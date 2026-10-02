@@ -83,6 +83,16 @@
  * while P's sequence runs, a fired restart timer, the retry entry and a
  * human-triggered restart answer `RESTART_OUTCOME_SEQUENCE_WAITING` with no
  * agent-director call and nothing recorded, which a retry takes as a refusal.
+ * The sequence gate is asked again wherever the latched gate is (after each
+ * liveness probe, after an 'escalate-dead' reconnect, right before the kill)
+ * and once more right before the launch, since a launch outside the
+ * serializer can start P's sequence during the work's awaits (a collision
+ * ladder's replacement site, b.jg5 SRJ-707); a sequence found running then
+ * ends the work with `RESTART_OUTCOME_SEQUENCE_WAITING` and nothing more
+ * called. A launch that answers `'refused'` while P's sequence runs (its own
+ * ladder started the sequence, or met it, and answered `sequence-waiting`)
+ * answers `RESTART_OUTCOME_SEQUENCE_WAITING` too, so a retry's re-armed line
+ * names the sequence.
  * Isolated from server.ts side effects — injectable deps make it testable.
  *
  * SPDX-License-Identifier: MIT
@@ -234,8 +244,13 @@ export const RESTART_OUTCOME_LATCHED = 'latched'
  * A live-row sequence runs for the persona (b.jg5 SRJ-706, SRJ-303,
  * `RestartDeps.isLiveRowSequenceRunning`): the work's gate right after the
  * latched gate found it so, so nothing was probed, reconnected, killed or
- * launched, nothing was recorded and nothing counts toward the cap. A
- * refusal at a retry (SRJ-302): the retry timer re-arms at the doubled wait.
+ * launched; or the gate asked again (after a probe, after an 'escalate-dead'
+ * reconnect, before the kill, before the launch) found it so, and nothing
+ * more was called; or the launch answered `'refused'` while the sequence ran
+ * (the launch's ladder started it at a replacement site, or met it, and
+ * answered `sequence-waiting`, b.jg5 SRJ-707). Nothing was recorded and
+ * nothing counts toward the cap. A refusal at a retry (SRJ-302): the retry
+ * timer re-arms at the doubled wait.
  */
 export const RESTART_OUTCOME_SEQUENCE_WAITING = 'sequence-waiting'
 /** Retry entry only: a launch was in flight for the persona, so no agent-director call was made. */
@@ -440,7 +455,12 @@ export interface RestartDeps {
    * liveness read, by every path that reaches it (a fired restart timer, the
    * retry entry, a human-triggered restart): while it answers true the work
    * makes no agent-director call, records no success or failure, adds nothing
-   * toward the cap and answers `RESTART_OUTCOME_SEQUENCE_WAITING`. It is the
+   * toward the cap and answers `RESTART_OUTCOME_SEQUENCE_WAITING`. Asked
+   * again wherever the latched query is asked again (after each liveness
+   * probe, after an 'escalate-dead' reconnect, right before the kill), once
+   * more right before the launch, and after a launch that answered
+   * `'refused'`: a sequence running then ends the work with the same answer
+   * and nothing more called. It is the
    * backstop for restart work queued before the sequence started; the retry
    * entry's own in-flight check (the server's "blocks a retry", which counts a
    * running sequence) answers first there. An answer of exactly `true` is
@@ -884,6 +904,10 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   // with no launch start, SRJ-513, read `unknown`); then nothing is
   // deferred, reconnected or killed, and the arm hook is not called.
   if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
+  // b.jg5 SRJ-706: the sequence gate is asked again wherever the latched gate
+  // is: a launch outside the serializer may have started P's live-row
+  // sequence while the probe ran (a collision ladder's replacement site).
+  if (skipIfSequenceRunning(d, key, 'after its liveness probe')) return RESTART_OUTCOME_SEQUENCE_WAITING
 
   // b.jg5 SRJ-314: agent-director could not report on the persona (a
   // `status` error, or a probe that threw). Never read as dead: no
@@ -1007,6 +1031,7 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     // b.jg5 SRJ-502: the adapter's sweep may have latched the persona (a
     // post-run `get` of its own row); then no re-probe follows.
     if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
+    if (skipIfSequenceRunning(d, key, 'after its escalate-dead reconnect')) return RESTART_OUTCOME_SEQUENCE_WAITING
     const reprobed = await reprobeDeadAfterEscalate(d, key)
     if (typeof reprobed === 'string') return reprobed
     deadRead = reprobed
@@ -1020,7 +1045,10 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   // check after the reconnect, during the reconnect) is never killed.
   // b.jg5 SRJ-609: after a `RECONNECT_ESCALATE_DEAD_NO_KILL` verdict no kill
   // is made; the latch is still asked before the relaunch.
+  // b.jg5 SRJ-706: so is the sequence gate, before the kill and again before
+  // the launch: while P's live-row sequence runs, nothing more is called.
   if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
+  if (skipIfSequenceRunning(d, key, 'before its kill')) return RESTART_OUTCOME_SEQUENCE_WAITING
   if (killBeforeLaunch) {
     const stopped = await killBeforeRelaunch(d, key, cwd, deadRead)
     if (stopped !== undefined) return stopped
@@ -1028,6 +1056,7 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     console.error(relaunchWithoutKillLine(key))
     console.error(relaunchAfterKillLine(key, cwd, RELAUNCH_KILL_NONE))
   }
+  if (skipIfSequenceRunning(d, key, 'before its launch')) return RESTART_OUTCOME_SEQUENCE_WAITING
 
   let ok: LaunchSessionResult
   try {
@@ -1058,6 +1087,12 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   }
 
   if (ok === 'refused') {
+    // b.jg5 SRJ-706, SRJ-707: the launch met P's live-row sequence (its
+    // ladder started one at a replacement site, or one was running), so it
+    // answered `sequence-waiting`, which `launchSession` reads as refused;
+    // the work answers sequence-waiting too, so a retry's re-armed line
+    // names the sequence. Nothing is recorded.
+    if (skipIfSequenceRunning(d, key, 'after its launch')) return RESTART_OUTCOME_SEQUENCE_WAITING
     // b.jg5 SRJ-302: refused, not failed. The launch met an UNAVAILABLE
     // outcome (or a read error) that armed the persona's retry timer, which
     // owns the persona from here. A persona is never given up on for
@@ -1255,6 +1290,7 @@ async function reprobeDeadAfterEscalate(d: RestartDeps, key: string): Promise<Re
   // reading `pending` with no launch start, read `unknown`): no arm
   // hook, deferral, kill or launch, and nothing recorded.
   if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
+  if (skipIfSequenceRunning(d, key, 'after its re-probe')) return RESTART_OUTCOME_SEQUENCE_WAITING
 
   switch (probe.kind) {
     case LIVENESS_DEAD:
@@ -1479,8 +1515,12 @@ function skipIfLatched(d: RestartDeps, key: string): boolean {
  * running: fail safe), log one line saying the restart work makes no attempt
  * and return true, so the caller returns `RESTART_OUTCOME_SEQUENCE_WAITING`
  * before any agent-director call. Records neither a success nor a failure.
+ * With `askedAgain` (where the work asks it again, wherever it asks the
+ * latched gate again: after a probe, before the kill, before the launch, or
+ * after a launch that came back refused) the line says the work goes no
+ * further: nothing more is called for the persona.
  */
-function skipIfSequenceRunning(d: RestartDeps, key: string): boolean {
+function skipIfSequenceRunning(d: RestartDeps, key: string, askedAgain?: string): boolean {
   if (d.isLiveRowSequenceRunning === undefined) return false
   let failure = ''
   try {
@@ -1489,7 +1529,9 @@ function skipIfSequenceRunning(d: RestartDeps, key: string): boolean {
     failure = ` (the running query failed: ${describeThrownValue(err)} — taken as running)`
   }
   console.error(
-    `[slack] Skipping restart for persona=${key} — its live-row sequence runs${failure}; no agent-director call, nothing recorded (sequence-waiting; b.jg5 SRJ-706, SRJ-303)`,
+    askedAgain === undefined
+      ? `[slack] Skipping restart for persona=${key} — its live-row sequence runs${failure}; no agent-director call, nothing recorded (sequence-waiting; b.jg5 SRJ-706, SRJ-303)`
+      : `[slack] Restart for persona=${key} goes no further ${askedAgain} — its live-row sequence runs${failure}; nothing more is called for it, nothing recorded (sequence-waiting; b.jg5 SRJ-706, SRJ-303)`,
   )
   return true
 }

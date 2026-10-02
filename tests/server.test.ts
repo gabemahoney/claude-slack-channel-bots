@@ -4377,8 +4377,9 @@ describe('b.jg5 SRJ-704, SRJ-1016: the liveness and reconnect adapters\' own-row
 // through the bounded retry (`retryPersonaKill`, b.jg5 SRJ-702) seeded with
 // the run's `dead` reading: not a row read live, so one try whose outcome
 // stands at once, with no `status` read and no wait on the clock (the tries,
-// the reads and the survivor rule are proved at the collision ladder's kill
-// of a row read live, in tests/session-manager.test.ts, and in
+// the reads and the survivor rule are proved at the live-row sequence's kill
+// of a row read live, in tests/session-manager.test.ts and
+// tests/live-row-sequence.test.ts, and in
 // tests/kill-retry.test.ts). The retry logs its one try line (`kill try 1 of
 // 1`, and, for an `ErrTmuxKillFailed`, its end line naming the ordinary
 // decision), then the adapter answers the outcome, `kill_sent` included, with

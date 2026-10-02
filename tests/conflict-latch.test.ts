@@ -89,9 +89,11 @@
  * call or delete for P and count nothing, the retry timer stopping latched;
  * Q launches and reconnects as before.
  * The kill as a latch site (SRJ-110, SRJ-505, AC 9; E20): P's restart run's
- * kill of its dead row, or its collision ladder's replacement kill of a row
- * read `waiting` (SRJ-613's kill backstop), answers CONFLICT "not this
- * launch's session" (the case table's restart-kill and ladder-kill rows), or
+ * kill of its dead row, or the step-1 kill of the live-row sequence P's
+ * launch starts at a collision ladder replacement site over a row read
+ * `waiting` in another directory (SRJ-613's kill backstop; the ladder makes
+ * no kill of its own, b.jg5 SRJ-707), answers CONFLICT "not this launch's
+ * session" (the case table's restart-kill and sequence-kill rows), or
  * the restart run's kill answers UNUSABLE NAME; P latches once with one
  * post, its armed retry timer stops latched, and the same paths plus a health
  * tick make no further `kill`, delete, spawn, resume or other tmux-touching
@@ -523,7 +525,7 @@ import {
   LAUNCH_START_ANOTHER_CALLERS_ID,
   LAUNCH_START_CASE_ROWS,
   LAUNCH_START_NON_LATCHING_ROWS,
-  LADDER_KILL_CONFLICT_CASE_ROWS,
+  SEQUENCE_STEP1_KILL_SITE,
   RESTART_KILL_CONFLICT_CASE_ROWS,
   RESTART_KILL_UNUSABLE_NAME_CASE_ROWS,
   REUSE_SPAWN_CONFLICT_CASE_ROWS,
@@ -531,6 +533,7 @@ import {
   SEQUENCE_KILL_CONFLICT_CASE_ROWS,
   SEQUENCE_KILL_STEP,
   SEQUENCE_KILL_UNUSABLE_NAME_CASE_ROWS,
+  sequenceKillConflictRowsAt,
   SESSION_ENDING_COMMAND_FORMS,
   UNUSABLE_NAME_CASE_ROWS,
   cscbOwnLines,
@@ -2643,8 +2646,10 @@ describe('SRJ-118, SRJ-505: a CONFLICT or UNUSABLE NAME at the reconnect\'s send
 // ---------------------------------------------------------------------------
 // b.jg5 SRJ-110, SRJ-505 (AC 9), SRJ-501, SRJ-502, SRJ-512, SRJ-613: a kill is
 // a latch site (E20; the E13, E16 and E19 hatch notes). P's restart run kills
-// its dead row, or P's collision ladder kills a row of P's read `waiting` in
-// another directory (SRJ-613's kill backstop), and the kill answers CONFLICT
+// its dead row, or the live-row sequence P's launch starts at a collision
+// ladder replacement site (a row of P's read `waiting` in another directory;
+// b.jg5 SRJ-707) kills it at its step 1 (SRJ-613's kill backstop), and the
+// kill answers CONFLICT
 // "not this launch's session"; or the restart run's kill answers UNUSABLE
 // NAME. P latches once with one post, P's retry timer (armed before) stops
 // latched, and no path that could retry the kill (a new launch, the retry
@@ -2674,8 +2679,8 @@ const KILL_LATCH_WAYS: ReadonlyArray<
       expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_LATCHED)
     },
   ] as const),
-  ...LADDER_KILL_CONFLICT_CASE_ROWS.filter((row) => row.killBackstop === true).map((row) => [
-    `the collision ladder's replacement kill of a row read waiting: CONFLICT (${row.name}, SRJ-613's kill backstop)`,
+  ...sequenceKillConflictRowsAt(SEQUENCE_STEP1_KILL_SITE, 'waiting').filter((row) => row.latchCase === LATCH_CASE_NOT_THIS_LAUNCH).map((row) => [
+    `the step-1 kill of the live-row sequence P's launch starts over a row read waiting in another directory: CONFLICT (${row.name}, SRJ-613's kill backstop)`,
     (key: string) =>
       expectedLatchRecord(key, {
         latchCase: row.latchCase,
@@ -2687,8 +2692,9 @@ const KILL_LATCH_WAYS: ReadonlyArray<
     () => row.notice.text,
     async (h: RecoveryHarness, key: string) => {
       h.script({ ...collided(h, personaOf(h, key), { cwd: h.home, state: 'waiting' }), killError: row.build() })
-      expect(await h.launch(key)).toEqual({ key, action: 'latched' })
-      // Nothing sent: no send-keys, delete or fresh spawn followed the kill.
+      expect(await h.launch(key)).toEqual({ key, action: 'sequence-waiting' })
+      expect(await h.driveSequence(h.sequenceSettled(key))).toMatchObject({ kind: LIVE_ROW_OUTCOME_ABORTED, latched: true })
+      // Nothing sent: no send-keys, delete or reuse spawn followed the kill.
       expect([h.stub.calls.sendKeysCalls, h.stub.calls.deleteCalls, h.stub.calls.spawnCalls.length]).toEqual([[], [], 1])
     },
   ] as const),

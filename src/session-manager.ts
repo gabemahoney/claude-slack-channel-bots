@@ -18,10 +18,11 @@
  *      launch start, or carrying a `provenance_conflict` note, or an UNUSABLE
  *      NAME answer) ends the ladder with `latched` before anything below,
  *      the `cwd` and `config_dir` guards included. A row whose `cwd`
- *      differs from the persona's working directory by real path is killed,
- *      deleted and spawned fresh whatever its state (b.av2 SR-6.2). Otherwise
- *      branch on the observed state (ended/missing → resume or
- *      kill+delete+spawn; waiting → /mcp reconnect via sendKeys; working →
+ *      differs from the persona's working directory by real path is replaced
+ *      whatever its state, with no row deleted (b.av2 SR-6.2 as amended,
+ *      b.jg5 SRJ-1503). Otherwise branch on the observed state (ended/missing
+ *      → resume, or the replacement when `resume_enabled` is false; waiting
+ *      → /mcp reconnect via sendKeys; working →
  *      wait for waiting (or, b.f2b, for positive evidence that the row is
  *      stale and the session idle: the same idle pane and the same transcript,
  *      ended with a completed turn, across a window) then reconnect;
@@ -29,10 +30,25 @@
  *      no-op on a pane or a read that could not answer, and a findMissing
  *      sweep, then resume or spawn once its row reads dead, when
  *      agent-director finds no pane of its launch or no row (b.jdc, b.jg5
- *      SRJ-607); pending → no-op). Nothing is ever typed
- *      into a prompt. Before any resume, a row whose `config_dir` label is missing
- *      or differs from the persona's current effective claude_config_dir is
- *      deleted and spawned fresh instead (a resume keeps the old config dir).
+ *      SRJ-607); pending → no-op, or the replacement when its `config_dir`
+ *      label is missing or differs, b.jg5 SRJ-411). Nothing is ever typed
+ *      into a prompt. Before any resume, a row whose `config_dir` label is
+ *      missing or differs from the persona's current effective
+ *      claude_config_dir is replaced instead (a resume keeps the old config
+ *      dir; b.av2 SR-6.2 as amended, b.jg5 SRJ-1504). Every replacement goes
+ *      through one replace step (`replacePersonaRow`, b.jg5 SRJ-707), which
+ *      decides on the row state the path last read: a finished row (`ended`,
+ *      `missing` or no row) gets a reuse spawn of the same id
+ *      (`reuseSpawnForPersona`, SRJ-112), whose collision re-runs this
+ *      get-then-act once (a second collision arms the reuse-collision cause
+ *      and answers the uncounted refused result); a live row (`pending`
+ *      included) starts the live-row sequence (SRJ-705), which ends in that
+ *      reuse spawn, and the ladder answers `sequence-waiting` with no other
+ *      call. No ladder path deletes a row or kills one, and none launches
+ *      over a live row. A resume's `ErrSpawnNotResumable` is a lost race
+ *      (b.jg5 SRJ-710): nothing is killed, deleted or launched, the retry
+ *      timer is armed with the lost-race cause, and the ladder answers the
+ *      uncounted refused result.
  *   3. Any other error raises a spawn-failure notice for the persona via
  *      `notifySpawnFailure` (through the per-persona notifier) and is logged,
  *      except a refusal (b.jg5 SRJ-105, `refusalAt`): an UNAVAILABLE,
@@ -42,11 +58,11 @@
  *      `ErrInternal` other than an unusable recorded name, a store-open
  *      name, `ErrSystemInstallDisappeared`, any name CSCB gives no handling,
  *      and a resume's `ErrInvalidFlags` after its re-check) outcome at any
- *      spawn, resume, kill or delete, or a read error (an
+ *      spawn or resume, or a read error (an
  *      ENVIRONMENT, CONFIG or UNCLASSIFIED answer included) at the collision
  *      `get`. It is logged once and stops the ladder with `failed`: no
  *      notice, no `spawn-failed` entry, no `dead-session` verdict, and no
- *      further kill, delete or launch. An `ErrTmuxSessionCreate` (LAUNCH
+ *      further launch. An `ErrTmuxSessionCreate` (LAUNCH
  *      FAILURE, decided by name) at any spawn or resume the ladder makes is
  *      one counted launch failure (b.jg5 SRJ-602, SRJ-111, SRJ-113): one
  *      line, the notice, a `spawn-failed` entry at start and `failed`;
@@ -66,53 +82,36 @@
  *   4. A CONFLICT (`ErrTmuxSessionConflict`, b.jg5 SRJ-105, SRJ-501) at any
  *      spawn or resume the ladder makes (the first spawn, the retry spawn
  *      after the collision `get` found no row, the spawn after `resume`
- *      found none, every delete-then-spawn branch, the resume, and the reuse
- *      spawn of the same id after resume's no-transcript answer) takes the
+ *      found none, the resume, and every reuse spawn of the same id: the
+ *      replace step's and the one after resume's no-transcript answer) takes the
  *      CONFLICT row (`conflictAt`): the persona latches
  *      through the installed latch (`setConflictLatch`) with the refused
  *      operation "plain spawn", "reuse spawn" or "resume" and the row state the path last
  *      read before the call (one latch-time `status` read when it read
  *      nothing), and the ladder answers `latched`: no notice from here, no
- *      `spawn-failed` entry, nothing counted, and no kill, delete or further
+ *      `spawn-failed` entry, nothing counted, and no further
  *      launch. A latched persona is not launched at all: `spawnForPersona`
  *      answers `latched` with no agent-director call (b.jg5 SRJ-502).
  *   5. An UNUSABLE NAME answer (an `ErrInternal` naming "the recorded tmux
  *      session name", b.jg5 SRJ-105, SRJ-512) at any of those spawns or the
- *      resume, or at the ladder's kill or delete in a delete-then-spawn
- *      chain, takes the UNUSABLE NAME row (`unusableNameAt`): the persona
+ *      resume takes the UNUSABLE NAME row (`unusableNameAt`): the persona
  *      latches with the case "unusable recorded name", the refused operation
  *      "none" and the row state the path last read (one latch-time `status`
  *      read when it read nothing), and the ladder answers `latched`, as at
  *      the CONFLICT row: no notice from here, no `spawn-failed` entry,
- *      nothing counted, and no kill, delete, further launch or reuse, so no
+ *      nothing counted, and no further launch or reuse, so no
  *      tmux-touching call follows it. Every other `ErrInternal` stays
  *      UNCLASSIFIED (step 3). The persona teardown's kill and delete
  *      (`killPersonaInstance`, `deletePersonaInstance`) latch nothing.
  *   6. Every kill is a checked kill (`src/checked-kill.ts`; b.jg5 SRJ-110,
  *      SRJ-701): `killPersonaInstance` answers its outcome, `kill_sent`
  *      included, and never throws; its context (`KILL_CONTEXT_ATTEMPT` or
- *      `KILL_CONTEXT_TEARDOWN`) is required. The ladder's replacement kills
- *      (`ladderKill`: a delete-then-spawn chain's kill and the
- *      `ErrSpawnNotResumable` branch's) run through the bounded retry
- *      (`retryPersonaKill`, `src/kill-retry.ts`; b.jg5 SRJ-702): a kill of a
- *      row read live gets up to 3 tries 2 s apart on UNAVAILABLE, with the
- *      own-row `status` read before each further try, and only the outcome
- *      that stands is reported to the retry timer. They go on to the delete
- *      and spawn only after the success that stands (any `kill_sent`,
- *      `ErrSpawnNotFound`, GONE, or a read that found the row finished); a
- *      stop of the tries answers `latched` for a latched persona, else the
- *      uncounted refused result. A
- *      CONFLICT there latches the persona with the refused operation "P's
- *      next check or recovery" and is never sent again (b.jg5 SRJ-501,
- *      SRJ-505), an UNUSABLE NAME takes step 5's row, an `ErrInvalidFlags`
- *      gets one immediate version re-check (a stop it decides answers
- *      `failed` marked `stopping`), a class the kill has no row for is
- *      reported as UNCLASSIFIED (step 3's refusal, never counted), and every
- *      other outcome is step 3's refusal. The retry's kill-failure alert
- *      decision is then raised (`raisePersonaKillFailureAlert`, through the
- *      installed kill-failure alerts; b.jg5 SRJ-704): the survivor version
- *      before the delete and spawn, the ordinary version after the
- *      outcome's own handling.
+ *      `KILL_CONTEXT_TEARDOWN`) is required. The collision ladder makes no
+ *      kill: a live row's kills are the live-row sequence's, which run
+ *      through the bounded retry (`retryPersonaKill`, `src/kill-retry.ts`;
+ *      b.jg5 SRJ-702) as the restart path's kill does, and raise the retry's
+ *      kill-failure alert decision (`raisePersonaKillFailureAlert`, through
+ *      the installed kill-failure alerts; b.jg5 SRJ-704).
  *
  * Own-row reads (b.jg5 SRJ-114, SRJ-115): every `get` of a persona's own row
  * at SRJ-114's sites goes through `readPersonaOwnRow`, and every own-row
@@ -189,10 +188,10 @@
  * findMissing sweep after the kills so a killed row reads `missing` once its
  * session is gone and isn't killed again at the next start (b.1ix). While a
  * persona's working directory cannot be resolved to a real path, neither the
- * sweep nor the collision ladder kills or deletes on `cwd` grounds a row
- * whose `cwd` has no real path either (b.av2 SR-6.4): the sweep defers the
- * check to the launch, and the ladder fails the launch instead. A row whose
- * `cwd` resolves to an existing directory is still a `cwd` mismatch.
+ * sweep nor the collision ladder acts on `cwd` grounds on a row whose `cwd`
+ * has no real path either (b.av2 SR-6.4): the sweep defers the check to the
+ * launch, and the ladder keeps the row and fails the launch instead. A row
+ * whose `cwd` resolves to an existing directory is still a `cwd` mismatch.
  *
  * At start, `startupSessionManager` brings each applied persona up through
  * the b.av2 SR-6.1 procedure (`persona-start.ts`, driven by the bring-up
@@ -228,7 +227,12 @@
  * agent-director call (the gate in `spawnForPersona`, which `launchSession`
  * answers as the uncounted `'refused'`); the sequence's own launch,
  * `launchForLiveRowSequence`, is exempt, and makes no call once the sequence
- * is stopped. No production site starts a sequence yet.
+ * is stopped. Its production starters are the collision ladder's
+ * replacement sites, through the replace step (`replacePersonaRow`, b.jg5
+ * SRJ-707): a live row there (`pending` included) starts a sequence with the
+ * conversation not kept and alert context `recovery`, and the launch answers
+ * `sequence-waiting`. The sequence's launch is never part of the start pass:
+ * it passes the start flag false, so it writes no startup-errors entry.
  *
  * No tmux process-tree walks, no JSONL existence checks for resume eligibility:
  * the library encapsulates both.
@@ -279,6 +283,7 @@ import {
   raiseTmuxUnavailable,
   reportAgentDirectorError,
   reportDeferredUnavailable,
+  reportLostRaceAtSite,
   reportReuseCollisionAtSite,
   reportUnclassifiedAtSite,
   setOutageFlag,
@@ -289,7 +294,6 @@ import {
   AgentDirectorError,
   ErrInstanceIdCollision,
   ErrSpawnNotFound,
-  ErrSpawnNotResumable,
   ErrCwdNotFound,
   ErrCwdNotADirectory,
   ErrSpawnCapReached,
@@ -302,7 +306,6 @@ import {
   ERR_SPAWN_NOT_RESUMABLE_NAME,
 } from './agent-director-errors.ts'
 import {
-  AD_CALL_KILL_ROW_READ_LIVE,
   AD_ERROR_CLASS_CONFIG,
   AD_ERROR_CLASS_CONFLICT,
   AD_ERROR_CLASS_DIRECTORY,
@@ -332,7 +335,6 @@ import {
   describeKillOutcome,
   killLetsNextStepRun,
   killOutcomeStopsServer,
-  type KillFailure,
   type KillOutcome,
 } from './checked-kill.ts'
 import {
@@ -363,7 +365,6 @@ import {
   KILL_RETRY_READ_LATCHED,
   KILL_RETRY_READ_NO_ROW,
   KILL_RETRY_READ_STATE,
-  KILL_RETRY_SEED_LIVE_UNREAD,
   KILL_RETRY_SEED_NOT_LIVE_VALUE,
   KILL_RETRY_SYSTEM_CLOCK,
   createKillRetryPassBudget,
@@ -405,7 +406,9 @@ import {
   CONFLICT_LATCH_SET_SAME_CASE,
   LATCH_CASE_LAUNCH_START_NOT_RECORDED,
   LATCH_CASE_NOT_THIS_LAUNCH,
+  LATCH_ROW_STATE_KIND_NO_ROW,
   LATCH_ROW_STATE_KIND_READ,
+  LATCH_ROW_STATE_KIND_UNREADABLE,
   LATCH_ROW_STATE_NO_ROW,
   LATCH_ROW_STATE_UNREADABLE,
   REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
@@ -437,6 +440,7 @@ import {
   runInAttempt,
   runOutsideAttempts,
   unavailableRetryCauseFor,
+  UNAVAILABLE_RETRY_CAUSE_LOST_RACE,
   UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION,
   UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED,
   UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED,
@@ -468,6 +472,7 @@ import {
   LIVE_ROW_RUN_MARKED_MISSING,
   LIVE_ROW_RUN_NOT_JUDGED,
   LIVE_ROW_RUN_REFUSED,
+  LIVE_ROW_SEQUENCE_ENTRY_KILL,
   LIVE_ROW_SEQUENCE_LOG_PREFIX,
   LIVE_ROW_SEQUENCE_NO_ROW,
   LIVE_ROW_SEQUENCE_SITE,
@@ -643,7 +648,7 @@ export interface RowPersonaComparison {
    * working_directory has no real path AND the row's `cwd` has none either
    * (absent, missing, a dangling symlink's old target) or equals the
    * configured working_directory lexically. The start sweep and the collision
-   * ladder never kill or delete such a row on `cwd` grounds. A row whose `cwd`
+   * ladder never act on such a row on `cwd` grounds. A row whose `cwd`
    * resolves to an existing directory elsewhere is not deferred: it is a
    * `cwd` mismatch even while the working directory is missing, so a persona
    * never adopts a directory another persona may now own.
@@ -1171,7 +1176,8 @@ function logUnusableName(site: string, what: string, ref: string, err: unknown, 
 /**
  * b.jg5 SRJ-105, SRJ-501, SRJ-512: the UNUSABLE NAME row of the ladder's
  * refusal handling, at every spawn and `resume` the collision ladder makes
- * and at its kill and delete in a delete-then-spawn chain. `err` was thrown
+ * (its reuse spawns included) and at a kill of the restart path or the
+ * live-row sequence (`latchOnKillOutcomeAt`). `err` was thrown
  * by that call for persona `key`. It is the row's only when
  * `isUnusableNameError` (the classifier, by name) answers true; for any
  * other value it answers `undefined` and the site goes on as before (every
@@ -1272,10 +1278,12 @@ export function _resetConfiguredPersonaQuery(): void {
  * `main()`'s, built over its notice episodes. The persona kills' alert
  * (`raisePersonaKillFailureAlert`) raises through it, and every own-row read
  * that reads the row `ended` or `missing`, or finds it gone, ends the
- * persona's kill-failure episode through it (`endKillFailureEpisodeOnRead`),
- * as does the collision ladder's delete of the row when it succeeds or
- * answers `ErrSpawnNotFound` (`tryDelete`). With none installed (unit tests, the integration driver) an alert is
- * written as one log line only, and no episode is ended.
+ * persona's kill-failure episode through it (`endKillFailureEpisodeOnRead`):
+ * on the replacing path these are the collision ladder's `get` and the
+ * live-row sequence's `get`s and between-try `status` reads, so a row seen
+ * gone there ends the episode. With none installed (unit tests, the
+ * integration driver) an alert is written as one log line only, and no
+ * episode is ended.
  */
 let killFailureAlerts: KillFailureAlerts | undefined
 
@@ -5817,7 +5825,9 @@ export async function checkPromptRowDeferral(key: string, state: string): Promis
  *   launch), or the row absent (`ErrSpawnNotFound`, which takes the GONE
  *   column, b.jg5 SRJ-117) → the memoized findMissing sweep, then the row is
  *   read again: `ended` or `missing` is recovered through
- *   `resumeOrFreshSpawn`, whose resume or spawn decides what holds the
+ *   `resumeOrFreshSpawn`, with that re-read as the state last read (a
+ *   finished row, so any replacement there is a reuse spawn of the same id,
+ *   b.jg5 SRJ-707), whose resume or spawn decides what holds the
  *   persona's name; anything else (or a failed read) is left as it is
  *   (`no-op`), for the restart path to retry. A refused sweep (b.jg5
  *   SRJ-105) reads nothing and answers `failed`: no resume or launch. A
@@ -5844,14 +5854,11 @@ export async function checkPromptRowDeferral(key: string, state: string): Promis
  * `promptRowLadderLatchedLine`).
  */
 async function launchOnPromptRow(
-  persona: Persona,
-  params: SpawnParams,
-  config: PersonaConfig,
-  isStartup: boolean,
-  ref: string,
+  run: LadderRun,
   row: Pick<GetResult, 'cwd' | 'labels'>,
   state: string,
 ): Promise<SpawnPersonaResult> {
+  const { persona, config, ref } = run
   const { key } = persona
   const read = await readPersonaOwnPane(key, {
     nLines: PROBE_PANE_READ_LINES,
@@ -5895,7 +5902,7 @@ async function launchOnPromptRow(
   if (isDeadRowState(after)) {
     console.error(`[slack] spawnForPersona: dead session for ${ref} (state=${state}) — recovering via resume/fresh-spawn`)
     // b.jg5 SRJ-501: the re-read after the sweep is the path's last read.
-    return resumeOrFreshSpawn(persona, params, config, isStartup, row, { lastRead: latchRowStateRead(after) })
+    return resumeOrFreshSpawn(run, row, { lastRead: latchRowStateRead(after) })
   }
   const next = config.session_restart_delay === 0
     ? 'session_restart_delay is 0, so nothing retries it before the next server start'
@@ -6635,11 +6642,12 @@ function spawnHomeDir(): string {
  * extra_env also always carries `PROMPT_SUGGESTION_OFF_ENV`
  * (`CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false`, b.svb/b.f2b; see
  * persona-identity.ts for why). Every plain spawn in the ladder (the first
- * spawn, the retry spawn after the collision `get` found no row, the spawn
- * after `resume` found none, and the replacement spawn) sends
+ * spawn, the retry spawn after the collision `get` found no row, and the
+ * spawn after `resume` found none) sends
  * these params unchanged, the reuse spawn (`reuseSpawnForPersona`), which
- * is also the launch after resume's no-transcript answer (b.jg5 SRJ-707,
- * SRJ-712), sends
+ * is every replacement of a row the ladder cannot keep (the replace step,
+ * `replacePersonaRow`, and the live-row sequence's final launch) and the
+ * launch after resume's no-transcript answer (b.jg5 SRJ-707, SRJ-712), sends
  * them with only `reuse_finished: true` added (b.jg5 SRJ-708: one
  * derivation, so a reuse carries the same template, `cwd`, labels and
  * `extra_env` as any launch of the persona), and a resume restores the env
@@ -6680,7 +6688,7 @@ function buildSpawnParams(persona: Persona, config: PersonaConfig, configDirLabe
 
 /**
  * A kill made inside a launch or recovery attempt for the persona (the
- * collision ladder's replacement kills, the restart path's kill).
+ * live-row sequence's kills, the restart path's kill).
  */
 const KILL_CONTEXT_ATTEMPT = 'attempt'
 /** A persona teardown's kill: no launch or recovery attempt; it arms nothing (b.jg5 SRJ-110; hatch A3). */
@@ -6714,10 +6722,9 @@ export interface KillPersonaInstanceOptions {
   readonly context: KillContext
   /**
    * True when the caller kills a row it read in a live state (b.jg5
-   * glossary: only such a kill is tmux-touching): the collision ladder, when
-   * it read the row live. Absent or false otherwise (the persona teardown
-   * did not read the row; the restart path kills only after a `dead`
-   * reading).
+   * glossary: only such a kill is tmux-touching): the live-row sequence's
+   * kills. Absent or false otherwise (the persona teardown did not read the
+   * row; the restart path kills only after a `dead` reading).
    */
   readonly rowReadLive?: boolean
   /**
@@ -6750,8 +6757,9 @@ export interface KillPersonaInstanceOptions {
  * its own and latches nothing: each caller acts on the outcome by its own
  * context. Its callers: the persona teardown (b.av2 SR-6.5, `main()`'s
  * binding, `KILL_CONTEXT_TEARDOWN`, one checked kill) and the bounded retry
- * of the collision ladder's replacement kills and the restart path's kill
- * (`retryPersonaKill`, `KILL_CONTEXT_ATTEMPT`, one call per try).
+ * of the live-row sequence's kills and the restart path's kill
+ * (`retryPersonaKill`, `KILL_CONTEXT_ATTEMPT`, one call per try). The
+ * collision ladder makes no kill.
  */
 export async function killPersonaInstance(key: string, options: KillPersonaInstanceOptions): Promise<KillOutcome> {
   const call = adKillCall(options.rowReadLive === true)
@@ -6851,19 +6859,6 @@ function personaKillKeepsGoing(key: string): boolean {
   }
 }
 
-/** The collision ladder's kill retry clock: the production clock unless a suite sets its own. */
-let _ladderKillClock: KillRetryWait = KILL_RETRY_SYSTEM_CLOCK
-
-/** Test-only seam: run the collision ladder's kill retry waits on `clock` (a suite passes `createFakeClock()`). */
-export function _setLadderKillClock(clock: KillRetryWait): void {
-  _ladderKillClock = clock
-}
-
-/** Test-only seam: restore the production clock for the collision ladder's kill retry. */
-export function _resetLadderKillClock(): void {
-  _ladderKillClock = KILL_RETRY_SYSTEM_CLOCK
-}
-
 /** What `retryPersonaKill` is given. */
 export interface PersonaKillRetryOptions {
   /** True when the path read the row in a live state: each try is a tmux-touching kill (`AdKillCall`). */
@@ -6959,15 +6954,15 @@ function callerKeepsGoing(options: PersonaKillRetryOptions): boolean {
 /**
  * Raise the kill-failure alert that persona `key`'s kill retry decided
  * (`retried.alert`; b.jg5 SRJ-704, SRJ-702, SRJ-1007), at the restart path
- * (`_buildKillSessionAdapter`, `src/server.ts`) and the collision ladder
- * (`ladderKill`), after the standing outcome's own handling (a CONFLICT has
+ * (`_buildKillSessionAdapter`, `src/server.ts`) and the live-row sequence's
+ * kills, after the standing outcome's own handling (a CONFLICT has
  * latched the persona with its own post; an UNAVAILABLE outcome has armed
  * its retry timer, `ErrTmuxKillFailed` with the kill-failed cause and never
  * the `tmux-unresponsive` condition) and, for the survivor version, before
- * the caller's next step (the launch, or the delete and the spawn). The
- * context is `recovery` at both sites (SRJ-1007); the live-row sequence's
- * kills pass their request's context and the server's alerts
- * (`buildLiveRowSequenceDeps`). Through the given kill-failure alerts, the
+ * the caller's next step. The context is `recovery` at the restart path
+ * (SRJ-1007); the live-row sequence's kills pass their request's context
+ * (`recovery` for a sequence the collision ladder starts) and the server's
+ * alerts (`buildLiveRowSequenceDeps`). Through the given kill-failure alerts, the
  * installed ones (`setKillFailureAlerts`) by default, which route it by
  * whether the persona is in the applied configuration now:
  *   - `survivor`: its destination, once for this retry, with no episode; or
@@ -7038,22 +7033,11 @@ async function readPersonaKillRow(key: string, site: string, ref: string): Promi
 }
 
 /**
- * The kill retry's seed for a kill the collision ladder makes (b.jg5
- * SRJ-702): a kill declared not of a row read live is one try; one declared
- * live takes the state the ladder last read when that state is live (so a
- * `pending` read keeps the CONFIG rule), and otherwise a known-live seed (the
- * `ErrSpawnNotResumable` kill, whose row agent-director has just called
- * live, or an unreadable state).
+ * Delete persona `key`'s row (`cscb_<key>`) through `withOutageDetection`;
+ * rethrows every error. The persona teardown's delete only
+ * (`deletePersonaInstance`), which E25 removes (b.jg5 SRJ-715, SRJ-716): no
+ * launch path deletes a row, and none deletes before a spawn (SRJ-707).
  */
-function ladderKillSeed(call: AdKillCall, lastRead: LatchRowState): KillRetrySeed {
-  if (!call.rowReadLive) return KILL_RETRY_SEED_NOT_LIVE_VALUE
-  if (lastRead.kind === LATCH_ROW_STATE_KIND_READ && !AGENT_DIRECTOR_DEAD_STATES.has(lastRead.state)) {
-    return killRetrySeedOfState(lastRead.state)
-  }
-  return KILL_RETRY_SEED_LIVE_UNREAD
-}
-
-/** Delete persona `key`'s row (`cscb_<key>`) through `withOutageDetection`; rethrows every error. */
 function deleteInstanceRow(key: string): Promise<unknown> {
   return withOutageDetection(key, undefined, 'delete', (client) => client.delete({ claude_instance_id: [personaInstanceId(key)] }))
 }
@@ -7062,9 +7046,9 @@ function deleteInstanceRow(key: string): Promise<unknown> {
  * Delete persona `key`'s agent-director row (`cscb_<key>`) through
  * `withOutageDetection`, quietly, as `killPersonaInstance` kills it: true when
  * the row was there, false when it was already gone (`ErrSpawnNotFound`);
- * every other error is rethrown. Unlike the collision ladder's delete, a
- * failure records no startup error and raises no spawn-failure notice. For
- * the persona teardown (b.av2 SR-6.5).
+ * every other error is rethrown. A failure records no startup error and
+ * raises no spawn-failure notice. For the persona teardown only (b.av2
+ * SR-6.5), until E25 removes it (b.jg5 SRJ-715).
  */
 export async function deletePersonaInstance(key: string): Promise<boolean> {
   try {
@@ -7074,128 +7058,6 @@ export async function deletePersonaInstance(key: string): Promise<boolean> {
     if (err instanceof ErrSpawnNotFound) return false
     throw err
   }
-}
-
-/**
- * The collision ladder's replacement kill (b.jg5 SRJ-110, SRJ-701, SRJ-702):
- * the bounded retry of the persona's kill (`retryPersonaKill`), inside the
- * launch attempt, on the ladder's kill clock (`_setLadderKillClock`). `call`
- * declares whether the ladder read the row in a live state (`AdKillCall`);
- * with `lastRead`, the row state the ladder last read, it gives the retry's
- * seed (`ladderKillSeed`): a kill of a row read live gets up to 3 tries 2 s
- * apart on UNAVAILABLE, with the own-row `status` read before each further
- * try; any other kill is one try. Never throws. Answers `undefined` only
- * after the success that stands (any `kill_sent`, `ErrSpawnNotFound`, GONE,
- * or a read that found the row finished), with one line naming the outcome:
- * the chain goes on to its delete and spawn. A stop of the tries (a read
- * that latched the persona, or the keep-going check) answers `latched` when
- * the persona is latched, else the uncounted refused result, with one line
- * and nothing more called (`ladderKillStopped`). Every other outcome stops
- * the chain (SRJ-110: "No step follows"), after which the caller deletes and
- * launches nothing and answers the result `ladderKillStop` gives. The
- * retry's alert decision is raised (`raisePersonaKillFailureAlert`, context
- * `recovery`): the survivor version after a success, before the chain's
- * delete and spawn; the ordinary version after the outcome's own handling
- * (b.jg5 SRJ-702, SRJ-704).
- */
-async function ladderKill(
-  key: string,
-  call: AdKillCall,
-  ref: string,
-  lastRead: LatchRowState,
-): Promise<SpawnPersonaResult | undefined> {
-  const retried = await retryPersonaKill(key, {
-    rowReadLive: call.rowReadLive,
-    lastRead: ladderKillSeed(call, lastRead),
-    site: 'spawnForPersona',
-    ref,
-    clock: _ladderKillClock,
-  })
-  const { outcome } = retried
-  if (killLetsNextStepRun(outcome)) {
-    console.error(`[slack] spawnForPersona: kill for ${ref}: ${describeKillOutcome(outcome)} — the delete and the fresh spawn follow (b.jg5 SRJ-701)`)
-    // b.jg5 SRJ-702, SRJ-704: a survivor-naming failure earlier in these
-    // tries raises the survivor version once, before the delete and spawn.
-    raisePersonaKillFailureAlert(key, retried, 'spawnForPersona', ref)
-    return undefined
-  }
-  // b.jg5 SRJ-702, SRJ-704: the ordinary version follows the standing
-  // outcome's own handling (a CONFLICT's latch and its post first).
-  const answered = killRetryStopped(retried) ? ladderKillStopped(key, ref, outcome) : await ladderKillStop(key, outcome, ref, lastRead)
-  raisePersonaKillFailureAlert(key, retried, 'spawnForPersona', ref)
-  return answered
-}
-
-/**
- * What the collision ladder answers when its kill's tries were stopped
- * (b.jg5 SRJ-702, SRJ-502): `latched` when the persona is latched (a read
- * between tries latched it, or it latched elsewhere), else (torn down, not
- * up, or the server shutting down) the uncounted refused result, a `failed`
- * result with the refusal marker that `launchSession` answers as `'refused'`
- * and the restart path never counts. One line; no delete or launch follows,
- * and nothing was reported for the kill, so no retry timer was armed by it.
- */
-function ladderKillStopped(key: string, ref: string, outcome: KillOutcome): SpawnPersonaResult {
-  if (personaLatchedNow(key)) {
-    console.error(
-      `[slack] spawnForPersona: kill for ${ref} did not succeed (${describeKillOutcome(outcome)}) and its tries were stopped: the persona is latched — answering latched; no delete or launch follows (b.jg5 SRJ-702, SRJ-502)`,
-    )
-    return { key, action: 'latched' }
-  }
-  console.error(
-    `[slack] spawnForPersona: kill for ${ref} did not succeed (${describeKillOutcome(outcome)}) and its tries were stopped (the persona is not up or is torn down, or the server is shutting down) — answering the uncounted refused result; no delete or launch follows (b.jg5 SRJ-702)`,
-  )
-  return { key, action: 'failed', refused: true }
-}
-
-/**
- * What a non-success at the collision ladder's replacement kill answers
- * (b.jg5 SRJ-110), by its class:
- *   - an `ErrInvalidFlags` whose immediate version re-check decided that the
- *     server stops (`killOutcomeStopsServer`; b.jg5 SRJ-204, SRJ-205): one
- *     line and a `failed` result marked `stopping`, as for a resume's; nothing
- *     more is called;
- *   - CONFLICT: latches the persona through the latch's CONFLICT entry with
- *     the refused operation "P's next check or recovery" and `lastRead`, the
- *     row state the ladder last read (`conflictAt`; b.jg5 SRJ-501, SRJ-505;
- *     on a live row, `pending` included, a "not this launch's session"
- *     answer is SRJ-613's kill backstop), and answers `latched`;
- *   - UNUSABLE NAME: latches it with `lastRead` (`unusableNameAt`; b.jg5
- *     SRJ-512) and answers `latched`;
- *   - UNAVAILABLE (`ErrTmuxKillFailed` included), ENVIRONMENT, CONFIG and
- *     UNCLASSIFIED: the refusal (`refusalAt`, b.jg5 SRJ-105, SRJ-311,
- *     SRJ-313, SRJ-316) answers `failed`, with one line and no notice. An
- *     UNCLASSIFIED outcome of a class the kill has no row for
- *     (`unlistedClass`, `ErrInvalidFlags` after a re-check that did not stop
- *     included) answers `failed` with the same line; `killPersonaInstance`
- *     has reported it as UNCLASSIFIED, arming the retry timer, so
- *     `markRefusal` marks the result refused and it is never counted.
- * Never throws.
- */
-async function ladderKillStop(
-  key: string,
-  outcome: KillFailure,
-  ref: string,
-  lastRead: LatchRowState,
-): Promise<SpawnPersonaResult> {
-  if (killOutcomeStopsServer(outcome)) {
-    console.error(
-      `[slack] spawnForPersona: kill for ${ref} did not succeed: ${describeKillOutcome(outcome)} — the version re-check decided that the server stops; answering failed, marked stopping; nothing more is called (b.jg5 SRJ-104, SRJ-205)`,
-    )
-    return { key, action: 'failed', stopping: true }
-  }
-  if (outcome.errorClass === AD_ERROR_CLASS_CONFLICT) {
-    const latched = await conflictAt(key, outcome.error, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, lastRead, 'kill', ref)
-    if (latched) return latched
-  } else if (outcome.errorClass === AD_ERROR_CLASS_UNUSABLE_NAME) {
-    const latched = await unusableNameAt(key, outcome.error, lastRead, 'spawnForPersona', 'kill', ref)
-    if (latched) return latched
-  } else if (outcome.errorClass === AD_ERROR_CLASS_UNAVAILABLE || outcome.unlistedClass === undefined) {
-    const refused = refusalAt(key, outcome.error, 'kill', 'spawnForPersona', 'kill', ref)
-    if (refused) return refused
-  }
-  logRefusal('spawnForPersona', 'kill', ref, describeKillOutcome(outcome))
-  return { key, action: 'failed' }
 }
 
 /**
@@ -7302,8 +7164,8 @@ function launchFailureResult(key: string): SpawnPersonaResult {
 /**
  * A plain spawn's failure by class (b.jg5 SRJ-111, SRJ-713), at every plain
  * spawn the ladder makes (the first spawn, the retry spawn after the
- * collision `get` found no row, the spawn after `resume` found none, and the
- * replacement spawn; resume's no-transcript answer goes to the reuse spawn
+ * collision `get` found no row, and the spawn after `resume` found none;
+ * every replacement and resume's no-transcript answer go to the reuse spawn
  * of the same id instead, b.jg5 SRJ-707, SRJ-712), with no further launch: the `cwd` errors
  * answer `failed` quietly (the spawn's wrapper raised `cwd-unreachable`);
  * then the refusal handling (`launchRefusalAt`: a CONFLICT latches with the
@@ -7332,112 +7194,6 @@ async function plainSpawnFailedAt(
   if (isStartup) recordStartupError('spawn-failed', `${what} failed for ${ref}: ${described}`)
   notifySpawnFailure(key, e, isStartup)
   return launchFailure ? launchFailureResult(key) : { key, action: 'failed' }
-}
-
-/**
- * Delete the spawn row; surface failures. Answers what stops the chain, or
- * `undefined` when the delete succeeded and the chain goes on. An UNUSABLE
- * NAME answer (b.jg5 SRJ-512, `unusableNameAt`) latches the persona with
- * `lastRead`, the row state the ladder last read, and answers `latched`; a
- * refusal (b.jg5 SRJ-105, SRJ-311, SRJ-313, SRJ-316: UNAVAILABLE,
- * ENVIRONMENT, CONFIG or UNCLASSIFIED) answers `failed`; both with one line
- * and no notice or `spawn-failed` entry. Any other failure answers `failed`
- * with the spawn-failure notice (and a `spawn-failed` entry at startup).
- *
- * A delete that succeeded or answered `ErrSpawnNotFound` (by name) leaves
- * the persona's row gone, so it ends the persona's kill-failure episode
- * silently with the row-gone reason (b.jg5 SRJ-704, SRJ-1016;
- * `KILL_FAILURE_END_ROW_GONE`) before the chain goes on or stops as above.
- */
-async function tryDelete(
-  key: string,
-  isStartup: boolean,
-  ref: string,
-  lastRead: LatchRowState,
-): Promise<SpawnPersonaResult | undefined> {
-  try {
-    await deleteInstanceRow(key)
-    endKillFailureEpisode(key, KILL_FAILURE_END_ROW_GONE)
-    return undefined
-  } catch (err) {
-    if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) endKillFailureEpisode(key, KILL_FAILURE_END_ROW_GONE)
-    // b.jg5 SRJ-105, SRJ-512: an UNUSABLE NAME delete latches the persona
-    // and stops the chain with no notice and no entry.
-    const latched = await unusableNameAt(key, err, lastRead, 'tryDelete', 'delete', ref)
-    if (latched) return latched
-    // b.jg5 SRJ-105, SRJ-311, SRJ-313, SRJ-316: an UNAVAILABLE, ENVIRONMENT,
-    // CONFIG or UNCLASSIFIED delete (`ErrSystemInstallDisappeared` included)
-    // stops the chain with no notice and no entry.
-    const refused = refusalAt(key, err, 'delete', 'tryDelete', 'delete', ref)
-    if (refused) return refused
-    const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('delete', 'UnknownError', String(err))
-    console.error(`[slack] tryDelete: failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-    if (isStartup) recordStartupError('spawn-failed', `delete failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-    notifySpawnFailure(key, e, isStartup)
-    return { key, action: 'failed' }
-  }
-}
-
-/**
- * Replace the persona's row with a fresh spawn: kill it (when `kill` is set,
- * for a row that may still be live; the bounded retry, `ladderKill`), delete
- * it only after the kill succeeded, spawn fresh
- * and run dialog approval. The collision ladder's kill+delete+fresh paths go
- * through here: `resume_enabled: false`, a row whose `cwd` differs from the
- * working directory (b.av2 SR-6.2), and a row whose `config_dir` label is
- * missing or differs before a resume. `killCall` declares whether the
- * ladder read the row in a live state, which makes the kill tmux-touching
- * (b.jg5 glossary, `AdKillCall`).
- *
- * - A kill whose standing outcome is not a success (b.jg5 SRJ-110, SRJ-701,
- *   SRJ-702; `ladderKillStopped`, `ladderKillStop`) stops the chain: no
- *   delete, no launch. A CONFLICT latches the persona
- *   with the refused operation "P's next check or recovery" and
- *   `opts.lastRead`, and an UNUSABLE NAME with `opts.lastRead` (b.jg5
- *   SRJ-512), each returning `latched`; every other class returns `failed`.
- *   A success (any `kill_sent`) and `ErrSpawnNotFound` go on to the delete.
- * - A failed delete returns `failed` (tryDelete records `spawn-failed` at
- *   startup and raises the spawn-failure notice, but not for a refusal), and
- *   one that answered UNUSABLE NAME returns `latched` the same way.
- * - The fresh spawn's failure takes the plain spawn's handling
- *   (`plainSpawnFailedAt`): cwd errors return `failed` quietly, and so does
- *   a refusal (an ENVIRONMENT, CONFIG or UNCLASSIFIED answer included,
- *   `ErrSystemInstallDisappeared` too, b.jg5 SRJ-313), with one line; a
- *   CONFLICT latches the persona with the refused operation "plain spawn"
- *   and `opts.lastRead`, the row state the ladder read before the kill and
- *   delete, and returns `latched` (b.jg5 SRJ-501, `conflictAt`), and so
- *   does an UNUSABLE NAME answer, with the refused operation "none"
- *   (SRJ-512, `unusableNameAt`); any other error records `spawn-failed` at
- *   startup and raises the spawn-failure notice. An `ErrTmuxSessionCreate`
- *   is one counted launch failure that kills nothing and arms the
- *   persona's retry timer at once in pending-only mode (b.jg5 SRJ-602,
- *   SRJ-713; `launchFailureResult`); no spawn is made in its place.
- * - Success returns `spawned`.
- */
-async function replaceWithFreshSpawn(
-  persona: Persona,
-  params: SpawnParams,
-  isStartup: boolean,
-  ref: string,
-  opts: { kill: boolean; killCall: AdKillCall; lastRead: LatchRowState },
-): Promise<SpawnPersonaResult> {
-  const { key } = persona
-  // b.jg5 SRJ-110, SRJ-701: only a successful kill lets the delete and the
-  // launch follow; any other outcome stops the chain, latching the persona
-  // for a CONFLICT or an UNUSABLE NAME. So does a refused or latching delete.
-  const killStop = opts.kill ? await ladderKill(key, opts.killCall, ref, opts.lastRead) : undefined
-  if (killStop) return killStop
-  const deleteStop = await tryDelete(key, isStartup, ref, opts.lastRead)
-  if (deleteStop) return deleteStop
-
-  try {
-    const launched: Phase1SpawnResult = await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
-    console.error(`[slack] spawnForPersona: fresh-spawned (after ${opts.kill ? 'kill+delete' : 'delete'}) for ${ref}`)
-    afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, launched)
-    return { key, action: 'spawned' }
-  } catch (err) {
-    return plainSpawnFailedAt(key, err, isStartup, ref, 'fresh spawn after delete', opts.lastRead)
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -7894,42 +7650,200 @@ async function noTranscriptReuse(
   }
 }
 
+// ---------------------------------------------------------------------------
+// The replace step (b.jg5 SRJ-707, SRJ-112, SRJ-705, SRJ-706)
+// ---------------------------------------------------------------------------
+
+/**
+ * One run of the collision ladder's get-then-act for a persona
+ * (`ladderGetThenAct`), carried by every step that can enter it again: the
+ * replace step's reuse collision re-runs it once (b.jg5 SRJ-112).
+ */
+interface LadderRun {
+  readonly persona: Persona
+  readonly config: PersonaConfig
+  /** Whether the launch is part of the start pass (startup-errors entries are written only then). */
+  readonly isStartup: boolean
+  readonly ref: string
+  /** The plain spawn's parameters (`buildSpawnParams`), for the retry spawn and the spawn after `resume` found no row. */
+  readonly params: SpawnParams
+  /** The hooks of the `spawnForPersona` call that started the ladder. */
+  readonly hooks: LaunchHooks | undefined
+  /**
+   * True in the one re-run of get-then-act that a reuse collision gives
+   * (b.jg5 SRJ-112): a reuse collision there is the second one, which
+   * re-runs nothing.
+   */
+  readonly reuseCollisionRerun: boolean
+}
+
+/**
+ * Whether the row state a ladder site last read is finished for the replace
+ * step: `ended`, `missing` or no row. Every other state is live, `pending`
+ * and an unreadable state included (b.jg5 SRJ-707, SRJ-705).
+ */
+function lastReadIsFinished(lastRead: LatchRowState): boolean {
+  if (lastRead.kind === LATCH_ROW_STATE_KIND_NO_ROW) return true
+  return lastRead.kind === LATCH_ROW_STATE_KIND_READ && AGENT_DIRECTOR_DEAD_STATES.has(lastRead.state)
+}
+
+/** The live-row sequence's seed state for a live row last read as `lastRead` (an unreadable state is seeded as such, a live state CSCB does not know). */
+function sequenceSeedState(lastRead: LatchRowState): string {
+  return lastRead.kind === LATCH_ROW_STATE_KIND_READ ? lastRead.state : LATCH_ROW_STATE_KIND_UNREADABLE
+}
+
+/**
+ * The replace step (b.jg5 SRJ-707, SRJ-1503, SRJ-1504): replace persona P's
+ * row `cscb_<key>` at a collision ladder site whose row cannot be kept
+ * (`replacing` says why: `resume_enabled` false, a `cwd` mismatch, a
+ * `config_dir` label missing or different), deciding on `lastRead`, the row state the site last
+ * read:
+ *   - finished (`ended`, `missing` or no row): one reuse spawn of the same id
+ *     (`reuseSpawnForPersona`, SRJ-112), through the finished-row branch
+ *     (`reuseFinishedRow`), whose collision re-runs get-then-act once;
+ *   - live (every other state, `pending` and an unreadable state included):
+ *     the live-row sequence (SRJ-705), started through the start entry
+ *     (`startLiveRowSequence`) with the state last read as its seed, entry
+ *     at step 1, the conversation not kept, the key not retired, ending in
+ *     a launch, alert context `recovery`; the sequence decides its step-6
+ *     launch itself, a reuse spawn of the same id for each of these reasons.
+ *     No other call is made, and the answer is `sequence-waiting` whatever
+ *     the start entry answers (`started`, `already-running`, `closed`,
+ *     `not-installed`), each with its own line from the start entry or the
+ *     registry; nothing is counted (SRJ-706, SRJ-1015).
+ * The step never deletes, never kills and never launches over a live row.
+ * Never throws.
+ */
+async function replacePersonaRow(run: LadderRun, lastRead: LatchRowState, replacing: string): Promise<SpawnPersonaResult> {
+  const { persona, config, isStartup, ref } = run
+  const { key } = persona
+  if (lastReadIsFinished(lastRead)) {
+    console.error(
+      `[slack] spawnForPersona: replacing the row of ${ref} (${replacing}; last read ${describeLatchRowState(lastRead)}): a reuse spawn of the same id; nothing is deleted (b.jg5 SRJ-707)`,
+    )
+    return reuseFinishedRow(run, REUSE_SPAWN_WHAT, () =>
+      reuseSpawnForPersona(persona, config, { isStartup, lastRead, trustPatchRan: true }),
+    )
+  }
+  const startAnswer = startLiveRowSequence({
+    key,
+    ref,
+    instanceId: personaInstanceId(key),
+    lastReadState: sequenceSeedState(lastRead),
+    entryStep: LIVE_ROW_SEQUENCE_ENTRY_KILL,
+    keepsConversation: false,
+    retiredKey: false,
+    launches: true,
+    alertContext: KILL_FAILURE_CONTEXT_RECOVERY,
+  })
+  console.error(
+    `[slack] spawnForPersona: replacing the row of ${ref} (${replacing}; last read ${describeLatchRowState(lastRead)}): a live row goes through the live-row sequence first, which ends in a reuse spawn of the same id; start answered ${startAnswer} — answering sequence-waiting; no other call, nothing counted (b.jg5 SRJ-707, SRJ-705, SRJ-706)`,
+  )
+  return { key, action: 'sequence-waiting' }
+}
+
+/**
+ * The replace step's finished-row branch (b.jg5 SRJ-707, SRJ-112): `reuse`
+ * makes the one reuse spawn of persona `run.persona`'s id (the replace
+ * step's, or the no-transcript step's after a `resume`, `noTranscriptReuse`;
+ * `what` names it in the lines), and its answer is the result, except a
+ * collision (`ErrInstanceIdCollision`: the row turned live), which launched
+ * nothing:
+ *   - the first collision re-runs get-then-act once (`ladderGetThenAct`,
+ *     marked as the re-run): its collision `get` reads the row and its
+ *     branches decide again;
+ *   - a collision in that re-run (any second collision) makes no further
+ *     call, arms the persona's retry timer with the reuse-collision cause
+ *     (`reportReuseCollisionAtSite`, so the attempt records it) and answers
+ *     the uncounted refused result: `failed` marked `refused`, no notice, no
+ *     `spawn-failed` entry, nothing counted (SRJ-112, SRJ-301).
+ * Never throws.
+ */
+async function reuseFinishedRow(
+  run: LadderRun,
+  what: string,
+  reuse: () => Promise<ReuseSpawnResult>,
+): Promise<SpawnPersonaResult> {
+  const { key } = run.persona
+  const { ref } = run
+  const reused = await reuse()
+  if (!isReuseSpawnCollided(reused)) return reused
+  if (!run.reuseCollisionRerun) {
+    console.error(
+      `[slack] spawnForPersona: the ${what} of ${ref} collided with a live row — nothing launched; re-running get-then-act once (b.jg5 SRJ-112)`,
+    )
+    return ladderGetThenAct({ ...run, reuseCollisionRerun: true })
+  }
+  // b.jg5 SRJ-112, SRJ-301: a second collision; P is re-evaluated at its
+  // next tick or retry, so its retry timer is armed with the reuse-collision cause.
+  const armed = reportReuseCollisionAtSite(key)
+  console.error(
+    `[slack] spawnForPersona: the ${what} of ${ref} collided with a live row again, in the re-run of get-then-act — nothing launched; answering the uncounted refused result, no spawn-failure notice, nothing counted; the retry timer ${armed ? 'is armed' : 'could not be armed'} (cause=${UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION}; b.jg5 SRJ-112)`,
+  )
+  return { key, action: 'failed', refused: true }
+}
+
 /**
  * Recover a collided spawn whose live session cannot be reached: resume-first
  * (preserves session history) when resume_enabled, with these fallbacks:
  * ErrNoSessionId / ErrJsonlMissing / ErrJsonlNeverWritten (by name) → the
  * no-transcript step (`noTranscriptReuse`, b.jg5 SRJ-707, SRJ-712): after
  * ErrJsonlMissing the lost-transcript diagnosis, then one reuse spawn of the
- * same id, with nothing deleted; ErrSpawnNotResumable → kill + delete +
- * fresh; ErrSpawnNotFound → fresh, no delete since the row is already gone.
+ * same id through the replace step's finished-row branch
+ * (`reuseFinishedRow`), with nothing deleted; ErrSpawnNotResumable → a lost
+ * race (below); ErrSpawnNotFound → a plain spawn, since the row is gone.
  * A resume's ErrTmuxSessionCreate has
  * no fallback: it is one counted launch failure through `resumeFailedAt`
  * (b.jg5 SRJ-113, SRJ-602), which kills nothing, makes no spawn in its
  * place and arms the persona's retry timer at once in pending-only mode, so
- * that the retry's read of the row decides (SRJ-409; HO rev 28). Every other
- * spawn here is a plain spawn from `buildSpawnParams` (no reuse flag, b.jg5
- * SRJ-711) whose failure takes the plain spawn's handling
+ * that the retry's read of the row decides (SRJ-409; HO rev 28). The spawn
+ * after ErrSpawnNotFound is a plain spawn from `buildSpawnParams` (no reuse
+ * flag, b.jg5 SRJ-711) whose failure takes the plain spawn's handling
  * (`plainSpawnFailedAt`), its `ErrTmuxSessionCreate` counted the same way.
  *
+ * `opts.lastRead` is the row state the caller last read, which the replace
+ * step decides on (b.jg5 SRJ-707): the `ended`/`missing` branch's collision
+ * `get` (a finished row); a dead-session path's (`reconcileMissingFirst`)
+ * collision `get` or working-row wait's last read, a live row unless that
+ * wait read it finished or gone; the prompt-row recovery's re-read, which
+ * read it finished.
+ *
  * The no-transcript step's reuse spawn has SRJ-112's outcomes
- * (`reuseSpawnFailedAt`). Its collision (`ErrInstanceIdCollision`: the row
- * is live again) ends the ladder with the uncounted refused result (`failed`
- * marked `refused`): nothing counted, no notice, and the persona's retry
- * timer armed with the reuse-collision cause (`reportReuseCollisionAtSite`).
+ * (`reuseSpawnFailedAt`); its collision (`ErrInstanceIdCollision`: the row
+ * is live again) takes the finished-row branch's one get-then-act re-run,
+ * and a second collision arms the reuse-collision cause and answers the
+ * uncounted refused result (`reuseFinishedRow`).
  * This is the `ended`/`missing` state handling, extracted so the
  * b.3ce dead-session fallback in the `waiting`/`working` branches reuses the
  * exact same decision logic instead of inventing its own.
  *
- * b.av2 SR-6.2 `config_dir` guard: before the `resume` call (after the
- * reconcile-missing-first sweep), the row's `config_dir` label — captured by
- * the collision `get` when the ladder started — is compared with the
- * persona's current effective claude_config_dir through
- * `compareRowToPersona`. A resume keeps the old `CLAUDE_CONFIG_DIR`, so a
- * missing or different label means no resume: kill (on the dead-session
- * paths, whose row may still be live), delete and spawn fresh, outcome
- * `spawned`. No transcript was lost (it stays in the old directory), so no
- * JSONL diagnosis or amnesia action runs. `resume_enabled: false` never
- * reaches the guard: it already kills, deletes and spawns fresh.
+ * `resume_enabled: false` (b.jg5 SRJ-707): the row is not resumed; the
+ * replace step replaces it, a finished row by a reuse spawn of the same id
+ * and a live row through the live-row sequence first, nothing deleted.
+ *
+ * b.av2 SR-6.2 `config_dir` guard, as amended (b.jg5 SRJ-1504): before the
+ * `resume` call (after the reconcile-missing-first sweep), the row's
+ * `config_dir` label — captured by the collision `get` when the ladder
+ * started — is compared with the persona's current effective
+ * claude_config_dir through `compareRowToPersona`. On a mismatch or a
+ * missing label it does not resume, because agent-director's `ResumeParams`
+ * carries only the instance ID and a resume keeps the old
+ * `CLAUDE_CONFIG_DIR`: a live row goes through the live-row sequence, then a
+ * reuse spawn of the same id (a new life); a finished row gets that reuse
+ * spawn directly; no row is deleted (the replace step). The old history
+ * stays in the old directory, archived to the earlier life. No transcript
+ * was lost, so no JSONL diagnosis or amnesia action runs. A directory that
+ * cannot be resolved keeps the row and answers `deferred` with no call (bug
+ * b.g57).
+ *
+ * b.jg5 SRJ-710: `ErrSpawnNotResumable` is never by itself a reason to kill
+ * and replace, and it is no reuse site: it is a lost race. Nothing is
+ * killed, deleted or launched, nothing is counted or posted, the persona's
+ * retry timer is armed with the lost-race cause
+ * (`reportLostRaceAtSite`, `UNAVAILABLE_RETRY_CAUSE_LOST_RACE`), and the
+ * answer is the uncounted refused result, so the persona is re-evaluated at
+ * its next tick or retry. E23 adds the row's re-read with `get`, its
+ * `pending` rule and the live-row sequence on dead evidence.
  *
  * b.jg5 SRJ-104: a `resume` that answers `ErrInvalidFlags` goes through the
  * `ErrInvalidFlags` step (`classifyWithInvalidFlagsRecheck`): one immediate
@@ -7950,43 +7864,34 @@ async function noTranscriptReuse(
  *
  * b.jg5 SRJ-501, SRJ-113, SRJ-111: a CONFLICT at the resume, or at any
  * spawn after it, latches the persona (`conflictAt`), with the refused
- * operation "resume", "plain spawn" or, at the no-transcript step's reuse,
- * "reuse spawn", and the row state the path last read
- * before that call: `opts.lastRead` (the caller's last read: the collision
- * `get`'s state, the working-row wait's last `status`, or the prompt row's
- * re-read), or, for the reuse after `ErrJsonlMissing`, what its diagnosis
- * `get` read. It answers `latched`: nothing is killed, deleted or launched
- * after it. An UNUSABLE NAME answer at the resume, at any spawn after it, or
- * at a kill or delete of its delete-then-spawn chains latches the persona
- * the same way, with the refused operation "none" (b.jg5 SRJ-512,
- * `unusableNameAt`).
+ * operation "resume", "plain spawn" or, at a reuse spawn, "reuse spawn", and
+ * the row state the path last read before that call: `opts.lastRead` (the
+ * caller's last read: the collision `get`'s state, the working-row wait's
+ * last `status`, or the prompt row's re-read), or, for the reuse after
+ * `ErrJsonlMissing`, what its diagnosis `get` read. It answers `latched`:
+ * nothing is killed, deleted or launched after it. An UNUSABLE NAME answer
+ * at the resume or at any spawn after it latches the persona the same way,
+ * with the refused operation "none" (b.jg5 SRJ-512, `unusableNameAt`).
  *
  * b.jg5 SRJ-120, SRJ-502: with `reconcileMissingFirst`, a persona latched
  * once the findMissing sweep is done (a post-run `get` of its own row read
  * the latching note, or the latch answers it latched) answers `latched` with
- * one line and no `resume`, kill, delete or spawn.
+ * one line and no `resume`, sequence or spawn.
  *
  * @param row  The row returned by the collision `get` (its `labels`).
  */
 async function resumeOrFreshSpawn(
-  persona: Persona,
-  params: SpawnParams,
-  config: PersonaConfig,
-  isStartup: boolean,
+  run: LadderRun,
   row: Pick<GetResult, 'cwd' | 'labels'>,
   opts: { reconcileMissingFirst?: boolean; lastRead: LatchRowState },
 ): Promise<SpawnPersonaResult> {
+  const { persona, params, config, isStartup, ref } = run
   const { key } = persona
-  const ref = personaRef(persona)
   const { lastRead } = opts
-  // The dead-session callers (reconcileMissingFirst) read the row `waiting`
-  // or `working`, a live state; the other callers read it `ended` or
-  // `missing`. A kill below declares which (b.jg5 glossary), except the
-  // ErrSpawnNotResumable kill, whose row agent-director has just called live.
-  const killCall = adKillCall(opts.reconcileMissingFirst === true)
   if (config.resume_enabled === false) {
-    console.error(`[slack] spawnForPersona: resume_enabled=false — kill+delete+fresh for ${ref}`)
-    return replaceWithFreshSpawn(persona, params, isStartup, ref, { kill: true, killCall, lastRead })
+    // b.jg5 SRJ-707: no resume; the replace step decides on the state last read.
+    console.error(`[slack] spawnForPersona: resume_enabled=false for ${ref} — not resuming; replacing its row by a reuse spawn of the same id`)
+    return replacePersonaRow(run, lastRead, 'resume_enabled is false')
   }
 
   // b.4dk: dead-session callers (state=waiting/working with a verified-dead
@@ -8001,10 +7906,10 @@ async function resumeOrFreshSpawn(
   // ErrConfigMalformed, SRJ-316, or UNCLASSIFIED, SRJ-313), or a refused
   // post-run `get` of the persona's own row (SRJ-114), stops the attempt
   // before the resume: a resume of the still-live row would answer
-  // ErrSpawnNotResumable, whose branch kills, deletes and spawns fresh. The ladder answers failed, and markRefusal adds
-  // `refused`. On any other findMissing error, fall through to attempting
-  // resume anyway (the ErrSpawnNotResumable → kill+delete+fresh branch is the
-  // fallback). Prefer AD's findMissing verb over CSCB-side tmux probing per
+  // ErrSpawnNotResumable, a lost race. The ladder answers failed, and
+  // markRefusal adds `refused`. On any other findMissing error, fall through
+  // to attempting resume anyway (an ErrSpawnNotResumable then is the lost
+  // race below). Prefer AD's findMissing verb over CSCB-side tmux probing per
   // docs/engineering-guide.md ("Avoiding Duplicated Effort").
   if (opts.reconcileMissingFirst) {
     const sweep = await reconcileMissingSweep(key, 'spawnForPersona: before resume', ref)
@@ -8012,7 +7917,7 @@ async function resumeOrFreshSpawn(
     if (sweep === FIND_MISSING_LATCHED) {
       // b.jg5 SRJ-120, SRJ-502: the persona latched during the sweep (a
       // post-run `get` of its row read the latching note, or the latch
-      // answers it latched): no resume, kill, delete or spawn follows.
+      // answers it latched): no resume, sequence or spawn follows.
       console.error(
         `[slack] spawnForPersona: ${ref} is latched after the findMissing sweep before resume — not resuming; nothing more is called for it (b.jg5 SRJ-502)`,
       )
@@ -8020,30 +7925,14 @@ async function resumeOrFreshSpawn(
     }
   }
 
-  // b.av2 SR-6.2: a resume keeps the row's old CLAUDE_CONFIG_DIR, so resume
-  // only a row labelled with the persona's current effective config dir.
+  // b.av2 SR-6.2 (b.jg5 SRJ-1504): a resume keeps the row's old
+  // CLAUDE_CONFIG_DIR, so resume only a row labelled with the persona's
+  // current effective config dir.
   const configDir = compareRowToPersona(row, persona, spawnHomeDir(), undefined, _configDirFs)
-  if (!configDir.configDirResolved) {
-    // Bug b.g57: the directory stopped resolving since this ladder's
-    // pre-launch check. No verdict, so no replacement: keep the row and
-    // launch nothing; the hold re-checks and launches once it resolves.
-    const deferred = deferIfConfigDirUnresolvable(persona)
-    if (deferred !== undefined) return deferred
-    // It resolved again between the comparison and the re-check: nothing
-    // holds it, and its next restart or health tick launches it.
-    console.error(
-      `[slack] spawnForPersona: ${ref} claude_config_dir could not be resolved during the launch — keeping its row; not launching`,
-    )
-    return { key, action: 'deferred' }
-  }
+  if (!configDir.configDirResolved) return deferForUnresolvedConfigDir(persona, ref)
   if (!configDir.configDirMatches) {
-    const was = configDir.configDirLabel === undefined ? 'label absent' : `was=${configDir.configDirLabel}`
-    console.error(
-      `[slack] spawnForPersona: ${ref} config_dir label ${configDir.configDirLabel === undefined ? 'missing' : 'changed'} ` +
-        `(${was}, now=${configDir.expectedConfigDirLabel} for claude_config_dir=${persona.claude_config_dir ?? '<default>'}) — ` +
-        `not resuming; spawning fresh`,
-    )
-    return replaceWithFreshSpawn(persona, params, isStartup, ref, { kill: killCall.rowReadLive, killCall, lastRead })
+    console.error(`[slack] spawnForPersona: ${configDirMismatchText(persona, ref, configDir)} — not resuming; replacing its row by a reuse spawn of the same id`)
+    return replacePersonaRow(run, lastRead, CONFIG_DIR_MISMATCH_WHY)
   }
 
   // resume_enabled: attempt resume
@@ -8062,54 +7951,25 @@ async function resumeOrFreshSpawn(
       console.error(
         `[slack] spawnForPersona: ${describeAgentDirectorFailure(err)} on resume for ${ref} — a reuse spawn of the same id follows; nothing is deleted (b.jg5 SRJ-707)`,
       )
-      // b.jg5 SRJ-707, SRJ-712: the no-transcript step. After ErrJsonlMissing
-      // the lost-transcript diagnosis runs first; a refused diagnosis get
-      // ends the ladder with no launch (`failed`, which markRefusal marks
-      // `refused`), and one that latched the persona answers `latched`
-      // (b.jg5 SRJ-105, SRJ-502). ErrNoSessionId and ErrJsonlNeverWritten lost
-      // no history, so they get no diagnosis and a success answers `spawned`.
-      // The reuse spawn's outcomes are SRJ-112's: a CONFLICT latches with the
-      // refused operation "reuse spawn" (b.jg5 SRJ-501).
-      const reused = await noTranscriptReuse(persona, config, err, { isStartup, lastRead, trustPatchRan: true })
-      if (!isReuseSpawnCollided(reused)) return reused
-      // b.jg5 SRJ-112, SRJ-301: the row is live again, so the reuse launched
-      // nothing. The attempt ends with the uncounted refused result, nothing
-      // posted, and the persona's retry timer armed with the reuse-collision
-      // cause, so its retry runs the restart path's decision on the row.
-      const armed = reportReuseCollisionAtSite(key)
-      console.error(
-        `[slack] spawnForPersona: the reuse spawn of ${ref} after its resume's no-transcript answer collided with a live row — nothing launched; answering the uncounted refused result, no spawn-failure notice, nothing counted; the retry timer ${armed ? 'is armed' : 'could not be armed'} (cause=${UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION}; b.jg5 SRJ-112)`,
+      // b.jg5 SRJ-707, SRJ-712: the no-transcript step, through the replace
+      // step's finished-row branch (the row `resume` refused is finished).
+      // After ErrJsonlMissing the lost-transcript diagnosis runs first; a
+      // refused diagnosis get ends the ladder with no launch (`failed`, which
+      // markRefusal marks `refused`), and one that latched the persona
+      // answers `latched` (b.jg5 SRJ-105, SRJ-502). ErrNoSessionId and
+      // ErrJsonlNeverWritten lost no history, so they get no diagnosis and a
+      // success answers `spawned`. The reuse spawn's outcomes are SRJ-112's:
+      // a CONFLICT latches with the refused operation "reuse spawn" (b.jg5
+      // SRJ-501); a collision re-runs get-then-act once.
+      return reuseFinishedRow(run, `${REUSE_SPAWN_WHAT} after its resume's no-transcript answer`, () =>
+        noTranscriptReuse(persona, config, err, { isStartup, lastRead, trustPatchRan: true }),
       )
-      return { key, action: 'failed', refused: true }
     }
-    if (err instanceof ErrSpawnNotResumable) {
-      // Row is non-terminal but resume rejected — defensive: kill + delete + spawn
-      console.error(`[slack] spawnForPersona: ErrSpawnNotResumable for ${ref} — kill+delete+fresh`)
-      // b.jg5 glossary: agent-director has just answered that this row is not
-      // terminal, so this kill is declared a kill of a row read live
-      // (tmux-touching), whichever state the ladder read before. E23
-      // (SRJ-710) owns what an ErrSpawnNotResumable means here.
-      // b.jg5 SRJ-110, SRJ-701: only a successful kill lets the delete and
-      // the launch follow; any other outcome stops the chain, latching the
-      // persona for a CONFLICT or an UNUSABLE NAME. So does a refused or
-      // latching delete.
-      const killStop = await ladderKill(key, AD_CALL_KILL_ROW_READ_LIVE, ref, lastRead)
-      if (killStop) return killStop
-      const deleteStop = await tryDelete(key, isStartup, ref, lastRead)
-      if (deleteStop) return deleteStop
-      try {
-        const launched: Phase1SpawnResult = await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
-        afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, launched)
-        return { key, action: 'spawned' }
-      } catch (err2) {
-        return plainSpawnFailedAt(key, err2, isStartup, ref, 'fresh spawn', lastRead)
-      }
-    }
+    if (hasAdErrorName(err, ERR_SPAWN_NOT_RESUMABLE_NAME)) return spawnNotResumableLostRace(key, ref, err)
     if (err instanceof ErrSpawnNotFound) {
       // Row vanished between the dead-session verdict and resume (operator
-      // delete, expire, race) — fresh-spawn directly, no delete: the row is
-      // already gone and a delete of a missing row would throw and turn
-      // recovery into action: 'failed'. Mirrors the caller-level retry below.
+      // action, expire, race) — a plain spawn: the row is already gone.
+      // Mirrors the caller-level retry below.
       console.error(`[slack] spawnForPersona: ErrSpawnNotFound on resume for ${ref} — fresh-spawn`)
       try {
         const launched: Phase1SpawnResult = await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
@@ -8123,6 +7983,57 @@ async function resumeOrFreshSpawn(
     }
     return resumeFailedAt(key, err, isStartup, ref, lastRead)
   }
+}
+
+/** The replace step's reason for a `config_dir` label missing or different (b.jg5 SRJ-707, SRJ-1504). */
+const CONFIG_DIR_MISMATCH_WHY = 'its config_dir label is missing or differs'
+
+/** The replace step's reason for a row whose `cwd` differs from the persona's working directory by real path (b.jg5 SRJ-707, SRJ-1503). */
+const CWD_MISMATCH_WHY = "its cwd differs from the persona's working directory"
+
+/** The words of a `config_dir` mismatch line: the label missing or changed, what it was and what it is now. */
+function configDirMismatchText(persona: Persona, ref: string, configDir: RowPersonaComparison): string {
+  const was = configDir.configDirLabel === undefined ? 'label absent' : `was=${configDir.configDirLabel}`
+  return (
+    `${ref} config_dir label ${configDir.configDirLabel === undefined ? 'missing' : 'changed'} ` +
+    `(${was}, now=${configDir.expectedConfigDirLabel} for claude_config_dir=${persona.claude_config_dir ?? '<default>'})`
+  )
+}
+
+/**
+ * Bug b.g57: the persona's claude_config_dir stopped resolving since this
+ * ladder's pre-launch check, so a row's `config_dir` label has no verdict and
+ * is no reason to replace it: the row is kept and nothing is launched; the
+ * hold re-checks and launches once it resolves (`deferred`). Never throws.
+ */
+function deferForUnresolvedConfigDir(persona: Persona, ref: string): SpawnPersonaResult {
+  const deferred = deferIfConfigDirUnresolvable(persona)
+  if (deferred !== undefined) return deferred
+  // It resolved again between the comparison and the re-check: nothing
+  // holds it, and its next restart or health tick launches it.
+  console.error(
+    `[slack] spawnForPersona: ${ref} claude_config_dir could not be resolved during the launch — keeping its row; not launching`,
+  )
+  return { key: persona.key, action: 'deferred' }
+}
+
+/**
+ * `resume`'s `ErrSpawnNotResumable` at the collision ladder (b.jg5 SRJ-710,
+ * SRJ-707, SRJ-301): never by itself a reason to kill and replace, and no
+ * reuse site, so a lost race: one line, no kill, delete or launch, the
+ * persona's retry timer armed with the lost-race cause through the outage
+ * state's site entry (`reportLostRaceAtSite`; the attempt records it), and
+ * the uncounted refused result (`failed` marked `refused`): no notice, no
+ * `spawn-failed` entry, nothing counted. The persona is re-evaluated at its
+ * next tick or retry. E23 adds the `get` re-read, its `pending` rule and the
+ * live-row sequence on dead evidence (SRJ-710, SRJ-611). Never throws.
+ */
+function spawnNotResumableLostRace(key: string, ref: string, err: unknown): SpawnPersonaResult {
+  const armed = reportLostRaceAtSite(key)
+  console.error(
+    `[slack] spawnForPersona: ${describeAgentDirectorFailure(err)} on resume for ${ref} — a lost race: nothing killed, deleted or launched; answering the uncounted refused result, no spawn-failure notice, nothing counted; the retry timer ${armed ? 'is armed' : 'could not be armed'} (cause=${UNAVAILABLE_RETRY_CAUSE_LOST_RACE}; b.jg5 SRJ-710)`,
+  )
+  return { key, action: 'failed', refused: true }
 }
 
 /**
@@ -8556,7 +8467,7 @@ export function _resetDialogApprovers(): void {
 
 /** The launches whose success runs the after-launch step, as the `pre_trust` line names them. */
 export type LaunchVerb = typeof LAUNCH_VERB_SPAWN | typeof LAUNCH_VERB_RESUME | typeof LAUNCH_VERB_REUSE_SPAWN
-/** A plain spawn (a first, retry or replacement spawn, or the spawn after `resume` found no row). */
+/** A plain spawn (a first or retry spawn, or the spawn after `resume` found no row). */
 export const LAUNCH_VERB_SPAWN = 'spawn'
 /** A `resume`. */
 export const LAUNCH_VERB_RESUME = 'resume'
@@ -8696,23 +8607,33 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *    - the note check comes first, before the guards and the state branches:
  *      a read that latched the persona (its own row carries the
  *      `provenance_conflict` note and it is configured) answers `latched` at
- *      once, whatever the row's state, `cwd` or `config_dir` label: no kill,
- *      delete, wait, sweep, reconnect or launch, no notice, nothing counted
+ *      once, whatever the row's state, `cwd` or `config_dir` label: no wait,
+ *      sweep, reconnect, sequence or launch, no notice, nothing counted
  *      (b.jg5 SRJ-501, SRJ-502). Any other note, or none, goes on below.
  *      `ErrSpawnNotFound` retries the plain spawn once; any other error takes
  *      the refusal row (`refusalAt`);
  *    - the row's `cwd` differs from the persona's working_directory by real
- *      path (`compareRowToPersona`) → kill + delete + fresh spawn, whatever
- *      the state and resume_enabled (b.av2 SR-6.2). When the working directory
+ *      path (`compareRowToPersona`) → the replace step, whatever the state
+ *      and resume_enabled (b.av2 SR-6.2 as amended, b.jg5 SRJ-1503: "An
+ *      existing row whose `cwd` differs from the persona's working
+ *      directory, by real path, is replaced on every ladder path with no row
+ *      deleted: a live row goes through the live-row sequence (b.jg5
+ *      SRJ-705), then a reuse spawn; a finished row gets a reuse spawn (b.jg5
+ *      SRJ-707)."). When the working directory
  *      cannot be resolved to a real path at that moment and the row's `cwd`
  *      has none either (`cwdCheckDeferred`), the row is kept instead: no
- *      kill, no delete, `cwd-unreachable` raised and `failed` returned
+ *      replacement, `cwd-unreachable` raised and `failed` returned
  *      (b.av2 SR-6.4). Otherwise branch on state:
  *    - ended/missing + resume_enabled → resume; on ErrNoSessionId/
  *      ErrJsonlMissing/ErrJsonlNeverWritten → the no-transcript step: after
  *      ErrJsonlMissing the lost-transcript diagnosis, then one reuse spawn
- *      of the same id; nothing is deleted (`noTranscriptReuse`).
- *    - ended/missing + !resume_enabled → kill + delete + fresh spawn.
+ *      of the same id through the replace step's finished-row branch;
+ *      nothing is deleted (`noTranscriptReuse`, `reuseFinishedRow`); on
+ *      ErrSpawnNotResumable → a lost race (b.jg5 SRJ-710): nothing killed,
+ *      deleted or launched, the retry timer armed with the lost-race cause,
+ *      the uncounted refused result.
+ *    - ended/missing + !resume_enabled → the replace step: a reuse spawn of
+ *      the same id.
  *    - waiting → the reconnect (`reconnectMcpWithCause`, one `send-keys`,
  *      b.jg5 SRJ-118); 'dead-session', whatever its cause → the find-missing
  *      run, then resume/fresh-spawn (b.3ce), whose resume or spawn decides
@@ -8734,11 +8655,22 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *      re-read, and a row now `ended` or `missing` → resume/fresh-spawn
  *      (otherwise no-op); CONFLICT or UNUSABLE NAME (the reader latched the
  *      persona) → `latched`.
- *    - pending → no-op.
+ *    - pending → no-op when its `config_dir` label matches; a label missing
+ *      or different (b.jg5 SRJ-411, SRJ-707) means the row is not covered,
+ *      and the replace step sends it through the live-row sequence.
  *    Every resume first checks the row's `config_dir` label; a missing or
- *    different label means delete + fresh spawn instead (resumeOrFreshSpawn).
+ *    different label means the replace step instead (resumeOrFreshSpawn;
+ *    b.av2 SR-6.2 as amended, b.jg5 SRJ-1504).
  *    A directory that stopped resolving since step 2 keeps the row and
  *    returns `deferred` instead.
+ *    The replace step (`replacePersonaRow`, b.jg5 SRJ-707) decides on the
+ *    row state the path last read: `ended`, `missing` or no row → one reuse
+ *    spawn of the same id (`reuseSpawnForPersona`); its collision re-runs
+ *    this step 5 once, and a second collision arms the reuse-collision
+ *    cause and answers the uncounted refused result; any live state,
+ *    `pending` included → the live-row sequence is started (SRJ-705,
+ *    SRJ-706) and the launch answers `sequence-waiting` with no other call.
+ *    Nothing in step 5 deletes or kills a row.
  * 6. A CONFLICT at any spawn or resume above latches the persona and
  *    answers `latched` (b.jg5 SRJ-501, `conflictAt`); other errors → surface
  *    to Slack + (when isStartup) startup-errors.log, except a refusal. An
@@ -8959,20 +8891,34 @@ async function runPersonaLadder(
     }
   }
 
+  return ladderGetThenAct({ persona, config, isStartup, ref, params, hooks, reuseCollisionRerun: false })
+}
+
+/**
+ * The collision ladder's get-then-act (b.jg5 SRJ-114, SRJ-112): the
+ * collision `get`, then the `cwd` guard and the state branches, as
+ * `spawnForPersona`'s step 5 lists them. Entered once after the first
+ * spawn's collision, and once more when a reuse spawn of the replace step's
+ * finished-row branch collides (`run.reuseCollisionRerun`, `reuseFinishedRow`).
+ * Never throws.
+ */
+async function ladderGetThenAct(run: LadderRun): Promise<SpawnPersonaResult> {
+  const { persona, config, isStartup, ref, params, hooks } = run
+  const { key } = persona
   // Collision-handling: get-then-act ---
   // b.jg5 SRJ-114: the collision `get` is the shared own-row read. A read
   // that latched the persona (its own row reading `pending` with no launch
   // start, b.jg5 SRJ-513, whatever its `cwd`, or a `provenance_conflict`
   // note on it) ends the ladder here, before the `cwd` and `config_dir` guards and the
-  // state branches: no kill, delete, wait, sweep, reconnect or launch, no
+  // state branches: no wait, sweep, reconnect, sequence or launch, no
   // notice, nothing counted (b.jg5 SRJ-501, SRJ-502).
   const collisionRead = await readPersonaOwnRow(key, { site: 'spawnForPersona', what: 'collision get', ref })
   // b.jg5 SRJ-105, SRJ-512: an UNUSABLE NAME answer latched the persona: no
-  // retry spawn, kill, delete or launch, no notice, nothing counted.
+  // retry spawn, sequence or launch, no notice, nothing counted.
   if (collisionRead.kind === OWN_ROW_READ_LATCHED) return { key, action: 'latched' }
   // b.jg5 SRJ-502: the get is awaited, and the persona may have latched
   // elsewhere meanwhile (the health tick's liveness read, SRJ-315): no retry
-  // spawn, kill, delete, wait, resume or launch follows.
+  // spawn, wait, resume, sequence or launch follows.
   if (latchedAfterOwnRowRead(key, 'spawnForPersona', 'collision get', ref)) return { key, action: 'latched' }
   if (collisionRead.kind !== OWN_ROW_READ_ROW) {
     if (collisionRead.kind === OWN_ROW_READ_ABSENT) {
@@ -9009,9 +8955,11 @@ async function runPersonaLadder(
   // read replaces it (the working-row wait's, the prompt row's re-read).
   const lastRead = latchRowStateRead(state)
 
-  // b.av2 SR-6.2: a row in another directory (by real path) is never resumed,
-  // reconnected or waited on, whatever its state and resume_enabled: kill,
-  // delete and spawn fresh in the persona's working directory.
+  // b.av2 SR-6.2 as amended (b.jg5 SRJ-1503): a row in another directory (by
+  // real path) is never resumed, reconnected or waited on, whatever its state
+  // and resume_enabled: it is replaced with no row deleted, a live row
+  // through the live-row sequence, then a reuse spawn; a finished row by a
+  // reuse spawn (the replace step, b.jg5 SRJ-707).
   const comparison = compareRowToPersona(row, persona, spawnHomeDir())
   if (!comparison.cwdMatches) {
     if (comparison.cwdCheckDeferred) {
@@ -9029,17 +8977,13 @@ async function runPersonaLadder(
       return { key, action: 'failed' }
     }
     console.error(
-      `[slack] spawnForPersona: ${ref} row cwd=${row.cwd || '<none>'} differs from working_directory=${persona.working_directory} (state=${state}) — replacing the row: kill+delete+fresh`,
+      `[slack] spawnForPersona: ${ref} row cwd=${row.cwd || '<none>'} differs from working_directory=${persona.working_directory} (state=${state}) — replacing the row by a reuse spawn of the same id; nothing is deleted`,
     )
-    return replaceWithFreshSpawn(persona, params, isStartup, ref, {
-      kill: true,
-      killCall: adKillCall(AGENT_DIRECTOR_LIVE_STATES.has(state)),
-      lastRead,
-    })
+    return replacePersonaRow(run, lastRead, CWD_MISMATCH_WHY)
   }
 
   if (state === 'ended' || state === 'missing') {
-    return resumeOrFreshSpawn(persona, params, config, isStartup, row, { lastRead })
+    return resumeOrFreshSpawn(run, row, { lastRead })
   }
 
   if (state === 'waiting') {
@@ -9053,7 +8997,7 @@ async function runPersonaLadder(
     const result = await reconnectMcpWithCause(key, lastRead, ref)
     if (result.outcome === 'dead-session') {
       console.error(`[slack] spawnForPersona: dead session for ${ref} (state=waiting) — recovering via resume/fresh-spawn`)
-      return resumeOrFreshSpawn(persona, params, config, isStartup, row, { reconcileMissingFirst: true, lastRead })
+      return resumeOrFreshSpawn(run, row, { reconcileMissingFirst: true, lastRead })
     }
     if (result.outcome === 'transient') return transientReconnectResult(key, ref, state, result)
     return { key, action: 'reconnected' }
@@ -9084,7 +9028,7 @@ async function runPersonaLadder(
     if (stopping) return { key, action: 'failed', stopping: true }
     if (outcome === 'dead-session') {
       console.error(`[slack] spawnForPersona: dead session for ${ref} (state=working) — recovering via resume/fresh-spawn`)
-      return resumeOrFreshSpawn(persona, params, config, isStartup, row, {
+      return resumeOrFreshSpawn(run, row, {
         reconcileMissingFirst: true,
         lastRead: waitRead ?? lastRead,
       })
@@ -9102,12 +9046,24 @@ async function runPersonaLadder(
 
   if (PROMPT_ROW_STATES.has(state)) {
     // b.jdc: never typed into (b.rmy), but its session may be gone.
-    return launchOnPromptRow(persona, params, config, isStartup, ref, row, state)
+    return launchOnPromptRow(run, row, state)
   }
 
   if (state === 'pending') {
     // b.jg5 SRJ-513: a configured persona's own `pending` row with no launch
     // start never reaches here: the collision `get` latched it first.
+    // b.jg5 SRJ-411, SRJ-707, SRJ-1504: a `pending` row whose `config_dir`
+    // label is missing or differs is not P's current life, so it is not
+    // covered: the replace step sends it through the live-row sequence,
+    // which waits until G past its launch start and ends in a reuse spawn of
+    // the same id. A directory that cannot be resolved gives no verdict and
+    // keeps the deferral (bug b.g57). A matching row is left as it is.
+    const configDir = compareRowToPersona(row, persona, spawnHomeDir(), undefined, _configDirFs)
+    if (!configDir.configDirResolved) return deferForUnresolvedConfigDir(persona, ref)
+    if (!configDir.configDirMatches) {
+      console.error(`[slack] spawnForPersona: ${configDirMismatchText(persona, ref, configDir)} on a pending row — not covered; replacing its row by a reuse spawn of the same id`)
+      return replacePersonaRow(run, lastRead, CONFIG_DIR_MISMATCH_WHY)
+    }
     console.error(`[slack] spawnForPersona: no action — state=${state} for ${ref}`)
     return { key, action: 'no-op' }
   }
@@ -9130,8 +9086,10 @@ const REUSE_SPAWN_WHAT = 'reuse spawn'
  * The reuse spawn's answer to `ErrInstanceIdCollision` (b.jg5 SRJ-112): the
  * row is live (a launch in progress included), so nothing was launched. Not
  * a launch result: no notice, no entry, nothing counted and nothing armed by
- * the reuse itself. Its caller decides what follows (the live-row sequence
- * ends without its launch and arms the reuse-collision cause).
+ * the reuse itself. Its caller decides what follows: the live-row sequence
+ * ends without its launch and arms the reuse-collision cause; a collision
+ * ladder reuse site re-runs get-then-act once, and a second collision arms
+ * that cause and ends the attempt (`reuseFinishedRow`).
  */
 export const REUSE_SPAWN_COLLIDED = 'reuse-collided'
 
@@ -9356,8 +9314,9 @@ let removeSequenceLatchObserver: (() => void) | undefined
 
 /**
  * Install the server's live-row sequence registry, or remove it with
- * undefined (b.jg5 SRJ-706). Later start sites reach it through the start
- * entry here (`startLiveRowSequence`). When a latch with `addSetObserver` is
+ * undefined (b.jg5 SRJ-706). Start sites (the collision ladder's replace
+ * step, b.jg5 SRJ-707) reach it through the start entry here
+ * (`startLiveRowSequence`). When a latch with `addSetObserver` is
  * installed too, one set observer stops a latched persona's running sequence
  * (`stopSequenceOnLatch`), whichever of the two is installed second.
  */
@@ -9397,7 +9356,8 @@ function stopSequenceOnLatch(event: ConflictLatchSetEvent): void {
 }
 
 /**
- * The start entry for later sites (b.jg5 SRJ-706): forwards `request` to the
+ * The start entry (b.jg5 SRJ-706), used by the collision ladder's replace
+ * step (`replacePersonaRow`, SRJ-707) and by later starters: forwards `request` to the
  * installed registry and answers its answer (`started`, `already-running`,
  * `closed`); the sequence runs in the background and this never waits for
  * it. A step-2 entry is the same call with the request's entry step 2. With
@@ -9542,6 +9502,14 @@ export type LiveRowSequenceLaunchEntryResult = SpawnPersonaResult | LiveRowSeque
  * result (a `resume`'s `ErrSpawnNotFound`, which still posts the
  * spawn-failure notice, for one) and a refused, stopping, latched, deferred
  * or not-launched answer record nothing.
+ * The launch is never part of the start pass, whichever path started the
+ * sequence (a start-pass collision ladder's replacement site included): the
+ * sequence runs detached, after its starter has answered `sequence-waiting`
+ * and the start pass has counted that (b.jg5 SRJ-706, SRJ-1015), so every
+ * call here passes the start flag false. No `spawn-failed`,
+ * `jsonl-transcript-lost-on-resume` or `jsonl-diagnosis-inconclusive`
+ * startup-errors entry is written for it; its log lines and persona notices
+ * are written as for any launch outside the start pass.
  * Never calls `delete` and never sets `include_finished`. Never throws.
  */
 export async function launchForLiveRowSequence(

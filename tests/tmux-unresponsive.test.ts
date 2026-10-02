@@ -13,7 +13,10 @@
  *
  * - What starts it: each UNAVAILABLE form but `ErrTmuxKillFailed` at one of
  *   the tmux-touching calls the launch ladder makes, every such call met by
- *   at least one form, inside the launch; each such form at the restart
+ *   at least one form, inside the launch; at the step-1 kill of the live-row
+ *   sequence a launch starts at a replacement site over a row read live
+ *   (b.jg5 SRJ-707; the ladder makes no kill), once its tries' refusal
+ *   stands, inside the sequence's recovery attempt; each such form at the restart
  *   run's one `read-pane` of a live `working`, `waiting` or
  *   `check_permission` row (b.jg5 SRJ-603, SRJ-604, SRJ-606), inside its
  *   recovery attempt, and at the one-line `read-pane` of the `ask_user` row
@@ -190,7 +193,7 @@ import {
   holdSpawns,
   unavailableForms,
 } from './test-helpers/agent-director-stub.ts'
-import { LIVE_ROW_OUTCOME_LAUNCHED, LIVE_ROW_SEQUENCE_ENTRY_GET } from '../src/live-row-sequence.ts'
+import { LIVE_ROW_OUTCOME_ABORTED, LIVE_ROW_OUTCOME_LAUNCHED, LIVE_ROW_SEQUENCE_ENTRY_GET } from '../src/live-row-sequence.ts'
 import type { AdConfigTables } from './test-helpers/ad-settings.ts'
 import { APPROVER_VERB_CALLS, conflictForPersona, conflictNoticeForPersona } from './test-helpers/conflict-cases.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
@@ -209,11 +212,13 @@ import {
   conditionStartedLines,
   expectLostMessageReports,
   killFailureNotice,
+  launchThroughSequence,
   makeRecoveryHarness,
   ordinaryAlertContent,
   ownRowsLiveThenMissing,
   personaOf,
   retryNow,
+  scriptLiveRowElsewhere,
   startSequenceHeldAtRun,
   type RecoveryHarness,
   type RecoveryHarnessOptions,
@@ -321,29 +326,16 @@ interface TmuxSite {
   readonly name: string
   readonly verb: string
   script(h: RecoveryHarness, persona: Persona, err: Error): RecoveryStubScript
-  /**
-   * How long after the launch starts the refusal stands: 0, except for a
-   * kill of a row read live, whose UNAVAILABLE outcome stands only after its
-   * tries (b.jg5 SRJ-702), so the condition's first refusal is the standing one.
-   */
-  readonly standsAfterMs?: number
 }
 
 const TMUX_SITES: readonly TmuxSite[] = [
   { name: 'the optimistic spawn', verb: 'spawn', script: (_h, _p, err) => ({ spawnError: err }) },
   { name: 'the resume of an ended row', verb: 'resume', script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), resumeError: err }) },
   { name: 'the reconnect of a waiting row', verb: 'send-keys', script: (h, p, err) => ({ ...collided(h, p, { state: 'waiting' }), sendKeysError: err }) },
-  {
-    // The row is `waiting` (read live) in another directory. The kill is
-    // tried up to 3 times 2 s apart (b.jg5 SRJ-702), and its refusal that
-    // stands stops the ladder (b.jg5 SRJ-105): no delete and no spawn follow,
-    // so no later launch call touches tmux in this launch.
-    name: 'the replacement kill of a row read live in another directory',
-    verb: 'kill',
-    script: (h, p, err) => ({ ...collided(h, p, { cwd: h.home, state: 'waiting' }), killError: err }),
-    standsAfterMs: (KILL_RETRY_TRIES - 1) * KILL_RETRY_SPACING_MS,
-  },
 ]
+
+/** When the step-1 kill's UNAVAILABLE refusal of a row read live stands: after its tries (b.jg5 SRJ-702), from the sequence's start. */
+const KILL_STANDS_AFTER_MS = (KILL_RETRY_TRIES - 1) * KILL_RETRY_SPACING_MS
 
 /**
  * The live rows whose pane the restart run reads with one `read-pane` before
@@ -375,13 +367,12 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
 
   test.each(paired)('%s at %s inside a launch starts P’s condition at the time its refusal stands; a second refusal keeps it; B’s never starts', async (_what, _site, make, site) => {
     const { h, p, b } = build()
-    const firstAt = h.clock.now() + (site.standsAfterMs ?? 0)
+    const firstAt = h.clock.now()
     h.script(site.script(h, personaOf(h, p), make(site.verb)))
 
     await h.drive(h.launch(p))
 
     expectHolds(h, p, site.verb, firstAt)
-    if (site.standsAfterMs !== undefined) expect(h.stub.calls.killCalls).toHaveLength(KILL_RETRY_TRIES)
 
     await h.advance(halfFirstWaitMs())
     h.script({ spawnQueue: [], spawnError: errTmuxUnresponsive('spawn') })
@@ -389,6 +380,32 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
 
     expect(h.clock.now()).toBeGreaterThan(firstAt)
     expectHolds(h, p, site.verb, firstAt)
+    expect(h.conditionEnds).toEqual([])
+    expectNeverStarted(h, b)
+    expectNoPostYet(h)
+  })
+
+  // A live row's kill is the live-row sequence's (b.jg5 SRJ-707, SRJ-705):
+  // P's launch meets its row read `waiting` in another directory and starts
+  // P's sequence, whose step-1 kill is tried up to 3 times 2 s apart (b.jg5
+  // SRJ-702) inside the sequence's recovery attempt; its refusal that stands
+  // aborts the sequence, so no later call of it touches tmux.
+  test.each(TMUX_STARTING_FORMS.slice(0, 3))('%s at the step-1 kill of the live-row sequence P\'s launch starts over its row read live in another directory starts P’s condition when its refusal stands, after the tries; a second refusal keeps it; B’s never starts', async (_what, make) => {
+    const { h, p, b } = build()
+    const firstAt = h.clock.now() + KILL_STANDS_AFTER_MS
+    scriptLiveRowElsewhere(h, p, { killError: make('kill') })
+
+    expect(await launchThroughSequence(h, p)).toMatchObject({ kind: LIVE_ROW_OUTCOME_ABORTED, step: 1 })
+
+    expect(h.stub.calls.killCalls).toHaveLength(KILL_RETRY_TRIES)
+    expectHolds(h, p, 'kill', firstAt)
+
+    await h.advance(halfFirstWaitMs())
+    h.script({ spawnQueue: [], spawnError: errTmuxUnresponsive('spawn') })
+    await h.drive(h.launch(p))
+
+    expect(h.clock.now()).toBeGreaterThan(firstAt)
+    expectHolds(h, p, 'kill', firstAt)
     expect(h.conditionEnds).toEqual([])
     expectNeverStarted(h, b)
     expectNoPostYet(h)
@@ -488,12 +505,12 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
   // b.jg5 SRJ-307, SRJ-704, SRJ-1011: ErrTmuxKillFailed goes to the
   // kill-failure alert, never to the condition. Its ordinary version is the
   // one post, and the episode it opens gives a message lost afterwards state 4.
-  test('ErrTmuxKillFailed from the replacement kill of a row read live, at every try, starts nothing; its one post is the ordinary kill-failure alert (the kill-failure cause only, once); a message lost after it reports kill failed, never not answering (SRJ-1011)', async () => {
+  test('ErrTmuxKillFailed from the live-row sequence\'s kill of a row read live (started at a replacement site), at every try, starts nothing; its one post is the ordinary kill-failure alert (the kill-failure cause only, once); a message lost after it reports kill failed, never not answering (SRJ-1011)', async () => {
     const { h, p, b } = build()
     const err = errTmuxKillFailed()
-    h.script({ ...collided(h, personaOf(h, p), { cwd: h.home, state: 'waiting' }), killError: err })
+    scriptLiveRowElsewhere(h, p, { killError: err })
 
-    await h.drive(h.launch(p))
+    await launchThroughSequence(h, p)
 
     expect(h.stub.calls.killCalls).toHaveLength(KILL_RETRY_TRIES)
     expect(h.triggers.filter((t) => t.kind === UNAVAILABLE_RETRY_CAUSE_KILL_FAILED)).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }])
@@ -511,16 +528,15 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
   // that end in ErrTmuxUnresponsive raise the ordinary version, and the last
   // outcome keeps its own handling besides: it starts the condition once, at
   // the time it stands (the earlier try's ErrTmuxKillFailed started nothing).
-  test('a survivor-naming ErrTmuxKillFailed, then ErrTmuxUnresponsive twice, at the replacement kill of a row read live: the condition starts once, when the last outcome stands, beside one ordinary alert quoting the survivor-naming description; B’s never starts', async () => {
+  test('a survivor-naming ErrTmuxKillFailed, then ErrTmuxUnresponsive twice, at the live-row sequence\'s kill of a row read live: the condition starts once, when the last outcome stands, beside one ordinary alert quoting the survivor-naming description; B’s never starts', async () => {
     const { h, p, b } = build()
     const survivor = errTmuxKillFailed(undefined, 'pane-process-survived')
-    h.script({
-      ...collided(h, personaOf(h, p), { cwd: h.home, state: 'waiting' }),
+    scriptLiveRowElsewhere(h, p, {
       killQueue: [cannedErr(survivor), cannedErr(errTmuxUnresponsive('kill')), cannedErr(errTmuxUnresponsive('kill'))],
     })
-    const standsAt = h.clock.now() + (KILL_RETRY_TRIES - 1) * KILL_RETRY_SPACING_MS
+    const standsAt = h.clock.now() + KILL_STANDS_AFTER_MS
 
-    await h.drive(h.launch(p))
+    await launchThroughSequence(h, p)
 
     expect(h.stub.calls.killCalls).toHaveLength(KILL_RETRY_TRIES)
     expectHolds(h, p, 'kill', standsAt)
@@ -535,9 +551,9 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
     const { h, p } = build(TICK_MODE)
     const at = await refuse(h, p)
     const err = errTmuxKillFailed()
-    h.script({ ...collided(h, personaOf(h, p), { cwd: h.home, state: 'waiting' }), killError: err })
+    scriptLiveRowElsewhere(h, p, { spawnError: undefined, killError: err })
 
-    await h.drive(h.launch(p))
+    await launchThroughSequence(h, p)
 
     const killAlert = killFailureNotice(p, ordinaryAlertContent(p, { last: err }))
     expectHolds(h, p, 'spawn', at)
@@ -555,18 +571,14 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
   // condition. A try's UNAVAILABLE that a later try's success replaces starts
   // nothing and arms nothing, and the own-row `status` read between the tries
   // (not tmux-touching) neither starts the condition nor ends it.
-  test('an ErrTmuxUnresponsive try then a success at the replacement kill of a row read live starts no condition and arms nothing; the delete and the fresh spawn follow', async () => {
+  test('an ErrTmuxUnresponsive try then a success at the live-row sequence\'s kill of a row read live starts no condition and arms nothing; the sequence\'s run and reuse spawn follow, with no delete', async () => {
     const { h, p, b } = build()
-    h.script({
-      ...collided(h, personaOf(h, p), { cwd: h.home, state: 'waiting' }),
-      killQueue: [cannedErr(errTmuxUnresponsive('kill')), cannedOk(cannedKillResult(true))],
-    })
+    scriptLiveRowElsewhere(h, p, { killQueue: [cannedErr(errTmuxUnresponsive('kill')), cannedOk(cannedKillResult(true))] })
 
-    const result = await h.drive(h.launch(p))
+    expect(await launchThroughSequence(h, p)).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, result: { key: p, action: 'spawned' } })
 
-    expect(result).toStrictEqual({ key: p, action: 'spawned' })
     expect(h.stub.calls.killCalls).toHaveLength(2)
-    expect(h.stub.calls.deleteCalls).toHaveLength(1)
+    expect(h.stub.calls.deleteCalls).toEqual([])
     expect(h.stub.calls.spawnCalls).toHaveLength(2)
     expect(h.triggers).toEqual([])
     expectNeverStarted(h, p)
@@ -577,16 +589,16 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
   test.each<[string, RecoveryStubScript['statusQueue']]>([
     ['a read that finds the row live', [cannedOk(cannedStatusResult({ state: 'waiting' }))]],
     ['a read that fails (ErrCallTimeout)', [cannedErr(errCallTimeout('status'))]],
-  ])('with P’s condition holding, %s between the replacement kill’s tries neither starts nor ends it; the standing refusal keeps it', async (_label, statusQueue) => {
+  ])('with P’s condition holding, %s between the live-row sequence’s kill’s tries neither starts nor ends it; the standing refusal keeps it', async (_label, statusQueue) => {
     const { h, p, b } = build()
     const at = await refuse(h, p)
-    h.script({
-      ...collided(h, personaOf(h, p), { cwd: h.home, state: 'waiting' }),
+    scriptLiveRowElsewhere(h, p, {
+      spawnError: undefined,
       killError: errTmuxUnresponsive('kill'),
       statusQueue: [...(statusQueue ?? []), cannedOk(cannedStatusResult({ state: 'waiting' }))],
     })
 
-    await h.drive(h.launch(p))
+    await launchThroughSequence(h, p)
 
     expect(h.stub.calls.killCalls).toHaveLength(KILL_RETRY_TRIES)
     expectHolds(h, p, 'spawn', at)

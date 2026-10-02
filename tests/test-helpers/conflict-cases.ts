@@ -106,22 +106,18 @@
  * name carries the state (`<site> (<state>): <stub case>`).
  *
  * The checked kill's rows (E20; b.jg5 SRJ-110, SRJ-501, SRJ-512, the E13, E16
- * and E19 hatch notes): two site kinds ({@link KillSite}),
- * {@link RESTART_KILL_SITE} (the restart path's kill before a relaunch,
- * `_buildKillSessionAdapter`) and {@link LADDER_KILL_SITE} (the collision
- * ladder's replacement kill). Each has one CONFLICT row per stub case `kill`
+ * and E19 hatch notes): the restart path's kill before a relaunch
+ * ({@link RESTART_KILL_SITE}, `_buildKillSessionAdapter`) and the live-row
+ * sequence's two kills (below), the kinds of {@link KillSite}. The collision
+ * ladder makes no kill and no delete (E22): a live row's kills are the
+ * sequence's. The restart kill has one CONFLICT row per stub case `kill`
  * answers ("not this launch's session", "never reported in", "conflicting
- * labels"), each refusing P's next check or recovery:
- * {@link RESTART_KILL_CONFLICT_CASE_ROWS} record the state the restart run
- * last read, carried by the `dead` reading handed to the kill (`ended`, with
- * no latch-time `status` read: `latchTimeRead` false; b.jg5 SRJ-501),
- * {@link LADDER_KILL_CONFLICT_CASE_ROWS} the state the
- * collision `get` read (`waiting`), its "not this launch's session" row
- * marked as SRJ-613's kill backstop (`killBackstop`). The UNUSABLE NAME rows:
- * {@link RESTART_KILL_UNUSABLE_NAME_CASE_ROWS}, one per fault, refused
- * operation none, their state the one the run's `dead` reading carries; the
- * ladder's are E16 T1's `ladder kill` rows
- * ({@link LADDER_KILL_UNUSABLE_NAME_CASE_ROWS}).
+ * labels"), each refusing P's next check or recovery and recording the state
+ * the restart run last read, carried by the `dead` reading handed to the
+ * kill (`ended`, with no latch-time `status` read: `latchTimeRead` false;
+ * b.jg5 SRJ-501; {@link RESTART_KILL_CONFLICT_CASE_ROWS}). Its UNUSABLE NAME
+ * rows: {@link RESTART_KILL_UNUSABLE_NAME_CASE_ROWS}, one per fault, refused
+ * operation none, their state the one the run's `dead` reading carries.
  *
  * The live-row sequence's kill rows (E21; b.jg5 SRJ-110, SRJ-501, SRJ-512,
  * SRJ-613, SRJ-705; the E13 and E20 hatch notes): two site kinds
@@ -189,8 +185,7 @@
  * Unusable-name rows (E16 T1 and E17, SRJ-512 and SRJ-1019), {@link UNUSABLE_NAME_CASE_ROWS}:
  * one row per fault in the stub's `UNUSABLE_NAME_FAULTS` for each verb site
  * kind ({@link UNUSABLE_NAME_SITES}): those E16 T1 wires (`resume`, a plain
- * spawn, the ladder's kill, the ladder's delete, `read-pane`, `status`,
- * `get`), then the dialog approver's `status`, `read-pane` and `send-keys`
+ * spawn, `read-pane`, `status`, `get`), then the dialog approver's `status`, `read-pane` and `send-keys`
  * (E17, {@link APPROVER_SITES}; {@link APPROVER_UNUSABLE_NAME_CASE_ROWS}),
  * and the reuse spawn's (E22, {@link REUSE_SPAWN_UNUSABLE_NAME_CASE_ROWS},
  * recording `ended`, the state its path last read).
@@ -204,8 +199,7 @@
  *     that itself answers UNUSABLE NAME records unreadable, the approver's
  *     `status` included (its read goes through the own-row `status` step).
  *     The others record the state the path last read: `ended` for `resume`
- *     and for the ladder's kill and delete (the finished-row path, a `resume`
- *     answering `ErrSpawnNotResumable` for the kill), `working` for
+ *     (the finished-row path), `working` for
  *     `read-pane` (the launch wait's evidence read and
  *     `checkWorkingRowPane`), `pending` for the approver's `read-pane` and
  *     `send-keys` (the lap's `status` read before them). The plain spawn
@@ -526,13 +520,6 @@ export function isPromptRowPaneSite(site: string): site is PromptRowPaneSite {
  */
 export const RESTART_KILL_SITE = 'restart kill'
 
-/**
- * The collision ladder's replacement kill as a site kind (`replaceWithFreshSpawn`
- * and the `ErrSpawnNotResumable` branch, `src/session-manager.ts`; b.jg5
- * SRJ-110, E20). E16 T1's unusable-name rows already name it.
- */
-export const LADDER_KILL_SITE = 'ladder kill'
-
 /** The reuse spawn as a site kind (`reuseSpawnForPersona`, b.jg5 SRJ-112, SRJ-708; E22). */
 export const REUSE_SPAWN_SITE = 'reuse spawn'
 
@@ -560,19 +547,19 @@ export function isSequenceKillSite(site: string): site is SequenceKillSite {
 }
 
 /**
- * One of the checked kill's site kinds: the restart path's kill, the
- * collision ladder's replacement kill (E20), or one of the live-row
- * sequence's two kills (E21).
+ * One of the checked kill's site kinds: the restart path's kill (E20) or one
+ * of the live-row sequence's two kills (E21). The collision ladder makes no
+ * kill (E22).
  */
-export type KillSite = typeof RESTART_KILL_SITE | typeof LADDER_KILL_SITE | SequenceKillSite
+export type KillSite = typeof RESTART_KILL_SITE | SequenceKillSite
 
 /**
  * The site kind that meets a CONFLICT row's refusal: a plain spawn, a reuse
  * spawn, a `resume`, a pane verb or a kill (by its verb), one of the dialog
  * approver's pane verbs, one of the liveness checks' `read-pane` sites, the
  * reconnect's `send-keys`, one of b.jdc's prompt-row `read-pane` sites, or
- * one of the checked kill's sites (the restart path's kill, the ladder's
- * replacement kill).
+ * one of the checked kill's sites (the restart path's kill, the live-row
+ * sequence's two kills).
  */
 export type ConflictCaseSite =
   | 'plain spawn'
@@ -626,9 +613,8 @@ export interface ConflictCaseRow {
    */
   readonly latchTimeRead?: false
   /**
-   * Set on the ladder kill's "not this launch's session" row and on the
-   * sequence step-1 kill's "not this launch's session" row on a `pending`
-   * seed only: SRJ-613's kill backstop (a kill on a live row, `pending`
+   * Set on the sequence step-1 kill's "not this launch's session" row on a
+   * `pending` seed only: SRJ-613's kill backstop (a kill on a live row, `pending`
    * included, answering "not this launch's session" latches the persona
    * with nothing sent; E19 hatch note).
    */
@@ -1031,18 +1017,6 @@ const RESTART_KILL_ROWS: readonly ConflictCaseRow[] = KILL_CASES.map(([stubCase,
   }),
 )
 
-/**
- * The collision ladder's replacement kill CONFLICT rows (E20; b.jg5 SRJ-110,
- * SRJ-501, the E13 hatch note): one row per case `kill` answers, each
- * refusing P's next check or recovery and recording the state the
- * collision `get` read, `waiting`. The "not this launch's session" row is
- * SRJ-613's kill backstop (`killBackstop`, E19 hatch note).
- */
-const LADDER_KILL_ROWS: readonly ConflictCaseRow[] = KILL_CASES.map(([stubCase, latchCase]) => {
-  const caseRow = row(LADDER_KILL_SITE, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, 'kill', stubCase, latchCase, WAITING)
-  return Object.freeze(latchCase === LATCH_CASE_NOT_THIS_LAUNCH ? { ...caseRow, killBackstop: true as const } : caseRow)
-})
-
 /** A state the live-row sequence last read before a kill: `pending`, or `waiting` (a live state other than `pending`). */
 export type SequenceKillLastRead = 'pending' | 'waiting'
 
@@ -1141,9 +1115,8 @@ export const CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze([
   ...RECONNECT_ROWS,
   // b.jdc's prompt-row `read-pane` sites (E19 T2).
   ...PROMPT_ROW_PANE_ROWS,
-  // The checked kill's sites (E20): the restart path's kill, the ladder's replacement kill.
+  // The checked kill's sites (E20): the restart path's kill.
   ...RESTART_KILL_ROWS,
-  ...LADDER_KILL_ROWS,
   // The live-row sequence's two kills (E21).
   ...SEQUENCE_KILL_ROWS,
 ])
@@ -1203,11 +1176,6 @@ export const RESTART_KILL_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Objec
   CONFLICT_CASE_ROWS.filter((caseRow) => caseRow.site === RESTART_KILL_SITE),
 )
 
-/** The collision ladder's replacement kill CONFLICT rows of {@link CONFLICT_CASE_ROWS} (E20), for `test.each`. */
-export const LADDER_KILL_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze(
-  CONFLICT_CASE_ROWS.filter((caseRow) => caseRow.site === LADDER_KILL_SITE),
-)
-
 /** The live-row sequence's kill CONFLICT rows of {@link CONFLICT_CASE_ROWS} (E21), for `test.each`. */
 export const SEQUENCE_KILL_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze(
   CONFLICT_CASE_ROWS.filter((caseRow) => isSequenceKillSite(caseRow.site)),
@@ -1251,8 +1219,6 @@ export function expectedLatchRecord(key: string, input: ConflictLatchSetInput): 
 export type UnusableNameSite =
   | 'resume'
   | 'plain spawn'
-  | 'ladder kill'
-  | 'ladder delete'
   | 'read-pane'
   | 'status'
   | 'get'
@@ -1266,8 +1232,6 @@ export type UnusableNameSite =
 const UNUSABLE_NAME_SITE_VERB: Readonly<Record<UnusableNameSite, string>> = Object.freeze({
   'resume': 'resume',
   'plain spawn': SPAWN_VERB,
-  'ladder kill': 'kill',
-  'ladder delete': 'delete',
   'read-pane': 'read-pane',
   'status': 'status',
   'get': 'get',
@@ -1322,8 +1286,6 @@ export interface UnusableNameCaseRow {
 const UNUSABLE_NAME_LAST_READ: Readonly<Record<Exclude<UnusableNameSite, ReconnectSite | SequenceKillSite>, LatchRowState>> = Object.freeze({
   'resume': ENDED,
   'plain spawn': LATCH_ROW_STATE_NO_ROW,
-  'ladder kill': ENDED,
-  'ladder delete': ENDED,
   'read-pane': WORKING,
   'status': LATCH_ROW_STATE_UNREADABLE,
   'get': LATCH_ROW_STATE_UNREADABLE,
@@ -1404,11 +1366,6 @@ export const RECONNECT_UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[] =
 /** The restart path's kill UNUSABLE NAME rows of {@link UNUSABLE_NAME_CASE_ROWS} (E20), for `test.each`. */
 export const RESTART_KILL_UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[] = Object.freeze(
   UNUSABLE_NAME_CASE_ROWS.filter((caseRow) => caseRow.site === RESTART_KILL_SITE),
-)
-
-/** The collision ladder's replacement kill UNUSABLE NAME rows of {@link UNUSABLE_NAME_CASE_ROWS} (E16 T1's, reused by E20), for `test.each`. */
-export const LADDER_KILL_UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[] = Object.freeze(
-  UNUSABLE_NAME_CASE_ROWS.filter((caseRow) => caseRow.site === LADDER_KILL_SITE),
 )
 
 /** The live-row sequence's kill UNUSABLE NAME rows of {@link UNUSABLE_NAME_CASE_ROWS} (E21), for `test.each`. */

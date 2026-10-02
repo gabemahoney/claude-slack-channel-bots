@@ -333,12 +333,15 @@
  * trust patch, the reply-guard steps over `h.stateDir` and the collision
  * ladder, against the composition's agent-director stub and the harness's
  * row table (`AgentDirectorRow`, shared by every run as agent-director's
- * store outlives a server restart): a spawn creates a `waiting` row, a
- * resume sets it `waiting`, a kill `ended`, a delete removes it. A launch
- * record gets the ladder's `action`. `run.composition.agentDirectorCalls` is
- * every agent-director call in order (a spawn with its `cwd`,
- * `CLAUDE_CONFIG_DIR` and `config_dir` label; each with its `result`), and
- * `instanceCallsOf(name)` the persona's spawn, resume, kill and delete.
+ * store outlives a server restart): a plain spawn creates a `waiting` row
+ * and collides with any row; a reuse spawn (`reuse_finished`) over an `ended`
+ * or `missing` row, or of an id with no row, starts a new `waiting` life with
+ * its own `cwd` and labels, and collides with a live row; a resume sets the
+ * row `waiting`, a kill `ended`, a delete removes it. A launch record gets
+ * the ladder's `action`. `run.composition.agentDirectorCalls` is every
+ * agent-director call in order (a spawn with its `cwd`, `CLAUDE_CONFIG_DIR`,
+ * `config_dir` label and whether it was a reuse; each with its `result`),
+ * and `instanceCallsOf(name)` the persona's spawn, resume, kill and delete.
  * `h.seedRow(persona, { state?, cwd?, configDir?, labels? })` sets or
  * changes a row before a launch, to choose its path (`h.rowOf(name)` reads
  * it); `run.relaunch(name)` is the persona's next launch through the
@@ -492,7 +495,8 @@ import {
 } from '../../src/persona-credentials.ts'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
-import type { MakeTemplateParams, SpawnParams } from 'agent-director'
+import type { MakeTemplateParams } from 'agent-director'
+import type { Phase1SpawnParams } from '../../src/ad-phase1-types.ts'
 
 import { _resetAckTracker, consumeAck, forgetPersonaAcks } from '../../src/ack-tracker.ts'
 import { resetClientForTests, setClientForTests } from '../../src/agent-director-client.ts'
@@ -508,6 +512,7 @@ import {
   type LiveRowSequenceRegistry,
 } from '../../src/live-row-sequence.ts'
 import { KILL_FAILURE_CONTEXT_RECOVERY } from '../../src/kill-failure-alert.ts'
+import { AGENT_DIRECTOR_DEAD_STATES } from '../../src/liveness-reading.ts'
 import { runDetachedRecoveryAttempt } from '../../src/unavailable-retry.ts'
 import { personaInstanceId, personaKey, renderPersonaRef } from '../../src/persona-identity.ts'
 import { createPersonaEventRouter } from '../../src/persona-event-router.ts'
@@ -933,8 +938,9 @@ export interface RealLifecycleComposition {
    * The persona's instance calls (`spawn`, `resume`, `kill`, `delete` of
    * `cscb_<key>`) among `agentDirectorCalls`, in order, with their results:
    * a relaunch from an `ended` row with an old `config_dir` label reads
-   * spawn (`ErrInstanceIdCollision`), delete (`ok`), spawn (`ok`); one with
-   * the current label spawn (`ErrInstanceIdCollision`), resume (`ok`).
+   * spawn (`ErrInstanceIdCollision`), then a reuse spawn of the same id
+   * (`reuse` set, `ok`), with no delete; one with the current label spawn
+   * (`ErrInstanceIdCollision`), resume (`ok`).
    */
   instanceCallsOf(name: string): AgentDirectorCall[]
   /**
@@ -969,8 +975,9 @@ export interface RealLifecycleComposition {
  * One agent-director call in `run.composition.agentDirectorCalls`. Holds no
  * token. `id` is the instance ID (`cscb_<key>`) for a per-instance verb.
  * A `spawn` also carries its `cwd`, the `CLAUDE_CONFIG_DIR` of its spawn
- * environment (undefined when absent) and its `config_dir` label value
- * (undefined when absent). `result` is set once the call settled: `'ok'`, or
+ * environment (undefined when absent), its `config_dir` label value
+ * (undefined when absent) and `reuse`: true for a reuse spawn of the same id
+ * (`reuse_finished`), false for a plain spawn. `result` is set once the call settled: `'ok'`, or
  * the rejection's agent-director error name (`ErrInstanceIdCollision` for
  * the ladder's optimistic spawn that met a row, `ErrSpawnNotFound`, …) or
  * error name. A spawn that created an instance is `{ verb: 'spawn', result:
@@ -982,6 +989,8 @@ export interface AgentDirectorCall {
   readonly cwd?: string
   readonly claudeConfigDir?: string
   readonly configDirLabel?: string
+  /** A spawn only: true for a reuse spawn (`reuse_finished: true`), false for a plain spawn. */
+  readonly reuse?: boolean
   result?: string
 }
 
@@ -995,9 +1004,12 @@ function errorName(err: unknown): string {
 /**
  * A persona's agent-director row in the harness's row table (shared by every
  * run, as agent-director's store outlives a server restart). With
- * `opts.realLaunch`, a spawn creates the row (`waiting`, the spawn's `cwd`
- * and labels), a resume sets it `waiting`, a kill `ended`, and a delete
- * removes it; `get` answers it and `status` its state (a `working` row
+ * `opts.realLaunch`, a plain spawn creates the row (`waiting`, the spawn's
+ * `cwd` and labels) and collides with any row there; a reuse spawn of the
+ * same id (`reuse_finished`) replaces an `ended` or `missing` row with a new
+ * life (`waiting`, the reuse's `cwd` and labels), creates a missing one, and
+ * collides with a live row; a resume sets it `waiting`, a kill `ended`, and
+ * a delete removes it, with no row deleted by any launch; `get` answers it and `status` its state (a `working` row
  * answers `waiting`, its turn over). `h.seedRow` sets or changes it.
  */
 export interface AgentDirectorRow {
@@ -2241,18 +2253,24 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
             return result
           })
         },
-        spawn(params: SpawnParams) {
+        spawn(params: Phase1SpawnParams) {
           const id = String(params.claude_instance_id)
           const labels = parseLabels(params.label)
+          const reuse = params.reuse_finished === true
           const call: AgentDirectorCall = {
             verb: 'spawn',
             id,
             cwd: params.cwd,
             claudeConfigDir: params.extra_env?.['CLAUDE_CONFIG_DIR'],
             configDirLabel: labels[CONFIG_DIR_LABEL],
+            reuse,
           }
           return tracked(call, async () => {
-            if (rows.has(id)) {
+            // agent-director's reuse replaces a finished row with a new life
+            // (or creates a missing one) and collides with a live one; a
+            // plain spawn collides with any row.
+            const existing = rows.get(id)
+            if (existing !== undefined && !(reuse && AGENT_DIRECTOR_DEAD_STATES.has(existing.state))) {
               agentDirector.spawnCalls.push(params)
               throw errInstanceIdCollision()
             }

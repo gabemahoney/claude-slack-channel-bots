@@ -52,13 +52,12 @@
  *     marked; a DIRECTORY spawn, or no sink at all, marks nothing
  *     (`launchSession` false); a joiner shares the marker; a start pass with
  *     one UNAVAILABLE persona tallies as before and arms only that persona.
- *   - b.jg5 SRJ-105 (AC 25), on `makeRecoveryHarness`: every spawn, resume,
- *     replacement kill and delete, and reconnect keystroke (its one
- *     `send-keys`, at the `waiting` and `working` branches) of the ladder,
- *     fed `ErrUnknownErrorName`,
- *     `ErrCallTimeout`, a wrapped `UnknownError`, `ErrTmuxUnresponsive` and
- *     (at kills and deletes) `ErrTmuxKillFailed`, makes no kill, delete or
- *     launch after it and no dead-session resume, posts no spawn-failure
+ *   - b.jg5 SRJ-105 (AC 25), on `makeRecoveryHarness`: every spawn and
+ *     resume (the replacement sites' reuse spawns included) and reconnect
+ *     keystroke (its one `send-keys`, at the `waiting` and `working`
+ *     branches) of the ladder, fed `ErrUnknownErrorName`,
+ *     `ErrCallTimeout`, a wrapped `UnknownError` and `ErrTmuxUnresponsive`,
+ *     makes no kill, delete or launch after it and no dead-session resume, posts no spawn-failure
  *     notice, records no `spawn-failed` entry, answers `{ failed, refused }`
  *     (`launchSession` `'refused'`) and is never counted; B launches as
  *     before. At the reconnect the answer is SRJ-118's `transient` (its
@@ -71,11 +70,10 @@
  *     each findMissing sweep, fed `ErrConfigMalformed`, is refused the same
  *     way, arms P's timer with the CONFIG cause, starts no condition, never
  *     reaches the inconclusive report, and raises P's
- *     `ad-config-malformed` with one onset. E8's hatch note: a refused kill
- *     (UNAVAILABLE or CONFIG) on each replace path is
- *     followed by no delete or launch, also through the restart path's retry
- *     (`runRestartRetry`), with the failure count at 0. The
- *     `ErrSpawnNotResumable` kill is declared a kill of a row read live. The
+ *     `ad-config-malformed` with one onset. A replace path makes no kill (a
+ *     live row's kills are the live-row sequence's: the SRJ-702 and SRJ-704
+ *     describes drive them from a replacement site, and SRJ-110 at each such
+ *     site is the SRJ-707 describe's). The
  *     approver's pane read and Enter, the working-row pane read and the
  *     persona teardown's kill keep their outcomes. At most one onset across
  *     several retries past the floor; none for a refusal that clears, or for
@@ -99,7 +97,7 @@
  *   - b.jg5 SRJ-105's UNUSABLE NAME row, SRJ-512 (E16), on
  *     `makeRecoveryHarness`: an UNUSABLE NAME answer, each fault of the
  *     case table's rows for the site (`UNUSABLE_NAME_CASE_ROWS`), at every
- *     ladder spawn and `resume`, at the ladder's kill and delete, at the
+ *     ladder spawn and `resume` (its reuse spawns included), at the
  *     working-pane read (the launch wait's evidence read and
  *     `checkWaitingRowPane` → `defer`, never `reconnect`; `checkWorkingRowPane`
  *     on the working-row verdict's pane makes no read of its own), at the
@@ -199,9 +197,15 @@
  *     value, quietly; through the outage wrapper (flags raised and cleared as
  *     for any wrapped `status`; an error reported to a recording sink only
  *     inside a recovery attempt for that persona, with the predicate's cause).
- *   - b.av2 SR-6.2 ladder guards: a row in another directory (by real path) is
- *     killed, deleted and spawned fresh on every path; a missing or changed
- *     `config_dir` label means a fresh spawn instead of a resume (AC 48).
+ *   - b.av2 SR-6.2 ladder guards, as amended (b.jg5 SRJ-1503, SRJ-1504,
+ *     SRJ-707): a row in another directory (by real path) is replaced on
+ *     every path, and a missing or changed `config_dir` label means no
+ *     resume (AC 48), with no row deleted: a finished row by one reuse spawn
+ *     of the same id, a live row through the live-row sequence first. The
+ *     SRJ-707 describe covers each replacement site on the recovery harness:
+ *     the reuse's parameters, SRJ-112's rows there, the sequence the ladder
+ *     starts for a live row and SRJ-110 at its first kill, the deferred
+ *     `cwd` check and the lost race on `ErrSpawnNotResumable` (SRJ-710).
  *   - b.av2 SR-6.3: the fixed instance ID, one launch in flight per persona,
  *     and the start sweep (`reconcileOrphans`) keyed by the `persona` label
  *     (AC 4). b.1ix: a pre-persona row (no `persona` label) is kept, never
@@ -610,6 +614,7 @@ import {
   LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE,
   LIVE_ROW_NOT_LAUNCHED_REUSE_COLLISION,
   LIVE_ROW_NOT_LAUNCHED_STOPPED,
+  LIVE_ROW_OUTCOME_ABORTED,
   LIVE_ROW_OUTCOME_LAUNCHED,
   LIVE_ROW_OUTCOME_NOT_LAUNCHED,
   LIVE_ROW_OUTCOME_STOPPED,
@@ -622,6 +627,7 @@ import {
   LIVE_ROW_STOP_SHUTDOWN,
   LIVE_ROW_STOP_TEARDOWN,
   createLiveRowSequenceStop,
+  liveRowSequenceStartLine,
   runLiveRowSequence,
   type LiveRowSequenceLaunchKind,
 } from '../src/live-row-sequence.ts'
@@ -901,9 +907,11 @@ import {
   personaCallCounts,
   personaOf as harnessPersona,
   holdSequenceReuse,
+  launchThroughSequence,
   recordCallOrder,
   retryNow,
   reuseSpawnOf,
+  scriptLiveRowElsewhere,
   startSequenceHeldAtRun,
   startupEntriesOf,
   survivorAlertContent,
@@ -923,9 +931,9 @@ import {
   LIVENESS_PANE_CONFLICT_CASE_ROWS,
   RECONNECT_CONFLICT_CASE_ROWS,
   RECONNECT_UNUSABLE_NAME_CASE_ROWS,
-  LADDER_KILL_CONFLICT_CASE_ROWS,
   REUSE_SPAWN_CONFLICT_CASE_ROWS,
   REUSE_SPAWN_SITE,
+  RESTART_KILL_SITE,
   REUSE_SPAWN_UNUSABLE_NAME_CASE_ROWS,
   UNUSABLE_NAME_CASE_ROWS,
   expectedConflictNotice,
@@ -984,6 +992,7 @@ import {
   UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
   UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
+  UNAVAILABLE_RETRY_CAUSE_LOST_RACE,
   UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION,
   UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
@@ -999,7 +1008,7 @@ import {
 import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_PENDING_STATE, LIVENESS_DEAD_ROW_ENDED } from '../src/liveness-reading.ts'
 import { adLaunchBoundMsInEffect } from '../src/ad-settings.ts'
 import { parseLaunchStart } from '../src/pending-row.ts'
-import type { Phase1KillResult, Phase1ResumeResult, Phase1SpawnParams, Phase1SpawnResult, Phase1StatusResult, PreTrust } from '../src/ad-phase1-types.ts'
+import type { Phase1GetResult, Phase1KillResult, Phase1ResumeResult, Phase1SpawnParams, Phase1SpawnResult, Phase1StatusResult, PreTrust } from '../src/ad-phase1-types.ts'
 
 // ---------------------------------------------------------------------------
 // Test fixture helpers
@@ -1857,7 +1866,9 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
     expect(deleteCalls).toEqual([])
   })
 
-  test('ended state + resume_enabled=false → kill + delete + fresh spawn (no resume)', async () => {
+  // b.jg5 SRJ-707: resume_enabled false over a finished row: one reuse spawn
+  // of the same id; nothing is killed or deleted.
+  test('missing state + resume_enabled=false → one reuse spawn of the same id (no resume, kill or delete)', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const killCalls: import('agent-director').KillParams[] = []
     const deleteCalls: import('agent-director').DeleteParams[] = []
@@ -1877,8 +1888,11 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('spawned')
     expect(resumeCalls).toHaveLength(0)
-    expect(killCalls).toHaveLength(1)
-    expect(deleteCalls).toHaveLength(1)
+    expect((spawnCalls as Phase1SpawnParams[]).map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([
+      ['cscb_C', undefined],
+      ['cscb_C', true],
+    ])
+    expect([killCalls, deleteCalls]).toEqual([[], []])
   })
 
   test('waiting state → reconnectMcp (sendKeys with /mcp reconnect)', async () => {
@@ -2329,12 +2343,18 @@ function newLadderCalls(): LadderCalls {
 }
 
 // ---------------------------------------------------------------------------
-// b.av2 SR-6.2 / AC 4 — a row in another directory is replaced on every
-// ladder path (kill + delete + fresh spawn in the persona's working directory)
+// b.av2 SR-6.2 / AC 4, as amended (b.jg5 SRJ-1503, SRJ-707) — a row in
+// another directory is replaced on every ladder path with no row deleted: a
+// finished row by one reuse spawn of the same id in the persona's working
+// directory, a live row (`pending` included) through the live-row sequence
+// first, whose start the launch answers `sequence-waiting` for with no call
+// of its own. These cases install no sequence registry (the start answers
+// `not-installed`); the sequence itself is the SRJ-707 describe's.
 // ---------------------------------------------------------------------------
 
 describe('collision ladder: cwd guard (b.av2 SR-6.2, AC 4)', () => {
-  const COLLISION_STATES = ['ended', 'missing', 'waiting', 'working', 'pending', 'check_permission', 'ask_user'] as const
+  const FINISHED_STATES = ['ended', 'missing'] as const
+  const LIVE_STATES = ['waiting', 'working', 'pending', 'check_permission', 'ask_user'] as const
 
   /** Persona `C` with working_directory `work` (a real temp directory by default), the seam home installed. */
   function guardConfig(work = fixtureSubdir('work')): { cfg: PersonaConfig; work: string } {
@@ -2356,7 +2376,11 @@ describe('collision ladder: cwd guard (b.av2 SR-6.2, AC 4)', () => {
     })
   }
 
-  test.each([...COLLISION_STATES])('state=%s, row cwd another existing directory → kill + delete + one fresh spawn, no resume or reconnect', async (state) => {
+  /** The ladder's line for a row of `C` in `elsewhere` read `state`. */
+  const mismatchLine = (elsewhere: string, work: string, state: string) =>
+    `spawnForPersona: ${renderPersonaRef('C', 'C')} row cwd=${elsewhere} differs from working_directory=${work} (state=${state}) — replacing the row by a reuse spawn of the same id; nothing is deleted`
+
+  test.each([...FINISHED_STATES])('state=%s, row cwd another existing directory → one reuse spawn of the same id in the persona\'s directory; no kill, delete, resume or reconnect', async (state) => {
     const { cfg, work } = guardConfig()
     const elsewhere = fixtureSubdir('elsewhere')
     const calls = newLadderCalls()
@@ -2368,19 +2392,36 @@ describe('collision ladder: cwd guard (b.av2 SR-6.2, AC 4)', () => {
     })
 
     expect(result).toEqual({ key: 'C', action: 'spawned' })
-    expect(calls.killCalls.map((k) => k.claude_instance_id)).toEqual(['cscb_C'])
-    expect(calls.deleteCalls.map((d) => d.claude_instance_id)).toEqual([['cscb_C']])
-    // The colliding spawn plus exactly one fresh spawn, in the persona's directory.
-    expect(calls.spawnCalls).toHaveLength(2)
-    expect(calls.spawnCalls[1].claude_instance_id).toBe('cscb_C')
-    expect(calls.spawnCalls[1].cwd).toBe(work)
+    expect([calls.killCalls, calls.deleteCalls]).toEqual([[], []])
+    // The colliding plain spawn, then exactly one reuse spawn of the same id, in the persona's directory.
+    expect((calls.spawnCalls as Phase1SpawnParams[]).map((call) => [call.claude_instance_id, call.reuse_finished, call.cwd])).toEqual([
+      ['cscb_C', undefined, work],
+      ['cscb_C', true, work],
+    ])
     // Never resumed, reconnected or reconciled-then-resumed.
     expect(calls.resumeCalls).toHaveLength(0)
     expect(calls.sendKeysCalls.filter((s) => String(s.text).includes('/mcp reconnect'))).toHaveLength(0)
     expect(calls.findMissingCalls).toHaveLength(0)
-    expect(errLog).toContain(
-      `spawnForPersona: ${renderPersonaRef('C', 'C')} row cwd=${elsewhere} differs from working_directory=${work} (state=${state}) — replacing the row: kill+delete+fresh`,
-    )
+    expect(errLog).toContain(mismatchLine(elsewhere, work, state))
+  })
+
+  test.each([...LIVE_STATES])('state=%s, row cwd another existing directory → the live-row sequence first: the launch answers sequence-waiting with no kill, delete, spawn, resume or reconnect of its own', async (state) => {
+    const { cfg, work } = guardConfig()
+    const elsewhere = fixtureSubdir('elsewhere')
+    const calls = newLadderCalls()
+    installCollision(personaRow(cfg, 'C', { state, cwd: elsewhere }), calls)
+
+    let result!: Awaited<ReturnType<typeof spawnForPersona>>
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    })
+
+    expect(result).toEqual({ key: 'C', action: 'sequence-waiting' })
+    expect([calls.killCalls, calls.deleteCalls, calls.resumeCalls, calls.sendKeysCalls, calls.findMissingCalls]).toEqual([[], [], [], [], []])
+    // Only the colliding plain spawn.
+    expect(calls.spawnCalls).toHaveLength(1)
+    expect(errLog).toContain(mismatchLine(elsewhere, work, state))
+    expect(errLog).toContain(`start answered ${LIVE_ROW_START_NOT_INSTALLED} — answering sequence-waiting; no other call, nothing counted`)
   })
 
   test.each([
@@ -2415,11 +2456,8 @@ describe('collision ladder: cwd guard (b.av2 SR-6.2, AC 4)', () => {
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
 
     expect(result).toEqual({ key: 'C', action: 'spawned' })
-    expect(calls.killCalls).toHaveLength(1)
-    expect(calls.deleteCalls).toHaveLength(1)
-    expect(calls.resumeCalls).toHaveLength(0)
-    expect(calls.spawnCalls).toHaveLength(2)
-    expect(calls.spawnCalls[1].cwd).toBe(work)
+    expect([calls.killCalls, calls.deleteCalls, calls.resumeCalls]).toEqual([[], [], []])
+    expect((calls.spawnCalls as Phase1SpawnParams[]).map((call) => [call.reuse_finished, call.cwd])).toEqual([[undefined, work], [true, work]])
   })
 
   test.each(['empty', 'absent'] as const)('a row with an %s cwd is a mismatch; the log prints cwd=<none>, never cwd=undefined', async (variant) => {
@@ -2435,44 +2473,20 @@ describe('collision ladder: cwd guard (b.av2 SR-6.2, AC 4)', () => {
     })
 
     expect(result).toEqual({ key: 'C', action: 'spawned' })
-    expect(calls.killCalls).toHaveLength(1)
-    expect(calls.deleteCalls).toHaveLength(1)
-    expect(calls.resumeCalls).toHaveLength(0)
-    expect(calls.spawnCalls[1].cwd).toBe(work)
-    expect(errLog).toContain(
-      `spawnForPersona: ${renderPersonaRef('C', 'C')} row cwd=<none> differs from working_directory=${work} (state=ended) — replacing the row`,
-    )
+    expect([calls.killCalls, calls.deleteCalls, calls.resumeCalls]).toEqual([[], [], []])
+    expect((calls.spawnCalls as Phase1SpawnParams[]).map((call) => [call.reuse_finished, call.cwd])).toEqual([[undefined, work], [true, work]])
+    expect(errLog).toContain(mismatchLine('<none>', work, 'ended'))
     expect(errLog).not.toContain('cwd=undefined')
-  })
-
-  test('a failed delete on the mismatch path → failed, no fresh spawn (never two instances)', async () => {
-    const readLog = captureStartupErrors()
-    const { cfg } = guardConfig()
-    const calls = newLadderCalls()
-    // A delete failure that is no refusal (a LAUNCH FAILURE answer; an
-    // UNCLASSIFIED one is refused, b.jg5 SRJ-313, below).
-    const deleteError = errTmuxSessionCreate('delete')
-    installCollision(personaRow(cfg, 'C', { state: 'waiting', cwd: fixtureSubdir('elsewhere') }), calls, { deleteError })
-
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
-
-    expect(result).toEqual({ key: 'C', action: 'failed' })
-    expect(calls.killCalls).toHaveLength(1)
-    expect(calls.deleteCalls).toHaveLength(1)
-    expect(calls.spawnCalls).toHaveLength(1) // only the colliding spawn
-    expect(calls.resumeCalls).toHaveLength(0)
-    expect(calls.sendKeysCalls).toHaveLength(0)
-    const log = readLog()
-    expect(log).toContain('[spawn-failed]')
-    expect(log).toContain(`delete failed for ${renderPersonaRef('C', 'C')}: ${deleteError.errName}`)
-    expect(notices).toHaveLength(1)
-    expect(notices[0].key).toBe('C')
   })
 })
 
 // ---------------------------------------------------------------------------
-// b.av2 SR-6.2 / AC 48 — before any resume, a missing or changed `config_dir`
-// label means delete + fresh spawn (a resume would keep the old config dir)
+// b.av2 SR-6.2 / AC 48, as amended (b.jg5 SRJ-1504, SRJ-707) — before any
+// resume, a missing or changed `config_dir` label means no resume (a resume
+// would keep the old config dir): a finished row gets one reuse spawn of the
+// same id carrying the current label and CLAUDE_CONFIG_DIR, a live row (the
+// dead-session path's `waiting` row) goes through the live-row sequence
+// first; no row is deleted
 // ---------------------------------------------------------------------------
 
 /** The four ways the ladder reaches a resume. */
@@ -2574,16 +2588,22 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
       return
     }
 
-    // No resume: the row is deleted (and killed first when it may still be
-    // live) and exactly one fresh spawn follows, carrying the current label
-    // and CLAUDE_CONFIG_DIR.
-    expect(result).toEqual({ key: 'C', action: 'spawned' })
-    expect(calls.resumeCalls).toHaveLength(0)
-    expect(calls.killCalls).toHaveLength(dead ? 1 : 0)
-    expect(calls.deleteCalls.map((d) => d.claude_instance_id)).toEqual([['cscb_C']])
-    expect(calls.spawnCalls).toHaveLength(2)
-    expect(calls.spawnCalls[1].label).toEqual(['service=cscb', 'persona=C', `config_dir=${expectedLabel}`])
-    expect(calls.spawnCalls[1].extra_env?.['CLAUDE_CONFIG_DIR']).toBe(configDir)
+    // No resume, and no row killed or deleted. The waiting row, last read
+    // live, goes through the live-row sequence first (none installed here:
+    // the launch answers sequence-waiting with no call of its own); every
+    // other entry last read the row finished (the working-row wait read it
+    // missing after its sweep), so exactly one reuse spawn of the same id
+    // follows, carrying the current label and CLAUDE_CONFIG_DIR.
+    expect([calls.resumeCalls, calls.killCalls, calls.deleteCalls]).toEqual([[], [], []])
+    if (dead && entry.startsWith('waiting')) {
+      expect(result).toEqual({ key: 'C', action: 'sequence-waiting' })
+      expect(calls.spawnCalls).toHaveLength(1)
+    } else {
+      expect(result).toEqual({ key: 'C', action: 'spawned' })
+      expect((calls.spawnCalls as Phase1SpawnParams[]).map((call) => call.reuse_finished)).toEqual([undefined, true])
+      expect(calls.spawnCalls[1].label).toEqual(['service=cscb', 'persona=C', `config_dir=${expectedLabel}`])
+      expect(calls.spawnCalls[1].extra_env?.['CLAUDE_CONFIG_DIR']).toBe(configDir)
+    }
     // A fresh spawn, not amnesia: no transcript diagnosis, record or notice.
     const log = readLog()
     expect(log).not.toContain(JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)
@@ -2592,11 +2612,11 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
     const ref = renderPersonaRef('C', 'C')
     if (variant === 'missing') {
       expect(errLog).toContain(
-        `spawnForPersona: ${ref} config_dir label missing (label absent, now=${expectedLabel} for claude_config_dir=${configDir}) — not resuming; spawning fresh`,
+        `spawnForPersona: ${ref} config_dir label missing (label absent, now=${expectedLabel} for claude_config_dir=${configDir}) — not resuming; replacing its row by a reuse spawn of the same id`,
       )
     } else {
       expect(errLog).toContain(
-        `spawnForPersona: ${ref} config_dir label changed (was=${labels['config_dir']}, now=${expectedLabel} for claude_config_dir=${configDir}) — not resuming; spawning fresh`,
+        `spawnForPersona: ${ref} config_dir label changed (was=${labels['config_dir']}, now=${expectedLabel} for claude_config_dir=${configDir}) — not resuming; replacing its row by a reuse spawn of the same id`,
       )
     }
   })
@@ -2657,7 +2677,7 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
     expect(calls.spawnCalls).toHaveLength(1)
   })
 
-  test('resume_enabled: false with a stale label keeps its kill + delete + fresh path', async () => {
+  test('resume_enabled: false with a stale label takes its own replacement: one reuse spawn of the same id, no kill or delete, and no config_dir line', async () => {
     const { cfg, home } = labelConfig({ resume_enabled: false })
     const calls = newLadderCalls()
     installStub({
@@ -2675,19 +2695,18 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
     })
 
     expect(result).toEqual({ key: 'C', action: 'spawned' })
-    expect(calls.resumeCalls).toHaveLength(0)
-    expect(calls.killCalls).toHaveLength(1)
-    expect(calls.deleteCalls).toHaveLength(1)
-    expect(calls.spawnCalls).toHaveLength(2)
-    expect(errLog).toContain(`resume_enabled=false — kill+delete+fresh for ${renderPersonaRef('C', 'C')}`)
+    expect([calls.resumeCalls, calls.killCalls, calls.deleteCalls]).toEqual([[], [], []])
+    expect((calls.spawnCalls as Phase1SpawnParams[]).map((call) => call.reuse_finished)).toEqual([undefined, true])
+    expect(errLog).toContain(`resume_enabled=false for ${renderPersonaRef('C', 'C')} — not resuming; replacing its row by a reuse spawn of the same id`)
     expect(errLog).not.toContain('config_dir label')
   })
 
   // AC 48 (b.av2 SR-14 "session-manager"): a persona inheriting the top-level
   // claude_config_dir runs; its effective directory then changes through a
   // per-persona override. The row still carries the earlier label, so the
-  // ladder deletes it and spawns fresh with the new CLAUDE_CONFIG_DIR.
-  test('AC 48: a changed effective claude_config_dir (inherited, then overridden) gives a fresh spawn with the new CLAUDE_CONFIG_DIR', async () => {
+  // ladder replaces it by a reuse spawn of the same id with the new
+  // CLAUDE_CONFIG_DIR, deleting nothing (b.jg5 SRJ-1504).
+  test('AC 48: a changed effective claude_config_dir (inherited, then overridden) gives a reuse spawn of the same id with the new CLAUDE_CONFIG_DIR and deletes nothing', async () => {
     const home = useSpawnHome()
     const work = fixtureSubdir('work')
     const earlier = fixtureSubdir('top-level-config')
@@ -2729,8 +2748,8 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
 
     expect(result).toEqual({ key: 'C', action: 'spawned' })
     expect(resumeCalls).toHaveLength(0)
-    expect(deleteCalls.map((d) => d.claude_instance_id)).toEqual([['cscb_C']])
-    expect(spawnCalls).toHaveLength(2)
+    expect(deleteCalls).toEqual([])
+    expect((spawnCalls as Phase1SpawnParams[]).map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([['cscb_C', undefined], ['cscb_C', true]])
     expect(spawnCalls[1].extra_env?.['CLAUDE_CONFIG_DIR']).toBe(later)
     expect(spawnCalls[1].label).toEqual(['service=cscb', 'persona=C', configDirLabelFor(later)])
     expect(spawnCalls[1].label).not.toContain(configDirLabelFor(earlier))
@@ -3090,14 +3109,18 @@ describe('pre-launch reply guard (b.av2 SR-9.4, SR-6.2)', () => {
 
   /**
    * The ticket's named paths (fresh spawn; resume of an ended or missing row;
-   * dead-session recovery; a fresh spawn after a cwd or config_dir mismatch),
-   * which between them reach the optimistic spawn, `client.resume` and
-   * `replaceWithFreshSpawn`, plus one row for each other spawn call site: the
-   * single retry after ErrSpawnNotFound on the post-collision get and each
-   * fallback spawn in `resumeOrFreshSpawn` (the no-transcript reuse spawn
-   * among them). Paths that share a call site with a row here (resume_enabled
-   * false, a dead working row, the other no-transcript resume errors, the restart
-   * adapter — covered end to end in restart.test.ts) have no row of their own.
+   * dead-session recovery; the reuse spawn of the same id after a cwd or
+   * config_dir mismatch on a finished row, b.jg5 SRJ-707), which between them
+   * reach the optimistic spawn, `client.resume` and the replace step's reuse
+   * spawn, plus one row for each other spawn call site: the single retry
+   * after ErrSpawnNotFound on the post-collision get and each fallback spawn
+   * in `resumeOrFreshSpawn` (the no-transcript reuse spawn among them). Paths
+   * that share a call site with a row here (resume_enabled false, a dead
+   * working row, the other no-transcript resume errors, the restart adapter —
+   * covered end to end in restart.test.ts) have no row of their own; a live
+   * row's replacement makes no launch call of its own (the live-row
+   * sequence's step 6 is the sequence-launch entry's), and a resume's
+   * ErrSpawnNotResumable launches nothing (b.jg5 SRJ-710).
    */
   const GUARD_PATHS: Array<[string, GuardPath]> = [
     ['fresh spawn', {
@@ -3120,13 +3143,13 @@ describe('pre-launch reply guard (b.av2 SR-9.4, SR-6.2)', () => {
       expected: 'resumed',
       events: [...COLLIDED, ...RESUME],
     }],
-    ['live row in another directory (cwd mismatch): kill + delete + fresh spawn', {
+    ['ended row in another directory (cwd mismatch): a reuse spawn of the same id', {
       install: (cfg, calls) =>
-        installStub({ ...calls, spawnQueue: [collision(), spawnOk()], getResult: guardRow(cfg, { state: 'waiting', cwd: fixtureSubdir('elsewhere') }) }),
+        installStub({ ...calls, spawnQueue: [collision(), spawnOk()], getResult: guardRow(cfg, { state: 'ended', cwd: fixtureSubdir('elsewhere') }) }),
       expected: 'spawned',
       events: [...COLLIDED, ...SPAWN],
     }],
-    ['ended row with a changed config_dir label: delete + fresh spawn', {
+    ['ended row with a changed config_dir label: a reuse spawn of the same id', {
       install: (cfg, calls) => {
         const labels = { ...guardRow(cfg).labels, config_dir: personaConfigDirLabelValue(fixtureSubdir('earlier-config'), ladderHome()) }
         return installResumeEntry('ended', guardRow(cfg, { labels }), calls, GUARD_KEY)
@@ -3142,11 +3165,6 @@ describe('pre-launch reply guard (b.av2 SR-9.4, SR-6.2)', () => {
     ['resume ErrJsonlMissing: its diagnosis, then the reuse spawn (b.jg5 SRJ-712)', {
       install: (cfg, calls) => installResumeRejects(guardRow(cfg, { state: 'ended' }), calls, errJsonlMissing()),
       expected: 'fresh-after-inconclusive-amnesia',
-      events: [...COLLIDED, ...RESUME, ...SPAWN],
-    }],
-    ['resume ErrSpawnNotResumable: kill + delete + fresh spawn', {
-      install: (cfg, calls) => installResumeRejects(guardRow(cfg, { state: 'ended' }), calls, errSpawnNotResumable()),
-      expected: 'spawned',
       events: [...COLLIDED, ...RESUME, ...SPAWN],
     }],
     ['resume ErrSpawnNotFound: fresh spawn', {
@@ -3428,9 +3446,12 @@ describe('prompt suggestions off on every launch (b.svb, b.f2b)', () => {
   /**
    * Every way a launch reaches agent-director: the fresh spawn; a resume
    * (ended, missing, dead waiting and working rows, the restart relaunch);
-   * each replacement spawn (resume_enabled false, cwd and config_dir
-   * mismatches, the retry after ErrSpawnNotFound on the get); and each
-   * fresh spawn after a rejected resume, the fresh-after-amnesia one included.
+   * each replacement of a finished row, a reuse spawn of the same id
+   * (resume_enabled false, cwd and config_dir mismatches; b.jg5 SRJ-707), and
+   * the retry after ErrSpawnNotFound on the get; and each spawn after a
+   * rejected resume, the fresh-after-amnesia one included. A live row's
+   * replacement and a resume's ErrSpawnNotResumable make no launch of their
+   * own (b.jg5 SRJ-705, SRJ-710).
    */
   const ENV_PATHS: Array<[string, EnvPath]> = [
     ['fresh spawn', { install: (_cfg, calls) => installStub({ ...calls }), expected: spawned, spawns: 1, resumes: 0 }],
@@ -3449,17 +3470,17 @@ describe('prompt suggestions off on every launch (b.svb, b.f2b)', () => {
       launch: (cfg) => launchSession('C', cfg),
       expected: true, spawns: 1, resumes: 1,
     }],
-    ['resume_enabled false: kill + delete + fresh spawn', {
+    ['resume_enabled false: a reuse spawn of the same id', {
       config: { resume_enabled: false },
       install: (cfg, calls) => installStub({ ...calls, spawnQueue: [collision(), spawnOk()], getResult: personaRow(cfg, 'C', { state: 'ended' }) }),
       expected: spawned, spawns: 2, resumes: 0,
     }],
-    ['live row in another directory (cwd mismatch): kill + delete + fresh spawn', {
+    ['ended row in another directory (cwd mismatch): a reuse spawn of the same id', {
       install: (cfg, calls) =>
-        installStub({ ...calls, spawnQueue: [collision(), spawnOk()], getResult: personaRow(cfg, 'C', { state: 'waiting', cwd: fixtureSubdir('elsewhere') }) }),
+        installStub({ ...calls, spawnQueue: [collision(), spawnOk()], getResult: personaRow(cfg, 'C', { state: 'ended', cwd: fixtureSubdir('elsewhere') }) }),
       expected: spawned, spawns: 2, resumes: 0,
     }],
-    ['ended row with a changed config_dir label: delete + fresh spawn', {
+    ['ended row with a changed config_dir label: a reuse spawn of the same id', {
       install: (cfg, calls) => {
         const labels = { ...personaRow(cfg, 'C').labels, config_dir: personaConfigDirLabelValue(fixtureSubdir('earlier-config'), ladderHome()) }
         return installResumeEntry('ended', personaRow(cfg, 'C', { labels }), calls)
@@ -3476,10 +3497,6 @@ describe('prompt suggestions off on every launch (b.svb, b.f2b)', () => {
     }],
     ['resume ErrNoSessionId: the reuse spawn (b.jg5 SRJ-707)', {
       install: (cfg, calls) => installResumeRejects(cfg, calls, errNoSessionId()),
-      expected: spawned, spawns: 2, resumes: 1,
-    }],
-    ['resume ErrSpawnNotResumable: kill + delete + fresh spawn', {
-      install: (cfg, calls) => installResumeRejects(cfg, calls, errSpawnNotResumable()),
       expected: spawned, spawns: 2, resumes: 1,
     }],
     ['resume ErrSpawnNotFound: fresh spawn', {
@@ -3709,7 +3726,7 @@ describe('launchSession: a key outside the applied set (b.av2 SR-8.6)', () => {
 // ---------------------------------------------------------------------------
 
 describe('next launch: the applied values at launch time (b.av2 SR-8.6 next-launch rows, AC 59)', () => {
-  test('claude_config_dir and stop_hook_bootstrap changed between two launches: the first uses the old values; the second deletes the old-label row and spawns fresh with the new CLAUDE_CONFIG_DIR (not created yet, under a symlinked parent) and writes the new record', async () => {
+  test('claude_config_dir and stop_hook_bootstrap changed between two launches: the first uses the old values; the second gives the old-label row a reuse spawn of the same id with the new CLAUDE_CONFIG_DIR (not created yet, under a symlinked parent), deletes nothing and writes the new record', async () => {
     useSpawnHome()
     const work = fixtureSubdir('work')
     const oldDir = fixtureSubdir('claude-config-old')
@@ -3758,8 +3775,11 @@ describe('next launch: the applied values at launch time (b.av2 SR-8.6 next-laun
 
     expect(result).toBe(true)
     expect(second.resumeCalls).toHaveLength(0)
-    expect(second.deleteCalls.map((d) => d.claude_instance_id)).toEqual([[GUARD_INSTANCE]])
-    expect(second.spawnCalls).toHaveLength(2)
+    expect(second.deleteCalls).toEqual([])
+    expect((second.spawnCalls as Phase1SpawnParams[]).map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([
+      [GUARD_INSTANCE, undefined],
+      [GUARD_INSTANCE, true],
+    ])
     expect(second.spawnCalls[1]!.extra_env?.['CLAUDE_CONFIG_DIR']).toBe(newDir)
     expect(second.spawnCalls[1]!.label).toEqual([
       'service=cscb',
@@ -4153,46 +4173,6 @@ describe('launch attempt: the refusal marker and launchSession\'s \'refused\' (b
     expect(view?.dueAt).toBe(r.clock.now() + UNAVAILABLE_RETRY_BASE_S * 1000)
     expect(view?.causes).toEqual([UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE])
     expect(r.clock.pendingCount()).toBe(1)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// resume_enabled: false replaces the row through the shared kill+delete+fresh
-// path; its fresh spawn's ErrTmuxSessionCreate is one counted launch failure
-// (b.jg5 SRJ-602, SRJ-713)
-// ---------------------------------------------------------------------------
-
-describe('resume_enabled: false fresh spawn answering ErrTmuxSessionCreate', () => {
-  test('one counted launch failure: failed, a spawn-failed entry and one notice; nothing killed for it (no kill call beyond the replacement\'s, no raw tmux call) and no spawn in its place', async () => {
-    const readLog = captureStartupErrors()
-    const tmux = recordTmuxCalls()
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { resume_enabled: false })
-    const spawnCalls: import('agent-director').SpawnParams[] = []
-    const killCalls: import('agent-director').KillParams[] = []
-    const deleteCalls: import('agent-director').DeleteParams[] = []
-    const launchFailure = errTmuxSessionCreate('spawn')
-    installStub({
-      spawnCalls,
-      killCalls,
-      deleteCalls,
-      spawnQueue: [
-        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedErr<import('agent-director').SpawnResult>(launchFailure),
-      ],
-      getResult: personaRow(cfg, 'C', { state: 'ended' }),
-    })
-
-    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
-    await withCapturedErr(async () => {
-      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
-    })
-
-    expect(result).toStrictEqual({ key: 'C', action: 'failed', countedClass: true })
-    expect([killCalls.length, deleteCalls.length, spawnCalls.length]).toEqual([1, 1, 2])
-    expect(tmux).toEqual([])
-    expect(onlyStartupEntry(readLog(), 'spawn-failed')).toContain(`fresh spawn after delete failed for ${renderPersonaRef('C', 'C')}: ${launchFailure.errName}`)
-    expect(notices.map((n) => n.key)).toEqual(['C'])
-    expect(notices[0].text).toContain(launchFailure.errName)
   })
 })
 
@@ -5270,7 +5250,7 @@ describe('collision ladder: a directory-broken persona keeps its row (b.av2 SR-6
     return makeStandInPersonaConfig({ C: { working_directory: workingDirectory } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
   }
 
-  /** `n` colliding spawns, then one that succeeds (for a fresh spawn after kill + delete). */
+  /** `n` colliding spawns, then one that succeeds. */
   function collisionsThenOk(n: number): CannedResponse<import('agent-director').SpawnResult>[] {
     return [
       ...Array.from({ length: n }, () => cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())),
@@ -5349,9 +5329,10 @@ describe('collision ladder: a directory-broken persona keeps its row (b.av2 SR-6
 
   // A row whose cwd resolves to an existing directory elsewhere is not
   // deferred even while the persona's own directory is missing: it may be
-  // another persona's instance, so it is replaced, never adopted. The fresh
-  // spawn then fails on the missing directory as any spawn there would.
-  test('a removed directory whose row cwd is another existing directory: killed, deleted and spawned fresh; the fresh spawn fails with ErrCwdNotFound → cwd-unreachable', async () => {
+  // another persona's instance, so it is replaced, never adopted (a finished
+  // row by a reuse spawn of the same id, b.jg5 SRJ-707). The reuse then fails
+  // on the missing directory as any spawn there would.
+  test('a removed directory whose row cwd is another existing directory: replaced by a reuse spawn of the same id, nothing killed or deleted; the reuse fails with ErrCwdNotFound → cwd-unreachable', async () => {
     const work = fixtureSubdir('work')
     const cfg = brokenConfig(work)
     rmSync(work, { recursive: true })
@@ -5368,15 +5349,12 @@ describe('collision ladder: a directory-broken persona keeps its row (b.av2 SR-6
 
     const { result, errLog } = await launch(cfg)
 
-    expect(result).toEqual({ key: 'C', action: 'failed' })
-    expect(calls.killCalls.map((k) => k.claude_instance_id)).toEqual(['cscb_C'])
-    expect(calls.deleteCalls.map((d) => d.claude_instance_id)).toEqual([['cscb_C']])
-    expect(calls.resumeCalls).toHaveLength(0)
-    // The colliding spawn, then the fresh one in the persona's directory.
-    expect(calls.spawnCalls).toHaveLength(2)
-    expect(calls.spawnCalls[1].cwd).toBe(work)
+    expect(result).toEqual({ key: 'C', action: 'failed', countedClass: true })
+    expect([calls.killCalls, calls.deleteCalls, calls.resumeCalls]).toEqual([[], [], []])
+    // The colliding spawn, then the reuse in the persona's directory.
+    expect((calls.spawnCalls as Phase1SpawnParams[]).map((call) => [call.reuse_finished, call.cwd])).toEqual([[undefined, work], [true, work]])
     expect(errLog).toContain(
-      `spawnForPersona: ${renderPersonaRef('C', 'C')} row cwd=${elsewhere} differs from working_directory=${work} (state=ended) — replacing the row: kill+delete+fresh`,
+      `spawnForPersona: ${renderPersonaRef('C', 'C')} row cwd=${elsewhere} differs from working_directory=${work} (state=ended) — replacing the row by a reuse spawn of the same id; nothing is deleted`,
     )
     expect(errLog).not.toContain('cannot be resolved')
     expect(getOutageFlags('C').has('cwd-unreachable')).toBe(true)
@@ -5432,7 +5410,7 @@ describe('collision ladder: a directory-broken persona keeps its row (b.av2 SR-6
     },
   )
 
-  test('a persona come up with an ended row carrying a stale config_dir label: the config_dir check still runs → delete + fresh spawn, no resume', async () => {
+  test('a persona come up with an ended row carrying a stale config_dir label: the config_dir check still runs → one reuse spawn of the same id, no resume, kill or delete', async () => {
     const broken = brokenWorkdir('a dangling symlink, row cwd its old real target')
     const cfg = brokenConfig(broken.workingDirectory)
     const stale = personaConfigDirLabelValue(fixtureSubdir('earlier-config'), ladderHome())
@@ -5444,10 +5422,8 @@ describe('collision ladder: a directory-broken persona keeps its row (b.av2 SR-6
     const { result, errLog } = await launch(cfg)
 
     expect(result).toEqual({ key: 'C', action: 'spawned' })
-    expect(calls.resumeCalls).toHaveLength(0)
-    expect(calls.killCalls).toHaveLength(0)
-    expect(calls.deleteCalls.map((d) => d.claude_instance_id)).toEqual([['cscb_C']])
-    expect(calls.spawnCalls).toHaveLength(2)
+    expect([calls.resumeCalls, calls.killCalls, calls.deleteCalls]).toEqual([[], [], []])
+    expect((calls.spawnCalls as Phase1SpawnParams[]).map((call) => call.reuse_finished)).toEqual([undefined, true])
     expect(errLog).toContain(`spawnForPersona: ${renderPersonaRef('C', 'C')} config_dir label changed (was=${stale}`)
   })
 })
@@ -6451,7 +6427,9 @@ describe('b.rmy: ErrTmuxSendKeys at the reconnect + reconnect outcome', () => {
     expect(readLog()).toBe('')
   })
 
-  test('spawnForPersona waiting branch (b.3ce): dead session + resume not resumable → kill+delete+fresh spawn', async () => {
+  // b.jg5 SRJ-710: ErrSpawnNotResumable is a lost race, never by itself a
+  // reason to kill and replace: nothing is killed, deleted or launched.
+  test('spawnForPersona waiting branch (b.3ce): dead session + resume not resumable → a lost race: the uncounted refused result, nothing killed, deleted or launched', async () => {
     const killCalls: import('agent-director').KillParams[] = []
     const deleteCalls: import('agent-director').DeleteParams[] = []
     const spawnCalls: import('agent-director').SpawnParams[] = []
@@ -6471,11 +6449,10 @@ describe('b.rmy: ErrTmuxSendKeys at the reconnect + reconnect outcome', () => {
       resumeError: errSpawnNotResumable(), // stale `waiting` row rejects resume
     })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
-    expect(result.action).toBe('spawned')
+    expect(result).toEqual({ key: 'C', action: 'failed', refused: true })
     expect(sendKeysCalls).toHaveLength(1)
-    expect(killCalls).toHaveLength(1)
-    expect(deleteCalls).toHaveLength(1)
-    expect(spawnCalls).toHaveLength(2) // initial collision + fresh spawn
+    expect([killCalls, deleteCalls]).toEqual([[], []])
+    expect(spawnCalls).toHaveLength(1) // the initial collision only
   })
 
   test('spawnForPersona waiting branch: dead session and recovery also fails → action=failed', async () => {
@@ -7044,8 +7021,8 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
 //
 // AD's resume verb requires a terminal (ended/missing) row. A dead-session
 // verdict arrives with a LIVE-state row (waiting/working), so pre-fix resume
-// was structurally guaranteed to throw ErrSpawnNotResumable → kill+delete+
-// fresh, destroying the session_id resume needed. The fix runs one
+// was structurally guaranteed to throw ErrSpawnNotResumable, which is now a
+// lost race (b.jg5 SRJ-710) and never a replacement. The fix runs one
 // client.findMissing({}) BEFORE resume (only on the dead-session callers) so
 // AD transitions the dead row to `missing` and resume can succeed.
 //
@@ -7137,12 +7114,13 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
   })
 
   // findMissing rejects → still attempt resume anyway → on a still-live row AD
-  // throws ErrSpawnNotResumable → existing defensive kill+delete+fresh preserved.
+  // throws ErrSpawnNotResumable → a lost race (b.jg5 SRJ-710): nothing killed,
+  // deleted or launched.
   // The rejection is one that is no refusal at `find-missing` (an UNUSABLE
   // NAME answer, b.jg5 SRJ-105); an UNAVAILABLE, ENVIRONMENT, CONFIG or
   // UNCLASSIFIED one stops the attempt there (the SRJ-105, SRJ-311, SRJ-316 and
   // SRJ-313 sweep cases below).
-  test('waiting dead-session: findMissing rejects → resume attempted → ErrSpawnNotResumable → kill+delete+fresh', async () => {
+  test('waiting dead-session: findMissing rejects → resume attempted → ErrSpawnNotResumable → a lost race, nothing killed, deleted or launched', async () => {
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
     const resumeCalls: import('agent-director').ResumeParams[] = []
     const killCalls: import('agent-director').KillParams[] = []
@@ -7165,17 +7143,18 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
       resumeError: errSpawnNotResumable(), // row still live-state → resume rejects
     })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
-    expect(result.action).toBe('spawned')
+    expect(result).toEqual({ key: 'C', action: 'failed', refused: true })
     expect(findMissingCalls).toHaveLength(1)
     expect(resumeCalls).toHaveLength(1) // resume still attempted despite findMissing failure
-    expect(killCalls).toHaveLength(1)
-    expect(deleteCalls).toHaveLength(1)
-    expect(spawnCalls).toHaveLength(2)
+    expect([killCalls, deleteCalls]).toEqual([[], []])
+    expect(spawnCalls).toHaveLength(1)
   })
 
-  // resume_enabled=false short-circuits BEFORE the findMissing block —
-  // kill+delete+fresh as before, no findMissing, no resume.
-  test('resume_enabled=false dead-session: no findMissing, no resume (kill+delete+fresh)', async () => {
+  // resume_enabled=false short-circuits BEFORE the findMissing block: the
+  // replace step decides on the row last read, `waiting` (live), so the
+  // live-row sequence goes first (none installed here) — no findMissing, no
+  // resume, kill, delete or spawn of the launch's own (b.jg5 SRJ-707).
+  test('resume_enabled=false dead-session: no findMissing, no resume; the live row goes to the live-row sequence (sequence-waiting), nothing killed or deleted', async () => {
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
     const resumeCalls: import('agent-director').ResumeParams[] = []
     const killCalls: import('agent-director').KillParams[] = []
@@ -7194,11 +7173,10 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
       sendKeysError: errTmuxSendKeys(),
     })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
-    expect(result.action).toBe('spawned')
+    expect(result).toEqual({ key: 'C', action: 'sequence-waiting' })
     expect(findMissingCalls).toHaveLength(0)
     expect(resumeCalls).toHaveLength(0)
-    expect(killCalls).toHaveLength(1)
-    expect(deleteCalls).toHaveLength(1)
+    expect([killCalls, deleteCalls]).toEqual([[], []])
   })
 
   // b.jg5 SRJ-602: an ErrTmuxSessionCreate on resume in the dead-session path,
@@ -10400,34 +10378,35 @@ const SUCCESS_SITES: ReadonlyArray<readonly [string, SuccessSite]> = [
     'the retry spawn after the collision get answers ErrSpawnNotFound',
     { script: (_cfg, preTrust) => ({ spawnQueue: [collision(), spawnOk(preTrust)], getError: errSpawnNotFound() }), launchVerb: 'spawn', action: 'spawned' },
   ],
+  // b.jg5 SRJ-707: a finished row the ladder cannot keep is replaced by one reuse spawn of the same id.
   [
-    'the fresh spawn of a replacement of a row in another directory (kill, delete, spawn)',
+    'the reuse spawn replacing an ended row in another directory',
     {
       script: (cfg, preTrust) => ({
         spawnQueue: [collision(), spawnOk(preTrust)],
-        getResult: personaRow(cfg, SUCCESS_SITE_KEY, { state: 'waiting', cwd: fixtureSubdir('elsewhere') }),
+        getResult: personaRow(cfg, SUCCESS_SITE_KEY, { state: 'ended', cwd: fixtureSubdir('elsewhere') }),
       }),
-      launchVerb: 'spawn',
+      launchVerb: LAUNCH_VERB_REUSE_SPAWN,
       action: 'spawned',
     },
   ],
   [
-    'the fresh spawn of a replacement of a row whose config_dir label changed (delete, spawn)',
+    'the reuse spawn replacing an ended row whose config_dir label changed',
     {
       script: (cfg, preTrust) => {
         const labels = { ...endedRow(cfg).labels, config_dir: personaConfigDirLabelValue(fixtureSubdir('earlier-config'), ladderHome()) }
         return { spawnQueue: [collision(), spawnOk(preTrust)], getResult: personaRow(cfg, SUCCESS_SITE_KEY, { state: 'ended', labels }) }
       },
-      launchVerb: 'spawn',
+      launchVerb: LAUNCH_VERB_REUSE_SPAWN,
       action: 'spawned',
     },
   ],
   [
-    'the fresh spawn of a replacement with resume_enabled false (kill, delete, spawn)',
+    'the reuse spawn replacing an ended row with resume_enabled false',
     {
       script: (cfg, preTrust) => ({ spawnQueue: [collision(), spawnOk(preTrust)], getResult: endedRow(cfg) }),
       config: { resume_enabled: false },
-      launchVerb: 'spawn',
+      launchVerb: LAUNCH_VERB_REUSE_SPAWN,
       action: 'spawned',
     },
   ],
@@ -10435,7 +10414,6 @@ const SUCCESS_SITES: ReadonlyArray<readonly [string, SuccessSite]> = [
   ['the reuse spawn after resume\'s ErrNoSessionId', { script: resumeAnswers(errNoSessionId()), launchVerb: LAUNCH_VERB_REUSE_SPAWN, action: 'spawned' }],
   ['the reuse spawn after resume\'s ErrJsonlMissing and its diagnosis', { script: resumeAnswers(errJsonlMissing()), launchVerb: LAUNCH_VERB_REUSE_SPAWN, action: 'fresh-after-inconclusive-amnesia' }],
   ['the reuse spawn after resume\'s ErrJsonlNeverWritten', { script: resumeAnswers(errJsonlNeverWritten()), launchVerb: LAUNCH_VERB_REUSE_SPAWN, action: 'spawned' }],
-  ['the spawn after resume\'s ErrSpawnNotResumable (kill, delete, spawn)', { script: resumeAnswers(errSpawnNotResumable()), launchVerb: 'spawn', action: 'spawned' }],
   ['the spawn after resume\'s ErrSpawnNotFound', { script: resumeAnswers(errSpawnNotFound()), launchVerb: 'spawn', action: 'spawned' }],
   ['the resume of an ended row', ENDED_ROW_RESUME_SITE],
   [
@@ -11052,50 +11030,25 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Site #9 — ladderKill → kill (tested via spawnForPersona collision path)
-  // ErrSystemInstallDisappeared is UNCLASSIFIED (b.jg5 SRJ-104): at the kill
-  // it is a refusal (SRJ-105's UNCLASSIFIED row, SRJ-313), so nothing is
-  // deleted or launched after it, and the wrapper still raises the outage
-  // flag.
+  // Site #9 — the replace step's reuse spawn (resume_enabled=false, a finished
+  // row; b.jg5 SRJ-707). The collision ladder makes no kill and no delete, so
+  // there are no kill or delete sites. ErrSystemInstallDisappeared is
+  // UNCLASSIFIED (b.jg5 SRJ-104): at the reuse it is a refusal (SRJ-112,
+  // SRJ-313), and the wrapper still raises the outage flag.
   // -------------------------------------------------------------------------
 
-  test('site #9: ladderKill kill ErrSystemInstallDisappeared → ad-unreachable, refused (b.jg5 SRJ-105, SRJ-313): no delete or launch after it, no spawn-failure notice', async () => {
-    // collision → get=ended → resume_enabled=false → kill throws (flag set, refused)
+  test('site #9: the reuse spawn replacing a finished row (resume_enabled=false) ErrSystemInstallDisappeared → ad-unreachable, refused (b.jg5 SRJ-112, SRJ-313): no further launch, no kill or delete, no spawn-failure notice', async () => {
     const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir, { resume_enabled: false })
     const calls = newLadderCalls()
     installStub({
       ...calls,
-      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(new ErrSystemInstallDisappeared('spawn', BIN))],
       getResult: personaRow(cfg, 'C', { state: 'ended' }),
-      killError: new ErrSystemInstallDisappeared('kill', BIN),
-    })
-    let result!: Awaited<ReturnType<typeof spawnForPersona>>
-    const errLog = await withCapturedErr(async () => {
-      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
-    })
-    expect(result.action).toBe('failed')
-    expect(calls.killCalls).toHaveLength(1)
-    expect(calls.deleteCalls).toHaveLength(0)
-    expect(calls.spawnCalls).toHaveLength(1) // the colliding spawn only: the refused kill stops the chain
-    expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
-    expect(notices).toHaveLength(0)
-    expect(errLog.split('\n').filter((l) => l.startsWith(`[slack] spawnForPersona: kill refused for ${renderPersonaRef('C', 'C')}: `))).toHaveLength(1)
-  })
-
-  // -------------------------------------------------------------------------
-  // Site #10 — tryDelete → delete
-  // -------------------------------------------------------------------------
-
-  test('site #10: tryDelete delete ErrSystemInstallDisappeared → ad-unreachable, no spawn-failure notice', async () => {
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir, { resume_enabled: false })
-    installStub({
-      spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getResult: personaRow(cfg, 'C', { state: 'ended' }),
-      // kill succeeds; delete fails with typed outage error
-      deleteError: new ErrSystemInstallDisappeared('delete', BIN),
     })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('failed')
+    expect([calls.killCalls, calls.deleteCalls]).toEqual([[], []])
+    expect((calls.spawnCalls as Phase1SpawnParams[]).map((call) => call.reuse_finished)).toEqual([undefined, true])
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
     expect(notices).toHaveLength(0)
   })
@@ -11161,10 +11114,10 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Site #14 — spawnForPersona fresh-spawn after kill+delete (resume_enabled=false)
+  // Site #14 — the replace step's reuse spawn (resume_enabled=false, b.jg5 SRJ-707)
   // -------------------------------------------------------------------------
 
-  test('site #14: fresh-spawn after kill+delete ErrCwdNotFound → cwd-unreachable, no spawn-failure notice', async () => {
+  test('site #14: the reuse spawn replacing a finished row ErrCwdNotFound → cwd-unreachable, no spawn-failure notice', async () => {
     const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir, { resume_enabled: false })
     installStub({
       spawnQueue: [
@@ -11213,26 +11166,6 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('failed')
     expect(getOutageFlags('C').has('cwd-unreachable')).toBe(true)
-    expect(notices).toHaveLength(0)
-  })
-
-  // -------------------------------------------------------------------------
-  // Site #17 — spawnForPersona spawn after ErrSpawnNotResumable → kill+delete → spawn
-  // -------------------------------------------------------------------------
-
-  test('site #17: spawn after ErrSpawnNotResumable kill+delete ErrSystemInstallDisappeared → ad-unreachable, no spawn-failure notice', async () => {
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir)
-    installStub({
-      spawnQueue: [
-        cannedErr(errInstanceIdCollision()),
-        cannedErr(new ErrSystemInstallDisappeared('spawn', BIN)),
-      ],
-      getResult: personaRow(cfg, 'C', { state: 'ended' }),
-      resumeError: errSpawnNotResumable(),
-    })
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
-    expect(result.action).toBe('failed')
-    expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
     expect(notices).toHaveLength(0)
   })
 
@@ -11295,7 +11228,7 @@ describe('wrapper-migration: dialog outage cases (Group B)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Group C: spawn/resume success-clear (sites #11, #13, #14, #15, #16, #17)
+// Group C: spawn/resume success-clear (sites #11, #13, #14, #15, #16)
 // Each pre-sets all three outage flags then exercises a spawn/resume success
 // path, asserting flags are empty and exactly one all-clear was emitted
 // naming all three classes.
@@ -11351,10 +11284,10 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Site #14 — fresh-spawn after kill+delete (resume_enabled=false) success
+  // Site #14 — the replace step's reuse spawn (resume_enabled=false) success
   // -------------------------------------------------------------------------
 
-  test('site #14: fresh-spawn after kill+delete (resume_enabled=false) clears all three flags', async () => {
+  test('site #14: the reuse spawn replacing a finished row (resume_enabled=false) clears all three flags', async () => {
     setupFlags()
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { resume_enabled: false })
     installStub({
@@ -11399,26 +11332,6 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
       ],
       getResult: personaRow(cfg, CH, { state: 'ended' }),
       resumeError: errNoSessionId(),
-    })
-    const result = await spawnForPersona(personaOf(cfg, CH), cfg, false)
-    expect(result.action).toBe('spawned')
-    assertAllClear()
-  })
-
-  // -------------------------------------------------------------------------
-  // Site #17 — fresh-spawn after ErrSpawnNotResumable → kill+delete → spawn success
-  // -------------------------------------------------------------------------
-
-  test('site #17: spawn after ErrSpawnNotResumable kill+delete success clears all three flags', async () => {
-    setupFlags()
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-    installStub({
-      spawnQueue: [
-        cannedErr(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
-      ],
-      getResult: personaRow(cfg, CH, { state: 'ended' }),
-      resumeError: errSpawnNotResumable(),
     })
     const result = await spawnForPersona(personaOf(cfg, CH), cfg, false)
     expect(result.action).toBe('spawned')
@@ -14000,7 +13913,8 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
 // stub's `spawn`, `resume`, `kill`, `delete` and `send-keys` counts are
 // exact, so a kill, delete or launch after the refusal (or a dead-session
 // resume) fails the case. Each case also asserts no session-manager notice (a
-// spawn-failure notice), no outage notice, no `spawn-failed` entry, one
+// spawn-failure notice), no episode post (no `tmux-unresponsive` onset
+// before the next tick), no outage notice, no `spawn-failed` entry, one
 // refusal line, a `{ failed, refused }` result, `launchSession` answering
 // `'refused'`, a failure count left at 0, and persona B launching as before.
 // The working-row wait's `status` reads are the exception (b.jg5 SRJ-605):
@@ -14053,12 +13967,6 @@ interface LadderSite {
   /** Every launch and destructive call one such launch makes, the refused one included. */
   readonly calls: LaunchVerbCalls
   /**
-   * Set on a kill site whose row the ladder read live (b.jg5 SRJ-702): an
-   * UNAVAILABLE answer there is tried up to `KILL_RETRY_TRIES` times, so
-   * the launch makes that many kills (`siteCalls`).
-   */
-  readonly killReadLive?: true
-  /**
    * Set on the reconnect's sites only: the ladder branch (`waiting` or
    * `working`) whose reconnect meets the error. The reconnect answers
    * `transient` by SRJ-118's reconnect row, with its own lines in place of
@@ -14075,11 +13983,17 @@ function harnessRow(h: RecoveryHarness, persona: Persona, overrides: PersonaGetR
   return cannedGetResult(overrides, persona, h.home)
 }
 
-/** `persona`'s row reading `waiting` whose `config_dir` label is missing (b.av2 SR-6.2: never resumed). */
-function unlabelledWaitingRow(h: RecoveryHarness, persona: Persona): PersonaGetResultOverrides {
-  const labels: Record<string, string> = { ...harnessRow(h, persona, { state: 'waiting' }).labels }
+/** `persona`'s row in its own directory reading `state`, with no `config_dir` label (b.av2 SR-6.2: never resumed). */
+function unlabelledRow(h: RecoveryHarness, persona: Persona, state: RecoveryRowState): PersonaGetResultOverrides {
+  const labels: Record<string, string> = { ...harnessRow(h, persona, { state }).labels }
   delete labels['config_dir']
-  return { state: 'waiting', labels }
+  return { state, labels }
+}
+
+/** `persona`'s row in its own directory reading `state`, its `config_dir` label naming another directory (b.av2 SR-6.2: never resumed). */
+function relabelledRow(h: RecoveryHarness, persona: Persona, state: RecoveryRowState): PersonaGetResultOverrides {
+  const labels: Record<string, string> = { ...harnessRow(h, persona, { state }).labels, config_dir: personaConfigDirLabelValue(h.stateDir, h.home) }
+  return { state, labels }
 }
 
 /** A row in another directory (the harness home), reading `state`. */
@@ -14109,7 +14023,7 @@ function deadlineAtStart(h: RecoveryHarness): void {
   _setWaitForWaitingTimeoutMs(0)
 }
 
-/** `resume_enabled: false`: every row found is replaced (kill, delete, fresh spawn). */
+/** `resume_enabled: false`: every row found is replaced (a finished row by a reuse spawn of the same id, b.jg5 SRJ-707). */
 function noResume(h: RecoveryHarness): void {
   h.config.resume_enabled = false
 }
@@ -14124,6 +14038,45 @@ function noResume(h: RecoveryHarness): void {
 function promptRowPanesGone(h: RecoveryHarness): void {
   h.script({ readPaneError: errTmuxCaptureFailed() })
 }
+
+/**
+ * The replacement sites over a finished row (b.jg5 SRJ-707, SRJ-1503,
+ * SRJ-1504): `resume_enabled` false, a row in another directory, and a
+ * `config_dir` label missing or different, each over an `ended` row the
+ * collision `get` read; the ladder's one reuse spawn of the same id there is
+ * the refused call (the colliding first spawn, then the reuse).
+ */
+const REPLACEMENT_REUSE_SITES: readonly LadderSite[] = [
+  {
+    name: 'the reuse spawn of a replacement (resume_enabled false, an ended row)',
+    verb: 'spawn',
+    setup: noResume,
+    script: (h, p, err) => collided(h, p, { state: 'ended' }, err),
+    calls: ladderCallsOf({ spawn: 2 }),
+    reuse: true,
+  },
+  {
+    name: 'the reuse spawn of a replacement (an ended row in another directory)',
+    verb: 'spawn',
+    script: (h, p, err) => collided(h, p, elsewhere(h, 'ended'), err),
+    calls: ladderCallsOf({ spawn: 2 }),
+    reuse: true,
+  },
+  {
+    name: 'the reuse spawn of a replacement (an ended row with no config_dir label)',
+    verb: 'spawn',
+    script: (h, p, err) => collided(h, p, unlabelledRow(h, p, 'ended'), err),
+    calls: ladderCallsOf({ spawn: 2 }),
+    reuse: true,
+  },
+  {
+    name: 'the reuse spawn of a replacement (an ended row whose config_dir label differs)',
+    verb: 'spawn',
+    script: (h, p, err) => collided(h, p, relabelledRow(h, p, 'ended'), err),
+    calls: ladderCallsOf({ spawn: 2 }),
+    reuse: true,
+  },
+]
 
 /**
  * Each spawn and resume the ladder makes, as the site where the launch meets
@@ -14148,107 +14101,16 @@ const SPAWN_AND_RESUME_SITES: readonly LadderSite[] = [
     reuse: true,
   },
   {
-    name: 'the fresh spawn after the resume\'s ErrSpawnNotResumable, its kill and its delete',
-    verb: 'spawn',
-    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }, err), resumeError: errSpawnNotResumable() }),
-    calls: ladderCallsOf({ spawn: 2, resume: 1, kill: 1, delete: 1 }),
-  },
-  {
     name: 'the fresh spawn after the resume\'s ErrSpawnNotFound',
     verb: 'spawn',
     script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }, err), resumeError: errSpawnNotFound() }),
     calls: ladderCallsOf({ spawn: 2, resume: 1 }),
   },
-  {
-    name: 'the fresh spawn of a replacement (resume_enabled false), after its kill and delete',
-    verb: 'spawn',
-    setup: noResume,
-    script: (h, p, err) => collided(h, p, { state: 'ended' }, err),
-    calls: ladderCallsOf({ spawn: 2, kill: 1, delete: 1 }),
-  },
-  {
-    name: 'the fresh spawn of a replacement (a row in another directory), after its kill and delete',
-    verb: 'spawn',
-    script: (h, p, err) => collided(h, p, elsewhere(h, 'ended'), err),
-    calls: ladderCallsOf({ spawn: 2, kill: 1, delete: 1 }),
-  },
+  // b.jg5 SRJ-707, SRJ-709: each replacement site over a finished row makes
+  // one reuse spawn of the same id, with no kill or delete before it.
+  ...REPLACEMENT_REUSE_SITES,
 ]
 
-/**
- * The calls one launch meeting `err` at `site` makes: the site's own, with
- * the kill's tries when the site kills a row read live and `err` is
- * UNAVAILABLE (b.jg5 SRJ-702).
- */
-function siteCalls(site: LadderSite, err: Error): LaunchVerbCalls {
-  const retried = site.killReadLive === true && classifyAdError(err).errorClass === AD_ERROR_CLASS_UNAVAILABLE
-  return retried ? { ...site.calls, kill: KILL_RETRY_TRIES } : site.calls
-}
-
-/** The kill before each replacement: nothing is deleted or launched after it. */
-const KILL_SITES: readonly LadderSite[] = [
-  {
-    name: 'the kill of a replacement (resume_enabled false)',
-    verb: 'kill',
-    setup: noResume,
-    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), killError: err }),
-    calls: ladderCallsOf({ spawn: 1, kill: 1 }),
-  },
-  {
-    name: 'the kill of a replacement (a row in another directory, read waiting)',
-    verb: 'kill',
-    script: (h, p, err) => ({ ...collided(h, p, elsewhere(h, 'waiting')), killError: err }),
-    calls: ladderCallsOf({ spawn: 1, kill: 1 }),
-    killReadLive: true,
-  },
-  {
-    name: 'the kill of a replacement (a row in another directory, read ended)',
-    verb: 'kill',
-    script: (h, p, err) => ({ ...collided(h, p, elsewhere(h, 'ended')), killError: err }),
-    calls: ladderCallsOf({ spawn: 1, kill: 1 }),
-  },
-  {
-    name: 'the kill of a replacement (a missing config_dir label, after a dead-session verdict on a waiting row)',
-    verb: 'kill',
-    script: (h, p, err) => ({
-      ...collided(h, p, unlabelledWaitingRow(h, p)),
-      sendKeysError: errSpawnNotInteractive('send-keys'),
-      killError: err,
-    }),
-    calls: ladderCallsOf({ spawn: 1, sendKeys: 1, kill: 1 }),
-    killReadLive: true,
-  },
-  {
-    name: 'the kill after the resume\'s ErrSpawnNotResumable',
-    verb: 'kill',
-    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), resumeError: errSpawnNotResumable(), killError: err }),
-    calls: ladderCallsOf({ spawn: 1, resume: 1, kill: 1 }),
-    // agent-director has just called the row live (ErrSpawnNotResumable).
-    killReadLive: true,
-  },
-]
-
-/** The delete in each replacement: nothing is launched after it. */
-const DELETE_SITES: readonly LadderSite[] = [
-  {
-    name: 'the delete of a replacement (resume_enabled false)',
-    verb: 'delete',
-    setup: noResume,
-    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), deleteError: err }),
-    calls: ladderCallsOf({ spawn: 1, kill: 1, delete: 1 }),
-  },
-  {
-    name: 'the delete of a replacement (a row in another directory)',
-    verb: 'delete',
-    script: (h, p, err) => ({ ...collided(h, p, elsewhere(h, 'waiting')), deleteError: err }),
-    calls: ladderCallsOf({ spawn: 1, kill: 1, delete: 1 }),
-  },
-  {
-    name: 'the delete after the resume\'s ErrSpawnNotResumable',
-    verb: 'delete',
-    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), resumeError: errSpawnNotResumable(), deleteError: err }),
-    calls: ladderCallsOf({ spawn: 1, resume: 1, kill: 1, delete: 1 }),
-  },
-]
 
 /**
  * The reconnect's one `send-keys` (b.jg5 SRJ-118, SRJ-609: never retried, so
@@ -14274,8 +14136,14 @@ const RECONNECT_SITES: readonly LadderSite[] = [
   },
 ]
 
-/** Every action site of the ladder: each spawn and resume, kill, delete and reconnect site above. */
-const ACTION_SITES: readonly LadderSite[] = [...SPAWN_AND_RESUME_SITES, ...KILL_SITES, ...DELETE_SITES, ...RECONNECT_SITES]
+/**
+ * Every action site of the ladder: each spawn and resume, the replacement
+ * sites' reuse spawns among them, and each reconnect site above. The ladder
+ * makes no kill and no delete (b.jg5 SRJ-707): a live row's kills are the
+ * live-row sequence's (tests/live-row-sequence.test.ts, and SRJ-110 at each
+ * replacement site in the SRJ-707 describe).
+ */
+const ACTION_SITES: readonly LadderSite[] = [...SPAWN_AND_RESUME_SITES, ...RECONNECT_SITES]
 
 /**
  * The `get` reads of the ladder (b.jg5 SRJ-105's read-error row): the
@@ -14469,9 +14337,11 @@ async function expectRefusedAt(
   const result = await h.drive(h.launch(p))
 
   expect(result).toStrictEqual({ key: p, action: 'failed', refused: true })
-  expect(ladderCallsMade(h)).toEqual(siteCalls(site, err))
+  expect(ladderCallsMade(h)).toEqual(site.calls)
   expect(h.reuseSpawns()).toEqual(site.reuse === true ? [reuseSpawnOf(h, p)] : [])
   expect(h.notices).toEqual([])
+  // No tmux-unresponsive onset (or any other episode post) before the next tick (b.jg5 SRJ-707, SRJ-308).
+  expect(h.episodeNotices).toEqual([])
   if (onsetText === undefined) {
     expect(h.outageNotices).toEqual([])
   } else {
@@ -14672,48 +14542,13 @@ describe('b.jg5 SRJ-105: UNAVAILABLE is never destructive', () => {
     await expectRefusedAt(site, make(site.verb), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)
   })
 
-  const killCross = [...SRJ105_UNAVAILABLE, SRJ105_KILL_FAILED].flatMap(([what, make]) =>
-    [...KILL_SITES, ...DELETE_SITES].map((site) => [what, site.name, make, site] as const),
-  )
-  test.each(killCross)('%s at %s: no delete or launch after it, no notice or spawn-failed entry, refused and never counted; B launches', async (what, _site, make, site) => {
-    const kind = what === SRJ105_KILL_FAILED[0] ? UNAVAILABLE_RETRY_CAUSE_KILL_FAILED : UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE
-    const { h, p } = await expectRefusedAt(site, make(site.verb), kind)
-    // AC 64's half: ErrTmuxKillFailed never starts the condition.
-    if (what === SRJ105_KILL_FAILED[0]) {
-      expect(h.tmuxUnresponsive.holds(p)).toBe(false)
-      expect(conditionStartedLines(h, p)).toEqual([])
-    }
-  })
+  // The collision ladder makes no kill or delete (b.jg5 SRJ-707): a live
+  // row's kills, their UNAVAILABLE tries and ErrTmuxKillFailed's outcome are
+  // the live-row sequence's (tests/live-row-sequence.test.ts; AC 64's half,
+  // that ErrTmuxKillFailed never starts the condition, is
+  // tests/tmux-unresponsive.test.ts's at the sequence's kill).
 
-  // An UNCLASSIFIED kill answer (an ErrInternal, an unhandled name such as
-  // ErrKillBroken) is a refusal too: b.jg5 SRJ-313's describe below.
-
-  test.each(SRJ105_UNAVAILABLE)('the kill after the resume\'s ErrSpawnNotResumable is declared a kill of a row read live: %s there starts P\'s condition (tmux-touching), where the same answer to a kill of a row in another directory read ended starts nothing', async (_what, make) => {
-    const { h, p } = srj105Build()
-    const persona = harnessPersona(h, p)
-    h.script({ ...collided(h, persona, { state: 'ended' }), resumeError: errSpawnNotResumable(), killError: make('kill') })
-
-    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'failed', refused: true })
-
-    expect(h.stub.calls.killCalls).toHaveLength(KILL_RETRY_TRIES)
-    expect(h.tmuxUnresponsive.holds(p)).toBe(true)
-    const started = conditionStartedLines(h, p)
-    expect(started).toHaveLength(1)
-    expect(started[0]).toContain(' — kill failed: ')
-
-    assertNoLeak(h.captured())
-    h.cleanup()
-    srj105Harness = undefined
-    const other = srj105Build()
-    other.h.script({ ...collided(other.h, harnessPersona(other.h, other.p), elsewhere(other.h, 'ended')), killError: make('kill') })
-    expect(await other.h.drive(other.h.launch(other.p))).toStrictEqual({ key: other.p, action: 'failed', refused: true })
-    // A row read ended: its kill is one try (b.jg5 SRJ-702).
-    expect(other.h.stub.calls.killCalls).toHaveLength(1)
-    expect(other.h.tmuxUnresponsive.holds(other.p)).toBe(false)
-    expect(conditionStartedLines(other.h, other.p)).toEqual([])
-  })
-
-  test.each([...SRJ105_UNAVAILABLE, SRJ105_KILL_FAILED])('regression: the persona teardown\'s kill (killPersonaInstance, which the ladder\'s kill wraps) answering %s answers its UNAVAILABLE outcome carrying it (b.jg5 SRJ-701: never rethrown), quietly: no line, delete, notice, startup-errors entry or trigger', async (_what, make) => {
+  test.each([...SRJ105_UNAVAILABLE, SRJ105_KILL_FAILED])('regression: the persona teardown\'s kill (killPersonaInstance, which the live-row sequence\'s and the restart path\'s kills wrap) answering %s answers its UNAVAILABLE outcome carrying it (b.jg5 SRJ-701: never rethrown), quietly: no line, delete, notice, startup-errors entry or trigger', async (_what, make) => {
     const { h, p } = srj105Build()
     const err = make('kill')
     h.script({ killError: err })
@@ -14933,138 +14768,67 @@ describe('b.jg5 SRJ-105, SRJ-605: a read error at the collision get or the ErrJs
   })
 })
 
-describe('b.jg5 SRJ-105 with E8\'s refusal marker: a refused kill on a replace path is followed by no delete and no launch, answers \'refused\' and is never counted', () => {
-  afterEach(srj105AfterEach)
-
-  /**
-   * Each replace path, as the stub answers for the launch after the
-   * collision; its kill is its first kill. The resume's ErrSpawnNotResumable
-   * kills a row agent-director has just called live, so an UNAVAILABLE
-   * answer there gets the kill's tries (b.jg5 SRJ-702); the other two kill a
-   * row read ended, one try.
-   */
-  const REPLACE_PATHS: ReadonlyArray<readonly [string, (h: RecoveryHarness, persona: Persona) => RecoveryStubScript, ((h: RecoveryHarness) => void) | undefined, Partial<LaunchVerbCalls>, boolean]> = [
-    ['resume_enabled false', (h, p) => collided(h, p, { state: 'ended' }), noResume, { spawn: 1, kill: 1 }, false],
-    ['a row in another directory', (h, p) => collided(h, p, elsewhere(h, 'ended')), undefined, { spawn: 1, kill: 1 }, false],
-    ['the resume\'s ErrSpawnNotResumable', (h, p) => ({ ...collided(h, p, { state: 'ended' }), resumeError: errSpawnNotResumable() }), undefined, { spawn: 1, resume: 1, kill: 1 }, true],
-  ]
-
-  /** The kill refusals: the UNAVAILABLE forms, and a CONFIG answer (b.jg5 SRJ-105's CONFIG row, SRJ-110, SRJ-316). */
-  const KILL_REFUSALS: ReadonlyArray<readonly [string, (verb: string) => Error, string]> = [
-    ...unavailableForms('ErrTmuxUnresponsive', 'ErrTmuxKillFailed'),
-    ['a CONFIG answer (ErrConfigMalformed, b.jg5 SRJ-316)', () => errConfigMalformed(), UNAVAILABLE_RETRY_CAUSE_CONFIG],
-    // AC 69: an injected ErrInternal is never counted (b.jg5 SRJ-313).
-    ['an UNCLASSIFIED ErrInternal (b.jg5 SRJ-313)', () => errInternal(), UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED],
-    ['an UNCLASSIFIED unhandled name (ErrKillBroken, b.jg5 SRJ-313)', (verb) => errGeneric(verb, 'ErrKillBroken'), UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED],
-  ]
-
-  const cross = REPLACE_PATHS.flatMap(([path, script, setup, calls, readLive]) => KILL_REFUSALS.map(([what, make]) => [path, what, script, setup, calls, readLive, make] as const))
-
-  test.each(cross)('%s, its kill answering %s: { failed, refused } from spawnForPersona, \'refused\' from launchSession, and the restart path\'s retry answers refused with the failure count still 0', async (_path, _what, script, setup, calls, readLive, make) => {
-    const { h, p } = srj105Build()
-    const persona = harnessPersona(h, p)
-    setup?.(h)
-    h.script({ ...script(h, persona), killError: make('kill') })
-    const retried = readLive && classifyAdError(make('kill')).errorClass === AD_ERROR_CLASS_UNAVAILABLE
-    const kills = retried ? KILL_RETRY_TRIES : 1
-
-    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'failed', refused: true })
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ ...calls, kill: kills }))
-
-    h.script({ ...script(h, persona), killError: make('kill') })
-    expect(await h.drive(launchSession(p, h.config))).toBe('refused')
-    expect(h.stub.calls.deleteCalls).toEqual([])
-
-    // The restart path: its liveness read finds the row dead, its own kill
-    // (one try, after a dead reading) succeeds, and the launch's replacement
-    // kill is refused at each of its tries, the reads between them finding
-    // the row live.
-    h.script({
-      ...script(h, persona),
-      killError: undefined,
-      killQueue: [cannedOk({}), ...Array.from({ length: kills }, () => cannedErr<Phase1KillResult>(make('kill')))],
-      statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))],
-      statusResult: cannedStatusResult({ state: 'waiting' }),
-    })
-    expect(await h.drive(runRestartRetry(p, persona.working_directory, isLaunchInFlight))).toBe(RESTART_OUTCOME_REFUSED)
-
-    expect(h.stub.calls.deleteCalls).toEqual([])
-    expect(getFailureCount(p)).toBe(0)
-    expect(h.notices).toEqual([])
-    expect(h.capReached).toEqual([])
-  })
-})
-
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-702: the collision ladder's replacement kill of a row read live
-// takes the bounded retry (calling agent's resolution: E21/E22 replace these
-// kills later). On the recovery harness, its waits on the harness clock
-// (`h.drive`): up to 3 tries 2 s apart on UNAVAILABLE, one own-row `status`
-// read before each further try (the shared own-row read, which latches P on
-// an UNUSABLE NAME or its own `pending` row with no launch start), the
-// keep-going check (P not up), and the survivor rule's decision on the end
-// line (T3 raises the alert). The row is `waiting` in another directory.
+// b.jg5 SRJ-702, SRJ-707, SRJ-705: a live row's kill at a collision ladder
+// replacement site is the live-row sequence's, which takes the bounded retry.
+// The ladder makes no kill: P's launch meets its row read `waiting` in
+// another directory, starts P's sequence through the start entry and answers
+// `sequence-waiting` (`scriptLiveRowElsewhere`, `launchThroughSequence`); the
+// sequence's step-1 kill, on the harness's sequence clock
+// (`h.driveSequence`), makes up to 3 tries 2 s apart on UNAVAILABLE, with one
+// own-row `status` read before each further try (the shared own-row read,
+// which latches P on an UNUSABLE NAME or its own `pending` row with no launch
+// start) and the keep-going check (P not up). After a kill that succeeds the
+// sequence's `get`s read P's row `ended`, so it goes on to its one run and a
+// reuse spawn of the same id. The tries' order and spacing and every
+// non-latching class at both kills are tests/live-row-sequence.test.ts's.
 // ---------------------------------------------------------------------------
 
-/** P's launch whose optimistic spawn collides with its row read `waiting` in another directory, with `script` on top. */
-function replaceLiveRow(h: RecoveryHarness, p: string, script: RecoveryStubScript): void {
-  h.script({ ...collided(h, harnessPersona(h, p), elsewhere(h, 'waiting')), ...script })
-}
-
-describe('b.jg5 SRJ-702: the collision ladder\'s replacement kill of a row read live makes its tries, reading the row before each further try', () => {
+describe('b.jg5 SRJ-702: the live-row sequence\'s kill of a row read live at a replacement site makes its tries, reading the row before each further try', () => {
   afterEach(srj105AfterEach)
 
   /** The lines naming a kill-failure alert decision of `kind`. */
   const decisionLines = (h: RecoveryHarness, kind: string): string[] => h.errors.filter((line) => line.includes(`alert=${kind}`))
 
-  test('ErrTmuxUnresponsive at every try: the exported try count, 2 s apart, with one own-row status read before each further try; then no delete and no spawn; refused, uncounted, armed once', async () => {
+  test('ErrTmuxUnresponsive at every try: no get, run, launch or delete after it; the sequence aborts, uncounted, the standing outcome armed once', async () => {
     const { h, p } = srj105Build()
-    replaceLiveRow(h, p, { killError: errTmuxUnresponsive('kill') })
-    const order = recordCallOrder(h)
-    const kills: number[] = []
-    const kill = h.stub.client.kill.bind(h.stub.client)
-    h.stub.client.kill = async (params) => {
-      kills.push(h.clock.now())
-      return kill(params)
-    }
+    scriptLiveRowElsewhere(h, p, { killError: errTmuxUnresponsive('kill') })
 
-    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'failed', refused: true })
+    expect(await launchThroughSequence(h, p)).toMatchObject({ kind: LIVE_ROW_OUTCOME_ABORTED, step: 1, errorClass: AD_ERROR_CLASS_UNAVAILABLE, latched: false })
 
-    expect(order.filter((verb) => verb === 'kill' || verb === 'status')).toEqual(['kill', 'status', 'kill', 'status', 'kill'])
-    expect(kills).toEqual(Array.from({ length: KILL_RETRY_TRIES }, (_, i) => i * KILL_RETRY_SPACING_MS))
-    expect(h.stub.calls.statusCalls).toEqual(Array.from({ length: KILL_RETRY_TRIES - 1 }, () => ({ claude_instance_id: personaInstanceId(p) })))
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, kill: KILL_RETRY_TRIES }))
-    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
+    expect(h.stub.calls.getCalls).toHaveLength(1)
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }, { key: p, kind: UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED }])
     expect(getFailureCount(p)).toBe(0)
   })
 
-  test('a second-try success goes on to the delete and the fresh spawn; nothing is armed', async () => {
+  test('a second-try success goes on to the sequence\'s get, run and one reuse spawn of the same id; nothing is armed, nothing deleted', async () => {
     const { h, p } = srj105Build()
-    replaceLiveRow(h, p, { killQueue: [cannedErr(errTmuxUnresponsive('kill')), cannedOk(cannedKillResult(true))] })
+    scriptLiveRowElsewhere(h, p, { killQueue: [cannedErr(errTmuxUnresponsive('kill')), cannedOk(cannedKillResult(true))] })
 
-    const result = await h.drive(h.launch(p))
+    expect(await launchThroughSequence(h, p)).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE, result: { key: p, action: 'spawned' } })
 
-    expect(result).toStrictEqual({ key: p, action: 'spawned' })
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 2, kill: 2, delete: 1 }))
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 2, kill: 2 }))
+    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
     expect(h.triggers).toEqual([])
     expect(decisionLines(h, KILL_RETRY_ALERT_SURVIVOR)).toEqual([])
   })
 
   // b.jg5 SRJ-702 (hatch A2), SRJ-502: a read between tries that latches P
-  // ends the tries with no further kill; the ladder answers latched, and
+  // ends the tries with no further kill; the latch stops the sequence, and
   // nothing is armed for the latched persona.
   test.each<[string, CannedResponse<Phase1StatusResult>, Record<string, unknown>]>([
     ['an UNUSABLE NAME answer', cannedErr(errUnusableName()), { latchCase: LATCH_CASE_UNUSABLE_RECORDED_NAME, refusedOperation: REFUSED_OPERATION_NONE, rowState: LATCH_ROW_STATE_UNREADABLE }],
     ['P\'s own row pending with no launch start', cannedOk(cannedStatusResult({ state: 'pending', launch_started_at: SAMPLE_LAUNCH_START_NONE })), { latchCase: LATCH_CASE_LAUNCH_START_NOT_RECORDED, rowState: latchRowStateRead('pending') }],
-  ])('a read between tries answering %s latches P and ends the tries with no further kill: the launch answers latched; no delete, no spawn, nothing armed', async (_label, read, record) => {
+  ])('a read between tries answering %s latches P and ends the tries with no further kill: the sequence stops for the latch; no get, launch or delete, nothing armed', async (_label, read, record) => {
     const { h, p } = srj105Build()
-    replaceLiveRow(h, p, { killError: errTmuxUnresponsive('kill'), statusQueue: [read] })
+    scriptLiveRowElsewhere(h, p, { killError: errTmuxUnresponsive('kill'), statusQueue: [read] })
 
-    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'latched' })
+    expect(await launchThroughSequence(h, p)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED })
 
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, kill: 1 }))
     expect(h.stub.calls.statusCalls).toHaveLength(1)
-    expect(h.latch.isLatched(p)).toBe(true)
+    expect(h.stub.calls.getCalls).toHaveLength(1)
     expect(h.latch.record(p)).toMatchObject(record)
     expect(h.triggers.filter((t) => t.kind === UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)).toEqual([])
     expect(h.controller.isArmed(p)).toBe(false)
@@ -15075,21 +14839,20 @@ describe('b.jg5 SRJ-702: the collision ladder\'s replacement kill of a row read 
   // CONFLICT is never tried again and latches P. An earlier failure naming no
   // survivor (or ErrTmuxUnresponsive) that the CONFLICT replaced as the last
   // outcome calls for no alert; after a survivor-naming one, the ordinary
-  // version follows (the alert describe's CONFLICT case below).
+  // version follows (tests/live-row-sequence.test.ts).
   test.each<[string, () => Error]>([
     ['ErrTmuxUnresponsive', () => errTmuxUnresponsive('kill')],
     ['an ErrTmuxKillFailed naming no survivor', () => errTmuxKillFailed()],
-  ])('a first try answering %s, then a second answering CONFLICT: latched, two kills and one read, no delete and no further spawn, no retry timer armed for P; no alert decision', async (_label, makeFirst) => {
+  ])('a first try answering %s, then a second answering CONFLICT: latched, two kills and one read, no delete and no launch, no retry timer armed for P; no alert decision', async (_label, makeFirst) => {
     const { h, p } = srj105Build()
-    replaceLiveRow(h, p, {
+    scriptLiveRowElsewhere(h, p, {
       killQueue: [cannedErr(makeFirst()), cannedErr(errTmuxSessionConflict('kill', 'not-this-launch')), cannedErr(errTmuxUnresponsive('kill'))],
     })
 
-    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'latched' })
+    expect(await launchThroughSequence(h, p)).toMatchObject({ kind: LIVE_ROW_OUTCOME_ABORTED, step: 1, errorClass: AD_ERROR_CLASS_CONFLICT, latched: true })
 
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, kill: 2 }))
     expect(h.stub.calls.statusCalls).toHaveLength(1)
-    expect(h.stub.calls.deleteCalls).toEqual([])
     expect(h.latch.isLatched(p)).toBe(true)
     expect(h.controller.isArmed(p)).toBe(false)
     expect(h.triggers).toEqual([])
@@ -15098,15 +14861,15 @@ describe('b.jg5 SRJ-702: the collision ladder\'s replacement kill of a row read 
     expect(getFailureCount(p)).toBe(0)
   })
 
-  // b.jg5 SRJ-702, SRJ-316 (AC 84): the ladder read the row `waiting`, so a
-  // CONFIG answer at a read between tries raises the outage (one onset) and
-  // the next try goes ahead.
+  // b.jg5 SRJ-702, SRJ-316 (AC 84): the sequence last read the row
+  // `waiting`, so a CONFIG answer at a read between tries raises the outage
+  // (one onset) and the next try goes ahead.
   test('a CONFIG answer at each read between tries of a row read waiting: ad-config-malformed raised with one onset, and every try is made; the UNAVAILABLE outcome that stands is reported once', async () => {
     const { h, p } = srj105Build()
     const configErr = errConfigMalformed()
-    replaceLiveRow(h, p, { killError: errTmuxUnresponsive('kill'), statusError: configErr })
+    scriptLiveRowElsewhere(h, p, { killError: errTmuxUnresponsive('kill'), statusError: configErr })
 
-    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'failed', refused: true })
+    expect(await launchThroughSequence(h, p)).toMatchObject({ kind: LIVE_ROW_OUTCOME_ABORTED, step: 1, errorClass: AD_ERROR_CLASS_UNAVAILABLE })
 
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, kill: KILL_RETRY_TRIES }))
     expect(h.stub.calls.statusCalls).toHaveLength(KILL_RETRY_TRIES - 1)
@@ -15115,12 +14878,12 @@ describe('b.jg5 SRJ-702: the collision ladder\'s replacement kill of a row read 
     expect(h.triggers.filter((t) => t.kind === UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
   })
 
-  test('the keep-going check: P not up stops the tries after the first wait, with no read and no further kill; the uncounted refused result, nothing armed', async () => {
+  test('the keep-going check: P not up stops the tries after the first wait, with no read and no further kill; the sequence stops, nothing armed', async () => {
     const { h, p } = srj105Build()
-    replaceLiveRow(h, p, { killError: errTmuxUnresponsive('kill') })
+    scriptLiveRowElsewhere(h, p, { killError: errTmuxUnresponsive('kill') })
     h.setUp(p, false)
 
-    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'failed', refused: true })
+    expect(await launchThroughSequence(h, p)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED })
 
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, kill: 1 }))
     expect(h.stub.calls.statusCalls).toEqual([])
@@ -15132,24 +14895,29 @@ describe('b.jg5 SRJ-702: the collision ladder\'s replacement kill of a row read 
 
 // ---------------------------------------------------------------------------
 // b.jg5 SRJ-704, SRJ-1007, SRJ-702 (E20 T3): the kill-failure alert at the
-// collision ladder's replacement kill of a row read live
+// live-row sequence's kill of a row read live, started at a collision ladder
+// replacement site
 //
-// The one place the tries of a row read live raise the alert end to end
-// (E20 T3's reconcile note 2: the restart path's kill is one try, covered in
-// tests/restart.test.ts). On the recovery harness, its kill-failure alerts
-// installed as `main()` installs them: P's launch collides with its row read
-// `waiting` in another directory, and the replacement kill makes up to
-// `KILL_RETRY_TRIES` tries on `h.killRetryClock` (`h.drive`), reading the row
-// before each further try through the shared own-row `status` read. The alert
-// is raised with the context `recovery`: the survivor version after a success,
-// before the delete and the fresh spawn; the ordinary version after the
-// standing outcome's own handling (a latch and its hold post first). Every
-// expected text is built with `src/kill-failure-alert.ts`'s builders (the
-// harness's `killFailureNotice`, `ordinaryAlertContent`, `survivorAlertContent`,
-// `killFailureRecoveryEntry`), each description the stub's.
+// The tries of a row read live raise the alert end to end (the restart
+// path's kill is one try, covered in tests/restart.test.ts). On the recovery
+// harness, its kill-failure alerts installed as `main()` installs them: P's
+// launch meets its row read `waiting` in another directory and starts P's
+// sequence (`scriptLiveRowElsewhere`, `launchThroughSequence`), whose step-1 kill
+// makes up to `KILL_RETRY_TRIES` tries, reading the row before each further
+// try through the shared own-row `status` read. The alert is raised with the
+// context `recovery` (the one a sequence the ladder starts carries): the
+// survivor version after a success, before the sequence's next step; the
+// ordinary version after the standing outcome's own handling (a latch and its
+// hold post first). Every expected text is built with
+// `src/kill-failure-alert.ts`'s builders (the harness's `killFailureNotice`,
+// `ordinaryAlertContent`, `survivorAlertContent`, `killFailureRecoveryEntry`),
+// each description the stub's. An ErrTmuxKillFailed at every try of either
+// kill, a survivor then a success, ErrTmuxUnresponsive or a non-survivor
+// ErrTmuxKillFailed, and a survivor then CONFLICT are
+// tests/live-row-sequence.test.ts's.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the collision ladder\'s replacement kill of a row read live', () => {
+describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the live-row sequence\'s kill of a row read live, started at a replacement site', () => {
   afterEach(srj105AfterEach)
 
   /** The stub's survivor-naming `ErrTmuxKillFailed`. */
@@ -15160,52 +14928,23 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the collis
     return h.latchEvents.flatMap((event) => (event.step === 'notice' && event.key === key ? [{ key, text: event.text }] : []))
   }
 
-  /** Wrap the stub's `delete` so each call records how many episode posts had been made by then. */
-  function postsAtDelete(h: RecoveryHarness): number[] {
+  /** Wrap the stub's `spawn` so each call records how many episode posts had been made by then. */
+  function postsAtSpawn(h: RecoveryHarness): number[] {
     const at: number[] = []
-    const remove = h.stub.client.delete.bind(h.stub.client)
-    h.stub.client.delete = async (params) => {
+    const spawn = h.stub.client.spawn.bind(h.stub.client)
+    h.stub.client.spawn = async (params) => {
       at.push(h.episodeNotices.length)
-      return remove(params)
+      return spawn(params)
     }
     return at
   }
 
-  // AC 64 (demo bullet 8), AC 61's part: after the tries, an ErrTmuxKillFailed
-  // that stands posts one alert at P's destination and opens its episode; a
-  // later failure in the same episode (the row never read ended or missing)
-  // posts nothing.
-  test.each([...KILL_FAILED_DESCRIPTIONS])('ErrTmuxKillFailed (%s) at every try: one ordinary alert at P\'s destination quoting it, with the not-latched closing and the recovery context; no spawn-failed entry; a second launch failing the same way in the same episode posts nothing', async (form) => {
-    const { h, p } = srj105Build()
-    const err = errTmuxKillFailed(undefined, form)
-    replaceLiveRow(h, p, { killError: err })
-
-    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'failed', refused: true })
-
-    const content = ordinaryAlertContent(p, { last: err })
-    const alert = killFailureNotice(p, content)
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, kill: KILL_RETRY_TRIES }))
-    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }])
-    expect(h.episodeNotices).toEqual([alert])
-    expect(killFailureLines(h, p)).toEqual([killFailurePostedLine(p, content)])
-    expect(h.startupErrors()).toEqual([])
-    expect(h.killFailureOpen(p)).toBe(true)
-
-    replaceLiveRow(h, p, { killError: err })
-    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'failed', refused: true })
-
-    expect(h.stub.calls.killCalls).toHaveLength(2 * KILL_RETRY_TRIES)
-    expect(h.episodeNotices).toEqual([alert])
-    expect(killFailureLines(h, p).at(-1)).toBe(killFailureHeldLine(p))
-    expect(h.killFailureOpen(p)).toBe(true)
-  })
-
   // Demo bullet 4 (HO rev 17, rev 22): after a survivor-naming failure, every
   // end of the tries as a success posts the survivor version once, before
-  // the caller's next step, and opens no episode.
+  // the sequence's next step, and opens no episode.
   // A read between the tries that ends them makes no further kill; a second
   // try's success ends them at two. Nothing is armed but a failed read's own
-  // cause (b.jg5 SRJ-301: a read inside the attempt).
+  // cause (b.jg5 SRJ-301: a read inside the sequence's attempt).
   test.each<[string, RecoveryStubScript, number, readonly string[]]>([
     ['a read of ended', { statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))] }, 1, []],
     ['a read of missing', { statusQueue: [cannedOk(cannedStatusResult({ state: 'missing' }))] }, 1, []],
@@ -15214,19 +14953,19 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the collis
     ['a second try\'s success with kill_sent true after a failed read', { killQueue: [cannedErr(survivorErr()), cannedOk(cannedKillResult(true))], statusQueue: [cannedErr(errCallTimeout('status'))] }, 2, [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE]],
     ['a second try\'s success with kill_sent false', { killQueue: [cannedErr(survivorErr()), cannedOk(cannedKillResult(false))] }, 2, []],
     ['a second try answering ErrSpawnNotFound', { killQueue: [cannedErr(survivorErr()), cannedErr(errSpawnNotFound())] }, 2, []],
-  ])('a survivor-naming ErrTmuxKillFailed, then %s: one survivor version at P\'s destination quoting it, posted before the delete and the fresh spawn, which follow; no kill-failure episode opens', async (_label, script, kills, armed) => {
+  ])('a survivor-naming ErrTmuxKillFailed, then %s: one survivor version at P\'s destination quoting it, posted before the sequence\'s reuse spawn, which follows; no kill-failure episode opens', async (_label, script, kills, armed) => {
     const { h, p } = srj105Build()
     const survivor = survivorErr()
-    replaceLiveRow(h, p, { killQueue: [cannedErr(survivor)], ...script })
-    const atDelete = postsAtDelete(h)
+    scriptLiveRowElsewhere(h, p, { killQueue: [cannedErr(survivor)], ...script })
+    const atSpawn = postsAtSpawn(h)
 
-    const result = await h.drive(h.launch(p))
+    expect(await launchThroughSequence(h, p)).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE, result: { key: p, action: 'spawned' } })
 
-    expect(result).toStrictEqual({ key: p, action: 'spawned' })
     const content = survivorAlertContent(p, survivor)
     expect(h.episodeNotices).toEqual([killFailureNotice(p, content)])
-    expect(atDelete).toEqual([1])
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 2, kill: kills, delete: 1 }))
+    // The ladder's colliding spawn, then the reuse after the post.
+    expect(atSpawn).toEqual([0, 1])
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 2, kill: kills }))
     expect(h.triggers).toEqual(armed.map((kind) => ({ key: p, kind })))
     expect(h.killFailureOpen(p)).toBe(false)
     expect(killFailureLines(h, p)).toEqual([killFailurePostedLine(p, content)])
@@ -15235,8 +14974,8 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the collis
   test('after the survivor version, a later ordinary kill failure for P still posts its alert', async () => {
     const { h, p } = srj105Build()
     const survivor = survivorErr()
-    replaceLiveRow(h, p, { killQueue: [cannedErr(survivor)], statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))] })
-    await h.drive(h.launch(p))
+    scriptLiveRowElsewhere(h, p, { killQueue: [cannedErr(survivor)], statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))] })
+    await launchThroughSequence(h, p)
     await h.runApproverToStop(p)
 
     const err = errTmuxKillFailed(undefined, 'no-session-no-kill')
@@ -15244,54 +14983,6 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the collis
     expect(await runRestartRetry(p, harnessPersona(h, p).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
 
     expect(h.episodeNotices).toEqual([killFailureNotice(p, survivorAlertContent(p, survivor)), killFailureNotice(p, ordinaryAlertContent(p, { last: err }))])
-    expect(h.killFailureOpen(p)).toBe(true)
-  })
-
-  // AC 64: the tries end in another failure after a survivor-naming one.
-  test('a survivor-naming ErrTmuxKillFailed, then ErrTmuxUnresponsive twice: one ordinary alert quoting only the survivor-naming description; its episode is open; the UNAVAILABLE outcome armed once', async () => {
-    const { h, p } = srj105Build()
-    const survivor = survivorErr()
-    replaceLiveRow(h, p, { killQueue: [cannedErr(survivor), cannedErr(errTmuxUnresponsive('kill')), cannedErr(errTmuxUnresponsive('kill'))] })
-
-    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'failed', refused: true })
-
-    expect(h.stub.calls.killCalls).toHaveLength(KILL_RETRY_TRIES)
-    expect(h.episodeNotices).toEqual([killFailureNotice(p, ordinaryAlertContent(p, { earlierSurvivor: survivor }))])
-    expect(h.killFailureOpen(p)).toBe(true)
-    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
-  })
-
-  test('a survivor-naming ErrTmuxKillFailed, then a non-survivor ErrTmuxKillFailed to the end: one ordinary alert quoting both descriptions, the last kill failure\'s first', async () => {
-    const { h, p } = srj105Build()
-    const survivor = survivorErr()
-    const last = errTmuxKillFailed(undefined, 'unverifiable-session-present')
-    replaceLiveRow(h, p, { killQueue: [cannedErr(survivor), cannedErr(errTmuxKillFailed()), cannedErr(last)] })
-
-    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'failed', refused: true })
-
-    expect(h.episodeNotices).toEqual([killFailureNotice(p, ordinaryAlertContent(p, { last, earlierSurvivor: survivor }))])
-    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }])
-  })
-
-  // AC 64, SRJ-704: a CONFLICT after a survivor-naming failure latches P with
-  // its own post, then the ordinary version follows with the latched closing.
-  test('a survivor-naming ErrTmuxKillFailed, then CONFLICT: P latches with its CONFLICT post, then one ordinary alert quoting the survivor-naming description with the latched closing (no "keeps retrying"); no retry timer for P', async () => {
-    const { h, p } = srj105Build()
-    const survivor = survivorErr()
-    replaceLiveRow(h, p, { killQueue: [cannedErr(survivor), cannedErr(errTmuxSessionConflict('kill', 'not-this-launch'))] })
-
-    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'latched' })
-
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, kill: 2 }))
-    expect(h.stub.calls.statusCalls).toHaveLength(1)
-    expect(h.triggers).toEqual([])
-    expect(getFailureCount(p)).toBe(0)
-    const latchedAlert = killFailureNotice(p, ordinaryAlertContent(p, { earlierSurvivor: survivor }), KILL_FAILURE_CLOSING_DESTINATION_LATCHED)
-    expect(holdPosts(h, p)).toHaveLength(1)
-    expect(h.episodeNotices).toEqual([...holdPosts(h, p), latchedAlert])
-    expect(latchedAlert.text).not.toContain(KILL_FAILURE_ORDINARY_DESTINATION_CLOSING)
-    expect(h.latch.isLatched(p)).toBe(true)
-    expect(h.controller.isArmed(p)).toBe(false)
     expect(h.killFailureOpen(p)).toBe(true)
   })
 
@@ -15306,9 +14997,9 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the collis
   ])('%s, then a read between tries that latches P: no second kill; P\'s hold post, then one ordinary alert quoting that description with the latched closing; no retry timer for P', async (_label, makeErr, read) => {
     const { h, p } = srj105Build()
     const err = makeErr()
-    replaceLiveRow(h, p, { killQueue: [cannedErr(err)], statusQueue: [read] })
+    scriptLiveRowElsewhere(h, p, { killQueue: [cannedErr(err)], statusQueue: [read] })
 
-    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'latched' })
+    expect(await launchThroughSequence(h, p)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED })
 
     expect(h.stub.calls.killCalls).toHaveLength(1)
     expect(holdPosts(h, p)).toHaveLength(1)
@@ -15320,9 +15011,9 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the collis
   // than ErrTmuxKillFailed calls for no alert.
   test('an ErrTmuxUnresponsive first try with no survivor-naming failure, then a read that latches P: no second kill and no alert of either version; P latched with its own post only', async () => {
     const { h, p } = srj105Build()
-    replaceLiveRow(h, p, { killQueue: [cannedErr(errTmuxUnresponsive('kill'))], statusQueue: [cannedErr(errUnusableName())] })
+    scriptLiveRowElsewhere(h, p, { killQueue: [cannedErr(errTmuxUnresponsive('kill'))], statusQueue: [cannedErr(errUnusableName())] })
 
-    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'latched' })
+    expect(await launchThroughSequence(h, p)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED })
 
     expect(h.stub.calls.killCalls).toHaveLength(1)
     expect(h.latch.isLatched(p)).toBe(true)
@@ -15336,7 +15027,7 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the collis
   test('a survivor-naming ErrTmuxKillFailed, then a read of ended with P removed from the applied configuration meanwhile: one persona-kill-survivor entry with the recovery context; nothing posted', async () => {
     const { h, p } = srj105Build()
     const survivor = survivorErr()
-    replaceLiveRow(h, p, { killQueue: [cannedErr(survivor)], statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))] })
+    scriptLiveRowElsewhere(h, p, { killQueue: [cannedErr(survivor)], statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))] })
     const status = h.stub.client.status.bind(h.stub.client)
     h.stub.client.status = async (params) => {
       try {
@@ -15346,20 +15037,20 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the collis
       }
     }
 
-    await h.drive(h.launch(p))
+    await launchThroughSequence(h, p)
 
     expect(startupEntriesOf(h, PERSONA_KILL_SURVIVOR_LABEL)).toEqual([killFailureRecoveryEntry(p, survivorAlertContent(p, survivor))])
     expect(h.episodeNotices).toEqual([])
     expect(h.killFailureOpen(p)).toBe(false)
   })
 
-  // Reconcile note 2's keep-going default (open for the user): tries stopped
-  // by the keep-going check while ErrTmuxKillFailed stands leave nothing to
-  // retry the kill, so no "CSCB keeps retrying" alert is posted.
+  // Tries stopped by the keep-going check while ErrTmuxKillFailed stands
+  // leave nothing to retry the kill, so no "CSCB keeps retrying" alert is
+  // posted.
   test('the keep-going check stops the tries because the server is shutting down while ErrTmuxKillFailed stands: one line carrying the decision and the redacted description, no post and no episode', async () => {
     const { h, p } = srj105Build()
     const err = errTmuxKillFailed()
-    replaceLiveRow(h, p, { killError: err })
+    scriptLiveRowElsewhere(h, p, { killError: err })
     const kill = h.stub.client.kill.bind(h.stub.client)
     h.stub.client.kill = async (params) => {
       try {
@@ -15369,7 +15060,7 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the collis
       }
     }
 
-    await h.drive(h.launch(p))
+    expect(await launchThroughSequence(h, p)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_SHUTDOWN })
 
     expect(h.stub.calls.killCalls).toHaveLength(1)
     expect(h.episodeNotices).toEqual([])
@@ -15385,7 +15076,7 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the collis
     const { h, p } = srj105Build()
     const survivor = survivorErr()
     const last = errTmuxKillFailed(undefined, 'unverifiable-session-present')
-    replaceLiveRow(h, p, { killQueue: [cannedErr(survivor), cannedErr(last)] })
+    scriptLiveRowElsewhere(h, p, { killQueue: [cannedErr(survivor), cannedErr(last)] })
     const kill = h.stub.client.kill.bind(h.stub.client)
     h.stub.client.kill = async (params) => {
       try {
@@ -15395,7 +15086,7 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the collis
       }
     }
 
-    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'failed', refused: true })
+    expect(await launchThroughSequence(h, p)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_SHUTDOWN })
 
     expect(h.stub.calls.killCalls).toHaveLength(2)
     expect(startupEntriesOf(h, PERSONA_KILL_FAILED_LABEL)).toEqual([killFailureRecoveryEntry(p, ordinaryAlertContent(p, { last, earlierSurvivor: survivor }))])
@@ -15411,7 +15102,7 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the collis
   test('the keep-going check stops the tries because P was removed from the applied configuration while ErrTmuxKillFailed stands: one persona-kill-failed entry with the recovery context; no post, no episode, no further kill', async () => {
     const { h, p } = srj105Build()
     const err = errTmuxKillFailed()
-    replaceLiveRow(h, p, { killError: err })
+    scriptLiveRowElsewhere(h, p, { killError: err })
     const kill = h.stub.client.kill.bind(h.stub.client)
     h.stub.client.kill = async (params) => {
       try {
@@ -15421,8 +15112,7 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the collis
       }
     }
 
-    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'failed', refused: true })
-    await h.advance(KILL_RETRY_TRIES * KILL_RETRY_SPACING_MS)
+    expect(await launchThroughSequence(h, p)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED })
 
     expect(h.stub.calls.killCalls).toHaveLength(1)
     expect(h.stub.calls.statusCalls).toEqual([])
@@ -15436,29 +15126,31 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the collis
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-704, SRJ-1016 (E20 T3): the shared own-row reads, and the
-// collision ladder's delete of P's row, end P's kill-failure episode
+// b.jg5 SRJ-704, SRJ-1016 (E20 T3): the shared own-row reads end P's
+// kill-failure episode, at a collision ladder replacement site too
 //
 // The episode runs from the ordinary alert until P's own row reads `ended` or
 // `missing`, or is gone (`ErrSpawnNotFound`). The shared own-row `status`
 // read (`readPersonaOwnRowStatus`, through `applyOwnRowStatusStep`) and E14's
 // shared `get` read (`readPersonaOwnRow`) end it silently; a live reading,
-// any other failed read and a read of another persona's row do not. The
-// ladder's delete of P's row (`tryDelete`), succeeding or answering
-// `ErrSpawnNotFound`, ends it too. The episode is opened by a ladder kill failing at every try, on the recovery
-// harness with its kill-failure alerts installed as main() installs them.
-// The liveness and reconnect adapters' own-row step is covered in
-// tests/server.test.ts.
+// any other failed read and a read of another persona's row do not. On the
+// replacing path these are the ladder's collision `get` and the live-row
+// sequence's `get`s (no ladder path deletes a row, b.jg5 SRJ-707): a row
+// seen finished or gone there ends the episode before the next launch. The
+// episode is opened by the live-row sequence's kill, started at a
+// replacement site, failing at every try, on the recovery harness with its
+// kill-failure alerts installed as main() installs them. The liveness and
+// reconnect adapters' own-row step is covered in tests/server.test.ts.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-704, SRJ-1016: the shared own-row status and get reads, and the collision ladder\'s delete of P\'s row, end P\'s kill-failure episode', () => {
+describe('b.jg5 SRJ-704, SRJ-1016: the shared own-row status and get reads end P\'s kill-failure episode, at a replacement site too', () => {
   afterEach(srj105AfterEach)
 
-  /** Open P's kill-failure episode: a launch whose ladder kill fails ErrTmuxKillFailed at every try; resolves with its one alert. */
+  /** Open P's kill-failure episode: a sequence started at a replacement site whose kill fails ErrTmuxKillFailed at every try; resolves with its one alert. */
   async function openEpisode(h: RecoveryHarness, p: string): Promise<{ key: string; text: string }> {
     const err = errTmuxKillFailed()
-    replaceLiveRow(h, p, { killError: err })
-    await h.drive(h.launch(p))
+    scriptLiveRowElsewhere(h, p, { killError: err })
+    await launchThroughSequence(h, p)
     const alert = killFailureNotice(p, ordinaryAlertContent(p, { last: err }))
     expect(h.episodeNotices).toEqual([alert])
     expect(h.killFailureOpen(p)).toBe(true)
@@ -15518,22 +15210,32 @@ describe('b.jg5 SRJ-704, SRJ-1016: the shared own-row status and get reads, and 
     expect(killFailureLines(h, p).filter((line) => line.includes(' ended — '))).toEqual([])
   })
 
-  // b.jg5 SRJ-704, SRJ-1016: the collision ladder's delete of P's row, when
-  // it succeeds or answers ErrSpawnNotFound, leaves the row gone, so it ends
-  // P's episode silently before the chain goes on (a healthy persona no
-  // longer reports lost-message state 4). The next ladder run reads the row
-  // live (its collision get, no own-row read), and its replacement kill
-  // succeeds at its first try. The ErrSpawnNotFound delete then stops the
-  // chain as a failed delete (tryDelete's spawn-failure notice), with no
-  // fresh spawn.
-  test.each<[string, RecoveryStubScript, SpawnPersonaResult['action'], boolean[]]>([
-    ['succeeds', {}, 'spawned', [true, false]],
-    ['answers ErrSpawnNotFound', { deleteError: errSpawnNotFound() }, 'failed', [true]],
-  ])('a later ladder run whose replacement kill succeeds and whose delete %s ends P\'s episode silently, with the row-gone line and nothing posted; a lost message then does not report kill-failed, and a later kill failure posts a new alert', async (_label, deleteScript, action, openAtSpawn) => {
+  // b.jg5 SRJ-704, SRJ-1016, SRJ-707 (E19–E20's note on E22): a row seen
+  // finished or gone at a replacement site ends P's episode silently before
+  // the launch that follows (a healthy persona no longer reports lost-message
+  // state 4): the ladder's collision get reading P's finished row in another
+  // directory, which the replace step gives a reuse spawn of the same id;
+  // and the step-2 get of the sequence the ladder starts over P's live row,
+  // reading it gone, after which the sequence's reuse is an ordinary fresh
+  // spawn of the id.
+  test.each<[string, (h: RecoveryHarness, p: string) => void, SpawnPersonaResult['action'], typeof KILL_FAILURE_END_ROW_FINISHED | typeof KILL_FAILURE_END_ROW_GONE]>([
+    [
+      'the collision get of a later launch reading P\'s row ended in another directory (one reuse spawn follows)',
+      (h, p) => h.script(collided(h, harnessPersona(h, p), elsewhere(h, LIVENESS_DEAD_ROW_ENDED))),
+      'spawned',
+      KILL_FAILURE_END_ROW_FINISHED,
+    ],
+    [
+      'the step-2 get of the sequence a later launch starts over P\'s row read live in another directory, reading the row gone (ErrSpawnNotFound)',
+      (h, p) => scriptLiveRowElsewhere(h, p, { killQueue: [cannedOk(cannedKillResult(true))], getResult: undefined, getError: errSpawnNotFound() }),
+      'sequence-waiting',
+      KILL_FAILURE_END_ROW_GONE,
+    ],
+  ])('%s ends P\'s episode silently, with its ended line and nothing posted, before the reuse spawn; a lost message then does not report kill-failed, and a later kill failure posts a new alert', async (_label, script, action, reason) => {
     const { h, p } = srj105Build()
     const alert = await openEpisode(h, p)
     const openLines = killFailureLines(h, p)
-    replaceLiveRow(h, p, { killQueue: [cannedOk(cannedKillResult(true))], ...deleteScript })
+    script(h, p)
     const open: boolean[] = []
     const spawn = h.stub.client.spawn.bind(h.stub.client)
     h.stub.client.spawn = async (params) => {
@@ -15541,22 +15243,24 @@ describe('b.jg5 SRJ-704, SRJ-1016: the shared own-row status and get reads, and 
       return spawn(params)
     }
 
-    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action })
+    expect(await h.launch(p)).toStrictEqual({ key: p, action })
+    await h.driveSequence(h.sequenceSettled(p))
 
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1 + openAtSpawn.length, kill: KILL_RETRY_TRIES + 1, delete: 1 }))
-    // Open at the colliding spawn; for the fresh spawn, ended by the delete.
-    expect(open).toEqual(openAtSpawn)
+    expect(h.stub.calls.deleteCalls).toEqual([])
+    // Open at the ladder's colliding spawn; ended by the read before the reuse.
+    expect(open).toEqual([true, false])
+    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
     expect(h.killFailureOpen(p)).toBe(false)
     expect(h.episodeNotices).toEqual([alert])
-    expect(killFailureLines(h, p)).toEqual([...openLines, killFailureEndedLine(p, KILL_FAILURE_END_ROW_GONE)])
+    expect(killFailureLines(h, p)).toEqual([...openLines, killFailureEndedLine(p, reason)])
 
     await h.runApproverToStop(p)
     // State 4 no longer applies: the message reads P's row and reports a later state.
     await expectLostMessageReports(h, p, 'auto-restart-disabled')
 
     const next = errTmuxKillFailed(undefined, 'no-session-no-kill')
-    replaceLiveRow(h, p, { killQueue: [], deleteError: undefined, killError: next })
-    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'failed', refused: true })
+    scriptLiveRowElsewhere(h, p, { killQueue: [], getError: undefined, killError: next })
+    await launchThroughSequence(h, p)
 
     const content = ordinaryAlertContent(p, { last: next })
     expect(h.episodeNotices).toEqual([alert, killFailureNotice(p, content)])
@@ -15866,15 +15570,10 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNCLASSIFIED outcome at the collision ladde
         getResult: personaRow(cfg, 'C', { state: 'ended' }),
         resumeError: err,
       })],
-      ['the kill of a replacement (resume_enabled false)', UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, false, (cfg, err) => ({
-        spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      // b.jg5 SRJ-707, SRJ-112 (AC 69): the replace step's reuse spawn of a finished row.
+      ['the reuse spawn of a replacement (resume_enabled false)', UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, false, (cfg, err) => ({
+        spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()), cannedErr<import('agent-director').SpawnResult>(err)],
         getResult: personaRow(cfg, 'C', { state: 'ended' }),
-        killError: err,
-      })],
-      ['the delete of a replacement (resume_enabled false)', UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, false, (cfg, err) => ({
-        spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-        getResult: personaRow(cfg, 'C', { state: 'ended' }),
-        deleteError: err,
       })],
       ['the reconnect of a waiting row', UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, true, (cfg, err) => ({
         spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
@@ -16230,12 +15929,6 @@ function statusAnswering(state: LatchRowState): RecoveryStubScript {
   return { statusError: errTmuxUnresponsive('status') }
 }
 
-/** `persona`'s row in its own directory reading `state`, with no `config_dir` label (b.av2 SR-6.2: never resumed). */
-function unlabelledRow(h: RecoveryHarness, persona: Persona, state: RecoveryRowState): PersonaGetResultOverrides {
-  const labels: Record<string, string> = { ...harnessRow(h, persona, { state }).labels }
-  delete labels['config_dir']
-  return { state, labels }
-}
 
 /** A spawn or resume of the ladder where P's launch meets a CONFLICT. */
 interface LatchSite {
@@ -16321,14 +16014,6 @@ const LATCH_SPAWN_SITES: readonly LatchSite[] = [
     reuse: true,
   },
   {
-    name: 'the fresh spawn after the resume\'s ErrSpawnNotResumable, its kill and its delete (an ended row)',
-    verb: 'spawn',
-    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }, err), resumeError: errSpawnNotResumable() }),
-    calls: ladderCallsOf({ spawn: 2, resume: 1, kill: 1, delete: 1 }),
-    reads: { get: 1, status: 0 },
-    lastRead: ENDED_READ,
-  },
-  {
     name: 'the fresh spawn after the resume\'s ErrSpawnNotFound (a missing row)',
     verb: 'spawn',
     script: (h, p, err) => ({ ...collided(h, p, { state: 'missing' }, err), resumeError: errSpawnNotFound() }),
@@ -16336,31 +16021,12 @@ const LATCH_SPAWN_SITES: readonly LatchSite[] = [
     reads: { get: 1, status: 0 },
     lastRead: MISSING_READ,
   },
-  {
-    name: 'the fresh spawn of a replacement (resume_enabled false, an ended row), after its kill and delete',
-    verb: 'spawn',
-    setup: noResume,
-    script: (h, p, err) => collided(h, p, { state: 'ended' }, err),
-    calls: ladderCallsOf({ spawn: 2, kill: 1, delete: 1 }),
-    reads: { get: 1, status: 0 },
-    lastRead: ENDED_READ,
-  },
-  {
-    name: 'the fresh spawn of a replacement (a row in another directory read waiting), after its kill and delete',
-    verb: 'spawn',
-    script: (h, p, err) => collided(h, p, elsewhere(h, 'waiting'), err),
-    calls: ladderCallsOf({ spawn: 2, kill: 1, delete: 1 }),
-    reads: { get: 1, status: 0 },
-    lastRead: WAITING_READ,
-  },
-  {
-    name: 'the fresh spawn of a replacement (an ended row with no config_dir label), after its delete',
-    verb: 'spawn',
-    script: (h, p, err) => collided(h, p, unlabelledRow(h, p, 'ended'), err),
-    calls: ladderCallsOf({ spawn: 2, delete: 1 }),
-    reads: { get: 1, status: 0 },
-    lastRead: ENDED_READ,
-  },
+  // b.jg5 SRJ-707, SRJ-709, SRJ-501: each replacement site over a finished
+  // row makes one reuse spawn of the same id, which records "reuse spawn" and
+  // the state the collision get read; a live row there is the live-row
+  // sequence's, whose own launch's CONFLICT rows are
+  // tests/conflict-latch.test.ts's.
+  ...REPLACEMENT_REUSE_SITES.map((site): LatchSite => ({ ...site, verb: 'spawn', reads: { get: 1, status: 0 }, lastRead: ENDED_READ })),
   // b.jg5 SRJ-605: the wait's absent row is a dead session; its recovery's
   // fresh spawn, after the resume finds no row either, decides what holds the
   // name, and a CONFLICT there latches P with no row read.
@@ -18488,8 +18154,8 @@ describe('b.jg5 SRJ-114, SRJ-105: a failed post-run get of the caller\'s own row
 // the refused operation "none" and the row state its path last read (a
 // `status` or `get` that itself answered records unreadable; a path that read
 // nothing makes the one latch-time `status` read). At every site the session
-// manager wires: the collision ladder's spawns and `resume` and its kill and
-// delete in a delete-then-spawn chain, the working-pane read (the launch
+// manager wires: the collision ladder's spawns (its replacement sites' reuse
+// spawns among them) and `resume`, the working-pane read (the launch
 // wait's evidence read and `checkWaitingRowPane`; the working-row verdict's
 // read is in tests/server.test.ts, and `checkWorkingRowPane` on its pane
 // makes no read, so it never meets the answer), the
@@ -18554,114 +18220,24 @@ function recordEveryCall(h: RecoveryHarness): string[] {
   return order
 }
 
-/** A spawn, `resume`, kill or delete of the collision ladder where P's launch meets an UNUSABLE NAME answer. */
+/** A spawn or `resume` of the collision ladder where P's launch meets an UNUSABLE NAME answer. */
 interface UnusableLadderSite extends Omit<LatchSite, 'verb'> {
   /** The site kind of `UNUSABLE_NAME_CASE_ROWS` whose rows it meets. */
   readonly kind: UnusableNameSite
   /** The stub client's method for the refused call. */
-  readonly verb: 'spawn' | 'resume' | 'kill' | 'delete'
+  readonly verb: 'spawn' | 'resume'
 }
-
-/** The kill of each delete-then-spawn chain: nothing is deleted or launched after it. */
-const UNUSABLE_KILL_SITES: readonly UnusableLadderSite[] = [
-  {
-    name: 'the kill of a replacement (resume_enabled false, an ended row)',
-    kind: 'ladder kill',
-    verb: 'kill',
-    setup: noResume,
-    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), killError: err }),
-    calls: ladderCallsOf({ spawn: 1, kill: 1 }),
-    reads: { get: 1, status: 0 },
-    lastRead: ENDED_READ,
-  },
-  {
-    name: 'the kill of a replacement (a row in another directory read waiting)',
-    kind: 'ladder kill',
-    verb: 'kill',
-    script: (h, p, err) => ({ ...collided(h, p, elsewhere(h, 'waiting')), killError: err }),
-    calls: ladderCallsOf({ spawn: 1, kill: 1 }),
-    reads: { get: 1, status: 0 },
-    lastRead: WAITING_READ,
-  },
-  {
-    name: 'the kill of a replacement (a row in another directory read ended)',
-    kind: 'ladder kill',
-    verb: 'kill',
-    script: (h, p, err) => ({ ...collided(h, p, elsewhere(h, 'ended')), killError: err }),
-    calls: ladderCallsOf({ spawn: 1, kill: 1 }),
-    reads: { get: 1, status: 0 },
-    lastRead: ENDED_READ,
-  },
-  {
-    name: 'the kill of a replacement (a waiting row with no config_dir label, after its reconnect\'s dead-session verdict)',
-    kind: 'ladder kill',
-    verb: 'kill',
-    script: (h, p, err) => ({ ...collided(h, p, unlabelledWaitingRow(h, p)), sendKeysError: errSpawnNotInteractive('send-keys'), killError: err }),
-    calls: ladderCallsOf({ spawn: 1, sendKeys: 1, kill: 1 }),
-    reads: { get: 1, status: 0 },
-    lastRead: WAITING_READ,
-  },
-  {
-    name: 'the kill after the resume\'s ErrSpawnNotResumable (an ended row)',
-    kind: 'ladder kill',
-    verb: 'kill',
-    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), resumeError: errSpawnNotResumable(), killError: err }),
-    calls: ladderCallsOf({ spawn: 1, resume: 1, kill: 1 }),
-    reads: { get: 1, status: 0 },
-    lastRead: ENDED_READ,
-  },
-]
-
-/** The delete of each delete-then-spawn chain: nothing is launched after it. */
-const UNUSABLE_DELETE_SITES: readonly UnusableLadderSite[] = [
-  {
-    name: 'the delete of a replacement (resume_enabled false, an ended row), after its kill',
-    kind: 'ladder delete',
-    verb: 'delete',
-    setup: noResume,
-    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), deleteError: err }),
-    calls: ladderCallsOf({ spawn: 1, kill: 1, delete: 1 }),
-    reads: { get: 1, status: 0 },
-    lastRead: ENDED_READ,
-  },
-  {
-    name: 'the delete of a replacement (a row in another directory read waiting), after its kill',
-    kind: 'ladder delete',
-    verb: 'delete',
-    script: (h, p, err) => ({ ...collided(h, p, elsewhere(h, 'waiting')), deleteError: err }),
-    calls: ladderCallsOf({ spawn: 1, kill: 1, delete: 1 }),
-    reads: { get: 1, status: 0 },
-    lastRead: WAITING_READ,
-  },
-  {
-    name: 'the delete of a replacement (an ended row with no config_dir label)',
-    kind: 'ladder delete',
-    verb: 'delete',
-    script: (h, p, err) => ({ ...collided(h, p, unlabelledRow(h, p, 'ended')), deleteError: err }),
-    calls: ladderCallsOf({ spawn: 1, delete: 1 }),
-    reads: { get: 1, status: 0 },
-    lastRead: ENDED_READ,
-  },
-  {
-    name: 'the delete after the resume\'s ErrSpawnNotResumable and its kill (an ended row)',
-    kind: 'ladder delete',
-    verb: 'delete',
-    script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), resumeError: errSpawnNotResumable(), deleteError: err }),
-    calls: ladderCallsOf({ spawn: 1, resume: 1, kill: 1, delete: 1 }),
-    reads: { get: 1, status: 0 },
-    lastRead: ENDED_READ,
-  },
-]
 
 /**
  * Every ladder site: each spawn (`plain spawn`, or `reuse spawn` at a reuse
- * site) and `resume` of E13's CONFLICT sites, and each kill and delete above.
+ * site, the replacement sites' among them) and `resume` of E13's CONFLICT
+ * sites. The ladder makes no kill and no delete (b.jg5 SRJ-707); the
+ * live-row sequence's kills' UNUSABLE NAME rows are
+ * tests/conflict-latch.test.ts's.
  */
 const UNUSABLE_LADDER_SITES: readonly UnusableLadderSite[] = [
   ...LATCH_SPAWN_SITES.map((site): UnusableLadderSite => ({ ...site, kind: site.reuse === true ? REUSE_SPAWN_SITE : 'plain spawn' })),
   ...LATCH_RESUME_SITES.map((site) => ({ ...site, kind: 'resume' as const })),
-  ...UNUSABLE_KILL_SITES,
-  ...UNUSABLE_DELETE_SITES,
 ]
 
 /**
@@ -18677,7 +18253,7 @@ const UNUSABLE_LADDER_CROSS = UNUSABLE_LADDER_SITES.map((site, i) => {
   return [site.name, row.fault, site, row] as const
 })
 
-describe('b.jg5 SRJ-105, SRJ-512, SRJ-501, SRJ-502: an UNUSABLE NAME answer at a spawn, resume, kill or delete of the collision ladder latches the persona; nothing else is done for it', () => {
+describe('b.jg5 SRJ-105, SRJ-512, SRJ-501, SRJ-502: an UNUSABLE NAME answer at a spawn or resume of the collision ladder latches the persona; nothing else is done for it', () => {
   afterEach(srj105AfterEach)
 
   test.each(UNUSABLE_LADDER_CROSS)('%s answering UNUSABLE NAME (%s): latched with "unusable recorded name", "none" and the state the path last read (one latch-time status read only where it read nothing); the refused call is the last, raw tmux included; one post after the holds; nothing counted, posted as a spawn failure, armed or started; then no launch path reaches agent-director; B launches', async (_site, _fault, site, row) => {
@@ -18737,177 +18313,6 @@ describe('b.jg5 SRJ-105, SRJ-512, SRJ-501, SRJ-502: an UNUSABLE NAME answer at a
     expect(result.failed).toBe(0)
     expect(result.succeeded).toBe(1)
     expectLatchedOnce(h, p, unusableNameLatch(p, row, LATCH_ROW_STATE_NO_ROW))
-  })
-})
-
-// ---------------------------------------------------------------------------
-// b.jg5 SRJ-110, SRJ-701 (HO C2 Verify; the E13, E16 and E19 hatch notes):
-// the collision ladder's replacement kills (each delete-then-spawn chain's
-// kill: `resume_enabled` false, a `cwd` or `config_dir` mismatch, and the
-// `ErrSpawnNotResumable` branch) are checked kills. Only a success
-// (`kill_sent` true, false or absent) or `ErrSpawnNotFound` lets the delete
-// and the fresh spawn follow. A CONFLICT latches P through the latch's
-// CONFLICT entry with "P's next check or recovery" and the state the ladder
-// last read, posts one notice and is never sent again (AC 9; on a `waiting`
-// row, "not this launch's session" is SRJ-613's kill backstop: nothing is
-// sent, a row of `conflictCross`). GONE is the session-gone success (b.jg5 SRJ-104: for `kill`, gone
-// is success): the chain goes on. A value of a class SRJ-110 gives no row (a
-// STATE name other than `ErrSpawnNotFound`, LAUNCH FAILURE) stops the chain
-// as UNCLASSIFIED: refused, never counted, P's timer armed with the
-// UNCLASSIFIED cause and its unclassified-error episode fed (b.jg5 SRJ-105,
-// SRJ-313). An `ErrInvalidFlags` gets exactly one immediate version re-check
-// (b.jg5 SRJ-104, SRJ-204): a pass is that UNCLASSIFIED handling, a stop
-// answers `failed` marked `stopping` with nothing more called (b.jg5
-// SRJ-205). The UNAVAILABLE,
-// ENVIRONMENT, CONFIG and UNCLASSIFIED rows at these sites are the SRJ-105,
-// SRJ-311, SRJ-316 and SRJ-313 describes' (`KILL_SITES`, `ACTION_SITES`);
-// UNUSABLE NAME is E16's describe above (`UNUSABLE_KILL_SITES`).
-// ---------------------------------------------------------------------------
-
-describe('b.jg5 SRJ-110, SRJ-701: the collision ladder\'s replacement kills are checked kills: only a success lets the delete and the fresh spawn follow', () => {
-  afterEach(srj105AfterEach)
-
-  const conflictCross = UNUSABLE_KILL_SITES.flatMap((site) =>
-    LADDER_KILL_CONFLICT_CASE_ROWS.map((row) => [site.name, row.name, site, row] as const),
-  )
-
-  test.each(conflictCross)('%s answering CONFLICT (%s): P latched once with the case, "P\'s next check or recovery" and the state the ladder last read; one post after the holds; no delete or spawn after the kill; nothing counted, armed or posted as a spawn failure; never sent again (AC 9): no launch path reaches agent-director; B launches', async (_site, _row, site, row) => {
-    const { h, p, b } = srj105Build()
-    const persona = harnessPersona(h, p)
-    site.setup?.(h)
-    const script = site.script(h, persona, row.build(), row)
-    h.script(script)
-
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
-
-    expect(ladderCallsMade(h)).toEqual(site.calls)
-    expect(h.stub.calls.statusCalls).toHaveLength(site.reads.status)
-    expectLatchedOnce(h, p, conflictLatch(p, row, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, site.lastRead!), site.inconclusiveEntries)
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
-
-    await expectLaunchedByNoPath(h, p, b, script)
-  })
-
-  test.each(UNUSABLE_KILL_SITES.flatMap((site) => [
-    ['a STATE name other than ErrSpawnNotFound (ErrSpawnNotResumable)', site.name, () => errSpawnNotResumable(), site] as const,
-    ['a STATE name other than ErrSpawnNotFound (ErrInstanceIdCollision)', site.name, () => errInstanceIdCollision(), site] as const,
-    ['a LAUNCH FAILURE name (ErrTmuxSessionCreate)', site.name, () => errTmuxSessionCreate('kill'), site] as const,
-  ]))('b.jg5 SRJ-110, SRJ-313: %s at %s (a class SRJ-110 gives no kill row, so UNCLASSIFIED): the chain stops, refused and not counted (no cap); P\'s timer armed with the UNCLASSIFIED cause; P\'s unclassified episode fed; no delete or spawn after the kill, no spawn-failure notice or spawn-failed entry, nothing latched', async (_what, _site, make, site) => {
-    const { h, p } = srj105Build()
-    site.setup?.(h)
-    h.script(site.script(h, harnessPersona(h, p), make(), { rowState: WAITING_READ }))
-
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
-
-    expect(ladderCallsMade(h)).toEqual(site.calls)
-    expect(getFailureCount(p)).toBe(0)
-    expect(h.capReached).toEqual([])
-    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
-    expect(h.unclassifiedErrorOpen(p)).toBe(true)
-    expect(h.notices).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
-    expect(h.latch.isLatched(p)).toBe(false)
-    expect(refusalLines(h, p)).toHaveLength(1)
-  })
-
-  // b.jg5 SRJ-104, SRJ-204, SRJ-205: an ErrInvalidFlags at a replacement
-  // kill gets exactly one immediate version re-check, at every kill site.
-  describe('an ErrInvalidFlags at a replacement kill', () => {
-    let resolveCalls: Array<object | undefined>
-    let stops: number[]
-
-    /** Install the real re-check, its `resolveSystemBinary` answering `outcome`. */
-    function installRecheck(outcome: StubResolveSystemBinaryOutcome): void {
-      resetAdVersionRecheckForTests()
-      installAdVersionRecheck({
-        resolveSystemBinary: makeStubResolveSystemBinary({ calls: resolveCalls, outcomes: [outcome] }),
-        baselineVersion: PHASE1_RC_VERSION,
-        recordStartupError: () => {},
-        stop: (exitCode) => { stops.push(exitCode) },
-        log: () => {},
-        clock: createFakeClock(),
-      })
-    }
-
-    beforeEach(() => {
-      resolveCalls = []
-      stops = []
-    })
-
-    afterEach(() => {
-      resetAdVersionRecheckForTests()
-    })
-
-    test.each(UNUSABLE_KILL_SITES.map((site) => [site.name, site] as const))('b.jg5 SRJ-104, SRJ-204: at %s, the re-check passes → exactly one re-check, no stop; then UNCLASSIFIED: refused and not counted, P\'s timer armed with the UNCLASSIFIED cause, its episode fed; no delete or spawn after the kill', async (_site, site) => {
-      installRecheck({ version: PHASE1_RC_VERSION })
-      const { h, p } = srj105Build()
-      site.setup?.(h)
-      h.script(site.script(h, harnessPersona(h, p), errInvalidFlags('kill'), { rowState: WAITING_READ }))
-
-      expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
-
-      expect(resolveCalls).toHaveLength(1)
-      expect(stops).toEqual([])
-      expect(ladderCallsMade(h)).toEqual(site.calls)
-      expect(getFailureCount(p)).toBe(0)
-      expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
-      expect(h.unclassifiedErrorOpen(p)).toBe(true)
-      expect(h.latch.isLatched(p)).toBe(false)
-      expect(refusalLines(h, p).filter((l) => l.includes(`recheck=${RECHECK_OUTCOME_PASS}`))).toHaveLength(1)
-    })
-
-    test.each(UNUSABLE_KILL_SITES.map((site) => [site.name, site] as const))('b.jg5 SRJ-104, SRJ-205: at %s, the re-check decides that the server stops → exactly one re-check and one stop; failed, marked stopping; nothing after the kill, nothing armed, counted, latched or posted, the episode not fed', async (_site, site) => {
-      installRecheck({ version: OLD_AD_VERSION })
-      const { h, p } = srj105Build()
-      site.setup?.(h)
-      h.script(site.script(h, harnessPersona(h, p), errInvalidFlags('kill'), { rowState: WAITING_READ }))
-
-      expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', stopping: true })
-
-      expect(resolveCalls).toHaveLength(1)
-      expect(stops).toHaveLength(1)
-      expect(ladderCallsMade(h)).toEqual(site.calls)
-      expect(getFailureCount(p)).toBe(0)
-      expect(h.triggers).toEqual([])
-      expect(h.unclassifiedErrorOpen(p)).toBe(false)
-      expect(h.latch.isLatched(p)).toBe(false)
-      expect(h.notices).toEqual([])
-      expect(refusalLines(h, p)).toEqual([])
-      expect(h.errors.filter((l) => l.startsWith(`[slack] spawnForPersona: kill for ${renderPersonaRef(p, p)} did not succeed: `) && l.includes(`recheck=${RECHECK_OUTCOME_STOP}`))).toHaveLength(1)
-    })
-  })
-
-  // b.jg5 SRJ-701, SRJ-703: a success with any `kill_sent`, and
-  // `ErrSpawnNotFound`, let the chain go on: the delete, then the fresh
-  // spawn, with one line naming the outcome; `kill_sent: false` raises
-  // nothing by itself.
-  test.each(UNUSABLE_KILL_SITES.flatMap((site) =>
-    ([
-      ['succeeds with kill_sent true', { killResult: cannedKillResult(true) }, { kind: KILL_OUTCOME_KILLED, killSent: true }],
-      ['succeeds with kill_sent false', { killResult: cannedKillResult(false) }, { kind: KILL_OUTCOME_KILLED, killSent: false }],
-      ['succeeds with no kill_sent', { killResult: cannedKillResult() }, { kind: KILL_OUTCOME_KILLED }],
-      ['answers ErrSpawnNotFound', { killError: errSpawnNotFound() }, { kind: KILL_OUTCOME_ROW_GONE }],
-      // b.jg5 SRJ-104, SRJ-110: for `kill`, gone is success.
-      ['answers GONE (ErrTmuxCaptureFailed), the session-gone success', { killError: errTmuxCaptureFailed(undefined, 'kill') }, { kind: KILL_OUTCOME_SESSION_GONE, name: errTmuxCaptureFailed().errName }],
-      ['answers GONE (ErrTmuxSendKeys), the session-gone success', { killError: errTmuxSendKeys() }, { kind: KILL_OUTCOME_SESSION_GONE, name: errTmuxSendKeys().errName }],
-    ] as const).map(([what, kill, outcome]) => [site.name, what, site, kill, outcome] as const),
-  ))('b.jg5 SRJ-701, SRJ-104: %s: the kill %s → the delete and the fresh spawn follow, with one line naming the outcome; nothing latched, armed or posted', async (_site, _what, site, kill, outcome) => {
-    const { h, p } = srj105Build()
-    site.setup?.(h)
-    const script = site.script(h, harnessPersona(h, p), errSpawnNotFound(), { rowState: WAITING_READ })
-    h.script({ ...script, killError: undefined, killResult: undefined, ...kill })
-
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
-
-    expect(h.stub.calls.killCalls).toHaveLength(1)
-    expect(h.stub.calls.deleteCalls).toEqual([{ claude_instance_id: [personaInstanceId(p)] }])
-    expect(h.stub.calls.spawnCalls).toHaveLength(2)
-    expect(h.errors).toContain(
-      `[slack] spawnForPersona: kill for ${renderPersonaRef(p, p)}: ${describeKillOutcome(outcome as KillOutcome)} — the delete and the fresh spawn follow (b.jg5 SRJ-701)`,
-    )
-    expect(h.latch.isLatched(p)).toBe(false)
-    expect(h.notices).toEqual([])
-    expect(h.triggers).toEqual([])
   })
 })
 
@@ -20459,7 +19864,7 @@ describe('b.jg5 SRJ-313, SRJ-1002, SRJ-512: the controls — a phrase-less ErrIn
 
   test('b.jg5 SRJ-701: the persona teardown\'s killPersonaInstance answering UNUSABLE NAME answers its UNUSABLE NAME outcome carrying the same value (never rethrown) and latches nothing: no set, no post, no UNUSABLE NAME line', async () => {
     const { h, p } = srj105Build()
-    const err = unusableNameRowsAt('ladder kill')[0]!.build()
+    const err = unusableNameRowsAt(RESTART_KILL_SITE)[0]!.build()
     h.script({ killError: err })
 
     expect(await killPersonaInstance(p, { context: KILL_CONTEXT_TEARDOWN })).toEqual({ kind: KILL_OUTCOME_NOT_KILLED, errorClass: AD_ERROR_CLASS_UNUSABLE_NAME, error: err })
@@ -20471,7 +19876,7 @@ describe('b.jg5 SRJ-313, SRJ-1002, SRJ-512: the controls — a phrase-less ErrIn
 
   test('the persona teardown\'s deletePersonaInstance answering UNUSABLE NAME still rethrows the same value and latches nothing: no set, no post, no UNUSABLE NAME line', async () => {
     const { h, p } = srj105Build()
-    const err = unusableNameRowsAt('ladder delete')[0]!.build()
+    const err = errUnusableName()
     h.script({ deleteError: err })
 
     let thrown: unknown
@@ -22321,9 +21726,10 @@ describe('b.jg5 SRJ-602, SRJ-711: ErrTmuxSessionCreate is one counted launch fai
 // `cscb_<key>`, carrying the reuse flag and the persona's `extra_env`, with
 // no `delete`, kill or plain spawn; on `ErrJsonlMissing` the diagnosis's `get`
 // comes first (the harness configures no message archive, so it is
-// inconclusive). At the collision ladder a reuse that collides ends the
-// attempt with the uncounted refused result: nothing posted or counted, P's
-// timer armed with the reuse-collision cause. At the sequence-launch entry a
+// inconclusive). At the collision ladder a reuse that collides re-runs
+// get-then-act once; a second collision ends the attempt with the uncounted
+// refused result: nothing posted or counted, P's timer armed with the
+// reuse-collision cause. At the sequence-launch entry a
 // refused or latching diagnosis `get` launches nothing. The ladder's
 // per-outcome rows are the SRJ-105, SRJ-311, SRJ-316, SRJ-313, CONFLICT and
 // UNUSABLE NAME describes' (their reuse sites); the entry's three answers
@@ -22363,21 +21769,27 @@ describe('b.jg5 SRJ-707, SRJ-712: resume\'s no-transcript answers go on to one r
     await h.runApproverToStop(p)
   })
 
-  // The Task's ruling until the ladder's re-run of get-then-act: a reuse
-  // collision there ends the attempt with the refused result (b.jg5 SRJ-112,
-  // SRJ-301). The diagnosis's notice is not posted: the reuse collided and
-  // did not bring P up.
-  test.each(NO_TRANSCRIPT_ANSWERS)('at the collision ladder, resume answering %s, then a reuse spawn that collides: the attempt ends refused, with no further launch; nothing counted, posted or recorded spawn-failed; P\'s timer armed with the reuse-collision cause; the restart path\'s launch answers refused', async (_label, make, _action, before) => {
+  // b.jg5 SRJ-112, SRJ-301: the first reuse collision re-runs the ladder's
+  // get-then-act once (its get reads the row ended again, so the resume and
+  // its no-transcript answer repeat); a collision in that re-run arms P's
+  // timer with the reuse-collision cause and ends the attempt with the
+  // uncounted refused result. The diagnosis's notice is not posted: the reuse
+  // collided and did not bring P up.
+  test.each(NO_TRANSCRIPT_ANSWERS)('at the collision ladder, resume answering %s, then a reuse spawn that collides, twice: get-then-act re-runs once, then the attempt ends refused with no third launch; nothing counted, posted or recorded spawn-failed; P\'s timer armed with the reuse-collision cause; the restart path\'s launch answers refused', async (_label, make, _action, before) => {
     const { h, p, b } = srj105Build()
     // A fresh script for each launch: the stub consumes its spawn queue.
-    const script = (): RecoveryStubScript => ({ ...collided(h, harnessPersona(h, p), ENDED_WITH_SESSION, errInstanceIdCollision()), resumeError: make() })
+    const script = (): RecoveryStubScript => ({
+      ...collided(h, harnessPersona(h, p), ENDED_WITH_SESSION, errInstanceIdCollision(), errInstanceIdCollision()),
+      resumeError: make(),
+    })
     h.script(script())
     const order = recordCallOrder(h)
 
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
 
-    expect(order).toEqual([...before, 'spawn'])
-    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
+    const pass = [...before.slice(1), 'spawn']
+    expect(order).toEqual(['spawn', ...pass, ...pass])
+    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p), reuseSpawnOf(h, p)])
     expect([h.stub.calls.deleteCalls, h.stub.calls.killCalls]).toEqual([[], []])
     expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION }])
     expect(h.controller.isArmed(p)).toBe(true)
@@ -22407,6 +21819,381 @@ describe('b.jg5 SRJ-707, SRJ-712: resume\'s no-transcript answers go on to one r
     expect(order).toEqual(['resume', 'get'])
     expect([h.stub.calls.spawnCalls, h.stub.calls.deleteCalls, h.stub.calls.killCalls, h.notices]).toEqual([[], [], [], []])
     expect(getFailureCount(p)).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504 (E22 T4), with SRJ-705, SRJ-706,
+// SRJ-110, SRJ-112 and SRJ-710, on `makeRecoveryHarness` (its registry, latch
+// and kill-failure alerts installed as `main()` installs them): every row the
+// collision ladder cannot keep (`resume_enabled` false, a `cwd` that differs
+// by real path, a `config_dir` label missing or different) is replaced with
+// no row deleted, deciding on the state the path last read.
+//
+// - A finished row (`ended` or `missing`): exactly one reuse spawn of
+//   `cscb_<key>` carrying the reuse field and the persona's `extra_env`
+//   (`reuseSpawnOf`), after the colliding plain spawn, with no `delete`, kill
+//   or other spawn; a `config_dir` site's reuse carries the current label
+//   and CLAUDE_CONFIG_DIR. SRJ-112's rows at each such site and at T3's
+//   three no-transcript sites (SRJ-709): the UNAVAILABLE, ENVIRONMENT,
+//   CONFIG, UNCLASSIFIED, CONFLICT and UNUSABLE NAME rows are the SRJ-105,
+//   SRJ-311, SRJ-316, SRJ-313, CONFLICT and UNUSABLE NAME describes' (their
+//   reuse sites); here a collision re-runs get-then-act exactly once, a
+//   second collision arms the reuse-collision cause with nothing counted or
+//   posted (T3's three sites: the T3 describe above), `ErrTmuxSessionCreate`
+//   is one counted launch failure that kills nothing, `ErrInvalidFlags` makes
+//   one version re-check and launches nothing more, and a directory error is
+//   counted.
+// - A live row (`pending` with a launch start included): the launch starts
+//   P's live-row sequence through the start entry (entry at step 1, seeded
+//   with that state, the conversation not kept, alert context `recovery`)
+//   and answers `sequence-waiting` with no call of its own, nothing counted;
+//   the sequence's kill, run and `get` follow on the clock and its step 6 is
+//   a reuse spawn although the row carries a session id. SRJ-110 at each
+//   such site: the sequence's first kill answering UNAVAILABLE,
+//   `ErrTmuxKillFailed`, CONFLICT or UNUSABLE NAME is followed by no launch
+//   and no `delete`.
+// - `cwdCheckDeferred` keeps the row: no reuse and no sequence. A resume's
+//   `ErrSpawnNotResumable` is a lost race at every path that resumes (the
+//   ended row's is tests/unavailable-retry.test.ts's): no kill, `delete` or
+//   launch, nothing counted or posted, the lost-race cause armed.
+// - The sequence a start-pass launch starts is not part of the start pass:
+//   its step-6 launch passes the start flag false, so a failure there writes
+//   no startup-errors entry (the ladder's own reuse at the start pass does).
+// No call of any case sets `include_finished`.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site replaces P\'s row with no delete: a finished row by one reuse spawn of the same id, a live row through the live-row sequence first', () => {
+  afterEach(() => {
+    const h = srj105Harness
+    if (h !== undefined) {
+      const everyCall = Object.values(h.stub.calls).flat() as unknown[]
+      expect(everyCall.filter((params) => typeof params === 'object' && params !== null && 'include_finished' in params)).toEqual([])
+      expect(h.stub.calls.deleteCalls).toEqual([])
+    }
+    srj105AfterEach()
+  })
+
+  /** The row the sequence's `get`s read after the ladder's: ended, with a session id (a resume would keep the conversation). */
+  const endedWithSession = (h: RecoveryHarness, p: string): CannedGetResult =>
+    harnessRow(h, harnessPersona(h, p), { state: LIVENESS_DEAD_ROW_ENDED, claude_session_id: 'a-session-id' })
+
+  /** A live row at a replacement site: how the ladder reaches it, the state it last read (the sequence's seed), and its calls before the start. */
+  interface LiveSite {
+    readonly name: string
+    readonly seed: string
+    readonly setup?: (h: RecoveryHarness) => void
+    /** The collision `get`'s row and any other answer the ladder's own path needs. */
+    readonly row: (h: RecoveryHarness, p: string) => PersonaGetResultOverrides
+    readonly script?: RecoveryStubScript
+    readonly before: readonly string[]
+  }
+
+  /** The dead-session verdict of a `waiting` row: its reconnect's one send-keys answers not interactive. */
+  const DEAD_WAITING: RecoveryStubScript = { sendKeysError: errSpawnNotInteractive('send-keys') }
+
+  const LIVE_SITES: readonly LiveSite[] = [
+    ...(['waiting', 'working', 'check_permission', 'ask_user', 'pending'] as const).map((state): LiveSite => ({
+      name: `a row in another directory read ${state}`,
+      seed: state,
+      row: (h) => elsewhere(h, state),
+      before: ['spawn', 'get'],
+    })),
+    { name: 'a pending row with no config_dir label (the pending branch)', seed: 'pending', row: (h, p) => unlabelledRow(h, harnessPersona(h, p), 'pending'), before: ['spawn', 'get'] },
+    { name: 'a pending row whose config_dir label differs (the pending branch)', seed: 'pending', row: (h, p) => relabelledRow(h, harnessPersona(h, p), 'pending'), before: ['spawn', 'get'] },
+    {
+      name: 'a waiting row with no config_dir label, after its dead-session verdict and sweep (the guard before resume)',
+      seed: 'waiting',
+      row: (h, p) => unlabelledRow(h, harnessPersona(h, p), 'waiting'),
+      script: DEAD_WAITING,
+      before: ['spawn', 'get', 'sendKeys', 'findMissing'],
+    },
+    {
+      name: 'a waiting row whose config_dir label differs, after its dead-session verdict and sweep (the guard before resume)',
+      seed: 'waiting',
+      row: (h, p) => relabelledRow(h, harnessPersona(h, p), 'waiting'),
+      script: DEAD_WAITING,
+      before: ['spawn', 'get', 'sendKeys', 'findMissing'],
+    },
+    {
+      name: 'a waiting row after its dead-session verdict, resume_enabled false',
+      seed: 'waiting',
+      setup: noResume,
+      row: () => ({ state: 'waiting' }),
+      script: DEAD_WAITING,
+      before: ['spawn', 'get', 'sendKeys'],
+    },
+  ]
+
+  /** Script P's launch to meet `site`'s row: the colliding first spawn, the ladder's `get`, then `endedWithSession` at every later `get`. */
+  function scriptLiveSite(h: RecoveryHarness, p: string, site: LiveSite, extra: RecoveryStubScript = {}): void {
+    site.setup?.(h)
+    h.script({
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, harnessPersona(h, p), site.row(h, p)))],
+      getResult: endedWithSession(h, p),
+      ...site.script,
+      ...extra,
+    })
+  }
+
+  test.each(LIVE_SITES.map((site) => [site.name, site] as const))('%s: the launch starts P\'s sequence (step 1, its seed the state read, recovery context) and answers sequence-waiting with no call of its own; the sequence\'s kill, get, run and get follow, and its step 6 is one reuse spawn though the row has a session id (the conversation is not kept); nothing counted or deleted', async (_name, site) => {
+    const { h, p, b } = srj105Build()
+    scriptLiveSite(h, p, site)
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
+    // The launch's own calls end at the ladder's; any call after them is the sequence's step-1 kill.
+    expect(order.slice(0, site.before.length)).toEqual([...site.before])
+    expect(order.slice(site.before.length).filter((verb) => verb !== 'kill')).toEqual([])
+    expect(h.sequenceRunning(p)).toBe(true)
+
+    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({
+      kind: LIVE_ROW_OUTCOME_LAUNCHED,
+      launchKind: LIVE_ROW_LAUNCH_REUSE,
+      result: { key: p, action: 'spawned' },
+      kills: 1,
+    })
+
+    expect(order.slice(0, order.lastIndexOf('spawn') + 1)).toEqual([...site.before, 'kill', 'get', 'findMissing', 'get', 'spawn'])
+    expect(h.lines).toContain(liveRowSequenceStartLine(renderPersonaRef(p, p), h.sequenceRequest(p, { lastReadState: site.seed })))
+    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
+    expect(h.stub.calls.resumeCalls).toEqual([])
+    expect([getFailureCount(p), h.triggers, h.notices]).toEqual([0, [], []])
+    expect(personaCallCounts(h, b)).toEqual({})
+    await h.runApproverToStop(p)
+  })
+
+  /**
+   * One non-success answer of the sequence's step-1 kill (b.jg5 SRJ-110; HO C2's list): its class, whether it
+   * latches P, the kill tries it takes (only UNAVAILABLE is tried again, SRJ-702), the cause its own handling arms
+   * (none when it latches), and the outage it raises or the unclassified report it makes.
+   */
+  interface FirstKillFailure {
+    readonly make: () => Error
+    readonly errorClass: AdErrorClass
+    readonly latches: boolean
+    readonly tries: number
+    readonly cause?: string
+    readonly outage?: OutageClass
+    readonly unclassified?: true
+  }
+
+  /** The sequence's step-1 kill answers: each followed by no launch and no delete. */
+  const FIRST_KILL_FAILURES: ReadonlyArray<readonly [string, FirstKillFailure]> = [
+    ['UNAVAILABLE (ErrTmuxUnresponsive) at every try', { make: () => errTmuxUnresponsive('kill'), errorClass: AD_ERROR_CLASS_UNAVAILABLE, latches: false, tries: KILL_RETRY_TRIES, cause: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }],
+    ['UNAVAILABLE (ErrCallTimeout) at every try', { make: () => errCallTimeout('kill'), errorClass: AD_ERROR_CLASS_UNAVAILABLE, latches: false, tries: KILL_RETRY_TRIES, cause: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }],
+    ['UNAVAILABLE (ErrUnknownErrorName) at every try', { make: () => errUnknownErrorName(), errorClass: AD_ERROR_CLASS_UNAVAILABLE, latches: false, tries: KILL_RETRY_TRIES, cause: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }],
+    ['ErrTmuxKillFailed at every try', { make: () => errTmuxKillFailed(), errorClass: AD_ERROR_CLASS_UNAVAILABLE, latches: false, tries: KILL_RETRY_TRIES, cause: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }],
+    ['CONFLICT', { make: () => errTmuxSessionConflict('kill', 'never-reported-in'), errorClass: AD_ERROR_CLASS_CONFLICT, latches: true, tries: 1 }],
+    ['UNUSABLE NAME', { make: () => errUnusableName(), errorClass: AD_ERROR_CLASS_UNUSABLE_NAME, latches: true, tries: 1 }],
+    ['ENVIRONMENT (ErrTmuxNotAvailable)', { make: () => errTmuxNotAvailable(undefined, 'kill'), errorClass: AD_ERROR_CLASS_ENVIRONMENT, latches: false, tries: 1, cause: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, outage: 'tmux-unavailable' }],
+    ['UNCLASSIFIED (an ErrInternal not naming the recorded tmux session name)', { make: () => errInternal(), errorClass: AD_ERROR_CLASS_UNCLASSIFIED, latches: false, tries: 1, cause: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, unclassified: true }],
+  ]
+
+  test.each(LIVE_SITES.flatMap((site) => FIRST_KILL_FAILURES.map(([what, row]) => [site.name, what, site, row] as const)))('SRJ-110: %s, the sequence\'s first kill answering %s: the sequence aborts at step 1 by its class; no launch and no delete follow; nothing counted', async (_name, _what, site, row) => {
+    const { h, p } = srj105Build()
+    scriptLiveSite(h, p, site, { killError: row.make() })
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
+    const outcome = await h.driveSequence(h.sequenceSettled(p))
+
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_ABORTED, step: 1, errorClass: row.errorClass, latched: row.latches, kills: 1, runs: 0 })
+    // SRJ-301: an abort that latched nothing ends without the launch and arms the other-end cause.
+    expect(outcome?.armed).toBe(row.latches ? undefined : LIVE_ROW_ARM_ENDED)
+    expect(h.stub.calls.killCalls).toHaveLength(row.tries)
+    // The colliding plain spawn only: no launch, resume or delete after the kill, and no get of the sequence's.
+    expect([h.stub.calls.spawnCalls.length, h.stub.calls.resumeCalls, h.stub.calls.deleteCalls]).toEqual([1, [], []])
+    expect(h.stub.calls.getCalls).toHaveLength(1)
+    expect(h.reuseSpawns()).toEqual([])
+    expect(h.latch.isLatched(p)).toBe(row.latches)
+    expect(h.triggers).toEqual(row.cause === undefined ? [] : [{ key: p, kind: row.cause }, { key: p, kind: UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED }])
+    expect([...getOutageFlags(p)]).toEqual(row.outage === undefined ? [] : [row.outage])
+    expect(h.unclassifiedErrorOpen(p)).toBe(row.unclassified === true)
+    expect(getFailureCount(p)).toBe(0)
+  })
+
+  /** A finished-row replacement site of the ladder, or T3's no-transcript site, and one pass of its get-then-act's calls. */
+  interface ReuseSite {
+    readonly name: string
+    readonly setup?: (h: RecoveryHarness) => void
+    /** The collision `get`'s row (and every later `get`'s). */
+    readonly row: (h: RecoveryHarness, p: string) => PersonaGetResultOverrides
+    /** The `resume` answer, at a no-transcript site. */
+    readonly resumeError?: () => Error
+    /** One pass of get-then-act up to its reuse spawn. */
+    readonly pass: readonly string[]
+    /** The launch's answer once a reuse succeeds. */
+    readonly action: SpawnPersonaResult['action']
+  }
+
+  const REPLACE_PASS = ['get', 'spawn'] as const
+  const REUSE_SITES: readonly ReuseSite[] = [
+    { name: 'resume_enabled false, an ended row', setup: noResume, row: () => ({ state: LIVENESS_DEAD_ROW_ENDED }), pass: REPLACE_PASS, action: 'spawned' },
+    { name: 'a missing row in another directory', row: (h) => elsewhere(h, 'missing'), pass: REPLACE_PASS, action: 'spawned' },
+    { name: 'an ended row with no config_dir label', row: (h, p) => unlabelledRow(h, harnessPersona(h, p), 'ended'), pass: REPLACE_PASS, action: 'spawned' },
+    { name: 'an ended row whose config_dir label differs', row: (h, p) => relabelledRow(h, harnessPersona(h, p), 'ended'), pass: REPLACE_PASS, action: 'spawned' },
+  ]
+  const NO_TRANSCRIPT_SITES: readonly ReuseSite[] = [
+    { name: 'resume answering ErrNoSessionId', row: () => ({ state: LIVENESS_DEAD_ROW_ENDED }), resumeError: () => errNoSessionId(), pass: ['get', 'resume', 'spawn'], action: 'spawned' },
+    { name: 'resume answering ErrJsonlNeverWritten', row: () => ({ state: LIVENESS_DEAD_ROW_ENDED }), resumeError: () => errJsonlNeverWritten(), pass: ['get', 'resume', 'spawn'], action: 'spawned' },
+    { name: 'resume answering ErrJsonlMissing, after its diagnosis get', row: () => ({ state: LIVENESS_DEAD_ROW_ENDED }), resumeError: () => errJsonlMissing(), pass: ['get', 'resume', 'get', 'spawn'], action: 'fresh-after-inconclusive-amnesia' },
+  ]
+
+  /** Script P's launch at `site`: the colliding first spawn, then `spawns` (each reuse's answer, success when undefined). */
+  function scriptReuseSite(h: RecoveryHarness, p: string, site: ReuseSite, ...spawns: Array<Error | undefined>): void {
+    site.setup?.(h)
+    h.script({
+      spawnQueue: [cannedErr(errInstanceIdCollision()), ...spawns.map((err) => (err === undefined ? cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: personaInstanceId(p) }) : cannedErr<import('agent-director').SpawnResult>(err)))],
+      getResult: harnessRow(h, harnessPersona(h, p), site.row(h, p)),
+      ...(site.resumeError === undefined ? {} : { resumeError: site.resumeError() }),
+    })
+  }
+
+  test.each(REUSE_SITES.map((site) => [site.name, site] as const))('%s: exactly one reuse spawn of cscb_<key> with the reuse field, P\'s extra_env and its current config_dir label, after the colliding plain spawn; no delete, kill, resume or other spawn', async (_name, site) => {
+    const { h, p, b } = srj105Build()
+    scriptReuseSite(h, p, site, undefined)
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
+
+    expect(order.slice(0, 3)).toEqual(['spawn', ...REPLACE_PASS])
+    expect(h.stub.calls.spawnCalls.map((call) => (call as Phase1SpawnParams).reuse_finished)).toEqual([undefined, true])
+    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
+    const persona = harnessPersona(h, p)
+    expect(h.reuseSpawns()[0]!.label).toContain(`config_dir=${personaConfigDirLabelValue(persona.claude_config_dir, h.home)}`)
+    expect([h.stub.calls.killCalls, h.stub.calls.resumeCalls]).toEqual([[], []])
+    expect(personaCallCounts(h, b)).toEqual({})
+    await h.runApproverToStop(p)
+  })
+
+  // SRJ-112: a collision means the row turned live; the ladder re-runs its
+  // get-then-act once, whose get reads it finished again, and goes on.
+  test.each([...REUSE_SITES, ...NO_TRANSCRIPT_SITES].map((site) => [site.name, site] as const))('SRJ-112, %s: the reuse collides, get-then-act re-runs exactly once (its get reads the row finished again) and its reuse succeeds; nothing counted, armed or posted', async (_name, site) => {
+    const { h, p } = srj105Build()
+    scriptReuseSite(h, p, site, errInstanceIdCollision(), undefined)
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: site.action })
+
+    expect(order.slice(0, 1 + 2 * site.pass.length)).toEqual(['spawn', ...site.pass, ...site.pass])
+    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p), reuseSpawnOf(h, p)])
+    expect(h.stub.calls.killCalls).toEqual([])
+    expect([getFailureCount(p), h.triggers, h.episodeNotices]).toEqual([0, [], []])
+    await h.runApproverToStop(p)
+  })
+
+  test.each(REUSE_SITES.map((site) => [site.name, site] as const))('SRJ-112, %s: a second collision, in the one re-run, arms the reuse-collision cause and answers the uncounted refused result; no third launch, nothing counted or posted', async (_name, site) => {
+    const { h, p } = srj105Build()
+    scriptReuseSite(h, p, site, errInstanceIdCollision(), errInstanceIdCollision(), undefined)
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
+
+    expect(order).toEqual(['spawn', ...site.pass, ...site.pass])
+    expect(h.reuseSpawns()).toHaveLength(2)
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION }])
+    expect([getFailureCount(p), h.notices, h.episodeNotices]).toEqual([0, [], []])
+    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+  })
+
+  test.each([...REUSE_SITES, ...NO_TRANSCRIPT_SITES].map((site) => [site.name, site] as const))('SRJ-112, SRJ-602, %s: ErrTmuxSessionCreate at the reuse is one counted launch failure: one notice and one spawn-failed entry, P armed at once in pending-only mode, no kill and no spawn in its place', async (_name, site) => {
+    const { h, p } = srj105Build()
+    const tmux: string[] = []
+    recordRawTmux(tmux)
+    scriptReuseSite(h, p, site, errTmuxSessionCreate('spawn'))
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', countedClass: true, pendingOnlyArmed: true })
+
+    expect(order).toEqual(['spawn', ...site.pass])
+    expect([h.stub.calls.killCalls, tmux]).toEqual([[], []])
+    expect(h.notices.map((notice) => notice.key)).toEqual([p])
+    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(1)
+    expect(h.controller.view(p)).toMatchObject({ mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW] })
+  })
+
+  test.each([...REUSE_SITES, ...NO_TRANSCRIPT_SITES].map((site) => [site.name, site] as const))('SRJ-112, SRJ-104, %s: ErrInvalidFlags at the reuse makes exactly one version re-check, then UNCLASSIFIED: refused, never counted, and no other launch', async (_name, site) => {
+    const { h, p } = srj105Build()
+    const { resolves, stops } = h.recheckAnswers(PHASE1_RC_VERSION)
+    scriptReuseSite(h, p, site, errInvalidFlags('spawn'))
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
+
+    expect([resolves.length, stops.length]).toEqual([1, 0])
+    expect(order).toEqual(['spawn', ...site.pass])
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
+    expect([getFailureCount(p), h.notices]).toEqual([0, []])
+  })
+
+  test.each([...REUSE_SITES, ...NO_TRANSCRIPT_SITES].map((site) => [site.name, site] as const))('SRJ-112, %s: a directory error (ErrCwdNotFound) at the reuse is counted: cwd-unreachable raised, no further launch, nothing armed', async (_name, site) => {
+    const { h, p } = srj105Build()
+    scriptReuseSite(h, p, site, errCwdNotFound())
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', countedClass: true })
+
+    expect(order).toEqual(['spawn', ...site.pass])
+    expect([...getOutageFlags(p)]).toEqual(['cwd-unreachable'])
+    expect(h.triggers).toEqual([])
+  })
+
+  // b.av2 SR-6.4: a row whose cwd has no real path while P's working
+  // directory has none either is kept: no replacement of either kind.
+  test('cwdCheckDeferred: a live row whose cwd has no real path, P\'s working directory unresolvable: the row is kept; no reuse and no sequence; cwd-unreachable, failed', async () => {
+    const { h, p } = srj105Build()
+    const persona = harnessPersona(h, p)
+    const gone = join(h.home, 'gone-work')
+    persona.working_directory = gone
+    h.script({ ...collided(h, persona, { state: 'waiting', cwd: join(h.home, 'gone-elsewhere') }) })
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed' })
+
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1 }))
+    expect(h.sequenceRunning(p)).toBe(false)
+    expect(h.lines.filter((line) => line.startsWith(LIVE_ROW_SEQUENCE_LOG_PREFIX))).toEqual([])
+    expect(getOutageFlags(p).has('cwd-unreachable')).toBe(true)
+  })
+
+  // b.jg5 SRJ-710: ErrSpawnNotResumable is never by itself a reason to kill
+  // and replace, at any path that resumes.
+  test.each<[string, RecoveryStubScript, readonly string[]]>([
+    ['the dead-session path of a waiting row (after its sweep)', { ...DEAD_WAITING }, ['spawn', 'get', 'sendKeys', 'findMissing', 'resume']],
+    ['a check_permission row whose read-pane answered GONE, swept and re-read ended', { readPaneError: errTmuxCaptureFailed(), statusResult: cannedStatusResult({ state: 'ended' }) }, ['spawn', 'get', 'readPane', 'findMissing', 'status', 'resume']],
+  ])('SRJ-710: resume answering ErrSpawnNotResumable on %s is a lost race: no kill, delete or launch, nothing counted or posted, P armed with the lost-race cause', async (_name, script, order) => {
+    const { h, p } = srj105Build()
+    const state = order.includes('readPane') ? 'check_permission' : 'waiting'
+    h.script({ ...collided(h, harnessPersona(h, p), { state }), ...script, resumeError: errSpawnNotResumable() })
+    const calls = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
+
+    expect(calls).toEqual([...order])
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_LOST_RACE }])
+    expect([getFailureCount(p), h.notices, h.episodeNotices, h.startupErrors()]).toEqual([0, [], [], []])
+    expect(h.sequenceRunning(p)).toBe(false)
+  })
+
+  // The reconcile note's start flag: a sequence runs detached from the start
+  // pass that started it (SRJ-706), so its step-6 launch is no start-pass
+  // launch: a LAUNCH FAILURE there is counted once and posts its notice, but
+  // writes no spawn-failed entry, where the ladder's own reuse at the start
+  // pass writes one (the ErrTmuxSessionCreate rows above).
+  test('the start flag: a sequence a start-pass launch starts makes its step-6 reuse outside the start pass: its ErrTmuxSessionCreate posts the notice and is counted once, but writes no startup-errors entry', async () => {
+    const { h, p } = srj105Build()
+    scriptLiveSite(h, p, LIVE_SITES[0]!)
+    h.script({ spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(errTmuxSessionCreate('spawn'))] })
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
+    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({
+      kind: LIVE_ROW_OUTCOME_LAUNCHED,
+      result: { key: p, action: 'failed', countedClass: true },
+    })
+
+    expect(h.notices.map((notice) => notice.key)).toEqual([p])
+    expect(getFailureCount(p)).toBe(1)
+    expect(h.startupErrors()).toEqual([])
   })
 })
 

@@ -29,7 +29,12 @@
  *      that is bringing the row up. A launch waiting for a `working` row to
  *      settle (up to 10 minutes) has that wait cancelled first (b.f2b: when
  *      the teardown is submitted, and again here), so it types nothing and
- *      settles promptly, and the apply is not held up by it (SR-8.6);
+ *      settles promptly, and the apply is not held up by it (SR-8.6). Once
+ *      it has settled, its live-row sequence is stopped again, awaited, and
+ *      its UNAVAILABLE retry timer stopped again (b.jg5 SRJ-715, SRJ-706):
+ *      that launch can have started a sequence at a collision ladder
+ *      replacement site (b.jg5 SRJ-707) after the first stop, or armed the
+ *      timer;
  *   3. its Slack connection is stopped (so no further event arrives for it),
  *      then its inbound dedupe store and its ack-tracker entries are dropped;
  *   4. its cached DM destination is forgotten, its held destination notices
@@ -326,8 +331,10 @@ export interface PersonaLifecycleDeps {
    * started included), so the teardown's later stops of the key's retry
    * timer clear an arm that call made. Called right after `stopApprover`:
    * when the teardown is submitted, and awaited as its second step, before
-   * the wait for the launch in flight. Optional, so hand-built fixtures stay
-   * valid; production always passes it.
+   * the wait for the launch in flight; and awaited again once that launch
+   * has settled, since the launch can have started a sequence at a collision
+   * ladder replacement site after the first stop (b.jg5 SRJ-715, SRJ-707).
+   * Optional, so hand-built fixtures stay valid; production always passes it.
    */
   stopLiveRowSequence?: (key: string) => unknown
   /** Resolves once the launch in flight for the key (if any) settled; never rejects (`whenLaunchSettled`). */
@@ -344,7 +351,9 @@ export interface PersonaLifecycleDeps {
   /**
    * Stop the key's UNAVAILABLE retry timer (b.jg5 SRJ-305: the retry
    * controller's `stop` with the torn-down reason), called beside
-   * `cancelRestartTimer`, and again after the teardown's agent-director calls
+   * `cancelRestartTimer`, again right after the second live-row sequence
+   * stop once the launch in flight settled (b.jg5 SRJ-715: that launch can
+   * have armed it), and again after the teardown's agent-director calls
    * (a failing kill's ENVIRONMENT answer arms the key's timer); other
    * personas' timers stay armed. In production
    * the stop also cancels the key's `tmux-unresponsive` alert check through
@@ -494,6 +503,9 @@ const DM_DESTINATION_SETTINGS: ReadonlySet<InPlaceSetting> = new Set<InPlaceSett
 /** The teardown step that stops the persona's live-row sequence: its log label. */
 export const LIVE_ROW_SEQUENCE_STOP_STEP = 'stopping its live-row sequence'
 
+/** The teardown's second stop of the persona's live-row sequence, once its launch in flight settled: its log label. */
+export const LIVE_ROW_SEQUENCE_STOP_AGAIN_STEP = 'stopping its live-row sequence again, after its launch in flight settled'
+
 /** Compose the persona teardown, the apply bring-up (and recovery), the credentials change and the in-place update. Creates, reads and schedules nothing. */
 export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifecycle {
   function log(line: string): void {
@@ -599,6 +611,13 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     // submitted; the launch then settles promptly.
     await step("cancelling its launch's wait for a working row", () => deps.cancelLaunchWait?.(key))
     await step('waiting for its launch in flight', () => deps.whenLaunchSettled(key))
+    // b.jg5 SRJ-715, SRJ-706: once that launch has settled, its live-row
+    // sequence and its retry timer are stopped again: the launch in flight
+    // can have started a sequence at a collision ladder replacement site
+    // (b.jg5 SRJ-707) after the first stop, or armed the timer. The stop is
+    // awaited, so the sequence's call in flight has returned before the kill.
+    await step(LIVE_ROW_SEQUENCE_STOP_AGAIN_STEP, () => deps.stopLiveRowSequence?.(key))
+    await step('stopping its UNAVAILABLE retry timer again, after its launch in flight settled', () => deps.stopRetryTimer(key))
 
     // The connection before the routing: an event for the key would create
     // a new dedupe store.

@@ -60,9 +60,10 @@
  *   - the restart path's kill before a relaunch (`_buildKillSessionAdapter`,
  *     `src/server.ts`, through `killPersonaInstance` in the bounded retry,
  *     `src/kill-retry.ts`);
- *   - the collision ladder's replacement kills (`replaceWithFreshSpawn` and
- *     the `ErrSpawnNotResumable` branch, `src/session-manager.ts`, through
- *     `killPersonaInstance` in the bounded retry);
+ *   - the live-row sequence's two kills (`src/live-row-sequence.ts`, bound
+ *     by `buildLiveRowSequenceDeps` in `src/session-manager.ts` to
+ *     `killPersonaInstance` in the bounded retry); the collision ladder
+ *     makes no kill of its own;
  *   - the start sweep's kills (`reconcileOrphans`, `src/session-manager.ts`,
  *     on the sweep's own client, in the bounded retry with the pass budget);
  *   - the persona teardown's kill (`runTeardown`, `src/persona-lifecycle.ts`,

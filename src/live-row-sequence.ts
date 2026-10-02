@@ -86,7 +86,18 @@
  * (P's latch, its teardown) sets that sequence's stop signal and resolves
  * once the sequence has settled, its call in flight returned; stop-all and
  * close stop every one, and after close no start is taken. The running query
- * answers by persona key. No production site starts a sequence yet.
+ * answers by persona key.
+ *
+ * Its production starters are the collision ladder's replacement sites
+ * (SRJ-707; the session manager's replace step, `replacePersonaRow`, through
+ * its start entry `startLiveRowSequence`): a row the ladder cannot keep
+ * (`resume_enabled` false, a `cwd` mismatch, a `config_dir` label missing or
+ * different, the last at a resume and at a `pending` row) that it last read
+ * live, `pending` included. Each such request enters at step 1, seeded with
+ * the state the ladder last read, with the conversation not kept, the key
+ * not retired, a launch at the end and the alert context `recovery`, so its
+ * step 6 is a reuse spawn of the same id; the ladder answers
+ * `sequence-waiting` whatever the start answers.
  *
  * The module holds no module-scope state, runs nothing at
  * import, and loads neither the session manager, the server, the notifier

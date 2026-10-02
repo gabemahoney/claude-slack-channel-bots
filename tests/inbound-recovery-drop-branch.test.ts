@@ -81,7 +81,7 @@
  * routing read. State 4 (b.jg5 SRJ-1011, SRJ-704) runs there too, the
  * driver's kill-failed input bound to the harness's kill-failure alerts'
  * episode: a message lost after the ordinary alert (the restart path's one
- * try, or the ladder's tries ending in `ErrTmuxUnresponsive` after a
+ * try, or a live-row sequence's tries ending in `ErrTmuxUnresponsive` after a
  * survivor-naming failure) reports `kill-failed`; after the survivor version,
  * or once the episode ended, it never does; a CONFLICT latch gives
  * `held-for-human` first. A message lost while P's live-row sequence runs
@@ -214,13 +214,14 @@ import {
   type ApproverStopReason,
 } from '../src/session-manager.ts'
 import {
-  collided,
   expectLostMessageReports,
   holdSequenceReuse,
+  launchThroughSequence,
   makeRecoveryHarness,
   ownRowsLiveThenMissing,
   personaOf,
   retryNow,
+  scriptLiveRowElsewhere,
   rowReadsUntilSpawn,
   startSequenceHeldAtRun,
   type RecoveryHarness,
@@ -1409,16 +1410,18 @@ describe('b.jg5 SRJ-1011 through the recovery harness: the read is the liveness 
 // Through the recovery harness's lost-message driver, whose `isKillFailed` is
 // bound to the harness's kill-failure alerts' episode as main() binds it. The
 // restart path's kill is one try (its `dead` seed), so an `ErrTmuxKillFailed`
-// there stands at once; the multi-try legs run at the collision ladder's
-// replacement kill of a row read live (`h.drive`, `h.killRetryClock`). States
+// there stands at once; the multi-try legs run at the step-1 kill of the
+// live-row sequence P's launch starts at a collision ladder replacement site
+// over a row read live (`scriptLiveRowElsewhere`, `launchThroughSequence`, on
+// the sequence clock; the ladder makes no kill, b.jg5 SRJ-707). States
 // and wordings come from src/lost-message.ts (`expectLostMessageReports`).
 // ===========================================================================
 
 describe('b.jg5 SRJ-1011 state 4: a message lost after the kill-failure alert reports kill failed, through the real routing', () => {
-  /** P's launch colliding with its row read `waiting` in another directory, its replacement kill answering `kills` in order. */
-  async function ladderKill(h: RecoveryHarness, key: string, ...kills: Error[]): Promise<void> {
-    h.script({ ...collided(h, personaOf(h, key), { cwd: h.home, state: 'waiting' }), killQueue: kills.map((err) => cannedErr(err)) })
-    await h.drive(h.launch(key))
+  /** P's launch meeting its row read `waiting` in another directory, the step-1 kill of the sequence it starts answering `kills` in order; the sequence is driven to its end. */
+  async function sequenceKill(h: RecoveryHarness, key: string, ...kills: Error[]): Promise<void> {
+    scriptLiveRowElsewhere(h, key, { killQueue: kills.map((err) => cannedErr(err)) })
+    await launchThroughSequence(h, key)
   }
 
   test('ErrTmuxKillFailed that stands at the restart path\'s kill: after the ordinary alert, a lost message reports kill failed with its wording; no human-triggered restart fires, with the delay above 0', async () => {
@@ -1435,23 +1438,23 @@ describe('b.jg5 SRJ-1011 state 4: a message lost after the kill-failure alert re
     expect(h.stub.calls.spawnCalls).toEqual([])
   })
 
-  test('a survivor-naming failure, then ErrTmuxUnresponsive twice, at the ladder\'s replacement kill: the ordinary alert, then a lost message reports kill failed', async () => {
+  test('a survivor-naming failure, then ErrTmuxUnresponsive twice, at the live-row sequence\'s kill of a row read live, started at a replacement site: the ordinary alert, then a lost message reports kill failed', async () => {
     const h = makeRecovery({ sessionRestartDelay: FAST_DELAY_S })
     const [key] = h.keys as [string]
 
-    await ladderKill(h, key, errTmuxKillFailed(undefined, 'pane-process-survived'), errTmuxUnresponsive('kill'), errTmuxUnresponsive('kill'))
+    await sequenceKill(h, key, errTmuxKillFailed(undefined, 'pane-process-survived'), errTmuxUnresponsive('kill'), errTmuxUnresponsive('kill'))
 
     expect(h.killFailureOpen(key)).toBe(true)
     await expectLostMessageReports(h, key, 'kill-failed')
     expect(isRestartPendingOrActive(key)).toBe(false)
   })
 
-  test('a survivor-naming failure, then a read of ended, at the ladder\'s replacement kill: the survivor version opens no episode, and a message lost afterwards reports the state the launch left, never kill failed', async () => {
+  test('a survivor-naming failure, then a read of ended, at the live-row sequence\'s kill of a row read live, started at a replacement site: the survivor version opens no episode, and a message lost afterwards reports the state the launch left, never kill failed', async () => {
     const h = makeRecovery()
     const [key] = h.keys as [string]
     h.script({ statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))] })
 
-    await ladderKill(h, key, errTmuxKillFailed(undefined, 'pane-process-survived'))
+    await sequenceKill(h, key, errTmuxKillFailed(undefined, 'pane-process-survived'))
     await h.runApproverToStop(key)
 
     expect(h.episodeNotices).toHaveLength(1)
@@ -1459,11 +1462,11 @@ describe('b.jg5 SRJ-1011 state 4: a message lost after the kill-failure alert re
     await expectLostMessageReports(h, key, 'auto-restart-disabled')
   })
 
-  test('a survivor-naming failure, then CONFLICT, at the ladder\'s replacement kill: P latched and its kill-failure episode open, a lost message reports held for a human, not kill failed', async () => {
+  test('a survivor-naming failure, then CONFLICT, at the live-row sequence\'s kill of a row read live, started at a replacement site: P latched and its kill-failure episode open, a lost message reports held for a human, not kill failed', async () => {
     const h = makeRecovery({ sessionRestartDelay: FAST_DELAY_S })
     const [key] = h.keys as [string]
 
-    await ladderKill(h, key, errTmuxKillFailed(undefined, 'pane-process-survived'), errTmuxSessionConflict('kill', 'not-this-launch'))
+    await sequenceKill(h, key, errTmuxKillFailed(undefined, 'pane-process-survived'), errTmuxSessionConflict('kill', 'not-this-launch'))
 
     expect(h.latch.isLatched(key)).toBe(true)
     expect(h.killFailureOpen(key)).toBe(true)

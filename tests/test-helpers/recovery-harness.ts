@@ -196,9 +196,9 @@
  *   `createKillFailureAlerts`) over the same episodes instance, built and
  *   installed in the session manager (`setKillFailureAlerts`, removed by
  *   `cleanup()`) as `main()` builds and installs them, before any launch:
- *   the restart path's kill adapter and the collision ladder's replacement
- *   kills raise the bounded retry's decision through them (context
- *   `recovery`), and every own-row read of the session manager that reads
+ *   the restart path's kill adapter and the live-row sequence's kills raise
+ *   the bounded retry's decision through them (context `recovery`; the
+ *   collision ladder makes no kill), and every own-row read of the session manager that reads
  *   the row `ended` or `missing`, or finds it gone (`ErrSpawnNotFound`), ends
  *   the persona's episode silently. The destination route posts through the
  *   episodes' sink, so the alert lands in `episodeNotices`; the
@@ -288,9 +288,10 @@
  * - The bounded retry of a kill (b.jg5 SRJ-702, `src/kill-retry.ts`) runs
  *   on the harness clock, bound as `main()` binds it: the restart path's kill
  *   adapter gets the kill-retry clock (its kill is one try, seeded with the
- *   run's `dead` reading), the collision ladder's replacement kills take it
- *   through the ladder's kill-clock seam (`_setLadderKillClock`, put back
- *   with `_resetLadderKillClock` by `cleanup()`), and the kill retry's
+ *   run's `dead` reading), the live-row sequence's kills take the sequence
+ *   clock through the session manager's dependency builder (the collision
+ *   ladder makes no kill; a live row's kills are the sequence's), and the
+ *   kill retry's
  *   keep-going query (`setPersonaKillKeepGoingQuery`, removed by
  *   `cleanup()`) is the up predicate over the same serving connection,
  *   bring-up outcome (`setUp`) and live applied set as the relaunch gate,
@@ -362,7 +363,13 @@
  *   pending; it throws when `work` is still unsettled then. The exported
  *   `runSequenceStoppedAtKill(h, key, step, answer, reason)` runs one whose
  *   step-1 or step-4 kill gets its last try's answer (one of
- *   `LATE_KILL_ANSWERS`) after its stop was set.
+ *   `LATE_KILL_ANSWERS`) after its stop was set. The exported
+ *   `scriptLiveRowElsewhere(h, key, script)` scripts a launch of the persona
+ *   to meet its own row read live in another directory, a collision ladder
+ *   replacement site (b.jg5 SRJ-707) whose launch starts the persona's
+ *   sequence and answers `sequence-waiting`, every later `get` reading the
+ *   row `ended`; `launchThroughSequence(h, key)` makes that launch and drives
+ *   the sequence it started to its end.
  * - `recheckAnswers(version)`: installs agent-director's version re-check
  *   (b.jg5 SRJ-204; `installAdVersionRecheck`, on its own fake clock, its
  *   lines to `lines`) with its `resolveSystemBinary` answering `version`
@@ -504,7 +511,7 @@
  *   failure counter, backoff and cap latch, the outage state and its trigger sink, the session notifier,
  *   the session manager's latch install and the latch's set observers,
  *   the kill-failure alerts' install,
- *   the ladder's kill clock and the kill retry's keep-going query,
+ *   the kill retry's keep-going query,
  *   the configured-persona query (`_resetConfiguredPersonaQuery`), so two
  *   harnesses built one after the other share no query,
  *   the stub spawn path and client with every launch still in flight and the
@@ -625,7 +632,7 @@ import {
   type ConflictLatchSetOutcome,
   type ConflictNoticeEpisodes,
 } from '../../src/conflict-latch.ts'
-import { LIVENESS_DEAD_ROW_MISSING, LIVENESS_LIVE } from '../../src/liveness-reading.ts'
+import { LIVENESS_DEAD_ROW_ENDED, LIVENESS_DEAD_ROW_MISSING, LIVENESS_LIVE } from '../../src/liveness-reading.ts'
 import { classifyAdError, describeAdErrorClassification, killFailedDescriptionOf } from '../../src/ad-error-class.ts'
 import {
   KILL_FAILURE_CLOSING_DESTINATION,
@@ -708,11 +715,9 @@ import {
   _resetConfiguredPersonaQuery,
   _resetDialogApprovers,
   _resetFindMissingMemo,
-  _resetLadderKillClock,
   _resetLiveRowSequenceRegistry,
   _setApproverClock,
   _setDialogReadyTimeoutMs,
-  _setLadderKillClock,
   _whenDialogApproverStopped,
   buildLiveRowSequenceDeps,
   isDialogApproverRunning,
@@ -1042,7 +1047,7 @@ export interface RecoveryHarness {
   launch(key: string): Promise<SpawnPersonaResult>
   /**
    * The harness clock with each wait between a kill's tries tracked (b.jg5
-   * SRJ-702): the restart kill adapter's and the ladder's, and the one a
+   * SRJ-702): the restart kill adapter's, and the one a
    * case hands the start sweep (`reconcileOrphans(config, clock)`), so
    * `drive` moves the clock to its waits.
    */
@@ -1391,8 +1396,8 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   if (options.approverCapMs !== undefined) _setDialogReadyTimeoutMs(options.approverCapMs)
   // The bounded retry of a kill (b.jg5 SRJ-702) waits on the harness clock,
   // each wait between tries tracked so `drive` can move the clock to it. As
-  // main() binds it: the restart kill adapter gets this clock (below), and the
-  // ladder's replacement kills take it through their seam. Undone by cleanup.
+  // main() binds it: the restart kill adapter gets this clock (below); the
+  // live-row sequence's kills run on the sequence clock.
   const killRetryTimers = new Set<unknown>()
   const killRetryClock: KillRetryClock = {
     setTimeout: (callback, delayMs) => {
@@ -1404,7 +1409,6 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       return handle
     },
   }
-  _setLadderKillClock(killRetryClock)
   _resetFindMissingMemo()
   const triggerSink: UnavailableRetryTriggerSink = {
     arm(key, cause) {
@@ -1488,7 +1492,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   // own row latches it and a key outside the set, or removed from it, does not.
   setConfiguredPersonaQuery((key) => appliedPersona(key) !== undefined)
   // As main() installs them, before any launch (b.jg5 SRJ-704, SRJ-1016):
-  // the restart path's kill and the ladder's replacement kills raise through
+  // the restart path's kill and the live-row sequence's kills raise through
   // them, and the session manager's own-row reads end a persona's episode.
   setKillFailureAlerts(killFailureAlerts)
   // As main() installs it (b.jg5 SRJ-702, SRJ-305): a kill's tries stop once
@@ -2108,7 +2112,6 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       setKillFailureAlerts(undefined)
       _resetConfiguredPersonaQuery()
       setPersonaKillKeepGoingQuery(undefined)
-      _resetLadderKillClock()
       for (const unbind of unbindLatch) unbind()
       resetStubSpawnPath()
       _resetFindMissingMemo()
@@ -2203,6 +2206,40 @@ export function collided(h: RecoveryHarness, persona: Persona, row: PersonaGetRe
     spawnQueue: [errInstanceIdCollision(), ...spawns].map((err) => cannedErr<SpawnResult>(err)),
     getResult: cannedGetResult(row, persona, h.home),
   }
+}
+
+/**
+ * Script persona `key`'s next launch to meet its own row read `waiting`
+ * (live) in another directory (the harness HOME) at a collision ladder
+ * replacement site (b.jg5 SRJ-707): the optimistic spawn collides and the
+ * collision `get` reads that row, so the ladder starts the persona's
+ * live-row sequence and answers `sequence-waiting` with no call of its own;
+ * every later `get` of the row (the sequence's) reads it `ended` in the
+ * persona's own directory, so a sequence whose kill succeeds goes on to its
+ * one run and a reuse spawn of the same id. `script` is applied on top.
+ */
+export function scriptLiveRowElsewhere(h: RecoveryHarness, key: string, script: RecoveryStubScript = {}): void {
+  const persona = personaOf(h, key)
+  h.script({
+    spawnQueue: [cannedErr<SpawnResult>(errInstanceIdCollision())],
+    getQueue: [cannedOk(cannedGetResult({ cwd: h.home, state: 'waiting' }, persona, h.home))],
+    getResult: cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED }, persona, h.home),
+    ...script,
+  })
+}
+
+/**
+ * Launch persona `key` (`h.launch`, the start pass's launch) over the row
+ * `scriptLiveRowElsewhere` scripted: the launch answers `sequence-waiting` at
+ * once; then the sequence it started is driven on the clock to its end
+ * (`driveSequence`). Resolves with the sequence's outcome.
+ */
+export async function launchThroughSequence(h: RecoveryHarness, key: string): Promise<LiveRowSequenceOutcome> {
+  expect(await h.launch(key)).toStrictEqual({ key, action: 'sequence-waiting' })
+  const outcome = await h.driveSequence(h.sequenceSettled(key))
+  expect(h.sequenceRunning(key)).toBe(false)
+  if (outcome === undefined) throw new Error(`launchThroughSequence: persona ${key}'s sequence settled with no outcome`)
+  return outcome
 }
 
 /** The stub's call counts, by verb, leaving out verbs never called. */
@@ -2582,8 +2619,8 @@ export function killFailureNotice(key: string, content: KillFailureAlertContent,
 }
 
 /**
- * The startup-errors entry of an alert the restart path, the collision
- * ladder or a live-row sequence raised for persona `key` no longer in the
+ * The startup-errors entry of an alert the restart path or a live-row
+ * sequence (one the collision ladder started included) raised for persona `key` no longer in the
  * applied configuration: `persona=<key> (<context>): <text>`, the context
  * `recovery` by default, the unescaped text with the log-only closing
  * sentence of its version.

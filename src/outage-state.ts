@@ -125,6 +125,7 @@ import {
   type UnclassifiedErrorSink,
 } from './persona-episodes.ts'
 import {
+  UNAVAILABLE_RETRY_CAUSE_LOST_RACE,
   UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
   UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
@@ -813,9 +814,10 @@ export function reportUnclassifiedAtSite(
 }
 
 /**
- * reportReuseCollisionAtSite — a reuse spawn's collision (`ErrInstanceIdCollision`,
- * b.jg5 SRJ-112, SRJ-301) at a launch site that ends its attempt on it (the
- * collision ladder's no-transcript step): inside a launch or recovery attempt
+ * reportReuseCollisionAtSite — a reuse spawn's second collision
+ * (`ErrInstanceIdCollision`, b.jg5 SRJ-112, SRJ-301) at a launch site that
+ * ends its attempt on it (a collision ladder reuse site, in the one re-run
+ * of get-then-act the first collision gave): inside a launch or recovery attempt
  * for `key` it arms the persona's retry timer with the reuse-collision cause
  * (`UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION`) through the installed trigger
  * sink, and the attempt records it as its last error, so a launch it ends is
@@ -825,6 +827,21 @@ export function reportUnclassifiedAtSite(
  */
 export function reportReuseCollisionAtSite(key: string): boolean {
   return reportAttemptCause(key, { kind: UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION }, 'spawn', deps?.triggerSink)
+}
+
+/**
+ * reportLostRaceAtSite — a lost race on `resume`'s `ErrSpawnNotResumable`
+ * (b.jg5 SRJ-710, SRJ-301) at the collision ladder, which ends its attempt
+ * on it with nothing killed, deleted or launched: inside a launch or
+ * recovery attempt for `key` it arms the persona's retry timer with the
+ * lost-race cause (`UNAVAILABLE_RETRY_CAUSE_LOST_RACE`) through the
+ * installed trigger sink, and the attempt records it as its last error, so
+ * a launch it ends is refused and never counted; outside one it does
+ * nothing. It starts no condition, posts nothing and never throws. Answers
+ * whether the timer was armed.
+ */
+export function reportLostRaceAtSite(key: string): boolean {
+  return reportAttemptCause(key, { kind: UNAVAILABLE_RETRY_CAUSE_LOST_RACE }, 'resume', deps?.triggerSink)
 }
 
 /**

@@ -175,6 +175,7 @@ import {
   KILL_RETRY_ALERT_ORDINARY,
   KILL_RETRY_ALERT_SURVIVOR,
   KILL_RETRY_END_EXHAUSTED,
+  KILL_RETRY_END_ROW_FINISHED,
   KILL_RETRY_END_SETTLED,
   KILL_RETRY_SPACING_MS,
   KILL_RETRY_TRIES,
@@ -306,6 +307,7 @@ import {
   reconcileOrphans,
   retryPersonaKill,
   stopDialogApprover,
+  stopLiveRowSequence,
   sweepDeadTmuxChannel,
   TRUST_DIALOG_NEEDLE,
   waitEndedDisconnectedLine,
@@ -339,6 +341,7 @@ import {
   UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
   UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
+  UNAVAILABLE_RETRY_CAUSE_LOST_RACE,
   UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION,
   UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED,
   UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED,
@@ -392,6 +395,7 @@ import {
   errCwdNotFound,
   errGeneric,
   errInstanceIdCollision,
+  errSpawnNotResumable,
   errInternal,
   errInvalidFlags,
   errJsonlNeverWritten,
@@ -998,10 +1002,9 @@ interface LaunchSite {
   readonly action: SpawnPersonaResult['action']
   /**
    * For the sites whose refusal stops the launch at once (b.jg5 SRJ-105): the
-   * stub calls the launch makes in all. An UNAVAILABLE at the ladder's kill
-   * or delete (`ErrTmuxKillFailed` included) means no delete after a refused
-   * kill and no spawn after either, so the optimistic spawn is the launch's
-   * only one; one at the sweep before a working-row wait means no row read
+   * stub calls the launch makes in all. An UNAVAILABLE at the reuse spawn
+   * that replaces a finished row means no further launch, kill or delete
+   * after it; one at the sweep before a working-row wait means no row read
    * and no reconnect after it.
    */
   readonly ladderCalls?: Readonly<Record<string, number>>
@@ -1039,23 +1042,17 @@ const LAUNCH_SITES: readonly LaunchSite[] = [
     action: 'reconnected',
     script: (h, p, err) => ({ ...collided(h, p, { state: 'working' }), statusQueue: [cannedErr(err)] }),
   },
-  // The collision get reads the row `waiting` (live), so its kill is
-  // tmux-touching and gets its tries, with the own-row status read before
-  // each further try (b.jg5 SRJ-702); only the outcome that stands arms.
+  // b.jg5 SRJ-707, SRJ-1503: the collision get reads a finished row in
+  // another directory, so the ladder replaces it by one reuse spawn of the
+  // same id, with no kill and no delete; that reuse's refusal stops the
+  // launch with nothing counted (b.jg5 SRJ-112).
   {
-    name: 'the kill of a row in another directory',
-    verb: 'kill',
+    name: 'the reuse spawn of a finished row in another directory',
+    verb: 'spawn',
     action: 'failed',
-    ladderCalls: { spawnCalls: 1, getCalls: 1, killCalls: KILL_RETRY_TRIES, statusCalls: KILL_RETRY_TRIES - 1 },
+    ladderCalls: { spawnCalls: 2, getCalls: 1 },
     leavesConditionHeld: true,
-    script: (h, p, err) => ({ ...collided(h, p, { cwd: h.home }), killError: err }),
-  },
-  {
-    name: 'the delete of a row in another directory',
-    verb: 'delete',
-    action: 'failed',
-    ladderCalls: { spawnCalls: 1, getCalls: 1, killCalls: 1, deleteCalls: 1 },
-    script: (h, p, err) => ({ ...collided(h, p, { cwd: h.home }), deleteError: err }),
+    script: (h, p, err) => collided(h, p, { cwd: h.home, state: 'ended' }, err),
   },
   { name: 'the resume of an ended row', verb: 'resume', action: 'failed', script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), resumeError: err }) },
 ]
@@ -3420,20 +3417,24 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
     expectStopped(h, key)
   })
 
-  test('a start-pass launch whose kill of a live row in another directory is refused UNAVAILABLE at every try stops there (no delete, no spawn), answers refused, leaves the condition holding and arms the timer at the base wait from the standing refusal, with no row recorded on the timer and no condition end', async () => {
+  // b.jg5 SRJ-707, SRJ-705, SRJ-110: a live row in another directory is
+  // replaced only through the live-row sequence, which the start-pass launch
+  // starts and answers sequence-waiting for; the sequence's step-1 kill
+  // refused UNAVAILABLE at every try ends it there.
+  test('a start-pass launch over a live row in another directory answers sequence-waiting; its sequence\'s step-1 kill refused UNAVAILABLE at every try stops there (no get, run, delete or launch), leaves the condition holding and arms the timer at the base wait from the standing refusal, with no row recorded on the timer and no condition end', async () => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     const [key] = h.keys as [string]
     h.script({ ...collided(h, personaOf(h, key), { cwd: h.home }), killError: errTmuxUnresponsive('kill') })
     // b.jg5 SRJ-702: the refusal stands after the kill's tries.
     const armedAt = h.clock.now() + (KILL_RETRY_TRIES - 1) * KILL_RETRY_SPACING_MS
 
-    // b.jg5 SRJ-105: the refusal that stands stops the ladder.
-    expect(await h.drive(h.launch(key))).toEqual({ key, action: 'failed', refused: true })
+    expect(await h.launch(key)).toEqual({ key, action: 'sequence-waiting' })
+    expect(await h.driveSequence(h.sequenceSettled(key))).toMatchObject({ kind: LIVE_ROW_OUTCOME_ABORTED, step: 1, errorClass: AD_ERROR_CLASS_UNAVAILABLE })
 
     // The status calls are the own-row reads between the tries.
     expect(callCounts(h)).toEqual({ spawnCalls: 1, getCalls: 1, killCalls: KILL_RETRY_TRIES, statusCalls: KILL_RETRY_TRIES - 1 })
     expect(getFailureCount(key)).toBe(0)
-    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
+    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }, { key, kind: UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED }])
     const lines = conditionLines(h, key)
     expect(lines).toHaveLength(1)
     expect(lines[0]).toStartWith(`${conditionLinePrefix(key)}started — kill failed: `)
@@ -3446,7 +3447,7 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
       dueAt: armedAt + waitMs(0),
       waitMs: waitMs(0),
       refusals: 0,
-      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED],
       mode: UNAVAILABLE_RETRY_MODE_FULL,
     })
     expect(h.clock.pending().map((t) => t.dueAt)).toEqual([armedAt + waitMs(0)])
@@ -5440,10 +5441,10 @@ describe('unavailable retry: a kill of the last session on a socket, then answer
 // tmux server that is exiting after the kill answers by class, a try's
 // `ErrTmuxUnresponsive` tried again and its `ErrTmuxNotAvailable` ending the
 // tries with one onset. The restart path's kill is one try (its dead seed),
-// so the tries are driven at the collision ladder's replacement kill of a
-// row read live in another directory, and directly through the persona
-// kill retry inside a recovery attempt. The waits run on the harness clock
-// (`h.drive`).
+// so the tries are driven directly through the persona kill retry of a row
+// read live inside a recovery attempt (the one the live-row sequence's kills
+// take; the collision ladder makes no kill, b.jg5 SRJ-707). The waits run on
+// the harness clock (`h.drive`).
 // ---------------------------------------------------------------------------
 
 /** The kill-failure alert decisions, for asserting that no line names one. */
@@ -5563,21 +5564,21 @@ describe('unavailable retry: a live row’s kill makes its tries before its outc
     },
   )
 
-  test('HO rev 23: a replacement kill answering ErrTmuxUnresponsive (the server exiting) then a read of ended: the tries end as a success, the delete and the launch run, nothing is posted or armed, nothing latches', async () => {
+  // AD handoff rev 23 at a live row's kill (the live-row sequence's and the
+  // restart path's go through this bounded retry; the collision ladder makes
+  // no kill): the kill of a row read live, retried inside a recovery attempt.
+  test('HO rev 23: a live row\'s kill answering ErrTmuxUnresponsive (the server exiting) then a read of ended: the tries end as a success, nothing is posted or armed, nothing latches', async () => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     const [key, other] = h.keys as [string, string]
     h.script({
-      ...collided(h, personaOf(h, key), { cwd: h.home, state: 'waiting' }),
       killQueue: [cannedErr(errTmuxUnresponsive('kill'))],
       statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))],
     })
 
-    const result = await h.drive(h.launch(key))
+    const result = await retriedKillInAttempt(h, key)
 
-    expect(result).toStrictEqual({ key: key, action: 'spawned' })
-    expect(h.stub.calls.killCalls).toHaveLength(1)
-    expect(h.stub.calls.deleteCalls).toHaveLength(1)
-    expect(h.stub.calls.spawnCalls).toHaveLength(2)
+    expect(result).toMatchObject({ end: KILL_RETRY_END_ROW_FINISHED, tries: 1, reads: 1 })
+    expect(callCounts(h)).toEqual({ killCalls: 1, statusCalls: 1 })
     expect(h.triggers).toEqual([])
     expect(h.outageNotices).toEqual([])
     expect(h.episodeNotices).toEqual([])
@@ -5589,17 +5590,16 @@ describe('unavailable retry: a live row’s kill makes its tries before its outc
     expectUntouched(h, other)
   })
 
-  test('HO rev 23: a replacement kill answering ErrTmuxUnresponsive then ErrTmuxNotAvailable at its second try: not tried again, no delete or launch, one onset and one ENVIRONMENT arm (the first try armed nothing), no latch; one all-clear once a tmux-touching call succeeds', async () => {
+  test('HO rev 23: a live row\'s kill answering ErrTmuxUnresponsive then ErrTmuxNotAvailable at its second try: not tried again, one onset and one ENVIRONMENT arm (the first try armed nothing), no latch; one all-clear once a tmux-touching call succeeds', async () => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     const [key, other] = h.keys as [string, string]
     h.script({
-      ...collided(h, personaOf(h, key), { cwd: h.home, state: 'waiting' }),
       killQueue: [cannedErr(errTmuxUnresponsive('kill')), cannedErr(errTmuxNotAvailable(undefined, 'kill')), cannedErr(errTmuxUnresponsive('kill'))],
     })
 
-    expect(await h.drive(h.launch(key))).toEqual({ key, action: 'failed', refused: true })
+    expect(await retriedKillInAttempt(h, key)).toMatchObject({ tries: 2, reads: 1 })
 
-    expect(callCounts(h)).toEqual({ spawnCalls: 1, getCalls: 1, killCalls: 2, statusCalls: 1 })
+    expect(callCounts(h)).toEqual({ killCalls: 2, statusCalls: 1 })
     expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key)])
     expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT }])
     expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', refusals: 0, causes: [UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT] })
@@ -7999,5 +7999,95 @@ describe('unavailable retry: a running live-row sequence blocks P\'s retry and i
 
     expect(h.attempts).toEqual([expect.objectContaining({ key, retry: 1, mode: UNAVAILABLE_RETRY_MODE_FULL, causes: [UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED] })])
     expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_RECOVERED }])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The collision ladder's replacement sites as SRJ-301 triggers (b.jg5
+// SRJ-301, SRJ-112, SRJ-710, SRJ-707, SRJ-706)
+//
+// On the recovery harness, both settings 0, one start-pass launch each: a
+// second `ErrInstanceIdCollision` from a reuse (the first re-ran
+// get-then-act once, whose `get` read the row finished again) and a lost
+// race on `resume`'s `ErrSpawnNotResumable` each arm P's timer once with
+// their exported cause, count nothing and make no kill, delete or further
+// launch; the lost race's next retry runs the restart path's decision. And a
+// full-mode retry whose own launch meets a live row at a replacement site,
+// which starts P's live-row sequence (held at its first run): the restart
+// run answers sequence-waiting, so the timer re-arms naming the sequence.
+// The outcome tables at each site are tests/session-manager.test.ts's.
+// ---------------------------------------------------------------------------
+
+describe('unavailable retry: the collision ladder\'s second reuse collision, its lost race and its sequence start as triggers (SRJ-301, SRJ-112, SRJ-710, SRJ-706)', () => {
+  test('a second collision: the reuse of a finished row in another directory collides, the re-run\'s get reads it ended, and the second reuse collides; P\'s timer is armed once with the reuse-collision cause and nothing is counted', async () => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [key, other] = h.keys as [string, string]
+    h.script(collided(h, personaOf(h, key), { cwd: h.home, state: LIVENESS_DEAD_ROW_ENDED }, errInstanceIdCollision(), errInstanceIdCollision()))
+
+    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+
+    expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION)
+    expect(callCounts(h)).toEqual({ spawnCalls: 3, getCalls: 2 })
+    expect(h.reuseSpawns()).toHaveLength(2)
+    expect(getFailureCount(key)).toBe(0)
+    expect([h.notices, h.episodeNotices, h.startupErrors()]).toEqual([[], [], []])
+    expectUntouched(h, other)
+  })
+
+  test('a lost race: resume answering ErrSpawnNotResumable arms P\'s timer once with the lost-race cause, counts nothing and makes no kill, delete or launch; the next retry re-runs the restart path\'s decision', async () => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [key, other] = h.keys as [string, string]
+    h.script({ ...collided(h, personaOf(h, key), { state: LIVENESS_DEAD_ROW_ENDED }), resumeError: errSpawnNotResumable() })
+
+    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+
+    expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_LOST_RACE)
+    expect(callCounts(h)).toEqual({ spawnCalls: 1, getCalls: 1, resumeCalls: 1 })
+    expect(getFailureCount(key)).toBe(0)
+    expect([h.notices, h.episodeNotices, h.startupErrors()]).toEqual([[], [], []])
+    expectUntouched(h, other)
+
+    // The row now reads live and P's session connects: the retry's decision finds nothing to recover.
+    h.script({ statusResult: cannedStatusResult() })
+    h.setConnected(key, true)
+    await retryNow(h, key)
+
+    expect(h.attempts).toEqual([expect.objectContaining({ key, retry: 1, mode: UNAVAILABLE_RETRY_MODE_FULL, causes: [UNAVAILABLE_RETRY_CAUSE_LOST_RACE] })])
+    expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_RECOVERED }])
+    expect(h.stub.calls.killCalls).toEqual([])
+    expect(h.stub.calls.deleteCalls).toEqual([])
+  })
+
+  // b.jg5 SRJ-706, SRJ-707: the restart work's launch meets a live row in
+  // another directory; its ladder starts P's sequence and answers
+  // sequence-waiting, which the work answers too (not the bare refusal).
+  test('a full-mode retry whose own launch meets a live row in another directory starts P\'s sequence (held at its first run): the restart run answers sequence-waiting and the timer re-arms at the doubled wait naming the sequence; the sequence still runs, and P\'s launch made no call of its own over the row', async () => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [key, other] = h.keys as [string, string]
+    const hold = holdFindMissing(h.stub.client)
+    h.script({
+      ...collided(h, personaOf(h, key), { cwd: h.home }),
+      statusResult: cannedStatusResult({ state: LIVENESS_DEAD_ROW_ENDED }),
+    })
+    h.controller.arm(key, UNAVAILABLE)
+
+    await retryNow(h, key)
+    await hold.entered()
+
+    expect(retryLinesOf(h, key).at(-1)).toBe(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_SEQUENCE_WAITING, 1))
+    expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', refusals: 1 })
+    expect(h.sequenceRunning(key)).toBe(true)
+    // The restart path's probe and kill, the ladder's first spawn and collision get, then the sequence's kill and get.
+    expect(h.stub.calls.spawnCalls).toHaveLength(1)
+    expect(h.reuseSpawns()).toEqual([])
+    expect(h.stub.calls.deleteCalls).toEqual([])
+    expect(getFailureCount(key)).toBe(0)
+
+    const stopping = stopLiveRowSequence(key, LIVE_ROW_STOP_TEARDOWN)
+    hold.release(cannedFindMissing())
+    expect(await h.driveSequence(stopping)).toBe(true)
+    expect(h.sequenceRunning(key)).toBe(false)
+    h.controller.stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
+    expectUntouched(h, other)
   })
 })

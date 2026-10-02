@@ -1621,11 +1621,14 @@ const KILL_SESSION_ADAPTER_SITE = 'killSession (restart adapter)'
  *
  * b.av2 SR-6.6 (per-persona lifecycle ops in sequence): restart.ts kills the
  * persona's session and then calls launchSession, which joins a launch already
- * in flight for the key. Mid-ladder (dialog approval on resume, or between
- * delete and spawn) the row reads dead, so an unguarded kill here would take
- * down the process the running launch is bringing up. While a launch for the
- * key is in flight the adapter therefore skips the kill; the in-flight launch
- * owns the session's lifecycle.
+ * in flight for the key. While a launch is in flight (a collision ladder
+ * between its `resume` or reuse spawn and the row's next state, or the
+ * live-row sequence's final launch) the row can read dead, so an unguarded
+ * kill here would take down the process the running launch is bringing up.
+ * While a launch for the key is in flight the adapter therefore skips the
+ * kill; the in-flight launch owns the session's lifecycle. A running
+ * live-row sequence is asked by the restart work itself, right before it
+ * calls this adapter (b.jg5 SRJ-706).
  *
  * Bug b.g57: with `getPersona`, a persona whose claude_config_dir cannot be
  * resolved to a real path is not killed either. The kill precedes a launch
@@ -2930,7 +2933,7 @@ export async function main(): Promise<void> {
   // the start sweep and the start pass.
   setConfiguredPersonaQuery((key) => getAppliedPersona(key) !== undefined)
   // b.jg5 SRJ-702, SRJ-305: a persona's kill retry (the restart path's kill,
-  // the collision ladder's replacement kills) makes no further try once the
+  // the live-row sequence's kills) makes no further try once the
   // persona is torn down or not up (`isPersonaUp`: serving, its bring-up
   // `up`, its key applied), or the server is shutting down; the session
   // manager asks the latch itself. It holds no state.
@@ -2961,8 +2964,8 @@ export async function main(): Promise<void> {
   // b.jg5 SRJ-704, SRJ-1007, SRJ-1016: the kill-failure alerts, their
   // episode held in the notice episodes (so a teardown forgets it and
   // shutdown closes it). The session manager raises them from the bounded
-  // kill retry's decision at the restart path's kill and the collision
-  // ladder's replacement kills (installed here, before the start pass), and
+  // kill retry's decision at the restart path's kill and the live-row
+  // sequence's kills (installed here, before the start pass), and
   // ends a persona's episode at any read of its own row that reads `ended`
   // or `missing`, or finds it gone. A persona in the applied configuration
   // gets the alert at its destination (the ordinary version once per
@@ -3533,7 +3536,9 @@ export async function main(): Promise<void> {
     isLatched: (key) => conflictLatch.isLatched(key),
     // b.jg5 SRJ-706, SRJ-303: while the persona's live-row sequence runs, its
     // restart work (a fired timer, a retry, a human-triggered restart) makes
-    // no agent-director call and answers sequence-waiting.
+    // no agent-director call and answers sequence-waiting; the work asks
+    // again wherever it asks the latch again and before its launch, and a
+    // launch the sequence held answers sequence-waiting too.
     isLiveRowSequenceRunning,
     // b.jg5 SRJ-610: each run's readings and verdicts feed the slow-recovery
     // count; nothing in the run changes because of it.

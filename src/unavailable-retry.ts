@@ -388,11 +388,22 @@ export const UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED = 'sequence-ended-without-la
  * The cause of a reuse spawn's collision (`ErrInstanceIdCollision`, b.jg5
  * SRJ-112, SRJ-301): the row is live, so the reuse launched nothing. Armed
  * when a collision at the live-row sequence's final launch ends the sequence
- * without its launch (SRJ-705, SRJ-706), and when a collision at the
- * collision ladder's no-transcript reuse ends the launch attempt
- * (`reportReuseCollisionAtSite`, `src/outage-state.ts`). Never counted.
+ * without its launch (SRJ-705, SRJ-706), and when a second collision at a
+ * collision ladder reuse site (the replace step's or the no-transcript
+ * step's, in the one re-run of get-then-act the first gave) ends the launch
+ * attempt (`reportReuseCollisionAtSite`, `src/outage-state.ts`). Never counted.
  */
 export const UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION = 'reuse-collision'
+
+/**
+ * The cause of a lost race on `resume`'s `ErrSpawnNotResumable` (b.jg5
+ * SRJ-710, SRJ-301): the row was not finished when the `resume` ran, so
+ * nothing was killed, deleted or launched, and the persona is re-evaluated
+ * at its next health tick or retry. Armed when the collision ladder's
+ * `resume` meets it (`reportLostRaceAtSite`, `src/outage-state.ts`). Never
+ * counted.
+ */
+export const UNAVAILABLE_RETRY_CAUSE_LOST_RACE = 'spawn-not-resumable-lost-race'
 
 // ---------------------------------------------------------------------------
 // Modes (b.jg5 SRJ-301, SRJ-303)

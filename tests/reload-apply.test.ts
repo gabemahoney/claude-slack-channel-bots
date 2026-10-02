@@ -91,7 +91,7 @@ import { RELOAD_APPLIED, RELOAD_NOOP } from '../src/reload.ts'
 import { personaConfigDirLabelValue } from '../src/session-manager.ts'
 import { REFUSED_OPERATION_PLAIN_SPAWN } from '../src/conflict-latch.ts'
 import { cannedErr, cannedFindMissing, errTemplateMalformed, stubCallCount, type FindMissingHold, type StubClientOptions } from './test-helpers/agent-director-stub.ts'
-import { LIVE_ROW_OUTCOME_NOT_LAUNCHED, LIVE_ROW_OUTCOME_STOPPED, LIVE_ROW_STOP_TEARDOWN, type LiveRowSequenceOutcome } from '../src/live-row-sequence.ts'
+import { LIVE_ROW_LAUNCH_REUSE, LIVE_ROW_OUTCOME_LAUNCHED, LIVE_ROW_OUTCOME_STOPPED, LIVE_ROW_STOP_TEARDOWN, type LiveRowSequenceOutcome } from '../src/live-row-sequence.ts'
 import { CONFLICT_CASE_ROWS } from './test-helpers/conflict-cases.ts'
 import {
   APP_TOKEN_PREFIX,
@@ -511,7 +511,9 @@ describe('a confirmed removal tears the persona down (b.av2 SR-6.5, SR-8.6 step 
     const composition = run.composition!
     // The teardown reaches the approver stop first and the live-row sequence stop right after it (b.jg5 SRJ-404,
     // SRJ-706, SRJ-715): both recorded at its submission and again as its turn's first two steps, before every other
-    // teardown step for bravo, the wait for its launch in flight included.
+    // teardown step for bravo, the wait for its launch in flight included. Once that launch settled, the sequence is
+    // stopped once more and the retry timer with it (a launch in flight can start a sequence at a replacement site,
+    // b.jg5 SRJ-707), before the kill.
     const bravoTeardownCalls = composition.calls.slice(callsAtCp).filter(([, key]) => key === bravoKey)
     expect(bravoTeardownCalls.slice(0, 4)).toEqual([
       ['stopApprover', bravoKey],
@@ -519,8 +521,10 @@ describe('a confirmed removal tears the persona down (b.av2 SR-6.5, SR-8.6 step 
       ['stopApprover', bravoKey],
       ['stopLiveRowSequence', bravoKey],
     ])
-    expect(bravoTeardownCalls.slice(4).filter(([member]) => member === 'stopApprover' || member === 'stopLiveRowSequence')).toEqual([])
-    expect(bravoTeardownCalls.slice(4).map(([member]) => member)).toContain('whenLaunchSettled')
+    const laterMembers = bravoTeardownCalls.slice(4).map(([member]) => member)
+    expect(laterMembers.filter((member) => member === 'stopApprover' || member === 'stopLiveRowSequence')).toEqual(['stopLiveRowSequence'])
+    const settledAt = laterMembers.indexOf('whenLaunchSettled')
+    expect(laterMembers.slice(settledAt, settledAt + 3)).toEqual(['whenLaunchSettled', 'stopLiveRowSequence', 'stopRetryTimer'])
     expect(composition.agentDirectorOrder).toEqual([`kill ${personaInstanceId(bravoKey)}`, `delete ${personaInstanceId(bravoKey)}`])
     expect(stubCallCount(composition.agentDirector)).toBe(2)
     // Every dependency call is for bravo, except the Stop-hook pass, which re-evaluates against the personas still applied.
@@ -2263,9 +2267,12 @@ function adCallsSince(run: ReloadRun, from: number): AgentDirectorCall[] {
   return run.composition!.agentDirectorCalls.slice(from)
 }
 
-/** The persona's instance calls (spawn, resume, kill, delete) from `from` on, as `<verb> <result>`. */
+/**
+ * The persona's instance calls (spawn, resume, kill, delete) from `from` on, as `<verb> <result>`; a reuse spawn of
+ * the same id (`reuse_finished`) reads `reuse-spawn <result>`, so a plain spawn in its place fails the case.
+ */
 function instanceCallsSince(run: ReloadRun, name: string, from: number): string[] {
-  return run.composition!.instanceCallsOf(name).slice(from).map((c) => `${c.verb} ${c.result}`)
+  return run.composition!.instanceCallsOf(name).slice(from).map((c) => `${c.reuse === true ? 'reuse-spawn' : c.verb} ${c.result}`)
 }
 
 /** The persona's last spawn call. */
@@ -2705,8 +2712,13 @@ describe('b.jg5 SRJ-706: an apply returns while a live-row sequence runs, and a 
     ])
     expect(h.rowOf('charlie')?.state).toBe('waiting')
 
+    // Released, the run marks bravo's row missing: the sequence's step 6 is a reuse spawn of the same id over the
+    // finished row (b.jg5 SRJ-705, SRJ-707), which starts its new life.
+    const bravoInstanceCalls = run.composition!.instanceCallsOf('bravo').length
     hold.release(bravoMarkedMissing())
-    expect(await outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_NOT_LAUNCHED })
+    expect(await outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE, result: { key: h.key('bravo'), action: 'spawned' } })
+    expect(run.composition!.instanceCallsOf('bravo').slice(bravoInstanceCalls).map((c) => [c.verb, c.reuse, c.result])).toEqual([['spawn', true, 'ok']])
+    expect(h.rowOf('bravo')?.state).toBe('waiting')
     expect(run.sequenceRunning('bravo')).toBe(false)
     expectNoPostNoLeak(run)
   })
@@ -2887,8 +2899,8 @@ describe('AC 59: a claude_config_dir or stop_hook_bootstrap change costs no sess
       what: 'claude_config_dir, moved to an existing directory,',
       change: () => ({ claude_config_dir: h.configDir('bravo-moved') }),
       refresh: true,
-      // From an `ended` row labelled with the old directory: deleted, then spawned fresh with the new one.
-      nextLaunch: ['spawn ErrInstanceIdCollision', 'delete ok', 'spawn ok'],
+      // From an `ended` row labelled with the old directory: replaced by a reuse of the same id with the new one, nothing deleted.
+      nextLaunch: ['spawn ErrInstanceIdCollision', 'reuse-spawn ok'],
       record: 'true',
     },
     {
@@ -2896,7 +2908,7 @@ describe('AC 59: a claude_config_dir or stop_hook_bootstrap change costs no sess
       what: 'claude_config_dir, moved to a directory not created yet under a symlinked parent,',
       change: () => ({ claude_config_dir: join(configDirLink('bravo-parent-link', h.configDir('bravo-parent')), 'fresh', 'nested') }),
       refresh: true,
-      nextLaunch: ['spawn ErrInstanceIdCollision', 'delete ok', 'spawn ok'],
+      nextLaunch: ['spawn ErrInstanceIdCollision', 'reuse-spawn ok'],
       record: 'true',
       // The nearest existing ancestor's real path (the link's target) plus the rest, never the path as written.
       label: () => configDirLabelValue(join(h.configDir('bravo-parent'), 'fresh', 'nested'), h.home),
@@ -2975,7 +2987,7 @@ describe('AC 59: a claude_config_dir or stop_hook_bootstrap change costs no sess
     expectNoPostNoLeak(run)
   })
 
-  test("b.g57: bravo, held because its claude_config_dir stopped resolving (a symlink whose target was removed), has its Slack connection closed and its row kept; a confirmed change moving it to a directory that resolves does nothing at the apply; its 5 s re-check reads the applied declaration, not the one it was held with, reconnects it with its held credentials and spawns it fresh in the new directory; alpha is untouched (real launch)", async () => {
+  test("b.g57: bravo, held because its claude_config_dir stopped resolving (a symlink whose target was removed), has its Slack connection closed and its row kept; a confirmed change moving it to a directory that resolves does nothing at the apply; its 5 s re-check reads the applied declaration, not the one it was held with, reconnects it with its held credentials and replaces its row by a reuse of the same id in the new directory, deleting nothing; alpha is untouched (real launch)", async () => {
     const target = h.configDir('bravo-target')
     const link = configDirLink('bravo-link', target)
     const { run, personas } = await running(['alpha', ['bravo', { claude_config_dir: link }]], REAL_LAUNCH)
@@ -3012,13 +3024,13 @@ describe('AC 59: a claude_config_dir or stop_hook_bootstrap change costs no sess
     expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual([])
     expect(run.isUp('bravo')).toBe(false)
 
-    // Its re-check, 5 s after the hold: the new directory resolves, so one cleared line and one fresh spawn there.
+    // Its re-check, 5 s after the hold: the new directory resolves, so one cleared line and one reuse of the same id there.
     await run.clock.advance(4_999)
     expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual([])
     const recheck = run.checkpoint()
     await run.clock.advance(1)
     expect(run.since(recheck).lifecycle).toEqual([{ op: 'launch', key: bravoKey, via: 'retry', action: 'spawned' }])
-    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(['spawn ErrInstanceIdCollision', 'delete ok', 'spawn ok'])
+    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(['spawn ErrInstanceIdCollision', 'reuse-spawn ok'])
     const label = personaConfigDirLabelValue(fresh, h.home)
     expect(lastSpawnOf(run, 'bravo')).toMatchObject({ claudeConfigDir: fresh, configDirLabel: label })
     expect(h.rowOf('bravo')).toMatchObject({ state: 'waiting', labels: expect.objectContaining({ config_dir: label }) })
@@ -3110,8 +3122,8 @@ describe('AC 59: a claude_config_dir or stop_hook_bootstrap change costs no sess
     expect(run.currentStub('bravo')).toBe(run.credentialsStub('bravo', label2))
     expect(run.connections.manager.identity(bravoKey)).toEqual(identityOf(run.credentialsStub('bravo', label2)))
     expect(run.since(recheck).lifecycle).toEqual([{ op: 'launch', key: bravoKey, via: 'retry', action: 'spawned' }])
-    // From the ended row labelled with the old directory: deleted, then spawned fresh in the new one.
-    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(['spawn ErrInstanceIdCollision', 'delete ok', 'spawn ok'])
+    // From the ended row labelled with the old directory: replaced by a reuse of the same id in the new one, nothing deleted.
+    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(['spawn ErrInstanceIdCollision', 'reuse-spawn ok'])
     expect(lastSpawnOf(run, 'bravo')).toMatchObject({ claudeConfigDir: link })
     expect(run.bringUps.state(bravoKey)?.outcome).toBe('up')
     expect(run.isUp('bravo')).toBe(true)
@@ -3148,7 +3160,7 @@ describe('AC 61: a changed inherited default leaves every instance undisturbed a
       inherit: { claude_config_dir: undefined },
       own: {},
       refresh: true,
-      inheritorLaunch: ['spawn ErrInstanceIdCollision', 'delete ok', 'spawn ok'],
+      inheritorLaunch: ['spawn ErrInstanceIdCollision', 'reuse-spawn ok'],
       ownLaunch: ['spawn ErrInstanceIdCollision', 'resume ok'],
       launched: (name) => ({ claudeConfigDir: name === 'charlie' ? ownConfigDir('charlie') : h.configDir('default-new'), record: 'true' }),
     },

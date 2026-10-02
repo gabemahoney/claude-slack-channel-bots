@@ -54,10 +54,11 @@
  * The survivor version's entry, on every route that writes one, is of its
  * own class, `persona-kill-survivor` (SRJ-1013).
  *
- * Who raises which route: the restart path's kill and the collision ladder's
- * replacement kills (`src/server.ts`, `src/session-manager.ts`, through the
+ * Who raises which route: the restart path's kill and the live-row
+ * sequence's kills (`src/server.ts`, `src/session-manager.ts`, through the
  * kill-failure alerts of `src/persona-episodes.ts`, with the context
- * `recovery`) raise a configured persona's destination route and the
+ * `recovery` for the server's own paths, a sequence the collision ladder
+ * starts included) raise a configured persona's destination route and the
  * not-configured route; the start sweep (`reconcileOrphans`,
  * `src/session-manager.ts`) writes the start-sweep route's entries. The
  * persona teardown's, the CLI teardown's, the old-life wait's and the

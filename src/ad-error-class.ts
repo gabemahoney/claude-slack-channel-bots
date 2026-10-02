@@ -197,7 +197,7 @@ export const AD_READ_VERBS: ReadonlySet<string> = new Set<AdVerb>(['status', 'ge
 
 /**
  * A `kill` call as its site declares it: `rowReadLive` is true only when the
- * site kills a row it read in a live state (a collision ladder's kill of the
+ * site kills a row it read in a live state (a live-row sequence's kill of the
  * row it read live); a kill after a `dead` reading, or a teardown's kill of a
  * row it did not read, declares false.
  */

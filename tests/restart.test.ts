@@ -74,6 +74,7 @@ import {
   killOutcomeOf,
   type KillOutcome,
 } from '../src/checked-kill.ts'
+import type { Phase1SpawnParams } from '../src/ad-phase1-types.ts'
 import { createPersonaRelaunchGate } from '../src/persona-start.ts'
 import { describeThrownValue } from '../src/persona-connection-errors.ts'
 import { createPersonaSerializer, type PersonaSerialize } from '../src/persona-serializer.ts'
@@ -3733,7 +3734,7 @@ describe('restart: the reply-guard record holds the effective value before the r
   // values; each relaunch goes through the launch adapter, handed the applied
   // set at that moment (the server's `personaConfig`, which a confirmed
   // apply's step 1 swaps), and the reply guard reads the live applied set.
-  test('claude_config_dir and stop_hook_bootstrap changed between two restarts: the first relaunch uses the old values; the second deletes the old-label row and spawns fresh with the new CLAUDE_CONFIG_DIR (not created yet) and writes the new record', async () => {
+  test('claude_config_dir and stop_hook_bootstrap changed between two restarts: the first relaunch uses the old values; the second gives the old-label row a reuse spawn of the same id with the new CLAUDE_CONFIG_DIR (not created yet), deletes nothing and writes the new record', async () => {
     const newDir = join(dir, 'claude-config-new')
     const configFor = (claude_config_dir: string, stop_hook_bootstrap: boolean) =>
       makeMultiPersonaConfig([{ name: 'Alpha Desk', claude_config_dir, stop_hook_bootstrap }], dir, { agent_director_poll_interval_ms: 1 })
@@ -3786,8 +3787,14 @@ describe('restart: the reply-guard record holds the effective value before the r
 
     expect(results).toEqual([true, true])
     expect(resumeCalls).toEqual([])
-    expect(deleteCalls.map((d) => d.claude_instance_id)).toEqual([[personaInstanceId(a.key)]])
+    // b.jg5 SRJ-707, SRJ-1504: the finished old-label row is replaced by a reuse spawn of the same id; nothing is deleted.
+    expect(deleteCalls).toEqual([])
     expect(spawnCalls).toHaveLength(3)
+    expect((spawnCalls as Phase1SpawnParams[]).map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([
+      [personaInstanceId(a.key), undefined],
+      [personaInstanceId(a.key), undefined],
+      [personaInstanceId(a.key), true],
+    ])
     expect(spawnCalls[2]!.extra_env?.['CLAUDE_CONFIG_DIR']).toBe(newDir)
     expect(spawnCalls[2]!.label).toEqual([
       'service=cscb',
@@ -6684,6 +6691,14 @@ describe('b.jg5 SRJ-706, SRJ-303: the restart path makes no attempt while P\'s l
   /** The restart work's one line for a persona whose sequence runs. */
   const sequenceSkipLine = (key: string, failure = ''): string =>
     `[slack] Skipping restart for persona=${key} — its live-row sequence runs${failure}; no agent-director call, nothing recorded (sequence-waiting; b.jg5 SRJ-706, SRJ-303)`
+  /** The restart work's one line for a persona whose sequence is found running when the gate is asked again, at `where`. */
+  const sequenceFurtherLine = (key: string, where: string): string =>
+    `[slack] Restart for persona=${key} goes no further ${where} — its live-row sequence runs; nothing more is called for it, nothing recorded (sequence-waiting; b.jg5 SRJ-706, SRJ-303)`
+  /**
+   * Q's asks of the running query in one run over a dead row that launches: at the work's start, after its probe,
+   * before its kill and before its launch (b.jg5 SRJ-706: asked again wherever the latched gate is, and before the launch).
+   */
+  const Q_RUN_ASKS = [Q, Q, Q, Q]
   let errLines: string[]
   let origConsoleError: typeof console.error
   /** Each serialized work's outcome, in order. */
@@ -6758,7 +6773,7 @@ describe('b.jg5 SRJ-706, SRJ-303: the restart path makes no attempt while P\'s l
     expectNothingForP(deps)
     expect(deps.killSessionCalls).toEqual([Q])
     expect(deps.launchSessionCalls.map((call) => call.key)).toEqual([Q])
-    expect(asked).toEqual([Q, P])
+    expect(asked).toEqual([...Q_RUN_ASKS, P])
   })
 
   test.each<[string, boolean, RestartRetryOutcome]>([
@@ -6778,7 +6793,79 @@ describe('b.jg5 SRJ-706, SRJ-303: the restart path makes no attempt while P\'s l
     expect(getFailureCount(P)).toBe(1)
     expect([deps.onCapReachedCalls, deps.armRetryTimerCalls]).toEqual([[], []])
     // The in-flight check answers before the serialized work: the running query is not asked for P then.
-    expect(asked).toEqual(inFlight ? [Q] : [P, Q])
+    expect(asked).toEqual(inFlight ? Q_RUN_ASKS : [P, ...Q_RUN_ASKS])
+  })
+
+  // b.jg5 SRJ-706: the running query is asked again wherever the latched
+  // gate is (after the probe, after an 'escalate-dead' reconnect, after its
+  // re-probe, before the kill) and once more before the launch, since a
+  // launch outside the serializer can start P's sequence during the work's
+  // awaits (a collision ladder's replacement site, b.jg5 SRJ-707). Driven on
+  // the escalate-dead path (a live row whose reconnect answers
+  // 'escalate-dead', then a dead re-probe), where every gate is asked: the
+  // query first answers running at the given ask, and the work goes no
+  // further: sequence-waiting, nothing recorded, nothing armed.
+  test.each<[number, string, { probes: number; reconnects: number; kills: number }]>([
+    [2, 'after its liveness probe', { probes: 1, reconnects: 0, kills: 0 }],
+    [3, 'after its escalate-dead reconnect', { probes: 1, reconnects: 1, kills: 0 }],
+    [4, 'after its re-probe', { probes: 2, reconnects: 1, kills: 0 }],
+    [5, 'before its kill', { probes: 2, reconnects: 1, kills: 0 }],
+    [6, 'before its launch', { probes: 2, reconnects: 1, kills: 1 }],
+  ])('the running query first answering true at ask %i (%s): the work goes no further, answers sequence-waiting, records nothing and arms nothing', async (runningFrom, where, made) => {
+    recordFailure(P)
+    const deps = sequenceDeps((key) => key === P && asked.filter((k) => k === P).length >= runningFrom)
+    const probes = [LIVENESS_READING_LIVE, LIVENESS_READING_DEAD]
+    deps.isSessionAlive = async (key) => {
+      deps.isSessionAliveCalls.push(key)
+      return probes[deps.isSessionAliveCalls.length - 1] ?? LIVENESS_READING_DEAD
+    }
+    deps.reconnectSession = async (key) => {
+      deps.reconnectSessionCalls.push(key)
+      return 'escalate-dead'
+    }
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD[P]!, () => false)).toBe(RESTART_OUTCOME_SEQUENCE_WAITING)
+
+    expect(asked).toEqual(Array(runningFrom).fill(P))
+    expect({
+      probes: deps.isSessionAliveCalls.length,
+      reconnects: deps.reconnectSessionCalls.length,
+      kills: deps.killSessionCalls.length,
+    }).toEqual(made)
+    expect(deps.launchSessionCalls).toEqual([])
+    expect(getFailureCount(P)).toBe(1)
+    expect([deps.onCapReachedCalls, deps.armRetryTimerCalls]).toEqual([[], []])
+    expect(errLines.filter((line) => line.includes('live-row sequence'))).toEqual([sequenceFurtherLine(P, where)])
+  })
+
+  // b.jg5 SRJ-706, SRJ-707: the restart's own launch reaches a collision
+  // ladder replacement site over a live row, which starts P's sequence and
+  // answers sequence-waiting (`launchSession`'s uncounted 'refused'): the work
+  // answers sequence-waiting too, so a retry's re-armed line names the
+  // sequence. Control: a refused launch with no sequence running stays the
+  // refused outcome.
+  test.each<[string, boolean, RestartRetryOutcome]>([
+    ['its ladder starts P\'s sequence: sequence-waiting', true, RESTART_OUTCOME_SEQUENCE_WAITING],
+    ['no sequence runs (control): refused', false, RESTART_OUTCOME_REFUSED],
+  ])('a restart whose own launch answers refused while %s; nothing recorded, nothing armed', async (_label, startsSequence, outcome) => {
+    recordFailure(P)
+    let started = false
+    const deps = sequenceDeps((key) => key === P && started)
+    deps.launchSession = async (key, cwd, sessionId) => {
+      deps.launchSessionCalls.push({ key, cwd, sessionId })
+      started = startsSequence
+      return 'refused'
+    }
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD[P]!, () => false)).toBe(outcome)
+
+    expect([deps.isSessionAliveCalls, deps.killSessionCalls, deps.launchSessionCalls.map((call) => call.key)]).toEqual([[P], [P], [P]])
+    expect(asked).toEqual([P, P, P, P, P])
+    expect(getFailureCount(P)).toBe(1)
+    expect([deps.onCapReachedCalls, deps.armRetryTimerCalls]).toEqual([[], []])
+    expect(errLines.filter((line) => line.includes('live-row sequence'))).toEqual(startsSequence ? [sequenceFurtherLine(P, 'after its launch')] : [])
   })
 
   test('a latched P whose sequence runs answers latched first: the running query is not asked', async () => {
@@ -7072,7 +7159,8 @@ describe('b.jg5 SRJ-512, SRJ-513: a restart run whose own liveness read latches 
 // `ordinaryAlertContent`, `killFailureRecoveryEntry`). The tries of a row read
 // live (the survivor matrix, the latching reads, AC 64's three tries) and
 // "a later failure in the same episode posts nothing" are proved at the
-// collision ladder's replacement kill, in tests/session-manager.test.ts: here
+// live-row sequence's kill, in tests/session-manager.test.ts and
+// tests/live-row-sequence.test.ts: here
 // each run's own liveness read of `ended` ends the episode before its kill
 // (b.jg5 SRJ-704), so a later run's failure opens a new one. The lost-message
 // legs are in tests/inbound-recovery-drop-branch.test.ts.

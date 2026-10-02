@@ -36,7 +36,10 @@
  * `sequence-waiting` with no call while Q goes ahead, a new sequence after
  * each kind of end, the stops at a latch, a teardown and shutdown during a
  * held run and the waits, `closed` after shutdown, and the sequence's own
- * detached recovery attempt). Every sequence runs through the registry but
+ * detached recovery attempt), and the sequence started at the collision
+ * ladder's real replacement sites (SRJ-707: the launch answering while it
+ * runs, its reuse at step 6, a new episode at the next retry after a
+ * not-judged stop, the `recovery` context). Every sequence runs through the registry but
  * `runWithDeps`'s, whose dependencies a case replaces. This
  * file asserts that the sequence stops; the latches it causes
  * (each kill's CONFLICT and UNUSABLE NAME rows, SRJ-613's kill backstop among
@@ -143,6 +146,7 @@ import {
   liveRowSequenceKillLine,
   liveRowSequenceNotStartedLine,
   liveRowSequenceRunLine,
+  liveRowSequenceStartLine,
   liveRowSequenceStopAskedLine,
   runLiveRowSequence,
   type LiveRowLaunchKindInput,
@@ -157,7 +161,7 @@ import {
 import { AGENT_DIRECTOR_PENDING_STATE, LIVENESS_DEAD_ROW_ENDED, LIVENESS_DEAD_ROW_MISSING } from '../src/liveness-reading.ts'
 import { parseLaunchStart } from '../src/pending-row.ts'
 import { describeThrownValue } from '../src/persona-connection-errors.ts'
-import { personaInstanceId } from '../src/persona-identity.ts'
+import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import { KILL_FAILURE_END_ROW_FINISHED } from '../src/persona-episodes.ts'
 import { MAX_TIMER_DELAY_MS } from '../src/persona-retry-schedule.ts'
 import {
@@ -175,6 +179,8 @@ import {
 import {
   runInAttempt,
   UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED,
+  UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED,
+  UNAVAILABLE_RETRY_STOP_TORN_DOWN,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
   type AttemptView,
 } from '../src/unavailable-retry.ts'
@@ -238,6 +244,7 @@ import {
   personaCallCounts,
   personaOf,
   recordCallOrder,
+  retryNow,
   reuseSpawnOf,
   runSequenceStoppedAtKill,
   scriptSequenceKillFailure,
@@ -1767,5 +1774,108 @@ describe('scheduling: each sequence runs in the background, one per persona at a
     expect(starter?.lastError).toBeUndefined()
     expect(h.triggers[0]).toEqual({ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE })
     expect(h.controller.isArmed(p)).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Started at the collision ladder's real replacement sites (b.jg5 SRJ-707,
+// SRJ-705, SRJ-706; E22)
+//
+// A launch of P (`h.launch`, the start pass's, or the restart path's
+// `launchSession`) whose optimistic spawn collides with P's row read live in
+// another directory starts P's sequence through the session manager's start
+// entry (step 1, the conversation not kept, alert context `recovery`) and
+// answers `sequence-waiting` (`launchSession`'s uncounted `'refused'`) while
+// the sequence runs in the background. A not-judged stop arms P's timer, and
+// the next retry, through the restart path, reaches the same site and begins
+// a new sequence episode. Each site's reuse and SRJ-110 at its first kill are
+// tests/session-manager.test.ts's.
+// ---------------------------------------------------------------------------
+
+describe('started at a collision ladder replacement site: the launch answers while the sequence runs in the background, the sequence ends in a reuse, and a later retry begins a new episode (SRJ-707, SRJ-706)', () => {
+  /** P's row in another directory read `state`, with a session id: a resume would keep the conversation. */
+  const elsewhereWithSession = (h: RecoveryHarness, key: string, state: string): Phase1GetResult =>
+    rowOf(h, key, { cwd: h.home, state, claude_session_id: 'a-session-id' })
+
+  /** The start line of P's sequence as the ladder starts it, the state it last read the seed. */
+  const ladderStartLine = (h: RecoveryHarness, key: string, lastReadState: string): string =>
+    liveRowSequenceStartLine(renderPersonaRef(key, key), h.sequenceRequest(key, { lastReadState }))
+
+  test('a launch over P\'s live row in another directory resolves while the sequence it started runs (its first run held), with no launch of its own, answering sequence-waiting; the restart path\'s launchSession meanwhile answers the uncounted refused with no call; released, the sequence reads the row missing and makes one reuse of cscb_<key> though the row has a session id', async () => {
+    const { h, p } = build()
+    const hold = holdFindMissing(h.stub.client)
+    h.script({
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getQueue: [cannedOk(elsewhereWithSession(h, p, LIVE))],
+      getResult: rowOf(h, p, { state: MISSING, claude_session_id: 'a-session-id' }),
+    })
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
+    await h.driveSequence(hold.entered())
+    expect(h.sequenceRunning(p)).toBe(true)
+    expect(await launchSession(p, h.config)).toBe('refused')
+    expect(order).toEqual(['spawn', 'get', 'kill', 'get', 'findMissing'])
+    expect(h.lines).toContain(ladderStartLine(h, p, LIVE))
+
+    hold.release(placed(p, 'ids'))
+    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE, result: { key: p, action: 'spawned' } })
+
+    expectCallsThenApprover(order, ['spawn', 'get', 'kill', 'get', 'findMissing', 'get', 'spawn'])
+    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
+    expect(h.stub.calls.resumeCalls).toEqual([])
+    await h.runApproverToStop(p)
+  })
+
+  test('a not-judged stop arms P\'s timer; its next retry reaches the same replacement site through the restart path and begins a new sequence episode, which reaches the reuse; one sequence per episode', async () => {
+    const { h, p } = build()
+    await clockAt(h, LAUNCH_START_MS + adGraceMsInEffect())
+    // Episode 1: the ladder's get reads P's pending row in another directory, and the
+    // sequence's own gets read it pending; its run leaves it in neither list.
+    let episode = 1
+    let secondGets = 0
+    h.script({
+      spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(errInstanceIdCollision())],
+      getFn: () => {
+        if (episode === 1) return elsewhereWithSession(h, p, PENDING)
+        return secondGets++ === 0 ? elsewhereWithSession(h, p, LIVE) : rowOf(h, p, { state: ENDED, claude_session_id: 'a-session-id' })
+      },
+    })
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
+    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_NOT_JUDGED })
+    expect(h.controller.view(p)?.causes).toEqual([UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED])
+    expect(h.reuseSpawns()).toEqual([])
+
+    // Episode 2: the retry's restart path reads the row dead, kills it and launches; the
+    // ladder's get reads the row live in another directory again, and a new sequence starts.
+    episode = 2
+    h.script({ statusResult: cannedStatusResult({ state: ENDED }) })
+    await retryNow(h, p)
+    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE, result: { key: p, action: 'spawned' } })
+
+    expect(h.lines.filter((line) => line.startsWith(`${LIVE_ROW_SEQUENCE_LOG_PREFIX} ${renderPersonaRef(p, p)}: started at step `))).toEqual([
+      ladderStartLine(h, p, PENDING),
+      ladderStartLine(h, p, LIVE),
+    ])
+    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
+    expect(h.stub.calls.resumeCalls).toEqual([])
+    await h.runApproverToStop(p)
+    h.controller.stop(p, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
+  })
+
+  test('a step-5 escalation of the sequence the ladder started carries the recovery context: P removed meanwhile gets one persona-kill-failed entry with it, and nothing to Slack', async () => {
+    const { h, p } = build()
+    h.script({ spawnQueue: [cannedErr(errInstanceIdCollision())], getQueue: [cannedOk(elsewhereWithSession(h, p, LIVE))], getResult: rowOf(h, p) })
+    // The sequence's last get: after the ladder's spawn and get, its kill, get, three runs and gets, kill, and one run.
+    const lastGet = ['spawn', 'get', 'kill', 'get', ...runAndGet(LIVE_ROW_SEQUENCE_STEP3_RUNS), 'kill', ...runAndGet(1)].length - 1
+    recordCallOrder(h, { at: lastGet, run: () => h.remove(p) })
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
+    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_ESCALATED })
+
+    expect(h.lines).toContain(ladderStartLine(h, p, LIVE))
+    expect(h.episodeNotices).toEqual([])
+    expect(startupEntriesOf(h, PERSONA_KILL_FAILED_LABEL)).toEqual([killFailureRecoveryEntry(p, ordinaryAlertContent(p), KILL_FAILURE_CONTEXT_RECOVERY)])
   })
 })
