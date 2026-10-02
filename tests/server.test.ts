@@ -82,6 +82,7 @@ import {
   errInternal,
   errInvalidFlags,
   errSchemaMismatch,
+  errSendKeysWhileRelayed,
   errSpawnNotFound,
   errSpawnNotInteractive,
   errSpawnNotResumable,
@@ -118,6 +119,8 @@ import {
   expectedLatchRecord,
   launchStartRecord,
   livenessPaneConflictRowsAt,
+  reconnectConflictRowsAt,
+  reconnectUnusableNameRowsAt,
   tmuxTouchingCallsIn,
   type ConflictCaseRow,
   type LivenessPaneSite,
@@ -147,8 +150,6 @@ import { writeAgentDirectorConfig } from './test-helpers/ad-settings.ts'
 import {
   _resetFindMissingMemo,
   _setFindMissingMemoTtlMs,
-  _setTmuxServerEnsurer,
-  _resetTmuxServerEnsurer,
   _setTmuxSessionProber,
   _resetTmuxSessionProber,
   _setTmuxCommandRunner,
@@ -160,7 +161,11 @@ import {
   _resetNow,
   _setNow,
   escalateDeadSweepLine,
+  ESCALATE_DEAD_EVIDENCE,
   ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ,
+  reconnectConflictLine,
+  reconnectTransientLine,
+  reconnectUnusableNameLine,
   ESCALATE_DEAD_WAITING_ROW_PANE_GONE,
   waitingRowAbsentAtPaneReadLine,
   waitingRowPaneGoneLine,
@@ -190,7 +195,7 @@ import {
 } from '../src/conflict-latch.ts'
 import { createPersonaEpisodes, type PersonaEpisodes } from '../src/persona-episodes.ts'
 import type { ClientOptions, FindMissingParams, FindMissingResult, GetParams, KillParams, ReadPaneParams, ReadPaneResult, ResumeParams, SendKeysParams, SendKeysResult, SpawnParams, StatusParams } from 'agent-director'
-import { KILL_SESSION_REFUSED, type KillSessionResult } from '../src/restart.ts'
+import { KILL_SESSION_REFUSED, RECONNECT_ESCALATE_DEAD_NO_KILL, type KillSessionResult } from '../src/restart.ts'
 import {
   UNAVAILABLE_RETRY_CAUSE_CONFIG,
   UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
@@ -1339,7 +1344,11 @@ function stringLines(errArgs: unknown[][]): string[] {
 // but it drives its send-keys through the SAME withOutageDetection client the
 // status probe uses, so the shared stub's `sendKeysCalls` is the observable
 // seam for "was a reconnect attempted", and `sendKeysResult`/`sendKeysError`
-// drive the ok→'success' / dead-session→'escalate-dead' mapping.
+// drive the mapping (b.jg5 SRJ-118, SRJ-609): ok → 'success'; dead-session
+// → one sweep with its cause's verdict, then 'escalate-dead' (or
+// `RECONNECT_ESCALATE_DEAD_NO_KILL` for `row-not-interactive`); transient →
+// 'transient' with no sweep. The reconnect is one `send-keys`, never retried,
+// with no tmux server start.
 //
 // b.d61, b.jg5 SRJ-603: a `working` row whose session is gone (the Claude
 // inside it was killed mid-turn, so AD's row stays frozen at `working`) must
@@ -1415,7 +1424,7 @@ describe('_buildReconnectSessionAdapter', () => {
     /** When set, the outage state's trigger sink records every retry it is asked to arm here. */
     triggers?: Array<{ key: string; kind: string }>
   }): {
-    adapter: (channelId: string) => Promise<'success' | 'escalate-dead' | 'transient' | 'pending'>
+    adapter: ReturnType<typeof _buildReconnectSessionAdapter>
     statusCalls: StatusParams[]
     sendKeysCalls: SendKeysParams[]
     findMissingCalls: FindMissingParams[]
@@ -1484,10 +1493,6 @@ describe('_buildReconnectSessionAdapter', () => {
       ...(triggers === undefined ? {} : { triggerSink: { arm: (key: string, cause: { kind: string }) => { triggers.push({ key, kind: cause.kind }); return true } } }),
     })
     setClientForTests(stub as unknown as Client)
-    // Seam: reconnectMcp's ErrTmuxSendKeys self-heal calls _ensureTmuxServer
-    // between the two send-keys attempts. Stub it so the dead-session path
-    // (double ErrTmuxSendKeys) never touches a live tmux server.
-    _setTmuxServerEnsurer(async () => {})
     return {
       // The builder resolves the instance ID from the persona key alone
       // (b.av2 SR-2.2); its persona lookup only locates a `working` row's
@@ -1544,7 +1549,6 @@ describe('_buildReconnectSessionAdapter', () => {
   afterEach(() => {
     resetClientForTests()
     _resetOutageState()
-    _resetTmuxServerEnsurer()
     _resetTmuxSessionProber()
     _resetTmuxCommandRunner()
     _resetFindMissingMemo()
@@ -1748,55 +1752,18 @@ describe('_buildReconnectSessionAdapter', () => {
     assertNoLeak({ errArgs })
   })
 
-  test("(iv) reconnectMcp 'dead-session' → 'escalate-dead', firing exactly one memoized findMissing sweep (b.sv7 / Epic t1.tkk.e4)", async () => {
-    // Persistent ErrTmuxSendKeys: the first send-keys AND the self-heal retry
-    // both fail, so reconnectMcp returns 'dead-session' (b.3ce). The status
-    // probe is 'waiting' (not 'working'), so the adapter does NOT defer — it
-    // falls through to reconnectMcp and the dead-session escalate branch.
-    const { adapter, statusCalls, sendKeysCalls, findMissingCalls } = makeHarness({
-      statusState: 'waiting',
-      sendKeysThrows: errTmuxSendKeys(),
-    })
-
-    const lines: string[] = []
-    const orig = console.error
-    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
-    let result: string | undefined
-    try {
-      result = await adapter('C1')
-    } finally {
-      console.error = orig
-    }
-
-    // Mapping is byte-for-byte unchanged per b.9a7: dead-session → 'escalate-dead'.
-    expect(result).toBe('escalate-dead')
-    // Both keystrokes answered GONE (ErrTmuxSendKeys); the line says what
-    // was observed, not that the tmux session is provably dead.
-    expect(lines.filter((l) => l.startsWith('[slack] escalate-dead: persona='))).toEqual([escalateDeadLine('dead-session')])
-    expect(statusCalls).toHaveLength(1)
-    // Two send-keys attempts (original + one self-heal retry) both threw.
-    expect(sendKeysCalls).toHaveLength(2)
-    expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1', 'cscb_C1'])
-    // The escalate-dead branch fires sweepDeadTmuxChannel → the memoized
-    // reconcileMissingSweep → exactly ONE client.findMissing({}). No direct new
-    // findMissing call site; the memoized helper is the only sweep mechanism.
-    expect(findMissingCalls).toHaveLength(1)
-  })
-
-  // b.jg5 SRJ-105: an UNAVAILABLE `send-keys` (at the first try, or at the
-  // retry after ErrTmuxSendKeys) is a refusal: 'transient', never
-  // 'escalate-dead', no sweep and no spawn-failure notice. One refusal line
-  // describes the error (never the raw value); nothing leaks.
-  /** reconnectMcp's refusal line for persona C1, for the call `what`. */
-  const sendKeysRefusedLine = (what: string, err: unknown): string =>
-    `[slack] reconnectMcp: ${what} refused for persona=C1: ${describeAgentDirectorFailure(err)} — no spawn-failure notice; nothing more is called (b.jg5 SRJ-105)`
-
-  /** Run the adapter for C1 over `opts`, capturing notices and console.error. */
+  // b.jg5 SRJ-118, SRJ-609: the reconnect is one `send-keys`, never retried,
+  // with no tmux server start or other raw tmux call. Each case below runs
+  // the adapter for C1 on a `waiting` row whose `read-pane` shows an idle
+  // pane (so the reconnect goes ahead), capturing every spawn-failure notice
+  // and console.error line; nothing leaks. The CONFLICT and UNUSABLE NAME
+  // cells, which need the latch, are in the per-cell describe below.
+  /** Run the adapter for C1 on a `waiting` row with an idle pane over `opts`, capturing notices and console.error. */
   async function reconnectCapturing(opts: Parameters<typeof makeHarness>[0]) {
     const raised: string[] = []
     setSessionNotifier((key) => { raised.push(key) })
     try {
-      const h = makeHarness(opts)
+      const h = makeHarness({ statusState: 'waiting', pane: IDLE_PANE, ...opts })
       const { result, errArgs } = await capturingErrorArgs(() => h.adapter('C1'))
       return { ...h, result, errArgs, raised }
     } finally {
@@ -1804,137 +1771,143 @@ describe('_buildReconnectSessionAdapter', () => {
     }
   }
 
-  test.each(UNAVAILABLE_FORMS)("SRJ-105: send-keys refused with %s → 'transient', never 'escalate-dead'; one send-keys, no sweep, no spawn-failure notice; one described refusal line, nothing leaks", async (_label, build, redacted) => {
+  /** The escalate-dead sweep lines among `lines`. */
+  const escalateDeadLines = (lines: readonly string[]): string[] => lines.filter((l) => l.startsWith('[slack] escalate-dead: persona='))
+
+  test("ok: one send-keys → 'success', with no sweep, notice or tmux call", async () => {
+    const h = await reconnectCapturing({})
+
+    expect(h.result).toBe('success')
+    expect(h.sendKeysCalls.map((c) => [c.claude_instance_id, c.text])).toEqual([[personaInstanceId('C1'), `/mcp reconnect ${MCP_SERVER_NAME}`]])
+    expect(h.findMissingCalls).toEqual([])
+    expect(h.raised).toEqual([])
+    expectNoTmuxCall(h)
+    assertNoLeak({ errArgs: h.errArgs })
+  })
+
+  test("(iv) GONE (ErrTmuxSendKeys) → dead-session → 'escalate-dead' after exactly one send-keys (no second try, no tmux call), firing exactly one memoized findMissing sweep (b.sv7 / Epic t1.tkk.e4) whose line carries the dead-session verdict's text; no notice", async () => {
+    // The status probe is 'waiting' (not 'working'), so the adapter does NOT
+    // defer — it falls through to the reconnect and the dead-session escalate
+    // branch.
+    const h = await reconnectCapturing({ sendKeysThrows: errTmuxSendKeys() })
+
+    expect(h.result).toBe('escalate-dead')
+    // The one keystroke answered GONE; the line says what was observed, not
+    // that the tmux session is provably dead.
+    const lines = stringLines(h.errArgs)
+    expect(escalateDeadLines(lines)).toEqual([escalateDeadLine('dead-session')])
+    expect(escalateDeadLines(lines)[0]).toContain(ESCALATE_DEAD_EVIDENCE['dead-session'])
+    expect(h.statusCalls).toHaveLength(1)
+    expect(h.sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
+    // The escalate-dead branch fires sweepDeadTmuxChannel → the memoized
+    // reconcileMissingSweep → exactly ONE client.findMissing({}). No direct new
+    // findMissing call site; the memoized helper is the only sweep mechanism.
+    expect(h.findMissingCalls).toHaveLength(1)
+    expect(h.raised).toEqual([])
+    expectNoTmuxCall(h)
+    assertNoLeak({ errArgs: h.errArgs })
+  })
+
+  test("ErrSpawnNotFound at the send-keys (no row) → dead-session (row-absent) → 'escalate-dead' with one sweep whose verdict is the row-absent one, never the GONE one; one send-keys; no notice", async () => {
+    const h = await reconnectCapturing({ sendKeysThrows: errSpawnNotFound() })
+
+    expect(h.result).toBe('escalate-dead')
+    const lines = stringLines(h.errArgs)
+    expect(escalateDeadLines(lines)).toEqual([escalateDeadLine(ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ)])
+    expect(escalateDeadLines(lines)[0]).not.toContain(ESCALATE_DEAD_EVIDENCE['dead-session'])
+    expect(h.sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
+    expect(h.findMissingCalls).toHaveLength(1)
+    expect(h.raised).toEqual([])
+    expectNoTmuxCall(h)
+    assertNoLeak({ errArgs: h.errArgs })
+  })
+
+  // b.jg5 SRJ-105, SRJ-118: an UNAVAILABLE `send-keys` is `transient`: never
+  // 'escalate-dead', no sweep and no spawn-failure notice. The reconnect's
+  // one line describes the error (never the raw value); nothing leaks.
+  /** The reconnect's transient line for persona C1. */
+  const sendKeysTransientLine = (err: unknown, errorClass: AdErrorClass): string =>
+    reconnectTransientLine('persona=C1', describeAgentDirectorFailure(err), errorClass)
+
+  test.each(UNAVAILABLE_FORMS)("SRJ-105, SRJ-118: send-keys refused with %s → 'transient', never 'escalate-dead'; one send-keys, no sweep, no spawn-failure notice, no tmux call; one described line, nothing leaks", async (_label, build, redacted) => {
     const err = build('send-keys')
 
-    const { result, errArgs, raised, sendKeysCalls, findMissingCalls } = await reconnectCapturing({ statusState: 'waiting', sendKeysThrows: err })
+    const { result, errArgs, raised, sendKeysCalls, findMissingCalls, ...h } = await reconnectCapturing({ sendKeysThrows: err })
 
     expect(result).toBe('transient')
     expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
     expect(findMissingCalls).toHaveLength(0)
     expect(raised).toEqual([])
+    expectNoTmuxCall(h)
     const lines = stringLines(errArgs)
-    expect(lines.filter((l) => l.startsWith('[slack] reconnectMcp:'))).toEqual([sendKeysRefusedLine('send-keys', err)])
+    expect(lines.filter((l) => l.startsWith('[slack] reconnectMcp:'))).toEqual([sendKeysTransientLine(err, AD_ERROR_CLASS_UNAVAILABLE)])
     expect(lines.filter((l) => l.startsWith('[slack] escalate-dead'))).toEqual([])
     if (redacted) expect(lines.join('\n')).toContain(REDACTED_SENTINEL_TAIL)
     assertNoLeak({ errArgs })
   })
 
-  test.each(UNAVAILABLE_FORMS)("SRJ-105: ErrTmuxSendKeys, then the retry refused with %s → 'transient', never 'escalate-dead'; two send-keys, no sweep, no spawn-failure notice; one described refusal line, nothing leaks", async (_label, build, redacted) => {
-    const err = build('send-keys')
-
-    const { result, errArgs, raised, sendKeysCalls, findMissingCalls } = await reconnectCapturing({
-      statusState: 'waiting',
-      sendKeysErrors: [errTmuxSendKeys(), err],
-    })
-
-    expect(result).toBe('transient')
-    expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1'), personaInstanceId('C1')])
-    expect(findMissingCalls).toHaveLength(0)
-    expect(raised).toEqual([])
-    const lines = stringLines(errArgs)
-    expect(lines.filter((l) => l.includes(' refused for persona=C1'))).toEqual([
-      sendKeysRefusedLine('retry send-keys after ErrTmuxSendKeys', err),
-    ])
-    expect(lines.filter((l) => l.startsWith('[slack] escalate-dead'))).toEqual([])
-    if (redacted) expect(lines.join('\n')).toContain(REDACTED_SENTINEL_TAIL)
-    assertNoLeak({ errArgs })
-  })
-
-  // b.jg5 SRJ-105, SRJ-316, SRJ-313, SRJ-113: a CONFIG `send-keys`
-  // (ErrConfigMalformed, whose outage wrapper raises `ad-config-malformed`) or
-  // an UNCLASSIFIED one (an `ErrInternal`, a name CSCB gives no handling, or
-  // `ErrSystemInstallDisappeared`, whose wrapper raises `ad-unreachable`), at
-  // the first try or at the retry after ErrTmuxSendKeys, is the same refusal:
-  // 'transient', never 'escalate-dead', no sweep, kill or launch and no
-  // spawn-failure notice; one described refusal line, nothing leaks. Each
-  // row raises exactly its expected outage flags.
-  /** [label, builder, the outage flags it leaves raised for C1]. */
-  const CONFIG_SEND_KEYS_ERROR: readonly [string, () => Error, readonly OutageClass[]] = [
-    'a CONFIG answer (ErrConfigMalformed)',
-    () => errConfigMalformed('starting_session_seconds', sentinelInMessage('send-keys-config')),
-    ['ad-config-malformed'],
+  // b.jg5 SRJ-105, SRJ-311, SRJ-316, SRJ-313, SRJ-118: an ENVIRONMENT
+  // `send-keys` (ErrTmuxNotAvailable, whose wrapper raises
+  // `tmux-unavailable`), a CONFIG one (ErrConfigMalformed, whose wrapper
+  // raises `ad-config-malformed`) or an UNCLASSIFIED one (an `ErrInternal`, a
+  // name CSCB gives no handling, `ErrSendKeysWhileRelayed`, or
+  // `ErrSystemInstallDisappeared`, whose wrapper raises `ad-unreachable`) is
+  // `transient` too: never 'escalate-dead', no sweep, kill or launch and no
+  // spawn-failure notice; one described line, nothing leaks. Each row raises
+  // exactly its expected outage flags.
+  /** [label, builder, the outage flags it leaves raised for C1, its class]. */
+  const TRANSIENT_SEND_KEYS_ERRORS: ReadonlyArray<readonly [string, () => Error, readonly OutageClass[], AdErrorClass]> = [
+    ['ErrTmuxNotAvailable (ENVIRONMENT)', () => errTmuxNotAvailable(undefined, 'send-keys'), ['tmux-unavailable'], AD_ERROR_CLASS_ENVIRONMENT],
+    ['a CONFIG answer (ErrConfigMalformed)', () => errConfigMalformed('starting_session_seconds', sentinelInMessage('send-keys-config')), ['ad-config-malformed'], AD_ERROR_CLASS_CONFIG],
+    ['ErrInternal (UNCLASSIFIED)', () => errInternal(`the store could not be read (${sentinelInMessage('send-keys-internal')})`), [], AD_ERROR_CLASS_UNCLASSIFIED],
+    ['a name CSCB gives no handling (UNCLASSIFIED)', () => errGeneric('send-keys', 'ErrSendKeysBroken', `the keystrokes broke (${sentinelInMessage('send-keys-generic')})`), [], AD_ERROR_CLASS_UNCLASSIFIED],
+    ['ErrSendKeysWhileRelayed (UNCLASSIFIED)', () => errSendKeysWhileRelayed(), [], AD_ERROR_CLASS_UNCLASSIFIED],
+    ['ErrSystemInstallDisappeared (UNCLASSIFIED)', () => errSystemInstallDisappeared('send-keys'), ['ad-unreachable'], AD_ERROR_CLASS_UNCLASSIFIED],
   ]
-  const UNCLASSIFIED_SEND_KEYS_ERRORS: ReadonlyArray<readonly [string, () => Error, readonly OutageClass[]]> = [
-    ['ErrInternal (UNCLASSIFIED)', () => errInternal(`the store could not be read (${sentinelInMessage('send-keys-internal')})`), []],
-    ['a name CSCB gives no handling (UNCLASSIFIED)', () => errGeneric('send-keys', 'ErrSendKeysBroken', `the keystrokes broke (${sentinelInMessage('send-keys-generic')})`), []],
-    ['ErrSystemInstallDisappeared (UNCLASSIFIED)', () => errSystemInstallDisappeared('send-keys'), ['ad-unreachable']],
-  ]
-  /** Where the keystrokes meet the error: the label, the refusal line's call, the harness options and the send-keys made. */
-  const SEND_KEYS_POSITIONS = [
-    ['at the first try', 'send-keys', (err: Error) => ({ sendKeysThrows: err }), 1],
-    ['at the retry after ErrTmuxSendKeys', 'retry send-keys after ErrTmuxSendKeys', (err: Error) => ({ sendKeysErrors: [errTmuxSendKeys(), err] }), 2],
-  ] as const
-  test.each([CONFIG_SEND_KEYS_ERROR, ...UNCLASSIFIED_SEND_KEYS_ERRORS].flatMap(([label, build, flags]) =>
-    SEND_KEYS_POSITIONS.map(([where, what, sendKeys, sends]) => [label, where, flags, what, sendKeys, sends, build] as const),
-  ))("b.jg5 SRJ-105, SRJ-316, SRJ-313: send-keys answers %s %s → 'transient', never 'escalate-dead'; no sweep, kill or launch, no spawn-failure notice; one described refusal line; outage flags exactly %j; nothing leaks", async (_label, _where, flags, what, sendKeys, sends, build) => {
+  test.each(TRANSIENT_SEND_KEYS_ERRORS)("b.jg5 SRJ-105, SRJ-118: send-keys answers %s → 'transient', never 'escalate-dead'; one send-keys, no sweep, kill or launch, no spawn-failure notice, no tmux call; one described line; outage flags exactly %j; nothing leaks", async (_label, build, flags, errorClass) => {
     const err = build()
 
-    const { result, errArgs, raised, sendKeysCalls, findMissingCalls, killCalls, spawnCalls, resumeCalls } = await reconnectCapturing({
-      statusState: 'waiting',
-      ...sendKeys(err),
-    })
+    const { result, errArgs, raised, sendKeysCalls, findMissingCalls, killCalls, spawnCalls, resumeCalls, ...h } = await reconnectCapturing({ sendKeysThrows: err })
 
     expect(result).toBe('transient')
-    expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(Array(sends).fill(personaInstanceId('C1')))
+    expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
     expect(findMissingCalls).toHaveLength(0)
     expect([killCalls, spawnCalls, resumeCalls]).toEqual([[], [], []])
     expect(raised).toEqual([])
+    expectNoTmuxCall(h)
     expect([...getOutageFlags('C1')]).toEqual([...flags])
     const lines = stringLines(errArgs)
-    expect(lines.filter((l) => l.includes(' refused for persona=C1'))).toEqual([sendKeysRefusedLine(what, err)])
+    expect(lines.filter((l) => l.startsWith('[slack] reconnectMcp:'))).toEqual([sendKeysTransientLine(err, errorClass)])
     expect(lines.filter((l) => l.startsWith('[slack] escalate-dead'))).toEqual([])
-    expect(lines.filter((l) => l.includes(' failed for persona=C1'))).toEqual([])
     assertNoLeak({ errArgs })
-  })
-
-  // A class that is no refusal still raises the spawn-failure notice: an
-  // UNUSABLE NAME `ErrInternal` (its own handling, SRJ-105) answers
-  // 'transient' with one notice and no refusal line (the contrast that shows
-  // the notice spy above is live).
-  test("SRJ-105 contrast: send-keys answering an UNUSABLE NAME ErrInternal (no refusal) → 'transient' with one spawn-failure notice and no refusal line", async () => {
-    const { result, errArgs, raised, findMissingCalls } = await reconnectCapturing({ statusState: 'waiting', sendKeysThrows: errUnusableName() })
-
-    expect(result).toBe('transient')
-    expect(findMissingCalls).toHaveLength(0)
-    expect(raised).toEqual(['C1'])
-    const lines = stringLines(errArgs)
-    expect(lines.filter((l) => l.includes(' refused for '))).toEqual([])
-    expect(lines.filter((l) => l.startsWith('[slack] reconnectMcp: send-keys failed for persona=C1: '))).toHaveLength(1)
   })
 
   // b.dup: agent-director refuses send-keys to an `ended` or `missing` row
   // with ErrSpawnNotInteractive. A findMissing sweep can mark the row missing
   // after the adapter read it (here `waiting`, or `missing` when the sweep
   // landed between the liveness probe and the adapter's status read) and
-  // before its keystrokes land. The claude process is gone: reconnectMcp
-  // answers 'dead-session', so the adapter escalates, and the restart run's
-  // re-probe relaunches the persona (restart.test.ts, b.dup). Before the fix:
-  // 'transient' and a spawn-failure notice.
+  // before its keystrokes land. The reconnect answers 'dead-session' (cause
+  // `row-not-interactive`), so the adapter sweeps and escalates with
+  // `RECONNECT_ESCALATE_DEAD_NO_KILL`: a route into the restart run's
+  // decision only, whose `dead` re-probe relaunches the persona with no kill
+  // (restart.test.ts, b.dup; b.jg5 SRJ-609). Before the fix: 'transient' and
+  // a spawn-failure notice.
   // b.jdc (b.dup review): the escalate-dead line says why. Here the tmux
   // session may well be alive: agent-director refused the keystrokes because
   // the row is not interactive, so the line must not claim the tmux session is
   // provably dead (REPRO for the wording: the old line always did).
-  test.each(['waiting', 'missing'])("REPRO (b.dup): the row reads %s and the reconnect's keystrokes are refused (ErrSpawnNotInteractive) → 'escalate-dead' with one sweep and one send-keys (no tmux-server retry); no spawn-failure notice; the escalate-dead line says the row is not interactive", async (state) => {
-    const raised: string[] = []
-    setSessionNotifier((key) => { raised.push(key) })
-    const lines: string[] = []
-    const orig = console.error
-    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
-    try {
-      const { adapter, sendKeysCalls, findMissingCalls } = makeHarness({ statusState: state, sendKeysThrows: errSpawnNotInteractive('send-keys') })
+  test.each(['waiting', 'missing'])("REPRO (b.dup): the row reads %s and the reconnect's keystrokes are refused (ErrSpawnNotInteractive) → the no-kill escalate-dead answer with one sweep and one send-keys (no second try, no tmux call); no spawn-failure notice; the escalate-dead line carries the row-not-interactive verdict's text", async (state) => {
+    const h = await reconnectCapturing({ statusState: state, sendKeysThrows: errSpawnNotInteractive('send-keys') })
 
-      const result = await adapter('C1')
-
-      expect(result).toBe('escalate-dead')
-      expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
-      expect(findMissingCalls).toHaveLength(1)
-      expect(raised).toEqual([])
-      expect(lines.filter((l) => l.startsWith('[slack] escalate-dead: persona='))).toEqual([escalateDeadLine('row-not-interactive')])
-    } finally {
-      console.error = orig
-      setSessionNotifier(undefined)
-    }
+    expect(h.result).toBe(RECONNECT_ESCALATE_DEAD_NO_KILL)
+    expect(h.sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
+    expect(h.findMissingCalls).toHaveLength(1)
+    expect(h.raised).toEqual([])
+    expectNoTmuxCall(h)
+    const lines = escalateDeadLines(stringLines(h.errArgs))
+    expect(lines).toEqual([escalateDeadLine('row-not-interactive')])
+    expect(lines[0]).toContain(ESCALATE_DEAD_EVIDENCE['row-not-interactive'])
+    assertNoLeak({ errArgs: h.errArgs })
   })
 
   // b.dup: a `pending` row's session has not started (SessionStart has not
@@ -2302,6 +2275,10 @@ describe('_buildReconnectSessionAdapter', () => {
   //     other UNCLASSIFIED.
   //   - A persona latched elsewhere while the `read-pane` is awaited gets no
   //     not-connected notice (b.jg5 SRJ-502).
+  //   - b.jg5 SRJ-118, SRJ-501, SRJ-512: on a `waiting` row whose pane is
+  //     idle, the reconnect's one `send-keys` answering CONFLICT (the case
+  //     table's reconnect rows for `waiting`) or UNUSABLE NAME latches P with
+  //     the state `waiting` and posts once; the next attempt types nothing.
   // No case makes a tmux call; every line, notice and latch line is
   // leak-checked.
   describe('b.jg5 SRJ-117, SRJ-603, SRJ-604: a working or waiting row\'s one read-pane, one case per cell', () => {
@@ -2680,6 +2657,54 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(raised).toEqual([])
     })
 
+    // ---- the reconnect's send-keys on a waiting row (b.jg5 SRJ-118, SRJ-501, SRJ-512) ----
+
+    /** The reconnect's latch line for C1 (`build` given the latch's outcome text), matched whole around that text. */
+    const reconnectLatchLines = (lines: readonly string[], build: (outcome: string) => string): string[] => {
+      const [head, tail] = build('\u0000').split('\u0000') as [string, string]
+      return lines.filter((l) => l.startsWith(head) && l.endsWith(tail))
+    }
+
+    /** [name, answer, the record C1 is latched with, the notice its latch posts, the reconnect's line builder] for each latching `send-keys` answer on a `waiting` row. */
+    const RECONNECT_LATCH_CELLS: ReadonlyArray<readonly [string, () => Error, ConflictLatchRecord, string, (outcome: string) => string]> = [
+      ...reconnectConflictRowsAt('waiting').map((row) => [
+        `CONFLICT at ${row.name}`,
+        row.build,
+        conflictRecord(row),
+        row.notice.text,
+        (outcome: string) => reconnectConflictLine('persona=C1', describeAgentDirectorFailure(row.build()), row.latchCase, outcome),
+      ] as const),
+      ...reconnectUnusableNameRowsAt('waiting').map((row) => [
+        `UNUSABLE NAME at ${row.name}`,
+        row.build,
+        row.record('C1'),
+        row.notice('C1'),
+        (outcome: string) => reconnectUnusableNameLine('persona=C1', describeAgentDirectorFailure(row.build()), outcome),
+      ] as const),
+    ]
+
+    test.each(RECONNECT_LATCH_CELLS)("a waiting row with an idle pane, the reconnect's send-keys answering %s, inside C1's recovery attempt → 'transient' after exactly one send-keys: C1 latched once with the state waiting and its one notice posted; nothing counted, swept or armed, no spawn-failure notice; one reconnect line; no tmux call; the next attempt types nothing", async (_name, build, record, notice, lineOf) => {
+      const h = cellHarness('waiting', { pane: IDLE_PANE, sendKeysThrows: build() })
+
+      const { verdict, lines } = await attempt(h, true)
+
+      expect(verdict).toBe('transient')
+      expect(callOrder).toEqual(['status', 'readPane', 'sendKeys'])
+      expectLatchedOnceAt(record, notice)
+      expect(h.findMissingCalls).toEqual([])
+      expectNoTmuxCall(h)
+      expect(raised).toEqual([])
+      expect(reconnectLatchLines(lines, lineOf)).toHaveLength(1)
+
+      // The refused send-keys is never retried: the next attempt for C1 types nothing and posts nothing more.
+      const next = await attempt(h, true)
+      expect(next.verdict).toBe('transient')
+      expect(h.sendKeysCalls).toHaveLength(1)
+      expect(posts).toHaveLength(1)
+      expect(raised).toEqual([])
+      expectNoTmuxCall(h)
+    })
+
     // ---- latched while the read-pane is awaited (b.jg5 SRJ-502) ----------
 
     /** Latch C1 through the latch's set entry while the next pane read is awaited (it then answers as scripted). */
@@ -3027,11 +3052,13 @@ describe('_buildReconnectSessionAdapter', () => {
       paneReads: number
       sendKeys: number
       raised: string[]
+      /** The escalate-dead answer of the swept attempt when the sweep is not refused (default 'escalate-dead'). */
+      escalated?: string
     }
 
     const SWEEP_SITES: ReadonlyArray<readonly [string, SweepSite]> = [
-      ['dead-session (ErrTmuxSendKeys twice)', { opts: () => ({ statusState: 'waiting', sendKeysThrows: errTmuxSendKeys() }), minutes: [0], prefix: 'escalate-dead', tmuxProbes: 0, paneReads: 1, sendKeys: 2, raised: [] }],
-      ['row-not-interactive (ErrSpawnNotInteractive)', { opts: () => ({ statusState: 'waiting', sendKeysThrows: errSpawnNotInteractive('send-keys') }), minutes: [0], prefix: 'escalate-dead', tmuxProbes: 0, paneReads: 1, sendKeys: 1, raised: [] }],
+      ['dead-session (one ErrTmuxSendKeys)', { opts: () => ({ statusState: 'waiting', sendKeysThrows: errTmuxSendKeys() }), minutes: [0], prefix: 'escalate-dead', tmuxProbes: 0, paneReads: 1, sendKeys: 1, raised: [] }],
+      ['row-not-interactive (ErrSpawnNotInteractive)', { opts: () => ({ statusState: 'waiting', sendKeysThrows: errSpawnNotInteractive('send-keys') }), minutes: [0], prefix: 'escalate-dead', tmuxProbes: 0, paneReads: 1, sendKeys: 1, raised: [], escalated: RECONNECT_ESCALATE_DEAD_NO_KILL }],
       ['working-tmux-gone (read-pane GONE)', { opts: () => ({ statusState: 'working', paneError: paneGone() }), minutes: [0], prefix: 'escalate-dead', tmuxProbes: 0, paneReads: 1, sendKeys: 0, raised: [] }],
       ['waiting-row-pane-gone (read-pane GONE)', { opts: () => ({ statusState: 'waiting', paneError: paneGone() }), minutes: [0], prefix: 'escalate-dead', tmuxProbes: 0, paneReads: 1, sendKeys: 0, raised: [] }],
       ['row-absent-at-pane-read (a working row, ErrSpawnNotFound)', { opts: () => ({ statusState: 'working', paneError: errSpawnNotFound() }), minutes: [0], prefix: 'escalate-dead', tmuxProbes: 0, paneReads: 1, sendKeys: 0, raised: [] }],
@@ -3102,11 +3129,11 @@ describe('_buildReconnectSessionAdapter', () => {
       await expectRefused(site, errInternal(`the store could not be read (${sentinelInMessage('sweep-internal')})`), false)
     })
 
-    test.each(SWEEP_SITES)("contrast: the sweep at %s failing with an UNUSABLE NAME ErrInternal (no refusal) → 'escalate-dead' at the swept attempt, one 'proceeding' line and no refusal line", async (_label, site) => {
+    test.each(SWEEP_SITES)("contrast: the sweep at %s failing with an UNUSABLE NAME ErrInternal (no refusal) → an escalate-dead answer at the swept attempt, one 'proceeding' line and no refusal line", async (_label, site) => {
       const err = errUnusableName()
       const r = await sweepFailing(site, err)
 
-      expect(r.verdicts).toEqual([...site.minutes.slice(0, -1).map(() => 'transient'), 'escalate-dead'])
+      expect(r.verdicts).toEqual([...site.minutes.slice(0, -1).map(() => 'transient'), site.escalated ?? 'escalate-dead'])
       expect(r.findMissingCalls).toHaveLength(1)
       expect([r.killCalls, r.spawnCalls, r.resumeCalls]).toEqual([[], [], []])
       expect(r.lines.filter((l) => l.includes('findMissing sweep refused'))).toEqual([])
@@ -3536,7 +3563,6 @@ describe('b.jg5 SRJ-115, SRJ-512, SRJ-513: a latching own-row status at the live
     resetClientForTests()
     _resetOutageState()
     _resetTmuxSessionProber()
-    _resetTmuxServerEnsurer()
     _resetFindMissingMemo()
     _resetNotConnectedEpisodes()
     rmSync(dir, { recursive: true, force: true })
@@ -3568,7 +3594,6 @@ describe('b.jg5 SRJ-115, SRJ-512, SRJ-513: a latching own-row status at the live
     setClientForTests(stub as unknown as Client)
     // Never reached for C1; C2's waiting row types through the stub alone.
     _setTmuxSessionProber(async () => true)
-    _setTmuxServerEnsurer(async () => {})
     return log
   }
 

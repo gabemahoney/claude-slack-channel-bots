@@ -38,7 +38,7 @@
  *      `ErrInternal` other than an unusable recorded name, a store-open
  *      name, `ErrSystemInstallDisappeared`, any name CSCB gives no handling,
  *      and a resume's `ErrInvalidFlags` after its re-check) outcome at any
- *      spawn, resume, kill, delete or reconnect keystroke, or a read error (an
+ *      spawn, resume, kill or delete, or a read error (an
  *      ENVIRONMENT, CONFIG or UNCLASSIFIED answer included) at the collision
  *      `get`. It is logged once and stops the ladder with `failed`: no
  *      notice, no `spawn-failed` entry, no `dead-session` verdict, and no
@@ -46,7 +46,12 @@
  *      reported to the persona's unclassified-error episode
  *      (`src/persona-episodes.ts`). A `status` error in the working-row wait
  *      is no refusal: the wait goes on, or at its timeout ends
- *      `not-reconnected` (b.jg5 SRJ-605, `waitForWaitingAndReconnect`).
+ *      `not-reconnected` (b.jg5 SRJ-605, `waitForWaitingAndReconnect`). The
+ *      reconnect keystroke is one `send-keys`, never retried, decided by
+ *      b.jg5 SRJ-118's reconnect row (`reconnectMcpWithCause`): it never
+ *      raises a spawn-failure notice, and its `transient` answer ends the
+ *      ladder `latched` for a latched persona and otherwise `failed` with the
+ *      refusal marker, uncounted.
  *   4. A CONFLICT (`ErrTmuxSessionConflict`, b.jg5 SRJ-105, SRJ-501) at any
  *      spawn or resume the ladder makes (the first spawn, its self-heal
  *      spawn, the retry spawn after the collision `get` found no row, the
@@ -204,12 +209,10 @@ import {
   ErrNoSessionId,
   ErrSpawnNotFound,
   ErrSpawnNotResumable,
-  ErrTmuxSendKeys,
   ErrTmuxSessionCreate,
   ErrCwdNotFound,
   ErrCwdNotADirectory,
   ErrSpawnCapReached,
-  ErrSpawnNotInteractive,
   ERR_SPAWN_NOT_FOUND_NAME,
   ERR_SPAWN_NOT_INTERACTIVE_NAME,
 } from './agent-director-errors.ts'
@@ -227,6 +230,7 @@ import {
   type AdVerb,
   classifyAdError,
   classifyWithInvalidFlagsRecheck,
+  conflictDescriptionOf,
   describeAdErrorClassification,
   describeAgentDirectorFailure,
   hasAdErrorName,
@@ -260,6 +264,7 @@ import {
   CONFLICT_LATCH_SET_RELATCHED,
   CONFLICT_LATCH_SET_SAME_CASE,
   LATCH_CASE_LAUNCH_START_NOT_RECORDED,
+  LATCH_CASE_NOT_THIS_LAUNCH,
   LATCH_ROW_STATE_NO_ROW,
   LATCH_ROW_STATE_UNREADABLE,
   REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
@@ -269,8 +274,10 @@ import {
   isUnusableNameError,
   latchRowStateRead,
   launchStartNotRecordedSetInput,
+  recogniseConflictCase,
   unusableNameSetInput,
   type ConflictLatch,
+  type ConflictLatchCase,
   type ConflictLatchRecord,
   type ConflictLatchSetEvent,
   type ConflictLatchSetOutcome,
@@ -1785,8 +1792,8 @@ export interface TmuxRunResult {
 
 /**
  * Runs `tmux <args>` and never rejects. Every raw tmux call in the server goes
- * through this one runner (the server start, the liveness probe and the b.vub
- * orphan kill), so a unit test
+ * through this one runner (the liveness probe and the b.vub orphan kill), so
+ * a unit test
  * can see each argv and no test reaches a real tmux server.
  */
 export type TmuxCommandRunner = (args: readonly string[]) => Promise<TmuxRunResult>
@@ -1835,36 +1842,8 @@ function tmuxExactSessionTarget(sessionName: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// reconnectMcp — send `/mcp reconnect <server-name>` via library sendKeys
+// The tmux-session prober (b.jdc's prompt rows)
 // ---------------------------------------------------------------------------
-
-/**
- * Ensure a tmux server exists on the default socket. Injectable seam so unit
- * tests can assert the b.rmy self-heal path without spawning real processes.
- * Default impl runs `tmux start-server` best-effort — never throws.
- *
- * b.rmy: after a container restart, /tmp (and thus the tmux socket) is wiped
- * and nothing auto-starts tmux at boot, so every startup reconnect fails with
- * `ErrTmuxSendKeys` ("no server running"). Starting the server before a retry
- * gives the reconnect a chance to succeed instead of failing terminally.
- */
-export type TmuxServerEnsurer = () => Promise<void>
-
-const defaultEnsureTmuxServer: TmuxServerEnsurer = async (): Promise<void> => {
-  await _runTmux(['start-server']) // best-effort
-}
-
-let _ensureTmuxServer: TmuxServerEnsurer = defaultEnsureTmuxServer
-
-/** Test-only seam: override the tmux-server ensurer. */
-export function _setTmuxServerEnsurer(fn: TmuxServerEnsurer): void {
-  _ensureTmuxServer = fn
-}
-
-/** Test-only seam: restore the default tmux-server ensurer. */
-export function _resetTmuxServerEnsurer(): void {
-  _ensureTmuxServer = defaultEnsureTmuxServer
-}
 
 /**
  * Probe whether a tmux session with this exact name is alive. Injectable seam
@@ -1905,33 +1884,44 @@ export async function hasPersonaTmuxSession(key: string): Promise<boolean> {
   return _hasTmuxSession(personaTmuxSessionName(key))
 }
 
+// ---------------------------------------------------------------------------
+// reconnectMcp — send `/mcp reconnect <server-name>` via library sendKeys
+// ---------------------------------------------------------------------------
+
 /**
- * Reconnect outcome (b.3ce). `dead-session` sends the caller to the
- * resume/fresh-spawn path rather than a bare failure; that recovery's resume
- * or spawn decides what holds the persona's name (agent-director classifies
- * any leftover session, and a CONFLICT there latches the persona, b.jg5
- * SRJ-501). It is answered when:
- *   - agent-director's row says the claude process is gone: it reads `ended`
- *     or `missing` (waitForWaitingAndReconnect's ended/missing branch and its
- *     timeout branch, after an evidence-based findMissing sweep; b.ecw), or
- *     agent-director refused reconnectMcp's keystrokes because it had ended
- *     the row or marked it missing since the caller read its state
- *     (`ErrSpawnNotInteractive`; b.dup);
- *   - the row is absent: the wait's `status` answered `ErrSpawnNotFound`, at
- *     the poll or the timeout (b.jg5 SRJ-605), with no tmux probe;
- *   - reconnectMcp's keystrokes failed twice with `ErrTmuxSendKeys` (b.3ce).
- * A verdict from a row read is not dead evidence (b.jg5 SRJ-611). A `status`
- * error other than `ErrSpawnNotFound` never gives `dead-session`.
+ * The reconnect's outcome (`reconnectMcpWithCause`, b.jg5 SRJ-118's
+ * reconnect row, SRJ-609):
+ *   - `ok`: `/mcp reconnect` was typed;
+ *   - `dead-session`: the caller recovers the persona (the ladder through its
+ *     find-missing run and resume/fresh-spawn, the restart adapter by
+ *     sweeping and escalating it). Its cause (`DeadSessionCause`) says what
+ *     agent-director answered. `waitForWaitingAndReconnect` also answers it
+ *     for a row it read `ended` or `missing`, or found absent
+ *     (`ErrSpawnNotFound`), with no tmux probe (b.ecw, b.jg5 SRJ-605). A
+ *     `dead-session` from a row read or from a refusal as not interactive
+ *     proves nothing about the worker's process (b.jg5 SRJ-609, SRJ-611); the
+ *     recovery's resume or spawn decides what holds the persona's name
+ *     (agent-director classifies any leftover session, and a CONFLICT there
+ *     latches the persona, SRJ-501);
+ *   - `transient`: nothing was typed and nothing is concluded about the
+ *     session: the persona latched at the reconnect (CONFLICT, UNUSABLE
+ *     NAME) or was latched already, or agent-director could not act on the
+ *     keystrokes (UNAVAILABLE, timeouts included, ENVIRONMENT, CONFIG,
+ *     UNCLASSIFIED). It is never counted toward the restart cap, never a
+ *     spawn-failure notice and never a `spawn-failed` entry: the ladder maps
+ *     it to `latched` for a latched persona and otherwise to its uncounted
+ *     refused result, and the restart adapter to `transient`.
  */
-export type ReconnectOutcome = 'ok' | 'failed' | 'dead-session'
+export type ReconnectOutcome = 'ok' | 'dead-session' | 'transient'
 
 /**
  * `waitForWaitingAndReconnect`'s outcome (b.f2b): a reconnect outcome (`ok`
  * only when `/mcp reconnect` was typed; `dead-session` as `ReconnectOutcome`
- * says, never for a `status` error other than `ErrSpawnNotFound`; `failed`
- * only for a refused findMissing sweep, a failed or refused reconnect, or a
- * server stop decided at the evidence read's version re-check, never for a
- * `status` error, b.jg5 SRJ-605); `not-reconnected`: the wait ended with the
+ * says, never for a `status` error other than `ErrSpawnNotFound`;
+ * `transient` for the wait's reconnect's own `transient`, for a refused
+ * findMissing sweep, and for a server stop decided at the evidence read's
+ * version re-check, never for a `status` error, b.jg5 SRJ-605: nothing was
+ * typed and nothing is counted); `not-reconnected`: the wait ended with the
  * persona's session alive, or its state unknown, but typed nothing (the row
  * moved to a live transient state, the timeout found it still live, or the
  * timeout `status` read failed), and has logged what happens next for the
@@ -1950,144 +1940,314 @@ export type WaitReconnectOutcome = ReconnectOutcome | 'not-reconnected' | 'cance
 /** The wait's outcome for a persona that is latched (`WaitReconnectOutcome`). */
 export const WAIT_OUTCOME_LATCHED = 'latched'
 
+/** `DeadSessionCause`: the reconnect's `send-keys` answered GONE (`ErrTmuxSendKeys`). */
+export const DEAD_SESSION_CAUSE_TMUX_GONE = 'tmux-gone'
+
+/** `DeadSessionCause`: agent-director refused the keystrokes as not interactive (`ErrSpawnNotInteractive`). */
+export const DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE = 'row-not-interactive'
+
+/** `DeadSessionCause`: no row has the persona's instance id (`ErrSpawnNotFound`), a row read. */
+export const DEAD_SESSION_CAUSE_ROW_ABSENT = 'row-absent'
+
 /**
- * Send `/mcp reconnect <MCP_SERVER_NAME>` to the spawn's pane. Library's
- * sendKeys appends Enter automatically per its contract.
- *
- * b.rmy self-heal: on `ErrTmuxSendKeys` (no tmux server / session — the
- * post-reboot field failure), ensure a tmux server exists and retry the
- * send-keys ONCE.
- *
- * b.3ce: if the retry ALSO fails with `ErrTmuxSendKeys`, the session is gone
- * for good (post-reboot /tmp wipe) — no amount of send-keys can revive it.
- * Return 'dead-session' so spawnForPersona can fall through to resume/fresh-spawn.
- *
- * b.dup: agent-director refuses send-keys to a row that is not interactive
- * with `ErrSpawnNotInteractive` (an `ended` or `missing` row; a `pending` one
- * too, without allow_pending, but no caller passes one: the restart path's
- * adapter defers a `pending` row). Every caller read the row `waiting` (or a
- * stale `working`) just before, so the row was ended or marked missing in
- * between: SessionEnd fired, or a findMissing sweep (another persona's launch
- * wait starts with one, b.m4r) found the claude process gone. That process is
- * gone, so this returns 'dead-session' too, on the first attempt or on the
- * `ErrTmuxSendKeys` retry, with one log line and no spawn-failure notice: the
- * caller recovers the persona (the ladder through resume/fresh-spawn, the
- * restart adapter by escalating it for a relaunch in the same run).
- *
- * b.jg5 SRJ-105, SRJ-311, SRJ-313, SRJ-316: an UNAVAILABLE, ENVIRONMENT
- * (`ErrTmuxNotAvailable`), CONFIG (`ErrConfigMalformed`) or UNCLASSIFIED
- * (`ErrSystemInstallDisappeared` included) answer to the keystrokes, at the first attempt or the `ErrTmuxSendKeys` retry, is a
- * refusal (`refusalAt`): one log line, no
- * spawn-failure notice, no further try, and 'failed' (never 'dead-session');
- * `reconnectMcpWithCause` marks it `refused`, so the ladder records no
- * `spawn-failed` entry for it.
+ * What agent-director answered when `reconnectMcpWithCause` answered
+ * `dead-session` (b.jdc; b.jg5 SRJ-118, SRJ-609):
+ *   - `tmux-gone`: the `send-keys` answered GONE (`ErrTmuxSendKeys`):
+ *     agent-director found no session of the row's launch. Answered at once,
+ *     with no tmux server start and no second try;
+ *   - `row-not-interactive`: agent-director refused the keystrokes as not
+ *     interactive (`ErrSpawnNotInteractive`, b.dup): the row finished
+ *     (`ended` or `missing`) after the caller read it, or it reads `pending`
+ *     and the session holding the persona's name may be another launch's
+ *     (b.jg5 SRJ-613). A finished row is not proof that the worker is gone,
+ *     so this is only a route into the restart path's decision: the restart
+ *     adapter answers `RECONNECT_ESCALATE_DEAD_NO_KILL`, and the restart work
+ *     kills nothing because of it (SRJ-609);
+ *   - `row-absent`: no row has the persona's instance id (`ErrSpawnNotFound`):
+ *     a row read, not a GONE.
+ */
+export type DeadSessionCause =
+  | typeof DEAD_SESSION_CAUSE_TMUX_GONE
+  | typeof DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE
+  | typeof DEAD_SESSION_CAUSE_ROW_ABSENT
+
+/** `reconnectMcpWithCause`'s answer: the outcome, with what goes with it. */
+export interface ReconnectResult {
+  outcome: ReconnectOutcome
+  /** Set on a `dead-session` outcome only: what agent-director answered. */
+  deadCause?: DeadSessionCause
+  /**
+   * Set on a `transient` outcome only: the persona is latched (the
+   * reconnect's CONFLICT or UNUSABLE NAME answer latched it, or it was
+   * latched already and no `send-keys` was made), so the ladder answers
+   * `latched` for it.
+   */
+  latched?: true
+  /**
+   * Set on a `transient` outcome only: the keystrokes answered
+   * `ErrInvalidFlags` and the immediate version re-check decided that the
+   * server stops (b.jg5 SRJ-104, SRJ-205); the ladder answers a `failed`
+   * result marked `stopping`.
+   */
+  stopping?: true
+}
+
+/**
+ * Send `/mcp reconnect <MCP_SERVER_NAME>` to persona `key`'s row and answer
+ * its outcome alone (`reconnectMcpWithCause`). `lastRead` is the row state
+ * the caller last read (b.jg5 SRJ-501), `waiting` when not given: every
+ * reconnect is made on a row read `waiting`, or a stale `working` row.
  *
  * @param key  Persona key: addresses `cscb_<key>` and keys outage flags and notices.
+ * @param lastRead  The row state the caller last read, for a latch the reconnect sets.
  * @param ref  Log reference; defaults to the key alone.
  */
 export async function reconnectMcp(
   key: string,
+  lastRead: LatchRowState = latchRowStateRead('waiting'),
   ref: string = keyRef(key),
 ): Promise<ReconnectOutcome> {
-  return (await reconnectMcpWithCause(key, ref)).outcome
+  return (await reconnectMcpWithCause(key, lastRead, ref)).outcome
 }
 
 /**
- * What proved a session dead when `reconnectMcp` answered `dead-session`
- * (b.jdc): `tmux-gone`, both keystrokes failed with `ErrTmuxSendKeys`, so its
- * tmux session is gone (b.3ce); `row-not-interactive`, agent-director refused
- * them with `ErrSpawnNotInteractive` because it ended the row or marked it
- * missing (b.dup), whatever became of its tmux session.
- */
-export type DeadSessionCause = 'tmux-gone' | 'row-not-interactive'
-
-/** `reconnectMcp`'s outcome, with what proved the session dead for `dead-session` (b.jdc). */
-export interface ReconnectResult {
-  outcome: ReconnectOutcome
-  deadCause?: DeadSessionCause
-  /**
-   * Set on a `failed` outcome only: the keystrokes met a refusal (b.jg5
-   * SRJ-105, SRJ-311, SRJ-313, SRJ-316, `refusalAt`: UNAVAILABLE, ENVIRONMENT, CONFIG or UNCLASSIFIED), at the first try or the
-   * `ErrTmuxSendKeys` retry. No spawn-failure notice was raised, and the
-   * ladder records no `spawn-failed` entry for it.
-   */
-  refused?: true
-}
-
-/**
- * `reconnectMcp`, also saying what proved the session dead (b.jdc): the
- * restart path's reconnect adapter words its escalate-dead line by it
- * (`sweepDeadTmuxChannel`). Same calls, lines and notices as `reconnectMcp`.
+ * Send `/mcp reconnect <MCP_SERVER_NAME>` to persona `key`'s row: exactly one
+ * `sendKeys` through `withOutageDetection`, declaring the `send-keys` verb
+ * (tmux-touching), with the library appending Enter. It never retries, never
+ * starts a tmux server and makes no tmux call of its own (b.jg5 SRJ-609, HO
+ * C20). Each answer is decided by class and name through
+ * `src/ad-error-class.ts`, never by `instanceof` (b.jg5 SRJ-118's reconnect
+ * row):
+ *
+ *   - a persona already latched (`personaLatchedNow`, b.jg5 SRJ-502): no
+ *     `send-keys`; `transient` (latched);
+ *   - success: `ok`;
+ *   - GONE (`ErrTmuxSendKeys`): `dead-session` with cause `tmux-gone`, at once;
+ *   - `ErrSpawnNotInteractive`: `dead-session` with cause
+ *     `row-not-interactive`, a route into the restart path's decision only;
+ *     it claims nothing about the worker's process;
+ *   - `ErrSpawnNotFound`: `dead-session` with cause `row-absent` (a row read,
+ *     not a GONE);
+ *   - CONFLICT: the persona latches through the latch's CONFLICT entry
+ *     (`setFromConflict`) with the refused operation "P's next check or
+ *     recovery" and `lastRead` (b.jg5 SRJ-501); `transient` (latched). On a
+ *     live row that is not `pending`, "not this launch's session" means a
+ *     leftover of an earlier launch holds the persona's session (SRJ-613),
+ *     and its line says so. The refused `send-keys` is never retried
+ *     (SRJ-505);
+ *   - UNUSABLE NAME: the persona latches through the unusable-name entry
+ *     (`latchOnUnusableName`: refused operation "none", `lastRead`, b.jg5
+ *     SRJ-512); `transient` (latched);
+ *   - `ErrInvalidFlags`, to which `send-keys` gives no meaning: one immediate
+ *     version re-check, then UNCLASSIFIED (b.jg5 SRJ-104, SRJ-204):
+ *     `transient`, carrying `stopping` when the re-check decided the stop;
+ *   - UNAVAILABLE (timeouts included), ENVIRONMENT, CONFIG and UNCLASSIFIED
+ *     (`ErrSendKeysWhileRelayed` and `ErrSystemInstallDisappeared`
+ *     included), and any STATE, LAUNCH FAILURE or DIRECTORY name SRJ-118
+ *     gives no column: `transient`. The wrapper has already done what their
+ *     class asks (b.jg5 SRJ-105, SRJ-301, SRJ-311, SRJ-313, SRJ-316): it
+ *     raised the `tmux-unavailable`, `ad-config-malformed` or
+ *     `ad-unreachable` outage, armed the persona's retry timer inside an
+ *     attempt and reported an UNCLASSIFIED answer to the persona's
+ *     unclassified-error episode; a CONFIG answer is otherwise taken as the
+ *     UNAVAILABLE column.
+ *
+ * No path posts a spawn-failure notice, records a `spawn-failed` entry or
+ * counts anything. Nothing is typed on any path but success. One line per
+ * call, from an exported builder (`reconnectStartLine`, then one of
+ * `reconnectLatchedLine`, `reconnectGoneLine`, `reconnectNotInteractiveLine`,
+ * `reconnectRowAbsentLine`, `reconnectConflictLine`,
+ * `reconnectUnusableNameLine`, `reconnectInvalidFlagsLine` and
+ * `reconnectTransientLine` for a failure). Never throws.
+ *
+ * @param key  Persona key: addresses `cscb_<key>` and keys outage flags and notices.
+ * @param lastRead  The row state the caller last read (b.jg5 SRJ-501): the
+ *   ladder's `waiting` branch `waiting`; the launch wait `waiting`, or
+ *   `working` for a stale `working` row; the restart adapter the state its
+ *   `status` read gave.
+ * @param ref  Log reference; defaults to the key alone.
  */
 export async function reconnectMcpWithCause(
   key: string,
+  lastRead: LatchRowState,
   ref: string = keyRef(key),
 ): Promise<ReconnectResult> {
-  const claude_instance_id = personaInstanceId(key)
-  console.error(`[slack] reconnecting MCP server "${MCP_SERVER_NAME}": ${ref}`)
-  const sendReconnect = (): Promise<unknown> =>
-    withOutageDetection(key, undefined, 'send-keys', (client) => client.sendKeys({
-      claude_instance_id,
-      text: `/mcp reconnect ${MCP_SERVER_NAME}`,
-    }))
+  if (personaLatchedNow(key)) {
+    console.error(reconnectLatchedLine(ref))
+    return { outcome: 'transient', latched: true }
+  }
+  console.error(reconnectStartLine(ref))
   try {
-    await sendReconnect()
+    await withOutageDetection(key, undefined, 'send-keys', (client) =>
+      client.sendKeys({
+        claude_instance_id: personaInstanceId(key),
+        text: `/mcp reconnect ${MCP_SERVER_NAME}`,
+      }),
+    )
     return { outcome: 'ok' }
   } catch (err) {
-    if (err instanceof ErrSpawnNotInteractive) return reconnectRefusedDeadSession(err, ref)
-    if (err instanceof ErrTmuxSendKeys) {
-      console.error(
-        `[slack] reconnectMcp: ErrTmuxSendKeys for ${ref} — ensuring tmux server exists and retrying send-keys once`,
-      )
-      await _ensureTmuxServer()
-      try {
-        await sendReconnect()
-        console.error(`[slack] reconnectMcp: retry succeeded after ErrTmuxSendKeys for ${ref}`)
-        return { outcome: 'ok' }
-      } catch (err2) {
-        if (err2 instanceof ErrSpawnNotInteractive) return reconnectRefusedDeadSession(err2, ref)
-        // b.jg5 SRJ-105, SRJ-311, SRJ-313, SRJ-316: an UNAVAILABLE,
-        // ENVIRONMENT, CONFIG or UNCLASSIFIED retry (`ErrSystemInstallDisappeared`
-        // included) is a refusal: no notice, never 'dead-session'.
-        if (refusalAt(key, err2, 'send-keys', 'reconnectMcp', 'retry send-keys after ErrTmuxSendKeys', ref)) {
-          return { outcome: 'failed', refused: true }
-        }
-        const e2 = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('send-keys', 'UnknownError', String(err2))
-        console.error(`[slack] reconnectMcp: retry after ErrTmuxSendKeys failed for ${ref}: ${describeAgentDirectorFailure(e2)}`)
-        if (err2 instanceof ErrTmuxSendKeys) {
-          // b.3ce: the session is provably gone — signal the caller to recover
-          // via resume/fresh-spawn instead of posting a terminal failure.
-          return { outcome: 'dead-session', deadCause: 'tmux-gone' }
-        }
-        notifySpawnFailure(key, e2)
-        return { outcome: 'failed' }
-      }
-    }
-    // b.jg5 SRJ-105, SRJ-311, SRJ-313, SRJ-316: an UNAVAILABLE, ENVIRONMENT,
-    // CONFIG or UNCLASSIFIED `send-keys` (`ErrSystemInstallDisappeared`
-    // included) is a refusal: no notice, never 'dead-session', no
-    // `spawn-failed` entry.
-    if (refusalAt(key, err, 'send-keys', 'reconnectMcp', 'send-keys', ref)) return { outcome: 'failed', refused: true }
-    const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('send-keys', 'UnknownError', String(err))
-    console.error(`[slack] reconnectMcp: send-keys failed for ${ref}: ${describeAgentDirectorFailure(e)}`)
-    notifySpawnFailure(key, e)
-    return { outcome: 'failed' }
+    return reconnectAnswerTo(key, lastRead, ref, err)
   }
 }
 
 /**
- * b.dup: reconnectMcp's verdict when agent-director refused its keystrokes
- * with `ErrSpawnNotInteractive`: the row was ended or marked missing after the
- * caller read its state, so the claude process is gone. Logs one line (the
- * error's name and redacted description) and returns 'dead-session' with the
- * cause `row-not-interactive`; raises no notice, since the caller recovers
- * the persona.
+ * `reconnectMcpWithCause`'s answer to a refused `send-keys` (`err`), by
+ * class and name (b.jg5 SRJ-118's reconnect row; see `reconnectMcpWithCause`
+ * for the table). Logs its one line. Never throws.
  */
-function reconnectRefusedDeadSession(err: ErrSpawnNotInteractive, ref: string): ReconnectResult {
-  console.error(
-    `[slack] reconnectMcp: send-keys refused for ${ref}: ${describeAgentDirectorFailure(err)} — agent-director ended its row or marked it missing after its state was read (SessionEnd or a findMissing sweep), so its claude process is gone — dead session (b.dup)`,
-  )
-  return { outcome: 'dead-session', deadCause: 'row-not-interactive' }
+async function reconnectAnswerTo(key: string, lastRead: LatchRowState, ref: string, err: unknown): Promise<ReconnectResult> {
+  if (isInvalidFlagsError(err)) return reconnectInvalidFlagsAnswer(key, ref, err)
+  const { errorClass } = classifyAdError(err)
+  const failure = describeAgentDirectorFailure(err)
+  if (errorClass === AD_ERROR_CLASS_GONE) {
+    console.error(reconnectGoneLine(ref, failure))
+    return { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_TMUX_GONE }
+  }
+  if (hasAdErrorName(err, ERR_SPAWN_NOT_INTERACTIVE_NAME)) {
+    console.error(reconnectNotInteractiveLine(ref, failure))
+    return { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE }
+  }
+  if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) {
+    console.error(reconnectRowAbsentLine(ref, failure))
+    return { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_ABSENT }
+  }
+  if (errorClass === AD_ERROR_CLASS_CONFLICT) {
+    // The latch is set first; its line then carries what became of it. The
+    // line's builder takes only the redacted description, the case and the
+    // latch's own outcome text.
+    logReconnectLine(
+      reconnectConflictLine(
+        ref,
+        failure,
+        recogniseConflictCase(conflictDescriptionOf(err)),
+        latchOnConflict(key, err, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, lastRead),
+      ),
+    )
+    return { outcome: 'transient', latched: true }
+  }
+  if (errorClass === AD_ERROR_CLASS_UNUSABLE_NAME) {
+    logReconnectLine(reconnectUnusableNameLine(ref, failure, latchOnUnusableName(key, err, lastRead)))
+    return { outcome: 'transient', latched: true }
+  }
+  console.error(reconnectTransientLine(ref, failure, errorClass))
+  return { outcome: 'transient' }
+}
+
+/**
+ * `reconnectMcpWithCause`'s answer to an `ErrInvalidFlags` (b.jg5 SRJ-104:
+ * `send-keys` gives it no meaning): exactly one immediate version re-check
+ * (`classifyWithInvalidFlagsRecheck`, b.jg5 SRJ-204; a stop it decides ends
+ * the process as the re-check defines), then UNCLASSIFIED: `transient`,
+ * carrying `stopping` when the re-check decided the stop (b.jg5 SRJ-205), in
+ * which case nothing is reported. Otherwise the answer takes SRJ-105's
+ * UNCLASSIFIED row through the outage state's site entry
+ * (`reportUnclassifiedAtSite`), since the wrapper took the value as STATE.
+ * One line (`reconnectInvalidFlagsLine`). Never throws.
+ */
+async function reconnectInvalidFlagsAnswer(key: string, ref: string, err: InvalidFlagsError): Promise<ReconnectResult> {
+  const step = await classifyWithInvalidFlagsRecheck(err)
+  const stopping = step.recheck.kind === RECHECK_OUTCOME_STOP
+  if (!stopping) reportUnclassifiedAtSite(key, err, 'send-keys', step.classification)
+  console.error(reconnectInvalidFlagsLine(ref, describeAdErrorClassification(step.classification), step.recheck.kind))
+  return stopping ? { outcome: 'transient', stopping: true } : { outcome: 'transient' }
+}
+
+/**
+ * One reconnect line to the server log; `line` comes from one of the
+ * reconnect's exported builders. The two latching lines go through it, as
+ * `logApproverLine` and `logPaneReadLatch` do, because their arguments hand
+ * the thrown value to the latch call, which a direct log call may not.
+ */
+function logReconnectLine(line: string): void {
+  console.error(line)
+}
+
+/** The reconnect's first line, before its one `send-keys` (`reconnectMcpWithCause`). */
+export function reconnectStartLine(ref: string): string {
+  return `[slack] reconnecting MCP server "${MCP_SERVER_NAME}": ${ref}`
+}
+
+/** The reconnect's line for a persona already latched: no `send-keys` is made (b.jg5 SRJ-502). */
+export function reconnectLatchedLine(ref: string): string {
+  return `[slack] reconnectMcp: ${ref} is latched — no send-keys; transient, nothing typed (b.jg5 SRJ-118, SRJ-502)`
+}
+
+/**
+ * The reconnect's line for a GONE answer (`ErrTmuxSendKeys`; `failure` is the
+ * redacting describer's output): `dead-session` with cause `tmux-gone`, at
+ * once, with no tmux server start and no second try (b.jg5 SRJ-118, SRJ-609).
+ */
+export function reconnectGoneLine(ref: string, failure: string): string {
+  return `[slack] reconnectMcp: send-keys answered GONE for ${ref}: ${failure} — agent-director found no session of the row's launch; dead session (${DEAD_SESSION_CAUSE_TMUX_GONE}), with no tmux server start and no second try (b.jg5 SRJ-118, SRJ-609)`
+}
+
+/**
+ * The reconnect's line for `ErrSpawnNotInteractive` (`failure` is the
+ * redacting describer's output): `dead-session` with cause
+ * `row-not-interactive`, a route into the restart path's decision only. It
+ * claims nothing about the worker's process (b.jg5 SRJ-609).
+ */
+export function reconnectNotInteractiveLine(ref: string, failure: string): string {
+  return `[slack] reconnectMcp: send-keys refused for ${ref}: ${failure} — agent-director refused the keystrokes as not interactive (the row finished after it was read, or a pending row's session may be another launch's), which does not prove the worker gone; dead session (${DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE}), a route into the restart path's decision only (b.jg5 SRJ-118, SRJ-609)`
+}
+
+/**
+ * The reconnect's line for `ErrSpawnNotFound` (`failure` is the redacting
+ * describer's output): `dead-session` with cause `row-absent`, a row read and
+ * not a GONE (b.jg5 SRJ-118).
+ */
+export function reconnectRowAbsentLine(ref: string, failure: string): string {
+  return `[slack] reconnectMcp: send-keys found no row for ${ref}: ${failure} — no row has the persona's instance id (a row read, not a GONE); dead session (${DEAD_SESSION_CAUSE_ROW_ABSENT}) (b.jg5 SRJ-118)`
+}
+
+/**
+ * What `reconnectConflictLine` adds for the CONFLICT case "not this launch's
+ * session": on a live row that is not `pending`, a leftover of an earlier
+ * launch holds the persona's session (b.jg5 SRJ-118, SRJ-613).
+ */
+export const RECONNECT_NOT_THIS_LAUNCH_NOTE = "a leftover of an earlier launch may hold the persona's session (b.jg5 SRJ-613)"
+
+/**
+ * The reconnect's line for a CONFLICT answer (`failure` is the redacting
+ * describer's output, `latchCase` the case its description's words give,
+ * `outcome` what became of the latch): nothing was typed, the persona
+ * latched, and the refused `send-keys` is never retried (b.jg5 SRJ-118,
+ * SRJ-501, SRJ-505). The case "not this launch's session" also carries
+ * `RECONNECT_NOT_THIS_LAUNCH_NOTE`.
+ */
+export function reconnectConflictLine(ref: string, failure: string, latchCase: ConflictLatchCase, outcome: string): string {
+  const note = latchCase === LATCH_CASE_NOT_THIS_LAUNCH ? ` (${RECONNECT_NOT_THIS_LAUNCH_NOTE})` : ''
+  return `[slack] reconnectMcp: send-keys refused for ${ref}: ${failure} — CONFLICT case=${latchCase}${note}: ${outcome}; nothing was typed and the send-keys is not retried; transient (b.jg5 SRJ-118, SRJ-501)`
+}
+
+/**
+ * The reconnect's line for an UNUSABLE NAME answer (`failure` is the
+ * redacting describer's output, `outcome` what became of the latch): nothing
+ * was typed and the persona latched (b.jg5 SRJ-118, SRJ-512).
+ */
+export function reconnectUnusableNameLine(ref: string, failure: string, outcome: string): string {
+  return `[slack] reconnectMcp: send-keys refused for ${ref}: ${failure} — UNUSABLE NAME: ${outcome}; nothing was typed and the send-keys is not retried; transient (b.jg5 SRJ-118, SRJ-512)`
+}
+
+/**
+ * The reconnect's line for an `ErrInvalidFlags` answer after its one version
+ * re-check (`classification` rendered by `describeAdErrorClassification`,
+ * `recheck` the re-check's answer kind): UNCLASSIFIED, `transient`, nothing
+ * typed (b.jg5 SRJ-104, SRJ-204).
+ */
+export function reconnectInvalidFlagsLine(ref: string, classification: string, recheck: string): string {
+  return `[slack] reconnectMcp: send-keys for ${ref} answered ${classification} — UNCLASSIFIED after one immediate agent-director version re-check: ${recheck}; transient, nothing typed (b.jg5 SRJ-104, SRJ-204)`
+}
+
+/**
+ * The reconnect's line for every other refused `send-keys` (`failure` is the
+ * redacting describer's output, `errorClass` its class): UNAVAILABLE,
+ * ENVIRONMENT, CONFIG, UNCLASSIFIED, or a STATE, LAUNCH FAILURE or DIRECTORY
+ * name SRJ-118 gives no column. `transient`: nothing was typed, no
+ * spawn-failure notice, nothing counted (b.jg5 SRJ-118, SRJ-105).
+ */
+export function reconnectTransientLine(ref: string, failure: string, errorClass: AdErrorClass): string {
+  return `[slack] reconnectMcp: send-keys refused for ${ref}: ${failure} — ${errorClass}: transient; nothing was typed, no spawn-failure notice, nothing counted (b.jg5 SRJ-118, SRJ-105)`
 }
 
 // ---------------------------------------------------------------------------
@@ -4026,17 +4186,17 @@ interface WorkingRowWait {
   /** Ends the wait's current poll sleep at once (a no-op between sleeps). */
   wake: () => void
   /**
-   * b.jg5 SRJ-105: set when the wait answers 'failed' for a refusal (a
-   * refused findMissing sweep or a refused reconnect), so the ladder records
-   * no `spawn-failed` entry for it. A `status` error never ends the wait
-   * 'failed' (b.jg5 SRJ-605).
+   * b.jg5 SRJ-118: set when the wait answers 'transient' because its
+   * reconnect latched the persona (a CONFLICT or UNUSABLE NAME answer to the
+   * keystrokes) or found it latched, so the ladder answers `latched`.
    */
-  refused?: true
+  latched?: true
   /**
-   * b.jg5 SRJ-205: set when the wait answers 'failed' because its evidence
-   * read's version re-check decided that the server stops; the ladder answers
-   * a `failed` result marked `stopping`, records no `spawn-failed` entry and
-   * posts nothing.
+   * b.jg5 SRJ-205: set when the wait answers 'transient' because a version
+   * re-check decided that the server stops (its evidence read's, or its
+   * reconnect's after an `ErrInvalidFlags`); the ladder answers a `failed`
+   * result marked `stopping`, records no `spawn-failed` entry and posts
+   * nothing.
    */
   stopping?: true
   /**
@@ -5071,25 +5231,29 @@ export function escalateDeadSweepLine(key: string, verdict: EscalateDeadVerdict)
  * - from a GONE answer (`ErrTmuxSendKeys`, or `ErrTmuxCaptureFailed` at a
  *   pane read: agent-director found no session or pane of the row's launch,
  *   b.jg5 SRJ-104):
- *   - `dead-session`: `reconnectMcp`'s keystrokes answered `ErrTmuxSendKeys`
- *     at the `/mcp reconnect` and at its retry (b.3ce);
+ *   - `dead-session`: the reconnect's one `send-keys` answered
+ *     `ErrTmuxSendKeys` (cause `tmux-gone`; b.3ce, b.jg5 SRJ-609);
  *   - `working-tmux-gone`: its row reads `working` and the reconnect
  *     adapter's `read-pane` of the row answered GONE (b.d61, b.jg5 SRJ-603);
  *   - `waiting-row-pane-gone`: its row reads `waiting` and the waiting-row
  *     check's `read-pane` answered GONE (b.f2b, b.jg5 SRJ-604);
  * - from a refusal: `row-not-interactive`, agent-director refused the
- *   keystrokes with `ErrSpawnNotInteractive` (b.dup);
+ *   reconnect's keystrokes as not interactive (`ErrSpawnNotInteractive`,
+ *   b.dup): a route into the restart path's decision only, which kills
+ *   nothing because of it (b.jg5 SRJ-609);
  * - from a row read: `row-absent-at-pane-read`, the row was absent
  *   (`ErrSpawnNotFound`) at the `read-pane` of the `working`-row verdict or
  *   the waiting-row check, which takes the GONE column without being a GONE
- *   (b.jg5 SRJ-117);
+ *   (b.jg5 SRJ-117), or at the reconnect's `send-keys` (cause `row-absent`,
+ *   b.jg5 SRJ-118);
  * - from the tmux probe of a prompt row: `prompt-row-tmux-gone`, its row
  *   reads `ask_user` or `check_permission` and its tmux session was not
  *   found (b.jdc).
- * A GONE does not prove the worker's process gone (b.jg5 SRJ-613), and the
- * evidence texts (`ESCALATE_DEAD_EVIDENCE`) of the GONE, absent-row and
- * prompt-row-probe verdicts say only what was observed. Each verdict records
- * its origin as one of the labels above, apart from its evidence text.
+ * Neither a GONE (b.jg5 SRJ-613) nor a refusal as not interactive nor a row
+ * read proves the worker's process gone, and every evidence text
+ * (`ESCALATE_DEAD_EVIDENCE`) says only what was observed. Each verdict
+ * records its origin as one of the labels above, apart from its evidence
+ * text.
  */
 export type EscalateDeadVerdict =
   | 'dead-session'
@@ -5102,31 +5266,56 @@ export type EscalateDeadVerdict =
 /** The escalate-dead verdict of a `waiting` row whose `read-pane` answered GONE (b.jg5 SRJ-604). */
 export const ESCALATE_DEAD_WAITING_ROW_PANE_GONE = 'waiting-row-pane-gone' satisfies EscalateDeadVerdict
 
-/** The escalate-dead verdict of a row found absent (`ErrSpawnNotFound`) at a pane read (b.jg5 SRJ-117). */
+/**
+ * The escalate-dead verdict of a row found absent (`ErrSpawnNotFound`) at a
+ * pane read (b.jg5 SRJ-117) or at the reconnect's `send-keys` (cause
+ * `row-absent`, b.jg5 SRJ-118).
+ */
 export const ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ = 'row-absent-at-pane-read' satisfies EscalateDeadVerdict
 
 /**
  * What each escalate-dead verdict observed, for its log line
  * (`sweepDeadTmuxChannelWithCause`, b.jdc): exactly one text per verdict.
- * The texts of the GONE, absent-row and prompt-row-probe verdicts say no
- * tmux session or worker is provably dead: a GONE says that agent-director
- * found no session or pane of the row's launch, an absent row that the row
- * read found none, and the prompt-row probe that it found no tmux session.
- * The `row-not-interactive` text says the row's claude process is gone.
+ * No text says a tmux session or a worker is provably dead: a GONE says that
+ * agent-director found no session or pane of the row's launch, an absent row
+ * that the row read found none, the prompt-row probe that it found no tmux
+ * session, and `row-not-interactive` that agent-director refused the
+ * keystrokes as not interactive, which does not prove the worker gone (a
+ * finished row, or a `pending` row whose session may be another launch's,
+ * b.jg5 SRJ-609, SRJ-613).
  */
 export const ESCALATE_DEAD_EVIDENCE: Readonly<Record<EscalateDeadVerdict, string>> = Object.freeze({
   'dead-session':
-    "agent-director's send-keys answered GONE (ErrTmuxSendKeys) at the /mcp reconnect and at its retry: no session of the row's launch was found",
+    "agent-director's send-keys answered GONE (ErrTmuxSendKeys) at the /mcp reconnect: no session of the row's launch was found",
   'row-not-interactive':
-    'row not interactive (agent-director refused the /mcp reconnect keystrokes: it ended the row or marked it missing, so its claude process is gone)',
+    "row not interactive (agent-director refused the /mcp reconnect keystrokes as not interactive: the row finished, or a pending row's session may be another launch's; this does not prove the worker gone)",
   'working-tmux-gone':
     "agent-director's read-pane found no pane of the row's launch (GONE) on its working row",
   'waiting-row-pane-gone':
     "agent-director's read-pane found no pane of the row's launch (GONE) on its waiting row",
   'row-absent-at-pane-read':
-    "its agent-director row was absent at the pane read (ErrSpawnNotFound): a row read, not a GONE",
+    "its agent-director row was absent (ErrSpawnNotFound) at the pane read or the /mcp reconnect's send-keys: a row read, not a GONE",
   'prompt-row-tmux-gone': 'its tmux session was not found by the probe of its ask_user or check_permission row',
 })
+
+/**
+ * The escalate-dead verdict the restart path's reconnect adapter sweeps with
+ * for a `dead-session` reconnect of cause `cause` (b.jg5 SRJ-118, SRJ-609):
+ * `tmux-gone` gives `dead-session`, `row-not-interactive` gives
+ * `row-not-interactive`, and `row-absent` gives `row-absent-at-pane-read`,
+ * never `tmux-gone`'s verdict. A `dead-session` with no cause (none of
+ * `reconnectMcpWithCause`'s answers) gives `dead-session`. Pure.
+ */
+export function escalateDeadVerdictOfCause(cause: DeadSessionCause | undefined): EscalateDeadVerdict {
+  switch (cause) {
+    case DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE:
+      return 'row-not-interactive'
+    case DEAD_SESSION_CAUSE_ROW_ABSENT:
+      return ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ
+    default:
+      return 'dead-session'
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Rows waiting on a prompt whose session may be gone (b.jdc)
@@ -5461,7 +5650,7 @@ async function launchOnPromptRow(
  *     `status`: one line, then 'dead-session'.
  *   - any other `status` error (UNAVAILABLE, a timeout, ENVIRONMENT, CONFIG,
  *     UNCLASSIFIED, `ErrSystemInstallDisappeared` included; b.jg5 SRJ-605):
- *     never 'dead-session', 'failed' or a refusal. At the poll the wait goes
+ *     never 'dead-session', 'transient' or a refusal. At the poll the wait goes
  *     on to its next poll with no post, logging its first failed read and
  *     again only when the class changes; at the timeout it ends
  *     'not-reconnected' through `reportWaitEndedDisconnected`. The wrapper
@@ -5487,12 +5676,19 @@ async function launchOnPromptRow(
  *     UNCLASSIFIED) is no evidence and the wait goes on.
  *   - an UNCLASSIFIED at the evidence read's pane read carrying the stop mark
  *     (`stopping`: the shared reader's `ErrInvalidFlags` re-check decided
- *     that the server stops, b.jg5 SRJ-205): one line, then 'failed' with the
- *     stop noted on the wait, no further call and nothing typed; the ladder
- *     answers a `failed` result marked `stopping`, as for a resume's re-check
- *     stop.
+ *     that the server stops, b.jg5 SRJ-205): one line, then 'transient' with
+ *     the stop noted on the wait, no further call and nothing typed; the
+ *     ladder answers a `failed` result marked `stopping`, as for a resume's
+ *     re-check stop.
  *   - a refused findMissing sweep (b.jg5 SRJ-105), up front or at the
- *     timeout: its refusal line, then 'failed' with no status read.
+ *     timeout: its refusal line, then 'transient' with no status read.
+ *   - the reconnect (`reconnectMcpWithCause`, made on a row read `waiting`,
+ *     at the poll or the timeout, or on a stale `working` row, with that row
+ *     state as its last read): its outcome is the wait's, unchanged (b.jg5
+ *     SRJ-118). A `transient` reconnect that latched the persona, or found it
+ *     latched, is noted on the wait so the ladder answers `latched`; one
+ *     whose `ErrInvalidFlags` re-check decided the stop is noted as a stop.
+ *     It is never retried.
  */
 export async function waitForWaitingAndReconnect(
   key: string,
@@ -5503,48 +5699,54 @@ export async function waitForWaitingAndReconnect(
 }
 
 /**
- * `waitForWaitingAndReconnect`, also saying whether a `failed` outcome was a
- * refusal (b.jg5 SRJ-105: a refused findMissing sweep or a refused
- * reconnect; the ladder records no `spawn-failed` entry for it) or a stop
- * (`stopping`, b.jg5 SRJ-205: the evidence read's version re-check decided
- * that the server stops). `lastRead` is the row state the wait's last read
- * gave (b.jg5 SRJ-501), absent when none answered.
+ * `waitForWaitingAndReconnect`, also saying, for a `transient` outcome,
+ * whether the persona is latched (`latched`: the wait's reconnect latched it
+ * or found it latched, b.jg5 SRJ-118) or the server stops (`stopping`, b.jg5
+ * SRJ-205: a version re-check, the evidence read's or the reconnect's,
+ * decided it). `lastRead` is the row state the wait's last read gave (b.jg5
+ * SRJ-501), absent when none answered.
  */
 async function waitForWaitingAndReconnectWithCause(
   key: string,
   config: PersonaConfig,
   ref: string,
-): Promise<{ outcome: WaitReconnectOutcome; refused?: true; stopping?: true; lastRead?: LatchRowState }> {
+): Promise<{ outcome: WaitReconnectOutcome; latched?: true; stopping?: true; lastRead?: LatchRowState }> {
   const wait: WorkingRowWait = { cancelled: cancelledLaunchWaits.has(key), wake: () => {} }
   workingRowWaits.set(key, wait)
   try {
     const outcome = await waitForWorkingRow(key, config, ref, wait)
     const lastRead = wait.lastRead === undefined ? {} : { lastRead: wait.lastRead }
-    if (outcome !== 'failed') return { outcome, ...lastRead }
+    if (outcome !== 'transient') return { outcome, ...lastRead }
     if (wait.stopping) return { outcome, stopping: true, ...lastRead }
-    return wait.refused ? { outcome, refused: true, ...lastRead } : { outcome, ...lastRead }
+    return wait.latched ? { outcome, latched: true, ...lastRead } : { outcome, ...lastRead }
   } finally {
     if (workingRowWaits.get(key) === wait) workingRowWaits.delete(key)
   }
 }
 
-/** The wait's reconnect: `reconnectMcp`, noting a refused one on `wait` (b.jg5 SRJ-105). */
-async function reconnectInWait(key: string, ref: string, wait: WorkingRowWait): Promise<ReconnectOutcome> {
-  const result = await reconnectMcpWithCause(key, ref)
-  if (result.refused) wait.refused = true
+/**
+ * The wait's reconnect (b.jg5 SRJ-118): `reconnectMcpWithCause` with
+ * `lastRead`, the row state the wait read just before (`waiting`, or
+ * `working` for a stale row), answering its outcome unchanged and noting on
+ * `wait` a `transient` one's latch or stop.
+ */
+async function reconnectInWait(key: string, ref: string, wait: WorkingRowWait, lastRead: LatchRowState): Promise<ReconnectOutcome> {
+  const result = await reconnectMcpWithCause(key, lastRead, ref)
+  if (result.latched) wait.latched = true
+  if (result.stopping) wait.stopping = true
   return result.outcome
 }
 
 /**
  * The wait's answer after a refused findMissing sweep (b.jg5 SRJ-105), which
  * logged its own refusal line: 'cancelled' for a wait its teardown cancelled
- * meanwhile, otherwise 'failed' with the refusal noted on `wait`. No status
- * read, reconnect or 'dead-session' verdict follows.
+ * meanwhile (or 'latched' for a persona latched meanwhile), otherwise
+ * 'transient': nothing typed, nothing counted. No status read, reconnect or
+ * 'dead-session' verdict follows.
  */
 function refusedWaitSweep(key: string, ref: string, wait: WorkingRowWait): WaitReconnectOutcome {
   if (waitMustEnd(key, wait)) return endWait(ref, wait)
-  wait.refused = true
-  return 'failed'
+  return 'transient'
 }
 
 /** `waitForWaitingAndReconnect`'s body, with its cancellable `wait` (b.f2b). */
@@ -5583,7 +5785,7 @@ async function waitForWorkingRow(
   // resumeOrFreshSpawn's reconcileMissingFirst branch. On a findMissing
   // error, log and fall through to the existing poll loop (today's
   // behavior), except a refused sweep (b.jg5 SRJ-105): nothing more is
-  // called, and the wait answers 'failed' with the refusal noted.
+  // called, and the wait answers 'transient'.
   if (waitMustEnd(key, wait)) return endWait(ref, wait)
   const upFrontSweep = await reconcileMissingSweep(key, 'waitForWaitingAndReconnect', ref)
   if (upFrontSweep === FIND_MISSING_REFUSED) return refusedWaitSweep(key, ref, wait)
@@ -5636,7 +5838,7 @@ async function waitForWorkingRow(
     if (state !== 'working') endWorkingRowDeferral(key)
 
     if (state === 'waiting') {
-      return reconnectInWait(key, ref, wait)
+      return reconnectInWait(key, ref, wait, latchRowStateRead(state))
     }
 
     if (state === 'working') {
@@ -5650,14 +5852,14 @@ async function waitForWorkingRow(
       // b.jg5 SRJ-205: the pane read's version re-check decided the stop.
       if (stale === WORKING_EVIDENCE_STOPPING) {
         wait.stopping = true
-        return 'failed'
+        return 'transient'
       }
       // b.jg5 SRJ-502: E14's after-call check — a latch set elsewhere, or a
       // cancel, ends the wait.
       if (waitMustEnd(key, wait)) return endWait(ref, wait)
       if (stale) {
         endWorkingRowDeferral(key)
-        return reconnectInWait(key, ref, wait)
+        return reconnectInWait(key, ref, wait, latchRowStateRead(state))
       }
       // b.f2b: held back again; a run that has lasted
       // UNPROVEN_IDLE_NOTICE_AFTER_MS raises the unproven-idle notice.
@@ -5697,11 +5899,11 @@ async function waitForWorkingRow(
   //   probe, as at the poll; the recovery's spawn classifies any leftover
   //   session (b.jg5 SRJ-605).
   // - any other status error → 'not-reconnected' through
-  //   reportWaitEndedDisconnected, never 'dead-session' or 'failed' (b.jg5
+  //   reportWaitEndedDisconnected, never 'dead-session' or 'transient' (b.jg5
   //   SRJ-605); an UNUSABLE NAME answer, or the row reading `pending` with
   //   no launch start, latches the persona and ends the wait 'latched'
   //   (b.jg5 SRJ-512, SRJ-513).
-  // - a refused sweep → 'failed' with no status read (b.jg5 SRJ-105).
+  // - a refused sweep → 'transient' with no status read (b.jg5 SRJ-105).
   if (waitMustEnd(key, wait)) return endWait(ref, wait)
   const timeoutSweep = await reconcileMissingSweep(key, 'waitForWaitingAndReconnect: timeout', ref)
   if (timeoutSweep === FIND_MISSING_REFUSED) return refusedWaitSweep(key, ref, wait)
@@ -5733,7 +5935,7 @@ async function waitForWorkingRow(
     }
     // b.jg5 SRJ-605: any other `status` error (`ErrSystemInstallDisappeared`
     // included) ends the wait 'not-reconnected', never 'dead-session' or
-    // 'failed'; the wrapper has raised its outage and armed the retry timer.
+    // 'transient'; the wrapper has raised its outage and armed the retry timer.
     const err = timeoutRead.error
     return reportWaitEndedDisconnected(
       key,
@@ -5753,7 +5955,7 @@ async function waitForWorkingRow(
     return 'dead-session'
   }
   // b.f2b: the row settled at the deadline — reconnect, as the loop would have.
-  if (timeoutState === 'waiting') return reconnectInWait(key, ref, wait)
+  if (timeoutState === 'waiting') return reconnectInWait(key, ref, wait, latchRowStateRead(timeoutState))
   // b.f2b: a `working` row given up on is one more deferral: a run that has
   // lasted UNPROVEN_IDLE_NOTICE_AFTER_MS raises the unproven-idle notice, at
   // any restart delay.
@@ -5828,7 +6030,9 @@ export interface SpawnPersonaResult {
   /**
    * The refusal marker, set on a `failed` result only: the launch attempt's
    * last agent-director error armed the persona's UNAVAILABLE retry timer
-   * (b.jg5 SRJ-301), which now owns the persona. `launchSession` answers
+   * (b.jg5 SRJ-301), which now owns the persona; or the ladder's reconnect,
+   * or its launch wait, was `transient` for a persona that is not latched
+   * (b.jg5 SRJ-118, `transientReconnectResult`). `launchSession` answers
    * `'refused'` for it, which the restart path never counts (SRJ-302).
    */
   refused?: true
@@ -7433,13 +7637,19 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *    - ended/missing + resume_enabled → resume; on ErrNoSessionId/
  *      ErrJsonlMissing/ErrJsonlNeverWritten → delete + fresh spawn.
  *    - ended/missing + !resume_enabled → kill + delete + fresh spawn.
- *    - waiting → reconnectMcp; 'dead-session' → resume/fresh-spawn (b.3ce;
- *      b.dup: a row ended or marked missing before the keystrokes landed).
- *    - working → waitForWaitingAndReconnect; 'dead-session' → resume/fresh-spawn (b.3ce);
- *      'not-reconnected' or 'cancelled' (its teardown cancelled the wait) →
- *      `not-reconnected` (b.f2b: nothing was typed; `reconnected` only when
- *      `/mcp reconnect` was). `hooks.onWorkingRowWait` is called as the wait
- *      starts (b.f2b).
+ *    - waiting → the reconnect (`reconnectMcpWithCause`, one `send-keys`,
+ *      b.jg5 SRJ-118); 'dead-session', whatever its cause → the find-missing
+ *      run, then resume/fresh-spawn (b.3ce), whose resume or spawn decides
+ *      what holds the persona's name; 'transient' → `latched` for a latched
+ *      persona, otherwise the uncounted refused result (`failed` with the
+ *      refusal marker): no spawn-failure notice, no `spawn-failed` entry,
+ *      nothing counted.
+ *    - working → waitForWaitingAndReconnect; its outcome is mapped as the
+ *      `waiting` branch maps the reconnect's ('dead-session' and
+ *      'transient'); 'not-reconnected' or 'cancelled' (its teardown cancelled
+ *      the wait) → `not-reconnected` (b.f2b: nothing was typed;
+ *      `reconnected` only when `/mcp reconnect` was). `hooks.onWorkingRowWait`
+ *      is called as the wait starts (b.f2b).
  *    - check_permission/ask_user → never typed into; the persona's tmux
  *      session is probed first (b.jdc, `launchOnPromptRow`): alive → no-op;
  *      gone → findMissing sweep and a re-read, and a row now `ended` or
@@ -7543,6 +7753,52 @@ export async function spawnForPersona(
 function markRefusal(result: SpawnPersonaResult, attempt: AttemptView): SpawnPersonaResult {
   if (result.action !== 'failed' || result.refused || attempt.lastError?.armed !== true) return result
   return { ...result, refused: true }
+}
+
+/** What the ladder answered for a `transient` reconnect (`transientReconnectResult`). */
+export type TransientReconnectAnswer = 'latched' | 'refused' | 'stopping'
+
+/**
+ * The ladder's one line for a `transient` reconnect at its `waiting` or
+ * `working` branch (`state`), with what it answered (b.jg5 SRJ-118, SRJ-609).
+ */
+export function transientReconnectLine(ref: string, state: string, answer: TransientReconnectAnswer): string {
+  const what =
+    answer === 'latched'
+      ? 'the persona is latched — answering latched'
+      : answer === 'stopping'
+        ? 'a version re-check decided that the server stops — answering failed, marked stopping'
+        : 'answering the uncounted refused result'
+  return `[slack] spawnForPersona: the reconnect for ${ref} (state=${state}) was transient: nothing was typed; ${what}; no spawn-failure notice, no spawn-failed entry, nothing counted (b.jg5 SRJ-118)`
+}
+
+/**
+ * The ladder's result for a `transient` reconnect at its `waiting` or
+ * `working` branch (b.jg5 SRJ-118, SRJ-609): a `failed` result marked
+ * `stopping` when a version re-check decided the stop (b.jg5 SRJ-205);
+ * `latched` when the reconnect latched the persona or found it latched, or
+ * the latched query (`personaLatchedNow`, b.jg5 SRJ-502) answers it latched;
+ * otherwise the uncounted refused result (`failed` with the refusal marker,
+ * which `launchSession` answers as `'refused'` and the restart path never
+ * counts). No spawn-failure notice, no `spawn-failed` entry, nothing counted,
+ * and nothing more is called. One line (`transientReconnectLine`).
+ */
+function transientReconnectResult(
+  key: string,
+  ref: string,
+  state: string,
+  transient: { latched?: true; stopping?: true },
+): SpawnPersonaResult {
+  if (transient.stopping) {
+    console.error(transientReconnectLine(ref, state, 'stopping'))
+    return { key, action: 'failed', stopping: true }
+  }
+  if (transient.latched || personaLatchedNow(key)) {
+    console.error(transientReconnectLine(ref, state, 'latched'))
+    return { key, action: 'latched' }
+  }
+  console.error(transientReconnectLine(ref, state, 'refused'))
+  return { key, action: 'failed', refused: true }
 }
 
 /** A caller's view into the collision ladder one `spawnForPersona` call starts (b.f2b). */
@@ -7725,45 +7981,38 @@ async function runPersonaLadder(
   }
 
   if (state === 'waiting') {
-    // b.rmy: propagate the reconnect outcome — a failed reconnect must count
-    // as `failed` so startupSessionManager's ok/failed totals reflect reality.
-    // b.3ce: a 'dead-session' verdict means send-keys can never reach the
-    // spawn (tmux session wiped by a reboot while the AD row froze at
-    // `waiting`) — recover exactly like the ended/missing states instead of
-    // giving up. b.dup: so does a row agent-director ended or marked missing
-    // after the `get` above read it `waiting` (a findMissing sweep, e.g. from
-    // another persona's launch wait, landed before the keystrokes).
-    const { outcome, refused } = await reconnectMcpWithCause(key, ref)
-    if (outcome === 'dead-session') {
+    // b.jg5 SRJ-118: one `send-keys`, never retried, with the collision
+    // `get`'s `waiting` as its last read. A 'dead-session' answer, whatever
+    // its cause (a GONE `send-keys`, a refusal as not interactive, or no
+    // row), takes the find-missing run and then resume/fresh-spawn, whose
+    // resume or spawn decides what holds the persona's name (b.3ce, b.dup):
+    // none of those causes is taken as proof that the worker is gone
+    // (SRJ-609). A 'transient' answer types nothing and counts nothing.
+    const result = await reconnectMcpWithCause(key, lastRead, ref)
+    if (result.outcome === 'dead-session') {
       console.error(`[slack] spawnForPersona: dead session for ${ref} (state=waiting) — recovering via resume/fresh-spawn`)
       return resumeOrFreshSpawn(persona, params, config, isStartup, row, { reconcileMissingFirst: true, lastRead })
     }
-    if (outcome !== 'ok') {
-      console.error(`[slack] spawnForPersona: reconnect failed for ${ref}`)
-      // b.jg5 SRJ-105, SRJ-311, SRJ-313, SRJ-316: a refused reconnect
-      // (UNAVAILABLE, ENVIRONMENT, CONFIG or UNCLASSIFIED) records no
-      // `spawn-failed` entry.
-      if (isStartup && !refused) recordStartupError('spawn-failed', `reconnect failed for ${ref} (state=waiting)`)
-      return { key, action: 'failed' }
-    }
+    if (result.outcome === 'transient') return transientReconnectResult(key, ref, state, result)
     return { key, action: 'reconnected' }
   }
 
   if (state === 'working') {
-    // b.rmy/b.3ce/b.ecw: same outcome propagation and dead-session recovery as
-    // the `waiting` branch. waitForWaitingAndReconnect returns 'ok' once it
-    // typed `/mcp reconnect`; 'not-reconnected' (b.f2b) on live transient
-    // transitions, whenever the row reads live at the deadline (a long turn
-    // isn't an error), and when the timeout `status` read fails (b.jg5
-    // SRJ-605); 'dead-session' when the row reads ended or missing (or the
-    // timeout sweep + status verdict says so, b.ecw), when its reconnect was
-    // refused because the row had just been ended or marked missing (b.dup),
-    // or when the row is absent (`ErrSpawnNotFound`, b.jg5 SRJ-605): the
-    // recovery's resume or spawn then decides what holds the name.
+    // b.3ce/b.ecw, b.jg5 SRJ-118: the same mapping as the `waiting` branch.
+    // waitForWaitingAndReconnect returns 'ok' once it typed `/mcp reconnect`;
+    // 'not-reconnected' (b.f2b) on live transient transitions, whenever the
+    // row reads live at the deadline (a long turn isn't an error), and when
+    // the timeout `status` read fails (b.jg5 SRJ-605); 'dead-session' when
+    // the row reads ended or missing (or the timeout sweep + status verdict
+    // says so, b.ecw), when its reconnect answered 'dead-session' (any
+    // cause), or when the row is absent (`ErrSpawnNotFound`, b.jg5
+    // SRJ-605): the recovery's resume or spawn then decides what holds the
+    // name; 'transient' when its reconnect was 'transient' or its findMissing
+    // sweep was refused: nothing typed, nothing counted.
     // b.f2b: the wait can take up to WAIT_FOR_WAITING_TIMEOUT_MS; tell the
     // caller (the start pass lets the launch go on in the background).
     hooks?.onWorkingRowWait?.()
-    const { outcome, refused, stopping, lastRead: waitRead } = await waitForWaitingAndReconnectWithCause(key, config, ref)
+    const { outcome, latched, stopping, lastRead: waitRead } = await waitForWaitingAndReconnectWithCause(key, config, ref)
     // b.jg5 SRJ-502, SRJ-608: the persona latched during the wait (a CONFLICT
     // or UNUSABLE NAME at a read, a note its transcript `get` read, or a
     // latch set elsewhere): nothing more for it.
@@ -7782,15 +8031,10 @@ async function runPersonaLadder(
     // teardown cancelled typed nothing either, and its session is left to
     // the teardown.
     if (outcome === 'not-reconnected' || outcome === 'cancelled') return { key, action: 'not-reconnected' }
-    if (outcome !== 'ok') {
-      console.error(`[slack] spawnForPersona: reconnect failed for ${ref}`)
-      // b.jg5 SRJ-105, SRJ-311, SRJ-316: a refusal (a refused findMissing
-      // sweep, or a refused reconnect) records no `spawn-failed` entry. A
-      // `status` error in the wait never gets here: it never ends the wait
-      // 'failed' (b.jg5 SRJ-605).
-      if (isStartup && !refused) recordStartupError('spawn-failed', `reconnect failed for ${ref} (state=working)`)
-      return { key, action: 'failed' }
-    }
+    // b.jg5 SRJ-118: a 'transient' wait (its reconnect's, or a refused
+    // findMissing sweep's) types nothing and counts nothing. A `status`
+    // error in the wait never gets here (b.jg5 SRJ-605).
+    if (outcome === 'transient') return transientReconnectResult(key, ref, state, latched ? { latched } : {})
     return { key, action: 'reconnected' }
   }
 

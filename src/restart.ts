@@ -273,6 +273,9 @@ export interface RestartDeps {
    * it `live`), so nothing was typed and the reconnect is deferred, as
    * `'transient'` is; the work answers `RESTART_OUTCOME_PENDING_DEFERRED`
    * for it, so the retry timer knows the row read `pending`.
+   * 'escalate-dead' and `RECONNECT_ESCALATE_DEAD_NO_KILL` are the two
+   * escalate-dead answers; after the second a `dead` re-probe relaunches
+   * with no kill (b.jg5 SRJ-609, `ReconnectSessionResult`).
    *
    * The return type is widened from void: the server.ts adapter already
    * computes reconnectMcp's ReconnectMcpResult union internally and now
@@ -377,12 +380,14 @@ export interface RestartDeps {
    * server's slow-recovery tracker, `src/slow-recovery.ts`). It is told what
    * each run read, after the gates that follow each probe (shutdown, not up,
    * latched) have passed, so a run those gates stop tells it nothing:
-   * - after an 'escalate-dead' reconnect, the re-probe reports once: `live`
+   * - after an escalate-dead reconnect ('escalate-dead' or
+   *   `RECONNECT_ESCALATE_DEAD_NO_KILL`), the re-probe reports once: `live`
    *   → `noteLive`; `pending` → `noteOther` with
    *   `RESTART_SLOW_RECOVERY_OTHER_PENDING_REPROBE`; `dead` from a row read
    *   (`ended`, `missing`, `ErrSpawnNotFound`) → `noteDead`, and `dead` from
    *   `ErrSystemInstallDisappeared` (`isInstallGoneDeadReading`) →
-   *   `noteInstallGone`, each before the same run's kill and relaunch;
+   *   `noteInstallGone`, each before the same run's kill (none after
+   *   `RECONNECT_ESCALATE_DEAD_NO_KILL`) and relaunch;
    *   `unknown` or a thrown probe → nothing; a persona latched by that read
    *   → nothing (the latch's own end applies);
    * - at the run's first liveness probe, `dead` from a row read →
@@ -390,8 +395,8 @@ export interface RestartDeps {
    *   `noteInstallGone`;
    * - at the run's first liveness probe, `pending` → `noteOther` with
    *   `RESTART_SLOW_RECOVERY_OTHER_PENDING_PROBE`;
-   * - a run whose reconnect ends with any verdict other than 'escalate-dead'
-   *   (a success, 'transient', 'pending', no answer or a reconnect that
+   * - a run whose reconnect ends with any verdict other than an
+   *   escalate-dead one (a success, 'transient', 'pending', no answer or a reconnect that
    *   throws), and a run that finds the session already connected with its
    *   stream → `noteOther` with `RESTART_SLOW_RECOVERY_OTHER_VERDICT`;
    * - a run that stops before the reconnect for any other reason (an
@@ -435,8 +440,45 @@ export interface RestartSlowRecoveryObserver {
   noteOther(key: string, reason: SlowRecoveryOtherReason): unknown
 }
 
-/** What `RestartDeps.reconnectSession` answers; `void` is a non-success. */
-export type ReconnectSessionResult = 'success' | 'escalate-dead' | 'transient' | 'pending' | void
+/**
+ * `RestartDeps.reconnectSession`'s escalate-dead answer for a verdict that
+ * never by itself leads to a kill (b.jg5 SRJ-609): the reconnect's
+ * `send-keys` was refused as not interactive (`ErrSpawnNotInteractive`,
+ * verdict `row-not-interactive`), which does not prove the worker gone. The
+ * restart work handles it as it handles 'escalate-dead' (the latch check,
+ * the re-probe and its slow-recovery note), except that when the re-probe
+ * reads `dead` it relaunches with no kill: the ladder's collision `get`
+ * reads the row itself.
+ */
+export const RECONNECT_ESCALATE_DEAD_NO_KILL = 'escalate-dead-no-kill'
+
+/**
+ * What `RestartDeps.reconnectSession` answers; `void` is a non-success.
+ * 'escalate-dead' and `RECONNECT_ESCALATE_DEAD_NO_KILL` are both
+ * escalate-dead verdicts; only the first lets a `dead` re-probe's relaunch be
+ * preceded by a kill.
+ */
+export type ReconnectSessionResult =
+  | 'success'
+  | 'escalate-dead'
+  | typeof RECONNECT_ESCALATE_DEAD_NO_KILL
+  | 'transient'
+  | 'pending'
+  | void
+
+/** True for both escalate-dead answers of `RestartDeps.reconnectSession`. */
+function isEscalateDeadResult(result: ReconnectSessionResult): result is 'escalate-dead' | typeof RECONNECT_ESCALATE_DEAD_NO_KILL {
+  return result === 'escalate-dead' || result === RECONNECT_ESCALATE_DEAD_NO_KILL
+}
+
+/**
+ * The restart work's line when a `dead` re-probe after a
+ * `RECONNECT_ESCALATE_DEAD_NO_KILL` verdict relaunches persona `key` with no
+ * kill (b.jg5 SRJ-609).
+ */
+export function relaunchWithoutKillLine(key: string): string {
+  return `[slack] No kill before the relaunch for persona=${key} — its escalate-dead verdict came from a send-keys refused as not interactive, which never by itself leads to a kill; the relaunch's own row read decides (b.jg5 SRJ-609)`
+}
 
 /** `RestartDeps.killSession`'s report that the kill was refused (b.jg5 SRJ-105): no launch follows. */
 export const KILL_SESSION_REFUSED = 'refused'
@@ -676,7 +718,9 @@ function launchInFlight(key: string, isInFlight: (key: string) => boolean): bool
  * success or failure accounting. A reconnect whose verdict
  * is 'escalate-dead' is followed by a second liveness probe; only when the
  * row now reads `dead` does the same run go on to the kill and launch
- * (b.d61). A kill that answers `KILL_SESSION_REFUSED` (b.jg5 SRJ-105) ends
+ * (b.d61). After a `RECONNECT_ESCALATE_DEAD_NO_KILL` verdict (a `send-keys`
+ * refused as not interactive) the same holds with no kill: a `dead` re-probe
+ * leads to the launch alone (`relaunchWithoutKillLine`, b.jg5 SRJ-609). A kill that answers `KILL_SESSION_REFUSED` (b.jg5 SRJ-105) ends
  * the work with `RESTART_OUTCOME_REFUSED`: no launch, nothing counted. The restart cap is not
  * asked here (the retry entry asks it before this work). The whole work is
  * one recovery attempt for the persona (b.jg5 SRJ-301). Answers what it did (`RestartWorkOutcome`).
@@ -744,7 +788,9 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   if (probe.kind === LIVENESS_DEAD) noteDeadReading(d, key, probe)
 
   // `live` takes the reconnect path; only `dead` falls through to the kill
-  // and the launch.
+  // and the launch (the kill left out after a `RECONNECT_ESCALATE_DEAD_NO_KILL`
+  // verdict, b.jg5 SRJ-609).
+  let killBeforeLaunch = true
   if (probe.kind !== LIVENESS_DEAD) {
     // If the session already re-established its MCP connection (e.g. Claude
     // Code refreshed the SSE stream on its own), skip the reconnect. A
@@ -770,8 +816,9 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     }
 
     // b.jg5 SRJ-610: a run whose reconnect ends with any verdict other than
-    // 'escalate-dead' resets the slow-recovery count.
-    if (reconnectResult !== 'escalate-dead') tellSlowRecovery(d, key, 'noteOther', RESTART_SLOW_RECOVERY_OTHER_VERDICT)
+    // an escalate-dead one resets the slow-recovery count.
+    const escalated = isEscalateDeadResult(reconnectResult)
+    if (!escalated) tellSlowRecovery(d, key, 'noteOther', RESTART_SLOW_RECOVERY_OTHER_VERDICT)
 
     if (reconnectResult === 'success') {
       // Reconnect succeeded — reset the failure counter and cap latch.
@@ -798,9 +845,9 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     // the failure count tied to actual launch attempts, not this reconnect
     // site.
     //
-    // For the dead-tmux 'escalate-dead' verdicts ('dead-session' from
-    // reconnectMcp, and a row whose read-pane answered GONE or found the row
-    // absent) CSCB recovers itself (b.sv7 / Epic t1.tkk.e4): the reconnectSession
+    // For the escalate-dead verdicts (a `dead-session` reconnect, whatever its
+    // cause, and a row whose read-pane answered GONE or found the row absent)
+    // CSCB recovers itself (b.sv7 / Epic t1.tkk.e4): the reconnectSession
     // adapter fires the internal memoized findMissing sweep before returning,
     // which may reconcile the frozen `working` row to `missing`. It may also
     // leave the row live (in `unverified_ids`, or, when `pending`, not judged
@@ -825,9 +872,13 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     // returns with no relaunch, calls the arm hook and leaves the count as it
     // is. The external ~/startup/find-missing-loop.sh is belt-and-braces only
     // — recovery no longer depends on it, and removing it is a separate
-    // operator decision.
+    // operator decision. b.jg5 SRJ-609: a verdict from a `send-keys` refused
+    // as not interactive (`RECONNECT_ESCALATE_DEAD_NO_KILL`) never by itself
+    // leads to a kill: its `dead` re-probe relaunches with no kill, the
+    // ladder's collision `get` reading the row itself.
     if (reconnectResult === 'pending') return RESTART_OUTCOME_PENDING_DEFERRED
-    if (reconnectResult !== 'escalate-dead') return RESTART_OUTCOME_RECONNECT_DEFERRED
+    if (!escalated) return RESTART_OUTCOME_RECONNECT_DEFERRED
+    killBeforeLaunch = reconnectResult !== RECONNECT_ESCALATE_DEAD_NO_KILL
     // b.jg5 SRJ-502: the adapter's sweep may have latched the persona (a
     // post-run `get` of its own row); then no re-probe follows.
     if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
@@ -841,11 +892,17 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   // b.jg5 SRJ-502: the latch is asked once more right before the kill, so a
   // persona that latched during the 'escalate-dead' re-probe (or, with the
   // check after the reconnect, during the reconnect) is never killed.
+  // b.jg5 SRJ-609: after a `RECONNECT_ESCALATE_DEAD_NO_KILL` verdict no kill
+  // is made; the latch is still asked before the relaunch.
   if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
   let killed: KillSessionResult = undefined
-  try {
-    killed = await d.killSession(key)
-  } catch { /* ignore */ }
+  if (killBeforeLaunch) {
+    try {
+      killed = await d.killSession(key)
+    } catch { /* ignore */ }
+  } else {
+    console.error(relaunchWithoutKillLine(key))
+  }
 
   if (killed === KILL_SESSION_REFUSED) {
     // b.jg5 SRJ-105: agent-director refused the kill (UNAVAILABLE,
@@ -882,8 +939,9 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     // check above and the launch, and the launch's own gate (the same
     // relaunch gate) logged why; or the launch's version re-check decided
     // the stop, and the server is stopping. The instance was already killed
-    // by then; the failure counter, backoff and cap latch are left exactly
-    // as they were.
+    // by then, unless the escalation was `RECONNECT_ESCALATE_DEAD_NO_KILL`,
+    // which relaunches with no kill; the failure counter, backoff and cap
+    // latch are left exactly as they were.
     return RESTART_OUTCOME_LAUNCH_SKIPPED
   }
 

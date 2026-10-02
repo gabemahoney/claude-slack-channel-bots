@@ -52,14 +52,17 @@
  *     (`launchSession` false); a joiner shares the marker; a start pass with
  *     one UNAVAILABLE persona tallies as before and arms only that persona.
  *   - b.jg5 SRJ-105 (AC 25), on `makeRecoveryHarness`: every spawn, resume,
- *     replacement kill and delete, and reconnect keystroke (first try and the
- *     `ErrTmuxSendKeys` retry) of the ladder, fed `ErrUnknownErrorName`,
+ *     replacement kill and delete, and reconnect keystroke (its one
+ *     `send-keys`, at the `waiting` and `working` branches) of the ladder,
+ *     fed `ErrUnknownErrorName`,
  *     `ErrCallTimeout`, a wrapped `UnknownError`, `ErrTmuxUnresponsive` and
  *     (at kills and deletes) `ErrTmuxKillFailed`, makes no kill, delete or
  *     launch after it and no dead-session resume, posts no spawn-failure
  *     notice, records no `spawn-failed` entry, answers `{ failed, refused }`
  *     (`launchSession` `'refused'`) and is never counted; B launches as
- *     before. The read-error row: the collision `get` and the
+ *     before. At the reconnect the answer is SRJ-118's `transient` (its
+ *     own two lines, `reconnectTransientLine` and the ladder's
+ *     `transientReconnectLine`, in place of the refusal line). The read-error row: the collision `get` and the
  *     ErrJsonlMissing diagnosis `get`, fed those forms, an UNCLASSIFIED read
  *     error and a store that cannot be opened, likewise, and start no
  *     condition; `ErrSpawnNotFound` keeps each site's meaning.
@@ -291,9 +294,28 @@
  *     failure callback run once per notice, not per retry.
  *   - b.dup: a reconnect whose keystrokes agent-director refuses
  *     (ErrSpawnNotInteractive) because a findMissing sweep ended the row
- *     after it was read is a dead session, recovered through resume with no
+ *     after it was read is a dead session (cause `row-not-interactive`, which
+ *     proves nothing about the worker), recovered through resume with no
  *     `[spawn-failed]` entry or notice, at a launch's `waiting` row (the live
  *     race: another persona's wait sweeps) and in each reconnect of the wait.
+ *   - b.jg5 SRJ-118, SRJ-609 (E19 T1), on `makeRecoveryHarness`:
+ *     `reconnectMcpWithCause` makes one `send-keys` and no other call, raw
+ *     tmux included (no tmux server start, no second try), and answers by
+ *     class, one case per cell: success `ok`; GONE `dead-session`
+ *     (`tmux-gone`); `ErrSpawnNotInteractive` (each stub form)
+ *     `dead-session` (`row-not-interactive`); `ErrSpawnNotFound`
+ *     `dead-session` (`row-absent`); UNAVAILABLE, ENVIRONMENT, CONFIG and
+ *     UNCLASSIFIED (`ErrSendKeysWhileRelayed` included) `transient` with
+ *     what their class asks and no notice, `spawn-failed` entry or count;
+ *     `ErrInvalidFlags` one re-check, then `transient` (`stopping` on a
+ *     stop); CONFLICT and UNUSABLE NAME (the case table's reconnect rows)
+ *     latch P once with the caller's last read, `transient`, and a later
+ *     reconnect types nothing; a latched P gets no `send-keys`. Each line
+ *     comes from its builder. The ladder's `waiting` and `working` branches
+ *     map `ok` to `reconnected`, every `dead-session` cause to one
+ *     find-missing run and `resume`, CONFLICT to `latched` (no path launches
+ *     P again), and a re-check stop to `failed` marked `stopping`. The
+ *     `row-not-interactive` evidence text claims no dead worker.
  *   - b.jdc: a launch that meets an `ask_user` or `check_permission` row
  *     probes the persona's own tmux session exactly and, when it is gone,
  *     sweeps and resumes the persona once its row reads dead; the restart
@@ -342,6 +364,23 @@ import { join } from 'path'
 import {
   reconcileOrphans,
   reconnectMcp,
+  reconnectMcpWithCause,
+  reconnectConflictLine,
+  reconnectGoneLine,
+  reconnectInvalidFlagsLine,
+  reconnectLatchedLine,
+  reconnectNotInteractiveLine,
+  reconnectRowAbsentLine,
+  reconnectStartLine,
+  reconnectTransientLine,
+  reconnectUnusableNameLine,
+  RECONNECT_NOT_THIS_LAUNCH_NOTE,
+  DEAD_SESSION_CAUSE_ROW_ABSENT,
+  DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE,
+  DEAD_SESSION_CAUSE_TMUX_GONE,
+  escalateDeadVerdictOfCause,
+  transientReconnectLine,
+  type ReconnectResult,
   waitForWaitingAndReconnect,
   approvePreSessionDialogs,
   spawnForPersona,
@@ -376,8 +415,6 @@ import {
   type EscalateDeadVerdict,
   _setTmuxSessionKiller,
   _resetTmuxSessionKiller,
-  _setTmuxServerEnsurer,
-  _resetTmuxServerEnsurer,
   _setTmuxSessionProber,
   _resetTmuxSessionProber,
   _setTmuxCommandRunner,
@@ -587,6 +624,7 @@ import {
   errSchemaMismatch,
   errSystemInstallDisappeared,
   errUnknownErrorName,
+  errSendKeysWhileRelayed,
   holdSpawns,
   makeStubCallLog,
   makeStubClient,
@@ -668,6 +706,7 @@ import {
   AD_ERROR_CLASS_UNAVAILABLE,
   AD_ERROR_CLASS_UNCLASSIFIED,
   AD_ERROR_CLASS_UNUSABLE_NAME,
+  classifyAdError,
   describeAdErrorClassification,
   describeAgentDirectorFailure,
   type AdErrorClass,
@@ -716,10 +755,13 @@ import {
   LAUNCH_START_CASE_ROWS,
   LAUNCH_START_NON_LATCHING_ROWS,
   LIVENESS_PANE_CONFLICT_CASE_ROWS,
+  RECONNECT_CONFLICT_CASE_ROWS,
+  RECONNECT_UNUSABLE_NAME_CASE_ROWS,
   UNUSABLE_NAME_CASE_ROWS,
   expectedConflictNotice,
   expectedLatchRecord,
   livenessPaneConflictRowsAt,
+  reconnectConflictRowsAt,
   type ConflictCaseRow,
   type LaunchStartCaseRow,
   type LaunchStartCaseRowOf,
@@ -934,7 +976,6 @@ afterEach(() => {
   _resetWaitForWaitingTimeoutMs()
   _resetFindMissingMemo()
   _resetTmuxSessionKiller()
-  _resetTmuxServerEnsurer()
   _resetTmuxSessionProber()
   _resetTmuxCommandRunner()
   // An approver case runs the approver on a fake clock (`useApproverClock`).
@@ -1177,9 +1218,8 @@ async function launchThenRunApprover<T>(clock: FakeClock, key: string, launch: P
 /**
  * Record every raw tmux call from now on, in order: each command through the
  * runner seam (`_setTmuxCommandRunner`, answering as the file's failing
- * stand-in does) as its argv, and the session prober, killer and server
- * ensurer as `[<seam>, <session>]`. The file's afterEach puts every seam
- * back. The startup-dialog approver makes none of these calls.
+ * stand-in does) as its argv, and the session prober and killer as
+ * `[<seam>, <session>]`. The file's afterEach puts every seam back. The startup-dialog approver makes none of these calls.
  */
 function recordTmuxCalls(): string[][] {
   const calls: string[][] = []
@@ -1193,9 +1233,6 @@ function recordTmuxCalls(): string[][] {
   })
   _setTmuxSessionKiller(async (name) => {
     calls.push(['killer', name])
-  })
-  _setTmuxServerEnsurer(async () => {
-    calls.push(['ensurer'])
   })
   return calls
 }
@@ -2295,7 +2332,7 @@ function labelConfig(
 
 /**
  * Drive `entry` to its resume decision. `ended` / `missing` resolve straight
- * to it; `waiting` meets a dead session through persistent ErrTmuxSendKeys;
+ * to it; `waiting` meets a dead session through the reconnect's GONE (ErrTmuxSendKeys);
  * `working` through the up-front findMissing sweep reconciling the row to
  * `missing`. The resumed or fresh session reports `waiting`, so the dialog
  * approver returns at once. `key` is the persona's key (default the stand-in
@@ -2303,7 +2340,6 @@ function labelConfig(
  */
 function installResumeEntry(entry: ResumeEntry, row: CannedGetResult, calls: LadderCalls, key = 'C'): StubClient {
   const state = entry.split(' ')[0] as 'ended' | 'missing' | 'waiting' | 'working'
-  if (state === 'waiting' || state === 'working') _setTmuxServerEnsurer(async () => {})
   if (state === 'working') _setWaitForWaitingTimeoutMs(30)
   return installStub({
     ...calls,
@@ -5727,104 +5763,55 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.rmy — ErrTmuxSendKeys self-heal + accurate reconnect outcome reporting
+// b.rmy, b.3ce — ErrTmuxSendKeys at the reconnect and accurate outcome reporting
+//
+// b.jg5 SRJ-118, SRJ-609 (HO C20): the reconnect makes one `send-keys` and no
+// raw tmux call. One ErrTmuxSendKeys is `dead-session` at once, with no tmux
+// server start and no second try, and the ladder recovers the persona.
 // ---------------------------------------------------------------------------
 
-describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
-  test('reconnectMcp: ErrTmuxSendKeys → ensure tmux server + retry once → success', async () => {
+describe('b.rmy: ErrTmuxSendKeys at the reconnect + reconnect outcome', () => {
+  test('reconnectMcp: one ErrTmuxSendKeys → dead-session after one send-keys, no raw tmux call, no failure notice (HO C20 Verify; AC 77)', async () => {
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
-    let ensureCalls = 0
-    _setTmuxServerEnsurer(async () => { ensureCalls++ })
-    installStub({
-      sendKeysCalls,
-      sendKeysQueue: [
-        cannedErr<import('agent-director').SendKeysResult>(errTmuxSendKeys()),
-        cannedOk<import('agent-director').SendKeysResult>({}),
-      ],
-    })
-    const result = await reconnectMcp('C')
-    expect(result).toBe('ok')
-    expect(ensureCalls).toBe(1)
-    expect(sendKeysCalls).toHaveLength(2)
-    expect(sendKeysCalls[1].text).toContain('/mcp reconnect')
-    // Retry succeeded — no failure notice
-    expect(notices).toHaveLength(0)
-  })
-
-  test('reconnectMcp: retry after ErrTmuxSendKeys also fails → dead-session (b.3ce: caller recovers, no failure notice)', async () => {
-    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
-    let ensureCalls = 0
-    _setTmuxServerEnsurer(async () => { ensureCalls++ })
-    installStub({
-      sendKeysCalls,
-      sendKeysError: errTmuxSendKeys(), // persistent — first attempt AND retry fail
-    })
+    const tmux = recordTmuxCalls()
+    installStub({ sendKeysCalls, sendKeysError: errTmuxSendKeys() })
     const result = await reconnectMcp('C')
     expect(result).toBe('dead-session')
-    expect(ensureCalls).toBe(1) // self-heal attempted exactly once (single retry)
-    expect(sendKeysCalls).toHaveLength(2)
+    expect(sendKeysCalls.map((c) => [c.claude_instance_id, c.text])).toEqual([['cscb_C', RECONNECT_TEXT]])
+    expect(tmux).toEqual([])
     // b.3ce: dead-session hands recovery to the caller — no premature failure notice
     expect(notices).toHaveLength(0)
   })
 
-  test('reconnectMcp: non-tmux sendKeys error → no self-heal, no retry', async () => {
-    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
-    let ensureCalls = 0
-    _setTmuxServerEnsurer(async () => { ensureCalls++ })
-    installStub({
-      sendKeysCalls,
-      sendKeysError: errGeneric('send-keys', 'ErrSomethingElse'),
-    })
-    const result = await reconnectMcp('C')
-    expect(result).toBe('failed')
-    expect(ensureCalls).toBe(0)
-    expect(sendKeysCalls).toHaveLength(1)
-  })
-
-  test('spawnForPersona waiting branch: self-heal retry succeeds → reconnected', async () => {
-    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
-    _setTmuxServerEnsurer(async () => {})
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-    installStub({
-      sendKeysCalls,
-      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-      getResult: personaRow(cfg, 'C', { state: 'waiting' }),
-      sendKeysQueue: [
-        cannedErr<import('agent-director').SendKeysResult>(errTmuxSendKeys()),
-        cannedOk<import('agent-director').SendKeysResult>({}),
-      ],
-    })
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
-    expect(result.action).toBe('reconnected')
-    expect(sendKeysCalls).toHaveLength(2)
-  })
-
-  test('spawnForPersona waiting branch (b.3ce): persistent ErrTmuxSendKeys → resume recovery, not failed', async () => {
+  test('spawnForPersona waiting branch (b.3ce): ErrTmuxSendKeys → resume recovery after one send-keys, not failed', async () => {
     const readLog = captureStartupErrors()
-    _setTmuxServerEnsurer(async () => {})
     const resumeCalls: import('agent-director').ResumeParams[] = []
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
       getResult: personaRow(cfg, 'C', { state: 'waiting' }),
-      sendKeysError: errTmuxSendKeys(), // persistent — self-heal retry fails too (dead session)
+      sendKeysError: errTmuxSendKeys(),
+      sendKeysCalls,
       resumeCalls,
     })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     // b.3ce: pre-fix this reported 'failed' and gave up; now the dead session
     // falls through to the ended/missing recovery logic (resume-first).
     expect(result.action).toBe('resumed')
+    expect(sendKeysCalls).toHaveLength(1)
     expect(resumeCalls).toHaveLength(1)
     expect(readLog()).toBe('')
   })
 
   test('spawnForPersona waiting branch (b.3ce): dead session + resume not resumable → kill+delete+fresh spawn', async () => {
-    _setTmuxServerEnsurer(async () => {})
     const killCalls: import('agent-director').KillParams[] = []
     const deleteCalls: import('agent-director').DeleteParams[] = []
     const spawnCalls: import('agent-director').SpawnParams[] = []
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
+      sendKeysCalls,
       spawnCalls,
       killCalls,
       deleteCalls,
@@ -5838,6 +5825,7 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
     })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('spawned')
+    expect(sendKeysCalls).toHaveLength(1)
     expect(killCalls).toHaveLength(1)
     expect(deleteCalls).toHaveLength(1)
     expect(spawnCalls).toHaveLength(2) // initial collision + fresh spawn
@@ -5845,10 +5833,11 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
 
   test('spawnForPersona waiting branch: dead session and recovery also fails → action=failed', async () => {
     const readLog = captureStartupErrors()
-    _setTmuxServerEnsurer(async () => {})
     _setTmuxSessionKiller(async () => {})
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
+      sendKeysCalls,
       // Recovery fails too: a LAUNCH FAILURE at the resume, and at the self-heal respawn after it.
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
@@ -5860,6 +5849,7 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
     })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('failed')
+    expect(sendKeysCalls).toHaveLength(1)
     // The recovery's failure raises a spawn-failure notice and its own one
     // spawn-failed entry (the self-heal respawn's); no reconnect-failed startup entry.
     expect(notices.map((n) => n.key)).toEqual(['C'])
@@ -5869,12 +5859,13 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
 
   test('startupSessionManager: unrecoverable channels are counted (no false "0 failed")', async () => {
     captureStartupErrors() // keep startup-errors.log in a temp dir
-    _setTmuxServerEnsurer(async () => {})
-    // Both routes collide into `waiting` rows whose reconnect send-keys fails
-    // persistently — the 2026-09-18 post-reboot outage shape — AND the b.3ce
+    // Both routes collide into `waiting` rows whose reconnect send-keys
+    // answers GONE — the 2026-09-18 post-reboot outage shape — AND the b.3ce
     // resume recovery fails, so both must land in the failed bucket.
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
     const cfg = makeStandInPersonaConfig({ C1: { working_directory: '/x1' }, C2: { working_directory: '/x2' } }, fixtureDir)
     const stub = installStub({
+      sendKeysCalls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
@@ -5888,6 +5879,8 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
     expect(result.failed).toBe(2)
     expect(result.succeeded).toBe(0)
     expect(result.perPersona.every((p) => p.action === 'failed')).toBe(true)
+    // One send-keys per persona: no second try.
+    expect(sendKeysCalls.map((c) => c.claude_instance_id).sort()).toEqual(['cscb_C1', 'cscb_C2'])
   })
 })
 
@@ -6346,7 +6339,6 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
   test('spawnForPersona working branch: loop ended/missing early-abort → dead-session → resume recovery', async () => {
     captureStartupErrors() // the dialog approver records dev-channels-approve-spawn-died here
     _setWaitForWaitingTimeoutMs(30)
-    _setTmuxServerEnsurer(async () => {})
     const resumeCalls: import('agent-director').ResumeParams[] = []
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
@@ -6421,11 +6413,10 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
 // ---------------------------------------------------------------------------
 
 describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
-  // Drive the WAITING-branch dead-session verdict: reconnectMcp send-keys fails
-  // persistently even after the b.vub self-heal (tmux server ensurer no-op),
-  // which is the 'dead-session' signal for a waiting row.
+  // Drive the WAITING-branch dead-session verdict: the reconnect's one
+  // send-keys answers GONE (ErrTmuxSendKeys), which is the 'dead-session'
+  // signal for a waiting row.
   test('waiting dead-session: findMissing runs exactly once BEFORE resume → resumed', async () => {
-    _setTmuxServerEnsurer(async () => {})
     const callLog: string[] = []
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
     const resumeCalls: import('agent-director').ResumeParams[] = []
@@ -6458,7 +6449,6 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
     captureStartupErrors() // the dialog approver records dev-channels-approve-spawn-died here
     _setWaitForWaitingTimeoutMs(30)
     _setFindMissingMemoTtlMs(0)
-    _setTmuxServerEnsurer(async () => {})
     const callLog: string[] = []
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
     const resumeCalls: import('agent-director').ResumeParams[] = []
@@ -6512,7 +6502,6 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
   // UNCLASSIFIED one stops the attempt there (the SRJ-105, SRJ-311, SRJ-316 and
   // SRJ-313 sweep cases below).
   test('waiting dead-session: findMissing rejects → resume attempted → ErrSpawnNotResumable → kill+delete+fresh', async () => {
-    _setTmuxServerEnsurer(async () => {})
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
     const resumeCalls: import('agent-director').ResumeParams[] = []
     const killCalls: import('agent-director').KillParams[] = []
@@ -6546,7 +6535,6 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
   // resume_enabled=false short-circuits BEFORE the findMissing block —
   // kill+delete+fresh as before, no findMissing, no resume.
   test('resume_enabled=false dead-session: no findMissing, no resume (kill+delete+fresh)', async () => {
-    _setTmuxServerEnsurer(async () => {})
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
     const resumeCalls: import('agent-director').ResumeParams[] = []
     const killCalls: import('agent-director').KillParams[] = []
@@ -6576,7 +6564,6 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
   // the dead-session path must still trigger the orphan-tmux-kill self-heal and
   // a fresh respawn — unchanged by the findMissing insertion.
   test('waiting dead-session: findMissing then resume ErrTmuxSessionCreate → b.vub self-heal respawn → spawned', async () => {
-    _setTmuxServerEnsurer(async () => {})
     const killedSessions: string[] = []
     _setTmuxSessionKiller(async (name) => { killedSessions.push(name) })
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
@@ -6673,7 +6660,6 @@ describe('b.m4r: waitForWaitingAndReconnect up-front findMissing sweep → fast 
   // SRJ-105); a refused one stops the wait (the sweep cases below).
   test('findMissing rejects → poll loop proceeds → working→waiting → reconnect ok', async () => {
     _setWaitForWaitingTimeoutMs(60_000)
-    _setTmuxServerEnsurer(async () => {})
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
     installStub({
       findMissingCalls,
@@ -6739,7 +6725,6 @@ describe('b.m4r: waitForWaitingAndReconnect up-front findMissing sweep → fast 
   // no refusal, as in the case above, so each wait goes on as before.)
   test('memo: a failed sweep is not memoized → next caller retries', async () => {
     _setWaitForWaitingTimeoutMs(60_000)
-    _setTmuxServerEnsurer(async () => {})
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
     installStub({
       findMissingCalls,
@@ -7077,7 +7062,6 @@ describe('b.c3o: waitForWaitingAndReconnect early-abort liveness verdict', () =>
 
   test('spawnForPersona working branch: transition to missing → resume recovery instead of misreported ok', async () => {
     captureStartupErrors() // the dialog approver records dev-channels-approve-spawn-died here
-    _setTmuxServerEnsurer(async () => {})
     const resumeCalls: import('agent-director').ResumeParams[] = []
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
     installStub({
@@ -8417,9 +8401,11 @@ describe('b.f2b: the wait for a working row at a launch (waitForWaitingAndReconn
 // `missing` after its ladder read the row `waiting` and before its
 // `/mcp reconnect` keystrokes land (/ci-live run 5, Checks 24-teardown and
 // 28: `find_missing.tick cscb_persona_a waiting→missing`, then
-// `send_keys cscb_persona_a ErrSpawnNotInteractive` 11 ms later). Its claude
-// process is gone, so reconnectMcp answers 'dead-session' and the caller
-// recovers the persona. Before the fix it answered 'failed': a `[spawn-failed]`
+// `send_keys cscb_persona_a ErrSpawnNotInteractive` 11 ms later). The
+// reconnect answers 'dead-session' (cause `row-not-interactive`) and the
+// caller recovers the persona; the refusal routes it into that recovery's
+// decision and proves nothing about its worker (b.jg5 SRJ-609). Before the
+// fix it answered 'failed': a `[spawn-failed]`
 // startup error and a spawn-failure notice, and the persona stayed down until
 // the restart backoff relaunched it.
 //
@@ -8427,8 +8413,8 @@ describe('b.f2b: the wait for a working row at a launch (waitForWaitingAndReconn
 // ---------------------------------------------------------------------------
 
 describe('b.dup: a row a findMissing sweep ended just before /mcp reconnect landed (ErrSpawnNotInteractive)', () => {
-  /** What reconnectMcp logs when agent-director refuses its keystrokes for a row that is no longer interactive. */
-  const REFUSED = 'ErrSpawnNotInteractive message="spawn not interactive — not in pending/waiting state" — agent-director ended its row or marked it missing after its state was read (SessionEnd or a findMissing sweep), so its claude process is gone — dead session (b.dup)'
+  /** The reconnect's one line for persona `ref` when agent-director refuses its keystrokes as not interactive (b.jg5 SRJ-609). */
+  const refusedLine = (ref: string): string => reconnectNotInteractiveLine(ref, describeAgentDirectorFailure(errSpawnNotInteractive('send-keys')))
 
   /** Personas `A` and `B`, each launch polling every 1 ms. */
   function raceConfig(): PersonaConfig {
@@ -8503,19 +8489,18 @@ describe('b.dup: a row a findMissing sweep ended just before /mcp reconnect land
     })
 
     expect(results).toEqual([{ key: 'A', action: 'resumed' }, { key: 'B', action: 'reconnected' }])
-    // A's keystrokes were refused once, with no tmux-server retry; B's landed.
+    // A's keystrokes were refused once, with no second try; B's landed.
     expect(race.sendKeysCalls.map((c) => c.claude_instance_id).sort()).toEqual(['cscb_A', 'cscb_B'])
     expect(race.resumeCalls).toEqual([{ claude_instance_id: 'cscb_A' }])
     expect(readLog()).toBe('')
     expect(notices).toEqual([])
-    expect(linesWith(errLog, `[slack] reconnectMcp: send-keys refused for "A" (key=A): ${REFUSED}`)).toHaveLength(1)
+    expect(errLog.split('\n').filter((line) => line === refusedLine(renderPersonaRef('A', 'A')))).toHaveLength(1)
     expect(linesWith(errLog, '[slack] spawnForPersona: dead session for "A" (key=A) (state=waiting) — recovering via resume/fresh-spawn')).toHaveLength(1)
   })
 
-  test('REPRO: reconnectMcp → dead-session on ErrSpawnNotInteractive: one send-keys, no tmux-server retry, no notice, one log line', async () => {
+  test('REPRO: reconnectMcp → dead-session on ErrSpawnNotInteractive: one send-keys, no raw tmux call, no notice, one log line', async () => {
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
-    let ensureCalls = 0
-    _setTmuxServerEnsurer(async () => { ensureCalls++ })
+    const tmux = recordTmuxCalls()
     installStub({ sendKeysCalls, sendKeysError: errSpawnNotInteractive('send-keys') })
 
     let result: string | undefined
@@ -8525,33 +8510,9 @@ describe('b.dup: a row a findMissing sweep ended just before /mcp reconnect land
 
     expect(result).toBe('dead-session')
     expect(sendKeysCalls.map((c) => [c.claude_instance_id, c.text])).toEqual([['cscb_C', RECONNECT_TEXT]])
-    expect(ensureCalls).toBe(0)
+    expect(tmux).toEqual([])
     expect(notices).toEqual([])
-    expect(linesWith(errLog, `[slack] reconnectMcp: send-keys refused for persona=C: ${REFUSED}`)).toHaveLength(1)
-  })
-
-  test('REPRO: the tmux-server retry after ErrTmuxSendKeys refused with ErrSpawnNotInteractive (the row was ended meanwhile) → dead-session, no notice', async () => {
-    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
-    let ensureCalls = 0
-    _setTmuxServerEnsurer(async () => { ensureCalls++ })
-    installStub({
-      sendKeysCalls,
-      sendKeysQueue: [
-        cannedErr<import('agent-director').SendKeysResult>(errTmuxSendKeys()),
-        cannedErr<import('agent-director').SendKeysResult>(errSpawnNotInteractive('send-keys')),
-      ],
-    })
-
-    let result: string | undefined
-    const errLog = await withCapturedErr(async () => {
-      result = await reconnectMcp('C')
-    })
-
-    expect(result).toBe('dead-session')
-    expect(sendKeysCalls).toHaveLength(2)
-    expect(ensureCalls).toBe(1)
-    expect(notices).toEqual([])
-    expect(linesWith(errLog, `[slack] reconnectMcp: send-keys refused for persona=C: ${REFUSED}`)).toHaveLength(1)
+    expect(errLog.split('\n').filter((line) => line === refusedLine('persona=C'))).toHaveLength(1)
   })
 
   /**
@@ -8589,7 +8550,7 @@ describe('b.dup: a row a findMissing sweep ended just before /mcp reconnect land
     expect(result).toBe('dead-session')
     expect(row.sendKeysCalls.map((c) => c.text)).toEqual([RECONNECT_TEXT])
     expect(notices).toEqual([])
-    expect(linesWith(errLog, `[slack] reconnectMcp: send-keys refused for persona=C: ${REFUSED}`)).toHaveLength(1)
+    expect(errLog.split('\n').filter((line) => line === refusedLine('persona=C'))).toHaveLength(1)
   })
 
   test('REPRO: the ladder\'s working branch recovers the refused reconnect through resume: resumed, no [spawn-failed] entry, no notice', async () => {
@@ -9015,13 +8976,18 @@ describe('b.f2b: one persona waiting for its working row does not hold up the st
     const readLog = captureStartupErrors()
     let aState: RowReading = 'working'
     // Once A's row reads waiting, its reconnect's keystrokes answer
-    // ErrTmuxSendKeys (B spawns fresh and types nothing).
+    // ErrTmuxSendKeys (B spawns fresh and types nothing), and the dead
+    // session's recovery rejects: reading A's claude_config_dir throws from
+    // then on, so building the recovery's launch parameters fails.
     const { cfg, sendKeysCalls, ref } = parkedA(1, () => aState, { sendKeysError: errTmuxSendKeys() })
-    // An injected tmux-server ensurer may reject (the default never does):
-    // here, at A's reconnect retry after ErrTmuxSendKeys.
-    const ensureFailure = Object.assign(new Error(leakyMessage('tmux server start failed', 'parked')), { detail: LEAK_SENTINEL })
-    _setTmuxServerEnsurer(async () => {
-      throw ensureFailure
+    const launchFailure = Object.assign(new Error(leakyMessage('recovery launch failed', 'parked')), { detail: LEAK_SENTINEL })
+    const personaA = personaOf(cfg, 'A')
+    const configDirA = personaA.claude_config_dir
+    Object.defineProperty(personaA, 'claude_config_dir', {
+      get() {
+        if (aState === 'waiting') throw launchFailure
+        return configDirA
+      },
     })
     unhandledRejections = []
     process.on('unhandledRejection', recordUnhandledRejection)
@@ -9040,11 +9006,11 @@ describe('b.f2b: one persona waiting for its working row does not hold up the st
     const lines = linesWith(errLog, 'unexpected error in the background launch')
     expect(lines).toHaveLength(1)
     expect(lines[0]).toStartWith(
-      `[slack] startupSessionManager: unexpected error in the background launch for ${ref}: Error message=${JSON.stringify(redactedLeakyMessage('tmux server start failed'))}`,
+      `[slack] startupSessionManager: unexpected error in the background launch for ${ref}: Error message=${JSON.stringify(redactedLeakyMessage('recovery launch failed'))}`,
     )
     expect(linesWith(errLog, `background launch for ${ref} settled`)).toEqual([])
     const entry = onlyStartupEntry(readLog(), 'spawn-failed')
-    expect(entry).toContain(`unexpected error spawning ${ref}: Error message=${JSON.stringify(redactedLeakyMessage('tmux server start failed'))}`)
+    expect(entry).toContain(`unexpected error spawning ${ref}: Error message=${JSON.stringify(redactedLeakyMessage('recovery launch failed'))}`)
     expect(unhandledRejections).toEqual([])
     assertNoLeak({ errLog, startupErrors: writtenFile(join(fixtureDir, 'state', 'startup-errors.log')) })
   })
@@ -10166,7 +10132,6 @@ describe('b.jg5 SRJ-401: the approver runs after every launch that returns succe
       'a collision on a waiting row (reconnected)',
       {
         arrange: (cfg) => {
-          _setTmuxServerEnsurer(async () => {})
           return { opts: { spawnQueue: [collision()], getResult: personaRow(cfg, KEY, { state: 'waiting' }) } }
         },
         action: 'reconnected',
@@ -10176,7 +10141,6 @@ describe('b.jg5 SRJ-401: the approver runs after every launch that returns succe
       'a collision on a working row (the wait reads waiting and reconnects)',
       {
         arrange: (cfg) => {
-          _setTmuxServerEnsurer(async () => {})
           return { opts: { spawnQueue: [collision()], getResult: personaRow(cfg, KEY, { state: 'working' }) } }
         },
         config: { agent_director_poll_interval_ms: 1 },
@@ -10616,7 +10580,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
   test('site #1: reconnectMcp ErrSystemInstallDisappeared → ad-unreachable, no spawn-failure notice', async () => {
     installStub({ sendKeysError: new ErrSystemInstallDisappeared('send-keys', BIN) })
     const result = await reconnectMcp('C')
-    expect(result).toBe('failed')
+    expect(result).toBe('transient')
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
     expect(notices).toHaveLength(0)
   })
@@ -10624,7 +10588,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
   test('site #1b: reconnectMcp ErrTmuxNotAvailable → tmux-unavailable, no spawn-failure notice', async () => {
     installStub({ sendKeysError: new ErrTmuxNotAvailable('send-keys', 'ErrTmuxNotAvailable', 'tmux not available') })
     const result = await reconnectMcp('C')
-    expect(result).toBe('failed')
+    expect(result).toBe('transient')
     expect(getOutageFlags('C').has('tmux-unavailable')).toBe(true)
     expect(notices).toHaveLength(0)
   })
@@ -13425,6 +13389,14 @@ interface LadderSite {
   setup?(h: RecoveryHarness): void
   /** Every launch and destructive call one such launch makes, the refused one included. */
   readonly calls: LaunchVerbCalls
+  /**
+   * Set on the reconnect's sites only: the ladder branch (`waiting` or
+   * `working`) whose reconnect meets the error. The reconnect answers
+   * `transient` by SRJ-118's reconnect row, with its own lines in place of
+   * SRJ-105's refusal line (`reconnectTransientLine`, then the ladder's
+   * `transientReconnectLine`).
+   */
+  readonly reconnectBranch?: 'waiting' | 'working'
 }
 
 /** A row for `persona` in its own directory with its current labels (`cannedGetResult` in persona form), with `overrides`. */
@@ -13609,19 +13581,19 @@ const DELETE_SITES: readonly LadderSite[] = [
   },
 ]
 
-/** The reconnect's keystrokes, first try and the retry after ErrTmuxSendKeys: never 'dead-session' (no resume). */
+/**
+ * The reconnect's one `send-keys` (b.jg5 SRJ-118, SRJ-609: never retried, so
+ * there is no second site): never 'dead-session' (no resume) for these
+ * answers, but `transient`, which the ladder maps to the uncounted refused
+ * result.
+ */
 const RECONNECT_SITES: readonly LadderSite[] = [
   {
     name: 'the reconnect of a waiting row',
     verb: 'send-keys',
     script: (h, p, err) => ({ ...collided(h, p, { state: 'waiting' }), sendKeysError: err }),
     calls: ladderCallsOf({ spawn: 1, sendKeys: 1 }),
-  },
-  {
-    name: 'the reconnect retry after ErrTmuxSendKeys on a waiting row',
-    verb: 'send-keys',
-    script: (h, p, err) => ({ ...collided(h, p, { state: 'waiting' }), sendKeysQueue: [cannedErr(errTmuxSendKeys()), cannedErr(err)] }),
-    calls: ladderCallsOf({ spawn: 1, sendKeys: 2 }),
+    reconnectBranch: 'waiting',
   },
   {
     name: 'the reconnect of a working row once its wait reads it waiting',
@@ -13629,17 +13601,7 @@ const RECONNECT_SITES: readonly LadderSite[] = [
     setup: fastPolls,
     script: (h, p, err) => ({ ...collided(h, p, { state: 'working' }), statusResult: cannedStatusResult({ state: 'waiting' }), sendKeysError: err }),
     calls: ladderCallsOf({ spawn: 1, sendKeys: 1 }),
-  },
-  {
-    name: 'the reconnect retry after ErrTmuxSendKeys on a working row its wait reads waiting',
-    verb: 'send-keys',
-    setup: fastPolls,
-    script: (h, p, err) => ({
-      ...collided(h, p, { state: 'working' }),
-      statusResult: cannedStatusResult({ state: 'waiting' }),
-      sendKeysQueue: [cannedErr(errTmuxSendKeys()), cannedErr(err)],
-    }),
-    calls: ladderCallsOf({ spawn: 1, sendKeys: 2 }),
+    reconnectBranch: 'working',
   },
 ]
 
@@ -13848,7 +13810,15 @@ async function expectRefusedAt(
     expect(getOutageFlags(p).has(outageClass)).toBe(true)
   }
   expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
-  expect(refusalLines(h, p)).toHaveLength(1)
+  if (site.reconnectBranch === undefined) {
+    expect(refusalLines(h, p)).toHaveLength(1)
+  } else {
+    // b.jg5 SRJ-118: the reconnect's transient line, then the ladder's, and no refusal line.
+    const ref = renderPersonaRef(p, p)
+    expect(refusalLines(h, p)).toEqual([])
+    expect(h.errors.filter((line) => line === reconnectTransientLine(ref, describeAgentDirectorFailure(err), classifyAdError(err).errorClass))).toHaveLength(1)
+    expect(h.errors.filter((line) => line === transientReconnectLine(ref, site.reconnectBranch!, 'refused'))).toHaveLength(1)
+  }
   expect(h.triggers).toEqual([{ key: p, kind: triggerKind }])
   expect(h.controller.isArmed(p)).toBe(true)
   expect(getFailureCount(p)).toBe(0)
@@ -17094,7 +17064,7 @@ describe('b.jg5 SRJ-120, SRJ-502: a persona latched by a run\'s get stops its ca
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
 
     expect(order.slice(order.indexOf('findMissing'))).toEqual(['findMissing', 'get'])
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: 2 }))
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: 1 }))
     expect(getIds(h)).toEqual([personaInstanceId(p), personaInstanceId(p)])
     expectNoteLatchedOnce(h, p, WAITING_READ)
   })
@@ -17207,7 +17177,7 @@ describe('b.jg5 SRJ-114, SRJ-105: a failed post-run get of the caller\'s own row
 
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
 
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: 2 }))
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: 1 }))
     expect(order.slice(order.indexOf('findMissing'))).toEqual(['findMissing', 'get'])
     expect(postRunGetRefusalLines(h, 'spawnForPersona: before resume', renderPersonaRef(p, p))).toHaveLength(1)
     expect(everyRefusalLine(h)).toHaveLength(1)
@@ -17229,7 +17199,7 @@ describe('b.jg5 SRJ-114, SRJ-105: a failed post-run get of the caller\'s own row
 
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
 
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: 2 }))
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: 1 }))
     expect(order.slice(order.indexOf('findMissing'))).toEqual(['findMissing', 'get'])
     expect(postRunGetRefusalLines(h, 'spawnForPersona: before resume', renderPersonaRef(p, p))).toEqual([])
     expect(everyRefusalLine(h)).toEqual([])
@@ -17316,8 +17286,8 @@ function unusableNameLinesOf(h: RecoveryHarness, key: string): string[] {
 
 /**
  * Record every raw tmux call into `order` (the call order `recordCallOrder`
- * keeps), as `tmux <what>`: the b.vub session kill, the server ensurer, the
- * session probe (answering `alive`), and any other command through the
+ * keeps), as `tmux <what>`: the b.vub session kill, the session probe
+ * (answering `alive`), and any other command through the
  * runner seam as `tmux <command>` (failing, as the file's stand-in does; the
  * startup-dialog approver makes none). The file's `afterEach` puts every
  * seam back.
@@ -17325,9 +17295,6 @@ function unusableNameLinesOf(h: RecoveryHarness, key: string): string[] {
 function recordRawTmux(order: string[], alive: boolean): void {
   _setTmuxSessionKiller(async () => {
     order.push('tmux kill-session')
-  })
-  _setTmuxServerEnsurer(async () => {
-    order.push('tmux ensure-server')
   })
   _setTmuxSessionProber(async () => {
     order.push('tmux has-session')
@@ -19071,7 +19038,7 @@ const LAUNCH_START_GET_SITES: readonly LaunchStartGetSite[] = [
     }),
     order: ['findMissing', 'get'],
     whole: false,
-    calls: ladderCallsOf({ spawn: 1, sendKeys: 2 }),
+    calls: ladderCallsOf({ spawn: 1, sendKeys: 1 }),
     gets: 2,
   },
 ]
@@ -19423,5 +19390,362 @@ describe('b.jg5 SRJ-122, SRJ-513 (hatch A2): the gets SRJ-122 leaves alone latch
     expectNoNoteLatch(h)
     expect(launchStartLinesOf(h, p)).toEqual([])
     assertNoLeak({ posted })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-118, SRJ-609 (E19 T1): the reconnect is one `send-keys` decided
+// by class (`reconnectMcpWithCause`)
+//
+// One case per cell of SRJ-118's reconnect row, on `makeRecoveryHarness` (its
+// latch installed as `main()` installs it), each call made inside a recovery
+// attempt for P as the restart path makes it: the outcome and its cause, the
+// stub's calls and every raw tmux call in order (`recordEveryCall`: exactly
+// one `send-keys` and nothing else, or nothing for a latched P), the lines
+// from the exported builders, and no spawn-failure notice, `spawn-failed`
+// entry or counted failure. No cell answers `failed`: each answer is compared
+// whole. Then the ladder's `waiting` and `working` branches map the answers:
+// `ok` → `reconnected`; `dead-session`, whatever its cause, → one find-missing
+// run, then `resume` (`resumed`); CONFLICT → `latched` with nothing more
+// called; a re-check stop → `failed` marked `stopping`. The ladder's
+// uncounted refused result for UNAVAILABLE, ENVIRONMENT, CONFIG and
+// UNCLASSIFIED is checked at the reconnect sites of the SRJ-105, SRJ-311,
+// SRJ-316 and SRJ-313 describes (`RECONNECT_SITES`). The named AC 44
+// sequence is E19 T3's.
+// ---------------------------------------------------------------------------
+
+/** A line from one of the reconnect's builders, matched whole around the latch's outcome text (which `build` takes). */
+function reconnectLatchLines(build: (outcome: string) => string): (h: RecoveryHarness) => string[] {
+  const mark = '\u0000'
+  const [head, tail] = build(mark).split(mark) as [string, string]
+  return (h) => h.errors.filter((line) => line.startsWith(head) && line.endsWith(tail))
+}
+
+/** What the reconnect's latch line says once the latch is set (SRJ-118: nothing typed, never retried). */
+const RECONNECT_LATCHED_SAYS = ': the persona latched; nothing was typed and the send-keys is not retried'
+
+/** The CONFLICT latch a reconnect of persona `p` sets from case-table `row` (SRJ-501: "P's next check or recovery", the caller's last read). */
+function reconnectConflictLatch(p: string, row: ConflictCaseRow): ExpectedLatch {
+  const lines = reconnectLatchLines((outcome) =>
+    reconnectConflictLine(renderPersonaRef(p, p), describeAgentDirectorFailure(row.build()), row.latchCase, outcome),
+  )
+  return { ...conflictLatch(p, row, row.refusedOperation, row.rowState), lines: (h) => lines(h), says: RECONNECT_LATCHED_SAYS }
+}
+
+/** The unusable-name latch a reconnect of persona `p` sets from case-table `row` (SRJ-512: refused operation none, the caller's last read). */
+function reconnectUnusableNameLatch(p: string, row: UnusableNameCaseRow): ExpectedLatch {
+  const lines = reconnectLatchLines((outcome) => reconnectUnusableNameLine(renderPersonaRef(p, p), describeAgentDirectorFailure(row.build()), outcome))
+  return { ...unusableNameLatch(p, row), lines: (h) => lines(h), says: RECONNECT_LATCHED_SAYS }
+}
+
+describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and decides its answer by class; no tmux server start, no retry, no failure counted or posted', () => {
+  /** Every `resolveSystemBinary` call the installed re-check made (the `ErrInvalidFlags` cells). */
+  let resolveCalls: Array<object | undefined>
+  /** The exit codes the re-check stopped with. */
+  let stops: number[]
+
+  beforeEach(() => {
+    _resetFindMissingMemo()
+    resolveCalls = []
+    stops = []
+  })
+
+  afterEach(() => {
+    resetAdVersionRecheckForTests()
+    srj105AfterEach()
+  })
+
+  /** Install the real re-check over a counting stub `resolveSystemBinary` answering `outcome` (the baseline when none). */
+  function installRecheck(outcome?: StubResolveSystemBinaryOutcome): void {
+    installAdVersionRecheck({
+      resolveSystemBinary: makeStubResolveSystemBinary({ calls: resolveCalls, ...(outcome === undefined ? {} : { outcomes: [outcome] }) }),
+      baselineVersion: PHASE1_RC_VERSION,
+      recordStartupError: () => {},
+      stop: (exitCode) => { stops.push(exitCode) },
+      log: () => {},
+      clock: createFakeClock(),
+    })
+  }
+
+  /**
+   * P's reconnect, made inside a recovery attempt for P with `lastRead` as
+   * its caller's last read, over `script`. Answers the result, every call
+   * from then on in order (the stub's verbs and raw tmux) and P's reference.
+   */
+  async function reconnectOnce(script: RecoveryStubScript, lastRead: LatchRowState = WAITING_READ) {
+    const { h, p } = srj105Build()
+    h.script(script)
+    const order = await recordEveryCall(h, p)
+    const ref = renderPersonaRef(p, p)
+    const result = await runInAttempt(p, 'recovery', () => reconnectMcpWithCause(p, lastRead, ref))
+    return { h, p, ref, order, result }
+  }
+
+  /** Exactly one send-keys of `/mcp reconnect` for P and no other call, raw tmux included; nothing posted as a spawn failure, recorded or counted. */
+  function expectOneSendKeysOnly(h: RecoveryHarness, p: string, order: readonly string[]): void {
+    expect(order).toEqual(['sendKeys'])
+    expect(h.stub.calls.sendKeysCalls.map((c) => [c.claude_instance_id, c.text])).toEqual([[personaInstanceId(p), RECONNECT_TEXT]])
+    expect(h.notices).toEqual([])
+    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(getFailureCount(p)).toBe(0)
+  }
+
+  /** The reconnect's lines for P: its start line, then exactly `line`. */
+  function expectLines(h: RecoveryHarness, ref: string, line: string): void {
+    const own = h.errors.filter((l) => l.startsWith('[slack] reconnect'))
+    expect(own).toEqual([reconnectStartLine(ref), line])
+  }
+
+  test('success: ok', async () => {
+    const { h, p, ref, order, result } = await reconnectOnce({})
+
+    expect(result).toStrictEqual({ outcome: 'ok' } satisfies ReconnectResult)
+    expectOneSendKeysOnly(h, p, order)
+    expect(h.errors.filter((l) => l.startsWith('[slack] reconnect'))).toEqual([reconnectStartLine(ref)])
+    expect(h.triggers).toEqual([])
+  })
+
+  /** The answers that give `dead-session`, each with its cause and its line's builder. */
+  const DEAD_CELLS: ReadonlyArray<readonly [string, () => Error, ReconnectResult, (ref: string, failure: string) => string]> = [
+    ['GONE (ErrTmuxSendKeys)', () => errTmuxSendKeys(), { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_TMUX_GONE }, reconnectGoneLine],
+    ['ErrSpawnNotInteractive (a finished row)', () => errSpawnNotInteractive('send-keys'), { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE }, reconnectNotInteractiveLine],
+    ['ErrSpawnNotInteractive (a leftover\'s session)', () => errSpawnNotInteractiveLeftover(), { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE }, reconnectNotInteractiveLine],
+    ['ErrSpawnNotInteractive (a pending row with no launch start)', () => errSpawnNotInteractiveNoLaunchStart(), { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE }, reconnectNotInteractiveLine],
+    ['ErrSpawnNotFound (no row)', () => errSpawnNotFound(), { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_ABSENT }, reconnectRowAbsentLine],
+  ]
+
+  test.each(DEAD_CELLS)('%s: dead-session with its cause at once, after one send-keys: no tmux server start, no second try, no notice', async (_what, make, expected, line) => {
+    const err = make()
+    const { h, p, ref, order, result } = await reconnectOnce({ sendKeysError: err })
+
+    expect(result).toStrictEqual(expected)
+    expectOneSendKeysOnly(h, p, order)
+    expectLines(h, ref, line(ref, describeAgentDirectorFailure(err)))
+    expect(h.outageNotices).toEqual([])
+    expect(h.triggers).toEqual([])
+    expect(h.latch.isLatched(p)).toBe(false)
+  })
+
+  test.each(PANE_UNAVAILABLE_FORMS)('UNAVAILABLE (%s): transient, no notice and no spawn-failed entry; P\'s retry timer armed with its cause', async (_what, make, cause) => {
+    const err = make('send-keys')
+    const { h, p, ref, order, result } = await reconnectOnce({ sendKeysError: err })
+
+    expect(result).toStrictEqual({ outcome: 'transient' } satisfies ReconnectResult)
+    expectOneSendKeysOnly(h, p, order)
+    expectLines(h, ref, reconnectTransientLine(ref, describeAgentDirectorFailure(err), AD_ERROR_CLASS_UNAVAILABLE))
+    expect(h.outageNotices).toEqual([])
+    expect(h.triggers).toEqual([{ key: p, kind: cause }])
+  })
+
+  test.each([
+    ['tmux cannot be run', () => errTmuxNotAvailable(undefined, 'send-keys'), ONSET_TEMPLATES['tmux-unavailable']()],
+    ['not the tmux server the agent was launched on', () => errTmuxNotAvailableDifferentServer(undefined, 'send-keys'), tmuxServerChangedOnset()],
+  ] as const)('ENVIRONMENT (ErrTmuxNotAvailable, %s): transient; P\'s tmux-unavailable raised once with its onset; no notice', async (_what, make, onset) => {
+    const err = make()
+    const { h, p, ref, order, result } = await reconnectOnce({ sendKeysError: err })
+
+    expect(result).toStrictEqual({ outcome: 'transient' } satisfies ReconnectResult)
+    expectOneSendKeysOnly(h, p, order)
+    expectLines(h, ref, reconnectTransientLine(ref, describeAgentDirectorFailure(err), AD_ERROR_CLASS_ENVIRONMENT))
+    expect(h.outageNotices).toEqual([{ key: p, text: onset }])
+    expect(getOutageFlags(p).has('tmux-unavailable')).toBe(true)
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT }])
+  })
+
+  test('CONFIG (ErrConfigMalformed): transient; P\'s ad-config-malformed raised once; no failure post', async () => {
+    const err = errConfigMalformed()
+    const { h, p, ref, order, result } = await reconnectOnce({ sendKeysError: err })
+
+    expect(result).toStrictEqual({ outcome: 'transient' } satisfies ReconnectResult)
+    expectOneSendKeysOnly(h, p, order)
+    expectLines(h, ref, reconnectTransientLine(ref, describeAgentDirectorFailure(err), AD_ERROR_CLASS_CONFIG))
+    expect(h.outageNotices).toEqual([{ key: p, text: adConfigMalformedOnset(err) }])
+    expect(getOutageFlags(p).has('ad-config-malformed')).toBe(true)
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_CONFIG }])
+  })
+
+  test.each([
+    ['ErrInternal with no phrase', () => errInternal()],
+    ['an error name CSCB gives no handling', () => errGeneric('send-keys', 'ErrBroken')],
+    ['ErrSendKeysWhileRelayed', () => errSendKeysWhileRelayed()],
+  ] as const)('UNCLASSIFIED (%s): transient, nothing typed; reported once to P\'s unclassified-error episode and P armed with the UNCLASSIFIED cause; no notice', async (_what, make) => {
+    const err = make()
+    expect(classifyAdError(err).errorClass).toBe(AD_ERROR_CLASS_UNCLASSIFIED)
+    const { h, p, ref, order, result } = await reconnectOnce({ sendKeysError: err })
+
+    expect(result).toStrictEqual({ outcome: 'transient' } satisfies ReconnectResult)
+    expectOneSendKeysOnly(h, p, order)
+    expectLines(h, ref, reconnectTransientLine(ref, describeAgentDirectorFailure(err), AD_ERROR_CLASS_UNCLASSIFIED))
+    expect(unclassifiedStartedLines(h, p)).toEqual([unclassifiedStartedLine(p, err)])
+    expect(h.unclassifiedErrorOpen(p)).toBe(true)
+    expect(h.outageNotices).toEqual([])
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
+  })
+
+  // b.jg5 SRJ-104, SRJ-204, SRJ-205: send-keys gives ErrInvalidFlags no
+  // meaning: one immediate version re-check, then UNCLASSIFIED.
+  test.each([
+    [RECHECK_OUTCOME_PASS, undefined, false],
+    [RECHECK_OUTCOME_STOP, { version: OLD_AD_VERSION }, true],
+  ] as const)('ErrInvalidFlags, the re-check answering %s: one re-check, then UNCLASSIFIED: transient (marked stopping when the re-check stops the server, and then nothing reported)', async (kind, outcome, stopping) => {
+    installRecheck(outcome)
+    const err = errInvalidFlags('send-keys')
+    const { h, p, ref, order, result } = await reconnectOnce({ sendKeysError: err })
+
+    expect(result).toStrictEqual((stopping ? { outcome: 'transient', stopping: true } : { outcome: 'transient' }) satisfies ReconnectResult)
+    expect(resolveCalls).toHaveLength(1)
+    expect(stops).toHaveLength(stopping ? 1 : 0)
+    expectOneSendKeysOnly(h, p, order)
+    const classification = `class=${AD_ERROR_CLASS_UNCLASSIFIED} name=${err.errName} message=${JSON.stringify(err.errDescription)}`
+    expectLines(h, ref, reconnectInvalidFlagsLine(ref, classification, kind))
+    expect(unclassifiedStartedLines(h, p)).toEqual(stopping ? [] : [`${unclassifiedLinePrefix(p)}started — ${classification}`])
+    expect(h.triggers).toEqual(stopping ? [] : [{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
+  })
+
+  test.each(RECONNECT_CONFLICT_CASE_ROWS.map((row) => [row.name, row] as const))('CONFLICT (%s): transient; P latched once through the CONFLICT entry with the row\'s case, "P\'s next check or recovery" and the caller\'s last read; one hold post; the refused send-keys is never retried, and a later reconnect of P types nothing', async (_name, row) => {
+    const { h, p, ref, order, result } = await reconnectOnce({ sendKeysError: row.build() }, row.rowState)
+
+    expect(result).toStrictEqual({ outcome: 'transient', latched: true } satisfies ReconnectResult)
+    expectOneSendKeysOnly(h, p, order)
+    expectLatchedOnce(h, p, reconnectConflictLatch(p, row))
+    const [line] = reconnectConflictLatch(p, row).lines(h, p)
+    // SRJ-613: "not this launch's session" on a live row that is not pending is a leftover of an earlier launch.
+    expect(line!.includes(RECONNECT_NOT_THIS_LAUNCH_NOTE)).toBe(row.leftoverOfEarlierLaunch === true)
+
+    // The next reconnect of P (any caller) finds it latched: no send-keys, nothing more posted or set.
+    const events = h.latchEvents.length
+    expect(await reconnectMcpWithCause(p, row.rowState, ref)).toStrictEqual({ outcome: 'transient', latched: true } satisfies ReconnectResult)
+    expect(order).toEqual(['sendKeys'])
+    expect(h.latchEvents).toHaveLength(events)
+    expect(h.episodeNotices).toHaveLength(1)
+    expect(h.errors.filter((l) => l === reconnectLatchedLine(ref))).toHaveLength(1)
+  })
+
+  test.each(RECONNECT_UNUSABLE_NAME_CASE_ROWS.map((row) => [row.name, row] as const))('UNUSABLE NAME (%s): transient; P latched once with refused operation none and the caller\'s last read; one post; nothing typed and no second send-keys', async (_name, row) => {
+    const { h, p, ref, order, result } = await reconnectOnce({ sendKeysError: row.build() }, row.rowState)
+
+    expect(result).toStrictEqual({ outcome: 'transient', latched: true } satisfies ReconnectResult)
+    expectOneSendKeysOnly(h, p, order)
+    expectLatchedOnce(h, p, reconnectUnusableNameLatch(p, row))
+
+    expect(await reconnectMcpWithCause(p, row.rowState, ref)).toStrictEqual({ outcome: 'transient', latched: true } satisfies ReconnectResult)
+    expect(order).toEqual(['sendKeys'])
+    expect(h.episodeNotices).toHaveLength(1)
+  })
+
+  test('a latched P: no send-keys and no other call, raw tmux included; transient (latched), one line, nothing posted or set', async () => {
+    const { h, p } = srj105Build()
+    const before = await latchBeforeRun(h, p)
+    const order = await recordEveryCall(h, p)
+    const ref = renderPersonaRef(p, p)
+
+    expect(await runInAttempt(p, 'recovery', () => reconnectMcpWithCause(p, WAITING_READ, ref))).toStrictEqual({ outcome: 'transient', latched: true } satisfies ReconnectResult)
+
+    expect(order).toEqual([])
+    expect(h.errors.filter((l) => l.startsWith('[slack] reconnect'))).toEqual([reconnectLatchedLine(ref)])
+    expectNoRelatch(h, before)
+  })
+
+  test.each([
+    [DEAD_SESSION_CAUSE_TMUX_GONE, 'dead-session'],
+    [DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE, 'row-not-interactive'],
+    [DEAD_SESSION_CAUSE_ROW_ABSENT, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ],
+    [undefined, 'dead-session'],
+  ] as const)('escalateDeadVerdictOfCause(%p) is %s: an absent row is never swept as a GONE', (cause, verdict) => {
+    expect(escalateDeadVerdictOfCause(cause)).toBe(verdict)
+  })
+
+  // b.jg5 SRJ-609: the row-not-interactive evidence text and line claim no
+  // dead worker: a finished row is not proof of death.
+  test('the row-not-interactive evidence text and the reconnect\'s line claim neither the process nor the worker is gone or dead', () => {
+    const claim = /\b(?:process|worker|session)\b[^;.()]*?\b(?:is|are|was|has been|have been)\s+(?:gone|dead|ended|exited)\b/i
+    expect(ESCALATE_DEAD_EVIDENCE['row-not-interactive']).not.toMatch(claim)
+    expect(reconnectNotInteractiveLine('persona=C', describeAgentDirectorFailure(errSpawnNotInteractive('send-keys')))).not.toMatch(claim)
+  })
+})
+
+describe('b.jg5 SRJ-118, SRJ-609: the ladder\'s waiting and working branches map the reconnect\'s answer', () => {
+  beforeEach(() => {
+    _resetFindMissingMemo()
+  })
+  afterEach(() => {
+    resetAdVersionRecheckForTests()
+    srj105AfterEach()
+  })
+
+  /** The ladder branch, with the stub answers that reach its reconnect (the working branch through its wait's poll reading `waiting`). */
+  const BRANCHES: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: Persona) => RecoveryStubScript, ((h: RecoveryHarness) => void) | undefined]> = [
+    ['waiting', (h, p) => collided(h, p, { state: 'waiting' }), undefined],
+    ['working (the wait\'s poll reads waiting)', (h, p) => ({ ...collided(h, p, { state: 'working' }), statusResult: cannedStatusResult({ state: 'waiting' }) }), fastPolls],
+  ]
+
+  test.each(BRANCHES)('%s: ok → reconnected, after one send-keys', async (_branch, reach, setup) => {
+    const { h, p } = srj105Build()
+    setup?.(h)
+    h.script(reach(h, harnessPersona(h, p)))
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'reconnected' })
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: 1 }))
+  })
+
+  const DEAD_CROSS = BRANCHES.flatMap(([branch, reach, setup]) =>
+    ([
+      ['GONE', () => errTmuxSendKeys()],
+      ['ErrSpawnNotInteractive', () => errSpawnNotInteractive('send-keys')],
+      ['ErrSpawnNotFound', () => errSpawnNotFound()],
+    ] as const).map(([what, make]) => [branch, what, reach, setup, make] as const),
+  )
+  test.each(DEAD_CROSS)('%s: %s → dead-session → one find-missing run, then resume: resumed, with one send-keys; no kill, delete, notice, spawn-failed entry or counted failure', async (branch, _what, reach, setup, make) => {
+    const { h, p } = srj105Build()
+    setup?.(h)
+    h.script({ ...reach(h, harnessPersona(h, p)), sendKeysError: make(), findMissingResult: cannedFindMissing({ count: 1, ids: [personaInstanceId(p)] }) })
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'resumed' })
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: 1, resume: 1 }))
+    // One find-missing run before the resume (the working branch's is its wait's up-front run, which the recovery shares through the memo).
+    expect(order.filter((call) => call === 'findMissing' || call === 'resume' || call === 'sendKeys')).toEqual(
+      branch === 'waiting' ? ['sendKeys', 'findMissing', 'resume'] : ['findMissing', 'sendKeys', 'resume'],
+    )
+    expect(h.notices).toEqual([])
+    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(getFailureCount(p)).toBe(0)
+  })
+
+  const CONFLICT_CROSS = BRANCHES.flatMap(([branch, reach, setup]) =>
+    reconnectConflictRowsAt('waiting').map((row) => [branch, row.name, reach, setup, row] as const),
+  )
+  test.each(CONFLICT_CROSS)('%s: CONFLICT (%s) → latched (launchSession \'skipped\'), one post, no resume, kill, delete or spawn after the send-keys; no path launches P again', async (_branch, _name, reach, setup, row) => {
+    const { h, p, b } = srj105Build()
+    setup?.(h)
+    const script = { ...reach(h, harnessPersona(h, p)), sendKeysError: row.build() }
+    h.script(script)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: 1 }))
+    expectLatchedOnce(h, p, reconnectConflictLatch(p, row))
+    await expectLaunchedByNoPath(h, p, b, script)
+  })
+
+  test('waiting: an ErrInvalidFlags whose re-check stops the server → failed, marked stopping; nothing posted, recorded or counted, and nothing after the send-keys', async () => {
+    const stops: number[] = []
+    installAdVersionRecheck({
+      resolveSystemBinary: makeStubResolveSystemBinary({ outcomes: [{ version: OLD_AD_VERSION }] }),
+      baselineVersion: PHASE1_RC_VERSION,
+      recordStartupError: () => {},
+      stop: (exitCode) => { stops.push(exitCode) },
+      log: () => {},
+      clock: createFakeClock(),
+    })
+    const { h, p } = srj105Build()
+    h.script({ ...collided(h, harnessPersona(h, p), { state: 'waiting' }), sendKeysError: errInvalidFlags('send-keys') })
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', stopping: true })
+    expect(stops).toHaveLength(1)
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: 1 }))
+    expect(h.notices).toEqual([])
+    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(getFailureCount(p)).toBe(0)
+    expect(h.errors.filter((l) => l === transientReconnectLine(renderPersonaRef(p, p), 'waiting', 'stopping'))).toHaveLength(1)
   })
 })

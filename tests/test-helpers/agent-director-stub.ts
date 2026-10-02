@@ -113,6 +113,7 @@ import {
   ErrPauseTimeout,
   ErrRelayFallenBack,
   ErrRelayModeOff,
+  ErrSendKeysWhileRelayed,
   ErrSpawnNotFound,
   ErrSpawnNotInteractive,
   ErrSpawnNotPausable,
@@ -527,6 +528,20 @@ export function errSpawnNotInteractiveNoLaunchStart(verb: string = 'send-keys'):
     verb,
     'ErrSpawnNotInteractive',
     'the pending row has no launch start; nothing was sent',
+  )
+}
+
+/**
+ * Build the client's ErrSendKeysWhileRelayed for `send-keys`: agent-director
+ * refuses keystrokes to a row that sits on a relayed permission prompt, and
+ * nothing was sent. CSCB gives the name no handling, so it classes
+ * UNCLASSIFIED (b.jg5 SRJ-104, SRJ-118).
+ */
+export function errSendKeysWhileRelayed(): ErrSendKeysWhileRelayed {
+  return new ErrSendKeysWhileRelayed(
+    'send-keys',
+    'ErrSendKeysWhileRelayed',
+    'the row sits on a relayed permission prompt; nothing was sent',
   )
 }
 

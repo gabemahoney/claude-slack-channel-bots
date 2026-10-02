@@ -36,6 +36,7 @@ import {
   RESTART_SLOW_RECOVERY_OTHER_PENDING_PROBE,
   RESTART_SLOW_RECOVERY_OTHER_PENDING_REPROBE,
   RESTART_SLOW_RECOVERY_OTHER_VERDICT,
+  relaunchWithoutKillLine,
   reprobeDeadLine,
   reprobeLiveLine,
   reprobePendingLine,
@@ -62,8 +63,6 @@ import { createPersonaSerializer, type PersonaSerialize } from '../src/persona-s
 import type { PersonaConnectionStatus } from '../src/persona-connections.ts'
 import {
   _resetFindMissingMemo,
-  _setTmuxServerEnsurer,
-  _resetTmuxServerEnsurer,
   _resetInFlightLaunches,
   _whenDialogApproverStopped,
   stopAllDialogApprovers,
@@ -198,6 +197,7 @@ import {
   NO_LAUNCH_START_FORM_NAMES,
   UNUSABLE_NAME_CASE_ROWS,
   launchStartRecord,
+  reconnectConflictRowsAt,
   tmuxTouchingCallsIn,
 } from './test-helpers/conflict-cases.ts'
 import {
@@ -1761,7 +1761,6 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
     initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
     setClientForTests(stub as unknown as Client)
     setSessionNotifier(() => {})
-    _setTmuxServerEnsurer(async () => {})
     _resetFindMissingMemo()
   })
 
@@ -1771,7 +1770,6 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
     resetClientForTests()
     _resetOutageState()
     setSessionNotifier(undefined)
-    _resetTmuxServerEnsurer()
     _resetFindMissingMemo()
     rmSync(dir, { recursive: true, force: true })
   })
@@ -2070,9 +2068,9 @@ describe('restart cap notice goes to the persona destination (b.av2 SR-7.2)', ()
 // kill+relaunch branch; while the row still reads alive, the run relaunches
 // nothing and a SUBSEQUENT tick that sees the session dead does.
 //
-// Seams only — the tmux-server ensurer is stubbed to a no-op so reconnectMcp's
-// self-heal retry never shells out to a real tmux server; no live tmux/fleet is
-// ever touched. The findMissing memo is reset per test so the call count is
+// Seams only: the reconnect is one send-keys through the stub, with no tmux
+// server start and no retry (b.jg5 SRJ-609), so no live tmux/fleet is ever
+// touched. The findMissing memo is reset per test so the call count is
 // deterministic (the TTL setter alone does not clear the memo).
 // ---------------------------------------------------------------------------
 
@@ -2101,9 +2099,9 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
     const statusCalls: StatusParams[] = []
     const sendKeysCalls: SendKeysParams[] = []
 
-    // Non-working status → adapter falls through to reconnectMcp; persistent
-    // ErrTmuxSendKeys on send-keys (ensurer stubbed no-op) → 'dead-session'
-    // → adapter maps to 'escalate-dead' and fires the internal sweep.
+    // Non-working status → adapter falls through to the reconnect; one
+    // ErrTmuxSendKeys on send-keys → 'dead-session' (`tmux-gone`) at once →
+    // adapter maps to 'escalate-dead' and fires the internal sweep.
     const stub = makeStubClient({
       statusFn: () => ({ state: 'waiting' }),
       statusCalls,
@@ -2117,7 +2115,6 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
       getClient: () => stub as unknown as Client,
     })
     setClientForTests(stub as unknown as Client)
-    _setTmuxServerEnsurer(async () => {})
 
     // The adapter resolves the instance ID from the persona key alone
     // (b.av2 SR-2.2) — here the persona key C_DEADTMUX.
@@ -2147,7 +2144,6 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
   afterEach(() => {
     resetClientForTests()
     _resetOutageState()
-    _resetTmuxServerEnsurer()
     _resetFindMissingMemo()
   })
 
@@ -2173,9 +2169,9 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
     expect(getFailureCount(KEY)).toBe(0)
     expect(isAtCap(KEY, RESTART_FAILURE_CAP)).toBe(false)
     // The adapter's AD calls address the persona's cscb_<key> instance: one
-    // status probe, then the send-keys reconnect and its one self-heal retry.
+    // status probe, then exactly one send-keys reconnect (no second try).
     expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(KEY)])
-    expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C_DEADTMUX', 'cscb_C_DEADTMUX'])
+    expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C_DEADTMUX'])
 
     // --- Tick 2: the row has since been reconciled to `missing`, so the next
     // tick observes the session dead. The normal kill+relaunch branch runs.
@@ -2188,6 +2184,8 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
 
     expect(deps.killSessionCalls).toEqual([KEY])
     expect(deps.launchSessionCalls).toEqual([KEY])
+    // Tick 2 found the session dead at its first probe: no reconnect, so still one send-keys.
+    expect(sendKeysCalls).toHaveLength(1)
   })
 
   test('b.d61: the sweep reconciles the row before the re-probe → the same run kills and relaunches once, with no second relaunch', async () => {
@@ -2201,10 +2199,10 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
     scheduleRestart(KEY, '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
-    // 'dead-session' → 'escalate-dead': the send-keys reconnect and its retry
-    // failed and the sweep ran once; the re-probe read the row dead, so this
+    // 'dead-session' → 'escalate-dead': the one send-keys reconnect answered
+    // GONE and the sweep ran once; the re-probe read the row dead, so this
     // one run killed and relaunched it and armed nothing further.
-    expect(sendKeysCalls).toHaveLength(2)
+    expect(sendKeysCalls).toHaveLength(1)
     expect(findMissingCalls).toHaveLength(1)
     expect(deps.killSessionCalls).toEqual([KEY])
     expect(deps.launchSessionCalls).toEqual([KEY])
@@ -2435,9 +2433,8 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
 // checked kill and the relaunch happen in that same run (b.jg5 SRJ-611). An
 // UNAVAILABLE `read-pane` of a `working` row is no proof the session is gone:
 // the run defers, with no sweep, kill, launch or accounting. Kill and launch
-// are recording fakes. No tmux is asked: the session prober and the server
-// ensurer are the defaults, whose only way to tmux is the raw runner, which
-// records every argv here. Each case awaits its restart work's end, not a
+// are recording fakes. No tmux is asked: the session prober is the default,
+// whose only way to tmux is the raw runner, which records every argv here. Each case awaits its restart work's end, not a
 // fixed sleep, and counts only the run's own calls (its persona's instance
 // and the whole-store sweep), so neither a late timer nor another persona's
 // call made while the case runs changes a count.
@@ -2445,7 +2442,7 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
 
 describe('b.d61: a working persona whose tmux session is gone is relaunched in the same restart run', () => {
   let dir: string
-  /** Every argv the raw tmux runner was asked to run (the default session prober and server ensurer included). */
+  /** Every argv the raw tmux runner was asked to run (the default session prober included). */
   let rawTmux: string[][]
   let errLines: string[]
   let origConsoleError: typeof console.error
@@ -2454,7 +2451,6 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
     dir = mkdtempSync(join(tmpdir(), 'restart-d61-'))
     _resetFindMissingMemo()
     _resetTmuxSessionProber()
-    _resetTmuxServerEnsurer()
     rawTmux = []
     _setTmuxCommandRunner(async (args) => {
       rawTmux.push([...args])
@@ -2660,11 +2656,15 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
 // one, b.m4r) marks it `missing` just before the `/mcp reconnect` keystrokes
 // land, and agent-director refuses them with ErrSpawnNotInteractive. The probe
 // and the adapter are the REAL ones over one stub AD client; kill and launch
-// are recording fakes. reconnectMcp answers 'dead-session', the adapter
-// escalates, and the re-probe (b.d61) reads the row dead, so the persona is
-// relaunched in that same run. Before the fix the adapter answered
-// 'transient' after a spawn-failure notice, and the persona stayed down until
-// a later tick.
+// are recording fakes. The reconnect answers 'dead-session' (cause
+// `row-not-interactive`) after one `send-keys`, the adapter sweeps and
+// answers the no-kill escalate-dead verdict, and the re-probe (b.d61)
+// decides: a row read `missing` is relaunched in that same run with no kill
+// (b.jg5 SRJ-609, hatch A2: the refusal never by itself leads to a kill); a
+// row read `pending` (another process's launch may hold it) is left alone,
+// with nothing killed, launched or counted. Before the fix the adapter
+// answered 'transient' after a spawn-failure notice, and the persona stayed
+// down until a later tick. Each run is awaited (`runRestartRetry`).
 // ---------------------------------------------------------------------------
 
 describe('b.dup: a persona whose row is ended just before its reconnect lands is relaunched in the same restart run', () => {
@@ -2679,30 +2679,37 @@ describe('b.dup: a persona whose row is ended just before its reconnect lands is
     cancelAllRestartTimers()
     resetClientForTests()
     _resetOutageState()
-    _resetTmuxServerEnsurer()
     _resetFindMissingMemo()
     setSessionNotifier(undefined)
     rmSync(dir, { recursive: true, force: true })
   })
 
-  test('REPRO: alive (waiting) but disconnected; the keystrokes are refused (ErrSpawnNotInteractive) → one send-keys and one sweep; the re-probe reads the row missing → one kill and one relaunch in that run; no spawn-failure notice, no failure counted', async () => {
+  /**
+   * One restart run for a persona whose row reads `waiting` until its
+   * keystrokes are refused (ErrSpawnNotInteractive), and `afterRefusal`
+   * from then on (what the sweep that ended it, or another launch, left).
+   * One failure is counted for it first, so a recordFailure or a
+   * recordSuccess in the run shows. Answers the run's outcome, its calls,
+   * the spawn-failure notices raised and its console.error lines.
+   */
+  async function refusedRun(afterRefusal: string) {
     const config = makeMultiPersonaConfig([{ name: 'alpha_bot' }], dir)
     const KEY = config.personas[0]!.key
     let rowState = 'waiting'
     const sendKeysCalls: SendKeysParams[] = []
     const findMissingCalls: FindMissingParams[] = []
-    const stub = makeStubClient({ statusFn: () => ({ state: rowState }), findMissingCalls })
+    const stub = makeStubClient({ statusFn: () => cannedStatusResult({ state: rowState }), findMissingCalls })
     stub.sendKeys = async (params) => {
       sendKeysCalls.push(params)
-      rowState = 'missing' // a findMissing sweep landed just before the keystrokes
+      rowState = afterRefusal // a findMissing sweep, or another launch, landed just before the keystrokes
       throw errSpawnNotInteractive('send-keys')
     }
     _resetOutageState()
     initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
     setClientForTests(stub as unknown as Client)
-    _setTmuxServerEnsurer(async () => {})
     const raised: string[] = []
     setSessionNotifier((key) => { raised.push(key) })
+    recordFailure(KEY)
 
     const killSessionCalls: string[] = []
     const launchSessionCalls: string[] = []
@@ -2719,16 +2726,125 @@ describe('b.dup: a persona whose row is ended just before its reconnect lands is
       onCapReached: () => {},
     })
 
-    scheduleRestart(KEY, config.personas[0]!.working_directory)
-    await Bun.sleep(WAIT_MS)
+    const lines: string[] = []
+    const orig = console.error
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
+    let outcome: RestartRetryOutcome
+    try {
+      outcome = await runRestartRetry(KEY, config.personas[0]!.working_directory, () => false)
+    } finally {
+      console.error = orig
+    }
+    return { KEY, outcome, sendKeysCalls, findMissingCalls, killSessionCalls, launchSessionCalls, raised, lines }
+  }
 
-    expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(KEY)])
-    expect(findMissingCalls).toHaveLength(1)
-    expect(killSessionCalls).toEqual([KEY])
-    expect(launchSessionCalls).toEqual([KEY])
-    expect(raised).toEqual([])
-    expect(getFailureCount(KEY)).toBe(0)
-    expect(isRestartPendingOrActive(KEY)).toBe(false)
+  test('REPRO: alive (waiting) but disconnected; the keystrokes are refused (ErrSpawnNotInteractive) → one send-keys and one sweep; the re-probe reads the row missing → one relaunch and no kill in that run (b.jg5 SRJ-609, hatch A2); no spawn-failure notice, no failure counted', async () => {
+    const run = await refusedRun('missing')
+
+    expect(run.outcome).toBe(RESTART_OUTCOME_LAUNCHED)
+    expect(run.sendKeysCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(run.KEY)])
+    expect(run.findMissingCalls).toHaveLength(1)
+    expect(run.killSessionCalls).toEqual([])
+    expect(run.launchSessionCalls).toEqual([run.KEY])
+    expect(run.lines.filter((l) => l === relaunchWithoutKillLine(run.KEY))).toHaveLength(1)
+    expect(run.raised).toEqual([])
+    // The relaunch's success is the run's only accounting.
+    expect(getFailureCount(run.KEY)).toBe(0)
+    expect(isRestartPendingOrActive(run.KEY)).toBe(false)
+  })
+
+  test('the keystrokes are refused (ErrSpawnNotInteractive) and the re-probe reads the row pending (another process\'s launch may hold it) → one send-keys and one sweep; no kill, no launch, no recordFailure or recordSuccess, no spawn-failure notice', async () => {
+    const run = await refusedRun(AGENT_DIRECTOR_PENDING_STATE)
+
+    expect(run.outcome).toBe(RESTART_OUTCOME_PENDING_DEFERRED)
+    expect(run.sendKeysCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(run.KEY)])
+    expect(run.findMissingCalls).toHaveLength(1)
+    expect(run.killSessionCalls).toEqual([])
+    expect(run.launchSessionCalls).toEqual([])
+    expect(run.lines.filter((l) => l === relaunchWithoutKillLine(run.KEY))).toEqual([])
+    expect(run.raised).toEqual([])
+    expect(getFailureCount(run.KEY)).toBe(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-118, SRJ-609: the reconnect's transient and latching answers in
+// the restart run, on the recovery harness (the real adapters over one stub,
+// the latch composed as `main()` composes it). P's row reads `waiting` and P
+// is disconnected, so the run reaches the reconnect adapter's one
+// `send-keys`. An UNAVAILABLE answer is `transient`: no sweep, kill, launch,
+// notice or counted failure in the run (its retry timer is E8's case above).
+// A CONFLICT answer latches P with one post, and the next run for P makes no
+// agent-director call and counts nothing. One failure is counted for P
+// first, so a recordFailure or a recordSuccess in the run shows. Each run is
+// awaited (`runRestartRetry`).
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-118, SRJ-609: the reconnect\'s transient and latching answers in the restart run', () => {
+  let harness: RecoveryHarness | undefined
+
+  afterEach(() => {
+    const h = harness
+    harness = undefined
+    if (h === undefined) return
+    assertNoLeak(h.captured())
+    h.cleanup()
+    expect(h.clock.pendingCount()).toBe(0)
+  })
+
+  /** A harness with no alert check; P's row reads `waiting` and its send-keys answers `err`; one failure counted for P. */
+  function build(err: Error): { h: RecoveryHarness; p: string; cwd: string } {
+    const h = (harness = makeRecoveryHarness({ alertThresholdMs: false }))
+    const p = h.keys[0]!
+    recordFailure(p)
+    h.script({ statusResult: cannedStatusResult({ state: 'waiting' }), sendKeysError: err })
+    return { h, p, cwd: h.config.personas[0]!.working_directory }
+  }
+
+  /** P's run made exactly one send-keys and nothing after it: no sweep, kill or launch; nothing counted or posted as a spawn failure. */
+  function expectOneSendKeysAndNothingAfter(h: RecoveryHarness, p: string): void {
+    expect(h.stub.calls.sendKeysCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(p)])
+    expect(h.stub.calls.findMissingCalls).toEqual([])
+    expect(h.stub.calls.killCalls).toEqual([])
+    expect(h.stub.spawnedIds()).toEqual([])
+    expect(h.stub.calls.resumeCalls).toEqual([])
+    expect(getFailureCount(p)).toBe(1)
+    expect(h.capReached).toEqual([])
+    expect(h.notices).toEqual([])
+    expect(h.startupErrors()).toEqual([])
+  }
+
+  const SEND_KEYS_UNAVAILABLE = UNAVAILABLE_FORMS.filter(([, , cause]) => cause !== UNAVAILABLE_RETRY_CAUSE_KILL_FAILED)
+
+  test.each(SEND_KEYS_UNAVAILABLE)('the reconnect\'s send-keys answers %s → the run defers: one send-keys, then no sweep, kill, launch, notice or counted failure', async (_label, make) => {
+    const { h, p, cwd } = build(make('send-keys'))
+
+    expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(RESTART_OUTCOME_RECONNECT_DEFERRED)
+
+    expectOneSendKeysAndNothingAfter(h, p)
+    expect(h.latch.isLatched(p)).toBe(false)
+    expect(h.episodeNotices).toEqual([])
+  })
+
+  test('the reconnect\'s send-keys answers CONFLICT → P latched with one post; the next scheduled run and the retry entry for P make no agent-director call and count nothing', async () => {
+    const row = reconnectConflictRowsAt('waiting')[0]!
+    const { h, p, cwd } = build(row.build())
+
+    expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(RESTART_OUTCOME_RECONNECT_DEFERRED)
+
+    expectOneSendKeysAndNothingAfter(h, p)
+    expect(h.latch.isLatched(p)).toBe(true)
+    expect(h.latch.record(p)?.latchCase).toBe(row.latchCase)
+    expect(h.episodeNotices).toEqual([{ key: p, text: row.notice.text }])
+
+    const calls = h.stub.callCount()
+    scheduleRestart(p, cwd)
+    expect(isRestartPendingOrActive(p)).toBe(false)
+    expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(RESTART_OUTCOME_LATCHED)
+    expect(h.stub.callCount()).toBe(calls)
+    expect(getFailureCount(p)).toBe(1)
+    expect(h.episodeNotices).toHaveLength(1)
+    expect(h.notices).toEqual([])
   })
 })
 
@@ -3267,7 +3383,6 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
     _setSpawnHomeDir(dir)
     _setDialogReadyTimeoutMs(200)
     _setTmuxSessionProber(async () => true)
-    _setTmuxServerEnsurer(async () => {})
   })
 
   afterEach(async () => {
@@ -3283,7 +3398,6 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
     _resetSpawnHomeDir()
     _resetDialogReadyTimeoutMs()
     _resetTmuxSessionProber()
-    _resetTmuxServerEnsurer()
     rmSync(dir, { recursive: true, force: true })
   })
 
@@ -3477,7 +3591,6 @@ describe('restart: the reply-guard record holds the effective value before the r
     _setSpawnHomeDir(dir)
     _setDialogReadyTimeoutMs(200)
     _setTmuxSessionProber(async () => true)
-    _setTmuxServerEnsurer(async () => {})
   })
 
   afterEach(async () => {
@@ -3490,7 +3603,6 @@ describe('restart: the reply-guard record holds the effective value before the r
     _resetSpawnHomeDir()
     _resetDialogReadyTimeoutMs()
     _resetTmuxSessionProber()
-    _resetTmuxServerEnsurer()
     rg.cleanup()
     rmSync(dir, { recursive: true, force: true })
   })
@@ -3713,7 +3825,6 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
     _resetInFlightLaunches()
     _setDialogReadyTimeoutMs(200)
     _setTmuxSessionProber(async () => true)
-    _setTmuxServerEnsurer(async () => {})
     _setConfigDirFs({
       realpath: (path) => {
         if (broken && (path === aConfigDir || path.startsWith(`${aConfigDir}/`))) {
@@ -3794,7 +3905,6 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
     _resetSpawnHomeDir()
     _resetDialogReadyTimeoutMs()
     _resetTmuxSessionProber()
-    _resetTmuxServerEnsurer()
     rmSync(dir, { recursive: true, force: true })
   })
 
@@ -4151,7 +4261,6 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
     _setSpawnHomeDir(dir)
     _setDialogReadyTimeoutMs(200)
     _setTmuxSessionProber(async () => true)
-    _setTmuxServerEnsurer(async () => {})
   })
 
   afterEach(async () => {
@@ -4169,7 +4278,6 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
     _resetSpawnHomeDir()
     _resetDialogReadyTimeoutMs()
     _resetTmuxSessionProber()
-    _resetTmuxServerEnsurer()
     rmSync(dir, { recursive: true, force: true })
     // Every case: no retry timer outlives the test, and no line the retry
     // controller or console.error wrote carries a credential value.
@@ -4909,7 +5017,6 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
       _setSpawnHomeDir(dir)
       _setDialogReadyTimeoutMs(200)
       _setTmuxSessionProber(async () => true)
-      _setTmuxServerEnsurer(async () => {})
     })
 
     afterEach(async () => {
@@ -4921,7 +5028,6 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
       _resetSpawnHomeDir()
       _resetDialogReadyTimeoutMs()
       _resetTmuxSessionProber()
-      _resetTmuxServerEnsurer()
       rmSync(dir, { recursive: true, force: true })
     })
 

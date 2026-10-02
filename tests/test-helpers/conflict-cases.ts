@@ -71,6 +71,28 @@
  * working-row verdict and at the launch wait's evidence read (the wait's
  * poll read `working`), `waiting` at the waiting-row check.
  *
+ * The reconnect's `send-keys` CONFLICT rows (E19 T1; b.jg5 SRJ-118, SRJ-501,
+ * SRJ-505, SRJ-613), {@link RECONNECT_CONFLICT_CASE_ROWS}: the site kind
+ * {@link RECONNECT_SITE} (`reconnectMcpWithCause`'s one `send-keys` of
+ * `/mcp reconnect`; select its rows with {@link isReconnectSite} or
+ * {@link reconnectConflictRowsAt}). One row per stub CONFLICT case that
+ * `send-keys` can answer on a live row that is not `pending`: the cases the
+ * approver's `send-keys` rows cover ("the agent's pane was not found", with
+ * and without "the agent's pane was not adopted", and "conflicting labels")
+ * and "not this launch's session", which on such a row is a CONFLICT (the
+ * approver's `pending` row answers it with `ErrSpawnNotInteractive`
+ * instead): the same set the approver's `read-pane` rows cover. Each case
+ * has a row for each state the reconnect's caller last read
+ * ({@link RECONNECT_ROW_STATES}): `waiting` (the ladder's `waiting` branch,
+ * the restart adapter's `waiting` row, the launch wait's poll) and `working`
+ * (the adapter's stale `working` row, the launch wait's positive-idle
+ * reconnect). Each records the refused operation "P's next check or
+ * recovery". The "not this launch's session" rows carry
+ * `leftoverOfEarlierLaunch` (SRJ-613's leftover case: a leftover of an
+ * earlier launch holds the persona's session), so a test can select them.
+ * The prompt-row `read-pane` rows (E19 T2), the reuse rows (E22) and the
+ * re-check columns (E30) are still to come.
+ *
  * Other exports (E13 T2):
  *   - {@link expectedConflictNotice}: the expected notice for any case,
  *     session and description (none: no description line), assembled from
@@ -133,7 +155,11 @@
  *     quoted session and the description), {@link expectedLatchRecord} of
  *     `src/conflict-latch.ts`'s `unusableNameSetInput(key, build(), rowState)`.
  *     Compare a latch's `record(key)` with it whole (`toEqual`).
- * The dialog approver's rows land here (E17).
+ * The dialog approver's rows land here (E17). The reconnect's `send-keys`
+ * (E19 T1, {@link RECONNECT_SITE}; {@link RECONNECT_UNUSABLE_NAME_CASE_ROWS})
+ * has one row per fault for each state in {@link RECONNECT_ROW_STATES}
+ * (`waiting`, `working`), each recording the state its caller last read;
+ * its row names carry the state (`reconnect send-keys (waiting): <fault>`).
  *
  * The expected latch records (SRJ-501), for any test that checks what a
  * hold-case latch holds (the server, restart, health-check, unavailable-retry
@@ -384,11 +410,25 @@ export function isLivenessPaneSite(site: string): site is LivenessPaneSite {
 type PaneOrKillSite = 'kill' | 'read-pane' | 'send-keys' | 'pause'
 
 /**
+ * The reconnect's one `send-keys` of `/mcp reconnect` as a site kind
+ * (`reconnectMcpWithCause`, b.jg5 SRJ-118's reconnect row).
+ */
+export const RECONNECT_SITE = 'reconnect send-keys'
+
+/** The reconnect's site kind ({@link RECONNECT_SITE}). */
+export type ReconnectSite = typeof RECONNECT_SITE
+
+/** Whether `site` is the reconnect's site kind. */
+export function isReconnectSite(site: string): site is ReconnectSite {
+  return site === RECONNECT_SITE
+}
+
+/**
  * The site kind that meets a CONFLICT row's refusal: a plain spawn, a reuse
  * spawn, a `resume`, a pane verb or a kill (by its verb), one of the dialog
  * approver's pane verbs, or one of the liveness checks' `read-pane` sites.
  */
-export type ConflictCaseSite = 'plain spawn' | 'reuse spawn' | 'resume' | PaneOrKillSite | ApproverSite | LivenessPaneSite
+export type ConflictCaseSite = 'plain spawn' | 'reuse spawn' | 'resume' | PaneOrKillSite | ApproverSite | LivenessPaneSite | ReconnectSite
 
 /** One refusal and what latching a persona on it records. */
 export interface ConflictCaseRow {
@@ -414,6 +454,12 @@ export interface ConflictCaseRow {
   readonly rowState: LatchRowState
   /** The CONFLICT notice for the row's case, quoted session and description (SRJ-1004). */
   readonly notice: ExpectedConflictNotice
+  /**
+   * Set on the reconnect's "not this launch's session" rows only: SRJ-613's
+   * leftover case (on a live row that is not `pending`, a leftover of an
+   * earlier launch holds the persona's session).
+   */
+  readonly leftoverOfEarlierLaunch?: true
 }
 
 // ---------------------------------------------------------------------------
@@ -711,6 +757,48 @@ const LIVENESS_PANE_ROWS: readonly ConflictCaseRow[] = LIVENESS_PANE_SITES.flatM
   ),
 )
 
+/** A state the reconnect's caller last read before its `send-keys`: `waiting`, or `working` (a stale row). */
+export type ReconnectLastRead = 'waiting' | 'working'
+
+/**
+ * The latch row state the reconnect's rows record for each state its caller
+ * last read (b.jg5 SRJ-501), in row order: `waiting`, then `working`.
+ */
+export const RECONNECT_ROW_STATES: Readonly<Record<ReconnectLastRead, LatchRowState>> = Object.freeze({
+  waiting: WAITING,
+  working: WORKING,
+})
+
+/** Every {@link ReconnectLastRead}, in row order. */
+const RECONNECT_LAST_READS = Object.keys(RECONNECT_ROW_STATES) as ReconnectLastRead[]
+
+/**
+ * The reconnect's `send-keys` CONFLICT rows (E19 T1; b.jg5 SRJ-118, SRJ-501):
+ * for each state in {@link RECONNECT_ROW_STATES}, one row per stub CONFLICT
+ * case the approver's `read-pane` rows cover (the approver's `send-keys`
+ * cases and "not this launch's session"), each refusing P's next check or
+ * recovery. The row name carries the state; the "not this launch's session"
+ * rows carry `leftoverOfEarlierLaunch` (SRJ-613).
+ */
+const RECONNECT_ROWS: readonly ConflictCaseRow[] = RECONNECT_LAST_READS.flatMap((lastRead) =>
+  APPROVER_ROWS.filter((approverRow) => approverRow.verb === 'read-pane').map((approverRow) => {
+    const caseRow = row(
+      RECONNECT_SITE,
+      REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
+      'send-keys',
+      approverRow.stubCase,
+      approverRow.latchCase,
+      RECONNECT_ROW_STATES[lastRead],
+      approverRow.options,
+    )
+    return Object.freeze({
+      ...caseRow,
+      name: caseRow.name.replace(RECONNECT_SITE, `${RECONNECT_SITE} (${lastRead})`),
+      ...(caseRow.latchCase === LATCH_CASE_NOT_THIS_LAUNCH ? { leftoverOfEarlierLaunch: true as const } : {}),
+    })
+  }),
+)
+
 /** Every CONFLICT latch row, for `test.each`. */
 export const CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze([
   // A plain spawn: the pre-spawn scan's refusals (nothing written, no row).
@@ -754,6 +842,8 @@ export const CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze([
   ...APPROVER_ROWS,
   // The liveness checks' `read-pane` sites (E18).
   ...LIVENESS_PANE_ROWS,
+  // The reconnect's `send-keys` (E19 T1).
+  ...RECONNECT_ROWS,
 ])
 
 /** The dialog approver's CONFLICT rows of {@link CONFLICT_CASE_ROWS} (its `read-pane` and `send-keys`), for `test.each`. */
@@ -769,6 +859,16 @@ export const LIVENESS_PANE_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Obje
 /** The liveness pane CONFLICT rows of one site kind, for `test.each`. */
 export function livenessPaneConflictRowsAt(site: LivenessPaneSite): readonly ConflictCaseRow[] {
   return LIVENESS_PANE_CONFLICT_CASE_ROWS.filter((caseRow) => caseRow.site === site)
+}
+
+/** The reconnect's `send-keys` CONFLICT rows of {@link CONFLICT_CASE_ROWS} (E19 T1), for `test.each`. */
+export const RECONNECT_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze(
+  CONFLICT_CASE_ROWS.filter((caseRow) => isReconnectSite(caseRow.site)),
+)
+
+/** The reconnect's CONFLICT rows for a caller that last read `lastRead`, for `test.each`. */
+export function reconnectConflictRowsAt(lastRead: ReconnectLastRead): readonly ConflictCaseRow[] {
+  return RECONNECT_CONFLICT_CASE_ROWS.filter((caseRow) => caseRow.rowState === RECONNECT_ROW_STATES[lastRead])
 }
 
 // ---------------------------------------------------------------------------
@@ -810,6 +910,7 @@ export type UnusableNameSite =
   | 'status'
   | 'get'
   | ApproverSite
+  | ReconnectSite
 
 /** The agent-director verb each site kind calls. */
 const UNUSABLE_NAME_SITE_VERB: Readonly<Record<UnusableNameSite, string>> = Object.freeze({
@@ -821,6 +922,7 @@ const UNUSABLE_NAME_SITE_VERB: Readonly<Record<UnusableNameSite, string>> = Obje
   'status': 'status',
   'get': 'get',
   ...APPROVER_SITE_VERB,
+  [RECONNECT_SITE]: 'send-keys',
 })
 
 /** Every site kind of {@link UnusableNameSite}, in row order. */
@@ -858,8 +960,12 @@ export interface UnusableNameCaseRow {
   readonly record: (key: string) => ConflictLatchRecord
 }
 
-/** The state each non-read site kind's path last read before its call (see the header). */
-const UNUSABLE_NAME_LAST_READ: Readonly<Record<UnusableNameSite, LatchRowState>> = Object.freeze({
+/**
+ * The state each non-read site kind's path last read before its call (see the
+ * header). The reconnect's rows take each state of {@link RECONNECT_ROW_STATES}
+ * instead.
+ */
+const UNUSABLE_NAME_LAST_READ: Readonly<Record<Exclude<UnusableNameSite, ReconnectSite>, LatchRowState>> = Object.freeze({
   'resume': ENDED,
   'plain spawn': LATCH_ROW_STATE_NO_ROW,
   'ladder kill': ENDED,
@@ -874,18 +980,22 @@ const UNUSABLE_NAME_LAST_READ: Readonly<Record<UnusableNameSite, LatchRowState>>
   'approver send-keys': PENDING,
 })
 
-function unusableNameRow(site: UnusableNameSite, fault: UnusableNameFault): UnusableNameCaseRow {
+function unusableNameRow(
+  site: UnusableNameSite,
+  fault: UnusableNameFault,
+  rowState: LatchRowState,
+  lastRead?: ReconnectLastRead,
+): UnusableNameCaseRow {
   const build = () => errUnusableName(fault)
   const message = classifyAdError(build()).message
   if (message === undefined) throw new Error(`conflict-cases: errUnusableName('${fault}') has no classification message`)
-  const rowState = UNUSABLE_NAME_LAST_READ[site]
   const record = (key: string): ConflictLatchRecord => {
     const input = unusableNameSetInput(key, build(), rowState)
     if (input === undefined) throw new Error(`conflict-cases: errUnusableName('${fault}') gives no unusable-name set input`)
     return expectedLatchRecord(key, input)
   }
   return Object.freeze({
-    name: `${site}: ${fault}`,
+    name: lastRead === undefined ? `${site}: ${fault}` : `${site} (${lastRead}): ${fault}`,
     site,
     verb: UNUSABLE_NAME_SITE_VERB[site],
     fault,
@@ -901,15 +1011,35 @@ function unusableNameRow(site: UnusableNameSite, fault: UnusableNameFault): Unus
   })
 }
 
-/** Every UNUSABLE NAME row: each fault of `UNUSABLE_NAME_FAULTS` at each site kind, for `test.each`. */
+/**
+ * Every UNUSABLE NAME row: each fault of `UNUSABLE_NAME_FAULTS` at each site
+ * kind (the reconnect's for each state in {@link RECONNECT_ROW_STATES}), for
+ * `test.each`.
+ */
 export const UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[] = Object.freeze(
-  UNUSABLE_NAME_SITES.flatMap((site) => UNUSABLE_NAME_FAULTS.map((fault) => unusableNameRow(site, fault))),
+  UNUSABLE_NAME_SITES.flatMap((site) =>
+    isReconnectSite(site)
+      ? RECONNECT_LAST_READS.flatMap((lastRead) =>
+          UNUSABLE_NAME_FAULTS.map((fault) => unusableNameRow(site, fault, RECONNECT_ROW_STATES[lastRead], lastRead)),
+        )
+      : UNUSABLE_NAME_FAULTS.map((fault) => unusableNameRow(site, fault, UNUSABLE_NAME_LAST_READ[site])),
+  ),
 )
 
 /** The dialog approver's UNUSABLE NAME rows of {@link UNUSABLE_NAME_CASE_ROWS} (its `status`, `read-pane` and `send-keys`), for `test.each`. */
 export const APPROVER_UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[] = Object.freeze(
   UNUSABLE_NAME_CASE_ROWS.filter((caseRow) => isApproverSite(caseRow.site)),
 )
+
+/** The reconnect's `send-keys` UNUSABLE NAME rows of {@link UNUSABLE_NAME_CASE_ROWS} (E19 T1), for `test.each`. */
+export const RECONNECT_UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[] = Object.freeze(
+  UNUSABLE_NAME_CASE_ROWS.filter((caseRow) => isReconnectSite(caseRow.site)),
+)
+
+/** The reconnect's UNUSABLE NAME rows for a caller that last read `lastRead`, for `test.each`. */
+export function reconnectUnusableNameRowsAt(lastRead: ReconnectLastRead): readonly UnusableNameCaseRow[] {
+  return RECONNECT_UNUSABLE_NAME_CASE_ROWS.filter((caseRow) => caseRow.rowState === RECONNECT_ROW_STATES[lastRead])
+}
 
 // ---------------------------------------------------------------------------
 // The launch start not recorded (b.jg5 SRJ-513, SRJ-408, SRJ-1020)

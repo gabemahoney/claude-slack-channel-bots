@@ -53,8 +53,11 @@
  *   - ErrInstanceIdCollision    (spawn / SR-1.4 idempotency)
  *   - ErrSpawnNotFound          (get / status / decide on missing row)
  *   - ErrSpawnNotInteractive    (send-keys / the row is `ended` or `missing`, or
- *                               `pending` without allow_pending: reconnectMcp's
- *                               dead-session verdict, b.dup)
+ *                               `pending` whose session may be another launch's
+ *                               or with no launch start: the reconnect's
+ *                               `dead-session` (`row-not-interactive`, b.dup),
+ *                               a route into the restart path's decision only;
+ *                               it does not prove the worker gone, b.jg5 SRJ-609)
  *   - ErrSendKeysWhileRelayed   (send-keys / the row sits on a relayed permission
  *                               prompt; UNCLASSIFIED under SRJ-104: CSCB gives it
  *                               no handling)

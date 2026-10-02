@@ -80,6 +80,14 @@
  * `ErrInternal` without the phrase at the same `resume` latches nothing,
  * posts no hold notice and takes E12's handling (the unclassified episode,
  * the UNCLASSIFIED cause armed, nothing counted).
+ *
+ * The reconnect as a latch site (SRJ-118, SRJ-505, on `makeRecoveryHarness`,
+ * both settings 0): P launches onto a colliding `waiting` row whose
+ * reconnect's one `send-keys` answers CONFLICT (a case-table reconnect row)
+ * or UNUSABLE NAME; P latches once with one post, and the same paths plus a
+ * health tick make no further `send-keys`, other tmux-touching call, raw tmux
+ * call or delete for P and count nothing, the retry timer stopping latched;
+ * Q launches and reconnects as before.
  * Recovery: each reason ("row reads" over every live and dead state) under
  * both latch kinds, with no line matching either list.
  *
@@ -472,6 +480,8 @@ import {
   isApproverSite,
   launchStartRecord,
   livenessPaneConflictRowsAt,
+  reconnectConflictRowsAt,
+  reconnectUnusableNameRowsAt,
   sessionEndingCommandsIn,
   tmuxTouchingCallCounts,
   tmuxTouchingCallsIn,
@@ -1823,7 +1833,7 @@ afterEach(() => {
   const built = harnesses
   harnesses = []
   _resetHealthCheckState()
-  // The raw tmux seams a case records (`recordRawTmux`); the harness puts back the killer and the ensurer.
+  // The raw tmux seams a case records (`recordRawTmux`); the harness puts back the killer.
   _resetTmuxCommandRunner()
   _resetTmuxSessionProber()
   for (const h of built) {
@@ -2029,6 +2039,41 @@ async function driveEveryPath({ h, killRow }: AutomatedPathsRun): Promise<EveryP
   return { launched, qCalls, notScheduledLines, attemptsBefore }
 }
 
+/**
+ * One health tick, its latched query bound as `main()` binds it, with Q's row
+ * read dead first; answers the keys it scheduled a restart for and what Q's
+ * part of the tick called.
+ */
+async function runHealthTick({ h, killRow }: AutomatedPathsRun): Promise<{ scheduled: string[]; qCalls: Record<string, number> }> {
+  const q = h.keys[1]!
+  const scheduled: string[] = []
+  initHealthCheck({
+    isSessionAlive: _buildIsSessionAliveAdapter(() => h.config),
+    isSessionConnected: () => false,
+    hasSessionStream: () => false,
+    isRestartPendingOrActive,
+    isLaunchInFlight,
+    isLatched: (key) => h.latch.isLatched(key),
+    isAtCap: (key) => isAtCap(key, RESTART_FAILURE_CAP),
+    statRoute: async () => true,
+    scheduleRestart: (key) => {
+      scheduled.push(key)
+    },
+    isShuttingDown: () => false,
+    getPersonas: () => Object.fromEntries(h.keys.map((key) => [key, personaOf(h, key).working_directory])),
+    endTmuxUnresponsive: (key) => {
+      h.tickEnd(key)
+    },
+    onTickEnd: (startedAt) => h.tickOnset(startedAt),
+    now: h.clock.now,
+  })
+  killRow(q)
+  const qBeforeTick = personaCallCounts(h, q)
+  await captureTimer('setInterval', () => startHealthCheck(1))()
+  stopHealthCheck()
+  return { scheduled, qCalls: callCountsSince(personaCallCounts(h, q), qBeforeTick) }
+}
+
 /** What Q's run of each `driveEveryPath` path calls: Q is unlatched, so each reaches the stub. */
 const Q_CALLS_ON_EVERY_PATH = [
   ['a new launch', { spawnCalls: 1, statusCalls: 1 }],
@@ -2050,9 +2095,8 @@ describe('AC 46: no automated path kills, launches or recovers a latched persona
   ]
   test.each(LATCH_ROWS)('P latched at %s: a new launch, the retry entry, a scheduled restart, a human-triggered restart, the retry timer and the health tick make no kill, spawn, resume or delete for P; one CONFLICT post; Q\'s paths reach the stub as before', async (_label, row, latchScript) => {
     const run = makeAutomatedPathsRun()
-    const { h, outcomes, killRow } = run
+    const { h, outcomes } = run
     const [p, q] = h.keys as [string, string]
-    const cwdOf = (key: string): string => personaOf(h, key).working_directory
 
     h.script(latchScript(h, p))
     expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
@@ -2068,33 +2112,8 @@ describe('AC 46: no automated path kills, launches or recovers a latched persona
     // Each request for P logged the not-scheduling line once, and nothing else naming P.
     expect(notScheduledLines).toEqual([[notSchedulingLine(p)], [notSchedulingLine(p)]])
 
-    // The health tick, its latched query bound as main() binds it; both rows read dead.
-    const scheduled: string[] = []
-    initHealthCheck({
-      isSessionAlive: _buildIsSessionAliveAdapter(() => h.config),
-      isSessionConnected: () => false,
-      hasSessionStream: () => false,
-      isRestartPendingOrActive,
-      isLaunchInFlight,
-      isLatched: (key) => h.latch.isLatched(key),
-      isAtCap: (key) => isAtCap(key, RESTART_FAILURE_CAP),
-      statRoute: async () => true,
-      scheduleRestart: (key) => {
-        scheduled.push(key)
-      },
-      isShuttingDown: () => false,
-      getPersonas: () => Object.fromEntries(h.keys.map((key) => [key, cwdOf(key)])),
-      endTmuxUnresponsive: (key) => {
-        h.tickEnd(key)
-      },
-      onTickEnd: (startedAt) => h.tickOnset(startedAt),
-      now: h.clock.now,
-    })
-    killRow(q)
-    const qBeforeTick = personaCallCounts(h, q)
-    await captureTimer('setInterval', () => startHealthCheck(1))()
-    stopHealthCheck()
-    qCalls.push(['the health tick', callCountsSince(personaCallCounts(h, q), qBeforeTick)])
+    const { scheduled, qCalls: qTickCalls } = await runHealthTick(run)
+    qCalls.push(['the health tick', qTickCalls])
 
     // P: since the latch, only the tick's liveness read; never a kill of its instance.
     expect(callCountsSince(personaCallCounts(h, p), pAtLatch)).toEqual({ statusCalls: 1 })
@@ -2478,6 +2497,94 @@ describe('SRJ-512: an UNUSABLE NAME from resume and from the working-row read-pa
     expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
     expect([getFailureCount(p), h.notices, h.startupErrors()]).toEqual([0, [], []])
     expect(personaCallCounts(h, p)).toEqual({ spawnCalls: 1, getCalls: 1, resumeCalls: 1 })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SRJ-118, SRJ-505, SRJ-502, SRJ-512: the reconnect is a latch site. P
+// launches onto a colliding `waiting` row and its reconnect's one `send-keys`
+// answers CONFLICT (a case-table reconnect row for `waiting`) or UNUSABLE
+// NAME: P latches once with one post, and no path that could retry it (a new
+// launch, the retry entry, a scheduled and a human-triggered restart, the
+// retry timer, the health tick) makes another `send-keys`, any other
+// tmux-touching call or a raw tmux call for P, or counts anything; Q's
+// launch and reconnect go on.
+// ---------------------------------------------------------------------------
+
+/** How P's reconnect latches: [label, P's expected record, P's one post, the stub answers of the launch]. */
+const RECONNECT_LATCH_WAYS: ReadonlyArray<
+  readonly [string, (key: string) => ConflictLatchRecord, (key: string) => string, (h: RecoveryHarness, key: string) => RecoveryStubScript]
+> = [
+  ...[reconnectConflictRowsAt('waiting')[0]!].map((row) => [
+    `CONFLICT (${row.name})`,
+    (key: string) =>
+      expectedLatchRecord(key, {
+        latchCase: row.latchCase,
+        refusedOperation: row.refusedOperation,
+        rowState: row.rowState,
+        sessionName: row.sessionName,
+        description: row.build().errDescription,
+      }),
+    () => row.notice.text,
+    (h: RecoveryHarness, key: string) => ({ ...collided(h, personaOf(h, key), { state: 'waiting' }), sendKeysError: row.build() }),
+  ] as const),
+  ...[reconnectUnusableNameRowsAt('waiting')[0]!].map((row) => [
+    `UNUSABLE NAME (${row.name})`,
+    (key: string) => row.record(key),
+    (key: string) => row.notice(key),
+    (h: RecoveryHarness, key: string) => ({ ...collided(h, personaOf(h, key), { state: 'waiting' }), sendKeysError: row.build() }),
+  ] as const),
+]
+
+describe('SRJ-118, SRJ-505: a CONFLICT or UNUSABLE NAME at the reconnect\'s send-keys holds P, and no automated path retries it (recovery harness)', () => {
+  test.each(RECONNECT_LATCH_WAYS)('P latched by its reconnect\'s %s: one post; then a new launch, the retry entry, a scheduled and a human-triggered restart, the retry timer and the health tick make no send-keys, other tmux-touching call, raw tmux call or delete for P and count nothing; the retry timer is stopped; Q launches and reconnects as before', async (_label, record, notice, latchScript) => {
+    const run = makeAutomatedPathsRun()
+    const { h, outcomes } = run
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    const [p, q] = h.keys as [string, string]
+    const session = personaTmuxSessionName(p)
+    const raw = recordRawTmux()
+
+    h.script(latchScript(h, p))
+    expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
+    expect(h.latch.record(p)).toEqual(record(p))
+    expect(h.stub.calls.sendKeysCalls.map((call) => call.claude_instance_id)).toEqual([personaInstanceId(p)])
+    h.script({ ...CLEARED, sendKeysError: undefined })
+    const touchingAtLatch = tmuxTouchingCallCounts(h.stub.calls)
+    const rawAtLatch = raw.length
+
+    const { launched, qCalls, notScheduledLines, attemptsBefore } = await driveEveryPath(run)
+    const tick = await runHealthTick(run)
+
+    // Nothing tmux-touching (the send-keys included), raw or deleting reached P after the latch.
+    expect(tmuxTouchingCallsIn(h.stub.calls, touchingAtLatch).filter((call) => instanceOf(call.params) === personaInstanceId(p))).toEqual([])
+    expect(h.stub.calls.sendKeysCalls.filter((call) => call.claude_instance_id === personaInstanceId(p))).toHaveLength(1)
+    expect(raw.slice(rawAtLatch).filter((call) => call.target.includes(session))).toEqual([])
+    expect(h.stub.calls.deleteCalls.filter((call) => instanceOf(call) === personaInstanceId(p))).toEqual([])
+    // Each path stopped for P: the launch and the retry entry answered latched, no restart timer, the retry timer stopped latched, the tick scheduled nothing for it.
+    expect(launched).toEqual([{ key: p, action: 'latched' }, { key: q, action: 'spawned' }])
+    expect(outcomes).toEqual([
+      [p, RESTART_OUTCOME_LATCHED],
+      ...[1, 2, 3, 4].map(() => [q, RESTART_OUTCOME_LAUNCHED] as const),
+    ])
+    expect(notScheduledLines).toEqual([[notSchedulingLine(p)], [notSchedulingLine(p)]])
+    expect(h.attempts.slice(attemptsBefore).map((a) => [a.key, a.retry])).toEqual([[p, 1], [q, 1], [q, 2]])
+    expect(h.stops.filter((stop) => stop.key === p)).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
+    expect([h.controller.armedKeys(), isRestartPendingOrActive(p)]).toEqual([[], false])
+    expect(tick.scheduled).toEqual([q])
+    // Nothing counted, no spawn-failure notice or spawn-failed entry, one latch and exactly one post.
+    expect([getFailureCount(p), getFailureCount(q)]).toEqual([0, 0])
+    expect(h.notices).toEqual([])
+    expect(h.startupErrors()).toEqual([])
+    expect(latchSteps(h)).toEqual(oneLatch(p))
+    expect(h.episodeNotices).toEqual([{ key: p, text: notice(p) }])
+    expect(h.latch.isLatched(q)).toBe(false)
+    // Q, beside it, reaches the stub on every path, and its own reconnect on a waiting row is typed.
+    expect(qCalls).toEqual([...Q_CALLS_ON_EVERY_PATH])
+    expect(tick.qCalls).toEqual({ statusCalls: 1 })
+    h.script(collided(h, personaOf(h, q), { state: 'waiting' }))
+    expect(await h.launch(q)).toEqual({ key: q, action: 'reconnected' })
+    expect(h.stub.calls.sendKeysCalls.filter((call) => call.claude_instance_id === personaInstanceId(q))).toHaveLength(1)
   })
 })
 

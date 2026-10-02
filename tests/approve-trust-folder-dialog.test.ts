@@ -217,6 +217,7 @@ import {
   errConfigMalformed,
   errGeneric,
   errInternal,
+  errSendKeysWhileRelayed,
   errSpawnNotFound,
   errSpawnNotInteractiveLeftover,
   errSpawnNotInteractiveNoLaunchStart,
@@ -1415,11 +1416,7 @@ describe('approvePreSessionDialogs: each answer by class, one case per cell (b.j
   const UNCLASSIFIED_CELLS: readonly Cell[] = [
     ...cellsOf('UNCLASSIFIED (ErrInternal with no phrase)', VERBS, () => errInternal()),
     ...cellsOf('UNCLASSIFIED (an error name CSCB gives no handling)', VERBS, (verb) => errGeneric(verb, 'ErrBroken')),
-    [
-      'send-keys: UNCLASSIFIED (ErrSendKeysWhileRelayed)',
-      'send-keys',
-      () => errGeneric('send-keys', 'ErrSendKeysWhileRelayed', 'the row sits on a relayed permission prompt; nothing was sent'),
-    ],
+    ['send-keys: UNCLASSIFIED (ErrSendKeysWhileRelayed)', 'send-keys', () => errSendKeysWhileRelayed()],
   ]
 
   test.each(UNCLASSIFIED_CELLS)(

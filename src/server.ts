@@ -85,7 +85,9 @@ import {
   checkPromptRowDeferral,
   checkWaitingRowPane,
   checkWorkingRowPane,
+  DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE,
   deletePersonaInstance,
+  escalateDeadVerdictOfCause,
   ESCALATE_DEAD_REPROBE_DECIDES,
   ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ,
   ESCALATE_DEAD_WAITING_ROW_PANE_GONE,
@@ -227,6 +229,7 @@ import {
   isRestartPendingOrActive,
   runRestartRetry,
   KILL_SESSION_REFUSED,
+  RECONNECT_ESCALATE_DEAD_NO_KILL,
   RESTART_FAILURE_CAP,
   type KillSessionResult,
 } from './restart.ts'
@@ -1802,13 +1805,31 @@ export function _buildKillSessionAdapter(
  *   - `ended` or `missing` — read here, or reached between this status read
  *     and the keystrokes (a findMissing sweep, such as the one another
  *     persona's launch wait starts with, marked the row missing) → the
- *     refused keystrokes make `reconnectMcp` answer 'dead-session', which
- *     escalates below: the claude process is gone, and when restart.ts's
- *     re-probe reads the row dead it relaunches the persona in the same run
- *     (b.d61); a row that still reads live is swept again at each later
- *     escalate-dead tick (b.jg5 SRJ-610).
- *     No spawn-failure notice is raised. Its escalate-dead line has the
- *     verdict `row-not-interactive` (b.jdc), not a dead tmux session's.
+ *     refused keystrokes make the reconnect answer 'dead-session' with cause
+ *     `row-not-interactive`, which is swept with that verdict (b.jdc) and
+ *     answered `RECONNECT_ESCALATE_DEAD_NO_KILL`: a route into restart.ts's
+ *     decision only, since a finished row (or a `pending` row whose session
+ *     may be another launch's, b.jg5 SRJ-613) does not prove the worker gone
+ *     (b.jg5 SRJ-609). When restart.ts's re-probe reads the row dead it
+ *     relaunches the persona in the same run with no kill (b.d61); a row
+ *     that still reads live is swept again at each later escalate-dead tick
+ *     (b.jg5 SRJ-610). No spawn-failure notice is raised.
+ *
+ * b.jg5 SRJ-118, SRJ-609 — the reconnect itself (`reconnectMcpWithCause`,
+ * with the row state this adapter's `status` read gave as its last read) is
+ * one `send-keys`, never retried, with no tmux server start. Its answer maps:
+ *   - `ok` → 'success';
+ *   - `dead-session` → one dead-tmux sweep (`sweepDeadTmuxChannelWithCause`)
+ *     with the verdict its cause gives (`escalateDeadVerdictOfCause`):
+ *     `tmux-gone` (GONE) → `dead-session`, `row-not-interactive` →
+ *     `row-not-interactive`, `row-absent` (`ErrSpawnNotFound`, a row read) →
+ *     `row-absent-at-pane-read`, never `tmux-gone`'s; then 'escalate-dead',
+ *     or `RECONNECT_ESCALATE_DEAD_NO_KILL` for `row-not-interactive`
+ *     ('transient' when the sweep was refused, b.jg5 SRJ-105);
+ *   - `transient` (the reconnect latched the persona on a CONFLICT or
+ *     UNUSABLE NAME, found it latched, or met UNAVAILABLE, ENVIRONMENT,
+ *     CONFIG or UNCLASSIFIED) → 'transient' with no sweep: nothing typed,
+ *     nothing counted, no spawn-failure notice.
  *
  * b.jg5 SRJ-115, SRJ-512, SRJ-513 — the state read applies the session manager's
  * own-row `status` step (`applyOwnRowStatusStep`) after its own call, on the
@@ -1852,7 +1873,7 @@ export function _buildKillSessionAdapter(
 export function _buildReconnectSessionAdapter(
   getPersona?: (key: string) => Persona | undefined,
   isLatched?: (key: string) => boolean,
-): (key: string) => Promise<'success' | 'escalate-dead' | 'transient' | 'pending'> {
+): (key: string) => Promise<'success' | 'escalate-dead' | typeof RECONNECT_ESCALATE_DEAD_NO_KILL | 'transient' | 'pending'> {
   // `key` is the persona key.
   return async (key: string) => {
     let state: string
@@ -1913,16 +1934,18 @@ export function _buildReconnectSessionAdapter(
     }
     // Widened return type (SR-25.1 single counting site): surface the
     // ReconnectOutcome to restart.ts so it can call recordSuccess on the
-    // success path. Map main's ReconnectOutcome onto the restart union —
+    // success path. Map the ReconnectOutcome onto the restart union —
     // 'ok' is the only success signal restart.ts acts on; 'dead-session'
-    // and 'failed' are non-success (no recordSuccess, no recordFailure).
-    // 'dead-session' maps to 'escalate-dead' (b.9a7-amended): restart.ts does
-    // not re-enter scheduleRestart on it. For the dead-tmux escalate-dead case
+    // and 'transient' are non-success (no recordSuccess, no recordFailure).
+    // 'dead-session' maps to an escalate-dead answer (b.9a7-amended):
+    // restart.ts does not re-enter scheduleRestart on it. For the escalate-dead case
     // (b.sv7 / Epic t1.tkk.e4), CSCB recovers ITSELF: we fire the internal
     // sweep wrapper here, which may reconcile the frozen `working` row to
     // `missing`, and restart.ts probes liveness again in the same restart run
     // (b.d61): a re-probe that reads `dead` takes the normal kill+relaunch
-    // branch at once. `pending` or `unknown` leaves the relaunch undone
+    // branch at once (the relaunch alone after
+    // `RECONNECT_ESCALATE_DEAD_NO_KILL`, b.jg5 SRJ-609). `pending` or
+    // `unknown` leaves the relaunch undone
     // (`unknown` arms the retry timer). The sweep may leave the row live (in
     // `unverified_ids`, or, when `pending`, not judged at all, b.jg5
     // SRJ-120), and the row may then stay live for further ticks: nothing
@@ -1948,14 +1971,17 @@ export function _buildReconnectSessionAdapter(
     // meanwhile. Ask the latch right before typing: a latched persona (or a
     // query that throws: fail safe) gets nothing typed, 'transient'.
     if (latchedNow()) return 'transient'
-    const result = await reconnectMcpWithCause(key)
+    // b.jg5 SRJ-118, SRJ-501: the reconnect's last read is this adapter's
+    // `status` read (`waiting`, or a stale `working` row).
+    const result = await reconnectMcpWithCause(key, latchRowStateRead(state))
     if (result.outcome === 'ok') return 'success'
     if (result.outcome === 'dead-session') {
       // b.sv7: trigger the internal memoized findMissing sweep (b.m4r) before
-      // returning the verdict. The 'escalate-dead' return value is unchanged
-      // regardless of sweep outcome (the wrapper never throws). b.jdc: the
-      // verdict says what proved the session dead, so the line doesn't claim
-      // a dead tmux session for a refused keystroke (b.dup).
+      // returning the verdict. The escalate-dead return value is unchanged
+      // regardless of sweep outcome (the wrapper never throws). b.jdc, b.jg5
+      // SRJ-118: the verdict says what agent-director answered, so the line
+      // claims no dead tmux session for a refused keystroke (b.dup) or an
+      // absent row.
       //
       // Memo-TTL vs. tick-cadence: reconcileMissingSweep's 10s memo window is
       // harmless at the ~120s health-check tick cadence — a later
@@ -1968,9 +1994,13 @@ export function _buildReconnectSessionAdapter(
       // findMissing reconciles the whole store for every escalating persona.
       // b.jg5 SRJ-105: a refused sweep stops the restart run: 'transient',
       // so no re-probe, kill or relaunch follows.
-      const sweep = await sweepDeadTmuxChannelWithCause(key, result.deadCause === 'row-not-interactive' ? 'row-not-interactive' : 'dead-session')
-      return sweep.refused ? 'transient' : 'escalate-dead'
+      const sweep = await sweepDeadTmuxChannelWithCause(key, escalateDeadVerdictOfCause(result.deadCause))
+      if (sweep.refused) return 'transient'
+      // b.jg5 SRJ-609: a refusal as not interactive never by itself leads to
+      // a kill; restart.ts relaunches after a `dead` re-probe with no kill.
+      return result.deadCause === DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE ? RECONNECT_ESCALATE_DEAD_NO_KILL : 'escalate-dead'
     }
+    // b.jg5 SRJ-118: 'transient' — nothing typed, no sweep, nothing counted.
     return 'transient'
   }
 }
@@ -2132,8 +2162,9 @@ export const LAUNCH_START_LOG_RE = /^[0-9TZ:.+-]{1,40}$/
  * The `pending` deferral for persona `key` (b.dup; b.jg5 SRJ-314, and the
  * entry point of SRJ-409's pending-row handling): its row reads `pending`, so
  * its session has not started. agent-director would refuse keystrokes to it
- * (`ErrSpawnNotInteractive`, which `reconnectMcp` reads as a dead session),
- * and the session connects its MCP servers on its own once it starts. Two
+ * (`ErrSpawnNotInteractive`, which the reconnect answers as `dead-session`
+ * with cause `row-not-interactive`, a route into the restart path's decision
+ * only, b.jg5 SRJ-609), and the session connects its MCP servers on its own once it starts. Two
  * callers reach it: the restart work, through `RestartDeps.deferPendingRow`
  * (bound in `main()`), when its liveness probe reads `pending`, whatever the
  * session's connection shows; and the reconnect adapter, when its own

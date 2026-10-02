@@ -1590,9 +1590,10 @@ function describeCause(cause: UnavailableRetryCause): string {
  * - UNCLASSIFIED from any declared verb but `status`, `get` and `list` (an
  *   unknown verb, which might be a read, arms nothing): an `unclassified` cause
  *   (`UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED`, SRJ-301, SRJ-313). An
- *   `ErrInvalidFlags` is STATE here; the resume path, which gives it no
- *   meaning, arms through the outage state's site entry
- *   (`reportUnclassifiedAtSite`) after its re-check;
+ *   `ErrInvalidFlags` is STATE here; the resume path, the shared pane reader
+ *   and the reconnect's `send-keys`, which give it no meaning, arm through
+ *   the outage state's site entry (`reportUnclassifiedAtSite`) after their
+ *   re-check;
  * - any other `status`, `get` or `list` error: a `read-error` cause, except
  *   `ErrSpawnNotFound` (each site keeps its meaning) and an UNUSABLE NAME
  *   answer (its own handling, SRJ-105);
