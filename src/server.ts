@@ -76,7 +76,7 @@ import {
   type ServerSettings,
   MCP_SERVER_NAME,
 } from './config.ts'
-import { personaInstanceId, personaTmuxSessionName, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
+import { personaInstanceId, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
 import {
   APPROVER_STOP_TEARDOWN,
   applyOwnRowStatusStep,
@@ -97,7 +97,6 @@ import {
   forgetNotConnectedEpisode,
   forgetWorkingRowEvidence,
   hasPendingWorkingRowEvidence,
-  hasPersonaTmuxSession,
   holdLaunchIfConfigDirUnresolvable,
   isDialogApproverRunning,
   isLaunchInFlight,
@@ -139,6 +138,7 @@ import {
   PANE_READ_UNCLASSIFIED,
   paneReadClassNote,
   type PaneReadFailure,
+  PROBE_PANE_READ_LINES,
 } from './pane-read.ts'
 import { createPersonaNotifier } from './persona-notifier.ts'
 import {
@@ -1676,12 +1676,27 @@ export function _buildKillSessionAdapter(
  * into an `ask_user` or `check_permission` session could confirm the dialog's
  * default, so those states are deferred too ('transient'): the deferral is
  * logged, and the persona's `blocked-on-prompt` not-connected notice is raised
- * (once per episode). b.jdc: only while its session may still be waiting on
- * the prompt. The row keeps its state after the session dies, so the
- * persona's tmux session is probed first: a gone one is swept and escalated
- * ('escalate-dead', no notice), and once the deferrals have run for
- * `PROMPT_ROW_SWEEP_AFTER_MS` each one first sweeps and reads the row again
- * (`promptRowReconnectVerdict`). Once the prompt is answered, a later tick reconnects it
+ * (once per episode). b.jdc, b.jg5 SRJ-606: only while its session may
+ * still be waiting on the prompt. The row keeps its state after the session
+ * dies, so the row is read first with one one-line `read-pane` through the
+ * shared reader (`promptRowReconnectVerdict`: `PROBE_PANE_READ_LINES`, no
+ * tmux call), answered by b.jg5 SRJ-117's b.jdc reconnect-verdict column:
+ *   - a pane → the deferral: once the deferrals have run for
+ *     `PROMPT_ROW_SWEEP_AFTER_MS` each one first sweeps and reads the row
+ *     again (`checkPromptRowDeferral`), and otherwise `deferPromptRow`
+ *     defers with the notice. A pane leads at most to the deferral;
+ *   - GONE → the dead-tmux sweep (verdict `prompt-row-tmux-gone`) and
+ *     'escalate-dead', with no notice; the row absent (`ErrSpawnNotFound`)
+ *     → the same with the verdict `row-absent-at-pane-read`;
+ *   - UNAVAILABLE (timeouts included), CONFIG (the wrapper raised the
+ *     `ad-config-malformed` outage) or UNCLASSIFIED → taken as alive: the
+ *     deferral;
+ *   - ENVIRONMENT (the wrapper raised the `tmux-unavailable` outage) →
+ *     'transient', with no deferral noted and no notice;
+ *   - CONFLICT or UNUSABLE NAME (the reader latched the persona with the row
+ *     state the adapter read), or a persona already latched → 'transient',
+ *     with no deferral noted, no notice and nothing typed.
+ * Once the prompt is answered, a later tick reconnects it
  * when it can tell the session is idle again (its row reads `waiting`, or the
  * positive-idle rule shows a `working` row stale).
  *
@@ -1849,14 +1864,15 @@ export function _buildKillSessionAdapter(
  * latch the persona while they run, after the restart work's own latched
  * check. So the latch (`isLatched`, `reconnectLatchedAt`) is asked again after
  * each awaited step that a further call follows: right after the state read,
- * before any branch on the state (so no pane read, tmux probe, sweep or
- * notice follows it); in the `working`-row verdict, right after its
- * `read-pane`, before the fold, the sweep or a deferral; in the prompt-row
- * verdict, right after the tmux probe, before the sweep; in the `waiting`
- * branch, right after its `read-pane`'s GONE or absent answer, before the
- * sweep; right before each not-connected notice the `working` and `waiting`
- * checks raise (the `unproven-idle` notice a noted deferral can raise, and
- * the `blocked-on-prompt` notice), passed to them as `latchedNow`; and right
+ * before any branch on the state (so no pane read, sweep or notice follows
+ * it); in the `working`-row verdict, right after its `read-pane`, before the
+ * fold, the sweep or a deferral; in the prompt-row verdict, right after its
+ * `read-pane`, before the sweep or the deferral, and again right before
+ * `deferPromptRow`'s `blocked-on-prompt` notice; in the `waiting` branch,
+ * right after its `read-pane`'s GONE or absent answer, before the sweep;
+ * right before each not-connected notice the `working` and `waiting` checks
+ * raise (the `unproven-idle` notice a noted deferral can raise, and the
+ * `blocked-on-prompt` notice), passed to them as `latchedNow`; and right
  * before `/mcp reconnect` is typed. A latched persona, or a query that throws (fail
  * safe), gets nothing more done and one line naming it, and the adapter
  * answers 'transient', which restart.ts neither counts nor escalates to a
@@ -1901,8 +1917,8 @@ export function _buildReconnectSessionAdapter(
       return 'transient'
     }
     // b.jg5 SRJ-502: the state read is awaited, and the persona may have
-    // latched elsewhere meanwhile; a latched persona gets no pane read, tmux
-    // probe, sweep or notice, and nothing typed.
+    // latched elsewhere meanwhile; a latched persona gets no pane read, sweep
+    // or notice, and nothing typed.
     const latchedNow = (): boolean => reconnectLatchedAt(key, isLatched)
     if (latchedNow()) return 'transient'
     // b.f2b: the evidence for a `working` row spans consecutive attempts that
@@ -2022,9 +2038,9 @@ function reconnectLatchedByRead(key: string): 'transient' {
 
 /**
  * The reconnect adapter's latched gate (b.jg5 SRJ-502), asked after its
- * state read, after the `read-pane` of a `working` or `waiting` row and the
- * tmux probe of a prompt row, right before each not-connected notice of the
- * `working` and `waiting` checks, and right before `/mcp reconnect` is typed
+ * state read, after the `read-pane` of a `working`, `waiting` or prompt row,
+ * right before each not-connected notice of the `working`, `waiting` and
+ * prompt-row checks, and right before `/mcp reconnect` is typed
  * (see `_buildReconnectSessionAdapter`): true, after logging one line naming
  * the persona,
  * when `isLatched` answers exactly `true` for persona `key` or throws (fail
@@ -2046,40 +2062,71 @@ function reconnectLatchedAt(key: string, isLatched: ((key: string) => boolean) |
 }
 
 /**
- * b.jdc: the reconnect adapter's verdict for a persona whose row reads
- * `ask_user` or `check_permission` (see `_buildReconnectSessionAdapter`).
- * Nothing is ever typed into such a row (b.rmy). But a session that dies
- * under a prompt keeps its row in that state (agent-director only refreshes a
- * row at SessionEnd and leaves reaping to its findMissing sweep), so the row
- * alone is no proof anyone is waiting on a prompt. Checked in order, the
- * probe before the notice:
- *   - a launch for the persona is in flight → 'transient', with no tmux probe
- *     and no notice: the launch owns the session;
- *   - latched by the time the tmux probe answers (`latchedNow`, the
- *     adapter's `reconnectLatchedAt` for the persona; b.jg5 SRJ-502) →
- *     'transient', with no sweep, no deferral noted and no notice;
- *   - its own tmux session is gone (`hasPersonaTmuxSession`, exact target) →
- *     the dead-tmux sweep (`sweepDeadTmuxChannelWithCause`, verdict
- *     `prompt-row-tmux-gone`) and 'escalate-dead', with no notice: restart.ts
- *     re-probes and, when the row reads dead, relaunches the persona in the
- *     same run (b.d61); a row the sweep leaves live may stay live for
- *     further ticks (b.jg5 SRJ-120), each escalate-dead tick sweeping again
- *     with no step beyond the sweep and the slow-recovery notice posted once
- *     after 3 such ticks (b.jg5 SRJ-610, SRJ-1010);
- *   - alive, or the probe failed (no proof it is dead) → one more deferral on
- *     the row (`checkPromptRowDeferral`): once the run has lasted
- *     `PROMPT_ROW_SWEEP_AFTER_MS`, it sweeps and reads the row again, and a
- *     row now `ended` or `missing` escalates the same way; otherwise
- *     `deferPromptRow` defers and raises the notice, as before. A persona
- *     latched once that sweep is done (a post-run `get` of its own row read
- *     a `provenance_conflict` note, b.jg5 SRJ-114, SRJ-120, or the latch
- *     answers it latched) gets no row read and is never escalated: the check
- *     answers `latched`, and this answers 'transient' with no notice, since the
- *     persona is held (b.jg5 SRJ-502) and its latch's own notice already
- *     tells the human (SRJ-508).
- * A refused sweep at either step (b.jg5 SRJ-105) answers 'transient', with
- * no notice: nothing is re-probed, killed or relaunched.
- * Never throws: the sweep and the deferral check swallow their own failures.
+ * b.jdc, b.jg5 SRJ-606: the reconnect adapter's verdict for a persona whose
+ * row reads `ask_user` or `check_permission` (see
+ * `_buildReconnectSessionAdapter`), b.jg5 SRJ-117's "b.jdc reconnect
+ * verdict" column. Nothing is ever typed into such a row (b.rmy). But a
+ * session that dies under a prompt keeps its row in that state
+ * (agent-director only refreshes a row at SessionEnd and leaves reaping to
+ * its findMissing sweep), so the row alone is no proof anyone is waiting on
+ * a prompt. Checked in order:
+ *   - a launch for the persona is in flight → 'transient', first and with no
+ *     agent-director call and no notice: the launch owns the session;
+ *   - otherwise one `read-pane` of the persona's own row through the shared
+ *     reader (`readPersonaOwnPane`: `PROBE_PANE_READ_LINES`, the row state
+ *     the adapter read as the recorded state), with no tmux call, mapped:
+ *     - CONFLICT or UNUSABLE NAME (the reader latched the persona with that
+ *       row state and logged its line, b.jg5 SRJ-501, SRJ-512), or a persona
+ *       already latched, which the reader does not read → 'transient', with
+ *       no deferral noted and no notice (`promptRowLatchedLine`);
+ *     - an UNCLASSIFIED carrying the stop mark (`stopping`: the reader's
+ *       `ErrInvalidFlags` re-check decided that the server stops, b.jg5
+ *       SRJ-205) → 'transient', nothing more called
+ *       (`promptRowPaneReadStoppingLine`);
+ *     - latched by the time the read answers (`latchedNow`, the adapter's
+ *       `reconnectLatchedAt` for the persona; b.jg5 SRJ-502) → 'transient',
+ *       with no sweep, no deferral noted and no notice;
+ *     - a pane → the deferral below: a pane leads at most to the deferral;
+ *     - GONE (`ErrTmuxCaptureFailed`: agent-director found no pane of the
+ *       row's launch) → the run of deferrals on the row ends, the dead-tmux
+ *       sweep runs (`escalateRowWithNoPane`, verdict `prompt-row-tmux-gone`)
+ *       and the answer is 'escalate-dead', with no notice
+ *       (`promptRowPaneGoneLine`);
+ *     - the row absent (`ErrSpawnNotFound`) → the same with the verdict
+ *       `row-absent-at-pane-read`: a row read that takes the GONE column
+ *       without being a GONE (b.jg5 SRJ-117; `promptRowAbsentAtPaneReadLine`);
+ *     - UNAVAILABLE (timeouts included), CONFIG (the wrapper raised the
+ *       `ad-config-malformed` outage, b.jg5 SRJ-316) or UNCLASSIFIED (b.jg5
+ *       SRJ-105: the wrapper reported the persona's unclassified-error
+ *       episode, or the reader did after an `ErrInvalidFlags` re-check) →
+ *       taken as alive, with one line naming the class
+ *       (`promptRowTakenAsAliveLine`), then the deferral below: a read that
+ *       could not run is never proof the session is dead (b.rmy);
+ *     - ENVIRONMENT (the wrapper raised the `tmux-unavailable` outage, b.jg5
+ *       SRJ-311) → 'transient', with no deferral noted and no notice
+ *       (`promptRowPaneReadEnvironmentLine`).
+ * The deferral is one more deferral on the row (`checkPromptRowDeferral`):
+ * once the run has lasted `PROMPT_ROW_SWEEP_AFTER_MS`, it sweeps and reads
+ * the row again, and a row now `ended` or `missing` answers 'escalate-dead';
+ * a persona latched once that sweep is done (a post-run `get` of its own row
+ * read a `provenance_conflict` note, b.jg5 SRJ-114, SRJ-120, or the latch
+ * answers it latched) gets no row read and is never escalated: the check
+ * answers `latched`, and this answers 'transient' with no notice, since the
+ * persona is held (b.jg5 SRJ-502) and its latch's own notice already tells
+ * the human (SRJ-508). Otherwise the latch is asked once more (`latchedNow`)
+ * right before `deferPromptRow`, which defers and raises the
+ * `blocked-on-prompt` notice: a persona latched meanwhile (for example by a
+ * launch outside the restart serializer during the `read-pane`) gets
+ * 'transient' with no notice.
+ * After 'escalate-dead' restart.ts re-probes and, when the row reads dead,
+ * kills and relaunches the persona in the same run (b.d61); a row the sweep
+ * leaves live may stay live for further ticks (b.jg5 SRJ-120), each
+ * escalate-dead tick sweeping again with no step beyond the sweep and the
+ * slow-recovery notice posted once after 3 such ticks (b.jg5 SRJ-610,
+ * SRJ-1010). A refused sweep at either step (b.jg5 SRJ-105) answers
+ * 'transient', with no notice: nothing is re-probed, killed or relaunched.
+ * Never throws: the reader, the sweep and the deferral check swallow their
+ * own failures.
  */
 async function promptRowReconnectVerdict(
   key: string,
@@ -2090,40 +2137,143 @@ async function promptRowReconnectVerdict(
     console.error(`[slack] reconnectSession: persona=${key} is ${state} and a launch for it is in flight — deferring to a later tick (b.jdc)`)
     return 'transient'
   }
-  let tmuxAlive: boolean
-  try {
-    tmuxAlive = await hasPersonaTmuxSession(key)
-  } catch (err) {
-    console.error(
-      `[slack] reconnectSession: persona=${key} is ${state} and its tmux session probe failed: ${describeThrownValue(err)} — taking the session as alive (b.jdc/b.rmy)`,
-    )
-    tmuxAlive = true
+  const read = await readPersonaOwnPane(key, {
+    nLines: PROBE_PANE_READ_LINES,
+    // The adapter has just read the row in this prompt state.
+    lastRead: latchRowStateRead(state),
+    site: PROMPT_ROW_PANE_READ_SITE,
+  })
+  if (read.kind === PANE_READ_LATCHED) {
+    console.error(promptRowLatchedLine(key, state))
+    return 'transient'
   }
-  // b.jg5 SRJ-502: latched during the probe → no sweep, no deferral, no notice.
+  // b.jg5 SRJ-205: the reader's version re-check decided that the server
+  // stops → nothing more is called for the persona.
+  if (read.kind === PANE_READ_UNCLASSIFIED && read.stopping === true) {
+    console.error(promptRowPaneReadStoppingLine(key, state, read))
+    return 'transient'
+  }
+  // b.jg5 SRJ-502: latched during the read → no sweep, no deferral, no notice.
   if (latchedNow()) return 'transient'
-  if (!tmuxAlive) {
-    endPromptRowDeferral(key)
-    console.error(promptRowTmuxGoneLine(key, state))
-    const sweep = await sweepDeadTmuxChannelWithCause(key, 'prompt-row-tmux-gone')
-    return sweep.refused ? 'transient' : 'escalate-dead'
+  switch (read.kind) {
+    case PANE_READ_PANE:
+      return promptRowDeferral(key, state, latchedNow)
+    case PANE_READ_GONE:
+      endPromptRowDeferral(key)
+      console.error(promptRowPaneGoneLine(key, state, read))
+      return escalateRowWithNoPane(key, 'prompt-row-tmux-gone', latchedNow)
+    case PANE_READ_ABSENT:
+      endPromptRowDeferral(key)
+      console.error(promptRowAbsentAtPaneReadLine(key, state, read))
+      return escalateRowWithNoPane(key, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, latchedNow)
+    case PANE_READ_UNAVAILABLE:
+    case PANE_READ_CONFIG:
+    case PANE_READ_UNCLASSIFIED:
+      console.error(promptRowTakenAsAliveLine(key, state, read))
+      return promptRowDeferral(key, state, latchedNow)
+    case PANE_READ_ENVIRONMENT:
+      console.error(promptRowPaneReadEnvironmentLine(key, state, read))
+      return 'transient'
   }
+}
+
+/** The site label of the prompt-row verdict's read, the head of the shared reader's latch line. */
+const PROMPT_ROW_PANE_READ_SITE = 'reconnectSession: prompt row'
+
+/**
+ * b.jdc: `promptRowReconnectVerdict`'s deferral, for a pane or a read taken
+ * as alive: one more deferral on the row (`checkPromptRowDeferral`), then
+ * 'escalate-dead' for a row its 10-minute sweep found `ended` or `missing`,
+ * 'transient' with no notice for a refused sweep or a persona latched after
+ * it, and otherwise, unless `latchedNow` finds the persona latched right
+ * before it (b.jg5 SRJ-502: 'transient', no notice), `deferPromptRow`'s
+ * deferral and notice. Never throws.
+ */
+async function promptRowDeferral(
+  key: string,
+  state: string,
+  latchedNow: () => boolean,
+): Promise<'escalate-dead' | 'transient'> {
   const deferral = await checkPromptRowDeferral(key, state)
   if (deferral === 'escalate') return 'escalate-dead'
   if (deferral === 'refused') return 'transient'
   // b.jg5 SRJ-502: latched after the sweep (its line is logged there): no notice.
   if (deferral === 'latched') return 'transient'
+  // b.jg5 SRJ-502: latched elsewhere while the read or the deferral check was
+  // awaited (the gate logs its line): no notice.
+  if (latchedNow()) return 'transient'
   return deferPromptRow(key, state)
 }
 
 /**
  * `promptRowReconnectVerdict`'s line when persona `key`'s row reads `state`
- * (`ask_user` or `check_permission`) but its own tmux session is gone (b.jdc).
+ * (`ask_user` or `check_permission`) and the row's `read-pane` answered GONE
+ * (b.jdc, b.jg5 SRJ-606); `read` is that failure. Exported for tests.
+ *
+ * @internal
+ */
+export function promptRowPaneGoneLine(key: string, state: string, read: PaneReadFailure): string {
+  return `[slack] reconnectSession: persona=${key} is ${state} but agent-director's read-pane found no pane of its launch: ${read.description} — not deferring; ${ESCALATE_DEAD_REPROBE_DECIDES} (${paneReadClassNote(read)}; b.jdc, b.jg5 SRJ-606)`
+}
+
+/**
+ * `promptRowReconnectVerdict`'s line when persona `key`'s row reads `state`
+ * but was absent (`ErrSpawnNotFound`) at its `read-pane` (b.jg5 SRJ-117);
+ * `read` is that failure. Exported for tests.
+ *
+ * @internal
+ */
+export function promptRowAbsentAtPaneReadLine(key: string, state: string, read: PaneReadFailure): string {
+  return `[slack] reconnectSession: persona=${key} is ${state} but its agent-director row was absent at the pane read: ${read.description} — not deferring; ${ESCALATE_DEAD_REPROBE_DECIDES} (${paneReadClassNote(read)}; b.jdc, b.jg5 SRJ-117)`
+}
+
+/**
+ * `promptRowReconnectVerdict`'s line when persona `key`'s row reads `state`
+ * and its `read-pane` answered UNAVAILABLE, CONFIG or UNCLASSIFIED, taken as
+ * alive (b.jdc, b.jg5 SRJ-606, SRJ-117, SRJ-105); `read` is that failure.
  * Exported for tests.
  *
  * @internal
  */
-export function promptRowTmuxGoneLine(key: string, state: string): string {
-  return `[slack] reconnectSession: persona=${key} is ${state} but its tmux session "${personaTmuxSessionName(key)}" is gone — no prompt is waiting in it; not deferring, ${ESCALATE_DEAD_REPROBE_DECIDES} (b.jdc)`
+export function promptRowTakenAsAliveLine(key: string, state: string, read: PaneReadFailure): string {
+  return `[slack] reconnectSession: persona=${key} is ${state} and reading its pane failed: ${read.description} — taken as alive (no proof the session is gone); deferring as for a pane (${paneReadClassNote(read)}; b.jdc, b.jg5 SRJ-606, SRJ-117)`
+}
+
+/**
+ * `promptRowReconnectVerdict`'s line when persona `key`'s row reads `state`
+ * and its `read-pane` answered ENVIRONMENT (b.jg5 SRJ-117, SRJ-311): the
+ * wrapper raised the `tmux-unavailable` outage; no deferral is noted and no
+ * notice raised. `read` is that failure. Exported for tests.
+ *
+ * @internal
+ */
+export function promptRowPaneReadEnvironmentLine(key: string, state: string, read: PaneReadFailure): string {
+  return `[slack] reconnectSession: persona=${key} is ${state} and reading its pane failed: ${read.description} — tmux is not available; deferring to a later tick, no deferral noted and no notice (${paneReadClassNote(read)}; b.jg5 SRJ-117, SRJ-311)`
+}
+
+/**
+ * `promptRowReconnectVerdict`'s line when persona `key`'s row reads `state`
+ * and its `read-pane` carried the stop mark of a version re-check that
+ * decided that the server stops (b.jg5 SRJ-204, SRJ-205); `read` is that
+ * failure. Exported for tests.
+ *
+ * @internal
+ */
+export function promptRowPaneReadStoppingLine(key: string, state: string, read: PaneReadFailure): string {
+  return `[slack] reconnectSession: persona=${key} is ${state} and reading its pane failed: ${read.description} — the agent-director version re-check decided that the server stops; nothing more is called for it (${paneReadClassNote(read)}; b.jg5 SRJ-204, SRJ-205)`
+}
+
+/**
+ * `promptRowReconnectVerdict`'s line when persona `key`'s row reads `state`
+ * and the shared reader answered latched: its CONFLICT or UNUSABLE NAME
+ * answer latched the persona (the reader logged that line), or the persona
+ * was already latched and was not read (b.jg5 SRJ-501, SRJ-502, SRJ-512).
+ * Exported for tests.
+ *
+ * @internal
+ */
+export function promptRowLatchedLine(key: string, state: string): string {
+  return `[slack] reconnectSession: persona=${key} is ${state} and is latched — deferring; no deferral noted, no notice, nothing typed (b.jg5 SRJ-502)`
 }
 
 /**
@@ -2331,9 +2481,10 @@ async function workingReconnectVerdict(
 }
 
 /**
- * The reconnect adapter's answer for a `working` or `waiting` row whose
- * `read-pane` found no pane of its launch (GONE) or found the row absent
- * (b.d61, b.f2b, b.jg5 SRJ-603, SRJ-604, SRJ-117): nothing is typed; the
+ * The reconnect adapter's answer for a `working`, `waiting`, `ask_user` or
+ * `check_permission` row whose `read-pane` found no pane of its launch (GONE)
+ * or found the row absent (b.d61, b.f2b, b.jdc, b.jg5 SRJ-603, SRJ-604,
+ * SRJ-606, SRJ-117): nothing is typed; the
  * persona's working-row evidence is forgotten, the dead-tmux sweep runs once
  * with `verdict` (`sweepDeadTmuxChannelWithCause`, which logs the
  * escalate-dead line) and the answer is 'escalate-dead', or 'transient' when

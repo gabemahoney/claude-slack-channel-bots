@@ -3252,7 +3252,6 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
 
   test.each<[string, ConditionArm, RowState, boolean, Record<string, number>, (key: string) => string, boolean]>([
     ['in full mode reads its row pending, connected with its stream (deferred on the pending row; the timer runs on)', FULL_MODE_ARM, 'pending', true, { statusCalls: 1 }, (key) => reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, 1), true],
-    ['in full mode reads its row live (check_permission) but not connected (its reconnect is deferred, typing nothing; the timer runs on)', FULL_MODE_ARM, 'check_permission', false, { statusCalls: 2 }, (key) => reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_RECONNECT_DEFERRED, 1), true],
     ['in pending-only mode reads its row pending, connected with its stream (the timer runs on)', PENDING_ONLY_ARM, 'pending', true, { statusCalls: 1 }, (key) => reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_ROW_PENDING, 1, { ranPendingOnly: true }), true],
     ['in pending-only mode reads its row live (waiting) but not connected (the pending-only row rule stops the timer, not a condition end)', PENDING_ONLY_ARM, 'waiting', false, { statusCalls: 1 }, (key) => pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_ROW_LIVE, 'waiting'), false],
   ])('a retry that %s leaves the condition holding with its first refusal’s time and never reaches the condition-end entry', async (_what, arm, state, connected, calls, last, armed) => {
@@ -3273,6 +3272,28 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
     expect(conditionLines(h, key).filter((line) => line.includes(' ended — '))).toEqual([])
     expect(retryLinesOf(h, key).at(-1)).toBe(last(key))
     expect(h.controller.isArmed(key)).toBe(armed)
+  })
+
+  // b.jdc, b.jg5 SRJ-606, SRJ-310: the restart run's one-line read-pane of a
+  // prompt row is tmux-touching, so a pane ends the condition while the
+  // retry runs (the end is deferred); the reconnect is still deferred,
+  // typing nothing, and with no pending reading the timer stops.
+  test('a retry that in full mode reads its row live (check_permission) but not connected: its restart run\'s one-line read-pane answers a pane, which ends the condition (deferred while the retry runs) though the reconnect is deferred, typing nothing; the timer stops', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    modelRow(h, 'check_permission')
+    await FULL_MODE_ARM(h, key)
+    h.setConnected(key, false)
+    const before = callCounts(h)
+
+    await retryNow(h, key)
+
+    expect(callsSince(h, before)).toEqual({ statusCalls: 2, readPaneCalls: 1 })
+    expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+    expect(conditionLines(h, key).at(-1)).toBe(conditionEndedLine(key, TMUX_UNRESPONSIVE_END_TMUX_VERB))
+    expect(h.conditionEnds).toEqual([{ key, reading: undefined, result: 'deferred' }])
+    expect(retryLinesOf(h, key).at(-1)).toBe(stoppedLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED))
+    expectStopped(h, key)
   })
 
   test('a full-mode retry whose own launch succeeds ends the condition through that spawn, with its pending row: the timer is kept and runs on in pending-only mode, the wait count carrying on', async () => {

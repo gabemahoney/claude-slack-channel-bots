@@ -90,8 +90,21 @@
  * recovery". The "not this launch's session" rows carry
  * `leftoverOfEarlierLaunch` (SRJ-613's leftover case: a leftover of an
  * earlier launch holds the persona's session), so a test can select them.
- * The prompt-row `read-pane` rows (E19 T2), the reuse rows (E22) and the
- * re-check columns (E30) are still to come.
+ *
+ * b.jdc's prompt-row `read-pane` CONFLICT rows (E19 T2; b.jg5 SRJ-117,
+ * SRJ-501, SRJ-606, SRJ-607), {@link PROMPT_ROW_PANE_CONFLICT_CASE_ROWS}: two
+ * site kinds ({@link PromptRowPaneSite}, {@link PROMPT_ROW_PANE_SITES};
+ * select their rows with {@link isPromptRowPaneSite} or
+ * {@link promptRowPaneConflictRowsAt}): b.jdc's reconnect verdict
+ * (`promptRowReconnectVerdict`) and b.jdc's ladder action
+ * (`launchOnPromptRow`), each reading P's own row through the shared reader.
+ * Each site has one row per stub CONFLICT case the liveness checks'
+ * `read-pane` rows cover (built from the approver's `read-pane` rows, as
+ * theirs are), for each prompt state (`PROMPT_ROW_STATES` of
+ * `src/session-manager.ts`: the state the path last read, `ask_user` or
+ * `check_permission`), each refusing P's next check or recovery. The row
+ * name carries the state (`<site> (<state>): <stub case>`).
+ * The reuse rows (E22) and the re-check columns (E30) are still to come.
  *
  * Other exports (E13 T2):
  *   - {@link expectedConflictNotice}: the expected notice for any case,
@@ -294,6 +307,7 @@ import {
   LATCH_CASE_PANE_NOT_FOUND,
   LATCH_CASE_UNRECOGNISED,
   LATCH_CASE_UNUSABLE_RECORDED_NAME,
+  LATCH_ROW_STATE_KIND_READ,
   LATCH_ROW_STATE_NO_ROW,
   LATCH_ROW_STATE_UNREADABLE,
   REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
@@ -321,7 +335,7 @@ import {
 import { classifyAdError } from '../../src/ad-error-class.ts'
 import { renderLogMessageText } from '../../src/persona-connection-errors.ts'
 import { personaInstanceId, personaTmuxSessionName } from '../../src/persona-identity.ts'
-import type { ApproverVerb } from '../../src/session-manager.ts'
+import { PROMPT_ROW_STATES, type ApproverVerb } from '../../src/session-manager.ts'
 import { escapeSlackControlCharacters } from '../../src/slack-text-escape.ts'
 import {
   SAMPLE_LAUNCH_START_NONE,
@@ -424,11 +438,40 @@ export function isReconnectSite(site: string): site is ReconnectSite {
 }
 
 /**
+ * One of b.jdc's `read-pane` sites of persona P's own `ask_user` or
+ * `check_permission` row as a site kind (b.jg5 SRJ-117's two b.jdc columns,
+ * SRJ-606, SRJ-607): the reconnect verdict (`promptRowReconnectVerdict`) and
+ * the ladder action (`launchOnPromptRow`), each one one-line read through the
+ * shared reader of P's own row (`readPersonaOwnPane`).
+ */
+export type PromptRowPaneSite = 'prompt-row reconnect verdict' | 'prompt-row ladder action'
+
+/** Every prompt-row pane site kind, in SRJ-117's column order: the reconnect verdict, then the ladder action. */
+export const PROMPT_ROW_PANE_SITES: readonly PromptRowPaneSite[] = Object.freeze([
+  'prompt-row reconnect verdict',
+  'prompt-row ladder action',
+] as const)
+
+/** Whether `site` is one of b.jdc's prompt-row `read-pane` site kinds. */
+export function isPromptRowPaneSite(site: string): site is PromptRowPaneSite {
+  return (PROMPT_ROW_PANE_SITES as readonly string[]).includes(site)
+}
+
+/**
  * The site kind that meets a CONFLICT row's refusal: a plain spawn, a reuse
  * spawn, a `resume`, a pane verb or a kill (by its verb), one of the dialog
- * approver's pane verbs, or one of the liveness checks' `read-pane` sites.
+ * approver's pane verbs, one of the liveness checks' `read-pane` sites, the
+ * reconnect's `send-keys`, or one of b.jdc's prompt-row `read-pane` sites.
  */
-export type ConflictCaseSite = 'plain spawn' | 'reuse spawn' | 'resume' | PaneOrKillSite | ApproverSite | LivenessPaneSite | ReconnectSite
+export type ConflictCaseSite =
+  | 'plain spawn'
+  | 'reuse spawn'
+  | 'resume'
+  | PaneOrKillSite
+  | ApproverSite
+  | LivenessPaneSite
+  | ReconnectSite
+  | PromptRowPaneSite
 
 /** One refusal and what latching a persona on it records. */
 export interface ConflictCaseRow {
@@ -799,6 +842,31 @@ const RECONNECT_ROWS: readonly ConflictCaseRow[] = RECONNECT_LAST_READS.flatMap(
   }),
 )
 
+/**
+ * b.jdc's prompt-row `read-pane` CONFLICT rows (E19 T2; b.jg5 SRJ-117,
+ * SRJ-501): for each prompt-row pane site and each prompt state the path
+ * last read (`PROMPT_ROW_STATES`), one row per stub CONFLICT case the
+ * approver's `read-pane` rows cover (as the liveness checks' rows), each
+ * refusing P's next check or recovery and recording that state. The row
+ * name carries the state.
+ */
+const PROMPT_ROW_PANE_ROWS: readonly ConflictCaseRow[] = PROMPT_ROW_PANE_SITES.flatMap((site) =>
+  [...PROMPT_ROW_STATES].flatMap((state) =>
+    APPROVER_ROWS.filter((approverRow) => approverRow.verb === 'read-pane').map((approverRow) => {
+      const caseRow = row(
+        site,
+        REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
+        'read-pane',
+        approverRow.stubCase,
+        approverRow.latchCase,
+        latchRowStateRead(state),
+        approverRow.options,
+      )
+      return Object.freeze({ ...caseRow, name: caseRow.name.replace(site, `${site} (${state})`) })
+    }),
+  ),
+)
+
 /** Every CONFLICT latch row, for `test.each`. */
 export const CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze([
   // A plain spawn: the pre-spawn scan's refusals (nothing written, no row).
@@ -844,6 +912,8 @@ export const CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze([
   ...LIVENESS_PANE_ROWS,
   // The reconnect's `send-keys` (E19 T1).
   ...RECONNECT_ROWS,
+  // b.jdc's prompt-row `read-pane` sites (E19 T2).
+  ...PROMPT_ROW_PANE_ROWS,
 ])
 
 /** The dialog approver's CONFLICT rows of {@link CONFLICT_CASE_ROWS} (its `read-pane` and `send-keys`), for `test.each`. */
@@ -869,6 +939,21 @@ export const RECONNECT_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.f
 /** The reconnect's CONFLICT rows for a caller that last read `lastRead`, for `test.each`. */
 export function reconnectConflictRowsAt(lastRead: ReconnectLastRead): readonly ConflictCaseRow[] {
   return RECONNECT_CONFLICT_CASE_ROWS.filter((caseRow) => caseRow.rowState === RECONNECT_ROW_STATES[lastRead])
+}
+
+/** b.jdc's prompt-row `read-pane` CONFLICT rows of {@link CONFLICT_CASE_ROWS} (E19 T2), for `test.each`. */
+export const PROMPT_ROW_PANE_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze(
+  CONFLICT_CASE_ROWS.filter((caseRow) => isPromptRowPaneSite(caseRow.site)),
+)
+
+/**
+ * The prompt-row pane CONFLICT rows of one site kind whose path last read
+ * prompt state `state` (`ask_user` or `check_permission`), for `test.each`.
+ */
+export function promptRowPaneConflictRowsAt(site: PromptRowPaneSite, state: string): readonly ConflictCaseRow[] {
+  return PROMPT_ROW_PANE_CONFLICT_CASE_ROWS.filter(
+    (caseRow) => caseRow.site === site && caseRow.rowState.kind === LATCH_ROW_STATE_KIND_READ && caseRow.rowState.state === state,
+  )
 }
 
 // ---------------------------------------------------------------------------

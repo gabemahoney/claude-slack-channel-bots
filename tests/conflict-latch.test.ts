@@ -410,10 +410,8 @@ import {
   TRUST_DIALOG_NEEDLE,
   _resetNotConnectedEpisodes,
   _resetTmuxCommandRunner,
-  _resetTmuxSessionProber,
   _setTmuxCommandRunner,
   _setTmuxSessionKiller,
-  _setTmuxSessionProber,
   isLaunchInFlight,
   notifyPersonaNotConnected,
   OWN_ROW_READ_ROW,
@@ -1835,7 +1833,6 @@ afterEach(() => {
   _resetHealthCheckState()
   // The raw tmux seams a case records (`recordRawTmux`); the harness puts back the killer.
   _resetTmuxCommandRunner()
-  _resetTmuxSessionProber()
   for (const h of built) {
     try {
       assertNoLeak(h.captured())
@@ -2366,8 +2363,8 @@ interface RawTmuxCall {
 }
 
 /**
- * Replace every raw tmux seam of the session manager (the command runner,
- * the session prober and the session killer) with a recorder that runs
+ * Replace every raw tmux seam of the session manager (the command runner
+ * and the session killer) with a recorder that runs
  * nothing; `afterEach` and the harness's `cleanup()` put them back. Answers
  * the recorded calls, in order. The startup-dialog approver has no raw tmux
  * seam: its pane reads and keys go through the stub client's `readPane` and
@@ -2379,10 +2376,6 @@ function recordRawTmux(): RawTmuxCall[] {
   _setTmuxCommandRunner(async (args) => {
     record('runner', args.join(' '))
     return { code: 1, stdout: '' }
-  })
-  _setTmuxSessionProber(async (name) => {
-    record('prober', name)
-    return false
   })
   _setTmuxSessionKiller(async (name) => {
     record('killer', name)

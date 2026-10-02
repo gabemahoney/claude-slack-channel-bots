@@ -66,8 +66,6 @@ import {
   _resetInFlightLaunches,
   _whenDialogApproverStopped,
   stopAllDialogApprovers,
-  _setTmuxSessionProber,
-  _resetTmuxSessionProber,
   _setTmuxCommandRunner,
   _resetTmuxCommandRunner,
   _setTmuxSessionKiller,
@@ -93,13 +91,14 @@ import {
   ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ,
   ESCALATE_DEAD_WAITING_ROW_PANE_GONE,
   FIND_MISSING_MEMO_TTL_MS,
+  PROMPT_ROW_STATES,
   _setNow,
   _resetNow,
   setConflictLatch,
   type ConfigDirUnresolvableHook,
   type EscalateDeadVerdict,
 } from '../src/session-manager.ts'
-import { FULL_PANE_READ_LINES } from '../src/pane-read.ts'
+import { FULL_PANE_READ_LINES, PROBE_PANE_READ_LINES } from '../src/pane-read.ts'
 import {
   conflictNoticeText,
   createConflictLatch,
@@ -2433,8 +2432,8 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
 // checked kill and the relaunch happen in that same run (b.jg5 SRJ-611). An
 // UNAVAILABLE `read-pane` of a `working` row is no proof the session is gone:
 // the run defers, with no sweep, kill, launch or accounting. Kill and launch
-// are recording fakes. No tmux is asked: the session prober is the default,
-// whose only way to tmux is the raw runner, which records every argv here. Each case awaits its restart work's end, not a
+// are recording fakes. No tmux is asked: the raw runner records every argv
+// here. Each case awaits its restart work's end, not a
 // fixed sleep, and counts only the run's own calls (its persona's instance
 // and the whole-store sweep), so neither a late timer nor another persona's
 // call made while the case runs changes a count.
@@ -2442,7 +2441,7 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
 
 describe('b.d61: a working persona whose tmux session is gone is relaunched in the same restart run', () => {
   let dir: string
-  /** Every argv the raw tmux runner was asked to run (the default session prober included). */
+  /** Every argv the raw tmux runner was asked to run. */
   let rawTmux: string[][]
   let errLines: string[]
   let origConsoleError: typeof console.error
@@ -2450,7 +2449,6 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'restart-d61-'))
     _resetFindMissingMemo()
-    _resetTmuxSessionProber()
     rawTmux = []
     _setTmuxCommandRunner(async (args) => {
       rawTmux.push([...args])
@@ -2600,6 +2598,72 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
     expect(run.armed).toEqual([])
     expect(isRestartPendingOrActive(run.KEY)).toBe(false)
     expect(rawTmux).toEqual([])
+  })
+
+  // b.jdc (/ci-live run 6), b.jg5 SRJ-606 (AC 38): a persona whose session
+  // died while its row read `ask_user` or `check_permission`. agent-director
+  // only refreshes the row at SessionEnd, so it keeps reading the prompt state
+  // until a findMissing sweep reaps it. Before the fix the adapter deferred
+  // the row as blocked on a prompt on every run and raised a *Waiting on a
+  // prompt* notice about the dead session, and nothing relaunched the persona
+  // (Checks 24-teardown, 25 and 27 then lost their messages). The row's
+  // evidence is now the adapter's one one-line `read-pane` of it: GONE sweeps
+  // and escalates with no notice, and the run's re-probe relaunches the
+  // persona; UNAVAILABLE is taken as alive, so the run defers with the
+  // notice and relaunches nothing. Every not-connected notice is recorded.
+  describe('b.jdc: a persona whose session died under a prompt', () => {
+    /** Every not-connected notice raised, by persona. */
+    let raised: string[]
+
+    beforeEach(() => {
+      _resetNotConnectedEpisodes()
+      raised = []
+      setSessionNotifier((key) => { raised.push(key) })
+    })
+
+    afterEach(() => {
+      setSessionNotifier(undefined)
+      _resetNotConnectedEpisodes()
+    })
+
+    test.each([...PROMPT_ROW_STATES])('REPRO: alive (%s) but disconnected, its one-line read-pane answering GONE → one read-pane of its own row, one findMissing sweep (verdict prompt-row-tmux-gone), no send-keys and no Waiting on a prompt notice; the re-probe reads the row missing → one kill and one relaunch in that run, no failure counted, nothing armed, no tmux asked', async (state) => {
+      const run = d61Run(untilSwept(state), errTmuxCaptureFailed())
+
+      await run.tick()
+
+      expect(run.stubCalls()).toEqual({ statusCalls: 3, readPaneCalls: 1, findMissingCalls: 1 })
+      expect(run.paneReads()).toEqual([[personaInstanceId(run.KEY), PROBE_PANE_READ_LINES]])
+      expect(escalateLines()).toHaveLength(1)
+      expect(escalateLines('prompt-row-tmux-gone')).toHaveLength(1)
+      expect(raised).toEqual([])
+      expect(run.kills).toEqual([run.KEY])
+      expect(run.launches).toEqual([run.KEY])
+      expect(run.outcomes).toEqual([RESTART_OUTCOME_LAUNCHED])
+      expect(getFailureCount(run.KEY)).toBe(0)
+      expect(run.armed).toEqual([])
+      expect(isRestartPendingOrActive(run.KEY)).toBe(false)
+      expect(rawTmux).toEqual([])
+    })
+
+    test.each([...PROMPT_ROW_STATES].flatMap((state) => READ_PANE_UNAVAILABLE_FORMS.map(([label, make]) => [state, label, make] as const)))('alive (%s) but disconnected, its one-line read-pane answering UNAVAILABLE (%s) → taken as alive: the run defers with the Waiting on a prompt notice; no sweep, send-keys, kill or launch, nothing counted or reset, nothing armed, no tmux asked', async (state, _label, make) => {
+      const run = d61Run(untilSwept(state), make('read-pane'))
+      // One failure on record, so a reset or a counted launch would show.
+      recordFailure(run.KEY)
+
+      await run.tick()
+
+      expect(run.stubCalls()).toEqual({ statusCalls: 2, readPaneCalls: 1 })
+      expect(run.paneReads()).toEqual([[personaInstanceId(run.KEY), PROBE_PANE_READ_LINES]])
+      expect(escalateLines()).toEqual([])
+      expect(raised).toEqual([run.KEY])
+      expect(run.kills).toEqual([])
+      expect(run.launches).toEqual([])
+      expect(run.outcomes).toEqual([RESTART_OUTCOME_RECONNECT_DEFERRED])
+      expect(getFailureCount(run.KEY)).toBe(1)
+      expect(run.armed).toEqual([])
+      expect(isRestartPendingOrActive(run.KEY)).toBe(false)
+      expect(rawTmux).toEqual([])
+    })
   })
 
   // b.jg5 SRJ-314 (AC 37, HO C12): the real liveness adapter over the stub
@@ -2845,86 +2909,6 @@ describe('b.jg5 SRJ-118, SRJ-609: the reconnect\'s transient and latching answer
     expect(getFailureCount(p)).toBe(1)
     expect(h.episodeNotices).toHaveLength(1)
     expect(h.notices).toEqual([])
-  })
-})
-
-// ---------------------------------------------------------------------------
-// b.jdc (/ci-live run 6): a persona whose session died while its row read
-// `ask_user` or `check_permission`. agent-director only refreshes the row at
-// SessionEnd, so it keeps reading the prompt state until a findMissing sweep
-// reaps it. The liveness probe and the reconnect adapter are the REAL ones over
-// one stub AD client whose row reads the prompt state until a sweep has run
-// and `missing` after it; the tmux-session prober reports the persona's
-// session gone. Kill and launch are recording fakes. Before the fix the
-// adapter deferred the row as blocked on a prompt on every run and raised a
-// *Waiting on a prompt* notice about the dead session, and nothing relaunched
-// the persona (Checks 24-teardown, 25 and 27 then lost their messages).
-// ---------------------------------------------------------------------------
-
-describe('b.jdc: a persona whose session died under a prompt is relaunched in the same restart run', () => {
-  let dir: string
-
-  beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), 'restart-jdc-'))
-    _resetFindMissingMemo()
-    _resetNotConnectedEpisodes()
-  })
-
-  afterEach(() => {
-    cancelAllRestartTimers()
-    resetClientForTests()
-    _resetOutageState()
-    _resetTmuxSessionProber()
-    _resetFindMissingMemo()
-    _resetNotConnectedEpisodes()
-    setSessionNotifier(undefined)
-    rmSync(dir, { recursive: true, force: true })
-  })
-
-  test.each(['ask_user', 'check_permission'])('REPRO: alive (%s) but disconnected, its tmux session gone → one probe of its own session, one findMissing sweep, nothing typed and no Waiting on a prompt notice; the re-probe reads the row missing → one kill and one relaunch in that run, no failure counted', async (state) => {
-    const config = makeMultiPersonaConfig([{ name: 'alpha_bot' }], dir)
-    const KEY = config.personas[0]!.key
-    const sendKeysCalls: SendKeysParams[] = []
-    const findMissingCalls: FindMissingParams[] = []
-    const stub = makeStubClient({
-      statusFn: () => ({ state: findMissingCalls.length > 0 ? 'missing' : state }),
-      sendKeysCalls,
-      findMissingCalls,
-    })
-    _resetOutageState()
-    initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
-    setClientForTests(stub as unknown as Client)
-    const probed: string[] = []
-    _setTmuxSessionProber(async (name) => { probed.push(name); return false })
-    const raised: string[] = []
-    setSessionNotifier((key) => { raised.push(key) })
-
-    const killSessionCalls: string[] = []
-    const launchSessionCalls: string[] = []
-    initRestart({
-      canRestart: () => true,
-      isSessionAlive: _buildIsSessionAliveAdapter(() => config),
-      isSessionConnected: () => false,
-      hasSessionStream: () => false,
-      reconnectSession: _buildReconnectSessionAdapter(),
-      async killSession(key) { killSessionCalls.push(key) },
-      async launchSession(key) { launchSessionCalls.push(key); return true },
-      getRestartDelay: () => FAST_DELAY_S,
-      isShuttingDown: () => false,
-      onCapReached: () => {},
-    })
-
-    scheduleRestart(KEY, config.personas[0]!.working_directory)
-    await Bun.sleep(WAIT_MS)
-
-    expect(probed).toEqual([`slack_bot_${KEY}`])
-    expect(findMissingCalls).toHaveLength(1)
-    expect(sendKeysCalls).toEqual([])
-    expect(raised).toEqual([])
-    expect(killSessionCalls).toEqual([KEY])
-    expect(launchSessionCalls).toEqual([KEY])
-    expect(getFailureCount(KEY)).toBe(0)
-    expect(isRestartPendingOrActive(KEY)).toBe(false)
   })
 })
 
@@ -3382,7 +3366,6 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
     _resetInFlightLaunches()
     _setSpawnHomeDir(dir)
     _setDialogReadyTimeoutMs(200)
-    _setTmuxSessionProber(async () => true)
   })
 
   afterEach(async () => {
@@ -3397,7 +3380,6 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
     setSessionNotifier(undefined)
     _resetSpawnHomeDir()
     _resetDialogReadyTimeoutMs()
-    _resetTmuxSessionProber()
     rmSync(dir, { recursive: true, force: true })
   })
 
@@ -3590,7 +3572,6 @@ describe('restart: the reply-guard record holds the effective value before the r
     _resetInFlightLaunches()
     _setSpawnHomeDir(dir)
     _setDialogReadyTimeoutMs(200)
-    _setTmuxSessionProber(async () => true)
   })
 
   afterEach(async () => {
@@ -3602,7 +3583,6 @@ describe('restart: the reply-guard record holds the effective value before the r
     setSessionNotifier(undefined)
     _resetSpawnHomeDir()
     _resetDialogReadyTimeoutMs()
-    _resetTmuxSessionProber()
     rg.cleanup()
     rmSync(dir, { recursive: true, force: true })
   })
@@ -3824,7 +3804,6 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
     _setSpawnHomeDir(dir)
     _resetInFlightLaunches()
     _setDialogReadyTimeoutMs(200)
-    _setTmuxSessionProber(async () => true)
     _setConfigDirFs({
       realpath: (path) => {
         if (broken && (path === aConfigDir || path.startsWith(`${aConfigDir}/`))) {
@@ -3904,7 +3883,6 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
     setSessionNotifier(undefined)
     _resetSpawnHomeDir()
     _resetDialogReadyTimeoutMs()
-    _resetTmuxSessionProber()
     rmSync(dir, { recursive: true, force: true })
   })
 
@@ -4260,7 +4238,6 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
     _resetFindMissingMemo()
     _setSpawnHomeDir(dir)
     _setDialogReadyTimeoutMs(200)
-    _setTmuxSessionProber(async () => true)
   })
 
   afterEach(async () => {
@@ -4277,7 +4254,6 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
     setSessionNotifier(undefined)
     _resetSpawnHomeDir()
     _resetDialogReadyTimeoutMs()
-    _resetTmuxSessionProber()
     rmSync(dir, { recursive: true, force: true })
     // Every case: no retry timer outlives the test, and no line the retry
     // controller or console.error wrote carries a credential value.
@@ -5016,7 +4992,6 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
       _resetInFlightLaunches()
       _setSpawnHomeDir(dir)
       _setDialogReadyTimeoutMs(200)
-      _setTmuxSessionProber(async () => true)
     })
 
     afterEach(async () => {
@@ -5027,7 +5002,6 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
       setSessionNotifier(undefined)
       _resetSpawnHomeDir()
       _resetDialogReadyTimeoutMs()
-      _resetTmuxSessionProber()
       rmSync(dir, { recursive: true, force: true })
     })
 

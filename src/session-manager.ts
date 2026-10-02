@@ -23,9 +23,11 @@
  *      wait for waiting (or, b.f2b, for positive evidence that the row is
  *      stale and the session idle: the same idle pane and the same transcript,
  *      ended with a completed turn, across a window) then reconnect;
- *      check_permission/ask_user → no-op while the persona's tmux session
- *      lives, and a findMissing sweep, then resume or spawn once its row reads
- *      dead, when it is gone (b.jdc); pending → no-op). Nothing is ever typed
+ *      check_permission/ask_user → one one-line `read-pane` of the row:
+ *      no-op on a pane or a read that could not answer, and a findMissing
+ *      sweep, then resume or spawn once its row reads dead, when
+ *      agent-director finds no pane of its launch or no row (b.jdc, b.jg5
+ *      SRJ-607); pending → no-op). Nothing is ever typed
  *      into a prompt. Before any resume, a row whose `config_dir` label is missing
  *      or differs from the persona's current effective claude_config_dir is
  *      deleted and spawned fresh instead (a resume keeps the old config dir).
@@ -97,8 +99,11 @@
  * through the shared read-pane (`readPersonaOwnPane`, b.jg5 SRJ-117; the
  * outcome and its class in `src/pane-read.ts`). Its uses (the launch wait's
  * evidence read and the restart path's `waiting`-row check through
- * `readWorkingPane`, and the `working`-row verdict in `src/server.ts`,
- * whose pane `checkWorkingRowPane` folds) latch on a CONFLICT answer,
+ * `readWorkingPane`, the `working`-row verdict in `src/server.ts`, whose
+ * pane `checkWorkingRowPane` folds, and b.jdc's one-line reads of an
+ * `ask_user` or `check_permission` row: the prompt-row verdict
+ * `promptRowReconnectVerdict` in `src/server.ts` and the ladder's
+ * `launchOnPromptRow`) latch on a CONFLICT answer,
  * with the refused operation "P's next check or recovery", and on an
  * UNUSABLE NAME answer, each with the state its caller last read; a latched
  * persona is not read, and its caller ends with nothing typed.
@@ -252,6 +257,7 @@ import {
   PANE_READ_UNCLASSIFIED,
   PANE_READ_UNUSABLE_NAME,
   paneReadClassNote,
+  PROBE_PANE_READ_LINES,
   paneReadFailureOf,
   type PaneReadConflict,
   type PaneReadFailure,
@@ -1792,9 +1798,8 @@ export interface TmuxRunResult {
 
 /**
  * Runs `tmux <args>` and never rejects. Every raw tmux call in the server goes
- * through this one runner (the liveness probe and the b.vub orphan kill), so
- * a unit test
- * can see each argv and no test reaches a real tmux server.
+ * through this one runner (the b.vub orphan kill), so a unit test can see
+ * each argv and no test reaches a real tmux server.
  */
 export type TmuxCommandRunner = (args: readonly string[]) => Promise<TmuxRunResult>
 
@@ -1834,54 +1839,12 @@ export function _resetTmuxCommandRunner(): void {
  * the exact name (b.1ix). Verified against tmux 3.2a, the version in the
  * `/ci` image.
  *
- * A session target (`has-session`, `kill-session`, and the `attach` command
- * the not-connected notices give an operator) is `=<name>`.
+ * A session target (the b.vub orphan kill's `kill-session`, and the
+ * `attach` command the not-connected notices give an operator) is
+ * `=<name>`.
  */
 function tmuxExactSessionTarget(sessionName: string): string {
   return `=${sessionName}`
-}
-
-// ---------------------------------------------------------------------------
-// The tmux-session prober (b.jdc's prompt rows)
-// ---------------------------------------------------------------------------
-
-/**
- * Probe whether a tmux session with this exact name is alive. Injectable seam
- * so unit tests can drive the b.3ce timeout-liveness verdict without real
- * tmux. Default impl runs `tmux has-session -t =<name>` (the `=` prefix
- * forces exact-name match, not prefix match) and reports exit code 0; tmux
- * missing reads as dead.
- */
-export type TmuxSessionProber = (sessionName: string) => Promise<boolean>
-
-const defaultHasTmuxSession: TmuxSessionProber = async (sessionName: string): Promise<boolean> => {
-  const { code } = await _runTmux(['has-session', '-t', tmuxExactSessionTarget(sessionName)])
-  return code === 0
-}
-
-let _hasTmuxSession: TmuxSessionProber = defaultHasTmuxSession
-
-/** Test-only seam: override the tmux-session liveness prober. */
-export function _setTmuxSessionProber(fn: TmuxSessionProber): void {
-  _hasTmuxSession = fn
-}
-
-/** Test-only seam: restore the default tmux-session liveness prober. */
-export function _resetTmuxSessionProber(): void {
-  _hasTmuxSession = defaultHasTmuxSession
-}
-
-/**
- * Probe whether the persona's own tmux session (`slack_bot_<key>`) is alive,
- * through the tmux-session prober seam above. Its callers are the prompt-row
- * paths (b.jdc): the reconnect adapter's verdict for an `ask_user` or
- * `check_permission` row (`promptRowReconnectVerdict` in `src/server.ts`) and
- * the launch path's check of such a row (`launchOnPromptRow`). The default
- * prober never rejects; an injected one may, so the caller decides what a
- * failed probe means.
- */
-export async function hasPersonaTmuxSession(key: string): Promise<boolean> {
-  return _hasTmuxSession(personaTmuxSessionName(key))
 }
 
 // ---------------------------------------------------------------------------
@@ -5237,18 +5200,18 @@ export function escalateDeadSweepLine(key: string, verdict: EscalateDeadVerdict)
  *     adapter's `read-pane` of the row answered GONE (b.d61, b.jg5 SRJ-603);
  *   - `waiting-row-pane-gone`: its row reads `waiting` and the waiting-row
  *     check's `read-pane` answered GONE (b.f2b, b.jg5 SRJ-604);
+ *   - `prompt-row-tmux-gone`: its row reads `ask_user` or
+ *     `check_permission` and the prompt-row verdict's one-line `read-pane`
+ *     answered GONE (b.jdc, b.jg5 SRJ-606);
  * - from a refusal: `row-not-interactive`, agent-director refused the
  *   reconnect's keystrokes as not interactive (`ErrSpawnNotInteractive`,
  *   b.dup): a route into the restart path's decision only, which kills
  *   nothing because of it (b.jg5 SRJ-609);
  * - from a row read: `row-absent-at-pane-read`, the row was absent
- *   (`ErrSpawnNotFound`) at the `read-pane` of the `working`-row verdict or
- *   the waiting-row check, which takes the GONE column without being a GONE
- *   (b.jg5 SRJ-117), or at the reconnect's `send-keys` (cause `row-absent`,
- *   b.jg5 SRJ-118);
- * - from the tmux probe of a prompt row: `prompt-row-tmux-gone`, its row
- *   reads `ask_user` or `check_permission` and its tmux session was not
- *   found (b.jdc).
+ *   (`ErrSpawnNotFound`) at the `read-pane` of the `working`-row verdict,
+ *   the waiting-row check or the prompt-row verdict, which takes the GONE
+ *   column without being a GONE (b.jg5 SRJ-117), or at the reconnect's
+ *   `send-keys` (cause `row-absent`, b.jg5 SRJ-118).
  * Neither a GONE (b.jg5 SRJ-613) nor a refusal as not interactive nor a row
  * read proves the worker's process gone, and every evidence text
  * (`ESCALATE_DEAD_EVIDENCE`) says only what was observed. Each verdict
@@ -5278,9 +5241,9 @@ export const ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ = 'row-absent-at-pane-read' s
  * (`sweepDeadTmuxChannelWithCause`, b.jdc): exactly one text per verdict.
  * No text says a tmux session or a worker is provably dead: a GONE says that
  * agent-director found no session or pane of the row's launch, an absent row
- * that the row read found none, the prompt-row probe that it found no tmux
- * session, and `row-not-interactive` that agent-director refused the
- * keystrokes as not interactive, which does not prove the worker gone (a
+ * that the row read found none, and `row-not-interactive` that
+ * agent-director refused the keystrokes as not interactive, which does not
+ * prove the worker gone (a
  * finished row, or a `pending` row whose session may be another launch's,
  * b.jg5 SRJ-609, SRJ-613).
  */
@@ -5295,7 +5258,8 @@ export const ESCALATE_DEAD_EVIDENCE: Readonly<Record<EscalateDeadVerdict, string
     "agent-director's read-pane found no pane of the row's launch (GONE) on its waiting row",
   'row-absent-at-pane-read':
     "its agent-director row was absent (ErrSpawnNotFound) at the pane read or the /mcp reconnect's send-keys: a row read, not a GONE",
-  'prompt-row-tmux-gone': 'its tmux session was not found by the probe of its ask_user or check_permission row',
+  'prompt-row-tmux-gone':
+    "agent-director's read-pane found no pane of the row's launch (GONE) on its ask_user or check_permission row",
 })
 
 /**
@@ -5323,27 +5287,31 @@ export function escalateDeadVerdictOfCause(cause: DeadSessionCause | undefined):
 
 /**
  * b.jdc: how long the restart path holds back from a persona whose row reads
- * `ask_user` or `check_permission` while its tmux session lives, before each
- * further deferral first runs the memoized findMissing sweep and reads the
- * row again (`checkPromptRowDeferral`). A session that dies under a prompt
- * keeps its row in that state: agent-director only refreshes a row at
- * SessionEnd and leaves reaping to its sweep. A gone tmux session is caught at
- * once by the tmux probe; this bounds the case the probe can't see, a claude
- * process gone from a tmux session that is still there. Measured from the
- * first deferral of the run, on the session manager's clock (`_now`).
+ * `ask_user` or `check_permission` while its one-line `read-pane` answers a
+ * pane or is taken as alive (UNAVAILABLE, CONFIG or UNCLASSIFIED, b.jg5
+ * SRJ-606, SRJ-117), before each further deferral first runs the memoized
+ * findMissing sweep and reads the row again (`checkPromptRowDeferral`). A
+ * session that dies under a prompt keeps its row in that state:
+ * agent-director only refreshes a row at SessionEnd and leaves reaping to its
+ * sweep. A read that finds no pane of the row's launch (GONE) escalates at
+ * once; this bounds what the read cannot tell: a pane does not show whether
+ * a claude process still runs in it, and a read that could not answer is no
+ * proof either way. Measured from the first deferral of the
+ * run, on the session manager's clock (`_now`).
  */
 export const PROMPT_ROW_SWEEP_AFTER_MS = 10 * 60 * 1000
 
 /**
  * When each persona's current run of deferrals on its `ask_user` or
  * `check_permission` row began (b.jdc, on the session manager's clock
- * `_now`): the first time the restart path held back from the row with its
- * tmux session alive (`checkPromptRowDeferral`). It ends
- * (`endPromptRowDeferral`) when the row reads another state or its tmux
- * session is gone, when the row is escalated, when any launch for the persona
- * starts, and with the persona's not-connected episode
- * (`forgetNotConnectedEpisode`). A failed status call neither extends nor
- * ends it.
+ * `_now`): the first time the restart path held back from the row on a pane
+ * or a read taken as alive (`checkPromptRowDeferral`). It ends
+ * (`endPromptRowDeferral`) when the row reads another state, when its
+ * `read-pane` finds no pane of the row's launch (GONE) or finds no row, when
+ * the row is escalated, when any launch for the persona starts, and with the
+ * persona's not-connected episode (`forgetNotConnectedEpisode`). A failed
+ * status call, a latched persona and a read answering ENVIRONMENT neither
+ * extend nor end it.
  */
 const promptRowDeferredSince = new Map<string, number>()
 
@@ -5477,10 +5445,12 @@ export async function readPersonaRowState(key: string): Promise<UnavailableRetry
 
 /**
  * b.jdc — the restart path's check of a persona whose row reads `state`
- * (`ask_user` or `check_permission`) and whose tmux session is alive, or
- * could not be probed (the reconnect adapter in `server.ts`, which types
- * nothing into such a row). Notes one more deferral in the persona's run on
- * the row (`promptRowDeferredSince`). Once the run has lasted
+ * (`ask_user` or `check_permission`) and whose one-line `read-pane` answered
+ * a pane or was taken as alive (UNAVAILABLE, CONFIG or UNCLASSIFIED; the
+ * reconnect adapter's `promptRowReconnectVerdict` in `server.ts`, which
+ * types nothing into such a row; b.jg5 SRJ-606). Notes one more deferral
+ * in the persona's run on the row (`promptRowDeferredSince`). Once the run
+ * has lasted
  * `PROMPT_ROW_SWEEP_AFTER_MS`, it runs the memoized findMissing sweep and
  * reads the row again: `ended` or `missing` means the claude process is gone,
  * so it logs that, ends the run and returns `escalate`, and the adapter
@@ -5513,22 +5483,45 @@ export async function checkPromptRowDeferral(key: string, state: string): Promis
 }
 
 /**
- * b.jdc — the collision ladder's action for persona `persona`'s row read
- * `state` (`ask_user` or `check_permission`). Nothing is ever typed into such
- * a row (b.rmy). Its session may be gone, though: a session that dies under a
+ * b.jdc, b.jg5 SRJ-607 — the collision ladder's action for persona
+ * `persona`'s row read `state` (`ask_user` or `check_permission`), b.jg5
+ * SRJ-117's "b.jdc ladder action" column. Nothing is ever typed into such a
+ * row (b.rmy). Its session may be gone, though: a session that dies under a
  * prompt keeps its row in that state until a findMissing sweep reaps it. So
- * the ladder probes the persona's own tmux session first (exactly,
- * `hasPersonaTmuxSession`):
- * - alive, or the probe failed → no action, as before (`no-op`); the health
- *   check's restart path reports the prompt if the persona stays disconnected;
- * - gone → the memoized findMissing sweep, then the row is read again:
- *   `ended` or `missing` is a dead session, recovered through
- *   `resumeOrFreshSpawn`; anything else (or a failed read) is left as it is
+ * the ladder makes one `read-pane` of the persona's own row through the
+ * shared reader (`readPersonaOwnPane`: `PROBE_PANE_READ_LINES`, the
+ * collision `get`'s state as the recorded state), with no tmux call, mapped:
+ * - a pane → no action (`no-op`), as before; the health check's restart path
+ *   reports the prompt if the persona stays disconnected;
+ * - GONE (`ErrTmuxCaptureFailed`: agent-director found no pane of the row's
+ *   launch), or the row absent (`ErrSpawnNotFound`, which takes the GONE
+ *   column, b.jg5 SRJ-117) → the memoized findMissing sweep, then the row is
+ *   read again: `ended` or `missing` is recovered through
+ *   `resumeOrFreshSpawn`, whose resume or spawn decides what holds the
+ *   persona's name; anything else (or a failed read) is left as it is
  *   (`no-op`), for the restart path to retry. A refused sweep (b.jg5
  *   SRJ-105) reads nothing and answers `failed`: no resume or launch. A
- *   persona latched once the sweep is done (b.jg5 SRJ-120, SRJ-502:
- *   `FIND_MISSING_LATCHED`) reads nothing and answers `latched`: no further
- *   call, no resume, kill, delete or launch.
+ *   persona latched before the sweep (b.jg5 SRJ-502, `personaLatchedNow`),
+ *   or once it is done (b.jg5 SRJ-120: `FIND_MISSING_LATCHED`, the re-read
+ *   included), answers `latched`: no further call, no resume, kill, delete
+ *   or launch;
+ * - UNAVAILABLE (timeouts included), CONFIG (the wrapper raised the
+ *   `ad-config-malformed` outage, b.jg5 SRJ-316) or UNCLASSIFIED (b.jg5
+ *   SRJ-105) → taken as alive: `no-op`, with one line naming the class;
+ * - ENVIRONMENT (the wrapper raised the `tmux-unavailable` outage, b.jg5
+ *   SRJ-311) → `no-op`, with one line naming the class;
+ * - an UNCLASSIFIED carrying the stop mark (`stopping`: the reader's
+ *   `ErrInvalidFlags` re-check decided that the server stops, b.jg5
+ *   SRJ-205) → a `failed` result marked `stopping`, as at the working-row
+ *   wait: no post, no `spawn-failed` entry, nothing counted;
+ * - CONFLICT or UNUSABLE NAME (the reader latched the persona with the
+ *   collision `get`'s state and logged its line, b.jg5 SRJ-501, SRJ-512), or
+ *   a persona already latched, which the reader does not read → `latched`,
+ *   nothing typed.
+ * Each log line but the pane's `no-op` comes from an exported builder
+ * (`promptRowLadderNoPaneLine`, `promptRowLadderAfterSweepLine`,
+ * `promptRowLadderNoActionLine`, `promptRowLadderStoppingLine`,
+ * `promptRowLadderLatchedLine`).
  */
 async function launchOnPromptRow(
   persona: Persona,
@@ -5540,22 +5533,41 @@ async function launchOnPromptRow(
   state: string,
 ): Promise<SpawnPersonaResult> {
   const { key } = persona
-  let tmuxAlive: boolean
-  try {
-    tmuxAlive = await hasPersonaTmuxSession(key)
-  } catch (err) {
-    console.error(
-      `[slack] spawnForPersona: ${ref} reads ${state} and its tmux session probe failed: ${describeThrownValue(err)} — taking the session as alive (b.jdc/b.rmy)`,
-    )
-    tmuxAlive = true
+  const read = await readPersonaOwnPane(key, {
+    nLines: PROBE_PANE_READ_LINES,
+    // b.jg5 SRJ-501: the collision `get` is the path's last read.
+    lastRead: latchRowStateRead(state),
+    site: PROMPT_ROW_LADDER_PANE_READ_SITE,
+  })
+  switch (read.kind) {
+    case PANE_READ_PANE:
+      console.error(`[slack] spawnForPersona: no action — state=${state} for ${ref}`)
+      return { key, action: 'no-op' }
+    case PANE_READ_LATCHED:
+      console.error(promptRowLadderLatchedLine(ref, state))
+      return { key, action: 'latched' }
+    case PANE_READ_UNCLASSIFIED:
+      if (read.stopping === true) {
+        console.error(promptRowLadderStoppingLine(ref, state, read))
+        return { key, action: 'failed', stopping: true }
+      }
+      console.error(promptRowLadderNoActionLine(ref, state, read))
+      return { key, action: 'no-op' }
+    case PANE_READ_UNAVAILABLE:
+    case PANE_READ_CONFIG:
+    case PANE_READ_ENVIRONMENT:
+      console.error(promptRowLadderNoActionLine(ref, state, read))
+      return { key, action: 'no-op' }
+    case PANE_READ_GONE:
+    case PANE_READ_ABSENT:
+      break
   }
-  if (tmuxAlive) {
-    console.error(`[slack] spawnForPersona: no action — state=${state} for ${ref}`)
-    return { key, action: 'no-op' }
+  console.error(promptRowLadderNoPaneLine(ref, state, read))
+  // b.jg5 SRJ-502: latched elsewhere while the read was awaited → no sweep.
+  if (personaLatchedNow(key)) {
+    console.error(promptRowLadderLatchedLine(ref, state))
+    return { key, action: 'latched' }
   }
-  console.error(
-    `[slack] spawnForPersona: ${ref} reads ${state} but its tmux session "${personaTmuxSessionName(key)}" is gone — no prompt is waiting in it; reconciling its row before deciding (b.jdc)`,
-  )
   const after = await reconcileAndReadRowState(key, 'spawnForPersona: prompt row', ref)
   if (after === FIND_MISSING_REFUSED) return { key, action: 'failed' }
   // b.jg5 SRJ-502: a persona latched after the sweep gets no further call.
@@ -5568,10 +5580,93 @@ async function launchOnPromptRow(
   const next = config.session_restart_delay === 0
     ? 'session_restart_delay is 0, so nothing retries it before the next server start'
     : "the health check's restart retries it"
-  console.error(
-    `[slack] spawnForPersona: ${ref}: its tmux session is gone, but its row ${after === undefined ? 'could not be read' : `still reads ${after}`} after the findMissing sweep — no action; ${next} (b.jdc)`,
-  )
+  console.error(promptRowLadderAfterSweepLine(ref, read, after, next))
   return { key, action: 'no-op' }
+}
+
+/** The site label of the ladder's prompt-row read, the head of the shared reader's latch line. */
+const PROMPT_ROW_LADDER_PANE_READ_SITE = 'spawnForPersona: prompt row'
+
+/**
+ * `launchOnPromptRow`'s line when persona `ref`'s row reads `state` and its
+ * one-line `read-pane` answered GONE or found the row absent (b.jdc, b.jg5
+ * SRJ-607, SRJ-117); `read` is that failure. Exported for tests.
+ *
+ * @internal
+ */
+export function promptRowLadderNoPaneLine(ref: string, state: string, read: PaneReadFailure): string {
+  return `[slack] spawnForPersona: ${ref} reads ${state} but ${promptRowLadderNoPaneFinding(read)}: ${read.description} — reconciling its row before deciding (${paneReadClassNote(read)}; b.jdc, b.jg5 SRJ-607)`
+}
+
+/**
+ * What the prompt-row ladder's pane read found, shared by
+ * `promptRowLadderNoPaneLine` and `promptRowLadderAfterSweepLine` so the two
+ * cannot drift: an absent row (`ErrSpawnNotFound`) is a row read, not a GONE
+ * (b.jg5 SRJ-117), and its line says so.
+ */
+function promptRowLadderNoPaneFinding(read: Pick<PaneReadFailure, 'kind'>): string {
+  return read.kind === PANE_READ_ABSENT
+    ? 'its agent-director row was absent at the pane read'
+    : "agent-director's read-pane found no pane of its launch"
+}
+
+/**
+ * `launchOnPromptRow`'s line when, after a GONE or absent read (`read`) and
+ * the findMissing sweep, persona `ref`'s row could not be read (`after`
+ * undefined) or still reads `after`, a state that is not `ended` or
+ * `missing`: no action; `next` says what retries it (b.jdc, b.jg5 SRJ-607,
+ * SRJ-117). Exported for tests.
+ *
+ * @internal
+ */
+export function promptRowLadderAfterSweepLine(
+  ref: string,
+  read: Pick<PaneReadFailure, 'kind'>,
+  after: string | undefined,
+  next: string,
+): string {
+  return `[slack] spawnForPersona: ${ref}: ${promptRowLadderNoPaneFinding(read)}, but its row ${after === undefined ? 'could not be read' : `still reads ${after}`} after the findMissing sweep — no action; ${next} (b.jdc, b.jg5 SRJ-607)`
+}
+
+/**
+ * `launchOnPromptRow`'s line when persona `ref`'s row reads `state` and its
+ * one-line `read-pane` answered UNAVAILABLE, CONFIG or UNCLASSIFIED (taken
+ * as alive) or ENVIRONMENT (tmux is not available): no action (b.jdc, b.jg5
+ * SRJ-607, SRJ-117, SRJ-105, SRJ-311); `read` is that failure. Exported for
+ * tests.
+ *
+ * @internal
+ */
+export function promptRowLadderNoActionLine(ref: string, state: string, read: PaneReadFailure): string {
+  const why = read.kind === PANE_READ_ENVIRONMENT
+    ? 'tmux is not available'
+    : 'taken as alive (no proof the session is gone)'
+  return `[slack] spawnForPersona: ${ref} reads ${state} and reading its pane failed: ${read.description} — ${why}; no action (${paneReadClassNote(read)}; b.jdc, b.jg5 SRJ-607, SRJ-117)`
+}
+
+/**
+ * `launchOnPromptRow`'s line when persona `ref`'s row reads `state` and its
+ * `read-pane` carried the stop mark of a version re-check that decided that
+ * the server stops (b.jg5 SRJ-204, SRJ-205); `read` is that failure.
+ * Exported for tests.
+ *
+ * @internal
+ */
+export function promptRowLadderStoppingLine(ref: string, state: string, read: PaneReadFailure): string {
+  return `[slack] spawnForPersona: ${ref} reads ${state} and reading its pane failed: ${read.description} — the agent-director version re-check decided that the server stops; nothing more is called for it (${paneReadClassNote(read)}; b.jg5 SRJ-204, SRJ-205)`
+}
+
+/**
+ * `launchOnPromptRow`'s line when persona `ref`'s row reads `state` and the
+ * persona is latched: the shared reader's CONFLICT or UNUSABLE NAME answer
+ * latched it (the reader logged that line), it was already latched and was
+ * not read, or it latched elsewhere while the read was awaited (b.jg5
+ * SRJ-501, SRJ-502, SRJ-512). Exported for tests.
+ *
+ * @internal
+ */
+export function promptRowLadderLatchedLine(ref: string, state: string): string {
+  return `[slack] spawnForPersona: ${ref} reads ${state} and is latched — no action; nothing typed and nothing more is called for it (b.jg5 SRJ-502)`
 }
 
 /**
@@ -7650,10 +7745,14 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *      the wait) → `not-reconnected` (b.f2b: nothing was typed;
  *      `reconnected` only when `/mcp reconnect` was). `hooks.onWorkingRowWait`
  *      is called as the wait starts (b.f2b).
- *    - check_permission/ask_user → never typed into; the persona's tmux
- *      session is probed first (b.jdc, `launchOnPromptRow`): alive → no-op;
- *      gone → findMissing sweep and a re-read, and a row now `ended` or
- *      `missing` → resume/fresh-spawn (otherwise no-op).
+ *    - check_permission/ask_user → never typed into; one one-line
+ *      `read-pane` of the persona's own row through the shared reader first
+ *      (b.jdc, b.jg5 SRJ-607, `launchOnPromptRow`), with no tmux call: a
+ *      pane, UNAVAILABLE, CONFIG, UNCLASSIFIED or ENVIRONMENT → no-op; GONE
+ *      or the row absent (`ErrSpawnNotFound`) → findMissing sweep and a
+ *      re-read, and a row now `ended` or `missing` → resume/fresh-spawn
+ *      (otherwise no-op); CONFLICT or UNUSABLE NAME (the reader latched the
+ *      persona) → `latched`.
  *    - pending → no-op.
  *    Every resume first checks the row's `config_dir` label; a missing or
  *    different label means delete + fresh spawn instead (resumeOrFreshSpawn).

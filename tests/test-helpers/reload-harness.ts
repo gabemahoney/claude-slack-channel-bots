@@ -402,10 +402,9 @@
  * recording notice sink), and a registered session or delivered event
  * touches the registry and ack tracker; `h.cleanup()` resets them. A
  * realLaunch run also installs the session manager's module seams (the
- * process's agent-director client, through which the startup-dialog
- * approver reads and types, the approver's 200 ms cap, the
- * liveness prober fake, the spawn home,
- * the trust patcher, the reply guard, the claude_config_dir hook, the
+ * process's agent-director client — through it the startup-dialog approver
+ * reads and types; the prompt-row checks only read —, the approver's 200 ms
+ * cap, the spawn home, the trust patcher, the reply guard, the claude_config_dir hook, the
  * session notifier, the latch, the configured-persona query) and captures
  * `console.error`; `h.cleanup()` first stops every dialog approver a launch
  * started (it runs on its own after the launch call, b.jg5 SRJ-401), then
@@ -524,10 +523,8 @@ import {
   _resetPreLaunchReplyGuard,
   _resetPreLaunchTrustPatcher,
   _resetSpawnHomeDir,
-  _resetTmuxSessionProber,
   _setDialogReadyTimeoutMs,
   _setSpawnHomeDir,
-  _setTmuxSessionProber,
   checkLaunchConfigDir,
   deletePersonaInstance,
   killPersonaInstance,
@@ -1337,7 +1334,8 @@ export interface ReloadRunOptions {
    * returns success starts the startup-dialog approver on its own, after the
    * launch call (b.jg5 SRJ-401), which reads and types through the stub only,
    * its laps `DIALOG_POLL_INTERVAL_MS` apart on the approver's clock with a
-   * 200 ms cap; the liveness prober reports every session alive and the spawn home is `h.home`. The composition's reply-guard members are the
+   * 200 ms cap; a prompt row (`ask_user`, `check_permission`) a launch meets is read
+   * through the stub's `read-pane` (b.jg5 SRJ-607); the spawn home is `h.home`. The composition's reply-guard members are the
    * real ones over `h.stateDir`. Every `console.error` line (the session
    * manager's, the reply guard's) goes to `run.logs` while the run is the
    * latest live one. The start-time bootstraps (the sweep, the trust and
@@ -2954,7 +2952,6 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       captureConsole({ lines: logs, live: () => !stopped })
       setClientForTests(composition!.client as Parameters<typeof setClientForTests>[0])
       _setDialogReadyTimeoutMs(200)
-      _setTmuxSessionProber(async () => true)
       _setSpawnHomeDir(home)
       // A new server process: nothing in flight (no launch, no dialog
       // approver), no launched-with dir known.
@@ -3278,7 +3275,6 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           resetClientForTests()
           _resetDialogReadyTimeoutMs()
           _resetApproverClock()
-          _resetTmuxSessionProber()
           _resetSpawnHomeDir()
           _resetLaunchedWithDirs()
           _resetFindMissingMemo()

@@ -1,6 +1,7 @@
 /**
  * pane-read.ts — The outcome of one `read-pane` of a persona's own row, its
- * class under b.jg5 SRJ-117's table, and the full-read line count.
+ * class under b.jg5 SRJ-117's table, and the line counts (the full read and
+ * the one-line probe).
  *
  * Every site that reads persona P's pane reads P's own row `cscb_<key>`.
  * agent-director answers by the row's current launch: the worker's pane, or,
@@ -11,15 +12,19 @@
  * worker's pane is not found, the one leftover has no pane carrying its
  * token, or several leftovers run, it is CONFLICT. So a pane never proves on
  * its own that the worker's own session is there (b.jg5 SRJ-613): a pane
- * leads at most to a deferral, a positive-idle fold or Enter, and the later
- * `send-keys` or `kill` is the backstop.
+ * leads at most to a deferral, a positive-idle fold, Enter or no action, and
+ * the later `send-keys` or `kill` is the backstop.
  *
  * The users of {@link PaneReadOutcome} are the shared reader
  * `readPersonaOwnPane` in `src/session-manager.ts` and, through it, the
  * b.d61 working-row verdict (`workingReconnectVerdict` in `src/server.ts`,
  * whose pane `checkWorkingRowPane` folds), the b.f2b waiting-row check
- * (`checkWaitingRowPane`) and the launch wait's evidence read
- * (`staleWorkingRowIsIdle`). b.jg5 SRJ-117 holds the full table of sites
+ * (`checkWaitingRowPane`), the launch wait's evidence read
+ * (`staleWorkingRowIsIdle`), and b.jdc's two prompt-row paths: the reconnect
+ * verdict (`promptRowReconnectVerdict` in `src/server.ts`) and the ladder
+ * action (`launchOnPromptRow`), which read with the one-line probe count
+ * ({@link PROBE_PANE_READ_LINES}); both of b.jdc's columns of SRJ-117's
+ * table are built. b.jg5 SRJ-117 holds the full table of sites
  * that read a persona's pane and how each handles each outcome. The dialog
  * approver (`approvePreSessionDialogs`) keeps its own classification and
  * does not use this module.
@@ -85,6 +90,17 @@ import { ERR_SPAWN_NOT_FOUND_NAME } from './agent-director-errors.ts'
  * read).
  */
 export const FULL_PANE_READ_LINES = 40
+
+/**
+ * Trailing pane lines a one-line probe asks for (b.jg5 SRJ-117's `n_lines`
+ * at b.jdc's reconnect verdict, `promptRowReconnectVerdict` in
+ * `src/server.ts`, and b.jdc's ladder action, `launchOnPromptRow`; SRJ-606,
+ * SRJ-607). These read whether a pane of the row's launch is there, not what
+ * it shows. SRJ-117's table gives the same count to the latch re-check probe
+ * (SRJ-505) and the CLI precheck (SRJ-901); neither reads a pane through this
+ * module today.
+ */
+export const PROBE_PANE_READ_LINES = 1
 
 // ---------------------------------------------------------------------------
 // Outcome kinds

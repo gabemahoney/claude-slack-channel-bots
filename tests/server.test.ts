@@ -23,6 +23,7 @@ import {
 import {
   FULL_PANE_READ_LINES,
   PANE_READ_UNCLASSIFIED,
+  PROBE_PANE_READ_LINES,
   paneReadClassNote,
   paneReadFailureOf,
   type PaneReadFailure,
@@ -119,6 +120,7 @@ import {
   expectedLatchRecord,
   launchStartRecord,
   livenessPaneConflictRowsAt,
+  promptRowPaneConflictRowsAt,
   reconnectConflictRowsAt,
   reconnectUnusableNameRowsAt,
   tmuxTouchingCallsIn,
@@ -132,7 +134,12 @@ import {
   _runCallTimeoutStartStep,
   deferPendingRow,
   LAUNCH_START_LOG_RE,
-  promptRowTmuxGoneLine,
+  promptRowAbsentAtPaneReadLine,
+  promptRowLatchedLine,
+  promptRowPaneGoneLine,
+  promptRowPaneReadEnvironmentLine,
+  promptRowPaneReadStoppingLine,
+  promptRowTakenAsAliveLine,
   workingRowAbsentAtPaneReadLine,
   workingRowPaneGoneLine,
 } from '../src/server.ts'
@@ -150,8 +157,6 @@ import { writeAgentDirectorConfig } from './test-helpers/ad-settings.ts'
 import {
   _resetFindMissingMemo,
   _setFindMissingMemoTtlMs,
-  _setTmuxSessionProber,
-  _resetTmuxSessionProber,
   _setTmuxCommandRunner,
   _resetTmuxCommandRunner,
   _setSpawnHomeDir,
@@ -174,6 +179,8 @@ import {
   forgetNotConnectedEpisode,
   hasPendingWorkingRowEvidence,
   isLaunchInFlight,
+  PROMPT_ROW_STATES,
+  PROMPT_ROW_SWEEP_AFTER_MS,
   setConflictLatch,
   setConfiguredPersonaQuery,
   _resetConfiguredPersonaQuery,
@@ -1360,16 +1367,17 @@ function stringLines(errArgs: unknown[][]): string[] {
 // manufactures a false dead. While a launch for the persona is in flight the
 // `working` row is deferred with no agent-director call: the launch owns the
 // session. b.jg5 SRJ-604: a `waiting` row's one `read-pane` is classed the same
-// way before `/mcp reconnect` is typed. The harness installs a recording
-// tmux-session prober (`_setTmuxSessionProber`) and a recording raw tmux
-// runner (`_setTmuxCommandRunner`), so no test shells out to tmux and the
-// `working` and `waiting` rows' cases can show they make no tmux call.
+// way before `/mcp reconnect` is typed. The harness installs a recording raw
+// tmux runner (`_setTmuxCommandRunner`), so no test shells out to tmux and
+// every case can show it makes no tmux call.
 //
-// b.jdc: an `ask_user` or `check_permission` row is never typed into, but its
-// tmux session is probed (through the recording prober) before it is
-// deferred or reported: a gone tmux session is swept and escalated with no
-// notice, and a live one's deferrals sweep and read the row again from
-// 10 min on (the b.jdc block below).
+// b.jdc, b.jg5 SRJ-606: an `ask_user` or `check_permission` row is never
+// typed into, but its own row is read first with one one-line `read-pane`
+// (`PROBE_PANE_READ_LINES`) before it is deferred or reported: GONE (or the
+// row absent) is swept and escalated with no notice, a pane or a read that
+// could not run is taken as alive and deferred, and the deferrals sweep and
+// read the row again from 10 min on (the per-cell block and the b.jdc block
+// below).
 // ---------------------------------------------------------------------------
 
 describe('_buildReconnectSessionAdapter', () => {
@@ -1379,9 +1387,7 @@ describe('_buildReconnectSessionAdapter', () => {
    * status probe and reconnectMcp's send-keys both flow through this one client.
    * The pane reads answer `paneQueue`, then `paneError`, then `pane` (the last
    * two read at each read, so a test may change them between attempts). The
-   * tmux-session prober reports `tmux` (default alive) and records every name
-   * it is asked about in `tmuxProbes`; the raw tmux runner records every argv
-   * in `tmuxRuns` and runs nothing. `stub` is the shared client, for a test
+   * raw tmux runner records every argv in `tmuxRuns` and runs nothing. `stub` is the shared client, for a test
    * that holds a launch's spawn open on it (`holdSpawns`).
    */
   function makeHarness(opts: {
@@ -1392,8 +1398,6 @@ describe('_buildReconnectSessionAdapter', () => {
     sendKeysThrows?: Error
     /** Errors the send-keys calls answer in turn, before `sendKeysThrows` or success. */
     sendKeysErrors?: Error[]
-    /** b.jdc: what the tmux-session prober reports for a prompt row (default alive); a `working` or `waiting` row is never probed. */
-    tmux?: 'alive' | 'gone' | 'probe-error'
     /** What every pane read shows unless `paneQueue` or `paneError` answers it (default: the stub's empty pane). */
     pane?: string
     /** When set, every pane read rejects with it unless `paneQueue` answers it. */
@@ -1433,7 +1437,6 @@ describe('_buildReconnectSessionAdapter', () => {
     spawnCalls: SpawnParams[]
     resumeCalls: ResumeParams[]
     getCalls: GetParams[]
-    tmuxProbes: string[]
     tmuxRuns: string[][]
     stub: StubClient
   } {
@@ -1445,13 +1448,7 @@ describe('_buildReconnectSessionAdapter', () => {
     const spawnCalls: SpawnParams[] = []
     const resumeCalls: ResumeParams[] = []
     const getCalls: GetParams[] = []
-    const tmuxProbes: string[] = []
     const tmuxRuns: string[][] = []
-    _setTmuxSessionProber(async (name) => {
-      tmuxProbes.push(name)
-      if (opts.tmux === 'probe-error') throw new Error('tmux probe failed')
-      return opts.tmux !== 'gone'
-    })
     _setTmuxCommandRunner(async (args) => {
       tmuxRuns.push([...args])
       return { code: 1, stdout: '' }
@@ -1507,20 +1504,23 @@ describe('_buildReconnectSessionAdapter', () => {
       spawnCalls,
       resumeCalls,
       getCalls,
-      tmuxProbes,
       tmuxRuns,
       stub,
     }
   }
 
-  /** A `working` or `waiting` row's case made no tmux call: no probe and no raw tmux command (b.jg5 SRJ-603, SRJ-604). */
-  function expectNoTmuxCall(h: { tmuxProbes: string[]; tmuxRuns: string[][] }): void {
-    expect([h.tmuxProbes, h.tmuxRuns]).toEqual([[], []])
+  /** The case made no tmux call: no raw tmux command (b.jg5 SRJ-603, SRJ-604, SRJ-606). */
+  function expectNoTmuxCall(h: { tmuxRuns: string[][] }): void {
+    expect(h.tmuxRuns).toEqual([])
   }
 
   /** `n` full reads of C1's own row's pane. */
   const fullPaneReads = (n: number): ReadPaneParams[] =>
     Array(n).fill({ claude_instance_id: personaInstanceId('C1'), n_lines: FULL_PANE_READ_LINES })
+
+  /** `n` one-line probe reads of C1's own row's pane (b.jdc's prompt rows, b.jg5 SRJ-606). */
+  const probePaneReads = (n: number): ReadPaneParams[] =>
+    Array(n).fill({ claude_instance_id: personaInstanceId('C1'), n_lines: PROBE_PANE_READ_LINES })
 
   /** The escalate-dead sweep line for persona C1 with `verdict`, from the imported builder. */
   const escalateDeadLine = (verdict: EscalateDeadVerdict): string => escalateDeadSweepLine('C1', verdict)
@@ -1549,7 +1549,6 @@ describe('_buildReconnectSessionAdapter', () => {
   afterEach(() => {
     resetClientForTests()
     _resetOutageState()
-    _resetTmuxSessionProber()
     _resetTmuxCommandRunner()
     _resetFindMissingMemo()
     _resetInFlightLaunches()
@@ -1597,7 +1596,7 @@ describe('_buildReconnectSessionAdapter', () => {
 
     expect(result).toBe('escalate-dead')
     expect(statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
-    // One read of the persona's own row; no tmux probe or raw tmux command.
+    // One read of the persona's own row; no raw tmux command.
     expect(readPaneCalls).toEqual(fullPaneReads(1))
     expectNoTmuxCall(h)
     // Nothing is typed into a pane that no longer exists.
@@ -1708,8 +1707,8 @@ describe('_buildReconnectSessionAdapter', () => {
     ['ErrCallTimeout', () => errCallTimeout('status')],
     ['ErrTmuxUnresponsive (by name)', () => errTmuxUnresponsive('status')],
     ['a plain Error', () => new Error('boom')],
-  ])("SRJ-115: %s at the state read → 'transient', never 'escalate-dead'; no send-keys, pane read, tmux probe or sweep; one line", async (_label, build) => {
-    const { adapter, statusCalls, sendKeysCalls, findMissingCalls, readPaneCalls, tmuxProbes } = makeHarness({
+  ])("SRJ-115: %s at the state read → 'transient', never 'escalate-dead'; no send-keys, pane read, tmux call or sweep; one line", async (_label, build) => {
+    const { adapter, statusCalls, sendKeysCalls, findMissingCalls, readPaneCalls, tmuxRuns } = makeHarness({
       statusError: build(),
     })
     const lines: string[] = []
@@ -1726,7 +1725,7 @@ describe('_buildReconnectSessionAdapter', () => {
     expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
     expect(sendKeysCalls).toEqual([])
     expect(readPaneCalls).toEqual([])
-    expect(tmuxProbes).toEqual([])
+    expect(tmuxRuns).toEqual([])
     expect(findMissingCalls).toHaveLength(0)
     expect(lines).toHaveLength(1)
     expect(lines[0]).toStartWith('[slack] reconnectSession: persona=C1 status check failed: ')
@@ -1735,14 +1734,14 @@ describe('_buildReconnectSessionAdapter', () => {
   // b.jg5 SRJ-115, SRJ-316: a CONFIG answer at the state read is the same
   // 'transient' with nothing typed, read or swept; the outage wrapper also
   // raises `ad-config-malformed`, which adds its one raise line.
-  test("SRJ-115, SRJ-316: a CONFIG answer (ErrConfigMalformed) at the state read → 'transient', never 'escalate-dead'; no send-keys, pane read, tmux probe or sweep; ad-config-malformed raised; the status-check line and one raise line", async () => {
-    const { result, errArgs, statusCalls, sendKeysCalls, findMissingCalls, readPaneCalls, tmuxProbes, killCalls, spawnCalls, resumeCalls } = await reconnectCapturing({
+  test("SRJ-115, SRJ-316: a CONFIG answer (ErrConfigMalformed) at the state read → 'transient', never 'escalate-dead'; no send-keys, pane read, tmux call or sweep; ad-config-malformed raised; the status-check line and one raise line", async () => {
+    const { result, errArgs, statusCalls, sendKeysCalls, findMissingCalls, readPaneCalls, tmuxRuns, killCalls, spawnCalls, resumeCalls } = await reconnectCapturing({
       statusError: errConfigMalformed(),
     })
 
     expect(result).toBe('transient')
     expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
-    expect([sendKeysCalls, readPaneCalls, tmuxProbes, killCalls, spawnCalls, resumeCalls]).toEqual([[], [], [], [], [], []])
+    expect([sendKeysCalls, readPaneCalls, tmuxRuns, killCalls, spawnCalls, resumeCalls]).toEqual([[], [], [], [], [], []])
     expect(findMissingCalls).toHaveLength(0)
     expect([...getOutageFlags('C1')]).toEqual(['ad-config-malformed'])
     const lines = stringLines(errArgs)
@@ -1930,7 +1929,7 @@ describe('_buildReconnectSessionAdapter', () => {
   // b.jg5 SRJ-408, SRJ-513: the configured-persona query counts no key here,
   // so the row with no launch start latches nothing and is deferred; under a
   // configured persona's key it latches instead (the SRJ-513 describe below).
-  test.each(DEFERRAL_CASES)("REPRO (b.dup), b.jg5 SRJ-303/SRJ-115: a pending row showing %s, under a key no configured persona uses → 'pending' with no send-keys, pane read, tmux probe or sweep, no notice, and one line naming its launch start", async (_label, launchStartedAt, launch) => {
+  test.each(DEFERRAL_CASES)("REPRO (b.dup), b.jg5 SRJ-303/SRJ-115: a pending row showing %s, under a key no configured persona uses → 'pending' with no send-keys, pane read, tmux call or sweep, no notice, and one line naming its launch start", async (_label, launchStartedAt, launch) => {
     const raised: string[] = []
     setSessionNotifier((key) => { raised.push(key) })
     setConfiguredPersonaQuery(() => false)
@@ -1938,7 +1937,7 @@ describe('_buildReconnectSessionAdapter', () => {
     const orig = console.error
     console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
     try {
-      const { adapter, sendKeysCalls, findMissingCalls, readPaneCalls, tmuxProbes } = makeHarness({
+      const { adapter, sendKeysCalls, findMissingCalls, readPaneCalls, tmuxRuns } = makeHarness({
         statusState: AGENT_DIRECTOR_PENDING_STATE,
         launchStartedAt,
         sendKeysThrows: errSpawnNotInteractive('send-keys'),
@@ -1949,7 +1948,7 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(result).toBe('pending')
       expect(sendKeysCalls).toEqual([])
       expect(readPaneCalls).toEqual([])
-      expect(tmuxProbes).toEqual([])
+      expect(tmuxRuns).toEqual([])
       expect(findMissingCalls).toHaveLength(0)
       expect(raised).toEqual([])
       expect(lines).toEqual([deferralLine(launch)])
@@ -1966,7 +1965,7 @@ describe('_buildReconnectSessionAdapter', () => {
   test.each(DEFERRAL_CASES)("deferPendingRow called directly with %s → 'pending'; no agent-director call, no notice; one line naming its launch start", (_label, launchStartedAt, launch) => {
     const raised: string[] = []
     setSessionNotifier((key) => { raised.push(key) })
-    const { statusCalls, sendKeysCalls, findMissingCalls, readPaneCalls, tmuxProbes } = makeHarness({})
+    const { statusCalls, sendKeysCalls, findMissingCalls, readPaneCalls, tmuxRuns } = makeHarness({})
     const lines: string[] = []
     const orig = console.error
     console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
@@ -1983,7 +1982,7 @@ describe('_buildReconnectSessionAdapter', () => {
     expect(sendKeysCalls).toEqual([])
     expect(readPaneCalls).toEqual([])
     expect(findMissingCalls).toHaveLength(0)
-    expect(tmuxProbes).toEqual([])
+    expect(tmuxRuns).toEqual([])
     expect(raised).toEqual([])
     expect(lines).toEqual([deferralLine(launch)])
   })
@@ -2159,21 +2158,6 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(h.sendKeysCalls).toHaveLength(2)
     })
 
-    // b.jdc: each attempt first probes the persona's own tmux session (alive
-    // here); a gone one is swept and escalated instead (the b.jdc block below).
-    test.each(['ask_user', 'check_permission'])("REPRO: a %s row whose tmux session lives is never typed into: 'transient' on every attempt with one probe of C1's own tmux session and no pane read, send-keys or sweep, and one blocked-on-prompt notice for the episode", async (state) => {
-      const h = makeHarness({ statusState: state })
-
-      expect(await attempts(h.adapter, 3, 60_000)).toEqual(['transient', 'transient', 'transient'])
-      expect(h.sendKeysCalls).toEqual([])
-      expect(h.readPaneCalls).toEqual([])
-      expect(h.tmuxProbes).toEqual(Array(3).fill('slack_bot_C1'))
-      expect(h.findMissingCalls).toEqual([])
-      expect(raised.map((n) => n.key)).toEqual(['C1'])
-      expect(raised[0]!.text).toStartWith(':warning: *Waiting on a prompt*')
-      expect(raised[0]!.text).toContain('`tmux attach -t =slack_bot_C1`')
-    })
-
     // b.f2b: at a non-zero delay nothing else escalates a `working` row whose
     // idleness can't be proven, so the adapter's deferrals on it are bounded:
     // `UNPROVEN_IDLE_NOTICE_AFTER_MS` after the first, the unproven-idle
@@ -2279,9 +2263,22 @@ describe('_buildReconnectSessionAdapter', () => {
   //     idle, the reconnect's one `send-keys` answering CONFLICT (the case
   //     table's reconnect rows for `waiting`) or UNUSABLE NAME latches P with
   //     the state `waiting` and posts once; the next attempt types nothing.
+  //   - An `ask_user` or `check_permission` row (b.jdc's reconnect verdict,
+  //     b.jg5 SRJ-606), each prompt state, one one-line `read-pane`
+  //     (`PROBE_PANE_READ_LINES`) per attempt and nothing typed: a pane
+  //     defers with the blocked-on-prompt notice once per episode; GONE and
+  //     the row absent sweep once and escalate with their verdicts, with no
+  //     notice; UNAVAILABLE, CONFIG (its outage raised) and UNCLASSIFIED are
+  //     taken as alive: the deferral and its notice, the read counted in the
+  //     run of deferrals (a read `PROMPT_ROW_SWEEP_AFTER_MS` later sweeps);
+  //     ENVIRONMENT (its outage raised) defers with no deferral noted and no
+  //     notice; CONFLICT (the case table's prompt-row reconnect-verdict rows)
+  //     and UNUSABLE NAME latch P with the prompt state; a stop-marked
+  //     UNCLASSIFIED calls nothing more; a persona latched elsewhere during
+  //     the read gets no notice.
   // No case makes a tmux call; every line, notice and latch line is
   // leak-checked.
-  describe('b.jg5 SRJ-117, SRJ-603, SRJ-604: a working or waiting row\'s one read-pane, one case per cell', () => {
+  describe('b.jg5 SRJ-117, SRJ-603, SRJ-604, SRJ-606: a working, waiting or prompt row\'s one read-pane, one case per cell', () => {
     let clock: FakeClock
     let raised: Array<{ key: string; text: string }>
     let latch: ConflictLatch
@@ -2326,7 +2323,7 @@ describe('_buildReconnectSessionAdapter', () => {
     type Harness = ReturnType<typeof makeHarness>
 
     /** A harness for C1's row reading `state`, its adapter given the installed latch's query; every stub verb call lands in `callOrder`. */
-    function cellHarness(state: 'working' | 'waiting', opts: Parameters<typeof makeHarness>[0]): Harness {
+    function cellHarness(state: string, opts: Parameters<typeof makeHarness>[0]): Harness {
       const h = makeHarness({ statusState: state, isLatched: (key) => latch.isLatched(key), triggers, ...opts })
       const client = h.stub as unknown as Record<string, unknown>
       for (const name of Object.keys(client)) {
@@ -2435,9 +2432,17 @@ describe('_buildReconnectSessionAdapter', () => {
       waiting: 'waiting-row check',
     }
 
-    /** [name, answer, the record C1 is latched with, the notice its latch posts] for each latching `read-pane` answer on a row reading `state`. */
-    const latchCells = (state: 'working' | 'waiting'): ReadonlyArray<readonly [string, () => Error, ConflictLatchRecord, string]> => [
-      ...livenessPaneConflictRowsAt(LIVENESS_SITE_OF[state]).map((row) => [`CONFLICT at ${row.name}`, row.build, conflictRecord(row), row.notice.text] as const),
+    /**
+     * [name, answer, the record C1 is latched with, the notice its latch
+     * posts] for each latching `read-pane` answer on a row reading `state`:
+     * the case table's CONFLICT rows `conflictRows` (default: the liveness
+     * site's for `working` or `waiting`), then each UNUSABLE NAME fault.
+     */
+    const latchCells = (
+      state: string,
+      conflictRows: readonly ConflictCaseRow[] = livenessPaneConflictRowsAt(LIVENESS_SITE_OF[state as 'working' | 'waiting']),
+    ): ReadonlyArray<readonly [string, () => Error, ConflictLatchRecord, string]> => [
+      ...conflictRows.map((row) => [`CONFLICT at ${row.name}`, row.build, conflictRecord(row), row.notice.text] as const),
       ...UNUSABLE_NAME_CASE_ROWS.filter((row) => row.site === 'read-pane').map(
         (row) => [`UNUSABLE NAME (${row.fault})`, row.build, { ...row.record('C1'), rowState: latchRowStateRead(state) }, row.notice('C1')] as const,
       ),
@@ -2754,6 +2759,217 @@ describe('_buildReconnectSessionAdapter', () => {
       expect([h.sendKeysCalls, h.findMissingCalls]).toEqual([[], []])
       expectNoTmuxCall(h)
     })
+
+    // ---- an `ask_user` or `check_permission` row (b.jdc, b.jg5 SRJ-606) ----
+
+    /** The prompt states, in `PROMPT_ROW_STATES`' order. */
+    const PROMPT_STATES = [...PROMPT_ROW_STATES]
+
+    /** Each prompt state crossed with each of `cells`: the state first, then the cell's own columns. */
+    const forEachPromptState = <T extends readonly unknown[]>(cells: ReadonlyArray<T>) =>
+      PROMPT_STATES.flatMap((state) => cells.map((cell) => [state, ...cell] as const))
+
+    /** The prompt-row verdict's own lines for C1's row reading `state`: its class, GONE, absent, stop and latched lines (each from its builder). */
+    const promptRowOwnLines = (lines: readonly string[], state: string): string[] =>
+      lines.filter((l) => l.startsWith(`[slack] reconnectSession: persona=C1 is ${state} and `) || l.startsWith(`[slack] reconnectSession: persona=C1 is ${state} but `))
+
+    /** The not-connected notices raised, by persona (a prompt row's only one is blocked-on-prompt). */
+    const noticeKeys = (): string[] => raised.map((n) => n.key)
+
+    // SRJ-606's literal (the SRD's `n_lines` 1 for this site): the one pinned
+    // count; every other case takes it from `PROBE_PANE_READ_LINES`.
+    test("SRJ-606: a prompt row's read-pane asks for exactly 1 line of C1's own row", async () => {
+      const h = cellHarness('ask_user', {})
+
+      await attempt(h)
+
+      expect(h.readPaneCalls).toEqual([{ claude_instance_id: 'cscb_C1', n_lines: 1 }])
+    })
+
+    test.each(PROMPT_STATES)("a %s row whose read-pane answers a pane → 'transient' at every attempt with the blocked-on-prompt notice once for the episode; one one-line read-pane of C1's own row per attempt; nothing typed, swept or latched; no class line; no tmux call", async (state) => {
+      const h = cellHarness(state, {})
+      const verdicts: string[] = []
+      const lines: string[] = []
+      for (let i = 0; i < 3; i++) {
+        if (i > 0) await clock.advance(60_000)
+        const r = await attempt(h)
+        verdicts.push(r.verdict)
+        lines.push(...r.lines)
+      }
+
+      expect(verdicts).toEqual(['transient', 'transient', 'transient'])
+      expect(noticeKeys()).toEqual(['C1'])
+      expect(h.readPaneCalls).toEqual(probePaneReads(3))
+      expect([h.sendKeysCalls, h.findMissingCalls]).toEqual([[], []])
+      expect(latch.isLatched('C1')).toBe(false)
+      expect(promptRowOwnLines(lines, state)).toEqual([])
+      expectNoTmuxCall(h)
+    })
+
+    test.each(forEachPromptState<readonly [string, () => Error, EscalateDeadVerdict, (key: string, state: string, read: PaneReadFailure) => string]>([
+      ['GONE (ErrTmuxCaptureFailed)', paneGone, 'prompt-row-tmux-gone', promptRowPaneGoneLine],
+      ['the row absent (ErrSpawnNotFound)', errSpawnNotFound, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, promptRowAbsentAtPaneReadLine],
+    ]))("REPRO: a %s row whose session died with the prompt open, its read-pane answering %s → 'escalate-dead' with nothing typed: one one-line read-pane, one findMissing sweep, the verdict's own line (its builder's) and the escalate-dead line with the verdict and its imported evidence text; no blocked-on-prompt notice, nothing latched; no tmux call", async (state, _label, build, escalateVerdict, lineOf) => {
+      const err = build()
+      const h = cellHarness(state, { paneError: err })
+
+      const { verdict, lines } = await attempt(h)
+
+      expect(verdict).toBe('escalate-dead')
+      expect(h.sendKeysCalls).toEqual([])
+      expect(h.readPaneCalls).toEqual(probePaneReads(1))
+      expect(h.findMissingCalls).toHaveLength(1)
+      expectNoTmuxCall(h)
+      expect(lines.filter((l) => l.startsWith('[slack] escalate-dead: persona='))).toEqual([escalateDeadLine(escalateVerdict)])
+      expect(promptRowOwnLines(lines, state)).toEqual([lineOf('C1', state, paneReadFailureOf(err))])
+      expect(latch.isLatched('C1')).toBe(false)
+      expect(raised).toEqual([])
+    })
+
+    /** [name, answer, the outage flags it raises] for each `read-pane` answer a prompt row takes as alive (b.jg5 SRJ-117, SRJ-105, SRJ-316). */
+    const TAKEN_AS_ALIVE: ReadonlyArray<readonly [string, () => Error, readonly OutageClass[]]> = [
+      ...PANE_UNAVAILABLE_FORMS.map(([label, build]) => [`UNAVAILABLE: ${label}`, () => build('read-pane'), []] as const),
+      ['CONFIG (ErrConfigMalformed)', paneConfigMalformed, ['ad-config-malformed']],
+      ...PANE_UNCLASSIFIED.map(([label, build, flags]) => [`UNCLASSIFIED: ${label}`, build, flags] as const),
+    ]
+
+    test.each(forEachPromptState(TAKEN_AS_ALIVE))("a %s row, %s → taken as alive: 'transient' with the blocked-on-prompt notice and one line naming the class; exactly the outage flags it raises; no sweep, nothing typed or latched; the read starts the run of deferrals, so the same answer PROMPT_ROW_SWEEP_AFTER_MS later sweeps and, the row then missing, escalates; no tmux call", async (state, _label, build, flags) => {
+      const err = build()
+      const h = cellHarness(state, { paneError: err, statusAfterSweep: 'missing' })
+
+      const first = await attempt(h)
+
+      expect(first.verdict).toBe('transient')
+      expect(noticeKeys()).toEqual(['C1'])
+      expect(h.findMissingCalls).toEqual([])
+      expect([...getOutageFlags('C1')]).toEqual([...flags])
+      expect(promptRowOwnLines(first.lines, state)).toEqual([promptRowTakenAsAliveLine('C1', state, paneReadFailureOf(err))])
+
+      await clock.advance(PROMPT_ROW_SWEEP_AFTER_MS)
+      expect((await attempt(h)).verdict).toBe('escalate-dead')
+
+      expect(h.findMissingCalls).toHaveLength(1)
+      expect(h.readPaneCalls).toEqual(probePaneReads(2))
+      expect(h.sendKeysCalls).toEqual([])
+      expect(noticeKeys()).toEqual(['C1'])
+      expect(latch.isLatched('C1')).toBe(false)
+      expectNoTmuxCall(h)
+    })
+
+    test.each(forEachPromptState(PANE_ENVIRONMENT))("a %s row, ENVIRONMENT (%s) → 'transient' with no deferral noted and no notice: tmux-unavailable raised; one line naming the class; no sweep; a pane PROMPT_ROW_SWEEP_AFTER_MS later starts the run of deferrals (its notice, no sweep); nothing typed or latched; no tmux call", async (state, _label, build) => {
+      const err = build()
+      const h = cellHarness(state, { paneQueue: [cannedErr(err)] })
+
+      const first = await attempt(h)
+
+      expect(first.verdict).toBe('transient')
+      expect(raised).toEqual([])
+      expect([...getOutageFlags('C1')]).toEqual(['tmux-unavailable'])
+      expect(promptRowOwnLines(first.lines, state)).toEqual([promptRowPaneReadEnvironmentLine('C1', state, paneReadFailureOf(err))])
+
+      await clock.advance(PROMPT_ROW_SWEEP_AFTER_MS)
+      expect((await attempt(h)).verdict).toBe('transient')
+
+      expect(h.findMissingCalls).toEqual([])
+      expect(noticeKeys()).toEqual(['C1'])
+      expect(h.readPaneCalls).toEqual(probePaneReads(2))
+      expect(h.sendKeysCalls).toEqual([])
+      expect(latch.isLatched('C1')).toBe(false)
+      expectNoTmuxCall(h)
+    })
+
+    test.each(PROMPT_STATES.flatMap((state) => latchCells(state, promptRowPaneConflictRowsAt('prompt-row reconnect verdict', state)).map((cell) => [state, ...cell] as const)))("a %s row, %s, read inside C1's recovery attempt → C1 latched once with that state and its one latch notice posted; nothing counted, no retry armed; 'transient' with no blocked-on-prompt notice, nothing typed or swept; one reader line and one latched line; no tmux call", async (state, _name, build, record, notice) => {
+      const h = cellHarness(state, { paneError: build() })
+
+      const { verdict, lines } = await attempt(h, true)
+
+      expect(verdict).toBe('transient')
+      expectLatchedOnceAt(record, notice)
+      expect(raised).toEqual([])
+      expect(h.readPaneCalls).toEqual(probePaneReads(1))
+      expect([h.sendKeysCalls, h.findMissingCalls]).toEqual([[], []])
+      expectNoTmuxCall(h)
+      expect(readerLatchLines(lines)).toHaveLength(1)
+      expect(promptRowOwnLines(lines, state)).toEqual([promptRowLatchedLine('C1', state)])
+    })
+
+    test.each(PROMPT_STATES)("a %s row, a read-pane ErrInvalidFlags whose version re-check decides that the server stops, inside C1's recovery attempt → 'transient': the status read, the read-pane and the re-check are the attempt's only calls; one stop; no notice; nothing swept, latched or armed; one line saying the server stops; no tmux call", async (state) => {
+      const stops = installRecheck({ version: OLD_AD_VERSION })
+      const err = errInvalidFlags('read-pane')
+      const h = cellHarness(state, { paneError: err })
+
+      const { verdict, lines } = await attempt(h, true)
+
+      expect(verdict).toBe('transient')
+      expect(callOrder).toEqual(['status', 'readPane', 'resolveSystemBinary'])
+      expect(stops).toHaveLength(1)
+      expect([raised, posts]).toEqual([[], []])
+      expect(h.findMissingCalls).toEqual([])
+      expectNoTmuxCall(h)
+      expect(latch.isLatched('C1')).toBe(false)
+      expect(triggers).toEqual([])
+      const stopped: PaneReadFailure = { kind: PANE_READ_UNCLASSIFIED, errorClass: AD_ERROR_CLASS_UNCLASSIFIED, description: describeAgentDirectorFailure(err), stopping: true }
+      expect(promptRowOwnLines(lines, state)).toEqual([promptRowPaneReadStoppingLine('C1', state, stopped)])
+    })
+
+    test("control: an ask_user row, a read-pane ErrInvalidFlags whose version re-check passes (no stop mark) → taken as alive as any UNCLASSIFIED: the re-check, then 'transient' with the blocked-on-prompt notice; no stop; one line naming the class", async () => {
+      const stops = installRecheck({ version: PHASE1_RC_VERSION })
+      const err = errInvalidFlags('read-pane')
+      const h = cellHarness('ask_user', { paneError: err })
+
+      const { verdict, lines } = await attempt(h, true)
+
+      expect(verdict).toBe('transient')
+      expect(callOrder).toEqual(['status', 'readPane', 'resolveSystemBinary'])
+      expect(stops).toEqual([])
+      expect(noticeKeys()).toEqual(['C1'])
+      const unclassified: PaneReadFailure = { kind: PANE_READ_UNCLASSIFIED, errorClass: AD_ERROR_CLASS_UNCLASSIFIED, description: describeAgentDirectorFailure(err) }
+      expect(promptRowOwnLines(lines, 'ask_user')).toEqual([promptRowTakenAsAliveLine('C1', 'ask_user', unclassified)])
+    })
+
+    // One literal pin per builder of the verdict's own non-escalating lines
+    // (its GONE and absent lines are pinned with the other escalate-dead
+    // reconnect lines in tests/session-manager.test.ts); every other case
+    // compares with the builder.
+    test("the prompt-row verdict's lines: one literal pin per builder", () => {
+      const unavailable = paneReadFailureOf(errCallTimeout('read-pane'))
+      const environment = paneReadFailureOf(errTmuxNotAvailable(undefined, 'read-pane'))
+      const stopped: PaneReadFailure = { kind: PANE_READ_UNCLASSIFIED, errorClass: AD_ERROR_CLASS_UNCLASSIFIED, description: 'class=UNCLASSIFIED name=ErrInvalidFlags', stopping: true }
+
+      expect(promptRowTakenAsAliveLine('C1', 'ask_user', unavailable)).toBe(
+        `[slack] reconnectSession: persona=C1 is ask_user and reading its pane failed: ${unavailable.description} — taken as alive (no proof the session is gone); deferring as for a pane (${paneReadClassNote(unavailable)}; b.jdc, b.jg5 SRJ-606, SRJ-117)`,
+      )
+      expect(promptRowPaneReadEnvironmentLine('C1', 'check_permission', environment)).toBe(
+        `[slack] reconnectSession: persona=C1 is check_permission and reading its pane failed: ${environment.description} — tmux is not available; deferring to a later tick, no deferral noted and no notice (${paneReadClassNote(environment)}; b.jg5 SRJ-117, SRJ-311)`,
+      )
+      expect(promptRowPaneReadStoppingLine('C1', 'ask_user', stopped)).toBe(
+        `[slack] reconnectSession: persona=C1 is ask_user and reading its pane failed: ${stopped.description} — the agent-director version re-check decided that the server stops; nothing more is called for it (${paneReadClassNote(stopped)}; b.jg5 SRJ-204, SRJ-205)`,
+      )
+      expect(promptRowLatchedLine('C1', 'check_permission')).toBe(
+        '[slack] reconnectSession: persona=C1 is check_permission and is latched — deferring; no deferral noted, no notice, nothing typed (b.jg5 SRJ-502)',
+      )
+    })
+
+    // b.jg5 SRJ-502 (the E14 hatch note): a persona latched by another path
+    // while the verdict's `read-pane` is awaited gets no blocked-on-prompt
+    // notice, though the read answers a pane.
+    test.each(forEachPromptState([
+      ['C1 latched during the read', true],
+      ['control: C1 not latched', false],
+    ] as const))("a %s row whose read-pane answers a pane: %s → 'transient', with the blocked-on-prompt notice only when not latched; nothing typed or swept; no tmux call", async (state, _label, latched) => {
+      const h = cellHarness(state, {})
+      if (latched) latchDuringNextPaneRead(h)
+
+      const { verdict, lines } = await attempt(h)
+
+      expect(verdict).toBe('transient')
+      expect(noticeKeys()).toEqual(latched ? [] : ['C1'])
+      expect(latch.isLatched('C1')).toBe(latched)
+      expect(lines.filter((l) => l.startsWith('[slack] reconnectSession: persona=C1 is latched'))).toHaveLength(latched ? 1 : 0)
+      expect(h.readPaneCalls).toEqual(probePaneReads(1))
+      expect([h.sendKeysCalls, h.findMissingCalls]).toEqual([[], []])
+      expectNoTmuxCall(h)
+    })
   })
 
   // b.jdc (/ci-live run 6): when a persona's session dies while its row reads
@@ -2761,14 +2977,17 @@ describe('_buildReconnectSessionAdapter', () => {
   // only refreshes a row at SessionEnd and leaves reaping to its findMissing
   // sweep. Deferring on the row alone kept a dead persona "blocked on a
   // prompt" for good: never relaunched, with a *Waiting on a prompt* notice
-  // about a session that no longer existed. The adapter now probes the
-  // persona's own tmux session first: gone → the dead-tmux sweep and
-  // 'escalate-dead', with no notice; alive (or a probe that fails) → the
-  // deferral and its notice as before, and once the deferrals on the row have
-  // run for 10 min each one first runs the findMissing sweep and reads the row
-  // again, escalating when it reads `missing` or `ended`. Nothing is ever typed
-  // into the row (b.rmy). Attempts run on a fake clock passed to `_setNow`.
-  // Cases marked REPRO fail on the code before the fix.
+  // about a session that no longer existed. The adapter now reads the
+  // persona's own row first with one one-line `read-pane` (b.jg5 SRJ-606;
+  // each answer's cell is in the per-cell block above): GONE → the dead-tmux
+  // sweep and 'escalate-dead', with no notice; a pane (or a read taken as
+  // alive) → the deferral and its notice as before, and once the deferrals on
+  // the row have run for `PROMPT_ROW_SWEEP_AFTER_MS` each one first runs the
+  // findMissing sweep and reads the row again, escalating when it reads
+  // `missing` or `ended`. The cases here run on the stub's pane (its default
+  // answer). Nothing is ever typed into the row (b.rmy). Attempts run on a
+  // fake clock passed to `_setNow`. Cases marked REPRO fail on the code
+  // before the fix.
   describe('b.jdc: a row waiting on a prompt whose session may be gone', () => {
     let clock: FakeClock
     let raised: Array<{ key: string; text: string }>
@@ -2788,6 +3007,7 @@ describe('_buildReconnectSessionAdapter', () => {
     afterEach(() => {
       console.error = realError
       setSessionNotifier(undefined)
+      assertNoLeak({ lines, raised })
     })
 
     /** Attempt a reconnect of C1 at each of `minutes` on the fake clock; the verdicts in order. */
@@ -2805,80 +3025,52 @@ describe('_buildReconnectSessionAdapter', () => {
       return lines.filter((l) => l.startsWith('[slack] reconnectSession: ') || l.startsWith('[slack] escalate-dead: persona='))
     }
 
-    test.each(['ask_user', 'check_permission'])("REPRO: a %s row whose tmux session is gone → 'escalate-dead' with one probe of C1's own session and one findMissing sweep; nothing typed or read, and no Waiting on a prompt notice", async (state) => {
-      const h = makeHarness({ statusState: state, tmux: 'gone' })
-
-      expect(await h.adapter('C1')).toBe('escalate-dead')
-
-      expect(h.tmuxProbes).toEqual(['slack_bot_C1'])
-      expect(h.findMissingCalls).toHaveLength(1)
-      expect(h.sendKeysCalls).toEqual([])
-      expect(h.readPaneCalls).toEqual([])
-      expect(raised).toEqual([])
-      expect(adapterLines()).toEqual([promptRowTmuxGoneLine('C1', state), escalateDeadLine('prompt-row-tmux-gone')])
-    })
+    /** The minute on the fake clock at which the run of deferrals has lasted `PROMPT_ROW_SWEEP_AFTER_MS`. */
+    const SWEEP_MINUTE = PROMPT_ROW_SWEEP_AFTER_MS / 60_000
 
     test.each([
       ['ask_user', 'missing'],
       ['check_permission', 'ended'],
-    ])("REPRO: a %s row whose tmux session lives is deferred with its notice; once the deferrals have run for 10 min the next one runs the findMissing sweep and reads the row again, and %s → 'escalate-dead'; nothing is ever typed", async (state, after) => {
-      const h = makeHarness({ statusState: state, tmux: 'alive', statusAfterSweep: after })
+    ])("REPRO: a %s row whose read-pane answers a pane is deferred with its notice; once the deferrals have run for PROMPT_ROW_SWEEP_AFTER_MS the next one runs the findMissing sweep and reads the row again, and %s → 'escalate-dead'; one one-line read-pane per attempt; nothing is ever typed; no tmux call", async (state, after) => {
+      const h = makeHarness({ statusState: state, statusAfterSweep: after })
 
       expect(await attemptsAt(h.adapter, [0, 4, 8])).toEqual(['transient', 'transient', 'transient'])
       expect(h.findMissingCalls).toEqual([])
-      expect(await attemptsAt(h.adapter, [10])).toEqual(['escalate-dead'])
+      expect(await attemptsAt(h.adapter, [SWEEP_MINUTE])).toEqual(['escalate-dead'])
 
       expect(h.findMissingCalls).toHaveLength(1)
-      expect(h.tmuxProbes).toEqual(Array(4).fill('slack_bot_C1'))
+      expect(h.readPaneCalls).toEqual(probePaneReads(4))
+      expectNoTmuxCall(h)
       // Each attempt's status read, then the read after the sweep.
       expect(h.statusCalls).toHaveLength(5)
       expect(h.sendKeysCalls).toEqual([])
-      expect(h.readPaneCalls).toEqual([])
       // The prompt was reported once, while its session was alive.
       expect(raised.map((n) => n.key)).toEqual(['C1'])
       expect(raised[0]!.text).toStartWith(':warning: *Waiting on a prompt*')
       expect(adapterLines().at(-1)).toBe(
-        `[slack] reconnectSession: persona=C1 has read ${state} for 10 min of deferrals, and after a findMissing sweep its row reads ${after} — its claude process is gone; not deferring, the restart relaunches it (b.jdc)`,
+        `[slack] reconnectSession: persona=C1 has read ${state} for ${SWEEP_MINUTE} min of deferrals, and after a findMissing sweep its row reads ${after} — its claude process is gone; not deferring, the restart relaunches it (b.jdc)`,
       )
     })
 
-    test('a check_permission row whose tmux session lives and that still reads check_permission after the sweep stays deferred: from 10 min on each deferral sweeps once; one notice for the episode; nothing typed', async () => {
+    test('a check_permission row whose read-pane answers a pane and that still reads check_permission after the sweep stays deferred: from PROMPT_ROW_SWEEP_AFTER_MS on each deferral sweeps once; one notice for the episode; nothing typed', async () => {
       // No memo: each attempt here is a tick or more apart.
       _setFindMissingMemoTtlMs(0)
-      const h = makeHarness({ statusState: 'check_permission', tmux: 'alive' })
+      const h = makeHarness({ statusState: 'check_permission' })
 
-      expect(await attemptsAt(h.adapter, [0, 9, 10, 13, 16])).toEqual(Array(5).fill('transient'))
+      expect(await attemptsAt(h.adapter, [0, SWEEP_MINUTE - 1, SWEEP_MINUTE, SWEEP_MINUTE + 3, SWEEP_MINUTE + 6])).toEqual(Array(5).fill('transient'))
 
       expect(h.findMissingCalls).toHaveLength(3)
       expect(h.sendKeysCalls).toEqual([])
-      expect(h.readPaneCalls).toEqual([])
+      expect(h.readPaneCalls).toEqual(probePaneReads(5))
       expect(raised.map((n) => n.key)).toEqual(['C1'])
     })
 
-    test("a check_permission row whose tmux probe fails is taken as alive (b.rmy): 'transient' with its notice, no sweep, nothing typed", async () => {
-      const h = makeHarness({ statusState: 'check_permission', tmux: 'probe-error' })
-
-      expect(await h.adapter('C1')).toBe('transient')
-
-      expect(h.tmuxProbes).toEqual(['slack_bot_C1'])
-      expect(h.findMissingCalls).toEqual([])
-      expect(h.sendKeysCalls).toEqual([])
-      expect(raised.map((n) => n.key)).toEqual(['C1'])
-      const [probe, deferral, ...rest] = adapterLines()
-      expect(rest).toEqual([])
-      expect(probe).toStartWith('[slack] reconnectSession: persona=C1 is check_permission and its tmux session probe failed: Error message="tmux probe failed" at ')
-      expect(probe).toEndWith(' — taking the session as alive (b.jdc/b.rmy)')
-      expect(deferral).toBe(
-        '[slack] reconnectSession: persona=C1 is check_permission — its session waits on a prompt or dialog; not typing /mcp reconnect into it, deferring to a later tick (b.f2b/b.rmy)',
-      )
-    })
-
-    test("a check_permission row while a launch for the persona is in flight → 'transient' with no tmux probe, sweep, send-keys or notice, even with its tmux session gone: the launch owns the session", async () => {
+    test("a check_permission row while a launch for the persona is in flight → 'transient' with no read-pane, tmux call, sweep, send-keys or notice, even with a read-pane that would answer GONE: the launch owns the session", async () => {
       // The launch resolves its unset claude_config_dir against a temp home.
       mkdirSync(join(dir, 'home', '.claude'), { recursive: true })
       _setSpawnHomeDir(join(dir, 'home'))
       const config = makeStandInPersonaConfig({ C1: {} }, dir)
-      const h = makeHarness({ statusState: 'check_permission', tmux: 'gone' })
+      const h = makeHarness({ statusState: 'check_permission', paneError: paneGone() })
       // A launch whose tmux session is not created yet: its spawn is held open.
       const held = holdSpawns(h.stub)
       const launch = spawnForPersona(config.personas[0]!, config, false)
@@ -2888,7 +3080,8 @@ describe('_buildReconnectSessionAdapter', () => {
 
         expect(await h.adapter('C1')).toBe('transient')
 
-        expect(h.tmuxProbes).toEqual([])
+        expect(h.readPaneCalls).toEqual([])
+        expectNoTmuxCall(h)
         expect(h.findMissingCalls).toEqual([])
         expect(h.sendKeysCalls).toEqual([])
         expect(raised).toEqual([])
@@ -2905,7 +3098,7 @@ describe('_buildReconnectSessionAdapter', () => {
     // b.jg5 SRJ-303: the minute-6 attempt reads `pending`, which the adapter
     // answers 'pending' (a deferral restart.ts treats as 'transient').
     test('an attempt that reads another state ends the run of deferrals on the prompt row: the 10 min start over (its pending read answers \'pending\', b.jg5 SRJ-303)', async () => {
-      const opts: Parameters<typeof makeHarness>[0] = { statusState: 'check_permission', tmux: 'alive', statusAfterSweep: 'missing' }
+      const opts: Parameters<typeof makeHarness>[0] = { statusState: 'check_permission', statusAfterSweep: 'missing' }
       const h = makeHarness(opts)
       const verdicts: string[] = []
       for (const [minute, state] of [[0, 'check_permission'], [6, 'pending'], [9, 'ask_user'], [18, 'ask_user'], [19, 'ask_user']] as const) {
@@ -2919,7 +3112,7 @@ describe('_buildReconnectSessionAdapter', () => {
     })
 
     test("the persona's not-connected episode ending (its MCP session registered again) ends the run too, and a later episode is reported again", async () => {
-      const h = makeHarness({ statusState: 'check_permission', tmux: 'alive', statusAfterSweep: 'missing' })
+      const h = makeHarness({ statusState: 'check_permission', statusAfterSweep: 'missing' })
 
       expect(await attemptsAt(h.adapter, [0, 5])).toEqual(['transient', 'transient'])
       forgetNotConnectedEpisode('C1')
@@ -2962,7 +3155,6 @@ describe('_buildReconnectSessionAdapter', () => {
       ])('%s: one sweep, one get of cscb_C1, nothing typed, killed or launched', async (_label, note, after, latched, verdict, deferrals) => {
         const h = makeHarness({
           statusState: 'check_permission',
-          tmux: 'alive',
           statusAfterSweep: after,
           findMissingResult: cannedFindMissing({ rows: { [personaInstanceId('C1')]: 'unverified_ids' } }),
           getRow: cannedGetResult({ claude_instance_id: personaInstanceId('C1'), state: 'check_permission', liveness_note: note }),
@@ -2971,7 +3163,7 @@ describe('_buildReconnectSessionAdapter', () => {
         expect(await attemptsAt(h.adapter, [0])).toEqual(['transient'])
         const minuteZero = adapterLines()
         expect(minuteZero).toHaveLength(1)
-        expect(await attemptsAt(h.adapter, [10])).toEqual([verdict])
+        expect(await attemptsAt(h.adapter, [SWEEP_MINUTE])).toEqual([verdict])
 
         expect(latch.isLatched('C1')).toBe(latched)
         expect(h.findMissingCalls).toHaveLength(1)
@@ -2979,7 +3171,7 @@ describe('_buildReconnectSessionAdapter', () => {
         // One status read per attempt, and one more after the sweep unless C1 latched.
         expect(h.statusCalls).toHaveLength(latched ? 2 : 3)
         expect(h.sendKeysCalls).toEqual([])
-        expect(h.readPaneCalls).toEqual([])
+        expect(h.readPaneCalls).toEqual(probePaneReads(2))
         expect([h.killCalls, h.spawnCalls, h.resumeCalls]).toEqual([[], [], []])
         expect(adapterLines().filter((l) => l === minuteZero[0])).toHaveLength(deferrals)
         // The minute-0 notice only.
@@ -2993,7 +3185,7 @@ describe('_buildReconnectSessionAdapter', () => {
       // second deferral line, no blocked-on-prompt notice) and no escalation,
       // and logs one line naming the read.
       test.each(['ask_user', 'check_permission'])("a %s row whose persona is latched during the status read after the sweep from 10 min on → 'transient': no deferral, nothing typed, killed or launched; one latched-after-read line", async (state) => {
-        const h = makeHarness({ statusState: state, tmux: 'alive', statusAfterSweep: 'missing', isLatched: (key) => latch.isLatched(key) })
+        const h = makeHarness({ statusState: state, statusAfterSweep: 'missing', isLatched: (key) => latch.isLatched(key) })
         const stub = h.stub as unknown as { status: (params: StatusParams) => Promise<unknown> }
         const realStatus = stub.status.bind(h.stub)
         stub.status = async (params) => {
@@ -3006,14 +3198,14 @@ describe('_buildReconnectSessionAdapter', () => {
         expect(await attemptsAt(h.adapter, [0])).toEqual(['transient'])
         const minuteZero = adapterLines()
         expect(minuteZero).toHaveLength(1)
-        expect(await attemptsAt(h.adapter, [10])).toEqual(['transient'])
+        expect(await attemptsAt(h.adapter, [SWEEP_MINUTE])).toEqual(['transient'])
 
         expect(latch.isLatched('C1')).toBe(true)
         expect(h.findMissingCalls).toHaveLength(1)
         // One status read per attempt, and the read after the sweep.
         expect(h.statusCalls).toHaveLength(3)
         expect(h.sendKeysCalls).toEqual([])
-        expect(h.readPaneCalls).toEqual([])
+        expect(h.readPaneCalls).toEqual(probePaneReads(2))
         expect([h.killCalls, h.spawnCalls, h.resumeCalls]).toEqual([[], [], []])
         // Minute 10: the sweep's summary, then the latched line; no deferral or escalation line.
         const [sweep, ...minuteTen] = adapterLines().slice(minuteZero.length)
@@ -3031,9 +3223,9 @@ describe('_buildReconnectSessionAdapter', () => {
   // (UNAVAILABLE) answers 'transient' instead of 'escalate-dead', so the
   // restart run neither re-probes nor kills nor relaunches the persona. The
   // sweep sites: the dead-session and row-not-interactive escalations after
-  // the reconnect's keystrokes, a `working` or `waiting` row whose
-  // `read-pane` answers GONE or finds the row absent and a prompt row whose
-  // tmux session is gone (`sweepDeadTmuxChannelWithCause`), and a live prompt row's
+  // the reconnect's keystrokes, a `working`, `waiting` or prompt row whose
+  // `read-pane` answers GONE or finds the row absent
+  // (`sweepDeadTmuxChannelWithCause`), and a live prompt row's
   // deferral from 10 min on (`checkPromptRowDeferral`, which then reads no
   // row and raises no notice). One described refusal line; nothing leaks. An
   // UNCLASSIFIED failure (b.jg5 SRJ-313) is the same refusal. A sweep failing
@@ -3047,8 +3239,7 @@ describe('_buildReconnectSessionAdapter', () => {
       minutes: readonly number[]
       /** The sweep's log prefix. */
       prefix: string
-      /** The tmux probes, pane reads, send-keys and notices the attempts make. */
-      tmuxProbes: number
+      /** The pane reads, send-keys and notices the attempts make. */
       paneReads: number
       sendKeys: number
       raised: string[]
@@ -3057,13 +3248,13 @@ describe('_buildReconnectSessionAdapter', () => {
     }
 
     const SWEEP_SITES: ReadonlyArray<readonly [string, SweepSite]> = [
-      ['dead-session (one ErrTmuxSendKeys)', { opts: () => ({ statusState: 'waiting', sendKeysThrows: errTmuxSendKeys() }), minutes: [0], prefix: 'escalate-dead', tmuxProbes: 0, paneReads: 1, sendKeys: 1, raised: [] }],
-      ['row-not-interactive (ErrSpawnNotInteractive)', { opts: () => ({ statusState: 'waiting', sendKeysThrows: errSpawnNotInteractive('send-keys') }), minutes: [0], prefix: 'escalate-dead', tmuxProbes: 0, paneReads: 1, sendKeys: 1, raised: [], escalated: RECONNECT_ESCALATE_DEAD_NO_KILL }],
-      ['working-tmux-gone (read-pane GONE)', { opts: () => ({ statusState: 'working', paneError: paneGone() }), minutes: [0], prefix: 'escalate-dead', tmuxProbes: 0, paneReads: 1, sendKeys: 0, raised: [] }],
-      ['waiting-row-pane-gone (read-pane GONE)', { opts: () => ({ statusState: 'waiting', paneError: paneGone() }), minutes: [0], prefix: 'escalate-dead', tmuxProbes: 0, paneReads: 1, sendKeys: 0, raised: [] }],
-      ['row-absent-at-pane-read (a working row, ErrSpawnNotFound)', { opts: () => ({ statusState: 'working', paneError: errSpawnNotFound() }), minutes: [0], prefix: 'escalate-dead', tmuxProbes: 0, paneReads: 1, sendKeys: 0, raised: [] }],
-      ['prompt-row-tmux-gone', { opts: () => ({ statusState: 'ask_user', tmux: 'gone' }), minutes: [0], prefix: 'escalate-dead', tmuxProbes: 1, paneReads: 0, sendKeys: 0, raised: [] }],
-      ['a live prompt row deferred 10 min', { opts: () => ({ statusState: 'check_permission', tmux: 'alive', statusAfterSweep: 'missing' }), minutes: [0, 10], prefix: 'reconnectSession: prompt row', tmuxProbes: 2, paneReads: 0, sendKeys: 0, raised: ['C1'] }],
+      ['dead-session (one ErrTmuxSendKeys)', { opts: () => ({ statusState: 'waiting', sendKeysThrows: errTmuxSendKeys() }), minutes: [0], prefix: 'escalate-dead', paneReads: 1, sendKeys: 1, raised: [] }],
+      ['row-not-interactive (ErrSpawnNotInteractive)', { opts: () => ({ statusState: 'waiting', sendKeysThrows: errSpawnNotInteractive('send-keys') }), minutes: [0], prefix: 'escalate-dead', paneReads: 1, sendKeys: 1, raised: [], escalated: RECONNECT_ESCALATE_DEAD_NO_KILL }],
+      ['working-tmux-gone (read-pane GONE)', { opts: () => ({ statusState: 'working', paneError: paneGone() }), minutes: [0], prefix: 'escalate-dead', paneReads: 1, sendKeys: 0, raised: [] }],
+      ['waiting-row-pane-gone (read-pane GONE)', { opts: () => ({ statusState: 'waiting', paneError: paneGone() }), minutes: [0], prefix: 'escalate-dead', paneReads: 1, sendKeys: 0, raised: [] }],
+      ['row-absent-at-pane-read (a working row, ErrSpawnNotFound)', { opts: () => ({ statusState: 'working', paneError: errSpawnNotFound() }), minutes: [0], prefix: 'escalate-dead', paneReads: 1, sendKeys: 0, raised: [] }],
+      ['prompt-row-tmux-gone (read-pane GONE)', { opts: () => ({ statusState: 'ask_user', paneError: paneGone() }), minutes: [0], prefix: 'escalate-dead', paneReads: 1, sendKeys: 0, raised: [] }],
+      ['a live prompt row deferred 10 min', { opts: () => ({ statusState: 'check_permission', statusAfterSweep: 'missing' }), minutes: [0, PROMPT_ROW_SWEEP_AFTER_MS / 60_000], prefix: 'reconnectSession: prompt row', paneReads: 2, sendKeys: 0, raised: ['C1'] }],
     ]
     const WORKING_TMUX_GONE = SWEEP_SITES.find(([label]) => label.startsWith('working-tmux-gone'))![1]
 
@@ -3101,7 +3292,6 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(r.findMissingCalls).toHaveLength(1)
       // One status read per attempt: the row is not read again after the sweep.
       expect(r.statusCalls).toHaveLength(site.minutes.length)
-      expect(r.tmuxProbes).toHaveLength(site.tmuxProbes)
       expect(r.tmuxRuns).toEqual([])
       expect(r.readPaneCalls).toHaveLength(site.paneReads)
       expect(r.sendKeysCalls).toHaveLength(site.sendKeys)
@@ -3150,12 +3340,13 @@ describe('_buildReconnectSessionAdapter', () => {
   // (before any branch on the state), right after a `working` row's
   // `read-pane` and after a `waiting` row's `read-pane` that answered GONE
   // or found the row absent (before the fold or the sweep), right after a
-  // prompt row's tmux probe, right before each not-connected notice of the
-  // `working` and `waiting` checks (the `unproven-idle` notice a noted
-  // deferral can raise, and the blocked-on-prompt notice), and right before
-  // `/mcp reconnect` is typed. A latched persona, or a query that throws
-  // (fail safe), gets nothing more done (no pane read, tmux probe, sweep,
-  // deferral, notice or typing), one line naming it, and 'transient'. An
+  // prompt row's `read-pane` (before the sweep or the deferral), right
+  // before each not-connected notice of the `working`, `waiting` and prompt
+  // rows' checks (the `unproven-idle` notice a noted deferral can raise, and
+  // the blocked-on-prompt notice), and right before `/mcp reconnect` is
+  // typed. A latched persona, or a query that throws (fail safe), gets
+  // nothing more done (no pane read, sweep, deferral, notice or typing), one
+  // line naming it, and 'transient'. An
   // unlatched one, or no query passed, is reconnected as before. Attempts
   // run on a fake clock passed to `_setNow`.
   describe('b.jg5 SRJ-502: a persona latched by the time /mcp reconnect would be typed', () => {
@@ -3264,18 +3455,15 @@ describe('_buildReconnectSessionAdapter', () => {
       assertNoLeak({ errArgs })
     })
 
-    /** Where a latch can land: a client verb's call, or a prompt row's tmux session probe (`tmux`). */
-    type LatchLanding = 'status' | 'tmux' | 'readPane' | 'get'
+    /** Where a latch can land: a client verb's call. */
+    type LatchLanding = 'status' | 'readPane' | 'get' | 'findMissing'
 
     /**
      * Note in `events` each call the next attempt makes (the client verbs by
-     * name, the tmux session probe as `tmux`); the latch is set inside
-     * `landing`'s call, before it resolves. The probe answers as `tmux` says
-     * (gone, or alive) and still lands in `h.tmuxProbes`.
+     * name); the latch is set inside `landing`'s call, before it resolves.
      */
     function noteCalls(
       h: ReturnType<typeof makeHarness>,
-      tmux: Parameters<typeof makeHarness>[0]['tmux'],
       latch: { latched: boolean },
       events: string[],
       landing: LatchLanding | undefined,
@@ -3289,18 +3477,11 @@ describe('_buildReconnectSessionAdapter', () => {
           return real(params)
         }
       }
-      _setTmuxSessionProber(async (name) => {
-        events.push('tmux')
-        h.tmuxProbes.push(name)
-        if (landing === 'tmux') latch.latched = true
-        return tmux !== 'gone'
-      })
     }
 
-    /** An attempt's calls up to the query right after its status read, right after its pane read, and right after a prompt row's tmux probe. */
+    /** An attempt's calls up to the query right after its status read, and right after its pane read. */
     const AFTER_READ = ['status', 'isLatched'] as const
     const AFTER_PANE_READ = [...AFTER_READ, 'readPane', 'isLatched'] as const
-    const AFTER_PROBE = [...AFTER_READ, 'tmux', 'isLatched'] as const
 
     // The persona is not latched when the attempt starts; the latch is set
     // while one of its awaited calls is in flight (the call resolves after
@@ -3314,19 +3495,20 @@ describe('_buildReconnectSessionAdapter', () => {
     const LATCH_DURING: ReadonlyArray<readonly [string, () => Parameters<typeof makeHarness>[0], number, LatchLanding, readonly string[]]> = [
       ["a waiting row's status read", () => ({ statusState: 'waiting' }), 0, 'status', AFTER_READ],
       ["a stale working row's status read", staleWorkingRow, 1, 'status', AFTER_READ],
-      ["an ask_user row's status read", () => ({ statusState: 'ask_user', tmux: 'alive' }), 0, 'status', AFTER_READ],
+      ["an ask_user row's status read", () => ({ statusState: 'ask_user' }), 0, 'status', AFTER_READ],
       ["a waiting row's pane read", () => ({ statusState: 'waiting' }), 0, 'readPane', AFTER_PANE_READ],
       ["a waiting row's pane read, its pane showing a dialog", () => ({ statusState: 'waiting', pane: PERMISSION_PANE }), 0, 'readPane', AFTER_PANE_READ],
       ["a waiting row's pane read, answering GONE", () => ({ statusState: 'waiting', paneError: paneGone() }), 0, 'readPane', AFTER_PANE_READ],
       ["a stale working row's pane read", staleWorkingRow, 1, 'readPane', AFTER_PANE_READ],
       ["a working row's pane read, answering GONE", () => ({ statusState: 'working', paneError: paneGone() }), 0, 'readPane', AFTER_PANE_READ],
       ["a working row's pane read, answering UNAVAILABLE", () => ({ statusState: 'working', paneError: errCallTimeout('read-pane') }), 0, 'readPane', AFTER_PANE_READ],
-      ["an ask_user row's tmux probe, its session alive", () => ({ statusState: 'ask_user', tmux: 'alive' }), 0, 'tmux', AFTER_PROBE],
-      ["a check_permission row's tmux probe, its session gone", () => ({ statusState: 'check_permission', tmux: 'gone' }), 0, 'tmux', AFTER_PROBE],
+      ["an ask_user row's pane read, a pane", () => ({ statusState: 'ask_user' }), 0, 'readPane', AFTER_PANE_READ],
+      ["a check_permission row's pane read, answering GONE", () => ({ statusState: 'check_permission', paneError: paneGone() }), 0, 'readPane', AFTER_PANE_READ],
+      ["an ask_user row's pane read, answering UNAVAILABLE", () => ({ statusState: 'ask_user', paneError: errCallTimeout('read-pane') }), 0, 'readPane', AFTER_PANE_READ],
       ["a stale working row's transcript row read", staleWorkingRow, 1, 'get', [...AFTER_PANE_READ, 'get', 'isLatched']],
     ]
 
-    test.each(LATCH_DURING)("REPRO: the persona latched during %s → 'transient': the first query after that call finds it latched and nothing more is called (no pane read, tmux probe or sweep), typed or raised; one latched line", async (_label, opts, before, landing, calls) => {
+    test.each(LATCH_DURING)("REPRO: the persona latched during %s → 'transient': the first query after that call finds it latched and nothing more is called (no pane read or sweep), typed or raised; one latched line", async (_label, opts, before, landing, calls) => {
       const events: string[] = []
       const latch = makeLatch(events)
       const o = opts()
@@ -3337,7 +3519,7 @@ describe('_buildReconnectSessionAdapter', () => {
       }
       events.length = 0
       const askedBefore = latch.asked.length
-      noteCalls(h, o.tmux, latch, events, landing)
+      noteCalls(h, latch, events, landing)
 
       const { result, errArgs } = await capturingErrorArgs(() => h.adapter('C1'))
 
@@ -3350,26 +3532,58 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(latchedLines(errArgs)).toEqual([latchedLine('')])
     })
 
-    test("a check_permission row whose persona latched during its tmux probe notes no deferral: unlatched, the next attempt 10 min later starts the run of deferrals (its notice, no sweep) rather than sweeping", async () => {
+    test("a check_permission row whose persona latched during its read-pane notes no deferral: unlatched, the next attempt PROMPT_ROW_SWEEP_AFTER_MS later starts the run of deferrals (its notice, no sweep) rather than sweeping", async () => {
       const latch = makeLatch()
-      const h = makeHarness({ statusState: 'check_permission', tmux: 'alive', isLatched: latch.isLatched })
-      // The latch lands during the first attempt's tmux probe.
-      _setTmuxSessionProber(async (name) => {
-        h.tmuxProbes.push(name)
-        if (h.tmuxProbes.length === 1) latch.latched = true
-        return true
-      })
+      const h = makeHarness({ statusState: 'check_permission', isLatched: latch.isLatched })
+      // The latch lands during the first attempt's read-pane.
+      const stub = h.stub as unknown as { readPane: (params: ReadPaneParams) => Promise<ReadPaneResult> }
+      const realReadPane = stub.readPane.bind(h.stub)
+      stub.readPane = async (params) => {
+        if (h.readPaneCalls.length === 0) latch.latched = true
+        return realReadPane(params)
+      }
 
       expect(await h.adapter('C1')).toBe('transient')
       expect(latch.asked).toEqual(['C1', 'C1'])
       expect(raised).toEqual([])
       latch.latched = false
-      await clock.advance(10 * 60_000)
+      await clock.advance(PROMPT_ROW_SWEEP_AFTER_MS)
       expect(await h.adapter('C1')).toBe('transient')
 
-      expect(h.tmuxProbes).toEqual(['slack_bot_C1', 'slack_bot_C1'])
+      expect(h.readPaneCalls).toEqual(probePaneReads(2))
       expect(h.findMissingCalls).toHaveLength(0)
       expect(h.sendKeysCalls).toEqual([])
+      expect(raised).toEqual(['C1'])
+    })
+
+    // The query right before the prompt row's deferral (the E14 hatch note):
+    // the deferral check's sweep from `PROMPT_ROW_SWEEP_AFTER_MS` on is
+    // awaited, and a persona latched meanwhile (here only through the
+    // adapter's query, so the sweep itself latches no one and the row still
+    // reads check_permission after it) gets no deferral: no deferral line, no
+    // notice and no escalation.
+    test.each([
+      ['C1 latched during the sweep', true],
+      ['control: C1 not latched', false],
+    ] as const)("a check_permission row deferred for PROMPT_ROW_SWEEP_AFTER_MS, its row still check_permission after the sweep: %s → 'transient'; the query asked after the status read, after the read-pane and right before the deferral; the deferral line only when not latched; nothing typed or escalated", async (_label, latched) => {
+      const events: string[] = []
+      const latch = makeLatch(events)
+      const h = makeHarness({ statusState: 'check_permission', isLatched: latch.isLatched })
+      expect(await h.adapter('C1')).toBe('transient') // the run of deferrals starts
+      await clock.advance(PROMPT_ROW_SWEEP_AFTER_MS)
+      events.length = 0
+      noteCalls(h, latch, events, latched ? 'findMissing' : undefined)
+
+      const { result, errArgs } = await capturingErrorArgs(() => h.adapter('C1'))
+
+      expect(result).toBe('transient')
+      expect(events).toEqual([...AFTER_PANE_READ, 'findMissing', 'status', 'isLatched'])
+      expect(latchedLines(errArgs)).toEqual(latched ? [latchedLine('')] : [])
+      const deferrals = stringLines(errArgs).filter((l) => l.startsWith('[slack] reconnectSession: persona=C1 is check_permission — '))
+      expect(deferrals).toHaveLength(latched ? 0 : 1)
+      expect(h.findMissingCalls).toHaveLength(1)
+      expect(h.sendKeysCalls).toEqual([])
+      // The minute-0 notice only (one per episode).
       expect(raised).toEqual(['C1'])
     })
 
@@ -3377,7 +3591,7 @@ describe('_buildReconnectSessionAdapter', () => {
       const events: string[] = []
       const latch = makeLatch(events)
       const h = makeHarness({ statusState: 'waiting', isLatched: latch.isLatched })
-      noteCalls(h, undefined, latch, events, undefined)
+      noteCalls(h, latch, events, undefined)
 
       const { result, errArgs } = await capturingErrorArgs(() => h.adapter('C1'))
 
@@ -3562,7 +3776,6 @@ describe('b.jg5 SRJ-115, SRJ-512, SRJ-513: a latching own-row status at the live
     setSessionNotifier(undefined)
     resetClientForTests()
     _resetOutageState()
-    _resetTmuxSessionProber()
     _resetFindMissingMemo()
     _resetNotConnectedEpisodes()
     rmSync(dir, { recursive: true, force: true })
@@ -3572,8 +3785,8 @@ describe('b.jg5 SRJ-115, SRJ-512, SRJ-513: a latching own-row status at the live
   /**
    * One stub over the outage state and the client seam: C1's `status`
    * answers `c1Status` (the same value each call: thrown when an error),
-   * every other persona's row reads `waiting`; every send-keys succeeds; the
-   * tmux session probe answers alive. Spies on every sink.
+   * every other persona's row reads `waiting`; every send-keys succeeds.
+   * Spies on every sink.
    */
   function install(c1Status: Error | Phase1StatusResult): StubCallLog {
     const log = makeStubCallLog()
@@ -3592,8 +3805,6 @@ describe('b.jg5 SRJ-115, SRJ-512, SRJ-513: a latching own-row status at the live
       conditionSink: { start: (key) => { conditionStarts.push(key) }, end: () => {} },
     })
     setClientForTests(stub as unknown as Client)
-    // Never reached for C1; C2's waiting row types through the stub alone.
-    _setTmuxSessionProber(async () => true)
     return log
   }
 
@@ -3664,8 +3875,6 @@ describe('b.jg5 SRJ-115, SRJ-512, SRJ-513: a latching own-row status at the live
     async (_name, c) => {
       const answer = c.answer()
       const log = install(answer)
-      const tmuxProbes: string[] = []
-      _setTmuxSessionProber(async (name) => { tmuxProbes.push(name); return true })
       const adapter = reconnectAdapter()
 
       const c1 = await run(() => runInAttempt('C1', 'recovery', () => adapter('C1')))
@@ -3675,7 +3884,6 @@ describe('b.jg5 SRJ-115, SRJ-512, SRJ-513: a latching own-row status at the live
       expect(log.statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1', 'cscb_C1'])
       expect(stubCallCount(log)).toBe(2)
       expect(tmuxTouchingCallsIn(log)).toEqual([])
-      expect(tmuxProbes).toEqual([])
       expectLatchedOnce(c)
       expect(c1.lines).toEqual([c.stepLine(RECONNECT_SITE, answer, 'the persona latched')])
       expect(again.lines).toEqual([c.stepLine(RECONNECT_SITE, answer, 'the persona was already latched with this case')])

@@ -14,9 +14,11 @@
  * - What starts it: each UNAVAILABLE form but `ErrTmuxKillFailed` at one of
  *   the tmux-touching calls the launch ladder makes, every such call met by
  *   at least one form, inside the launch; each such form at the restart
- *   run's one `read-pane` of a live `working` or `waiting` row (b.jg5
- *   SRJ-603, SRJ-604), inside its recovery attempt, with nothing counted; and
- *   a wrapped `read-pane` inside a recovery attempt; nothing else (the
+ *   run's one `read-pane` of a live `working`, `waiting` or
+ *   `check_permission` row (b.jg5 SRJ-603, SRJ-604, SRJ-606), inside its
+ *   recovery attempt, and at the one-line `read-pane` of the `ask_user` row
+ *   a launch meets (b.jg5 SRJ-607), inside the launch, with nothing counted;
+ *   and a wrapped `read-pane` inside a recovery attempt; nothing else (the
  *   kill-failure cause, read and sweep
  *   errors inside an attempt, kills not of a row read live, calls outside
  *   every attempt, the dialog approver's `status`, `read-pane` and
@@ -24,8 +26,9 @@
  * - Held apart from the outages: no flag raised or cleared, no onset or
  *   all-clear, and an outage's own all-clear neither held back nor joined.
  * - What ends it: a tmux-touching success or GONE, in any context (a later
- *   restart run's `read-pane` of a live `working` or `waiting` row answering
- *   a pane or GONE among them, with the recovery post only after an onset),
+ *   restart run's `read-pane` of a live `working`, `waiting` or
+ *   `check_permission` row answering a pane or GONE among them, with the
+ *   recovery post only after an onset),
  *   and the tick's end; a read's success does not. Ends are idempotent, and
  *   each end of a holding condition reaches the retry timer's condition-end
  *   entry once.
@@ -289,9 +292,11 @@ const TMUX_STARTING_FORMS = unavailableForms(
  * A tmux-touching call the launch ladder makes, and the stub answers that make
  * it meet `err`. The dialog approver's calls are not here: they come after the
  * launch call returned, outside every attempt (b.jg5 SRJ-401, SRJ-307). The
- * restart run's pane reads, its one `read-pane` of a live `working` or
- * `waiting` row (b.jg5 SRJ-603, SRJ-604), have their own rows below
- * (`restartRunPaneReads`), each run inside its recovery attempt.
+ * restart run's pane reads, its one `read-pane` of a live `working`,
+ * `waiting` or `check_permission` row (b.jg5 SRJ-603, SRJ-604, SRJ-606),
+ * have their own rows below (`restartRunPaneReads`), each run inside its
+ * recovery attempt, and so does the launch's one-line `read-pane` of an
+ * `ask_user` row (b.jdc's ladder action, b.jg5 SRJ-607).
  */
 interface TmuxSite {
   readonly name: string
@@ -313,14 +318,19 @@ const TMUX_SITES: readonly TmuxSite[] = [
   },
 ]
 
-/** The live rows whose pane the restart run reads with one `read-pane` before any reconnect (b.jg5 SRJ-603, SRJ-604). */
-const RESTART_RUN_ROWS = ['working', 'waiting'] as const
+/**
+ * The live rows whose pane the restart run reads with one `read-pane` before
+ * any reconnect (b.jg5 SRJ-603, SRJ-604), a prompt row among them (b.jdc's
+ * one-line read, b.jg5 SRJ-606).
+ */
+const RESTART_RUN_ROWS = ['working', 'waiting', 'check_permission'] as const
 
 /**
  * One restart run's calls on P's live `row` (not connected) whose `read-pane`
  * is refused: the liveness read and the reconnect adapter's state read, the
  * one `read-pane`, and on a `waiting` row the reconnect's `send-keys`, which
- * the refused read lets go ahead. No tmux probe, kill or spawn.
+ * the refused read lets go ahead (a `check_permission` row's refused read is
+ * taken as alive and deferred). No raw tmux call, kill or spawn.
  */
 function restartRunPaneReadCalls(row: (typeof RESTART_RUN_ROWS)[number]): Record<string, number> {
   return { statusCalls: 2, readPaneCalls: 1, ...(row === 'waiting' ? { sendKeysCalls: 1 } : {}) }
@@ -357,10 +367,11 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
   })
 
   // The restart run (the harness's default retry action) reads a live
-  // `working` or `waiting` row's pane with one `read-pane` (b.jg5 SRJ-603,
-  // SRJ-604) inside its recovery attempt. A `waiting` row's refused read lets
-  // the reconnect go ahead, so its `send-keys` is refused too here: a
-  // `send-keys` that succeeded would end the condition in the same run.
+  // `working`, `waiting` or `check_permission` row's pane with one
+  // `read-pane` (b.jg5 SRJ-603, SRJ-604, SRJ-606) inside its recovery
+  // attempt. A `waiting` row's refused read lets the reconnect go ahead, so
+  // its `send-keys` is refused too here: a `send-keys` that succeeded would
+  // end the condition in the same run.
   const restartRunPaneReads = RESTART_RUN_ROWS.flatMap((row) =>
     TMUX_STARTING_FORMS.map(([what, make]) => [what, row, make] as const),
   )
@@ -388,6 +399,32 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
     expectHolds(h, p, 'read-pane', firstAt)
     expect(h.conditionEnds).toEqual([])
     expect(h.triggers.filter((t) => t.key !== p)).toEqual([])
+    expect(getFailureCount(p)).toBe(0)
+    expectNeverStarted(h, b)
+    expectNoPostYet(h)
+  })
+
+  // b.jdc's ladder action (b.jg5 SRJ-607): a launch meeting P's colliding
+  // `ask_user` row reads its pane with one one-line `read-pane` inside the
+  // launch; a refused read is taken as alive (no action).
+  test.each(TMUX_STARTING_FORMS)('%s answering the one-line read-pane of the ask_user row a launch meets starts P’s condition at the first refusal’s time; a second launch’s refusal keeps it; B’s never starts; nothing is counted', async (_what, make) => {
+    const { h, p, b } = build()
+    const promptRow = (): RecoveryStubScript => ({ ...collided(h, personaOf(h, p), { state: 'ask_user' }), readPaneError: make('read-pane') })
+    const firstAt = h.clock.now()
+    h.script(promptRow())
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'no-op' })
+
+    expectHolds(h, p, 'read-pane', firstAt)
+    expect(callCounts(h)).toEqual({ spawnCalls: 1, getCalls: 1, readPaneCalls: 1 })
+
+    await h.advance(halfFirstWaitMs())
+    h.script(promptRow())
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'no-op' })
+
+    expect(h.clock.now()).toBeGreaterThan(firstAt)
+    expectHolds(h, p, 'read-pane', firstAt)
+    expect(h.conditionEnds).toEqual([])
     expect(getFailureCount(p)).toBe(0)
     expectNeverStarted(h, b)
     expectNoPostYet(h)
@@ -792,14 +829,16 @@ describe('tmux-unresponsive: what ends it (SRJ-310)', () => {
     expectNoPostYet(h)
   })
 
-  // The restart run's `read-pane` of a live `working` or `waiting` row
-  // (b.jg5 SRJ-603, SRJ-604) is tmux-touching: a pane or GONE ends the
+  // The restart run's `read-pane` of a live `working`, `waiting` or
+  // `check_permission` row (b.jg5 SRJ-603, SRJ-604, SRJ-606) is
+  // tmux-touching: a pane or GONE ends the
   // condition its earlier refusal started, while the run is in progress (the
   // end is deferred to the run's end). With both settings 0 the onset comes
   // only at a retry past the floor, and the end posts the recovery only after
   // it (no alert check here, so the onset is the only notice). A pane on a
-  // `waiting` row lets the reconnect go ahead; GONE types nothing and sweeps,
-  // and the re-probe reads the row live again.
+  // `waiting` row lets the reconnect go ahead, and on a `check_permission`
+  // row defers; GONE types nothing and sweeps, and the re-probe reads the row
+  // live again.
   const restartRunEnds = RESTART_RUN_ROWS.flatMap((row) =>
     ([
       ['a pane', { readPaneResults: [{ pane: '' }] }, { statusCalls: 2, readPaneCalls: 1, ...(row === 'waiting' ? { sendKeysCalls: 1 } : {}) }],
