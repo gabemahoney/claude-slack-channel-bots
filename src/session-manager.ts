@@ -2131,10 +2131,11 @@ function tmuxExactSessionTarget(sessionName: string): string {
  *     find-missing run and resume/fresh-spawn, the restart adapter by
  *     sweeping and escalating it). Its cause (`DeadSessionCause`) says what
  *     agent-director answered. `waitForWaitingAndReconnect` also answers it
- *     for a row it read `ended` or `missing`, or found absent
- *     (`ErrSpawnNotFound`), with no tmux probe (b.ecw, b.jg5 SRJ-605). A
- *     `dead-session` from a row read or from a refusal as not interactive
- *     proves nothing about the worker's process (b.jg5 SRJ-609, SRJ-611); the
+ *     for a row it read `ended` or `missing` (`row-read-finished`), or found
+ *     absent (`ErrSpawnNotFound`, `row-absent`), with no tmux probe (b.ecw,
+ *     b.jg5 SRJ-605). A `dead-session` from a row read or from a refusal as
+ *     not interactive is not dead evidence and proves nothing about the
+ *     worker's process (b.jg5 SRJ-609, SRJ-611); the
  *     recovery's resume or spawn decides what holds the persona's name
  *     (agent-director classifies any leftover session, and a CONFLICT there
  *     latches the persona, SRJ-501);
@@ -2152,7 +2153,8 @@ export type ReconnectOutcome = 'ok' | 'dead-session' | 'transient'
 /**
  * `waitForWaitingAndReconnect`'s outcome (b.f2b): a reconnect outcome (`ok`
  * only when `/mcp reconnect` was typed; `dead-session` as `ReconnectOutcome`
- * says, never for a `status` error other than `ErrSpawnNotFound`;
+ * says, never for a `status` error other than `ErrSpawnNotFound`, and
+ * always with its cause in the wait's result, `WaitDeadSession`;
  * `transient` for the wait's reconnect's own `transient`, for a refused
  * findMissing sweep, and for a server stop decided at the evidence read's
  * version re-check, never for a `status` error, b.jg5 SRJ-605: nothing was
@@ -2175,6 +2177,44 @@ export type WaitReconnectOutcome = ReconnectOutcome | 'not-reconnected' | 'cance
 /** The wait's outcome for a persona that is latched (`WaitReconnectOutcome`). */
 export const WAIT_OUTCOME_LATCHED = 'latched'
 
+/**
+ * A `dead-session` end of the launch wait, with its cause (b.jg5 SRJ-605,
+ * SRJ-611). Each end has exactly one:
+ *   - the wait's reconnect answered `dead-session`: the reconnect's cause,
+ *     unchanged (`tmux-gone`, `row-not-interactive` or `row-absent`);
+ *   - a `status` read, at the poll or the timeout, answered
+ *     `ErrSpawnNotFound`: `row-absent`;
+ *   - a `status` read, at the poll or the timeout (after its sweep), found
+ *     the row `ended` or `missing`: `row-read-finished`, with that state
+ *     (`finishedState`).
+ * Of these only the reconnect's `tmux-gone` is dead evidence
+ * (`isDeadEvidence`); the others are a refusal or row reads.
+ */
+export interface WaitDeadSession {
+  readonly outcome: 'dead-session'
+  readonly deadCause: DeadSessionCause
+  /** With `row-read-finished` only: the state read, `ended` or `missing`. */
+  readonly finishedState?: string
+}
+
+/** How the launch wait's body ends: a `dead-session` always carries its cause (`WaitDeadSession`). */
+type WaitEnd = Exclude<WaitReconnectOutcome, 'dead-session'> | WaitDeadSession
+
+/**
+ * `waitForWaitingAndReconnectWithCause`'s answer: a `dead-session` with its
+ * cause (`WaitDeadSession`), or any other outcome with, for `transient`,
+ * whether the persona is latched or the server stops. `lastRead` is the row
+ * state the wait's last read gave (b.jg5 SRJ-501), absent when none answered.
+ */
+export type WaitReconnectResult =
+  | (WaitDeadSession & { readonly lastRead?: LatchRowState })
+  | {
+      readonly outcome: Exclude<WaitReconnectOutcome, 'dead-session'>
+      readonly latched?: true
+      readonly stopping?: true
+      readonly lastRead?: LatchRowState
+    }
+
 /** `DeadSessionCause`: the reconnect's `send-keys` answered GONE (`ErrTmuxSendKeys`). */
 export const DEAD_SESSION_CAUSE_TMUX_GONE = 'tmux-gone'
 
@@ -2185,47 +2225,94 @@ export const DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE = 'row-not-interactive'
 export const DEAD_SESSION_CAUSE_ROW_ABSENT = 'row-absent'
 
 /**
- * What agent-director answered when `reconnectMcpWithCause` answered
- * `dead-session` (b.jdc; b.jg5 SRJ-118, SRJ-609):
- *   - `tmux-gone`: the `send-keys` answered GONE (`ErrTmuxSendKeys`):
- *     agent-director found no session of the row's launch. Answered at once,
- *     with no tmux server start and no second try;
- *   - `row-not-interactive`: agent-director refused the keystrokes as not
- *     interactive (`ErrSpawnNotInteractive`, b.dup): the row finished
- *     (`ended` or `missing`) after the caller read it, or it reads `pending`
- *     and the session holding the persona's name may be another launch's
- *     (b.jg5 SRJ-613). A finished row is not proof that the worker is gone,
- *     so this is only a route into the restart path's decision: the restart
- *     adapter answers `RECONNECT_ESCALATE_DEAD_NO_KILL`, and the restart work
- *     kills nothing because of it (SRJ-609);
- *   - `row-absent`: no row has the persona's instance id (`ErrSpawnNotFound`):
- *     a row read, not a GONE.
+ * `DeadSessionCause`: the launch wait's `status` read found the row `ended`
+ * or `missing` (at its poll, or at its timeout after the sweep), a row read;
+ * the wait's answer carries the state read (`WaitDeadSession`).
  */
-export type DeadSessionCause =
+export const DEAD_SESSION_CAUSE_ROW_READ_FINISHED = 'row-read-finished'
+
+/**
+ * `DeadSessionCause`: the collision ladder's one-line `read-pane` of a row
+ * read `ask_user` or `check_permission` answered GONE (`ErrTmuxCaptureFailed`,
+ * b.jdc's ladder action, `launchOnPromptRow`; b.jg5 SRJ-607).
+ */
+export const DEAD_SESSION_CAUSE_PROMPT_ROW_LADDER_GONE = 'prompt-row-ladder-gone'
+
+/**
+ * Every `DeadSessionCause`, in one runtime list, so a test iterates the
+ * values themselves (b.jg5 SRJ-611).
+ */
+export const DEAD_SESSION_CAUSES = Object.freeze([
+  DEAD_SESSION_CAUSE_TMUX_GONE,
+  DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE,
+  DEAD_SESSION_CAUSE_ROW_ABSENT,
+  DEAD_SESSION_CAUSE_ROW_READ_FINISHED,
+  DEAD_SESSION_CAUSE_PROMPT_ROW_LADDER_GONE,
+] as const)
+
+/**
+ * What proved a `dead-session` verdict (b.jdc; b.jg5 SRJ-118, SRJ-609,
+ * SRJ-611). Only the GONE-based causes are dead evidence
+ * (`isDeadEvidence`); a refusal or a row read never is:
+ *   - GONE-based, dead evidence:
+ *     - `tmux-gone`: the reconnect's `send-keys` answered GONE
+ *       (`ErrTmuxSendKeys`): agent-director found no session of the row's
+ *       launch. Answered at once, with no tmux server start and no second
+ *       try;
+ *     - `prompt-row-ladder-gone`: the collision ladder's `read-pane` of a
+ *       prompt row answered GONE (`ErrTmuxCaptureFailed`, `launchOnPromptRow`,
+ *       SRJ-607);
+ *   - a refusal, never dead evidence: `row-not-interactive`, agent-director
+ *     refused the reconnect's keystrokes as not interactive
+ *     (`ErrSpawnNotInteractive`, b.dup): the row finished (`ended` or
+ *     `missing`) after the caller read it, or it reads `pending` and the
+ *     session holding the persona's name may be another launch's (b.jg5
+ *     SRJ-613). A finished row is not proof that the worker is gone, so this
+ *     is only a route into the restart path's decision, and the restart work
+ *     kills nothing because of it (SRJ-609);
+ *   - row reads, never dead evidence:
+ *     - `row-absent`: no row has the persona's instance id
+ *       (`ErrSpawnNotFound`), at the reconnect's `send-keys`, at the launch
+ *       wait's `status` read or at the ladder's prompt-row `read-pane`;
+ *     - `row-read-finished`: the launch wait read the row `ended` or
+ *       `missing`.
+ * The reconnect answers only `tmux-gone`, `row-not-interactive` and
+ * `row-absent` (`ReconnectDeadSessionCause`).
+ */
+export type DeadSessionCause = (typeof DEAD_SESSION_CAUSES)[number]
+
+/** The `DeadSessionCause`s `reconnectMcpWithCause` answers (b.jg5 SRJ-118, SRJ-609). */
+export type ReconnectDeadSessionCause =
   | typeof DEAD_SESSION_CAUSE_TMUX_GONE
   | typeof DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE
   | typeof DEAD_SESSION_CAUSE_ROW_ABSENT
 
-/** `reconnectMcpWithCause`'s answer: the outcome, with what goes with it. */
-export interface ReconnectResult {
-  outcome: ReconnectOutcome
-  /** Set on a `dead-session` outcome only: what agent-director answered. */
-  deadCause?: DeadSessionCause
-  /**
-   * Set on a `transient` outcome only: the persona is latched (the
-   * reconnect's CONFLICT or UNUSABLE NAME answer latched it, or it was
-   * latched already and no `send-keys` was made), so the ladder answers
-   * `latched` for it.
-   */
-  latched?: true
-  /**
-   * Set on a `transient` outcome only: the keystrokes answered
-   * `ErrInvalidFlags` and the immediate version re-check decided that the
-   * server stops (b.jg5 SRJ-104, SRJ-205); the ladder answers a `failed`
-   * result marked `stopping`.
-   */
-  stopping?: true
-}
+/**
+ * `reconnectMcpWithCause`'s answer: the outcome, with what goes with it. A
+ * `dead-session` always carries its cause (b.jg5 SRJ-611).
+ */
+export type ReconnectResult =
+  | { outcome: 'ok' }
+  | {
+      outcome: 'dead-session'
+      /** What agent-director answered. */
+      deadCause: ReconnectDeadSessionCause
+    }
+  | {
+      outcome: 'transient'
+      /**
+       * The persona is latched (the reconnect's CONFLICT or UNUSABLE NAME
+       * answer latched it, or it was latched already and no `send-keys` was
+       * made), so the ladder answers `latched` for it.
+       */
+      latched?: true
+      /**
+       * The keystrokes answered `ErrInvalidFlags` and the immediate version
+       * re-check decided that the server stops (b.jg5 SRJ-104, SRJ-205); the
+       * ladder answers a `failed` result marked `stopping`.
+       */
+      stopping?: true
+    }
 
 /**
  * Send `/mcp reconnect <MCP_SERVER_NAME>` to persona `key`'s row and answer
@@ -4694,12 +4781,27 @@ export function waitEndedDisconnectedLine(
 /**
  * The line of a wait whose `status` read found persona `ref`'s row absent
  * (`ErrSpawnNotFound`, b.jg5 SRJ-605): at the poll, or, with `timedOutAfterMs`,
- * at the timeout read. The wait answers 'dead-session' with no tmux probe;
+ * at the timeout read. The wait answers 'dead-session' with no tmux probe,
+ * its cause `row-absent`, a row read and not dead evidence (b.jg5 SRJ-611);
  * the recovery's spawn classifies any leftover session.
  */
 export function waitRowAbsentLine(ref: string, timedOutAfterMs?: number): string {
   const at = timedOutAfterMs === undefined ? `${ref}'s` : `timed out for ${ref} after ${timedOutAfterMs}ms —`
-  return `[slack] waitForWaitingAndReconnect: ${at} agent-director row is absent (ErrSpawnNotFound) — dead session; the recovery's spawn classifies any leftover session (b.jg5 SRJ-605)`
+  return `[slack] waitForWaitingAndReconnect: ${at} agent-director row is absent (ErrSpawnNotFound) — dead session (${describeDeadEvidence(carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_ROW_ABSENT))}); the recovery's spawn classifies any leftover session (b.jg5 SRJ-605, SRJ-611)`
+}
+
+/**
+ * The line of a wait whose `status` read found persona `ref`'s row in
+ * `state`, `ended` or `missing` (b.ecw, b.jg5 SRJ-605): at the poll, or, with
+ * `timedOutAfterMs`, at the timeout read after its sweep. The wait answers
+ * 'dead-session' with no tmux probe, its cause `row-read-finished`, a row
+ * read and not dead evidence: a finished row is not proof that the worker is
+ * gone (b.jg5 SRJ-611). The recovery's resume or spawn decides what holds the
+ * persona's name.
+ */
+export function waitRowFinishedLine(ref: string, state: string, timedOutAfterMs?: number): string {
+  const at = timedOutAfterMs === undefined ? `${ref}'s` : `timed out for ${ref} after ${timedOutAfterMs}ms — its`
+  return `[slack] waitForWaitingAndReconnect: ${at} row reads state=${state} — dead session (${describeDeadEvidence(carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_ROW_READ_FINISHED))}); the recovery's resume or spawn decides what holds its name (b.ecw, b.jg5 SRJ-605, SRJ-611)`
 }
 
 /**
@@ -5442,8 +5544,9 @@ export function readFindMissingRow(
  * `~/startup/find-missing-loop.sh`: emit an operator-visible log line, then run
  * the memoized, ordinary `reconcileMissingSweep` (b.m4r, b.jg5 SRJ-120). The
  * sweep may reconcile the frozen `working` row to `missing`; when the restart
- * run's second liveness probe (b.d61) then reads `dead`, it takes the normal
- * kill+relaunch branch at once. It may also leave the row live (in
+ * run's second liveness probe (b.d61) then reads `dead`, it relaunches at
+ * once, making its checked kill first only after a verdict that is dead
+ * evidence (b.jg5 SRJ-611). It may also leave the row live (in
  * `unverified_ids`, or, when `pending`, not judged), and the row may stay
  * live for further ticks: nothing promises that the re-probe or a later tick
  * reads it dead (b.jg5 SRJ-610). A re-probe reading `pending` or `unknown`
@@ -5534,15 +5637,25 @@ export function escalateDeadSweepLine(key: string, verdict: EscalateDeadVerdict)
  * read proves the worker's process gone, and every evidence text
  * (`ESCALATE_DEAD_EVIDENCE`) says only what was observed. Each verdict
  * records its origin as one of the labels above, apart from its evidence
- * text.
+ * text. Only the GONE-based verdicts are dead evidence (`isDeadEvidence`,
+ * b.jg5 SRJ-611); `row-not-interactive` and `row-absent-at-pane-read` never
+ * are, and never by themselves lead to a kill, a delete or a live-row
+ * sequence (SRJ-609, SRJ-611).
  */
-export type EscalateDeadVerdict =
-  | 'dead-session'
-  | 'row-not-interactive'
-  | 'working-tmux-gone'
-  | 'waiting-row-pane-gone'
-  | 'row-absent-at-pane-read'
-  | 'prompt-row-tmux-gone'
+export type EscalateDeadVerdict = (typeof ESCALATE_DEAD_VERDICTS)[number]
+
+/**
+ * Every `EscalateDeadVerdict`, in one runtime list, so a test iterates the
+ * values themselves (b.jg5 SRJ-611).
+ */
+export const ESCALATE_DEAD_VERDICTS = Object.freeze([
+  'dead-session',
+  'row-not-interactive',
+  'working-tmux-gone',
+  'waiting-row-pane-gone',
+  'row-absent-at-pane-read',
+  'prompt-row-tmux-gone',
+] as const)
 
 /** The escalate-dead verdict of a `waiting` row whose `read-pane` answered GONE (b.jg5 SRJ-604). */
 export const ESCALATE_DEAD_WAITING_ROW_PANE_GONE = 'waiting-row-pane-gone' satisfies EscalateDeadVerdict
@@ -5563,7 +5676,11 @@ export const ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ = 'row-absent-at-pane-read' s
  * agent-director refused the keystrokes as not interactive, which does not
  * prove the worker gone (a
  * finished row, or a `pending` row whose session may be another launch's,
- * b.jg5 SRJ-609, SRJ-613).
+ * b.jg5 SRJ-609, SRJ-613). The GONE-based verdicts (`dead-session`,
+ * `working-tmux-gone`, `waiting-row-pane-gone`, `prompt-row-tmux-gone`) are
+ * dead evidence; the refusal (`row-not-interactive`) and the row read
+ * (`row-absent-at-pane-read`) never are (b.jg5 SRJ-609, SRJ-611;
+ * `isDeadEvidence`).
  */
 export const ESCALATE_DEAD_EVIDENCE: Readonly<Record<EscalateDeadVerdict, string>> = Object.freeze({
   'dead-session':
@@ -5585,18 +5702,145 @@ export const ESCALATE_DEAD_EVIDENCE: Readonly<Record<EscalateDeadVerdict, string
  * for a `dead-session` reconnect of cause `cause` (b.jg5 SRJ-118, SRJ-609):
  * `tmux-gone` gives `dead-session`, `row-not-interactive` gives
  * `row-not-interactive`, and `row-absent` gives `row-absent-at-pane-read`,
- * never `tmux-gone`'s verdict. A `dead-session` with no cause (none of
- * `reconnectMcpWithCause`'s answers) gives `dead-session`. Pure.
+ * never `tmux-gone`'s verdict, so each verdict keeps its cause's dead
+ * evidence answer (b.jg5 SRJ-611). Pure.
  */
-export function escalateDeadVerdictOfCause(cause: DeadSessionCause | undefined): EscalateDeadVerdict {
+export function escalateDeadVerdictOfCause(cause: ReconnectDeadSessionCause): EscalateDeadVerdict {
   switch (cause) {
+    case DEAD_SESSION_CAUSE_TMUX_GONE:
+      return 'dead-session'
     case DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE:
       return 'row-not-interactive'
     case DEAD_SESSION_CAUSE_ROW_ABSENT:
       return ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ
-    default:
-      return 'dead-session'
   }
+}
+
+// ---------------------------------------------------------------------------
+// Dead evidence (b.jg5 SRJ-611)
+// ---------------------------------------------------------------------------
+
+/** What a path's dead evidence is decided on: a `dead-session` cause or an escalate-dead verdict. */
+export type DeadEvidenceSource = DeadSessionCause | EscalateDeadVerdict
+
+/** `CarriedDeadEvidence.source` when a path carries no cause or verdict. */
+export const DEAD_EVIDENCE_NONE = 'none'
+
+/**
+ * Whether `source`, a `dead-session` cause or an escalate-dead verdict, is
+ * dead evidence for the persona (b.jg5 SRJ-611): true exactly for the
+ * GONE-based ones, a `dead-session` caused by `ErrTmuxSendKeys`
+ * (`tmux-gone`, and the reconnect adapter's verdict for it, `dead-session`)
+ * or by a pane read's `ErrTmuxCaptureFailed` (`working-tmux-gone`,
+ * `waiting-row-pane-gone`, `prompt-row-tmux-gone`, and the ladder action's
+ * `prompt-row-ladder-gone`). False for the refusal as not interactive
+ * (`row-not-interactive`, SRJ-609), for the row reads (`row-absent`,
+ * `row-absent-at-pane-read`, `row-read-finished`), for
+ * `DEAD_EVIDENCE_NONE` and for any value it does not know (fail safe). The
+ * switch is exhaustive: a new cause or verdict fails the typecheck until it
+ * is decided here. Decided by value alone. Pure; never throws.
+ */
+export function isDeadEvidence(source: string | undefined): boolean {
+  const value = source as DeadEvidenceSource
+  switch (value) {
+    case DEAD_SESSION_CAUSE_TMUX_GONE:
+    case DEAD_SESSION_CAUSE_PROMPT_ROW_LADDER_GONE:
+    case 'dead-session':
+    case 'working-tmux-gone':
+    case ESCALATE_DEAD_WAITING_ROW_PANE_GONE:
+    case 'prompt-row-tmux-gone':
+      return true
+    case DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE:
+    case DEAD_SESSION_CAUSE_ROW_ABSENT:
+    case DEAD_SESSION_CAUSE_ROW_READ_FINISHED:
+    case ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ:
+      return false
+    default: {
+      // Every known value is decided above, so `value` is `never` here; at
+      // run time an unknown value (or none) is not dead evidence.
+      const undecided: never = value
+      void undecided
+      return false
+    }
+  }
+}
+
+/**
+ * The dead evidence a recovery path carries (b.jg5 SRJ-611): the cause or
+ * verdict that proved its `dead-session` or escalate-dead verdict, or
+ * `DEAD_EVIDENCE_NONE`, and whether it is dead evidence. Built only by
+ * `carriedDeadEvidenceOf`, so `evidence` is always `isDeadEvidence(source)`:
+ * the type carries a type-only brand (`carriedDeadEvidenceBrand`, never
+ * present at run time) that only `carriedDeadEvidenceOf` and
+ * `CARRIED_DEAD_EVIDENCE_NONE` supply, so an object literal built by hand
+ * fails the typecheck. The restart path carries it across its dependencies
+ * as an opaque value (`src/restart.ts` imports the type only).
+ */
+export interface CarriedDeadEvidence {
+  readonly source: DeadEvidenceSource | typeof DEAD_EVIDENCE_NONE
+  readonly evidence: boolean
+  readonly [carriedDeadEvidenceBrand]: true
+}
+
+/**
+ * The brand on `CarriedDeadEvidence`: declared only, so it has no run-time
+ * value and no module outside this one can name it.
+ */
+declare const carriedDeadEvidenceBrand: unique symbol
+
+/** A path that carries no cause or verdict: never dead evidence. */
+export const CARRIED_DEAD_EVIDENCE_NONE: CarriedDeadEvidence = brandCarriedDeadEvidence(DEAD_EVIDENCE_NONE, false)
+
+/**
+ * The frozen value `{ source, evidence }`, typed with the brand (b.jg5
+ * SRJ-611). The one place the brand is applied; callers are
+ * `carriedDeadEvidenceOf` and `CARRIED_DEAD_EVIDENCE_NONE`.
+ */
+function brandCarriedDeadEvidence(source: CarriedDeadEvidence['source'], evidence: boolean): CarriedDeadEvidence {
+  return Object.freeze({ source, evidence }) as CarriedDeadEvidence
+}
+
+/**
+ * The carried dead evidence of `source` (b.jg5 SRJ-611):
+ * `CARRIED_DEAD_EVIDENCE_NONE` for none (absent or `DEAD_EVIDENCE_NONE`),
+ * else the source with `isDeadEvidence`'s answer. Pure.
+ */
+export function carriedDeadEvidenceOf(source: DeadEvidenceSource | typeof DEAD_EVIDENCE_NONE | undefined): CarriedDeadEvidence {
+  if (source === undefined || source === DEAD_EVIDENCE_NONE) return CARRIED_DEAD_EVIDENCE_NONE
+  return brandCarriedDeadEvidence(source, isDeadEvidence(source))
+}
+
+/**
+ * `carried`'s cause or verdict and whether it counts as dead evidence, as
+ * the dead-session lines name it (b.jg5 SRJ-611): `cause=<source>: dead
+ * evidence (GONE-based)`, `cause=<source>: not dead evidence`, or `no cause
+ * carried: not dead evidence`. Decided again from the source
+ * (`isDeadEvidence`), so a value cast past the brand says what it is. Pure.
+ */
+export function describeDeadEvidence(carried: CarriedDeadEvidence): string {
+  if (carried.source === DEAD_EVIDENCE_NONE) return 'no cause carried: not dead evidence'
+  return isDeadEvidence(carried.source)
+    ? `cause=${carried.source}: dead evidence (GONE-based)`
+    : `cause=${carried.source}: not dead evidence`
+}
+
+/**
+ * The collision ladder's one line for a dead-session route (b.jg5 SRJ-611):
+ * persona `ref`'s row, read `state`, goes to resume/fresh-spawn
+ * (`resumeOrFreshSpawn`); `own` is the route's own cause and `carriedIn` the
+ * escalate-dead verdict the restart path carried into the launch
+ * (`CARRIED_DEAD_EVIDENCE_NONE` when none), and the line says whether the
+ * path holds dead evidence (either does).
+ */
+export function deadSessionRouteLine(
+  ref: string,
+  state: string,
+  own: CarriedDeadEvidence,
+  carriedIn: CarriedDeadEvidence,
+): string {
+  const carried = carriedIn.source === DEAD_EVIDENCE_NONE ? '' : `; the restart path carried in ${describeDeadEvidence(carriedIn)}`
+  const holds = isDeadEvidence(own.source) || isDeadEvidence(carriedIn.source) ? 'holds dead evidence' : 'holds no dead evidence'
+  return `[slack] spawnForPersona: dead session for ${ref} (state=${state}) — ${describeDeadEvidence(own)}${carried}; the path ${holds}; recovering via resume/fresh-spawn (b.jg5 SRJ-611)`
 }
 
 // ---------------------------------------------------------------------------
@@ -5656,8 +5900,8 @@ export function endPromptRowDeferral(key: string): void {
   promptRowDeferredSince.delete(key)
 }
 
-/** A row state that says the persona's claude process is gone: agent-director ended the row or marked it missing. */
-function isDeadRowState(state: string | undefined): boolean {
+/** A finished row state: agent-director ended the row or marked it missing (a row read, never dead evidence; b.jg5 SRJ-611). */
+function isDeadRowState(state: string | undefined): state is 'ended' | 'missing' {
   return state === 'ended' || state === 'missing'
 }
 
@@ -5770,9 +6014,11 @@ export async function readPersonaRowState(key: string): Promise<UnavailableRetry
  * in the persona's run on the row (`promptRowDeferredSince`). Once the run
  * has lasted
  * `PROMPT_ROW_SWEEP_AFTER_MS`, it runs the memoized findMissing sweep and
- * reads the row again: `ended` or `missing` means the claude process is gone,
- * so it logs that, ends the run and returns `escalate`, and the adapter
- * escalates the persona as dead for the restart to relaunch. A refused sweep
+ * reads the row again: on `ended` or `missing` it logs what was read
+ * (`promptRowSweepFinishedLine`), ends the run and returns `escalate`, and
+ * the adapter answers escalate-dead with the cause `row-read-finished`, a
+ * row read and not dead evidence (b.jg5 SRJ-609, SRJ-611): the restart
+ * path's re-probe decides, and no kill follows from it. A refused sweep
  * (b.jg5 SRJ-105) returns `refused`: the row is not read, and the adapter
  * answers `transient`, so the restart run kills and launches nothing and
  * raises no notice. A persona latched once the sweep is done (b.jg5 SRJ-120,
@@ -5794,10 +6040,21 @@ export async function checkPromptRowDeferral(key: string, state: string): Promis
   if (after === FIND_MISSING_LATCHED) return 'latched'
   if (!isDeadRowState(after)) return 'defer'
   endPromptRowDeferral(key)
-  console.error(
-    `[slack] reconnectSession: ${ref} has read ${state} for ${describeWaitSpan(heldMs)} of deferrals, and after a findMissing sweep its row reads ${after} — its claude process is gone; not deferring, the restart relaunches it (b.jdc)`,
-  )
+  console.error(promptRowSweepFinishedLine(ref, state, heldMs, after))
   return 'escalate'
+}
+
+/**
+ * `checkPromptRowDeferral`'s line when persona `ref`'s row, read `state` for
+ * `heldMs` of deferrals, reads `after` (`ended` or `missing`) after the
+ * findMissing sweep (b.jdc): it says what was read, a row read and not dead
+ * evidence (cause `row-read-finished`, b.jg5 SRJ-609, SRJ-611), and that the
+ * restart path's re-probe decides. Exported for tests.
+ *
+ * @internal
+ */
+export function promptRowSweepFinishedLine(ref: string, state: string, heldMs: number, after: string): string {
+  return `[slack] reconnectSession: ${ref} has read ${state} for ${describeWaitSpan(heldMs)} of deferrals, and after a findMissing sweep its row reads ${after} — not deferring; escalating (escalate-dead), the restart path's re-probe decides (${describeDeadEvidence(carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_ROW_READ_FINISHED))}; b.jdc, b.jg5 SRJ-611)`
 }
 
 /**
@@ -5826,7 +6083,11 @@ export async function checkPromptRowDeferral(key: string, state: string): Promis
  *   `resumeOrFreshSpawn`, with that re-read as the state last read (a
  *   finished row, so any replacement there is a reuse spawn of the same id,
  *   b.jg5 SRJ-707), whose resume or spawn decides what holds the
- *   persona's name; anything else (or a failed read) is left as it is
+ *   persona's name. The route's line (`deadSessionRouteLine`) names its
+ *   cause: after a GONE `prompt-row-ladder-gone`, dead evidence; after an
+ *   absent row `row-absent`, a row read and not dead evidence (b.jg5
+ *   SRJ-611); either is handed on with any verdict the restart path carried
+ *   in. Anything else (or a failed read) is left as it is
  *   (`no-op`), for the restart path to retry. A refused sweep (b.jg5
  *   SRJ-105) reads nothing and answers `failed`: no resume or launch. A
  *   persona latched before the sweep (b.jg5 SRJ-502, `personaLatchedNow`),
@@ -5849,7 +6110,7 @@ export async function checkPromptRowDeferral(key: string, state: string): Promis
  * Each log line but the pane's `no-op` comes from an exported builder
  * (`promptRowLadderNoPaneLine`, `promptRowLadderAfterSweepLine`,
  * `promptRowLadderNoActionLine`, `promptRowLadderStoppingLine`,
- * `promptRowLadderLatchedLine`).
+ * `promptRowLadderLatchedLine`, `deadSessionRouteLine`).
  */
 async function launchOnPromptRow(
   run: LadderRun,
@@ -5898,9 +6159,16 @@ async function launchOnPromptRow(
   // b.jg5 SRJ-502: a persona latched after the sweep gets no further call.
   if (after === FIND_MISSING_LATCHED) return { key, action: 'latched' }
   if (isDeadRowState(after)) {
-    console.error(`[slack] spawnForPersona: dead session for ${ref} (state=${state}) — recovering via resume/fresh-spawn`)
+    // b.jg5 SRJ-607, SRJ-611: a GONE read is dead evidence
+    // (`prompt-row-ladder-gone`); an absent row is a row read (`row-absent`)
+    // and is not.
+    const own = carriedDeadEvidenceOf(read.kind === PANE_READ_GONE ? DEAD_SESSION_CAUSE_PROMPT_ROW_LADDER_GONE : DEAD_SESSION_CAUSE_ROW_ABSENT)
+    console.error(deadSessionRouteLine(ref, state, own, run.carriedDeadEvidence))
     // b.jg5 SRJ-501: the re-read after the sweep is the path's last read.
-    return resumeOrFreshSpawn(run, row, { lastRead: latchRowStateRead(after) })
+    return resumeOrFreshSpawn(run, row, {
+      lastRead: latchRowStateRead(after),
+      deadEvidence: heldDeadEvidence(own, run.carriedDeadEvidence),
+    })
   }
   const next = config.session_restart_delay === 0
     ? 'session_restart_delay is 0, so nothing retries it before the next server start'
@@ -6055,19 +6323,24 @@ export function promptRowLadderLatchedLine(ref: string, state: string): string {
  * 'dead-session', the recovery's resume or spawn (`resumeOrFreshSpawn`)
  * decides what holds the persona's name: agent-director classifies any
  * leftover session, and a CONFLICT there latches the persona (b.jg5
- * SRJ-501). A 'dead-session' from a row read is not dead evidence (b.jg5
- * SRJ-611).
- *   - ended/missing branch: `ended` means SessionEnd fired (the process
- *     exited); `missing` after the up-front sweep is agent-director's
- *     evidence-based verdict that the process is gone. Returns
- *     'dead-session' directly.
+ * SRJ-501). Each 'dead-session' end carries one cause
+ * (`waitForWaitingAndReconnectWithCause`, `WaitDeadSession`, b.jg5
+ * SRJ-611): only the reconnect's `tmux-gone` is dead evidence; a
+ * 'dead-session' from a row read or from a refusal as not interactive is
+ * not.
+ *   - ended/missing branch: `ended` means SessionEnd fired; `missing` after
+ *     the up-front sweep is agent-director's sweep verdict on the row. One
+ *     line (`waitRowFinishedLine`), then 'dead-session' directly, cause
+ *     `row-read-finished` with the state read.
  *   - timeout branch: a FRESH findMissing sweep (the 10s memo has long
  *     expired at the 10-minute deadline) + one status call. A `waiting` row
  *     is reconnected (b.f2b); a process mid-long-turn is left alive,
  *     'not-reconnected' (the b.rmy/b.3ce long-turn guard); only a row that
- *     reads `ended` or `missing`, or is absent, returns 'dead-session'.
+ *     reads `ended` or `missing` (cause `row-read-finished`), or is absent,
+ *     returns 'dead-session'.
  *   - an absent row (`ErrSpawnNotFound`), at the poll or the timeout
- *     `status`: one line, then 'dead-session'.
+ *     `status`: one line (`waitRowAbsentLine`), then 'dead-session', cause
+ *     `row-absent`.
  *   - any other `status` error (UNAVAILABLE, a timeout, ENVIRONMENT, CONFIG,
  *     UNCLASSIFIED, `ErrSystemInstallDisappeared` included; b.jg5 SRJ-605):
  *     never 'dead-session', 'transient' or a refusal. At the poll the wait goes
@@ -6105,10 +6378,14 @@ export function promptRowLadderLatchedLine(ref: string, state: string): string {
  *   - the reconnect (`reconnectMcpWithCause`, made on a row read `waiting`,
  *     at the poll or the timeout, or on a stale `working` row, with that row
  *     state as its last read): its outcome is the wait's, unchanged (b.jg5
- *     SRJ-118). A `transient` reconnect that latched the persona, or found it
- *     latched, is noted on the wait so the ladder answers `latched`; one
+ *     SRJ-118), a 'dead-session' with the reconnect's cause (`tmux-gone`,
+ *     `row-not-interactive` or `row-absent`). A `transient` reconnect that
+ *     latched the persona, or found it latched, is noted on the wait so the
+ *     ladder answers `latched`; one
  *     whose `ErrInvalidFlags` re-check decided the stop is noted as a stop.
  *     It is never retried.
+ * Outcome only: it answers a bare 'dead-session' with no cause; a caller
+ * that needs the cause uses `waitForWaitingAndReconnectWithCause`.
  */
 export async function waitForWaitingAndReconnect(
   key: string,
@@ -6119,26 +6396,29 @@ export async function waitForWaitingAndReconnect(
 }
 
 /**
- * `waitForWaitingAndReconnect`, also saying, for a `transient` outcome,
- * whether the persona is latched (`latched`: the wait's reconnect latched it
- * or found it latched, b.jg5 SRJ-118) or the server stops (`stopping`, b.jg5
- * SRJ-205: a version re-check, the evidence read's or the reconnect's,
- * decided it). `lastRead` is the row state the wait's last read gave (b.jg5
- * SRJ-501), absent when none answered.
+ * `waitForWaitingAndReconnect`, also saying, for a `dead-session` outcome,
+ * its cause (`WaitDeadSession`: the reconnect's, `row-absent` or
+ * `row-read-finished` with the state read; b.jg5 SRJ-611), and, for a
+ * `transient` outcome, whether the persona is latched (`latched`: the wait's
+ * reconnect latched it or found it latched, b.jg5 SRJ-118) or the server
+ * stops (`stopping`, b.jg5 SRJ-205: a version re-check, the evidence read's
+ * or the reconnect's, decided it). `lastRead` is the row state the wait's
+ * last read gave (b.jg5 SRJ-501), absent when none answered.
  */
-async function waitForWaitingAndReconnectWithCause(
+export async function waitForWaitingAndReconnectWithCause(
   key: string,
   config: PersonaConfig,
-  ref: string,
-): Promise<{ outcome: WaitReconnectOutcome; latched?: true; stopping?: true; lastRead?: LatchRowState }> {
+  ref: string = keyRef(key),
+): Promise<WaitReconnectResult> {
   const wait: WorkingRowWait = { cancelled: cancelledLaunchWaits.has(key), wake: () => {} }
   workingRowWaits.set(key, wait)
   try {
-    const outcome = await waitForWorkingRow(key, config, ref, wait)
+    const end = await waitForWorkingRow(key, config, ref, wait)
     const lastRead = wait.lastRead === undefined ? {} : { lastRead: wait.lastRead }
-    if (outcome !== 'transient') return { outcome, ...lastRead }
-    if (wait.stopping) return { outcome, stopping: true, ...lastRead }
-    return wait.latched ? { outcome, latched: true, ...lastRead } : { outcome, ...lastRead }
+    if (typeof end !== 'string') return { ...end, ...lastRead }
+    if (end !== 'transient') return { outcome: end, ...lastRead }
+    if (wait.stopping) return { outcome: end, stopping: true, ...lastRead }
+    return wait.latched ? { outcome: end, latched: true, ...lastRead } : { outcome: end, ...lastRead }
   } finally {
     if (workingRowWaits.get(key) === wait) workingRowWaits.delete(key)
   }
@@ -6147,13 +6427,17 @@ async function waitForWaitingAndReconnectWithCause(
 /**
  * The wait's reconnect (b.jg5 SRJ-118): `reconnectMcpWithCause` with
  * `lastRead`, the row state the wait read just before (`waiting`, or
- * `working` for a stale row), answering its outcome unchanged and noting on
+ * `working` for a stale row), answering its outcome unchanged, a
+ * `dead-session` with the reconnect's cause (b.jg5 SRJ-611), and noting on
  * `wait` a `transient` one's latch or stop.
  */
-async function reconnectInWait(key: string, ref: string, wait: WorkingRowWait, lastRead: LatchRowState): Promise<ReconnectOutcome> {
+async function reconnectInWait(key: string, ref: string, wait: WorkingRowWait, lastRead: LatchRowState): Promise<WaitEnd> {
   const result = await reconnectMcpWithCause(key, lastRead, ref)
-  if (result.latched) wait.latched = true
-  if (result.stopping) wait.stopping = true
+  if (result.outcome === 'dead-session') return { outcome: 'dead-session', deadCause: result.deadCause }
+  if (result.outcome === 'transient') {
+    if (result.latched) wait.latched = true
+    if (result.stopping) wait.stopping = true
+  }
   return result.outcome
 }
 
@@ -6164,18 +6448,22 @@ async function reconnectInWait(key: string, ref: string, wait: WorkingRowWait, l
  * 'transient': nothing typed, nothing counted. No status read, reconnect or
  * 'dead-session' verdict follows.
  */
-function refusedWaitSweep(key: string, ref: string, wait: WorkingRowWait): WaitReconnectOutcome {
+function refusedWaitSweep(key: string, ref: string, wait: WorkingRowWait): 'cancelled' | typeof WAIT_OUTCOME_LATCHED | 'transient' {
   if (waitMustEnd(key, wait)) return endWait(ref, wait)
   return 'transient'
 }
 
-/** `waitForWaitingAndReconnect`'s body, with its cancellable `wait` (b.f2b). */
+/**
+ * `waitForWaitingAndReconnect`'s body, with its cancellable `wait` (b.f2b).
+ * Each `dead-session` end carries its cause (`WaitDeadSession`, b.jg5
+ * SRJ-611).
+ */
 async function waitForWorkingRow(
   key: string,
   config: PersonaConfig,
   ref: string,
   wait: WorkingRowWait,
-): Promise<WaitReconnectOutcome> {
+): Promise<WaitEnd> {
   const pollIntervalMs = config.agent_director_poll_interval_ms
   const waitStartedAt = _now()
   const deadline = waitStartedAt + _waitForWaitingTimeoutMs
@@ -6233,10 +6521,11 @@ async function waitForWorkingRow(
       if (read.kind === OWN_ROW_STATUS_ABSENT) {
         // b.jg5 SRJ-605: the row is absent (`ErrSpawnNotFound`): 'dead-session'
         // with no tmux probe; the recovery's spawn classifies any leftover
-        // session. A row read, so not dead evidence (b.jg5 SRJ-611).
+        // session. A row read, so not dead evidence (b.jg5 SRJ-611): cause
+        // `row-absent`.
         wait.lastRead = LATCH_ROW_STATE_NO_ROW
         console.error(waitRowAbsentLine(ref))
-        return 'dead-session'
+        return { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_ABSENT }
       }
       // b.jg5 SRJ-605: any other `status` error (UNAVAILABLE, ENVIRONMENT,
       // CONFIG, UNCLASSIFIED, `ErrSystemInstallDisappeared` included) is
@@ -6289,18 +6578,18 @@ async function waitForWorkingRow(
     }
 
     // b.ecw: this branch keys on the row agent-director keeps for the claude
-    // process. `ended` means SessionEnd fired (the process exited); `missing`
-    // (after the up-front reconcileMissingSweep) is agent-director's
-    // evidence-based verdict that the process is gone. Either way the wait
-    // returns 'dead-session' directly, with no tmux probe, and the recovery's
-    // resume or spawn (resumeOrFreshSpawn) decides what holds the persona's
-    // name: agent-director classifies any leftover session. A row read, so
-    // not dead evidence (b.jg5 SRJ-611). Live transient states (ask_user,
-    // check_permission, pending) fall through to 'not-reconnected' below
-    // (b.f2b).
+    // process. `ended` means SessionEnd fired; `missing` (after the up-front
+    // reconcileMissingSweep) is agent-director's sweep verdict on the row.
+    // Either way the wait returns 'dead-session' directly, with no tmux
+    // probe, and the recovery's resume or spawn (resumeOrFreshSpawn) decides
+    // what holds the persona's name: agent-director classifies any leftover
+    // session. A row read, so not dead evidence (b.jg5 SRJ-611): cause
+    // `row-read-finished`, with the state read. Live transient states
+    // (ask_user, check_permission, pending) fall through to 'not-reconnected'
+    // below (b.f2b).
     if (state === 'ended' || state === 'missing') {
-      console.error(`[slack] waitForWaitingAndReconnect: ${ref} transitioned to state=${state} (claude process gone) — dead session`)
-      return 'dead-session'
+      console.error(waitRowFinishedLine(ref, state))
+      return { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_READ_FINISHED, finishedState: state }
     }
 
     return reportWaitEndedDisconnected(key, config, waitEndedOnStateReport(ref, state))
@@ -6310,14 +6599,15 @@ async function waitForWorkingRow(
   // The up-front sweep's 10s memo has long expired at the 10-minute
   // deadline, so run a FRESH reconcileMissingSweep (a real whole-store
   // findMissing) to reconcile a row frozen at `working`, then one status call.
-  // - ended/missing → the process is gone → 'dead-session'.
+  // - ended/missing → 'dead-session', cause `row-read-finished` with the
+  //   state read: a row read, not dead evidence (b.jg5 SRJ-611).
   // - waiting → the turn ended at the deadline: reconnect (b.f2b).
   // - any other live state (working/ask_user/check_permission/pending) → a
   //   process merely mid-long-turn is left alive, 'not-reconnected' (b.f2b;
   //   the b.rmy/b.3ce long-turn guard).
-  // - ErrSpawnNotFound → the row is absent: 'dead-session', with no tmux
-  //   probe, as at the poll; the recovery's spawn classifies any leftover
-  //   session (b.jg5 SRJ-605).
+  // - ErrSpawnNotFound → the row is absent: 'dead-session', cause
+  //   `row-absent`, with no tmux probe, as at the poll; the recovery's spawn
+  //   classifies any leftover session (b.jg5 SRJ-605, SRJ-611).
   // - any other status error → 'not-reconnected' through
   //   reportWaitEndedDisconnected, never 'dead-session' or 'transient' (b.jg5
   //   SRJ-605); an UNUSABLE NAME answer, or the row reading `pending` with
@@ -6348,10 +6638,10 @@ async function waitForWorkingRow(
     if (waitMustEnd(key, wait)) return endWait(ref, wait)
     if (timeoutRead.kind === OWN_ROW_STATUS_ABSENT) {
       // b.jg5 SRJ-605: the row is absent: 'dead-session' with no tmux probe,
-      // as at the poll; not dead evidence (b.jg5 SRJ-611).
+      // as at the poll; cause `row-absent`, not dead evidence (b.jg5 SRJ-611).
       wait.lastRead = LATCH_ROW_STATE_NO_ROW
       console.error(waitRowAbsentLine(ref, _waitForWaitingTimeoutMs))
-      return 'dead-session'
+      return { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_ABSENT }
     }
     // b.jg5 SRJ-605: any other `status` error (`ErrSystemInstallDisappeared`
     // included) ends the wait 'not-reconnected', never 'dead-session' or
@@ -6369,10 +6659,8 @@ async function waitForWorkingRow(
 
   if (timeoutState !== 'working') endWorkingRowDeferral(key)
   if (timeoutState === 'ended' || timeoutState === 'missing') {
-    console.error(
-      `[slack] waitForWaitingAndReconnect: timed out for ${ref} after ${_waitForWaitingTimeoutMs}ms — claude process state=${timeoutState} (gone) — dead session`,
-    )
-    return 'dead-session'
+    console.error(waitRowFinishedLine(ref, timeoutState, _waitForWaitingTimeoutMs))
+    return { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_READ_FINISHED, finishedState: timeoutState }
   }
   // b.f2b: the row settled at the deadline — reconnect, as the loop would have.
   if (timeoutState === 'waiting') return reconnectInWait(key, ref, wait, latchRowStateRead(timeoutState))
@@ -7672,6 +7960,67 @@ interface LadderRun {
    * re-runs nothing.
    */
   readonly reuseCollisionRerun: boolean
+  /**
+   * The escalate-dead verdict the restart path carried into this launch
+   * (`spawnForPersona`'s `deadEvidence`, b.jg5 SRJ-611), kept for the run:
+   * `CARRIED_DEAD_EVIDENCE_NONE` when none was carried.
+   */
+  readonly carriedDeadEvidence: CarriedDeadEvidence
+}
+
+/**
+ * The dead evidence a ladder path hands `resumeOrFreshSpawn` (b.jg5
+ * SRJ-611): the path holds dead evidence when its own cause (`own`) is dead
+ * evidence or the verdict the restart path carried in (`carriedIn`) is,
+ * within the same recovery attempt. Answers the one that is dead evidence,
+ * the path's own first; with neither, the path's own cause, or the carried
+ * verdict when the path has none. Pure.
+ */
+function heldDeadEvidence(own: CarriedDeadEvidence, carriedIn: CarriedDeadEvidence): CarriedDeadEvidence {
+  if (isDeadEvidence(own.source)) return own
+  if (isDeadEvidence(carriedIn.source)) return carriedIn
+  return own.source === DEAD_EVIDENCE_NONE ? carriedIn : own
+}
+
+/**
+ * The row state a dead-session route hands `resumeOrFreshSpawn` as the
+ * state last read (b.jg5 SRJ-501, SRJ-611): a cause that is a row read
+ * passes what it read, no row for `row-absent` and the state read for
+ * `row-read-finished` (`finishedState`), never the earlier live read; any
+ * other cause passes `liveRead`, the route's own last read.
+ */
+function deadSessionLastRead(cause: DeadSessionCause, finishedState: string | undefined, liveRead: LatchRowState): LatchRowState {
+  if (cause === DEAD_SESSION_CAUSE_ROW_ABSENT) return LATCH_ROW_STATE_NO_ROW
+  if (cause === DEAD_SESSION_CAUSE_ROW_READ_FINISHED && finishedState !== undefined) return latchRowStateRead(finishedState)
+  return liveRead
+}
+
+/**
+ * A dead-session route of the collision ladder's `waiting` or `working`
+ * branch (b.3ce; b.jg5 SRJ-611) for persona `run.persona`'s row read
+ * `state`: one line naming the route's own `cause` and whether the path
+ * holds dead evidence (`deadSessionRouteLine`), then resume/fresh-spawn with
+ * the find-missing run before its `resume` (`reconcileMissingFirst`), on
+ * every such route and for every cause, dead evidence or not. It hands on
+ * the state its cause last read (`deadSessionLastRead`; `liveRead` for a
+ * cause that is no row read) and the dead evidence the path holds
+ * (`heldDeadEvidence`). Adds no kill, delete or launch of its own.
+ */
+function deadSessionRoute(
+  run: LadderRun,
+  row: Pick<GetResult, 'cwd' | 'labels'>,
+  state: string,
+  cause: DeadSessionCause,
+  finishedState: string | undefined,
+  liveRead: LatchRowState,
+): Promise<SpawnPersonaResult> {
+  const own = carriedDeadEvidenceOf(cause)
+  console.error(deadSessionRouteLine(run.ref, state, own, run.carriedDeadEvidence))
+  return resumeOrFreshSpawn(run, row, {
+    reconcileMissingFirst: true,
+    lastRead: deadSessionLastRead(cause, finishedState, liveRead),
+    deadEvidence: heldDeadEvidence(own, run.carriedDeadEvidence),
+  })
 }
 
 /**
@@ -7801,9 +8150,17 @@ async function reuseFinishedRow(
  * `opts.lastRead` is the row state the caller last read, which the replace
  * step decides on (b.jg5 SRJ-707): the `ended`/`missing` branch's collision
  * `get` (a finished row); a dead-session path's (`reconcileMissingFirst`)
- * collision `get` or working-row wait's last read, a live row unless that
- * wait read it finished or gone; the prompt-row recovery's re-read, which
- * read it finished.
+ * collision `get` or working-row wait's last read, a live row unless its
+ * cause is a row read (no row for `row-absent`, the state read for
+ * `row-read-finished`, `deadSessionLastRead`); the prompt-row recovery's
+ * re-read, which read it finished.
+ *
+ * `opts.deadEvidence` is the dead evidence the path holds (b.jg5 SRJ-611,
+ * `heldDeadEvidence`): its own `dead-session` cause, or the escalate-dead
+ * verdict the restart path carried in, whichever is dead evidence;
+ * `CARRIED_DEAD_EVIDENCE_NONE` when not given. Only a GONE-based cause or
+ * verdict is dead evidence; `row-not-interactive` and the row reads never
+ * are. The lost race's line names it.
  *
  * The no-transcript step's reuse spawn has SRJ-112's outcomes
  * (`reuseSpawnFailedAt`); its collision (`ErrInstanceIdCollision`: the row
@@ -7879,25 +8236,28 @@ async function reuseFinishedRow(
 async function resumeOrFreshSpawn(
   run: LadderRun,
   row: Pick<GetResult, 'cwd' | 'labels'>,
-  opts: { reconcileMissingFirst?: boolean; lastRead: LatchRowState },
+  opts: { reconcileMissingFirst?: boolean; lastRead: LatchRowState; deadEvidence?: CarriedDeadEvidence },
 ): Promise<SpawnPersonaResult> {
   const { persona, params, config, isStartup, ref } = run
   const { key } = persona
   const { lastRead } = opts
+  const deadEvidence = opts.deadEvidence ?? CARRIED_DEAD_EVIDENCE_NONE
   if (config.resume_enabled === false) {
     // b.jg5 SRJ-707: no resume; the replace step decides on the state last read.
     console.error(`[slack] spawnForPersona: resume_enabled=false for ${ref} — not resuming; replacing its row by a reuse spawn of the same id`)
     return replacePersonaRow(run, lastRead, 'resume_enabled is false')
   }
 
-  // b.4dk: dead-session callers (state=waiting/working with a verified-dead
-  // tmux session) arrive with a LIVE-state AD row. AD's resume verb requires
-  // a terminal row (ended/missing) — otherwise ErrSpawnNotResumable. Run
-  // findMissing first so AD's per-row, evidence-based sweep (agent-director
-  // plan b.93m, t1.93m.hp: degraded-mode guard removed) transitions the dead
-  // row to `missing`, letting resume succeed and preserve session history.
-  // The ended/missing caller does NOT set reconcileMissingFirst (row already
-  // terminal). A refused sweep (b.jg5 SRJ-105: UNAVAILABLE, e.g.
+  // b.4dk: dead-session callers (state=waiting/working, whatever the
+  // verdict's cause) arrive with a LIVE-state AD row. AD's resume verb
+  // requires a terminal row (ended/missing) — otherwise ErrSpawnNotResumable.
+  // Run findMissing first so AD's per-row, evidence-based sweep
+  // (agent-director plan b.93m, t1.93m.hp: degraded-mode guard removed) can
+  // move a row whose process is gone to `missing`, letting resume succeed and
+  // preserve session history. It runs on every such path, for every cause,
+  // dead evidence or not (b.jg5 SRJ-611); only the evidence the path carries
+  // differs. The ended/missing caller does NOT set reconcileMissingFirst (row
+  // already terminal). A refused sweep (b.jg5 SRJ-105: UNAVAILABLE, e.g.
   // ErrCallTimeout, ENVIRONMENT, ErrTmuxNotAvailable, CONFIG,
   // ErrConfigMalformed, SRJ-316, or UNCLASSIFIED, SRJ-313), or a refused
   // post-run `get` of the persona's own row (SRJ-114), stops the attempt
@@ -7961,7 +8321,7 @@ async function resumeOrFreshSpawn(
         noTranscriptReuse(persona, config, err, { isStartup, lastRead, trustPatchRan: true }),
       )
     }
-    if (hasAdErrorName(err, ERR_SPAWN_NOT_RESUMABLE_NAME)) return spawnNotResumableLostRace(key, ref, err)
+    if (hasAdErrorName(err, ERR_SPAWN_NOT_RESUMABLE_NAME)) return spawnNotResumableLostRace(key, ref, err, deadEvidence)
     if (err instanceof ErrSpawnNotFound) {
       // Row vanished between the dead-session verdict and resume (operator
       // action, expire, race) — a plain spawn: the row is already gone.
@@ -8021,12 +8381,14 @@ function deferForUnresolvedConfigDir(persona: Persona, ref: string): SpawnPerson
  * state's site entry (`reportLostRaceAtSite`; the attempt records it), and
  * the uncounted refused result (`failed` marked `refused`): no notice, no
  * `spawn-failed` entry, nothing counted. The persona is re-evaluated at its
- * next tick or retry; the row is not re-read here. Never throws.
+ * next tick or retry; the row is not re-read here. The line names the dead
+ * evidence the path held (`deadEvidence`, `describeDeadEvidence`; b.jg5
+ * SRJ-611). Never throws.
  */
-function spawnNotResumableLostRace(key: string, ref: string, err: unknown): SpawnPersonaResult {
+function spawnNotResumableLostRace(key: string, ref: string, err: unknown, deadEvidence: CarriedDeadEvidence): SpawnPersonaResult {
   const armed = reportLostRaceAtSite(key)
   console.error(
-    `[slack] spawnForPersona: ${describeAgentDirectorFailure(err)} on resume for ${ref} — a lost race: nothing killed, deleted or launched; answering the uncounted refused result, no spawn-failure notice, nothing counted; the retry timer ${armed ? 'is armed' : 'could not be armed'} (cause=${UNAVAILABLE_RETRY_CAUSE_LOST_RACE}; b.jg5 SRJ-710)`,
+    `[slack] spawnForPersona: ${describeAgentDirectorFailure(err)} on resume for ${ref} — a lost race (${describeDeadEvidence(deadEvidence)}): nothing killed, deleted or launched; answering the uncounted refused result, no spawn-failure notice, nothing counted; the retry timer ${armed ? 'is armed' : 'could not be armed'} (cause=${UNAVAILABLE_RETRY_CAUSE_LOST_RACE}; b.jg5 SRJ-710, SRJ-611)`,
   )
   return { key, action: 'failed', refused: true }
 }
@@ -8626,19 +8988,27 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *      nothing is deleted (`noTranscriptReuse`, `reuseFinishedRow`); on
  *      ErrSpawnNotResumable → a lost race (b.jg5 SRJ-710): nothing killed,
  *      deleted or launched, the retry timer armed with the lost-race cause,
- *      the uncounted refused result.
+ *      the uncounted refused result. An escalate-dead verdict the restart
+ *      path carried in (`deadEvidence`) goes with this path, named in one
+ *      line (b.jg5 SRJ-611).
  *    - ended/missing + !resume_enabled → the replace step: a reuse spawn of
  *      the same id.
  *    - waiting → the reconnect (`reconnectMcpWithCause`, one `send-keys`,
  *      b.jg5 SRJ-118); 'dead-session', whatever its cause → the find-missing
  *      run, then resume/fresh-spawn (b.3ce), whose resume or spawn decides
- *      what holds the persona's name; 'transient' → `latched` for a latched
+ *      what holds the persona's name. The route's one line names its cause
+ *      and hands it on (`deadSessionRoute`, b.jg5 SRJ-611): only a
+ *      GONE-based cause (`tmux-gone`) is dead evidence, never
+ *      `row-not-interactive` or `row-absent`, and the find-missing run is
+ *      made for every cause; 'transient' → `latched` for a latched
  *      persona, otherwise the uncounted refused result (`failed` with the
  *      refusal marker): no spawn-failure notice, no `spawn-failed` entry,
  *      nothing counted.
  *    - working → waitForWaitingAndReconnect; its outcome is mapped as the
- *      `waiting` branch maps the reconnect's ('dead-session' and
- *      'transient'); 'not-reconnected' or 'cancelled' (its teardown cancelled
+ *      `waiting` branch maps the reconnect's ('dead-session', with the
+ *      wait's cause: the reconnect's, `row-absent` or `row-read-finished`,
+ *      of which only `tmux-gone` is dead evidence, and 'transient');
+ *      'not-reconnected' or 'cancelled' (its teardown cancelled
  *      the wait) → `not-reconnected` (b.f2b: nothing was typed;
  *      `reconnected` only when `/mcp reconnect` was). `hooks.onWorkingRowWait`
  *      is called as the wait starts (b.f2b).
@@ -8647,7 +9017,9 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *      (b.jdc, b.jg5 SRJ-607, `launchOnPromptRow`), with no tmux call: a
  *      pane, UNAVAILABLE, CONFIG, UNCLASSIFIED or ENVIRONMENT → no-op; GONE
  *      or the row absent (`ErrSpawnNotFound`) → findMissing sweep and a
- *      re-read, and a row now `ended` or `missing` → resume/fresh-spawn
+ *      re-read, and a row now `ended` or `missing` → resume/fresh-spawn,
+ *      carrying `prompt-row-ladder-gone` (dead evidence) after a GONE and
+ *      `row-absent` (not dead evidence) after an absent row (b.jg5 SRJ-611)
  *      (otherwise no-op); CONFLICT or UNUSABLE NAME (the reader latched the
  *      persona) → `latched`.
  *    - pending → no-op when its `config_dir` label matches; a label missing
@@ -8692,12 +9064,24 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *
  * `hooks` belong to the ladder this call starts; a call that joins a launch
  * already in flight gets none of them.
+ *
+ * `deadEvidence` is the escalate-dead verdict the restart path carries into
+ * its relaunch (b.jg5 SRJ-611; absent, none): the ladder keeps it for the
+ * run (decided again from its cause or verdict, `carriedDeadEvidenceOf`),
+ * and every `resumeOrFreshSpawn` call it makes holds dead evidence when that
+ * verdict is dead evidence or the path's own cause is. A call that joins a
+ * launch already in flight gets that launch's result, and its verdict is
+ * dropped with one line. The `sequence-waiting` gate runs before the join
+ * check, so it answers either way; the latched gate runs after it, so it
+ * answers only a call that starts a ladder (a joining call gets the
+ * in-flight launch's result).
  */
 export async function spawnForPersona(
   persona: Persona,
   config: PersonaConfig,
   isStartup = true,
   hooks?: LaunchHooks,
+  deadEvidence?: CarriedDeadEvidence,
 ): Promise<SpawnPersonaResult> {
   const { key } = persona
   const ref = personaRef(persona)
@@ -8707,9 +9091,13 @@ export async function spawnForPersona(
   // A latched persona still gets the latched gate's answer.
   const sequenceWaiting = sequenceWaitingResult(key, ref, 'spawnForPersona')
   if (sequenceWaiting !== undefined) return sequenceWaiting
+  // b.jg5 SRJ-611: decided again from its cause or verdict, so a value cast
+  // past the brand carries only what its source proves.
+  const carriedIn = carriedDeadEvidenceOf(deadEvidence?.source)
   const inFlight = inFlightLaunches.get(key)
   if (inFlight) {
     console.error(`[slack] spawnForPersona: launch already in flight for ${ref} — joining it`)
+    if (carriedIn.source !== DEAD_EVIDENCE_NONE) console.error(joinedLaunchDropsDeadEvidenceLine(ref, carriedIn))
     return inFlight
   }
 
@@ -8748,7 +9136,7 @@ export async function spawnForPersona(
   endPromptRowDeferral(key)
   // b.jg5 SRJ-301: the ladder is a launch attempt; joiners get its result, marker included.
   const launch = runInAttempt(key, 'launch', async (attempt) =>
-    markRefusal(await runPersonaLadder(persona, config, isStartup, ref, configDirLabel, hooks), attempt),
+    markRefusal(await runPersonaLadder(persona, config, isStartup, ref, configDirLabel, hooks, carriedIn), attempt),
   )
   inFlightLaunches.set(key, launch)
   try {
@@ -8762,6 +9150,15 @@ export async function spawnForPersona(
       cancelledComingApprovers.delete(key)
     }
   }
+}
+
+/**
+ * `spawnForPersona`'s line when a call that carried an escalate-dead verdict
+ * (`carried`, b.jg5 SRJ-611) joins persona `ref`'s launch already in flight:
+ * it gets that launch's result, and its verdict is dropped.
+ */
+export function joinedLaunchDropsDeadEvidenceLine(ref: string, carried: CarriedDeadEvidence): string {
+  return `[slack] spawnForPersona: the joining call for ${ref} carried an escalate-dead verdict (${describeDeadEvidence(carried)}) — dropped; it gets the launch in flight's result (b.jg5 SRJ-611)`
 }
 
 /**
@@ -8831,7 +9228,11 @@ export interface LaunchHooks {
   onWorkingRowWait?: () => void
 }
 
-/** One collision ladder for a persona; `spawnForPersona` single-flights it per key. */
+/**
+ * One collision ladder for a persona; `spawnForPersona` single-flights it per
+ * key. `carriedDeadEvidence` is the escalate-dead verdict the restart path
+ * carried in (b.jg5 SRJ-611), kept for the run (`LadderRun`).
+ */
 async function runPersonaLadder(
   persona: Persona,
   config: PersonaConfig,
@@ -8839,6 +9240,7 @@ async function runPersonaLadder(
   ref: string,
   configDirLabel: string,
   hooks: LaunchHooks | undefined,
+  carriedDeadEvidence: CarriedDeadEvidence,
 ): Promise<SpawnPersonaResult> {
   const { key } = persona
   const params = buildSpawnParams(persona, config, configDirLabel)
@@ -8886,7 +9288,7 @@ async function runPersonaLadder(
     }
   }
 
-  return ladderGetThenAct({ persona, config, isStartup, ref, params, hooks, reuseCollisionRerun: false })
+  return ladderGetThenAct({ persona, config, isStartup, ref, params, hooks, reuseCollisionRerun: false, carriedDeadEvidence })
 }
 
 /**
@@ -8978,7 +9380,14 @@ async function ladderGetThenAct(run: LadderRun): Promise<SpawnPersonaResult> {
   }
 
   if (state === 'ended' || state === 'missing') {
-    return resumeOrFreshSpawn(run, row, { lastRead })
+    // b.jg5 SRJ-611: an escalate-dead verdict the restart path carried in
+    // goes with this path, named in one line; with none carried the path
+    // holds none.
+    const { carriedDeadEvidence } = run
+    if (carriedDeadEvidence.source !== DEAD_EVIDENCE_NONE) {
+      console.error(deadSessionRouteLine(ref, state, CARRIED_DEAD_EVIDENCE_NONE, carriedDeadEvidence))
+    }
+    return resumeOrFreshSpawn(run, row, { lastRead, deadEvidence: carriedDeadEvidence })
   }
 
   if (state === 'waiting') {
@@ -8986,14 +9395,13 @@ async function ladderGetThenAct(run: LadderRun): Promise<SpawnPersonaResult> {
     // `get`'s `waiting` as its last read. A 'dead-session' answer, whatever
     // its cause (a GONE `send-keys`, a refusal as not interactive, or no
     // row), takes the find-missing run and then resume/fresh-spawn, whose
-    // resume or spawn decides what holds the persona's name (b.3ce, b.dup):
-    // none of those causes is taken as proof that the worker is gone
-    // (SRJ-609). A 'transient' answer types nothing and counts nothing.
+    // resume or spawn decides what holds the persona's name (b.3ce, b.dup).
+    // The route hands on its own cause: only `tmux-gone` is dead evidence;
+    // `row-not-interactive` and `row-absent` are never taken as proof that
+    // the worker is gone (SRJ-609, SRJ-611). A 'transient' answer types
+    // nothing and counts nothing.
     const result = await reconnectMcpWithCause(key, lastRead, ref)
-    if (result.outcome === 'dead-session') {
-      console.error(`[slack] spawnForPersona: dead session for ${ref} (state=waiting) — recovering via resume/fresh-spawn`)
-      return resumeOrFreshSpawn(run, row, { reconcileMissingFirst: true, lastRead })
-    }
+    if (result.outcome === 'dead-session') return deadSessionRoute(run, row, state, result.deadCause, undefined, lastRead)
     if (result.outcome === 'transient') return transientReconnectResult(key, ref, state, result)
     return { key, action: 'reconnected' }
   }
@@ -9005,29 +9413,29 @@ async function ladderGetThenAct(run: LadderRun): Promise<SpawnPersonaResult> {
     // row reads live at the deadline (a long turn isn't an error), and when
     // the timeout `status` read fails (b.jg5 SRJ-605); 'dead-session' when
     // the row reads ended or missing (or the timeout sweep + status verdict
-    // says so, b.ecw), when its reconnect answered 'dead-session' (any
-    // cause), or when the row is absent (`ErrSpawnNotFound`, b.jg5
-    // SRJ-605): the recovery's resume or spawn then decides what holds the
-    // name; 'transient' when its reconnect was 'transient' or its findMissing
-    // sweep was refused: nothing typed, nothing counted.
+    // says so, b.ecw; cause `row-read-finished`), when its reconnect
+    // answered 'dead-session' (the reconnect's cause), or when the row is
+    // absent (`ErrSpawnNotFound`, b.jg5 SRJ-605; cause `row-absent`): the
+    // recovery's resume or spawn then decides what holds the name, and the
+    // route hands on the wait's cause, of which only the reconnect's
+    // `tmux-gone` is dead evidence (b.jg5 SRJ-611); 'transient' when its
+    // reconnect was 'transient' or its findMissing sweep was refused:
+    // nothing typed, nothing counted.
     // b.f2b: the wait can take up to WAIT_FOR_WAITING_TIMEOUT_MS; tell the
     // caller (the start pass lets the launch go on in the background).
     hooks?.onWorkingRowWait?.()
-    const { outcome, latched, stopping, lastRead: waitRead } = await waitForWaitingAndReconnectWithCause(key, config, ref)
+    const waited = await waitForWaitingAndReconnectWithCause(key, config, ref)
+    const { outcome } = waited
     // b.jg5 SRJ-502, SRJ-608: the persona latched during the wait (a CONFLICT
     // or UNUSABLE NAME at a read, a note its transcript `get` read, or a
     // latch set elsewhere): nothing more for it.
     if (outcome === WAIT_OUTCOME_LATCHED) return { key, action: 'latched' }
+    if (waited.outcome === 'dead-session') {
+      return deadSessionRoute(run, row, state, waited.deadCause, waited.finishedState, waited.lastRead ?? lastRead)
+    }
     // b.jg5 SRJ-205: the evidence read's version re-check decided the stop:
     // no post, no `spawn-failed` entry, nothing counted (as at a resume).
-    if (stopping) return { key, action: 'failed', stopping: true }
-    if (outcome === 'dead-session') {
-      console.error(`[slack] spawnForPersona: dead session for ${ref} (state=working) — recovering via resume/fresh-spawn`)
-      return resumeOrFreshSpawn(run, row, {
-        reconcileMissingFirst: true,
-        lastRead: waitRead ?? lastRead,
-      })
-    }
+    if (waited.stopping) return { key, action: 'failed', stopping: true }
     // b.f2b: report the real outcome, not `reconnected`. A wait its persona's
     // teardown cancelled typed nothing either, and its session is left to
     // the teardown.
@@ -9035,7 +9443,7 @@ async function ladderGetThenAct(run: LadderRun): Promise<SpawnPersonaResult> {
     // b.jg5 SRJ-118: a 'transient' wait (its reconnect's, or a refused
     // findMissing sweep's) types nothing and counts nothing. A `status`
     // error in the wait never gets here (b.jg5 SRJ-605).
-    if (outcome === 'transient') return transientReconnectResult(key, ref, state, latched ? { latched } : {})
+    if (outcome === 'transient') return transientReconnectResult(key, ref, state, waited.latched ? { latched: true } : {})
     return { key, action: 'reconnected' }
   }
 
@@ -10892,16 +11300,20 @@ function createLaunchPool(size: number): <T>(task: () => Promise<T>) => Promise<
  * persona's live-row sequence runs; never `'skipped'`, which would stop the
  * retry timer), which the restart path never counts (SRJ-302). The richer `SpawnPersonaResult` is collapsed here
  * because the restart subsystem only cares about did-it-relaunch.
+ *
+ * `options.deadEvidence` is the escalate-dead verdict the restart path's
+ * relaunch carries (b.jg5 SRJ-611), handed to `spawnForPersona` unchanged;
+ * absent, the launch is as it always was.
  */
 export async function launchSession(
   key: string,
   config: PersonaConfig,
-  options?: { canLaunch?: (key: string) => boolean },
+  options?: { canLaunch?: (key: string) => boolean; deadEvidence?: CarriedDeadEvidence },
 ): Promise<boolean | 'skipped' | 'refused'> {
   if (options?.canLaunch && !options.canLaunch(key)) return 'skipped'
   const persona = config.personas.find((p) => p.key === key)
   if (!persona) return false
-  const result = await spawnForPersona(persona, config, false)
+  const result = await spawnForPersona(persona, config, false, undefined, options?.deadEvidence)
   // b.jg5 SRJ-1015: a latched persona records nothing; the latch stops its retry timer.
   if (result.action === 'deferred' || result.action === 'latched' || result.stopping) return 'skipped'
   // b.jg5 SRJ-706, SRJ-1015: a launch held for P's live-row sequence records

@@ -49,6 +49,7 @@ import {
   reprobeUnknownLine,
   type KillSessionResult,
   type LaunchSessionResult,
+  type ReconnectEscalateDead,
   type ReconnectSessionResult,
   type RestartDeps,
   type RestartRetryOutcome,
@@ -112,6 +113,16 @@ import {
   _resetNow,
   setConflictLatch,
   type ConfigDirUnresolvableHook,
+  CARRIED_DEAD_EVIDENCE_NONE,
+  carriedDeadEvidenceOf,
+  DEAD_SESSION_CAUSE_ROW_READ_FINISHED,
+  deadSessionRouteLine,
+  describeDeadEvidence,
+  ESCALATE_DEAD_VERDICTS,
+  isDeadEvidence,
+  isLiveRowSequenceRunning,
+  type CarriedDeadEvidence,
+  type DeadEvidenceSource,
   type EscalateDeadVerdict,
 } from '../src/session-manager.ts'
 import { FULL_PANE_READ_LINES, PROBE_PANE_READ_LINES } from '../src/pane-read.ts'
@@ -215,6 +226,7 @@ import {
   killFailureLoggedLine,
   killFailureNotice,
   killFailureRecoveryEntry,
+  collided,
   makeRecoveryHarness,
   ordinaryAlertContent,
   personaCallCounts,
@@ -252,6 +264,7 @@ import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director
 import {
   AGENT_DIRECTOR_PENDING_STATE,
   LIVENESS_DEAD_ROW_ENDED,
+  LIVENESS_DEAD_ROW_MISSING,
   LIVENESS_READING_DEAD,
   LIVENESS_READING_DEAD_ENDED,
   LIVENESS_READING_DEAD_INSTALL_GONE,
@@ -314,19 +327,39 @@ type DepsOpts = {
   isSessionConnectedResult?: boolean  // default: false (not yet reconnected)
   hasSessionStreamResult?: boolean  // default: true (stream present — prior semantics)
   launchSessionResult?: LaunchSessionResult  // default: true (launch succeeds); 'skipped': the relaunch gate declined
-  launchSession?: (key: string, cwd: string, sessionId?: string) => Promise<LaunchSessionResult>  // override entire launchSession
+  launchSession?: (key: string, cwd: string, sessionId?: string, deadEvidence?: CarriedDeadEvidence) => Promise<LaunchSessionResult>  // override entire launchSession
   killSession?: (key: string, lastRead: DeadLivenessReading) => Promise<KillSessionResult>  // runs after the capture (e.g. the real kill adapter), given the run's dead reading; its answer is the kill's (default: KILL_SUCCEEDED)
   restartDelay?: number           // default: FAST_DELAY_S
   isShuttingDown?: boolean        // default: false
   onCapReached?: (key: string) => void  // called after the capture (e.g. the real cap-notice function)
 }
 
+/** One `RestartDeps.launchSession` call: `deadEvidence` is present only when the call passed a verdict (b.jg5 SRJ-611). */
+type LaunchSessionCall = { key: string; cwd: string; sessionId: string | undefined; deadEvidence?: CarriedDeadEvidence }
+
+/**
+ * The reconnect adapter's escalate-dead answer carrying `verdict`, the
+ * verdict it swept with, decided by the session manager's own builder (b.jg5
+ * SRJ-611).
+ */
+function escalateDeadWith(verdict: DeadEvidenceSource): ReconnectEscalateDead {
+  return { outcome: 'escalate-dead', deadEvidence: carriedDeadEvidenceOf(verdict) }
+}
+
+/**
+ * The escalate-dead answer of b.d61's GONE-based verdict (a `working` row's
+ * `read-pane` answered GONE): dead evidence, so a `dead` re-probe after it
+ * leads to the checked kill and then the relaunch (b.jg5 SRJ-611).
+ */
+const ESCALATE_DEAD_WORKING_GONE = escalateDeadWith('working-tmux-gone')
+
 function makeDeps(opts: DepsOpts = {}): RestartDeps & {
   isSessionAliveCalls: string[]
   killSessionCalls: string[]
   /** The `dead` reading each `killSession` call was handed (b.jg5 SRJ-501), in call order. */
   killSessionReads: DeadLivenessReading[]
-  launchSessionCalls: Array<{ key: string; cwd: string; sessionId: string | undefined }>
+  /** Each launch call; `deadEvidence` only on a call that carried a verdict (b.jg5 SRJ-611). */
+  launchSessionCalls: LaunchSessionCall[]
   reconnectSessionCalls: string[]
   onCapReachedCalls: string[]
   armRetryTimerCalls: string[]
@@ -334,7 +367,7 @@ function makeDeps(opts: DepsOpts = {}): RestartDeps & {
   const isSessionAliveCalls: string[] = []
   const killSessionCalls: string[] = []
   const killSessionReads: DeadLivenessReading[] = []
-  const launchSessionCalls: Array<{ key: string; cwd: string; sessionId: string | undefined }> = []
+  const launchSessionCalls: LaunchSessionCall[] = []
   const reconnectSessionCalls: string[] = []
   const onCapReachedCalls: string[] = []
   const armRetryTimerCalls: string[] = []
@@ -367,9 +400,9 @@ function makeDeps(opts: DepsOpts = {}): RestartDeps & {
       killSessionReads.push(lastRead)
       return opts.killSession ? opts.killSession(key, lastRead) : KILL_SUCCEEDED
     },
-    async launchSession(key, cwd, sessionId) {
-      launchSessionCalls.push({ key, cwd, sessionId })
-      if (opts.launchSession) return opts.launchSession(key, cwd, sessionId)
+    async launchSession(key, cwd, sessionId, deadEvidence) {
+      launchSessionCalls.push({ key, cwd, sessionId, ...(deadEvidence === undefined ? {} : { deadEvidence }) })
+      if (opts.launchSession) return opts.launchSession(key, cwd, sessionId, deadEvidence)
       return opts.launchSessionResult ?? true
     },
     getRestartDelay: () => opts.restartDelay ?? FAST_DELAY_S,
@@ -1199,8 +1232,9 @@ describe('backoff integration (SR-29.3)', () => {
   //     re-enter scheduleRestart. For 'escalate-dead' (dead-tmux) the adapter
   //     upstream fires CSCB's internal reconcileMissingSweep so the frozen
   //     `working` row reconciles to `missing`; the same restart run then probes
-  //     liveness again and, when the row reads dead, takes the kill+relaunch
-  //     branch at once (b.d61; a row that still reads alive is left to a later
+  //     liveness again and, when the row reads dead, relaunches at once,
+  //     its checked kill first only after a verdict that is dead evidence
+  //     (b.d61, b.jg5 SRJ-611; a row that still reads alive is left to a later
   //     tick) — recovery is internal, not deferred to the external
   //     ~/startup/find-missing-loop.sh (belt-and-braces only; Epic t1.tkk.e4 /
   //     b.sv7). Whether or not that sweep fires, the reconnect verdict path still
@@ -1260,7 +1294,7 @@ describe('backoff integration (SR-29.3)', () => {
 
     // Simulate alive=true with reconnect returning 'escalate-dead'
     const escapingDeps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE })
-    escapingDeps.reconnectSession = async (_key) => 'escalate-dead'
+    escapingDeps.reconnectSession = async (_key) => ESCALATE_DEAD_WORKING_GONE
     initRestart(escapingDeps)
 
     scheduleRestart(KEY, '/cwd/test')
@@ -2407,7 +2441,11 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
     }
 
     expect(runs.outcomes).toEqual(Array(RUNS).fill(RESTART_OUTCOME_RECONNECT_DEFERRED))
+    // b.jg5 SRJ-610, SRJ-611: no kill outside the live-row sequence, and no
+    // sequence started for P either: the escalate-dead verdict (GONE-based,
+    // dead evidence) leads to no kill, delete or launch while the row reads live.
     expect(runs.kills).toEqual([])
+    expect(isLiveRowSequenceRunning(runs.KEY)).toBe(false)
     expect(runs.launches).toEqual([])
     expect(getFailureCount(runs.KEY)).toBe(0)
     expect(raised).toEqual([])
@@ -2535,7 +2573,8 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
    * One persona's restart deps over the real liveness and reconnect adapters
    * and one stub client: its `status` answers `row`, its `read-pane` rejects
    * with `readPaneError`, kill and launch record (the launch answering
-   * `launchResult`), and the arm hook, the slow-recovery observer's notes
+   * `launchResult`, and `carriedIn` the verdict each launch was handed, b.jg5
+   * SRJ-611), and the arm hook, the slow-recovery observer's notes
    * (`notes`, b.jg5 SRJ-610) and the serialized work's outcome are
    * recorded. `tick()` schedules the persona's restart and resolves once its
    * work has run (`awaitRuns`), whenever the timer fires. `stubCalls()`
@@ -2556,6 +2595,7 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
     setClientForTests(stub as unknown as Client)
     const kills: string[] = []
     const launches: string[] = []
+    const carriedIn: Array<CarriedDeadEvidence | undefined> = []
     const armed: string[] = []
     const notes: SlowRecoveryNote[] = []
     const deps: RestartDeps = {
@@ -2565,7 +2605,7 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
       hasSessionStream: () => false,
       reconnectSession: _buildReconnectSessionAdapter(),
       async killSession(key) { kills.push(key); return KILL_SUCCEEDED },
-      async launchSession(key) { launches.push(key); return launchResult },
+      async launchSession(key, _cwd, _sessionId, deadEvidence) { launches.push(key); carriedIn.push(deadEvidence); return launchResult },
       getRestartDelay: () => FAST_DELAY_S,
       isShuttingDown: () => false,
       onCapReached: () => {},
@@ -2578,7 +2618,7 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
     /** The run's pane reads, as `[instance id, lines]`. */
     const paneReads = (): Array<[string, number | undefined]> =>
       log.readPaneCalls.filter((c) => c.claude_instance_id === instanceId).map((c) => [c.claude_instance_id, c.n_lines])
-    return { KEY: persona.key, kills, launches, armed, notes, outcomes, tick: () => tick(persona.key, persona.working_directory), stubCalls, paneReads }
+    return { KEY: persona.key, CWD: persona.working_directory, kills, launches, carriedIn, armed, notes, outcomes, tick: () => tick(persona.key, persona.working_directory), stubCalls, paneReads }
   }
 
   /** The escalate-dead verdict lines (one per sweep the adapter fires); only `verdict`'s, with its evidence text, when given. */
@@ -2595,7 +2635,7 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
   test.each<[string, EscalateDeadVerdict]>([
     ['working', WORKING_TMUX_GONE],
     ['waiting', ESCALATE_DEAD_WAITING_ROW_PANE_GONE],
-  ])('alive (%s) but disconnected, its read-pane answering GONE → one read-pane of its own row, one findMissing sweep (verdict %s) and no send-keys; the re-probe reads the row missing → one noteDead, then one kill and one relaunch in that run, no failure counted, nothing armed, no tmux asked', async (state, verdict) => {
+  ])('alive (%s) but disconnected, its read-pane answering GONE → one read-pane of its own row, one findMissing sweep (verdict %s, dead evidence) and no send-keys; the re-probe reads the row missing → one noteDead, then one kill and one relaunch carrying the verdict in that run, no failure counted, nothing armed, no tmux asked', async (state, verdict) => {
     const run = d61Run(untilSwept(state), errTmuxCaptureFailed())
 
     await run.tick()
@@ -2608,6 +2648,8 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
     expect(escalateLines(verdict)).toHaveLength(1)
     expect(run.kills).toEqual([run.KEY])
     expect(run.launches).toEqual([run.KEY])
+    // b.jg5 SRJ-611: the relaunch carries the GONE-based verdict the adapter swept with.
+    expect(run.carriedIn).toEqual([carriedDeadEvidenceOf(verdict)])
     expect(run.outcomes).toEqual([RESTART_OUTCOME_LAUNCHED])
     // b.jg5 SRJ-610: the re-probe's row read of `missing` ends any slow recovery.
     expect(run.notes).toEqual([['noteDead', run.KEY]])
@@ -2620,9 +2662,10 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
   })
 
   // b.jg5 SRJ-117: the row absent at the read-pane takes the GONE column
-  // without being a GONE. Which verdicts are dead evidence, and so what the
-  // run may kill after one, is not pinned here.
-  test.each(['working', 'waiting'])('alive (%s) but disconnected, its read-pane answering ErrSpawnNotFound → one findMissing sweep with the row-absent verdict and no send-keys; no failure counted, no tmux asked', async (state) => {
+  // without being a GONE. b.jg5 SRJ-611: its verdict is a row read, never dead
+  // evidence, so the re-probe that reads the row missing leads to the
+  // relaunch alone, carrying the verdict, with no kill.
+  test.each(['working', 'waiting'])('alive (%s) but disconnected, its read-pane answering ErrSpawnNotFound → one findMissing sweep with the row-absent verdict and no send-keys; the re-probe reads the row missing → no kill, one relaunch carrying the row-absent verdict; no failure counted, no tmux asked', async (state) => {
     const run = d61Run(untilSwept(state), errSpawnNotFound())
 
     await run.tick()
@@ -2630,6 +2673,13 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
     expect(run.stubCalls()).toEqual({ statusCalls: 3, readPaneCalls: 1, findMissingCalls: 1 })
     expect(escalateLines()).toHaveLength(1)
     expect(escalateLines(ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ)).toHaveLength(1)
+    expect(run.kills).toEqual([])
+    expect(run.launches).toEqual([run.KEY])
+    const carried = carriedDeadEvidenceOf(ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ)
+    expect(run.carriedIn).toEqual([carried])
+    expect(isDeadEvidence(ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ)).toBe(false)
+    expect(errLines.filter((l) => l === relaunchWithoutKillLine(run.KEY, carried))).toHaveLength(1)
+    expect(run.outcomes).toEqual([RESTART_OUTCOME_LAUNCHED])
     expect(getFailureCount(run.KEY)).toBe(0)
     expect(run.armed).toEqual([])
     expect(rawTmux).toEqual([])
@@ -2697,6 +2747,8 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
       expect(raised).toEqual([])
       expect(run.kills).toEqual([run.KEY])
       expect(run.launches).toEqual([run.KEY])
+      // b.jg5 SRJ-611: GONE-based, dead evidence: the relaunch carries it.
+      expect(run.carriedIn).toEqual([carriedDeadEvidenceOf('prompt-row-tmux-gone')])
       expect(run.outcomes).toEqual([RESTART_OUTCOME_LAUNCHED])
       expect(getFailureCount(run.KEY)).toBe(0)
       expect(run.armed).toEqual([])
@@ -2781,9 +2833,11 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
 // and the adapter are the REAL ones over one stub AD client; kill and launch
 // are recording fakes. The reconnect answers 'dead-session' (cause
 // `row-not-interactive`) after one `send-keys`, the adapter sweeps and
-// answers the no-kill escalate-dead verdict, and the re-probe (b.d61)
-// decides: a row read `missing` is relaunched in that same run with no kill
-// (b.jg5 SRJ-609, hatch A2: the refusal never by itself leads to a kill); a
+// answers escalate-dead carrying the `row-not-interactive` verdict, which is
+// not dead evidence (b.jg5 SRJ-611), and the re-probe (b.d61) decides: a row
+// read `missing` is relaunched in that same run with no kill, the relaunch
+// carrying the verdict (b.jg5 SRJ-609, SRJ-611, hatch A2: the refusal never
+// by itself leads to a kill); a
 // row read `pending` (another process's launch may hold it) is left alone,
 // with nothing killed, launched or counted. Before the fix the adapter
 // answered 'transient' after a spawn-failure notice, and the persona stayed
@@ -2836,6 +2890,7 @@ describe('b.dup: a persona whose row is ended just before its reconnect lands is
 
     const killSessionCalls: string[] = []
     const launchSessionCalls: string[] = []
+    const carriedIn: Array<CarriedDeadEvidence | undefined> = []
     initRestart({
       canRestart: () => true,
       isSessionAlive: _buildIsSessionAliveAdapter(() => config),
@@ -2843,7 +2898,7 @@ describe('b.dup: a persona whose row is ended just before its reconnect lands is
       hasSessionStream: () => false,
       reconnectSession: _buildReconnectSessionAdapter(),
       async killSession(key) { killSessionCalls.push(key); return KILL_SUCCEEDED },
-      async launchSession(key) { launchSessionCalls.push(key); return true },
+      async launchSession(key, _cwd, _sessionId, deadEvidence) { launchSessionCalls.push(key); carriedIn.push(deadEvidence); return true },
       getRestartDelay: () => FAST_DELAY_S,
       isShuttingDown: () => false,
       onCapReached: () => {},
@@ -2860,10 +2915,10 @@ describe('b.dup: a persona whose row is ended just before its reconnect lands is
       console.error = orig
     }
     assertNoLeak({ lines })
-    return { KEY, CWD, outcome, sendKeysCalls, findMissingCalls, killSessionCalls, launchSessionCalls, raised, lines }
+    return { KEY, CWD, outcome, sendKeysCalls, findMissingCalls, killSessionCalls, launchSessionCalls, carriedIn, raised, lines }
   }
 
-  test('REPRO: alive (waiting) but disconnected; the keystrokes are refused (ErrSpawnNotInteractive) → one send-keys and one sweep; the re-probe reads the row missing → one relaunch and no kill in that run (b.jg5 SRJ-609, hatch A2); no spawn-failure notice, no failure counted', async () => {
+  test('REPRO: alive (waiting) but disconnected; the keystrokes are refused (ErrSpawnNotInteractive) → one send-keys and one sweep; the re-probe reads the row missing → one relaunch carrying the row-not-interactive verdict and zero kills in that run (b.jg5 SRJ-609, SRJ-611, hatch A2); no spawn-failure notice, no failure counted', async () => {
     const run = await refusedRun('missing')
 
     expect(run.outcome).toBe(RESTART_OUTCOME_LAUNCHED)
@@ -2871,11 +2926,23 @@ describe('b.dup: a persona whose row is ended just before its reconnect lands is
     expect(run.findMissingCalls).toHaveLength(1)
     expect(run.killSessionCalls).toEqual([])
     expect(run.launchSessionCalls).toEqual([run.KEY])
-    expect(run.lines.filter((l) => l === relaunchWithoutKillLine(run.KEY))).toHaveLength(1)
+    // b.jg5 SRJ-611: the relaunch carries the verdict, which the session
+    // manager's decision reads as no dead evidence.
+    const carried = carriedDeadEvidenceOf('row-not-interactive')
+    expect(run.carriedIn).toEqual([carried])
+    expect(isDeadEvidence(run.carriedIn[0]?.source)).toBe(false)
+    expect(run.lines.filter((l) => l === relaunchWithoutKillLine(run.KEY, carried))).toHaveLength(1)
+    // The no-kill line's one literal pin: it names the verdict carried and says it is not dead evidence.
+    expect(relaunchWithoutKillLine(run.KEY, carried)).toBe(
+      `[slack] No kill before the relaunch for persona=${run.KEY} — its escalate-dead verdict (verdict=row-not-interactive) is not dead evidence, which never by itself leads to a kill; the relaunch's own row read decides (b.jg5 SRJ-609, SRJ-611)`,
+    )
+    expect(relaunchWithoutKillLine(run.KEY)).toBe(
+      `[slack] No kill before the relaunch for persona=${run.KEY} — its escalate-dead verdict (none carried) is not dead evidence, which never by itself leads to a kill; the relaunch's own row read decides (b.jg5 SRJ-609, SRJ-611)`,
+    )
     // The relaunch line names no kill, built by the relaunch-line builder's
-    // no-kill form (b.jg5 SRJ-609); its text is pinned literally.
+    // no-kill form (b.jg5 SRJ-611); its text is pinned literally.
     const noKillLine = relaunchAfterKillLine(run.KEY, run.CWD, RELAUNCH_KILL_NONE)
-    expect(noKillLine).toBe(`[slack] Relaunching session for persona=${run.KEY} cwd="${run.CWD}" — kill: none (b.jg5 SRJ-609)`)
+    expect(noKillLine).toBe(`[slack] Relaunching session for persona=${run.KEY} cwd="${run.CWD}" — kill: none (b.jg5 SRJ-611)`)
     expect(run.lines.filter((l) => l === noKillLine)).toHaveLength(1)
     expect(run.lines.filter((l) => l.startsWith(`[slack] Relaunching session for persona=${run.KEY} `))).toEqual([noKillLine])
     expect(run.raised).toEqual([])
@@ -2892,10 +2959,68 @@ describe('b.dup: a persona whose row is ended just before its reconnect lands is
     expect(run.findMissingCalls).toHaveLength(1)
     expect(run.killSessionCalls).toEqual([])
     expect(run.launchSessionCalls).toEqual([])
-    expect(run.lines.filter((l) => l === relaunchWithoutKillLine(run.KEY))).toEqual([])
+    expect(run.lines.filter((l) => l.startsWith(`[slack] No kill before the relaunch for persona=${run.KEY} `))).toEqual([])
     expect(run.lines.filter((l) => l.startsWith(`[slack] Relaunching session for persona=${run.KEY} `))).toEqual([])
     expect(run.raised).toEqual([])
     expect(getFailureCount(run.KEY)).toBe(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-611 (and SRJ-1304: the harness binds the restart dependencies as
+// `main()` binds them): the relaunch after an escalate-dead answer hands the
+// ladder the verdict the reconnect adapter swept with. P's row reads
+// `working` until that sweep and `missing` after it, and its `read-pane`
+// answers the case's failure. The relaunch's optimistic spawn collides, its
+// collision `get` reads the row `missing` and its `resume` answers
+// `ErrSpawnNotResumable`, so the ladder's finished-row route logs the verdict
+// carried in (`deadSessionRouteLine`) and the lost race names the dead
+// evidence the path holds; the launch is refused and counted nowhere. A
+// GONE-based verdict keeps its checked kill; a row-absent one makes none.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-611: on the recovery harness, the relaunch after escalate-dead hands the ladder its verdict', () => {
+  let harness: RecoveryHarness | undefined
+
+  afterEach(() => {
+    const h = harness
+    harness = undefined
+    if (h === undefined) return
+    try {
+      assertNoLeak(h.captured())
+    } finally {
+      h.cleanup()
+    }
+    expect(h.clock.pendingCount()).toBe(0)
+  })
+
+  test.each<[string, () => Error, EscalateDeadVerdict, number]>([
+    ['GONE (ErrTmuxCaptureFailed): its verdict is dead evidence → one checked kill, then the relaunch', () => errTmuxCaptureFailed(), 'working-tmux-gone', 1],
+    ['the row absent (ErrSpawnNotFound): its verdict is a row read → no kill, the relaunch alone', () => errSpawnNotFound(), ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, 0],
+  ])('P\'s working row\'s read-pane answers %s carrying the verdict into the ladder', async (_label, answer, verdict, kills) => {
+    const h = (harness = makeRecoveryHarness({ alertThresholdMs: false }))
+    const persona = h.config.personas[0]!
+    const p = persona.key
+    const calls = h.stub.calls
+    h.script({
+      ...collided(h, persona, { state: LIVENESS_DEAD_ROW_MISSING }),
+      statusFn: () => cannedStatusResult({ state: calls.findMissingCalls.length > 0 ? LIVENESS_DEAD_ROW_MISSING : 'working' }),
+      readPaneError: answer(),
+      resumeError: errSpawnNotResumable(),
+    })
+
+    expect(await runRestartRetry(p, persona.working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
+
+    const carried = carriedDeadEvidenceOf(verdict)
+    const ref = renderPersonaRef(persona.name, p)
+    expect(calls.killCalls).toHaveLength(kills)
+    expect(calls.resumeCalls).toHaveLength(1)
+    expect(h.errors.filter((l) => l.startsWith(`[slack] spawnForPersona: dead session for ${ref} `))).toEqual([
+      deadSessionRouteLine(ref, LIVENESS_DEAD_ROW_MISSING, CARRIED_DEAD_EVIDENCE_NONE, carried),
+    ])
+    expect(h.errors.filter((l) => l.includes(` on resume for ${ref} — a lost race (${describeDeadEvidence(carried)}): `))).toHaveLength(1)
+    expect(calls.deleteCalls).toEqual([])
+    await h.settle()
   })
 })
 
@@ -2995,8 +3120,13 @@ describe('b.jg5 SRJ-118, SRJ-609: the reconnect\'s transient and latching answer
 // after the re-probe, since it is an async agent-director call. Each run tells
 // a recording slow-recovery observer what it read (b.jg5 SRJ-610). The deps
 // are `makeDeps` fakes: the first probe reads `live` and the reconnect answers
-// 'escalate-dead'. Each case awaits its run's end (`awaitRuns`). The re-probe
-// lines are the exported builders'.
+// escalate-dead carrying b.d61's GONE-based verdict (`working-tmux-gone`)
+// unless a case gives another answer. b.jg5 SRJ-611: the relaunch carries
+// the verdict the answer carried into the ladder, and only a GONE-based
+// verdict, dead evidence, is preceded by the checked kill; after any other
+// verdict, or a bare 'escalate-dead' that carries none, a `dead` re-probe
+// leads to the relaunch alone. Each case awaits its run's end (`awaitRuns`).
+// The re-probe lines are the exported builders'.
 // ---------------------------------------------------------------------------
 
 describe('b.d61: after an escalate-dead reconnect, the restart run probes liveness again', () => {
@@ -3023,9 +3153,14 @@ describe('b.d61: after an escalate-dead reconnect, the restart run probes livene
 
   /**
    * makeDeps whose first liveness probe reads `live`, whose reconnect answers
-   * 'escalate-dead', and whose re-probe runs `reprobe`.
+   * `answer` (default: escalate-dead carrying the GONE-based
+   * `working-tmux-gone`), and whose re-probe runs `reprobe`.
    */
-  function makeEscalateDeps(reprobe: () => Promise<LivenessReading>, opts: DepsOpts = {}): ReturnType<typeof makeDeps> {
+  function makeEscalateDeps(
+    reprobe: () => Promise<LivenessReading>,
+    opts: DepsOpts = {},
+    answer: ReconnectSessionResult = ESCALATE_DEAD_WORKING_GONE,
+  ): ReturnType<typeof makeDeps> {
     const deps = makeDeps(opts)
     deps.isSessionAlive = async (key) => {
       deps.isSessionAliveCalls.push(key)
@@ -3033,7 +3168,7 @@ describe('b.d61: after an escalate-dead reconnect, the restart run probes livene
     }
     deps.reconnectSession = async (key) => {
       deps.reconnectSessionCalls.push(key)
-      return 'escalate-dead'
+      return answer
     }
     return deps
   }
@@ -3121,6 +3256,8 @@ describe('b.d61: after an escalate-dead reconnect, the restart run probes livene
     expect(deps.reconnectSessionCalls).toEqual([KEY])
     expect(deps.killSessionCalls).toEqual(relaunched ? [KEY] : [])
     expect(deps.launchSessionCalls.map((c) => c.key)).toEqual(relaunched ? [KEY] : [])
+    // b.jg5 SRJ-611: the relaunch carries the GONE-based verdict the answer carried.
+    expect(deps.launchSessionCalls.map((c) => c.deadEvidence)).toEqual(relaunched ? [ESCALATE_DEAD_WORKING_GONE.deadEvidence] : [])
     // The re-probe's note, told before the same run's kill and relaunch.
     expect(timeline).toEqual([...notes, ...(relaunched ? [['kill', KEY], ['launch', KEY]] : [])])
     expect(getFailureCount(KEY)).toBe(relaunched ? 2 : 1)
@@ -3174,6 +3311,59 @@ describe('b.d61: after an escalate-dead reconnect, the restart run probes livene
     expect(notes).toEqual([])
   })
 
+  // b.jg5 SRJ-611, SRJ-609 (hatch A2): every verdict the reconnect adapter
+  // can answer escalate-dead with (each `EscalateDeadVerdict`, and the prompt
+  // row's 10-minute sweep's `row-read-finished`), and the bare
+  // 'escalate-dead' that carries none, then a `dead` re-probe: exactly one
+  // relaunch, which receives the verdict unchanged (none for the bare
+  // answer). Only a GONE-based verdict gets the checked kill first; any
+  // other gets no kill and the no-kill line naming it.
+  const GONE_BASED_VERDICTS: ReadonlySet<DeadEvidenceSource> = new Set<EscalateDeadVerdict>(['dead-session', 'working-tmux-gone', ESCALATE_DEAD_WAITING_ROW_PANE_GONE, 'prompt-row-tmux-gone'])
+  const ADAPTER_VERDICTS: readonly DeadEvidenceSource[] = [...ESCALATE_DEAD_VERDICTS, DEAD_SESSION_CAUSE_ROW_READ_FINISHED]
+  const CARRIED_VERDICTS: ReadonlyArray<readonly [string, ReconnectSessionResult, CarriedDeadEvidence | undefined, boolean]> = [
+    ...ADAPTER_VERDICTS.map((verdict) => [`the verdict ${verdict}`, escalateDeadWith(verdict), carriedDeadEvidenceOf(verdict), GONE_BASED_VERDICTS.has(verdict)] as const),
+    ['no verdict (a bare escalate-dead)', 'escalate-dead', undefined, false],
+  ]
+
+  test.each(CARRIED_VERDICTS)('b.jg5 SRJ-611: escalate-dead carrying %s, then a dead re-probe → exactly one relaunch, which receives that verdict; the checked kill before it only for a GONE-based verdict (dead evidence)', async (_label, answer, carried, killed) => {
+    const timeline: unknown[] = []
+    const deps = makeEscalateDeps(async () => LIVENESS_READING_DEAD_MISSING, timelineOpts(timeline), answer)
+    const run = awaitRuns(deps)
+    initRestart(deps)
+
+    await run.tick(KEY, CWD)
+
+    expect(deps.isSessionAliveCalls).toEqual([KEY, KEY])
+    expect(timeline).toEqual([...(killed ? [['kill', KEY]] : []), ['launch', KEY]])
+    expect(deps.launchSessionCalls).toEqual([{ key: KEY, cwd: CWD, sessionId: undefined, ...(carried === undefined ? {} : { deadEvidence: carried }) }])
+    // The session manager's decision reads the carried verdict as the run did.
+    expect(carried !== undefined && isDeadEvidence(carried.source)).toBe(killed)
+    expect(lines().filter((l) => l === relaunchWithoutKillLine(KEY, carried))).toHaveLength(killed ? 0 : 1)
+    expect(lines().filter((l) => l.startsWith(`[slack] Relaunching session for persona=${KEY} `))).toEqual([
+      relaunchAfterKillLine(KEY, CWD, killed ? KILL_SUCCEEDED : RELAUNCH_KILL_NONE),
+    ])
+    assertNoLeak({ errArgs })
+  })
+
+  // b.jg5 SRJ-610 (no kill outside the live-row sequence): after any
+  // escalate-dead answer, a re-probe that does not read `dead` kills and
+  // relaunches nothing.
+  test.each(CARRIED_VERDICTS.flatMap(([label, answer]) => ([
+    ['live', LIVENESS_READING_LIVE],
+    ['pending', LIVENESS_READING_PENDING],
+    ['unknown', LIVENESS_READING_UNKNOWN],
+  ] as const).map(([reads, reading]) => [label, reads, answer, reading] as const)))('b.jg5 SRJ-611: escalate-dead carrying %s, then a re-probe reading %s → no kill and no relaunch', async (_label, _reads, answer, reading) => {
+    const deps = makeEscalateDeps(async () => reading, {}, answer)
+    const run = awaitRuns(deps)
+    initRestart(deps)
+
+    await run.tick(KEY, CWD)
+
+    expect(deps.isSessionAliveCalls).toEqual([KEY, KEY])
+    expect(deps.killSessionCalls).toEqual([])
+    expect(deps.launchSessionCalls).toEqual([])
+  })
+
   // b.jg5 SRJ-610: the slow-recovery observer (`RestartDeps.slowRecovery`)
   // beyond the re-probe: a dead first probe, a reconnect ending with another
   // verdict, a pending first probe and a session already connected, the runs
@@ -3194,6 +3384,8 @@ describe('b.d61: after an escalate-dead reconnect, the restart run probes livene
       expect(deps.isSessionAliveCalls).toEqual([KEY])
       expect(deps.reconnectSessionCalls).toEqual([])
       expect(timeline).toEqual([note, ['kill', KEY], ['launch', KEY]])
+      // b.jg5 SRJ-611: no escalate-dead answer, so the relaunch carries no verdict.
+      expect(deps.launchSessionCalls).toEqual([{ key: KEY, cwd: CWD, sessionId: undefined }])
       expect(run.outcomes).toEqual([RESTART_OUTCOME_COUNTED_FAILURE])
     })
 
@@ -3260,7 +3452,7 @@ describe('b.d61: after an escalate-dead reconnect, the restart run probes livene
         (deps) => {
           let latched = false
           deps.isLatched = () => latched
-          deps.reconnectSession = async () => { latched = true; return 'escalate-dead' }
+          deps.reconnectSession = async () => { latched = true; return ESCALATE_DEAD_WORKING_GONE }
         },
         RESTART_OUTCOME_LATCHED,
       ],
@@ -4770,8 +4962,8 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
     ['the reconnect is transient → reconnect-deferred, nothing counted', 'transient', LIVENESS_READING_LIVE, RESTART_OUTCOME_RECONNECT_DEFERRED, 1],
     ['the reconnect answers pending (b.jg5 SRJ-303: the row not started yet) → pending-deferred, nothing counted', 'pending', LIVENESS_READING_LIVE, RESTART_OUTCOME_PENDING_DEFERRED, 1],
     ['the reconnect gives no answer → reconnect-deferred, nothing counted', undefined, LIVENESS_READING_LIVE, RESTART_OUTCOME_RECONNECT_DEFERRED, 1],
-    ['escalate-dead and the row still reads live → reconnect-deferred, nothing counted', 'escalate-dead', LIVENESS_READING_LIVE, RESTART_OUTCOME_RECONNECT_DEFERRED, 1],
-    ['escalate-dead and the row now reads dead → a kill and a launch in the same retry, launched', 'escalate-dead', LIVENESS_READING_DEAD, RESTART_OUTCOME_LAUNCHED, 0],
+    ['a GONE-based escalate-dead and the row still reads live → reconnect-deferred, nothing counted', ESCALATE_DEAD_WORKING_GONE, LIVENESS_READING_LIVE, RESTART_OUTCOME_RECONNECT_DEFERRED, 1],
+    ['a GONE-based escalate-dead and the row now reads dead → a kill and a launch carrying the verdict in the same retry, launched', ESCALATE_DEAD_WORKING_GONE, LIVENESS_READING_DEAD, RESTART_OUTCOME_LAUNCHED, 0],
   ])('alive but not connected: %s', async (_label, verdict, reprobe, outcome, count) => {
     recordFailure(P)
     const deps = retryDeps()
@@ -4784,9 +4976,10 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
 
     expect(deps.reconnectSessionCalls).toEqual([P])
     const relaunched = outcome === RESTART_OUTCOME_LAUNCHED
-    expect(deps.isSessionAliveCalls).toHaveLength(verdict === 'escalate-dead' ? 2 : 1)
+    expect(deps.isSessionAliveCalls).toHaveLength(verdict === ESCALATE_DEAD_WORKING_GONE ? 2 : 1)
     expect(deps.killSessionCalls).toEqual(relaunched ? [P] : [])
     expect(deps.launchSessionCalls.map((c) => c.key)).toEqual(relaunched ? [P] : [])
+    expect(deps.launchSessionCalls.map((c) => c.deadEvidence)).toEqual(relaunched ? [ESCALATE_DEAD_WORKING_GONE.deadEvidence] : [])
     expect(getFailureCount(P)).toBe(count)
   })
 
@@ -5235,7 +5428,7 @@ describe('b.jg5 SRJ-314: an unknown or thrown liveness probe kills and launches 
       deps.isSessionAliveCalls.push(key)
       return deps.isSessionAliveCalls.length === 1 ? LIVENESS_READING_LIVE : reprobe()
     }
-    deps.reconnectSession = async (key) => { deps.reconnectSessionCalls.push(key); return 'escalate-dead' }
+    deps.reconnectSession = async (key) => { deps.reconnectSessionCalls.push(key); return ESCALATE_DEAD_WORKING_GONE }
     initRestart(deps)
 
     expect(await runRestartRetry(P, CWD, notInFlight)).toBe(outcome)
@@ -5733,7 +5926,7 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNAVAILABLE or UNCLASSIFIED kill, send-keys
       }
       deps.reconnectSession = async (key) => {
         deps.reconnectSessionCalls.push(key)
-        return 'escalate-dead'
+        return ESCALATE_DEAD_WORKING_GONE
       }
       initRestart(deps)
 
@@ -6532,7 +6725,7 @@ describe('b.jg5 SRJ-502: the restart path makes no attempt for a latched persona
       deps.reconnectSession = async (key) => {
         deps.reconnectSessionCalls.push(key)
         if (during === 'reconnect') makeLatched(deps)
-        return 'escalate-dead'
+        return ESCALATE_DEAD_WORKING_GONE
       }
       initRestart(deps)
 
@@ -6571,7 +6764,7 @@ describe('b.jg5 SRJ-502: the restart path makes no attempt for a latched persona
       }
       deps.reconnectSession = async (key) => {
         deps.reconnectSessionCalls.push(key)
-        return 'escalate-dead'
+        return ESCALATE_DEAD_WORKING_GONE
       }
       initRestart(deps)
 
@@ -6822,7 +7015,7 @@ describe('b.jg5 SRJ-706, SRJ-303: the restart path makes no attempt while P\'s l
     }
     deps.reconnectSession = async (key) => {
       deps.reconnectSessionCalls.push(key)
-      return 'escalate-dead'
+      return ESCALATE_DEAD_WORKING_GONE
     }
     initRestart(deps)
 

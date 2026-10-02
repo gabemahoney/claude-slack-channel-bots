@@ -52,7 +52,10 @@
  *   `_buildKillSessionAdapter`, over the applied-persona lookup, the kill
  *   adapter with the kill-retry clock below) and
  *   `launchSession` over the applied configuration with the relaunch gate as
- *   `canLaunch`. `getRestartDelay` answers the configuration's
+ *   `canLaunch` and, as `main()` binds it, the escalate-dead verdict the
+ *   restart work hands a relaunch passed on unchanged as `deadEvidence`
+ *   (b.jg5 SRJ-611), so a relaunch after an escalation carries its verdict
+ *   into the ladder. `getRestartDelay` answers the configuration's
  *   `session_restart_delay` (0 by default). `onCapReached` records the key in
  *   `capReached` and then, as `main()` binds it, calls
  *   `notifyRestartCapReached`, whose notice lands in `notices`, and ends the
@@ -1530,7 +1533,9 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     hasSessionStream: (key) => connected.has(key),
     reconnectSession: _buildReconnectSessionAdapter(appliedPersona),
     killSession: _buildKillSessionAdapter(appliedPersona, killRetryClock),
-    launchSession: (key) => launchSession(key, appliedConfig(), { canLaunch: canRelaunch }),
+    // As main() binds it: the verdict an escalate-dead relaunch carries is
+    // passed on unchanged, into the ladder (b.jg5 SRJ-611).
+    launchSession: (key, _cwd, _sessionId, deadEvidence) => launchSession(key, appliedConfig(), { canLaunch: canRelaunch, deadEvidence }),
     getRestartDelay: () => config.session_restart_delay,
     isShuttingDown: () => shuttingDown,
     // As main() binds it, after recording the key: the cap notice, then the

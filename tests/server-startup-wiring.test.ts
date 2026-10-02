@@ -1721,14 +1721,24 @@ describe('server.ts gates every relaunch on the persona\'s connection (SR-6.1) a
     expect(onlyCallProps('initRestart').get('canRestart')).toBe(constOf('createPersonaRelaunchGate'))
   })
 
-  test('the restart module\'s launch passes the live applied config (read at call time, SR-8.6) and the gate to launchSession as canLaunch', () => {
+  test('the restart module\'s launch passes the live applied config (read at call time, SR-8.6), the gate to launchSession as canLaunch, and the escalate-dead verdict it is handed as deadEvidence (b.jg5 SRJ-611)', () => {
     const gate = constOf('createPersonaRelaunchGate')
-    expect(onlyCallProps('initRestart').get('launchSession')).toContain('launchSession(')
+    const binding = onlyCallProps('initRestart').get('launchSession')!
+    expect(binding).toContain('launchSession(')
     const args = onlyCallArgs('launchSession')
     expect(args).toHaveLength(3)
     // The live applied set a confirmed reload swaps, never the start-time config.
     expect(args[1]).toBe(loadedConfigName(SERVER_CODE))
-    expect(objectProperties(args[2]!).get('canLaunch')).toBe(gate)
+    const options = objectProperties(args[2]!)
+    expect(options.get('canLaunch')).toBe(gate)
+    // The binding's fourth parameter, `RestartDeps.launchSession`'s verdict,
+    // is what it passes on, unchanged: the relaunch after an escalate-dead
+    // answer carries that verdict into the ladder.
+    const params = splitTopLevel(binding.slice(...balancedAfter(binding, 0, '(', ')')))
+    expect(params).toHaveLength(4)
+    expect(params[0]).toBe(args[0])
+    expect(options.get('deadEvidence')).toBe(params[3])
+    expect([...options.keys()].sort()).toEqual(['canLaunch', 'deadEvidence'])
   })
 
   // Bug b.g57: the adapter's persona lookup is optional; without it a restart

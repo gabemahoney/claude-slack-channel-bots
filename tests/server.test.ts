@@ -215,6 +215,11 @@ import {
   setKillFailureAlerts,
   setSessionNotifier,
   spawnForPersona,
+  carriedDeadEvidenceOf,
+  DEAD_SESSION_CAUSE_ROW_READ_FINISHED,
+  isDeadEvidence,
+  promptRowSweepFinishedLine,
+  type DeadEvidenceSource,
   type EscalateDeadVerdict,
 } from '../src/session-manager.ts'
 import {
@@ -264,7 +269,7 @@ import {
   killRetryTryLine,
 } from '../src/kill-retry.ts'
 import type { ClientOptions, FindMissingParams, FindMissingResult, GetParams, KillParams, ReadPaneParams, ReadPaneResult, ResumeParams, SendKeysParams, SendKeysResult, SpawnParams, StatusParams } from 'agent-director'
-import { KILL_SESSION_NOT_KILLED_GUARD, RECONNECT_ESCALATE_DEAD_NO_KILL, type KillSessionResult } from '../src/restart.ts'
+import { KILL_SESSION_NOT_KILLED_GUARD, type KillSessionResult, type ReconnectEscalateDead } from '../src/restart.ts'
 import {
   UNAVAILABLE_RETRY_CAUSE_CONFIG,
   UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
@@ -1440,6 +1445,9 @@ async function capturingErrorArgs<T>(fn: () => Promise<T>): Promise<{ result: T;
   }
 }
 
+/** Every answer the reconnect adapter (`_buildReconnectSessionAdapter`) gives. */
+type AdapterAnswer = Awaited<ReturnType<ReturnType<typeof _buildReconnectSessionAdapter>>>
+
 /** The lines `errArgs` holds, each argument a string (a raw error or object fails). */
 function stringLines(errArgs: unknown[][]): string[] {
   return errArgs.map((args) => {
@@ -1466,8 +1474,8 @@ function stringLines(errArgs: unknown[][]): string[] {
 // status probe uses, so the shared stub's `sendKeysCalls` is the observable
 // seam for "was a reconnect attempted", and `sendKeysResult`/`sendKeysError`
 // drive the mapping (b.jg5 SRJ-118, SRJ-609): ok → 'success'; dead-session
-// → one sweep with its cause's verdict, then 'escalate-dead' (or
-// `RECONNECT_ESCALATE_DEAD_NO_KILL` for `row-not-interactive`); transient →
+// → one sweep with its cause's verdict, then an escalate-dead answer carrying
+// that verdict (b.jg5 SRJ-611); transient →
 // 'transient' with no sweep. The reconnect is one `send-keys`, never retried,
 // with no tmux server start.
 //
@@ -1639,6 +1647,12 @@ describe('_buildReconnectSessionAdapter', () => {
   /** The escalate-dead sweep line for persona C1 with `verdict`, from the imported builder. */
   const escalateDeadLine = (verdict: EscalateDeadVerdict): string => escalateDeadSweepLine('C1', verdict)
 
+  /**
+   * The adapter's escalate-dead answer carrying `verdict`, the verdict it
+   * swept with, decided by the session manager's own builder (b.jg5 SRJ-611).
+   */
+  const escalatedWith = (verdict: DeadEvidenceSource): ReconnectEscalateDead => ({ outcome: 'escalate-dead', deadEvidence: carriedDeadEvidenceOf(verdict) })
+
   /** C1's `read-pane` answering GONE: agent-director found no pane of its launch. */
   const paneGone = (): Error => errTmuxCaptureFailed(personaTmuxSessionName('C1'))
 
@@ -1708,7 +1722,7 @@ describe('_buildReconnectSessionAdapter', () => {
 
     const { result, errArgs } = await capturingErrorArgs(() => adapter('C1'))
 
-    expect(result).toBe('escalate-dead')
+    expect(result).toEqual(escalatedWith('working-tmux-gone'))
     expect(statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
     // One read of the persona's own row; no raw tmux command.
     expect(readPaneCalls).toEqual(fullPaneReads(1))
@@ -1790,7 +1804,7 @@ describe('_buildReconnectSessionAdapter', () => {
     const lines: string[] = []
     const orig = console.error
     console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
-    let result: string | undefined
+    let result: AdapterAnswer | undefined
     try {
       result = await adapter('C1')
     } finally {
@@ -1828,7 +1842,7 @@ describe('_buildReconnectSessionAdapter', () => {
     const lines: string[] = []
     const orig = console.error
     console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
-    let result: string | undefined
+    let result: AdapterAnswer | undefined
     try {
       result = await adapter('C1')
     } finally {
@@ -1904,7 +1918,7 @@ describe('_buildReconnectSessionAdapter', () => {
     // branch.
     const h = await reconnectCapturing({ sendKeysThrows: errTmuxSendKeys() })
 
-    expect(h.result).toBe('escalate-dead')
+    expect(h.result).toEqual(escalatedWith('dead-session'))
     // The one keystroke answered GONE; the line says what was observed, not
     // that the tmux session is provably dead.
     const lines = stringLines(h.errArgs)
@@ -1924,7 +1938,7 @@ describe('_buildReconnectSessionAdapter', () => {
   test("ErrSpawnNotFound at the send-keys (no row) → dead-session (row-absent) → 'escalate-dead' with one sweep whose verdict is the row-absent one, never the GONE one; one send-keys; no notice", async () => {
     const h = await reconnectCapturing({ sendKeysThrows: errSpawnNotFound() })
 
-    expect(h.result).toBe('escalate-dead')
+    expect(h.result).toEqual(escalatedWith(ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ))
     const lines = stringLines(h.errArgs)
     expect(escalateDeadLines(lines)).toEqual([escalateDeadLine(ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ)])
     expect(escalateDeadLines(lines)[0]).not.toContain(ESCALATE_DEAD_EVIDENCE['dead-session'])
@@ -2000,19 +2014,19 @@ describe('_buildReconnectSessionAdapter', () => {
   // after the adapter read it (here `waiting`, or `missing` when the sweep
   // landed between the liveness probe and the adapter's status read) and
   // before its keystrokes land. The reconnect answers 'dead-session' (cause
-  // `row-not-interactive`), so the adapter sweeps and escalates with
-  // `RECONNECT_ESCALATE_DEAD_NO_KILL`: a route into the restart run's
-  // decision only, whose `dead` re-probe relaunches the persona with no kill
-  // (restart.test.ts, b.dup; b.jg5 SRJ-609). Before the fix: 'transient' and
-  // a spawn-failure notice.
+  // `row-not-interactive`), so the adapter sweeps and escalates carrying the
+  // `row-not-interactive` verdict, which is not dead evidence: a route into
+  // the restart run's decision only, whose `dead` re-probe relaunches the
+  // persona with no kill (restart.test.ts, b.dup; b.jg5 SRJ-609, SRJ-611).
+  // Before the fix: 'transient' and a spawn-failure notice.
   // b.jdc (b.dup review): the escalate-dead line says why. Here the tmux
   // session may well be alive: agent-director refused the keystrokes because
   // the row is not interactive, so the line must not claim the tmux session is
   // provably dead (REPRO for the wording: the old line always did).
-  test.each(['waiting', 'missing'])("REPRO (b.dup): the row reads %s and the reconnect's keystrokes are refused (ErrSpawnNotInteractive) → the no-kill escalate-dead answer with one sweep and one send-keys (no second try, no tmux call); no spawn-failure notice; the escalate-dead line carries the row-not-interactive verdict's text", async (state) => {
+  test.each(['waiting', 'missing'])("REPRO (b.dup): the row reads %s and the reconnect's keystrokes are refused (ErrSpawnNotInteractive) → the escalate-dead answer carrying the row-not-interactive verdict with one sweep and one send-keys (no second try, no tmux call); no spawn-failure notice; the escalate-dead line carries the row-not-interactive verdict's text", async (state) => {
     const h = await reconnectCapturing({ statusState: state, sendKeysThrows: errSpawnNotInteractive('send-keys') })
 
-    expect(h.result).toBe(RECONNECT_ESCALATE_DEAD_NO_KILL)
+    expect(h.result).toEqual(escalatedWith('row-not-interactive'))
     expect(h.sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
     expect(h.findMissingCalls).toHaveLength(1)
     expect(h.raised).toEqual([])
@@ -2187,8 +2201,8 @@ describe('_buildReconnectSessionAdapter', () => {
     })
 
     /** Attempt a reconnect of C1 `n` times, `stepMs` apart; the verdicts in order. */
-    async function attempts(adapter: (key: string) => Promise<string>, n: number, stepMs: number): Promise<string[]> {
-      const verdicts: string[] = []
+    async function attempts(adapter: (key: string) => Promise<AdapterAnswer>, n: number, stepMs: number): Promise<AdapterAnswer[]> {
+      const verdicts: AdapterAnswer[] = []
       for (let i = 0; i < n; i++) {
         if (i > 0) await clock.advance(stepMs)
         verdicts.push(await adapter('C1'))
@@ -2457,7 +2471,7 @@ describe('_buildReconnectSessionAdapter', () => {
     }
 
     /** One attempt for C1 (its lines kept for the leak check): its verdict and lines; with `inside`, run inside C1's recovery attempt (as the restart run calls it). */
-    async function attempt(h: Harness, inside = false): Promise<{ verdict: string; lines: string[] }> {
+    async function attempt(h: Harness, inside = false): Promise<{ verdict: AdapterAnswer; lines: string[] }> {
       const r = await capturingErrorArgs(() => (inside ? runInAttempt('C1', 'recovery', () => h.adapter('C1')) : h.adapter('C1')))
       errArgs.push(...r.errArgs)
       return { verdict: r.result, lines: stringLines(r.errArgs) }
@@ -2579,7 +2593,7 @@ describe('_buildReconnectSessionAdapter', () => {
     async function workingAfterRun(
       answer: Error,
       { then = [], inside = false }: { then?: CannedResponse<ReadPaneResult>[]; inside?: boolean } = {},
-    ): Promise<{ h: Harness; verdict: string; lines: string[] }> {
+    ): Promise<{ h: Harness; verdict: AdapterAnswer; lines: string[] }> {
       const h = cellHarness('working', { pane: IDLE_PANE, row: endedTranscript(), paneQueue: [cannedOk({ pane: IDLE_PANE }), cannedErr(answer), ...then] })
       expect((await attempt(h)).verdict).toBe('transient')
       expect(hasPendingWorkingRowEvidence('C1')).toBe(true)
@@ -2770,7 +2784,7 @@ describe('_buildReconnectSessionAdapter', () => {
 
       const { verdict, lines } = await attempt(h)
 
-      expect(verdict).toBe('escalate-dead')
+      expect(verdict).toEqual(escalatedWith(escalateVerdict))
       expect(h.sendKeysCalls).toEqual([])
       expect(h.readPaneCalls).toEqual(fullPaneReads(1))
       expect(h.findMissingCalls).toHaveLength(1)
@@ -2779,6 +2793,50 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(lines.filter((l) => l.startsWith(`[slack] reconnectSession: persona=C1 is ${state} `))).toEqual([lineOf('C1', paneReadFailureOf(err))])
       expect(latch.isLatched('C1')).toBe(false)
       expect(raised).toEqual([])
+    })
+
+    // ---- b.jg5 SRJ-611: every escalate-dead answer carries the verdict it swept with ----
+
+    /**
+     * [cell, C1's row state, harness options, the verdict the escalate-dead
+     * answer carries, whether that verdict is dead evidence, the sweep's line
+     * naming it] for every cell of the adapter that escalates: the `read-pane`
+     * of a `working`, `waiting` or prompt row (b.jg5 SRJ-603, SRJ-604,
+     * SRJ-606), the reconnect's one `send-keys` on a `waiting` row whose pane
+     * is idle (SRJ-609), and a prompt row deferred for
+     * `PROMPT_ROW_SWEEP_AFTER_MS` whose re-read after the sweep reads it
+     * finished (its second attempt escalates). Only the GONE-based verdicts are
+     * dead evidence; a row read or the refusal as not interactive never is.
+     */
+    const ESCALATE_DEAD_CELLS: ReadonlyArray<readonly [string, string, Parameters<typeof makeHarness>[0], DeadEvidenceSource, boolean, string]> = [
+      ['a working row, read-pane GONE', 'working', { paneError: paneGone() }, 'working-tmux-gone', true, escalateDeadLine('working-tmux-gone')],
+      ['a working row, read-pane ErrSpawnNotFound', 'working', { paneError: errSpawnNotFound() }, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, false, escalateDeadLine(ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ)],
+      ['a waiting row, read-pane GONE', 'waiting', { paneError: paneGone() }, ESCALATE_DEAD_WAITING_ROW_PANE_GONE, true, escalateDeadLine(ESCALATE_DEAD_WAITING_ROW_PANE_GONE)],
+      ['a waiting row, read-pane ErrSpawnNotFound', 'waiting', { paneError: errSpawnNotFound() }, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, false, escalateDeadLine(ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ)],
+      ['a waiting row, the reconnect\'s send-keys ErrTmuxSendKeys', 'waiting', { pane: IDLE_PANE, sendKeysThrows: errTmuxSendKeys() }, 'dead-session', true, escalateDeadLine('dead-session')],
+      ['a waiting row, the reconnect\'s send-keys ErrSpawnNotInteractive', 'waiting', { pane: IDLE_PANE, sendKeysThrows: errSpawnNotInteractive('send-keys') }, 'row-not-interactive', false, escalateDeadLine('row-not-interactive')],
+      ['a waiting row, the reconnect\'s send-keys ErrSpawnNotFound', 'waiting', { pane: IDLE_PANE, sendKeysThrows: errSpawnNotFound() }, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, false, escalateDeadLine(ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ)],
+      ...[...PROMPT_ROW_STATES].flatMap((state) => [
+        [`a ${state} row, read-pane GONE`, state, { paneError: paneGone() }, 'prompt-row-tmux-gone', true, escalateDeadLine('prompt-row-tmux-gone')] as const,
+        [`a ${state} row, read-pane ErrSpawnNotFound`, state, { paneError: errSpawnNotFound() }, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, false, escalateDeadLine(ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ)] as const,
+        [`a ${state} row deferred for PROMPT_ROW_SWEEP_AFTER_MS, re-read missing after the sweep`, state, { statusAfterSweep: 'missing' }, DEAD_SESSION_CAUSE_ROW_READ_FINISHED, false, promptRowSweepFinishedLine('persona=C1', state, PROMPT_ROW_SWEEP_AFTER_MS, 'missing')] as const,
+      ]),
+    ]
+
+    test.each(ESCALATE_DEAD_CELLS)('b.jg5 SRJ-611: %s → the escalate-dead answer carries the verdict it swept with, and the session manager\'s decision reads it as the row\'s evidence; its line names the same verdict', async (_label, state, opts, verdict, evidence, line) => {
+      const h = cellHarness(state, opts)
+      const deferred = verdict === DEAD_SESSION_CAUSE_ROW_READ_FINISHED
+      if (deferred) {
+        expect((await attempt(h)).verdict).toBe('transient')
+        await clock.advance(PROMPT_ROW_SWEEP_AFTER_MS)
+      }
+
+      const { verdict: answer, lines } = await attempt(h)
+
+      expect(answer).toEqual({ outcome: 'escalate-dead', deadEvidence: carriedDeadEvidenceOf(verdict) })
+      expect(isDeadEvidence((answer as ReconnectEscalateDead).deadEvidence.source)).toBe(evidence)
+      expect(h.findMissingCalls).toHaveLength(1)
+      expect(lines.filter((l) => l === line)).toHaveLength(1)
     })
 
     // ---- the reconnect's send-keys on a waiting row (b.jg5 SRJ-118, SRJ-501, SRJ-512) ----
@@ -2912,7 +2970,7 @@ describe('_buildReconnectSessionAdapter', () => {
 
     test.each(PROMPT_STATES)("a %s row whose read-pane answers a pane → 'transient' at every attempt with the blocked-on-prompt notice once for the episode; one one-line read-pane of C1's own row per attempt; nothing typed, swept or latched; no class line; no tmux call", async (state) => {
       const h = cellHarness(state, {})
-      const verdicts: string[] = []
+      const verdicts: AdapterAnswer[] = []
       const lines: string[] = []
       for (let i = 0; i < 3; i++) {
         if (i > 0) await clock.advance(60_000)
@@ -2939,7 +2997,7 @@ describe('_buildReconnectSessionAdapter', () => {
 
       const { verdict, lines } = await attempt(h)
 
-      expect(verdict).toBe('escalate-dead')
+      expect(verdict).toEqual(escalatedWith(escalateVerdict))
       expect(h.sendKeysCalls).toEqual([])
       expect(h.readPaneCalls).toEqual(probePaneReads(1))
       expect(h.findMissingCalls).toHaveLength(1)
@@ -2970,7 +3028,7 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(promptRowOwnLines(first.lines, state)).toEqual([promptRowTakenAsAliveLine('C1', state, paneReadFailureOf(err))])
 
       await clock.advance(PROMPT_ROW_SWEEP_AFTER_MS)
-      expect((await attempt(h)).verdict).toBe('escalate-dead')
+      expect((await attempt(h)).verdict).toEqual(escalatedWith(DEAD_SESSION_CAUSE_ROW_READ_FINISHED))
 
       expect(h.findMissingCalls).toHaveLength(1)
       expect(h.readPaneCalls).toEqual(probePaneReads(2))
@@ -3264,8 +3322,8 @@ describe('_buildReconnectSessionAdapter', () => {
     })
 
     /** Attempt a reconnect of C1 at each of `minutes` on the fake clock; the verdicts in order. */
-    async function attemptsAt(adapter: (key: string) => Promise<string>, minutes: readonly number[]): Promise<string[]> {
-      const verdicts: string[] = []
+    async function attemptsAt(adapter: (key: string) => Promise<AdapterAnswer>, minutes: readonly number[]): Promise<AdapterAnswer[]> {
+      const verdicts: AdapterAnswer[] = []
       for (const minute of minutes) {
         await clock.advance(minute * 60_000 - clock.now())
         verdicts.push(await adapter('C1'))
@@ -3289,7 +3347,7 @@ describe('_buildReconnectSessionAdapter', () => {
 
       expect(await attemptsAt(h.adapter, [0, 4, 8])).toEqual(['transient', 'transient', 'transient'])
       expect(h.findMissingCalls).toEqual([])
-      expect(await attemptsAt(h.adapter, [SWEEP_MINUTE])).toEqual(['escalate-dead'])
+      expect(await attemptsAt(h.adapter, [SWEEP_MINUTE])).toEqual([escalatedWith(DEAD_SESSION_CAUSE_ROW_READ_FINISHED)])
 
       expect(h.findMissingCalls).toHaveLength(1)
       expect(h.readPaneCalls).toEqual(probePaneReads(4))
@@ -3300,8 +3358,11 @@ describe('_buildReconnectSessionAdapter', () => {
       // The prompt was reported once, while its session was alive.
       expect(raised.map((n) => n.key)).toEqual(['C1'])
       expect(raised[0]!.text).toStartWith(':warning: *Waiting on a prompt*')
+      expect(adapterLines().at(-1)).toBe(promptRowSweepFinishedLine('persona=C1', state, PROMPT_ROW_SWEEP_AFTER_MS, after))
+      // The builder's one literal pin (b.jg5 SRJ-611): it says what was read, a
+      // row read and not dead evidence, and that the re-probe decides.
       expect(adapterLines().at(-1)).toBe(
-        `[slack] reconnectSession: persona=C1 has read ${state} for ${SWEEP_MINUTE} min of deferrals, and after a findMissing sweep its row reads ${after} — its claude process is gone; not deferring, the restart relaunches it (b.jdc)`,
+        `[slack] reconnectSession: persona=C1 has read ${state} for ${SWEEP_MINUTE} min of deferrals, and after a findMissing sweep its row reads ${after} — not deferring; escalating (escalate-dead), the restart path's re-probe decides (cause=row-read-finished: not dead evidence; b.jdc, b.jg5 SRJ-611)`,
       )
     })
 
@@ -3353,13 +3414,13 @@ describe('_buildReconnectSessionAdapter', () => {
     test('an attempt that reads another state ends the run of deferrals on the prompt row: the 10 min start over (its pending read answers \'pending\', b.jg5 SRJ-303)', async () => {
       const opts: Parameters<typeof makeHarness>[0] = { statusState: 'check_permission', statusAfterSweep: 'missing' }
       const h = makeHarness(opts)
-      const verdicts: string[] = []
+      const verdicts: AdapterAnswer[] = []
       for (const [minute, state] of [[0, 'check_permission'], [6, 'pending'], [9, 'ask_user'], [18, 'ask_user'], [19, 'ask_user']] as const) {
         opts.statusState = state
         verdicts.push(...(await attemptsAt(h.adapter, [minute])))
       }
 
-      expect(verdicts).toEqual(['transient', 'pending', 'transient', 'transient', 'escalate-dead'])
+      expect(verdicts).toEqual(['transient', 'pending', 'transient', 'transient', escalatedWith(DEAD_SESSION_CAUSE_ROW_READ_FINISHED)])
       expect(h.findMissingCalls).toHaveLength(1)
       expect(h.sendKeysCalls).toEqual([])
     })
@@ -3369,7 +3430,7 @@ describe('_buildReconnectSessionAdapter', () => {
 
       expect(await attemptsAt(h.adapter, [0, 5])).toEqual(['transient', 'transient'])
       forgetNotConnectedEpisode('C1')
-      expect(await attemptsAt(h.adapter, [6, 15, 16])).toEqual(['transient', 'transient', 'escalate-dead'])
+      expect(await attemptsAt(h.adapter, [6, 15, 16])).toEqual(['transient', 'transient', escalatedWith(DEAD_SESSION_CAUSE_ROW_READ_FINISHED)])
 
       expect(h.findMissingCalls).toHaveLength(1)
       expect(raised.map((n) => n.key)).toEqual(['C1', 'C1'])
@@ -3399,12 +3460,12 @@ describe('_buildReconnectSessionAdapter', () => {
         _resetConfiguredPersonaQuery()
       })
 
-      test.each<[string, string | undefined, string, boolean, string, number]>([
+      test.each<[string, string | undefined, string, boolean, AdapterAnswer, number]>([
         ['a provenance_conflict note latches C1; the row would still read check_permission', provenanceNote, 'check_permission', true, 'transient', 1],
         ['a provenance_conflict note latches C1; the row would read missing', provenanceNote, 'missing', true, 'transient', 1],
         ['regression: no note, the row still reads check_permission → deferred again', undefined, 'check_permission', false, 'transient', 2],
         ['regression: a note that latches no one, the row still reads check_permission → deferred again', nonLatchingNotes[0], 'check_permission', false, 'transient', 2],
-        ['regression: no note, the row reads missing → escalated', undefined, 'missing', false, 'escalate-dead', 1],
+        ['regression: no note, the row reads missing → escalated', undefined, 'missing', false, escalatedWith(DEAD_SESSION_CAUSE_ROW_READ_FINISHED), 1],
       ])('%s: one sweep, one get of cscb_C1, nothing typed, killed or launched', async (_label, note, after, latched, verdict, deferrals) => {
         const h = makeHarness({
           statusState: 'check_permission',
@@ -3496,18 +3557,18 @@ describe('_buildReconnectSessionAdapter', () => {
       paneReads: number
       sendKeys: number
       raised: string[]
-      /** The escalate-dead answer of the swept attempt when the sweep is not refused (default 'escalate-dead'). */
-      escalated?: string
+      /** The verdict the swept attempt's escalate-dead answer carries when the sweep is not refused (b.jg5 SRJ-611). */
+      verdict: DeadEvidenceSource
     }
 
     const SWEEP_SITES: ReadonlyArray<readonly [string, SweepSite]> = [
-      ['dead-session (one ErrTmuxSendKeys)', { opts: () => ({ statusState: 'waiting', sendKeysThrows: errTmuxSendKeys() }), minutes: [0], prefix: 'escalate-dead', paneReads: 1, sendKeys: 1, raised: [] }],
-      ['row-not-interactive (ErrSpawnNotInteractive)', { opts: () => ({ statusState: 'waiting', sendKeysThrows: errSpawnNotInteractive('send-keys') }), minutes: [0], prefix: 'escalate-dead', paneReads: 1, sendKeys: 1, raised: [], escalated: RECONNECT_ESCALATE_DEAD_NO_KILL }],
-      ['working-tmux-gone (read-pane GONE)', { opts: () => ({ statusState: 'working', paneError: paneGone() }), minutes: [0], prefix: 'escalate-dead', paneReads: 1, sendKeys: 0, raised: [] }],
-      ['waiting-row-pane-gone (read-pane GONE)', { opts: () => ({ statusState: 'waiting', paneError: paneGone() }), minutes: [0], prefix: 'escalate-dead', paneReads: 1, sendKeys: 0, raised: [] }],
-      ['row-absent-at-pane-read (a working row, ErrSpawnNotFound)', { opts: () => ({ statusState: 'working', paneError: errSpawnNotFound() }), minutes: [0], prefix: 'escalate-dead', paneReads: 1, sendKeys: 0, raised: [] }],
-      ['prompt-row-tmux-gone (read-pane GONE)', { opts: () => ({ statusState: 'ask_user', paneError: paneGone() }), minutes: [0], prefix: 'escalate-dead', paneReads: 1, sendKeys: 0, raised: [] }],
-      ['a live prompt row deferred 10 min', { opts: () => ({ statusState: 'check_permission', statusAfterSweep: 'missing' }), minutes: [0, PROMPT_ROW_SWEEP_AFTER_MS / 60_000], prefix: 'reconnectSession: prompt row', paneReads: 2, sendKeys: 0, raised: ['C1'] }],
+      ['dead-session (one ErrTmuxSendKeys)', { opts: () => ({ statusState: 'waiting', sendKeysThrows: errTmuxSendKeys() }), minutes: [0], prefix: 'escalate-dead', paneReads: 1, sendKeys: 1, raised: [], verdict: 'dead-session' }],
+      ['row-not-interactive (ErrSpawnNotInteractive)', { opts: () => ({ statusState: 'waiting', sendKeysThrows: errSpawnNotInteractive('send-keys') }), minutes: [0], prefix: 'escalate-dead', paneReads: 1, sendKeys: 1, raised: [], verdict: 'row-not-interactive' }],
+      ['working-tmux-gone (read-pane GONE)', { opts: () => ({ statusState: 'working', paneError: paneGone() }), minutes: [0], prefix: 'escalate-dead', paneReads: 1, sendKeys: 0, raised: [], verdict: 'working-tmux-gone' }],
+      ['waiting-row-pane-gone (read-pane GONE)', { opts: () => ({ statusState: 'waiting', paneError: paneGone() }), minutes: [0], prefix: 'escalate-dead', paneReads: 1, sendKeys: 0, raised: [], verdict: ESCALATE_DEAD_WAITING_ROW_PANE_GONE }],
+      ['row-absent-at-pane-read (a working row, ErrSpawnNotFound)', { opts: () => ({ statusState: 'working', paneError: errSpawnNotFound() }), minutes: [0], prefix: 'escalate-dead', paneReads: 1, sendKeys: 0, raised: [], verdict: ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ }],
+      ['prompt-row-tmux-gone (read-pane GONE)', { opts: () => ({ statusState: 'ask_user', paneError: paneGone() }), minutes: [0], prefix: 'escalate-dead', paneReads: 1, sendKeys: 0, raised: [], verdict: 'prompt-row-tmux-gone' }],
+      ['a live prompt row deferred 10 min', { opts: () => ({ statusState: 'check_permission', statusAfterSweep: 'missing' }), minutes: [0, PROMPT_ROW_SWEEP_AFTER_MS / 60_000], prefix: 'reconnectSession: prompt row', paneReads: 2, sendKeys: 0, raised: ['C1'], verdict: DEAD_SESSION_CAUSE_ROW_READ_FINISHED }],
     ]
     const WORKING_TMUX_GONE = SWEEP_SITES.find(([label]) => label.startsWith('working-tmux-gone'))![1]
 
@@ -3524,7 +3585,7 @@ describe('_buildReconnectSessionAdapter', () => {
       try {
         const h = makeHarness({ ...site.opts(), findMissingError: err })
         const { result: verdicts, errArgs } = await capturingErrorArgs(async () => {
-          const out: string[] = []
+          const out: AdapterAnswer[] = []
           for (const minute of site.minutes) {
             await clock.advance(minute * 60_000 - clock.now())
             out.push(await h.adapter('C1'))
@@ -3576,7 +3637,7 @@ describe('_buildReconnectSessionAdapter', () => {
       const err = errUnusableName()
       const r = await sweepFailing(site, err)
 
-      expect(r.verdicts).toEqual([...site.minutes.slice(0, -1).map(() => 'transient'), site.escalated ?? 'escalate-dead'])
+      expect(r.verdicts).toEqual([...site.minutes.slice(0, -1).map((): AdapterAnswer => 'transient'), escalatedWith(site.verdict)])
       expect(r.findMissingCalls).toHaveLength(1)
       expect([r.killCalls, r.spawnCalls, r.resumeCalls]).toEqual([[], [], []])
       expect(r.lines.filter((l) => l.includes('findMissing sweep refused'))).toEqual([])

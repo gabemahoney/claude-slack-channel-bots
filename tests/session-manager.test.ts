@@ -430,9 +430,25 @@ import {
   reconnectTransientLine,
   reconnectUnusableNameLine,
   RECONNECT_NOT_THIS_LAUNCH_NOTE,
+  CARRIED_DEAD_EVIDENCE_NONE,
+  carriedDeadEvidenceOf,
+  DEAD_EVIDENCE_NONE,
+  DEAD_SESSION_CAUSE_PROMPT_ROW_LADDER_GONE,
   DEAD_SESSION_CAUSE_ROW_ABSENT,
   DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE,
+  DEAD_SESSION_CAUSE_ROW_READ_FINISHED,
   DEAD_SESSION_CAUSE_TMUX_GONE,
+  DEAD_SESSION_CAUSES,
+  deadSessionRouteLine,
+  describeDeadEvidence,
+  ESCALATE_DEAD_VERDICTS,
+  isDeadEvidence,
+  joinedLaunchDropsDeadEvidenceLine,
+  waitForWaitingAndReconnectWithCause,
+  waitRowFinishedLine,
+  type CarriedDeadEvidence,
+  type DeadEvidenceSource,
+  type DeadSessionCause,
   escalateDeadVerdictOfCause,
   transientReconnectLine,
   type ReconnectResult,
@@ -6687,11 +6703,12 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     expect(findMissingCalls).toHaveLength(2)
   })
 
-  // b.ecw: the timeout status reports the process is gone (`missing`) → provably
-  // dead → 'dead-session', with NO tmux probe. The poll loop stays `working`
+  // b.ecw: the timeout status reads the row `missing` → 'dead-session' (cause
+  // `row-read-finished`, a row read and not dead evidence, b.jg5 SRJ-611),
+  // with NO tmux probe. The poll loop stays `working`
   // (frozen mid-turn) until the deadline; only the timeout status flips to
   // `missing`, so the timeout branch (not the ended/missing loop branch) decides.
-  test('timeout with claude process gone (status missing at deadline) → dead-session, no raw tmux call', async () => {
+  test('timeout with the row read missing at the deadline → dead-session, no raw tmux call', async () => {
     _setWaitForWaitingTimeoutMs(30)
     _setFindMissingMemoTtlMs(0) // memo expired by the deadline → the timeout re-sweeps
     const tmux = recordTmuxCalls()
@@ -7053,9 +7070,9 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
   })
 
   // Drive the WORKING-branch dead-session verdict: waitForWaitingAndReconnect
-  // times out and the timeout status reports the claude process gone (b.ecw —
-  // the timeout branch now keys on the process via a fresh findMissing sweep +
-  // status, not the raw tmux probe). TTL=0 makes the timeout sweep observable
+  // times out and the timeout status reads the row `missing` (b.ecw — the
+  // timeout branch keys on the row via a fresh findMissing sweep + status, not
+  // the raw tmux probe). TTL=0 makes the timeout sweep observable
   // and lets the reconciled `missing` verdict flip in.
   test('working dead-session: findMissing runs (sweep + reconcile) BEFORE resume → resumed', async () => {
     captureStartupErrors() // the dialog approver records dev-channels-approve-spawn-died here
@@ -7372,20 +7389,6 @@ describe('b.m4r: waitForWaitingAndReconnect up-front findMissing sweep → fast 
 //     in-flight-shared sweep; failures NOT memoized; never a second sweep pattern.
 // ---------------------------------------------------------------------------
 
-/**
- * Every escalate-dead verdict, checked complete at compile time: the record
- * names each `EscalateDeadVerdict` exactly once.
- */
-const ESCALATE_DEAD_VERDICT_SET: Readonly<Record<EscalateDeadVerdict, true>> = {
-  'dead-session': true,
-  'row-not-interactive': true,
-  'working-tmux-gone': true,
-  [ESCALATE_DEAD_WAITING_ROW_PANE_GONE]: true,
-  [ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ]: true,
-  'prompt-row-tmux-gone': true,
-}
-const ESCALATE_DEAD_VERDICTS = Object.keys(ESCALATE_DEAD_VERDICT_SET) as EscalateDeadVerdict[]
-
 describe('t1.tkk.e4: sweepDeadTmuxChannel escalate-dead wrapper', () => {
   // Capture console.error to assert on the operator-visible log line. The
   // wrapper (and reconcileMissingSweep) log via console.error; we restore it in
@@ -7488,7 +7491,7 @@ describe('t1.tkk.e4: sweepDeadTmuxChannel escalate-dead wrapper', () => {
   // taken from `ESCALATE_DEAD_EVIDENCE`. A GONE answer (a prompt row's
   // included), a refused keystroke and an absent row each say only what was
   // seen; none says a tmux session or a worker is "provably dead".
-  test.each(ESCALATE_DEAD_VERDICTS)('log: verdict=%s says its own evidence text, from ESCALATE_DEAD_EVIDENCE', async (verdict) => {
+  test.each([...ESCALATE_DEAD_VERDICTS])('log: verdict=%s says its own evidence text, from ESCALATE_DEAD_EVIDENCE', async (verdict) => {
     installStub({})
 
     await sweepDeadTmuxChannel('C', verdict)
@@ -8594,12 +8597,21 @@ describe('b.f2b, b.jg5 SRJ-605: the wait-ended reports and the wait\'s lines (on
     expect(waitEndedDisconnectedLine(report, 60)).toBe('[slack] the head; what the health check does next')
   })
 
-  test('waitRowAbsentLine: the absent row at the poll and at the timeout read, a dead session either way', () => {
+  test('waitRowAbsentLine: the absent row at the poll and at the timeout read, a dead session either way, its cause a row read that is not dead evidence', () => {
     expect(waitRowAbsentLine(WAIT_REF_C)).toBe(
-      "[slack] waitForWaitingAndReconnect: persona=C's agent-director row is absent (ErrSpawnNotFound) — dead session; the recovery's spawn classifies any leftover session (b.jg5 SRJ-605)",
+      "[slack] waitForWaitingAndReconnect: persona=C's agent-director row is absent (ErrSpawnNotFound) — dead session (cause=row-absent: not dead evidence); the recovery's spawn classifies any leftover session (b.jg5 SRJ-605, SRJ-611)",
     )
     expect(waitRowAbsentLine(WAIT_REF_C, 10 * 60_000)).toBe(
-      "[slack] waitForWaitingAndReconnect: timed out for persona=C after 600000ms — agent-director row is absent (ErrSpawnNotFound) — dead session; the recovery's spawn classifies any leftover session (b.jg5 SRJ-605)",
+      "[slack] waitForWaitingAndReconnect: timed out for persona=C after 600000ms — agent-director row is absent (ErrSpawnNotFound) — dead session (cause=row-absent: not dead evidence); the recovery's spawn classifies any leftover session (b.jg5 SRJ-605, SRJ-611)",
+    )
+  })
+
+  test('waitRowFinishedLine: a row read ended or missing at the poll and at the timeout read, a dead session either way, its cause a row read that is not dead evidence', () => {
+    expect(waitRowFinishedLine(WAIT_REF_C, 'missing')).toBe(
+      "[slack] waitForWaitingAndReconnect: persona=C's row reads state=missing — dead session (cause=row-read-finished: not dead evidence); the recovery's resume or spawn decides what holds its name (b.ecw, b.jg5 SRJ-605, SRJ-611)",
+    )
+    expect(waitRowFinishedLine(WAIT_REF_C, 'ended', 10 * 60_000)).toBe(
+      "[slack] waitForWaitingAndReconnect: timed out for persona=C after 600000ms — its row reads state=ended — dead session (cause=row-read-finished: not dead evidence); the recovery's resume or spawn decides what holds its name (b.ecw, b.jg5 SRJ-605, SRJ-611)",
     )
   })
 
@@ -9180,7 +9192,10 @@ describe('b.dup: a row a findMissing sweep ended just before /mcp reconnect land
     expect(readLog()).toBe('')
     expect(notices).toEqual([])
     expect(errLog.split('\n').filter((line) => line === refusedLine(renderPersonaRef('A', 'A')))).toHaveLength(1)
-    expect(linesWith(errLog, '[slack] spawnForPersona: dead session for "A" (key=A) (state=waiting) — recovering via resume/fresh-spawn')).toHaveLength(1)
+    // b.jg5 SRJ-611: the route names its own cause, a refusal that is not dead evidence.
+    expect(linesWith(errLog, '[slack] spawnForPersona: dead session for ')).toEqual([
+      deadSessionRouteLine(renderPersonaRef('A', 'A'), 'waiting', carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE), CARRIED_DEAD_EVIDENCE_NONE),
+    ])
   })
 
   test('REPRO: reconnectMcp → dead-session on ErrSpawnNotInteractive: one send-keys, no raw tmux call, no notice, one log line', async () => {
@@ -19147,10 +19162,15 @@ const PROMPT_ROW_OUTAGE_ANSWERS: ReadonlyArray<readonly [string, () => Error, Ou
   ...SRJ311_ENVIRONMENT.map(([what, make, onset]) => [`ENVIRONMENT: ${what}`, () => make('read-pane'), TMUX_UNAVAILABLE_CLASS, () => onset] as const),
 ]
 
-/** The `read-pane` answers that find no pane of the row's launch: GONE, and the row absent (which takes the GONE column, b.jg5 SRJ-117). */
-const PROMPT_ROW_NO_PANE: ReadonlyArray<readonly [string, (key: string) => Error]> = [
-  ['GONE (ErrTmuxCaptureFailed)', (key) => errTmuxCaptureFailed(personaTmuxSessionName(key))],
-  ['the row absent (ErrSpawnNotFound)', () => errSpawnNotFound()],
+/**
+ * The `read-pane` answers that find no pane of the row's launch: GONE, and
+ * the row absent (which takes the GONE column, b.jg5 SRJ-117), each with the
+ * cause its recovery route carries (b.jg5 SRJ-611: GONE is dead evidence, an
+ * absent row is a row read and is not).
+ */
+const PROMPT_ROW_NO_PANE: ReadonlyArray<readonly [string, (key: string) => Error, DeadSessionCause]> = [
+  ['GONE (ErrTmuxCaptureFailed)', (key) => errTmuxCaptureFailed(personaTmuxSessionName(key)), DEAD_SESSION_CAUSE_PROMPT_ROW_LADDER_GONE],
+  ['the row absent (ErrSpawnNotFound)', () => errSpawnNotFound(), DEAD_SESSION_CAUSE_ROW_ABSENT],
 ]
 
 /** Each prompt state crossed with each of `cells`: the state first, then the cell's own columns. */
@@ -19195,11 +19215,11 @@ describe('b.jdc, b.jg5 SRJ-117, SRJ-607: the collision ladder\'s action on a pro
     expect(h.notices).toEqual([])
   })
 
-  test.each(forEachPromptState(PROMPT_ROW_NO_PANE))('REPRO: a %s row whose session died with the prompt open, its read-pane answering %s → one findMissing sweep and a re-read; the row reads missing → resumed (one resume, no kill, delete or second spawn); nothing typed, no notice, nothing counted; the verdict\'s line (its builder\'s) and no no-action line; no raw tmux call', async (state, _label, build) => {
+  test.each(forEachPromptState(PROMPT_ROW_NO_PANE).flatMap((cell) => [...AGENT_DIRECTOR_DEAD_STATES].map((after) => [...cell, after] as const)))('REPRO: a %s row whose session died with the prompt open, its read-pane answering %s → one findMissing sweep and a re-read; the row reads %s → resumed (one resume, no kill, delete or second spawn), the sweep the one find-missing right before it; nothing typed, no notice, nothing counted; the verdict\'s line (its builder\'s), the route\'s line naming its cause and dead-evidence answer (b.jg5 SRJ-611) and no no-action line; no raw tmux call', async (state, _label, build, cause, after) => {
     const { h, p } = srj105Build()
     const err = build(p)
 
-    const { result, order } = await launchOnPromptRow(h, p, promptRowLaunch(h, p, state, { answer: cannedErr(err), afterSweep: 'missing' }))
+    const { result, order } = await launchOnPromptRow(h, p, promptRowLaunch(h, p, state, { answer: cannedErr(err), afterSweep: after }))
 
     expect(result).toStrictEqual({ key: p, action: 'resumed' })
     expect(order.slice(0, order.indexOf('resume') + 1)).toEqual(['spawn', 'get', 'readPane', 'findMissing', 'status', 'resume'])
@@ -19210,6 +19230,9 @@ describe('b.jdc, b.jg5 SRJ-117, SRJ-607: the collision ladder\'s action on a pro
     expect(h.notices).toEqual([])
     expect(getFailureCount(p)).toBe(0)
     expect(linesEqualTo(h, promptRowLadderNoPaneLine(renderPersonaRef(p, p), state, paneReadFailureOf(err)))).toBe(1)
+    expect(h.errors.filter((l) => l.startsWith('[slack] spawnForPersona: dead session for '))).toEqual([
+      deadSessionRouteLine(renderPersonaRef(p, p), state, carriedDeadEvidenceOf(cause), CARRIED_DEAD_EVIDENCE_NONE),
+    ])
     expect(h.errors.filter((l) => l.includes('no action'))).toEqual([])
   })
 
@@ -20777,13 +20800,17 @@ describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and 
     expectNoRelatch(h, before)
   })
 
+  // b.jg5 SRJ-611: each verdict keeps its cause's dead-evidence answer, so a
+  // reconnect cause that is not dead evidence never maps to the GONE verdict.
+  // A cause the reconnect does not answer is no input (the typecheck refuses
+  // it): no verdict, and so no dead evidence, is made up for it.
   test.each([
     [DEAD_SESSION_CAUSE_TMUX_GONE, 'dead-session'],
     [DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE, 'row-not-interactive'],
     [DEAD_SESSION_CAUSE_ROW_ABSENT, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ],
-    [undefined, 'dead-session'],
-  ] as const)('escalateDeadVerdictOfCause(%p) is %s: an absent row is never swept as a GONE', (cause, verdict) => {
+  ] as const)('escalateDeadVerdictOfCause(%p) is %s: an absent row is never swept as a GONE, and the verdict keeps the cause\'s dead-evidence answer', (cause, verdict) => {
     expect(escalateDeadVerdictOfCause(cause)).toBe(verdict)
+    expect(isDeadEvidence(verdict)).toBe(isDeadEvidence(cause))
   })
 
   // b.jg5 SRJ-609: the row-not-interactive evidence text and line claim no
@@ -20792,6 +20819,232 @@ describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and 
     const claim = /\b(?:process|worker|session)\b[^;.()]*?\b(?:is|are|was|has been|have been)\s+(?:gone|dead|ended|exited)\b/i
     expect(ESCALATE_DEAD_EVIDENCE['row-not-interactive']).not.toMatch(claim)
     expect(reconnectNotInteractiveLine('persona=C', describeAgentDirectorFailure(errSpawnNotInteractive('send-keys')))).not.toMatch(claim)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-611: only GONE-based verdicts are dead evidence, and every
+// dead-session and escalate-dead verdict carries what proved it.
+//
+// The rule (`isDeadEvidence`) runs over every value of the exported lists
+// (`DEAD_SESSION_CAUSES`, `ESCALATE_DEAD_VERDICTS`); each value's expected
+// answer comes from a record keyed by their union, so a new value fails the
+// typecheck until it has an answer here, and a value or a value the rule
+// does not know is never dead evidence (fail safe). The launch wait's
+// `dead-session` carries one cause per end
+// (`waitForWaitingAndReconnectWithCause`). A launch the restart path gives an
+// escalate-dead verdict (`launchSession`'s `deadEvidence`) carries it into
+// the ladder: the `ended`/`missing` route names it in one line, and a
+// dead-session route holds dead evidence when its own cause or the carried
+// verdict is GONE-based. What a path hands `resumeOrFreshSpawn` shows in the
+// lost race's line: every such case has its `resume` answer
+// `ErrSpawnNotResumable`, so no dialog approver starts. A call joining a
+// launch in flight drops its verdict with one line. Each line is compared
+// with its exported builder, with one literal pin per builder. The
+// dead-session routes' own lines and their find-missing run before the
+// resume are the ladder describe's below and the prompt-row describe's.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-611: dead evidence, the launch wait\'s dead-session cause and the verdict a relaunch carries', () => {
+  afterEach(() => {
+    srj105AfterEach()
+  })
+
+  /**
+   * A bare `{ source, evidence }`, cast past `CarriedDeadEvidence`'s brand on
+   * purpose: to pin the builders' run-time shape, and to hand the code a value
+   * whose `evidence` its source does not prove.
+   */
+  const handBuilt = (source: CarriedDeadEvidence['source'], evidence: boolean): CarriedDeadEvidence =>
+    ({ source, evidence }) as unknown as CarriedDeadEvidence
+
+  /** The dead-evidence answer of every cause and verdict: true exactly for the GONE-based ones. */
+  const DEAD_EVIDENCE_OF: Readonly<Record<DeadEvidenceSource, boolean>> = {
+    [DEAD_SESSION_CAUSE_TMUX_GONE]: true,
+    [DEAD_SESSION_CAUSE_PROMPT_ROW_LADDER_GONE]: true,
+    [DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE]: false,
+    [DEAD_SESSION_CAUSE_ROW_ABSENT]: false,
+    [DEAD_SESSION_CAUSE_ROW_READ_FINISHED]: false,
+    'dead-session': true,
+    'working-tmux-gone': true,
+    [ESCALATE_DEAD_WAITING_ROW_PANE_GONE]: true,
+    [ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ]: false,
+    'prompt-row-tmux-gone': true,
+  }
+
+  /** Every cause and verdict, from the exported lists themselves. */
+  const EVERY_SOURCE: readonly DeadEvidenceSource[] = [...new Set<DeadEvidenceSource>([...DEAD_SESSION_CAUSES, ...ESCALATE_DEAD_VERDICTS])]
+
+  test.each([...EVERY_SOURCE])('%s has exactly one dead-evidence answer, its carried form says the same, and its line names it', (source) => {
+    const evidence = DEAD_EVIDENCE_OF[source]
+    expect(typeof evidence).toBe('boolean')
+
+    expect(isDeadEvidence(source)).toBe(evidence)
+    const carried = carriedDeadEvidenceOf(source)
+    expect(carried).toEqual(handBuilt(source, evidence))
+    expect(Object.isFrozen(carried)).toBe(true)
+    expect(describeDeadEvidence(carried)).toBe(describeDeadEvidence(handBuilt(source, !evidence)))
+  })
+
+  test('the exported lists hold each value once', () => {
+    expect(new Set(DEAD_SESSION_CAUSES).size).toBe(DEAD_SESSION_CAUSES.length)
+    expect(new Set(ESCALATE_DEAD_VERDICTS).size).toBe(ESCALATE_DEAD_VERDICTS.length)
+  })
+
+  test.each<[string, string | undefined]>([
+    ['no value', undefined],
+    ['the no-cause marker', DEAD_EVIDENCE_NONE],
+    ['an empty value', ''],
+    ['a GONE cause in another case', DEAD_SESSION_CAUSE_TMUX_GONE.toUpperCase()],
+    ['a value from a later build', 'a-cause-from-a-later-build'],
+  ])('fail safe: %s is not dead evidence', (_label, value) => {
+    expect(isDeadEvidence(value)).toBe(false)
+  })
+
+  test('a path that carries nothing carries the frozen no-cause value, which is not dead evidence', () => {
+    expect(carriedDeadEvidenceOf(undefined)).toBe(CARRIED_DEAD_EVIDENCE_NONE)
+    expect(carriedDeadEvidenceOf(DEAD_EVIDENCE_NONE)).toBe(CARRIED_DEAD_EVIDENCE_NONE)
+    expect(CARRIED_DEAD_EVIDENCE_NONE).toEqual(handBuilt(DEAD_EVIDENCE_NONE, false))
+    expect(Object.isFrozen(CARRIED_DEAD_EVIDENCE_NONE)).toBe(true)
+  })
+
+  // The builders' literal pins; every other case compares with the builders.
+  test('describeDeadEvidence: a GONE-based cause, a row read, none carried, and a hand-built value claiming evidence its cause does not prove', () => {
+    expect(describeDeadEvidence(carriedDeadEvidenceOf('working-tmux-gone'))).toBe('cause=working-tmux-gone: dead evidence (GONE-based)')
+    expect(describeDeadEvidence(carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_ROW_ABSENT))).toBe('cause=row-absent: not dead evidence')
+    expect(describeDeadEvidence(CARRIED_DEAD_EVIDENCE_NONE)).toBe('no cause carried: not dead evidence')
+    expect(describeDeadEvidence(handBuilt(DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE, true))).toBe('cause=row-not-interactive: not dead evidence')
+  })
+
+  test('deadSessionRouteLine: the route\'s own cause, the verdict carried in, and whether the path holds dead evidence (either does)', () => {
+    const ref = renderPersonaRef('C', 'C')
+    expect(deadSessionRouteLine(ref, 'waiting', carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_TMUX_GONE), CARRIED_DEAD_EVIDENCE_NONE)).toBe(
+      `[slack] spawnForPersona: dead session for ${ref} (state=waiting) — cause=tmux-gone: dead evidence (GONE-based); the path holds dead evidence; recovering via resume/fresh-spawn (b.jg5 SRJ-611)`,
+    )
+    expect(deadSessionRouteLine(ref, 'working', carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_ROW_ABSENT), carriedDeadEvidenceOf('working-tmux-gone'))).toBe(
+      `[slack] spawnForPersona: dead session for ${ref} (state=working) — cause=row-absent: not dead evidence; the restart path carried in cause=working-tmux-gone: dead evidence (GONE-based); the path holds dead evidence; recovering via resume/fresh-spawn (b.jg5 SRJ-611)`,
+    )
+    expect(deadSessionRouteLine(ref, 'ended', CARRIED_DEAD_EVIDENCE_NONE, carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE))).toBe(
+      `[slack] spawnForPersona: dead session for ${ref} (state=ended) — no cause carried: not dead evidence; the restart path carried in cause=row-not-interactive: not dead evidence; the path holds no dead evidence; recovering via resume/fresh-spawn (b.jg5 SRJ-611)`,
+    )
+  })
+
+  test('joinedLaunchDropsDeadEvidenceLine: the joining call\'s verdict, dropped', () => {
+    const ref = renderPersonaRef('C', 'C')
+    expect(joinedLaunchDropsDeadEvidenceLine(ref, carriedDeadEvidenceOf('dead-session'))).toBe(
+      `[slack] spawnForPersona: the joining call for ${ref} carried an escalate-dead verdict (cause=dead-session: dead evidence (GONE-based)) — dropped; it gets the launch in flight's result (b.jg5 SRJ-611)`,
+    )
+  })
+
+  // b.jg5 SRJ-605, SRJ-611: each dead-session end of the launch wait carries
+  // exactly one cause: the wait's reconnect's (its `send-keys` on a row the
+  // poll read `waiting`), `row-absent` for a `status` read answering
+  // `ErrSpawnNotFound`, and `row-read-finished` with the state for a row read
+  // `ended` or `missing`, at the poll or at the timeout read (the deadline at
+  // the wait's start). The row reads' lines are their builders'.
+  const WAIT_DEAD_ENDS: ReadonlyArray<readonly [string, (h: RecoveryHarness) => void, RecoveryStubScript, { deadCause: DeadSessionCause; finishedState?: string }, ((ref: string) => string) | undefined]> = [
+    ['the wait\'s reconnect answers ErrTmuxSendKeys', fastPolls, { statusResult: cannedStatusResult({ state: 'waiting' }), sendKeysError: errTmuxSendKeys() }, { deadCause: DEAD_SESSION_CAUSE_TMUX_GONE }, undefined],
+    ['the wait\'s reconnect answers ErrSpawnNotInteractive', fastPolls, { statusResult: cannedStatusResult({ state: 'waiting' }), sendKeysError: errSpawnNotInteractive('send-keys') }, { deadCause: DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE }, undefined],
+    ['the wait\'s reconnect answers ErrSpawnNotFound', fastPolls, { statusResult: cannedStatusResult({ state: 'waiting' }), sendKeysError: errSpawnNotFound() }, { deadCause: DEAD_SESSION_CAUSE_ROW_ABSENT }, undefined],
+    ['the poll\'s status answers ErrSpawnNotFound', fastPolls, { statusError: errSpawnNotFound() }, { deadCause: DEAD_SESSION_CAUSE_ROW_ABSENT }, (ref) => waitRowAbsentLine(ref)],
+    ['the timeout read answers ErrSpawnNotFound', deadlineAtStart, { statusError: errSpawnNotFound() }, { deadCause: DEAD_SESSION_CAUSE_ROW_ABSENT }, (ref) => waitRowAbsentLine(ref, 0)],
+    ...[...AGENT_DIRECTOR_DEAD_STATES].flatMap((state) => [
+      [`the poll reads ${state}`, fastPolls, { statusResult: cannedStatusResult({ state }) }, { deadCause: DEAD_SESSION_CAUSE_ROW_READ_FINISHED, finishedState: state }, (ref: string) => waitRowFinishedLine(ref, state)] as const,
+      [`the timeout read reads ${state}`, deadlineAtStart, { statusResult: cannedStatusResult({ state }) }, { deadCause: DEAD_SESSION_CAUSE_ROW_READ_FINISHED, finishedState: state }, (ref: string) => waitRowFinishedLine(ref, state, 0)] as const,
+    ]),
+  ]
+
+  test.each(WAIT_DEAD_ENDS)('the launch wait: %s → dead-session with exactly its one cause (and the state read for a finished row); one line from its builder for a row read', async (_label, setup, script, expected, lineOf) => {
+    const { h, p } = srj105Build()
+    setup(h)
+    h.script(script)
+
+    const result = await waitForWaitingAndReconnectWithCause(p, h.config)
+
+    // `lastRead` is the SRJ-501 cases'; everything else is the dead-session end.
+    expect({ ...result, lastRead: undefined }).toEqual({ outcome: 'dead-session', ...expected, lastRead: undefined })
+    expect(Object.keys(result).filter((k) => k !== 'lastRead').sort()).toEqual(['outcome', ...Object.keys(expected)].sort())
+    if (lineOf !== undefined) expect(h.errors.filter((l) => l === lineOf(`persona=${p}`))).toHaveLength(1)
+    expect(h.errors.filter((l) => l.startsWith('[slack] waitForWaitingAndReconnect: ') && l.includes('(claude process gone)'))).toEqual([])
+  })
+
+  /**
+   * A launch through the restart path's entry (`launchSession`) carrying
+   * `carried`, onto P's row as `reach` scripts it, whose `resume` answers
+   * `ErrSpawnNotResumable`: the launch's answer and P's dead-session route
+   * lines and lost-race lines.
+   */
+  async function launchCarrying(h: RecoveryHarness, p: string, reach: RecoveryStubScript, carried: CarriedDeadEvidence | undefined) {
+    h.script({ ...reach, resumeError: errSpawnNotResumable() })
+    const launched = await launchSession(p, h.config, carried === undefined ? {} : { deadEvidence: carried })
+    return {
+      launched,
+      routes: h.errors.filter((l) => l.startsWith('[slack] spawnForPersona: dead session for ')),
+      lostRaces: h.errors.filter((l) => l.includes(` on resume for ${renderPersonaRef(p, p)} — a lost race (`)),
+    }
+  }
+
+  /** The waiting row whose reconnect answers `err`, or the finished row `state`, as P's collision `get` reads it. */
+  const waitingRow = (err: Error) => (h: RecoveryHarness, p: string): RecoveryStubScript => ({ ...collided(h, harnessPersona(h, p), { state: 'waiting' }), sendKeysError: err })
+  const finishedRow = (state: string) => (h: RecoveryHarness, p: string): RecoveryStubScript => collided(h, harnessPersona(h, p), { state })
+
+  const GONE_VERDICT = carriedDeadEvidenceOf('working-tmux-gone')
+  const NOT_INTERACTIVE = carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE)
+  const OWN_GONE = carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_TMUX_GONE)
+
+  /**
+   * [case, P's row, the row state the route's line names, the verdict the
+   * relaunch carries, the route's own cause (none on the finished-row
+   * route), the dead evidence the path holds].
+   */
+  const CARRIED_ROUTES: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string) => RecoveryStubScript, string, CarriedDeadEvidence | undefined, CarriedDeadEvidence, CarriedDeadEvidence]> = [
+    ...[...AGENT_DIRECTOR_DEAD_STATES].flatMap((state) => [
+      [`an ${state} row, a GONE-based verdict carried → the path holds dead evidence`, finishedRow(state), state, GONE_VERDICT, CARRIED_DEAD_EVIDENCE_NONE, GONE_VERDICT] as const,
+      [`an ${state} row, a row-not-interactive verdict carried → no dead evidence`, finishedRow(state), state, NOT_INTERACTIVE, CARRIED_DEAD_EVIDENCE_NONE, NOT_INTERACTIVE] as const,
+      [`an ${state} row, no verdict carried → no dead evidence and no route line`, finishedRow(state), state, undefined, CARRIED_DEAD_EVIDENCE_NONE, CARRIED_DEAD_EVIDENCE_NONE] as const,
+    ]),
+    // Deliberately inconsistent, cast past the brand: the ladder must re-decide from the source.
+    ['an ended row, a hand-built value claiming evidence for row-not-interactive → decided again from its cause: no dead evidence', finishedRow(LIVENESS_DEAD_ROW_ENDED), LIVENESS_DEAD_ROW_ENDED, handBuilt(DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE, true), CARRIED_DEAD_EVIDENCE_NONE, NOT_INTERACTIVE],
+    ['a waiting row whose reconnect is refused as not interactive, a GONE-based verdict carried → the path holds the carried evidence', waitingRow(errSpawnNotInteractive('send-keys')), 'waiting', GONE_VERDICT, NOT_INTERACTIVE, GONE_VERDICT],
+    ['a waiting row whose reconnect is refused as not interactive, no verdict carried → no dead evidence', waitingRow(errSpawnNotInteractive('send-keys')), 'waiting', undefined, NOT_INTERACTIVE, NOT_INTERACTIVE],
+    ['a waiting row whose reconnect answers GONE, a row-not-interactive verdict carried → the path holds its own evidence', waitingRow(errTmuxSendKeys()), 'waiting', NOT_INTERACTIVE, OWN_GONE, OWN_GONE],
+  ]
+
+  test.each(CARRIED_ROUTES)('the restart path\'s relaunch: %s; the lost race names it; nothing killed or deleted', async (_label, reach, routeState, carried, own, held) => {
+    const { h, p } = srj105Build()
+
+    const { launched, routes, lostRaces } = await launchCarrying(h, p, reach(h, p), carried)
+
+    expect(launched).toBe('refused')
+    // The finished-row route logs its line only when a verdict was carried in.
+    const routed = own !== CARRIED_DEAD_EVIDENCE_NONE || carried !== undefined
+    expect(routes).toEqual(routed ? [deadSessionRouteLine(renderPersonaRef(p, p), routeState, own, carriedDeadEvidenceOf(carried?.source))] : [])
+    expect(lostRaces).toHaveLength(1)
+    expect(lostRaces[0]).toContain(`— a lost race (${describeDeadEvidence(held)}): `)
+    expect([h.stub.calls.killCalls, h.stub.calls.deleteCalls]).toEqual([[], []])
+  })
+
+  test.each<[string, CarriedDeadEvidence | undefined]>([
+    ['carrying a GONE-based verdict → its verdict is dropped with one line', carriedDeadEvidenceOf('dead-session')],
+    ['carrying nothing → no drop line', undefined],
+  ])('a relaunch joining P\'s launch in flight, %s; it gets that launch\'s result', async (_label, carried) => {
+    const { h, p } = srj105Build()
+    const held = holdSpawns(h.stub.client)
+    const first = h.launch(p)
+    await held.entered(personaInstanceId(p))
+
+    const joining = launchSession(p, h.config, carried === undefined ? {} : { deadEvidence: carried })
+    held.release(personaInstanceId(p))
+    const [result, launched] = await Promise.all([first, joining])
+
+    expect(result).toStrictEqual({ key: p, action: 'spawned' })
+    expect(launched).toBe(true)
+    expect(held.calls).toHaveLength(1)
+    const ref = renderPersonaRef(p, p)
+    expect(h.errors.filter((l) => l.startsWith(`[slack] spawnForPersona: the joining call for ${ref} `))).toEqual(
+      carried === undefined ? [] : [joinedLaunchDropsDeadEvidenceLine(ref, carried)],
+    )
+    await h.runApproverToStop(p)
   })
 })
 
@@ -20819,14 +21072,17 @@ describe('b.jg5 SRJ-118, SRJ-609: the ladder\'s waiting and working branches map
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: 1 }))
   })
 
+  /** The row state the ladder read on `branch`, which its dead-session route's line names. */
+  const branchState = (branch: string): string => (branch === 'waiting' ? 'waiting' : 'working')
+
   const DEAD_CROSS = BRANCHES.flatMap(([branch, reach, setup]) =>
     ([
-      ['GONE', () => errTmuxSendKeys()],
-      ['ErrSpawnNotInteractive', () => errSpawnNotInteractive('send-keys')],
-      ['ErrSpawnNotFound', () => errSpawnNotFound()],
-    ] as const).map(([what, make]) => [branch, what, reach, setup, make] as const),
+      ['GONE', () => errTmuxSendKeys(), DEAD_SESSION_CAUSE_TMUX_GONE],
+      ['ErrSpawnNotInteractive', () => errSpawnNotInteractive('send-keys'), DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE],
+      ['ErrSpawnNotFound', () => errSpawnNotFound(), DEAD_SESSION_CAUSE_ROW_ABSENT],
+    ] as const).map(([what, make, cause]) => [branch, what, reach, setup, make, cause] as const),
   )
-  test.each(DEAD_CROSS)('%s: %s → dead-session → one find-missing run, then resume: resumed, with one send-keys; no kill, delete, notice, spawn-failed entry or counted failure', async (branch, _what, reach, setup, make) => {
+  test.each(DEAD_CROSS)('%s: %s → dead-session → one find-missing run, then resume: resumed, with one send-keys; the route\'s one line names the reconnect\'s cause and its dead-evidence answer (b.jg5 SRJ-611); no kill, delete, notice, spawn-failed entry or counted failure', async (branch, _what, reach, setup, make, cause) => {
     const { h, p } = srj105Build()
     setup?.(h)
     h.script({ ...reach(h, harnessPersona(h, p)), sendKeysError: make(), findMissingResult: cannedFindMissing({ count: 1, ids: [personaInstanceId(p)] }) })
@@ -20838,8 +21094,42 @@ describe('b.jg5 SRJ-118, SRJ-609: the ladder\'s waiting and working branches map
     expect(order.filter((call) => call === 'findMissing' || call === 'resume' || call === 'sendKeys')).toEqual(
       branch === 'waiting' ? ['sendKeys', 'findMissing', 'resume'] : ['findMissing', 'sendKeys', 'resume'],
     )
+    expect(h.errors.filter((l) => l.startsWith('[slack] spawnForPersona: dead session for '))).toEqual([
+      deadSessionRouteLine(renderPersonaRef(p, p), branchState(branch), carriedDeadEvidenceOf(cause), CARRIED_DEAD_EVIDENCE_NONE),
+    ])
     expect(h.notices).toEqual([])
     expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(getFailureCount(p)).toBe(0)
+  })
+
+  // b.jg5 SRJ-605, SRJ-611: the working branch's dead sessions its wait
+  // decides from a row read (the poll's or the timeout read's
+  // `ErrSpawnNotFound`, `ended` or `missing`) take the same route: one line
+  // naming the row read's cause, never dead evidence, then the find-missing
+  // run before the resume, as for the reconnect's causes above.
+  const WAIT_ROW_READS: ReadonlyArray<readonly [string, (h: RecoveryHarness) => void, RecoveryStubScript, DeadSessionCause]> = [
+    ['the poll\'s status answers ErrSpawnNotFound', fastPolls, { statusError: errSpawnNotFound() }, DEAD_SESSION_CAUSE_ROW_ABSENT],
+    ...[...AGENT_DIRECTOR_DEAD_STATES].map((state) => [`the poll reads ${state}`, fastPolls, { statusResult: cannedStatusResult({ state }) }, DEAD_SESSION_CAUSE_ROW_READ_FINISHED] as const),
+    ['the timeout read answers ErrSpawnNotFound', deadlineAtStart, { statusError: errSpawnNotFound() }, DEAD_SESSION_CAUSE_ROW_ABSENT],
+    ...[...AGENT_DIRECTOR_DEAD_STATES].map((state) => [`the timeout read reads ${state}`, deadlineAtStart, { statusResult: cannedStatusResult({ state }) }, DEAD_SESSION_CAUSE_ROW_READ_FINISHED] as const),
+  ]
+  test.each(WAIT_ROW_READS)('working: %s → dead-session → one find-missing run, then resume: resumed, with nothing typed; the route\'s one line names the row read\'s cause, not dead evidence (b.jg5 SRJ-611); no kill, delete, notice or counted failure', async (_what, setup, script, cause) => {
+    const { h, p } = srj105Build()
+    setup(h)
+    h.script({ ...collided(h, harnessPersona(h, p), { state: 'working' }), ...script })
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'resumed' })
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, resume: 1 }))
+    // The wait's own find-missing run, which the recovery shares through the memo, comes before the one resume.
+    const sweepsAndResumes = order.filter((call) => call === 'findMissing' || call === 'resume')
+    expect(sweepsAndResumes.at(-1)).toBe('resume')
+    expect(sweepsAndResumes.filter((call) => call === 'resume')).toHaveLength(1)
+    expect(sweepsAndResumes.at(-2)).toBe('findMissing')
+    expect(h.errors.filter((l) => l.startsWith('[slack] spawnForPersona: dead session for '))).toEqual([
+      deadSessionRouteLine(renderPersonaRef(p, p), 'working', carriedDeadEvidenceOf(cause), CARRIED_DEAD_EVIDENCE_NONE),
+    ])
+    expect(h.notices).toEqual([])
     expect(getFailureCount(p)).toBe(0)
   })
 

@@ -86,7 +86,9 @@ import {
   checkPromptRowDeferral,
   checkWaitingRowPane,
   checkWorkingRowPane,
-  DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE,
+  carriedDeadEvidenceOf,
+  DEAD_SESSION_CAUSE_ROW_READ_FINISHED,
+  type DeadEvidenceSource,
   deletePersonaInstance,
   escalateDeadVerdictOfCause,
   ESCALATE_DEAD_REPROBE_DECIDES,
@@ -247,9 +249,9 @@ import {
   isRestartPendingOrActive,
   runRestartRetry,
   KILL_SESSION_NOT_KILLED_GUARD,
-  RECONNECT_ESCALATE_DEAD_NO_KILL,
   RESTART_FAILURE_CAP,
   type KillSessionResult,
+  type ReconnectEscalateDead,
 } from './restart.ts'
 import {
   createFullModeRetryAction,
@@ -1787,9 +1789,10 @@ export function _buildKillSessionAdapter(
  *     be a single leftover's (b.jg5 SRJ-117, SRJ-613), nothing is typed on
  *     it, and the reconnect's `send-keys` a later tick makes is the backstop
  *     (its CONFLICT "not this launch's session" latches the persona);
- *   - GONE → the dead-tmux sweep (verdict `prompt-row-tmux-gone`) and
- *     'escalate-dead', with no notice; the row absent (`ErrSpawnNotFound`)
- *     → the same with the verdict `row-absent-at-pane-read`;
+ *   - GONE → the dead-tmux sweep (verdict `prompt-row-tmux-gone`) and an
+ *     escalate-dead answer carrying that verdict (`escalateDeadWith`), with
+ *     no notice; the row absent (`ErrSpawnNotFound`) → the same, carrying
+ *     the verdict `row-absent-at-pane-read`;
  *   - UNAVAILABLE (timeouts included), CONFIG (the wrapper raised the
  *     `ad-config-malformed` outage) or UNCLASSIFIED → taken as alive: the
  *     deferral;
@@ -1814,9 +1817,10 @@ export function _buildKillSessionAdapter(
  *     persona with nothing typed (b.jg5 SRJ-118, SRJ-501);
  *   - GONE → nothing is typed: the dead-tmux sweep
  *     (`sweepDeadTmuxChannelWithCause`, verdict `waiting-row-pane-gone`) and
- *     'escalate-dead' ('transient' when the sweep was refused), as the
- *     `working` row's GONE below; the row absent (`ErrSpawnNotFound`) → the
- *     same with the verdict `row-absent-at-pane-read` (b.jg5 SRJ-117);
+ *     an escalate-dead answer carrying that verdict (`escalateDeadWith`;
+ *     'transient' when the sweep was refused), as the `working` row's GONE
+ *     below; the row absent (`ErrSpawnNotFound`) → the same, carrying the
+ *     verdict `row-absent-at-pane-read` (b.jg5 SRJ-117);
  *   - CONFLICT or UNUSABLE NAME (the reader latched the persona with the row
  *     state `waiting`), a persona already latched, or ENVIRONMENT (the
  *     wrapper raised the `tmux-unavailable` outage) → 'transient', nothing
@@ -1872,10 +1876,10 @@ export function _buildKillSessionAdapter(
  *   - GONE (`ErrTmuxCaptureFailed`: agent-director found no pane of the
  *     row's launch) → there is no pane to type into: forget the evidence,
  *     fire the dead-tmux sweep (`sweepDeadTmuxChannelWithCause`, b.sv7,
- *     verdict `working-tmux-gone`) once and return 'escalate-dead'
- *     ('transient' when the sweep was refused, b.jg5 SRJ-105: nothing is
- *     re-probed, killed or relaunched);
- *   - the row absent (`ErrSpawnNotFound`) → the same, with the verdict
+ *     verdict `working-tmux-gone`) once and answer escalate-dead carrying
+ *     that verdict (`escalateDeadWith`; 'transient' when the sweep was
+ *     refused, b.jg5 SRJ-105: nothing is re-probed, killed or relaunched);
+ *   - the row absent (`ErrSpawnNotFound`) → the same, carrying the verdict
  *     `row-absent-at-pane-read`: a row read that takes the GONE column
  *     without being a GONE (b.jg5 SRJ-117);
  *   - UNAVAILABLE (timeouts included), or CONFIG (the wrapper raised the
@@ -1891,9 +1895,10 @@ export function _buildKillSessionAdapter(
  *     state `working`, b.jg5 SRJ-501, SRJ-512), or a persona already latched,
  *     which the reader does not read → 'transient', with no deferral noted,
  *     no notice and nothing typed (b.jg5 SRJ-502).
- *   After an 'escalate-dead' answer restart.ts probes liveness again in the
- *   same restart run and, when the reconciled row reads dead, takes the
- *   kill+relaunch branch at once. The sweep may leave the row live (in
+ *   After an escalate-dead answer restart.ts probes liveness again in the
+ *   same restart run and, when the reconciled row reads dead, relaunches at
+ *   once, with its checked kill first only for a verdict that is dead
+ *   evidence (b.jg5 SRJ-611). The sweep may leave the row live (in
  *   `unverified_ids`, or, when `pending`, not judged, b.jg5 SRJ-120), and it
  *   may then stay live for further ticks: nothing promises that the re-probe
  *   or a later tick reads it dead. Each escalate-dead tick sweeps again, with
@@ -1928,13 +1933,15 @@ export function _buildKillSessionAdapter(
  *     persona's launch wait starts with, marked the row missing) → the
  *     refused keystrokes make the reconnect answer 'dead-session' with cause
  *     `row-not-interactive`, which is swept with that verdict (b.jdc) and
- *     answered `RECONNECT_ESCALATE_DEAD_NO_KILL`: a route into restart.ts's
- *     decision only, since a finished row (or a `pending` row whose session
- *     may be another launch's, b.jg5 SRJ-613) does not prove the worker gone
- *     (b.jg5 SRJ-609). When restart.ts's re-probe reads the row dead it
- *     relaunches the persona in the same run with no kill (b.d61); a row
- *     that still reads live is swept again at each later escalate-dead tick
- *     (b.jg5 SRJ-610). No spawn-failure notice is raised.
+ *     answered escalate-dead carrying it: a verdict that is never dead
+ *     evidence and only routes the persona into restart.ts's decision, since
+ *     a finished row (or a `pending` row whose session may be another
+ *     launch's, b.jg5 SRJ-613) does not prove the worker gone (b.jg5 SRJ-609,
+ *     SRJ-611). When restart.ts's re-probe reads the row dead it relaunches
+ *     the persona in the same run with no kill, carrying the verdict into
+ *     the ladder (b.d61); a row that still reads live is swept again at each
+ *     later escalate-dead tick (b.jg5 SRJ-610). No spawn-failure notice is
+ *     raised.
  *
  * b.jg5 SRJ-118, SRJ-609 — the reconnect itself (`reconnectMcpWithCause`,
  * with the row state this adapter's `status` read gave as its last read) is
@@ -1949,13 +1956,24 @@ export function _buildKillSessionAdapter(
  *     with the verdict its cause gives (`escalateDeadVerdictOfCause`):
  *     `tmux-gone` (GONE) → `dead-session`, `row-not-interactive` →
  *     `row-not-interactive`, `row-absent` (`ErrSpawnNotFound`, a row read) →
- *     `row-absent-at-pane-read`, never `tmux-gone`'s; then 'escalate-dead',
- *     or `RECONNECT_ESCALATE_DEAD_NO_KILL` for `row-not-interactive`
- *     ('transient' when the sweep was refused, b.jg5 SRJ-105);
+ *     `row-absent-at-pane-read`, never `tmux-gone`'s; then escalate-dead
+ *     carrying that verdict ('transient' when the sweep was refused, b.jg5
+ *     SRJ-105);
  *   - `transient` (the reconnect latched the persona on a CONFLICT or
  *     UNUSABLE NAME, found it latched, or met UNAVAILABLE, ENVIRONMENT,
  *     CONFIG or UNCLASSIFIED) → 'transient' with no sweep: nothing typed,
  *     nothing counted, no spawn-failure notice.
+ *
+ * b.jg5 SRJ-611 — every escalate-dead answer carries what proved it
+ * (`ReconnectEscalateDead`, `escalateDeadWith`): the verdict it swept with,
+ * the one its escalate-dead line names, or, for a prompt row whose 10-minute
+ * sweep found it finished, the cause `row-read-finished` that the deferral
+ * check's line names. Only the GONE-based verdicts are dead evidence:
+ * `dead-session` (`tmux-gone`), `working-tmux-gone`, `waiting-row-pane-gone`
+ * and `prompt-row-tmux-gone`. `row-not-interactive` (b.jg5 SRJ-609),
+ * `row-absent-at-pane-read` and `row-read-finished` are a refusal and row
+ * reads: they only route the persona into restart.ts's decision, which
+ * relaunches after a `dead` re-probe with no kill.
  *
  * b.jg5 SRJ-115, SRJ-512, SRJ-513 — the state read applies the session manager's
  * own-row `status` step (`applyOwnRowStatusStep`) after its own call, on the
@@ -2000,7 +2018,7 @@ export function _buildKillSessionAdapter(
 export function _buildReconnectSessionAdapter(
   getPersona?: (key: string) => Persona | undefined,
   isLatched?: (key: string) => boolean,
-): (key: string) => Promise<'success' | 'escalate-dead' | typeof RECONNECT_ESCALATE_DEAD_NO_KILL | 'transient' | 'pending'> {
+): (key: string) => Promise<'success' | ReconnectEscalateDead | 'transient' | 'pending'> {
   // `key` is the persona key.
   return async (key: string) => {
     let state: string
@@ -2064,14 +2082,16 @@ export function _buildReconnectSessionAdapter(
     // success path. Map the ReconnectOutcome onto the restart union —
     // 'ok' is the only success signal restart.ts acts on; 'dead-session'
     // and 'transient' are non-success (no recordSuccess, no recordFailure).
-    // 'dead-session' maps to an escalate-dead answer (b.9a7-amended):
-    // restart.ts does not re-enter scheduleRestart on it. For the escalate-dead case
+    // 'dead-session' maps to an escalate-dead answer (b.9a7-amended),
+    // carrying the verdict swept with (b.jg5 SRJ-611): restart.ts does not
+    // re-enter scheduleRestart on it. For the escalate-dead case
     // (b.sv7 / Epic t1.tkk.e4), CSCB recovers ITSELF: we fire the internal
     // sweep wrapper here, which may reconcile the frozen `working` row to
     // `missing`, and restart.ts probes liveness again in the same restart run
-    // (b.d61): a re-probe that reads `dead` takes the normal kill+relaunch
-    // branch at once (the relaunch alone after
-    // `RECONNECT_ESCALATE_DEAD_NO_KILL`, b.jg5 SRJ-609). `pending` or
+    // (b.d61): a re-probe that reads `dead` relaunches at once, with its
+    // checked kill first only after a verdict that is dead evidence (the
+    // relaunch alone after `row-not-interactive` or `row-absent-at-pane-read`,
+    // b.jg5 SRJ-609, SRJ-611). `pending` or
     // `unknown` leaves the relaunch undone
     // (`unknown` arms the retry timer). The sweep may leave the row live (in
     // `unverified_ids`, or, when `pending`, not judged at all, b.jg5
@@ -2121,11 +2141,14 @@ export function _buildReconnectSessionAdapter(
       // findMissing reconciles the whole store for every escalating persona.
       // b.jg5 SRJ-105: a refused sweep stops the restart run: 'transient',
       // so no re-probe, kill or relaunch follows.
-      const sweep = await sweepDeadTmuxChannelWithCause(key, escalateDeadVerdictOfCause(result.deadCause))
+      const verdict = escalateDeadVerdictOfCause(result.deadCause)
+      const sweep = await sweepDeadTmuxChannelWithCause(key, verdict)
       if (sweep.refused) return 'transient'
-      // b.jg5 SRJ-609: a refusal as not interactive never by itself leads to
-      // a kill; restart.ts relaunches after a `dead` re-probe with no kill.
-      return result.deadCause === DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE ? RECONNECT_ESCALATE_DEAD_NO_KILL : 'escalate-dead'
+      // b.jg5 SRJ-609, SRJ-611: the answer carries the verdict swept with;
+      // only `dead-session` (`tmux-gone`) is dead evidence. A refusal as not
+      // interactive or an absent row never by itself leads to a kill:
+      // restart.ts relaunches after a `dead` re-probe with no kill.
+      return escalateDeadWith(verdict)
     }
     // b.jg5 SRJ-118: 'transient' — nothing typed, no sweep, nothing counted.
     return 'transient'
@@ -2145,6 +2168,18 @@ const RECONNECT_STATUS_SITE = { site: 'reconnectSession', what: 'status check' }
 function reconnectLatchedByRead(key: string): 'transient' {
   forgetWorkingRowEvidence(key)
   return 'transient'
+}
+
+/**
+ * The reconnect adapter's escalate-dead answer (b.jg5 SRJ-611): it carries
+ * `source`, the verdict the adapter swept with (`escalateRowWithNoPane`, the
+ * reconnect's `dead-session`), or, for the prompt row's 10-minute sweep, the
+ * cause its re-read gave (`row-read-finished`), with whether it is dead
+ * evidence (`carriedDeadEvidenceOf`). restart.ts kills before its relaunch
+ * only for dead evidence and carries the verdict into the relaunch.
+ */
+function escalateDeadWith(source: DeadEvidenceSource): ReconnectEscalateDead {
+  return { outcome: 'escalate-dead', deadEvidence: carriedDeadEvidenceOf(source) }
 }
 
 /**
@@ -2210,9 +2245,9 @@ function reconnectLatchedAt(key: string, isLatched: ((key: string) => boolean) |
  *     - GONE (`ErrTmuxCaptureFailed`: agent-director found no pane of the
  *       row's launch) → the run of deferrals on the row ends, the dead-tmux
  *       sweep runs (`escalateRowWithNoPane`, verdict `prompt-row-tmux-gone`)
- *       and the answer is 'escalate-dead', with no notice
- *       (`promptRowPaneGoneLine`);
- *     - the row absent (`ErrSpawnNotFound`) → the same with the verdict
+ *       and the answer is escalate-dead carrying that verdict
+ *       (`escalateDeadWith`), with no notice (`promptRowPaneGoneLine`);
+ *     - the row absent (`ErrSpawnNotFound`) → the same, carrying the verdict
  *       `row-absent-at-pane-read`: a row read that takes the GONE column
  *       without being a GONE (b.jg5 SRJ-117; `promptRowAbsentAtPaneReadLine`);
  *     - UNAVAILABLE (timeouts included), CONFIG (the wrapper raised the
@@ -2227,7 +2262,8 @@ function reconnectLatchedAt(key: string, isLatched: ((key: string) => boolean) |
  *       (`promptRowPaneReadEnvironmentLine`).
  * The deferral is one more deferral on the row (`checkPromptRowDeferral`):
  * once the run has lasted `PROMPT_ROW_SWEEP_AFTER_MS`, it sweeps and reads
- * the row again, and a row now `ended` or `missing` answers 'escalate-dead';
+ * the row again, and a row now `ended` or `missing` answers escalate-dead
+ * carrying `row-read-finished`, a row read and not dead evidence;
  * a persona latched once that sweep is done (a post-run `get` of its own row
  * read a `provenance_conflict` note, b.jg5 SRJ-114, SRJ-120, or the latch
  * answers it latched) gets no row read and is never escalated: the check
@@ -2238,9 +2274,12 @@ function reconnectLatchedAt(key: string, isLatched: ((key: string) => boolean) |
  * `blocked-on-prompt` notice: a persona latched meanwhile (for example by a
  * launch outside the restart serializer during the `read-pane`) gets
  * 'transient' with no notice.
- * After 'escalate-dead' restart.ts re-probes and, when the row reads dead,
- * kills and relaunches the persona in the same run (b.d61); a row the sweep
- * leaves live may stay live for further ticks (b.jg5 SRJ-120), each
+ * Each escalate-dead answer carries its verdict (`escalateDeadWith`, b.jg5
+ * SRJ-611): `prompt-row-tmux-gone`, dead evidence; `row-absent-at-pane-read`
+ * and the 10-minute sweep's `row-read-finished`, row reads that are not.
+ * After it restart.ts re-probes and, when the row reads dead, relaunches the
+ * persona in the same run (b.d61), killing first only for dead evidence; a
+ * row the sweep leaves live may stay live for further ticks (b.jg5 SRJ-120), each
  * escalate-dead tick sweeping again with no step beyond the sweep and the
  * slow-recovery notice posted once after 3 such ticks (b.jg5 SRJ-610,
  * SRJ-1010). A refused sweep at either step (b.jg5 SRJ-105) answers
@@ -2252,7 +2291,7 @@ async function promptRowReconnectVerdict(
   key: string,
   state: string,
   latchedNow: () => boolean,
-): Promise<'escalate-dead' | 'transient'> {
+): Promise<ReconnectEscalateDead | 'transient'> {
   if (isLaunchInFlight(key)) {
     console.error(`[slack] reconnectSession: persona=${key} is ${state} and a launch for it is in flight — deferring to a later tick (b.jdc)`)
     return 'transient'
@@ -2303,7 +2342,9 @@ const PROMPT_ROW_PANE_READ_SITE = 'reconnectSession: prompt row'
 /**
  * b.jdc: `promptRowReconnectVerdict`'s deferral, for a pane or a read taken
  * as alive: one more deferral on the row (`checkPromptRowDeferral`), then
- * 'escalate-dead' for a row its 10-minute sweep found `ended` or `missing`,
+ * escalate-dead for a row its 10-minute sweep found `ended` or `missing`,
+ * carrying the cause `row-read-finished`, a row read and not dead evidence
+ * (b.jg5 SRJ-609, SRJ-611), as the check's line says,
  * 'transient' with no notice for a refused sweep or a persona latched after
  * it, and otherwise, unless `latchedNow` finds the persona latched right
  * before it (b.jg5 SRJ-502: 'transient', no notice), `deferPromptRow`'s
@@ -2313,9 +2354,9 @@ async function promptRowDeferral(
   key: string,
   state: string,
   latchedNow: () => boolean,
-): Promise<'escalate-dead' | 'transient'> {
+): Promise<ReconnectEscalateDead | 'transient'> {
   const deferral = await checkPromptRowDeferral(key, state)
-  if (deferral === 'escalate') return 'escalate-dead'
+  if (deferral === 'escalate') return escalateDeadWith(DEAD_SESSION_CAUSE_ROW_READ_FINISHED)
   if (deferral === 'refused') return 'transient'
   // b.jg5 SRJ-502: latched after the sweep (its line is logged there): no notice.
   if (deferral === 'latched') return 'transient'
@@ -2515,8 +2556,9 @@ const WORKING_ROW_PANE_READ_SITE = 'reconnectSession'
  *     CONFLICT notice posted once, the refused `send-keys` is never retried
  *     (SRJ-118) and the adapter answers 'transient';
  *   - GONE → the sweep with the verdict `working-tmux-gone`
- *     (`escalateRowWithNoPane`) and 'escalate-dead';
- *   - the row absent (`ErrSpawnNotFound`) → the same with the verdict
+ *     (`escalateRowWithNoPane`) and an escalate-dead answer carrying that
+ *     verdict (`escalateDeadWith`);
+ *   - the row absent (`ErrSpawnNotFound`) → the same, carrying the verdict
  *     `row-absent-at-pane-read`;
  *   - UNAVAILABLE (timeouts included) or CONFIG → 'transient', with one
  *     deferral noted on the row (`noteWorkingRowDeferral`);
@@ -2530,7 +2572,7 @@ const WORKING_ROW_PANE_READ_SITE = 'reconnectSession'
  *     deferral noted and no notice.
  * Every answer but a pane forgets the persona's working-row evidence. A
  * refused sweep (b.jg5 SRJ-105) answers 'transient' instead of
- * 'escalate-dead'. A persona latched by the time the read answers
+ * escalate-dead. A persona latched by the time the read answers
  * (`latchedNow`, the adapter's `reconnectLatchedAt` for the persona; b.jg5
  * SRJ-502) gets no fold, sweep, deferral or notice: 'transient'; the check
  * on a pane asks `latchedNow` again right before each notice it can raise.
@@ -2541,7 +2583,7 @@ async function workingReconnectVerdict(
   key: string,
   getPersona: ((key: string) => Persona | undefined) | undefined,
   latchedNow: () => boolean,
-): Promise<'escalate-dead' | 'transient' | 'reconnect'> {
+): Promise<ReconnectEscalateDead | 'transient' | 'reconnect'> {
   if (isLaunchInFlight(key)) {
     console.error(`[slack] reconnectSession: persona=${key} is working and a launch for it is in flight — deferring /mcp reconnect to a later tick (b.d61)`)
     return 'transient'
@@ -2615,7 +2657,9 @@ async function workingReconnectVerdict(
  * SRJ-606, SRJ-117): nothing is typed; the
  * persona's working-row evidence is forgotten, the dead-tmux sweep runs once
  * with `verdict` (`sweepDeadTmuxChannelWithCause`, which logs the
- * escalate-dead line) and the answer is 'escalate-dead', or 'transient' when
+ * escalate-dead line) and the answer is escalate-dead carrying that same
+ * verdict (`escalateDeadWith`, b.jg5 SRJ-611: the GONE verdicts are dead
+ * evidence, `row-absent-at-pane-read` is not), or 'transient' when
  * the sweep was refused (b.jg5 SRJ-105). A persona `latchedNow` finds
  * latched first gets no sweep: 'transient' (b.jg5 SRJ-502). restart.ts then
  * probes liveness again in the same run (b.d61); the row may still read live
@@ -2626,11 +2670,11 @@ async function escalateRowWithNoPane(
   key: string,
   verdict: EscalateDeadVerdict,
   latchedNow: () => boolean,
-): Promise<'escalate-dead' | 'transient'> {
+): Promise<ReconnectEscalateDead | 'transient'> {
   forgetWorkingRowEvidence(key)
   if (latchedNow()) return 'transient'
   const sweep = await sweepDeadTmuxChannelWithCause(key, verdict)
-  return sweep.refused ? 'transient' : 'escalate-dead'
+  return sweep.refused ? 'transient' : escalateDeadWith(verdict)
 }
 
 // ---------------------------------------------------------------------------
@@ -3484,7 +3528,7 @@ export async function main(): Promise<void> {
     // claude_config_dir) for the positive-idle rule.
     reconnectSession: _buildReconnectSessionAdapter(getAppliedPersona, (key) => conflictLatch.isLatched(key)),
     killSession: _buildKillSessionAdapter(getAppliedPersona, KILL_RETRY_SYSTEM_CLOCK),
-    launchSession: async (key) => {
+    launchSession: async (key, _cwd, _sessionId, deadEvidence) => {
       if (!personaConfig) return false
       // Launches the applied persona with this key; false when there is none.
       // resume vs fresh is handled inside spawnForPersona (SR-1.4
@@ -3493,8 +3537,10 @@ export async function main(): Promise<void> {
       // and AD owns the resume state, not CSCB. A persona that is not up is
       // skipped (neither success nor failure); a launch its UNAVAILABLE retry
       // timer was armed for is passed through as 'refused', which restart.ts
-      // never counts (b.jg5 SRJ-301, SRJ-302).
-      return await launchSession(key, personaConfig, { canLaunch: canRelaunch })
+      // never counts (b.jg5 SRJ-301, SRJ-302). The escalate-dead verdict a
+      // relaunch carries is passed on unchanged, into the ladder (b.jg5
+      // SRJ-611).
+      return await launchSession(key, personaConfig, { canLaunch: canRelaunch, deadEvidence })
     },
     getRestartDelay: () => appliedConfig.session_restart_delay,
     isShuttingDown: () => shuttingDown,
