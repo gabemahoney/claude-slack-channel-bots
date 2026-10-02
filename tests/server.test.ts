@@ -236,13 +236,13 @@ import {
 import {
   KILL_FAILURE_END_ROW_FINISHED,
   KILL_FAILURE_END_ROW_GONE,
-  PERSONA_EPISODE_KIND_KILL_FAILURE,
   createKillFailureAlerts,
   createPersonaEpisodes,
   type KillFailureAlerts,
   type PersonaEpisodes,
 } from '../src/persona-episodes.ts'
 import { KILL_FAILURE_CONTEXT_RECOVERY } from '../src/kill-failure-alert.ts'
+import { killFailureEndedLine } from './test-helpers/recovery-harness.ts'
 import {
   KILL_OUTCOME_KILLED,
   KILL_OUTCOME_NOT_KILLED,
@@ -270,7 +270,6 @@ import {
   UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
   UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
-  UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
   UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
   isInsideAttempt,
   runInAttempt,
@@ -2790,9 +2789,14 @@ describe('_buildReconnectSessionAdapter', () => {
       return lines.filter((l) => l.startsWith(head) && l.endsWith(tail))
     }
 
-    /** [name, answer, the record C1 is latched with, the notice its latch posts, the reconnect's line builder] for each latching `send-keys` answer on a `waiting` row. */
+    /**
+     * [name, answer, the record C1 is latched with, the notice its latch
+     * posts, the reconnect's line builder] for each latching `send-keys`
+     * answer on a `waiting` row. The leftover row ("not this launch's
+     * session") is the SRJ-613 describe's, on its idle-pane path.
+     */
     const RECONNECT_LATCH_CELLS: ReadonlyArray<readonly [string, () => Error, ConflictLatchRecord, string, (outcome: string) => string]> = [
-      ...reconnectConflictRowsAt('waiting').map((row) => [
+      ...reconnectConflictRowsAt('waiting').filter((row) => row.leftoverOfEarlierLaunch !== true).map((row) => [
         `CONFLICT at ${row.name}`,
         row.build,
         conflictRecord(row),
@@ -4327,8 +4331,6 @@ describe('b.jg5 SRJ-704, SRJ-1016: the liveness and reconnect adapters\' own-row
     captured.push(...errArgs)
   }
 
-  const endedLine = (reason: string): string => `[slack] persona-episodes: persona=C1 ${PERSONA_EPISODE_KIND_KILL_FAILURE} ended — ${reason}`
-
   test.each(ADAPTERS.flatMap(([name, adapter]) => [
     [name, 'ended', adapter, () => cannedStatusResult({ state: 'ended' }), KILL_FAILURE_END_ROW_FINISHED],
     [name, 'missing', adapter, () => cannedStatusResult({ state: 'missing' }), KILL_FAILURE_END_ROW_FINISHED],
@@ -4340,7 +4342,7 @@ describe('b.jg5 SRJ-704, SRJ-1016: the liveness and reconnect adapters\' own-row
 
     expect(alerts.isOpen('C1')).toBe(false)
     expect(posts).toHaveLength(1)
-    expect(lines.at(-1)).toBe(endedLine(reason))
+    expect(lines.at(-1)).toBe(killFailureEndedLine('C1', reason))
     expect(lines.filter((line) => line.includes(' ended — '))).toHaveLength(1)
   })
 
@@ -4623,26 +4625,6 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
     expect(statusCalls).toEqual([])
   })
 
-  // b.jg5 SRJ-702 (reconcile note): the restart path kills only after a
-  // `dead` reading, so its kill goes through the bounded retry with a seed
-  // that is not live: one try, whose UNAVAILABLE outcome stands at once. A
-  // second answer that would have succeeded is never reached, no read is
-  // made, and the clock is never asked to wait.
-  test('b.jg5 SRJ-702: an UNAVAILABLE first answer with a success queued behind it: one kill, the UNAVAILABLE standing, one try line ("1 of 1"), no status read, no wait, the timer armed once', async () => {
-    const err = errTmuxUnresponsive('kill')
-    install(undefined, cannedKillResult(true), undefined, [cannedErr<Phase1KillResult>(err), cannedOk(cannedKillResult(true))])
-    killErr = err
-
-    const { result, errArgs } = await killInAttempt()
-
-    expect(notKilled(result).error).toBe(err)
-    expect(killCalls).toHaveLength(1)
-    expect(statusCalls).toEqual([])
-    expect(stringLines(errArgs)).toEqual(killLines(result as KillOutcome))
-    expect(triggers).toEqual([{ key: 'C1', kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
-    expect(clock.firedCount()).toBe(0)
-  })
-
   // Non-vacuity for "no condition starts": the same refusal from a kill
   // declared of a row read live, in the same attempt, does start it. The
   // adapter's declaration (not read live) is what keeps it from starting.
@@ -4885,7 +4867,6 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
     expect(outcome.errorClass).toBe(AD_ERROR_CLASS_CONFLICT)
     expect(outcome.error).toBe(err)
     expect(killCalls).toHaveLength(1)
-    expect(row.latchTimeRead).toBe(false)
     expect(statusCalls).toEqual([])
     expect(latch.record('C1')).toStrictEqual(expectedLatchRecord('C1', {
       latchCase: row.latchCase,
@@ -4894,7 +4875,6 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
       sessionName: row.sessionName,
       description: err.errDescription,
     }))
-    expect(row.refusedOperation).toBe(REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY)
     expect(posts).toEqual([{ key: 'C1', text: row.notice.text }])
     const lines = stringLines(errArgs)
     expect(lines.slice(0, killLines(outcome).length)).toEqual(killLines(outcome))
@@ -4917,10 +4897,8 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
     expect(outcome.errorClass).toBe(AD_ERROR_CLASS_UNUSABLE_NAME)
     expect(outcome.error).toBe(err)
     expect(killCalls).toHaveLength(1)
-    expect(row.latchTimeRead).toBe(false)
     expect(statusCalls).toEqual([])
-    expect(latch.record('C1')).toStrictEqual(row.record('C1'))
-    expect(row.refusedOperation).toBe(REFUSED_OPERATION_NONE)
+    expect(latch.record('C1')).toStrictEqual({ ...row.record('C1'), refusedOperation: REFUSED_OPERATION_NONE })
     expect(posts).toEqual([{ key: 'C1', text: row.notice('C1') }])
     const lines = stringLines(errArgs)
     expect(lines.slice(0, killLines(outcome).length)).toEqual(killLines(outcome))

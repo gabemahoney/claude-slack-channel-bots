@@ -271,7 +271,9 @@ import {
 } from './ad-error-class.ts'
 import { armNeverEarlyWait, wholeMinutes } from './ad-settings.ts'
 import {
+  KILL_FAILURE_CLOSING_LOG_ONLY,
   KILL_FAILURE_VERSION_ORDINARY,
+  PERSONA_KILL_FAILED_LABEL,
   describeKillFailureDescriptions,
   killFailureAlertContentOf,
   killFailureAlertEntryText,
@@ -1492,6 +1494,13 @@ export const KILL_FAILURE_END_ROW_FINISHED = 'its own row read ended or missing'
 /** End reason: a read of the persona's own row found it gone (`ErrSpawnNotFound`; b.jg5 SRJ-704, SRJ-1016). */
 export const KILL_FAILURE_END_ROW_GONE = 'its own row is gone (ErrSpawnNotFound)'
 
+/**
+ * The route name in the written line of a stopped ordinary decision's entry
+ * (`KillFailureRaiseInput.stopped` with an earlier survivor-naming
+ * description).
+ */
+const KILL_FAILURE_STOPPED_SURVIVOR_ROUTE = 'stopped-survivor'
+
 /** Why a kill-failure episode ended (a teardown's `forget` and shutdown's `close` drop it with no line). */
 export type KillFailureEndReason = typeof KILL_FAILURE_END_ROW_FINISHED | typeof KILL_FAILURE_END_ROW_GONE
 
@@ -1508,7 +1517,9 @@ export type KillFailureEndReason = typeof KILL_FAILURE_END_ROW_FINISHED | typeof
  *   - `closed`: after the episodes' `close` (shutdown), nothing is posted;
  *   - `stopped`: the ordinary version for a configured persona whose tries
  *     the keep-going check stopped (`KillFailureRaiseInput.stopped`): one
- *     line, nothing posted and no episode;
+ *     line, nothing posted and no episode; when the decision carries an
+ *     earlier survivor-naming description, a `persona-kill-failed` entry
+ *     too;
  *   - `none`: the decision called for no alert.
  */
 export type KillFailureRaiseResult = 'posted' | 'held' | 'logged' | 'not-routed' | 'closed' | 'stopped' | 'none'
@@ -1535,7 +1546,12 @@ export interface KillFailureRaiseInput {
    * server stops: nothing retries the kill, so an ordinary version at a
    * destination, which says CSCB keeps retrying, is not posted; one line
    * carries the decision and the redacted descriptions, and no episode is
-   * opened (b.jg5 SRJ-702, SRJ-301). A log-only route is written as usual.
+   * opened (b.jg5 SRJ-702, SRJ-301). When the decision carries an earlier
+   * survivor-naming description (`earlierSurvivorDescription`), whose
+   * failure is the only report of the surviving process (SRJ-702), the
+   * ordinary version is also written through the log-only sink as one
+   * `persona-kill-failed` entry with the log-only closing sentence and the
+   * raise's context. A log-only route is written as usual.
    */
   readonly stopped?: boolean
   /** The session the alert names, unquoted; `slack_bot_<key>` when absent. */
@@ -1580,7 +1596,8 @@ export interface KillFailureAlerts {
    *   - either, on a log-only route: one entry of the route's class through
    *     the log-only sink, and no episode;
    *   - ordinary with `stopped`, at a destination: one line, nothing posted
-   *     and no episode.
+   *     and no episode; with an earlier survivor-naming description, also
+   *     one `persona-kill-failed` entry through the log-only sink.
    * A `none` decision does nothing. Never throws.
    */
   raise(input: KillFailureRaiseInput): KillFailureRaiseResult
@@ -1602,6 +1619,7 @@ export interface KillFailureAlerts {
  *   [slack] persona-episodes: persona=<key> kill-failure survivor alert posted to its destination (<context>)
  *   [slack] persona-episodes: persona=<key> kill-failure <version> alert written to the server log and startup-errors.log (<class>) — <route>
  *   [slack] persona-episodes: persona=<key> kill-failure ordinary alert not raised — its tries were stopped (the persona is not up or is torn down, or the server is shutting down), so nothing retries this kill; <descriptions> (<context>)
+ *   [slack] persona-episodes: persona=<key> kill-failure ordinary alert written to the server log and startup-errors.log (persona-kill-failed) — stopped-survivor
  *   [slack] persona-episodes: persona=<key> kill-failure ended — <reason>
  *
  * and, only on a failure or a missing route: `configured-key lookup failed:
@@ -1629,6 +1647,32 @@ export function createKillFailureAlerts(deps: KillFailureAlertsDeps): KillFailur
     }
   }
 
+  /**
+   * Write `entry` of `classLabel` through the log-only sink, with its line
+   * naming `routeName`. True when written; false (one line says why) when no
+   * sink or class is installed, or the sink threw.
+   */
+  function writeLogOnly(
+    key: string,
+    version: string,
+    classLabel: string | undefined,
+    entry: string,
+    routeName: string,
+  ): boolean {
+    if (deps.logOnly === undefined || classLabel === undefined) {
+      line(key, `${version} alert not routed — no log-only route is installed`)
+      return false
+    }
+    try {
+      deps.logOnly(classLabel, entry)
+    } catch (err) {
+      line(key, `${version} log-only alert failed: ${describeThrownValue(err)}`)
+      return false
+    }
+    line(key, `${version} alert written to the server log and startup-errors.log (${classLabel}) — ${routeName}`)
+    return true
+  }
+
   function raise(input: KillFailureRaiseInput): KillFailureRaiseResult {
     const { key, context } = input
     const content = killFailureAlertContentOf(
@@ -1641,24 +1685,25 @@ export function createKillFailureAlerts(deps: KillFailureAlertsDeps): KillFailur
     const route = selectKillFailureAlertRoute({ version, context, configured: configured(key), latched: input.latched === true })
     if (!route.destination) {
       const entry = killFailureAlertEntryText(`persona=${key}`, context, killFailureAlertText(content, route.closing, false))
-      if (deps.logOnly === undefined || route.classLabel === undefined) {
-        line(key, `${version} alert not routed — no log-only route is installed`)
-        return 'not-routed'
-      }
-      try {
-        deps.logOnly(route.classLabel, entry)
-      } catch (err) {
-        line(key, `${version} log-only alert failed: ${describeThrownValue(err)}`)
-        return 'not-routed'
-      }
-      line(key, `${version} alert written to the server log and startup-errors.log (${route.classLabel}) — ${route.route}`)
-      return 'logged'
+      return writeLogOnly(key, version, route.classLabel, entry, route.route) ? 'logged' : 'not-routed'
     }
-    if (version === KILL_FAILURE_VERSION_ORDINARY && input.stopped === true) {
+    if (content.version === KILL_FAILURE_VERSION_ORDINARY && input.stopped === true) {
       line(
         key,
         `${version} alert not raised — its tries were stopped (the persona is not up or is torn down, or the server is shutting down), so nothing retries this kill; ${describeKillFailureDescriptions(input.decision)} (${context})`,
       )
+      // b.jg5 SRJ-702: the failure that named a survivor is the only report
+      // of it, and a human ends it, so its description is kept in an entry.
+      if (content.quotes?.earlierSurvivorDescription !== undefined) {
+        const text = killFailureAlertText(content, KILL_FAILURE_CLOSING_LOG_ONLY, false)
+        writeLogOnly(
+          key,
+          version,
+          PERSONA_KILL_FAILED_LABEL,
+          killFailureAlertEntryText(`persona=${key}`, context, text),
+          KILL_FAILURE_STOPPED_SURVIVOR_ROUTE,
+        )
+      }
       return 'stopped'
     }
     const text = killFailureAlertText(content, route.closing, true)

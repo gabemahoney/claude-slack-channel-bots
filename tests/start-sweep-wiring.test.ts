@@ -15,9 +15,9 @@
  *
  * b.jg5 SRJ-702 (AC 56): the sweep's kills are each a bounded retry, so
  * main() hands the sweep the production kill-retry clock (imported from
- * src/kill-retry.ts, never a copy or a test clock), and the session manager
- * builds the pass budget fresh inside each `reconcileOrphans` call (no
- * module-scope budget outlives a pass).
+ * src/kill-retry.ts, never a copy or a test clock). That each
+ * `reconcileOrphans` call has its own pass budget is shown by behaviour in
+ * tests/session-manager.test.ts.
  *
  * Why a static audit: main() cannot run in a unit test (the agent-director
  * startup gate, a real port, real Slack connections). This follows the
@@ -30,21 +30,15 @@
 import { describe, test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import type * as KillRetryModule from '../src/kill-retry.ts'
-import { balancedAfter, importSource, indicesOf, loadedConfigName, startResolution, stripComments } from './test-helpers/source-audit.ts'
+import { importSource, indicesOf, loadedConfigName, startResolution, stripComments } from './test-helpers/source-audit.ts'
 
 const SERVER_SRC = readFileSync(new URL('../src/server.ts', import.meta.url), 'utf-8')
 
 /** server.ts with every comment removed (see stripComments). */
 const SERVER_CODE = stripComments(SERVER_SRC)
 
-/** session-manager.ts with every comment removed. */
-const SESSION_MANAGER_CODE = stripComments(readFileSync(new URL('../src/session-manager.ts', import.meta.url), 'utf-8'))
-
 /** The production kill-retry clock (b.jg5 SRJ-702); renaming it fails the typecheck. */
 const PRODUCTION_CLOCK: keyof typeof KillRetryModule = 'KILL_RETRY_SYSTEM_CLOCK'
-
-/** The pass budget's factory (b.jg5 SRJ-702, AC 56); renaming it fails the typecheck. */
-const BUDGET_FACTORY: keyof typeof KillRetryModule = 'createKillRetryPassBudget'
 
 /** Any call of the sweep in code, awaited or not, whatever its argument. */
 const ANY_SWEEP_CALL = /\breconcileOrphans\s*\(/g
@@ -77,18 +71,5 @@ describe('server.ts wires the persona start sweep (b.av2 SR-6.3)', () => {
   test('b.jg5 SRJ-702: the clock handed to the sweep is the one src/kill-retry.ts exports, imported, never declared in server.ts', () => {
     expect(importSource(SERVER_CODE, PRODUCTION_CLOCK)).toBe('./kill-retry.ts')
     expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${PRODUCTION_CLOCK}\\b`, 'g'), SERVER_CODE)).toEqual([])
-  })
-
-  test('b.jg5 SRJ-702 (AC 56): the pass budget is built once per reconcileOrphans call, inside its body, and nowhere else in the session manager', () => {
-    const builds = indicesOf(new RegExp(`(?<![\\w.$])${BUDGET_FACTORY}\\s*\\(`, 'g'), SESSION_MANAGER_CODE)
-    expect(builds).toHaveLength(1)
-    const decls = indicesOf(/^export async function reconcileOrphans\s*\(/gm, SESSION_MANAGER_CODE)
-    expect(decls).toHaveLength(1)
-    const [, paramsEnd] = balancedAfter(SESSION_MANAGER_CODE, decls[0]!, '(', ')')
-    const [bodyStart, bodyEnd] = balancedAfter(SESSION_MANAGER_CODE, paramsEnd + 1, '{', '}')
-    expect(builds[0]!).toBeGreaterThan(bodyStart)
-    expect(builds[0]!).toBeLessThan(bodyEnd)
-    // Not inside a nested function of the body: a `const` of the body's own scope.
-    expect(SESSION_MANAGER_CODE.slice(bodyStart, bodyEnd)).toMatch(new RegExp(`\\n  const \\w+(?:: \\w+)? = \\{[^\\n]*\\bbudget: ${BUDGET_FACTORY}\\(\\)`))
   })
 })

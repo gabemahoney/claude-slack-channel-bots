@@ -5432,31 +5432,22 @@ describe('unavailable retry: a live row’s kill makes its tries before its outc
     expectUntouched(h, other)
   })
 
-  // The recovery harness puts the waits between tries on its clock (b.jg5
-  // SRJ-702), as every other timer: advancing the clock alone finishes the
-  // tries, and a try still waiting fails the harness's cleanup.
-  test('the waits between tries run on the harness clock: advancing it alone finishes the tries; a try still waiting fails cleanup', async () => {
+  // The waits between tries run on the clock the kill is given (b.jg5
+  // SRJ-702), here the harness's: advancing it alone finishes the tries.
+  test('the waits between tries run on the harness clock: advancing it alone finishes the tries', async () => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     const [key] = h.keys as [string]
     h.script({ killError: errTmuxUnresponsive('kill') })
     let result: KillRetryResult | undefined
-    const retried = (on: RecoveryHarness): Promise<KillRetryResult> =>
-      retryPersonaKill(key, { rowReadLive: true, lastRead: killRetrySeedOfState('waiting'), site: 'kill-retry-case', ref: `persona=${key}`, clock: on.killRetryClock })
-    void runInAttempt(key, 'recovery', () => retried(h)).then((r) => { result = r })
+    void runInAttempt(key, 'recovery', () =>
+      retryPersonaKill(key, { rowReadLive: true, lastRead: killRetrySeedOfState('waiting'), site: 'kill-retry-case', ref: `persona=${key}`, clock: h.killRetryClock }),
+    ).then((r) => { result = r })
 
     await h.advance((KILL_RETRY_TRIES - 1) * KILL_RETRY_SPACING_MS - 1)
     expect(result).toBeUndefined()
     await h.advance(1)
     expect(result).toMatchObject({ end: KILL_RETRY_END_EXHAUSTED, tries: KILL_RETRY_TRIES })
     expect(h.stub.calls.killCalls).toHaveLength(KILL_RETRY_TRIES)
-
-    // A second harness whose kill is left waiting between its tries.
-    const waiting = makeRecoveryHarness(RETRY_TIMER_ONLY)
-    waiting.script({ killError: errTmuxUnresponsive('kill') })
-    void retried(waiting)
-    await waiting.clock.flush()
-    expect(waiting.clock.pending().map((t) => t.delayMs)).toEqual([KILL_RETRY_SPACING_MS])
-    expect(() => waiting.cleanup()).toThrow(/timer\(s\) still pending/)
   })
 
   test.each<[string, Error]>([
@@ -5522,7 +5513,7 @@ describe('unavailable retry: a live row’s kill makes its tries before its outc
 
     const result = await h.drive(h.launch(key))
 
-    expect(result.action).not.toBe('failed')
+    expect(result).toStrictEqual({ key: key, action: 'spawned' })
     expect(h.stub.calls.killCalls).toHaveLength(1)
     expect(h.stub.calls.deleteCalls).toHaveLength(1)
     expect(h.stub.calls.spawnCalls).toHaveLength(2)

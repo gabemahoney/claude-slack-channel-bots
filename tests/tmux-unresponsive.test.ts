@@ -524,7 +524,7 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
 
     const result = await h.drive(h.launch(p))
 
-    expect(result.action).not.toBe('failed')
+    expect(result).toStrictEqual({ key: p, action: 'spawned' })
     expect(h.stub.calls.killCalls).toHaveLength(2)
     expect(h.stub.calls.deleteCalls).toHaveLength(1)
     expect(h.stub.calls.spawnCalls).toHaveLength(2)

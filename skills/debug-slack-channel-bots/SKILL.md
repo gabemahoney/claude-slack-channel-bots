@@ -1832,15 +1832,18 @@ destination:
   [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own)),
   nothing counts toward the restart limit, and no *Not answering* record
   starts for it. The notice ends `CSCB keeps retrying on its own and posts
-  no second alert about this.` When the persona is held by then (the last
-  try met a tmux session conflict, for example, or a read between the
-  tries held it), it ends `This persona is held for a human (see its hold
+  no second alert about this.` When the persona is held by then (a read
+  between the tries held it, for example, or the last try met a tmux
+  session conflict after an earlier try named a process that outlived the
+  kill), it ends `This persona is held for a human (see its hold
   post); CSCB posts no second alert about this.` instead: the *Held:*
   notice goes to the same destination and nothing retries the persona.
 - *Kill failed* is posted once per episode. The episode ends, with no
   post, when a read of the persona's row finds it `ended` or `missing`, or
-  finds no row; a later kill that succeeds while the row still reads
-  running does not end it. The persona's removal or destructive change by
+  finds no row, or when the server's launch replaces the persona's row
+  with a fresh one (so a persona that came back no longer reports `kill
+  failed`); a later kill that succeeds while the row still reads running
+  does not end it. The persona's removal or destructive change by
   a confirmed change, or a server restart, ends it too. While it lasts, a message sent to the persona is lost and its
   *Message lost* notice reports `kill failed` (`held for a human` for a held
   persona), with no restart started.
@@ -1854,7 +1857,13 @@ destination:
   being up, or because the server is stopping, posts nothing: nothing
   retries that kill. One `not raised` line records it (below); for a
   persona already removed from the applied configuration, its
-  `persona-kill-failed` entry is written instead (**Where it goes**).
+  `persona-kill-failed` entry is written instead (**Where it goes**). When
+  an earlier try had named a process that outlived the kill, nothing else
+  reports that process, so the *Kill failed* text is also written to
+  `server.log` and `startup-errors.log` as
+  `[<time>] [persona-kill-failed] persona=<key> (recovery): <text>`, with
+  the log-only last sentence (**Where it goes**); still nothing is posted
+  and no episode starts.
 
 **Where it goes.**
 
@@ -1878,7 +1887,7 @@ destination:
 
 | Class | Cause | Fix |
 |---|---|---|
-| `persona-kill-failed` | A *Kill failed* notice for a persona no longer in the applied configuration. | A human checks the worker the entry names, following the "Operator actions" section of agent-director's README. Nothing needs doing for the removed persona itself. |
+| `persona-kill-failed` | A *Kill failed* notice for a persona no longer in the applied configuration, or for a persona whose kill tries were stopped after an earlier try named a process that outlived the kill. | A human checks the worker the entry names, following the "Operator actions" section of agent-director's README. Nothing needs doing for the removed persona itself. |
 | `persona-kill-survivor` | A *Process outlived kill* notice with no Slack destination: a persona no longer in the applied configuration, or the clean-up's kill at a start. | A human deals with the process the entry names by pid, following "Operator actions". |
 | `orphan-cleanup` carrying `; kill-failure alert:` | A start's clean-up could not end an old instance after its tries. Its row is kept. | As for `persona-kill-failed`. The next start's clean-up tries the kill again. |
 
@@ -1903,7 +1912,7 @@ found, and a pane can be a leftover's.
 All of one persona's kill and notice lines (replace `ops_bot` with the key):
 
 ```sh
-grep -h -E 'persona-episodes: persona=ops_bot kill-failure |(kill try [0-9]+( of [0-9]+)?|kill tries) for cscb_ops_bot|kill for persona=ops_bot: (the kill-failure alert|raising the kill-failure alert)|kill-failure episode end for persona=ops_bot ' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
+grep -h -E 'persona-episodes: persona=ops_bot kill-failure |(kill try [0-9]+( of [0-9]+)?|kill tries) for cscb_ops_bot|kill for (persona=ops_bot|"[^"]*" \(key=ops_bot\)): (the kill-failure alert|raising the kill-failure alert)|kill-failure episode end for persona=ops_bot ' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
 ```
 
 | Line | Meaning | What to do |
@@ -1913,6 +1922,7 @@ grep -h -E 'persona-episodes: persona=ops_bot kill-failure |(kill try [0-9]+( of
 | `[slack] persona-episodes: persona=<key> kill-failure survivor alert posted to its destination (<context>)` | The *Process outlived kill* notice was posted; the relaunch or the launch goes on. | As for the notice. |
 | `[slack] persona-episodes: persona=<key> kill-failure <version> alert written to the server log and startup-errors.log (<class>) — <route>` | The persona is no longer in the applied configuration (`<route>` `not-configured`), so the notice went to `server.log` and a `<class>` entry (`persona-kill-failed` for `ordinary`, `persona-kill-survivor` for `survivor`) instead of Slack. | See the class table above. |
 | `[slack] persona-episodes: persona=<key> kill-failure ordinary alert not raised — its tries were stopped (the persona is not up or is torn down, or the server is shutting down), so nothing retries this kill; <descriptions> (<context>)` | A kill that agent-director could not carry out stopped its tries because the persona was removed or stopped being up, or the server is stopping. Nothing is posted and no episode starts. `<descriptions>` quotes agent-director's answers, redacted (`last="…"`, `earlier survivor-naming="…"`). | Nothing for the persona. If the worker may still run, a human checks it as for the notice. |
+| `[slack] persona-episodes: persona=<key> kill-failure ordinary alert written to the server log and startup-errors.log (persona-kill-failed) — stopped-survivor` | Follows the `not raised` line when an earlier try had named a process that outlived the kill: the *Kill failed* text went to `server.log` and a `persona-kill-failed` entry, since nothing else reports that process. Nothing is posted and no episode starts. | A human checks the process the entry names, as for the notice. |
 | `[slack] persona-episodes: persona=<key> kill-failure ended — <reason>` | The episode ended with no post. `<reason>`: `its own row read ended or missing` or `its own row is gone (ErrSpawnNotFound)`. A later failed kill can post *Kill failed* again. | Nothing. |
 | `[slack] persona-episodes: persona=<key> kill-failure configured-key lookup failed: <error> — the alert takes the log-only route` | An internal error while checking whether the persona is still configured: the notice went to the log and `startup-errors.log` instead of Slack. | Report it as a bug, with the persona's lines. |
 | `[slack] persona-episodes: persona=<key> kill-failure <version> alert not posted — the episodes are closed` | The server is stopping, so nothing is posted. | Nothing. |
@@ -2629,7 +2639,7 @@ grep -h -E '(kill try [0-9]+ of [0-9]+|status read before kill try [0-9]+|kill t
 | `[slack] <site>: kill tries for <id> stop before try <n>: <why> — no further kill; the last try's outcome stands (b.jg5 SRJ-702)` | The tries stopped early. `<why>`: `the caller's keep-going check answered false` (the persona was put on hold, removed or is no longer up, or the server is stopping) or `the wait between tries failed` (an internal error). | For a hold, see the *Held:* entry; for a removal or a stopping server, nothing. `the wait between tries failed`: report it as a bug, with the persona's lines. |
 | `[slack] <site>: kill tries for <id> ended (<end>) after <n> kill(s) and <m> read(s): <outcome> — alert=<none\|survivor\|ordinary> (b.jg5 SRJ-702)` | The summary of a kill that took more than one call, or whose tries met agent-director's report that it couldn't stop the session. `<outcome>` is the result that stands. `alert=` records which kind of human alert the tries call for: `survivor` (the kill ended as a success, but an earlier try named a surviving process: a *Process outlived kill* notice) or `ordinary` (agent-director couldn't stop the session: a *Kill failed* notice), or `none`. The notice, or the entry or line that stands in for it, comes after this line. | Nothing for `none`. Otherwise see [A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice); the tries' lines above it for `<id>` quote agent-director's answer. |
 | `[slack] spawnForPersona: kill for <ref> did not succeed (<outcome>) and its tries were stopped: the persona is latched — answering latched; no delete or launch follows (b.jg5 SRJ-702, SRJ-502)` | A launch replacing the persona's row stopped its kill's tries because the persona was put on hold meanwhile. Nothing is removed or launched. | See the *Held:* entry the persona's notice names. |
-| `[slack] spawnForPersona: kill for <ref> did not succeed (<outcome>) and its tries were stopped (the persona is not up or is torn down, or the server is shutting down) — answering the uncounted refused result; no delete or launch follows (b.jg5 SRJ-702)` | The same, because the persona was removed, stopped being up, or the server began stopping. Nothing counts toward the restart limit. A kill agent-director couldn't carry out posts no *Kill failed* notice then, since nothing retries it: a `kill-failure ordinary alert not raised` line records it (see [A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice)). | Nothing; for a persona that isn't up, follow its class line (see [Persona diagnostic classes](#persona-diagnostic-classes)). |
+| `[slack] spawnForPersona: kill for <ref> did not succeed (<outcome>) and its tries were stopped (the persona is not up or is torn down, or the server is shutting down) — answering the uncounted refused result; no delete or launch follows (b.jg5 SRJ-702)` | The same, because the persona was removed, stopped being up, or the server began stopping. Nothing counts toward the restart limit. A kill agent-director couldn't carry out posts no *Kill failed* notice then, since nothing retries it: a `kill-failure ordinary alert not raised` line records it, followed by a `persona-kill-failed` entry (`— stopped-survivor`) when an earlier try named a process that outlived the kill (see [A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice)). | Nothing; for a persona that isn't up, follow its class line (see [Persona diagnostic classes](#persona-diagnostic-classes)). |
 | `[slack] reconcileOrphans: the status read between kill tries for instanceId=<id> answered CONFIG; the row names no persona of the applied configuration, so no outage is raised — logged only (b.jg5 SRJ-110, SRJ-316)` | At a start, agent-director refused its config file while the server was reading a leftover instance (a removed persona's, or one from before personas) between its kill's tries. No persona's notice is raised for it. | See **agent-director refuses its config file** above. |
 
 ---

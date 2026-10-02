@@ -1081,8 +1081,7 @@ const personaRouting = createPersonaRouting({
   // row has not since read `ended` or `missing`, or been found gone). Read at
   // call time through the holder main() sets: before main() builds the
   // alerts no episode is open. The survivor version opens no episode, so it
-  // never reports this state. The old-life-hold half of this input (P waits
-  // on an old-life hold whose old key's kill failed) is E27's.
+  // never reports this state. Only an open episode reports it.
   isKillFailed: (key) => personaKillFailureAlerts?.isOpen(key) === true,
   // Left unbound until their Epics bind them, so they answer false:
   // isHeldOnInvalidFlags (E23) and isSequenceOrWaitRunning (E21, E27).

@@ -465,8 +465,11 @@
  * `ordinaryAlertContent`, `survivorAlertContent`, `killFailureNotice` (the
  * destination post as `episodeNotices` holds it), `killFailureRecoveryEntry`
  * (the not-configured route's entry, context `recovery`), with
- * `startupEntriesOf` (one class's entries without their timestamp) and
- * `killFailureLines` (the alerts' own lines).
+ * `startupEntriesOf` (one class's entries without their timestamp),
+ * `killFailureLines` (the alerts' own lines) and the alerts' line builders
+ * (context `recovery`): `killFailureEndedLine`, `killFailurePostedLine`,
+ * `killFailureHeldLine`, `killFailureLoggedLine`, `killFailureNotRaisedLine`
+ * and `killFailureStoppedSurvivorLine`.
  *
  * Pending-only mode is armed directly (`controller.armPendingOnly`) until
  * covered `pending` rows exist. Later work extends this harness in place.
@@ -520,9 +523,12 @@ import {
   KILL_FAILURE_CONTEXT_RECOVERY,
   KILL_FAILURE_VERSION_ORDINARY,
   KILL_FAILURE_VERSION_SURVIVOR,
+  PERSONA_KILL_FAILED_LABEL,
+  describeKillFailureDescriptions,
   killFailureAlertEntryText,
   killFailureAlertText,
   type KillFailureAlertContent,
+  type KillFailureAlertVersion,
   type KillFailureClosing,
 } from '../../src/kill-failure-alert.ts'
 import { LOST_MESSAGE_STATES, STATE_WORDING, type LostMessageState } from '../../src/lost-message.ts'
@@ -543,6 +549,7 @@ import {
   TMUX_UNRESPONSIVE_END_TICK,
   UNCLASSIFIED_ERROR_END_CAPPED,
   UNCLASSIFIED_ERROR_END_LATCHED,
+  type KillFailureEndReason,
   type PersonaEpisodes,
   type TmuxUnresponsiveCondition,
   type TmuxUnresponsiveEndReason,
@@ -555,7 +562,7 @@ import { createPersonaSerializer, type PersonaSerializer } from '../../src/perso
 import { createPersonaRelaunchGate, createPersonaUpPredicate, type PersonaUpQuery } from '../../src/persona-start.ts'
 import type { PersonaDestinationHold } from '../../src/persona-destination-hold.ts'
 import { createNameResolver, type NameResolverWebClient } from '../../src/message-archive.ts'
-import type { KillRetryClock } from '../../src/kill-retry.ts'
+import { KILL_RETRY_ALERT_ORDINARY, type KillRetryAlert, type KillRetryClock } from '../../src/kill-retry.ts'
 import { getSessionByPersona } from '../../src/registry.ts'
 import {
   _resetRestartState,
@@ -2095,9 +2102,68 @@ export function startupEntriesOf(h: RecoveryHarness, classLabel: string): string
   })
 }
 
+/** The prefix of every line persona `key`'s kill-failure alerts log. */
+function killFailureLinePrefix(key: string): string {
+  return `[slack] persona-episodes: persona=${key} ${PERSONA_EPISODE_KIND_KILL_FAILURE} `
+}
+
 /** Persona `key`'s kill-failure alert lines (the alerts' own, in `lines`), in order. */
 export function killFailureLines(h: RecoveryHarness, key: string): string[] {
-  return h.lines.filter((line) => line.startsWith(`[slack] persona-episodes: persona=${key} ${PERSONA_EPISODE_KIND_KILL_FAILURE} `))
+  return h.lines.filter((line) => line.startsWith(killFailureLinePrefix(key)))
+}
+
+// The kill-failure alerts' own log lines (`createKillFailureAlerts`,
+// `src/persona-episodes.ts`), each for the context `recovery`. As the
+// condition's lines above, the fixed words are held here (pinned as literals
+// only in tests/persona-episodes.test.ts); the kind, the versions, the
+// closings, the classes and the rendering of the descriptions come from `src/`.
+
+/** The line of persona `key`'s episode ended silently for `reason`. */
+export function killFailureEndedLine(key: string, reason: KillFailureEndReason): string {
+  return `${killFailureLinePrefix(key)}ended — ${reason}`
+}
+
+/**
+ * The line of `content`'s alert posted at persona `key`'s destination: the
+ * ordinary version names its `closing` (the not-latched one by default); the
+ * survivor version names none.
+ */
+export function killFailurePostedLine(key: string, content: KillFailureAlertContent, closing: KillFailureClosing = KILL_FAILURE_CLOSING_DESTINATION): string {
+  const where = content.version === KILL_FAILURE_VERSION_ORDINARY ? `${KILL_FAILURE_CONTEXT_RECOVERY}; ${closing}` : KILL_FAILURE_CONTEXT_RECOVERY
+  return `${killFailureLinePrefix(key)}${content.version} alert posted to its destination (${where})`
+}
+
+/** The line of an ordinary alert held back: its episode's alert already posted. */
+export function killFailureHeldLine(key: string): string {
+  return `${killFailureLinePrefix(key)}${KILL_FAILURE_VERSION_ORDINARY} alert not posted — its episode's alert already posted`
+}
+
+/** The line of a `version` alert written through the log-only route as one `classLabel` entry, naming `route`. */
+export function killFailureLoggedLine(key: string, version: KillFailureAlertVersion, classLabel: string, route: string): string {
+  return `${killFailureLinePrefix(key)}${version} alert written to the server log and startup-errors.log (${classLabel}) — ${route}`
+}
+
+/**
+ * The line of an ordinary decision whose tries the keep-going check stopped:
+ * not raised, with the decision's descriptions (`quoted`, as
+ * `ordinaryAlertContent` takes them) redacted.
+ */
+export function killFailureNotRaisedLine(key: string, quoted: { last?: Error; earlierSurvivor?: Error } = {}): string {
+  const decision: KillRetryAlert = {
+    kind: KILL_RETRY_ALERT_ORDINARY,
+    ...(quoted.last === undefined ? {} : { lastKillFailedDescription: killFailedDescription(quoted.last) }),
+    ...(quoted.earlierSurvivor === undefined ? {} : { earlierSurvivorDescription: killFailedDescription(quoted.earlierSurvivor) }),
+  }
+  return `${killFailureLinePrefix(key)}${KILL_FAILURE_VERSION_ORDINARY} alert not raised — its tries were stopped (the persona is not up or is torn down, or the server is shutting down), so nothing retries this kill; ${describeKillFailureDescriptions(decision)} (${KILL_FAILURE_CONTEXT_RECOVERY})`
+}
+
+/**
+ * The line of a stopped ordinary decision's `persona-kill-failed` entry (one
+ * that carries an earlier survivor-naming description), after its not-raised
+ * line.
+ */
+export function killFailureStoppedSurvivorLine(key: string): string {
+  return killFailureLoggedLine(key, KILL_FAILURE_VERSION_ORDINARY, PERSONA_KILL_FAILED_LABEL, 'stopped-survivor')
 }
 
 /** The outage class a CONFIG answer raises (b.jg5 SRJ-316). */

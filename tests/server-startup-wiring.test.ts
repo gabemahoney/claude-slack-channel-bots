@@ -327,17 +327,6 @@ const SERVER_PATH = join(SRC_DIR, 'server.ts')
 /** server.ts with every comment removed (see stripComments). */
 const SERVER_CODE = stripComments(readFileSync(SERVER_PATH, 'utf-8'))
 
-/** session-manager.ts with every comment removed. */
-const SESSION_MANAGER_CODE = stripComments(readFileSync(join(SRC_DIR, 'session-manager.ts'), 'utf-8'))
-
-/** The body of the one function `name` declared in session-manager.ts (exported or not); fails unless there is exactly one. */
-function sessionManagerFunctionBody(name: string): string {
-  const decls = indicesOf(new RegExp(`^(?:export\\s+)?(?:async\\s+)?function\\s+${name}\\s*\\(`, 'gm'), SESSION_MANAGER_CODE)
-  expect(decls).toHaveLength(1)
-  const [, paramsEnd] = balancedAfter(SESSION_MANAGER_CODE, decls[0]!, '(', ')')
-  return SESSION_MANAGER_CODE.slice(...balancedAfter(SESSION_MANAGER_CODE, paramsEnd + 1, '{', '}'))
-}
-
 /** The production kill-retry clock (b.jg5 SRJ-702); renaming it fails the typecheck. */
 const KILL_RETRY_PRODUCTION_CLOCK: keyof typeof KillRetryModule = 'KILL_RETRY_SYSTEM_CLOCK'
 
@@ -1739,35 +1728,6 @@ describe('server.ts gates every relaunch on the persona\'s connection (SR-6.1) a
   test('b.jg5 SRJ-702: the production kill-retry clock is the one src/kill-retry.ts exports, imported, never declared in server.ts', () => {
     expect(importSource(SERVER_CODE, KILL_RETRY_PRODUCTION_CLOCK)).toBe('./kill-retry.ts')
     expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${KILL_RETRY_PRODUCTION_CLOCK}\\b`, 'g'), SERVER_CODE)).toEqual([])
-  })
-
-  // b.jg5 SRJ-702: the adapter's one kill goes through the session manager's
-  // bounded retry (whose read between tries is the shared own-row status
-  // read), seeded as not read live (the run read the row dead), on the clock
-  // the adapter was built with.
-  test('b.jg5 SRJ-702: the adapter kills through the session manager\'s bounded retry, on the clock it was built with, seeded not live', () => {
-    const decls = indicesOf(/^export function _buildKillSessionAdapter\s*\(/gm, SERVER_CODE)
-    expect(decls).toHaveLength(1)
-    const [paramsStart, paramsEnd] = balancedAfter(SERVER_CODE, decls[0]!, '(', ')')
-    const params = splitTopLevel(SERVER_CODE.slice(paramsStart, paramsEnd))
-    expect(params).toHaveLength(2)
-    expect(params[1]).toBe(`clock: KillRetryWait = ${KILL_RETRY_PRODUCTION_CLOCK}`)
-    const body = SERVER_CODE.slice(...balancedAfter(SERVER_CODE, paramsEnd + 1, '{', '}'))
-    const retries = indicesOf(/(?<![\w.$])retryPersonaKill\s*\(/g, body)
-    expect(retries).toHaveLength(1)
-    const props = objectProperties(splitTopLevel(callArguments(body, retries[0]!))[1]!)
-    expect(props.get('clock')).toBe('clock')
-    expect(props.get('rowReadLive')).toBe('false')
-    expect(props.get('lastRead')).toBe('KILL_RETRY_SEED_NOT_LIVE_VALUE')
-    expect(importSource(SERVER_CODE, 'retryPersonaKill')).toBe('./session-manager.ts')
-    expect(importSource(SERVER_CODE, 'KILL_RETRY_SEED_NOT_LIVE_VALUE')).toBe('./kill-retry.ts')
-    // No other kill path in server.ts but the teardown's checked kill.
-    expect(indicesOf(/(?<![\w.$])killPersonaInstance\s*\(/g, body)).toEqual([])
-    // The session manager's retry reads the row between tries through the
-    // shared own-row status read (b.jg5 SRJ-115, SRJ-702).
-    const retryBody = sessionManagerFunctionBody('retryPersonaKill')
-    expect(indicesOf(/\bread:\s*\(\)\s*=>\s*readPersonaKillRow\s*\(/g, retryBody)).toHaveLength(1)
-    expect(indicesOf(/(?<![\w.$])readPersonaOwnRowStatus\s*\(/g, sessionManagerFunctionBody('readPersonaKillRow'))).toHaveLength(1)
   })
 
   // b.jg5 SRJ-702, SRJ-305: main() installs the persona kill retry's

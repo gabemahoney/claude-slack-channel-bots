@@ -15,7 +15,7 @@
  * a description quoted unredacted fails the leak check.
  *
  * The module's import boundary is checked by walking its runtime imports
- * through `src/` (`runtimeLoads`, `tests/test-helpers/source-audit.ts`).
+ * through `src/` (`forbiddenServerLoads`, `tests/test-helpers/source-audit.ts`).
  *
  * No process, no timer, no top-level mock.module(), no value import of
  * `Client` or `resolveSystemBinary`, no Phase-1-only named import.
@@ -85,7 +85,7 @@ import {
 } from './test-helpers/agent-director-stub.ts'
 import { LAUNCH_START_PRE_PERSONA_KEY } from './test-helpers/conflict-cases.ts'
 import { REDACTED_SENTINEL_TAIL, assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
-import { importedSpecifiers, runtimeLoads, srcModules } from './test-helpers/source-audit.ts'
+import { forbiddenServerLoads } from './test-helpers/source-audit.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -491,7 +491,7 @@ function expectedRoute(version: KillFailureAlertVersion, context: KillFailureAle
   const survivor = version === KILL_FAILURE_VERSION_SURVIVOR
   const logOnly = (route: string, ordinaryClass: string, closing: KillFailureClosing, printed = false): KillFailureAlertRoute =>
     ({ route, destination: false, classLabel: survivor ? PERSONA_KILL_SURVIVOR_LABEL : ordinaryClass, printed, opensEpisode: false, closing, closingSentence: killFailureClosingSentence(version, closing) }) as KillFailureAlertRoute
-  if (context === KILL_FAILURE_CONTEXT_START_SWEEP) return logOnly(KILL_FAILURE_ROUTE_START_SWEEP, 'orphan-cleanup', KILL_FAILURE_CLOSING_LOG_ONLY)
+  if (context === KILL_FAILURE_CONTEXT_START_SWEEP) return logOnly(KILL_FAILURE_ROUTE_START_SWEEP, ORPHAN_CLEANUP_LABEL, KILL_FAILURE_CLOSING_LOG_ONLY)
   if (context === KILL_FAILURE_CONTEXT_CLI_TEARDOWN) return logOnly(KILL_FAILURE_ROUTE_CLI_TEARDOWN, PERSONA_KILL_FAILED_LABEL, KILL_FAILURE_CLOSING_CLI_TEARDOWN, true)
   if (context === KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN) return logOnly(KILL_FAILURE_ROUTE_PERSONA_TEARDOWN, 'persona-teardown-notice', KILL_FAILURE_CLOSING_LOG_ONLY)
   if (context === KILL_FAILURE_CONTEXT_OLD_LIFE_WAIT || !configured) return logOnly(KILL_FAILURE_ROUTE_NOT_CONFIGURED, PERSONA_KILL_FAILED_LABEL, KILL_FAILURE_CLOSING_LOG_ONLY)
@@ -515,8 +515,8 @@ describe('kill-failure alert: route selection (b.jg5 SRJ-704, SRJ-1013)', () => 
     ])
   })
 
-  test('the start sweep\'s class, which reconcileOrphans\' own entries share, is orphan-cleanup', () => {
-    expect(ORPHAN_CLEANUP_LABEL).toBe('orphan-cleanup')
+  test('the classes: the start sweep\'s (which reconcileOrphans\' own entries share) is orphan-cleanup; the ordinary version\'s persona-kill-failed; the survivor version\'s persona-kill-survivor', () => {
+    expect([ORPHAN_CLEANUP_LABEL, PERSONA_KILL_FAILED_LABEL, PERSONA_KILL_SURVIVOR_LABEL]).toEqual(['orphan-cleanup', 'persona-kill-failed', 'persona-kill-survivor'])
   })
 
   test.each(ROUTE_ROWS)('context %s, %s version, configured %p, latched %p: the route, class, print, episode and closing sentence SRJ-704 gives', (context, version, configured, latched) => {
@@ -534,7 +534,7 @@ describe('kill-failure alert: route selection (b.jg5 SRJ-704, SRJ-1013)', () => 
       new Set([KILL_FAILURE_ROUTE_START_SWEEP, KILL_FAILURE_ROUTE_CLI_TEARDOWN, KILL_FAILURE_ROUTE_PERSONA_TEARDOWN, KILL_FAILURE_ROUTE_NOT_CONFIGURED, KILL_FAILURE_ROUTE_DESTINATION]),
     )
     expect(new Set(routes.flatMap((r) => (r.classLabel === undefined ? [] : [r.classLabel])))).toEqual(
-      new Set(['orphan-cleanup', PERSONA_KILL_FAILED_LABEL, 'persona-teardown-notice', PERSONA_KILL_SURVIVOR_LABEL]),
+      new Set([ORPHAN_CLEANUP_LABEL, PERSONA_KILL_FAILED_LABEL, 'persona-teardown-notice', PERSONA_KILL_SURVIVOR_LABEL]),
     )
     expect(new Set(routes.filter((r) => r.destination).map((r) => r.closing))).toEqual(new Set([KILL_FAILURE_CLOSING_DESTINATION, KILL_FAILURE_CLOSING_DESTINATION_LATCHED]))
     expect(routes.filter((r) => r.printed).map((r) => r.route)).toEqual(routes.filter((r) => r.route === KILL_FAILURE_ROUTE_CLI_TEARDOWN).map((r) => r.route))
@@ -545,22 +545,12 @@ describe('kill-failure alert: route selection (b.jg5 SRJ-704, SRJ-1013)', () => 
 // Import boundary: no server-only module (E25, E26, E27, E29 and E33 reuse it)
 // ---------------------------------------------------------------------------
 
-/** Server-only `src/` modules: the notifier, outage state, the latch, the episodes, the server, the session manager and restart. */
-const SERVER_ONLY_MODULES = /^(?:outage-state|conflict-latch|persona-episodes|server|session-manager|restart)\.ts$|notifier/
-
 describe('kill-failure alert: import boundary', () => {
   test('the module loads, through its runtime imports in src/, no server-only module, no Slack client module and no @slack/ package', () => {
-    const modules = srcModules()
-    const loads = runtimeLoads(modules, 'kill-failure-alert.ts')
+    const { loads, forbidden } = forbiddenServerLoads('kill-failure-alert.ts')
     // Not vacuous: the walk reaches the one survivor detector and the shared renderer.
     expect(loads.modules.has('ad-description-phrases.ts')).toBe(true)
     expect(loads.modules.has('persona-connection-errors.ts')).toBe(true)
-    const forbidden = [
-      ...[...loads.modules]
-        .filter(([name]) => SERVER_ONLY_MODULES.test(name) || (/slack/i.test(name) && importedSpecifiers(modules.get(name)!).length > 0))
-        .map(([, chain]) => chain.join(' -> ')),
-      ...loads.packages.filter(({ specifier }) => specifier.startsWith('@slack/')).map(({ chain, specifier }) => `${chain.join(' -> ')} -> ${specifier}`),
-    ]
     expect(forbidden).toEqual([])
   })
 })

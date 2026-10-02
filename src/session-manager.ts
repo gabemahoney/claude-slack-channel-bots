@@ -1175,8 +1175,9 @@ export function _resetConfiguredPersonaQuery(): void {
  * `main()`'s, built over its notice episodes. The persona kills' alert
  * (`raisePersonaKillFailureAlert`) raises through it, and every own-row read
  * that reads the row `ended` or `missing`, or finds it gone, ends the
- * persona's kill-failure episode through it (`endKillFailureEpisodeOnRead`).
- * With none installed (unit tests, the integration driver) an alert is
+ * persona's kill-failure episode through it (`endKillFailureEpisodeOnRead`),
+ * as does the collision ladder's delete of the row when it succeeds or
+ * answers `ErrSpawnNotFound` (`tryDelete`). With none installed (unit tests, the integration driver) an alert is
  * written as one log line only, and no episode is ended.
  */
 let killFailureAlerts: KillFailureAlerts | undefined
@@ -6540,7 +6541,7 @@ function buildSpawnParams(persona: Persona, config: PersonaConfig, configDirLabe
  * A kill made inside a launch or recovery attempt for the persona (the
  * collision ladder's replacement kills, the restart path's kill).
  */
-export const KILL_CONTEXT_ATTEMPT = 'attempt'
+const KILL_CONTEXT_ATTEMPT = 'attempt'
 /** A persona teardown's kill: no launch or recovery attempt; it arms nothing (b.jg5 SRJ-110; hatch A3). */
 export const KILL_CONTEXT_TEARDOWN = 'teardown'
 
@@ -6811,7 +6812,11 @@ export async function retryPersonaKill(key: string, options: PersonaKillRetryOpt
  * outcome's version re-check decided that the server stops, is raised with
  * `stopped`: no retry follows, so for a configured persona the alerts post
  * nothing (their text would say CSCB keeps retrying) and open no episode,
- * and write one line with the decision and the redacted descriptions; for a
+ * and write one line with the decision and the redacted descriptions, and,
+ * when the decision carries an earlier survivor-naming description (whose
+ * failure is the only report of the surviving process), one
+ * `persona-kill-failed` entry with the log-only closing sentence and the
+ * `recovery` context through the log-only route; for a
  * persona no longer in the applied configuration (one removed while the
  * tries ran) the not-configured route's entry is written as usual. With no
  * alerts installed, one line carries the decision instead. A `none`
@@ -7136,6 +7141,11 @@ async function selfHealTmuxCollisionAndRespawn(
  * ENVIRONMENT, CONFIG or UNCLASSIFIED) answers `failed`; both with one line
  * and no notice or `spawn-failed` entry. Any other failure answers `failed`
  * with the spawn-failure notice (and a `spawn-failed` entry at startup).
+ *
+ * A delete that succeeded or answered `ErrSpawnNotFound` (by name) leaves
+ * the persona's row gone, so it ends the persona's kill-failure episode
+ * silently with the row-gone reason (b.jg5 SRJ-704, SRJ-1016;
+ * `KILL_FAILURE_END_ROW_GONE`) before the chain goes on or stops as above.
  */
 async function tryDelete(
   key: string,
@@ -7145,8 +7155,10 @@ async function tryDelete(
 ): Promise<SpawnPersonaResult | undefined> {
   try {
     await deleteInstanceRow(key)
+    endKillFailureEpisode(key, KILL_FAILURE_END_ROW_GONE)
     return undefined
   } catch (err) {
+    if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) endKillFailureEpisode(key, KILL_FAILURE_END_ROW_GONE)
     // b.jg5 SRJ-105, SRJ-512: an UNUSABLE NAME delete latches the persona
     // and stops the chain with no notice and no entry.
     const latched = await unusableNameAt(key, err, lastRead, 'tryDelete', 'delete', ref)

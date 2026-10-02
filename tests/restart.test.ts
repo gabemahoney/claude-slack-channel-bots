@@ -115,7 +115,7 @@ import {
   type EscalateDeadVerdict,
 } from '../src/session-manager.ts'
 import { FULL_PANE_READ_LINES, PROBE_PANE_READ_LINES } from '../src/pane-read.ts'
-import { KILL_FAILURE_ROUTE_NOT_CONFIGURED, PERSONA_KILL_FAILED_LABEL } from '../src/kill-failure-alert.ts'
+import { KILL_FAILURE_ROUTE_NOT_CONFIGURED, KILL_FAILURE_VERSION_ORDINARY, PERSONA_KILL_FAILED_LABEL } from '../src/kill-failure-alert.ts'
 import {
   conflictNoticeText,
   createConflictLatch,
@@ -161,7 +161,6 @@ import {
   errSystemInstallDisappeared,
   errTmuxKillFailed,
   errTmuxCaptureFailed,
-  errUnknownErrorName,
   errUnusableName,
   cannedKillResult,
   KILL_FAILED_DESCRIPTIONS,
@@ -209,7 +208,9 @@ import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import {
   callCounts,
   callCountsSince,
+  killFailureEndedLine,
   killFailureLines,
+  killFailureLoggedLine,
   killFailureNotice,
   killFailureRecoveryEntry,
   makeRecoveryHarness,
@@ -234,7 +235,6 @@ import {
 import {
   createPersonaEpisodes,
   KILL_FAILURE_END_ROW_FINISHED,
-  PERSONA_EPISODE_KIND_KILL_FAILURE,
   TMUX_UNRESPONSIVE_ONSET_FLOOR_MS,
   tmuxUnresponsiveOnsetText,
 } from '../src/persona-episodes.ts'
@@ -2856,6 +2856,7 @@ describe('b.dup: a persona whose row is ended just before its reconnect lands is
     } finally {
       console.error = orig
     }
+    assertNoLeak({ lines })
     return { KEY, CWD, outcome, sendKeysCalls, findMissingCalls, killSessionCalls, launchSessionCalls, raised, lines }
   }
 
@@ -5753,19 +5754,25 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNAVAILABLE or UNCLASSIFIED kill, send-keys
       ['an AgentDirectorError of a name CSCB gives no handling (UNCLASSIFIED)', (verb) => errGeneric(verb, 'ErrSomethingElse', 'it broke'), UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED],
     ]
 
-    // b.jg5 SRJ-110, SRJ-313 (AC 69 for the UNCLASSIFIED rows): the kill's
-    // refusal is the adapter's, so no step follows it and nothing is counted.
+    // b.jg5 SRJ-110, SRJ-313 (AC 69 for the UNCLASSIFIED rows; HO C2 Verify,
+    // AC 24's restart-path half, for these classes): the kill's refusal is the
+    // adapter's, so no step follows it (no launch, spawn, resume or delete:
+    // the exact call counts) and nothing is counted (P's failure count one
+    // short of the cap stays, with no recordFailure, recordSuccess or cap).
     // b.jg5 SRJ-704: of these, only an ErrTmuxKillFailed raises the ordinary
-    // kill-failure alert at P's destination; every other answer posts nothing.
-    test.each(REFUSING_ANSWERS)('the kill after a dead reading answers %s → refused: no launch, no recordFailure, no onCapReached; nothing posted but an ErrTmuxKillFailed\'s kill-failure alert; the timer is armed (cause %s)', async (_label, make, cause) => {
+    // kill-failure alert at P's destination (each description: the alert
+    // describe below); every other answer posts nothing.
+    test.each(REFUSING_ANSWERS)('the kill after a dead reading answers %s → refused: no launch, spawn, resume or delete; no recordFailure, recordSuccess or onCapReached; nothing latched; nothing posted but an ErrTmuxKillFailed\'s kill-failure alert; the timer is armed (cause %s)', async (_label, make, cause) => {
       const { h, p, cwd } = build()
       rowReadsUntilSpawn(h, 'ended')
       const err = make('kill')
       h.script({ killError: err })
 
       expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
+      await h.settle()
 
       expect(callCounts(h)).toEqual({ statusCalls: 1, killCalls: 1 })
+      expect(h.latch.isLatched(p)).toBe(false)
       expect(h.stub.calls.killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(p)])
       expect(h.stub.spawnedIds()).toEqual([])
       expect(h.errors).toContain(KILL_REFUSED_LINE(p, killOutcomeOf({ thrown: err })))
@@ -5824,15 +5831,11 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNAVAILABLE or UNCLASSIFIED kill, send-keys
     // deletes nothing; the outcome is `refused` for UNAVAILABLE, ENVIRONMENT,
     // CONFIG and UNCLASSIFIED and `latched` for CONFLICT and UNUSABLE NAME.
     // P's failure count starts one short of the cap, so a recordFailure would
-    // cap it and a recordSuccess would reset it.
+    // cap it and a recordSuccess would reset it. The UNAVAILABLE values and
+    // `ErrInternal` are `REFUSING_ANSWERS`' rows above.
     test.each<[string, () => Error, RestartWorkOutcome]>([
-      ...KILL_FAILED_DESCRIPTIONS.map((d): [string, () => Error, RestartWorkOutcome] => [`ErrTmuxKillFailed (${d})`, () => errTmuxKillFailed(undefined, d), RESTART_OUTCOME_REFUSED]),
-      ['ErrTmuxUnresponsive', () => errTmuxUnresponsive('kill'), RESTART_OUTCOME_REFUSED],
       ...RESTART_KILL_CONFLICT_CASE_ROWS.map((row): [string, () => Error, RestartWorkOutcome] => [`ErrTmuxSessionConflict (${row.name})`, row.build, RESTART_OUTCOME_LATCHED]),
       ['ErrTmuxNotAvailable', () => errTmuxNotAvailable(undefined, 'kill'), RESTART_OUTCOME_REFUSED],
-      ['ErrInternal', () => errInternal(), RESTART_OUTCOME_REFUSED],
-      ['ErrUnknownErrorName', () => errUnknownErrorName(), RESTART_OUTCOME_REFUSED],
-      ['ErrCallTimeout', () => errCallTimeout('kill'), RESTART_OUTCOME_REFUSED],
       ...RESTART_KILL_UNUSABLE_NAME_CASE_ROWS.map((row): [string, () => Error, RestartWorkOutcome] => [`UNUSABLE NAME (${row.name})`, row.build, RESTART_OUTCOME_LATCHED]),
       ['ErrConfigMalformed', () => errConfigMalformed(), RESTART_OUTCOME_REFUSED],
       ['ErrSystemInstallDisappeared (UNCLASSIFIED)', () => errSystemInstallDisappeared('kill'), RESTART_OUTCOME_REFUSED],
@@ -6952,7 +6955,7 @@ describe('b.jg5 SRJ-704, SRJ-1007: the kill-failure alert at the restart path\'s
     expect(h.episodeNotices).toEqual([alert, alert])
     const added = killFailureLines(h, p).slice(firstLines.length)
     expect(added).toHaveLength(2)
-    expect(added[0]).toBe(`[slack] persona-episodes: persona=${p} ${PERSONA_EPISODE_KIND_KILL_FAILURE} ended — ${KILL_FAILURE_END_ROW_FINISHED}`)
+    expect(added[0]).toBe(killFailureEndedLine(p, KILL_FAILURE_END_ROW_FINISHED))
     expect(added[1]).toBe(firstLines[0])
     expect(h.killFailureOpen(p)).toBe(true)
   })
@@ -6978,9 +6981,7 @@ describe('b.jg5 SRJ-704, SRJ-1007: the kill-failure alert at the restart path\'s
     expect(h.startupErrors()).toHaveLength(1)
     expect(h.episodeNotices).toEqual([])
     expect(h.killFailureOpen(p)).toBe(false)
-    expect(killFailureLines(h, p)).toEqual([
-      `[slack] persona-episodes: persona=${p} ${PERSONA_EPISODE_KIND_KILL_FAILURE} ordinary alert written to the server log and startup-errors.log (${PERSONA_KILL_FAILED_LABEL}) — ${KILL_FAILURE_ROUTE_NOT_CONFIGURED}`,
-    ])
+    expect(killFailureLines(h, p)).toEqual([killFailureLoggedLine(p, KILL_FAILURE_VERSION_ORDINARY, PERSONA_KILL_FAILED_LABEL, KILL_FAILURE_ROUTE_NOT_CONFIGURED)])
   })
 
   // b.jg5 SRJ-703, SRJ-702: a success with no survivor-naming failure before

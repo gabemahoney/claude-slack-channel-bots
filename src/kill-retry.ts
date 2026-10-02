@@ -448,7 +448,7 @@ function emit(options: KillRetryOptions, line: string): void {
 // ---------------------------------------------------------------------------
 
 /** Another try follows, after the wait and a read. */
-export const KILL_RETRY_NEXT_AGAIN = 'again'
+const KILL_RETRY_NEXT_AGAIN = 'again'
 /** The outcome stands: a success. */
 export const KILL_RETRY_NEXT_SUCCESS = 'success'
 /** The outcome stands: a class that is never tried again. */
@@ -456,9 +456,9 @@ export const KILL_RETRY_NEXT_NOT_RETRIED = 'not-retried'
 /** The outcome stands: the row was not last read live, so one try. */
 export const KILL_RETRY_NEXT_NOT_LIVE = 'not-live'
 /** The outcome stands: every try was used. */
-export const KILL_RETRY_NEXT_EXHAUSTED = 'exhausted'
+const KILL_RETRY_NEXT_EXHAUSTED = 'exhausted'
 /** The outcome stands: the pass budget was spent, so one try. */
-export const KILL_RETRY_NEXT_BUDGET_SPENT = 'budget-spent'
+const KILL_RETRY_NEXT_BUDGET_SPENT = 'budget-spent'
 
 /** What follows a try. */
 export type KillRetryTryNext =

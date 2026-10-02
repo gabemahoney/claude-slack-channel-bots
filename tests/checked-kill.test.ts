@@ -14,7 +14,7 @@
  * value of a class SRJ-110 has no kill row for (UNCLASSIFIED, its class kept
  * as `unlistedClass`) keep their thrown value and their class. The
  * module's import boundary is checked by walking its runtime imports through
- * `src/` (`runtimeLoads`, `tests/test-helpers/source-audit.ts`).
+ * `src/` (`forbiddenServerLoads`, `tests/test-helpers/source-audit.ts`).
  *
  * No process, no real timer, no top-level mock.module(), no value import of
  * `Client` or `resolveSystemBinary`, no Phase-1-only named import.
@@ -102,7 +102,7 @@ import {
   fakeToken,
   sentinelInMessage,
 } from './test-helpers/credentials.ts'
-import { importedSpecifiers, runtimeLoads, srcModules } from './test-helpers/source-audit.ts'
+import { forbiddenServerLoads } from './test-helpers/source-audit.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -124,8 +124,12 @@ function errCwd(Cls: typeof ErrCwdNotFound | typeof ErrCwdNotADirectory): Error 
 /** The one call every checked kill makes: the instance id alone, no `include_finished` (SRJ-106). */
 const PLAIN_KILL_CALL = { claude_instance_id: STUB_INSTANCE_ID }
 
-/** A non-success row: its label, the value the kill throws, and the SRJ-110 class it must carry. */
-type NonSuccessRow = readonly [label: string, build: () => unknown, expected: AdErrorClass]
+/**
+ * A non-success row: its label, the value the kill throws, the SRJ-110 class
+ * it must carry and, for a value of a class SRJ-110 has no kill row for, that
+ * class (kept as `unlistedClass`).
+ */
+type NonSuccessRow = readonly [label: string, build: () => unknown, expected: AdErrorClass, unlistedClass?: KillUnlistedClass]
 
 /**
  * HO C2's non-success list (SRJ-110's Test line), each built by name, plus the
@@ -145,12 +149,12 @@ const NON_SUCCESS_ROWS: readonly NonSuccessRow[] = [
   ['errConfigMalformed', () => errConfigMalformed(), AD_ERROR_CLASS_CONFIG],
   ['a plain Error (not an agent-director error)', () => new Error('boom'), AD_ERROR_CLASS_UNAVAILABLE],
   ['errSystemInstallDisappeared', () => errSystemInstallDisappeared('kill'), AD_ERROR_CLASS_UNCLASSIFIED],
-  ['errTmuxSessionCreate (LAUNCH FAILURE: no SRJ-110 row)', () => errTmuxSessionCreate('kill'), AD_ERROR_CLASS_UNCLASSIFIED],
-  ['errSpawnNotResumable (a STATE name other than ErrSpawnNotFound)', () => errSpawnNotResumable(), AD_ERROR_CLASS_UNCLASSIFIED],
-  ['errInstanceIdCollision (a STATE name other than ErrSpawnNotFound)', () => errInstanceIdCollision(), AD_ERROR_CLASS_UNCLASSIFIED],
-  ['errInvalidFlags (a STATE name other than ErrSpawnNotFound)', () => errInvalidFlags('kill'), AD_ERROR_CLASS_UNCLASSIFIED],
-  ['ErrCwdNotFound (DIRECTORY: no SRJ-110 row)', () => errCwd(ErrCwdNotFound), AD_ERROR_CLASS_UNCLASSIFIED],
-  ['ErrCwdNotADirectory (DIRECTORY: no SRJ-110 row)', () => errCwd(ErrCwdNotADirectory), AD_ERROR_CLASS_UNCLASSIFIED],
+  ['errTmuxSessionCreate (LAUNCH FAILURE: no SRJ-110 row)', () => errTmuxSessionCreate('kill'), AD_ERROR_CLASS_UNCLASSIFIED, AD_ERROR_CLASS_LAUNCH_FAILURE],
+  ['errSpawnNotResumable (a STATE name other than ErrSpawnNotFound)', () => errSpawnNotResumable(), AD_ERROR_CLASS_UNCLASSIFIED, AD_ERROR_CLASS_STATE],
+  ['errInstanceIdCollision (a STATE name other than ErrSpawnNotFound)', () => errInstanceIdCollision(), AD_ERROR_CLASS_UNCLASSIFIED, AD_ERROR_CLASS_STATE],
+  ['errInvalidFlags (a STATE name other than ErrSpawnNotFound)', () => errInvalidFlags('kill'), AD_ERROR_CLASS_UNCLASSIFIED, AD_ERROR_CLASS_STATE],
+  ['ErrCwdNotFound (DIRECTORY: no SRJ-110 row)', () => errCwd(ErrCwdNotFound), AD_ERROR_CLASS_UNCLASSIFIED, AD_ERROR_CLASS_DIRECTORY],
+  ['ErrCwdNotADirectory (DIRECTORY: no SRJ-110 row)', () => errCwd(ErrCwdNotADirectory), AD_ERROR_CLASS_UNCLASSIFIED, AD_ERROR_CLASS_DIRECTORY],
 ]
 
 /** The GONE values (SRJ-104: for `kill`, gone is success), each built by name with the stub. */
@@ -238,9 +242,9 @@ describe('checkedKill: non-success (SRJ-110, SRJ-701)', () => {
     ]))
   })
 
-  test.each(NON_SUCCESS_ROWS.map(([label, build, expected]) => [label, expected, build] as const))(
+  test.each(NON_SUCCESS_ROWS.map(([label, build, expected, unlistedClass]) => [label, expected, build, unlistedClass] as const))(
     '%s is not-killed with class %s, keeps the thrown value and never lets the next step run',
-    async (_label, expected, build) => {
+    async (_label, expected, build, unlistedClass) => {
       const thrown = build()
       const { outcome, calls } = await killThroughStub({ killError: thrown as Error })
       expect(outcome.kind).toBe(KILL_OUTCOME_NOT_KILLED)
@@ -253,9 +257,11 @@ describe('checkedKill: non-success (SRJ-110, SRJ-701)', () => {
       // The class is the classifier's, by name, wherever SRJ-110 has a row for it.
       const classified = classifyAdError(thrown).errorClass
       if ((KILL_FAILURE_CLASSES as readonly string[]).includes(classified)) expect(outcome.errorClass as AdErrorClass).toBe(classified)
-      // A class SRJ-110 has no row for is kept as `unlistedClass`; every other value carries none.
-      const unlisted = (KILL_UNLISTED_CLASSES as readonly string[]).includes(classified) ? classified : undefined
-      expect('unlistedClass' in outcome ? outcome.unlistedClass : undefined).toBe(unlisted as never)
+      // A class SRJ-110 has no row for (b.jg5 SRJ-104, SRJ-110) is UNCLASSIFIED
+      // with that class kept as `unlistedClass`, and nothing else; every other
+      // value carries none.
+      expect('unlistedClass' in outcome ? outcome.unlistedClass : undefined).toBe(unlistedClass)
+      if (unlistedClass !== undefined) expect(outcome).toEqual({ kind: KILL_OUTCOME_NOT_KILLED, errorClass: AD_ERROR_CLASS_UNCLASSIFIED, error: thrown, unlistedClass })
       // No re-check is made here (the caller's), and no stop is decided.
       expect('recheck' in outcome).toBe(false)
       expect(killOutcomeStopsServer(outcome)).toBe(false)
@@ -264,21 +270,6 @@ describe('checkedKill: non-success (SRJ-110, SRJ-701)', () => {
 
   test('KILL_UNLISTED_CLASSES is the three classes SRJ-110 has no kill row for (SRJ-104, SRJ-110)', () => {
     expect(new Set(KILL_UNLISTED_CLASSES)).toEqual(new Set([AD_ERROR_CLASS_LAUNCH_FAILURE, AD_ERROR_CLASS_STATE, AD_ERROR_CLASS_DIRECTORY]))
-  })
-
-  test.each<[string, () => Error, KillUnlistedClass]>([
-    ['errTmuxSessionCreate', () => errTmuxSessionCreate('kill'), AD_ERROR_CLASS_LAUNCH_FAILURE],
-    ['errInstanceIdCollision', () => errInstanceIdCollision(), AD_ERROR_CLASS_STATE],
-    ['errInvalidFlags', () => errInvalidFlags('kill'), AD_ERROR_CLASS_STATE],
-    ['ErrCwdNotFound', () => errCwd(ErrCwdNotFound), AD_ERROR_CLASS_DIRECTORY],
-  ])('b.jg5 SRJ-104, SRJ-110: %s at a kill is UNCLASSIFIED with unlistedClass %s', (_label, build, unlistedClass) => {
-    const thrown = build()
-    expect(killOutcomeOf({ thrown })).toEqual({
-      kind: KILL_OUTCOME_NOT_KILLED,
-      errorClass: AD_ERROR_CLASS_UNCLASSIFIED,
-      error: thrown,
-      unlistedClass,
-    })
   })
 
   test.each([...KILL_FAILED_DESCRIPTIONS])('errTmuxKillFailed (%s) is told apart and carries its own description, read from the value', async (d) => {
@@ -486,21 +477,11 @@ describe('describeKillOutcome', () => {
 // Import boundary: no server-only module (so E33's CLI can use it)
 // ---------------------------------------------------------------------------
 
-/** Server-only `src/` modules: the notifier, outage state, the latch, the episodes, the server, the session manager and restart. */
-const SERVER_ONLY_MODULES = /^(?:outage-state|conflict-latch|persona-episodes|server|session-manager|restart)\.ts$|notifier/
-
 describe('checked-kill: import boundary', () => {
   test('the module loads, through its runtime imports in src/, no server-only module, no Slack module and no @slack/ package', () => {
-    const modules = srcModules()
-    const loads = runtimeLoads(modules, 'checked-kill.ts')
+    const { loads, forbidden } = forbiddenServerLoads('checked-kill.ts')
     // Not vacuous: the walk reaches the classifier it decides every class through.
     expect(loads.modules.has('ad-error-class.ts')).toBe(true)
-    const forbidden = [
-      ...[...loads.modules]
-        .filter(([name]) => SERVER_ONLY_MODULES.test(name) || (/slack/i.test(name) && importedSpecifiers(modules.get(name)!).length > 0))
-        .map(([, chain]) => chain.join(' -> ')),
-      ...loads.packages.filter(({ specifier }) => specifier.startsWith('@slack/')).map(({ chain, specifier }) => `${chain.join(' -> ')} -> ${specifier}`),
-    ]
     expect(forbidden).toEqual([])
   })
 })

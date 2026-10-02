@@ -564,7 +564,7 @@ import { resolveJsonlPath } from '../src/cozempic.ts'
 import type { PersonaNoticeOptions } from '../src/persona-notifier.ts'
 import type { PersonaDestinationHold } from '../src/persona-destination-hold.ts'
 import { PERSONA_CONFIG_DIR_UNRESOLVABLE, PERSONA_DESTINATION_FAILED } from '../src/persona-diagnostics.ts'
-import { describeThrownValue, renderLogMessageText } from '../src/persona-connection-errors.ts'
+import { describeThrownValue } from '../src/persona-connection-errors.ts'
 import {
   makeDeferredConnect,
   makeStubSlack,
@@ -765,16 +765,13 @@ import { promptRowAbsentAtPaneReadLine, promptRowPaneGoneLine, workingRowAbsentA
 import {
   KILL_FAILURE_END_ROW_FINISHED,
   KILL_FAILURE_END_ROW_GONE,
-  PERSONA_EPISODE_KIND_KILL_FAILURE,
   createKillFailureAlerts,
   createPersonaEpisodes,
   type UnclassifiedErrorSink,
 } from '../src/persona-episodes.ts'
 import {
-  KILL_FAILURE_CLOSING_DESTINATION,
   KILL_FAILURE_CLOSING_DESTINATION_LATCHED,
   KILL_FAILURE_CLOSING_LOG_ONLY,
-  KILL_FAILURE_CONTEXT_RECOVERY,
   KILL_FAILURE_CONTEXT_START_SWEEP,
   KILL_FAILURE_ORDINARY_DESTINATION_CLOSING,
   KILL_FAILURE_VERSION_ORDINARY,
@@ -791,9 +788,15 @@ import {
   adConfigMalformedRaiseLines,
   collided,
   conditionStartedLines,
+  expectLostMessageReports,
+  killFailureEndedLine,
+  killFailureHeldLine,
   killFailureLines,
+  killFailureNotRaisedLine,
   killFailureNotice,
+  killFailurePostedLine,
   killFailureRecoveryEntry,
+  killFailureStoppedSurvivorLine,
   makeRecoveryHarness,
   ordinaryAlertContent,
   personaOf as harnessPersona,
@@ -4725,12 +4728,12 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
     // only when that persona is in the applied configuration; for an absent
     // persona's row it is only logged and recorded in the row's
     // `orphan-cleanup` entry.
-    test.each<[string, () => Error, OutageClass, string, string, boolean]>([
-      ['ENVIRONMENT', () => errTmuxNotAvailable(undefined, 'kill'), 'tmux-unavailable', 'cscb_alpha_old', 'alpha', true],
-      ['ENVIRONMENT', () => errTmuxNotAvailable(undefined, 'kill'), 'tmux-unavailable', 'cscb_departed', 'departed', false],
-      ['CONFIG', () => errConfigMalformed(), 'ad-config-malformed', 'cscb_alpha_old', 'alpha', true],
-      ['CONFIG', () => errConfigMalformed(), 'ad-config-malformed', 'cscb_departed', 'departed', false],
-    ])('b.jg5 SRJ-110 (hatch A3): an %s answer at the sweep kill of %s\'s row (%s, configured: %p) raises %s only for a configured persona; recorded in the row\'s orphan-cleanup entry; no retry timer armed, nothing deleted', async (_class, make, flag, id, persona, configured) => {
+    test.each<[string, string, string, boolean, OutageClass, () => Error]>([
+      ['ENVIRONMENT', 'alpha', 'cscb_alpha_old', true, 'tmux-unavailable', () => errTmuxNotAvailable(undefined, 'kill')],
+      ['ENVIRONMENT', 'departed', 'cscb_departed', false, 'tmux-unavailable', () => errTmuxNotAvailable(undefined, 'kill')],
+      ['CONFIG', 'alpha', 'cscb_alpha_old', true, 'ad-config-malformed', () => errConfigMalformed()],
+      ['CONFIG', 'departed', 'cscb_departed', false, 'ad-config-malformed', () => errConfigMalformed()],
+    ])('b.jg5 SRJ-110 (hatch A3): an %s answer at the sweep kill of %s\'s row (%s, configured: %p) raises %s only for a configured persona; recorded in the row\'s orphan-cleanup entry; no retry timer armed, nothing deleted', async (_class, persona, id, configured, flag, make) => {
       const err = make()
 
       const r = await sweepOne(id, persona, { killError: err })
@@ -14954,37 +14957,10 @@ describe('b.jg5 SRJ-702: the collision ladder\'s replacement kill of a row read 
 
     const result = await h.drive(h.launch(p))
 
-    expect(result.action).not.toBe('failed')
+    expect(result).toStrictEqual({ key: p, action: 'spawned' })
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 2, kill: 2, delete: 1 }))
     expect(h.triggers).toEqual([])
     expect(decisionLines(h, KILL_RETRY_ALERT_SURVIVOR)).toEqual([])
-  })
-
-  test('a survivor-naming ErrTmuxKillFailed, then a read of ended: the tries end as a success with no further kill, the delete and the fresh spawn follow, and the tries call for the survivor version; nothing is armed', async () => {
-    const { h, p } = srj105Build()
-    replaceLiveRow(h, p, {
-      killQueue: [cannedErr(errTmuxKillFailed(undefined, 'pane-process-survived'))],
-      statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))],
-    })
-
-    const result = await h.drive(h.launch(p))
-
-    expect(result.action).not.toBe('failed')
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 2, kill: 1, delete: 1 }))
-    expect(decisionLines(h, KILL_RETRY_ALERT_SURVIVOR)).toHaveLength(1)
-    expect(decisionLines(h, KILL_RETRY_ALERT_ORDINARY)).toEqual([])
-    expect(h.triggers).toEqual([])
-  })
-
-  test('ErrTmuxKillFailed naming no survivor at every try: refused, armed once with the kill-failed cause, and the tries call for the ordinary version', async () => {
-    const { h, p } = srj105Build()
-    replaceLiveRow(h, p, { killError: errTmuxKillFailed() })
-
-    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'failed', refused: true })
-
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, kill: KILL_RETRY_TRIES }))
-    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }])
-    expect(decisionLines(h, KILL_RETRY_ALERT_ORDINARY)).toHaveLength(1)
   })
 
   // b.jg5 SRJ-702 (hatch A2), SRJ-502: a read between tries that latches P
@@ -15009,15 +14985,14 @@ describe('b.jg5 SRJ-702: the collision ladder\'s replacement kill of a row read 
   })
 
   // b.jg5 SRJ-702, SRJ-501, SRJ-704, SRJ-1007: a second try answering
-  // CONFLICT is never tried again and latches P. The tries call for the
-  // ordinary version only after a survivor-naming ErrTmuxKillFailed; an
-  // earlier failure naming no survivor (or ErrTmuxUnresponsive) that the
-  // CONFLICT replaced as the last outcome calls for none.
-  test.each<[string, () => Error, number]>([
-    ['ErrTmuxUnresponsive', () => errTmuxUnresponsive('kill'), 0],
-    ['an ErrTmuxKillFailed naming no survivor', () => errTmuxKillFailed(), 0],
-    ['a survivor-naming ErrTmuxKillFailed', () => errTmuxKillFailed(undefined, 'pane-process-survived'), 1],
-  ])('a first try answering %s, then a second answering CONFLICT: latched, two kills and one read, no delete and no further spawn, no retry timer armed for P; the ordinary decision lines: %p', async (_label, makeFirst, ordinary) => {
+  // CONFLICT is never tried again and latches P. An earlier failure naming no
+  // survivor (or ErrTmuxUnresponsive) that the CONFLICT replaced as the last
+  // outcome calls for no alert; after a survivor-naming one, the ordinary
+  // version follows (the alert describe's CONFLICT case below).
+  test.each<[string, () => Error]>([
+    ['ErrTmuxUnresponsive', () => errTmuxUnresponsive('kill')],
+    ['an ErrTmuxKillFailed naming no survivor', () => errTmuxKillFailed()],
+  ])('a first try answering %s, then a second answering CONFLICT: latched, two kills and one read, no delete and no further spawn, no retry timer armed for P; no alert decision', async (_label, makeFirst) => {
     const { h, p } = srj105Build()
     replaceLiveRow(h, p, {
       killQueue: [cannedErr(makeFirst()), cannedErr(errTmuxSessionConflict('kill', 'not-this-launch')), cannedErr(errTmuxUnresponsive('kill'))],
@@ -15031,7 +15006,7 @@ describe('b.jg5 SRJ-702: the collision ladder\'s replacement kill of a row read 
     expect(h.latch.isLatched(p)).toBe(true)
     expect(h.controller.isArmed(p)).toBe(false)
     expect(h.triggers).toEqual([])
-    expect(decisionLines(h, KILL_RETRY_ALERT_ORDINARY)).toHaveLength(ordinary)
+    expect(decisionLines(h, KILL_RETRY_ALERT_ORDINARY)).toEqual([])
     expect(decisionLines(h, KILL_RETRY_ALERT_SURVIVOR)).toEqual([])
     expect(getFailureCount(p)).toBe(0)
   })
@@ -15120,12 +15095,12 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the collis
 
     expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'failed', refused: true })
 
-    const alert = killFailureNotice(p, ordinaryAlertContent(p, { last: err }))
-    expect(h.stub.calls.killCalls).toHaveLength(KILL_RETRY_TRIES)
+    const content = ordinaryAlertContent(p, { last: err })
+    const alert = killFailureNotice(p, content)
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, kill: KILL_RETRY_TRIES }))
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }])
     expect(h.episodeNotices).toEqual([alert])
-    expect(killFailureLines(h, p)).toEqual([
-      `[slack] persona-episodes: persona=${p} ${PERSONA_EPISODE_KIND_KILL_FAILURE} ordinary alert posted to its destination (${KILL_FAILURE_CONTEXT_RECOVERY}; ${KILL_FAILURE_CLOSING_DESTINATION})`,
-    ])
+    expect(killFailureLines(h, p)).toEqual([killFailurePostedLine(p, content)])
     expect(h.startupErrors()).toEqual([])
     expect(h.killFailureOpen(p)).toBe(true)
 
@@ -15134,22 +15109,25 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the collis
 
     expect(h.stub.calls.killCalls).toHaveLength(2 * KILL_RETRY_TRIES)
     expect(h.episodeNotices).toEqual([alert])
-    expect(killFailureLines(h, p).at(-1)).toBe(`[slack] persona-episodes: persona=${p} ${PERSONA_EPISODE_KIND_KILL_FAILURE} ordinary alert not posted — its episode's alert already posted`)
+    expect(killFailureLines(h, p).at(-1)).toBe(killFailureHeldLine(p))
     expect(h.killFailureOpen(p)).toBe(true)
   })
 
   // Demo bullet 4 (HO rev 17, rev 22): after a survivor-naming failure, every
   // end of the tries as a success posts the survivor version once, before
   // the caller's next step, and opens no episode.
-  test.each<[string, RecoveryStubScript]>([
-    ['a read of ended', { statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))] }],
-    ['a read of missing', { statusQueue: [cannedOk(cannedStatusResult({ state: 'missing' }))] }],
-    ['a read answering ErrSpawnNotFound', { statusQueue: [cannedErr(errSpawnNotFound())] }],
-    ['a second try\'s success with kill_sent true after a live read', { killQueue: [cannedErr(survivorErr()), cannedOk(cannedKillResult(true))] }],
-    ['a second try\'s success with kill_sent true after a failed read', { killQueue: [cannedErr(survivorErr()), cannedOk(cannedKillResult(true))], statusQueue: [cannedErr(errCallTimeout('status'))] }],
-    ['a second try\'s success with kill_sent false', { killQueue: [cannedErr(survivorErr()), cannedOk(cannedKillResult(false))] }],
-    ['a second try answering ErrSpawnNotFound', { killQueue: [cannedErr(survivorErr()), cannedErr(errSpawnNotFound())] }],
-  ])('a survivor-naming ErrTmuxKillFailed, then %s: one survivor version at P\'s destination quoting it, posted before the delete and the fresh spawn, which follow; no kill-failure episode opens', async (_label, script) => {
+  // A read between the tries that ends them makes no further kill; a second
+  // try's success ends them at two. Nothing is armed but a failed read's own
+  // cause (b.jg5 SRJ-301: a read inside the attempt).
+  test.each<[string, RecoveryStubScript, number, readonly string[]]>([
+    ['a read of ended', { statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))] }, 1, []],
+    ['a read of missing', { statusQueue: [cannedOk(cannedStatusResult({ state: 'missing' }))] }, 1, []],
+    ['a read answering ErrSpawnNotFound', { statusQueue: [cannedErr(errSpawnNotFound())] }, 1, []],
+    ['a second try\'s success with kill_sent true after a live read', { killQueue: [cannedErr(survivorErr()), cannedOk(cannedKillResult(true))] }, 2, []],
+    ['a second try\'s success with kill_sent true after a failed read', { killQueue: [cannedErr(survivorErr()), cannedOk(cannedKillResult(true))], statusQueue: [cannedErr(errCallTimeout('status'))] }, 2, [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE]],
+    ['a second try\'s success with kill_sent false', { killQueue: [cannedErr(survivorErr()), cannedOk(cannedKillResult(false))] }, 2, []],
+    ['a second try answering ErrSpawnNotFound', { killQueue: [cannedErr(survivorErr()), cannedErr(errSpawnNotFound())] }, 2, []],
+  ])('a survivor-naming ErrTmuxKillFailed, then %s: one survivor version at P\'s destination quoting it, posted before the delete and the fresh spawn, which follow; no kill-failure episode opens', async (_label, script, kills, armed) => {
     const { h, p } = srj105Build()
     const survivor = survivorErr()
     replaceLiveRow(h, p, { killQueue: [cannedErr(survivor)], ...script })
@@ -15157,14 +15135,14 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the collis
 
     const result = await h.drive(h.launch(p))
 
-    expect(result.action).not.toBe('failed')
-    expect(h.episodeNotices).toEqual([killFailureNotice(p, survivorAlertContent(p, survivor))])
+    expect(result).toStrictEqual({ key: p, action: 'spawned' })
+    const content = survivorAlertContent(p, survivor)
+    expect(h.episodeNotices).toEqual([killFailureNotice(p, content)])
     expect(atDelete).toEqual([1])
-    expect(ladderCallsMade(h)).toMatchObject({ spawn: 2, delete: 1 })
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 2, kill: kills, delete: 1 }))
+    expect(h.triggers).toEqual(armed.map((kind) => ({ key: p, kind })))
     expect(h.killFailureOpen(p)).toBe(false)
-    expect(killFailureLines(h, p)).toEqual([
-      `[slack] persona-episodes: persona=${p} ${PERSONA_EPISODE_KIND_KILL_FAILURE} survivor alert posted to its destination (${KILL_FAILURE_CONTEXT_RECOVERY})`,
-    ])
+    expect(killFailureLines(h, p)).toEqual([killFailurePostedLine(p, content)])
   })
 
   test('after the survivor version, a later ordinary kill failure for P still posts its alert', async () => {
@@ -15217,6 +15195,10 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the collis
 
     expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'latched' })
 
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, kill: 2 }))
+    expect(h.stub.calls.statusCalls).toHaveLength(1)
+    expect(h.triggers).toEqual([])
+    expect(getFailureCount(p)).toBe(0)
     const latchedAlert = killFailureNotice(p, ordinaryAlertContent(p, { earlierSurvivor: survivor }), KILL_FAILURE_CLOSING_DESTINATION_LATCHED)
     expect(holdPosts(h, p)).toHaveLength(1)
     expect(h.episodeNotices).toEqual([...holdPosts(h, p), latchedAlert])
@@ -15305,10 +15287,35 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the collis
     expect(h.stub.calls.killCalls).toHaveLength(1)
     expect(h.episodeNotices).toEqual([])
     expect(h.killFailureOpen(p)).toBe(false)
-    const lines = killFailureLines(h, p)
-    expect(lines).toHaveLength(1)
-    expect(lines[0]).toStartWith(`[slack] persona-episodes: persona=${p} ${PERSONA_EPISODE_KIND_KILL_FAILURE} ordinary alert not raised — its tries were stopped`)
-    expect(lines[0]).toContain(JSON.stringify(renderLogMessageText(killFailedDescriptionOf(err))))
+    expect(killFailureLines(h, p)).toEqual([killFailureNotRaisedLine(p, { last: err })])
+    expect(h.startupErrors()).toEqual([])
+  })
+
+  // b.jg5 SRJ-702: the survivor-naming failure is the only report of the
+  // surviving process, so a stopped ordinary decision that carries it is
+  // kept in one persona-kill-failed entry; still nothing is posted.
+  test('a survivor-naming ErrTmuxKillFailed, then an ErrTmuxKillFailed naming no survivor that stands as the keep-going check stops the tries (the server shutting down): one persona-kill-failed entry quoting both, with the log-only closing and the recovery context, after the not-raised line; no post and no episode', async () => {
+    const { h, p } = srj105Build()
+    const survivor = survivorErr()
+    const last = errTmuxKillFailed(undefined, 'unverifiable-session-present')
+    replaceLiveRow(h, p, { killQueue: [cannedErr(survivor), cannedErr(last)] })
+    const kill = h.stub.client.kill.bind(h.stub.client)
+    h.stub.client.kill = async (params) => {
+      try {
+        return await kill(params)
+      } finally {
+        if (h.stub.calls.killCalls.length === 2) h.shutdown()
+      }
+    }
+
+    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'failed', refused: true })
+
+    expect(h.stub.calls.killCalls).toHaveLength(2)
+    expect(startupEntriesOf(h, PERSONA_KILL_FAILED_LABEL)).toEqual([killFailureRecoveryEntry(p, ordinaryAlertContent(p, { last, earlierSurvivor: survivor }))])
+    expect(h.startupErrors()).toHaveLength(1)
+    expect(h.episodeNotices).toEqual([])
+    expect(h.killFailureOpen(p)).toBe(false)
+    expect(killFailureLines(h, p)).toEqual([killFailureNotRaisedLine(p, { last, earlierSurvivor: survivor }), killFailureStoppedSurvivorLine(p)])
   })
 
   // SRJ-704 rule 4 before the stop's line: P removed from the applied
@@ -15342,21 +15349,22 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the collis
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-704, SRJ-1016 (E20 T3): the shared own-row reads end P's
-// kill-failure episode
+// b.jg5 SRJ-704, SRJ-1016 (E20 T3): the shared own-row reads, and the
+// collision ladder's delete of P's row, end P's kill-failure episode
 //
 // The episode runs from the ordinary alert until P's own row reads `ended` or
 // `missing`, or is gone (`ErrSpawnNotFound`). The shared own-row `status`
 // read (`readPersonaOwnRowStatus`, through `applyOwnRowStatusStep`) and E14's
 // shared `get` read (`readPersonaOwnRow`) end it silently; a live reading,
 // any other failed read and a read of another persona's row do not. The
-// episode is opened by a ladder kill failing at every try, on the recovery
+// ladder's delete of P's row (`tryDelete`), succeeding or answering
+// `ErrSpawnNotFound`, ends it too. The episode is opened by a ladder kill failing at every try, on the recovery
 // harness with its kill-failure alerts installed as main() installs them.
 // The liveness and reconnect adapters' own-row step is covered in
 // tests/server.test.ts.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-704, SRJ-1016: the shared own-row status and get reads end P\'s kill-failure episode', () => {
+describe('b.jg5 SRJ-704, SRJ-1016: the shared own-row status and get reads, and the collision ladder\'s delete of P\'s row, end P\'s kill-failure episode', () => {
   afterEach(srj105AfterEach)
 
   /** Open P's kill-failure episode: a launch whose ladder kill fails ErrTmuxKillFailed at every try; resolves with its one alert. */
@@ -15396,7 +15404,7 @@ describe('b.jg5 SRJ-704, SRJ-1016: the shared own-row status and get reads end P
 
     expect(h.killFailureOpen(p)).toBe(false)
     expect(h.episodeNotices).toEqual([alert])
-    expect(killFailureLines(h, p).at(-1)).toBe(`[slack] persona-episodes: persona=${p} ${PERSONA_EPISODE_KIND_KILL_FAILURE} ended — ${reason}`)
+    expect(killFailureLines(h, p).at(-1)).toBe(killFailureEndedLine(p, reason))
   })
 
   test.each(READS.flatMap((read) => [
@@ -15421,6 +15429,52 @@ describe('b.jg5 SRJ-704, SRJ-1016: the shared own-row status and get reads end P
 
     expect(h.killFailureOpen(p)).toBe(true)
     expect(killFailureLines(h, p).filter((line) => line.includes(' ended — '))).toEqual([])
+  })
+
+  // b.jg5 SRJ-704, SRJ-1016: the collision ladder's delete of P's row, when
+  // it succeeds or answers ErrSpawnNotFound, leaves the row gone, so it ends
+  // P's episode silently before the chain goes on (a healthy persona no
+  // longer reports lost-message state 4). The next ladder run reads the row
+  // live (its collision get, no own-row read), and its replacement kill
+  // succeeds at its first try. The ErrSpawnNotFound delete then stops the
+  // chain as a failed delete (tryDelete's spawn-failure notice), with no
+  // fresh spawn.
+  test.each<[string, RecoveryStubScript, SpawnPersonaResult['action'], boolean[]]>([
+    ['succeeds', {}, 'spawned', [true, false]],
+    ['answers ErrSpawnNotFound', { deleteError: errSpawnNotFound() }, 'failed', [true]],
+  ])('a later ladder run whose replacement kill succeeds and whose delete %s ends P\'s episode silently, with the row-gone line and nothing posted; a lost message then does not report kill-failed, and a later kill failure posts a new alert', async (_label, deleteScript, action, openAtSpawn) => {
+    const { h, p } = srj105Build()
+    const alert = await openEpisode(h, p)
+    const openLines = killFailureLines(h, p)
+    replaceLiveRow(h, p, { killQueue: [cannedOk(cannedKillResult(true))], ...deleteScript })
+    const open: boolean[] = []
+    const spawn = h.stub.client.spawn.bind(h.stub.client)
+    h.stub.client.spawn = async (params) => {
+      open.push(h.killFailureOpen(p))
+      return spawn(params)
+    }
+
+    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action })
+
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1 + openAtSpawn.length, kill: KILL_RETRY_TRIES + 1, delete: 1 }))
+    // Open at the colliding spawn; for the fresh spawn, ended by the delete.
+    expect(open).toEqual(openAtSpawn)
+    expect(h.killFailureOpen(p)).toBe(false)
+    expect(h.episodeNotices).toEqual([alert])
+    expect(killFailureLines(h, p)).toEqual([...openLines, killFailureEndedLine(p, KILL_FAILURE_END_ROW_GONE)])
+
+    await h.runApproverToStop(p)
+    // State 4 no longer applies: the message reads P's row and reports a later state.
+    await expectLostMessageReports(h, p, 'auto-restart-disabled')
+
+    const next = errTmuxKillFailed(undefined, 'no-session-no-kill')
+    replaceLiveRow(h, p, { killQueue: [], deleteError: undefined, killError: next })
+    expect(await h.drive(h.launch(p))).toStrictEqual({ key: p, action: 'failed', refused: true })
+
+    const content = ordinaryAlertContent(p, { last: next })
+    expect(h.episodeNotices).toEqual([alert, killFailureNotice(p, content)])
+    expect(killFailureLines(h, p).at(-1)).toBe(killFailurePostedLine(p, content))
+    expect(h.killFailureOpen(p)).toBe(true)
   })
 })
 
@@ -18628,7 +18682,7 @@ describe('b.jg5 SRJ-105, SRJ-512, SRJ-501, SRJ-502: an UNUSABLE NAME answer at a
 // CONFLICT entry with "P's next check or recovery" and the state the ladder
 // last read, posts one notice and is never sent again (AC 9; on a `waiting`
 // row, "not this launch's session" is SRJ-613's kill backstop: nothing is
-// sent). GONE is the session-gone success (b.jg5 SRJ-104: for `kill`, gone
+// sent, a row of `conflictCross`). GONE is the session-gone success (b.jg5 SRJ-104: for `kill`, gone
 // is success): the chain goes on. A value of a class SRJ-110 gives no row (a
 // STATE name other than `ErrSpawnNotFound`, LAUNCH FAILURE) stops the chain
 // as UNCLASSIFIED: refused, never counted, P's timer armed with the
@@ -18660,25 +18714,10 @@ describe('b.jg5 SRJ-110, SRJ-701: the collision ladder\'s replacement kills are 
 
     expect(ladderCallsMade(h)).toEqual(site.calls)
     expect(h.stub.calls.statusCalls).toHaveLength(site.reads.status)
-    expect(row.refusedOperation).toBe(REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY)
     expectLatchedOnce(h, p, conflictLatch(p, row, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, site.lastRead!), site.noticesBefore)
     expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
 
     await expectLaunchedByNoPath(h, p, b, script)
-  })
-
-  test('b.jg5 SRJ-613 (E19 hatch note): the kill backstop: the kill of a row read waiting answering "not this launch\'s session" latches P with the row\'s recorded state (waiting) and nothing sent: no send-keys, delete or spawn after the collision', async () => {
-    const { h, p } = srj105Build()
-    const site = UNUSABLE_KILL_SITES.find((s) => s.lastRead === WAITING_READ && s.calls.sendKeys === 0)!
-    const row = LADDER_KILL_CONFLICT_CASE_ROWS.find((r) => r.killBackstop === true)!
-    expect(row.rowState).toEqual(WAITING_READ)
-    h.script(site.script(h, harnessPersona(h, p), row.build(), row))
-
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
-
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, kill: 1 }))
-    expect(h.latch.record(p)).toStrictEqual(conflictLatch(p, row, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, row.rowState).record)
-    expect(h.episodeNotices).toEqual([{ key: p, text: row.notice.text }])
   })
 
   test.each(UNUSABLE_KILL_SITES.flatMap((site) => [
@@ -21328,9 +21367,13 @@ describe('b.jg5 SRJ-118, SRJ-609: the ladder\'s waiting and working branches map
     expect(getFailureCount(p)).toBe(0)
   })
 
-  const CONFLICT_CROSS = BRANCHES.flatMap(([branch, reach, setup]) =>
-    reconnectConflictRowsAt('waiting').map((row) => [branch, row.name, reach, setup, row] as const),
-  )
+  // One representative row per branch, a different one at each: every row
+  // is met at the reconnect adapter's cells (tests/server.test.ts).
+  const CONFLICT_CROSS = BRANCHES.map(([branch, reach, setup], i) => {
+    const rows = reconnectConflictRowsAt('waiting')
+    const row = rows[i % rows.length]!
+    return [branch, row.name, reach, setup, row] as const
+  })
   test.each(CONFLICT_CROSS)('%s: CONFLICT (%s) → latched (launchSession \'skipped\'), one post, no resume, kill, delete or spawn after the send-keys; no path launches P again', async (_branch, _name, reach, setup, row) => {
     const { h, p, b } = srj105Build()
     setup?.(h)

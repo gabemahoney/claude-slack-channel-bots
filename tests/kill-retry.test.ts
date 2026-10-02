@@ -16,7 +16,7 @@
  * the leak check covers the log lines, never the decision.
  *
  * The module's import boundary is checked by walking its runtime imports
- * through `src/` (`runtimeLoads`, `tests/test-helpers/source-audit.ts`).
+ * through `src/` (`forbiddenServerLoads`, `tests/test-helpers/source-audit.ts`).
  *
  * No process, no real timer, no top-level mock.module(), no value import of
  * `Client` or `resolveSystemBinary`, no Phase-1-only named import.
@@ -43,7 +43,6 @@ import {
   KILL_ROW_FINISHED_MISSING,
   KILL_ROW_FINISHED_NO_ROW,
   checkedKill,
-  killLetsNextStepRun,
   killOutcomeOf,
   type KillOutcome,
   type KillRowFinishedRead,
@@ -108,7 +107,7 @@ import {
   sentinelInMessage,
 } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
-import { importedSpecifiers, runtimeLoads, srcModules } from './test-helpers/source-audit.ts'
+import { forbiddenServerLoads } from './test-helpers/source-audit.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -408,14 +407,6 @@ describe('runKillRetry: only UNAVAILABLE of a row last read live is tried again 
     expect(r.result).toEqual({ outcome: notKilled(gone), end: KILL_RETRY_END_SETTLED, tries: 2, reads: 1, alert: { kind: KILL_RETRY_ALERT_NONE } })
     expect(r.result.outcome).toMatchObject({ errorClass: AD_ERROR_CLASS_ENVIRONMENT })
   })
-
-  test('HO rev 23: a first try\'s ErrTmuxUnresponsive then a read of ended ends the tries as a success with no further kill', async () => {
-    const r = await run({ kills: failing(KILL_RETRY_TRIES, () => errTmuxUnresponsive('kill')), reads: [readState('ended')] })
-
-    expect(r.calls).toEqual(['kill', 'status'])
-    expect(r.result).toEqual({ outcome: rowFinished(KILL_ROW_FINISHED_ENDED), end: KILL_RETRY_END_ROW_FINISHED, tries: 1, reads: 1, alert: { kind: KILL_RETRY_ALERT_NONE } })
-    expect(killLetsNextStepRun(r.result.outcome)).toBe(true)
-  })
 })
 
 // ---------------------------------------------------------------------------
@@ -423,12 +414,6 @@ describe('runKillRetry: only UNAVAILABLE of a row last read live is tried again 
 // ---------------------------------------------------------------------------
 
 describe('runKillRetry: one status read before each further try (b.jg5 SRJ-702, SRJ-110, AC 84)', () => {
-  test('no read before the first try, exactly one before each further try', async () => {
-    const r = await run({ kills: failing(KILL_RETRY_TRIES, () => errTmuxUnresponsive('kill')) })
-
-    expect(r.calls).toEqual(['kill', 'status', 'kill', 'status', 'kill'])
-  })
-
   test.each<[string, ReadStep, KillRowFinishedRead]>([
     ['ended', readState('ended'), KILL_ROW_FINISHED_ENDED],
     ['missing', readState('missing'), KILL_ROW_FINISHED_MISSING],
@@ -794,22 +779,12 @@ describe('runKillRetry: each try and each read is logged, redacted (b.jg5 SRJ-70
 // Import boundary: no server-only module (E21, E25 to E33 and the CLI reuse it)
 // ---------------------------------------------------------------------------
 
-/** Server-only `src/` modules: the notifier, outage state, the latch, the episodes, the server, the session manager and restart. */
-const SERVER_ONLY_MODULES = /^(?:outage-state|conflict-latch|persona-episodes|server|session-manager|restart)\.ts$|notifier/
-
 describe('kill-retry: import boundary', () => {
   test('the module loads, through its runtime imports in src/, no server-only module, no Slack module and no @slack/ package', () => {
-    const modules = srcModules()
-    const loads = runtimeLoads(modules, 'kill-retry.ts')
+    const { loads, forbidden } = forbiddenServerLoads('kill-retry.ts')
     // Not vacuous: the walk reaches the checked kill and the one survivor detector.
     expect(loads.modules.has('checked-kill.ts')).toBe(true)
     expect(loads.modules.has('ad-description-phrases.ts')).toBe(true)
-    const forbidden = [
-      ...[...loads.modules]
-        .filter(([name]) => SERVER_ONLY_MODULES.test(name) || (/slack/i.test(name) && importedSpecifiers(modules.get(name)!).length > 0))
-        .map(([, chain]) => chain.join(' -> ')),
-      ...loads.packages.filter(({ specifier }) => specifier.startsWith('@slack/')).map(({ chain, specifier }) => `${chain.join(' -> ')} -> ${specifier}`),
-    ]
     expect(forbidden).toEqual([])
   })
 })

@@ -67,9 +67,6 @@
  *     on the sweep's own client, in the bounded retry with the pass budget);
  *   - the persona teardown's kill (`runTeardown`, `src/persona-lifecycle.ts`,
  *     through `killPersonaInstance`).
- * SRJ-110's other sites take it as each is built: the live-row sequence (E21),
- * an old-life wait (E27), the stuck-launch abort (E29) and the CLI teardown
- * (E33, in the CLI process).
  *
  * The module holds no state, makes no version re-check (that is the
  * caller's) and loads no server-only module (no notifier, outage state, Slack

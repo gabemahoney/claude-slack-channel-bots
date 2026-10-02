@@ -129,6 +129,7 @@ import {
   KILL_FAILURE_VERSION_SURVIVOR,
   PERSONA_KILL_FAILED_LABEL,
   PERSONA_KILL_SURVIVOR_LABEL,
+  describeKillFailureDescriptions,
   killFailureAlertEntryText,
   killFailureAlertText,
   type KillFailureAlertContent,
@@ -2517,6 +2518,27 @@ describe('the kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)', () => {
     expect(raise(alerts, 'Q', ordinary(), { stopped: true })).toBe('logged')
     expect(logOnlyCalls.map((call) => call.classLabel)).toEqual([PERSONA_KILL_FAILED_LABEL])
     expect(posts).toEqual([])
+  })
+
+  // b.jg5 SRJ-702: the failure that named a survivor is the only report of
+  // the surviving process, so a stopped decision carrying it is kept in one
+  // persona-kill-failed entry; still nothing is posted and no episode opens.
+  test.each<[string, () => KillRetryAlert]>([
+    ['and a last description', () => ({ ...ordinary(), earlierSurvivorDescription: description('pane-process-survived') })],
+    ['alone', () => ({ kind: KILL_RETRY_ALERT_ORDINARY, earlierSurvivorDescription: description('pane-process-survived') })],
+  ])('stopped tries whose ordinary decision carries an earlier survivor-naming description %s: the not-raised line, then one persona-kill-failed entry with the log-only closing and the recovery context; no post and no episode', (_label, decision) => {
+    const alerts = buildAlerts()
+
+    expect(raise(alerts, 'K', decision(), { stopped: true })).toBe('stopped')
+
+    const text = killFailureAlertText(contentOf('K', decision()), KILL_FAILURE_CLOSING_LOG_ONLY, false)
+    expect(logOnlyCalls).toEqual([{ classLabel: PERSONA_KILL_FAILED_LABEL, entry: killFailureAlertEntryText('persona=K', KILL_FAILURE_CONTEXT_RECOVERY, text) }])
+    expect(posts).toEqual([])
+    expect(alerts.isOpen('K')).toBe(false)
+    expect(killLines('K')).toEqual([
+      `[slack] persona-episodes: persona=K kill-failure ordinary alert not raised — its tries were stopped (the persona is not up or is torn down, or the server is shutting down), so nothing retries this kill; ${describeKillFailureDescriptions(decision())} (recovery)`,
+      '[slack] persona-episodes: persona=K kill-failure ordinary alert written to the server log and startup-errors.log (persona-kill-failed) — stopped-survivor',
+    ])
   })
 
   test('P\'s episode is independent of B\'s: the open query answers per key, and B\'s end leaves P\'s open', () => {

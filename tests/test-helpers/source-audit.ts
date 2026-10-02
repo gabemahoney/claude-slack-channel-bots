@@ -352,3 +352,31 @@ export function runtimeLoads(modules: Map<string, string>, entry: string): Runti
   }
   return { modules: reached, packages }
 }
+
+/**
+ * Server-only `src/` modules: the notifier, outage state, the latch, the
+ * episodes, the server, the session manager and restart. A module the CLI
+ * reuses (`checked-kill.ts`, `kill-retry.ts`, `kill-failure-alert.ts`) loads
+ * none of them.
+ */
+export const SERVER_ONLY_MODULES = /^(?:outage-state|conflict-latch|persona-episodes|server|session-manager|restart)\.ts$|notifier/
+
+/**
+ * What `entry` (a `src/` file name) loads at run time, and each forbidden
+ * load among it as its import chain (`a.ts -> b.ts`): a server-only module
+ * (`SERVER_ONLY_MODULES`), a Slack module (one whose name has `slack` and
+ * that imports anything) or an `@slack/` package. A case asserts `forbidden`
+ * is empty and, so the walk is not vacuous, that `loads` reaches a module it
+ * names.
+ */
+export function forbiddenServerLoads(entry: string): { loads: RuntimeLoads; forbidden: string[] } {
+  const modules = srcModules()
+  const loads = runtimeLoads(modules, entry)
+  const forbidden = [
+    ...[...loads.modules]
+      .filter(([name]) => SERVER_ONLY_MODULES.test(name) || (/slack/i.test(name) && importedSpecifiers(modules.get(name)!).length > 0))
+      .map(([, chain]) => chain.join(' -> ')),
+    ...loads.packages.filter(({ specifier }) => specifier.startsWith('@slack/')).map(({ chain, specifier }) => `${chain.join(' -> ')} -> ${specifier}`),
+  ]
+  return { loads, forbidden }
+}
