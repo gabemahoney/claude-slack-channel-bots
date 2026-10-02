@@ -88,6 +88,14 @@
  * health tick make no further `send-keys`, other tmux-touching call, raw tmux
  * call or delete for P and count nothing, the retry timer stopping latched;
  * Q launches and reconnects as before.
+ * The kill as a latch site (SRJ-110, SRJ-505, AC 9; E20): P's restart run's
+ * kill of its dead row, or its collision ladder's replacement kill of a row
+ * read `waiting` (SRJ-613's kill backstop), answers CONFLICT "not this
+ * launch's session" (the case table's restart-kill and ladder-kill rows), or
+ * the restart run's kill answers UNUSABLE NAME; P latches once with one
+ * post, its armed retry timer stops latched, and the same paths plus a health
+ * tick make no further `kill`, delete, spawn, resume or other tmux-touching
+ * call for P: exactly one `kill` of P; Q's paths go on.
  * Recovery: each reason ("row reads" over every live and dead state) under
  * both latch kinds, with no line matching either list.
  *
@@ -469,6 +477,9 @@ import {
   LAUNCH_START_ANOTHER_CALLERS_ID,
   LAUNCH_START_CASE_ROWS,
   LAUNCH_START_NON_LATCHING_ROWS,
+  LADDER_KILL_CONFLICT_CASE_ROWS,
+  RESTART_KILL_CONFLICT_CASE_ROWS,
+  RESTART_KILL_UNUSABLE_NAME_CASE_ROWS,
   SESSION_ENDING_COMMAND_FORMS,
   UNUSABLE_NAME_CASE_ROWS,
   cscbOwnLines,
@@ -2578,6 +2589,121 @@ describe('SRJ-118, SRJ-505: a CONFLICT or UNUSABLE NAME at the reconnect\'s send
     h.script(collided(h, personaOf(h, q), { state: 'waiting' }))
     expect(await h.launch(q)).toEqual({ key: q, action: 'reconnected' })
     expect(h.stub.calls.sendKeysCalls.filter((call) => call.claude_instance_id === personaInstanceId(q))).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-110, SRJ-505 (AC 9), SRJ-501, SRJ-502, SRJ-512, SRJ-613: a kill is
+// a latch site (E20; the E13, E16 and E19 hatch notes). P's restart run kills
+// its dead row, or P's collision ladder kills a row of P's read `waiting` in
+// another directory (SRJ-613's kill backstop), and the kill answers CONFLICT
+// "not this launch's session"; or the restart run's kill answers UNUSABLE
+// NAME. P latches once with one post, P's retry timer (armed before) stops
+// latched, and no path that could retry the kill (a new launch, the retry
+// entry, a scheduled and a human-triggered restart, the retry timer, the
+// health tick) makes a `kill`, `delete`, `spawn`, `resume` or any other
+// tmux-touching call for P: the stub records exactly one `kill` of P. Q's
+// paths go on.
+// ---------------------------------------------------------------------------
+
+/** How P's kill latches: [label, P's expected record, P's one post, the latching call (P's retry timer armed before it)]. */
+const KILL_LATCH_WAYS: ReadonlyArray<
+  readonly [string, (key: string) => ConflictLatchRecord, (key: string) => string, (h: RecoveryHarness, key: string) => Promise<void>]
+> = [
+  ...RESTART_KILL_CONFLICT_CASE_ROWS.filter((row) => row.latchCase === LATCH_CASE_NOT_THIS_LAUNCH).map((row) => [
+    `the restart run's kill: CONFLICT (${row.name})`,
+    (key: string) =>
+      expectedLatchRecord(key, {
+        latchCase: row.latchCase,
+        refusedOperation: REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
+        rowState: row.rowState,
+        sessionName: row.sessionName,
+        description: row.build().errDescription,
+      }),
+    () => row.notice.text,
+    async (h: RecoveryHarness, key: string) => {
+      h.script({ killError: row.build() })
+      expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_LATCHED)
+    },
+  ] as const),
+  ...LADDER_KILL_CONFLICT_CASE_ROWS.filter((row) => row.killBackstop === true).map((row) => [
+    `the collision ladder's replacement kill of a row read waiting: CONFLICT (${row.name}, SRJ-613's kill backstop)`,
+    (key: string) =>
+      expectedLatchRecord(key, {
+        latchCase: row.latchCase,
+        refusedOperation: REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
+        rowState: row.rowState,
+        sessionName: row.sessionName,
+        description: row.build().errDescription,
+      }),
+    () => row.notice.text,
+    async (h: RecoveryHarness, key: string) => {
+      h.script({ ...collided(h, personaOf(h, key), { cwd: h.home, state: 'waiting' }), killError: row.build() })
+      expect(await h.launch(key)).toEqual({ key, action: 'latched' })
+      // Nothing sent: no send-keys, delete or fresh spawn followed the kill.
+      expect([h.stub.calls.sendKeysCalls, h.stub.calls.deleteCalls, h.stub.calls.spawnCalls.length]).toEqual([[], [], 1])
+    },
+  ] as const),
+  ...RESTART_KILL_UNUSABLE_NAME_CASE_ROWS.slice(0, 1).map((row) => [
+    `the restart run's kill: UNUSABLE NAME (${row.name})`,
+    (key: string) => row.record(key),
+    (key: string) => row.notice(key),
+    async (h: RecoveryHarness, key: string) => {
+      h.script({ killError: row.build() })
+      expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_LATCHED)
+    },
+  ] as const),
+]
+
+describe('SRJ-110, SRJ-505 (AC 9): a CONFLICT or UNUSABLE NAME at P\'s kill holds P, and no automated path sends the kill again (recovery harness)', () => {
+  test.each(KILL_LATCH_WAYS)('P latched by %s: one post; P\'s retry timer stops; then a new launch, the retry entry, a scheduled and a human-triggered restart, the retry timer and the health tick make no kill, delete, spawn, resume or other tmux-touching call for P and count nothing: exactly one kill of P; Q goes on as before', async (_label, record, notice, latch) => {
+    const run = makeAutomatedPathsRun()
+    const { h, outcomes } = run
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    const [p, q] = h.keys as [string, string]
+    h.controller.arm(p, { kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR })
+
+    await latch(h, p)
+    await h.settle()
+
+    expect(h.latch.record(p)).toEqual(record(p))
+    expect(h.stops.filter((stop) => stop.key === p)).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
+    expect(h.controller.isArmed(p)).toBe(false)
+    h.script({ ...CLEARED, killError: undefined })
+    const touchingAtLatch = tmuxTouchingCallCounts(h.stub.calls)
+    const outcomesAtLatch = outcomes.length
+
+    const { launched, qCalls, notScheduledLines } = await driveEveryPath(run)
+    const tick = await runHealthTick(run)
+
+    // Nothing tmux-touching or deleting reached P after the latch; the kill was sent once.
+    expect(tmuxTouchingCallsIn(h.stub.calls, touchingAtLatch).filter((call) => instanceOf(call.params) === personaInstanceId(p))).toEqual([])
+    expect(h.stub.calls.killCalls.filter((call) => call.claude_instance_id === personaInstanceId(p))).toHaveLength(1)
+    expect(h.stub.calls.deleteCalls.filter((call) => instanceOf(call) === personaInstanceId(p))).toEqual([])
+    // Each path stopped for P.
+    expect(launched).toEqual([{ key: p, action: 'latched' }, { key: q, action: 'spawned' }])
+    expect(outcomes.slice(outcomesAtLatch)).toEqual([
+      [p, RESTART_OUTCOME_LATCHED],
+      ...[1, 2, 3, 4].map(() => [q, RESTART_OUTCOME_LAUNCHED] as const),
+    ])
+    expect(notScheduledLines).toEqual([[notSchedulingLine(p)], [notSchedulingLine(p)]])
+    // The latch stopped the timer armed before it; the retry timer's path arms it again, and its first retry stops it latched.
+    expect(h.stops.filter((stop) => stop.key === p)).toEqual([
+      { key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED },
+      { key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED },
+    ])
+    expect([h.controller.armedKeys(), isRestartPendingOrActive(p)]).toEqual([[], false])
+    expect(tick.scheduled).toEqual([q])
+    expect(h.clock.pendingCount()).toBe(0)
+    // Nothing counted, no spawn-failure notice or spawn-failed entry, one latch and exactly one post.
+    expect([getFailureCount(p), getFailureCount(q)]).toEqual([0, 0])
+    expect(h.notices).toEqual([])
+    expect(h.startupErrors()).toEqual([])
+    expect(latchSteps(h)).toEqual(oneLatch(p))
+    expect(h.episodeNotices).toEqual([{ key: p, text: notice(p) }])
+    expect(h.latch.isLatched(q)).toBe(false)
+    // Q, beside it, reaches the stub on every path.
+    expect(qCalls).toEqual([...Q_CALLS_ON_EVERY_PATH])
   })
 })
 

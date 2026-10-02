@@ -132,7 +132,13 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { classifyAdError, describeAgentDirectorFailure } from '../src/ad-error-class.ts'
+import {
+  AD_ERROR_CLASS_UNAVAILABLE,
+  AD_ERROR_CLASS_UNCLASSIFIED,
+  classifyAdError,
+  describeAgentDirectorFailure,
+} from '../src/ad-error-class.ts'
+import { KILL_OUTCOME_NOT_KILLED } from '../src/checked-kill.ts'
 import { adAlertThresholdMs, adAlertThresholdMsInEffect, DEFAULT_AD_SETTINGS_IN_EFFECT } from '../src/ad-settings.ts'
 import { ERR_SCHEMA_MISMATCH_NAME, ErrCwdNotFound } from '../src/agent-director-errors.ts'
 import { _resetBackoffState, doublingBackoffDelay, getFailureCount, isAtCap, recordFailure } from '../src/backoff.ts'
@@ -219,7 +225,9 @@ import {
   APPROVER_STOP_NOT_INTERACTIVE,
   APPROVER_STOP_TEARDOWN,
   DIALOG_POLL_INTERVAL_MS,
+  deletePersonaInstance,
   isLaunchInFlight,
+  KILL_CONTEXT_TEARDOWN,
   killPersonaInstance,
   reconcileOrphans,
   stopDialogApprover,
@@ -1191,10 +1199,10 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
       await reconcileOrphans(h.config)
       return h.stub.calls.listCalls.length
     }],
-    ['a persona teardown’s kill', async (h, key) => {
+    ['a persona teardown’s kill (b.jg5 SRJ-701: it answers its non-success outcome, never throws)', async (h, key) => {
       const err = errTmuxKillFailed()
       h.script({ killError: err })
-      await expect(killPersonaInstance(key)).rejects.toBe(err)
+      expect(await killPersonaInstance(key, { context: KILL_CONTEXT_TEARDOWN })).toMatchObject({ kind: KILL_OUTCOME_NOT_KILLED, errorClass: AD_ERROR_CLASS_UNAVAILABLE, error: err })
       return h.stub.calls.killCalls.length
     }],
   ])('an UNAVAILABLE answer to %s, made outside every attempt, arms nothing', async (_site, run) => {
@@ -4698,11 +4706,6 @@ describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, i
       h.script({ statusError: errTmuxNotAvailable(undefined, 'status') })
       expect(await _buildIsSessionAliveAdapter(() => h.config)(key)).toEqual(LIVENESS_READING_UNKNOWN)
     }, { statusCalls: 1 }],
-    ['a persona teardown’s kill', async (h, key) => {
-      const err = errTmuxNotAvailable(undefined, 'kill')
-      h.script({ killError: err })
-      await expect(killPersonaInstance(key)).rejects.toBe(err)
-    }, { killCalls: 1 }],
     ['a plain read-pane through the outage wrapper', async (h, key) => {
       const err = errTmuxNotAvailable(undefined, 'read-pane')
       h.script({ readPaneError: err })
@@ -4785,12 +4788,14 @@ describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, i
     expect(h.attempts).toEqual([])
   })
 
-  test('a trigger for a key no longer in the applied configuration (its teardown’s kill answers ErrTmuxNotAvailable) arms it, and its first retry stops it with no agent-director call; the other persona is untouched', async () => {
+  // The teardown's kill arms nothing (b.jg5 SRJ-110, hatch A3: the case
+  // below), so this trigger comes from the teardown's delete.
+  test('a trigger for a key no longer in the applied configuration (its teardown’s delete answers ErrTmuxNotAvailable) arms it, and its first retry stops it with no agent-director call; the other persona is untouched', async () => {
     const h = (harness = makeRecoveryHarness())
     const [key, other] = h.keys as [string, string]
     h.remove(key)
-    h.script({ killError: errTmuxNotAvailable(undefined, 'kill') })
-    await expect(killPersonaInstance(key)).rejects.toThrow()
+    h.script({ deleteError: errTmuxNotAvailable(undefined, 'delete') })
+    await expect(deletePersonaInstance(key)).rejects.toThrow()
     expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT)
     const before = callCounts(h)
 
@@ -4800,6 +4805,38 @@ describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, i
     expect(callsSince(h, before)).toEqual({})
     expect(retryLinesOf(h, key).at(-1)).toBe(stoppedLine(key, UNAVAILABLE_RETRY_STOP_NOT_APPLIED))
     expectStopped(h, key)
+    expectUntouched(h, other)
+  })
+
+  // b.jg5 SRJ-110, SRJ-301 (hatch A3): a persona teardown's kill is no
+  // launch or recovery attempt, so its ENVIRONMENT or CONFIG answer arms
+  // nothing (no trigger, no timer); its outage is raised for the persona
+  // only while it is in the applied configuration, and only logged for a key
+  // no longer applied. Flips E11's pin, in which the teardown's ENVIRONMENT
+  // kill armed the persona's timer (and, for a key no longer applied, its
+  // first retry stopped that stray timer).
+  // The outage class is read when the case runs (the CONFIG section's constant is declared below).
+  test.each<[string, () => Error, (key: string, err: Error) => { key: string; text: string }, () => OutageClass, boolean]>([
+    ['ErrTmuxNotAvailable', () => errTmuxNotAvailable(undefined, 'kill'), (key) => tmuxUnavailableOnset(key), () => 'tmux-unavailable', true],
+    ['ErrTmuxNotAvailable', () => errTmuxNotAvailable(undefined, 'kill'), (key) => tmuxUnavailableOnset(key), () => 'tmux-unavailable', false],
+    ['ErrConfigMalformed', () => errConfigMalformed(), configOnset, () => AD_CONFIG_MALFORMED, true],
+    ['ErrConfigMalformed', () => errConfigMalformed(), configOnset, () => AD_CONFIG_MALFORMED, false],
+  ])('b.jg5 SRJ-110, SRJ-301 (hatch A3): %s from a persona teardown’s kill arms nothing; the persona applied (%p) gets its outage raised, a key no longer applied none; the other persona is untouched', async (_what, make, onset, flag, applied) => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    if (!applied) h.remove(key)
+    const err = make()
+    h.script({ killError: err })
+    expect(isInsideAttempt(key)).toBe(false)
+
+    expect(await killPersonaInstance(key, { context: KILL_CONTEXT_TEARDOWN })).toMatchObject({ kind: KILL_OUTCOME_NOT_KILLED, error: err })
+
+    expect(callCounts(h)).toEqual({ killCalls: 1 })
+    expectNothingArmed(h)
+    expect(h.outageNotices).toEqual(applied ? [onset(key, err)] : [])
+    expect([...getOutageFlags(key)]).toEqual(applied ? [flag()] : [])
+    expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+    expect(getFailureCount(key)).toBe(0)
     expectUntouched(h, other)
   })
 
@@ -5470,10 +5507,6 @@ describe('unavailable retry: CONFIG arms from any verb in any context, takes no 
       h.script({ statusError: err })
       expect(await _buildIsSessionAliveAdapter(() => h.config)(key)).toEqual(LIVENESS_READING_UNKNOWN)
     }, { statusCalls: 1 }],
-    ['a persona teardown’s kill', async (h, key, err) => {
-      h.script({ killError: err })
-      await expect(killPersonaInstance(key)).rejects.toBe(err)
-    }, { killCalls: 1 }],
     ['a plain read-pane through the outage wrapper', async (h, key, err) => {
       h.script({ readPaneError: err })
       await expect(readPaneSucceeds(h, key)).rejects.toBe(err)
@@ -6139,9 +6172,9 @@ describe('unavailable retry: the unclassified-error episode’s ends and the sto
       h.script({ statusError: err })
       expect(await _buildIsSessionAliveAdapter(() => h.config)(key)).toEqual(LIVENESS_READING_UNKNOWN)
     }, { statusCalls: 1 }],
-    ['a persona teardown’s kill', async (h, key, err) => {
+    ['a persona teardown’s kill (b.jg5 SRJ-701: it answers its non-success outcome, never throws)', async (h, key, err) => {
       h.script({ killError: err })
-      await expect(killPersonaInstance(key)).rejects.toBe(err)
+      expect(await killPersonaInstance(key, { context: KILL_CONTEXT_TEARDOWN })).toMatchObject({ kind: KILL_OUTCOME_NOT_KILLED, errorClass: AD_ERROR_CLASS_UNCLASSIFIED, error: err })
     }, { killCalls: 1 }],
     ['a plain read-pane through the outage wrapper', async (h, key, err) => {
       h.script({ readPaneError: err })

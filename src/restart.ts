@@ -25,9 +25,14 @@
  * relaunch), an UNCLASSIFIED one (SRJ-313, `ErrSystemInstallDisappeared`
  * included) from any of them but a `status`, `get` or `list`, or any other
  * `status`, `get` or `list` error, arms the persona's UNAVAILABLE retry timer
- * through the installed trigger sink. A kill that meets UNAVAILABLE,
- * ENVIRONMENT, CONFIG or UNCLASSIFIED is refused, and a relaunch the timer
- * now owns answers `'refused'`; neither is ever counted toward the cap
+ * through the installed trigger sink. The kill is a checked kill (b.jg5
+ * SRJ-110, SRJ-701): only its success (GONE included) lets the relaunch
+ * follow; a kill that meets UNAVAILABLE, ENVIRONMENT, CONFIG or UNCLASSIFIED
+ * (a class the kill has no row for included) is refused, one that meets a
+ * CONFLICT or an UNUSABLE NAME latches the persona, one whose
+ * `ErrInvalidFlags` re-check decides that the server stops ends the work
+ * with nothing more called, and a relaunch
+ * the timer now owns answers `'refused'`; none is ever counted toward the cap
  * (SRJ-302): a persona is never given up on for UNAVAILABLE, ENVIRONMENT,
  * CONFIG or UNCLASSIFIED alone.
  * The liveness probe answers one of four readings (b.jg5 SRJ-314,
@@ -88,15 +93,30 @@ import {
 import type { PersonaSerialize } from './persona-serializer.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import { runInAttempt } from './unavailable-retry.ts'
+import { AD_ERROR_CLASS_CONFLICT, AD_ERROR_CLASS_UNUSABLE_NAME } from './ad-error-class.ts'
+import {
+  KILL_OUTCOME_NOT_KILLED,
+  describeKillOutcome,
+  isKillOutcome,
+  killLetsNextStepRun,
+  killOutcomeStopsServer,
+  type KillOutcome,
+  type KillSuccess,
+} from './checked-kill.ts'
 import {
   LIVENESS_DEAD,
   LIVENESS_LIVE,
   LIVENESS_PENDING,
+  LIVENESS_READING_DEAD_INSTALL_GONE,
   LIVENESS_UNKNOWN,
+  deadLivenessReading,
+  deadRowReadOf,
   isInstallGoneDeadReading,
   launchStartOfReading,
   livenessKindOf,
   pendingLivenessReading,
+  type DeadLivenessReading,
+  type DeadRowRead,
   type LivenessKind,
   type LivenessReading,
   type PendingLivenessReading,
@@ -128,7 +148,13 @@ export const HUMAN_TRIGGER_DELAY_CEILING = 5
 // Outcomes of the restart work and of the retry entry
 // ---------------------------------------------------------------------------
 
-/** The server is shutting down: nothing was probed, reconnected, killed or launched. */
+/**
+ * The server is shutting down: nothing was probed, reconnected, killed or
+ * launched; or the kill before the relaunch answered `ErrInvalidFlags` and
+ * its immediate version re-check decided that the server stops (b.jg5
+ * SRJ-104, SRJ-204, SRJ-205), so nothing more was called and nothing was
+ * recorded.
+ */
 export const RESTART_OUTCOME_SHUTTING_DOWN = 'shutting-down'
 /** The persona is not up (or not applied): its instance and row were left as they are. */
 export const RESTART_OUTCOME_NOT_UP = 'not-up'
@@ -157,8 +183,10 @@ export const RESTART_OUTCOME_PENDING_DEFERRED = 'pending-deferred'
 export const RESTART_OUTCOME_LAUNCHED = 'launched'
 /**
  * The launch was refused (its UNAVAILABLE retry timer was armed for it), or
- * the kill before it was refused (`KILL_SESSION_REFUSED`), so nothing was
- * launched. Not counted.
+ * the kill before it did not succeed and latched nothing (b.jg5 SRJ-110,
+ * SRJ-701: UNAVAILABLE, ENVIRONMENT, CONFIG or UNCLASSIFIED, a class the kill
+ * has no row for included, no kill outcome, or a kill that threw), so nothing
+ * was launched. Not counted.
  */
 export const RESTART_OUTCOME_REFUSED = 'refused'
 /** The launch failed and the failure was counted, below the cap. */
@@ -191,7 +219,9 @@ export const RESTART_OUTCOME_LIVENESS_UNKNOWN = 'liveness-unknown'
  * or recorded (no `pending` deferral, no arm hook); or its launch answered
  * `'skipped'` because the persona latched at that launch (a CONFLICT or an
  * UNUSABLE NAME at a spawn or resume), after which nothing was recorded
- * either. A latched query that
+ * either; or the kill before the relaunch answered a CONFLICT or an UNUSABLE
+ * NAME, which latched the persona (b.jg5 SRJ-110, SRJ-501, SRJ-512), and
+ * nothing was launched or recorded. A latched query that
  * threw answers this too (fail safe). The retry timer stops on it.
  */
 export const RESTART_OUTCOME_LATCHED = 'latched'
@@ -287,16 +317,27 @@ export interface RestartDeps {
    */
   reconnectSession(key: string): Promise<ReconnectSessionResult>
   /**
-   * Kill the persona's instance before its launch. `KILL_SESSION_REFUSED`:
-   * the kill met an UNAVAILABLE outcome (b.jg5 SRJ-105, `ErrTmuxKillFailed`
-   * included), an ENVIRONMENT one (`ErrTmuxNotAvailable`, SRJ-311), a CONFIG
-   * one (`ErrConfigMalformed`, SRJ-316) or an UNCLASSIFIED one (SRJ-313,
-   * `ErrSystemInstallDisappeared` included), so the work launches nothing,
-   * records no success or failure and answers
-   * `RESTART_OUTCOME_REFUSED`. Anything else, `undefined`
-   * included, and a kill that throws, means go on to the launch.
+   * Kill the persona's instance before its launch, with one checked kill
+   * (b.jg5 SRJ-110, SRJ-701), and answer its outcome (`KillOutcome`,
+   * `kill_sent` included), or `KILL_SESSION_NOT_KILLED_GUARD` when a guard
+   * made no call. Required: every kill reports its outcome. `lastRead` is
+   * the run's last liveness reading, the `dead` one that led to the kill:
+   * it carries the row state the run read (`ended`, `missing` or no row,
+   * `deadRowReadOf`), or none (`ErrSystemInstallDisappeared`), and is the
+   * state a latch the kill sets records (b.jg5 SRJ-501), with no further
+   * `status` read when it carries one. The work launches only after a
+   * success form (`killed`, any `kill_sent`; `row-gone`, `ErrSpawnNotFound`;
+   * `session-gone`, GONE; `row-finished`) or the guard answer. A CONFLICT or
+   * an UNUSABLE NAME (which the adapter latched) answers
+   * `RESTART_OUTCOME_LATCHED`; an `ErrInvalidFlags` whose re-check decided
+   * that the server stops answers `RESTART_OUTCOME_SHUTTING_DOWN` (b.jg5
+   * SRJ-205); every other non-success (UNAVAILABLE, `ErrTmuxKillFailed`
+   * included, ENVIRONMENT, CONFIG, UNCLASSIFIED, `ErrSystemInstallDisappeared`
+   * and a class the kill has no row for included), an answer that is not an
+   * outcome and a kill that throws answer `RESTART_OUTCOME_REFUSED`; none of
+   * them launches, records a success or a failure, or reaches the cap.
    */
-  killSession(key: string): Promise<KillSessionResult>
+  killSession(key: string, lastRead: DeadLivenessReading): Promise<KillSessionResult>
   /**
    * `cwd` is the persona's working directory. `'skipped'`: the launch was
    * declined (the persona stopped being up after the last `canRestart`
@@ -480,14 +521,58 @@ export function relaunchWithoutKillLine(key: string): string {
   return `[slack] No kill before the relaunch for persona=${key} — its escalate-dead verdict came from a send-keys refused as not interactive, which never by itself leads to a kill; the relaunch's own row read decides (b.jg5 SRJ-609)`
 }
 
-/** `RestartDeps.killSession`'s report that the kill was refused (b.jg5 SRJ-105): no launch follows. */
-export const KILL_SESSION_REFUSED = 'refused'
+/**
+ * `RestartDeps.killSession`'s answer when one of the adapter's guards made no
+ * call (b.jg5 SRJ-110: "its guards stay"): a launch is already in flight for
+ * the persona, or its `claude_config_dir` cannot be resolved to a real path.
+ * Nothing was killed; the work goes on to the launch as it always has (the
+ * launch joins the one in flight, or the relaunch gate refuses it).
+ */
+export const KILL_SESSION_NOT_KILLED_GUARD = 'not-killed-guard'
 
 /**
- * What `RestartDeps.killSession` answers: `KILL_SESSION_REFUSED` stops the
- * work before its launch; `void` (a kill that resolves with nothing) goes on.
+ * What `RestartDeps.killSession` answers: the kill's outcome
+ * (`src/checked-kill.ts`; b.jg5 SRJ-110, SRJ-701), `kill_sent` included, or
+ * `KILL_SESSION_NOT_KILLED_GUARD` when a guard made no call.
  */
-export type KillSessionResult = void | typeof KILL_SESSION_REFUSED
+export type KillSessionResult = KillOutcome | typeof KILL_SESSION_NOT_KILLED_GUARD
+
+/**
+ * `relaunchAfterKillLine`'s form for a relaunch with no kill made: after a
+ * `RECONNECT_ESCALATE_DEAD_NO_KILL` verdict (b.jg5 SRJ-609).
+ */
+export const RELAUNCH_KILL_NONE = 'kill-none'
+
+/**
+ * The restart work's line naming the kill's outcome, before the relaunch
+ * after a kill that succeeded, a guard that made no call, or no kill at all
+ * (`RELAUNCH_KILL_NONE`, SRJ-609) (b.jg5 SRJ-701, SRJ-1014): a kill's line
+ * is `describeKillOutcome`'s rendering, `kill_sent` included.
+ */
+export function relaunchAfterKillLine(
+  key: string,
+  cwd: string,
+  killed: KillSuccess | typeof KILL_SESSION_NOT_KILLED_GUARD | typeof RELAUNCH_KILL_NONE,
+): string {
+  const kill =
+    killed === RELAUNCH_KILL_NONE
+      ? 'none (b.jg5 SRJ-609)'
+      : killed === KILL_SESSION_NOT_KILLED_GUARD
+        ? 'not killed (a guard made no call)'
+        : describeKillOutcome(killed)
+  return `[slack] Relaunching session for persona=${key} cwd="${cwd}" — kill: ${kill}`
+}
+
+/**
+ * The restart work's line when the kill did not succeed (b.jg5 SRJ-110,
+ * SRJ-701): no relaunch and nothing counted. `described` is the outcome's
+ * rendering (`describeKillOutcome`), or why the answer was no outcome.
+ */
+export function killNotSucceededLine(key: string, described: string, latched: boolean): string {
+  return latched
+    ? `[slack] Session kill for persona=${key} did not succeed (${described}) — the persona is latched; no relaunch; not counted`
+    : `[slack] Session kill for persona=${key} did not succeed (${described}) — no relaunch; not counted`
+}
 
 /**
  * What a restart's launch answers: true launched, false a counted failure,
@@ -720,8 +805,11 @@ function launchInFlight(key: string, isInFlight: (key: string) => boolean): bool
  * row now reads `dead` does the same run go on to the kill and launch
  * (b.d61). After a `RECONNECT_ESCALATE_DEAD_NO_KILL` verdict (a `send-keys`
  * refused as not interactive) the same holds with no kill: a `dead` re-probe
- * leads to the launch alone (`relaunchWithoutKillLine`, b.jg5 SRJ-609). A kill that answers `KILL_SESSION_REFUSED` (b.jg5 SRJ-105) ends
- * the work with `RESTART_OUTCOME_REFUSED`: no launch, nothing counted. The restart cap is not
+ * leads to the launch alone (`relaunchWithoutKillLine`, b.jg5 SRJ-609). When a
+ * kill is made, the launch follows only its success, or a guard of the
+ * adapter's that made no call (`killBeforeRelaunch`, b.jg5 SRJ-110, SRJ-701);
+ * any other answer ends the work with `RESTART_OUTCOME_LATCHED` (a CONFLICT or
+ * an UNUSABLE NAME) or `RESTART_OUTCOME_REFUSED`: no launch, nothing counted. The restart cap is not
  * asked here (the retry entry asks it before this work). The whole work is
  * one recovery attempt for the persona (b.jg5 SRJ-301). Answers what it did (`RestartWorkOutcome`).
  */
@@ -789,8 +877,10 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
 
   // `live` takes the reconnect path; only `dead` falls through to the kill
   // and the launch (the kill left out after a `RECONNECT_ESCALATE_DEAD_NO_KILL`
-  // verdict, b.jg5 SRJ-609).
+  // verdict, b.jg5 SRJ-609). `deadRead` is the run's last `dead` reading,
+  // handed to the kill (b.jg5 SRJ-501: the state the path last read).
   let killBeforeLaunch = true
+  let deadRead = deadReadingOf(probe)
   if (probe.kind !== LIVENESS_DEAD) {
     // If the session already re-established its MCP connection (e.g. Claude
     // Code refreshed the SSE stream on its own), skip the reconnect. A
@@ -882,40 +972,27 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     // b.jg5 SRJ-502: the adapter's sweep may have latched the persona (a
     // post-run `get` of its own row); then no re-probe follows.
     if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
-    const held = await reprobeDeadAfterEscalate(d, key)
-    if (held !== undefined) return held
+    const reprobed = await reprobeDeadAfterEscalate(d, key)
+    if (typeof reprobed === 'string') return reprobed
+    deadRead = reprobed
   }
 
-  // Kill the zombie session, if any. A refused kill (`KILL_SESSION_REFUSED`,
-  // b.jg5 SRJ-105) stops the run below with no launch; any other error (a
-  // throw, e.g. the session may not exist) is ignored and the launch follows.
+  // Kill the zombie session, if any, with one checked kill (b.jg5 SRJ-110,
+  // SRJ-701): only a success (any `kill_sent`, or `ErrSpawnNotFound`), or a
+  // guard of the adapter's that made no call, lets the launch follow.
   // b.jg5 SRJ-502: the latch is asked once more right before the kill, so a
   // persona that latched during the 'escalate-dead' re-probe (or, with the
   // check after the reconnect, during the reconnect) is never killed.
   // b.jg5 SRJ-609: after a `RECONNECT_ESCALATE_DEAD_NO_KILL` verdict no kill
   // is made; the latch is still asked before the relaunch.
   if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
-  let killed: KillSessionResult = undefined
   if (killBeforeLaunch) {
-    try {
-      killed = await d.killSession(key)
-    } catch { /* ignore */ }
+    const stopped = await killBeforeRelaunch(d, key, cwd, deadRead)
+    if (stopped !== undefined) return stopped
   } else {
     console.error(relaunchWithoutKillLine(key))
+    console.error(relaunchAfterKillLine(key, cwd, RELAUNCH_KILL_NONE))
   }
-
-  if (killed === KILL_SESSION_REFUSED) {
-    // b.jg5 SRJ-105: agent-director refused the kill (UNAVAILABLE,
-    // ENVIRONMENT, CONFIG (`ErrConfigMalformed`, SRJ-316) or UNCLASSIFIED
-    // (SRJ-313, `ErrSystemInstallDisappeared` included)), so no launch
-    // follows it. Nothing is counted: the failure
-    // counter, backoff and cap latch are left exactly as they were, and the
-    // refusal is answered as the launch's is (SRJ-302).
-    console.error(`[slack] Session kill refused for persona=${key} — no relaunch; not counted`)
-    return RESTART_OUTCOME_REFUSED
-  }
-
-  console.error(`[slack] Relaunching session for persona=${key} cwd="${cwd}"`)
 
   let ok: LaunchSessionResult
   try {
@@ -982,11 +1059,86 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
 }
 
 /**
+ * The restart work's kill before its relaunch (b.jg5 SRJ-110, SRJ-701):
+ * one `RestartDeps.killSession` call with `lastRead`, the run's last `dead`
+ * reading. Answers `undefined` when the launch may
+ * follow: after a success form (`killed` with any `kill_sent`, `row-gone`,
+ * `session-gone`, `row-finished`) or `KILL_SESSION_NOT_KILLED_GUARD`, after logging the
+ * relaunch line that names the outcome (`relaunchAfterKillLine`). Otherwise
+ * the work's outcome, with no launch and nothing recorded (no success, no
+ * failure, no cap): `RESTART_OUTCOME_SHUTTING_DOWN` for an `ErrInvalidFlags`
+ * whose re-check decided that the server stops (b.jg5 SRJ-205: nothing more
+ * is called), `RESTART_OUTCOME_LATCHED` for a CONFLICT or an UNUSABLE
+ * NAME, which the adapter has latched (b.jg5 SRJ-501, SRJ-512; never sent
+ * again), and `RESTART_OUTCOME_REFUSED` for every other non-success
+ * (UNAVAILABLE, `ErrTmuxKillFailed` included, ENVIRONMENT, CONFIG,
+ * UNCLASSIFIED, `ErrSystemInstallDisappeared` and a class the kill has no
+ * row for included, each having armed the retry timer inside the attempt),
+ * for an answer that is not a kill outcome, and for a `killSession` that
+ * throws: none of them shows the kill succeeded.
+ */
+async function killBeforeRelaunch(
+  d: RestartDeps,
+  key: string,
+  cwd: string,
+  lastRead: DeadLivenessReading,
+): Promise<RestartWorkOutcome | undefined> {
+  let killed: unknown
+  try {
+    killed = await d.killSession(key, lastRead)
+  } catch (err) {
+    console.error(killNotSucceededLine(key, `killSession threw: ${describeThrownValue(err)}`, false))
+    return RESTART_OUTCOME_REFUSED
+  }
+  if (killed === KILL_SESSION_NOT_KILLED_GUARD || killLetsNextStepRun(killed)) {
+    console.error(relaunchAfterKillLine(key, cwd, killed))
+    return undefined
+  }
+  if (!isKillOutcome(killed)) {
+    console.error(killNotSucceededLine(key, 'killSession answered no kill outcome', false))
+    return RESTART_OUTCOME_REFUSED
+  }
+  // A non-success: no launch follows, and nothing is counted (SRJ-302).
+  if (killOutcomeStopsServer(killed)) {
+    console.error(killStopsServerLine(key, describeKillOutcome(killed)))
+    return RESTART_OUTCOME_SHUTTING_DOWN
+  }
+  const latched =
+    killed.kind === KILL_OUTCOME_NOT_KILLED &&
+    (killed.errorClass === AD_ERROR_CLASS_CONFLICT || killed.errorClass === AD_ERROR_CLASS_UNUSABLE_NAME)
+  console.error(killNotSucceededLine(key, describeKillOutcome(killed), latched))
+  return latched ? RESTART_OUTCOME_LATCHED : RESTART_OUTCOME_REFUSED
+}
+
+/**
+ * The restart work's line when the kill answered `ErrInvalidFlags` and its
+ * immediate version re-check decided that the server stops (b.jg5 SRJ-104,
+ * SRJ-204, SRJ-205): no relaunch, nothing counted, nothing more called.
+ * `described` is the outcome's rendering (`describeKillOutcome`).
+ */
+export function killStopsServerLine(key: string, described: string): string {
+  return `[slack] Session kill for persona=${key} did not succeed (${described}) — the version re-check decided that the server stops; no relaunch; not counted; nothing more is called`
+}
+
+/**
+ * The run's `dead` reading handed to the kill (`RestartDeps.killSession`'s
+ * `lastRead`) for `probe`: the install-gone reading for
+ * `ErrSystemInstallDisappeared`, else the `dead` reading carrying the row
+ * state the probe read (`deadLivenessReading`), none when it read none.
+ * Only a `dead` probe reaches the kill.
+ */
+function deadReadingOf(probe: LivenessProbe): DeadLivenessReading {
+  if (probe.installGone === true) return LIVENESS_READING_DEAD_INSTALL_GONE
+  return deadLivenessReading(probe.deadRowRead)
+}
+
+/**
  * b.d61: after an 'escalate-dead' reconnect verdict (whose adapter already ran
  * the findMissing sweep), probe the persona's liveness again. A swept row may
  * stay live for further ticks (b.jg5 SRJ-610): nothing promises this re-probe
  * or a later one reads it dead. Returns
- * undefined only when the row now reads `dead` and this restart run should go
+ * the `dead` reading (`deadReadingOf`: the row state it read, for the kill's
+ * `lastRead`) only when the row now reads `dead` and this restart run should go
  * on to the kill+relaunch branch; otherwise the outcome the run returns with,
  * with no relaunch (b.jg5 SRJ-314): `RESTART_OUTCOME_RECONNECT_DEFERRED` (the
  * row still reads `live`: no kill, launch or accounting; each later
@@ -1012,7 +1164,7 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
  * `reprobeLiveLine`, `reprobePendingLine`, `reprobeUnknownLine`,
  * `reprobeUnhandledLine`).
  */
-async function reprobeDeadAfterEscalate(d: RestartDeps, key: string): Promise<RestartWorkOutcome | undefined> {
+async function reprobeDeadAfterEscalate(d: RestartDeps, key: string): Promise<RestartWorkOutcome | DeadLivenessReading> {
   const probe = await probeLiveness(d, key)
 
   if (d.isShuttingDown()) {
@@ -1030,7 +1182,7 @@ async function reprobeDeadAfterEscalate(d: RestartDeps, key: string): Promise<Re
     case LIVENESS_DEAD:
       console.error(reprobeDeadLine(key))
       noteDeadReading(d, key, probe)
-      return undefined
+      return deadReadingOf(probe)
     case LIVENESS_UNKNOWN:
       // b.jg5 SRJ-610: neither counts nor resets the slow-recovery count.
       console.error(reprobeUnknownLine(key, probe.failure))
@@ -1106,13 +1258,15 @@ interface LivenessProbe {
   readonly installGone?: true
   /** A `pending` reading's launch start (raw); absent for any other reading, or when it showed none. */
   readonly launchStartedAt?: string
+  /** A `dead` row read's row state (`deadRowReadOf`: `ended`, `missing` or no row); absent for any other reading, or when it read no row. */
+  readonly deadRowRead?: DeadRowRead
 }
 
 /**
  * Probe persona `key`'s liveness (b.jg5 SRJ-314): the reading's kind, with a
  * probe that throws, or answers something that is not a reading, read
- * `unknown` (never `dead`), and a `pending` reading's launch start. Logs
- * nothing; never rejects.
+ * `unknown` (never `dead`), a `pending` reading's launch start, and a `dead`
+ * row read's row state. Logs nothing; never rejects.
  */
 async function probeLiveness(d: RestartDeps, key: string): Promise<LivenessProbe> {
   let reading: LivenessReading
@@ -1123,6 +1277,8 @@ async function probeLiveness(d: RestartDeps, key: string): Promise<LivenessProbe
   }
   const kind = livenessKindOf(reading)
   if (isInstallGoneDeadReading(reading)) return { kind, installGone: true }
+  const deadRowRead = deadRowReadOf(reading)
+  if (deadRowRead !== undefined) return { kind, deadRowRead }
   const launchStartedAt = launchStartOfReading(reading)
   return launchStartedAt === undefined ? { kind } : { kind, launchStartedAt }
 }

@@ -60,6 +60,14 @@
  * classification itself carries no description, so
  * `describeAdErrorClassification` never logs the raw text. Never throws.
  *
+ * {@link killFailedDescriptionOf} answers the description of a value that is
+ * an `ErrTmuxKillFailed` by name (its own `errName`, or an
+ * `ErrUnknownErrorName` carrying that name, with the envelope's
+ * description), and nothing for any other value; the kill outcome
+ * (`src/checked-kill.ts`; b.jg5 SRJ-110, SRJ-702) carries it raw, and every
+ * log line renders it redacted. An UNAVAILABLE classification carries no
+ * description either. Never throws.
+ *
  * The classifier is pure: no I/O, clock, module state or agent-director call,
  * and it never throws (a throwing property read counts as an absent field).
  *
@@ -80,8 +88,14 @@
  * injectable) and answers UNCLASSIFIED with the re-check's answer; any other
  * value answers its pure class with no re-check. A stop the re-check decides
  * ends the process as the re-check defines. Its callers: the resume path of
- * `resumeOrFreshSpawn` (`src/session-manager.ts`) and the `decide` branch of
- * the click handler (`src/permission-click-handler.ts`).
+ * `resumeOrFreshSpawn` (`src/session-manager.ts`), the kill sites
+ * (`recheckKillOnInvalidFlags`, `src/session-manager.ts`) and the `decide`
+ * branch of the click handler (`src/permission-click-handler.ts`).
+ *
+ * {@link unclassifiedClassificationOf} is the UNCLASSIFIED classification,
+ * reported name and rendered message included, of a value a site takes as
+ * UNCLASSIFIED although the classifier gives it another class (b.jg5 SRJ-110:
+ * a class a kill has no row for). Pure; never throws.
  *
  * {@link describeAgentDirectorFailure} renders a failed call for a log line by
  * the same name rule: the `errName` when it is a safe identifier, then the
@@ -284,6 +298,9 @@ export type AdErrorClass = (typeof AD_ERROR_CLASSES)[number]
 /** `errName` of the client's error for an `err_name` it has no class for. */
 const ERR_UNKNOWN_ERROR_NAME = 'ErrUnknownErrorName'
 
+/** The agent-director error names the table classes GONE; the one source of them. */
+export const AD_GONE_ERR_NAMES = ['ErrTmuxSendKeys', 'ErrTmuxCaptureFailed'] as const
+
 /** `unknownName` of an agent-director internal error (no class in any client). */
 const ERR_INTERNAL_NAME = 'ErrInternal'
 
@@ -306,8 +323,7 @@ const ERR_INVALID_FLAGS_NAME = 'ErrInvalidFlags'
  * {@link classifyAdError}; any other name is UNCLASSIFIED.
  */
 const CLASS_BY_ERR_NAME: ReadonlyMap<string, AdErrorClass> = new Map<string, AdErrorClass>([
-  ['ErrTmuxSendKeys', AD_ERROR_CLASS_GONE],
-  ['ErrTmuxCaptureFailed', AD_ERROR_CLASS_GONE],
+  ...AD_GONE_ERR_NAMES.map((name): [string, AdErrorClass] => [name, AD_ERROR_CLASS_GONE]),
   [ERR_TMUX_UNRESPONSIVE_NAME, AD_ERROR_CLASS_UNAVAILABLE],
   [ERR_TMUX_KILL_FAILED_NAME, AD_ERROR_CLASS_UNAVAILABLE],
   ['ErrCallTimeout', AD_ERROR_CLASS_UNAVAILABLE],
@@ -392,6 +408,35 @@ export function conflictDescriptionOf(value: unknown): string | undefined {
   }
 }
 
+/**
+ * The description of a value that is an `ErrTmuxKillFailed` by name (b.jg5
+ * SRJ-101 interim rule): for a value whose own `errName` is
+ * `ErrTmuxKillFailed`, its `errDescription`; for an `ErrUnknownErrorName`
+ * whose `unknownName` is `ErrTmuxKillFailed` (a client that has no class of
+ * that name), the envelope's `err_description`. Raw, as agent-director wrote
+ * it, when it is a string. `undefined` for a value of any other name, for a
+ * value that is not an agent-director error, and when a read throws or finds
+ * no string. The kill outcome (`src/checked-kill.ts`) carries it; the caller
+ * redacts it before it reaches a log line, a stored record or a notice. A
+ * classification never carries it, so `describeAdErrorClassification` never
+ * logs the raw text. Pure; never throws.
+ */
+export function killFailedDescriptionOf(value: unknown): string | undefined {
+  try {
+    if (!isAgentDirectorError(value)) return undefined
+    const errName = readProp(value, 'errName')
+    let description: unknown
+    if (errName === ERR_TMUX_KILL_FAILED_NAME) {
+      description = readProp(value, 'errDescription')
+    } else if (errName === ERR_UNKNOWN_ERROR_NAME && readProp(value, 'unknownName') === ERR_TMUX_KILL_FAILED_NAME) {
+      description = readProp(readProp(value, 'envelope'), 'err_description')
+    }
+    return typeof description === 'string' ? description : undefined
+  } catch {
+    return undefined
+  }
+}
+
 /** An agent-director error whose `errName` is `ErrInvalidFlags`. */
 export type InvalidFlagsError = AgentDirectorError & { readonly errName: typeof ERR_INVALID_FLAGS_NAME }
 
@@ -466,6 +511,34 @@ export function describeAgentDirectorFailure(err: unknown): string {
     /* a throwing property read falls back to the generic describer */
   }
   return describeThrownValue(err)
+}
+
+/**
+ * The UNCLASSIFIED classification of `value`, for a site that takes a value
+ * of another class as UNCLASSIFIED because it gives that class no meaning
+ * (b.jg5 SRJ-104, SRJ-110: at a kill, a STATE name other than
+ * `ErrSpawnNotFound`, LAUNCH FAILURE or DIRECTORY): class UNCLASSIFIED, with
+ * the reported name (`errName`, or `unknownName` of an `ErrUnknownErrorName`)
+ * when it is a safe identifier and the rendered message (`errDescription`,
+ * or the envelope's `err_description` of an `ErrUnknownErrorName`) when it
+ * is not empty. For a value that is not an agent-director error, class
+ * UNCLASSIFIED alone. Pure; never throws.
+ */
+export function unclassifiedClassificationOf(value: unknown): AdErrorClassification {
+  try {
+    if (!isAgentDirectorError(value)) return { errorClass: AD_ERROR_CLASS_UNCLASSIFIED }
+    const errName = readProp(value, 'errName')
+    if (errName === ERR_UNKNOWN_ERROR_NAME) {
+      return reported(
+        AD_ERROR_CLASS_UNCLASSIFIED,
+        readProp(value, 'unknownName'),
+        readProp(readProp(value, 'envelope'), 'err_description'),
+      )
+    }
+    return reported(AD_ERROR_CLASS_UNCLASSIFIED, errName, readProp(value, 'errDescription'))
+  } catch {
+    return { errorClass: AD_ERROR_CLASS_UNCLASSIFIED }
+  }
 }
 
 /** The class of an `ErrUnknownErrorName` (or an A-13 value) by `unknownName` and description. */

@@ -471,6 +471,7 @@ import {
   _resetPreLaunchTrustPatcher,
   _resetPreLaunchReplyGuard,
   setPreLaunchReplyGuard,
+  KILL_CONTEXT_TEARDOWN,
   killPersonaInstance,
   deletePersonaInstance,
   readPersonaRowState,
@@ -606,8 +607,13 @@ import {
   SAMPLE_LAUNCH_START_NONE,
   SAMPLE_LAUNCH_START_WHOLE,
   cannedFindMissing,
+  cannedKillResult,
   cannedOk,
   cannedErr,
+  errCallTimeout,
+  errTmuxKillFailed,
+  errTmuxSessionConflict,
+  KILL_FAILED_DESCRIPTIONS,
   errInstanceIdCollision,
   errNoSessionId,
   errJsonlMissing,
@@ -653,6 +659,15 @@ import {
   UNUSABLE_NAME_FAULTS,
 } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig, makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
+import {
+  KILL_OUTCOME_KILLED,
+  KILL_OUTCOME_NOT_KILLED,
+  KILL_OUTCOME_ROW_GONE,
+  KILL_OUTCOME_SESSION_GONE,
+  describeKillOutcome,
+  killOutcomeOf,
+  type KillOutcome,
+} from '../src/checked-kill.ts'
 import { buildTempArchiveDb, messagesSince } from './test-helpers/archive-db.ts'
 import {
   CUSTOM_VERB_SPINNER_PANE,
@@ -765,6 +780,7 @@ import {
   LIVENESS_PANE_CONFLICT_CASE_ROWS,
   RECONNECT_CONFLICT_CASE_ROWS,
   RECONNECT_UNUSABLE_NAME_CASE_ROWS,
+  LADDER_KILL_CONFLICT_CASE_ROWS,
   UNUSABLE_NAME_CASE_ROWS,
   expectedConflictNotice,
   expectedLatchRecord,
@@ -4366,10 +4382,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
     expect(countDeferredLines(errLog)).toBe(1)
   })
 
-  test.each([
-    ['kill', 'killed 1, failed 0', { found: 1, killed: 1, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 } }],
-    ['delete', 'killed 0, failed 1', { found: 1, killed: 0, failed: 1, prePersona: { kept: 0, live: 0, killFailed: 0 } }],
-  ] as const)('a %s failure records orphan-cleanup; the delete is still attempted (%s)', async (verb, _label, expected) => {
+  test('a delete failure records orphan-cleanup after a kill that succeeded (killed 0, failed 1)', async () => {
     const readLog = captureStartupErrors()
     const { cfg, home } = sweepConfig()
     const killCalls: import('agent-director').KillParams[] = []
@@ -4378,34 +4391,305 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
       killCalls,
       deleteCalls,
       listResult: { spawns: [cannedListRow({ claude_instance_id: 'cscb_alpha_old' }, personaOf(cfg, 'alpha'), home)] },
-      killError: verb === 'kill' ? errGeneric('kill', 'ErrKillBroken') : undefined,
-      deleteError: verb === 'delete' ? errGeneric('delete', 'ErrDeleteBroken') : undefined,
+      deleteError: errGeneric('delete', 'ErrDeleteBroken'),
     })
 
     const result = await reconcileOrphans(cfg)
 
-    expect(result).toEqual(expected)
+    expect(result).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 0, live: 0, killFailed: 0 } })
     expect(killCalls.map((k) => k.claude_instance_id)).toEqual(['cscb_alpha_old'])
     expect(deleteCalls.map((d) => d.claude_instance_id)).toEqual([['cscb_alpha_old']])
     const log = readLog()
     expect(countStartupEntries(log, 'orphan-cleanup')).toBe(1)
-    expect(log).toContain(
-      `${verb} failed for orphan instanceId=cscb_alpha_old persona=${renderPersonaRef('alpha', 'alpha')}: Err${verb === 'kill' ? 'Kill' : 'Delete'}Broken`,
-    )
+    expect(log).toContain(`delete failed for orphan instanceId=cscb_alpha_old persona=${renderPersonaRef('alpha', 'alpha')}: ErrDeleteBroken`)
+  })
+
+  // b.jg5 SRJ-110, SRJ-701 (HO C2 Verify, AC 24): the start sweep's kill is
+  // a checked kill. A swept row whose kill does not succeed (each value of
+  // HO C2's non-success list, the unusable-name value, `ErrConfigMalformed`,
+  // another error) is kept: no delete call, counted failed, and one
+  // `orphan-cleanup` entry naming the outcome. Nothing latches (the sweep
+  // routes a CONFLICT or an UNUSABLE NAME per SRJ-1002, even for a
+  // configured persona's row with the server's latch installed), and no
+  // retry timer is armed. Reverses "a kill failure records orphan-cleanup;
+  // the delete is still attempted". The sweep is no launch or recovery
+  // attempt, so a class the kill has no row for (UNCLASSIFIED) arms nothing
+  // and feeds no unclassified-error episode either (b.jg5 SRJ-110). GONE is
+  // the session-gone success (b.jg5 SRJ-104): the row is deleted. An
+  // `ErrInvalidFlags` gets exactly one immediate version re-check (b.jg5
+  // SRJ-104, SRJ-204); a stop it decides ends the sweep: no further row is
+  // handled and no findMissing sweep follows (b.jg5 SRJ-205).
+  describe('b.jg5 SRJ-110, SRJ-701: the start sweep\'s checked kill', () => {
+    /** Every arm the outage state's trigger sink received. */
+    let armed: Array<{ key: string; kind: string }>
+    /** Every report the outage state's unclassified sink received. */
+    let reported: string[]
+
+    beforeEach(() => {
+      armed = []
+      reported = []
+      initOutageState({
+        getClient,
+        notify: (key, text) => { outageEmissions.push({ key, text }) },
+        triggerSink: { arm: (key, cause) => { armed.push({ key, kind: cause.kind }); return true } },
+        unclassifiedSink: { report: (key) => { reported.push(key) } },
+      })
+    })
+
+    /** Sweep one row (`id`, labelled `persona`) whose kill is scripted by `kill`; returns the result, the calls, the log and the startup-errors entries. */
+    async function sweepOne(
+      id: string,
+      persona: string,
+      kill: Pick<StubClientOptions, 'killError' | 'killResult'>,
+    ): Promise<{ result: Awaited<ReturnType<typeof reconcileOrphans>>; killCalls: string[]; deleteCalls: string[][]; errLog: string; entries: string; latch: ConflictLatch }> {
+      const readLog = captureStartupErrors()
+      const { cfg, home } = sweepConfig()
+      const latch = createConflictLatch({ log: () => {} })
+      setConflictLatch(latch)
+      setConfiguredPersonaQuery((key) => cfg.personas.some((p) => p.key === key))
+      const killCalls: import('agent-director').KillParams[] = []
+      const deleteCalls: import('agent-director').DeleteParams[] = []
+      installStub({
+        killCalls,
+        deleteCalls,
+        listResult: { spawns: [cannedListRow({ claude_instance_id: id, labels: { service: 'cscb', persona } }, personaOf(cfg, 'alpha'), home)] },
+        ...kill,
+      })
+      let result!: Awaited<ReturnType<typeof reconcileOrphans>>
+      const errLog = await withCapturedErr(async () => {
+        result = await reconcileOrphans(cfg)
+      })
+      return {
+        result,
+        killCalls: killCalls.map((k) => k.claude_instance_id),
+        deleteCalls: deleteCalls.map((d) => d.claude_instance_id),
+        errLog,
+        entries: readLog(),
+        latch,
+      }
+    }
+
+    /** The `orphan-cleanup` entry for a swept row whose kill answered `outcome`. */
+    const keptEntry = (id: string, persona: string, outcome: KillOutcome): string =>
+      `kill did not succeed for orphan instanceId=${id} persona=${persona}: ${describeKillOutcome(outcome)}; row kept, no delete was made, its session may still be running`
+
+    test.each<[string, () => Error]>([
+      ...KILL_FAILED_DESCRIPTIONS.map((d): [string, () => Error] => [`ErrTmuxKillFailed (${d})`, () => errTmuxKillFailed(undefined, d)]),
+      ['ErrTmuxUnresponsive', () => errTmuxUnresponsive('kill')],
+      ['ErrTmuxSessionConflict (not this launch\'s session)', () => errTmuxSessionConflict('kill', 'not-this-launch')],
+      ['ErrTmuxSessionConflict (conflicting labels)', () => errTmuxSessionConflict('kill', 'conflicting-labels')],
+      ['ErrTmuxNotAvailable', () => errTmuxNotAvailable(undefined, 'kill')],
+      ['ErrInternal', () => errInternal()],
+      ['ErrUnknownErrorName', () => errUnknownErrorName()],
+      ['ErrCallTimeout', () => errCallTimeout('kill')],
+      ['an UNUSABLE NAME ErrInternal', () => errUnusableName()],
+      ['ErrConfigMalformed', () => errConfigMalformed()],
+      ['another error (ErrKillBroken)', () => errGeneric('kill', 'ErrKillBroken')],
+      // b.jg5 SRJ-110: a class the kill has no row for is UNCLASSIFIED; the sweep arms nothing for it.
+      ['a STATE name (ErrInstanceIdCollision), UNCLASSIFIED', () => errInstanceIdCollision()],
+      ['a STATE name (ErrSpawnNotResumable), UNCLASSIFIED', () => errSpawnNotResumable()],
+      ['a LAUNCH FAILURE name (ErrTmuxSessionCreate), UNCLASSIFIED', () => errTmuxSessionCreate('kill')],
+    ])('a configured persona\'s swept row whose kill answers %s: kept, no delete call, counted failed, one orphan-cleanup entry naming the outcome; nothing latches, no retry timer, no unclassified report', async (_label, make) => {
+      const err = make()
+
+      const r = await sweepOne('cscb_alpha_old', 'alpha', { killError: err })
+
+      expect(r.result).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 0, live: 0, killFailed: 0 } })
+      expect(r.killCalls).toEqual(['cscb_alpha_old'])
+      expect(r.deleteCalls).toEqual([])
+      expect(countStartupEntries(r.entries, 'orphan-cleanup')).toBe(1)
+      expect(r.entries).toContain(keptEntry('cscb_alpha_old', renderPersonaRef('alpha', 'alpha'), killOutcomeOf({ thrown: err })))
+      expect(r.latch.isLatched('alpha')).toBe(false)
+      expect(armed).toEqual([])
+      expect(reported).toEqual([])
+      assertNoLeak({ errLog: r.errLog, entries: r.entries })
+    })
+
+    test.each<[string, Pick<StubClientOptions, 'killError' | 'killResult'>, KillOutcome]>([
+      ['succeeds with kill_sent true', { killResult: cannedKillResult(true) }, { kind: KILL_OUTCOME_KILLED, killSent: true }],
+      ['succeeds with kill_sent false', { killResult: cannedKillResult(false) }, { kind: KILL_OUTCOME_KILLED, killSent: false }],
+      ['succeeds with no kill_sent', { killResult: cannedKillResult() }, { kind: KILL_OUTCOME_KILLED }],
+      ['answers ErrSpawnNotFound', { killError: errSpawnNotFound() }, { kind: KILL_OUTCOME_ROW_GONE }],
+      // b.jg5 SRJ-104, SRJ-110: for `kill`, gone is success.
+      ['answers GONE (ErrTmuxCaptureFailed), the session-gone success', { killError: errTmuxCaptureFailed(undefined, 'kill') }, { kind: KILL_OUTCOME_SESSION_GONE, name: errTmuxCaptureFailed().errName }],
+      ['answers GONE (ErrTmuxSendKeys), the session-gone success', { killError: errTmuxSendKeys() }, { kind: KILL_OUTCOME_SESSION_GONE, name: errTmuxSendKeys().errName }],
+    ])('b.jg5 SRJ-701, SRJ-104: a swept row whose kill %s: deleted as before, with one line naming the outcome; no orphan-cleanup entry', async (_label, kill, outcome) => {
+      const r = await sweepOne('cscb_alpha_old', 'alpha', kill)
+
+      expect(r.result).toEqual({ found: 1, killed: 1, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 } })
+      expect(r.deleteCalls).toEqual([['cscb_alpha_old']])
+      expect(r.errLog).toContain(`reconcileOrphans: kill succeeded for orphan instanceId=cscb_alpha_old (${describeKillOutcome(outcome)}) — deleting the row`)
+      expect(countStartupEntries(r.entries, 'orphan-cleanup')).toBe(0)
+      expect(armed).toEqual([])
+    })
+
+    describe('an ErrInvalidFlags at a sweep kill (b.jg5 SRJ-104, SRJ-204, SRJ-205)', () => {
+      let resolveCalls: Array<object | undefined>
+      let stops: number[]
+
+      /** Install the real re-check, its `resolveSystemBinary` answering `outcome`. */
+      function installRecheck(outcome: StubResolveSystemBinaryOutcome): void {
+        resetAdVersionRecheckForTests()
+        installAdVersionRecheck({
+          resolveSystemBinary: makeStubResolveSystemBinary({ calls: resolveCalls, outcomes: [outcome] }),
+          baselineVersion: PHASE1_RC_VERSION,
+          recordStartupError: () => {},
+          stop: (exitCode) => { stops.push(exitCode) },
+          log: () => {},
+          clock: createFakeClock(),
+        })
+      }
+
+      beforeEach(() => {
+        resolveCalls = []
+        stops = []
+      })
+
+      afterEach(() => {
+        resetAdVersionRecheckForTests()
+      })
+
+      test('the re-check passes → exactly one re-check, no stop; the row kept (no delete), counted failed, one orphan-cleanup entry naming the UNCLASSIFIED outcome and its re-check; nothing armed or reported', async () => {
+        installRecheck({ version: PHASE1_RC_VERSION })
+        const err = errInvalidFlags('kill')
+
+        const r = await sweepOne('cscb_alpha_old', 'alpha', { killError: err })
+
+        expect(resolveCalls).toHaveLength(1)
+        expect(stops).toEqual([])
+        expect(r.result).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 0, live: 0, killFailed: 0 } })
+        expect(r.deleteCalls).toEqual([])
+        expect(r.entries).toContain(
+          keptEntry('cscb_alpha_old', renderPersonaRef('alpha', 'alpha'), { ...killOutcomeOf({ thrown: err }), recheck: RECHECK_OUTCOME_PASS } as KillOutcome),
+        )
+        expect(armed).toEqual([])
+        expect(reported).toEqual([])
+        expect(r.latch.isLatched('alpha')).toBe(false)
+      })
+
+      test('the re-check decides that the server stops → exactly one re-check and one stop; the sweep stops: no delete, no further row handled, no findMissing sweep; no orphan-cleanup entry; one stop line; the summary still logged', async () => {
+        installRecheck({ version: OLD_AD_VERSION })
+        const readLog = captureStartupErrors()
+        const { cfg, home } = sweepConfig()
+        const alpha = personaOf(cfg, 'alpha')
+        const killCalls: import('agent-director').KillParams[] = []
+        const deleteCalls: import('agent-director').DeleteParams[] = []
+        const callLog: string[] = []
+        installStub({
+          killCalls,
+          deleteCalls,
+          callLog,
+          // The live pre-persona row's kill succeeds; the swept row's answers ErrInvalidFlags; the last row is never reached.
+          killQueue: [cannedOk(cannedKillResult(true)), cannedErr(errInvalidFlags('kill')), cannedOk(cannedKillResult(true))],
+          listResult: {
+            spawns: [
+              prePersonaRow('waiting'),
+              cannedListRow({ claude_instance_id: 'cscb_alpha_old' }, alpha, home),
+              cannedListRow({ claude_instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' } }, alpha, home),
+            ],
+          },
+        })
+
+        let result!: Awaited<ReturnType<typeof reconcileOrphans>>
+        const errLog = await withCapturedErr(async () => {
+          result = await reconcileOrphans(cfg)
+        })
+
+        expect(resolveCalls).toHaveLength(1)
+        expect(stops).toHaveLength(1)
+        expect(killCalls.map((k) => k.claude_instance_id)).toEqual(['cscb_old_waiting_C0OLD', 'cscb_alpha_old'])
+        expect(deleteCalls).toEqual([])
+        expect(callLog).toEqual([])
+        expect(result).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 1, live: 1, killFailed: 0 } })
+        const entries = readLog()
+        expect(countStartupEntries(entries, 'orphan-cleanup')).toBe(0)
+        const stopLines = errLog.split('\n').filter((l) => l.includes('the version re-check decided that the server stops'))
+        expect(stopLines).toHaveLength(1)
+        expect(stopLines[0]).toContain('reconcileOrphans: kill did not succeed for instanceId=cscb_alpha_old: ')
+        expect(stopLines[0]).toContain(`recheck=${RECHECK_OUTCOME_STOP}`)
+        expect(errLog).toContain('reconcileOrphans: found=1 killed=0 failed=1; pre-persona rows kept=1 live=1 kill-failed=0')
+        expect(errLog).not.toContain('instanceId=cscb_departed')
+        expect(armed).toEqual([])
+        expect(reported).toEqual([])
+      })
+
+      test('a live pre-persona row\'s kill whose re-check decides that the server stops → one re-check and one stop; the row kept (kill-failed 1), no orphan-cleanup entry, no further row handled and no findMissing sweep', async () => {
+        installRecheck({ version: OLD_AD_VERSION })
+        const readLog = captureStartupErrors()
+        const { cfg } = sweepConfig()
+        const killCalls: import('agent-director').KillParams[] = []
+        const deleteCalls: import('agent-director').DeleteParams[] = []
+        const callLog: string[] = []
+        installStub({
+          killCalls,
+          deleteCalls,
+          callLog,
+          killQueue: [cannedErr(errInvalidFlags('kill')), cannedOk(cannedKillResult(true))],
+          listResult: {
+            spawns: [
+              prePersonaRow('waiting'),
+              cannedListRow({ claude_instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' } }),
+            ],
+          },
+        })
+
+        let result!: Awaited<ReturnType<typeof reconcileOrphans>>
+        const errLog = await withCapturedErr(async () => {
+          result = await reconcileOrphans(cfg)
+        })
+
+        expect(resolveCalls).toHaveLength(1)
+        expect(stops).toHaveLength(1)
+        expect(killCalls.map((k) => k.claude_instance_id)).toEqual(['cscb_old_waiting_C0OLD'])
+        expect(deleteCalls).toEqual([])
+        expect(callLog).toEqual([])
+        expect(result).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 1, live: 1, killFailed: 1 } })
+        expect(countStartupEntries(readLog(), 'orphan-cleanup')).toBe(0)
+        expect(errLog.split('\n').filter((l) => l.includes('the version re-check decided that the server stops'))).toHaveLength(1)
+      })
+    })
+
+    // b.jg5 SRJ-110, SRJ-301 (hatch A3): an ENVIRONMENT or CONFIG answer at a
+    // start-sweep kill arms no retry timer and deletes nothing. It raises
+    // the row's persona's outage (`tmux-unavailable`, `ad-config-malformed`)
+    // only when that persona is in the applied configuration; for an absent
+    // persona's row it is only logged and recorded in the row's
+    // `orphan-cleanup` entry.
+    test.each<[string, () => Error, OutageClass, string, string, boolean]>([
+      ['ENVIRONMENT', () => errTmuxNotAvailable(undefined, 'kill'), 'tmux-unavailable', 'cscb_alpha_old', 'alpha', true],
+      ['ENVIRONMENT', () => errTmuxNotAvailable(undefined, 'kill'), 'tmux-unavailable', 'cscb_departed', 'departed', false],
+      ['CONFIG', () => errConfigMalformed(), 'ad-config-malformed', 'cscb_alpha_old', 'alpha', true],
+      ['CONFIG', () => errConfigMalformed(), 'ad-config-malformed', 'cscb_departed', 'departed', false],
+    ])('b.jg5 SRJ-110 (hatch A3): an %s answer at the sweep kill of %s\'s row (%s, configured: %p) raises %s only for a configured persona; recorded in the row\'s orphan-cleanup entry; no retry timer armed, nothing deleted', async (_class, make, flag, id, persona, configured) => {
+      const err = make()
+
+      const r = await sweepOne(id, persona, { killError: err })
+
+      expect(r.deleteCalls).toEqual([])
+      expect(r.result.failed).toBe(1)
+      const shown = configured ? renderPersonaRef('alpha', 'alpha') : persona
+      expect(r.entries).toContain(keptEntry(id, shown, killOutcomeOf({ thrown: err })))
+      expect(armed).toEqual([])
+      expect([...getOutageFlags(persona)]).toEqual(configured ? [flag] : [])
+      expect(outageEmissions.map((e) => e.key)).toEqual(configured ? [persona] : [])
+      for (const key of ['beta', 'gamma']) expect(getOutageFlags(key).size).toBe(0)
+      assertNoLeak({ errLog: r.errLog, entries: r.entries, outageEmissions })
+    })
   })
 
   // b.1ix: a pre-persona row (no persona label; a build before personas made
   // it, with a `cscb_<name>_<channel>` ID) is never deleted, since no launch
-  // reuses its ID. A live one gets one kill call per start and is kept whether
-  // its kill reports success or fails; an ended or missing one gets no call.
-  // One findMissing sweep follows the kills, since agent-director 0.10.0's
-  // kill leaves the row's state as it was. A row naming an absent persona is
-  // still killed and deleted, even after a failed kill.
+  // reuses its ID. A live one gets one checked kill per start (b.jg5 SRJ-110,
+  // SRJ-701) and is kept whether its kill succeeds or not; an ended or
+  // missing one gets no call. One findMissing sweep follows the kills, since
+  // agent-director 0.10.0's kill leaves the row's state as it was. A row
+  // naming an absent persona is still killed and deleted after its own kill
+  // succeeded.
   describe('pre-persona rows are kept, never deleted (b.1ix)', () => {
     test.each([
-      ['reports success', undefined],
-      ['fails', errGeneric('kill', 'ErrKillBroken')],
-    ] as const)('a live pre-persona row whose kill %s: one kill call, kept (no delete), the result logged, then one findMissing sweep; an absent persona’s row is still killed and deleted', async (_label, killError) => {
+      ['succeeds', undefined],
+      ['does not succeed (b.jg5 SRJ-110: the orphan-cleanup entry names the outcome)', errGeneric('kill', 'ErrKillBroken')],
+    ] as const)('a live pre-persona row whose kill %s: one kill call, kept (no delete), the outcome logged, then one findMissing sweep; an absent persona’s row is still killed and deleted', async (_label, killError) => {
       const readLog = captureStartupErrors()
       const { cfg } = sweepConfig()
       const killCalls: import('agent-director').KillParams[] = []
@@ -4414,7 +4698,8 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
       installStub({
         killCalls,
         deleteCalls,
-        killError,
+        // The pre-persona row's kill first, then the absent persona's row's, which succeeds.
+        killQueue: [killError ? cannedErr(killError) : cannedOk(cannedKillResult()), cannedOk(cannedKillResult())],
         callLog,
         listResult: {
           spawns: [
@@ -4435,18 +4720,21 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
       expect(deleteCalls.map((d) => d.claude_instance_id)).toEqual([['cscb_departed']])
       expect(errLog).toContain('reconcileOrphans: pre-persona row (no persona label) instanceId=cscb_old_waiting_C0OLD state=waiting tmux_session=slack_bot_old_waiting_C0OLD is live')
       expect(errLog).toContain(`pre-persona rows kept=1 live=1 kill-failed=${failed}`)
-      // The sweep runs after a failed kill too: the session may be gone all the same.
+      // The sweep runs after a kill that did not succeed too: the session may be gone all the same.
       expect(callLog).toEqual(['findMissing'])
       expect(errLog).toContain('reconcileOrphans: findMissing after the kills of 1 live pre-persona row(s): missing=0 [] still-live=1 [cscb_old_waiting_C0OLD]')
       const entries = readLog()
       if (killError) {
-        expect(entries).toContain('kill failed for pre-persona row instanceId=cscb_old_waiting_C0OLD: ErrKillBroken')
-        expect(entries).toContain('row kept, its session may still be running')
-        expect(errLog).not.toContain('kill reported success')
+        expect(entries).toContain(
+          `kill did not succeed for pre-persona row instanceId=cscb_old_waiting_C0OLD: ${describeKillOutcome(killOutcomeOf({ thrown: killError }))}; row kept, its session may still be running`,
+        )
+        expect(countStartupEntries(entries, 'orphan-cleanup')).toBe(1)
+        expect(errLog).not.toContain('kill succeeded for pre-persona row')
       } else {
-        expect(errLog).toContain('kill reported success for pre-persona row instanceId=cscb_old_waiting_C0OLD — row kept')
+        expect(errLog).toContain(`reconcileOrphans: kill succeeded for pre-persona row instanceId=cscb_old_waiting_C0OLD (${describeKillOutcome({ kind: KILL_OUTCOME_KILLED })}) — row kept`)
         expect(entries).not.toContain('pre-persona')
       }
+      assertNoLeak({ errLog, entries })
     })
 
     test('every live state gets one kill call and all share one findMissing sweep, whose outcome line counts the killed pending row left in neither list as not judged and a killed pending row in unverified_ids as still live; ended and missing pre-persona rows get no kill, no delete and no line', async () => {
@@ -10539,14 +10827,14 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Site #9 — tryKill → kill (tested via spawnForPersona collision path)
+  // Site #9 — ladderKill → kill (tested via spawnForPersona collision path)
   // ErrSystemInstallDisappeared is UNCLASSIFIED (b.jg5 SRJ-104): at the kill
   // it is a refusal (SRJ-105's UNCLASSIFIED row, SRJ-313), so nothing is
   // deleted or launched after it, and the wrapper still raises the outage
   // flag.
   // -------------------------------------------------------------------------
 
-  test('site #9: tryKill kill ErrSystemInstallDisappeared → ad-unreachable, refused (b.jg5 SRJ-105, SRJ-313): no delete or launch after it, no spawn-failure notice', async () => {
+  test('site #9: ladderKill kill ErrSystemInstallDisappeared → ad-unreachable, refused (b.jg5 SRJ-105, SRJ-313): no delete or launch after it, no spawn-failure notice', async () => {
     // collision → get=ended → resume_enabled=false → kill throws (flag set, refused)
     const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir, { resume_enabled: false })
     const calls = newLadderCalls()
@@ -12653,22 +12941,42 @@ describe('persona notices (b.av2 SR-7.2)', () => {
 // ---------------------------------------------------------------------------
 // The persona teardown's quiet kill and delete (b.av2 SR-6.5)
 //
-// `killPersonaInstance(key)` / `deletePersonaInstance(key)` touch only
-// `cscb_<key>`, through `withOutageDetection` (its flags move as for any other
-// call), and are quiet: no log line, no startup error, no persona notice.
-// A row already gone (`ErrSpawnNotFound`) resolves false; every other error is
-// rethrown for the teardown to log. `tryKill` / `tryDelete` keep their own
-// behaviour (the collision ladder and start sweep cases above stay green).
+// `killPersonaInstance(key, { context: KILL_CONTEXT_TEARDOWN })` /
+// `deletePersonaInstance(key)` touch only `cscb_<key>`, through
+// `withOutageDetection` (its flags move as for any other call), and are
+// quiet: no log line, no startup error, no persona notice.
+// b.jg5 SRJ-110, SRJ-701: the kill is one checked kill that answers its
+// outcome, `kill_sent` included, and never throws: a success (`kill_sent`
+// true, false or absent), the row-gone success for `ErrSpawnNotFound`, or a
+// non-success keeping the thrown value. The delete still resolves false for
+// a row already gone and rethrows every other error for the teardown to log.
 // ---------------------------------------------------------------------------
 
 describe('killPersonaInstance / deletePersonaInstance: the persona teardown\'s quiet kill and delete (b.av2 SR-6.5)', () => {
   const B = 'B'
   const A = 'A'
+  /** The persona teardown's kill context (`main()`'s binding). */
+  const TEARDOWN = { context: KILL_CONTEXT_TEARDOWN } as const
+
+  // Ruling (b.jg5 SRJ-110): the kill's context is required, so no caller
+  // takes either context by omission. Checked by `bun run typecheck`: each
+  // call below must stay a type error. The function is never called.
+  test('b.jg5 SRJ-110: killPersonaInstance\'s context is a required parameter (a type error without it)', () => {
+    const neverCalled = (): unknown[] => [
+      // @ts-expect-error -- no options: the context is required
+      killPersonaInstance(B),
+      // @ts-expect-error -- options without a context
+      killPersonaInstance(B, {}),
+      // @ts-expect-error -- options with only rowReadLive
+      killPersonaInstance(B, { rowReadLive: true }),
+    ]
+    expect(typeof neverCalled).toBe('function')
+  })
 
   /** Run `fn` with the startup-errors log and console captured; returns what it resolved or rejected with, and everything captured. */
-  async function runQuietly<T>(fn: () => Promise<T>): Promise<{ outcome: { ok: T } | { err: unknown }; errLog: string; startupLog: string }> {
+  async function runQuietly(fn: () => Promise<unknown>): Promise<{ outcome: { ok: unknown } | { err: unknown }; errLog: string; startupLog: string }> {
     const readStartupLog = captureStartupErrors()
-    let outcome!: { ok: T } | { err: unknown }
+    let outcome!: { ok: unknown } | { err: unknown }
     const errLog = await withCapturedErr(async () => {
       try {
         outcome = { ok: await fn() }
@@ -12680,14 +12988,18 @@ describe('killPersonaInstance / deletePersonaInstance: the persona teardown\'s q
     return { outcome, errLog, startupLog: readStartupLog() }
   }
 
-  test('a present row: kill addresses only cscb_B and resolves true, delete addresses only cscb_B and resolves true; no other verb, no line, no startup error, no notice', async () => {
+  test.each([
+    ['true', true],
+    ['false', false],
+    ['absent', undefined],
+  ] as const)('b.jg5 SRJ-701, SRJ-703: a present row whose kill succeeds with kill_sent %s: kill addresses only cscb_B and resolves the killed outcome carrying it; delete addresses only cscb_B and resolves true; no other verb, no line, no startup error, no notice', async (_label, killSent) => {
     const calls = makeStubCallLog()
-    installStub(calls)
+    installStub({ ...calls, killResult: cannedKillResult(killSent) })
 
-    const kill = await runQuietly(() => killPersonaInstance(B))
+    const kill = await runQuietly(() => killPersonaInstance(B, TEARDOWN))
     const del = await runQuietly(() => deletePersonaInstance(B))
 
-    expect(kill.outcome).toEqual({ ok: true })
+    expect(kill.outcome).toEqual({ ok: killSent === undefined ? { kind: KILL_OUTCOME_KILLED } : { kind: KILL_OUTCOME_KILLED, killSent } })
     expect(del.outcome).toEqual({ ok: true })
     expect(calls.killCalls).toEqual([{ claude_instance_id: 'cscb_B' }])
     expect(calls.deleteCalls).toEqual([{ claude_instance_id: ['cscb_B'] }])
@@ -12701,28 +13013,39 @@ describe('killPersonaInstance / deletePersonaInstance: the persona teardown\'s q
   })
 
   test.each([
-    ['kill', () => killPersonaInstance(B)],
-    ['delete', () => deletePersonaInstance(B)],
-  ] as const)('%s: a row already gone (ErrSpawnNotFound) resolves false, quietly', async (verb, call) => {
+    ['kill', () => killPersonaInstance(B, TEARDOWN), { kind: KILL_OUTCOME_ROW_GONE }],
+    ['delete', () => deletePersonaInstance(B), false],
+  ] as const)('%s: a row already gone (ErrSpawnNotFound) is a success, quietly (b.jg5 SRJ-701: the kill resolves the row-gone outcome, the delete false)', async (verb, call, expected) => {
     installStub(verb === 'kill' ? { killError: errSpawnNotFound() } : { deleteError: errSpawnNotFound() })
 
     const r = await runQuietly(call)
 
-    expect(r.outcome).toEqual({ ok: false })
+    expect(r.outcome).toEqual({ ok: expected })
     expect(r.errLog).toBe('')
     expect(r.startupLog).toBe('')
     expect(notices).toEqual([])
     expect(outageEmissions).toEqual([])
   })
 
-  test.each([
-    ['kill', () => killPersonaInstance(B)],
-    ['delete', () => deletePersonaInstance(B)],
-  ] as const)('%s: any other error is rethrown unchanged, with no line, startup error or notice of its own', async (verb, call) => {
-    const err = errGeneric(verb, 'ErrBroken')
-    installStub(verb === 'kill' ? { killError: err } : { deleteError: err })
+  test('b.jg5 SRJ-701: kill: any other error is never rethrown: it resolves the non-success outcome keeping the same value, with no line, startup error or notice of its own', async () => {
+    const err = errGeneric('kill', 'ErrBroken')
+    installStub({ killError: err })
 
-    const r = await runQuietly(call)
+    const r = await runQuietly(() => killPersonaInstance(B, TEARDOWN))
+
+    expect(r.outcome).toEqual({ ok: { kind: KILL_OUTCOME_NOT_KILLED, errorClass: AD_ERROR_CLASS_UNCLASSIFIED, error: err } })
+    expect((r.outcome as { ok: { error: unknown } }).ok.error).toBe(err)
+    expect(r.errLog).toBe('')
+    expect(r.startupLog).toBe('')
+    expect(notices).toEqual([])
+    expect(outageEmissions).toEqual([])
+  })
+
+  test('delete: any other error is rethrown unchanged, with no line, startup error or notice of its own', async () => {
+    const err = errGeneric('delete', 'ErrBroken')
+    installStub({ deleteError: err })
+
+    const r = await runQuietly(() => deletePersonaInstance(B))
 
     expect(r.outcome).toEqual({ err })
     expect(r.errLog).toBe('')
@@ -12732,9 +13055,9 @@ describe('killPersonaInstance / deletePersonaInstance: the persona teardown\'s q
   })
 
   test.each([
-    ['kill', () => killPersonaInstance(B)],
+    ['kill', () => killPersonaInstance(B, TEARDOWN)],
     ['delete', () => deletePersonaInstance(B)],
-  ] as const)('%s goes through the outage wrapper: agent-director unreachable raises B\'s ad-unreachable flag (and rethrows); a later success clears it with B\'s all-clear; A\'s flag is untouched', async (verb, call) => {
+  ] as const)('%s goes through the outage wrapper: agent-director unreachable raises B\'s ad-unreachable flag (the kill answers its UNCLASSIFIED outcome, b.jg5 SRJ-701; the delete rethrows); a later success clears it with B\'s all-clear; A\'s flag is untouched', async (verb, call) => {
     const BIN = '/opt/ad/bin/agent-director'
     setOutageFlag(A, 'ad-unreachable', BIN)
     outageEmissions = []
@@ -12743,14 +13066,16 @@ describe('killPersonaInstance / deletePersonaInstance: the persona teardown\'s q
 
     const failed = await runQuietly(call)
 
-    expect(failed.outcome).toEqual({ err: unreachable })
+    expect(failed.outcome).toEqual(
+      verb === 'kill' ? { ok: { kind: KILL_OUTCOME_NOT_KILLED, errorClass: AD_ERROR_CLASS_UNCLASSIFIED, error: unreachable } } : { err: unreachable },
+    )
     expect([...getOutageFlags(B)]).toEqual(['ad-unreachable'])
     expect(outageEmissions.map((e) => e.key)).toEqual([B])
 
     installStub({})
     const ok = await runQuietly(call)
 
-    expect(ok.outcome).toEqual({ ok: true })
+    expect(ok.outcome).toEqual({ ok: verb === 'kill' ? { kind: KILL_OUTCOME_KILLED } : true })
     expect([...getOutageFlags(B)]).toEqual([])
     expect(outageEmissions.map((e) => e.key)).toEqual([B, B])
     expect(outageEmissions[1]!.text).toContain('All clear')
@@ -13159,9 +13484,6 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
   // (A spawn whose error has a token-shaped errName is UNCLASSIFIED, b.jg5
   // SRJ-313: refused with no spawn-failed record; its case follows this table.)
   test.each<[string, string, string, (err: Error) => Promise<void>]>([
-    ['a failed orphan kill', 'orphan-cleanup', 'kill', async (err) => {
-      expect(await reconcileOrphans(installOrphan('killError', err))).toEqual({ found: 1, killed: 1, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 } })
-    }],
     ['a failed orphan delete', 'orphan-cleanup', 'delete', async (err) => {
       expect(await reconcileOrphans(installOrphan('deleteError', err))).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 0, live: 0, killFailed: 0 } })
     }],
@@ -13178,6 +13500,26 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
     expect(entry).toContain(`${REDACTED_AD_DESCRIPTION}"`)
     // Once: no cause tail repeating the description.
     expect(entry).not.toContain(' — ')
+    expect(entry.split(REDACTED_URL_PLACEHOLDER)).toHaveLength(2)
+    assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
+  })
+
+  // b.jg5 SRJ-110, SRJ-701: the sweep's kill is a checked kill, so a failed
+  // orphan kill keeps the row (no delete) and its record names the outcome:
+  // the class, and the redacted description once (the token-shaped errName
+  // is no safe identifier, so it is left out).
+  test('b.jg5 SRJ-110, SRJ-701: a failed orphan kill with a base AgentDirectorError whose errName is token-shaped and whose description holds a URL and a fake token → the row is kept (no delete) and the orphan-cleanup record names the outcome and the redacted description once; nothing leaks', async () => {
+    const readLog = captureStartupErrors()
+    const err = new AgentDirectorError('kill', tokenErrName(), adDescription())
+    let result: Awaited<ReturnType<typeof reconcileOrphans>> | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await reconcileOrphans(installOrphan('killError', err))
+    })
+
+    expect(result).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 0, live: 0, killFailed: 0 } })
+    const entry = onlyStartupEntry(readLog(), 'orphan-cleanup')
+    expect(entry).toContain(`: ${describeKillOutcome(killOutcomeOf({ thrown: err }))}; row kept, no delete was made`)
+    expect(entry).toContain(`message="${REDACTED_AD_DESCRIPTION}"`)
     expect(entry.split(REDACTED_URL_PLACEHOLDER)).toHaveLength(2)
     assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
   })
@@ -13975,12 +14317,12 @@ describe('b.jg5 SRJ-105: UNAVAILABLE is never destructive', () => {
     expect(conditionStartedLines(other.h, other.p)).toEqual([])
   })
 
-  test.each([...SRJ105_UNAVAILABLE, SRJ105_KILL_FAILED])('regression: the persona teardown\'s kill (killPersonaInstance, which the ladder\'s kill wraps) answering %s still rethrows it unchanged, quietly: no line, delete, notice, startup-errors entry or trigger', async (_what, make) => {
+  test.each([...SRJ105_UNAVAILABLE, SRJ105_KILL_FAILED])('regression: the persona teardown\'s kill (killPersonaInstance, which the ladder\'s kill wraps) answering %s answers its UNAVAILABLE outcome carrying it (b.jg5 SRJ-701: never rethrown), quietly: no line, delete, notice, startup-errors entry or trigger', async (_what, make) => {
     const { h, p } = srj105Build()
     const err = make('kill')
     h.script({ killError: err })
 
-    await expect(killPersonaInstance(p)).rejects.toBe(err)
+    expect(await killPersonaInstance(p, { context: KILL_CONTEXT_TEARDOWN })).toMatchObject({ kind: KILL_OUTCOME_NOT_KILLED, errorClass: AD_ERROR_CLASS_UNAVAILABLE, error: err })
 
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ kill: 1 }))
     expect(h.errors).toEqual([])
@@ -14511,12 +14853,12 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNCLASSIFIED outcome at the collision ladde
     expect(h.unclassifiedErrorOpen(p)).toBe(false)
   })
 
-  test('outside a launch or recovery attempt nothing is reported or armed: the persona teardown\'s kill (killPersonaInstance) answering an ErrInternal rethrows it unchanged, quietly, and begins no episode', async () => {
+  test('outside a launch or recovery attempt nothing is reported or armed: the persona teardown\'s kill (killPersonaInstance) answering an ErrInternal answers its UNCLASSIFIED outcome carrying it (b.jg5 SRJ-701: never rethrown), quietly, and begins no episode', async () => {
     const { h, p } = srj105Build()
     const err = errInternal()
     h.script({ killError: err })
 
-    await expect(killPersonaInstance(p)).rejects.toBe(err)
+    expect(await killPersonaInstance(p, { context: KILL_CONTEXT_TEARDOWN })).toEqual({ kind: KILL_OUTCOME_NOT_KILLED, errorClass: AD_ERROR_CLASS_UNCLASSIFIED, error: err })
 
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ kill: 1 }))
     expect(h.errors).toEqual([])
@@ -17434,6 +17776,192 @@ describe('b.jg5 SRJ-105, SRJ-512, SRJ-501, SRJ-502: an UNUSABLE NAME answer at a
   })
 })
 
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-110, SRJ-701 (HO C2 Verify; the E13, E16 and E19 hatch notes):
+// the collision ladder's replacement kills (each delete-then-spawn chain's
+// kill: `resume_enabled` false, a `cwd` or `config_dir` mismatch, and the
+// `ErrSpawnNotResumable` branch) are checked kills. Only a success
+// (`kill_sent` true, false or absent) or `ErrSpawnNotFound` lets the delete
+// and the fresh spawn follow. A CONFLICT latches P through the latch's
+// CONFLICT entry with "P's next check or recovery" and the state the ladder
+// last read, posts one notice and is never sent again (AC 9; on a `waiting`
+// row, "not this launch's session" is SRJ-613's kill backstop: nothing is
+// sent). GONE is the session-gone success (b.jg5 SRJ-104: for `kill`, gone
+// is success): the chain goes on. A value of a class SRJ-110 gives no row (a
+// STATE name other than `ErrSpawnNotFound`, LAUNCH FAILURE) stops the chain
+// as UNCLASSIFIED: refused, never counted, P's timer armed with the
+// UNCLASSIFIED cause and its unclassified-error episode fed (b.jg5 SRJ-105,
+// SRJ-313). An `ErrInvalidFlags` gets exactly one immediate version re-check
+// (b.jg5 SRJ-104, SRJ-204): a pass is that UNCLASSIFIED handling, a stop
+// answers `failed` marked `stopping` with nothing more called (b.jg5
+// SRJ-205). The UNAVAILABLE,
+// ENVIRONMENT, CONFIG and UNCLASSIFIED rows at these sites are the SRJ-105,
+// SRJ-311, SRJ-316 and SRJ-313 describes' (`KILL_SITES`, `ACTION_SITES`);
+// UNUSABLE NAME is E16's describe above (`UNUSABLE_KILL_SITES`).
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-110, SRJ-701: the collision ladder\'s replacement kills are checked kills: only a success lets the delete and the fresh spawn follow', () => {
+  afterEach(srj105AfterEach)
+
+  const conflictCross = UNUSABLE_KILL_SITES.flatMap((site) =>
+    LADDER_KILL_CONFLICT_CASE_ROWS.map((row) => [site.name, row.name, site, row] as const),
+  )
+
+  test.each(conflictCross)('%s answering CONFLICT (%s): P latched once with the case, "P\'s next check or recovery" and the state the ladder last read; one post after the holds; no delete or spawn after the kill; nothing counted, armed or posted as a spawn failure; never sent again (AC 9): no launch path reaches agent-director; B launches', async (_site, _row, site, row) => {
+    const { h, p, b } = srj105Build()
+    const persona = harnessPersona(h, p)
+    site.setup?.(h)
+    const script = site.script(h, persona, row.build(), row)
+    h.script(script)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+
+    expect(ladderCallsMade(h)).toEqual(site.calls)
+    expect(h.stub.calls.statusCalls).toHaveLength(site.reads.status)
+    expect(row.refusedOperation).toBe(REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY)
+    expectLatchedOnce(h, p, conflictLatch(p, row, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, site.lastRead!), site.noticesBefore)
+    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+
+    await expectLaunchedByNoPath(h, p, b, script)
+  })
+
+  test('b.jg5 SRJ-613 (E19 hatch note): the kill backstop: the kill of a row read waiting answering "not this launch\'s session" latches P with the row\'s recorded state (waiting) and nothing sent: no send-keys, delete or spawn after the collision', async () => {
+    const { h, p } = srj105Build()
+    const site = UNUSABLE_KILL_SITES.find((s) => s.lastRead === WAITING_READ && s.calls.sendKeys === 0)!
+    const row = LADDER_KILL_CONFLICT_CASE_ROWS.find((r) => r.killBackstop === true)!
+    expect(row.rowState).toEqual(WAITING_READ)
+    h.script(site.script(h, harnessPersona(h, p), row.build(), row))
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, kill: 1 }))
+    expect(h.latch.record(p)).toStrictEqual(conflictLatch(p, row, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, row.rowState).record)
+    expect(h.episodeNotices).toEqual([{ key: p, text: row.notice.text }])
+  })
+
+  test.each(UNUSABLE_KILL_SITES.flatMap((site) => [
+    ['a STATE name other than ErrSpawnNotFound (ErrSpawnNotResumable)', site.name, () => errSpawnNotResumable(), site] as const,
+    ['a STATE name other than ErrSpawnNotFound (ErrInstanceIdCollision)', site.name, () => errInstanceIdCollision(), site] as const,
+    ['a LAUNCH FAILURE name (ErrTmuxSessionCreate)', site.name, () => errTmuxSessionCreate('kill'), site] as const,
+  ]))('b.jg5 SRJ-110, SRJ-313: %s at %s (a class SRJ-110 gives no kill row, so UNCLASSIFIED): the chain stops, refused and not counted (no cap); P\'s timer armed with the UNCLASSIFIED cause; P\'s unclassified episode fed; no delete or spawn after the kill, no spawn-failure notice or spawn-failed entry, nothing latched', async (_what, _site, make, site) => {
+    const { h, p } = srj105Build()
+    site.setup?.(h)
+    h.script(site.script(h, harnessPersona(h, p), make(), { rowState: WAITING_READ }))
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
+
+    expect(ladderCallsMade(h)).toEqual(site.calls)
+    expect(getFailureCount(p)).toBe(0)
+    expect(h.capReached).toEqual([])
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
+    expect(h.unclassifiedErrorOpen(p)).toBe(true)
+    expect(h.notices).toEqual([])
+    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(h.latch.isLatched(p)).toBe(false)
+    expect(refusalLines(h, p)).toHaveLength(1)
+  })
+
+  // b.jg5 SRJ-104, SRJ-204, SRJ-205: an ErrInvalidFlags at a replacement
+  // kill gets exactly one immediate version re-check, at every kill site.
+  describe('an ErrInvalidFlags at a replacement kill', () => {
+    let resolveCalls: Array<object | undefined>
+    let stops: number[]
+
+    /** Install the real re-check, its `resolveSystemBinary` answering `outcome`. */
+    function installRecheck(outcome: StubResolveSystemBinaryOutcome): void {
+      resetAdVersionRecheckForTests()
+      installAdVersionRecheck({
+        resolveSystemBinary: makeStubResolveSystemBinary({ calls: resolveCalls, outcomes: [outcome] }),
+        baselineVersion: PHASE1_RC_VERSION,
+        recordStartupError: () => {},
+        stop: (exitCode) => { stops.push(exitCode) },
+        log: () => {},
+        clock: createFakeClock(),
+      })
+    }
+
+    beforeEach(() => {
+      resolveCalls = []
+      stops = []
+    })
+
+    afterEach(() => {
+      resetAdVersionRecheckForTests()
+    })
+
+    test.each(UNUSABLE_KILL_SITES.map((site) => [site.name, site] as const))('b.jg5 SRJ-104, SRJ-204: at %s, the re-check passes → exactly one re-check, no stop; then UNCLASSIFIED: refused and not counted, P\'s timer armed with the UNCLASSIFIED cause, its episode fed; no delete or spawn after the kill', async (_site, site) => {
+      installRecheck({ version: PHASE1_RC_VERSION })
+      const { h, p } = srj105Build()
+      site.setup?.(h)
+      h.script(site.script(h, harnessPersona(h, p), errInvalidFlags('kill'), { rowState: WAITING_READ }))
+
+      expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', refused: true })
+
+      expect(resolveCalls).toHaveLength(1)
+      expect(stops).toEqual([])
+      expect(ladderCallsMade(h)).toEqual(site.calls)
+      expect(getFailureCount(p)).toBe(0)
+      expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
+      expect(h.unclassifiedErrorOpen(p)).toBe(true)
+      expect(h.latch.isLatched(p)).toBe(false)
+      expect(refusalLines(h, p).filter((l) => l.includes(`recheck=${RECHECK_OUTCOME_PASS}`))).toHaveLength(1)
+    })
+
+    test.each(UNUSABLE_KILL_SITES.map((site) => [site.name, site] as const))('b.jg5 SRJ-104, SRJ-205: at %s, the re-check decides that the server stops → exactly one re-check and one stop; failed, marked stopping; nothing after the kill, nothing armed, counted, latched or posted, the episode not fed', async (_site, site) => {
+      installRecheck({ version: OLD_AD_VERSION })
+      const { h, p } = srj105Build()
+      site.setup?.(h)
+      h.script(site.script(h, harnessPersona(h, p), errInvalidFlags('kill'), { rowState: WAITING_READ }))
+
+      expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', stopping: true })
+
+      expect(resolveCalls).toHaveLength(1)
+      expect(stops).toHaveLength(1)
+      expect(ladderCallsMade(h)).toEqual(site.calls)
+      expect(getFailureCount(p)).toBe(0)
+      expect(h.triggers).toEqual([])
+      expect(h.unclassifiedErrorOpen(p)).toBe(false)
+      expect(h.latch.isLatched(p)).toBe(false)
+      expect(h.notices).toEqual([])
+      expect(refusalLines(h, p)).toEqual([])
+      expect(h.errors.filter((l) => l.startsWith(`[slack] spawnForPersona: kill for ${renderPersonaRef(p, p)} did not succeed: `) && l.includes(`recheck=${RECHECK_OUTCOME_STOP}`))).toHaveLength(1)
+    })
+  })
+
+  // b.jg5 SRJ-701, SRJ-703: a success with any `kill_sent`, and
+  // `ErrSpawnNotFound`, let the chain go on: the delete, then the fresh
+  // spawn, with one line naming the outcome; `kill_sent: false` raises
+  // nothing by itself.
+  test.each(UNUSABLE_KILL_SITES.flatMap((site) =>
+    ([
+      ['succeeds with kill_sent true', { killResult: cannedKillResult(true) }, { kind: KILL_OUTCOME_KILLED, killSent: true }],
+      ['succeeds with kill_sent false', { killResult: cannedKillResult(false) }, { kind: KILL_OUTCOME_KILLED, killSent: false }],
+      ['succeeds with no kill_sent', { killResult: cannedKillResult() }, { kind: KILL_OUTCOME_KILLED }],
+      ['answers ErrSpawnNotFound', { killError: errSpawnNotFound() }, { kind: KILL_OUTCOME_ROW_GONE }],
+      // b.jg5 SRJ-104, SRJ-110: for `kill`, gone is success.
+      ['answers GONE (ErrTmuxCaptureFailed), the session-gone success', { killError: errTmuxCaptureFailed(undefined, 'kill') }, { kind: KILL_OUTCOME_SESSION_GONE, name: errTmuxCaptureFailed().errName }],
+      ['answers GONE (ErrTmuxSendKeys), the session-gone success', { killError: errTmuxSendKeys() }, { kind: KILL_OUTCOME_SESSION_GONE, name: errTmuxSendKeys().errName }],
+    ] as const).map(([what, kill, outcome]) => [site.name, what, site, kill, outcome] as const),
+  ))('b.jg5 SRJ-701, SRJ-104: %s: the kill %s → the delete and the fresh spawn follow, with one line naming the outcome; nothing latched, armed or posted', async (_site, _what, site, kill, outcome) => {
+    const { h, p } = srj105Build()
+    site.setup?.(h)
+    const script = site.script(h, harnessPersona(h, p), errSpawnNotFound(), { rowState: WAITING_READ })
+    h.script({ ...script, killError: undefined, killResult: undefined, ...kill })
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
+
+    expect(h.stub.calls.killCalls).toHaveLength(1)
+    expect(h.stub.calls.deleteCalls).toEqual([{ claude_instance_id: [personaInstanceId(p)] }])
+    expect(h.stub.calls.spawnCalls).toHaveLength(2)
+    expect(h.errors).toContain(
+      `[slack] spawnForPersona: kill for ${renderPersonaRef(p, p)}: ${describeKillOutcome(outcome as KillOutcome)} — the delete and the fresh spawn follow (b.jg5 SRJ-701)`,
+    )
+    expect(h.latch.isLatched(p)).toBe(false)
+    expect(h.notices).toEqual([])
+    expect(h.triggers).toEqual([])
+  })
+})
+
 /** How the working-row wait's evidence read is reached: directly, or through the launch's collision ladder. */
 const PANE_WAIT_CROSS = WAIT_ENTRIES.flatMap(([entry, before]) => unusableNameRowsAt('read-pane').map((row) => [entry, row.fault, before, row] as const))
 
@@ -18980,17 +19508,26 @@ describe('b.jg5 SRJ-313, SRJ-1002, SRJ-512: the controls — a phrase-less ErrIn
     expect(unusableNameLinesOf(h, p)).toEqual([])
   })
 
-  test.each<[string, UnusableNameSite, (key: string) => Promise<boolean>, keyof RecoveryStubScript]>([
-    ['killPersonaInstance', 'ladder kill', (key) => killPersonaInstance(key), 'killError'],
-    ['deletePersonaInstance', 'ladder delete', (key) => deletePersonaInstance(key), 'deleteError'],
-  ])('the persona teardown\'s %s answering UNUSABLE NAME still rethrows the same value and latches nothing: no set, no post, no UNUSABLE NAME line', async (_name, kind, call, knob) => {
+  test('b.jg5 SRJ-701: the persona teardown\'s killPersonaInstance answering UNUSABLE NAME answers its UNUSABLE NAME outcome carrying the same value (never rethrown) and latches nothing: no set, no post, no UNUSABLE NAME line', async () => {
     const { h, p } = srj105Build()
-    const err = unusableNameRowsAt(kind)[0]!.build()
-    h.script({ [knob]: err })
+    const err = unusableNameRowsAt('ladder kill')[0]!.build()
+    h.script({ killError: err })
+
+    expect(await killPersonaInstance(p, { context: KILL_CONTEXT_TEARDOWN })).toEqual({ kind: KILL_OUTCOME_NOT_KILLED, errorClass: AD_ERROR_CLASS_UNUSABLE_NAME, error: err })
+
+    expectNoNoteLatch(h)
+    expect(unusableNameLinesOf(h, p)).toEqual([])
+    expect(h.notices).toEqual([])
+  })
+
+  test('the persona teardown\'s deletePersonaInstance answering UNUSABLE NAME still rethrows the same value and latches nothing: no set, no post, no UNUSABLE NAME line', async () => {
+    const { h, p } = srj105Build()
+    const err = unusableNameRowsAt('ladder delete')[0]!.build()
+    h.script({ deleteError: err })
 
     let thrown: unknown
     try {
-      await call(p)
+      await deletePersonaInstance(p)
     } catch (e) {
       thrown = e
     }

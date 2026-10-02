@@ -527,6 +527,7 @@ import {
   _setSpawnHomeDir,
   checkLaunchConfigDir,
   deletePersonaInstance,
+  KILL_CONTEXT_TEARDOWN,
   killPersonaInstance,
   launchSession,
   personaConfigDirLabelValue,
@@ -2319,9 +2320,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         },
         forgetPersonaPrompts: rec('forgetPersonaPrompts', () => 0),
         dropSession: rec('dropSession', async () => undefined),
+        // As main() binds it: the persona teardown's kill context (b.jg5 SRJ-110).
         killInstance: (key) => {
           calls.push(['killInstance', key])
-          return killPersonaInstance(key)
+          return killPersonaInstance(key, { context: KILL_CONTEXT_TEARDOWN })
         },
         deleteInstance: (key) => {
           calls.push(['deleteInstance', key])

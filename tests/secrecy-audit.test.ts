@@ -136,6 +136,7 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/persona-episodes\.ts$/, "the persona episodes and the tmux-unresponsive condition, whose start line carries agent-director failure text (the refusing verb's error, described)"],
   [/^src\/outage-state\.ts$/, "the outage flags and their notices, whose ad-config-malformed onset carries agent-director's description (its error's message) to Slack"],
   [/^src\/conflict-latch\.ts$/, "the conflict latch, whose latch and relatch lines and stored record carry text from agent-director's CONFLICT description (the quoted session and the description, redacted)"],
+  [/^src\/checked-kill\.ts$/, "the checked kill, whose outcome keeps the thrown agent-director error and an ErrTmuxKillFailed description raw, and whose one-line rendering carries agent-director failure text (described, redacted) to log lines and startup errors"],
   [/^src\/pane-read\.ts$/, "the read-pane outcome, whose failure outcomes carry the described agent-director failure text (redacted) to the callers' log lines"],
   [/^src\/persona-routing\.ts$/, "the persona routing, which receives a persona's Slack events, archives through its client and logs Slack failure text and its lost-message row read's agent-director failure text (described, redacted)"],
 ]
@@ -417,6 +418,21 @@ describe('every suite that touches config, credentials or reload calls assertNoL
       (file) => SUITES.includes(file) && touchReasons(file).some((r) => r.includes('src/conflict-latch.ts')),
     )
     expect(exemptForLatch).toEqual([])
+  })
+
+  // b.jg5 SRJ-110, SRJ-701: a kill outcome keeps the thrown agent-director error and its description raw, and its
+  // rendering carries the described failure text to log lines and startup errors.
+  test('src/checked-kill.ts is a source surface: its functions touch, its constants alone do not, and its suite leak-checks with no exemption', () => {
+    const suite = 'tests/checked-kill.test.ts'
+    expect(SOURCE_SURFACES.some(([re]) => re.test('src/checked-kill.ts'))).toBe(true)
+    expect(touchReasonsOf(suite, "import { checkedKill } from '../src/checked-kill.ts'").length).toBe(1)
+    expect(touchReasonsOf(suite, "import { describeKillOutcome as describe } from '../src/checked-kill.ts'").length).toBe(1)
+    expect(touchReasonsOf(suite, "import { KILL_OUTCOME_KILLED, KILL_OUTCOME_NOT_KILLED } from '../src/checked-kill.ts'")).toEqual([])
+    expect(touchReasonsOf(suite, "import type { KillOutcome } from '../src/checked-kill.ts'")).toEqual([])
+    expect(touchReasons(suite).some((r) => r.includes('src/checked-kill.ts'))).toBe(true)
+    expect([callsAssertNoLeak(suite), suite in EXEMPT]).toEqual([true, false])
+    const exemptForKill = Object.keys(EXEMPT).filter((file) => SUITES.includes(file) && touchReasons(file).some((r) => r.includes('src/checked-kill.ts')))
+    expect(exemptForKill).toEqual([])
   })
 
   // b.jg5 SRJ-117: a read-pane failure outcome carries the described agent-director failure to its callers' log lines.

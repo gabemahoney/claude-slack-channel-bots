@@ -28,11 +28,14 @@
  *                                            a real ad-config-malformed clear logs one line
  *   - resetAllToHealthy(keys)              — silent wipe (boot-time reset; one key at a teardown);
  *                                            tells the observer nothing
- *   - withOutageDetection(key, dir, call, fn) — AD verb wrapper; raises/clears flags on error/success;
+ *   - withOutageDetection(key, dir, call, fn, options?) — AD verb wrapper; raises/clears flags on error/success;
  *                                            `call` is the verb `fn` calls, declared by the site;
  *                                            clears tmux-unavailable only on a tmux-touching
  *                                            success or GONE, and ad-config-malformed only on a
- *                                            success (b.jg5 SRJ-312)
+ *                                            success (b.jg5 SRJ-312); with `armsNothing` (a
+ *                                            persona teardown's kill) it reports nothing and
+ *                                            raises an ENVIRONMENT or CONFIG outage only for a
+ *                                            configured persona (b.jg5 SRJ-110; hatch A3)
  *   - withSpawnDetection(key, dir, call, fn)  — like withOutageDetection + clears cwd-unreachable on success
  *   - reportAgentDirectorError(key, err, call) — report an error to the retry timer's trigger sink
  *                                            (inside a launch or recovery attempt, and for
@@ -205,6 +208,32 @@ export interface ReportAgentDirectorErrorOptions {
    * reading (b.jg5 SRJ-105, SRJ-314). Its arming is unchanged. Default true.
    */
   reportUnclassified?: boolean
+}
+
+/** Options of {@link withOutageDetection}. */
+export interface OutageDetectionOptions {
+  /**
+   * Present for a call made outside every launch or recovery attempt that
+   * must arm nothing: a persona teardown's kill (b.jg5 SRJ-110, SRJ-301;
+   * hatch A3). Its error is then not reported (`reportAgentDirectorError` is
+   * not called: no retry timer is armed, no `tmux-unresponsive` condition is
+   * started, nothing reaches the unclassified sink), and an ENVIRONMENT or
+   * CONFIG answer raises its outage (`tmux-unavailable`,
+   * `ad-config-malformed`) only when `personaConfigured()` answers true: the
+   * persona is in the applied configuration. A `personaConfigured` that
+   * throws counts as false. Everything else (the `ad-unreachable` raise, the
+   * clears on a success or on GONE) is unchanged.
+   */
+  readonly armsNothing?: { readonly personaConfigured: () => boolean }
+}
+
+/** `options.armsNothing.personaConfigured()`, a throw counting as false. Never throws. */
+function armsNothingPersonaConfigured(armsNothing: NonNullable<OutageDetectionOptions['armsNothing']>): boolean {
+  try {
+    return armsNothing.personaConfigured() === true
+  } catch {
+    return false
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -590,6 +619,11 @@ export function resetAllToHealthy(keys: string[]): void {
  *     with no reading.
  * Returns result.
  *
+ * With `options.armsNothing` (a persona teardown's kill, b.jg5 SRJ-110,
+ * SRJ-301; hatch A3) the error is not reported, so nothing is armed, started
+ * or reported, and an ENVIRONMENT or CONFIG answer raises its outage only for
+ * a persona in the applied configuration (`OutageDetectionOptions`).
+ *
  * The original error is always rethrown so callers can handle it normally.
  */
 export async function withOutageDetection<T>(
@@ -597,6 +631,7 @@ export async function withOutageDetection<T>(
   workingDirectory: string | undefined,
   call: AdCall,
   fn: (client: Client) => Promise<T>,
+  options?: OutageDetectionOptions,
 ): Promise<T> {
   if (!deps) {
     throw new Error(
@@ -616,12 +651,16 @@ export async function withOutageDetection<T>(
     return result
   } catch (err) {
     const { errorClass } = classifyAdError(err)
+    const armsNothing = options?.armsNothing
+    // b.jg5 SRJ-110 (hatch A3): a call that arms nothing raises an
+    // ENVIRONMENT or CONFIG outage only for a configured persona.
+    const raisesOutage = armsNothing === undefined || armsNothingPersonaConfigured(armsNothing)
     if (err instanceof ErrSystemInstallDisappeared) {
       setOutageFlag(key, 'ad-unreachable', err.binaryPath)
     } else if (errorClass === AD_ERROR_CLASS_ENVIRONMENT) {
-      raiseTmuxUnavailable(key, err)
+      if (raisesOutage) raiseTmuxUnavailable(key, err)
     } else if (errorClass === AD_ERROR_CLASS_CONFIG) {
-      raiseAdConfigMalformed(key, err)
+      if (raisesOutage) raiseAdConfigMalformed(key, err)
     } else if (err instanceof ErrCwdNotFound || err instanceof ErrCwdNotADirectory) {
       if (workingDirectory !== undefined) {
         setOutageFlag(key, 'cwd-unreachable', workingDirectory)
@@ -631,7 +670,7 @@ export async function withOutageDetection<T>(
         )
       }
     }
-    reportAgentDirectorError(key, err, call)
+    if (armsNothing === undefined) reportAgentDirectorError(key, err, call)
     if (isTmuxTouchingCall(call) && errorClass === AD_ERROR_CLASS_GONE) {
       // b.jg5 SRJ-312: GONE from a tmux-touching call is tmux answering.
       clearOutageFlag(key, 'tmux-unavailable')
@@ -692,9 +731,12 @@ export function reportAgentDirectorError(
  * reportUnclassifiedAtSite — the site entry for an UNCLASSIFIED outcome a
  * site classifies itself (b.jg5 SRJ-104, SRJ-313): an `ErrInvalidFlags` at
  * the resume path, at the shared pane reader (`readPersonaOwnPane` in
- * `src/session-manager.ts`, `call` `read-pane`) or at the reconnect's one
- * `send-keys` (`reconnectMcpWithCause`, `call` `send-keys`), once its
- * immediate re-check answered UNCLASSIFIED without stopping the server.
+ * `src/session-manager.ts`, `call` `read-pane`), at the reconnect's one
+ * `send-keys` (`reconnectMcpWithCause`, `call` `send-keys`) or at a kill
+ * made in an attempt (`killPersonaInstance`, `call` `kill`), once its
+ * immediate re-check answered UNCLASSIFIED without stopping the server; and
+ * at such a kill, any other class the kill has no row for (b.jg5 SRJ-110: a
+ * STATE name other than `ErrSpawnNotFound`, LAUNCH FAILURE, DIRECTORY).
  * `classification` is the step's answer. Inside a launch or recovery attempt
  * for `key` it arms the persona's retry timer with the UNCLASSIFIED cause
  * through the installed trigger sink (the

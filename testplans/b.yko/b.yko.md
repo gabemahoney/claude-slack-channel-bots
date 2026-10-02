@@ -988,7 +988,7 @@ Steps:
 
 Expected:
 
-- `server.log` shows `[slack] Session disconnected` for persona `"persona_a" (key=persona_a)`, then `[slack] Scheduling restart for persona=persona_a in <n>s (backoff)`, `[slack] Relaunching session for persona=persona_a cwd="<working directory>"` and a new `[slack] Session connected: persona "persona_a" (key=persona_a)` line.
+- `server.log` shows `[slack] Session disconnected` for persona `"persona_a" (key=persona_a)`, then `[slack] Scheduling restart for persona=persona_a in <n>s (backoff)`, `[slack] Relaunching session for persona=persona_a cwd="<working directory>" — kill: <outcome>` and a new `[slack] Session connected: persona "persona_a" (key=persona_a)` line.
 - The list again shows exactly three rows, one per persona, as in Check 6.
 - A replies "back" in A-home under its own name and avatar.
 

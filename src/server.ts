@@ -100,7 +100,10 @@ import {
   holdLaunchIfConfigDirUnresolvable,
   isDialogApproverRunning,
   isLaunchInFlight,
+  KILL_CONTEXT_ATTEMPT,
+  KILL_CONTEXT_TEARDOWN,
   killPersonaInstance,
+  latchOnRestartKillOutcome,
   launchSession,
   noteWorkingRowDeferral,
   notifyDisconnectedWithAutoRestartDisabled,
@@ -185,29 +188,29 @@ import {
 } from './persona-bringup-controller.ts'
 import { createPersonaSerializer } from './persona-serializer.ts'
 import { createPersonaLifecycle, type PersonaLifecycle } from './persona-lifecycle.ts'
+import { describeKillOutcome, killOutcomeStopsServer } from './checked-kill.ts'
 import { cleanSession, getCozempicAvailable } from './cozempic.ts'
-import { ErrSpawnNotFound, resolveSystemBinary } from 'agent-director'
+import { resolveSystemBinary } from 'agent-director'
 import {
   ERR_SPAWN_NOT_FOUND_NAME,
   ERR_SYSTEM_INSTALL_DISAPPEARED_NAME,
 } from './agent-director-errors.ts'
 import {
-  AD_CALL_KILL_ROW_NOT_READ_LIVE,
   AD_ERROR_CLASS_CONFIG,
   AD_ERROR_CLASS_ENVIRONMENT,
-  AD_VERB_KILL,
   classifyAdError,
-  describeAgentDirectorFailure,
   hasAdErrorName,
 } from './ad-error-class.ts'
 import {
   LIVENESS_LIVE,
   LIVENESS_READING_DEAD,
+  LIVENESS_READING_DEAD_NO_ROW,
   LIVENESS_READING_DEAD_INSTALL_GONE,
   LIVENESS_READING_UNKNOWN,
   LIVENESS_UNKNOWN,
   livenessReadingForStatus,
   pendingLaunchStartOf,
+  type DeadLivenessReading,
   type LivenessReading,
 } from './liveness-reading.ts'
 import { getClient, closeClient } from './agent-director-client.ts'
@@ -228,7 +231,7 @@ import {
   cancelRestartTimer,
   isRestartPendingOrActive,
   runRestartRetry,
-  KILL_SESSION_REFUSED,
+  KILL_SESSION_NOT_KILLED_GUARD,
   RECONNECT_ESCALATE_DEAD_NO_KILL,
   RESTART_FAILURE_CAP,
   type KillSessionResult,
@@ -236,7 +239,6 @@ import {
 import {
   createFullModeRetryAction,
   createUnavailableRetryController,
-  unavailableRetryCauseFor,
   UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE,
@@ -1339,8 +1341,8 @@ export async function _runCallTimeoutStartStep(
  * It answers one of four readings (b.jg5 SRJ-314, `src/liveness-reading.ts`):
  * a `status` result maps through `livenessReadingForStatus` (`pending` →
  * `pending`, carrying the row's raw launch start when the result shows one,
- * b.jg5 SRJ-115; another live state → `live`, `ended` or `missing` → `dead`,
- * any other state → `unknown`, logged), and clears `ad-unreachable` and
+ * b.jg5 SRJ-115; another live state → `live`, `ended` or `missing` → `dead`
+ * carrying the state it read, any other state → `unknown`, logged), and clears `ad-unreachable` and
  * `ad-config-malformed` (b.jg5 SRJ-312: agent-director loaded its config and
  * read the store). It
  * never clears `tmux-unavailable` (b.jg5 SRJ-312): a `status` is not
@@ -1349,7 +1351,8 @@ export async function _runCallTimeoutStartStep(
  * check that finds the row live and connected with its stream (the health
  * tick's healthy branch, a retry's healthy row), clears it. A `status` error
  * is decided by name through `src/ad-error-class.ts`:
- *   - `ErrSpawnNotFound` → `dead`; clears `ad-unreachable` and
+ *   - `ErrSpawnNotFound` → `dead`, carrying no row as what it read
+ *     (`LIVENESS_READING_DEAD_NO_ROW`); clears `ad-unreachable` and
  *     `ad-config-malformed`, as a state answer does;
  *   - `ErrSystemInstallDisappeared` → `dead`, marked as read from no row
  *     (`LIVENESS_READING_DEAD_INSTALL_GONE`: the slow-recovery count resets
@@ -1474,7 +1477,7 @@ function statusErrorReading(key: string, err: unknown): LivenessReading {
     // It loaded its config and read the store, so `ad-config-malformed` clears.
     clearOutageFlag(key, 'ad-unreachable')
     clearOutageFlag(key, 'ad-config-malformed')
-    return LIVENESS_READING_DEAD
+    return LIVENESS_READING_DEAD_NO_ROW
   }
   if (hasAdErrorName(err, ERR_SYSTEM_INSTALL_DISAPPEARED_NAME)) {
     setOutageFlag(key, 'ad-unreachable', binaryPathOf(err))
@@ -1555,6 +1558,9 @@ export function _buildStatRouteImpl(deps?: {
 // _buildKillSessionAdapter
 // ---------------------------------------------------------------------------
 
+/** The restart kill adapter's line prefix, its latch-time `status` read's included. */
+const KILL_SESSION_ADAPTER_SITE = 'killSession (restart adapter)'
+
 /**
  * _buildKillSessionAdapter — test-only factory for the restart module's
  * killSession dependency. Production code wires this via main()'s initRestart
@@ -1575,22 +1581,42 @@ export function _buildStatRouteImpl(deps?: {
  * would (`holdLaunchIfConfigDirUnresolvable`); the launch that follows is then
  * refused by the relaunch gate (`'skipped'`), counting no failure.
  *
- * b.jg5 SRJ-105, SRJ-110, SRJ-311, SRJ-313, SRJ-316: a kill that meets an
- * UNAVAILABLE outcome (by name, `ErrTmuxKillFailed` included), an
- * ENVIRONMENT answer (`ErrTmuxNotAvailable`, which also raises
- * `tmux-unavailable` and arms the persona's retry timer through the outage
- * wrapper), a CONFIG answer (`ErrConfigMalformed`, which the wrapper turns
- * into the `ad-config-malformed` outage and an armed retry timer) or an
- * UNCLASSIFIED answer (an `ErrInternal` other than an unusable recorded name,
- * a store-open name, `ErrSystemInstallDisappeared`, whose wrapper also raises
- * `ad-unreachable`, or any name CSCB gives no handling; the wrapper arms the
- * persona's retry timer and reports it to its unclassified-error episode)
- * answers `KILL_SESSION_REFUSED`, decided by the arming predicate
- * (`unavailableRetryCauseFor`, by name through `src/ad-error-class.ts`), and
- * the restart work launches nothing and counts nothing: the refused outcome
- * (SRJ-110: "No step follows"). The kill is not repeated.
- * `ErrSpawnNotFound` resolves with nothing, as before, and every other kill
- * error is ignored as before; the launch follows.
+ * b.jg5 SRJ-110, SRJ-701: both guards make no call and answer
+ * `KILL_SESSION_NOT_KILLED_GUARD`, after which the restart work goes on as it
+ * always has (the launch joins the launch in flight, or the relaunch gate
+ * refuses it). Otherwise the adapter makes one checked kill
+ * (`killPersonaInstance` with `KILL_CONTEXT_ATTEMPT`, inside the restart
+ * work's recovery attempt; not of a row read live, so not tmux-touching,
+ * since the restart path kills only after a `dead` reading), logs its
+ * outcome with `kill_sent` (`describeKillOutcome`) and answers it. Every
+ * class is decided by name through `src/ad-error-class.ts`. The restart work
+ * launches only after a success (any `kill_sent`, `ErrSpawnNotFound`, or
+ * GONE). By class:
+ *   - CONFLICT: the persona latches through the latch's CONFLICT entry with
+ *     the refused operation "P's next check or recovery"
+ *     (`latchOnRestartKillOutcome`; b.jg5 SRJ-501, SRJ-505; a "not this
+ *     launch's session" answer on a live row is SRJ-613's kill backstop), and
+ *     the work answers `latched`;
+ *   - UNUSABLE NAME: the persona latches through the unusable-name entry
+ *     (b.jg5 SRJ-512), and the work answers `latched`;
+ *   - either latch records `lastRead`'s row state, the state the restart run
+ *     last read (`ended`, `missing` or no row), with no further `status`
+ *     read; only a reading that carries none (`ErrSystemInstallDisappeared`)
+ *     leads to one latch-time `status` read, its lines prefixed
+ *     `killSession (restart adapter)` (b.jg5 SRJ-501);
+ *   - `ErrInvalidFlags`: one immediate version re-check (b.jg5 SRJ-104,
+ *     SRJ-204); when it decides that the server stops, the outcome is
+ *     answered with nothing more done and the work answers `shutting-down`
+ *     (b.jg5 SRJ-205); otherwise it is UNCLASSIFIED, as below;
+ *   - UNAVAILABLE (`ErrTmuxKillFailed` included), ENVIRONMENT (the wrapper
+ *     raises `tmux-unavailable`), CONFIG (the wrapper raises
+ *     `ad-config-malformed`) and UNCLASSIFIED (`ErrSystemInstallDisappeared`
+ *     included, whose wrapper raises `ad-unreachable`; and a class the kill
+ *     has no row for, which `killPersonaInstance` reports as UNCLASSIFIED):
+ *     the persona's retry timer is armed, an UNCLASSIFIED outcome feeds its
+ *     unclassified-error episode, and the work answers `refused`.
+ * No non-success launches anything or counts anything, and the kill is never
+ * repeated.
  *
  * @param getPersona  The applied persona with a key (production:
  *   `getAppliedPersona`); without it the directory is not checked here.
@@ -1598,9 +1624,9 @@ export function _buildStatRouteImpl(deps?: {
  */
 export function _buildKillSessionAdapter(
   getPersona?: (key: string) => Persona | undefined,
-): (key: string) => Promise<KillSessionResult> {
-  // `key` is the persona key.
-  return async (key: string) => {
+): (key: string, lastRead: DeadLivenessReading) => Promise<KillSessionResult> {
+  // `key` is the persona key; `lastRead` the restart run's `dead` reading.
+  return async (key: string, lastRead: DeadLivenessReading) => {
     // The launch call only, not a running dialog approver (b.jg5 SRJ-401):
     // this kill can run while an approver still runs for the persona (an
     // approver reads the row again only at its next lap, or once its call in
@@ -1609,36 +1635,24 @@ export function _buildKillSessionAdapter(
     // reconnect verdicts (`promptRowReconnectVerdict`, `workingReconnectVerdict`).
     if (isLaunchInFlight(key)) {
       console.error(`[slack] killSession (restart adapter): launch already in flight for persona=${key} — not killing`)
-      return
+      return KILL_SESSION_NOT_KILLED_GUARD
     }
     const persona = getPersona?.(key)
     if (persona !== undefined && holdLaunchIfConfigDirUnresolvable(persona)) {
       console.error(
         `[slack] killSession (restart adapter): persona=${key} claude_config_dir cannot be resolved to a real path — not killing; its row is kept`,
       )
-      return
+      return KILL_SESSION_NOT_KILLED_GUARD
     }
-    try {
-      // The restart path kills only after a `dead` reading (b.jg5 E9), so
-      // this kill is not of a row read live: not tmux-touching.
-      await withOutageDetection(key, undefined, AD_CALL_KILL_ROW_NOT_READ_LIVE, (client) =>
-        client.kill({ claude_instance_id: personaInstanceId(key) })
-      )
-    } catch (err) {
-      if (err instanceof ErrSpawnNotFound) return
-      // b.jg5 SRJ-105, SRJ-311, SRJ-313, SRJ-316: an UNAVAILABLE kill
-      // (`ErrTmuxKillFailed` included), an ENVIRONMENT kill
-      // (`ErrTmuxNotAvailable`), a CONFIG kill (`ErrConfigMalformed`) or an
-      // UNCLASSIFIED kill (`ErrSystemInstallDisappeared` included),
-      // classified by name, is a refusal: the restart work launches nothing.
-      if (unavailableRetryCauseFor(err, AD_VERB_KILL) !== undefined) {
-        console.error(
-          `[slack] killSession (restart adapter): kill refused for persona=${key}: ${describeAgentDirectorFailure(err)} — no relaunch follows (b.jg5 SRJ-105)`,
-        )
-        return KILL_SESSION_REFUSED
-      }
-      console.error(`[slack] killSession (restart adapter): error for persona=${key}: ${describeThrownValue(err)}`)
-    }
+    // The restart path kills only after a `dead` reading (b.jg5 E9), so this
+    // kill is not of a row read live: not tmux-touching. It runs inside the
+    // restart work's recovery attempt.
+    const outcome = await killPersonaInstance(key, { context: KILL_CONTEXT_ATTEMPT })
+    console.error(`[slack] killSession (restart adapter): kill for persona=${key}: ${describeKillOutcome(outcome)}`)
+    // b.jg5 SRJ-205: a stop the re-check decided is answered as it is, and
+    // nothing more is done here.
+    if (!killOutcomeStopsServer(outcome)) await latchOnRestartKillOutcome(key, outcome, KILL_SESSION_ADAPTER_SITE, lastRead)
+    return outcome
   }
 }
 
@@ -3108,7 +3122,7 @@ export async function main(): Promise<void> {
     forgetPersonaPrompts,
     forgetAcks: forgetPersonaAcks,
     dropSession: dropPersonaSessionAndKeepAlive,
-    killInstance: killPersonaInstance,
+    killInstance: (key) => killPersonaInstance(key, { context: KILL_CONTEXT_TEARDOWN }),
     deleteInstance: deletePersonaInstance,
     replyGuard: {
       launchedWithDir: getLaunchedWithDir,

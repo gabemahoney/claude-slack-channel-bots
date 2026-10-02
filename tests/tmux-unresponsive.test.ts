@@ -142,7 +142,8 @@ import {
 import { personaInstanceId } from '../src/persona-identity.ts'
 import { RESTART_FAILURE_CAP } from '../src/restart.ts'
 import { _buildIsSessionAliveAdapter } from '../src/server.ts'
-import { killPersonaInstance, reconcileOrphans, TRUST_DIALOG_NEEDLE, type ApproverVerb } from '../src/session-manager.ts'
+import { KILL_CONTEXT_TEARDOWN, killPersonaInstance, reconcileOrphans, TRUST_DIALOG_NEEDLE, type ApproverVerb } from '../src/session-manager.ts'
+import { KILL_OUTCOME_NOT_KILLED } from '../src/checked-kill.ts'
 import {
   runInAttempt,
   UNAVAILABLE_RETRY_BASE_S,
@@ -536,26 +537,30 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
     expectNoPostYet(h)
   })
 
-  test.each<[string, (h: RecoveryHarness, key: string) => Promise<void>, boolean]>([
-    ['a persona teardown’s kill, even inside a recovery attempt', async (h, key) => {
+  test.each<[string, (h: RecoveryHarness, key: string) => Promise<void>]>([
+    // b.jg5 SRJ-110 (hatch A3): the teardown's kill answers its outcome and
+    // arms nothing, even run inside a recovery attempt.
+    ['a persona teardown’s kill, even inside a recovery attempt (b.jg5 SRJ-110: it answers its outcome and arms nothing)', async (h, key) => {
       const err = errTmuxUnresponsive('kill')
       h.script({ killError: err })
-      await runInAttempt(key, 'recovery', () => expect(killPersonaInstance(key)).rejects.toBe(err))
-    }, true],
+      await runInAttempt(key, 'recovery', async () => {
+        expect(await killPersonaInstance(key, { context: KILL_CONTEXT_TEARDOWN })).toMatchObject({ kind: KILL_OUTCOME_NOT_KILLED, error: err })
+      })
+    }],
     ['a start-sweep kill of the persona’s row in another directory', async (h, key) => {
       h.script({
         listResult: { spawns: [cannedListRow({ cwd: h.home, state: 'waiting' }, personaOf(h, key), h.home)] },
         killError: errTmuxUnresponsive('kill'),
       })
       await reconcileOrphans(h.config)
-    }, false],
-  ])('%s answering ErrTmuxUnresponsive starts nothing', async (_what, run, insideAttempt) => {
+    }],
+  ])('%s answering ErrTmuxUnresponsive starts nothing and arms nothing', async (_what, run) => {
     const { h, p, b } = build()
 
     await run(h, p)
 
     expect(h.stub.calls.killCalls).toHaveLength(1)
-    expect(h.triggers).toEqual(insideAttempt ? [{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }] : [])
+    expect(h.triggers).toEqual([])
     expectNeverStarted(h, p)
     expectNeverStarted(h, b)
     expectNoPostYet(h)

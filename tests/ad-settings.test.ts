@@ -33,7 +33,7 @@
  */
 
 import { afterEach, describe, expect, spyOn, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -115,7 +115,13 @@ import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director
 import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { osTempDir } from './test-helpers/host-safe-env.ts'
-import { importSource, stripComments } from './test-helpers/source-audit.ts'
+import {
+  importSource,
+  importedSpecifiers,
+  runtimeLoads,
+  srcModules,
+  type RuntimeLoads,
+} from './test-helpers/source-audit.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -788,75 +794,7 @@ describe('ad settings: no file text reaches a line or an outcome', () => {
 // Source audits (SRJ-209: one parser, one settings module, no outage path)
 // ---------------------------------------------------------------------------
 
-const SRC_DIR = join(import.meta.dir, '..', 'src')
 const SETTINGS_MODULE = 'ad-settings.ts'
-
-/** Every `src/` module's comment-stripped code, by file name. */
-function srcModules(): Map<string, string> {
-  const modules = new Map<string, string>()
-  for (const name of readdirSync(SRC_DIR).filter((n) => n.endsWith('.ts')).sort()) {
-    modules.set(name, stripComments(readFileSync(join(SRC_DIR, name), 'utf-8')))
-  }
-  return modules
-}
-
-/** The module specifiers `code` imports or re-exports, static or dynamic. */
-function importedSpecifiers(code: string): string[] {
-  const patterns = [/\bfrom\s*['"]([^'"]+)['"]/g, /\bimport\s*['"]([^'"]+)['"]/g, /\bimport\s*\(\s*['"]([^'"]+)['"]/g, /\brequire\s*\(\s*['"]([^'"]+)['"]/g]
-  return patterns.flatMap((re) => [...code.matchAll(re)].map((m) => m[1]!))
-}
-
-/** A type-only import or re-export (`import type …`, `export type …`): erased at build, it loads nothing. */
-const TYPE_ONLY_FROM = /\b(?:import|export)\s+type\s+(?:\{[^}]*\}|\*(?:\s+as\s+[\w$]+)?|[\w$]+)\s*from\s*['"]([^'"]+)['"]/g
-
-/**
- * The specifiers `code` loads at run time: every one `importedSpecifiers`
- * finds, less one per type-only import or re-export. An import whose names
- * are each marked `type` (`import { type A } from …`) still counts: only the
- * whole-statement forms are excluded.
- */
-function runtimeSpecifiers(code: string): string[] {
-  const specifiers = importedSpecifiers(code)
-  for (const m of code.matchAll(TYPE_ONLY_FROM)) {
-    const at = specifiers.indexOf(m[1]!)
-    if (at < 0) throw new Error(`type-only import of ${m[1]} not among the specifiers`)
-    specifiers.splice(at, 1)
-  }
-  return specifiers
-}
-
-/** What a module loads at run time: each module reached with the import chain that reaches it, and each package or builtin imported on the way. */
-interface RuntimeLoads {
-  readonly modules: Map<string, string[]>
-  readonly packages: { readonly chain: string[]; readonly specifier: string }[]
-}
-
-/**
- * Follows `entry`'s runtime imports through `modules` (file name → code),
- * transitively. Throws on a relative specifier that names no module in
- * `modules`, so an import the walk cannot follow fails the audit instead of
- * being skipped.
- */
-function runtimeLoads(modules: Map<string, string>, entry: string): RuntimeLoads {
-  const reached = new Map<string, string[]>([[entry, [entry]]])
-  const packages: { chain: string[]; specifier: string }[] = []
-  const queue = [entry]
-  for (let name = queue.shift(); name !== undefined; name = queue.shift()) {
-    const chain = reached.get(name)!
-    for (const specifier of runtimeSpecifiers(modules.get(name)!)) {
-      if (!specifier.startsWith('.')) {
-        packages.push({ chain, specifier })
-        continue
-      }
-      const target = specifier.replace(/^\.\//, '')
-      if (!modules.has(target)) throw new Error(`${name} imports ${specifier}, which is no src/ module`)
-      if (reached.has(target)) continue
-      reached.set(target, [...chain, target])
-      queue.push(target)
-    }
-  }
-  return { modules: reached, packages }
-}
 
 /** `src/` modules the settings module must never load: the session manager, the agent-director client, outage-state and the notifier. */
 const FORBIDDEN_SETTINGS_LOADS = /^(?:session-manager|agent-director-client|outage-state)\.ts$|notifier/

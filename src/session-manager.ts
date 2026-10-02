@@ -78,6 +78,20 @@
  *      tmux-touching call follows it. Every other `ErrInternal` stays
  *      UNCLASSIFIED (step 3). The persona teardown's kill and delete
  *      (`killPersonaInstance`, `deletePersonaInstance`) latch nothing.
+ *   6. Every kill is a checked kill (`src/checked-kill.ts`; b.jg5 SRJ-110,
+ *      SRJ-701): `killPersonaInstance` answers its outcome, `kill_sent`
+ *      included, and never throws; its context (`KILL_CONTEXT_ATTEMPT` or
+ *      `KILL_CONTEXT_TEARDOWN`) is required. The ladder's replacement kills
+ *      (`ladderKill`: a delete-then-spawn chain's kill and the
+ *      `ErrSpawnNotResumable` branch's) go on to the delete and spawn only
+ *      after a success (any `kill_sent`, `ErrSpawnNotFound`, or GONE). A
+ *      CONFLICT there latches the persona with the refused operation "P's
+ *      next check or recovery" and is never sent again (b.jg5 SRJ-501,
+ *      SRJ-505), an UNUSABLE NAME takes step 5's row, an `ErrInvalidFlags`
+ *      gets one immediate version re-check (a stop it decides answers
+ *      `failed` marked `stopping`), a class the kill has no row for is
+ *      reported as UNCLASSIFIED (step 3's refusal, never counted), and every
+ *      other outcome is step 3's refusal.
  *
  * Own-row reads (b.jg5 SRJ-114, SRJ-115): every `get` of a persona's own row
  * at SRJ-114's sites goes through `readPersonaOwnRow`, and every own-row
@@ -141,9 +155,11 @@
  * reply-guard step (the optimistic spawn's steps are undone on a collision).
  *
  * The start sweep (`reconcileOrphans`, b.av2 SR-6.3) lists every
- * `service=cscb` spawn and kills+deletes any with a persona absent from the
+ * `service=cscb` spawn and kills any with a persona absent from the
  * applied configuration, an instance ID other than `cscb_<key>`, or a `cwd`
- * other than its persona's working directory. A pre-persona row (no `persona`
+ * other than its persona's working directory, deleting it only after a kill
+ * that succeeded (each kill a checked kill, b.jg5 SRJ-110, SRJ-701; it latches
+ * nothing and arms no retry timer). A pre-persona row (no `persona`
  * label) is never deleted: it is kept, and killed only when live, with one
  * findMissing sweep after the kills so a killed row reads `missing` once its
  * session is gone and isn't killed again at the next start (b.1ix). While a
@@ -246,9 +262,19 @@ import {
   describeAgentDirectorFailure,
   hasAdErrorName,
   isInvalidFlagsError,
+  unclassifiedClassificationOf,
   type InvalidFlagsError,
 } from './ad-error-class.ts'
 import { RECHECK_OUTCOME_STOP } from './ad-version-gate.ts'
+import {
+  KILL_OUTCOME_NOT_KILLED,
+  checkedKill,
+  describeKillOutcome,
+  killLetsNextStepRun,
+  killOutcomeStopsServer,
+  type KillFailure,
+  type KillOutcome,
+} from './checked-kill.ts'
 import {
   FULL_PANE_READ_LINES,
   PANE_READ_ABSENT,
@@ -337,7 +363,10 @@ import {
   AGENT_DIRECTOR_DEAD_STATES,
   AGENT_DIRECTOR_LIVE_STATES,
   AGENT_DIRECTOR_PENDING_STATE,
+  LIVENESS_DEAD_ROW_NO_ROW,
+  deadRowReadOf,
   pendingLaunchStartOf,
+  type LivenessReading,
 } from './liveness-reading.ts'
 import { parseLaunchStart } from './pending-row.ts'
 import { isDryRun } from './tokens.ts'
@@ -845,10 +874,11 @@ type LatchTimeRead = { readonly rowState: LatchRowState } | { readonly latched: 
  * the read was awaited (`personaLatchedNow`, b.jg5 SRJ-502: the health
  * tick reads even while a launch is in flight, SRJ-315) answers `latched`
  * the same way, whatever the read gave: that latch stands, and no second
- * case or post is set on top of it. Logs nothing of its own; never throws.
+ * case or post is set on top of it. `site` names the path that met the
+ * refusal in the read's own lines. Logs nothing of its own; never throws.
  */
-async function latchTimeRowState(key: string): Promise<LatchTimeRead> {
-  const read = await readPersonaOwnRowStatus(key, { site: 'spawnForPersona', what: 'latch-time status read' })
+async function latchTimeRowState(key: string, site: string): Promise<LatchTimeRead> {
+  const read = await readPersonaOwnRowStatus(key, { site, what: 'latch-time status read' })
   if (read.kind === OWN_ROW_STATUS_LATCHED) return { latched: true, outcome: LATCH_TIME_READ_LATCHED }
   if (personaLatchedNow(key)) return { latched: true, outcome: LATCH_TIME_READ_LATCHED_ELSEWHERE }
   switch (read.kind) {
@@ -864,10 +894,11 @@ async function latchTimeRowState(key: string): Promise<LatchTimeRead> {
 /**
  * The row state to record for a latch met by a call whose path last read
  * `lastRead`: `lastRead` itself, or, when the path read nothing
- * (`NOTHING_READ`), the one latch-time `status` read (`latchTimeRowState`).
+ * (`NOTHING_READ`), the one latch-time `status` read (`latchTimeRowState`),
+ * its lines prefixed `site`.
  */
-async function recordedRowState(key: string, lastRead: LastRowRead): Promise<LatchTimeRead> {
-  return lastRead === NOTHING_READ ? latchTimeRowState(key) : { rowState: lastRead }
+async function recordedRowState(key: string, lastRead: LastRowRead, site: string): Promise<LatchTimeRead> {
+  return lastRead === NOTHING_READ ? latchTimeRowState(key, site) : { rowState: lastRead }
 }
 
 /** The latch line's outcome when the latch-time `status` read latched the persona itself. */
@@ -898,7 +929,8 @@ const LATCH_TIME_READ_LATCHED_ELSEWHERE =
  * spawn-failure notice, no `spawn-failed` entry, nothing counted, and the
  * caller kills, deletes and launches nothing more. With no latch installed
  * it makes no read, sets nothing, logs the one line saying so, and still
- * answers `latched`. Never throws.
+ * answers `latched`. `site` is the line's prefix (default `spawnForPersona`).
+ * Never throws.
  */
 async function conflictAt(
   key: string,
@@ -907,26 +939,27 @@ async function conflictAt(
   lastRead: LastRowRead,
   what: string,
   ref: string,
+  site = 'spawnForPersona',
 ): Promise<SpawnPersonaResult | undefined> {
   if (classifyAdError(err).errorClass !== AD_ERROR_CLASS_CONFLICT) return undefined
   const latch = conflictLatch
   if (latch === undefined) {
-    logConflict(what, ref, err, LATCH_OUTCOME_NO_LATCH)
+    logConflict(site, what, ref, err, LATCH_OUTCOME_NO_LATCH)
     return { key, action: 'latched' }
   }
-  const recorded = await recordedRowState(key, lastRead)
+  const recorded = await recordedRowState(key, lastRead, site)
   if ('latched' in recorded) {
-    logConflict(what, ref, err, recorded.outcome)
+    logConflict(site, what, ref, err, recorded.outcome)
     return { key, action: 'latched' }
   }
   const { rowState } = recorded
   try {
     latch.setFromConflict(key, err, { refusedOperation: operation, rowState })
   } catch (setErr) {
-    logConflict(what, ref, err, `latching the persona failed: ${describeThrownValue(setErr)}`)
+    logConflict(site, what, ref, err, `latching the persona failed: ${describeThrownValue(setErr)}`)
     return { key, action: 'latched' }
   }
-  logConflict(what, ref, err, 'the persona latched')
+  logConflict(site, what, ref, err, 'the persona latched')
   return { key, action: 'latched' }
 }
 
@@ -934,9 +967,9 @@ async function conflictAt(
  * `conflictAt`'s one line for a CONFLICT at `what` for `ref`, with `outcome`
  * (what became of the latch), logged once the latch is set or has failed.
  */
-function logConflict(what: string, ref: string, err: unknown, outcome: string): void {
+function logConflict(site: string, what: string, ref: string, err: unknown, outcome: string): void {
   console.error(
-    `[slack] spawnForPersona: ${what} refused for ${ref}: ${describeAgentDirectorFailure(err)} — CONFLICT: ${outcome}; ` +
+    `[slack] ${site}: ${what} refused for ${ref}: ${describeAgentDirectorFailure(err)} — CONFLICT: ${outcome}; ` +
       `no spawn-failure notice; nothing more is called (b.jg5 SRJ-105, SRJ-501)`,
   )
 }
@@ -1015,7 +1048,7 @@ async function unusableNameAt(
     logUnusableName(site, what, ref, err, LATCH_OUTCOME_NO_LATCH)
     return { key, action: 'latched' }
   }
-  const recorded = await recordedRowState(key, lastRead)
+  const recorded = await recordedRowState(key, lastRead, site)
   logUnusableName(
     site,
     what,
@@ -6386,29 +6419,122 @@ function buildSpawnParams(persona: Persona, config: PersonaConfig, configDirLabe
 }
 
 /**
- * Kill persona `key`'s instance (`cscb_<key>`) through `withOutageDetection`,
- * quietly: logs nothing, records no startup error and raises no notice of its
- * own (the wrapper still raises or clears the key's outage flags). Resolves
- * true when the row was there, false when it was already gone
- * (`ErrSpawnNotFound` counts as success); rethrows every other error for the
- * caller to report. For the persona teardown (b.av2 SR-6.5), and the
- * collision ladder's kill (`tryKill`), which ignores every error but a
- * refusal and stops the ladder on a refusal (b.jg5 SRJ-105).
- *
- * `rowReadLive` declares whether the caller kills a row it read in a live
- * state (b.jg5 glossary: only such a kill is tmux-touching). The teardown did
- * not read the row, so it passes nothing (false); the ladder passes true when
- * it read the row live.
+ * A kill made inside a launch or recovery attempt for the persona (the
+ * collision ladder's replacement kills, the restart path's kill).
  */
-export async function killPersonaInstance(key: string, rowReadLive = false): Promise<boolean> {
+export const KILL_CONTEXT_ATTEMPT = 'attempt'
+/** A persona teardown's kill: no launch or recovery attempt; it arms nothing (b.jg5 SRJ-110; hatch A3). */
+export const KILL_CONTEXT_TEARDOWN = 'teardown'
+
+/** The context of a `killPersonaInstance` call. */
+export type KillContext = typeof KILL_CONTEXT_ATTEMPT | typeof KILL_CONTEXT_TEARDOWN
+
+/** Options of `killPersonaInstance`. `context` is required, so no caller takes either form by omission. */
+export interface KillPersonaInstanceOptions {
+  /**
+   * `KILL_CONTEXT_ATTEMPT`: the kill is made inside a launch or recovery
+   * attempt for the persona. The wrapper reports its error as for any call in
+   * the attempt (b.jg5 SRJ-301: an UNAVAILABLE, ENVIRONMENT, CONFIG or
+   * UNCLASSIFIED answer arms the persona's retry timer), and a class the kill
+   * has no row for (`unlistedClass`: a STATE name other than
+   * `ErrSpawnNotFound`, `ErrInvalidFlags` after its re-check included, LAUNCH
+   * FAILURE, DIRECTORY) takes SRJ-105's UNCLASSIFIED row through the outage
+   * state's site entry (`reportUnclassifiedAtSite`): it arms the retry timer
+   * with the UNCLASSIFIED cause and feeds the persona's unclassified-error
+   * episode (b.jg5 SRJ-313), and is never counted.
+   *
+   * `KILL_CONTEXT_TEARDOWN`: the persona teardown's kill, which is no launch
+   * or recovery attempt (b.jg5 SRJ-110; hatch A3): it arms no retry timer,
+   * starts no `tmux-unresponsive` condition, reports nothing to the
+   * unclassified-error episode, and raises the `tmux-unavailable` or
+   * `ad-config-malformed` outage for an ENVIRONMENT or CONFIG answer only
+   * when the persona is in the applied configuration (the installed
+   * configured-persona query).
+   */
+  readonly context: KillContext
+  /**
+   * True when the caller kills a row it read in a live state (b.jg5
+   * glossary: only such a kill is tmux-touching): the collision ladder, when
+   * it read the row live. Absent or false otherwise (the persona teardown
+   * did not read the row; the restart path kills only after a `dead`
+   * reading).
+   */
+  readonly rowReadLive?: boolean
+}
+
+/**
+ * Kill persona `key`'s instance (`cscb_<key>`): one checked kill
+ * (`checkedKill`, `src/checked-kill.ts`; b.jg5 SRJ-110, SRJ-701) through
+ * `withOutageDetection`, which raises or clears the key's outage flags as
+ * `options.context` says (`KillPersonaInstanceOptions`). Answers the kill's
+ * outcome, `kill_sent` included: a success (any `kill_sent`,
+ * `ErrSpawnNotFound`, or GONE) or a non-success with its class and the
+ * thrown value. An `ErrInvalidFlags` gets exactly one immediate version
+ * re-check first, in either context (`recheckKillOnInvalidFlags`; b.jg5
+ * SRJ-104, SRJ-204), its answer kind kept in the outcome; when it decides
+ * that the server stops (`killOutcomeStopsServer`), nothing is reported and
+ * the caller does nothing more (b.jg5 SRJ-205). In `KILL_CONTEXT_ATTEMPT`
+ * an outcome of a class the kill has no row for is then reported as
+ * UNCLASSIFIED (`reportUnlistedKillOutcome`). Never throws or rejects, and
+ * never retries. Logs nothing, records no startup error, raises no notice of
+ * its own and latches nothing: each caller acts on the outcome by its own
+ * context. Its callers: the persona teardown (b.av2 SR-6.5, `main()`'s
+ * binding, `KILL_CONTEXT_TEARDOWN`), the collision ladder's replacement
+ * kills (`ladderKill`) and the restart path's kill
+ * (`_buildKillSessionAdapter`, `src/server.ts`), both `KILL_CONTEXT_ATTEMPT`.
+ */
+export async function killPersonaInstance(key: string, options: KillPersonaInstanceOptions): Promise<KillOutcome> {
+  const call = adKillCall(options.rowReadLive === true)
+  const inAttempt = options.context === KILL_CONTEXT_ATTEMPT
+  const wrapperOptions = inAttempt
+    ? undefined
+    : { armsNothing: { personaConfigured: () => configuredReadingOf(key).configured } }
+  const killed = await checkedKill(personaInstanceId(key), (params) =>
+    withOutageDetection(key, undefined, call, (client) => client.kill(params), wrapperOptions),
+  )
+  const outcome = await recheckKillOnInvalidFlags(killed)
+  if (inAttempt) reportUnlistedKillOutcome(key, outcome, call)
+  return outcome
+}
+
+/**
+ * The `ErrInvalidFlags` step at a kill (b.jg5 SRJ-104, SRJ-204): every kill
+ * site gives `ErrInvalidFlags` no meaning, so a non-success whose thrown
+ * value is an `ErrInvalidFlags` (by name) gets exactly one immediate version
+ * re-check (`classifyWithInvalidFlagsRecheck`; a stop it decides ends the
+ * process as the re-check defines) and is answered with the re-check's
+ * answer kind as its `recheck`; it stays UNCLASSIFIED. Every other outcome is
+ * answered as it is, with no re-check. Never throws or rejects.
+ */
+async function recheckKillOnInvalidFlags(outcome: KillOutcome): Promise<KillOutcome> {
+  if (outcome.kind !== KILL_OUTCOME_NOT_KILLED || outcome.errorClass === AD_ERROR_CLASS_UNAVAILABLE) return outcome
+  if (!isInvalidFlagsError(outcome.error)) return outcome
+  const step = await classifyWithInvalidFlagsRecheck(outcome.error)
+  return { ...outcome, recheck: step.recheck.kind }
+}
+
+/**
+ * Inside a launch or recovery attempt for persona `key`: an outcome of a
+ * class the kill has no row for (`unlistedClass`: a STATE name other than
+ * `ErrSpawnNotFound`, LAUNCH FAILURE, DIRECTORY; b.jg5 SRJ-104, SRJ-110),
+ * which the wrapper did not take as UNCLASSIFIED, is reported as an
+ * UNCLASSIFIED outcome through the outage state's site entry
+ * (`reportUnclassifiedAtSite`, with its UNCLASSIFIED classification,
+ * `unclassifiedClassificationOf`): the persona's retry timer is armed with
+ * the UNCLASSIFIED cause (the attempt records it, so a launch it ends is
+ * refused and never counted) and its unclassified-error episode is fed
+ * (b.jg5 SRJ-105, SRJ-313). An `ErrInvalidFlags` whose re-check decided that
+ * the server stops is not reported (b.jg5 SRJ-205). Every other outcome,
+ * a by-name UNCLASSIFIED one included (the wrapper reported it), reports
+ * nothing. Never throws.
+ */
+function reportUnlistedKillOutcome(key: string, outcome: KillOutcome, call: AdKillCall): void {
   try {
-    await withOutageDetection(key, undefined, adKillCall(rowReadLive), (client) =>
-      client.kill({ claude_instance_id: personaInstanceId(key) }),
-    )
-    return true
-  } catch (err) {
-    if (err instanceof ErrSpawnNotFound) return false
-    throw err
+    if (outcome.kind !== KILL_OUTCOME_NOT_KILLED || outcome.errorClass === AD_ERROR_CLASS_UNAVAILABLE) return
+    if (outcome.unlistedClass === undefined || killOutcomeStopsServer(outcome)) return
+    reportUnclassifiedAtSite(key, outcome.error, call, unclassifiedClassificationOf(outcome.error))
+  } catch {
+    /* a failing report changes nothing about the kill's own outcome */
   }
 }
 
@@ -6436,39 +6562,127 @@ export async function deletePersonaInstance(key: string): Promise<boolean> {
 }
 
 /**
- * The collision ladder's kill — never throws. Answers what stops the chain
- * (b.jg5 SRJ-105), or `undefined` when it may go on to its delete and
- * launch: after a success or `ErrSpawnNotFound`, and after any other error
- * but those below, which is ignored as before. It stops the chain
- * (SRJ-110: "No step follows"), after which the caller deletes and launches
- * nothing and answers the result given:
- *   - an UNUSABLE NAME answer (b.jg5 SRJ-512, `unusableNameAt`) latches the
- *     persona with `lastRead`, the row state the ladder last read, and
- *     answers `latched`;
- *   - a refusal (`refusalAt`: UNAVAILABLE, `ErrTmuxKillFailed` included,
- *     ENVIRONMENT, `ErrTmuxNotAvailable`, b.jg5 SRJ-311, CONFIG,
- *     `ErrConfigMalformed`, SRJ-316, or UNCLASSIFIED, SRJ-313) answers
- *     `failed`.
- * `call` declares whether the ladder read the row in a live state
- * (`AdKillCall`, `killPersonaInstance`). The persona teardown's kill
- * (`killPersonaInstance` itself) is unchanged.
+ * The collision ladder's replacement kill (b.jg5 SRJ-110, SRJ-701): one
+ * checked kill through `killPersonaInstance`, inside the launch attempt
+ * (`KILL_CONTEXT_ATTEMPT`). Never throws. Answers `undefined` only after a
+ * success (any `kill_sent`, `ErrSpawnNotFound`, or GONE), with one line
+ * naming the outcome: the chain goes on to its delete and spawn. Every other
+ * outcome stops the chain (SRJ-110: "No step follows"), after which the
+ * caller deletes and launches nothing and answers the result
+ * `ladderKillStop` gives. The kill is never repeated. `call` declares
+ * whether the ladder read the row in a live state (`AdKillCall`).
  */
-async function tryKill(
+async function ladderKill(
   key: string,
   call: AdKillCall,
   ref: string,
   lastRead: LatchRowState,
 ): Promise<SpawnPersonaResult | undefined> {
-  try {
-    await killPersonaInstance(key, call.rowReadLive)
-  } catch (err) {
-    const latched = await unusableNameAt(key, err, lastRead, 'spawnForPersona', 'kill', ref)
-    if (latched) return latched
-    const refused = refusalAt(key, err, 'kill', 'spawnForPersona', 'kill', ref)
-    if (refused) return refused
-    /* any other error: ignored, as before */
+  const outcome = await killPersonaInstance(key, { context: KILL_CONTEXT_ATTEMPT, rowReadLive: call.rowReadLive })
+  if (killLetsNextStepRun(outcome)) {
+    console.error(`[slack] spawnForPersona: kill for ${ref}: ${describeKillOutcome(outcome)} — the delete and the fresh spawn follow (b.jg5 SRJ-701)`)
+    return undefined
   }
-  return undefined
+  return ladderKillStop(key, outcome, ref, lastRead)
+}
+
+/**
+ * What a non-success at the collision ladder's replacement kill answers
+ * (b.jg5 SRJ-110), by its class:
+ *   - an `ErrInvalidFlags` whose immediate version re-check decided that the
+ *     server stops (`killOutcomeStopsServer`; b.jg5 SRJ-204, SRJ-205): one
+ *     line and a `failed` result marked `stopping`, as for a resume's; nothing
+ *     more is called;
+ *   - CONFLICT: latches the persona through the latch's CONFLICT entry with
+ *     the refused operation "P's next check or recovery" and `lastRead`, the
+ *     row state the ladder last read (`conflictAt`; b.jg5 SRJ-501, SRJ-505;
+ *     on a live row, `pending` included, a "not this launch's session"
+ *     answer is SRJ-613's kill backstop), and answers `latched`;
+ *   - UNUSABLE NAME: latches it with `lastRead` (`unusableNameAt`; b.jg5
+ *     SRJ-512) and answers `latched`;
+ *   - UNAVAILABLE (`ErrTmuxKillFailed` included), ENVIRONMENT, CONFIG and
+ *     UNCLASSIFIED: the refusal (`refusalAt`, b.jg5 SRJ-105, SRJ-311,
+ *     SRJ-313, SRJ-316) answers `failed`, with one line and no notice. An
+ *     UNCLASSIFIED outcome of a class the kill has no row for
+ *     (`unlistedClass`, `ErrInvalidFlags` after a re-check that did not stop
+ *     included) answers `failed` with the same line; `killPersonaInstance`
+ *     has reported it as UNCLASSIFIED, arming the retry timer, so
+ *     `markRefusal` marks the result refused and it is never counted.
+ * Never throws.
+ */
+async function ladderKillStop(
+  key: string,
+  outcome: KillFailure,
+  ref: string,
+  lastRead: LatchRowState,
+): Promise<SpawnPersonaResult> {
+  if (killOutcomeStopsServer(outcome)) {
+    console.error(
+      `[slack] spawnForPersona: kill for ${ref} did not succeed: ${describeKillOutcome(outcome)} — the version re-check decided that the server stops; answering failed, marked stopping; nothing more is called (b.jg5 SRJ-104, SRJ-205)`,
+    )
+    return { key, action: 'failed', stopping: true }
+  }
+  if (outcome.errorClass === AD_ERROR_CLASS_CONFLICT) {
+    const latched = await conflictAt(key, outcome.error, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, lastRead, 'kill', ref)
+    if (latched) return latched
+  } else if (outcome.errorClass === AD_ERROR_CLASS_UNUSABLE_NAME) {
+    const latched = await unusableNameAt(key, outcome.error, lastRead, 'spawnForPersona', 'kill', ref)
+    if (latched) return latched
+  } else if (outcome.errorClass === AD_ERROR_CLASS_UNAVAILABLE || outcome.unlistedClass === undefined) {
+    const refused = refusalAt(key, outcome.error, 'kill', 'spawnForPersona', 'kill', ref)
+    if (refused) return refused
+  }
+  logRefusal('spawnForPersona', 'kill', ref, describeKillOutcome(outcome))
+  return { key, action: 'failed' }
+}
+
+/**
+ * The row state the restart path's kill records in a latch (b.jg5 SRJ-501):
+ * the state its run last read, carried by `lastRead`, the run's `dead`
+ * reading (`deadRowReadOf`): `ended` or `missing` as read, or no row for
+ * `ErrSpawnNotFound`. `NOTHING_READ` when the reading carries no row state
+ * (`ErrSystemInstallDisappeared`, which reads no row, or a reading made with
+ * no `status` call): the latch then makes the one latch-time `status` read.
+ */
+function restartKillLastRead(lastRead: LivenessReading): LastRowRead {
+  const rowRead = deadRowReadOf(lastRead)
+  if (rowRead === undefined) return NOTHING_READ
+  return rowRead === LIVENESS_DEAD_ROW_NO_ROW ? LATCH_ROW_STATE_NO_ROW : latchRowStateRead(rowRead)
+}
+
+/**
+ * The restart path's latch for its kill's outcome (b.jg5 SRJ-110, SRJ-501,
+ * SRJ-512; `_buildKillSessionAdapter`, `src/server.ts`): a CONFLICT latches
+ * persona `key` through the latch's CONFLICT entry with the refused
+ * operation "P's next check or recovery", and an UNUSABLE NAME through the
+ * unusable-name entry, each with the row state the restart run last read
+ * (`lastRead`, its `dead` reading: `ended`, `missing` or no row;
+ * `restartKillLastRead`), with no further `status` read; only when that
+ * reading carries no row state (`ErrSystemInstallDisappeared`) is one
+ * latch-time `status` read made, its lines prefixed `site` too. A read that
+ * itself latches the persona leaves that latch standing. One line prefixed
+ * `site`. With no latch installed nothing is read or set, and the line says
+ * so. Answers true for those two classes (the restart work answers
+ * `latched`), false for every other outcome, for which it does nothing. The
+ * kill is never repeated. Never throws.
+ */
+export async function latchOnRestartKillOutcome(
+  key: string,
+  outcome: KillOutcome,
+  site: string,
+  lastRead: LivenessReading,
+): Promise<boolean> {
+  if (outcome.kind !== KILL_OUTCOME_NOT_KILLED) return false
+  const ref = keyRef(key)
+  if (outcome.errorClass === AD_ERROR_CLASS_CONFLICT) {
+    await conflictAt(key, outcome.error, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, restartKillLastRead(lastRead), 'kill', ref, site)
+    return true
+  }
+  if (outcome.errorClass === AD_ERROR_CLASS_UNUSABLE_NAME) {
+    await unusableNameAt(key, outcome.error, restartKillLastRead(lastRead), site, 'kill', ref)
+    return true
+  }
+  return false
 }
 
 // ---------------------------------------------------------------------------
@@ -6572,8 +6786,8 @@ async function tryDelete(
 
 /**
  * Replace the persona's row with a fresh spawn: kill it (when `kill` is set,
- * for a row that may still be live; errors other than a refusal are ignored),
- * delete it, spawn fresh
+ * for a row that may still be live; one checked kill, `ladderKill`), delete
+ * it only after the kill succeeded, spawn fresh
  * and run dialog approval. The collision ladder's kill+delete+fresh paths go
  * through here: `resume_enabled: false`, a row whose `cwd` differs from the
  * working directory (b.av2 SR-6.2), and a row whose `config_dir` label is
@@ -6581,9 +6795,12 @@ async function tryDelete(
  * ladder read the row in a live state, which makes the kill tmux-touching
  * (b.jg5 glossary, `AdKillCall`).
  *
- * - A refused kill (b.jg5 SRJ-105, `tryKill`) returns `failed`, and a kill
- *   that answered UNUSABLE NAME latches the persona with `opts.lastRead` and
- *   returns `latched` (b.jg5 SRJ-512): no delete, no launch.
+ * - A kill that did not succeed (b.jg5 SRJ-110, SRJ-701, `ladderKillStop`)
+ *   stops the chain: no delete, no launch. A CONFLICT latches the persona
+ *   with the refused operation "P's next check or recovery" and
+ *   `opts.lastRead`, and an UNUSABLE NAME with `opts.lastRead` (b.jg5
+ *   SRJ-512), each returning `latched`; every other class returns `failed`.
+ *   A success (any `kill_sent`) and `ErrSpawnNotFound` go on to the delete.
  * - A failed delete returns `failed` (tryDelete records `spawn-failed` at
  *   startup and raises the spawn-failure notice, but not for a refusal), and
  *   one that answered UNUSABLE NAME returns `latched` the same way.
@@ -6609,9 +6826,10 @@ async function replaceWithFreshSpawn(
   opts: { kill: boolean; killCall: AdKillCall; lastRead: LatchRowState },
 ): Promise<SpawnPersonaResult> {
   const { key } = persona
-  // b.jg5 SRJ-105, SRJ-512: a refused kill, or one that latched the persona,
-  // stops the chain: no delete, no launch. So does such a delete.
-  const killStop = opts.kill ? await tryKill(key, opts.killCall, ref, opts.lastRead) : undefined
+  // b.jg5 SRJ-110, SRJ-701: only a successful kill lets the delete and the
+  // launch follow; any other outcome stops the chain, latching the persona
+  // for a CONFLICT or an UNUSABLE NAME. So does a refused or latching delete.
+  const killStop = opts.kill ? await ladderKill(key, opts.killCall, ref, opts.lastRead) : undefined
   if (killStop) return killStop
   const deleteStop = await tryDelete(key, isStartup, ref, opts.lastRead)
   if (deleteStop) return deleteStop
@@ -7221,9 +7439,11 @@ async function resumeOrFreshSpawn(
       // terminal, so this kill is declared a kill of a row read live
       // (tmux-touching), whichever state the ladder read before. E23
       // (SRJ-710) owns what an ErrSpawnNotResumable means here.
-      // b.jg5 SRJ-105, SRJ-512: a refused kill, or one that latched the
-      // persona, stops the chain: no delete, no launch. So does such a delete.
-      const killStop = await tryKill(key, AD_CALL_KILL_ROW_READ_LIVE, ref, lastRead)
+      // b.jg5 SRJ-110, SRJ-701: only a successful kill lets the delete and
+      // the launch follow; any other outcome stops the chain, latching the
+      // persona for a CONFLICT or an UNUSABLE NAME. So does a refused or
+      // latching delete.
+      const killStop = await ladderKill(key, AD_CALL_KILL_ROW_READ_LIVE, ref, lastRead)
       if (killStop) return killStop
       const deleteStop = await tryDelete(key, isStartup, ref, lastRead)
       if (deleteStop) return deleteStop
@@ -8232,11 +8452,11 @@ async function runPersonaLadder(
 
 /** What the start sweep did. */
 export interface OrphanReconcileResult {
-  /** Rows swept: each killed, then deleted. Pre-persona rows are never swept. */
+  /** Rows swept: each killed, then deleted only after a kill that succeeded. Pre-persona rows are never swept. */
   found: number
   /** Swept rows deleted. */
   killed: number
-  /** Swept rows whose delete failed. */
+  /** Swept rows kept because their kill did not succeed, or whose delete failed. */
   failed: number
   /** Pre-persona rows (no `persona` label), all kept (b.1ix). */
   prePersona: PrePersonaSweepCounts
@@ -8252,7 +8472,7 @@ export interface PrePersonaSweepCounts {
   kept: number
   /** Those in a live state (`AGENT_DIRECTOR_LIVE_STATES`), each given one kill call at this start. */
   live: number
-  /** Live ones whose kill failed. */
+  /** Live ones whose kill did not succeed (`kill_sent` false or absent, and `ErrSpawnNotFound`, are successes). */
   killFailed: number
 }
 
@@ -8293,9 +8513,10 @@ function sweepDecision(
  * label (b.1ix; the rows a build that predates personas made, instance IDs
  * `cscb_<name>_<channel>`): the row is kept, never deleted. Its ID is never a
  * persona's `cscb_<key>`, so no launch reuses or resumes it, and keeping it is
- * harmless. A row in a live state gets one kill call at this start and the
- * kill's result logged; an `ended` or `missing` row is left alone, with no
- * call and no line. Returns whether it called `kill`.
+ * harmless. A row in a live state gets one checked kill at this start
+ * (`sweepKill`; b.jg5 SRJ-110, SRJ-701) and its outcome logged; an `ended` or
+ * `missing` row is left alone, with no call and no line. Returns whether it
+ * called `kill`.
  *
  * agent-director 0.10.0's `kill` doesn't change the row's state, so a killed
  * row would still read live at every later start and be killed again each
@@ -8311,13 +8532,23 @@ function sweepDecision(
  * and has an operator confirm with `tmux ls` that none is left.
  *
  *   [slack] reconcileOrphans: pre-persona row (no persona label) instanceId=<id> state=<state> tmux_session=<name> is live — killing it; the row is kept (a pre-persona row is never deleted)
- *   [slack] reconcileOrphans: kill reported success for pre-persona row instanceId=<id> — row kept; a reported success does not prove tmux session <name> is gone
+ *   [slack] reconcileOrphans: kill succeeded for pre-persona row instanceId=<id> (<outcome>) — row kept
  *
- * A failed kill records `orphan-cleanup` (`kill failed for pre-persona row
- * instanceId=<id>: <errName> message="…"; row kept, its session may still be
- * running`).
+ * `<outcome>` is `describeKillOutcome`'s rendering, `kill_sent` included; a
+ * success with `kill_sent` false or absent, `ErrSpawnNotFound` and GONE are
+ * successes. A kill that did not succeed records one `orphan-cleanup` entry
+ * (`kill did not succeed for pre-persona row instanceId=<id>: <outcome>; row
+ * kept, its session may still be running`), except when its `ErrInvalidFlags`
+ * re-check decided that the server stops (`stop.stopping` is then set): one
+ * line (`sweepStoppedLine`), and nothing more. The row has no persona label,
+ * so no outage is raised for it and nothing latches.
  */
-async function keepPrePersonaRow(client: Client, row: ListRow, counts: PrePersonaSweepCounts): Promise<boolean> {
+async function keepPrePersonaRow(
+  client: Client,
+  row: ListRow,
+  counts: PrePersonaSweepCounts,
+  stop: SweepStop,
+): Promise<boolean> {
   counts.kept++
   if (!AGENT_DIRECTOR_LIVE_STATES.has(row.state)) return false
   counts.live++
@@ -8325,21 +8556,78 @@ async function keepPrePersonaRow(client: Client, row: ListRow, counts: PrePerson
   console.error(
     `[slack] reconcileOrphans: pre-persona row (no persona label) instanceId=${id} state=${row.state} tmux_session=${row.tmux_session_name} is live — killing it; the row is kept (a pre-persona row is never deleted)`,
   )
-  try {
-    await client.kill({ claude_instance_id: id })
-  } catch (err) {
+  const outcome = await sweepKill(client, id, undefined, stop)
+  if (!killLetsNextStepRun(outcome)) {
     counts.killFailed++
-    const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('kill', 'UnknownError', String(err))
+    if (stop.stopping) {
+      console.error(sweepStoppedLine(id, describeKillOutcome(outcome)))
+      return true
+    }
     recordStartupError(
       'orphan-cleanup',
-      `kill failed for pre-persona row instanceId=${id}: ${describeAgentDirectorFailure(e)}; row kept, its session may still be running`,
+      `kill did not succeed for pre-persona row instanceId=${id}: ${describeKillOutcome(outcome)}; row kept, its session may still be running`,
     )
     return true
   }
-  console.error(
-    `[slack] reconcileOrphans: kill reported success for pre-persona row instanceId=${id} — row kept; a reported success does not prove tmux session ${row.tmux_session_name} is gone`,
-  )
+  console.error(`[slack] reconcileOrphans: kill succeeded for pre-persona row instanceId=${id} (${describeKillOutcome(outcome)}) — row kept`)
   return true
+}
+
+/**
+ * Whether a start-sweep kill's `ErrInvalidFlags` re-check decided that the
+ * server stops (b.jg5 SRJ-205): once set, the sweep makes no further
+ * agent-director call (no kill, delete or findMissing sweep).
+ */
+interface SweepStop {
+  stopping: boolean
+}
+
+/**
+ * The start sweep's line when a kill's `ErrInvalidFlags` re-check decided
+ * that the server stops (b.jg5 SRJ-104, SRJ-204, SRJ-205): the row is kept,
+ * and the sweep makes no further call. `described` is the outcome's
+ * rendering (`describeKillOutcome`).
+ */
+function sweepStoppedLine(instanceId: string, described: string): string {
+  return `[slack] reconcileOrphans: kill did not succeed for instanceId=${instanceId}: ${described} — the version re-check decided that the server stops; row kept; the sweep makes no further call (b.jg5 SRJ-205)`
+}
+
+/**
+ * One start-sweep kill (b.jg5 SRJ-110, SRJ-701): one checked kill of
+ * `instanceId` on the sweep's own client, answering its outcome. The start
+ * sweep is no launch or recovery attempt: nothing latches (a CONFLICT or an
+ * UNUSABLE NAME answer is recorded, b.jg5 SRJ-1002), no retry timer is armed,
+ * no `tmux-unresponsive` condition starts and no unclassified-error episode
+ * is fed (a class the kill has no row for is UNCLASSIFIED and only recorded).
+ * An `ErrInvalidFlags` gets exactly one immediate version re-check
+ * (`recheckKillOnInvalidFlags`; b.jg5 SRJ-104, SRJ-204); when it decides that
+ * the server stops, `stop.stopping` is set and the caller does nothing more
+ * (b.jg5 SRJ-205). An ENVIRONMENT answer raises
+ * `tmux-unavailable`, and a CONFIG answer `ad-config-malformed`, for
+ * `configuredKey` only: the persona of the applied configuration the row's
+ * label names, `undefined` for a row of an absent persona or with no persona
+ * label, whose answer is only logged and recorded by the caller (b.jg5
+ * SRJ-110, SRJ-301, SRJ-1002; hatch A3). Never throws.
+ */
+async function sweepKill(
+  client: Client,
+  instanceId: string,
+  configuredKey: string | undefined,
+  stop: SweepStop,
+): Promise<KillOutcome> {
+  const outcome = await recheckKillOnInvalidFlags(await checkedKill(instanceId, (params) => client.kill(params)))
+  if (killOutcomeStopsServer(outcome)) stop.stopping = true
+  if (configuredKey !== undefined && outcome.kind === KILL_OUTCOME_NOT_KILLED) {
+    try {
+      if (outcome.errorClass === AD_ERROR_CLASS_ENVIRONMENT) raiseTmuxUnavailable(configuredKey, outcome.error)
+      else if (outcome.errorClass === AD_ERROR_CLASS_CONFIG) raiseAdConfigMalformed(configuredKey, outcome.error)
+    } catch (err) {
+      console.error(
+        `[slack] reconcileOrphans: raising the outage for persona=${configuredKey} failed: ${describeThrownValue(err)}`,
+      )
+    }
+  }
+  return outcome
 }
 
 /**
@@ -8411,19 +8699,43 @@ interface KilledPrePersonaRow {
 }
 
 /**
- * Kill, then delete, one row the start sweep swept. A failed kill still
- * attempts the delete (b.fmk replaces this with no delete after a kill that
- * didn't succeed). Returns whether the delete succeeded; each failure records
- * `orphan-cleanup`.
+ * Kill one row the start sweep swept (one checked kill, `sweepKill`; b.jg5
+ * SRJ-110, SRJ-701), then delete it only after a success (any `kill_sent`,
+ * or `ErrSpawnNotFound`). A kill that did not succeed keeps the row: no
+ * delete call is made, and one `orphan-cleanup` entry names the outcome
+ * (`kill did not succeed for orphan instanceId=<id> persona=<persona>:
+ * <outcome>; row kept, no delete was made, its session may still be
+ * running`); nothing latches and no retry timer is armed. `configuredKey`
+ * is the applied persona the row's label names (`undefined` for an absent
+ * persona), for whom an ENVIRONMENT or CONFIG answer raises its outage
+ * (`sweepKill`). A kill whose `ErrInvalidFlags` re-check decided that the
+ * server stops (`stop.stopping`) records nothing: one line, no delete.
+ * Returns whether the delete succeeded; a failed delete records
+ * `orphan-cleanup` too.
+ *
+ *   [slack] reconcileOrphans: kill succeeded for orphan instanceId=<id> (<outcome>) — deleting the row
  */
-async function killAndDeleteSweptRow(client: Client, row: ListRow, displayPersona: string): Promise<boolean> {
+async function killAndDeleteSweptRow(
+  client: Client,
+  row: ListRow,
+  displayPersona: string,
+  configuredKey: string | undefined,
+  stop: SweepStop,
+): Promise<boolean> {
   const id = row.claude_instance_id
-  try {
-    await client.kill({ claude_instance_id: id })
-  } catch (err) {
-    const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('kill', 'UnknownError', String(err))
-    recordStartupError('orphan-cleanup', `kill failed for orphan instanceId=${id} persona=${displayPersona}: ${describeAgentDirectorFailure(e)}`)
+  const outcome = await sweepKill(client, id, configuredKey, stop)
+  if (!killLetsNextStepRun(outcome)) {
+    if (stop.stopping) {
+      console.error(sweepStoppedLine(id, describeKillOutcome(outcome)))
+      return false
+    }
+    recordStartupError(
+      'orphan-cleanup',
+      `kill did not succeed for orphan instanceId=${id} persona=${displayPersona}: ${describeKillOutcome(outcome)}; row kept, no delete was made, its session may still be running`,
+    )
+    return false
   }
+  console.error(`[slack] reconcileOrphans: kill succeeded for orphan instanceId=${id} (${describeKillOutcome(outcome)}) — deleting the row`)
   try {
     await client.delete({ claude_instance_id: [id] })
     return true
@@ -8444,7 +8756,8 @@ async function killAndDeleteSweptRow(client: Client, row: ListRow, displayPerson
  * session is gone reads `missing` and the next start leaves it alone
  * (`reconcileKilledPrePersonaRows`).
  *
- * Every other row is swept, killed and then deleted, when it
+ * Every other row is swept, killed and then deleted after a kill that
+ * succeeded (`killAndDeleteSweptRow`), when it
  *   - names a persona absent from the applied configuration (the kill and
  *     delete stay until b.fmk: agent-director 0.10.0 has no reuse, and a
  *     persona added again must start fresh),
@@ -8459,10 +8772,17 @@ async function killAndDeleteSweptRow(client: Client, row: ListRow, displayPerson
  *
  *   [slack] reconcileOrphans: persona "<name>" (key=<key>) working_directory="<path>" cannot be resolved to a real path — keeping its rows; the cwd check is deferred to its launch
  *
- * A `channel` label left on a row by an older spawn plays no part. A failed
- * kill of a swept row still attempts the delete; kill and delete failures
- * record `orphan-cleanup`, a list failure records `orphan-cleanup-list-failed`
- * and does not block startup. One summary line ends the sweep:
+ * A `channel` label left on a row by an older spawn plays no part. Every kill
+ * is a checked kill (`sweepKill`; b.jg5 SRJ-110, SRJ-701): a swept row whose
+ * kill did not succeed is kept, with no delete call, and counted failed. A
+ * kill whose `ErrInvalidFlags` re-check decides that the server stops ends
+ * the sweep: no further row is handled and no findMissing sweep follows
+ * (b.jg5 SRJ-205); the summary line is still logged. No
+ * sweep kill latches anything or arms a retry timer; an ENVIRONMENT or CONFIG
+ * answer raises its outage only for a configured persona's row (hatch A3). A
+ * kill that did not succeed and a failed delete record `orphan-cleanup`, a
+ * list failure records `orphan-cleanup-list-failed` and does not block
+ * startup. One summary line ends the sweep:
  *
  *   [slack] reconcileOrphans: found=<n> killed=<n> failed=<n>; pre-persona rows kept=<n> live=<n> kill-failed=<n>
  */
@@ -8493,11 +8813,15 @@ export async function reconcileOrphans(
   const result = emptySweepResult()
   const deferredLogged = new Set<string>()
   const killedPrePersonaRows: KilledPrePersonaRow[] = []
+  const stop: SweepStop = { stopping: false }
 
   for (const row of rows) {
+    // b.jg5 SRJ-205: a kill's version re-check decided that the server
+    // stops, so the sweep makes no further agent-director call.
+    if (stop.stopping) break
     const personaLabel = row.labels?.[PERSONA_LABEL_KEY]
     if (!personaLabel) {
-      if (await keepPrePersonaRow(client, row, result.prePersona)) {
+      if (await keepPrePersonaRow(client, row, result.prePersona, stop)) {
         killedPrePersonaRows.push({ id: row.claude_instance_id, state: row.state })
       }
       continue
@@ -8525,11 +8849,11 @@ export async function reconcileOrphans(
     console.error(
       `[slack] reconcileOrphans: sweeping row (${reason}) persona=${displayPersona} instanceId=${row.claude_instance_id} state=${row.state}${cwdDetail} — killing and deleting`,
     )
-    if (await killAndDeleteSweptRow(client, row, displayPersona)) result.killed++
+    if (await killAndDeleteSweptRow(client, row, displayPersona, persona?.key, stop)) result.killed++
     else result.failed++
   }
 
-  if (killedPrePersonaRows.length > 0) await reconcileKilledPrePersonaRows(client, killedPrePersonaRows)
+  if (killedPrePersonaRows.length > 0 && !stop.stopping) await reconcileKilledPrePersonaRows(client, killedPrePersonaRows)
 
   const { found, killed, failed, prePersona } = result
   console.error(

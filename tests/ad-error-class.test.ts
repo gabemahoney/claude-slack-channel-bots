@@ -4,7 +4,10 @@
  * predicate `isDifferentTmuxServerError` (b.jg5 SRJ-311, SRJ-1021), the
  * CONFLICT description accessor `conflictDescriptionOf` (b.jg5 SRJ-501,
  * SRJ-507; by class, so an `ErrUnknownErrorName` carrying the CONFLICT name,
- * UNAVAILABLE by SRJ-104, answers nothing), and the
+ * UNAVAILABLE by SRJ-104, answers nothing), the kill-failure description
+ * accessor `killFailedDescriptionOf` (b.jg5 SRJ-110, SRJ-702; by name, so an
+ * `ErrUnknownErrorName` carrying the `ErrTmuxKillFailed` name answers its
+ * envelope's description), and the
  * stub's error builders it is fed with (b.jg5 SRJ-1303; their shape checks
  * live here).
  *
@@ -51,6 +54,8 @@ import {
   hasAdErrorName,
   isDifferentTmuxServerError,
   isInvalidFlagsError,
+  killFailedDescriptionOf,
+  unclassifiedClassificationOf,
   type AdErrorClass,
   type AdErrorClassification,
   type AdVersionRecheckTrigger,
@@ -1258,6 +1263,163 @@ describe('conflictDescriptionOf', () => {
       expect({ label, value: snapshot(value) }).toEqual({ label, value: before })
     }
     expect(stubCallCount(log)).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// killFailedDescriptionOf (b.jg5 SRJ-110, SRJ-702)
+// ---------------------------------------------------------------------------
+
+/** The ROWS labels that build an `ErrTmuxKillFailed` by name: the four descriptions and the `ErrUnknownErrorName` envelope form. */
+const KILL_FAILED_ROW_LABELS: ReadonlySet<string> = new Set([
+  ...KILL_FAILED_DESCRIPTIONS.map((d) => `errTmuxKillFailed (${d})`),
+  `errUnknownErrorName with the Phase-1-only name ${ERR_TMUX_KILL_FAILED_NAME}`,
+])
+
+/** An `ErrUnknownErrorName` carrying the `ErrTmuxKillFailed` name and the stub's description `d` in its envelope. */
+function unknownNamedKillFailed(d: (typeof KILL_FAILED_DESCRIPTIONS)[number], sessionName = STUB_TMUX_SESSION_NAME): ErrUnknownErrorName {
+  return errUnknownErrorName(ERR_TMUX_KILL_FAILED_NAME, errTmuxKillFailed(sessionName, d).errDescription)
+}
+
+describe('killFailedDescriptionOf', () => {
+  test.each([...KILL_FAILED_DESCRIPTIONS])('errTmuxKillFailed (%s) answers its own errDescription, read from the value', (d) => {
+    for (const sessionName of [STUB_TMUX_SESSION_NAME, OTHER_SESSION_NAME]) {
+      const value = errTmuxKillFailed(sessionName, d)
+      const expected = value.errDescription
+      expect(expected).toContain(JSON.stringify(sessionName))
+      expect(killFailedDescriptionOf(value)).toBe(expected)
+    }
+  })
+
+  test.each([...KILL_FAILED_DESCRIPTIONS])(
+    'an ErrUnknownErrorName whose unknownName is ErrTmuxKillFailed, carrying the %s description, answers the envelope description, not its own errDescription',
+    (d) => {
+      const value = unknownNamedKillFailed(d, OTHER_SESSION_NAME)
+      const expected = (value.envelope as { err_description: string }).err_description
+      // Precondition: the envelope holds the stub's description and the client's own text differs.
+      expect(expected).toBe(errTmuxKillFailed(OTHER_SESSION_NAME, d).errDescription)
+      expect(value.errDescription).not.toBe(expected)
+      expect(killFailedDescriptionOf(value)).toBe(expected)
+    },
+  )
+
+  test.each(
+    ROWS.filter(([label]) => !KILL_FAILED_ROW_LABELS.has(label)).map(([label, build, expected]) => [label, expected, build] as const),
+  )('%s (%s) answers nothing', (_label, _expected, build) => {
+    expect(killFailedDescriptionOf(build())).toBeUndefined()
+  })
+
+  test.each<Built>([
+    ['ErrTmuxSessionConflict (kill, not-this-launch)', () => baseError(ERR_TMUX_SESSION_CONFLICT_NAME, errTmuxKillFailed().errDescription)],
+    ['ErrTmuxUnresponsive', () => baseError(ERR_TMUX_UNRESPONSIVE_NAME, errTmuxKillFailed().errDescription)],
+    ['ErrSpawnNotFound', () => baseError(ERR_SPAWN_NOT_FOUND_NAME, errTmuxKillFailed().errDescription)],
+    ['an ErrInternal (envelope description)', () => errInternal(errTmuxKillFailed().errDescription)],
+    ['an ErrUnknownErrorName of another name', () => errUnknownErrorName('ErrFromALaterBinary', errTmuxKillFailed().errDescription)],
+  ])('%s carrying a kill-failure description answers nothing: the name decides, never the words', (_label, build) => {
+    expect(killFailedDescriptionOf(build())).toBeUndefined()
+  })
+
+  test.each<Built>([
+    ['an Error named ErrTmuxKillFailed whose message is a kill-failure description', () => Object.assign(plainErrorNamed(ERR_TMUX_KILL_FAILED_NAME), { message: errTmuxKillFailed().errDescription })],
+    ['an object shaped like an ErrTmuxKillFailed', () => ({ verb: 'kill', errName: ERR_TMUX_KILL_FAILED_NAME, errDescription: errTmuxKillFailed().errDescription, name: ERR_TMUX_KILL_FAILED_NAME })],
+    ['a kill-failure description string itself', () => errTmuxKillFailed().errDescription],
+    ['undefined', () => undefined],
+    ['null', () => null],
+  ])('%s is not an agent-director error: nothing, and nothing throws', (_label, build) => {
+    const value = build()
+    expect(() => killFailedDescriptionOf(value)).not.toThrow()
+    expect(killFailedDescriptionOf(value)).toBeUndefined()
+  })
+
+  test.each<Built>([
+    ['an errName getter that throws', () => Object.defineProperty(errTmuxKillFailed(), 'errName', { get: () => { throw new Error('boom') } })],
+    ['an errDescription getter that throws', () => Object.defineProperty(errTmuxKillFailed(), 'errDescription', { get: () => { throw new Error('boom') } })],
+    ['an errDescription that is not a string', () => Object.defineProperty(errTmuxKillFailed(), 'errDescription', { value: 42 })],
+    ['an envelope getter that throws', () => Object.defineProperty(unknownNamedKillFailed('outlived-exit-wait'), 'envelope', { get: () => { throw new Error('boom') } })],
+    ['an envelope with no description', () => Object.defineProperty(unknownNamedKillFailed('outlived-exit-wait'), 'envelope', { value: { err_name: ERR_TMUX_KILL_FAILED_NAME } })],
+    ['a proxy whose every trap throws', hostileProxy],
+    ['a proxy over an ErrTmuxKillFailed whose every read throws', () => new Proxy(errTmuxKillFailed(), { get: () => { throw new Error('boom') } })],
+  ])('%s answers nothing, and nothing throws', (_label, build) => {
+    const value = build()
+    expect(() => killFailedDescriptionOf(value)).not.toThrow()
+    expect(killFailedDescriptionOf(value)).toBeUndefined()
+  })
+
+  test('the description comes back raw: not redacted, not put on one line, not capped', () => {
+    const description = `${RETRY_KILL_LATER_PHRASE}\n${sentinelInMessage('kill')}\r\n${'x'.repeat(MAX_LOGGED_MESSAGE_LENGTH)} ${NEVER_DELETE_ROW_PHRASE}`
+    expect(killFailedDescriptionOf(baseError(ERR_TMUX_KILL_FAILED_NAME, description))).toBe(description)
+    expect(killFailedDescriptionOf(errUnknownErrorName(ERR_TMUX_KILL_FAILED_NAME, description))).toBe(description)
+  })
+
+  test('reading the description changes no value and makes no agent-director call', () => {
+    const log = makeStubCallLog()
+    setClientForTests(makeStubClient(log) as unknown as Parameters<typeof setClientForTests>[0])
+    for (const d of KILL_FAILED_DESCRIPTIONS) {
+      for (const value of [errTmuxKillFailed(STUB_TMUX_SESSION_NAME, d), unknownNamedKillFailed(d)]) {
+        const before = snapshot(value)
+        const first = killFailedDescriptionOf(value)
+        expect({ d, same: killFailedDescriptionOf(value) }).toEqual({ d, same: first })
+        expect({ d, value: snapshot(value) }).toEqual({ d, value: before })
+      }
+    }
+    expect(stubCallCount(log)).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// unclassifiedClassificationOf (b.jg5 SRJ-104, SRJ-110): the UNCLASSIFIED
+// classification a kill site reports for a class it has no row for
+// ---------------------------------------------------------------------------
+
+describe('unclassifiedClassificationOf (b.jg5 SRJ-104, SRJ-110)', () => {
+  test.each<[string, () => AgentDirectorError & { errName: string; errDescription: string }, AdErrorClass]>([
+    ['errInstanceIdCollision', () => errInstanceIdCollision(), AD_ERROR_CLASS_STATE],
+    ['errSpawnNotResumable', () => errSpawnNotResumable(), AD_ERROR_CLASS_STATE],
+    ['errTmuxSessionCreate', () => errTmuxSessionCreate('kill'), AD_ERROR_CLASS_LAUNCH_FAILURE],
+    ['ErrCwdNotFound', () => clientError(ErrCwdNotFound, 'kill', 'cwd not found'), AD_ERROR_CLASS_DIRECTORY],
+  ])('%s (classified %s) → UNCLASSIFIED, carrying its errName and its description', (_label, build, classified) => {
+    const value = build()
+    // Precondition: the classifier gives it another class.
+    expect(classifyAdError(value).errorClass).toBe(classified)
+    expect(unclassifiedClassificationOf(value)).toEqual({
+      errorClass: AD_ERROR_CLASS_UNCLASSIFIED,
+      reportedName: value.errName,
+      message: value.errDescription,
+    })
+  })
+
+  test('an ErrInvalidFlags → the same classification the ErrInvalidFlags step gives', () => {
+    expect(unclassifiedClassificationOf(errInvalidFlags())).toEqual(expectedInvalidFlagsClassification())
+  })
+
+  test('an ErrUnknownErrorName → its unknownName and the envelope description, not the client\'s own text', () => {
+    const value = errUnknownErrorName('ErrFromALaterBinary', 'a later binary\'s description')
+    expect(unclassifiedClassificationOf(value)).toEqual({
+      errorClass: AD_ERROR_CLASS_UNCLASSIFIED,
+      reportedName: value.unknownName,
+      message: (value.envelope as { err_description: string }).err_description,
+    })
+  })
+
+  test('a description carrying a token and a ticket URL comes out redacted, on one line', () => {
+    const classification = unclassifiedClassificationOf(errGeneric('kill', 'ErrKillBroken', `line one\n${sentinelInMessage('unclassified')}`))
+    expect(classification.message).toContain(REDACTED_SENTINEL_TAIL)
+    expect(classification.message).not.toMatch(/[\r\n]/)
+    assertNoLeak({ classification })
+  })
+
+  test('an errName that is not a safe identifier is not reported; an empty description gives no message', () => {
+    expect(unclassifiedClassificationOf(errGeneric('kill', 'not a safe name', ''))).toEqual({ errorClass: AD_ERROR_CLASS_UNCLASSIFIED })
+  })
+
+  test.each<Built>([
+    ['a plain Error', () => new Error('boom')],
+    ['undefined', () => undefined],
+    ['a proxy whose every trap throws', hostileProxy],
+  ])('%s → UNCLASSIFIED alone, and nothing throws', (_label, build) => {
+    const value = build()
+    expect(() => unclassifiedClassificationOf(value)).not.toThrow()
+    expect(unclassifiedClassificationOf(value)).toEqual({ errorClass: AD_ERROR_CLASS_UNCLASSIFIED })
   })
 })
 

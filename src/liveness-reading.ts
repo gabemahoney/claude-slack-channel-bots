@@ -14,7 +14,10 @@
  *            (the adapter decides those errors); the last reads no row, so
  *            its reading carries the source `install-gone`
  *            (`isInstallGoneDeadReading`), which the slow-recovery count
- *            tells apart from a row read (b.jg5 SRJ-610)
+ *            tells apart from a row read (b.jg5 SRJ-610); a row read's
+ *            reading carries what it read (`rowRead`: `ended`, `missing`
+ *            or `no-row`, `deadRowReadOf`), so the restart path's kill can
+ *            record the state its path last read in a latch (b.jg5 SRJ-501)
  *   unknown  any other `status` error, and any state string that is none of
  *            the above: agent-director could not report on the persona
  *
@@ -105,14 +108,28 @@ export interface PendingLivenessReading {
  */
 export const LIVENESS_DEAD_SOURCE_INSTALL_GONE = 'install-gone'
 
+/** A `dead` row read's `rowRead`: the row read `ended`. */
+export const LIVENESS_DEAD_ROW_ENDED = 'ended'
+/** A `dead` row read's `rowRead`: the row read `missing`. */
+export const LIVENESS_DEAD_ROW_MISSING = 'missing'
+/** A `dead` row read's `rowRead`: the read answered `ErrSpawnNotFound`, no row. */
+export const LIVENESS_DEAD_ROW_NO_ROW = 'no-row'
+
+/** What a `dead` row read found (b.jg5 SRJ-501: the state the path last read). */
+export type DeadRowRead = typeof LIVENESS_DEAD_ROW_ENDED | typeof LIVENESS_DEAD_ROW_MISSING | typeof LIVENESS_DEAD_ROW_NO_ROW
+
 /**
  * The `dead` reading. `source` is `LIVENESS_DEAD_SOURCE_INSTALL_GONE` when the
  * reading came from `ErrSystemInstallDisappeared`; absent for a row read
- * (`ended`, `missing`, `ErrSpawnNotFound`).
+ * (`ended`, `missing`, `ErrSpawnNotFound`). `rowRead` is what a row read
+ * found (`ended`, `missing`, or `no-row` for `ErrSpawnNotFound`); absent when
+ * no row was read (`ErrSystemInstallDisappeared`, or a reading made with no
+ * `status` call).
  */
 export interface DeadLivenessReading {
   readonly kind: typeof LIVENESS_DEAD
   readonly source?: typeof LIVENESS_DEAD_SOURCE_INSTALL_GONE
+  readonly rowRead?: DeadRowRead
 }
 
 /** The `unknown` reading. */
@@ -131,8 +148,23 @@ export type LivenessReading =
 export const LIVENESS_READING_LIVE: LiveLivenessReading = Object.freeze({ kind: LIVENESS_LIVE })
 /** The `pending` reading with no launch start, as a value. */
 export const LIVENESS_READING_PENDING: PendingLivenessReading = Object.freeze({ kind: LIVENESS_PENDING })
-/** The `dead` reading of a row read, as a value. */
+/** The `dead` reading with no row state read (no `status` call was made), as a value. */
 export const LIVENESS_READING_DEAD: DeadLivenessReading = Object.freeze({ kind: LIVENESS_DEAD })
+/** The `dead` reading of a row read `ended`, as a value. */
+export const LIVENESS_READING_DEAD_ENDED: DeadLivenessReading = Object.freeze({
+  kind: LIVENESS_DEAD,
+  rowRead: LIVENESS_DEAD_ROW_ENDED,
+})
+/** The `dead` reading of a row read `missing`, as a value. */
+export const LIVENESS_READING_DEAD_MISSING: DeadLivenessReading = Object.freeze({
+  kind: LIVENESS_DEAD,
+  rowRead: LIVENESS_DEAD_ROW_MISSING,
+})
+/** The `dead` reading of a `status` that answered `ErrSpawnNotFound` (no row), as a value. */
+export const LIVENESS_READING_DEAD_NO_ROW: DeadLivenessReading = Object.freeze({
+  kind: LIVENESS_DEAD,
+  rowRead: LIVENESS_DEAD_ROW_NO_ROW,
+})
 /** The `dead` reading from `ErrSystemInstallDisappeared`, which reads no row, as a value. */
 export const LIVENESS_READING_DEAD_INSTALL_GONE: DeadLivenessReading = Object.freeze({
   kind: LIVENESS_DEAD,
@@ -150,14 +182,16 @@ const KINDS: ReadonlySet<unknown> = new Set<unknown>(LIVENESS_KINDS)
 /**
  * The reading for a row state `status` answered: `pending` gives `pending`;
  * every other state in `AGENT_DIRECTOR_LIVE_STATES` gives `live`; `ended` and
- * `missing` give `dead`; any other value gives `unknown` (SRJ-314's `dead`
+ * `missing` (`AGENT_DIRECTOR_DEAD_STATES`) give `dead` carrying that state as
+ * its `rowRead`; any other value gives `unknown` (SRJ-314's `dead`
  * list is closed, so a state CSCB does not know is never read as dead).
  */
 export function livenessReadingForState(state: unknown): LivenessReading {
   if (typeof state !== 'string') return LIVENESS_READING_UNKNOWN
   if (state === AGENT_DIRECTOR_PENDING_STATE) return LIVENESS_READING_PENDING
   if (AGENT_DIRECTOR_LIVE_STATES.has(state)) return LIVENESS_READING_LIVE
-  if (AGENT_DIRECTOR_DEAD_STATES.has(state)) return LIVENESS_READING_DEAD
+  if (state === LIVENESS_DEAD_ROW_ENDED) return LIVENESS_READING_DEAD_ENDED
+  if (state === LIVENESS_DEAD_ROW_MISSING) return LIVENESS_READING_DEAD_MISSING
   return LIVENESS_READING_UNKNOWN
 }
 
@@ -188,6 +222,40 @@ export function isInstallGoneDeadReading(reading: unknown): boolean {
     return (reading as { readonly source?: unknown }).source === LIVENESS_DEAD_SOURCE_INSTALL_GONE
   } catch {
     return false
+  }
+}
+
+/**
+ * What a probe's `dead` row read found (`rowRead`: `ended`, `missing` or
+ * `no-row`); `undefined` for any other answer, a `dead` reading that read no
+ * row included. Never throws.
+ */
+export function deadRowReadOf(reading: unknown): DeadRowRead | undefined {
+  try {
+    if (livenessKindOf(reading) !== LIVENESS_DEAD) return undefined
+    const rowRead = (reading as { readonly rowRead?: unknown }).rowRead
+    return rowRead === LIVENESS_DEAD_ROW_ENDED || rowRead === LIVENESS_DEAD_ROW_MISSING || rowRead === LIVENESS_DEAD_ROW_NO_ROW
+      ? rowRead
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The `dead` reading carrying `rowRead` (one of the frozen values), or
+ * `LIVENESS_READING_DEAD` when there is none.
+ */
+export function deadLivenessReading(rowRead?: DeadRowRead): DeadLivenessReading {
+  switch (rowRead) {
+    case LIVENESS_DEAD_ROW_ENDED:
+      return LIVENESS_READING_DEAD_ENDED
+    case LIVENESS_DEAD_ROW_MISSING:
+      return LIVENESS_READING_DEAD_MISSING
+    case LIVENESS_DEAD_ROW_NO_ROW:
+      return LIVENESS_READING_DEAD_NO_ROW
+    default:
+      return LIVENESS_READING_DEAD
   }
 }
 

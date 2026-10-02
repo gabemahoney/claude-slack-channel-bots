@@ -18,7 +18,9 @@
  *   hold it open or make it fail (a throwing hook: not recorded);
  * - the real restart and backoff state, with `initRestart` given
  *   `makeRestartDeps`: every liveness probe answers the `dead` reading
- *   (`LIVENESS_READING_DEAD`, src/liveness-reading.ts), launches are recorded in
+ *   (`LIVENESS_READING_DEAD`, src/liveness-reading.ts), the kill answers the
+ *   success outcome (`killed`, `kill_sent: true`, src/checked-kill.ts), so the
+ *   launch follows it (b.jg5 SRJ-701), launches are recorded in
  *   `h.launches`, every relaunch-gate ask (`canRestart`, made when a restart
  *   is scheduled and when its timer fires) in `h.restartAsks`, and the restart
  *   delay is read from `h.restartDelayS` at call time. `launchSession`
@@ -190,6 +192,7 @@ import {
   type RestartDeps,
 } from '../../src/restart.ts'
 import { LIVENESS_READING_DEAD, type LivenessReading } from '../../src/liveness-reading.ts'
+import { KILL_OUTCOME_KILLED } from '../../src/checked-kill.ts'
 import { _resetBackoffState, isAtCap, recordFailure } from '../../src/backoff.ts'
 import { LATCH_ROW_STATE_NO_ROW, REFUSED_OPERATION_PLAIN_SPAWN } from '../../src/conflict-latch.ts'
 import { createPersonaUpPredicate } from '../../src/persona-start.ts'
@@ -506,7 +509,9 @@ export interface RestartFakeCaptures {
 }
 
 /**
- * Restart deps whose session always reads `dead`, whose launches are recorded
+ * Restart deps whose session always reads `dead`, whose kill answers the
+ * success outcome (`killed` with `kill_sent: true`, `src/checked-kill.ts`; b.jg5
+ * SRJ-701: only a success lets the launch follow), whose launches are recorded
  * in `launches` (and counted in flight until their outcome settles) and whose
  * relaunch-gate asks are recorded in `restartAsks`.
  */
@@ -527,7 +532,7 @@ export function makeRestartDeps(opts: RestartFakeOptions = {}): RestartDeps & Re
     isSessionConnected: () => false,
     hasSessionStream: () => false,
     reconnectSession: async () => 'success',
-    killSession: async () => {},
+    killSession: async () => ({ kind: KILL_OUTCOME_KILLED, killSent: true }),
     launchSession: async (key, cwd, sessionId) => {
       launches.push(sessionId === undefined ? { key, cwd } : { key, cwd, sessionId })
       inFlight.set(key, (inFlight.get(key) ?? 0) + 1)

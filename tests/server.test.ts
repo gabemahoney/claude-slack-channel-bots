@@ -11,11 +11,15 @@ import type { Client } from 'agent-director'
 import {
   AD_CALL_KILL_ROW_READ_LIVE,
   AD_ERROR_CLASS_CONFIG,
+  AD_ERROR_CLASS_CONFLICT,
+  AD_ERROR_CLASS_DIRECTORY,
   AD_ERROR_CLASS_ENVIRONMENT,
   AD_ERROR_CLASS_GONE,
+  AD_ERROR_CLASS_LAUNCH_FAILURE,
   AD_ERROR_CLASS_STATE,
   AD_ERROR_CLASS_UNAVAILABLE,
   AD_ERROR_CLASS_UNCLASSIFIED,
+  AD_ERROR_CLASS_UNUSABLE_NAME,
   CSCB_UNKNOWN_ERROR_NAME,
   describeAgentDirectorFailure,
   type AdErrorClass,
@@ -32,21 +36,31 @@ import {
   AGENT_DIRECTOR_DEAD_STATES,
   AGENT_DIRECTOR_LIVE_STATES,
   AGENT_DIRECTOR_PENDING_STATE,
+  LIVENESS_DEAD_ROW_ENDED,
+  LIVENESS_DEAD_ROW_MISSING,
+  LIVENESS_DEAD_ROW_NO_ROW,
   LIVENESS_READING_DEAD,
+  LIVENESS_READING_DEAD_ENDED,
   LIVENESS_READING_DEAD_INSTALL_GONE,
+  LIVENESS_READING_DEAD_MISSING,
+  LIVENESS_READING_DEAD_NO_ROW,
   LIVENESS_READING_LIVE,
   LIVENESS_READING_PENDING,
   LIVENESS_READING_UNKNOWN,
   LIVENESS_PENDING,
+  deadLivenessReading,
+  deadRowReadOf,
   isInstallGoneDeadReading,
   launchStartOfReading,
   livenessKindOf,
   livenessReadingForStatus,
   pendingLaunchStartOf,
   pendingLivenessReading,
+  type DeadLivenessReading,
+  type DeadRowRead,
   type LivenessReading,
 } from '../src/liveness-reading.ts'
-import type { Phase1StatusResult } from '../src/ad-phase1-types.ts'
+import type { Phase1KillResult, Phase1StatusResult } from '../src/ad-phase1-types.ts'
 import {
   ALL_CLEAR_TEMPLATE,
   ONSET_TEMPLATES,
@@ -70,6 +84,7 @@ import {
   cannedOk,
   cannedFindMissing,
   cannedGetResult,
+  cannedKillResult,
   cannedStatusResult,
   makeCloseCountingStubClient,
   makeStubCallLog,
@@ -80,6 +95,7 @@ import {
   errCallTimeout,
   errConfigMalformed,
   errGeneric,
+  errInstanceIdCollision,
   errInternal,
   errInvalidFlags,
   errSchemaMismatch,
@@ -92,6 +108,7 @@ import {
   errTmuxNotAvailable,
   errTmuxNotAvailableDifferentServer,
   errTmuxSendKeys,
+  errTmuxSessionCreate,
   errTmuxUnresponsive,
   errUnknownErrorName,
   errUnusableName,
@@ -109,11 +126,19 @@ import {
   unavailableForms,
 } from './test-helpers/agent-director-stub.ts'
 import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
-import { installAdVersionRecheck, resetAdVersionRecheckForTests } from '../src/ad-version-gate.ts'
+import {
+  RECHECK_OUTCOME_PASS,
+  RECHECK_OUTCOME_STOP,
+  installAdVersionRecheck,
+  resetAdVersionRecheckForTests,
+} from '../src/ad-version-gate.ts'
+import { ErrCwdNotFound } from '../src/agent-director-errors.ts'
 import { _resetBackoffState, getFailureCount } from '../src/backoff.ts'
 import {
   NO_LAUNCH_START_FORMS,
   NO_LAUNCH_START_FORM_NAMES,
+  RESTART_KILL_CONFLICT_CASE_ROWS,
+  RESTART_KILL_UNUSABLE_NAME_CASE_ROWS,
   UNUSABLE_NAME_CASE_ROWS,
   conflictForPersona,
   conflictNoticeForPersona,
@@ -192,6 +217,9 @@ import {
 import {
   LATCH_CASE_LAUNCH_START_NOT_RECORDED,
   LATCH_ROW_STATE_NO_ROW,
+  LATCH_ROW_STATE_UNREADABLE,
+  REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
+  REFUSED_OPERATION_NONE,
   REFUSED_OPERATION_PLAIN_SPAWN,
   bindConflictNotice,
   createConflictLatch,
@@ -200,10 +228,21 @@ import {
   launchStartNotRecordedNoticeText,
   type ConflictLatch,
   type ConflictLatchRecord,
+  type LatchRowState,
 } from '../src/conflict-latch.ts'
 import { createPersonaEpisodes, type PersonaEpisodes } from '../src/persona-episodes.ts'
+import {
+  KILL_OUTCOME_KILLED,
+  KILL_OUTCOME_NOT_KILLED,
+  KILL_OUTCOME_ROW_GONE,
+  KILL_OUTCOME_SESSION_GONE,
+  describeKillOutcome,
+  killOutcomeStopsServer,
+  type KillFailure,
+  type KillOutcome,
+} from '../src/checked-kill.ts'
 import type { ClientOptions, FindMissingParams, FindMissingResult, GetParams, KillParams, ReadPaneParams, ReadPaneResult, ResumeParams, SendKeysParams, SendKeysResult, SpawnParams, StatusParams } from 'agent-director'
-import { KILL_SESSION_REFUSED, RECONNECT_ESCALATE_DEAD_NO_KILL, type KillSessionResult } from '../src/restart.ts'
+import { KILL_SESSION_NOT_KILLED_GUARD, RECONNECT_ESCALATE_DEAD_NO_KILL, type KillSessionResult } from '../src/restart.ts'
 import {
   UNAVAILABLE_RETRY_CAUSE_CONFIG,
   UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
@@ -551,10 +590,19 @@ describe('sanitizeFilename', () => {
 const LIVE_NOT_PENDING_STATES = [...AGENT_DIRECTOR_LIVE_STATES].filter((s) => s !== AGENT_DIRECTOR_PENDING_STATE)
 /** A state string CSCB does not know (from a later binary). */
 const UNRECOGNISED_STATE = 'a-state-from-a-later-binary'
-/** Every state other than `pending`, with the reading it gives (b.jg5 SRJ-314). */
+/**
+ * The `dead` reading each dead state gives: it carries the state it read
+ * (b.jg5 SRJ-501: the state the path last read). A dead state missing here
+ * gives `undefined`, so its case fails.
+ */
+const DEAD_STATE_READING: Readonly<Record<string, DeadLivenessReading>> = {
+  [LIVENESS_DEAD_ROW_ENDED]: LIVENESS_READING_DEAD_ENDED,
+  [LIVENESS_DEAD_ROW_MISSING]: LIVENESS_READING_DEAD_MISSING,
+}
+/** Every state other than `pending`, with the reading it gives (b.jg5 SRJ-314, SRJ-501). */
 const NOT_PENDING_STATE_READINGS = [
   ...LIVE_NOT_PENDING_STATES.map((s) => [s, LIVENESS_READING_LIVE] as const),
-  ...[...AGENT_DIRECTOR_DEAD_STATES].map((s) => [s, LIVENESS_READING_DEAD] as const),
+  ...[...AGENT_DIRECTOR_DEAD_STATES].map((s) => [s, DEAD_STATE_READING[s]!] as const),
   [UNRECOGNISED_STATE, LIVENESS_READING_UNKNOWN] as const,
 ]
 /** The launch starts a `pending` row may show (ADSRD SR-22.2 forms). */
@@ -646,6 +694,47 @@ describe("liveness-reading: a pending row's launch start (b.jg5 SRJ-115)", () =>
 // from a row read's `dead`; only a row read of `ended` or `missing` ends a
 // slow-recovery episode.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// The `dead` reading's row read (b.jg5 SRJ-501): a row read's `dead` reading
+// carries what it read (`ended`, `missing`, or no row for `ErrSpawnNotFound`),
+// so the restart path's kill can record the state its path last read.
+// ---------------------------------------------------------------------------
+
+describe("liveness-reading: the dead reading's row read (b.jg5 SRJ-501)", () => {
+  /** Each row read with its frozen reading. */
+  const ROW_READS: ReadonlyArray<readonly [DeadRowRead, DeadLivenessReading]> = [
+    [LIVENESS_DEAD_ROW_ENDED, LIVENESS_READING_DEAD_ENDED],
+    [LIVENESS_DEAD_ROW_MISSING, LIVENESS_READING_DEAD_MISSING],
+    [LIVENESS_DEAD_ROW_NO_ROW, LIVENESS_READING_DEAD_NO_ROW],
+  ]
+
+  test.each(ROW_READS)('row read %s: deadLivenessReading gives its frozen dead reading, and deadRowReadOf reads it back', (rowRead, reading) => {
+    expect(deadLivenessReading(rowRead)).toBe(reading)
+    expect(Object.isFrozen(reading)).toBe(true)
+    expect(livenessKindOf(reading)).toBe(livenessKindOf(LIVENESS_READING_DEAD))
+    expect(deadRowReadOf(reading)).toBe(rowRead)
+    expect(isInstallGoneDeadReading(reading)).toBe(false)
+  })
+
+  test('no row read: deadLivenessReading gives the plain dead reading, which carries no row read', () => {
+    expect(deadLivenessReading()).toBe(LIVENESS_READING_DEAD)
+    expect(deadRowReadOf(LIVENESS_READING_DEAD)).toBeUndefined()
+  })
+
+  test.each<[string, unknown]>([
+    ['the install-gone dead reading (it reads no row)', LIVENESS_READING_DEAD_INSTALL_GONE],
+    ['a live reading carrying a row read', { ...LIVENESS_READING_LIVE, rowRead: LIVENESS_DEAD_ROW_ENDED }],
+    ['an unknown reading carrying a row read', { ...LIVENESS_READING_UNKNOWN, rowRead: LIVENESS_DEAD_ROW_MISSING }],
+    ['a dead reading carrying a row read CSCB does not know', { ...LIVENESS_READING_DEAD, rowRead: 'a-later-state' }],
+    ['a dead reading whose rowRead getter throws', Object.defineProperty({ kind: LIVENESS_READING_DEAD.kind }, 'rowRead', { get(): never { throw new Error('boom') } })],
+    ['null', null],
+    ['the row read as a bare string', LIVENESS_DEAD_ROW_ENDED],
+  ])('deadRowReadOf(%s) → none, and nothing throws', (_label, value) => {
+    expect(() => deadRowReadOf(value)).not.toThrow()
+    expect(deadRowReadOf(value)).toBeUndefined()
+  })
+})
 
 describe("liveness-reading: the dead reading's install-gone source", () => {
   test('LIVENESS_READING_DEAD_INSTALL_GONE is a frozen dead reading, told apart from the row read\'s dead', () => {
@@ -886,7 +975,7 @@ describe('_buildIsSessionAliveAdapter', () => {
 
   // b.jg5 SRJ-312: agent-director answered but tmux did not, so an
   // ErrSpawnNotFound clears `ad-unreachable` only.
-  test('2. ErrSpawnNotFound (b.jg5 SRJ-312): status throws with both flags raised → clears ad-unreachable only; tmux-unavailable stays raised, no all-clear; reads dead', async () => {
+  test('2. ErrSpawnNotFound (b.jg5 SRJ-312, SRJ-501): status throws with both flags raised → clears ad-unreachable only; tmux-unavailable stays raised, no all-clear; reads dead, carrying no row as what it read', async () => {
     const { emissions, statusCalls, triggers, cleared, adapter } = makeHarness(errSpawnNotFound())
     setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
     setOutageFlag('C1', 'tmux-unavailable')
@@ -894,7 +983,7 @@ describe('_buildIsSessionAliveAdapter', () => {
 
     const result = await adapter('C1')
 
-    expect(result).toEqual(LIVENESS_READING_DEAD)
+    expect(result).toEqual(LIVENESS_READING_DEAD_NO_ROW)
     expect(isInstallGoneDeadReading(result)).toBe(false)
     expect(statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
     expect([...getOutageFlags('C1')]).toEqual(['tmux-unavailable'])
@@ -904,14 +993,14 @@ describe('_buildIsSessionAliveAdapter', () => {
   })
 
   // Twin of case 2 (b.jg5 SRJ-312): the `ad-unreachable` clear stays pinned.
-  test('2b. ErrSpawnNotFound (b.jg5 SRJ-312): status throws with only ad-unreachable raised → clears it; one all-clear posted; reads dead', async () => {
+  test('2b. ErrSpawnNotFound (b.jg5 SRJ-312, SRJ-501): status throws with only ad-unreachable raised → clears it; one all-clear posted; reads dead, carrying no row', async () => {
     const { emissions, cleared, adapter } = makeHarness(errSpawnNotFound())
     setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
     const before = emissions.length
 
     const result = await adapter('C1')
 
-    expect(result).toEqual(LIVENESS_READING_DEAD)
+    expect(result).toEqual(LIVENESS_READING_DEAD_NO_ROW)
     expect(getOutageFlags('C1').size).toBe(0)
     expect(cleared).toEqual([{ key: 'C1', cls: 'ad-unreachable' }])
     expect(emissions.slice(before)).toEqual([{ key: 'C1', text: adUnreachableAllClear('/bin/ad') }])
@@ -1061,7 +1150,7 @@ describe('_buildIsSessionAliveAdapter', () => {
   // clears that one) the clear is silent. The reading is unchanged.
   test.each([
     ['a successful status (a live state)', undefined, LIVENESS_READING_LIVE],
-    ['ErrSpawnNotFound', errSpawnNotFound, LIVENESS_READING_DEAD],
+    ['ErrSpawnNotFound', errSpawnNotFound, LIVENESS_READING_DEAD_NO_ROW],
   ].flatMap(([label, build, reading]) => [
     [label, build, reading, false],
     [label, build, reading, true],
@@ -1230,6 +1319,8 @@ describe('_buildIsSessionAliveAdapter', () => {
 
     expect(result).toEqual(LIVENESS_READING_DEAD)
     expect(isInstallGoneDeadReading(result)).toBe(false)
+    // b.jg5 SRJ-501: no status call, so the reading carries no row read.
+    expect(deadRowReadOf(result)).toBeUndefined()
     expect(statusCalls).toHaveLength(0)
     // No probe ran, so nothing was cleared and no all-clear was posted.
     expect(getOutageFlags('C9').has('ad-unreachable')).toBe(true)
@@ -4138,28 +4229,45 @@ describe('b.jg5 SRJ-115, SRJ-512, SRJ-513: a latching own-row status at the live
 })
 
 // ---------------------------------------------------------------------------
-// _buildKillSessionAdapter: an UNAVAILABLE kill is a refusal (b.jg5 SRJ-105)
+// _buildKillSessionAdapter: the checked kill's outcome (b.jg5 SRJ-110, SRJ-701)
 //
 // The restart work's kill adapter, run inside a recovery attempt for the
-// persona as `runRestartWork` runs it. An UNAVAILABLE kill (by name,
-// `ErrTmuxKillFailed` included) answers `KILL_SESSION_REFUSED` with one
-// described line, so the restart work launches nothing; so does an
-// ENVIRONMENT kill (`ErrTmuxNotAvailable`, b.jg5 SRJ-311), which also raises
-// `tmux-unavailable`, and a CONFIG kill (`ErrConfigMalformed`, b.jg5
-// SRJ-316), which also raises `ad-config-malformed`, and an UNCLASSIFIED
-// kill (b.jg5 SRJ-313: an `ErrInternal`, a store-open name, a name CSCB gives
-// no handling, `ErrSystemInstallDisappeared`, which also raises
-// `ad-unreachable`), which the wrapper reports to the unclassified sink;
-// success and `ErrSpawnNotFound` answer nothing ("go on"), and so does every
-// other class, with one error line. The kill follows a `dead`
-// reading, so it is declared as not of a row read live: not tmux-touching, it
-// never starts (or, on success, ends) the `tmux-unresponsive` condition. The
-// outage state's trigger and condition sinks are spies.
+// persona as `runRestartWork` runs it. It makes one checked kill and answers
+// its outcome, `kill_sent` included, with one line naming it; nothing is
+// swallowed. A success (`kill_sent` true, false or absent) and
+// `ErrSpawnNotFound` arm nothing. An UNAVAILABLE kill (by name,
+// `ErrTmuxKillFailed` included, told apart) arms the timer (b.jg5 SRJ-105); an
+// ENVIRONMENT kill (`ErrTmuxNotAvailable`, b.jg5 SRJ-311) also raises
+// `tmux-unavailable`, a CONFIG kill (`ErrConfigMalformed`, b.jg5 SRJ-316)
+// `ad-config-malformed`; an UNCLASSIFIED kill (b.jg5 SRJ-313:
+// `ErrSystemInstallDisappeared`, which also raises `ad-unreachable`,
+// included) is reported to the unclassified sink. GONE is the session-gone
+// success (b.jg5 SRJ-104: for `kill`, gone is success). A class SRJ-110 has
+// no row for (a STATE name other than `ErrSpawnNotFound`, LAUNCH FAILURE,
+// DIRECTORY) is the UNCLASSIFIED non-success, reported as UNCLASSIFIED: the
+// timer armed with the UNCLASSIFIED cause and the unclassified sink fed once
+// (b.jg5 SRJ-105, SRJ-313). An `ErrInvalidFlags` gets one immediate version
+// re-check first (b.jg5 SRJ-104, SRJ-204); a stop it decides is answered with
+// nothing armed, reported or latched (b.jg5 SRJ-205). A CONFLICT (the case
+// table's restart-kill rows) latches the persona through the latch's CONFLICT
+// entry with the refused operation "P's next check or recovery", and an
+// UNUSABLE NAME through E16's entry, each recording the state the run's
+// `dead` reading carries (the adapter's `lastRead`: `ended`, `missing` or no
+// row), with no further `status` read; only the install-gone reading, which
+// carries none, leads to the one latch-time `status` read (b.jg5 SRJ-501;
+// E13, E16 hatch notes). The kill follows a `dead` reading, so
+// it is declared as not of a row read live: not tmux-touching, it never
+// starts (or, on success, ends) the `tmux-unresponsive` condition. The guards
+// (a launch in flight, an unresolvable `claude_config_dir`) make no call and
+// answer the guard result. The outage state's sinks are spies; the server's
+// latch is installed with C1 configured, its notice bound to recorded
+// episodes.
 // ---------------------------------------------------------------------------
 
-describe('_buildKillSessionAdapter: an UNAVAILABLE kill is a refusal (b.jg5 SRJ-105)', () => {
+describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, SRJ-701)', () => {
   let dir: string
   let killCalls: KillParams[]
+  let statusCalls: StatusParams[]
   let triggers: Array<{ key: string; kind: string }>
   let starts: Array<{ key: string; verb: string }>
   let ends: string[]
@@ -4168,15 +4276,33 @@ describe('_buildKillSessionAdapter: an UNAVAILABLE kill is a refusal (b.jg5 SRJ-
   let reports: Array<{ key: string; same: boolean }>
   /** The error the stub's `kill` answers, for `reports`. */
   let killErr: Error | undefined
+  let latch: ConflictLatch
+  let latchLines: string[]
+  /** Every latch notice the episodes' sink received. */
+  let posts: Array<{ key: string; text: string }>
+  let unbindNotice: () => void
+  /** Every `console.error` argument list the case captured, for the leak check. */
+  let captured: unknown[][]
 
-  /** The adapter's refusal line for persona C1. */
-  const refusedLine = (err: unknown): string =>
-    `[slack] killSession (restart adapter): kill refused for persona=C1: ${describeAgentDirectorFailure(err)} — no relaunch follows (b.jg5 SRJ-105)`
+  /** The adapter's one line naming C1's kill outcome. */
+  const killLine = (outcome: KillOutcome): string =>
+    `[slack] killSession (restart adapter): kill for persona=C1: ${describeKillOutcome(outcome)}`
 
-  /** Install a stub whose `kill` answers `killError` (default: success), with spy sinks. */
-  function install(killError?: Error): StubClient {
+  /**
+   * Install a stub whose `kill` answers `killError` (else `killResult`), whose
+   * `status` throws `statusError` (else reads C1's row `ended`; the
+   * latch-time read, made only after an install-gone reading), with spy
+   * sinks.
+   */
+  function install(killError?: Error, killResult: Phase1KillResult = cannedKillResult(true), statusError?: Error): StubClient {
     killErr = killError
-    const stub = makeStubClient({ killCalls, killError })
+    const stub = makeStubClient({
+      killCalls,
+      statusCalls,
+      killError,
+      killResult,
+      ...(statusError === undefined ? { statusResult: cannedStatusResult({ state: LIVENESS_DEAD_ROW_ENDED }) } : { statusError }),
+    })
     _resetOutageState()
     initOutageState({
       notify: (key, text) => { emissions.push({ key, text }) },
@@ -4192,50 +4318,115 @@ describe('_buildKillSessionAdapter: an UNAVAILABLE kill is a refusal (b.jg5 SRJ-
     return stub
   }
 
-  /** Run the adapter for `key` inside a recovery attempt, capturing console.error. */
-  function killInAttempt(
+  /**
+   * Run the adapter for `key` inside a recovery attempt, handing it the run's
+   * `dead` reading `lastRead` (default: a row read `ended`), capturing
+   * console.error.
+   */
+  async function killInAttempt(
     key: string = 'C1',
     getPersona?: (key: string) => Persona | undefined,
+    lastRead: DeadLivenessReading = LIVENESS_READING_DEAD_ENDED,
   ): Promise<{ result: KillSessionResult; errArgs: unknown[][] }> {
-    return capturingErrorArgs(() => runInAttempt(key, 'recovery', () => _buildKillSessionAdapter(getPersona)(key)))
+    const run = await capturingErrorArgs(() => runInAttempt(key, 'recovery', () => _buildKillSessionAdapter(getPersona)(key, lastRead)))
+    captured.push(...run.errArgs)
+    return run
+  }
+
+  /** The non-success `result` is, narrowed; fails the case for any other answer. */
+  function notKilled(result: KillSessionResult): KillFailure {
+    expect(result).toMatchObject({ kind: KILL_OUTCOME_NOT_KILLED })
+    return result as KillFailure
   }
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'server-kill-'))
     killCalls = []
+    statusCalls = []
     triggers = []
     starts = []
     ends = []
     emissions = []
     reports = []
     killErr = undefined
+    latchLines = []
+    posts = []
+    captured = []
+    latch = createConflictLatch({ log: (line) => { latchLines.push(line) } })
+    unbindNotice = bindConflictNotice(
+      latch,
+      createPersonaEpisodes({ sink: (key, text) => { posts.push({ key, text }) }, log: (line) => { latchLines.push(line) }, clock: createFakeClock() }),
+    )
+    setConflictLatch(latch)
+    setConfiguredPersonaQuery((key) => key === 'C1')
   })
 
   afterEach(() => {
+    unbindNotice()
+    setConflictLatch(undefined)
+    _resetConfiguredPersonaQuery()
     resetClientForTests()
     _resetOutageState()
     _resetInFlightLaunches()
     _resetSpawnHomeDir()
     rmSync(dir, { recursive: true, force: true })
+    assertNoLeak({ captured, emissions, latchLines, posts })
   })
 
-  test.each(UNAVAILABLE_FORMS)('kill refused with %s → KILL_SESSION_REFUSED; one kill, one described refusal line; the timer is armed, no condition starts, nothing posted or leaked', async (_label, build, redacted, causeKind) => {
+  test.each([
+    ['true', true],
+    ['false', false],
+    ['absent', undefined],
+  ] as const)('b.jg5 SRJ-701, SRJ-703: kill succeeds with kill_sent %s → the killed outcome carrying it; one kill, one outcome line; nothing armed, latched or posted; no condition started or ended (not tmux-touching)', async (_label, killSent) => {
+    install(undefined, cannedKillResult(killSent))
+
+    const { result, errArgs } = await killInAttempt()
+
+    expect(result).toEqual(killSent === undefined ? { kind: KILL_OUTCOME_KILLED } : { kind: KILL_OUTCOME_KILLED, killSent })
+    expect(killCalls).toEqual([{ claude_instance_id: personaInstanceId('C1') }])
+    expect(stringLines(errArgs)).toEqual([killLine(result as KillOutcome)])
+    expect(triggers).toEqual([])
+    expect(starts).toEqual([])
+    expect(ends).toEqual([])
+    expect(emissions).toEqual([])
+    expect(latch.isLatched('C1')).toBe(false)
+    expect(statusCalls).toEqual([])
+  })
+
+  test('b.jg5 SRJ-701: kill answers ErrSpawnNotFound → the row-gone success; one outcome line; nothing armed or latched, no condition', async () => {
+    install(errSpawnNotFound())
+
+    const { result, errArgs } = await killInAttempt()
+
+    expect(result).toEqual({ kind: KILL_OUTCOME_ROW_GONE })
+    expect(killCalls).toHaveLength(1)
+    expect(stringLines(errArgs)).toEqual([killLine({ kind: KILL_OUTCOME_ROW_GONE })])
+    expect(triggers).toEqual([])
+    expect(starts).toEqual([])
+    expect(latch.isLatched('C1')).toBe(false)
+  })
+
+  test.each(UNAVAILABLE_FORMS)('b.jg5 SRJ-110, SRJ-105: kill answers %s → the UNAVAILABLE non-success, not swallowed; one kill, one described outcome line; the timer is armed, no condition starts, nothing latched, posted or leaked', async (_label, build, redacted, causeKind) => {
     const err = build('kill')
     install(err)
 
     const { result, errArgs } = await killInAttempt()
 
-    expect(result).toBe(KILL_SESSION_REFUSED)
+    const outcome = notKilled(result)
+    expect(outcome.errorClass).toBe(AD_ERROR_CLASS_UNAVAILABLE)
+    expect(outcome.error).toBe(err)
+    expect(outcome.errorClass === AD_ERROR_CLASS_UNAVAILABLE && outcome.killFailed).toBe(causeKind === UNAVAILABLE_RETRY_CAUSE_KILL_FAILED)
     expect(killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
     const lines = stringLines(errArgs)
-    expect(lines).toEqual([refusedLine(err)])
+    expect(lines).toEqual([killLine(outcome)])
     if (redacted) expect(lines[0]).toContain(REDACTED_SENTINEL_TAIL)
     expect(triggers).toEqual([{ key: 'C1', kind: causeKind }])
     expect(starts).toEqual([])
     expect(ends).toEqual([])
     expect(emissions).toEqual([])
     expect(getOutageFlags('C1').size).toBe(0)
-    assertNoLeak({ errArgs, emissions })
+    expect(latch.isLatched('C1')).toBe(false)
+    expect(statusCalls).toEqual([])
   })
 
   // Non-vacuity for "no condition starts": the same refusal from a kill
@@ -4251,145 +4442,349 @@ describe('_buildKillSessionAdapter: an UNAVAILABLE kill is a refusal (b.jg5 SRJ-
     expect(starts).toEqual([{ key: 'C1', verb: 'kill' }])
 
     const { result } = await killInAttempt()
-    expect(result).toBe(KILL_SESSION_REFUSED)
+    expect(notKilled(result).errorClass).toBe(AD_ERROR_CLASS_UNAVAILABLE)
     expect(starts).toHaveLength(1)
   })
 
-  test('kill succeeds → answers nothing (go on); no line, nothing armed; no condition started or ended (not tmux-touching)', async () => {
-    install()
-
-    const { result, errArgs } = await killInAttempt()
-
-    expect(result).toBeUndefined()
-    expect(killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
-    expect(errArgs).toEqual([])
-    expect(triggers).toEqual([])
-    expect(starts).toEqual([])
-    expect(ends).toEqual([])
-  })
-
-  test('kill answers ErrSpawnNotFound → answers nothing (go on); no line, nothing armed, no condition', async () => {
-    install(errSpawnNotFound())
-
-    const { result, errArgs } = await killInAttempt()
-
-    expect(result).toBeUndefined()
-    expect(killCalls).toHaveLength(1)
-    expect(errArgs).toEqual([])
-    expect(triggers).toEqual([])
-    expect(starts).toEqual([])
-  })
-
-  // b.jg5 SRJ-311: an ENVIRONMENT kill is a refusal, never swallowed into a
-  // launch. The wrapper raises `tmux-unavailable` (its one onset) and arms the
-  // timer once with the ENVIRONMENT cause; ENVIRONMENT never starts the
+  // b.jg5 SRJ-311: an ENVIRONMENT kill is a non-success, never swallowed into
+  // a launch. The wrapper raises `tmux-unavailable` (its one onset) and arms
+  // the timer once with the ENVIRONMENT cause; ENVIRONMENT never starts the
   // `tmux-unresponsive` condition (SRJ-307).
   // b.jg5 SRJ-1021: the re-bound-socket form (the description carries "not the
-  // tmux server the agent was launched on") is the same refusal, with
-  // SRJ-1021's onset in place of today's.
+  // tmux server the agent was launched on") is the same, with SRJ-1021's onset.
   test.each([
     ['ErrTmuxNotAvailable', () => errTmuxNotAvailable(undefined, 'kill'), () => ONSET_TEMPLATES['tmux-unavailable']()],
     ['ErrTmuxNotAvailable, re-bound-socket form (b.jg5 SRJ-1021)', () => errTmuxNotAvailableDifferentServer(undefined, 'kill'), tmuxServerChangedOnset],
-  ] as const)('b.jg5 SRJ-311: kill answers %s (ENVIRONMENT) → KILL_SESSION_REFUSED, not swallowed into a launch; one described refusal line; tmux-unavailable raised with its onset; the timer armed once with the environment cause; no condition', async (_label, build, onset) => {
+  ] as const)('b.jg5 SRJ-110, SRJ-311: kill answers %s → the ENVIRONMENT non-success, not swallowed into a launch; one described outcome line; tmux-unavailable raised with its onset; the timer armed once with the environment cause; no condition', async (_label, build, onset) => {
     const err = build()
     install(err)
 
     const { result, errArgs } = await killInAttempt()
 
-    expect(result).toBe(KILL_SESSION_REFUSED)
+    const outcome = notKilled(result)
+    expect(outcome.errorClass).toBe(AD_ERROR_CLASS_ENVIRONMENT)
+    expect(outcome.error).toBe(err)
     expect(killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
-    expect(stringLines(errArgs)).toEqual([refusedLine(err)])
+    expect(stringLines(errArgs)).toEqual([killLine(outcome)])
     expect([...getOutageFlags('C1')]).toEqual(['tmux-unavailable'])
     expect(emissions).toEqual([{ key: 'C1', text: onset() }])
     expect(triggers).toEqual([{ key: 'C1', kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT }])
     expect(starts).toEqual([])
     expect(ends).toEqual([])
-    assertNoLeak({ errArgs, emissions })
   })
 
-  // b.jg5 SRJ-316, SRJ-110, SRJ-105: a CONFIG kill is a refusal, so the
-  // restart work launches nothing after it, and the kill is not repeated. The
-  // wrapper raises `ad-config-malformed` (its onset, quoting the redacted
-  // description) and arms the timer once with the CONFIG cause; CONFIG never
-  // starts the `tmux-unresponsive` condition (SRJ-307).
-  test('b.jg5 SRJ-316: kill answers a CONFIG answer (ErrConfigMalformed) → KILL_SESSION_REFUSED with no second kill; one described refusal line; ad-config-malformed raised with its onset; the timer armed once with the config cause; no condition; nothing leaks', async () => {
+  // b.jg5 SRJ-316, SRJ-110: a CONFIG kill is a non-success, so the restart
+  // work launches nothing after it, and the kill is not repeated. The wrapper
+  // raises `ad-config-malformed` (its onset, quoting the redacted
+  // description) and arms the timer once with the CONFIG cause.
+  test('b.jg5 SRJ-110, SRJ-316: kill answers a CONFIG answer (ErrConfigMalformed) → the CONFIG non-success with no second kill; one described outcome line; ad-config-malformed raised with its onset; the timer armed once with the config cause; no condition; nothing leaks', async () => {
     const err = errConfigMalformed('starting_session_seconds', sentinelInMessage('kill-config'))
     install(err)
 
     const { result, errArgs } = await killInAttempt()
 
-    expect(result).toBe(KILL_SESSION_REFUSED)
+    const outcome = notKilled(result)
+    expect(outcome.errorClass).toBe(AD_ERROR_CLASS_CONFIG)
     expect(killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
     const lines = stringLines(errArgs)
-    expect(lines.filter((l) => l.includes('kill refused'))).toEqual([refusedLine(err)])
+    expect(lines.filter((l) => l.includes('killSession (restart adapter)'))).toEqual([killLine(outcome)])
     expect(lines.filter((l) => l.includes('ad-config-malformed raised for persona=C1'))).toHaveLength(1)
     expect(lines).toHaveLength(2)
+    expect(lines.join('\n')).toContain(REDACTED_SENTINEL_TAIL)
     expect([...getOutageFlags('C1')]).toEqual(['ad-config-malformed'])
     expect(emissions).toEqual([{ key: 'C1', text: adConfigMalformedOnset(err) }])
     expect(triggers).toEqual([{ key: 'C1', kind: UNAVAILABLE_RETRY_CAUSE_CONFIG }])
     expect(starts).toEqual([])
     expect(ends).toEqual([])
-    assertNoLeak({ errArgs, emissions })
   })
 
-  // b.jg5 SRJ-105, SRJ-110, SRJ-313: an UNCLASSIFIED kill is a refusal too:
-  // the adapter reports the stop to the restart work (`KILL_SESSION_REFUSED`)
-  // and makes no second call, so no step follows. The wrapper arms the timer
-  // once with the UNCLASSIFIED cause and, inside the attempt, reports the
-  // error once to the unclassified sink; it starts no condition.
-  // `ErrSystemInstallDisappeared` also raises `ad-unreachable` with its onset;
-  // nothing else posts.
+  // b.jg5 SRJ-110, SRJ-313: an UNCLASSIFIED kill is a non-success: the
+  // adapter answers it to the restart work and makes no second call, so no
+  // step follows. The wrapper arms the timer once with the UNCLASSIFIED cause
+  // and, inside the attempt, reports the error once to the unclassified sink.
+  // `ErrSystemInstallDisappeared` also raises `ad-unreachable` with its onset.
   test.each([
     ['ErrInternal', () => errInternal(`the store could not be read (${sentinelInMessage('kill-internal')})`), undefined],
     ['a store agent-director cannot open (ErrSchemaMismatch)', () => errSchemaMismatch(`the store could not be opened (${sentinelInMessage('kill-schema')})`), undefined],
     ['a name CSCB gives no handling', () => errGeneric('kill', 'ErrKillBroken', `the kill broke (${sentinelInMessage('kill-generic')})`), undefined],
     ['ErrSystemInstallDisappeared', () => errSystemInstallDisappeared('kill'), 'ad-unreachable'],
-  ] as const)('b.jg5 SRJ-313: kill answers %s (UNCLASSIFIED) → KILL_SESSION_REFUSED with no second kill; one described refusal line; the timer armed once with the unclassified cause; reported once to the unclassified sink; no condition; nothing leaks', async (_label, build, flag) => {
+  ] as const)('b.jg5 SRJ-110, SRJ-313: kill answers %s → the UNCLASSIFIED non-success with no second kill; one described outcome line; the timer armed once with the unclassified cause; reported once to the unclassified sink; no condition; nothing leaks', async (_label, build, flag) => {
     const err = build()
     install(err)
 
     const { result, errArgs } = await killInAttempt()
 
-    expect(result).toBe(KILL_SESSION_REFUSED)
+    const outcome = notKilled(result)
+    expect(outcome.errorClass).toBe(AD_ERROR_CLASS_UNCLASSIFIED)
+    expect(outcome.error).toBe(err)
     expect(killCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
-    expect(stringLines(errArgs).filter((l) => l.includes('killSession (restart adapter)'))).toEqual([refusedLine(err)])
+    expect(stringLines(errArgs).filter((l) => l.includes('killSession (restart adapter)'))).toEqual([killLine(outcome)])
     expect(triggers).toEqual([{ key: 'C1', kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
     expect(reports).toEqual([{ key: 'C1', same: true }])
     expect(starts).toEqual([])
     expect(ends).toEqual([])
     expect([...getOutageFlags('C1')]).toEqual(flag === undefined ? [] : [flag])
     expect(emissions.map((e) => e.key)).toEqual(flag === undefined ? [] : ['C1'])
-    assertNoLeak({ errArgs, emissions })
+    expect(latch.isLatched('C1')).toBe(false)
   })
 
-  // Every other class is no refusal: one "error for persona" line and the
-  // launch follows (nothing answered); a kill is no read, so nothing is armed
-  // or reported either.
+  // b.jg5 SRJ-104, SRJ-110: for `kill`, gone is success. A GONE answer is the
+  // session-gone success carrying its name: nothing armed, reported or
+  // latched, and the restart work's relaunch follows it.
   test.each([
-    ['an UNUSABLE NAME ErrInternal', () => errUnusableName()],
-    ['a STATE name (ErrSpawnNotResumable)', () => errSpawnNotResumable()],
-    ['a GONE name (ErrTmuxCaptureFailed)', () => errTmuxCaptureFailed(undefined, 'kill')],
-  ])("kill answers %s → answers nothing (go on) with one error line; nothing armed or reported, no condition", async (_label, build) => {
+    ['ErrTmuxCaptureFailed', () => errTmuxCaptureFailed(undefined, 'kill')],
+    ['ErrTmuxSendKeys', () => errTmuxSendKeys()],
+  ] as const)('b.jg5 SRJ-104, SRJ-110: kill answers GONE (%s) → the session-gone success carrying its name (for kill, gone is success); one kill, one outcome line rendering session-gone; nothing armed, reported or latched, no condition, no status read', async (_label, build) => {
     const err = build()
     install(err)
 
     const { result, errArgs } = await killInAttempt()
 
-    expect(result).toBeUndefined()
-    expect(killCalls).toHaveLength(1)
-    expect(stringLines(errArgs)).toEqual([
-      `[slack] killSession (restart adapter): error for persona=C1: ${describeThrownValue(err)}`,
-    ])
+    expect(result).toEqual({ kind: KILL_OUTCOME_SESSION_GONE, name: err.errName })
+    expect(killCalls).toEqual([{ claude_instance_id: personaInstanceId('C1') }])
+    expect(stringLines(errArgs)).toEqual([killLine(result as KillOutcome)])
+    expect(killLine(result as KillOutcome)).toContain(`outcome=${KILL_OUTCOME_SESSION_GONE} (${err.errName})`)
     expect(triggers).toEqual([])
     expect(reports).toEqual([])
     expect(starts).toEqual([])
-    assertNoLeak({ errArgs })
+    expect(ends).toEqual([])
+    expect(emissions).toEqual([])
+    expect(latch.isLatched('C1')).toBe(false)
+    expect(statusCalls).toEqual([])
   })
 
-  // The guards run first and are unchanged: with a kill that would be
-  // refused, a launch in flight or an unresolvable claude_config_dir still
-  // skips the kill and answers nothing.
-  test('launch in flight: no kill (the skip line only) and nothing answered, even with a kill that would be refused', async () => {
+  // b.jg5 SRJ-110, SRJ-105, SRJ-313: a class SRJ-110 gives no kill row (a
+  // STATE name other than ErrSpawnNotFound, LAUNCH FAILURE, DIRECTORY) is the
+  // UNCLASSIFIED non-success, never swallowed into a launch; inside the
+  // attempt it is reported as UNCLASSIFIED: the timer armed once with the
+  // UNCLASSIFIED cause and the unclassified sink fed once. Never latched.
+  test.each([
+    ['a STATE name (ErrSpawnNotResumable)', () => errSpawnNotResumable(), AD_ERROR_CLASS_STATE],
+    ['a STATE name (ErrInstanceIdCollision)', () => errInstanceIdCollision(), AD_ERROR_CLASS_STATE],
+    ['a LAUNCH FAILURE name (ErrTmuxSessionCreate)', () => errTmuxSessionCreate('kill'), AD_ERROR_CLASS_LAUNCH_FAILURE],
+    ['a DIRECTORY name (ErrCwdNotFound)', () => new ErrCwdNotFound('kill', ErrCwdNotFound.name, 'the working directory is gone'), AD_ERROR_CLASS_DIRECTORY],
+  ] as const)('b.jg5 SRJ-110, SRJ-313: kill answers %s → the UNCLASSIFIED non-success carrying unlistedClass %s, not swallowed into a launch; one kill, one outcome line; the timer armed once with the UNCLASSIFIED cause; reported once to the unclassified sink; nothing latched, no condition, no status read', async (_label, build, unlistedClass) => {
+    const err = build()
+    install(err)
+
+    const { result, errArgs } = await killInAttempt()
+
+    expect(result).toEqual({ kind: KILL_OUTCOME_NOT_KILLED, errorClass: AD_ERROR_CLASS_UNCLASSIFIED, error: err, unlistedClass })
+    expect(killCalls).toHaveLength(1)
+    expect(stringLines(errArgs).filter((l) => l.includes('killSession (restart adapter)'))).toEqual([killLine(result as KillOutcome)])
+    expect(triggers).toEqual([{ key: 'C1', kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
+    expect(reports).toEqual([{ key: 'C1', same: true }])
+    expect(starts).toEqual([])
+    expect(latch.isLatched('C1')).toBe(false)
+    expect(statusCalls).toEqual([])
+  })
+
+  // b.jg5 SRJ-104, SRJ-204, SRJ-205: an ErrInvalidFlags at the kill gets
+  // exactly one immediate version re-check. When it passes, the outcome is
+  // the UNCLASSIFIED non-success reported as UNCLASSIFIED; when it decides
+  // that the server stops, the outcome carries the stop and nothing more is
+  // done: nothing armed, reported or latched.
+  describe('an ErrInvalidFlags at the kill (b.jg5 SRJ-104, SRJ-204, SRJ-205)', () => {
+    let resolveCalls: Array<object | undefined>
+    let stops: number[]
+
+    /** Install the real re-check, its `resolveSystemBinary` answering `outcome`. */
+    function installRecheck(outcome: StubResolveSystemBinaryOutcome): void {
+      resetAdVersionRecheckForTests()
+      installAdVersionRecheck({
+        resolveSystemBinary: makeStubResolveSystemBinary({ calls: resolveCalls, outcomes: [outcome] }),
+        baselineVersion: PHASE1_RC_VERSION,
+        recordStartupError: () => {},
+        stop: (exitCode) => { stops.push(exitCode) },
+        log: () => {},
+        clock: createFakeClock(),
+      })
+    }
+
+    beforeEach(() => {
+      resolveCalls = []
+      stops = []
+    })
+
+    afterEach(() => {
+      resetAdVersionRecheckForTests()
+    })
+
+    test('the re-check passes → exactly one re-check and no stop; the UNCLASSIFIED non-success (from STATE, recheck pass); the timer armed once with the UNCLASSIFIED cause; reported once; nothing latched, no status read', async () => {
+      installRecheck({ version: PHASE1_RC_VERSION })
+      const err = errInvalidFlags('kill')
+      install(err)
+
+      const { result, errArgs } = await killInAttempt()
+
+      expect(resolveCalls).toHaveLength(1)
+      expect(stops).toEqual([])
+      expect(result).toEqual({
+        kind: KILL_OUTCOME_NOT_KILLED,
+        errorClass: AD_ERROR_CLASS_UNCLASSIFIED,
+        error: err,
+        unlistedClass: AD_ERROR_CLASS_STATE,
+        recheck: RECHECK_OUTCOME_PASS,
+      })
+      expect(killOutcomeStopsServer(result)).toBe(false)
+      expect(killCalls).toHaveLength(1)
+      expect(stringLines(errArgs).filter((l) => l.includes('killSession (restart adapter)'))).toEqual([killLine(result as KillOutcome)])
+      expect(triggers).toEqual([{ key: 'C1', kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
+      expect(reports).toEqual([{ key: 'C1', same: true }])
+      expect(latch.isLatched('C1')).toBe(false)
+      expect(statusCalls).toEqual([])
+    })
+
+    test('the re-check decides that the server stops → exactly one re-check and one stop; the outcome carries the stop; nothing armed, reported or latched; one kill, one outcome line, no status read', async () => {
+      installRecheck({ version: OLD_AD_VERSION })
+      const err = errInvalidFlags('kill')
+      install(err)
+
+      const { result, errArgs } = await killInAttempt()
+
+      expect(resolveCalls).toHaveLength(1)
+      expect(stops).toHaveLength(1)
+      expect(killOutcomeStopsServer(result)).toBe(true)
+      expect(notKilled(result)).toMatchObject({ errorClass: AD_ERROR_CLASS_UNCLASSIFIED, error: err, recheck: RECHECK_OUTCOME_STOP })
+      expect(killCalls).toHaveLength(1)
+      expect(stringLines(errArgs).filter((l) => l.includes('killSession (restart adapter)'))).toEqual([killLine(result as KillOutcome)])
+      expect(triggers).toEqual([])
+      expect(reports).toEqual([])
+      expect(latch.isLatched('C1')).toBe(false)
+      expect(posts).toEqual([])
+      expect(statusCalls).toEqual([])
+    })
+  })
+
+  // b.jg5 SRJ-110, SRJ-501, SRJ-505 (E13 hatch note): a CONFLICT at the
+  // restart path's kill latches C1 once through the latch's CONFLICT entry
+  // with the row's case, "P's next check or recovery" and the state the
+  // run's `dead` reading carries, with no `status` read; the outcome says
+  // latched (CONFLICT), and the kill is made once.
+  test.each(RESTART_KILL_CONFLICT_CASE_ROWS.map((row) => [row.name, row] as const))('b.jg5 SRJ-110, SRJ-501: CONFLICT at the kill (%s) → the CONFLICT non-success; C1 latched once with its case, "P\'s next check or recovery" and the state the run\'s dead reading carries, with no status read; one notice; one kill; nothing armed', async (_name, row) => {
+    const err = row.build()
+    install(err)
+
+    const { result, errArgs } = await killInAttempt()
+
+    const outcome = notKilled(result)
+    expect(outcome.errorClass).toBe(AD_ERROR_CLASS_CONFLICT)
+    expect(outcome.error).toBe(err)
+    expect(killCalls).toHaveLength(1)
+    expect(row.latchTimeRead).toBe(false)
+    expect(statusCalls).toEqual([])
+    expect(latch.record('C1')).toStrictEqual(expectedLatchRecord('C1', {
+      latchCase: row.latchCase,
+      refusedOperation: REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
+      rowState: row.rowState,
+      sessionName: row.sessionName,
+      description: err.errDescription,
+    }))
+    expect(row.refusedOperation).toBe(REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY)
+    expect(posts).toEqual([{ key: 'C1', text: row.notice.text }])
+    const lines = stringLines(errArgs)
+    expect(lines[0]).toBe(killLine(outcome))
+    expect(lines.filter((l) => l.startsWith('[slack] killSession (restart adapter): kill refused for persona=C1: ') && l.includes(' — CONFLICT: the persona latched; '))).toHaveLength(1)
+    expect(triggers).toEqual([])
+    expect(starts).toEqual([])
+  })
+
+  // b.jg5 SRJ-110, SRJ-512 (E16 hatch note): an UNUSABLE NAME at the restart
+  // path's kill latches C1 through E16's entry (refused operation none), with
+  // the state the run's `dead` reading carries and no `status` read; one
+  // SRJ-1019 notice.
+  test.each(RESTART_KILL_UNUSABLE_NAME_CASE_ROWS.map((row) => [row.name, row] as const))('b.jg5 SRJ-110, SRJ-512, SRJ-501: UNUSABLE NAME at the kill (%s) → the UNUSABLE NAME non-success; C1 latched once through E16\'s entry, refused operation none, with the state the run\'s dead reading carries and no status read; one notice; one kill; nothing armed', async (_name, row) => {
+    const err = row.build()
+    install(err)
+
+    const { result, errArgs } = await killInAttempt()
+
+    const outcome = notKilled(result)
+    expect(outcome.errorClass).toBe(AD_ERROR_CLASS_UNUSABLE_NAME)
+    expect(outcome.error).toBe(err)
+    expect(killCalls).toHaveLength(1)
+    expect(row.latchTimeRead).toBe(false)
+    expect(statusCalls).toEqual([])
+    expect(latch.record('C1')).toStrictEqual(row.record('C1'))
+    expect(row.refusedOperation).toBe(REFUSED_OPERATION_NONE)
+    expect(posts).toEqual([{ key: 'C1', text: row.notice('C1') }])
+    const lines = stringLines(errArgs)
+    expect(lines[0]).toBe(killLine(outcome))
+    expect(lines.filter((l) => l.startsWith('[slack] killSession (restart adapter): kill refused for persona=C1: ') && l.includes(' — UNUSABLE NAME: '))).toHaveLength(1)
+    expect(triggers).toEqual([])
+  })
+
+  // b.jg5 SRJ-501: the restart path's kill latch records the state its run
+  // last read, carried by the `dead` reading the work hands the adapter
+  // (`ended`, `missing`, or no row for ErrSpawnNotFound), with no extra
+  // `status` call.
+  describe('the latch records the state the run\'s dead reading carries (b.jg5 SRJ-501)', () => {
+    const [conflictRow] = RESTART_KILL_CONFLICT_CASE_ROWS
+    const [unusableRow] = RESTART_KILL_UNUSABLE_NAME_CASE_ROWS
+    const READINGS: ReadonlyArray<readonly [string, DeadLivenessReading, LatchRowState]> = [
+      ['ended', LIVENESS_READING_DEAD_ENDED, latchRowStateRead(LIVENESS_DEAD_ROW_ENDED)],
+      ['missing', LIVENESS_READING_DEAD_MISSING, latchRowStateRead(LIVENESS_DEAD_ROW_MISSING)],
+      ['no row (ErrSpawnNotFound)', LIVENESS_READING_DEAD_NO_ROW, LATCH_ROW_STATE_NO_ROW],
+    ]
+
+    test.each(READINGS)('CONFLICT at the kill after a dead reading of %s → C1 latched with that state; no status call', async (_label, lastRead, rowState) => {
+      const err = conflictRow!.build()
+      install(err)
+
+      await killInAttempt('C1', undefined, lastRead)
+
+      expect(statusCalls).toEqual([])
+      expect(latch.record('C1')).toStrictEqual(expectedLatchRecord('C1', {
+        latchCase: conflictRow!.latchCase,
+        refusedOperation: REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
+        rowState,
+        sessionName: conflictRow!.sessionName,
+        description: err.errDescription,
+      }))
+    })
+
+    test.each(READINGS)('UNUSABLE NAME at the kill after a dead reading of %s → C1 latched with that state; no status call', async (_label, lastRead, rowState) => {
+      install(unusableRow!.build())
+
+      await killInAttempt('C1', undefined, lastRead)
+
+      expect(statusCalls).toEqual([])
+      expect(latch.record('C1')).toStrictEqual({ ...unusableRow!.record('C1'), rowState })
+    })
+
+    // The install-gone reading reads no row, so it carries no state: the one
+    // latch-time `status` read gives it, its lines prefixed with the
+    // adapter's site.
+    test('CONFLICT at the kill after the install-gone dead reading → one latch-time status read, its state recorded', async () => {
+      const err = conflictRow!.build()
+      install(err)
+
+      await killInAttempt('C1', undefined, LIVENESS_READING_DEAD_INSTALL_GONE)
+
+      expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
+      expect(latch.record('C1')?.rowState).toEqual(latchRowStateRead(LIVENESS_DEAD_ROW_ENDED))
+    })
+
+    test('CONFLICT at the kill after the install-gone dead reading, the latch-time status read answering UNUSABLE NAME → that read latches C1 (state unreadable), its line prefixed killSession (restart adapter); the CONFLICT sets nothing on top', async () => {
+      const readErr = unusableRow!.build()
+      install(conflictRow!.build(), cannedKillResult(true), readErr)
+
+      const { errArgs } = await killInAttempt('C1', undefined, LIVENESS_READING_DEAD_INSTALL_GONE)
+
+      expect(statusCalls).toHaveLength(1)
+      expect(latch.record('C1')).toStrictEqual({ ...unusableRow!.record('C1'), rowState: LATCH_ROW_STATE_UNREADABLE })
+      const readLines = stringLines(errArgs).filter((l) => l.includes(' — UNUSABLE NAME: '))
+      expect(readLines).toHaveLength(1)
+      expect(readLines[0]).toStartWith('[slack] killSession (restart adapter): latch-time status read for ')
+      expect(posts).toHaveLength(1)
+    })
+  })
+
+  // b.jg5 SRJ-110 ("its guards stay"): the guards run first and are
+  // unchanged; with a kill that would be refused, a launch in flight or an
+  // unresolvable claude_config_dir still makes no kill, with the same line,
+  // and answers the guard result.
+  test('b.jg5 SRJ-110: launch in flight: no kill (the skip line only); answers the guard result, even with a kill that would be refused', async () => {
     mkdirSync(join(dir, 'home', '.claude'), { recursive: true })
     _setSpawnHomeDir(join(dir, 'home'))
     const config = makeStandInPersonaConfig({ C1: {} }, dir)
@@ -4402,7 +4797,7 @@ describe('_buildKillSessionAdapter: an UNAVAILABLE kill is a refusal (b.jg5 SRJ-
 
       const { result, errArgs } = await killInAttempt()
 
-      expect(result).toBeUndefined()
+      expect(result).toBe(KILL_SESSION_NOT_KILLED_GUARD)
       expect(killCalls).toEqual([])
       expect(stringLines(errArgs)).toEqual([
         '[slack] killSession (restart adapter): launch already in flight for persona=C1 — not killing',
@@ -4413,7 +4808,7 @@ describe('_buildKillSessionAdapter: an UNAVAILABLE kill is a refusal (b.jg5 SRJ-
     }
   })
 
-  test('claude_config_dir cannot be resolved: no kill and nothing answered, even with a kill that would be refused', async () => {
+  test('b.jg5 SRJ-110: claude_config_dir cannot be resolved: no kill; answers the guard result, even with a kill that would be refused', async () => {
     const dangling = join(dir, 'dangling-config')
     symlinkSync(join(dir, 'nowhere'), dangling)
     const persona = makeStandInPersonaConfig({ C1: { claude_config_dir: dangling } }, dir).personas[0]!
@@ -4421,13 +4816,13 @@ describe('_buildKillSessionAdapter: an UNAVAILABLE kill is a refusal (b.jg5 SRJ-
 
     const { result, errArgs } = await killInAttempt('C1', (k) => (k === 'C1' ? persona : undefined))
 
-    expect(result).toBeUndefined()
+    expect(result).toBe(KILL_SESSION_NOT_KILLED_GUARD)
     expect(killCalls).toEqual([])
     const lines = stringLines(errArgs)
     expect(lines).toContain(
       '[slack] killSession (restart adapter): persona=C1 claude_config_dir cannot be resolved to a real path — not killing; its row is kept',
     )
-    expect(lines.filter((l) => l.includes('kill refused'))).toEqual([])
+    expect(lines.filter((l) => l.includes('kill for persona=C1'))).toEqual([])
   })
 })
 

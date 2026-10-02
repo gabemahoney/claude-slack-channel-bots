@@ -33,8 +33,17 @@
  *      Slack messages stay as posted);
  *   6. its registered MCP session is dropped, the registry entry before the
  *      transport closes, so the closing stream schedules no restart;
- *   7. agent-director: `cscb_<key>` is killed, then its row deleted, each
- *      through `withOutageDetection`; a row already gone is success. Its
+ *   7. agent-director: `cscb_<key>` is killed with one checked kill (b.jg5
+ *      SRJ-110, SRJ-701; `killPersonaInstance`, no tries), its outcome
+ *      logged with `kill_sent` (`describeKillOutcome`), then its row is
+ *      deleted only after a success (any `kill_sent`, a row already gone,
+ *      or a session found gone):
+ *      a kill that did not succeed fails the kill step, no delete is made
+ *      and the row is kept, and nothing latches. The kill is no launch or
+ *      recovery attempt: it arms no retry timer, and an ENVIRONMENT or
+ *      CONFIG answer raises its outage only while the persona is in the
+ *      applied configuration (hatch A3). The delete goes through
+ *      `withOutageDetection`; a row already gone is success. Its
  *      outage flags are forgotten before these calls (so a success posts no
  *      all-clear) and again after them (so a flag a failing call raised does
  *      not survive). Its restart failure count, health-check streak,
@@ -77,8 +86,9 @@
  *     done, and none reaches its new half's destination.
  *   Each step's failure is logged and the
  *   remaining steps still run. Nothing is posted to Slack and nothing is
- *   recorded in `startup-errors.log`; a row a failed delete leaves behind is
- *   swept at the next start (SR-6.3). Dry run: no agent-director call.
+ *   recorded in `startup-errors.log`; a row a failed kill or a failed delete
+ *   leaves behind is swept at the next start (SR-6.3). Dry run: no
+ *   agent-director call.
  *
  * - **apply bring-up** (SR-6.1, SR-6.2, apply step 6): the start procedure
  *   for one added persona: the non-persistent-storage check for its
@@ -210,6 +220,7 @@
 
 import type { MakeTemplateParams } from 'agent-director'
 import { refreshSlackChannelBotTemplate, type TemplateRefreshResult } from './agent-director-template.ts'
+import { describeKillOutcome, isKillOutcome, killLetsNextStepRun, type KillOutcome } from './checked-kill.ts'
 import type { Persona, PersonaConfig } from './config.ts'
 import {
   isCredentialsBroken,
@@ -360,8 +371,17 @@ export interface PersonaLifecycleDeps {
    * its transport closes (server.ts: `dropPersonaSessionAndKeepAlive`).
    */
   dropSession: (key: string) => Promise<unknown>
-  /** Kill `cscb_<key>` through `withOutageDetection`; not-found resolves (`killPersonaInstance`). */
-  killInstance: (key: string) => Promise<unknown>
+  /**
+   * One checked kill of `cscb_<key>` (`killPersonaInstance` with
+   * `KILL_CONTEXT_TEARDOWN`; b.jg5 SRJ-110, SRJ-701), answering its outcome,
+   * `kill_sent` included; never throws. It arms no retry timer and latches
+   * nothing; an `ErrInvalidFlags` gets its immediate version re-check there
+   * (b.jg5 SRJ-104, SRJ-204). Only a success (`killLetsNextStepRun`: any
+   * `kill_sent`, `ErrSpawnNotFound`, or GONE) lets the delete follow; any
+   * other outcome, an answer that is not an outcome, and a throw fail the
+   * kill step, and no delete or other agent-director call follows.
+   */
+  killInstance: (key: string) => Promise<KillOutcome>
   /** Delete the `cscb_<key>` row through `withOutageDetection`; not-found resolves (`deletePersonaInstance`). */
   deleteInstance: (key: string) => Promise<unknown>
   /** The reply-guard helpers, the state directory bound. */
@@ -571,14 +591,33 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     } else {
       // A clean slate first, so a successful call clears no flag and posts no all-clear.
       await step('forgetting its outage state', () => deps.resetOutageState([key]))
-      await step(`agent-director kill of ${instanceId}`, () => deps.killInstance(key))
-      await step(`agent-director delete of ${instanceId}`, () => deps.deleteInstance(key))
+      // b.jg5 SRJ-110, SRJ-701: one checked kill; only a success lets the
+      // delete follow. A kill that did not succeed fails this step and keeps
+      // the row (no delete); nothing latches.
+      let killSucceeded = false
+      await step(`agent-director kill of ${instanceId}`, async () => {
+        const outcome = await deps.killInstance(key)
+        if (killLetsNextStepRun(outcome)) {
+          log(`${prefix}: agent-director kill of ${instanceId}: ${describeKillOutcome(outcome)}`)
+          killSucceeded = true
+          return
+        }
+        failed++
+        const described = isKillOutcome(outcome) ? describeKillOutcome(outcome) : 'it answered no kill outcome'
+        log(`${prefix}: agent-director kill of ${instanceId} failed: ${described}`)
+      })
+      if (killSucceeded) {
+        await step(`agent-director delete of ${instanceId}`, () => deps.deleteInstance(key))
+      } else {
+        log(`${prefix}: agent-director delete of ${instanceId} not made — its kill did not succeed, so the row is kept (b.jg5 SRJ-701)`)
+      }
     }
-    // After the agent-director calls: a flag a failing call raised goes too,
-    // and so does a retry timer it armed (an ENVIRONMENT answer arms one in
-    // any context, b.jg5 SRJ-311). Its key stays applied for a destructive
-    // modify, so a timer left armed would retry against the new half 30 s
-    // later with agent-director calls; stopping it here leaves none.
+    // After the agent-director calls: a flag a failing call raised goes too.
+    // The teardown's kill arms no retry timer (b.jg5 SRJ-110; hatch A3), and
+    // its delete none outside an attempt but for an ENVIRONMENT or CONFIG
+    // answer (b.jg5 SRJ-311, SRJ-316); its key stays applied for a
+    // destructive modify, so a timer left armed would retry against the new
+    // half 30 s later with agent-director calls; stopping it here leaves none.
     await step('forgetting its outage state', () => deps.resetOutageState([key]))
     await step('stopping its UNAVAILABLE retry timer', () => deps.stopRetryTimer(key))
     // The old half of a destructive modify is still applied, so a notice

@@ -486,12 +486,11 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       // The silent per-key ack-tracker forget, so a key added again starts clean.
       ['forgetAcks', 'forgetPersonaAcks'],
       ['dropSession', 'dropPersonaSessionAndKeepAlive'],
-      ['killInstance', 'killPersonaInstance'],
       ['deleteInstance', 'deletePersonaInstance'],
     ])
     // Functions and objects with a parameter name of the source's choosing.
     // (`templateRefresh` is pinned in the test after this one.)
-    const shaped = ['log', 'replyGuard', 'storageCheck', 'launch', 'templateRefresh', 'stopApprover', 'stopRetryTimer', 'forgetConflictLatch', 'forgetNoticeEpisodes']
+    const shaped = ['log', 'replyGuard', 'storageCheck', 'launch', 'templateRefresh', 'stopApprover', 'stopRetryTimer', 'forgetConflictLatch', 'forgetNoticeEpisodes', 'killInstance']
     expect([...props.keys()].sort()).toEqual([...expected.keys(), ...shaped].sort())
     for (const [dep, value] of expected) expect([dep, props.get(dep)]).toEqual([dep, value])
 
@@ -501,6 +500,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       whenLaunchSettled: './session-manager.ts',
       cancelWorkingRowWait: './session-manager.ts',
       killPersonaInstance: './session-manager.ts',
+      KILL_CONTEXT_TEARDOWN: './session-manager.ts',
       deletePersonaInstance: './session-manager.ts',
       stopDialogApprover: './session-manager.ts',
       APPROVER_STOP_TEARDOWN: './session-manager.ts',
@@ -569,6 +569,17 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     )
     expect(stopApprover).not.toBeNull()
     expect(stopApprover![2]).toBe(stopApprover![1])
+
+    // b.jg5 SRJ-110 (hatch A3): the teardown's kill is the session manager's
+    // checked kill of that key with the teardown context (its context is
+    // required), so it arms nothing: not a stub, not the delete, not another
+    // key's kill, not the attempt context, and nothing else in its options
+    // (imported above, not shadowed).
+    const killInstance = (props.get('killInstance') ?? '').match(
+      /^\(?(\w+)\)? => killPersonaInstance\((\w+), \{\s*context:\s*KILL_CONTEXT_TEARDOWN\s*\}\)$/,
+    )
+    expect(killInstance).not.toBeNull()
+    expect(killInstance![2]).toBe(killInstance![1])
 
     // b.jg5 SRJ-305: the teardown stops the key's UNAVAILABLE retry timer on
     // the server's one retry controller (the one installed as the outage
