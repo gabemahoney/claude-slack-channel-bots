@@ -6,9 +6,10 @@
  * SRJ-901, SRJ-902, SRJ-117, SRJ-908); the teardown's per-persona
  * outcome, its pause verdict, its state-read verdict, its kill's mapping
  * and the bounds of its cost (SRJ-903, SRJ-904, SRJ-119, SRJ-316, SRJ-908;
- * hatch note E12); and the teardown's report: each persona's failure line,
+ * hatch note E12); the teardown's report: each persona's failure line,
  * kill-failure alert and startup-errors entry, and the last line (SRJ-907,
- * SRJ-909, SRJ-1013).
+ * SRJ-909, SRJ-1013); and `clean_restart`'s not-restarted alert and its
+ * class (SRJ-906, SRJ-1013).
  *
  * The precheck. Before either command stops anything, it reads each persona
  * of the configuration the server runs: one `get` of `cscb_<key>`, then, for
@@ -118,6 +119,18 @@
  * form names the command as the context. When any persona failed, the
  * command ends with {@link teardownNotStoppedLine}, printed only.
  *
+ * The restart (SRJ-906): when any persona of a `clean_restart` failed, the
+ * CLI checks that agent-director answers, one `list` of `service=cscb` rows
+ * made at most {@link PRECHECK_TRIES} times {@link PRECHECK_TRY_SPACING_MS}
+ * apart, any error being a failed try, and starts the server when it does.
+ * When it does not, the server is not started, and
+ * {@link cleanRestartNotRestartedAlert}, which names every failed persona
+ * with its session and class and ends with
+ * {@link CLEAN_RESTART_NOT_STARTED_SENTENCE}, is printed, appended as one
+ * `server.log` line and recorded as one
+ * {@link CLEAN_RESTART_NOT_RESTARTED_LABEL} entry. The last line follows the
+ * restart's outcome.
+ *
  * The cost (SRJ-908): {@link teardownBoundMs} bounds one persona's teardown
  * and {@link precheckBoundMs} its precheck, each call taking the call
  * timeout, from {@link PRECHECK_TRIES}, {@link PRECHECK_TRY_SPACING_MS},
@@ -220,10 +233,19 @@ export const AD_CONFIG_FILE_DISPLAY_NAME = join('~', AD_SETTINGS_RELATIVE_PATH)
 // Tries
 // ---------------------------------------------------------------------------
 
-/** Most calls the precheck makes of one `get` or `read-pane` that answers UNAVAILABLE (b.jg5 SRJ-901 step 3). */
+/**
+ * Most calls the precheck makes of one `get` or `read-pane` that answers
+ * UNAVAILABLE (b.jg5 SRJ-901 step 3); also the most `pause` calls of one
+ * persona's teardown (SRJ-903) and the most `list` calls of `clean_restart`'s
+ * answer check (SRJ-906).
+ */
 export const PRECHECK_TRIES = 3
 
-/** The wait between two tries of one precheck call, on the CLI's injected clock (b.jg5 SRJ-901, SRJ-908). */
+/**
+ * The wait between two tries of one precheck call, of one teardown's `pause`
+ * and of `clean_restart`'s answer check, on the CLI's injected clock (b.jg5
+ * SRJ-901, SRJ-903, SRJ-906, SRJ-908).
+ */
 export const PRECHECK_TRY_SPACING_MS = 2_000
 
 // ---------------------------------------------------------------------------
@@ -1137,4 +1159,52 @@ export function personaTeardownReportOf(
     logged: [failureLine, alert.line],
     entry: { classLabel: alert.classLabel, message: `${failureLine} ${alert.line}` },
   }
+}
+
+// ---------------------------------------------------------------------------
+// clean_restart's restart after a failed teardown (b.jg5 SRJ-906, SRJ-1013)
+// ---------------------------------------------------------------------------
+
+/**
+ * The `startup-errors.log` class of a `clean_restart` whose teardown failed
+ * and whose answer check found agent-director not answering, so the server
+ * was not started (b.jg5 SRJ-906, SRJ-1013).
+ */
+export const CLEAN_RESTART_NOT_RESTARTED_LABEL = 'clean-restart-not-restarted'
+
+/** The sentence the not-restarted alert ends with (b.jg5 SRJ-1013). */
+export const CLEAN_RESTART_NOT_STARTED_SENTENCE = 'the server was not started: start it once agent-director answers'
+
+/** A persona `clean_restart` could not stop, with the class its teardown failed under. */
+export interface CleanRestartFailedPersona {
+  readonly persona: CliTeardownPersona
+  readonly errorClass: AdErrorClass
+}
+
+/**
+ * The one not-restarted alert of a `clean_restart` run (b.jg5 SRJ-906,
+ * SRJ-1013): printed, appended as one `server.log` line and recorded as one
+ * {@link CLEAN_RESTART_NOT_RESTARTED_LABEL} entry, the same text on all three
+ * routes. It names every persona that could not be stopped, in the order
+ * given, with its session and class, and ends with
+ * {@link CLEAN_RESTART_NOT_STARTED_SENTENCE}:
+ *
+ *   `clean_restart: could not stop persona "<name>" (key=<key>), session "slack_bot_<key>": <class>;
+ *    persona "<name>" (key=<key>), session "slack_bot_<key>": <class>; agent-director did not answer,
+ *    so the server was not started: start it once agent-director answers`
+ *
+ * (one line). It carries no agent-director description: each persona's own
+ * failure line carries that, redacted. Pure; never throws.
+ */
+export function cleanRestartNotRestartedAlert(failures: readonly CleanRestartFailedPersona[]): string {
+  const personas = failures
+    .map(({ persona, errorClass }) => {
+      const session = JSON.stringify(personaTmuxSessionName(persona.key))
+      return `persona ${renderPersonaRef(persona.name, persona.key)}, session ${session}: ${errorClass}`
+    })
+    .join('; ')
+  return (
+    `${CLI_COMMAND_CLEAN_RESTART}: could not stop ${personas}; ` +
+    `agent-director did not answer, so ${CLEAN_RESTART_NOT_STARTED_SENTENCE}`
+  )
 }

@@ -10,10 +10,12 @@
  * tries (b.jg5 SRJ-904, SRJ-702, SRJ-907); the teardown's report: each
  * persona's failure line, its `cli-teardown-failed` entry message, the last
  * line and the per-persona report plan (lines printed, `server.log` lines and
- * at most one startup-errors entry; b.jg5 SRJ-907, SRJ-909, SRJ-1013); and the
- * bounds of the precheck's and the teardown's cost (SRJ-908). The precheck
+ * at most one startup-errors entry; b.jg5 SRJ-907, SRJ-909, SRJ-1013);
+ * `clean_restart`'s not-restarted alert and its class (SRJ-906, SRJ-1013);
+ * and the bounds of the precheck's and the teardown's cost (SRJ-908). The precheck
  * runner, the teardown's tries, poll and kill on the CLI's injected clock,
- * both commands' order and where each report line goes are
+ * both commands' order, where each report line goes, and `clean_restart`'s
+ * answer check and the routes of its not-restarted alert are
  * tests/cli.test.ts's.
  *
  * Every agent-director error is built by name with the stub's builders; class
@@ -66,6 +68,8 @@ import {
 } from '../src/agent-director-errors.ts'
 import {
   AD_CONFIG_FILE_DISPLAY_NAME,
+  CLEAN_RESTART_NOT_RESTARTED_LABEL,
+  CLEAN_RESTART_NOT_STARTED_SENTENCE,
   CLI_COMMAND_CLEAN_RESTART,
   CLI_COMMAND_STOP_BOTS,
   CLI_TEARDOWN_FAILED_LABEL,
@@ -98,6 +102,7 @@ import {
   TEARDOWN_STOPPED_EXITED,
   TEARDOWN_STOPPED_KILLED,
   TEARDOWN_STOPPED_NO_ROW,
+  cleanRestartNotRestartedAlert,
   cliTeardownFailedEntryText,
   exitTimeoutMsOf,
   onlyServerStoppedLine,
@@ -119,6 +124,7 @@ import {
   teardownNotStoppedLine,
   teardownRejectedOutcomeOf,
   teardownStopped,
+  type CleanRestartFailedPersona,
   type CliTeardownCommand,
   type CliTeardownPersona,
   type PauseVerdict,
@@ -1178,6 +1184,71 @@ describe('personaTeardownReportOf: each persona\'s report plan (b.jg5 SRJ-907, S
       expect(text.includes('\n')).toBe(false)
     }
     assertNoLeak({ failed, survivor })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// clean_restart's not-restarted alert and its class (b.jg5 SRJ-906, SRJ-1013)
+// ---------------------------------------------------------------------------
+
+describe('the not-restarted alert and its class (b.jg5 SRJ-906, SRJ-1013)', () => {
+  const SECOND_PERSONA: CliTeardownPersona = { name: 'Beta', key: personaKey('Beta') }
+
+  test('SRJ-1013\'s class label, closing sentence and one alert, exactly (pinned once)', () => {
+    expect(CLEAN_RESTART_NOT_RESTARTED_LABEL).toBe('clean-restart-not-restarted')
+    expect(CLEAN_RESTART_NOT_STARTED_SENTENCE).toBe('the server was not started: start it once agent-director answers')
+    expect(cleanRestartNotRestartedAlert([{ persona: { name: 'Ops Bot', key: 'ops_bot' }, errorClass: AD_ERROR_CLASS_CONFLICT }])).toBe(
+      'clean_restart: could not stop persona "Ops Bot" (key=ops_bot), session "slack_bot_ops_bot": CONFLICT; ' +
+        'agent-director did not answer, so the server was not started: start it once agent-director answers',
+    )
+  })
+
+  test.each<[string, CleanRestartFailedPersona[]]>([
+    ['one failed persona', [{ persona: REPORT_PERSONA, errorClass: AD_ERROR_CLASS_UNAVAILABLE }]],
+    ['two failed personas', [
+      { persona: REPORT_PERSONA, errorClass: AD_ERROR_CLASS_CONFLICT },
+      { persona: SECOND_PERSONA, errorClass: AD_ERROR_CLASS_ENVIRONMENT },
+    ]],
+    ['two failed personas given in the other order', [
+      { persona: SECOND_PERSONA, errorClass: AD_ERROR_CLASS_CONFIG },
+      { persona: REPORT_PERSONA, errorClass: AD_ERROR_CLASS_UNAVAILABLE },
+    ]],
+  ])('%s: one line that starts with the command, names each persona with its session and class, in the order given, and ends with the closing sentence', (_label, failures) => {
+    const alert = cleanRestartNotRestartedAlert(failures)
+    const pieces = [
+      `${CLI_COMMAND_CLEAN_RESTART}: `,
+      ...failures.flatMap(({ persona, errorClass }) => [
+        renderPersonaRef(persona.name, persona.key),
+        JSON.stringify(personaTmuxSessionName(persona.key)),
+        `: ${errorClass}`,
+      ]),
+      CLEAN_RESTART_NOT_STARTED_SENTENCE,
+    ]
+    const at = pieces.map((piece) => alert.indexOf(piece))
+    expect(at[0]).toBe(0)
+    expect(at.every((i) => i >= 0)).toBe(true)
+    expect([...at].sort((a, b) => a - b)).toEqual(at)
+    expect(alert.endsWith(CLEAN_RESTART_NOT_STARTED_SENTENCE)).toBe(true)
+    expect(alert.includes('\n')).toBe(false)
+    assertNoLeak(alert)
+  })
+
+  test('the alert carries no agent-director description: failures whose descriptions carry fake tokens give an alert holding neither the redacted description nor the token', () => {
+    const failures = [
+      errGeneric(KILL_VERB, ERR_TMUX_SESSION_CONFLICT_NAME, `session refused (${sentinelInMessage('not-restarted-conflict')})`),
+      errGeneric(KILL_VERB, 'ErrNoHandlingInCscb', `refused (${sentinelInMessage('not-restarted-unclassified')})`),
+    ].map((value, i) => {
+      const report = teardownErrorReportOf(value)
+      expect(report.description).toContain(REDACTED_SENTINEL_TAIL) // precondition: the failure line would carry it, redacted
+      return { persona: [REPORT_PERSONA, SECOND_PERSONA][i]!, errorClass: report.errorClass, description: report.description }
+    })
+    const alert = cleanRestartNotRestartedAlert(failures.map(({ persona, errorClass }) => ({ persona, errorClass })))
+    for (const { description, errorClass } of failures) {
+      expect(alert).not.toContain(description)
+      expect(alert).toContain(`: ${errorClass}`)
+    }
+    expect(alert).not.toContain(REDACTED_SENTINEL_TAIL)
+    assertNoLeak(alert)
   })
 })
 

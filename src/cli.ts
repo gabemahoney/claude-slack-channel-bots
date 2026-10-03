@@ -10,7 +10,9 @@
  *                    `--stop-bots` first runs the precheck, then stops the
  *                    server and exits every configured persona's instance.
  *   clean_restart  — Run the precheck, then stop the server, exit every
- *                    configured persona's instance and start the server.
+ *                    configured persona's instance and start the server;
+ *                    after a failed teardown, start it only once
+ *                    agent-director answers.
  *   credentials    — `credentials <persona>`: write that persona's
  *                    credentials file from the operator's terminal, by
  *                    running the packaged `scripts/write-credentials.sh`
@@ -34,8 +36,9 @@
  * prints its lines, ending `<command>: nothing was stopped`, and exits 1.
  * The precheck latches nothing and writes no file. After a passed precheck
  * the server is stopped, then every persona torn down; `clean_restart` then
- * starts the server. `stop --stop-bots` with an unreadable configuration has
- * no per-persona step: it stops the server and skips the teardown.
+ * starts the server, or, after a failed teardown, checks that agent-director
+ * answers first (below). `stop --stop-bots` with an unreadable configuration
+ * has no per-persona step: it stops the server and skips the teardown.
  *
  * Personas are torn down in parallel, and once every persona has settled
  * each persona's report is written in configuration order (b.jg5 SRJ-907,
@@ -51,10 +54,27 @@
  * (`recordStartupErrorEntry`): `persona-kill-failed`, `cli-teardown-failed`
  * or `persona-kill-survivor`. Both writes are best effort and change no exit
  * status. When any persona failed, the command ends with the last line
- * (`teardownNotStoppedLine`), printed only. `stop --stop-bots` then exits 1,
- * and otherwise with the server stop's code; `clean_restart` with a failed
- * persona aborts without a start and exits 1. Nothing is posted to Slack and
- * nothing latches (b.jg5 SRJ-1002).
+ * (`teardownNotStoppedLine`), printed only, and exits 1. Nothing is posted
+ * to Slack and nothing latches (b.jg5 SRJ-1002).
+ *
+ * After the teardown (b.jg5 SRJ-905, SRJ-906):
+ *   - `stop --stop-bots` never starts the server: with a failed persona it
+ *     exits 1 and the server stays stopped; otherwise it exits with the
+ *     server stop's code;
+ *   - `clean_restart` with every persona stopped (a persona stopped with the
+ *     survivor version included) starts the server, with no answer check,
+ *     and exits as `start` does;
+ *   - `clean_restart` with a failed persona checks that agent-director
+ *     answers: one `list` of `service=cscb` rows (`directorList`) succeeds
+ *     within PRECHECK_TRIES calls PRECHECK_TRY_SPACING_MS apart on the
+ *     injected clock, any error a failed try (`callWithCliTries`, the CLI's
+ *     one source of those tries). If it answers, the server is started, a
+ *     failed start printing its start-failed line; if not, the server is not
+ *     started (b.qwo) and the not-restarted alert
+ *     (`cleanRestartNotRestartedAlert`) is printed, appended to `server.log`
+ *     and recorded as one `clean-restart-not-restarted` entry. The last line
+ *     follows that outcome, and the exit is 1 either way. Rows are never
+ *     deleted.
  *
  * `clean_restart`'s initialization runs the whole startup gate, CSCB's
  * Phase 1 floor included, and any failure of it stops nothing (b.jg5
@@ -105,12 +125,13 @@ import { killRetrySeedOfState, runKillRetry, type KillRetryRead } from './kill-r
 import type { Phase1GetResult } from './ad-phase1-types.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import { getClient } from './agent-director-client.ts'
-import type { Client } from 'agent-director'
-import { personaInstanceId, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
+import type { Client, ListRow } from 'agent-director'
+import { SERVICE_LABEL, personaInstanceId, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
 import { REFUSAL_KIND_CLIENT_TOO_OLD, runStartupGate } from './agent-director-startup.ts'
 import type { StartupGateDeps, StartupGateOptions, StartupGateRefusalKind } from './agent-director-startup.ts'
 import { PROBE_PANE_READ_LINES } from './pane-read.ts'
 import {
+  CLEAN_RESTART_NOT_RESTARTED_LABEL,
   CLI_COMMAND_CLEAN_RESTART,
   CLI_COMMAND_STOP_BOTS,
   PRECHECK_CALL_GET,
@@ -136,6 +157,7 @@ import {
   TEARDOWN_STOPPED_EXITED,
   TEARDOWN_STOPPED_NO_ROW,
   TEARDOWN_KILL_OPTIONS,
+  cleanRestartNotRestartedAlert,
   exitTimeoutMsOf,
   onlyServerStoppedLine,
   pauseVerdictAfterLastTry,
@@ -145,6 +167,7 @@ import {
   precheckNothingStoppedLine,
   precheckVerdictOf,
   stateReadVerdictOf,
+  teardownErrorReportOf,
   teardownFailed,
   teardownKillOutcomeOf,
   teardownKillReadIsConfig,
@@ -152,6 +175,7 @@ import {
   teardownNotStoppedLine,
   teardownRejectedOutcomeOf,
   teardownStopped,
+  type CleanRestartFailedPersona,
   type CliTeardownCommand,
   type CliTeardownStartupErrorEntry,
   type PauseAnswer,
@@ -251,9 +275,9 @@ export interface CliDeps {
   fileSize: (path: string) => number
   /** A file's bytes from `offset` to the end, as UTF-8 text; '' when it cannot be read. */
   readFileFrom: (path: string, offset: number) => string
-  /** Current time in milliseconds (the clock of the daemon startup wait, `stop`'s exit polls, the precheck's tries and the teardown's pause tries, poll and kill tries). */
+  /** Current time in milliseconds (the clock of the daemon startup wait, `stop`'s exit polls, the precheck's tries, the teardown's pause tries, poll and kill tries, and `clean_restart`'s answer check). */
   now: () => number
-  /** Resolve after `ms` milliseconds (the clock of the daemon startup wait, `stop`'s exit polls, the precheck's tries and the teardown's pause tries, poll and kill tries). */
+  /** Resolve after `ms` milliseconds (the clock of the daemon startup wait, `stop`'s exit polls, the precheck's tries, the teardown's pause tries, poll and kill tries, and `clean_restart`'s answer check). */
   sleep: (ms: number) => Promise<void>
   /** Remove a file. */
   unlinkSync: (path: string) => void
@@ -362,6 +386,14 @@ export interface CliDeps {
    */
   directorKill: (instanceId: string) => Promise<unknown>
   /**
+   * `clean_restart`'s answer check after a failed teardown (b.jg5 SRJ-906):
+   * one `list` filtered by the service label alone (`SERVICE_LABEL`,
+   * `service=cscb`), answering the rows as given, finished rows included.
+   * Every error propagates unchanged; the caller counts any of them as a
+   * failed try. Latches, records and writes nothing.
+   */
+  directorList: () => Promise<readonly ListRow[]>
+  /**
    * Append one line to `server.log` in the state directory, in the server
    * log's `[<ISO time>] <text>` form at `at` (ms since the epoch, from
    * `now`), through the shared rotation (`appendLogLine`, `src/logging.ts`,
@@ -424,6 +456,35 @@ function describeCliFailure(err: unknown): string {
  */
 function isClientTooOldRefusal(err: unknown): boolean {
   return err instanceof StartupGateFailedError && err.refusalKind === REFUSAL_KIND_CLIENT_TOO_OLD
+}
+
+// ---------------------------------------------------------------------------
+// Tries on the CLI's injected clock (b.jg5 SRJ-908)
+// ---------------------------------------------------------------------------
+
+/**
+ * One agent-director call of the CLI, made again while its answer asks for
+ * another try: at most PRECHECK_TRIES calls, PRECHECK_TRY_SPACING_MS apart,
+ * each wait through `sleep` (the CLI's injected clock, `CliDeps.sleep`;
+ * b.jg5 SRJ-908), and no wait after the last call. Answers the last answer;
+ * the caller decides what an answer that still asks for another try means.
+ * The one source of the CLI's "3 calls 2 s apart" tries: the precheck's
+ * `get` and `read-pane` and the teardown's `pause` retry while their verdict
+ * is UNAVAILABLE (b.jg5 SRJ-901, SRJ-903), and `clean_restart`'s answer
+ * check retries its `list` on any error (b.jg5 SRJ-906). Never throws unless
+ * `call` or `sleep` does.
+ */
+export async function callWithCliTries<A>(
+  call: () => Promise<A>,
+  retry: (answer: A) => boolean,
+  sleep: (ms: number) => Promise<void>,
+): Promise<A> {
+  let answer = await call()
+  for (let tries = 1; retry(answer) && tries < PRECHECK_TRIES; tries++) {
+    await sleep(PRECHECK_TRY_SPACING_MS)
+    answer = await call()
+  }
+  return answer
 }
 
 // ---------------------------------------------------------------------------
@@ -701,10 +762,11 @@ export function createCli(deps: CliDeps): CliHandlers {
 
   /**
    * The teardown's `pause` of `id` and its verdict, the `pause` alone made
-   * again while it answers UNAVAILABLE: at most PRECHECK_TRIES calls,
-   * PRECHECK_TRY_SPACING_MS apart on the injected clock, with no `status`
-   * read between them (b.jg5 SRJ-903, SRJ-908). A retry verdict that stands
-   * after the last try escalates (`pauseVerdictAfterLastTry`).
+   * again while it answers UNAVAILABLE (`callWithCliTries`): at most
+   * PRECHECK_TRIES calls, PRECHECK_TRY_SPACING_MS apart on the injected
+   * clock, with no `status` read between them (b.jg5 SRJ-903, SRJ-908). A
+   * retry verdict that stands after the last try escalates
+   * (`pauseVerdictAfterLastTry`).
    */
   async function pauseTries(id: string): Promise<PauseVerdict> {
     const call = async (): Promise<PauseAnswer> => {
@@ -715,11 +777,11 @@ export function createCli(deps: CliDeps): CliHandlers {
         return { error }
       }
     }
-    let verdict = pauseVerdictOf(await call())
-    for (let tries = 1; verdict.kind === PAUSE_VERDICT_RETRY && tries < PRECHECK_TRIES; tries++) {
-      await deps.sleep(PRECHECK_TRY_SPACING_MS)
-      verdict = pauseVerdictOf(await call())
-    }
+    const verdict = await callWithCliTries(
+      async () => pauseVerdictOf(await call()),
+      (v) => v.kind === PAUSE_VERDICT_RETRY,
+      deps.sleep,
+    )
     return pauseVerdictAfterLastTry(verdict)
   }
 
@@ -819,17 +881,48 @@ export function createCli(deps: CliDeps): CliHandlers {
 
   /**
    * One precheck call and its verdict, the call made again while it answers
-   * UNAVAILABLE: at most PRECHECK_TRIES calls, PRECHECK_TRY_SPACING_MS apart
-   * on the injected clock (b.jg5 SRJ-901 step 3, SRJ-908). A retry verdict
-   * that stands after the last try is the persona's failure.
+   * UNAVAILABLE (`callWithCliTries`): at most PRECHECK_TRIES calls,
+   * PRECHECK_TRY_SPACING_MS apart on the injected clock (b.jg5 SRJ-901
+   * step 3, SRJ-908). A retry verdict that stands after the last try is the
+   * persona's failure.
    */
   async function precheckTries(call: () => Promise<PrecheckAnswer>): Promise<PrecheckVerdict> {
-    let verdict = precheckVerdictOf(await call())
-    for (let tries = 1; verdict.kind === PRECHECK_VERDICT_RETRY && tries < PRECHECK_TRIES; tries++) {
-      await deps.sleep(PRECHECK_TRY_SPACING_MS)
-      verdict = precheckVerdictOf(await call())
-    }
-    return verdict
+    return callWithCliTries(
+      async () => precheckVerdictOf(await call()),
+      (v) => v.kind === PRECHECK_VERDICT_RETRY,
+      deps.sleep,
+    )
+  }
+
+  /**
+   * `clean_restart`'s answer check after a failed teardown (b.jg5 SRJ-906):
+   * true when one `list` of `service=cscb` rows (`deps.directorList`)
+   * succeeds within PRECHECK_TRIES calls, PRECHECK_TRY_SPACING_MS apart on
+   * the injected clock (`callWithCliTries`). Any error is a failed try,
+   * CONFIG included, and goes to stderr in one line with its class and
+   * redacted description (`teardownErrorReportOf`). Latches, records and
+   * writes nothing else; never throws for an agent-director answer.
+   */
+  async function agentDirectorAnswers(command: CliTeardownCommand): Promise<boolean> {
+    let tries = 0
+    return callWithCliTries(
+      async (): Promise<boolean> => {
+        tries++
+        try {
+          await deps.directorList()
+          return true
+        } catch (error) {
+          const report = teardownErrorReportOf(error)
+          console.error(
+            `[slack] ${command}: agent-director answer check: list try ${tries} of ${PRECHECK_TRIES} failed: ` +
+              `${report.errorClass}: ${report.description}`,
+          )
+          return false
+        }
+      },
+      (answered) => !answered,
+      deps.sleep,
+    )
   }
 
   /**
@@ -1027,6 +1120,10 @@ export function createCli(deps: CliDeps): CliHandlers {
     // exits 1 (b.jg5 SRJ-905). A persona stopped with the kill-failure
     // alert's survivor version counts as stopped: the survivor text changes
     // no exit status.
+    //
+    // b.jg5 SRJ-905: `stop --stop-bots` never starts the server. It has no
+    // answer check and no `start` spawn: after a failed teardown the server
+    // stays stopped, unlike clean_restart (SRJ-906).
     if (config !== null) {
       console.error('[slack] stop --stop-bots: gracefully exiting managed bots')
       const outcomes = await teardownBots(config.personas, config.exit_timeout)
@@ -1182,6 +1279,17 @@ export function createCli(deps: CliDeps): CliHandlers {
     return 1
   }
 
+  /**
+   * `clean_restart`, in this order (b.jg5 SRJ-901, SRJ-906): load the
+   * configuration the server runs, initialize the client, run the precheck
+   * (a failure stops nothing), spawn `stop`, tear down every persona and
+   * report it, then:
+   *   - every persona stopped: spawn `start`;
+   *   - a persona failed: the answer check (`agentDirectorAnswers`), then
+   *     spawn `start` if agent-director answers, or the not-restarted alert,
+   *     with no `start`, if it does not; then the last line and exit 1.
+   * Nothing is stopped before the precheck has passed.
+   */
   async function clean_restart(): Promise<void> {
     // Everything below goes to clean_restart.log. A fatal line is also written
     // to the stderr in place before the redirect, so a failed clean_restart
@@ -1192,6 +1300,17 @@ export function createCli(deps: CliDeps): CliHandlers {
     const fatal = (...args: unknown[]): void => {
       console.error(...args)
       if (console.error !== terminalError) terminalError(...args)
+    }
+    // The `start` spawn: one `start` of this CLI, whose own daemon startup
+    // report decides its status. A non-zero status prints the start-failed
+    // line through the fatal path. Answers the status; the caller exits.
+    const spawnStart = (): number | null => {
+      console.error('[slack] clean_restart: starting server')
+      const startResult = deps.spawnSync(process.execPath, [process.argv[1], 'start'])
+      if (startResult.status !== 0) {
+        fatal(`[slack] clean_restart: start failed with exit code ${startResult.status}`)
+      }
+      return startResult.status
     }
 
     // Phase 1: Load config (the persona set to check and tear down). An
@@ -1244,29 +1363,51 @@ export function createCli(deps: CliDeps): CliHandlers {
     // Each persona's report goes through the fatal path (the terminal once
     // and clean_restart.log), server.log and startup-errors.log once every
     // persona has settled (b.jg5 SRJ-907, SRJ-909), the survivor text
-    // included on a teardown that succeeded.
-    //
-    // b.qwo: a failed persona (AD unreachable at its state read included)
-    // aborts the restart — never proceed to `start` on top of bots we could
-    // not reach. The abort line comes before the last line, which is printed
-    // last. A persona stopped with the survivor version counts as stopped and
-    // the start goes ahead.
+    // included on a teardown that succeeded. A persona stopped with the
+    // survivor version counts as stopped: it takes no failure path.
     const outcomes = await teardownBots(personas, exit_timeout)
     const failed = reportTeardown(CLI_COMMAND_CLEAN_RESTART, personas, outcomes, (line) => fatal(line))
-    if (failed > 0) {
-      fatal('[slack] clean_restart: bot teardown failed — aborting restart; the server was not started')
+
+    // Phase 6: Start the server. After a teardown that stopped every persona,
+    // start as ever, with no answer check.
+    if (failed === 0) {
+      const status = spawnStart()
+      if (status !== 0) deps.exit(status ?? 1)
+      console.error('[slack] clean_restart: done')
+      return
+    }
+
+    // b.jg5 SRJ-906: a failed teardown restarts the server, so no failure
+    // ends with every persona down, once agent-director answers (one `list`
+    // of service=cscb rows within PRECHECK_TRIES tries, PRECHECK_TRY_SPACING_MS
+    // apart on the injected clock). The started server applies its ordinary
+    // start rules: a configured persona's own running row is kept, and a
+    // session conflict at its launch latches. A start that then fails prints its
+    // start-failed line and records no not-restarted entry. Either way the
+    // last line follows the restart's outcome and the exit is 1. Rows are
+    // never deleted.
+    if (await agentDirectorAnswers(CLI_COMMAND_CLEAN_RESTART)) {
+      console.error('[slack] clean_restart: agent-director answers — starting server after the failed teardown')
+      spawnStart()
       fatal(teardownNotStoppedLine(CLI_COMMAND_CLEAN_RESTART, failed))
       deps.exit(1)
     }
 
-    // Phase 6: Start new server and exit
-    console.error('[slack] clean_restart: starting server')
-    const startResult = deps.spawnSync(process.execPath, [process.argv[1], 'start'])
-    if (startResult.status !== 0) {
-      fatal(`[slack] clean_restart: start failed with exit code ${startResult.status}`)
-      deps.exit(startResult.status ?? 1)
-    }
-    console.error('[slack] clean_restart: done')
+    // b.qwo: agent-director did not answer, so the server is not started on
+    // top of bots CSCB could not reach. One alert names every failed persona
+    // with its session and class: printed through the fatal path, appended
+    // as one server.log line and recorded as one clean-restart-not-restarted
+    // entry, the same text on all three routes; both writes are best effort
+    // (b.jg5 SRJ-906, SRJ-1013). Nothing goes to Slack and nothing latches.
+    const failedPersonas: CleanRestartFailedPersona[] = outcomes.flatMap((outcome, i) =>
+      outcome.kind === TEARDOWN_OUTCOME_FAILED ? [{ persona: personas[i], errorClass: outcome.errorClass }] : [],
+    )
+    const alert = cleanRestartNotRestartedAlert(failedPersonas)
+    fatal(alert)
+    appendServerLog(CLI_COMMAND_CLEAN_RESTART, alert)
+    recordEntry(CLI_COMMAND_CLEAN_RESTART, { classLabel: CLEAN_RESTART_NOT_RESTARTED_LABEL, message: alert })
+    fatal(teardownNotStoppedLine(CLI_COMMAND_CLEAN_RESTART, failed))
+    deps.exit(1)
   }
 
   /**
@@ -1352,18 +1493,21 @@ function runCredentialsScript(credentialsFile: string): number {
 // Production agent-director operations for the precheck and the persona teardown
 // ---------------------------------------------------------------------------
 
-/** The agent-director operations the precheck and `teardownBots` use (the `director*` CliDeps). */
+/**
+ * The agent-director operations the precheck, `teardownBots` and
+ * `clean_restart`'s answer check use (the `director*` CliDeps).
+ */
 export type DirectorOps = Pick<
   CliDeps,
-  'directorGet' | 'directorReadPane' | 'directorStatus' | 'directorPause' | 'directorKill'
+  'directorGet' | 'directorReadPane' | 'directorStatus' | 'directorPause' | 'directorKill' | 'directorList'
 >
 
 /** The part of the agent-director Client that `createDirectorOps` calls. */
-export type DirectorClient = Pick<Client, 'get' | 'readPane' | 'status' | 'pause' | 'kill'>
+export type DirectorClient = Pick<Client, 'get' | 'readPane' | 'status' | 'pause' | 'kill' | 'list'>
 
 /**
  * Build the production `directorGet` / `directorReadPane` /
- * `directorStatus` / `directorPause` / `directorKill` deps over `getClient`
+ * `directorStatus` / `directorPause` / `directorKill` / `directorList` deps over `getClient`
  * (the agent-director singleton accessor in production). `getClient` is
  * called on every operation, so the Client installed by `initClient` is
  * picked up and an uninstalled one throws at the call.
@@ -1376,6 +1520,9 @@ export type DirectorClient = Pick<Client, 'get' | 'readPane' | 'status' | 'pause
  * `directorReadPane`, `directorPause` and `directorKill` pass every error
  * through, ErrSpawnNotFound included. `directorKill` answers the kill result
  * as given, for the teardown's checked kill (b.jg5 SRJ-110, SRJ-904).
+ * `directorList` makes one `list` filtered by `SERVICE_LABEL` alone and
+ * answers its rows, passing every error through, for `clean_restart`'s
+ * answer check (b.jg5 SRJ-906).
  *
  * b.jg5 SRJ-114, SRJ-801, SRJ-807: `directorGet` and `directorStatus` apply
  * no row-read rule and the CLI installs no latch and no retired-key store, so
@@ -1416,6 +1563,13 @@ export function createDirectorOps(getClient: () => DirectorClient): DirectorOps 
     // reaches) is a plain success there (b.jg5 SRJ-110, SRJ-902).
     directorKill: async (id) => {
       return getClient().kill({ claude_instance_id: id })
+    },
+    // The service label is the only filter: no state filter, no other label
+    // (b.jg5 SRJ-906). Every error passes through; the answer check counts
+    // each as a failed try.
+    directorList: async () => {
+      const r = await getClient().list({ label: [SERVICE_LABEL] })
+      return r.spawns
     },
   }
 }
@@ -1502,6 +1656,7 @@ if (import.meta.main) {
     directorStatus: directorOps.directorStatus,
     directorPause: directorOps.directorPause,
     directorKill: directorOps.directorKill,
+    directorList: directorOps.directorList,
     // b.jg5 SRJ-909: the teardown's server.log lines and startup-errors.log
     // entries, in the state directory the server uses, the entries with no
     // copy on fd 2.
