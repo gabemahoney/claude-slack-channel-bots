@@ -171,6 +171,8 @@ import {
   promptRowTakenAsAliveLine,
   workingRowAbsentAtPaneReadLine,
   workingRowPaneGoneLine,
+  LIVENESS_STATUS_SITE,
+  RECONNECT_STATUS_SITE,
 } from '../src/server.ts'
 import { buildPersonaClientOrExit, type PersonaClientDeps } from '../src/agent-director-startup.ts'
 import {
@@ -264,7 +266,7 @@ import {
   LIVE_ROW_SEQUENCE_ENTRY_KILL,
   LIVE_ROW_START_STARTED,
 } from '../src/live-row-sequence.ts'
-import { _resetRetiredKeyStore, setRetiredKeyStore, SPAWN_ACTION_FRESH_RETIRED } from '../src/session-manager.ts'
+import { _resetLiveRowSequenceRegistry, _resetRetiredKeyStore, setRetiredKeyStore, SPAWN_ACTION_FRESH_RETIRED } from '../src/session-manager.ts'
 import { loadRetiredKeyStore, RETIRED_KEY_CAUSE_REMOVED, retiredKeysPath, type RetiredKeyStore } from '../src/retired-keys.ts'
 import { RETIRED_ENTRY_CLEARING_STATES } from '../src/row-read-rules.ts'
 import { readRetiredKeysRecord, retiredKeysRecordOf, writeRetiredKeysRecord, type RetiredKeySeed } from './test-helpers/retired-keys.ts'
@@ -3985,6 +3987,52 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(h.sendKeysCalls).toEqual([])
       expect(latchedLines(errArgs)).toEqual(latched ? [latchedLine('')] : [])
     })
+
+    // b.jg5 SRJ-805: the store is asked again right before typing, after the
+    // awaited pane read, as the latch is: C1, not recorded when its attempt
+    // read the row, recorded with no mark (an apply's step 1) while the pane
+    // read is out, is an old life: nothing is typed, the live-row sequence
+    // starts for it (read from a recording registry, which runs nothing) and
+    // the attempt answers transient. The store is loaded over the case's own
+    // temp state directory and installed as main() installs it.
+    test.each<readonly [string, () => Parameters<typeof makeHarness>[0], number, string]>([
+      ["a waiting row's pane read", () => ({ statusState: 'waiting' }), 0, 'waiting'],
+      ["a stale working row's pane read", staleWorkingRow, 1, 'working'],
+    ])("C1 recorded as retired during %s → 'transient': nothing typed or swept, and one sequence start for its old life with the retired-key flag, seeded with the state read; one old-life line", async (_label, opts, before, state) => {
+      const dir = mkdtempSync(join(tmpdir(), 'server-retired-reconnect-'))
+      try {
+        const loaded = loadRetiredKeyStore(dir, { log: () => {} })
+        if (loaded.kind !== 'loaded') throw new Error(loaded.message)
+        setRetiredKeyStore(loaded.store)
+        const starts = recordSequenceStarts()
+        const h = makeHarness(opts())
+        for (let i = 0; i < before; i++) {
+          expect(await h.adapter('C1')).toBe('transient')
+          await clock.advance(STALE_WORKING_WINDOW_MS)
+        }
+        const stub = h.stub as unknown as Record<string, (params: unknown) => Promise<unknown>>
+        const readPane = stub['readPane']!.bind(h.stub)
+        stub['readPane'] = async (params) => {
+          loaded.store.record([{ key: 'C1', cause: RETIRED_KEY_CAUSE_REMOVED }])
+          return readPane(params)
+        }
+
+        const { result, errArgs } = await capturingErrorArgs(() => h.adapter('C1'))
+
+        expect(result).toBe('transient')
+        expect(h.readPaneCalls).toEqual(fullPaneReads(before + 1))
+        expect(h.sendKeysCalls).toEqual([])
+        expect(h.findMissingCalls).toHaveLength(0)
+        expect(starts).toEqual([expect.objectContaining({ key: 'C1', lastReadState: state, retiredKey: true, keepsConversation: false, launches: true })])
+        expect(stringLines(errArgs).filter((line) => line.includes(' and its key is retired with no new life begun'))).toEqual([
+          `[slack] reconnectSession: persona=C1 is ${state} and its key is retired with no new life begun — not typing /mcp reconnect into its old life; the live-row sequence replaces it (start answered ${LIVE_ROW_START_STARTED}); deferring (b.jg5 SRJ-805)`,
+        ])
+      } finally {
+        _resetLiveRowSequenceRegistry()
+        _resetRetiredKeyStore()
+        rmSync(dir, { recursive: true, force: true })
+      }
+    })
   })
 })
 
@@ -4023,8 +4071,8 @@ describe('b.jg5 SRJ-115, SRJ-512, SRJ-513: a latching own-row status at the live
   const pendingRow = (start: string | null | undefined): Phase1StatusResult =>
     cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: start })
 
-  const LIVENESS_SITE = 'isSessionAlive: status'
-  const RECONNECT_SITE = 'reconnectSession: status check'
+  const LIVENESS_SITE = `${LIVENESS_STATUS_SITE.site}: ${LIVENESS_STATUS_SITE.what}`
+  const RECONNECT_SITE = `${RECONNECT_STATUS_SITE.site}: ${RECONNECT_STATUS_SITE.what}`
   /** The reconnect adapter's `pending` deferral line for C1 begins with this. */
   const DEFERRAL_HEAD = '[slack] Deferring persona=C1: its row reads pending'
 
@@ -4469,8 +4517,8 @@ describe('b.jg5 SRJ-704, SRJ-1016: the liveness and reconnect adapters\' own-row
 
 describe('b.jg5 SRJ-807, SRJ-115: the liveness and reconnect adapters clear a retired key\'s entry on its own row read live other than pending with its mark set, and read and answer as before', () => {
   const SEED: RetiredKeySeed = { cause: RETIRED_KEY_CAUSE_REMOVED, mark: true }
-  const LIVENESS_SITE = { site: 'isSessionAlive', what: 'status' }
-  const RECONNECT_SITE = { site: 'reconnectSession', what: 'status check' }
+  const LIVENESS_SITE = LIVENESS_STATUS_SITE
+  const RECONNECT_SITE = RECONNECT_STATUS_SITE
 
   let dir: string
   let store: RetiredKeyStore
@@ -4682,6 +4730,8 @@ describe('b.jg5 SRJ-805: the reconnect adapter starts the live-row sequence for 
         entryStep: LIVE_ROW_SEQUENCE_ENTRY_KILL,
         keepsConversation: false,
         retiredKey: true,
+        // The start entry's reading of P when the request came: recorded once, no mark (b.jg5 SRJ-806).
+        retiredAtStart: { recorded: true, marked: false, generation: 1 },
         launches: true,
         alertContext: KILL_FAILURE_CONTEXT_RECOVERY,
       },

@@ -182,7 +182,6 @@ import {
   ORPHAN_CLEANUP_LABEL,
   PERSONA_KILL_FAILED_LABEL,
   PERSONA_KILL_SURVIVOR_LABEL,
-  describeKillFailureDescriptions,
   killFailureAlertEntryText,
   killFailureAlertText,
   killFailureClosingSentence,
@@ -219,6 +218,8 @@ import {
   createPersonaEpisodes,
   createTmuxUnresponsiveCondition,
   createUnclassifiedErrorEpisodes,
+  KILL_FAILURE_STOP_CAUSE_DEFAULT,
+  killFailureStoppedRetryText,
   tmuxUnresponsiveAlertText,
   tmuxUnresponsiveOnsetText,
   tmuxUnresponsiveRecoveryText,
@@ -278,7 +279,7 @@ import {
 } from './test-helpers/agent-director-stub.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
-import { makeNotifierHarness, teardownNoticeEntry, type NotifierHarness } from './test-helpers/persona-notifier.ts'
+import { makeNotifierHarness, teardownNoticeEntry, teardownNoticeLine, type NotifierHarness } from './test-helpers/persona-notifier.ts'
 import {
   BOT_TOKEN_PREFIX,
   LEAK_SENTINEL,
@@ -2725,25 +2726,30 @@ describe('the kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)', () => {
     return alerts.raise(raiseInput(key, decision, KILL_FAILURE_CONTEXT_RECOVERY, extra))
   }
 
-  // A stopped retry's record (b.jg5 SRJ-702): its fixed words, pinned here.
+  // A stopped retry's record (b.jg5 SRJ-702): built by
+  // `killFailureStoppedRetryText`, whose fixed words are pinned once below.
   /** The class and cause a stopped raise in these cases names. */
   const STOP: RaiseExtra = { stopped: true, lastOutcomeClass: AD_ERROR_CLASS_UNAVAILABLE, stopCause: 'its teardown began between its tries' }
 
-  /** What a stopped raise's line says after `kill-failure `, with no context: `extra`'s class and cause, or none and the generic cause. */
-  function stoppedText(decision: KillRetryAlert, extra: RaiseExtra = STOP): string {
-    const cause = extra.stopCause ?? 'the persona is not up or is torn down, or the server is shutting down'
-    const lastClass = extra.lastOutcomeClass === undefined ? '' : `; its last outcome's class: ${extra.lastOutcomeClass}`
-    return `ordinary alert not raised — its tries were stopped (${cause})${lastClass}, so nothing retries this kill; ${describeKillFailureDescriptions(decision)}`
+  /** The stopped-retry line and entry text for persona `key` of `decision` in `context`, with `extra`'s class and cause. */
+  function stoppedText(key: string, decision: KillRetryAlert, context: KillFailureAlertContext, extra: RaiseExtra): { line: string; entry: string } {
+    return killFailureStoppedRetryText({
+      key,
+      decision,
+      context,
+      ...(extra.lastOutcomeClass === undefined ? {} : { lastOutcomeClass: extra.lastOutcomeClass }),
+      ...(extra.stopCause === undefined ? {} : { stopCause: extra.stopCause }),
+    })
   }
 
   /** The one line of a stopped raise for persona `key` in `context`. */
   function stoppedLine(key: string, decision: KillRetryAlert, context: KillFailureAlertContext = KILL_FAILURE_CONTEXT_RECOVERY, extra: RaiseExtra = STOP): string {
-    return `[slack] persona-episodes: persona=${key} ${KIND} ${stoppedText(decision, extra)} (${context})`
+    return stoppedText(key, decision, context, extra).line
   }
 
   /** The `persona-kill-failed` entry of a stopped raise for persona `key` no longer configured: the line's content, no alert text. */
   function stoppedEntry(key: string, decision: KillRetryAlert, context: KillFailureAlertContext = KILL_FAILURE_CONTEXT_RECOVERY, extra: RaiseExtra = STOP): { classLabel: string; entry: string } {
-    return { classLabel: PERSONA_KILL_FAILED_LABEL, entry: killFailureAlertEntryText(`persona=${key}`, context, `the kill-failure ${stoppedText(decision, extra)}`) }
+    return { classLabel: PERSONA_KILL_FAILED_LABEL, entry: stoppedText(key, decision, context, extra).entry }
   }
 
   /** The line written after a stopped raise's entry. */
@@ -2895,6 +2901,21 @@ describe('the kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)', () => {
     expectNoAlertText('Q', logOnlyCalls[0]!.entry, ordinary())
     expect(posts).toEqual([])
     expect([alerts.isOpen('K'), alerts.isOpen('Q')]).toEqual([false, false])
+  })
+
+  // The stopped-retry text's one literal pin (b.jg5 SRJ-702, SRJ-1013); every
+  // other case builds it with `killFailureStoppedRetryText`.
+  test('the stopped-retry line and entry, and the default stop cause (pin)', () => {
+    const decision: KillRetryAlert = { kind: KILL_RETRY_ALERT_ORDINARY, lastKillFailedDescription: 'kill failed' }
+
+    expect(KILL_FAILURE_STOP_CAUSE_DEFAULT).toBe('the persona is not up or is torn down, or the server is shutting down')
+    expect(killFailureStoppedRetryText({ key: 'K', decision, context: KILL_FAILURE_CONTEXT_RECOVERY, lastOutcomeClass: AD_ERROR_CLASS_UNAVAILABLE, stopCause: 'stop' })).toEqual({
+      line: '[slack] persona-episodes: persona=K kill-failure ordinary alert not raised — its tries were stopped (stop); its last outcome\'s class: UNAVAILABLE, so nothing retries this kill; last="kill failed" (recovery)',
+      entry: 'persona=K (recovery): the kill-failure ordinary alert not raised — its tries were stopped (stop); its last outcome\'s class: UNAVAILABLE, so nothing retries this kill; last="kill failed"',
+    })
+    expect(killFailureStoppedRetryText({ key: 'K', decision: { kind: KILL_RETRY_ALERT_ORDINARY }, context: KILL_FAILURE_CONTEXT_RECOVERY }).line).toBe(
+      '[slack] persona-episodes: persona=K kill-failure ordinary alert not raised — its tries were stopped (the persona is not up or is torn down, or the server is shutting down), so nothing retries this kill; no description (recovery)',
+    )
   })
 
   // b.jg5 SRJ-702: the stop's line quotes the latest survivor-naming
@@ -3197,9 +3218,7 @@ describe('the kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)', () => {
 
       const text = killFailureAlertText(contentOf(key, ordinary()), KILL_FAILURE_CLOSING_LOG_ONLY, false)
       expect(h.startupEntries()).toEqual([teardownNoticeEntry(removed, text)])
-      expect(h.logs).toEqual([
-        `[slack] persona-notifier: notice for ${renderPersonaRef(removed.name, key)} raised during its teardown — written to the server log and startup-errors.log (${PERSONA_TEARDOWN_NOTICE_LABEL}), not posted: ${text.split('\n')[0]}`,
-      ])
+      expect(h.logs).toEqual([teardownNoticeLine(removed, text)])
       expect(h.totalPosts()).toBe(0)
       expect(logOnlyCalls).toEqual([stoppedEntry(key, ordinary())])
       expect(killLines(key)).toEqual([

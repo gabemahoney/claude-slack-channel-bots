@@ -214,6 +214,33 @@ export const RELOAD_RETIRED_KEYS_RESTORE_FAILED =
   'recorded that reached the file stays retired'
 
 /**
+ * What a failed rewrite's `reload-record-write-failed` line adds once step 1
+ * wrote the retired-key record and putting it back succeeded (b.jg5 SRJ-804),
+ * for the record at `path` (quoted as JSON in the line):
+ *
+ *   ; the retired-key record "<path>" is put back to what it held before this apply: the keys this apply recorded are removed again, and keys recorded before it stay (b.jg5 SRJ-804)
+ */
+export function reloadRetiredKeysPutBackClause(path: string): string {
+  return (
+    `; the retired-key record ${JSON.stringify(path)} is put back to what it held before this apply: the keys this apply ` +
+    'recorded are removed again, and keys recorded before it stay (b.jg5 SRJ-804)'
+  )
+}
+
+/**
+ * What the same line adds when putting the record at `path` back failed
+ * (b.jg5 SRJ-804):
+ *
+ *   ; putting the retired-key record "<path>" back to what it held before this apply failed, so the keys this apply recorded stay retired (b.jg5 SRJ-804)
+ */
+export function reloadRetiredKeysPutBackFailedClause(path: string): string {
+  return (
+    `; putting the retired-key record ${JSON.stringify(path)} back to what it held before this apply failed, so the keys this ` +
+    'apply recorded stay retired (b.jg5 SRJ-804)'
+  )
+}
+
+/**
  * Nothing is pending any more: the configuration file and the credentials
  * files it references match what is applied again (a revert, or a leftover
  * `config.json.pending` found obsolete at the first check after a start), and
@@ -1445,16 +1472,14 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
   /**
    * What a failed rewrite's `reload-record-write-failed` line adds once step 1
    * wrote the retired-key record (b.jg5 SRJ-804): the record put back to what
-   * it held before the apply, or, when that restore failed, that the keys
-   * this apply recorded stay retired.
+   * it held before the apply (`reloadRetiredKeysPutBackClause`), or, when that
+   * restore failed, that the keys this apply recorded stay retired
+   * (`reloadRetiredKeysPutBackFailedClause`).
    */
   function retiredKeysRestoredClause(store: RetiredKeyStore, restore: RetiredKeysRestoreOutcome): string {
-    const file = JSON.stringify(store.path)
     return restore === RETIRED_KEYS_WRITE_FAILED
-      ? `; putting the retired-key record ${file} back to what it held before this apply failed, so the keys this ` +
-          'apply recorded stay retired (b.jg5 SRJ-804)'
-      : `; the retired-key record ${file} is put back to what it held before this apply: the keys this apply ` +
-          'recorded are removed again, and keys recorded before it stay (b.jg5 SRJ-804)'
+      ? reloadRetiredKeysPutBackFailedClause(store.path)
+      : reloadRetiredKeysPutBackClause(store.path)
   }
 
   /**

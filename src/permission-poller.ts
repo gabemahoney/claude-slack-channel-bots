@@ -248,7 +248,7 @@ export interface PollerDeps {
    * warning is handed to its `notify`, whose window writes it as a teardown
    * notice (one log line and one `persona-teardown-notice` entry), never
    * posted, held or dropped. Absent, or outside a window: the warning goes
-   * through the destination hold as before.
+   * through the destination hold (`destinationHold`).
    */
   teardownNotices?: Pick<PersonaNotifier, 'notify' | 'teardownWindowState'>
   /**

@@ -126,8 +126,12 @@
  *     `/mcp reconnect`.
  * The ladder answers `sequence-waiting` whatever the start answers. While
  * P's key is recorded as retired the start entry sets the retired-key flag
- * whatever the starter asked (SRJ-805), so no sequence for such a key ends
- * in a `resume`.
+ * whatever the starter asked (SRJ-805), and step 6 reads the store again
+ * through P's facts, so no sequence ends in a `resume` for a key recorded
+ * at its start or while it ran. The request carries the store's reading of
+ * the key when its launch attempt began (`retiredAtStart`), which step 6
+ * hands its launch unchanged, so a reuse marks a new life only when no
+ * recording named the key since (SRJ-806).
  *
  * The module holds no module-scope state, runs nothing at
  * import, and loads neither the session manager, the server, the notifier
@@ -200,6 +204,22 @@ export const LIVE_ROW_SEQUENCE_NO_ROW = 'no-row'
 // The request
 // ---------------------------------------------------------------------------
 
+/**
+ * What the installed retired-key store said of a persona's key when a launch
+ * attempt started (SRJ-806): whether the key was recorded, whether its "new
+ * life has begun" mark was set, and its record generation (undefined when
+ * the key was not recorded or the generation could not be read). A reuse
+ * spawn made in that attempt sets the mark at its success only when the key
+ * was recorded then and no recording has named it since, so a launch decided
+ * before a recording never marks the life it began as the new one. The
+ * sequence never reads it; it hands it to step 6's launch unchanged.
+ */
+export interface RetiredKeyAttemptStart {
+  readonly recorded: boolean
+  readonly marked: boolean
+  readonly generation: number | undefined
+}
+
 /** What a starter asks for. */
 export interface LiveRowSequenceRequest {
   /** Persona P's key. */
@@ -216,6 +236,13 @@ export interface LiveRowSequenceRequest {
   readonly keepsConversation: boolean
   /** Whether P's key is retired. */
   readonly retiredKey: boolean
+  /**
+   * The retired-key store's reading of P's key when the launch attempt that
+   * started the sequence began (the collision ladder's start, or the start
+   * entry's own read, `startLiveRowSequence`), handed to step 6's launch
+   * (SRJ-806). Absent: the launch reads the store just before its reuse call.
+   */
+  readonly retiredAtStart?: RetiredKeyAttemptStart
   /** Whether the sequence ends in a launch; false only for an old-life wait's steps (the no-launch form). */
   readonly launches: boolean
   /** The kill-failure alert's context, one of `src/kill-failure-alert.ts`'s. */
@@ -336,12 +363,16 @@ export type LiveRowSequenceLaunchReason =
  * P's facts for step 6, from the applied configuration and the existing row
  * comparison (`compareRowToPersona`): `resume_enabled`, and whether the
  * row's `cwd` and `config_dir` label match P. A comparison that cannot be
- * made (no row) answers both as matching.
+ * made (no row) answers both as matching. `retired` is the installed
+ * retired-key store's reading at step 6 (SRJ-805): true while P's key is
+ * recorded, marked or not, so a key recorded after the sequence started
+ * still ends in a reuse, never a `resume`; absent reads as not recorded.
  */
 export interface LiveRowSequencePersonaFacts {
   readonly resumeEnabled: boolean
   readonly cwdMatches: boolean
   readonly configDirMatches: boolean
+  readonly retired?: boolean
 }
 
 /** What step 6's decision is given. */
@@ -748,13 +779,14 @@ export interface LiveRowSequenceDeps {
   raiseKillAlert(key: string, retried: KillRetryResult, context: KillFailureAlertContext, ref: string, stopCause?: string): void
   /** Raise step 5's alert: the ordinary version with no description, with the request's context. */
   raiseEscalationAlert(key: string, context: KillFailureAlertContext, ref: string): void
-  /** P's facts for step 6, against the row last read; undefined when P is not applied. */
+  /** P's facts for step 6, against the row last read, the store's retired-key reading included; undefined when P is not applied. */
   personaFacts(key: string, row: LiveRowSequenceRow | undefined): LiveRowSequencePersonaFacts | undefined
   /**
    * Step 6's launch through the session manager's sequence-launch entry. The
    * sequence's stop signal goes with it: a launch that waits for another
    * launch of P to settle makes no call once the signal is set (SRJ-706).
-   * The sequence always passes it.
+   * The sequence always passes it, and the request's `retiredAtStart`
+   * (SRJ-806) as it is.
    */
   launch(
     key: string,
@@ -762,6 +794,7 @@ export interface LiveRowSequenceDeps {
     lastRead: LiveRowSequenceLastRead,
     ref: string,
     stop?: LiveRowSequenceStopSignal,
+    retiredAtStart?: RetiredKeyAttemptStart,
   ): Promise<LiveRowSequenceLaunchAnswer>
   /** Arm P's retry timer with the cause; never counted. */
   armRetry(key: string, cause: LiveRowSequenceArmCause): void
@@ -1337,14 +1370,16 @@ export async function runLiveRowSequence(
     } catch {
       facts = undefined
     }
+    // SRJ-805: the store is read again here, so a key recorded while the
+    // sequence ran ends in a reuse as one recorded at its start does.
     const decision = decideLiveRowLaunchKind({
       keepsConversation: request.keepsConversation,
-      retiredKey: request.retiredKey,
+      retiredKey: request.retiredKey || facts?.retired === true,
       row,
       persona: facts,
     })
     log(liveRowSequenceLaunchLine(ref, decision))
-    const answer = await deps.launch(key, decision.kind, lastRead, ref, stop)
+    const answer = await deps.launch(key, decision.kind, lastRead, ref, stop, request.retiredAtStart)
     const droppedBy = dropStop()
     if (droppedBy !== undefined) {
       // SRJ-706: the launch ran to its end; its result is dropped.

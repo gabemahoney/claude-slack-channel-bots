@@ -315,7 +315,9 @@
  *   lines go to `run.logs` and its times come from `run.clock`. `run
  *   .retiredKeys` is the store (to seed a key held only in memory, record a
  *   batch through it with the writer failing). The record's path is
- *   `retiredKeysPath(h.stateDir)`; seed and read it with
+ *   `retiredKeysPath(h.stateDir)` (`h.retiredKeysFile`; `h.retiredKeysWrite(ok?)`
+ *   and `h.lastAppliedWrite(ok?)` are the writer calls on it and on the
+ *   last-applied record, as `run.writes` holds them); seed and read it with
  *   `tests/test-helpers/retired-keys.ts`. A later run over the same
  *   directories (a restart) loads a new store from the disk; a record it
  *   cannot load makes `h.build` throw. A realLaunch run also installs that
@@ -677,7 +679,7 @@ import {
   type ReloadTick,
   type ReloadTickDriver,
 } from '../../src/reload.ts'
-import { loadRetiredKeyStore, type RetiredKeyStore } from '../../src/retired-keys.ts'
+import { loadRetiredKeyStore, retiredKeysPath, type RetiredKeyStore } from '../../src/retired-keys.ts'
 import {
   cannedGetResult,
   cannedStatusResult,
@@ -1947,6 +1949,12 @@ export interface ReloadHarness {
   rowOf(name: string): AgentDirectorRow | undefined
   /** `reloadFilePaths(<dir>/config.json)`. */
   readonly paths: ReloadFilePaths
+  /** The retired-key record's path, `retiredKeysPath(stateDir)` (b.jg5 SRJ-802). */
+  readonly retiredKeysFile: string
+  /** A writer call on the retired-key record, as `run.writes` holds it: apply step 1's record, or a restore (b.jg5 SRJ-803, SRJ-804). */
+  retiredKeysWrite(ok?: boolean): ReloadRunActivity['writes'][number]
+  /** A writer call on the last-applied record (`paths.lastApplied`), as `run.writes` holds it. */
+  lastAppliedWrite(ok?: boolean): ReloadRunActivity['writes'][number]
   /** The persona key of `name` (`personaKey`). */
   key(name: string): string
   /** A file-form persona named `name`: its own `all` channel, DMs off, paths under `<root>/personas/<key>/`. */
@@ -3524,6 +3532,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       return launchStartedAt === undefined ? read : { ...read, launchStartedAt }
     },
     paths,
+    retiredKeysFile: retiredKeysPath(stateDir),
+    retiredKeysWrite: (ok = true) => ({ path: retiredKeysPath(stateDir), ok }),
+    lastAppliedWrite: (ok = true) => ({ path: paths.lastApplied, ok }),
     key: (name) => personaKey(name),
     persona(name, overrides = {}) {
       let channel = channels.get(name)

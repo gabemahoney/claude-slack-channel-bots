@@ -171,7 +171,9 @@
  * Any key's own row read live other than `pending` while the installed
  * retired-key store (`setRetiredKeyStore`) has the key recorded with its
  * mark set clears the key's entry, beside any latch the same read decides
- * (b.jg5 SRJ-807).
+ * (b.jg5 SRJ-807); the persona teardown kill's `status` read between its
+ * tries applies that clear alone and latches nothing (`readTeardownKillRow`,
+ * SRJ-715, SRJ-115).
  * An UNUSABLE NAME answer to either read latches the persona with the state
  * unreadable. A read that latched answers `latched`, and the caller calls
  * nothing more for the persona: no `send-keys`, kill, delete or launch, and
@@ -498,6 +500,7 @@ import {
 import {
   LATCHING_LIVENESS_NOTE,
   decideOwnRowRead,
+  decideRetiredEntryClear,
   isLatchingLivenessNote,
   isPersonaOwnRow,
   type RowReadClearDecision,
@@ -566,6 +569,7 @@ import {
   type LiveRowSequenceStartAnswer,
   type LiveRowSequenceStopReason,
   type LiveRowSequenceStopSignal,
+  type RetiredKeyAttemptStart,
 } from './live-row-sequence.ts'
 import { recordStartupError } from './startup-errors.ts'
 import {
@@ -1428,9 +1432,9 @@ export function _resetConfiguredPersonaQuery(): void {
  * `mark`, the "new life has begun" mark's one writer, called when a reuse
  * spawn for a recorded key succeeds and, to write again a mark whose write
  * failed, at the key's next launch decision (SRJ-806); and
- * `recordGeneration`, read by a reuse spawn just before its call and at its
- * success, so that a key recorded during the call, a re-record that wrote
- * nothing included, gets no mark (`reuseSuccessAction`, SRJ-806).
+ * `recordGeneration`, read when a launch attempt starts and at a reuse
+ * spawn's success, so that a key recorded during the attempt, a re-record
+ * that wrote nothing included, gets no mark (`reuseSuccessAction`, SRJ-806).
  */
 export type SessionRetiredKeys = Pick<RetiredKeyStore, 'isRecorded' | 'isMarked' | 'mark' | 'clear' | 'recordGeneration'>
 
@@ -1523,9 +1527,10 @@ export function retiredKeyReadingOf(key: string): RetiredKeyReading {
 /**
  * Persona key `key`'s record generation in the installed store (b.jg5
  * SRJ-806): how many recordings named it in this server's life
- * (`RetiredKeyStore.recordGeneration`), read by a reuse spawn just before its
- * call and at its success. Undefined with no store installed, or when the
- * query throws, which gives one line; `reuseSuccessAction` takes an
+ * (`RetiredKeyStore.recordGeneration`), read when a launch attempt starts
+ * (`retiredKeyAttemptStartOf`) and at a reuse spawn's success. Undefined
+ * with no store installed, or when the query throws, which gives one line;
+ * `reuseSuccessAction` takes an
  * undefined generation as a recording it cannot rule out, so no mark is set,
  * erring toward a fresh start. Never throws.
  */
@@ -1536,7 +1541,7 @@ function retiredRecordGenerationOf(key: string): number | undefined {
     return store.recordGeneration(key)
   } catch (err) {
     console.error(
-      `[slack] retired-keys: the record-generation query for ${keyRef(key)} failed: ${describeThrownValue(err)}; a recording during the reuse spawn cannot be ruled out, so no mark is set (b.jg5 SRJ-806)`,
+      `[slack] retired-keys: the record-generation query for ${keyRef(key)} failed: ${describeThrownValue(err)}; a recording during the launch attempt cannot be ruled out, so no mark is set (b.jg5 SRJ-806)`,
     )
     return undefined
   }
@@ -1566,27 +1571,68 @@ function retiredLaunchReadingOf(key: string): RetiredKeyReading {
 }
 
 /**
- * The action a reuse spawn of persona `key` that succeeded answers (b.jg5
- * SRJ-806, SRJ-112's success row), given `before`, the installed store's
- * reading of the key, and `generationBefore`, its record generation
- * (`retiredRecordGenerationOf`), both taken just before the reuse's call:
- *   - `fresh-retired` when the key was recorded both before the call and now,
- *     and its record generation now equals `generationBefore`, so no
- *     recording named it during the call: its "new life has begun" mark is
- *     set through the store's `mark`, the mark's one writer, unless it is
- *     already set;
- *   - `spawned` for a key not recorded now, with nothing written;
- *   - `spawned` for a key recorded during the call (not recorded before it,
- *     or recorded again while the call was in flight, whether that cleared a
- *     mark or, for a key with no mark, wrote nothing; a generation that
- *     could not be read counts as such a recording): the launch was decided
- *     before that recording, so its life is the life being retired, and no
- *     mark is set. One line, `<how>` being "it was not recorded when the call
- *     was made", "recorded again while the reuse was in flight" or "its
- *     record generation could not be read, so a recording during the call
- *     cannot be ruled out":
+ * The installed store's reading of persona key `key` and its record
+ * generation when a launch attempt starts (b.jg5 SRJ-806;
+ * `RetiredKeyAttemptStart`): `reading` when the attempt has already read the
+ * key (the collision ladder's launch decision), else `retiredKeyReadingOf`;
+ * the generation is read only for a recorded key
+ * (`retiredRecordGenerationOf`). Taken by the collision ladder at its start
+ * (`runPersonaLadder`), by the live-row sequence's start entry
+ * (`startLiveRowSequence`), and by a reuse spawn with no attempt context just
+ * before its call. Never throws.
+ */
+function retiredKeyAttemptStartOf(key: string, reading: RetiredKeyReading = retiredKeyReadingOf(key)): RetiredKeyAttemptStart {
+  return { recorded: reading.recorded, marked: reading.marked, generation: reading.recorded ? retiredRecordGenerationOf(key) : undefined }
+}
+
+/** `<how>` of the in-flight reuse line: the key was not recorded when the launch attempt started (b.jg5 SRJ-806). */
+export const REUSE_RECORDED_SINCE_NOT_RECORDED_AT_START = 'it was not recorded when the launch attempt started'
+
+/** `<how>` of the in-flight reuse line: a recording named the key again since the launch attempt started (b.jg5 SRJ-806). */
+export const REUSE_RECORDED_SINCE_RECORDED_AGAIN = 'recorded again while the launch attempt was in flight'
+
+/** `<how>` of the in-flight reuse line: a record generation could not be read (b.jg5 SRJ-806). */
+export const REUSE_RECORDED_SINCE_GENERATION_UNREADABLE =
+  'its record generation could not be read, so a recording during the launch attempt cannot be ruled out'
+
+/** How a key came to be recorded during a reuse spawn's launch attempt: one of the three `<how>` texts. */
+export type ReuseRecordedSince =
+  | typeof REUSE_RECORDED_SINCE_NOT_RECORDED_AT_START
+  | typeof REUSE_RECORDED_SINCE_RECORDED_AGAIN
+  | typeof REUSE_RECORDED_SINCE_GENERATION_UNREADABLE
+
+/**
+ * The in-flight reuse line (b.jg5 SRJ-806, SRJ-805): a reuse spawn of `ref`
+ * succeeded for a key recorded during its launch attempt (`how`), so no mark
+ * is set:
  *
- *   [slack] reuseSpawnForPersona: <ref>'s key was recorded as retired while this reuse spawn was in flight (<how>) — the launch was decided before that recording, so its life is the old life: no mark is set; answering spawned (b.jg5 SRJ-806, SRJ-805)
+ *   [slack] reuseSpawnForPersona: <ref>'s key was recorded as retired while this reuse spawn's launch attempt was in flight (<how>) — the launch was decided before that recording, so its life is the old life: no mark is set; answering spawned (b.jg5 SRJ-806, SRJ-805)
+ */
+export function reuseRecordedInFlightLine(ref: string, how: ReuseRecordedSince): string {
+  return `[slack] ${REUSE_SPAWN_SITE}: ${ref}'s key was recorded as retired while this reuse spawn's launch attempt was in flight (${how}) — the launch was decided before that recording, so its life is the old life: no mark is set; answering spawned (b.jg5 SRJ-806, SRJ-805)`
+}
+
+/**
+ * The action a reuse spawn of persona `key` that succeeded answers (b.jg5
+ * SRJ-806, SRJ-112's success row), given `start`, the installed store's
+ * reading of the key and its record generation when the launch attempt the
+ * reuse runs in started (`retiredKeyAttemptStartOf`; just before the call
+ * for a reuse with no attempt context):
+ *   - `fresh-retired` when the key was recorded both at the attempt's start
+ *     and now, and its record generation now equals the start's, so no
+ *     recording named it since: its "new life has begun" mark is set through
+ *     the store's `mark`, the mark's one writer, unless it is already set;
+ *   - `spawned` for a key not recorded now, with nothing written;
+ *   - `spawned` for a key recorded since the attempt started (not recorded
+ *     then, or recorded again since, whether that cleared a mark or, for a
+ *     key with no mark, wrote nothing; a generation that could not be read
+ *     counts as such a recording): the launch was decided before that
+ *     recording, under the declaration the attempt carries, so its life is
+ *     the life being retired, and no mark is set. One line
+ *     (`reuseRecordedInFlightLine`, `<how>` one of the
+ *     `REUSE_RECORDED_SINCE_*` texts):
+ *
+ *   [slack] reuseSpawnForPersona: <ref>'s key was recorded as retired while this reuse spawn's launch attempt was in flight (<how>) — the launch was decided before that recording, so its life is the old life: no mark is set; answering spawned (b.jg5 SRJ-806, SRJ-805)
  *
  * For `fresh-retired`, one line names `ref`, that its new life has begun and
  * what the mark's write did:
@@ -1598,30 +1644,23 @@ function retiredLaunchReadingOf(key: string): RetiredKeyReading {
  * next launch decision (`retiredLaunchReadingOf`); a restart loses it.
  * Never throws.
  */
-function reuseSuccessAction(
-  key: string,
-  ref: string,
-  before: RetiredKeyReading,
-  generationBefore: number | undefined,
-): 'spawned' | typeof SPAWN_ACTION_FRESH_RETIRED {
+function reuseSuccessAction(key: string, ref: string, start: RetiredKeyAttemptStart): 'spawned' | typeof SPAWN_ACTION_FRESH_RETIRED {
   const reading = retiredKeyReadingOf(key)
   const store = retiredKeyStore
   if (!reading.recorded || store === undefined) return 'spawned'
-  // b.jg5 SRJ-806: a recording made while the call was in flight retires the
-  // life this launch began, so that life is never marked as the new one. The
-  // record generation shows a re-record of an unmarked key, which writes nothing.
-  const generationNow = before.recorded && generationBefore !== undefined ? retiredRecordGenerationOf(key) : undefined
-  const recordedDuringCall = !before.recorded
-    ? 'it was not recorded when the call was made'
-    : generationBefore === undefined || generationNow === undefined
-      ? 'its record generation could not be read, so a recording during the call cannot be ruled out'
-      : generationNow !== generationBefore
-        ? 'recorded again while the reuse was in flight'
+  // b.jg5 SRJ-806: a recording made since the launch attempt started retires
+  // the life this launch began, so that life is never marked as the new one.
+  // The record generation shows a re-record of an unmarked key, which writes nothing.
+  const generationNow = start.recorded && start.generation !== undefined ? retiredRecordGenerationOf(key) : undefined
+  const recordedSince: ReuseRecordedSince | undefined = !start.recorded
+    ? REUSE_RECORDED_SINCE_NOT_RECORDED_AT_START
+    : start.generation === undefined || generationNow === undefined
+      ? REUSE_RECORDED_SINCE_GENERATION_UNREADABLE
+      : generationNow !== start.generation
+        ? REUSE_RECORDED_SINCE_RECORDED_AGAIN
         : undefined
-  if (recordedDuringCall !== undefined) {
-    console.error(
-      `[slack] ${REUSE_SPAWN_SITE}: ${ref}'s key was recorded as retired while this reuse spawn was in flight (${recordedDuringCall}) — the launch was decided before that recording, so its life is the old life: no mark is set; answering spawned (b.jg5 SRJ-806, SRJ-805)`,
-    )
+  if (recordedSince !== undefined) {
+    console.error(reuseRecordedInFlightLine(ref, recordedSince))
     return 'spawned'
   }
   let mark: string
@@ -1682,6 +1721,15 @@ function clearRetiredEntryOnRead(key: string, decision: RowReadClearDecision, at
     console.error(`[slack] retired-keys: clearing ${keyRef(key)}'s entry failed: ${describeThrownValue(err)}; the entry stays (b.jg5 SRJ-807)`)
   }
 }
+
+/** Who reads, in the own-row lines of the retry timer's row read (`readPersonaRowState`; b.jg5 SRJ-115, SRJ-807). */
+export const RETRY_ROW_READ_SITE: OwnRowReadSite = Object.freeze({ site: 'unavailable-retry', what: 'retry row read' })
+
+/** Who reads, in the own-row lines of the `working`-row wait's `status` reads (`waitForWaitingAndReconnect`; the persona's ref is added; b.jg5 SRJ-115, SRJ-807). */
+export const WORKING_WAIT_STATUS_SITE: OwnRowReadSite = Object.freeze({ site: 'waitForWaitingAndReconnect', what: 'status read' })
+
+/** Who reads, in the own-row lines of the collision ladder's collision `get` (`ladderGetThenAct`; the persona's ref is added; b.jg5 SRJ-114, SRJ-807). */
+export const COLLISION_GET_SITE: OwnRowReadSite = Object.freeze({ site: 'spawnForPersona', what: 'collision get' })
 
 /**
  * The installed kill-failure alerts (b.jg5 SRJ-704, SRJ-1016;
@@ -6443,7 +6491,7 @@ async function reconcileAndReadRowState(
  */
 export async function readPersonaRowState(key: string): Promise<UnavailableRetryRowRead> {
   // b.jg5 SRJ-115: P's own row through the shared own-row `status` read.
-  const read = await readPersonaOwnRowStatus(key, { site: 'unavailable-retry', what: 'retry row read' })
+  const read = await readPersonaOwnRowStatus(key, RETRY_ROW_READ_SITE)
   switch (read.kind) {
     case OWN_ROW_STATUS_STATE:
       return read.launchStartedAt === undefined ? { state: read.state } : { state: read.state, launchStartedAt: read.launchStartedAt }
@@ -6958,7 +7006,7 @@ async function waitForWorkingRow(
   while (_now() < deadline) {
     if (waitMustEnd(key, wait)) return endWait(ref, wait)
     // b.jg5 SRJ-115: P's own row through the shared own-row `status` read.
-    const read = await readPersonaOwnRowStatus(key, { site: 'waitForWaitingAndReconnect', what: 'status read', ref })
+    const read = await readPersonaOwnRowStatus(key, { ...WORKING_WAIT_STATUS_SITE, ref })
     // b.jg5 SRJ-105, SRJ-512, SRJ-513: the read latched P (an UNUSABLE NAME
     // answer, recorded unreadable, or its own row reading `pending` with no
     // launch start, recorded `pending`): the wait ends `latched`, nothing
@@ -7635,6 +7683,15 @@ function personaKillKeepsGoing(key: string): boolean {
 export const PERSONA_KILL_STOP_CAUSE_GENERIC =
   'its keep-going check answered false: the persona is torn down or not up, or the server is shutting down'
 
+/** The stop cause of a persona's kill retry when the server's keep-going query says the server is shutting down (b.jg5 SRJ-702). */
+export const PERSONA_KILL_STOP_CAUSE_SHUTDOWN = 'its keep-going check answered false: the server is shutting down'
+
+/** The stop cause of a persona's kill retry when the server's keep-going query says the persona is not up (b.jg5 SRJ-702). */
+export const PERSONA_KILL_STOP_CAUSE_NOT_UP = 'its keep-going check answered false: the persona is torn down or not up'
+
+/** The stop cause of a persona's kill retry whose last outcome's version re-check decided that the server stops (b.jg5 SRJ-702, SRJ-205). */
+export const PERSONA_KILL_STOP_CAUSE_RECHECK = "the last outcome's version re-check stops the server"
+
 /**
  * Why persona `key`'s kill retry was stopped, as far as the server's
  * keep-going query tells now (b.jg5 SRJ-702: the stop's cause): the server
@@ -7648,8 +7705,8 @@ function personaKillStopCause(key: string): string {
   const query = personaKillKeepGoingQuery
   if (query === undefined) return PERSONA_KILL_STOP_CAUSE_GENERIC
   try {
-    if (query.isShuttingDown() === true) return 'its keep-going check answered false: the server is shutting down'
-    if (query.isPersonaUp(key) !== true) return 'its keep-going check answered false: the persona is torn down or not up'
+    if (query.isShuttingDown() === true) return PERSONA_KILL_STOP_CAUSE_SHUTDOWN
+    if (query.isPersonaUp(key) !== true) return PERSONA_KILL_STOP_CAUSE_NOT_UP
   } catch {
     /* the generic cause below */
   }
@@ -7820,7 +7877,7 @@ export function raisePersonaKillFailureAlert(
     const stop = stopped
       ? {
           lastOutcomeClass: outcome.kind === KILL_OUTCOME_NOT_KILLED ? outcome.errorClass : outcome.kind,
-          stopCause: stopsServer ? "the last outcome's version re-check stops the server" : (stopCause ?? personaKillStopCause(key)),
+          stopCause: stopsServer ? PERSONA_KILL_STOP_CAUSE_RECHECK : (stopCause ?? personaKillStopCause(key)),
         }
       : {}
     alerts.raise({ key, decision, latched, stopped, context, ...stop })
@@ -7847,11 +7904,6 @@ async function readPersonaKillRow(key: string, site: string, ref: string): Promi
 // ---------------------------------------------------------------------------
 // The persona teardown's kill (b.jg5 SRJ-715, SRJ-110, SRJ-702)
 // ---------------------------------------------------------------------------
-
-/** A CONFLICT or an UNUSABLE NAME answer the teardown's kill met at one of its tries (`KILL_REFUSAL_AT_KILL`, `src/checked-kill.ts`). */
-export const TEARDOWN_KILL_REFUSAL_AT_KILL = KILL_REFUSAL_AT_KILL
-/** A CONFLICT or an UNUSABLE NAME answer the teardown's kill met at a `status` read between its tries (`KILL_REFUSAL_AT_READ`). */
-export const TEARDOWN_KILL_REFUSAL_AT_READ = KILL_REFUSAL_AT_READ
 
 /**
  * One CONFLICT or UNUSABLE NAME answer the persona teardown's kill met (b.jg5
@@ -7909,9 +7961,12 @@ function teardownRefusalClassOf(err: unknown): PersonaTeardownKillRefusal['error
  *   - the read before each further try is one `status` of the row through
  *     `withOutageDetection` arming nothing too (`readTeardownKillRow`): a
  *     CONFIG answer raises `ad-config-malformed` for a configured persona
- *     only, and the read latches nothing (b.jg5 SRJ-1002): no own-row step
- *     applies, so a `pending` row with no launch start is a live read and an
- *     UNUSABLE NAME answer a failed one, and the next try goes ahead;
+ *     only, and the read latches nothing (b.jg5 SRJ-1002): no own-row latch
+ *     step applies, so a `pending` row with no launch start is a live read
+ *     and an UNUSABLE NAME answer a failed one, and the next try goes ahead;
+ *     the row-read rule's entry clear alone applies (b.jg5 SRJ-807, SRJ-115):
+ *     a row read `waiting`, `working`, `ask_user` or `check_permission` of
+ *     a key recorded with its mark set clears the key's entry;
  *   - no keep-going check: the teardown is not stopped by the persona being
  *     latched or not up. Neither SRJ-316's rule against starting a kill of a
  *     row last read `pending` nor a latch holds the kill's start back, so a
@@ -7943,7 +7998,7 @@ export async function killPersonaInstanceForTeardown(
           outcome.errorClass === AD_ERROR_CLASS_CONFLICT || outcome.errorClass === AD_ERROR_CLASS_UNUSABLE_NAME
             ? outcome.errorClass
             : undefined
-        if (errorClass !== undefined) refusals.push({ at: TEARDOWN_KILL_REFUSAL_AT_KILL, errorClass, error: outcome.error })
+        if (errorClass !== undefined) refusals.push({ at: KILL_REFUSAL_AT_KILL, errorClass, error: outcome.error })
       }
       return outcome
     },
@@ -7951,7 +8006,7 @@ export async function killPersonaInstanceForTeardown(
       const read = await readTeardownKillRow(key)
       if (read.kind === KILL_RETRY_READ_FAILED) {
         const errorClass = teardownRefusalClassOf(read.error)
-        if (errorClass !== undefined) refusals.push({ at: TEARDOWN_KILL_REFUSAL_AT_READ, errorClass, error: read.error })
+        if (errorClass !== undefined) refusals.push({ at: KILL_REFUSAL_AT_READ, errorClass, error: read.error })
       }
       return read
     },
@@ -7963,13 +8018,21 @@ export async function killPersonaInstanceForTeardown(
   return { ...result, refusals: [...refusals] }
 }
 
+/** Who reads, in the clear line of the teardown kill's `status` read between its tries (b.jg5 SRJ-807). */
+export const TEARDOWN_KILL_STATUS_SITE: OwnRowReadSite = Object.freeze({ site: 'persona teardown kill', what: 'status read between tries' })
+
 /**
  * One `status` read of persona `key`'s row between the teardown kill's tries
  * (b.jg5 SRJ-702, SRJ-715): through `withOutageDetection` arming nothing (a
  * CONFIG answer raises `ad-config-malformed` for a configured persona only;
- * nothing is armed or reported), with no own-row step, so it latches nothing
- * and clears no retired-key entry. Its state, no row for `ErrSpawnNotFound`
- * (by name), or a failed read. Never throws.
+ * nothing is armed or reported). It latches nothing (SRJ-715, SRJ-1002): of
+ * the row-read rule only the entry clear applies (`decideRetiredEntryClear`
+ * over the read of `cscb_<key>` with the installed store's mark,
+ * `clearRetiredEntryOnRead`; b.jg5 SRJ-807, SRJ-115), so a row read live
+ * other than `pending` of a key recorded with its mark set clears its entry,
+ * with the store's one line naming `TEARDOWN_KILL_STATUS_SITE`. Its state, no
+ * row for `ErrSpawnNotFound` (by name), or a failed read; what it answers is
+ * the same whatever the clear did. Never throws.
  */
 async function readTeardownKillRow(key: string): Promise<KillRetryRead> {
   try {
@@ -7980,6 +8043,13 @@ async function readTeardownKillRow(key: string): Promise<KillRetryRead> {
       (client) => client.status({ claude_instance_id: personaInstanceId(key) }),
       { armsNothing: { personaConfigured: () => configuredReadingOf(key).configured } },
     )
+    const clear = decideRetiredEntryClear({
+      key,
+      row: { ...result, claude_instance_id: personaInstanceId(key) },
+      configured: false,
+      retiredMarked: retiredMarkOf(key),
+    })
+    if (clear !== undefined) clearRetiredEntryOnRead(key, clear, TEARDOWN_KILL_STATUS_SITE)
     return { kind: KILL_RETRY_READ_STATE, state: result.state }
   } catch (err) {
     if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) return { kind: KILL_RETRY_READ_NO_ROW }
@@ -8517,6 +8587,8 @@ interface NoTranscriptReuseOptions {
   readonly lastRead: LatchRowState
   /** True when the caller ran the pre-launch trust patch in this launch attempt. */
   readonly trustPatchRan: boolean
+  /** The store's reading of the key when the launch attempt started, for the reuse (`ReuseSpawnOptions.retiredAtStart`, b.jg5 SRJ-806). */
+  readonly retiredAtStart: RetiredKeyAttemptStart | undefined
 }
 
 /**
@@ -8568,6 +8640,7 @@ async function noTranscriptReuse(
     isStartup: options.isStartup,
     lastRead: diagnosisRead.lastRead ?? options.lastRead,
     trustPatchRan: options.trustPatchRan,
+    retiredAtStart: options.retiredAtStart,
   })
   // b.jg5 SRJ-112's success row: a retired key's success is `fresh-retired`,
   // its mark set by the reuse; the amnesia results are for any other key.
@@ -8622,6 +8695,15 @@ interface LadderRun {
    * `CARRIED_DEAD_EVIDENCE_NONE` when none was carried.
    */
   readonly carriedDeadEvidence: CarriedDeadEvidence
+  /**
+   * The installed retired-key store's reading of the key and its record
+   * generation at the ladder's launch decision (`retiredKeyAttemptStartOf`,
+   * b.jg5 SRJ-806), taken once when the ladder starts and kept for the run:
+   * every reuse spawn the ladder makes, and every live-row sequence it
+   * starts, compares against it, so a key recorded after the ladder started
+   * gets no mark from a reuse the ladder makes under its old declaration.
+   */
+  readonly retiredAtStart: RetiredKeyAttemptStart
 }
 
 /**
@@ -8709,9 +8791,10 @@ function sequenceStartAction(startAnswer: string): 'held' | 'sequence-waiting' {
  * (`startLiveRowSequence`): seeded with `lastRead`, entry at step 1, the
  * conversation kept when `keepsConversation`, the request's retired-key flag
  * `retiredKey` (the start entry sets it anyway while the key is recorded,
- * b.jg5 SRJ-805), ending in a launch, alert context `recovery`. Answers the
- * start entry's answer and the ladder's action for it
- * (`sequenceStartAction`). Never throws.
+ * b.jg5 SRJ-805), the ladder's retired-key reading at its start
+ * (`run.retiredAtStart`, SRJ-806), ending in a launch, alert context
+ * `recovery`. Answers the start entry's answer and the ladder's action for
+ * it (`sequenceStartAction`). Never throws.
  */
 function startRecoverySequence(
   run: LadderRun,
@@ -8729,6 +8812,7 @@ function startRecoverySequence(
     entryStep: LIVE_ROW_SEQUENCE_ENTRY_KILL,
     keepsConversation,
     retiredKey,
+    retiredAtStart: run.retiredAtStart,
     launches: true,
     alertContext: KILL_FAILURE_CONTEXT_RECOVERY,
   })
@@ -8779,7 +8863,7 @@ async function replacePersonaRow(
       `[slack] spawnForPersona: replacing the row of ${ref} (${replacing}; last read ${describeLatchRowState(lastRead)}): a reuse spawn of the same id; nothing is deleted (b.jg5 SRJ-707)`,
     )
     return reuseFinishedRow(run, REUSE_SPAWN_WHAT, () =>
-      reuseSpawnForPersona(persona, config, { isStartup, lastRead, trustPatchRan: true }),
+      reuseSpawnForPersona(persona, config, { isStartup, lastRead, trustPatchRan: true, retiredAtStart: run.retiredAtStart }),
     )
   }
   const retired = retiredKey ?? retiredKeyReadingOf(key).recorded
@@ -8899,15 +8983,18 @@ async function reuseFinishedRow(
  * dead-session routes from `waiting` and from `working`, and the prompt-row
  * recovery's finished re-read (`launchOnPromptRow`, SRJ-607). The
  * reconcile-missing-first sweep and the unresolvable-directory deferral
- * come first, as for any key; then, in place of the `resume_enabled`, the
- * `config_dir` and the `resume` steps, one reuse spawn of the same id is
- * made first, whatever row the path last read (`retiredKeyAtResumeSite`):
- * a finished row or no row gets its new life (`fresh-retired`, the mark
- * set, SRJ-806); a live row makes it collide, and the re-run of
- * get-then-act reads the row, sending an old life (no mark) through the
- * live-row sequence with the retired-key flag and handling a new life
- * (mark set) as any live row. A key that is not recorded takes the steps
- * below exactly as before (SRJ-711).
+ * come first, as for any key; then the store is read again (a key recorded
+ * during the sweep's await included) and, for a recorded key, in place of
+ * the `resume_enabled`, the `config_dir` and the `resume` steps, one reuse
+ * spawn of the same id is made first, whatever row the path last read
+ * (`retiredKeyAtResumeSite`): a finished row or no row gets its new life
+ * (`fresh-retired`, the mark set, SRJ-806); a live row makes it collide,
+ * and the re-run of get-then-act reads the row, sending an old life (no
+ * mark) through the live-row sequence with the retired-key flag and
+ * handling a new life (mark set) as any live row. A key that is not
+ * recorded takes the `resume_enabled`, `config_dir` and `resume` steps
+ * below (SRJ-711); the read made before the sweep decides only the
+ * `resume_enabled` false step, which a key not recorded then takes at once.
  *
  * `resume_enabled: false` (b.jg5 SRJ-707): the row is not resumed; it is
  * replaced through the resume site's replacement (`replaceAtResumeSite`),
@@ -9008,13 +9095,10 @@ async function resumeOrFreshSpawn(
   const { lastRead } = opts
   const deadEvidence = opts.deadEvidence ?? CARRIED_DEAD_EVIDENCE_NONE
   // b.jg5 SRJ-805: a retired key is never resumed; its rule runs below,
-  // after the sweep and the unresolvable-directory deferral.
-  const retired = retiredKeyReadingOf(key)
-  if (!retired.recorded && config.resume_enabled === false) {
-    // b.jg5 SRJ-707, SRJ-609, SRJ-611: no resume; the resume site's
-    // replacement decides on the state last read and the path's evidence.
-    console.error(`[slack] spawnForPersona: resume_enabled=false for ${ref} — not resuming; replacing its row by a reuse spawn of the same id`)
-    return replaceAtResumeSite(run, lastRead, RESUME_DISABLED_WHY, deadEvidence)
+  // after the sweep and the unresolvable-directory deferral, on a reading
+  // taken there. This reading decides only the `resume_enabled` false step.
+  if (config.resume_enabled === false && !retiredKeyReadingOf(key).recorded) {
+    return resumeDisabledAtResumeSite(run, lastRead, deadEvidence)
   }
 
   // b.4dk: dead-session callers (state=waiting/working, whatever the
@@ -9055,8 +9139,13 @@ async function resumeOrFreshSpawn(
   // current effective config dir.
   const configDir = compareRowToPersona(row, persona, spawnHomeDir(), undefined, _configDirFs)
   if (!configDir.configDirResolved) return deferForUnresolvedConfigDir(persona, ref)
-  // b.jg5 SRJ-805: no `resume` while the key is recorded, marked or not.
+  // b.jg5 SRJ-805: no `resume` while the key is recorded, marked or not,
+  // read after the sweep's await, so a key recorded during it is never resumed.
+  const retired = retiredKeyReadingOf(key)
   if (retired.recorded) return retiredKeyAtResumeSite(run, lastRead, retired)
+  // A key read recorded above whose entry was cleared during the sweep
+  // (SRJ-807) still takes the `resume_enabled` false step.
+  if (config.resume_enabled === false) return resumeDisabledAtResumeSite(run, lastRead, deadEvidence)
   if (!configDir.configDirMatches) {
     console.error(`[slack] spawnForPersona: ${configDirMismatchText(persona, ref, configDir)} — not resuming; replacing its row by a reuse spawn of the same id`)
     return replaceAtResumeSite(run, lastRead, CONFIG_DIR_MISMATCH_WHY, deadEvidence)
@@ -9087,7 +9176,7 @@ async function resumeOrFreshSpawn(
       // a CONFLICT latches with the refused operation "reuse spawn" (b.jg5
       // SRJ-501); a collision re-runs get-then-act once.
       return reuseFinishedRow(run, `${REUSE_SPAWN_WHAT} after its resume's no-transcript answer`, () =>
-        noTranscriptReuse(persona, config, err, { isStartup, lastRead, trustPatchRan: true }),
+        noTranscriptReuse(persona, config, err, { isStartup, lastRead, trustPatchRan: true, retiredAtStart: run.retiredAtStart }),
       )
     },
     notResumable: (err) => spawnNotResumableAtLadder(run, err, deadEvidence),
@@ -9117,8 +9206,19 @@ function retiredKeyAtResumeSite(run: LadderRun, lastRead: LatchRowState, retired
     `[slack] spawnForPersona: ${ref}'s key is retired (${describeRetiredMark(retired)}; last read ${describeLatchRowState(lastRead)}) — not resuming: a reuse spawn of the same id first; nothing is deleted (b.jg5 SRJ-805)`,
   )
   return reuseFinishedRow(run, RETIRED_KEY_REUSE_WHAT, () =>
-    reuseSpawnForPersona(persona, config, { isStartup, lastRead, trustPatchRan: true }),
+    reuseSpawnForPersona(persona, config, { isStartup, lastRead, trustPatchRan: true, retiredAtStart: run.retiredAtStart }),
   )
+}
+
+/**
+ * `resumeOrFreshSpawn`'s `resume_enabled` false step (b.jg5 SRJ-707, SRJ-609,
+ * SRJ-611): one line, then no `resume`: the resume site's replacement
+ * decides on the state last read and the path's evidence
+ * (`replaceAtResumeSite`). Never throws.
+ */
+function resumeDisabledAtResumeSite(run: LadderRun, lastRead: LatchRowState, deadEvidence: CarriedDeadEvidence): Promise<SpawnPersonaResult> {
+  console.error(`[slack] spawnForPersona: resume_enabled=false for ${run.ref} — not resuming; replacing its row by a reuse spawn of the same id`)
+  return replaceAtResumeSite(run, lastRead, RESUME_DISABLED_WHY, deadEvidence)
 }
 
 /** The head of the collision ladder's lines. */
@@ -10290,7 +10390,7 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *    branches, makes a reuse in place of every `resume`, and the live-row
  *    sequence's start entry sets the retired-key flag, so no sequence for
  *    the key ends in a `resume`. A key that is not recorded takes steps 4
- *    to 8 exactly as before (SRJ-711).
+ *    to 8 as written below (SRJ-711).
  * 5. `ErrInstanceIdCollision` → `client.get(...)`, the shared own-row read
  *    (`readPersonaOwnRow`, b.jg5 SRJ-114), then:
  *    - the note check comes first, before the guards and the state branches:
@@ -10597,11 +10697,23 @@ async function runPersonaLadder(
   // covers every path below (the patch is idempotent).
   runPreLaunchTrustPatch(persona, ref)
 
-  const run: LadderRun = { persona, config, isStartup, ref, params, hooks, reuseCollisionRerun: false, carriedDeadEvidence }
   // b.jg5 SRJ-805, SRJ-806: while the key is recorded its first launch is a
   // reuse spawn, never a plain spawn and never a `resume`; this launch
-  // decision also writes again a mark held only in memory.
+  // decision also writes again a mark held only in memory. Its reading and
+  // the key's record generation are the attempt's start, which every reuse
+  // the ladder makes compares against.
   const retired = retiredLaunchReadingOf(key)
+  const run: LadderRun = {
+    persona,
+    config,
+    isStartup,
+    ref,
+    params,
+    hooks,
+    reuseCollisionRerun: false,
+    carriedDeadEvidence,
+    retiredAtStart: retiredKeyAttemptStartOf(key, retired),
+  }
   if (retired.recorded) return retiredKeyFirstLaunch(run, retired)
 
   // Attempt fresh spawn ---
@@ -10681,7 +10793,13 @@ async function retiredKeyFirstLaunch(run: LadderRun, retired: RetiredKeyReading)
   console.error(
     `[slack] spawnForPersona: ${ref}'s key is retired (${describeRetiredMark(retired)}) — its first launch is a reuse spawn of the same id, never a plain spawn or a resume (b.jg5 SRJ-805)`,
   )
-  const reused = await reuseSpawnForPersona(persona, config, { isStartup, lastRead: NOTHING_READ, trustPatchRan: true, firstLaunch: true })
+  const reused = await reuseSpawnForPersona(persona, config, {
+    isStartup,
+    lastRead: NOTHING_READ,
+    trustPatchRan: true,
+    firstLaunch: true,
+    retiredAtStart: run.retiredAtStart,
+  })
   if (!isReuseSpawnCollided(reused)) return reused
   // b.jg5 SRJ-112: this collision is the attempt's one reuse collision, so
   // get-then-act runs as its one re-run, and a reuse collision there is the
@@ -10742,7 +10860,7 @@ async function ladderGetThenAct(run: LadderRun): Promise<SpawnPersonaResult> {
   // note on it) ends the ladder here, before the `cwd` and `config_dir` guards and the
   // state branches: no wait, sweep, reconnect, sequence or launch, no
   // notice, nothing counted (b.jg5 SRJ-501, SRJ-502).
-  const collisionRead = await readPersonaOwnRow(key, { site: 'spawnForPersona', what: 'collision get', ref })
+  const collisionRead = await readPersonaOwnRow(key, { ...COLLISION_GET_SITE, ref })
   // b.jg5 SRJ-105, SRJ-512: an UNUSABLE NAME answer latched the persona: no
   // retry spawn, sequence or launch, no notice, nothing counted.
   if (collisionRead.kind === OWN_ROW_READ_LATCHED) return { key, action: 'latched' }
@@ -10976,6 +11094,16 @@ export interface ReuseSpawnOptions {
    * spawn's collision does.
    */
   readonly firstLaunch?: boolean
+  /**
+   * The installed retired-key store's reading of the key and its record
+   * generation when the launch attempt this reuse runs in started (b.jg5
+   * SRJ-806): the collision ladder's (`LadderRun.retiredAtStart`) or the
+   * live-row sequence's (its request's). A success sets the "new life has
+   * begun" mark only when the key was recorded then and no recording has
+   * named it since (`reuseSuccessAction`). Absent, for a reuse with no
+   * attempt context: read just before the call.
+   */
+  readonly retiredAtStart?: RetiredKeyAttemptStart
 }
 
 /**
@@ -11001,16 +11129,17 @@ export interface ReuseSpawnOptions {
  *     ordinary fresh spawn, SRJ-112; when it is nothing read, a retired
  *     key's first launch, that any finished row is kept as an earlier life),
  *     then, for a key the installed retired-key store had recorded when the
- *     call was made and still has recorded, with its record generation
- *     unchanged since the call was made (no recording named it during the
- *     call), sets its "new life has begun" mark through the store's `mark`
- *     unless it is already set, with one line (`reuseSuccessAction`; SRJ-806,
- *     SRJ-112's success row), then runs
+ *     launch attempt started (`options.retiredAtStart`; when the call was
+ *     made, for a reuse with no attempt context) and still has recorded,
+ *     with its record generation unchanged since (no recording named it
+ *     during the attempt), sets its "new life has begun" mark through the
+ *     store's `mark` unless it is already set, with one line
+ *     (`reuseSuccessAction`; SRJ-806, SRJ-112's success row), then runs
  *     the after-launch step (`afterLaunchSucceeded`: the `pre_trust` line
  *     naming the reuse spawn, SRJ-413, and the dialog approver on the
  *     persona's row, SRJ-401), and answers `fresh-retired` for that key
  *     (`SPAWN_ACTION_FRESH_RETIRED`) and `spawned` for any other. A key
- *     recorded while the call was in flight (first recorded then, or
+ *     recorded while the attempt was in flight (first recorded then, or
  *     recorded again, whether that cleared its mark or wrote nothing) gets no
  *     mark and answers `spawned`, with one line: the launch was decided
  *     before that recording, so its life is the old life. Every reuse site (the collision ladder's
@@ -11045,10 +11174,10 @@ export async function reuseSpawnForPersona(
   // b.av2 SR-9.4: the reply guard immediately before the call; a retired
   // key's first launch undoes it on a collision, as the plain first spawn does.
   const replyGuardUndo = runPreLaunchReplyGuard(persona, ref)
-  // b.jg5 SRJ-806: the reading and record generation the call is made under;
-  // a key recorded during the call gets no mark at its success (`reuseSuccessAction`).
-  const retiredBefore = retiredKeyReadingOf(key)
-  const generationBefore = retiredBefore.recorded ? retiredRecordGenerationOf(key) : undefined
+  // b.jg5 SRJ-806: the reading and record generation the launch attempt
+  // started under (read now when the caller gave none); a key recorded since
+  // gets no mark at the reuse's success (`reuseSuccessAction`).
+  const retiredAtStart = options.retiredAtStart ?? retiredKeyAttemptStartOf(key)
   try {
     launched = await withSpawnDetection(key, persona.working_directory, 'spawn', (client) => client.spawn(params))
   } catch (err) {
@@ -11066,7 +11195,7 @@ export async function reuseSpawnForPersona(
     `[slack] ${REUSE_SPAWN_SITE}: reuse-spawned ${ref} instanceId=${personaInstanceId(key)} — a new life on its own id; ${earlierLife} (b.jg5 SRJ-112)`,
   )
   // b.jg5 SRJ-806: for a retired key the new life has begun; its mark is set.
-  const action = reuseSuccessAction(key, ref, retiredBefore, generationBefore)
+  const action = reuseSuccessAction(key, ref, retiredAtStart)
   afterLaunchSucceeded(key, options.isStartup, ref, LAUNCH_VERB_REUSE_SPAWN, launched)
   return { key, action }
 }
@@ -11299,7 +11428,11 @@ function stopSequenceOnLatch(event: ConflictLatchSetEvent): void {
  * marked or not (`retiredKeyReadingOf`, b.jg5 SRJ-805), the request is
  * forwarded with its retired-key flag set whatever the starter passed, so
  * the sequence's step-6 launch is a reuse spawn and no sequence for the key
- * ends in a `resume`; when the starter had not set it, one line says so:
+ * ends in a `resume` (step 6 reads the store again too, for a key recorded
+ * while the sequence runs). A request with no `retiredAtStart` is forwarded
+ * with the store's reading and record generation now, which the step-6
+ * reuse compares against (SRJ-806). When the starter had not set the
+ * retired-key flag of a recorded key, one line says so:
  *
  *   [slack] live-row-sequence: <ref>: its key is retired, so the sequence carries the retired-key flag and ends in a reuse spawn, never a resume (b.jg5 SRJ-805, SRJ-705)
  *
@@ -11319,16 +11452,21 @@ export function startLiveRowSequence(request: LiveRowSequenceRequest): LiveRowSe
 }
 
 /**
- * `request` with its retired-key flag set when the installed store has its
- * key recorded and the starter had not set it, with one line (b.jg5
- * SRJ-805); otherwise `request` as it is. Never throws.
+ * `request` as the start entry forwards it (b.jg5 SRJ-805, SRJ-806): its
+ * retired-key flag set when the installed store has its key recorded and the
+ * starter had not set it, with one line; and, when the starter gave none, the
+ * store's reading of the key with its record generation now
+ * (`retiredKeyAttemptStartOf`), the start of the attempt the sequence's
+ * step-6 reuse compares against. Never throws.
  */
 function retiredKeyRequest(request: LiveRowSequenceRequest, ref: string): LiveRowSequenceRequest {
-  if (request.retiredKey || !retiredKeyReadingOf(request.key).recorded) return request
+  const reading = retiredKeyReadingOf(request.key)
+  const retiredAtStart = request.retiredAtStart ?? retiredKeyAttemptStartOf(request.key, reading)
+  if (request.retiredKey || !reading.recorded) return { ...request, retiredAtStart }
   console.error(
     `${LIVE_ROW_SEQUENCE_LOG_PREFIX} ${ref}: its key is retired, so the sequence carries the retired-key flag and ends in a reuse spawn, never a resume (b.jg5 SRJ-805, SRJ-705)`,
   )
-  return { ...request, retiredKey: true }
+  return { ...request, retiredKey: true, retiredAtStart }
 }
 
 /**
@@ -11387,6 +11525,12 @@ export interface LiveRowSequenceLaunchRequest {
    * and makes no call. Absent: only the latched gate holds the launch back.
    */
   readonly stop?: LiveRowSequenceStopSignal
+  /**
+   * The store's reading of the key when the sequence's launch attempt began
+   * (the request's `retiredAtStart`, b.jg5 SRJ-806), which the reuse
+   * compares against at its success. Absent: read just before the reuse's call.
+   */
+  readonly retiredAtStart?: RetiredKeyAttemptStart
 }
 
 /** The entry's answer when it made no launch: a reuse collision, `ErrSpawnNotResumable`, the sequence stopped. */
@@ -11636,7 +11780,7 @@ async function sequenceLaunchCall(
   params: SpawnParams,
 ): Promise<LiveRowSequenceLaunchEntryResult> {
   const { key } = persona
-  if (request.kind === LIVE_ROW_LAUNCH_REUSE) return sequenceReuse(persona, config, request.lastRead, false)
+  if (request.kind === LIVE_ROW_LAUNCH_REUSE) return sequenceReuse(persona, config, request.lastRead, false, request.retiredAtStart)
   // b.av2 SR-6.2: the trust patch precedes every launch.
   runPreLaunchTrustPatch(persona, ref)
   console.error(`${LIVE_ROW_SEQUENCE_LOG_PREFIX} resuming ${ref} (b.jg5 SRJ-705)`)
@@ -11662,6 +11806,7 @@ async function sequenceLaunchCall(
         isStartup: false,
         lastRead: request.lastRead,
         trustPatchRan: true,
+        retiredAtStart: request.retiredAtStart,
       })
       return sequenceReuseAnswer(persona, reused)
     },
@@ -11710,16 +11855,22 @@ async function sequenceNotResumable(key: string, ref: string, err: unknown): Pro
 /**
  * The sequence's reuse spawn (`reuseSpawnForPersona`) of the `reuse` kind,
  * with `lastRead`, the row state the sequence last read; `trustPatchRan`
- * when this attempt already ran the trust patch. Its answer is read as
- * `sequenceReuseAnswer` reads it. Never throws.
+ * when this attempt already ran the trust patch; `retiredAtStart`, the
+ * store's reading of the key when the sequence's launch attempt began
+ * (b.jg5 SRJ-806). Its answer is read as `sequenceReuseAnswer` reads it.
+ * Never throws.
  */
 async function sequenceReuse(
   persona: Persona,
   config: PersonaConfig,
   lastRead: LatchRowState,
   trustPatchRan: boolean,
+  retiredAtStart: RetiredKeyAttemptStart | undefined,
 ): Promise<LiveRowSequenceLaunchEntryResult> {
-  return sequenceReuseAnswer(persona, await reuseSpawnForPersona(persona, config, { isStartup: false, lastRead, trustPatchRan }))
+  return sequenceReuseAnswer(
+    persona,
+    await reuseSpawnForPersona(persona, config, { isStartup: false, lastRead, trustPatchRan, retiredAtStart }),
+  )
 }
 
 /**
@@ -11780,9 +11931,10 @@ const LIVE_ROW_SEQUENCE_ARM_CAUSE_LABELS: { readonly [C in LiveRowSequenceArmCau
  *     (`conflictAt`, `unusableNameAt`) with the state last read;
  *   - the alerts through the server's kill-failure alerts, with the
  *     request's context;
- *   - the latched query, P's `ad-config-malformed` flag, E6's G accessor
- *     (`adGraceMsInEffect`), the applied `resume_enabled` and the row
- *     comparison (`compareRowToPersona`), the sequence-launch entry
+ *   - the latched query, P's `ad-config-malformed` flag, the G accessor
+ *     (`adGraceMsInEffect`), the applied `resume_enabled`, the row
+ *     comparison (`compareRowToPersona`) and the installed retired-key
+ *     store's reading at step 6 (`retiredKeyReadingOf`), the sequence-launch entry
  *     (`launchForLiveRowSequence`) and the retry arm with the sequence's
  *     four causes (`UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED`,
  *     `UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED`,
@@ -11824,17 +11976,20 @@ export function buildLiveRowSequenceDeps(input: LiveRowSequenceDepsInput): LiveR
       const found = applied(key)
       if (found === undefined) return undefined
       const resumeEnabled = found.config.resume_enabled !== false
-      if (row === undefined) return { resumeEnabled, cwdMatches: true, configDirMatches: true }
+      // b.jg5 SRJ-805: the store read at step 6, so a key recorded while the sequence ran never ends in a `resume`.
+      const retired = retiredKeyReadingOf(key).recorded
+      if (row === undefined) return { resumeEnabled, cwdMatches: true, configDirMatches: true, retired }
       const comparison = compareRowToPersona({ cwd: row.cwd, labels: row.labels }, found.persona, spawnHomeDir(), undefined, _configDirFs)
       return {
         resumeEnabled,
+        retired,
         // b.av2 SR-6.4: a `cwd` check that cannot be made now is no mismatch.
         cwdMatches: comparison.cwdMatches || comparison.cwdCheckDeferred,
         // Bug b.g57: an unresolvable directory gives no verdict; the launch's own check holds it.
         configDirMatches: !comparison.configDirResolved || comparison.configDirMatches === true,
       }
     },
-    launch: async (key, kind, lastRead, ref, stop) => {
+    launch: async (key, kind, lastRead, ref, stop, retiredAtStart) => {
       const found = applied(key)
       if (found === undefined) {
         console.error(
@@ -11846,6 +12001,7 @@ export function buildLiveRowSequenceDeps(input: LiveRowSequenceDepsInput): LiveR
         kind,
         lastRead: latchRowStateOfSequenceRead(lastRead),
         stop,
+        retiredAtStart,
       })
       return result.action === LIVE_ROW_OUTCOME_NOT_LAUNCHED
         ? { kind: LIVE_ROW_OUTCOME_NOT_LAUNCHED, reason: result.reason }

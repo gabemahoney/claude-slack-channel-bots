@@ -1639,6 +1639,38 @@ const KILL_FAILURE_STOPPED_ROUTE = 'stopped'
 /** What that written line names: the stop's log line, never an alert (b.jg5 SRJ-702, SRJ-1013). */
 const KILL_FAILURE_STOPPED_SUBJECT = "stopped retry's log line (no alert text)"
 
+/** The stop's cause a stopped kill retry's line and entry name when its raiser gives none (`KillFailureRaiseInput.stopCause`; b.jg5 SRJ-702). */
+export const KILL_FAILURE_STOP_CAUSE_DEFAULT = 'the persona is not up or is torn down, or the server is shutting down'
+
+/** What the stopped-retry line and entry are built from (`killFailureStoppedRetryText`). */
+export type KillFailureStoppedRetryInput = Pick<KillFailureRaiseInput, 'key' | 'decision' | 'context' | 'lastOutcomeClass' | 'stopCause'>
+
+/**
+ * The one line, and the entry text, of an ordinary kill-failure decision
+ * whose tries were stopped (b.jg5 SRJ-702, SRJ-1013): the line names the
+ * persona, the stop's cause (`KILL_FAILURE_STOP_CAUSE_DEFAULT` when none is
+ * given), the last outcome's class when given, the redacted descriptions and
+ * the context; the entry (written only for a persona no longer configured,
+ * as `persona-kill-failed`) carries the same content with no alert text:
+ *
+ *   line:  [slack] persona-episodes: persona=<key> kill-failure ordinary alert not raised — its tries were stopped (<cause>)[; its last outcome's class: <class>], so nothing retries this kill; <descriptions> (<context>)
+ *   entry: persona=<key> (<context>): the kill-failure ordinary alert not raised — its tries were stopped (<cause>)[; its last outcome's class: <class>], so nothing retries this kill; <descriptions>
+ *
+ * Pure; never throws for a well-formed decision.
+ */
+export function killFailureStoppedRetryText(input: KillFailureStoppedRetryInput): { readonly line: string; readonly entry: string } {
+  const { key, context } = input
+  const lastOutcome = input.lastOutcomeClass === undefined ? '' : `; its last outcome's class: ${input.lastOutcomeClass}`
+  const cause = input.stopCause ?? KILL_FAILURE_STOP_CAUSE_DEFAULT
+  const what =
+    `${KILL_FAILURE_VERSION_ORDINARY} alert not raised — its tries were stopped (${cause})${lastOutcome}, ` +
+    `so nothing retries this kill; ${describeKillFailureDescriptions(input.decision)}`
+  return {
+    line: `[slack] persona-episodes: persona=${key} ${PERSONA_EPISODE_KIND_KILL_FAILURE} ${what} (${context})`,
+    entry: killFailureAlertEntryText(`persona=${key}`, context, `the ${PERSONA_EPISODE_KIND_KILL_FAILURE} ${what}`),
+  }
+}
+
 /** Why a kill-failure episode ended (a teardown's `forget` and shutdown's `close` drop it with no line). */
 export type KillFailureEndReason = typeof KILL_FAILURE_END_ROW_FINISHED | typeof KILL_FAILURE_END_ROW_GONE
 
@@ -1875,13 +1907,8 @@ export function createKillFailureAlerts(deps: KillFailureAlertsDeps): KillFailur
    */
   function raiseStopped(input: KillFailureRaiseInput): KillFailureRaiseResult {
     const { key, context } = input
-    const lastOutcome = input.lastOutcomeClass === undefined ? '' : `; its last outcome's class: ${input.lastOutcomeClass}`
-    const cause =
-      input.stopCause ?? 'the persona is not up or is torn down, or the server is shutting down'
-    const what =
-      `${KILL_FAILURE_VERSION_ORDINARY} alert not raised — its tries were stopped (${cause})${lastOutcome}, ` +
-      `so nothing retries this kill; ${describeKillFailureDescriptions(input.decision)}`
-    line(key, `${what} (${context})`)
+    const stopped = killFailureStoppedRetryText(input)
+    safeLog(deps.log, stopped.line)
     const route = selectKillFailureAlertRoute({
       version: KILL_FAILURE_VERSION_ORDINARY,
       context,
@@ -1895,7 +1922,7 @@ export function createKillFailureAlerts(deps: KillFailureAlertsDeps): KillFailur
       key,
       KILL_FAILURE_VERSION_ORDINARY,
       classLabel,
-      killFailureAlertEntryText(`persona=${key}`, context, `the kill-failure ${what}`),
+      stopped.entry,
       KILL_FAILURE_STOPPED_ROUTE,
       KILL_FAILURE_STOPPED_SUBJECT,
     )

@@ -95,7 +95,7 @@ import {
 import { composePendingFile, PENDING_FILE_HEADER, reloadFingerprint } from '../src/reload-fingerprint.ts'
 import { createReloadTickDriver } from '../src/reload-timer.ts'
 import { DESTRUCTIVE_PREFIX, DESTRUCTIVE_RETIRED_CLAUSE, REMOVED_RETIRED_CLAUSE } from '../src/reload-plan.ts'
-import { RETIRED_KEYS_LOG_PREFIX, retiredKeysPath } from '../src/retired-keys.ts'
+import { RETIRED_KEYS_LOG_PREFIX } from '../src/retired-keys.ts'
 import {
   APP_TOKEN_PREFIX,
   assertNoLeak,
@@ -480,7 +480,7 @@ describe('a start without a record applies the configuration file or refuses', (
     expect(run.outcome.kind === 'applied' && run.outcome.source).toBe('config')
     expect(h.readRecord()).toEqual(configBytes)
     expect(h.readConfig()).toEqual(configBytes)
-    expect(run.writes).toEqual([{ path: h.paths.lastApplied, ok: true }])
+    expect(run.writes).toEqual([h.lastAppliedWrite()])
     // No temporary sibling (or any other file) is left beside the config.
     expect(h.configDirEntries()).toEqual(['config.json', 'config.json.last-applied'])
     expect(run.lifecycle.startPasses.map((c) => c.personas.map((p) => p.key))).toEqual([[h.key('alpha'), h.key('bravo')]])
@@ -570,7 +570,7 @@ describe('a start without a record applies the configuration file or refuses', (
 
     expectNothingApplied(run)
     expect(run.outcome.kind === 'refused' && run.outcome.class).toBe(RELOAD_RECORD_WRITE_FAILED)
-    expect(run.writes).toEqual([{ path: h.paths.lastApplied, ok: false }])
+    expect(run.writes).toEqual([h.lastAppliedWrite(false)])
     expect(h.readRecord()).toBeUndefined()
     expect(h.readConfig()).toEqual(configBytes)
     expect(h.configDirEntries()).toEqual(['config.json'])
@@ -592,7 +592,7 @@ describe('a start without a record applies the configuration file or refuses', (
     expectNothingApplied(run)
     expect(run.outcome.kind === 'refused' && run.outcome.source).toBe('config')
     expect(run.outcome.kind === 'refused' && run.outcome.class).toBe(RELOAD_RECORD_WRITE_FAILED)
-    expect(run.writes).toEqual([{ path: h.paths.lastApplied, ok: false }])
+    expect(run.writes).toEqual([h.lastAppliedWrite(false)])
     expect(run.logs).toEqual([
       `[slack] ${RELOAD_RECORD_WRITE_FAILED}: the last-applied record "${h.paths.lastApplied}" was written but its ` +
         'directory could not be synced (EIO), so it may not survive a crash, and the next start will run it; ' +
@@ -983,7 +983,7 @@ describe('the controller enforces the start call order', () => {
 
     expect(run.lifecycle.startPasses).toHaveLength(1)
     expect(broughtUp(run)).toEqual(keysOf('alpha'))
-    expect(run.writes).toEqual([{ path: h.paths.lastApplied, ok: true }])
+    expect(run.writes).toEqual([h.lastAppliedWrite()])
     assertNoLeak(run.captured())
 
     h.remove(h.paths.lastApplied)
@@ -1047,7 +1047,7 @@ describe('a dry-run start follows the same start rules', () => {
     expect(run.outcome.kind === 'applied' && run.outcome.source).toBe(withRecord ? 'record' : 'config')
     expect(h.readRecord()).toEqual(recordBytes ?? configBytes)
     expect(h.readConfig()).toEqual(configBytes)
-    expect(run.writes).toEqual(withRecord ? [] : [{ path: h.paths.lastApplied, ok: true }])
+    expect(run.writes).toEqual(withRecord ? [] : [h.lastAppliedWrite()])
     const names = withRecord ? ['alpha'] : ['alpha', 'bravo']
     expectOutcomeConfigIsStartPass(run, ...names)
     expect(broughtUp(run)).toEqual(keysOf(...names))
@@ -2617,18 +2617,9 @@ function applyNotRemoved(): ReloadRunActivity['removes'][number] {
   return { path: h.paths.apply, ok: false, removed: undefined, unsynced: false }
 }
 
-/**
- * Apply step 1's write of the retired-key record (b.jg5 SRJ-803), through
- * the run's writer, in `h.stateDir`: made before the last-applied write by
- * every confirmed apply that removes or destructively modifies a persona.
- */
-function retiredKeysWrite(ok = true): ReloadRunActivity['writes'][number] {
-  return { path: retiredKeysPath(h.stateDir), ok }
-}
-
 /** The retired-key record removed durably: a failed rewrite's restore to the empty record held before the apply (b.jg5 SRJ-804). */
 function retiredKeysRemoved(): ReloadRunActivity['removes'][number] {
-  return { path: retiredKeysPath(h.stateDir), ok: true, removed: true, unsynced: false }
+  return { path: h.retiredKeysFile, ok: true, removed: true, unsynced: false }
 }
 
 /**
@@ -2801,7 +2792,7 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
     expect(outsideLifecycle(run.since(cp))).toEqual({
       ...NO_RUN_ACTIVITY,
       logs: [retiredKeysLogged('recorded'), appliedLogged({ removed: 1 })],
-      writes: [retiredKeysWrite(), { path: h.paths.lastApplied, ok: true }],
+      writes: [h.retiredKeysWrite(), h.lastAppliedWrite()],
       removes: [applyRemoved()],
     })
 
@@ -3147,7 +3138,7 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
     expect(outsideLifecycle(run.since(cp))).toEqual({
       ...NO_RUN_ACTIVITY,
       logs: [undeletableLogged('EIO'), retiredKeysLogged('recorded'), appliedLogged({ removed: 1 })],
-      writes: [retiredKeysWrite(), { path: h.paths.lastApplied, ok: true }],
+      writes: [h.retiredKeysWrite(), h.lastAppliedWrite()],
       removes: [applyNotRemoved()],
     })
     expect(h.readRecord()).toEqual(configBytes)
@@ -3228,7 +3219,7 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
     expect(outsideLifecycle(run.since(again))).toEqual({
       ...NO_RUN_ACTIVITY,
       logs: [undeletableLogged('EIO'), noopLogged()],
-      writes: [{ path: h.paths.lastApplied, ok: true }],
+      writes: [h.lastAppliedWrite()],
       removes: [applyNotRemoved()],
     })
     expect(h.readRecord()).toEqual(configBytes)
@@ -3247,7 +3238,7 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
     expect(outsideLifecycle(run.since(cp))).toEqual({
       ...NO_RUN_ACTIVITY,
       logs: [removedUnsyncedLogged('EIO'), retiredKeysLogged('recorded'), appliedLogged({ removed: 1 })],
-      writes: [retiredKeysWrite(), { path: h.paths.lastApplied, ok: true }],
+      writes: [h.retiredKeysWrite(), h.lastAppliedWrite()],
       removes: [{ path: h.paths.apply, ok: true, removed: true, unsynced: true }],
     })
     expect(h.readRecord()).toEqual(configBytes)
@@ -3315,8 +3306,8 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
       ...NO_RUN_ACTIVITY,
       logs: [retiredKeysLogged('recorded'), retiredKeysLogged('restored'), line()],
       writes: [
-        retiredKeysWrite(),
-        ...recordWrites.map((ok) => ({ path: h.paths.lastApplied, ok })),
+        h.retiredKeysWrite(),
+        ...recordWrites.map((ok) => h.lastAppliedWrite(ok)),
         { path: h.paths.pending, ok: true },
       ],
       removes: [applyRemoved(), retiredKeysRemoved()],
@@ -3367,7 +3358,7 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
     expect(run.since(cp)).toEqual({
       ...NO_RUN_ACTIVITY,
       logs: [noopLogged()],
-      writes: [{ path: h.paths.lastApplied, ok: true }],
+      writes: [h.lastAppliedWrite()],
       removes: [applyRemoved()],
     })
     expect(h.readRecord()).toEqual(configBytes)
@@ -3392,7 +3383,7 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
     expect(run.since(cp)).toEqual({
       ...NO_RUN_ACTIVITY,
       logs: [appliedLogged({ settings: 1 })],
-      writes: [{ path: h.paths.lastApplied, ok: true }],
+      writes: [h.lastAppliedWrite()],
       removes: [applyRemoved()],
     })
     expect(h.readRecord()).toEqual(configBytes)
@@ -3523,7 +3514,7 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
         ),
         appliedLogged({ removed: 1 }),
       ],
-      writes: [retiredKeysWrite(), { path: h.paths.lastApplied, ok: true }],
+      writes: [h.retiredKeysWrite(), h.lastAppliedWrite()],
       removes: [applyRemoved()],
     })
     // Every step this removal runs (no config directory changed, so no template refresh), after step 1.

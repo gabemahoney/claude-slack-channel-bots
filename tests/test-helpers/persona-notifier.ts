@@ -31,6 +31,15 @@
  *   window opened; the handle's `close()` closes the window and ends the
  *   submit. `h.duringTeardown(persona, body)` runs `body` inside one.
  *
+ * `readStartupEntries(logDir)` is the one reader of a test's startup-errors
+ * entries: the entries in `<logDir>/startup-errors.log`, in order, each as
+ * its class and text (`StartupEntry`); `h.startupEntries()` reads the
+ * harness's own `logDir` with it.
+ *
+ * `teardownNoticeLine(persona, text, occasion?, classLabel?)` is the window's
+ * log line for that notice (`personaTeardownNoticeWrittenLine`), with the
+ * same arguments as `teardownNoticeEntry` below.
+ *
  * `teardownNoticeEntry(persona, text, occasion?)` is the parsed entry the
  * window writes for a notice: the class `persona-teardown-notice` and the
  * text `personaTeardownNoticeEntryText` builds from the persona reference,
@@ -72,6 +81,7 @@ import {
   PERSONA_TEARDOWN_NOTICE_RAISED,
   createPersonaNotifier,
   personaTeardownNoticeEntryText,
+  personaTeardownNoticeWrittenLine,
   type PersonaNotifier,
   type PersonaStartupErrorRecorder,
   type PersonaTeardownNoticeOccasion,
@@ -162,6 +172,41 @@ export function teardownNoticeEntry(
     classLabel,
     text: flattenEntryText(personaTeardownNoticeEntryText(`persona ${renderPersonaRef(persona.name, persona.key)}`, text, occasion)),
   }
+}
+
+/**
+ * The one log line the persona teardown window writes for a notice of
+ * `persona` whose entry was written (b.jg5 SRJ-1003, SRJ-1002): the builder
+ * `personaTeardownNoticeWrittenLine`, with `teardownNoticeEntry`'s arguments
+ * and defaults (the occasion "raised during its teardown", the class
+ * `persona-teardown-notice`).
+ */
+export function teardownNoticeLine(
+  persona: Pick<Persona, 'name' | 'key'>,
+  text: string,
+  occasion: PersonaTeardownNoticeOccasion = PERSONA_TEARDOWN_NOTICE_RAISED,
+  classLabel: string = PERSONA_TEARDOWN_NOTICE_LABEL,
+): string {
+  return personaTeardownNoticeWrittenLine(persona, classLabel, occasion, text)
+}
+
+/**
+ * The entries the real `recordStartupError` wrote to `startup-errors.log` in
+ * `logDir`, in order, each parsed into its class and text (the timestamp
+ * dropped); none when the file is absent. Throws on a line that is not an
+ * entry. The one reader of a test's startup-errors entries.
+ */
+export function readStartupEntries(logDir: string): StartupEntry[] {
+  const path = join(logDir, 'startup-errors.log')
+  if (!existsSync(path)) return []
+  return readFileSync(path, 'utf-8')
+    .split('\n')
+    .filter((line) => line !== '')
+    .map((line) => {
+      const match = STARTUP_ENTRY_RE.exec(line)
+      if (match === null) throw new Error(`readStartupEntries: not a startup-errors entry: ${JSON.stringify(line)}`)
+      return { classLabel: match[1]!, text: match[2]! }
+    })
 }
 
 /** A persona teardown window opened by `openTeardown`. */
@@ -301,17 +346,7 @@ export function makeNotifierHarness(
   const startupErrorsPath = (): string => join(logDir ?? join(rootDir(), logDirName), 'startup-errors.log')
 
   function startupEntries(): StartupEntry[] {
-    if (logDir === undefined) return []
-    const path = join(logDir, 'startup-errors.log')
-    if (!existsSync(path)) return []
-    return readFileSync(path, 'utf-8')
-      .split('\n')
-      .filter((line) => line !== '')
-      .map((line) => {
-        const match = STARTUP_ENTRY_RE.exec(line)
-        if (match === null) throw new Error(`makeNotifierHarness: not a startup-errors entry: ${JSON.stringify(line)}`)
-        return { classLabel: match[1]!, text: match[2]! }
-      })
+    return logDir === undefined ? [] : readStartupEntries(logDir)
   }
 
   function openTeardown(persona: Pick<Persona, 'name' | 'key'>): TeardownWindowHandle {

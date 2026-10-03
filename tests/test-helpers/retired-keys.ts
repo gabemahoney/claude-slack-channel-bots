@@ -18,6 +18,8 @@
  *   parser, or `null` when there is no file, so an absent file is told apart
  *   from an empty record. A file the parser refuses throws, naming the
  *   parser's problem (which carries no file content).
+ * - `RFC3339_UTC`: the form the server writes a time in, to match a
+ *   `retired_at` or a mark the server wrote.
  *
  * Isolation (b.jg5 SRJ-1301): both take the state directory explicitly and
  * never resolve a default one; the writer writes only the record in that
@@ -45,6 +47,9 @@ export const SAMPLE_RETIRED_AT = '2026-05-24T12:00:00.000Z'
 
 /** The `new_life_begun_at` a seeded mark gets when the test sets the mark with no time of its own. */
 export const SAMPLE_NEW_LIFE_BEGUN_AT = '2026-05-24T12:05:00.000Z'
+
+/** RFC 3339 UTC, written with `T` and ending in `Z`, as the server writes a record's times. */
+export const RFC3339_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/
 
 /** One entry to seed. */
 export interface RetiredKeySeed {

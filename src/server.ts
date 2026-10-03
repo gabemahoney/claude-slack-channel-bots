@@ -1551,7 +1551,7 @@ export function _buildIsSessionAliveAdapter(
 }
 
 /** Who reads, in the own-row `status` step's lines for the liveness adapter's read. */
-const LIVENESS_STATUS_SITE = { site: 'isSessionAlive', what: 'status' } as const
+export const LIVENESS_STATUS_SITE = { site: 'isSessionAlive', what: 'status' } as const
 
 /**
  * The liveness adapter's reading for a `status` answer that latched the
@@ -2046,9 +2046,12 @@ export function _buildKillSessionAdapter(
  * lost-message trigger and the retry timer's full-mode rerun all reach it
  * through the restart path. With the mark set the live row is the new life
  * and is reconnected as below; a `pending` row keeps the `pending` deferral;
- * a key not recorded is unchanged. The state read itself clears a marked
- * key's entry when the row reads `waiting`, `working`, `ask_user` or
- * `check_permission` (b.jg5 SRJ-807).
+ * a key not recorded is unchanged. The `working` and `waiting` branches read
+ * the pane, which is awaited, so the store is asked again right before
+ * `/mcp reconnect` is typed, after the latch, and a key recorded meanwhile
+ * takes the same replacement with nothing typed. The state read itself
+ * clears a marked key's entry when the row reads `waiting`, `working`,
+ * `ask_user` or `check_permission` (b.jg5 SRJ-807).
  *
  * b.jg5 SRJ-502 — never type into a latched persona, nor read its pane. The
  * reads above are awaited, and a launch outside the restart serializer can
@@ -2183,6 +2186,10 @@ export function _buildReconnectSessionAdapter(
     // meanwhile. Ask the latch right before typing: a latched persona (or a
     // query that throws: fail safe) gets nothing typed, 'transient'.
     if (latchedNow()) return 'transient'
+    // b.jg5 SRJ-805: the pane reads above are awaited, and the key may have
+    // been recorded meanwhile (an apply's step 1): the store is asked again
+    // right before typing, so an old life is never typed into.
+    if (isRetiredOldLife(key, state)) return replaceRetiredOldLife(key, state)
     // b.jg5 SRJ-118, SRJ-501: the reconnect's last read is this adapter's
     // `status` read (`waiting`, or a stale `working` row).
     const result = await reconnectMcpWithCause(key, latchRowStateRead(state))
@@ -2221,7 +2228,7 @@ export function _buildReconnectSessionAdapter(
 }
 
 /** Who reads, in the own-row `status` step's lines for the reconnect adapter's state read. */
-const RECONNECT_STATUS_SITE = { site: 'reconnectSession', what: 'status check' } as const
+export const RECONNECT_STATUS_SITE = { site: 'reconnectSession', what: 'status check' } as const
 
 /**
  * Whether persona `key`'s row, read `state` by the reconnect adapter's

@@ -123,6 +123,7 @@ import {
   LIVE_ROW_LAUNCH_REASON_NOT_APPLIED,
   LIVE_ROW_LAUNCH_REASON_NOT_KEPT,
   LIVE_ROW_LAUNCH_REASON_RESUME_DISABLED,
+  LIVE_ROW_LAUNCH_ANSWER_LAUNCHED,
   LIVE_ROW_LAUNCH_REASON_RETIRED_KEY,
   LIVE_ROW_LAUNCH_RESUME,
   LIVE_ROW_LAUNCH_REUSE,
@@ -184,6 +185,7 @@ import {
   type LiveRowSequenceRequest,
   type LiveRowSequenceStopHandle,
   type LiveRowSequenceStopReason,
+  type RetiredKeyAttemptStart,
 } from '../src/live-row-sequence.ts'
 import { AGENT_DIRECTOR_PENDING_STATE, LIVENESS_DEAD_ROW_ENDED, LIVENESS_DEAD_ROW_MISSING } from '../src/liveness-reading.ts'
 import { parseLaunchStart } from '../src/pending-row.ts'
@@ -441,7 +443,13 @@ function expectEndArmed(h: RecoveryHarness, outcome: LiveRowSequenceOutcome, cau
  * inside its recovery attempt, over the harness's dependencies with `replaced`
  * members and over `stop`; driven to its end.
  */
-function runWithDeps(h: RecoveryHarness, key: string, stop: LiveRowSequenceStopHandle, replaced: Partial<LiveRowSequenceDeps>): Promise<LiveRowSequenceOutcome> {
+function runWithDeps(
+  h: RecoveryHarness,
+  key: string,
+  stop: LiveRowSequenceStopHandle,
+  replaced: Partial<LiveRowSequenceDeps>,
+  requested: Partial<LiveRowSequenceRequest> = {},
+): Promise<LiveRowSequenceOutcome> {
   const request: LiveRowSequenceRequest = {
     key,
     instanceId: personaInstanceId(key),
@@ -451,6 +459,7 @@ function runWithDeps(h: RecoveryHarness, key: string, stop: LiveRowSequenceStopH
     retiredKey: false,
     launches: true,
     alertContext: KILL_FAILURE_CONTEXT_RECOVERY,
+    ...requested,
   }
   return h.driveSequence(runInAttempt(key, 'recovery', () => runLiveRowSequence(request, { ...h.sequenceDeps, ...replaced }, stop)))
 }
@@ -1320,6 +1329,42 @@ describe('the launch: a resume when the row has a session id and P keeps its con
     expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE, reason, result: { key: p, action: 'spawned' } })
     expectOneReuseOf(h, p)
     expect(h.stub.calls.resumeCalls).toEqual([])
+  })
+
+  // b.jg5 SRJ-805, SRJ-806: step 6's retired-key flag is the request's or P's
+  // facts' (the store read at step 6, so a key recorded while the sequence
+  // ran ends in a reuse), and its launch gets the request's attempt-start
+  // reading as it is, for the reuse to compare against. The facts and the
+  // launch are replaced; the facts say everything else allows a resume.
+  test.each<[string, boolean, boolean | undefined, LiveRowSequenceLaunchKind, LiveRowSequenceLaunchReason]>([
+    ['the request not flagged, P\'s facts reading retired at step 6', false, true, LIVE_ROW_LAUNCH_REUSE, LIVE_ROW_LAUNCH_REASON_RETIRED_KEY],
+    ['the request flagged, P\'s facts reading not retired', true, false, LIVE_ROW_LAUNCH_REUSE, LIVE_ROW_LAUNCH_REASON_RETIRED_KEY],
+    ['the request flagged, P\'s facts with no retired reading', true, undefined, LIVE_ROW_LAUNCH_REUSE, LIVE_ROW_LAUNCH_REASON_RETIRED_KEY],
+    ['control: neither, P keeping its conversation', false, false, LIVE_ROW_LAUNCH_RESUME, LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION],
+  ])('%s: one launch of the kind that decides, handed the request\'s attempt-start reading unchanged', async (_label, retiredKey, retired, kind, reason) => {
+    const { h, p } = build()
+    finishedAtRun1(h, p, { claude_session_id: SESSION_ID })
+    const retiredAtStart: RetiredKeyAttemptStart = { recorded: true, marked: false, generation: 3 }
+    const launches: Array<Parameters<LiveRowSequenceDeps['launch']>> = []
+
+    const outcome = await runWithDeps(
+      h,
+      p,
+      createLiveRowSequenceStop(),
+      {
+        personaFacts: () => ({ resumeEnabled: true, cwdMatches: true, configDirMatches: true, ...(retired === undefined ? {} : { retired }) }),
+        launch: async (...args) => {
+          launches.push(args)
+          return { kind: LIVE_ROW_LAUNCH_ANSWER_LAUNCHED, result: { key: p, action: 'spawned' } }
+        },
+      },
+      { keepsConversation: true, retiredKey, retiredAtStart },
+    )
+
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: kind, reason, result: { key: p, action: 'spawned' } })
+    expect(launches).toHaveLength(1)
+    expect(launches[0]![1]).toBe(kind)
+    expect(launches[0]![5]).toBe(retiredAtStart)
   })
 
   // HO rev 15: a reuse of an id with no row is an ordinary fresh spawn, which

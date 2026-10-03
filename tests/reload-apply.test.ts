@@ -140,24 +140,34 @@ import {
 } from '../src/persona-diagnostics.ts'
 import { configDirLabelValue, personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import { DESTRUCTIVE_SETTINGS, type DestructiveSetting, type InPlaceSetting } from '../src/reload-plan.ts'
-import { RELOAD_APPLIED, RELOAD_NOOP, RELOAD_RECORD_WRITE_FAILED, RELOAD_RETIRED_KEYS_RESTORED, RELOAD_RETIRED_KEYS_RESTORE_FAILED } from '../src/reload.ts'
+import {
+  RELOAD_APPLIED,
+  RELOAD_NOOP,
+  RELOAD_RECORD_WRITE_FAILED,
+  RELOAD_RETIRED_KEYS_RESTORED,
+  RELOAD_RETIRED_KEYS_RESTORE_FAILED,
+  reloadRetiredKeysPutBackClause,
+  reloadRetiredKeysPutBackFailedClause,
+} from '../src/reload.ts'
 import {
   RETIRED_KEY_CAUSE_ABSENT_AT_START,
   RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY,
   RETIRED_KEY_CAUSE_REMOVED,
   RETIRED_KEYS_LOG_PREFIX,
   RETIRED_KEYS_WRITE_FAILED,
-  retiredKeysPath,
+  parseRetiredKeys,
   type RetiredKeyCause,
   type RetiredKeyRecord,
 } from '../src/retired-keys.ts'
-import { readRetiredKeysRecord, retiredKeysRecordOf, writeRetiredKeysRecord } from './test-helpers/retired-keys.ts'
+import { readRetiredKeysRecord, retiredKeysRecordOf, RFC3339_UTC, writeRetiredKeysRecord } from './test-helpers/retired-keys.ts'
 import {
   _whenDialogApproverStopped,
   APPROVER_STOP_RETIRED_KEY,
   isDialogApproverRunning,
   personaConfigDirLabelValue,
   retiredKeyReadingOf,
+  REUSE_RECORDED_SINCE_RECORDED_AGAIN,
+  reuseRecordedInFlightLine,
   SPAWN_ACTION_FRESH_RETIRED,
 } from '../src/session-manager.ts'
 import {
@@ -736,21 +746,6 @@ describe('a name change is a removal of the old key and an addition of the new o
 // Apply step 1: the retired keys (b.jg5 SRJ-803, SRJ-804, SRJ-1511; AC 52, AC 70)
 // ---------------------------------------------------------------------------
 
-/** The retired-key record's path: in the harness's state directory. */
-function retiredKeysFile(): string {
-  return retiredKeysPath(h.stateDir)
-}
-
-/** A writer call on the retired-key record, as `run.writes` holds it. */
-function retiredKeysWrite(ok = true): { path: string; ok: boolean } {
-  return { path: retiredKeysFile(), ok }
-}
-
-/** A writer call on the last-applied record, as `run.writes` holds it. */
-function lastAppliedWrite(ok = true): { path: string; ok: boolean } {
-  return { path: h.paths.lastApplied, ok }
-}
-
 /** The time the run's store gives a key it records now (the store reads `run.clock`). */
 function nowOf(run: ReloadRun): string {
   return new Date(run.clock.now()).toISOString()
@@ -828,7 +823,7 @@ describe('apply step 1 records the retired keys before the last-applied record i
 
     await run.ticks.tick()
 
-    expect(run.since(applying).writes).toEqual([retiredKeysWrite(), lastAppliedWrite()])
+    expect(run.since(applying).writes).toEqual([h.retiredKeysWrite(), h.lastAppliedWrite()])
     expect(readRetiredKeysRecord(h.stateDir)).toEqual(recorded(run))
     expect(run.retiredKeys.isRecorded(h.key('alpha'))).toBe(false)
     expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
@@ -868,7 +863,7 @@ describe('apply step 1 records the retired keys before the last-applied record i
 
     await run.ticks.tick()
 
-    expect(run.since(applying).writes).toEqual([lastAppliedWrite()])
+    expect(run.since(applying).writes).toEqual([h.lastAppliedWrite()])
     expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
     expect(readRetiredKeysRecord(h.stateDir)).toBeNull()
     expect(run.retiredKeys.keys()).toEqual([])
@@ -896,7 +891,7 @@ describe('apply step 1 records the retired keys before the last-applied record i
 
     // Held at step 2's first teardown: both writes are made, the retired-key one first, before any teardown began.
     expect(writesAt).toEqual([
-      [retiredKeysFile(), 0],
+      [h.retiredKeysFile, 0],
       [h.paths.lastApplied, 0],
     ])
     expect(run.lifecycle.timeline).toEqual([
@@ -911,7 +906,7 @@ describe('apply step 1 records the retired keys before the last-applied record i
     gate.release()
     await applying
 
-    expect(run.since(cp).writes).toEqual([{ path: h.paths.pending, ok: true }, retiredKeysWrite(), lastAppliedWrite()])
+    expect(run.since(cp).writes).toEqual([{ path: h.paths.pending, ok: true }, h.retiredKeysWrite(), h.lastAppliedWrite()])
     expect(run.lifecycle.keys('teardown')).toEqual([bravoKey, charlieKey])
     expect(run.since(cp).lifecycle.filter((r) => r.key === h.key('alpha'))).toEqual([])
     // The record is as step 1 wrote it: alpha never recorded, the teardowns change nothing in it.
@@ -933,7 +928,7 @@ describe('apply step 1 records the retired keys before the last-applied record i
     const applying = run.checkpoint()
     await run.ticks.tick()
 
-    expect(run.since(applying).writes).toEqual(written ? [retiredKeysWrite(), lastAppliedWrite()] : [lastAppliedWrite()])
+    expect(run.since(applying).writes).toEqual(written ? [h.retiredKeysWrite(), h.lastAppliedWrite()] : [h.lastAppliedWrite()])
     expect(readRetiredKeysRecord(h.stateDir)).toEqual(written ? recordedNow(run, { [h.key('bravo')]: RETIRED_KEY_CAUSE_REMOVED }) : seeded)
     expect(run.retiredKeys.isMarked(h.key('bravo'))).toBe(false)
     expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
@@ -977,7 +972,7 @@ describe('apply step 1 records the retired keys before the last-applied record i
     await applyConfig(run, [personas[0]!])
 
     expect(run.stoppedBeforeWrite).toBe(true)
-    expect(run.since(cp).writes).toEqual([{ path: h.paths.pending, ok: true }, retiredKeysWrite(), lastAppliedWrite()])
+    expect(run.since(cp).writes).toEqual([{ path: h.paths.pending, ok: true }, h.retiredKeysWrite(), h.lastAppliedWrite()])
     expectNoPostNoLeak(run)
 
     await run.stop()
@@ -991,31 +986,45 @@ describe('apply step 1 records the retired keys before the last-applied record i
     expectNoPostNoLeak(restarted)
   })
 
-  test('an add-only apply re-adding a persona whose key is held only in memory writes the retired-key record before the last-applied record, and after a restart the key is still recorded (b.jg5 SRJ-803; hatch A3)', async () => {
-    const { run, personas } = await running(['alpha'])
+  // Real launch (b.jg5 SRJ-805): charlie's old row is `ended` with the current
+  // `config_dir` label, which a key not recorded would resume. The apply's
+  // launch is a reuse whose call is refused UNAVAILABLE, so no mark is set and
+  // the row stays ended; after the restart the key is still recorded and the
+  // start pass's launch of charlie is a reuse spawn of its id, never a resume.
+  test('an add-only apply re-adding a persona whose key is held only in memory writes the retired-key record before the last-applied record, and after a restart the key is still recorded: the start pass launches the re-added persona by a reuse spawn, never a resume (b.jg5 SRJ-803, SRJ-805; hatch A3; real launch)', async () => {
+    await useConfigDirs()
+    const spawnQueue: SpawnQueue = []
+    const { run, personas } = await running(['alpha'], { ...REAL_LAUNCH, agentDirector: { spawnQueue } })
     const charlieKey = h.key('charlie')
     holdInMemory(run, charlieKey)
     const charlie = h.persona('charlie')
     h.materialize(charlie)
+    h.seedRow(charlie, { state: 'ended' })
     h.writeConfig(configOf(personas[0]!, charlie))
     await run.ticks.tick()
     h.confirm()
+    spawnQueue.push(cannedErr(errTmuxUnresponsive('spawn')))
     const cp = run.checkpoint()
 
     await run.ticks.tick()
 
-    expect(run.since(cp).writes).toEqual([retiredKeysWrite(), lastAppliedWrite()])
+    expect(run.since(cp).writes).toEqual([h.retiredKeysWrite(), h.lastAppliedWrite()])
     expect(readRetiredKeysRecord(h.stateDir)).toEqual(recordedNow(run, { [charlieKey]: RETIRED_KEY_CAUSE_ABSENT_AT_START }))
     expect(run.retiredKeys.isHeldInMemory(charlieKey)).toBe(false)
     expect(run.appliedKeys()).toEqual(keysOf('alpha', 'charlie'))
     expect(run.since(cp).lifecycle.filter((r) => r.op === 'bring-up').map((r) => r.key)).toEqual([charlieKey])
     expect(recordWriteFailedLines(run)).toEqual([])
+    expect(instanceCallsSince(run, 'charlie', 0)).toEqual(['reuse-spawn ErrTmuxUnresponsive'])
+    expect(h.rowOf('charlie')?.state).toBe('ended')
     expectNoPostNoLeak(run)
 
     await run.stop()
-    const restarted = await h.start()
-    expect(restarted.retiredKeys.isRecorded(charlieKey)).toBe(true)
-    expect(readRetiredKeysRecord(h.stateDir)).toEqual(recordedNow(run, { [charlieKey]: RETIRED_KEY_CAUSE_ABSENT_AT_START }))
+    const restarted = await h.start(REAL_LAUNCH)
+
+    expect(launchesOf(restarted, 'charlie')).toEqual([{ op: 'launch', key: charlieKey, via: 'start', action: SPAWN_ACTION_FRESH_RETIRED }])
+    expect(instanceCallsSince(restarted, 'charlie', 0)).toEqual(['reuse-spawn ok'])
+    expect(lastSpawnOf(restarted, 'charlie')).toMatchObject({ id: personaInstanceId(charlieKey), reuse: true })
+    expect(markWrittenLines(restarted, charlieKey)).toHaveLength(1)
     expectNoPostNoLeak(restarted)
   })
 
@@ -1068,13 +1077,13 @@ describe('a failed apply undoes its recording (b.jg5 SRJ-804, SRJ-1511; AC 70)',
 
     // Step 1 wrote the record, then put it back: written again, or removed when it was empty before.
     expect(run.since(cp).writes).toEqual([
-      retiredKeysWrite(),
-      ...lastAppliedWrites.map((ok) => lastAppliedWrite(ok)),
-      ...(seeded ? [retiredKeysWrite()] : []),
+      h.retiredKeysWrite(),
+      ...lastAppliedWrites.map((ok) => h.lastAppliedWrite(ok)),
+      ...(seeded ? [h.retiredKeysWrite()] : []),
       { path: h.paths.pending, ok: true },
     ])
-    expect(run.since(cp).removes.filter((r) => r.path === retiredKeysFile())).toEqual(
-      seeded ? [] : [{ path: retiredKeysFile(), ok: true, removed: true, unsynced: false }],
+    expect(run.since(cp).removes.filter((r) => r.path === h.retiredKeysFile)).toEqual(
+      seeded ? [] : [{ path: h.retiredKeysFile, ok: true, removed: true, unsynced: false }],
     )
     expect(readRetiredKeysRecord(h.stateDir)).toEqual(before)
     expect(run.retiredKeys.keys()).toEqual(seeded ? [h.key('bravo'), 'zulu'].sort() : [])
@@ -1086,10 +1095,9 @@ describe('a failed apply undoes its recording (b.jg5 SRJ-804, SRJ-1511; AC 70)',
     const lines = recordWriteFailedLines(run)
     expect(lines).toHaveLength(1)
     expect(lines[0]).toContain(JSON.stringify(h.paths.lastApplied))
-    expect(lines[0]).toContain(JSON.stringify(retiredKeysFile()))
     // The restore succeeded: the line says the record is put back, never that the apply's keys stay retired.
-    expect(lines[0]).toContain(`the retired-key record ${JSON.stringify(retiredKeysFile())} is put back to what it held before this apply`)
-    expect(lines[0]).not.toContain('stay retired')
+    expect(lines[0]).toContain(reloadRetiredKeysPutBackClause(h.retiredKeysFile))
+    expect(lines[0]).not.toContain(reloadRetiredKeysPutBackFailedClause(h.retiredKeysFile))
     expect(h.readRecord()).toEqual(recordBytes)
     expect(run.controller.applied()).toBe(applied)
     expect(run.appliedConfigs).toEqual([])
@@ -1107,6 +1115,16 @@ describe('a failed apply undoes its recording (b.jg5 SRJ-804, SRJ-1511; AC 70)',
     expect(readRetiredKeysRecord(h.stateDir)!.get(h.key('charlie'))?.cause).toBe(RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY)
     expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
     expectNoPostNoLeak(run)
+  })
+
+  // The restore clauses' one literal pin; every other case builds them.
+  test('the failed rewrite line\'s restore clauses: put back, and its restore failed (pin)', () => {
+    expect(reloadRetiredKeysPutBackClause('/state/retired-keys.json')).toBe(
+      '; the retired-key record "/state/retired-keys.json" is put back to what it held before this apply: the keys this apply recorded are removed again, and keys recorded before it stay (b.jg5 SRJ-804)',
+    )
+    expect(reloadRetiredKeysPutBackFailedClause('/state/retired-keys.json')).toBe(
+      '; putting the retired-key record "/state/retired-keys.json" back to what it held before this apply failed, so the keys this apply recorded stay retired (b.jg5 SRJ-804)',
+    )
   })
 
   test('a rewrite that fails with the restore failing too names the failed restore in its one line, and the keys the apply recorded stay retired', async () => {
@@ -1127,13 +1145,11 @@ describe('a failed apply undoes its recording (b.jg5 SRJ-804, SRJ-1511; AC 70)',
 
     await run.ticks.tick()
 
-    expect(run.since(cp).writes.slice(0, 3)).toEqual([retiredKeysWrite(), lastAppliedWrite(false), retiredKeysWrite(false)])
+    expect(run.since(cp).writes.slice(0, 3)).toEqual([h.retiredKeysWrite(), h.lastAppliedWrite(false), h.retiredKeysWrite(false)])
     const lines = recordWriteFailedLines(run)
     expect(lines).toHaveLength(1)
-    expect(lines[0]).toContain(JSON.stringify(retiredKeysFile()))
-    expect(lines[0]).toContain(`putting the retired-key record ${JSON.stringify(retiredKeysFile())} back to what it held before this apply failed`)
-    expect(lines[0]).toContain('stay retired')
-    expect(lines[0]).not.toContain('is put back')
+    expect(lines[0]).toContain(reloadRetiredKeysPutBackFailedClause(h.retiredKeysFile))
+    expect(lines[0]).not.toContain(reloadRetiredKeysPutBackClause(h.retiredKeysFile))
     // The apply's keys stay recorded, on disk and in memory; the keys recorded before it too.
     const after = readRetiredKeysRecord(h.stateDir)!
     expect([...after.keys()].sort()).toEqual([h.key('bravo'), h.key('charlie'), 'zulu'].sort())
@@ -1166,7 +1182,7 @@ describe('a failed apply undoes its recording (b.jg5 SRJ-804, SRJ-1511; AC 70)',
     await run.ticks.tick()
 
     // The retired-key write failed; no last-applied write was made, and no approver was stopped (b.jg5 SRJ-808).
-    expect(run.since(cp).writes[0]).toEqual(retiredKeysWrite(false))
+    expect(run.since(cp).writes[0]).toEqual(h.retiredKeysWrite(false))
     expect(run.since(cp).writes.filter((w) => w.path === h.paths.lastApplied)).toEqual([])
     expect(run.approverStops).toEqual([])
     expect(h.readRecord()).toEqual(recordBytes)
@@ -1175,7 +1191,7 @@ describe('a failed apply undoes its recording (b.jg5 SRJ-804, SRJ-1511; AC 70)',
     expect(run.since(cp).lifecycle).toEqual([])
     const lines = recordWriteFailedLines(run)
     expect(lines).toHaveLength(1)
-    expect(lines[0]).toContain(JSON.stringify(retiredKeysFile()))
+    expect(lines[0]).toContain(JSON.stringify(h.retiredKeysFile))
     // How the restore went: put back (the held-only-in-memory key written to the file), or failed too.
     expect(lines[0]).toContain(restoreFails ? RELOAD_RETIRED_KEYS_RESTORE_FAILED : RELOAD_RETIRED_KEYS_RESTORED)
     expect(lines[0]).not.toContain(restoreFails ? RELOAD_RETIRED_KEYS_RESTORED : RELOAD_RETIRED_KEYS_RESTORE_FAILED)
@@ -1256,20 +1272,30 @@ function launchesOf(run: ReloadRun, name: string): ReloadLifecycleRecord[] {
 }
 
 /**
- * Keeps, in `bytes`, the retired-key record's bytes as they stood on disk
- * just before the latest write of it that found `key` marked there: what a
- * server stopped after the mark's write, before any later write of the
- * record, leaves on disk. Pass `beforeWrite` to the run.
+ * Keeps, in `record`, the retired-key record as it stood on disk (parsed by
+ * the module's parser) just before the latest write of it that found `key`
+ * marked there: what a server stopped after the mark's write, before any
+ * later write of the record, leaves on disk. Pass `beforeWrite` to the run;
+ * `restore()` writes that record back through `writeRetiredKeysRecord`.
  */
-function markedRecordKeeper(key: string): { beforeWrite: (path: string) => void; bytes: () => Buffer | undefined } {
-  let kept: Buffer | undefined
+function markedRecordKeeper(key: string): { beforeWrite: (path: string) => void; record: () => RetiredKeyRecord | undefined; restore: () => void } {
+  let kept: RetiredKeyRecord | undefined
   return {
     beforeWrite: (path) => {
-      if (path !== retiredKeysFile() || !existsSync(path)) return
-      const entry = readRetiredKeysRecord(h.stateDir)?.get(key)
-      if (entry !== undefined && entry.newLifeBegunAt !== null) kept = readFileSync(path)
+      if (path !== h.retiredKeysFile || !existsSync(path)) return
+      const parsed = parseRetiredKeys(readFileSync(path))
+      if (!parsed.ok) throw new Error(`markedRecordKeeper: the record cannot be parsed: ${parsed.problem}`)
+      const entry = parsed.record.get(key)
+      if (entry !== undefined && entry.newLifeBegunAt !== null) kept = parsed.record
     },
-    bytes: () => kept,
+    record: () => kept,
+    restore: () => {
+      if (kept === undefined) throw new Error('markedRecordKeeper: no record with the mark was kept')
+      const seeds = Object.fromEntries(
+        [...kept].map(([k, entry]) => [k, { cause: entry.cause, retiredAt: entry.retiredAt, mark: entry.newLifeBegunAt }] as const),
+      )
+      writeRetiredKeysRecord(h.stateDir, seeds)
+    },
   }
 }
 
@@ -1363,16 +1389,15 @@ describe('a retired key is launched by a reuse spawn at every launch path, never
 
     await applyConfig(run, [alpha, bravo])
     expect(launchesOf(run, 'bravo')).toEqual([{ op: 'launch', key: bravoKey, via: 'apply', action: SPAWN_ACTION_FRESH_RETIRED }])
-    await until(() => keeper.bytes() !== undefined)
+    await until(() => keeper.record() !== undefined)
     expectNoPostNoLeak(run)
     await run.stop()
     // The disk as the stopped server left it: the mark written, the entry not yet cleared.
-    writeFileSync(retiredKeysFile(), keeper.bytes()!)
+    keeper.restore()
+    expect(readRetiredKeysRecord(h.stateDir)?.get(bravoKey)?.newLifeBegunAt).toMatch(RFC3339_UTC)
 
     const again = await h.start(REAL_LAUNCH)
 
-    // Loaded from the disk by the new server: still recorded, the mark set.
-    expect(readRetiredKeysRecord(h.stateDir)?.get(bravoKey)?.newLifeBegunAt).not.toBeNull()
     expect(launchesOf(again, 'bravo')).toEqual([{ op: 'launch', key: bravoKey, via: 'start', action: 'reconnected' }])
     expect(instanceCallsSince(again, 'bravo', 0)).toEqual(['reuse-spawn ErrInstanceIdCollision'])
     expect(again.composition!.agentDirectorCalls.filter((c) => c.verb === 'kill' || c.verb === 'delete' || c.verb === 'findMissing')).toEqual([])
@@ -1514,10 +1539,8 @@ describe('a retired key is launched by a reuse spawn at every launch path, never
     expect(readRetiredKeysRecord(h.stateDir)?.get(bravoKey)?.newLifeBegunAt).toBeNull()
     expect(markWrittenLines(restarted, bravoKey)).toEqual([])
     expect(freshRetiredLines(restarted, 'bravo')).toEqual([])
-    const ref = renderPersonaRef('bravo', bravoKey)
-    expect(restarted.logs.filter((line) => line.includes('while this reuse spawn was in flight'))).toEqual([
-      `[slack] reuseSpawnForPersona: ${ref}'s key was recorded as retired while this reuse spawn was in flight (recorded again while the reuse was in flight) — the launch was decided before that recording, so its life is the old life: no mark is set; answering spawned (b.jg5 SRJ-806, SRJ-805)`,
-    ])
+    const inFlight = reuseRecordedInFlightLine(renderPersonaRef('bravo', bravoKey), REUSE_RECORDED_SINCE_RECORDED_AGAIN)
+    expect(restarted.logs.filter((line) => line.startsWith('[slack] reuseSpawnForPersona: ') && line.includes(' was recorded as retired while '))).toEqual([inFlight])
 
     teardown.release()
     await modifying
@@ -3761,8 +3784,8 @@ describe('b.jg5 SRJ-808, SRJ-715: step 1 stops each recorded key\'s approver bef
 
     await applyConfig(run, [alpha!, movedDirectory(charlie!)])
 
-    const recordWrite = seeded ? [] : [retiredKeysWrite()]
-    expect(run.since(cp).writes).toEqual([{ path: h.paths.pending, ok: true }, ...recordWrite, lastAppliedWrite()])
+    const recordWrite = seeded ? [] : [h.retiredKeysWrite()]
+    expect(run.since(cp).writes).toEqual([{ path: h.paths.pending, ok: true }, ...recordWrite, h.lastAppliedWrite()])
     // Both stops come after the pending write and the record (when one is written), before the last-applied write,
     // with no apply-time lifecycle call and no agent-director call made yet.
     const stopAt = cp.writes + 1 + recordWrite.length

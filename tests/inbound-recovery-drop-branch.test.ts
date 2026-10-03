@@ -250,6 +250,7 @@ import { launchForLiveRowSequence, readPersonaOwnRow, SPAWN_ACTION_FRESH_RETIRED
 import { LIVE_ROW_LAUNCH_REASON_RETIRED_KEY, LIVE_ROW_LAUNCH_REUSE, LIVE_ROW_OUTCOME_LAUNCHED } from '../src/live-row-sequence.ts'
 import { latchRowStateRead } from '../src/conflict-latch.ts'
 import { PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
+import { LIVENESS_STATUS_SITE } from '../src/server.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1457,7 +1458,7 @@ describe('b.jg5 SRJ-807: the lost-message read clears a retired key\'s entry on 
     expect(readRetiredKeysRecord(h.stateDir)).toEqual(retiredKeysRecordOf({ [other]: SEED }))
     expect([h.retiredKeys.isRecorded(key), h.retiredKeys.isMarked(other)]).toEqual([false, true])
     expect(h.retiredKeyWrites).toEqual([{ path, ok: true }])
-    expect(retiredKeyLinesIn(h.errors)).toEqual([retiredEntryClearedLine(path, key, 'waiting', { site: 'isSessionAlive', what: 'status' })])
+    expect(retiredKeyLinesIn(h.errors)).toEqual([retiredEntryClearedLine(path, key, 'waiting', LIVENESS_STATUS_SITE)])
     expect(isRestartPendingOrActive(key)).toBe(false)
     expectNothingRaisedOrArmed(h, key)
   })

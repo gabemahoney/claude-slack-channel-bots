@@ -377,6 +377,38 @@ export function personaTeardownNoticeEntryText(
 }
 
 /**
+ * The head of a teardown-route log line for `persona` (b.jg5 SRJ-1003,
+ * SRJ-1002): a notice raised while the window was open, or the all-clear of
+ * an outage whose onset the window routed.
+ */
+function teardownNoticeLineHead(persona: Pick<Persona, 'name' | 'key'>, occasion: PersonaTeardownNoticeOccasion): string {
+  const ref = renderPersonaRef(persona.name, persona.key)
+  return occasion === PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER
+    ? `[slack] persona-notifier: all-clear for ${ref} of an outage raised during its teardown`
+    : `[slack] persona-notifier: notice for ${ref} raised during its teardown`
+}
+
+/**
+ * The one log line of a notice the teardown route wrote (b.jg5 SRJ-1003,
+ * SRJ-1002): `persona`, the entry's class `classLabel`, the occasion, and
+ * the first line of `text`, the notice as handed in, with Slack's
+ * control-character escapes undone:
+ *
+ *   [slack] persona-notifier: notice for <ref> raised during its teardown — written to the server log and startup-errors.log (<class>), not posted: <first line>
+ *   [slack] persona-notifier: all-clear for <ref> of an outage raised during its teardown — written to the server log and startup-errors.log (<class>), not posted: <first line>
+ *
+ * Pure.
+ */
+export function personaTeardownNoticeWrittenLine(
+  persona: Pick<Persona, 'name' | 'key'>,
+  classLabel: string,
+  occasion: PersonaTeardownNoticeOccasion,
+  text: string,
+): string {
+  return `${teardownNoticeLineHead(persona, occasion)} — written to the server log and startup-errors.log (${classLabel}), not posted: ${firstNoticeLine(unescapeSlackControlCharacters(text))}`
+}
+
+/**
  * Call a `PersonaNotify` sink without letting it throw or reject: a
  * synchronous throw or a rejected promise goes to `onError` instead. For
  * callers holding an injected sink (which may be a test fake).
@@ -475,22 +507,21 @@ export function createPersonaNotifier(deps: PersonaNotifierDeps): PersonaNotifie
     occasion: PersonaTeardownNoticeOccasion,
   ): void {
     const text = unescapeSlackControlCharacters(slackText)
-    const ref = renderPersonaRef(persona.name, persona.key)
-    const head =
-      occasion === PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER
-        ? `[slack] persona-notifier: all-clear for ${ref} of an outage raised during its teardown`
-        : `[slack] persona-notifier: notice for ${ref} raised during its teardown`
-    let outcome = `written to the server log and startup-errors.log (${classLabel}), not posted`
+    let failure: string | undefined
     if (deps.recordStartupError === undefined) {
-      outcome = 'not posted, and its startup-errors entry was not written: no startup-errors recorder is installed'
+      failure = 'no startup-errors recorder is installed'
     } else {
       try {
         deps.recordStartupError(classLabel, personaTeardownNoticeEntryText(teardownRef(persona), text, occasion))
       } catch (err) {
-        outcome = `not posted, and its startup-errors entry was not written: ${describeThrownValue(err)}`
+        failure = describeThrownValue(err)
       }
     }
-    deps.log(`${head} — ${outcome}: ${firstNoticeLine(text)}`)
+    deps.log(
+      failure === undefined
+        ? personaTeardownNoticeWrittenLine(persona, classLabel, occasion, slackText)
+        : `${teardownNoticeLineHead(persona, occasion)} — not posted, and its startup-errors entry was not written: ${failure}: ${firstNoticeLine(text)}`,
+    )
   }
 
   /** Mark `classes` of the key's outage as routed by its teardown, naming `persona`. */

@@ -80,6 +80,8 @@ import {
   PERSONA_TEARDOWN_NOTICE_RAISED,
   createPersonaNotifier,
   formatPersonaNotice,
+  personaTeardownNoticeEntryText,
+  personaTeardownNoticeWrittenLine,
   type PersonaNoticeOptions,
 } from '../src/persona-notifier.ts'
 import { createPersonaDestinations, type DestinationFailure } from '../src/persona-destination.ts'
@@ -88,7 +90,7 @@ import { personaKey, renderPersonaRef } from '../src/persona-identity.ts'
 import { escapeSlackControlCharacters, unescapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { makeMultiPersonaConfig, makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
-import { makeNotifierHarness, teardownNoticeEntry, type NotifierHarness } from './test-helpers/persona-notifier.ts'
+import { makeNotifierHarness, teardownNoticeEntry, teardownNoticeLine, type NotifierHarness } from './test-helpers/persona-notifier.ts'
 import { stubOpenedDmId, type WebApiOutcome } from './test-helpers/slack-stub.ts'
 import { LEAK_SENTINEL, assertNoLeak, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
 
@@ -987,13 +989,36 @@ describe('failure log lines (SR-10.3 token-safe)', () => {
 // ---------------------------------------------------------------------------
 
 describe('the persona teardown window: every notice for the key is a log line and a startup-errors entry, never posted, held or dropped (b.jg5 SRJ-1003)', () => {
-  /** The line a notice written by the window logs: `<class>` its entry's class, the notice's first line. */
+  /** The line a notice written by the window logs (`teardownNoticeLine`): `<class>` its entry's class, the notice's first line. */
   const windowLine = (p: Persona, text: string, classLabel: string = PERSONA_TEARDOWN_NOTICE_LABEL) =>
-    `[slack] persona-notifier: notice for ${ref(p)} raised during its teardown — written to the server log and startup-errors.log (${classLabel}), not posted: ${text.split('\n')[0]}`
+    teardownNoticeLine(p, text, PERSONA_TEARDOWN_NOTICE_RAISED, classLabel)
 
   /** The line an all-clear written after the window closed logs. */
-  const allClearLine = (p: Persona, text: string) =>
-    `[slack] persona-notifier: all-clear for ${ref(p)} of an outage raised during its teardown — written to the server log and startup-errors.log (${PERSONA_TEARDOWN_NOTICE_LABEL}), not posted: ${text.split('\n')[0]}`
+  const allClearLine = (p: Persona, text: string) => teardownNoticeLine(p, text, PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER)
+
+  // The teardown route's one literal pin (b.jg5 SRJ-1003, SRJ-1013): the two
+  // occasions, an entry's text and both forms of the line, the notice's first
+  // line only, its Slack escapes undone. Every other case builds them with
+  // `teardownNoticeEntry` and `teardownNoticeLine`.
+  test('the teardown route\'s occasions, entry text and log lines (pin)', () => {
+    const p = { name: 'Alpha', key: 'alpha_1' }
+    expect([PERSONA_TEARDOWN_NOTICE_RAISED, PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER]).toEqual([
+      'raised during its teardown',
+      'the all-clear of an outage raised during its teardown',
+    ])
+    expect(personaTeardownNoticeEntryText('persona "Alpha" (key=alpha_1)', 'Outage &lt;x&gt;\nmore')).toBe(
+      'persona "Alpha" (key=alpha_1), raised during its teardown: Outage &lt;x&gt;\nmore',
+    )
+    expect(personaTeardownNoticeEntryText('persona "Alpha" (key=alpha_1)', 'All clear', PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER)).toBe(
+      'persona "Alpha" (key=alpha_1), the all-clear of an outage raised during its teardown: All clear',
+    )
+    expect(personaTeardownNoticeWrittenLine(p, PERSONA_TEARDOWN_NOTICE_LABEL, PERSONA_TEARDOWN_NOTICE_RAISED, 'Outage &lt;x&gt;\nmore')).toBe(
+      '[slack] persona-notifier: notice for "Alpha" (key=alpha_1) raised during its teardown — written to the server log and startup-errors.log (persona-teardown-notice), not posted: Outage <x>',
+    )
+    expect(personaTeardownNoticeWrittenLine(p, PERSONA_TEARDOWN_NOTICE_LABEL, PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER, 'All clear')).toBe(
+      '[slack] persona-notifier: all-clear for "Alpha" (key=alpha_1) of an outage raised during its teardown — written to the server log and startup-errors.log (persona-teardown-notice), not posted: All clear',
+    )
+  })
 
   const droppedLine = (p: Persona, n: number) =>
     `[slack] persona-notifier: persona=${p.key}: dropped ${n} held notice(s), not posted — the persona was torn down`

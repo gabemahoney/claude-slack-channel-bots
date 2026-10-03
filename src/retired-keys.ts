@@ -51,14 +51,15 @@
  *     persona it brings up whose key is held only in memory (SRJ-803);
  *   - `mark`: a reuse spawn that began the key's new life (SRJ-806);
  *   - `clear`: the session manager's shared own-row reads
- *     (`readPersonaOwnRow`, `applyOwnRowStatusStep`), on the row-read rule's
- *     clear decision for a marked key's row read live other than `pending`
- *     (SRJ-807);
+ *     (`readPersonaOwnRow`, `applyOwnRowStatusStep`) and the persona
+ *     teardown kill's read between its tries (`readTeardownKillRow`), on the
+ *     row-read rule's clear decision for a marked key's row read live other
+ *     than `pending` (SRJ-807);
  *   - `isRecorded`, `isMarked` and `entry`: the launch rule (SRJ-805), the
  *     row-read rule and the old-life hold (SRJ-809);
- *   - `recordGeneration`: a reuse spawn, read before its call and at its
- *     success, so that a key recorded while the call was in flight gets no
- *     mark (SRJ-806).
+ *   - `recordGeneration`: a launch attempt, read when it starts and at its
+ *     reuse spawn's success, so that a key recorded while the attempt was in
+ *     flight gets no mark (SRJ-806).
  *
  * The record generation. Each key has an in-memory count of the `record`
  * calls that named it in this store's life, every one counted: a batch that

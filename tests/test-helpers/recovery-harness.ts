@@ -435,8 +435,10 @@
  *   a configured one or one `remove(key)` dropped, with the request's seed
  *   (the state last read), entry step (step 1 by default),
  *   keep-conversation flag and retired-key flag (both false by default),
- *   launch flag (true by default; false is the no-launch form) and alert
- *   context (`recovery` by default); a case that wants the start entry's own
+ *   launch flag (true by default; false is the no-launch form), alert
+ *   context (`recovery` by default) and, when given, the retired-key reading
+ *   at the attempt's start (`retiredAtStart`, b.jg5 SRJ-806; absent by
+ *   default, so the start entry fills it); a case that wants the start entry's own
  *   answer hands it to `startLiveRowSequence`. `startSequence(key, request)`
  *   starts one sequence (steps 1 to 6) through the session manager's start
  *   entry and resolves at once, before the sequence's first call, throwing
@@ -692,9 +694,10 @@
  * `killFailureHeldLine`, `killFailureLoggedLine`, `killFailureNotRaisedLine`
  * (a stopped retry's one line, b.jg5 SRJ-702, naming the stop's cause it is
  * given: `liveRowStopCauseText` for the live-row sequence's own stop,
- * `KILL_FAILURE_STOP_CAUSE_SHUTDOWN` or `KILL_FAILURE_STOP_CAUSE_NOT_UP` for
+ * `PERSONA_KILL_STOP_CAUSE_SHUTDOWN` or `PERSONA_KILL_STOP_CAUSE_NOT_UP` for
  * what the keep-going query told, `PERSONA_KILL_STOP_CAUSE_GENERIC` when it
- * could not tell, or `KILL_FAILURE_STOP_CAUSE_RECHECK`), `killFailureStoppedEntry` (its
+ * could not tell, or `PERSONA_KILL_STOP_CAUSE_RECHECK`, all from
+ * `src/session-manager.ts`; built by `killFailureStoppedRetryText`), `killFailureStoppedEntry` (its
  * `persona-kill-failed` entry, no alert text) and
  * `killFailureStoppedEntryLine`.
  *
@@ -762,7 +765,6 @@ import {
   KILL_FAILURE_VERSION_ORDINARY,
   KILL_FAILURE_VERSION_SURVIVOR,
   PERSONA_KILL_FAILED_LABEL,
-  describeKillFailureDescriptions,
   killFailureAlertEntryText,
   killFailureAlertText,
   type KillFailureAlertContent,
@@ -780,6 +782,7 @@ import {
   createPersonaEpisodes,
   createTmuxUnresponsiveCondition,
   createUnclassifiedErrorEpisodes,
+  killFailureStoppedRetryText,
   PERSONA_EPISODE_KIND_KILL_FAILURE,
   PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE,
   PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR,
@@ -815,6 +818,7 @@ import {
   type LiveRowSequenceOutcome,
   type LiveRowSequenceRequest,
   type LiveRowSequenceStopReason,
+  type RetiredKeyAttemptStart,
 } from '../../src/live-row-sequence.ts'
 import { getSessionByPersona } from '../../src/registry.ts'
 import {
@@ -1147,6 +1151,8 @@ export interface RecoverySequenceRequest {
   readonly launches?: boolean
   /** The kill-failure alert's context; `recovery` when unset. */
   readonly alertContext?: KillFailureAlertContext
+  /** The store's reading of the key when the launch attempt began (b.jg5 SRJ-806); absent when unset, so the start entry reads it. */
+  readonly retiredAtStart?: RetiredKeyAttemptStart
 }
 
 /** One live-row sequence `startSequence` started through the registry: its outcome and its stop. */
@@ -2145,6 +2151,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       retiredKey: request.retiredKey ?? false,
       launches: request.launches ?? true,
       alertContext: request.alertContext ?? KILL_FAILURE_CONTEXT_RECOVERY,
+      ...(request.retiredAtStart === undefined ? {} : { retiredAtStart: request.retiredAtStart }),
     }
   }
 
@@ -3298,53 +3305,35 @@ export function killFailureLoggedLine(key: string, version: KillFailureAlertVers
 }
 
 /**
- * The stop's cause a stopped retry's line names when the server's
- * keep-going query, read as the alert is raised, says the server is shutting
- * down (`raisePersonaKillFailureAlert`, b.jg5 SRJ-702). Its literal pin is in
- * tests/session-manager.test.ts.
+ * The stopped-retry text (`killFailureStoppedRetryText`, b.jg5 SRJ-702) of an
+ * ordinary decision whose tries were stopped for `cause`, at the restart path
+ * (context `recovery`): the decision quotes `quoted`'s descriptions, as
+ * `ordinaryAlertContent` takes them, and the last outcome's class is
+ * `lastOutcomeClass` (`AD_ERROR_CLASS_UNAVAILABLE` for a standing
+ * `ErrTmuxKillFailed` by default).
  */
-export const KILL_FAILURE_STOP_CAUSE_SHUTDOWN = 'its keep-going check answered false: the server is shutting down'
-
-/** The same, when the query says the persona is torn down or not up (b.jg5 SRJ-702). */
-export const KILL_FAILURE_STOP_CAUSE_NOT_UP = 'its keep-going check answered false: the persona is torn down or not up'
-
-/** The stop's cause when the last outcome's version re-check decided that the server stops (b.jg5 SRJ-702, SRJ-204). */
-export const KILL_FAILURE_STOP_CAUSE_RECHECK = "the last outcome's version re-check stops the server"
-
-/**
- * What a stopped retry's line says after `persona=<key> kill-failure `, with
- * no context (b.jg5 SRJ-702): not raised, the stop's cause, the last
- * outcome's class (`AD_ERROR_CLASS_UNAVAILABLE` for a standing
- * `ErrTmuxKillFailed` by default) and the decision's descriptions
- * (`quoted`, as `ordinaryAlertContent` takes them) redacted.
- */
-function killFailureStoppedText(
+function killFailureStoppedRecovery(
+  key: string,
+  cause: string,
   quoted: { last?: Error; earlierSurvivor?: Error },
   lastOutcomeClass: string,
-  cause: string,
-): string {
+): { readonly line: string; readonly entry: string } {
   const decision: KillRetryAlert = {
     kind: KILL_RETRY_ALERT_ORDINARY,
     ...(quoted.last === undefined ? {} : { lastKillFailedDescription: killFailedDescription(quoted.last) }),
     ...(quoted.earlierSurvivor === undefined ? {} : { earlierSurvivorDescription: killFailedDescription(quoted.earlierSurvivor) }),
   }
-  return (
-    `${KILL_FAILURE_VERSION_ORDINARY} alert not raised — its tries were stopped (${cause}); its last outcome's class: ${lastOutcomeClass}, ` +
-    `so nothing retries this kill; ${describeKillFailureDescriptions(decision)}`
-  )
+  return killFailureStoppedRetryText({ key, decision, context: KILL_FAILURE_CONTEXT_RECOVERY, lastOutcomeClass, stopCause: cause })
 }
 
-/**
- * The one line of an ordinary decision whose tries were stopped for `cause`
- * (b.jg5 SRJ-702): see `killFailureStoppedText`, then the context `recovery`.
- */
+/** The one line of an ordinary decision whose tries were stopped for `cause` (b.jg5 SRJ-702): see `killFailureStoppedRecovery`. */
 export function killFailureNotRaisedLine(
   key: string,
   cause: string,
   quoted: { last?: Error; earlierSurvivor?: Error } = {},
   lastOutcomeClass: string = AD_ERROR_CLASS_UNAVAILABLE,
 ): string {
-  return `${killFailureLinePrefix(key)}${killFailureStoppedText(quoted, lastOutcomeClass, cause)} (${KILL_FAILURE_CONTEXT_RECOVERY})`
+  return killFailureStoppedRecovery(key, cause, quoted, lastOutcomeClass).line
 }
 
 /**
@@ -3358,7 +3347,7 @@ export function killFailureStoppedEntry(
   quoted: { last?: Error; earlierSurvivor?: Error } = {},
   lastOutcomeClass: string = AD_ERROR_CLASS_UNAVAILABLE,
 ): string {
-  return killFailureAlertEntryText(`persona=${key}`, KILL_FAILURE_CONTEXT_RECOVERY, `the kill-failure ${killFailureStoppedText(quoted, lastOutcomeClass, cause)}`)
+  return killFailureStoppedRecovery(key, cause, quoted, lastOutcomeClass).entry
 }
 
 /** The line of a stopped retry's `persona-kill-failed` entry, after its not-raised line (b.jg5 SRJ-702). */

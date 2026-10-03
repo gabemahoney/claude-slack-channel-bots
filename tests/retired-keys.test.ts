@@ -147,16 +147,18 @@ import {
 import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, writtenFile } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { makeFifo, mkfifoAvailable } from './test-helpers/fifo.ts'
+import { readStartupEntries, type StartupEntry } from './test-helpers/persona-notifier.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import {
   readRetiredKeysRecord,
   retiredKeysRecordOf,
+  RFC3339_UTC,
   SAMPLE_NEW_LIFE_BEGUN_AT,
   SAMPLE_RETIRED_AT,
   writeRetiredKeysRecord,
   type RetiredKeySeed,
 } from './test-helpers/retired-keys.ts'
-import { readPersonaRowState, SPAWN_ACTION_FRESH_RETIRED } from '../src/session-manager.ts'
+import { readPersonaRowState, RETRY_ROW_READ_SITE, SPAWN_ACTION_FRESH_RETIRED } from '../src/session-manager.ts'
 import { errSpawnNotFound } from './test-helpers/agent-director-stub.ts'
 import {
   makeRecoveryHarness,
@@ -166,18 +168,12 @@ import {
   type RecoveryHarness,
 } from './test-helpers/recovery-harness.ts'
 
-/** The retry timer's row read as the store's clear line names it (`readPersonaRowState`'s site). */
-const RETRY_ROW_READ_SITE = { site: 'unavailable-retry', what: 'retry row read' } as const
-
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
 
 /** The fake clock's start: a whole second, so every stamp is distinct from the helper's samples. */
 const START_MS = Date.UTC(2026, 9, 2, 9, 30, 0)
-
-/** RFC 3339 UTC, written with `T` and ending in `Z`, as the server writes it. */
-const RFC3339_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/
 
 let root: string
 /** The state directory under test. */
@@ -573,10 +569,14 @@ describe('restore puts back the record held before a batch (b.jg5 SRJ-804)', () 
 // The start read (SRJ-802, SRJ-1013)
 // ---------------------------------------------------------------------------
 
-/** The startup-errors entries the real `recordStartupError` wrote to the temp `logDir`. */
-function startupEntries(): string[] {
-  const path = join(logDir, 'startup-errors.log')
-  return existsSync(path) ? readFileSync(path, 'utf-8').split('\n').filter((line) => line !== '') : []
+/** The startup-errors entries the real `recordStartupError` wrote to the temp `logDir`, each as its class and text. */
+function startupEntries(): StartupEntry[] {
+  return readStartupEntries(logDir)
+}
+
+/** The one `retired-keys-unreadable` entry the start read writes for the record at `path` with `problem`. */
+function unreadableEntry(path: string, problem: string): StartupEntry {
+  return { classLabel: RETIRED_KEYS_UNREADABLE_LABEL, text: retiredKeysUnreadableMessage(path, problem) }
 }
 
 /** The start read over `dir`, recording through the real `recordStartupError` into the temp `logDir`. */
@@ -650,10 +650,9 @@ describe('the start read (b.jg5 SRJ-802, SRJ-1013)', () => {
     writeFileSync(path, bytes)
     expect(startRead()).toEqual({ kind: 'refused', path })
     const entries = startupEntries()
-    expect(entries).toHaveLength(1)
-    expect(entries[0]).toEndWith(retiredKeysUnreadableMessage(path, (parsed as { problem: string }).problem))
-    expect(entries[0]).not.toContain(unknownCause)
-    expect(entries[0]).not.toContain('beta')
+    expect(entries).toEqual([unreadableEntry(path, (parsed as { problem: string }).problem)])
+    expect(entries[0]!.text).not.toContain(unknownCause)
+    expect(entries[0]!.text).not.toContain('beta')
   })
 
   // Each malformed form is the seed's serialised bytes altered. The problem is
@@ -692,9 +691,7 @@ describe('the start read (b.jg5 SRJ-802, SRJ-1013)', () => {
 
     expect(startRead(undefined, logs)).toEqual({ kind: 'refused', path })
 
-    const entries = startupEntries()
-    expect(entries).toHaveLength(1)
-    expect(entries[0]).toEndWith(` [${RETIRED_KEYS_UNREADABLE_LABEL}] ${retiredKeysUnreadableMessage(path, (parsed as { problem: string }).problem)}`)
+    expect(startupEntries()).toEqual([unreadableEntry(path, (parsed as { problem: string }).problem)])
     expect(logs).toEqual([])
     expect(new Uint8Array(readFileSync(path)) as Uint8Array).toEqual(bytes)
   })
@@ -713,17 +710,16 @@ describe('the start read (b.jg5 SRJ-802, SRJ-1013)', () => {
 
     expect(startRead(readFs)).toEqual({ kind: 'refused', path })
 
-    const entries = startupEntries()
-    expect(entries).toHaveLength(1)
-    expect(entries[0]).toEndWith(` [${RETIRED_KEYS_UNREADABLE_LABEL}] ${retiredKeysUnreadableMessage(path, configReadFailurePredicate(code))}`)
+    expect(startupEntries()).toEqual([unreadableEntry(path, configReadFailurePredicate(code))])
   })
 
-  test('the refusal names the file, what is wrong and the move-aside remedy', () => {
-    const path = retiredKeysPath(dir)
-    const problem = configReadFailurePredicate('EACCES')
-    const message = retiredKeysUnreadableMessage(path, problem)
-    expect(message).toContain(`"${path}" ${problem}`)
-    expect(message).toMatch(/aside/)
+  // The refusal's one literal pin; every other case builds it with `retiredKeysUnreadableMessage`.
+  test('the refusal names the file, what is wrong, that the server does not start and the move-aside remedy with its cost (pin)', () => {
+    expect(retiredKeysUnreadableMessage('/state/retired-keys.json', 'cannot be read (EACCES)')).toBe(
+      'The retired-key record "/state/retired-keys.json" cannot be read (EACCES), so the server does not start: it never guesses which persona keys are retired. ' +
+        'Moving the file aside (for example, renaming it) lets the server start, at the cost that the keys it held are no longer retired, ' +
+        'so a persona whose key it held may resume the conversation of the life that was retired.',
+    )
   })
 
   test.skipIf(!mkfifoAvailable())('a real FIFO at the path with no writer: refused at once, unread, with one entry (child process, 10 s bound; skipped where mkfifo is unavailable)', () => {

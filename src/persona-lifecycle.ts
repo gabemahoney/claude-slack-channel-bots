@@ -290,6 +290,7 @@ import {
 import { ERR_SYSTEM_INSTALL_DISAPPEARED_NAME } from './agent-director-errors.ts'
 import {
   KILL_REFUSAL_AT_KILL,
+  KILL_REFUSAL_AT_READ,
   describeKillOutcome,
   isKillOutcome,
   killLetsNextStepRun,
@@ -677,14 +678,6 @@ function raisableKillFailureAlertOf(killed: unknown, malformed: (what: string) =
 }
 
 /**
- * The notice builders for the teardown kill's outcome live beside
- * `describeKillOutcome` in `src/checked-kill.ts`, so an old-life wait's entry
- * can use them with no lifecycle module (b.jg5 SRJ-1003, SRJ-811); they are
- * re-exported here for the callers that import them from this module.
- */
-export { teardownKillNotSucceededNoticeText, teardownKillRefusalNoticeText }
-
-/**
  * The outage a teardown kill's standing non-success raises when its persona
  * is in the applied configuration (b.jg5 SRJ-110, SRJ-311, SRJ-316): an
  * ENVIRONMENT answer `tmux-unavailable`, a CONFIG answer
@@ -717,7 +710,7 @@ function teardownKillRefusalsOf(killed: unknown): PersonaTeardownKillRefusal[] {
         typeof refusal === 'object' &&
         refusal !== null &&
         (refusal.errorClass === AD_ERROR_CLASS_CONFLICT || refusal.errorClass === AD_ERROR_CLASS_UNUSABLE_NAME) &&
-        (refusal.at === 'kill' || refusal.at === 'status read'),
+        (refusal.at === KILL_REFUSAL_AT_KILL || refusal.at === KILL_REFUSAL_AT_READ),
     )
   } catch {
     return []

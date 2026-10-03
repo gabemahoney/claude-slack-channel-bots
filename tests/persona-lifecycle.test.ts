@@ -62,7 +62,7 @@
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import type { MakeTemplateParams } from 'agent-director'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 
@@ -144,8 +144,6 @@ import {
   LIVE_ROW_SEQUENCE_STOP_AGAIN_STEP,
   LIVE_ROW_SEQUENCE_STOP_STEP,
   TEARDOWN_RETRY_TIMER_STOP_AFTER_KILL_STEP,
-  teardownKillNotSucceededNoticeText,
-  teardownKillRefusalNoticeText,
   type PersonaLifecycle,
   type PersonaLifecycleDeps,
 } from '../src/persona-lifecycle.ts'
@@ -175,8 +173,6 @@ import {
   setConfiguredPersonaQuery,
   setConflictLatch,
   stopLiveRowSequence,
-  TEARDOWN_KILL_REFUSAL_AT_KILL,
-  TEARDOWN_KILL_REFUSAL_AT_READ,
   whenLaunchSettled,
   type PersonaTeardownKillRefusal,
   type PersonaTeardownKillResult,
@@ -225,8 +221,12 @@ import {
   KILL_OUTCOME_NOT_KILLED,
   KILL_OUTCOME_ROW_GONE,
   KILL_OUTCOME_SESSION_GONE,
+  KILL_REFUSAL_AT_KILL,
+  KILL_REFUSAL_AT_READ,
   describeKillOutcome,
   killOutcomeOf,
+  teardownKillNotSucceededNoticeText,
+  teardownKillRefusalNoticeText,
   type KillFailure,
   type KillOutcome,
 } from '../src/checked-kill.ts'
@@ -292,7 +292,14 @@ import { APP_TOKEN_PREFIX, BOT_TOKEN_PREFIX, LEAK_SENTINEL, assertNoLeak, fakeTo
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { makeConnectionHarness, type ConnectionHarness, type ConnectionHarnessOptions } from './test-helpers/persona-connection-harness.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
-import { makeNotifierHarness, teardownNoticeEntry, type NotifierHarness } from './test-helpers/persona-notifier.ts'
+import {
+  makeNotifierHarness,
+  readStartupEntries,
+  teardownNoticeEntry,
+  teardownNoticeLine,
+  type NotifierHarness,
+  type StartupEntry,
+} from './test-helpers/persona-notifier.ts'
 import { INITIAL_CREDENTIALS, makeDeferredWebApiCall, type WebApiOutcome } from './test-helpers/slack-stub.ts'
 
 
@@ -1511,12 +1518,12 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
   test.each<[string, () => PersonaTeardownKillResult, (f: Fixture, r: PersonaTeardownKillResult) => string[]]>([
     [
       'a CONFLICT at its try: the refusal notice only',
-      () => failedKillResult(errTmuxSessionConflict('kill', 'not-this-launch'), 1, [{ at: TEARDOWN_KILL_REFUSAL_AT_KILL, errorClass: AD_ERROR_CLASS_CONFLICT, error: errTmuxSessionConflict('kill', 'not-this-launch') }]),
+      () => failedKillResult(errTmuxSessionConflict('kill', 'not-this-launch'), 1, [{ at: KILL_REFUSAL_AT_KILL, errorClass: AD_ERROR_CLASS_CONFLICT, error: errTmuxSessionConflict('kill', 'not-this-launch') }]),
       (f, r) => [teardownKillRefusalNoticeText(personaInstanceId(f.b.key), r.refusals[0]!)],
     ],
     [
       'an UNUSABLE NAME at a status read, then ErrTmuxUnresponsive standing: the refusal notice, then the not-succeeded notice',
-      () => failedKillResult(errTmuxUnresponsive('kill'), KILL_RETRY_TRIES, [{ at: TEARDOWN_KILL_REFUSAL_AT_READ, errorClass: AD_ERROR_CLASS_UNUSABLE_NAME, error: errUnusableName() }]),
+      () => failedKillResult(errTmuxUnresponsive('kill'), KILL_RETRY_TRIES, [{ at: KILL_REFUSAL_AT_READ, errorClass: AD_ERROR_CLASS_UNUSABLE_NAME, error: errUnusableName() }]),
       (f, r) => [teardownKillRefusalNoticeText(personaInstanceId(f.b.key), r.refusals[0]!), notSucceededText(f, r)],
     ],
   ])('b.jg5 SRJ-1003, SRJ-110: %s', async (_label, build, texts) => {
@@ -2104,6 +2111,23 @@ describe('persona teardown of a key still applied (the old half of a destructive
   })
 })
 
+/** The channel a destructive modify's new half of B sends its notices to, unlike the old half's. */
+const NEW_HALF_CHANNEL = 'C0BETANEW1'
+
+/**
+ * Step 1 of a destructive modify of `old` (SR-8.6): its key stays applied, its
+ * new half's declaration sending notices to `NEW_HALF_CHANNEL` (its own
+ * channel and prompt target), put in `old`'s place in the notifier harness's
+ * persona list and added to `applied`. Answers the new half.
+ */
+function applyNewHalfOf(h: NotifierHarness, applied: Persona[], old: Persona): Persona {
+  const newHalf: Persona = { ...old, channels: [{ id: NEW_HALF_CHANNEL, delivery: 'all' }], permission_prompts: NEW_HALF_CHANNEL }
+  expect(newHalf.permission_prompts).not.toBe(old.permission_prompts)
+  h.personas.splice(h.personas.findIndex((p) => p.key === old.key), 1, newHalf)
+  applied.push(newHalf)
+  return newHalf
+}
+
 // ---------------------------------------------------------------------------
 // Persona teardown over the real latch (b.jg5 SRJ-504, SRJ-1002): the latch
 // ends silently with its persona, a latch its launch in flight set included.
@@ -2267,9 +2291,7 @@ describe('persona teardown over the real latch (b.jg5 SRJ-504, SRJ-1002): the ke
     // The in-flight latch's notice reached the notifier, which wrote it: one entry, one line, no Slack call for B.
     expect(r.posts).toEqual([{ key: a, text: aText }, { key: b, text: bText }])
     expect(h.startupEntries()).toEqual([teardownNoticeEntry(r.f.b, bText)])
-    expect(h.logs).toEqual([
-      `[slack] persona-notifier: notice for ${renderPersonaRef(r.f.b.name, b)} raised during its teardown — written to the server log and startup-errors.log (${PERSONA_TEARDOWN_NOTICE_LABEL}), not posted: ${bText.split('\n')[0]}`,
-    ])
+    expect(h.logs).toEqual([teardownNoticeLine(r.f.b, bText)])
     expect(h.stub(b).callLog).toEqual([])
     expect(h.posts(a)).toHaveLength(1)
     expect(r.latch.isLatched(a)).toBe(true)
@@ -2493,9 +2515,7 @@ describe('persona teardown over the real ErrInvalidFlags hold (b.jg5 SRJ-207, SR
     const h = r.h!
     const b = r.f.b
     // A destructive modify: B's key stays applied, its new half sending notices to another channel.
-    const newHalf: Persona = { ...b, channels: [{ id: 'C0BETANEW1', delivery: 'all' }], permission_prompts: 'C0BETANEW1' }
-    h.personas.splice(h.personas.findIndex((p) => p.key === b.key), 1, newHalf)
-    r.f.applied.push(newHalf)
+    const newHalf = applyNewHalfOf(h, r.f.applied, b)
     const full = stillAppliedTeardownTrail(b, `${JSON.stringify([b.claude_config_dir, undefined])}:[${r.f.a.key},${b.key}]`)
       .filter((c) => !c.startsWith('notifier.'))
 
@@ -2514,9 +2534,7 @@ describe('persona teardown over the real ErrInvalidFlags hold (b.jg5 SRJ-207, SR
     // The set's alert reached the notifier, which wrote it; nothing was posted by any persona's client.
     expect(r.posts).toEqual([alertFor(b.key)])
     expect(h.startupEntries()).toEqual([teardownNoticeEntry(b, INVALID_FLAGS_HOLD_ALERT_TEXT)])
-    expect(h.logs).toEqual([
-      `[slack] persona-notifier: notice for ${renderPersonaRef(b.name, b.key)} raised during its teardown — written to the server log and startup-errors.log (${PERSONA_TEARDOWN_NOTICE_LABEL}), not posted: ${INVALID_FLAGS_HOLD_ALERT_TEXT.split('\n')[0]}`,
-    ])
+    expect(h.logs).toEqual([teardownNoticeLine(b, INVALID_FLAGS_HOLD_ALERT_TEXT)])
     expect(h.totalPosts()).toBe(0)
 
     // The new half, up, meets ErrInvalidFlags itself: a new episode, its alert at its own destination.
@@ -2559,8 +2577,8 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     arms: string[]
     reports: string[]
     conditionStarts: string[]
-    /** The startup-errors.log entries written under the test's temp directory, each from its class on (`[<class>] <entry>`). */
-    startupEntries(): string[]
+    /** The startup-errors.log entries written under the test's temp directory, each as its class and text. */
+    startupEntries(): StartupEntry[]
   }
 
   /**
@@ -2675,11 +2693,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
         ...opts.overrides?.(() => f),
       },
     })
-    const startupEntries = (): string[] => {
-      const path = join(logDir, 'startup-errors.log')
-      if (!existsSync(path)) return []
-      return readFileSync(path, 'utf-8').split('\n').filter((line) => line !== '').map((line) => line.slice(line.indexOf('] [') + 2))
-    }
+    const startupEntries = (): StartupEntry[] => readStartupEntries(logDir)
     return { f, h, calls, adOrder, emissions, killClock, killWaits, logOnly, alertLines, unclassified, episodesClock, arms, reports, conditionStarts, startupEntries }
   }
 
@@ -2690,24 +2704,8 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
    * half.
    */
   function newHalfOfB(r: RealFixture): Persona {
-    const old = r.f.b
-    const newHalf: Persona = { ...old, channels: [{ id: 'C0BETANEW1', delivery: 'all' }], permission_prompts: 'C0BETANEW1' }
-    expect(newHalf.permission_prompts).not.toBe(old.permission_prompts)
-    r.h.personas.splice(r.h.personas.findIndex((p) => p.key === old.key), 1, newHalf)
-    r.f.applied.push(newHalf)
-    return newHalf
+    return applyNewHalfOf(r.h, r.f.applied, r.f.b)
   }
-
-  /** `entry` as `startupEntries()` holds it: `[<class>] <text>`. */
-  const entryLine = (entry: { classLabel: string; text: string }): string => `[${entry.classLabel}] ${entry.text}`
-
-  /** The notifier's line for a notice of `p` written by the teardown window (b.jg5 SRJ-1003). */
-  const windowLine = (p: Persona, text: string, classLabel: string = PERSONA_TEARDOWN_NOTICE_LABEL): string =>
-    `[slack] persona-notifier: notice for ${renderPersonaRef(p.name, p.key)} raised during its teardown — written to the server log and startup-errors.log (${classLabel}), not posted: ${text.split('\n')[0]}`
-
-  /** The notifier's line for the all-clear of an outage whose onset the window wrote, coming after the window closed. */
-  const allClearAfterLine = (p: Persona, text: string): string =>
-    `[slack] persona-notifier: all-clear for ${renderPersonaRef(p.name, p.key)} of an outage raised during its teardown — written to the server log and startup-errors.log (${PERSONA_TEARDOWN_NOTICE_LABEL}), not posted: ${text.split('\n')[0]}`
 
   /** Step 1 of the apply: B leaves the applied set the notifier reads. */
   function removeB(r: RealFixture): void {
@@ -2852,15 +2850,15 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     // The wrapper raises ad-unreachable for B (b.jg5 SRJ-110); the window writes its onset, and the flag stays.
     expect(r.emissions.map((e) => e.key)).toEqual([r.f.b.key])
     const [onsetNotice] = r.emissions
-    expect(r.startupEntries()).toEqual([entryLine(teardownNoticeEntry(r.f.b, onsetNotice!.text))])
-    expect(r.h.logs).toEqual([windowLine(r.f.b, onsetNotice!.text)])
+    expect(r.startupEntries()).toEqual([teardownNoticeEntry(r.f.b, onsetNotice!.text)])
+    expect(r.h.logs).toEqual([teardownNoticeLine(r.f.b, onsetNotice!.text)])
     expect([...getOutageFlags(r.f.b.key)]).toEqual(['ad-unreachable'])
     expect(r.h.hold.view(r.f.b.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
     expectNothingArmedOrDeleted(r)
     assertNoLeak({ lines: r.f.lines, logs: r.h.logs, killLines: consoleLines() })
     // The onset quotes the binary path as the outage state was given it (the same text it posts outside a
     // teardown); with that path masked, the entry carries nothing token-like.
-    assertNoLeak({ entries: r.startupEntries().map((line) => line.replaceAll(unreachable.binaryPath, '<binary path>')) })
+    assertNoLeak({ entries: r.startupEntries().map((entry) => entry.text.replaceAll(unreachable.binaryPath, '<binary path>')) })
   })
 
   // b.jg5 SRJ-715, SRJ-701, SRJ-703, SRJ-104: a success (`kill_sent` true,
@@ -2912,7 +2910,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
   const BY_ALERT: RecordedBy = (r, err) => teardownAlertText(ordinaryAlertContent(r.f.b.key, { last: err }), false)
   const BY_REFUSAL: RecordedBy = (r, err) =>
     teardownKillRefusalNoticeText(personaInstanceId(r.f.b.key), {
-      at: TEARDOWN_KILL_REFUSAL_AT_KILL,
+      at: KILL_REFUSAL_AT_KILL,
       errorClass: classifyAdError(err).errorClass as PersonaTeardownKillRefusal['errorClass'],
       error: err,
     })
@@ -2952,8 +2950,8 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     expect(latch.isLatched(r.f.b.key)).toBe(false)
     expect(r.logOnly).toEqual([])
     const text = recordedBy(r, err, tries)
-    expect(r.startupEntries()).toEqual([entryLine(teardownNoticeEntry(r.f.b, text))])
-    expect(r.h.logs).toEqual([windowLine(r.f.b, text)])
+    expect(r.startupEntries()).toEqual([teardownNoticeEntry(r.f.b, text)])
+    expect(r.h.logs).toEqual([teardownNoticeLine(r.f.b, text)])
     expectNothingArmedOrDeleted(r)
     assertNoLeak({ lines: r.f.lines, logs: r.h.logs, alertLines: r.alertLines, entries: r.startupEntries(), killLines: consoleLines() })
   })
@@ -3015,8 +3013,8 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
       const entry = teardownNoticeEntry(r.f.b, text)
       expect(entry.text).toContain(PERSONA_TEARDOWN_NOTICE_RAISED)
       expect(r.logOnly).toEqual([])
-      expect(r.startupEntries()).toEqual([entryLine(entry)])
-      expect(r.h.logs).toEqual([windowLine(r.f.b, text)])
+      expect(r.startupEntries()).toEqual([entry])
+      expect(r.h.logs).toEqual([teardownNoticeLine(r.f.b, text)])
       expect(r.alertLines.filter((line) => line.includes(`persona=${b} `))).toHaveLength(1)
       expect(r.adOrder).toEqual(killsAndReads(personaInstanceId(b), KILL_RETRY_TRIES))
       expect(r.f.lines.slice(1)).toEqual([
@@ -3042,9 +3040,9 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
 
       const text = teardownAlertText(survivorAlertContent(b, survivor), stillApplied)
       expect(r.logOnly).toEqual([])
-      expect(r.startupEntries()).toEqual([entryLine(teardownNoticeEntry(r.f.b, text, PERSONA_TEARDOWN_NOTICE_RAISED, PERSONA_KILL_SURVIVOR_LABEL))])
-      expect(r.startupEntries().filter((line) => line.startsWith(`[${PERSONA_TEARDOWN_NOTICE_LABEL}]`))).toEqual([])
-      expect(r.h.logs).toEqual([windowLine(r.f.b, text, PERSONA_KILL_SURVIVOR_LABEL)])
+      expect(r.startupEntries()).toEqual([teardownNoticeEntry(r.f.b, text, PERSONA_TEARDOWN_NOTICE_RAISED, PERSONA_KILL_SURVIVOR_LABEL)])
+      expect(r.startupEntries().filter((entry) => entry.classLabel === PERSONA_TEARDOWN_NOTICE_LABEL)).toEqual([])
+      expect(r.h.logs).toEqual([teardownNoticeLine(r.f.b, text, PERSONA_TEARDOWN_NOTICE_RAISED, PERSONA_KILL_SURVIVOR_LABEL)])
       expect(r.adOrder).toEqual(killsAndReads(personaInstanceId(b), 2))
       expect(r.killWaits).toEqual([KILL_RETRY_SPACING_MS])
       expect(r.f.lines).toEqual(cleanTeardownLines(r.f.b, { kind: KILL_OUTCOME_KILLED, killSent: true }, 2))
@@ -3071,7 +3069,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     expect(r.emissions.map((e) => e.key)).toEqual([b.key]) // the onset was raised for B
     expect(r.adOrder).toEqual(killsAndReads(personaInstanceId(b.key), triesFor(unreachable)))
     const [onsetNotice] = r.emissions
-    expect(r.startupEntries()).toEqual([entryLine(teardownNoticeEntry(b, onsetNotice!.text))])
+    expect(r.startupEntries()).toEqual([teardownNoticeEntry(b, onsetNotice!.text)])
     expect([...getOutageFlags(b.key)]).toEqual(['ad-unreachable'])
 
     // Step 6: B's new half comes up and its held notices are flushed: none was held.
@@ -3085,10 +3083,10 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     await flush()
     const allClearNotice = r.emissions[1]!
     expect(r.startupEntries()).toEqual([
-      entryLine(teardownNoticeEntry(b, onsetNotice!.text)),
-      entryLine(teardownNoticeEntry(b, allClearNotice.text, PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER)),
+      teardownNoticeEntry(b, onsetNotice!.text),
+      teardownNoticeEntry(b, allClearNotice.text, PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER),
     ])
-    expect(r.h.logs).toEqual([windowLine(b, onsetNotice!.text), allClearAfterLine(b, allClearNotice.text)])
+    expect(r.h.logs).toEqual([teardownNoticeLine(b, onsetNotice!.text), teardownNoticeLine(b, allClearNotice.text, PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER)])
     expect(r.f.lines.at(-1)).toBe(`${teardownPrefix(b)}: complete, with 1 failed step(s)`)
     expectNothingArmedOrDeleted(r)
 
@@ -3179,9 +3177,9 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     // The outage's onset for B only while B is configured, written by the window; the flag is kept.
     expect(r.emissions.map((e) => e.key)).toEqual(configured ? [k] : [])
     expect([...getOutageFlags(k)]).toEqual(configured ? [outage] : [])
-    const onsetEntries = r.emissions.map((e) => entryLine(teardownNoticeEntry(b, e.text)))
+    const onsetEntries = r.emissions.map((e) => teardownNoticeEntry(b, e.text))
     const notSucceeded = teardownKillNotSucceededNoticeText(id, killOutcomeOf({ thrown: err }) as KillFailure, 1)
-    expect(r.startupEntries()).toEqual(configured ? onsetEntries : [entryLine(teardownNoticeEntry(b, notSucceeded))])
+    expect(r.startupEntries()).toEqual(configured ? onsetEntries : [teardownNoticeEntry(b, notSucceeded)])
 
     // The outage clears after the teardown, the new half up: its all-clear is written, not posted.
     clearOutageFlag(k, outage)
@@ -3189,11 +3187,11 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     expect(r.emissions.map((e) => e.key)).toEqual(configured ? [k, k] : [])
     expect(r.startupEntries()).toEqual(
       configured
-        ? [...onsetEntries, entryLine(teardownNoticeEntry(b, r.emissions[1]!.text, PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER))]
-        : [entryLine(teardownNoticeEntry(b, notSucceeded))],
+        ? [...onsetEntries, teardownNoticeEntry(b, r.emissions[1]!.text, PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER)]
+        : [teardownNoticeEntry(b, notSucceeded)],
     )
     expect(r.h.logs).toEqual(
-      configured ? [windowLine(b, r.emissions[0]!.text), allClearAfterLine(b, r.emissions[1]!.text)] : [windowLine(b, notSucceeded)],
+      configured ? [teardownNoticeLine(b, r.emissions[0]!.text), teardownNoticeLine(b, r.emissions[1]!.text, PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER)] : [teardownNoticeLine(b, notSucceeded)],
     )
     expect(r.calls.deleteCalls).toEqual([])
     expect(r.h.totalPosts()).toBe(0)
@@ -3240,16 +3238,16 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     expect(controller.isArmed(k)).toBe(false)
     // One onset, raised by the launch in the window and written; the kill's same answer raised none.
     expect(r.emissions.map((e) => e.key)).toEqual([k])
-    expect(r.startupEntries()).toEqual([entryLine(teardownNoticeEntry(b, r.emissions[0]!.text))])
+    expect(r.startupEntries()).toEqual([teardownNoticeEntry(b, r.emissions[0]!.text)])
     expect([...getOutageFlags(k)]).toEqual([outage])
 
     clearOutageFlag(k, outage)
     await flush()
     expect(r.startupEntries()).toEqual([
-      entryLine(teardownNoticeEntry(b, r.emissions[0]!.text)),
-      entryLine(teardownNoticeEntry(b, r.emissions[1]!.text, PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER)),
+      teardownNoticeEntry(b, r.emissions[0]!.text),
+      teardownNoticeEntry(b, r.emissions[1]!.text, PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER),
     ])
-    expect(r.h.logs).toEqual([windowLine(b, r.emissions[0]!.text), allClearAfterLine(b, r.emissions[1]!.text)])
+    expect(r.h.logs).toEqual([teardownNoticeLine(b, r.emissions[0]!.text), teardownNoticeLine(b, r.emissions[1]!.text, PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER)])
     expect(r.h.totalPosts()).toBe(0)
     expect(r.calls.deleteCalls).toEqual([])
     assertNoLeak({ lines: r.f.lines, logs: r.h.logs, entries: r.startupEntries() })
@@ -3265,20 +3263,20 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
   // half's nor the new half's destination hears of it. For a removal and for
   // a destructive modify's old half (its new half sending notices elsewhere).
   test.each<[string, PersonaTeardownKillRefusal['at'], PersonaTeardownKillRefusal['errorClass'], () => Error, boolean]>([
-    ['a CONFLICT at its try, B removed', TEARDOWN_KILL_REFUSAL_AT_KILL, AD_ERROR_CLASS_CONFLICT, () => errTmuxSessionConflict('kill', 'not-this-launch'), false],
-    ['a CONFLICT at its try, a destructive modify\'s old half', TEARDOWN_KILL_REFUSAL_AT_KILL, AD_ERROR_CLASS_CONFLICT, () => errTmuxSessionConflict('kill', 'not-this-launch'), true],
-    ['an UNUSABLE NAME at its try, B removed', TEARDOWN_KILL_REFUSAL_AT_KILL, AD_ERROR_CLASS_UNUSABLE_NAME, () => errUnusableName(), false],
-    ['an UNUSABLE NAME at its try, a destructive modify\'s old half', TEARDOWN_KILL_REFUSAL_AT_KILL, AD_ERROR_CLASS_UNUSABLE_NAME, () => errUnusableName(), true],
-    ['a CONFLICT at the status read between its tries, B removed', TEARDOWN_KILL_REFUSAL_AT_READ, AD_ERROR_CLASS_CONFLICT, () => errTmuxSessionConflict('status', 'not-this-launch'), false],
-    ['a CONFLICT at the status read between its tries, a destructive modify\'s old half', TEARDOWN_KILL_REFUSAL_AT_READ, AD_ERROR_CLASS_CONFLICT, () => errTmuxSessionConflict('status', 'not-this-launch'), true],
-    ['an UNUSABLE NAME at the status read between its tries, B removed', TEARDOWN_KILL_REFUSAL_AT_READ, AD_ERROR_CLASS_UNUSABLE_NAME, () => errUnusableName(), false],
-    ['an UNUSABLE NAME at the status read between its tries, a destructive modify\'s old half', TEARDOWN_KILL_REFUSAL_AT_READ, AD_ERROR_CLASS_UNUSABLE_NAME, () => errUnusableName(), true],
+    ['a CONFLICT at its try, B removed', KILL_REFUSAL_AT_KILL, AD_ERROR_CLASS_CONFLICT, () => errTmuxSessionConflict('kill', 'not-this-launch'), false],
+    ['a CONFLICT at its try, a destructive modify\'s old half', KILL_REFUSAL_AT_KILL, AD_ERROR_CLASS_CONFLICT, () => errTmuxSessionConflict('kill', 'not-this-launch'), true],
+    ['an UNUSABLE NAME at its try, B removed', KILL_REFUSAL_AT_KILL, AD_ERROR_CLASS_UNUSABLE_NAME, () => errUnusableName(), false],
+    ['an UNUSABLE NAME at its try, a destructive modify\'s old half', KILL_REFUSAL_AT_KILL, AD_ERROR_CLASS_UNUSABLE_NAME, () => errUnusableName(), true],
+    ['a CONFLICT at the status read between its tries, B removed', KILL_REFUSAL_AT_READ, AD_ERROR_CLASS_CONFLICT, () => errTmuxSessionConflict('status', 'not-this-launch'), false],
+    ['a CONFLICT at the status read between its tries, a destructive modify\'s old half', KILL_REFUSAL_AT_READ, AD_ERROR_CLASS_CONFLICT, () => errTmuxSessionConflict('status', 'not-this-launch'), true],
+    ['an UNUSABLE NAME at the status read between its tries, B removed', KILL_REFUSAL_AT_READ, AD_ERROR_CLASS_UNUSABLE_NAME, () => errUnusableName(), false],
+    ['an UNUSABLE NAME at the status read between its tries, a destructive modify\'s old half', KILL_REFUSAL_AT_READ, AD_ERROR_CLASS_UNUSABLE_NAME, () => errUnusableName(), true],
   ])('AC 65: %s: one log line and one persona-teardown-notice entry with the kill outcome\'s one-line rendering, nothing latched, nothing posted to either half\'s destination', async (_label, at, errorClass, make, destructive) => {
     const refused = make()
     expect(classifyAdError(refused).errorClass).toBe(errorClass)
     const latch = installLatch(() => true)
     // At a read: the first try answers UNAVAILABLE, the read between the tries the refusal, the second try succeeds.
-    const r = at === TEARDOWN_KILL_REFUSAL_AT_KILL
+    const r = at === KILL_REFUSAL_AT_KILL
       ? makeReal({ killError: refused })
       : makeReal({ killQueue: [cannedErr(errTmuxUnresponsive('kill')), cannedOk(cannedKillResult(true))], statusQueue: [cannedErr(refused)] })
     const b = r.f.b
@@ -3289,19 +3287,19 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     await flush()
 
     const id = personaInstanceId(b.key)
-    expect(r.adOrder).toEqual(at === TEARDOWN_KILL_REFUSAL_AT_KILL ? [`kill:${id}`] : killsAndReads(id, 2))
+    expect(r.adOrder).toEqual(at === KILL_REFUSAL_AT_KILL ? [`kill:${id}`] : killsAndReads(id, 2))
     const text = teardownKillRefusalNoticeText(id, { at, errorClass, error: refused })
     expect(text).not.toContain('Held')
     const entry = teardownNoticeEntry(b, text)
-    expect(r.startupEntries()).toEqual([entryLine(entry)])
+    expect(r.startupEntries()).toEqual([entry])
     expect(entry.text).toContain(`${PERSONA_TEARDOWN_NOTICE_RAISED}: `)
-    expect(r.h.logs).toEqual([windowLine(b, text)])
+    expect(r.h.logs).toEqual([teardownNoticeLine(b, text)])
     expect(latch.isLatched(b.key)).toBe(false)
     expect(latch.record(b.key)).toBeUndefined()
     expect(r.logOnly).toEqual([])
     expectNothingArmedOrDeleted(r)
     expect(r.f.lines.at(-1)).toBe(
-      at === TEARDOWN_KILL_REFUSAL_AT_KILL ? `${teardownPrefix(b)}: complete, with 1 failed step(s)` : `${teardownPrefix(b)}: complete`,
+      at === KILL_REFUSAL_AT_KILL ? `${teardownPrefix(b)}: complete, with 1 failed step(s)` : `${teardownPrefix(b)}: complete`,
     )
     assertNoLeak({ lines: r.f.lines, logs: r.h.logs, entries: r.startupEntries(), killLines: consoleLines() })
   })
@@ -3358,11 +3356,11 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     const [onsetNotice, allClearNotice] = r.emissions
     const notSucceeded = teardownKillNotSucceededNoticeText(personaInstanceId(b.key), killOutcomeOf({ thrown: unavailable }) as KillFailure, KILL_RETRY_TRIES)
     expect(r.startupEntries()).toEqual([
-      entryLine(teardownNoticeEntry(b, onsetNotice!.text)),
-      entryLine(teardownNoticeEntry(b, allClearNotice!.text)),
-      entryLine(teardownNoticeEntry(b, notSucceeded)),
+      teardownNoticeEntry(b, onsetNotice!.text),
+      teardownNoticeEntry(b, allClearNotice!.text),
+      teardownNoticeEntry(b, notSucceeded),
     ])
-    expect(r.h.logs).toEqual([windowLine(b, onsetNotice!.text), windowLine(b, allClearNotice!.text), windowLine(b, notSucceeded)])
+    expect(r.h.logs).toEqual([teardownNoticeLine(b, onsetNotice!.text), teardownNoticeLine(b, allClearNotice!.text), teardownNoticeLine(b, notSucceeded)])
     expect([...getOutageFlags(b.key)]).toEqual([])
     expect(latch.isLatched(b.key)).toBe(false)
     expectNothingArmedOrDeleted(r)
@@ -3391,8 +3389,8 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     const outcome = killOutcomeOf({ thrown: err }) as KillFailure
     expect<string>(outcome.errorClass).toBe(errorClass)
     const text = teardownKillNotSucceededNoticeText(id, outcome, 1)
-    expect(r.startupEntries()).toEqual([entryLine(teardownNoticeEntry(b, text))])
-    expect(r.h.logs).toEqual([windowLine(b, text)])
+    expect(r.startupEntries()).toEqual([teardownNoticeEntry(b, text)])
+    expect(r.h.logs).toEqual([teardownNoticeLine(b, text)])
     expect(r.f.lines.slice(1)).toEqual([killFailedLine(b, outcome, 1), `${teardownPrefix(b)}: complete, with 1 failed step(s)`])
     expectNothingArmedOrDeleted(r)
     assertNoLeak({ lines: r.f.lines, logs: r.h.logs, entries: r.startupEntries() })
@@ -3419,10 +3417,10 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
 
     const id = personaInstanceId(b.key)
     expect(r.adOrder).toEqual(killsAndReads(id, KILL_RETRY_TRIES))
-    const refusal = teardownKillRefusalNoticeText(id, { at: TEARDOWN_KILL_REFUSAL_AT_READ, errorClass: AD_ERROR_CLASS_CONFLICT, error: refused })
+    const refusal = teardownKillRefusalNoticeText(id, { at: KILL_REFUSAL_AT_READ, errorClass: AD_ERROR_CLASS_CONFLICT, error: refused })
     const notSucceeded = teardownKillNotSucceededNoticeText(id, killOutcomeOf({ thrown: unavailable }) as KillFailure, KILL_RETRY_TRIES)
-    expect(r.startupEntries()).toEqual([entryLine(teardownNoticeEntry(b, refusal)), entryLine(teardownNoticeEntry(b, notSucceeded))])
-    expect(r.h.logs).toEqual([windowLine(b, refusal), windowLine(b, notSucceeded)])
+    expect(r.startupEntries()).toEqual([teardownNoticeEntry(b, refusal), teardownNoticeEntry(b, notSucceeded)])
+    expect(r.h.logs).toEqual([teardownNoticeLine(b, refusal), teardownNoticeLine(b, notSucceeded)])
     expect(latch.isLatched(b.key)).toBe(false)
     expect(r.logOnly).toEqual([])
     expectNothingArmedOrDeleted(r)
@@ -3453,9 +3451,9 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     await flush()
 
     const text = unclassifiedErrorAlertText(classifyAdError(unclassifiedErr), { escapeForSlack: false })
-    expect(r.startupEntries()).toEqual([entryLine(teardownNoticeEntry(b, text))])
-    expect(r.startupEntries().filter((line) => line.startsWith(`[${PERSONA_UNCLASSIFIED_ERROR_LABEL}]`))).toEqual([])
-    expect(r.h.logs).toEqual([windowLine(b, text)])
+    expect(r.startupEntries()).toEqual([teardownNoticeEntry(b, text)])
+    expect(r.startupEntries().filter((entry) => entry.classLabel === PERSONA_UNCLASSIFIED_ERROR_LABEL)).toEqual([])
+    expect(r.h.logs).toEqual([teardownNoticeLine(b, text)])
     expect(r.h.totalPosts()).toBe(0)
     assertNoLeak({ lines: r.f.lines, logs: r.h.logs, alertLines: r.alertLines, entries: r.startupEntries() })
   })

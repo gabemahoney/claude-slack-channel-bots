@@ -53,7 +53,10 @@
  * whoever made the call (the shared own-row `status` read, and the liveness
  * and reconnect adapters in `src/server.ts`, so the health tick, the restart
  * path, the re-probe and the lost-message read too), and acts on both kinds
- * of decision the same way. None of the decisions applies at the permission
+ * of decision the same way. The persona teardown kill's `status` read
+ * between its tries (`readTeardownKillRow`) asks only the entry clear
+ * ({@link decideRetiredEntryClear}) and acts on it, latching nothing
+ * (SRJ-715, SRJ-115). None of the decisions applies at the permission
  * poller's `list` and `get` or at the JSONL persistence safeguard's `get`,
  * which are not SRJ-114's sites (b.jg5 SRJ-122).
  *
@@ -234,9 +237,9 @@ function decideOwnRowLatch(input: OwnRowReadInput): RowReadLatchDecision | undef
  * configured ({@link decideRetiredEntryClear}, b.jg5 SRJ-807): the row is
  * `key`'s own, reads a live state other than `pending`, and the key is
  * recorded with its mark set. A read with no clear answers the latch
- * decision alone, as the same object it answered before the clear existed
- * ({@link ROW_READ_LAUNCH_START_NOT_RECORDED} for step 1, which never comes
- * with a clear).
+ * decision alone: {@link ROW_READ_NO_DECISION} with no latch,
+ * {@link ROW_READ_LAUNCH_START_NOT_RECORDED} for step 1 (which never comes
+ * with a clear), and a frozen `{ latch }` for step 2.
  *
  * Pure; never throws.
  */

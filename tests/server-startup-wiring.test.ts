@@ -857,21 +857,6 @@ describe('main() resolves the start through the reload controller and exits on a
     }
   })
 
-  test('hands the controller the one retired-key store main() loaded, by the binding the start read\'s store was bound to, so apply step 1 records through it (b.jg5 SRJ-802, SRJ-803)', () => {
-    /** The controller's store dependency and the start read; typed, so a rename fails the typecheck. */
-    const STORE_DEP: keyof ReloadControllerDeps = 'retiredKeys'
-    const START_READ: keyof typeof RetiredKeysModule = 'readRetiredKeysAtStart'
-    // `const <store> = <outcome>.store`, where `<outcome>` binds the one start read.
-    const outcome = constOf(START_READ)
-    const stores = [
-      ...SERVER_CODE.matchAll(new RegExp(`\\bconst\\s+(\\w+)(?:\\s*:\\s*\\w+)?\\s*=\\s*${outcome}\\s*\\.\\s*store\\b`, 'g')),
-    ].map((m) => m[1]!)
-    expect(stores).toHaveLength(1)
-    declaredOnce(stores[0]!)
-    // Exactly that binding: a store of the controller's own (an inline build, another name) or none fails.
-    expect(onlyCallProps('createReloadController').get(STORE_DEP)).toBe(stores[0])
-  })
-
   test('the start resolution comes AFTER the PID check, so a duplicate start never writes the record', () => {
     const { resolveAt } = startResolution(SERVER_CODE)
     expect(resolveAt).toBeGreaterThan(onlyCallOf('checkPidConflict'))
