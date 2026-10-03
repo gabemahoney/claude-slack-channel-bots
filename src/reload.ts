@@ -50,7 +50,9 @@
  * record; if the rewrite fails, nothing is applied,
  * `reload-record-write-failed` is logged, and the keys this apply recorded
  * are removed again, a key held as retired before the apply staying retired,
- * SRJ-804; then swap the applied state and tell `onApplied`), then steps 2–6
+ * SRJ-804; once the rewrite succeeded, begin an old-life hold on each
+ * removed or destructively modified key's `cscb_<key>` at its old working
+ * directory, SRJ-809; then swap the applied state and tell `onApplied`), then steps 2–6
  * of `reload-apply.ts` in order (by default through the
  * lifecycle operations: step 2 tears down each removed persona and the old
  * half of each destructive modify, steps 3 and 4 update in place and
@@ -66,7 +68,8 @@
  * injected, as `createCronScheduler` is: the SR-8.1 paths, the durable
  * writer and delete, the server's retired-key store (`retired-keys.ts`,
  * whose writes go through the same writer), the dialog approver stop that
- * step 1 calls for each key it records (b.jg5 SRJ-808), the log sink, the
+ * step 1 calls for each key it records (b.jg5 SRJ-808), the server's
+ * old-life hold set step 1 begins holds in (b.jg5 SRJ-809), the log sink, the
  * lifecycle operations (the start bring-up pass, and the apply's per-step
  * operations), the tick driver, the dry-run flag, the held credentials
  * digests and bring-up states, and the Slack client factory that later work binds
@@ -123,7 +126,7 @@ import {
   type CredentialsFileRead,
   type CredentialsFs,
 } from './persona-credentials.ts'
-import { expandTilde, renderPersonaRef } from './persona-identity.ts'
+import { expandTilde, personaInstanceId, renderPersonaRef } from './persona-identity.ts'
 import type { PersonaSlackClientFactory } from './persona-slack-clients.ts'
 import {
   applyStepInputs,
@@ -169,11 +172,14 @@ import {
   type ValidChangePlan,
 } from './reload-plan.ts'
 import {
+  OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1,
   RETIRED_KEY_CAUSE_ABSENT_AT_START,
   RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY,
   RETIRED_KEY_CAUSE_REMOVED,
   RETIRED_KEYS_WRITE_FAILED,
   RETIRED_KEYS_WRITTEN,
+  type OldLifeHoldBegin,
+  type OldLifeHoldSet,
   type RetiredKeyStore,
   type RetiredKeysRestoreOutcome,
   type RetiredKeyToRecord,
@@ -455,6 +461,18 @@ export interface ReloadControllerDeps {
    * failed rewrite restarts no approver.
    */
   stopApprover: (key: string) => unknown
+  /**
+   * The server's old-life hold set (`createOldLifeHoldSet`,
+   * `src/retired-keys.ts`; b.jg5 SRJ-809): production passes the one set
+   * `main()` builds, the set the session manager has installed. Once a
+   * confirmed apply's last-applied rewrite has succeeded, step 1 begins one
+   * hold in it for each removed persona's key (a renamed persona's old key
+   * included) and each destructive modify's key, on `cscb_<key>`, at the
+   * old declaration's working directory (`oldLifeHoldsToBegin`); an apply
+   * that fails at its retired-key write or its rewrite begins none. A begin
+   * on an id already held keeps its held directory.
+   */
+  oldLifeHolds: Pick<OldLifeHoldSet, 'begin'>
   /** The detection tick's driver; without one, `startDetection` arms nothing. */
   tickDriver?: ReloadTickDriver
   /**
@@ -580,6 +598,36 @@ export function retiredKeysToRecord(
       .filter(({ key }) => store.isHeldInMemory(key))
       .map(({ key }): RetiredKeyToRecord => ({ key, cause: store.entry(key)?.cause ?? RETIRED_KEY_CAUSE_ABSENT_AT_START })),
   ]
+}
+
+/**
+ * The old-life holds a confirmed apply's step 1 begins once its last-applied
+ * rewrite has succeeded (b.jg5 SRJ-809's first start): one per key the step
+ * records whose old declaration `applied` (the configuration in effect
+ * before the apply) holds, in the plan's order: each removed persona's key
+ * (a key-changing rename's old key included) and each destructive modify's
+ * key, the instance id `cscb_<key>`, the old key itself, the old
+ * declaration's working directory (a session manager read of the row's
+ * `cwd` replaces it later), and the apply-step-1 cause. A key recorded again
+ * (already recorded with no mark, so nothing was written) and a destructive
+ * modify whose working directory is unchanged still get theirs: only a
+ * launch gate tells a same-key new half apart (SRJ-805). A key the plan adds
+ * that the store held only in memory gets none here: it has no old
+ * declaration, and the start sweep held its live row already. Pure.
+ */
+export function oldLifeHoldsToBegin(plan: ValidChangePlan, applied: PersonaConfig): OldLifeHoldBegin[] {
+  const begins: OldLifeHoldBegin[] = []
+  for (const { key } of [...plan.removed, ...plan.destructive]) {
+    const old = applied.personas.find((persona) => persona.key === key)
+    if (old === undefined) continue
+    begins.push({
+      instanceId: personaInstanceId(key),
+      oldKey: key,
+      directory: old.working_directory,
+      cause: OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1,
+    })
+  }
+  return begins
 }
 
 // ---------------------------------------------------------------------------
@@ -1499,6 +1547,23 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     }
   }
 
+  /**
+   * Begin apply step 1's old-life holds (`oldLifeHoldsToBegin`, b.jg5
+   * SRJ-809) in the injected hold set, after the last-applied rewrite
+   * succeeded; each begin logs its own line. A throw is logged, never
+   * raised: the apply goes on.
+   */
+  function beginStepOneHolds(plan: ValidChangePlan, applied: PersonaConfig): void {
+    const holds = deps.oldLifeHolds
+    for (const begin of oldLifeHoldsToBegin(plan, applied)) {
+      try {
+        holds.begin(begin)
+      } catch (err) {
+        deps.log(`[slack] reload: beginning the old-life hold of ${begin.instanceId} failed: ${describeThrownValue(err)} (b.jg5 SRJ-809)`)
+      }
+    }
+  }
+
   /** Tell the server the new applied configuration; a throw is logged, never raised. */
   function notifyApplied(config: PersonaConfig): void {
     try {
@@ -1533,7 +1598,12 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
    *      apply (the keys this apply recorded removed again, keys and marks
    *      held before it kept), one `reload-record-write-failed` line says how
    *      the restore went, and nothing is applied (SRJ-804); no approver
-   *      stopped in step 1 is started again;
+   *      stopped in step 1 is started again, and no old-life hold begins.
+   *      Once it succeeded, each removed persona's key (a rename's old key
+   *      included) and each destructive modify's key holds its old life's
+   *      working directory (`oldLifeHoldsToBegin`, SRJ-809), before any
+   *      teardown's kill; a failed retired-key write above began none
+   *      either;
    *   3. swap the applied state and tell `onApplied`.
    * Then the bound steps 2–6 run in order (`applyStepsFor`: none but the
    * template refresh for a no-op, and that only when the config directories
@@ -1576,6 +1646,10 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
       deps.log(rewriteFailed + restored)
       return false
     }
+    // b.jg5 SRJ-809: the rewrite succeeded, so each key this step recorded
+    // holds its old life's working directory from now, before any teardown's
+    // kill; a failed write or rewrite above began none.
+    beginStepOneHolds(plan, current.config)
     appliedState = { config: candidate.config, bytes, source: 'config' }
     notifyApplied(candidate.config)
 

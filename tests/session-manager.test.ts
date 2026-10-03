@@ -492,6 +492,7 @@ import { homedir, tmpdir } from 'os'
 import { join } from 'path'
 import {
   reconcileOrphans,
+  findMissingRunReadName,
   setKillFailureAlerts,
   reconnectMcp,
   reconnectMcpWithCause,
@@ -1182,13 +1183,25 @@ import { parseLaunchStart } from '../src/pending-row.ts'
 import type { Phase1GetResult, Phase1KillResult, Phase1ListRow, Phase1ResumeResult, Phase1SpawnParams, Phase1SpawnResult, Phase1StatusResult, PreTrust } from '../src/ad-phase1-types.ts'
 import {
   loadRetiredKeyStore,
+  OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1,
+  OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL,
+  OLD_LIFE_HOLD_CAUSE_START_SWEEP_LISTING,
+  OLD_LIFE_HOLD_END_FIND_MISSING_IDS,
+  OLD_LIFE_HOLD_END_READ_ENDED,
+  OLD_LIFE_HOLD_END_READ_MISSING,
+  OLD_LIFE_HOLD_LOG_PREFIX,
+  oldLifeHoldBeganLine,
+  oldLifeHoldEndedLine,
   RETIRED_KEY_CAUSE_ABSENT_AT_START,
   RETIRED_KEY_CAUSE_REMOVED,
   RETIRED_KEYS_LOG_PREFIX,
   RETIRED_KEYS_WRITTEN,
+  type OldLifeHold,
+  type OldLifeHoldEndReason,
 } from '../src/retired-keys.ts'
 import { RETIRED_ENTRY_CLEARING_STATES } from '../src/row-read-rules.ts'
 import {
+  _resetOldLifeHolds,
   _resetRetiredKeyStore,
   COLLISION_GET_SITE,
   PERSONA_KILL_STOP_CAUSE_GENERIC,
@@ -6445,6 +6458,107 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       }
       expect([h.episodeNotices, h.notices, h.controller.armedKeys()]).toEqual([[], [], []])
       expect(h.latch.isLatched(p)).toBe(false)
+    })
+  })
+
+  // b.jg5 SRJ-809, SRJ-714 (the E26 hatch note): the sweep's holds begin after
+  // its recording and before its first kill, and its post-kill find-missing
+  // run ends the hold on each row its `ids` list; a row it lists in
+  // `unverified_ids`, or a `pending` row it did not judge, keeps its hold.
+  // Which rows the sweep holds is tests/old-life-wait.test.ts's.
+  describe('b.jg5 SRJ-809, SRJ-714: the sweep\'s holds begin after its recording and before its first kill, and its post-kill find-missing ends a hold only on a row its ids list', () => {
+    afterEach(() => {
+      expect(srj105Harness?.clock.pendingCount() ?? 0).toBe(0)
+      srj105AfterEach()
+    })
+
+    /** The hold set's lines among the case's errors. */
+    const holdLines = (h: RecoveryHarness, what: 'began' | 'ended'): string[] => h.errors.filter((line) => line.startsWith(`${OLD_LIFE_HOLD_LOG_PREFIX} ${what} `))
+
+    test('an absent persona\'s live row: its key\'s record line, then the hold\'s began line, both before the first kill; one write and one hold when the kill is sent', async () => {
+      const { h } = srj105Build()
+      const row = absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY)
+      let atFirstKill: { writes: number; holds: string[] } | undefined
+      const kill = h.stub.client.kill.bind(h.stub.client)
+      h.stub.client.kill = (params) => {
+        atFirstKill ??= { writes: h.retiredKeyWrites.length, holds: h.oldLifeHolds.snapshot().map((view) => view.instanceId) }
+        return kill(params)
+      }
+
+      await sweepOver(h, [row])
+
+      expect(atFirstKill).toEqual({ writes: 1, holds: [row.claude_instance_id] })
+      const recordedAt = h.errors.findIndex((line) => line.startsWith(`${RETIRED_KEYS_LOG_PREFIX} recorded `))
+      const beganAt = h.errors.indexOf(holdLines(h, 'began')[0]!)
+      expect(recordedAt).toBeGreaterThanOrEqual(0)
+      expect(beganAt).toBeGreaterThan(recordedAt)
+    })
+
+    /** The sweep's two holds: an absent persona's live row (its kill succeeds, held by the listing) and B's row under another instance id (its kill fails, held by the failure and marked). */
+    function heldRows(h: RecoveryHarness, b: string): { absent: Phase1ListRow; bOld: Phase1ListRow } {
+      const absent = absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY)
+      const bOld = listed(h, b, { claude_instance_id: `${personaInstanceId(b)}_old`, cwd: h.home })
+      h.script({ killQueue: [cannedOk(cannedKillResult(true)), ...Array.from({ length: KILL_RETRY_TRIES }, () => cannedErr<Phase1KillResult>(errTmuxKillFailed()))] })
+      return { absent, bOld }
+    }
+
+    test('the post-kill find-missing listing both rows in its ids ends both holds, the killed row\'s and the failed kill\'s, with one end line each naming the run', async () => {
+      const { h, b } = srj105Build()
+      const { absent, bOld } = heldRows(h, b)
+      h.script({ findMissingResult: cannedFindMissing({ rows: { [absent.claude_instance_id]: 'ids', [bOld.claude_instance_id]: 'ids' } }) })
+
+      await sweepOver(h, [absent, bOld])
+
+      expect(killedIds(h)).toEqual([absent.claude_instance_id, ...Array.from({ length: KILL_RETRY_TRIES }, () => bOld.claude_instance_id)])
+      expect(h.oldLifeHolds.snapshot()).toEqual([])
+      const began = holdLines(h, 'began')
+      expect(began).toHaveLength(2)
+      const views: OldLifeHold[] = [
+        { instanceId: absent.claude_instance_id, oldKey: LAUNCH_START_ABSENT_PERSONA_KEY, directory: absent.cwd, realDirectory: realpathSync(absent.cwd), cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_LISTING, killFailed: false, waiting: [] },
+        { instanceId: bOld.claude_instance_id, oldKey: bOld.claude_instance_id, directory: h.home, realDirectory: realpathSync(h.home), cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL, killFailed: true, waiting: [] },
+      ]
+      expect(began).toEqual(views.map((view) => oldLifeHoldBeganLine(view)))
+      expect(holdLines(h, 'ended')).toEqual(views.map((view) => oldLifeHoldEndedLine(view, OLD_LIFE_HOLD_END_FIND_MISSING_IDS, findMissingRunReadName('reconcileOrphans'))))
+    })
+
+    test.each<[string, FindMissingRowPlacement, string]>([
+      ['in unverified_ids (judged still live)', 'unverified_ids', 'waiting'],
+      ['in neither list, its pending row not judged', 'neither', AGENT_DIRECTOR_PENDING_STATE],
+    ])('the post-kill find-missing listing the rows %s keeps both holds, with no end line', async (_label, placement, state) => {
+      const { h, b } = srj105Build()
+      const { absent, bOld } = heldRows(h, b)
+      const rows = [{ ...absent, state }, { ...bOld, state }]
+      h.script({ findMissingResult: cannedFindMissing({ rows: Object.fromEntries(rows.map((row) => [row.claude_instance_id, placement])) }) })
+
+      await sweepOver(h, rows)
+
+      expect(h.stub.calls.findMissingCalls).toHaveLength(1)
+      expect(h.oldLifeHolds.snapshot().map((view) => [view.instanceId, view.killFailed])).toEqual([[absent.claude_instance_id, false], [bOld.claude_instance_id, true]])
+      expect(holdLines(h, 'ended')).toEqual([])
+    })
+
+    // b.jg5 SRJ-714: once the sweep has stopped, it acts on no answer, so a
+    // read that settles after the stop ends no hold.
+    test.each<[string, (h: RecoveryHarness, p: string) => RecoveryStubScript, (h: RecoveryHarness) => boolean]>([
+      [
+        'its kill\'s status read between tries answers ended as the server begins shutting down',
+        () => ({ killQueue: [cannedErr(errTmuxUnresponsive('kill'))], statusQueue: statusReads(LIVENESS_DEAD_ROW_ENDED) }),
+        (h) => h.stub.calls.statusCalls.length > 0,
+      ],
+      [
+        'the post-kill find-missing lists it in its ids as the server begins shutting down',
+        (_h, p) => ({ killResult: cannedKillResult(true), findMissingResult: cannedFindMissing({ rows: { [personaInstanceId(p)]: 'ids' } }) }),
+        (h) => h.stub.calls.findMissingCalls.length > 0,
+      ],
+    ])('P\'s held own row listed in another cwd, %s: the read settles after the sweep stopped, so P\'s hold stays, with no end line', async (_label, script, shuttingDown) => {
+      const { h, p } = srj105Build()
+      beginApplyStepHold(h, p)
+      h.script(script(h, p))
+
+      await sweepOver(h, [listed(h, p, { cwd: h.home })], h.config, () => shuttingDown(h))
+
+      expect(h.oldLifeHolds.snapshot().map((view) => [view.instanceId, view.directory])).toEqual([[personaInstanceId(p), h.home]])
+      expect(holdLines(h, 'ended')).toEqual([])
     })
   })
 })
@@ -22408,6 +22522,177 @@ describe('b.jg5 SRJ-807: a clear whose write fails leaves the entry and changes 
     expect(h.retiredKeyWrites).toEqual([{ path, ok: false }, { path, ok: true }])
     expect(retiredKeyLinesIn(h.errors)).toEqual([failed, clearedLine(h, p, 'waiting', DEDUP_SITE)])
     expectUntouched(h, b)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-809 (E27 T1): the old-life hold ends at every read the session
+// manager makes of the held row
+//
+// A read of the old row by any call ends its hold when it reads `ended` or
+// `missing`, or finds no row (`ErrSpawnNotFound`), with the hold set's one end
+// line naming the read; a live reading (`waiting`, `pending` with a launch
+// start) keeps it. Each read site reaches the session manager's one read
+// entry: the shared own-row `get`, the shared own-row `status` step, the
+// persona teardown kill's and the start sweep kill's `status` reads between
+// tries, and the start sweep's `list`. On `makeRecoveryHarness`, whose one
+// hold set is built and installed as `main()` builds and installs it; P's
+// hold is begun as apply step 1 begins it (`h.beginOldLifeHold`, on
+// `cscb_<P>` at P's working directory), and B's beside it shows that a read
+// of P's row ends no other hold. The entry's decision table (every state, a
+// `find-missing` listing, the `cwd` re-point) is tests/old-life-wait.test.ts's.
+// ---------------------------------------------------------------------------
+
+/** What a read site is answered with: a state, or no row. */
+type HoldReadAnswer = { readonly state: string } | { readonly noRow: true }
+
+/** One read site of a held row: its read name in the end line, whether it can find no row, how a case reads P's row through it, and where P's hold points when it ends. */
+interface HoldReadSite {
+  readonly read: string
+  /** The `list` gives rows only: it has no no-row answer. */
+  readonly listsOnly?: true
+  run(h: RecoveryHarness, p: string, answer: HoldReadAnswer): Promise<unknown>
+  /** P's held directory once the site has read the row: P's working directory unless the site's row carries another `cwd`. */
+  directory(h: RecoveryHarness, p: string): string
+}
+
+/** A `status` answer for `answer`. */
+const holdStatusAnswer = (answer: HoldReadAnswer): CannedResponse<Phase1StatusResult> =>
+  'noRow' in answer ? cannedErr(errSpawnNotFound()) : cannedOk(cannedStatusResult({ state: answer.state }))
+
+/** The read name an own-row read site gives in a hold's end line. */
+const holdReadName = (at: Pick<OwnRowReadSite, 'site' | 'what'>): string => `${at.site}: ${at.what}`
+
+const HOLD_READ_SITES: ReadonlyArray<readonly [string, HoldReadSite]> = [
+  ['the shared own-row get (readPersonaOwnRow)', {
+    read: holdReadName(DEDUP_SITE),
+    run: (h, p, answer) => {
+      h.script('noRow' in answer ? { getError: errSpawnNotFound() } : { getResult: harnessRow(h, harnessPersona(h, p), { state: answer.state }) })
+      return readPersonaOwnRow(p, DEDUP_SITE)
+    },
+    directory: (h, p) => harnessPersona(h, p).working_directory,
+  }],
+  ['the shared own-row status step (readPersonaOwnRowStatus)', {
+    read: holdReadName(STATUS_READ_SITE),
+    run: (h, p, answer) => {
+      h.script('noRow' in answer ? { statusError: errSpawnNotFound() } : { statusResult: cannedStatusResult({ state: answer.state }) })
+      return readPersonaOwnRowStatus(p, STATUS_READ_SITE)
+    },
+    directory: (h, p) => harnessPersona(h, p).working_directory,
+  }],
+  ['the persona teardown kill\'s status read between tries', {
+    read: holdReadName(TEARDOWN_KILL_STATUS_SITE),
+    run: (h, p, answer) => {
+      h.script({ killError: errTmuxUnresponsive('kill'), statusQueue: [holdStatusAnswer(answer)] })
+      return h.drive(killPersonaInstanceForTeardown(p, { clock: h.killRetryClock }))
+    },
+    directory: (h, p) => harnessPersona(h, p).working_directory,
+  }],
+  ['the start sweep kill\'s status read between tries (P\'s own row listed in another cwd)', {
+    read: holdReadName(START_SWEEP_KILL_STATUS_SITE),
+    run: (h, p, answer) => {
+      h.script({
+        listResult: { spawns: [cannedListRow({ cwd: h.home }, harnessPersona(h, p), h.home)] },
+        killQueue: [cannedErr(errTmuxUnresponsive('kill')), cannedOk(cannedKillResult(true))],
+        statusQueue: [holdStatusAnswer(answer)],
+      })
+      return h.startSweep()
+    },
+    // The listed row's cwd re-pointed the hold before the read.
+    directory: (h) => h.home,
+  }],
+  ['the start sweep\'s list (P\'s own row in its directory)', {
+    read: holdReadName(START_SWEEP_LIST_SITE),
+    listsOnly: true,
+    run: (h, p, answer) => {
+      if ('noRow' in answer) throw new Error('a list has no no-row answer')
+      h.script({ listResult: { spawns: [cannedListRow({ state: answer.state }, harnessPersona(h, p), h.home)] } })
+      return h.startSweep()
+    },
+    directory: (h, p) => harnessPersona(h, p).working_directory,
+  }],
+]
+
+/** The answers that end a hold: the answer, the end reason and what the end line adds to the read's name. */
+const HOLD_ENDING_ANSWERS: ReadonlyArray<readonly [string, HoldReadAnswer, OldLifeHoldEndReason, string]> = [
+  ['ended', { state: LIVENESS_DEAD_ROW_ENDED }, OLD_LIFE_HOLD_END_READ_ENDED, ''],
+  ['missing', { state: LIVENESS_DEAD_ROW_MISSING }, OLD_LIFE_HOLD_END_READ_MISSING, ''],
+  ['no row (ErrSpawnNotFound)', { noRow: true }, OLD_LIFE_HOLD_END_READ_MISSING, ': no row'],
+]
+
+/** The live answers that keep a hold. */
+const HOLD_KEEPING_ANSWERS: ReadonlyArray<readonly [string, HoldReadAnswer]> = [
+  ['waiting', { state: 'waiting' }],
+  ['pending (a launch start)', { state: AGENT_DIRECTOR_PENDING_STATE }],
+]
+
+/** The hold set's end lines among the case's errors. */
+const holdEndedLines = (h: RecoveryHarness): string[] => h.errors.filter((line) => line.startsWith(`${OLD_LIFE_HOLD_LOG_PREFIX} ended `))
+
+/** Apply step 1's hold on persona `key`'s own row at its working directory. */
+function beginApplyStepHold(h: RecoveryHarness, key: string): OldLifeHold {
+  return h.beginOldLifeHold({ instanceId: personaInstanceId(key), oldKey: key, directory: harnessPersona(h, key).working_directory, cause: OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1 })
+}
+
+/** `view` re-pointed at `directory`, as the hold set shows it then. */
+function holdAt(view: OldLifeHold, directory: string): OldLifeHold {
+  return { ...view, directory, realDirectory: realpathSync(directory) }
+}
+
+describe('b.jg5 SRJ-809: a read of the held row ended, missing or gone ends its hold at every read site of the session manager; a live read keeps it; another row\'s hold stays', () => {
+  afterEach(() => {
+    expect(srj105Harness?.clock.pendingCount() ?? 0).toBe(0)
+    srj105AfterEach()
+  })
+
+  test.each(HOLD_READ_SITES.flatMap(([site, at]) =>
+    HOLD_ENDING_ANSWERS.filter(([, answer]) => !(at.listsOnly && 'noRow' in answer)).map(([label, answer, reason, suffix]) => [site, label, at, answer, reason, suffix] as const),
+  ))('%s reading P\'s row %s ends P\'s hold with one end line naming the read; B\'s hold stays', async (_site, _label, at, answer, reason, suffix) => {
+    const { h, p, b } = srj105Build()
+    const pHold = beginApplyStepHold(h, p)
+    const bHold = beginApplyStepHold(h, b)
+
+    await at.run(h, p, answer)
+
+    expect(h.oldLifeHolds.snapshot()).toEqual([bHold])
+    expect(holdEndedLines(h)).toEqual([oldLifeHoldEndedLine(holdAt(pHold, at.directory(h, p)), reason, `${at.read}${suffix}`)])
+  })
+
+  test.each(HOLD_READ_SITES.flatMap(([site, at]) => HOLD_KEEPING_ANSWERS.map(([label, answer]) => [site, label, at, answer] as const)))('%s reading P\'s row %s keeps P\'s hold, with no end line', async (_site, _label, at, answer) => {
+    const { h, p, b } = srj105Build()
+    const pHold = beginApplyStepHold(h, p)
+    const bHold = beginApplyStepHold(h, b)
+
+    await at.run(h, p, answer)
+
+    expect(h.oldLifeHolds.snapshot()).toEqual([holdAt(pHold, at.directory(h, p)), bHold])
+    expect(holdEndedLines(h)).toEqual([])
+  })
+
+  test('the shared own-row get reading P\'s row live in another cwd re-points P\'s hold to that cwd, with no line; the read answers the row as before', async () => {
+    const { h, p } = srj105Build()
+    const pHold = beginApplyStepHold(h, p)
+    const row = harnessRow(h, harnessPersona(h, p), { state: 'waiting', cwd: h.home })
+    h.script({ getResult: row })
+
+    expect(await readPersonaOwnRow(p, DEDUP_SITE)).toEqual({ kind: OWN_ROW_READ_ROW, row, latched: false })
+
+    expect(h.oldLifeHolds.snapshot()).toEqual([holdAt(pHold, h.home)])
+    expect(h.errors.filter((line) => line.startsWith(`${OLD_LIFE_HOLD_LOG_PREFIX} `))).toEqual([oldLifeHoldBeganLine(pHold)])
+  })
+
+  test('with no hold set installed, the shared get and status reads of P\'s row ended answer as before, end nothing and log no hold line', async () => {
+    const { h, p } = srj105Build()
+    const pHold = beginApplyStepHold(h, p)
+    _resetOldLifeHolds()
+    const row = harnessRow(h, harnessPersona(h, p), { state: LIVENESS_DEAD_ROW_ENDED })
+    h.script({ getResult: row, statusResult: cannedStatusResult({ state: LIVENESS_DEAD_ROW_ENDED }) })
+
+    expect(await readPersonaOwnRow(p, DEDUP_SITE)).toEqual({ kind: OWN_ROW_READ_ROW, row, latched: false })
+    expect(await readPersonaOwnRowStatus(p, STATUS_READ_SITE)).toStrictEqual({ kind: OWN_ROW_STATUS_STATE, state: LIVENESS_DEAD_ROW_ENDED })
+
+    expect(h.oldLifeHolds.snapshot()).toEqual([pHold])
+    expect(h.errors.filter((line) => line.startsWith(`${OLD_LIFE_HOLD_LOG_PREFIX} `))).toEqual([oldLifeHoldBeganLine(pHold)])
   })
 })
 

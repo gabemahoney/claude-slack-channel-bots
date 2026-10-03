@@ -126,6 +126,7 @@ import {
   setConflictLatch,
   setInvalidFlagsHold,
   setLiveRowSequenceRegistry,
+  setOldLifeHolds,
   setPreLaunchReplyGuard,
   setPreLaunchTrustPatcher,
   setRetiredKeyStore,
@@ -337,7 +338,7 @@ import { handleInterject } from './interject.ts'
 import { createCronScheduler, type CronScheduler } from './cron-scheduler.ts'
 import { configInEffect, createReloadController, reloadFilePaths, type ReloadController } from './reload.ts'
 import { createReloadTickDriver } from './reload-timer.ts'
-import { readRetiredKeysAtStart, type RetiredKeyStore } from './retired-keys.ts'
+import { createOldLifeHoldSet, readRetiredKeysAtStart, type OldLifeHoldSet, type RetiredKeyStore } from './retired-keys.ts'
 import { PRODUCTION_SLACK_CLIENT_FACTORY } from './persona-slack-clients.ts'
 import { initOutageState, getOutageFlags, setOutageFlag, clearOutageFlag, raiseAdConfigMalformed, raiseTmuxUnavailable, resetAllToHealthy, withOutageDetection, reportAgentDirectorError } from './outage-state.ts'
 
@@ -1483,7 +1484,11 @@ export async function _runCallTimeoutStartStep(
  * never handed to `deferPendingRow`. The step reads the result whole, its
  * `launch_started_at` included. An answer that latched the persona
  * reads `unknown` (`livenessLatchedReading`), so the restart work, the
- * health tick and the lost-message routing ask the latch next.
+ * health tick and the lost-message routing ask the latch next. The step also
+ * ends an old-life hold on `cscb_<key>` when the row reads `ended` or
+ * `missing`, or the answer is `ErrSpawnNotFound`, and keeps it on any live
+ * reading, `pending` included (b.jg5 SRJ-809), so this read needs no hold
+ * call of its own.
  *
  * Its bare `status` is the one persona call not made through the outage
  * wrappers, so its error branches report the error themselves
@@ -1526,7 +1531,9 @@ export function _buildIsSessionAliveAdapter(
       clearOutageFlag(key, 'ad-unreachable')
       clearOutageFlag(key, 'ad-config-malformed')
       // b.jg5 SRJ-115: the own-row rules over this answer; a read that
-      // latched the persona reads `unknown`.
+      // latched the persona reads `unknown`. b.jg5 SRJ-809: the same step
+      // ends an old-life hold on cscb_<key> when the row reads `ended` or
+      // `missing`; a live reading, `pending` included, keeps it.
       if (applyOwnRowStatusStep(key, { result: r }, LIVENESS_STATUS_SITE)) return livenessLatchedReading()
       const reading = livenessReadingForStatus(r)
       if (reading.kind === LIVENESS_UNKNOWN) {
@@ -1544,6 +1551,8 @@ export function _buildIsSessionAliveAdapter(
       })
       // b.jg5 SRJ-105, SRJ-512: an UNUSABLE NAME answer latches the persona
       // (the own-row `status` step) and reads `unknown`, never `dead`.
+      // b.jg5 SRJ-809: the same step ends an old-life hold on cscb_<key> on
+      // `ErrSpawnNotFound` (no row); any other error keeps it.
       if (applyOwnRowStatusStep(key, { thrown: err }, LIVENESS_STATUS_SITE)) return livenessLatchedReading()
       return statusErrorReading(key, err)
     }
@@ -2025,7 +2034,10 @@ export function _buildKillSessionAdapter(
  * rule over the result (a configured persona's own row reading `pending`
  * with no launch start, b.jg5 SRJ-513), latches the persona, and the
  * adapter answers 'transient' with nothing typed and no `deferPendingRow`
- * hand-off (`reconnectLatchedByRead`). The `working` and `waiting`
+ * hand-off (`reconnectLatchedByRead`). The same step ends an old-life hold
+ * on `cscb_<key>` when the row reads `ended` or `missing`, or the answer is
+ * `ErrSpawnNotFound`, and keeps it on any live reading, `pending` included
+ * (b.jg5 SRJ-809). The `working` and `waiting`
  * rows' pane reads (`workingReconnectVerdict`, `checkWaitingRowPane`, both
  * through the shared reader) latch on an UNUSABLE NAME answer too and
  * defer, so nothing is typed after them.
@@ -2095,13 +2107,17 @@ export function _buildReconnectSessionAdapter(
         client.status({ claude_instance_id }),
       )
       // b.jg5 SRJ-115: the own-row rules over this answer; a read that
-      // latched the persona types nothing.
+      // latched the persona types nothing. b.jg5 SRJ-809: the same step ends
+      // an old-life hold on cscb_<key> when the row reads `ended` or
+      // `missing`; a live reading, `pending` included, keeps it.
       if (applyOwnRowStatusStep(key, { result: st }, RECONNECT_STATUS_SITE)) return reconnectLatchedByRead(key)
       state = st.state
       launchStartedAt = pendingLaunchStartOf(st)
     } catch (err) {
       // b.jg5 SRJ-105, SRJ-512: an UNUSABLE NAME answer latches the persona
-      // (the own-row `status` step); nothing is typed.
+      // (the own-row `status` step); nothing is typed. b.jg5 SRJ-809: the
+      // same step ends an old-life hold on cscb_<key> on `ErrSpawnNotFound`
+      // (no row); any other error keeps it.
       if (applyOwnRowStatusStep(key, { thrown: err }, RECONNECT_STATUS_SITE)) return reconnectLatchedByRead(key)
       // b.f2b: nothing is known about the session, so nothing is typed.
       forgetWorkingRowEvidence(key)
@@ -2903,6 +2919,13 @@ export async function main(): Promise<void> {
   const retiredKeysStart = readRetiredKeysAtStart(STATE_DIR, { log: (line) => console.error(line) })
   if (retiredKeysStart.kind === 'refused') process.exit(1)
   const retiredKeys: RetiredKeyStore = retiredKeysStart.store
+  // b.jg5 SRJ-809: the server's one old-life hold set, in memory only, built
+  // beside the store: the reload controller's apply step 1 begins holds in it
+  // and the session manager (installed below, before the start sweep) ends
+  // them at its reads, begins the start sweep's and marks kill failures. A
+  // restart drops every hold; the start sweep rebuilds the ones still needed
+  // from its list and the retired-key record.
+  const oldLifeHolds: OldLifeHoldSet = createOldLifeHoldSet({ log: (line) => console.error(line) })
 
   // The agent-director store owns session-id state; CSCB's own sessions.json
   // registry was deleted (SR-7.1, Epic 2).
@@ -2947,6 +2970,9 @@ export async function main(): Promise<void> {
   const reload = createReloadController({
     paths: reloadFilePaths(CONFIG_PATH),
     retiredKeys,
+    // b.jg5 SRJ-809: apply step 1 begins its old-life holds in the one hold
+    // set, once the last-applied rewrite has succeeded.
+    oldLifeHolds,
     // b.jg5 SRJ-808, SRJ-404: apply step 1 stops the dialog approver of each
     // key it records, right after the record and before the last-applied
     // rewrite and the teardown's kill; no pending-row rule run follows.
@@ -3150,6 +3176,12 @@ export async function main(): Promise<void> {
   // row the server reads already clears; with no store installed no read
   // would clear, and an entry whose new life reads live would stay retired.
   setRetiredKeyStore(retiredKeys)
+  // b.jg5 SRJ-809: the one old-life hold set built above, the one the reload
+  // controller begins apply step 1's holds in, installed with no branch
+  // before the start sweep (which rebuilds the holds a restart dropped, from
+  // its list and the retired-key record), the start bring-up pass, the health
+  // tick and the restart path, so every row read ends or re-points a hold.
+  setOldLifeHolds(oldLifeHolds)
   // b.jg5 SRJ-702, SRJ-305: a persona's kill retry (the restart path's kill,
   // the live-row sequence's kills) makes no further try once the
   // persona is torn down or not up (`isPersonaUp`: serving, its bring-up

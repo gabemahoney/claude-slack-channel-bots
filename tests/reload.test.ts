@@ -95,7 +95,7 @@ import {
 import { composePendingFile, PENDING_FILE_HEADER, reloadFingerprint } from '../src/reload-fingerprint.ts'
 import { createReloadTickDriver } from '../src/reload-timer.ts'
 import { DESTRUCTIVE_PREFIX, DESTRUCTIVE_RETIRED_CLAUSE, REMOVED_RETIRED_CLAUSE } from '../src/reload-plan.ts'
-import { RETIRED_KEYS_LOG_PREFIX } from '../src/retired-keys.ts'
+import { OLD_LIFE_HOLD_LOG_PREFIX, RETIRED_KEYS_LOG_PREFIX } from '../src/retired-keys.ts'
 import {
   APP_TOKEN_PREFIX,
   assertNoLeak,
@@ -2633,6 +2633,17 @@ function retiredKeysLogged(action: 'recorded' | 'restored'): string {
 }
 
 /**
+ * The hold set's begin line for the key apply step 1 recorded, once the
+ * last-applied rewrite succeeded (b.jg5 SRJ-809): its wording is pinned in
+ * `tests/reload-apply.test.ts`, so it is matched by the hold set's prefix
+ * only.
+ */
+function oldLifeHoldBeganLogged(): string {
+  const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return expect.stringMatching(new RegExp(`^${escape(`${OLD_LIFE_HOLD_LOG_PREFIX} began `)}`))
+}
+
+/**
  * `activity` with its lifecycle records left out: a confirmed change's
  * teardowns and bring-ups are pinned in `tests/reload-apply.test.ts`, so
  * these cases neither assert them nor their absence for a changed persona.
@@ -2791,7 +2802,7 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
     // No reload-nothing-pending line: the apply's own line says what happened. Step 1 writes the retired-key record first.
     expect(outsideLifecycle(run.since(cp))).toEqual({
       ...NO_RUN_ACTIVITY,
-      logs: [retiredKeysLogged('recorded'), appliedLogged({ removed: 1 })],
+      logs: [retiredKeysLogged('recorded'), oldLifeHoldBeganLogged(), appliedLogged({ removed: 1 })],
       writes: [h.retiredKeysWrite(), h.lastAppliedWrite()],
       removes: [applyRemoved()],
     })
@@ -3137,7 +3148,7 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
 
     expect(outsideLifecycle(run.since(cp))).toEqual({
       ...NO_RUN_ACTIVITY,
-      logs: [undeletableLogged('EIO'), retiredKeysLogged('recorded'), appliedLogged({ removed: 1 })],
+      logs: [undeletableLogged('EIO'), retiredKeysLogged('recorded'), oldLifeHoldBeganLogged(), appliedLogged({ removed: 1 })],
       writes: [h.retiredKeysWrite(), h.lastAppliedWrite()],
       removes: [applyNotRemoved()],
     })
@@ -3237,7 +3248,7 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
 
     expect(outsideLifecycle(run.since(cp))).toEqual({
       ...NO_RUN_ACTIVITY,
-      logs: [removedUnsyncedLogged('EIO'), retiredKeysLogged('recorded'), appliedLogged({ removed: 1 })],
+      logs: [removedUnsyncedLogged('EIO'), retiredKeysLogged('recorded'), oldLifeHoldBeganLogged(), appliedLogged({ removed: 1 })],
       writes: [h.retiredKeysWrite(), h.lastAppliedWrite()],
       removes: [{ path: h.paths.apply, ok: true, removed: true, unsynced: true }],
     })
@@ -3506,6 +3517,7 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
       ...NO_RUN_ACTIVITY,
       logs: [
         retiredKeysLogged('recorded'),
+        oldLifeHoldBeganLogged(),
         expect.stringMatching(
           new RegExp(
             "^\\[slack\\] reload: updating the server's applied configuration failed: Error " +

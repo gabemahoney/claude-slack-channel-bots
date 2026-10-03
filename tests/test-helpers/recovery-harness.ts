@@ -345,6 +345,29 @@
  *   `retiredEntry(key)` reads the key's entry back through the store's
  *   queries: `{ recorded, marked, entry }` (`isRecorded`, `isMarked`, a mark
  *   held in memory after a failed write included, and `entry`).
+ * - `oldLifeHolds` (b.jg5 SRJ-809): the one old-life hold set, built right
+ *   after the retired-key store as `main()` builds it
+ *   (`createOldLifeHoldSet`, its lines to `console.error`, so to `errors`,
+ *   directories compared by the production real-path resolver) and
+ *   installed in the session manager right after the store
+ *   (`setOldLifeHolds`), as `main()` installs it before the start sweep; so
+ *   every row read the session manager makes ends or re-points a hold, the
+ *   start sweep begins its holds there, and a teardown or sweep kill whose
+ *   tries decided the ordinary kill-failure alert marks one. A restart is a
+ *   new harness: holds live in memory, so it starts with none. The view is
+ *   read-only: `snapshot()` (every hold, in begin order: instance id, old
+ *   key, directory and its real path, cause, kill-failed mark, waiting
+ *   personas), `holdOf(id)`, `holdsOnDirectory(dir)`,
+ *   `holdsWaitedOnBy(persona)` and `waitsOnKillFailed(persona)`.
+ *   `beginOldLifeHold(begin)` is apply step 1's begin, the one member of the
+ *   set `main()` hands the reload controller (`ReloadControllerDeps.oldLifeHolds`);
+ *   a case that needs a hold no sweep began (an apply step 1 hold on
+ *   `cscb_<key>` at the old declaration's directory) begins it there. The
+ *   start sweep is `startSweep(isShuttingDown?)`: `reconcileOrphans` over the
+ *   applied configuration (the live applied set) on `killRetryClock`, driven
+ *   with `drive`, its shutdown query the harness's shutting-down flag
+ *   (`shutdown()`) as `main()` binds it unless the case passes another; its
+ *   rows are the stub's `list` answer (`script({ listResult })`).
  * - `tickEnd(key)`: what a health tick's healthy branch does to the
  *   condition, as `main()` binds `HealthCheckDeps.endTmuxUnresponsive`: the
  *   condition's end with reason `TMUX_UNRESPONSIVE_END_TICK` and the `live`
@@ -619,7 +642,8 @@
  *   the configured-persona query (`_resetConfiguredPersonaQuery`), so two
  *   harnesses built one after the other share no query,
  *   the retired-key store's install (`_resetRetiredKeyStore`), so none is
- *   left installed after it,
+ *   left installed after it, the old-life hold set's install
+ *   (`_resetOldLifeHolds`), so no hold outlives the harness,
  *   the stub spawn path and client with every launch still in flight and the
  *   approver's clock and cap, the
  *   findMissing memo, the tmux seams, the settings install, the version
@@ -843,6 +867,7 @@ import {
   DIALOG_POLL_INTERVAL_MS,
   _resetConfiguredPersonaQuery,
   _resetDialogApprovers,
+  _resetOldLifeHolds,
   _resetRetiredKeyStore,
   _resetFindMissingMemo,
   _resetInvalidFlagsHold,
@@ -859,11 +884,13 @@ import {
   launchSession,
   notifyRestartCapReached,
   readPersonaRowState,
+  reconcileOrphans,
   setConfiguredPersonaQuery,
   setConflictLatch,
   setInvalidFlagsHold,
   setKillFailureAlerts,
   setLiveRowSequenceRegistry,
+  setOldLifeHolds,
   setPersonaKillKeepGoingQuery,
   setRetiredKeyStore,
   setSessionNotifier,
@@ -875,16 +902,21 @@ import {
   whenLaunchSettled,
   type ApproverClock,
   type ApproverOutcome,
+  type OrphanReconcileResult,
   type SpawnPersonaResult,
 } from '../../src/session-manager.ts'
 import { durableWriteFileSync } from '../../src/atomic-write.ts'
 import type { OwnRowReadSite } from '../../src/session-manager.ts'
 import {
+  createOldLifeHoldSet,
   readRetiredKeysAtStart,
   RETIRED_KEY_CAUSE_REMOVED,
   RETIRED_KEYS_LOG_PREFIX,
   RETIRED_KEYS_UNCHANGED,
   RETIRED_KEYS_WRITTEN,
+  type OldLifeHold,
+  type OldLifeHoldBegin,
+  type OldLifeHoldSet,
   type RetiredKeyCause,
   type RetiredKeyEntry,
   type RetiredKeyStore,
@@ -1231,6 +1263,13 @@ export type RecoveryTeardownDeps = Required<
   >
 >
 
+/**
+ * The harness's one old-life hold set, read-only (b.jg5 SRJ-809): its
+ * queries, each answering copies (`OldLifeHold`: instance id, old key,
+ * directory and its real path, cause, kill-failed mark, waiting personas).
+ */
+export type RecoveryOldLifeHoldsView = Pick<OldLifeHoldSet, 'snapshot' | 'holdOf' | 'holdsOnDirectory' | 'holdsWaitedOnBy' | 'waitsOnKillFailed'>
+
 /** The harness's slow-recovery tracker, read-only: a persona's count and whether its episode is open. */
 export type RecoverySlowRecoveryView = Pick<SlowRecoveryTracker, 'count' | 'isOpen'>
 
@@ -1296,6 +1335,24 @@ export interface RecoveryHarness {
   retireKey(key: string, options?: RecoveryRetireKeyOptions): void
   /** `key`'s entry read through the store's queries; see the module comment. */
   retiredEntry(key: string): RecoveryRetiredEntry
+  /**
+   * The harness's one old-life hold set, read-only (b.jg5 SRJ-809), built and
+   * installed in the session manager as `main()` builds and installs it; see
+   * the module comment.
+   */
+  readonly oldLifeHolds: RecoveryOldLifeHoldsView
+  /**
+   * Begin one old-life hold as apply step 1 begins it: the hold set's `begin`,
+   * the one member `main()` hands the reload controller. Answers the hold.
+   */
+  beginOldLifeHold(begin: OldLifeHoldBegin): OldLifeHold
+  /**
+   * Run the start sweep as `main()` runs it (`reconcileOrphans` over the
+   * applied configuration on `killRetryClock`, driven with `drive`), its
+   * shutdown query the harness's shutting-down flag unless `isShuttingDown`
+   * is given; its rows are the stub's `list` answer.
+   */
+  startSweep(isShuttingDown?: () => boolean): Promise<OrphanReconcileResult>
   /**
    * Install agent-director's version re-check on the harness clock as
    * `main()` installs it, its binary resolve answering `initial` until the
@@ -1708,6 +1765,11 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     throw new Error('recovery harness: the retired-key record the case seeded cannot be read')
   }
   const retiredKeys = retiredKeysStart.store
+  // As main() builds it (b.jg5 SRJ-809), right after the store: the one
+  // old-life hold set, in memory only, its lines to `console.error` (so to
+  // `errors`), directories compared by the production real-path resolver.
+  // Installed in the session manager below, right after the store.
+  const oldLifeHolds = createOldLifeHoldSet({ log: (line) => console.error(line) })
 
   const stub = installStubSpawnPath(home)
   // The dialog approver runs on the harness clock (b.jg5 SRJ-401): its sleeps
@@ -1837,6 +1899,10 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   // SRJ-807): any key's own row read live other than pending while the store
   // has the key recorded with its mark set clears its entry.
   setRetiredKeyStore(retiredKeys)
+  // As main() installs it, right after the store and before the start sweep
+  // (b.jg5 SRJ-809): every row read the session manager makes ends or
+  // re-points a hold, and the start sweep begins its holds here.
+  setOldLifeHolds(oldLifeHolds)
   // As main() installs them, before any launch (b.jg5 SRJ-704, SRJ-1016):
   // the restart path's kill and the live-row sequence's kills raise through
   // them, and the session manager's own-row reads end a persona's episode.
@@ -2350,6 +2416,19 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       }
     },
     retiredEntry: (key) => ({ recorded: retiredKeys.isRecorded(key), marked: retiredKeys.isMarked(key), entry: retiredKeys.entry(key) }),
+    oldLifeHolds: Object.freeze({
+      snapshot: () => oldLifeHolds.snapshot(),
+      holdOf: (instanceId: string) => oldLifeHolds.holdOf(instanceId),
+      holdsOnDirectory: (directory: string) => oldLifeHolds.holdsOnDirectory(directory),
+      holdsWaitedOnBy: (persona: Parameters<OldLifeHoldSet['holdsWaitedOnBy']>[0]) => oldLifeHolds.holdsWaitedOnBy(persona),
+      waitsOnKillFailed: (persona: Parameters<OldLifeHoldSet['waitsOnKillFailed']>[0]) => oldLifeHolds.waitsOnKillFailed(persona),
+    }),
+    // As main() hands the reload controller the set (b.jg5 SRJ-809): apply
+    // step 1 begins its holds through `begin` alone.
+    beginOldLifeHold: (begin) => oldLifeHolds.begin(begin),
+    // As main() runs it (b.jg5 SRJ-714): over the applied configuration, on
+    // the kill-retry clock, its shutdown query the shutting-down flag.
+    startSweep: (isShuttingDown = () => shuttingDown) => drive(reconcileOrphans(appliedConfig(), killRetryClock, isShuttingDown)),
     versionRecheck(initial = { version: PHASE1_RC_VERSION }) {
       // As main() installs it: one re-check, never two (a leftover install
       // would answer the triggers instead of this one).
@@ -2613,6 +2692,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       setKillFailureAlerts(undefined)
       _resetConfiguredPersonaQuery()
       _resetRetiredKeyStore()
+      _resetOldLifeHolds()
       setPersonaKillKeepGoingQuery(undefined)
       for (const unbind of unbindLatch) unbind()
       resetStubSpawnPath()

@@ -326,6 +326,20 @@
  *   before its start pass; `run.stop()` resets the install when it is the
  *   run's own, and `h.cleanup()` always does. A run without `realLaunch`
  *   installs none;
+ * - the old-life holds (b.jg5 SRJ-809): every run builds one hold set, empty
+ *   (`createOldLifeHoldSet`, its lines to `run.logs`, as `main()` builds its
+ *   one set beside the store), and hands it to the controller as
+ *   `oldLifeHolds`, so a confirmed apply's step 1 begins its holds in it once
+ *   the last-applied rewrite succeeded. A realLaunch run also installs that
+ *   same set for the session manager (`setOldLifeHolds`, beside the store, as
+ *   `main()` does), so its reads end or re-point a hold, a recorded key's
+ *   reuse that begins its new life ends one, and the teardown's kill marks
+ *   one kill-failed; `run.stop()` resets the install when it is the run's
+ *   own, and `h.cleanup()` always does. A run without `realLaunch` installs
+ *   none. `run.oldLifeHolds` reads the set (`holdOf`, `holdsOnDirectory`,
+ *   `holdsWaitedOnBy`, `waitsOnKillFailed`, `snapshot`). Holds live in server
+ *   memory: a later run over the same directories (a restart) starts with a
+ *   new, empty set, and the harness runs no start sweep to rebuild one;
  * - a stop between writes: `opts.stopBeforeWrite` names a path; just before
  *   the run's writer is first called for it, the harness keeps an image of
  *   every regular file under the configuration and state directories, and
@@ -495,7 +509,8 @@
  * process's agent-director client — through it the startup-dialog approver
  * reads and types; the prompt-row checks only read —, the approver's 200 ms
  * cap, the spawn home, the trust patcher, the reply guard, the claude_config_dir hook, the
- * session notifier, the latch, the `ErrInvalidFlags` hold, the configured-persona query) and captures
+ * session notifier, the latch, the `ErrInvalidFlags` hold, the configured-persona query, the
+ * retired-key store and the old-life hold set) and captures
  * `console.error`; `h.cleanup()` first stops every dialog approver a launch
  * started (it runs on its own after the launch call, b.jg5 SRJ-401), then
  * resets and restores them. No launch is a startup launch, so nothing resolves the
@@ -626,6 +641,7 @@ import {
   _resetInFlightLaunches,
   _resetInvalidFlagsHold,
   _resetLiveRowSequenceRegistry,
+  _resetOldLifeHolds,
   _resetPreLaunchReplyGuard,
   _resetPreLaunchTrustPatcher,
   _resetRetiredKeyStore,
@@ -644,6 +660,7 @@ import {
   setConflictLatch,
   setInvalidFlagsHold,
   setLiveRowSequenceRegistry,
+  setOldLifeHolds,
   setPreLaunchReplyGuard,
   setPreLaunchTrustPatcher,
   setRetiredKeyStore,
@@ -679,7 +696,13 @@ import {
   type ReloadTick,
   type ReloadTickDriver,
 } from '../../src/reload.ts'
-import { loadRetiredKeyStore, retiredKeysPath, type RetiredKeyStore } from '../../src/retired-keys.ts'
+import {
+  createOldLifeHoldSet,
+  loadRetiredKeyStore,
+  retiredKeysPath,
+  type OldLifeHoldSet,
+  type RetiredKeyStore,
+} from '../../src/retired-keys.ts'
 import {
   cannedGetResult,
   cannedStatusResult,
@@ -1530,8 +1553,9 @@ export interface ReloadRunOptions {
    * reply-guard steps over `h.stateDir` and the applied set, the bring-up
    * controller's claude_config_dir hold and re-check, and a session notifier
    * that records each notice (`run.sessionNotices`) and raises it through
-   * the run's notifier, the run's latch (`run.latch`) and the run's
-   * retired-key store (`run.retiredKeys`, b.jg5 SRJ-805); a launch that
+   * the run's notifier, the run's latch (`run.latch`), the run's
+   * retired-key store (`run.retiredKeys`, b.jg5 SRJ-805) and the run's
+   * old-life hold set (`run.oldLifeHolds`, b.jg5 SRJ-809); a launch that
    * returns success starts the startup-dialog approver on its own, after the
    * launch call (b.jg5 SRJ-401), which reads and types through the stub only,
    * its laps `DIALOG_POLL_INTERVAL_MS` apart on the approver's clock with a
@@ -1610,6 +1634,9 @@ export type ReloadLatchView = Pick<ConflictLatch, 'isLatched' | 'record'>
 /** A run's `ErrInvalidFlags` hold, read-only: the held query and the version a hold began under. */
 export type ReloadInvalidFlagsHoldView = Pick<InvalidFlagsHold, 'isHeld' | 'beganUnder'>
 
+/** A run's old-life hold set, read-only: its queries (b.jg5 SRJ-809). */
+export type ReloadOldLifeHoldsView = Pick<OldLifeHoldSet, 'holdOf' | 'holdsOnDirectory' | 'holdsWaitedOnBy' | 'waitsOnKillFailed' | 'snapshot'>
+
 /** One server start over the harness's files; see the file comment. */
 export interface ReloadRun {
   /** The real reload controller. */
@@ -1642,6 +1669,16 @@ export interface ReloadRun {
    * (`setRetiredKeyStore`) until the run stops (b.jg5 SRJ-805, SRJ-806).
    */
   readonly retiredKeys: RetiredKeyStore
+  /**
+   * The run's old-life hold set, read-only (`createOldLifeHoldSet`, b.jg5
+   * SRJ-809), built empty at the run's start as `main()` builds its one set,
+   * and handed to the controller (`oldLifeHolds`), so a confirmed apply's
+   * step 1 begins its holds here; its lines go to `run.logs`. With
+   * `opts.realLaunch` it is also the session manager's installed set
+   * (`setOldLifeHolds`) until the run stops. A later run (a restart) starts
+   * with a new, empty set.
+   */
+  readonly oldLifeHolds: ReloadOldLifeHoldsView
   /** Whether the run reached its `opts.stopBeforeWrite` stop point (the disk image was kept). */
   readonly stoppedBeforeWrite: boolean
   /**
@@ -2210,6 +2247,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
    * realLaunch run's), so a run's stop resets the install only when it is its own.
    */
   let installedRetiredKeys: RetiredKeyStore | undefined
+  /** The old-life hold set installed in the session manager now (the latest realLaunch run's), likewise. */
+  let installedOldLifeHolds: OldLifeHoldSet | undefined
   /** `console.error` before the harness captured it (a realLaunch run), restored at cleanup. */
   const originalConsoleError = console.error
   let consoleCaptured = false
@@ -3048,10 +3087,17 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       throw new Error(`reload-harness: the run cannot load the retired-key record: ${loadedRetiredKeys.message}`)
     }
     const retiredKeys = loadedRetiredKeys.store
+    // As main() builds its one set beside the store (b.jg5 SRJ-809): in
+    // memory only, so each run (a server start) begins with none.
+    const oldLifeHolds = createOldLifeHoldSet({ log })
     const approverStops: ReloadApproverStop[] = []
     controller = createReloadController({
       paths,
       retiredKeys,
+      // As main() passes it (b.jg5 SRJ-809): apply step 1 begins its holds in
+      // the run's one set, the set a realLaunch run installs for the session
+      // manager.
+      oldLifeHolds,
       // As main() binds it (b.jg5 SRJ-808, SRJ-404): apply step 1 stops the
       // dialog approver of each key it recorded. Recorded with where the run
       // stood; with the real launch path also the session manager's real stop
@@ -3207,6 +3253,13 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       writes,
       removes,
       retiredKeys,
+      oldLifeHolds: Object.freeze({
+        holdOf: (instanceId: string) => oldLifeHolds.holdOf(instanceId),
+        holdsOnDirectory: (directory: string) => oldLifeHolds.holdsOnDirectory(directory),
+        holdsWaitedOnBy: (persona: Parameters<OldLifeHoldSet['holdsWaitedOnBy']>[0]) => oldLifeHolds.holdsWaitedOnBy(persona),
+        waitsOnKillFailed: (persona: Parameters<OldLifeHoldSet['waitsOnKillFailed']>[0]) => oldLifeHolds.waitsOnKillFailed(persona),
+        snapshot: () => oldLifeHolds.snapshot(),
+      }),
       approverStops,
       get stoppedBeforeWrite() {
         return stopImage !== undefined
@@ -3406,6 +3459,11 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           _resetRetiredKeyStore()
           installedRetiredKeys = undefined
         }
+        // Likewise its old-life hold set, which the process's end drops (b.jg5 SRJ-809).
+        if (installedOldLifeHolds === oldLifeHolds) {
+          _resetOldLifeHolds()
+          installedOldLifeHolds = undefined
+        }
         controller.stopDetection()
         bringUps.cancelAll()
         noticeStack.hold.cancelAll()
@@ -3469,6 +3527,13 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       // own-row read clears through it.
       setRetiredKeyStore(retiredKeys)
       installedRetiredKeys = retiredKeys
+      // As main() installs it beside the store, before its start sweep
+      // (b.jg5 SRJ-809): the run's one old-life hold set, the controller's,
+      // so the session manager's reads end or re-point the holds apply step 1
+      // begins, a recorded key's new life ends its hold, and the teardown's
+      // kill marks one kill-failed.
+      setOldLifeHolds(oldLifeHolds)
+      installedOldLifeHolds = oldLifeHolds
       // As main() builds and installs it after the latch (b.jg5 SRJ-706): the
       // run's one live-row sequence registry, its dependencies from the
       // session manager's builder on the run's clock over the configuration
@@ -3803,6 +3868,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           _resetConfiguredPersonaQuery()
           _resetRetiredKeyStore()
           installedRetiredKeys = undefined
+          _resetOldLifeHolds()
+          installedOldLifeHolds = undefined
           _resetLiveRowSequenceRegistry()
         }
         if (outageStateInstalled) _resetOutageState()

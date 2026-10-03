@@ -183,7 +183,19 @@
  * no hand-off to the `pending` deferral or the pending-only retry. A row
  * either read reads `ended` or `missing`, or an `ErrSpawnNotFound` answer,
  * ends the persona's kill-failure episode silently (b.jg5 SRJ-704,
- * SRJ-1016). Every
+ * SRJ-1016).
+ * Old-life holds (b.jg5 SRJ-809): the server's one hold set
+ * (`setOldLifeHolds`) is told of every read the session manager makes of a
+ * row through one entry (`noteOldLifeRowRead`): the shared `get` and `status`
+ * reads (so every kill retry's between-try read and the server's adapters
+ * too), the teardown and start-sweep kills' between-try reads, every
+ * completed `find-missing` run's `ids` and the start sweep's `list`. A read
+ * of `ended` or `missing`, no row, or a listing in `ids` ends the hold on
+ * that id, and a live `get` or `list` row's `cwd` re-points it; a recorded
+ * key's reuse that began its new life ends the hold on `cscb_<key>`. No kill
+ * outcome ends a hold. The start sweep begins holds, and a teardown or sweep
+ * kill whose tries decided the ordinary kill-failure alert marks its hold
+ * kill-failed (SRJ-812). Every
  * `read-pane` of a persona's own row outside the dialog approver goes
  * through the shared read-pane (`readPersonaOwnPane`, b.jg5 SRJ-117; the
  * outcome and its class in `src/pane-read.ts`). Its uses (the launch wait's
@@ -244,7 +256,12 @@
  * of every listed row labelled with a persona absent from the applied
  * configuration, with the cause `absent-at-start` (b.jg5 SRJ-714, SRJ-803);
  * a failed write leaves the file as it was while the store holds those keys
- * in memory, and the sweep goes on. Then it kills, with the result checked,
+ * in memory, and the sweep goes on. Still before the first kill it begins an
+ * old-life hold (b.jg5 SRJ-809) on the `cwd` of every row listed live
+ * (`pending` included) whose key is recorded as retired without the "new
+ * life has begun" mark, whether it then kills, keeps or spares the row for a
+ * latch: holds live in server memory, so this restores after a restart the
+ * holds apply step 1 began. Then it kills, with the result checked,
  * each remaining live row with a persona absent from the applied
  * configuration, an instance ID other than `cscb_<key>`, or a `cwd` other
  * than its persona's working directory, and each live pre-persona row (no
@@ -254,6 +271,11 @@
  * It deletes no row (b.jg5 SRJ-714, SRJ-1506 amending b.av2 SR-6.3): every
  * row is kept, whatever its kill's outcome, pre-persona and absent-persona
  * rows are never resumed, and agent-director's `expire` removes them later.
+ * A kill that did not succeed holds the row's `cwd` for an old life (its
+ * old key the `persona` label's key, or the instance id for a pre-persona
+ * row or an id that is not the label's `cscb_<key>`), marked kill-failed
+ * when its tries decided the ordinary kill-failure alert (SRJ-809, SRJ-812);
+ * no hold begins once the sweep has stopped.
  * One findMissing run follows the kills, over every row given one, so a
  * killed row reads `missing` once its session is gone and isn't killed again
  * at the next start, and one summary line ends the sweep. Once the server
@@ -531,11 +553,20 @@ import {
   type RowReadRow,
 } from './row-read-rules.ts'
 import {
+  OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL,
+  OLD_LIFE_HOLD_CAUSE_START_SWEEP_LISTING,
+  OLD_LIFE_HOLD_END_FIND_MISSING_IDS,
+  OLD_LIFE_HOLD_END_NEW_LIFE,
+  OLD_LIFE_HOLD_END_READ_ENDED,
+  OLD_LIFE_HOLD_END_READ_MISSING,
   RETIRED_KEY_CAUSE_ABSENT_AT_START,
   RETIRED_KEYS_NOT_RECORDED,
   RETIRED_KEYS_UNCHANGED,
   RETIRED_KEYS_WRITE_FAILED,
   RETIRED_KEYS_WRITTEN,
+  oldLifeKeyOf,
+  type OldLifeHoldEndReason,
+  type OldLifeHoldSet,
   type RetiredKeyStore,
 } from './retired-keys.ts'
 import {
@@ -1488,6 +1519,128 @@ export function _resetRetiredKeyStore(): void {
 }
 
 /**
+ * The installed old-life hold set (b.jg5 SRJ-809; `createOldLifeHoldSet`,
+ * `src/retired-keys.ts`). Production installs the one set `main()` builds,
+ * before the start sweep, the set the reload controller's apply step 1
+ * begins holds in. The session manager ends or re-points a hold at every
+ * read it makes of a held row (`noteOldLifeRowRead`), ends a key's hold when
+ * its reuse begins its new life (`endOldLifeHoldForNewLife`), begins the
+ * start sweep's holds (`reconcileOrphans`) and marks a hold kill-failed when
+ * the persona teardown's kill decided the ordinary kill-failure alert
+ * (`killPersonaInstanceForTeardown`, SRJ-812). With none installed (unit
+ * tests, the integration driver, the CLI) no row is held: every hold query
+ * answers not held, no hold begins, and every hook does nothing.
+ */
+let oldLifeHolds: OldLifeHoldSet | undefined
+
+/** Install the server's old-life hold set (production: `main()`), or remove it with undefined (b.jg5 SRJ-809). */
+export function setOldLifeHolds(holds: OldLifeHoldSet | undefined): void {
+  oldLifeHolds = holds
+}
+
+/** Test-only seam: remove any installed old-life hold set. */
+export function _resetOldLifeHolds(): void {
+  oldLifeHolds = undefined
+}
+
+/** A read of a row gave its state (and, from a `get` or a `list` row, its `cwd`). */
+export const OLD_LIFE_ROW_READ_STATE = 'state'
+/** A read of a row found no row (`ErrSpawnNotFound`, by name). */
+export const OLD_LIFE_ROW_READ_NO_ROW = 'no-row'
+/** A completed `find-missing` run listed the row in its `ids`. */
+export const OLD_LIFE_ROW_READ_FIND_MISSING_IDS = 'find-missing-ids'
+
+/** What one read of a row answered, as `noteOldLifeRowRead` takes it. */
+export type OldLifeRowRead =
+  | { readonly kind: typeof OLD_LIFE_ROW_READ_STATE; readonly state: unknown; readonly cwd?: unknown }
+  | { readonly kind: typeof OLD_LIFE_ROW_READ_NO_ROW }
+  | { readonly kind: typeof OLD_LIFE_ROW_READ_FIND_MISSING_IDS }
+
+/**
+ * The one entry for a read of row `instanceId` (b.jg5 SRJ-809): what ends or
+ * re-points an old-life hold on it, whoever made the read. `by` names the
+ * read in the end line (`<site>: <what>`).
+ *   - a state `ended` ends the hold (`OLD_LIFE_HOLD_END_READ_ENDED`); a state
+ *     `missing`, or no row, ends it (`OLD_LIFE_HOLD_END_READ_MISSING`); a
+ *     listing in a completed `find-missing` run's `ids` ends it
+ *     (`OLD_LIFE_HOLD_END_FIND_MISSING_IDS`);
+ *   - any other state (`pending` included, and a state CSCB does not know)
+ *     keeps it, and a `cwd` the read carries that differs from the held
+ *     directory replaces it (no line).
+ * No kill outcome reaches this entry: a kill's success (`kill_sent` true,
+ * false or absent, `ErrSpawnNotFound` at the kill), a CONFLICT and every
+ * other answer to a kill end nothing (AC 54, AC 63); a kill retry's
+ * between-try `status` read that finds the row finished is a read, and ends
+ * the hold through its own call here. With no hold set installed, or no hold
+ * on the id, nothing happens. Makes no agent-director call. Never throws.
+ */
+export function noteOldLifeRowRead(instanceId: string, read: OldLifeRowRead, by: string): void {
+  const holds = oldLifeHolds
+  if (holds === undefined || typeof instanceId !== 'string') return
+  try {
+    if (holds.holdOf(instanceId) === undefined) return
+    if (read.kind === OLD_LIFE_ROW_READ_NO_ROW) {
+      holds.end(instanceId, OLD_LIFE_HOLD_END_READ_MISSING, `${by}: no row`)
+      return
+    }
+    if (read.kind === OLD_LIFE_ROW_READ_FIND_MISSING_IDS) {
+      holds.end(instanceId, OLD_LIFE_HOLD_END_FIND_MISSING_IDS, by)
+      return
+    }
+    if (read.state === 'ended' || read.state === 'missing') {
+      const reason: OldLifeHoldEndReason = read.state === 'ended' ? OLD_LIFE_HOLD_END_READ_ENDED : OLD_LIFE_HOLD_END_READ_MISSING
+      holds.end(instanceId, reason, by)
+      return
+    }
+    if (typeof read.cwd === 'string' && read.cwd !== '') holds.replaceDirectory(instanceId, read.cwd)
+  } catch (err) {
+    // Not reached (the hold set never throws); the hold stays as it was.
+    console.error(`[slack] old-life hold: noting the read of instanceId=${instanceId} failed: ${describeThrownValue(err)} (b.jg5 SRJ-809)`)
+  }
+}
+
+/** `<site>: <what>`, the read an own-row read site names in a hold's end line. */
+function oldLifeReadName(at: OwnRowReadSite): string {
+  return `${at.site}: ${at.what}`
+}
+
+/**
+ * One `status` answer from persona `key`'s own row, given to the old-life
+ * read entry (`noteOldLifeRowRead`, b.jg5 SRJ-809): a returned result's
+ * state, or no row for a thrown `ErrSpawnNotFound` (by name); any other
+ * thrown value read nothing and is not given. A `status` result carries no
+ * `cwd`. Never throws.
+ */
+function noteOldLifeStatusAnswer(key: string, answer: OwnRowStatusAnswer, at: OwnRowReadSite): void {
+  if ('thrown' in answer) {
+    if (hasAdErrorName(answer.thrown, ERR_SPAWN_NOT_FOUND_NAME)) {
+      noteOldLifeRowRead(personaInstanceId(key), { kind: OLD_LIFE_ROW_READ_NO_ROW }, oldLifeReadName(at))
+    }
+    return
+  }
+  noteOldLifeRowRead(personaInstanceId(key), { kind: OLD_LIFE_ROW_READ_STATE, state: answer.result.state }, oldLifeReadName(at))
+}
+
+/**
+ * End the old-life hold on persona key `key`'s own row (`cscb_<key>`)
+ * because a reuse spawn for the key began its new life (b.jg5 SRJ-809,
+ * SRJ-806): a reuse that succeeded reset a finished row, so the old life is
+ * over. Called at a recorded key's reuse success (`reuseSuccessAction`),
+ * whatever the mark's write did. With no hold set installed, or no hold on
+ * the id, nothing happens. Never throws.
+ */
+function endOldLifeHoldForNewLife(key: string): void {
+  const holds = oldLifeHolds
+  if (holds === undefined) return
+  try {
+    holds.end(personaInstanceId(key), OLD_LIFE_HOLD_END_NEW_LIFE, OLD_LIFE_NEW_LIFE_READ)
+  } catch (err) {
+    // Not reached (the hold set never throws).
+    console.error(`[slack] old-life hold: ending the hold of ${keyRef(key)} for its new life failed: ${describeThrownValue(err)} (b.jg5 SRJ-809)`)
+  }
+}
+
+/**
  * Whether key `key` is recorded as retired with its "new life has begun" mark
  * set, by the installed store, for the row-read rule (b.jg5 SRJ-807). No store
  * installed, or an `isMarked` that throws, counts as not marked, so nothing
@@ -1662,7 +1815,9 @@ export function reuseRecordedInFlightLine(ref: string, how: ReuseRecordedSince):
  *   [slack] reuseSpawnForPersona: <ref>'s key was recorded as retired while this reuse spawn's launch attempt was in flight (<how>) — the launch was decided before that recording, so its life is the old life: no mark is set; answering spawned (b.jg5 SRJ-806, SRJ-805)
  *
  * For `fresh-retired`, one line names `ref`, that its new life has begun and
- * what the mark's write did:
+ * what the mark's write did, and then the old-life hold on `cscb_<key>`, if
+ * any, ends with the new-life reason, whatever the mark's write did
+ * (`endOldLifeHoldForNewLife`, b.jg5 SRJ-809):
  *
  *   [slack] reuseSpawnForPersona: <ref>'s key is retired and its new life has begun — answering fresh-retired; <mark> (b.jg5 SRJ-806, SRJ-112)
  *
@@ -1721,6 +1876,9 @@ function reuseSuccessAction(key: string, ref: string, start: RetiredKeyAttemptSt
   console.error(
     `[slack] ${REUSE_SPAWN_SITE}: ${ref}'s key is retired and its new life has begun — answering ${SPAWN_ACTION_FRESH_RETIRED}; ${mark} (b.jg5 SRJ-806, SRJ-112)`,
   )
+  // b.jg5 SRJ-809: the new life implies the old row was finished, so the
+  // key's old-life hold ends, whatever the mark's write did.
+  endOldLifeHoldForNewLife(key)
   return SPAWN_ACTION_FRESH_RETIRED
 }
 
@@ -1911,11 +2069,13 @@ function ownRowActGoes(key: string, at: OwnRowReadSite): boolean {
  *
  * A row read `ended` or `missing`, or `ErrSpawnNotFound`, also ends the
  * persona's kill-failure episode silently (`endKillFailureEpisodeOnRead`;
- * b.jg5 SRJ-704, SRJ-1016).
+ * b.jg5 SRJ-704, SRJ-1016), and ends an old-life hold on `cscb_<key>`, with
+ * its one end line; a row read in any other state keeps the hold, and its
+ * `cwd` becomes the held directory (`noteOldLifeRowRead`; b.jg5 SRJ-809).
  *
  * When `at.actGoes` answers that the caller has stopped once the `get`
  * settles (`ownRowActGoes`; b.jg5 SRJ-714), nothing below is acted on: no
- * latch, no retired-entry clear, no episode end and no routed line; the read
+ * latch, no retired-entry clear, no episode or hold end and no routed line; the read
  * answers `row` with `latched` false, `absent`, or `refused` carrying the
  * error, after that check's one line.
  *
@@ -1963,6 +2123,8 @@ export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promis
     if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) {
       // b.jg5 SRJ-704, SRJ-1016: the row is gone; the kill-failure episode ends.
       endKillFailureEpisodeOnRead(key, { thrown: err })
+      // b.jg5 SRJ-809: no row ends an old-life hold on it.
+      noteOldLifeRowRead(personaInstanceId(key), { kind: OLD_LIFE_ROW_READ_NO_ROW }, oldLifeReadName(at))
       return { kind: OWN_ROW_READ_ABSENT }
     }
     if (at.unusableNameRoutedIn !== undefined) {
@@ -1977,6 +2139,9 @@ export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promis
   if (!ownRowActGoes(key, at)) return { kind: OWN_ROW_READ_ROW, row, latched: false }
   // b.jg5 SRJ-704, SRJ-1016: a row read `ended` or `missing` ends the kill-failure episode.
   endKillFailureEpisodeOnRead(key, { state: row.state })
+  // b.jg5 SRJ-809: a row read `ended` or `missing` ends an old-life hold on
+  // it, and a live one's `cwd` becomes the held directory.
+  noteOldLifeRowRead(personaInstanceId(key), { kind: OLD_LIFE_ROW_READ_STATE, state: row.state, cwd: row.cwd }, oldLifeReadName(at))
   return { kind: OWN_ROW_READ_ROW, row, latched: actOnOwnRowRead(key, row, at, true) !== undefined }
 }
 
@@ -2230,7 +2395,11 @@ export type OwnRowStatusAnswer =
  *   - Either way, first: a result reading `ended` or `missing`, or an
  *     `ErrSpawnNotFound` answer (the row is gone), ends the persona's
  *     kill-failure episode silently (`endKillFailureEpisodeOnRead`; b.jg5
- *     SRJ-704, SRJ-1016).
+ *     SRJ-704, SRJ-1016), and ends an old-life hold on `cscb_<key>`, with
+ *     its one end line (`noteOldLifeRowRead`; b.jg5 SRJ-809); any other
+ *     state keeps it. So every own-row `status` the server makes ends the
+ *     hold this way: the shared own-row `status` read, a persona kill
+ *     retry's between-try read, and the liveness and reconnect adapters.
  *
  * With no latch installed a latching answer still answers true, with
  * nothing latched, as at the CONFLICT row. Log lines:
@@ -2243,6 +2412,9 @@ export function applyOwnRowStatusStep(key: string, answer: OwnRowStatusAnswer, a
     // b.jg5 SRJ-704, SRJ-1016: a row read `ended` or `missing`, or gone, ends
     // the persona's kill-failure episode, whoever made the call.
     endKillFailureEpisodeOnRead(key, 'thrown' in answer ? { thrown: answer.thrown } : { state: answer.result.state })
+    // b.jg5 SRJ-809: a row read `ended` or `missing`, or gone, ends an
+    // old-life hold on it, whoever made the call.
+    noteOldLifeStatusAnswer(key, answer, at)
     if ('thrown' in answer) return latchOnUnusableNameRead(key, answer.thrown, at)
     const row = { ...answer.result, claude_instance_id: personaInstanceId(key) }
     const decision = decideOwnRowRead({
@@ -5865,8 +6037,20 @@ function findMissingSweepWords(kind: FindMissingRunKind): string {
 }
 
 /**
+ * The read name a findMissing run gives the old-life hold end line of each
+ * row in its `ids` (b.jg5 SRJ-809): `<logPrefix>: findMissing sweep`, or
+ * `<logPrefix>: bypassing findMissing sweep` for a bypassing run. Pure.
+ */
+export function findMissingRunReadName(logPrefix: string, bypassing = false): string {
+  return `${logPrefix}: ${findMissingSweepWords(bypassing ? FIND_MISSING_RUN_BYPASSING : FIND_MISSING_RUN_ORDINARY)}`
+}
+
+/**
  * Start one findMissing run (`sharedFindMissingSweep`): make the call, then,
- * on success, log the run's line, make the post-run `get`s
+ * on success, log the run's line, end the old-life hold on each row in the
+ * result's `ids` (`noteOldLifeRowRead`, b.jg5 SRJ-809; not when the starter's
+ * `postRunGetsGo` answered no, as its post-run `get`s are not made then),
+ * make the post-run `get`s
  * (`readListedPersonaRows`, whose latched and failed reads the run's outcome
  * carries), memoize the result unless a run started later
  * has been memoized already, and clear the in-flight slot while this run is
@@ -5898,7 +6082,11 @@ function startFindMissingRun(
     console.error(
       `[slack] ${logPrefix}: ${words} for ${ref} — count=${result.count} ids=[${result.ids.join(',')}] unverified=${result.unverified} unverified_ids=[${result.unverified_ids.join(',')}]`,
     )
-    const reads = postRunGetsGo(opts)
+    const go = postRunGetsGo(opts)
+    // b.jg5 SRJ-809: a row in this run's `ids` reads `missing`, which ends an
+    // old-life hold on it, whoever made the run; a memo reuse ends nothing new.
+    if (go) for (const id of result.ids ?? []) noteOldLifeRowRead(id, { kind: OLD_LIFE_ROW_READ_FIND_MISSING_IDS }, findMissingRunReadName(logPrefix, kind === FIND_MISSING_RUN_BYPASSING))
+    const reads = go
       ? await readListedPersonaRows(
           result,
           opts.nextStepGetKey,
@@ -8161,7 +8349,11 @@ function teardownRefusalClassOf(err: unknown): PersonaTeardownKillRefusal['error
  *     nothing latches on it or on an UNUSABLE NAME: each one met, at a try or
  *     at a read, is answered in `refusals` for the teardown's routing.
  * Nothing is reported after the tries: an UNAVAILABLE outcome that stands
- * arms no retry timer. No delete is made, whatever the outcome: the row is
+ * arms no retry timer. When the tries decided the kill-failure alert's
+ * ordinary version, the key's old-life hold (begun at apply step 1) is
+ * marked kill-failed (`markOldLifeHoldKillFailed`; b.jg5 SRJ-812, SRJ-715);
+ * no outcome ends the hold, a success included: the next read of the old
+ * row does (b.jg5 SRJ-809). No delete is made, whatever the outcome: the row is
  * kept (b.jg5 SRJ-715). Each try and read is logged by the retry under
  * `[slack] persona teardown kill`. Never throws or rejects, and leaves no
  * timer pending once it settles.
@@ -8198,7 +8390,36 @@ export async function killPersonaInstanceForTeardown(
     log: (line) => console.error(line),
     logPrefix: `${TEARDOWN_KILL_LOG_PREFIX} for ${ref}`,
   })
+  // b.jg5 SRJ-812, SRJ-809: tries that decided the ordinary kill-failure
+  // alert mark the old life's hold kill-failed; nothing here ends it.
+  markOldLifeHoldKillFailed(personaInstanceId(key), result)
   return { ...result, refusals: [...refusals] }
+}
+
+/**
+ * Mark the old-life hold on `instanceId` kill-failed (b.jg5 SRJ-812, SRJ-809)
+ * when `retried`, a kill of the old row, decided the ordinary kill-failure
+ * alert (`ErrTmuxKillFailed` after its tries, or any failure after a
+ * survivor-naming one) and no stop ended its tries (`killRetryStopped`),
+ * since a stopped kill raises no alert. A caller whose stop rule withholds
+ * the alert for more (the start sweep, once it has stopped) does not call
+ * it then. A success (`kill_sent` true or false, or after a survivor-naming
+ * failure, whose survivor version never marks), a CONFLICT or an UNUSABLE
+ * NAME with no survivor-naming failure before it, or any outcome that
+ * decided no ordinary alert marks nothing. Nothing ends
+ * the hold here, and with no hold set installed, or no hold on the id,
+ * nothing happens. The mark lasts until the hold ends. Never throws.
+ */
+function markOldLifeHoldKillFailed(instanceId: string, retried: KillRetryResult): void {
+  const holds = oldLifeHolds
+  if (holds === undefined) return
+  try {
+    if (retried.alert.kind !== KILL_RETRY_ALERT_ORDINARY || killRetryStopped(retried)) return
+    holds.markKillFailed(instanceId)
+  } catch (err) {
+    // Not reached (the hold set never throws); the hold stays as it was.
+    console.error(`[slack] old-life hold: marking instanceId=${instanceId} kill-failed failed: ${describeThrownValue(err)} (b.jg5 SRJ-812)`)
+  }
 }
 
 /** Who reads, in the clear line of the teardown kill's `status` read between its tries (b.jg5 SRJ-807). */
@@ -8213,9 +8434,11 @@ export const TEARDOWN_KILL_STATUS_SITE: OwnRowReadSite = Object.freeze({ site: '
  * over the read of `cscb_<key>` with the installed store's mark,
  * `clearRetiredEntryOnRead`; b.jg5 SRJ-807, SRJ-115), so a row read live
  * other than `pending` of a key recorded with its mark set clears its entry,
- * with the store's one line naming `TEARDOWN_KILL_STATUS_SITE`. Its state, no
- * row for `ErrSpawnNotFound` (by name), or a failed read; what it answers is
- * the same whatever the clear did. Never throws.
+ * with the store's one line naming `TEARDOWN_KILL_STATUS_SITE`. A read of
+ * `ended` or `missing`, or no row, ends the old-life hold on `cscb_<key>`
+ * (`noteOldLifeRowRead`; b.jg5 SRJ-809). Its state, no row for
+ * `ErrSpawnNotFound` (by name), or a failed read; what it answers is the same
+ * whatever the clear or the hold's end did. Never throws.
  */
 async function readTeardownKillRow(key: string): Promise<KillRetryRead> {
   try {
@@ -8233,9 +8456,15 @@ async function readTeardownKillRow(key: string): Promise<KillRetryRead> {
       retiredMarked: retiredMarkOf(key),
     })
     if (clear !== undefined) clearRetiredEntryOnRead(key, clear, TEARDOWN_KILL_STATUS_SITE)
+    // b.jg5 SRJ-809: a row read `ended` or `missing` ends the key's old-life hold.
+    noteOldLifeRowRead(personaInstanceId(key), { kind: OLD_LIFE_ROW_READ_STATE, state: result.state }, oldLifeReadName(TEARDOWN_KILL_STATUS_SITE))
     return { kind: KILL_RETRY_READ_STATE, state: result.state }
   } catch (err) {
-    if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) return { kind: KILL_RETRY_READ_NO_ROW }
+    if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) {
+      // b.jg5 SRJ-809: no row ends the key's old-life hold.
+      noteOldLifeRowRead(personaInstanceId(key), { kind: OLD_LIFE_ROW_READ_NO_ROW }, oldLifeReadName(TEARDOWN_KILL_STATUS_SITE))
+      return { kind: KILL_RETRY_READ_NO_ROW }
+    }
     return { kind: KILL_RETRY_READ_FAILED, error: err }
   }
 }
@@ -11221,6 +11450,12 @@ async function ladderGetThenAct(run: LadderRun): Promise<SpawnPersonaResult> {
 /** The prefix of the reuse spawn's own lines. */
 const REUSE_SPAWN_SITE = 'reuseSpawnForPersona'
 
+/**
+ * The read name a reuse spawn's success gives the end line of the old-life
+ * hold it ends for the key's new life (b.jg5 SRJ-809, SRJ-806).
+ */
+export const OLD_LIFE_NEW_LIFE_READ = `${REUSE_SPAWN_SITE}: reuse spawn succeeded`
+
 /** What the reuse spawn's lines call the call. */
 const REUSE_SPAWN_WHAT = 'reuse spawn'
 
@@ -12828,18 +13063,30 @@ export const START_SWEEP_KILL_STATUS_SITE: OwnRowReadSite = Object.freeze({ site
  * other than `pending` of a key recorded with its mark set clears its entry
  * (`decideRetiredEntryClear` with the installed store's mark,
  * `clearRetiredEntryOnRead`), the store's one line naming
- * `START_SWEEP_KILL_STATUS_SITE`. Once the sweep has stopped by the time the
- * read returns (`sweepStopped`), neither the clear nor the CONFIG answer's
- * raise is made (b.jg5 SRJ-714). What it answers is the same whatever the
- * clear did. Never throws.
+ * `START_SWEEP_KILL_STATUS_SITE`. A read of `ended` or `missing`, or no row,
+ * ends an old-life hold on the row (`noteOldLifeRowRead`; b.jg5 SRJ-809).
+ * Once the sweep has stopped by the time the read returns (`sweepStopped`),
+ * neither the clear, the hold's end nor the CONFIG answer's raise is made
+ * (b.jg5 SRJ-714). What it answers is the same whatever the clear did. Never
+ * throws.
  */
 async function sweepKillRead(pass: SweepPass, instanceId: string, configuredKey: string | undefined): Promise<KillRetryRead> {
   try {
     const result = await pass.client.status({ claude_instance_id: instanceId })
-    if (!sweepStopped(pass)) clearOnSweepKillRead(instanceId, result)
+    if (!sweepStopped(pass)) {
+      clearOnSweepKillRead(instanceId, result)
+      // b.jg5 SRJ-809: a row read `ended` or `missing` ends an old-life hold on it.
+      noteOldLifeRowRead(instanceId, { kind: OLD_LIFE_ROW_READ_STATE, state: result.state }, oldLifeReadName(START_SWEEP_KILL_STATUS_SITE))
+    }
     return { kind: KILL_RETRY_READ_STATE, state: result.state }
   } catch (err) {
-    if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) return { kind: KILL_RETRY_READ_NO_ROW }
+    if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) {
+      // b.jg5 SRJ-809: no row ends an old-life hold on it.
+      if (!sweepStopped(pass)) {
+        noteOldLifeRowRead(instanceId, { kind: OLD_LIFE_ROW_READ_NO_ROW }, oldLifeReadName(START_SWEEP_KILL_STATUS_SITE))
+      }
+      return { kind: KILL_RETRY_READ_NO_ROW }
+    }
     if (classifyAdError(err).errorClass === AD_ERROR_CLASS_CONFIG) sweepReadConfigAnswer(pass, instanceId, configuredKey, err)
     return { kind: KILL_RETRY_READ_FAILED, error: err }
   }
@@ -13178,6 +13425,13 @@ function recordAbsentPersonaKeys(keys: readonly string[]): number {
  *      (`recordAbsentPersonaKeys`; b.jg5 SRJ-714, SRJ-803); the keys are
  *      counted in `recordedAsRetired`. A failed write leaves the file as it
  *      was, the store holds the keys in memory, and the sweep goes on.
+ *      Then, still before the first kill, the listing's old-life holds
+ *      (`beginStartSweepListingHolds`; b.jg5 SRJ-809, SRJ-714): every row
+ *      listed live (`pending` included) whose key is recorded as retired
+ *      without the "new life has begun" mark, a key just recorded included,
+ *      holds its `cwd`, whether the sweep then kills it, keeps it or leaves
+ *      it for a latch, so a restart restores the hold apply step 1 began (a
+ *      destructive modify's same-key old life the sweep keeps included).
  *   4. Row by row in list order, of the rows step 2 left: a row with no
  *      `persona` label (a pre-persona row, b.1ix) is a stray; a labelled row
  *      is a stray when `sweepDecision` sweeps it (an absent persona, an
@@ -13194,10 +13448,13 @@ function recordAbsentPersonaKeys(keys: readonly string[]): number {
  *      kill latches anything or arms a retry timer; an ENVIRONMENT or CONFIG
  *      answer raises its outage only for a configured persona's row (hatch
  *      A3). Every row is kept, whatever its kill's outcome; a kill that did
- *      not succeed records `orphan-cleanup`.
+ *      not succeed records `orphan-cleanup` and holds the row's `cwd` for
+ *      an old life (`beginStartSweepKillHold`; b.jg5 SRJ-809), keeping the
+ *      listing's hold when the row has one, and marks the hold kill-failed
+ *      when its tries decided the ordinary kill-failure alert (SRJ-812).
  *   5. When at least one kill was made, one findMissing run over every row
  *      given a kill, whatever its outcome (`runStartSweepPostKillFindMissing`;
- *      b.jg5 SRJ-714, SRJ-120).
+ *      b.jg5 SRJ-714, SRJ-120); a row in its `ids` ends its old-life hold.
  *   6. One summary line (`startSweepSummaryLine`): the rows killed, kept
  *      (with the failed kills as a sub-count), recorded as retired, and left
  *      unkilled for a latch.
@@ -13236,6 +13493,13 @@ function recordAbsentPersonaKeys(keys: readonly string[]): number {
  * (`startSweepStoppedKillLine`); the rows it left unkilled count as kept;
  * and it logs `START_SWEEP_SHUTDOWN_STOP_LINE` once, then its summary line.
  * Either way, a latched persona's rows still count as left for its latch.
+ * Once the sweep has stopped it begins and marks no old-life hold.
+ *
+ * Each listed row is also a read of it for the old-life holds
+ * (`noteOldLifeRowRead`; b.jg5 SRJ-809): a row listed `ended` or `missing`
+ * ends a hold on it, and a live row's `cwd` becomes its held directory. Holds
+ * live in server memory, so this sweep is where a restart rebuilds the ones
+ * still needed.
  *
  * The sweep keeps one record per listed row (`SweepRowRecord`: the row as
  * listed, what it did with it, and its kill's result), from which its
@@ -13282,15 +13546,35 @@ export async function reconcileOrphans(
     return endStartSweep(pass, records, 0)
   }
 
+  // b.jg5 SRJ-809: each listed row is a read of it: a finished one ends an
+  // old-life hold on it, and a live one's `cwd` becomes its held directory.
+  for (const row of rows) {
+    noteOldLifeRowRead(
+      row.claude_instance_id,
+      { kind: OLD_LIFE_ROW_READ_STATE, state: row.state, cwd: row.cwd },
+      oldLifeReadName(START_SWEEP_LIST_SITE),
+    )
+  }
+
   // b.jg5 SRJ-502, SRJ-714: every latch and record decision is made over the
   // whole list before the first kill.
   const personasByKey = new Map(personaConfig.personas.map((p) => [p.key, p]))
   const absentKeys = absentPersonaKeysOf(rows, personasByKey)
   const latched = latchFromListedRows(rows, personasByKey, new Set(absentKeys))
   const recordedAsRetired = recordAbsentPersonaKeys(absentKeys)
+  // b.jg5 SRJ-809, SRJ-714: after the recording and before the first kill,
+  // the listing's holds: every live row of a key recorded without its mark,
+  // whatever the sweep then does with it.
+  beginStartSweepListingHolds(pass, rows)
 
   const context: StartSweepRowContext = { latched, personasByKey, home: spawnHomeDir(), deferredLogged: new Set<string>() }
-  for (const row of rows) records.push(await sweepListedRow(pass, row, context))
+  for (const row of rows) {
+    const record = await sweepListedRow(pass, row, context)
+    records.push(record)
+    // b.jg5 SRJ-809: a kill that did not succeed holds the row's directory,
+    // before the post-kill findMissing run, which can end the hold.
+    beginStartSweepKillHold(pass, record)
+  }
 
   // b.jg5 SRJ-714, SRJ-120: one findMissing run over every row given a kill.
   const killed = records.filter((record) => record.kill !== undefined)
@@ -13298,6 +13582,90 @@ export async function reconcileOrphans(
     await runStartSweepPostKillFindMissing(pass, killed)
   }
   return endStartSweep(pass, records, recordedAsRetired)
+}
+
+/**
+ * The start sweep's listing holds (b.jg5 SRJ-809's third start, SRJ-714,
+ * SRJ-1506), begun after its batch record and before its first kill: each
+ * listed row in a live state (`AGENT_DIRECTOR_LIVE_STATES`, `pending`
+ * included) whose `persona` label key the installed retired-key store answers
+ * as recorded without the "new life has begun" mark (`retiredKeyReadingOf`,
+ * a key this sweep has just recorded and one held only in memory included)
+ * gets one hold on its `cwd`, with the cause `start-sweep-listing` and the old
+ * key `oldLifeKeyOf` gives (the label, or the instance id when the id is not
+ * the label's `cscb_<key>`), whatever the sweep then does with the row: kill
+ * it, keep it (a destructive modify's same-key old life whose `cwd` matches
+ * its persona included) or leave it for a latch. It restores after a restart
+ * the hold apply step 1 began. A row whose kill then succeeds keeps the hold
+ * until a read shows it finished (the post-kill findMissing run usually
+ * does). A finished row, a row with no `persona` label, and a row whose key is
+ * not recorded, or recorded with its mark set, get none. Nothing begins once
+ * the sweep has stopped (`sweepStopped`), or with no hold set installed.
+ * Each hold's begin line is the hold set's. Never throws.
+ */
+function beginStartSweepListingHolds(pass: SweepPass, rows: readonly ListRow[]): void {
+  const holds = oldLifeHolds
+  if (holds === undefined || sweepStopped(pass)) return
+  for (const row of rows) {
+    try {
+      if (!AGENT_DIRECTOR_LIVE_STATES.has(row.state)) continue
+      const label = row.labels?.[PERSONA_LABEL_KEY]
+      if (typeof label !== 'string' || label === '') continue
+      const reading = retiredKeyReadingOf(label)
+      if (!reading.recorded || reading.marked) continue
+      if (typeof row.cwd !== 'string' || row.cwd === '') continue
+      holds.begin({
+        instanceId: row.claude_instance_id,
+        oldKey: oldLifeKeyOf(row.claude_instance_id, label),
+        directory: row.cwd,
+        cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_LISTING,
+      })
+    } catch (err) {
+      // Not reached (the hold set and the reading never throw).
+      console.error(`${SWEEP_LOG_PREFIX}: beginning the old-life hold of instanceId=${row.claude_instance_id} failed: ${describeThrownValue(err)} (b.jg5 SRJ-809)`)
+    }
+  }
+}
+
+/**
+ * The start sweep's kill hold for one row's record (b.jg5 SRJ-809's second
+ * start, SRJ-714, SRJ-1506): a row given a kill that did not succeed
+ * (`SWEEP_ROW_KILL_FAILED`: every non-success class, CONFLICT and UNUSABLE
+ * NAME included) holds its `cwd`, with the cause
+ * `start-sweep-kill-not-succeeded` and the old key `oldLifeKeyOf` gives (the
+ * `persona` label key, or the instance id for a pre-persona row and a row
+ * whose id is not the label's `cscb_<key>`): an absent persona's row, a live
+ * pre-persona row, a row swept for its instance id and one swept for its
+ * `cwd` alike. A row that already has a hold (the listing's) keeps that one
+ * hold. Either way the hold is marked kill-failed when the kill's tries
+ * decided the ordinary kill-failure alert (`markOldLifeHoldKillFailed`;
+ * b.jg5 SRJ-812). A kill that succeeded begins nothing and marks nothing.
+ * Nothing begins or is marked once the sweep has stopped (`sweepStopped`: a
+ * shutdown, or a version re-check's stop), or with no hold set installed.
+ * Never throws.
+ */
+function beginStartSweepKillHold(pass: SweepPass, record: SweepRowRecord): void {
+  const holds = oldLifeHolds
+  if (holds === undefined || record.disposition !== SWEEP_ROW_KILL_FAILED || record.kill === undefined) return
+  if (sweepStopped(pass)) return
+  const { row } = record
+  const id = row.claude_instance_id
+  try {
+    if (holds.holdOf(id) === undefined) {
+      if (typeof row.cwd !== 'string' || row.cwd === '') return
+      holds.begin({
+        instanceId: id,
+        oldKey: oldLifeKeyOf(id, row.labels?.[PERSONA_LABEL_KEY]),
+        directory: row.cwd,
+        cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL,
+      })
+    }
+  } catch (err) {
+    // Not reached (the hold set never throws).
+    console.error(`${SWEEP_LOG_PREFIX}: beginning the old-life hold of instanceId=${id} failed: ${describeThrownValue(err)} (b.jg5 SRJ-809)`)
+    return
+  }
+  markOldLifeHoldKillFailed(id, record.kill)
 }
 
 /** What the start sweep decides each listed row by, once its latch pass is done. */

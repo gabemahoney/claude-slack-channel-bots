@@ -83,15 +83,35 @@
  *   [slack] retired-keys: restored the record held before the apply …
  *   [slack] retired-keys: cannot <action> …
  *
+ * The old-life holds (b.jg5 SRJ-809; {@link createOldLifeHoldSet}). An old
+ * life that may still be running holds its working directory until
+ * agent-director shows it finished. Holds live in server memory only: one
+ * hold set per server, built by `main()` beside the store and shared by the
+ * session manager and the reload controller; a restart drops them, and the
+ * start sweep rebuilds the ones still needed from its `list` and this record.
+ * A hold is keyed by the old row's instance id and carries the old key, the
+ * held directory (compared by real path), what began it
+ * ({@link OLD_LIFE_HOLD_CAUSES}), whether the old key's kill has failed
+ * (SRJ-812) and the personas recorded as waiting on it. It ends only on a
+ * read of the old row as `ended` or `missing` (or no row), a listing in a
+ * `find-missing` result's `ids`, or the key's new life
+ * ({@link OLD_LIFE_HOLD_END_REASONS}); no kill outcome ends it. The hold set
+ * never reads or writes `retired-keys.json`: whether a key is recorded
+ * without its mark is asked of the store by the hold's starters. One line
+ * when a hold begins and one when it ends:
+ *
+ *   [slack] old-life hold: began on "<real path>" for oldKey=<key> (instanceId="<id>"): <cause> — the old life may still be running (b.jg5 SRJ-809)
+ *   [slack] old-life hold: ended on "<real path>" for oldKey=<key> (instanceId="<id>"): <reason>[ (<read>)]; waiting personas: <keys|none> (b.jg5 SRJ-809)
+ *
  * Importable with no side effect: nothing reads a file or the environment,
  * arms a timer or logs at import. Loading the store reads the file once and
- * logs nothing; the store has no timer. The module imports nothing from
- * agent-director.
+ * logs nothing; the store has no timer, and neither has the hold set. The
+ * module imports nothing from agent-director.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 
 import {
   DurableUnlinkUnsyncedError,
@@ -104,12 +124,14 @@ import {
   isMissingConfigCode,
   PersonaConfigReadError,
   readPersonaConfigBytes,
+  resolveRealPath,
   resolveServerStateDir,
   type PersonaConfigFs,
 } from './config.ts'
 import { jsonSyntaxErrorOffset, positionAt } from './json-position.ts'
+import { describeThrownValue, renderLogMessageText } from './persona-connection-errors.ts'
 import { errnoSuffix } from './persona-credentials.ts'
-import { PERSONA_KEY_RE } from './persona-identity.ts'
+import { PERSONA_KEY_RE, personaInstanceId } from './persona-identity.ts'
 import { recordStartupError } from './startup-errors.ts'
 
 // ---------------------------------------------------------------------------
@@ -823,4 +845,377 @@ export function readRetiredKeysAtStart(stateDir: string, deps: RetiredKeysStartD
   if (loaded.kind === 'loaded') return loaded
   ;(deps.recordStartupError ?? recordStartupError)(RETIRED_KEYS_UNREADABLE_LABEL, loaded.message)
   return { kind: 'refused', path: loaded.path }
+}
+
+// ---------------------------------------------------------------------------
+// The old-life holds (b.jg5 SRJ-809)
+// ---------------------------------------------------------------------------
+
+/** The start of the two lines the hold set logs. */
+export const OLD_LIFE_HOLD_LOG_PREFIX = '[slack] old-life hold:'
+
+/** Apply step 1 recorded the key as retired, and the last-applied rewrite succeeded (SRJ-809's first start). */
+export const OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1 = 'apply-step-1'
+/** A start-sweep kill of a live row did not succeed (SRJ-809's second start). */
+export const OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL = 'start-sweep-kill-not-succeeded'
+/** The start sweep listed a live row of a key recorded as retired without the "new life has begun" mark (SRJ-809's third start). */
+export const OLD_LIFE_HOLD_CAUSE_START_SWEEP_LISTING = 'start-sweep-listing'
+
+/** What begins a hold, in SRJ-809's order. */
+export const OLD_LIFE_HOLD_CAUSES = [
+  OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1,
+  OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL,
+  OLD_LIFE_HOLD_CAUSE_START_SWEEP_LISTING,
+] as const
+
+/** What began a hold. */
+export type OldLifeHoldCause = (typeof OLD_LIFE_HOLD_CAUSES)[number]
+
+/** A read of the old row answered `ended`. */
+export const OLD_LIFE_HOLD_END_READ_ENDED = 'read-ended'
+/** A read of the old row answered `missing`, or found no row (`ErrSpawnNotFound`). */
+export const OLD_LIFE_HOLD_END_READ_MISSING = 'read-missing'
+/** A completed `find-missing` run listed the old row in its `ids`. */
+export const OLD_LIFE_HOLD_END_FIND_MISSING_IDS = 'find-missing-ids'
+/** A reuse for the key began its new life (SRJ-806), which implies the old row was finished. */
+export const OLD_LIFE_HOLD_END_NEW_LIFE = 'new-life'
+
+/** What ends a hold (SRJ-809): nothing else does, and no kill outcome is among them. */
+export const OLD_LIFE_HOLD_END_REASONS = [
+  OLD_LIFE_HOLD_END_READ_ENDED,
+  OLD_LIFE_HOLD_END_READ_MISSING,
+  OLD_LIFE_HOLD_END_FIND_MISSING_IDS,
+  OLD_LIFE_HOLD_END_NEW_LIFE,
+] as const
+
+/** What ended a hold. */
+export type OldLifeHoldEndReason = (typeof OLD_LIFE_HOLD_END_REASONS)[number]
+
+/** The tail of the began-again line: a second begin keeps the one hold on its held directory. */
+export const OLD_LIFE_HOLD_BEGAN_AGAIN_TAIL = 'one hold is kept, on its held directory'
+
+/** Each cause in the begin line's words. */
+const OLD_LIFE_HOLD_CAUSE_WORDS: Readonly<Record<OldLifeHoldCause, string>> = Object.freeze({
+  [OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1]: 'apply step 1 recorded its key as retired',
+  [OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL]: 'its start-sweep kill did not succeed',
+  [OLD_LIFE_HOLD_CAUSE_START_SWEEP_LISTING]:
+    'the start sweep listed it live while its key is recorded as retired without the "new life has begun" mark',
+})
+
+/** Each end reason in the end line's words. */
+const OLD_LIFE_HOLD_END_WORDS: Readonly<Record<OldLifeHoldEndReason, string>> = Object.freeze({
+  [OLD_LIFE_HOLD_END_READ_ENDED]: 'the old row read ended',
+  [OLD_LIFE_HOLD_END_READ_MISSING]: 'the old row read missing, or no row',
+  [OLD_LIFE_HOLD_END_FIND_MISSING_IDS]: "a find-missing run listed the old row in its ids",
+  [OLD_LIFE_HOLD_END_NEW_LIFE]: "a reuse for the key began its new life",
+})
+
+/**
+ * The old key of a row an old-life hold is begun on (SRJ-809): the key in the
+ * row's `persona` label when the row's instance id is that key's own
+ * (`cscb_<key>`); otherwise (no label, an empty one, or an instance id that
+ * is not the label's `cscb_<key>`) the instance id itself takes the place of
+ * the old key. Pure; never throws.
+ */
+export function oldLifeKeyOf(instanceId: string, personaLabel: unknown): string {
+  if (typeof personaLabel === 'string' && personaLabel !== '' && personaInstanceId(personaLabel) === instanceId) {
+    return personaLabel
+  }
+  return instanceId
+}
+
+/** One hold as the hold set's queries answer it: a copy, never the set's own state. */
+export interface OldLifeHold {
+  /** The old row's instance id: the hold's key. */
+  readonly instanceId: string
+  /** The old key: the row's `persona` label key, or the instance id in its place (`oldLifeKeyOf`). */
+  readonly oldKey: string
+  /** The held directory, as given at the begin or replaced by a later-read `cwd`. */
+  readonly directory: string
+  /** `directory`'s real path when this copy was made (its lexical path when it cannot be resolved). */
+  readonly realDirectory: string
+  /** What began it (the latest begin's cause). */
+  readonly cause: OldLifeHoldCause
+  /** True once a kill of the old row decided the ordinary kill-failure alert (SRJ-812); until the hold ends. */
+  readonly killFailed: boolean
+  /** The persona keys recorded as having waited on it, sorted. */
+  readonly waiting: readonly string[]
+}
+
+/** What `begin` is given. */
+export interface OldLifeHoldBegin {
+  readonly instanceId: string
+  readonly oldKey: string
+  /** The held directory (the old declaration's working directory, or the row's `cwd`). */
+  readonly directory: string
+  readonly cause: OldLifeHoldCause
+}
+
+/** A persona as the waits query reads it: its key and its working directory (a `Persona` fits). */
+export interface OldLifeHoldPersona {
+  readonly key: string
+  readonly working_directory: string
+}
+
+/** Told each hold that ends, with the reason; registered with `onEnd`. */
+export type OldLifeHoldEndObserver = (hold: OldLifeHold, reason: OldLifeHoldEndReason) => void
+
+/** Dependencies of {@link createOldLifeHoldSet}. */
+export interface OldLifeHoldSetDeps {
+  /** Receives each line the set logs (the server log). A throwing log is swallowed. */
+  log: (line: string) => void
+  /**
+   * The real-path resolver directories are compared by; `resolveRealPath`
+   * (`src/config.ts`) by default, so a directory that no longer exists
+   * compares by its lexical path. A throw counts as the lexical path.
+   */
+  realPath?: (path: string) => string
+}
+
+/**
+ * One server's old-life holds (SRJ-809), in memory. Every member is
+ * synchronous and never throws. No member ends a hold on a kill outcome:
+ * only `end`, which its callers call on a read of the old row as `ended` or
+ * `missing` (or no row), a `find-missing` result's `ids`, or the key's new
+ * life.
+ */
+export interface OldLifeHoldSet {
+  /**
+   * Begin a hold on `input.instanceId`, logging one begin line. A begin on an
+   * instance id already held keeps that one hold: only its cause becomes the
+   * new one, and its directory, old key, kill-failed mark and waiting personas
+   * stay (`input.directory` is not used). Its one began-again line names the
+   * kept directory. Only `replaceDirectory` moves a held directory. Answers
+   * the hold.
+   */
+  begin(input: OldLifeHoldBegin): OldLifeHold
+  /**
+   * Replace the held directory of `instanceId`'s hold with `cwd`, a `cwd` read
+   * later from its row. No line. Answers true when the directory changed;
+   * false when the id is not held or `cwd` is the same string.
+   */
+  replaceDirectory(instanceId: string, cwd: string): boolean
+  /**
+   * End `instanceId`'s hold for `reason`: it is removed, one end line is
+   * logged (`read`, when given, names the read that ended it), then each end
+   * observer is told once, in registration order; an observer's throw is
+   * logged and stops neither the end nor another observer. An id not held
+   * does nothing and logs nothing. Answers the hold as it was, or undefined.
+   */
+  end(instanceId: string, reason: OldLifeHoldEndReason, read?: string): OldLifeHold | undefined
+  /** Mark `instanceId`'s hold kill-failed (SRJ-812): it stays so until it ends. True when the id is held. */
+  markKillFailed(instanceId: string): boolean
+  /** Record persona `key` as waiting on `instanceId`'s hold. True when the id is held. */
+  recordWaiting(instanceId: string, key: string): boolean
+  /** Forget persona `key` from every hold's waiting record. */
+  forgetWaiting(key: string): void
+  /** Register an end observer; answers a function that removes it. */
+  onEnd(observer: OldLifeHoldEndObserver): () => void
+  /** Every hold whose directory is `directory` by real path, in begin order. */
+  holdsOnDirectory(directory: string): OldLifeHold[]
+  /** The hold on `instanceId`, or undefined. */
+  holdOf(instanceId: string): OldLifeHold | undefined
+  /**
+   * The holds `persona` waits on, in begin order: each hold whose directory
+   * is the persona's working directory by real path, and the hold on the
+   * persona's own `cscb_<key>`.
+   */
+  holdsWaitedOnBy(persona: OldLifeHoldPersona): OldLifeHold[]
+  /** Whether any hold `persona` waits on is marked kill-failed (SRJ-812's state 4). */
+  waitsOnKillFailed(persona: OldLifeHoldPersona): boolean
+  /** Every hold, in begin order: for tests and diagnostics. */
+  snapshot(): OldLifeHold[]
+}
+
+/** A hold's own state in the set. */
+interface OldLifeHoldState {
+  readonly instanceId: string
+  readonly oldKey: string
+  directory: string
+  cause: OldLifeHoldCause
+  killFailed: boolean
+  readonly waiting: Set<string>
+}
+
+/** A key as the hold lines show it: bare when it is a persona key, else JSON-quoted. */
+function holdKeyText(key: string): string {
+  return PERSONA_KEY_RE.test(key) ? key : JSON.stringify(renderLogMessageText(key))
+}
+
+/** A value of agent-director's (an instance id, a directory) as the hold lines quote it. */
+function holdQuoted(text: string): string {
+  return JSON.stringify(renderLogMessageText(text))
+}
+
+/**
+ * The line a hold's begin logs (SRJ-809): the directory as its real path, the
+ * old key, the instance id and the cause; `again` when the instance id was
+ * already held, so the one hold is kept on its held directory with the new
+ * cause:
+ *
+ *   [slack] old-life hold: began on "<real path>" for oldKey=<key> (instanceId="<id>"): <cause> — the old life may still be running (b.jg5 SRJ-809)
+ *   [slack] old-life hold: began again on "<real path>" for oldKey=<key> (instanceId="<id>"): <cause> — one hold is kept, on its held directory (b.jg5 SRJ-809)
+ *
+ * Carries no token and no file content. Pure.
+ */
+export function oldLifeHoldBeganLine(hold: OldLifeHold, again = false): string {
+  const tail = again ? OLD_LIFE_HOLD_BEGAN_AGAIN_TAIL : 'the old life may still be running'
+  return (
+    `${OLD_LIFE_HOLD_LOG_PREFIX} began ${again ? 'again ' : ''}on ${holdQuoted(hold.realDirectory)} for oldKey=${holdKeyText(hold.oldKey)} ` +
+    `(instanceId=${holdQuoted(hold.instanceId)}): ${OLD_LIFE_HOLD_CAUSE_WORDS[hold.cause] ?? hold.cause} — ${tail} (b.jg5 SRJ-809)`
+  )
+}
+
+/**
+ * The line a hold's end logs (SRJ-809): the directory as its real path, the
+ * old key, the instance id, what ended it (with the read that did, when
+ * given) and the personas recorded as waiting on it:
+ *
+ *   [slack] old-life hold: ended on "<real path>" for oldKey=<key> (instanceId="<id>"): <reason>[ (<read>)]; waiting personas: <keys|none> (b.jg5 SRJ-809)
+ *
+ * Carries no token and no file content. Pure.
+ */
+export function oldLifeHoldEndedLine(hold: OldLifeHold, reason: OldLifeHoldEndReason, read?: string): string {
+  const by = read === undefined || read === '' ? '' : ` (${read})`
+  const waiting = hold.waiting.length === 0 ? 'none' : hold.waiting.map(holdKeyText).join(', ')
+  return (
+    `${OLD_LIFE_HOLD_LOG_PREFIX} ended on ${holdQuoted(hold.realDirectory)} for oldKey=${holdKeyText(hold.oldKey)} ` +
+    `(instanceId=${holdQuoted(hold.instanceId)}): ${OLD_LIFE_HOLD_END_WORDS[reason] ?? reason}${by}; waiting personas: ${waiting} (b.jg5 SRJ-809)`
+  )
+}
+
+/**
+ * Build one server's old-life hold set (SRJ-809): in memory, empty, with no
+ * timer, no file read or write and no agent-director call; nothing is shared
+ * between two sets. Directories are compared by `deps.realPath` (default
+ * `resolveRealPath`), resolved when compared, so a directory created or
+ * removed after the begin compares by what it is now.
+ */
+export function createOldLifeHoldSet(deps: OldLifeHoldSetDeps): OldLifeHoldSet {
+  const resolver = deps.realPath ?? resolveRealPath
+  /** The holds, by instance id, in begin order. */
+  const holds = new Map<string, OldLifeHoldState>()
+  const observers: OldLifeHoldEndObserver[] = []
+
+  const realOf = (path: string): string => {
+    try {
+      const real = resolver(path)
+      return typeof real === 'string' ? real : resolve(path)
+    } catch {
+      return resolve(path)
+    }
+  }
+
+  const viewOf = (state: OldLifeHoldState): OldLifeHold => ({
+    instanceId: state.instanceId,
+    oldKey: state.oldKey,
+    directory: state.directory,
+    realDirectory: realOf(state.directory),
+    cause: state.cause,
+    killFailed: state.killFailed,
+    waiting: [...state.waiting].sort(),
+  })
+
+  const log = (line: string): void => safeLog(deps.log, line)
+
+  /** The states the persona waits on: its own `cscb_<key>`'s, and each on its working directory. */
+  const waitedOn = (persona: OldLifeHoldPersona): OldLifeHoldState[] => {
+    const own = personaInstanceId(persona.key)
+    const real = realOf(persona.working_directory)
+    return [...holds.values()].filter((state) => state.instanceId === own || realOf(state.directory) === real)
+  }
+
+  function begin(input: OldLifeHoldBegin): OldLifeHold {
+    const existing = holds.get(input.instanceId)
+    if (existing !== undefined) {
+      existing.cause = input.cause
+      const view = viewOf(existing)
+      log(oldLifeHoldBeganLine(view, true))
+      return view
+    }
+    const state: OldLifeHoldState = {
+      instanceId: input.instanceId,
+      oldKey: input.oldKey,
+      directory: input.directory,
+      cause: input.cause,
+      killFailed: false,
+      waiting: new Set<string>(),
+    }
+    holds.set(input.instanceId, state)
+    const view = viewOf(state)
+    log(oldLifeHoldBeganLine(view))
+    return view
+  }
+
+  function replaceDirectory(instanceId: string, cwd: string): boolean {
+    const state = holds.get(instanceId)
+    if (state === undefined || typeof cwd !== 'string' || cwd === '' || state.directory === cwd) return false
+    state.directory = cwd
+    return true
+  }
+
+  function end(instanceId: string, reason: OldLifeHoldEndReason, read?: string): OldLifeHold | undefined {
+    const state = holds.get(instanceId)
+    if (state === undefined) return undefined
+    holds.delete(instanceId)
+    const view = viewOf(state)
+    log(oldLifeHoldEndedLine(view, reason, read))
+    for (const observer of [...observers]) {
+      try {
+        observer(view, reason)
+      } catch (err) {
+        log(`${OLD_LIFE_HOLD_LOG_PREFIX} an end observer failed for instanceId=${holdQuoted(instanceId)}: ${describeThrownValue(err)} (b.jg5 SRJ-809)`)
+      }
+    }
+    return view
+  }
+
+  function markKillFailed(instanceId: string): boolean {
+    const state = holds.get(instanceId)
+    if (state === undefined) return false
+    state.killFailed = true
+    return true
+  }
+
+  function recordWaiting(instanceId: string, key: string): boolean {
+    const state = holds.get(instanceId)
+    if (state === undefined) return false
+    state.waiting.add(key)
+    return true
+  }
+
+  function forgetWaiting(key: string): void {
+    for (const state of holds.values()) state.waiting.delete(key)
+  }
+
+  function onEnd(observer: OldLifeHoldEndObserver): () => void {
+    observers.push(observer)
+    return () => {
+      const at = observers.indexOf(observer)
+      if (at >= 0) observers.splice(at, 1)
+    }
+  }
+
+  function holdsOnDirectory(directory: string): OldLifeHold[] {
+    const real = realOf(directory)
+    return [...holds.values()].filter((state) => realOf(state.directory) === real).map(viewOf)
+  }
+
+  return {
+    begin,
+    replaceDirectory,
+    end,
+    markKillFailed,
+    recordWaiting,
+    forgetWaiting,
+    onEnd,
+    holdsOnDirectory,
+    holdOf: (instanceId) => {
+      const state = holds.get(instanceId)
+      return state === undefined ? undefined : viewOf(state)
+    },
+    holdsWaitedOnBy: (persona) => waitedOn(persona).map(viewOf),
+    waitsOnKillFailed: (persona) => waitedOn(persona).some((state) => state.killFailed),
+    snapshot: () => [...holds.values()].map(viewOf),
+  }
 }

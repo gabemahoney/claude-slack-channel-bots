@@ -266,8 +266,22 @@ import {
   LIVE_ROW_SEQUENCE_ENTRY_KILL,
   LIVE_ROW_START_STARTED,
 } from '../src/live-row-sequence.ts'
-import { _resetLiveRowSequenceRegistry, _resetRetiredKeyStore, setRetiredKeyStore, SPAWN_ACTION_FRESH_RETIRED } from '../src/session-manager.ts'
-import { loadRetiredKeyStore, RETIRED_KEY_CAUSE_REMOVED, retiredKeysPath, type RetiredKeyStore } from '../src/retired-keys.ts'
+import { _resetLiveRowSequenceRegistry, _resetOldLifeHolds, _resetRetiredKeyStore, setOldLifeHolds, setRetiredKeyStore, SPAWN_ACTION_FRESH_RETIRED } from '../src/session-manager.ts'
+import {
+  createOldLifeHoldSet,
+  loadRetiredKeyStore,
+  OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1,
+  OLD_LIFE_HOLD_END_READ_ENDED,
+  OLD_LIFE_HOLD_END_READ_MISSING,
+  OLD_LIFE_HOLD_LOG_PREFIX,
+  oldLifeHoldEndedLine,
+  RETIRED_KEY_CAUSE_REMOVED,
+  retiredKeysPath,
+  type OldLifeHold,
+  type OldLifeHoldEndReason,
+  type OldLifeHoldSet,
+  type RetiredKeyStore,
+} from '../src/retired-keys.ts'
 import { RETIRED_ENTRY_CLEARING_STATES } from '../src/row-read-rules.ts'
 import { readRetiredKeysRecord, retiredKeysRecordOf, writeRetiredKeysRecord, type RetiredKeySeed } from './test-helpers/retired-keys.ts'
 import {
@@ -4638,6 +4652,131 @@ describe('b.jg5 SRJ-807, SRJ-115: the liveness and reconnect adapters clear a re
 
     expect(log.sendKeysCalls).toEqual([])
     expectNothingCleared()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-809 at SRJ-115's adapter sites: the liveness and reconnect
+// adapters' own-row step ends an old-life hold on the persona's own row
+//
+// A same-key old life's row is P's own row, so P's liveness and reconnect
+// adapters read it; their reads are "a read by any call". Both apply the
+// session manager's own-row `status` step after their own call, so C1's own
+// row read `ended` or `missing`, or answering `ErrSpawnNotFound`, ends the
+// hold on `cscb_C1`, with the hold set's one end line naming the adapter's
+// read, and leaves C2's hold alone; a live reading (`waiting`, `pending`
+// with a launch start) or a failed read keeps it. The hold set is built over
+// a recording log and installed with `setOldLifeHolds` as main() installs
+// it, removed in `afterEach`; each hold is begun as apply step 1 begins it.
+// With no set installed the readings and answers are the ones the same rows
+// give today (every other adapter case in this file). The shared reads
+// themselves are tests/session-manager.test.ts's.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-809, SRJ-115: the liveness and reconnect adapters\' own-row step ends an old-life hold on the persona\'s own row read ended, missing or gone, and keeps it on a live or failed read', () => {
+  let dir: string
+  let config: PersonaConfig
+  let holds: OldLifeHoldSet
+  /** The hold set's lines. */
+  let holdLines: string[]
+  let captured: unknown[][]
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'server-old-life-hold-'))
+    holdLines = []
+    captured = []
+    config = makeStandInPersonaConfig({ C1: {}, C2: {} }, dir)
+    holds = createOldLifeHoldSet({ log: (line) => { holdLines.push(line) } })
+    setOldLifeHolds(holds)
+    setConfiguredPersonaQuery((key) => key === 'C1' || key === 'C2')
+    for (const persona of config.personas) {
+      holds.begin({ instanceId: personaInstanceId(persona.key), oldKey: persona.key, directory: persona.working_directory, cause: OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1 })
+    }
+  })
+
+  afterEach(() => {
+    _resetOldLifeHolds()
+    _resetConfiguredPersonaQuery()
+    resetClientForTests()
+    _resetOutageState()
+    _resetFindMissingMemo()
+    _resetNotConnectedEpisodes()
+    setSessionNotifier(undefined)
+    rmSync(dir, { recursive: true, force: true })
+    assertNoLeak({ captured, holdLines })
+  })
+
+  /** A stub whose `status` answers `answer` for C1's row (thrown when an error) and `waiting` for every other row; every send-keys succeeds. */
+  function install(answer: Error | Phase1StatusResult): void {
+    const stub = makeStubClient({
+      statusFn: ({ claude_instance_id }) => (claude_instance_id === personaInstanceId('C1') ? answer : cannedStatusResult({ state: 'waiting' })),
+      sendKeysResult: {},
+    })
+    _resetOutageState()
+    initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
+    setClientForTests(stub as unknown as Client)
+    setSessionNotifier(() => {})
+  }
+
+  /** The two adapters, each with the read name its own-row step gives, reading `key`'s row outside any attempt. */
+  const ADAPTERS: ReadonlyArray<readonly [string, string, (key: string) => Promise<unknown>]> = [
+    ['the liveness adapter', `${LIVENESS_STATUS_SITE.site}: ${LIVENESS_STATUS_SITE.what}`, (key) => _buildIsSessionAliveAdapter(() => config)(key)],
+    ['the reconnect adapter', `${RECONNECT_STATUS_SITE.site}: ${RECONNECT_STATUS_SITE.what}`, (key) => _buildReconnectSessionAdapter(undefined, () => false)(key)],
+  ]
+
+  async function read(adapter: (key: string) => Promise<unknown>, key: string): Promise<void> {
+    const { errArgs } = await capturingErrorArgs(() => adapter(key))
+    captured.push(...errArgs)
+  }
+
+  /** The holds' end lines. */
+  const endLines = (): string[] => holdLines.filter((line) => line.startsWith(`${OLD_LIFE_HOLD_LOG_PREFIX} ended `))
+
+  test.each(ADAPTERS.flatMap(([name, readName, adapter]) => [
+    [name, 'ended', adapter, () => cannedStatusResult({ state: 'ended' }), OLD_LIFE_HOLD_END_READ_ENDED, readName],
+    [name, 'missing', adapter, () => cannedStatusResult({ state: 'missing' }), OLD_LIFE_HOLD_END_READ_MISSING, readName],
+    [name, 'ErrSpawnNotFound', adapter, () => errSpawnNotFound(), OLD_LIFE_HOLD_END_READ_MISSING, `${readName}: no row`],
+  ] as const))('%s reading C1\'s row %s ends the hold on cscb_C1 with one end line naming the read; C2\'s hold stays', async (_name, _answer, adapter, answer, reason: OldLifeHoldEndReason, named) => {
+    install(answer())
+    const c1: OldLifeHold = holds.holdOf(personaInstanceId('C1'))!
+    const c2 = holds.holdOf(personaInstanceId('C2'))
+
+    await read(adapter, 'C1')
+
+    expect(holds.snapshot()).toEqual([c2!])
+    expect(endLines()).toEqual([oldLifeHoldEndedLine(c1, reason, named)])
+  })
+
+  test.each(ADAPTERS.flatMap(([name, , adapter]) => [
+    [name, 'a live reading (waiting)', adapter, () => cannedStatusResult({ state: 'waiting' })],
+    [name, 'a pending reading with a launch start', adapter, () => cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_WHOLE })],
+    [name, 'a failed read (ErrTmuxUnresponsive)', adapter, () => errTmuxUnresponsive('status')],
+  ] as const))('%s with %s for C1 keeps both holds, with no end line', async (_name, _label, adapter, answer) => {
+    install(answer())
+    const before = holds.snapshot()
+
+    await read(adapter, 'C1')
+
+    expect(holds.snapshot()).toEqual(before)
+    expect(endLines()).toEqual([])
+  })
+
+  test.each(ADAPTERS.map(([name, , adapter]) => [name, adapter] as const))('with no hold set installed, %s reading C1\'s row ended ends nothing, and answers as it does with the set installed', async (_name, adapter) => {
+    install(cannedStatusResult({ state: 'ended' }))
+    const answerOf = async (): Promise<unknown> => {
+      const { result, errArgs } = await capturingErrorArgs(() => adapter('C1'))
+      captured.push(...errArgs)
+      return result
+    }
+
+    _resetOldLifeHolds()
+    const without = await answerOf()
+    expect(holds.snapshot()).toHaveLength(2)
+    expect(endLines()).toEqual([])
+
+    setOldLifeHolds(holds)
+    expect(await answerOf()).toEqual(without)
+    expect(endLines()).toHaveLength(1)
   })
 })
 

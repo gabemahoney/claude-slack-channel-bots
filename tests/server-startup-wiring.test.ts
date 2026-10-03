@@ -242,6 +242,14 @@
  *   start sweep, every launch path, the liveness adapter, the connection
  *   manager and `Bun.serve`; server.ts never names the test-only reset, and
  *   no other src file (the CLI included) installs a store.
+ * - b.jg5 SRJ-809: the one old-life hold set (`createOldLifeHoldSet`) is
+ *   built once, bound to a const in main()'s own statement list with only a
+ *   log of its own, before the reload controller, which gets it by that
+ *   binding (`oldLifeHolds`); it is installed for the session manager once
+ *   (`setOldLifeHolds`), behind no branch, beside the retired-key store's
+ *   install and before the start sweep, every launch path, the liveness
+ *   adapter, the connection manager and `Bun.serve`; server.ts never names
+ *   the test-only reset, and no other src file builds or installs a set.
  * - b.jg5 SRJ-704 / SRJ-1007 / SRJ-1016: the kill-failure alerts are built
  *   exactly once (`createKillFailureAlerts`), in main()'s own statement list,
  *   over the one notice episodes instance and the server log, with the live
@@ -4277,6 +4285,87 @@ describe('main() installs the one retired-key store for the session manager once
       onlyCallOf('Bun\\.serve'),
     ]
     for (const at of later) expect(install).toBeLessThan(at)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: b.jg5 SRJ-809 — the one old-life hold set
+//
+// Holds live in server memory: the reload controller's apply step 1 begins
+// them, and the session manager's reads end them, its start sweep begins its
+// own and its teardown kill marks them. The controller's set and the session
+// manager's install are both optional: a second set (each side its own), a
+// missing binding, or an install after the start sweep (whose holds would
+// begin in no set) would type-check and pass every behaviour suite, as the
+// harnesses compose one set themselves. What the holds do is tested in
+// tests/old-life-wait.test.ts, tests/reload-apply.test.ts and
+// tests/session-manager.test.ts; pinned here: the one set, its install and
+// the controller's binding.
+// ---------------------------------------------------------------------------
+
+describe('main() builds one old-life hold set, installs it for the session manager before the start sweep and gives the same set to the reload controller (b.jg5 SRJ-809)', () => {
+  // Tied to src by type: renaming any of these fails the typecheck.
+  const BUILD: keyof typeof RetiredKeysModule = 'createOldLifeHoldSet'
+  const INSTALL: keyof typeof SessionManagerModule = 'setOldLifeHolds'
+  const RESET: keyof typeof SessionManagerModule = '_resetOldLifeHolds'
+  const HOLDS_DEP: keyof ReloadControllerDeps = 'oldLifeHolds'
+  const START_SWEEP: keyof typeof SessionManagerModule = 'reconcileOrphans'
+  const STORE_INSTALL: keyof typeof SessionManagerModule = 'setRetiredKeyStore'
+
+  test('the set is built exactly once, imported from the record module, bound to a const in main()\'s own statement list (behind no branch), with only a log to console.error; no other src file builds one', () => {
+    expect(importSource(SERVER_CODE, BUILD)).toBe('./retired-keys.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${BUILD}\\b`, 'g'), SERVER_CODE)).toEqual([])
+    const at = onlyCallOf(BUILD)
+    const holds = constOf(BUILD)
+    declaredOnce(holds)
+    const decl = SERVER_CODE.slice(0, at).search(new RegExp(`\\bconst\\s+${holds}\\b[^=]*=\\s*$`))
+    expect(decl).toBeGreaterThanOrEqual(0)
+    expect(atMainTopLevel(SERVER_CODE, decl)).toBe(true)
+    const args = onlyCallArgs(BUILD)
+    expect(args).toHaveLength(1)
+    const props = objectProperties(args[0]!)
+    expect([...props.keys()]).toEqual(['log'])
+    expect(props.get('log')).toMatch(/^\(\s*(\w+)\s*\)\s*=>\s*console\.error\(\s*\1\s*\)$/)
+    // One set per server: no other src file (the session manager and the CLI included) builds one.
+    const builders = srcFiles()
+      .filter(([path]) => path !== 'src/server.ts' && path !== 'src/retired-keys.ts')
+      .filter(([, source]) => indicesOf(new RegExp(`\\b${BUILD}\\s*\\(`, 'g'), stripComments(source)).length > 0)
+      .map(([path]) => path)
+    expect(builders).toEqual([])
+  })
+
+  test('the set is installed exactly once, in main()\'s own statement list (behind no branch), through the session manager\'s own install, by its binding; no other src file installs one and the test-only reset is never named', () => {
+    const at = onlyCallOf(INSTALL)
+    expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+    expect(importSource(SERVER_CODE, INSTALL)).toBe('./session-manager.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${INSTALL}\\b`, 'g'), SERVER_CODE)).toEqual([])
+    expect(indicesOf(new RegExp(`\\b${RESET}\\b`, 'g'), SERVER_CODE)).toEqual([])
+    expect(onlyCallArgs(INSTALL)).toEqual([constOf(BUILD)])
+    const installers = srcFiles()
+      .filter(([path]) => path !== 'src/server.ts' && path !== 'src/session-manager.ts')
+      .filter(([, source]) => indicesOf(new RegExp(`\\b${INSTALL}\\s*\\(`, 'g'), stripComments(source)).length > 0)
+      .map(([path]) => path)
+    expect(installers).toEqual([])
+  })
+
+  test('the reload controller gets the same set, by its binding, as its oldLifeHolds', () => {
+    expect(onlyCallProps('createReloadController').get(HOLDS_DEP)).toBe(constOf(BUILD))
+  })
+
+  test('the set is built before the reload controller and its install, and installed beside the retired-key store, before the start sweep (reconcileOrphans), every launch path, the liveness adapter, the connection manager and Bun.serve', () => {
+    const build = onlyCallOf(BUILD)
+    const install = onlyCallOf(INSTALL)
+    expect(build).toBeLessThan(startResolution(SERVER_CODE).createAt)
+    expect(build).toBeLessThan(install)
+    const sweep = onlyCallOf(START_SWEEP)
+    expect(insideMain(sweep)).toBe(true)
+    const adapterBuilds = indicesOf(/(?<![\w.$]|function\s+)_buildIsSessionAliveAdapter\s*\(/g, SERVER_CODE)
+    expect(adapterBuilds).toHaveLength(1)
+    const later = [sweep, ...latchStartPass(), ...adapterBuilds, onlyCallOf('createPersonaConnectionManager'), onlyCallOf('Bun\\.serve')]
+    for (const at of later) expect(install).toBeLessThan(at)
+    // Beside the store's install: nothing awaited between the two.
+    const store = onlyCallOf(STORE_INSTALL)
+    expect(indicesOf(/\bawait\b/g, SERVER_CODE.slice(Math.min(store, install), Math.max(store, install)))).toEqual([])
   })
 })
 
