@@ -101,6 +101,12 @@
  *   - Wedge detector (b.fae F4 / SR-7.2): one persona-named warning to the
  *     persona's destination through its client. The scenario passes a
  *     destination hold whose fake clock moves one poll interval per tick.
+ *     While the persona's teardown window is open (b.jg5 SRJ-1003, a
+ *     recording stand-in for the notifier's `notify` and
+ *     `teardownWindowState`), the warning's body is handed to `notify` once,
+ *     with one line, never to the hold, and latched; with no window open, or
+ *     only another persona's, it posts as before; a throwing window read and
+ *     a rejecting `notify` are logged token-safely.
  *   - A persona that is not up (b.av2 SR-6.4), through the production up
  *     predicate: its rows get no `get`, post, update, live entry, wedge tick
  *     or trail event while an up persona's row posts in the same tick; a
@@ -138,6 +144,7 @@ import {
 import { _resetTrailFdForTests } from '../src/permission-trail.ts'
 import { createPersonaDestinations, type PersonaDestinations } from '../src/persona-destination.ts'
 import { createPersonaDestinationHold, type PersonaDestinationHold } from '../src/persona-destination-hold.ts'
+import type { PersonaTeardownWindowState } from '../src/persona-notifier.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { parsePermissionActionId } from '../src/permission-action-id.ts'
 import { personaKeyFromActionId } from './test-helpers/action-id-key.ts'
@@ -3085,7 +3092,7 @@ describe('b.fae F4 — wedge detector', () => {
    * on, so tick `n` (from 1) runs at `(n - 1) * WEDGE_INTERVAL_MS` and the
    * 30 s retry throttle and the hold's 5/10/20 s backoff line up.
    */
-  function makeWedgeScenario(persona: Persona = A): {
+  function makeWedgeScenario(persona: Persona = A, teardownNotices?: PollerDeps['teardownNotices']): {
     ivl: ManualIntervalControl
     trail: TrailCapture
     logCalls: unknown[][]
@@ -3107,6 +3114,7 @@ describe('b.fae F4 — wedge detector', () => {
       emitTrail: trail.emit,
       log: (...args) => { logCalls.push(args) },
       destinationHold: hold,
+      ...(teardownNotices === undefined ? {} : { teardownNotices }),
     })
     return {
       ivl,
@@ -3220,6 +3228,119 @@ describe('b.fae F4 — wedge detector', () => {
     // send-keys, if mentioned at all, must be an explicit DON'T — never a remedy.
     expect(text).toContain('Do NOT use send-keys')
     expect(text).not.toContain('use send-keys to')
+  })
+
+  // b.jg5 SRJ-1003: while the persona's teardown window is open, its
+  // stuck-prompt warning is a teardown notice: handed to the notifier's
+  // `notify` (whose window writes it as one log line and one
+  // persona-teardown-notice entry, tests/persona-notifier.test.ts), never to
+  // the destination hold, and latched as delivered. Outside a window it posts.
+  describe('during a persona teardown (b.jg5 SRJ-1003)', () => {
+    /** A recording stand-in for the notifier: each key's window state, and every notice handed to `notify`. */
+    function recordingNotices(
+      states: Readonly<Record<string, PersonaTeardownWindowState>>,
+      notify: (key: string, text: string) => Promise<void> = async () => undefined,
+    ): { notices: NonNullable<PollerDeps['teardownNotices']>; handed: Array<{ key: string; text: string }> } {
+      const handed: Array<{ key: string; text: string }> = []
+      return {
+        handed,
+        notices: {
+          notify: (key, text) => {
+            handed.push({ key, text })
+            return notify(key, text)
+          },
+          teardownWindowState: (key) => states[key] ?? 'none',
+        },
+      }
+    }
+
+    /** The poller's one line for A's warning handed to the notifier in A's teardown window. */
+    const handedLine = `[slack] permission-poller: stuck-prompt warning for ${renderPersonaRef(NAME_A, KEY_A)} (${INSTANCE_A}) raised during its persona teardown — handed to the notifier, which writes it to the server log and startup-errors.log, not posted (b.jg5 SRJ-1003)`
+
+    test('A\'s window open at the trip: the warning\'s body is handed to the notifier once, with one line; nothing reaches A\'s destination or the hold, no attempt is made, and the latch holds across many later ticks', async () => {
+      const r = recordingNotices({ [KEY_A]: 'open' })
+      const s = makeWedgeScenario(A, r.notices)
+
+      await s.driveTicks(K - 1)
+      expect(r.handed).toEqual([])
+      await s.driveTicks(1)
+      await s.driveTicks(K + RETRY_EVERY)
+
+      expect(r.handed).toHaveLength(1)
+      const [{ key, text }] = r.handed as [{ key: string; text: string }]
+      expect(key).toBe(KEY_A)
+      // The notifier adds the persona reference itself: the body carries none.
+      expect(text).not.toStartWith('Persona ')
+      expect(text).toContain(INSTANCE_A)
+      expect(text).toContain('read-pane')
+      expect(text).toContain('Do NOT use send-keys')
+      expect(slackCalls(stubA, stubB, stubD)).toBe(0)
+      expect(s.hold.view(KEY_A)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
+      expect(wedgeTrail(s.trail)).toEqual([])
+      expect(logLines(s.logCalls, 'raised during its persona teardown')).toEqual([[handedLine]])
+      expect(logLines(s.logCalls, 'sending one-shot warning')).toEqual([])
+      assertNoLeak({ logCalls: s.logCalls, handed: r.handed }, 'teardown wedge warning')
+    })
+
+    test.each<[string, Readonly<Record<string, PersonaTeardownWindowState>>]>([
+      ['no window open for A', { [KEY_A]: 'none' }],
+      ['only B\'s window open', { [KEY_B]: 'open' }],
+    ])('control, %s: the warning posts to A\'s destination through its client as before; nothing is handed to the notifier', async (_label, states) => {
+      const r = recordingNotices(states)
+      const s = makeWedgeScenario(A, r.notices)
+
+      await s.driveTicks(K)
+
+      expect(r.handed).toEqual([])
+      const warnings = wedgeWarnings(stubA)
+      expect(warnings).toHaveLength(1)
+      expect(warnings[0].channel).toBe(A_DEST)
+      expect(String(warnings[0].text).startsWith(`Persona ${renderPersonaRef(NAME_A, KEY_A)}: `)).toBe(true)
+      expect(wedgeTrail(s.trail).map((e) => e['ok'])).toEqual([true])
+      expect(logLines(s.logCalls, 'raised during its persona teardown')).toEqual([])
+    })
+
+    test('a window read that throws is logged token-safely and read as not open: the warning posts to A\'s destination; nothing is handed over', async () => {
+      const r = recordingNotices({})
+      const s = makeWedgeScenario(A, {
+        notify: r.notices.notify,
+        teardownWindowState: () => {
+          throw new Error(`window read refused (${sentinelInMessage('poller-window')})`)
+        },
+      })
+
+      await s.driveTicks(K)
+
+      expect(r.handed).toEqual([])
+      expect(wedgeWarnings(stubA)).toHaveLength(1)
+      const failed = logLines(s.logCalls, 'teardown window read for')
+      expect(failed).toHaveLength(1)
+      const line = String(failed[0]![0])
+      expect(line).toStartWith(
+        `[slack] permission-poller: teardown window read for ${renderPersonaRef(NAME_A, KEY_A)} failed: Error message="window read refused (${REDACTED_SENTINEL_TAIL})"`,
+      )
+      expect(line).toEndWith(' — read as not open')
+      assertNoLeak({ logCalls: s.logCalls }, 'teardown window read failure')
+    })
+
+    test('a notifier that rejects: the handed line, then one token-safe failure line; the warning is still latched and never posted', async () => {
+      const r = recordingNotices({ [KEY_A]: 'open' }, async () => {
+        throw new Error(`notifier refused (${sentinelInMessage('poller-notify')})`)
+      })
+      const s = makeWedgeScenario(A, r.notices)
+
+      await s.driveTicks(K + RETRY_EVERY)
+
+      expect(r.handed).toHaveLength(1)
+      expect(slackCalls(stubA, stubB, stubD)).toBe(0)
+      const failed = logLines(s.logCalls, 'failed at the notifier')
+      expect(failed).toHaveLength(1)
+      expect(String(failed[0]![0])).toStartWith(
+        `[slack] permission-poller: stuck-prompt warning for ${renderPersonaRef(NAME_A, KEY_A)} (${INSTANCE_A}) failed at the notifier: Error message="notifier refused (${REDACTED_SENTINEL_TAIL})"`,
+      )
+      expect(logLines(s.logCalls, 'raised during its persona teardown')).toEqual([[handedLine]])
+      assertNoLeak({ logCalls: s.logCalls }, 'teardown wedge warning notifier failure')
+    })
   })
 
   // b.fae F3 — warning-post FAILURE path. The latch (`warningFired`) sets ONLY

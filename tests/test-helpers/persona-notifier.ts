@@ -18,6 +18,26 @@
  *   notice starts no real timer and its retries run only when the test moves
  *   the clock (`h.clock.runNext()`, `h.clock.advance(ms)`).
  *
+ * - the notifier's startup-errors recorder (b.jg5 SRJ-1003, SRJ-1013) is the
+ *   real `recordStartupError` over `h.logDir`, a `startup-errors` directory
+ *   under the harness's own temp root, which is made at the first entry
+ *   written (a harness that writes none makes no directory) and removed by
+ *   `h.cleanup()`; `h.startupEntries()` answers the entries written there,
+ *   in order, each parsed into its class and text. `recordStartupError:
+ *   null` builds the notifier with no recorder, and a function replaces the
+ *   default one;
+ * - `h.openTeardown(persona)` drives the persona teardown window as
+ *   `runTeardown` does (`src/persona-lifecycle.ts`): the submit, then the
+ *   window opened; the handle's `close()` closes the window and ends the
+ *   submit. `h.duringTeardown(persona, body)` runs `body` inside one.
+ *
+ * `teardownNoticeEntry(persona, text, occasion?)` is the parsed entry the
+ * window writes for a notice: the class `persona-teardown-notice` and the
+ * text `personaTeardownNoticeEntryText` builds from the persona reference,
+ * the occasion and the notice's text, flattened to one line as the recorder
+ * writes it; `teardownNoticeEntry(persona, text, occasion, classLabel)`
+ * gives another class (the survivor version's `persona-kill-survivor`).
+ *
  * The harness installs nothing: pass `h.notifier.notify` to the notice site
  * under test (`setSessionNotifier`, `initOutageState({ notify })`, the
  * safeguard's `notify` argument).
@@ -29,18 +49,34 @@
  * helpers (tests/test-helpers/persona-routing-harness.ts,
  * tests/test-helpers/persona-routing-managed.ts) build their notifier with it.
  *
- * Isolation (b.av2 SR-13.2): no module-scope state, no I/O, no real timers,
- * no token literal. The stubs' failures carry `leakMarker` when given.
+ * Isolation (b.av2 SR-13.2): no module-scope state, no real timers, no token
+ * literal, and no I/O but the startup-errors entries, written only under the
+ * harness's own temp root (a test that can open a teardown window calls
+ * `h.cleanup()` after it). The stubs' failures carry `leakMarker` when given.
  *
  * SPDX-License-Identifier: MIT
  */
+
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import type { WebClient } from '@slack/web-api'
 
 import type { Persona, PersonaConfig } from '../../src/config.ts'
 import { createPersonaDestinationHold, type PersonaDestinationHold } from '../../src/persona-destination-hold.ts'
 import { createPersonaDestinations, type PersonaDestinations } from '../../src/persona-destination.ts'
-import { createPersonaNotifier, type PersonaNotifier } from '../../src/persona-notifier.ts'
+import { renderPersonaRef } from '../../src/persona-identity.ts'
+import {
+  PERSONA_TEARDOWN_NOTICE_LABEL,
+  PERSONA_TEARDOWN_NOTICE_RAISED,
+  createPersonaNotifier,
+  personaTeardownNoticeEntryText,
+  type PersonaNotifier,
+  type PersonaStartupErrorRecorder,
+  type PersonaTeardownNoticeOccasion,
+} from '../../src/persona-notifier.ts'
+import { recordStartupError } from '../../src/startup-errors.ts'
 import { createFakeClock, type FakeClock } from './fake-clock.ts'
 import { makeStubSlack, type StubSlack, type WebApiOutcome } from './slack-stub.ts'
 
@@ -62,6 +98,8 @@ export interface NotifierStackDeps {
   isDryRun?: () => boolean
   /** Every line the resolver, the hold and the notifier log. */
   log(line: string): void
+  /** The notifier's startup-errors recorder (b.jg5 SRJ-1003). Default: none installed. */
+  recordStartupError?: PersonaStartupErrorRecorder
 }
 
 /** The notifier and the pieces it was built with. */
@@ -91,8 +129,45 @@ export function makeNotifierStack(deps: NotifierStackDeps): NotifierStack {
     destinationHold: hold,
     isDryRun: deps.isDryRun ?? (() => false),
     log,
+    ...(deps.recordStartupError !== undefined ? { recordStartupError: deps.recordStartupError } : {}),
   })
   return { notifier, hold, destinations, clock }
+}
+
+/** One parsed `startup-errors.log` entry: its class and its text (after the timestamp and the class). */
+export interface StartupEntry {
+  classLabel: string
+  text: string
+}
+
+/** The one-line form `recordStartupError` writes a message in (its line breaks become spaces). */
+function flattenEntryText(text: string): string {
+  return text.replace(/\r?\n/g, ' ').replace(/\r/g, ' ')
+}
+
+/**
+ * The parsed entry the persona teardown window writes for a notice of
+ * `persona` (b.jg5 SRJ-1003, SRJ-1013): `classLabel` (default
+ * `persona-teardown-notice`) and the text `personaTeardownNoticeEntryText`
+ * builds from the persona reference (`persona "<name>" (key=<key>)`), the
+ * occasion (default "raised during its teardown") and `text`, on one line.
+ */
+export function teardownNoticeEntry(
+  persona: Pick<Persona, 'name' | 'key'>,
+  text: string,
+  occasion: PersonaTeardownNoticeOccasion = PERSONA_TEARDOWN_NOTICE_RAISED,
+  classLabel: string = PERSONA_TEARDOWN_NOTICE_LABEL,
+): StartupEntry {
+  return {
+    classLabel,
+    text: flattenEntryText(personaTeardownNoticeEntryText(`persona ${renderPersonaRef(persona.name, persona.key)}`, text, occasion)),
+  }
+}
+
+/** A persona teardown window opened by `openTeardown`. */
+export interface TeardownWindowHandle {
+  /** Close the window and end the submit, as the teardown's completion does. Acts once. */
+  close(): void
 }
 
 export interface NotifierHarnessOptions {
@@ -109,6 +184,12 @@ export interface NotifierHarnessOptions {
   dryRun?: boolean
   /** The destination hold's clock and timers. Default: a new `createFakeClock()`. */
   clock?: FakeClock
+  /**
+   * The notifier's startup-errors recorder. Default (undefined): the real
+   * `recordStartupError` over `logDir`; `null`: none installed; a function:
+   * that one.
+   */
+  recordStartupError?: PersonaStartupErrorRecorder | null
 }
 
 export interface NotifierHarness {
@@ -140,7 +221,25 @@ export interface NotifierHarness {
   allPosts(): Record<string, NoticePost[]>
   /** Total `chat.postMessage` calls across every stub. */
   totalPosts(): number
+  /** The directory the default recorder writes `startup-errors.log` in (made at its first entry). */
+  readonly logDir: string
+  /** The `startup-errors.log` path under `logDir` (for `writtenFile`; it may not exist). */
+  readonly startupErrorsPath: string
+  /** The entries written to `startupErrorsPath`, in order, parsed; none when the file does not exist. */
+  startupEntries(): StartupEntry[]
+  /**
+   * Open `persona`'s teardown window as `runTeardown` does: its submit
+   * (`submitTeardown`), then the window (`openTeardownWindow`).
+   */
+  openTeardown(persona: Pick<Persona, 'name' | 'key'>): TeardownWindowHandle
+  /** Run `body` inside `persona`'s teardown window (`openTeardown`), closed however `body` ends. */
+  duringTeardown<T>(persona: Pick<Persona, 'name' | 'key'>, body: () => T | Promise<T>): Promise<T>
+  /** Remove the harness's temp root (the startup-errors directory with it). Safe to call more than once. */
+  cleanup(): void
 }
+
+/** `[<timestamp>] [<class>] <text>`: a `recordStartupError` line with no cause. */
+const STARTUP_ENTRY_RE = /^\[[^\]]*\] \[([^\]]*)\] (.*)$/
 
 /** Build the real persona notifier over one stub Slack per persona of `config`. */
 export function makeNotifierHarness(
@@ -165,12 +264,30 @@ export function makeNotifierHarness(
   const log = (line: string): void => {
     logs.push(line)
   }
+  // The temp root is made at the first entry written, so a harness that
+  // writes none leaves nothing behind.
+  let root: string | undefined
+  const rootDir = (): string => (root ??= mkdtempSync(join(tmpdir(), 'cscb-notifier-harness-')))
+  const logDirName = 'startup-errors'
+  let logDir: string | undefined
+  const ensureLogDir = (): string => {
+    if (logDir === undefined) {
+      logDir = join(rootDir(), logDirName)
+      mkdirSync(logDir, { recursive: true })
+    }
+    return logDir
+  }
+  const recorder: PersonaStartupErrorRecorder | undefined =
+    opts.recordStartupError === null
+      ? undefined
+      : (opts.recordStartupError ?? ((classLabel, message) => recordStartupError(classLabel, message, undefined, { logDir: ensureLogDir() })))
   const { notifier, hold, destinations, clock } = makeNotifierStack({
     getPersona,
     clientFor,
     clock: opts.clock,
     isDryRun: () => dryRun,
     log,
+    ...(recorder !== undefined ? { recordStartupError: recorder } : {}),
   })
 
   function stub(key: string): StubSlack {
@@ -180,6 +297,36 @@ export function makeNotifierHarness(
   }
 
   const posts = (key: string): NoticePost[] => stub(key).calls.postMessage as NoticePost[]
+
+  const startupErrorsPath = (): string => join(logDir ?? join(rootDir(), logDirName), 'startup-errors.log')
+
+  function startupEntries(): StartupEntry[] {
+    if (logDir === undefined) return []
+    const path = join(logDir, 'startup-errors.log')
+    if (!existsSync(path)) return []
+    return readFileSync(path, 'utf-8')
+      .split('\n')
+      .filter((line) => line !== '')
+      .map((line) => {
+        const match = STARTUP_ENTRY_RE.exec(line)
+        if (match === null) throw new Error(`makeNotifierHarness: not a startup-errors entry: ${JSON.stringify(line)}`)
+        return { classLabel: match[1]!, text: match[2]! }
+      })
+  }
+
+  function openTeardown(persona: Pick<Persona, 'name' | 'key'>): TeardownWindowHandle {
+    notifier.submitTeardown(persona.key)
+    notifier.openTeardownWindow(persona)
+    let closed = false
+    return {
+      close: () => {
+        if (closed) return
+        closed = true
+        notifier.closeTeardownWindow(persona.key)
+        notifier.settleTeardown(persona.key)
+      },
+    }
+  }
 
   return {
     notifier,
@@ -200,5 +347,26 @@ export function makeNotifierHarness(
     posts,
     allPosts: () => Object.fromEntries([...stubs.keys()].map((k) => [k, posts(k)])),
     totalPosts: () => [...stubs.values()].reduce((n, s) => n + s.calls.postMessage.length, 0),
+    get logDir() {
+      return logDir ?? join(rootDir(), logDirName)
+    },
+    get startupErrorsPath() {
+      return startupErrorsPath()
+    },
+    startupEntries,
+    openTeardown,
+    duringTeardown: async (persona, body) => {
+      const window = openTeardown(persona)
+      try {
+        return await body()
+      } finally {
+        window.close()
+      }
+    },
+    cleanup: () => {
+      if (root !== undefined) rmSync(root, { recursive: true, force: true })
+      root = undefined
+      logDir = undefined
+    },
   }
 }

@@ -605,17 +605,20 @@ describe('a confirmed removal tears the persona down (b.av2 SR-6.5, SR-8.6 step 
     const composition = run.composition!
     // The teardown reaches the approver stop first and the live-row sequence stop right after it (b.jg5 SRJ-404,
     // SRJ-706, SRJ-715): both recorded at its submission and again as its turn's first two steps, before every other
-    // teardown step for bravo, the wait for its launch in flight included. Once that launch settled, the sequence is
-    // stopped once more and the retry timer with it (a launch in flight can start a sequence at a replacement site,
-    // b.jg5 SRJ-707), before the kill.
+    // teardown step for bravo, the wait for its launch in flight included. Its turn starts by forgetting bravo's
+    // outage state, once, right before its notice window opens and nowhere after the kill (b.jg5 SRJ-1002, SRJ-1003).
+    // Once that launch settled, the sequence is stopped once more and the retry timer with it (a launch in flight can
+    // start a sequence at a replacement site, b.jg5 SRJ-707), before the kill.
     const bravoTeardownCalls = composition.calls.slice(callsAtCp).filter(([, key]) => key === bravoKey)
-    expect(bravoTeardownCalls.slice(0, 4)).toEqual([
+    expect(bravoTeardownCalls.slice(0, 5)).toEqual([
       ['stopApprover', bravoKey],
       ['stopLiveRowSequence', bravoKey],
+      ['resetOutageState', bravoKey],
       ['stopApprover', bravoKey],
       ['stopLiveRowSequence', bravoKey],
     ])
-    const laterMembers = bravoTeardownCalls.slice(4).map(([member]) => member)
+    const laterMembers = bravoTeardownCalls.slice(5).map(([member]) => member)
+    expect(laterMembers.filter((member) => member === 'resetOutageState')).toEqual([])
     expect(laterMembers.filter((member) => member === 'stopApprover' || member === 'stopLiveRowSequence')).toEqual(['stopLiveRowSequence'])
     const settledAt = laterMembers.indexOf('whenLaunchSettled')
     expect(laterMembers.slice(settledAt, settledAt + 3)).toEqual(['whenLaunchSettled', 'stopLiveRowSequence', 'stopRetryTimer'])

@@ -12,7 +12,11 @@
  * the onset's text; every other case compares with the exported template
  * over the classifier's rendered message), and the report of an UNCLASSIFIED
  * outcome met in P's attempt to the unclassified sink, through the wrappers,
- * the reporting point and the site entry (b.jg5 SRJ-313, SRJ-301).
+ * the reporting point and the site entry (b.jg5 SRJ-313, SRJ-301), and the
+ * phase and classes each notice carries to the notifier, the all-clear's
+ * `allClearOf` rendering any subset of its classes over the same bad
+ * stretch (b.jg5 SRJ-1002, SRJ-1003; the notifier's split of it is
+ * tests/persona-notifier.test.ts's).
  *
  * Every wrapped call declares its verb. The trigger-sink and condition-sink
  * cases install recording fake sinks (no timer, no episodes) and run the
@@ -54,6 +58,7 @@ import {
   tmuxServerChangedOnset,
   type ClassRecord,
   type OutageClass,
+  type OutageNoticeOptions,
 } from '../src/outage-state.ts'
 import { DIFFERENT_TMUX_SERVER_PHRASE } from '../src/ad-description-phrases.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
@@ -403,6 +408,60 @@ describe('cases 10-14: bad-stretch history, reset, template, post-failure, start
     expect(emissions[0].text).toMatch(/Working directory unreachable/)
     expect(emissions[1].key).toBe(P1)
     expect(emissions[1].text).toMatch(/All clear.*cwd-unreachable/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The options each notice carries (b.jg5 SRJ-1002, SRJ-1003)
+// ---------------------------------------------------------------------------
+
+describe('the options each notice carries to the notifier (b.jg5 SRJ-1002, SRJ-1003)', () => {
+  /** A harness whose notify also records each call's options. */
+  function makeOptionsHarness(): Array<{ key: string; text: string; options: OutageNoticeOptions | undefined }> {
+    const calls: Array<{ key: string; text: string; options: OutageNoticeOptions | undefined }> = []
+    _resetOutageState()
+    initOutageState({
+      notify: (key, text, options) => {
+        calls.push({ key, text, options })
+      },
+      getClient: () => makeStubClient() as unknown as Client,
+    })
+    return calls
+  }
+
+  test.each<[string, () => void, OutageClass]>([
+    ['setOutageFlag ad-unreachable', () => setOutageFlag(P1, 'ad-unreachable', '/bin/ad'), 'ad-unreachable'],
+    ['raiseTmuxUnavailable', () => raiseTmuxUnavailable(P1, errTmuxNotAvailable()), 'tmux-unavailable'],
+    ['raiseAdConfigMalformed', () => raiseAdConfigMalformed(P1, errConfigMalformed()), 'ad-config-malformed'],
+  ])('an onset (%s) carries its phase and its one class', (_label, raise, cls) => {
+    const calls = makeOptionsHarness()
+
+    raise()
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.options).toEqual({ outage: { phase: 'onset', classes: [cls] } })
+  })
+
+  test('the all-clear carries its phase, every class of its bad stretch in raise order, and allClearOf, which renders the all-clear of any subset of them over the same stretch (other classes ignored) and of all of them as the text sent', () => {
+    const calls = makeOptionsHarness()
+    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
+    setOutageFlag(P1, 'tmux-unavailable')
+    clearOutageFlag(P1, 'ad-unreachable')
+
+    clearOutageFlag(P1, 'tmux-unavailable')
+
+    expect(calls).toHaveLength(3)
+    const [, , allClear] = calls
+    expect(allClear!.text).toBe(allClearOf([['ad-unreachable', '/bin/ad'], ['tmux-unavailable', undefined]]))
+    const outage = allClear!.options!.outage
+    expect([outage.phase, outage.classes]).toEqual(['all-clear', ['ad-unreachable', 'tmux-unavailable']])
+    expect(outage.allClearOf!(['ad-unreachable'])).toBe(allClearOf([['ad-unreachable', '/bin/ad']]))
+    expect(outage.allClearOf!(['tmux-unavailable'])).toBe(allClearOf([['tmux-unavailable', undefined]]))
+    expect(outage.allClearOf!(['tmux-unavailable', 'cwd-unreachable'])).toBe(allClearOf([['tmux-unavailable', undefined]]))
+    expect(outage.allClearOf!(['ad-unreachable', 'tmux-unavailable'])).toBe(allClear!.text)
+    // The stretch is snapshotted: a new outage changes nothing the earlier all-clear renders.
+    setOutageFlag(P1, 'cwd-unreachable', '/elsewhere')
+    expect(outage.allClearOf!(['ad-unreachable'])).toBe(allClearOf([['ad-unreachable', '/bin/ad']]))
   })
 })
 

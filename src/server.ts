@@ -1226,6 +1226,14 @@ const personaDestinationHold = createPersonaDestinationHold({
  * notices send every persona notice through it.
  * A notice raised while its persona has no client is held, and flushed when
  * that persona reports up (the manager's status listener).
+ * b.jg5 SRJ-1003, SRJ-1013: while a persona's teardown window is open (the
+ * persona lifecycle opens it for the whole of `runTeardown`), every notice
+ * for its key is written instead, one server-log line and one
+ * `startup-errors.log` entry (`persona-teardown-notice`, or
+ * `persona-kill-survivor` for the kill-failure alert's survivor version)
+ * through `recordStartupError` with its default log directory, and so is the
+ * all-clear of an outage whose onset the window routed, whenever it comes;
+ * none is posted or dropped. Building it writes nothing.
  */
 const personaNotifier = createPersonaNotifier({
   getPersona: getAppliedPersona,
@@ -1234,6 +1242,7 @@ const personaNotifier = createPersonaNotifier({
   destinationHold: personaDestinationHold,
   isDryRun,
   log: (line) => console.error(line),
+  recordStartupError: (classLabel, message) => recordStartupError(classLabel, message),
 })
 
 // ---------------------------------------------------------------------------
@@ -3054,11 +3063,18 @@ export async function main(): Promise<void> {
   // clock, built before the retry controller and the start pass, so every
   // poster reaches it from the first launch. Its posts go through the persona
   // notifier. A teardown forgets the key's episodes and shutdown closes it.
+  // b.jg5 SRJ-1003: its teardown query is the one notifier's
+  // `teardownWindowState`: from a persona teardown's submit until its window
+  // opens the key's posts are muted, and while the window is open its
+  // log-only routes (the unclassified alert for a key no longer applied,
+  // every kill-failure alert for the key) go through the notifier too, whose
+  // window writes them; the survivor version's class rides in the options.
   const noticeEpisodes = createPersonaEpisodes({
-    sink: (key, text) => {
-      void personaNotifier.notify(key, text)
+    sink: (key, text, options) => {
+      void personaNotifier.notify(key, text, options)
     },
     log: (line) => console.error(line),
+    teardownWindow: (key) => personaNotifier.teardownWindowState(key),
   })
   personaEpisodes = noticeEpisodes
 
@@ -3208,7 +3224,9 @@ export async function main(): Promise<void> {
   // kill retry's decision at the restart path's kill and the live-row
   // sequence's kills (installed here, before the start pass), the persona
   // teardown raises them with the context 'persona teardown' (its log-only
-  // route, b.jg5 SRJ-704, SRJ-715; bound below), and
+  // route, b.jg5 SRJ-704, SRJ-715; bound below; while a key's teardown
+  // window is open every alert for it takes that route, written by the
+  // notifier's window, b.jg5 SRJ-1003), and
   // ends a persona's episode at any read of its own row that reads `ended`
   // or `missing`, or finds it gone. A persona in the applied configuration
   // gets the alert at its destination (the ordinary version once per
@@ -3375,8 +3393,11 @@ export async function main(): Promise<void> {
   // found the row healthy, or a launch call's `pending`), so the timer stops
   // unless its `pending` or kill-failure exception holds.
   initOutageState({
-    notify: (key, text) => {
-      void personaNotifier.notify(key, text)
+    // b.jg5 SRJ-1002, SRJ-1003: each onset and all-clear carries its phase
+    // and classes, so the notifier writes the all-clear of an outage whose
+    // onset a persona teardown's window routed as that onset was.
+    notify: (key, text, options) => {
+      void personaNotifier.notify(key, text, options)
     },
     getClient,
     triggerSink: retryTimers,
@@ -3463,9 +3484,13 @@ export async function main(): Promise<void> {
   // included), each through the per-persona serializer, and its template
   // refresh. The teardown (b.jg5 SRJ-715, SRJ-1507) stops the key's
   // approver, live-row sequence and retry timer first, kills its row with
-  // the bounded retry and keeps the row: nothing here deletes one. This
-  // supplies only the production dependencies; the operations live in
-  // persona-lifecycle.ts.
+  // the bounded retry and keeps the row: nothing here deletes one. b.jg5
+  // SRJ-1003: the one notifier also carries the teardown's window: its submit
+  // mutes the key's notice episodes, and from the start of its turn until it
+  // completes every notice for the key, a CONFLICT or UNUSABLE NAME its kill
+  // meets included, is written to the server log and startup-errors.log,
+  // never posted. This supplies only the production dependencies; the
+  // operations live in persona-lifecycle.ts.
   personaLifecycleOps = createPersonaLifecycle({
     serialize: personaLifecycle.run,
     bringUps: personaBringUps,
@@ -3522,11 +3547,16 @@ export async function main(): Promise<void> {
     // retry on the real clock, arming nothing and latching nothing; there is
     // no delete, so the row is kept whatever the outcome.
     killInstance: (key) => killPersonaInstanceForTeardown(key, { clock: KILL_RETRY_SYSTEM_CLOCK }),
-    // b.jg5 SRJ-704: its kill-failure alert, through the one kill-failure
-    // alerts instance over the notice episodes, with the context 'persona
-    // teardown': the server log and a startup-errors entry, never Slack.
+    // b.jg5 SRJ-704, SRJ-1003: its kill-failure alert, through the one
+    // kill-failure alerts instance over the notice episodes, with the context
+    // 'persona teardown': raised in its window, so the notifier writes it to
+    // the server log and a startup-errors entry, never Slack.
     raiseKillFailureAlert: (key, decision) =>
       killFailureAlerts.raise({ key, decision, latched: false, context: KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN }),
+    // b.jg5 SRJ-110, SRJ-1003: the key's outage flags, read after its kill,
+    // so a standing non-success whose outage onset the window wrote raises
+    // no second notice.
+    outageFlags: getOutageFlags,
     replyGuard: {
       launchedWithDir: getLaunchedWithDir,
       teardown: (key) => teardownPersonaReplyGuard(STATE_DIR, key),
@@ -3560,6 +3590,9 @@ export async function main(): Promise<void> {
       clientFor,
       destinations: personaDestinations,
       destinationHold: personaDestinationHold,
+      // b.jg5 SRJ-1003: a stuck-prompt warning raised in a persona's teardown
+      // window is written by the notifier's window, never posted.
+      teardownNotices: personaNotifier,
       getPersona: getAppliedPersona,
       // b.av2 SR-6.4: a not-up persona's rows are skipped, its prompts and
       // wedge state held until it is up.

@@ -27,7 +27,10 @@
  * count was above 0, an ended line (with its reason) only when an episode was
  * open, and a failed line per throwing note. Every line carries the persona
  * key only, and `afterEach` asserts no timer is pending and runs
- * `assertNoLeak` over every post and line.
+ * `assertNoLeak` over every post and line. A persona teardown (b.jg5
+ * SRJ-1003): from its submit until its window opens the note at the
+ * threshold reaches no sink and logs the muted line, counting as posted in
+ * its episode; with the window open it posts as usual.
  *
  * What the restart work notes for each reading (an `unknown` re-probe noting
  * nothing included) is in `tests/restart.test.ts`, the health check's call of
@@ -44,6 +47,7 @@ import {
   type PersonaEpisodes,
   type PersonaEpisodeSink,
 } from '../src/persona-episodes.ts'
+import type { PersonaTeardownWindowState } from '../src/persona-notifier.ts'
 import {
   SLOW_RECOVERY_POST_THRESHOLD,
   SLOW_RECOVERY_RESET_HEALTHY,
@@ -59,6 +63,7 @@ import {
   slowRecoveryCountResetLine,
   slowRecoveryEpisodeEndedLine,
   slowRecoveryFailedLine,
+  slowRecoveryNoticeMutedLine,
   slowRecoveryNoticeNotPostedLine,
   slowRecoveryNoticePostedLine,
   slowRecoveryText,
@@ -160,6 +165,7 @@ describe('SRJ-1010\'s text (pin)', () => {
     expect([
       slowRecoveryCountLine('sample', 2),
       slowRecoveryNoticePostedLine('sample', 3),
+      slowRecoveryNoticeMutedLine('sample', 3),
       slowRecoveryNoticeNotPostedLine('sample'),
       slowRecoveryCountResetLine('sample', 2, SLOW_RECOVERY_RESET_ROW_DEAD),
       slowRecoveryEpisodeEndedLine('sample', SLOW_RECOVERY_RESET_LATCHED),
@@ -167,6 +173,7 @@ describe('SRJ-1010\'s text (pin)', () => {
     ]).toEqual([
       "[slack] slow-recovery: persona=sample count 2 of 3 — an escalate-dead verdict's re-probe still reads the row live",
       '[slack] slow-recovery: persona=sample notice posted — 3 consecutive escalate-dead verdicts whose re-probe still reads the row live',
+      '[slack] slow-recovery: persona=sample notice not posted — muted, its persona teardown was submitted; it counts as posted in its episode; 3 consecutive escalate-dead verdicts whose re-probe still reads the row live',
       '[slack] slow-recovery: persona=sample notice not posted — the server is shutting down',
       '[slack] slow-recovery: persona=sample count reset from 2 — its row read ended or missing, or no row was found',
       '[slack] slow-recovery: persona=sample episode ended — the persona latched',
@@ -334,6 +341,54 @@ describe('once per episode (AC 66)', () => {
     expect(tracker.isOpen(P)).toBe(false)
 
     expect(posts).toEqual([notice(P), notice(Q)])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A persona teardown (b.jg5 SRJ-1003)
+// ---------------------------------------------------------------------------
+
+// From a persona teardown's submit until its window opens the episodes post
+// nothing for the key (tests/persona-episodes.test.ts); the tracker's own
+// line then says its notice was muted, and the post still counts in its
+// episode, so the run after it posts nothing more. With the window open the
+// notice goes to the sink (the notifier's window writes it), as posted.
+describe('a persona teardown (b.jg5 SRJ-1003)', () => {
+  let states: Map<string, PersonaTeardownWindowState>
+
+  beforeEach(() => {
+    states = new Map()
+    episodes = createPersonaEpisodes({ sink: record, log: (line) => lines.push(line), clock, teardownWindow: (key) => states.get(key) ?? 'none' })
+    tracker = track()
+  })
+
+  /** The tracker's own lines, without the episodes' muted line. */
+  const trackerLines = (): string[] => takeLines().filter((line) => line.startsWith('[slack] slow-recovery: '))
+
+  test('P\'s teardown submitted: the note at the threshold reaches no sink and logs the muted line, not the posted one; it counts as posted, so later live notes post nothing; Q\'s notice posts as usual', () => {
+    states.set(P, 'submitted')
+
+    expect(live(P, T)).toEqual(RUN_THAT_POSTS)
+    expect(posts).toEqual([])
+    expect(tracker.isOpen(P)).toBe(true)
+    expect(trackerLines()).toEqual([...countLines(P, 1, T), slowRecoveryNoticeMutedLine(P, T)])
+
+    states.delete(P)
+    expect(live(P, T)).toEqual(counted(T))
+    expect(posts).toEqual([])
+
+    expect(live(Q, T)).toEqual(RUN_THAT_POSTS)
+    expect(posts).toEqual([notice(Q)])
+    expect(trackerLines()).toEqual([...countLines(P, T + 1, 2 * T), ...postingRunLines(Q)])
+  })
+
+  test('P\'s teardown window open: the notice goes to the sink and the posted line is logged', () => {
+    states.set(P, 'open')
+
+    expect(live(P, T)).toEqual(RUN_THAT_POSTS)
+
+    expect(posts).toEqual([notice(P)])
+    expect(trackerLines()).toEqual(postingRunLines(P))
   })
 })
 

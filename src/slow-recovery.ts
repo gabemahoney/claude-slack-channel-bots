@@ -59,6 +59,7 @@
  *
  *   [slack] slow-recovery: persona=<key> count <n> of <threshold> — an escalate-dead verdict's re-probe still reads the row live
  *   [slack] slow-recovery: persona=<key> notice posted — <n> consecutive escalate-dead verdicts whose re-probe still reads the row live
+ *   [slack] slow-recovery: persona=<key> notice not posted — muted, its persona teardown was submitted; it counts as posted in its episode; <n> consecutive escalate-dead verdicts whose re-probe still reads the row live
  *   [slack] slow-recovery: persona=<key> notice not posted — the server is shutting down
  *   [slack] slow-recovery: persona=<key> count reset from <n> — <reason>
  *   [slack] slow-recovery: persona=<key> episode ended — <reason>
@@ -68,7 +69,7 @@
  * A note that throws inside (an episodes call) logs `[slack] slow-recovery:
  * persona=<key> failed: <error>` and changes nothing else. Each line has its
  * exported builder (`slowRecoveryCountLine`, `slowRecoveryNoticePostedLine`,
- * `slowRecoveryNoticeNotPostedLine`, `slowRecoveryCountResetLine`,
+ * `slowRecoveryNoticeMutedLine`, `slowRecoveryNoticeNotPostedLine`, `slowRecoveryCountResetLine`,
  * `slowRecoveryEpisodeEndedLine`, `slowRecoveryFailedLine`).
  *
  * No agent-director call, no timer and no Slack client: the post goes only
@@ -80,7 +81,7 @@
  */
 
 import { describeThrownValue } from './persona-connection-errors.ts'
-import { PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY, type PersonaEpisodes } from './persona-episodes.ts'
+import { MUTED_BY_TEARDOWN, PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY, type PersonaEpisodes } from './persona-episodes.ts'
 import { personaTmuxSessionName } from './persona-identity.ts'
 import {
   RESTART_SLOW_RECOVERY_OTHER_PENDING_PROBE,
@@ -151,6 +152,15 @@ export function slowRecoveryCountLine(key: string, count: number): string {
 /** The line for the notice posted for persona `key` at `count` (b.jg5 SRJ-1010). */
 export function slowRecoveryNoticePostedLine(key: string, count: number): string {
   return `${slowRecoveryLineHead(key)} notice posted — ${count} consecutive escalate-dead verdicts whose re-probe still reads the row live`
+}
+
+/**
+ * The line for the notice of persona `key` at `count` that its submitted
+ * persona teardown muted (b.jg5 SRJ-1003): nothing reached Slack, and it
+ * counts as posted in its episode.
+ */
+export function slowRecoveryNoticeMutedLine(key: string, count: number): string {
+  return `${slowRecoveryLineHead(key)} notice not posted — ${MUTED_BY_TEARDOWN}; it counts as posted in its episode; ${count} consecutive escalate-dead verdicts whose re-probe still reads the row live`
 }
 
 /** The line for a notice not posted for persona `key` because the episodes are closed (shutdown). */
@@ -260,8 +270,11 @@ export function createSlowRecoveryTracker(deps: SlowRecoveryTrackerDeps): SlowRe
             log(slowRecoveryNoticeNotPostedLine(key))
             return 'closed'
           }
+          // b.jg5 SRJ-1003: read before the post, which a submitted teardown
+          // mutes (the episode still counts it as posted).
+          const muted = episodes.teardownWindowState(key) === 'submitted'
           if (!episodes.post(key, kind, slowRecoveryText(key))) return 'counted'
-          log(slowRecoveryNoticePostedLine(key, count))
+          log(muted ? slowRecoveryNoticeMutedLine(key, count) : slowRecoveryNoticePostedLine(key, count))
           return 'posted'
         },
         'counted',

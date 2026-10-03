@@ -393,11 +393,14 @@ import {
 } from './invalid-flags-hold.ts'
 import {
   KILL_OUTCOME_NOT_KILLED,
+  KILL_REFUSAL_AT_KILL,
+  KILL_REFUSAL_AT_READ,
   checkedKill,
   describeKillOutcome,
   killLetsNextStepRun,
   killOutcomeStopsServer,
   type KillOutcome,
+  type KillRefusal,
 } from './checked-kill.ts'
 import {
   KILL_FAILURE_CONTEXT_RECOVERY,
@@ -7628,6 +7631,31 @@ function personaKillKeepsGoing(key: string): boolean {
   }
 }
 
+/** The stop cause of a persona's kill retry when the server's keep-going query cannot tell which one answered false. */
+export const PERSONA_KILL_STOP_CAUSE_GENERIC =
+  'its keep-going check answered false: the persona is torn down or not up, or the server is shutting down'
+
+/**
+ * Why persona `key`'s kill retry was stopped, as far as the server's
+ * keep-going query tells now (b.jg5 SRJ-702: the stop's cause): the server
+ * is shutting down, or the persona is not up (torn down, or no longer
+ * serving); otherwise, a query that throws, or none installed, the generic
+ * cause (`PERSONA_KILL_STOP_CAUSE_GENERIC`). Read when the alert is raised,
+ * right after the tries. A caller that knows its own cause (the live-row
+ * sequence's stop) passes it instead. Never throws.
+ */
+function personaKillStopCause(key: string): string {
+  const query = personaKillKeepGoingQuery
+  if (query === undefined) return PERSONA_KILL_STOP_CAUSE_GENERIC
+  try {
+    if (query.isShuttingDown() === true) return 'its keep-going check answered false: the server is shutting down'
+    if (query.isPersonaUp(key) !== true) return 'its keep-going check answered false: the persona is torn down or not up'
+  } catch {
+    /* the generic cause below */
+  }
+  return PERSONA_KILL_STOP_CAUSE_GENERIC
+}
+
 /** What `retryPersonaKill` is given. */
 export interface PersonaKillRetryOptions {
   /** True when the path read the row in a live state: each try is a tmux-touching kill (`AdKillCall`). */
@@ -7745,15 +7773,20 @@ function callerKeepsGoing(options: PersonaKillRetryOptions): boolean {
  * tries the keep-going check stopped while the persona is not latched (it
  * is torn down or not up, or the server is shutting down), or whose last
  * outcome's version re-check decided that the server stops, is raised with
- * `stopped`: no retry follows, so for a configured persona the alerts post
- * nothing (their text would say CSCB keeps retrying) and open no episode,
- * and write one line with the decision and the redacted descriptions, and,
- * when the decision carries an earlier survivor-naming description (whose
- * failure is the only report of the surviving process), one
- * `persona-kill-failed` entry with the log-only closing sentence and the
- * `recovery` context through the log-only route; for a
+ * `stopped`, the last outcome's class and the stop's cause (`stopCause` when
+ * the caller knows it, as the live-row sequence does for its own stop;
+ * otherwise what the server's keep-going query tells now: the server is
+ * shutting down, or the persona is torn down or not up, with the generic
+ * `PERSONA_KILL_STOP_CAUSE_GENERIC` when it cannot tell; for a version
+ * re-check's stop, that): it is no notice
+ * (b.jg5 SRJ-702, SRJ-1003, SRJ-1013), inside a teardown window or not, so
+ * the alerts post nothing, raise neither version, open no episode and write
+ * one line naming the persona, the context, that class, that cause and the
+ * redacted descriptions (the latest survivor-naming one included); for a
  * persona no longer in the applied configuration (one removed while the
- * tries ran) the not-configured route's entry is written as usual. With no
+ * tries ran) they also write that line's content as one
+ * `persona-kill-failed` entry, with no alert text, and for a configured
+ * persona the line only. With no
  * alerts installed, one line carries the decision instead. A `none`
  * decision does nothing. Never throws.
  *
@@ -7768,19 +7801,29 @@ export function raisePersonaKillFailureAlert(
   ref: string,
   context: KillFailureAlertContext = KILL_FAILURE_CONTEXT_RECOVERY,
   alerts: KillFailureAlerts | undefined = killFailureAlerts,
+  stopCause?: string,
 ): void {
   try {
     const decision = retried.alert
     if (decision.kind === KILL_RETRY_ALERT_NONE) return
     const latched = retried.end === KILL_RETRY_END_READ_LATCHED || personaLatchedNow(key)
-    const stopped = killOutcomeStopsServer(retried.outcome) || (retried.end === KILL_RETRY_END_STOPPED && !latched)
+    const stopsServer = killOutcomeStopsServer(retried.outcome)
+    const stopped = stopsServer || (retried.end === KILL_RETRY_END_STOPPED && !latched)
     if (alerts === undefined) {
       console.error(
         `[slack] ${site}: kill for ${ref}: the kill-failure alert's ${decision.kind} version is not raised — no kill-failure alerts are installed; ${describeKillFailureDescriptions(decision)} (b.jg5 SRJ-704)`,
       )
       return
     }
-    alerts.raise({ key, decision, latched, stopped, context })
+    const { outcome } = retried
+    // b.jg5 SRJ-702: a stopped retry's one line names the last outcome's class and the stop's cause.
+    const stop = stopped
+      ? {
+          lastOutcomeClass: outcome.kind === KILL_OUTCOME_NOT_KILLED ? outcome.errorClass : outcome.kind,
+          stopCause: stopsServer ? "the last outcome's version re-check stops the server" : (stopCause ?? personaKillStopCause(key)),
+        }
+      : {}
+    alerts.raise({ key, decision, latched, stopped, context, ...stop })
   } catch (err) {
     console.error(`[slack] ${site}: kill for ${ref}: raising the kill-failure alert failed: ${describeThrownValue(err)}`)
   }
@@ -7805,23 +7848,19 @@ async function readPersonaKillRow(key: string, site: string, ref: string): Promi
 // The persona teardown's kill (b.jg5 SRJ-715, SRJ-110, SRJ-702)
 // ---------------------------------------------------------------------------
 
-/** A CONFLICT or an UNUSABLE NAME answer the teardown's kill met at one of its tries. */
-export const TEARDOWN_KILL_REFUSAL_AT_KILL = 'kill'
-/** A CONFLICT or an UNUSABLE NAME answer the teardown's kill met at a `status` read between its tries. */
-export const TEARDOWN_KILL_REFUSAL_AT_READ = 'status read'
+/** A CONFLICT or an UNUSABLE NAME answer the teardown's kill met at one of its tries (`KILL_REFUSAL_AT_KILL`, `src/checked-kill.ts`). */
+export const TEARDOWN_KILL_REFUSAL_AT_KILL = KILL_REFUSAL_AT_KILL
+/** A CONFLICT or an UNUSABLE NAME answer the teardown's kill met at a `status` read between its tries (`KILL_REFUSAL_AT_READ`). */
+export const TEARDOWN_KILL_REFUSAL_AT_READ = KILL_REFUSAL_AT_READ
 
 /**
  * One CONFLICT or UNUSABLE NAME answer the persona teardown's kill met (b.jg5
  * SRJ-715, SRJ-1002, SRJ-1003): where, its class (by name, through
  * `src/ad-error-class.ts`) and the thrown value, raw, for the teardown's own
- * routing. Nothing latched on it.
+ * routing. Nothing latched on it. The shape is `KillRefusal`
+ * (`src/checked-kill.ts`), whose notice builder the teardown uses.
  */
-export interface PersonaTeardownKillRefusal {
-  readonly at: typeof TEARDOWN_KILL_REFUSAL_AT_KILL | typeof TEARDOWN_KILL_REFUSAL_AT_READ
-  readonly errorClass: typeof AD_ERROR_CLASS_CONFLICT | typeof AD_ERROR_CLASS_UNUSABLE_NAME
-  /** The thrown value. Never logged raw. */
-  readonly error: unknown
-}
+export type PersonaTeardownKillRefusal = KillRefusal
 
 /**
  * What the persona teardown's kill answers: the bounded retry's result (the
@@ -11778,8 +11817,8 @@ export function buildLiveRowSequenceDeps(input: LiveRowSequenceDepsInput): LiveR
       }),
     latchOnKillOutcome: (key, outcome, lastRead, ref) =>
       latchOnKillOutcomeAt(key, outcome, LIVE_ROW_SEQUENCE_SITE, ref, latchRowStateOfSequenceRead(lastRead)),
-    raiseKillAlert: (key, retried, context, ref) =>
-      raisePersonaKillFailureAlert(key, retried, LIVE_ROW_SEQUENCE_SITE, ref, context, input.killFailureAlerts),
+    raiseKillAlert: (key, retried, context, ref, stopCause) =>
+      raisePersonaKillFailureAlert(key, retried, LIVE_ROW_SEQUENCE_SITE, ref, context, input.killFailureAlerts, stopCause),
     raiseEscalationAlert: (key, context, ref) => raiseSequenceEscalationAlert(key, context, ref, input.killFailureAlerts),
     personaFacts: (key, row) => {
       const found = applied(key)

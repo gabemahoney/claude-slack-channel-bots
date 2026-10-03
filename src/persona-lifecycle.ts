@@ -14,7 +14,26 @@
  *   key was recorded as retired in apply step 1 (b.jg5 SRJ-803), which also
  *   stopped its dialog approver (SRJ-808), so the row is the key's old life
  *   and is never resumed. It serves a removed persona and the old half of a
- *   destructive modify alike. In order:
+ *   destructive modify alike. When it is submitted, before its serializer
+ *   turn, it registers with the notifier (`submitTeardown`): from then until
+ *   it completes the key's notice episodes post nothing to Slack (b.jg5
+ *   SRJ-1003), so an old half's `tmux-unresponsive` onset, alert or recovery
+ *   never reaches its new half's destination. At the start of its turn, with
+ *   nothing awaited before them, its outage flags are forgotten silently (a
+ *   flag raised before the teardown posts no all-clear) and its notice
+ *   window opens (`openTeardownWindow`, b.jg5 SRJ-1003): from there until it
+ *   completes, every notice raised for its key (an outage onset from its
+ *   calls or from the launch in flight it waits for, a latch's or an
+ *   `ErrInvalidFlags` hold's notice that launch raises, an unclassified
+ *   alert, a kill-failure alert, a CONFLICT or UNUSABLE NAME met by its
+ *   kill) is a server-log line and a startup-errors entry naming the persona
+ *   and "raised during its teardown" (`persona-teardown-notice`, or
+ *   `persona-kill-survivor` for the kill-failure alert's survivor version),
+ *   never a Slack post to the old or the new half's destination, and is never
+ *   dropped. A flag raised in the window is kept past the teardown, and its
+ *   all-clear, whenever it comes, is written the same way (b.jg5 SRJ-1002).
+ *   The window closes, and the submit ends, when the teardown completes,
+ *   whatever a step throws. In order, inside the window:
  *   1. first, before the wait for its launch in flight (b.jg5 SRJ-715): its
  *      dialog approver is stopped (b.jg5 SRJ-404), when the teardown is
  *      submitted and again as its first step; the stop also cancels the
@@ -51,7 +70,9 @@
  *   5. its Slack connection is stopped (so no further event arrives for it),
  *      then its inbound dedupe store and its ack-tracker entries are dropped;
  *   6. its cached DM destination is forgotten, its held destination notices
- *      are cancelled, and its pre-validation held notices dropped;
+ *      are cancelled, and its pre-validation held notices dropped
+ *      (`notifier.forget`, with its one line): only notices held before the
+ *      window opened, since a notice raised in it is written, never held;
  *   7. its tracked permission prompts and wedge state are dropped (their
  *      Slack messages stay as posted);
  *   8. its registered MCP session is dropped, the registry entry before the
@@ -72,24 +93,33 @@
  *      a survivor-naming one, the survivor version for a success after a
  *      survivor-naming failure) is raised with the context 'persona
  *      teardown' (b.jg5 SRJ-704: the server log and a startup-errors entry,
- *      never Slack). Either way the row is kept: a destructive modify's new
- *      half replaces it only through the live-row sequence once a later kill
- *      succeeds (b.jg5 SRJ-805). Its outage flags are forgotten before the
- *      kill (so a success posts no all-clear) and again after it (so a flag
- *      a failing call raised does not survive). Then its UNAVAILABLE retry
- *      timer is stopped once more, and its restart failure count,
- *      health-check streak and not-connected episode (b.f2b: its notice
- *      latch and the restart path's idle evidence) are forgotten, and its
- *      latch once more, silently (b.jg5 SRJ-715). No recovery notice is
- *      posted, no clear is logged, and nothing is retried;
+ *      never Slack). Each CONFLICT or UNUSABLE NAME answer the kill met, at
+ *      a try or at a `status` read between its tries, latches nothing and is
+ *      raised as one notice through the notifier, which the window writes:
+ *      the kill outcome's one-line rendering with the instance id
+ *      (`teardownKillRefusalNoticeText`), with no hold sentence (b.jg5
+ *      SRJ-1003, SRJ-1002). A standing non-success that no other notice
+ *      records (no kill-failure alert, no CONFLICT or UNUSABLE NAME notice
+ *      from a try, no outage onset written for it: `outageFlags`) is raised
+ *      as one notice too (`teardownKillNotSucceededNoticeText`), so the
+ *      window writes it (b.jg5 SRJ-110). Either way the row is kept: a destructive
+ *      modify's new half replaces it only through the live-row sequence once
+ *      a later kill succeeds (b.jg5 SRJ-805). An outage flag the kill raises
+ *      is kept (its onset was written in the window; b.jg5 SRJ-1002). Then
+ *      its UNAVAILABLE retry timer is stopped once more, and its restart
+ *      failure count, health-check streak and not-connected episode (b.f2b:
+ *      its notice latch and the restart path's idle evidence) are forgotten,
+ *      and its latch once more, silently (b.jg5 SRJ-715). No recovery
+ *      notice is posted, no clear is logged, and nothing is retried;
  *   10. its reply-guard record is deleted and its launched-with directory
  *      forgotten (read first), then the Stop-hook launch pass re-evaluates
  *      the persona's configured and launched-with directories against the
  *      personas still applied.
  *   A removed persona has already left the applied set (apply step 1), so
- *   every launch, restart and retry path refuses it, and a notice raised for
- *   it during the teardown (an outage onset from a failing kill) is dropped
- *   by the notifier, never posted or held. The old half of a destructive
+ *   every launch, restart and retry path refuses it; a notice raised for it
+ *   between apply step 1 and the teardown's turn is dropped by the
+ *   notifier's rule for a key no longer applied, and one raised in the
+ *   window is written as above. The old half of a destructive
  *   modify (SR-8.6: a `credentials_file` path or `working_directory` change)
  *   keeps its key applied until step 6 brings its new declaration up, so the
  *   applied-set guard does not refuse it. Instead:
@@ -102,14 +132,15 @@
  *     teardown to kill it; from then until step 6 the relaunch gate and
  *     the up predicate answer not up for it, so no restart, retry or launch
  *     path starts it;
- *   - notices raised during its teardown are held for a persona with no
- *     client, so they are dropped again once its agent-director calls are
- *     done, and none reaches its new half's destination.
+ *   - a notice raised for it between the submit and the turn routes as any
+ *     configured persona's, its notice episodes' posts excepted (muted from
+ *     the submit); one raised in the window is written, never posted, so
+ *     none reaches its new half's destination.
  *   Each step's failure is logged and the remaining steps still run. Nothing
- *   is posted to Slack; the kill-failure alert, when the kill's retry calls
- *   for one, is written to the server log and a startup-errors entry. Dry
- *   run: every step runs but the kill, which is skipped with one line, so no
- *   agent-director call is made.
+ *   is posted to Slack; every notice raised in the window, the kill-failure
+ *   alert included, is written to the server log and a startup-errors entry.
+ *   Dry run: every step runs but the kill, which is skipped with one line,
+ *   so no agent-director call is made; the window routes as in a live run.
  *
  * - **apply bring-up** (SR-6.1, SR-6.2, apply step 6): the start procedure
  *   for one added persona: the non-persistent-storage check for its
@@ -208,6 +239,9 @@
  *   [slack] persona teardown of "<name>" (key=<key>): agent-director kill of cscb_<key>: <outcome> after <n> kill(s); the row is kept (b.jg5 SRJ-715)
  *   [slack] persona teardown of "<name>" (key=<key>): agent-director kill of cscb_<key> failed: <outcome> after <n> kill(s) — the row is kept; nothing latches and no retry timer is armed (b.jg5 SRJ-715, SRJ-110)
  *   [slack] persona teardown of "<name>" (key=<key>): agent-director kill of cscb_<key> failed: it answered no kill outcome — the row is kept (b.jg5 SRJ-715)
+ *   [slack] persona teardown of "<name>" (key=<key>): no notifier route is installed for the notice: <notice text>
+ *   [slack] persona teardown of "<name>" (key=<key>): registering its submit failed: <thrown value>
+ *   [slack] persona teardown of "<name>" (key=<key>): ending its submit failed: <thrown value>
  *   [slack] dry-run: persona teardown of "<name>" (key=<key>): skipping the agent-director kill of cscb_<key>; the row is kept
  *   [slack] persona "<name>" (key=<key>): up at apply — launching
  *   [slack] persona "<name>" (key=<key>): launch at apply failed: <thrown value>
@@ -246,7 +280,23 @@
 
 import type { MakeTemplateParams } from 'agent-director'
 import { refreshSlackChannelBotTemplate, type TemplateRefreshResult } from './agent-director-template.ts'
-import { describeKillOutcome, isKillOutcome, killLetsNextStepRun } from './checked-kill.ts'
+import {
+  AD_ERROR_CLASS_CONFIG,
+  AD_ERROR_CLASS_CONFLICT,
+  AD_ERROR_CLASS_ENVIRONMENT,
+  AD_ERROR_CLASS_UNUSABLE_NAME,
+  hasAdErrorName,
+} from './ad-error-class.ts'
+import { ERR_SYSTEM_INSTALL_DISAPPEARED_NAME } from './agent-director-errors.ts'
+import {
+  KILL_REFUSAL_AT_KILL,
+  describeKillOutcome,
+  isKillOutcome,
+  killLetsNextStepRun,
+  teardownKillNotSucceededNoticeText,
+  teardownKillRefusalNoticeText,
+  type KillFailure,
+} from './checked-kill.ts'
 import type { Persona, PersonaConfig } from './config.ts'
 import {
   KILL_RETRY_ALERT_NONE,
@@ -271,7 +321,7 @@ import type { PersonaRouting } from './persona-routing.ts'
 import type { PersonaSerialize } from './persona-serializer.ts'
 import type { ApplyBringUpOptions, InPlaceApplyInput } from './reload-apply.ts'
 import type { InPlaceSetting } from './reload-plan.ts'
-import type { PersonaTeardownKillResult } from './session-manager.ts'
+import type { PersonaTeardownKillRefusal, PersonaTeardownKillResult } from './session-manager.ts'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -315,8 +365,20 @@ export interface PersonaLifecycleDeps {
   destinations: Pick<PersonaDestinations, 'forget'>
   /** The shared destination hold: a removed persona's held notices and retry are cancelled. */
   destinationHold: Pick<PersonaDestinationHold, 'cancel'>
-  /** The notifier: a removed persona's pre-validation held notices are dropped. */
-  notifier: Pick<PersonaNotifier, 'forget'>
+  /**
+   * The notifier: a torn-down persona's pre-validation held notices are
+   * dropped (`forget`), and its teardown window (b.jg5 SRJ-1003) is
+   * registered at the submit (`submitTeardown`, ended by `settleTeardown`),
+   * opened at the start of its serializer turn (`openTeardownWindow`) and
+   * closed when it completes (`closeTeardownWindow`), whatever a step throws.
+   * A CONFLICT or UNUSABLE NAME met by its kill, and a standing non-success
+   * of its kill that no other notice records, is raised through `notify`,
+   * which the open window writes. The window entries and `notify` are
+   * optional, so hand-built fixtures stay valid; production passes the one
+   * notifier.
+   */
+  notifier: Pick<PersonaNotifier, 'forget'> &
+    Partial<Pick<PersonaNotifier, 'notify' | 'submitTeardown' | 'settleTeardown' | 'openTeardownWindow' | 'closeTeardownWindow'>>
   /**
    * The persona set applied now (the server's `personaConfig`), read at each
    * use: the teardown's Stop-hook pass, whether a teardown's key is still
@@ -426,7 +488,12 @@ export interface PersonaLifecycleDeps {
    * unheld.
    */
   forgetInvalidFlagsHold: (key: string) => unknown
-  /** Forget the keys' outage flags silently (`resetAllToHealthy`). */
+  /**
+   * Forget the keys' outage flags silently (`resetAllToHealthy`): once per
+   * teardown, right before its notice window opens, so a flag raised before
+   * the teardown posts no all-clear and every flag raised in the window
+   * survives it, its all-clear routed as its onset was (b.jg5 SRJ-1002).
+   */
   resetOutageState: (keys: string[]) => void
   /** Drop the key's tracked permission prompts and wedge state (`forgetPersonaPrompts`). */
   forgetPersonaPrompts: (key: string) => unknown
@@ -463,6 +530,18 @@ export interface PersonaLifecycleDeps {
    * step and is logged.
    */
   raiseKillFailureAlert: (key: string, decision: KillRetryAlert) => unknown
+  /**
+   * The key's raised outage classes now (production: `getOutageFlags`,
+   * `src/outage-state.ts`), read once after the teardown's kill: the outage
+   * state was reset right before the window opened, so a class raised now
+   * had its onset written in the window, and a standing ENVIRONMENT, CONFIG
+   * or `ErrSystemInstallDisappeared` outcome whose outage is raised needs no
+   * notice of its own (b.jg5 SRJ-110, SRJ-1003). Optional, so hand-built
+   * fixtures stay valid: absent, an ENVIRONMENT or CONFIG outcome counts as
+   * raised while the key is applied (the kill's own rule), and
+   * `ErrSystemInstallDisappeared` always. A throw counts as none raised.
+   */
+  outageFlags?: (key: string) => ReadonlySet<string>
   /** The reply-guard helpers, the state directory bound. */
   replyGuard: PersonaTeardownReplyGuard
 
@@ -597,6 +676,54 @@ function raisableKillFailureAlertOf(killed: unknown, malformed: (what: string) =
   return undefined
 }
 
+/**
+ * The notice builders for the teardown kill's outcome live beside
+ * `describeKillOutcome` in `src/checked-kill.ts`, so an old-life wait's entry
+ * can use them with no lifecycle module (b.jg5 SRJ-1003, SRJ-811); they are
+ * re-exported here for the callers that import them from this module.
+ */
+export { teardownKillNotSucceededNoticeText, teardownKillRefusalNoticeText }
+
+/**
+ * The outage a teardown kill's standing non-success raises when its persona
+ * is in the applied configuration (b.jg5 SRJ-110, SRJ-311, SRJ-316): an
+ * ENVIRONMENT answer `tmux-unavailable`, a CONFIG answer
+ * `ad-config-malformed`; `ErrSystemInstallDisappeared` (by name) raises
+ * `ad-unreachable` whatever the configuration. Undefined for every other
+ * outcome, which raises no outage. Never throws.
+ */
+function teardownKillOutageClassOf(outcome: KillFailure): string | undefined {
+  try {
+    if (outcome.errorClass === AD_ERROR_CLASS_ENVIRONMENT) return 'tmux-unavailable'
+    if (outcome.errorClass === AD_ERROR_CLASS_CONFIG) return 'ad-config-malformed'
+    if (hasAdErrorName(outcome.error, ERR_SYSTEM_INSTALL_DISAPPEARED_NAME)) return 'ad-unreachable'
+  } catch {
+    /* an unreadable value raises no outage */
+  }
+  return undefined
+}
+
+/**
+ * The CONFLICT and UNUSABLE NAME answers the teardown's kill reported
+ * (`PersonaTeardownKillResult.refusals`), each well formed; an answer with no
+ * list, or entries of another shape, gives none of those. Never throws.
+ */
+function teardownKillRefusalsOf(killed: unknown): PersonaTeardownKillRefusal[] {
+  try {
+    const refusals: unknown = (killed as { refusals?: unknown } | null | undefined)?.refusals
+    if (!Array.isArray(refusals)) return []
+    return refusals.filter(
+      (refusal): refusal is PersonaTeardownKillRefusal =>
+        typeof refusal === 'object' &&
+        refusal !== null &&
+        (refusal.errorClass === AD_ERROR_CLASS_CONFLICT || refusal.errorClass === AD_ERROR_CLASS_UNUSABLE_NAME) &&
+        (refusal.at === 'kill' || refusal.at === 'status read'),
+    )
+  } catch {
+    return []
+  }
+}
+
 /** Compose the persona teardown, the apply bring-up (and recovery), the credentials change and the in-place update. Creates, reads and schedules nothing. */
 export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifecycle {
   function log(line: string): void {
@@ -616,9 +743,58 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     }
   }
 
+  /**
+   * Whether the teardown kill's standing non-success `outcome` had its
+   * outage's onset written in the window (b.jg5 SRJ-110, SRJ-1002): its
+   * outage class (`teardownKillOutageClassOf`) is raised for the key now
+   * (`outageFlags`), or, with no reader, would be by the kill's own rule.
+   * Never throws.
+   */
+  function teardownKillOutageWritten(key: string, outcome: KillFailure): boolean {
+    const cls = teardownKillOutageClassOf(outcome)
+    if (cls === undefined) return false
+    if (deps.outageFlags === undefined) return cls === 'ad-unreachable' || isApplied(key)
+    try {
+      return deps.outageFlags(key).has(cls)
+    } catch {
+      return false
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Persona teardown (b.av2 SR-6.5)
   // -------------------------------------------------------------------------
+
+  /**
+   * Register the teardown's submit with the notifier (b.jg5 SRJ-1003), so
+   * from now until the teardown completes the key's notice episodes post
+   * nothing to Slack. Answers its end, which acts once however often it is
+   * called (the teardown's completion, and the serializer's settling for a
+   * turn that never ran) and answers false only when that one act failed
+   * (logged), so the teardown can count it as a failed step. Never throws.
+   */
+  function submitTeardown(persona: Persona): () => boolean {
+    const { key } = persona
+    const prefix = `[slack] persona teardown of ${renderPersonaRef(persona.name, key)}`
+    try {
+      deps.notifier.submitTeardown?.(key)
+    } catch (err) {
+      log(`${prefix}: registering its submit failed: ${describeThrownValue(err)}`)
+      return () => true
+    }
+    let settled = false
+    return () => {
+      if (settled) return true
+      settled = true
+      try {
+        deps.notifier.settleTeardown?.(key)
+        return true
+      } catch (err) {
+        log(`${prefix}: ending its submit failed: ${describeThrownValue(err)}`)
+        return false
+      }
+    }
+  }
 
   /**
    * Run when a teardown is submitted, before its serializer turn. For every
@@ -667,10 +843,12 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     }
   }
 
-  async function runTeardown(persona: Persona): Promise<void> {
+  async function runTeardown(persona: Persona, settle: () => boolean): Promise<void> {
     const { key } = persona
     const prefix = `[slack] persona teardown of ${renderPersonaRef(persona.name, key)}`
     let failed = 0
+    /** A synchronous step's returned promise, settled (its rejection counted) before the complete line. */
+    const pendingSteps: Promise<void>[] = []
 
     /** Run one step; a throw or rejection is logged and the next step still runs. */
     async function step(what: string, body: () => unknown): Promise<void> {
@@ -682,7 +860,62 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
       }
     }
 
+    /**
+     * Run one step synchronously, awaiting nothing before the next step; a
+     * throw is logged and the next step still runs. A returned promise is
+     * not waited for here: it is settled before the complete line, and its
+     * rejection is logged and counted then.
+     */
+    function syncStep(what: string, body: () => unknown): void {
+      const fail = (err: unknown): void => {
+        failed++
+        log(`${prefix}: ${what} failed: ${describeThrownValue(err)}`)
+      }
+      try {
+        const pending = body()
+        if (pending instanceof Promise) pendingSteps.push(pending.then(() => undefined, fail))
+      } catch (err) {
+        fail(err)
+      }
+    }
+
     log(`${prefix}: starting`)
+
+    // b.jg5 SRJ-1002, SRJ-1003: a clean outage slate, then the notice window,
+    // with nothing awaited between them or before them: a flag raised before
+    // the teardown goes silently (no all-clear), and every notice raised from
+    // here until the teardown completes is written, never posted or dropped;
+    // the window keeps an onset's outage marked, so its flag is not reset
+    // again and its all-clear, whenever it comes, is written as the onset was.
+    syncStep('forgetting its outage state', () => deps.resetOutageState([key]))
+    syncStep('opening its notice window', () => deps.notifier.openTeardownWindow?.(persona))
+    try {
+      await runTeardownSteps(persona, prefix, step, () => {
+        failed++
+      })
+    } finally {
+      syncStep('closing its notice window', () => deps.notifier.closeTeardownWindow?.(key))
+      // Its end logs its own failure; counted here as a failed step.
+      if (!settle()) failed++
+    }
+
+    // Every failed step is counted before the complete line, which is last.
+    if (pendingSteps.length > 0) await Promise.all(pendingSteps)
+    log(failed === 0 ? `${prefix}: complete` : `${prefix}: complete, with ${failed} failed step(s)`)
+  }
+
+  /**
+   * The teardown's steps inside its notice window (b.jg5 SRJ-715 order).
+   * `step` runs one step, counting and logging its failure; `fail` counts a
+   * failure a step's body logged itself.
+   */
+  async function runTeardownSteps(
+    persona: Persona,
+    prefix: string,
+    step: (what: string, body: () => unknown) => Promise<void>,
+    fail: () => void,
+  ): Promise<void> {
+    const { key } = persona
 
     // b.jg5 SRJ-715, first group, before the wait for its launch in flight.
     // b.jg5 SRJ-404: its dialog approver first, so no Enter reaches the old
@@ -732,8 +965,10 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     // schedules no restart.
     await step('dropping its MCP session', () => deps.dropSession(key))
 
-    // A clean slate first, so a successful call clears no flag and posts no all-clear.
-    await step('forgetting its outage state', () => deps.resetOutageState([key]))
+    // The outage state was reset right before the window opened, so a flag
+    // raised before the teardown posts no all-clear at a successful kill; a
+    // flag raised in the window (by the launch in flight or by the kill) is
+    // kept, its all-clear written as its onset was (b.jg5 SRJ-1002).
     const instanceId = personaInstanceId(key)
     if (deps.dryRun) {
       log(`[slack] dry-run: persona teardown of ${renderPersonaRef(persona.name, key)}: skipping the agent-director kill of ${instanceId}; the row is kept`)
@@ -741,12 +976,17 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
       // b.jg5 SRJ-715, SRJ-110, SRJ-702: the kill with the bounded retry, its
       // result checked. A non-success fails this step; nothing latches and no
       // retry timer is armed. Either way the row is kept: nothing deletes it.
-      const decided: { alert?: KillRetryAlert } = {}
+      const decided: {
+        alert?: KillRetryAlert
+        refusals: PersonaTeardownKillRefusal[]
+        failure?: { outcome: KillFailure; tries: number }
+      } = { refusals: [] }
       await step(`agent-director kill of ${instanceId}`, async () => {
         const killed = await deps.killInstance(key)
+        decided.refusals = teardownKillRefusalsOf(killed)
         const outcome: unknown = (killed as Partial<PersonaTeardownKillResult> | undefined)?.outcome
         if (!isKillOutcome(outcome)) {
-          failed++
+          fail()
           log(`${prefix}: agent-director kill of ${instanceId} failed: it answered no kill outcome — the row is kept (b.jg5 SRJ-715)`)
           return
         }
@@ -758,7 +998,8 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
           log(`${prefix}: agent-director kill of ${instanceId}: ${describeKillOutcome(outcome)} ${tries}; the row is kept (b.jg5 SRJ-715)`)
           return
         }
-        failed++
+        fail()
+        decided.failure = { outcome, tries: killed.tries }
         log(
           `${prefix}: agent-director kill of ${instanceId} failed: ${describeKillOutcome(outcome)} ${tries} — ` +
             'the row is kept; nothing latches and no retry timer is armed (b.jg5 SRJ-715, SRJ-110)',
@@ -769,22 +1010,53 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
       // entry, never Slack). Only a well-formed survivor or ordinary decision
       // gets here (`raisableKillFailureAlertOf`), so nothing outside a step
       // can throw.
+      // b.jg5 SRJ-1003, SRJ-1002, SRJ-715: each CONFLICT or UNUSABLE NAME
+      // answer the kill met, at a try or at a status read between its tries,
+      // is one notice for the key, which the open window writes (a server-log
+      // line and a persona-teardown-notice entry, never Slack). Nothing
+      // latched on it.
+      for (const refusal of decided.refusals) {
+        await step(`raising the notice for the ${refusal.errorClass} its kill met`, () => {
+          const text = teardownKillRefusalNoticeText(instanceId, refusal)
+          if (deps.notifier.notify === undefined) {
+            log(`${prefix}: no notifier route is installed for the notice: ${text}`)
+            return undefined
+          }
+          return deps.notifier.notify(key, text)
+        })
+      }
+      // b.jg5 SRJ-110, SRJ-1003: a standing non-success is recorded. When no
+      // other notice of the window records it (no kill-failure alert, no
+      // refusal notice from a try, no outage onset written for it: an
+      // ENVIRONMENT or CONFIG answer for a removed persona, an UNAVAILABLE
+      // value other than ErrTmuxKillFailed, an UNCLASSIFIED value), it is
+      // raised as one notice, which the open window writes. Nothing latches
+      // and nothing is armed on it.
+      const failure = decided.failure
+      if (
+        failure !== undefined &&
+        decided.alert === undefined &&
+        !decided.refusals.some((refusal) => refusal.at === KILL_REFUSAL_AT_KILL) &&
+        !teardownKillOutageWritten(key, failure.outcome)
+      ) {
+        await step("raising the notice for its kill's outcome", () => {
+          const text = teardownKillNotSucceededNoticeText(instanceId, failure.outcome, failure.tries)
+          if (deps.notifier.notify === undefined) {
+            log(`${prefix}: no notifier route is installed for the notice: ${text}`)
+            return undefined
+          }
+          return deps.notifier.notify(key, text)
+        })
+      }
       const decision = decided.alert
       if (decision !== undefined) {
         await step('raising the kill-failure alert', () => deps.raiseKillFailureAlert(key, decision))
       }
     }
-    // After the kill: a flag a failing call raised goes too.
-    await step('forgetting its outage state', () => deps.resetOutageState([key]))
     // The kill arms no retry timer (b.jg5 SRJ-110); a destructive modify's
     // key stays applied, so a timer left armed would retry against the new
     // half: stopping it once more leaves none.
     await step(TEARDOWN_RETRY_TIMER_STOP_AFTER_KILL_STEP, () => deps.stopRetryTimer(key))
-    // The old half of a destructive modify is still applied, so a notice
-    // raised during this teardown (an outage onset from a failing kill) was
-    // held for it rather than dropped: drop it again, so it never reaches the
-    // destination of its new half once that is up.
-    if (isApplied(key)) await step('dropping the notices held during its teardown', () => deps.notifier.forget(key))
     await step('forgetting its restart failure count', () => deps.forgetFailures(key))
     await step('forgetting its health-check streak', () => deps.forgetDisconnectedStreak(key))
     await step('forgetting its not-connected episode', () => deps.forgetNotConnectedEpisode?.(key))
@@ -800,8 +1072,6 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     await step('re-evaluating the Stop hook in its config directories', () =>
       deps.replyGuard.launchPass([persona.claude_config_dir, launchedWith], deps.appliedPersonas()),
     )
-
-    log(failed === 0 ? `${prefix}: complete` : `${prefix}: complete, with ${failed} failed step(s)`)
   }
 
   // -------------------------------------------------------------------------
@@ -989,8 +1259,9 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
 
   return {
     teardown: (persona) => {
+      const settle = submitTeardown(persona)
       cancelBeforeTurn(persona)
-      return deps.serialize(persona.key, () => runTeardown(persona))
+      return deps.serialize(persona.key, () => runTeardown(persona, settle)).finally(settle)
     },
     bringUp: (persona, applied, options) => deps.serialize(persona.key, () => runBringUp(persona, applied, options)),
     reconnectCredentials: (persona, applied) => deps.serialize(persona.key, () => runReconnectCredentials(persona, applied)),

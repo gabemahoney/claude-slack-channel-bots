@@ -11,12 +11,18 @@
  * (tests/outage-state.test.ts) and the unclassified-error alert's quoted
  * message in src/persona-episodes.ts (tests/persona-episodes.test.ts).
  *
+ * `unescapeSlackControlCharacters` undoes it: `&lt;` → `<`, `&gt;` → `>`,
+ * then `&amp;` → `&` (last, so `&amp;lt;` becomes `&lt;`); nothing else
+ * changes, and escaping then unescaping gives the text back. Its caller, the
+ * persona teardown window's entry and line, is covered in
+ * tests/persona-notifier.test.ts.
+ *
  * SPDX-License-Identifier: MIT
  */
 
 import { describe, expect, test } from 'bun:test'
 
-import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
+import { escapeSlackControlCharacters, unescapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 
 describe('escapeSlackControlCharacters', () => {
   test.each([
@@ -46,5 +52,35 @@ describe('escapeSlackControlCharacters', () => {
     expect(once).toBe('&lt;!channel&gt; &amp; co')
     expect(escapeSlackControlCharacters(once)).toBe('&amp;lt;!channel&amp;gt; &amp;amp; co')
     expect(escapeSlackControlCharacters('&lt; &gt; &amp; &#60;')).toBe('&amp;lt; &amp;gt; &amp;amp; &amp;#60;')
+  })
+})
+
+describe('unescapeSlackControlCharacters', () => {
+  test.each([
+    ['a lone &amp;', '&amp;', '&'],
+    ['a lone &lt;', '&lt;', '<'],
+    ['a lone &gt;', '&gt;', '>'],
+    ['an escaped broadcast mention', '&lt;!channel&gt;', '<!channel>'],
+    ['a mix, every occurrence', 'a &amp; b &lt;c&gt; &amp;&amp; &lt;&lt;d&gt;&gt;', 'a & b <c> && <<d>>'],
+    ['&amp; undone last: a doubly escaped entity is undone once', '&amp;lt; &amp;gt; &amp;amp;', '&lt; &gt; &amp;'],
+  ])('%s: %p → %p', (_label, input, expected) => {
+    expect(unescapeSlackControlCharacters(input)).toBe(expected)
+  })
+
+  test.each([
+    ['empty text', ''],
+    ['plain words and punctuation', 'config.toml: [tmux] starting_session_seconds = 30, below 60 s!'],
+    ['the raw characters, and entities it does not undo', 'a & b <c> > &quot; &#60; &nbsp; &amp'],
+    ['line breaks and tabs', 'one\ntwo\r\nthree\tfour'],
+  ])('%s: returned unchanged', (_label, input) => {
+    expect(unescapeSlackControlCharacters(input)).toBe(input)
+  })
+
+  test.each([
+    ['a broadcast mention and an ampersand', '<!channel> & co'],
+    ['an entity written as text', '&lt; &gt; &amp; &#60;'],
+    ['a mix with line breaks', 'one <a>\ntwo && <<b>>'],
+  ])('the inverse of escaping: %s comes back as it was', (_label, input) => {
+    expect(unescapeSlackControlCharacters(escapeSlackControlCharacters(input))).toBe(input)
   })
 })

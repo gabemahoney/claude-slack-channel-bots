@@ -9,6 +9,11 @@
  * onset and the unclassified-error alert use it for agent-director's quoted
  * description.
  *
+ * `unescapeSlackControlCharacters` undoes it, for text built for Slack that
+ * is written somewhere else instead (the persona teardown window's server-log
+ * line and startup-errors entry, `src/persona-notifier.ts`), so the entry
+ * reads as the unescaped notices' entries do.
+ *
  * Pure module: no imports, no module-scope state, nothing runs at import.
  *
  * SPDX-License-Identifier: MIT
@@ -20,4 +25,13 @@
  */
 export function escapeSlackControlCharacters(text: string): string {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+/**
+ * `text` with Slack's control-character escapes undone: `&lt;` → `<`,
+ * `&gt;` → `>`, then `&amp;` → `&` (last, so `&amp;lt;` becomes `&lt;`, the
+ * inverse of {@link escapeSlackControlCharacters}). Nothing else changes.
+ */
+export function unescapeSlackControlCharacters(text: string): string {
+  return text.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&')
 }

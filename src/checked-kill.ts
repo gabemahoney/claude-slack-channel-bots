@@ -55,6 +55,11 @@
  * its class (and the unlisted class it came from), `kill_sent` when present,
  * the re-check's answer when one was made, and any description only through
  * the shared redaction (`renderLogMessageText`, `describeAgentDirectorFailure`).
+ * Beside it, the two notices built from a kill's outcome where nothing
+ * latches on it (SRJ-1002, SRJ-1003, SRJ-811): {@link teardownKillRefusalNoticeText}
+ * for a CONFLICT or an UNUSABLE NAME answer met at a try or at a read
+ * between tries, and {@link teardownKillNotSucceededNoticeText} for a
+ * non-success after the tries that no other notice records.
  *
  * SRJ-110's sites that take the checked kill (each with the result checked):
  *   - the restart path's kill before a relaunch (`_buildKillSessionAdapter`,
@@ -433,6 +438,68 @@ export function describeKillOutcome(outcome: KillOutcome): string {
     /* fall through to the fixed text */
   }
   return 'outcome=unknown'
+}
+
+// ---------------------------------------------------------------------------
+// Notices built from a kill's outcome (SRJ-1002, SRJ-1003, SRJ-110, SRJ-811)
+// ---------------------------------------------------------------------------
+
+/** A CONFLICT or an UNUSABLE NAME answer a kill met at one of its tries. */
+export const KILL_REFUSAL_AT_KILL = 'kill'
+/** A CONFLICT or an UNUSABLE NAME answer a kill met at a `status` read between its tries. */
+export const KILL_REFUSAL_AT_READ = 'status read'
+
+/**
+ * One CONFLICT or UNUSABLE NAME answer a kill met where nothing latches on
+ * it (a persona teardown's kill, an old-life wait's kill; SRJ-1002): where,
+ * its class (by name) and the thrown value, raw. Never logged raw.
+ */
+export interface KillRefusal {
+  readonly at: typeof KILL_REFUSAL_AT_KILL | typeof KILL_REFUSAL_AT_READ
+  readonly errorClass: typeof AD_ERROR_CLASS_CONFLICT | typeof AD_ERROR_CLASS_UNUSABLE_NAME
+  readonly error: unknown
+}
+
+/**
+ * The notice for a CONFLICT or an UNUSABLE NAME answer a kill met where
+ * nothing latches on it, at one of its tries or at a `status` read between
+ * them (SRJ-1003, SRJ-1002): the kill outcome's one-line rendering
+ * ({@link describeKillOutcome}: its class and agent-director's redacted
+ * description) with the instance id and where it was met. Nothing latched
+ * on it, so it carries no hold sentence and is never the CONFLICT notice's
+ * or the unusable-name notice's text. The one builder of that notice: a
+ * persona teardown's window writes it inside its entry form
+ * (`personaTeardownNoticeEntryText`, `src/persona-notifier.ts`), and an
+ * old-life wait's entry can use it with no server-only module (SRJ-811).
+ * Unescaped. Never throws.
+ *
+ *   agent-director kill of <id> refused at a try: <describeKillOutcome>
+ *   agent-director kill of <id> refused at a status read between its tries: <describeKillOutcome>
+ */
+export function teardownKillRefusalNoticeText(instanceId: string, refusal: Pick<KillRefusal, 'at' | 'errorClass' | 'error'>): string {
+  const where = refusal.at === KILL_REFUSAL_AT_READ ? 'at a status read between its tries' : 'at a try'
+  const outcome = describeKillOutcome({ kind: KILL_OUTCOME_NOT_KILLED, errorClass: refusal.errorClass, error: refusal.error })
+  return `agent-director kill of ${instanceId} refused ${where}: ${outcome}`
+}
+
+/**
+ * The notice for a kill whose outcome, after its tries, is a non-success
+ * that no other notice records (SRJ-110: "keeps the row and is recorded";
+ * SRJ-1003): no kill-failure alert was raised for it, it is no CONFLICT or
+ * UNUSABLE NAME answer (whose notice is
+ * {@link teardownKillRefusalNoticeText}'s), and no outage onset was written
+ * for it (an ENVIRONMENT or CONFIG answer for a persona no longer in the
+ * applied configuration, which raises no outage; an UNAVAILABLE value other
+ * than `ErrTmuxKillFailed`; an UNCLASSIFIED value). The outcome's one-line
+ * rendering ({@link describeKillOutcome}) with the instance id and the
+ * number of kills made. Nothing latches and nothing is armed on it.
+ * Unescaped. Never throws.
+ *
+ *   agent-director kill of <id> did not succeed after <n> kill(s); the row is kept: <describeKillOutcome>
+ */
+export function teardownKillNotSucceededNoticeText(instanceId: string, outcome: KillFailure, tries: number): string {
+  const kills = Number.isSafeInteger(tries) && tries >= 0 ? `${tries} kill(s)` : 'its tries'
+  return `agent-director kill of ${instanceId} did not succeed after ${kills}; the row is kept: ${describeKillOutcome(outcome)}`
 }
 
 /** The `session-gone` rendering, naming the GONE name only when it is one of the two. */

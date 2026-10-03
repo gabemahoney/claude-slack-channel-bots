@@ -163,6 +163,12 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    `persona-kill-survivor` entry (or an `orphan-cleanup` entry carrying `; kill-failure alert:`) in
    `startup-errors.log`, is covered under
    [A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice).
+   Any `persona-teardown-notice` entry (`raised during its teardown`), or a
+   `persona-notifier: notice for … raised during its teardown` line, is a
+   notice raised while a confirmed change tore a persona down, written
+   instead of posted: see
+   [A notice raised during a teardown](#a-notice-raised-during-a-teardown),
+   then the inner notice's own section.
    A *tmux unavailable* or *tmux server changed* notice is covered under
    **tmux isn't available** in
    [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own).
@@ -1338,6 +1344,7 @@ grep -h -E 'persona=ops_bot( |:|;|$)' "$STATE"/server.log.* "$STATE"/server.log 
 | `[slack] slow-recovery: persona=<key> count <n> of 3 — an escalate-dead verdict's re-probe still reads the row live` | The line above, counted. `<n>` keeps rising while the row stays live; the notice is posted at 3 only. |
 | `[slack] slow-recovery: persona=<key> notice posted — <n> consecutive escalate-dead verdicts whose re-probe still reads the row live` | The *Slow recovery* notice was handed to the persona's destination. The line is logged before the post's result is known: a post that fails shows only as the `notice failed` line below, or as [`persona-destination-failed`](#persona-destination-failed) when the notice reached the persona's notifier but couldn't be delivered. |
 | `[slack] slow-recovery: persona=<key> notice not posted — the server is shutting down` | The third check came while the server was stopping. Nothing is posted. |
+| `[slack] slow-recovery: persona=<key> notice not posted — muted, its persona teardown was submitted; it counts as posted in its episode; <n> consecutive escalate-dead verdicts whose re-probe still reads the row live` | The third check came after a confirmed change queued the persona's teardown and before it started, so the *Slow recovery* notice was not posted (see [A notice raised during a teardown](#a-notice-raised-during-a-teardown)). Nothing to do: the teardown ends the persona's session. |
 | `[slack] slow-recovery: persona=<key> count reset from <n> — <reason>` | The count started over. `<reason>`: `its row read ended or missing, or no row was found`; `its liveness read dead from ErrSystemInstallDisappeared, which reads no row` (see **agent-director returns an error the server can't classify** under [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own)); `a restart run ended with a verdict other than escalate-dead` (also when the restart found the session already reconnected); `an escalate-dead verdict's re-probe read the row pending, which is not counted`; `a restart run's liveness probe read the row pending`; `a health check found the session live, connected and with its stream`; or `the persona latched`. Logged only when the count was above 0. |
 | `[slack] slow-recovery: persona=<key> episode ended — <reason>` | The episode ended, with no post: `its row read ended or missing, or no row was found`, or `the persona latched`. A later run of three posts again. A teardown or a server stop ends it with no line. |
 | `[slack] slow-recovery: persona=<key> failed: <error>`, `[slack] restart: the slow-recovery <note> failed for persona=<key>: <error>` | An internal error keeping the count. The restart is not affected, but the count or the notice may be off. Report it as a bug, with the persona's lines. |
@@ -1448,6 +1455,7 @@ grep -h -E 'persona-episodes: persona=ops_bot tmux-unresponsive |unavailable-ret
 | `[slack] persona-episodes: persona=<key> tmux-unresponsive alert check armed again — a new refusal armed its retry timer again` | A new refusal restarted the retries in the same episode, so *Still not answering* is due again, timed from the first refusal. Never logged after the persona was torn down or removed from the configuration, or the server began shutting down, in this episode. | Nothing yet. |
 | `[slack] persona-episodes: persona=<key> tmux-unresponsive ended — <reason>` | The persona's session answers again. `<reason>`: `a tmux-touching call succeeded or answered GONE` (a call on its session went through, or agent-director reported the session gone, which the recovery then handles), `a health tick found its row live and its session connected with its stream` or `a retry found its row live and its session connected with its stream` (the persona is being served), or `the persona latched` (see [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice); no *Answering again* follows, and the retries were already stopped). Otherwise the retries then stop (`stopped — the tmux-unresponsive condition ended`), or go on when a `kept` line follows. When the end came during a retry and a later call in that same retry was refused again (a `tmux-unresponsive started` line follows), a new episode begins and the retries go on with no `stopped` line. When the call that went through launched the instance (`spawn` or `resume`), its new session may not have started yet, so the `kept — … its row last read pending` line follows and the next retry checks the instance. | Nothing. |
 | `[slack] persona-episodes: persona=<key> tmux-unresponsive recovery posted` | *Answering again* was posted, right after the `ended` line. | Nothing. |
+| `[slack] persona-episodes: persona=<key> tmux-unresponsive onset not posted — muted, its persona teardown was submitted; …`, `… alert not posted — muted, its persona teardown was submitted; …`, `… recovery not posted — muted, its persona teardown was submitted` | A confirmed change queued the persona's teardown, so the notice was not posted (it counts as posted). Once the teardown starts, such a notice goes to a `persona-teardown-notice` entry instead (see [A notice raised during a teardown](#a-notice-raised-during-a-teardown)). | Nothing. |
 | `[slack] persona-episodes: persona=<key> tmux-unresponsive recovery not posted — a silent end (a CONFLICT answer ended it)` | The record ended, after *Not answering* or *Still not answering*, on an answer whose own notice follows, so *Answering again* was not posted. | Follow that notice. |
 | `[slack] persona-episodes: persona=<key> tmux-unresponsive alert check not armed: <error>`, `… alert check failed: <error>`, `… alert check cancel failed: <error>`, `… onset check at a retry failed: <error>`, `[slack] persona-episodes: tmux-unresponsive onset check at a health tick failed: <error>`, `[slack] persona-episodes: persona=<key> tmux-unresponsive episode close step failed: <error>`, `[slack] health-check: the tick-end hook failed: <error>`, `[slack] health-check: the tick's start time could not be read: <error> — no tick-end hook this tick` | An internal error: a notice may be missing, but the retries go on unchanged. | Report it as a bug, with the persona's lines. |
 | `[slack] persona-episodes: tmux-unresponsive health-check mode read failed: <error> — taken as on` | An internal error reading `health_check_interval`; the notice is timed as with the health check on. | Report it as a bug. |
@@ -1483,6 +1491,17 @@ The server met one of two things:
   idle, or right after the server's own `find-missing` run listed the
   persona's row as unverified (the server then reads that row once). This is
   the "Conflicting labels" case below.
+
+A confirmed change's teardown of the persona (a removal, or the old half
+of a destructive change) holds nothing: when its kill meets a session
+conflict, nothing latches and nothing is posted. The conflict is written to
+`server.log` and a `persona-teardown-notice` entry,
+`agent-director kill of cscb_<key> refused at a try: outcome=not-killed class=CONFLICT …`
+(or `refused at a status read between its tries`), and a *Held:* notice
+that a launch still running raises during the teardown is written there too,
+not posted (see
+[A notice raised during a teardown](#a-notice-raised-during-a-teardown)).
+The "What to do" below still applies to the session it names.
 
 Only the persona's own row, for a persona in the configuration, counts.
 agent-director's other liveness notes (such as `tmux_server_changed` or
@@ -1649,6 +1668,12 @@ The row read right after the `find-missing` run of the start sweep (the
 clean-up of old sessions at a server start) is the exception: there the
 answer holds nobody and posts nothing. It is only logged (the `UNUSABLE NAME
 met in the start sweep` line below), and the persona's launch goes on.
+The kill of a confirmed change's teardown (or the read between its tries)
+holds nobody either: nothing latches and nothing is posted, and the answer
+is written to `server.log` and a `persona-teardown-notice` entry,
+`agent-director kill of cscb_<key> refused at a try: outcome=not-killed class=UNUSABLE_NAME …`
+(see
+[A notice raised during a teardown](#a-notice-raised-during-a-teardown)).
 
 The persona is then held: its destination gets one *Held: unusable tmux
 session name* notice, and the server attempts nothing more for it.
@@ -1874,7 +1899,10 @@ Other personas are not affected.
   again, with one new notice.
 - **The persona's teardown.** Removing the persona, or a destructive change
   to it, ends its hold with no post and no retry; the new half of a
-  destructive change starts unheld.
+  destructive change starts unheld. A *Cannot launch* notice that a launch
+  still running raises during the teardown is not posted: it goes to
+  `server.log` and a `persona-teardown-notice` entry (see
+  [A notice raised during a teardown](#a-notice-raised-during-a-teardown)).
 
 A persona whose hold ended and whose launch is rejected again is held
 again, with one new notice. Nothing else ends a hold.
@@ -2027,20 +2055,28 @@ destination:
   `persona-kill-survivor` entry, `instanceId=<id> (start sweep): <text>`,
   names the instance; a removed instance's row is then deleted as usual.
 - The kill of a confirmed change's teardown (a removed persona, or the old
-  half of a destructive change): nothing is posted, whether or not the
-  persona is still in the configuration. `startup-errors.log` gets
-  `[<time>] [persona-teardown-notice] persona=<key> (persona teardown): <text>`
-  for *Kill failed*, or `[<time>] [persona-kill-survivor] persona=<key>
-  (persona teardown): <text>` for *Process outlived kill*, and `server.log`
-  the same line, with the same last sentences as above. The persona's row is
-  kept either way (see
-  [A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change)).
+  half of a destructive change), and any kill failure raised for the
+  persona while that teardown runs: nothing is posted, at the old
+  destination or the new half's, whether or not the persona is still in the
+  configuration. `startup-errors.log` gets
+  `[<time>] [persona-teardown-notice] persona "<name>" (key=<key>), raised during its teardown: <text>`
+  for *Kill failed*, or the same with `[persona-kill-survivor]` for
+  *Process outlived kill*, and `server.log` the same line, with the same
+  last sentences as above. Nothing is held. The persona's row is kept either
+  way (see
+  [A notice raised during a teardown](#a-notice-raised-during-a-teardown)).
+- A kill whose tries were stopped (the persona was removed, torn down or
+  stopped being up, the server is stopping, or the check of agent-director's
+  version stops the server) raises neither notice, during a teardown too:
+  one `not raised` line (below), and, for a persona removed during the
+  tries, a `persona-kill-failed` entry carrying that line, with no notice
+  text.
 
 | Class | Cause | Fix |
 |---|---|---|
-| `persona-kill-failed` | A *Kill failed* notice for a persona no longer in the applied configuration, or for a persona whose kill tries were stopped after an earlier try named a process that outlived the kill. | A human checks the worker the entry names, following the "Operator actions" section of agent-director's README. Nothing needs doing for the removed persona itself. |
-| `persona-teardown-notice` | A *Kill failed* notice from the kill of a confirmed change's teardown (a removed persona, or the old half of a destructive change), whether or not the persona is still in the configuration. The row is kept. | As for `persona-kill-failed`. |
-| `persona-kill-survivor` | A *Process outlived kill* notice with no Slack destination: a persona no longer in the applied configuration, the kill of a confirmed change's teardown, or the clean-up's kill at a start. | A human deals with the process the entry names by pid, following "Operator actions". |
+| `persona-kill-failed` | A *Kill failed* notice for a persona no longer in the applied configuration; or, with no notice text, the `not raised` line of a kill whose tries were stopped for a persona removed during them. | A human checks the worker the entry names, following the "Operator actions" section of agent-director's README. Nothing needs doing for the removed persona itself. |
+| `persona-teardown-notice` | A notice raised for a persona while a confirmed change tore it down (a removed persona, or the old half of a destructive change), whether or not the persona is still in the configuration: here, a *Kill failed* notice. The row is kept. | As for `persona-kill-failed`; see [A notice raised during a teardown](#a-notice-raised-during-a-teardown). |
+| `persona-kill-survivor` | A *Process outlived kill* notice with no Slack destination: a persona no longer in the applied configuration, a persona being torn down by a confirmed change, or the clean-up's kill at a start. | A human deals with the process the entry names by pid, following "Operator actions". |
 | `orphan-cleanup` carrying `; kill-failure alert:` | A start's clean-up could not end an old instance after its tries. Its row is kept. | As for `persona-kill-failed`. The next start's clean-up tries the kill again. |
 
 **The fix is a human's.** A human follows the "Operator actions" section
@@ -2078,9 +2114,11 @@ grep -h -E 'live-row-sequence: .*(persona=ops_bot\b|\(key=ops_bot\)|cscb_ops_bot
 | `[slack] persona-episodes: persona=<key> kill-failure ordinary alert posted to its destination (<context>; <closing>)` | The *Kill failed* notice was posted. `<context>` is `recovery` (a restart's kill, or a kill while the server replaces the persona's old instance). `<closing>` is `destination`, or `destination-latched` when the persona was held and the notice ends with the held sentence. | As for the notice. |
 | `[slack] persona-episodes: persona=<key> kill-failure ordinary alert not posted — its episode's alert already posted` | Another kill failed in the same episode: nothing new is posted. | Nothing more: the first notice stands. |
 | `[slack] persona-episodes: persona=<key> kill-failure survivor alert posted to its destination (<context>)` | The *Process outlived kill* notice was posted; the relaunch or the launch goes on. | As for the notice. |
-| `[slack] persona-episodes: persona=<key> kill-failure <version> alert written to the server log and startup-errors.log (<class>) — <route>` | The notice went to `server.log` and a `<class>` entry instead of Slack. `<route>` says why: `not-configured` when the persona is no longer in the applied configuration (`<class>` `persona-kill-failed` for `ordinary`, `persona-kill-survivor` for `survivor`), or `persona-teardown` for the kill of a confirmed change's teardown, whether or not the persona is still in the configuration (`<class>` `persona-teardown-notice` for `ordinary`, `persona-kill-survivor` for `survivor`). | See the class table above. |
-| `[slack] persona-episodes: persona=<key> kill-failure ordinary alert not raised — its tries were stopped (the persona is not up or is torn down, or the server is shutting down), so nothing retries this kill; <descriptions> (<context>)` | A kill that agent-director could not carry out stopped its tries because the persona was removed or stopped being up, or the server is stopping. Nothing is posted and no episode starts. `<descriptions>` quotes agent-director's answers, redacted (`last="…"`, `earlier survivor-naming="…"`). | Nothing for the persona. If the worker may still run, a human checks it as for the notice. |
-| `[slack] persona-episodes: persona=<key> kill-failure ordinary alert written to the server log and startup-errors.log (persona-kill-failed) — stopped-survivor` | Follows the `not raised` line when an earlier try had named a process that outlived the kill: the *Kill failed* text went to `server.log` and a `persona-kill-failed` entry, since nothing else reports that process. Nothing is posted and no episode starts. | A human checks the process the entry names, as for the notice. |
+| `[slack] persona-episodes: persona=<key> kill-failure <version> alert written to the server log and startup-errors.log (<class>) — <route>` | The notice went to `server.log` and a `<class>` entry instead of Slack. `<route>` says why: `not-configured` when the persona is no longer in the applied configuration (`<class>` `persona-kill-failed` for `ordinary`, `persona-kill-survivor` for `survivor`), or `persona-teardown` for the kill of a confirmed change's teardown with no teardown window open (`<class>` `persona-teardown-notice` for `ordinary`, `persona-kill-survivor` for `survivor`). | See the class table above. |
+| `[slack] persona-episodes: persona=<key> kill-failure <version> alert written to the server log and startup-errors.log (<class>) — persona-teardown, raised during its teardown (<context>)` | The notice was raised while a confirmed change tore the persona down, whether or not it is still in the configuration: written to `server.log` and a `persona-teardown-notice` (`ordinary`) or `persona-kill-survivor` (`survivor`) entry, posted nowhere. `<context>` is `persona teardown` for the teardown's own kill. | See [A notice raised during a teardown](#a-notice-raised-during-a-teardown). |
+| `[slack] persona-episodes: persona=<key> kill-failure ordinary alert not posted to its destination — muted, its persona teardown was submitted; it counts as posted in its episode (<context>; <closing>)`, `… survivor alert not posted to its destination — muted, its persona teardown was submitted (<context>)` | The notice came after a confirmed change queued the persona's teardown and before it started, so it was not posted. | As for the notice; check the worker the line's descriptions name. |
+| `[slack] persona-episodes: persona=<key> kill-failure ordinary alert not raised — its tries were stopped (<cause>)[; its last outcome's class: <class>], so nothing retries this kill; <descriptions> (<context>)` | A kill that agent-director could not carry out stopped its tries. `<cause>` says why: `its keep-going check answered false: the server is shutting down`, `its keep-going check answered false: the persona is torn down or not up` (or both, `… the persona is torn down or not up, or the server is shutting down`, when the server could not tell which), `its live-row sequence was stopped: ` followed by `the persona's teardown began`, `the server is shutting down`, `the persona is not up` or `the persona latched` (the server was replacing the persona's old instance), or `the last outcome's version re-check stops the server`. It is no notice, during a teardown too: nothing is posted, no episode starts and no `persona-teardown-notice` entry is written. `<descriptions>` quotes agent-director's answers, redacted (`last="…"`, `earlier survivor-naming="…"`). | Nothing for the persona. If the worker, or a process the descriptions name, may still run, a human checks it as for the notice. |
+| `[slack] persona-episodes: persona=<key> kill-failure stopped retry's log line (no alert text) written to the server log and startup-errors.log (persona-kill-failed) — stopped` | Follows the `not raised` line for a persona removed during the tries: the same line went to a `persona-kill-failed` entry, with no notice text. | As for the `not raised` line. |
 | `[slack] persona-episodes: persona=<key> kill-failure ended — <reason>` | The episode ended with no post. `<reason>`: `its own row read ended or missing` or `its own row is gone (ErrSpawnNotFound)`. A later failed kill can post *Kill failed* again. | Nothing. |
 | `[slack] persona-episodes: persona=<key> kill-failure configured-key lookup failed: <error> — the alert takes the log-only route` | An internal error while checking whether the persona is still configured: the notice went to the log and `startup-errors.log` instead of Slack. | Report it as a bug, with the persona's lines. |
 | `[slack] persona-episodes: persona=<key> kill-failure <version> alert not posted — the episodes are closed` | The server is stopping, so nothing is posted. | Nothing. |
@@ -2146,7 +2184,7 @@ row is kept, whatever the kill's result: the persona is retired, and the row
 is its old conversation, which is never resumed. Its permission prompts stay
 in Slack as posted; clicking one does nothing, because clicks arrive only on
 the persona's own Slack connection, which the removal closed. A held
-persona's hold ends with it, silently. To bring the persona back, add it to
+persona's hold ends with it, silently. Nothing about the teardown is posted to Slack: every notice raised for the persona while it runs goes to `startup-errors.log` and `server.log` (see [A notice raised during a teardown](#a-notice-raised-during-a-teardown)). To bring the persona back, add it to
 `config.json` again and confirm: it starts a new conversation on the same
 instance, even with a server restart in between, and never resumes the old
 one. A persona renamed and then renamed back does the same. See
@@ -2161,10 +2199,11 @@ one. A persona renamed and then renamed back does the same. See
 | `[slack] live-row-sequence: <ref>: stop asked — the persona's teardown began; no further call (b.jg5 SRJ-706)` | The server was replacing the persona's old instance; the teardown stopped that first. Normal. |
 | `[slack] persona teardown kill for persona=<key>: kill try <n> of <max> for cscb_<key>: <outcome> — <what follows> (b.jg5 SRJ-702)`, `…: status read before kill try <n> for cscb_<key>: <state> — <what it decides> (b.jg5 SRJ-702)`, `…: kill tries for cscb_<key> ended (<end>) after <n> kill(s) and <m> read(s): <outcome> — alert=<none\|survivor\|ordinary> (b.jg5 SRJ-702)` | The teardown's kill, one line per try and per read of the row between tries. More than one try means agent-director couldn't carry out the kill at once; a read of `ended` or `missing` between tries ends them as a success. `(names a surviving pid)` after an outcome means a process outlived the kill (see `alert=` and the *Process outlived kill* entry under [A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice)). |
 | `[slack] persona teardown of "<name>" (key=<key>): agent-director kill of cscb_<key>: <outcome> after <n> kill(s); the row is kept (b.jg5 SRJ-715)` | The teardown stopped the instance: `<outcome>` is `outcome=killed kill_sent=<true\|false\|absent>`, `outcome=row-gone (ErrSpawnNotFound)`, `outcome=session-gone (<error name>)` or the finished row a read between tries found. `kill_sent=false` means agent-director found no session of the current launch and the worker gone or not recorded; it is no fault. The row is kept; nothing deletes it. |
-| `[slack] persona teardown of "<name>" (key=<key>): agent-director kill of cscb_<key> failed: <outcome> after <n> kill(s) — the row is kept; nothing latches and no retry timer is armed (b.jg5 SRJ-715, SRJ-110)` | agent-director couldn't stop the instance (`outcome=not-killed class=<class> …`; often because it was unreachable), so its session may still be running. The row is kept, nothing is held, no retry timer is armed, and the other steps still ran. The row is still there (see [Listing instances](#listing-instances)); for a removed persona, the next server start's clean-up kills it again and removes it only once that kill succeeds. For a destructively modified persona, its bring-up never launches over the old session: it ends it first and starts the new conversation on the same instance only once that succeeds; the old conversation is never resumed. When the tries call for it, a *Kill failed* entry follows (the `[persona-teardown-notice]` row below). |
+| `[slack] persona teardown of "<name>" (key=<key>): agent-director kill of cscb_<key> failed: <outcome> after <n> kill(s) — the row is kept; nothing latches and no retry timer is armed (b.jg5 SRJ-715, SRJ-110)` | agent-director couldn't stop the instance (`outcome=not-killed class=<class> …`; often because it was unreachable), so its session may still be running. The row is kept, nothing is held, no retry timer is armed, and the other steps still ran. The row is still there (see [Listing instances](#listing-instances)); for a removed persona, the next server start's clean-up kills it again and removes it only once that kill succeeds. For a destructively modified persona, its bring-up never launches over the old session: it ends it first and starts the new conversation on the same instance only once that succeeds; the old conversation is never resumed. When the tries call for it, a *Kill failed* entry follows (the `[persona-teardown-notice]` row below); when no other entry records the failure, an `agent-director kill of cscb_<key> did not succeed after <n> kill(s); the row is kept: …` entry follows instead, so every failed kill has an entry. |
 | `[slack] persona teardown of "<name>" (key=<key>): agent-director kill of cscb_<key> failed: it answered no kill outcome — the row is kept (b.jg5 SRJ-715)` | An internal error in the teardown's kill; the row is kept and the other steps still ran. Report it as a bug. |
 | `[slack] persona teardown of "<name>" (key=<key>): agent-director kill of cscb_<key>: it answered a malformed kill-failure alert decision — no kill-failure alert is raised (b.jg5 SRJ-704)` | An internal error in the teardown's kill: its tries answered an alert decision the teardown could not read, so no *Kill failed* or *Process outlived kill* entry is written for it. The kill's own line, which follows it, still says how it went; the row is kept and the other steps still ran. Report it as a bug; if that line says the kill failed, a human checks the worker as for the notice. |
-| `[<time>] [persona-teardown-notice] persona=<key> (persona teardown): <text>` (or `[persona-kill-survivor]`), in `startup-errors.log` and `server.log` | agent-director could not end the instance after its tries (*Kill failed*), or ended it while a process outlived the kill (*Process outlived kill*). Nothing is posted to Slack. A human follows [A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice). |
+| `[<time>] [persona-teardown-notice] persona "<name>" (key=<key>), raised during its teardown: <text>` (or `[persona-kill-survivor]`), in `startup-errors.log` and `server.log` | A notice raised during the teardown, written instead of posted: for example agent-director could not end the instance after its tries (*Kill failed*), or ended it while a process outlived the kill (*Process outlived kill*), or its kill met a session conflict or an unusable tmux session name (`agent-director kill of cscb_<key> refused at a try: …`; nothing is held), or its kill did not succeed and nothing else recorded it (`agent-director kill of cscb_<key> did not succeed after <n> kill(s); the row is kept: …`). Nothing is posted to Slack. See [A notice raised during a teardown](#a-notice-raised-during-a-teardown). |
+| `[slack] persona-notifier: notice for "<name>" (key=<key>) raised during its teardown — written to the server log and startup-errors.log (<class>), not posted: <first line>` | Follows that entry's line. See [A notice raised during a teardown](#a-notice-raised-during-a-teardown) for this line and the teardown's other notice lines. |
 | `[slack] persona teardown of "<name>" (key=<key>): forgetting its latch failed: <error>` | An internal error ending the persona's hold (see [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice)). The other steps still ran, but the key may still be held: a destructively modified persona, or a persona added again with the same key, is then not launched (`spawnForPersona: not launching … — it is latched`) until the server next starts. Report it as a bug, with the persona's lines. |
 | `[slack] persona teardown of "<name>" (key=<key>): forgetting its ErrInvalidFlags hold failed: <error>` | An internal error ending the persona's *Cannot launch* hold (see [A persona posts a Cannot launch notice](#a-persona-posts-a-cannot-launch-notice)). The other steps still ran, but the key may still be held; a server restart ends every hold. Report it as a bug. |
 | `[slack] invalid-flags-hold: persona=<key> hold forgotten — it began under agent-director version <version>; nothing is posted or retried (b.jg5 SRJ-207)` | The persona was held because agent-director rejected its launch; its hold ended with it, with no post and no retry. |
@@ -2178,7 +2217,7 @@ one. A persona renamed and then renamed back does the same. See
 | `[slack] waitForWaitingAndReconnect: the wait for "<name>" (key=<key>) was cancelled (its persona is being torn down) — nothing typed (b.f2b)` | The cancelled wait ended with nothing typed; the teardown goes on. |
 | `[slack] persona teardown of "<name>" (key=<key>): cancelling its launch's wait for a working row before its turn failed: <error>` | An internal error in that cancel; the teardown still runs. Report it as a bug. |
 | `[slack] permission-poller: persona=<key>: dropped <n> tracked prompt(s); their Slack messages stay as posted` | Its open prompts are no longer tracked. Their messages stay in Slack, and clicking them does nothing. |
-| `[slack] persona-notifier: persona=<key>: dropped <n> held notice(s), not posted — the persona was torn down` | Notices that were waiting for its Slack client are dropped. |
+| `[slack] persona-notifier: persona=<key>: dropped <n> held notice(s), not posted — the persona was torn down` | Notices that were waiting for its Slack client before the teardown started are dropped. A notice raised during the teardown is never dropped: it is written (above). |
 | `[slack] persona-destination-hold: hold cancelled — <n> held notice(s) for "<name>" (key=<key>) dropped, not posted` | Notices that were waiting for its failing destination are dropped. |
 
 **Destructively modified persona.** A kept persona whose `credentials_file`
@@ -2195,6 +2234,8 @@ is held again, with one new notice, only if it meets a conflict again: at its
 launch, or when the server later reads conflicting labels on its own row.
 A restart or retry that was pending for it is cancelled
 when its teardown is queued, so the old entry is never relaunched in between.
+No notice raised during its teardown reaches the new half's destination (see
+[A notice raised during a teardown](#a-notice-raised-during-a-teardown)).
 `[slack] persona teardown of "<name>" (key=<key>): <step> before its turn failed: <error>`
 is an internal error in that cancel; the teardown still runs. Report it as a
 bug.
@@ -2202,6 +2243,101 @@ bug.
 **Either.** `[slack] reload: apply step <n> (<step>) failed for persona "<name>" (key=<key>): <error>`
 is an internal error in that persona's teardown or bring-up; the other
 personas were still handled. Report it as a bug, with the persona's lines.
+
+### A notice raised during a teardown
+
+From the start of a removed or destructively modified persona's teardown
+until it completes, nothing about the persona is posted to Slack, at its old
+destination or at the new half's. Every notice raised for it in that time is
+written to `startup-errors.log` and `server.log` instead, and none is
+dropped:
+
+```
+[<time>] [persona-teardown-notice] persona "<name>" (key=<key>), raised during its teardown: <the notice's text>
+```
+
+followed in `server.log` by
+`[slack] persona-notifier: notice for "<name>" (key=<key>) raised during its teardown — written to the server log and startup-errors.log (persona-teardown-notice), not posted: <first line>`.
+A *Process outlived kill* notice raised then has the same form with the
+class `persona-kill-survivor`. `<the notice's text>` is the notice as it
+would have been posted, but with Slack's escapes undone (`&`, `<` and `>`
+appear as themselves, not as `&amp;`, `&lt;` and `&gt;`), in the entry and
+the line alike. A *Kill failed* or *Process outlived kill* notice of a kill
+other than the teardown's own (a launch still running) starts with its
+context in parentheses, for example `(recovery) `.
+
+**The fix is the inner notice's own.** The entry only says where the notice
+went; read `<the notice's text>` and follow that notice's own section:
+
+| Inner notice | Where to look |
+|---|---|
+| *Kill failed* or *Process outlived kill* (the teardown's kill, or a kill of a launch still running) | [A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice) |
+| `agent-director kill of cscb_<key> refused at a try: outcome=not-killed class=CONFLICT …` (or `class=UNUSABLE_NAME`, or `refused at a status read between its tries`) | The teardown's kill met a session conflict or an unusable tmux session name. Nothing is held for it. The "What to do" of [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice) or [A persona posts a Held: unusable tmux session name notice](#a-persona-posts-a-held-unusable-tmux-session-name-notice) applies to the session or row it names. |
+| `agent-director kill of cscb_<key> did not succeed after <n> kill(s); the row is kept: outcome=not-killed class=<class> …` | The teardown's kill did not succeed, and no other entry (*Kill failed*, a `refused at a try` entry, or an outage notice) records it: for example agent-director answered an error the server can't classify, or a removed persona's kill met an ENVIRONMENT or CONFIG answer. The row is kept and the session may still run. Read the row (see [Listing instances](#listing-instances)); for a removed persona the next start's clean-up kills it again, and a destructively modified persona's bring-up ends the old session before it launches. For `class=ENVIRONMENT`, `class=CONFIG` or `class=UNCLASSIFIED`, see [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own). |
+| *tmux unavailable*, *tmux server changed*, *agent-director refuses its config file*, and that outage's *All clear.* | [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own) |
+| *Unclassified agent-director error* | **agent-director returns an error the server can't classify** in [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own) |
+| A *Held:* or *Cannot launch* notice from a launch still running | The *Held:* or *Cannot launch* section for that notice. The teardown already ended the hold. |
+| A stuck permission prompt warning | The persona's session was blocked on a native permission prompt; its teardown ends that session. |
+
+**An outage's all-clear.** An outage whose notice was written this way keeps
+its state past the teardown, and its *All clear.*, whenever it comes, is
+written the same way and never posted, the new half's destination included.
+After the teardown has completed, the entry reads
+`persona "<name>" (key=<key>), the all-clear of an outage raised during its teardown: <text>`
+and the line
+`[slack] persona-notifier: all-clear for "<name>" (key=<key>) of an outage raised during its teardown — written to the server log and startup-errors.log (persona-teardown-notice), not posted: <first line>`.
+When one *All clear.* covers both such an outage and another one whose
+notice was posted, it is split: the part for the outage written this way is
+written as above, and an *All clear.* naming only the other outage is posted
+to the destination as usual.
+
+**Before the teardown starts.** Once the teardown is queued, none of the
+persona's once-per-episode notices is posted: *Held: tmux session conflict*,
+*Held: unusable tmux session name*, *Held: launch start not recorded*,
+*Cannot launch*, *Slow recovery*, *Not answering*, *Still not answering*,
+*Answering again*, *Unclassified agent-director error*, *Kill failed* and
+*Process outlived kill*. Their lines say `not posted — muted, its persona
+teardown was submitted`. *agent-director refuses its config file* is not
+posted either: the line
+`[slack] persona-notifier: onset for "<name>" (key=<key>) of ad-config-malformed not posted — muted, its persona teardown was submitted; its all-clear is written, never posted: <first line>`
+says so, and its *All clear.* is later written as above, never posted.
+Every other notice raised then is handled as usual (another outage's notice,
+such as *tmux unavailable*, a stuck permission prompt warning, a
+spawn-failure notice and a lost-message notice): a removed persona's is
+dropped (`no applied persona with key=<key> — notice dropped`), and a
+destructively modified persona's goes to its destination.
+
+**A kill the teardown stopped is no notice.** A kill the server was trying
+again for the persona when the teardown began (while replacing its old
+instance, for example) stops its tries. It posts nothing and writes no
+`persona-teardown-notice` entry: one
+`kill-failure ordinary alert not raised — its tries were stopped (<cause>)`
+line, its cause usually `its live-row sequence was stopped: the persona's
+teardown began` or `its keep-going check answered false: the persona is torn
+down or not up`, and
+for a persona removed during the tries a `persona-kill-failed` entry carrying
+that line (see
+[A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice)).
+
+**Read-only checks.** One persona's teardown entries and lines (replace
+`ops_bot` with the key):
+
+```sh
+grep -h -E '\[persona-(teardown-notice|kill-survivor)\] persona "[^"]*" \(key=ops_bot\)' "$STATE"/startup-errors.log
+grep -h -E 'persona-notifier: (notice|all-clear|onset) for "[^"]*" \(key=ops_bot\)|persona teardown of "[^"]*" \(key=ops_bot\)|(persona-episodes|slow-recovery): persona=ops_bot .*(muted, its persona teardown|raised during its|its persona teardown was submitted)|stuck-prompt warning for "[^"]*" \(key=ops_bot\)' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
+```
+
+| Line | Meaning |
+|---|---|
+| `[slack] persona-notifier: notice for "<name>" (key=<key>) raised during its teardown — written to the server log and startup-errors.log (<class>), not posted: <first line>` | A notice raised during the teardown was written, not posted. Follow the inner notice (above). |
+| `[slack] persona-notifier: all-clear for "<name>" (key=<key>) of an outage raised during its teardown — written to the server log and startup-errors.log (persona-teardown-notice), not posted: <first line>` | The outage that notice reported has cleared. Nothing to do. |
+| `… not posted, and its startup-errors entry was not written: <reason>` at the end of either line | An internal error: the notice is in `server.log` only. Report it as a bug. |
+| `[slack] persona-episodes: persona=<key> kill-failure <version> alert written to the server log and startup-errors.log (<class>) — persona-teardown, raised during its teardown (<context>)` | A *Kill failed* (`ordinary`) or *Process outlived kill* (`survivor`) notice raised during the teardown; `<context>` is `persona teardown` for the teardown's own kill, or `recovery` for a launch still running. |
+| `[slack] persona-episodes: persona=<key> unclassified-error alert written to the server log and startup-errors.log (persona-teardown-notice) — raised during its persona teardown; …` | An *Unclassified agent-director error* notice raised during the teardown. |
+| `[slack] permission-poller: stuck-prompt warning for "<name>" (key=<key>) (<id>) raised during its persona teardown — handed to the notifier, which writes it to the server log and startup-errors.log, not posted (b.jg5 SRJ-1003)` | A stuck permission prompt warning raised during the teardown. |
+| `[slack] persona-episodes: persona=<key> <kind> notice not posted — its persona teardown was submitted (b.jg5 SRJ-1003)`, and a poster's `… not posted — muted, its persona teardown was submitted …` line | A notice between the teardown being queued and its start: not posted. Nothing to do. |
+| `[slack] persona-notifier: onset for "<name>" (key=<key>) of ad-config-malformed not posted — muted, its persona teardown was submitted; its all-clear is written, never posted: <first line>` | *agent-director refuses its config file* between the teardown being queued and its start: not posted, and no entry. Its *All clear.* is written, never posted. If agent-director still refuses its config file afterwards, see [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own). |
+| `[slack] persona teardown of "<name>" (key=<key>): raising the notice for the <CONFLICT\|UNUSABLE_NAME> its kill met failed: <error>`, `…: raising the notice for its kill's outcome failed: <error>`, `…: opening its notice window failed: <error>`, `…: closing its notice window failed: <error>`, `…: forgetting its outage state failed: <error>`, `…: registering its submit failed: <error>`, `…: ending its submit failed: <error>`, `…: no notifier route is installed for the notice: <text>` | An internal error: a notice may have been posted or lost. Report it as a bug, with the persona's lines. |
 
 ### Added again or renamed back
 
@@ -2562,7 +2698,13 @@ agent-director's description of the problem, and the persona's retries start
 with the `config` cause, even when nothing was launching or recovering it (a
 health check, a permission prompt or a removal met it). The quoted
 description is shown as text: a mention or link in it notifies no one. A
-later answer of the same kind while the notice holds posts nothing.
+later answer of the same kind while the notice holds posts nothing. When the
+answer comes while a confirmed change tears the persona down (its kill, the
+read between its tries, or a launch still running), neither the notice nor
+its later *All clear.*, whenever that comes, is posted: both go to
+`server.log` and `persona-teardown-notice` entries (see
+[A notice raised during a teardown](#a-notice-raised-during-a-teardown));
+the fix is the same.
 
 The server does nothing because of it: nothing counts toward the restart
 limit, the persona is never read as dead (its state reads unknown), nothing
@@ -2658,6 +2800,15 @@ startup-errors.log` line (below). The entry names the persona's key and the
 notice's text:
 `[<time>] [persona-unclassified-error] persona=<key>: :warning: *Unclassified agent-director error* — <rest of the notice>`.
 
+**During a teardown.** When the notice falls due while a confirmed change
+tears the persona down (a launch for it was still running), nothing reaches
+Slack, whether or not the persona is still configured: it goes to
+`server.log` and a `persona-teardown-notice` entry instead of a
+`persona-unclassified-error` one (see
+[A notice raised during a teardown](#a-notice-raised-during-a-teardown)).
+Once the teardown is queued and before it starts, the notice is not posted
+either (the `not posted to its destination — muted` line below).
+
 ```sh
 grep -h -F '[persona-unclassified-error]' "$STATE"/startup-errors.log 2>/dev/null | tail -n 20
 grep -h -E 'persona-episodes: persona=ops_bot unclassified-error alert written' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
@@ -2682,6 +2833,8 @@ grep -h -E 'persona-episodes: persona=ops_bot unclassified-error |unavailable-re
 | `[slack] unavailable-retry: persona=<key> armed (unclassified: <error>) — first retry in 30 s` | The retries started with the `unclassified` cause (`armed (read-error: <error>)` when the error came from reading the persona's state). | Nothing. |
 | `[slack] persona-episodes: persona=<key> unclassified-error alert posted to its destination — an UNCLASSIFIED outcome met <s> s after the episode's first, over its alert threshold of <s> s: class=UNCLASSIFIED[ name=<name>][ message="<description>"]` | The *Unclassified agent-director error* notice went to the persona's destination. The numbers are the time since the episode's first error and the alert threshold in effect; the classification is the error the notice quotes. | A human checks the host's agent-director, following agent-director's documentation. If the notice doesn't arrive, see [`persona-destination-failed`](#persona-destination-failed). |
 | `[slack] persona-episodes: persona=<key> unclassified-error alert written to the server log and startup-errors.log (persona-unclassified-error) — the persona is not in the applied configuration; an UNCLASSIFIED outcome met <s> s after the episode's first, over its alert threshold of <s> s: <classification>` | The notice was due, but the persona is no longer in the applied configuration, so it went to `startup-errors.log` (the `persona-unclassified-error` entry) and `server.log` only. | As above; nothing to do for the removed persona itself. |
+| `[slack] persona-episodes: persona=<key> unclassified-error alert written to the server log and startup-errors.log (persona-teardown-notice) — raised during its persona teardown; an UNCLASSIFIED outcome met …` | The notice fell due while a confirmed change tore the persona down: it went to a `persona-teardown-notice` entry and `server.log` only. | As above. |
+| `[slack] persona-episodes: persona=<key> unclassified-error alert not posted to its destination — muted, its persona teardown was submitted; it counts as posted in its episode; an UNCLASSIFIED outcome met …` | The notice fell due after a confirmed change queued the persona's teardown, before it started: not posted. | As above. |
 | `[slack] persona-episodes: persona=<key> unclassified-error ended — <reason>` | The episode ended with no notice. `<reason>`: `a retry found nothing left to recover` (the persona is back), `a retry read its row live out of pending` (after a relaunch, its new session started), `its retry timer stopped when its tmux condition ended` (tmux answers again for the persona), `a retry read its row ended or gone` (after a relaunch, its new session ended or disappeared; the restart path decides what happens next), `the persona reached the restart cap` (see the `SpawnCapReached` notice), or `the persona latched` (see [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice)). | Nothing. At the restart cap, restart the server to retry the persona once agent-director answers normally. |
 | `[slack] spawnForPersona: resume refused for "<name>" (key=<key>): class=UNCLASSIFIED name=ErrInvalidFlags[ message="<description>"] (after one immediate agent-director version re-check: <answer>) — no spawn-failure notice; nothing more is called (b.jg5 SRJ-105)` | agent-director refused the persona's resume with `ErrInvalidFlags`. The server re-checked the binary's version once (`<answer>`: `pass`, `could-not-run` or `not-running`) and treats it as an error it can't classify: the resume stops, nothing is deleted, killed or launched, and the retries take over. When the re-check refuses the binary instead, the line reads `resume failed for … (after one immediate agent-director version re-check: stop)` and the server stops (see [Found while the server was running](#found-while-the-server-was-running)). | Nothing yet; the notice follows if it lasts. |
 | `[slack] <site>: pane read for persona=<key> answered <classification> — UNCLASSIFIED after one immediate agent-director version re-check: <recheck> (b.jg5 SRJ-104, SRJ-204)` | agent-director answered a read of the persona's screen with `ErrInvalidFlags`, which means nothing for that read. `<site>` is `readWorkingPane` (a launch waiting on a `working` row, or the health check's reconnect checking a `waiting` row), `reconnectSession` (the health check's reconnect checking a `working` row), `reconnectSession: prompt row` (the health check's reconnect checking an `ask_user` or `check_permission` row) or `spawnForPersona: prompt row` (a launch checking such a row). The server re-checked the binary's version once (`<recheck>`: `pass`, `stop`, `could-not-run` or `not-running`) and treats the answer as an error it can't classify: the reader's own line for that class follows (for the health check, a `reading its pane failed` line in [A row that reads `working` while the instance sits idle](#a-row-that-reads-working-while-the-instance-sits-idle)). Inside a launch or recovery attempt the persona's retries take over and the episode is reported; in a health check no episode starts. With `<recheck>` `stop` the re-check refused the binary: the read types nothing, the launch's wait or the health check's reconnect logs one of the *version re-check decided that the server stops* lines (the wait's is in [A row that reads `working` while the instance sits idle](#a-row-that-reads-working-while-the-instance-sits-idle); the reconnect's three and the launch's prompt-row one are below) and calls nothing more for the persona, and the server stops (see [Found while the server was running](#found-while-the-server-was-running)). | Nothing yet; the notice follows if it lasts. With `stop`, as for a stopped server. |
@@ -3961,6 +4114,10 @@ or a filesystem that doesn't support syncing a directory).
       (`spawn <id> names no applied persona (persona=<key>) — skipping`), and
       a notice for it is dropped
       (`persona-notifier: no applied persona with key=<key> — notice dropped`);
+      once its teardown starts, and until it completes, a notice for it is
+      not dropped: it goes to `server.log` and a `persona-teardown-notice`
+      entry in `startup-errors.log` (see
+      [A notice raised during a teardown](#a-notice-raised-during-a-teardown));
     - it is never restarted or relaunched again;
   - a kept persona's `channels` (each entry's `delivery` included), `dm.*`
     and `permission_prompts`

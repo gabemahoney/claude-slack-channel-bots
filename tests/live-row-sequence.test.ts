@@ -109,7 +109,7 @@ import {
   KILL_FAILURE_VERSION_ORDINARY,
   PERSONA_KILL_FAILED_LABEL,
 } from '../src/kill-failure-alert.ts'
-import { KILL_RETRY_ALERT_NONE, KILL_RETRY_END_SETTLED, KILL_RETRY_SPACING_MS, KILL_RETRY_TRIES } from '../src/kill-retry.ts'
+import { KILL_RETRY_ALERT_NONE, KILL_RETRY_ALERT_ORDINARY, KILL_RETRY_END_SETTLED, KILL_RETRY_END_STOPPED, KILL_RETRY_SPACING_MS, KILL_RETRY_TRIES, type KillRetryResult } from '../src/kill-retry.ts'
 import {
   LIVE_ROW_ARM_ENDED,
   LIVE_ROW_ARM_LOST_RACE,
@@ -157,6 +157,7 @@ import {
   LIVE_ROW_START_CLOSED,
   LIVE_ROW_START_STARTED,
   LIVE_ROW_STOP_LATCHED,
+  LIVE_ROW_STOP_NOT_UP,
   LIVE_ROW_STOP_SHUTDOWN,
   LIVE_ROW_STOP_TEARDOWN,
   createLiveRowSequenceStop,
@@ -171,6 +172,7 @@ import {
   liveRowSequenceRunLine,
   liveRowSequenceStartLine,
   liveRowSequenceStopAskedLine,
+  liveRowStopCauseText,
   runLiveRowSequence,
   type LiveRowLaunchKindInput,
   type LiveRowSequenceLaunchKind,
@@ -1663,6 +1665,82 @@ describe('the stop signal: a result that arrives after the sequence was stopped 
 
     expect(outcome).toEqual({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED, runs: 0, kills: 0, judgedRuns: 0 })
     expect(h.stub.callCount()).toBe(before)
+  })
+})
+
+
+// b.jg5 SRJ-702: a kill retry the sequence's own stop ended raises its alert
+// with that stop's cause (`liveRowStopCauseText`), the fifth argument of the
+// alert dependency; tries the keep-going check ended with no stop of the
+// sequence's own (P latched meanwhile) raise it with no cause, so the
+// binding tells the cause itself (tests/session-manager.test.ts).
+describe('the stop\'s cause of a kill retry the sequence\'s stop ended (b.jg5 SRJ-702)', () => {
+  test('each stop reason\'s cause (pin)', () => {
+    expect(([LIVE_ROW_STOP_TEARDOWN, LIVE_ROW_STOP_SHUTDOWN, LIVE_ROW_STOP_NOT_UP, LIVE_ROW_STOP_LATCHED] as const).map((reason) => liveRowStopCauseText(reason))).toEqual([
+      "its live-row sequence was stopped: the persona's teardown began",
+      'its live-row sequence was stopped: the server is shutting down',
+      'its live-row sequence was stopped: the persona is not up',
+      'its live-row sequence was stopped: the persona latched',
+    ])
+  })
+
+  /** The step-1 kill's retry: `during` runs while its tries do, which then end stopped over a standing ErrTmuxKillFailed. */
+  function stoppedKill(during: () => void): LiveRowSequenceDeps['killWithRetry'] {
+    return async (_key, options) => {
+      during()
+      expect(options.keepGoing()).toBe(false)
+      const result: KillRetryResult = {
+        outcome: killOutcomeOf({ thrown: errTmuxKillFailed() }),
+        end: KILL_RETRY_END_STOPPED,
+        tries: 1,
+        reads: 0,
+        alert: { kind: KILL_RETRY_ALERT_ORDINARY },
+      }
+      return result
+    }
+  }
+
+  test.each([LIVE_ROW_STOP_TEARDOWN, LIVE_ROW_STOP_SHUTDOWN, LIVE_ROW_STOP_NOT_UP, LIVE_ROW_STOP_LATCHED] as const)('the sequence stopped for %s while its step-1 kill\'s tries ran: one alert raise, with the recovery context and that stop\'s cause; the sequence ends stopped for it', async (reason) => {
+    const { h, p } = build()
+    const stop = createLiveRowSequenceStop()
+    const raises: unknown[][] = []
+
+    const outcome = await runWithDeps(h, p, stop, {
+      killWithRetry: stoppedKill(() => {
+        stop.stop(reason)
+      }),
+      raiseKillAlert: (...args) => {
+        raises.push(args)
+      },
+    })
+
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason })
+    expect(raises).toHaveLength(1)
+    expect(raises[0]!.slice(0, 1)).toEqual([p])
+    expect(raises[0]!.slice(2)).toEqual([KILL_FAILURE_CONTEXT_RECOVERY, `persona=${p}`, liveRowStopCauseText(reason)])
+  })
+
+  test('tries the keep-going check ended because P latched, with no stop of the sequence\'s own: one alert raise with no stop\'s cause (four arguments); the sequence ends stopped as latched', async () => {
+    const { h, p } = build()
+    const stop = createLiveRowSequenceStop()
+    const raises: unknown[][] = []
+    const conflict = killOutcomeOf({ thrown: errTmuxSessionConflict('kill', 'not-this-launch') })
+
+    const outcome = await runWithDeps(h, p, stop, {
+      killWithRetry: async (key, options) => {
+        expect(await h.sequenceDeps.latchOnKillOutcome(key, conflict, { kind: 'state', state: LIVE }, `persona=${key}`)).toBe(true)
+        return stoppedKill(() => undefined)(key, options)
+      },
+      raiseKillAlert: (...args) => {
+        raises.push(args)
+      },
+    })
+
+    expect(stop.reason).toBeUndefined()
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED })
+    expect(raises).toHaveLength(1)
+    expect(raises[0]!).toHaveLength(4)
+    expect(raises[0]!.slice(2)).toEqual([KILL_FAILURE_CONTEXT_RECOVERY, `persona=${p}`])
   })
 })
 

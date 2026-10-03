@@ -17,7 +17,8 @@
  *   created `~/.claude/channels/slack`; main() now creates the state and
  *   inbox directories.
  * - The connection seams (SR-3.1, SR-3.4, SR-4.1, SR-7.2): the manager's dry
- *   run and up→flush listener, `connections = <manager>`, `clientFor` and
+ *   run and up→flush listener, the outage state's notify passing its options
+ *   to the persona notifier (b.jg5 SRJ-1002, SRJ-1003), `connections = <manager>`, `clientFor` and
  *   `identityFor` over the connection view, the routing's identity, client,
  *   archive and notice (`notify`, the persona notifier's, SR-7.3) seams, and
  *   the archive writer's per-persona resolver source.
@@ -116,7 +117,9 @@
  *   imported from the episodes module, in main()'s own statement list, before
  *   the retry controller, the restart module, the start bring-up and the
  *   health check, on the production clock, with the module-scope persona
- *   notifier's `notify` as its sink, and held in the one module-scope handle
+ *   notifier's `notify` as its sink (key, text and options passed through)
+ *   and that notifier's `teardownWindowState` as its teardown query, read
+ *   nowhere else (b.jg5 SRJ-1003), and held in the one module-scope handle
  *   assigned in main(); shutdown closes them once, through that handle,
  *   before it first yields (every episode ends, every alert check is
  *   cancelled, and no episode begins again).
@@ -1769,9 +1772,15 @@ describe('startupSessionManager runs the SR-6.1 bring-up over the loaded persona
 describe('server.ts wires the persona connection seams (SR-3.1, SR-3.4, SR-4.1, SR-7.2)', () => {
   test('the connection manager takes dry run from isDryRun() and, on each status, flushes on up the notifier every persona notice goes through and tells the bring-up controller', () => {
     const notifier = constOf('createPersonaNotifier')
-    // The notices' notifier: the session manager's sink and the outage state's notify.
+    // The notices' notifier: the session manager's sink and the outage state's
+    // notify. The outage notify passes its options through, so the notifier
+    // routes the all-clear of an outage whose onset a persona teardown's
+    // window routed as that onset was (b.jg5 SRJ-1002, SRJ-1003); the
+    // parameters' names are free.
     expect(onlyCallArgs('setSessionNotifier')).toEqual([`${notifier}.notify`])
-    expect(onlyCallProps('initOutageState').get('notify')).toContain(`${notifier}.notify(`)
+    expect(onlyCallProps('initOutageState').get('notify')).toMatch(
+      new RegExp(`^\\((\\w+), (\\w+), (\\w+)\\) => \\{ void ${notifier}\\.notify\\(\\1, \\2, \\3\\);? \\}$`),
+    )
 
     const props = onlyCallProps('createPersonaConnectionManager')
     expect(props.get('dryRun')).toBe('isDryRun()')
@@ -1810,6 +1819,15 @@ describe('server.ts wires the persona connection seams (SR-3.1, SR-3.4, SR-4.1, 
     expect(insideMain(onlyCallOf('createPersonaDestinations'))).toBe(false)
     expect(onlyCallProps('createPersonaNotifier').get('destinations')).toBe(resolver)
     expect(onlyCallProps('startPermissionPoller').get('destinations')).toBe(resolver)
+  })
+
+  // b.jg5 SRJ-1003: a stuck-prompt warning raised in a persona's teardown
+  // window goes to the notifier, whose window writes it; the poller is handed
+  // the one notifier main() builds.
+  test('the permission poller\'s teardownNotices is the one persona notifier (createPersonaNotifier\'s constant), beside its destination hold', () => {
+    const poller = onlyCallProps('startPermissionPoller')
+    expect(poller.get('teardownNotices')).toBe(constOf('createPersonaNotifier'))
+    expect(poller.get('destinationHold')).toBe(constOf('createPersonaDestinationHold'))
   })
 
   test('main() points the lookups at the manager: `connections = <manager>` once, inside main(), before the bring-up', () => {
@@ -2393,7 +2411,8 @@ describe('main() binds the restart module\'s pending deferral (deferPendingRow) 
 // latch to reach) would pass every behaviour suite. What the episodes do is
 // tested in tests/persona-episodes.test.ts and the teardown's forget in
 // tests/persona-lifecycle.test.ts and tests/reload-wiring.test.ts; pinned
-// here: the build, its dependencies and shutdown's close. A forget-all in its
+// here: the build, its dependencies (the sink and the teardown query, b.jg5
+// SRJ-1003) and shutdown's close. A forget-all in its
 // place would end every episode but leave a later begin open: a launch still
 // in flight at shutdown could open an episode and arm an alert check after it.
 // ---------------------------------------------------------------------------
@@ -2408,6 +2427,8 @@ describe('main() builds the one set of per-persona notice episodes before the st
   const SYSTEM_CLOCK: keyof typeof PersonaConnectionsModule = 'SYSTEM_PERSONA_CONNECTION_CLOCK'
   const NOTIFIER_FACTORY: keyof typeof PersonaNotifierModule = 'createPersonaNotifier'
   const NOTIFY: keyof PersonaNotifier = 'notify'
+  const TEARDOWN_WINDOW: keyof PersonaEpisodesDeps = 'teardownWindow'
+  const WINDOW_STATE: keyof PersonaNotifier = 'teardownWindowState'
 
   /** The one module-scope `let <handle>: PersonaEpisodes | undefined` shutdown reads. */
   const HANDLE = /^let\s+(\w+)\s*:\s*PersonaEpisodes\s*\|\s*undefined\s*$/gm
@@ -2458,10 +2479,34 @@ describe('main() builds the one set of per-persona notice episodes before the st
     expect(insideMain(onlyCallOf(NOTIFIER_FACTORY))).toBe(false)
     expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${notifier}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
 
-    // `<notifier>.notify`, or `(key, text) => { void <notifier>.notify(key, text) }`
-    // or the same call as an expression body; the parameters' names are free.
-    const call = `(?:void )?${notifier}\\.${NOTIFY}\\(\\1, \\2\\)`
-    expect(props.get(SINK)).toMatch(new RegExp(`^(?:${notifier}\\.${NOTIFY}|\\((\\w+), (\\w+)\\) => (?:\\{ ${call};? \\}|${call}))$`))
+    // Exactly `(key, text, options) => { void <notifier>.notify(key, text, options) }`,
+    // the parameters' names free: every argument passed through in order, so
+    // the kill-failure survivor version's class reaches the notifier's
+    // teardown window (b.jg5 SRJ-1003, SRJ-1013).
+    expect(props.get(SINK)).toMatch(new RegExp(`^\\((\\w+), (\\w+), (\\w+)\\) => \\{ void ${notifier}\\.${NOTIFY}\\(\\1, \\2, \\3\\);? \\}$`))
+  })
+
+  // b.jg5 SRJ-1003: the teardown query is optional (absent, every key reads
+  // `none`), so a production wiring with no query, a stand-in, or another
+  // notifier's query would type-check while an old half's posts reached the
+  // new half's destination between a teardown's submit and its turn, and the
+  // episodes' log-only routes bypassed the window. What the query does is
+  // tested in tests/persona-episodes.test.ts and the window in
+  // tests/persona-notifier.test.ts.
+  test('its teardown query is bound once, to the one module-scope persona notifier\'s teardownWindowState, the key passed through', () => {
+    const notifier = constOf(NOTIFIER_FACTORY)
+    expect(importSource(SERVER_CODE, NOTIFIER_FACTORY)).toBe('./persona-notifier.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${NOTIFIER_FACTORY}\\b`, 'g'), SERVER_CODE)).toEqual([])
+    expect(callsOf(NOTIFIER_FACTORY)).toHaveLength(1)
+    declaredOnce(notifier)
+
+    // `(key) => <notifier>.teardownWindowState(key)` (an expression body: a
+    // block with no return would answer undefined), or the method itself.
+    expect(onlyCallProps(FACTORY).get(TEARDOWN_WINDOW)).toMatch(
+      new RegExp(`^(?:${notifier}\\.${WINDOW_STATE}|\\(?(\\w+)\\)? => ${notifier}\\.${WINDOW_STATE}\\(\\1\\))$`),
+    )
+    // The notifier's query is read nowhere else in server.ts.
+    expect(indicesOf(new RegExp(`\\b${WINDOW_STATE}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
   })
 
   test('shutdown closes the episodes exactly once, through the handle, before it first yields, and nothing forgets them all', () => {

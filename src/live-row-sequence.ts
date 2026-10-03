@@ -543,6 +543,25 @@ export type LiveRowSequenceStopReason =
   | typeof LIVE_ROW_STOP_NOT_UP
 
 /**
+ * The stop's cause for a kill retry the sequence's own stop ended (b.jg5
+ * SRJ-702), for the stopped retry's one line and entry. Never throws.
+ */
+export function liveRowStopCauseText(reason: LiveRowSequenceStopReason): string {
+  switch (reason) {
+    case LIVE_ROW_STOP_TEARDOWN:
+      return "its live-row sequence was stopped: the persona's teardown began"
+    case LIVE_ROW_STOP_SHUTDOWN:
+      return 'its live-row sequence was stopped: the server is shutting down'
+    case LIVE_ROW_STOP_NOT_UP:
+      return 'its live-row sequence was stopped: the persona is not up'
+    case LIVE_ROW_STOP_LATCHED:
+      return 'its live-row sequence was stopped: the persona latched'
+    default:
+      return 'its live-row sequence was stopped'
+  }
+}
+
+/**
  * Arm P's retry timer with the not-judged cause (SRJ-717). The same string
  * as the retry controller's cause label for it
  * (`UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED` in `src/unavailable-retry.ts`,
@@ -720,8 +739,13 @@ export interface LiveRowSequenceDeps {
   killWithRetry(key: string, options: LiveRowSequenceKillOptions): Promise<KillRetryResult>
   /** Latch P on a kill's CONFLICT or UNUSABLE NAME with the state last read; answers whether it latched. */
   latchOnKillOutcome(key: string, outcome: KillOutcome, lastRead: LiveRowSequenceLastRead, ref: string): Promise<boolean>
-  /** Raise a kill retry's alert decision with the request's context. */
-  raiseKillAlert(key: string, retried: KillRetryResult, context: KillFailureAlertContext, ref: string): void
+  /**
+   * Raise a kill retry's alert decision with the request's context. For tries
+   * the sequence's own stop ended, `stopCause` names that stop
+   * (`liveRowStopCauseText`; b.jg5 SRJ-702: the stop's cause); absent, the
+   * binding tells the cause itself.
+   */
+  raiseKillAlert(key: string, retried: KillRetryResult, context: KillFailureAlertContext, ref: string, stopCause?: string): void
   /** Raise step 5's alert: the ordinary version with no description, with the request's context. */
   raiseEscalationAlert(key: string, context: KillFailureAlertContext, ref: string): void
   /** P's facts for step 6, against the row last read; undefined when P is not applied. */
@@ -1180,7 +1204,8 @@ export async function runLiveRowSequence(
       return halted()
     }
     if (killRetryStopped(retried)) {
-      raiseKillAlert(retried)
+      // SRJ-702: the stop's cause, when the sequence's own stop ended the tries.
+      raiseKillAlert(retried, stop.reason === undefined ? undefined : liveRowStopCauseText(stop.reason))
       if (stop.reason !== undefined) return { kind: LIVE_ROW_OUTCOME_STOPPED, reason: stop.reason }
       return { kind: LIVE_ROW_OUTCOME_STOPPED, reason: latchedNow() ? LIVE_ROW_STOP_LATCHED : LIVE_ROW_STOP_NOT_UP }
     }
@@ -1206,9 +1231,10 @@ export async function runLiveRowSequence(
     return { kind: LIVE_ROW_OUTCOME_ABORTED, step, errorClass: outcome.errorClass, latched }
   }
 
-  const raiseKillAlert = (retried: KillRetryResult): void => {
+  const raiseKillAlert = (retried: KillRetryResult, stopCause?: string): void => {
     try {
-      deps.raiseKillAlert(key, retried, request.alertContext, ref)
+      if (stopCause === undefined) deps.raiseKillAlert(key, retried, request.alertContext, ref)
+      else deps.raiseKillAlert(key, retried, request.alertContext, ref, stopCause)
     } catch {
       /* the alert's own failure changes nothing about the sequence */
     }

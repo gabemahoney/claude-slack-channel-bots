@@ -720,6 +720,7 @@ import {
   createLiveRowSequenceStop,
   LIVE_ROW_START_STARTED,
   liveRowSequenceStartLine,
+  liveRowStopCauseText,
   runLiveRowSequence,
   type LiveRowSequenceLaunchKind,
   type LiveRowSequenceRequest,
@@ -877,10 +878,12 @@ import {
   KILL_RETRY_END_READ_LATCHED,
   KILL_RETRY_END_ROW_FINISHED,
   KILL_RETRY_END_SETTLED,
+  KILL_RETRY_END_STOPPED,
   KILL_RETRY_SPACING_MS,
   KILL_RETRY_TRIES,
   killRetryEndLine,
   type KillRetryAlert,
+  type KillRetryResult,
 } from '../src/kill-retry.ts'
 import { buildTempArchiveDb, messagesSince } from './test-helpers/archive-db.ts'
 import {
@@ -977,11 +980,14 @@ import {
   KILL_FAILURE_END_ROW_GONE,
   createKillFailureAlerts,
   createPersonaEpisodes,
+  type KillFailureAlerts,
+  type KillFailureRaiseInput,
   type UnclassifiedErrorSink,
 } from '../src/persona-episodes.ts'
 import {
   KILL_FAILURE_CLOSING_DESTINATION_LATCHED,
   KILL_FAILURE_CLOSING_LOG_ONLY,
+  KILL_FAILURE_CONTEXT_RECOVERY,
   KILL_FAILURE_CONTEXT_START_SWEEP,
   KILL_FAILURE_VERSION_ORDINARY,
   KILL_FAILURE_VERSION_SURVIVOR,
@@ -990,6 +996,7 @@ import {
   PERSONA_KILL_SURVIVOR_LABEL,
   killFailureAlertEntryText,
   killFailureAlertText,
+  killFailureClosingSentence,
   type KillFailureAlertContent,
 } from '../src/kill-failure-alert.ts'
 import { getFailureCount } from '../src/backoff.ts'
@@ -1004,8 +1011,12 @@ import {
   killFailureNotRaisedLine,
   killFailureNotice,
   killFailurePostedLine,
+  KILL_FAILURE_STOP_CAUSE_NOT_UP,
+  KILL_FAILURE_STOP_CAUSE_RECHECK,
+  KILL_FAILURE_STOP_CAUSE_SHUTDOWN,
   killFailureRecoveryEntry,
-  killFailureStoppedSurvivorLine,
+  killFailureStoppedEntry,
+  killFailureStoppedEntryLine,
   makeRecoveryHarness,
   ordinaryAlertContent,
   ownRowsLiveThenMissing,
@@ -1141,7 +1152,11 @@ import { loadRetiredKeyStore, RETIRED_KEY_CAUSE_REMOVED } from '../src/retired-k
 import { RETIRED_ENTRY_CLEARING_STATES } from '../src/row-read-rules.ts'
 import {
   _resetRetiredKeyStore,
+  PERSONA_KILL_STOP_CAUSE_GENERIC,
+  raisePersonaKillFailureAlert,
   retiredKeyReadingOf,
+  setPersonaKillKeepGoingQuery,
+  type PersonaKillKeepGoingQuery,
   setLiveRowSequenceRegistry,
   setRetiredKeyStore,
   SPAWN_ACTION_FRESH_RETIRED,
@@ -15480,10 +15495,12 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the live-r
     expect(h.killFailureOpen(p)).toBe(false)
   })
 
-  // Tries stopped by the keep-going check while ErrTmuxKillFailed stands
-  // leave nothing to retry the kill, so no "CSCB keeps retrying" alert is
-  // posted.
-  test('the keep-going check stops the tries because the server is shutting down while ErrTmuxKillFailed stands: one line carrying the decision and the redacted description, no post and no episode', async () => {
+  // b.jg5 SRJ-702: tries stopped by the keep-going check while
+  // ErrTmuxKillFailed stands are no notice: neither version is raised and
+  // nothing is posted; one line names the context, the last outcome's class,
+  // the stop's cause and the redacted description; a configured persona gets
+  // that line only.
+  test('the keep-going check stops the tries because the server is shutting down while ErrTmuxKillFailed stands: one line naming the last outcome\'s class, the stop\'s cause and the redacted description; no post, no episode, no entry', async () => {
     const { h, p } = srj105Build()
     const err = errTmuxKillFailed()
     scriptLiveRowElsewhere(h, p, { killError: err })
@@ -15501,14 +15518,14 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the live-r
     expect(h.stub.calls.killCalls).toHaveLength(1)
     expect(h.episodeNotices).toEqual([])
     expect(h.killFailureOpen(p)).toBe(false)
-    expect(killFailureLines(h, p)).toEqual([killFailureNotRaisedLine(p, { last: err })])
+    expect(killFailureLines(h, p)).toEqual([killFailureNotRaisedLine(p, liveRowStopCauseText(LIVE_ROW_STOP_SHUTDOWN), { last: err })])
     expect(h.startupErrors()).toEqual([])
   })
 
-  // b.jg5 SRJ-702: the survivor-naming failure is the only report of the
-  // surviving process, so a stopped ordinary decision that carries it is
-  // kept in one persona-kill-failed entry; still nothing is posted.
-  test('a survivor-naming ErrTmuxKillFailed, then an ErrTmuxKillFailed naming no survivor that stands as the keep-going check stops the tries (the server shutting down): one persona-kill-failed entry quoting both, with the log-only closing and the recovery context, after the not-raised line; no post and no episode', async () => {
+  // b.jg5 SRJ-702: a stopped retry's line quotes the latest survivor-naming
+  // description when a try returned one; for a configured persona that line
+  // is all: no entry, no post, neither version.
+  test('a survivor-naming ErrTmuxKillFailed, then an ErrTmuxKillFailed naming no survivor that stands as the keep-going check stops the tries (the server shutting down): the one stop line quotes both descriptions; no entry, no post and no episode', async () => {
     const { h, p } = srj105Build()
     const survivor = survivorErr()
     const last = errTmuxKillFailed(undefined, 'unverifiable-session-present')
@@ -15525,17 +15542,17 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the live-r
     expect(await launchThroughSequence(h, p)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_SHUTDOWN })
 
     expect(h.stub.calls.killCalls).toHaveLength(2)
-    expect(startupEntriesOf(h, PERSONA_KILL_FAILED_LABEL)).toEqual([killFailureRecoveryEntry(p, ordinaryAlertContent(p, { last, earlierSurvivor: survivor }))])
-    expect(h.startupErrors()).toHaveLength(1)
+    expect(h.startupErrors()).toEqual([])
     expect(h.episodeNotices).toEqual([])
     expect(h.killFailureOpen(p)).toBe(false)
-    expect(killFailureLines(h, p)).toEqual([killFailureNotRaisedLine(p, { last, earlierSurvivor: survivor }), killFailureStoppedSurvivorLine(p)])
+    expect(killFailureLines(h, p)).toEqual([killFailureNotRaisedLine(p, liveRowStopCauseText(LIVE_ROW_STOP_SHUTDOWN), { last, earlierSurvivor: survivor })])
   })
 
-  // SRJ-704 rule 4 before the stop's line: P removed from the applied
-  // configuration during the tries is not up, so the keep-going check stops
-  // them, and the ordinary decision takes the not-configured route.
-  test('the keep-going check stops the tries because P was removed from the applied configuration while ErrTmuxKillFailed stands: one persona-kill-failed entry with the recovery context; no post, no episode, no further kill', async () => {
+  // b.jg5 SRJ-702, SRJ-1013: P removed from the applied configuration during
+  // the tries is not up, so the keep-going check stops them; a persona
+  // removed during the tries also gets its persona-kill-failed entry, whose
+  // text is the stop's line, with no alert text.
+  test('the keep-going check stops the tries because P was removed from the applied configuration while ErrTmuxKillFailed stands: the stop line, then one persona-kill-failed entry holding that line with the recovery context and no alert text; no post, no episode, no further kill', async () => {
     const { h, p } = srj105Build()
     const err = errTmuxKillFailed()
     scriptLiveRowElsewhere(h, p, { killError: err })
@@ -15552,12 +15569,148 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the live-r
 
     expect(h.stub.calls.killCalls).toHaveLength(1)
     expect(h.stub.calls.statusCalls).toEqual([])
-    expect(startupEntriesOf(h, PERSONA_KILL_FAILED_LABEL)).toEqual([killFailureRecoveryEntry(p, ordinaryAlertContent(p, { last: err }))])
-    expect(startupEntriesOf(h, PERSONA_KILL_SURVIVOR_LABEL)).toEqual([])
+    expect(startupEntriesOf(h, PERSONA_KILL_FAILED_LABEL)).toEqual([killFailureStoppedEntry(p, KILL_FAILURE_STOP_CAUSE_NOT_UP, { last: err })])
+    expect(h.startupErrors()).toHaveLength(1)
+    // No alert text: neither version's closing sentence, nor its body.
+    const [entry] = startupEntriesOf(h, PERSONA_KILL_FAILED_LABEL)
+    expect(entry).not.toContain(killFailureAlertText(ordinaryAlertContent(p, { last: err }), KILL_FAILURE_CLOSING_LOG_ONLY, false))
+    expect(entry).not.toContain(killFailureClosingSentence(KILL_FAILURE_VERSION_ORDINARY, KILL_FAILURE_CLOSING_LOG_ONLY))
+    expect(killFailureLines(h, p)).toEqual([killFailureNotRaisedLine(p, KILL_FAILURE_STOP_CAUSE_NOT_UP, { last: err }), killFailureStoppedEntryLine(p)])
     expect(h.episodeNotices).toEqual([])
     expect(h.notices).toEqual([])
     expect(h.killFailureOpen(p)).toBe(false)
     expect(h.triggers).toEqual([])
+  })
+
+  // b.jg5 SRJ-702, SRJ-204: an ordinary decision whose last outcome's version
+  // re-check decided that the server stops is a stopped retry too, raised
+  // through raisePersonaKillFailureAlert into the installed alerts: its one
+  // line names that outcome's class and the re-check as the stop's cause.
+  test('an ordinary decision (a survivor-naming failure, then an ErrInvalidFlags whose re-check stops the server): one stop line naming the standing outcome\'s class and the re-check as the cause, quoting the survivor-naming description; no post, no entry, no episode', () => {
+    const { h, p } = srj105Build()
+    const survivor = survivorErr()
+    const standing = killOutcomeOf({ thrown: errInvalidFlags('kill') })
+    if (standing.kind !== KILL_OUTCOME_NOT_KILLED) throw new Error('an ErrInvalidFlags kill is a non-success')
+    const retried: KillRetryResult = {
+      outcome: { ...standing, recheck: RECHECK_OUTCOME_STOP } as KillOutcome,
+      end: KILL_RETRY_END_SETTLED,
+      tries: 2,
+      reads: 1,
+      alert: { kind: KILL_RETRY_ALERT_ORDINARY, earlierSurvivorDescription: killFailedDescriptionOf(survivor)! },
+    }
+
+    raisePersonaKillFailureAlert(p, retried, 'test-site', `persona=${p}`)
+
+    expect(killFailureLines(h, p)).toEqual([
+      killFailureNotRaisedLine(p, KILL_FAILURE_STOP_CAUSE_RECHECK, { earlierSurvivor: survivor }, standing.errorClass),
+    ])
+    expect(h.episodeNotices).toEqual([])
+    expect(h.startupErrors()).toEqual([])
+    expect(h.killFailureOpen(p)).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-702: the stop's cause a stopped retry's alert input carries
+//
+// `raisePersonaKillFailureAlert` hands the alerts the last outcome's class
+// and the stop's cause: the caller's own (the live-row sequence passes its
+// stop's, `liveRowStopCauseText`), else what the server's keep-going query
+// tells as the alert is raised (the server shutting down first, then the
+// persona torn down or not up), else the generic cause; a version re-check
+// that stops the server is its own cause. Over recording alerts, so only the
+// input is asserted; the alerts' line for it is tests/persona-episodes.test.ts's.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-702: the stop\'s cause raisePersonaKillFailureAlert hands the alerts for a stopped retry', () => {
+  const KEY = 'stop_cause_key'
+
+  afterEach(() => {
+    setPersonaKillKeepGoingQuery(undefined)
+  })
+
+  /** Alerts that record each raise's input and answer `stopped`. */
+  function recordingAlerts(): { alerts: KillFailureAlerts; inputs: KillFailureRaiseInput[] } {
+    const inputs: KillFailureRaiseInput[] = []
+    const alerts = {
+      raise: (input: KillFailureRaiseInput) => {
+        inputs.push(input)
+        return 'stopped' as const
+      },
+    } as unknown as KillFailureAlerts
+    return { alerts, inputs }
+  }
+
+  /** An ordinary decision over a standing ErrTmuxKillFailed whose tries ended as `end`. */
+  function retryEndedBy(end: KillRetryResult['end']): KillRetryResult {
+    const err = errTmuxKillFailed()
+    return {
+      outcome: killOutcomeOf({ thrown: err }),
+      end,
+      tries: 1,
+      reads: 0,
+      alert: { kind: KILL_RETRY_ALERT_ORDINARY, lastKillFailedDescription: killFailedDescriptionOf(err)! },
+    }
+  }
+
+  /** A keep-going query answering `shuttingDown` and `up`, either of which may throw. */
+  function query(shuttingDown: boolean | 'throws', up: boolean | 'throws'): PersonaKillKeepGoingQuery {
+    return {
+      isShuttingDown: () => {
+        if (shuttingDown === 'throws') throw new Error('shutdown flag unreadable')
+        return shuttingDown
+      },
+      isPersonaUp: () => {
+        if (up === 'throws') throw new Error('up predicate unreadable')
+        return up
+      },
+    }
+  }
+
+  test('the generic cause\'s wording (pin)', () => {
+    expect(PERSONA_KILL_STOP_CAUSE_GENERIC).toBe(
+      'its keep-going check answered false: the persona is torn down or not up, or the server is shutting down',
+    )
+  })
+
+  // Rows: the keep-going query installed (none, or its two answers), and the cause handed on.
+  test.each<[string, PersonaKillKeepGoingQuery | undefined, string]>([
+    ['no query installed: the generic cause', undefined, PERSONA_KILL_STOP_CAUSE_GENERIC],
+    ['the server shutting down, the persona up', query(true, true), KILL_FAILURE_STOP_CAUSE_SHUTDOWN],
+    ['the server shutting down and the persona not up: the shutdown first', query(true, false), KILL_FAILURE_STOP_CAUSE_SHUTDOWN],
+    ['the persona torn down or not up, the server not shutting down', query(false, false), KILL_FAILURE_STOP_CAUSE_NOT_UP],
+    ['the query telling neither (the caller\'s own keep-going stopped the tries): the generic cause', query(false, true), PERSONA_KILL_STOP_CAUSE_GENERIC],
+    ['a shutdown read that throws: the generic cause', query('throws', false), PERSONA_KILL_STOP_CAUSE_GENERIC],
+    ['an up read that throws: the generic cause', query(false, 'throws'), PERSONA_KILL_STOP_CAUSE_GENERIC],
+  ])('tries stopped with %s', (_label, installed, cause) => {
+    setPersonaKillKeepGoingQuery(installed)
+    const { alerts, inputs } = recordingAlerts()
+
+    raisePersonaKillFailureAlert(KEY, retryEndedBy(KILL_RETRY_END_STOPPED), 'test-site', `persona=${KEY}`, KILL_FAILURE_CONTEXT_RECOVERY, alerts)
+
+    expect(inputs).toHaveLength(1)
+    expect(inputs[0]).toMatchObject({ key: KEY, stopped: true, lastOutcomeClass: AD_ERROR_CLASS_UNAVAILABLE, stopCause: cause })
+  })
+
+  // The live-row sequence's own stop, passed by the caller, wins over what the query tells.
+  test.each([LIVE_ROW_STOP_TEARDOWN, LIVE_ROW_STOP_SHUTDOWN] as const)('a caller\'s own cause (the live-row sequence stopped for %s) is handed on as given, whatever the query tells', (reason) => {
+    setPersonaKillKeepGoingQuery(query(false, false))
+    const { alerts, inputs } = recordingAlerts()
+
+    raisePersonaKillFailureAlert(KEY, retryEndedBy(KILL_RETRY_END_STOPPED), 'test-site', `persona=${KEY}`, KILL_FAILURE_CONTEXT_RECOVERY, alerts, liveRowStopCauseText(reason))
+
+    expect(inputs).toEqual([expect.objectContaining({ stopped: true, stopCause: liveRowStopCauseText(reason) })])
+  })
+
+  test('a retry that was not stopped carries no stop\'s cause and no last outcome\'s class, even with a caller\'s cause given', () => {
+    setPersonaKillKeepGoingQuery(query(true, false))
+    const { alerts, inputs } = recordingAlerts()
+
+    raisePersonaKillFailureAlert(KEY, retryEndedBy(KILL_RETRY_END_EXHAUSTED), 'test-site', `persona=${KEY}`, KILL_FAILURE_CONTEXT_RECOVERY, alerts, 'a cause')
+
+    expect(inputs).toHaveLength(1)
+    expect(inputs[0]!.stopped).toBe(false)
+    expect(Object.keys(inputs[0]!).filter((name) => name === 'stopCause' || name === 'lastOutcomeClass')).toEqual([])
   })
 })
 

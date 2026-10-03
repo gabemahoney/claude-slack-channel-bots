@@ -19,9 +19,10 @@
  *   once per mark in the open episode, and never when none is open. A kind
  *   with one text uses the default mark; a kind with two texts (stuck
  *   launch) gives each its own mark, so each posts at most once.
- * - `postWithoutEpisode(key, kind, text)` hands `text` to the notice sink
- *   with no episode read or changed (the kill-failure alert's survivor
- *   version, posted once per bounded retry); never after `close`.
+ * - `postWithoutEpisode(key, kind, text, options?)` hands `text` to the
+ *   notice sink with no episode read or changed (the kill-failure alert's
+ *   survivor version, posted once per bounded retry, and any kill-failure
+ *   alert raised during a persona teardown); never after `close`.
  * - `end(key, kind)` ends the open episode silently: a later `begin` opens a
  *   new one, whose post is made again.
  * - `forget(key)` ends every kind's episode of one persona silently (its
@@ -35,6 +36,27 @@
  *   the episode (the `tmux-unresponsive` alert check) is cancelled with it.
  * - `openKeys(kind)` lists the keys with an open episode of the kind; `clock`
  *   is the clock the start times come from.
+ * - `teardownWindowState(key)` reads the injected teardown query (b.jg5
+ *   SRJ-1003; production: the persona notifier's `teardownWindowState`).
+ *
+ * A persona teardown (b.jg5 SRJ-1002, SRJ-1003). From the teardown's submit
+ * until its serializer turn opens its window (`submitted`), a post or a
+ * `postWithoutEpisode` for the key reaches no sink: one line says it was not
+ * posted, and a post still counts as posted in its episode, so an old half's
+ * `tmux-unresponsive` onset, alert or recovery never reaches the new half's
+ * destination. While the window is open (`open`) every post is handed to the
+ * sink, whose window (the persona notifier's) writes it as a server-log line
+ * and a `persona-teardown-notice` startup-errors entry and posts nothing; the
+ * log-only routes below take that route too, in place of their own classes:
+ * the unclassified-error alert for a key no longer applied, and every
+ * kill-failure alert for the key (its route chosen with the context `persona
+ * teardown`, SRJ-704's first match, so the survivor version's entry is
+ * `persona-kill-survivor`). A kill-failure decision whose tries were stopped
+ * (SRJ-702) is no notice: it is decided before the window, and writes no
+ * `persona-teardown-notice` entry. The muted post's line (each poster's own
+ * line then says its notice was not posted, not that it was):
+ *
+ *   [slack] persona-episodes: persona=<key> <kind> notice not posted — its persona teardown was submitted (b.jg5 SRJ-1003)
  * - `count(key, kind)`, `addCount(key, kind)` and `resetCount(key, kind)`
  *   keep a per-persona, per-kind count of consecutive observations, for a
  *   kind whose post waits for a run of them (the slow dead-session recovery
@@ -171,6 +193,15 @@
  *   [slack] persona-episodes: persona=<key> tmux-unresponsive recovery posted
  *   [slack] persona-episodes: persona=<key> tmux-unresponsive recovery not posted — a silent end (a CONFLICT answer ended it)
  *
+ * When the key's persona teardown was submitted and its window is not open
+ * yet (b.jg5 SRJ-1003), the onset, the alert and the recovery reach no sink
+ * but still count as posted in their episode; their lines say so in place of
+ * the posted ones:
+ *
+ *   [slack] persona-episodes: persona=<key> tmux-unresponsive onset not posted — muted, its persona teardown was submitted; it counts as posted in its episode; still not answering at <a health tick|a retry>, <s> s after its first refusal
+ *   [slack] persona-episodes: persona=<key> tmux-unresponsive alert not posted — muted, its persona teardown was submitted; it counts as posted in its episode; not answering for <s> s, over its alert threshold of <s> s
+ *   [slack] persona-episodes: persona=<key> tmux-unresponsive recovery not posted — muted, its persona teardown was submitted
+ *
  * and, only on a failure: `alert check not armed: <error>`, `alert check
  * failed: <error>`, `onset check at a retry failed: <error>`, `alert check
  * cancel failed: <error>` (each after `persona=<key> tmux-unresponsive`),
@@ -196,12 +227,16 @@
  *   threshold in effect now (the injected accessor, read at each check), the
  *   alert is posted once, quoting this outcome. No timer: an outcome met past
  *   the threshold posts it, and none posts it otherwise.
- * - The alert's route is decided when it is posted: a persona in the applied
- *   configuration (the injected lookup) gets it through the episodes' sink
- *   (its destination); any other persona gets it through the injected
- *   log-only route (in production `recordStartupError` with
- *   `PERSONA_UNCLASSIFIED_ERROR_LABEL`, the key and the unescaped text), and
- *   nothing reaches Slack. Either way it counts as posted.
+ * - The alert's route is decided when it is posted: while the persona's
+ *   teardown window is open (b.jg5 SRJ-1003) it goes, unescaped, through the
+ *   episodes' sink, whose window writes it as a `persona-teardown-notice`
+ *   entry and posts nothing, whether the persona is configured or not;
+ *   otherwise a persona in the applied configuration (the injected lookup)
+ *   gets it through the episodes' sink (its destination); any other persona
+ *   gets it through the injected log-only route (in production
+ *   `recordStartupError` with `PERSONA_UNCLASSIFIED_ERROR_LABEL`, the key and
+ *   the unescaped text), and nothing reaches Slack. Either way it counts as
+ *   posted.
  * - `end(key, reason)` ends the episode silently: `retryStopped(key, stop)`,
  *   bound in `main()` to every stop of the retry timer, ends it for the stops
  *   that mean the retries are over because the persona's state got better:
@@ -232,7 +267,9 @@
  *
  *   [slack] persona-episodes: persona=<key> unclassified-error started — <describeAdErrorClassification>
  *   [slack] persona-episodes: persona=<key> unclassified-error alert posted to its destination — <met>
+ *   [slack] persona-episodes: persona=<key> unclassified-error alert not posted to its destination — muted, its persona teardown was submitted; it counts as posted in its episode; <met>
  *   [slack] persona-episodes: persona=<key> unclassified-error alert written to the server log and startup-errors.log (persona-unclassified-error) — the persona is not in the applied configuration; <met>
+ *   [slack] persona-episodes: persona=<key> unclassified-error alert written to the server log and startup-errors.log (persona-teardown-notice) — raised during its persona teardown; <met>
  *   [slack] persona-episodes: persona=<key> unclassified-error ended — <reason>
  *
  * where `<met>` is `an UNCLASSIFIED outcome met <s> s after the episode's
@@ -252,7 +289,9 @@
  *
  * The notice sink is the persona notifier's post in production (`main()` in
  * `src/server.ts`), which adds the persona prefix and holds a notice until
- * the persona's client is validated. A sink that throws or rejects is logged
+ * the persona's client is validated; while the key's teardown window is open
+ * it writes the notice instead (the sink's options carry the survivor
+ * version's class). A sink that throws or rejects is logged
  * through the injected log, with the text counted as posted; so is a
  * `whenClosed` disposer that throws (`episode close step failed`). The clock is
  * injected in `PersonaConnectionClock`'s shape (`now`, `setTimeout`,
@@ -273,20 +312,30 @@ import {
 } from './ad-error-class.ts'
 import { armNeverEarlyWait, wholeMinutes } from './ad-settings.ts'
 import {
-  KILL_FAILURE_CLOSING_LOG_ONLY,
+  KILL_FAILURE_CONTEXT_CLI_TEARDOWN,
+  KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN,
+  KILL_FAILURE_CONTEXT_START_SWEEP,
   KILL_FAILURE_VERSION_ORDINARY,
   PERSONA_KILL_FAILED_LABEL,
+  PERSONA_KILL_SURVIVOR_LABEL,
   describeKillFailureDescriptions,
   killFailureAlertContentOf,
   killFailureAlertEntryText,
   killFailureAlertText,
   selectKillFailureAlertRoute,
+  type KillFailureAlertContent,
   type KillFailureAlertContext,
 } from './kill-failure-alert.ts'
 import type { KillRetryAlert } from './kill-retry.ts'
 import { describeThrownValue, isSafeIdentifier } from './persona-connection-errors.ts'
 import { SYSTEM_PERSONA_CONNECTION_CLOCK, type PersonaConnectionClock } from './persona-connections.ts'
 import { personaInstanceId, personaTmuxSessionName } from './persona-identity.ts'
+import {
+  PERSONA_TEARDOWN_NOTICE_LABEL,
+  personaTeardownNoticeEntryText,
+  type PersonaNoticeOptions,
+  type PersonaTeardownWindowState,
+} from './persona-notifier.ts'
 import { escapeSlackControlCharacters } from './slack-text-escape.ts'
 import {
   UNAVAILABLE_RETRY_STOP_RECOVERED,
@@ -296,6 +345,14 @@ import {
   UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED,
   UNAVAILABLE_RETRY_TERMINAL_STOPS,
 } from './unavailable-retry.ts'
+
+/**
+ * Why a poster's post reached no sink: the key's persona teardown was
+ * submitted and its window is not open yet (b.jg5 SRJ-1003). The post still
+ * counts as posted in its episode; the poster's line says it was not posted.
+ * Exported for the posters outside this module (`src/slow-recovery.ts`).
+ */
+export const MUTED_BY_TEARDOWN = 'muted, its persona teardown was submitted'
 
 // ---------------------------------------------------------------------------
 // Kinds (b.jg5 SRJ-1016)
@@ -426,17 +483,38 @@ export const PERSONA_EPISODE_DEFAULT_MARK = 'notice'
 /** The clock and timers an instance uses (the shared fake clock satisfies it in tests). */
 export type PersonaEpisodesClock = PersonaConnectionClock
 
-/** Receives each notice to post: the persona key and the notice body (production: the persona notifier's post). */
-export type PersonaEpisodeSink = (key: string, text: string) => void | Promise<void>
+/**
+ * A notice's options for the sink: the kill-failure alert's survivor version
+ * raised during a persona teardown carries its entry's class
+ * (`persona-kill-survivor`, b.jg5 SRJ-1003, SRJ-1013).
+ */
+export type PersonaEpisodeSinkOptions = Pick<PersonaNoticeOptions, 'teardownEntryClass'>
+
+/**
+ * Receives each notice to post: the persona key, the notice body and its
+ * options when it has any (production: the persona notifier's post).
+ */
+export type PersonaEpisodeSink = (key: string, text: string, options?: PersonaEpisodeSinkOptions) => void | Promise<void>
 
 /** Dependencies of `createPersonaEpisodes`. */
 export interface PersonaEpisodesDeps {
   /** Receives each notice a post makes. */
   sink: PersonaEpisodeSink
-  /** Receives each `[slack]` line (the server log): only a sink or a close step that throws or rejects. A throwing log is swallowed. */
+  /**
+   * Receives each `[slack]` line (the server log): a sink or a close step
+   * that throws or rejects, and a post not made because the key's persona
+   * teardown was submitted. A throwing log is swallowed.
+   */
   log: (line: string) => void
   /** Clock and timers; `SYSTEM_PERSONA_CONNECTION_CLOCK` by default. */
   clock?: PersonaEpisodesClock
+  /**
+   * Where the key stands with its persona teardown (b.jg5 SRJ-1003;
+   * production: the persona notifier's `teardownWindowState`): `submitted`
+   * mutes the key's posts, `open` routes the log-only routes through the sink
+   * (see the module comment). Absent, or a throw: `none` (a throw is logged).
+   */
+  teardownWindow?: (key: string) => PersonaTeardownWindowState
 }
 
 /**
@@ -485,12 +563,16 @@ export interface PersonaEpisodes {
    */
   post(key: string, kind: PersonaEpisodeKind, text: string, mark?: string): boolean
   /**
-   * Hand `text` to the sink for a notice of this kind that has no episode
-   * (the kill-failure alert's survivor version, b.jg5 SRJ-704): no episode is
-   * read, begun or changed. Returns true when it was handed over; false after
-   * `close`.
+   * Hand `text` to the sink, with `options`, for a notice of this kind that
+   * has no episode (the kill-failure alert's survivor version, b.jg5
+   * SRJ-704, and any kill-failure alert raised during a persona teardown,
+   * SRJ-1003): no episode is read, begun or changed. Returns true when it was
+   * handed over, or muted because the key's persona teardown was submitted;
+   * false after `close`.
    */
-  postWithoutEpisode(key: string, kind: PersonaEpisodeKind, text: string): boolean
+  postWithoutEpisode(key: string, kind: PersonaEpisodeKind, text: string, options?: PersonaEpisodeSinkOptions): boolean
+  /** Where the key stands with its persona teardown (the injected query; `none` when absent). Never throws. */
+  teardownWindowState(key: string): PersonaTeardownWindowState
   /** Whether this mark (`PERSONA_EPISODE_DEFAULT_MARK` when none is given) was posted in the open episode. */
   hasPosted(key: string, kind: PersonaEpisodeKind, mark?: string): boolean
   /** End the open episode silently. Returns whether one was open. */
@@ -592,11 +674,32 @@ export function createPersonaEpisodes(deps: PersonaEpisodesDeps): PersonaEpisode
     if (replaced !== undefined) dispose(key, kind, replaced)
   }
 
-  function send(key: string, kind: PersonaEpisodeKind, text: string): void {
+  /** The injected teardown query; absent reads `none`, a throw `none` with one line. Never throws. */
+  function teardownWindowState(key: string): PersonaTeardownWindowState {
+    if (deps.teardownWindow === undefined) return 'none'
+    try {
+      const state = deps.teardownWindow(key)
+      return state === 'open' || state === 'submitted' ? state : 'none'
+    } catch (err) {
+      safeLog(deps.log, `[slack] persona-episodes: persona=${key} teardown window read failed: ${describeThrownValue(err)} — read as none`)
+      return 'none'
+    }
+  }
+
+  /**
+   * Hand a notice to the sink, unless the key's persona teardown was
+   * submitted and its window is not open yet (b.jg5 SRJ-1003): then one line
+   * says it was not posted, and nothing reaches the sink.
+   */
+  function send(key: string, kind: PersonaEpisodeKind, text: string, options?: PersonaEpisodeSinkOptions): void {
+    if (teardownWindowState(key) === 'submitted') {
+      safeLog(deps.log, `[slack] persona-episodes: persona=${key} ${kind} notice not posted — its persona teardown was submitted (b.jg5 SRJ-1003)`)
+      return
+    }
     const failed = (err: unknown): void =>
       safeLog(deps.log, `[slack] persona-episodes: persona=${key} ${kind} notice failed: ${describeThrownValue(err)}`)
     try {
-      void Promise.resolve(deps.sink(key, text)).catch(failed)
+      void Promise.resolve(options === undefined ? deps.sink(key, text) : deps.sink(key, text, options)).catch(failed)
     } catch (err) {
       failed(err)
     }
@@ -637,11 +740,13 @@ export function createPersonaEpisodes(deps: PersonaEpisodesDeps): PersonaEpisode
       return true
     },
 
-    postWithoutEpisode(key, kind, text) {
+    postWithoutEpisode(key, kind, text, options) {
       if (closed) return false
-      send(key, kind, text)
+      send(key, kind, text, options)
       return true
     },
+
+    teardownWindowState,
 
     hasPosted: (key, kind, mark = PERSONA_EPISODE_DEFAULT_MARK) => open(key, kind)?.posted.has(mark) ?? false,
 
@@ -1066,10 +1171,12 @@ export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionD
       if (current === undefined || current.episode !== episode) return
       const thresholdMs = deps.alertThresholdMs?.()
       if (thresholdMs === undefined) return
+      const muted = episodes.teardownWindowState(key) === 'submitted'
       if (!episodes.post(key, kind, tmuxUnresponsiveAlertText(key, thresholdMs), ALERT_MARK)) return
       line(
         key,
-        `alert posted — not answering for ${seconds(episodes.clock.now() - current.startedAt)} s, ` +
+        `${muted ? `alert not posted — ${MUTED_BY_TEARDOWN}; it counts as posted in its episode;` : 'alert posted —'} ` +
+          `not answering for ${seconds(episodes.clock.now() - current.startedAt)} s, ` +
           `over its alert threshold of ${seconds(thresholdMs)} s`,
       )
     } catch (err) {
@@ -1100,8 +1207,10 @@ export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionD
       line(key, 'onset not posted — its retry timer stopped and no refusal has re-armed it')
       return
     }
+    const muted = episodes.teardownWindowState(key) === 'submitted'
     if (!episodes.post(key, kind, tmuxUnresponsiveOnsetText(key), ONSET_MARK)) return
-    line(key, `onset posted — still not answering at ${where}, ${seconds(now - current.startedAt)} s after its first refusal`)
+    const what = muted ? `onset not posted — ${MUTED_BY_TEARDOWN}; it counts as posted in its episode;` : 'onset posted —'
+    line(key, `${what} still not answering at ${where}, ${seconds(now - current.startedAt)} s after its first refusal`)
   }
 
   return {
@@ -1130,10 +1239,11 @@ export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionD
       // holds the onset back once it has posted).
       const noticePosted = episodes.hasPosted(key, kind, ONSET_MARK) || episodes.hasPosted(key, kind, ALERT_MARK)
       const silent = options?.silent === true
+      const muted = episodes.teardownWindowState(key) === 'submitted'
       const recovered = noticePosted && !silent && episodes.post(key, kind, tmuxUnresponsiveRecoveryText(key), RECOVERY_MARK)
       episodes.end(key, kind)
       line(key, `ended — ${endText(reason)}`)
-      if (recovered) line(key, 'recovery posted')
+      if (recovered) line(key, muted ? `recovery not posted — ${MUTED_BY_TEARDOWN}` : 'recovery posted')
       else if (noticePosted && silent) line(key, 'recovery not posted — a silent end (a CONFLICT answer ended it)')
       try {
         deps.conditionEnded?.(key, reading)
@@ -1425,9 +1535,23 @@ export function createUnclassifiedErrorEpisodes(deps: UnclassifiedErrorEpisodesD
       if (alerted.get(key) === episode) alerted.delete(key)
     })
     const met = `an UNCLASSIFIED outcome met ${seconds(elapsedMs)} s after the episode's first, over its alert threshold of ${seconds(thresholdMs)} s: ${describeAdErrorClassification(classification)}`
+    // b.jg5 SRJ-1003, SRJ-704's first match: during the persona's teardown
+    // the alert is a teardown notice, configured or not: the sink's window
+    // writes it (unescaped) and posts nothing.
+    if (episodes.teardownWindowState(key) === 'open') {
+      episodes.post(key, kind, unclassifiedErrorAlertText(classification, { escapeForSlack: false }), UNCLASSIFIED_ALERT_MARK)
+      line(key, `alert written to the server log and startup-errors.log (${PERSONA_TEARDOWN_NOTICE_LABEL}) — raised during its persona teardown; ${met}`)
+      return
+    }
     if (configured(key)) {
+      const muted = episodes.teardownWindowState(key) === 'submitted'
       episodes.post(key, kind, unclassifiedErrorAlertText(classification), UNCLASSIFIED_ALERT_MARK)
-      line(key, `alert posted to its destination — ${met}`)
+      line(
+        key,
+        muted
+          ? `alert not posted to its destination — ${MUTED_BY_TEARDOWN}; it counts as posted in its episode; ${met}`
+          : `alert posted to its destination — ${met}`,
+      )
       return
     }
     const text = unclassifiedErrorAlertText(classification, { escapeForSlack: false })
@@ -1507,10 +1631,13 @@ export const KILL_FAILURE_END_ROW_GONE = 'its own row is gone (ErrSpawnNotFound)
 
 /**
  * The route name in the written line of a stopped ordinary decision's entry
- * (`KillFailureRaiseInput.stopped` with an earlier survivor-naming
- * description).
+ * (`KillFailureRaiseInput.stopped` for a persona no longer in the applied
+ * configuration, or an old-life wait's old key).
  */
-const KILL_FAILURE_STOPPED_SURVIVOR_ROUTE = 'stopped-survivor'
+const KILL_FAILURE_STOPPED_ROUTE = 'stopped'
+
+/** What that written line names: the stop's log line, never an alert (b.jg5 SRJ-702, SRJ-1013). */
+const KILL_FAILURE_STOPPED_SUBJECT = "stopped retry's log line (no alert text)"
 
 /** Why a kill-failure episode ended (a teardown's `forget` and shutdown's `close` drop it with no line). */
 export type KillFailureEndReason = typeof KILL_FAILURE_END_ROW_FINISHED | typeof KILL_FAILURE_END_ROW_GONE
@@ -1526,11 +1653,10 @@ export type KillFailureEndReason = typeof KILL_FAILURE_END_ROW_FINISHED | typeof
  *   - `not-routed`: a log-only route with no log-only sink installed, or one
  *     that threw (one line says so);
  *   - `closed`: after the episodes' `close` (shutdown), nothing is posted;
- *   - `stopped`: the ordinary version for a configured persona whose tries
- *     the keep-going check stopped (`KillFailureRaiseInput.stopped`): one
- *     line, nothing posted and no episode; when the decision carries an
- *     earlier survivor-naming description, a `persona-kill-failed` entry
- *     too;
+ *   - `stopped`: an ordinary decision whose tries were stopped
+ *     (`KillFailureRaiseInput.stopped`): one line, nothing posted and no
+ *     episode; for a persona no longer configured, also one
+ *     `persona-kill-failed` entry with no alert text;
  *   - `none`: the decision called for no alert.
  */
 export type KillFailureRaiseResult = 'posted' | 'held' | 'logged' | 'not-routed' | 'closed' | 'stopped' | 'none'
@@ -1554,17 +1680,25 @@ export interface KillFailureRaiseInput {
    * True when the retry's tries were stopped by its keep-going check while
    * the persona was not latched (it is torn down or not up, or the server is
    * shutting down), or the last outcome's version re-check decided that the
-   * server stops: nothing retries the kill, so an ordinary version at a
-   * destination, which says CSCB keeps retrying, is not posted; one line
-   * carries the decision and the redacted descriptions, and no episode is
-   * opened (b.jg5 SRJ-702, SRJ-301). When the decision carries an earlier
-   * survivor-naming description (`earlierSurvivorDescription`), whose
-   * failure is the only report of the surviving process (SRJ-702), the
-   * ordinary version is also written through the log-only sink as one
-   * `persona-kill-failed` entry with the log-only closing sentence and the
-   * raise's context. A log-only route is written as usual.
+   * server stops. A stopped ordinary decision is no notice (b.jg5 SRJ-702,
+   * SRJ-1003, SRJ-1013), inside a teardown window or not: neither version is
+   * raised, nothing is posted and no episode is read or changed; one line
+   * names the persona, the context, the last outcome's class
+   * (`lastOutcomeClass`), the stop's cause (`stopCause`) and the redacted
+   * descriptions, the latest survivor-naming one included. For a persona no
+   * longer in the applied configuration (or an old-life wait's old key) that
+   * line's content is also written as one `persona-kill-failed` entry, with
+   * no alert text; a configured persona's stop writes the line only.
    */
   readonly stopped?: boolean
+  /**
+   * With `stopped`: the class of the outcome that stands (its failure class,
+   * or its outcome kind), for the stop's line and entry (b.jg5 SRJ-702).
+   * Absent: the line names none.
+   */
+  readonly lastOutcomeClass?: string
+  /** With `stopped`: why the tries were stopped, for the stop's line and entry; a generic cause when absent. */
+  readonly stopCause?: string
   /** The session the alert names, unquoted; `slack_bot_<key>` when absent. */
   readonly session?: string
   /** The row's instance id; `cscb_<key>` when absent. */
@@ -1596,19 +1730,28 @@ export interface KillFailureAlertsDeps {
 /** One server's kill-failure alerts. */
 export interface KillFailureAlerts {
   /**
-   * Raise the alert the retry's decision calls for (b.jg5 SRJ-704), on the
-   * route `selectKillFailureAlertRoute` gives for the context, whether the
-   * persona is configured now and `latched`:
+   * Raise the alert the retry's decision calls for (b.jg5 SRJ-704). An
+   * ordinary decision with `stopped` is decided first, before every route
+   * below, the teardown window's included: one line, and for a persona no
+   * longer configured one `persona-kill-failed` entry with no alert text
+   * (SRJ-702); it answers `stopped`. While the
+   * key's persona teardown window is open, for any context but a start-sweep
+   * or CLI teardown kill, it takes the persona-teardown
+   * route (b.jg5 SRJ-1003): handed to the sink with no episode, whose window
+   * writes it (`persona-teardown-notice`, or `persona-kill-survivor` for the
+   * survivor version) and posts nothing; it answers `logged`. Otherwise it
+   * takes the route `selectKillFailureAlertRoute` gives for the context,
+   * whether the persona is configured now and `latched`:
    *   - ordinary, at a destination: begins the persona's kill-failure
    *     episode when none is open and posts the text once in it (a later
    *     raise in the same episode posts nothing);
    *   - survivor, at a destination: posts the text once for this call, with
    *     no episode read or changed;
    *   - either, on a log-only route: one entry of the route's class through
-   *     the log-only sink, and no episode;
-   *   - ordinary with `stopped`, at a destination: one line, nothing posted
-   *     and no episode; with an earlier survivor-naming description, also
-   *     one `persona-kill-failed` entry through the log-only sink.
+   *     the log-only sink (a `persona-teardown-notice` entry built by
+   *     `personaTeardownNoticeEntryText`), and no episode.
+   * A post that the key's submitted teardown mutes (SRJ-1003) still answers
+   * `posted` and counts in its episode; its line says it was not posted.
    * A `none` decision does nothing. Never throws.
    */
   raise(input: KillFailureRaiseInput): KillFailureRaiseResult
@@ -1629,14 +1772,19 @@ export interface KillFailureAlerts {
  *   [slack] persona-episodes: persona=<key> kill-failure ordinary alert not posted — its episode's alert already posted
  *   [slack] persona-episodes: persona=<key> kill-failure survivor alert posted to its destination (<context>)
  *   [slack] persona-episodes: persona=<key> kill-failure <version> alert written to the server log and startup-errors.log (<class>) — <route>
- *   [slack] persona-episodes: persona=<key> kill-failure ordinary alert not raised — its tries were stopped (the persona is not up or is torn down, or the server is shutting down), so nothing retries this kill; <descriptions> (<context>)
- *   [slack] persona-episodes: persona=<key> kill-failure ordinary alert written to the server log and startup-errors.log (persona-kill-failed) — stopped-survivor
+ *   [slack] persona-episodes: persona=<key> kill-failure <version> alert written to the server log and startup-errors.log (<class>) — persona-teardown, raised during its teardown (<context>)
+ *   [slack] persona-episodes: persona=<key> kill-failure ordinary alert not posted to its destination — muted, its persona teardown was submitted; it counts as posted in its episode (<context>; <closing>)
+ *   [slack] persona-episodes: persona=<key> kill-failure survivor alert not posted to its destination — muted, its persona teardown was submitted (<context>)
+ *   [slack] persona-episodes: persona=<key> kill-failure ordinary alert not raised — its tries were stopped (<cause>)[; its last outcome's class: <class>], so nothing retries this kill; <descriptions> (<context>)
+ *   [slack] persona-episodes: persona=<key> kill-failure stopped retry's log line (no alert text) written to the server log and startup-errors.log (persona-kill-failed) — stopped
  *   [slack] persona-episodes: persona=<key> kill-failure ended — <reason>
  *
  * and, only on a failure or a missing route: `configured-key lookup failed:
  * <error> — the alert takes the log-only route`, `<version> alert not routed
  * — no log-only route is installed`, `<version> log-only alert failed:
- * <error>`, `<version> alert not posted — the episodes are closed` and
+ * <error>` (for a stopped retry's entry, `stopped retry's log line (no alert
+ * text) not routed — …` and `… log-only write failed: <error>`),
+ * `<version> alert not posted — the episodes are closed` and
  * `raise failed: <error>` (each after `persona=<key> kill-failure`).
  */
 export function createKillFailureAlerts(deps: KillFailureAlertsDeps): KillFailureAlerts {
@@ -1669,19 +1817,89 @@ export function createKillFailureAlerts(deps: KillFailureAlertsDeps): KillFailur
     classLabel: string | undefined,
     entry: string,
     routeName: string,
+    what?: string,
   ): boolean {
+    const subject = what ?? `${version} alert`
     if (deps.logOnly === undefined || classLabel === undefined) {
-      line(key, `${version} alert not routed — no log-only route is installed`)
+      line(key, `${subject} not routed — no log-only route is installed`)
       return false
     }
     try {
       deps.logOnly(classLabel, entry)
     } catch (err) {
-      line(key, `${version} log-only alert failed: ${describeThrownValue(err)}`)
+      line(key, `${what === undefined ? `${version} log-only alert` : `${what} log-only write`} failed: ${describeThrownValue(err)}`)
       return false
     }
-    line(key, `${version} alert written to the server log and startup-errors.log (${classLabel}) — ${routeName}`)
+    line(key, `${subject} written to the server log and startup-errors.log (${classLabel}) — ${routeName}`)
     return true
+  }
+
+  /**
+   * An alert raised while the key's persona teardown window is open (b.jg5
+   * SRJ-1003, SRJ-704's first match): the persona-teardown route, written by
+   * the sink's window (one server-log line and one entry naming the persona
+   * and "raised during its teardown"; `persona-kill-survivor` for the
+   * survivor version), with no episode and no Slack post. An alert of
+   * another context than the persona teardown's own kill (a `recovery` or
+   * `stuck-launch abort` kill whose tries ended in the window) carries that
+   * context ahead of its text, as `(<context>) <text>`, so its entry names
+   * it (SRJ-1007, SRJ-1013).
+   */
+  function raiseInTeardownWindow(input: KillFailureRaiseInput, content: KillFailureAlertContent): KillFailureRaiseResult {
+    const { key, context } = input
+    const { version } = content
+    const route = selectKillFailureAlertRoute({ version, context: KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN, configured: configured(key), latched: false })
+    const alertText = killFailureAlertText(content, route.closing, false)
+    const text = context === KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN ? alertText : `(${context}) ${alertText}`
+    const options: PersonaEpisodeSinkOptions | undefined =
+      route.classLabel === PERSONA_KILL_SURVIVOR_LABEL ? { teardownEntryClass: PERSONA_KILL_SURVIVOR_LABEL } : undefined
+    if (!episodes.postWithoutEpisode(key, kind, text, options)) {
+      line(key, `${version} alert not posted — the episodes are closed`)
+      return 'closed'
+    }
+    line(key, `${version} alert written to the server log and startup-errors.log (${route.classLabel ?? PERSONA_TEARDOWN_NOTICE_LABEL}) — ${route.route}, raised during its teardown (${input.context})`)
+    return 'logged'
+  }
+
+  /**
+   * An ordinary decision whose tries SRJ-702's stop rule stopped (b.jg5
+   * SRJ-702, SRJ-704, SRJ-1003, SRJ-1013): no notice, whether or not the
+   * key's teardown window is open. Nothing is posted, no episode is read or
+   * changed and no alert text is written: one line naming the persona, the
+   * context, the last outcome's class, the stop's cause and the redacted
+   * descriptions (the latest survivor-naming one included); and, for a
+   * persona no longer in the applied configuration (or an old-life wait's
+   * old key), that line's content as one entry of the not-configured route's
+   * class, `persona-kill-failed`. A configured persona's stop writes the line
+   * only.
+   */
+  function raiseStopped(input: KillFailureRaiseInput): KillFailureRaiseResult {
+    const { key, context } = input
+    const lastOutcome = input.lastOutcomeClass === undefined ? '' : `; its last outcome's class: ${input.lastOutcomeClass}`
+    const cause =
+      input.stopCause ?? 'the persona is not up or is torn down, or the server is shutting down'
+    const what =
+      `${KILL_FAILURE_VERSION_ORDINARY} alert not raised — its tries were stopped (${cause})${lastOutcome}, ` +
+      `so nothing retries this kill; ${describeKillFailureDescriptions(input.decision)}`
+    line(key, `${what} (${context})`)
+    const route = selectKillFailureAlertRoute({
+      version: KILL_FAILURE_VERSION_ORDINARY,
+      context,
+      configured: configured(key),
+      latched: input.latched === true,
+    })
+    if (route.destination) return 'stopped'
+    // Never a persona-teardown-notice entry: a stopped retry is no notice.
+    const classLabel = route.classLabel === PERSONA_TEARDOWN_NOTICE_LABEL ? PERSONA_KILL_FAILED_LABEL : route.classLabel
+    writeLogOnly(
+      key,
+      KILL_FAILURE_VERSION_ORDINARY,
+      classLabel,
+      killFailureAlertEntryText(`persona=${key}`, context, `the kill-failure ${what}`),
+      KILL_FAILURE_STOPPED_ROUTE,
+      KILL_FAILURE_STOPPED_SUBJECT,
+    )
+    return 'stopped'
   }
 
   function raise(input: KillFailureRaiseInput): KillFailureRaiseResult {
@@ -1693,38 +1911,39 @@ export function createKillFailureAlerts(deps: KillFailureAlertsDeps): KillFailur
     )
     if (content === undefined) return 'none'
     const { version } = content
+    // b.jg5 SRJ-702, SRJ-1003: a retry whose tries were stopped is no notice,
+    // inside a teardown window or not: it is decided before every route.
+    if (version === KILL_FAILURE_VERSION_ORDINARY && input.stopped === true) return raiseStopped(input)
+    // b.jg5 SRJ-704: a start-sweep or CLI teardown kill matches first.
+    if (
+      context !== KILL_FAILURE_CONTEXT_START_SWEEP &&
+      context !== KILL_FAILURE_CONTEXT_CLI_TEARDOWN &&
+      episodes.teardownWindowState(key) === 'open'
+    ) {
+      return raiseInTeardownWindow(input, content)
+    }
     const route = selectKillFailureAlertRoute({ version, context, configured: configured(key), latched: input.latched === true })
     if (!route.destination) {
-      const entry = killFailureAlertEntryText(`persona=${key}`, context, killFailureAlertText(content, route.closing, false))
+      const text = killFailureAlertText(content, route.closing, false)
+      // b.jg5 SRJ-1013: a persona-teardown-notice entry names the persona and
+      // "raised during its teardown" (only the key is known here).
+      const entry =
+        route.classLabel === PERSONA_TEARDOWN_NOTICE_LABEL
+          ? personaTeardownNoticeEntryText(`persona=${key}`, text)
+          : killFailureAlertEntryText(`persona=${key}`, context, text)
       return writeLogOnly(key, version, route.classLabel, entry, route.route) ? 'logged' : 'not-routed'
     }
-    if (content.version === KILL_FAILURE_VERSION_ORDINARY && input.stopped === true) {
-      line(
-        key,
-        `${version} alert not raised — its tries were stopped (the persona is not up or is torn down, or the server is shutting down), so nothing retries this kill; ${describeKillFailureDescriptions(input.decision)} (${context})`,
-      )
-      // b.jg5 SRJ-702: the failure that named a survivor is the only report
-      // of it, and a human ends it, so its description is kept in an entry.
-      if (content.quotes?.earlierSurvivorDescription !== undefined) {
-        const text = killFailureAlertText(content, KILL_FAILURE_CLOSING_LOG_ONLY, false)
-        writeLogOnly(
-          key,
-          version,
-          PERSONA_KILL_FAILED_LABEL,
-          killFailureAlertEntryText(`persona=${key}`, context, text),
-          KILL_FAILURE_STOPPED_SURVIVOR_ROUTE,
-        )
-      }
-      return 'stopped'
-    }
     const text = killFailureAlertText(content, route.closing, true)
+    // b.jg5 SRJ-1003: read before the post, which a submitted teardown mutes
+    // (the episode still counts it as posted).
+    const muted = episodes.teardownWindowState(key) === 'submitted'
     // A destination route that opens no episode (the survivor version) posts once for this call.
     if (!route.opensEpisode) {
       if (!episodes.postWithoutEpisode(key, kind, text)) {
         line(key, `${version} alert not posted — the episodes are closed`)
         return 'closed'
       }
-      line(key, `${version} alert posted to its destination (${context})`)
+      line(key, muted ? `${version} alert not posted to its destination — ${MUTED_BY_TEARDOWN} (${context})` : `${version} alert posted to its destination (${context})`)
       return 'posted'
     }
     if (episodes.begin(key, kind) === 'closed') {
@@ -1735,7 +1954,12 @@ export function createKillFailureAlerts(deps: KillFailureAlertsDeps): KillFailur
       line(key, `${version} alert not posted — its episode's alert already posted`)
       return 'held'
     }
-    line(key, `${version} alert posted to its destination (${context}; ${route.closing})`)
+    line(
+      key,
+      muted
+        ? `${version} alert not posted to its destination — ${MUTED_BY_TEARDOWN}; it counts as posted in its episode (${context}; ${route.closing})`
+        : `${version} alert posted to its destination (${context}; ${route.closing})`,
+    )
     return 'posted'
   }
 

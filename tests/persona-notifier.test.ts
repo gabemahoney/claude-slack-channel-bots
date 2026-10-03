@@ -27,31 +27,70 @@
  * only when notices were dropped, so the key added again never posts them;
  * it leaves the destination hold and other personas' queues alone.
  *
+ * The persona teardown window (b.jg5 SRJ-1003, SRJ-1002, SRJ-1013, AC 65):
+ * while a persona's window is open every notice for its key is one log line
+ * and one startup-errors entry (`persona-teardown-notice`, or
+ * `persona-kill-survivor` for the kill-failure alert's survivor version),
+ * over a channel and a `dm` destination, a validated and a not-yet-validated
+ * client, a key still applied (a destructive modify's old half, its applied
+ * persona sending notices elsewhere) and a key no longer applied: no Slack
+ * call, never queued, never handed to the destination hold, never dropped
+ * (`forget` drops only what was queued before the window, with its one
+ * line). Once it closes the key's notices route as before, but for the
+ * all-clear of an outage whose onset the window routed, which is written the
+ * same way whenever it comes; an all-clear also listing a class whose onset
+ * was posted is split by its `allClearOf` (the marked part written, the rest
+ * posted), or written whole without a usable one. A notice built for Slack is
+ * written with its control-character escapes undone. From a teardown's
+ * submit until its window opens, an `ad-config-malformed` onset for an
+ * applied key is muted (one line, no post, no entry) and its all-clear
+ * written. The entries are read back from the harness's
+ * temp `logDir`; their class and text come from `src/`'s constant and
+ * builder.
+ *
  * Pure module under test: built from injected fakes only, through the shared
  * `makeNotifierHarness` (`makeStubSlack` Web stubs, a validated-key set, a
  * dry-run flag, a line capture and a destination hold on a fake clock, so no
- * real timer runs and retries fire only on `h.clock.runNext()`). No token is
- * used; every stub carries `LEAK_SENTINEL` and `afterEach` runs `assertNoLeak`
- * over every captured log line and post.
+ * real timer runs and retries fire only on `h.clock.runNext()`, and the
+ * startup-errors recorder over the harness's own temp `logDir`, removed after
+ * each case). No token is used; every stub carries `LEAK_SENTINEL` and
+ * `afterEach` runs `assertNoLeak` over every captured log line, post and
+ * startup-errors entry, and the written `startup-errors.log`.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import type { WebClient } from '@slack/web-api'
 
 import type { Persona } from '../src/config.ts'
-import { MAX_HELD_NOTICES_PER_PERSONA, createPersonaNotifier, formatPersonaNotice } from '../src/persona-notifier.ts'
+import { LATCH_CASE_LEFTOVER, conflictNoticeText } from '../src/conflict-latch.ts'
+import { PERSONA_KILL_SURVIVOR_LABEL } from '../src/kill-failure-alert.ts'
+import type { OutageClass } from '../src/outage-state.ts'
+import { describeThrownValue } from '../src/persona-connection-errors.ts'
+import {
+  MAX_HELD_NOTICES_PER_PERSONA,
+  PERSONA_NOTICE_OUTAGE_ALL_CLEAR,
+  PERSONA_NOTICE_OUTAGE_ONSET,
+  PERSONA_NOTICE_SUBMIT_MUTED_OUTAGE_CLASSES,
+  PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER,
+  PERSONA_TEARDOWN_NOTICE_LABEL,
+  PERSONA_TEARDOWN_NOTICE_RAISED,
+  createPersonaNotifier,
+  formatPersonaNotice,
+  type PersonaNoticeOptions,
+} from '../src/persona-notifier.ts'
 import { createPersonaDestinations, type DestinationFailure } from '../src/persona-destination.ts'
 import { createPersonaDestinationHold } from '../src/persona-destination-hold.ts'
 import { personaKey, renderPersonaRef } from '../src/persona-identity.ts'
+import { escapeSlackControlCharacters, unescapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { makeMultiPersonaConfig, makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
-import { makeNotifierHarness, type NotifierHarness } from './test-helpers/persona-notifier.ts'
+import { makeNotifierHarness, teardownNoticeEntry, type NotifierHarness } from './test-helpers/persona-notifier.ts'
 import { stubOpenedDmId, type WebApiOutcome } from './test-helpers/slack-stub.ts'
-import { LEAK_SENTINEL, assertNoLeak } from './test-helpers/credentials.ts'
+import { LEAK_SENTINEL, assertNoLeak, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -142,9 +181,18 @@ beforeEach(() => {
 })
 
 afterEach(() => {
-  h.hold.cancelAll()
-  assertNoLeak({ lines: h.logs, posts: h.allPosts() })
-  rmSync(dir, { recursive: true, force: true })
+  try {
+    h.hold.cancelAll()
+    assertNoLeak({
+      lines: h.logs,
+      posts: h.allPosts(),
+      entries: h.startupEntries(),
+      ...(existsSync(h.startupErrorsPath) ? { file: writtenFile(h.startupErrorsPath) } : {}),
+    })
+  } finally {
+    h.cleanup()
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 // Mirror-case selector: [label, notified persona, other persona].
@@ -932,4 +980,422 @@ describe('failure log lines (SR-10.3 token-safe)', () => {
       expect(h.logs).toHaveLength(1)
     },
   )
+})
+
+// ---------------------------------------------------------------------------
+// The persona teardown window (b.jg5 SRJ-1003, SRJ-1002, SRJ-1013, AC 65)
+// ---------------------------------------------------------------------------
+
+describe('the persona teardown window: every notice for the key is a log line and a startup-errors entry, never posted, held or dropped (b.jg5 SRJ-1003)', () => {
+  /** The line a notice written by the window logs: `<class>` its entry's class, the notice's first line. */
+  const windowLine = (p: Persona, text: string, classLabel: string = PERSONA_TEARDOWN_NOTICE_LABEL) =>
+    `[slack] persona-notifier: notice for ${ref(p)} raised during its teardown — written to the server log and startup-errors.log (${classLabel}), not posted: ${text.split('\n')[0]}`
+
+  /** The line an all-clear written after the window closed logs. */
+  const allClearLine = (p: Persona, text: string) =>
+    `[slack] persona-notifier: all-clear for ${ref(p)} of an outage raised during its teardown — written to the server log and startup-errors.log (${PERSONA_TEARDOWN_NOTICE_LABEL}), not posted: ${text.split('\n')[0]}`
+
+  const droppedLine = (p: Persona, n: number) =>
+    `[slack] persona-notifier: persona=${p.key}: dropped ${n} held notice(s), not posted — the persona was torn down`
+
+  /** No Slack call of any kind on any persona's stub, nothing held at a destination and no hold timer. */
+  function expectNoSlackCallOrHold(): void {
+    for (const p of [f.A, f.B, f.D]) {
+      expect(h.stub(p.key).callLog).toEqual([])
+      expect(h.hold.view(p.key)).toEqual(NOT_HELD)
+    }
+    expect(h.clock.pendingCount()).toBe(0)
+  }
+
+  const onset = (...classes: OutageClass[]): PersonaNoticeOptions => ({ outage: { phase: PERSONA_NOTICE_OUTAGE_ONSET, classes } })
+  const allClear = (...classes: OutageClass[]): PersonaNoticeOptions => ({ outage: { phase: PERSONA_NOTICE_OUTAGE_ALL_CLEAR, classes } })
+
+  /**
+   * The applied set for the case: the key still applied as a destructive
+   * modify's new half, which sends its notices to another destination (A:
+   * another of its channels; D: its DM with another contact), or the key no
+   * longer applied (apply step 1 removed it).
+   */
+  function applyCase(p: Persona, stillApplied: boolean): void {
+    const at = h.personas.findIndex((q) => q.key === p.key)
+    if (!stillApplied) {
+      h.personas.splice(at, 1)
+      return
+    }
+    const newHalf: Persona =
+      p.permission_prompts === 'dm'
+        ? { ...p, dm: { enabled: true, contact: 'U0DELTA02' } }
+        : { ...p, permission_prompts: p.channels[0]!.id }
+    expect(newHalf.permission_prompts === 'dm' ? newHalf.dm.contact : newHalf.permission_prompts).not.toBe(
+      p.permission_prompts === 'dm' ? p.dm.contact : p.permission_prompts,
+    )
+    h.personas.splice(at, 1, newHalf)
+  }
+
+  // Rows: the persona (a channel or a `dm` destination), whether its client is validated, and whether its key is
+  // still applied (a destructive modify's old half, its new half sending notices elsewhere) or no longer applied.
+  test.each<[string, (x: Fixture) => Persona, boolean, boolean]>([
+    ['channel destination, validated, still applied', (x) => x.A, true, true],
+    ['channel destination, validated, no longer applied', (x) => x.A, true, false],
+    ['channel destination, not validated, still applied', (x) => x.A, false, true],
+    ['channel destination, not validated, no longer applied', (x) => x.A, false, false],
+    ['dm destination, validated, still applied', (x) => x.D, true, true],
+    ['dm destination, validated, no longer applied', (x) => x.D, true, false],
+    ['dm destination, not validated, still applied', (x) => x.D, false, true],
+    ['dm destination, not validated, no longer applied', (x) => x.D, false, false],
+  ])('%s: a notice raised in the window makes no Slack call, is neither queued nor held, and writes one log line and one persona-teardown-notice entry naming the persona; nothing posts once the window closes', async (_label, pick, validated, stillApplied) => {
+    const p = pick(f)
+    if (validated) h.validate(p.key)
+    applyCase(p, stillApplied)
+    const text = 'Spawn failure:\n  Error: boom'
+
+    await h.duringTeardown(p, async () => {
+      await expect(h.notifier.notify(p.key, text)).resolves.toBeUndefined()
+      // A flush in the window posts nothing.
+      await h.notifier.flush(p.key)
+    })
+
+    expect(h.startupEntries()).toEqual([teardownNoticeEntry(p, text)])
+    expect(h.startupEntries()[0]!.classLabel).toBe(PERSONA_TEARDOWN_NOTICE_LABEL)
+    expect(h.startupEntries()[0]!.text).toContain(PERSONA_TEARDOWN_NOTICE_RAISED)
+    expect(h.logs).toEqual([windowLine(p, text)])
+    expectNoSlackCallOrHold()
+
+    // Nothing was queued: a forget drops nothing, and a validated flush posts nothing.
+    h.notifier.forget(p.key)
+    h.validate(p.key)
+    await h.notifier.flush(p.key)
+    expect(h.logs).toEqual([windowLine(p, text)])
+    expectNoSlackCallOrHold()
+  })
+
+  test('the window comes before the dry-run branch: in dry run a notice raised in it is still written, with no dry-run line', async () => {
+    h.validate(f.A.key)
+    h.setDryRun(true)
+
+    await h.duringTeardown(f.A, () => h.notifier.notify(f.A.key, 'onset'))
+
+    expect(h.logs).toEqual([windowLine(f.A, 'onset')])
+    expect(h.startupEntries()).toEqual([teardownNoticeEntry(f.A, 'onset')])
+    expectNoSlackCallOrHold()
+  })
+
+  test('b.jg5 SRJ-704, SRJ-1013: the survivor option writes one persona-kill-survivor entry and no persona-teardown-notice one, and posts nothing; outside a window the option changes nothing', async () => {
+    h.validate(f.A.key)
+    const survivor: PersonaNoticeOptions = { teardownEntryClass: PERSONA_KILL_SURVIVOR_LABEL }
+
+    await h.duringTeardown(f.A, () => h.notifier.notify(f.A.key, 'survivor version', survivor))
+
+    expect(h.startupEntries()).toEqual([teardownNoticeEntry(f.A, 'survivor version', PERSONA_TEARDOWN_NOTICE_RAISED, PERSONA_KILL_SURVIVOR_LABEL)])
+    expect(h.startupEntries().filter((e) => e.classLabel === PERSONA_TEARDOWN_NOTICE_LABEL)).toEqual([])
+    expect(h.logs).toEqual([windowLine(f.A, 'survivor version', PERSONA_KILL_SURVIVOR_LABEL)])
+    expectNoSlackCallOrHold()
+
+    await h.notifier.notify(f.A.key, 'survivor version', survivor)
+    expect(h.posts(f.A.key)).toEqual([{ channel: f.A.permission_prompts, text: formatPersonaNotice(f.A, 'survivor version') }])
+    expect(h.startupEntries()).toHaveLength(1)
+  })
+
+  test('forget in the window drops none of the notices raised in it; a notice queued before the window is dropped by it with its one line, and a flush in the window posts nothing of it', async () => {
+    await h.notifier.notify(f.A.key, 'queued before')
+    h.validate(f.A.key) // the queue waits for a flush
+
+    const window = h.openTeardown(f.A)
+    await h.notifier.notify(f.A.key, 'in the window 1')
+    await h.notifier.flush(f.A.key)
+    expect(h.posts(f.A.key)).toEqual([])
+    h.notifier.forget(f.A.key)
+    await h.notifier.notify(f.A.key, 'in the window 2')
+    h.notifier.forget(f.A.key)
+    window.close()
+    h.notifier.forget(f.A.key)
+    await h.notifier.flush(f.A.key)
+
+    expect(h.startupEntries()).toEqual([teardownNoticeEntry(f.A, 'in the window 1'), teardownNoticeEntry(f.A, 'in the window 2')])
+    expect(h.logs).toEqual([windowLine(f.A, 'in the window 1'), droppedLine(f.A, 1), windowLine(f.A, 'in the window 2')])
+    expectNoSlackCallOrHold()
+  })
+
+  test('after the window closes the key\'s notices route as before (posted for an applied key, dropped with its line for a removed one); another persona\'s notices in the window post as usual', async () => {
+    for (const p of [f.A, f.B]) h.validate(p.key)
+
+    await h.duringTeardown(f.A, () => h.notifier.notify(f.B.key, 'B in A\'s window'))
+    expect(h.posts(f.B.key)).toEqual([{ channel: f.B.permission_prompts, text: formatPersonaNotice(f.B, 'B in A\'s window') }])
+
+    await h.notifier.notify(f.A.key, 'after')
+    expect(h.posts(f.A.key)).toEqual([{ channel: f.A.permission_prompts, text: formatPersonaNotice(f.A, 'after') }])
+
+    h.personas.splice(h.personas.indexOf(f.A), 1)
+    await h.duringTeardown(f.A, () => undefined)
+    await h.notifier.notify(f.A.key, 'removed')
+    expect(h.posts(f.A.key)).toHaveLength(1)
+    expect(h.logs).toEqual([`[slack] persona-notifier: no applied persona with key=${f.A.key} — notice dropped`])
+    expect(h.startupEntries()).toEqual([])
+  })
+
+  // b.jg5 SRJ-1002, SRJ-1003 (hatch A3): the all-clear of an outage whose onset the window routed.
+  test('an onset routed by the window marks its outage: the all-clear that comes after the window closed is written (the all-clear occasion) and never reaches the new half\'s destination; a later all-clear of that class posts as usual', async () => {
+    h.validate(f.A.key)
+    applyCase(f.A, true) // the new half, validated, sends its notices to another channel
+    const newHalf = h.personas.find((q) => q.key === f.A.key)!
+
+    await h.duringTeardown(f.A, () => h.notifier.notify(f.A.key, 'onset: unreachable', onset('ad-unreachable')))
+    await h.notifier.notify(f.A.key, 'all clear: unreachable', allClear('ad-unreachable'))
+
+    expect(h.startupEntries()).toEqual([
+      teardownNoticeEntry(f.A, 'onset: unreachable'),
+      teardownNoticeEntry(f.A, 'all clear: unreachable', PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER),
+    ])
+    expect(h.logs).toEqual([windowLine(f.A, 'onset: unreachable'), allClearLine(f.A, 'all clear: unreachable')])
+    expectNoSlackCallOrHold()
+
+    // The mark is spent: the next all-clear of that class is an ordinary notice.
+    await h.notifier.notify(f.A.key, 'all clear again', allClear('ad-unreachable'))
+    expect(h.posts(f.A.key)).toEqual([{ channel: newHalf.permission_prompts, text: formatPersonaNotice(newHalf, 'all clear again') }])
+    expect(h.startupEntries()).toHaveLength(2)
+  })
+
+  // Rows: what follows the onset the window routed, before the all-clear that comes after the window closed.
+  test.each<[string, (x: Fixture) => Promise<void>, boolean]>([
+    ['an all-clear listing a class the window did not mark', async (x) => {
+      await h.notifier.notify(x.A.key, 'all clear: other', allClear('tmux-unavailable'))
+    }, false],
+    ['an onset of the marked class raised outside any window (a new outage)', async (x) => {
+      await h.notifier.notify(x.A.key, 'onset again', onset('ad-unreachable'))
+    }, true],
+    ['an all-clear of the marked class raised in the window itself', async (x) => {
+      await h.duringTeardown(x.A, () => h.notifier.notify(x.A.key, 'all clear in window', allClear('ad-unreachable')))
+    }, true],
+  ])('%s: the marked class\'s all-clear after the window posts as usual once its mark is gone, and is written while the mark stands (mark gone: %p)', async (_label, between, markGone) => {
+    h.validate(f.A.key)
+    await h.duringTeardown(f.A, () => h.notifier.notify(f.A.key, 'onset: unreachable', onset('ad-unreachable')))
+    await between(f)
+    const entriesBefore = h.startupEntries().length
+
+    await h.notifier.notify(f.A.key, 'all clear: unreachable', allClear('ad-unreachable'))
+
+    const posted = h.posts(f.A.key).map((c) => c.text)
+    if (markGone) {
+      expect(posted.at(-1)).toBe(formatPersonaNotice(f.A, 'all clear: unreachable'))
+      expect(h.startupEntries()).toHaveLength(entriesBefore)
+    } else {
+      expect(posted).not.toContain(formatPersonaNotice(f.A, 'all clear: unreachable'))
+      expect(h.startupEntries().slice(entriesBefore)).toEqual([teardownNoticeEntry(f.A, 'all clear: unreachable', PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER)])
+    }
+  })
+
+  test('the all-clear of an outage whose onset the window routed for a removed key is written whenever it comes, naming the persona as the window did', async () => {
+    h.personas.splice(h.personas.indexOf(f.A), 1)
+
+    await h.duringTeardown(f.A, () => h.notifier.notify(f.A.key, 'onset', onset('ad-config-malformed')))
+    await h.notifier.notify(f.A.key, 'all clear', allClear('tmux-unavailable', 'ad-config-malformed'))
+
+    expect(h.startupEntries()).toEqual([
+      teardownNoticeEntry(f.A, 'onset'),
+      teardownNoticeEntry(f.A, 'all clear', PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER),
+    ])
+    expect(h.logs).toEqual([windowLine(f.A, 'onset'), allClearLine(f.A, 'all clear')])
+    expectNoSlackCallOrHold()
+  })
+
+  // Rows: no recorder installed, or the error the installed recorder throws (its line gives that error, described).
+  test.each<[string, Error | undefined]>([
+    ['no recorder installed', undefined],
+    ['a recorder that throws', new Error('disk full')],
+  ])('%s: the notice is still never posted, held or dropped, and its one line says its entry was not written', async (_label, thrown) => {
+    const recorder = thrown === undefined ? null : () => { throw thrown }
+    const reason = thrown === undefined ? 'no startup-errors recorder is installed' : describeThrownValue(thrown)
+    const s = makeNotifierHarness(
+      makeMultiPersonaConfig([{ name: 'Alpha Notifier' }], dir),
+      { leakMarker: LEAK_SENTINEL, recordStartupError: recorder },
+    )
+    const [p] = s.personas as [Persona]
+
+    try {
+      await expect(s.duringTeardown(p, () => s.notifier.notify(p.key, 'notice\n  detail'))).resolves.toBeUndefined()
+
+      expect(s.logs).toEqual([
+        `[slack] persona-notifier: notice for ${ref(p)} raised during its teardown — not posted, and its startup-errors entry was not written: ${reason}: notice`,
+      ])
+      expect(s.stub(p.key).callLog).toEqual([])
+      expect(s.hold.view(p.key)).toEqual(NOT_HELD)
+      expect(s.startupEntries()).toEqual([])
+      assertNoLeak({ lines: s.logs })
+    } finally {
+      s.cleanup()
+    }
+  })
+
+  test('the window\'s state: none, submitted from the submit, open while the window is open, none once it closes and the submit ends; submits and opens are counted, so two teardowns of one key pair up; other keys stay none', () => {
+    const state = () => [f.A.key, f.B.key].map((k) => h.notifier.teardownWindowState(k))
+    expect(state()).toEqual(['none', 'none'])
+
+    h.notifier.submitTeardown(f.A.key)
+    h.notifier.submitTeardown(f.A.key)
+    expect(state()).toEqual(['submitted', 'none'])
+    h.notifier.openTeardownWindow(f.A)
+    h.notifier.openTeardownWindow(f.A)
+    expect(state()).toEqual(['open', 'none'])
+    h.notifier.closeTeardownWindow(f.A.key)
+    expect(state()).toEqual(['open', 'none'])
+    h.notifier.closeTeardownWindow(f.A.key)
+    expect(state()).toEqual(['submitted', 'none'])
+    h.notifier.settleTeardown(f.A.key)
+    expect(state()).toEqual(['submitted', 'none'])
+    h.notifier.settleTeardown(f.A.key)
+    expect(state()).toEqual(['none', 'none'])
+    // A close or settle with none registered is a no-op.
+    h.notifier.closeTeardownWindow(f.A.key)
+    h.notifier.settleTeardown(f.A.key)
+    expect(state()).toEqual(['none', 'none'])
+    expect(h.logs).toEqual([])
+  })
+
+  // b.jg5 SRJ-1003: a notice built for Slack (here the CONFLICT notice, whose
+  // session name and description are escaped for Slack) is written with the
+  // escapes undone, in the entry and the line's first line, so it reads as the
+  // unescaped notices' entries do; a persona name holding the same characters
+  // is written as given.
+  test('a CONFLICT notice built for Slack, its session name and description holding &, < and >, for a persona whose name holds them too: the entry and the line carry the characters, never &amp;, &lt; or &gt;; nothing posted', async () => {
+    const odd: Persona = { ...f.A, name: 'Alpha <&> Notifier' }
+    h.personas.splice(h.personas.indexOf(f.A), 1, odd)
+    const text = conflictNoticeText({
+      sessionName: 'slack_bot_<a&b>',
+      latchCase: LATCH_CASE_LEFTOVER,
+      description: `session <x> & <y> refused (${sentinelInMessage('conflict')})`,
+    })
+    expect(text).toContain(escapeSlackControlCharacters('<a&b>'))
+    expect(text).toContain(escapeSlackControlCharacters('<x> & <y>'))
+
+    await h.duringTeardown(odd, () => h.notifier.notify(odd.key, text))
+
+    const unescaped = unescapeSlackControlCharacters(text)
+    expect(h.startupEntries()).toEqual([teardownNoticeEntry(odd, unescaped)])
+    expect(h.logs).toEqual([windowLine(odd, unescaped)])
+    const [entry] = h.startupEntries()
+    expect(entry!.text).toContain('<a&b>')
+    expect(entry!.text).toContain('<x> & <y>')
+    expect(entry!.text).toContain(`persona ${ref(odd)}`)
+    for (const written of [entry!.text, h.logs[0]!]) {
+      for (const escape of ['&amp;', '&lt;', '&gt;']) expect(written).not.toContain(escape)
+    }
+    expectNoSlackCallOrHold()
+    assertNoLeak({ lines: h.logs, entries: h.startupEntries(), file: writtenFile(h.startupErrorsPath) })
+  })
+
+  // b.jg5 SRJ-1003, SRJ-1016: an outage that is a notice episode of its own
+  // (ad-config-malformed) has its onset muted from the teardown's submit
+  // until its window opens, and its all-clear is then written, never posted.
+  test('the outage classes whose onset a submitted teardown mutes (pin)', () => {
+    expect(PERSONA_NOTICE_SUBMIT_MUTED_OUTAGE_CLASSES).toEqual(['ad-config-malformed'])
+  })
+
+  /** The line of an onset muted between the teardown's submit and its window: the classes, the onset's first line unescaped. */
+  const mutedOnsetLine = (p: Persona, classes: readonly string[], text: string) =>
+    `[slack] persona-notifier: onset for ${ref(p)} of ${classes.join(', ')} not posted — muted, its persona teardown was submitted; its all-clear is written, never posted: ${unescapeSlackControlCharacters(text).split('\n')[0]}`
+
+  test('ad-config-malformed\'s onset for an applied key between the teardown\'s submit and its window: no Slack call, no entry, one muted line (first line unescaped); its all-clear after the teardown is written, never posted; a tmux-unavailable onset raised in the same stretch posts as usual', async () => {
+    h.validate(f.A.key)
+    const onsetText = 'agent-director config &lt;tmux&gt; section &amp; more is malformed\n  detail'
+    h.notifier.submitTeardown(f.A.key)
+
+    await h.notifier.notify(f.A.key, onsetText, onset('ad-config-malformed'))
+    await h.notifier.notify(f.A.key, 'onset: tmux', onset('tmux-unavailable'))
+
+    expect(h.posts(f.A.key)).toEqual([{ channel: f.A.permission_prompts, text: formatPersonaNotice(f.A, 'onset: tmux') }])
+    expect(h.startupEntries()).toEqual([])
+    expect(h.logs).toEqual([mutedOnsetLine(f.A, ['ad-config-malformed'], onsetText)])
+    expect(h.logs[0]).toContain('config <tmux> section & more is malformed')
+
+    // The teardown's turn: its window opens and closes, then its submit ends.
+    h.notifier.openTeardownWindow(f.A)
+    h.notifier.closeTeardownWindow(f.A.key)
+    h.notifier.settleTeardown(f.A.key)
+    await h.notifier.notify(f.A.key, 'all clear: config', allClear('ad-config-malformed'))
+    await h.notifier.notify(f.A.key, 'all clear: tmux', allClear('tmux-unavailable'))
+
+    expect(h.startupEntries()).toEqual([teardownNoticeEntry(f.A, 'all clear: config', PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER)])
+    expect(h.logs.slice(1)).toEqual([allClearLine(f.A, 'all clear: config')])
+    expect(texts(f.A)).toEqual([formatPersonaNotice(f.A, 'onset: tmux'), formatPersonaNotice(f.A, 'all clear: tmux')])
+  })
+
+  // Controls: before any submit the onset posts; a key no longer applied has
+  // it dropped with the drop's line, unmuted and unmarked, so its all-clear
+  // is dropped the same way.
+  test('controls: with no teardown submitted the ad-config-malformed onset posts; for a submitted key no longer applied it is dropped as before, with no muted line and no entry, and so is its all-clear', async () => {
+    h.validate(f.A.key)
+    await h.notifier.notify(f.A.key, 'onset: config', onset('ad-config-malformed'))
+    expect(texts(f.A)).toEqual([formatPersonaNotice(f.A, 'onset: config')])
+
+    h.validate(f.B.key)
+    h.personas.splice(h.personas.indexOf(f.B), 1)
+    h.notifier.submitTeardown(f.B.key)
+    await h.notifier.notify(f.B.key, 'onset: config', onset('ad-config-malformed'))
+    h.notifier.settleTeardown(f.B.key)
+    await h.notifier.notify(f.B.key, 'all clear: config', allClear('ad-config-malformed'))
+
+    const dropped = `[slack] persona-notifier: no applied persona with key=${f.B.key} — notice dropped`
+    expect(h.logs).toEqual([dropped, dropped])
+    expect(h.posts(f.B.key)).toEqual([])
+    expect(h.startupEntries()).toEqual([])
+  })
+
+  // b.jg5 SRJ-1002, SRJ-1003: an all-clear listing a class whose onset the
+  // window routed and one whose onset was posted is split by its
+  // `allClearOf`: the marked classes' all-clear is written, the rest posted
+  // to the destination naming only its own classes.
+  test('an all-clear listing a window-routed class and a posted one, with allClearOf: the marked class\'s all-clear is written (the all-clear occasion), the other class\'s posted to the destination, each rendered for its own classes only', async () => {
+    h.validate(f.A.key)
+    const asked: string[][] = []
+    const allClearOf = (classes: readonly string[]): string => {
+      asked.push([...classes])
+      return `All clear: ${classes.join(' + ')}`
+    }
+    await h.duringTeardown(f.A, () => h.notifier.notify(f.A.key, 'onset: unreachable', onset('ad-unreachable')))
+    await h.notifier.notify(f.A.key, 'onset: tmux', onset('tmux-unavailable'))
+
+    await h.notifier.notify(f.A.key, 'All clear: ad-unreachable + tmux-unavailable', {
+      outage: { phase: PERSONA_NOTICE_OUTAGE_ALL_CLEAR, classes: ['ad-unreachable', 'tmux-unavailable'], allClearOf },
+    })
+
+    expect(asked).toEqual([['ad-unreachable'], ['tmux-unavailable']])
+    expect(h.startupEntries()).toEqual([
+      teardownNoticeEntry(f.A, 'onset: unreachable'),
+      teardownNoticeEntry(f.A, 'All clear: ad-unreachable', PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER),
+    ])
+    expect(h.logs).toEqual([windowLine(f.A, 'onset: unreachable'), allClearLine(f.A, 'All clear: ad-unreachable')])
+    expect(h.posts(f.A.key)).toEqual([
+      { channel: f.A.permission_prompts, text: formatPersonaNotice(f.A, 'onset: tmux') },
+      { channel: f.A.permission_prompts, text: formatPersonaNotice(f.A, 'All clear: tmux-unavailable') },
+    ])
+  })
+
+  // Rows: the all-clear's renderer: none (the outage state's all-clear
+  // before it carried one), one that throws, one that answers no string.
+  // Without a usable renderer the whole all-clear is written, and nothing of
+  // it is posted.
+  test.each<[string, PersonaNoticeOptions['outage']]>([
+    ['no allClearOf', { phase: PERSONA_NOTICE_OUTAGE_ALL_CLEAR, classes: ['ad-unreachable', 'tmux-unavailable'] }],
+    ['an allClearOf that throws', { phase: PERSONA_NOTICE_OUTAGE_ALL_CLEAR, classes: ['ad-unreachable', 'tmux-unavailable'], allClearOf: () => { throw new Error('no render') } }],
+    ['an allClearOf answering no string', { phase: PERSONA_NOTICE_OUTAGE_ALL_CLEAR, classes: ['ad-unreachable', 'tmux-unavailable'], allClearOf: () => undefined as unknown as string }],
+  ])('an all-clear listing a window-routed class and a posted one, with %s: the whole all-clear is written, nothing of it posted', async (_label, outage) => {
+    h.validate(f.A.key)
+    await h.duringTeardown(f.A, () => h.notifier.notify(f.A.key, 'onset: unreachable', onset('ad-unreachable')))
+    await h.notifier.notify(f.A.key, 'onset: tmux', onset('tmux-unavailable'))
+
+    await h.notifier.notify(f.A.key, 'All clear: both', { outage })
+
+    expect(h.startupEntries().slice(1)).toEqual([teardownNoticeEntry(f.A, 'All clear: both', PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER)])
+    expect(texts(f.A)).toEqual([formatPersonaNotice(f.A, 'onset: tmux')])
+  })
+
+  test('a notice quoting a redacted error carries no token into the log line or the entry (assertNoLeak over both and the written file)', async () => {
+    const text = `agent-director kill refused: ${describeThrownValue(new Error(`refused ${sentinelInMessage('teardown-notice')}`))}`
+
+    await h.duringTeardown(f.A, () => h.notifier.notify(f.A.key, text))
+
+    expect(h.startupEntries()).toEqual([teardownNoticeEntry(f.A, text)])
+    expect(h.startupEntries()[0]!.text).toContain('<redacted-token>')
+    assertNoLeak({ lines: h.logs, entries: h.startupEntries(), file: writtenFile(h.startupErrorsPath) })
+  })
 })

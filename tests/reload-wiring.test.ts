@@ -50,7 +50,10 @@
  * kill-failure alert on the one alerts instance with the context 'persona
  * teardown' and is given no delete (b.jg5 SRJ-715, SRJ-704), that apply step
  * 1 stops each recorded key's dialog approver with the retired-key reason
- * (b.jg5 SRJ-808), and that the refresh gets the server-wide
+ * (b.jg5 SRJ-808), that the one persona notifier, built at module scope, is
+ * given startup-errors.ts's `recordStartupError` with its default log
+ * directory (no `logDir`) and is the lifecycle's notifier, whose window
+ * entries server.ts never drives itself (b.jg5 SRJ-1003, SRJ-1013), and that the refresh gets the server-wide
  * template arguments the boot install wrote (a value captured once at start,
  * never re-read at apply) and the agent-director client. What the default step bodies do with those members
  * is tested in tests/reload-apply.test.ts; what the teardown, the apply
@@ -75,7 +78,9 @@
  * but src/server.ts (and, for the one name check that the teardown's delete is
  * gone, every src/*.ts file's text), imports only the pure `configInEffect` from
  * src/reload.ts and the pure `replySettingsOf`, constants and types from
- * src/config.ts, runs no server code, and touches no home directory.
+ * src/config.ts (and only types from src/persona-notifier.ts and
+ * src/persona-lifecycle.ts), runs no server code, and touches no home
+ * directory.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -107,6 +112,9 @@ import {
   type PersonaConfig,
   type ReplySettings,
 } from '../src/config.ts'
+import type { PersonaLifecycleDeps } from '../src/persona-lifecycle.ts'
+import type * as PersonaNotifierModule from '../src/persona-notifier.ts'
+import type { PersonaNotifier, PersonaNotifierDeps } from '../src/persona-notifier.ts'
 
 /** server.ts with every comment removed (see stripComments). */
 const SERVER_CODE = stripComments(readFileSync(new URL('../src/server.ts', import.meta.url), 'utf-8'))
@@ -494,6 +502,11 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       // The silent per-key ack-tracker forget, so a key added again starts clean.
       ['forgetAcks', 'forgetPersonaAcks'],
       ['dropSession', 'dropPersonaSessionAndKeepAlive'],
+      // b.jg5 SRJ-110, SRJ-1003: optional in the deps, so only this pin makes
+      // sure production reads the key's raised outage classes after its kill:
+      // without it an ENVIRONMENT or CONFIG outcome counts as covered by an
+      // onset while the key is applied, raised or not.
+      ['outageFlags', 'getOutageFlags'],
     ])
     // Functions and objects with a parameter name of the source's choosing.
     // (`templateRefresh` is pinned in the test after this one.)
@@ -522,6 +535,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       forgetDisconnectedStreak: './health-check.ts',
       forgetNotConnectedEpisode: './session-manager.ts',
       resetAllToHealthy: './outage-state.ts',
+      getOutageFlags: './outage-state.ts',
       forgetPersonaPrompts: './permission-poller.ts',
       forgetPersonaAcks: './ack-tracker.ts',
       getLaunchedWithDir: './stop-hook-bootstrap.ts',
@@ -840,6 +854,54 @@ describe('server.ts binds apply step 1\'s approver stop, and no src file keeps t
     expect(files).toContain('server.ts')
     const naming = files.filter((name) => /\b(?:deletePersonaInstance|deleteInstanceRow)\b/.test(readFileSync(new URL(name, srcDir), 'utf-8')))
     expect(naming).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The persona notifier's startup-errors recorder and the teardown's window
+// (b.jg5 SRJ-1003, SRJ-1013)
+// ---------------------------------------------------------------------------
+
+describe('server.ts builds the one persona notifier with the production startup-errors recorder, and the teardown\'s window is that notifier\'s (b.jg5 SRJ-1003, SRJ-1013)', () => {
+  // Tied to src by type: renaming any of these fails the typecheck.
+  const NOTIFIER_FACTORY: keyof typeof PersonaNotifierModule = 'createPersonaNotifier'
+  const RECORDER: keyof PersonaNotifierDeps = 'recordStartupError'
+  const LIFECYCLE_NOTIFIER: keyof PersonaLifecycleDeps = 'notifier'
+  const WINDOW_ENTRIES: ReadonlyArray<keyof PersonaNotifier> = ['submitTeardown', 'settleTeardown', 'openTeardownWindow', 'closeTeardownWindow']
+
+  // The recorder is optional (absent, a window notice's line says no entry was
+  // written) and any function type-checks, so a production notifier with no
+  // recorder, a stand-in, or `recordStartupError` given a test `logDir` would
+  // pass every behaviour suite while no persona-teardown-notice entry reached
+  // the operator's startup-errors.log. What the window writes is tested in
+  // tests/persona-notifier.test.ts.
+  test('the one createPersonaNotifier call, at module scope, gets startup-errors.ts\'s recordStartupError with its default log directory: the class and the message passed through, nothing else', () => {
+    expect(callsOf(SERVER_CODE, NOTIFIER_FACTORY)).toHaveLength(1)
+    const notifier = constOf(NOTIFIER_FACTORY)
+    expect(insideMain(SERVER_CODE, callsOf(SERVER_CODE, NOTIFIER_FACTORY)[0]!)).toBe(false)
+    expect(importSource(SERVER_CODE, NOTIFIER_FACTORY)).toBe('./persona-notifier.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${NOTIFIER_FACTORY}\\b`, 'g'), SERVER_CODE)).toEqual([])
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${notifier}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
+
+    // `(classLabel, message) => recordStartupError(classLabel, message)` (the
+    // parameters' names free, two arguments: no cause and no options, so no
+    // `logDir`), or the function itself.
+    const recorder = onlyCallProps(NOTIFIER_FACTORY).get(RECORDER)
+    expect(recorder).toMatch(new RegExp(`^(?:${RECORDER}|\\((\\w+), (\\w+)\\) => ${RECORDER}\\(\\1, \\2\\))$`))
+    expect(importSource(SERVER_CODE, RECORDER)).toBe('./startup-errors.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${RECORDER}\\b`, 'g'), SERVER_CODE)).toEqual([])
+    expect(onlyCallArguments(SERVER_CODE, NOTIFIER_FACTORY)).not.toMatch(/\blogDir\b/)
+  })
+
+  // The window entries are optional on the lifecycle's notifier dependency,
+  // so a lifecycle bound to another notifier, or a window driven from
+  // server.ts beside the lifecycle's, would type-check while the window the
+  // teardown opens was not the one the notices go through.
+  test('the lifecycle\'s notifier, which carries the window entries, is that same notifier, and server.ts drives none of the window entries itself', () => {
+    const notifier = constOf(NOTIFIER_FACTORY)
+
+    expect(onlyCallProps('createPersonaLifecycle').get(LIFECYCLE_NOTIFIER)).toBe(notifier)
+    for (const entry of WINDOW_ENTRIES) expect([entry, anyCallOf(entry)]).toEqual([entry, []])
   })
 })
 

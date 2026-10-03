@@ -82,9 +82,45 @@
  * not-latched or latched closing sentence (the survivor version always its
  * destination one); a key the lookup does not know gets one log-only call of
  * `persona-kill-failed` or `persona-kill-survivor` with the `recovery` entry,
- * nothing posted and no episode; stopped tries post nothing for a configured
- * persona (one redacted line) and still write a not-configured persona's
- * entry; each persona's episode is its own; and after `close` nothing posts.
+ * nothing posted and no episode; stopped tries (b.jg5 SRJ-702) raise neither
+ * version: one redacted line naming the context, the last outcome's class and
+ * the stop's cause (the generic cause and no class when none is given),
+ * quoting the latest survivor-naming description, and for a persona no
+ * longer configured one `persona-kill-failed` entry holding that line, with
+ * no alert text (a refused entry logged token-safely); each persona's
+ * episode is its own; and after `close` nothing posts.
+ *
+ * A persona teardown (b.jg5 SRJ-1003, SRJ-704, SRJ-1013), over an injected
+ * teardown query standing in for the persona notifier's
+ * `teardownWindowState`: from the teardown's submit until its window opens,
+ * no post or `postWithoutEpisode` of any kind reaches the sink (one muted line
+ * each, a post still counting as posted), so a destructive modify's old half's
+ * `tmux-unresponsive` onset at a health tick, its alert and its recovery reach
+ * neither half's destination, and the kill-failure alert of either version is
+ * muted too; while the window is open every post reaches the sink as given
+ * (the notifier's window writes it). A query that throws reads as none, with
+ * one redacted line. In the window the unclassified-error alert, for a key
+ * still applied or not, goes once, unescaped, to the sink and never to the
+ * log-only route (its line names `persona-teardown-notice`); a kill-failure
+ * alert of every context but a start-sweep or CLI teardown kill, configured
+ * or not and latched or not, is handed to the sink with no episode (the
+ * survivor version with its `persona-kill-survivor` class in the options),
+ * answers `logged` and is never held, and once the window closes the next
+ * ordinary alert opens its episode at the destination; a start-sweep or CLI
+ * teardown kill keeps its own route; a retry the teardown stopped (a
+ * recovery or stuck-launch abort kill, in the open window or between the
+ * submit and the turn) is no teardown notice: its stop line and, for a
+ * removed persona, its `persona-kill-failed` entry with no alert text,
+ * nothing handed to the sink; another persona's alert goes to its
+ * destination. Muted posts name themselves: the condition's onset, alert and
+ * recovery lines, the unclassified alert's and both kill-failure versions'
+ * lines say "not posted — muted". Controls with no window open: the
+ * unclassified alert's and the kill-failure alert's own routes, and the
+ * persona-teardown context's entry built by `personaTeardownNoticeEntryText`.
+ * Over the real persona notifier (`makeNotifierHarness`), wired as `main()`
+ * wires them: an alert raised in its open window is one log line and one
+ * `persona-teardown-notice` entry with no Slack call, and a stopped retry in
+ * the same window writes no such entry.
  *
  * Per-kind counts (b.jg5 SRJ-610): `addCount` and `resetCount` answer the
  * new and the prior count, per persona and kind; a count is independent of
@@ -102,14 +138,20 @@
  * `closed` and nothing posts.
  *
  * Pure module under test: built over `createFakeClock`, a recording notice
- * sink and a line capture. Kinds come from `PERSONA_EPISODE_KINDS`, so a
+ * sink and a line capture (the real-notifier cases over `makeNotifierHarness`
+ * on its own fake clock, their persona paths and entries under a per-test
+ * `mkdtempSync` directory and the harness's own temp root, both removed). Kinds come from `PERSONA_EPISODE_KINDS`, so a
  * later kind joins every table. `afterEach` asserts no timer is pending and
  * runs `assertNoLeak` over every captured post and line.
  */
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import {
+  AD_ERROR_CLASS_UNAVAILABLE,
   AD_ERROR_CLASS_UNCLASSIFIED,
   classifyAdError,
   describeAdErrorClassification,
@@ -118,26 +160,39 @@ import {
   type AdErrorClassification,
 } from '../src/ad-error-class.ts'
 import { DEFAULT_AD_SETTINGS_IN_EFFECT, adAlertThresholdMs, type AdSettingsInEffect } from '../src/ad-settings.ts'
+import type { Persona } from '../src/config.ts'
 import { LIVENESS_LIVE } from '../src/liveness-reading.ts'
 import {
+  KILL_FAILURE_CLOSING_CLI_TEARDOWN,
   KILL_FAILURE_CLOSING_DESTINATION,
   KILL_FAILURE_CLOSING_DESTINATION_LATCHED,
   KILL_FAILURE_CLOSING_LOG_ONLY,
+  KILL_FAILURE_CONTEXT_CLI_TEARDOWN,
+  KILL_FAILURE_CONTEXT_OLD_LIFE_WAIT,
+  KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN,
   KILL_FAILURE_CONTEXT_RECOVERY,
+  KILL_FAILURE_CONTEXT_START_SWEEP,
+  KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT,
+  KILL_FAILURE_ROUTE_CLI_TEARDOWN,
   KILL_FAILURE_ROUTE_NOT_CONFIGURED,
+  KILL_FAILURE_ROUTE_PERSONA_TEARDOWN,
+  KILL_FAILURE_ROUTE_START_SWEEP,
   KILL_FAILURE_VERSION_ORDINARY,
   KILL_FAILURE_VERSION_SURVIVOR,
+  ORPHAN_CLEANUP_LABEL,
   PERSONA_KILL_FAILED_LABEL,
   PERSONA_KILL_SURVIVOR_LABEL,
   describeKillFailureDescriptions,
   killFailureAlertEntryText,
   killFailureAlertText,
+  killFailureClosingSentence,
   type KillFailureAlertContent,
+  type KillFailureAlertContext,
   type KillFailureClosing,
 } from '../src/kill-failure-alert.ts'
 import { KILL_RETRY_ALERT_NONE, KILL_RETRY_ALERT_ORDINARY, KILL_RETRY_ALERT_SURVIVOR, type KillRetryAlert } from '../src/kill-retry.ts'
 import { MAX_LOGGED_MESSAGE_LENGTH, renderLogMessageText } from '../src/persona-connection-errors.ts'
-import { personaInstanceId, personaTmuxSessionName } from '../src/persona-identity.ts'
+import { personaInstanceId, personaTmuxSessionName, renderPersonaRef } from '../src/persona-identity.ts'
 import {
   KILL_FAILURE_END_ROW_FINISHED,
   KILL_FAILURE_END_ROW_GONE,
@@ -170,8 +225,10 @@ import {
   unclassifiedErrorAlertText,
   type KillFailureAlerts,
   type KillFailureEndReason,
+  type KillFailureRaiseInput,
   type PersonaEpisodeKind,
   type PersonaEpisodeSink,
+  type PersonaEpisodeSinkOptions,
   type PersonaEpisodesClock,
   type PersonaEpisodes,
   type TmuxUnresponsiveCondition,
@@ -181,6 +238,12 @@ import {
   type UnclassifiedErrorEpisodesDeps,
   type UnclassifiedErrorQuote,
 } from '../src/persona-episodes.ts'
+import {
+  PERSONA_TEARDOWN_NOTICE_LABEL,
+  formatPersonaNotice,
+  personaTeardownNoticeEntryText,
+  type PersonaTeardownWindowState,
+} from '../src/persona-notifier.ts'
 import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import {
   _resetNotConnectedEpisodes,
@@ -214,6 +277,8 @@ import {
   type KillFailedDescription,
 } from './test-helpers/agent-director-stub.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
+import { makeNotifierHarness, teardownNoticeEntry, type NotifierHarness } from './test-helpers/persona-notifier.ts'
 import {
   BOT_TOKEN_PREFIX,
   LEAK_SENTINEL,
@@ -232,20 +297,39 @@ const START_MS = 1_000
 interface Post {
   key: string
   text: string
+  /** The sink's options, recorded only when the sink was given any. */
+  options?: PersonaEpisodeSinkOptions
 }
 
 let clock: FakeClock
 let posts: Post[]
 let lines: string[]
 let episodes: PersonaEpisodes
+/** Where each key stands with its persona teardown, as the injected query answers it (absent: `none`). */
+let teardownStates: Map<string, PersonaTeardownWindowState>
 
-const record: PersonaEpisodeSink = (key, text) => {
-  posts.push({ key, text })
+const record: PersonaEpisodeSink = (key, text, options) => {
+  posts.push(options === undefined ? { key, text } : { key, text, options })
 }
 
 /** One instance over the fake clock and the line capture; the recording sink unless another is given. */
 function build(sink: PersonaEpisodeSink = record): PersonaEpisodes {
   return createPersonaEpisodes({ sink, log: (line) => lines.push(line), clock })
+}
+
+/** `build()` with the persona-teardown query over `teardownStates` (production: the notifier's `teardownWindowState`). */
+function buildWithTeardownQuery(): PersonaEpisodes {
+  return createPersonaEpisodes({
+    sink: record,
+    log: (line) => lines.push(line),
+    clock,
+    teardownWindow: (key) => teardownStates.get(key) ?? 'none',
+  })
+}
+
+/** The one line a post or a `postWithoutEpisode` logs when the key's persona teardown was submitted and its window is not open yet. */
+function mutedLine(key: string, kind: PersonaEpisodeKind): string {
+  return `[slack] persona-episodes: persona=${key} ${kind} notice not posted — its persona teardown was submitted (b.jg5 SRJ-1003)`
 }
 
 /** A distinct notice body per kind and attempt, built at runtime. */
@@ -259,6 +343,7 @@ beforeEach(() => {
   clock = createFakeClock({ start: START_MS })
   posts = []
   lines = []
+  teardownStates = new Map()
   episodes = build()
 })
 
@@ -842,6 +927,96 @@ describe('a failing sink', () => {
     } finally {
       process.off('unhandledRejection', onRejection)
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A persona teardown's submit and window (b.jg5 SRJ-1003): the posts
+// ---------------------------------------------------------------------------
+
+describe('a persona teardown\'s submit and window: every kind\'s posts', () => {
+  beforeEach(() => {
+    episodes = buildWithTeardownQuery()
+  })
+
+  test('from the submit until the window opens, no post of any kind reaches the sink: one line each, the post still counts as posted in its episode, and another persona posts', () => {
+    teardownStates.set('K', 'submitted')
+    const before = posts.length
+
+    for (const kind of PERSONA_EPISODE_KINDS) {
+      episodes.begin('K', kind)
+      episodes.begin('Q', kind)
+      expect({ kind, K: episodes.post('K', kind, textOf(kind, 1)), Q: episodes.post('Q', kind, textOf(kind, 2)) }).toEqual({ kind, K: true, Q: true })
+      expect({ kind, posted: episodes.hasPosted('K', kind), again: episodes.post('K', kind, textOf(kind, 3)) }).toEqual({ kind, posted: true, again: false })
+    }
+
+    expect(posts.slice(before)).toEqual(PERSONA_EPISODE_KINDS.map((kind) => ({ key: 'Q', text: textOf(kind, 2) })))
+    expect(lines).toEqual(PERSONA_EPISODE_KINDS.map((kind) => mutedLine('K', kind)))
+  })
+
+  test('from the submit, a postWithoutEpisode of any kind, with options or none, reaches no sink: true, one line, and no episode read or begun', () => {
+    teardownStates.set('K', 'submitted')
+    const options: PersonaEpisodeSinkOptions = { teardownEntryClass: PERSONA_KILL_SURVIVOR_LABEL }
+
+    for (const kind of PERSONA_EPISODE_KINDS) {
+      expect({ kind, plain: episodes.postWithoutEpisode('K', kind, textOf(kind, 1)), withOptions: episodes.postWithoutEpisode('K', kind, textOf(kind, 2), options) }).toEqual({
+        kind,
+        plain: true,
+        withOptions: true,
+      })
+      expect({ kind, open: episodes.isOpen('K', kind) }).toEqual({ kind, open: false })
+    }
+
+    expect(posts).toEqual([])
+    expect(lines).toEqual(PERSONA_EPISODE_KINDS.flatMap((kind) => [mutedLine('K', kind), mutedLine('K', kind)]))
+  })
+
+  test('while the window is open, every kind\'s post and postWithoutEpisode reach the sink as given (the notifier\'s window writes them), options only when given, with no line', () => {
+    teardownStates.set('K', 'open')
+    const options: PersonaEpisodeSinkOptions = { teardownEntryClass: PERSONA_KILL_SURVIVOR_LABEL }
+
+    for (const kind of PERSONA_EPISODE_KINDS) {
+      episodes.begin('K', kind)
+      expect({ kind, post: episodes.post('K', kind, textOf(kind, 1)), without: episodes.postWithoutEpisode('K', kind, textOf(kind, 2), options) }).toEqual({
+        kind,
+        post: true,
+        without: true,
+      })
+    }
+
+    expect(posts).toEqual(
+      PERSONA_EPISODE_KINDS.flatMap((kind) => [
+        { key: 'K', text: textOf(kind, 1) },
+        { key: 'K', text: textOf(kind, 2), options },
+      ]),
+    )
+    expect(lines).toEqual([])
+  })
+
+  test('teardownWindowState answers the query, none with no query installed or for an answer it does not know; a query that throws is logged, redacted, read as none, and the post reaches the sink', () => {
+    teardownStates.set('K', 'open')
+    teardownStates.set('Q', 'submitted')
+    teardownStates.set('R', 'not-a-state' as PersonaTeardownWindowState)
+    expect(['K', 'Q', 'R', 'S'].map((key) => episodes.teardownWindowState(key))).toEqual(['open', 'submitted', 'none', 'none'])
+    expect(build().teardownWindowState('K')).toBe('none')
+
+    const kind = PERSONA_EPISODE_KINDS[0]
+    episodes = createPersonaEpisodes({
+      sink: record,
+      log: (line) => lines.push(line),
+      clock,
+      teardownWindow: () => {
+        throw new Error(`query refused (${sentinelInMessage('window')})`)
+      },
+    })
+    episodes.begin('K', kind)
+
+    expect(episodes.post('K', kind, textOf(kind, 1))).toBe(true)
+
+    expect(posts).toEqual([{ key: 'K', text: textOf(kind, 1) }])
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toStartWith(`[slack] persona-episodes: persona=K teardown window read failed: Error message="query refused (${REDACTED_SENTINEL_TAIL})"`)
+    expect(lines[0]).toEndWith(' — read as none')
   })
 })
 
@@ -1512,6 +1687,67 @@ describe('the tmux-unresponsive condition\'s own rules', () => {
   })
 
   // -------------------------------------------------------------------------
+  // A destructive modify's old half between its teardown's submit and its
+  // serializer turn (b.jg5 SRJ-1003): both halves share the key, so a post
+  // that reaches no sink reaches neither half's destination.
+  // -------------------------------------------------------------------------
+
+  describe('from a persona teardown\'s submit, before its turn', () => {
+    const onsetPost = (key: string): Post => ({ key, text: tmuxUnresponsiveOnsetText(key) })
+
+    beforeEach(() => {
+      episodes = buildWithTeardownQuery()
+    })
+
+    test('a destructive modify\'s old half with an open condition: a health tick past the onset floor posts its onset to no destination, one muted line; another persona\'s onset at the same tick posts', async () => {
+      const condition = buildCondition({ healthCheckOn: () => true })
+      condition.start('Q', VERB, errTmuxUnresponsive(VERB))
+      expect(condition.start('K', VERB, errTmuxUnresponsive(VERB))).toBe('started')
+      await clock.advance(TMUX_UNRESPONSIVE_ONSET_FLOOR_MS)
+      teardownStates.set('K', 'submitted')
+      const before = lines.length
+
+      condition.onsetAtTick(clock.now())
+      condition.onsetAtTick(clock.now())
+
+      expect(posts).toEqual([onsetPost('Q')])
+      // The muted line, then the condition's own onset line saying it was not posted (it counts as posted); the second tick adds neither.
+      const kLines = lines.slice(before).filter((line) => line.startsWith(personaLine('K', '')))
+      expect(kLines).toHaveLength(2)
+      expect(kLines[0]).toBe(mutedLine('K', KIND))
+      expect(kLines[1]).toStartWith(
+        personaLine('K', 'onset not posted — muted, its persona teardown was submitted; it counts as posted in its episode; still not answering at a health tick, '),
+      )
+      expect(lines.filter((line) => line.startsWith(personaLine('K', 'onset posted')))).toEqual([])
+      // The onset counts as posted in K's episode, so no later tick posts it either.
+      expect(episodes.hasPosted('K', KIND)).toBe(true)
+      for (const key of ['K', 'Q']) condition.end(key, TMUX_UNRESPONSIVE_END_TMUX_VERB, undefined, { silent: true })
+    })
+
+    test('its alert past the threshold and its recovery at the end reach no destination either: one muted line each, and the condition\'s own alert and recovery lines say they were not posted', async () => {
+      const condition = buildCondition({ alertThresholdMs: () => THRESHOLD_MS })
+      expect(condition.start('K', VERB, errTmuxUnresponsive(VERB))).toBe('started')
+      teardownStates.set('K', 'submitted')
+
+      await clock.advance(THRESHOLD_MS + 1)
+      expect(condition.end('K', TMUX_UNRESPONSIVE_END_TICK, LIVENESS_LIVE)).toBe('ended-after-notice')
+
+      expect(posts).toEqual([])
+      expect(lines.filter((line) => line === mutedLine('K', KIND))).toHaveLength(2)
+      const alertLines = lines.filter((line) => line.startsWith(personaLine('K', 'alert posted')) || line.startsWith(personaLine('K', 'alert not posted')))
+      expect(alertLines).toHaveLength(1)
+      expect(alertLines[0]).toStartWith(
+        personaLine('K', 'alert not posted — muted, its persona teardown was submitted; it counts as posted in its episode; not answering for '),
+      )
+      expect(alertLines[0]).toEndWith(` s, over its alert threshold of ${Math.floor(THRESHOLD_MS / 1000)} s`)
+      expect(lines.filter((line) => line.startsWith(personaLine('K', 'recovery ')))).toEqual([
+        personaLine('K', 'recovery not posted — muted, its persona teardown was submitted'),
+      ])
+      expect(clock.pendingCount()).toBe(0)
+    })
+  })
+
+  // -------------------------------------------------------------------------
   // The failure-only lines: each failure is logged and never throws out of
   // the entry that met it.
   // -------------------------------------------------------------------------
@@ -2108,6 +2344,93 @@ describe('the unclassified-error episodes (b.jg5 SRJ-313, SRJ-1009)', () => {
   })
 
   // -------------------------------------------------------------------------
+  // During a persona teardown (b.jg5 SRJ-1003, SRJ-1013): the alert is a
+  // teardown notice, configured or not. The sink is the persona notifier,
+  // whose open window writes it to the server log and a
+  // persona-teardown-notice entry (tests/persona-notifier.test.ts).
+  // -------------------------------------------------------------------------
+
+  describe('during a persona teardown', () => {
+    beforeEach(() => {
+      episodes = buildWithTeardownQuery()
+    })
+
+    function teardownLine(key: string, elapsedMs: number, thresholdMs: number, classification: AdErrorClassification): string {
+      return personaLine(
+        key,
+        `alert written to the server log and startup-errors.log (${PERSONA_TEARDOWN_NOTICE_LABEL}) — raised during its persona teardown; ${met(elapsedMs, thresholdMs, classification)}`,
+      )
+    }
+
+    test.each([
+      ['still applied (a destructive modify\'s old half)', true],
+      ['no longer applied (a removal)', false],
+    ])('a key %s whose window opened after its episode began: the alert goes once, unescaped, to the sink and never to the log-only route, its line naming persona-teardown-notice', async (_what, isConfigured) => {
+      const u = buildUnclassified({ isConfigured: () => isConfigured })
+      const err = errInternal(MENTIONING)
+      expect(u.report('K', errInternal())).toBe('begun')
+      teardownStates.set('K', 'open')
+      await clock.advance(DEFAULT_THRESHOLD_MS + 1)
+
+      expect(u.report('K', err)).toBe('alerted')
+
+      expect(posts).toEqual([{ key: 'K', text: unclassifiedErrorAlertText(classifyAdError(err), { escapeForSlack: false }) }])
+      expect(posts[0]!.text).toContain(`"${MENTIONING}"`)
+      expect(logOnlyCalls).toEqual([])
+      expect(lines.at(-1)).toBe(teardownLine('K', DEFAULT_THRESHOLD_MS + 1, DEFAULT_THRESHOLD_MS, classifyAdError(err)))
+      expect(lines.filter((line) => line.includes(PERSONA_UNCLASSIFIED_ERROR_LABEL))).toEqual([])
+
+      // One alert per episode: a later report in the window writes nothing more.
+      await clock.advance(1)
+      expect(u.report('K', errInternal())).toBe('continued')
+      expect(posts).toHaveLength(1)
+      expect(logOnlyCalls).toEqual([])
+    })
+
+    // SRJ-1003: from the submit, before the turn, a configured key's alert is
+    // muted; it still counts as posted, so no later report posts it.
+    test('a configured key whose teardown was submitted and whose window is not open yet: the alert reaches no sink and no log-only route; the muted line, then its own line saying it was not posted; it counts as posted in its episode', async () => {
+      const u = buildUnclassified({ isConfigured: () => true })
+      const err = errInternal(MENTIONING)
+      expect(u.report('K', errInternal())).toBe('begun')
+      teardownStates.set('K', 'submitted')
+      await clock.advance(DEFAULT_THRESHOLD_MS + 1)
+
+      expect(u.report('K', err)).toBe('alerted')
+
+      expect(posts).toEqual([])
+      expect(logOnlyCalls).toEqual([])
+      expect(lines.slice(-2)).toEqual([
+        mutedLine('K', KIND),
+        personaLine(
+          'K',
+          `alert not posted to its destination — muted, its persona teardown was submitted; it counts as posted in its episode; ${met(DEFAULT_THRESHOLD_MS + 1, DEFAULT_THRESHOLD_MS, classifyAdError(err))}`,
+        ),
+      ])
+      // Counted as posted: a later report in the episode posts nothing and logs no second muted line.
+      await clock.advance(1)
+      expect(u.report('K', errInternal())).toBe('continued')
+      expect(posts).toEqual([])
+      expect(lines.filter((line) => line === mutedLine('K', KIND))).toHaveLength(1)
+    })
+
+    test('control, no window open: a configured key\'s alert is posted escaped and one no longer applied writes persona-unclassified-error, while another persona\'s window is open', async () => {
+      teardownStates.set('Q', 'open')
+      const u = buildUnclassified({ isConfigured: (key) => key === 'K' })
+      const err = errInternal(MENTIONING)
+
+      await untilAlert(u, 'K', err)
+      await untilAlert(u, 'R', err)
+
+      expect(posts).toEqual([alertPost('K', err)])
+      expect(logOnlyCalls).toEqual([{ key: 'R', text: unclassifiedErrorAlertText(classifyAdError(err), { escapeForSlack: false }) }])
+      expect(lines).toContain(postedLine('K', DEFAULT_THRESHOLD_MS + 1, DEFAULT_THRESHOLD_MS, classifyAdError(err)))
+      expect(lines).toContain(logOnlyLine('R', DEFAULT_THRESHOLD_MS + 1, DEFAULT_THRESHOLD_MS, classifyAdError(err)))
+      expect(lines.filter((line) => line.includes(PERSONA_TEARDOWN_NOTICE_LABEL))).toEqual([])
+    })
+  })
+
+  // -------------------------------------------------------------------------
   // Ends, retry-timer stops, forget, forget-all and close
   // -------------------------------------------------------------------------
 
@@ -2381,9 +2704,61 @@ describe('the kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)', () => {
     return { key, text: killFailureAlertText(contentOf(key, decision), closing, true) }
   }
 
+  /** What a raise may add: latched, and a stopped retry's flag, last outcome's class and stop cause. */
+  type RaiseExtra = { latched?: boolean; stopped?: boolean; lastOutcomeClass?: string; stopCause?: string }
+
+  /** The raise's input for persona `key` of `decision` in `context`, not latched and not stopped unless said. */
+  function raiseInput(key: string, decision: KillRetryAlert, context: KillFailureAlertContext, extra: RaiseExtra): KillFailureRaiseInput {
+    return {
+      key,
+      decision,
+      latched: extra.latched ?? false,
+      context,
+      ...(extra.stopped === undefined ? {} : { stopped: extra.stopped }),
+      ...(extra.lastOutcomeClass === undefined ? {} : { lastOutcomeClass: extra.lastOutcomeClass }),
+      ...(extra.stopCause === undefined ? {} : { stopCause: extra.stopCause }),
+    }
+  }
+
   /** A raise for persona `key` of `decision` at the restart path (context `recovery`), not latched unless said. */
-  function raise(alerts: KillFailureAlerts, key: string, decision: KillRetryAlert, extra: { latched?: boolean; stopped?: boolean } = {}): string {
-    return alerts.raise({ key, decision, latched: extra.latched ?? false, context: KILL_FAILURE_CONTEXT_RECOVERY, ...(extra.stopped === undefined ? {} : { stopped: extra.stopped }) })
+  function raise(alerts: KillFailureAlerts, key: string, decision: KillRetryAlert, extra: RaiseExtra = {}): string {
+    return alerts.raise(raiseInput(key, decision, KILL_FAILURE_CONTEXT_RECOVERY, extra))
+  }
+
+  // A stopped retry's record (b.jg5 SRJ-702): its fixed words, pinned here.
+  /** The class and cause a stopped raise in these cases names. */
+  const STOP: RaiseExtra = { stopped: true, lastOutcomeClass: AD_ERROR_CLASS_UNAVAILABLE, stopCause: 'its teardown began between its tries' }
+
+  /** What a stopped raise's line says after `kill-failure `, with no context: `extra`'s class and cause, or none and the generic cause. */
+  function stoppedText(decision: KillRetryAlert, extra: RaiseExtra = STOP): string {
+    const cause = extra.stopCause ?? 'the persona is not up or is torn down, or the server is shutting down'
+    const lastClass = extra.lastOutcomeClass === undefined ? '' : `; its last outcome's class: ${extra.lastOutcomeClass}`
+    return `ordinary alert not raised — its tries were stopped (${cause})${lastClass}, so nothing retries this kill; ${describeKillFailureDescriptions(decision)}`
+  }
+
+  /** The one line of a stopped raise for persona `key` in `context`. */
+  function stoppedLine(key: string, decision: KillRetryAlert, context: KillFailureAlertContext = KILL_FAILURE_CONTEXT_RECOVERY, extra: RaiseExtra = STOP): string {
+    return `[slack] persona-episodes: persona=${key} ${KIND} ${stoppedText(decision, extra)} (${context})`
+  }
+
+  /** The `persona-kill-failed` entry of a stopped raise for persona `key` no longer configured: the line's content, no alert text. */
+  function stoppedEntry(key: string, decision: KillRetryAlert, context: KillFailureAlertContext = KILL_FAILURE_CONTEXT_RECOVERY, extra: RaiseExtra = STOP): { classLabel: string; entry: string } {
+    return { classLabel: PERSONA_KILL_FAILED_LABEL, entry: killFailureAlertEntryText(`persona=${key}`, context, `the kill-failure ${stoppedText(decision, extra)}`) }
+  }
+
+  /** The line written after a stopped raise's entry. */
+  function stoppedEntryLine(key: string): string {
+    return `[slack] persona-episodes: persona=${key} ${KIND} stopped retry's log line (no alert text) written to the server log and startup-errors.log (${PERSONA_KILL_FAILED_LABEL}) — stopped`
+  }
+
+  /** No alert text of either version in `entry`: neither version's text nor any closing sentence. */
+  function expectNoAlertText(key: string, entry: string, decision: KillRetryAlert): void {
+    expect(entry).not.toContain(killFailureAlertText(contentOf(key, decision), KILL_FAILURE_CLOSING_LOG_ONLY, false))
+    for (const version of [KILL_FAILURE_VERSION_ORDINARY, KILL_FAILURE_VERSION_SURVIVOR] as const) {
+      for (const closing of [KILL_FAILURE_CLOSING_LOG_ONLY, KILL_FAILURE_CLOSING_DESTINATION, KILL_FAILURE_CLOSING_DESTINATION_LATCHED, KILL_FAILURE_CLOSING_CLI_TEARDOWN] as const) {
+        expect(entry).not.toContain(killFailureClosingSentence(version, closing))
+      }
+    }
   }
 
   /** Persona `key`'s kill-failure lines. */
@@ -2497,48 +2872,68 @@ describe('the kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)', () => {
     ])
   })
 
-  // b.jg5 SRJ-702, SRJ-301 (Reconcile note 2's keep-going default): tries the
-  // keep-going check stopped leave nothing retrying the kill, so a configured
-  // persona's ordinary version is one line and no post; a persona no longer
-  // configured still gets its entry (SRJ-704, SRJ-1013).
-  test('stopped tries: a configured persona gets one line carrying the decision and the redacted description, no post and no episode; one no longer configured still gets its persona-kill-failed entry', () => {
+  // b.jg5 SRJ-702, SRJ-1013: a retry whose tries were stopped is no notice:
+  // neither version is raised, nothing is posted and no episode opens. One
+  // line names the persona, the context, the last outcome's class, the stop's
+  // cause and the redacted descriptions; a persona no longer configured also
+  // gets one persona-kill-failed entry holding that line's content, with no
+  // alert text; a configured persona's stop writes the line only.
+  test.each<[string, RaiseExtra]>([
+    ['with its last outcome\'s class and its cause', STOP],
+    ['with neither (the generic cause, no class)', { stopped: true }],
+  ])('stopped tries %s: a configured persona gets the one line only; one no longer configured gets the line and one persona-kill-failed entry holding it, with no alert text; both answer stopped, nothing posted, no episode', (_label, extra) => {
     const alerts = buildAlerts()
-
-    expect(raise(alerts, 'K', ordinary(), { stopped: true })).toBe('stopped')
-
-    expect(posts).toEqual([])
-    expect(alerts.isOpen('K')).toBe(false)
-    const [line] = killLines('K')
-    expect(killLines('K')).toHaveLength(1)
-    expect(line).toContain(`ordinary alert not raised — `)
-    expect(line).toContain(JSON.stringify(renderLogMessageText(description('outlived-exit-wait'))))
-    expect(line).toContain(REDACTED_SENTINEL_TAIL)
-
     configured.delete('Q')
-    expect(raise(alerts, 'Q', ordinary(), { stopped: true })).toBe('logged')
-    expect(logOnlyCalls.map((call) => call.classLabel)).toEqual([PERSONA_KILL_FAILED_LABEL])
+
+    expect([raise(alerts, 'K', ordinary(), extra), raise(alerts, 'Q', ordinary(), extra)]).toEqual(['stopped', 'stopped'])
+
+    expect(killLines('K')).toEqual([stoppedLine('K', ordinary(), KILL_FAILURE_CONTEXT_RECOVERY, extra)])
+    expect(killLines('K')[0]).toContain(JSON.stringify(renderLogMessageText(description('outlived-exit-wait'))))
+    expect(killLines('K')[0]).toContain(REDACTED_SENTINEL_TAIL)
+    expect(killLines('Q')).toEqual([stoppedLine('Q', ordinary(), KILL_FAILURE_CONTEXT_RECOVERY, extra), stoppedEntryLine('Q')])
+    expect(logOnlyCalls).toEqual([stoppedEntry('Q', ordinary(), KILL_FAILURE_CONTEXT_RECOVERY, extra)])
+    expectNoAlertText('Q', logOnlyCalls[0]!.entry, ordinary())
     expect(posts).toEqual([])
+    expect([alerts.isOpen('K'), alerts.isOpen('Q')]).toEqual([false, false])
   })
 
-  // b.jg5 SRJ-702: the failure that named a survivor is the only report of
-  // the surviving process, so a stopped decision carrying it is kept in one
-  // persona-kill-failed entry; still nothing is posted and no episode opens.
+  // b.jg5 SRJ-702: the stop's line quotes the latest survivor-naming
+  // description when a try returned one; still no alert of either version,
+  // and a configured persona gets no entry.
   test.each<[string, () => KillRetryAlert]>([
     ['and a last description', () => ({ ...ordinary(), earlierSurvivorDescription: description('pane-process-survived') })],
     ['alone', () => ({ kind: KILL_RETRY_ALERT_ORDINARY, earlierSurvivorDescription: description('pane-process-survived') })],
-  ])('stopped tries whose ordinary decision carries an earlier survivor-naming description %s: the not-raised line, then one persona-kill-failed entry with the log-only closing and the recovery context; no post and no episode', (_label, decision) => {
+  ])('stopped tries whose ordinary decision carries an earlier survivor-naming description %s: a configured persona gets one line quoting it and no entry; one no longer configured gets the line and its persona-kill-failed entry quoting it, with no alert text; no post and no episode', (_label, decision) => {
     const alerts = buildAlerts()
+    configured.delete('Q')
 
-    expect(raise(alerts, 'K', decision(), { stopped: true })).toBe('stopped')
+    expect([raise(alerts, 'K', decision(), STOP), raise(alerts, 'Q', decision(), STOP)]).toEqual(['stopped', 'stopped'])
 
-    const text = killFailureAlertText(contentOf('K', decision()), KILL_FAILURE_CLOSING_LOG_ONLY, false)
-    expect(logOnlyCalls).toEqual([{ classLabel: PERSONA_KILL_FAILED_LABEL, entry: killFailureAlertEntryText('persona=K', KILL_FAILURE_CONTEXT_RECOVERY, text) }])
+    expect(killLines('K')).toEqual([stoppedLine('K', decision())])
+    expect(killLines('K')[0]).toContain(`earlier survivor-naming=${JSON.stringify(renderLogMessageText(description('pane-process-survived')))}`)
+    expect(killLines('Q')).toEqual([stoppedLine('Q', decision()), stoppedEntryLine('Q')])
+    expect(logOnlyCalls).toEqual([stoppedEntry('Q', decision())])
+    expectNoAlertText('Q', logOnlyCalls[0]!.entry, decision())
     expect(posts).toEqual([])
-    expect(alerts.isOpen('K')).toBe(false)
-    expect(killLines('K')).toEqual([
-      `[slack] persona-episodes: persona=K kill-failure ordinary alert not raised — its tries were stopped (the persona is not up or is torn down, or the server is shutting down), so nothing retries this kill; ${describeKillFailureDescriptions(decision())} (recovery)`,
-      '[slack] persona-episodes: persona=K kill-failure ordinary alert written to the server log and startup-errors.log (persona-kill-failed) — stopped-survivor',
-    ])
+    expect([alerts.isOpen('K'), alerts.isOpen('Q')]).toEqual([false, false])
+  })
+
+  test('a stopped raise\'s entry that the log-only route refuses: the line, then one token-safe failure line; still stopped, nothing posted', () => {
+    const alerts = createKillFailureAlerts({
+      episodes,
+      log: (line) => lines.push(line),
+      isConfigured: () => false,
+      logOnly: () => {
+        throw new Error(`route refused (${sentinelInMessage('stopped-entry')})`)
+      },
+    })
+
+    expect(raise(alerts, 'K', ordinary(), STOP)).toBe('stopped')
+
+    expect(killLines('K')).toHaveLength(2)
+    expect(killLines('K')[0]).toBe(stoppedLine('K', ordinary()))
+    expect(killLines('K')[1]).toStartWith(`[slack] persona-episodes: persona=K ${KIND} stopped retry's log line (no alert text) log-only write failed: Error message="route refused (${REDACTED_SENTINEL_TAIL})"`)
+    expect(posts).toEqual([])
   })
 
   test('P\'s episode is independent of B\'s: the open query answers per key, and B\'s end leaves P\'s open', () => {
@@ -2561,6 +2956,278 @@ describe('the kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)', () => {
     expect([raise(alerts, 'K', ordinary()), raise(alerts, 'K', survivor())]).toEqual(['closed', 'closed'])
     expect(posts).toEqual([])
     expect(alerts.isOpen('K')).toBe(false)
+  })
+
+  // -------------------------------------------------------------------------
+  // During a persona teardown (b.jg5 SRJ-1003, SRJ-704's first match,
+  // SRJ-1013). While the key's window is open an alert of any context but a
+  // start-sweep or CLI teardown kill takes the persona-teardown route: handed
+  // to the sink with no episode, where the persona notifier's window writes
+  // it (tests/persona-notifier.test.ts), the survivor version carrying its
+  // own class in the options.
+  // -------------------------------------------------------------------------
+
+  describe('during a persona teardown', () => {
+    beforeEach(() => {
+      episodes = buildWithTeardownQuery()
+    })
+
+    /** A raise for persona `key` of `decision` in `context`, not latched and not stopped unless said. */
+    function raiseIn(alerts: KillFailureAlerts, key: string, decision: KillRetryAlert, context: KillFailureAlertContext, extra: RaiseExtra = {}): string {
+      return alerts.raise(raiseInput(key, decision, context, extra))
+    }
+
+    /**
+     * The teardown route's text for `decision`: the log-only closing,
+     * unescaped; an alert of another context than the persona teardown's own
+     * kill carries that context ahead of its text, as `(<context>) <text>`
+     * (SRJ-1007, SRJ-1013).
+     */
+    function teardownText(key: string, decision: KillRetryAlert, context: KillFailureAlertContext = KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN): string {
+      const text = killFailureAlertText(contentOf(key, decision), KILL_FAILURE_CLOSING_LOG_ONLY, false)
+      return context === KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN ? text : `(${context}) ${text}`
+    }
+
+    const versions: ReadonlyArray<readonly [string, () => KillRetryAlert, string, PersonaEpisodeSinkOptions | undefined]> = [
+      [KILL_FAILURE_VERSION_ORDINARY, () => ordinary(), PERSONA_TEARDOWN_NOTICE_LABEL, undefined],
+      [KILL_FAILURE_VERSION_SURVIVOR, () => survivor(), PERSONA_KILL_SURVIVOR_LABEL, { teardownEntryClass: PERSONA_KILL_SURVIVOR_LABEL }],
+    ]
+    const windowContexts: readonly KillFailureAlertContext[] = [
+      KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN,
+      KILL_FAILURE_CONTEXT_OLD_LIFE_WAIT,
+      KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT,
+      KILL_FAILURE_CONTEXT_RECOVERY,
+    ]
+
+    test.each(
+      windowContexts.flatMap((context) =>
+        [true, false].flatMap((isConfigured) => versions.map(([version, decision, classLabel, options]) => [version, context, isConfigured, decision, classLabel, options] as const)),
+      ),
+    )('the %s version raised in the window with the context %s (configured %p): logged, handed to the sink with its class, never the log-only route, and no episode opened', (version, context, isConfigured, decision, classLabel, options) => {
+      if (!isConfigured) configured.delete('K')
+      teardownStates.set('K', 'open')
+      const alerts = buildAlerts()
+
+      expect(raiseIn(alerts, 'K', decision(), context)).toBe('logged')
+
+      expect(posts).toEqual([{ key: 'K', text: teardownText('K', decision(), context), ...(options === undefined ? {} : { options }) }])
+      expect(logOnlyCalls).toEqual([])
+      expect(alerts.isOpen('K')).toBe(false)
+      expect(killLines('K')).toEqual([
+        `[slack] persona-episodes: persona=K ${KIND} ${version} alert written to the server log and startup-errors.log (${classLabel}) — ${KILL_FAILURE_ROUTE_PERSONA_TEARDOWN}, raised during its teardown (${context})`,
+      ])
+      expect(lines.filter((line) => line.includes(PERSONA_KILL_FAILED_LABEL))).toEqual([])
+    })
+
+    test('a latched raise in the window still takes the teardown route, and none is held back: each ordinary raise is handed over, and once the window has closed the next ordinary alert opens its episode at the destination', () => {
+      teardownStates.set('K', 'open')
+      const alerts = buildAlerts()
+
+      expect([raiseIn(alerts, 'K', ordinary(), KILL_FAILURE_CONTEXT_RECOVERY, { latched: true }), raiseIn(alerts, 'K', ordinary(), KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN)]).toEqual(['logged', 'logged'])
+      expect(posts).toEqual([
+        { key: 'K', text: teardownText('K', ordinary(), KILL_FAILURE_CONTEXT_RECOVERY) },
+        { key: 'K', text: teardownText('K', ordinary()) },
+      ])
+      expect(alerts.isOpen('K')).toBe(false)
+
+      teardownStates.delete('K')
+      expect(raise(alerts, 'K', ordinary())).toBe('posted')
+      expect(posts.at(-1)).toEqual(destinationPost('K', ordinary()))
+      expect(alerts.isOpen('K')).toBe(true)
+    })
+
+    test('another persona\'s alert while K\'s window is open goes to its own destination', () => {
+      teardownStates.set('K', 'open')
+      const alerts = buildAlerts()
+
+      expect(raise(alerts, 'Q', ordinary())).toBe('posted')
+
+      expect(posts).toEqual([destinationPost('Q', ordinary())])
+      expect([alerts.isOpen('Q'), alerts.isOpen('K')]).toEqual([true, false])
+    })
+
+    // SRJ-704's first match: a start-sweep or CLI teardown kill keeps its own route, window or not.
+    test.each<[KillFailureAlertContext, string, KillFailureClosing, string]>([
+      [KILL_FAILURE_CONTEXT_START_SWEEP, ORPHAN_CLEANUP_LABEL, KILL_FAILURE_CLOSING_LOG_ONLY, KILL_FAILURE_ROUTE_START_SWEEP],
+      [KILL_FAILURE_CONTEXT_CLI_TEARDOWN, PERSONA_KILL_FAILED_LABEL, KILL_FAILURE_CLOSING_CLI_TEARDOWN, KILL_FAILURE_ROUTE_CLI_TEARDOWN],
+    ])('a %s kill in the window keeps its own route: one %s entry through the log-only route, nothing handed to the sink', (context, classLabel, closing, route) => {
+      teardownStates.set('K', 'open')
+      const alerts = buildAlerts()
+
+      expect(raiseIn(alerts, 'K', ordinary(), context)).toBe('logged')
+
+      const text = killFailureAlertText(contentOf('K', ordinary()), closing, false)
+      expect(logOnlyCalls).toEqual([{ classLabel, entry: killFailureAlertEntryText('persona=K', context, text) }])
+      expect(posts).toEqual([])
+      expect(killLines('K')).toEqual([`[slack] persona-episodes: persona=K ${KIND} ordinary alert written to the server log and startup-errors.log (${classLabel}) — ${route}`])
+    })
+
+    // SRJ-702, SRJ-1003 (the control for a retry the teardown's start
+    // stopped): a bounded retry of a launch or recovery attempt's kill (the
+    // live-row sequence's and the restart path's kills, context recovery; the
+    // stuck-launch abort's) stopped while the key's window is open, or between
+    // its submit and its turn, is no teardown notice: SRJ-702's one line and,
+    // for a persona removed during the tries, its persona-kill-failed entry
+    // with no alert text; nothing handed to the sink (so no
+    // persona-teardown-notice entry and no Slack call), neither version, no
+    // muted line and no episode. A configured persona's stop writes the line only.
+    test.each<[KillFailureAlertContext, PersonaTeardownWindowState]>([
+      [KILL_FAILURE_CONTEXT_RECOVERY, 'open'],
+      [KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT, 'open'],
+      [KILL_FAILURE_CONTEXT_RECOVERY, 'submitted'],
+    ])('a stopped retry of a %s kill, its teardown %s: a removed persona gets the stop line and one persona-kill-failed entry with no alert text, a configured one the line only; never a persona-teardown-notice entry, nothing handed to the sink, neither version', (context, state) => {
+      teardownStates.set('K', state)
+      teardownStates.set('R', state)
+      configured.delete('R')
+      const alerts = buildAlerts()
+
+      expect([raiseIn(alerts, 'K', ordinary(), context, STOP), raiseIn(alerts, 'R', ordinary(), context, STOP)]).toEqual(['stopped', 'stopped'])
+
+      expect(killLines('K')).toEqual([stoppedLine('K', ordinary(), context)])
+      expect(killLines('R')).toEqual([stoppedLine('R', ordinary(), context), stoppedEntryLine('R')])
+      expect(logOnlyCalls).toEqual([stoppedEntry('R', ordinary(), context)])
+      expectNoAlertText('R', logOnlyCalls[0]!.entry, ordinary())
+      expect(posts).toEqual([])
+      expect(lines.filter((line) => line.includes(PERSONA_TEARDOWN_NOTICE_LABEL) || line.includes(PERSONA_KILL_SURVIVOR_LABEL))).toEqual([])
+      expect(lines.filter((line) => line === mutedLine('K', KIND) || line === mutedLine('R', KIND))).toEqual([])
+      expect([alerts.isOpen('K'), alerts.isOpen('R')]).toEqual([false, false])
+    })
+
+    // SRJ-1003: from the submit, before the turn, the key's posts are muted;
+    // the alerts' own line says the alert was not posted.
+    test.each<[string, () => KillRetryAlert, string]>([
+      [
+        KILL_FAILURE_VERSION_ORDINARY,
+        () => ordinary(),
+        `ordinary alert not posted to its destination — muted, its persona teardown was submitted; it counts as posted in its episode (${KILL_FAILURE_CONTEXT_RECOVERY}; ${KILL_FAILURE_CLOSING_DESTINATION})`,
+      ],
+      [
+        KILL_FAILURE_VERSION_SURVIVOR,
+        () => survivor(),
+        `survivor alert not posted to its destination — muted, its persona teardown was submitted (${KILL_FAILURE_CONTEXT_RECOVERY})`,
+      ],
+    ])('the %s version raised between the teardown\'s submit and its turn, for a configured persona, reaches no destination: the muted line, then its own line saying it was not posted', (_version, decision, ownLine) => {
+      teardownStates.set('K', 'submitted')
+      const alerts = buildAlerts()
+
+      expect(raise(alerts, 'K', decision())).toBe('posted')
+
+      expect(posts).toEqual([])
+      expect(logOnlyCalls).toEqual([])
+      expect(lines).toEqual([mutedLine('K', KIND), `[slack] persona-episodes: persona=K ${KIND} ${ownLine}`])
+    })
+
+    // Controls: with no window open the routes are SRJ-704's own; the
+    // persona-teardown context's entry is built by the shared builder.
+    test.each(versions)('control, no window open: the %s version for a configured persona in recovery goes to its destination', (_version, decision) => {
+      teardownStates.set('Q', 'open')
+      const alerts = buildAlerts()
+
+      expect(raise(alerts, 'K', decision())).toBe('posted')
+
+      expect(posts).toEqual([destinationPost('K', decision())])
+      expect(logOnlyCalls).toEqual([])
+    })
+
+    test.each<[string, () => KillRetryAlert, string, (text: string) => string]>([
+      [KILL_FAILURE_VERSION_ORDINARY, () => ordinary(), PERSONA_TEARDOWN_NOTICE_LABEL, (text) => personaTeardownNoticeEntryText('persona=K', text)],
+      [KILL_FAILURE_VERSION_SURVIVOR, () => survivor(), PERSONA_KILL_SURVIVOR_LABEL, (text) => killFailureAlertEntryText('persona=K', KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN, text)],
+    ])('control, no window open: the %s version with the persona-teardown context writes one %s entry through the log-only route and hands nothing to the sink', (version, decision, classLabel, entryOf) => {
+      const alerts = buildAlerts()
+
+      expect(raiseIn(alerts, 'K', decision(), KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN)).toBe('logged')
+
+      expect(logOnlyCalls).toEqual([{ classLabel, entry: entryOf(teardownText('K', decision())) }])
+      expect(posts).toEqual([])
+      expect(alerts.isOpen('K')).toBe(false)
+      expect(killLines('K')).toEqual([
+        `[slack] persona-episodes: persona=K ${KIND} ${version} alert written to the server log and startup-errors.log (${classLabel}) — ${KILL_FAILURE_ROUTE_PERSONA_TEARDOWN}`,
+      ])
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // Over the real persona notifier's teardown window (b.jg5 SRJ-1003,
+  // SRJ-702), wired as main() wires them: the episodes' sink is the
+  // notifier's `notify` and their teardown query its `teardownWindowState`.
+  // -------------------------------------------------------------------------
+
+  describe('over the real persona notifier\'s teardown window', () => {
+    let baseDir: string
+    let h: NotifierHarness
+    /** A destructive modify's old half (still configured) and a removed persona. */
+    let kept: Persona
+    let removed: Persona
+
+    beforeEach(() => {
+      baseDir = mkdtempSync(join(tmpdir(), 'cscb-episodes-'))
+      const config = makeMultiPersonaConfig([{ name: 'Kilo Episodes' }, { name: 'Romeo Episodes' }], baseDir)
+      ;[kept, removed] = config.personas as [Persona, Persona]
+      h = makeNotifierHarness(config, { leakMarker: LEAK_SENTINEL })
+      configured = new Set([kept.key])
+      h.personas.splice(h.personas.findIndex((p) => p.key === removed.key), 1) // apply step 1: removed
+      episodes = createPersonaEpisodes({
+        sink: (key, text, options) => h.notifier.notify(key, text, options),
+        log: (line) => lines.push(line),
+        clock,
+        teardownWindow: (key) => h.notifier.teardownWindowState(key),
+      })
+    })
+
+    afterEach(() => {
+      try {
+        assertNoLeak({ logs: h.logs, slack: h.allPosts(), entries: h.startupEntries() })
+      } finally {
+        h.hold.cancelAll()
+        h.cleanup()
+        rmSync(baseDir, { recursive: true, force: true })
+      }
+    })
+
+    test('in a removed persona\'s open window: an ordinary alert is one notifier line and one persona-teardown-notice entry with no Slack call, while a stopped retry beside it writes only its stop line and its persona-kill-failed entry with no alert text', async () => {
+      const alerts = buildAlerts()
+      const key = removed.key
+
+      await h.duringTeardown(removed, async () => {
+        expect(h.notifier.teardownWindowState(key)).toBe('open')
+        expect(alerts.raise(raiseInput(key, ordinary(), KILL_FAILURE_CONTEXT_RECOVERY, STOP))).toBe('stopped')
+        expect(alerts.raise(raiseInput(key, ordinary(), KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN, {}))).toBe('logged')
+        await clock.flush()
+      })
+
+      const text = killFailureAlertText(contentOf(key, ordinary()), KILL_FAILURE_CLOSING_LOG_ONLY, false)
+      expect(h.startupEntries()).toEqual([teardownNoticeEntry(removed, text)])
+      expect(h.logs).toEqual([
+        `[slack] persona-notifier: notice for ${renderPersonaRef(removed.name, key)} raised during its teardown — written to the server log and startup-errors.log (${PERSONA_TEARDOWN_NOTICE_LABEL}), not posted: ${text.split('\n')[0]}`,
+      ])
+      expect(h.totalPosts()).toBe(0)
+      expect(logOnlyCalls).toEqual([stoppedEntry(key, ordinary())])
+      expect(killLines(key)).toEqual([
+        stoppedLine(key, ordinary()),
+        stoppedEntryLine(key),
+        `[slack] persona-episodes: persona=${key} ${KIND} ${KILL_FAILURE_VERSION_ORDINARY} alert written to the server log and startup-errors.log (${PERSONA_TEARDOWN_NOTICE_LABEL}) — ${KILL_FAILURE_ROUTE_PERSONA_TEARDOWN}, raised during its teardown (${KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN})`,
+      ])
+      expect(alerts.isOpen(key)).toBe(false)
+    })
+
+    test('control: a destructive modify\'s old half with no window open gets its ordinary alert at its destination through its own client; once its window is open a stopped retry posts and writes nothing more than its stop line', async () => {
+      const alerts = buildAlerts()
+      const key = kept.key
+
+      expect(alerts.raise(raiseInput(key, ordinary(), KILL_FAILURE_CONTEXT_RECOVERY, {}))).toBe('posted')
+      await clock.flush()
+      expect(h.posts(key)).toEqual([{ channel: kept.permission_prompts, text: formatPersonaNotice(kept, killFailureAlertText(contentOf(key, ordinary()), KILL_FAILURE_CLOSING_DESTINATION, true)) }])
+
+      await h.duringTeardown(kept, async () => {
+        expect(alerts.raise(raiseInput(key, ordinary(), KILL_FAILURE_CONTEXT_RECOVERY, STOP))).toBe('stopped')
+        await clock.flush()
+      })
+
+      expect(h.posts(key)).toHaveLength(1)
+      expect(h.startupEntries()).toEqual([])
+      expect(logOnlyCalls).toEqual([])
+      expect(killLines(key).at(-1)).toBe(stoppedLine(key, ordinary()))
+    })
   })
 })
 

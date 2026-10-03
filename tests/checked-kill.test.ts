@@ -15,6 +15,10 @@
  * as `unlistedClass`) keep their thrown value and their class. The
  * module's import boundary is checked by walking its runtime imports through
  * `src/` (`forbiddenServerLoads`, `tests/test-helpers/source-audit.ts`).
+ * The two notices built from a kill's outcome where nothing latches on it
+ * (a CONFLICT or UNUSABLE NAME refusal, and a non-success no other notice
+ * records; b.jg5 SRJ-1003, SRJ-110) are pinned here once; their routing is
+ * tests/persona-lifecycle.test.ts's.
  *
  * No process, no real timer, no top-level mock.module(), no value import of
  * `Client` or `resolveSystemBinary`, no Phase-1-only named import.
@@ -51,6 +55,8 @@ import {
   KILL_OUTCOME_ROW_FINISHED,
   KILL_OUTCOME_ROW_GONE,
   KILL_OUTCOME_SESSION_GONE,
+  KILL_REFUSAL_AT_KILL,
+  KILL_REFUSAL_AT_READ,
   KILL_ROW_FINISHED_ENDED,
   KILL_ROW_FINISHED_MISSING,
   KILL_ROW_FINISHED_NO_ROW,
@@ -61,6 +67,9 @@ import {
   killLetsNextStepRun,
   killOutcomeOf,
   killOutcomeStopsServer,
+  teardownKillNotSucceededNoticeText,
+  teardownKillRefusalNoticeText,
+  type KillFailure,
   type KillOutcome,
   type KillRecheckKind,
   type KillRowFinishedRead,
@@ -470,6 +479,51 @@ describe('describeKillOutcome', () => {
     const hostile = new Proxy({}, { get: () => { throw new Error('boom') } }) as KillOutcome
     expect(() => describeKillOutcome(hostile)).not.toThrow()
     expect(describeKillOutcome(hostile)).toBe('outcome=unknown')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The notices built from a kill's outcome (b.jg5 SRJ-1003, SRJ-1002, SRJ-110)
+// ---------------------------------------------------------------------------
+
+describe('the notices built from a kill\'s outcome where nothing latches on it', () => {
+  test('pin: the refusal notice met at a try and at a status read, and the not-succeeded notice, each the instance id with the outcome\'s one-line rendering', () => {
+    const conflict = errTmuxSessionConflict('kill', 'not-this-launch')
+    const unusable = errUnusableName('empty')
+    const unresponsive = errTmuxUnresponsive('kill')
+    const notKilled = killOutcomeOf({ thrown: unresponsive }) as KillFailure
+    expect([KILL_REFUSAL_AT_KILL, KILL_REFUSAL_AT_READ]).toEqual(['kill', 'status read'])
+    expect([
+      teardownKillRefusalNoticeText('cscb_sample', { at: KILL_REFUSAL_AT_KILL, errorClass: AD_ERROR_CLASS_CONFLICT, error: conflict }),
+      teardownKillRefusalNoticeText('cscb_sample', { at: KILL_REFUSAL_AT_READ, errorClass: AD_ERROR_CLASS_UNUSABLE_NAME, error: unusable }),
+      teardownKillNotSucceededNoticeText('cscb_sample', notKilled, 3),
+    ]).toEqual([
+      `agent-director kill of cscb_sample refused at a try: ${describeKillOutcome(killOutcomeOf({ thrown: conflict }))}`,
+      `agent-director kill of cscb_sample refused at a status read between its tries: ${describeKillOutcome(killOutcomeOf({ thrown: unusable }))}`,
+      `agent-director kill of cscb_sample did not succeed after 3 kill(s); the row is kept: ${describeKillOutcome(notKilled)}`,
+    ])
+  })
+
+  test.each<[string, number]>([
+    ['a negative count', -1],
+    ['a fractional count', 1.5],
+    ['NaN', Number.NaN],
+  ])('the not-succeeded notice with %s of kills names "its tries" instead', (_label, tries) => {
+    const outcome = killOutcomeOf({ thrown: errInternal() }) as KillFailure
+    expect(teardownKillNotSucceededNoticeText('cscb_sample', outcome, tries)).toBe(
+      `agent-director kill of cscb_sample did not succeed after its tries; the row is kept: ${describeKillOutcome(outcome)}`,
+    )
+  })
+
+  test('a description carrying a token comes out redacted, on one line, in both notices', () => {
+    const plain = new Error(`line one\n${sentinelInMessage('notice')}`)
+    const conflict = errTmuxSessionConflict('kill', 'not-this-launch', fakeToken(BOT_TOKEN_PREFIX, 'notice'))
+    const lines = [
+      teardownKillNotSucceededNoticeText('cscb_sample', killOutcomeOf({ thrown: plain }) as KillFailure, 1),
+      teardownKillRefusalNoticeText('cscb_sample', { at: KILL_REFUSAL_AT_KILL, errorClass: AD_ERROR_CLASS_CONFLICT, error: conflict }),
+    ]
+    for (const line of lines) expect(line).not.toMatch(/[\r\n]/)
+    assertNoLeak({ lines })
   })
 })
 

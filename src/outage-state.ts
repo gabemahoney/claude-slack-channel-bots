@@ -7,7 +7,12 @@
  * the injected `notify`
  * hook, which production wires to the per-persona notifier
  * (`src/persona-notifier.ts`): the notice goes to that persona's destination
- * and the notifier adds the persona reference (b.av2 SR-7.2). The module is
+ * and the notifier adds the persona reference (b.av2 SR-7.2). Each notice
+ * carries its phase and the classes it concerns (`OutageNoticeOptions`): the
+ * onset its one class, the all-clear every class it lists, so the notifier
+ * routes the all-clear of an outage whose onset a persona teardown's window
+ * routed as that onset was, whenever it comes (b.jg5 SRJ-1002, SRJ-1003).
+ * The module is
  * intentionally free of Date / timestamp logic — operators scroll back to the
  * onset message for timing context.
  *
@@ -169,8 +174,10 @@ export interface OutageStateDeps {
    * Fire-and-forget notice for the persona with this key: synchronous, and
    * errors MUST be handled internally by the caller. Production wires the
    * per-persona notifier, which adds the persona reference to `text`.
+   * `options` says whether it is an onset or an all-clear, and of which
+   * classes (b.jg5 SRJ-1002, SRJ-1003).
    */
-  notify(key: string, text: string): void
+  notify(key: string, text: string, options?: OutageNoticeOptions): void
   /** Return the singleton AD Client. Same semantics as getClient() in agent-director-client.ts. */
   getClient(): Client
   /**
@@ -211,6 +218,24 @@ export interface OutageStateDeps {
    * arming is unchanged.
    */
   unclassifiedSink?: UnclassifiedErrorSink
+}
+
+/**
+ * What an outage notice is (b.jg5 SRJ-1002, SRJ-1003): an `onset` of its one
+ * class, or an `all-clear` of every class it lists. The persona notifier's
+ * `PersonaNoticeOptions.outage` takes it as given. An all-clear also carries
+ * `allClearOf`, which renders the all-clear of a subset of its classes (the
+ * same template over the same bad-stretch snapshot), so the notifier can
+ * split it: the classes whose onset a persona teardown's window routed are
+ * written, and the rest posted.
+ */
+export interface OutageNoticeOptions {
+  readonly outage: {
+    readonly phase: 'onset' | 'all-clear'
+    readonly classes: readonly OutageClass[]
+    /** All-clear only: the all-clear text of `classes`, a subset of the notice's (others ignored). Pure; never throws. */
+    readonly allClearOf?: (classes: readonly string[]) => string
+  }
 }
 
 /** Options of {@link reportAgentDirectorError}. */
@@ -471,14 +496,14 @@ export function raiseAdConfigMalformed(key: string, err: unknown): void {
  * logged once (`describeThrownValue`) and otherwise ignored, so the notice
  * counts as posted (the precedent of `src/persona-episodes.ts`). Never throws.
  */
-function notifyIsolated(key: string, text: string): void {
+function notifyIsolated(key: string, text: string, options?: OutageNoticeOptions): void {
   const logFailure = (failure: unknown): void => {
     console.error(
       `[slack] outage-state: onset notice for persona=${key} failed: ${describeThrownValue(failure)} — the flag stays raised; the notice counts as posted`,
     )
   }
   try {
-    const pending: unknown = deps?.notify(key, text)
+    const pending: unknown = deps?.notify(key, text, options)
     if (pending instanceof Promise) pending.catch(logFailure)
   } catch (failure) {
     logFailure(failure)
@@ -511,7 +536,7 @@ function raiseFlag(
   detail: string | undefined,
   onset: () => string,
   onRaised?: () => void,
-  post?: (key: string, text: string) => void,
+  post?: (key: string, text: string, options?: OutageNoticeOptions) => void,
 ): void {
   if (!deps) return
   const entry = entryFor(key)
@@ -520,8 +545,9 @@ function raiseFlag(
   entry.flags.add(cls)
   entry.badStretchClasses.set(cls, { detail })
   onRaised?.()
-  if (post !== undefined) post(key, onset())
-  else deps.notify(key, onset())
+  const options: OutageNoticeOptions = { outage: { phase: 'onset', classes: [cls] } }
+  if (post !== undefined) post(key, onset(), options)
+  else deps.notify(key, onset(), options)
 }
 
 /**
@@ -557,7 +583,9 @@ export function clearOutageFlag(key: string, cls: OutageClass, reading?: string)
     // Snapshot history and reset BEFORE the notify call.
     const snapshot = new Map(entry.badStretchClasses)
     entry.badStretchClasses = new Map()
-    deps.notify(key, ALL_CLEAR_TEMPLATE(snapshot))
+    const allClearOf = (classes: readonly string[]): string =>
+      ALL_CLEAR_TEMPLATE(new Map([...snapshot].filter(([cls]) => classes.includes(cls))))
+    deps.notify(key, ALL_CLEAR_TEMPLATE(snapshot), { outage: { phase: 'all-clear', classes: [...snapshot.keys()], allClearOf } })
   }
   flagCleared(key, cls, reading)
 }

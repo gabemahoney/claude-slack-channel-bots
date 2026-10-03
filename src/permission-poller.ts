@@ -63,6 +63,15 @@
  * persona: it is logged and trailed per attempt and tried again next tick.
  * Closing updates and clicks are never gated (an update is not a post).
  *
+ * A persona teardown (b.jg5 SRJ-1003): while the persona's teardown window is
+ * open (the injected `teardownNotices`), its stuck-prompt warning is not
+ * posted: it is handed to the notifier's `notify`, whose window writes it as
+ * one log line and one `persona-teardown-notice` entry, and the warning's
+ * latch is set, so it is written once and never dropped. Outside a window it
+ * routes as above:
+ *
+ *   [slack] permission-poller: stuck-prompt warning for "<name>" (key=<key>) (<id>) raised during its persona teardown — handed to the notifier, which writes it to the server log and startup-errors.log, not posted (b.jg5 SRJ-1003)
+ *
  * A persona that is not up (b.av2 SR-6.4, the injected `isPersonaUp`) keeps
  * its instance, but the poller leaves it alone: its rows get no `get`, no
  * prompt and no wedge-detector tick, and its tracked prompts and wedge state
@@ -119,7 +128,7 @@ import {
   type PersonaDestinationHold,
 } from './persona-destination-hold.ts'
 import { PERSONA_LABEL_KEY, personaInstanceId, renderPersonaRef } from './persona-identity.ts'
-import { formatPersonaNotice } from './persona-notifier.ts'
+import { formatPersonaNotice, notifySafely, type PersonaNotifier } from './persona-notifier.ts'
 import { emitTrail as defaultEmitTrail } from './permission-trail.ts'
 import type {
   ClosureVerdictTag,
@@ -233,6 +242,15 @@ export interface PollerDeps {
    * set a timer (it holds no notices).
    */
   destinationHold?: PersonaDestinationHold
+  /**
+   * The persona notifier (b.jg5 SRJ-1003): while the key's persona teardown
+   * window is open (`teardownWindowState` answers `open`), the stuck-prompt
+   * warning is handed to its `notify`, whose window writes it as a teardown
+   * notice (one log line and one `persona-teardown-notice` entry), never
+   * posted, held or dropped. Absent, or outside a window: the warning goes
+   * through the destination hold as before.
+   */
+  teardownNotices?: Pick<PersonaNotifier, 'notify' | 'teardownWindowState'>
   /**
    * The applied persona with this key, or undefined. Read on every tick, so a
    * swapped persona set is seen at once.
@@ -577,16 +595,48 @@ function emitRowDecision(
  * recovery is read-pane + kill/respawn.
  */
 function buildWedgeWarningText(persona: Pick<Persona, 'name' | 'key'>, claudeInstanceId: string): string {
-  return formatPersonaNotice(
-    persona,
+  return formatPersonaNotice(persona, wedgeWarningBody(claudeInstanceId))
+}
+
+/** The wedge warning's body, with no persona reference (the notifier adds its own). */
+function wedgeWarningBody(claudeInstanceId: string): string {
+  return (
     '⚠️ This persona appears blocked on a native Claude Code permission prompt that ' +
-      "never reached Slack — it will not respond until it's cleared. To recover: run " +
-      '`agent-director read-pane --claude-instance-id ' +
-      claudeInstanceId +
-      '` to see the native prompt, then kill and respawn the session ' +
-      '(`agent-director kill` / tmux-kill + respawn). Do NOT use send-keys — it is ' +
-      'rejected in this state.',
+    "never reached Slack — it will not respond until it's cleared. To recover: run " +
+    '`agent-director read-pane --claude-instance-id ' +
+    claudeInstanceId +
+    '` to see the native prompt, then kill and respawn the session ' +
+    '(`agent-director kill` / tmux-kill + respawn). Do NOT use send-keys — it is ' +
+    'rejected in this state.'
   )
+}
+
+/**
+ * b.jg5 SRJ-1003 — while the persona's teardown window is open, hand the
+ * wedge warning to the notifier, whose window writes it as a teardown notice
+ * (never posted, held or dropped), and answer true; answer false (nothing
+ * done) when no notifier is given or no window is open. A failing notifier
+ * is logged. Never throws.
+ */
+function writeWedgeWarningInTeardown(deps: PollerDeps, persona: Persona, claudeInstanceId: string): boolean {
+  const notices = deps.teardownNotices
+  if (notices === undefined) return false
+  const ref = renderPersonaRef(persona.name, persona.key)
+  try {
+    if (notices.teardownWindowState(persona.key) !== 'open') return false
+  } catch (err) {
+    logViaDeps(deps, `[slack] permission-poller: teardown window read for ${ref} failed: ${describeThrownValue(err)} — read as not open`)
+    return false
+  }
+  logViaDeps(
+    deps,
+    `[slack] permission-poller: stuck-prompt warning for ${ref} (${claudeInstanceId}) raised during its persona teardown — ` +
+      'handed to the notifier, which writes it to the server log and startup-errors.log, not posted (b.jg5 SRJ-1003)',
+  )
+  notifySafely(notices.notify, persona.key, wedgeWarningBody(claudeInstanceId), undefined, (err) =>
+    logViaDeps(deps, `[slack] permission-poller: stuck-prompt warning for ${ref} (${claudeInstanceId}) failed at the notifier: ${describeThrownValue(err)}`),
+  )
+  return true
 }
 
 /**
@@ -694,6 +744,12 @@ async function observeWedgeCandidate(
     state.lastWarnAttemptTicks !== 0 &&
     state.emptyTicks - state.lastWarnAttemptTicks < retryEvery
   ) {
+    return
+  }
+  // b.jg5 SRJ-1003: inside the persona's teardown window the warning is a
+  // teardown notice, written once and latched as delivered.
+  if (writeWedgeWarningInTeardown(deps, persona, claudeInstanceId)) {
+    state.warningFired = true
     return
   }
   const text = buildWedgeWarningText(persona, claudeInstanceId)

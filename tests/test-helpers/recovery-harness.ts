@@ -690,7 +690,13 @@
  * (context `recovery`; `killFailurePostedLine` takes another):
  * `killFailureEndedLine`, `killFailurePostedLine`,
  * `killFailureHeldLine`, `killFailureLoggedLine`, `killFailureNotRaisedLine`
- * and `killFailureStoppedSurvivorLine`.
+ * (a stopped retry's one line, b.jg5 SRJ-702, naming the stop's cause it is
+ * given: `liveRowStopCauseText` for the live-row sequence's own stop,
+ * `KILL_FAILURE_STOP_CAUSE_SHUTDOWN` or `KILL_FAILURE_STOP_CAUSE_NOT_UP` for
+ * what the keep-going query told, `PERSONA_KILL_STOP_CAUSE_GENERIC` when it
+ * could not tell, or `KILL_FAILURE_STOP_CAUSE_RECHECK`), `killFailureStoppedEntry` (its
+ * `persona-kill-failed` entry, no alert text) and
+ * `killFailureStoppedEntryLine`.
  *
  * Pending-only mode is armed directly (`controller.armPendingOnly`) until
  * covered `pending` rows exist. Later work extends this harness in place.
@@ -747,7 +753,7 @@ import {
   type ConflictNoticeEpisodes,
 } from '../../src/conflict-latch.ts'
 import { LIVENESS_DEAD_ROW_ENDED, LIVENESS_DEAD_ROW_MISSING, LIVENESS_LIVE } from '../../src/liveness-reading.ts'
-import { classifyAdError, describeAdErrorClassification, killFailedDescriptionOf } from '../../src/ad-error-class.ts'
+import { AD_ERROR_CLASS_UNAVAILABLE, classifyAdError, describeAdErrorClassification, killFailedDescriptionOf } from '../../src/ad-error-class.ts'
 import {
   KILL_FAILURE_CLOSING_DESTINATION,
   KILL_FAILURE_CLOSING_LOG_ONLY,
@@ -3292,26 +3298,72 @@ export function killFailureLoggedLine(key: string, version: KillFailureAlertVers
 }
 
 /**
- * The line of an ordinary decision whose tries the keep-going check stopped:
- * not raised, with the decision's descriptions (`quoted`, as
- * `ordinaryAlertContent` takes them) redacted.
+ * The stop's cause a stopped retry's line names when the server's
+ * keep-going query, read as the alert is raised, says the server is shutting
+ * down (`raisePersonaKillFailureAlert`, b.jg5 SRJ-702). Its literal pin is in
+ * tests/session-manager.test.ts.
  */
-export function killFailureNotRaisedLine(key: string, quoted: { last?: Error; earlierSurvivor?: Error } = {}): string {
+export const KILL_FAILURE_STOP_CAUSE_SHUTDOWN = 'its keep-going check answered false: the server is shutting down'
+
+/** The same, when the query says the persona is torn down or not up (b.jg5 SRJ-702). */
+export const KILL_FAILURE_STOP_CAUSE_NOT_UP = 'its keep-going check answered false: the persona is torn down or not up'
+
+/** The stop's cause when the last outcome's version re-check decided that the server stops (b.jg5 SRJ-702, SRJ-204). */
+export const KILL_FAILURE_STOP_CAUSE_RECHECK = "the last outcome's version re-check stops the server"
+
+/**
+ * What a stopped retry's line says after `persona=<key> kill-failure `, with
+ * no context (b.jg5 SRJ-702): not raised, the stop's cause, the last
+ * outcome's class (`AD_ERROR_CLASS_UNAVAILABLE` for a standing
+ * `ErrTmuxKillFailed` by default) and the decision's descriptions
+ * (`quoted`, as `ordinaryAlertContent` takes them) redacted.
+ */
+function killFailureStoppedText(
+  quoted: { last?: Error; earlierSurvivor?: Error },
+  lastOutcomeClass: string,
+  cause: string,
+): string {
   const decision: KillRetryAlert = {
     kind: KILL_RETRY_ALERT_ORDINARY,
     ...(quoted.last === undefined ? {} : { lastKillFailedDescription: killFailedDescription(quoted.last) }),
     ...(quoted.earlierSurvivor === undefined ? {} : { earlierSurvivorDescription: killFailedDescription(quoted.earlierSurvivor) }),
   }
-  return `${killFailureLinePrefix(key)}${KILL_FAILURE_VERSION_ORDINARY} alert not raised — its tries were stopped (the persona is not up or is torn down, or the server is shutting down), so nothing retries this kill; ${describeKillFailureDescriptions(decision)} (${KILL_FAILURE_CONTEXT_RECOVERY})`
+  return (
+    `${KILL_FAILURE_VERSION_ORDINARY} alert not raised — its tries were stopped (${cause}); its last outcome's class: ${lastOutcomeClass}, ` +
+    `so nothing retries this kill; ${describeKillFailureDescriptions(decision)}`
+  )
 }
 
 /**
- * The line of a stopped ordinary decision's `persona-kill-failed` entry (one
- * that carries an earlier survivor-naming description), after its not-raised
- * line.
+ * The one line of an ordinary decision whose tries were stopped for `cause`
+ * (b.jg5 SRJ-702): see `killFailureStoppedText`, then the context `recovery`.
  */
-export function killFailureStoppedSurvivorLine(key: string): string {
-  return killFailureLoggedLine(key, KILL_FAILURE_VERSION_ORDINARY, PERSONA_KILL_FAILED_LABEL, 'stopped-survivor')
+export function killFailureNotRaisedLine(
+  key: string,
+  cause: string,
+  quoted: { last?: Error; earlierSurvivor?: Error } = {},
+  lastOutcomeClass: string = AD_ERROR_CLASS_UNAVAILABLE,
+): string {
+  return `${killFailureLinePrefix(key)}${killFailureStoppedText(quoted, lastOutcomeClass, cause)} (${KILL_FAILURE_CONTEXT_RECOVERY})`
+}
+
+/**
+ * The `persona-kill-failed` entry of a stopped retry for persona `key` no
+ * longer in the applied configuration (b.jg5 SRJ-702, SRJ-1013): the stop's
+ * line content with the context `recovery`, and no alert text.
+ */
+export function killFailureStoppedEntry(
+  key: string,
+  cause: string,
+  quoted: { last?: Error; earlierSurvivor?: Error } = {},
+  lastOutcomeClass: string = AD_ERROR_CLASS_UNAVAILABLE,
+): string {
+  return killFailureAlertEntryText(`persona=${key}`, KILL_FAILURE_CONTEXT_RECOVERY, `the kill-failure ${killFailureStoppedText(quoted, lastOutcomeClass, cause)}`)
+}
+
+/** The line of a stopped retry's `persona-kill-failed` entry, after its not-raised line (b.jg5 SRJ-702). */
+export function killFailureStoppedEntryLine(key: string): string {
+  return `${killFailureLinePrefix(key)}stopped retry's log line (no alert text) written to the server log and startup-errors.log (${PERSONA_KILL_FAILED_LABEL}) — stopped`
 }
 
 /** The outage class a CONFIG answer raises (b.jg5 SRJ-316). */

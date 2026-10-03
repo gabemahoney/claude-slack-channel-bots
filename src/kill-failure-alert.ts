@@ -52,7 +52,14 @@
  *      ordinary version once per kill-failure episode, the survivor version
  *      once per bounded retry.
  * The survivor version's entry, on every route that writes one, is of its
- * own class, `persona-kill-survivor` (SRJ-1013).
+ * own class, `persona-kill-survivor` (SRJ-1013). The persona teardown's
+ * class, `persona-teardown-notice` (`PERSONA_TEARDOWN_NOTICE_LABEL`), is the
+ * one constant the persona notifier (`src/persona-notifier.ts`), which owns
+ * the teardown route for every notice raised during a persona teardown
+ * (SRJ-1003), imports and re-exports. While a persona's teardown window is
+ * open, the kill-failure alerts take the persona-teardown route for any
+ * alert raised for its key, whatever its context but a start-sweep or CLI
+ * teardown kill (`src/persona-episodes.ts`).
  *
  * Who raises which route: the restart path's kill and the live-row
  * sequence's kills (`src/server.ts`, `src/session-manager.ts`, through the
@@ -135,14 +142,21 @@ export const PERSONA_KILL_FAILED_LABEL = 'persona-kill-failed'
 export const PERSONA_KILL_SURVIVOR_LABEL = 'persona-kill-survivor'
 
 /**
+ * The `startup-errors.log` class of a notice raised during a persona teardown
+ * (SRJ-1003, SRJ-1013): the ordinary version's on the persona-teardown route,
+ * and every other notice the persona notifier's teardown window writes. The
+ * one constant: the persona notifier (`src/persona-notifier.ts`), which owns
+ * the teardown route for every notice, imports and re-exports it, since this
+ * module may load no notifier.
+ */
+export const PERSONA_TEARDOWN_NOTICE_LABEL = 'persona-teardown-notice'
+
+/**
  * The start sweep's class (SRJ-714, SRJ-1013): the ordinary version rides in
  * its entry. The start sweep's own entries (`reconcileOrphans`,
  * `src/session-manager.ts`) are of this class too.
  */
 export const ORPHAN_CLEANUP_LABEL = 'orphan-cleanup'
-
-/** The persona teardown's class (SRJ-1003, SRJ-1013). */
-const PERSONA_TEARDOWN_NOTICE_LABEL = 'persona-teardown-notice'
 
 // ---------------------------------------------------------------------------
 // Closing sentences (SRJ-1007)
