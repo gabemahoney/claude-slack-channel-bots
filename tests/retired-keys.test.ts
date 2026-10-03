@@ -30,6 +30,12 @@
  * - Held changes (SRJ-714, SRJ-806, SRJ-807; hatch A3): the keys of a failed
  *   `absent-at-start` batch and a failed mark stay in memory, the next write
  *   that succeeds carries them, and `isHeldInMemory` tells which keys are held.
+ * - The record generation (SRJ-806): 0 for a key no batch named, a loaded key
+ *   included; one more for each batch naming the key, whatever it wrote (a new
+ *   key, a cleared mark, an unmarked re-record that writes nothing, a held
+ *   key, a failed write), a key named twice in a batch counted once, a batch
+ *   that throws a `RangeError` counted not at all; mark, clear, snapshot and
+ *   restore never lower it; it is never written, so a store loaded anew reads 0.
  * - When an entry is cleared (SRJ-807, SRJ-114, SRJ-115, SRJ-116, SRJ-513;
  *   hatch A3), over src/row-read-rules.ts's decision with the mark answered
  *   by a real store: a decision table over a `status` result, a `get` row and
@@ -47,6 +53,12 @@
  *   durably, with one line naming the read; no other read, record or mark
  *   removes an entry; a clear whose write fails keeps the entry in memory and
  *   in the file, and the next qualifying read clears it.
+ * - End to end over the session manager and the stub (SRJ-805, SRJ-806,
+ *   SRJ-807), on `makeRecoveryHarness`: a recorded key with no row is launched
+ *   by its reuse (an ordinary fresh spawn, no `resume`), the reuse's success
+ *   sets the mark, which a store loaded anew over the same directory reads (a
+ *   restart), a `pending` read of the new life clears nothing, and its first
+ *   live read removes the entry durably.
  *
  * Isolation: every file sits under a per-test `mkdtempSync` root removed in
  * `afterEach`; the store's clock is a `createFakeClock`; the record is
@@ -108,6 +120,7 @@ import {
   type RetiredKeyEntry,
   type RetiredKeyRecord,
   type RetiredKeyStore,
+  type RetiredKeysRecordResult,
   type RetiredKeysWriter,
 } from '../src/retired-keys.ts'
 import { recordStartupError } from '../src/startup-errors.ts'
@@ -143,6 +156,18 @@ import {
   writeRetiredKeysRecord,
   type RetiredKeySeed,
 } from './test-helpers/retired-keys.ts'
+import { readPersonaRowState, SPAWN_ACTION_FRESH_RETIRED } from '../src/session-manager.ts'
+import { errSpawnNotFound } from './test-helpers/agent-director-stub.ts'
+import {
+  makeRecoveryHarness,
+  retiredEntryClearedLine,
+  retiredKeyLinesIn,
+  reuseSpawnOf,
+  type RecoveryHarness,
+} from './test-helpers/recovery-harness.ts'
+
+/** The retry timer's row read as the store's clear line names it (`readPersonaRowState`'s site). */
+const RETRY_ROW_READ_SITE = { site: 'unavailable-retry', what: 'retry row read' } as const
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -955,6 +980,105 @@ describe('changes held in memory after a failed write (b.jg5 SRJ-714, SRJ-803, S
 })
 
 // ---------------------------------------------------------------------------
+// The record generation (SRJ-806): an in-memory count of the batches that
+// named a key, so a reader holding a reading across a wait sees a re-record
+// that wrote nothing
+// ---------------------------------------------------------------------------
+
+describe('the record generation (b.jg5 SRJ-806)', () => {
+  test('a key no batch named reads 0, a key loaded from the file included', () => {
+    writeRetiredKeysRecord(dir, SEED)
+    const rig = openStore()
+    expect(['alpha', 'beta', 'gamma'].map((key) => rig.store.recordGeneration(key))).toEqual([0, 0, 0])
+  })
+
+  test.each<[string, (rig: Rig) => void, string, RetiredKeysRecordResult['outcome']]>([
+    ['a new key, written', () => {}, 'gamma', RETIRED_KEYS_WRITTEN],
+    ['a marked key, its mark cleared and written', () => {}, 'alpha', RETIRED_KEYS_WRITTEN],
+    ['an unmarked key, unchanged with no write', () => {}, 'beta', RETIRED_KEYS_UNCHANGED],
+    [
+      'a key held only in memory, now written',
+      (rig) => {
+        rig.writeFails = errnoError('EIO')
+        rig.store.record([{ key: 'held', cause: RETIRED_KEY_CAUSE_ABSENT_AT_START }])
+        rig.writeFails = undefined
+      },
+      'held',
+      RETIRED_KEYS_WRITTEN,
+    ],
+    [
+      'a new key whose write fails, so it is not recorded',
+      (rig) => {
+        rig.writeFails = errnoError('EIO')
+      },
+      'gamma',
+      RETIRED_KEYS_WRITE_FAILED,
+    ],
+    [
+      'a key held only in memory whose write fails again',
+      (rig) => {
+        rig.writeFails = errnoError('EIO')
+        rig.store.record([{ key: 'held', cause: RETIRED_KEY_CAUSE_ABSENT_AT_START }])
+      },
+      'held',
+      RETIRED_KEYS_WRITE_FAILED,
+    ],
+  ])('a batch naming %s increases its generation by exactly one, whatever it wrote', (_label, setup, key, outcome) => {
+    writeRetiredKeysRecord(dir, SEED)
+    const rig = openStore()
+    setup(rig)
+    const before = rig.store.recordGeneration(key)
+    const writes = rig.writes.length
+
+    expect(rig.store.record([{ key, cause: RETIRED_KEY_CAUSE_REMOVED }]).outcome).toBe(outcome)
+
+    expect(rig.store.recordGeneration(key)).toBe(before + 1)
+    expect(rig.writes.length - writes).toBe(outcome === RETIRED_KEYS_UNCHANGED ? 0 : 1)
+  })
+
+  test('a key named twice in one batch counts once, beside another key of the batch; a batch that throws a RangeError counts nothing', () => {
+    const rig = openStore()
+
+    rig.store.record([
+      { key: 'gamma', cause: RETIRED_KEY_CAUSE_REMOVED },
+      { key: 'gamma', cause: RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY },
+      { key: 'delta', cause: RETIRED_KEY_CAUSE_REMOVED },
+    ])
+    expect([rig.store.recordGeneration('gamma'), rig.store.recordGeneration('delta')]).toEqual([1, 1])
+
+    expect(() => rig.store.record([{ key: 'gamma', cause: RETIRED_KEY_CAUSE_REMOVED }, { key: '', cause: RETIRED_KEY_CAUSE_REMOVED }])).toThrow(RangeError)
+    expect(() => rig.store.record([{ key: 'epsilon', cause: 'retired' } as never])).toThrow(RangeError)
+    expect([rig.store.recordGeneration('gamma'), rig.store.recordGeneration('epsilon')]).toEqual([1, 0])
+  })
+
+  test('mark, clear, snapshot and a restore that removes the key leave it as it is: it only increases', () => {
+    const rig = openStore()
+    const { snapshot } = rig.store.record([{ key: 'gamma', cause: RETIRED_KEY_CAUSE_REMOVED }])
+    expect(rig.store.recordGeneration('gamma')).toBe(1)
+
+    expect(rig.store.restore(snapshot)).toBe(RETIRED_KEYS_REMOVED)
+    expect([rig.store.isRecorded('gamma'), rig.store.recordGeneration('gamma')]).toEqual([false, 1])
+
+    rig.store.record([{ key: 'gamma', cause: RETIRED_KEY_CAUSE_REMOVED }])
+    rig.store.mark('gamma')
+    rig.store.snapshot()
+    expect(rig.store.recordGeneration('gamma')).toBe(2)
+    expect(rig.store.clear('gamma')).toBe(RETIRED_KEYS_WRITTEN)
+    expect(rig.store.recordGeneration('gamma')).toBe(2)
+  })
+
+  test('it is never written: the file holds the record\'s bytes only, and a store loaded anew reads every key at 0', () => {
+    const rig = openStore()
+    rig.store.record([{ key: 'gamma', cause: RETIRED_KEY_CAUSE_REMOVED }])
+    rig.store.record([{ key: 'gamma', cause: RETIRED_KEY_CAUSE_REMOVED }])
+    expect(rig.store.recordGeneration('gamma')).toBe(2)
+
+    expect(fileBytes()).toEqual(serializeRetiredKeys(rig.store.snapshot().entries))
+    expect(openStore().store.recordGeneration('gamma')).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // When an entry is cleared (SRJ-807; the clear rule of SRJ-114, SRJ-115 and
 // SRJ-116; SRJ-513's latch beside it)
 // ---------------------------------------------------------------------------
@@ -1187,5 +1311,67 @@ describe('the clear end to end over the store: only a qualifying read removes an
     rig.writeFails = undefined
     expect(readAndAct(rig, 'alpha', ownRow('get', 'alpha', { state: 'check_permission' })).cleared).toBe(RETIRED_KEYS_WRITTEN)
     expect(freshRecord()).toEqual(seedWithout('alpha'))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// End to end over the session manager and the stub (b.jg5 SRJ-806, SRJ-807,
+// SRJ-805), on `makeRecoveryHarness`, whose one store is installed as
+// `main()` installs it. A recorded key whose row `expire` already removed is
+// launched by its reuse, an ordinary fresh spawn; the reuse that succeeds sets
+// the mark, which a store loaded anew over the same directory reads (a server
+// restart); the new life's first read live other than `pending` removes the
+// entry, durably, through the shared own-row read's clear.
+// ---------------------------------------------------------------------------
+
+describe('a recorded key\'s reuse sets its mark, which survives a restart, and its new life\'s first live read clears the entry, end to end (b.jg5 SRJ-806, SRJ-807, SRJ-805)', () => {
+  let harness: RecoveryHarness | undefined
+
+  afterEach(() => {
+    const h = harness
+    harness = undefined
+    if (h === undefined) return
+    try {
+      assertNoLeak(h.captured())
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  /** The store the next server start loads over `stateDir`. */
+  function restartedStore(stateDir: string): RetiredKeyStore {
+    const loaded = loadRetiredKeyStore(stateDir, { log: () => {} })
+    if (loaded.kind !== 'loaded') throw new Error(`the store did not load: ${loaded.message}`)
+    return loaded.store
+  }
+
+  test('P recorded with no row: one spawn carrying the reuse flag, no get or resume, fresh-retired; the mark read by a store loaded anew; a pending read of the new life clears nothing; its first waiting read removes the entry, in the file and after a restart, with the store\'s one clear line', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [p, q] = h.keys as [string, string]
+    h.retireKey(p)
+    h.retireKey(q, { mark: true })
+    h.script({ getError: errSpawnNotFound(), statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }) })
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_FRESH_RETIRED })
+
+    expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, p)])
+    expect([h.stub.calls.getCalls, h.stub.calls.resumeCalls]).toEqual([[], []])
+    // The approver's reads of the pending new life clear nothing.
+    await h.runApproverToStop(p)
+    const marked = readRetiredKeysRecord(h.stateDir)
+    expect(marked?.get(p)?.newLifeBegunAt).toMatch(RFC3339_UTC)
+    expect([restartedStore(h.stateDir).isMarked(p), restartedStore(h.stateDir).entry(p)]).toEqual([true, marked?.get(p)])
+
+    expect(await readPersonaRowState(p)).toMatchObject({ state: AGENT_DIRECTOR_PENDING_STATE })
+    expect(readRetiredKeysRecord(h.stateDir)).toEqual(marked)
+
+    h.script({ statusResult: cannedStatusResult({ state: 'waiting' }) })
+    expect(await readPersonaRowState(p)).toEqual({ state: 'waiting' })
+
+    const afterClear = new Map(marked)
+    afterClear.delete(p)
+    expect(readRetiredKeysRecord(h.stateDir)).toEqual(afterClear)
+    expect([h.retiredKeys.isRecorded(p), restartedStore(h.stateDir).isRecorded(p), restartedStore(h.stateDir).isMarked(q)]).toEqual([false, false, true])
+    expect(retiredKeyLinesIn(h.errors).at(-1)).toBe(retiredEntryClearedLine(h.retiredKeys.path, p, 'waiting', RETRY_ROW_READ_SITE))
   })
 })

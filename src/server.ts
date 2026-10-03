@@ -121,6 +121,7 @@ import {
   readPersonaRowState,
   reconcileOrphans,
   reconnectMcpWithCause,
+  retiredKeyReadingOf,
   setConfigDirUnresolvableHook,
   setConfiguredPersonaQuery,
   setConflictLatch,
@@ -131,6 +132,7 @@ import {
   setRetiredKeyStore,
   setSessionNotifier,
   spawnForPersona,
+  startLiveRowSequence,
   startupSessionManager,
   stopAllDialogApprovers,
   stopDialogApprover,
@@ -192,7 +194,13 @@ import {
   SYSTEM_PERSONA_CONNECTION_CLOCK,
   type PersonaConnectionManager,
 } from './persona-connections.ts'
-import { createLiveRowSequenceRegistry, LIVE_ROW_STOP_TEARDOWN, type LiveRowSequenceRegistry } from './live-row-sequence.ts'
+import {
+  createLiveRowSequenceRegistry,
+  LIVE_ROW_SEQUENCE_ENTRY_KILL,
+  LIVE_ROW_STOP_TEARDOWN,
+  type LiveRowSequenceRegistry,
+} from './live-row-sequence.ts'
+import { KILL_FAILURE_CONTEXT_RECOVERY } from './kill-failure-alert.ts'
 import { resolveSlackApiUrlOverride } from './persona-slack-clients.ts'
 import { createUnhandledRejectionHandler, describeThrownValue } from './persona-connection-errors.ts'
 import { createPersonaEventRouter } from './persona-event-router.ts'
@@ -227,6 +235,8 @@ import {
   hasAdErrorName,
 } from './ad-error-class.ts'
 import {
+  AGENT_DIRECTOR_DEAD_STATES,
+  AGENT_DIRECTOR_PENDING_STATE,
   LIVENESS_LIVE,
   LIVENESS_READING_DEAD,
   LIVENESS_READING_DEAD_NO_ROW,
@@ -2014,6 +2024,24 @@ export function _buildKillSessionAdapter(
  * (The lost-message row read is the liveness adapter's,
  * `_buildIsSessionAliveAdapter`, which applies the same step; not this one.)
  *
+ * b.jg5 SRJ-805 — never type into a retired key's old life. Right after the
+ * state read and the latched gate below, a row that reads live other than
+ * `pending` (`waiting`, `working`, a prompt state, or a state CSCB does not
+ * know) of a key the installed retired-key store has recorded with no "new
+ * life has begun" mark (`retiredKeyReadingOf`, the session manager's one
+ * reader of that store; a mark held in memory after a failed write counts as
+ * set) is the old life (`isRetiredOldLife`): no pane is read and nothing is
+ * typed; the live-row sequence is started through the session manager's
+ * start entry with the retired-key flag, the conversation not kept and alert
+ * context `recovery`, seeded with the state read, and the adapter answers
+ * 'transient', never counted (`replaceRetiredOldLife`). The health tick, the
+ * lost-message trigger and the retry timer's full-mode rerun all reach it
+ * through the restart path. With the mark set the live row is the new life
+ * and is reconnected as below; a `pending` row keeps the `pending` deferral;
+ * a key not recorded is unchanged. The state read itself clears a marked
+ * key's entry when the row reads `waiting`, `working`, `ask_user` or
+ * `check_permission` (b.jg5 SRJ-807).
+ *
  * b.jg5 SRJ-502 — never type into a latched persona, nor read its pane. The
  * reads above are awaited, and a launch outside the restart serializer can
  * latch the persona while they run, after the restart work's own latched
@@ -2076,6 +2104,9 @@ export function _buildReconnectSessionAdapter(
     // or notice, and nothing typed.
     const latchedNow = (): boolean => reconnectLatchedAt(key, isLatched)
     if (latchedNow()) return 'transient'
+    // b.jg5 SRJ-805: a retired key's old life is never typed into; the
+    // live-row sequence replaces it and the adapter reports 'transient'.
+    if (isRetiredOldLife(key, state)) return replaceRetiredOldLife(key, state)
     // b.f2b: the evidence for a `working` row spans consecutive attempts that
     // read the row `working`; any other reading ends it, and the run of
     // deferrals on the row with it.
@@ -2183,6 +2214,62 @@ export function _buildReconnectSessionAdapter(
 
 /** Who reads, in the own-row `status` step's lines for the reconnect adapter's state read. */
 const RECONNECT_STATUS_SITE = { site: 'reconnectSession', what: 'status check' } as const
+
+/**
+ * Whether persona `key`'s row, read `state` by the reconnect adapter's
+ * `status` read, is a retired key's old life (b.jg5 SRJ-805): the installed
+ * retired-key store has the key recorded with no "new life has begun" mark
+ * (`retiredKeyReadingOf`, the in-memory mark of a failed write counting as
+ * set), and the row reads live other than `pending`: `waiting`, `working`, a
+ * prompt state, or a state CSCB does not know. A `pending` row keeps the
+ * `pending` deferral, and an `ended` or `missing` row the adapter's own
+ * handling. With the mark set the live row is the new life, reconnected as
+ * any other; a key not recorded is unchanged. Never throws.
+ */
+function isRetiredOldLife(key: string, state: string): boolean {
+  if (state === AGENT_DIRECTOR_PENDING_STATE || AGENT_DIRECTOR_DEAD_STATES.has(state)) return false
+  const retired = retiredKeyReadingOf(key)
+  return retired.recorded && !retired.marked
+}
+
+/**
+ * The reconnect adapter's answer for a retired key's old life (b.jg5
+ * SRJ-805; `isRetiredOldLife`), read `state`: no `/mcp reconnect` is typed
+ * into it and no pane is read. The `working`-row evidence and the runs of
+ * deferrals on the row are ended (they were the old life's), one live-row
+ * sequence is started through the session manager's start entry
+ * (`startLiveRowSequence`: seeded with `state`, entry at step 1, the
+ * conversation not kept, the retired-key flag set, ending in a launch, alert
+ * context `recovery`), so its step 6 is the reuse spawn that begins the new
+ * life, and one line names the start's answer:
+ *
+ *   [slack] reconnectSession: persona=<key> is <state> and its key is retired with no new life begun — not typing /mcp reconnect into its old life; the live-row sequence replaces it (start answered <answer>); deferring (b.jg5 SRJ-805)
+ *
+ * The answer is 'transient', which restart.ts neither counts nor escalates
+ * (`RESTART_OUTCOME_RECONNECT_DEFERRED`), whatever the start answered; the
+ * running sequence then holds every other launch path for the persona
+ * (SRJ-706). Never throws.
+ */
+function replaceRetiredOldLife(key: string, state: string): 'transient' {
+  forgetWorkingRowEvidence(key)
+  endWorkingRowDeferral(key)
+  endPromptRowDeferral(key)
+  const startAnswer = startLiveRowSequence({
+    key,
+    ref: `persona=${key}`,
+    instanceId: personaInstanceId(key),
+    lastReadState: state,
+    entryStep: LIVE_ROW_SEQUENCE_ENTRY_KILL,
+    keepsConversation: false,
+    retiredKey: true,
+    launches: true,
+    alertContext: KILL_FAILURE_CONTEXT_RECOVERY,
+  })
+  console.error(
+    `[slack] reconnectSession: persona=${key} is ${state} and its key is retired with no new life begun — not typing /mcp reconnect into its old life; the live-row sequence replaces it (start answered ${startAnswer}); deferring (b.jg5 SRJ-805)`,
+  )
+  return 'transient'
+}
 
 /**
  * The reconnect adapter's answer for a state read that latched the persona

@@ -143,6 +143,12 @@
  * that latches P. What every other end without the launch arms, and every
  * step-6 reuse outcome (its triggers in order, the count and the notice by
  * class), are tests/live-row-sequence.test.ts's.
+ * A key recorded as retired (b.jg5 SRJ-805, SRJ-806; AC 51's retry-timer
+ * half) runs on the harness too: a start-pass or non-start launch refused
+ * UNAVAILABLE arms its timer, each retry relaunches it by the reuse and never
+ * resumes, the retry whose reuse succeeds sets the mark; a live old life read
+ * at a retry goes through the live-row sequence with nothing typed; a held
+ * retired key's retry makes no call.
  * Only the pin case holds the SRD's numbers; every other case derives its
  * waits from the exported base and ceiling through `doublingBackoffDelay`. No
  * retry timer is real; the only real-time waits are the spawn path's 1 ms
@@ -194,6 +200,7 @@ import {
   LIVE_ROW_ARM_ENDED,
   LIVE_ROW_OUTCOME_ABORTED,
   LIVE_ROW_OUTCOME_CONFIG_MALFORMED,
+  LIVE_ROW_LAUNCH_REASON_RETIRED_KEY,
   LIVE_ROW_LAUNCH_RESUME,
   LIVE_ROW_LAUNCH_REUSE,
   LIVE_ROW_OUTCOME_ESCALATED,
@@ -294,6 +301,8 @@ import {
   deletePersonaInstance,
   isLaunchInFlight,
   KILL_CONTEXT_TEARDOWN,
+  launchSession,
+  SPAWN_ACTION_FRESH_RETIRED,
   killPersonaInstance,
   reconcileOrphans,
   retryPersonaKill,
@@ -474,7 +483,7 @@ import { PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import { RESTART_OUTCOME_HELD } from '../src/restart.ts'
 import { isDialogApproverRunning } from '../src/session-manager.ts'
 import { _buildRestartDisconnectedPersona } from '../src/server.ts'
-import { holdThroughReuse, launchThroughSequence, scriptLiveRowElsewhere, scriptReuseInvalidFlags } from './test-helpers/recovery-harness.ts'
+import { holdThroughReuse, launchThroughSequence, retiredKeyLinesIn, scriptLiveRowElsewhere, scriptReuseInvalidFlags } from './test-helpers/recovery-harness.ts'
 import { errInvalidFlags } from './test-helpers/agent-director-stub.ts'
 
 const KEY = 'alpha'
@@ -8278,5 +8287,99 @@ describe('unavailable retry: the ErrInvalidFlags hold stops the timer, no retry 
     expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_HELD }])
     expect(h.controller.isArmed(key)).toBe(false)
     await h.runApproverToStop(key)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A retired key at the retry timer and the start pass (b.jg5 SRJ-805,
+// SRJ-806; AC 51's retry-timer half)
+//
+// P is recorded as retired, with no mark, through the harness's store
+// (`retireKey`). Each retry's relaunch is the restart path's `launchSession`,
+// whose launch for a recorded key is a reuse spawn of its own id, never a
+// `resume`; a live old life read at a retry is the reconnect adapter's, which
+// starts the live-row sequence (with the retired-key flag) and types nothing.
+// ---------------------------------------------------------------------------
+
+describe('unavailable retry: a retired key\'s retries launch by the reuse, never a resume, and its live old life goes through the sequence (SRJ-805, SRJ-806, AC 51)', () => {
+  /** P's store lines saying its mark was written. */
+  const markedLines = (h: RecoveryHarness, key: string): string[] => retiredKeyLinesIn(h.errors).filter((line) => line.includes(`persona=${key} marked: `))
+
+  test.each<[string, (h: RecoveryHarness, key: string) => Promise<unknown>, unknown]>([
+    ['the start pass (spawnForPersona, isStartup true)', (h, key) => h.launch(key), { action: 'failed', refused: true }],
+    ['a non-start launch (launchSession)', (h, key) => launchSession(key, h.config), 'refused'],
+  ])('P recorded with no mark, its row ended with a session id: %s refused UNAVAILABLE arms P\'s timer; each retry relaunches by the reuse and never resumes; the retry whose reuse succeeds launches, sets the mark and runs on in pending-only mode, whose next retry stops the timer', async (_path, launch, refused) => {
+    const h = (harness = makeRecoveryHarness({ ...RETRY_TIMER_ONLY, resumeEnabled: true }))
+    const [key] = h.keys as [string]
+    h.retireKey(key)
+    modelRow(h, 'ended')
+    h.script({ spawnError: errTmuxUnresponsive('spawn'), getResult: personaRow(h, key, { state: LIVENESS_DEAD_ROW_ENDED, claude_session_id: 'a-session-id' }) })
+
+    const answer = await launch(h, key)
+    expect(answer).toEqual(typeof refused === 'object' ? { key, ...refused } : refused)
+    expect(h.controller.view(key)?.causes).toEqual([UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE])
+
+    for (let retry = 1; retry <= 2; retry++) {
+      await retryNow(h, key)
+      expect([retry, h.stub.calls.spawnCalls.length, h.controller.view(key)?.refusals]).toEqual([retry, retry + 1, retry])
+    }
+    expect(markedLines(h, key)).toEqual([])
+
+    h.script({ spawnError: undefined })
+    await retryNow(h, key)
+
+    expect(h.stub.calls.spawnCalls).toEqual(Array.from({ length: 4 }, () => reuseSpawnOf(h, key)))
+    expect(h.stub.calls.resumeCalls).toEqual([])
+    expect(markedLines(h, key)).toHaveLength(1)
+    expect(h.controller.view(key)).toMatchObject({ mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY })
+    expect(h.lines).toContain(reArmedLine(key, 3, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, 3, { switchedTo: UNAVAILABLE_RETRY_MODE_PENDING_ONLY }))
+
+    // The new life reads waiting: the pending-only retry stops the timer
+    // (and that read of the marked key's live row clears its entry, SRJ-807).
+    await retryNow(h, key)
+    expect(retryLinesOf(h, key).at(-1)).toBe(pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_ROW_LIVE, 'waiting'))
+    expect([h.controller.isArmed(key), h.retiredEntry(key).recorded]).toEqual([false, false])
+    expect(h.stub.calls.spawnCalls).toHaveLength(4)
+    await h.runApproverToStop(key)
+  })
+
+  test('P recorded with no mark, its old life reading waiting at the retry: the retry types nothing and launches nothing itself; the sequence it starts carries the retired-key flag and ends in the reuse', async () => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [key] = h.keys as [string]
+    h.retireKey(key)
+    ownRowsLiveThenMissing(h)
+    h.script({ statusResult: cannedStatusResult({ state: 'waiting' }) })
+    const hold = holdFindMissing(h.stub.client)
+    h.controller.arm(key, UNAVAILABLE)
+
+    await retryNow(h, key)
+    await h.driveSequence(hold.entered(1))
+
+    expect([h.stub.calls.sendKeysCalls, h.stub.calls.spawnCalls, h.stub.calls.resumeCalls]).toEqual([[], [], []])
+    expect(h.sequenceRunning(key)).toBe(true)
+    hold.release(cannedFindMissing({ rows: { [personaInstanceId(key)]: 'ids' } }))
+    expect(await h.driveSequence(h.sequenceSettled(key))).toMatchObject({
+      kind: LIVE_ROW_OUTCOME_LAUNCHED,
+      launchKind: LIVE_ROW_LAUNCH_REUSE,
+      reason: LIVE_ROW_LAUNCH_REASON_RETIRED_KEY,
+      result: { key, action: SPAWN_ACTION_FRESH_RETIRED },
+    })
+    expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls]).toEqual([[reuseSpawnOf(h, key)], []])
+    await h.runApproverToStop(key)
+  })
+
+  test('a held retired P: its retry makes no agent-director call and stops with the hold\'s reason', async () => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [key] = h.keys as [string]
+    h.retireKey(key)
+    modelRow(h, UNAVAILABLE_RETRY_ROW_ABSENT)
+    await holdThroughReuse(h, key)
+    h.controller.arm(key, UNAVAILABLE)
+    const before = callCounts(h)
+
+    await retryNow(h, key)
+
+    expect(callsSince(h, before)).toEqual({})
+    expectStoppedByHold(h, key)
   })
 })

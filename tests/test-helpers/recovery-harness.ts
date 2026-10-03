@@ -316,6 +316,16 @@
  *   next `count` (1 by default) with `RECOVERY_RETIRED_KEY_WRITE_FAILURE_CODE`
  *   before they touch the file. A record the store refuses to read fails the
  *   build, with everything it installed put back.
+ *   `retireKey(key, options?)` (b.jg5 SRJ-805, SRJ-806) records a key after
+ *   the build through the installed store's own primitives, never by writing
+ *   the file behind it: one `record` batch with the key and its cause
+ *   (`removed` by default), then, with `options.mark`, one `mark`; it throws
+ *   unless each went through (written, or unchanged for a key already so), so
+ *   a case that wants a failing write calls `failRetiredKeyWrites` after it.
+ *   Its writes show in `retiredKeyWrites` like any other.
+ *   `retiredEntry(key)` reads the key's entry back through the store's
+ *   queries: `{ recorded, marked, entry }` (`isRecorded`, `isMarked`, a mark
+ *   held in memory after a failed write included, and `entry`).
  * - `tickEnd(key)`: what a health tick's healthy branch does to the
  *   condition, as `main()` binds `HealthCheckDeps.endTmuxUnresponsive`: the
  *   condition's end with reason `TMUX_UNRESPONSIVE_END_TICK` and the `live`
@@ -836,7 +846,17 @@ import {
 } from '../../src/session-manager.ts'
 import { durableWriteFileSync } from '../../src/atomic-write.ts'
 import type { OwnRowReadSite } from '../../src/session-manager.ts'
-import { readRetiredKeysAtStart, RETIRED_KEYS_LOG_PREFIX, type RetiredKeyStore, type RetiredKeysWriter } from '../../src/retired-keys.ts'
+import {
+  readRetiredKeysAtStart,
+  RETIRED_KEY_CAUSE_REMOVED,
+  RETIRED_KEYS_LOG_PREFIX,
+  RETIRED_KEYS_UNCHANGED,
+  RETIRED_KEYS_WRITTEN,
+  type RetiredKeyCause,
+  type RetiredKeyEntry,
+  type RetiredKeyStore,
+  type RetiredKeysWriter,
+} from '../../src/retired-keys.ts'
 import { createSlowRecoveryTracker, type SlowRecoveryTracker } from '../../src/slow-recovery.ts'
 import { recordStartupError } from '../../src/startup-errors.ts'
 import {
@@ -984,6 +1004,22 @@ export interface RecoveryRetiredKeyWrite {
 
 /** The errno a write refused by `failRetiredKeyWrites` throws with, before it touches the file. */
 export const RECOVERY_RETIRED_KEY_WRITE_FAILURE_CODE = 'ENOSPC'
+
+/** What `retireKey` records: the key's cause (`removed` when unset) and whether its mark is set (false when unset). */
+export interface RecoveryRetireKeyOptions {
+  readonly cause?: RetiredKeyCause
+  readonly mark?: boolean
+}
+
+/** A key's entry as `retiredEntry` reads it through the store's queries. */
+export interface RecoveryRetiredEntry {
+  /** `isRecorded`. */
+  readonly recorded: boolean
+  /** `isMarked`: a mark held in memory after a failed write included. */
+  readonly marked: boolean
+  /** `entry`: undefined when the key is not recorded. */
+  readonly entry: RetiredKeyEntry | undefined
+}
 
 /** The stub's answer knobs: every `StubClientOptions` field but the capture lists. */
 export type RecoveryStubScript = Omit<StubClientOptions, keyof StubCallLog | 'callLog'>
@@ -1195,6 +1231,14 @@ export interface RecoveryHarness {
   readonly retiredKeyWrites: readonly RecoveryRetiredKeyWrite[]
   /** Refuse the retired-key store's next `count` writes (1 when unset), each before it touches the file. */
   failRetiredKeyWrites(count?: number): void
+  /**
+   * Record `key` through the installed store's `record` and, with
+   * `options.mark`, set its mark through `mark` (b.jg5 SRJ-805, SRJ-806);
+   * throws unless each went through. See the module comment.
+   */
+  retireKey(key: string, options?: RecoveryRetireKeyOptions): void
+  /** `key`'s entry read through the store's queries; see the module comment. */
+  retiredEntry(key: string): RecoveryRetiredEntry
   /**
    * Install agent-director's version re-check on the harness clock as
    * `main()` installs it, its binary resolve answering `initial` until the
@@ -2227,6 +2271,20 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     failRetiredKeyWrites(count = 1) {
       refuseRetiredKeyWrites = count
     },
+    retireKey(key, retire = {}) {
+      // Through the store's own primitives, so the record in memory and the
+      // file agree; never a file written behind the loaded store.
+      const recorded = retiredKeys.record([{ key, cause: retire.cause ?? RETIRED_KEY_CAUSE_REMOVED }]).outcome
+      if (recorded !== RETIRED_KEYS_WRITTEN && recorded !== RETIRED_KEYS_UNCHANGED) {
+        throw new Error(`recovery harness: recording ${key} as retired answered ${recorded}`)
+      }
+      if (retire.mark !== true) return
+      const marked = retiredKeys.mark(key)
+      if (marked !== RETIRED_KEYS_WRITTEN && marked !== RETIRED_KEYS_UNCHANGED) {
+        throw new Error(`recovery harness: marking ${key} answered ${marked}`)
+      }
+    },
+    retiredEntry: (key) => ({ recorded: retiredKeys.isRecorded(key), marked: retiredKeys.isMarked(key), entry: retiredKeys.entry(key) }),
     versionRecheck(initial = { version: PHASE1_RC_VERSION }) {
       // As main() installs it: one re-check, never two (a leftover install
       // would answer the triggers instead of this one).
@@ -2618,6 +2676,28 @@ export async function expectLostMessageReports(
   const instance = { claude_instance_id: personaInstanceId(key) }
   expect(h.stub.calls.statusCalls.slice(statusBefore)).toEqual(Array.from({ length: calls['statusCalls'] ?? 0 }, () => instance))
   return outcome
+}
+
+/**
+ * Install, in the harness registry's place, a live-row sequence registry that
+ * records each start request and answers started, running nothing; answers
+ * the record, so a case reads the whole request a start was given. The
+ * harness's cleanup removes it.
+ */
+export function recordSequenceStarts(): LiveRowSequenceRequest[] {
+  const starts: LiveRowSequenceRequest[] = []
+  setLiveRowSequenceRegistry({
+    start: (request) => {
+      starts.push(request)
+      return LIVE_ROW_START_STARTED
+    },
+    stop: async () => false,
+    stopAll: async () => {},
+    close: async () => {},
+    isRunning: () => false,
+    _whenSettled: async () => undefined,
+  })
+  return starts
 }
 
 /**

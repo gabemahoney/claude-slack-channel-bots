@@ -715,9 +715,11 @@ import {
   LIVE_ROW_STOP_SHUTDOWN,
   LIVE_ROW_STOP_TEARDOWN,
   createLiveRowSequenceStop,
+  LIVE_ROW_START_STARTED,
   liveRowSequenceStartLine,
   runLiveRowSequence,
   type LiveRowSequenceLaunchKind,
+  type LiveRowSequenceRequest,
 } from '../src/live-row-sequence.ts'
 import type { TranscriptReading, TranscriptSnapshot } from '../src/session-transcript.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
@@ -1121,11 +1123,17 @@ import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_PENDING_STATE, LIVENESS_DEAD
 import { adLaunchBoundMsInEffect } from '../src/ad-settings.ts'
 import { parseLaunchStart } from '../src/pending-row.ts'
 import type { Phase1GetResult, Phase1KillResult, Phase1ResumeResult, Phase1SpawnParams, Phase1SpawnResult, Phase1StatusResult, PreTrust } from '../src/ad-phase1-types.ts'
-import { RETIRED_KEY_CAUSE_REMOVED } from '../src/retired-keys.ts'
+import { loadRetiredKeyStore, RETIRED_KEY_CAUSE_REMOVED } from '../src/retired-keys.ts'
 import { RETIRED_ENTRY_CLEARING_STATES } from '../src/row-read-rules.ts'
-import { _resetRetiredKeyStore, setRetiredKeyStore } from '../src/session-manager.ts'
+import {
+  _resetRetiredKeyStore,
+  retiredKeyReadingOf,
+  setLiveRowSequenceRegistry,
+  setRetiredKeyStore,
+  SPAWN_ACTION_FRESH_RETIRED,
+} from '../src/session-manager.ts'
 import { readRetiredKeysRecord, retiredKeysRecordOf, type RetiredKeySeed } from './test-helpers/retired-keys.ts'
-import { expectUntouched, retiredEntryClearedLine, retiredEntryClearFailedLine, retiredKeyLinesIn } from './test-helpers/recovery-harness.ts'
+import { expectUntouched, recordSequenceStarts, retiredEntryClearedLine, retiredEntryClearFailedLine, retiredKeyLinesIn } from './test-helpers/recovery-harness.ts'
 
 // ---------------------------------------------------------------------------
 // Test fixture helpers
@@ -3437,6 +3445,56 @@ describe('pre-launch reply guard (b.av2 SR-9.4, SR-6.2)', () => {
     expect(rg.readRecord(GUARD_KEY)).toBe(before)
     expect(getLaunchedWithDir(GUARD_KEY)).toBe(dirOf(after.dir))
     expect(hookedIn(configDir)).toBe(after.hooked)
+  })
+
+  // b.jg5 SRJ-805: a recorded key's first launch is a reuse spawn, and its
+  // step precedes it as it precedes the plain first spawn. Its collision (the
+  // row is live) undoes that step, as the plain first spawn's does; a later
+  // reuse that collides (the replace step's, in the one re-run of
+  // get-then-act) undoes nothing. The key is recorded in a real store over a
+  // temp state directory, installed as main() installs it (the file-level
+  // afterEach removes it); no live-row sequence registry is installed, so a
+  // live old life's sequence start answers not-installed and runs nothing.
+  test.each<readonly [string, (cfg: PersonaConfig) => Parameters<typeof makeStubClient>[0], SpawnPersonaResult, readonly GuardEvent[]]>([
+    ['no row: the one reuse succeeds', () => ({ getError: errSpawnNotFound() }), { key: GUARD_KEY, action: SPAWN_ACTION_FRESH_RETIRED }, SPAWN],
+    [
+      'a live waiting row (the old life): the reuse collides and the sequence is started',
+      (cfg) => ({ spawnQueue: [collision()], getResult: guardRow(cfg, { state: 'waiting' }) }),
+      { key: GUARD_KEY, action: 'sequence-waiting' },
+      COLLIDED,
+    ],
+    [
+      'the reuse colliding, the collision get reading ended: the replace step\'s reuse succeeds',
+      (cfg) => ({ spawnQueue: [collision(), spawnOk()], getResult: guardRow(cfg, { state: 'ended' }) }),
+      { key: GUARD_KEY, action: SPAWN_ACTION_FRESH_RETIRED },
+      [...COLLIDED, ...SPAWN],
+    ],
+    [
+      'the reuse colliding, the collision get reading ended: the replace step\'s reuse collides too',
+      (cfg) => ({ spawnQueue: [collision(), collision()], getResult: guardRow(cfg, { state: 'ended' }) }),
+      { key: GUARD_KEY, action: 'failed', refused: true },
+      [...COLLIDED, ...SPAWN],
+    ],
+  ])('a recorded key\'s first launch, %s: the step precedes each reuse spawn, and only the first launch\'s collision undoes it', async (_label, script, expected, expectedEvents) => {
+    const { cfg, persona, configDir } = guardConfig()
+    const loaded = loadRetiredKeyStore(fixtureSubdir('retired-state'), { log: () => {} })
+    if (loaded.kind !== 'loaded') throw new Error('the retired-key record cannot be loaded')
+    loaded.store.record([{ key: GUARD_KEY, cause: RETIRED_KEY_CAUSE_REMOVED }])
+    setRetiredKeyStore(loaded.store)
+    const events: GuardEvent[] = []
+    installRecordingReplyGuard(cfg.personas, rg.stateDir, events)
+    const calls = newLadderCalls()
+    observeGuardCalls(installStub({ ...calls, ...script(cfg) }), configDir, events, [])
+
+    let result!: Awaited<ReturnType<typeof spawnForPersona>>
+    await withCapturedErr(async () => {
+      result = await spawnForPersona(persona, cfg)
+    })
+
+    expect(result).toStrictEqual(expected)
+    expect(events).toEqual([...expectedEvents])
+    expect((calls.spawnCalls as Phase1SpawnParams[]).map((call) => call.reuse_finished)).toEqual(expectedEvents.filter((e) => e === 'spawn').map(() => true))
+    expect(calls.resumeCalls).toEqual([])
   })
 
   test('dry run: no step runs — no record, record directory, launched-with dir or settings.json — and nothing is launched', async () => {
@@ -20850,25 +20908,23 @@ describe('b.jg5 SRJ-807, SRJ-115: a retired key\'s own row read live other than 
     expectUntouched(h, b)
   })
 
-  // P's mark is set during the wait's poll (as a reuse that began P's new life
-  // would set it), so the collision get, which read P's row working while P
-  // was unmarked, cleared nothing, and the clear is the poll's.
-  test('a launch whose working-row wait\'s poll reads P\'s own row waiting once P\'s mark is set: the poll clears P\'s entry, and the wait reconnects as it does today (one spawn, one send-keys, reconnected); the collision get before it, unmarked, cleared nothing', async () => {
-    const { h, p, b } = retiredBuild(false)
+  // P is marked, so its live row is its new life (b.jg5 SRJ-805) and the
+  // ladder takes the working branch. The collision get's clear is refused
+  // (its write fails), so the entry stays and the clear is the poll's.
+  test('a launch whose working-row wait\'s poll reads P\'s own row waiting with P\'s mark set: the poll clears P\'s entry, and the wait reconnects as it does today (one spawn, one send-keys, reconnected); the collision get before it, its clear\'s write refused, left the entry', async () => {
+    const { h, p, b } = retiredBuild()
     fastPolls(h)
+    h.failRetiredKeyWrites()
     h.script({
       ...collided(h, harnessPersona(h, p), { state: 'working' }),
-      statusFn: () => {
-        h.retiredKeys.mark(p)
-        return cannedStatusResult({ state: 'waiting' })
-      },
+      statusResult: cannedStatusResult({ state: 'waiting' }),
     })
 
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'reconnected' })
 
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: 1 }))
-    expect(h.retiredKeyWrites[0]).toEqual({ path: h.retiredKeys.path, ok: true })
-    expect(retiredKeyLinesIn(h.errors)[0]).toStartWith(`[slack] retired-keys: persona=${p} marked: `)
+    expect(h.retiredKeyWrites[0]).toEqual({ path: h.retiredKeys.path, ok: false })
+    expect(retiredKeyLinesIn(h.errors)[0]).toBe(retiredEntryClearFailedLine(h.retiredKeys.path, p, 'working', COLLISION_GET_SITE))
     expectClearedOnce(h, p, b, clearedLine(h, p, 'waiting', WAIT_POLL_SITE), 1)
     expectUntouched(h, b)
   })
@@ -20929,13 +20985,16 @@ describe('b.jg5 SRJ-807: the controls — an unmarked key, a pending row, a conf
       'the installed store\'s mark query throws (taken as not marked)',
       (h, cleared) =>
         setRetiredKeyStore({
+          isRecorded: (key) => h.retiredKeys.isRecorded(key),
           isMarked: () => {
             throw new Error('mark query broken')
           },
+          mark: (key) => h.retiredKeys.mark(key),
           clear: (key, onRead) => {
             cleared.push(key)
             return h.retiredKeys.clear(key, onRead)
           },
+          recordGeneration: (key) => h.retiredKeys.recordGeneration(key),
         }),
       1,
     ],
@@ -24409,5 +24468,614 @@ describe('b.jg5 SRJ-207, SRJ-111, SRJ-113: only a reuse holds; a plain spawn\'s 
 
     expect(order).toEqual(['spawn'])
     expect([h.invalidFlagsHold.heldKeys(), h.episodeNotices, h.reuseSpawns()]).toEqual([[], [], []])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-805, SRJ-806: while a key is recorded as retired, every launch
+// path launches it by a reuse spawn of its own id and never resumes it; a
+// reuse that succeeds sets its "new life has begun" mark and answers
+// `fresh-retired` (`SPAWN_ACTION_FRESH_RETIRED`), a success as `spawned` is.
+//
+// On `makeRecoveryHarness`, whose one retired-key store is loaded over its
+// temporary state directory and installed as `main()` installs it (removed by
+// its cleanup). P is recorded through `h.retireKey` after the build, with its
+// mark only where a case sets it; B is never recorded. Each case launches P
+// through the start pass (`h.launch`) and a non-start launch
+// (`spawnForPersona`, isStartup false), or through `launchSession`. A live
+// row's sequence start is read from a recording registry installed in the
+// harness's place (`recordSequenceStarts`), so the whole request is read and
+// no sequence runs; the sequence's own reuse and mark are
+// tests/live-row-sequence.test.ts's. The mark is read in the running store,
+// in the record file (`readRetiredKeysRecord`) and in a second store loaded
+// over the same directory, as the next start loads it (`markOf`).
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at every launch path, never resumed, and its reuse that succeeds sets the mark and answers fresh-retired', () => {
+  afterEach(() => {
+    expectNoDeleteOrIncludeFinished(srj105Harness)
+    srj105AfterEach()
+  })
+
+  /** A harness over P and B with P recorded (removed), its mark set when `mark`. */
+  function retiredLaunchBuild(mark = false, options?: RecoveryHarnessOptions): { h: RecoveryHarness; p: string; b: string } {
+    const built = srj105Build(options)
+    built.h.retireKey(built.p, { mark })
+    return built
+  }
+
+  /** The sequence request a retired key's old life read `state` starts: the retired-key flag, the conversation not kept, context `recovery`. */
+  function retiredSequenceRequest(h: RecoveryHarness, key: string, state: string): LiveRowSequenceRequest {
+    return { ...h.sequenceRequest(key, { lastReadState: state, retiredKey: true }), ref: renderPersonaRef(harnessPersona(h, key).name, key) }
+  }
+
+  /** Whether `key`'s mark is set in the running store, in the record file and in a store loaded anew over the same directory. */
+  function markOf(h: RecoveryHarness, key: string): [boolean, boolean, boolean] {
+    const reloaded = loadRetiredKeyStore(h.stateDir, { log: () => {} })
+    if (reloaded.kind !== 'loaded') throw new Error('the retired-key record cannot be loaded again')
+    const fileMark = readRetiredKeysRecord(h.stateDir)?.get(key)?.newLifeBegunAt ?? null
+    return [h.retiredKeys.isMarked(key), fileMark !== null, reloaded.store.isMarked(key)]
+  }
+
+  /** The store's lines in the case's errors. */
+  const storeLines = (h: RecoveryHarness): string[] => retiredKeyLinesIn(h.errors)
+
+  /** The launch paths a case runs P through, each answering a launch result. */
+  const LAUNCHERS: ReadonlyArray<readonly [string, (h: RecoveryHarness, key: string) => Promise<SpawnPersonaResult>]> = [
+    ['the start pass (spawnForPersona, isStartup true)', (h, key) => h.launch(key)],
+    ['a non-start launch (spawnForPersona, isStartup false)', (h, key) => spawnForPersona(harnessPersona(h, key), h.config, false)],
+  ]
+
+  /** P's row before its first launch: none, `missing`, or `ended` with a session id (resume_enabled true), as every read finds it. */
+  const FINISHED_ROWS: ReadonlyArray<readonly [string, (h: RecoveryHarness, key: string) => RecoveryStubScript]> = [
+    ['no row (ErrSpawnNotFound)', () => ({ getError: errSpawnNotFound(), statusError: errSpawnNotFound() })],
+    ['missing', (h, key) => ({ getResult: harnessRow(h, harnessPersona(h, key), { state: LIVENESS_DEAD_ROW_MISSING }), statusResult: cannedStatusResult({ state: LIVENESS_DEAD_ROW_MISSING }) })],
+    ['ended with a session id', (h, key) => ({ getResult: harnessRow(h, harnessPersona(h, key), ENDED_WITH_SESSION), statusResult: cannedStatusResult({ state: LIVENESS_DEAD_ROW_ENDED }) })],
+  ]
+
+  test.each(LAUNCHERS.flatMap(([path, launch]) => FINISHED_ROWS.map(([row, script]) => [path, row, launch, script] as const)))(
+    '%s, P recorded with no mark, its row %s: one spawn, the reuse, and no get or resume; fresh-retired, its mark set in memory, in the file and after a restart with one write; the dialog approver starts as after any launch; no sequence',
+    async (_path, _row, launch, script) => {
+      const { h, p } = retiredLaunchBuild(false, { resumeEnabled: true })
+      const starts = recordSequenceStarts()
+      h.script(script(h, p))
+      const writes = h.retiredKeyWrites.length
+      const order = recordCallOrder(h)
+
+      expect(await launch(h, p)).toStrictEqual({ key: p, action: SPAWN_ACTION_FRESH_RETIRED })
+
+      expect(order.filter((verb) => verb !== 'status' && verb !== 'readPane' && verb !== 'sendKeys')).toEqual(['spawn'])
+      expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, p)])
+      expect([h.stub.calls.resumeCalls, h.stub.calls.getCalls, starts]).toEqual([[], [], []])
+      expect(markOf(h, p)).toEqual([true, true, true])
+      expect(h.retiredKeyWrites.slice(writes)).toEqual([{ path: h.retiredKeys.path, ok: true }])
+      expect(h.approverRunning(p)).toBe(true)
+      await h.runApproverToStop(p)
+    },
+  )
+
+  test('launchSession maps fresh-retired to a success (true) and a retired key\'s live old life to the uncounted refused answer; nothing counted', async () => {
+    const { h, p } = retiredLaunchBuild()
+    const starts = recordSequenceStarts()
+    h.script({ ...collided(h, harnessPersona(h, p), { state: 'waiting' }) })
+
+    expect(await launchSession(p, h.config)).toBe('refused')
+    expect(starts).toEqual([retiredSequenceRequest(h, p, 'waiting')])
+
+    h.script({ spawnQueue: [], getResult: undefined, getError: errSpawnNotFound() })
+    expect(await launchSession(p, h.config)).toBe(true)
+    expect(markOf(h, p)).toEqual([true, true, true])
+    expect(getFailureCount(p)).toBe(0)
+    await h.runApproverToStop(p)
+  })
+
+  // HO rev 15: a reuse of an id with no row is an ordinary fresh spawn, which
+  // the pre-spawn scan can refuse; nothing of the row was read before it, so
+  // the latch takes the one latch-time status read and records no row.
+  test.each(reuseSpawnScanRows().map((row) => [row.name, row] as const))('P recorded with no row, its reuse refused by the pre-spawn scan (%s): latched with the reuse spawn refused and no row recorded; no resume or second spawn, and no mark', async (_name, row) => {
+    const { h, p } = retiredLaunchBuild()
+    h.script({ spawnError: row.build(), statusError: errSpawnNotFound(), getError: errSpawnNotFound() })
+    const writes = h.retiredKeyWrites.length
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+
+    expectLatchedOnce(h, p, conflictLatch(p, row, REFUSED_OPERATION_REUSE_SPAWN, LATCH_ROW_STATE_NO_ROW))
+    expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls]).toEqual([[reuseSpawnOf(h, p)], []])
+    expect(markOf(h, p)).toEqual([false, false, false])
+    expect(h.retiredKeyWrites.slice(writes)).toEqual([])
+  })
+
+  /** The live states a retired key's old life can read: `pending` with a launch start, `waiting`, `working` and each prompt state. */
+  const LIVE_STATES = [AGENT_DIRECTOR_PENDING_STATE, 'waiting', 'working', ...PROMPT_ROW_STATES] as const
+
+  test.each(LAUNCHERS.flatMap(([path, launch]) => LIVE_STATES.map((state) => [path, state, launch] as const)))(
+    '%s, P recorded with no mark, its row live (%s): the one reuse collides, the collision get reads the old life, and one sequence starts with the retired-key flag, the conversation not kept and context recovery; sequence-waiting, with no second launch, resume, keystroke or pane read, and no mark',
+    async (_path, state, launch) => {
+      const { h, p } = retiredLaunchBuild()
+      const starts = recordSequenceStarts()
+      h.script(collided(h, harnessPersona(h, p), { state }))
+      const writes = h.retiredKeyWrites.length
+
+      expect(await launch(h, p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
+
+      expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, p)])
+      expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1 }))
+      expect([h.stub.calls.getCalls.length, h.stub.calls.readPaneCalls]).toEqual([1, []])
+      expect(starts).toEqual([retiredSequenceRequest(h, p, state)])
+      expect(markOf(h, p)).toEqual([false, false, false])
+      expect(h.retiredKeyWrites.slice(writes)).toEqual([])
+      expect([getFailureCount(p), h.notices]).toEqual([0, []])
+    },
+  )
+
+  /**
+   * Record `key` (no mark) as the stub's `verb` is first called: the key is
+   * retired while its launch runs, after the ladder decided on its row.
+   */
+  function retireWhenCalled(h: RecoveryHarness, key: string, verb: 'sendKeys' | 'readPane' | 'resume'): void {
+    const client = h.stub.client as unknown as Record<string, (...args: unknown[]) => unknown>
+    const call = client[verb]!.bind(client)
+    client[verb] = (...args: unknown[]) => {
+      if (!h.retiredEntry(key).recorded) h.retireKey(key)
+      return call(...args)
+    }
+  }
+
+  // A recorded key's dead-session route after a live last read reuses first
+  // (b.jg5 SRJ-805: the reuse whatever row the caller last read): the row
+  // still live makes it collide, and get-then-act, run once more, reads the
+  // old life and starts the sequence. P is recorded while its reconnect's
+  // send-keys is out, so the ladder reached the branch as for any key.
+  test.each([
+    ['waiting', undefined, 'waiting'],
+    ['working (the wait\'s poll reads waiting)', fastPolls, 'working'],
+  ] as const)('the dead-session route from %s, P recorded while its send-keys answers GONE: no resume; one colliding reuse after the plain first spawn, one more get, and one sequence start with the retired-key flag seeded with that get\'s state; sequence-waiting, no mark', async (_branch, setup, state) => {
+    const { h, p } = srj105Build()
+    setup?.(h)
+    const starts = recordSequenceStarts()
+    h.script({
+      spawnError: errInstanceIdCollision(),
+      getResult: harnessRow(h, harnessPersona(h, p), { state }),
+      statusResult: cannedStatusResult({ state: 'waiting' }),
+      sendKeysError: errTmuxSendKeys(),
+    })
+    retireWhenCalled(h, p, 'sendKeys')
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
+
+    expect(h.stub.calls.spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined, true])
+    expect(h.stub.calls.spawnCalls[1]).toEqual(reuseSpawnOf(h, p))
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 2, sendKeys: 1 }))
+    expect(h.stub.calls.getCalls).toHaveLength(2)
+    expect(starts).toEqual([retiredSequenceRequest(h, p, state)])
+    expect(h.retiredEntry(p)).toMatchObject({ recorded: true, marked: false })
+  })
+
+  // b.jg5 SRJ-607: the prompt-row recovery's re-read finding the row
+  // finished recovers it by a reuse for a recorded key, never a resume.
+  test.each([LIVENESS_DEAD_ROW_ENDED, LIVENESS_DEAD_ROW_MISSING])('the prompt-row recovery, P recorded while its read-pane answers GONE, its re-read after the sweep reading %s: one reuse after the plain first spawn, no resume; fresh-retired with the mark set', async (after) => {
+    const { h, p } = srj105Build()
+    h.script(promptRowLaunch(h, p, 'ask_user', { answer: cannedErr(errTmuxCaptureFailed(personaTmuxSessionName(p))), afterSweep: after }))
+    retireWhenCalled(h, p, 'readPane')
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_FRESH_RETIRED })
+
+    expect(h.stub.calls.spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined, true])
+    expect(h.stub.calls.spawnCalls[1]).toEqual(reuseSpawnOf(h, p))
+    expect(h.stub.calls.resumeCalls).toEqual([])
+    expect(markOf(h, p)).toEqual([true, true, true])
+    await h.runApproverToStop(p)
+  })
+
+  /** The reuse's non-success answers at P's first launch (no row), with the result's action. */
+  const NOT_LAUNCHED: ReadonlyArray<readonly [string, () => Error, SpawnPersonaResult['action']]> = [
+    ['UNAVAILABLE (ErrTmuxUnresponsive)', () => errTmuxUnresponsive('spawn'), 'failed'],
+    ['UNAVAILABLE (ErrCallTimeout)', () => unavailableAt('spawn'), 'failed'],
+    [`CONFLICT (${REUSE_SPAWN_CONFLICT_CASE_ROWS.find((row) => row.noRowWritten !== true)!.name})`, () => REUSE_SPAWN_CONFLICT_CASE_ROWS.find((row) => row.noRowWritten !== true)!.build(), 'latched'],
+    [`UNUSABLE NAME (${REUSE_SPAWN_UNUSABLE_NAME_CASE_ROWS[0]!.name})`, () => REUSE_SPAWN_UNUSABLE_NAME_CASE_ROWS[0]!.build(), 'latched'],
+    ['UNCLASSIFIED (ErrInternal)', () => errInternal(), 'failed'],
+  ]
+
+  test.each(NOT_LAUNCHED)('P recorded with no row, its reuse answering %s: that answer\'s result, the one reuse the only launch call, no resume, and no mark written or held', async (_label, make, action) => {
+    const { h, p } = retiredLaunchBuild()
+    h.script({ spawnError: make(), statusError: errSpawnNotFound(), getError: errSpawnNotFound() })
+    const writes = h.retiredKeyWrites.length
+
+    expect((await h.launch(p)).action).toBe(action)
+
+    expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls]).toEqual([[reuseSpawnOf(h, p)], []])
+    expect(markOf(h, p)).toEqual([false, false, false])
+    expect(h.retiredKeyWrites.slice(writes)).toEqual([])
+  })
+
+  // b.jg5 SRJ-207: a retired key's reuse meeting ErrInvalidFlags holds P
+  // (no re-check is installed, so it is not running, which holds too).
+  test('P recorded with no row, its reuse answering ErrInvalidFlags: held, no mark; then every launch entry answers held, with no agent-director call', async () => {
+    const { h, p } = retiredLaunchBuild()
+    h.script({ spawnError: errInvalidFlags('spawn') })
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'held' })
+    expect(h.invalidFlagsHold.isHeld(p)).toBe(true)
+    expect(markOf(h, p)).toEqual([false, false, false])
+
+    const order = recordCallOrder(h)
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'held' })
+    expect(await spawnForPersona(harnessPersona(h, p), h.config, false)).toStrictEqual({ key: p, action: 'held' })
+    expect(await launchSession(p, h.config)).toBe('skipped')
+    expect(startLiveRowSequence(h.sequenceRequest(p, { lastReadState: 'waiting' }))).toBe(LIVE_ROW_START_HELD)
+    expect(order).toEqual([])
+  })
+
+  // b.jg5 SRJ-806's failed mark write: one line from the store, the mark
+  // held in memory (read as set, so the new life is never sequenced), and
+  // written again at the key's next launch decision.
+  test('a reuse success whose mark write fails: fresh-retired with one store line; the running server reads P as marked, so its live row is reconnected, not sequenced, while every write still fails; the next launch decision writes the mark', async () => {
+    const { h, p } = retiredLaunchBuild()
+    const starts = recordSequenceStarts()
+    const path = h.retiredKeys.path
+    const writes = h.retiredKeyWrites.length
+    const lines = storeLines(h).length
+    h.failRetiredKeyWrites(3)
+    h.script({ getError: errSpawnNotFound(), statusError: errSpawnNotFound() })
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_FRESH_RETIRED })
+    expect(storeLines(h).slice(lines)).toEqual([expect.stringContaining(`cannot mark persona=${p} `)])
+    expect(markOf(h, p)).toEqual([true, false, false])
+    await h.runApproverToStop(p)
+
+    // The launch decision's write and the collision get's clear both fail; P is still read as marked.
+    h.script({ ...collided(h, harnessPersona(h, p), { state: 'waiting' }), getError: undefined, statusError: undefined })
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'reconnected' })
+    expect(starts).toEqual([])
+    expect(h.stub.calls.sendKeysCalls).toHaveLength(1)
+    expect(markOf(h, p)).toEqual([true, false, false])
+
+    h.script({ spawnQueue: [], getError: errSpawnNotFound(), statusError: errSpawnNotFound() })
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_FRESH_RETIRED })
+    expect(h.retiredKeyWrites.slice(writes)).toEqual([...Array.from({ length: 3 }, () => ({ path, ok: false })), { path, ok: true }])
+    expect(markOf(h, p)).toEqual([true, true, true])
+    expect(h.stub.calls.resumeCalls).toEqual([])
+    await h.runApproverToStop(p)
+  })
+
+  test.each(FINISHED_ROWS.filter(([row]) => row !== 'missing'))('P recorded with its mark set, its row %s: another reuse, fresh-retired, with no write and the mark as it was', async (_row, script) => {
+    const { h, p } = retiredLaunchBuild(true, { resumeEnabled: true })
+    h.script(script(h, p))
+    const writes = h.retiredKeyWrites.length
+    const before = h.retiredKeys.entry(p)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_FRESH_RETIRED })
+
+    expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls]).toEqual([[reuseSpawnOf(h, p)], []])
+    expect(h.retiredKeyWrites.slice(writes)).toEqual([])
+    expect(h.retiredKeys.entry(p)).toEqual(before)
+    expect(markOf(h, p)).toEqual([true, true, true])
+    await h.runApproverToStop(p)
+  })
+
+  // With the mark set a live row is P's new life, handled as any live row of
+  // P and never sequenced. The waiting row's clear (b.jg5 SRJ-807) is refused
+  // so P is still recorded and marked when the ladder decides; a pending row
+  // with a launch start clears nothing and takes the pending-row handling as
+  // B, not recorded, takes it on the same row.
+  test.each([
+    ['waiting (its clear\'s write refused)', 'waiting', 'reconnected', 1],
+    ['pending with a launch start', AGENT_DIRECTOR_PENDING_STATE, 'no-op', 0],
+  ] as const)('P recorded with its mark set, its row live (%s): the reuse collides and the ladder handles the row as any live row: %s, no sequence, no resume', async (_label, state, action, sendKeys) => {
+    const { h, p, b } = retiredLaunchBuild(true)
+    const starts = recordSequenceStarts()
+    if (state === 'waiting') h.failRetiredKeyWrites()
+    h.script(collided(h, harnessPersona(h, p), { state }))
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action })
+
+    expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, p)])
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys }))
+    expect(starts).toEqual([])
+    expect(h.retiredEntry(p)).toMatchObject({ recorded: true, marked: true })
+
+    h.script(collided(h, harnessPersona(h, b), { state }))
+    expect(await h.launch(b)).toStrictEqual({ key: b, action })
+  })
+
+  // b.jg5 SRJ-711: a key not recorded launches exactly as before beside a recorded one.
+  test('B, not recorded, beside a recorded P: B\'s first spawn is plain and its ended row is resumed (get, then resume), while P comes up fresh-retired; only P\'s spawn carries the reuse flag', async () => {
+    const { h, p, b } = retiredLaunchBuild()
+    h.script(collided(h, harnessPersona(h, b), ENDED_WITH_SESSION))
+
+    expect(await h.launch(b)).toStrictEqual({ key: b, action: 'resumed' })
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_FRESH_RETIRED })
+
+    expect(h.stub.calls.spawnCalls.map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([
+      [personaInstanceId(b), undefined],
+      [personaInstanceId(p), true],
+    ])
+    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: personaInstanceId(b) }])
+    expect(h.retiredEntry(b).recorded).toBe(false)
+    await h.runApproverToStop(b)
+    await h.runApproverToStop(p)
+  })
+
+  test('the start pass counts a recorded P\'s fresh-retired as a succeeded fresh spawn, beside B\'s plain spawn', async () => {
+    const { h, p, b } = retiredLaunchBuild()
+
+    const result = await startupSessionManager(h.config, { concurrency: 1 })
+
+    expect(result.perPersona).toEqual([{ key: p, action: SPAWN_ACTION_FRESH_RETIRED }, { key: b, action: 'spawned' }])
+    expect([result.succeeded, result.failed, result.freshSpawned]).toEqual([2, 0, 2])
+    await h.settle()
+    await h.runApproverToStop(p)
+    await h.runApproverToStop(b)
+  })
+
+  /**
+   * Install, in the harness store's place, a store over it whose `query`
+   * throws `err`; every other query and write is the harness store's. The
+   * harness's cleanup removes it.
+   */
+  function installThrowingQuery(h: RecoveryHarness, query: 'isRecorded' | 'isMarked' | 'mark' | 'recordGeneration', err: Error): void {
+    const store = h.retiredKeys
+    setRetiredKeyStore({
+      isRecorded: (key) => store.isRecorded(key),
+      isMarked: (key) => store.isMarked(key),
+      mark: (key) => store.mark(key),
+      clear: (key, onRead) => store.clear(key, onRead),
+      recordGeneration: (key) => store.recordGeneration(key),
+      [query]: () => {
+        throw err
+      },
+    })
+  }
+
+  /** The value the throwing queries below throw. */
+  const QUERY_THROWN = new Error('retired-key query broken')
+
+  /** The reuse's one line for a recorded key that began its new life, `mark` saying what the mark's write did. */
+  function freshRetiredLine(h: RecoveryHarness, key: string, mark: string): string {
+    const ref = renderPersonaRef(harnessPersona(h, key).name, key)
+    return `[slack] reuseSpawnForPersona: ${ref}'s key is retired and its new life has begun — answering ${SPAWN_ACTION_FRESH_RETIRED}; ${mark} (b.jg5 SRJ-806, SRJ-112)`
+  }
+
+  test.each<readonly [string, boolean, (h: RecoveryHarness) => void, string]>([
+    ['no mark, its write going through', false, () => {}, 'its mark is set in the retired-key record'],
+    ['its mark already set', true, () => {}, 'its mark was already set, so nothing is written'],
+    [
+      'no mark, its write refused',
+      false,
+      (h) => h.failRetiredKeyWrites(),
+      "writing its mark failed, so this server holds the mark in memory and writes it again at the key's next launch decision",
+    ],
+    [
+      'no mark, the store\'s mark throwing',
+      false,
+      (h) => installThrowingQuery(h, 'mark', QUERY_THROWN),
+      `setting its mark threw: ${describeThrownValue(QUERY_THROWN)}; this server reads the key as it did before`,
+    ],
+  ])('P recorded (%s), its first launch with no row: fresh-retired, with exactly one reuse line naming that its new life has begun and what the mark\'s write did; B, not recorded, launched after it, logs no such line', async (_label, mark, setup, words) => {
+    const { h, p, b } = retiredLaunchBuild(mark)
+    setup(h)
+    h.script({ getError: errSpawnNotFound(), statusError: errSpawnNotFound() })
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_FRESH_RETIRED })
+    h.script({ getError: undefined, statusError: undefined })
+    expect(await h.launch(b)).toStrictEqual({ key: b, action: 'spawned' })
+
+    expect(h.errors.filter((line) => line.includes("'s key is retired and its new life has begun"))).toEqual([freshRetiredLine(h, p, words)])
+    await h.runApproverToStop(p)
+    await h.runApproverToStop(b)
+  })
+
+  // b.jg5 SRJ-805: the start entry sets the retired-key flag for a recorded
+  // key, marked or not, whatever the starter passed, with one line only when
+  // the starter had not set it; a key not recorded is forwarded as it is.
+  test.each<readonly [string, 'p' | 'b', boolean, boolean, boolean]>([
+    ['P recorded with no mark, the request without the flag', 'p', false, false, true],
+    ['P recorded with its mark set, the request without the flag', 'p', true, false, true],
+    ['P recorded, the request already carrying the flag', 'p', false, true, false],
+    ['B, not recorded, the request without the flag', 'b', false, false, false],
+  ])('the live-row sequence\'s start entry, %s: the request is forwarded with the flag set exactly when P is recorded, with the one forced-flag line naming the request\'s ref only when the entry set it', (_label, who, mark, flagged, forced) => {
+    const { h, p, b } = retiredLaunchBuild(mark)
+    const starts = recordSequenceStarts()
+    const key = who === 'p' ? p : b
+    const ref = renderPersonaRef(harnessPersona(h, key).name, key)
+    const request: LiveRowSequenceRequest = { ...h.sequenceRequest(key, { lastReadState: 'waiting', retiredKey: flagged }), ref }
+
+    expect(startLiveRowSequence(request)).toBe(LIVE_ROW_START_STARTED)
+
+    expect(starts).toEqual([{ ...request, retiredKey: flagged || forced }])
+    const forcedLine = `${LIVE_ROW_SEQUENCE_LOG_PREFIX} ${ref}: its key is retired, so the sequence carries the retired-key flag and ends in a reuse spawn, never a resume (b.jg5 SRJ-805, SRJ-705)`
+    expect(h.errors.filter((line) => line.startsWith(`${LIVE_ROW_SEQUENCE_LOG_PREFIX} `))).toEqual(forced ? [forcedLine] : [])
+  })
+
+  // A recorded query that throws reads not recorded, as with no store; the
+  // launch then takes the path of a key that is not retired (b.jg5 SRJ-711).
+  test('the installed store\'s recorded query throwing for a recorded P: the reading is not recorded, with one line per reading; P\'s launch with no row is a plain first spawn answering spawned, with no mark written', async () => {
+    const { h, p } = retiredLaunchBuild()
+    installThrowingQuery(h, 'isRecorded', QUERY_THROWN)
+    const line = `[slack] retired-keys: the recorded query for persona=${p} failed: ${describeThrownValue(QUERY_THROWN)}; taken as not recorded (b.jg5 SRJ-805)`
+    const before = storeLines(h).length
+    const writes = h.retiredKeyWrites.length
+
+    expect(retiredKeyReadingOf(p)).toEqual({ recorded: false, marked: false })
+    expect(storeLines(h).slice(before)).toEqual([line])
+
+    h.script({ getError: errSpawnNotFound(), statusError: errSpawnNotFound() })
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
+
+    expect(h.stub.calls.spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined])
+    expect(storeLines(h).slice(before)).toEqual([line, line])
+    expect(h.retiredKeyWrites.slice(writes)).toEqual([])
+    expect(markOf(h, p)).toEqual([false, false, false])
+    await h.runApproverToStop(p)
+  })
+
+  // A mark query that throws reads not marked, so a live row is the old life:
+  // a marked P's new life is sequenced, erring toward a fresh start.
+  test('the installed store\'s mark query throwing for P recorded with its mark set: the reading is recorded and not marked, with one line; P\'s live waiting row is then read as the old life: the one reuse collides and one sequence starts with the retired-key flag; sequence-waiting, nothing typed, and P\'s entry untouched', async () => {
+    const { h, p } = retiredLaunchBuild(true)
+    const starts = recordSequenceStarts()
+    installThrowingQuery(h, 'isMarked', QUERY_THROWN)
+    const line = `[slack] retired-keys: the mark query for persona=${p} failed: ${describeThrownValue(QUERY_THROWN)}; taken as not marked, so its row is the old life (b.jg5 SRJ-805, SRJ-806)`
+    const before = storeLines(h).length
+    const writes = h.retiredKeyWrites.length
+
+    expect(retiredKeyReadingOf(p)).toEqual({ recorded: true, marked: false })
+    expect(storeLines(h).slice(before)).toEqual([line])
+
+    h.script(collided(h, harnessPersona(h, p), { state: 'waiting' }))
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
+
+    expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, p)])
+    expect([h.stub.calls.sendKeysCalls, h.stub.calls.resumeCalls]).toEqual([[], []])
+    expect(starts).toEqual([retiredSequenceRequest(h, p, 'waiting')])
+    expect(h.retiredKeyWrites.slice(writes)).toEqual([])
+    expect(h.retiredEntry(p)).toMatchObject({ recorded: true, marked: true })
+  })
+
+  // b.jg5 SRJ-112: a recorded key's first launch is a reuse, so its collision
+  // is the attempt's one reuse collision and the get-then-act it enters is the
+  // one re-run: a reuse there that collides too re-runs nothing, arms the
+  // retry timer with the reuse-collision cause and answers the uncounted
+  // refused result.
+  test.each([
+    ['succeeds', [] as Error[], { action: SPAWN_ACTION_FRESH_RETIRED }, [] as string[]],
+    ['collides again', [errInstanceIdCollision()], { action: 'failed', refused: true }, [UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION]],
+  ] as const)('P recorded with no mark, its first reuse colliding and the collision get reading ended: the replace step\'s reuse %s; exactly two reuse spawns and one get, no resume, and the first collision\'s line names the one get-then-act', async (_label, later, answer, armed) => {
+    const { h, p } = retiredLaunchBuild()
+    h.script(collided(h, harnessPersona(h, p), ENDED_WITH_SESSION, ...later))
+    const ref = renderPersonaRef(harnessPersona(h, p).name, p)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, ...answer })
+
+    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p), reuseSpawnOf(h, p)])
+    expect(h.stub.calls.spawnCalls).toHaveLength(2)
+    expect([h.stub.calls.getCalls.length, h.stub.calls.resumeCalls]).toEqual([1, []])
+    expect(h.triggers).toEqual(armed.map((kind) => ({ key: p, kind })))
+    expect([getFailureCount(p), h.notices]).toEqual([0, []])
+    expect(h.errors.filter((line) => line.includes(' collided — fetching current state'))).toEqual([
+      `[slack] spawnForPersona: the retired key's reuse spawn of ${ref} collided — fetching current state; this is the one get-then-act a reuse collision gives (b.jg5 SRJ-805, SRJ-112)`,
+    ])
+    if (answer.action === SPAWN_ACTION_FRESH_RETIRED) await h.runApproverToStop(p)
+  })
+
+  /**
+   * Record `key` again (no mark) as the stub's `spawn` is called with the
+   * reuse flag: a recording made while a reuse spawn is in flight, after its
+   * launch was decided.
+   */
+  function recordDuringReuse(h: RecoveryHarness, key: string): void {
+    const client = h.stub.client as unknown as { spawn: (params: Phase1SpawnParams) => unknown }
+    const spawn = client.spawn.bind(client)
+    client.spawn = (params) => {
+      if (params.reuse_finished === true) h.retireKey(key)
+      return spawn(params)
+    }
+  }
+
+  /** The reuse's one line for a key recorded while its call was in flight, `how` naming how that is known. */
+  function recordedInFlightLine(h: RecoveryHarness, key: string, how: string): string {
+    const ref = renderPersonaRef(harnessPersona(h, key).name, key)
+    return `[slack] reuseSpawnForPersona: ${ref}'s key was recorded as retired while this reuse spawn was in flight (${how}) — the launch was decided before that recording, so its life is the old life: no mark is set; answering spawned (b.jg5 SRJ-806, SRJ-805)`
+  }
+
+  // b.jg5 SRJ-806: the launch of a reuse is decided before its call, so a key
+  // recorded while the call is in flight (a re-record that writes nothing, a
+  // re-record that clears the mark, a first recording) began the old life,
+  // which is never marked: the reuse answers spawned with one line. A
+  // recording of another key during the call changes nothing for P.
+  test.each([
+    ['P recorded with no mark, re-recorded during its first launch\'s reuse (nothing written)', false],
+    ['P recorded with its mark set, re-recorded during its first launch\'s reuse (the mark cleared)', true],
+  ] as const)('%s: spawned, no mark in memory, the file or after a restart, and the one in-flight line naming the re-record', async (_label, mark) => {
+    const { h, p } = retiredLaunchBuild(mark)
+    h.script({ getError: errSpawnNotFound(), statusError: errSpawnNotFound() })
+    recordDuringReuse(h, p)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
+
+    expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, p)])
+    expect(markOf(h, p)).toEqual([false, false, false])
+    expect(h.errors.filter((line) => line.includes('while this reuse spawn was in flight'))).toEqual([recordedInFlightLine(h, p, 'recorded again while the reuse was in flight')])
+    expect(h.errors.filter((line) => line.includes("'s key is retired and its new life has begun"))).toEqual([])
+    await h.runApproverToStop(p)
+  })
+
+  test('P not recorded at its launch decision, its ended row in another directory replaced by a reuse spawn during which P is first recorded: spawned, no mark, and the in-flight line naming that it was not recorded when the call was made', async () => {
+    const { h, p } = srj105Build()
+    h.script(collided(h, harnessPersona(h, p), elsewhere(h, LIVENESS_DEAD_ROW_ENDED)))
+    recordDuringReuse(h, p)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
+
+    expect(h.stub.calls.spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined, true])
+    expect(h.retiredEntry(p).recorded).toBe(true)
+    expect(markOf(h, p)).toEqual([false, false, false])
+    expect(h.errors.filter((line) => line.includes('while this reuse spawn was in flight'))).toEqual([
+      recordedInFlightLine(h, p, 'it was not recorded when the call was made'),
+    ])
+    await h.runApproverToStop(p)
+  })
+
+  test('P recorded with no mark, B first recorded while P\'s reuse is in flight: P\'s record generation is unchanged, so fresh-retired with P\'s mark set and no in-flight line', async () => {
+    const { h, p, b } = retiredLaunchBuild()
+    h.script({ getError: errSpawnNotFound(), statusError: errSpawnNotFound() })
+    recordDuringReuse(h, b)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_FRESH_RETIRED })
+
+    expect(h.retiredEntry(b).recorded).toBe(true)
+    expect(markOf(h, p)).toEqual([true, true, true])
+    expect(h.errors.filter((line) => line.includes('while this reuse spawn was in flight'))).toEqual([])
+    await h.runApproverToStop(p)
+  })
+
+  test('the installed store\'s record-generation query throwing for a recorded P: its first launch\'s reuse succeeds and answers spawned with no mark, one query line and the in-flight line naming that a recording cannot be ruled out', async () => {
+    const { h, p } = retiredLaunchBuild()
+    installThrowingQuery(h, 'recordGeneration', QUERY_THROWN)
+    h.script({ getError: errSpawnNotFound(), statusError: errSpawnNotFound() })
+    const writes = h.retiredKeyWrites.length
+    const before = storeLines(h).length
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
+
+    expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, p)])
+    expect(storeLines(h).slice(before)).toEqual([
+      `[slack] retired-keys: the record-generation query for persona=${p} failed: ${describeThrownValue(QUERY_THROWN)}; a recording during the reuse spawn cannot be ruled out, so no mark is set (b.jg5 SRJ-806)`,
+    ])
+    expect(h.errors.filter((line) => line.includes('while this reuse spawn was in flight'))).toEqual([
+      recordedInFlightLine(h, p, 'its record generation could not be read, so a recording during the call cannot be ruled out'),
+    ])
+    expect(h.retiredKeyWrites.slice(writes)).toEqual([])
+    expect(markOf(h, p)).toEqual([false, false, false])
+    await h.runApproverToStop(p)
+  })
+
+  // A recorded key never reaches a `resume`, so its no-transcript reuse is
+  // reached only by a key recorded while the resume is out, after the ladder
+  // decided on its row as for any key. The reuse's fresh-retired is answered
+  // as it is after each of the three answers: no amnesia result, and no
+  // diagnosis notice. After ErrJsonlMissing the diagnosis had a notice (the
+  // harness configures no message archive, so it is inconclusive), so one
+  // line says that notice is not posted; the other two make no diagnosis.
+  test.each<readonly [string, () => Error, boolean]>([
+    ['ErrNoSessionId', () => errNoSessionId(), false],
+    ['ErrJsonlNeverWritten', () => errJsonlNeverWritten(), false],
+    ['ErrJsonlMissing', () => errJsonlMissing(), true],
+  ])('P recorded while its resume of an ended row is out, the resume answering %s: the one reuse after it succeeds and the launch answers fresh-retired, not an amnesia result, with the mark set, no diagnosis notice for P, and no second resume', async (_label, make, diagnosed) => {
+    const { h, p } = srj105Build()
+    h.script({ ...collided(h, harnessPersona(h, p), ENDED_WITH_SESSION), resumeError: make() })
+    retireWhenCalled(h, p, 'resume')
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_FRESH_RETIRED })
+
+    expect(h.stub.calls.spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined, true])
+    expect(h.stub.calls.spawnCalls[1]).toEqual(reuseSpawnOf(h, p))
+    expect(h.stub.calls.resumeCalls).toHaveLength(1)
+    expect(markOf(h, p)).toEqual([true, true, true])
+    expect(h.notices).toEqual([])
+    const ref = renderPersonaRef(harnessPersona(h, p).name, p)
+    const notPosted = `[slack] spawnForPersona: ${ref}'s key is retired, so its reuse spawn answered ${SPAWN_ACTION_FRESH_RETIRED} — answering it, not an amnesia result; the lost-transcript diagnosis's persona notice is not posted (b.jg5 SRJ-112, SRJ-806)`
+    expect(h.errors.filter((line) => line.includes('not an amnesia result'))).toEqual(diagnosed ? [notPosted] : [])
+    await h.runApproverToStop(p)
   })
 })

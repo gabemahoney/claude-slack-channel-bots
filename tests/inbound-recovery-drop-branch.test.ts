@@ -100,6 +100,11 @@
  * installed as main() installs it): P recorded with its mark set and its row
  * read `waiting` reports as before with P's entry cleared, and a `pending`
  * row reports session starting with nothing cleared.
+ * A message lost for P whose key is recorded as retired with no mark (b.jg5
+ * SRJ-805) asks for P's restart as for any persona, and that restart never
+ * resumes P or types into its old life: an `ended` row is launched by one
+ * reuse of P's id, and a live row goes through the live-row sequence, during
+ * which a further lost message reports restarting with no read.
  *
  * main() in src/server.ts cannot run in a test (startup gate, real port, real
  * Slack connections), so describe (7) audits its source for the wiring only:
@@ -236,13 +241,13 @@ import {
   type RecoveryHarnessOptions,
   type RecoveryRowState,
 } from './test-helpers/recovery-harness.ts'
-import { holdThroughReuse, personaCallCounts, personaRow, unavailableAt } from './test-helpers/recovery-harness.ts'
+import { holdThroughReuse, personaCallCounts, personaRow, reuseSpawnOf, unavailableAt } from './test-helpers/recovery-harness.ts'
 import { retiredEntryClearedLine, retiredKeyLinesIn } from './test-helpers/recovery-harness.ts'
 import { readRetiredKeysRecord, retiredKeysRecordOf, type RetiredKeySeed } from './test-helpers/retired-keys.ts'
 import { RETIRED_KEY_CAUSE_REMOVED } from '../src/retired-keys.ts'
 import { errInvalidFlags, provenanceNote } from './test-helpers/agent-director-stub.ts'
-import { launchForLiveRowSequence, readPersonaOwnRow } from '../src/session-manager.ts'
-import { LIVE_ROW_LAUNCH_REUSE } from '../src/live-row-sequence.ts'
+import { launchForLiveRowSequence, readPersonaOwnRow, SPAWN_ACTION_FRESH_RETIRED } from '../src/session-manager.ts'
+import { LIVE_ROW_LAUNCH_REASON_RETIRED_KEY, LIVE_ROW_LAUNCH_REUSE, LIVE_ROW_OUTCOME_LAUNCHED } from '../src/live-row-sequence.ts'
 import { latchRowStateRead } from '../src/conflict-latch.ts'
 import { PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
 
@@ -1471,6 +1476,65 @@ describe('b.jg5 SRJ-807: the lost-message read clears a retired key\'s entry on 
     expect(h.retiredKeys.isMarked(key)).toBe(true)
     expect(isRestartPendingOrActive(key)).toBe(false)
     expectNothingRaisedOrArmed(h, key)
+  })
+})
+
+// ===========================================================================
+// b.jg5 SRJ-805 at the lost-message trigger: a message lost for P whose key
+// is recorded as retired, with no mark, asks for P's human-triggered restart
+// as for any persona; that restart never resumes P and never types into its
+// old life. With P's row `ended`, its launch is one reuse of P's own id; with
+// the row live, the restart path's reconnect adapter starts the live-row
+// sequence (with the retired-key flag) and types nothing, and a message lost
+// while that sequence runs reports restarting with no read and no second
+// restart. On the recovery harness, at a short `session_restart_delay` so
+// the asked-for restart runs.
+// ===========================================================================
+
+describe('b.jg5 SRJ-805: a message lost for a retired key asks for a restart that never resumes it or types into its old life', () => {
+  test('P\'s row ended with a session id: the message reports starting now and asks for P\'s restart, whose launch is one reuse of cscb_<key>, no resume or keystroke; fresh-retired, with P\'s mark set', async () => {
+    const h = makeRecovery({ sessionRestartDelay: FAST_DELAY_S, resumeEnabled: true })
+    const [key] = h.keys as [string]
+    h.retireKey(key)
+    h.script({
+      statusResult: cannedStatusResult({ state: LIVENESS_DEAD_ROW_ENDED }),
+      getResult: personaRow(h, key, { state: LIVENESS_DEAD_ROW_ENDED, claude_session_id: 'a-session-id' }),
+    })
+
+    await expectLostMessageReports(h, key, 'starting-now', { restartRequested: true })
+    await waitFor(() => !isRestartPendingOrActive(key), 1000)
+    await h.settle()
+
+    expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, key)])
+    expect([h.stub.calls.resumeCalls, h.stub.calls.sendKeysCalls]).toEqual([[], []])
+    expect(h.retiredEntry(key)).toMatchObject({ recorded: true, marked: true })
+    await h.runApproverToStop(key)
+  })
+
+  test('P\'s row live (waiting): the asked-for restart types nothing into the old life and launches nothing itself, and starts the sequence; a second message while it runs reports restarting with no read and asks for no restart; the sequence ends in the reuse for the retired key', async () => {
+    const h = makeRecovery({ sessionRestartDelay: FAST_DELAY_S })
+    const [key] = h.keys as [string]
+    h.retireKey(key)
+    ownRowsLiveThenMissing(h)
+    h.script({ statusResult: cannedStatusResult({ state: 'waiting' }) })
+    const hold = holdFindMissing(h.stub.client)
+
+    await expectLostMessageReports(h, key, 'starting-now', { restartRequested: true })
+    await waitFor(() => !isRestartPendingOrActive(key), 1000)
+    await h.driveSequence(hold.entered(1))
+
+    expect([h.stub.calls.sendKeysCalls, h.stub.calls.spawnCalls, h.sequenceRunning(key)]).toEqual([[], [], true])
+    await expectLostMessageReports(h, key, 'restarting', { calls: {} })
+
+    hold.release(cannedFindMissing({ rows: { [personaInstanceId(key)]: 'ids' } }))
+    expect(await h.driveSequence(h.sequenceSettled(key))).toMatchObject({
+      kind: LIVE_ROW_OUTCOME_LAUNCHED,
+      launchKind: LIVE_ROW_LAUNCH_REUSE,
+      reason: LIVE_ROW_LAUNCH_REASON_RETIRED_KEY,
+      result: { key, action: SPAWN_ACTION_FRESH_RETIRED },
+    })
+    expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls, h.stub.calls.sendKeysCalls]).toEqual([[reuseSpawnOf(h, key)], [], []])
+    await h.runApproverToStop(key)
   })
 })
 

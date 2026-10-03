@@ -306,7 +306,12 @@
  *   `retiredKeysPath(h.stateDir)`; seed and read it with
  *   `tests/test-helpers/retired-keys.ts`. A later run over the same
  *   directories (a restart) loads a new store from the disk; a record it
- *   cannot load makes `h.build` throw;
+ *   cannot load makes `h.build` throw. A realLaunch run also installs that
+ *   same store for the session manager (`setRetiredKeyStore`, as `main()`
+ *   does right after the configured-persona query, b.jg5 SRJ-805, SRJ-806),
+ *   before its start pass; `run.stop()` resets the install when it is the
+ *   run's own, and `h.cleanup()` always does. A run without `realLaunch`
+ *   installs none;
  * - a stop between writes: `opts.stopBeforeWrite` names a path; just before
  *   the run's writer is first called for it, the harness keeps an image of
  *   every regular file under the configuration and state directories, and
@@ -367,7 +372,12 @@
  * or `missing` row, or of an id with no row, starts a new `waiting` life with
  * its own `cwd` and labels, and collides with a live row; a resume sets the
  * row `waiting`, a kill `ended`, a delete removes it. A launch record gets
- * the ladder's `action`. `run.composition.agentDirectorCalls` is every
+ * the ladder's `action`: for a key the run's retired-key store has recorded
+ * (b.jg5 SRJ-805, SRJ-806) a reuse spawn that succeeded answers
+ * `SPAWN_ACTION_FRESH_RETIRED` (`fresh-retired`, from
+ * `src/session-manager.ts`) with the key's "new life has begun" mark set
+ * through the store, so a case tells it from a plain `spawned`, a `resumed`
+ * and a `reconnected`. `run.composition.agentDirectorCalls` is every
  * agent-director call in order (a spawn with its `cwd`, `CLAUDE_CONFIG_DIR`,
  * `config_dir` label and whether it was a reuse; each with its `result`),
  * and `instanceCallsOf(name)` the persona's spawn, resume, kill and delete.
@@ -400,7 +410,9 @@
  * starts the persona's sequence through the session manager's start entry,
  * `run.sequenceRunning(name)` reads the running query, and
  * `run.composition.holdFindMissing()` holds its runs (the stub's
- * `holdFindMissing`), so a case can hold a sequence across an apply;
+ * `holdFindMissing`), so a case can hold a sequence across an apply, and
+ * `run.composition.holdSpawns(shouldHold)` holds the spawns that reach the
+ * stub (the stub's `holdSpawns`), so a case can hold a reuse mid-call;
  * `run.stop()` closes the registry, as `main()`'s shutdown does, and
  * `h.cleanup()` removes it. So a CONFLICT at a
  * ladder spawn or `resume` latches the persona (its launch record's `action`
@@ -597,6 +609,7 @@ import {
   _resetLiveRowSequenceRegistry,
   _resetPreLaunchReplyGuard,
   _resetPreLaunchTrustPatcher,
+  _resetRetiredKeyStore,
   _resetSpawnHomeDir,
   _setDialogReadyTimeoutMs,
   _setSpawnHomeDir,
@@ -615,6 +628,7 @@ import {
   setLiveRowSequenceRegistry,
   setPreLaunchReplyGuard,
   setPreLaunchTrustPatcher,
+  setRetiredKeyStore,
   setSessionNotifier,
   spawnForPersona,
   startLiveRowSequence,
@@ -654,9 +668,11 @@ import {
   errInstanceIdCollision,
   errSpawnNotFound,
   holdFindMissing,
+  holdSpawns,
   makeStubCallLog,
   makeStubClient,
   type FindMissingHold,
+  type SpawnHold,
   type StubCallLog,
   type StubClientOptions,
 } from './agent-director-stub.ts'
@@ -836,7 +852,9 @@ export interface ReloadLifecycleRecord {
   /**
    * Launch only, with `opts.realLaunch`: what the real launch path
    * (`spawnForPersona`) did, set once it resolved (`spawned`, `resumed`,
-   * `reconnected`, `deferred`, `failed`, …). Absent for a recorded-only launch.
+   * `reconnected`, `deferred`, `failed`, …; `fresh-retired`,
+   * `SPAWN_ACTION_FRESH_RETIRED`, for a recorded retired key's reuse that
+   * began its new life, b.jg5 SRJ-806). Absent for a recorded-only launch.
    */
   action?: SpawnPersonaResult['action']
   /**
@@ -1020,6 +1038,15 @@ export interface RealLifecycleComposition {
    * call before the harness's cleanup.
    */
   holdFindMissing(): FindMissingHold
+  /**
+   * Hold every `spawn` the stub gets from now on whose instance ID satisfies
+   * `shouldHold` until the case settles it (the stub's `holdSpawns`); a
+   * released spawn then acts on the row table as any spawn that went through.
+   * A spawn the row table answers with a collision never reaches the stub,
+   * so it is never held. The case releases every held spawn before the
+   * harness's cleanup.
+   */
+  holdSpawns(shouldHold: (id: string) => boolean): SpawnHold
 }
 
 /**
@@ -1438,7 +1465,8 @@ export interface ReloadRunOptions {
    * reply-guard steps over `h.stateDir` and the applied set, the bring-up
    * controller's claude_config_dir hold and re-check, and a session notifier
    * that records each notice (`run.sessionNotices`) and raises it through
-   * the run's notifier, and the run's latch (`run.latch`); a launch that
+   * the run's notifier, the run's latch (`run.latch`) and the run's
+   * retired-key store (`run.retiredKeys`, b.jg5 SRJ-805); a launch that
    * returns success starts the startup-dialog approver on its own, after the
    * launch call (b.jg5 SRJ-401), which reads and types through the stub only,
    * its laps `DIALOG_POLL_INTERVAL_MS` apart on the approver's clock with a
@@ -1510,6 +1538,8 @@ export interface ReloadRun {
    * `run.writes` / `run.removes` and `h.failWrites` / `h.failRemoves` count
    * them with the record's; its lines go to `run.logs`; its times come from
    * `run.clock`. A later run (a restart) loads a new store from the disk.
+   * With `opts.realLaunch` it is also the session manager's installed store
+   * (`setRetiredKeyStore`) until the run stops (b.jg5 SRJ-805, SRJ-806).
    */
   readonly retiredKeys: RetiredKeyStore
   /** Whether the run reached its `opts.stopBeforeWrite` stop point (the disk image was kept). */
@@ -2059,6 +2089,11 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
   const rows = new Map<string, { state: string; cwd: string; labels: Record<string, string> }>()
   /** A realLaunch run installed the session manager's module seams: reset them at cleanup. */
   let launchSeamsInstalled = false
+  /**
+   * The retired-key store installed in the session manager now (the latest
+   * realLaunch run's), so a run's stop resets the install only when it is its own.
+   */
+  let installedRetiredKeys: RetiredKeyStore | undefined
   /** `console.error` before the harness captured it (a realLaunch run), restored at cleanup. */
   const originalConsoleError = console.error
   let consoleCaptured = false
@@ -2588,6 +2623,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         },
         failTemplateRefresh: (err) => void templateFailures.push(err),
         holdFindMissing: () => holdFindMissing(stub),
+        holdSpawns: (shouldHold) => holdSpawns(stub, shouldHold),
         client,
       }
     }
@@ -3201,6 +3237,12 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           putDiskImageBack(stopImage)
           runsStoppedBeforeWrite.delete(run)
         }
+        // As the server process ends: its store is no longer the session
+        // manager's (only when this run's is the one installed).
+        if (installedRetiredKeys === retiredKeys) {
+          _resetRetiredKeyStore()
+          installedRetiredKeys = undefined
+        }
         controller.stopDetection()
         bringUps.cancelAll()
         noticeStack.hold.cancelAll()
@@ -3255,6 +3297,13 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       // as configured while the run's applied configuration holds it, read at
       // each call, so a note on a configured persona's own row latches it.
       setConfiguredPersonaQuery((key) => getAppliedPersona(key) !== undefined)
+      // As main() installs it right after the configured-persona query
+      // (b.jg5 SRJ-805, SRJ-806, SRJ-807): the run's one retired-key store,
+      // the controller's, so a launch reads the keys apply step 1 records, a
+      // reuse success for a recorded key sets its mark through it, and an
+      // own-row read clears through it.
+      setRetiredKeyStore(retiredKeys)
+      installedRetiredKeys = retiredKeys
       // As main() builds and installs it after the latch (b.jg5 SRJ-706): the
       // run's one live-row sequence registry, its dependencies from the
       // session manager's builder on the run's clock over the configuration
@@ -3579,6 +3628,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           setConflictLatch(undefined)
           _resetInvalidFlagsHold()
           _resetConfiguredPersonaQuery()
+          _resetRetiredKeyStore()
+          installedRetiredKeys = undefined
           _resetLiveRowSequenceRegistry()
         }
         if (outageStateInstalled) _resetOutageState()

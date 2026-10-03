@@ -84,6 +84,7 @@ import {
   cannedErr,
   cannedOk,
   cannedFindMissing,
+  holdFindMissing,
   cannedGetResult,
   cannedKillResult,
   cannedStatusResult,
@@ -246,8 +247,24 @@ import {
   type PersonaEpisodes,
 } from '../src/persona-episodes.ts'
 import { KILL_FAILURE_CONTEXT_RECOVERY } from '../src/kill-failure-alert.ts'
-import { killFailureEndedLine, retiredEntryClearedLine, retiredKeyLinesIn } from './test-helpers/recovery-harness.ts'
-import { _resetRetiredKeyStore, setRetiredKeyStore } from '../src/session-manager.ts'
+import {
+  killFailureEndedLine,
+  makeRecoveryHarness,
+  ownRowsLiveThenMissing,
+  retiredEntryClearedLine,
+  recordSequenceStarts,
+  retiredKeyLinesIn,
+  type RecoveryHarness,
+} from './test-helpers/recovery-harness.ts'
+import {
+  LIVE_ROW_LAUNCH_REASON_RETIRED_KEY,
+  LIVE_ROW_LAUNCH_REUSE,
+  LIVE_ROW_OUTCOME_LAUNCHED,
+  LIVE_ROW_START_ALREADY_RUNNING,
+  LIVE_ROW_SEQUENCE_ENTRY_KILL,
+  LIVE_ROW_START_STARTED,
+} from '../src/live-row-sequence.ts'
+import { _resetRetiredKeyStore, setRetiredKeyStore, SPAWN_ACTION_FRESH_RETIRED } from '../src/session-manager.ts'
 import { loadRetiredKeyStore, RETIRED_KEY_CAUSE_REMOVED, retiredKeysPath, type RetiredKeyStore } from '../src/retired-keys.ts'
 import { RETIRED_ENTRY_CLEARING_STATES } from '../src/row-read-rules.ts'
 import { readRetiredKeysRecord, retiredKeysRecordOf, writeRetiredKeysRecord, type RetiredKeySeed } from './test-helpers/retired-keys.ts'
@@ -4573,6 +4590,144 @@ describe('b.jg5 SRJ-807, SRJ-115: the liveness and reconnect adapters clear a re
 
     expect(log.sendKeysCalls).toEqual([])
     expectNothingCleared()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-805: the reconnect adapter never types `/mcp reconnect` into a
+// retired key's old life. For a key recorded with no "new life has begun"
+// mark whose row reads live other than `pending` (a state CSCB does not know
+// included), it reads no pane, types nothing, starts the live-row sequence
+// (the retired-key flag, alert context `recovery`, seeded with the state
+// read) and answers 'transient'; a second call while that sequence runs starts
+// no second one (one sequence per persona). With the mark set the row is the
+// new life and is reconnected as any other; a key not recorded is unchanged;
+// a `pending` reading keeps its answer.
+//
+// On `makeRecoveryHarness`, whose store is installed through the session
+// manager's installer and whose registry is installed as `main()` installs
+// it; the adapter is called directly. P's own row reads live at the
+// sequence's first `get` and `missing` after (`ownRowsLiveThenMissing`), so
+// a sequence started through that registry runs to its final launch, a reuse
+// of the id, whose outcome shows the retired-key flag. The cases that read
+// the whole start request install a recording registry in its place
+// (`recordSequenceStarts`), which runs nothing. The sequence's own steps are
+// tests/live-row-sequence.test.ts's.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-805: the reconnect adapter starts the live-row sequence for a retired key\'s old life and answers transient, never typing into it', () => {
+  let harness: RecoveryHarness | undefined
+
+  afterEach(() => {
+    const h = harness
+    harness = undefined
+    if (h === undefined) return
+    try {
+      assertNoLeak(h.captured())
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  /** A harness over P and Q, P recorded (its mark set when `mark`), each row's `status` reading `state`, every `get` live then missing. */
+  function retiredReconnect(state: string, mark = false): { h: RecoveryHarness; p: string; q: string } {
+    const h = (harness = makeRecoveryHarness())
+    const [p, q] = h.keys as [string, string]
+    h.retireKey(p, { mark })
+    ownRowsLiveThenMissing(h)
+    h.script({ statusResult: cannedStatusResult({ state }) })
+    return { h, p, q }
+  }
+
+  /** The adapter as the harness's restart path builds it, with the harness's latch. */
+  const reconnect = (h: RecoveryHarness, key: string) => _buildReconnectSessionAdapter(undefined, (k) => h.latch.isLatched(k))(key)
+
+  /** The adapter's lines for a retired key's old life, logged by the case. */
+  const oldLifeLinesIn = (h: RecoveryHarness): string[] =>
+    h.errors.filter((line) => line.startsWith('[slack] reconnectSession: ') && line.includes(' and its key is retired with no new life begun'))
+
+  /** The adapter's one line for persona `key`'s old life read `state`, the start entry answering `startAnswer`. */
+  const oldLifeLine = (key: string, state: string, startAnswer: string): string =>
+    `[slack] reconnectSession: persona=${key} is ${state} and its key is retired with no new life begun — not typing /mcp reconnect into its old life; the live-row sequence replaces it (start answered ${startAnswer}); deferring (b.jg5 SRJ-805)`
+
+  /** P's sequence driven to its end: its final launch the reuse the retired-key flag decides, answering fresh-retired. */
+  async function expectRetiredSequenceEnds(h: RecoveryHarness, p: string): Promise<void> {
+    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({
+      kind: LIVE_ROW_OUTCOME_LAUNCHED,
+      launchKind: LIVE_ROW_LAUNCH_REUSE,
+      reason: LIVE_ROW_LAUNCH_REASON_RETIRED_KEY,
+      result: { key: p, action: SPAWN_ACTION_FRESH_RETIRED },
+    })
+    expect(h.stub.calls.resumeCalls).toEqual([])
+    await h.runApproverToStop(p)
+  }
+
+  // The start request is read whole from a recording registry installed in
+  // the harness's place (`recordSequenceStarts`), so no sequence runs; the
+  // run to its reuse is the second call's case below.
+  test.each(['waiting', 'working', 'ask_user', 'check_permission', 'hibernating'])('P recorded with no mark, its row reading %s: transient, with no pane read and nothing typed, and one adapter line naming the state and the start\'s answer; exactly one start request: seeded with the state read, entry at step 1, the retired-key flag, the conversation not kept, ending in a launch, context recovery', async (state) => {
+    const { h, p, q } = retiredReconnect(state)
+    const starts = recordSequenceStarts()
+
+    expect(await reconnect(h, p)).toBe('transient')
+
+    expect([h.stub.calls.sendKeysCalls, h.stub.calls.readPaneCalls]).toEqual([[], []])
+    expect(oldLifeLinesIn(h)).toEqual([oldLifeLine(p, state, LIVE_ROW_START_STARTED)])
+    expect(starts).toEqual([
+      {
+        key: p,
+        ref: `persona=${p}`,
+        instanceId: personaInstanceId(p),
+        lastReadState: state,
+        entryStep: LIVE_ROW_SEQUENCE_ENTRY_KILL,
+        keepsConversation: false,
+        retiredKey: true,
+        launches: true,
+        alertContext: KILL_FAILURE_CONTEXT_RECOVERY,
+      },
+    ])
+    expect(h.retiredEntry(q).recorded).toBe(false)
+  })
+
+  test('a second call while P\'s sequence runs (its first run held): transient again, with nothing typed and no second sequence; its line names the start\'s already-running answer', async () => {
+    const { h, p } = retiredReconnect('waiting')
+    const hold = holdFindMissing(h.stub.client)
+
+    expect(await reconnect(h, p)).toBe('transient')
+    await h.driveSequence(hold.entered(1))
+    expect(await reconnect(h, p)).toBe('transient')
+
+    expect(oldLifeLinesIn(h)).toEqual([oldLifeLine(p, 'waiting', LIVE_ROW_START_STARTED), oldLifeLine(p, 'waiting', LIVE_ROW_START_ALREADY_RUNNING)])
+    expect(h.stub.calls.sendKeysCalls).toEqual([])
+    expect([h.stub.calls.killCalls.length, h.sequenceRunning(p)]).toEqual([1, true])
+    hold.release(cannedFindMissing({ rows: { [personaInstanceId(p)]: 'ids' } }))
+    await expectRetiredSequenceEnds(h, p)
+    expect(h.stub.calls.killCalls).toHaveLength(1)
+  })
+
+  // The waiting read's clear (b.jg5 SRJ-807) is refused, so P is still
+  // recorded and marked when the adapter decides.
+  test.each([
+    ['P recorded with its mark set (its clear\'s write refused)', true],
+    ['Q, not recorded', false],
+  ] as const)('%s, its row reading waiting: the ordinary reconnect, success with one send-keys, and no sequence', async (_label, marked) => {
+    const { h, p, q } = retiredReconnect('waiting', true)
+    const key = marked ? p : q
+    if (marked) h.failRetiredKeyWrites()
+
+    expect(await reconnect(h, key)).toBe('success')
+
+    expect(h.stub.calls.sendKeysCalls.map((call) => call.claude_instance_id)).toEqual([personaInstanceId(key)])
+    expect([h.sequenceRunning(key), oldLifeLinesIn(h)]).toEqual([false, []])
+    if (marked) expect(h.retiredEntry(p)).toMatchObject({ recorded: true, marked: true })
+  })
+
+  test('P recorded with no mark, its row reading pending with a launch start: the pending answer as before, nothing typed and no sequence', async () => {
+    const { h, p } = retiredReconnect(AGENT_DIRECTOR_PENDING_STATE)
+
+    expect(await reconnect(h, p)).toBe('pending')
+
+    expect([h.stub.calls.sendKeysCalls, h.sequenceRunning(p), oldLifeLinesIn(h)]).toEqual([[], false, []])
   })
 })
 

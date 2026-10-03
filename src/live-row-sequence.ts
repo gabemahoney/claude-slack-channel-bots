@@ -105,20 +105,29 @@
  *   - the collision ladder's replacement sites (SRJ-707; the session
  *     manager's replace step, `replacePersonaRow`): a row the ladder cannot
  *     keep (`resume_enabled` false, a `cwd` mismatch, a `config_dir` label
- *     missing or different, the last at a resume and at a `pending` row)
+ *     missing or different, the last at a resume and at a `pending` row,
+ *     or a retired key's old life: a live row, `pending` included, of a key
+ *     recorded as retired with no "new life has begun" mark, SRJ-805)
  *     that it last read live, `pending` included: the collision `get`'s or a
  *     re-read's live state, or a dead-session path's earlier live read only
  *     when that path holds dead evidence (SRJ-609, SRJ-611). Each such
  *     request enters at step 1, seeded with the state the ladder last read,
- *     with the conversation not kept, the key not retired, a launch at the
- *     end and the alert context `recovery`, so its step 6 is a reuse spawn
- *     of the same id;
+ *     with the conversation not kept, the retired-key flag set for a retired
+ *     key, a launch at the end and the alert context `recovery`, so its
+ *     step 6 is a reuse spawn of the same id;
  *   - the collision ladder's `resume` answering `ErrSpawnNotResumable` on a
  *     path that holds dead evidence (SRJ-710, SRJ-611), whose re-read finds
  *     the row in a live state other than `pending`: the same request with
  *     the re-read state as its seed and the conversation kept, so its step 6
- *     is a `resume` when the row has a session id and P may resume it.
- * The ladder answers `sequence-waiting` whatever the start answers.
+ *     is a `resume` when the row has a session id and P may resume it;
+ *   - the restart path's reconnect adapter (SRJ-805), for a retired key with
+ *     no mark whose row reads live other than `pending`: the same request as
+ *     the replacement sites', with the retired-key flag, in place of its
+ *     `/mcp reconnect`.
+ * The ladder answers `sequence-waiting` whatever the start answers. While
+ * P's key is recorded as retired the start entry sets the retired-key flag
+ * whatever the starter asked (SRJ-805), so no sequence for such a key ends
+ * in a `resume`.
  *
  * The module holds no module-scope state, runs nothing at
  * import, and loads neither the session manager, the server, the notifier
@@ -445,10 +454,14 @@ export const LIVE_ROW_LAUNCH_ANSWER_LAUNCHED = 'launched'
  * The launch results that are a success: the session manager's launch result
  * actions that leave P's session running (`launchSession` maps each to true).
  * Every other answer of a launch call (`failed`, `deferred`, `latched`,
- * `held`) ends the sequence without its launch.
+ * `held`) ends the sequence without its launch. `fresh-retired` is the
+ * session manager's `SPAWN_ACTION_FRESH_RETIRED`: a reuse spawn for a
+ * retired key that began its new life (SRJ-806, SRJ-112), a success as
+ * `spawned` is.
  */
 export const LIVE_ROW_LAUNCH_SUCCESS_ACTIONS: ReadonlySet<string> = new Set([
   'spawned',
+  'fresh-retired',
   'resumed',
   'reconnected',
   'not-reconnected',

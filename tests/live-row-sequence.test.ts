@@ -61,6 +61,14 @@
  * due time, what a dropped kill arms, step 4's `ad-config-malformed` no-kill
  * and the step-6 resume's failures in tests/unavailable-retry.test.ts.
  *
+ * A retired key's old life (b.jg5 SRJ-805, SRJ-806, SRJ-1007): with P
+ * recorded with no mark (the harness's `retireKey`), the final launch is one
+ * reuse and never a `resume`, the flag set by its starter or by the start
+ * entry; a reuse that succeeds answers `fresh-retired` and sets the mark, a
+ * failed reuse (UNAVAILABLE, a collision, `ErrInvalidFlags`) and a sequence
+ * stopped by a latch, a teardown or shutdown set none; an escalation raises
+ * the ordinary alert for P's own id on its configured destination.
+ *
  * Every spacing, limit, outcome, cause, context, state and class is
  * imported from `src/` or the stub builders, and every expected alert text
  * is built with `src/kill-failure-alert.ts`'s builders (through the
@@ -197,6 +205,7 @@ import {
   SEQUENCE_NOT_RESUMABLE_LATCHED_OUTCOME,
   SEQUENCE_NOT_RESUMABLE_LOST_RACE_OUTCOME,
   SEQUENCE_NOT_RESUMABLE_PENDING_OUTCOME,
+  SPAWN_ACTION_FRESH_RETIRED,
   spawnNotResumableLine,
   startLiveRowSequence,
   sweepDeadTmuxChannel,
@@ -258,6 +267,7 @@ import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director
 import { INVALID_FLAGS_HOLD_ALERT_TEXT } from '../src/invalid-flags-hold.ts'
 import { AD_VERSION_RECHECK_STOP_EXIT_CODE } from '../src/ad-version-gate.ts'
 import { errNoSessionId } from './test-helpers/agent-director-stub.ts'
+import { readRetiredKeysRecord } from './test-helpers/retired-keys.ts'
 import { assertNoLeak, isTokenLike, LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, sentinelInMessage } from './test-helpers/credentials.ts'
 import { forbiddenServerLoads } from './test-helpers/source-audit.ts'
 import {
@@ -1340,6 +1350,7 @@ describe('the launch: a resume when the row has a session id and P keeps its con
  */
 const LAUNCH_ACTION_SUCCEEDS: Readonly<Record<SpawnPersonaResult['action'], boolean>> = {
   spawned: true,
+  [SPAWN_ACTION_FRESH_RETIRED]: true,
   resumed: true,
   reconnected: true,
   'not-reconnected': true,
@@ -2311,5 +2322,101 @@ describe('step 6\'s reuse answering ErrInvalidFlags holds P: the sequence ends l
     expect([rc.resolves.length, rc.stops]).toEqual([1, [AD_VERSION_RECHECK_STOP_EXIT_CODE]])
     expect([h.invalidFlagsHold.heldKeys(), h.episodeNotices, h.triggers, h.controller.armedKeys(), getFailureCount(p)]).toEqual([[], [], [], [], 0])
     expect(h.clock.pendingCount()).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A retired key's old life through the sequence (b.jg5 SRJ-805, SRJ-806,
+// SRJ-1007)
+//
+// P is recorded as retired, with no mark, through the harness's store
+// (`retireKey`). The sequence's final launch for it is a reuse spawn, never a
+// `resume`, whatever its starter's flag (the start entry sets the flag while
+// the key is recorded), and only a reuse that succeeds sets the mark; a
+// sequence that escalates raises the ordinary alert for P's own id.
+// ---------------------------------------------------------------------------
+
+describe('a retired key\'s sequence: its final launch is a reuse that sets the mark only on success, and its step-5 alert names P\'s own id (b.jg5 SRJ-805, SRJ-806, SRJ-1007)', () => {
+  /** P and Q, P recorded as retired with no mark; P's row resumable but for the key (resume_enabled true). */
+  function retiredBuild(): { h: RecoveryHarness; p: string; q: string } {
+    const built = build({ resumeEnabled: true })
+    built.h.retireKey(built.p)
+    return built
+  }
+
+  /** P's mark as the running store and the record file read it. */
+  function markOf(h: RecoveryHarness, key: string): [boolean, boolean] {
+    return [h.retiredEntry(key).marked, (readRetiredKeysRecord(h.stateDir)?.get(key)?.newLifeBegunAt ?? null) !== null]
+  }
+
+  test.each([
+    ['the starter set the retired-key flag', true],
+    ['the starter did not set it (the start entry sets it while the key is recorded)', false],
+  ] as const)('%s: over a live row whose session id P could resume, the sequence ends in one reuse of cscb_<key>, no resume; fresh-retired, and the mark is set', async (_label, retiredKey) => {
+    const { h, p } = retiredBuild()
+    finishedAtRun1(h, p, { claude_session_id: SESSION_ID })
+    // The new life reads pending to the approver, so no read of it clears the entry (b.jg5 SRJ-807).
+    h.script({ statusResult: cannedStatusResult({ state: PENDING }) })
+
+    const outcome = await h.runSequence(p, { lastReadState: LIVE, keepsConversation: true, retiredKey })
+
+    expect(outcome).toMatchObject({
+      kind: LIVE_ROW_OUTCOME_LAUNCHED,
+      launchKind: LIVE_ROW_LAUNCH_REUSE,
+      reason: LIVE_ROW_LAUNCH_REASON_RETIRED_KEY,
+      result: { key: p, action: SPAWN_ACTION_FRESH_RETIRED },
+    })
+    expectOneReuseOf(h, p)
+    expect(h.stub.calls.resumeCalls).toEqual([])
+    expect(markOf(h, p)).toEqual([true, true])
+    await h.runApproverToStop(p)
+  })
+
+  test.each<[string, () => Error, Partial<LiveRowSequenceOutcome>]>([
+    ['UNAVAILABLE (ErrTmuxUnresponsive)', () => errTmuxUnresponsive('spawn'), { kind: LIVE_ROW_OUTCOME_LAUNCHED, result: { key: 'p', action: 'failed', refused: true } }],
+    ['a collision (ErrInstanceIdCollision)', () => errInstanceIdCollision(), { kind: LIVE_ROW_OUTCOME_NOT_LAUNCHED, notLaunched: LIVE_ROW_NOT_LAUNCHED_REUSE_COLLISION }],
+    ['ErrInvalidFlags (P held)', () => errInvalidFlags('spawn'), { kind: LIVE_ROW_OUTCOME_LAUNCHED, result: { key: 'p', action: 'held' } }],
+  ])('the final reuse answering %s: no resume, and no mark set or held', async (_label, make, ended) => {
+    const { h, p } = retiredBuild()
+    finishedAtRun1(h, p, { claude_session_id: SESSION_ID })
+    h.script({ spawnError: make() })
+    const writes = h.retiredKeyWrites.length
+
+    const outcome = await h.runSequence(p, { lastReadState: LIVE, retiredKey: true })
+
+    expect(outcome).toMatchObject({ ...ended, launchKind: LIVE_ROW_LAUNCH_REUSE, ...('result' in ended ? { result: { ...ended.result, key: p } } : {}) })
+    expectOneReuseOf(h, p)
+    expect(h.stub.calls.resumeCalls).toEqual([])
+    expect(markOf(h, p)).toEqual([false, false])
+    expect(h.retiredKeyWrites.slice(writes)).toEqual([])
+  })
+
+  test.each(SEQUENCE_STOP_WAYS)('%s during the pending wait: the sequence ends stopped with no launch, and no mark', async (_label, stopP, reason) => {
+    const { h, p } = retiredBuild()
+    await clockAt(h, LAUNCH_START_MS)
+    h.script({ getResult: personaRow(h, p, { state: PENDING }) })
+    const run = h.startSequence(p, { lastReadState: PENDING, entryStep: LIVE_ROW_SEQUENCE_ENTRY_GET, retiredKey: true })
+    for (let flushes = 0; flushes < 20 && h.clock.pendingCount() === 0; flushes++) await h.clock.flush()
+
+    await stopP(h, p)
+
+    expect(await run.outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason })
+    expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls]).toEqual([[], []])
+    expect(markOf(h, p)).toEqual([false, false])
+  })
+
+  test('a row still live after every run that judged it: the sequence escalates with no launch and no mark, and raises one ordinary alert for cscb_<key> on P\'s configured destination, context recovery, built by the alert\'s builder', async () => {
+    const { h, p } = retiredBuild()
+    h.script({ getResult: personaRow(h, p), findMissingResult: placed(p, 'unverified_ids') })
+
+    const outcome = await h.runSequence(p, { lastReadState: LIVE, retiredKey: true })
+
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_ESCALATED })
+    const content = ordinaryAlertContent(p)
+    expect(content).toMatchObject({ instanceId: personaInstanceId(p) })
+    expect(h.episodeNotices).toEqual([killFailureNotice(p, content, KILL_FAILURE_CLOSING_DESTINATION)])
+    expect(killFailurePosts(h, p)).toEqual([killFailurePostedLine(p, content, KILL_FAILURE_CLOSING_DESTINATION, KILL_FAILURE_CONTEXT_RECOVERY)])
+    expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls]).toEqual([[], []])
+    expect(markOf(h, p)).toEqual([false, false])
   })
 })

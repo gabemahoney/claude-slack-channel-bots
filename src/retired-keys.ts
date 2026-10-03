@@ -55,7 +55,21 @@
  *     clear decision for a marked key's row read live other than `pending`
  *     (SRJ-807);
  *   - `isRecorded`, `isMarked` and `entry`: the launch rule (SRJ-805), the
- *     row-read rule and the old-life hold (SRJ-809).
+ *     row-read rule and the old-life hold (SRJ-809);
+ *   - `recordGeneration`: a reuse spawn, read before its call and at its
+ *     success, so that a key recorded while the call was in flight gets no
+ *     mark (SRJ-806).
+ *
+ * The record generation. Each key has an in-memory count of the `record`
+ * calls that named it in this store's life, every one counted: a batch that
+ * writes, one that fails, one that writes nothing because the key is already
+ * recorded with no mark, and one that records a key held only in memory. It is
+ * never written, never read from the file (every key starts at 0 when the
+ * store loads), never put back by a `restore` (a count only increases), and
+ * changes nothing that is written or what any primitive answers. It is how a
+ * reader that held a reading across a wait tells that the key was recorded
+ * again in between, which the record itself cannot show when a re-record of
+ * an unmarked key leaves it as it was.
  *
  * Log lines (SRJ-1014), one per change of the record and one per failed
  * write, to the injected log (a throwing log is swallowed). They name the
@@ -420,6 +434,16 @@ export interface RetiredKeyStore {
   /** The recorded keys, sorted. */
   keys(): string[]
   /**
+   * `key`'s record generation: how many `record` calls named it in this
+   * store's life (0 for a key no `record` has named, a key loaded from the
+   * file included). Every such call counts, whatever it wrote or did not
+   * write, its failure included; a key named twice in one batch counts once.
+   * Held in memory only: never written, never restored, it only increases.
+   * A reader that captures it before a wait and finds it unchanged after
+   * knows no `record` named the key in between (SRJ-806).
+   */
+  recordGeneration(key: string): number
+  /**
    * Record a batch with one write (SRJ-803). A new key gets an entry
    * (`retired_at` now, the cause, no mark); a recorded key whose mark is set
    * gets the mark cleared, `retired_at` now and the new cause; a recorded key
@@ -428,7 +452,9 @@ export interface RetiredKeyStore {
    * record in memory as it was, except that the keys it recorded with the
    * `absent-at-start` cause stay recorded, held only in memory (SRJ-714).
    * Answers the outcome and the record before the batch. Throws a `RangeError`
-   * on an empty key or an unknown cause, before any change.
+   * on an empty key or an unknown cause, before any change. Every key of a
+   * batch that does not throw has its record generation increased by one,
+   * whatever the outcome ({@link RetiredKeyStore.recordGeneration}).
    */
   record(batch: readonly RetiredKeyToRecord[]): RetiredKeysRecordResult
   /**
@@ -536,6 +562,8 @@ function createRetiredKeyStore(
   let heldMarks: ReadonlySet<string> = new Set()
   /** What the file is believed to hold (null: no file), for writing it back after an unsynced rename. */
   let fileBytes: Uint8Array | null = initialBytes
+  /** Each key's record generation (absent: 0). In memory only; never written, never restored, only increased. */
+  const generations = new Map<string, number>()
 
   const timestamp = (): string => new Date(now()).toISOString()
 
@@ -598,6 +626,8 @@ function createRetiredKeyStore(
       if (typeof key !== 'string' || key === '') throw new RangeError('retired-keys: a key to record must be a non-empty string')
       if (!isRetiredKeyCause(cause)) throw new RangeError('retired-keys: a key to record needs a known cause')
     }
+    // SRJ-806: every recording of a key counts, a re-record that writes nothing included.
+    for (const key of new Set(batch.map(({ key }) => key))) generations.set(key, (generations.get(key) ?? 0) + 1)
     const before = snapshot()
     const next = new Map(entries)
     const changed: RetiredKeyToRecord[] = []
@@ -757,6 +787,7 @@ function createRetiredKeyStore(
     isHeldInMemory: (key) => heldKeys.has(key),
     entry: (key) => entries.get(key),
     keys: () => [...entries.keys()].sort(),
+    recordGeneration: (key) => generations.get(key) ?? 0,
     record,
     mark,
     clear,

@@ -38,7 +38,13 @@
  * The liveness probe answers one of four readings (b.jg5 SRJ-314,
  * `src/liveness-reading.ts`), and only `dead` leads to the kill and the
  * launch; after an escalate-dead verdict that is not dead evidence (b.jg5
- * SRJ-611), to the launch alone. `live` takes the reconnect path. `pending` (the row's session has
+ * SRJ-611), to the launch alone. `live` takes the reconnect path; for a key
+ * recorded as retired with no "new life has begun" mark the server's
+ * reconnect adapter types nothing into that old life, starts the live-row
+ * sequence (with the retired-key flag) and answers 'transient' (b.jg5
+ * SRJ-805), so the work counts nothing; and the relaunch after a `dead`
+ * reading of any key recorded as retired, marked or not, is the session
+ * manager's reuse spawn, never a `resume`. `pending` (the row's session has
  * not started) is handed to the `pending` deferral
  * (`RestartDeps.deferPendingRow`) with the row's launch start, whatever the
  * session's connection shows, and the work returns with no reconnect, kill,
