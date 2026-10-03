@@ -3853,19 +3853,26 @@ export async function main(): Promise<void> {
     slowRecovery,
   })
 
-  // b.av2 SR-6.3, b.jg5 SRJ-116, SRJ-714: the start sweep, BEFORE the trust
-  // patch and any spawn. One `list` of every `service=cscb` row in every
-  // state; then, over the whole list and before any kill, the latch pass (a
-  // latched persona's own row and every row labelled with it are left
-  // unkilled) and one batch record of the keys of rows naming a persona absent
-  // from the applied config as retired. The remaining rows naming an absent
-  // persona, or with an instance ID other than `cscb_<key>` or a `cwd` other
-  // than the persona's working directory, get killed + deleted. A row with no
-  // `persona` label (a pre-persona row, b.1ix) is never deleted: a live one is
-  // killed and kept, and one findMissing sweep after those kills lets a row
-  // whose session is gone read `missing`.
+  // b.av2 SR-6.3 as amended by b.jg5 SRJ-1506; b.jg5 SRJ-116, SRJ-714: the
+  // start sweep, BEFORE the trust patch and any spawn. One `list` reads every
+  // `service=cscb` row in every state; then, over the whole list and before
+  // any kill, the latch pass (a latched persona's own row and every row
+  // labelled with it are left unkilled) and one batch record of the keys of
+  // rows naming a persona absent from the applied config as retired. Each
+  // remaining live row naming an absent persona, or with an instance ID
+  // other than `cscb_<key>` or a `cwd` other than the persona's working
+  // directory, and each live row with no `persona` label (a pre-persona row,
+  // b.1ix), is killed with the result checked; a finished row is never
+  // killed, and no row is deleted: pre-persona and absent-persona rows are
+  // kept and never resumed until agent-director's `expire` removes them. One
+  // findMissing run follows the kills, and one summary line ends the sweep.
+  // The sweep reads `shuttingDown` live through its shutdown query: once a
+  // shutdown has begun (a version re-check's stop, b.jg5 SRJ-205) it makes no
+  // further agent-director call and changes no agent-director row.
+  // No sweep once a shutdown has begun (b.jg5 SRJ-205).
+  if (shuttingDown) return
   try {
-    await reconcileOrphans(personaConfig, KILL_RETRY_SYSTEM_CLOCK)
+    await reconcileOrphans(personaConfig, KILL_RETRY_SYSTEM_CLOCK, () => shuttingDown)
   } catch (err) {
     console.error(`[slack] Warning: orphan reconciliation failed: ${describeThrownValue(err)}`)
   }
@@ -3875,6 +3882,9 @@ export async function main(): Promise<void> {
   // pre-accepted before any spawn fires (the pre-launch patcher repeats it per
   // launch). Runs for both real and dry-run modes (config-file patch, not a
   // session operation).
+  // A shutdown may have begun during the sweep: no bootstrap pass starts
+  // after it (b.jg5 SRJ-205).
+  if (shuttingDown) return
   await trustBootstrap(personaConfig)
 
   // b.zak: preventative JSONL-persistence safeguard. Detect non-persistent
@@ -3885,6 +3895,9 @@ export async function main(): Promise<void> {
   // Runs over the applied personas. Awaited but wrapped so a rejection can
   // never kill startup. Its notices go through the per-persona notifier, which
   // only logs them in dry run.
+  // It makes agent-director `get` calls: none once a shutdown has begun
+  // (b.jg5 SRJ-205).
+  if (shuttingDown) return
   try {
     await runJsonlPersistenceSafeguard(personaConfig, personaNotifier.notify)
   } catch (err) {
@@ -3897,6 +3910,8 @@ export async function main(): Promise<void> {
   // directory. Runs for both real and dry-run modes (config-file patch, not a
   // session operation). Never throws — per-dir failures are recorded via
   // recordStartupError.
+  // No bootstrap pass starts once a shutdown has begun (b.jg5 SRJ-205).
+  if (shuttingDown) return
   stopHookBootstrap(personaConfig, STATE_DIR)
 
   // b.av2 SR-6.1: bring each applied persona up — one persona-start line,

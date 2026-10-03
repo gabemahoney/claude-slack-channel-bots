@@ -1307,9 +1307,10 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
       expect(await _buildIsSessionAliveAdapter(() => h.config)(key)).toEqual(LIVENESS_READING_UNKNOWN)
       return h.stub.calls.statusCalls.length
     }],
-    ['the start sweep’s list', async (h) => {
+    ['the start sweep’s list (b.jg5 SRJ-116: no latch, record or kill follows the failed list)', async (h) => {
       h.script({ listError: errCallTimeout('list') })
-      await reconcileOrphans(h.config)
+      await reconcileOrphans(h.config, h.killRetryClock)
+      expect([h.stub.calls.killCalls, h.stub.calls.findMissingCalls, h.retiredKeyWrites, h.latchEvents]).toEqual([[], [], [], []])
       return h.stub.calls.listCalls.length
     }],
     ['a persona teardown’s kill (b.jg5 SRJ-701: it answers its non-success outcome, never throws)', async (h, key) => {
@@ -1730,7 +1731,7 @@ describe('unavailable retry: a shared findMissing sweep that fails arms each per
     const result = await sweep
     await joined
 
-    expect(result.prePersona).toEqual({ kept: 1, live: 1, killFailed: 0 })
+    expect([result.killed, result.killFailed]).toEqual([1, 0])
     expect(hold.calls).toHaveLength(1)
     expectArmedOnce(h, p, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)
   })
@@ -1763,7 +1764,7 @@ describe('unavailable retry: a shared findMissing sweep that fails arms each per
 
     const result = await reconcileOrphans(h.config)
 
-    expect(result.prePersona).toEqual({ kept: 1, live: 1, killFailed: 0 })
+    expect([result.killed, result.killFailed]).toEqual([1, 0])
     expect(h.stub.calls.findMissingCalls).toHaveLength(1)
     expectNothingArmed(h)
   })

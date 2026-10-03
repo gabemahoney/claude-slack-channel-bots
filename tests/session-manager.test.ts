@@ -1199,6 +1199,18 @@ import {
 } from '../src/session-manager.ts'
 import { readRetiredKeysRecord, retiredKeysRecordOf, RFC3339_UTC, type RetiredKeySeed } from './test-helpers/retired-keys.ts'
 import { expectUntouched, recordSequenceStarts, retiredEntryClearedLine, retiredEntryClearFailedLine, retiredKeyLinesIn } from './test-helpers/recovery-harness.ts'
+import {
+  START_SWEEP_KILL_STATUS_SITE,
+  START_SWEEP_KILL_STOP_RECHECK,
+  START_SWEEP_KILL_STOP_SHUTDOWN,
+  START_SWEEP_SHUTDOWN_STOP_LINE,
+  startSweepKillFailedEntry,
+  startSweepPostKillFailedLine,
+  startSweepPostKillLine,
+  startSweepStoppedKillLine,
+  startSweepSummaryLine,
+  type OrphanReconcileResult,
+} from '../src/session-manager.ts'
 
 // ---------------------------------------------------------------------------
 // Test fixture helpers
@@ -4489,7 +4501,8 @@ function prePersonaRow(state: string, id = `cscb_old_${state}_C0OLD`): import('a
 }
 
 // ---------------------------------------------------------------------------
-// b.av2 SR-6.3 (formerly SR-1.6) — the start sweep
+// b.av2 SR-6.3 (formerly SR-1.6), amended by b.jg5 SRJ-1506 — the start sweep
+// (b.jg5 SRJ-714, SRJ-1514)
 // ---------------------------------------------------------------------------
 
 /**
@@ -4513,7 +4526,75 @@ async function reconcileOnClock(cfg: PersonaConfig, clock: FakeClock = createFak
   return work
 }
 
-describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', () => {
+/** The start sweep's result (b.jg5 SRJ-714's counts): every count 0 but `counts`. */
+function sweepResult(counts: Partial<OrphanReconcileResult> = {}): OrphanReconcileResult {
+  return { listed: 0, killed: 0, kept: 0, killFailed: 0, recordedAsRetired: 0, leftForLatch: 0, ...counts }
+}
+
+/**
+ * The sweep ended with its one summary line for `result` (b.jg5 SRJ-714):
+ * the builder's line, once, and the last of the sweep's lines in `log` (a
+ * captured log, or the lines).
+ */
+function expectSummaryLast(log: string | readonly string[], result: OrphanReconcileResult): void {
+  const lines = typeof log === 'string' ? log.split('\n') : log
+  const summary = startSweepSummaryLine(result)
+  expect(lines.filter((line) => line === summary)).toHaveLength(1)
+  expect(lines.filter((line) => line.startsWith('[slack] reconcileOrphans: ')).at(-1)).toBe(summary)
+}
+
+/** Every entry of class `classLabel` in a startup-errors.log body, the text after its timestamp and class. */
+function startupEntriesIn(log: string, classLabel: string): string[] {
+  const marker = `] [${classLabel}] `
+  return log.split('\n').flatMap((line) => (line.includes(marker) ? [line.slice(line.indexOf(marker) + marker.length)] : []))
+}
+
+/** The descriptions the kill-failure alert's ordinary version quotes. */
+type SweepOrdinaryQuotes = Extract<KillFailureAlertContent, { version: typeof KILL_FAILURE_VERSION_ORDINARY }>['quotes']
+
+/** The start sweep's kill-failure alert entry text for `row`: `instanceId=<id> (start sweep): <text>`, the log-only closing, unescaped. */
+function sweepAlertEntry(row: import('agent-director').ListRow, content: KillFailureAlertContent): string {
+  return killFailureAlertEntryText(`instanceId=${row.claude_instance_id}`, KILL_FAILURE_CONTEXT_START_SWEEP, killFailureAlertText(content, KILL_FAILURE_CLOSING_LOG_ONLY, false))
+}
+
+/** The survivor version's `persona-kill-survivor` entry for a sweep kill of `row` whose earlier try named `survivorDescription`. */
+function sweepSurvivorEntry(row: import('agent-director').ListRow, survivorDescription: string): string {
+  return sweepAlertEntry(row, { version: KILL_FAILURE_VERSION_SURVIVOR, session: row.tmux_session_name, survivorDescription })
+}
+
+/**
+ * The `orphan-cleanup` entry of a sweep kill of `row` that did not succeed
+ * (b.jg5 SRJ-714, SRJ-1013): the row (`persona` its label as the sweep names
+ * it; none for a pre-persona row), its listed state and session and the
+ * outcome that stands; then the ordinary version quoting `ordinary`, when
+ * SRJ-714 calls for it; none for a kill whose tries a shutdown stopped.
+ */
+function sweepKillFailedEntry(
+  row: import('agent-director').ListRow,
+  persona: string | undefined,
+  outcome: KillOutcome,
+  ordinary?: SweepOrdinaryQuotes,
+  stoppedAtShutdown = false,
+): string {
+  const entry = startSweepKillFailedEntry({
+    instanceId: row.claude_instance_id,
+    ...(persona === undefined ? {} : { persona }),
+    state: row.state,
+    session: row.tmux_session_name,
+    outcome: describeKillOutcome(outcome),
+    stoppedAtShutdown,
+  })
+  if (ordinary === undefined) return entry
+  return `${entry}; kill-failure alert: ${sweepAlertEntry(row, { version: KILL_FAILURE_VERSION_ORDINARY, session: row.tmux_session_name, instanceId: row.claude_instance_id, quotes: ordinary })}`
+}
+
+/** The sweep's line for a kill of `row` (named `persona`; none for a pre-persona row) whose success stands with `outcome`. */
+function sweepKillSucceededLine(row: import('agent-director').ListRow, persona: string | undefined, outcome: KillOutcome): string {
+  const name = persona === undefined ? `pre-persona row instanceId=${row.claude_instance_id}` : `orphan instanceId=${row.claude_instance_id} persona=${persona}`
+  return `[slack] reconcileOrphans: kill succeeded for ${name} (${describeKillOutcome(outcome)}) — row kept`
+}
+
+describe('reconcileOrphans: the start sweep by persona kills its live strays with the result checked and deletes no row (b.av2 SR-6.3, AC 4; b.jg5 SRJ-714, SRJ-1506, SRJ-1514)', () => {
   /**
    * Three applied personas in real temp working directories, except that
    * beta's configured working_directory is a symlink to `betaReal` (the path
@@ -4535,7 +4616,11 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
     return { cfg, home, betaReal }
   }
 
-  test('kills and deletes exactly the rows with an absent persona, a wrong instance ID or a wrong cwd; kills a live pre-persona row but keeps it; keeps correct rows', async () => {
+  /** A swept row of persona `persona` (`alpha`'s directory), id `id`, listed `state`. */
+  const sweptRow = (cfg: PersonaConfig, home: string, id: string, persona: string, state = 'waiting'): import('agent-director').ListRow =>
+    cannedListRow({ claude_instance_id: id, state, labels: { service: 'cscb', persona } }, personaOf(cfg, 'alpha'), home)
+
+  test('kills, with no delete, exactly the live rows with an absent persona, a wrong instance ID or a wrong cwd, and a live pre-persona row; keeps every row; leaves correct rows alone', async () => {
     const { cfg, home, betaReal } = sweepConfig()
     const alpha = personaOf(cfg, 'alpha')
     const beta = personaOf(cfg, 'beta')
@@ -4572,20 +4657,21 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
     })
 
     expect(listCalls).toEqual([{ label: ['service=cscb'] }])
-    expect(result).toEqual({ found: 3, killed: 3, failed: 0, prePersona: { kept: 1, live: 1, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
-    const swept = ['cscb_alpha_old', 'cscb_departed', 'cscb_gamma']
-    expect(killCalls.map((k) => k.claude_instance_id).sort()).toEqual([...swept, 'cscb_legacy'])
-    expect(deleteCalls.map((d) => d.claude_instance_id).sort()).toEqual(swept.map((id) => [id]))
-    // Each row is swept for its own reason, named in the log; the pre-persona row is not swept.
-    expect(errLog).toContain('reconcileOrphans: pre-persona row (no persona label) instanceId=cscb_legacy state=waiting')
+    expect(result).toEqual(sweepResult({ listed: 6, killed: 4, kept: 2 }))
+    expect(killCalls.map((k) => k.claude_instance_id).sort()).toEqual(['cscb_alpha_old', 'cscb_departed', 'cscb_gamma', 'cscb_legacy'])
+    expect(deleteCalls).toEqual([])
+    // Each row is swept for its own reason, named in the log; the pre-persona row is killed, not swept.
+    expect(errLog).toContain('reconcileOrphans: killing pre-persona row instanceId=cscb_legacy state=waiting ')
     expect(errLog).not.toContain('sweeping row (no persona label)')
-    expect(errLog).toContain('reconcileOrphans: sweeping row (absent persona) persona=departed instanceId=cscb_departed state=waiting — killing and deleting')
-    expect(errLog).toContain(`reconcileOrphans: sweeping row (wrong instance ID) persona=${renderPersonaRef('alpha', 'alpha')} instanceId=cscb_alpha_old state=waiting — killing and deleting`)
-    expect(errLog).toContain(`reconcileOrphans: sweeping row (wrong cwd) persona=${renderPersonaRef('gamma', 'gamma')} instanceId=cscb_gamma state=waiting cwd=${elsewhere} — killing and deleting`)
+    const killedKept = 'it is live, so it is killed; the row is kept (b.jg5 SRJ-714)'
+    expect(errLog).toContain(`reconcileOrphans: sweeping row (absent persona) persona=departed instanceId=cscb_departed state=waiting — ${killedKept}`)
+    expect(errLog).toContain(`reconcileOrphans: sweeping row (wrong instance ID) persona=${renderPersonaRef('alpha', 'alpha')} instanceId=cscb_alpha_old state=waiting — ${killedKept}`)
+    expect(errLog).toContain(`reconcileOrphans: sweeping row (wrong cwd) persona=${renderPersonaRef('gamma', 'gamma')} instanceId=cscb_gamma state=waiting cwd=${elsewhere} — ${killedKept}`)
     expect(errLog).not.toContain('instanceId=cscb_alpha state=')
     expect(errLog).not.toContain('instanceId=cscb_beta ')
     // Every working directory resolves, so nothing is deferred.
     expect(countDeferredLines(errLog)).toBe(0)
+    expectSummaryLast(errLog, result)
   })
 
   // b.av2 SR-6.4: the sweep runs before any bring-up, so it cannot compare a
@@ -4593,7 +4679,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
   // cwd check to the launch; the other three conditions still apply, to that
   // persona and to every other row in the same sweep.
   test.each([...UNRESOLVABLE_WORKDIRS])(
-    'working directory %s: its row is kept (neither found nor failed) with one deferred-check line; the other conditions still kill and delete, and a pre-persona row is killed but kept',
+    'working directory %s: its row is kept with no kill, with one deferred-check line; the other conditions still kill, and every row is kept with no delete',
     async (variant) => {
       const home = useSpawnHome()
       const broken = brokenWorkdir(variant)
@@ -4637,23 +4723,22 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
         result = await reconcileOrphans(cfg)
       })
 
-      expect(result).toEqual({ found: 3, killed: 3, failed: 0, prePersona: { kept: 1, live: 1, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
-      const swept = ['cscb_delta_old', 'cscb_departed', 'cscb_gamma']
-      expect(killCalls.map((k) => k.claude_instance_id).sort()).toEqual([...swept, 'cscb_legacy'])
-      expect(deleteCalls.map((d) => d.claude_instance_id).sort()).toEqual(swept.map((id) => [id]))
+      expect(result).toEqual(sweepResult({ listed: 6, killed: 4, kept: 2 }))
+      expect(killCalls.map((k) => k.claude_instance_id).sort()).toEqual(['cscb_delta_old', 'cscb_departed', 'cscb_gamma', 'cscb_legacy'])
+      expect(deleteCalls).toEqual([])
       expect(errLog).toContain(deferredSweepLine('delta', 'delta', broken.workingDirectory))
       expect(countDeferredLines(errLog)).toBe(1)
       expect(errLog).toContain(
-        `reconcileOrphans: sweeping row (wrong instance ID) persona=${renderPersonaRef('delta', 'delta')} instanceId=cscb_delta_old state=waiting — killing and deleting`,
+        `reconcileOrphans: sweeping row (wrong instance ID) persona=${renderPersonaRef('delta', 'delta')} instanceId=cscb_delta_old state=waiting — it is live, so it is killed; the row is kept`,
       )
       expect(errLog).toContain('reconcileOrphans: sweeping row (absent persona) persona=departed instanceId=cscb_departed')
-      expect(errLog).toContain('reconcileOrphans: pre-persona row (no persona label) instanceId=cscb_legacy')
+      expect(errLog).toContain('reconcileOrphans: killing pre-persona row instanceId=cscb_legacy ')
       expect(errLog).toContain(`reconcileOrphans: sweeping row (wrong cwd) persona=${renderPersonaRef('gamma', 'gamma')} instanceId=cscb_gamma state=waiting cwd=${elsewhere}`)
       expect(errLog).not.toContain('instanceId=cscb_delta state=')
     },
   )
 
-  test('two directory-broken personas: one deferred-check line each, and neither row is swept', async () => {
+  test('two directory-broken personas: one deferred-check line each, and neither row is swept or killed', async () => {
     const home = useSpawnHome()
     const first = brokenWorkdir('a missing directory, row cwd the configured path', 'first')
     const second = brokenWorkdir('a dangling symlink, row cwd its old real target', 'second')
@@ -4682,7 +4767,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
       result = await reconcileOrphans(cfg)
     })
 
-    expect(result).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
+    expect(result).toEqual(sweepResult({ listed: 2, kept: 2 }))
     expect(killCalls).toHaveLength(0)
     expect(deleteCalls).toHaveLength(0)
     expect(errLog).toContain(deferredSweepLine('delta', 'delta', first.workingDirectory))
@@ -4694,7 +4779,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
   // directory (here another persona's) is not deferred: it is swept as wrong
   // cwd, so the persona can never adopt that instance. A row with no real
   // path in the same sweep is still deferred.
-  test('a directory-broken persona whose row cwd is an existing directory elsewhere: swept as wrong cwd, no deferred line for it', async () => {
+  test('a directory-broken persona whose row cwd is an existing directory elsewhere: swept as wrong cwd and killed with no delete, no deferred line for it', async () => {
     const home = useSpawnHome()
     const alphaWork = fixtureSubdir('alpha-work')
     const delta = brokenWorkdir('a missing directory, row cwd the configured path', 'delta')
@@ -4728,165 +4813,280 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
       result = await reconcileOrphans(cfg)
     })
 
-    expect(result).toEqual({ found: 1, killed: 1, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
+    expect(result).toEqual(sweepResult({ listed: 3, killed: 1, kept: 2 }))
     expect(killCalls.map((k) => k.claude_instance_id)).toEqual(['cscb_delta'])
-    expect(deleteCalls.map((d) => d.claude_instance_id)).toEqual([['cscb_delta']])
+    expect(deleteCalls).toEqual([])
     expect(errLog).toContain(`reconcileOrphans: sweeping row (wrong cwd) persona=${renderPersonaRef('delta', 'delta')} instanceId=cscb_delta state=waiting cwd=${alphaWork}`)
     expect(errLog).toContain(deferredSweepLine('epsilon', 'epsilon', epsilon.workingDirectory))
     expect(countDeferredLines(errLog)).toBe(1)
   })
 
-  test('a delete failure records orphan-cleanup after a kill that succeeded (killed 0, failed 1)', async () => {
-    const readLog = captureStartupErrors()
-    const { cfg, home } = sweepConfig()
-    const killCalls: import('agent-director').KillParams[] = []
-    const deleteCalls: import('agent-director').DeleteParams[] = []
-    installStub({
-      killCalls,
-      deleteCalls,
-      listResult: { spawns: [cannedListRow({ claude_instance_id: 'cscb_alpha_old' }, personaOf(cfg, 'alpha'), home)] },
-      deleteError: errGeneric('delete', 'ErrDeleteBroken'),
-    })
-
-    const result = await reconcileOrphans(cfg)
-
-    expect(result).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
-    expect(killCalls.map((k) => k.claude_instance_id)).toEqual(['cscb_alpha_old'])
-    expect(deleteCalls.map((d) => d.claude_instance_id)).toEqual([['cscb_alpha_old']])
-    const log = readLog()
-    expect(countStartupEntries(log, ORPHAN_CLEANUP_LABEL)).toBe(1)
-    expect(log).toContain(`delete failed for orphan instanceId=cscb_alpha_old persona=${renderPersonaRef('alpha', 'alpha')}: ErrDeleteBroken`)
-  })
-
-  // b.jg5 SRJ-110, SRJ-701 (HO C2 Verify, AC 24): the start sweep's kill is
-  // a checked kill. A swept row whose kill does not succeed (each value of
-  // HO C2's non-success list, the unusable-name value, `ErrConfigMalformed`,
-  // another error) is kept: no delete call, counted failed, and one
-  // `orphan-cleanup` entry naming the outcome. Nothing latches (the sweep
-  // routes a CONFLICT or an UNUSABLE NAME per SRJ-1002, even for a
-  // configured persona's row with the server's latch installed), and no
-  // retry timer is armed. Reverses "a kill failure records orphan-cleanup;
-  // the delete is still attempted". The sweep is no launch or recovery
-  // attempt, so a class the kill has no row for (UNCLASSIFIED) arms nothing
-  // and feeds no unclassified-error episode either (b.jg5 SRJ-110). GONE is
-  // the session-gone success (b.jg5 SRJ-104): the row is deleted. An
+  // b.jg5 SRJ-110, SRJ-701, SRJ-714 (HO C2, C17 Verify; AC 24, AC 77): the
+  // start sweep's kill is a checked kill and deletes no row, whatever its
+  // outcome. A kill that does not succeed keeps the row with one
+  // `orphan-cleanup` entry naming the row, its state, its session and the
+  // outcome's class, carrying the kill-failure alert's ordinary version for
+  // an `ErrTmuxKillFailed` that stands or any failure after a survivor-naming
+  // try; a success after a survivor-naming try counts killed and writes one
+  // `persona-kill-survivor` entry. Nothing latches (a CONFLICT or an UNUSABLE
+  // NAME is routed per SRJ-1002, even for a configured persona's row with the
+  // server's latch installed), nothing is posted (kill-failure alerts over a
+  // recording sink are installed, as main() installs them), no retry timer is
+  // armed and no unclassified-error episode is fed (b.jg5 SRJ-110). An
   // `ErrInvalidFlags` gets exactly one immediate version re-check (b.jg5
-  // SRJ-104, SRJ-204); a stop it decides ends the sweep: no further row is
-  // handled and no findMissing sweep follows (b.jg5 SRJ-205).
-  describe('b.jg5 SRJ-110, SRJ-701: the start sweep\'s checked kill', () => {
+  // SRJ-104, SRJ-204); a stop it decides ends the sweep's calls (SRJ-205).
+  describe('b.jg5 SRJ-110, SRJ-701, SRJ-714: the start sweep\'s checked kill', () => {
     /** Every arm the outage state's trigger sink received. */
     let armed: Array<{ key: string; kind: string }>
     /** Every report the outage state's unclassified sink received. */
     let reported: string[]
+    /** Every post the installed kill-failure alerts made. */
+    let alertPosts: Array<{ key: string; text: string }>
 
     beforeEach(() => {
       armed = []
       reported = []
+      alertPosts = []
       initOutageState({
         getClient,
         notify: (key, text) => { outageEmissions.push({ key, text }) },
         triggerSink: { arm: (key, cause) => { armed.push({ key, kind: cause.kind }); return true } },
         unclassifiedSink: { report: (key) => { reported.push(key) } },
       })
+      setKillFailureAlerts(
+        createKillFailureAlerts({
+          episodes: createPersonaEpisodes({ sink: (key, text) => { alertPosts.push({ key, text }) }, log: () => {}, clock: createFakeClock() }),
+          log: () => {},
+        }),
+      )
     })
 
+    afterEach(() => {
+      setKillFailureAlerts(undefined)
+      expect(alertPosts).toEqual([])
+    })
+
+    /** What one stub-driven sweep did. */
+    interface StubSweep {
+      readonly result: Awaited<ReturnType<typeof reconcileOrphans>>
+      readonly rows: readonly import('agent-director').ListRow[]
+      readonly killCalls: string[]
+      readonly statusCalls: string[]
+      readonly deleteCalls: string[][]
+      readonly findMissingCalls: number
+      readonly clock: FakeClock
+      readonly errLog: string
+      readonly entries: string
+      readonly latch: ConflictLatch
+    }
+
     /**
-     * Sweep one row (`id`, labelled `persona`, listed in `state`) whose kill
-     * and between-try reads are scripted by `script`, its kill retries on a
-     * fake clock (b.jg5 SRJ-702); returns the result, the calls, the log and
-     * the startup-errors entries.
+     * Sweep `rows` (built over `sweepConfig`'s personas) with the stub
+     * answering `script`, its kill retries on a fake clock (b.jg5 SRJ-702),
+     * the server's latch and configured-persona query installed; answers the
+     * calls by instance id, the log and the startup-errors entries, leak-checked.
      */
-    async function sweepOne(
-      id: string,
-      persona: string,
+    async function sweepListed(
+      rows: (cfg: PersonaConfig, home: string) => import('agent-director').ListRow[],
       script: Pick<StubClientOptions, 'killError' | 'killResult' | 'killQueue' | 'statusQueue' | 'statusError'>,
-      state = 'waiting',
-    ): Promise<{ result: Awaited<ReturnType<typeof reconcileOrphans>>; killCalls: string[]; statusCalls: string[]; deleteCalls: string[][]; errLog: string; entries: string; latch: ConflictLatch }> {
+    ): Promise<StubSweep> {
       const readLog = captureStartupErrors()
       const { cfg, home } = sweepConfig()
       const latch = createConflictLatch({ log: () => {} })
       setConflictLatch(latch)
       setConfiguredPersonaQuery((key) => cfg.personas.some((p) => p.key === key))
+      const listed = rows(cfg, home)
       const killCalls: import('agent-director').KillParams[] = []
       const statusCalls: import('agent-director').StatusParams[] = []
       const deleteCalls: import('agent-director').DeleteParams[] = []
-      installStub({
-        killCalls,
-        statusCalls,
-        deleteCalls,
-        listResult: { spawns: [cannedListRow({ claude_instance_id: id, state, labels: { service: 'cscb', persona } }, personaOf(cfg, 'alpha'), home)] },
-        ...script,
-      })
+      const findMissingCalls: import('agent-director').FindMissingParams[] = []
+      installStub({ killCalls, statusCalls, deleteCalls, findMissingCalls, listResult: { spawns: listed }, ...script })
+      const clock = createFakeClock()
       let result!: Awaited<ReturnType<typeof reconcileOrphans>>
       const errLog = await withCapturedErr(async () => {
-        result = await reconcileOnClock(cfg)
+        result = await reconcileOnClock(cfg, clock)
       })
+      const entries = readLog()
+      assertNoLeak({ errLog, entries, outageEmissions, notices })
       return {
         result,
+        rows: listed,
         killCalls: killCalls.map((k) => k.claude_instance_id),
         statusCalls: statusCalls.map((c) => c.claude_instance_id),
         deleteCalls: deleteCalls.map((d) => d.claude_instance_id),
+        findMissingCalls: findMissingCalls.length,
+        clock,
         errLog,
-        entries: readLog(),
+        entries,
         latch,
       }
     }
 
-    /** The `orphan-cleanup` entry for a swept row whose kill answered `outcome`. */
-    const keptEntry = (id: string, persona: string, outcome: KillOutcome): string =>
-      `kill did not succeed for orphan instanceId=${id} persona=${persona}: ${describeKillOutcome(outcome)}; row kept, no delete was made, its session may still be running`
+    /** Sweep alpha's one swept row `id` labelled `persona`, listed `state`, its kill and reads scripted by `script`. */
+    function sweepOne(
+      id: string,
+      persona: string,
+      script: Pick<StubClientOptions, 'killError' | 'killResult' | 'killQueue' | 'statusQueue' | 'statusError'>,
+      state = 'waiting',
+    ): Promise<StubSweep> {
+      return sweepListed((cfg, home) => [sweptRow(cfg, home, id, persona, state)], script)
+    }
 
-    test.each<[string, () => Error]>([
-      ...KILL_FAILED_DESCRIPTIONS.map((d): [string, () => Error] => [`ErrTmuxKillFailed (${d})`, () => errTmuxKillFailed(undefined, d)]),
-      ['ErrTmuxUnresponsive', () => errTmuxUnresponsive('kill')],
-      ['ErrTmuxSessionConflict (not this launch\'s session)', () => errTmuxSessionConflict('kill', 'not-this-launch')],
-      ['ErrTmuxSessionConflict (conflicting labels)', () => errTmuxSessionConflict('kill', 'conflicting-labels')],
-      ['ErrTmuxNotAvailable', () => errTmuxNotAvailable(undefined, 'kill')],
-      ['ErrInternal', () => errInternal()],
-      ['ErrUnknownErrorName', () => errUnknownErrorName()],
-      ['ErrCallTimeout', () => errCallTimeout('kill')],
-      ['an UNUSABLE NAME ErrInternal', () => errUnusableName()],
-      ['ErrConfigMalformed', () => errConfigMalformed()],
-      ['another error (ErrKillBroken)', () => errGeneric('kill', 'ErrKillBroken')],
+    /**
+     * How a sweep kill's tries end, the stub answering `script`: the outcome
+     * that stands, the kills and reads made, whether its success stands, and
+     * the alert SRJ-714 calls for (the ordinary version's quotes, or the
+     * survivor version's description).
+     */
+    interface SweepKillScenario {
+      readonly script: Pick<StubClientOptions, 'killError' | 'killResult' | 'killQueue' | 'statusQueue'>
+      readonly standing: KillOutcome
+      readonly tries: number
+      readonly reads: number
+      readonly killed: boolean
+      readonly ordinary?: SweepOrdinaryQuotes
+      readonly survivorDescription?: string
+    }
+
+    /** A kill answering `err` at every try: tried again only while UNAVAILABLE (b.jg5 SRJ-702); the ordinary version for an `ErrTmuxKillFailed`. */
+    function failingAtEveryTry(err: Error): SweepKillScenario {
+      const standing = killOutcomeOf({ thrown: err })
+      const tries = standing.kind === KILL_OUTCOME_NOT_KILLED && standing.errorClass === AD_ERROR_CLASS_UNAVAILABLE ? KILL_RETRY_TRIES : 1
+      const description = killFailedDescriptionOf(err)
+      return {
+        script: { killError: err },
+        standing,
+        tries,
+        reads: tries - 1,
+        killed: false,
+        ...(description === undefined ? {} : { ordinary: { lastKillFailedDescription: description } }),
+      }
+    }
+
+    /** A kill whose first try succeeds with `outcome`. */
+    function succeeding(script: SweepKillScenario['script'], standing: KillOutcome): SweepKillScenario {
+      return { script, standing, tries: 1, reads: 0, killed: true }
+    }
+
+    /** A survivor-naming `ErrTmuxKillFailed`, its session carrying the sentinel. */
+    const survivorNaming = (label: string): Error => errTmuxKillFailed(sentinelInMessage(label), 'pane-process-survived')
+
+    /** Every kill outcome at one live row (b.jg5 SRJ-714's test, HO C2's non-success list, SRJ-1002's CONFLICT and UNUSABLE NAME). */
+    const SWEEP_KILL_SCENARIOS: ReadonlyArray<readonly [string, () => SweepKillScenario]> = [
+      ['succeeds with kill_sent true', () => succeeding({ killResult: cannedKillResult(true) }, { kind: KILL_OUTCOME_KILLED, killSent: true })],
+      ['succeeds with kill_sent false', () => succeeding({ killResult: cannedKillResult(false) }, { kind: KILL_OUTCOME_KILLED, killSent: false })],
+      ['succeeds with no kill_sent', () => succeeding({ killResult: cannedKillResult() }, { kind: KILL_OUTCOME_KILLED })],
+      ['answers ErrSpawnNotFound', () => succeeding({ killError: errSpawnNotFound() }, { kind: KILL_OUTCOME_ROW_GONE })],
+      // b.jg5 SRJ-104, SRJ-110: for `kill`, gone is success.
+      ['answers GONE (ErrTmuxCaptureFailed)', () => succeeding({ killError: errTmuxCaptureFailed(undefined, 'kill') }, { kind: KILL_OUTCOME_SESSION_GONE, name: errTmuxCaptureFailed().errName })],
+      ['answers GONE (ErrTmuxSendKeys)', () => succeeding({ killError: errTmuxSendKeys() }, { kind: KILL_OUTCOME_SESSION_GONE, name: errTmuxSendKeys().errName })],
+      ...KILL_FAILED_DESCRIPTIONS.map((d) => [`answers ErrTmuxKillFailed (${d})`, () => failingAtEveryTry(errTmuxKillFailed(sentinelInMessage(`sweep-${d}`), d))] as const),
+      ['answers ErrTmuxUnresponsive', () => failingAtEveryTry(errTmuxUnresponsive('kill'))],
+      ['answers ErrTmuxSessionConflict (not this launch\'s session), CONFLICT', () => failingAtEveryTry(errTmuxSessionConflict('kill', 'not-this-launch'))],
+      ['answers ErrTmuxSessionConflict (conflicting labels), CONFLICT', () => failingAtEveryTry(errTmuxSessionConflict('kill', 'conflicting-labels'))],
+      ['answers ErrTmuxNotAvailable', () => failingAtEveryTry(errTmuxNotAvailable(undefined, 'kill'))],
+      ['answers ErrInternal', () => failingAtEveryTry(errInternal())],
+      ['answers ErrUnknownErrorName', () => failingAtEveryTry(errUnknownErrorName())],
+      ['answers ErrCallTimeout', () => failingAtEveryTry(errCallTimeout('kill'))],
+      ['answers an UNUSABLE NAME ErrInternal', () => failingAtEveryTry(errUnusableName())],
+      ['answers ErrConfigMalformed', () => failingAtEveryTry(errConfigMalformed())],
+      ['answers another error (ErrKillBroken)', () => failingAtEveryTry(errGeneric('kill', 'ErrKillBroken'))],
       // b.jg5 SRJ-110: a class the kill has no row for is UNCLASSIFIED; the sweep arms nothing for it.
-      ['a STATE name (ErrInstanceIdCollision), UNCLASSIFIED', () => errInstanceIdCollision()],
-      ['a STATE name (ErrSpawnNotResumable), UNCLASSIFIED', () => errSpawnNotResumable()],
-      ['a LAUNCH FAILURE name (ErrTmuxSessionCreate), UNCLASSIFIED', () => errTmuxSessionCreate('kill')],
-    ])('a configured persona\'s swept row whose kill answers %s (at every try, b.jg5 SRJ-702: only UNAVAILABLE is tried again): kept, no delete call, counted failed, one orphan-cleanup entry naming the outcome that stands; nothing latches, no retry timer, no unclassified report', async (_label, make) => {
-      const err = make()
-      const outcome = killOutcomeOf({ thrown: err })
-      const tries = outcome.kind === KILL_OUTCOME_NOT_KILLED && outcome.errorClass === AD_ERROR_CLASS_UNAVAILABLE ? KILL_RETRY_TRIES : 1
+      ['answers a STATE name (ErrInstanceIdCollision), UNCLASSIFIED', () => failingAtEveryTry(errInstanceIdCollision())],
+      ['answers a STATE name (ErrSpawnNotResumable), UNCLASSIFIED', () => failingAtEveryTry(errSpawnNotResumable())],
+      ['answers a LAUNCH FAILURE name (ErrTmuxSessionCreate), UNCLASSIFIED', () => failingAtEveryTry(errTmuxSessionCreate('kill'))],
+      ['answers a survivor-naming ErrTmuxKillFailed, then succeeds after a read of waiting', () => {
+        const survivor = survivorNaming('sweep-survivor-then-killed')
+        return {
+          script: { killQueue: [cannedErr(survivor), cannedOk(cannedKillResult(true))] },
+          standing: { kind: KILL_OUTCOME_KILLED, killSent: true },
+          tries: 2,
+          reads: 1,
+          killed: true,
+          survivorDescription: killFailedDescriptionOf(survivor)!,
+        }
+      }],
+      ['answers a survivor-naming ErrTmuxKillFailed, then a read of ended ends the tries', () => {
+        const survivor = survivorNaming('sweep-survivor-then-ended')
+        return {
+          script: { killQueue: [cannedErr(survivor)], statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))] },
+          standing: { kind: KILL_OUTCOME_ROW_FINISHED, read: KILL_ROW_FINISHED_ENDED },
+          tries: 1,
+          reads: 1,
+          killed: true,
+          survivorDescription: killFailedDescriptionOf(survivor)!,
+        }
+      }],
+      ['answers a survivor-naming ErrTmuxKillFailed, then ErrTmuxUnresponsive to the end', () => {
+        const survivor = survivorNaming('sweep-survivor-then-unresponsive')
+        const last = errTmuxUnresponsive('kill')
+        return {
+          script: { killQueue: [cannedErr(survivor), cannedErr(last), cannedErr(last)] },
+          standing: killOutcomeOf({ thrown: last }),
+          tries: KILL_RETRY_TRIES,
+          reads: KILL_RETRY_TRIES - 1,
+          killed: false,
+          ordinary: { earlierSurvivorDescription: killFailedDescriptionOf(survivor)! },
+        }
+      }],
+    ]
 
-      const r = await sweepOne('cscb_alpha_old', 'alpha', { killError: err })
+    /** The two kinds of live stray: alpha's swept row under another instance id (named as the sweep names it), and a pre-persona row. */
+    const STRAY_ROWS: ReadonlyArray<readonly [string, (cfg: PersonaConfig, home: string) => import('agent-director').ListRow, string | undefined]> = [
+      ['a configured persona\'s swept row', (cfg, home) => cannedListRow({ claude_instance_id: 'cscb_alpha_old' }, personaOf(cfg, 'alpha'), home), renderPersonaRef('alpha', 'alpha')],
+      ['a live pre-persona row', () => prePersonaRow('waiting'), undefined],
+    ]
 
-      expect(r.result).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
-      expect(r.killCalls).toEqual(Array.from({ length: tries }, () => 'cscb_alpha_old'))
-      expect(r.statusCalls).toEqual(Array.from({ length: tries - 1 }, () => 'cscb_alpha_old'))
-      expect(r.deleteCalls).toEqual([])
-      expect(countStartupEntries(r.entries, ORPHAN_CLEANUP_LABEL)).toBe(1)
-      expect(r.entries).toContain(keptEntry('cscb_alpha_old', renderPersonaRef('alpha', 'alpha'), killOutcomeOf({ thrown: err })))
-      expect(r.latch.isLatched('alpha')).toBe(false)
-      expect(armed).toEqual([])
-      expect(reported).toEqual([])
-      assertNoLeak({ errLog: r.errLog, entries: r.entries })
+    test.each(STRAY_ROWS.flatMap(([rowLabel, row, persona]) => SWEEP_KILL_SCENARIOS.map(([label, scenario]) => [rowLabel, label, row, persona, scenario] as const)))(
+      '%s whose kill %s: no delete; counted killed or kept with a failed kill in its sub-count, the summary line agreeing; an orphan-cleanup entry for a failed kill, with the ordinary text only where SRJ-714 says, and a persona-kill-survivor entry only for a success after a survivor-naming try; one find-missing; nothing latched, posted, armed or reported',
+      async (_rowLabel, _label, row, persona, scenario) => {
+        const s = scenario()
+
+        const r = await sweepListed((cfg, home) => [row(cfg, home)], s.script)
+        const listed = r.rows[0]!
+        const id = listed.claude_instance_id
+
+        expect(r.deleteCalls).toEqual([])
+        expect(r.killCalls).toEqual(Array.from({ length: s.tries }, () => id))
+        expect(r.statusCalls).toEqual(Array.from({ length: s.reads }, () => id))
+        const expected = sweepResult(s.killed ? { listed: 1, killed: 1 } : { listed: 1, kept: 1, killFailed: 1 })
+        expect(r.result).toEqual(expected)
+        expectSummaryLast(r.errLog, expected)
+        // b.jg5 SRJ-714, SRJ-120: a kill was made, whatever its outcome, so one run follows.
+        expect(r.findMissingCalls).toBe(1)
+        expect(startupEntriesIn(r.entries, ORPHAN_CLEANUP_LABEL)).toEqual(s.killed ? [] : [sweepKillFailedEntry(listed, persona, s.standing, s.ordinary)])
+        expect(startupEntriesIn(r.entries, PERSONA_KILL_SURVIVOR_LABEL)).toEqual(s.survivorDescription === undefined ? [] : [sweepSurvivorEntry(listed, s.survivorDescription)])
+        if (s.killed) expect(r.errLog.split('\n')).toContain(sweepKillSucceededLine(listed, persona, s.standing))
+        expect(r.latch.isLatched('alpha')).toBe(false)
+        expect(notices).toEqual([])
+        expect(armed).toEqual([])
+        expect(reported).toEqual([])
+      },
+    )
+
+    test('a survivor-naming description and an ErrTmuxKillFailed session reach the entries redacted', async () => {
+      const r = await sweepOne('cscb_alpha_old', 'alpha', { killError: survivorNaming('sweep-redacted') })
+
+      expect(r.entries).toContain(REDACTED_SENTINEL_TAIL)
     })
 
-    test.each<[string, Pick<StubClientOptions, 'killError' | 'killResult'>, KillOutcome]>([
-      ['succeeds with kill_sent true', { killResult: cannedKillResult(true) }, { kind: KILL_OUTCOME_KILLED, killSent: true }],
-      ['succeeds with kill_sent false', { killResult: cannedKillResult(false) }, { kind: KILL_OUTCOME_KILLED, killSent: false }],
-      ['succeeds with no kill_sent', { killResult: cannedKillResult() }, { kind: KILL_OUTCOME_KILLED }],
-      ['answers ErrSpawnNotFound', { killError: errSpawnNotFound() }, { kind: KILL_OUTCOME_ROW_GONE }],
-      // b.jg5 SRJ-104, SRJ-110: for `kill`, gone is success.
-      ['answers GONE (ErrTmuxCaptureFailed), the session-gone success', { killError: errTmuxCaptureFailed(undefined, 'kill') }, { kind: KILL_OUTCOME_SESSION_GONE, name: errTmuxCaptureFailed().errName }],
-      ['answers GONE (ErrTmuxSendKeys), the session-gone success', { killError: errTmuxSendKeys() }, { kind: KILL_OUTCOME_SESSION_GONE, name: errTmuxSendKeys().errName }],
-    ])('b.jg5 SRJ-701, SRJ-104: a swept row whose kill %s: deleted as before, with one line naming the outcome; no orphan-cleanup entry', async (_label, kill, outcome) => {
-      const r = await sweepOne('cscb_alpha_old', 'alpha', kill)
+    // b.jg5 SRJ-1002, SRJ-512 (the E16 and E20 hatch notes): a CONFLICT or
+    // an UNUSABLE NAME answer at the kill of a configured persona's own row
+    // swept for its cwd latches no one, though the row is the persona's own.
+    test.each<[string, () => Error]>([
+      ['ErrTmuxSessionConflict (not this launch\'s session)', () => errTmuxSessionConflict('kill', 'not-this-launch')],
+      ['ErrTmuxSessionConflict (conflicting labels)', () => errTmuxSessionConflict('kill', 'conflicting-labels')],
+      ['an UNUSABLE NAME ErrInternal', () => errUnusableName()],
+    ])('the kill of alpha\'s own row in another cwd answers %s: no latch, no post, no retry timer, no delete; one orphan-cleanup entry', async (_label, make) => {
+      const err = make()
 
-      expect(r.result).toEqual({ found: 1, killed: 1, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
-      expect(r.deleteCalls).toEqual([['cscb_alpha_old']])
-      expect(r.errLog).toContain(`reconcileOrphans: kill succeeded for orphan instanceId=cscb_alpha_old (${describeKillOutcome(outcome)}) — deleting the row`)
-      expect(countStartupEntries(r.entries, ORPHAN_CLEANUP_LABEL)).toBe(0)
-      expect(armed).toEqual([])
+      const r = await sweepListed((cfg, home) => [cannedListRow({ cwd: fixtureSubdir('elsewhere') }, personaOf(cfg, 'alpha'), home)], { killError: err })
+
+      expect(r.killCalls).toEqual(['cscb_alpha'])
+      expect(r.deleteCalls).toEqual([])
+      expect(startupEntriesIn(r.entries, ORPHAN_CLEANUP_LABEL)).toEqual([sweepKillFailedEntry(r.rows[0]!, renderPersonaRef('alpha', 'alpha'), killOutcomeOf({ thrown: err }))])
+      expect(r.latch.isLatched('alpha')).toBe(false)
+      expect([notices, outageEmissions, armed, reported]).toEqual([[], [], [], []])
     })
 
     describe('an ErrInvalidFlags at a sweep kill (b.jg5 SRJ-104, SRJ-204, SRJ-205)', () => {
@@ -4915,7 +5115,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
         resetAdVersionRecheckForTests()
       })
 
-      test('the re-check passes → exactly one re-check, no stop; the row kept (no delete), counted failed, one orphan-cleanup entry naming the UNCLASSIFIED outcome and its re-check; nothing armed or reported', async () => {
+      test('the re-check passes → exactly one re-check, no stop; the row kept (no delete), counted kept with a failed kill, one orphan-cleanup entry naming the UNCLASSIFIED outcome and its re-check; nothing armed or reported', async () => {
         installRecheck({ version: PHASE1_RC_VERSION })
         const err = errInvalidFlags('kill')
 
@@ -4923,17 +5123,17 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
 
         expect(resolveCalls).toHaveLength(1)
         expect(stops).toEqual([])
-        expect(r.result).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
+        expect(r.result).toEqual(sweepResult({ listed: 1, kept: 1, killFailed: 1 }))
         expect(r.deleteCalls).toEqual([])
-        expect(r.entries).toContain(
-          keptEntry('cscb_alpha_old', renderPersonaRef('alpha', 'alpha'), { ...killOutcomeOf({ thrown: err }), recheck: RECHECK_OUTCOME_PASS } as KillOutcome),
-        )
+        expect(startupEntriesIn(r.entries, ORPHAN_CLEANUP_LABEL)).toEqual([
+          sweepKillFailedEntry(r.rows[0]!, renderPersonaRef('alpha', 'alpha'), { ...killOutcomeOf({ thrown: err }), recheck: RECHECK_OUTCOME_PASS } as KillOutcome),
+        ])
         expect(armed).toEqual([])
         expect(reported).toEqual([])
         expect(r.latch.isLatched('alpha')).toBe(false)
       })
 
-      test('the re-check decides that the server stops → exactly one re-check and one stop; the sweep stops: no delete, no further row handled, no findMissing sweep; no orphan-cleanup entry; one stop line; the summary still logged', async () => {
+      test('the re-check decides that the server stops → exactly one re-check and one stop; the sweep stops: no delete, no further row handled, no findMissing sweep; one stop line; one orphan-cleanup entry for the stopped row with no alert text; the summary still logged, the unreached row kept', async () => {
         installRecheck({ version: OLD_AD_VERSION })
         const readLog = captureStartupErrors()
         const { cfg, home } = sweepConfig()
@@ -4941,19 +5141,19 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
         const killCalls: import('agent-director').KillParams[] = []
         const deleteCalls: import('agent-director').DeleteParams[] = []
         const callLog: string[] = []
+        const err = errInvalidFlags('kill')
+        const spawns = [
+          prePersonaRow('waiting'),
+          cannedListRow({ claude_instance_id: 'cscb_alpha_old' }, alpha, home),
+          cannedListRow({ claude_instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' } }, alpha, home),
+        ]
         installStub({
           killCalls,
           deleteCalls,
           callLog,
           // The live pre-persona row's kill succeeds; the swept row's answers ErrInvalidFlags; the last row is never reached.
-          killQueue: [cannedOk(cannedKillResult(true)), cannedErr(errInvalidFlags('kill')), cannedOk(cannedKillResult(true))],
-          listResult: {
-            spawns: [
-              prePersonaRow('waiting'),
-              cannedListRow({ claude_instance_id: 'cscb_alpha_old' }, alpha, home),
-              cannedListRow({ claude_instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' } }, alpha, home),
-            ],
-          },
+          killQueue: [cannedOk(cannedKillResult(true)), cannedErr(err), cannedOk(cannedKillResult(true))],
+          listResult: { spawns },
         })
 
         let result!: Awaited<ReturnType<typeof reconcileOrphans>>
@@ -4966,34 +5166,40 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
         expect(killCalls.map((k) => k.claude_instance_id)).toEqual(['cscb_old_waiting_C0OLD', 'cscb_alpha_old'])
         expect(deleteCalls).toEqual([])
         expect(callLog).toEqual([])
-        expect(result).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 1, live: 1, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
-        const entries = readLog()
-        expect(countStartupEntries(entries, ORPHAN_CLEANUP_LABEL)).toBe(0)
-        const stopLines = errLog.split('\n').filter((l) => l.includes('the version re-check decided that the server stops'))
-        expect(stopLines).toHaveLength(1)
-        expect(stopLines[0]).toContain('reconcileOrphans: kill did not succeed for instanceId=cscb_alpha_old: ')
-        expect(stopLines[0]).toContain(`recheck=${RECHECK_OUTCOME_STOP}`)
-        expect(errLog).toContain('reconcileOrphans: found=1 killed=0 failed=1; pre-persona rows kept=1 live=1 kill-failed=0')
-        expect(errLog).not.toContain('instanceId=cscb_departed')
+        expect(result).toEqual(sweepResult({ listed: 3, killed: 1, kept: 2, killFailed: 1 }))
+        const standing = { ...killOutcomeOf({ thrown: err }), recheck: RECHECK_OUTCOME_STOP } as KillOutcome
+        const recheckStopped: KillRetryResult = { outcome: standing, end: KILL_RETRY_END_SETTLED, tries: 1, reads: 0, alert: { kind: KILL_RETRY_ALERT_NONE } }
+        expect(errLog.split('\n').filter((l) => l.includes('the version re-check decided that the server stops'))).toEqual([
+          startSweepStoppedKillLine('cscb_alpha_old', renderPersonaRef('alpha', 'alpha'), recheckStopped, START_SWEEP_KILL_STOP_RECHECK),
+        ])
+        // The re-check's stop is its one line; no shutdown stop line.
+        expect(errLog).not.toContain(START_SWEEP_SHUTDOWN_STOP_LINE)
+        expect(startupEntriesIn(readLog(), ORPHAN_CLEANUP_LABEL)).toEqual([
+          sweepKillFailedEntry(spawns[1]!, renderPersonaRef('alpha', 'alpha'), standing, undefined, true),
+        ])
+        expectSummaryLast(errLog, result)
+        expect(errLog).not.toContain('instanceId=cscb_departed state=')
         expect(armed).toEqual([])
         expect(reported).toEqual([])
       })
 
-      test('a live pre-persona row\'s kill whose re-check decides that the server stops → one re-check and one stop; the row kept (kill-failed 1), no orphan-cleanup entry, no further row handled and no findMissing sweep', async () => {
+      test('a live pre-persona row\'s kill whose re-check decides that the server stops → one re-check and one stop; the row kept (kill-failed 1) with one orphan-cleanup entry and no alert text, no further row handled and no findMissing sweep', async () => {
         installRecheck({ version: OLD_AD_VERSION })
         const readLog = captureStartupErrors()
         const { cfg } = sweepConfig()
         const killCalls: import('agent-director').KillParams[] = []
         const deleteCalls: import('agent-director').DeleteParams[] = []
         const callLog: string[] = []
+        const err = errInvalidFlags('kill')
+        const legacy = prePersonaRow('waiting')
         installStub({
           killCalls,
           deleteCalls,
           callLog,
-          killQueue: [cannedErr(errInvalidFlags('kill')), cannedOk(cannedKillResult(true))],
+          killQueue: [cannedErr(err), cannedOk(cannedKillResult(true))],
           listResult: {
             spawns: [
-              prePersonaRow('waiting'),
+              legacy,
               cannedListRow({ claude_instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' } }),
             ],
           },
@@ -5009,18 +5215,51 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
         expect(killCalls.map((k) => k.claude_instance_id)).toEqual(['cscb_old_waiting_C0OLD'])
         expect(deleteCalls).toEqual([])
         expect(callLog).toEqual([])
-        expect(result).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 1, live: 1, killFailed: 1 }, recordedAsRetired: 0, leftForLatch: 0 })
-        expect(countStartupEntries(readLog(), ORPHAN_CLEANUP_LABEL)).toBe(0)
+        expect(result).toEqual(sweepResult({ listed: 2, kept: 2, killFailed: 1 }))
         expect(errLog.split('\n').filter((l) => l.includes('the version re-check decided that the server stops'))).toHaveLength(1)
+        expect(startupEntriesIn(readLog(), ORPHAN_CLEANUP_LABEL)).toEqual([
+          sweepKillFailedEntry(legacy, undefined, { ...killOutcomeOf({ thrown: err }), recheck: RECHECK_OUTCOME_STOP } as KillOutcome, undefined, true),
+        ])
+      })
+
+      // b.jg5 SRJ-205, SRJ-702, SRJ-714 (PM finding F1): a re-check stop after
+      // a survivor-naming try is a kill a shutdown stopped, so its one line
+      // quotes that survivor; the entry carries no alert text.
+      test('a survivor-naming ErrTmuxKillFailed, then an ErrInvalidFlags whose re-check decides that the server stops: one stopped line quoting the redacted survivor description, with the re-check\'s cause; the orphan-cleanup entry has no alert text and there is no persona-kill-survivor entry', async () => {
+        installRecheck({ version: OLD_AD_VERSION })
+        const survivor = survivorNaming('sweep-recheck-stop-survivor')
+        const err = errInvalidFlags('kill')
+
+        const r = await sweepOne('cscb_alpha_old', 'alpha', { killQueue: [cannedErr(survivor), cannedErr(err)] })
+
+        expect([r.killCalls, r.statusCalls]).toEqual([['cscb_alpha_old', 'cscb_alpha_old'], ['cscb_alpha_old']])
+        expect([resolveCalls, stops].map((calls) => calls.length)).toEqual([1, 1])
+        expect(r.result).toEqual(sweepResult({ listed: 1, kept: 1, killFailed: 1 }))
+        const ref = renderPersonaRef('alpha', 'alpha')
+        const standing = { ...killOutcomeOf({ thrown: err }), recheck: RECHECK_OUTCOME_STOP } as KillOutcome
+        const retried: KillRetryResult = {
+          outcome: standing,
+          end: KILL_RETRY_END_SETTLED,
+          tries: 2,
+          reads: 1,
+          alert: { kind: KILL_RETRY_ALERT_ORDINARY, earlierSurvivorDescription: killFailedDescriptionOf(survivor)! },
+        }
+        const stoppedLines = r.errLog.split('\n').filter((l) => l.startsWith('[slack] reconcileOrphans: kill tries for ') && l.includes(' were stopped: '))
+        expect(stoppedLines).toEqual([startSweepStoppedKillLine('cscb_alpha_old', ref, retried, START_SWEEP_KILL_STOP_RECHECK)])
+        expect(stoppedLines[0]).toContain(REDACTED_SENTINEL_TAIL)
+        expect(startupEntriesIn(r.entries, ORPHAN_CLEANUP_LABEL)).toEqual([sweepKillFailedEntry(r.rows[0]!, ref, standing, undefined, true)])
+        expect(startupEntriesIn(r.entries, PERSONA_KILL_SURVIVOR_LABEL)).toEqual([])
+        expect(r.findMissingCalls).toBe(0)
+        expect([armed, reported]).toEqual([[], []])
       })
     })
 
-    // b.jg5 SRJ-110, SRJ-301 (hatch A3): an ENVIRONMENT or CONFIG answer at a
-    // start-sweep kill arms no retry timer and deletes nothing. It raises
-    // the row's persona's outage (`tmux-unavailable`, `ad-config-malformed`)
-    // only when that persona is in the applied configuration; for an absent
-    // persona's row it is only logged and recorded in the row's
-    // `orphan-cleanup` entry.
+    // b.jg5 SRJ-110, SRJ-301, SRJ-714 (hatch A3; the E11 and E12 hatch
+    // notes): an ENVIRONMENT or CONFIG answer at a start-sweep kill arms no
+    // retry timer and deletes nothing. It raises the row's persona's outage
+    // (`tmux-unavailable`, `ad-config-malformed`) only when that persona is
+    // in the applied configuration; for an absent persona's row it is only
+    // logged and recorded in the row's `orphan-cleanup` entry.
     test.each<[string, string, string, boolean, OutageClass, () => Error]>([
       ['ENVIRONMENT', 'alpha', 'cscb_alpha_old', true, 'tmux-unavailable', () => errTmuxNotAvailable(undefined, 'kill')],
       ['ENVIRONMENT', 'departed', 'cscb_departed', false, 'tmux-unavailable', () => errTmuxNotAvailable(undefined, 'kill')],
@@ -5032,58 +5271,24 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
       const r = await sweepOne(id, persona, { killError: err })
 
       expect(r.deleteCalls).toEqual([])
-      expect(r.result.failed).toBe(1)
+      expect(r.result).toEqual(sweepResult({ listed: 1, kept: 1, killFailed: 1 }))
       const shown = configured ? renderPersonaRef('alpha', 'alpha') : persona
-      expect(r.entries).toContain(keptEntry(id, shown, killOutcomeOf({ thrown: err })))
+      expect(startupEntriesIn(r.entries, ORPHAN_CLEANUP_LABEL)).toEqual([sweepKillFailedEntry(r.rows[0]!, shown, killOutcomeOf({ thrown: err }))])
       expect(armed).toEqual([])
+      expect(r.clock.pendingCount()).toBe(0)
       expect([...getOutageFlags(persona)]).toEqual(configured ? [flag] : [])
       expect(outageEmissions.map((e) => e.key)).toEqual(configured ? [persona] : [])
       for (const key of ['beta', 'gamma']) expect(getOutageFlags(key).size).toBe(0)
-      assertNoLeak({ errLog: r.errLog, entries: r.entries, outageEmissions })
     })
 
     // b.jg5 SRJ-702 (AC 56, AC 84): each sweep kill of a row listed live is
     // tried up to 3 times 2 s apart, with one bare `status` read of the row
     // before each further try, on the sweep's clock and with one pass budget:
     // once a row has used its tries on UNAVAILABLE, every later kill in the
-    // pass is made once.
+    // pass is made once. A row listed finished is never killed (SRJ-714).
     describe('b.jg5 SRJ-702: the sweep\'s kills take the bounded retry with one pass budget (AC 56, AC 84)', () => {
-      /** Sweep `rows` with the stub answering `script`, on a fake clock; the calls by instance id, the clock, the log and the result. */
-      async function sweepRows(
-        rows: (cfg: PersonaConfig, home: string) => import('agent-director').ListRow[],
-        script: Pick<StubClientOptions, 'killError' | 'killQueue' | 'statusQueue' | 'statusError'>,
-      ): Promise<{ result: Awaited<ReturnType<typeof reconcileOrphans>>; killCalls: string[]; statusCalls: string[]; deleteCalls: string[][]; clock: FakeClock; errLog: string; entries: string }> {
-        const readLog = captureStartupErrors()
-        const { cfg, home } = sweepConfig()
-        setConfiguredPersonaQuery((key) => cfg.personas.some((p) => p.key === key))
-        const killCalls: import('agent-director').KillParams[] = []
-        const statusCalls: import('agent-director').StatusParams[] = []
-        const deleteCalls: import('agent-director').DeleteParams[] = []
-        installStub({ killCalls, statusCalls, deleteCalls, listResult: { spawns: rows(cfg, home) }, ...script })
-        const clock = createFakeClock()
-        let result!: Awaited<ReturnType<typeof reconcileOrphans>>
-        const errLog = await withCapturedErr(async () => {
-          result = await reconcileOnClock(cfg, clock)
-        })
-        const entries = readLog()
-        assertNoLeak({ errLog, entries, outageEmissions })
-        return {
-          result,
-          killCalls: killCalls.map((k) => k.claude_instance_id),
-          statusCalls: statusCalls.map((c) => c.claude_instance_id),
-          deleteCalls: deleteCalls.map((d) => d.claude_instance_id),
-          clock,
-          errLog,
-          entries,
-        }
-      }
-
-      /** A swept row of persona `persona` (`alpha`'s directory), id `id`, listed `state`. */
-      const sweptRow = (cfg: PersonaConfig, home: string, id: string, persona: string, state = 'waiting'): import('agent-director').ListRow =>
-        cannedListRow({ claude_instance_id: id, state, labels: { service: 'cscb', persona } }, personaOf(cfg, 'alpha'), home)
-
       test('tmux wedged at start: the first live row gets the exported try count, every later live row (swept or pre-persona) one kill; the pass takes no more virtual time than one row\'s retries; nothing deleted, nothing armed', async () => {
-        const r = await sweepRows(
+        const r = await sweepListed(
           (cfg, home) => [sweptRow(cfg, home, 'cscb_alpha_old', 'alpha'), prePersonaRow('waiting'), sweptRow(cfg, home, 'cscb_departed', 'departed')],
           { killError: errTmuxUnresponsive('kill') },
         )
@@ -5092,7 +5297,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
         expect(r.statusCalls).toEqual(Array.from({ length: KILL_RETRY_TRIES - 1 }, () => 'cscb_alpha_old'))
         expect(r.clock.now()).toBe((KILL_RETRY_TRIES - 1) * KILL_RETRY_SPACING_MS)
         expect(r.deleteCalls).toEqual([])
-        expect(r.result).toEqual({ found: 2, killed: 0, failed: 2, prePersona: { kept: 1, live: 1, killFailed: 1 }, recordedAsRetired: 0, leftForLatch: 0 })
+        expect(r.result).toEqual(sweepResult({ listed: 3, kept: 3, killFailed: 3 }))
         expect(armed).toEqual([])
       })
 
@@ -5116,23 +5321,26 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
         assertNoLeak({ errLog, entries: readLog() })
       })
 
-      test('a first row whose tries end in a success leaves the budget unspent, so a later row still gets its tries; a row listed ended gets one kill and no read', async () => {
+      test('a first row whose tries end in a success leaves the budget unspent, so a later row still gets its tries; a row listed ended gets no kill and no read', async () => {
         const unresponsive = (): CannedResponse<Phase1KillResult> => cannedErr(errTmuxUnresponsive('kill'))
-        const r = await sweepRows(
+        const r = await sweepListed(
           (cfg, home) => [
             sweptRow(cfg, home, 'cscb_alpha_old', 'alpha'),
             sweptRow(cfg, home, 'cscb_gamma_old', 'gamma', 'ended'),
             sweptRow(cfg, home, 'cscb_departed', 'departed'),
           ],
-          { killQueue: [unresponsive(), cannedOk(cannedKillResult(true)), unresponsive(), unresponsive(), unresponsive(), unresponsive()] },
+          { killQueue: [unresponsive(), cannedOk(cannedKillResult(true)), unresponsive(), unresponsive(), unresponsive()] },
         )
 
-        expect(r.killCalls).toEqual(['cscb_alpha_old', 'cscb_alpha_old', 'cscb_gamma_old', 'cscb_departed', 'cscb_departed', 'cscb_departed'])
+        expect(r.killCalls).toEqual(['cscb_alpha_old', 'cscb_alpha_old', 'cscb_departed', 'cscb_departed', 'cscb_departed'])
         expect(r.statusCalls).toEqual(['cscb_alpha_old', 'cscb_departed', 'cscb_departed'])
-        expect(r.deleteCalls).toEqual([['cscb_alpha_old']])
-        expect(r.result).toEqual({ found: 3, killed: 1, failed: 2, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
+        expect(r.deleteCalls).toEqual([])
+        expect(r.result).toEqual(sweepResult({ listed: 3, killed: 1, kept: 2, killFailed: 1 }))
       })
 
+      // b.jg5 SRJ-110, SRJ-316, SRJ-714 (hatch A3; the E12 hatch note): a
+      // CONFIG answer at the status read between a sweep kill's tries raises
+      // its outage for a configured persona's row only, and arms no timer.
       test.each<[string, string, string, number, boolean]>([
         ['a configured persona\'s row listed pending', 'pending', 'alpha', 1, true],
         ['a configured persona\'s row listed waiting', 'waiting', 'alpha', KILL_RETRY_TRIES, true],
@@ -5146,178 +5354,74 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
         expect(r.killCalls).toEqual(Array.from({ length: kills }, () => id))
         expect(r.statusCalls).toEqual(Array.from({ length: kills === 1 ? 1 : kills - 1 }, () => id))
         expect(r.deleteCalls).toEqual([])
-        expect(r.result.failed).toBe(1)
+        expect(r.result).toEqual(sweepResult({ listed: 1, kept: 1, killFailed: 1 }))
         expect([...getOutageFlags(persona)]).toEqual(configured ? ['ad-config-malformed'] : [])
         expect(outageEmissions.map((e) => e.key)).toEqual(configured ? [persona] : [])
         for (const key of ['beta', 'gamma']) expect(getOutageFlags(key).size).toBe(0)
         if (!configured) expect(r.errLog.split('\n').filter((l) => l.includes(`instanceId=${id}`) && l.includes('CONFIG') && l.includes('logged only'))).toHaveLength(kills === 1 ? 1 : kills - 1)
         expect(armed).toEqual([])
-        assertNoLeak({ errLog: r.errLog, entries: r.entries, outageEmissions })
-      })
-
-      // b.jg5 SRJ-704, SRJ-714, SRJ-1013, SRJ-1007 (E20 T3): the start
-      // sweep's kill-failure alert is the server-log line and the
-      // startup-errors entry only: the ordinary version rides in the row's
-      // `orphan-cleanup` entry, the survivor version is one
-      // `persona-kill-survivor` entry. Kill-failure alerts over a recording
-      // sink are installed, as main() installs them, to show the sweep posts
-      // nothing through them. Every text is built with the module's builders.
-      describe('b.jg5 SRJ-704, SRJ-714: the kill-failure alert\'s entries', () => {
-        let sweepPosts: Array<{ key: string; text: string }>
-
-        beforeEach(() => {
-          sweepPosts = []
-          setKillFailureAlerts(
-            createKillFailureAlerts({
-              episodes: createPersonaEpisodes({ sink: (key, text) => { sweepPosts.push({ key, text }) }, log: () => {}, clock: createFakeClock() }),
-              log: () => {},
-            }),
-          )
-        })
-
-        afterEach(() => {
-          setKillFailureAlerts(undefined)
-          expect(sweepPosts).toEqual([])
-        })
-
-        /** The sweep's alert tail for `row`'s id: `instanceId=<id> (start sweep): <text>`, the start-sweep closing, unescaped. */
-        function sweepEntry(row: import('agent-director').ListRow, content: KillFailureAlertContent): string {
-          return killFailureAlertEntryText(`instanceId=${row.claude_instance_id}`, KILL_FAILURE_CONTEXT_START_SWEEP, killFailureAlertText(content, KILL_FAILURE_CLOSING_LOG_ONLY, false))
-        }
-
-        /** The ordinary content for `row` quoting `quotes`. */
-        function ordinaryFor(row: import('agent-director').ListRow, quotes: { lastKillFailedDescription?: string; earlierSurvivorDescription?: string }): KillFailureAlertContent {
-          return { version: KILL_FAILURE_VERSION_ORDINARY, session: row.tmux_session_name, instanceId: row.claude_instance_id, quotes }
-        }
-
-        /** Every entry of class `classLabel` in a startup-errors.log body, the text after its timestamp and class. */
-        function entriesOf(log: string, classLabel: string): string[] {
-          const marker = `] [${classLabel}] `
-          return log.split('\n').flatMap((line) => (line.includes(marker) ? [line.slice(line.indexOf(marker) + marker.length)] : []))
-        }
-
-        test('a swept row and a live pre-persona row whose kills answer ErrTmuxKillFailed at every try: each one orphan-cleanup entry carrying the ordinary text for its own id with the start-sweep closing; nothing posted, nothing armed, nothing deleted', async () => {
-          const err = errTmuxKillFailed(sentinelInMessage('sweep-kill'))
-          const rows: import('agent-director').ListRow[] = []
-          const r = await sweepRows((cfg, home) => {
-            rows.push(sweptRow(cfg, home, 'cscb_alpha_old', 'alpha'), prePersonaRow('waiting'))
-            return rows
-          }, { killError: err })
-          const [swept, prePersona] = rows as [import('agent-director').ListRow, import('agent-director').ListRow]
-          const quotes = { lastKillFailedDescription: killFailedDescriptionOf(err)! }
-
-          const entries = entriesOf(r.entries, ORPHAN_CLEANUP_LABEL)
-          expect(entries).toHaveLength(2)
-          expect(entries[0]!.endsWith(`; kill-failure alert: ${sweepEntry(swept, ordinaryFor(swept, quotes))}`)).toBe(true)
-          expect(entries[1]!.endsWith(`; kill-failure alert: ${sweepEntry(prePersona, ordinaryFor(prePersona, quotes))}`)).toBe(true)
-          expect(entriesOf(r.entries, PERSONA_KILL_SURVIVOR_LABEL)).toEqual([])
-          expect(r.deleteCalls).toEqual([])
-          expect(armed).toEqual([])
-          expect(outageEmissions).toEqual([])
-          expect(r.entries).toContain(REDACTED_SENTINEL_TAIL)
-        })
-
-        test('a survivor-naming ErrTmuxKillFailed, then a read of ended: the row counts as killed and is deleted; one persona-kill-survivor entry names it with the survivor text; no orphan-cleanup entry', async () => {
-          const survivor = errTmuxKillFailed(sentinelInMessage('sweep-survivor'), 'pane-process-survived')
-          const rows: import('agent-director').ListRow[] = []
-          const r = await sweepRows((cfg, home) => {
-            rows.push(sweptRow(cfg, home, 'cscb_alpha_old', 'alpha'))
-            return rows
-          }, { killQueue: [cannedErr(survivor)], statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))] })
-          const row = rows[0]!
-
-          expect(r.result).toMatchObject({ found: 1, killed: 1, failed: 0 })
-          expect(r.killCalls).toEqual(['cscb_alpha_old'])
-          expect(r.deleteCalls).toEqual([['cscb_alpha_old']])
-          expect(entriesOf(r.entries, PERSONA_KILL_SURVIVOR_LABEL)).toEqual([
-            sweepEntry(row, { version: KILL_FAILURE_VERSION_SURVIVOR, session: row.tmux_session_name, survivorDescription: killFailedDescriptionOf(survivor)! }),
-          ])
-          expect(entriesOf(r.entries, ORPHAN_CLEANUP_LABEL)).toEqual([])
-          expect(armed).toEqual([])
-        })
-
-        test('a survivor-naming ErrTmuxKillFailed, then ErrTmuxUnresponsive to the end: one orphan-cleanup entry with the ordinary text quoting the survivor-naming description; no persona-kill-survivor entry', async () => {
-          const survivor = errTmuxKillFailed(sentinelInMessage('sweep-survivor-then-unresponsive'), 'pane-process-survived')
-          const rows: import('agent-director').ListRow[] = []
-          const r = await sweepRows((cfg, home) => {
-            rows.push(sweptRow(cfg, home, 'cscb_alpha_old', 'alpha'))
-            return rows
-          }, { killQueue: [cannedErr(survivor), cannedErr(errTmuxUnresponsive('kill')), cannedErr(errTmuxUnresponsive('kill'))] })
-          const row = rows[0]!
-
-          expect(r.killCalls).toEqual(Array.from({ length: KILL_RETRY_TRIES }, () => 'cscb_alpha_old'))
-          const entries = entriesOf(r.entries, ORPHAN_CLEANUP_LABEL)
-          expect(entries).toHaveLength(1)
-          expect(entries[0]!.endsWith(`; kill-failure alert: ${sweepEntry(row, ordinaryFor(row, { earlierSurvivorDescription: killFailedDescriptionOf(survivor)! }))}`)).toBe(true)
-          expect(entriesOf(r.entries, PERSONA_KILL_SURVIVOR_LABEL)).toEqual([])
-          expect(r.deleteCalls).toEqual([])
-          expect(armed).toEqual([])
-        })
+        expect(r.clock.pendingCount()).toBe(0)
       })
     })
   })
 
-  // b.1ix: a pre-persona row (no persona label; a build before personas made
-  // it, with a `cscb_<name>_<channel>` ID) is never deleted, since no launch
-  // reuses its ID. A live one gets one checked kill per start (b.jg5 SRJ-110,
-  // SRJ-701) and is kept whether its kill succeeds or not; an ended or
-  // missing one gets no call. One findMissing sweep follows the kills, since
-  // agent-director 0.10.0's kill leaves the row's state as it was. A row
-  // naming an absent persona is still killed and deleted after its own kill
-  // succeeded.
-  describe('pre-persona rows are kept, never deleted (b.1ix)', () => {
-    test.each([
-      ['succeeds', undefined],
-      ['does not succeed (b.jg5 SRJ-110: the orphan-cleanup entry names the outcome)', errGeneric('kill', 'ErrKillBroken')],
-    ] as const)('a live pre-persona row whose kill %s: one kill call, kept (no delete), the outcome logged, then one findMissing sweep; an absent persona’s row is still killed and deleted', async (_label, killError) => {
+  // b.jg5 SRJ-714, SRJ-120 (b.1ix): after the kills, one findMissing run over
+  // every row given a kill, swept and pre-persona rows alike and whatever
+  // the outcome, since agent-director's kill leaves the row's state as it
+  // was; none when no kill was made. A pre-persona row is never deleted: no
+  // launch reuses its ID, and `expire` removes it later.
+  describe('b.jg5 SRJ-714, SRJ-120: one findMissing run after the kills', () => {
+    /** Every row id the default (empty) findMissing result leaves live, as the post-kill line lists them. */
+    const POST_KILL_ROWS: ReadonlyArray<readonly [string, (cfg: PersonaConfig) => import('agent-director').ListRow[]]> = [
+      ['a swept row only', () => [cannedListRow({ claude_instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' } })]],
+      ['a pre-persona row only', () => [prePersonaRow('waiting')]],
+      ['a pre-persona row and a swept row', () => [prePersonaRow('waiting'), cannedListRow({ claude_instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' } })]],
+    ]
+
+    test.each(POST_KILL_ROWS.flatMap(([label, rows]) => [
+      [label, 'succeed', rows, undefined],
+      [label, 'do not succeed', rows, errGeneric('kill', 'ErrKillBroken')],
+    ] as const))('%s given a kill whose kills %s, beside a finished row and a row matching its persona: one findMissing after the last kill, its line covering exactly the killed rows; no delete; the summary ends the sweep', async (_label, _outcome, rows, killError) => {
       const readLog = captureStartupErrors()
-      const { cfg } = sweepConfig()
-      const killCalls: import('agent-director').KillParams[] = []
+      const { cfg, home } = sweepConfig()
+      const killed = rows(cfg)
+      const order: string[] = []
       const deleteCalls: import('agent-director').DeleteParams[] = []
-      const callLog: string[] = []
-      installStub({
-        killCalls,
+      const stub = installStub({
         deleteCalls,
-        // The pre-persona row's kill first, then the absent persona's row's, which succeeds.
-        killQueue: [killError ? cannedErr(killError) : cannedOk(cannedKillResult()), cannedOk(cannedKillResult())],
-        callLog,
-        listResult: {
-          spawns: [
-            prePersonaRow('waiting'),
-            cannedListRow({ claude_instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' } }),
-          ],
-        },
+        ...(killError === undefined ? {} : { killError }),
+        listResult: { spawns: [prePersonaRow('ended'), ...killed, cannedListRow({}, personaOf(cfg, 'alpha'), home)] },
       })
+      const kill = stub.kill.bind(stub)
+      stub.kill = async (params) => {
+        order.push(`kill ${params.claude_instance_id}`)
+        return kill(params)
+      }
+      const findMissing = stub.findMissing.bind(stub)
+      stub.findMissing = async (params) => {
+        order.push('findMissing')
+        return findMissing(params)
+      }
 
       let result!: Awaited<ReturnType<typeof reconcileOrphans>>
       const errLog = await withCapturedErr(async () => {
         result = await reconcileOrphans(cfg)
       })
 
-      const failed = killError ? 1 : 0
-      expect(result).toEqual({ found: 1, killed: 1, failed: 0, prePersona: { kept: 1, live: 1, killFailed: failed }, recordedAsRetired: 0, leftForLatch: 0 })
-      expect(killCalls.map((k) => k.claude_instance_id)).toEqual(['cscb_old_waiting_C0OLD', 'cscb_departed'])
-      expect(deleteCalls.map((d) => d.claude_instance_id)).toEqual([['cscb_departed']])
-      expect(errLog).toContain('reconcileOrphans: pre-persona row (no persona label) instanceId=cscb_old_waiting_C0OLD state=waiting tmux_session=slack_bot_old_waiting_C0OLD is live')
-      expect(errLog).toContain(`pre-persona rows kept=1 live=1 kill-failed=${failed}`)
-      // The sweep runs after a kill that did not succeed too: the session may be gone all the same.
-      expect(callLog).toEqual(['findMissing'])
-      expect(errLog).toContain('reconcileOrphans: findMissing after the kills of 1 live pre-persona row(s): missing=0 [] still-live=1 [cscb_old_waiting_C0OLD]')
-      const entries = readLog()
-      if (killError) {
-        expect(entries).toContain(
-          `kill did not succeed for pre-persona row instanceId=cscb_old_waiting_C0OLD: ${describeKillOutcome(killOutcomeOf({ thrown: killError }))}; row kept, its session may still be running`,
-        )
-        expect(countStartupEntries(entries, ORPHAN_CLEANUP_LABEL)).toBe(1)
-        expect(errLog).not.toContain('kill succeeded for pre-persona row')
-      } else {
-        expect(errLog).toContain(`reconcileOrphans: kill succeeded for pre-persona row instanceId=cscb_old_waiting_C0OLD (${describeKillOutcome({ kind: KILL_OUTCOME_KILLED })}) — row kept`)
-        expect(entries).not.toContain('pre-persona')
-      }
-      assertNoLeak({ errLog, entries })
+      const ids = killed.map((row) => row.claude_instance_id)
+      expect(order).toEqual([...ids.map((id) => `kill ${id}`), 'findMissing'])
+      expect(deleteCalls).toEqual([])
+      expect(errLog.split('\n')).toContain(startSweepPostKillLine(ids.length, [], ids, []))
+      const expected = killError === undefined
+        ? sweepResult({ listed: ids.length + 2, killed: ids.length, kept: 2 })
+        : sweepResult({ listed: ids.length + 2, kept: ids.length + 2, killFailed: ids.length })
+      expect(result).toEqual(expected)
+      expectSummaryLast(errLog, expected)
+      expect(startupEntriesIn(readLog(), ORPHAN_CLEANUP_LABEL)).toHaveLength(killError === undefined ? 0 : ids.length)
+      assertNoLeak({ errLog, entries: readLog() })
     })
 
-    test('every live state gets one kill call and all share one findMissing sweep, whose outcome line counts the killed pending row left in neither list as not judged and a killed pending row in unverified_ids as still live; ended and missing pre-persona rows get no kill, no delete and no line', async () => {
+    test('every live state gets one kill call and all share one findMissing sweep, whose line counts the killed pending row left in neither list as not judged and a killed pending row in unverified_ids as still live; ended and missing pre-persona rows get no kill, no delete and no line', async () => {
       const { cfg } = sweepConfig()
       const killCalls: import('agent-director').KillParams[] = []
       const deleteCalls: import('agent-director').DeleteParams[] = []
@@ -5340,7 +5444,8 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
         result = await reconcileOrphans(cfg)
       })
 
-      expect(result).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 8, live: 6, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
+      const killedCount = liveIds.length + 1
+      expect(result).toEqual(sweepResult({ listed: killedCount + 2, killed: killedCount, kept: 2 }))
       expect(killCalls.map((k) => k.claude_instance_id)).toEqual([...liveIds, pendingLeftLive])
       expect(deleteCalls).toHaveLength(0)
       expect(findMissingCalls).toEqual([{}])
@@ -5350,44 +5455,79 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
       const pendingId = `cscb_old_${AGENT_DIRECTOR_PENDING_STATE}_C0OLD`
       expect(liveIds[0]).toBe(pendingId)
       const stillLive = [...liveIds.filter((_, i) => i !== 0 && i !== 1 && i !== 3), pendingLeftLive]
-      expect(errLog).toContain(
-        `reconcileOrphans: findMissing after the kills of 6 live pre-persona row(s): missing=2 [${liveIds[1]},${liveIds[3]}] still-live=3 [${stillLive.join(',')}] not-judged=1 [${pendingId}] — a row that still reads live is killed again at the next start; a not-judged row was pending and not judged by this sweep (retry later)`,
-      )
-      // The summary line still ends the sweep.
-      const lines = errLog.trim().split('\n')
-      expect(lines.at(-1)).toContain('reconcileOrphans: found=0 killed=0 failed=0; pre-persona rows kept=8 live=6 kill-failed=0')
+      expect(errLog.split('\n')).toContain(startSweepPostKillLine(killedCount, [liveIds[1]!, liveIds[3]!], stillLive, [pendingId]))
+      expectSummaryLast(errLog, result)
       expect(errLog).not.toContain('cscb_old_ended_C0OLD')
       expect(errLog).not.toContain('cscb_old_missing_C0OLD')
     })
 
-    test.each([
-      ['no pre-persona row', [] as string[]],
-      ['only ended and missing pre-persona rows', ['ended', 'missing']],
-    ])('%s is live: no findMissing sweep and no outcome line (a swept persona row runs none either)', async (_label, states) => {
-      const { cfg } = sweepConfig()
+    // b.jg5 SRJ-714, SRJ-408: a swept `pending` row with no launch start is
+    // killed with no wait before the first try; the run judges it by
+    // agent-director's ordinary rules, so one in neither list was not judged.
+    test('swept pending rows with no launch start (an absent persona\'s, a wrong instance ID\'s): each killed at once, with no read and no wait first; the post-kill line reports them not judged', async () => {
+      const { cfg, home } = sweepConfig()
+      const noLaunchStart = { state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: undefined }
+      const rows = [
+        cannedListRow({ claude_instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' }, ...noLaunchStart }),
+        cannedListRow({ claude_instance_id: 'cscb_alpha_old', ...noLaunchStart }, personaOf(cfg, 'alpha'), home),
+      ]
+      expect(rows.map((row) => 'launch_started_at' in row)).toEqual([false, false])
+      const statusCalls: import('agent-director').StatusParams[] = []
+      const stub = installStub({ statusCalls, listResult: { spawns: rows } })
+      const clock = createFakeClock()
+      const killedAt: number[] = []
+      const kill = stub.kill.bind(stub)
+      stub.kill = async (params) => {
+        killedAt.push(clock.now())
+        return kill(params)
+      }
+
+      let result!: Awaited<ReturnType<typeof reconcileOrphans>>
+      const errLog = await withCapturedErr(async () => {
+        result = await reconcileOnClock(cfg, clock)
+      })
+
+      expect(killedAt).toEqual([0, 0])
+      expect(statusCalls).toEqual([])
+      expect(result).toEqual(sweepResult({ listed: 2, killed: 2 }))
+      expect(errLog.split('\n')).toContain(startSweepPostKillLine(2, [], [], ['cscb_departed', 'cscb_alpha_old']))
+    })
+
+    test('no kill made (an absent persona\'s rows listed ended and missing, finished pre-persona rows, a wrong instance ID\'s and a wrong cwd\'s rows listed finished, a row matching its persona): no kill, no findMissing run and no post-kill line; every row kept', async () => {
+      const { cfg, home } = sweepConfig()
       const findMissingCalls: import('agent-director').FindMissingParams[] = []
+      const killCalls: import('agent-director').KillParams[] = []
       installStub({
         findMissingCalls,
+        killCalls,
         listResult: {
           spawns: [
-            ...states.map((state) => prePersonaRow(state)),
-            cannedListRow({ claude_instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' } }),
+            prePersonaRow('ended'),
+            prePersonaRow('missing'),
+            cannedListRow({ claude_instance_id: 'cscb_departed', state: 'ended', labels: { service: 'cscb', persona: 'departed' } }),
+            cannedListRow({ claude_instance_id: 'cscb_departed_old', state: 'missing', labels: { service: 'cscb', persona: 'departed' } }),
+            cannedListRow({ claude_instance_id: 'cscb_alpha_old', state: 'missing' }, personaOf(cfg, 'alpha'), home),
+            cannedListRow({ cwd: fixtureSubdir('elsewhere'), state: 'ended' }, personaOf(cfg, 'gamma'), home),
+            cannedListRow({}, personaOf(cfg, 'alpha'), home),
           ],
         },
       })
 
+      let result!: Awaited<ReturnType<typeof reconcileOrphans>>
       const errLog = await withCapturedErr(async () => {
-        await reconcileOrphans(cfg)
+        result = await reconcileOrphans(cfg)
       })
 
-      expect(findMissingCalls).toHaveLength(0)
+      expect([killCalls, findMissingCalls]).toEqual([[], []])
       expect(errLog).not.toContain('findMissing')
+      expect(result).toEqual(sweepResult({ listed: 7, kept: 7 }))
+      expectSummaryLast(errLog, result)
     })
 
     test.each([
       ['a generic agent-director error', errGeneric('find-missing', 'ErrFindBroken')],
       ['agent-director disappeared', new ErrSystemInstallDisappeared('find-missing', '/usr/bin/agent-director')],
-    ])('the findMissing sweep fails (%s): one failure line and an outcome line saying the rows still read live; the start sweep finishes, and no persona’s outage flag or notice is raised', async (_label, findMissingError) => {
+    ])('the findMissing sweep fails (%s): one failure line and the post-kill failure line; the start sweep ends with its summary, and no persona\'s outage flag or notice is raised', async (_label, findMissingError) => {
       const { cfg } = sweepConfig()
       const findMissingCalls: import('agent-director').FindMissingParams[] = []
       installStub({ findMissingCalls, findMissingError, listResult: { spawns: [prePersonaRow('working')] } })
@@ -5398,12 +5538,10 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
       })
 
       expect(findMissingCalls).toHaveLength(1)
-      expect(result).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 1, live: 1, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
-      expect(errLog).toContain('[slack] reconcileOrphans: findMissing sweep failed for killed pre-persona rows:')
-      expect(errLog).toContain(
-        '[slack] reconcileOrphans: findMissing after the kills of 1 live pre-persona row(s) failed — they still read live and are killed again at the next start',
-      )
-      expect(errLog).toContain('pre-persona rows kept=1 live=1 kill-failed=0')
+      expect(result).toEqual(sweepResult({ listed: 1, killed: 1 }))
+      expect(errLog.split('\n').filter((line) => line.startsWith('[slack] reconcileOrphans: findMissing sweep failed for the rows the start sweep killed: '))).toHaveLength(1)
+      expect(errLog.split('\n')).toContain(startSweepPostKillFailedLine(1))
+      expectSummaryLast(errLog, result)
       for (const key of ['alpha', 'beta', 'gamma']) expect(getOutageFlags(key).size).toBe(0)
       expect(outageEmissions).toHaveLength(0)
     })
@@ -5412,7 +5550,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
     // the row's state as it was, and `findMissing` marks a live row whose
     // session is gone `missing`. Before b.1ix's follow-up the killed row still
     // read live at every later start and was killed again each time.
-    test('across two starts: a killed row whose session is gone reads missing after the first start’s sweep and the second start leaves it alone; a row whose session survived its kill is killed again', async () => {
+    test('across two starts: a killed row whose session is gone reads missing after the first start\'s sweep and the second start leaves it alone; a row whose session survived its kill is killed again', async () => {
       const { cfg } = sweepConfig()
       const gone = prePersonaRow('waiting')
       const survivor = prePersonaRow('working')
@@ -5448,82 +5586,95 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
       expect(findMissingCalls).toHaveLength(1)
       expect(rows.get(gone.claude_instance_id)!.state).toBe('missing')
       expect(rows.get(survivor.claude_instance_id)!.state).toBe('working')
-      expect(firstLog).toContain(
-        `findMissing after the kills of 2 live pre-persona row(s): missing=1 [${gone.claude_instance_id}] still-live=1 [${survivor.claude_instance_id}]`,
-      )
+      expect(firstLog.split('\n')).toContain(startSweepPostKillLine(2, [gone.claude_instance_id], [survivor.claude_instance_id], []))
 
       // The next start is a new server process: nothing memoized.
       _resetFindMissingMemo()
       killCalls.length = 0
+      let second!: Awaited<ReturnType<typeof reconcileOrphans>>
       const secondLog = await withCapturedErr(async () => {
-        await reconcileOrphans(cfg)
+        second = await reconcileOrphans(cfg)
       })
       expect(killCalls).toEqual([survivor.claude_instance_id])
       expect(findMissingCalls).toHaveLength(2)
       expect(secondLog).not.toContain(`instanceId=${gone.claude_instance_id}`)
-      expect(secondLog).toContain('pre-persona rows kept=2 live=1 kill-failed=0')
+      expect(second).toEqual(sweepResult({ listed: 2, killed: 1, kept: 1 }))
       expect([...rows.keys()]).toEqual([gone.claude_instance_id, survivor.claude_instance_id])
     })
   })
 
+  // Every case below runs on `makeRecoveryHarness` over P and B: its latch,
+  // configured-persona query and retired-key store (over its temp state
+  // directory) installed as `main()` installs them, its notice episodes as
+  // the recording notice sink; `srj105AfterEach` leak-checks everything
+  // captured and puts every install back. The sweep runs as `main()` runs it,
+  // its kill retries on the harness clock.
+
+  /** Every state a listed row can be in: each live state, `pending` first, then the finished ones. */
+  const EVERY_STATE = [...AGENT_DIRECTOR_LIVE_STATES, ...AGENT_DIRECTOR_DEAD_STATES]
+  /** A second key no persona of the harness has. */
+  const ABSENT_2 = `${LAUNCH_START_ABSENT_PERSONA_KEY}_2`
+
+  /** Persona `key`'s row as the `list` gives it (its id, labels and directory; `waiting`), with `overrides`. */
+  function listed(h: RecoveryHarness, key: string, overrides: Partial<Phase1ListRow> = {}): Phase1ListRow {
+    return cannedListRow(overrides, harnessPersona(h, key), h.home)
+  }
+
+  /** A row a spawn of `key`, a persona absent from the configuration, left (`cscb_<key>`, labelled `key`), with `overrides`. */
+  function absentRow(h: RecoveryHarness, key: string, overrides: Partial<Phase1ListRow> = {}): Phase1ListRow {
+    return cannedListRow(overrides, { ...harnessPersona(h, h.keys[0]!), key }, h.home)
+  }
+
+  /** The harness's configuration without persona `key`, which is also dropped from the applied set (the configured-persona query). */
+  function withoutPersona(h: RecoveryHarness, key: string): PersonaConfig {
+    h.remove(key)
+    return { ...h.config, personas: h.config.personas.filter((persona) => persona.key !== key) }
+  }
+
+  /** What one sweep did: its result, every stub call in order, and the record writes made and the personas latched when its first kill was sent. */
+  interface SweepRun {
+    readonly result: Awaited<ReturnType<typeof reconcileOrphans>>
+    readonly order: string[]
+    readonly atFirstKill: { readonly writes: number; readonly latched: string[] } | undefined
+  }
+
+  /**
+   * Run the start sweep over `rows` with `config` (the harness's own by
+   * default), as `main()` runs it, with `isShuttingDown` as its shutdown query
+   * when given (b.jg5 SRJ-714).
+   */
+  async function sweepOver(h: RecoveryHarness, rows: readonly Phase1ListRow[], config: PersonaConfig = h.config, isShuttingDown?: () => boolean): Promise<SweepRun> {
+    h.script({ listResult: { spawns: [...rows] } })
+    let atFirstKill: SweepRun['atFirstKill']
+    const kill = h.stub.client.kill.bind(h.stub.client)
+    h.stub.client.kill = (params) => {
+      atFirstKill ??= { writes: h.retiredKeyWrites.length, latched: h.keys.filter((key) => h.latch.isLatched(key)) }
+      return kill(params)
+    }
+    const order = recordCallOrder(h)
+    const result = await h.drive(reconcileOrphans(config, h.killRetryClock, isShuttingDown))
+    return { result, order, atFirstKill }
+  }
+
+  /** The ids the sweep sent a `kill` for, in order. */
+  const killedIds = (h: RecoveryHarness): string[] => h.stub.calls.killCalls.map((k) => k.claude_instance_id)
+
+  /** The record file holds exactly `absent`, each recorded `absent-at-start` now with no mark, beside `others` as seeded. */
+  function expectRecordedAbsent(h: RecoveryHarness, absent: readonly string[], others: Readonly<Record<string, RetiredKeySeed>> = {}): void {
+    const record = readRetiredKeysRecord(h.stateDir)
+    expect([...(record?.keys() ?? [])].sort()).toEqual([...absent, ...Object.keys(others)].sort())
+    for (const key of absent) {
+      expect(record?.get(key)).toEqual({ cause: RETIRED_KEY_CAUSE_ABSENT_AT_START, retiredAt: expect.stringMatching(RFC3339_UTC), newLifeBegunAt: null })
+    }
+    for (const [key, entry] of retiredKeysRecordOf(others)) expect(record?.get(key)).toEqual(entry)
+  }
+
   // b.jg5 SRJ-116, SRJ-714 (its list, latch and record parts), SRJ-502
   // (AC 55), SRJ-504 (AC 45's list half), SRJ-513, SRJ-803, SRJ-807; the
-  // E13, E14, E16 and E24 hatch notes. Every case runs on
-  // `makeRecoveryHarness` over P and B: its latch, configured-persona query
-  // and retired-key store (over its temp state directory) installed as
-  // `main()` installs them, its notice episodes as the recording notice sink;
-  // `srj105AfterEach` leak-checks everything captured and puts every install
-  // back. The sweep runs as `main()` runs it, its kill retries on the
-  // harness clock. A latched persona's rows are never killed; whether the
-  // sweep still kills a finished row or deletes after a kill, and its
-  // summary line, are not checked here.
+  // E13, E14, E16 and E24 hatch notes. A latched persona's rows are never
+  // killed; the kills, the summary and the stops are the next describe's.
   describe('b.jg5 SRJ-116, SRJ-714: the one list latches each configured persona from its own row, records absent personas\' keys as retired in one write before the first kill, clears at its rows, and never kills a latched persona\'s rows', () => {
     afterEach(srj105AfterEach)
-
-    /** Every state a listed row can be in: each live state, `pending` first, then the finished ones. */
-    const EVERY_STATE = [...AGENT_DIRECTOR_LIVE_STATES, ...AGENT_DIRECTOR_DEAD_STATES]
-    /** A second key no persona of the harness has. */
-    const ABSENT_2 = `${LAUNCH_START_ABSENT_PERSONA_KEY}_2`
-
-    /** Persona `key`'s row as the `list` gives it (its id, labels and directory; `waiting`), with `overrides`. */
-    function listed(h: RecoveryHarness, key: string, overrides: Partial<Phase1ListRow> = {}): Phase1ListRow {
-      return cannedListRow(overrides, harnessPersona(h, key), h.home)
-    }
-
-    /** A row a spawn of `key`, a persona absent from the configuration, left (`cscb_<key>`, labelled `key`), with `overrides`. */
-    function absentRow(h: RecoveryHarness, key: string, overrides: Partial<Phase1ListRow> = {}): Phase1ListRow {
-      return cannedListRow(overrides, { ...harnessPersona(h, h.keys[0]!), key }, h.home)
-    }
-
-    /** The harness's configuration without persona `key`, which is also dropped from the applied set (the configured-persona query). */
-    function withoutPersona(h: RecoveryHarness, key: string): PersonaConfig {
-      h.remove(key)
-      return { ...h.config, personas: h.config.personas.filter((persona) => persona.key !== key) }
-    }
-
-    /** What one sweep did: its result, every stub call in order, and the record writes made and the personas latched when its first kill was sent. */
-    interface SweepRun {
-      readonly result: Awaited<ReturnType<typeof reconcileOrphans>>
-      readonly order: string[]
-      readonly atFirstKill: { readonly writes: number; readonly latched: string[] } | undefined
-    }
-
-    /** Run the start sweep over `rows` with `config` (the harness's own by default), as `main()` runs it. */
-    async function sweepOver(h: RecoveryHarness, rows: readonly Phase1ListRow[], config: PersonaConfig = h.config): Promise<SweepRun> {
-      h.script({ listResult: { spawns: [...rows] } })
-      let atFirstKill: SweepRun['atFirstKill']
-      const kill = h.stub.client.kill.bind(h.stub.client)
-      h.stub.client.kill = (params) => {
-        atFirstKill ??= { writes: h.retiredKeyWrites.length, latched: h.keys.filter((key) => h.latch.isLatched(key)) }
-        return kill(params)
-      }
-      const order = recordCallOrder(h)
-      const result = await h.drive(reconcileOrphans(config, h.killRetryClock))
-      return { result, order, atFirstKill }
-    }
-
-    /** The ids the sweep sent a `kill` for, in order. */
-    const killedIds = (h: RecoveryHarness): string[] => h.stub.calls.killCalls.map((k) => k.claude_instance_id)
 
     /** The sweep's own latch lines: one per persona it holds. */
     const sweepLatchLines = (h: RecoveryHarness): string[] =>
@@ -5533,16 +5684,6 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
     const latchedFromListLine = (p: string, latchCase: string): string =>
       `[slack] reconcileOrphans: ${renderPersonaRef(p, p)} latched from its own listed row instanceId=${personaInstanceId(p)} (case=${latchCase}) — its own row and every row labelled with it are left unkilled (b.jg5 SRJ-116, SRJ-502, SRJ-714)`
 
-    /** The record file holds exactly `absent`, each recorded `absent-at-start` now with no mark, beside `others` as seeded. */
-    function expectRecordedAbsent(h: RecoveryHarness, absent: readonly string[], others: Readonly<Record<string, RetiredKeySeed>> = {}): void {
-      const record = readRetiredKeysRecord(h.stateDir)
-      expect([...(record?.keys() ?? [])].sort()).toEqual([...absent, ...Object.keys(others)].sort())
-      for (const key of absent) {
-        expect(record?.get(key)).toEqual({ cause: RETIRED_KEY_CAUSE_ABSENT_AT_START, retiredAt: expect.stringMatching(RFC3339_UTC), newLifeBegunAt: null })
-      }
-      for (const [key, entry] of retiredKeysRecordOf(others)) expect(record?.get(key)).toEqual(entry)
-    }
-
     test('one list carrying the service label alone, with no state filter, and nothing else: a sweep listing no row makes no other call, latches, records and posts nothing', async () => {
       const { h } = srj105Build()
 
@@ -5550,7 +5691,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
 
       expect(h.stub.calls.listCalls).toEqual([{ label: [SERVICE_LABEL] }])
       expect(run.order).toEqual(['list'])
-      expect(run.result).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
+      expect(run.result).toEqual(sweepResult())
       expectNoNoteLatch(h)
       expect([h.retiredKeyWrites, readRetiredKeysRecord(h.stateDir)]).toEqual([[], null])
     })
@@ -5661,7 +5802,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
 
       expectNoteLatchedOnce(h, p, latchRowStateRead(state))
       expect(killedIds(h)).toEqual([])
-      expect(run.result).toMatchObject({ found: 0, leftForLatch: 1 })
+      expect(run.result).toEqual(sweepResult({ listed: 1, leftForLatch: 1 }))
       expect(sweepLatchLines(h)).toEqual([latchedFromListLine(p, LATCH_CASE_CONFLICTING_LABELS)])
       expectUntouched(h, b)
     })
@@ -5753,7 +5894,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
 
       expect(killedIds(h)).toEqual([bOld])
       expect(run.atFirstKill).toEqual({ writes: 0, latched: [p] })
-      expect(run.result).toMatchObject({ found: 1, killed: 1, leftForLatch: 3 })
+      expect(run.result).toEqual(sweepResult({ listed: 4, killed: 1, leftForLatch: 3 }))
       expectNoteLatchedOnce(h, p, latchRowStateRead('waiting'))
       expect(sweepLatchLines(h)).toEqual([latchedFromListLine(p, LATCH_CASE_CONFLICTING_LABELS)])
     })
@@ -5773,7 +5914,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
       ])
 
       expect(killedIds(h)).toEqual([bOld])
-      expect(run.result).toMatchObject({ found: 1, killed: 1, leftForLatch: 3 })
+      expect(run.result).toEqual(sweepResult({ listed: 4, killed: 1, leftForLatch: 3 }))
       expectNoteLatchedOnce(h, p, latchRowStateRead('waiting'))
       expect(sweepLatchLines(h)).toEqual([
         `[slack] reconcileOrphans: ${renderPersonaRef(p, p)} is latched (case=${LATCH_CASE_CONFLICTING_LABELS}) — its own row and every row labelled with it are left unkilled (b.jg5 SRJ-502, SRJ-714)`,
@@ -5900,7 +6041,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
       const result = await reconcileOrphans(h.config, h.killRetryClock)
 
       expect(order).toEqual(['list'])
-      expect(result).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
+      expect(result).toEqual(sweepResult())
       expect(countStartupEntries(h.startupErrors().join('\n'), ORPHAN_CLEANUP_LIST_FAILED_LABEL)).toBe(1)
       expectNoNoteLatch(h)
       expect(h.retiredKeyWrites).toEqual([])
@@ -5916,9 +6057,374 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
       const run = await sweepOver(h, [listed(h, p, { liveness_note: provenanceNote }), absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY)])
 
       expect(run.order).toEqual([])
-      expect(run.result).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
+      expect(run.result).toEqual(sweepResult())
       expectNoNoteLatch(h)
       expect(h.retiredKeyWrites).toEqual([])
+    })
+  })
+
+  // b.jg5 SRJ-714, SRJ-1506, SRJ-1514 (HO C2, C17; AC 55, AC 77), with the
+  // E3, E14, E20 and E24–E25 hatch notes and the orchestrator's ruling on a
+  // kill retry a shutdown stopped: what the sweep does past its latch pass
+  // and record, on the harness, as `main()` runs it.
+  describe('b.jg5 SRJ-714, SRJ-1506, SRJ-1514: the sweep kills its live strays with the result checked, deletes no row, runs one find-missing, ends with its summary and stops at a shutdown', () => {
+    afterEach(() => {
+      expectNoDeleteOrIncludeFinished(srj105Harness)
+      expect(srj105Harness?.clock.pendingCount() ?? 0).toBe(0)
+      srj105AfterEach()
+    })
+
+    /** The harness's `orphan-cleanup` and `persona-kill-survivor` entries. */
+    const killEntries = (h: RecoveryHarness): [string[], string[]] => [startupEntriesOf(h, ORPHAN_CLEANUP_LABEL), startupEntriesOf(h, PERSONA_KILL_SURVIVOR_LABEL)]
+
+    /** The harness's lines that are exactly `line`. */
+    const linesEqual = (h: RecoveryHarness, line: string): string[] => h.errors.filter((candidate) => candidate === line)
+
+    // SRJ-714's Test line, the sprint demo.
+    test('demo: at start a finished row of an absent persona has its key recorded and gets no kill, a live pre-persona row is killed and kept, and P\'s own row carrying provenance_conflict in another cwd latches P and is not killed, nor is P\'s other row; no delete; one find-missing; the summary ends the sweep', async () => {
+      const { h, p } = srj105Build()
+      const legacy = prePersonaRow('waiting')
+
+      const run = await sweepOver(h, [
+        absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY, { state: LIVENESS_DEAD_ROW_ENDED }),
+        legacy,
+        listed(h, p, { liveness_note: provenanceNote, cwd: h.home }),
+        listed(h, p, { claude_instance_id: `${personaInstanceId(p)}_old`, cwd: h.home }),
+      ])
+
+      expect(run.order).toEqual(['list', 'kill', 'findMissing'])
+      expect(killedIds(h)).toEqual([legacy.claude_instance_id])
+      expectRecordedAbsent(h, [LAUNCH_START_ABSENT_PERSONA_KEY])
+      expectNoteLatchedOnce(h, p, latchRowStateRead('waiting'))
+      const expected = sweepResult({ listed: 4, killed: 1, kept: 1, recordedAsRetired: 1, leftForLatch: 2 })
+      expect(run.result).toEqual(expected)
+      expectSummaryLast(h.errors, expected)
+    })
+
+    test('the summary line\'s counts equal the result\'s: a row left for P\'s latch, a row matching B, a killed swept row, a failed kill (kept, in the sub-count), a finished row and a killed pre-persona row; the absent key recorded', async () => {
+      const { h, p, b } = srj105Build()
+      const bOld = `${personaInstanceId(b)}_old`
+      const conflict = errTmuxSessionConflict('kill', 'not-this-launch')
+      h.script({ killQueue: [cannedOk(cannedKillResult(true)), cannedErr(conflict), cannedOk(cannedKillResult(false))] })
+      const failing = absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY)
+
+      const run = await sweepOver(h, [
+        listed(h, p, { liveness_note: provenanceNote }),
+        listed(h, b),
+        listed(h, b, { claude_instance_id: bOld }),
+        failing,
+        absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY, { state: LIVENESS_DEAD_ROW_MISSING, claude_instance_id: `${personaInstanceId(LAUNCH_START_ABSENT_PERSONA_KEY)}_old` }),
+        prePersonaRow('working'),
+      ])
+
+      expect(killedIds(h)).toEqual([bOld, failing.claude_instance_id, prePersonaRow('working').claude_instance_id])
+      const expected = sweepResult({ listed: 6, killed: 2, kept: 3, killFailed: 1, recordedAsRetired: 1, leftForLatch: 1 })
+      expect(run.result).toEqual(expected)
+      expectSummaryLast(h.errors, expected)
+      expect(killEntries(h)).toEqual([[sweepKillFailedEntry(failing, LAUNCH_START_ABSENT_PERSONA_KEY, killOutcomeOf({ thrown: conflict }))], []])
+      expect(h.stub.calls.findMissingCalls).toHaveLength(1)
+    })
+
+    // b.jg5 SRJ-714, SRJ-120 (E14's post-kill half): a configured persona's
+    // own row killed by the sweep and judged left live by the run is read
+    // with one `get`, and a provenance_conflict note there latches it.
+    test('P\'s own row in another cwd, listed with no note, is killed; the post-kill run lists it in unverified_ids, and its get reads the note: P latches once; the kill still counts and the post-kill line names it still live', async () => {
+      const { h, p } = srj105Build()
+      scriptNotedRows(h, new Map([[p, { liveness_note: provenanceNote }]]))
+      h.script({ findMissingResult: unverifiedRowsOf(p) })
+
+      const run = await sweepOver(h, [listed(h, p, { cwd: h.home })])
+
+      expect(run.order).toEqual(['list', 'kill', 'findMissing', 'get'])
+      expectNoteLatchedOnce(h, p, ENDED_READ)
+      expect(run.result).toEqual(sweepResult({ listed: 1, killed: 1 }))
+      expect(linesEqual(h, startSweepPostKillLine(1, [], [personaInstanceId(p)], []))).toHaveLength(1)
+    })
+
+    // b.jg5 SRJ-807 (the E24–E25 hatch note): the between-try `status` read
+    // of a row whose id is a key's own applies the entry clear alone, naming
+    // its site; it latches no one, and a shutdown begun by the time the read
+    // returns stops the clear (SRJ-714).
+    test.each<[string, string, boolean, boolean]>([
+      ['reads waiting: P\'s entry is cleared once, naming the read', 'waiting', false, true],
+      ['reads pending: nothing is cleared', AGENT_DIRECTOR_PENDING_STATE, false, false],
+      ['reads waiting as the server begins shutting down: nothing is cleared and no further kill is made', 'waiting', true, false],
+    ])('P recorded with its mark set, its own row in another cwd listed pending with a launch start, its kill answering ErrTmuxUnresponsive first; the status read between the tries %s; nothing latches', async (_label, state, shutdownAtRead, cleared) => {
+      const { h, p, b } = retiredBuild()
+      const before = readFileSync(h.retiredKeys.path)
+      h.script({ killQueue: [cannedErr(errTmuxUnresponsive('kill')), cannedOk(cannedKillResult(true))], statusQueue: statusReads(state) })
+
+      await sweepOver(h, [listed(h, p, { state: AGENT_DIRECTOR_PENDING_STATE, cwd: h.home })], h.config, () => shutdownAtRead && h.stub.calls.statusCalls.length > 0)
+
+      expect(h.stub.calls.statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(p)])
+      expect(killedIds(h)).toHaveLength(shutdownAtRead ? 1 : 2)
+      if (cleared) expectClearedOnce(h, p, b, clearedLine(h, p, state, START_SWEEP_KILL_STATUS_SITE))
+      else expectNothingCleared(h, p, before)
+      expectNoNoteLatch(h)
+    })
+
+    // b.jg5 SRJ-714, SRJ-205 (the E3 hatch note): once the server's shutdown
+    // query answers true, the sweep makes no further agent-director call and
+    // no further latch, record write or clear; what it did stands, the rows it
+    // left unkilled count as kept, and it logs one stop line and its summary.
+    describe('the shutdown stop (b.jg5 SRJ-714, SRJ-702)', () => {
+      /** P's own row with the note (P latches), an absent persona's row (its key recorded) and B's row under another instance id (swept). */
+      function stopRows(h: RecoveryHarness, p: string, b: string): Phase1ListRow[] {
+        return [
+          listed(h, b, { claude_instance_id: `${personaInstanceId(b)}_old` }),
+          listed(h, p, { liveness_note: provenanceNote }),
+          absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY),
+          prePersonaRow('waiting'),
+        ]
+      }
+
+      test.each<[string, () => boolean]>([
+        ['the shutdown query answers true', () => true],
+        ['the shutdown query throws (counted as shutting down)', () => {
+          throw new Error('shutdown query broken')
+        }],
+      ])('shutting down by the time the list returns (%s): no latch, record write, kill or find-missing; every row kept; one stop line, then the summary', async (_label, isShuttingDown) => {
+        const { h, p, b } = srj105Build()
+
+        const run = await sweepOver(h, stopRows(h, p, b), h.config, isShuttingDown)
+
+        expect(run.order).toEqual(['list'])
+        expectNoNoteLatch(h)
+        expect([h.retiredKeyWrites, readRetiredKeysRecord(h.stateDir)]).toEqual([[], null])
+        const expected = sweepResult({ listed: 4, kept: 4 })
+        expect(run.result).toEqual(expected)
+        expect(linesEqual(h, START_SWEEP_SHUTDOWN_STOP_LINE)).toHaveLength(1)
+        expectSummaryLast(h.errors, expected)
+      })
+
+      test('shutting down once the absent key is recorded, before the first kill: P\'s latch and the record stand; no kill, status, find-missing or get; the unkilled rows count as kept; one stop line, then the summary', async () => {
+        const { h, p, b } = srj105Build()
+
+        const run = await sweepOver(h, stopRows(h, p, b), h.config, () => h.retiredKeyWrites.length > 0)
+
+        expect(run.order).toEqual(['list'])
+        expectNoteLatchedOnce(h, p, latchRowStateRead('waiting'))
+        expectRecordedAbsent(h, [LAUNCH_START_ABSENT_PERSONA_KEY])
+        const expected = sweepResult({ listed: 4, kept: 3, recordedAsRetired: 1, leftForLatch: 1 })
+        expect(run.result).toEqual(expected)
+        expect(linesEqual(h, START_SWEEP_SHUTDOWN_STOP_LINE)).toHaveLength(1)
+        expectSummaryLast(h.errors, expected)
+        expect(killEntries(h)).toEqual([[], []])
+      })
+
+      test.each<[string, () => Error, (err: Error) => KillRetryAlert]>([
+        ['ErrTmuxUnresponsive', () => errTmuxUnresponsive('kill'), () => ({ kind: KILL_RETRY_ALERT_NONE })],
+        [
+          'a survivor-naming ErrTmuxKillFailed',
+          () => errTmuxKillFailed(sentinelInMessage('sweep-stopped-survivor'), 'pane-process-survived'),
+          (err) => ({ kind: KILL_RETRY_ALERT_ORDINARY, lastKillFailedDescription: killFailedDescriptionOf(err)! }),
+        ],
+      ])('shutting down during the first row\'s tries, after a first try answering %s: no further try or read for it, no kill of a later row, no find-missing; the latch and the record made before the kills stand; its orphan-cleanup entry has no alert text and there is no persona-kill-survivor entry; its one line quotes the descriptions; one stop line, then the summary', async (_label, make, alert) => {
+        const { h, p, b } = srj105Build()
+        const err = make()
+        h.script({ killError: err })
+        const rows = stopRows(h, p, b)
+
+        const run = await sweepOver(h, rows, h.config, () => h.stub.calls.killCalls.length > 0)
+
+        expect(run.order).toEqual(['list', 'kill'])
+        expectNoteLatchedOnce(h, p, latchRowStateRead('waiting'))
+        expectRecordedAbsent(h, [LAUNCH_START_ABSENT_PERSONA_KEY])
+        const expected = sweepResult({ listed: 4, kept: 3, killFailed: 1, recordedAsRetired: 1, leftForLatch: 1 })
+        expect(run.result).toEqual(expected)
+        const bRef = renderPersonaRef(b, b)
+        const standing = killOutcomeOf({ thrown: err })
+        expect(killEntries(h)).toEqual([[sweepKillFailedEntry(rows[0]!, bRef, standing, undefined, true)], []])
+        const stopped: KillRetryResult = { outcome: standing, end: KILL_RETRY_END_STOPPED, tries: 1, reads: 0, alert: alert(err) }
+        expect(linesEqual(h, startSweepStoppedKillLine(rows[0]!.claude_instance_id, bRef, stopped, START_SWEEP_KILL_STOP_SHUTDOWN))).toHaveLength(1)
+        expect(linesEqual(h, START_SWEEP_SHUTDOWN_STOP_LINE)).toHaveLength(1)
+        expectSummaryLast(h.errors, expected)
+        expect([h.controller.armedKeys(), h.triggers, h.notices]).toEqual([[], [], []])
+      })
+
+      test('shutting down while the post-kill find-missing runs: no get of P\'s own killed row it lists in unverified_ids, so P latches nothing; one stop line, then the no-get line, then the summary ends the sweep', async () => {
+        const { h, p } = srj105Build()
+        scriptNotedRows(h, new Map([[p, { liveness_note: provenanceNote }]]))
+        h.script({ findMissingResult: unverifiedRowsOf(p) })
+
+        const run = await sweepOver(h, [listed(h, p, { cwd: h.home })], h.config, () => h.stub.calls.findMissingCalls.length > 0)
+
+        expect(run.order).toEqual(['list', 'kill', 'findMissing'])
+        expectNoNoteLatch(h)
+        const expected = sweepResult({ listed: 1, killed: 1 })
+        expect(run.result).toEqual(expected)
+        expect(linesEqual(h, START_SWEEP_SHUTDOWN_STOP_LINE)).toHaveLength(1)
+        expectSummaryLast(h.errors, expected)
+        const stopAt = h.errors.indexOf(START_SWEEP_SHUTDOWN_STOP_LINE)
+        const noGetAt = h.errors.findIndex((line) => line.startsWith('[slack] reconcileOrphans: ') && line.includes('no post-sweep get is made'))
+        expect(stopAt).toBeGreaterThanOrEqual(0)
+        expect(noGetAt).toBeGreaterThan(stopAt)
+        expect(h.errors.indexOf(startSweepSummaryLine(expected))).toBeGreaterThan(noGetAt)
+      })
+
+      // PM finding F2: a shutdown begun during a find-missing run that then
+      // fails is logged by the sweep's end, once, before its summary.
+      test('shutting down while the post-kill find-missing runs, which then fails: the failure line and the post-kill failure line, then exactly one stop line, then the summary ends the sweep; no get', async () => {
+        const { h } = srj105Build()
+        h.script({ findMissingError: errGeneric('find-missing', 'ErrFindBroken') })
+        const legacy = prePersonaRow('waiting')
+
+        const run = await sweepOver(h, [legacy], h.config, () => h.stub.calls.findMissingCalls.length > 0)
+
+        expect(run.order).toEqual(['list', 'kill', 'findMissing'])
+        const expected = sweepResult({ listed: 1, killed: 1 })
+        expect(run.result).toEqual(expected)
+        expect(linesEqual(h, START_SWEEP_SHUTDOWN_STOP_LINE)).toHaveLength(1)
+        expectSummaryLast(h.errors, expected)
+        const failedAt = h.errors.indexOf(startSweepPostKillFailedLine(1))
+        const stopAt = h.errors.indexOf(START_SWEEP_SHUTDOWN_STOP_LINE)
+        expect(failedAt).toBeGreaterThanOrEqual(0)
+        expect(stopAt).toBeGreaterThan(failedAt)
+        expect(h.errors.indexOf(startSweepSummaryLine(expected))).toBeGreaterThan(stopAt)
+      })
+
+      /** The sweep's one line for an outage answer to `call` for `key` that came after it stopped (b.jg5 SRJ-714). */
+      const outageNotRaisedLine = (key: string, errorClass: string, call: string): string =>
+        `[slack] reconcileOrphans: the ${errorClass} answer to the ${call} for persona=${key} came after the sweep stopped — no outage is raised (b.jg5 SRJ-714)`
+
+      // PM ruling 3(a): once a shutdown has begun, an ENVIRONMENT or CONFIG
+      // answer at P's own row's kill, or at its read between the tries, raises
+      // no outage and arms nothing: one line instead.
+      test.each<[string, () => RecoveryStubScript, (h: RecoveryHarness) => boolean, string, string]>([
+        [
+          'the second kill answers ENVIRONMENT, the shutdown begun as it was made',
+          () => ({ killQueue: [cannedErr(errTmuxUnresponsive('kill')), cannedErr(errTmuxNotAvailable(undefined, 'kill'))] }),
+          (h) => h.stub.calls.killCalls.length > 1,
+          AD_ERROR_CLASS_ENVIRONMENT,
+          'kill',
+        ],
+        [
+          'the second kill answers CONFIG, the shutdown begun as it was made',
+          () => ({ killQueue: [cannedErr(errTmuxUnresponsive('kill')), cannedErr(errConfigMalformed())] }),
+          (h) => h.stub.calls.killCalls.length > 1,
+          AD_ERROR_CLASS_CONFIG,
+          'kill',
+        ],
+        [
+          'the status read between the tries answers CONFIG, the shutdown begun as it was made',
+          () => ({ killQueue: [cannedErr(errTmuxUnresponsive('kill')), cannedOk(cannedKillResult(true))], statusQueue: [cannedErr(errConfigMalformed())] }),
+          (h) => h.stub.calls.statusCalls.length > 0,
+          AD_ERROR_CLASS_CONFIG,
+          'status read between kill tries',
+        ],
+      ])('P\'s own row in another cwd, its first kill answering ErrTmuxUnresponsive; %s: no outage raised for P, nothing armed, triggered or posted; one line says so; no find-missing', async (_label, script, shuttingDown, errorClass, call) => {
+        const { h, p, b } = srj105Build()
+        h.script(script())
+
+        const run = await sweepOver(h, [listed(h, p, { cwd: h.home })], h.config, () => shuttingDown(h))
+
+        expect(run.order).not.toContain('findMissing')
+        expect(h.errors.filter((line) => line.includes('came after the sweep stopped'))).toEqual([outageNotRaisedLine(p, errorClass, call)])
+        for (const key of [p, b]) expect(getOutageFlags(key).size).toBe(0)
+        expect([h.controller.armedKeys(), h.triggers, h.notices, h.episodeNotices]).toEqual([[], [], [], []])
+        expect(linesEqual(h, START_SWEEP_SHUTDOWN_STOP_LINE)).toHaveLength(1)
+        expectNoNoteLatch(h)
+      })
+
+      // PM ruling 3(b): a post-run get that settles once the shutdown has
+      // begun is not acted on, though it reads P's own row with the note.
+      // (The get's own outage wrapper is the shared module's and is not
+      // asserted here.)
+      test('shutting down as the post-run get of P\'s own killed row settles, the row carrying provenance_conflict: P latches nothing and nothing is posted; one not-acted-on line, and the reads line says so; one stop line, then the summary', async () => {
+        const { h, p } = srj105Build()
+        scriptNotedRows(h, new Map([[p, { liveness_note: provenanceNote }]]))
+        h.script({ findMissingResult: unverifiedRowsOf(p) })
+
+        const run = await sweepOver(h, [listed(h, p, { cwd: h.home })], h.config, () => h.stub.calls.getCalls.length > 0)
+
+        expect(run.order).toEqual(['list', 'kill', 'findMissing', 'get'])
+        expectNoNoteLatch(h)
+        expect([h.notices, h.episodeNotices]).toEqual([[], []])
+        expect(h.errors.filter((line) => line.includes('the get settled after its caller stopped — not acted on'))).toHaveLength(1)
+        expect(h.errors.filter((line) => line.includes(`persona=${p} not acted on (its caller stopped)`))).toHaveLength(1)
+        const expected = sweepResult({ listed: 1, killed: 1 })
+        expect(run.result).toEqual(expected)
+        expect(linesEqual(h, START_SWEEP_SHUTDOWN_STOP_LINE)).toHaveLength(1)
+        expectSummaryLast(h.errors, expected)
+      })
+
+      test('the stopped kill\'s line quotes the survivor-naming description, redacted', async () => {
+        const { h, p, b } = srj105Build()
+        h.script({ killError: errTmuxKillFailed(sentinelInMessage('sweep-stopped-quote'), 'pane-process-survived') })
+
+        await sweepOver(h, stopRows(h, p, b), h.config, () => h.stub.calls.killCalls.length > 0)
+
+        const stoppedLines = h.errors.filter((line) => line.startsWith(`[slack] reconcileOrphans: kill tries for orphan instanceId=${personaInstanceId(b)}_old `))
+        expect(stoppedLines).toHaveLength(1)
+        expect(stoppedLines[0]).toContain(REDACTED_SENTINEL_TAIL)
+      })
+    })
+
+    // The orchestrator's ruling (2026-10-02; b.jg5 SRJ-702, SRJ-704, SRJ-714):
+    // a kill retry a server shutdown stopped posts nothing and leaves the row
+    // live; the next start's sweep is where that kill is retried, checked and
+    // alerted. Two harness lifetimes: the first server's live-row sequence
+    // kill stopped by its shutdown, then the next start's sweep over the row.
+    /** How the next start's sweep kill is scripted, and the outcome and alert it is to write. */
+    interface NextStartKill {
+      readonly script: RecoveryStubScript
+      readonly standing?: KillOutcome
+      readonly ordinary?: SweepOrdinaryQuotes
+      readonly survivorDescription?: string
+    }
+
+    test.each<[string, () => NextStartKill, boolean]>([
+      [
+        'its kill answers ErrTmuxKillFailed at every try: kept, with the ordinary version in its orphan-cleanup entry',
+        () => {
+          const err = errTmuxKillFailed(sentinelInMessage('next-start-kill-failed'))
+          return { script: { killError: err }, ordinary: { lastKillFailedDescription: killFailedDescriptionOf(err)! }, standing: killOutcomeOf({ thrown: err }) }
+        },
+        false,
+      ],
+      [
+        'its kill names a survivor, then succeeds: killed, with one persona-kill-survivor entry',
+        () => {
+          const survivor = errTmuxKillFailed(sentinelInMessage('next-start-survivor'), 'pane-process-survived')
+          return { script: { killQueue: [cannedErr(survivor), cannedOk(cannedKillResult(true))] }, survivorDescription: killFailedDescriptionOf(survivor)! }
+        },
+        true,
+      ],
+    ])('a row an earlier server\'s attempt kill left live when its shutdown stopped the tries (nothing posted or recorded then) is killed and checked by the next start\'s sweep: %s', async (_label, outcome, killed) => {
+      const first = srj105Build()
+      scriptLiveRowElsewhere(first.h, first.p, { killError: errTmuxUnresponsive('kill') })
+      const firstKill = first.h.stub.client.kill.bind(first.h.stub.client)
+      first.h.stub.client.kill = async (params) => {
+        try {
+          return await firstKill(params)
+        } finally {
+          first.h.shutdown()
+        }
+      }
+      expect(await launchThroughSequence(first.h, first.p)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_SHUTDOWN })
+      expect([first.h.startupErrors(), first.h.episodeNotices]).toEqual([[], []])
+      // The restart: leak-checked and cleaned up as afterEach does.
+      srj105AfterEach()
+
+      const { h, p } = srj105Build()
+      expect(p).toBe(first.p)
+      const o = outcome()
+      h.script(o.script)
+      // The row the first server's sequence left live: P's own row, in another directory.
+      const row = listed(h, p, { cwd: h.home })
+
+      const run = await sweepOver(h, [row])
+
+      const ref = renderPersonaRef(p, p)
+      if (killed) {
+        expect(run.result).toEqual(sweepResult({ listed: 1, killed: 1 }))
+        expect(killEntries(h)).toEqual([[], [sweepSurvivorEntry(row, o.survivorDescription!)]])
+      } else {
+        expect(run.result).toEqual(sweepResult({ listed: 1, kept: 1, killFailed: 1 }))
+        expect(killEntries(h)).toEqual([[sweepKillFailedEntry(row, ref, o.standing!, o.ordinary)], []])
+      }
+      expect([h.episodeNotices, h.notices, h.controller.armedKeys()]).toEqual([[], [], []])
+      expect(h.latch.isLatched(p)).toBe(false)
     })
   })
 })
@@ -6075,7 +6581,7 @@ describe('collision ladder: a directory-broken persona keeps its row (b.av2 SR-6
       const sweepLog = await withCapturedErr(async () => {
         sweep = await reconcileOrphans(cfg)
       })
-      expect(sweep).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
+      expect(sweep).toEqual(sweepResult({ listed: 1, kept: 1 }))
       expect(sweepLog).toContain(deferredSweepLine('C', 'C', broken.workingDirectory))
 
       broken.recreate()
@@ -14663,36 +15169,29 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
     return { cfg: makeMultiPersonaConfig([{ name: 'alpha', working_directory: fixtureSubdir('alpha-work') }], fixtureDir), home }
   }
 
-  /** Stub alpha's sweep: one row with a wrong instance ID (swept: kill, then delete), `failing` the verb that rejects. */
-  function installOrphan(failing: 'killError' | 'deleteError', err: Error): PersonaConfig {
+  /** Stub alpha's sweep: one row with a wrong instance ID (swept and killed), its kill rejecting with `err`; answers the configuration and the row. */
+  function installOrphan(err: Error): { cfg: PersonaConfig; row: import('agent-director').ListRow } {
     const { cfg, home } = orphanConfig()
-    installStub({
-      listResult: { spawns: [cannedListRow({ claude_instance_id: 'cscb_alpha_old' }, personaOf(cfg, 'alpha'), home)] },
-      [failing]: err,
-    })
-    return cfg
+    const row = cannedListRow({ claude_instance_id: 'cscb_alpha_old' }, personaOf(cfg, 'alpha'), home)
+    installStub({ listResult: { spawns: [row] }, killError: err })
+    return { cfg, row }
   }
 
-  // Each site records `<what> failed …: <describeAgentDirectorFailure(err)>`
+  // The site records `failed to list spawns …: <describeAgentDirectorFailure(err)>`
   // and no ` — <cause>` tail: the errName and the redacted description as
   // `message="…"` when the errName is a short identifier, else
   // describeThrownValue (the type, the redacted message `<errName>:
-  // <description>`, frames). The description appears once.
-  // (A spawn whose error has a token-shaped errName is UNCLASSIFIED, b.jg5
-  // SRJ-313: refused with no spawn-failed record; its case follows this table.)
-  test.each<[string, string, string, (err: Error) => Promise<void>]>([
-    ['a failed orphan delete', ORPHAN_CLEANUP_LABEL, 'delete', async (err) => {
-      expect(await reconcileOrphans(installOrphan('deleteError', err))).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
-    }],
-    ['a failed orphan list', ORPHAN_CLEANUP_LIST_FAILED_LABEL, 'list', async (err) => {
-      installStub({ listError: err })
-      expect(await reconcileOrphans(orphanConfig().cfg)).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
-    }],
-  ])('%s with a base AgentDirectorError whose errName is token-shaped and whose description holds a URL and a fake token → the %s record names its type and the redacted description once; nothing leaks', async (_label, classLabel, verb, run) => {
+  // <description>`, frames). The description appears once. (A spawn whose
+  // error has a token-shaped errName is UNCLASSIFIED, b.jg5 SRJ-313: refused
+  // with no spawn-failed record; its case follows this one.)
+  test('a failed orphan list with a base AgentDirectorError whose errName is token-shaped and whose description holds a URL and a fake token → the orphan-cleanup-list-failed record names its type and the redacted description once; nothing leaks', async () => {
     const readLog = captureStartupErrors()
-    const errLog = await withCapturedErr(() => run(new AgentDirectorError(verb, tokenErrName(), adDescription())))
+    const errLog = await withCapturedErr(async () => {
+      installStub({ listError: new AgentDirectorError('list', tokenErrName(), adDescription()) })
+      expect(await reconcileOrphans(orphanConfig().cfg)).toEqual(sweepResult())
+    })
 
-    const entry = onlyStartupEntry(readLog(), classLabel)
+    const entry = onlyStartupEntry(readLog(), ORPHAN_CLEANUP_LIST_FAILED_LABEL)
     expect(entry).toContain(': AgentDirectorError message="')
     expect(entry).toContain(`${REDACTED_AD_DESCRIPTION}"`)
     // Once: no cause tail repeating the description.
@@ -14701,21 +15200,32 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
     assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
   })
 
-  // b.jg5 SRJ-110, SRJ-701: the sweep's kill is a checked kill, so a failed
-  // orphan kill keeps the row (no delete) and its record names the outcome:
-  // the class, and the redacted description once (the token-shaped errName
-  // is no safe identifier, so it is left out).
-  test('b.jg5 SRJ-110, SRJ-701: a failed orphan kill with a base AgentDirectorError whose errName is token-shaped and whose description holds a URL and a fake token → the row is kept (no delete) and the orphan-cleanup record names the outcome and the redacted description once; nothing leaks', async () => {
+  // b.jg5 SRJ-110, SRJ-701, SRJ-714: the sweep's kill is a checked kill, so a
+  // failed orphan kill keeps the row (no delete) and its record names the
+  // row, its state, its session and the outcome: the class, and the redacted
+  // description once (the token-shaped errName is no safe identifier, so it
+  // is left out).
+  test('b.jg5 SRJ-110, SRJ-701, SRJ-714: a failed orphan kill with a base AgentDirectorError whose errName is token-shaped and whose description holds a URL and a fake token → the row is kept (no delete) and the orphan-cleanup record names the row and the outcome with the redacted description once; nothing leaks', async () => {
     const readLog = captureStartupErrors()
     const err = new AgentDirectorError('kill', tokenErrName(), adDescription())
     let result: Awaited<ReturnType<typeof reconcileOrphans>> | undefined
+    let row!: import('agent-director').ListRow
     const errLog = await withCapturedErr(async () => {
-      result = await reconcileOrphans(installOrphan('killError', err))
+      const orphan = installOrphan(err)
+      row = orphan.row
+      result = await reconcileOrphans(orphan.cfg)
     })
 
-    expect(result).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
+    expect(result).toEqual(sweepResult({ listed: 1, kept: 1, killFailed: 1 }))
     const entry = onlyStartupEntry(readLog(), ORPHAN_CLEANUP_LABEL)
-    expect(entry).toContain(`: ${describeKillOutcome(killOutcomeOf({ thrown: err }))}; row kept, no delete was made`)
+    expect(entry.endsWith(startSweepKillFailedEntry({
+      instanceId: row.claude_instance_id,
+      persona: renderPersonaRef('alpha', 'alpha'),
+      state: row.state,
+      session: row.tmux_session_name,
+      outcome: describeKillOutcome(killOutcomeOf({ thrown: err })),
+      stoppedAtShutdown: false,
+    }))).toBe(true)
     expect(entry).toContain(`message="${REDACTED_AD_DESCRIPTION}"`)
     expect(entry.split(REDACTED_URL_PLACEHOLDER)).toHaveLength(2)
     assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
@@ -18333,7 +18843,7 @@ const OLD_MARKED_MISSING = cannedFindMissing({ rows: { [SWEPT_OLD_ID]: 'ids' } }
 const OLD_LEFT_LIVE = cannedFindMissing({ rows: { [SWEPT_OLD_ID]: 'unverified_ids' } })
 
 /** The start sweep's post-kill outcome line's buckets. */
-const POST_KILL_OUTCOME = /: findMissing after the kills of \d+ live pre-persona row\(s\): missing=\d+ \[([^\]]*)\] still-live=\d+ \[([^\]]*)\] not-judged=\d+ \[([^\]]*)\]/
+const POST_KILL_OUTCOME = /: findMissing after the kills of \d+ row\(s\): missing=\d+ \[([^\]]*)\] still-live=\d+ \[([^\]]*)\] not-judged=\d+ \[([^\]]*)\]/
 
 /** For each post-kill outcome line in `lines`, in order, the bucket holding row `id` (`none` when no bucket does). */
 function sweptRowBuckets(lines: readonly string[], id = SWEPT_OLD_ID): string[] {

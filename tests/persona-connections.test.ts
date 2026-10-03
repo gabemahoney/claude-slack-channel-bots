@@ -6547,7 +6547,10 @@ describe('bring-up outcomes (E5)', () => {
   // `closePendingSession`, as that handler does.
   // -------------------------------------------------------------------------
 
-  /** A row of a persona absent from the config: the sweep's control, which it must remove. */
+  /**
+   * A live row of a persona absent from the config: the sweep's control, which it kills and keeps
+   * (no delete; b.jg5 SRJ-714, SRJ-1506 beside b.av2 SR-6.3).
+   */
   const ORPHAN_ID = 'cscb_gone'
   /** The rows the agent-director stub holds, by instance ID (see holdRows). */
   let rows: Map<string, { list: ReturnType<typeof cannedListRow>; get: ReturnType<typeof cannedGetResult> }>
@@ -6700,11 +6703,11 @@ describe('bring-up outcomes (E5)', () => {
       // A notice raised for A before the pass is held; it must never be posted.
       await f.notifier.notify(a.key, 'held notice for A')
 
-      // The start sweep removes its control row and nothing of A's; A's cwd check is deferred
-      // only when its working directory has no real path.
+      // The start sweep kills its control row and keeps it (no delete), and touches nothing of
+      // A's; A's cwd check is deferred only when its working directory has no real path.
       await reconcileOrphans(f.h.config!)
-      expect(adCallsFor(ORPHAN_ID)).toEqual({ kill: 1, delete: 1 })
-      expect([...rows.keys()]).toEqual([idOf(a)])
+      expect(adCallsFor(ORPHAN_ID)).toEqual({ kill: 1 })
+      expect([...rows.keys()]).toEqual([idOf(a), ORPHAN_ID])
       expect(deferredLines()).toEqual(existsSync(a.working_directory) ? [] : [expect.stringContaining(renderPersonaRef(a.name, a.key))])
 
       let result: StartupSessionManagerResult | undefined
@@ -6765,7 +6768,7 @@ describe('bring-up outcomes (E5)', () => {
       expect(getSessionByPersona(a.key)).toBeUndefined()
       expect(getSessionByPersona(b.key)).toBe(fromB.entry!)
       expect(adCallsFor(idOf(a))).toEqual({})
-      expect([...rows.keys()]).toEqual([idOf(a)])
+      expect([...rows.keys()]).toEqual([idOf(a), ORPHAN_ID])
       await expectServes(f, b)
       expect(slackCallsBesidesAuthTest(f)).toEqual([])
       expect(sessionNotices).toEqual([])
@@ -6918,7 +6921,7 @@ describe('bring-up outcomes (E5)', () => {
 
       expect(result.perPersona.find(p => p.key === a.key)).toMatchObject({ action: 'not-brought-up', outcome: 'retrying' })
       expect(adCallsFor(idOf(a))).toEqual({})
-      expect(adCallsFor(ORPHAN_ID)).toEqual({ kill: 1, delete: 1 })
+      expect(adCallsFor(ORPHAN_ID)).toEqual({ kill: 1 })
       expect(deferredLines()).toEqual([expect.stringContaining(renderPersonaRef(a.name, a.key))])
       // While A retries, a registration from its configured directory is refused.
       const whileRetrying = await connectSession(f, a.working_directory)
@@ -6934,7 +6937,7 @@ describe('bring-up outcomes (E5)', () => {
       await waitForReal(() => launched !== undefined)
       expect(launched).toEqual({ key: a.key, action })
       expect(adCallsFor(idOf(a))).toEqual(reuseCalls)
-      expect([...rows.keys()]).toEqual([idOf(a)])
+      expect([...rows.keys()]).toEqual([idOf(a), ORPHAN_ID])
       expect(spawnedIds()).toEqual([idOf(b), idOf(a)])
       expect(getOutageFlags(a.key).has('cwd-unreachable')).toBe(false)
 

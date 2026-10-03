@@ -175,7 +175,8 @@
  * mark set clears the key's entry, beside any latch the same read decides
  * (b.jg5 SRJ-807); the persona teardown kill's `status` read between its
  * tries applies that clear alone and latches nothing (`readTeardownKillRow`,
- * SRJ-715, SRJ-115).
+ * SRJ-715, SRJ-115), and so does the start sweep kill's (`sweepKillRead`,
+ * SRJ-714).
  * An UNUSABLE NAME answer to either read latches the persona with the state
  * unreadable. A read that latched answers `latched`, and the caller calls
  * nothing more for the persona: no `send-keys`, kill, delete or launch, and
@@ -243,16 +244,20 @@
  * of every listed row labelled with a persona absent from the applied
  * configuration, with the cause `absent-at-start` (b.jg5 SRJ-714, SRJ-803);
  * a failed write leaves the file as it was while the store holds those keys
- * in memory, and the sweep goes on. Then it kills each remaining row with a
- * persona absent from the
- * applied configuration, an instance ID other than `cscb_<key>`, or a `cwd`
- * other than its persona's working directory, deleting it only after a kill
- * that succeeded (each kill a checked kill, b.jg5 SRJ-110, SRJ-701, run
- * through the bounded retry with one pass budget, SRJ-702; no kill latches
- * anything or arms a retry timer). A pre-persona row (no `persona`
- * label) is never deleted: it is kept, and killed only when live, with one
- * findMissing sweep after the kills so a killed row reads `missing` once its
- * session is gone and isn't killed again at the next start (b.1ix). While a
+ * in memory, and the sweep goes on. Then it kills, with the result checked,
+ * each remaining live row with a persona absent from the applied
+ * configuration, an instance ID other than `cscb_<key>`, or a `cwd` other
+ * than its persona's working directory, and each live pre-persona row (no
+ * `persona` label, b.1ix); a finished row is never killed (each kill a
+ * checked kill, b.jg5 SRJ-110, SRJ-701, run through the bounded retry with
+ * one pass budget, SRJ-702; no kill latches anything or arms a retry timer).
+ * It deletes no row (b.jg5 SRJ-714, SRJ-1506 amending b.av2 SR-6.3): every
+ * row is kept, whatever its kill's outcome, pre-persona and absent-persona
+ * rows are never resumed, and agent-director's `expire` removes them later.
+ * One findMissing run follows the kills, over every row given one, so a
+ * killed row reads `missing` once its session is gone and isn't killed again
+ * at the next start, and one summary line ends the sweep. Once the server
+ * begins shutting down, the sweep makes no further agent-director call. While a
  * persona's working directory cannot be resolved to a real path, neither the
  * sweep nor the collision ladder acts on `cwd` grounds on a row whose `cwd`
  * has no real path either (b.av2 SR-6.4): the sweep defers the check to the
@@ -1828,6 +1833,37 @@ export interface OwnRowReadSite {
    * (`readPersonaOwnRow`). The row-read rule still applies to a row read.
    */
   readonly unusableNameRoutedIn?: string
+  /**
+   * Asked once the `get` settles, before anything is acted on: an answer
+   * other than true (or a throw) means the read's caller has stopped, so
+   * nothing is acted on (`ownRowActGoes`; b.jg5 SRJ-714): the start sweep's
+   * post-run `get`s once the server has begun shutting down. Absent: the
+   * answer is acted on.
+   */
+  readonly actGoes?: () => boolean
+}
+
+/**
+ * Whether `readPersonaOwnRow` acts on the answer of the `get` it made at
+ * `at` (`OwnRowReadSite.actGoes`): true when `at` carries no check; when the
+ * check answers other than true or throws, false, with one line:
+ *
+ *   [slack] <site>: <what> for <ref>: the get settled after its caller stopped — not acted on: no latch, clear or episode end (b.jg5 SRJ-714)
+ *
+ * Never throws.
+ */
+function ownRowActGoes(key: string, at: OwnRowReadSite): boolean {
+  if (at.actGoes === undefined) return true
+  let goes: boolean
+  try {
+    goes = at.actGoes() === true
+  } catch {
+    goes = false
+  }
+  if (!goes) {
+    console.error(`${ownRowReadHead(key, at)}: the get settled after its caller stopped — not acted on: no latch, clear or episode end (b.jg5 SRJ-714)`)
+  }
+  return goes
 }
 
 /**
@@ -1876,6 +1912,12 @@ export interface OwnRowReadSite {
  * persona's kill-failure episode silently (`endKillFailureEpisodeOnRead`;
  * b.jg5 SRJ-704, SRJ-1016).
  *
+ * When `at.actGoes` answers that the caller has stopped once the `get`
+ * settles (`ownRowActGoes`; b.jg5 SRJ-714), nothing below is acted on: no
+ * latch, no retired-entry clear, no episode end and no routed line; the read
+ * answers `row` with `latched` false, `absent`, or `refused` carrying the
+ * error, after that check's one line.
+ *
  * A row that is the key's own, read `waiting`, `working`, `ask_user` or
  * `check_permission` while the installed retired-key store has the key
  * recorded with its mark set, clears the key's entry, durably, whether or
@@ -1913,6 +1955,10 @@ export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promis
       client.get({ claude_instance_id: personaInstanceId(key) }),
     )
   } catch (err) {
+    // b.jg5 SRJ-714: an answer that settles after the caller stopped is not acted on.
+    if (!ownRowActGoes(key, at)) {
+      return hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME) ? { kind: OWN_ROW_READ_ABSENT } : { kind: OWN_ROW_READ_REFUSED, error: err }
+    }
     if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) {
       // b.jg5 SRJ-704, SRJ-1016: the row is gone; the kill-failure episode ends.
       endKillFailureEpisodeOnRead(key, { thrown: err })
@@ -1926,6 +1972,8 @@ export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promis
     if (latchOnUnusableNameRead(key, err, at)) return { kind: OWN_ROW_READ_LATCHED }
     return { kind: OWN_ROW_READ_REFUSED, error: err }
   }
+  // b.jg5 SRJ-714: a row that settles after the caller stopped is not acted on.
+  if (!ownRowActGoes(key, at)) return { kind: OWN_ROW_READ_ROW, row, latched: false }
   // b.jg5 SRJ-704, SRJ-1016: a row read `ended` or `missing` ends the kill-failure episode.
   endKillFailureEpisodeOnRead(key, { state: row.state })
   return { kind: OWN_ROW_READ_ROW, row, latched: actOnOwnRowRead(key, row, at, true) !== undefined }
@@ -5446,14 +5494,23 @@ interface FindMissingSweepOptions {
    */
   readonly nextStepGetKey?: string
   /**
-   * The start sweep's run (`reconcileKilledPrePersonaRows`, which acts for no
-   * persona): a run this caller starts makes its post-run `get`s with an
-   * UNUSABLE NAME answer routed per SRJ-1002, so it latches nothing (b.jg5
+   * The start sweep's run (`runStartSweepPostKillFindMissing`, which acts
+   * for no persona): a run this caller starts makes its post-run `get`s with
+   * an UNUSABLE NAME answer routed per SRJ-1002, so it latches nothing (b.jg5
    * SRJ-512) and is carried as a failed read. The note and launch-start
    * decisions still latch there (b.jg5 SRJ-114, SRJ-513). A run another
    * caller started keeps that caller's reads.
    */
   readonly startSweepRun?: boolean
+  /**
+   * Asked once when a run this caller starts has returned, before its
+   * post-run `get`s: an answer other than true (or a throw) makes none, with
+   * one line (the start sweep's shutdown stop, b.jg5 SRJ-714). Asked again
+   * as each of those `get`s settles, before its answer is acted on: an
+   * answer other than true leaves that `get`'s answer not acted on
+   * (`readListedPersonaRows`). Absent: the `get`s are made and acted on.
+   */
+  readonly postRunGetsGo?: () => boolean
 }
 
 /** The context an UNUSABLE NAME answer to the start sweep's post-run `get`s is routed in (b.jg5 SRJ-1002). */
@@ -5612,7 +5669,7 @@ export const FIND_MISSING_LATCHED: unique symbol = Symbol('find-missing latched'
  * The memo and single-flight core of every findMissing caller
  * (b.m4r, b.jg5 SRJ-120). `start` makes the call when a run starts: a
  * persona's call through `withOutageDetection`, or the start sweep's direct
- * call (`reconcileKilledPrePersonaRows`), which acts for no persona. Never
+ * call (`runStartSweepPostKillFindMissing`), which acts for no persona. Never
  * throws.
  *
  * Run kinds (`opts.kind`):
@@ -5840,19 +5897,45 @@ function startFindMissingRun(
     console.error(
       `[slack] ${logPrefix}: ${words} for ${ref} — count=${result.count} ids=[${result.ids.join(',')}] unverified=${result.unverified} unverified_ids=[${result.unverified_ids.join(',')}]`,
     )
-    const reads = await readListedPersonaRows(
-      result,
-      opts.nextStepGetKey,
-      logPrefix,
-      `${words} for ${ref}`,
-      opts.startSweepRun === true ? START_SWEEP_ROUTED_CONTEXT : undefined,
-    )
+    const reads = postRunGetsGo(opts)
+      ? await readListedPersonaRows(
+          result,
+          opts.nextStepGetKey,
+          logPrefix,
+          `${words} for ${ref}`,
+          opts.startSweepRun === true ? START_SWEEP_ROUTED_CONTEXT : undefined,
+          opts.postRunGetsGo === undefined ? undefined : () => postRunGetsGo(opts),
+        )
+      : noPostRunReads(logPrefix, `${words} for ${ref}`)
     if (_findMissingLast === null || _findMissingLast.seq < seq) _findMissingLast = { result, at, seq }
     if (_findMissingInFlight === run) _findMissingInFlight = null
     return { result, latchedKeys: reads.latchedKeys, refusedReads: reads.refusedReads }
   })()
   run = { seq, kind, promise }
   return run
+}
+
+/** The starter's `postRunGetsGo` answer: true when absent, false for any other answer than true or a throw. Never throws. */
+function postRunGetsGo(opts: FindMissingSweepOptions): boolean {
+  if (opts.postRunGetsGo === undefined) return true
+  try {
+    return opts.postRunGetsGo() === true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * A run's post-run reads when its starter's `postRunGetsGo` answered no: no
+ * `get` is made, nothing latched and nothing refused, with one line:
+ *
+ *   [slack] <logPrefix>: after the <run> — no post-sweep get is made: its caller stopped (b.jg5 SRJ-120, SRJ-714)
+ *
+ * Never throws.
+ */
+function noPostRunReads(logPrefix: string, run: string): PostRunReads {
+  console.error(`[slack] ${logPrefix}: after the ${run} — no post-sweep get is made: its caller stopped (b.jg5 SRJ-120, SRJ-714)`)
+  return { latchedKeys: NO_LATCHED_KEYS, refusedReads: new Map<string, unknown>() }
 }
 
 /**
@@ -5905,13 +5988,18 @@ function ownRowKeyOfRowId(id: unknown): string | undefined {
  * in the answer (`refusedReads`) for that persona's own caller to handle
  * (`postRunGetRefusal`); for every other caller it is only listed in the
  * line below. Neither ever fails the run, is memoized as a failure or stops
- * the other `get`s. No `get` is made for any other id. When at least one
+ * the other `get`s. No `get` is made for any other id. `actGoes`, when
+ * given (the starter's `postRunGetsGo`), is asked as each `get` settles
+ * (`OwnRowReadSite.actGoes`): a `get` that settles once it answers no is
+ * not acted on (b.jg5 SRJ-714): no latch, clear or episode end, nothing
+ * latched or carried in the answer, and `not acted on (its caller stopped)`
+ * in the line below. When at least one
  * listed persona was read or skipped, one line lists every one of them, in
  * `unverified_ids` order, with what its read answered or that it was skipped
  * (persona references only; a refused read carries the redacting
  * describer's text):
  *
- *   [slack] <logPrefix>: after the <run> — one get of each configured persona's own row in unverified_ids: persona=<key> <read|latched|absent|refused (<failure>)|skipped (latched)>, … (b.jg5 SRJ-120)
+ *   [slack] <logPrefix>: after the <run> — one get of each configured persona's own row in unverified_ids: persona=<key> <read|latched|absent|refused (<failure>)|skipped (latched)|not acted on (its caller stopped)>, … (b.jg5 SRJ-120)
  *
  * where `<run>` is `findMissing sweep for <ref>` or `bypassing findMissing
  * sweep for <ref>`. No line is logged when no configured persona is listed.
@@ -5925,9 +6013,27 @@ async function readListedPersonaRows(
   logPrefix: string,
   run: string,
   unusableNameRoutedIn: string | undefined,
+  actGoes: (() => boolean) | undefined,
 ): Promise<PostRunReads> {
   const latchedKeys = new Set<string>()
   const refusedReads = new Map<string, unknown>()
+  // The personas whose `get` settled after the starter stopped: not acted on.
+  const notActed = new Set<string>()
+  const siteFor = (key: string): OwnRowReadSite => {
+    const base: OwnRowReadSite =
+      unusableNameRoutedIn === undefined
+        ? { site: logPrefix, what: 'post-sweep get' }
+        : { site: logPrefix, what: 'post-sweep get', unusableNameRoutedIn }
+    if (actGoes === undefined) return base
+    return {
+      ...base,
+      actGoes: () => {
+        const goes = actGoes()
+        if (!goes) notActed.add(key)
+        return goes
+      },
+    }
+  }
   // One entry per listed configured persona, in `unverified_ids` order: what
   // its `get` answered, or that it was skipped because it was already latched.
   const entries: string[] = []
@@ -5940,22 +6046,18 @@ async function readListedPersonaRows(
       listed.push({ key, skipped: personaLatchedNow(key) })
     }
     const toRead = listed.filter((l) => !l.skipped).map((l) => l.key)
-    const settled = await Promise.allSettled(
-      toRead.map((key) =>
-        readPersonaOwnRow(
-          key,
-          unusableNameRoutedIn === undefined
-            ? { site: logPrefix, what: 'post-sweep get' }
-            : { site: logPrefix, what: 'post-sweep get', unusableNameRoutedIn },
-        ),
-      ),
-    )
+    const settled = await Promise.allSettled(toRead.map((key) => readPersonaOwnRow(key, siteFor(key))))
     const entryOf = new Map<string, string>()
     settled.forEach((outcome, i) => {
       const key = toRead[i]
       if (outcome.status === 'rejected') {
         // Not reached (`readPersonaOwnRow` never throws); that persona is left out of the line.
         console.error(`[slack] ${logPrefix}: after the ${run} — the post-sweep gets failed: ${describeThrownValue(outcome.reason)} (b.jg5 SRJ-120)`)
+        return
+      }
+      if (notActed.has(key)) {
+        // b.jg5 SRJ-714: settled after the starter stopped; neither latched nor carried.
+        entryOf.set(key, `${keyRef(key)} not acted on (its caller stopped)`)
         return
       }
       const ownRead = outcome.value
@@ -12149,24 +12251,38 @@ function raiseSequenceEscalationAlert(
 }
 
 // ---------------------------------------------------------------------------
-// reconcileOrphans — SR-1.6 startup orphan reconciliation
+// reconcileOrphans — the start sweep (b.av2 SR-6.3; b.jg5 SRJ-714, SRJ-1506)
 // ---------------------------------------------------------------------------
 
-/** What the start sweep did. */
+/**
+ * What the start sweep did, in b.jg5 SRJ-714's summary counts. Every listed
+ * row is counted once, so `listed` is `killed + kept + leftForLatch`; no row
+ * is ever deleted.
+ */
 export interface OrphanReconcileResult {
-  /** Rows swept: each killed, then deleted only after a kill that succeeded. Pre-persona rows are never swept. */
-  found: number
-  /** Swept rows deleted. */
+  /** Rows the sweep's one `list` returned. */
+  listed: number
+  /**
+   * Rows whose kill's success stands: any `kill_sent`, `ErrSpawnNotFound`,
+   * GONE, or a `status` read between tries that found the row finished, a
+   * success after a survivor-naming failure included (b.jg5 SRJ-702).
+   */
   killed: number
-  /** Swept rows kept because their kill did not succeed, or whose delete failed. */
-  failed: number
-  /** Pre-persona rows (no `persona` label), all kept (b.1ix). */
-  prePersona: PrePersonaSweepCounts
+  /**
+   * Listed rows neither killed nor left for a latch: finished rows (never
+   * killed), rows that match their persona, rows whose directory check is
+   * deferred, rows whose kill did not succeed (`killFailed`), and rows a
+   * shutdown or a version re-check's stop left unreached.
+   */
+  kept: number
+  /** Of `kept`, the rows given a kill that did not succeed, a kill whose tries a shutdown stopped included. */
+  killFailed: number
   /**
    * Keys recorded as retired with the cause `absent-at-start`, in the sweep's
    * one batch record (`recordAbsentPersonaKeys`; b.jg5 SRJ-714, SRJ-803):
-   * every key the batch named, those held only in memory after a failed
-   * write included (hatch A3). 0 with no store installed.
+   * every key the batch named, an already-recorded key and those held only
+   * in memory after a failed write included (hatch A3). 0 with no store
+   * installed.
    */
   recordedAsRetired: number
   /**
@@ -12177,38 +12293,89 @@ export interface OrphanReconcileResult {
   leftForLatch: number
 }
 
-/**
- * The start sweep's pre-persona rows (b.1ix): all kept; each live one is
- * killed at this start, then one findMissing sweep lets a killed row whose
- * session is gone read `missing`, so a later start doesn't kill it again.
- */
-export interface PrePersonaSweepCounts {
-  /** Pre-persona rows listed. Every one is kept. */
-  kept: number
-  /** Those in a live state (`AGENT_DIRECTOR_LIVE_STATES`), each given one kill call at this start. */
-  live: number
-  /** Live ones whose kill did not succeed (`kill_sent` false or absent, and `ErrSpawnNotFound`, are successes). */
-  killFailed: number
-}
-
 /** A start sweep that did nothing (dry run, or a failed list). */
 function emptySweepResult(): OrphanReconcileResult {
-  return { found: 0, killed: 0, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 }
+  return { listed: 0, killed: 0, kept: 0, killFailed: 0, recordedAsRetired: 0, leftForLatch: 0 }
+}
+
+/**
+ * The start sweep's one summary line (b.jg5 SRJ-714), the last line of every
+ * sweep that listed its rows, a sweep a shutdown stopped included:
+ *
+ *   [slack] reconcileOrphans: summary — listed=<n> killed=<n> kept=<n> (kill-failed=<n>) recorded-as-retired=<n> left-unkilled-for-latch=<n> (b.jg5 SRJ-714)
+ *
+ * Pure.
+ */
+export function startSweepSummaryLine(result: Readonly<OrphanReconcileResult>): string {
+  return (
+    `[slack] reconcileOrphans: summary — listed=${result.listed} killed=${result.killed} kept=${result.kept} ` +
+    `(kill-failed=${result.killFailed}) recorded-as-retired=${result.recordedAsRetired} ` +
+    `left-unkilled-for-latch=${result.leftForLatch} (b.jg5 SRJ-714)`
+  )
+}
+
+/** A listed row the sweep left as it was because its persona latched (b.jg5 SRJ-502, SRJ-714). */
+const SWEEP_ROW_LEFT_FOR_LATCH = 'left-for-latch'
+/** A listed row given no kill and kept: finished, matching its persona, directory-deferred, or not reached after a stop. */
+const SWEEP_ROW_KEPT = 'kept'
+/** A listed row whose kill's success stands. */
+const SWEEP_ROW_KILLED = 'killed'
+/** A listed row given a kill that did not succeed: kept. */
+const SWEEP_ROW_KILL_FAILED = 'kill-failed'
+
+/** What the start sweep did with one listed row. */
+type SweepRowDisposition =
+  | typeof SWEEP_ROW_LEFT_FOR_LATCH
+  | typeof SWEEP_ROW_KEPT
+  | typeof SWEEP_ROW_KILLED
+  | typeof SWEEP_ROW_KILL_FAILED
+
+/**
+ * One listed row as the start sweep handled it: the row as listed (its
+ * state, `cwd`, labels and session), what the sweep did with it, and, for a
+ * row given a kill, the bounded retry's result (the outcome that stands, how
+ * the tries ended and the alert decision). The sweep keeps one per listed
+ * row, in list order; its counts and its post-kill findMissing run are taken
+ * from them.
+ */
+interface SweepRowRecord {
+  readonly row: ListRow
+  readonly disposition: SweepRowDisposition
+  readonly kill?: KillRetryResult
+}
+
+/** The sweep's counts over its per-row records (`listed` = every record). Pure. */
+function sweepResultOf(records: readonly SweepRowRecord[], recordedAsRetired: number): OrphanReconcileResult {
+  const result = emptySweepResult()
+  result.listed = records.length
+  result.recordedAsRetired = recordedAsRetired
+  for (const { disposition } of records) {
+    if (disposition === SWEEP_ROW_LEFT_FOR_LATCH) result.leftForLatch++
+    else if (disposition === SWEEP_ROW_KILLED) result.killed++
+    else {
+      result.kept++
+      if (disposition === SWEEP_ROW_KILL_FAILED) result.killFailed++
+    }
+  }
+  return result
 }
 
 /**
  * What the start sweep does with a row that has a `persona` label (b.av2
- * SR-6.3, SR-6.4): `sweep` it with a reason, `keep` it, or keep it with its
- * `cwd` check `deferred` to the persona's launch. A row is kept only when its
- * label names an applied persona, its instance ID is that persona's
- * `cscb_<key>`, and its `cwd` matches the persona's working directory by real
- * path. When that working directory cannot be resolved to a real path (a
- * directory-broken persona) and the row's `cwd` has no real path either or
- * equals the configured path lexically (`cwdCheckDeferred`), the `cwd`
- * condition cannot be evaluated and is deferred; the other conditions still
- * apply. A row whose `cwd` resolves to an existing directory is swept as
- * `wrong cwd`. A row with no `persona` label never gets here: see
- * `keepPrePersonaRow`.
+ * SR-6.3, SR-6.4, amended by b.jg5 SRJ-1506; b.jg5 SRJ-714): `sweep` it with
+ * a reason, `keep` it, or keep it with its `cwd` check `deferred` to the
+ * persona's launch. A row is kept only when its label names an applied
+ * persona, its instance ID is that persona's `cscb_<key>`, and its `cwd`
+ * matches the persona's working directory by real path. When that working
+ * directory cannot be resolved to a real path (a directory-broken persona)
+ * and the row's `cwd` has no real path either or equals the configured path
+ * lexically (`cwdCheckDeferred`), the `cwd` condition cannot be evaluated and
+ * is deferred; the other conditions still apply. A row whose `cwd` resolves
+ * to an existing directory is swept as `wrong cwd`. A swept row is killed
+ * with the result checked only when it is listed live, a finished one is
+ * never killed, and no swept row is deleted (`killStartSweepRow`). A row
+ * with no `persona` label never gets here: it is a pre-persona row, killed
+ * when live and kept the same way.
  */
 function sweepDecision(
   row: ListRow,
@@ -12224,79 +12391,172 @@ function sweepDecision(
 }
 
 /**
- * The start sweep's handling of a pre-persona row, one with no `persona`
- * label (b.1ix; the rows a build that predates personas made, instance IDs
- * `cscb_<name>_<channel>`): the row is kept, never deleted. Its ID is never a
- * persona's `cscb_<key>`, so no launch reuses or resumes it, and keeping it is
- * harmless. A row in a live state gets its kill at this start, through the
- * bounded retry with the pass's budget (`sweepKill`; b.jg5 SRJ-110, SRJ-701,
- * SRJ-702), and the outcome that stands logged; an `ended` or `missing` row
- * is left alone, with no call and no line. Returns whether it called
- * `kill`.
+ * Which row a start-sweep kill is for, in its lines and its `orphan-cleanup`
+ * entry: a swept row (`persona` is the persona reference when the persona is
+ * applied, else the raw label value) or a pre-persona row (no `persona`
+ * label; b.1ix), and the applied persona the row's label names
+ * (`configuredKey`, undefined for an absent persona and a pre-persona row),
+ * for whom an ENVIRONMENT or CONFIG answer raises its outage (b.jg5 SRJ-110;
+ * hatch A3).
+ */
+interface StartSweepKillTarget {
+  readonly persona?: string
+  readonly configuredKey?: string
+}
+
+/** How a start-sweep kill's lines and entry name the row (`<what> instanceId=<id>[ persona=<persona>]`). */
+function startSweepRowName(instanceId: string, persona: string | undefined): string {
+  return persona === undefined ? `pre-persona row instanceId=${instanceId}` : `orphan instanceId=${instanceId} persona=${persona}`
+}
+
+/** What a start-sweep kill's `orphan-cleanup` entry is built from (`startSweepKillFailedEntry`). */
+export interface StartSweepKillFailedEntryInput {
+  /** The row's instance id. */
+  readonly instanceId: string
+  /** The swept row's persona reference or label value; absent for a pre-persona row. */
+  readonly persona?: string
+  /** The state the sweep listed the row in. */
+  readonly state: string
+  /** The row's tmux session name as listed. */
+  readonly session: string
+  /** The outcome that stands, rendered (`describeKillOutcome`: its class, name and redacted description). */
+  readonly outcome: string
+  /** True when a shutdown stopped the kill's tries (b.jg5 SRJ-702, SRJ-714): no alert text follows. */
+  readonly stoppedAtShutdown: boolean
+}
+
+/**
+ * The text of a start-sweep kill's `orphan-cleanup` entry (b.jg5 SRJ-714,
+ * SRJ-1013): the row, its listed state, its tmux session and the outcome
+ * that stands with its class; for a kill whose tries a shutdown stopped, that
+ * no kill-failure alert is raised:
  *
- * agent-director 0.10.0's `kill` doesn't change the row's state, so a killed
- * row would still read live at every later start and be killed again each
- * time. `reconcileOrphans` therefore runs one findMissing sweep after the
- * kills (`reconcileKilledPrePersonaRows`): a row whose session is gone then
- * reads `missing`, and later starts leave it alone. A row whose session is
- * still there stays live and is killed again at the next start.
+ *   kill did not succeed for <orphan instanceId=<id> persona=<persona>|pre-persona row instanceId=<id>> state=<state> tmux_session=<session>: <outcome>[; its tries were stopped because the server is shutting down, so no kill-failure alert is raised]; row kept, its session may still be running
  *
- * Why no delete: agent-director 0.10.0's `kill` can report success while the
- * session lives on, and a deleted row would leave that session running with
- * no row to find it by (the incident pattern, at the upgrade to personas the
- * whole fleet at once). The upgrade runbook stops the old build's bots first
- * and has an operator confirm with `tmux ls` that none is left.
+ * The sweep appends the kill-failure alert's ordinary version to it when the
+ * retry decided it and no shutdown stopped the tries (`; kill-failure alert:
+ * <entry>`). Pure.
+ */
+export function startSweepKillFailedEntry(input: StartSweepKillFailedEntryInput): string {
+  const stopped = input.stoppedAtShutdown
+    ? '; its tries were stopped because the server is shutting down, so no kill-failure alert is raised'
+    : ''
+  return (
+    `kill did not succeed for ${startSweepRowName(input.instanceId, input.persona)} state=${input.state} ` +
+    `tmux_session=${input.session}: ${input.outcome}${stopped}; row kept, its session may still be running`
+  )
+}
+
+/** A start-sweep kill's stop cause (`startSweepStoppedKillLine`): the server began shutting down during its tries (b.jg5 SRJ-702, SRJ-714). */
+export const START_SWEEP_KILL_STOP_SHUTDOWN = 'the server is shutting down'
+/**
+ * A start-sweep kill's stop cause (`startSweepStoppedKillLine`): the
+ * `ErrInvalidFlags` re-check of the outcome that stands decided that the
+ * server stops (b.jg5 SRJ-205, SRJ-714).
+ */
+export const START_SWEEP_KILL_STOP_RECHECK = 'the version re-check decided that the server stops; row kept; the sweep makes no further call'
+
+/** Why a start-sweep kill's tries were stopped (`startSweepStoppedKillLine`). */
+export type StartSweepKillStopCause = typeof START_SWEEP_KILL_STOP_SHUTDOWN | typeof START_SWEEP_KILL_STOP_RECHECK
+
+/**
+ * The start sweep's one line for a kill whose tries were stopped, by a
+ * shutdown (`START_SWEEP_KILL_STOP_SHUTDOWN`) or by a version re-check that
+ * decided that the server stops (`START_SWEEP_KILL_STOP_RECHECK`) (b.jg5
+ * SRJ-205, SRJ-702, SRJ-714): the row, the context, the cause, the last
+ * outcome's class, and the descriptions the retry's alert decision carries
+ * (`describeKillFailureDescriptions`), the latest survivor-naming one
+ * included when a try returned one; no alert is raised:
  *
- *   [slack] reconcileOrphans: pre-persona row (no persona label) instanceId=<id> state=<state> tmux_session=<name> is live — killing it; the row is kept (a pre-persona row is never deleted)
- *   [slack] reconcileOrphans: kill succeeded for pre-persona row instanceId=<id> (<outcome>) — row kept
+ *   [slack] reconcileOrphans: kill tries for <row name> (start sweep) were stopped: <cause>; its last outcome's class: <class>; no kill-failure alert is raised; <descriptions> (b.jg5 SRJ-702, SRJ-714[, SRJ-205])
+ *
+ * `SRJ-205` is cited for the re-check's cause. Pure.
+ */
+export function startSweepStoppedKillLine(
+  instanceId: string,
+  persona: string | undefined,
+  retried: KillRetryResult,
+  cause: StartSweepKillStopCause,
+): string {
+  const { outcome } = retried
+  const lastClass = outcome.kind === KILL_OUTCOME_NOT_KILLED ? outcome.errorClass : outcome.kind
+  const refs = cause === START_SWEEP_KILL_STOP_RECHECK ? 'b.jg5 SRJ-702, SRJ-714, SRJ-205' : 'b.jg5 SRJ-702, SRJ-714'
+  return (
+    `${SWEEP_LOG_PREFIX}: kill tries for ${startSweepRowName(instanceId, persona)} (${KILL_FAILURE_CONTEXT_START_SWEEP}) ` +
+    `were stopped: ${cause}; its last outcome's class: ${lastClass}; no kill-failure alert is raised; ` +
+    `${describeKillFailureDescriptions(retried.alert)} (${refs})`
+  )
+}
+
+/**
+ * One start-sweep kill of a row listed live (b.jg5 SRJ-110, SRJ-701, SRJ-702,
+ * SRJ-714, SRJ-1506): the bounded retry with the pass's budget, clock and
+ * keep-going check (`sweepKill`), its result checked. The row is kept
+ * whatever the outcome: the sweep deletes no row. A row with no `persona`
+ * label (a pre-persona row, b.1ix: an id that is never a persona's
+ * `cscb_<key>`, so no launch reuses or resumes it) is killed and kept the
+ * same way; `expire` removes kept rows later. Answers the retry's result.
+ * Never throws.
+ *
+ *   [slack] reconcileOrphans: killing <row name> state=<state> tmux_session=<session>; the row is kept whatever the outcome (b.jg5 SRJ-714)
+ *   [slack] reconcileOrphans: kill succeeded for <row name> (<outcome>) — row kept
  *
  * `<outcome>` is `describeKillOutcome`'s rendering, `kill_sent` included; a
- * success with `kill_sent` false or absent, `ErrSpawnNotFound` and GONE are
- * successes. A kill that did not succeed records one `orphan-cleanup` entry
- * (`kill did not succeed for pre-persona row instanceId=<id>: <outcome>; row
- * kept, its session may still be running`), except when its `ErrInvalidFlags`
- * re-check decided that the server stops (`stop.stopping` is then set): one
- * line (`sweepStoppedLine`), and nothing more. The row has no persona label,
- * so no outage is raised for it and nothing latches.
- *
- * The kill-failure alert (b.jg5 SRJ-704, SRJ-714, SRJ-1007), from the
- * retry's decision, with the start sweep's context and closing sentence and
- * the row's own id: the ordinary version's text rides in that
- * `orphan-cleanup` entry (`; kill-failure alert: instanceId=<id> (start
- * sweep): <text>`); after a success that stands, the survivor version is one
- * `persona-kill-survivor` entry naming the row. Nothing is posted, no retry
- * timer is armed and nothing latches.
+ * success with `kill_sent` false or absent, `ErrSpawnNotFound`, GONE and a
+ * read between tries that found the row finished are successes. A kill whose
+ * success stands writes the kill-failure alert's survivor version, when the
+ * retry decided it, as one `persona-kill-survivor` entry naming the row
+ * (`recordSweepSurvivorAlert`; b.jg5 SRJ-704, SRJ-1007). A kill that did not
+ * succeed records one `orphan-cleanup` entry (`startSweepKillFailedEntry`),
+ * whatever its class: a CONFLICT or an UNUSABLE NAME answer is routed so,
+ * per b.jg5 SRJ-1002, and latches no one, a configured persona's own row
+ * included; an ENVIRONMENT or a CONFIG answer is recorded so too, besides
+ * its outage for `target.configuredKey` (`sweepKill`). The entry carries the
+ * kill-failure alert's ordinary version when the retry decided it (an
+ * `ErrTmuxKillFailed` that stands, or any failure after a survivor-naming
+ * one; `sweepOrdinaryAlertTail`), except for a kill whose tries a shutdown
+ * stopped: its entry carries no alert text, and one line quotes the
+ * descriptions, the latest survivor-naming one included
+ * (`startSweepStoppedKillLine`). A kill whose `ErrInvalidFlags` re-check
+ * decided that the server stops (`stop.stopping` is then set) is one whose
+ * tries a shutdown stopped: the same one line, with the re-check's cause, and
+ * its `orphan-cleanup` entry with no alert text, and nothing more (b.jg5
+ * SRJ-205, SRJ-702, SRJ-714). Nothing is posted, no retry timer is armed and
+ * nothing latches.
  */
-async function keepPrePersonaRow(
-  pass: SweepPass,
-  row: ListRow,
-  counts: PrePersonaSweepCounts,
-): Promise<boolean> {
-  const { stop } = pass
-  counts.kept++
-  if (!AGENT_DIRECTOR_LIVE_STATES.has(row.state)) return false
-  counts.live++
+async function killStartSweepRow(pass: SweepPass, row: ListRow, target: StartSweepKillTarget): Promise<KillRetryResult> {
   const id = row.claude_instance_id
+  const name = startSweepRowName(id, target.persona)
   console.error(
-    `[slack] reconcileOrphans: pre-persona row (no persona label) instanceId=${id} state=${row.state} tmux_session=${row.tmux_session_name} is live — killing it; the row is kept (a pre-persona row is never deleted)`,
+    `${SWEEP_LOG_PREFIX}: killing ${name} state=${row.state} tmux_session=${row.tmux_session_name}; the row is kept whatever the outcome (b.jg5 SRJ-714)`,
   )
-  const { outcome, alert } = await sweepKill(pass, id, row.state, undefined)
-  if (!killLetsNextStepRun(outcome)) {
-    counts.killFailed++
-    if (stop.stopping) {
-      console.error(sweepStoppedLine(id, describeKillOutcome(outcome)))
-      return true
-    }
-    recordStartupError(
-      ORPHAN_CLEANUP_LABEL,
-      `kill did not succeed for pre-persona row instanceId=${id}: ${describeKillOutcome(outcome)}; row kept, its session may still be running` +
-        sweepOrdinaryAlertTail(row, alert),
-    )
-    return true
+  const retried = await sweepKill(pass, id, row.state, target.configuredKey)
+  const { outcome, alert } = retried
+  if (killLetsNextStepRun(outcome)) {
+    console.error(`${SWEEP_LOG_PREFIX}: kill succeeded for ${name} (${describeKillOutcome(outcome)}) — row kept`)
+    recordSweepSurvivorAlert(row, alert)
+    return retried
   }
-  console.error(`[slack] reconcileOrphans: kill succeeded for pre-persona row instanceId=${id} (${describeKillOutcome(outcome)}) — row kept`)
-  recordSweepSurvivorAlert(row, alert)
-  return true
+  // b.jg5 SRJ-205, SRJ-702, SRJ-714: a kill whose version re-check decided
+  // that the server stops is a kill that a shutdown stopped: its one line,
+  // quoting the latest survivor-naming description, then its entry with no
+  // alert text.
+  const stoppedByRecheck = pass.stop.stopping
+  const stoppedAtShutdown = stoppedByRecheck || (retried.end === KILL_RETRY_END_STOPPED && sweepShuttingDown(pass))
+  if (stoppedAtShutdown) {
+    const cause = stoppedByRecheck ? START_SWEEP_KILL_STOP_RECHECK : START_SWEEP_KILL_STOP_SHUTDOWN
+    console.error(startSweepStoppedKillLine(id, target.persona, retried, cause))
+  }
+  const entry = startSweepKillFailedEntry({
+    instanceId: id,
+    ...(target.persona === undefined ? {} : { persona: target.persona }),
+    state: row.state,
+    session: typeof row.tmux_session_name === 'string' ? row.tmux_session_name : '',
+    outcome: describeKillOutcome(outcome),
+    stoppedAtShutdown,
+  })
+  recordStartupError(ORPHAN_CLEANUP_LABEL, stoppedAtShutdown ? entry : entry + sweepOrdinaryAlertTail(row, alert))
+  return retried
 }
 
 /**
@@ -12353,53 +12613,111 @@ function recordSweepSurvivorAlert(row: ListRow, alert: KillRetryAlert): void {
 }
 
 /**
- * Whether a start-sweep kill's `ErrInvalidFlags` re-check decided that the
- * server stops (b.jg5 SRJ-205): once set, the sweep makes no further
- * agent-director call (no kill, delete or findMissing sweep).
+ * The start sweep's stops. `stopping`: a kill's `ErrInvalidFlags` re-check
+ * decided that the server stops (b.jg5 SRJ-205); once set, the sweep makes
+ * no further agent-director call (no kill or findMissing sweep).
+ * `shutdownLogged`: the sweep has logged its one shutdown stop line
+ * (`START_SWEEP_SHUTDOWN_STOP_LINE`).
  */
 interface SweepStop {
   stopping: boolean
+  shutdownLogged: boolean
 }
 
 /**
- * One start sweep pass's kill context: the sweep's own client, its stop
- * flag, its pass budget (b.jg5 SRJ-702, AC 56: once one row's kill has used
- * its tries on UNAVAILABLE, every later kill in the pass is made once) and
- * the clock its retries wait on.
+ * One start sweep pass's kill context: the sweep's own client, its stops,
+ * its pass budget (b.jg5 SRJ-702, AC 56: once one row's kill has used its
+ * tries on UNAVAILABLE, every later kill in the pass is made once), the
+ * clock its retries wait on, and the server's shutdown query
+ * (`sweepShuttingDown`; b.jg5 SRJ-714).
  */
 interface SweepPass {
   readonly client: Client
   readonly stop: SweepStop
   readonly budget: KillRetryPassBudget
   readonly clock: KillRetryWait
+  readonly isShuttingDown: () => boolean
 }
 
 /** The start sweep's line prefix, its kill retry's lines included. */
 const SWEEP_LOG_PREFIX = '[slack] reconcileOrphans'
 
 /**
- * The start sweep's line when a kill's `ErrInvalidFlags` re-check decided
- * that the server stops (b.jg5 SRJ-104, SRJ-204, SRJ-205): the row is kept,
- * and the sweep makes no further call. `described` is the outcome's
- * rendering (`describeKillOutcome`).
+ * The start sweep's one line when it stops because the server began shutting
+ * down (b.jg5 SRJ-714, SRJ-702, SRJ-205), logged once per sweep, before its
+ * summary line.
  */
-function sweepStoppedLine(instanceId: string, described: string): string {
-  return `[slack] reconcileOrphans: kill did not succeed for instanceId=${instanceId}: ${described} — the version re-check decided that the server stops; row kept; the sweep makes no further call (b.jg5 SRJ-205)`
+export const START_SWEEP_SHUTDOWN_STOP_LINE =
+  `${SWEEP_LOG_PREFIX}: the server began shutting down — the sweep stops: no further kill, status read, findMissing or get, ` +
+  'and no further latch, record write or clear; what it did stands, and the rows it left unkilled count as kept (b.jg5 SRJ-714, SRJ-205)'
+
+/**
+ * Whether the server has begun shutting down, by the sweep's shutdown query
+ * (b.jg5 SRJ-714). A query that throws counts as shutting down, so the
+ * sweep errs toward making no call. Logs nothing. Never throws.
+ */
+function sweepShuttingDown(pass: SweepPass): boolean {
+  try {
+    return pass.isShuttingDown() === true
+  } catch {
+    return true
+  }
+}
+
+/**
+ * Whether the sweep stops here because the server has begun shutting down
+ * (`sweepShuttingDown`): when it has, the sweep's one stop line
+ * (`START_SWEEP_SHUTDOWN_STOP_LINE`) is logged, the first time only. Never
+ * throws.
+ */
+function sweepStopsAtShutdown(pass: SweepPass): boolean {
+  if (!sweepShuttingDown(pass)) return false
+  if (!pass.stop.shutdownLogged) {
+    pass.stop.shutdownLogged = true
+    console.error(START_SWEEP_SHUTDOWN_STOP_LINE)
+  }
+  return true
+}
+
+/**
+ * Whether the sweep has stopped (b.jg5 SRJ-205, SRJ-714): a version re-check
+ * decided that the server stops (`stop.stopping`), or the server has begun
+ * shutting down (`sweepShuttingDown`). Once it has, an answer that arrives
+ * raises no outage. Logs nothing. Never throws.
+ */
+function sweepStopped(pass: SweepPass): boolean {
+  return pass.stop.stopping || sweepShuttingDown(pass)
+}
+
+/**
+ * The one line for an ENVIRONMENT or CONFIG answer to a start-sweep `call`
+ * (its kill, or its `status` read between tries) for configured persona
+ * `key` that arrived after the sweep stopped (`sweepStopped`; b.jg5 SRJ-714):
+ *
+ *   [slack] reconcileOrphans: the <class> answer to the <call> for persona=<key> came after the sweep stopped — no outage is raised (b.jg5 SRJ-714)
+ */
+function logSweepOutageNotRaised(key: string, errorClass: string, call: string): void {
+  console.error(
+    `${SWEEP_LOG_PREFIX}: the ${errorClass} answer to the ${call} for persona=${key} came after the sweep stopped — no outage is raised (b.jg5 SRJ-714)`,
+  )
 }
 
 /**
  * One start-sweep kill (b.jg5 SRJ-110, SRJ-701, SRJ-702): the bounded retry
  * (`runKillRetry`, `src/kill-retry.ts`) of `instanceId`'s kill on the
- * sweep's own client, seeded with `listedState`, the state the sweep listed
- * the row in, on the pass's clock and with the pass's budget: a row listed
- * live gets up to 3 tries 2 s apart on UNAVAILABLE, until one row of the
- * pass has used its tries that way, after which every later kill in the
- * pass is made once (AC 56); a row listed finished gets one kill. Each try
- * is one checked kill (`sweepKillTry`); before each further try, one bare
- * `status` read of the row (`sweepKillRead`). Each try and read is logged
- * with the sweep's prefix. Answers the retry's result; its caller writes the
- * alert decision's entries (`sweepOrdinaryAlertTail`,
- * `recordSweepSurvivorAlert`; b.jg5 SRJ-704, SRJ-714).
+ * sweep's own client, seeded with `listedState`, the live state the sweep
+ * listed the row in (a finished row is never killed, b.jg5 SRJ-714), on the
+ * pass's clock and with the pass's budget: up to 3 tries 2 s apart on
+ * UNAVAILABLE, until one row of the pass has used its tries that way, after
+ * which every later kill in the pass is made once (AC 56). Each try is one
+ * checked kill (`sweepKillTry`); before each further try, one bare `status`
+ * read of the row (`sweepKillRead`). The keep-going check is the sweep's
+ * shutdown query (`sweepShuttingDown`): once the server has begun shutting
+ * down, no further try or read is made and the last try's outcome stands
+ * (b.jg5 SRJ-702, SRJ-714). Each try and read is logged with the sweep's
+ * prefix. Answers the retry's result; its caller writes the alert
+ * decision's entries (`sweepOrdinaryAlertTail`, `recordSweepSurvivorAlert`;
+ * b.jg5 SRJ-704, SRJ-714).
  *
  * The start sweep is no launch or recovery attempt: nothing latches (a
  * CONFLICT or an UNUSABLE NAME answer is recorded, b.jg5 SRJ-1002), no retry
@@ -12408,13 +12726,17 @@ function sweepStoppedLine(instanceId: string, described: string): string {
  * UNCLASSIFIED and only recorded). An `ErrInvalidFlags` gets exactly one
  * immediate version re-check (`recheckKillOnInvalidFlags`; b.jg5 SRJ-104,
  * SRJ-204); when the outcome that stands is one whose re-check decided that
- * the server stops, `stop.stopping` is set and the caller does nothing more
- * (b.jg5 SRJ-205). Of the outcome that stands only (hatch A3, through the
+ * the server stops, `stop.stopping` is set and the caller records the kill
+ * as one a shutdown stopped, with no further call (b.jg5 SRJ-205, SRJ-714).
+ * Of the outcome that stands only (hatch A3, through the
  * tries), an ENVIRONMENT answer raises `tmux-unavailable`, and a CONFIG
  * answer `ad-config-malformed`, for `configuredKey` only: the persona of the
  * applied configuration the row's label names, `undefined` for a row of an
  * absent persona or with no persona label, whose answer is only logged and
- * recorded by the caller (b.jg5 SRJ-110, SRJ-301, SRJ-1002). Never throws.
+ * recorded by the caller (b.jg5 SRJ-110, SRJ-301, SRJ-1002). Such an answer
+ * raises nothing once the sweep has stopped (`sweepStopped`, asked when the
+ * tries end): one line (`logSweepOutageNotRaised`; b.jg5 SRJ-714). Never
+ * throws.
  */
 async function sweepKill(
   pass: SweepPass,
@@ -12425,19 +12747,29 @@ async function sweepKill(
   const result = await runKillRetry({
     instanceId,
     kill: () => sweepKillTry(pass.client, instanceId),
-    read: () => sweepKillRead(pass.client, instanceId, configuredKey),
+    read: () => sweepKillRead(pass, instanceId, configuredKey),
     wait: pass.clock,
     lastRead: killRetrySeedOfState(listedState),
+    keepGoing: () => !sweepShuttingDown(pass),
     budget: pass.budget,
     log: (line) => console.error(line),
     logPrefix: SWEEP_LOG_PREFIX,
   })
   const { outcome } = result
   if (killOutcomeStopsServer(outcome)) pass.stop.stopping = true
-  if (configuredKey !== undefined && outcome.kind === KILL_OUTCOME_NOT_KILLED) {
+  if (
+    configuredKey !== undefined &&
+    outcome.kind === KILL_OUTCOME_NOT_KILLED &&
+    (outcome.errorClass === AD_ERROR_CLASS_ENVIRONMENT || outcome.errorClass === AD_ERROR_CLASS_CONFIG)
+  ) {
+    // b.jg5 SRJ-714: an answer that arrives after the sweep stopped raises nothing.
+    if (sweepStopped(pass)) {
+      logSweepOutageNotRaised(configuredKey, outcome.errorClass, 'kill')
+      return result
+    }
     try {
       if (outcome.errorClass === AD_ERROR_CLASS_ENVIRONMENT) raiseTmuxUnavailable(configuredKey, outcome.error)
-      else if (outcome.errorClass === AD_ERROR_CLASS_CONFIG) raiseAdConfigMalformed(configuredKey, outcome.error)
+      else raiseAdConfigMalformed(configuredKey, outcome.error)
     } catch (err) {
       console.error(
         `${SWEEP_LOG_PREFIX}: raising the outage for persona=${configuredKey} failed: ${describeThrownValue(err)}`,
@@ -12456,34 +12788,54 @@ async function sweepKillTry(client: Client, instanceId: string): Promise<KillOut
   return recheckKillOnInvalidFlags(await checkedKill(instanceId, (params) => client.kill(params)))
 }
 
+/** Who reads, in the clear line of a start-sweep kill's `status` read between its tries (b.jg5 SRJ-807). */
+export const START_SWEEP_KILL_STATUS_SITE: OwnRowReadSite = Object.freeze({ site: 'reconcileOrphans', what: 'status read between kill tries' })
+
 /**
  * One `status` read of a swept row between its kill's tries (b.jg5 SRJ-702),
  * on the sweep's own client: its state, or no row for `ErrSpawnNotFound` (by
- * name), or a failed read that latches nothing (the start sweep latches
- * nothing; an UNUSABLE NAME answer is a failed read). A CONFIG answer raises
- * `ad-config-malformed` for `configuredKey` only, through its raise entry,
- * arming no retry timer, and is otherwise only logged (b.jg5 SRJ-110,
+ * name), or a failed read that latches nothing (the start sweep latches only
+ * from its `list`; an UNUSABLE NAME answer is a failed read). A CONFIG answer
+ * raises `ad-config-malformed` for `configuredKey` only, through its raise
+ * entry, arming no retry timer, and is otherwise only logged (b.jg5 SRJ-110,
  * SRJ-316; hatch A3); the retry then ends the tries when the row was last
- * read `pending`. No own-row step applies to this read: it latches nothing
- * and clears no retired-key entry (b.jg5 SRJ-807). Never throws.
+ * read `pending`. Of the row-read rule only the entry clear applies (b.jg5
+ * SRJ-807): when the row's id is a key's own (`cscb_<key>`), a read live
+ * other than `pending` of a key recorded with its mark set clears its entry
+ * (`decideRetiredEntryClear` with the installed store's mark,
+ * `clearRetiredEntryOnRead`), the store's one line naming
+ * `START_SWEEP_KILL_STATUS_SITE`. Once the sweep has stopped by the time the
+ * read returns (`sweepStopped`), neither the clear nor the CONFIG answer's
+ * raise is made (b.jg5 SRJ-714). What it answers is the same whatever the
+ * clear did. Never throws.
  */
-async function sweepKillRead(client: Client, instanceId: string, configuredKey: string | undefined): Promise<KillRetryRead> {
+async function sweepKillRead(pass: SweepPass, instanceId: string, configuredKey: string | undefined): Promise<KillRetryRead> {
   try {
-    const result = await client.status({ claude_instance_id: instanceId })
+    const result = await pass.client.status({ claude_instance_id: instanceId })
+    if (!sweepStopped(pass)) clearOnSweepKillRead(instanceId, result)
     return { kind: KILL_RETRY_READ_STATE, state: result.state }
   } catch (err) {
     if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) return { kind: KILL_RETRY_READ_NO_ROW }
-    if (classifyAdError(err).errorClass === AD_ERROR_CLASS_CONFIG) sweepReadConfigAnswer(instanceId, configuredKey, err)
+    if (classifyAdError(err).errorClass === AD_ERROR_CLASS_CONFIG) sweepReadConfigAnswer(pass, instanceId, configuredKey, err)
     return { kind: KILL_RETRY_READ_FAILED, error: err }
   }
 }
 
-/** A CONFIG answer at a swept row's between-try read: raised for a configured persona, else one line. Never throws. */
-function sweepReadConfigAnswer(instanceId: string, configuredKey: string | undefined, err: unknown): void {
+/**
+ * A CONFIG answer at a swept row's between-try read: raised for a configured
+ * persona, else one line; once the sweep has stopped (`sweepStopped`) by the
+ * time the read returns, nothing is raised, with one line
+ * (`logSweepOutageNotRaised`; b.jg5 SRJ-714). Never throws.
+ */
+function sweepReadConfigAnswer(pass: SweepPass, instanceId: string, configuredKey: string | undefined, err: unknown): void {
   if (configuredKey === undefined) {
     console.error(
       `${SWEEP_LOG_PREFIX}: the status read between kill tries for instanceId=${instanceId} answered CONFIG; the row names no persona of the applied configuration, so no outage is raised — logged only (b.jg5 SRJ-110, SRJ-316)`,
     )
+    return
+  }
+  if (sweepStopped(pass)) {
+    logSweepOutageNotRaised(configuredKey, AD_ERROR_CLASS_CONFIG, 'status read between kill tries')
     return
   }
   try {
@@ -12496,130 +12848,131 @@ function sweepReadConfigAnswer(instanceId: string, configuredKey: string | undef
 }
 
 /**
- * After the start sweep's kills of live pre-persona rows (b.1ix), run one
- * findMissing sweep, so each killed row whose session is gone reads `missing`
- * and is not killed again at the next start (agent-director 0.10.0's `kill`
- * leaves the row's state as it was). It runs after a failed kill too: the
- * session may be gone all the same, and only the sweep would tell.
+ * SRJ-807's entry clear over a start-sweep kill's between-try `status` read
+ * of `instanceId` (`sweepKillRead`): only when the id is a key's own
+ * (`cscb_<key>`, configured or not), through `decideRetiredEntryClear` with
+ * the installed store's mark and `clearRetiredEntryOnRead` at
+ * `START_SWEEP_KILL_STATUS_SITE`. No latch. Never throws.
+ */
+function clearOnSweepKillRead(instanceId: string, read: { readonly state: string }): void {
+  try {
+    const key = ownRowKeyOfRowId(instanceId)
+    if (key === undefined) return
+    const clear = decideRetiredEntryClear({
+      key,
+      row: { ...read, claude_instance_id: instanceId },
+      configured: false,
+      retiredMarked: retiredMarkOf(key),
+    })
+    if (clear !== undefined) clearRetiredEntryOnRead(key, clear, START_SWEEP_KILL_STATUS_SITE)
+  } catch (err) {
+    // Not reached (nothing above throws); the read's answer is unchanged.
+    console.error(`${SWEEP_LOG_PREFIX}: the entry clear on the status read of instanceId=${instanceId} failed: ${describeThrownValue(err)}`)
+  }
+}
+
+/**
+ * The start sweep's post-kill line (b.jg5 SRJ-714, SRJ-120): what one
+ * findMissing run says of the `killedCount` rows the sweep gave a kill call
+ * (each read with `readFindMissingRow` and the state the sweep listed it
+ * with): `missing` the rows marked missing; `not-judged` the `pending` rows in
+ * neither list, which agent-director did not judge (retry later; never a
+ * reason to escalate, alert or kill); `still-live` the rest, judged and left
+ * live (in `unverified_ids`) or judged alive:
  *
- * It is an ordinary run of the memoized, single-flight sweep every
- * findMissing caller shares (`sharedFindMissingSweep`, b.m4r, b.jg5 SRJ-120).
- * The start sweep runs before any launch and before the health check, so no
- * earlier sweep in this process can be reused; the launches right after it
- * reuse this one within its window. The call goes to the start sweep's client
- * directly, as its list and kills do: it acts for no persona, so no persona's
- * outage flag is raised or cleared by the call. As after any run the server
- * makes, each configured persona's own row listed in `unverified_ids` is then
- * read with one `get` through that persona's `withOutageDetection`
+ *   [slack] reconcileOrphans: findMissing after the kills of <n> row(s): missing=<n> [<ids>] still-live=<n> [<ids>] not-judged=<n> [<ids>] — a row that still reads live is killed again by the next start's sweep when it sweeps it; a not-judged row was pending and not judged by this run (retry later)
+ *
+ * Pure.
+ */
+export function startSweepPostKillLine(
+  killedCount: number,
+  missing: readonly string[],
+  stillLive: readonly string[],
+  notJudged: readonly string[],
+): string {
+  return (
+    `${SWEEP_LOG_PREFIX}: findMissing after the kills of ${killedCount} row(s): ` +
+    `missing=${missing.length} [${missing.join(',')}] still-live=${stillLive.length} [${stillLive.join(',')}] ` +
+    `not-judged=${notJudged.length} [${notJudged.join(',')}] — a row that still reads live is killed again by the next start's sweep ` +
+    'when it sweeps it; a not-judged row was pending and not judged by this run (retry later)'
+  )
+}
+
+/**
+ * The start sweep's post-kill line when its findMissing run failed (b.jg5
+ * SRJ-714, SRJ-120), after the run's own failure line; the sweep goes on to
+ * its summary:
+ *
+ *   [slack] reconcileOrphans: findMissing after the kills of <n> row(s) failed — each reads as it did, and a live one is killed again by the next start's sweep when it sweeps it
+ *
+ * Pure.
+ */
+export function startSweepPostKillFailedLine(killedCount: number): string {
+  return (
+    `${SWEEP_LOG_PREFIX}: findMissing after the kills of ${killedCount} row(s) failed — each reads as it did, ` +
+    "and a live one is killed again by the next start's sweep when it sweeps it"
+  )
+}
+
+/**
+ * After the start sweep's kills, one findMissing run over every row the
+ * sweep gave a kill call, swept and pre-persona rows alike, whatever each
+ * kill's outcome (b.jg5 SRJ-714, SRJ-120): `kill` never changes a row's
+ * state, so a killed row whose session is gone reads `missing` only once a
+ * run marks it, and a later start then leaves it alone; a failed kill's
+ * session may be gone all the same, and only the run would tell. A swept
+ * `pending` row with no launch start is judged by agent-director's ordinary
+ * rules (b.jg5 SRJ-408). The caller makes it once, after the last kill, only
+ * when at least one kill was made and no stop came first.
+ *
+ * It is an ordinary run of the memoized, single-flight run every findMissing
+ * caller shares (`sharedFindMissingSweep`, b.m4r, b.jg5 SRJ-120). The start
+ * sweep runs before any launch and before the health check, so no earlier
+ * run in this process can be reused; the launches right after it reuse this
+ * one within its window. The call goes to the start sweep's client directly,
+ * as its list and kills do: it acts for no persona, so no persona's outage
+ * flag is raised or cleared by the call. As after any run the server makes,
+ * each configured persona's own row listed in `unverified_ids` is then read
+ * with one `get` through that persona's `withOutageDetection`
  * (`readListedPersonaRows`; an already-latched persona is skipped), and only
  * a `provenance_conflict` note there, or the persona's own row reading
  * `pending` with no launch start (b.jg5 SRJ-513), latches. The run is the
  * start sweep's (`startSweepRun`), so an UNUSABLE NAME answer to one of
  * those `get`s is routed per SRJ-1002 and latches nothing (b.jg5 SRJ-512):
- * its routed line, and `refused (<failure>)` in the reads' line. Never
- * throws.
+ * its routed line, and `refused (<failure>)` in the reads' line. Those
+ * `get`s are made only while the server has not begun shutting down when the
+ * run returns (`postRunGetsGo`; b.jg5 SRJ-714); when it has, the sweep's one
+ * stop line is logged then (`sweepStopsAtShutdown`), before its summary. The
+ * same check is asked as each `get` settles: one that settles once the
+ * server has begun shutting down is not acted on (no latch, clear or
+ * episode end, nothing posted; `readListedPersonaRows`). A shutdown begun
+ * during a run that then fails is logged by the sweep's end
+ * (`endStartSweep`). Never throws.
  *
- * Each killed row is read with `readFindMissingRow` and the state the start
- * sweep listed it with: `missing` holds the rows marked missing; `not-judged`
- * the `pending` rows in neither list, which agent-director did not judge
- * (retry later; never a reason to escalate, alert or kill); `still-live` the
- * rest, judged and left live (in `unverified_ids`) or judged alive. The
- * start sweep's kill decisions do not depend on this line. The sweep's own
- * line, then one line with the outcome for the killed rows:
- *
- *   [slack] reconcileOrphans: findMissing sweep for killed pre-persona rows — count=<n> ids=[…] unverified=<n> unverified_ids=[…]
- *   [slack] reconcileOrphans: findMissing after the kills of <n> live pre-persona row(s): missing=<n> [<ids>] still-live=<n> [<ids>] not-judged=<n> [<ids>] — a row that still reads live is killed again at the next start; a not-judged row was pending and not judged by this sweep (retry later)
- *
- * or, when the sweep fails, its failure line and:
- *
- *   [slack] reconcileOrphans: findMissing after the kills of <n> live pre-persona row(s) failed — they still read live and are killed again at the next start
+ * The run's own line, then `startSweepPostKillLine` for the killed rows, or,
+ * when the run fails, its failure line and `startSweepPostKillFailedLine`.
+ * The start sweep's kill decisions do not depend on these lines.
  */
-async function reconcileKilledPrePersonaRows(client: Client, killed: readonly KilledPrePersonaRow[]): Promise<void> {
-  const head = `[slack] reconcileOrphans: findMissing after the kills of ${killed.length} live pre-persona row(s)`
-  const r = await sharedFindMissingSweep(() => client.findMissing({}), 'reconcileOrphans', 'killed pre-persona rows', undefined, {
+async function runStartSweepPostKillFindMissing(pass: SweepPass, killed: readonly SweepRowRecord[]): Promise<void> {
+  const r = await sharedFindMissingSweep(() => pass.client.findMissing({}), 'reconcileOrphans', 'the rows the start sweep killed', undefined, {
     startSweepRun: true,
+    postRunGetsGo: () => !sweepStopsAtShutdown(pass),
   })
   if (!r) {
-    console.error(`${head} failed — they still read live and are killed again at the next start`)
+    console.error(startSweepPostKillFailedLine(killed.length))
     return
   }
   const missing: string[] = []
   const stillLive: string[] = []
   const notJudged: string[] = []
-  for (const { id, state } of killed) {
-    const reading = readFindMissingRow(r, id, state)
+  for (const { row } of killed) {
+    const id = row.claude_instance_id
+    const reading = readFindMissingRow(r, id, row.state)
     if (reading === FIND_MISSING_ROW_MARKED_MISSING) missing.push(id)
     else if (reading === FIND_MISSING_ROW_NOT_JUDGED) notJudged.push(id)
     else stillLive.push(id)
   }
-  console.error(
-    `${head}: missing=${missing.length} [${missing.join(',')}] still-live=${stillLive.length} [${stillLive.join(',')}] not-judged=${notJudged.length} [${notJudged.join(',')}] — a row that still reads live is killed again at the next start; a not-judged row was pending and not judged by this sweep (retry later)`,
-  )
-}
-
-/** A pre-persona row the start sweep killed: its instance id and the state the sweep listed it with. */
-interface KilledPrePersonaRow {
-  readonly id: string
-  readonly state: string
-}
-
-/**
- * Kill one row the start sweep swept (the bounded retry with the pass's
- * budget, `sweepKill`; b.jg5 SRJ-110, SRJ-701, SRJ-702), then delete it only
- * after the success that stands (any `kill_sent`, `ErrSpawnNotFound`, GONE,
- * or a read between tries that found the row finished). A kill that did not succeed keeps the row: no
- * delete call is made, and one `orphan-cleanup` entry names the outcome
- * (`kill did not succeed for orphan instanceId=<id> persona=<persona>:
- * <outcome>; row kept, no delete was made, its session may still be
- * running`); nothing latches and no retry timer is armed. `configuredKey`
- * is the applied persona the row's label names (`undefined` for an absent
- * persona), for whom an ENVIRONMENT or CONFIG answer raises its outage
- * (`sweepKill`). A kill whose `ErrInvalidFlags` re-check decided that the
- * server stops (`stop.stopping`) records nothing: one line, no delete.
- * Returns whether the delete succeeded; a failed delete records
- * `orphan-cleanup` too.
- *
- * The kill-failure alert (b.jg5 SRJ-704, SRJ-714, SRJ-1007), from the
- * retry's decision, with the start sweep's context and closing sentence: the
- * ordinary version's text rides in the kill's `orphan-cleanup` entry (`;
- * kill-failure alert: instanceId=<id> (start sweep): <text>`); after a
- * success that stands, the survivor version is one `persona-kill-survivor`
- * entry naming the row, written before the delete. Nothing is posted, even
- * for a configured persona's row: the sweep acts for no persona.
- *
- *   [slack] reconcileOrphans: kill succeeded for orphan instanceId=<id> (<outcome>) — deleting the row
- */
-async function killAndDeleteSweptRow(
-  pass: SweepPass,
-  row: ListRow,
-  displayPersona: string,
-  configuredKey: string | undefined,
-): Promise<boolean> {
-  const { client, stop } = pass
-  const id = row.claude_instance_id
-  const { outcome, alert } = await sweepKill(pass, id, row.state, configuredKey)
-  if (!killLetsNextStepRun(outcome)) {
-    if (stop.stopping) {
-      console.error(sweepStoppedLine(id, describeKillOutcome(outcome)))
-      return false
-    }
-    recordStartupError(
-      ORPHAN_CLEANUP_LABEL,
-      `kill did not succeed for orphan instanceId=${id} persona=${displayPersona}: ${describeKillOutcome(outcome)}; row kept, no delete was made, its session may still be running` +
-        sweepOrdinaryAlertTail(row, alert),
-    )
-    return false
-  }
-  console.error(`[slack] reconcileOrphans: kill succeeded for orphan instanceId=${id} (${describeKillOutcome(outcome)}) — deleting the row`)
-  recordSweepSurvivorAlert(row, alert)
-  try {
-    await client.delete({ claude_instance_id: [id] })
-    return true
-  } catch (err) {
-    const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('delete', 'UnknownError', String(err))
-    recordStartupError(ORPHAN_CLEANUP_LABEL, `delete failed for orphan instanceId=${id} persona=${displayPersona}: ${describeAgentDirectorFailure(e)}`)
-    return false
-  }
+  console.error(startSweepPostKillLine(killed.length, missing, stillLive, notJudged))
 }
 
 /** Who reads, in the own-row lines of the start sweep's `list` rows (`reconcileOrphans`; the persona's ref is added for a configured persona; b.jg5 SRJ-116, SRJ-807). */
@@ -12769,14 +13122,18 @@ function recordAbsentPersonaKeys(keys: readonly string[]): number {
 }
 
 /**
- * The start sweep (b.av2 SR-6.3; b.jg5 SRJ-116, SRJ-714), run by `main()`
- * before any bring-up, in this order:
+ * The start sweep (b.av2 SR-6.3, amended by b.jg5 SRJ-1506; b.jg5 SRJ-116,
+ * SRJ-714), run by `main()` before any bring-up. It deletes no row: every
+ * row is read, live strays are killed with the result checked, finished rows
+ * are never killed, and pre-persona and absent-persona rows are kept and
+ * never resumed until agent-director's `expire` removes them. In this order:
  *
  *   1. One `list` of every `service=cscb` row, in every state: the call
  *      carries the service label only, with no state filter (b.jg5
  *      SRJ-116). A list failure records one `orphan-cleanup-list-failed`
  *      entry and returns at once: nothing is latched, recorded, cleared or
- *      killed and no findMissing sweep runs; the start pass goes on.
+ *      killed, no findMissing run follows and no summary line is logged; the
+ *      start pass goes on.
  *   2. The latch pass over the whole list, before any kill
  *      (`latchFromListedRows`): each row whose id is a key's own goes
  *      through the shared own-row read's act step at
@@ -12797,20 +13154,30 @@ function recordAbsentPersonaKeys(keys: readonly string[]): number {
  *      (`recordAbsentPersonaKeys`; b.jg5 SRJ-714, SRJ-803); the keys are
  *      counted in `recordedAsRetired`. A failed write leaves the file as it
  *      was, the store holds the keys in memory, and the sweep goes on.
- *   4. The kills, row by row in list order, of the rows step 2 left:
+ *   4. Row by row in list order, of the rows step 2 left: a row with no
+ *      `persona` label (a pre-persona row, b.1ix) is a stray; a labelled row
+ *      is a stray when `sweepDecision` sweeps it (an absent persona, an
+ *      instance ID other than `cscb_<key>`, or a `cwd` other than its
+ *      persona's working directory, by real path, `compareRowToPersona`),
+ *      and is kept otherwise. A stray listed live (`AGENT_DIRECTOR_LIVE_STATES`,
+ *      `pending` included) is killed with the result checked
+ *      (`killStartSweepRow`; b.jg5 SRJ-110, SRJ-701, SRJ-702), a swept
+ *      `pending` row with no launch start included, with no wait (SRJ-408);
+ *      a stray listed finished gets no call and is kept. Every kill runs
+ *      through the bounded retry with one pass budget for the whole pass, so
+ *      a wedged tmux delays the pass by at most one row's retries (AC 56), on
+ *      `clock` (the production clock unless the caller passes its own). No
+ *      kill latches anything or arms a retry timer; an ENVIRONMENT or CONFIG
+ *      answer raises its outage only for a configured persona's row (hatch
+ *      A3). Every row is kept, whatever its kill's outcome; a kill that did
+ *      not succeed records `orphan-cleanup`.
+ *   5. When at least one kill was made, one findMissing run over every row
+ *      given a kill, whatever its outcome (`runStartSweepPostKillFindMissing`;
+ *      b.jg5 SRJ-714, SRJ-120).
+ *   6. One summary line (`startSweepSummaryLine`): the rows killed, kept
+ *      (with the failed kills as a sub-count), recorded as retired, and left
+ *      unkilled for a latch.
  *
- * A pre-persona row (no `persona` label) is kept, never deleted, and killed
- * only when it is live (`keepPrePersonaRow`, b.1ix). When at least one was
- * killed, one findMissing sweep follows the loop, so a killed row whose
- * session is gone reads `missing` and the next start leaves it alone
- * (`reconcileKilledPrePersonaRows`).
- *
- * Every other row is swept, killed and then deleted after a kill that
- * succeeded (`killAndDeleteSweptRow`), when it
- *   - names a persona absent from the applied configuration,
- *   - has an instance ID other than `cscb_<key>` for its persona, or
- *   - has a `cwd` other than its persona's working directory, by real path
- *     (`compareRowToPersona`).
  * When a persona's working directory cannot be resolved to a real path (a
  * directory-broken persona, b.av2 SR-6.4), its rows whose `cwd` has no real
  * path either (or equals the configured path lexically) are kept, and one
@@ -12819,26 +13186,41 @@ function recordAbsentPersonaKeys(keys: readonly string[]): number {
  *
  *   [slack] reconcileOrphans: persona "<name>" (key=<key>) working_directory="<path>" cannot be resolved to a real path — keeping its rows; the cwd check is deferred to its launch
  *
- * A `channel` label left on a row by an older spawn plays no part. Every kill
- * is a checked kill, run through the bounded retry (`sweepKill`; b.jg5
- * SRJ-110, SRJ-701, SRJ-702) with one pass budget for the whole pass, so a
- * wedged tmux delays the pass by at most one row's retries (AC 56), on
- * `clock` (the production clock unless the caller passes its own): a swept
- * row whose kill did not succeed is kept, with no delete call, and counted
- * failed. A
- * kill whose `ErrInvalidFlags` re-check decides that the server stops ends
- * the sweep: no further row is handled and no findMissing sweep follows
- * (b.jg5 SRJ-205); the summary line is still logged. No
- * sweep kill latches anything or arms a retry timer; an ENVIRONMENT or CONFIG
- * answer raises its outage only for a configured persona's row (hatch A3). A
- * kill that did not succeed and a failed delete record `orphan-cleanup`. One
- * summary line ends the sweep:
+ * A swept row gets one line saying why it is swept and whether it is killed:
  *
- *   [slack] reconcileOrphans: found=<n> killed=<n> failed=<n>; pre-persona rows kept=<n> live=<n> kill-failed=<n>
+ *   [slack] reconcileOrphans: sweeping row (<reason>) persona=<persona> instanceId=<id> state=<state>[ cwd=<cwd>] — <it is live, so it is killed; the row is kept|it is finished, so it is not killed (a finished row is never killed); the row is kept> (b.jg5 SRJ-714)
+ *
+ * A `channel` label left on a row by an older spawn plays no part.
+ *
+ * The stops. A kill whose `ErrInvalidFlags` re-check decides that the server
+ * stops ends the sweep's agent-director calls: the kill is recorded as one a
+ * shutdown stopped (its `orphan-cleanup` entry with no alert text, counted
+ * kept and failed), no later row is killed and no findMissing run follows
+ * (b.jg5 SRJ-205, SRJ-714). `isShuttingDown`, the server's
+ * shutdown query (with none, nothing counts as shutting down), is asked once
+ * the `list` returns, before each row, as the bounded retry's keep-going
+ * check (before each further try and read), when a between-try read returns
+ * (before its entry clear or its CONFIG answer's raise), when a kill's tries
+ * end (before its ENVIRONMENT or CONFIG answer's raise), before the
+ * findMissing run, before its post-run `get`s, as each of those `get`s
+ * settles (before its act step), and at the sweep's end, before its summary
+ * (b.jg5 SRJ-714). Once it answers true the sweep makes no further
+ * agent-director call (`kill`, a `status` read, `find-missing`, `get`) and
+ * no further latch, record write, clear or outage raise, an answer that
+ * arrives after it included; what it has done stands; a kill whose tries
+ * were stopped keeps its `orphan-cleanup` entry with no alert text
+ * (`startSweepStoppedKillLine`); the rows it left unkilled count as kept;
+ * and it logs `START_SWEEP_SHUTDOWN_STOP_LINE` once, then its summary line.
+ * Either way, a latched persona's rows still count as left for its latch.
+ *
+ * The sweep keeps one record per listed row (`SweepRowRecord`: the row as
+ * listed, what it did with it, and its kill's result), from which its
+ * counts and its findMissing run are taken.
  */
 export async function reconcileOrphans(
   personaConfig: PersonaConfig,
   clock: KillRetryWait = KILL_RETRY_SYSTEM_CLOCK,
+  isShuttingDown: () => boolean = () => false,
 ): Promise<OrphanReconcileResult> {
   if (isDryRun()) {
     console.error('[slack] dry-run: skipping orphan reconciliation')
@@ -12860,69 +13242,113 @@ export async function reconcileOrphans(
     return emptySweepResult()
   }
 
-  const personasByKey = new Map(personaConfig.personas.map((p) => [p.key, p]))
-  const home = spawnHomeDir()
-  const result = emptySweepResult()
-  const deferredLogged = new Set<string>()
-  const killedPrePersonaRows: KilledPrePersonaRow[] = []
-  const stop: SweepStop = { stopping: false }
-  const pass: SweepPass = { client, stop, budget: createKillRetryPassBudget(), clock }
+  const pass: SweepPass = {
+    client,
+    stop: { stopping: false, shutdownLogged: false },
+    budget: createKillRetryPassBudget(),
+    clock,
+    isShuttingDown,
+  }
+  const records: SweepRowRecord[] = []
+
+  // b.jg5 SRJ-714: a shutdown begun by the time the list returns means no
+  // latch, no record write and no kill; every row counts as kept.
+  if (sweepStopsAtShutdown(pass)) {
+    for (const row of rows) records.push({ row, disposition: SWEEP_ROW_KEPT })
+    return endStartSweep(pass, records, 0)
+  }
 
   // b.jg5 SRJ-502, SRJ-714: every latch and record decision is made over the
   // whole list before the first kill.
+  const personasByKey = new Map(personaConfig.personas.map((p) => [p.key, p]))
   const absentKeys = absentPersonaKeysOf(rows, personasByKey)
   const latched = latchFromListedRows(rows, personasByKey, new Set(absentKeys))
-  result.recordedAsRetired = recordAbsentPersonaKeys(absentKeys)
+  const recordedAsRetired = recordAbsentPersonaKeys(absentKeys)
 
-  for (const row of rows) {
-    // b.jg5 SRJ-205: a kill's version re-check decided that the server
-    // stops, so the sweep makes no further agent-director call.
-    if (stop.stopping) break
-    // b.jg5 SRJ-502 (AC 55): a latched persona's rows are left as they are.
-    if (startSweepLatchOf(row, latched) !== undefined) {
-      result.leftForLatch++
-      continue
-    }
-    const personaLabel = row.labels?.[PERSONA_LABEL_KEY]
-    if (!personaLabel) {
-      if (await keepPrePersonaRow(pass, row, result.prePersona)) {
-        killedPrePersonaRows.push({ id: row.claude_instance_id, state: row.state })
-      }
-      continue
-    }
-    const persona = personasByKey.get(personaLabel)
-    const decision = sweepDecision(row, persona, home)
-    if (decision.action === 'keep') continue
+  const context: StartSweepRowContext = { latched, personasByKey, home: spawnHomeDir(), deferredLogged: new Set<string>() }
+  for (const row of rows) records.push(await sweepListedRow(pass, row, context))
+
+  // b.jg5 SRJ-714, SRJ-120: one findMissing run over every row given a kill.
+  const killed = records.filter((record) => record.kill !== undefined)
+  if (killed.length > 0 && !pass.stop.stopping && !sweepStopsAtShutdown(pass)) {
+    await runStartSweepPostKillFindMissing(pass, killed)
+  }
+  return endStartSweep(pass, records, recordedAsRetired)
+}
+
+/** What the start sweep decides each listed row by, once its latch pass is done. */
+interface StartSweepRowContext {
+  /** The personas whose rows are left for their latch (`latchFromListedRows`). */
+  readonly latched: ReadonlySet<string>
+  /** The applied configuration's personas by key. */
+  readonly personasByKey: ReadonlyMap<string, Persona>
+  /** The home directory `compareRowToPersona` resolves `~` against. */
+  readonly home: string
+  /** The directory-broken personas whose deferral line has been logged. */
+  readonly deferredLogged: Set<string>
+}
+
+/**
+ * The start sweep's step 4 for one listed row (`reconcileOrphans`): its
+ * record. A row whose persona latched is left for the latch; after a stop
+ * (a version re-check's, or a shutdown begun, `sweepStopsAtShutdown`) a row
+ * is kept with no call; a row `sweepDecision` keeps or defers is kept; a
+ * stray listed finished is kept with no call; a stray listed live is killed
+ * (`killStartSweepRow`) and kept, counted killed when the kill's success
+ * stands. Never throws.
+ */
+async function sweepListedRow(pass: SweepPass, row: ListRow, context: StartSweepRowContext): Promise<SweepRowRecord> {
+  // b.jg5 SRJ-502 (AC 55): a latched persona's rows are left as they are.
+  if (startSweepLatchOf(row, context.latched) !== undefined) return { row, disposition: SWEEP_ROW_LEFT_FOR_LATCH }
+  // b.jg5 SRJ-205, SRJ-714: after a stop the sweep makes no further call.
+  if (pass.stop.stopping || sweepStopsAtShutdown(pass)) return { row, disposition: SWEEP_ROW_KEPT }
+  const live = AGENT_DIRECTOR_LIVE_STATES.has(row.state)
+  const personaLabel = row.labels?.[PERSONA_LABEL_KEY]
+  let target: StartSweepKillTarget = {}
+  if (personaLabel) {
+    const persona = context.personasByKey.get(personaLabel)
+    const decision = sweepDecision(row, persona, context.home)
+    if (decision.action === 'keep') return { row, disposition: SWEEP_ROW_KEPT }
     if (decision.action === 'deferred') {
       const deferred = decision.persona
-      if (!deferredLogged.has(deferred.key)) {
-        deferredLogged.add(deferred.key)
+      if (!context.deferredLogged.has(deferred.key)) {
+        context.deferredLogged.add(deferred.key)
         console.error(
-          `[slack] reconcileOrphans: persona ${personaRef(deferred)} working_directory="${deferred.working_directory}" ` +
+          `${SWEEP_LOG_PREFIX}: persona ${personaRef(deferred)} working_directory="${deferred.working_directory}" ` +
             'cannot be resolved to a real path — keeping its rows; the cwd check is deferred to its launch',
         )
       }
-      continue
+      return { row, disposition: SWEEP_ROW_KEPT }
     }
-    const { reason } = decision
-
-    result.found++
     // The persona reference when the persona exists, else the raw label value.
     const displayPersona = persona ? personaRef(persona) : personaLabel
-    const cwdDetail = reason === 'wrong cwd' ? ` cwd=${row.cwd}` : ''
+    const cwdDetail = decision.reason === 'wrong cwd' ? ` cwd=${row.cwd}` : ''
+    const what = live
+      ? 'it is live, so it is killed; the row is kept'
+      : 'it is finished, so it is not killed (a finished row is never killed); the row is kept'
     console.error(
-      `[slack] reconcileOrphans: sweeping row (${reason}) persona=${displayPersona} instanceId=${row.claude_instance_id} state=${row.state}${cwdDetail} — killing and deleting`,
+      `${SWEEP_LOG_PREFIX}: sweeping row (${decision.reason}) persona=${displayPersona} instanceId=${row.claude_instance_id} state=${row.state}${cwdDetail} — ${what} (b.jg5 SRJ-714)`,
     )
-    if (await killAndDeleteSweptRow(pass, row, displayPersona, persona?.key)) result.killed++
-    else result.failed++
+    target = persona ? { persona: displayPersona, configuredKey: persona.key } : { persona: displayPersona }
   }
+  // b.jg5 SRJ-714, SRJ-110: a finished row is never killed.
+  if (!live) return { row, disposition: SWEEP_ROW_KEPT }
+  const kill = await killStartSweepRow(pass, row, target)
+  return { row, disposition: killLetsNextStepRun(kill.outcome) ? SWEEP_ROW_KILLED : SWEEP_ROW_KILL_FAILED, kill }
+}
 
-  if (killedPrePersonaRows.length > 0 && !stop.stopping) await reconcileKilledPrePersonaRows(client, killedPrePersonaRows)
-
-  const { found, killed, failed, prePersona } = result
-  console.error(
-    `[slack] reconcileOrphans: found=${found} killed=${killed} failed=${failed}; pre-persona rows kept=${prePersona.kept} live=${prePersona.live} kill-failed=${prePersona.killFailed}`,
-  )
+/**
+ * The start sweep's end (b.jg5 SRJ-714): when no version re-check stopped
+ * the sweep and the server has begun shutting down by now, its one stop line
+ * (`sweepStopsAtShutdown`, logged once per sweep: a shutdown begun during a
+ * findMissing run that then failed, or during its post-run `get`s, is logged
+ * here); then its counts over `records`, logged as its one summary line
+ * (`startSweepSummaryLine`).
+ */
+function endStartSweep(pass: SweepPass, records: readonly SweepRowRecord[], recordedAsRetired: number): OrphanReconcileResult {
+  if (!pass.stop.stopping) sweepStopsAtShutdown(pass)
+  const result = sweepResultOf(records, recordedAsRetired)
+  console.error(startSweepSummaryLine(result))
   return result
 }
 

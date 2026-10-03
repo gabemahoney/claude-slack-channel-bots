@@ -1184,17 +1184,23 @@ describe('main() installs the runtime agent-director version re-check right afte
   // The stop can come while main() is still starting up (the re-check's
   // timer is armed before the PID check). shutdown() stops what it finds, so
   // main() must not start the HTTP server, the start bring-up, the health
-  // check or the detection tick once a shutdown has begun. main() can only
-  // observe that after it resumes from an await, so each of those calls needs
-  // an `if (shuttingDown) return` between the last await before it and the
-  // call. Every `await` in main()'s text counts, a closure's included, so the
-  // rule errs strict.
+  // check or the detection tick once a shutdown has begun; nor the start
+  // sweep or a bootstrap pass after it (trust, JSONL safeguard, Stop hook),
+  // so a version re-check's stop changes no agent-director row (b.jg5
+  // SRJ-205, SRJ-714). main() can only observe that after it resumes from an
+  // await, so each of those calls needs an `if (shuttingDown) return` between
+  // the last await before it and the call. Every `await` in main()'s text
+  // counts, a closure's included, so the rule errs strict.
   test.each<[string, (controller: string) => RegExp]>([
     ['the HTTP server (Bun.serve)', () => /\bBun\s*\.\s*serve\s*\(/g],
     ['the start bring-up (<controller>.runStartBringUp)', (controller) => new RegExp(`\\b${controller}\\s*\\.\\s*runStartBringUp\\s*\\(`, 'g')],
     ['the health check (startHealthCheck)', () => /(?<![\w.$])startHealthCheck\s*\(/g],
     ['the reload detection tick (<controller>.startDetection)', (controller) => new RegExp(`\\b${controller}\\s*\\.\\s*startDetection\\s*\\(`, 'g')],
     ['the boot template install (installSlackChannelBotTemplate)', () => /(?<![\w.$])installSlackChannelBotTemplate\s*\(/g],
+    ['the start sweep (reconcileOrphans)', () => /(?<![\w.$])reconcileOrphans\s*\(/g],
+    ['the trust bootstrap (trustBootstrap)', () => /(?<![\w.$])trustBootstrap\s*\(/g],
+    ['the JSONL-persistence safeguard (runJsonlPersistenceSafeguard)', () => /(?<![\w.$])runJsonlPersistenceSafeguard\s*\(/g],
+    ['the Stop-hook bootstrap (stopHookBootstrap)', () => /(?<![\w.$])stopHookBootstrap\s*\(/g],
   ])('main() starts %s only if no shutdown has begun: an `if (shuttingDown) return` in main()\'s own statement list after the last await before the call', (_what, callPattern) => {
     const [start, end] = mainBody(SERVER_CODE)
     const calls = indicesOf(callPattern(startResolution(SERVER_CODE).controller), SERVER_CODE)
