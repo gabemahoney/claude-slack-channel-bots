@@ -7,73 +7,82 @@
  * (`ReloadLifecycleOps.teardown`, `.bringUp`, `.reconnectCredentials`,
  * `.updateInPlace` and `.refreshTemplate`, `reload.ts`):
  *
- * - **persona teardown** (SR-6.5, apply step 2): everything the server holds
- *   for one persona key goes, with no graceful wind-down. It serves a
- *   removed persona and the old half of a destructive modify alike. In
- *   order:
- *   0. its dialog approver is stopped (b.jg5 SRJ-404, SRJ-715), first, when
- *      the teardown is submitted and again as its first step, before it
- *      waits for its launch in flight; the stop also cancels the approver a
- *      launch in flight would start, so no Enter reaches the old life; right
- *      after it, its running live-row sequence is stopped (b.jg5 SRJ-706,
- *      SRJ-715), when the teardown is submitted and again as its second
- *      step, which waits for the sequence's call in flight (a step-6 launch
- *      it had started included) before going on, so the sequence makes no
- *      further call and the retry-timer stops below clear an arm it made;
- *   1. its bring-up retries are cancelled and its bring-up state forgotten,
- *      its pending restart timer is cancelled and its UNAVAILABLE retry timer
- *      stopped (b.jg5 SRJ-305; a retry already running finishes first, since
- *      the teardown waits its serializer turn, and its answer is dropped);
- *   2. a launch still in flight for it (the start pass's, which runs outside
+ * - **persona teardown** (b.av2 SR-6.5 as amended by b.jg5 SRJ-1507, apply
+ *   step 2; b.jg5 SRJ-715): the server stops everything it runs for one
+ *   persona key, with no graceful wind-down, kills its agent-director row
+ *   with the result checked, and keeps the row: there is no delete. The
+ *   key was recorded as retired in apply step 1 (b.jg5 SRJ-803), which also
+ *   stopped its dialog approver (SRJ-808), so the row is the key's old life
+ *   and is never resumed. It serves a removed persona and the old half of a
+ *   destructive modify alike. In order:
+ *   1. first, before the wait for its launch in flight (b.jg5 SRJ-715): its
+ *      dialog approver is stopped (b.jg5 SRJ-404), when the teardown is
+ *      submitted and again as its first step; the stop also cancels the
+ *      approver a launch in flight would start, so no Enter reaches the old
+ *      life after this point. Right after it, its running live-row sequence
+ *      is stopped (b.jg5 SRJ-706), when the teardown is submitted and again
+ *      as its second step, which waits for the sequence's call in flight (a
+ *      step-6 launch it had started included), so the sequence makes no
+ *      further call and the retry-timer stop that follows clears an arm it
+ *      made. Then its UNAVAILABLE retry timer is stopped (b.jg5 SRJ-305), its
+ *      latch forgotten silently (b.jg5 SRJ-504: no post, no line claiming a
+ *      clear), its `ErrInvalidFlags` hold forgotten (b.jg5 SRJ-207: no post
+ *      and no retry) and its notice episodes of every kind ended silently
+ *      (b.jg5 SRJ-1016);
+ *   2. its bring-up retries are cancelled and its bring-up state forgotten,
+ *      and its pending restart timer is cancelled (a retry already running
+ *      finishes first, since the teardown waits its serializer turn, and its
+ *      answer is dropped);
+ *   3. a launch still in flight for it (the start pass's, which runs outside
  *      the serializer) is waited for, so the kill below never races a launch
  *      that is bringing the row up. A launch waiting for a `working` row to
  *      settle (up to 10 minutes) has that wait cancelled first (b.f2b: when
  *      the teardown is submitted, and again here), so it types nothing and
- *      settles promptly, and the apply is not held up by it (SR-8.6). Once
- *      it has settled, its live-row sequence is stopped again, awaited, and
- *      its UNAVAILABLE retry timer stopped again (b.jg5 SRJ-715, SRJ-706):
- *      that launch can have started a sequence at a collision ladder
- *      replacement site (b.jg5 SRJ-707) after the first stop, or armed the
- *      timer;
- *   3. its Slack connection is stopped (so no further event arrives for it),
+ *      settles promptly, and the apply is not held up by it (SR-8.6);
+ *   4. once that launch has settled (b.jg5 SRJ-715): its live-row sequence
+ *      is stopped again, awaited, its UNAVAILABLE retry timer stopped again,
+ *      its latch forgotten silently again, and its `ErrInvalidFlags` hold
+ *      and its notice episodes ended again, since that launch can have
+ *      started a sequence at a collision ladder replacement site (b.jg5
+ *      SRJ-707), armed the timer, set a latch or a hold, or opened an
+ *      episode after the first group. The teardown latches nothing (b.jg5
+ *      SRJ-1002), so a destructive modify's new half starts unlatched and
+ *      unheld;
+ *   5. its Slack connection is stopped (so no further event arrives for it),
  *      then its inbound dedupe store and its ack-tracker entries are dropped;
- *   4. its cached DM destination is forgotten, its held destination notices
+ *   6. its cached DM destination is forgotten, its held destination notices
  *      are cancelled, and its pre-validation held notices dropped;
- *   5. its tracked permission prompts and wedge state are dropped (their
+ *   7. its tracked permission prompts and wedge state are dropped (their
  *      Slack messages stay as posted);
- *   6. its registered MCP session is dropped, the registry entry before the
+ *   8. its registered MCP session is dropped, the registry entry before the
  *      transport closes, so the closing stream schedules no restart;
- *   7. agent-director: `cscb_<key>` is killed with one checked kill (b.jg5
- *      SRJ-110, SRJ-701; `killPersonaInstance`, no tries), its outcome
- *      logged with `kill_sent` (`describeKillOutcome`), then its row is
- *      deleted only after a success (any `kill_sent`, a row already gone,
- *      or a session found gone):
- *      a kill that did not succeed fails the kill step, no delete is made
- *      and the row is kept, and nothing latches. The kill is no launch or
- *      recovery attempt: it arms no retry timer, and an ENVIRONMENT or
- *      CONFIG answer raises its outage only while the persona is in the
- *      applied configuration (hatch A3). The delete goes through
- *      `withOutageDetection`; a row already gone is success. Its
- *      outage flags are forgotten before these calls (so a success posts no
- *      all-clear) and again after them (so a flag a failing call raised does
- *      not survive). Its restart failure count, health-check streak,
- *      not-connected episode (b.f2b: its notice latch and the restart path's
- *      idle evidence), its latch (b.jg5 SRJ-504), its `ErrInvalidFlags` hold
- *      (b.jg5 SRJ-207, SRJ-715: no post and no retry) and then its notice
- *      episodes of every kind (b.jg5 SRJ-1016) are forgotten, silently. The
- *      latch, the hold and the episodes go after the launch in flight settled
- *      (step 2), so a latch or a hold that launch set during the teardown,
- *      and the episode it began, go too (SRJ-1002) (that latch's CONFLICT
- *      notice, or that hold's alert, was raised at the set, while the
- *      connection still served: the notifier drops it for a removed persona
- *      and, for a destructive modify's old half, posts it to the destination
- *      of the declaration now applied, the new half's; routing it to the
- *      teardown's log-only entry is not built yet): the key is left neither
- *      latched nor held nor with either episode open, so a destructive
- *      modify's new half starts unlatched and unheld and, if its own launch
- *      meets the same CONFLICT, latches with one post. No recovery notice is
+ *   9. agent-director: `cscb_<key>` is killed with the bounded retry and the
+ *      result checked (b.jg5 SRJ-715, SRJ-110, SRJ-702; the injected
+ *      `killInstance`): a live row it has not read, so UNAVAILABLE gets up
+ *      to 3 tries 2 s apart, its `status` read between tries latches
+ *      nothing, a CONFLICT is never tried again, and a `pending` row with no
+ *      launch start or a latched persona's row is killed too. The outcome
+ *      that stands is logged (`describeKillOutcome`, `kill_sent` included);
+ *      a non-success fails the kill step, and nothing latches. The kill is
+ *      no launch or recovery attempt: it arms no retry timer and starts no
+ *      `tmux-unresponsive` condition, and an ENVIRONMENT or CONFIG answer
+ *      raises its outage only while the persona is in the applied
+ *      configuration. The retry's kill-failure alert decision (the ordinary
+ *      version for `ErrTmuxKillFailed` after the tries or any failure after
+ *      a survivor-naming one, the survivor version for a success after a
+ *      survivor-naming failure) is raised with the context 'persona
+ *      teardown' (b.jg5 SRJ-704: the server log and a startup-errors entry,
+ *      never Slack). Either way the row is kept: a destructive modify's new
+ *      half replaces it only through the live-row sequence once a later kill
+ *      succeeds (b.jg5 SRJ-805). Its outage flags are forgotten before the
+ *      kill (so a success posts no all-clear) and again after it (so a flag
+ *      a failing call raised does not survive). Then its UNAVAILABLE retry
+ *      timer is stopped once more, and its restart failure count,
+ *      health-check streak and not-connected episode (b.f2b: its notice
+ *      latch and the restart path's idle evidence) are forgotten, and its
+ *      latch once more, silently (b.jg5 SRJ-715). No recovery notice is
  *      posted, no clear is logged, and nothing is retried;
- *   8. its reply-guard record is deleted and its launched-with directory
+ *   10. its reply-guard record is deleted and its launched-with directory
  *      forgotten (read first), then the Stop-hook launch pass re-evaluates
  *      the persona's configured and launched-with directories against the
  *      personas still applied.
@@ -90,17 +99,17 @@
  *     ahead of the teardown for the key (a restart timer's work, a bring-up
  *     retry and its launch) then finds it not up or cancelled and launches
  *     nothing, rather than launching the new declaration only for the
- *     teardown to destroy it; from then until step 6 the relaunch gate and
+ *     teardown to kill it; from then until step 6 the relaunch gate and
  *     the up predicate answer not up for it, so no restart, retry or launch
  *     path starts it;
  *   - notices raised during its teardown are held for a persona with no
  *     client, so they are dropped again once its agent-director calls are
  *     done, and none reaches its new half's destination.
- *   Each step's failure is logged and the
- *   remaining steps still run. Nothing is posted to Slack and nothing is
- *   recorded in `startup-errors.log`; a row a failed kill or a failed delete
- *   leaves behind is swept at the next start (SR-6.3). Dry run: no
- *   agent-director call.
+ *   Each step's failure is logged and the remaining steps still run. Nothing
+ *   is posted to Slack; the kill-failure alert, when the kill's retry calls
+ *   for one, is written to the server log and a startup-errors entry. Dry
+ *   run: every step runs but the kill, which is skipped with one line, so no
+ *   agent-director call is made.
  *
  * - **apply bring-up** (SR-6.1, SR-6.2, apply step 6): the start procedure
  *   for one added persona: the non-persistent-storage check for its
@@ -196,7 +205,10 @@
  *   [slack] persona teardown of "<name>" (key=<key>): <step> before its turn failed: <thrown value>
  *   [slack] persona teardown of "<name>" (key=<key>): complete
  *   [slack] persona teardown of "<name>" (key=<key>): complete, with <n> failed step(s)
- *   [slack] dry-run: persona teardown of "<name>" (key=<key>): skipping the agent-director kill and delete of cscb_<key>
+ *   [slack] persona teardown of "<name>" (key=<key>): agent-director kill of cscb_<key>: <outcome> after <n> kill(s); the row is kept (b.jg5 SRJ-715)
+ *   [slack] persona teardown of "<name>" (key=<key>): agent-director kill of cscb_<key> failed: <outcome> after <n> kill(s) — the row is kept; nothing latches and no retry timer is armed (b.jg5 SRJ-715, SRJ-110)
+ *   [slack] persona teardown of "<name>" (key=<key>): agent-director kill of cscb_<key> failed: it answered no kill outcome — the row is kept (b.jg5 SRJ-715)
+ *   [slack] dry-run: persona teardown of "<name>" (key=<key>): skipping the agent-director kill of cscb_<key>; the row is kept
  *   [slack] persona "<name>" (key=<key>): up at apply — launching
  *   [slack] persona "<name>" (key=<key>): launch at apply failed: <thrown value>
  *   [slack] persona "<name>" (key=<key>): storage check at apply failed: <thrown value>
@@ -215,9 +227,11 @@
  *   [slack] persona "<name>" (key=<key>): credentials change not applied — the server is shutting down
  *   [slack] persona "<name>" (key=<key>): forgetting its cached DM conversation failed: <thrown value>
  *
- * A credentials change that cannot be used is logged by the bring-up
- * controller (`persona-credentials-change-failed`); the template refresh's
- * one line is `refreshSlackChannelBotTemplate`'s.
+ * `<outcome>` is the outcome that stands, through `describeKillOutcome`
+ * (`src/checked-kill.ts`); each try and each read between tries is logged by
+ * the injected kill itself. A credentials change that cannot be used is
+ * logged by the bring-up controller (`persona-credentials-change-failed`);
+ * the template refresh's one line is `refreshSlackChannelBotTemplate`'s.
  *
  * `<settings>` lists the changed setting groups, comma-separated, in the
  * change plan's order (`channels`, `delivery`, `permission_prompts`,
@@ -232,8 +246,14 @@
 
 import type { MakeTemplateParams } from 'agent-director'
 import { refreshSlackChannelBotTemplate, type TemplateRefreshResult } from './agent-director-template.ts'
-import { describeKillOutcome, isKillOutcome, killLetsNextStepRun, type KillOutcome } from './checked-kill.ts'
+import { describeKillOutcome, isKillOutcome, killLetsNextStepRun } from './checked-kill.ts'
 import type { Persona, PersonaConfig } from './config.ts'
+import {
+  KILL_RETRY_ALERT_NONE,
+  KILL_RETRY_ALERT_ORDINARY,
+  KILL_RETRY_ALERT_SURVIVOR,
+  type KillRetryAlert,
+} from './kill-retry.ts'
 import {
   isCredentialsBroken,
   type CredentialsChangeHooks,
@@ -251,6 +271,7 @@ import type { PersonaRouting } from './persona-routing.ts'
 import type { PersonaSerialize } from './persona-serializer.ts'
 import type { ApplyBringUpOptions, InPlaceApplyInput } from './reload-apply.ts'
 import type { InPlaceSetting } from './reload-plan.ts'
+import type { PersonaTeardownKillResult } from './session-manager.ts'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -319,10 +340,11 @@ export interface PersonaLifecycleDeps {
    * Stop the key's dialog approver (b.jg5 SRJ-404, SRJ-715: production
    * `stopDialogApprover` with the teardown reason): a running one makes no
    * further call and the returned promise settles once it has stopped; the
-   * approver a launch in flight would start does not start. Called first:
-   * when the teardown is submitted, and awaited as its first step, before the
-   * wait for the launch in flight. Optional, so hand-built fixtures stay
-   * valid; production always passes it.
+   * approver a launch in flight would start does not start. Called first,
+   * for every teardown: when the teardown is submitted, and awaited as its
+   * first step, before the wait for the launch in flight, so it stops before
+   * the kill. Optional, so hand-built fixtures stay valid; production always
+   * passes it.
    */
   stopApprover?: (key: string) => unknown
   /**
@@ -330,13 +352,13 @@ export interface PersonaLifecycleDeps {
    * production `stopLiveRowSequence` with the teardown reason): it makes no
    * further call, and the returned promise settles once the sequence has
    * settled, its call in flight returned (a step-6 launch it had already
-   * started included), so the teardown's later stops of the key's retry
-   * timer clear an arm that call made. Called right after `stopApprover`:
-   * when the teardown is submitted, and awaited as its second step, before
-   * the wait for the launch in flight; and awaited again once that launch
-   * has settled, since the launch can have started a sequence at a collision
-   * ladder replacement site after the first stop (b.jg5 SRJ-715, SRJ-707).
-   * Optional, so hand-built fixtures stay valid; production always passes it.
+   * started included), so the retry-timer stop that follows clears an arm
+   * that call made. Called right after `stopApprover`: when the teardown is
+   * submitted, and awaited as its second step, before the wait for the
+   * launch in flight; and awaited again once that launch has settled, since
+   * the launch can have started a sequence at a collision ladder replacement
+   * site after the first stop (b.jg5 SRJ-715, SRJ-707). Optional, so
+   * hand-built fixtures stay valid; production always passes it.
    */
   stopLiveRowSequence?: (key: string) => unknown
   /** Resolves once the launch in flight for the key (if any) settled; never rejects (`whenLaunchSettled`). */
@@ -352,15 +374,17 @@ export interface PersonaLifecycleDeps {
   cancelRestartTimer: (key: string) => unknown
   /**
    * Stop the key's UNAVAILABLE retry timer (b.jg5 SRJ-305: the retry
-   * controller's `stop` with the torn-down reason), called beside
-   * `cancelRestartTimer`, again right after the second live-row sequence
-   * stop once the launch in flight settled (b.jg5 SRJ-715: that launch can
-   * have armed it), and again after the teardown's agent-director calls
-   * (a failing kill's ENVIRONMENT answer arms the key's timer); other
-   * personas' timers stay armed. In production
-   * the stop also cancels the key's `tmux-unresponsive` alert check through
-   * the controller's stop observer (b.jg5 SRJ-309: its text says CSCB keeps
-   * retrying), its episode kept until `forgetNoticeEpisodes`.
+   * controller's `stop` with the torn-down reason): in the teardown's first
+   * group, right after the live-row sequence stop; again right after the
+   * second sequence stop once the launch in flight settled (b.jg5 SRJ-715:
+   * that launch can have armed it); and once more after the kill, which
+   * arms none, so no timer is left armed for the key (a destructive modify's
+   * key stays applied, and a timer left armed would retry against the new
+   * half). For a destructive modify's old half it is also stopped when the
+   * teardown is submitted. Other personas' timers stay armed. In production
+   * the stop also cancels the key's `tmux-unresponsive` alert check (b.jg5
+   * SRJ-309: its text says CSCB keeps retrying), its episode ended by
+   * `forgetNoticeEpisodes`.
    */
   stopRetryTimer: (key: string) => unknown
   /** Forget the key's restart failure count and cap latch (`forgetFailures`). */
@@ -374,28 +398,31 @@ export interface PersonaLifecycleDeps {
    */
   forgetNotConnectedEpisode?: (key: string) => void
   /**
-   * End the key's notice episodes of every kind silently (b.jg5 SRJ-1016:
-   * the episodes instance's `forget`), run beside `forgetNotConnectedEpisode`
-   * after its launch in flight settled; other personas' episodes stay open.
+   * End the key's notice episodes of every kind silently (b.jg5 SRJ-1016,
+   * SRJ-715: the episodes instance's `forget`): in the teardown's first
+   * group, right after `forgetInvalidFlagsHold`, and again once its launch
+   * in flight settled, since that launch can have opened one (the CONFLICT
+   * episode a latch it set began, the hold's episode included); other
+   * personas' episodes stay open.
    */
   forgetNoticeEpisodes: (key: string) => unknown
   /**
-   * Forget the key's latch silently (b.jg5 SRJ-504: the latch instance's
-   * `forget`): no post, no set observer call, no line claiming a clear. Run
-   * after its launch in flight settled and after the teardown's
-   * agent-director calls, so a latch that launch set during the teardown
-   * goes too (SRJ-1002), and right before `forgetNoticeEpisodes`, which ends
-   * the CONFLICT episode that latch began; other personas' latches stay.
+   * Forget the key's latch silently (b.jg5 SRJ-504, SRJ-715: the latch
+   * instance's `forget`): no post, no set observer call, no line claiming a
+   * clear. In the teardown's first group, right after the retry-timer stop;
+   * again once its launch in flight settled, so a latch that launch set
+   * during the teardown goes too (SRJ-1002); and once more after the kill.
+   * The teardown latches nothing. Other personas' latches stay.
    */
   forgetConflictLatch: (key: string) => unknown
   /**
    * Forget the key's `ErrInvalidFlags` hold silently (b.jg5 SRJ-207,
    * SRJ-715: the hold instance's `forget`): no post and no retry, so a
-   * persona that is gone is never relaunched by its hold's end. Run right
-   * after `forgetConflictLatch`, after its launch in flight settled and after
-   * the teardown's agent-director calls, so a hold that launch set during the
-   * teardown goes too, and right before `forgetNoticeEpisodes`, which ends the
-   * hold's episode; other personas' holds stay. A key added again starts
+   * persona that is gone is never relaunched by its hold's end. Right after
+   * `forgetConflictLatch` in the teardown's first group, and again once its
+   * launch in flight settled, so a hold that launch set during the teardown
+   * goes too; each time right before `forgetNoticeEpisodes`, which ends the
+   * hold's episode. Other personas' holds stay. A key added again starts
    * unheld.
    */
   forgetInvalidFlagsHold: (key: string) => unknown
@@ -411,18 +438,31 @@ export interface PersonaLifecycleDeps {
    */
   dropSession: (key: string) => Promise<unknown>
   /**
-   * One checked kill of `cscb_<key>` (`killPersonaInstance` with
-   * `KILL_CONTEXT_TEARDOWN`; b.jg5 SRJ-110, SRJ-701), answering its outcome,
-   * `kill_sent` included; never throws. It arms no retry timer and latches
-   * nothing; an `ErrInvalidFlags` gets its immediate version re-check there
-   * (b.jg5 SRJ-104, SRJ-204). Only a success (`killLetsNextStepRun`: any
-   * `kill_sent`, `ErrSpawnNotFound`, or GONE) lets the delete follow; any
-   * other outcome, an answer that is not an outcome, and a throw fail the
-   * kill step, and no delete or other agent-director call follows.
+   * The teardown's kill of `cscb_<key>` (b.jg5 SRJ-715, SRJ-110, SRJ-702;
+   * production `killPersonaInstanceForTeardown` on the real clock): the
+   * checked kill inside the bounded retry, seeded as a live row the
+   * teardown has not read, its between-try `status` read latching nothing;
+   * neither arms a retry timer nor starts `tmux-unresponsive`, and a
+   * CONFLICT is never tried again. Answers the retry's result (the outcome
+   * that stands, `kill_sent` included, and the kill-failure alert decision)
+   * and every CONFLICT or UNUSABLE NAME answer met; never throws. A success
+   * (`killLetsNextStepRun`: any `kill_sent`, `ErrSpawnNotFound`, GONE, or a
+   * read of the row finished) is logged; any other outcome, an answer that
+   * is not an outcome, and a throw fail the kill step. Either way the row is
+   * kept: nothing deletes it.
    */
-  killInstance: (key: string) => Promise<KillOutcome>
-  /** Delete the `cscb_<key>` row through `withOutageDetection`; not-found resolves (`deletePersonaInstance`). */
-  deleteInstance: (key: string) => Promise<unknown>
+  killInstance: (key: string) => Promise<PersonaTeardownKillResult>
+  /**
+   * Raise the kill-failure alert the teardown kill's retry decided (b.jg5
+   * SRJ-704, SRJ-702, SRJ-715: production the kill-failure alerts' `raise`,
+   * over the server's one episodes instance, with the context 'persona
+   * teardown', so the ordinary version goes to the server log and a
+   * `persona-teardown-notice` entry and the survivor version to the log and
+   * a `persona-kill-survivor` entry, never to Slack). Called after the kill
+   * step, only for an `ordinary` or `survivor` decision. A throw fails the
+   * step and is logged.
+   */
+  raiseKillFailureAlert: (key: string, decision: KillRetryAlert) => unknown
   /** The reply-guard helpers, the state directory bound. */
   replyGuard: PersonaTeardownReplyGuard
 
@@ -519,6 +559,44 @@ export const LIVE_ROW_SEQUENCE_STOP_STEP = 'stopping its live-row sequence'
 /** The teardown's second stop of the persona's live-row sequence, once its launch in flight settled: its log label. */
 export const LIVE_ROW_SEQUENCE_STOP_AGAIN_STEP = 'stopping its live-row sequence again, after its launch in flight settled'
 
+/** The suffix of each teardown step repeated once its launch in flight settled (b.jg5 SRJ-715). */
+const AGAIN_AFTER_LAUNCH = 'again, after its launch in flight settled'
+
+/** The teardown's last stop of the persona's UNAVAILABLE retry timer, after its kill: its log label. */
+export const TEARDOWN_RETRY_TIMER_STOP_AFTER_KILL_STEP = 'stopping its UNAVAILABLE retry timer once more, after the kill'
+
+/**
+ * The kill-failure alert decision the teardown's kill answered (`killed`'s
+ * `alert`, b.jg5 SRJ-704, SRJ-702), when it is one to raise: a survivor
+ * decision with a string description, or an ordinary one. `none`, or no
+ * decision, answers undefined; a malformed decision (or a throwing read of
+ * it) answers undefined too, after one call of `malformed` saying so. Never
+ * throws.
+ */
+function raisableKillFailureAlertOf(killed: unknown, malformed: (what: string) => void): KillRetryAlert | undefined {
+  let alert: unknown
+  try {
+    alert = (killed as { alert?: unknown } | null | undefined)?.alert
+    if (alert === undefined) return undefined
+    if (typeof alert === 'object' && alert !== null) {
+      const { kind } = alert as { kind?: unknown }
+      if (kind === KILL_RETRY_ALERT_NONE) return undefined
+      if (kind === KILL_RETRY_ALERT_ORDINARY) return alert as KillRetryAlert
+      if (kind === KILL_RETRY_ALERT_SURVIVOR && typeof (alert as { survivorDescription?: unknown }).survivorDescription === 'string') {
+        return alert as KillRetryAlert
+      }
+    }
+  } catch {
+    /* a throwing read is a malformed decision */
+  }
+  try {
+    malformed('it answered a malformed kill-failure alert decision')
+  } catch {
+    /* a failing logger changes nothing */
+  }
+  return undefined
+}
+
 /** Compose the persona teardown, the apply bring-up (and recovery), the credentials change and the in-place update. Creates, reads and schedules nothing. */
 export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifecycle {
   function log(line: string): void {
@@ -545,8 +623,8 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
   /**
    * Run when a teardown is submitted, before its serializer turn. For every
    * teardown, first (b.jg5 SRJ-404, SRJ-715): stop its dialog approver, and
-   * the one its launch in flight would start; right after, its running
-   * live-row sequence (b.jg5 SRJ-706). Then (b.f2b): cancel its
+   * the one its launch in flight would start; second, its running live-row
+   * sequence (b.jg5 SRJ-706). Then (b.f2b): cancel its
    * launch's wait for a `working` row, if one is
    * running, so neither the teardown nor work queued ahead of it for the key
    * (a restart that joined that launch) waits it out, up to 10 minutes. For
@@ -606,31 +684,40 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
 
     log(`${prefix}: starting`)
 
-    // b.jg5 SRJ-404, SRJ-715: its dialog approver first, before any other
-    // step and before the wait for its launch in flight, so no Enter reaches
-    // the old life (the approver that launch would start does not start).
+    // b.jg5 SRJ-715, first group, before the wait for its launch in flight.
+    // b.jg5 SRJ-404: its dialog approver first, so no Enter reaches the old
+    // life (the approver that launch would start does not start).
     await step('stopping its dialog approver', () => deps.stopApprover?.(key))
-    // b.jg5 SRJ-706, SRJ-715: its live-row sequence right after, before the
-    // wait for its launch in flight: it makes no further call, and this step
-    // waits for its call in flight, so the retry-timer stops below clear an
-    // arm that call made.
+    // b.jg5 SRJ-706: its live-row sequence second: it makes no further call,
+    // and this step waits for its call in flight, so the retry-timer stop
+    // right after clears an arm that call made.
     await step(LIVE_ROW_SEQUENCE_STOP_STEP, () => deps.stopLiveRowSequence?.(key))
-    // Retries and timers next, so nothing for the key is started while the
-    // teardown waits below.
+    await step('stopping its UNAVAILABLE retry timer', () => deps.stopRetryTimer(key))
+    // b.jg5 SRJ-504, SRJ-207, SRJ-1016: silently, its latch, then its
+    // ErrInvalidFlags hold (no post, no retry), then its notice episodes, the
+    // CONFLICT and hold episodes included, so none is left open.
+    await step('forgetting its latch', () => deps.forgetConflictLatch(key))
+    await step('forgetting its ErrInvalidFlags hold', () => deps.forgetInvalidFlagsHold(key))
+    await step('forgetting its notice episodes', () => deps.forgetNoticeEpisodes(key))
+    // Then its bring-up retries and restart timer, so nothing for the key is
+    // started while the teardown waits below.
     await step('cancelling its bring-up retries', () => deps.bringUps.cancel(key))
     await step('cancelling its restart timer', () => deps.cancelRestartTimer(key))
-    await step('stopping its UNAVAILABLE retry timer', () => deps.stopRetryTimer(key))
     // b.f2b: again here, for a wait that started after the teardown was
     // submitted; the launch then settles promptly.
     await step("cancelling its launch's wait for a working row", () => deps.cancelLaunchWait?.(key))
     await step('waiting for its launch in flight', () => deps.whenLaunchSettled(key))
-    // b.jg5 SRJ-715, SRJ-706: once that launch has settled, its live-row
-    // sequence and its retry timer are stopped again: the launch in flight
-    // can have started a sequence at a collision ladder replacement site
-    // (b.jg5 SRJ-707) after the first stop, or armed the timer. The stop is
-    // awaited, so the sequence's call in flight has returned before the kill.
+    // b.jg5 SRJ-715, SRJ-1002: once that launch has settled, everything it
+    // can have started, armed, set or opened since the first group goes
+    // again: a sequence at a collision ladder replacement site (b.jg5
+    // SRJ-707, awaited, so its call in flight has returned before the kill),
+    // the retry timer, a latch, an ErrInvalidFlags hold and a notice
+    // episode. The teardown latches nothing.
     await step(LIVE_ROW_SEQUENCE_STOP_AGAIN_STEP, () => deps.stopLiveRowSequence?.(key))
-    await step('stopping its UNAVAILABLE retry timer again, after its launch in flight settled', () => deps.stopRetryTimer(key))
+    await step(`stopping its UNAVAILABLE retry timer ${AGAIN_AFTER_LAUNCH}`, () => deps.stopRetryTimer(key))
+    await step(`forgetting its latch ${AGAIN_AFTER_LAUNCH}`, () => deps.forgetConflictLatch(key))
+    await step(`forgetting its ErrInvalidFlags hold ${AGAIN_AFTER_LAUNCH}`, () => deps.forgetInvalidFlagsHold(key))
+    await step(`forgetting its notice episodes ${AGAIN_AFTER_LAUNCH}`, () => deps.forgetNoticeEpisodes(key))
 
     // The connection before the routing: an event for the key would create
     // a new dedupe store.
@@ -645,41 +732,54 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     // schedules no restart.
     await step('dropping its MCP session', () => deps.dropSession(key))
 
+    // A clean slate first, so a successful call clears no flag and posts no all-clear.
+    await step('forgetting its outage state', () => deps.resetOutageState([key]))
     const instanceId = personaInstanceId(key)
     if (deps.dryRun) {
-      log(`[slack] dry-run: persona teardown of ${renderPersonaRef(persona.name, key)}: skipping the agent-director kill and delete of ${instanceId}`)
+      log(`[slack] dry-run: persona teardown of ${renderPersonaRef(persona.name, key)}: skipping the agent-director kill of ${instanceId}; the row is kept`)
     } else {
-      // A clean slate first, so a successful call clears no flag and posts no all-clear.
-      await step('forgetting its outage state', () => deps.resetOutageState([key]))
-      // b.jg5 SRJ-110, SRJ-701: one checked kill; only a success lets the
-      // delete follow. A kill that did not succeed fails this step and keeps
-      // the row (no delete); nothing latches.
-      let killSucceeded = false
+      // b.jg5 SRJ-715, SRJ-110, SRJ-702: the kill with the bounded retry, its
+      // result checked. A non-success fails this step; nothing latches and no
+      // retry timer is armed. Either way the row is kept: nothing deletes it.
+      const decided: { alert?: KillRetryAlert } = {}
       await step(`agent-director kill of ${instanceId}`, async () => {
-        const outcome = await deps.killInstance(key)
+        const killed = await deps.killInstance(key)
+        const outcome: unknown = (killed as Partial<PersonaTeardownKillResult> | undefined)?.outcome
+        if (!isKillOutcome(outcome)) {
+          failed++
+          log(`${prefix}: agent-director kill of ${instanceId} failed: it answered no kill outcome — the row is kept (b.jg5 SRJ-715)`)
+          return
+        }
+        decided.alert = raisableKillFailureAlertOf(killed, (what) =>
+          log(`${prefix}: agent-director kill of ${instanceId}: ${what} — no kill-failure alert is raised (b.jg5 SRJ-704)`),
+        )
+        const tries = `after ${killed.tries} kill(s)`
         if (killLetsNextStepRun(outcome)) {
-          log(`${prefix}: agent-director kill of ${instanceId}: ${describeKillOutcome(outcome)}`)
-          killSucceeded = true
+          log(`${prefix}: agent-director kill of ${instanceId}: ${describeKillOutcome(outcome)} ${tries}; the row is kept (b.jg5 SRJ-715)`)
           return
         }
         failed++
-        const described = isKillOutcome(outcome) ? describeKillOutcome(outcome) : 'it answered no kill outcome'
-        log(`${prefix}: agent-director kill of ${instanceId} failed: ${described}`)
+        log(
+          `${prefix}: agent-director kill of ${instanceId} failed: ${describeKillOutcome(outcome)} ${tries} — ` +
+            'the row is kept; nothing latches and no retry timer is armed (b.jg5 SRJ-715, SRJ-110)',
+        )
       })
-      if (killSucceeded) {
-        await step(`agent-director delete of ${instanceId}`, () => deps.deleteInstance(key))
-      } else {
-        log(`${prefix}: agent-director delete of ${instanceId} not made — its kill did not succeed, so the row is kept (b.jg5 SRJ-701)`)
+      // b.jg5 SRJ-704, SRJ-702: the retry's kill-failure alert decision, on
+      // the persona-teardown route (the server log and a startup-errors
+      // entry, never Slack). Only a well-formed survivor or ordinary decision
+      // gets here (`raisableKillFailureAlertOf`), so nothing outside a step
+      // can throw.
+      const decision = decided.alert
+      if (decision !== undefined) {
+        await step('raising the kill-failure alert', () => deps.raiseKillFailureAlert(key, decision))
       }
     }
-    // After the agent-director calls: a flag a failing call raised goes too.
-    // The teardown's kill arms no retry timer (b.jg5 SRJ-110; hatch A3), and
-    // its delete none outside an attempt but for an ENVIRONMENT or CONFIG
-    // answer (b.jg5 SRJ-311, SRJ-316); its key stays applied for a
-    // destructive modify, so a timer left armed would retry against the new
-    // half 30 s later with agent-director calls; stopping it here leaves none.
+    // After the kill: a flag a failing call raised goes too.
     await step('forgetting its outage state', () => deps.resetOutageState([key]))
-    await step('stopping its UNAVAILABLE retry timer', () => deps.stopRetryTimer(key))
+    // The kill arms no retry timer (b.jg5 SRJ-110); a destructive modify's
+    // key stays applied, so a timer left armed would retry against the new
+    // half: stopping it once more leaves none.
+    await step(TEARDOWN_RETRY_TIMER_STOP_AFTER_KILL_STEP, () => deps.stopRetryTimer(key))
     // The old half of a destructive modify is still applied, so a notice
     // raised during this teardown (an outage onset from a failing kill) was
     // held for it rather than dropped: drop it again, so it never reaches the
@@ -688,16 +788,8 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     await step('forgetting its restart failure count', () => deps.forgetFailures(key))
     await step('forgetting its health-check streak', () => deps.forgetDisconnectedStreak(key))
     await step('forgetting its not-connected episode', () => deps.forgetNotConnectedEpisode?.(key))
-    // b.jg5 SRJ-504, SRJ-1002: silently, after its launch in flight settled
-    // and after the agent-director calls, so a latch that launch set during
-    // the teardown goes too; then its notice episodes, the CONFLICT episode
-    // that latch began included, so neither is left open: a CONFLICT episode
-    // left open would keep a later same-case latch from posting.
-    await step('forgetting its latch', () => deps.forgetConflictLatch(key))
-    // b.jg5 SRJ-207, SRJ-715: its ErrInvalidFlags hold likewise, with no post
-    // and no retry, before the episodes, its hold episode included.
-    await step('forgetting its ErrInvalidFlags hold', () => deps.forgetInvalidFlagsHold(key))
-    await step('forgetting its notice episodes', () => deps.forgetNoticeEpisodes(key))
+    // b.jg5 SRJ-715, SRJ-504: its latch once more, silently, after the kill.
+    await step('forgetting its latch once more, after the kill', () => deps.forgetConflictLatch(key))
 
     // Read the launched-with dir before the teardown forgets it.
     let launchedWith: string | undefined

@@ -46,7 +46,8 @@
  * and the key of each persona it brings up that is held as retired only in
  * memory, durably through the injected retired-key store, a failure of that
  * write failing the apply with nothing applied, SRJ-803, SRJ-804; then
- * rewrite the record; if the rewrite fails, nothing is applied,
+ * stop the dialog approver of each key recorded, SRJ-808; then rewrite the
+ * record; if the rewrite fails, nothing is applied,
  * `reload-record-write-failed` is logged, and the keys this apply recorded
  * are removed again, a key held as retired before the apply staying retired,
  * SRJ-804; then swap the applied state and tell `onApplied`), then steps 2–6
@@ -64,10 +65,11 @@
  * The controller (`createReloadController`) is built with every dependency
  * injected, as `createCronScheduler` is: the SR-8.1 paths, the durable
  * writer and delete, the server's retired-key store (`retired-keys.ts`,
- * whose writes go through the same writer), the log sink, the lifecycle
- * operations (the start bring-up pass, and the apply's per-step operations),
- * the tick driver, the dry-run flag, the held credentials digests and
- * bring-up states, and the Slack client factory that later work binds
+ * whose writes go through the same writer), the dialog approver stop that
+ * step 1 calls for each key it records (b.jg5 SRJ-808), the log sink, the
+ * lifecycle operations (the start bring-up pass, and the apply's per-step
+ * operations), the tick driver, the dry-run flag, the held credentials
+ * digests and bring-up states, and the Slack client factory that later work binds
  * (applying a confirmed change). The start resolution records no retired
  * key. It keeps the applied bytes and configuration in memory.
  * `readAppliedPersonaConfig` is the CLI's read-only resolver over the same
@@ -413,6 +415,19 @@ export interface ReloadControllerDeps {
    * too, and a test builds it over the writer (and delete) it gives here.
    */
   retiredKeys: RetiredKeyStore
+  /**
+   * Stop the dialog approver running for a key apply step 1 recorded as
+   * retired (b.jg5 SRJ-808, SRJ-404: production `stopDialogApprover` with
+   * the retired-key reason, which logs the stop and its reason and also
+   * cancels the approver a launch in flight would start; no pending-row rule
+   * run follows). Called synchronously in step 1, for each key of the batch,
+   * once the record did not fail (written, or unchanged for a key already
+   * recorded with no mark), before the last-applied rewrite and so before
+   * any teardown is submitted; its returned value is not awaited, and a
+   * throw or rejection is logged. A failed step-1 write stops nothing, and a
+   * failed rewrite restarts no approver.
+   */
+  stopApprover: (key: string) => unknown
   /** The detection tick's driver; without one, `startDetection` arms nothing. */
   tickDriver?: ReloadTickDriver
   /**
@@ -1442,6 +1457,23 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
           'recorded are removed again, and keys recorded before it stay (b.jg5 SRJ-804)'
   }
 
+  /**
+   * Stop the dialog approver of `key`, which step 1 recorded as retired
+   * (b.jg5 SRJ-808): `deps.stopApprover`, not awaited; a throw or a
+   * rejection is logged, never raised:
+   *
+   *   [slack] reload: stopping the dialog approver of key=<key>, recorded as retired, failed: <thrown value>
+   */
+  function stopApproverOf(key: string): void {
+    const failed = (err: unknown): void =>
+      deps.log(`[slack] reload: stopping the dialog approver of key=${key}, recorded as retired, failed: ${describeThrownValue(err)}`)
+    try {
+      void Promise.resolve(deps.stopApprover(key)).catch(failed)
+    } catch (err) {
+      failed(err)
+    }
+  }
+
   /** Tell the server the new applied configuration; a throw is logged, never raised. */
   function notifyApplied(config: PersonaConfig): void {
     try {
@@ -1466,12 +1498,17 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
    *      before the apply, as far as it can be, one
    *      `reload-record-write-failed` line naming the retired-key file is
    *      logged, and nothing is applied: the last-applied record is not
-   *      rewritten and the change stays pending (SRJ-804);
+   *      rewritten and the change stays pending (SRJ-804). Once the record
+   *      did not fail (written, or nothing to write for keys already
+   *      recorded with no mark), the dialog approver of each key of the
+   *      batch is stopped (`stopApprover`, SRJ-808), before the rewrite and
+   *      before any teardown's kill;
    *   2. rewrite the last-applied record. When that fails, the retired-key
    *      record, if step 1 wrote it, is restored to what it held before the
    *      apply (the keys this apply recorded removed again, keys and marks
    *      held before it kept), one `reload-record-write-failed` line says how
-   *      the restore went, and nothing is applied (SRJ-804);
+   *      the restore went, and nothing is applied (SRJ-804); no approver
+   *      stopped in step 1 is started again;
    *   3. swap the applied state and tell `onApplied`.
    * Then the bound steps 2–6 run in order (`applyStepsFor`: none but the
    * template refresh for a no-op, and that only when the config directories
@@ -1501,6 +1538,10 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
       deps.log(retiredKeysWriteFailedLine(store, store.restore(recorded.snapshot)))
       return false
     }
+    // b.jg5 SRJ-808: each recorded key's approver stops now, before the
+    // rewrite and the teardown's kill; nothing awaited, so step 1 stays one
+    // synchronous stretch.
+    for (const { key } of batch) stopApproverOf(key)
     const rewriteFailed = writeRecord(bytes, current.bytes)
     if (rewriteFailed !== undefined) {
       const restored =

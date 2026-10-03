@@ -181,8 +181,10 @@
  *   `refreshTemplate` run the real composition instead (`run.composition`, see
  *   `RealLifecycleComposition`: `createPersonaLifecycle` over the run's
  *   controller and manager, a real serializer, the run's destination
- *   resolver, the real agent-director kill and delete over a `makeStubClient`
- *   stub, `opts.agentDirector`, a recorded launch, the template refresh over
+ *   resolver, the teardown's real agent-director kill with the bounded retry
+ *   on `run.clock` and no delete (the row is kept, b.jg5 SRJ-715) over a
+ *   `makeStubClient` stub, its kill-failure alert on the persona-teardown
+ *   route, `opts.agentDirector`, a recorded launch, the template refresh over
  *   that stub keeping `installedTemplate`, and never shutting down). The
  *   controller's default step bodies call them for every confirmed apply run
  *   without `opts.applySteps`: step 2 tears down each removed persona and the
@@ -290,7 +292,17 @@
  *   (`opts.onApplied` is called too), and `run.appliedKeys()` is the
  *   controller's applied persona keys now (`controller.applied()`).
  *   `opts.beforeWrite(path)` runs before every writer call, e.g. to see
- *   whether `paths.apply` still exists when the record is written;
+ *   whether `paths.apply` still exists when the record is written. Its
+ *   approver stop (`stopApprover`, b.jg5 SRJ-808: step 1 stops each recorded
+ *   key's dialog approver, right after the record and before the rewrite)
+ *   is recorded in `run.approverStops`, each call with the key and how many
+ *   `run.writes`, `run.lifecycle.timeline` and agent-director call entries
+ *   there were then (`ReloadApproverStop`); with `opts.realLaunch` it is
+ *   also the session manager's real `stopDialogApprover` with the
+ *   retired-key reason (`APPROVER_STOP_RETIRED_KEY`), as `main()` binds it.
+ *   `opts.approverClock` puts a realLaunch run's approver on a fake clock,
+ *   so a case holds an approver polling a `pending` row
+ *   (`opts.leaveSpawnsPending`) across an apply;
  * - the retired-key store (b.jg5 SRJ-802, SRJ-803, SRJ-804): every run
  *   loads one store over `h.stateDir` (`loadRetiredKeyStore`, as `main()`
  *   loads its one store before the start resolution) and hands it to the
@@ -371,7 +383,10 @@
  * and collides with any row; a reuse spawn (`reuse_finished`) over an `ended`
  * or `missing` row, or of an id with no row, starts a new `waiting` life with
  * its own `cwd` and labels, and collides with a live row; a resume sets the
- * row `waiting`, a kill `ended`, a delete removes it. A launch record gets
+ * row `waiting`, a kill that succeeds `ended`; nothing removes a row (no CSCB
+ * path deletes one, b.jg5 SRJ-715), and a spawn
+ * `opts.leaveSpawnsPending` picks leaves its row `pending` with a
+ * launch start until the case moves it. A launch record gets
  * the ladder's `action`: for a key the run's retired-key store has recorded
  * (b.jg5 SRJ-805, SRJ-806) a reuse spawn that succeeded answers
  * `SPAWN_ACTION_FRESH_RETIRED` (`fresh-retired`, from
@@ -380,8 +395,9 @@
  * and a `reconnected`. `run.composition.agentDirectorCalls` is every
  * agent-director call in order (a spawn with its `cwd`, `CLAUDE_CONFIG_DIR`,
  * `config_dir` label and whether it was a reuse; each with its `result`),
- * and `instanceCallsOf(name)` the persona's spawn, resume, kill and delete.
- * `h.seedRow(persona, { state?, cwd?, configDir?, labels? })` sets or
+ * and `instanceCallsOf(name)` the persona's spawn, resume and kill (a
+ * delete would show there too; none is made).
+ * `h.seedRow(persona, { state?, cwd?, configDir?, labels?, launchStartedAt? })` sets or
  * changes a row before a launch, to choose its path (`h.rowOf(name)` reads
  * it); `run.relaunch(name)` is the persona's next launch through the
  * restart path (the relaunch gate, then `launchSession`, in its serializer
@@ -560,7 +576,7 @@ import { _resetAckTracker, consumeAck, forgetPersonaAcks } from '../../src/ack-t
 import { resetClientForTests, setClientForTests } from '../../src/agent-director-client.ts'
 import { buildTemplateParams, type TemplateRefreshResult } from '../../src/agent-director-template.ts'
 import { bindConflictNotice, createConflictLatch, type ConflictLatch } from '../../src/conflict-latch.ts'
-import { createPersonaEpisodes } from '../../src/persona-episodes.ts'
+import { createKillFailureAlerts, createPersonaEpisodes } from '../../src/persona-episodes.ts'
 import { bindInvalidFlagsHoldSetReaction, createInvalidFlagsHold, type InvalidFlagsHold } from '../../src/invalid-flags-hold.ts'
 import {
   LIVE_ROW_SEQUENCE_ENTRY_KILL,
@@ -570,7 +586,7 @@ import {
   type LiveRowSequenceOutcome,
   type LiveRowSequenceRegistry,
 } from '../../src/live-row-sequence.ts'
-import { KILL_FAILURE_CONTEXT_RECOVERY } from '../../src/kill-failure-alert.ts'
+import { KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN, KILL_FAILURE_CONTEXT_RECOVERY } from '../../src/kill-failure-alert.ts'
 import { AGENT_DIRECTOR_DEAD_STATES } from '../../src/liveness-reading.ts'
 import { runDetachedRecoveryAttempt } from '../../src/unavailable-retry.ts'
 import { personaInstanceId, personaKey, renderPersonaRef } from '../../src/persona-identity.ts'
@@ -599,6 +615,7 @@ import {
   type SessionToolDeps,
 } from '../../src/registry.ts'
 import {
+  APPROVER_STOP_RETIRED_KEY,
   APPROVER_STOP_TEARDOWN,
   _resetApproverClock,
   _resetConfiguredPersonaQuery,
@@ -611,14 +628,13 @@ import {
   _resetPreLaunchTrustPatcher,
   _resetRetiredKeyStore,
   _resetSpawnHomeDir,
+  _setApproverClock,
   _setDialogReadyTimeoutMs,
   _setSpawnHomeDir,
   buildLiveRowSequenceDeps,
   checkLaunchConfigDir,
-  deletePersonaInstance,
   isLiveRowSequenceRunning,
-  KILL_CONTEXT_TEARDOWN,
-  killPersonaInstance,
+  killPersonaInstanceForTeardown,
   launchSession,
   personaConfigDirLabelValue,
   setConfigDirUnresolvableHook,
@@ -671,6 +687,7 @@ import {
   holdSpawns,
   makeStubCallLog,
   makeStubClient,
+  SAMPLE_LAUNCH_START_DEFAULT,
   type FindMissingHold,
   type SpawnHold,
   type StubCallLog,
@@ -960,8 +977,14 @@ export interface LifecycleTimelineEntry {
  * The real lifecycle composition a run binds with `opts.realLifecycle`
  * (`run.composition`): `createPersonaLifecycle` (`persona-lifecycle.ts`) over
  * the run's real bring-up controller and connection manager, a real
- * per-persona serializer (shared with that controller and manager), the real `killPersonaInstance` and
- * `deletePersonaInstance` over a `makeStubClient` agent-director stub, the
+ * per-persona serializer (shared with that controller and manager), the
+ * teardown's real kill (`killPersonaInstanceForTeardown`, the bounded retry
+ * with its waits between tries on `run.clock`; b.jg5 SRJ-715, SRJ-702) over a
+ * `makeStubClient` agent-director stub, with no delete, so the row is kept
+ * whatever the kill's outcome, its kill-failure alert raised through the
+ * run's kill-failure alerts with the context 'persona teardown'
+ * (`raiseKillFailureAlert`, as `main()` binds it; the log-only route's
+ * entries in `killFailureEntries`), the
  * session manager's real `whenLaunchSettled` and approver stop
  * (`stopApprover`: `stopDialogApprover` with the teardown reason, as `main()`
  * binds it, so a teardown stops the key's dialog approver first, b.jg5
@@ -975,7 +998,12 @@ export interface RealLifecycleComposition {
   readonly lifecycle: PersonaLifecycle
   /** Every agent-director verb call, by verb (`killCalls`, `deleteCalls`, …). */
   readonly agentDirector: StubCallLog
-  /** The agent-director `kill` and `delete` calls in call order, as `<verb> <instance ID>`. */
+  /**
+   * The agent-director `kill` calls in call order, as `kill <instance ID>`
+   * (one per try of a teardown's bounded retry). No CSCB path deletes a row
+   * (b.jg5 SRJ-715, SRJ-716); a `delete` call would show here too, as
+   * `delete <instance IDs>`, and leave the row as it was.
+   */
   readonly agentDirectorOrder: readonly string[]
   /**
    * Every call of a dependency the composition got, in call order, as
@@ -986,7 +1014,7 @@ export interface RealLifecycleComposition {
    * `'connections.stop'`, `'routing.forget'`, `'forgetAcks'`, `'destinations.forget'`,
    * `'destinationHold.cancel'`, `'notifier.forget'`, `'forgetPersonaPrompts'`,
    * `'dropSession'`, `'resetOutageState'`, `'killInstance'`,
-   * `'deleteInstance'`, `'forgetFailures'`, `'forgetDisconnectedStreak'`,
+   * `'raiseKillFailureAlert'`, `'forgetFailures'`, `'forgetDisconnectedStreak'`,
    * `'forgetConflictLatch'`, `'forgetInvalidFlagsHold'`, `'forgetNoticeEpisodes'`, `'replyGuard.launchedWithDir'`, `'replyGuard.teardown'`,
    * `'replyGuard.launchPass'`, `'storageCheck'`, `'bringUps.bringUp'`,
    * `'bringUps.changeCredentials'`, `'connections.reconnectCredentials'`,
@@ -997,15 +1025,16 @@ export interface RealLifecycleComposition {
   readonly calls: ReadonlyArray<readonly [string, string]>
   /**
    * Every agent-director call the stub received, in call order, with what a
-   * test needs of it (see `AgentDirectorCall`): the lifecycle's kill and
-   * delete, step 5's `makeTemplate`, and with `opts.realLaunch` the launch
+   * test needs of it (see `AgentDirectorCall`): the teardown kill's tries and
+   * the `status` reads between them, step 5's `makeTemplate`, and with `opts.realLaunch` the launch
    * path's spawn, get, resume, status and the rest. Their full params are on
    * `agentDirector` by verb.
    */
   readonly agentDirectorCalls: readonly AgentDirectorCall[]
   /**
-   * The persona's instance calls (`spawn`, `resume`, `kill`, `delete` of
-   * `cscb_<key>`) among `agentDirectorCalls`, in order, with their results:
+   * The persona's instance calls (`spawn`, `resume`, `kill`, and a `delete`,
+   * which no CSCB path makes, of `cscb_<key>`) among `agentDirectorCalls`, in
+   * order, with their results (a teardown's kill is one `kill` per try):
    * a relaunch from an `ended` row with an old `config_dir` label reads
    * spawn (`ErrInstanceIdCollision`), then a reuse spawn of the same id
    * (`reuse` set, `ok`), with no delete; one with the current label spawn
@@ -1047,6 +1076,15 @@ export interface RealLifecycleComposition {
    * harness's cleanup.
    */
   holdSpawns(shouldHold: (id: string) => boolean): SpawnHold
+  /**
+   * Every entry the run's kill-failure alerts wrote through their log-only
+   * route (production's `recordStartupError`: the server log and
+   * `startup-errors.log`), in order, as its class label and entry text: a
+   * persona teardown's alert (b.jg5 SRJ-704, SRJ-715) is one
+   * `persona-teardown-notice` (ordinary) or `persona-kill-survivor` entry.
+   * Nothing on this route reaches Slack.
+   */
+  readonly killFailureEntries: ReadonlyArray<{ readonly classLabel: string; readonly entry: string }>
 }
 
 /**
@@ -1083,18 +1121,24 @@ function errorName(err: unknown): string {
  * A persona's agent-director row in the harness's row table (shared by every
  * run, as agent-director's store outlives a server restart). With
  * `opts.realLaunch`, a plain spawn creates the row (`waiting`, the spawn's
- * `cwd` and labels) and collides with any row there; a reuse spawn of the
- * same id (`reuse_finished`) replaces an `ended` or `missing` row with a new
- * life (`waiting`, the reuse's `cwd` and labels), creates a missing one, and
- * collides with a live row; a resume sets it `waiting`, a kill `ended`, and
- * a delete removes it, with no row deleted by any launch; `get` answers it and `status` its state (a `working` row
- * answers `waiting`, its turn over). `h.seedRow` sets or changes it.
+ * `cwd` and labels; `pending` for a spawn `opts.leaveSpawnsPending` picks) and
+ * collides with any row there; a reuse spawn of the same id
+ * (`reuse_finished`) replaces an `ended` or `missing` row with a new life
+ * (`waiting`, the reuse's `cwd` and labels), creates a missing one, and
+ * collides with a live row; a resume sets it `waiting` and a kill that
+ * succeeds `ended`, and a failed kill leaves it as it was. Nothing removes a
+ * row: no CSCB path deletes one (b.jg5 SRJ-715), so a torn-down persona's
+ * row is kept, `ended`. `get` answers it and `status` its state (a `working`
+ * row answers `waiting`, its turn over), a `pending` row's with its launch
+ * start. `h.seedRow` sets or changes it.
  */
 export interface AgentDirectorRow {
   readonly state: string
   readonly cwd: string
   /** The row's labels (`service`, `persona`, `config_dir`, …). */
   readonly labels: Readonly<Record<string, string>>
+  /** A `pending` row's launch start (`launch_started_at`); absent for a row in any other state, or a `pending` row with none. */
+  readonly launchStartedAt?: string
 }
 
 /** `h.seedRow`'s fields; each one given replaces the row's. */
@@ -1111,6 +1155,25 @@ export interface AgentDirectorRowSeed {
   configDir?: string | null
   /** Replace all labels (wins over `configDir`). */
   labels?: Record<string, string>
+  /** A `pending` row's launch start (`launch_started_at`); `null` removes it. */
+  launchStartedAt?: string | null
+}
+
+/** A row as the harness's row table holds it (`AgentDirectorRow`, mutable). */
+interface TableRow {
+  state: string
+  cwd: string
+  labels: Record<string, string>
+  launchStartedAt?: string
+}
+
+/**
+ * The launch start a `status` or `get` of `row` carries: a `pending` row's
+ * own (absent: none, as agent-director answers a `pending` row with no
+ * launch start), nothing for any other state.
+ */
+function launchStartOf(row: TableRow): { launch_started_at?: string } {
+  return row.state === 'pending' ? { launch_started_at: row.launchStartedAt } : {}
 }
 
 /** The verbs `instanceCallsOf` keeps: those that start, stop or remove an instance. */
@@ -1483,6 +1546,25 @@ export interface ReloadRunOptions {
   /** With `realLifecycle`: options for the agent-director stub (e.g. `killError`). Its call captures are the harness's own. */
   agentDirector?: StubClientOptions
   /**
+   * With `realLaunch`: the startup-dialog approver's clock
+   * (`_setApproverClock`, reset by `h.cleanup()`), so its laps, its sleeps
+   * between them and its 200 ms cap run only when the case moves this clock
+   * (pass a `createFakeClock()`, never `run.clock`). Absent, the approver
+   * runs on the real clock.
+   */
+  approverClock?: FakeClock
+  /**
+   * With `realLaunch`: a spawn that creates or resets a row and whose
+   * instance ID satisfies this leaves the row `pending`, with a launch start
+   * (`SAMPLE_LAUNCH_START_DEFAULT`), instead of `waiting`, until the case
+   * moves it (`h.seedRow`) or a kill that succeeds ends it; its `status` and
+   * `get` carry that launch start. The launch's startup-dialog approver then
+   * polls the row (b.jg5 SRJ-404), lap by lap on the approver's clock
+   * (`approverClock`), until it is stopped. Absent: every spawn leaves its
+   * row `waiting`.
+   */
+  leaveSpawnsPending?: (id: string) => boolean
+  /**
    * Called with the path before every call of the controller's writer (the
    * record, the pending file, the retired-key record), e.g. to observe what
    * exists when the record is written.
@@ -1502,6 +1584,22 @@ export interface ReloadRunOptions {
    * that reached it must be stopped before the next run is built.
    */
   stopBeforeWrite?: string
+}
+
+/**
+ * One call of the reload controller's approver stop (`run.approverStops`):
+ * the key, and how many entries `run.writes`, `run.lifecycle.timeline` and
+ * (with the real composition) `run.composition.agentDirectorCalls` held when
+ * it was made, so a case orders it against the retired-key write, the
+ * last-applied write, the teardown's start and the agent-director calls.
+ * Holds no token.
+ */
+export interface ReloadApproverStop {
+  readonly key: string
+  readonly writes: number
+  readonly timeline: number
+  /** Undefined without the real composition. */
+  readonly agentDirectorCalls: number | undefined
 }
 
 /** A run's latch, read-only: the latched query and the record. */
@@ -1544,6 +1642,15 @@ export interface ReloadRun {
   readonly retiredKeys: RetiredKeyStore
   /** Whether the run reached its `opts.stopBeforeWrite` stop point (the disk image was kept). */
   readonly stoppedBeforeWrite: boolean
+  /**
+   * Every call of the controller's approver stop (`stopApprover`, b.jg5
+   * SRJ-808: apply step 1 stops the dialog approver of each key it recorded,
+   * right after the record), in order, with where the run stood at the call
+   * (see `ReloadApproverStop`). With `opts.realLaunch` each call is also the
+   * session manager's real `stopDialogApprover(key, APPROVER_STOP_RETIRED_KEY)`,
+   * as `main()` binds it; otherwise it is only recorded.
+   */
+  readonly approverStops: readonly ReloadApproverStop[]
   /** The latest `run.resolveStart()` outcome (also set by `h.start`). */
   readonly outcome: ReloadStartOutcome | undefined
   /** The real lifecycle composition, with `opts.realLifecycle`; undefined otherwise. */
@@ -1825,8 +1932,9 @@ export interface ReloadHarness {
   /**
    * Set or change the persona's agent-director row in the row table (see
    * `AgentDirectorRow`), before a launch, to choose the ladder's path: an
-   * `ended` row with an old `config_dir` label is deleted and spawned fresh,
-   * one with the current label resumed, a `waiting` one reconnected. A new
+   * `ended` row with an old `config_dir` label is replaced by a reuse spawn
+   * of the same id, nothing deleted, one with the current label resumed, a
+   * `waiting` one reconnected; a `pending` one carries `launchStartedAt`. A new
    * row takes `seed`'s fields, else the persona's `working_directory`, its
    * `claude_config_dir` for the label and the state `ended`; an existing row
    * changes only the fields given.
@@ -2086,7 +2194,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
   const paths = reloadFilePaths(join(dir, 'config.json'))
 
   /** The agent-director row table, by instance ID: shared by every run (see `AgentDirectorRow`). */
-  const rows = new Map<string, { state: string; cwd: string; labels: Record<string, string> }>()
+  const rows = new Map<string, TableRow>()
   /** A realLaunch run installed the session manager's module seams: reset them at cleanup. */
   let launchSeamsInstalled = false
   /**
@@ -2382,6 +2490,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       const agentDirectorOrder: string[] = []
       const agentDirectorCalls: AgentDirectorCall[] = []
       const templateFailures: Error[] = []
+      /** Whether a spawn of `id` leaves its row `pending` (`opts.leaveSpawnsPending`); none by default. */
+      const spawnsLeftPending = (id: string): boolean => runOpts.leaveSpawnsPending?.(id) === true
       const stub = makeStubClient({ ...runOpts.agentDirector, ...agentDirector })
       /** Log `call`, run `body`, and note on `call` how it ended. */
       async function tracked<T>(call: AgentDirectorCall, body: () => Promise<T>): Promise<T> {
@@ -2415,14 +2525,13 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
             return result
           })
         },
+        // No CSCB path deletes a row (b.jg5 SRJ-715, SRJ-716): a delete is
+        // only recorded (`agentDirectorOrder`, `instanceCallsOf`), so a case's
+        // exact expectation fails on it, and it changes no row.
         delete(params: Parameters<typeof stub.delete>[0]) {
           const ids = params.claude_instance_id
           agentDirectorOrder.push(`delete ${ids.join(',')}`)
-          return tracked({ verb: 'delete', id: ids.join(',') }, async () => {
-            const result = await stub.delete(params)
-            for (const id of ids) rows.delete(id)
-            return result
-          })
+          return tracked({ verb: 'delete', id: ids.join(',') }, () => stub.delete(params))
         },
         spawn(params: Phase1SpawnParams) {
           const id = String(params.claude_instance_id)
@@ -2446,7 +2555,13 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
               throw errInstanceIdCollision()
             }
             const result = await stub.spawn(params)
-            rows.set(id, { state: 'waiting', cwd: params.cwd, labels })
+            // A spawn `opts.leaveSpawnsPending` picks leaves its row `pending`, with a launch start, until the case moves it.
+            rows.set(
+              id,
+              spawnsLeftPending(id)
+                ? { state: 'pending', cwd: params.cwd, labels, launchStartedAt: SAMPLE_LAUNCH_START_DEFAULT }
+                : { state: 'waiting', cwd: params.cwd, labels },
+            )
             return result
           })
         },
@@ -2463,7 +2578,13 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           return tracked({ verb: 'get', id }, async () => {
             agentDirector.getCalls.push(params)
             const row = rowFor(id)
-            return cannedGetResult({ claude_instance_id: id, state: row.state, cwd: row.cwd, labels: { ...row.labels } })
+            return cannedGetResult({
+              claude_instance_id: id,
+              state: row.state,
+              cwd: row.cwd,
+              labels: { ...row.labels },
+              ...launchStartOf(row),
+            })
           })
         },
         status(params: Parameters<typeof stub.status>[0]) {
@@ -2473,7 +2594,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
             const row = rowFor(id)
             // A working instance's turn is over by the first poll.
             if (row.state === 'working') row.state = 'waiting'
-            return { state: row.state }
+            return { state: row.state, ...launchStartOf(row) }
           })
         },
         sendKeys: (params: Parameters<typeof stub.sendKeys>[0]) =>
@@ -2490,13 +2611,24 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
             throw failure
           }),
       }
-      // The real kill and delete run through withOutageDetection, whose
+      // The real kill and its reads run through withOutageDetection, whose
       // module state this installs (reset by `h.cleanup()`).
       initOutageState({
         getClient: () => client as unknown as ReturnType<Parameters<typeof initOutageState>[0]['getClient']>,
         notify: (key) => void calls.push(['outage-notice', key]),
       })
       outageStateInstalled = true
+      // As main() builds them (b.jg5 SRJ-704): the kill-failure alerts over
+      // the run's notice episodes, a key configured while the run's applied
+      // configuration holds it, and the log-only route (production's
+      // `recordStartupError`) recorded in `killFailureEntries`, never Slack.
+      const killFailureEntries: Array<{ classLabel: string; entry: string }> = []
+      const killFailureAlerts = createKillFailureAlerts({
+        episodes,
+        log,
+        isConfigured: (key) => getAppliedPersona(key) !== undefined,
+        logOnly: (classLabel, entry) => void killFailureEntries.push({ classLabel, entry }),
+      })
       /** A recording dependency: logs `[member, key]`, then returns `result(key)`. */
       const rec =
         <R>(member: string, result: (key: string) => R = () => undefined as R) =>
@@ -2572,14 +2704,20 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         },
         forgetPersonaPrompts: rec('forgetPersonaPrompts', () => 0),
         dropSession: rec('dropSession', async () => undefined),
-        // As main() binds it: the persona teardown's kill context (b.jg5 SRJ-110).
+        // As main() binds it (b.jg5 SRJ-715, SRJ-110, SRJ-702): the
+        // teardown's kill with the bounded retry, its waits between tries on
+        // the run's fake clock (`run.clock`), never a real timer; there is no
+        // delete, so the row is kept whatever the outcome.
         killInstance: (key) => {
           calls.push(['killInstance', key])
-          return killPersonaInstance(key, { context: KILL_CONTEXT_TEARDOWN })
+          return killPersonaInstanceForTeardown(key, { clock: connections.clock })
         },
-        deleteInstance: (key) => {
-          calls.push(['deleteInstance', key])
-          return deletePersonaInstance(key)
+        // As main() binds it (b.jg5 SRJ-704): the retry's kill-failure alert
+        // decision through the run's kill-failure alerts, with the context
+        // 'persona teardown' (the log-only route: `killFailureEntries`).
+        raiseKillFailureAlert: (key, decision) => {
+          calls.push(['raiseKillFailureAlert', key])
+          return killFailureAlerts.raise({ key, decision, latched: false, context: KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN })
         },
         // With the real launch path, the real reply-guard members over the
         // harness's state directory, as server.ts binds them; else recorders.
@@ -2624,6 +2762,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         failTemplateRefresh: (err) => void templateFailures.push(err),
         holdFindMissing: () => holdFindMissing(stub),
         holdSpawns: (shouldHold) => holdSpawns(stub, shouldHold),
+        killFailureEntries,
         client,
       }
     }
@@ -2901,9 +3040,23 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       throw new Error(`reload-harness: the run cannot load the retired-key record: ${loadedRetiredKeys.message}`)
     }
     const retiredKeys = loadedRetiredKeys.store
+    const approverStops: ReloadApproverStop[] = []
     controller = createReloadController({
       paths,
       retiredKeys,
+      // As main() binds it (b.jg5 SRJ-808, SRJ-404): apply step 1 stops the
+      // dialog approver of each key it recorded. Recorded with where the run
+      // stood; with the real launch path also the session manager's real stop
+      // with the retired-key reason, as nothing else starts an approver.
+      stopApprover: (key) => {
+        approverStops.push({
+          key,
+          writes: writes.length,
+          timeline: timeline.length,
+          agentDirectorCalls: composition?.agentDirectorCalls.length,
+        })
+        return realLaunch ? stopDialogApprover(key, APPROVER_STOP_RETIRED_KEY) : undefined
+      },
       lifecycle: ops,
       log,
       write,
@@ -3046,6 +3199,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       writes,
       removes,
       retiredKeys,
+      approverStops,
       get stoppedBeforeWrite() {
         return stopImage !== undefined
       },
@@ -3113,6 +3267,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         removes,
         slack: slackCalls(),
         episodeNotices,
+        killFailureEntries: composition?.killFailureEntries ?? [],
         written: [...new Set(writes.filter((w) => w.ok).map((w) => w.path))]
           .filter((path) => existsSync(path))
           .map((path) => writtenFile(path)),
@@ -3269,6 +3424,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       captureConsole({ lines: logs, live: () => !stopped })
       setClientForTests(composition!.client as Parameters<typeof setClientForTests>[0])
       _setDialogReadyTimeoutMs(200)
+      if (runOpts.approverClock === undefined) _resetApproverClock()
+      else _setApproverClock(runOpts.approverClock)
       _setSpawnHomeDir(home)
       // A new server process: nothing in flight (no launch, no dialog
       // approver), no launched-with dir known.
@@ -3354,12 +3511,17 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       if (seed.configDir === null) delete row.labels[CONFIG_DIR_LABEL]
       else if (seed.configDir !== undefined) row.labels[CONFIG_DIR_LABEL] = personaConfigDirLabelValue(seed.configDir, home)
       if (seed.labels !== undefined) row.labels = { ...seed.labels }
+      if (seed.launchStartedAt === null) delete row.launchStartedAt
+      else if (seed.launchStartedAt !== undefined) row.launchStartedAt = seed.launchStartedAt
       rows.set(id, row)
       return h.rowOf(persona.name)!
     },
     rowOf(name) {
       const row = rows.get(personaInstanceId(personaKey(name)))
-      return row === undefined ? undefined : { state: row.state, cwd: row.cwd, labels: { ...row.labels } }
+      if (row === undefined) return undefined
+      const read = { state: row.state, cwd: row.cwd, labels: { ...row.labels } }
+      const { launch_started_at: launchStartedAt } = launchStartOf(row)
+      return launchStartedAt === undefined ? read : { ...read, launchStartedAt }
     },
     paths,
     key: (name) => personaKey(name),

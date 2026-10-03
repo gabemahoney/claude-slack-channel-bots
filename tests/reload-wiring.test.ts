@@ -45,7 +45,12 @@
  * the key's tmux-unresponsive alert check on the one condition main() builds
  * (b.jg5 SRJ-309), that the teardown forgets the key's latch on the one
  * latch main() builds, through the only forget of that latch in server.ts
- * (b.jg5 SRJ-504), and that the refresh gets the server-wide
+ * (b.jg5 SRJ-504), that the teardown kills through the session manager's
+ * bounded-retry teardown kill on the production clock, raises its
+ * kill-failure alert on the one alerts instance with the context 'persona
+ * teardown' and is given no delete (b.jg5 SRJ-715, SRJ-704), that apply step
+ * 1 stops each recorded key's dialog approver with the retired-key reason
+ * (b.jg5 SRJ-808), and that the refresh gets the server-wide
  * template arguments the boot install wrote (a value captured once at start,
  * never re-read at apply) and the agent-director client. What the default step bodies do with those members
  * is tested in tests/reload-apply.test.ts; what the teardown, the apply
@@ -67,7 +72,8 @@
  * connections). This follows tests/cron-scheduler-wiring.test.ts and
  * tests/start-sweep-wiring.test.ts: it reads the source with comments
  * stripped and anchors on content, never on line numbers. It reads no file
- * but src/server.ts, imports only the pure `configInEffect` from
+ * but src/server.ts (and, for the one name check that the teardown's delete is
+ * gone, every src/*.ts file's text), imports only the pure `configInEffect` from
  * src/reload.ts and the pure `replySettingsOf`, constants and types from
  * src/config.ts, runs no server code, and touches no home directory.
  *
@@ -75,7 +81,7 @@
  */
 
 import { describe, test, expect } from 'bun:test'
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 import {
   atMainTopLevel,
   balancedAfter,
@@ -443,8 +449,10 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
 
   // Every dependency is required, so the typecheck catches a missing one; it
   // cannot catch one bound to a stub (`() => undefined`, `async () => {}`) or
-  // two same-typed ones swapped (killInstance/deleteInstance). Each value is
-  // pinned to the production function or object it must be.
+  // two same-typed ones swapped (forgetFailures/forgetDisconnectedStreak).
+  // Each value is pinned to the production function or object it must be.
+  // b.jg5 SRJ-715: there is no delete, so no `deleteInstance` is passed (the
+  // exact key list below) and nothing deleting a row is imported.
   test('createPersonaLifecycle gets every production dependency: nothing stubbed, nothing swapped, nothing extra', () => {
     const props = onlyCallProps('createPersonaLifecycle')
     const loaded = loadedConfigName(SERVER_CODE)
@@ -486,13 +494,12 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       // The silent per-key ack-tracker forget, so a key added again starts clean.
       ['forgetAcks', 'forgetPersonaAcks'],
       ['dropSession', 'dropPersonaSessionAndKeepAlive'],
-      ['deleteInstance', 'deletePersonaInstance'],
     ])
     // Functions and objects with a parameter name of the source's choosing.
     // (`templateRefresh` is pinned in the test after this one.)
     const shaped = [
       'log', 'replyGuard', 'storageCheck', 'launch', 'templateRefresh', 'stopApprover', 'stopLiveRowSequence', 'stopRetryTimer',
-      'forgetConflictLatch', 'forgetInvalidFlagsHold', 'forgetNoticeEpisodes', 'killInstance',
+      'forgetConflictLatch', 'forgetInvalidFlagsHold', 'forgetNoticeEpisodes', 'killInstance', 'raiseKillFailureAlert',
     ]
     expect([...props.keys()].sort()).toEqual([...expected.keys(), ...shaped].sort())
     for (const [dep, value] of expected) expect([dep, props.get(dep)]).toEqual([dep, value])
@@ -502,9 +509,10 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     const imports: Record<string, string> = {
       whenLaunchSettled: './session-manager.ts',
       cancelWorkingRowWait: './session-manager.ts',
-      killPersonaInstance: './session-manager.ts',
-      KILL_CONTEXT_TEARDOWN: './session-manager.ts',
-      deletePersonaInstance: './session-manager.ts',
+      killPersonaInstanceForTeardown: './session-manager.ts',
+      KILL_RETRY_SYSTEM_CLOCK: './kill-retry.ts',
+      createKillFailureAlerts: './persona-episodes.ts',
+      KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN: './kill-failure-alert.ts',
       stopDialogApprover: './session-manager.ts',
       APPROVER_STOP_TEARDOWN: './session-manager.ts',
       stopLiveRowSequence: './session-manager.ts',
@@ -588,16 +596,38 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     expect(stopSequence).not.toBeNull()
     expect(stopSequence![2]).toBe(stopSequence![1])
 
-    // b.jg5 SRJ-110 (hatch A3): the teardown's kill is the session manager's
-    // checked kill of that key with the teardown context (its context is
-    // required), so it arms nothing: not a stub, not the delete, not another
-    // key's kill, not the attempt context, and nothing else in its options
-    // (imported above, not shadowed).
+    // b.jg5 SRJ-715, SRJ-110, SRJ-702: the teardown's kill is the session
+    // manager's teardown kill entry for that key (the checked kill inside the
+    // bounded retry, arming nothing and latching nothing) on the production
+    // kill-retry clock: not a stub, not the one-try checked kill, not another
+    // key's kill, not a test or hand-built clock, and nothing else in its
+    // options (imported above, not shadowed).
     const killInstance = (props.get('killInstance') ?? '').match(
-      /^\(?(\w+)\)? => killPersonaInstance\((\w+), \{\s*context:\s*KILL_CONTEXT_TEARDOWN\s*\}\)$/,
+      /^\(?(\w+)\)? => killPersonaInstanceForTeardown\((\w+), \{\s*clock:\s*KILL_RETRY_SYSTEM_CLOCK\s*\}\)$/,
     )
     expect(killInstance).not.toBeNull()
     expect(killInstance![2]).toBe(killInstance![1])
+
+    // b.jg5 SRJ-704, SRJ-715: required, so the typecheck catches it missing;
+    // it cannot catch it bound to a stub, to a second alerts instance (one
+    // over episodes a teardown never forgets and shutdown never closes), to
+    // another context's route (one that posts to Slack), or with the key, the
+    // decision or the latched flag swapped. It raises the decision it is
+    // given, for the key it is given, unlatched (the teardown latches
+    // nothing), with the context 'persona teardown', on the server's one
+    // kill-failure alerts instance, built over the one notice episodes
+    // instance (imported above, not shadowed).
+    const alerts = constOf('createKillFailureAlerts')
+    expect(onlyCallProps('createKillFailureAlerts').get('episodes')).toBe(constOf('createPersonaEpisodes'))
+    const raiser = (props.get('raiseKillFailureAlert') ?? '').match(new RegExp(`^\\((\\w+), (\\w+)\\) => ${alerts}\\.raise\\((\\{[\\s\\S]*\\})\\)$`))
+    expect(raiser).not.toBeNull()
+    const raised = objectProperties(raiser![3]!)
+    expect(Object.fromEntries(raised)).toEqual({
+      key: raiser![1]!,
+      decision: raiser![2]!,
+      latched: 'false',
+      context: 'KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN',
+    })
 
     // b.jg5 SRJ-305: the teardown stops the key's UNAVAILABLE retry timer on
     // the server's one retry controller (the one installed as the outage
@@ -770,6 +800,46 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     expect(forgets[0]!).toBeGreaterThan(steps[0]!)
     expect(forgets[0]!).toBeLessThan(close)
     expect(indicesOf(new RegExp(`(?<![\\w$.])${hold}\\s*(?:\\?\\.|!)?\\s*\\[`, 'g'), SERVER_CODE)).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Apply step 1's approver stop, and no delete anywhere (b.jg5 SRJ-808,
+// SRJ-404, SRJ-715)
+// ---------------------------------------------------------------------------
+
+describe('server.ts binds apply step 1\'s approver stop, and no src file keeps the teardown\'s delete (b.jg5 SRJ-808, SRJ-404, SRJ-715)', () => {
+  // `ReloadControllerDeps.stopApprover` is required, so the typecheck catches
+  // it missing; it cannot catch it bound to a stub, to another key's stop, to
+  // every persona's stop or to another reason (the teardown's, which is
+  // already the lifecycle's; a superseded stop, which leaves the row to the
+  // pending-row rule). What step 1 does with it is tested in
+  // tests/reload-apply.test.ts; what the stop does in
+  // tests/approve-trust-folder-dialog.test.ts.
+  test('the reload controller\'s stopApprover is exactly the session manager\'s approver stop for the key it is given, with the retired-key reason (imported, not shadowed)', () => {
+    const stop = (controllerProps().get('stopApprover') ?? '').match(
+      /^\(?(\w+)\)? => stopDialogApprover\((\w+), APPROVER_STOP_RETIRED_KEY\)$/,
+    )
+    expect(stop).not.toBeNull()
+    expect(stop![2]).toBe(stop![1])
+    for (const name of ['stopDialogApprover', 'APPROVER_STOP_RETIRED_KEY']) {
+      expect([name, importSource(SERVER_CODE, name)]).toEqual([name, './session-manager.ts'])
+      expect([name, indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${name}\\b`, 'g'), SERVER_CODE)]).toEqual([name, []])
+    }
+    // The retired-key reason is used for this binding alone.
+    expect(indicesOf(/\bAPPROVER_STOP_RETIRED_KEY\b/g, SERVER_CODE).filter((at) => insideMain(SERVER_CODE, at))).toHaveLength(1)
+  })
+
+  // b.jg5 SRJ-715: the teardown keeps the row, so `deletePersonaInstance`
+  // and `deleteInstanceRow` are gone; one left in any module (a re-export, a
+  // copy under the same name) would let a later wiring delete a row whose
+  // kill may have failed.
+  test('no src/ file names deletePersonaInstance or deleteInstanceRow, in code or comments', () => {
+    const srcDir = new URL('../src/', import.meta.url)
+    const files = readdirSync(srcDir, { recursive: true, encoding: 'utf-8' }).filter((name) => name.endsWith('.ts'))
+    expect(files).toContain('server.ts')
+    const naming = files.filter((name) => /\b(?:deletePersonaInstance|deleteInstanceRow)\b/.test(readFileSync(new URL(name, srcDir), 'utf-8')))
+    expect(naming).toEqual([])
   })
 })
 

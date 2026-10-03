@@ -585,7 +585,10 @@ import {
   setPreLaunchReplyGuard,
   KILL_CONTEXT_TEARDOWN,
   killPersonaInstance,
-  deletePersonaInstance,
+  killPersonaInstanceForTeardown,
+  TEARDOWN_KILL_REFUSAL_AT_KILL,
+  TEARDOWN_KILL_REFUSAL_AT_READ,
+  type PersonaTeardownKillResult,
   readPersonaRowState,
   whenLaunchSettled,
   ConfigDirUnresolvableError,
@@ -855,18 +858,29 @@ import { makeMultiPersonaConfig, makeStandInPersonaConfig } from './test-helpers
 import {
   KILL_OUTCOME_KILLED,
   KILL_OUTCOME_NOT_KILLED,
+  KILL_OUTCOME_ROW_FINISHED,
   KILL_OUTCOME_ROW_GONE,
   KILL_OUTCOME_SESSION_GONE,
+  KILL_ROW_FINISHED_ENDED,
+  KILL_ROW_FINISHED_MISSING,
+  KILL_ROW_FINISHED_NO_ROW,
   describeKillOutcome,
   killOutcomeOf,
   type KillOutcome,
 } from '../src/checked-kill.ts'
 import {
+  KILL_RETRY_ALERT_NONE,
   KILL_RETRY_ALERT_ORDINARY,
   KILL_RETRY_ALERT_SURVIVOR,
+  KILL_RETRY_END_EXHAUSTED,
+  KILL_RETRY_END_READ_CONFIG,
   KILL_RETRY_END_READ_LATCHED,
+  KILL_RETRY_END_ROW_FINISHED,
+  KILL_RETRY_END_SETTLED,
   KILL_RETRY_SPACING_MS,
   KILL_RETRY_TRIES,
+  killRetryEndLine,
+  type KillRetryAlert,
 } from '../src/kill-retry.ts'
 import { buildTempArchiveDb, messagesSince } from './test-helpers/archive-db.ts'
 import {
@@ -13423,20 +13437,21 @@ describe('persona notices (b.av2 SR-7.2)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The persona teardown's quiet kill and delete (b.av2 SR-6.5)
+// The one checked kill each try of the persona teardown's kill makes
+// (b.av2 SR-6.5, b.jg5 SRJ-715)
 //
-// `killPersonaInstance(key, { context: KILL_CONTEXT_TEARDOWN })` /
-// `deletePersonaInstance(key)` touch only `cscb_<key>`, through
-// `withOutageDetection` (its flags move as for any other call), and are
-// quiet: no log line, no startup error, no persona notice.
-// b.jg5 SRJ-110, SRJ-701: the kill is one checked kill that answers its
+// `killPersonaInstance(key, { context: KILL_CONTEXT_TEARDOWN })` touches only
+// `cscb_<key>`, through `withOutageDetection` (its flags move as for any
+// other call), and is quiet: no log line, no startup error, no persona
+// notice. b.jg5 SRJ-110, SRJ-701: it is one checked kill that answers its
 // outcome, `kill_sent` included, and never throws: a success (`kill_sent`
 // true, false or absent), the row-gone success for `ErrSpawnNotFound`, or a
-// non-success keeping the thrown value. The delete still resolves false for
-// a row already gone and rethrows every other error for the teardown to log.
+// non-success keeping the thrown value. The teardown's kill entry
+// (`killPersonaInstanceForTeardown`, the describe after this one) makes it
+// once per try; there is no delete (b.jg5 SRJ-715).
 // ---------------------------------------------------------------------------
 
-describe('killPersonaInstance / deletePersonaInstance: the persona teardown\'s quiet kill and delete (b.av2 SR-6.5)', () => {
+describe('killPersonaInstance: the one checked kill each try of the persona teardown\'s kill makes (b.av2 SR-6.5, b.jg5 SRJ-715)', () => {
   const B = 'B'
   const A = 'A'
   /** The persona teardown's kill context (`main()`'s binding). */
@@ -13476,35 +13491,27 @@ describe('killPersonaInstance / deletePersonaInstance: the persona teardown\'s q
     ['true', true],
     ['false', false],
     ['absent', undefined],
-  ] as const)('b.jg5 SRJ-701, SRJ-703: a present row whose kill succeeds with kill_sent %s: kill addresses only cscb_B and resolves the killed outcome carrying it; delete addresses only cscb_B and resolves true; no other verb, no line, no startup error, no notice', async (_label, killSent) => {
+  ] as const)('b.jg5 SRJ-701, SRJ-703: a present row whose kill succeeds with kill_sent %s: kill addresses only cscb_B and resolves the killed outcome carrying it; no other verb, no line, no startup error, no notice', async (_label, killSent) => {
     const calls = makeStubCallLog()
     installStub({ ...calls, killResult: cannedKillResult(killSent) })
 
     const kill = await runQuietly(() => killPersonaInstance(B, TEARDOWN))
-    const del = await runQuietly(() => deletePersonaInstance(B))
 
     expect(kill.outcome).toEqual({ ok: killSent === undefined ? { kind: KILL_OUTCOME_KILLED } : { kind: KILL_OUTCOME_KILLED, killSent } })
-    expect(del.outcome).toEqual({ ok: true })
     expect(calls.killCalls).toEqual([{ claude_instance_id: 'cscb_B' }])
-    expect(calls.deleteCalls).toEqual([{ claude_instance_id: ['cscb_B'] }])
-    expect(stubCallCount(calls)).toBe(2)
-    for (const r of [kill, del]) {
-      expect(r.errLog).toBe('')
-      expect(r.startupLog).toBe('')
-    }
+    expect(stubCallCount(calls)).toBe(1)
+    expect(kill.errLog).toBe('')
+    expect(kill.startupLog).toBe('')
     expect(notices).toEqual([])
     expect(outageEmissions).toEqual([])
   })
 
-  test.each([
-    ['kill', () => killPersonaInstance(B, TEARDOWN), { kind: KILL_OUTCOME_ROW_GONE }],
-    ['delete', () => deletePersonaInstance(B), false],
-  ] as const)('%s: a row already gone (ErrSpawnNotFound) is a success, quietly (b.jg5 SRJ-701: the kill resolves the row-gone outcome, the delete false)', async (verb, call, expected) => {
-    installStub(verb === 'kill' ? { killError: errSpawnNotFound() } : { deleteError: errSpawnNotFound() })
+  test('a row already gone (ErrSpawnNotFound) is a success, quietly (b.jg5 SRJ-701: the kill resolves the row-gone outcome)', async () => {
+    installStub({ killError: errSpawnNotFound() })
 
-    const r = await runQuietly(call)
+    const r = await runQuietly(() => killPersonaInstance(B, TEARDOWN))
 
-    expect(r.outcome).toEqual({ ok: expected })
+    expect(r.outcome).toEqual({ ok: { kind: KILL_OUTCOME_ROW_GONE } })
     expect(r.errLog).toBe('')
     expect(r.startupLog).toBe('')
     expect(notices).toEqual([])
@@ -13525,47 +13532,230 @@ describe('killPersonaInstance / deletePersonaInstance: the persona teardown\'s q
     expect(outageEmissions).toEqual([])
   })
 
-  test('delete: any other error is rethrown unchanged, with no line, startup error or notice of its own', async () => {
-    const err = errGeneric('delete', 'ErrBroken')
-    installStub({ deleteError: err })
-
-    const r = await runQuietly(() => deletePersonaInstance(B))
-
-    expect(r.outcome).toEqual({ err })
-    expect(r.errLog).toBe('')
-    expect(r.startupLog).toBe('')
-    expect(notices).toEqual([])
-    expect(outageEmissions).toEqual([])
-  })
-
-  test.each([
-    ['kill', () => killPersonaInstance(B, TEARDOWN)],
-    ['delete', () => deletePersonaInstance(B)],
-  ] as const)('%s goes through the outage wrapper: agent-director unreachable raises B\'s ad-unreachable flag (the kill answers its UNCLASSIFIED outcome, b.jg5 SRJ-701; the delete rethrows); a later success clears it with B\'s all-clear; A\'s flag is untouched', async (verb, call) => {
+  test('it goes through the outage wrapper: agent-director unreachable raises B\'s ad-unreachable flag (the kill answers its UNCLASSIFIED outcome, b.jg5 SRJ-701); a later success clears it with B\'s all-clear; A\'s flag is untouched', async () => {
     const BIN = '/opt/ad/bin/agent-director'
     setOutageFlag(A, 'ad-unreachable', BIN)
     outageEmissions = []
-    const unreachable = new ErrSystemInstallDisappeared(verb, BIN)
-    installStub(verb === 'kill' ? { killError: unreachable } : { deleteError: unreachable })
+    const unreachable = new ErrSystemInstallDisappeared('kill', BIN)
+    installStub({ killError: unreachable })
+    const call = () => killPersonaInstance(B, TEARDOWN)
 
     const failed = await runQuietly(call)
 
-    expect(failed.outcome).toEqual(
-      verb === 'kill' ? { ok: { kind: KILL_OUTCOME_NOT_KILLED, errorClass: AD_ERROR_CLASS_UNCLASSIFIED, error: unreachable } } : { err: unreachable },
-    )
+    expect(failed.outcome).toEqual({ ok: { kind: KILL_OUTCOME_NOT_KILLED, errorClass: AD_ERROR_CLASS_UNCLASSIFIED, error: unreachable } })
     expect([...getOutageFlags(B)]).toEqual(['ad-unreachable'])
     expect(outageEmissions.map((e) => e.key)).toEqual([B])
 
     installStub({})
     const ok = await runQuietly(call)
 
-    expect(ok.outcome).toEqual({ ok: verb === 'kill' ? { kind: KILL_OUTCOME_KILLED } : true })
+    expect(ok.outcome).toEqual({ ok: { kind: KILL_OUTCOME_KILLED } })
     expect([...getOutageFlags(B)]).toEqual([])
     expect(outageEmissions.map((e) => e.key)).toEqual([B, B])
     expect(outageEmissions[1]!.text).toContain('All clear')
     expect([...getOutageFlags(A)]).toEqual(['ad-unreachable'])
     expect(ok.errLog).toBe('')
     expect(notices).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The persona teardown's kill entry (b.jg5 SRJ-715, SRJ-110, SRJ-702,
+// SRJ-1002)
+//
+// `killPersonaInstanceForTeardown(key, { clock })` is the teardown's kill:
+// the bounded retry over the checked kill above, seeded as a live row it has
+// not read, on the injected clock (here the recovery harness's kill-retry
+// clock, driven with `h.drive`). UNAVAILABLE gets `KILL_RETRY_TRIES` tries
+// `KILL_RETRY_SPACING_MS` apart with one `status` read of the row before each
+// further try; a read of `ended`, `missing` or `ErrSpawnNotFound` ends the
+// tries as a success; a CONFLICT is never tried again, and each CONFLICT or
+// UNUSABLE NAME met, at a try or at a read, is answered for the teardown's
+// routing and latched on nothing. A persona teardown is no launch or
+// recovery attempt (SRJ-110): nothing arms a retry timer or starts the
+// `tmux-unresponsive` condition. It answers the retry's alert decision for
+// the caller to raise (persona-lifecycle's teardown route is tested in
+// tests/persona-lifecycle.test.ts); it never deletes. Every expected line is
+// built with `src/kill-retry.ts`'s builder.
+// ---------------------------------------------------------------------------
+
+describe('killPersonaInstanceForTeardown: the persona teardown\'s bounded, checked kill, arming and latching nothing (b.jg5 SRJ-715, SRJ-110, SRJ-702, SRJ-1002)', () => {
+  afterEach(srj105AfterEach)
+
+  /** The teardown kill's line head for persona `key` (its reference when none is given). */
+  const prefixOf = (key: string): string => `[slack] persona teardown kill for persona=${key}`
+
+  /**
+   * Run the teardown's kill of `p` on the harness's kill-retry clock to its
+   * end; assert it took exactly the waits its reads stood behind, left no
+   * timer, made no call but `kill` and `status` of P's own instance (`kills`
+   * and `reads` of them), deleted nothing, armed, latched and started
+   * nothing, and touched B not at all. Resolves with its result.
+   */
+  async function teardownKill(h: RecoveryHarness, p: string, b: string, kills: number, reads: number): Promise<PersonaTeardownKillResult> {
+    const startedAt = h.clock.now()
+    const result = await h.drive(killPersonaInstanceForTeardown(p, { clock: h.killRetryClock }))
+    expect([result.tries, result.reads]).toEqual([kills, reads])
+    expect(h.clock.now() - startedAt).toBe(reads * KILL_RETRY_SPACING_MS)
+    expect(h.clock.pending()).toEqual([])
+    const id = personaInstanceId(p)
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ kill: kills }))
+    expect(h.stub.calls.killCalls).toEqual(Array.from({ length: kills }, () => ({ claude_instance_id: id })))
+    expect(h.stub.calls.statusCalls.map((c) => c.claude_instance_id)).toEqual(Array.from({ length: reads }, () => id))
+    expect(h.stub.callCount()).toBe(kills + reads)
+    expect(h.triggers).toEqual([])
+    expect(h.controller.isArmed(p)).toBe(false)
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+    expectNoNoteLatch(h)
+    expect(h.notices).toEqual([])
+    expect(h.startupErrors()).toEqual([])
+    expect(getFailureCount(p)).toBe(0)
+    expectUntouched(h, b)
+    return result
+  }
+
+  test.each<[string, () => Error, (err: Error) => KillRetryAlert]>([
+    ['ErrTmuxKillFailed', () => errTmuxKillFailed(), (err) => ({ kind: KILL_RETRY_ALERT_ORDINARY, lastKillFailedDescription: killFailedDescriptionOf(err)! })],
+    ['ErrTmuxUnresponsive', () => errTmuxUnresponsive('kill'), () => ({ kind: KILL_RETRY_ALERT_NONE })],
+    ['ErrCallTimeout', () => errCallTimeout('kill'), () => ({ kind: KILL_RETRY_ALERT_NONE })],
+  ])('UNAVAILABLE (%s) at every try: every try is made, the row read live before each further try; the outcome stands (exhausted) with the retry\'s alert decision; nothing armed, latched or deleted', async (_what, make, alert) => {
+    const { h, p, b } = srj105Build()
+    const err = make()
+    h.script({ killError: err })
+
+    const result = await teardownKill(h, p, b, KILL_RETRY_TRIES, KILL_RETRY_TRIES - 1)
+
+    expect(result.outcome).toMatchObject({ kind: KILL_OUTCOME_NOT_KILLED, errorClass: AD_ERROR_CLASS_UNAVAILABLE, error: err })
+    expect(result).toEqual({
+      outcome: killOutcomeOf({ thrown: err }),
+      end: KILL_RETRY_END_EXHAUSTED,
+      tries: KILL_RETRY_TRIES,
+      reads: KILL_RETRY_TRIES - 1,
+      alert: alert(err),
+      refusals: [],
+    })
+    const lines = h.errors.filter((line) => line.startsWith(prefixOf(p)))
+    expect(lines).toHaveLength(KILL_RETRY_TRIES + (KILL_RETRY_TRIES - 1) + 1)
+    expect(lines.at(-1)).toBe(killRetryEndLine(prefixOf(p), personaInstanceId(p), result))
+    assertNoLeak(lines)
+  })
+
+  test.each<[string, CannedResponse<Phase1StatusResult>, string]>([
+    ['ended', cannedOk(cannedStatusResult({ state: 'ended' })), KILL_ROW_FINISHED_ENDED],
+    ['missing', cannedOk(cannedStatusResult({ state: 'missing' })), KILL_ROW_FINISHED_MISSING],
+    ['ErrSpawnNotFound', cannedErr(errSpawnNotFound()), KILL_ROW_FINISHED_NO_ROW],
+  ])('a read between tries answering %s ends the tries as the row-finished success, with no further kill', async (_what, read, finished) => {
+    const { h, p, b } = srj105Build()
+    h.script({ killError: errTmuxUnresponsive('kill'), statusQueue: [read] })
+
+    const result = await teardownKill(h, p, b, 1, 1)
+
+    expect(result).toMatchObject({ outcome: { kind: KILL_OUTCOME_ROW_FINISHED, read: finished }, end: KILL_RETRY_END_ROW_FINISHED, alert: { kind: KILL_RETRY_ALERT_NONE }, refusals: [] })
+  })
+
+  test('a survivor-naming ErrTmuxKillFailed, then a success: two tries and one read; the survivor decision quotes the survivor-naming description', async () => {
+    const { h, p, b } = srj105Build()
+    const survivor = errTmuxKillFailed(undefined, 'pane-process-survived')
+    h.script({ killQueue: [cannedErr(survivor), cannedOk(cannedKillResult(true))] })
+
+    const result = await teardownKill(h, p, b, 2, 1)
+
+    expect(result).toEqual({
+      outcome: { kind: KILL_OUTCOME_KILLED, killSent: true },
+      end: KILL_RETRY_END_SETTLED,
+      tries: 2,
+      reads: 1,
+      alert: { kind: KILL_RETRY_ALERT_SURVIVOR, survivorDescription: killFailedDescriptionOf(survivor)! },
+      refusals: [],
+    })
+  })
+
+  test.each<[string, () => Error, typeof AD_ERROR_CLASS_CONFLICT | typeof AD_ERROR_CLASS_UNUSABLE_NAME]>([
+    ['CONFLICT (ErrTmuxSessionConflict)', () => errTmuxSessionConflict('kill', 'different-id'), AD_ERROR_CLASS_CONFLICT],
+    ['UNUSABLE NAME', () => errUnusableName(), AD_ERROR_CLASS_UNUSABLE_NAME],
+  ])('%s at the first try: never tried again; the outcome stands and the answer is returned for routing, at the kill; nothing latches', async (_what, make, errorClass) => {
+    const { h, p, b } = srj105Build()
+    const err = make()
+    h.script({ killQueue: [cannedErr(err), cannedOk(cannedKillResult(true))] })
+
+    const result = await teardownKill(h, p, b, 1, 0)
+
+    expect(result).toMatchObject({ outcome: { kind: KILL_OUTCOME_NOT_KILLED, errorClass, error: err }, end: KILL_RETRY_END_SETTLED, alert: { kind: KILL_RETRY_ALERT_NONE } })
+    expect(result.refusals).toEqual([{ at: TEARDOWN_KILL_REFUSAL_AT_KILL, errorClass, error: err }])
+  })
+
+  test.each<[string, () => Error, typeof AD_ERROR_CLASS_CONFLICT | typeof AD_ERROR_CLASS_UNUSABLE_NAME]>([
+    ['CONFLICT (ErrTmuxSessionConflict)', () => errTmuxSessionConflict('status', 'different-id'), AD_ERROR_CLASS_CONFLICT],
+    ['UNUSABLE NAME', () => errUnusableName(), AD_ERROR_CLASS_UNUSABLE_NAME],
+  ])('%s at the first read between tries: returned for routing, at the status read; nothing latches and the next try goes ahead', async (_what, make, errorClass) => {
+    const { h, p, b } = srj105Build()
+    const err = make()
+    const unavailable = errTmuxUnresponsive('kill')
+    h.script({ killError: unavailable, statusQueue: [cannedErr(err)] })
+
+    const result = await teardownKill(h, p, b, KILL_RETRY_TRIES, KILL_RETRY_TRIES - 1)
+
+    expect(result).toMatchObject({ outcome: { kind: KILL_OUTCOME_NOT_KILLED, errorClass: AD_ERROR_CLASS_UNAVAILABLE, error: unavailable }, end: KILL_RETRY_END_EXHAUSTED })
+    expect(result.refusals).toEqual([{ at: TEARDOWN_KILL_REFUSAL_AT_READ, errorClass, error: err }])
+  })
+
+  // b.jg5 SRJ-316, SRJ-702: the read between tries goes through the outage
+  // wrapper arming nothing, so a CONFIG answer raises `ad-config-malformed`
+  // only while the persona is configured (a later successful read clears it
+  // as from any verb); it is no refusal, and after a read other than
+  // `pending` the next try goes ahead.
+  test.each<[string, boolean]>([
+    ['a configured persona', true],
+    ['a persona no longer configured', false],
+  ])('a CONFIG answer at the first read between tries, for %s: the next try goes ahead; ad-config-malformed raised once (then cleared by the next read) only when configured; nothing armed, latched or refused', async (_label, configured) => {
+    const { h, p, b } = srj105Build()
+    const configErr = errConfigMalformed()
+    const unavailable = errTmuxUnresponsive('kill')
+    h.script({ killError: unavailable, statusQueue: [cannedErr(configErr)] })
+    if (!configured) h.remove(p)
+
+    const result = await teardownKill(h, p, b, KILL_RETRY_TRIES, KILL_RETRY_TRIES - 1)
+
+    expect(result).toMatchObject({ outcome: { kind: KILL_OUTCOME_NOT_KILLED, errorClass: AD_ERROR_CLASS_UNAVAILABLE, error: unavailable }, end: KILL_RETRY_END_EXHAUSTED })
+    expect(result.refusals).toEqual([])
+    // The next read's success clears the outage that CONFIG answer raised, with one all-clear.
+    const allClear = ALL_CLEAR_TEMPLATE(new Map([[AD_CONFIG_MALFORMED_CLASS, { detail: undefined }]]))
+    expect(h.outageNotices).toEqual(configured ? [{ key: p, text: adConfigMalformedOnset(configErr) }, { key: p, text: allClear }] : [])
+    expect(adConfigMalformedRaiseLines(h, p)).toHaveLength(configured ? 1 : 0)
+    expect([...getOutageFlags(p)]).toEqual([])
+  })
+
+  // b.jg5 SRJ-702: SRJ-316's rule between tries: a CONFIG answer at a read
+  // that follows a read of `pending` ends the tries with no further kill.
+  test('a CONFIG answer at a read following a read of pending ends the tries (read-config) with no further kill; ad-config-malformed raised once; nothing armed, latched or refused', async () => {
+    const { h, p, b } = srj105Build()
+    const configErr = errConfigMalformed()
+    const unavailable = errTmuxUnresponsive('kill')
+    h.script({ killError: unavailable, statusQueue: [cannedOk(cannedStatusResult({ state: 'pending' })), cannedErr(configErr)] })
+
+    const result = await teardownKill(h, p, b, 2, 2)
+
+    expect(result).toEqual({
+      outcome: killOutcomeOf({ thrown: unavailable }),
+      end: KILL_RETRY_END_READ_CONFIG,
+      tries: 2,
+      reads: 2,
+      alert: { kind: KILL_RETRY_ALERT_NONE },
+      refusals: [],
+    })
+    expect([...getOutageFlags(p)]).toEqual([AD_CONFIG_MALFORMED_CLASS])
+    expect(h.outageNotices).toEqual([{ key: p, text: adConfigMalformedOnset(configErr) }])
+    expect(adConfigMalformedRaiseLines(h, p)).toHaveLength(1)
+    expect(h.errors.filter((line) => line.startsWith(prefixOf(p))).at(-1)).toBe(killRetryEndLine(prefixOf(p), personaInstanceId(p), result))
+  })
+
+  // b.jg5 SRJ-715: the teardown keeps the row, so the session manager offers
+  // no delete of a persona's row (that no src file names either is pinned in
+  // tests/reload-wiring.test.ts).
+  test('the session manager exports neither deletePersonaInstance nor deleteInstanceRow', async () => {
+    const exported = Object.keys(await import('../src/session-manager.ts'))
+    expect(exported).toContain('killPersonaInstanceForTeardown')
+    expect(exported.filter((name) => name === 'deletePersonaInstance' || name === 'deleteInstanceRow')).toEqual([])
   })
 })
 
@@ -20128,23 +20318,6 @@ describe('b.jg5 SRJ-313, SRJ-1002, SRJ-512: the controls — a phrase-less ErrIn
     expect(h.notices).toEqual([])
   })
 
-  test('the persona teardown\'s deletePersonaInstance answering UNUSABLE NAME still rethrows the same value and latches nothing: no set, no post, no UNUSABLE NAME line', async () => {
-    const { h, p } = srj105Build()
-    const err = errUnusableName()
-    h.script({ deleteError: err })
-
-    let thrown: unknown
-    try {
-      await deletePersonaInstance(p)
-    } catch (e) {
-      thrown = e
-    }
-
-    expect(thrown).toBe(err)
-    expectNoNoteLatch(h)
-    expect(unusableNameLinesOf(h, p)).toEqual([])
-    expect(h.notices).toEqual([])
-  })
 })
 
 // ---------------------------------------------------------------------------

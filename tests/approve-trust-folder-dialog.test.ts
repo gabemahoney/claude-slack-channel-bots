@@ -67,7 +67,9 @@
  * `dialogApproverLaunchStart`) and its await seam
  * (`_whenDialogApproverStopped`): at most one approver per persona, a stop
  * that completes after the call in progress returns and types nothing after
- * it, the launch start a running approver keeps, stop-all, and calls made
+ * it (asked with the teardown's reason, and with the retired-key reason apply
+ * step 1 stops a recorded key's approver with, b.jg5 SRJ-808, whose recorded
+ * calls end at that stop), the launch start a running approver keeps, stop-all, and calls made
  * outside every launch attempt, and the latch (b.jg5 SRJ-502): a latch of P
  * set by another site through the installed latch stops P's approver (its
  * calls end at the latch) and a latch of another persona does not; with a
@@ -132,6 +134,7 @@ import {
   APPROVER_STOP_LIVE,
   APPROVER_STOP_NO_LAUNCH_START,
   APPROVER_STOP_NOT_INTERACTIVE,
+  APPROVER_STOP_RETIRED_KEY,
   APPROVER_STOP_SHUTDOWN,
   APPROVER_STOP_SUPERSEDED,
   APPROVER_STOP_TEARDOWN,
@@ -1674,7 +1677,14 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
     expect(approverLines()).toEqual([])
   })
 
-  test('a stop between laps ends P\'s approver at once with no further call; Q\'s goes on; a second stop and a stop of a key with no approver answer false and log nothing', async () => {
+  /**
+   * The reasons the stop entry is asked for one key with: the teardown's
+   * (b.jg5 SRJ-404, SRJ-715) and apply step 1's once the key is recorded as
+   * retired (b.jg5 SRJ-808), whose recorded calls end at that stop.
+   */
+  const STOP_ENTRY_REASONS: ReadonlyArray<typeof APPROVER_STOP_TEARDOWN | typeof APPROVER_STOP_RETIRED_KEY> = [APPROVER_STOP_TEARDOWN, APPROVER_STOP_RETIRED_KEY]
+
+  test.each(STOP_ENTRY_REASONS.map((reason) => [reason] as const))('a stop (%s) between laps ends P\'s approver at once with no further call and one line naming the reason; Q\'s goes on; a second stop and a stop of a key with no approver answer false and log nothing; no timer is left', async (reason) => {
     rows.set(PLAIN.id, [PENDING_ROW])
     rows.set(NAMED.id, [PENDING_ROW])
     startDialogApprover(PLAIN.key, true, PLAIN.ref)
@@ -1684,19 +1694,20 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
     const at = clock.now()
     const fired = clock.firedCount()
 
-    expect(await stopDialogApprover(PLAIN.key, APPROVER_STOP_TEARDOWN)).toBe(true)
+    expect(await stopDialogApprover(PLAIN.key, reason)).toBe(true)
 
     // Ended during its sleep: no timer fired and no time passed.
     expect(clock.now()).toBe(at)
     expect(clock.firedCount()).toBe(fired)
     expect(isDialogApproverRunning(PLAIN.key)).toBe(false)
     expect(isDialogApproverRunning(NAMED.key)).toBe(true)
-    expect(await _whenDialogApproverStopped(PLAIN.key)).toEqual({ reason: APPROVER_STOP_TEARDOWN, launchStartMs: LAUNCH_START_MS })
-    const stopLine = approverLogLine(approverStopRequestedMessage(PLAIN.ref, APPROVER_STOP_TEARDOWN))
+    expect(await _whenDialogApproverStopped(PLAIN.key)).toEqual({ reason, launchStartMs: LAUNCH_START_MS })
+    const stopLine = approverLogLine(approverStopRequestedMessage(PLAIN.ref, reason))
+    expect(stopLine).toContain(`(${reason}): `)
     expect(approverLines()).toEqual([stopLine])
 
-    expect(await stopDialogApprover(PLAIN.key, APPROVER_STOP_TEARDOWN)).toBe(false)
-    expect(await stopDialogApprover(personaKey('never-started'), APPROVER_STOP_TEARDOWN)).toBe(false)
+    expect(await stopDialogApprover(PLAIN.key, reason)).toBe(false)
+    expect(await stopDialogApprover(personaKey('never-started'), reason)).toBe(false)
     expect(approverLines()).toEqual([stopLine])
 
     // Q's next lap runs; P makes no call.
@@ -1707,6 +1718,7 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
     rows.set(NAMED.id, [LIVE_ROW])
     expect(await runUntilStopped(NAMED)).toEqual({ reason: APPROVER_STOP_LIVE, launchStartMs: LAUNCH_START_MS })
     expect(callsOf(PLAIN)).toEqual(lap(PLAIN, 'status', 'read-pane'))
+    expect(clock.pending()).toEqual([])
   })
 
   /** [the call held open, the calls of the lap up to and including it]. */
@@ -1716,9 +1728,9 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
     ['send-keys', ['status', 'read-pane', 'send-keys']],
   ]
 
-  test.each(HELD)(
-    'a stop while its %s is in progress (row pending, the pane showing a needle): resolves only after that call returns, and no call follows it',
-    async (verb, upTo) => {
+  test.each(HELD.flatMap(([verb, upTo]) => STOP_ENTRY_REASONS.map((reason) => [verb, reason, upTo] as const)))(
+    'a stop while its %s is in progress (row pending, the pane showing a needle), asked with the %s reason: resolves only after that call returns, and no call follows it',
+    async (verb, reason, upTo) => {
       rows.set(PLAIN.id, [PENDING_ROW])
       panes.set(PLAIN.id, dialogPane(TRUST_DIALOG_NEEDLE))
       const hold = holdNext(verb, PLAIN)
@@ -1726,7 +1738,7 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
       await clock.flush()
       expect(hold.reached).toBe(true)
 
-      const stop = track(stopDialogApprover(PLAIN.key, APPROVER_STOP_TEARDOWN))
+      const stop = track(stopDialogApprover(PLAIN.key, reason))
       await clock.flush()
       expect(stop.settled).toBe(false)
       expect(isDialogApproverRunning(PLAIN.key)).toBe(true)
@@ -1736,9 +1748,10 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
       expect(stop.value).toBe(true)
       expect(isDialogApproverRunning(PLAIN.key)).toBe(false)
       expect(events).toEqual(lap(PLAIN, ...upTo))
+      expect(sendKeysCount(PLAIN)).toBe(verb === 'send-keys' ? 1 : 0)
       expect(clock.pending()).toEqual([])
-      expect((await _whenDialogApproverStopped(PLAIN.key))?.reason).toBe(APPROVER_STOP_TEARDOWN)
-      expect(approverLines()).toEqual([approverLogLine(approverStopRequestedMessage(PLAIN.ref, APPROVER_STOP_TEARDOWN))])
+      expect((await _whenDialogApproverStopped(PLAIN.key))?.reason).toBe(reason)
+      expect(approverLines()).toEqual([approverLogLine(approverStopRequestedMessage(PLAIN.ref, reason))])
     },
   )
 

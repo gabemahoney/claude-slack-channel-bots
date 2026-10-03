@@ -60,9 +60,12 @@
  * `recovery` for the server's own paths, a sequence the collision ladder
  * starts included) raise a configured persona's destination route and the
  * not-configured route; the start sweep (`reconcileOrphans`,
- * `src/session-manager.ts`) writes the start-sweep route's entries. The
- * persona teardown's, the CLI teardown's, the old-life wait's and the
- * stuck-launch abort's routes are selected here; no site raises them.
+ * `src/session-manager.ts`) writes the start-sweep route's entries; the
+ * persona teardown (`runTeardown`, `src/persona-lifecycle.ts`, through the
+ * `raiseKillFailureAlert` that `main()` binds to the same kill-failure
+ * alerts with the context `persona teardown`) raises the persona-teardown
+ * route. The CLI teardown's, the old-life wait's and the stuck-launch
+ * abort's routes are selected here; no site raises them.
  *
  * Pure module: no module-scope state, no environment or file access, no
  * server-only import (no notifier, Slack client, latch, episodes, outage

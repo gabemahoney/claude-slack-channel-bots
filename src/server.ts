@@ -78,6 +78,7 @@ import {
 } from './config.ts'
 import { personaInstanceId, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
 import {
+  APPROVER_STOP_RETIRED_KEY,
   APPROVER_STOP_TEARDOWN,
   applyOwnRowStatusStep,
   buildLiveRowSequenceDeps,
@@ -89,7 +90,6 @@ import {
   carriedDeadEvidenceOf,
   DEAD_SESSION_CAUSE_ROW_READ_FINISHED,
   type DeadEvidenceSource,
-  deletePersonaInstance,
   escalateDeadVerdictOfCause,
   ESCALATE_DEAD_REPROBE_DECIDES,
   ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ,
@@ -104,8 +104,7 @@ import {
   isDialogApproverRunning,
   isLaunchInFlight,
   isLiveRowSequenceRunning,
-  KILL_CONTEXT_TEARDOWN,
-  killPersonaInstance,
+  killPersonaInstanceForTeardown,
   latchOnRestartKillOutcome,
   raisePersonaKillFailureAlert,
   retryPersonaKill,
@@ -200,7 +199,7 @@ import {
   LIVE_ROW_STOP_TEARDOWN,
   type LiveRowSequenceRegistry,
 } from './live-row-sequence.ts'
-import { KILL_FAILURE_CONTEXT_RECOVERY } from './kill-failure-alert.ts'
+import { KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN, KILL_FAILURE_CONTEXT_RECOVERY } from './kill-failure-alert.ts'
 import { resolveSlackApiUrlOverride } from './persona-slack-clients.ts'
 import { createUnhandledRejectionHandler, describeThrownValue } from './persona-connection-errors.ts'
 import { createPersonaEventRouter } from './persona-event-router.ts'
@@ -2932,6 +2931,10 @@ export async function main(): Promise<void> {
   const reload = createReloadController({
     paths: reloadFilePaths(CONFIG_PATH),
     retiredKeys,
+    // b.jg5 SRJ-808, SRJ-404: apply step 1 stops the dialog approver of each
+    // key it records, right after the record and before the last-applied
+    // rewrite and the teardown's kill; no pending-row rule run follows.
+    stopApprover: (key) => stopDialogApprover(key, APPROVER_STOP_RETIRED_KEY),
     lifecycle: {
       startBringUp: (applied) => startupSessionManager(applied, { bringUp: personaBringUps }),
       teardown: (persona) => personaLifecycleOps.teardown(persona),
@@ -3203,7 +3206,9 @@ export async function main(): Promise<void> {
   // episode held in the notice episodes (so a teardown forgets it and
   // shutdown closes it). The session manager raises them from the bounded
   // kill retry's decision at the restart path's kill and the live-row
-  // sequence's kills (installed here, before the start pass), and
+  // sequence's kills (installed here, before the start pass), the persona
+  // teardown raises them with the context 'persona teardown' (its log-only
+  // route, b.jg5 SRJ-704, SRJ-715; bound below), and
   // ends a persona's episode at any read of its own row that reads `ended`
   // or `missing`, or finds it gone. A persona in the applied configuration
   // gets the alert at its destination (the ordinary version once per
@@ -3456,8 +3461,11 @@ export async function main(): Promise<void> {
   // b.av2 SR-6.5 / SR-6.1 / SR-8.6 / SR-6.6 / SR-6.4: the apply's persona
   // teardown, in-place update, credentials change and bring-up (recovery
   // included), each through the per-persona serializer, and its template
-  // refresh. This supplies only
-  // the production dependencies; the operations live in persona-lifecycle.ts.
+  // refresh. The teardown (b.jg5 SRJ-715, SRJ-1507) stops the key's
+  // approver, live-row sequence and retry timer first, kills its row with
+  // the bounded retry and keeps the row: nothing here deletes one. This
+  // supplies only the production dependencies; the operations live in
+  // persona-lifecycle.ts.
   personaLifecycleOps = createPersonaLifecycle({
     serialize: personaLifecycle.run,
     bringUps: personaBringUps,
@@ -3496,9 +3504,10 @@ export async function main(): Promise<void> {
     forgetFailures,
     forgetDisconnectedStreak,
     forgetNotConnectedEpisode,
-    // b.jg5 SRJ-504: the teardown forgets the key's latch silently (no
-    // observer call, no post, no line), after its launch in flight settled
-    // and right before its notice episodes, the CONFLICT episode included.
+    // b.jg5 SRJ-504, SRJ-715: the teardown forgets the key's latch silently
+    // (no observer call, no post, no line) three times: in its first group,
+    // again once its launch in flight settled, each right before its notice
+    // episodes (the CONFLICT episode included), and once more after the kill.
     forgetConflictLatch: (key) => conflictLatch.forget(key),
     // b.jg5 SRJ-207, SRJ-715: likewise its ErrInvalidFlags hold, with no post
     // and no retry, right after its latch and before its notice episodes,
@@ -3509,8 +3518,15 @@ export async function main(): Promise<void> {
     forgetPersonaPrompts,
     forgetAcks: forgetPersonaAcks,
     dropSession: dropPersonaSessionAndKeepAlive,
-    killInstance: (key) => killPersonaInstance(key, { context: KILL_CONTEXT_TEARDOWN }),
-    deleteInstance: deletePersonaInstance,
+    // b.jg5 SRJ-715, SRJ-110, SRJ-702: the teardown's kill, with the bounded
+    // retry on the real clock, arming nothing and latching nothing; there is
+    // no delete, so the row is kept whatever the outcome.
+    killInstance: (key) => killPersonaInstanceForTeardown(key, { clock: KILL_RETRY_SYSTEM_CLOCK }),
+    // b.jg5 SRJ-704: its kill-failure alert, through the one kill-failure
+    // alerts instance over the notice episodes, with the context 'persona
+    // teardown': the server log and a startup-errors entry, never Slack.
+    raiseKillFailureAlert: (key, decision) =>
+      killFailureAlerts.raise({ key, decision, latched: false, context: KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN }),
     replyGuard: {
       launchedWithDir: getLaunchedWithDir,
       teardown: (key) => teardownPersonaReplyGuard(STATE_DIR, key),

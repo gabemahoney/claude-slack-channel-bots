@@ -119,6 +119,24 @@
  *   episodes). The harness does not wait for a launch in flight as the turn
  *   does, so a case settles any launch before `teardown(key)`. `remove(key)`
  *   drops the persona from the applied configuration without a teardown.
+ * - `teardownDeps()` (b.jg5 SRJ-715): the persona teardown's dependencies
+ *   that act on what the harness owns, each bound as `main()` binds it in
+ *   `createPersonaLifecycle`, so a case hands them to the real lifecycle
+ *   (with recorders or real modules for the rest) and the whole teardown,
+ *   submit and turn, runs over the harness: `stopApprover`
+ *   (`stopDialogApprover(key, APPROVER_STOP_TEARDOWN)`),
+ *   `stopLiveRowSequence` (`stopLiveRowSequence(key,
+ *   LIVE_ROW_STOP_TEARDOWN)`), `whenLaunchSettled`, `cancelLaunchWait`
+ *   (`cancelWorkingRowWait`), `stopRetryTimer` (the controller's
+ *   `stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)`, then the condition's
+ *   `cancelAlert` with the same reason), `forgetConflictLatch` (`latch`'s
+ *   `forget`), `forgetInvalidFlagsHold` (`invalidFlagsHold`'s `forget`),
+ *   `forgetNoticeEpisodes` (`episodes.forget`), `resetOutageState`
+ *   (`resetAllToHealthy`), `killInstance` (`killPersonaInstanceForTeardown`
+ *   with `killRetryClock`, so `drive` moves the clock to its waits) and
+ *   `raiseKillFailureAlert` (the harness's kill-failure alerts' `raise`,
+ *   not latched, with the context `KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN`).
+ *   Each call builds a fresh object over the same instances.
  * - `stub`: one stub client (`makeStubClient`) with its call log
  *   (`stub.calls`), installed through `installStubSpawnPath` with the spawn
  *   home under the harness's temporary HOME, and handed to the outage state
@@ -733,6 +751,7 @@ import { classifyAdError, describeAdErrorClassification, killFailedDescriptionOf
 import {
   KILL_FAILURE_CLOSING_DESTINATION,
   KILL_FAILURE_CLOSING_LOG_ONLY,
+  KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN,
   KILL_FAILURE_CONTEXT_RECOVERY,
   KILL_FAILURE_VERSION_ORDINARY,
   KILL_FAILURE_VERSION_SURVIVOR,
@@ -747,7 +766,8 @@ import {
 } from '../../src/kill-failure-alert.ts'
 import { LOST_MESSAGE_STATES, STATE_WORDING, type LostMessageState } from '../../src/lost-message.ts'
 import { parseLaunchStart } from '../../src/pending-row.ts'
-import { _resetOutageState, clearOutageFlag, getOutageFlags, initOutageState, type OutageClass } from '../../src/outage-state.ts'
+import { _resetOutageState, clearOutageFlag, getOutageFlags, initOutageState, resetAllToHealthy, type OutageClass } from '../../src/outage-state.ts'
+import type { PersonaLifecycleDeps } from '../../src/persona-lifecycle.ts'
 import type { PersonaConnectionStatus } from '../../src/persona-connections.ts'
 import {
   createKillFailureAlerts,
@@ -820,9 +840,11 @@ import {
   _setDialogReadyTimeoutMs,
   _whenDialogApproverStopped,
   buildLiveRowSequenceDeps,
+  cancelWorkingRowWait,
   isDialogApproverRunning,
   isLaunchInFlight,
   isLiveRowSequenceRunning,
+  killPersonaInstanceForTeardown,
   launchSession,
   notifyRestartCapReached,
   readPersonaRowState,
@@ -1174,6 +1196,28 @@ export interface RecoveryVersionRecheck {
   pendingTimers(): number
 }
 
+/**
+ * The persona teardown's dependencies `teardownDeps()` binds over the
+ * harness's own instances, as `main()` binds them (b.jg5 SRJ-715); see the
+ * module comment.
+ */
+export type RecoveryTeardownDeps = Required<
+  Pick<
+    PersonaLifecycleDeps,
+    | 'stopApprover'
+    | 'stopLiveRowSequence'
+    | 'whenLaunchSettled'
+    | 'cancelLaunchWait'
+    | 'stopRetryTimer'
+    | 'forgetConflictLatch'
+    | 'forgetInvalidFlagsHold'
+    | 'forgetNoticeEpisodes'
+    | 'resetOutageState'
+    | 'killInstance'
+    | 'raiseKillFailureAlert'
+  >
+>
+
 /** The harness's slow-recovery tracker, read-only: a persona's count and whether its episode is open. */
 export type RecoverySlowRecoveryView = Pick<SlowRecoveryTracker, 'count' | 'isOpen'>
 
@@ -1349,6 +1393,11 @@ export interface RecoveryHarness {
    * case's `episodes.forget(key)` after it.
    */
   teardown(key: string): void
+  /**
+   * The persona teardown's dependencies over the harness's own instances,
+   * each bound as `main()` binds it (b.jg5 SRJ-715); see the module comment.
+   */
+  teardownDeps(): RecoveryTeardownDeps
   /** Drop persona `key` from the applied configuration. */
   remove(key: string): void
   /** A health tick's end of the condition, as `main()` binds it: reason `tick`, reading `live`. */
@@ -2445,6 +2494,30 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       // after the latch, silently: no post and no retry.
       invalidFlagsHold.forget(key)
     },
+
+    teardownDeps: () => ({
+      // As main() binds them in createPersonaLifecycle (b.jg5 SRJ-404,
+      // SRJ-706, SRJ-715): the approver first, then the live-row sequence.
+      stopApprover: (key) => stopDialogApprover(key, APPROVER_STOP_TEARDOWN),
+      stopLiveRowSequence: (key) => stopLiveRowSequence(key, LIVE_ROW_STOP_TEARDOWN),
+      whenLaunchSettled: (key) => whenLaunchSettled(key),
+      cancelLaunchWait: (key) => cancelWorkingRowWait(key),
+      // b.jg5 SRJ-305, SRJ-309: the timer's stop, then the condition's alert check.
+      stopRetryTimer: (key) => {
+        controller.stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
+        tmuxUnresponsive.cancelAlert(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
+      },
+      // b.jg5 SRJ-504, SRJ-207, SRJ-1016: silently, each over the harness's one instance.
+      forgetConflictLatch: (key) => latch.forget(key),
+      forgetInvalidFlagsHold: (key) => invalidFlagsHold.forget(key),
+      forgetNoticeEpisodes: (key) => episodes.forget(key),
+      resetOutageState: (keys) => resetAllToHealthy(keys),
+      // b.jg5 SRJ-715, SRJ-110, SRJ-702: the bounded retry on the harness's kill-retry clock.
+      killInstance: (key) => killPersonaInstanceForTeardown(key, { clock: killRetryClock }),
+      // b.jg5 SRJ-704: not latched, on the persona-teardown route.
+      raiseKillFailureAlert: (key, decision) =>
+        killFailureAlerts.raise({ key, decision, latched: false, context: KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN }),
+    }),
 
     remove(key) {
       applied.delete(key)

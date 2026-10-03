@@ -130,8 +130,8 @@
  *      the CONFLICT row: no notice from here, no `spawn-failed` entry,
  *      nothing counted, and no further launch or reuse, so no
  *      tmux-touching call follows it. Every other `ErrInternal` stays
- *      UNCLASSIFIED (step 3). The persona teardown's kill and delete
- *      (`killPersonaInstance`, `deletePersonaInstance`) latch nothing.
+ *      UNCLASSIFIED (step 3). The persona teardown's kill
+ *      (`killPersonaInstanceForTeardown`) latches nothing.
  *   5a. An `ErrInvalidFlags` at a reuse spawn of the same id (b.jg5 SRJ-112,
  *      SRJ-207; `reuseSpawnFailedAt`) gets one immediate version re-check;
  *      unless it stops the server, the persona is held on `ErrInvalidFlags`
@@ -150,7 +150,11 @@
  *      through the bounded retry (`retryPersonaKill`, `src/kill-retry.ts`;
  *      b.jg5 SRJ-702) as the restart path's kill does, and raise the retry's
  *      kill-failure alert decision (`raisePersonaKillFailureAlert`, through
- *      the installed kill-failure alerts; b.jg5 SRJ-704).
+ *      the installed kill-failure alerts; b.jg5 SRJ-704). The persona
+ *      teardown's kill runs through the same bounded retry
+ *      (`killPersonaInstanceForTeardown`, b.jg5 SRJ-715), arming nothing and
+ *      latching nothing; its caller raises the alert decision on the
+ *      persona-teardown route. No path here deletes a persona's row.
  *
  * Own-row reads (b.jg5 SRJ-114, SRJ-115): every `get` of a persona's own row
  * at SRJ-114's sites goes through `readPersonaOwnRow`, and every own-row
@@ -423,6 +427,7 @@ import {
   KILL_RETRY_READ_LATCHED,
   KILL_RETRY_READ_NO_ROW,
   KILL_RETRY_READ_STATE,
+  KILL_RETRY_SEED_LIVE_UNREAD,
   KILL_RETRY_SEED_NOT_LIVE_VALUE,
   KILL_RETRY_SYSTEM_CLOCK,
   createKillRetryPassBudget,
@@ -3182,6 +3187,13 @@ export const APPROVER_STOP_TMUX_UNAVAILABLE = 'tmux-unavailable'
 export const APPROVER_STOP_SUPERSEDED = 'superseded'
 /** The persona's teardown stopped the approver (b.jg5 SRJ-404, SRJ-715). */
 export const APPROVER_STOP_TEARDOWN = 'teardown'
+/**
+ * The persona's key was recorded as retired (b.jg5 SRJ-808, SRJ-404): apply
+ * step 1 stopped the approver right after its record, before the
+ * last-applied rewrite and before the teardown's kill. No pending-row rule
+ * run follows this stop.
+ */
+export const APPROVER_STOP_RETIRED_KEY = 'retired-key'
 /** Shutdown stopped the approver (b.jg5 SRJ-404). */
 export const APPROVER_STOP_SHUTDOWN = 'shutdown'
 /** The approver's loop threw (not reached: every step is guarded); the throw was logged and nothing more was called. */
@@ -3193,7 +3205,7 @@ export const APPROVER_STOP_FAILED = 'failed'
  * member, so a reader of the outcome tells which stops leave a `pending` row
  * to the pending-row rule (b.jg5 SRJ-404: B or the cap, GONE, not
  * interactive, tmux unavailable, superseded) from those that do not
- * (shutdown, latched, teardown).
+ * (shutdown, latched, teardown, retired key).
  */
 export type ApproverStopReason =
   | typeof APPROVER_STOP_LIVE
@@ -3208,19 +3220,22 @@ export type ApproverStopReason =
   | typeof APPROVER_STOP_TMUX_UNAVAILABLE
   | typeof APPROVER_STOP_SUPERSEDED
   | typeof APPROVER_STOP_TEARDOWN
+  | typeof APPROVER_STOP_RETIRED_KEY
   | typeof APPROVER_STOP_SHUTDOWN
   | typeof APPROVER_STOP_FAILED
 
 /**
  * The reasons a caller stops a persona's approver with (`stopDialogApprover`):
  * each is also the stopped approver's {@link ApproverStopReason}. One member
- * per kind of stop, so a later stop (a key recorded as retired, the abort of
- * the persona's own stuck launch) is one more member here, and a reader of
- * the outcome tells which stops leave the row to the pending-row rule.
+ * per kind of stop (a later stop, such as the abort of the persona's own
+ * stuck launch, is one more member here), so a reader of the outcome tells
+ * which stops leave the row to the pending-row rule: none of these but
+ * `superseded` does (b.jg5 SRJ-404).
  */
 export type ApproverStopRequestReason =
   | typeof APPROVER_STOP_SUPERSEDED
   | typeof APPROVER_STOP_TEARDOWN
+  | typeof APPROVER_STOP_RETIRED_KEY
   | typeof APPROVER_STOP_SHUTDOWN
   | typeof APPROVER_STOP_LATCHED
 
@@ -3380,6 +3395,7 @@ export function approverLaunchStartChangedMessage(ref: string): string {
 const APPROVER_STOP_REQUEST_WHY: Readonly<Record<ApproverStopRequestReason, string>> = {
   [APPROVER_STOP_SUPERSEDED]: 'a later launch started its own approver',
   [APPROVER_STOP_TEARDOWN]: 'its teardown began',
+  [APPROVER_STOP_RETIRED_KEY]: 'its key was recorded as retired',
   [APPROVER_STOP_SHUTDOWN]: 'the server is shutting down',
   [APPROVER_STOP_LATCHED]: 'the persona latched',
 }
@@ -7508,11 +7524,11 @@ export interface KillPersonaInstanceOptions {
  * UNAVAILABLE answer is not reported here. Never throws or rejects, and
  * never retries. Logs nothing, records no startup error, raises no notice of
  * its own and latches nothing: each caller acts on the outcome by its own
- * context. Its callers: the persona teardown (b.av2 SR-6.5, `main()`'s
- * binding, `KILL_CONTEXT_TEARDOWN`, one checked kill) and the bounded retry
- * of the live-row sequence's kills and the restart path's kill
- * (`retryPersonaKill`, `KILL_CONTEXT_ATTEMPT`, one call per try). The
- * collision ladder makes no kill.
+ * context. Its callers, one call per try of a bounded retry: the persona
+ * teardown's kill (`killPersonaInstanceForTeardown`, `KILL_CONTEXT_TEARDOWN`;
+ * b.jg5 SRJ-715) and the live-row sequence's kills and the restart path's
+ * kill (`retryPersonaKill`, `KILL_CONTEXT_ATTEMPT`). The collision ladder
+ * makes no kill.
  */
 export async function killPersonaInstance(key: string, options: KillPersonaInstanceOptions): Promise<KillOutcome> {
   const call = adKillCall(options.rowReadLive === true)
@@ -7785,31 +7801,150 @@ async function readPersonaKillRow(key: string, site: string, ref: string): Promi
   }
 }
 
+// ---------------------------------------------------------------------------
+// The persona teardown's kill (b.jg5 SRJ-715, SRJ-110, SRJ-702)
+// ---------------------------------------------------------------------------
+
+/** A CONFLICT or an UNUSABLE NAME answer the teardown's kill met at one of its tries. */
+export const TEARDOWN_KILL_REFUSAL_AT_KILL = 'kill'
+/** A CONFLICT or an UNUSABLE NAME answer the teardown's kill met at a `status` read between its tries. */
+export const TEARDOWN_KILL_REFUSAL_AT_READ = 'status read'
+
 /**
- * Delete persona `key`'s row (`cscb_<key>`) through `withOutageDetection`;
- * rethrows every error. The persona teardown's delete only
- * (`deletePersonaInstance`; b.jg5 SRJ-715, SRJ-716): no launch path deletes
- * a row, and none deletes before a spawn (SRJ-707).
+ * One CONFLICT or UNUSABLE NAME answer the persona teardown's kill met (b.jg5
+ * SRJ-715, SRJ-1002, SRJ-1003): where, its class (by name, through
+ * `src/ad-error-class.ts`) and the thrown value, raw, for the teardown's own
+ * routing. Nothing latched on it.
  */
-function deleteInstanceRow(key: string): Promise<unknown> {
-  return withOutageDetection(key, undefined, 'delete', (client) => client.delete({ claude_instance_id: [personaInstanceId(key)] }))
+export interface PersonaTeardownKillRefusal {
+  readonly at: typeof TEARDOWN_KILL_REFUSAL_AT_KILL | typeof TEARDOWN_KILL_REFUSAL_AT_READ
+  readonly errorClass: typeof AD_ERROR_CLASS_CONFLICT | typeof AD_ERROR_CLASS_UNUSABLE_NAME
+  /** The thrown value. Never logged raw. */
+  readonly error: unknown
 }
 
 /**
- * Delete persona `key`'s agent-director row (`cscb_<key>`) through
- * `withOutageDetection`, quietly, as `killPersonaInstance` kills it: true when
- * the row was there, false when it was already gone (`ErrSpawnNotFound`);
- * every other error is rethrown. A failure records no startup error and
- * raises no spawn-failure notice. For the persona teardown only (b.av2
- * SR-6.5, b.jg5 SRJ-715).
+ * What the persona teardown's kill answers: the bounded retry's result (the
+ * outcome that stands, how the tries ended, and the kill-failure alert
+ * decision, which the caller raises on the persona-teardown route), and every
+ * CONFLICT or UNUSABLE NAME answer met, in order (a CONFLICT is never tried
+ * again, so at most one comes from a try).
  */
-export async function deletePersonaInstance(key: string): Promise<boolean> {
+export interface PersonaTeardownKillResult extends KillRetryResult {
+  readonly refusals: readonly PersonaTeardownKillRefusal[]
+}
+
+/** What `killPersonaInstanceForTeardown` is given. */
+export interface PersonaTeardownKillOptions {
+  /** The wait between tries (production: `KILL_RETRY_SYSTEM_CLOCK`; a test passes `createFakeClock()`). */
+  readonly clock: KillRetryWait
+  /** The persona's reference for the lines; `persona=<key>` when absent. */
+  readonly ref?: string
+}
+
+/** The line head of the persona teardown kill's tries and reads. */
+const TEARDOWN_KILL_LOG_PREFIX = '[slack] persona teardown kill'
+
+/** `err`'s class when it is CONFLICT or UNUSABLE NAME (by name), else undefined. Never throws. */
+function teardownRefusalClassOf(err: unknown): PersonaTeardownKillRefusal['errorClass'] | undefined {
   try {
-    await deleteInstanceRow(key)
-    return true
+    const { errorClass } = classifyAdError(err)
+    return errorClass === AD_ERROR_CLASS_CONFLICT || errorClass === AD_ERROR_CLASS_UNUSABLE_NAME ? errorClass : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The persona teardown's kill of `cscb_<key>` (b.jg5 SRJ-715, SRJ-110,
+ * SRJ-702): the bounded retry (`runKillRetry`, `src/kill-retry.ts`) on
+ * `options.clock`, seeded as a live row the teardown has not read
+ * (`KILL_RETRY_SEED_LIVE_UNREAD`), so its UNAVAILABLE outcomes get up to 3
+ * tries 2 s apart:
+ *   - each try is one checked kill (`killPersonaInstance` with
+ *     `KILL_CONTEXT_TEARDOWN`): through `withOutageDetection` arming nothing,
+ *     so no try arms a retry timer, starts a `tmux-unresponsive` condition or
+ *     feeds the unclassified-error episode, and an ENVIRONMENT or CONFIG
+ *     answer raises its outage only while the persona is in the applied
+ *     configuration; an `ErrInvalidFlags` gets its one version re-check;
+ *   - the read before each further try is one `status` of the row through
+ *     `withOutageDetection` arming nothing too (`readTeardownKillRow`): a
+ *     CONFIG answer raises `ad-config-malformed` for a configured persona
+ *     only, and the read latches nothing (b.jg5 SRJ-1002): no own-row step
+ *     applies, so a `pending` row with no launch start is a live read and an
+ *     UNUSABLE NAME answer a failed one, and the next try goes ahead;
+ *   - no keep-going check: the teardown is not stopped by the persona being
+ *     latched or not up. Neither SRJ-316's rule against starting a kill of a
+ *     row last read `pending` nor a latch holds the kill's start back, so a
+ *     `pending` row with no launch start, and a latched persona's row, get
+ *     its first try (b.jg5 SRJ-503, SRJ-513). Between tries the retry's own
+ *     rule still applies: a CONFIG answer at a read that follows a read of
+ *     `pending` ends the tries with no further kill (b.jg5 SRJ-702);
+ *   - a CONFLICT is never tried again (the retry tries only UNAVAILABLE), and
+ *     nothing latches on it or on an UNUSABLE NAME: each one met, at a try or
+ *     at a read, is answered in `refusals` for the teardown's routing.
+ * Nothing is reported after the tries: an UNAVAILABLE outcome that stands
+ * arms no retry timer. No delete is made, whatever the outcome: the row is
+ * kept (b.jg5 SRJ-715). Each try and read is logged by the retry under
+ * `[slack] persona teardown kill`. Never throws or rejects, and leaves no
+ * timer pending once it settles.
+ */
+export async function killPersonaInstanceForTeardown(
+  key: string,
+  options: PersonaTeardownKillOptions,
+): Promise<PersonaTeardownKillResult> {
+  const ref = options.ref ?? keyRef(key)
+  const refusals: PersonaTeardownKillRefusal[] = []
+  const result = await runKillRetry({
+    instanceId: personaInstanceId(key),
+    kill: async () => {
+      const outcome = await killPersonaInstance(key, { context: KILL_CONTEXT_TEARDOWN })
+      if (outcome.kind === KILL_OUTCOME_NOT_KILLED) {
+        const errorClass =
+          outcome.errorClass === AD_ERROR_CLASS_CONFLICT || outcome.errorClass === AD_ERROR_CLASS_UNUSABLE_NAME
+            ? outcome.errorClass
+            : undefined
+        if (errorClass !== undefined) refusals.push({ at: TEARDOWN_KILL_REFUSAL_AT_KILL, errorClass, error: outcome.error })
+      }
+      return outcome
+    },
+    read: async () => {
+      const read = await readTeardownKillRow(key)
+      if (read.kind === KILL_RETRY_READ_FAILED) {
+        const errorClass = teardownRefusalClassOf(read.error)
+        if (errorClass !== undefined) refusals.push({ at: TEARDOWN_KILL_REFUSAL_AT_READ, errorClass, error: read.error })
+      }
+      return read
+    },
+    wait: options.clock,
+    lastRead: KILL_RETRY_SEED_LIVE_UNREAD,
+    log: (line) => console.error(line),
+    logPrefix: `${TEARDOWN_KILL_LOG_PREFIX} for ${ref}`,
+  })
+  return { ...result, refusals: [...refusals] }
+}
+
+/**
+ * One `status` read of persona `key`'s row between the teardown kill's tries
+ * (b.jg5 SRJ-702, SRJ-715): through `withOutageDetection` arming nothing (a
+ * CONFIG answer raises `ad-config-malformed` for a configured persona only;
+ * nothing is armed or reported), with no own-row step, so it latches nothing
+ * and clears no retired-key entry. Its state, no row for `ErrSpawnNotFound`
+ * (by name), or a failed read. Never throws.
+ */
+async function readTeardownKillRow(key: string): Promise<KillRetryRead> {
+  try {
+    const result = await withOutageDetection(
+      key,
+      undefined,
+      'status',
+      (client) => client.status({ claude_instance_id: personaInstanceId(key) }),
+      { armsNothing: { personaConfigured: () => configuredReadingOf(key).configured } },
+    )
+    return { kind: KILL_RETRY_READ_STATE, state: result.state }
   } catch (err) {
-    if (err instanceof ErrSpawnNotFound) return false
-    throw err
+    if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) return { kind: KILL_RETRY_READ_NO_ROW }
+    return { kind: KILL_RETRY_READ_FAILED, error: err }
   }
 }
 
@@ -10030,8 +10165,8 @@ function afterLaunchSucceeded(
 /**
  * Resolves once the launch in flight for persona `key` (if any) has settled,
  * whatever its outcome; at once when none is. Never rejects and starts
- * nothing. For a teardown (b.av2 SR-6.6), which must not kill or delete the
- * row while a launch is still bringing it up; launches that run outside the
+ * nothing. For a teardown (b.av2 SR-6.6), which must not kill the row while
+ * a launch is still bringing it up; launches that run outside the
  * lifecycle serializer (the start pass) are covered too. The launch's dialog
  * approver is not waited for: a launch settles as its launch call returns,
  * and the teardown stops the approver first (`stopDialogApprover`, b.jg5

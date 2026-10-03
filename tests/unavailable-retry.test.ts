@@ -298,7 +298,6 @@ import {
   APPROVER_STOP_NOT_INTERACTIVE,
   APPROVER_STOP_TEARDOWN,
   DIALOG_POLL_INTERVAL_MS,
-  deletePersonaInstance,
   isLaunchInFlight,
   KILL_CONTEXT_TEARDOWN,
   launchSession,
@@ -4875,14 +4874,21 @@ describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, i
     expect(h.attempts).toEqual([])
   })
 
-  // The teardown's kill arms nothing (b.jg5 SRJ-110, hatch A3: the case
-  // below), so this trigger comes from the teardown's delete.
-  test('a trigger for a key no longer in the applied configuration (its teardown’s delete answers ErrTmuxNotAvailable) arms it, and its first retry stops it with no agent-director call; the other persona is untouched', async () => {
+  // The teardown's kill and its between-try read arm nothing (b.jg5 SRJ-110,
+  // hatch A3: the case below), and the teardown makes no delete (b.jg5
+  // SRJ-715), so this trigger comes from a plain read-pane through the outage
+  // wrapper, made outside every attempt.
+  test('a trigger for a key no longer in the applied configuration (a plain read-pane through the outage wrapper answers ErrTmuxNotAvailable) arms it, and its first retry stops it with no agent-director call; the other persona is untouched', async () => {
     const h = (harness = makeRecoveryHarness())
     const [key, other] = h.keys as [string, string]
+    const cwd = personaOf(h, key).working_directory
     h.remove(key)
-    h.script({ deleteError: errTmuxNotAvailable(undefined, 'delete') })
-    await expect(deletePersonaInstance(key)).rejects.toThrow()
+    const err = errTmuxNotAvailable(undefined, 'read-pane')
+    h.script({ readPaneError: err })
+    expect(isInsideAttempt(key)).toBe(false)
+    await expect(
+      withOutageDetection(key, cwd, 'read-pane', (client) => client.readPane({ claude_instance_id: personaInstanceId(key), n_lines: 1 })),
+    ).rejects.toBe(err)
     expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT)
     const before = callCounts(h)
 

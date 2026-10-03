@@ -43,8 +43,9 @@
  *
  * The latch block (b.jg5 SRJ-504, AC 45) latches a persona through the real
  * launch path (a destructive modify's new half, whose key step 1 retired,
- * makes a reuse spawn of an id with no row that meets the pre-spawn scan's
- * refusal, `reuseSpawnScanRows`, scripted on the stub's spawn queue), then
+ * makes a reuse spawn over the row its old half's teardown killed and kept,
+ * which meets a leftover refusal, `REUSE_SPAWN_CONFLICT_CASE_ROWS`, scripted
+ * on the stub's spawn queue), then
  * destructively modifies it again, and reads the
  * run's latch (`run.latch`), its CONFLICT notices (`run.episodeNotices`) and
  * the posts they made: the old half's teardown forgets the latch silently,
@@ -98,6 +99,18 @@
  * launch too (the AC 60, latch and hold blocks). The retry timer's half of
  * AC 51 is in `tests/unavailable-retry.test.ts`.
  *
+ * The persona teardown keeps the row (b.jg5 SRJ-715): every teardown's
+ * agent-director calls are its kill's tries, with no delete, and a removed
+ * persona's row reads `ended` afterwards. The approver block (b.jg5 SRJ-808,
+ * SRJ-715) reads step 1's approver stops from `run.approverStops`: they come
+ * right after the record, before the last-applied write and every teardown;
+ * with the real launch path an approver polling a `pending` row makes no
+ * call after the recording, whether the apply goes on or its rewrite fails;
+ * and a destructive modify whose teardown kill fails after its tries keeps
+ * the old row live, so its new half's launch sends it through the live-row
+ * sequence with the retired-key flag. The failure blocks also show a failed
+ * step-1 write stops no approver.
+ *
  * Confirmation processing, invalid, stale and no-op candidates and step 1's
  * write sequence are pinned in `tests/reload.test.ts`; the preview's wording in
  * `tests/reload-preview.test.ts`, so a preview line is asserted here only as
@@ -139,11 +152,39 @@ import {
   type RetiredKeyRecord,
 } from '../src/retired-keys.ts'
 import { readRetiredKeysRecord, retiredKeysRecordOf, writeRetiredKeysRecord } from './test-helpers/retired-keys.ts'
-import { personaConfigDirLabelValue, retiredKeyReadingOf, SPAWN_ACTION_FRESH_RETIRED } from '../src/session-manager.ts'
-import { cannedErr, cannedFindMissing, errInvalidFlags, errTemplateMalformed, errTmuxUnresponsive, stubCallCount, type FindMissingHold, type StubClientOptions } from './test-helpers/agent-director-stub.ts'
+import {
+  _whenDialogApproverStopped,
+  APPROVER_STOP_RETIRED_KEY,
+  isDialogApproverRunning,
+  personaConfigDirLabelValue,
+  retiredKeyReadingOf,
+  SPAWN_ACTION_FRESH_RETIRED,
+} from '../src/session-manager.ts'
+import {
+  cannedErr,
+  cannedFindMissing,
+  errInvalidFlags,
+  errTemplateMalformed,
+  errTmuxKillFailed,
+  errTmuxUnresponsive,
+  stubCallCount,
+  type FindMissingHold,
+  type StubClientOptions,
+} from './test-helpers/agent-director-stub.ts'
+import { createFakeClock } from './test-helpers/fake-clock.ts'
+import { KILL_RETRY_SPACING_MS, KILL_RETRY_TRIES } from '../src/kill-retry.ts'
+import { KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN, KILL_FAILURE_VERSION_ORDINARY, selectKillFailureAlertRoute } from '../src/kill-failure-alert.ts'
 import { INVALID_FLAGS_HOLD_ALERT_TEXT } from '../src/invalid-flags-hold.ts'
-import { LIVE_ROW_LAUNCH_REUSE, LIVE_ROW_OUTCOME_LAUNCHED, LIVE_ROW_OUTCOME_STOPPED, LIVE_ROW_STOP_TEARDOWN, type LiveRowSequenceOutcome } from '../src/live-row-sequence.ts'
-import { reuseSpawnScanRows } from './test-helpers/conflict-cases.ts'
+import {
+  LIVE_ROW_LAUNCH_REASON_RETIRED_KEY,
+  LIVE_ROW_LAUNCH_REUSE,
+  LIVE_ROW_OUTCOME_LAUNCHED,
+  LIVE_ROW_OUTCOME_STOPPED,
+  LIVE_ROW_STOP_TEARDOWN,
+  liveRowSequenceLaunchLine,
+  type LiveRowSequenceOutcome,
+} from '../src/live-row-sequence.ts'
+import { REUSE_SPAWN_CONFLICT_CASE_ROWS } from './test-helpers/conflict-cases.ts'
 import {
   APP_TOKEN_PREFIX,
   assertNoLeak,
@@ -549,7 +590,7 @@ describe('the dry-run sprint demo: a confirmed addition (real composition, dry r
 // ---------------------------------------------------------------------------
 
 describe('a confirmed removal tears the persona down (b.av2 SR-6.5, SR-8.6 step 2)', () => {
-  test('AC 57: removing bravo from alpha, bravo and charlie tears down bravo only through the real composition: it kills then deletes cscb_<bravo> only, closes only its connection, forgets its bring-up, leaves the applied set, and posts nothing', async () => {
+  test('AC 57: removing bravo from alpha, bravo and charlie tears down bravo only through the real composition: it kills cscb_<bravo> only and deletes nothing, closes only its connection, forgets its bring-up, leaves the applied set, and posts nothing', async () => {
     const { run, personas } = await running(['alpha', 'bravo', 'charlie'], { realLifecycle: true })
     const [alpha, , charlie] = personas
     const bravoKey = h.key('bravo')
@@ -578,8 +619,9 @@ describe('a confirmed removal tears the persona down (b.av2 SR-6.5, SR-8.6 step 
     expect(laterMembers.filter((member) => member === 'stopApprover' || member === 'stopLiveRowSequence')).toEqual(['stopLiveRowSequence'])
     const settledAt = laterMembers.indexOf('whenLaunchSettled')
     expect(laterMembers.slice(settledAt, settledAt + 3)).toEqual(['whenLaunchSettled', 'stopLiveRowSequence', 'stopRetryTimer'])
-    expect(composition.agentDirectorOrder).toEqual([`kill ${personaInstanceId(bravoKey)}`, `delete ${personaInstanceId(bravoKey)}`])
-    expect(stubCallCount(composition.agentDirector)).toBe(2)
+    // One kill, which succeeds at its first try, and no delete: the row is kept (b.jg5 SRJ-715).
+    expect(composition.agentDirectorOrder).toEqual([`kill ${personaInstanceId(bravoKey)}`])
+    expect(stubCallCount(composition.agentDirector)).toBe(1)
     // Every dependency call is for bravo, except the Stop-hook pass, which re-evaluates against the personas still applied.
     expect(composition.calls.filter(([member, key]) => member !== 'replyGuard.launchPass' && key !== bravoKey)).toEqual([])
     expect(composition.calls.filter(([member]) => member === 'replyGuard.launchPass')).toEqual([
@@ -611,7 +653,7 @@ describe('a confirmed removal tears the persona down (b.av2 SR-6.5, SR-8.6 step 
     await applyConfig(run, [alpha!])
 
     expect(run.since(cp).lifecycle).toEqual([{ op: 'teardown', key: bravoKey, via: 'apply' }])
-    expect(run.composition!.agentDirectorOrder).toEqual([`kill ${personaInstanceId(bravoKey)}`, `delete ${personaInstanceId(bravoKey)}`])
+    expect(run.composition!.agentDirectorOrder).toEqual([`kill ${personaInstanceId(bravoKey)}`])
     // Its retry timer is gone: with its directory back, far past every retry, nothing runs for it.
     expect(run.clock.pendingCount()).toBe(0)
     h.materialize(bravo!)
@@ -678,7 +720,7 @@ describe('a name change is a removal of the old key and an addition of the new o
       { op: 'bring-up', key: newKey, phase: 'start' },
       { op: 'bring-up', key: newKey, phase: 'settled' },
     ])
-    expect(run.composition!.agentDirectorOrder).toEqual([`kill ${personaInstanceId(oldKey)}`, `delete ${personaInstanceId(oldKey)}`])
+    expect(run.composition!.agentDirectorOrder).toEqual([`kill ${personaInstanceId(oldKey)}`])
     expect(run.composition!.calls.filter(([, key]) => key === h.key('alpha'))).toEqual([])
     expect(slackSideOf(run, 'alpha')).toEqual(alphaBefore)
     expect(run.appliedKeys()).toEqual([h.key('alpha'), newKey])
@@ -1034,6 +1076,9 @@ describe('a failed apply undoes its recording (b.jg5 SRJ-804, SRJ-1511; AC 70)',
     expect(readRetiredKeysRecord(h.stateDir)).toEqual(before)
     expect(run.retiredKeys.keys()).toEqual(seeded ? [h.key('bravo'), 'zulu'].sort() : [])
     expect(run.retiredKeys.isMarked(h.key('bravo'))).toBe(seeded)
+    // Step 1 stopped each recorded key's approver right after its record, before the failed rewrite, and the
+    // restore stops or restarts none (b.jg5 SRJ-808).
+    expect(run.approverStops).toEqual(keysOf('bravo', 'charlie').map((key) => ({ key, writes: cp.writes + 1, timeline: 0, agentDirectorCalls: undefined })))
     // Nothing applied, the change pending, one line naming the last-applied record and the retired-key record.
     const lines = recordWriteFailedLines(run)
     expect(lines).toHaveLength(1)
@@ -1117,9 +1162,10 @@ describe('a failed apply undoes its recording (b.jg5 SRJ-804, SRJ-1511; AC 70)',
 
     await run.ticks.tick()
 
-    // The retired-key write failed; no last-applied write was made.
+    // The retired-key write failed; no last-applied write was made, and no approver was stopped (b.jg5 SRJ-808).
     expect(run.since(cp).writes[0]).toEqual(retiredKeysWrite(false))
     expect(run.since(cp).writes.filter((w) => w.path === h.paths.lastApplied)).toEqual([])
+    expect(run.approverStops).toEqual([])
     expect(h.readRecord()).toEqual(recordBytes)
     expect(run.controller.applied()).toBe(applied)
     expect(run.appliedConfigs).toEqual([])
@@ -1181,13 +1227,13 @@ describe('AC 70: after a failed rewrite, the persona it would have retired resum
 // A retired key's launch (b.jg5 SRJ-805, SRJ-806; AC 49, AC 50, AC 51, AC 52)
 //
 // Every case runs the real launch path over the row table, with the run's
-// retired-key store installed for the session manager. Until the persona
-// teardown keeps the old row, a case that needs the old life seeds it as the
-// teardown will leave it (`ended`, with the persona's current `cwd` and
-// `config_dir` label, so a key that is not retired would be resumed). The
-// new life's first row read that finds it live clears the key's entry (b.jg5
-// SRJ-807), so the mark is read from the store's and the session manager's
-// lines, or from the record as it stood just before that clear's write.
+// retired-key store installed for the session manager. The persona teardown
+// keeps the old life's row (b.jg5 SRJ-715): `ended`, with the persona's
+// `cwd` and `config_dir` label, so a key that is not retired would be
+// resumed from it. The new life's first row read that finds it live clears
+// the key's entry (b.jg5 SRJ-807), so the mark is read from the store's and
+// the session manager's lines, or from the record as it stood just before
+// that clear's write.
 // ---------------------------------------------------------------------------
 
 /** The store's lines saying `key`'s mark was written (b.jg5 SRJ-806). */
@@ -1229,7 +1275,7 @@ describe('a retired key is launched by a reuse spawn at every launch path, never
 
   /**
    * alpha and bravo running; bravo removed (its key recorded by step 1),
-   * its old row seeded as the teardown will leave it; the server restarted
+   * its old row killed and kept by the teardown; the server restarted
    * over the same directories (`runOpts` for the new run); bravo's key still
    * recorded and unmarked there. Answers the new run, alpha and bravo.
    */
@@ -1239,7 +1285,7 @@ describe('a retired key is launched by a reuse spawn at every launch path, never
     const bravoKey = h.key('bravo')
     await applyConfig(run, [alpha!])
     expect(run.retiredKeys.isRecorded(bravoKey)).toBe(true)
-    h.seedRow(bravo!, { state: 'ended' })
+    expect(h.rowOf('bravo')).toMatchObject({ state: 'ended', cwd: bravo!.working_directory })
     expectNoPostNoLeak(run)
     await run.stop()
 
@@ -1348,7 +1394,8 @@ describe('a retired key is launched by a reuse spawn at every launch path, never
     expect(run.retiredKeys.isRecorded(bravoKey)).toBe(true)
     expect(run.retiredKeys.isRecorded(renamedKey)).toBe(false)
     expect(markWrittenLines(run, renamedKey)).toEqual([])
-    h.seedRow(bravo!, { state: 'ended' })
+    // The old key's row, killed and kept by its teardown (b.jg5 SRJ-715).
+    expect(h.rowOf('bravo')).toMatchObject({ state: 'ended', cwd: bravo!.working_directory })
     const bravoFrom = run.composition!.instanceCallsOf('bravo').length
 
     await applyConfig(run, [alpha!, bravo!])
@@ -1369,7 +1416,7 @@ describe('a retired key is launched by a reuse spawn at every launch path, never
     const [alpha, bravo] = personas
     const bravoKey = h.key('bravo')
     await applyConfig(run, [alpha!])
-    h.seedRow(bravo!, { state: 'ended' })
+    expect(h.rowOf('bravo')).toMatchObject({ state: 'ended', cwd: bravo!.working_directory })
     const from = run.composition!.instanceCallsOf('bravo').length
     spawnQueue.push(cannedErr(errTmuxUnresponsive('spawn')))
 
@@ -1486,7 +1533,7 @@ describe('a retired key is launched by a reuse spawn at every launch path, never
     const [alpha, bravo] = personas
     const bravoKey = h.key('bravo')
     await applyConfig(run, [alpha!])
-    h.seedRow(bravo!, { state: 'ended' })
+    expect(h.rowOf('bravo')).toMatchObject({ state: 'ended', cwd: bravo!.working_directory })
     h.deleteWorkingDirectory(bravo!)
     const from = run.composition!.instanceCallsOf('bravo').length
 
@@ -3141,7 +3188,7 @@ function adCallsSince(run: ReloadRun, from: number): AgentDirectorCall[] {
 }
 
 /**
- * The persona's instance calls (spawn, resume, kill, delete) from `from` on, as `<verb> <result>`; a reuse spawn of
+ * The persona's instance calls (spawn, resume, kill, and a delete, which no path makes) from `from` on, as `<verb> <result>`; a reuse spawn of
  * the same id (`reuse_finished`) reads `reuse-spawn <result>`, so a plain spawn in its place fails the case.
  */
 function instanceCallsSince(run: ReloadRun, name: string, from: number): string[] {
@@ -3203,7 +3250,7 @@ describe('AC 60: a destructive modify tears the persona down at step 2 and bring
   test.each<{ setting: 'working_directory' | 'credentials_file'; move: (bravo: PersonaInput) => PersonaInput }>([
     { setting: 'working_directory', move: (bravo) => movedDirectory(bravo) },
     { setting: 'credentials_file', move: (bravo) => movedCredentials(bravo) },
-  ])("AC 60: bravo's $setting moved, beside alpha, is previewed DESTRUCTIVE:, then exactly one teardown and one bring-up for bravo: its old row killed and deleted and a fresh spawn (never a resume) from the new declaration, its old connection closed before the new one opened, and no call of any kind for alpha (real launch)", async ({ setting, move }) => {
+  ])("AC 60: bravo's $setting moved, beside alpha, is previewed DESTRUCTIVE:, then exactly one teardown and one bring-up for bravo: its old row killed and kept, nothing deleted, then replaced by a reuse spawn of its id (never a resume) from the new declaration, its old connection closed before the new one opened, and no call of any kind for alpha (real launch)", async ({ setting, move }) => {
     const { run, personas } = await running(['alpha', 'bravo'], REAL_LAUNCH)
     const [alpha, bravo] = personas
     const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
@@ -3230,8 +3277,8 @@ describe('AC 60: a destructive modify tears the persona down at step 2 and bring
     await run.ticks.tick()
 
     // One teardown at step 2, then one bring-up at step 6, launched fresh; nothing else. Its key is retired by step 1,
-    // so the launch is a reuse spawn of the same id with no row (an ordinary fresh spawn) that begins its new life
-    // (b.jg5 SRJ-805, SRJ-806).
+    // so the launch is a reuse spawn of the same id over the row the teardown kept `ended`, which resets it to a new
+    // life (b.jg5 SRJ-715, SRJ-805, SRJ-806).
     expect(run.since(cp).lifecycle).toEqual([
       { op: 'teardown', key: bravoKey, via: 'apply' },
       { op: 'bring-up', key: bravoKey, via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
@@ -3243,8 +3290,8 @@ describe('AC 60: a destructive modify tears the persona down at step 2 and bring
       { op: 'bring-up', key: bravoKey, phase: 'start' },
       { op: 'bring-up', key: bravoKey, phase: 'settled' },
     ])
-    // Its old row killed and deleted, then spawned fresh from the new declaration: never resumed.
-    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(['kill ok', 'delete ok', 'reuse-spawn ok'])
+    // Its old row killed and kept (no delete), then reused from the new declaration: never resumed.
+    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(['kill ok', 'reuse-spawn ok'])
     expect(markWrittenLines(run, bravoKey)).toHaveLength(1)
     expect(lastSpawnOf(run, 'bravo')).toMatchObject({ id: bravoId, cwd: moved.working_directory, claudeConfigDir: ownConfigDir('bravo') })
     expect(h.rowOf('bravo')).toMatchObject({ state: 'waiting', cwd: moved.working_directory })
@@ -3275,7 +3322,7 @@ describe('AC 60: a destructive modify tears the persona down at step 2 and bring
   test.each<{ label: string; move: (bravo: PersonaInput) => PersonaInput; outcome: PersonaBringUpOutcome; cls: string; timers: number }>([
     { label: 'a new working directory that is missing', move: (bravo) => movedDirectory(bravo, false), outcome: 'retrying', cls: PERSONA_DIRECTORY_MISSING, timers: 1 },
     { label: 'a new credentials path that is missing', move: (bravo) => movedCredentials(bravo, false), outcome: 'broken', cls: PERSONA_CREDENTIALS_MISSING, timers: 0 },
-  ])('AC 60: bravo moved to $label is still torn down (its instance killed and deleted), and its fresh bring-up ends $outcome under the startup rules, launching nothing, while alpha is untouched and nothing is pending (real composition)', async ({ move, outcome, cls, timers }) => {
+  ])('AC 60: bravo moved to $label is still torn down (its instance killed, nothing deleted), and its fresh bring-up ends $outcome under the startup rules, launching nothing, while alpha is untouched and nothing is pending (real composition)', async ({ move, outcome, cls, timers }) => {
     const { run, personas } = await running(['alpha', 'bravo'], { realLifecycle: true })
     const [alpha, bravo] = personas
     const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
@@ -3290,7 +3337,7 @@ describe('AC 60: a destructive modify tears the persona down at step 2 and bring
       { op: 'bring-up', key: bravoKey, via: 'apply', result: expect.objectContaining({ outcome }) },
     ])
     expect(run.lifecycle.classes(bravoKey)).toEqual([cls])
-    expect(run.composition!.agentDirectorOrder).toEqual([`kill ${personaInstanceId(bravoKey)}`, `delete ${personaInstanceId(bravoKey)}`])
+    expect(run.composition!.agentDirectorOrder).toEqual([`kill ${personaInstanceId(bravoKey)}`])
     expect(run.clock.pendingCount()).toBe(timers)
     alphaUntouched()
     expect(run.composition!.calls.filter(([, key]) => key === alphaKey)).toEqual([])
@@ -3342,7 +3389,7 @@ describe('AC 60: a destructive modify tears the persona down at step 2 and bring
       timers: 1,
       fix: () => undefined,
     },
-  ])("AC 60: bravo $label, whose working directory is moved, is still torn down (its kept row killed and deleted, any retry timer cancelled) and brought up fresh in the new directory; its old declaration never comes back (real launch)", async ({ breakBravo, outcome, timers, fix }) => {
+  ])("AC 60: bravo $label, whose working directory is moved, is still torn down (its kept row killed, nothing deleted, any retry timer cancelled) and brought up fresh in the new directory; its old declaration never comes back (real launch)", async ({ breakBravo, outcome, timers, fix }) => {
     const { run, personas } = await running(['alpha', 'bravo'], REAL_LAUNCH, ([, bravo]) => {
       breakBravo(bravo!)
       h.seedRow(bravo!, { state: 'ended' })
@@ -3365,8 +3412,8 @@ describe('AC 60: a destructive modify tears the persona down at step 2 and bring
       { op: 'bring-up', key: bravoKey, via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
       { op: 'launch', key: bravoKey, via: 'apply', action: SPAWN_ACTION_FRESH_RETIRED },
     ])
-    // Its key retired by step 1: a reuse spawn of the same id with no row, never a resume (b.jg5 SRJ-805).
-    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(['kill ok', 'delete ok', 'reuse-spawn ok'])
+    // Its key retired by step 1: a reuse spawn of the same id over the row the teardown kept, never a resume (b.jg5 SRJ-805).
+    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(['kill ok', 'reuse-spawn ok'])
     expect(lastSpawnOf(run, 'bravo')).toMatchObject({ cwd: moved.working_directory })
     expect(run.clock.pendingCount()).toBe(0)
     // With its old directory back, far past every retry, nothing runs for its old declaration.
@@ -3443,6 +3490,7 @@ describe('AC 60: a destructive modify tears the persona down at step 2 and bring
     expect(run.lifecycle.outcome(bravoKey)).toBe(outcome)
     const moved = movedDirectory(bravo!)
     const bravoInstanceCalls = run.composition!.instanceCallsOf('bravo').length
+    const rowBefore = h.rowOf('bravo')
     const gate = run.lifecycle.hold('bring-up', bravoKey)
 
     const { applying } = await confirmConfig(run, [alpha!, moved])
@@ -3462,13 +3510,15 @@ describe('AC 60: a destructive modify tears the persona down at step 2 and bring
     expect(run.connections.manager.status(bravoKey)).toBeUndefined()
     expect(run.isUp('bravo')).toBe(false)
     expect(run.admitSession('bravo').kind).toBe('not-up')
-    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(['kill ok', 'delete ok'])
+    // The teardown killed its row and kept it (if it had one), `ended` and otherwise as it was: nothing deleted (b.jg5 SRJ-715).
+    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(['kill ok'])
+    expect(h.rowOf('bravo')).toEqual(rowBefore === undefined ? undefined : { ...rowBefore, state: 'ended' })
 
     gate.release()
     await applying
 
-    // The new half's one launch: its key retired by step 1, a reuse spawn of the same id (b.jg5 SRJ-805).
-    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(['kill ok', 'delete ok', 'reuse-spawn ok'])
+    // The new half's one launch: its key retired by step 1, a reuse spawn of the same id over the kept row (b.jg5 SRJ-805).
+    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(['kill ok', 'reuse-spawn ok'])
     expect(lastSpawnOf(run, 'bravo')).toMatchObject({ cwd: moved.working_directory })
     expect(run.isUp('bravo')).toBe(true)
     expect(run.admitSession('bravo').kind).toBe('admitted')
@@ -3479,7 +3529,7 @@ describe('AC 60: a destructive modify tears the persona down at step 2 and bring
     { setting: 'working_directory', move: (bravo) => movedDirectory(bravo) },
     // Dry run reads no credentials file, so the new path need not exist.
     { setting: 'credentials_file', move: (bravo) => movedCredentials(bravo, false) },
-  ])("AC 60 in dry run: bravo's $setting moved in the configuration file is still a destructive modify: previewed DESTRUCTIVE:, then one teardown that skips the agent-director kill and delete and one bring-up under the dry-run rules (no credentials read, no Slack client, a launch recorded), and alpha is untouched (real composition, dry run)", async ({ setting, move }) => {
+  ])("AC 60 in dry run: bravo's $setting moved in the configuration file is still a destructive modify: previewed DESTRUCTIVE:, then one teardown that skips the agent-director kill (no delete exists) and one bring-up under the dry-run rules (no credentials read, no Slack client, a launch recorded), and alpha is untouched (real composition, dry run)", async ({ setting, move }) => {
     const { run, personas } = await running(['alpha', 'bravo'], { realLifecycle: true, dryRun: true })
     const [alpha, bravo] = personas
     const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
@@ -3602,9 +3652,9 @@ describe('b.jg5 SRJ-706: an apply returns while a live-row sequence runs, and a 
   })
 
   test.each<[string, (alpha: PersonaInput, bravo: PersonaInput) => PersonaInput[], string[]]>([
-    ['a confirmed removal of bravo', (alpha) => [alpha], ['kill ok', 'delete ok']],
-    // The new half's launch is a reuse spawn: step 1 retired its key (b.jg5 SRJ-805).
-    ['a destructive modify of bravo (its working directory moved)', (alpha, bravo) => [alpha, movedDirectory(bravo)], ['kill ok', 'delete ok', 'reuse-spawn ok']],
+    ['a confirmed removal of bravo', (alpha) => [alpha], ['kill ok']],
+    // The new half's launch is a reuse spawn over the kept row: step 1 retired its key (b.jg5 SRJ-715, SRJ-805).
+    ['a destructive modify of bravo (its working directory moved)', (alpha, bravo) => [alpha, movedDirectory(bravo)], ['kill ok', 'reuse-spawn ok']],
   ])('%s while bravo\'s run is held: the teardown stops the sequence (at its submission and as its turn\'s step) before its first agent-director call, waits for the held run, and once it is released the sequence makes no further call; the apply then resolves', async (_label, next, instanceCalls) => {
     const { run, personas } = await running(['alpha', 'bravo'], REAL_LAUNCH)
     const [alpha, bravo] = personas
@@ -3631,7 +3681,7 @@ describe('b.jg5 SRJ-706: an apply returns while a live-row sequence runs, and a 
     await applying
 
     expect(await outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_TEARDOWN })
-    // The teardown's kill and delete (and the new half's spawn), and no get, run or launch from the sequence.
+    // The teardown's kill, no delete (and the new half's spawn), and no get, run or launch from the sequence.
     expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(instanceCalls)
     expect(adCallsSince(run, adFrom).filter((call) => call.verb === 'get' || call.verb === 'findMissing' || call.verb === 'resume')).toEqual([])
     expect(bravoCalls().indexOf('killInstance')).toBeGreaterThan(bravoCalls().lastIndexOf('stopLiveRowSequence'))
@@ -3642,14 +3692,220 @@ describe('b.jg5 SRJ-706: an apply returns while a live-row sequence runs, and a 
 })
 
 // ---------------------------------------------------------------------------
+// The teardown keeps the row, and step 1's recording stops the approver
+// (b.jg5 SRJ-715, SRJ-808, SRJ-805; AC 35, AC 77)
+//
+// Step 1's approver stops are read from `run.approverStops`, each with how
+// many writes, apply-time timeline entries and agent-director calls the run
+// had made when it was called. With the real launch path the stop is the
+// session manager's real one with the retired-key reason; a spawn the run
+// leaves `pending` (`opts.leaveSpawnsPending`) keeps its launch's approver
+// polling the row, lap by lap on a fake approver clock (`opts.approverClock`),
+// until it is stopped. A teardown kill that fails runs its bounded retry's
+// waits on `run.clock`, moved to each wait as it is set.
+// ---------------------------------------------------------------------------
+
+/** The class of the log-only entry a persona teardown's ordinary kill-failure alert writes (b.jg5 SRJ-704). */
+const TEARDOWN_ALERT_CLASS = selectKillFailureAlertRoute({
+  version: KILL_FAILURE_VERSION_ORDINARY,
+  context: KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN,
+  configured: true,
+  latched: false,
+}).classLabel!
+
+/**
+ * Move `run.clock` through the waits between a teardown kill's `tries` tries:
+ * each time, once the retry's wait is the one timer pending, asking
+ * `KILL_RETRY_SPACING_MS`, to its end.
+ */
+async function driveTeardownKillTries(run: ReloadRun, tries: number): Promise<void> {
+  for (let i = 1; i < tries; i++) {
+    await until(() => run.clock.pendingCount() > 0)
+    expect(run.clock.pending().map((t) => t.delayMs)).toEqual([KILL_RETRY_SPACING_MS])
+    await run.clock.advance(KILL_RETRY_SPACING_MS)
+  }
+}
+
+/** The calls a dialog approver makes on `id` (`status`, `read-pane`, `send-keys`) from `from` (an `agentDirectorCalls` length) on. */
+function approverCallsSince(run: ReloadRun, id: string, from: number): AgentDirectorCall[] {
+  return adCallsSince(run, from).filter((c) => c.id === id && (c.verb === 'status' || c.verb === 'readPane' || c.verb === 'sendKeys'))
+}
+
+/** The calls on `id` from `from` on, as `<verb> <result>`. */
+function callsOnSince(run: ReloadRun, id: string, from: number): string[] {
+  return adCallsSince(run, from)
+    .filter((c) => c.id === id)
+    .map((c) => `${c.verb} ${c.result}`)
+}
+
+describe('b.jg5 SRJ-808, SRJ-715: step 1 stops each recorded key\'s approver before the teardown, and the teardown keeps the row', () => {
+  beforeEach(useConfigDirs)
+
+  test.each<{ label: string; seeded: boolean }>([
+    { label: 'written by step 1', seeded: false },
+    { label: 'already recorded with no mark, so step 1 writes nothing', seeded: true },
+  ])("a removal of bravo and a destructive modify of charlie, their keys $label: step 1 stops each key's approver once, right after the record and before the last-applied write, before either teardown starts and before any agent-director call (real composition)", async ({ seeded }) => {
+    const [bravoKey, charlieKey] = keysOf('bravo', 'charlie')
+    if (seeded) {
+      writeRetiredKeysRecord(h.stateDir, {
+        [bravoKey]: { cause: RETIRED_KEY_CAUSE_REMOVED },
+        [charlieKey]: { cause: RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY },
+      })
+    }
+    const { run, personas } = await running(['alpha', 'bravo', 'charlie'], { realLifecycle: true })
+    const [alpha, , charlie] = personas
+    const cp = run.checkpoint()
+
+    await applyConfig(run, [alpha!, movedDirectory(charlie!)])
+
+    const recordWrite = seeded ? [] : [retiredKeysWrite()]
+    expect(run.since(cp).writes).toEqual([{ path: h.paths.pending, ok: true }, ...recordWrite, lastAppliedWrite()])
+    // Both stops come after the pending write and the record (when one is written), before the last-applied write,
+    // with no apply-time lifecycle call and no agent-director call made yet.
+    const stopAt = cp.writes + 1 + recordWrite.length
+    expect(run.approverStops).toEqual(
+      [bravoKey, charlieKey].map((key) => ({ key, writes: stopAt, timeline: 0, agentDirectorCalls: 0 })),
+    )
+    expect(run.lifecycle.timeline.slice(0, 2)).toEqual([
+      { op: 'teardown', key: bravoKey, phase: 'start' },
+      { op: 'teardown', key: charlieKey, phase: 'start' },
+    ])
+    // Each teardown's kill, with no delete: the rows are kept (b.jg5 SRJ-715).
+    expect(run.composition!.agentDirectorOrder).toEqual([`kill ${personaInstanceId(bravoKey)}`, `kill ${personaInstanceId(charlieKey)}`])
+    expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
+    expectNoPostNoLeak(run)
+  })
+
+  test.each<{ label: string; rewriteFails: boolean }>([
+    { label: 'the apply goes on, and the teardown kills the pending row and keeps it, ended', rewriteFails: false },
+    { label: 'the last-applied rewrite fails, nothing is applied, and no approver runs for bravo again', rewriteFails: true },
+  ])("bravo's approver, polling its pending row, is stopped by step 1's recording of the removal, with the retired-key reason, and makes no call after it; $label (real launch)", async ({ rewriteFails }) => {
+    const approverClock = createFakeClock()
+    const bravoKey = h.key('bravo')
+    const bravoId = personaInstanceId(bravoKey)
+    const { run, personas } = await running(['alpha', 'bravo'], {
+      ...REAL_LAUNCH,
+      approverClock,
+      leaveSpawnsPending: (id) => id === bravoId,
+    })
+    const [alpha, bravo] = personas
+    // bravo's launch left its row pending: its approver read the row and the pane, and waits for its next lap.
+    await until(() => approverCallsSince(run, bravoId, 0).some((c) => c.verb === 'readPane'))
+    expect(h.rowOf('bravo')).toMatchObject({ state: 'pending', cwd: bravo!.working_directory })
+    expect(isDialogApproverRunning(bravoKey)).toBe(true)
+    const stopped = _whenDialogApproverStopped(bravoKey)
+    h.writeConfig(configOf(alpha!))
+    await run.ticks.tick()
+    h.confirm()
+    // The retired-key write's two opens come first: the last-applied write's own open is the third.
+    if (rewriteFails) h.failWrites({ step: 'openSync', call: 3 })
+
+    await run.ticks.tick()
+    h.clearWriteFailure()
+
+    // Stopped by step 1, before any teardown: the retired-key reason, not the teardown's.
+    expect(run.approverStops.map(({ key, timeline }) => ({ key, timeline }))).toEqual([{ key: bravoKey, timeline: 0 }])
+    expect(await stopped).toMatchObject({ reason: APPROVER_STOP_RETIRED_KEY })
+    expect(isDialogApproverRunning(bravoKey)).toBe(false)
+    // After the recording, no approver call on bravo's row: only the teardown's kill, when the apply went on.
+    const from = run.approverStops[0]!.agentDirectorCalls!
+    const expected = rewriteFails ? [] : ['kill ok']
+    expect(callsOnSince(run, bravoId, from)).toEqual(expected)
+    // Its clock moved far past every lap and its cap: still no call, no approver and no timer.
+    await approverClock.advance(60_000)
+    await turns()
+    expect(callsOnSince(run, bravoId, from)).toEqual(expected)
+    expect(isDialogApproverRunning(bravoKey)).toBe(false)
+    expect(approverClock.pendingCount()).toBe(0)
+    if (rewriteFails) {
+      expect(recordWriteFailedLines(run)).toHaveLength(1)
+      expect(run.appliedKeys()).toEqual(keysOf('alpha', 'bravo'))
+      expect(run.lifecycle.timeline).toEqual([])
+      expect(h.rowOf('bravo')?.state).toBe('pending')
+    } else {
+      expect(run.lifecycle.timeline).toEqual([
+        { op: 'teardown', key: bravoKey, phase: 'start' },
+        { op: 'teardown', key: bravoKey, phase: 'settled' },
+      ])
+      // The pending row, which no launch of this server has in flight, is killed, and kept (b.jg5 SRJ-513, SRJ-715).
+      expect(h.rowOf('bravo')).toEqual({ state: 'ended', cwd: bravo!.working_directory, labels: expect.any(Object) })
+    }
+    expectNoPostNoLeak(run)
+  })
+
+  test("a destructive modify of bravo whose teardown kill ends in ErrTmuxKillFailed after its tries keeps the row live, writes its alert on the persona-teardown route only, and the new half's launch sends the live old row through the live-row sequence with the retired-key flag: killed there, then reused, never launched over or resumed (real launch)", async () => {
+    const killQueue: NonNullable<StubClientOptions['killQueue']> = []
+    const { run, personas } = await running(['alpha', 'bravo'], { realLaunch: true, agentDirector: { killQueue } })
+    const [alpha, bravo] = personas
+    const bravoKey = h.key('bravo')
+    const bravoId = personaInstanceId(bravoKey)
+    const bravoRef = renderPersonaRef('bravo', bravoKey)
+    expect(h.rowOf('bravo')).toMatchObject({ state: 'waiting', cwd: bravo!.working_directory })
+    for (let i = 0; i < KILL_RETRY_TRIES; i++) killQueue.push(cannedErr(errTmuxKillFailed()))
+    const moved = movedDirectory(bravo!)
+    const alphaUntouched = watchUntouched(run, 'alpha')
+    const adFrom = run.composition!.agentDirectorCalls.length
+    const instanceFrom = run.composition!.instanceCallsOf('bravo').length
+    const gate = run.lifecycle.hold('bring-up', bravoKey)
+
+    const { applying } = await confirmConfig(run, [alpha!, moved])
+    await driveTeardownKillTries(run, KILL_RETRY_TRIES)
+    await gate.entered
+
+    // Between the halves: every try failed, a status read before each further one; the row is still live, and kept.
+    expect(callsOnSince(run, bravoId, adFrom)).toEqual([
+      'kill ErrTmuxKillFailed',
+      'status ok',
+      'kill ErrTmuxKillFailed',
+      'status ok',
+      'kill ErrTmuxKillFailed',
+    ])
+    expect(h.rowOf('bravo')).toMatchObject({ state: 'waiting', cwd: bravo!.working_directory })
+    expect(run.logs.filter((l) => l.startsWith(`[slack] persona teardown of ${bravoRef}: agent-director kill of ${bravoId} failed: `))).toHaveLength(1)
+    // Its kill-failure alert: one log-only entry on the persona-teardown route, nothing posted.
+    expect(run.composition!.killFailureEntries.map((e) => e.classLabel)).toEqual([TEARDOWN_ALERT_CLASS])
+    expect(run.slackPosts()).toEqual([])
+
+    gate.release()
+    await applying
+    await until(() => !run.sequenceRunning('bravo'))
+
+    // The new half's reuse collides with the live old row, which goes through the sequence with the retired-key flag;
+    // its kill succeeds, then its step 6 is a reuse spawn from the new declaration that begins the new life.
+    expect(launchesOf(run, 'bravo').at(-1)).toEqual({ op: 'launch', key: bravoKey, via: 'apply', action: 'sequence-waiting' })
+    expect(instanceCallsSince(run, 'bravo', instanceFrom)).toEqual([
+      'kill ErrTmuxKillFailed',
+      'kill ErrTmuxKillFailed',
+      'kill ErrTmuxKillFailed',
+      'reuse-spawn ErrInstanceIdCollision',
+      'kill ok',
+      'reuse-spawn ok',
+    ])
+    expect(run.logs.filter((l) => l === liveRowSequenceLaunchLine(bravoRef, { kind: LIVE_ROW_LAUNCH_REUSE, reason: LIVE_ROW_LAUNCH_REASON_RETIRED_KEY }))).toHaveLength(1)
+    expect(lastSpawnOf(run, 'bravo')).toMatchObject({ id: bravoId, reuse: true, cwd: moved.working_directory })
+    expect(h.rowOf('bravo')).toMatchObject({ state: 'waiting', cwd: moved.working_directory })
+    expect(markWrittenLines(run, bravoKey)).toHaveLength(1)
+    expect(run.composition!.killFailureEntries).toHaveLength(1)
+    // alpha: no lifecycle record, Slack activity or call on its row (the sequence's find-missing run names no row).
+    alphaUntouched()
+    expect(callsOnSince(run, personaInstanceId(h.key('alpha')), adFrom)).toEqual([])
+    expect(run.clock.pendingCount()).toBe(0)
+    expectNoPostNoLeak(run)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // A destructive modify of a latched persona (b.jg5 SRJ-504, AC 45)
 // ---------------------------------------------------------------------------
 
 /**
- * The pre-spawn scan's refusal of a reuse spawn of an id with no row (no row written): what a destructive modify's
- * new half meets, its key retired by step 1, so its launch is a reuse spawn of the deleted row's id (b.jg5 SRJ-805).
+ * The leftover refusal of a reuse spawn over a finished row (recorded `ended`; the row left as it was): what a
+ * destructive modify's new half can meet, its key retired by step 1, so its launch is a reuse spawn of the id over
+ * the row its old half's teardown killed and kept (b.jg5 SRJ-715, SRJ-805).
  */
-const SCAN_LEFTOVER = reuseSpawnScanRows().find((row) => row.stubCase === 'scan-leftover')!
+const REUSE_LEFTOVER = REUSE_SPAWN_CONFLICT_CASE_ROWS.find(
+  (row) => row.stubCase === 'leftover' && row.rowState.kind === 'read' && row.rowState.state === 'ended',
+)!
 
 /** The stub's spawn answers, in order (each spawn that reaches the stub takes the next; an empty queue spawns). */
 type SpawnQueue = NonNullable<StubClientOptions['spawnQueue']>
@@ -3664,9 +3920,9 @@ describe('b.jg5 SRJ-504: a destructive modify does not carry a latch over to its
   beforeEach(useConfigDirs)
 
   test.each<{ label: string; again: boolean }>([
-    { label: 'its fresh spawn succeeds: up and unlatched, nothing posted', again: false },
-    { label: 'its fresh spawn meets the same CONFLICT: latched again with exactly one post, to the new declaration’s destination', again: true },
-  ])("bravo, latched by a CONFLICT at a fresh spawn, is destructively modified (working directory and destination moved): the old half's teardown forgets the latch and posts nothing, and the new half's spawn reaches agent-director; $label; alpha gets no call", async ({ again }) => {
+    { label: 'its reuse spawn succeeds: up and unlatched, nothing posted', again: false },
+    { label: 'its reuse spawn meets the same CONFLICT: latched again with exactly one post, to the new declaration’s destination', again: true },
+  ])("bravo, latched by a CONFLICT at its reuse spawn over its kept row, is destructively modified (working directory and destination moved): the old half's teardown forgets the latch and posts nothing, and the new half's spawn reaches agent-director; $label; alpha gets no call", async ({ again }) => {
     const spawnQueue: SpawnQueue = []
     const { run, personas } = await running(['alpha', 'bravo'], { realLaunch: true, agentDirector: { spawnQueue } })
     const [alpha, bravo] = personas
@@ -3676,19 +3932,20 @@ describe('b.jg5 SRJ-504: a destructive modify does not carry a latch over to its
     expect(run.latch.isLatched(alphaKey)).toBe(false)
     expect(run.latch.isLatched(bravoKey)).toBe(false)
 
-    // A first destructive modify latches bravo: its fresh spawn meets the scan's refusal.
-    spawnQueue.push(cannedErr(SCAN_LEFTOVER.build()))
+    // A first destructive modify latches bravo: its reuse spawn over the row the teardown kept meets the leftover refusal.
+    spawnQueue.push(cannedErr(REUSE_LEFTOVER.build()))
     const latchedDeclaration = movedDirectory(bravo!)
     await applyConfig(run, [alpha!, latchedDeclaration])
     expect(run.lifecycle.records.filter((r) => r.op === 'launch' && r.key === bravoKey).at(-1)?.action).toBe('latched')
     expect(run.latch.record(bravoKey)).toMatchObject({
-      latchCase: SCAN_LEFTOVER.latchCase,
-      refusedOperation: SCAN_LEFTOVER.refusedOperation,
-      rowState: SCAN_LEFTOVER.rowState,
+      latchCase: REUSE_LEFTOVER.latchCase,
+      refusedOperation: REUSE_LEFTOVER.refusedOperation,
+      rowState: REUSE_LEFTOVER.rowState,
     })
-    expect(h.rowOf('bravo')).toBeUndefined()
-    expect(run.episodeNotices).toEqual([{ key: bravoKey, text: SCAN_LEFTOVER.notice.text }])
-    const posted = formatPersonaNotice({ name: 'bravo', key: bravoKey }, SCAN_LEFTOVER.notice.text)
+    // The old life's row, killed and kept by the teardown (b.jg5 SRJ-715); the refused reuse left it as it was.
+    expect(h.rowOf('bravo')).toMatchObject({ state: 'ended', cwd: bravo!.working_directory })
+    expect(run.episodeNotices).toEqual([{ key: bravoKey, text: REUSE_LEFTOVER.notice.text }])
+    const posted = formatPersonaNotice({ name: 'bravo', key: bravoKey }, REUSE_LEFTOVER.notice.text)
     expect(run.slackPosts().map(postOf)).toEqual([{ channel: oldDestination, text: posted }])
 
     // The second destructive modify: a new working directory, and a destination no other persona claims.
@@ -3699,7 +3956,7 @@ describe('b.jg5 SRJ-504: a destructive modify does not carry a latch over to its
       permission_prompts: newDestination,
     })
     h.makeWorkingDirectory(moved)
-    if (again) spawnQueue.push(cannedErr(SCAN_LEFTOVER.build()))
+    if (again) spawnQueue.push(cannedErr(REUSE_LEFTOVER.build()))
     const alphaUntouched = watchUntouched(run, 'alpha')
     const bravoInstanceCalls = run.composition!.instanceCallsOf('bravo').length
     const adFrom = run.composition!.agentDirectorCalls.length
@@ -3718,7 +3975,7 @@ describe('b.jg5 SRJ-504: a destructive modify does not carry a latch over to its
     await applying
     await turns()
 
-    // One teardown and one bring-up for bravo; its launch reached agent-director (a fresh spawn, never held as latched before the call).
+    // One teardown and one bring-up for bravo; its launch reached agent-director (a reuse spawn, never held as latched before the call).
     expect(run.since(cp).lifecycle).toEqual([
       { op: 'teardown', key: bravoKey, via: 'apply' },
       { op: 'bring-up', key: bravoKey, via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
@@ -3726,21 +3983,20 @@ describe('b.jg5 SRJ-504: a destructive modify does not carry a latch over to its
     ])
     expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual([
       'kill ok',
-      'delete ok',
-      `reuse-spawn ${again ? SCAN_LEFTOVER.build().name : 'ok'}`,
+      `reuse-spawn ${again ? REUSE_LEFTOVER.build().name : 'ok'}`,
     ])
     expect(lastSpawnOf(run, 'bravo')).toMatchObject({ id: bravoId, cwd: moved.working_directory })
     const newPosts = run.slackPosts().slice(postsFrom).map(postOf)
     if (again) {
       // Latched again with a new record and exactly one post, to the new declaration's destination only.
       expect(run.latch.record(bravoKey)).toMatchObject({
-        latchCase: SCAN_LEFTOVER.latchCase,
-        refusedOperation: SCAN_LEFTOVER.refusedOperation,
-        rowState: SCAN_LEFTOVER.rowState,
+        latchCase: REUSE_LEFTOVER.latchCase,
+        refusedOperation: REUSE_LEFTOVER.refusedOperation,
+        rowState: REUSE_LEFTOVER.rowState,
       })
-      expect(run.episodeNotices.slice(noticesFrom)).toEqual([{ key: bravoKey, text: SCAN_LEFTOVER.notice.text }])
+      expect(run.episodeNotices.slice(noticesFrom)).toEqual([{ key: bravoKey, text: REUSE_LEFTOVER.notice.text }])
       expect(newPosts).toEqual([{ channel: newDestination, text: posted }])
-      expect(h.rowOf('bravo')).toBeUndefined()
+      expect(h.rowOf('bravo')).toMatchObject({ state: 'ended', cwd: bravo!.working_directory })
     } else {
       expect(run.latch.isLatched(bravoKey)).toBe(false)
       expect(run.episodeNotices.slice(noticesFrom)).toEqual([])
@@ -3819,10 +4075,14 @@ describe('b.jg5 SRJ-207, SRJ-715: a destructive modify ends a held persona\'s Er
       { op: 'bring-up', key: bravoKey, via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
       { op: 'launch', key: bravoKey, via: 'apply', action: SPAWN_ACTION_FRESH_RETIRED },
     ])
-    // Its key retired by step 1: the new half's launch is a reuse spawn of the same id (b.jg5 SRJ-805).
-    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(['kill ok', 'delete ok', 'reuse-spawn ok'])
+    // Its key retired by step 1: the new half's launch is a reuse spawn of the same id over the kept row (b.jg5 SRJ-715, SRJ-805).
+    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(['kill ok', 'reuse-spawn ok'])
     expect(lastSpawnOf(run, 'bravo')).toMatchObject({ id: bravoId, cwd: moved.working_directory })
-    expect(run.composition!.calls.slice(callsFrom).filter(([member]) => member === 'forgetInvalidFlagsHold')).toEqual([['forgetInvalidFlagsHold', bravoKey]])
+    // The hold forgotten in the teardown's first group and again once its launch in flight settled (b.jg5 SRJ-715).
+    expect(run.composition!.calls.slice(callsFrom).filter(([member]) => member === 'forgetInvalidFlagsHold')).toEqual([
+      ['forgetInvalidFlagsHold', bravoKey],
+      ['forgetInvalidFlagsHold', bravoKey],
+    ])
     expect(run.invalidFlagsHold.isHeld(bravoKey)).toBe(false)
     expect(run.episodeNotices.slice(noticesFrom)).toEqual([])
     expect(run.slackPosts().slice(postsFrom)).toEqual([])

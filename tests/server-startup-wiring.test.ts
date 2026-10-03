@@ -246,9 +246,10 @@
  *   `recordStartupError(<class>, <entry>)` as their log-only route; they are
  *   installed in the session manager once (`setKillFailureAlerts`), after
  *   their build and before the restart module, the start sweep and the start
- *   pass, and named only at the build, the install and the routing holder's
- *   assignment; the restart kill adapter raises the kill retry's decision
- *   once, after the outcome's own handling.
+ *   pass, and named only at the build, the install, the routing holder's
+ *   assignment and the persona teardown's alert raiser (b.jg5 SRJ-715); the
+ *   restart kill adapter raises the kill retry's decision once, after the
+ *   outcome's own handling.
  * - b.jg5 SRJ-1011: the module-scope persona routing's lost-message inputs
  *   are read at call time: its latched query through a module-scope holder
  *   assigned the one latch once in main(), its `tmux-unresponsive` query
@@ -384,6 +385,7 @@ import type * as PersonaNotifierModule from '../src/persona-notifier.ts'
 import type { PersonaNotifier } from '../src/persona-notifier.ts'
 import type { PersonaConfig } from '../src/config.ts'
 import type { PersonaRoutingDeps } from '../src/persona-routing.ts'
+import type { PersonaLifecycleDeps } from '../src/persona-lifecycle.ts'
 
 const SRC_DIR = fileURLToPath(new URL('../src/', import.meta.url))
 const SERVER_PATH = join(SRC_DIR, 'server.ts')
@@ -3032,8 +3034,9 @@ describe('main() builds the one unclassified-error episodes instance over the no
 // suite. What the alerts do is tested in tests/persona-episodes.test.ts and
 // end to end on the recovery harness (tests/restart.test.ts,
 // tests/session-manager.test.ts); the routing's kill-failed query is pinned in
-// the routing's describe below. Pinned here: the build, the install and the
-// restart adapter's raise.
+// the routing's describe below. Pinned here: the build, the install, the
+// restart adapter's raise and where the persona teardown's alert raiser names
+// the instance (its form is pinned in tests/reload-wiring.test.ts).
 // ---------------------------------------------------------------------------
 
 describe('main() builds the one kill-failure alerts instance over the notice episodes, with the live applied-persona lookup and recordStartupError as its log-only route, and installs it in the session manager before the restart module, the start sweep and the start pass (b.jg5 SRJ-704, SRJ-1007, SRJ-1016)', () => {
@@ -3098,13 +3101,24 @@ describe('main() builds the one kill-failure alerts instance over the notice epi
     }
   })
 
-  test('the instance is named only at its build, its install and the routing holder\'s assignment (no module-scope copy, no second use)', () => {
+  test('the instance is named only at its build, its install, the routing holder\'s assignment and the persona teardown\'s alert raiser (no module-scope copy, no second use)', () => {
     const alerts = constOf(FACTORY)
+    const ALERT_RAISE: keyof KillFailureAlerts = 'raise'
+    const TEARDOWN_RAISER: keyof PersonaLifecycleDeps = 'raiseKillFailureAlert'
     const named = indicesOf(new RegExp(`\\b${alerts}\\b`, 'g'), SERVER_CODE)
-    expect(named).toHaveLength(3)
+    expect(named).toHaveLength(4)
     // The install's one argument starts right at its opening parenthesis.
     expect(named).toContain(balancedAfter(SERVER_CODE, onlyCallOf(INSTALL), '(', ')')[0])
     // The third is the routing holder's assignment (pinned in the routing's describe below).
+    // The fourth is the persona teardown's raiser (b.jg5 SRJ-704, SRJ-715): one
+    // raise on the instance inside createPersonaLifecycle's call, as the value
+    // of its alert raiser and nothing else (its whole form is pinned in
+    // tests/reload-wiring.test.ts).
+    const [open, close] = balancedAfter(SERVER_CODE, onlyCallOf('createPersonaLifecycle'), '(', ')')
+    expect(named.filter((at) => at > open && at < close)).toHaveLength(1)
+    const lifecycleProps = onlyCallProps('createPersonaLifecycle')
+    expect(lifecycleProps.get(TEARDOWN_RAISER)).toContain(`${alerts}.${ALERT_RAISE}(`)
+    expect([...lifecycleProps].filter(([, value]) => new RegExp(`\\b${alerts}\\b`).test(value)).map(([prop]) => prop)).toEqual([TEARDOWN_RAISER])
     for (const at of named) expect(insideMain(at)).toBe(true)
   })
 

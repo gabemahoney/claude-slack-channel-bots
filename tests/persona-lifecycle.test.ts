@@ -9,10 +9,20 @@
  * dependencies are recorders by default (each call appends `<dep>:<arg>` to
  * one shared trail, so order and the key are both asserted), replaced by the
  * real module where the case is about that module:
- * - the agent-director kill and delete: the real `killPersonaInstance` /
- *   `deletePersonaInstance` over `makeStubClient`, with the real outage state
- *   (`resetAllToHealthy`) and the real notifier, destination resolver and
- *   destination hold (`makeNotifierHarness`, fake clock);
+ * - the agent-director kill (b.jg5 SRJ-715, SRJ-110, SRJ-702): the real
+ *   teardown kill entry (`killPersonaInstanceForTeardown`, the bounded retry
+ *   on a fake clock whose waits the case drives) over `makeStubClient`, with
+ *   the real outage state (`resetAllToHealthy`), the real notifier,
+ *   destination resolver and destination hold (`makeNotifierHarness`, fake
+ *   clock), and the real kill-failure alerts over real notice episodes, bound
+ *   as `main()` binds them (context 'persona teardown'), whose log-only
+ *   entries are read back from the test's temp `logDir`. There is no delete:
+ *   the row is kept whatever the kill answers;
+ * - the teardown end to end (b.jg5 SRJ-715): the recovery harness's
+ *   `teardownDeps()` (the real approver and live-row sequence stops, retry
+ *   controller, latch, hold, notice episodes, outage state and bounded-retry
+ *   kill, bound as `main()` binds them), what P holds set through the
+ *   harness's real routes, each left-over read through its module's query;
  * - the ack-reaction entries: the real ack tracker's `forgetPersonaAcks`;
  * - the notice episodes (b.jg5 SRJ-1016): a real `createPersonaEpisodes`
  *   instance on a fake clock, its `forget` as `forgetNoticeEpisodes`;
@@ -43,7 +53,7 @@
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import type { MakeTemplateParams } from 'agent-director'
-import { mkdirSync, mkdtempSync, rmSync, unlinkSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 
@@ -82,6 +92,7 @@ import {
 import { checkPersonaConfigDir } from '../src/persona-bringup.ts'
 import { credentialsDigest, readCredentialsFile } from '../src/persona-credentials.ts'
 import {
+  createKillFailureAlerts,
   createPersonaEpisodes,
   PERSONA_EPISODE_KIND_CONFLICT,
   PERSONA_EPISODE_KIND_INVALID_FLAGS_HOLD,
@@ -106,7 +117,14 @@ import {
   PERSONA_SLACK_UNREACHABLE,
 } from '../src/persona-diagnostics.ts'
 import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
-import { createPersonaLifecycle, LIVE_ROW_SEQUENCE_STOP_AGAIN_STEP, LIVE_ROW_SEQUENCE_STOP_STEP, type PersonaLifecycle, type PersonaLifecycleDeps } from '../src/persona-lifecycle.ts'
+import {
+  createPersonaLifecycle,
+  LIVE_ROW_SEQUENCE_STOP_AGAIN_STEP,
+  LIVE_ROW_SEQUENCE_STOP_STEP,
+  TEARDOWN_RETRY_TIMER_STOP_AFTER_KILL_STEP,
+  type PersonaLifecycle,
+  type PersonaLifecycleDeps,
+} from '../src/persona-lifecycle.ts'
 import { createPersonaSerializer, type PersonaSerializer } from '../src/persona-serializer.ts'
 import type { PersonaBringUpStep } from '../src/persona-start.ts'
 import type { InPlaceApplyInput } from '../src/reload-apply.ts'
@@ -123,19 +141,54 @@ import {
 } from '../src/restart.ts'
 import { LIVENESS_READING_DEAD } from '../src/liveness-reading.ts'
 import {
+  APPROVER_LOG_PREFIX,
+  APPROVER_STOP_TEARDOWN,
   _resetConfiguredPersonaQuery,
-  deletePersonaInstance,
-  KILL_CONTEXT_TEARDOWN,
-  killPersonaInstance,
+  _whenDialogApproverStopped,
+  approverLogLine,
+  approverNotStartedMessage,
+  killPersonaInstanceForTeardown,
   setConfiguredPersonaQuery,
   setConflictLatch,
   stopLiveRowSequence,
   whenLaunchSettled,
+  type PersonaTeardownKillResult,
 } from '../src/session-manager.ts'
 import { LIVE_ROW_OUTCOME_STOPPED, LIVE_ROW_STOP_TEARDOWN } from '../src/live-row-sequence.ts'
-import { makeRecoveryHarness, personaOf, scriptLiveRowElsewhere } from './test-helpers/recovery-harness.ts'
+import {
+  callCounts,
+  callCountsSince,
+  holdThroughReuse,
+  killFailureRecoveryEntry,
+  makeRecoveryHarness,
+  ordinaryAlertContent,
+  personaOf,
+  scriptLiveRowElsewhere,
+  survivorAlertContent,
+  type RecoveryHarness,
+} from './test-helpers/recovery-harness.ts'
+import { conflictForPersona } from './test-helpers/conflict-cases.ts'
+import {
+  KILL_RETRY_ALERT_NONE,
+  KILL_RETRY_ALERT_ORDINARY,
+  KILL_RETRY_ALERT_SURVIVOR,
+  KILL_RETRY_END_EXHAUSTED,
+  KILL_RETRY_END_SETTLED,
+  KILL_RETRY_SPACING_MS,
+  KILL_RETRY_TRIES,
+  type KillRetryAlert,
+} from '../src/kill-retry.ts'
+import {
+  KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN,
+  KILL_FAILURE_VERSION_ORDINARY,
+  PERSONA_KILL_FAILED_LABEL,
+  PERSONA_KILL_SURVIVOR_LABEL,
+  selectKillFailureAlertRoute,
+} from '../src/kill-failure-alert.ts'
+import { recordStartupError } from '../src/startup-errors.ts'
 import {
   KILL_OUTCOME_KILLED,
+  KILL_OUTCOME_NOT_KILLED,
   KILL_OUTCOME_ROW_GONE,
   KILL_OUTCOME_SESSION_GONE,
   describeKillOutcome,
@@ -149,8 +202,14 @@ import {
   resetAdVersionRecheckForTests,
 } from '../src/ad-version-gate.ts'
 import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
-import { AD_ERROR_CLASS_CONFIG, AD_ERROR_CLASS_ENVIRONMENT, AD_ERROR_CLASS_UNCLASSIFIED } from '../src/ad-error-class.ts'
-import type { Phase1KillResult } from '../src/ad-phase1-types.ts'
+import {
+  AD_ERROR_CLASS_CONFIG,
+  AD_ERROR_CLASS_ENVIRONMENT,
+  AD_ERROR_CLASS_UNAVAILABLE,
+  AD_ERROR_CLASS_UNCLASSIFIED,
+  killFailedDescriptionOf,
+} from '../src/ad-error-class.ts'
+import type { Phase1KillResult, Phase1StatusResult } from '../src/ad-phase1-types.ts'
 import {
   createUnavailableRetryController,
   runInAttempt,
@@ -161,10 +220,14 @@ import {
   type UnavailableRetryController,
 } from '../src/unavailable-retry.ts'
 import {
+  cannedErr,
   cannedKillResult,
+  cannedOk,
   cannedStatusResult,
+  errCallTimeout,
   errConfigMalformed,
   errGeneric,
+  errInternal,
   errInstanceIdCollision,
   errInvalidFlags,
   errSpawnNotFound,
@@ -178,10 +241,14 @@ import {
   errTmuxUnresponsive,
   makeStubResolveSystemBinary,
   type StubResolveSystemBinaryOutcome,
+  errUnknownErrorName,
   errUnusableName,
+  holdSpawns,
   makeStubCallLog,
   makeStubClient,
+  SAMPLE_LAUNCH_START_NONE,
   stubCallCount,
+  type CannedResponse,
 } from './test-helpers/agent-director-stub.ts'
 import { APP_TOKEN_PREFIX, BOT_TOKEN_PREFIX, LEAK_SENTINEL, assertNoLeak, fakeToken, sentinelInMessage, writeCredentialsFile } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
@@ -191,8 +258,18 @@ import { makeNotifierHarness, type NotifierHarness } from './test-helpers/person
 import { INITIAL_CREDENTIALS, makeDeferredWebApiCall, type WebApiOutcome } from './test-helpers/slack-stub.ts'
 
 
-/** The kill's success the fixture's `killInstance` answers: `kill_sent: true` (b.jg5 SRJ-701: only a success lets the delete follow). */
+/** The kill's success the fixture's `killInstance` answers: `kill_sent: true` (b.jg5 SRJ-701). */
 const KILL_SUCCEEDED: KillOutcome = { kind: KILL_OUTCOME_KILLED, killSent: true }
+
+/** The teardown kill's result the fixture's `killInstance` answers: one try, `KILL_SUCCEEDED`, no alert. */
+const KILL_RESULT_SUCCEEDED: PersonaTeardownKillResult = {
+  outcome: KILL_SUCCEEDED,
+  end: KILL_RETRY_END_SETTLED,
+  tries: 1,
+  reads: 0,
+  alert: { kind: KILL_RETRY_ALERT_NONE },
+  refusals: [],
+}
 
 // ---------------------------------------------------------------------------
 // Temp directory, console capture and module state
@@ -220,6 +297,11 @@ afterEach(async () => {
   consoleSpy?.mockRestore()
   rmSync(dir, { recursive: true, force: true })
 })
+
+/** Every line logged to console.error in the running test (the teardown kill's tries and reads are logged there), as text. */
+function consoleLines(): string[] {
+  return (consoleSpy?.mock.calls ?? []).map((call: unknown[]) => String(call[0]))
+}
 
 /** Let pending promise continuations run (no timer involved). */
 async function flush(): Promise<void> {
@@ -262,14 +344,14 @@ type DepName =
   | 'bringUps.cancel' | 'bringUps.bringUp' | 'bringUps.state' | 'bringUps.changeCredentials' | 'cancelRestartTimer' | 'stopRetryTimer' | 'cancelLaunchWait'
   | 'stopApprover' | 'stopLiveRowSequence' | 'whenLaunchSettled' | 'connections.stop'
   | 'routing.forget' | 'forgetAcks' | 'destinations.forget' | 'destinationHold.cancel' | 'notifier.forget' | 'forgetPersonaPrompts'
-  | 'dropSession' | 'resetOutageState' | 'killInstance' | 'deleteInstance' | 'forgetFailures'
+  | 'dropSession' | 'resetOutageState' | 'killInstance' | 'raiseKillFailureAlert' | 'forgetFailures'
   | 'forgetDisconnectedStreak' | 'forgetNotConnectedEpisode' | 'forgetConflictLatch' | 'forgetInvalidFlagsHold' | 'forgetNoticeEpisodes' | 'replyGuard.launchedWithDir' | 'replyGuard.teardown' | 'replyGuard.launchPass'
   | 'storageCheck' | 'launch' | 'connections.reconnectCredentials' | 'connections.replaceRetryTokens'
 
 /** Dependencies whose production form returns a promise: their failure is a rejection, the others' a throw. */
 const ASYNC_DEPS = new Set<DepName>([
   'bringUps.bringUp', 'bringUps.changeCredentials', 'stopApprover', 'stopLiveRowSequence', 'whenLaunchSettled', 'connections.stop', 'connections.reconnectCredentials',
-  'dropSession', 'killInstance', 'deleteInstance', 'launch',
+  'dropSession', 'killInstance', 'launch',
 ])
 
 /** A thrown value whose message carries a fake token: the log line must not show it. */
@@ -291,6 +373,8 @@ interface FixtureOptions {
   state?: () => PersonaBringUpState | undefined
   /** What the recording `bringUps.changeCredentials` resolves with (default: `swapped`). It never calls the hook itself. */
   changeResult?: PersonaCredentialsChangeResult
+  /** What the recording `killInstance` resolves with (default: `KILL_RESULT_SUCCEEDED`). */
+  killResult?: PersonaTeardownKillResult
   /** Replace any dependency (real modules); the trail then records only the recorders left. */
   overrides?: Partial<PersonaLifecycleDeps>
 }
@@ -411,8 +495,8 @@ function makeFixture(opts: FixtureOptions = {}): Fixture {
     resetOutageState: rec('resetOutageState', (keys: string[]) => keys.join(','), () => undefined),
     forgetPersonaPrompts: rec('forgetPersonaPrompts', byKey, () => 0),
     dropSession: rec('dropSession', byKey, async () => false),
-    killInstance: rec('killInstance', byKey, async (): Promise<KillOutcome> => KILL_SUCCEEDED),
-    deleteInstance: rec('deleteInstance', byKey, async () => true),
+    killInstance: rec('killInstance', byKey, async (): Promise<PersonaTeardownKillResult> => opts.killResult ?? KILL_RESULT_SUCCEEDED),
+    raiseKillFailureAlert: rec('raiseKillFailureAlert', (key: string, decision: KillRetryAlert) => `${key}:${decision.kind}`, () => undefined),
     replyGuard: {
       launchedWithDir: rec('replyGuard.launchedWithDir', byKey, () => opts.launchedWith),
       teardown: rec('replyGuard.teardown', byKey, () => undefined),
@@ -443,51 +527,72 @@ function teardownPrefix(p: Persona): string {
 }
 
 /**
- * The teardown's line naming its kill's outcome for `p` (b.jg5 SRJ-701,
- * SRJ-1014), logged when the kill succeeded: `outcome` is the fixture's
- * `KILL_SUCCEEDED` unless given (the real kill over the stub's default
- * result answers `kill_sent` absent).
+ * The teardown's line naming its kill's outcome for `p` after `tries`
+ * kill(s), the row kept (b.jg5 SRJ-715, SRJ-701, SRJ-1014), logged when the
+ * kill succeeded: `outcome` is the fixture's `KILL_SUCCEEDED` unless given
+ * (the real kill over the stub's default result answers `kill_sent` absent).
  */
-function killOutcomeLine(p: Persona, outcome: KillOutcome = KILL_SUCCEEDED): string {
-  return `${teardownPrefix(p)}: agent-director kill of ${personaInstanceId(p.key)}: ${describeKillOutcome(outcome)}`
+function killOutcomeLine(p: Persona, outcome: KillOutcome = KILL_SUCCEEDED, tries = 1): string {
+  return `${teardownPrefix(p)}: agent-director kill of ${personaInstanceId(p.key)}: ${describeKillOutcome(outcome)} after ${tries} kill(s); the row is kept (b.jg5 SRJ-715)`
 }
 
-/** The teardown's line saying no delete was made after a kill that did not succeed (b.jg5 SRJ-701). */
-function deleteNotMadeLine(p: Persona): string {
-  return `${teardownPrefix(p)}: agent-director delete of ${personaInstanceId(p.key)} not made — its kill did not succeed, so the row is kept (b.jg5 SRJ-701)`
+/**
+ * The teardown's kill-step failure line for `p` whose kill's standing
+ * outcome is `outcome` after `tries` kill(s): the row is kept, nothing
+ * latches and no retry timer is armed (b.jg5 SRJ-715, SRJ-110).
+ */
+function killFailedLine(p: Persona, outcome: KillOutcome, tries: number): string {
+  return (
+    `${teardownPrefix(p)}: agent-director kill of ${personaInstanceId(p.key)} failed: ${describeKillOutcome(outcome)} after ${tries} kill(s) — ` +
+    'the row is kept; nothing latches and no retry timer is armed (b.jg5 SRJ-715, SRJ-110)'
+  )
+}
+
+/** The teardown's one line for `p` when its kill answered a malformed kill-failure alert decision: nothing is raised (b.jg5 SRJ-704). */
+function malformedAlertLine(p: Persona): string {
+  return (
+    `${teardownPrefix(p)}: agent-director kill of ${personaInstanceId(p.key)}: it answered a malformed kill-failure alert decision — ` +
+    'no kill-failure alert is raised (b.jg5 SRJ-704)'
+  )
 }
 
 /** A teardown's lines when every step succeeds: starting, its kill's outcome line, complete. */
-function cleanTeardownLines(p: Persona, outcome: KillOutcome = KILL_SUCCEEDED): string[] {
-  return [`${teardownPrefix(p)}: starting`, killOutcomeLine(p, outcome), `${teardownPrefix(p)}: complete`]
+function cleanTeardownLines(p: Persona, outcome: KillOutcome = KILL_SUCCEEDED, tries = 1): string[] {
+  return [`${teardownPrefix(p)}: starting`, killOutcomeLine(p, outcome, tries), `${teardownPrefix(p)}: complete`]
 }
 
 /**
  * The teardown's own steps for `p` (its serializer turn), outside dry run,
- * with the recorders' defaults: its dialog approver is stopped first and its
- * live-row sequence right after, before every other step and before the
- * wait for its launch in flight (b.jg5 SRJ-404, SRJ-706, SRJ-715); the
- * launch's wait for a `working` row is
+ * with the recorders' defaults (b.jg5 SRJ-715): first, before the wait for
+ * its launch in flight, its dialog approver, its live-row sequence and its
+ * UNAVAILABLE retry timer are stopped and its latch, `ErrInvalidFlags` hold
+ * and notice episodes forgotten, in that order (b.jg5 SRJ-404, SRJ-706,
+ * SRJ-305, SRJ-504, SRJ-207, SRJ-1016); then its bring-up retries and
+ * restart timer are cancelled and the launch's wait for a `working` row
  * cancelled again (b.f2b) right before the teardown waits for the launch;
- * once that launch settled, its live-row sequence is stopped again and its
- * UNAVAILABLE retry timer with it (b.jg5 SRJ-715, SRJ-706: the launch can
- * have started a sequence at a collision ladder replacement site, b.jg5
- * SRJ-707, or armed the timer); after the agent-director calls the outage
- * state is forgotten and the
- * UNAVAILABLE retry timer stopped again (b.jg5 SRJ-311: a failing delete's
- * ENVIRONMENT answer arms one; the kill arms none, b.jg5 SRJ-110, hatch A3).
+ * once that launch settled, the sequence, the retry timer, the latch, the
+ * hold and the episodes go again (the launch can have started a sequence at
+ * a collision ladder replacement site, b.jg5 SRJ-707, armed the timer, set a
+ * latch or a hold, or opened an episode); then the Slack connection and the
+ * session state; the outage state is forgotten, the kill made (no delete:
+ * the row is kept) and, after it, the outage state forgotten and the retry
+ * timer stopped once more (the kill arms none, b.jg5 SRJ-110), the failure
+ * count, health streak and not-connected episode forgotten and the latch
+ * forgotten once more; then the reply guard. No alert is raised for the
+ * fixture's default kill (its decision is `none`).
  */
 function teardownTurnTrail(p: Persona, launchPass: string): string[] {
   const k = p.key
   return [
-    `stopApprover:${k}`, `stopLiveRowSequence:${k}`,
-    `bringUps.cancel:${k}`, `cancelRestartTimer:${k}`, `stopRetryTimer:${k}`, `cancelLaunchWait:${k}`, `whenLaunchSettled:${k}`,
-    `stopLiveRowSequence:${k}`, `stopRetryTimer:${k}`,
+    `stopApprover:${k}`, `stopLiveRowSequence:${k}`, `stopRetryTimer:${k}`,
+    `forgetConflictLatch:${k}`, `forgetInvalidFlagsHold:${k}`, `forgetNoticeEpisodes:${k}`,
+    `bringUps.cancel:${k}`, `cancelRestartTimer:${k}`, `cancelLaunchWait:${k}`, `whenLaunchSettled:${k}`,
+    `stopLiveRowSequence:${k}`, `stopRetryTimer:${k}`, `forgetConflictLatch:${k}`, `forgetInvalidFlagsHold:${k}`, `forgetNoticeEpisodes:${k}`,
     `connections.stop:${k}`, `routing.forget:${k}`, `forgetAcks:${k}`, `destinations.forget:${k}`, `destinationHold.cancel:${k}`,
     `notifier.forget:${k}`, `forgetPersonaPrompts:${k}`, `dropSession:${k}`,
-    `resetOutageState:${k}`, `killInstance:${k}`, `deleteInstance:${k}`, `resetOutageState:${k}`, `stopRetryTimer:${k}`,
+    `resetOutageState:${k}`, `killInstance:${k}`, `resetOutageState:${k}`, `stopRetryTimer:${k}`,
     `forgetFailures:${k}`, `forgetDisconnectedStreak:${k}`, `forgetNotConnectedEpisode:${k}`, `forgetConflictLatch:${k}`,
-    `forgetInvalidFlagsHold:${k}`, `forgetNoticeEpisodes:${k}`, `replyGuard.launchedWithDir:${k}`, `replyGuard.teardown:${k}`, `replyGuard.launchPass:${launchPass}`,
+    `replyGuard.launchedWithDir:${k}`, `replyGuard.teardown:${k}`, `replyGuard.launchPass:${launchPass}`,
   ]
 }
 
@@ -697,6 +802,9 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     await done
     expect(f.trail).toEqual(full)
     expect(f.trail.filter((c) => c.startsWith('stopApprover:'))).toEqual([`stopApprover:${f.b.key}`, `stopApprover:${f.b.key}`])
+    // AC 35's part: the approver stops before the wait for the launch in flight and before the kill.
+    expect(f.trail.lastIndexOf(`stopApprover:${f.b.key}`)).toBeLessThan(f.trail.indexOf(`whenLaunchSettled:${f.b.key}`))
+    expect(f.trail.lastIndexOf(`stopApprover:${f.b.key}`)).toBeLessThan(f.trail.indexOf(`killInstance:${f.b.key}`))
     expect(f.lines).toEqual(cleanTeardownLines(f.b))
   })
 
@@ -780,7 +888,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
   // sequence stop. Once that launch settled, the turn stops the sequence
   // again and awaits that stop (the sequence's call in flight) before its
   // second retry-timer stop and every later step, the kill included.
-  test('b.jg5 SRJ-715, SRJ-706: once B\'s launch in flight settled, B\'s live-row sequence is stopped again and the turn awaits that stop, then stops B\'s retry timer again, before its Slack connection stops and before its kill', async () => {
+  test('b.jg5 SRJ-715, SRJ-706: once B\'s launch in flight settled, B\'s live-row sequence is stopped again and the turn awaits that stop, then stops B\'s retry timer again and forgets its latch, hold and notice episodes again, before its Slack connection stops and before its kill', async () => {
     const againStop = Promise.withResolvers<boolean>()
     let stops = 0
     const f = makeFixture({
@@ -803,7 +911,10 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     await done
     const k = f.b.key
     const settledAt = f.trail.indexOf(`whenLaunchSettled:${k}`)
-    expect(f.trail.slice(settledAt, settledAt + 4)).toEqual([`whenLaunchSettled:${k}`, `stopLiveRowSequence:${k}`, `stopRetryTimer:${k}`, `connections.stop:${k}`])
+    expect(f.trail.slice(settledAt, settledAt + 7)).toEqual([
+      `whenLaunchSettled:${k}`, `stopLiveRowSequence:${k}`, `stopRetryTimer:${k}`,
+      `forgetConflictLatch:${k}`, `forgetInvalidFlagsHold:${k}`, `forgetNoticeEpisodes:${k}`, `connections.stop:${k}`,
+    ])
     expect(f.trail).toEqual(full)
     expect(f.lines).toEqual(cleanTeardownLines(f.b))
   })
@@ -985,14 +1096,77 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     expect(h.controller.isArmed(p)).toBe(false)
   })
 
-  // Rows: the dependency that fails and the step phrase of each line it fails, in order. Two deps run more than once
-  // in the turn, so each of their steps fails: resetOutageState (before and after the agent-director calls) and
-  // stopRetryTimer (with the early timers, again once the launch in flight settled, b.jg5 SRJ-715, and again after
-  // the post-call reset, b.jg5 SRJ-311).
+  // b.jg5 SRJ-715, SRJ-305, SRJ-301: P's launch in flight
+  // (the start pass's, outside the serializer) can arm P's retry timer after
+  // the teardown's first-group stop. Composed over the recovery harness: the
+  // real retry controller on its fake clock and the real launch, its spawn
+  // held, then answering UNAVAILABLE inside its attempt; the teardown's
+  // retry-timer stop and its wait for the launch bound as main() binds them.
+  test('b.jg5 SRJ-715: P\'s launch in flight meets UNAVAILABLE after the teardown\'s first retry-timer stop and arms P\'s timer; the stop once that launch settled clears it, so no timer is armed for P when the teardown completes; Q\'s timer stays armed', async () => {
+    const h = makeRecoveryHarness()
+    cleanups.push(() => {
+      try {
+        assertNoLeak(h.captured())
+      } finally {
+        h.cleanup()
+      }
+    })
+    const [p, q] = h.keys as [string, string]
+    const spawns = holdSpawns(h.stub.client)
+    const launch = h.launch(p)
+    await spawns.entered(personaInstanceId(p))
+    h.controller.arm(q, { kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE })
+    const qDue = h.controller.view(q)!.dueAt
+    const f = makeFixture({
+      overrides: {
+        whenLaunchSettled: (key) => {
+          f.trail.push(`whenLaunchSettled:${key}`)
+          return whenLaunchSettled(key)
+        },
+        // As server.ts binds it, recording whether the key had a timer when this stop ran.
+        stopRetryTimer: (key) => {
+          f.trail.push(`stopRetryTimer:${key}:${h.controller.isArmed(key) ? 'armed' : 'none'}`)
+          h.controller.stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
+        },
+      },
+    })
+    f.applied.push(personaOf(h, p)) // a destructive modify's old half: P's key stays applied
+
+    const done = f.lifecycle.teardown(personaOf(h, p))
+    await flush()
+    // The first group ran (P had no timer then); the turn waits for P's launch in flight.
+    expect(f.trail.at(-1)).toBe(`whenLaunchSettled:${p}`)
+    expect(h.controller.isArmed(p)).toBe(false)
+
+    spawns.fail(personaInstanceId(p), errTmuxUnresponsive('spawn'))
+    await launch
+    await done
+    await h.settle()
+
+    // The launch armed P's timer as it settled; the stop right after the wait found it armed and stopped it.
+    expect(h.triggers).toContainEqual({ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE })
+    const settledAt = f.trail.indexOf(`whenLaunchSettled:${p}`)
+    const stops = f.trail.filter((c) => c.startsWith(`stopRetryTimer:${p}:`))
+    expect(stops.filter((c) => c.endsWith(':armed'))).toEqual([`stopRetryTimer:${p}:armed`])
+    expect(f.trail.indexOf(`stopRetryTimer:${p}:armed`)).toBeGreaterThan(settledAt)
+    expect(f.trail.slice(settledAt + 1, settledAt + 3)).toEqual([`stopLiveRowSequence:${p}`, `stopRetryTimer:${p}:armed`])
+    expect(stops.at(-1)).toBe(`stopRetryTimer:${p}:none`)
+    expect(h.controller.isArmed(p)).toBe(false)
+    expect(h.controller.armedKeys()).toEqual([q])
+    expect(h.controller.view(q)!.dueAt).toBe(qDue)
+    expect(f.lines.at(-1)).toBe(`${teardownPrefix(personaOf(h, p))}: complete`)
+    h.controller.stop(q, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
+  })
+
+  // Rows: the dependency that fails and the step phrase of each line it fails, in order. Some deps run more than once
+  // in the turn, so each of their steps fails: resetOutageState (before and after the kill), stopRetryTimer (in the
+  // first group, again once the launch in flight settled and once more after the kill), the latch forget (in the
+  // first group, again once the launch settled and once more after the kill), and the hold and episodes forgets (in
+  // the first group and again once the launch settled) (b.jg5 SRJ-715).
   test.each<[DepName, string[]]>([
     ['bringUps.cancel', ['cancelling its bring-up retries']],
     ['cancelRestartTimer', ['cancelling its restart timer']],
-    ['stopRetryTimer', ['stopping its UNAVAILABLE retry timer', 'stopping its UNAVAILABLE retry timer again, after its launch in flight settled', 'stopping its UNAVAILABLE retry timer']],
+    ['stopRetryTimer', ['stopping its UNAVAILABLE retry timer', 'stopping its UNAVAILABLE retry timer again, after its launch in flight settled', TEARDOWN_RETRY_TIMER_STOP_AFTER_KILL_STEP]],
     ['whenLaunchSettled', ['waiting for its launch in flight']],
     ['connections.stop', ['stopping its Slack connection']],
     ['routing.forget', ['forgetting its inbound dedupe store']],
@@ -1003,13 +1177,12 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     ['forgetPersonaPrompts', ['dropping its tracked permission prompts']],
     ['dropSession', ['dropping its MCP session']],
     ['resetOutageState', ['forgetting its outage state', 'forgetting its outage state']],
-    ['deleteInstance', ['agent-director delete of cscb_<key>']],
     ['forgetFailures', ['forgetting its restart failure count']],
     ['forgetDisconnectedStreak', ['forgetting its health-check streak']],
     ['forgetNotConnectedEpisode', ['forgetting its not-connected episode']],
-    ['forgetConflictLatch', ['forgetting its latch']],
-    ['forgetInvalidFlagsHold', ['forgetting its ErrInvalidFlags hold']],
-    ['forgetNoticeEpisodes', ['forgetting its notice episodes']],
+    ['forgetConflictLatch', ['forgetting its latch', 'forgetting its latch again, after its launch in flight settled', 'forgetting its latch once more, after the kill']],
+    ['forgetInvalidFlagsHold', ['forgetting its ErrInvalidFlags hold', 'forgetting its ErrInvalidFlags hold again, after its launch in flight settled']],
+    ['forgetNoticeEpisodes', ['forgetting its notice episodes', 'forgetting its notice episodes again, after its launch in flight settled']],
     ['replyGuard.launchedWithDir', ['reading its launched-with directory']],
     ['replyGuard.teardown', ['deleting its reply-guard record']],
     ['replyGuard.launchPass', ['re-evaluating the Stop hook in its config directories']],
@@ -1033,57 +1206,198 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     assertNoLeak({ lines: f.lines })
   })
 
-  // b.jg5 SRJ-110, SRJ-701: a kill step that throws shows no success, so the
-  // delete is not made (the row is kept); every other step still runs.
-  test('b.jg5 SRJ-701: killInstance failing (it throws): its step is logged token-safely, no delete is made (one line says so), every other step still runs, and the completion line counts one failed step', async () => {
+  // b.jg5 SRJ-715, SRJ-110: a kill step that throws shows no outcome: the
+  // step fails, nothing is raised and the row is kept (there is no delete);
+  // every other step still runs.
+  test('b.jg5 SRJ-715: killInstance failing (it throws): its step is logged token-safely, no alert is raised, every other step still runs, and the completion line counts one failed step', async () => {
     const launchedWith = join(dir, 'beta-launched-with')
     const f = makeFixture({ fail: ['killInstance'], launchedWith })
 
     await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
 
-    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, launchedWith)).filter((c) => c !== `deleteInstance:${f.b.key}`))
+    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, launchedWith)))
     expect(f.lines).toEqual([
       `${teardownPrefix(f.b)}: starting`,
       expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: agent-director kill of ${personaInstanceId(f.b.key)} failed: Error`)}( |$)`)),
-      deleteNotMadeLine(f.b),
       `${teardownPrefix(f.b)}: complete, with 1 failed step(s)`,
     ])
     assertNoLeak({ lines: f.lines })
   })
 
-  test('every step failing: the teardown still resolves, runs each step once but the delete (b.jg5 SRJ-701: the kill did not succeed) and reports all of them', async () => {
+  test('b.jg5 SRJ-715: a kill answering no kill outcome fails the kill step with its own line; nothing is raised and every other step still runs', async () => {
+    const f = makeFixture({ killResult: { refusals: [] } as unknown as PersonaTeardownKillResult })
+
+    await f.lifecycle.teardown(f.b)
+
+    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
+    expect(f.lines).toEqual([
+      `${teardownPrefix(f.b)}: starting`,
+      `${teardownPrefix(f.b)}: agent-director kill of ${personaInstanceId(f.b.key)} failed: it answered no kill outcome — the row is kept (b.jg5 SRJ-715)`,
+      `${teardownPrefix(f.b)}: complete, with 1 failed step(s)`,
+    ])
+  })
+
+  // b.jg5 SRJ-704, SRJ-715: the kill's retry decision is raised right after
+  // the kill step, for B, with the decision as the kill answered it, before
+  // the outage state is forgotten again; a `none` decision raises nothing
+  // (every other case here). A failing raise is one failed step.
+  test.each<[string, PersonaTeardownKillResult, boolean]>([
+    [
+      'ordinary decision, after a kill failing at every try',
+      {
+        outcome: killOutcomeOf({ thrown: errTmuxKillFailed() }),
+        end: KILL_RETRY_END_EXHAUSTED,
+        tries: KILL_RETRY_TRIES,
+        reads: KILL_RETRY_TRIES - 1,
+        alert: { kind: KILL_RETRY_ALERT_ORDINARY, lastKillFailedDescription: killFailedDescriptionOf(errTmuxKillFailed())! },
+        refusals: [],
+      },
+      false,
+    ],
+    [
+      'survivor decision, after a success that followed a survivor-naming failure',
+      {
+        outcome: KILL_SUCCEEDED,
+        end: KILL_RETRY_END_SETTLED,
+        tries: 2,
+        reads: 1,
+        alert: { kind: KILL_RETRY_ALERT_SURVIVOR, survivorDescription: killFailedDescriptionOf(errTmuxKillFailed(undefined, 'pane-process-survived'))! },
+        refusals: [],
+      },
+      true,
+    ],
+  ])('b.jg5 SRJ-704: the kill\'s %s is raised once for B, right after the kill step; a raise that throws is logged as its own failed step and every other step still runs', async (_label, killResult, succeeded) => {
+    for (const raiseFails of [false, true]) {
+      const f = makeFixture({ killResult, ...(raiseFails ? { fail: ['raiseKillFailureAlert' as const] } : {}) })
+      const k = f.b.key
+
+      await f.lifecycle.teardown(f.b)
+
+      const expected = fullTeardownTrail(f.b, launchPassOf(f, undefined))
+      const afterKill = expected.indexOf(`killInstance:${k}`) + 1
+      expect(f.trail).toEqual([...expected.slice(0, afterKill), `raiseKillFailureAlert:${k}:${killResult.alert.kind}`, ...expected.slice(afterKill)])
+      const failedSteps = (succeeded ? 0 : 1) + (raiseFails ? 1 : 0)
+      expect(f.lines).toEqual([
+        `${teardownPrefix(f.b)}: starting`,
+        succeeded ? killOutcomeLine(f.b, killResult.outcome, killResult.tries) : killFailedLine(f.b, killResult.outcome, killResult.tries),
+        ...(raiseFails ? [expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: raising the kill-failure alert failed: Error`)}( |$)`))] : []),
+        failedSteps === 0 ? `${teardownPrefix(f.b)}: complete` : `${teardownPrefix(f.b)}: complete, with ${failedSteps} failed step(s)`,
+      ])
+      assertNoLeak({ lines: f.lines })
+    }
+  })
+
+  // b.jg5 SRJ-704: only an ordinary decision, or a survivor one carrying a
+  // string description, is raised. A malformed decision (or one whose read
+  // throws) raises nothing and is said once, inside the kill step: the kill
+  // succeeded, so no step fails.
+  test.each<[string, unknown]>([
+    ['null', null],
+    ['an unknown kind', { kind: 'catastrophic', lastKillFailedDescription: 'tmux kill failed' }],
+    ['survivor without a description', { kind: KILL_RETRY_ALERT_SURVIVOR }],
+    ['survivor with a non-string description', { kind: KILL_RETRY_ALERT_SURVIVOR, survivorDescription: 42 }],
+    ['a decision without a kind', {}],
+    ['a decision that is not an object', KILL_RETRY_ALERT_ORDINARY],
+  ])('b.jg5 SRJ-704: a malformed kill-failure alert decision (%s) raises nothing, logs its one line, counts no failed step, and the teardown resolves', async (_label, alert) => {
+    const killResult = { ...KILL_RESULT_SUCCEEDED, alert } as unknown as PersonaTeardownKillResult
+    const f = makeFixture({ killResult })
+
+    await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
+
+    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
+    expect(f.trail.filter((c) => c.startsWith('raiseKillFailureAlert:'))).toEqual([])
+    expect(f.lines).toEqual([
+      `${teardownPrefix(f.b)}: starting`,
+      malformedAlertLine(f.b),
+      killOutcomeLine(f.b),
+      `${teardownPrefix(f.b)}: complete`,
+    ])
+  })
+
+  test('b.jg5 SRJ-704: a kill-failure alert decision whose read throws raises nothing, logs the malformed-decision line, counts no failed step, and the teardown resolves', async () => {
+    const killResult = { ...KILL_RESULT_SUCCEEDED } as Record<string, unknown>
+    Object.defineProperty(killResult, 'alert', { get: () => { throw failure() }, enumerable: true })
+    const f = makeFixture({ killResult: killResult as unknown as PersonaTeardownKillResult })
+
+    await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
+
+    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
+    expect(f.lines).toEqual([
+      `${teardownPrefix(f.b)}: starting`,
+      malformedAlertLine(f.b),
+      killOutcomeLine(f.b),
+      `${teardownPrefix(f.b)}: complete`,
+    ])
+    assertNoLeak({ lines: f.lines })
+  })
+
+  test('b.jg5 SRJ-704: a malformed decision after a failing kill raises nothing and logs its line; only the kill step counts as failed', async () => {
+    const outcome = killOutcomeOf({ thrown: errTmuxKillFailed() })
+    const killResult = {
+      outcome,
+      end: KILL_RETRY_END_EXHAUSTED,
+      tries: KILL_RETRY_TRIES,
+      reads: KILL_RETRY_TRIES - 1,
+      alert: { kind: KILL_RETRY_ALERT_SURVIVOR, survivorDescription: null },
+      refusals: [],
+    } as unknown as PersonaTeardownKillResult
+    const f = makeFixture({ killResult })
+
+    await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
+
+    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
+    expect(f.lines).toEqual([
+      `${teardownPrefix(f.b)}: starting`,
+      malformedAlertLine(f.b),
+      killFailedLine(f.b, outcome, KILL_RETRY_TRIES),
+      `${teardownPrefix(f.b)}: complete, with 1 failed step(s)`,
+    ])
+  })
+
+  // A `none` decision, or none at all, is no alert to raise: nothing raised, no line.
+  test.each<[string, Partial<PersonaTeardownKillResult>]>([
+    ['a none decision', { alert: { kind: KILL_RETRY_ALERT_NONE } }],
+    ['no decision', { alert: undefined }],
+  ])('b.jg5 SRJ-704: %s raises nothing and logs no malformed-decision line', async (_label, alertPart) => {
+    const f = makeFixture({ killResult: { ...KILL_RESULT_SUCCEEDED, ...alertPart } as PersonaTeardownKillResult })
+
+    await f.lifecycle.teardown(f.b)
+
+    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
+    expect(f.lines).toEqual(cleanTeardownLines(f.b))
+  })
+
+  test('every step failing: the teardown still resolves, runs each step once and reports every one of them; there is no delete step', async () => {
     const all: DepName[] = [
       'stopApprover', 'stopLiveRowSequence', 'bringUps.cancel', 'cancelRestartTimer', 'stopRetryTimer', 'cancelLaunchWait', 'whenLaunchSettled', 'connections.stop', 'routing.forget',
       'forgetAcks', 'destinations.forget', 'destinationHold.cancel', 'notifier.forget', 'forgetPersonaPrompts', 'dropSession',
-      'resetOutageState', 'killInstance', 'deleteInstance', 'forgetFailures', 'forgetDisconnectedStreak', 'forgetNotConnectedEpisode',
+      'resetOutageState', 'killInstance', 'forgetFailures', 'forgetDisconnectedStreak', 'forgetNotConnectedEpisode',
       'forgetConflictLatch', 'forgetInvalidFlagsHold', 'forgetNoticeEpisodes', 'replyGuard.launchedWithDir', 'replyGuard.teardown', 'replyGuard.launchPass',
     ]
     const f = makeFixture({ fail: all })
 
     await f.lifecycle.teardown(f.b)
 
-    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)).filter((c) => c !== `deleteInstance:${f.b.key}`))
-    // 27 dependencies, the delete not run after the failed kill (b.jg5 SRJ-701);
-    // resetOutageState and stopLiveRowSequence each run (and fail) twice in the turn, stopRetryTimer three times.
-    expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete, with 30 failed step(s)`)
-    expect(f.lines).toContain(deleteNotMadeLine(f.b))
+    const turn = teardownTurnTrail(f.b, launchPassOf(f, undefined))
+    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
+    // Every step of the turn failed once (the repeated stops and forgets each count): 34.
+    expect(turn).toHaveLength(34)
+    expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete, with ${turn.length} failed step(s)`)
+    expect(f.lines.filter((line) => line.includes(' delete '))).toEqual([])
     assertNoLeak({ lines: f.lines })
   })
 
-  test('dry run: no agent-director kill or delete (and no clean slate before them), one dry-run line naming cscb_<key>; every other step still runs', async () => {
+  test('dry run: no agent-director kill (its outage state is still forgotten before and after it), one dry-run line naming cscb_<key> and saying the row is kept; every other step still runs', async () => {
     const f = makeFixture({ dryRun: true })
 
     await f.lifecycle.teardown(f.b)
 
     const k = f.b.key
     const full = fullTeardownTrail(f.b, launchPassOf(f, undefined))
-    const firstReset = full.indexOf(`resetOutageState:${k}`)
-    expect(f.trail).toEqual(
-      full.filter((c, i) => c !== `killInstance:${k}` && c !== `deleteInstance:${k}` && i !== firstReset),
-    )
+    expect(f.trail).toEqual(full.filter((c) => c !== `killInstance:${k}`))
     expect(f.lines).toEqual([
       `${teardownPrefix(f.b)}: starting`,
-      `[slack] dry-run: persona teardown of ${renderPersonaRef(f.b.name, k)}: skipping the agent-director kill and delete of ${personaInstanceId(k)}`,
+      `[slack] dry-run: persona teardown of ${renderPersonaRef(f.b.name, k)}: skipping the agent-director kill of ${personaInstanceId(k)}; the row is kept`,
       `${teardownPrefix(f.b)}: complete`,
     ])
   })
@@ -1116,7 +1430,8 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 
   // Rows: the forget that fails (b.jg5 SRJ-1016's notice episodes, SRJ-504's latch, SRJ-207's
   // ErrInvalidFlags hold), its step phrase, and how (no production form returns a promise, but a
-  // rejection is awaited too).
+  // rejection is awaited too). Each runs in the first group and again once the launch in flight
+  // settled; the latch once more after the kill (b.jg5 SRJ-715).
   test.each<['forgetNoticeEpisodes' | 'forgetConflictLatch' | 'forgetInvalidFlagsHold', string, 'throws' | 'rejects']>([
     ['forgetNoticeEpisodes', 'forgetting its notice episodes', 'throws'],
     ['forgetNoticeEpisodes', 'forgetting its notice episodes', 'rejects'],
@@ -1124,7 +1439,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     ['forgetConflictLatch', 'forgetting its latch', 'rejects'],
     ['forgetInvalidFlagsHold', 'forgetting its ErrInvalidFlags hold', 'throws'],
     ['forgetInvalidFlagsHold', 'forgetting its ErrInvalidFlags hold', 'rejects'],
-  ])('b.jg5: %s failing (%s; it %s): its step is logged token-safely by its own phrase, every other step still runs, and the teardown completes with one failed step', async (dep, phrase, how) => {
+  ])('b.jg5: %s failing (%s; it %s): each of its steps is logged token-safely by its own phrase, every other step still runs, and the teardown completes counting each', async (dep, phrase, how) => {
     const f = makeFixture({
       overrides: {
         [dep]: (key: string) => {
@@ -1138,10 +1453,14 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
 
     expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
+    const failedLine = (step: string) => expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: ${step} failed: Error`)}( |$)`))
+    const beforeKill = [failedLine(phrase), failedLine(`${phrase} again, after its launch in flight settled`)]
+    const afterKill = dep === 'forgetConflictLatch' ? [failedLine(`${phrase} once more, after the kill`)] : []
     expect(f.lines.slice(1)).toEqual([
+      ...beforeKill,
       killOutcomeLine(f.b),
-      expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: ${phrase} failed: Error`)}( |$)`)),
-      `${teardownPrefix(f.b)}: complete, with 1 failed step(s)`,
+      ...afterKill,
+      `${teardownPrefix(f.b)}: complete, with ${beforeKill.length + afterKill.length} failed step(s)`,
     ])
     assertNoLeak({ lines: f.lines })
   })
@@ -1188,6 +1507,163 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 })
 
 // ---------------------------------------------------------------------------
+// Persona teardown end to end over the recovery harness (b.jg5 SRJ-715,
+// SRJ-404, SRJ-706, SRJ-305, SRJ-504, SRJ-207, SRJ-1016): the lifecycle's
+// teardown dependencies that act on what the harness owns are its
+// `teardownDeps()`, bound as main() binds them (the real approver and
+// sequence stops, retry controller, latch, hold, notice episodes, outage
+// state and the bounded-retry kill on the harness's kill-retry clock); the
+// rest are the fixture's recorders. Apply step 1 has already dropped P from
+// the applied set (`h.remove`), as for a removed persona.
+// ---------------------------------------------------------------------------
+
+describe('persona teardown end to end over the recovery harness (b.jg5 SRJ-715): nothing the server runs for the key is left, the row is kept, and the other persona keeps its own', () => {
+  /** A recovery harness for one case, checked for leaks and cleaned up after it. */
+  function harness(): RecoveryHarness {
+    const h = makeRecoveryHarness()
+    cleanups.push(() => {
+      try {
+        assertNoLeak(h.captured())
+      } finally {
+        h.cleanup()
+      }
+    })
+    return h
+  }
+
+  /** What is left for `key`, each read through its own module's query. */
+  function leftFor(h: RecoveryHarness, key: string) {
+    return {
+      approver: h.approverRunning(key),
+      sequence: h.sequenceRunning(key),
+      retryTimer: h.controller.isArmed(key),
+      latched: h.latch.isLatched(key),
+      held: h.invalidFlagsHold.isHeld(key),
+      openEpisodes: PERSONA_EPISODE_KINDS.filter((kind) => h.episodes.isOpen(key, kind)),
+    }
+  }
+
+  const NOTHING_LEFT: ReturnType<typeof leftFor> = { approver: false, sequence: false, retryTimer: false, latched: false, held: false, openEpisodes: [] }
+
+  // Rows: what P holds when its teardown is submitted, set through the real
+  // route where one exists (a launch, the sequence's start entry, a CONFLICT
+  // at P's spawn, an ErrInvalidFlags at P's reuse), and what that leaves
+  // standing for P just before the teardown.
+  test.each<[string, (h: RecoveryHarness, p: string) => Promise<void>, Partial<ReturnType<typeof leftFor>>]>([
+    [
+      'its dialog approver between laps after a launch, an armed retry timer and an open episode of every kind',
+      async (h, p) => {
+        // A row read pending: the approver's first lap finds no dialog and it sleeps until its next lap.
+        h.script({ statusResult: cannedStatusResult({ state: 'pending' }) })
+        expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
+        await h.settle()
+        h.controller.arm(p, { kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE })
+        for (const kind of PERSONA_EPISODE_KINDS) h.episodes.begin(p, kind, 'case-1')
+      },
+      { approver: true, retryTimer: true, openEpisodes: [...PERSONA_EPISODE_KINDS] },
+    ],
+    [
+      'a live-row sequence running and an armed retry timer',
+      async (h, p) => {
+        h.startSequence(p, { lastReadState: cannedStatusResult().state })
+        await flush()
+        h.controller.arm(p, { kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE })
+      },
+      { sequence: true, retryTimer: true },
+    ],
+    [
+      'a latch set by a CONFLICT at its spawn, with its CONFLICT episode open',
+      async (h, p) => {
+        h.script({ spawnError: conflictForPersona(p) })
+        expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+        await h.settle()
+        h.script({ spawnError: undefined })
+      },
+      { latched: true, openEpisodes: [PERSONA_EPISODE_KIND_CONFLICT] },
+    ],
+    [
+      'an ErrInvalidFlags hold set by its reuse, with its hold episode open',
+      async (h, p) => {
+        await holdThroughReuse(h, p)
+        await h.settle()
+      },
+      { held: true, openEpisodes: [PERSONA_EPISODE_KIND_INVALID_FLAGS_HOLD] },
+    ],
+  ])('P holding %s: once its teardown completes, no approver, live-row sequence, retry timer, latch, hold or notice episode is left for P; its row was killed once by the teardown and never deleted; Q\'s armed timer and open episode stay', async (_label, setUp, before) => {
+    const h = harness()
+    const [p, q] = h.keys as [string, string]
+    await setUp(h, p)
+    expect(leftFor(h, p)).toEqual({ ...NOTHING_LEFT, ...before })
+    h.controller.arm(q, { kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE })
+    h.episodes.begin(q, PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE, 'case-1')
+    const qDue = h.controller.view(q)!.dueAt
+    const killsBefore = h.stub.calls.killCalls.length
+    h.remove(p) // apply step 1
+    const f = makeFixture({ overrides: h.teardownDeps() })
+
+    await h.driveSequence(h.drive(f.lifecycle.teardown(personaOf(h, p))))
+    await h.settle()
+
+    expect(leftFor(h, p)).toEqual(NOTHING_LEFT)
+    // The row is kept: the teardown's one kill of P's row, and no delete at all.
+    expect(h.stub.calls.killCalls.slice(killsBefore)).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+    expect(h.stub.calls.deleteCalls).toEqual([])
+    const ref = personaOf(h, p)
+    expect(f.lines[0]).toBe(`${teardownPrefix(ref)}: starting`)
+    expect(f.lines.filter((line) => line.startsWith(`${teardownPrefix(ref)}: agent-director kill of ${personaInstanceId(p)}`))).toEqual([
+      expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(ref)}: agent-director kill of ${personaInstanceId(p)}: `)}.* after 1 kill\\(s\\); the row is kept \\(b\\.jg5 SRJ-715\\)$`)),
+    ])
+    expect(f.lines.at(-1)).toBe(`${teardownPrefix(ref)}: complete`)
+    // Q keeps its own.
+    expect(h.controller.armedKeys()).toEqual([q])
+    expect(h.controller.view(q)!.dueAt).toBe(qDue)
+    expect(h.episodes.isOpen(q, PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE)).toBe(true)
+    h.controller.stop(q, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
+  })
+
+  // b.jg5 SRJ-404, SRJ-715: the stop made when the teardown is submitted,
+  // before its serializer turn, cancels the approver P's launch in flight
+  // would start. The turn is held behind work already queued for P, so only
+  // the submit-time stop has run when the held spawn succeeds.
+  test('the stop at submit cancels the approver P\'s launch in flight would start: with the turn held behind work queued for P, the held spawn succeeds, the launch answers spawned and no approver starts (one not-started line, no approver call); the turn then completes', async () => {
+    const h = harness()
+    const [p] = h.keys as [string]
+    const spawns = holdSpawns(h.stub.client)
+    const launch = h.launch(p)
+    await spawns.entered(personaInstanceId(p))
+    h.remove(p) // apply step 1
+    const f = makeFixture({ overrides: h.teardownDeps() })
+    const ahead = Promise.withResolvers<void>()
+    const queued = f.serializer.run(p, () => ahead.promise)
+
+    const done = f.lifecycle.teardown(personaOf(h, p))
+    await flush()
+    // Only the submit-time stops ran: the turn has not started.
+    expect(f.lines).toEqual([])
+    const before = callCounts(h)
+
+    spawns.release(personaInstanceId(p))
+    expect(await launch).toStrictEqual({ key: p, action: 'spawned' })
+    await h.settle()
+
+    expect(h.approverRunning(p)).toBe(false)
+    expect(await _whenDialogApproverStopped(p)).toBeUndefined()
+    // No approver call followed the spawn.
+    expect(callCountsSince(callCounts(h), before)).toEqual({})
+    expect(h.errors.filter((line) => line.startsWith(APPROVER_LOG_PREFIX))).toEqual([
+      approverLogLine(approverNotStartedMessage(renderPersonaRef(personaOf(h, p).name, p), APPROVER_STOP_TEARDOWN)),
+    ])
+    expect(await settled(done)).toBe(false)
+
+    ahead.resolve()
+    await queued
+    await h.drive(done)
+    expect(f.lines.at(-1)).toBe(`${teardownPrefix(personaOf(h, p))}: complete`)
+    expect(h.approverRunning(p)).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Persona teardown of a key still applied: the old half of a destructive
 // modify (b.av2 SR-8.6, a credentials_file path or working_directory change).
 // ---------------------------------------------------------------------------
@@ -1229,7 +1705,7 @@ describe('persona teardown of a key still applied (the old half of a destructive
     expect(f.submitted).toEqual([f.b.key])
   })
 
-  test('dry run, B still applied: the early cancels and the second notice drop still run; only the kill and delete (and the clean slate before them) are skipped', async () => {
+  test('dry run, B still applied: the early cancels and the second notice drop still run; only the kill is skipped', async () => {
     const f = makeFixture({ dryRun: true })
     f.applied.push(f.b)
 
@@ -1237,11 +1713,7 @@ describe('persona teardown of a key still applied (the old half of a destructive
 
     const k = f.b.key
     const launchPass = `${JSON.stringify([f.b.claude_config_dir, undefined])}:[${f.a.key},${k}]`
-    const trail = stillAppliedTeardownTrail(f.b, launchPass)
-    const firstReset = trail.indexOf(`resetOutageState:${k}`)
-    expect(f.trail).toEqual(
-      trail.filter((c, i) => c !== `killInstance:${k}` && c !== `deleteInstance:${k}` && i !== firstReset),
-    )
+    expect(f.trail).toEqual(stillAppliedTeardownTrail(f.b, launchPass).filter((c) => c !== `killInstance:${k}`))
   })
 
   // Rows: the early cancel that fails, its step phrase, and whether it throws or returns a rejected promise.
@@ -1513,7 +1985,7 @@ describe('persona teardown over the real latch (b.jg5 SRJ-504, SRJ-1002): the ke
     expect(r.posts.slice(postsBefore)).toEqual([bNotice])
   })
 
-  test('dry run: B\'s latch and CONFLICT episode are still forgotten silently (only the agent-director kill and delete are skipped)', async () => {
+  test('dry run: B\'s latch and CONFLICT episode are still forgotten silently (only the agent-director kill is skipped)', async () => {
     const r = makeLatched({ dryRun: true })
     r.latch.set(r.f.b.key, LEFTOVER)
     const postsBefore = r.posts.length
@@ -1660,36 +2132,59 @@ describe('persona teardown over the real ErrInvalidFlags hold (b.jg5 SRJ-207, SR
 })
 
 // ---------------------------------------------------------------------------
-// Persona teardown with the real agent-director calls, outage state,
-// notifier and destination hold: no wind-down, no flag and no notice left.
+// Persona teardown with the real agent-director kill, outage state, notifier,
+// destination hold and kill-failure alerts (b.jg5 SRJ-715, SRJ-110, SRJ-702,
+// SRJ-704): no wind-down, no delete (the row is kept, HO C16), no flag, no
+// latch, no retry timer and no Slack post left.
 // ---------------------------------------------------------------------------
 
-describe('persona teardown (SR-6.5) over the real kill and delete, outage state, notifier and destination hold', () => {
+describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry kill, outage state, notifier, destination hold and kill-failure alerts: no delete, the row kept', () => {
   interface RealFixture {
     f: Fixture
     h: NotifierHarness
     calls: ReturnType<typeof makeStubCallLog>
-    /** Agent-director verbs in call order, with the instance they name. */
+    /** Agent-director verbs in call order, with the instance they name (`kill`, `status`, `delete`). */
     adOrder: string[]
     /** Every outage notify call (onsets and all-clears), by key. */
     emissions: Array<{ key: string; text: string }>
+    /** The kill retry's clock: its waits between tries, driven by `tearDown`. */
+    killClock: FakeClock
+    /** Every wait between tries the kill retry asked for, in ms, in order. */
+    killWaits: number[]
+    /** What the kill-failure alerts' episodes posted (their Slack route), in order. */
+    alertPosts: Array<{ key: string; text: string }>
+    /** Every call of the kill-failure alerts' log-only route, in order. */
+    logOnly: Array<{ classLabel: string; entry: string }>
+    /** The kill-failure alerts' own lines. */
+    alertLines: string[]
+    /** Every retry arm and every unclassified report the outage state sent, and every tmux-unresponsive start, by key. */
+    arms: string[]
+    reports: string[]
+    conditionStarts: string[]
+    /** The startup-errors.log entries written under the test's temp directory, each from its class on (`[<class>] <entry>`). */
+    startupEntries(): string[]
   }
 
   /**
    * B already left the applied set (apply step 1): the notifier harness's
-   * persona list no longer has it. Outage notices go through the real
-   * notifier. `kill` / `delete` script the stub's errors; `triggerSink` is
-   * the outage state's retry trigger sink (none by default) and `overrides`
-   * replace further lifecycle dependencies.
+   * persona list no longer has it (`removeB`). Outage notices go through the
+   * real notifier. As `main()` binds them: the teardown's kill is
+   * `killPersonaInstanceForTeardown` (here on `killClock`, a fake clock), and
+   * its alert raiser the real kill-failure alerts over real notice episodes
+   * with the context 'persona teardown', their log-only route
+   * `recordStartupError` into the test's temp directory. `kill*` and
+   * `status*` script the stub; the outage state's trigger, unclassified and
+   * condition sinks record; `overrides` replace further lifecycle
+   * dependencies.
    */
   function makeReal(opts: {
     killError?: Error
     killResult?: Phase1KillResult
-    deleteError?: Error
+    killQueue?: CannedResponse<Phase1KillResult>[]
+    statusResult?: Phase1StatusResult
+    statusQueue?: CannedResponse<Phase1StatusResult>[]
     post?: Record<string, readonly WebApiOutcome[]>
     triggerSink?: UnavailableRetryController
-    /** The outage state's unclassified-error sink (none by default). */
-    unclassifiedSink?: { report: (key: string, error: unknown) => void }
     overrides?: (f: () => Fixture) => Partial<PersonaLifecycleDeps>
   } = {}): RealFixture {
     const config = makeConfig()
@@ -1697,27 +2192,61 @@ describe('persona teardown (SR-6.5) over the real kill and delete, outage state,
     cleanups.push(() => h.hold.cancelAll())
     const calls = makeStubCallLog()
     const adOrder: string[] = []
-    const stub = makeStubClient({ ...calls, killError: opts.killError, killResult: opts.killResult, deleteError: opts.deleteError })
+    const stub = makeStubClient({
+      ...calls,
+      killError: opts.killError,
+      killResult: opts.killResult,
+      killQueue: opts.killQueue,
+      statusResult: opts.statusResult,
+      statusQueue: opts.statusQueue,
+    })
     const kill = stub.kill.bind(stub)
+    const status = stub.status.bind(stub)
     const del = stub.delete.bind(stub)
     stub.kill = (p) => { adOrder.push(`kill:${p.claude_instance_id}`); return kill(p) }
+    stub.status = (p) => { adOrder.push(`status:${p.claude_instance_id}`); return status(p) }
     stub.delete = (p) => { adOrder.push(`delete:${p.claude_instance_id.join(',')}`); return del(p) }
     setClientForTests(stub as unknown as Parameters<typeof setClientForTests>[0])
     const emissions: Array<{ key: string; text: string }> = []
+    const arms: string[] = []
+    const reports: string[] = []
+    const conditionStarts: string[] = []
     initOutageState({
       getClient,
       notify: (key, text) => {
         emissions.push({ key, text })
         void h.notifier.notify(key, text)
       },
-      ...(opts.triggerSink !== undefined ? { triggerSink: opts.triggerSink } : {}),
-      ...(opts.unclassifiedSink !== undefined ? { unclassifiedSink: opts.unclassifiedSink } : {}),
+      triggerSink: opts.triggerSink ?? ({ arm: (key: string) => { arms.push(key); return true } } as unknown as UnavailableRetryController),
+      unclassifiedSink: { report: (key) => void reports.push(key) },
+      conditionSink: { start: (key) => void conditionStarts.push(key), end: () => undefined },
+    })
+    const killClock = createFakeClock()
+    const killWaits: number[] = []
+    const alertPosts: RealFixture['alertPosts'] = []
+    const logOnly: RealFixture['logOnly'] = []
+    const alertLines: string[] = []
+    const episodesClock = createFakeClock()
+    const episodes = createPersonaEpisodes({ sink: (key, text) => void alertPosts.push({ key, text }), log: (line) => void alertLines.push(line), clock: episodesClock })
+    const logDir = join(dir, 'state')
+    const alerts = createKillFailureAlerts({
+      episodes,
+      log: (line) => void alertLines.push(line),
+      isConfigured: (key) => f.applied.some((p) => p.key === key),
+      logOnly: (classLabel, entry) => {
+        logOnly.push({ classLabel, entry })
+        recordStartupError(classLabel, entry, undefined, { logDir })
+      },
+    })
+    cleanups.push(() => {
+      expect(killClock.pendingCount()).toBe(0)
+      expect(episodesClock.pendingCount()).toBe(0)
     })
     const f: Fixture = makeFixture({
       overrides: {
-        // As server.ts binds it: the teardown's kill context (b.jg5 SRJ-110).
-        killInstance: (key) => killPersonaInstance(key, { context: KILL_CONTEXT_TEARDOWN }),
-        deleteInstance: deletePersonaInstance,
+        killInstance: (key) => killPersonaInstanceForTeardown(key, { clock: killClock }),
+        raiseKillFailureAlert: (key, decision) =>
+          alerts.raise({ key, decision, latched: false, context: KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN }),
         resetOutageState: resetAllToHealthy,
         notifier: h.notifier,
         destinations: h.destinations,
@@ -1725,7 +2254,12 @@ describe('persona teardown (SR-6.5) over the real kill and delete, outage state,
         ...opts.overrides?.(() => f),
       },
     })
-    return { f, h, calls, adOrder, emissions }
+    const startupEntries = (): string[] => {
+      const path = join(logDir, 'startup-errors.log')
+      if (!existsSync(path)) return []
+      return readFileSync(path, 'utf-8').split('\n').filter((line) => line !== '').map((line) => line.slice(line.indexOf('] [') + 2))
+    }
+    return { f, h, calls, adOrder, emissions, killClock, killWaits, alertPosts, logOnly, alertLines, arms, reports, conditionStarts, startupEntries }
   }
 
   /** Step 1 of the apply: B leaves the applied set the notifier reads. */
@@ -1734,39 +2268,47 @@ describe('persona teardown (SR-6.5) over the real kill and delete, outage state,
     r.h.personas.splice(i, 1)
   }
 
-  test('AC 57: B\'s row is killed then deleted, cscb_B only, and no other agent-director verb is called (no graceful wind-down); A\'s outage flag is untouched', async () => {
-    const r = makeReal()
-    setOutageFlag(r.f.a.key, 'ad-unreachable', '/bin/ad')
-    removeB(r)
-    const before = r.emissions.length
+  /**
+   * Tear `p` down and drive the kill's tries on `r.killClock` to the
+   * teardown's end: each wait between tries is recorded in `r.killWaits` and
+   * fired as it is set; no wait is left pending.
+   */
+  async function tearDown(r: RealFixture, p: Persona): Promise<void> {
+    const done = r.f.lifecycle.teardown(p)
+    let finished = false
+    void done.then(() => {
+      finished = true
+    })
+    for (let steps = 0; !finished; steps++) {
+      if (steps > 1_000) throw new Error('the teardown did not settle')
+      await r.killClock.flush()
+      if (finished || r.killClock.pendingCount() === 0) continue
+      r.killWaits.push(...r.killClock.pending().map((timer) => timer.delayMs))
+      await r.killClock.runNext()
+    }
+    await done
+    expect(r.killClock.pendingCount()).toBe(0)
+  }
 
-    await r.f.lifecycle.teardown(r.f.b)
+  /** The kills the teardown's bounded retry makes for `err` answered at every try: `KILL_RETRY_TRIES` for UNAVAILABLE, else one (b.jg5 SRJ-702). */
+  function triesFor(err: Error): number {
+    const outcome = killOutcomeOf({ thrown: err })
+    return outcome.kind === KILL_OUTCOME_NOT_KILLED && outcome.errorClass === AD_ERROR_CLASS_UNAVAILABLE ? KILL_RETRY_TRIES : 1
+  }
 
-    const id = personaInstanceId(r.f.b.key)
-    expect(r.adOrder).toEqual([`kill:${id}`, `delete:${id}`])
-    expect(stubCallCount(r.calls)).toBe(2)
-    expect([...getOutageFlags(r.f.a.key)]).toEqual(['ad-unreachable'])
-    expect(r.emissions.slice(before)).toEqual([])
-    expect(r.f.lines).toEqual(cleanTeardownLines(r.f.b, { kind: KILL_OUTCOME_KILLED }))
-    expect(r.h.totalPosts()).toBe(1) // A's onset, posted before the teardown
-    expect(r.h.posts(r.f.b.key)).toEqual([])
-  })
+  /** `tries` kills of `id`, with one `status` read of it before each further try. */
+  function killsAndReads(id: string, tries: number): string[] {
+    return Array.from({ length: tries }, (_, i) => (i === 0 ? [`kill:${id}`] : [`status:${id}`, `kill:${id}`])).flat()
+  }
 
-  test('B held an ad-unreachable flag and the kill and delete succeed: no all-clear is raised or posted, and B holds no flag afterwards', async () => {
-    const r = makeReal()
-    setOutageFlag(r.f.b.key, 'ad-unreachable', '/bin/ad')
-    await flush()
-    const postsBefore = r.h.posts(r.f.b.key).length
-    removeB(r)
-    const before = r.emissions.length
-
-    await r.f.lifecycle.teardown(r.f.b)
-    await flush()
-
-    expect(r.emissions.slice(before)).toEqual([])
-    expect([...getOutageFlags(r.f.b.key)]).toEqual([])
-    expect(r.h.posts(r.f.b.key)).toHaveLength(postsBefore)
-  })
+  /** The recorded steps after the kill for `p`, a removed key (the real resets and notifier drop record nothing). */
+  function stepsAfterKill(f: Fixture, p: Persona): string[] {
+    const k = p.key
+    return [
+      `stopRetryTimer:${k}`, `forgetFailures:${k}`, `forgetDisconnectedStreak:${k}`, `forgetNotConnectedEpisode:${k}`, `forgetConflictLatch:${k}`,
+      `replyGuard.launchedWithDir:${k}`, `replyGuard.teardown:${k}`, `replyGuard.launchPass:${launchPassOf(f, undefined)}`,
+    ]
+  }
 
   /**
    * The server's latch installed for the case, with `configured` as the
@@ -1784,30 +2326,76 @@ describe('persona teardown (SR-6.5) over the real kill and delete, outage state,
     return latch
   }
 
-  /** The teardown's kill-step failure line for `p` whose kill answered `err`, from its outcome (b.jg5 SRJ-701). */
-  function killFailedLine(p: Persona, err: Error): string {
-    return `${teardownPrefix(p)}: agent-director kill of ${personaInstanceId(p.key)} failed: ${describeKillOutcome(killOutcomeOf({ thrown: err }))}`
+  /** The class of the persona-teardown route's ordinary entry, from the kill-failure alert's route selection (b.jg5 SRJ-704, SRJ-1013). */
+  function teardownNoticeClass(): string {
+    return selectKillFailureAlertRoute({
+      version: KILL_FAILURE_VERSION_ORDINARY,
+      context: KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN,
+      configured: false,
+      latched: false,
+    }).classLabel!
   }
 
-  test('b.jg5 SRJ-701: agent-director unreachable: the kill fails and is logged, no delete is made, the other steps run, B holds no flag afterwards, and the onset raised for B is never posted or held', async () => {
-    const unreachable = new ErrSystemInstallDisappeared('kill', `/opt/ad/${fakeToken(BOT_TOKEN_PREFIX, 'bin')}`)
-    const r = makeReal({ killError: unreachable, deleteError: unreachable })
-    removeB(r)
+  /** Nothing was armed, reported, started or posted for the teardown's kill, and no delete was made. */
+  function expectNothingArmedOrDeleted(r: RealFixture): void {
+    expect(r.calls.deleteCalls).toEqual([])
+    expect(r.adOrder.filter((call) => call.startsWith('delete:'))).toEqual([])
+    expect(r.arms).toEqual([])
+    expect(r.reports).toEqual([])
+    expect(r.conditionStarts).toEqual([])
+    expect(r.alertPosts).toEqual([])
+    expect(r.h.totalPosts()).toBe(0)
+  }
 
-    await r.f.lifecycle.teardown(r.f.b)
-    await flush()
+  test('AC 57: B\'s row is killed, cscb_B only, and no other agent-director verb is called (no graceful wind-down, no delete: the row is kept); A\'s outage flag is untouched', async () => {
+    const r = makeReal()
+    setOutageFlag(r.f.a.key, 'ad-unreachable', '/bin/ad')
+    removeB(r)
+    const before = r.emissions.length
+
+    await tearDown(r, r.f.b)
 
     const id = personaInstanceId(r.f.b.key)
     expect(r.adOrder).toEqual([`kill:${id}`])
-    expect(r.f.trail.slice(-9)).toEqual([
-      `forgetFailures:${r.f.b.key}`, `forgetDisconnectedStreak:${r.f.b.key}`, `forgetNotConnectedEpisode:${r.f.b.key}`,
-      `forgetConflictLatch:${r.f.b.key}`, `forgetInvalidFlagsHold:${r.f.b.key}`, `forgetNoticeEpisodes:${r.f.b.key}`,
-      `replyGuard.launchedWithDir:${r.f.b.key}`, `replyGuard.teardown:${r.f.b.key}`,
-      `replyGuard.launchPass:${launchPassOf(r.f, undefined)}`,
-    ])
+    expect(stubCallCount(r.calls)).toBe(1)
+    expect(r.killWaits).toEqual([])
+    expect([...getOutageFlags(r.f.a.key)]).toEqual(['ad-unreachable'])
+    expect(r.emissions.slice(before)).toEqual([])
+    expect(r.f.lines).toEqual(cleanTeardownLines(r.f.b, { kind: KILL_OUTCOME_KILLED }))
+    expect(r.h.totalPosts()).toBe(1) // A's onset, posted before the teardown
+    expect(r.h.posts(r.f.b.key)).toEqual([])
+    expect(r.logOnly).toEqual([])
+  })
+
+  test('B held an ad-unreachable flag and the kill succeeds: no all-clear is raised or posted, and B holds no flag afterwards', async () => {
+    const r = makeReal()
+    setOutageFlag(r.f.b.key, 'ad-unreachable', '/bin/ad')
+    await flush()
+    const postsBefore = r.h.posts(r.f.b.key).length
+    removeB(r)
+    const before = r.emissions.length
+
+    await tearDown(r, r.f.b)
+    await flush()
+
+    expect(r.emissions.slice(before)).toEqual([])
+    expect([...getOutageFlags(r.f.b.key)]).toEqual([])
+    expect(r.h.posts(r.f.b.key)).toHaveLength(postsBefore)
+  })
+
+  test('b.jg5 SRJ-715: agent-director unreachable: the kill fails (one try: not UNAVAILABLE) and is logged, no delete is made, the other steps run, B holds no flag afterwards, and the onset raised for B is never posted or held', async () => {
+    const unreachable = new ErrSystemInstallDisappeared('kill', `/opt/ad/${fakeToken(BOT_TOKEN_PREFIX, 'bin')}`)
+    const r = makeReal({ killError: unreachable })
+    removeB(r)
+
+    await tearDown(r, r.f.b)
+    await flush()
+
+    const id = personaInstanceId(r.f.b.key)
+    expect(r.adOrder).toEqual(killsAndReads(id, triesFor(unreachable)))
+    expect(r.f.trail.slice(-8)).toEqual(stepsAfterKill(r.f, r.f.b))
     expect(r.f.lines.slice(1)).toEqual([
-      killFailedLine(r.f.b, unreachable),
-      deleteNotMadeLine(r.f.b),
+      killFailedLine(r.f.b, killOutcomeOf({ thrown: unreachable }), triesFor(unreachable)),
       `${teardownPrefix(r.f.b)}: complete, with 1 failed step(s)`,
     ])
     expect(r.f.lines[1]).toContain(`class=${AD_ERROR_CLASS_UNCLASSIFIED}`)
@@ -1816,12 +2404,13 @@ describe('persona teardown (SR-6.5) over the real kill and delete, outage state,
     expect(r.emissions.map((e) => e.key)).toEqual([r.f.b.key])
     expect(r.h.totalPosts()).toBe(0)
     expect(r.h.hold.view(r.f.b.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
-    assertNoLeak({ lines: r.f.lines, logs: r.h.logs })
+    expectNothingArmedOrDeleted(r)
+    assertNoLeak({ lines: r.f.lines, logs: r.h.logs, killLines: consoleLines() })
   })
 
-  // b.jg5 SRJ-701, SRJ-703: a success (`kill_sent` true, false or absent) and
-  // `ErrSpawnNotFound` pass the kill step, and the delete runs; `kill_sent:
-  // false` raises nothing.
+  // b.jg5 SRJ-715, SRJ-701, SRJ-703, SRJ-104: a success (`kill_sent` true,
+  // false or absent), `ErrSpawnNotFound` and GONE end the kill step at the
+  // first try with its outcome line; no delete follows, nothing is raised.
   test.each<[string, { killResult?: Phase1KillResult; killError?: Error }, KillOutcome]>([
     ['kill_sent true', { killResult: cannedKillResult(true) }, { kind: KILL_OUTCOME_KILLED, killSent: true }],
     ['kill_sent false', { killResult: cannedKillResult(false) }, { kind: KILL_OUTCOME_KILLED, killSent: false }],
@@ -1829,103 +2418,162 @@ describe('persona teardown (SR-6.5) over the real kill and delete, outage state,
     // b.jg5 SRJ-104, SRJ-110: for `kill`, gone is success.
     ['GONE (ErrTmuxCaptureFailed), the session-gone success', { killError: errTmuxCaptureFailed(undefined, 'kill') }, { kind: KILL_OUTCOME_SESSION_GONE, name: errTmuxCaptureFailed().errName }],
     ['GONE (ErrTmuxSendKeys), the session-gone success', { killError: errTmuxSendKeys() }, { kind: KILL_OUTCOME_SESSION_GONE, name: errTmuxSendKeys().errName }],
-  ])('b.jg5 SRJ-701, SRJ-703, SRJ-104: the kill succeeds with %s: the kill step passes with its outcome line, the delete runs, nothing is raised or posted', async (_label, kill, outcome) => {
+  ])('b.jg5 SRJ-715, SRJ-701, SRJ-104: the kill succeeds with %s: one try, the kill step passes with its outcome line, no delete is made, nothing is raised or posted', async (_label, kill, outcome) => {
     const r = makeReal(kill)
     removeB(r)
 
-    await r.f.lifecycle.teardown(r.f.b)
+    await tearDown(r, r.f.b)
     await flush()
 
-    const id = personaInstanceId(r.f.b.key)
-    expect(r.adOrder).toEqual([`kill:${id}`, `delete:${id}`])
+    expect(r.adOrder).toEqual([`kill:${personaInstanceId(r.f.b.key)}`])
     expect(r.f.lines).toEqual(cleanTeardownLines(r.f.b, outcome))
     expect(r.emissions).toEqual([])
-    expect(r.h.totalPosts()).toBe(0)
+    expect(r.logOnly).toEqual([])
+    expectNothingArmedOrDeleted(r)
   })
 
-  test('the row is already gone (ErrSpawnNotFound on both): success, no failed step', async () => {
-    const r = makeReal({ killError: errSpawnNotFound(), deleteError: errSpawnNotFound() })
-    removeB(r)
-
-    await r.f.lifecycle.teardown(r.f.b)
-
-    const id = personaInstanceId(r.f.b.key)
-    expect(r.adOrder).toEqual([`kill:${id}`, `delete:${id}`])
-    expect(r.f.lines).toEqual(cleanTeardownLines(r.f.b, { kind: KILL_OUTCOME_ROW_GONE }))
-    expect(r.emissions).toEqual([])
-    expect(r.h.totalPosts()).toBe(0)
-  })
-
-  test('the delete fails with another error: logged after the kill\'s outcome line', async () => {
-    const r = makeReal({ deleteError: errGeneric('delete', 'ErrDeleteBroken') })
-    removeB(r)
-
-    await r.f.lifecycle.teardown(r.f.b)
-
-    const id = personaInstanceId(r.f.b.key)
-    expect(r.adOrder).toEqual([`kill:${id}`, `delete:${id}`])
-    expect(r.f.lines.slice(1)).toEqual([
-      killOutcomeLine(r.f.b, { kind: KILL_OUTCOME_KILLED }),
-      expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(r.f.b)}: agent-director delete of ${id} failed: AgentDirectorError`)}`)),
-      `${teardownPrefix(r.f.b)}: complete, with 1 failed step(s)`,
-    ])
-    expect(r.emissions).toEqual([])
-    expect(r.h.totalPosts()).toBe(0)
-  })
-
-  // b.jg5 SRJ-110, SRJ-701: a kill that does not succeed fails the kill
-  // step with the teardown's failure line naming the outcome, makes no
-  // delete (the row is kept) and latches nothing, even with the server's
-  // latch installed and B configured (SRJ-1002 routes it; E25 owns the
-  // route); the teardown's other steps still run. Reverses "the kill fails
-  // with another error: logged, and the delete still runs".
-  test.each<[string, () => Error]>([
-    ['ErrTmuxKillFailed', () => errTmuxKillFailed()],
-    ['ErrTmuxUnresponsive', () => errTmuxUnresponsive('kill')],
-    ['ErrTmuxSessionConflict (not this launch\'s session)', () => errTmuxSessionConflict('kill', 'not-this-launch')],
-    ['an UNUSABLE NAME ErrInternal', () => errUnusableName()],
-    ['an unreachable error (a plain Error)', () => new Error(`agent-director went away (${sentinelInMessage('teardown-kill')})`)],
-    ['another error (ErrKillBroken)', () => errGeneric('kill', 'ErrKillBroken')],
-  ])('b.jg5 SRJ-110, SRJ-701: the kill answers %s: the kill step fails with its line, no delete is made, nothing latches, every other step still runs', async (_label, make) => {
+  // b.jg5 SRJ-715 (HO C16 Verify, AC 77), SRJ-110, SRJ-702, SRJ-1002: each
+  // of HO C2's non-success classes at every try of the teardown's kill, over
+  // the real kill on the fake clock: UNAVAILABLE gets KILL_RETRY_TRIES tries
+  // KILL_RETRY_SPACING_MS apart with one `status` read of the row before
+  // each further try, every other class one try (a CONFLICT is never tried
+  // again). The kill step fails with its line; no delete is made, so the row
+  // is kept; nothing latches, even with the server's latch installed and B
+  // configured; no retry timer is armed, nothing is reported and no
+  // tmux-unresponsive condition starts, even with the teardown run inside a
+  // recovery attempt for B (an attempt-context kill would arm); the later
+  // steps still run. Only ErrTmuxKillFailed calls for an alert (the ordinary
+  // version, on the persona-teardown route, below).
+  test.each<[string, () => Error, boolean]>([
+    ['ErrTmuxKillFailed', () => errTmuxKillFailed(), true],
+    ['ErrTmuxUnresponsive', () => errTmuxUnresponsive('kill'), false],
+    ['ErrTmuxSessionConflict (not this launch\'s session)', () => errTmuxSessionConflict('kill', 'not-this-launch'), false],
+    ['ErrTmuxNotAvailable', () => errTmuxNotAvailable(undefined, 'kill'), false],
+    ['ErrInternal', () => errInternal(), false],
+    ['ErrUnknownErrorName', () => errUnknownErrorName(), false],
+    ['ErrCallTimeout', () => errCallTimeout('kill'), false],
+    ['an UNUSABLE NAME ErrInternal', () => errUnusableName(), false],
+    ['an unreachable error (a plain Error)', () => new Error(`agent-director went away (${sentinelInMessage('teardown-kill')})`), false],
+    ['another error (ErrKillBroken)', () => errGeneric('kill', 'ErrKillBroken'), false],
+  ])('b.jg5 SRJ-715, SRJ-110: the kill answers %s at every try: its tries are made on the fake clock, the kill step fails with its line, no delete is made (the row is kept), nothing latches, arms or starts, and every other step still runs', async (_label, make, alerts) => {
     const err = make()
     const latch = installLatch(() => true)
     const r = makeReal({ killError: err })
     removeB(r)
 
-    await r.f.lifecycle.teardown(r.f.b)
+    await runInAttempt(r.f.b.key, 'recovery', () => tearDown(r, r.f.b))
     await flush()
 
     const id = personaInstanceId(r.f.b.key)
-    expect(r.adOrder).toEqual([`kill:${id}`])
-    expect(stubCallCount(r.calls)).toBe(1)
-    // The steps after the agent-director calls still ran.
-    expect(r.f.trail.slice(-9)).toEqual([
-      `forgetFailures:${r.f.b.key}`, `forgetDisconnectedStreak:${r.f.b.key}`, `forgetNotConnectedEpisode:${r.f.b.key}`,
-      `forgetConflictLatch:${r.f.b.key}`, `forgetInvalidFlagsHold:${r.f.b.key}`, `forgetNoticeEpisodes:${r.f.b.key}`,
-      `replyGuard.launchedWithDir:${r.f.b.key}`, `replyGuard.teardown:${r.f.b.key}`,
-      `replyGuard.launchPass:${launchPassOf(r.f, undefined)}`,
-    ])
+    const tries = triesFor(err)
+    expect(r.adOrder).toEqual(killsAndReads(id, tries))
+    expect(stubCallCount(r.calls)).toBe(2 * tries - 1)
+    expect(r.killWaits).toEqual(Array.from({ length: tries - 1 }, () => KILL_RETRY_SPACING_MS))
+    expect(r.f.trail.slice(-8)).toEqual(stepsAfterKill(r.f, r.f.b))
     expect(r.f.lines.slice(1)).toEqual([
-      killFailedLine(r.f.b, err),
-      deleteNotMadeLine(r.f.b),
+      killFailedLine(r.f.b, killOutcomeOf({ thrown: err }), tries),
       `${teardownPrefix(r.f.b)}: complete, with 1 failed step(s)`,
     ])
     expect(latch.isLatched(r.f.b.key)).toBe(false)
-    expect(r.h.totalPosts()).toBe(0)
-    assertNoLeak({ lines: r.f.lines, logs: r.h.logs })
+    expect(r.logOnly.map((e) => e.classLabel)).toEqual(alerts ? [teardownNoticeClass()] : [])
+    expectNothingArmedOrDeleted(r)
+    assertNoLeak({ lines: r.f.lines, logs: r.h.logs, alertLines: r.alertLines, entries: r.startupEntries(), killLines: consoleLines() })
   })
 
-  test('b.jg5 SRJ-701: the old half of a destructive modify (B still applied, its connection stopped) with agent-director unreachable: the onset its failing kill raises is held for B, then dropped after the agent-director call, so B\'s new half, once validated and flushed, posts nothing; no delete is made', async () => {
+  // b.jg5 SRJ-513 bullet 2, SRJ-715, SRJ-1002: a destructive
+  // modify's old half whose row reads `pending` with no launch start still
+  // gets the ordinary checked kill (SRJ-316's no-kill-of-a-pending-row rule
+  // does not hold it back), and the reads between its tries latch nothing.
+  test('b.jg5 SRJ-513, SRJ-715: B still applied, its row read pending with no launch start: the kill is made, an UNAVAILABLE first try is tried again after a read of that row, the second try\'s success ends the step; nothing latches, nothing is armed and no delete is made', async () => {
+    const latch = installLatch(() => true)
+    const r = makeReal({
+      killQueue: [cannedErr(errTmuxUnresponsive('kill')), cannedOk(cannedKillResult(true))],
+      statusResult: cannedStatusResult({ state: 'pending', launch_started_at: SAMPLE_LAUNCH_START_NONE }),
+    })
+    r.f.applied.push(r.f.b) // B keeps its key applied until step 6 brings its new declaration up
+
+    await tearDown(r, r.f.b)
+    await flush()
+
+    const id = personaInstanceId(r.f.b.key)
+    expect(r.adOrder).toEqual(killsAndReads(id, 2))
+    expect(r.killWaits).toEqual([KILL_RETRY_SPACING_MS])
+    expect(r.f.lines).toEqual(cleanTeardownLines(r.f.b, { kind: KILL_OUTCOME_KILLED, killSent: true }, 2))
+    expect(latch.isLatched(r.f.b.key)).toBe(false)
+    expect(latch.record(r.f.b.key)).toBeUndefined()
+    expect(r.logOnly).toEqual([])
+    expectNothingArmedOrDeleted(r)
+  })
+
+  // b.jg5 SRJ-704, SRJ-702, SRJ-1007, SRJ-1013: the kill's alert on the
+  // persona-teardown route (`src/kill-failure-alert.ts`'s route selection, context 'persona
+  // teardown'), for a removed B and for the old half of a destructive modify
+  // (B still applied, which would otherwise take B's destination route):
+  // the server log and one startup-errors entry of the route's class, its
+  // text that module's builder output; never Slack.
+  test.each<[string, boolean]>([['removed', false], ['still applied (a destructive modify\'s old half)', true]])(
+    'b.jg5 SRJ-704: ErrTmuxKillFailed at every try, B %s: one ordinary alert, one log line and one entry of the persona-teardown route\'s class, its text the ordinary version quoting the last description; nothing posted to Slack',
+    async (_label, stillApplied) => {
+      const err = errTmuxKillFailed()
+      const r = makeReal({ killError: err })
+      if (stillApplied) r.f.applied.push(r.f.b)
+      else removeB(r)
+      const b = r.f.b.key
+
+      await tearDown(r, r.f.b)
+      await flush()
+
+      const classLabel = teardownNoticeClass()
+      expect(classLabel).not.toBe(PERSONA_KILL_FAILED_LABEL)
+      const entry = killFailureRecoveryEntry(b, ordinaryAlertContent(b, { last: err }), KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN)
+      expect(r.logOnly).toEqual([{ classLabel, entry }])
+      expect(r.startupEntries()).toEqual([`[${classLabel}] ${entry}`])
+      expect(r.alertLines.filter((line) => line.includes(`persona=${b} `))).toHaveLength(1)
+      expect(r.adOrder).toEqual(killsAndReads(personaInstanceId(b), KILL_RETRY_TRIES))
+      expect(r.f.lines.slice(1)).toEqual([
+        killFailedLine(r.f.b, killOutcomeOf({ thrown: err }), KILL_RETRY_TRIES),
+        `${teardownPrefix(r.f.b)}: complete, with 1 failed step(s)`,
+      ])
+      expectNothingArmedOrDeleted(r)
+      assertNoLeak({ lines: r.f.lines, alertLines: r.alertLines, entries: r.startupEntries() })
+    },
+  )
+
+  test.each<[string, boolean]>([['removed', false], ['still applied (a destructive modify\'s old half)', true]])(
+    'b.jg5 SRJ-704, SRJ-1013: a survivor-naming ErrTmuxKillFailed, then a success, B %s: one survivor alert, one persona-kill-survivor entry and no persona-teardown route entry; nothing posted to Slack; the kill step passes',
+    async (_label, stillApplied) => {
+      const survivor = errTmuxKillFailed(undefined, 'pane-process-survived')
+      const r = makeReal({ killQueue: [cannedErr(survivor), cannedOk(cannedKillResult(true))] })
+      if (stillApplied) r.f.applied.push(r.f.b)
+      else removeB(r)
+      const b = r.f.b.key
+
+      await tearDown(r, r.f.b)
+      await flush()
+
+      const entry = killFailureRecoveryEntry(b, survivorAlertContent(b, survivor), KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN)
+      expect(r.logOnly).toEqual([{ classLabel: PERSONA_KILL_SURVIVOR_LABEL, entry }])
+      expect(r.startupEntries()).toEqual([`[${PERSONA_KILL_SURVIVOR_LABEL}] ${entry}`])
+      expect(r.startupEntries().filter((line) => line.startsWith(`[${teardownNoticeClass()}]`))).toEqual([])
+      expect(r.adOrder).toEqual(killsAndReads(personaInstanceId(b), 2))
+      expect(r.killWaits).toEqual([KILL_RETRY_SPACING_MS])
+      expect(r.f.lines).toEqual(cleanTeardownLines(r.f.b, { kind: KILL_OUTCOME_KILLED, killSent: true }, 2))
+      expectNothingArmedOrDeleted(r)
+      assertNoLeak({ lines: r.f.lines, alertLines: r.alertLines, entries: r.startupEntries() })
+    },
+  )
+
+  test('b.jg5 SRJ-715: the old half of a destructive modify (B still applied, its connection stopped) with agent-director unreachable: the onset its failing kill raises is held for B, then dropped after the agent-director call, so B\'s new half, once validated and flushed, posts nothing; no delete is made', async () => {
     const unreachable = new ErrSystemInstallDisappeared('kill', '/opt/ad/bin')
-    const r = makeReal({ killError: unreachable, deleteError: unreachable })
+    const r = makeReal({ killError: unreachable })
     const b = r.f.b
     r.f.applied.push(b) // B keeps its key applied until step 6 brings its new declaration up
     r.h.validated.delete(b.key) // its connection is stopped: no validated client, so a notice for it is held
 
-    await r.f.lifecycle.teardown(b)
+    await tearDown(r, b)
     await flush()
     expect(r.emissions.map((e) => e.key)).toEqual([b.key]) // the onset was raised for B
-    expect(r.adOrder).toEqual([`kill:${personaInstanceId(b.key)}`])
+    expect(r.adOrder).toEqual(killsAndReads(personaInstanceId(b.key), triesFor(unreachable)))
 
     // Step 6: B's new half comes up and its held notices are flushed.
     r.h.validate(b.key)
@@ -1936,6 +2584,7 @@ describe('persona teardown (SR-6.5) over the real kill and delete, outage state,
     expect([...getOutageFlags(b.key)]).toEqual([])
     expect(r.h.hold.view(b.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
     expect(r.f.lines.at(-1)).toBe(`${teardownPrefix(b)}: complete, with 1 failed step(s)`)
+    expectNothingArmedOrDeleted(r)
     assertNoLeak({ lines: r.f.lines, logs: r.h.logs })
   })
 
@@ -1943,9 +2592,7 @@ describe('persona teardown (SR-6.5) over the real kill and delete, outage state,
   // recovery attempt, so an ENVIRONMENT or CONFIG answer there arms no retry
   // timer and makes no delete; it raises its outage only while B is in the
   // applied configuration (the configured-persona query), and the
-  // teardown's reset after the agent-director call drops it. Replaces E11's
-  // case in which the kill's ENVIRONMENT answer armed B's timer and the
-  // teardown's second stop stopped it.
+  // teardown's reset after the agent-director call drops it.
   test.each<[string, () => Error, string, boolean]>([
     ['ENVIRONMENT (ErrTmuxNotAvailable)', () => errTmuxNotAvailable(undefined, 'kill'), AD_ERROR_CLASS_ENVIRONMENT, true],
     ['ENVIRONMENT (ErrTmuxNotAvailable)', () => errTmuxNotAvailable(undefined, 'kill'), AD_ERROR_CLASS_ENVIRONMENT, false],
@@ -1984,12 +2631,12 @@ describe('persona teardown (SR-6.5) over the real kill and delete, outage state,
     r.f.applied.push(b) // B keeps its key applied until step 6 brings its new declaration up
     controller.arm(r.f.a.key, { kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE })
 
-    await r.f.lifecycle.teardown(b)
+    await tearDown(r, b)
     await flush()
 
     const id = personaInstanceId(k)
     expect(r.adOrder).toEqual([`kill:${id}`])
-    // Every stop (at submit, in the turn, after its launch in flight settled, after the kill) finds no timer: the kill armed none.
+    // Every stop (at submit, in the first group, after its launch in flight settled, after the kill) finds no timer: the kill armed none.
     const stops = r.f.trail.filter((c) => c.startsWith('stopRetryTimer:'))
     expect(stops).toEqual([`stopRetryTimer:${k}:none`, `stopRetryTimer:${k}:none`, `stopRetryTimer:${k}:none`, `stopRetryTimer:${k}:none`])
     expect(retryLines.filter((l) => l.startsWith(`[slack] unavailable-retry: persona=${k} armed`))).toEqual([])
@@ -2001,29 +2648,13 @@ describe('persona teardown (SR-6.5) over the real kill and delete, outage state,
     expect([...getOutageFlags(k)]).toEqual([])
     expect(latch.isLatched(k)).toBe(false)
     expect(r.f.lines.slice(1)).toEqual([
-      killFailedLine(b, err),
-      deleteNotMadeLine(b),
+      killFailedLine(b, killOutcomeOf({ thrown: err }), 1),
       `${teardownPrefix(b)}: complete, with 1 failed step(s)`,
     ])
     expect(r.f.lines[1]).toContain(`class=${errorClass}`)
+    expect(r.calls.deleteCalls).toEqual([])
     assertNoLeak({ lines: r.f.lines, logs: r.h.logs })
   })
-
-  /**
-   * A recording trigger sink and unclassified sink: every arm and every
-   * unclassified report the outage state sends, by key.
-   */
-  function recordingSinks(): {
-    arms: string[]
-    reports: string[]
-    triggerSink: UnavailableRetryController
-    unclassifiedSink: { report: (key: string) => void }
-  } {
-    const arms: string[] = []
-    const reports: string[] = []
-    const triggerSink = { arm: (key: string) => { arms.push(key); return true } } as unknown as UnavailableRetryController
-    return { arms, reports, triggerSink, unclassifiedSink: { report: (key) => { reports.push(key) } } }
-  }
 
   // b.jg5 SRJ-110 (hatch A3): the teardown's kill is no launch or recovery
   // attempt, so a class the kill has no row for (UNCLASSIFIED) arms nothing
@@ -2037,29 +2668,27 @@ describe('persona teardown (SR-6.5) over the real kill and delete, outage state,
   ])('b.jg5 SRJ-110: the kill answers %s (a class it has no row for, UNCLASSIFIED), the teardown run inside a recovery attempt for B: nothing armed or reported; the kill step fails with its line, no delete is made, nothing latches', async (_label, make) => {
     const err = make()
     const latch = installLatch(() => true)
-    const sinks = recordingSinks()
-    const r = makeReal({ killError: err, triggerSink: sinks.triggerSink, unclassifiedSink: sinks.unclassifiedSink })
+    const r = makeReal({ killError: err })
     removeB(r)
 
-    await runInAttempt(r.f.b.key, 'recovery', () => r.f.lifecycle.teardown(r.f.b))
+    await runInAttempt(r.f.b.key, 'recovery', () => tearDown(r, r.f.b))
     await flush()
 
     expect(r.adOrder).toEqual([`kill:${personaInstanceId(r.f.b.key)}`])
-    expect(sinks.arms).toEqual([])
-    expect(sinks.reports).toEqual([])
     expect(r.f.lines.slice(1)).toEqual([
-      killFailedLine(r.f.b, err),
-      deleteNotMadeLine(r.f.b),
+      killFailedLine(r.f.b, killOutcomeOf({ thrown: err }), 1),
       `${teardownPrefix(r.f.b)}: complete, with 1 failed step(s)`,
     ])
     expect(r.f.lines[1]).toContain(`class=${AD_ERROR_CLASS_UNCLASSIFIED}`)
     expect(latch.isLatched(r.f.b.key)).toBe(false)
+    expectNothingArmedOrDeleted(r)
     assertNoLeak({ lines: r.f.lines, logs: r.h.logs })
   })
 
   // b.jg5 SRJ-104, SRJ-204, SRJ-205: an ErrInvalidFlags at the teardown's
   // kill gets exactly one immediate version re-check; either way the kill
-  // step fails and no delete is made, and nothing is armed or reported.
+  // step fails after its one try and no delete is made, and nothing is armed
+  // or reported.
   describe('an ErrInvalidFlags at the teardown\'s kill', () => {
     let resolveCalls: Array<object | undefined>
     let stops: number[]
@@ -2092,25 +2721,22 @@ describe('persona teardown (SR-6.5) over the real kill and delete, outage state,
     ] as const)('the re-check %s → exactly one re-check; the kill step fails with its line naming the re-check, no delete is made; nothing armed or reported', async (_label, outcome, recheck, stopCount) => {
       installRecheck(outcome)
       const err = errInvalidFlags('kill')
-      const sinks = recordingSinks()
-      const r = makeReal({ killError: err, triggerSink: sinks.triggerSink, unclassifiedSink: sinks.unclassifiedSink })
+      const r = makeReal({ killError: err })
       removeB(r)
 
-      await r.f.lifecycle.teardown(r.f.b)
+      await tearDown(r, r.f.b)
       await flush()
 
       expect(resolveCalls).toHaveLength(1)
       expect(stops).toHaveLength(stopCount)
       expect(r.adOrder).toEqual([`kill:${personaInstanceId(r.f.b.key)}`])
-      expect(sinks.arms).toEqual([])
-      expect(sinks.reports).toEqual([])
-      const described = describeKillOutcome({ ...killOutcomeOf({ thrown: err }), recheck } as KillOutcome)
-      expect(described).toContain(`recheck=${recheck}`)
+      const outcomeWithRecheck = { ...killOutcomeOf({ thrown: err }), recheck } as KillOutcome
+      expect(describeKillOutcome(outcomeWithRecheck)).toContain(`recheck=${recheck}`)
       expect(r.f.lines.slice(1)).toEqual([
-        `${teardownPrefix(r.f.b)}: agent-director kill of ${personaInstanceId(r.f.b.key)} failed: ${described}`,
-        deleteNotMadeLine(r.f.b),
+        killFailedLine(r.f.b, outcomeWithRecheck, 1),
         `${teardownPrefix(r.f.b)}: complete, with 1 failed step(s)`,
       ])
+      expectNothingArmedOrDeleted(r)
       assertNoLeak({ lines: r.f.lines, logs: r.h.logs })
     })
   })
@@ -2126,7 +2752,7 @@ describe('persona teardown (SR-6.5) over the real kill and delete, outage state,
     r.h.stub(b.key).script.post.length = 0
     removeB(r)
 
-    await r.f.lifecycle.teardown(b)
+    await tearDown(r, b)
     await r.h.clock.advance(3_600_000)
 
     expect(r.h.hold.view(b.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
@@ -3301,7 +3927,7 @@ describe('persona teardown serialization (SR-6.6)', () => {
       await done
       const launched = f.trail.indexOf(`restart.launchSession:${f.b.key}`)
       expect(f.trail.slice(launched + 1, launched + 7)).toEqual([
-        ...submitCancels(f.b), `stopApprover:${f.b.key}`, `stopLiveRowSequence:${f.b.key}`, `bringUps.cancel:${f.b.key}`,
+        ...submitCancels(f.b), `stopApprover:${f.b.key}`, `stopLiveRowSequence:${f.b.key}`, `stopRetryTimer:${f.b.key}`,
       ])
       expect(teardownOnly(f)).toEqual(expectedTeardown(f))
       expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete`)
@@ -3343,7 +3969,7 @@ describe('persona teardown serialization (SR-6.6)', () => {
       // The turn's first step comes right after the retry's work ended (its launch, then the arm).
       const armed = f.trail.indexOf(`restart.retryArmed:${k}`)
       expect(f.trail.indexOf(`restart.launchSession:${k}`)).toBeLessThan(armed)
-      expect(f.trail.slice(armed + 1, armed + 5)).toEqual([`stopApprover:${k}`, `stopLiveRowSequence:${k}`, `bringUps.cancel:${k}`, `stopRetryTimer:${k}`])
+      expect(f.trail.slice(armed + 1, armed + 4)).toEqual([`stopApprover:${k}`, `stopLiveRowSequence:${k}`, `stopRetryTimer:${k}`])
       expect(teardownOnly(f)).toEqual(
         stillAppliedTeardownTrail(f.b, `${JSON.stringify([f.b.claude_config_dir, undefined])}:[${f.a.key},${k}]`)
           .filter((c) => !c.startsWith('cancelRestartTimer:')),
@@ -3381,7 +4007,7 @@ describe('persona teardown serialization (SR-6.6)', () => {
       // The submit-time approver stop and cancel of a launch's wait (b.f2b), then the refused restart work, then B's turn.
       expect(f.trail.slice(0, 9)).toEqual([
         `restart.canRestart:${k}`, `restart.submitted:${k}`, ...submitCancels(f.b), `restart.canRestart:${k}`,
-        `stopApprover:${k}`, `stopLiveRowSequence:${k}`, `bringUps.cancel:${k}`,
+        `stopApprover:${k}`, `stopLiveRowSequence:${k}`, `stopRetryTimer:${k}`,
       ])
       expect(teardownOnly(f)).toEqual(expectedTeardown(f))
       expect(isRestartPendingOrActive(k)).toBe(false)
