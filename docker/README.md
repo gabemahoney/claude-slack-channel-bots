@@ -6,19 +6,16 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
 
 ## Images
 
-- **`cscb-ci-base:v4`** (built from `docker/Dockerfile.test.base`) — slow base
+- **`cscb-ci-base:v5`** (built from `docker/Dockerfile.test.base`) — slow base
   layers (apt deps incl. tmux, bun, nodejs, cozempic, agent-director). Built
-  lazily once per host. ~1+ GB. No CSCB source inside. Its agent-director is
-  the npm package at the range `package.json` declares and the Go binary of
-  the same version (0.10.0 in `v4`). The build takes the GitHub token for
-  agent-director's private release as a BuildKit secret (see
-  [The base build's GitHub token](#the-base-builds-github-token)), so no image
-  history holds it.
-- **`cscb-ci:latest`** (built from `docker/Dockerfile.test`, `FROM cscb-ci-base:v4`)
+  lazily once per host. ~1+ GB. No CSCB source inside, and nothing from the
+  repo build context: it reads no `package.json`. What it holds is in
+  [What the base holds](#what-the-base-holds).
+- **`cscb-ci:latest`** (built from `docker/Dockerfile.test`, `FROM cscb-ci-base:v5`)
   — adds `docker/entrypoint.sh`, `tests/`, `testplans/`, the `testuser` account,
   and the `ENTRYPOINT`. Built on every `/ci` run; should complete in under 10 s
   on a warm base.
-- **`cscb-ci-live:latest`** (built from `docker/Dockerfile.live`, `FROM cscb-ci-base:v4`)
+- **`cscb-ci-live:latest`** (built from `docker/Dockerfile.live`, `FROM cscb-ci-base:v5`)
   — the `/ci-live` image (see [/ci-live](#ci-live-the-live-slack-acceptance-run)
   below). It adds Claude Code at a pinned version with auto-update off, the
   agent-director the production host runs (see
@@ -28,30 +25,94 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
   The package under test is not in the image; the runner mounts its tarball.
   Built on every `/ci-live` run.
 
-`/ci` detects whether `cscb-ci-base:v4` exists locally; if absent, it builds the
+`/ci` detects whether `cscb-ci-base:v5` exists locally; if absent, it builds the
 base first, then builds `cscb-ci`. The base build is a one-time per-host cost
 per version tag. `/ci-live` does not build the base: it stops (exit 2) and asks
 for one `/ci` run when the base is missing.
 
-The base build fetches bun and the agent-director binary from GitHub, and `/ci`
-runs it with `docker build --network=host`. On some hosts the default docker
-bridge network intermittently fails those fetches with SSL/timeout errors even
-when the host itself reaches the same URLs fine; host networking sidesteps that.
-It affects only the one-time base build, so the blast radius is minimal. If you
-invoke the base build by hand (e.g. the cold-cache path below), pass
+Nothing from agent-director's release candidate is installed or run on the
+host. The release candidate's files and its install script reach only the
+base build, through named build contexts, and are checked and installed
+inside the image (see [How the base gets the release candidate](#how-the-base-gets-the-release-candidate)).
+
+The base build fetches bun and agent-director 0.10.0's binary from GitHub and
+two npm tarballs from the registry, and `/ci` runs it with
+`docker build --network=host`. On some hosts the default docker bridge network
+intermittently fails those fetches with SSL/timeout errors even when the host
+itself reaches the same URLs fine; host networking sidesteps that. It affects
+only the one-time base build, so the blast radius is minimal. If you invoke
+the base build by hand (e.g. the cold-cache path below), pass
 `--network=host` too if you hit a fetch failure, and always the token secret
-below.
+and the two build contexts below.
+
+## What the base holds
+
+Every path is readable by every user, `testuser` included.
+
+| Path | What it is |
+|---|---|
+| `/opt/agent-director-rc/bin/agent-director` | The release candidate's binary (agent-director `0.11.0-rc.1`), the image's default agent-director. Its directory holds nothing else and is first on the default `PATH` (`/opt/agent-director-rc/bin:/usr/local/sbin:/usr/local/bin:…`), so every `/ci` test (test-1 to test-12) finds it, and a test can drop the directory from `PATH` and still find bun. `/usr/local/bin` holds no agent-director. In the live image the runner's staged binary takes this path (see [The live image's agent-director](#the-live-images-agent-director)), and `docker/live/`'s scripts put this directory first on their `PATH` |
+| `/opt/agent-director-rc/client/agent-director-0.10.0.tgz` | The release candidate's TypeScript client tarball, as its `SHA256SUMS` lists it. Its package version is `0.10.0` by design |
+| `/opt/agent-director-rc/client/agent-director/` | That tarball unpacked |
+| `/opt/agent-director-rc/client/release.json` | The release record: `version`, `commit`, `client_tarball` (the tarball's path above) and `client_tarball_sha256` |
+| `/opt/agent-director-rc/install/install.sh` | The release candidate's install script (mode 0755), from agent-director's source tree at the pinned commit. Off `PATH`; its directory holds nothing else |
+| `/opt/agent-director-0.10.0/bin/agent-director` | agent-director 0.10.0's binary, off `PATH` |
+| `/opt/agent-director-0.10.0/agent-director-0.10.0.tgz` | The published agent-director 0.10.0 client, from npm |
+| `/opt/claude-slack-channel-bots-0.10.0/claude-slack-channel-bots-0.10.0.tgz` | The published pre-persona claude-slack-channel-bots 0.10.0 package, from npm |
+| `/etc/cscb-ci-image` | The image marker (see [Image marker](#image-marker)) |
+
+It also installs `sqlite3` (the harness's store reads and edits) and `file`
+(the install script's pre-flight) with apt. No agent-director client is
+installed globally. The 0.10.0 tarballs are fetched by exact version with
+`npm pack --ignore-scripts`; nothing in the base installs them.
+
+## How the base gets the release candidate
+
+The base reads the release candidate and its install script only through two
+named build contexts, never from the repo context. Each has a fallback stage
+of the same name in `docker/Dockerfile.test.base`, so a build without it stops
+with an `ERROR:` line naming the missing context.
+
+- **`agent-director-rc`**: the release candidate's directory, which the
+  operator names in `CSCB_AD_RC_DIR`. The build reads only `SHA256SUMS`,
+  `agent-director-linux-amd64` and `agent-director-0.10.0.tgz` from it. Each
+  of the two files must have exactly one `SHA256SUMS` entry and match it
+  (`sha256sum -c --strict`), and the binary's `version` must report the
+  pinned build args `AD_RC_VERSION` (`0.11.0-rc.1`) and `AD_RC_COMMIT`
+  (`d787cb434043868543c3c98105e3394026d6ca5f`). Only then are the files
+  installed, and the build checks that the release candidate's binary is the
+  first and only agent-director on `PATH`.
+- **`agent-director-install`**: a directory holding `install.sh`. `/ci`
+  extracts it, read-only, from the agent-director source checkout the
+  operator names in `CSCB_AD_SRC_DIR`
+  (`git -C "$CSCB_AD_SRC_DIR" show <AD_INSTALL_SH_COMMIT>:skills/install-agent-director/install.sh`)
+  into a fresh temp directory outside the repo, and removes it after the
+  build. Its SHA-256 must equal the pinned `AD_INSTALL_SH_SHA256`, from
+  commit `AD_INSTALL_SH_COMMIT`.
+
+Neither variable is read when the base already exists. `/ci` stops as not
+runnable when it must build the base and either is unset or lacks a file it
+needs. Nothing from either directory is copied into the repo.
 
 ## The base build's GitHub token
 
 agent-director's release repo is private, so the base build needs a GitHub
-token to download the Go binary. It takes the token only as the BuildKit secret
-`gh_token`, never as a build-arg. By hand, as `/ci` runs it:
+token to download agent-director 0.10.0's binary (release tag `v0.10.0`, from
+the build arg `AD_PREV_VERSION`). The release candidate needs none. It takes
+the token only as the BuildKit secret `gh_token`, never as a build-arg. By
+hand, as `/ci` runs it:
 
 ```sh
+AD_INSTALL_SH_COMMIT="$(sed -n 's/^ARG AD_INSTALL_SH_COMMIT=//p' docker/Dockerfile.test.base)"
+AD_INSTALL_CTX="$(mktemp -d)"
+git -C "$CSCB_AD_SRC_DIR" show "$AD_INSTALL_SH_COMMIT:skills/install-agent-director/install.sh" \
+  > "$AD_INSTALL_CTX/install.sh"
 GH_TOKEN="$(gh auth token)" docker build --network=host \
   --secret id=gh_token,env=GH_TOKEN --progress=quiet \
-  -f docker/Dockerfile.test.base -t cscb-ci-base:v4 .
+  --build-context agent-director-rc="$CSCB_AD_RC_DIR" \
+  --build-context agent-director-install="$AD_INSTALL_CTX" \
+  -f docker/Dockerfile.test.base -t cscb-ci-base:v5 .
+rm -rf "$AD_INSTALL_CTX"
 ```
 
 - **One command's environment.** Set `GH_TOKEN` only on the `docker build`
@@ -63,17 +124,26 @@ GH_TOKEN="$(gh auth token)" docker build --network=host \
   build-arg's value, by contrast, is recorded in the history of the image and
   of every image built on it, and the build log prints it.
 - **BuildKit only.** It is docker's default builder since 23.0 (check with
-  `docker buildx version`); the legacy builder refuses the secret mount.
+  `docker buildx version`); the legacy builder refuses the secret mount and
+  the named build contexts.
 - **A missing token** fails the step with
   `ERROR: the gh_token build secret is required`. `--progress=quiet` hides
-  that message: rerun with `--progress=plain` to see which step failed and why.
+  that message, and every other check's `ERROR:` line: rerun with
+  `--progress=plain` to see which step failed and why.
 - **Check an image by counts only**, never by printing its history:
-  `docker history --no-trunc cscb-ci-base:v4 | grep -c GH_TOKEN=` prints `0`.
-- **Earlier tags are retired.** Tags before `v4` took the token as a
-  build-arg, so their image history held its value, as did every image built
-  on them. Nothing names them any more; they are removed from the hosts that
-  had them. Never push, `docker save` or share an image built from a
+  `docker history --no-trunc cscb-ci-base:v5 | grep -c GH_TOKEN=` prints `0`.
+- **Earlier tags are retired.** Nothing names `v4` or an earlier tag. Tags
+  before `v4` took the token as a build-arg, so their image history held its
+  value, as did every image built on them; they are removed from the hosts
+  that had them. Never push, `docker save` or share an image built from a
   build-arg token.
+
+## Image marker
+
+Only the `cscb-ci` images carry `/etc/cscb-ci-image`, written by the base
+build (so `cscb-ci` and `cscb-ci-live` have it too). `tests/runner.sh` checks
+for it first and, when it is absent, prints one line on stderr and exits 2,
+so the runner never runs outside a `cscb-ci` image.
 
 ## Credential env vars passed to the container
 
@@ -92,27 +162,42 @@ against Anthropic's direct endpoint.
 
 ## When to bump the base image version
 
-Bump `cscb-ci-base`'s version tag (e.g. `v1` → `v2`) whenever you change
-`docker/Dockerfile.test.base` or the `agent-director` range in `package.json`.
-The base reads the range only when it is built: `/ci` builds a base only when
-its tag is missing, so without a bump every host keeps testing the
-agent-director its existing base was built with. There is **no** automatic
-version derivation — bump it manually in every place that names it:
+Bump `cscb-ci-base`'s version tag (e.g. `v5` → `v6`) whenever you change
+`docker/Dockerfile.test.base`, its pins included: the release candidate's
+`AD_RC_VERSION` and `AD_RC_COMMIT`, the install script's
+`AD_INSTALL_SH_COMMIT` and `AD_INSTALL_SH_SHA256`, and the 0.10.0 legs'
+`AD_PREV_VERSION` and `CSCB_PREV_VERSION`. `/ci` builds a base only when its
+tag is missing, so without a bump every host keeps testing the base it
+already has. The base reads no `package.json`, so a change there needs no
+bump. There is **no** automatic version derivation — bump it manually in
+every place that names it:
 
 1. The `FROM` line in `docker/Dockerfile.test`.
-2. The `BASE_TAG` variable in `.claude/skills/ci/SKILL.md`.
+2. The `BASE_TAG` variable in `.claude/skills/ci/SKILL.md`, and the tag in
+   its non-runnable conditions.
 3. The `FROM` line in `docker/Dockerfile.live`.
 4. `BASE_IMAGE` in `ci-live/lib/docker.ts`.
 5. The tag in `.claude/skills/ci-live/SKILL.md` (twice) and in
    `ci-live/README.md`'s "Where you start".
-6. This file: the image list above, the `/ci` paragraph after it, and the
-   commands under the two "Verifying" sections below.
+6. The header comment of `docker/Dockerfile.test.base`.
+7. This file: the image list above, the `/ci` paragraph after it, the hand
+   build command, the `docker history` check, and the commands under the
+   two "Verifying" sections below.
 
-Common reasons to bump: bumping the bun installer, changing the nodejs major,
-adding/removing an apt package, changing the cozempic install, or changing the
-`agent-director` range in `package.json` (the base reads it at build time).
-The live image needs no bump of its own for a range change: it reads the
-range at every build (see
+The source audit in `tests/ci-live-docker.test.ts` fails when a tag in
+`docker/Dockerfile.test`, `docker/Dockerfile.live`,
+`docker/Dockerfile.test.base` or either skill differs from `BASE_IMAGE`. The
+install script's commit is set in one place only, the Dockerfile's
+`ARG AD_INSTALL_SH_COMMIT`: the `/ci` skill and the hand build above both read
+it from there (with `sed`) and type no commit of their own, so a change to it
+is a change to the Dockerfile alone (with `AD_INSTALL_SH_SHA256` and the tag
+bump). The source audit fails when the skill types a commit.
+
+Common reasons to bump: a new release candidate or install script, a change
+of the 0.10.0 pins, bumping the bun installer, changing the nodejs major,
+adding/removing an apt package, or changing the cozempic install.
+The live image needs no bump of its own for a change of `package.json`'s
+`agent-director` range: it reads the range at every build (see
 [The live image's agent-director](#the-live-images-agent-director)).
 
 After bumping, the next `/ci` on every host will rebuild the base. Leave the
@@ -124,20 +209,20 @@ still name it keep using it.
 To simulate a fresh host:
 
 ```bash
-docker rmi cscb-ci-base:v4 cscb-ci:latest 2>/dev/null
-/ci   # or invoke the build sequence from the skill manually
+docker rmi cscb-ci-base:v5 cscb-ci:latest 2>/dev/null
+/ci   # with CSCB_AD_RC_DIR and CSCB_AD_SRC_DIR set; or run the hand build above
 ```
 
-The first build should take minutes (apt + bun + nodejs + pip + bun-add). Time
-it; if it exceeds the Claude Code Bash tool's 10-minute timeout, raise an
-issue.
+The first build should take minutes (apt + bun + nodejs + pip + npm pack +
+the release candidate's checks). Time it; if it exceeds the Claude Code Bash
+tool's 10-minute timeout, raise an issue.
 
 ## Verifying warm-cache parity
 
 After a `/ci` run, confirm the base layers are intact:
 
 ```bash
-docker history cscb-ci-base:v4
+docker history cscb-ci-base:v5
 ```
 
 Then edit a comment in (e.g.) `tests/integration/test-1-install-startup.sh`
@@ -147,9 +232,9 @@ and re-run the build:
 docker build -f docker/Dockerfile.test -t cscb-ci .
 ```
 
-This should complete in seconds. `docker history cscb-ci-base:v4` should show
-the same layer IDs as before — proof the source edit didn't invalidate the
-base.
+This should complete in seconds, and needs neither build context nor the
+token. `docker history cscb-ci-base:v5` should show the same layer IDs as
+before — proof the source edit didn't invalidate the base.
 
 ## /ci-live: the live Slack acceptance run
 
@@ -452,7 +537,9 @@ run, whichever one the base image was built with:
 - The runner copies the host's `agent-director` binary
   (`~/.agent-director/bin/agent-director`, else the first one on `PATH`) into
   a temporary directory that the build sees as the named context
-  `agent-director-bin`. The image puts it first on `PATH`.
+  `agent-director-bin`. The image copies it over the base's
+  `/opt/agent-director-rc/bin/agent-director`, first on `PATH`, and the
+  build checks that it is the first agent-director there.
 - The build fails when the binary's version is not the npm package's, or is
   below the package's version floor (`dist/version-floor.json`). The run then
   reports a `container` FAIL row saying the host binary does not match the

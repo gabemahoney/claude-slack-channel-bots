@@ -54,11 +54,24 @@
  *   around each, stopped before Teardown, halted by a stop's cleanup, its
  *   report in the results), reaches the container only through the checks'
  *   helpers, and its one agent-director command, the fallback deny, runs
- *   behind the plan's `guard`.
+ *   behind the plan's `guard`;
+ * - the /ci images name one base tag, `BASE_IMAGE`: the `FROM` lines of
+ *   `docker/Dockerfile.test` and `docker/Dockerfile.live` and the `/ci` and
+ *   `/ci-live` skills; the base (`docker/Dockerfile.test.base`) reads nothing
+ *   from the repo context (no `package.json`, no agent-director client from
+ *   the registry), takes the release candidate and `install.sh` only from
+ *   their named build contexts, checks them (SHA256SUMS, the pinned version
+ *   and commit, the pinned SHA-256) before installing them, puts the release
+ *   candidate's binary in a directory of its own first on PATH (never
+ *   /usr/local/bin) and the 0.10.0 binary, fetched for its pinned release, off
+ *   PATH, installs `sqlite3` and `file` and writes the marker
+ *   /etc/cscb-ci-image; `Dockerfile.live` and the three `docker/live` scripts'
+ *   PATH lines use the base's release-candidate directory.
  *
  * Nothing here runs docker: spawns go to a recording fake. The wiring that
  * lives in `ci-live/runtime/` and `ci-live/main.ts` (which load
- * playwright-core, so no test imports them) is pinned by a source audit.
+ * playwright-core, so no test imports them) and the /ci images' Dockerfiles,
+ * skills and scripts are pinned by source audits.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -74,6 +87,7 @@ import { HELPERS_PATH, TestContainer } from '../ci-live/lib/container.ts'
 import { CONTAINER_LOGS_URGENT_WAIT_MS, CONTAINER_LOGS_WAIT_MS } from '../ci-live/lib/container-logs.ts'
 import {
   assertSafeRunArgs,
+  BASE_IMAGE,
   buildExecArgs,
   buildImageArgs,
   buildRunArgs,
@@ -1489,5 +1503,195 @@ describe('runner wiring (source audit of ci-live/)', () => {
       ["'human'", 'humanMailbox'],
       ["'second'", 'null'],
     ])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The /ci images (source audit of docker/ and the /ci and /ci-live skills)
+// ---------------------------------------------------------------------------
+
+const REPO = join(import.meta.dir, '..')
+const BASE_DOCKERFILE = join('docker', 'Dockerfile.test.base')
+
+function repoFile(rel: string): string {
+  return readFileSync(join(REPO, rel), 'utf-8')
+}
+
+/** A Dockerfile's instructions: comment and blank lines dropped, continuation lines joined. */
+function dockerInstructions(rel: string): string[] {
+  const out: string[] = []
+  let current = ''
+  for (const line of repoFile(rel).split('\n')) {
+    const body = line.trim()
+    if (body.startsWith('#') || body === '') continue
+    if (body.endsWith('\\')) {
+      current += `${body.slice(0, -1)} `
+      continue
+    }
+    out.push(`${current}${body}`)
+    current = ''
+  }
+  return out
+}
+
+/** The one RUN instruction holding `fragment`. */
+function runWith(instructions: string[], fragment: string): string {
+  const runs = instructions.filter((i) => i.startsWith('RUN ') && i.includes(fragment))
+  expect(runs.length).toBe(1)
+  return runs[0]!
+}
+
+function expand(value: string, vars: Map<string, string>): string {
+  return value.replace(/\$\{(\w+)\}/g, (all, name: string) => vars.get(name) ?? all)
+}
+
+/** A RUN's plain assignments (`NAME=value;`, `NAME="value";`), each expanded over the ARG defaults and the assignments before it. */
+function shellVars(run: string, args: Record<string, string>): Map<string, string> {
+  const vars = new Map(Object.entries(args))
+  for (const statement of run.split(';')) {
+    const m = /^\s*([A-Z_][A-Z0-9_]*)=(?:"((?:[^"$]|\$\{\w+\})*)"|([\w./:-]+))\s*$/.exec(statement)
+    if (m) vars.set(m[1]!, expand(m[2] ?? m[3]!, vars))
+  }
+  return vars
+}
+
+/** Where a RUN's `install -m <mode> <src>/<file> <target>` statement puts `file` (expanded), and where the statement is. */
+function installTarget(run: string, file: string, vars: Map<string, string>): { at: number, target: string } {
+  const m = new RegExp(`(?:^|;)\\s*install\\s+-m\\s+\\d+\\s+"?[^\\s";]*/${file.replace(/\./g, '\\.')}"?\\s+"?([^\\s";]+)"?\\s*(?:;|$)`).exec(run)
+  expect(m).not.toBeNull()
+  return { at: m!.index, target: expand(m![1]!, vars) }
+}
+
+/** `docker/Dockerfile.test.base`: its instructions, ARG defaults, bind mounts (context → target) and default PATH, whose first directory is the release candidate's binary directory. */
+function baseImage() {
+  const instructions = dockerInstructions(BASE_DOCKERFILE)
+  const args = Object.fromEntries(instructions.flatMap((i) => {
+    const m = /^ARG (\w+)=(\S+)$/.exec(i)
+    return m ? [[m[1]!, m[2]!]] : []
+  }))
+  const mounts = new Map([...instructions.join('\n').matchAll(/--mount=type=bind,from=([\w-]+),target=(\S+)/g)].map((m) => [m[1]!, m[2]!]))
+  const env = instructions.filter((i) => i.startsWith('ENV PATH='))
+  expect(env.length).toBe(1)
+  const path = env[0]!.slice('ENV PATH='.length).split(':')
+  return { instructions, args, mounts, path, rcBinDir: path[0]! }
+}
+
+describe('the /ci images (source audit)', () => {
+  const baseRepo = BASE_IMAGE.slice(0, BASE_IMAGE.indexOf(':'))
+
+  test.each([
+    join('docker', 'Dockerfile.test'),
+    join('docker', 'Dockerfile.live'),
+    BASE_DOCKERFILE,
+    join('.claude', 'skills', 'ci', 'SKILL.md'),
+    join('.claude', 'skills', 'ci-live', 'SKILL.md'),
+  ])('every base-image tag %s names is BASE_IMAGE', (rel) => {
+    const tags = [...repoFile(rel).matchAll(new RegExp(`${baseRepo}:[\\w-]+(?:\\.[\\w-]+)*`, 'g'))].map((m) => m[0])
+    expect(tags.length).toBeGreaterThan(0)
+    expect(tags.filter((tag) => tag !== BASE_IMAGE)).toEqual([])
+  })
+
+  test.each([join('docker', 'Dockerfile.test'), join('docker', 'Dockerfile.live')])('%s is built FROM BASE_IMAGE and nothing else', (rel) => {
+    expect(dockerInstructions(rel).filter((i) => /^FROM\s/i.test(i))).toEqual([`FROM ${BASE_IMAGE}`])
+  })
+
+  test("the /ci skill's BASE_TAG is BASE_IMAGE, and it builds docker/Dockerfile.test.base under that tag", () => {
+    const skill = repoFile(join('.claude', 'skills', 'ci', 'SKILL.md'))
+    expect([...skill.matchAll(/^\s*BASE_TAG=(\S+)/gm)].map((m) => m[1])).toEqual([BASE_IMAGE])
+    expect(skill).toContain('-f docker/Dockerfile.test.base -t "${BASE_TAG}" .')
+  })
+
+  test('the base reads nothing from the repo context (no COPY or ADD, so no package.json) and installs no agent-director client from the registry; the 0.10.0 legs are packed at exact versions', () => {
+    const { instructions, args } = baseImage()
+    expect(instructions.filter((i) => /^(COPY|ADD)\s/i.test(i))).toEqual([])
+    expect(instructions.filter((i) => /\bnpm\s+(i|install|add)\b|\bbun\s+(add|install)\b|\s(-g|--global)\b/.test(i))).toEqual([])
+    expect([args.AD_PREV_VERSION, args.CSCB_PREV_VERSION].map((v) => /^\d+\.\d+\.\d+$/.test(v ?? ''))).toEqual([true, true])
+    const pack = runWith(instructions, 'npm pack')
+    expect([pack.includes('"agent-director@${AD_PREV_VERSION}"'), pack.includes('"claude-slack-channel-bots@${CSCB_PREV_VERSION}"')]).toEqual([true, true])
+  })
+
+  test('the base binds only the agent-director-rc and agent-director-install contexts, each with a fallback stage of its name', () => {
+    const { instructions, mounts } = baseImage()
+    expect([...mounts.keys()]).toEqual(['agent-director-rc', 'agent-director-install'])
+    expect(instructions.filter((i) => /^FROM\s+\S+\s+AS\s+agent-director-(rc|install)$/i.test(i)).length).toBe(2)
+  })
+
+  test("the release candidate is read from its context and checked against SHA256SUMS and the pinned version and commit before its binary is installed, first on PATH in a directory of its own (not /usr/local/bin), which the build checks", () => {
+    const { instructions, args, mounts, path, rcBinDir } = baseImage()
+    const rc = runWith(instructions, 'from=agent-director-rc,')
+    const vars = shellVars(rc, args)
+    expect(vars.get('RC_CTX')).toBe(mounts.get('agent-director-rc')!)
+    expect(rc).toContain('"${RC_CTX}/SHA256SUMS"')
+    expect(args.AD_RC_VERSION).toMatch(/^\d+\.\d+\.\d+-rc\.\d+$/)
+    expect(args.AD_RC_COMMIT).toMatch(/^[0-9a-f]{40}$/)
+    const binary = installTarget(rc, 'agent-director-linux-amd64', vars)
+    const checks = [rc.indexOf('sha256sum -c'), rc.indexOf('!= "${AD_RC_VERSION}"'), rc.indexOf('!= "${AD_RC_COMMIT}"')]
+    expect(checks.map((at) => at >= 0 && at < binary.at)).toEqual([true, true, true])
+    expect([rcBinDir === '/usr/local/bin', path.includes('/usr/local/bin')]).toEqual([false, true])
+    expect(binary.target).toBe(join(rcBinDir, 'agent-director'))
+    expect(instructions.filter((i) => i.includes('/usr/local/bin/agent-director'))).toEqual([])
+    expect(rc.indexOf('command -v agent-director')).toBeGreaterThan(binary.at)
+  })
+
+  test('install.sh is read from its context and checked against the pinned SHA-256 before it is installed off PATH', () => {
+    const { instructions, args, mounts, path } = baseImage()
+    expect(args.AD_INSTALL_SH_SHA256).toMatch(/^[0-9a-f]{64}$/)
+    const run = runWith(instructions, 'from=agent-director-install,')
+    const vars = shellVars(run, args)
+    expect(vars.get('INSTALL_CTX')).toBe(mounts.get('agent-director-install')!)
+    expect(run).toContain('"${INSTALL_CTX}/install.sh"')
+    const script = installTarget(run, 'install.sh', vars)
+    const check = run.indexOf('!= "${AD_INSTALL_SH_SHA256}"')
+    expect(check >= 0 && check < script.at).toBe(true)
+    expect([script.target.startsWith('/'), path.includes(dirname(script.target))]).toEqual([true, false])
+  })
+
+  test("the /ci skill extracts install.sh at the commit it reads from the base's ARG AD_INSTALL_SH_COMMIT, and types no commit of its own", () => {
+    const skill = repoFile(join('.claude', 'skills', 'ci', 'SKILL.md'))
+    const { args } = baseImage()
+    expect(args.AD_INSTALL_SH_COMMIT).toMatch(/^[0-9a-f]{40}$/)
+    // What the skill's `sed -n 's/^ARG AD_INSTALL_SH_COMMIT=//p'` prints: that ARG's default, once.
+    const sedOutput = repoFile(BASE_DOCKERFILE).split('\n').flatMap((l) => l.startsWith('ARG AD_INSTALL_SH_COMMIT=') ? [l.slice('ARG AD_INSTALL_SH_COMMIT='.length)] : [])
+    expect(sedOutput).toEqual([args.AD_INSTALL_SH_COMMIT!])
+    expect([...skill.matchAll(/^\s*AD_INSTALL_SH_COMMIT=(.*)$/gm)].map((m) => m[1])).toEqual([
+      `"$(sed -n 's/^ARG AD_INSTALL_SH_COMMIT=//p' ${BASE_DOCKERFILE})"`,
+    ])
+    expect([...skill.matchAll(/\bgit -C "\$\{CSCB_AD_SRC_DIR\}" show "([^"]*)"/g)].map((m) => m[1])).toEqual([
+      '${AD_INSTALL_SH_COMMIT}:skills/install-agent-director/install.sh',
+    ])
+    expect(skill.match(/\b[0-9a-f]{40}\b/g) ?? []).toEqual([])
+  })
+
+  test('the 0.10.0 binary is fetched for its pinned release into a directory off PATH', () => {
+    const { instructions, args, path } = baseImage()
+    const run = runWith(instructions, 'id=gh_token')
+    const vars = shellVars(run, args)
+    expect(vars.get('AD_TAG')).toBe(`v${args.AD_PREV_VERSION}`)
+    expect(run).toContain('/releases/tags/${AD_TAG}"')
+    const target = expand(/\s-o\s+"?([^\s";]+)"?/.exec(run)![1]!, vars)
+    expect(target).toMatch(/^\/[^$]*\/agent-director$/)
+    expect(path).not.toContain(dirname(target))
+  })
+
+  test('the base installs sqlite3 and file with apt and writes the marker /etc/cscb-ci-image', () => {
+    const { instructions } = baseImage()
+    const packages = instructions.flatMap((i) => [...i.matchAll(/apt-get install -y((?:\s+[a-z0-9][\w.+-]*)+)/g)].flatMap((m) => m[1]!.trim().split(/\s+/)))
+    expect(['sqlite3', 'file'].filter((p) => !packages.includes(p))).toEqual([])
+    expect(instructions.filter((i) => /^RUN\s.*>\s*\/etc\/cscb-ci-image(\s|$)/.test(i)).length).toBe(1)
+  })
+
+  test("Dockerfile.live copies the staged binary over the base's release-candidate binary and checks that it is the first agent-director on PATH", () => {
+    const bin = join(baseImage().rcBinDir, 'agent-director')
+    const live = dockerInstructions(join('docker', 'Dockerfile.live'))
+    expect(live.filter((i) => i.startsWith('COPY --from=agent-director-bin '))).toEqual([`COPY --from=agent-director-bin agent-director ${bin}`])
+    expect(runWith(live, 'command -v agent-director')).toContain(`if [ "$(command -v agent-director)" != ${bin} ]`)
+    expect(live.filter((i) => i.includes('/usr/local/bin/agent-director'))).toEqual([])
+  })
+
+  test.each(['cscb-live-helpers.sh', 'cscb-live-preflight.sh', 'entrypoint.sh'])("docker/live/%s's PATH lines start with the base's release-candidate directory", (file) => {
+    const { rcBinDir } = baseImage()
+    const firsts = [...repoFile(join('docker', 'live', file)).matchAll(/^\s*export PATH="([^"]*)"/gm)].map((m) => m[1]!.split(':')[0])
+    expect(firsts.length).toBeGreaterThan(0)
+    expect(firsts.filter((dir) => dir !== rcBinDir)).toEqual([])
   })
 })
