@@ -72,12 +72,11 @@
  * 0): P latches from `resume`'s UNUSABLE NAME, and in a second harness from
  * the working-row evidence `read-pane`; then a new launch, the retry entry,
  * a scheduled and a human-triggered restart and the retry timer make no
- * tmux-touching call (`tmuxTouchingCallsIn`) or delete for P's instance and
- * no raw tmux seam call (`recordRawTmux`) for P's session, count nothing,
- * and leave exactly one post, SRJ-1019; Q's paths reach the stub as before.
- * A message lost for P so latched reports `held-for-human` with no call and
- * no restart; Q's reports its own state. The UNCLASSIFIED control: an
- * `ErrInternal` without the phrase at the same `resume` latches nothing,
+ * tmux-touching call (`tmuxTouchingCallsIn`) or delete for P's instance,
+ * count nothing, and leave exactly one post, SRJ-1019; Q's paths reach the
+ * stub as before. A message lost for P so latched reports `held-for-human`
+ * with no call and no restart; Q's reports its own state. The UNCLASSIFIED
+ * control: an `ErrInternal` without the phrase at the same `resume` latches nothing,
  * posts no hold notice and takes E12's handling (the unclassified episode,
  * the UNCLASSIFIED cause armed, nothing counted).
  *
@@ -85,8 +84,8 @@
  * both settings 0): P launches onto a colliding `waiting` row whose
  * reconnect's one `send-keys` answers CONFLICT (a case-table reconnect row)
  * or UNUSABLE NAME; P latches once with one post, and the same paths plus a
- * health tick make no further `send-keys`, other tmux-touching call, raw tmux
- * call or delete for P and count nothing, the retry timer stopping latched;
+ * health tick make no further `send-keys`, other tmux-touching call or
+ * delete for P and count nothing, the retry timer stopping latched;
  * Q launches and reconnects as before.
  * The kill as a latch site (SRJ-110, SRJ-505, AC 9; E20): P's restart run's
  * kill of its dead row, or the step-1 kill of the live-row sequence P's
@@ -280,7 +279,7 @@
  * three holds, one post), nothing is armed, counted or noticed, and Q's
  * approver presses Enter on its own dialog and runs on to its cap; then every
  * automated path (`driveEveryPath`) makes no call for P, tmux-touching or
- * raw, with still one post, while Q's paths reach the stub as before. A latch
+ * not, with still one post, while Q's paths reach the stub as before. A latch
  * from another path (an own-row `get` of a `provenance_conflict` note, an
  * own-row `status` of a `pending` row with no launch start, a CONFLICT at a
  * new launch's plain spawn), set while P's approver sleeps between laps or
@@ -294,7 +293,7 @@
  * observer; `afterEach` runs `assertNoLeak` over every line, event and record
  * captured, over every notice post and over each harness's `captured()`,
  * then cleans the harness up (which throws on a pending timer) and resets the
- * health check and the raw tmux runner a case recorded. The notice cases build `createPersonaEpisodes` over
+ * health check. The notice cases build `createPersonaEpisodes` over
  * `createFakeClock` with a recording sink; `afterEach` checks no timer is
  * pending and clears the session-manager notifier and its not-connected
  * latch. No `mock.module()`.
@@ -479,8 +478,6 @@ import {
   DIALOG_POLL_INTERVAL_MS,
   TRUST_DIALOG_NEEDLE,
   _resetNotConnectedEpisodes,
-  _resetTmuxCommandRunner,
-  _setTmuxCommandRunner,
   isLaunchInFlight,
   notifyPersonaNotConnected,
   OWN_ROW_READ_ROW,
@@ -1925,8 +1922,6 @@ afterEach(() => {
   const built = harnesses
   harnesses = []
   _resetHealthCheckState()
-  // The raw tmux runner a case records (`recordRawTmux`).
-  _resetTmuxCommandRunner()
   for (const h of built) {
     try {
       assertNoLeak(h.captured())
@@ -2446,30 +2441,9 @@ describe('SRJ-502, SRJ-1011: a message lost while P is latched reports held for 
 // ---------------------------------------------------------------------------
 // SRJ-512, SRJ-502: an UNUSABLE NAME from `resume` and from the working-row
 // evidence `read-pane` latches P once, posts SRJ-1019 once, and is followed
-// by no tmux-touching call, raw tmux call, delete or counted failure on any
+// by no tmux-touching call, delete or counted failure on any
 // automated path; a lost message then reports held for a human (AC 68, AC 77)
 // ---------------------------------------------------------------------------
-
-/** One raw tmux runner call: what it targeted (the runner's arguments joined). */
-interface RawTmuxCall {
-  readonly target: string
-}
-
-/**
- * Replace the session manager's one raw tmux seam (the command runner) with
- * a recorder that runs nothing; `afterEach` puts it back. Answers the
- * recorded calls, in order. The startup-dialog approver has no raw tmux
- * seam: its pane reads and keys go through the stub client's `readPane` and
- * `sendKeys`, which `tmuxTouchingCallsIn` counts.
- */
-function recordRawTmux(): RawTmuxCall[] {
-  const calls: RawTmuxCall[] = []
-  _setTmuxCommandRunner(async (args) => {
-    calls.push({ target: args.join(' ') })
-    return { code: 1, stdout: '' }
-  })
-  return calls
-}
 
 /** The instance id a stub call's params name, if any. */
 const instanceOf = (params: unknown): unknown => (params as { claude_instance_id?: unknown } | undefined)?.claude_instance_id
@@ -2493,13 +2467,11 @@ const UNUSABLE_LATCH_WAYS: ReadonlyArray<readonly [string, UnusableNameCaseRow, 
 ]
 
 describe('SRJ-512: an UNUSABLE NAME from resume and from the working-row read-pane holds P for a human on every automated path (recovery harness)', () => {
-  test.each(UNUSABLE_LATCH_WAYS)('P latched by %s: one SRJ-1019 post; then a new launch, the retry entry, a scheduled and a human-triggered restart and the retry timer make no tmux-touching call, raw tmux call or delete for P and count nothing; Q\'s paths reach the stub as before', async (_label, row, latchScript) => {
+  test.each(UNUSABLE_LATCH_WAYS)('P latched by %s: one SRJ-1019 post; then a new launch, the retry entry, a scheduled and a human-triggered restart and the retry timer make no tmux-touching call or delete for P and count nothing; Q\'s paths reach the stub as before', async (_label, row, latchScript) => {
     const run = makeAutomatedPathsRun()
     const { h, outcomes } = run
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
     const [p, q] = h.keys as [string, string]
-    const session = personaTmuxSessionName(p)
-    const raw = recordRawTmux()
     run.readWorking(p)
 
     h.script(latchScript(h, p))
@@ -2507,13 +2479,11 @@ describe('SRJ-512: an UNUSABLE NAME from resume and from the working-row read-pa
     expect(h.latch.record(p)).toEqual(row.record(p))
     h.script(CLEARED)
     const touchingAtLatch = tmuxTouchingCallCounts(h.stub.calls)
-    const rawAtLatch = raw.length
 
     const { launched, qCalls, notScheduledLines, attemptsBefore } = await driveEveryPath(run)
 
-    // Nothing tmux-touching, raw or deleting reached P after the latch.
+    // Nothing tmux-touching or deleting reached P after the latch.
     expect(tmuxTouchingCallsIn(h.stub.calls, touchingAtLatch).filter((call) => instanceOf(call.params) === personaInstanceId(p))).toEqual([])
-    expect(raw.slice(rawAtLatch).filter((call) => call.target.includes(session))).toEqual([])
     expect(h.stub.calls.deleteCalls.filter((call) => instanceOf(call) === personaInstanceId(p))).toEqual([])
     // Each path stopped for P: the launch and the retry entry answered latched, no restart timer, the retry timer stopped latched.
     expect(launched).toEqual([{ key: p, action: 'latched' }, { key: q, action: 'spawned' }])
@@ -2587,8 +2557,8 @@ describe('SRJ-512: an UNUSABLE NAME from resume and from the working-row read-pa
 // answers CONFLICT (a case-table reconnect row for `waiting`) or UNUSABLE
 // NAME: P latches once with one post, and no path that could retry it (a new
 // launch, the retry entry, a scheduled and a human-triggered restart, the
-// retry timer, the health tick) makes another `send-keys`, any other
-// tmux-touching call or a raw tmux call for P, or counts anything; Q's
+// retry timer, the health tick) makes another `send-keys` or any other
+// tmux-touching call for P, or counts anything; Q's
 // launch and reconnect go on.
 // ---------------------------------------------------------------------------
 
@@ -2618,13 +2588,11 @@ const RECONNECT_LATCH_WAYS: ReadonlyArray<
 ]
 
 describe('SRJ-118, SRJ-505: a CONFLICT or UNUSABLE NAME at the reconnect\'s send-keys holds P, and no automated path retries it (recovery harness)', () => {
-  test.each(RECONNECT_LATCH_WAYS)('P latched by its reconnect\'s %s: one post; then a new launch, the retry entry, a scheduled and a human-triggered restart, the retry timer and the health tick make no send-keys, other tmux-touching call, raw tmux call or delete for P and count nothing; the retry timer is stopped; Q launches and reconnects as before', async (_label, record, notice, latchScript) => {
+  test.each(RECONNECT_LATCH_WAYS)('P latched by its reconnect\'s %s: one post; then a new launch, the retry entry, a scheduled and a human-triggered restart, the retry timer and the health tick make no send-keys, other tmux-touching call or delete for P and count nothing; the retry timer is stopped; Q launches and reconnects as before', async (_label, record, notice, latchScript) => {
     const run = makeAutomatedPathsRun()
     const { h, outcomes } = run
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
     const [p, q] = h.keys as [string, string]
-    const session = personaTmuxSessionName(p)
-    const raw = recordRawTmux()
 
     h.script(latchScript(h, p))
     expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
@@ -2632,15 +2600,13 @@ describe('SRJ-118, SRJ-505: a CONFLICT or UNUSABLE NAME at the reconnect\'s send
     expect(h.stub.calls.sendKeysCalls.map((call) => call.claude_instance_id)).toEqual([personaInstanceId(p)])
     h.script({ ...CLEARED, sendKeysError: undefined })
     const touchingAtLatch = tmuxTouchingCallCounts(h.stub.calls)
-    const rawAtLatch = raw.length
 
     const { launched, qCalls, notScheduledLines, attemptsBefore } = await driveEveryPath(run)
     const tick = await runHealthTick(run)
 
-    // Nothing tmux-touching (the send-keys included), raw or deleting reached P after the latch.
+    // Nothing tmux-touching (the send-keys included) or deleting reached P after the latch.
     expect(tmuxTouchingCallsIn(h.stub.calls, touchingAtLatch).filter((call) => instanceOf(call.params) === personaInstanceId(p))).toEqual([])
     expect(h.stub.calls.sendKeysCalls.filter((call) => call.claude_instance_id === personaInstanceId(p))).toHaveLength(1)
-    expect(raw.slice(rawAtLatch).filter((call) => call.target.includes(session))).toEqual([])
     expect(h.stub.calls.deleteCalls.filter((call) => instanceOf(call) === personaInstanceId(p))).toEqual([])
     // Each path stopped for P: the launch and the retry entry answered latched, no restart timer, the retry timer stopped latched, the tick scheduled nothing for it.
     expect(launched).toEqual([{ key: p, action: 'latched' }, { key: q, action: 'spawned' }])
@@ -3904,7 +3870,6 @@ describe('the dialog approver\'s latches: its own CONFLICT or UNUSABLE NAME latc
     const run = makeAutomatedPathsRun()
     const { h } = run
     const [p, q] = h.keys as [string, string]
-    const raw = recordRawTmux()
     run.readPending(p)
     run.readPending(q)
     approverMeets(run, p, c.verb, c.build())
@@ -3934,7 +3899,6 @@ describe('the dialog approver\'s latches: its own CONFLICT or UNUSABLE NAME latc
     const { launched, qCalls, attemptsBefore } = await driveEveryPath(run)
     expect(callCountsSince(personaCallCounts(h, p), pAtLatch)).toEqual({})
     expect(tmuxTouchingCallsIn(h.stub.calls, touchingAtLatch).filter((call) => instanceOf(call.params) === personaInstanceId(p))).toEqual([])
-    expect(raw.filter((call) => call.target.includes(personaTmuxSessionName(p)))).toEqual([])
     expect(launched).toEqual([{ key: p, action: 'latched' }, { key: q, action: 'spawned' }])
     expect(h.attempts.slice(attemptsBefore).map((a) => [a.key, a.retry])).toEqual([[p, 1], [q, 1], [q, 2]])
     expect(h.stops.filter((stop) => stop.key === p)).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])

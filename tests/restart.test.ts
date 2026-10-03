@@ -87,8 +87,6 @@ import {
   _resetInFlightLaunches,
   _whenDialogApproverStopped,
   stopAllDialogApprovers,
-  _setTmuxCommandRunner,
-  _resetTmuxCommandRunner,
   _setDialogReadyTimeoutMs,
   _resetDialogReadyTimeoutMs,
   _setSpawnHomeDir,
@@ -2337,8 +2335,7 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
 // and launch are recording fakes. The findMissing memo runs on the same fake
 // clock (`_setNow`), moved past `FIND_MISSING_MEMO_TTL_MS` between runs, so
 // every run sweeps. Each run is awaited (`awaitRuns`), and only P's own stub
-// calls are counted (`ownStubCalls`). No tmux is asked: the raw runner records
-// every argv.
+// calls are counted (`ownStubCalls`).
 // ---------------------------------------------------------------------------
 
 describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unverified_ids for several ticks (HO C14 Verify, AC 66)', () => {
@@ -2348,8 +2345,6 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
   let clock: FakeClock
   let latch: ConflictLatch
   let errLines: string[]
-  /** Every argv the raw tmux runner was asked to run. */
-  let rawTmux: string[][]
   /** The persona keys the session manager raised a spawn-failure notice for. */
   let raised: string[]
   let origConsoleError: typeof console.error
@@ -2362,11 +2357,6 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
     errLines = []
     origConsoleError = console.error
     console.error = (...args: unknown[]) => { errLines.push(args.map(String).join(' ')) }
-    rawTmux = []
-    _setTmuxCommandRunner(async (args) => {
-      rawTmux.push([...args])
-      return { code: 1, stdout: '' }
-    })
     raised = []
     setSessionNotifier((key) => { raised.push(key) })
     latch = createConflictLatch({ log: (line) => { errLines.push(line) } })
@@ -2378,7 +2368,6 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
     cancelAllRestartTimers()
     resetClientForTests()
     _resetOutageState()
-    _resetTmuxCommandRunner()
     _resetFindMissingMemo()
     _resetNow()
     setConflictLatch(undefined)
@@ -2468,7 +2457,6 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
     expect(runs.armed).toEqual([])
     expect(latch.isLatched(runs.KEY)).toBe(false)
     expect(isRestartPendingOrActive(runs.KEY)).toBe(false)
-    expect(rawTmux).toEqual([])
     expect(clock.pendingCount()).toBe(0)
     assertNoLeak({ errLines, posts: runs.posts })
   })
@@ -2500,7 +2488,6 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
     expect(runs.launches).toEqual([])
     expect(getFailureCount(runs.KEY)).toBe(0)
     expect(raised).toEqual([])
-    expect(rawTmux).toEqual([])
     expect(clock.pendingCount()).toBe(0)
     assertNoLeak({ errLines, posts: runs.posts })
   })
@@ -2523,7 +2510,6 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
     expect(runs.launches).toEqual([])
     expect(getFailureCount(runs.KEY)).toBe(0)
     expect(raised).toEqual([])
-    expect(rawTmux).toEqual([])
     expect(clock.pendingCount()).toBe(0)
     assertNoLeak({ errLines, posts: runs.posts })
   })
@@ -2545,8 +2531,7 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
 // checked kill and the relaunch happen in that same run (b.jg5 SRJ-611). An
 // UNAVAILABLE `read-pane` of a `working` row is no proof the session is gone:
 // the run defers, with no sweep, kill, launch or accounting. Kill and launch
-// are recording fakes. No tmux is asked: the raw runner records every argv
-// here. Each case awaits its restart work's end, not a
+// are recording fakes. Each case awaits its restart work's end, not a
 // fixed sleep, and counts only the run's own calls (its persona's instance
 // and the whole-store sweep), so neither a late timer nor another persona's
 // call made while the case runs changes a count.
@@ -2554,19 +2539,12 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
 
 describe('b.d61: a working persona whose tmux session is gone is relaunched in the same restart run', () => {
   let dir: string
-  /** Every argv the raw tmux runner was asked to run. */
-  let rawTmux: string[][]
   let errLines: string[]
   let origConsoleError: typeof console.error
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'restart-d61-'))
     _resetFindMissingMemo()
-    rawTmux = []
-    _setTmuxCommandRunner(async (args) => {
-      rawTmux.push([...args])
-      return { code: 1, stdout: '' }
-    })
     errLines = []
     origConsoleError = console.error
     console.error = (...args: unknown[]) => { errLines.push(args.map(String).join(' ')) }
@@ -2577,7 +2555,6 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
     cancelAllRestartTimers()
     resetClientForTests()
     _resetOutageState()
-    _resetTmuxCommandRunner()
     _resetFindMissingMemo()
     rmSync(dir, { recursive: true, force: true })
   })
@@ -2651,7 +2628,7 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
   test.each<[string, EscalateDeadVerdict]>([
     ['working', WORKING_TMUX_GONE],
     ['waiting', ESCALATE_DEAD_WAITING_ROW_PANE_GONE],
-  ])('alive (%s) but disconnected, its read-pane answering GONE → one read-pane of its own row, one findMissing sweep (verdict %s, dead evidence) and no send-keys; the re-probe reads the row missing → one noteDead, then one kill and one relaunch carrying the verdict in that run, no failure counted, nothing armed, no tmux asked', async (state, verdict) => {
+  ])('alive (%s) but disconnected, its read-pane answering GONE → one read-pane of its own row, one findMissing sweep (verdict %s, dead evidence) and no send-keys; the re-probe reads the row missing → one noteDead, then one kill and one relaunch carrying the verdict in that run, no failure counted, nothing armed', async (state, verdict) => {
     const run = d61Run(untilSwept(state), errTmuxCaptureFailed())
 
     await run.tick()
@@ -2674,14 +2651,13 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
     // The run armed no further timer: nothing relaunches the persona again.
     expect(run.armed).toEqual([])
     expect(isRestartPendingOrActive(run.KEY)).toBe(false)
-    expect(rawTmux).toEqual([])
   })
 
   // b.jg5 SRJ-117: the row absent at the read-pane takes the GONE column
   // without being a GONE. b.jg5 SRJ-611: its verdict is a row read, never dead
   // evidence, so the re-probe that reads the row missing leads to the
   // relaunch alone, carrying the verdict, with no kill.
-  test.each(['working', 'waiting'])('alive (%s) but disconnected, its read-pane answering ErrSpawnNotFound → one findMissing sweep with the row-absent verdict and no send-keys; the re-probe reads the row missing → no kill, one relaunch carrying the row-absent verdict; no failure counted, no tmux asked', async (state) => {
+  test.each(['working', 'waiting'])('alive (%s) but disconnected, its read-pane answering ErrSpawnNotFound → one findMissing sweep with the row-absent verdict and no send-keys; the re-probe reads the row missing → no kill, one relaunch carrying the row-absent verdict; no failure counted', async (state) => {
     const run = d61Run(untilSwept(state), errSpawnNotFound())
 
     await run.tick()
@@ -2697,7 +2673,6 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
     expect(run.outcomes).toEqual([RESTART_OUTCOME_LAUNCHED])
     expect(getFailureCount(run.KEY)).toBe(0)
     expect(run.armed).toEqual([])
-    expect(rawTmux).toEqual([])
   })
 
   // b.jg5 SRJ-603 (HO C18 Verify, AC 77): a `working` row's read-pane that
@@ -2705,7 +2680,7 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
   // a read can meet (the kill-failure form is a kill's only).
   const READ_PANE_UNAVAILABLE_FORMS = UNAVAILABLE_FORMS.filter(([, , cause]) => cause === UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)
 
-  test.each(READ_PANE_UNAVAILABLE_FORMS)('alive (working) but disconnected, its read-pane answering UNAVAILABLE (%s) → the run defers: no sweep, send-keys, kill or launch, nothing counted or reset, nothing armed, no tmux asked; the transient verdict resets the slow-recovery count', async (_label, make) => {
+  test.each(READ_PANE_UNAVAILABLE_FORMS)('alive (working) but disconnected, its read-pane answering UNAVAILABLE (%s) → the run defers: no sweep, send-keys, kill or launch, nothing counted or reset, nothing armed; the transient verdict resets the slow-recovery count', async (_label, make) => {
     const run = d61Run(() => ({ state: 'working' }), make('read-pane'))
     // One failure on record, so a reset or a counted launch would show.
     recordFailure(run.KEY)
@@ -2721,7 +2696,6 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
     expect(getFailureCount(run.KEY)).toBe(1)
     expect(run.armed).toEqual([])
     expect(isRestartPendingOrActive(run.KEY)).toBe(false)
-    expect(rawTmux).toEqual([])
   })
 
   // b.jdc (/ci-live run 6), b.jg5 SRJ-606 (AC 38): a persona whose session
@@ -2750,7 +2724,7 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
       _resetNotConnectedEpisodes()
     })
 
-    test.each([...PROMPT_ROW_STATES])('REPRO: alive (%s) but disconnected, its one-line read-pane answering GONE → one read-pane of its own row, one findMissing sweep (verdict prompt-row-tmux-gone), no send-keys and no Waiting on a prompt notice; the re-probe reads the row missing → one kill and one relaunch in that run, no failure counted, nothing armed, no tmux asked', async (state) => {
+    test.each([...PROMPT_ROW_STATES])('REPRO: alive (%s) but disconnected, its one-line read-pane answering GONE → one read-pane of its own row, one findMissing sweep (verdict prompt-row-tmux-gone), no send-keys and no Waiting on a prompt notice; the re-probe reads the row missing → one kill and one relaunch in that run, no failure counted, nothing armed', async (state) => {
       const run = d61Run(untilSwept(state), errTmuxCaptureFailed())
 
       await run.tick()
@@ -2768,10 +2742,9 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
       expect(getFailureCount(run.KEY)).toBe(0)
       expect(run.armed).toEqual([])
       expect(isRestartPendingOrActive(run.KEY)).toBe(false)
-      expect(rawTmux).toEqual([])
     })
 
-    test.each([...PROMPT_ROW_STATES].flatMap((state) => READ_PANE_UNAVAILABLE_FORMS.map(([label, make]) => [state, label, make] as const)))('alive (%s) but disconnected, its one-line read-pane answering UNAVAILABLE (%s) → taken as alive: the run defers with the Waiting on a prompt notice; no sweep, send-keys, kill or launch, nothing counted or reset, nothing armed, no tmux asked', async (state, _label, make) => {
+    test.each([...PROMPT_ROW_STATES].flatMap((state) => READ_PANE_UNAVAILABLE_FORMS.map(([label, make]) => [state, label, make] as const)))('alive (%s) but disconnected, its one-line read-pane answering UNAVAILABLE (%s) → taken as alive: the run defers with the Waiting on a prompt notice; no sweep, send-keys, kill or launch, nothing counted or reset, nothing armed', async (state, _label, make) => {
       const run = d61Run(untilSwept(state), make('read-pane'))
       // One failure on record, so a reset or a counted launch would show.
       recordFailure(run.KEY)
@@ -2788,7 +2761,6 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
       expect(getFailureCount(run.KEY)).toBe(1)
       expect(run.armed).toEqual([])
       expect(isRestartPendingOrActive(run.KEY)).toBe(false)
-      expect(rawTmux).toEqual([])
     })
   })
 
@@ -2834,7 +2806,6 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
     expect(run.armed).toEqual(dead ? [] : [run.KEY])
     expect(run.notes).toEqual(dead ? [[note, run.KEY]] : [])
     expect(isRestartPendingOrActive(run.KEY)).toBe(false)
-    expect(rawTmux).toEqual([])
   })
 })
 

@@ -84,10 +84,6 @@
  * the pace starts its clock at a sample launch start, so launch starts are
  * built from the clock's time.
  *
- * tmux: a recording tmux runner (`_setTmuxCommandRunner`) is installed for
- * every case and `afterEach` asserts it recorded no call: the server starts no
- * tmux process for the approver.
- *
  * Every captured log line, notice, stub call and the state directory the
  * startup-errors log is written to pass through `assertNoLeak`. No
  * mock.module().
@@ -156,10 +152,8 @@ import {
   _resetConfiguredPersonaQuery,
   _resetDialogApprovers,
   _resetDialogReadyTimeoutMs,
-  _resetTmuxCommandRunner,
   _setApproverClock,
   _setDialogReadyTimeoutMs,
-  _setTmuxCommandRunner,
   _whenDialogApproverStopped,
   setConfiguredPersonaQuery,
   setConflictLatch,
@@ -375,7 +369,7 @@ const G_120_S: AdConfigTables = { tmux: { pending_grace_seconds: DEFAULT_AD_SETT
 const G_AT_B_FLOOR: AdConfigTables = { tmux: { pending_grace_seconds: BigInt(DIALOG_READY_TIMEOUT_MS / MS_PER_SECOND) } }
 
 // ---------------------------------------------------------------------------
-// Per-case state: the fake clock, the stub, the log lines, the tmux runner
+// Per-case state: the fake clock, the stub, the log lines
 // ---------------------------------------------------------------------------
 
 let clock: FakeClock
@@ -386,7 +380,6 @@ let statusAt: number[]
 let readPaneAt: number[]
 let errLines: string[]
 let savedConsoleError: typeof console.error
-let tmuxCalls: string[][]
 let stateDir: string
 let savedStateDir: string | undefined
 
@@ -456,11 +449,6 @@ beforeEach(() => {
     sessionNotices.push({ key, text })
     return forwardSessionNotice?.(key, text)
   })
-  tmuxCalls = []
-  _setTmuxCommandRunner(async (args) => {
-    tmuxCalls.push([...args])
-    return { code: 1, stdout: '' }
-  })
   calls = makeStubCallLog()
   statusAt = []
   readPaneAt = []
@@ -480,7 +468,6 @@ afterEach(() => {
   const leakCheck = {
     errLines,
     calls,
-    tmuxCalls,
     outageNotices,
     sessionNotices,
     settingsLines,
@@ -488,7 +475,6 @@ afterEach(() => {
   }
   try {
     expect(pendingTimers).toEqual([])
-    expect(tmuxCalls).toEqual([])
     // The approver posts nothing (b.jg5 SRJ-405), and its calls run outside
     // every attempt: only ENVIRONMENT and CONFIG arm P's retry timer, and no
     // answer starts a condition or reaches the unclassified sink (hatch A2).
@@ -501,7 +487,6 @@ afterEach(() => {
   } finally {
     _resetApproverClock()
     _resetDialogReadyTimeoutMs()
-    _resetTmuxCommandRunner()
     resetClientForTests()
     _resetOutageState()
     setConflictLatch(undefined)
@@ -724,7 +709,7 @@ describe('approvePreSessionDialogs: the lap on a pending row with a launch start
     expect(calls.sendKeysCalls).toEqual([expectedEnter(PLAIN.id), expectedEnter(PLAIN.id), expectedEnter(PLAIN.id)])
   })
 
-  test('resumed row reading pending (HO C5): both dialogs are cleared through readPane and sendKeys alone, and no tmux call is made', async () => {
+  test('resumed row reading pending (HO C5): both dialogs are cleared through readPane and sendKeys (allow_pending) alone: three status reads, two pane reads, two Enters and no other agent-director call', async () => {
     // A resumed launch reads `pending` with this launch's start until it
     // reports in; a `status` result shows no `started_at`, so the lap is the
     // same as after a fresh spawn. Folder-trust then dev-channels.
@@ -735,9 +720,13 @@ describe('approvePreSessionDialogs: the lap on a pending row with a launch start
 
     expect(await approve(NAMED, false)).toBe(APPROVER_STOP_LIVE)
 
-    expect(calls.readPaneCalls).toEqual([expectedReadPane(NAMED.id), expectedReadPane(NAMED.id)])
-    expect(calls.sendKeysCalls).toEqual([expectedEnter(NAMED.id), expectedEnter(NAMED.id)])
-    expect(tmuxCalls).toEqual([])
+    const status = { claude_instance_id: NAMED.id }
+    expect(calls).toEqual({
+      ...makeStubCallLog(),
+      statusCalls: [status, status, status],
+      readPaneCalls: [expectedReadPane(NAMED.id), expectedReadPane(NAMED.id)],
+      sendKeysCalls: [expectedEnter(NAMED.id), expectedEnter(NAMED.id)],
+    })
   })
 })
 
@@ -772,7 +761,7 @@ describe('approvePreSessionDialogs: the stops on a row state (b.jg5 SRJ-402)', (
   )
 
   test.each(FINISHED_ROWS)(
-    '%s read %s (isStartup %s): stops at that lap (finished), no read-pane, send-keys or tmux call there, one log line, the spawn-died entry only for a start-pass launch, written at once',
+    '%s read %s (isStartup %s): stops at that lap (finished), no read-pane or send-keys there and no other agent-director call, one log line, the spawn-died entry only for a start-pass launch, written at once',
     async (state, _when, isStartup, before) => {
       installStub([...before, cannedStatusResult({ state }), PENDING_ROW], { readPaneResults: [CLEAR_PANE] })
 
@@ -782,9 +771,12 @@ describe('approvePreSessionDialogs: the stops on a row state (b.jg5 SRJ-402)', (
       expect(statusAt).toHaveLength(before.length + 1)
       expect(clock.now()).toBe(statusAt[statusAt.length - 1]!)
       expect(clock.firedCount()).toBe(before.length)
-      expect(calls.readPaneCalls).toHaveLength(before.length)
-      expect(calls.sendKeysCalls).toEqual([])
-      expect(tmuxCalls).toEqual([])
+      // One status per lap; only the earlier pending lap, if any, read the pane.
+      expect(calls).toEqual({
+        ...makeStubCallLog(),
+        statusCalls: [...before, state].map(() => ({ claude_instance_id: NAMED.id })),
+        readPaneCalls: before.map(() => expectedReadPane(NAMED.id)),
+      })
       const message = approverFinishedMessage(NAMED.ref, state)
       expect(approverLines()).toEqual([approverLogLine(message)])
       expect(startupEntries()).toEqual(isStartup ? [{ label: STARTUP_ERROR_APPROVE_SPAWN_DIED, message }] : [])

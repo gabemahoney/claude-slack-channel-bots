@@ -3005,61 +3005,19 @@ function remediationHint(error: AgentDirectorError): string {
 }
 
 // ---------------------------------------------------------------------------
-// Raw tmux calls — one runner, exact targets only (b.1ix)
+// The operator's attach target — exact session name only (b.1ix)
 // ---------------------------------------------------------------------------
 
-/** One `tmux` run: its exit code (`null` when it could not run) and its stdout. */
-export interface TmuxRunResult {
-  code: number | null
-  stdout: string
-}
-
 /**
- * Runs `tmux <args>` and never rejects. No server path makes a raw tmux call
- * through it: CSCB reaches tmux only through agent-director. The runner and
- * its seams stay so a unit test can install a recording runner, see that no
- * argv reaches it, and never reach a real tmux server.
- */
-export type TmuxCommandRunner = (args: readonly string[]) => Promise<TmuxRunResult>
-
-const defaultRunTmux: TmuxCommandRunner = async (args) => {
-  const { spawn } = await import('child_process')
-  return new Promise<TmuxRunResult>((resolve) => {
-    try {
-      const child = spawn('tmux', [...args], { stdio: ['ignore', 'pipe', 'ignore'] })
-      let stdout = ''
-      child.stdout?.on('data', (d: Buffer) => { stdout += d.toString('utf8') })
-      child.on('error', () => resolve({ code: null, stdout: '' })) // tmux missing
-      child.on('close', (code) => resolve({ code, stdout }))
-    } catch {
-      resolve({ code: null, stdout: '' })
-    }
-  })
-}
-
-let _runTmux: TmuxCommandRunner = defaultRunTmux
-
-/** Test-only seam: override the tmux command runner. */
-export function _setTmuxCommandRunner(fn: TmuxCommandRunner): void {
-  _runTmux = fn
-}
-
-/** Test-only seam: restore the default tmux command runner. */
-export function _resetTmuxCommandRunner(): void {
-  _runTmux = defaultRunTmux
-}
-
-/**
+ * Renders the session target of the `tmux attach` command the not-connected
+ * notices give an operator; that text is its only use, and it makes no call.
  * tmux resolves a bare `-t <name>` to the session with that exact name when
  * there is one, and otherwise to the one session whose name starts with it.
  * Persona keys can prefix one another (`dev`, `dev_2`), so a bare
  * `slack_bot_dev` reaches `slack_bot_dev_2` whenever `slack_bot_dev` is gone:
- * an operator's `attach` would reach the neighbour's bot. A `=` prefix accepts only
- * the exact name (b.1ix). Verified against tmux 3.2a, the version in the
- * `/ci` image.
- *
- * The `attach` command the not-connected notices give an operator names
- * its session target as `=<name>`.
+ * the operator's `attach` would reach the neighbour's bot. A `=` prefix
+ * accepts only the exact name (b.1ix). Verified against tmux 3.2a, the
+ * version in the `/ci` image.
  */
 function tmuxExactSessionTarget(sessionName: string): string {
   return `=${sessionName}`
