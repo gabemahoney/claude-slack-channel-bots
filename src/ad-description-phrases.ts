@@ -25,7 +25,13 @@
  * plain spawn's label wordings, "the new row was ended", "nothing was written
  * and no row was created", "the agent's pane was not adopted", "retry kill
  * later", "never delete this row", "no kill was sent") are not case phrases:
- * each rides beside a case phrase or on a kill failure.
+ * each rides beside a case phrase, on a kill failure, or on an UNAVAILABLE
+ * (`ErrTmuxUnresponsive`) or ENVIRONMENT (`ErrTmuxNotAvailable`) error: "the
+ * new row was ended" also rides on a plain spawn's `ErrTmuxUnresponsive` or
+ * `ErrTmuxNotAvailable` after "duplicate session" whose re-lookup could not
+ * answer, beside a retry with `reuse_finished` (HO rev 26; b.jg5 SRJ-111).
+ * CSCB keys no behaviour on those words there: the error's class decides,
+ * and the row the `get` after it reads.
  *
  * Besides words, this module holds one pattern and its one helper: the
  * survivor-naming form of a kill failure (`SURVIVOR_PID_PATTERN`, b.jg5
@@ -78,7 +84,8 @@ export const CONFLICT_DIFFERENT_ID_PHRASE = 'a different instance id'
 export const CONFLICT_ANOTHER_STORE_PHRASE = 'another agent-director store'
 
 // ---------------------------------------------------------------------------
-// Words beside a CONFLICT case phrase (b.jg5 SRJ-507, SRJ-1303; not case phrases)
+// Words beside a CONFLICT case phrase, or on an UNAVAILABLE or ENVIRONMENT
+// error (b.jg5 SRJ-507, SRJ-111, SRJ-1303; not case phrases)
 // ---------------------------------------------------------------------------
 
 /**
@@ -91,7 +98,14 @@ export const PLAIN_SPAWN_LABEL_NAMES_THIS_ID_PHRASE = 'its label names this inst
 /** Written by a plain spawn beside "a different instance id" or "another agent-director store" for the holder it meets at "duplicate session". */
 export const PLAIN_SPAWN_LABEL_NOT_THIS_ID_PHRASE = 'its label does not name this instance id'
 
-/** Written by a plain spawn whose "duplicate session" refusal ended the new row. */
+/**
+ * Written by a plain spawn that ended its new row after its session-creating
+ * call met "duplicate session" (b.jg5 SRJ-111, SRJ-713): beside the case
+ * phrase of its `ErrTmuxSessionConflict`, or, when its re-lookup of the
+ * holder could not answer, in its `ErrTmuxUnresponsive` (UNAVAILABLE) or
+ * `ErrTmuxNotAvailable` (ENVIRONMENT) description, which also names a retry
+ * with `reuse_finished` once the name is free (HO rev 26).
+ */
 export const NEW_ROW_ENDED_PHRASE = 'the new row was ended'
 
 /** Written by the pre-spawn scan's refusal, which leaves no row behind. */
@@ -133,7 +147,7 @@ export function survivorPids(description: string): number[] {
 }
 
 // ---------------------------------------------------------------------------
-// Different tmux server (b.jg5 E11)
+// Different tmux server (b.jg5 SRJ-311, SRJ-1021)
 // ---------------------------------------------------------------------------
 
 /** Carried when the tmux server on the row's recorded socket is not the one the agent was launched on. */

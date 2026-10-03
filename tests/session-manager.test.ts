@@ -768,6 +768,7 @@ import {
   notResumableSequenceOutcome,
   replaceRereadLine,
   resumeNotFoundSpawnLine,
+  plainSpawnCollisionLine,
   spawnNotResumableLine,
   type PersonaRowReread,
   PENDING_ROW_STEP_LOG_PREFIX,
@@ -784,6 +785,7 @@ import {
   LIVE_ROW_NOT_LAUNCHED_NOT_APPLIED,
   LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE,
   LIVE_ROW_NOT_LAUNCHED_REUSE_COLLISION,
+  LIVE_ROW_NOT_LAUNCHED_SPAWN_COLLISION,
   LIVE_ROW_NOT_LAUNCHED_STOPPED,
   LIVE_ROW_OUTCOME_ABORTED,
   LIVE_ROW_OUTCOME_LAUNCHED,
@@ -907,6 +909,8 @@ import {
   errTmuxUnresponsive,
   errTmuxNotAvailable,
   errTmuxNotAvailableDifferentServer,
+  errTmuxNotAvailableNewRowEnded,
+  errTmuxUnresponsiveNewRowEnded,
   errConfigMalformed,
   errUnusableName,
   errSchemaMismatch,
@@ -937,6 +941,7 @@ import {
   RESTORE_SENTENCES,
   STUB_INSTANCE_ID,
   STUB_TMUX_SESSION_NAME,
+  STUB_TMUX_SOCKET_PATH,
   withRestoreSentence,
 } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig, makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
@@ -1130,6 +1135,7 @@ import {
 } from './test-helpers/recovery-harness.ts'
 import {
   CONFLICT_CASE_ROWS,
+  PLAIN_SPAWN_CONFLICT_CASE_ROWS,
   LAUNCH_START_ABSENT_PERSONA_KEY,
   LAUNCH_START_AND_NOTE_ROW,
   LAUNCH_START_CASE_ROWS,
@@ -1151,6 +1157,7 @@ import {
   sequenceResumeConflictRowsAt,
   type ConflictCaseRow,
   type LaunchStartCaseRow,
+  type PlainSpawnRowAfter,
   type LaunchStartCaseRowOf,
   type LaunchStartNonLatchingRowOf,
   type LaunchStartReadShape,
@@ -18150,6 +18157,15 @@ function statusAnswering(state: LatchRowState): RecoveryStubScript {
 }
 
 
+/**
+ * The latch row state a read of the row a plain spawn's CONFLICT left gives
+ * (b.jg5 SRJ-111; HO rev 15, rev 20): no row after the pre-spawn scan's
+ * refusal, `ended` after "duplicate session".
+ */
+function rowAfterState(rowAfter: PlainSpawnRowAfter): LatchRowState {
+  return rowAfter === 'none' ? LATCH_ROW_STATE_NO_ROW : latchRowStateRead(rowAfter)
+}
+
 /** A spawn or resume of the ladder where P's launch meets a CONFLICT. */
 interface LatchSite {
   readonly name: string
@@ -18157,8 +18173,12 @@ interface LatchSite {
   readonly verb: 'spawn' | 'resume'
   /** Configuration or seams the site needs, set before the launch. */
   setup?(h: RecoveryHarness): void
-  /** Stub answers that make P's launch meet `err` here; a site that reads nothing answers the latch-time read with `row`'s state. */
-  script(h: RecoveryHarness, persona: Persona, err: Error, row: Pick<ConflictCaseRow, 'rowState'>): RecoveryStubScript
+  /**
+   * Stub answers that make P's launch meet `err` here; a site that reads
+   * nothing answers the latch-time read with the row a plain spawn's refusal
+   * left (`row.rowAfter`, b.jg5 SRJ-111), else with `row`'s state.
+   */
+  script(h: RecoveryHarness, persona: Persona, err: Error, row: Pick<ConflictCaseRow, 'rowState' | 'rowAfter'>): RecoveryStubScript
   /** Every launch and destructive call the launch makes, the refused one included. */
   readonly calls: LaunchVerbCalls
   /** The `get` and `status` reads the path makes before the refused call. */
@@ -18185,7 +18205,7 @@ const LATCH_SPAWN_SITES: readonly LatchSite[] = [
   {
     name: 'the first spawn',
     verb: 'spawn',
-    script: (_h, _p, err, row) => ({ spawnError: err, ...statusAnswering(row.rowState) }),
+    script: (_h, _p, err, row) => ({ spawnError: err, ...statusAnswering(row.rowAfter === undefined ? row.rowState : rowAfterState(row.rowAfter)) }),
     calls: ladderCallsOf({ spawn: 1 }),
     reads: { get: 0, status: 0 },
     lastRead: undefined,
@@ -24194,19 +24214,22 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
     expectLatchedOnce(h, p, conflictLatch(p, row, REFUSED_OPERATION_RESUME, LAST_READ))
   })
 
-  // b.jg5 SRJ-113, SRJ-111, SRJ-501 (HO rev 15): the plain spawn after the
-  // entry's ErrSpawnNotFound makes agent-director's pre-spawn scan; its
-  // refusal latches P with the refused operation "plain spawn" and the state
-  // the sequence last read (resume is not a read), the stub holding no row.
-  test.each(CONFLICT_CASE_ROWS.filter((row) => row.site === 'plain spawn' && row.rowState === LATCH_ROW_STATE_NO_ROW).map((row) => [row.name, row] as const))('SRJ-113 at the entry: ErrSpawnNotFound, then the plain spawn\'s scan CONFLICT (%s): latched with "plain spawn" and the state last read; no spawn-failure notice, nothing counted, no further call', async (_name, row) => {
+  // b.jg5 SRJ-113, SRJ-111, SRJ-501 (HO rev 15, rev 20): the plain spawn
+  // after the entry's ErrSpawnNotFound makes agent-director's pre-spawn scan;
+  // each of the plain spawn's CONFLICT rows (the scan's refusal, leaving no
+  // row, and each "duplicate session" answer, leaving the row `ended`)
+  // latches P with the refused operation "plain spawn" and the state the
+  // sequence last read (resume is not a read): no kill, no further call.
+  test.each(PLAIN_SPAWN_CONFLICT_CASE_ROWS.map((row) => [row.name, row.rowAfter, row] as const))('SRJ-113, SRJ-111 at the entry: ErrSpawnNotFound, then the plain spawn\'s CONFLICT (%s, the row left: %s): latched with "plain spawn" and the state last read, no read of the row after it; no kill, no spawn-failure notice, nothing counted, no further call', async (_name, _rowAfter, row) => {
     const { h, p } = srj105Build()
-    h.script({ resumeError: errSpawnNotFound(), spawnError: row.build(), getError: errSpawnNotFound() })
+    h.script({ resumeError: errSpawnNotFound(), spawnError: row.build() })
     const order = recordCallOrder(h)
 
     expect(await launchEntry(h, p, LIVE_ROW_LAUNCH_RESUME)).toEqual({ key: p, action: 'latched' })
 
     expect(order).toEqual(['resume', 'spawn'])
     expect(h.stub.calls.spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined])
+    expect(h.stub.calls.killCalls).toEqual([])
     expectLatchedOnce(h, p, conflictLatch(p, row, REFUSED_OPERATION_PLAIN_SPAWN, LAST_READ))
   })
 
@@ -24688,8 +24711,8 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
 // b.jg5 SRJ-602 (HO C1, AC 77) and SRJ-711 (AC 57), on `makeRecoveryHarness`
 // (both settings 0).
 //
-// SRJ-602: an `ErrTmuxSessionCreate` from the plain spawn at each of its three
-// calls, from a `resume` of
+// SRJ-602: an `ErrTmuxSessionCreate` from the plain spawn at each of its four
+// calls (the live-row sequence's launch entry's included), from a `resume` of
 // an `ended` row (each through the start pass's launch, `h.launch`, and the
 // restart path's `launchSession`) and from a reuse spawn (through the
 // live-row sequence's launch entry, the reuse's only caller) is one counted
@@ -24755,6 +24778,17 @@ describe('b.jg5 SRJ-602, SRJ-711: ErrTmuxSessionCreate is one counted launch fai
         order: ['spawn'],
         launch: (h, key) =>
           launchForLiveRowSequence(harnessPersona(h, key), h.config, { kind: LIVE_ROW_LAUNCH_REUSE, lastRead: latchRowStateRead(LIVENESS_DEAD_ROW_ENDED) }),
+        entries: 0,
+      },
+    ],
+    [
+      // b.jg5 SRJ-111: the plain spawn after the entry's resume answers ErrSpawnNotFound, through the one plain-spawn outcome handler.
+      'the plain spawn after the live-row sequence\'s launch entry\'s resume answers ErrSpawnNotFound',
+      {
+        script: () => ({ resumeError: errSpawnNotFound(), spawnError: errTmuxSessionCreate('spawn') }),
+        order: ['resume', 'spawn'],
+        launch: (h, key) =>
+          launchForLiveRowSequence(harnessPersona(h, key), h.config, { kind: LIVE_ROW_LAUNCH_RESUME, lastRead: latchRowStateRead(LIVENESS_DEAD_ROW_ENDED) }),
         entries: 0,
       },
     ],
@@ -26643,19 +26677,8 @@ describe('b.jg5 SRJ-207, SRJ-111, SRJ-113: only a reuse holds; a plain spawn\'s 
     h.controller.stop(p, UNAVAILABLE_RETRY_STOP_RECOVERED)
   })
 
-  // The ladder's first, plain spawn: SRJ-111's row for it (a re-check, then
-  // UNCLASSIFIED) is not built yet; this case pins only that it holds nothing.
-  test('the ladder\'s plain spawn answering ErrInvalidFlags with a passing binary: no hold, no alert, no reuse spawn and no further call', async () => {
-    const { h, p } = srj105Build()
-    h.versionRecheck({ version: PHASE1_RC_VERSION })
-    h.script({ spawnError: errInvalidFlags('spawn') })
-    const order = recordCallOrder(h)
-
-    expect((await h.launch(p)).action).not.toBe('held')
-
-    expect(order).toEqual(['spawn'])
-    expect([h.invalidFlagsHold.heldKeys(), h.episodeNotices, h.reuseSpawns()]).toEqual([[], [], []])
-  })
+  // The plain spawn's row (a re-check, then UNCLASSIFIED, never the hold) at
+  // each plain-spawn site is SRJ-111's table describe's, at the end of this file.
 })
 
 // ---------------------------------------------------------------------------
@@ -28672,7 +28695,11 @@ describe('b.jg5 SRJ-407: each launch call\'s window, and one get after a launch 
     ([verbName, verb]): Array<readonly [string, string, TimedVerb, () => Error]> => [
       [verbName, 'tmux unreadable (ErrTmuxUnresponsive)', verb, () => errTmuxUnresponsive(verb.verb)],
       ...(verb.verb === 'spawn' && !verb.reuse
-        ? [[verbName, 'HO rev 15: the pre-spawn scan could not answer, no row written (ErrTmuxUnresponsive)', verb, () => errTmuxUnresponsive(verb.verb, 'the pre-spawn scan could not list tmux sessions; no row was written; retry later')] as const]
+        ? [
+            [verbName, 'HO rev 15: the pre-spawn scan could not answer, no row written (ErrTmuxUnresponsive)', verb, () => errTmuxUnresponsive(verb.verb, 'the pre-spawn scan could not list tmux sessions; no row was written; retry later')] as const,
+            // HO rev 26 with the end write not applied: the new row still reads pending, a covered row waited out.
+            [verbName, 'HO rev 26: the re-lookup after "duplicate session" could not answer, its end write not applied (ErrTmuxUnresponsive)', verb, () => errTmuxUnresponsiveNewRowEnded(verb.verb)] as const,
+          ]
         : [
             [verbName, 'still stopping (ErrTmuxUnresponsive)', verb, () => errTmuxUnresponsiveStillStopping(verb.verb)] as const,
             [verbName, 'still starting (ErrTmuxUnresponsive)', verb, () => errTmuxUnresponsiveStillStarting(verb.verb)] as const,
@@ -28876,5 +28903,476 @@ describe('b.jg5 SRJ-407: each launch call\'s window, and one get after a launch 
     expect(launches()).toBe(launched)
     expect(conditionEndedLines(h, p)).toHaveLength(1)
     expect([h.stub.calls.killCalls, getFailureCount(p), h.notices, h.latch.isLatched(p)]).toEqual([[], 0, [], false])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-111 (E28 T4): the plain spawn's outcome table through the one
+// plain-spawn outcome handler (`plainSpawnOutcomeAt`), at every plain-spawn
+// site: the ladder's first spawn, its retry spawn after the collision `get`
+// answers `ErrSpawnNotFound`, and the spawn after `resume`'s
+// `ErrSpawnNotFound` at `resumeOrFreshSpawn` and at the live-row sequence's
+// launch entry. On `makeRecoveryHarness` (both settings 0).
+//
+// One case per row at each site the table below gives it, asserting the
+// launch's answer, the launch and read calls from the site's first on (no
+// further launch after a refusal; an UNAVAILABLE outcome's one `get`, b.jg5
+// SRJ-407), the causes sent, the outages raised, the failures counted (the
+// entry counts its own launch), the call's window, and never a notice, a
+// `spawn-failed` entry, a kill, a delete, a reuse flag or the
+// `ErrInvalidFlags` hold. The rows pinned elsewhere are not repeated here:
+// the CONFLICT rows (E13's `LATCH_CROSS` at the ladder's three sites, the
+// row the scan's refusal or "duplicate session" leaves read at the first
+// spawn's latch-time read; the entry's in the sequence-launch entry's
+// describe), `ErrTmuxSessionCreate` (`SRJ602_SITES`, all four), the first
+// spawn's success, UNAVAILABLE and `get` table (the SRJ-401, SRJ-413 and
+// SRJ-407 describes), and ENVIRONMENT, CONFIG, UNCLASSIFIED and UNUSABLE
+// NAME at the ladder's three sites (the SRJ-105, SRJ-311, SRJ-316, SRJ-313
+// and SRJ-512 describes). A collision (get-then-act, re-run once, b.jg5
+// SRJ-114) and HO rev 26's recovery (the next attempt's collision, `get` and
+// reuse) have their own cases; the sequence's end after the entry's collision
+// is tests/live-row-sequence.test.ts's.
+// ---------------------------------------------------------------------------
+
+/** Where a plain spawn is made. */
+type PlainSpawnSiteKey = 'first' | 'retry' | 'resume' | 'entry'
+
+/** A plain-spawn site: how P's launch reaches its plain spawn, and its launch and read calls up to and including it. */
+interface PlainSpawnSite {
+  readonly key: PlainSpawnSiteKey
+  readonly name: string
+  /** Stub answers bringing P's launch to the plain spawn, which answers `answer` (success when unset), the `get`s after it answering `after`. */
+  script(h: RecoveryHarness, p: string, answer: Error | undefined, after: ReadonlyArray<CannedResponse<Phase1GetResult>>): RecoveryStubScript
+  launch(h: RecoveryHarness, p: string): Promise<unknown>
+  /** The launch and read calls (`LAUNCH_AND_READ_VERBS`) up to and including the plain spawn. */
+  readonly calls: readonly string[]
+}
+
+/** The plain spawn's own answer, queued after the site's earlier spawns: none for a success (the stub's default). */
+const plainSpawnAnswer = (answer: Error | undefined): Array<CannedResponse<Phase1SpawnResult>> => (answer === undefined ? [] : [cannedErr(answer)])
+
+const PLAIN_SPAWN_SITES: Readonly<Record<PlainSpawnSiteKey, PlainSpawnSite>> = {
+  first: {
+    key: 'first',
+    name: 'the ladder\'s first spawn',
+    script: (_h, _p, answer, after) => ({ spawnQueue: plainSpawnAnswer(answer), getQueue: [...after] }),
+    launch: (h, p) => h.launch(p),
+    calls: ['spawn'],
+  },
+  retry: {
+    key: 'retry',
+    name: 'the retry spawn after the collision get answers ErrSpawnNotFound',
+    script: (_h, _p, answer, after) => ({
+      spawnQueue: [cannedErr(errInstanceIdCollision()), ...plainSpawnAnswer(answer)],
+      getQueue: [cannedErr(errSpawnNotFound()), ...after],
+    }),
+    launch: (h, p) => h.launch(p),
+    calls: ['spawn', 'get', 'spawn'],
+  },
+  resume: {
+    key: 'resume',
+    name: 'the spawn after resume answers ErrSpawnNotFound (resumeOrFreshSpawn)',
+    script: (h, p, answer, after) => ({
+      spawnQueue: [cannedErr(errInstanceIdCollision()), ...plainSpawnAnswer(answer)],
+      getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION)), ...after],
+      resumeError: errSpawnNotFound(),
+    }),
+    launch: (h, p) => h.launch(p),
+    calls: ['spawn', 'get', 'resume', 'spawn'],
+  },
+  entry: {
+    key: 'entry',
+    name: 'the spawn after the live-row sequence\'s launch entry\'s resume answers ErrSpawnNotFound',
+    script: (_h, _p, answer, after) => ({ spawnQueue: plainSpawnAnswer(answer), getQueue: [...after], resumeError: errSpawnNotFound() }),
+    launch: (h, p) => launchForLiveRowSequence(harnessPersona(h, p), h.config, { kind: LIVE_ROW_LAUNCH_RESUME, lastRead: ENDED_READ }),
+    calls: ['resume', 'spawn'],
+  },
+}
+
+/** Every site but the first spawn, and every site. */
+const LATER_PLAIN_SPAWN_SITES: readonly PlainSpawnSiteKey[] = ['retry', 'resume', 'entry']
+const ALL_PLAIN_SPAWN_SITES: readonly PlainSpawnSiteKey[] = ['first', ...LATER_PLAIN_SPAWN_SITES]
+
+/** One row of SRJ-111's table: the plain spawn's answer and what follows it. */
+interface PlainSpawnRow {
+  readonly name: string
+  /** The plain spawn's answer; success when unset. */
+  readonly make?: () => Error
+  /** The sites this row's cases cover (the rest are pinned elsewhere; see the comment above). */
+  readonly sites: readonly PlainSpawnSiteKey[]
+  /** The launch's answer, without its key; `entryAnswer` at the entry when set. */
+  readonly answer: Readonly<Record<string, unknown>>
+  readonly entryAnswer?: Readonly<Record<string, unknown>>
+  /** P's failures counted by the entry (the ladder's launches are counted by the restart path); none when unset. */
+  readonly entryCounted?: number
+  /** An UNAVAILABLE outcome's one `get` (b.jg5 SRJ-407), reading the row `ended` or finding none, and its outcome. */
+  readonly getAfter?: 'ended' | 'none'
+  /** The retry causes sent for P, in order. */
+  readonly triggers: readonly string[]
+  /** The outages raised for P; none when unset. */
+  readonly flags?: readonly OutageClass[]
+  /** The call's window end; none when unset (an error that is no launch timeout). */
+  readonly windowEnd?: string
+  /** Install agent-director's version re-check, which passes (ErrInvalidFlags's one immediate re-check, b.jg5 SRJ-204). */
+  readonly recheck?: true
+  /** P latched (UNUSABLE NAME). */
+  readonly latched?: true
+  /** P's unclassified-error episode opened (b.jg5 SRJ-313). */
+  readonly unclassified?: true
+  /** A launch that returned success: P's approver runs, with one `pre_trust` line. */
+  readonly launched?: true
+}
+
+/** The UNAVAILABLE outcomes of a plain spawn (b.jg5 SRJ-104, SRJ-111), each with what its one `get` reads and whether it is a launch timeout. */
+const PLAIN_SPAWN_UNAVAILABLE: ReadonlyArray<readonly [string, () => Error, 'ended' | 'none', boolean]> = [
+  ['a launch timeout (ErrCallTimeout)', () => errCallTimeout('spawn'), 'ended', true],
+  ['a launch timeout (ErrTmuxUnresponsive: the session may have been created)', () => errTmuxUnresponsiveLaunchTimeout('spawn'), 'ended', true],
+  ['tmux unreadable (ErrTmuxUnresponsive)', () => errTmuxUnresponsive('spawn'), 'ended', false],
+  ['HO rev 15: the pre-spawn scan could not answer, no row written (ErrTmuxUnresponsive)', () => errTmuxUnresponsive('spawn', 'the pre-spawn scan could not list tmux sessions; no row was written; retry later'), 'none', false],
+  ['HO rev 20: "duplicate session" and its holder could not be read (ErrTmuxUnresponsive)', () => errTmuxUnresponsiveAfterDuplicateSession('spawn'), 'ended', false],
+  ['HO rev 26: the re-lookup after "duplicate session" could not answer, the new row ended (ErrTmuxUnresponsive)', () => errTmuxUnresponsiveNewRowEnded(), 'ended', false],
+]
+
+/** A refusal's answer: `failed` answered as `retrying`, P's timer armed (b.jg5 SRJ-1015). */
+const PLAIN_SPAWN_RETRYING = { action: SPAWN_ACTION_RETRYING } as const
+
+const PLAIN_SPAWN_ROWS: readonly PlainSpawnRow[] = [
+  {
+    name: 'success → spawned: the window ends returned, the approver on P\'s row, P\'s pending-only watch, one pre_trust line',
+    sites: LATER_PLAIN_SPAWN_SITES,
+    answer: { action: 'spawned' },
+    triggers: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
+    windowEnd: LAUNCH_CALL_END_RETURNED,
+    launched: true,
+  },
+  ...PLAIN_SPAWN_UNAVAILABLE.map(([label, make, getAfter, timeout]): PlainSpawnRow => ({
+    name: `UNAVAILABLE, ${label} → refused, never counted; one get of the row (${getAfter === 'none' ? 'no row' : 'ended'}), no launch after it`,
+    make,
+    sites: LATER_PLAIN_SPAWN_SITES,
+    answer: PLAIN_SPAWN_RETRYING,
+    getAfter,
+    triggers: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+    ...(timeout ? { windowEnd: LAUNCH_CALL_END_LAUNCH_TIMEOUT } : {}),
+  })),
+  ...([
+    ['the session-creating call (tmux could not be run)', () => errTmuxNotAvailable(undefined, 'spawn'), ['entry']],
+    ['the pre-spawn scan (the socket not accessible)', () => errTmuxNotAvailable(STUB_TMUX_SOCKET_PATH, 'spawn'), ['entry']],
+    ['HO rev 26: the re-lookup after "duplicate session" (the new row ended)', () => errTmuxNotAvailableNewRowEnded(), ALL_PLAIN_SPAWN_SITES],
+  ] as const).map(([label, make, sites]): PlainSpawnRow => ({
+    name: `ENVIRONMENT (ErrTmuxNotAvailable from ${label}) → tmux-unavailable, refused, never counted, no get`,
+    make,
+    sites,
+    answer: PLAIN_SPAWN_RETRYING,
+    triggers: [UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
+    flags: ['tmux-unavailable'],
+  })),
+  ...[errCwdNotFound, errCwdNotADirectory].map((make): PlainSpawnRow => ({
+    name: `DIRECTORY (${make('spawn').errName}) → cwd-unreachable; the entry counts it`,
+    make: () => make('spawn'),
+    sites: ALL_PLAIN_SPAWN_SITES,
+    answer: { action: 'failed' },
+    entryAnswer: { action: 'failed', countedClass: true },
+    entryCounted: 1,
+    triggers: [],
+    flags: ['cwd-unreachable'],
+  })),
+  {
+    name: 'ErrInvalidFlags → one immediate version re-check, then UNCLASSIFIED; never the hold',
+    make: () => errInvalidFlags('spawn'),
+    sites: ALL_PLAIN_SPAWN_SITES,
+    recheck: true,
+    answer: PLAIN_SPAWN_RETRYING,
+    triggers: [UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED],
+    unclassified: true,
+  },
+  ...([
+    ['a STATE name (ErrSpawnNotResumable)', () => errGeneric('spawn', errSpawnNotResumable().errName)],
+    ['a GONE name (ErrTmuxSendKeys)', () => errGeneric('spawn', errTmuxSendKeys().errName)],
+  ] as const).map(([label, make]): PlainSpawnRow => ({
+    name: `${label} the plain spawn gives no meaning → UNCLASSIFIED (b.jg5 SRJ-104), refused, never counted`,
+    make,
+    sites: ALL_PLAIN_SPAWN_SITES,
+    answer: PLAIN_SPAWN_RETRYING,
+    triggers: [UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED],
+    unclassified: true,
+  })),
+  {
+    name: 'UNUSABLE NAME → latched (b.jg5 SRJ-105, SRJ-512), never counted',
+    make: () => errUnusableName(),
+    sites: ['entry'],
+    answer: { action: 'latched' },
+    triggers: [],
+    latched: true,
+  },
+  {
+    name: 'CONFIG (ErrConfigMalformed) → ad-config-malformed, refused, never counted',
+    make: () => errConfigMalformed(),
+    sites: ['entry'],
+    answer: PLAIN_SPAWN_RETRYING,
+    triggers: [UNAVAILABLE_RETRY_CAUSE_CONFIG],
+    flags: ['ad-config-malformed'],
+  },
+  {
+    name: 'UNCLASSIFIED (ErrInternal) → refused, never counted',
+    make: () => errInternal(),
+    sites: ['entry'],
+    answer: PLAIN_SPAWN_RETRYING,
+    triggers: [UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED],
+    unclassified: true,
+  },
+]
+
+/** The lines `plainSpawnCollisionLine` writes for persona `key` (any spawn), re-running get-then-act (`rerun`) or answering `retrying` with the timer armed. */
+function plainSpawnCollisionLinesOf(h: RecoveryHarness, key: string, rerun: boolean): string[] {
+  const [head, tail] = plainSpawnCollisionLine('\u0000', renderPersonaRef(key, key), rerun, true).split('\u0000') as [string, string]
+  return h.errors.filter((line) => line.startsWith(head) && line.endsWith(tail))
+}
+
+describe('b.jg5 SRJ-111: the plain spawn\'s outcome table through the one handler at every plain-spawn site; a collision is get-then-act, re-run once; HO rev 26\'s ended row is recovered by the next attempt\'s collision and reuse', () => {
+  afterEach(() => {
+    expectNoDeleteOrIncludeFinished(srj105Harness)
+    srj105AfterEach()
+  })
+
+  test.each(PLAIN_SPAWN_ROWS.flatMap((row) => row.sites.map((key) => [PLAIN_SPAWN_SITES[key].name, row.name, PLAIN_SPAWN_SITES[key], row] as const)))('SRJ-111 at %s: the plain spawn answering %s', async (_site, _row, site, row) => {
+    const { h, p, b } = srj105Build()
+    const rechecks = row.recheck === true ? h.recheckAnswers(PHASE1_RC_VERSION) : undefined
+    const after = row.getAfter === undefined ? [] : [row.getAfter === 'none' ? cannedErr<Phase1GetResult>(errSpawnNotFound()) : cannedOk<Phase1GetResult>(harnessRow(h, harnessPersona(h, p), { state: LIVENESS_DEAD_ROW_ENDED }))]
+    h.script(site.script(h, p, row.make?.(), after))
+    const order = recordCallOrder(h)
+
+    const result = await site.launch(h, p)
+
+    const entry = site.key === 'entry'
+    expect(result).toStrictEqual({ key: p, ...(entry ? row.entryAnswer ?? row.answer : row.answer) })
+    expect(order.filter((verb) => LAUNCH_AND_READ_VERBS.has(verb))).toEqual([...site.calls, ...(row.getAfter === undefined ? [] : ['get'])])
+    expect(h.triggers.filter((trigger) => trigger.key === p).map((trigger) => trigger.kind)).toEqual([...row.triggers])
+    expect([...getOutageFlags(p)]).toEqual([...(row.flags ?? [])])
+    expect(getFailureCount(p)).toBe(entry ? row.entryCounted ?? 0 : 0)
+    expect(launchCallWindowOf(p)).toMatchObject({ verb: 'spawn' })
+    expect<string | undefined>(launchCallWindowOf(p)?.end).toBe(row.windowEnd)
+    // The step's one line after an UNAVAILABLE outcome, ending in what its get read.
+    const lines = launchUnavailableLines(h)
+    expect(lines).toHaveLength(row.getAfter === undefined ? 0 : 1)
+    if (row.getAfter !== undefined) {
+      const outcome = row.getAfter === 'none' ? LAUNCH_UNAVAILABLE_OUTCOME_NO_ROW : LAUNCH_UNAVAILABLE_OUTCOME_FINISHED
+      expect(lines[0]).toEndWith(` — ${outcome}; no launch in this attempt (b.jg5 SRJ-407)`)
+    }
+    // Only a LAUNCH FAILURE reaches the spawn-failure notice: none here, and no spawn-failed entry.
+    expect(h.notices).toEqual([])
+    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect([h.stub.calls.killCalls, h.reuseSpawns(), h.invalidFlagsHold.heldKeys()]).toEqual([[], [], []])
+    expect(h.stub.calls.spawnCalls.filter((call) => 'reuse_finished' in call)).toEqual([])
+    expect(h.latch.isLatched(p)).toBe(row.latched === true)
+    expect(h.unclassifiedErrorOpen(p)).toBe(row.unclassified === true)
+    if (rechecks !== undefined) expect(rechecks.resolves).toHaveLength(1)
+    expect(h.approverRunning(p)).toBe(row.launched === true)
+    expect(preTrustLines(h.errors.join('\n'))).toEqual(row.launched === true ? [preTrustLogLine(renderPersonaRef(p, p), LAUNCH_VERB_SPAWN, undefined)] : [])
+    if (row.launched === true) await h.runApproverToStop(p)
+    expect(personaCallCounts(h, b)).toEqual({})
+  })
+
+  test('ErrInvalidFlags at the first spawn whose re-check stops the server (a below-floor binary): failed and stopping, with no notice, no cause sent, nothing counted and no further call', async () => {
+    const { h, p } = srj105Build()
+    const rc = h.versionRecheck({ version: OLD_AD_VERSION })
+    h.script({ spawnError: errInvalidFlags('spawn') })
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', stopping: true })
+
+    expect(order).toEqual(['spawn'])
+    expect([rc.resolves.length, rc.stops]).toEqual([1, [AD_VERSION_RECHECK_STOP_EXIT_CODE]])
+    expect([h.notices, h.triggers, getFailureCount(p), h.invalidFlagsHold.heldKeys(), h.unclassifiedErrorOpen(p)]).toEqual([[], [], 0, [], false])
+  })
+
+  // b.jg5 SRJ-111, SRJ-114, SRJ-713: a later plain spawn's collision (the row
+  // turned live since the read that found none) re-runs get-then-act once:
+  // its collision get reads the row and its branches decide again; a plain
+  // spawn's collision in that re-run answers retrying with P's timer armed
+  // with the collision cause. Never a notice, never counted, no reuse flag.
+  test.each<readonly [string, PlainSpawnSiteKey, (h: RecoveryHarness, p: string) => RecoveryStubScript, readonly string[], Readonly<Record<string, unknown>>, readonly string[], number]>([
+    [
+      'the retry spawn collides; the re-run\'s get reads the row ended with a session id: it is resumed',
+      'retry',
+      (h, p) => ({ spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(errInstanceIdCollision())], getQueue: [cannedErr(errSpawnNotFound()), cannedOk<Phase1GetResult>(harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION))] }),
+      ['spawn', 'get', 'spawn', 'get', 'resume'],
+      { action: 'resumed' },
+      [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
+      0,
+    ],
+    [
+      'the spawn after resume\'s ErrSpawnNotFound collides; the re-run\'s get finds no row: its retry spawn succeeds',
+      'resume',
+      (h, p) => ({
+        spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(errInstanceIdCollision())],
+        getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION)), cannedErr(errSpawnNotFound())],
+        resumeError: errSpawnNotFound(),
+      }),
+      ['spawn', 'get', 'resume', 'spawn', 'get', 'spawn'],
+      { action: 'spawned' },
+      [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
+      0,
+    ],
+    [
+      'the retry spawn collides, and again in the re-run (its get finding no row again)',
+      'retry',
+      () => ({ spawnQueue: [0, 1, 2].map(() => cannedErr(errInstanceIdCollision())), getQueue: [cannedErr(errSpawnNotFound()), cannedErr(errSpawnNotFound())] }),
+      ['spawn', 'get', 'spawn', 'get', 'spawn'],
+      PLAIN_SPAWN_RETRYING,
+      [UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION],
+      1,
+    ],
+    [
+      'the spawn after resume\'s ErrSpawnNotFound collides, and again in the re-run (its get reading the row ended, its resume finding none again)',
+      'resume',
+      (h, p) => ({
+        spawnQueue: [0, 1, 2].map(() => cannedErr(errInstanceIdCollision())),
+        getResult: harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION),
+        resumeError: errSpawnNotFound(),
+      }),
+      ['spawn', 'get', 'resume', 'spawn', 'get', 'resume', 'spawn'],
+      PLAIN_SPAWN_RETRYING,
+      [UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION],
+      1,
+    ],
+    [
+      'the spawn after resume\'s ErrSpawnNotFound collides, and the re-run\'s retry spawn collides too (its get finding no row): one re-run per attempt, whichever plain spawn collides',
+      'resume',
+      (h, p) => ({
+        spawnQueue: [0, 1, 2].map(() => cannedErr(errInstanceIdCollision())),
+        getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION)), cannedErr(errSpawnNotFound())],
+        resumeError: errSpawnNotFound(),
+      }),
+      ['spawn', 'get', 'resume', 'spawn', 'get', 'spawn'],
+      PLAIN_SPAWN_RETRYING,
+      [UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION],
+      1,
+    ],
+  ])('a collision at %s (%s): get-then-act re-run once; no notice, nothing counted, no reuse flag', async (_label, _site, script, calls, answer, triggers, armedLines) => {
+    const { h, p } = srj105Build()
+    h.script(script(h, p))
+    const order = recordCallOrder(h)
+
+    expect<unknown>(await h.launch(p)).toStrictEqual({ key: p, ...answer })
+
+    expect(order.filter((verb) => LAUNCH_AND_READ_VERBS.has(verb))).toEqual([...calls])
+    expect(h.triggers.filter((trigger) => trigger.key === p).map((trigger) => trigger.kind)).toEqual([...triggers])
+    expect([plainSpawnCollisionLinesOf(h, p, true), plainSpawnCollisionLinesOf(h, p, false)].map((lines) => lines.length)).toEqual([1, armedLines])
+    expect([h.notices, getFailureCount(p), h.latch.isLatched(p)]).toEqual([[], 0, false])
+    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(h.stub.calls.spawnCalls.filter((call) => 'reuse_finished' in call)).toEqual([])
+    if (h.approverRunning(p)) await h.runApproverToStop(p)
+  })
+
+  // Hatch note E23: the collision at the entry runs no get-then-act inside the
+  // sequence; the entry answers not launched (spawn-collision), and the
+  // sequence's end arms the collision cause (tests/live-row-sequence.test.ts).
+  test('a collision at the plain spawn after the live-row sequence\'s launch entry\'s resume answers ErrSpawnNotFound: not launched (spawn-collision), no further call, nothing counted, no notice, no cause sent by the entry; the reply guard is undone', async () => {
+    const { h, p } = srj105Build()
+    const events: string[] = []
+    setPreLaunchReplyGuard(() => {
+      events.push('guard')
+      return () => void events.push('undo')
+    })
+    observeLaunchCalls(h.stub.client, (call) => events.push(call))
+    h.script(PLAIN_SPAWN_SITES.entry.script(h, p, errInstanceIdCollision(), []))
+    const order = recordCallOrder(h)
+
+    expect(await PLAIN_SPAWN_SITES.entry.launch(h, p)).toEqual({ key: p, action: LIVE_ROW_OUTCOME_NOT_LAUNCHED, reason: LIVE_ROW_NOT_LAUNCHED_SPAWN_COLLISION })
+
+    expect(order).toEqual(['resume', 'spawn'])
+    expect(events).toEqual(['guard', 'resume', 'guard', 'spawn', 'undo'])
+    expect([h.notices, h.triggers, getFailureCount(p), h.latch.isLatched(p)]).toEqual([[], [], 0, false])
+    expect(plainSpawnCollisionLinesOf(h, p, true)).toEqual([])
+  })
+
+  // HO rev 15 (b.jg5 SRJ-111, SRJ-407): a pre-spawn scan that could not
+  // answer wrote no row: the one get finds none and nothing more is launched
+  // in the attempt; P's next retry launches it.
+  test('HO rev 15: the first spawn\'s pre-spawn scan could not answer: one get finding no row, no launch in the attempt, nothing counted; P\'s next retry launches it with one plain spawn', async () => {
+    const { h, p } = srj105Build()
+    const [, make] = PLAIN_SPAWN_UNAVAILABLE.find(([, , getAfter]) => getAfter === 'none')!
+    h.script({ spawnQueue: [cannedErr(make())], getError: errSpawnNotFound(), statusError: errSpawnNotFound() })
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, ...PLAIN_SPAWN_RETRYING })
+
+    expect(order.filter((verb) => LAUNCH_AND_READ_VERBS.has(verb))).toEqual(['spawn', 'get'])
+    expect(launchUnavailableLines(h)).toEqual([expect.stringMatching(new RegExp(` — ${LAUNCH_UNAVAILABLE_OUTCOME_NO_ROW}; no launch in this attempt \\(b\\.jg5 SRJ-407\\)$`))])
+    expect([getFailureCount(p), h.notices, h.stub.calls.spawnCalls.length]).toEqual([0, [], 1])
+
+    await retryNow(h, p)
+
+    expect(h.attempts).toEqual([expect.objectContaining({ key: p, retry: 1 })])
+    expect(h.stub.calls.spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined, undefined])
+    expect([getFailureCount(p), h.notices]).toEqual([0, []])
+    if (h.approverRunning(p)) await h.runApproverToStop(p)
+    h.controller.stop(p, UNAVAILABLE_RETRY_STOP_RECOVERED)
+  })
+
+  // HO rev 26 (b.jg5 SRJ-111, SRJ-711): a plain spawn meeting "duplicate
+  // session" whose re-lookup could not answer has ended its new row. The
+  // attempt's one get reads it ended: nothing latched or counted. P's next
+  // attempt recovers it as any ended row with no session id: its plain first
+  // spawn collides, the collision get reads the row, the `resume` answers
+  // ErrNoSessionId and the launch is one reuse spawn, never a plain spawn
+  // after the collision. (The end write not applied, the get reads pending,
+  // a covered row: the SRJ-407 describe's "no launch timeout" rows.)
+  test('HO rev 26: the first spawn\'s re-lookup ErrTmuxUnresponsive (the new row ended): one get reading ended, retrying, P not latched, nothing counted; P\'s next attempt collides, reads the row and launches one reuse spawn (reuse_finished), no plain spawn after the collision', async () => {
+    const { h, p } = srj105Build()
+    const endedRow = harnessRow(h, harnessPersona(h, p), { state: LIVENESS_DEAD_ROW_ENDED })
+    h.script({ spawnError: errTmuxUnresponsiveNewRowEnded(), getResult: endedRow })
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, ...PLAIN_SPAWN_RETRYING })
+
+    expect(order.filter((verb) => LAUNCH_AND_READ_VERBS.has(verb))).toEqual(['spawn', 'get'])
+    expect(launchUnavailableLines(h)).toEqual([expect.stringMatching(new RegExp(` — ${LAUNCH_UNAVAILABLE_OUTCOME_FINISHED}; no launch in this attempt \\(b\\.jg5 SRJ-407\\)$`))])
+    expect([h.latch.isLatched(p), getFailureCount(p), h.notices]).toEqual([false, 0, []])
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
+
+    // The next attempt: the row reads ended, with no session id.
+    h.script({ spawnError: undefined, spawnQueue: [cannedErr(errInstanceIdCollision())], statusResult: cannedStatusResult({ state: LIVENESS_DEAD_ROW_ENDED }), resumeError: errNoSessionId() })
+    const firstSpawns = h.stub.calls.spawnCalls.length
+    const retryOrder = recordCallOrder(h)
+    await retryNow(h, p)
+
+    const launches = retryOrder.filter((verb) => ['spawn', 'get', 'resume'].includes(verb))
+    expect(launches.slice(0, 4)).toEqual(['spawn', 'get', 'resume', 'spawn'])
+    const retrySpawns = h.stub.calls.spawnCalls.slice(firstSpawns)
+    expect(retrySpawns.map((call) => call.reuse_finished)).toEqual([undefined, true])
+    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
+    expect([h.latch.isLatched(p), getFailureCount(p), h.notices]).toEqual([false, 0, []])
+    if (h.approverRunning(p)) await h.runApproverToStop(p)
+    h.controller.stop(p, UNAVAILABLE_RETRY_STOP_RECOVERED)
+  })
+
+  test('HO rev 26: the re-lookup\'s ErrTmuxNotAvailable (the new row ended): ENVIRONMENT, tmux-unavailable raised, no get and no further launch, nothing counted; P\'s next attempt collides, reads the ended row and launches one reuse spawn (reuse_finished), no plain spawn after the collision', async () => {
+    const { h, p } = srj105Build()
+    h.script({ spawnError: errTmuxNotAvailableNewRowEnded() })
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, ...PLAIN_SPAWN_RETRYING })
+
+    expect(order.filter((verb) => LAUNCH_AND_READ_VERBS.has(verb))).toEqual(['spawn'])
+    expect([...getOutageFlags(p)]).toEqual(['tmux-unavailable'])
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT }])
+    expect([h.latch.isLatched(p), getFailureCount(p), h.notices]).toEqual([false, 0, []])
+
+    // P's next attempt (the restart path's launch): the agent-director row reads ended, with no session id.
+    h.script({
+      spawnError: undefined,
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getResult: harnessRow(h, harnessPersona(h, p), { state: LIVENESS_DEAD_ROW_ENDED }),
+      resumeError: errNoSessionId(),
+    })
+    const retryOrder = recordCallOrder(h)
+    expect(await spawnForPersona(harnessPersona(h, p), h.config, false)).toStrictEqual({ key: p, action: 'spawned' })
+
+    expect(retryOrder.filter((verb) => LAUNCH_AND_READ_VERBS.has(verb))).toEqual(['spawn', 'get', 'resume', 'spawn'])
+    expect(h.stub.calls.spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined, undefined, true])
+    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
+    await h.runApproverToStop(p)
+    h.controller.stop(p, UNAVAILABLE_RETRY_STOP_RECOVERED)
   })
 })

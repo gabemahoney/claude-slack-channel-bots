@@ -78,6 +78,13 @@
  *      the path holds dead evidence (SRJ-611); anything else is a lost race:
  *      nothing is killed, deleted or launched, the retry timer is armed with
  *      the lost-race cause, and the ladder answers `retrying`, uncounted.
+ *      Every plain spawn (the first, the retry after the collision `get`
+ *      found no row, the one after `resume` found none, at both `resume`
+ *      sites) takes SRJ-111's table through one handler
+ *      (`plainSpawnOutcomeAt`): a later plain spawn's collision re-runs this
+ *      get-then-act once, and a plain spawn's collision in that re-run arms
+ *      the collision cause and answers `retrying`, uncounted; no collision
+ *      raises a spawn-failure notice.
  *   3. Any other error raises a spawn-failure notice for the persona via
  *      `notifySpawnFailure` (through the per-persona notifier) and is logged,
  *      except a refusal (b.jg5 SRJ-105, `refusalAt`): an UNAVAILABLE,
@@ -86,7 +93,8 @@
  *      `ad-config-malformed` outage) or UNCLASSIFIED (SRJ-313: an
  *      `ErrInternal` other than an unusable recorded name, a store-open
  *      name, `ErrSystemInstallDisappeared`, any name CSCB gives no handling,
- *      and a resume's `ErrInvalidFlags` after its re-check) outcome at any
+ *      a plain spawn's STATE or GONE name, and a resume's or a plain spawn's
+ *      `ErrInvalidFlags` after its re-check) outcome at any
  *      spawn or resume, or a read error (an
  *      ENVIRONMENT, CONFIG or UNCLASSIFIED answer included) at the collision
  *      `get`. It is logged once and stops the ladder with `failed`, which
@@ -668,6 +676,7 @@ import {
   LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE_LATCHED,
   LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE_PENDING,
   LIVE_ROW_NOT_LAUNCHED_REUSE_COLLISION,
+  LIVE_ROW_NOT_LAUNCHED_SPAWN_COLLISION,
   LIVE_ROW_NOT_LAUNCHED_STOPPED,
   LIVE_ROW_OUTCOME_NOT_LAUNCHED,
   LIVE_ROW_READ_ABSENT,
@@ -9118,23 +9127,75 @@ function launchFailureResult(key: string): SpawnPersonaResult {
 }
 
 /**
- * A plain spawn's failure by class (b.jg5 SRJ-111, SRJ-713), at every plain
- * spawn the ladder makes (the first spawn, the retry spawn after the
- * collision `get` found no row, and the spawn after `resume` found none;
- * every replacement and resume's no-transcript answer go to the reuse spawn
- * of the same id instead, b.jg5 SRJ-707, SRJ-712), with no further launch: the DIRECTORY
- * errors (`ErrCwdNotFound`, `ErrCwdNotADirectory`, by name) answer `failed`
- * quietly (the spawn's wrapper raised `cwd-unreachable`);
- * then the refusal handling (`launchRefusalAt`: a CONFLICT latches with the
- * refused operation "plain spawn" and `lastRead`, an UNUSABLE NAME latches,
- * a refusal answers `failed`), an UNAVAILABLE refusal (a launch timeout, the
- * pre-spawn scan that could not answer and "duplicate session"'s unreadable
- * or ambiguous holder included) followed by the one `get` and its decision
- * (`afterLaunchUnavailable`, b.jg5 SRJ-407); any other error writes one line (`what`
- * names the spawn), a `spawn-failed` entry at start and the spawn-failure
- * notice, and answers `failed`. An `ErrTmuxSessionCreate` among those is one
- * counted launch failure (`launchFailureResult`): nothing is killed and no
- * spawn is made in its place (SRJ-602). Never throws.
+ * A launch's `ErrInvalidFlags` at a site that gives it no meaning (b.jg5
+ * SRJ-104, SRJ-204: a plain spawn and a `resume`; the reuse spawn holds the
+ * persona instead, `invalidFlagsAtReuse`): exactly one immediate version
+ * re-check through the `ErrInvalidFlags` step
+ * (`classifyWithInvalidFlagsRecheck`), then:
+ *   - a stop the re-check decides: one line (`what` names the call), and
+ *     `failed` marked `stopping`: nothing posted, and the launch it ends is
+ *     not counted (SRJ-205);
+ *   - any other re-check answer: SRJ-105's UNCLASSIFIED row (SRJ-313): the
+ *     outage state's site entry (`reportUnclassifiedAtSite`, with the
+ *     declared `verb`) arms the persona's retry timer with the UNCLASSIFIED
+ *     cause and reports it to the persona's unclassified-error episode, one
+ *     refusal line, and `failed`, which the launch answers as `retrying`
+ *     when the timer was armed (`retryingWhenArmed`).
+ * No spawn-failure notice, no `spawn-failed` entry, nothing counted, and no
+ * further launch, delete or kill. Each line is built from the
+ * classification's rendered fields, never from the error itself. Never
+ * throws.
+ */
+async function invalidFlagsUnclassifiedAt(
+  key: string,
+  err: InvalidFlagsError,
+  verb: 'spawn' | 'resume',
+  what: string,
+  ref: string,
+): Promise<SpawnPersonaResult> {
+  const step = await classifyWithInvalidFlagsRecheck(err)
+  const recheck = `after one immediate agent-director version re-check: ${step.recheck.kind}`
+  if (step.recheck.kind === RECHECK_OUTCOME_STOP) {
+    console.error(
+      `[slack] spawnForPersona: ${what} failed for ${ref}: ${describeAdErrorClassification(step.classification)} (${recheck})`,
+    )
+    return { key, action: 'failed', stopping: true }
+  }
+  reportUnclassifiedAtSite(key, err, verb, step.classification)
+  logRefusal('spawnForPersona', what, ref, `${describeAdErrorClassification(step.classification)} (${recheck})`)
+  return { key, action: 'failed' }
+}
+
+/**
+ * A plain spawn's failure by class (b.jg5 SRJ-111, SRJ-713), once the one
+ * plain-spawn outcome handler (`plainSpawnOutcomeAt`) has taken its
+ * collision, with no further launch in the attempt:
+ *   - `ErrInvalidFlags`: one immediate version re-check, then UNCLASSIFIED
+ *     (`invalidFlagsUnclassifiedAt`, SRJ-204, SRJ-313);
+ *   - DIRECTORY (`ErrCwdNotFound`, `ErrCwdNotADirectory`, by name): `failed`
+ *     quietly (the spawn's wrapper raised `cwd-unreachable`);
+ *   - the refusal handling (`launchRefusalAt`): a CONFLICT, the pre-spawn
+ *     scan's refusal or one after "duplicate session" alike (CSCB does not
+ *     tell them apart by their words), latches with the refused operation
+ *     "plain spawn" and `lastRead`, with nothing counted and no kill; an
+ *     UNUSABLE NAME latches; UNAVAILABLE, ENVIRONMENT, CONFIG and
+ *     UNCLASSIFIED answer `failed` with no notice, the reporting point having
+ *     armed the persona's retry timer, raised the outage or fed the
+ *     unclassified-error episode by class;
+ *   - an UNAVAILABLE refusal (a launch timeout, the pre-spawn scan that could
+ *     not answer, "duplicate session"'s unreadable or ambiguous holder, and
+ *     the re-lookup after "duplicate session" that could not answer, whose
+ *     new row agent-director ended, included) is then followed by the one
+ *     `get` and its decision (`afterLaunchUnavailable`, b.jg5 SRJ-407);
+ *   - LAUNCH FAILURE (`ErrTmuxSessionCreate`): one line (`what` names the
+ *     spawn), a `spawn-failed` entry at start and the spawn-failure notice,
+ *     and one counted launch failure (`launchFailureResult`): nothing is
+ *     killed, no spawn is made in its place (SRJ-602), and the persona's
+ *     retry timer is armed at once in pending-only mode;
+ *   - any other value (a STATE or GONE name a plain spawn gives no meaning):
+ *     SRJ-105's UNCLASSIFIED row through the site entry
+ *     (`reportUnclassifiedAtSite`), one refusal line, `failed`, no notice.
+ * Only a LAUNCH FAILURE reaches the spawn-failure notice. Never throws.
  */
 async function plainSpawnFailedAt(
   persona: Persona,
@@ -9145,6 +9206,8 @@ async function plainSpawnFailedAt(
   lastRead: LastRowRead,
 ): Promise<SpawnPersonaResult> {
   const { key } = persona
+  // b.jg5 SRJ-111, SRJ-204: the plain spawn gives ErrInvalidFlags no meaning.
+  if (isInvalidFlagsError(err)) return invalidFlagsUnclassifiedAt(key, err, 'spawn', what, ref)
   // b.av2 SR-6.4: `cwd-unreachable` was raised by the spawn's wrapper.
   if (classifyAdError(err).errorClass === AD_ERROR_CLASS_DIRECTORY) return { key, action: 'failed' }
   const refused = await launchRefusalAt(key, err, 'spawn', what, ref, lastRead)
@@ -9156,13 +9219,106 @@ async function plainSpawnFailedAt(
       ? afterLaunchUnavailable({ persona, isStartup, ref, verb: 'spawn', what }, err, refused)
       : refused
   }
-  const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('spawn', 'UnknownError', String(err))
-  const described = describeAgentDirectorFailure(e)
-  const launchFailure = isLaunchFailure(err)
-  console.error(`[slack] spawnForPersona: ${what} failed for ${ref}: ${described}${launchFailure ? LAUNCH_FAILURE_LINE_TAIL : ''}`)
-  if (isStartup) recordStartupError('spawn-failed', `${what} failed for ${ref}: ${described}`)
-  notifySpawnFailure(key, e, isStartup)
-  return launchFailure ? launchFailureResult(key) : { key, action: 'failed' }
+  if (isLaunchFailure(err)) {
+    const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('spawn', 'UnknownError', String(err))
+    const described = describeAgentDirectorFailure(e)
+    console.error(`[slack] spawnForPersona: ${what} failed for ${ref}: ${described}${LAUNCH_FAILURE_LINE_TAIL}`)
+    if (isStartup) recordStartupError('spawn-failed', `${what} failed for ${ref}: ${described}`)
+    notifySpawnFailure(key, e, isStartup)
+    return launchFailureResult(key)
+  }
+  // b.jg5 SRJ-104, SRJ-105, SRJ-313: a name the plain spawn gives no meaning.
+  const classification = unclassifiedClassificationOf(err)
+  reportUnclassifiedAtSite(key, err, 'spawn', classification)
+  logRefusal('spawnForPersona', what, ref, describeAdErrorClassification(classification))
+  return { key, action: 'failed' }
+}
+
+/** What a plain-spawn site gives the one plain-spawn outcome handler (`plainSpawnOutcomeAt`). */
+export interface PlainSpawnSite<R> {
+  readonly persona: Persona
+  /** Whether the launch is part of the start pass (startup-errors entries are written only then). */
+  readonly isStartup: boolean
+  readonly ref: string
+  /** The plain spawn's parameters: `buildSpawnParams`, unchanged, with no reuse flag and no `no_pre_trust` (b.jg5 SRJ-111, SRJ-413). */
+  readonly params: SpawnParams
+  /** What the handler's lines call the spawn. */
+  readonly what: string
+  /** The row state the site last read before the spawn: the state a CONFLICT or UNUSABLE NAME latch records (b.jg5 SRJ-501). */
+  readonly lastRead: LastRowRead
+  /**
+   * Whether a DIRECTORY failure (`ErrCwdNotFound`, `ErrCwdNotADirectory`) is
+   * marked `countedClass`: the live-row sequence's launch entry counts a
+   * failure only when it is marked (b.jg5 SRJ-111), while the restart path
+   * counts any `failed` result that is not stopping. Absent: not marked.
+   */
+  readonly marksDirectoryCounted?: boolean
+  /** The site's line for a success, given the spawn's result. */
+  readonly spawnedLine: (launched: Phase1SpawnResult) => string
+  /**
+   * The site's `ErrInstanceIdCollision` row (b.jg5 SRJ-111, SRJ-114): the
+   * collision ladder's get-then-act (its first run after the first spawn,
+   * its one re-run after a later plain spawn's collision,
+   * `plainSpawnCollisionAtLadder`), or, at the live-row sequence's launch
+   * entry, the sequence's end without its launch, whose retry runs
+   * get-then-act. Never the spawn-failure notice (SRJ-713).
+   */
+  readonly collided: (err: unknown) => Promise<R>
+}
+
+/**
+ * The one plain-spawn outcome handler (b.jg5 SRJ-111): one plain spawn of
+ * persona `site.persona`'s `cscb_<key>` from `site.params`, its outcome
+ * decided by name or class (`src/ad-error-class.ts`), never by `instanceof`.
+ * Used at every plain-spawn site: the collision ladder's first spawn, its
+ * retry spawn after the collision `get` answered `ErrSpawnNotFound`, and the
+ * spawn after `resume`'s `ErrSpawnNotFound` at both `resume` sites
+ * (`resumeOrFreshSpawn` and the live-row sequence's launch entry, through
+ * `plainSpawnAfterResumeNotFound`). agent-director's pre-spawn scan runs
+ * inside the spawn and writes nothing when it refuses (HO rev 15).
+ *
+ * The installed reply-guard steps run immediately before the call (b.av2
+ * SR-9.4), and the call records its window (`launchCallWithWindow`, b.jg5
+ * SRJ-407). Then:
+ *   - success: the site's line, the after-launch step
+ *     (`afterLaunchSucceeded`: the dialog approver on the persona's `pending`
+ *     row, the pending-only arm of its retry timer, the `pre_trust` line;
+ *     SRJ-401, SRJ-301, SRJ-413), and `spawned`;
+ *   - `ErrInstanceIdCollision` (by name): nothing was launched, so the
+ *     reply-guard steps are undone (restored while still the step's own),
+ *     and the site's collision row (`site.collided`) answers: nothing is
+ *     counted, and no spawn-failure notice is posted (SRJ-713);
+ *   - any other value: the plain spawn's failure by class
+ *     (`plainSpawnFailedAt`): CONFLICT and UNUSABLE NAME latch, a launch
+ *     timeout and every other UNAVAILABLE outcome are followed by the one
+ *     `get`, ENVIRONMENT, CONFIG and UNCLASSIFIED are refusals,
+ *     `ErrTmuxSessionCreate` is one counted launch failure with no kill,
+ *     DIRECTORY answers `failed` (marked `countedClass` where the site asks,
+ *     `site.marksDirectoryCounted`), and `ErrInvalidFlags` gets one
+ *     immediate version re-check, then UNCLASSIFIED.
+ * The handler makes one launch call and never a second one after a refusal;
+ * nothing here deletes, kills or sets `include_finished`. Never throws.
+ */
+export async function plainSpawnOutcomeAt<R>(site: PlainSpawnSite<R>): Promise<SpawnPersonaResult | R> {
+  const { persona, isStartup, ref, params } = site
+  const { key } = persona
+  const replyGuardUndo = runPreLaunchReplyGuard(persona, ref)
+  let launched: Phase1SpawnResult
+  try {
+    launched = await launchCallWithWindow(key, persona.working_directory, 'spawn', (client) => client.spawn(params))
+  } catch (err) {
+    if (hasAdErrorName(err, ERR_INSTANCE_ID_COLLISION_NAME)) {
+      // b.av2 SR-9.4: a collision means an instance already exists, so this
+      // spawn's reply-guard steps are undone; any later launch runs them again.
+      undoPreLaunchReplyGuard(replyGuardUndo, ref)
+      return site.collided(err)
+    }
+    const notSpawned = await plainSpawnFailedAt(persona, err, isStartup, ref, site.what, site.lastRead)
+    return site.marksDirectoryCounted === true ? withDirectoryCounted(notSpawned, err) : notSpawned
+  }
+  console.error(site.spawnedLine(launched))
+  afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, launched)
+  return { key, action: 'spawned' }
 }
 
 // ---------------------------------------------------------------------------
@@ -9640,7 +9796,8 @@ async function noTranscriptReuse(
 /**
  * One run of the collision ladder's get-then-act for a persona
  * (`ladderGetThenAct`), carried by every step that can enter it again: the
- * replace step's reuse collision re-runs it once (b.jg5 SRJ-112).
+ * replace step's reuse collision re-runs it once (b.jg5 SRJ-112), and so
+ * does a later plain spawn's collision (SRJ-111, `plainSpawnCollisionAtLadder`).
  */
 interface LadderRun {
   readonly persona: Persona
@@ -9659,6 +9816,17 @@ interface LadderRun {
    * get-then-act its collision enters is that re-run (`retiredKeyFirstLaunch`).
    */
   readonly reuseCollisionRerun: boolean
+  /**
+   * True in the one re-run of get-then-act that a plain spawn's collision
+   * gives (b.jg5 SRJ-111, SRJ-114): the collision of a plain spawn made inside
+   * get-then-act (the retry spawn after the collision `get` found no row, or
+   * the spawn after `resume` found none) re-runs it once; a plain spawn's
+   * collision there re-runs nothing, arms the retry timer and answers
+   * `retrying` (`plainSpawnCollisionAtLadder`). The first spawn's collision
+   * enters get-then-act itself, as no re-run. Kept apart from
+   * `reuseCollisionRerun`, so each kind of collision gets its own one re-run.
+   */
+  readonly plainSpawnCollisionRerun: boolean
   /**
    * The escalate-dead verdict the restart path carried into this launch
    * (`spawnForPersona`'s `deadEvidence`, b.jg5 SRJ-611), kept for the run:
@@ -9905,6 +10073,48 @@ async function reuseFinishedRow(
 }
 
 /**
+ * The line of a plain spawn's collision inside the collision ladder's
+ * get-then-act (b.jg5 SRJ-111, SRJ-114, SRJ-713), for the spawn `what` of
+ * persona `ref`: with `rerun` the collision re-runs get-then-act once;
+ * otherwise it met the one re-run already, and the retry timer was armed
+ * (`armed`) or could not be.
+ */
+export function plainSpawnCollisionLine(what: string, ref: string, rerun: boolean, armed: boolean): string {
+  const outcome = rerun
+    ? 're-running get-then-act once'
+    : `this is the re-run of get-then-act it gave — answering retrying; the retry timer ${armed ? 'is armed' : 'could not be armed'} (cause=${UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION})`
+  return `[slack] spawnForPersona: the ${what} of ${ref} collided with a live row — nothing launched, no spawn-failure notice, nothing counted; ${outcome} (b.jg5 SRJ-111, SRJ-114, SRJ-713)`
+}
+
+/**
+ * The collision row of a plain spawn made inside the collision ladder's
+ * get-then-act (b.jg5 SRJ-111, SRJ-114, SRJ-713): the retry spawn after the
+ * collision `get` answered `ErrSpawnNotFound`, or the spawn after `resume`'s
+ * `ErrSpawnNotFound` (`resumeOrFreshSpawn`). The row turned live since the
+ * read that found none, so nothing was launched:
+ *   - the first such collision in the attempt re-runs get-then-act once
+ *     (`ladderGetThenAct`, marked as that re-run,
+ *     `run.plainSpawnCollisionRerun`): its collision `get` reads the row and
+ *     its branches decide again;
+ *   - a plain spawn's collision in that re-run makes no further call, arms
+ *     the persona's retry timer with the collision cause, as a reuse spawn's
+ *     second collision does (`reportReuseCollisionAtSite`, so the attempt
+ *     records it), and answers `retrying` (b.jg5 SRJ-1015).
+ * One line either way (`plainSpawnCollisionLine`). Never the spawn-failure
+ * notice and never counted. Never throws.
+ */
+function plainSpawnCollisionAtLadder(run: LadderRun, what: string): Promise<SpawnPersonaResult> {
+  const { key } = run.persona
+  if (!run.plainSpawnCollisionRerun) {
+    console.error(plainSpawnCollisionLine(what, run.ref, true, false))
+    return ladderGetThenAct({ ...run, plainSpawnCollisionRerun: true })
+  }
+  const armed = reportReuseCollisionAtSite(key)
+  console.error(plainSpawnCollisionLine(what, run.ref, false, armed))
+  return Promise.resolve({ key, action: SPAWN_ACTION_RETRYING })
+}
+
+/**
  * Recover a collided spawn whose live session cannot be reached: resume-first
  * (preserves session history) when resume_enabled. The `resume` and its
  * outcomes follow b.jg5 SRJ-113's table through the one `resume` outcome
@@ -9921,11 +10131,11 @@ async function reuseFinishedRow(
  *   - ErrSpawnNotFound → one plain spawn of `cscb_<key>` from
  *     `buildSpawnParams` (no reuse flag, b.jg5 SRJ-711), which makes
  *     agent-director's pre-spawn scan (SRJ-111; HO rev 15), with no
- *     spawn-failure notice for the ErrSpawnNotFound itself; the spawn's
- *     failure takes the plain spawn's handling (`plainSpawnFailedAt`), its
- *     CONFLICT latching with the refused operation "plain spawn" and its
- *     `ErrTmuxSessionCreate` counted; no other row of SRJ-111's table is
- *     applied to this spawn here;
+ *     spawn-failure notice for the ErrSpawnNotFound itself; the spawn takes
+ *     SRJ-111's whole table through the one plain-spawn outcome handler
+ *     (`plainSpawnOutcomeAt`): its collision re-runs get-then-act once
+ *     (`plainSpawnCollisionAtLadder`), its CONFLICT latches with the refused
+ *     operation "plain spawn", its `ErrTmuxSessionCreate` is counted;
  *   - every other outcome → `resumeFailedAt`: a CONFLICT latches (below),
  *     never a kill; UNAVAILABLE (the launch-timeout forms included) and
  *     ENVIRONMENT take the refusal rows, and nothing assumes the row was
@@ -10173,6 +10383,9 @@ async function resumeOrFreshSpawn(
       )
     },
     notResumable: (err) => spawnNotResumableAtLadder(run, err, deadEvidence),
+    // b.jg5 SRJ-111, SRJ-114: the plain spawn after `resume`'s
+    // ErrSpawnNotFound collided: get-then-act, re-run once.
+    plainSpawnCollided: () => plainSpawnCollisionAtLadder(run, RESUME_NOT_FOUND_SPAWN_WHAT),
   })
 }
 
@@ -10280,6 +10493,13 @@ interface ResumeSite<R> {
   readonly noTranscript: (err: AgentDirectorError) => Promise<R>
   /** The `ErrSpawnNotResumable` row (b.jg5 SRJ-710): the site's not-resumable step. */
   readonly notResumable: (err: unknown) => Promise<R>
+  /**
+   * The collision row of the plain spawn after `ErrSpawnNotFound` (b.jg5
+   * SRJ-111, SRJ-713; `plainSpawnOutcomeAt`'s `collided`): the collision
+   * ladder's get-then-act re-run once (`plainSpawnCollisionAtLadder`), or the
+   * live-row sequence's end without its launch (`sequenceSpawnCollision`).
+   */
+  readonly plainSpawnCollided: (err: unknown) => Promise<R>
 }
 
 /**
@@ -10297,8 +10517,10 @@ interface ResumeSite<R> {
  *   - `ErrSpawnNotResumable`: the site's not-resumable step
  *     (`site.notResumable`, SRJ-710);
  *   - `ErrSpawnNotFound`: one plain spawn of the same id
- *     (`plainSpawnAfterResumeNotFound`, SRJ-111), with no spawn-failure
- *     notice for the `ErrSpawnNotFound` itself;
+ *     (`plainSpawnAfterResumeNotFound`, SRJ-111) through the one plain-spawn
+ *     outcome handler, with no spawn-failure notice for the
+ *     `ErrSpawnNotFound` itself; its collision takes the site's row
+ *     (`site.plainSpawnCollided`);
  *   - any other outcome: `resumeFailedAt` (CONFLICT latches with the refused
  *     operation "resume" and `site.lastRead`, never a kill; UNAVAILABLE,
  *     ENVIRONMENT, CONFIG and UNCLASSIFIED take the refusal rows, an
@@ -10343,33 +10565,41 @@ export function resumeNotFoundSpawnLine(head: string, ref: string): string {
   return `${head} ErrSpawnNotFound on resume for ${ref} — fresh-spawn: one plain spawn of the same id, which makes agent-director's pre-spawn scan; no spawn-failure notice for the ErrSpawnNotFound (b.jg5 SRJ-113, SRJ-111)`
 }
 
+/** What the lines of the plain spawn after `resume`'s `ErrSpawnNotFound` call it. */
+const RESUME_NOT_FOUND_SPAWN_WHAT = 'fresh spawn after ErrSpawnNotFound on resume'
+
 /**
  * `resume`'s `ErrSpawnNotFound` row (b.jg5 SRJ-113, SRJ-111): the row is
  * gone (an operator's action, or `expire` removed it before `resume`'s
  * move), so one plain spawn of `cscb_<key>` from `site.params`
- * (`buildSpawnParams`, no reuse flag, SRJ-711) through the ladder's launch
- * helper; agent-director's pre-spawn scan runs inside it (HO rev 15). No
- * spawn-failure notice is posted for the `ErrSpawnNotFound` itself. A
- * success runs the after-launch step and answers `spawned`; a failure takes
- * the plain spawn's handling (`plainSpawnFailedAt`): its CONFLICT (the
- * scan's refusal, or one after "duplicate session") latches with the
- * refused operation "plain spawn" and `site.lastRead`, since `resume` is not
- * a read; its `ErrTmuxSessionCreate` is one counted launch failure. Never
- * throws.
+ * (`buildSpawnParams`, no reuse flag, SRJ-711) through the one plain-spawn
+ * outcome handler (`plainSpawnOutcomeAt`); agent-director's pre-spawn scan
+ * runs inside it (HO rev 15). No spawn-failure notice is posted for the
+ * `ErrSpawnNotFound` itself. A success runs the after-launch step and
+ * answers `spawned`; a collision takes the site's collision row
+ * (`site.plainSpawnCollided`: get-then-act at the collision ladder, the
+ * sequence's end without its launch at the live-row sequence's entry); a
+ * failure takes the plain spawn's handling (`plainSpawnFailedAt`): its
+ * CONFLICT (the scan's refusal, or one after "duplicate session") latches
+ * with the refused operation "plain spawn" and `site.lastRead`, since
+ * `resume` is not a read; its `ErrTmuxSessionCreate` is one counted launch
+ * failure. A DIRECTORY failure is marked `countedClass` where the site asks
+ * (`site.marksDirectoryCounted`). Never throws.
  */
-async function plainSpawnAfterResumeNotFound(site: ResumeSite<unknown>): Promise<SpawnPersonaResult> {
+async function plainSpawnAfterResumeNotFound<R>(site: ResumeSite<R>): Promise<SpawnPersonaResult | R> {
   const { persona, isStartup, ref, lastRead, head, params } = site
-  const { key } = persona
   console.error(resumeNotFoundSpawnLine(head, ref))
-  try {
-    const launched: Phase1SpawnResult = await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
-    console.error(`${head} fresh-spawned (after ErrSpawnNotFound on resume) for ${ref}`)
-    afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, launched)
-    return { key, action: 'spawned' }
-  } catch (err2) {
-    const notSpawned = await plainSpawnFailedAt(persona, err2, isStartup, ref, 'fresh spawn after ErrSpawnNotFound on resume', lastRead)
-    return site.marksDirectoryCounted ? withDirectoryCounted(notSpawned, err2) : notSpawned
-  }
+  return plainSpawnOutcomeAt<R>({
+    persona,
+    isStartup,
+    ref,
+    params,
+    what: RESUME_NOT_FOUND_SPAWN_WHAT,
+    lastRead,
+    marksDirectoryCounted: site.marksDirectoryCounted,
+    spawnedLine: () => `${head} fresh-spawned (after ErrSpawnNotFound on resume) for ${ref}`,
+    collided: site.plainSpawnCollided,
+  })
 }
 
 /** `result` marked `countedClass` when it is `failed`, not stopping, and `err`'s class is DIRECTORY; otherwise `result` as it is. */
@@ -11104,8 +11334,9 @@ async function replaceAtResumeSite(
  * A `resume`'s failure by class, once the one `resume` outcome handler's
  * own rows have passed it (`resumeAtSite`, at `resumeOrFreshSpawn` and at
  * the live-row sequence's launch entry), with no further launch: `ErrInvalidFlags` gets one immediate version re-check
- * (a stop it decides answers `failed` marked `stopping`; otherwise
- * UNCLASSIFIED through the site entry, b.jg5 SRJ-104, SRJ-313); the
+ * (`invalidFlagsUnclassifiedAt`: a stop it decides answers `failed` marked
+ * `stopping`; otherwise UNCLASSIFIED through the site entry, b.jg5 SRJ-104,
+ * SRJ-313); the
  * DIRECTORY errors (`ErrCwdNotFound`, `ErrCwdNotADirectory`, by name) answer
  * `failed` quietly (the wrapper raised `cwd-unreachable`); then the refusal handling
  * (`launchRefusalAt`: a CONFLICT latches with the refused operation
@@ -11129,27 +11360,9 @@ async function resumeFailedAt(
   lastRead: LastRowRead,
 ): Promise<SpawnPersonaResult> {
   const { key } = persona
-  if (isInvalidFlagsError(err)) {
-    // b.jg5 SRJ-104: the resume site gives ErrInvalidFlags no meaning: one
-    // immediate version re-check, then UNCLASSIFIED. The line is built from
-    // the classification's rendered fields, never from the error itself.
-    const step = await classifyWithInvalidFlagsRecheck(err)
-    const recheck = `after one immediate agent-director version re-check: ${step.recheck.kind}`
-    // The stop posts nothing to Slack, and a launch it ends is not counted.
-    if (step.recheck.kind === RECHECK_OUTCOME_STOP) {
-      console.error(
-        `[slack] spawnForPersona: resume failed for ${ref}: ${describeAdErrorClassification(step.classification)} (${recheck})`,
-      )
-      return { key, action: 'failed', stopping: true }
-    }
-    // b.jg5 SRJ-105, SRJ-313: UNCLASSIFIED handling. The site entry arms
-    // the persona's retry timer with the UNCLASSIFIED cause (so the launch
-    // is refused and never counted) and reports the outcome to its
-    // unclassified-error episode. No notice; no delete, kill or launch.
-    reportUnclassifiedAtSite(key, err, 'resume', step.classification)
-    logRefusal('spawnForPersona', 'resume', ref, `${describeAdErrorClassification(step.classification)} (${recheck})`)
-    return { key, action: 'failed' }
-  }
+  // b.jg5 SRJ-104: the resume site gives ErrInvalidFlags no meaning: one
+  // immediate version re-check, then UNCLASSIFIED (SRJ-105, SRJ-313).
+  if (isInvalidFlagsError(err)) return invalidFlagsUnclassifiedAt(key, err, 'resume', 'resume', ref)
   // b.av2 SR-6.4: `cwd-unreachable` was raised by the resume's wrapper.
   if (classifyAdError(err).errorClass === AD_ERROR_CLASS_DIRECTORY) return { key, action: 'failed' }
   // b.jg5 SRJ-104, SRJ-105: `ErrSystemInstallDisappeared` is UNCLASSIFIED
@@ -11535,12 +11748,12 @@ function undoPreLaunchReplyGuard(undo: ReplyGuardUndo | undefined, ref: string):
  * An agent-director call that starts the persona's instance (`client.spawn`
  * or `client.resume`, declared as `verb`), preceded immediately by the
  * reply-guard steps. Every
- * spawn and resume in the ladder goes through here except the optimistic
- * first spawn, which also undoes the steps when it meets a live instance,
- * and the reuse spawn (`reuseSpawnForPersona`), which makes the same two
- * steps itself so that a retired key's first launch can undo them the same
- * way (b.jg5 SRJ-805). The call records its window (`launchCallWithWindow`,
- * b.jg5 SRJ-407).
+ * `resume` goes through here; every plain spawn goes through the one
+ * plain-spawn outcome handler (`plainSpawnOutcomeAt`), which also undoes the
+ * steps when it meets a live instance, and the reuse spawn
+ * (`reuseSpawnForPersona`) makes the same two steps itself so that a retired
+ * key's first launch can undo them the same way (b.jg5 SRJ-805). The call
+ * records its window (`launchCallWithWindow`, b.jg5 SRJ-407).
  */
 function launchWithReplyGuard<T>(
   persona: Persona,
@@ -11615,8 +11828,8 @@ export function forgetLaunchCalls(key: string): void {
  * description carries "the session may have been created"), when the call's
  * error reaches CSCB. Any other error leaves the window with no end. The
  * call's answer or error is passed on unchanged. Every launch call goes
- * through here: the ladder's first spawn and a reuse spawn directly, and
- * every other spawn and `resume` through `launchWithReplyGuard`.
+ * through here: every plain spawn (`plainSpawnOutcomeAt`) and a reuse spawn
+ * directly, and every `resume` through `launchWithReplyGuard`.
  */
 async function launchCallWithWindow<T>(
   key: string,
@@ -12277,8 +12490,11 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *      once, whatever the row's state, `cwd` or `config_dir` label: no wait,
  *      sweep, reconnect, sequence or launch, no notice, nothing counted
  *      (b.jg5 SRJ-501, SRJ-502). Any other note, or none, goes on below.
- *      `ErrSpawnNotFound` retries the plain spawn once; any other error takes
- *      the refusal row (`refusalAt`);
+ *      `ErrSpawnNotFound` retries the plain spawn once, through the one
+ *      plain-spawn outcome handler (`plainSpawnOutcomeAt`, b.jg5 SRJ-111),
+ *      whose collision re-runs this step once (`plainSpawnCollisionAtLadder`;
+ *      a plain spawn's collision in that re-run answers `retrying` with the
+ *      retry timer armed); any other error takes the refusal row (`refusalAt`);
  *    - the row's `cwd` differs from the persona's working_directory by real
  *      path (`compareRowToPersona`) → the replace step, whatever the state
  *      and resume_enabled (b.av2 SR-6.2 as amended, b.jg5 SRJ-1503: "An
@@ -12302,7 +12518,8 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *      the conversation kept only when the path holds dead evidence
  *      (SRJ-611); otherwise a lost race: nothing killed, deleted or
  *      launched, the retry timer armed with the lost-race cause,
- *      `retrying`; on ErrSpawnNotFound → one plain spawn
+ *      `retrying`; on ErrSpawnNotFound → one plain spawn through the one
+ *      plain-spawn outcome handler, whose collision re-runs this step once
  *      (SRJ-113, SRJ-111). An escalate-dead verdict the restart path carried
  *      in (`deadEvidence`) goes with this path, named in one line (b.jg5
  *      SRJ-611).
@@ -12359,7 +12576,10 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *    Nothing in step 5 deletes or kills a row.
  * 6. A CONFLICT at any spawn or resume above latches the persona and
  *    answers `latched` (b.jg5 SRJ-501, `conflictAt`); other errors → surface
- *    to Slack + (when isStartup) startup-errors.log, except a refusal. An
+ *    to Slack + (when isStartup) startup-errors.log, except a refusal and,
+ *    at a plain spawn, any error but a LAUNCH FAILURE (SRJ-111: a collision
+ *    is get-then-act, and `ErrInvalidFlags` and the names a plain spawn
+ *    gives no meaning are UNCLASSIFIED). An
  *    `ErrTmuxSessionCreate` (LAUNCH FAILURE, by name) at any of them is one
  *    counted launch failure (b.jg5 SRJ-602; `plainSpawnFailedAt`,
  *    `resumeFailedAt`): the notice, a `spawn-failed` entry at start, and
@@ -12578,8 +12798,9 @@ export interface LaunchHooks {
  * One collision ladder for a persona; `spawnForPersona` single-flights it per
  * key. `carriedDeadEvidence` is the escalate-dead verdict the restart path
  * carried in (b.jg5 SRJ-611), kept for the run (`LadderRun`).
+ * Not `async` on purpose (keeps callers' microtask timing); its async-arrow caller turns a throw into a rejection.
  */
-async function runPersonaLadder(
+function runPersonaLadder(
   persona: Persona,
   config: PersonaConfig,
   isStartup: boolean,
@@ -12610,6 +12831,7 @@ async function runPersonaLadder(
     params,
     hooks,
     reuseCollisionRerun: false,
+    plainSpawnCollisionRerun: false,
     carriedDeadEvidence,
     retiredAtStart: retiredKeyAttemptStartOf(key, retired),
   }
@@ -12624,37 +12846,36 @@ async function runPersonaLadder(
   // b.av2 SR-9.4: the reply-guard steps run immediately before every spawn or
   // resume, never on a path that only reconnects to a live instance or does
   // nothing. This optimistic spawn is a launch only when no row exists; a
-  // collision means an instance already exists, so its steps are undone (the
-  // record and launched-with dir restored while still this step's own, and
-  // the hook re-evaluated against the persona's current config) and any later
-  // spawn or resume below runs them again.
-  let replyGuardUndo: ReplyGuardUndo | undefined
-  try {
-    replyGuardUndo = runPreLaunchReplyGuard(persona, ref)
-    const r: Phase1SpawnResult = await launchCallWithWindow(key, persona.working_directory, 'spawn', (client) => client.spawn(params))
-    console.error(`[slack] spawnForPersona: spawned ${ref} instanceId=${r.claude_instance_id}`)
-    afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, r)
-    return { key, action: 'spawned' }
-  } catch (err) {
-    if (err instanceof ErrInstanceIdCollision) {
-      // Collision → fall through to get-then-act
-      undoPreLaunchReplyGuard(replyGuardUndo, ref)
+  // collision means an instance already exists, so the handler undoes its
+  // steps (the record and launched-with dir restored while still this step's
+  // own, and the hook re-evaluated against the persona's current config) and
+  // any later spawn or resume below runs them again.
+  // b.jg5 SRJ-111: SRJ-111's table through the one plain-spawn outcome
+  // handler. A CONFLICT (the pre-spawn scan's, or one after "duplicate
+  // session") latches the persona with the refused operation "plain spawn";
+  // nothing of the row was read before this first spawn, so the latch-time
+  // `status` read gives its state. An `ErrTmuxSessionCreate` (by name) is one
+  // counted launch failure: nothing is killed and no spawn is made in its
+  // place, and the persona's retry timer is armed at once in pending-only
+  // mode (b.jg5 SRJ-602, SRJ-713, SRJ-409). Its collision leads on to
+  // get-then-act, as its first run, not a re-run (SRJ-114).
+  return plainSpawnOutcomeAt<SpawnPersonaResult>({
+    persona,
+    isStartup,
+    ref,
+    params,
+    what: 'spawn',
+    lastRead: NOTHING_READ,
+    spawnedLine: (r) => `[slack] spawnForPersona: spawned ${ref} instanceId=${r.claude_instance_id}`,
+    collided: () => {
       console.error(`[slack] spawnForPersona: ErrInstanceIdCollision for ${ref} — fetching current state`)
-    } else {
-      // b.jg5 SRJ-111: a CONFLICT (the pre-spawn scan's, or one after
-      // "duplicate session") latches the persona with the refused operation
-      // "plain spawn"; nothing of the row was read before this first spawn,
-      // so the latch-time `status` read gives its state. An
-      // `ErrTmuxSessionCreate` (by name) is one counted launch failure:
-      // nothing is killed and no spawn is made in its place, and the
-      // persona's retry timer is armed at once in pending-only mode
-      // (b.jg5 SRJ-602, SRJ-713, SRJ-409).
-      return plainSpawnFailedAt(persona, err, isStartup, ref, 'spawn', NOTHING_READ)
-    }
-  }
-
-  return ladderGetThenAct(run)
+      return ladderGetThenAct(run)
+    },
+  })
 }
+
+/** What the ladder's lines call its retry spawn after the collision `get` answered `ErrSpawnNotFound`. */
+const LADDER_RETRY_SPAWN_WHAT = 'retry-spawn'
 
 /** What the retired-key rule's lines call the reuse spawn it makes. */
 const RETIRED_KEY_REUSE_WHAT = "retired key's reuse spawn"
@@ -12774,17 +12995,21 @@ async function ladderGetThenAct(run: LadderRun): Promise<SpawnPersonaResult> {
       const retired = retiredKeyReadingOf(key)
       const retiredStep = retired.recorded ? retiredKeyAtCollision(run, retired, LATCH_ROW_STATE_NO_ROW) : undefined
       if (retiredStep !== undefined) return retiredStep
-      // Race: row deleted between spawn-collision and get. Retry spawn once.
+      // Race: row deleted between spawn-collision and get. Retry spawn once,
+      // through the one plain-spawn outcome handler (b.jg5 SRJ-111); the
+      // collision `get` read no row (SRJ-501), and a collision of this spawn
+      // re-runs get-then-act once (SRJ-114, `plainSpawnCollisionAtLadder`).
       console.error(`[slack] spawnForPersona: ErrSpawnNotFound after collision for ${ref} — retrying spawn (single retry)`)
-      try {
-        const r: Phase1SpawnResult = await launchWithReplyGuard(persona, ref, 'spawn', (client) => client.spawn(params))
-        console.error(`[slack] spawnForPersona: retry-spawn succeeded for ${ref} instanceId=${r.claude_instance_id}`)
-        afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, r)
-        return { key, action: 'spawned' }
-      } catch (err2) {
-        // b.jg5 SRJ-501: the collision `get` read no row.
-        return plainSpawnFailedAt(persona, err2, isStartup, ref, 'retry-spawn', LATCH_ROW_STATE_NO_ROW)
-      }
+      return plainSpawnOutcomeAt<SpawnPersonaResult>({
+        persona,
+        isStartup,
+        ref,
+        params,
+        what: LADDER_RETRY_SPAWN_WHAT,
+        lastRead: LATCH_ROW_STATE_NO_ROW,
+        spawnedLine: (r) => `[slack] spawnForPersona: retry-spawn succeeded for ${ref} instanceId=${r.claude_instance_id}`,
+        collided: () => plainSpawnCollisionAtLadder(run, LADDER_RETRY_SPAWN_WHAT),
+      })
     }
     // b.jg5 SRJ-105, SRJ-311, SRJ-313, SRJ-316: a read error is a refusal,
     // an ENVIRONMENT, a CONFIG and an UNCLASSIFIED answer
@@ -13843,7 +14068,7 @@ export interface LiveRowSequenceLaunchRequest {
   readonly retiredAtStart?: RetiredKeyAttemptStart
 }
 
-/** The entry's answer when it made no launch: a reuse collision, `ErrSpawnNotResumable`, the sequence stopped. */
+/** The entry's answer when it made no launch: a reuse collision, a collision of the plain spawn after `resume`'s `ErrSpawnNotFound`, `ErrSpawnNotResumable`, the sequence stopped. */
 export interface LiveRowSequenceNotLaunched {
   readonly key: string
   readonly action: typeof LIVE_ROW_OUTCOME_NOT_LAUNCHED
@@ -13900,8 +14125,14 @@ export type LiveRowSequenceLaunchEntryResult = SpawnPersonaResult | LiveRowSeque
  *     row, `not-resumable` (a lost race) otherwise. `ErrSpawnNotFound` makes
  *     one plain spawn of the same id from `buildSpawnParams` (no reuse flag;
  *     agent-director's pre-spawn scan runs inside it, SRJ-111), with no
- *     spawn-failure notice for the `ErrSpawnNotFound` itself; that spawn's
- *     failure takes the plain spawn's handling (`plainSpawnFailedAt`). An
+ *     spawn-failure notice for the `ErrSpawnNotFound` itself; that spawn
+ *     takes SRJ-111's table through the one plain-spawn outcome handler
+ *     (`plainSpawnOutcomeAt`): its collision answers not launched
+ *     (`spawn-collision`, `sequenceSpawnCollision`): no further launch,
+ *     nothing counted, no notice; the sequence ends without its launch and
+ *     arms the persona's retry timer with the collision cause, whose run is
+ *     the get-then-act; its failure takes the plain spawn's handling
+ *     (`plainSpawnFailedAt`). An
  *     `ErrTmuxSessionCreate` (by class) is a counted launch failure that also
  *     arms the persona's retry timer at once in pending-only mode, through
  *     the shared `resumeFailedAt` (SRJ-113, SRJ-409), and a DIRECTORY error
@@ -14132,7 +14363,28 @@ async function sequenceLaunchCall(
       return sequenceReuseAnswer(persona, reused)
     },
     notResumable: (err) => sequenceNotResumable(key, ref, err),
+    plainSpawnCollided: () => Promise.resolve(sequenceSpawnCollision(persona)),
   })
+}
+
+/**
+ * The collision row of the plain spawn the live-row sequence's step-6
+ * `resume` leg makes after `ErrSpawnNotFound` (b.jg5 SRJ-111, SRJ-713,
+ * SRJ-705, SRJ-706): the row turned live, so nothing was launched. No
+ * get-then-act runs inside the sequence, which would be a second launch path
+ * for the persona while its sequence runs: one line and the not-launched
+ * answer `spawn-collision`, so the sequence ends without its launch, counts
+ * nothing and arms the persona's retry timer with the collision cause, and
+ * that retry's run of the restart path's decision is the get-then-act (its
+ * ladder's plain first spawn collides and goes on to the collision `get`),
+ * as for a reuse collision there (SRJ-112). Never the spawn-failure notice.
+ */
+function sequenceSpawnCollision(persona: Persona): LiveRowSequenceNotLaunched {
+  const { key } = persona
+  console.error(
+    `${LIVE_ROW_SEQUENCE_LOG_PREFIX} the ${RESUME_NOT_FOUND_SPAWN_WHAT} of ${personaRef(persona)} collided with a live row — nothing launched, no spawn-failure notice, nothing counted; the sequence ends without its launch, and the retry it arms runs get-then-act (b.jg5 SRJ-111, SRJ-705, SRJ-713)`,
+  )
+  return { key, action: LIVE_ROW_OUTCOME_NOT_LAUNCHED, reason: LIVE_ROW_NOT_LAUNCHED_SPAWN_COLLISION }
 }
 
 /** The outcome of the step-6 `resume`'s `ErrSpawnNotResumable` when the re-read latched the persona. */

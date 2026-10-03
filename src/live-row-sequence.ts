@@ -458,6 +458,14 @@ export interface LiveRowSequenceLaunchResult {
  */
 export const LIVE_ROW_NOT_LAUNCHED_REUSE_COLLISION = 'reuse-collision'
 /**
+ * Not launched: the `resume` answered `ErrSpawnNotFound` and the plain spawn
+ * after it answered `ErrInstanceIdCollision`, so the row is live and nothing
+ * was launched (SRJ-111, SRJ-713). Nothing is counted; the end arms the
+ * collision cause, as for a reuse collision, and that retry's run is the
+ * get-then-act (SRJ-705, SRJ-706: none runs inside the sequence).
+ */
+export const LIVE_ROW_NOT_LAUNCHED_SPAWN_COLLISION = 'spawn-collision'
+/**
  * Not launched: the `resume` answered `ErrSpawnNotResumable` and the re-read
  * of the row found a lost race: a live state other than `pending`, `ended`,
  * `missing` or no row, or the read failed (SRJ-710: no second sequence).
@@ -488,6 +496,7 @@ export const LIVE_ROW_NOT_LAUNCHED_STOPPED = 'stopped'
 /** Why step 6 made no launch. */
 export type LiveRowSequenceNotLaunchedReason =
   | typeof LIVE_ROW_NOT_LAUNCHED_REUSE_COLLISION
+  | typeof LIVE_ROW_NOT_LAUNCHED_SPAWN_COLLISION
   | typeof LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE
   | typeof LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE_PENDING
   | typeof LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE_LATCHED
@@ -648,7 +657,9 @@ export const LIVE_ROW_ARM_NOT_JUDGED = 'sequence-not-judged'
 export const LIVE_ROW_ARM_ENDED = 'sequence-ended-without-launch'
 /**
  * Arm P's retry timer with the reuse-collision cause (SRJ-112, SRJ-301): a
- * reuse collision at step 6 ended the sequence without its launch. The same
+ * reuse collision at step 6, or a collision of the plain spawn after the
+ * `resume`'s `ErrSpawnNotFound` (SRJ-111), ended the sequence without its
+ * launch. The same
  * string as the retry controller's cause label for it
  * (`UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION`), as for the other causes.
  */
@@ -1248,8 +1259,9 @@ export async function runLiveRowSequence(
    * `ErrTmuxSessionCreate` armed the timer in pending-only mode itself
    * (SRJ-112, SRJ-113, SRJ-409: pending-only unless another cause holds); an
    * arm the launch's own refusal handling made already keeps its due time. A
-   * reuse collision at step 6 arms the reuse-collision cause (SRJ-112,
-   * SRJ-705); a `resume`'s `ErrSpawnNotResumable` whose re-read found a lost
+   * reuse collision at step 6, and a collision of the plain spawn after the
+   * `resume`'s `ErrSpawnNotFound`, arm the reuse-collision cause (SRJ-112,
+   * SRJ-111, SRJ-705); a `resume`'s `ErrSpawnNotResumable` whose re-read found a lost
    * race arms the lost-race cause, and one whose re-read found the row
    * `pending` the other-end cause (SRJ-710).
    */
@@ -1268,7 +1280,7 @@ export async function runLiveRowSequence(
         if (body.result.pendingOnlyArmed === true) return undefined
         break
       case LIVE_ROW_OUTCOME_NOT_LAUNCHED:
-        if (body.notLaunched === LIVE_ROW_NOT_LAUNCHED_REUSE_COLLISION) {
+        if (body.notLaunched === LIVE_ROW_NOT_LAUNCHED_REUSE_COLLISION || body.notLaunched === LIVE_ROW_NOT_LAUNCHED_SPAWN_COLLISION) {
           return latchedNow() ? undefined : LIVE_ROW_ARM_REUSE_COLLISION
         }
         if (body.notLaunched === LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE) {

@@ -161,14 +161,17 @@ import {
   errSystemInstallDisappeared,
   errTmuxCaptureFailed,
   errTmuxKillFailed,
+  NEW_ROW_ENDED_RETRY,
   errTmuxNotAvailable,
   errTmuxNotAvailableDifferentServer,
+  errTmuxNotAvailableNewRowEnded,
   errTmuxSendKeys,
   errTmuxSessionConflict,
   errTmuxSessionCreate,
   errTmuxUnresponsive,
   errTmuxUnresponsiveAfterDuplicateSession,
   errTmuxUnresponsiveLaunchTimeout,
+  errTmuxUnresponsiveNewRowEnded,
   errTmuxUnresponsiveStillStarting,
   errTmuxUnresponsiveStillStopping,
   errUnknownErrorName,
@@ -240,6 +243,8 @@ const ROWS: readonly Row[] = [
   ['errTmuxUnresponsiveLaunchTimeout (resume)', () => errTmuxUnresponsiveLaunchTimeout('resume'), AD_ERROR_CLASS_UNAVAILABLE],
   ['errTmuxUnresponsiveStillStopping', () => errTmuxUnresponsiveStillStopping(), AD_ERROR_CLASS_UNAVAILABLE],
   ['errTmuxUnresponsiveStillStarting', () => errTmuxUnresponsiveStillStarting(), AD_ERROR_CLASS_UNAVAILABLE],
+  // HO rev 26: a plain spawn's re-lookup after "duplicate session" that could not answer, its new row ended.
+  ['errTmuxUnresponsiveNewRowEnded', () => errTmuxUnresponsiveNewRowEnded(), AD_ERROR_CLASS_UNAVAILABLE],
   ...KILL_FAILED_DESCRIPTIONS.map((d): Row => [
     `errTmuxKillFailed (${d})`,
     () => errTmuxKillFailed(STUB_TMUX_SESSION_NAME, d),
@@ -298,6 +303,7 @@ const ROWS: readonly Row[] = [
   ['errTmuxNotAvailable', () => errTmuxNotAvailable(), AD_ERROR_CLASS_ENVIRONMENT],
   ['errTmuxNotAvailable with a socket', () => errTmuxNotAvailable(STUB_TMUX_SOCKET_PATH), AD_ERROR_CLASS_ENVIRONMENT],
   ['errTmuxNotAvailableDifferentServer', () => errTmuxNotAvailableDifferentServer(), AD_ERROR_CLASS_ENVIRONMENT],
+  ['errTmuxNotAvailableNewRowEnded', () => errTmuxNotAvailableNewRowEnded(), AD_ERROR_CLASS_ENVIRONMENT],
   // LAUNCH FAILURE
   ['errTmuxSessionCreate (spawn)', () => errTmuxSessionCreate('spawn'), AD_ERROR_CLASS_LAUNCH_FAILURE],
   ['errTmuxSessionCreate (resume)', () => errTmuxSessionCreate('resume'), AD_ERROR_CLASS_LAUNCH_FAILURE],
@@ -720,6 +726,7 @@ describe('stub builders: shape (SRJ-1303)', () => {
     ['launch timeout (resume)', () => errTmuxUnresponsiveLaunchTimeout('resume'), 'resume', [LAUNCH_TIMEOUT_PHRASE]],
     ['still stopping', () => errTmuxUnresponsiveStillStopping('resume', OTHER_SESSION_NAME), 'resume', [STILL_STOPPING_PHRASE, JSON.stringify(OTHER_SESSION_NAME)]],
     ['still starting', () => errTmuxUnresponsiveStillStarting('resume', OTHER_SESSION_NAME), 'resume', [STILL_STARTING_PHRASE, JSON.stringify(OTHER_SESSION_NAME)]],
+    ['new row ended (HO rev 26)', () => errTmuxUnresponsiveNewRowEnded(), 'spawn', [NEW_ROW_ENDED_PHRASE, NEW_ROW_ENDED_RETRY, JSON.stringify(STUB_TMUX_SESSION_NAME)]],
   ] as const)('errTmuxUnresponsive %s carries the verb and its words', (_label, build, verb, words) => {
     const err = build()
     expect(err.verb).toBe(verb)
@@ -736,6 +743,14 @@ describe('stub builders: shape (SRJ-1303)', () => {
     expect(different.errDescription).toContain(DIFFERENT_TMUX_SERVER_PHRASE)
     expect(different.errDescription).toContain(socketPath)
     expect(errTmuxNotAvailable(STUB_TMUX_SOCKET_PATH).errDescription).not.toContain(DIFFERENT_TMUX_SERVER_PHRASE)
+  })
+
+  test('errTmuxNotAvailableNewRowEnded (HO rev 26) carries the verb, the quoted name, the new-row-ended words and the reuse_finished retry, and none of the launch-timeout, still-stopping, still-starting or different-server words', () => {
+    const err = errTmuxNotAvailableNewRowEnded('spawn', OTHER_SESSION_NAME)
+    expect(err.verb).toBe('spawn')
+    for (const w of [NEW_ROW_ENDED_PHRASE, NEW_ROW_ENDED_RETRY, JSON.stringify(OTHER_SESSION_NAME)]) expect(err.errDescription).toContain(w)
+    expect(NEW_ROW_ENDED_RETRY).toContain('reuse_finished')
+    expect([LAUNCH_TIMEOUT_PHRASE, STILL_STOPPING_PHRASE, STILL_STARTING_PHRASE, DIFFERENT_TMUX_SERVER_PHRASE].filter((w) => err.errDescription.includes(w))).toEqual([])
   })
 
   test('errConfigMalformed names a [tmux] key, its value and its minimum', () => {
@@ -1017,6 +1032,7 @@ describe('isDifferentTmuxServerError', () => {
     ['plain ENVIRONMENT without a socket', () => errTmuxNotAvailable()],
     ['plain ENVIRONMENT with the stub\'s socket', () => errTmuxNotAvailable(STUB_TMUX_SOCKET_PATH)],
     ['plain ENVIRONMENT with another socket', () => errTmuxNotAvailable(OTHER_SOCKET_PATH, 'resume')],
+    ['a plain spawn\'s re-lookup that could not run tmux, its new row ended (HO rev 26)', () => errTmuxNotAvailableNewRowEnded()],
   ])('%s is ENVIRONMENT but not the re-bound form', (_label, build) => {
     const value = build()
     expect(classifyAdError(value).errorClass).toBe(AD_ERROR_CLASS_ENVIRONMENT)

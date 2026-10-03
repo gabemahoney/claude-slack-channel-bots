@@ -417,13 +417,17 @@ export const UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED = 'sequence-not-judged'
 export const UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED = 'sequence-ended-without-launch'
 
 /**
- * The cause of a reuse spawn's collision (`ErrInstanceIdCollision`, b.jg5
- * SRJ-112, SRJ-301): the row is live, so the reuse launched nothing. Armed
- * when a collision at the live-row sequence's final launch ends the sequence
- * without its launch (SRJ-705, SRJ-706), and when a second collision at a
- * collision ladder reuse site (the replace step's or the no-transcript
- * step's, in the one re-run of get-then-act the first gave) ends the launch
- * attempt (`reportReuseCollisionAtSite`, `src/outage-state.ts`). Never counted.
+ * The cause of a launch's collision (`ErrInstanceIdCollision`, b.jg5
+ * SRJ-112, SRJ-111, SRJ-301): the row is live, so the reuse spawn or plain
+ * spawn launched nothing. Armed when a collision at the live-row sequence's
+ * final launch (its reuse, or the plain spawn after its `resume`'s
+ * `ErrSpawnNotFound`) ends the sequence without its launch (SRJ-705,
+ * SRJ-706), when a second collision at a collision ladder reuse site (the
+ * replace step's or the no-transcript step's, in the one re-run of
+ * get-then-act the first gave) ends the launch attempt, and when a plain
+ * spawn's collision in the one re-run of get-then-act a plain spawn's
+ * collision gave ends it (`reportReuseCollisionAtSite`,
+ * `src/outage-state.ts`). Never counted.
  */
 export const UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION = 'reuse-collision'
 

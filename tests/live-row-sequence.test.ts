@@ -162,6 +162,7 @@ import {
   LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE,
   LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE_PENDING,
   LIVE_ROW_NOT_LAUNCHED_REUSE_COLLISION,
+  LIVE_ROW_NOT_LAUNCHED_SPAWN_COLLISION,
   LIVE_ROW_OUTCOME_ABORTED,
   LIVE_ROW_OUTCOME_CONFIG_MALFORMED,
   LIVE_ROW_OUTCOME_ESCALATED,
@@ -2495,6 +2496,45 @@ describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the 
     expect(h.stub.calls.spawnCalls.map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([[personaInstanceId(p), undefined]])
     expect([h.notices, h.triggers, getFailureCount(p)]).toEqual([[], [{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }], 0])
     await h.runApproverToStop(p)
+  })
+
+  // b.jg5 SRJ-111, SRJ-705, SRJ-713 (hatch note E23): the plain spawn after
+  // step 6's ErrSpawnNotFound colliding runs no get-then-act inside the
+  // sequence; the sequence ends without its launch and the retry it arms is
+  // the get-then-act, through the restart path's ladder.
+  test('step 6\'s resume answering ErrSpawnNotFound, its plain spawn colliding (ErrInstanceIdCollision): not launched (spawn-collision), the reuse-collision cause armed, no second spawn, nothing counted or posted; the retry it arms makes the ladder\'s get-then-act', async () => {
+    const { h, p } = build()
+    h.script({ spawnError: errInstanceIdCollision() })
+
+    const { outcome, order } = await runToStep6Resume(h, p, errSpawnNotFound())
+
+    expect(outcome).toEqual({
+      kind: LIVE_ROW_OUTCOME_NOT_LAUNCHED,
+      launchKind: LIVE_ROW_LAUNCH_RESUME,
+      notLaunched: LIVE_ROW_NOT_LAUNCHED_SPAWN_COLLISION,
+      runs: 1,
+      kills: 1,
+      judgedRuns: 1,
+      armed: LIVE_ROW_ARM_REUSE_COLLISION,
+    })
+    expect(order).toEqual([...SEQUENCE_CALLS, 'spawn'])
+    expect(h.stub.calls.spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined])
+    expect(liveRowSequenceEndLine(`persona=${p}`, outcome)).toContain(`: not launched (resume; ${LIVE_ROW_NOT_LAUNCHED_SPAWN_COLLISION}) — `)
+    expectEndArmed(h, outcome, UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION)
+
+    // The retry: the row reads ended with its session id; the ladder's plain
+    // first spawn collides, its collision get reads the row and resumes it.
+    h.script({ spawnError: undefined, spawnQueue: [cannedErr(errInstanceIdCollision())], resumeError: undefined, statusResult: cannedStatusResult({ state: ENDED }) })
+    const retryOrder = recordCallOrder(h)
+    await retryNow(h, p)
+
+    const launches = retryOrder.filter((verb) => ['spawn', 'get', 'resume'].includes(verb))
+    expect(launches.slice(0, 3)).toEqual(['spawn', 'get', 'resume'])
+    expect(h.stub.calls.resumeCalls).toHaveLength(2)
+    expect(h.stub.calls.spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined, undefined])
+    expect([h.notices, getFailureCount(p)]).toEqual([[], 0])
+    if (h.approverRunning(p)) await h.runApproverToStop(p)
+    h.controller.stop(p, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
   })
 
   /**

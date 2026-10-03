@@ -89,6 +89,11 @@
  *     `{ err_name, err_description }` envelope in `envelope`
  *     (`ErrSchemaMigrationRequired` and `ErrStoreOpen` through
  *     `errUnknownErrorName`).
+ *   - A plain spawn's re-lookup after "duplicate session" that could not
+ *     answer (HO rev 26; b.jg5 SRJ-111): `errTmuxUnresponsiveNewRowEnded`
+ *     (UNAVAILABLE) and `errTmuxNotAvailableNewRowEnded` (ENVIRONMENT), each
+ *     carrying "the new row was ended" and the retry with `reuse_finished`
+ *     (`NEW_ROW_ENDED_RETRY`), never the launch-timeout words.
  *   - `UNAVAILABLE_FORMS` is the one table of UNAVAILABLE forms (label,
  *     builder by verb, cause kind); `unavailableForms` picks a subset.
  *   - The description words CSCB matches come from
@@ -782,8 +787,9 @@ function phase1OnlyError(name: Phase1OnlyErrName, verb: string, description: str
  * (default verb `resume`; `status` only reads the store and never returns
  * it). The default description is a call timeout that did nothing; pass
  * `description` for another. See `errTmuxUnresponsiveLaunchTimeout`,
- * `errTmuxUnresponsiveStillStopping`, `errTmuxUnresponsiveStillStarting`
- * and `errTmuxUnresponsiveAfterDuplicateSession` for the variants.
+ * `errTmuxUnresponsiveStillStopping`, `errTmuxUnresponsiveStillStarting`,
+ * `errTmuxUnresponsiveAfterDuplicateSession` and
+ * `errTmuxUnresponsiveNewRowEnded` for the variants.
  */
 export function errTmuxUnresponsive(
   verb: string = 'resume',
@@ -853,6 +859,34 @@ export function errTmuxUnresponsiveStillStarting(
     ERR_TMUX_UNRESPONSIVE_NAME,
     verb,
     `the agent in tmux session ${JSON.stringify(sessionName)} ${STILL_STARTING_PHRASE}: the session is younger than the starting-session bound (300 s); nothing was done; retry later`,
+  )
+}
+
+/**
+ * The retry a plain spawn's re-lookup error names once it has ended its new
+ * row (HO rev 26; b.jg5 SRJ-111): a spawn with `reuse_finished` once the
+ * session name is free. agent-director's own words; CSCB keys nothing on
+ * them, so `src/` holds none.
+ */
+export const NEW_ROW_ENDED_RETRY = 'retry with reuse_finished once the session name is free'
+
+/**
+ * Build an `ErrTmuxUnresponsive` (by name) from a plain spawn whose
+ * `tmux new-session` answered "duplicate session" and whose re-lookup of the
+ * session holding the name could not answer (HO rev 26; b.jg5 SRJ-111,
+ * SRJ-1303): agent-director ended the new row, so the description carries
+ * "the new row was ended" and names a retry with `reuse_finished`, and none
+ * of the launch-timeout, still-stopping or still-starting words (default verb
+ * `spawn`).
+ */
+export function errTmuxUnresponsiveNewRowEnded(
+  verb: string = 'spawn',
+  sessionName: string = STUB_TMUX_SESSION_NAME,
+): AgentDirectorError {
+  return phase1OnlyError(
+    ERR_TMUX_UNRESPONSIVE_NAME,
+    verb,
+    `tmux new-session answered duplicate session for tmux session ${JSON.stringify(sessionName)} and the re-lookup of the session holding the name did not answer within 5 s; ${NEW_ROW_ENDED_PHRASE}; ${NEW_ROW_ENDED_RETRY}`,
   )
 }
 
@@ -1087,6 +1121,24 @@ export function errTmuxNotAvailableDifferentServer(
     verb,
     'ErrTmuxNotAvailable',
     `the tmux server on socket ${socketPath} is ${DIFFERENT_TMUX_SERVER_PHRASE}; nothing was done`,
+  )
+}
+
+/**
+ * Build an ErrTmuxNotAvailable (the client's class) from a plain spawn whose
+ * `tmux new-session` answered "duplicate session" and whose re-lookup of the
+ * session holding the name could not run tmux (HO rev 26; b.jg5 SRJ-111):
+ * agent-director ended the new row, so the description carries "the new row
+ * was ended" and names a retry with `reuse_finished` (default verb `spawn`).
+ */
+export function errTmuxNotAvailableNewRowEnded(
+  verb: string = 'spawn',
+  sessionName: string = STUB_TMUX_SESSION_NAME,
+): ErrTmuxNotAvailable {
+  return new ErrTmuxNotAvailable(
+    verb,
+    'ErrTmuxNotAvailable',
+    `tmux new-session answered duplicate session for tmux session ${JSON.stringify(sessionName)} and tmux could not be run for the re-lookup of the session holding the name; ${NEW_ROW_ENDED_PHRASE}; ${NEW_ROW_ENDED_RETRY}`,
   )
 }
 

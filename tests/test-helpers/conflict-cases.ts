@@ -28,7 +28,11 @@
  *     row after the pre-spawn scan's refusal, `ended` after a plain spawn's
  *     "duplicate session" answer and on the finished-row path, the state the
  *     path last read for a pane verb or a kill, unreadable where the path
- *     could not read it.
+ *     could not read it;
+ *   - `rowAfter`, on the plain spawn's rows only (E28 T4; b.jg5 SRJ-111,
+ *     {@link PLAIN_SPAWN_CONFLICT_CASE_ROWS}): the row agent-director leaves,
+ *     none after the pre-spawn scan's refusal and `ended` after a "duplicate
+ *     session" answer, so a case scripts the reads after the refusal from it.
  *
  * Columns filled here (E13 T2, the CONFLICT notice, SRJ-1004):
  *   - `notice`: the {@link ExpectedConflictNotice} for the row's case, quoted
@@ -650,7 +654,20 @@ export interface ConflictCaseRow {
    * written and no row created (HO rev 15); the latch records no row.
    */
   readonly noRowWritten?: true
+  /**
+   * Set on the plain spawn's rows only (b.jg5 SRJ-111; HO rev 15, rev 20):
+   * the row agent-director leaves for the persona's id after the refusal, so
+   * a case scripts the stub's reads of it after the refusal: `none` after the
+   * pre-spawn scan's refusal (nothing written, no row created), `ended` after
+   * a "duplicate session" answer (the new row was ended). At the first spawn,
+   * which read nothing before it, the latch-time `status` read reads this
+   * row, so the row's `rowState` is its reading (no row, or `ended`).
+   */
+  readonly rowAfter?: PlainSpawnRowAfter
 }
+
+/** The row a plain spawn's CONFLICT leaves (`ConflictCaseRow.rowAfter`): none after the pre-spawn scan's refusal, `ended` after "duplicate session". */
+export type PlainSpawnRowAfter = 'none' | typeof LIVENESS_DEAD_ROW_ENDED
 
 // ---------------------------------------------------------------------------
 // The expected CONFLICT notice (b.jg5 SRJ-1004)
@@ -885,8 +902,16 @@ function row(
   })
 }
 
-const plainSpawn = (c: ConflictCase, l: ConflictLatchCase, s: LatchRowState, o?: ConflictOptions): ConflictCaseRow =>
-  row('plain spawn', REFUSED_OPERATION_PLAIN_SPAWN, SPAWN_VERB, c, l, s, o)
+/**
+ * A plain spawn's CONFLICT row, with the row agent-director leaves after it
+ * (`rowAfter`), which the first spawn's latch-time `status` read reads: no
+ * row, or `ended`.
+ */
+const plainSpawn = (c: ConflictCase, l: ConflictLatchCase, rowAfter: PlainSpawnRowAfter, o?: ConflictOptions): ConflictCaseRow =>
+  Object.freeze({
+    ...row('plain spawn', REFUSED_OPERATION_PLAIN_SPAWN, SPAWN_VERB, c, l, rowAfter === 'none' ? LATCH_ROW_STATE_NO_ROW : ENDED, o),
+    rowAfter,
+  })
 const reuseSpawn = (c: ConflictCase, l: ConflictLatchCase, s: LatchRowState, o?: ConflictOptions): ConflictCaseRow =>
   row(REUSE_SPAWN_SITE, REFUSED_OPERATION_REUSE_SPAWN, SPAWN_VERB, c, l, s, o)
 /** The reuse spawn of an id with no row, refused by the pre-spawn scan: no row recorded, none written (HO rev 15). */
@@ -1078,6 +1103,27 @@ const SEQUENCE_KILL_ROWS: readonly ConflictCaseRow[] = SEQUENCE_KILL_SITES.flatM
 )
 
 /**
+ * The plain spawn's CONFLICT rows (b.jg5 SRJ-111, SRJ-501, SRJ-507; HO rev
+ * 15, rev 20), each refusing the plain spawn and carrying the row
+ * agent-director leaves (`rowAfter`): none after the pre-spawn scan's
+ * refusals ("left over from an earlier life", and "conflicting labels" in its
+ * scan form: nothing written, no row created); `ended` after each "duplicate
+ * session" answer (the new row was ended). For `test.each` over the plain
+ * spawn's sites; they open {@link CONFLICT_CASE_ROWS}.
+ */
+export const PLAIN_SPAWN_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze([
+  // The pre-spawn scan's refusals (nothing written, no row).
+  plainSpawn('scan-leftover', LATCH_CASE_LEFTOVER, 'none'),
+  plainSpawn('conflicting-labels', LATCH_CASE_CONFLICTING_LABELS, 'none', { scan: true }),
+  // The "duplicate session" answers (the new row was ended).
+  plainSpawn('duplicate-session-leftover', LATCH_CASE_LEFTOVER, LIVENESS_DEAD_ROW_ENDED),
+  plainSpawn('no-valid-id', LATCH_CASE_NO_VALID_ID, LIVENESS_DEAD_ROW_ENDED),
+  plainSpawn('different-id', LATCH_CASE_DIFFERENT_ID, LIVENESS_DEAD_ROW_ENDED, { plainSpawn: true }),
+  plainSpawn('another-store', LATCH_CASE_ANOTHER_STORE, LIVENESS_DEAD_ROW_ENDED, { plainSpawn: true }),
+  plainSpawn('conflicting-labels', LATCH_CASE_CONFLICTING_LABELS, LIVENESS_DEAD_ROW_ENDED),
+])
+
+/**
  * The reuse spawn's CONFLICT rows (E22; b.jg5 SRJ-112, SRJ-501, SRJ-507; HO
  * rev 15, rev 20): one row per stub case a spawn can answer, each refusing
  * the reuse spawn. A reuse of an id with no row is an ordinary fresh spawn:
@@ -1168,15 +1214,9 @@ export function sequenceResumeConflictRowsAt(lastRead: SequenceResumeLastRead): 
 
 /** Every CONFLICT latch row, for `test.each`. */
 export const CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze([
-  // A plain spawn: the pre-spawn scan's refusals (nothing written, no row).
-  plainSpawn('scan-leftover', LATCH_CASE_LEFTOVER, LATCH_ROW_STATE_NO_ROW),
-  plainSpawn('conflicting-labels', LATCH_CASE_CONFLICTING_LABELS, LATCH_ROW_STATE_NO_ROW, { scan: true }),
-  // A plain spawn's "duplicate session" answers (the new row was ended).
-  plainSpawn('duplicate-session-leftover', LATCH_CASE_LEFTOVER, ENDED),
-  plainSpawn('no-valid-id', LATCH_CASE_NO_VALID_ID, ENDED),
-  plainSpawn('different-id', LATCH_CASE_DIFFERENT_ID, ENDED, { plainSpawn: true }),
-  plainSpawn('another-store', LATCH_CASE_ANOTHER_STORE, ENDED, { plainSpawn: true }),
-  plainSpawn('conflicting-labels', LATCH_CASE_CONFLICTING_LABELS, ENDED),
+  // A plain spawn: the pre-spawn scan's refusals (no row after), then the
+  // "duplicate session" answers (the row `ended` after).
+  ...PLAIN_SPAWN_CONFLICT_CASE_ROWS,
   // A spawn with `--reuse-finished` (E22): of a finished row, and of an id
   // with no row (an ordinary fresh spawn, which the pre-spawn scan refuses).
   ...REUSE_SPAWN_ROWS,
