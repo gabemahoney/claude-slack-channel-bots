@@ -50,6 +50,7 @@ import {
   PRECHECK_VERDICT_PASS,
   PRECHECK_VERDICT_RETRY,
   PRECHECK_VERDICT_SKIP,
+  onlyServerStoppedLine,
   precheckFailureLine,
   precheckNothingStoppedLine,
   precheckVerdictOf,
@@ -239,6 +240,10 @@ describe('precheck failure lines (b.jg5 SRJ-901)', () => {
     )
     expect(precheckNothingStoppedLine(CLI_COMMAND_STOP_BOTS)).toBe('stop --stop-bots: nothing was stopped')
     expect(precheckNothingStoppedLine(CLI_COMMAND_CLEAN_RESTART)).toBe('clean_restart: nothing was stopped')
+  })
+
+  test('SRJ-902\'s too-old closing line, exactly (pinned once), with no [slack] prefix', () => {
+    expect(onlyServerStoppedLine()).toBe('stop --stop-bots: only the server was stopped; every worker and row was left as it is')
   })
 
   test('the tries, their spacing and the config file\'s display name are SRJ-901\'s (pinned once): 3 tries 2 s apart, ~/.agent-director/config.toml, built from the settings path', () => {

@@ -39,6 +39,15 @@
  * `directorReadPane`, by default a live `waiting` row and a pane). The
  * verdict over each answer is tests/cli-teardown.test.ts's.
  *
+ * The client's initialization (b.jg5 SRJ-203, SRJ-902): the fixture's
+ * `initClient` records the call timeout and the gate each command asks for
+ * (`clean_restart` the whole gate, `stop --stop-bots` the gate without CSCB's
+ * Phase 1 floor). Every gate refusal a case throws is the real gate's
+ * (`initProductionClient` or `runStartupGate` over passing seams and the stub
+ * client factory), and the cases that run `stop --stop-bots` through the stub
+ * client install it as the singleton and reset it after each case; no
+ * agent-director binary runs.
+ *
  * SPDX-License-Identifier: MIT
  */
 
@@ -75,6 +84,7 @@ import {
   type DaemonSpawnOptions,
   type DirectorClient,
   type DirectorOps,
+  type InitClientGateOptions,
 } from '../src/cli.ts'
 import {
   AD_CONFIG_FILE_DISPLAY_NAME,
@@ -84,6 +94,7 @@ import {
   PRECHECK_CALL_READ_PANE,
   PRECHECK_TRIES,
   PRECHECK_TRY_SPACING_MS,
+  onlyServerStoppedLine,
   precheckFailureLine,
   precheckNothingStoppedLine,
   precheckVerdictOf,
@@ -107,7 +118,9 @@ import {
   REFUSAL_KIND_BELOW_PHASE1_FLOOR,
   REFUSAL_KIND_CLIENT_TOO_OLD,
   REFUSAL_KIND_OTHER,
+  runStartupGate,
   type StartupGateDeps,
+  type StartupGateFailure,
   type StartupGateOptions,
   type StartupGateRefusalKind,
 } from '../src/agent-director-startup.ts'
@@ -151,6 +164,7 @@ import {
   UNAVAILABLE_FORMS,
   UNUSABLE_NAME_FAULTS,
   cannedGetResult,
+  cannedKillResult,
   cannedStatusResult,
   errCallTimeout,
   errConfigMalformed,
@@ -171,12 +185,14 @@ import {
   errUnusableName,
   makePassingGateDeps,
   provenanceNote,
+  makeStubCallLog,
   makeStubClient,
   makeStubCreateClient,
+  stubCallCount,
   type StubClientOptions,
   type StubCreateClientOptions,
 } from './test-helpers/agent-director-stub.ts'
-import { OLD_AD_VERSION } from './test-helpers/agent-director-versions.ts'
+import { BELOW_CLIENT_MIN_VERSION, CLIENT_MIN_VERSION, OLD_AD_VERSION } from './test-helpers/agent-director-versions.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import {
   makeMultiPersonaConfig,
@@ -366,8 +382,8 @@ interface Overrides {
   spawnDaemonError?: Error
   /** Runs after the call is recorded; the default only records (console is never redirected). */
   initLogging?: (path: string) => void
-  /** Answers each `initClient` call, given the call timeout it received. */
-  initClient?: (callTimeoutMs: number) => Promise<void>
+  /** Answers each `initClient` call, given the call timeout and the gate options it received. */
+  initClient?: (callTimeoutMs: number, gateOptions?: InitClientGateOptions) => Promise<void>
   /** The precheck's `get`; default a live `waiting` row with no note ({@link LIVE_ROW}). */
   directorGet?: (id: string) => Promise<PrecheckRow | null>
   /** The precheck's `read-pane`; default a pane ({@link FAKE_PANE}). */
@@ -406,6 +422,12 @@ interface Bundle {
   events: string[]
   /** The call timeout each `initClient` call received, in call order (b.jg5 SRJ-213). */
   initClientCalls: number[]
+  /**
+   * The gate each `initClient` call asked for, in call order (b.jg5 SRJ-203):
+   * `undefined` for the whole gate, {@link FLOOR_EXEMPT_GATE} for the gate
+   * without CSCB's Phase 1 floor.
+   */
+  initClientGates: Array<InitClientGateOptions | undefined>
   /** Each path `credentials` loaded the configuration file from. */
   configFileLoads: string[]
   /** Each credentials file the fake credentials-script runner was given. */
@@ -444,6 +466,7 @@ function makeDeps(o: Overrides = {}): Bundle {
   const serverSignals: string[] = []
   const events: string[] = []
   const initClientCalls: number[] = []
+  const initClientGates: Bundle['initClientGates'] = []
   const configFileLoads: string[] = []
   const credentialsRuns: string[] = []
   let startServerCalled = false
@@ -517,10 +540,11 @@ function makeDeps(o: Overrides = {}): Bundle {
     },
     ...(o.initClient
       ? {
-          initClient: async (callTimeoutMs: number) => {
+          initClient: async (callTimeoutMs: number, gateOptions?: InitClientGateOptions) => {
             initClientCalls.push(callTimeoutMs)
+            initClientGates.push(gateOptions)
             events.push('initClient')
-            return o.initClient!(callTimeoutMs)
+            return o.initClient!(callTimeoutMs, gateOptions)
           },
         }
       : {}),
@@ -553,10 +577,66 @@ function makeDeps(o: Overrides = {}): Bundle {
   return {
     deps, clock, exitCodes, exitTimes, spawnCalls, daemonSpawns, logOpens, closedFds, logInits, loadPaths,
     getCalls, readPaneCalls, directorCallTimes, statusCalls, pauseCalls, killCalls,
-    serverSignals, events, initClientCalls, configFileLoads, credentialsRuns,
+    serverSignals, events, initClientCalls, initClientGates, configFileLoads, credentialsRuns,
     get startServerCalled() { return startServerCalled },
   }
 }
+
+/** The gate `stop --stop-bots` asks for: CSCB's Phase 1 floor left out (b.jg5 SRJ-203, SRJ-902). */
+const FLOOR_EXEMPT_GATE: InitClientGateOptions = Object.freeze({ skipPhase1Floor: true })
+
+/** The options each stub client was built with, as `makeStubCreateClient` records them. */
+type RecordedClientOptions = NonNullable<StubCreateClientOptions['calls']>
+
+/** Startup-gate seams that pass every check after construction; `createClient` decides the build (never a real client). */
+const passingGateSeams = (createClient: StartupGateDeps['createClient']): Partial<StartupGateDeps> =>
+  makePassingGateDeps({ createClient, exit: (code) => { throw new ExitError(code) } })
+
+/**
+ * The error the production init throws when the startup gate refuses the
+ * build `stub` describes: the gate's own class label, message and refusal
+ * kind. The gate runs over passing seams, so no agent-director binary runs.
+ */
+async function gateRefusalOf(stub: StubCreateClientOptions, gateOptions?: InitClientGateOptions): Promise<StartupGateFailedError> {
+  const err = await initProductionClient(DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS, gateOptions, passingGateSeams(makeStubCreateClient(stub)))
+    .then(() => undefined, (e: unknown) => e)
+  if (!(err instanceof StartupGateFailedError)) {
+    resetClientForTests()
+    throw new Error('precondition: the startup gate refuses the build')
+  }
+  return err
+}
+
+/** A stub client factory that throws the client's own too-old refusal of a binary one step below the client's minimum. */
+const tooOldBuild = (calls?: RecordedClientOptions): StubCreateClientOptions => ({
+  error: errSystemInstallTooOld(BELOW_CLIENT_MIN_VERSION, CLIENT_MIN_VERSION),
+  calls,
+})
+
+/** The gate's client-too-old refusal of {@link tooOldBuild}, as `stop --stop-bots`' init throws it. */
+const tooOldRefusal = (): Promise<StartupGateFailedError> => gateRefusalOf(tooOldBuild(), FLOOR_EXEMPT_GATE)
+
+/**
+ * One build per refusal kind the whole gate gives (b.jg5 SRJ-203): the
+ * client's own too-old refusal, CSCB's floor refusing `OLD_AD_VERSION`, and
+ * another construction failure.
+ */
+const GATE_REFUSAL_BUILDS: ReadonlyArray<readonly [StartupGateRefusalKind, () => StubCreateClientOptions]> = [
+  [REFUSAL_KIND_CLIENT_TOO_OLD, () => tooOldBuild()],
+  [REFUSAL_KIND_BELOW_PHASE1_FLOOR, () => ({ client: makeStubClient({ binaryVersion: OLD_AD_VERSION }) })],
+  [REFUSAL_KIND_OTHER, () => ({ error: errSystemInstallNotFound() })],
+]
+
+/** The whole gate's refusal of the build of `kind` in {@link GATE_REFUSAL_BUILDS}; it keeps that kind. */
+async function wholeGateRefusal(kind: StartupGateRefusalKind): Promise<StartupGateFailedError> {
+  const build = GATE_REFUSAL_BUILDS.find(([k]) => k === kind)![1]
+  const err = await gateRefusalOf(build())
+  expect(err.refusalKind).toBe(kind)
+  return err
+}
+
+/** The start of `stop --stop-bots`' initialization-failed line; the failure's description follows. */
+const STOP_BOTS_INIT_FAILED = '[slack] stop --stop-bots: agent-director initialization failed: '
 
 const startedServer = (b: Bundle): boolean => b.spawnCalls.some((c) => c.args.includes('start'))
 
@@ -925,7 +1005,7 @@ describe('last-applied record (SR-8.7)', () => {
   test.each([
     ...SOURCES.map(([label, source]) => ['clean_restart', label, source, runCleanRestart] as const),
     ...SOURCES.map(([label, source]) => ['stop --stop-bots', label, source, runStopBots] as const),
-  ])('%s: persona set, exit_timeout and the client\'s agent_director_call_timeout_ms come from %s — exactly cscb_<key> of Alpha and Beta, each prechecked, then paused and killed at once, never Gamma; initClient gets the call timeout once, after the configuration is read and before the precheck', async (name, _label, source, run) => {
+  ])('%s: persona set, exit_timeout and the client\'s agent_director_call_timeout_ms come from %s — exactly cscb_<key> of Alpha and Beta, each prechecked, then paused and killed at once, never Gamma; initClient gets the call timeout once, after the configuration is read and before the precheck, clean_restart asking for the whole gate and stop --stop-bots for the gate without CSCB\'s floor', async (name, _label, source, run) => {
     // Precondition: the three values differ, so any wrong source shows.
     expect(new Set([APPLIED_CALL_TIMEOUT_MS, EDITED_CALL_TIMEOUT_MS, DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS]).size).toBe(3)
     writeSource(source)
@@ -955,6 +1035,8 @@ describe('last-applied record (SR-8.7)', () => {
       expect(startedServer(b)).toBe(true)
     }
     expect(b.initClientCalls).toEqual([APPLIED_CALL_TIMEOUT_MS])
+    // b.jg5 SRJ-203: only stop --stop-bots leaves the floor out.
+    expect(b.initClientGates).toEqual([name === 'stop --stop-bots' ? FLOOR_EXEMPT_GATE : undefined])
     // The configuration read that sizes the client comes before it is built,
     // and the client is built before the precheck's first call.
     const initAt = b.events.indexOf('initClient')
@@ -2154,10 +2236,23 @@ describe('b.qwo — initClient startup gate', () => {
     })
     await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
     expect(b.initClientCalls).toEqual([DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS])
+    expect(b.initClientGates).toEqual([FLOOR_EXEMPT_GATE])
     expect(b.events.filter((e) => e === 'loadConfig' || e === 'initClient')).toEqual(['loadConfig', 'initClient'])
     expect(stderr.filter((l) => l.startsWith('[slack] stop --stop-bots: could not load config — skipping bot teardown:'))).toHaveLength(1)
     expect(b.directorCallTimes).toEqual([]) // no get, read-pane, status, pause or kill
     expect(b.exitCodes).toEqual([0])
+    assertNoLeak({ stderr, exitCodes: b.exitCodes })
+  })
+
+  test.each<[string, (b: Bundle) => Promise<void>]>([
+    ['plain stop', (b) => createCli(b.deps).stop()],
+    ['credentials <persona>', (b) => createCli(b.deps).credentials([OPS_NAME])],
+  ])('%s builds no agent-director client, even with initClient wired (b.jg5 SRJ-203)', async (_label, run) => {
+    const b = makeLiveStopDeps({ initClient: async () => { /* gate ok */ } })
+    await expect(run(b)).rejects.toBeInstanceOf(ExitError)
+    expect(b.exitCodes).toEqual([0])
+    expect(b.initClientCalls).toEqual([])
+    expect(b.directorCallTimes).toEqual([])
     assertNoLeak({ stderr, exitCodes: b.exitCodes })
   })
 
@@ -2576,47 +2671,72 @@ describe('stop --stop-bots failure lines (AC 20)', () => {
     expect(gateError.classLabel).toBe(label)
   })
 
-  // The kind changes nothing in the printed line (it is never read there): the
-  // line is CSCB's own label and message. The detail is the floor gate's own.
-  test('a startup gate failure (StartupGateFailedError) prints the gate\'s class label and message on the initialization-failed line; exit 1, no director verb', async () => {
-    const detail = buildBelowPhase1FloorMessage({ foundVersion: OLD_AD_VERSION, binaryPath: join(root, 'bin', 'agent-director') })
-    const gateError = new StartupGateFailedError(AD_BELOW_PHASE1_FLOOR, detail, REFUSAL_KIND_BELOW_PHASE1_FLOOR)
-    const b = makeLiveStopDeps({
-      initClient: async () => { throw gateError },
-      directorStatus: async () => ({ state: 'waiting' }),
-    })
+  // b.jg5 SRJ-901, SRJ-902: every gate refusal but the client's too-old one is
+  // a precheck failure that stops nothing. The line is the gate's own label and
+  // message (CSCB authored them, so they are printed whole).
+  test.each(GATE_REFUSAL_BUILDS.filter(([kind]) => kind !== REFUSAL_KIND_CLIENT_TOO_OLD).map(([kind]) => [kind]))(
+    'a startup gate refusal of kind %s prints the gate\'s class label and message on the initialization-failed line, then "nothing was stopped"; exit 1, no server signal, no director call',
+    async (kind) => {
+      const gateError = await wholeGateRefusal(kind)
+      const b = makeLiveStopDeps({ initClient: async () => { throw gateError } })
 
-    await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
+      await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
 
-    // b.jg5 SRJ-901, SRJ-902: any initClient failure but the too-old refusal is a precheck failure that stops nothing.
-    expect(stderr).toEqual([
-      `[slack] stop --stop-bots: agent-director initialization failed: agent-director startup gate failed (${AD_BELOW_PHASE1_FLOOR}): ${detail}`,
-      precheckNothingStoppedLine(CLI_COMMAND_STOP_BOTS),
-    ])
-    expect(b.exitCodes).toEqual([1])
-    expect(b.serverSignals).toEqual([])
-    expect(b.directorCallTimes).toEqual([])
-    assertNoLeak({ consoleErrorArgs: errorSpy.mock.calls, stderr })
-  })
+      expect(stderr).toEqual([`${STOP_BOTS_INIT_FAILED}${gateError.message}`, precheckNothingStoppedLine(CLI_COMMAND_STOP_BOTS)])
+      expect(stderr[0]).toContain(`(${gateError.classLabel}): `)
+      expect(b.exitCodes).toEqual([1])
+      expect(b.serverSignals).toEqual([])
+      expect(b.directorCallTimes).toEqual([])
+      assertNoLeak({ consoleErrorArgs: errorSpy.mock.calls, stderr })
+    },
+  )
 
-  test('production initClient is initProductionClient, which runs the full startup gate: runStartupGate(gateDeps, { callTimeoutMs }) and no other option (cli.ts never names the floor-exempt option), and throws StartupGateFailedError with the outcome\'s label, message and refusal kind (static; b.jg5 SRJ-203, SRJ-213)', () => {
+  test('the floor-exempt gate option appears once in src/cli.ts, at stop --stop-bots\' initClient call, and clean_restart\'s initClient call passes only the call timeout; production initClient is initProductionClient, which hands the caller\'s gate options with its call timeout to the one runStartupGate call and throws StartupGateFailedError with the outcome\'s label, message and refusal kind; realDeps.initClient hands on the call timeout and the gate options, no gate seams (static; b.jg5 SRJ-203, SRJ-213, SRJ-902)', () => {
     const FLOOR_EXEMPT_OPTION: keyof StartupGateOptions = 'skipPhase1Floor'
+    const CALL_TIMEOUT_OPTION: keyof StartupGateOptions = 'callTimeoutMs'
     const code = stripComments(readFileSync(CLI_SOURCE, 'utf-8'))
-    expect(indicesOf(new RegExp(`\\b${FLOOR_EXEMPT_OPTION}\\b`, 'g'), code)).toEqual([])
+    /** [start, end) of the body of the one `function <name>(` in cli.ts. */
+    const bodyOf = (name: string): [number, number] => {
+      const at = indicesOf(new RegExp(`\\bfunction\\s+${name}\\s*\\(`, 'g'), code)
+      expect([name, at.length]).toEqual([name, 1])
+      return balancedAfter(code, at[0]!, '{', '}')
+    }
+    const within = (at: number, [from, to]: [number, number]): boolean => at >= from && at < to
+
+    // One initClient call in each command's init path: clean_restart's passes
+    // only the call timeout (the whole gate), stop --stop-bots' also the gate
+    // options, holding only the floor-exempt option, set to true.
+    const initCalls = indicesOf(/\bdeps\.initClient\s*\(/g, code)
+    expect(initCalls).toHaveLength(2)
+    const stopBotsInit = initCalls.filter((at) => within(at, bodyOf('precheckStopBots')))
+    const cleanRestartInit = initCalls.filter((at) => within(at, bodyOf('clean_restart')))
+    expect([stopBotsInit.length, cleanRestartInit.length]).toEqual([1, 1])
+    expect(splitTopLevel(callArguments(code, cleanRestartInit[0]!))).toHaveLength(1)
+    const stopBotsArgs = splitTopLevel(callArguments(code, stopBotsInit[0]!))
+    expect(stopBotsArgs).toHaveLength(2)
+    expect([...objectProperties(stopBotsArgs[1]!)]).toEqual([[FLOOR_EXEMPT_OPTION, 'true']])
+    const optionAt = indicesOf(new RegExp(`\\b${FLOOR_EXEMPT_OPTION}\\b`, 'g'), code)
+    expect(optionAt).toHaveLength(1)
+    expect(within(optionAt[0]!, balancedAfter(code, stopBotsInit[0]!, '(', ')'))).toBe(true)
 
     // The one runStartupGate call in cli.ts is initProductionClient's, passing
-    // its gate seams and an options object holding only its call timeout.
+    // its gate seams and an options object of the caller's gate options with
+    // the call timeout set after them, so no gate option can replace it.
     const decl = indicesOf(/\bexport\s+async\s+function\s+initProductionClient\s*\(/g, code)
     expect(decl).toHaveLength(1)
     const params = splitTopLevel(callArguments(code, decl[0]!)).map((p) => p.match(/^(\w+)/)?.[1])
-    expect(params).toHaveLength(2)
-    const [timeoutParam, gateDepsParam] = params
-    const body = code.slice(...balancedAfter(code, decl[0]!, '{', '}'))
+    expect(params).toHaveLength(3)
+    const [timeoutParam, gateOptionsParam, gateDepsParam] = params
+    const body = code.slice(...bodyOf('initProductionClient'))
     expect(callsOf(code, 'runStartupGate')).toHaveLength(1)
     const gateArgs = splitTopLevel(onlyCallArguments(body, 'runStartupGate'))
     expect(gateArgs).toHaveLength(2)
     expect(gateArgs[0]).toBe(gateDepsParam!)
-    expect([...objectProperties(gateArgs[1]!)]).toEqual([['callTimeoutMs', timeoutParam!]])
+    const longhand = (part: string): string => (/^\w+$/.test(part) ? `${part}: ${part}` : part)
+    expect(splitTopLevel(gateArgs[1]!.slice(...balancedAfter(gateArgs[1]!, 0, '{', '}'))).map(longhand)).toEqual([
+      `...${gateOptionsParam}`,
+      `${CALL_TIMEOUT_OPTION}: ${timeoutParam}`,
+    ])
 
     const outcome = body.match(/\bconst\s+(\w+)\s*=\s*await\s+runStartupGate\s*\(/)?.[1]
     expect(outcome).toBeDefined()
@@ -2629,14 +2749,14 @@ describe('stop --stop-bots failure lines (AC 20)', () => {
     ])
 
     // The entry point's deps wire initClient to it, handing on the call
-    // timeout and no gate seams.
+    // timeout and the gate options, and no gate seams.
     const main = indicesOf(/\bif\s*\(\s*import\.meta\.main\s*\)/g, code)
     expect(main).toHaveLength(1)
     const mainBlock = code.slice(...balancedAfter(code, main[0]!, '{', '}'))
     const realDepsAt = mainBlock.indexOf('const realDeps: CliDeps =')
     expect(realDepsAt).toBeGreaterThanOrEqual(0)
     const initClient = objectProperties(mainBlock.slice(realDepsAt)).get('initClient')
-    expect(initClient).toMatch(/^\(\s*(\w+)\s*\)\s*=>\s*initProductionClient\(\1\)$/)
+    expect(initClient).toMatch(/^\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*=>\s*initProductionClient\(\s*\1\s*,\s*\2\s*\)$/)
   })
 
   test('an incomplete teardown (TeardownIncompleteError) prints its count and retry advice on the teardown-failed line; the underlying error, carrying fake tokens, is only described, its message redacted; exit 1; nothing logged leaks', async () => {
@@ -2695,25 +2815,291 @@ describe('stop --stop-bots failure lines (AC 20)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// stop --stop-bots on a binary older than Phase 1 (b.jg5 SRJ-902, AC 75's
+// part). Its init leaves CSCB's Phase 1 floor out, so on a binary the client
+// accepts (OLD_AD_VERSION) the precheck and teardown run through that client.
+// Only the client's own too-old refusal, read from the gate's refusal kind and
+// never its label or message, stops the server alone: no precheck, no
+// teardown, the initialization-failed line carrying the gate's message, then
+// onlyServerStoppedLine, and exit 1 whatever the server stop returned. Any
+// other init failure stops nothing; clean_restart, whose init runs the whole
+// gate, has no such exception. Every gate refusal here is the real gate's,
+// over passing seams and the stub client factory: no agent-director binary
+// runs.
+// ---------------------------------------------------------------------------
+
+describe('stop --stop-bots on a binary older than Phase 1 (b.jg5 SRJ-902, AC 75)', () => {
+  beforeEach(() => resetClientForTests())
+  afterEach(() => resetClientForTests())
+
+  const twoPersonas = (): PersonaConfig =>
+    makeMultiPersonaConfig([ALPHA, BETA], root, { exit_timeout: 0, agent_director_call_timeout_ms: MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS })
+  const twoIds = (): string[] => [ALPHA.name, BETA.name].map((name) => personaInstanceId(personaKey(name))).sort()
+
+  const runStopBots = (b: Bundle): Promise<void> =>
+    createCli(b.deps).stop({ stopBots: true }).catch((e) => { if (!(e instanceof ExitError)) throw e })
+
+  /**
+   * `make`'s bundle for the two personas, wired as production wires it: the
+   * director ops over the client singleton (`createDirectorOps(getClient)`)
+   * and the production init over passing gate seams and a stub client
+   * factory over `build`.
+   */
+  function productionWired(make: (o?: Overrides) => Bundle, build: StubCreateClientOptions): Bundle {
+    return make({
+      config: twoPersonas(),
+      initClient: (callTimeoutMs, gateOptions) =>
+        initProductionClient(callTimeoutMs, gateOptions, passingGateSeams(makeStubCreateClient(build))),
+      ...createDirectorOps(getClient),
+    })
+  }
+
+  /** The whole gate's failure outcome for the build of `kind` in GATE_REFUSAL_BUILDS. */
+  async function wholeGateFailure(kind: StartupGateRefusalKind): Promise<StartupGateFailure> {
+    const outcome = await runStartupGate(passingGateSeams(makeStubCreateClient(GATE_REFUSAL_BUILDS.find(([k]) => k === kind)![1]())))
+    if (outcome.ok) {
+      resetClientForTests()
+      throw new Error(`precondition: the whole gate refuses the ${kind} build`)
+    }
+    expect(outcome.refusalKind).toBe(kind)
+    return outcome
+  }
+
+  /** A gate error carrying the label and message of the `from` refusal, but the refusal kind `kind`. */
+  const relabelled = async (from: StartupGateRefusalKind, kind: StartupGateRefusalKind): Promise<StartupGateFailedError> => {
+    const failure = await wholeGateFailure(from)
+    return new StartupGateFailedError(failure.classLabel, failure.message, kind)
+  }
+
+  /**
+   * Only the server was stopped, sending `signals`: no `get`, `read-pane`,
+   * `status`, `pause` or `kill`, no spawn; the init asked for the
+   * floor-exempt gate; the initialization-failed line carries `err`'s
+   * message, before any server signal, and the last line is
+   * onlyServerStoppedLine, with no "nothing was stopped" line; exit 1.
+   */
+  function expectOnlyServerStopped(b: Bundle, err: StartupGateFailedError, signals: readonly string[]): void {
+    expect(b.exitCodes).toEqual([1])
+    expect(b.serverSignals).toEqual([...signals])
+    expect(b.directorCallTimes).toEqual([])
+    expect(b.spawnCalls).toEqual([])
+    expect(b.initClientGates).toEqual([FLOOR_EXEMPT_GATE])
+    expect(stderr.filter((l) => l.startsWith(STOP_BOTS_INIT_FAILED))).toEqual([`${STOP_BOTS_INIT_FAILED}${err.message}`])
+    expect(stderr.at(-1)).toBe(onlyServerStoppedLine())
+    expect(stderr).not.toContain(precheckNothingStoppedLine(CLI_COMMAND_STOP_BOTS))
+    const initAt = b.events.indexOf('initClient')
+    expect(initAt).toBeGreaterThanOrEqual(0)
+    for (const [i, e] of b.events.entries()) if (e.startsWith('server:')) expect(i).toBeGreaterThan(initAt)
+    assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
+  }
+
+  // -------------------------------------------------------------------------
+  // Through the stub client, as production wires it
+  // -------------------------------------------------------------------------
+
+  test('on OLD_AD_VERSION, which the client accepts: the floor-exempt production init installs the stub with the configured call timeout, and per persona the stub gets get, a one-line readPane, status, pause and kill, in that order; the kill result with no kill_sent is a plain success, every persona is stopped and the server too; exit 0 (AC 75)', async () => {
+    const log = makeStubCallLog()
+    const created: RecordedClientOptions = []
+    const client = makeStubClient({
+      ...log,
+      binaryVersion: OLD_AD_VERSION,
+      getFn: (params) => cannedGetResult({ claude_instance_id: params.claude_instance_id }),
+      readPaneResults: [{ pane: FAKE_PANE }],
+      statusResult: cannedStatusResult({ state: 'waiting' }),
+      killResult: cannedKillResult(),
+    })
+    // Precondition: the kill result is a pre-Phase-1 binary's, with no kill_sent field.
+    expect(Object.keys(cannedKillResult())).toEqual([])
+    const b = productionWired(makeLiveStopDeps, { client, calls: created })
+
+    await runStopBots(b)
+
+    expect(created.map((c) => c.callTimeoutMs)).toEqual([MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS])
+    expect(b.initClientGates).toEqual([FLOOR_EXEMPT_GATE])
+    expect(getClient() as unknown).toBe(client)
+    for (const id of twoIds()) {
+      const verbs = b.events.filter((e) => e.endsWith(`:${id}`)).map((e) => e.slice(0, -(id.length + 1)))
+      expect([id, verbs]).toEqual([id, [PRECHECK_CALL_GET, PRECHECK_CALL_READ_PANE, 'status', 'pause', 'kill']])
+    }
+    const idsOf = (calls: ReadonlyArray<{ claude_instance_id: string }>): string[] => calls.map((c) => c.claude_instance_id).sort()
+    expect([log.getCalls, log.statusCalls, log.pauseCalls, log.killCalls].map(idsOf)).toEqual(Array.from({ length: 4 }, twoIds))
+    expect([...log.readPaneCalls].sort((a, c) => a.claude_instance_id.localeCompare(c.claude_instance_id))).toEqual(
+      twoIds().map((id) => ({ claude_instance_id: id, n_lines: PROBE_PANE_READ_LINES })),
+    )
+    expect(stubCallCount(log)).toBe(twoIds().length * 5) // no other verb reached the stub
+    expect(b.serverSignals).toEqual(['SIGTERM'])
+    expect(b.exitCodes).toEqual([0])
+    expect(stderr.filter((l) => /fail/i.test(l))).toEqual([])
+    assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls, created })
+  })
+
+  test('the same OLD_AD_VERSION stub under clean_restart, whose init runs the whole gate: CSCB\'s floor refuses it, no stub verb is called, no client is installed, nothing is stopped; exit 1', async () => {
+    const log = makeStubCallLog()
+    const created: RecordedClientOptions = []
+    const client = makeStubClient({ ...log, binaryVersion: OLD_AD_VERSION })
+    const b = productionWired(makeDeps, { client, calls: created })
+
+    await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+
+    expect(b.initClientGates).toEqual([undefined])
+    expect(created.map((c) => c.callTimeoutMs)).toEqual([MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS])
+    expect(stubCallCount(log)).toBe(0)
+    expect(() => getClient()).toThrow()
+    expect(b.directorCallTimes).toEqual([])
+    expect(b.spawnCalls).toEqual([])
+    expect(b.exitCodes).toEqual([1])
+    const refusal = await wholeGateRefusal(REFUSAL_KIND_BELOW_PHASE1_FLOOR)
+    expect(stderr).toEqual([
+      `[slack] clean_restart: agent-director initialization failed: ${refusal.message}`,
+      precheckNothingStoppedLine(CLI_COMMAND_CLEAN_RESTART),
+    ])
+    expect(stderr[0]).toContain(OLD_AD_VERSION)
+    assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
+  })
+
+  test('a stub client factory throwing the client\'s too-old refusal: the server is stopped, no client is installed and no verb is asked of agent-director, the initialization-failed line names the version found and the version required, then only the server was stopped; exit 1 (AC 75)', async () => {
+    const created: RecordedClientOptions = []
+    const b = productionWired(makeLiveStopDeps, tooOldBuild(created))
+
+    await runStopBots(b)
+
+    expect(created.map((c) => c.callTimeoutMs)).toEqual([MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS])
+    expect(() => getClient()).toThrow()
+    const refusal = await tooOldRefusal()
+    expect(refusal.refusalKind).toBe(REFUSAL_KIND_CLIENT_TOO_OLD)
+    expectOnlyServerStopped(b, refusal, ['SIGTERM'])
+    const initLine = stderr.find((l) => l.startsWith(STOP_BOTS_INIT_FAILED))!
+    expect(initLine).toContain(BELOW_CLIENT_MIN_VERSION)
+    expect(initLine).toContain(CLIENT_MIN_VERSION)
+  })
+
+  // -------------------------------------------------------------------------
+  // The too-old branch, whatever the server stop does
+  // -------------------------------------------------------------------------
+
+  test.each<[string, (o: Overrides) => Bundle, readonly string[]]>([
+    ['no server running (no PID file)', (o) => makeDeps(o), []],
+    ['a stale PID file', makeStopDeps, []],
+    ['a live server that stops on SIGTERM', makeLiveStopDeps, ['SIGTERM']],
+    [
+      'a server that stops only on SIGKILL',
+      (o) => {
+        const b: Bundle = makeDeps({ serverPid: 4242, config: opsConfig({ stop_timeout: 0 }), isProcessRunning: () => !b.serverSignals.includes('SIGKILL'), ...o })
+        return b
+      },
+      ['SIGTERM', 'SIGKILL'],
+    ],
+    [
+      'a server that survives SIGKILL (the server stop answers 1)',
+      (o) => makeDeps({ serverPid: 4242, config: opsConfig({ stop_timeout: 0 }), isProcessRunning: () => true, ...o }),
+      ['SIGTERM', 'SIGKILL'],
+    ],
+    [
+      'an unreadable configuration (a live server)',
+      (o) => makeLiveStopDeps({ loadConfig: () => { throw new Error('config boom') }, ...o }),
+      ['SIGTERM'],
+    ],
+  ])('the client\'s too-old refusal with %s: only the server stop runs, no director call, the initialization-failed line then only the server was stopped; exit 1', async (_label, make, signals) => {
+    const refusal = await tooOldRefusal()
+    const b = make({ initClient: async () => { throw refusal } })
+
+    await runStopBots(b)
+
+    expect(b.initClientCalls).toEqual([DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS])
+    expectOnlyServerStopped(b, refusal, signals)
+  })
+
+  test('the client\'s too-old refusal with a server stop that throws: the rejection reaches the entry point\'s fatal handler (exit 1), with no "only the server" line and no director call', async () => {
+    const refusal = await tooOldRefusal()
+    const thrown = new Error('kill refused')
+    const b = makeLiveStopDeps({ initClient: async () => { throw refusal } })
+    b.deps.kill = () => { throw thrown }
+
+    await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBe(thrown)
+
+    expect(b.exitCodes).toEqual([])
+    expect(b.directorCallTimes).toEqual([])
+    expect(stderr).toEqual([`${STOP_BOTS_INIT_FAILED}${refusal.message}`])
+    // The entry point turns stop's rejection into the fatal line and exit 1 (static).
+    const code = stripComments(readFileSync(CLI_SOURCE, 'utf-8'))
+    const stopAt = indicesOf(/\bcli\.stop\s*\(/g, code)
+    expect(stopAt).toHaveLength(1)
+    expect(code.slice(stopAt[0]!)).toMatch(/^cli\.stop\(\s*\{\s*stopBots\s*\}\s*\)\.catch\(\s*\(\s*(\w+)\s*\)\s*=>\s*\{[^}]*\bprocess\.exit\(1\)/)
+    assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
+  })
+
+  // -------------------------------------------------------------------------
+  // Keyed on the refusal kind, never the label or the message (SRJ-203)
+  // -------------------------------------------------------------------------
+
+  test.each<[string, StartupGateRefusalKind]>([
+    ['CSCB\'s floor refusal', REFUSAL_KIND_BELOW_PHASE1_FLOOR],
+    ['another construction failure', REFUSAL_KIND_OTHER],
+  ])('the client-too-old kind carrying the label and message of %s still stops only the server; exit 1', async (_label, from) => {
+    const err = await relabelled(from, REFUSAL_KIND_CLIENT_TOO_OLD)
+    const b = makeLiveStopDeps({ initClient: async () => { throw err } })
+
+    await runStopBots(b)
+
+    expectOnlyServerStopped(b, err, ['SIGTERM'])
+  })
+
+  test.each<[StartupGateRefusalKind]>([[REFUSAL_KIND_BELOW_PHASE1_FLOOR], [REFUSAL_KIND_OTHER]])(
+    'the client\'s too-old label and message with the %s kind is a precheck failure: no server signal, no director call, the initialization-failed line then "nothing was stopped"; exit 1',
+    async (kind) => {
+      const err = await relabelled(REFUSAL_KIND_CLIENT_TOO_OLD, kind)
+      const b = makeLiveStopDeps({ initClient: async () => { throw err } })
+
+      await runStopBots(b)
+
+      expect(b.exitCodes).toEqual([1])
+      expect(b.serverSignals).toEqual([])
+      expect(b.directorCallTimes).toEqual([])
+      expect(stderr).toEqual([`${STOP_BOTS_INIT_FAILED}${err.message}`, precheckNothingStoppedLine(CLI_COMMAND_STOP_BOTS)])
+      assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
+    },
+  )
+
+  // -------------------------------------------------------------------------
+  // clean_restart has no too-old exception
+  // -------------------------------------------------------------------------
+
+  test.each(GATE_REFUSAL_BUILDS.map(([kind]) => [kind]))(
+    'clean_restart, whose init asks for the whole gate, refused with kind %s: no stop spawn, no director call, no start, the initialization-failed line then "nothing was stopped"; exit 1',
+    async (kind) => {
+      const refusal = await wholeGateRefusal(kind)
+      const b = makeLiveStopDeps({ initClient: async () => { throw refusal } })
+
+      await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+
+      expect(b.initClientGates).toEqual([undefined])
+      expect(b.exitCodes).toEqual([1])
+      expect(b.spawnCalls).toEqual([])
+      expect(b.serverSignals).toEqual([])
+      expect(b.directorCallTimes).toEqual([])
+      expect(stderr).toEqual([
+        `[slack] clean_restart: agent-director initialization failed: ${refusal.message}`,
+        precheckNothingStoppedLine(CLI_COMMAND_CLEAN_RESTART),
+      ])
+      assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
+    },
+  )
+})
+
+// ---------------------------------------------------------------------------
 // initProductionClient — the production init over the start gate's stubbed
 // seams (b.jg5 SRJ-213); never a real agent-director client
 // ---------------------------------------------------------------------------
 
 describe('initProductionClient', () => {
-  type RecordedClientOptions = NonNullable<StubCreateClientOptions['calls']>
-
   beforeEach(() => resetClientForTests())
   afterEach(() => resetClientForTests())
-
-  /** Gate seams that pass every check after construction; `createClient` decides the build. */
-  const gateDeps = (createClient: StartupGateDeps['createClient']): Partial<StartupGateDeps> =>
-    makePassingGateDeps({ createClient, exit: (code) => { throw new ExitError(code) } })
 
   test('builds the client with the call timeout it is given and installs it as the singleton', async () => {
     const calls: RecordedClientOptions = []
     const client = makeStubClient()
 
-    await initProductionClient(MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS, gateDeps(makeStubCreateClient({ client, calls })))
+    await initProductionClient(MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS, undefined, passingGateSeams(makeStubCreateClient({ client, calls })))
 
     expect(calls.map((c) => c.callTimeoutMs)).toEqual([MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS])
     expect(getClient() as unknown).toBe(client)
@@ -2724,10 +3110,10 @@ describe('initProductionClient', () => {
     [REFUSAL_KIND_CLIENT_TOO_OLD, AD_SYSTEM_INSTALL_TOO_OLD, () => ({ error: errSystemInstallTooOld() })],
     [REFUSAL_KIND_BELOW_PHASE1_FLOOR, AD_BELOW_PHASE1_FLOOR, () => ({ client: makeStubClient({ binaryVersion: OLD_AD_VERSION }) })],
     [REFUSAL_KIND_OTHER, AD_SYSTEM_INSTALL_NOT_FOUND, () => ({ error: errSystemInstallNotFound() })],
-  ])('a gate refusal of kind %s (label %s): the client was built with the call timeout, the thrown StartupGateFailedError keeps that kind and label, and no client is installed', async (kind, label, stub) => {
+  ])('the whole gate (no gate options) refusing with kind %s (label %s): the client was built with the call timeout, the thrown StartupGateFailedError keeps that kind and label, and no client is installed', async (kind, label, stub) => {
     const calls: RecordedClientOptions = []
 
-    const err = await initProductionClient(MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS, gateDeps(makeStubCreateClient({ ...stub(), calls })))
+    const err = await initProductionClient(MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS, undefined, passingGateSeams(makeStubCreateClient({ ...stub(), calls })))
       .then(() => undefined, (e: unknown) => e)
 
     expect(calls.map((c) => c.callTimeoutMs)).toEqual([MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS])
@@ -2736,6 +3122,34 @@ describe('initProductionClient', () => {
     expect(gateError.refusalKind).toBe(kind)
     expect(gateError.classLabel).toBe(label)
     expect(gateError.message.startsWith(`agent-director startup gate failed (${label}): `)).toBe(true)
+    expect(() => getClient()).toThrow()
+    assertNoLeak({ stderr, message: gateError.message })
+  })
+
+  // b.jg5 SRJ-203, SRJ-902: the gate stop --stop-bots asks for leaves only CSCB's floor out.
+  test('with the floor-exempt gate, a client reporting OLD_AD_VERSION (below CSCB\'s floor, accepted by the client) passes: built with the call timeout and installed as the singleton', async () => {
+    const calls: RecordedClientOptions = []
+    const client = makeStubClient({ binaryVersion: OLD_AD_VERSION })
+
+    await initProductionClient(MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS, FLOOR_EXEMPT_GATE, passingGateSeams(makeStubCreateClient({ client, calls })))
+
+    expect(calls.map((c) => c.callTimeoutMs)).toEqual([MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS])
+    expect(getClient() as unknown).toBe(client)
+    assertNoLeak({ stderr })
+  })
+
+  test('with the floor-exempt gate, the client\'s own too-old refusal still fails the gate: the client-too-old kind and label, a message naming the version found and the version required, and no client installed', async () => {
+    const calls: RecordedClientOptions = []
+
+    const err = await initProductionClient(MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS, FLOOR_EXEMPT_GATE, passingGateSeams(makeStubCreateClient(tooOldBuild(calls))))
+      .then(() => undefined, (e: unknown) => e)
+
+    expect(calls.map((c) => c.callTimeoutMs)).toEqual([MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS])
+    expect(err).toBeInstanceOf(StartupGateFailedError)
+    const gateError = err as StartupGateFailedError
+    expect([gateError.refusalKind, gateError.classLabel]).toEqual([REFUSAL_KIND_CLIENT_TOO_OLD, AD_SYSTEM_INSTALL_TOO_OLD])
+    expect(gateError.message).toContain(BELOW_CLIENT_MIN_VERSION)
+    expect(gateError.message).toContain(CLIENT_MIN_VERSION)
     expect(() => getClient()).toThrow()
     assertNoLeak({ stderr, message: gateError.message })
   })

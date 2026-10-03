@@ -1,8 +1,9 @@
 /**
  * cli-teardown.ts — The pure pieces of the CLI's persona teardown commands,
  * `stop --stop-bots` and `clean_restart` (`src/cli.ts`): the precheck's
- * verdict over one answer, its tries and spacing, its two operator lines and
- * the config-file display name (b.jg5 SRJ-901, SRJ-117, SRJ-908).
+ * verdict over one answer, its tries and spacing, its two operator lines,
+ * `stop --stop-bots`' too-old line and the config-file display name (b.jg5
+ * SRJ-901, SRJ-902, SRJ-117, SRJ-908).
  *
  * The precheck. Before either command stops anything, it reads each persona
  * of the configuration the server runs: one `get` of `cscb_<key>`, then, for
@@ -39,6 +40,8 @@
  *
  * A failed precheck prints, per persona it could not reach,
  * {@link precheckFailureLine}, then {@link precheckNothingStoppedLine}.
+ * When the client refuses the binary as too old, `stop --stop-bots` stops
+ * only the server and ends with {@link onlyServerStoppedLine} (SRJ-902).
  *
  * The precheck has no side effects (SRJ-114, SRJ-115, SRJ-801): nothing
  * latches, no record is written and no retired-key entry is cleared. This
@@ -294,4 +297,16 @@ export function precheckFailureLine(
 /** The last line of a failed precheck (b.jg5 SRJ-901): `<command>: nothing was stopped`. */
 export function precheckNothingStoppedLine(command: CliTeardownCommand): string {
   return `${command}: nothing was stopped`
+}
+
+/**
+ * The last line of `stop --stop-bots` when the agent-director client refuses
+ * the binary as too old (b.jg5 SRJ-902): no agent-director call can be made,
+ * so the server alone is stopped and every worker and row is left as it is.
+ * It follows the initialization-failed line that carries the gate's too-old
+ * message (the version found, the version required and the switch-over
+ * section).
+ */
+export function onlyServerStoppedLine(): string {
+  return `${CLI_COMMAND_STOP_BOTS}: only the server was stopped; every worker and row was left as it is`
 }

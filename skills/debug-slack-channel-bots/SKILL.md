@@ -207,6 +207,9 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
     and exited 1?** Its precheck failed and the server and every bot still
     run. See
     [A precheck failed: nothing was stopped](#a-precheck-failed-nothing-was-stopped).
+    `stop --stop-bots` printed `only the server was stopped` and exited 1?
+    The installed agent-director is too old for the client. See
+    [The two CLI commands on an old binary](#the-two-cli-commands-on-an-old-binary).
 
 ---
 
@@ -3186,9 +3189,10 @@ one is skipped. When the check fails, the command stops nothing and exits 1.
   (see [The server log](#the-server-log)). When it could not connect to
   agent-director at all, there is no per-persona line: it prints
   `[slack] <command>: agent-director initialization failed: <failure>`,
-  then `<command>: nothing was stopped`. A binary the startup gate refuses
-  fails here too (see
-  [The server refuses the agent-director binary at start](#the-server-refuses-the-agent-director-binary-at-start)).
+  then `<command>: nothing was stopped`. For `clean_restart`, a binary the
+  startup gate refuses fails here too; `stop --stop-bots` fails here only on
+  a refusal other than the client's too-old one (see
+  [The two CLI commands on an old binary](#the-two-cli-commands-on-an-old-binary)).
 - **Where:** on the terminal. `clean_restart` also writes them to
   `clean_restart.log` in the state directory. Neither command writes them to
   `server.log` or `startup-errors.log`.
@@ -3299,6 +3303,50 @@ exit code 1).
 - **Fix:** the same as at start: the operator follows the README section
   "Switching over to agent-director Phase 1", then starts the server again.
   A bot or this skill never changes the agent-director install itself.
+
+### The two CLI commands on an old binary
+
+`stop --stop-bots` and `clean_restart` connect to agent-director before they
+stop anything. They treat the two classes differently:
+
+| Binary | `stop --stop-bots` | `clean_restart` |
+|---|---|---|
+| Below CSCB's Phase 1 floor, accepted by the client (`ad-below-phase1-floor` at start) | Works as usual: it makes no version check of its own, so the precheck and the teardown run through that binary and every bot is stopped. | Stops nothing: its connection runs the same checks as the server's start and fails (see [A precheck failed: nothing was stopped](#a-precheck-failed-nothing-was-stopped)). Exit 1. |
+| Below the client's own minimum (`ad-system-install-too-old`) | Stops the server only, as below. Exit 1. | Stops nothing, as above. Exit 1. |
+
+So an operator on an agent-director older than Phase 1 can stop the bots
+with `stop --stop-bots` before the switch-over; `clean_restart` needs the
+switch-over first.
+
+**`stop --stop-bots` on a binary the client refuses as too old.**
+
+- **Lines** (terminal only):
+
+  ```text
+  [slack] stop --stop-bots: agent-director initialization failed: agent-director startup gate failed (ad-system-install-too-old): <too-old message>
+  <the server stop's own lines>
+  stop --stop-bots: only the server was stopped; every worker and row was left as it is
+  ```
+
+  The too-old message is the one described under
+  [`ad-system-install-too-old`](#ad-system-install-too-old): it names the
+  version found, the version required and the README section "Switching
+  over to agent-director Phase 1".
+- **Meaning:** no agent-director call could be made, so only the server was
+  stopped. No bot was checked, paused or killed, and every bot and its
+  agent-director row is as it was. The command exits 1 whatever the server
+  stop did, and whether or not the configuration could be loaded. The server
+  stop's lines tell whether the server is really down: `[slack] Server
+  stopped.`, `[slack] Server killed.` or `server is not running` mean it is;
+  `[slack] Warning: server did not die after SIGKILL.` means it is still
+  running, though the last line still prints; `[slack] Could not read PID
+  file: …` means the PID file could not be read, so the server's state is
+  unknown.
+- **Cause:** the system-installed binary is older than the minimum the
+  agent-director client accepts.
+- **Fix:** the operator follows the README section "Switching over to
+  agent-director Phase 1". A bot or this skill never changes the
+  agent-director install itself.
 
 ---
 
@@ -4326,7 +4374,10 @@ or a filesystem that doesn't support syncing a directory).
   `stop --stop-bots` logs `could not load config — skipping bot teardown`,
   checks no persona and stops only the server. If it can't connect to
   agent-director first, it stops nothing (see
-  [A precheck failed: nothing was stopped](#a-precheck-failed-nothing-was-stopped)). `stop` logs one line saying it could not load the applied
+  [A precheck failed: nothing was stopped](#a-precheck-failed-nothing-was-stopped)),
+  unless the client refused the binary as too old: then it stops only the
+  server and exits 1 (see
+  [The two CLI commands on an old binary](#the-two-cli-commands-on-an-old-binary)). `stop` logs one line saying it could not load the applied
   configuration, and uses a 30 s `stop_timeout`.
 - **Fix:** If it can't be read, make it a readable file and start again; the
   record is kept. Otherwise, with the operator's say-so, delete the record and

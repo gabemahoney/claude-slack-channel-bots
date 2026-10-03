@@ -30,13 +30,29 @@
  * the precheck (b.jg5 SRJ-901): the client's initialization, then per persona
  * of that configuration one `get` of its row and, for a live row, one
  * one-line `read-pane`, decided by `precheckVerdictOf` (`src/cli-teardown.ts`).
- * A failed initialization or precheck stops neither the server nor any
- * persona: the command prints its lines, ending `<command>: nothing was
- * stopped`, and exits 1. The precheck latches nothing and writes no file.
- * After a passed precheck the server is stopped, then every persona torn
- * down; `clean_restart` then starts the server. `stop --stop-bots` with an
- * unreadable configuration has no per-persona step: it stops the server and
- * skips the teardown.
+ * A failed precheck stops neither the server nor any persona: the command
+ * prints its lines, ending `<command>: nothing was stopped`, and exits 1.
+ * The precheck latches nothing and writes no file. After a passed precheck
+ * the server is stopped, then every persona torn down; `clean_restart` then
+ * starts the server. `stop --stop-bots` with an unreadable configuration has
+ * no per-persona step: it stops the server and skips the teardown.
+ *
+ * `clean_restart`'s initialization runs the whole startup gate, CSCB's
+ * Phase 1 floor included, and any failure of it stops nothing (b.jg5
+ * SRJ-203). `stop --stop-bots`'s initialization leaves the floor out, so the
+ * command makes no version check of its own, and has three outcomes (b.jg5
+ * SRJ-902):
+ *   - it passes on any binary the client accepts, one below CSCB's floor
+ *     included, and the precheck and teardown run through that client;
+ *   - the client refuses the binary as too old (the gate's refusal kind,
+ *     never its label or message): no agent-director call can be made, so
+ *     the server alone is stopped, with no precheck and no teardown; the
+ *     command prints the initialization-failed line carrying the gate's
+ *     too-old message, then `onlyServerStoppedLine`, and exits 1 whatever
+ *     the server's stop returned, with the configuration read or not;
+ *   - any other failure is a precheck failure: nothing is stopped, the
+ *     initialization-failed line and `<command>: nothing was stopped` are
+ *     printed, and the exit is 1.
  *
  * `credentials` reads the configuration file as it stands
  * (`loadPersonaConfig`), where a persona being added is declared before any
@@ -69,8 +85,8 @@ import { describeThrownValue } from './persona-connection-errors.ts'
 import { getClient } from './agent-director-client.ts'
 import type { Client } from 'agent-director'
 import { personaInstanceId, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
-import { runStartupGate } from './agent-director-startup.ts'
-import type { StartupGateDeps, StartupGateRefusalKind } from './agent-director-startup.ts'
+import { REFUSAL_KIND_CLIENT_TOO_OLD, runStartupGate } from './agent-director-startup.ts'
+import type { StartupGateDeps, StartupGateOptions, StartupGateRefusalKind } from './agent-director-startup.ts'
 import { PROBE_PANE_READ_LINES } from './pane-read.ts'
 import {
   CLI_COMMAND_CLEAN_RESTART,
@@ -82,6 +98,7 @@ import {
   PRECHECK_VERDICT_PASS,
   PRECHECK_VERDICT_RETRY,
   PRECHECK_VERDICT_SKIP,
+  onlyServerStoppedLine,
   precheckFailureLine,
   precheckNothingStoppedLine,
   precheckVerdictOf,
@@ -147,6 +164,13 @@ export interface DaemonChild {
 // ---------------------------------------------------------------------------
 // Injectable dependency interface
 // ---------------------------------------------------------------------------
+
+/**
+ * The startup gate's options a caller of `initClient` may set (b.jg5
+ * SRJ-203): every `StartupGateOptions` field but the call timeout, which
+ * `initClient` takes as its own argument.
+ */
+export type InitClientGateOptions = Omit<StartupGateOptions, 'callTimeoutMs'>
 
 export interface CliDeps {
   /** Run a command and return its exit code (or null if spawn failed). */
@@ -222,17 +246,24 @@ export interface CliDeps {
    * `stop --stop-bots` run in a short-lived CLI process that never runs the
    * server startup gate, so getClient() would throw (the b.qps root cause).
    * Production wires this to {@link initProductionClient}, the non-exiting
-   * runStartupGate variant; on failure the caller stops nothing and exits
-   * loudly (AD-unreachable is never a silent skip). Optional so tests that
-   * install a stub singleton via setClientForTests can omit it — when absent,
-   * callers skip init and use the already-installed stub.
+   * runStartupGate variant; on failure the caller exits loudly
+   * (AD-unreachable is never a silent skip): clean_restart stops nothing,
+   * and `stop --stop-bots` stops nothing unless the client refused the binary
+   * as too old (b.jg5 SRJ-902). Optional so tests that install a stub
+   * singleton via setClientForTests can omit it — when absent, callers skip
+   * init and use the already-installed stub.
    *
    * `callTimeoutMs` is the client's call timeout (b.jg5 SRJ-213): the
    * configuration's `agent_director_call_timeout_ms` (its default when the
    * configuration omits it), or the default when `stop --stop-bots` could not
    * read the configuration. Both commands read the configuration before this.
+   *
+   * `gateOptions` are the startup gate's behaviour options (b.jg5 SRJ-203).
+   * Only `stop --stop-bots` passes any: the option that leaves CSCB's Phase 1
+   * floor out, so it makes no version check of its own and any binary the
+   * client accepts passes. Absent, the whole gate runs, as for clean_restart.
    */
-  initClient?: (callTimeoutMs: number) => Promise<void>
+  initClient?: (callTimeoutMs: number, gateOptions?: InitClientGateOptions) => Promise<void>
   /**
    * The precheck's read of a persona's row (b.jg5 SRJ-901): one `get` of its
    * instance ID (`cscb_<key>`), answering the row's state, `liveness_note` and
@@ -261,7 +292,9 @@ export interface CliDeps {
    * Hard-terminate a persona's instance (`cscb_<key>`) via client.kill. May
    * throw ErrSpawnNotFound for an already-gone row; the real deps absorb it
    * and teardownBots also tolerates it at the call sites — the double-layer
-   * leniency is intentional (b.dnt).
+   * leniency is intentional (b.dnt). A kill result with no `kill_sent` field
+   * (a binary older than Phase 1, reached only by `stop --stop-bots`) is a
+   * plain success (b.jg5 SRJ-110, SRJ-902).
    */
   directorKill: (instanceId: string) => Promise<void>
 }
@@ -315,6 +348,15 @@ class TeardownIncompleteError extends Error {
 function describeCliFailure(err: unknown): string {
   if (err instanceof StartupGateFailedError || err instanceof TeardownIncompleteError) return err.message
   return describeThrownValue(err)
+}
+
+/**
+ * True when `err` is the startup gate's failure for the client's own too-old
+ * refusal (b.jg5 SRJ-902): decided by its refusal kind alone, never by its
+ * class label or its message (SRJ-203).
+ */
+function isClientTooOldRefusal(err: unknown): boolean {
+  return err instanceof StartupGateFailedError && err.refusalKind === REFUSAL_KIND_CLIENT_TOO_OLD
 }
 
 // ---------------------------------------------------------------------------
@@ -741,7 +783,8 @@ export function createCli(deps: CliDeps): CliHandlers {
     // are meant to survive server restarts).
     //
     // Order (b.jg5 SRJ-901): the configuration, the client's initialization
-    // and the precheck come first, so a failed one stops nothing. Then the
+    // and the precheck come first, so a failed one stops nothing (the
+    // client's too-old refusal alone stops the server, SRJ-902). Then the
     // server stops, then teardownBots runs — clean_restart's order too. If
     // teardown ran while the daemon were still alive, a bot's graceful `/exit`
     // would close its MCP session and the live server's onsessionclosed
@@ -779,9 +822,13 @@ export function createCli(deps: CliDeps): CliHandlers {
    * call timeout, and run the precheck over its personas. Answers the
    * configuration to tear down, or null when it cannot be read: then there is
    * no per-persona step, the client takes the default call timeout, and the
-   * teardown is skipped after the server stop. A failed initialization or
-   * precheck prints its lines, ending with the "nothing was stopped" line,
-   * and exits 1 with nothing stopped.
+   * teardown is skipped after the server stop. The initialization leaves
+   * CSCB's Phase 1 floor out (b.jg5 SRJ-203). When the client refuses the
+   * binary as too old, the server alone is stopped and the command exits 1
+   * after the "only the server was stopped" line (b.jg5 SRJ-902), whether or
+   * not the configuration was read. Any other failed initialization, and a
+   * failed precheck, print their lines, ending with the "nothing was
+   * stopped" line, and exit 1 with nothing stopped.
    */
   async function precheckStopBots(): Promise<PersonaConfig | null> {
     // Config load is best-effort: a config problem (a pre-persona file
@@ -800,11 +847,23 @@ export function createCli(deps: CliDeps): CliHandlers {
     // clean_restart, `stop --stop-bots` runs in a short-lived CLI process that
     // never runs the server startup gate; without init getClient() throws and
     // the precheck and teardown could reach no row (the b.qps root cause).
+    // The gate leaves CSCB's Phase 1 floor out here and only here (b.jg5
+    // SRJ-203, SRJ-902): `stop --stop-bots` makes no version check of its own,
+    // so a binary the client accepts runs the precheck and teardown.
     if (deps.initClient) {
       try {
-        await deps.initClient(agentDirectorCallTimeoutMsOf(config))
+        await deps.initClient(agentDirectorCallTimeoutMsOf(config), { skipPhase1Floor: true })
       } catch (err) {
         console.error(`[slack] stop --stop-bots: agent-director initialization failed: ${describeCliFailure(err)}`)
+        if (isClientTooOldRefusal(err)) {
+          // b.jg5 SRJ-902: no agent-director call can be made, so the server
+          // alone is stopped, with no precheck and no teardown; every worker
+          // and row is left as it is. The line above carries the gate's
+          // too-old message (both versions). Exit 1 whatever the stop returned.
+          await stopServer()
+          console.error(onlyServerStoppedLine())
+          deps.exit(1)
+        }
         console.error(precheckNothingStoppedLine(CLI_COMMAND_STOP_BOTS))
         deps.exit(1)
       }
@@ -927,7 +986,9 @@ export function createCli(deps: CliDeps): CliHandlers {
     // explicit init getClient() throws (the b.qps root cause). We use the
     // non-exiting runStartupGate variant so a gate failure surfaces here as a
     // distinct loud non-zero exit, with nothing stopped (b.jg5 SRJ-901 step 1).
-    // The client takes the loaded configuration's call timeout (b.jg5 SRJ-213).
+    // The client takes the loaded configuration's call timeout (b.jg5 SRJ-213)
+    // and the whole gate runs, CSCB's Phase 1 floor included (b.jg5 SRJ-203):
+    // every gate refusal, the floor's included, stops nothing.
     if (deps.initClient) {
       try {
         await deps.initClient(agentDirectorCallTimeoutMsOf(config!))
@@ -1117,6 +1178,9 @@ export function createDirectorOps(getClient: () => DirectorClient): DirectorOps 
     },
     directorKill: async (id) => {
       try {
+        // The result is not read: a result with no `kill_sent` field (a
+        // binary older than Phase 1, which only `stop --stop-bots` reaches)
+        // is a plain success (b.jg5 SRJ-110, SRJ-902).
         await getClient().kill({ claude_instance_id: id })
       } catch (err) {
         if (err instanceof ErrSpawnNotFound) return
@@ -1135,7 +1199,10 @@ export function createDirectorOps(getClient: () => DirectorClient): DirectorOps 
  * singleton through the non-exiting startup gate, `runStartupGate`, which
  * performs Client.create() + setClient() and returns a typed outcome. The
  * client is built with `callTimeoutMs` as its call timeout (b.jg5 SRJ-213).
- * It runs the full gate, CSCB's Phase 1 floor included (b.jg5 SRJ-203). On
+ * The caller's `gateOptions` go to the gate as they are (b.jg5 SRJ-203):
+ * without any it runs the whole gate, CSCB's Phase 1 floor included, as for
+ * clean_restart; `stop --stop-bots` passes the option that leaves the floor
+ * out, and the client's own too-old refusal still fails the gate. On
  * failure it throws {@link StartupGateFailedError} with the outcome's class
  * label, message and refusal kind, so the caller (clean_restart /
  * `stop --stop-bots`) exits loudly rather than silently skipping teardown.
@@ -1143,9 +1210,10 @@ export function createDirectorOps(getClient: () => DirectorClient): DirectorOps 
  */
 export async function initProductionClient(
   callTimeoutMs: number,
+  gateOptions?: InitClientGateOptions,
   gateDeps?: Partial<StartupGateDeps>,
 ): Promise<void> {
-  const outcome = await runStartupGate(gateDeps, { callTimeoutMs })
+  const outcome = await runStartupGate(gateDeps, { ...gateOptions, callTimeoutMs })
   if (!outcome.ok) {
     throw new StartupGateFailedError(outcome.classLabel, outcome.message, outcome.refusalKind)
   }
@@ -1197,8 +1265,8 @@ if (import.meta.main) {
     runCredentialsScript,
     // b.qwo: install the AD Client singleton via the non-exiting startup gate
     // before the precheck and teardown, with the configuration's call timeout
-    // (b.jg5 SRJ-213).
-    initClient: (callTimeoutMs) => initProductionClient(callTimeoutMs),
+    // (b.jg5 SRJ-213) and the caller's gate options (b.jg5 SRJ-203).
+    initClient: (callTimeoutMs, gateOptions) => initProductionClient(callTimeoutMs, gateOptions),
     directorGet: directorOps.directorGet,
     directorReadPane: directorOps.directorReadPane,
     directorStatus: directorOps.directorStatus,

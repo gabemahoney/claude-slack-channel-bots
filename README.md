@@ -759,6 +759,19 @@ This follows `clean_restart`'s order. It runs the [precheck](#precheck-before-st
 
 If agent-director can't be reached, or a persona's instance can't be read, the precheck fails: nothing is stopped and the command exits 1 (see [Precheck before stopping bots](#precheck-before-stopping-bots)). If the teardown itself fails after a passed precheck, the command prints the error and exits non-zero rather than silently reporting a clean stop.
 
+`stop --stop-bots` makes no version check of its own, so CSCB can always be stopped, whatever agent-director is installed:
+
+- **An agent-director older than CSCB needs, that the agent-director client still accepts:** the command works as usual. The precheck and the teardown run through that agent-director, and every bot is stopped. This is how you stop the bots before the switch-over (see the README section "Switching over to agent-director Phase 1").
+- **An agent-director below the client's own minimum:** no agent-director call can be made, so only the server is stopped. No bot is checked, paused or killed, and every bot and its agent-director instance is left as it is. The command prints the reason, which names the version found, the version required and the README section "Switching over to agent-director Phase 1", then the server stop's own lines, then a last line, and exits 1:
+
+  ```text
+  [slack] stop --stop-bots: agent-director initialization failed: agent-director startup gate failed (ad-system-install-too-old): agent-director system install is too old: …
+  [slack] Server stopped.
+  stop --stop-bots: only the server was stopped; every worker and row was left as it is
+  ```
+
+  The exit status is 1 whatever the server stop did, so read the lines between the first and the last to tell whether the server is really down: `[slack] Server stopped.`, `[slack] Server killed.` or `server is not running` mean it is; `[slack] Warning: server did not die after SIGKILL.` means it is still running; `[slack] Could not read PID file: …` means the PID file could not be read, so the server's state is unknown. This happens whether or not the configuration could be loaded.
+
 A configuration that cannot be loaded, a bad record or a missing or pre-persona file included, is best-effort: it prints `[slack] stop --stop-bots: could not load config — skipping bot teardown:` with the cause, no persona is checked, the server is stopped, and the teardown is skipped.
 
 ### `claude-slack-channel-bots clean_restart`
@@ -784,13 +797,14 @@ Behavior by case:
 - **Server already stopped:** `stop` reports `server is not running`; `start` then brings up a fresh server.
 - **Server fails to start again:** `clean_restart` exits non-zero with `[slack] clean_restart: start failed with exit code <n>`; the reason is in `server.log`.
 - **agent-director unreachable, or a persona's instance can't be read:** the precheck fails and nothing is stopped: the old server and every bot keep running, and `clean_restart` exits 1 (see [Precheck before stopping bots](#precheck-before-stopping-bots)).
+- **An agent-director older than CSCB needs:** `clean_restart` runs the same version checks as the server's start, so on an agent-director below CSCB's Phase 1 floor, or below the client's own minimum, its precheck fails at the connection and nothing is stopped. Follow the README section "Switching over to agent-director Phase 1". To stop the bots before the switch-over, use `stop --stop-bots`, which works on any agent-director the client accepts (see [`stop`](#claude-slack-channel-bots-stop)).
 - **agent-director fails during the teardown:** the teardown fails loudly and the restart is aborted (non-zero exit); no new server is started. The `no spawn row` message appears only when a persona genuinely has no spawn, never when the client failed to reach agent-director.
 
 ### Precheck before stopping bots
 
 Before `stop --stop-bots` or `clean_restart` stops anything, it checks that agent-director answers and that each persona's instance can be read:
 
-1. It connects to agent-director, with the same version checks as the server's start.
+1. It connects to agent-director. `clean_restart` makes the same version checks as the server's start. `stop --stop-bots` makes no version check of its own: any agent-director the client accepts passes, one older than CSCB's Phase 1 floor included.
 2. For each persona in the last-applied record (or in `config.json` when there is no record), it reads the persona's instance, `cscb_<key>`. A persona with no instance, or whose instance has finished, is skipped. A running instance has one line of its screen read.
 
 A persona fails the precheck when agent-director answers with one of these classes:
@@ -813,7 +827,7 @@ clean_restart: precheck failed for persona "<name>" (key=<key>), session "slack_
 clean_restart: nothing was stopped
 ```
 
-The lines start with the command, `stop --stop-bots` or `clean_restart`. `<description>` is the error's name and agent-director's description, as `<name> message="…"`, on one line, with anything that looks like a token replaced by a redaction marker. `stop --stop-bots` prints the lines on the terminal only; `clean_restart` prints them on the terminal and in `clean_restart.log`. When the connection in step 1 fails (an agent-director binary older than CSCB needs included), the command prints `[slack] <command>: agent-director initialization failed:` with the reason, then `<command>: nothing was stopped`, and exits 1.
+The lines start with the command, `stop --stop-bots` or `clean_restart`. `<description>` is the error's name and agent-director's description, as `<name> message="…"`, on one line, with anything that looks like a token replaced by a redaction marker. `stop --stop-bots` prints the lines on the terminal only; `clean_restart` prints them on the terminal and in `clean_restart.log`. When the connection in step 1 fails, the command prints `[slack] <command>: agent-director initialization failed:` with the reason, then `<command>: nothing was stopped`, and exits 1. For `clean_restart` this includes an agent-director older than CSCB needs. The one exception is `stop --stop-bots` on an agent-director below the client's own minimum: it stops the server alone and ends with `stop --stop-bots: only the server was stopped; every worker and row was left as it is` (see [`stop`](#claude-slack-channel-bots-stop)).
 
 Nothing was stopped: the server and every bot keep running. Fix the cause, then run the command again.
 
@@ -1693,7 +1707,10 @@ grep -E 'persona-episodes: persona=<key> unclassified-error |unavailable-retry: 
 If a session does not exit within `exit_timeout` seconds (default 120s), `clean_restart` force-kills the spawn via `agent-director kill` and proceeds. To manually recover, run `agent-director list --label service=cscb` to find lingering spawns and `agent-director kill <claude_instance_id>` to clear them, then `claude-slack-channel-bots stop && claude-slack-channel-bots start`.
 
 **`clean_restart` or `stop --stop-bots` exits non-zero with `nothing was stopped`**
-The precheck failed, so nothing was stopped: the server and every bot keep running. The `precheck failed for persona` lines name each persona it could not check and why, by class (see [Precheck before stopping bots](#precheck-before-stopping-bots)); an `agent-director initialization failed:` line means agent-director could not be reached or its version was refused. Fix the cause, then re-run the command.
+The precheck failed, so nothing was stopped: the server and every bot keep running. The `precheck failed for persona` lines name each persona it could not check and why, by class (see [Precheck before stopping bots](#precheck-before-stopping-bots)); an `agent-director initialization failed:` line means agent-director could not be reached or (for `clean_restart`) its version was refused. Fix the cause, then re-run the command.
+
+**`stop --stop-bots` exits non-zero with `only the server was stopped`**
+The installed agent-director is below the agent-director client's own minimum, so only the server was stopped. See [`stop`](#claude-slack-channel-bots-stop) for what was left running and how to read the server stop's lines, then follow the README section "Switching over to agent-director Phase 1".
 
 **`clean_restart` or `stop --stop-bots` exits non-zero with an agent-director teardown error**
 This is intentional: when agent-director is unreachable, the teardown cannot run, so the command fails loudly rather than silently no-op'ing and (for `clean_restart`) restarting on top of bots it never touched. Confirm agent-director is installed and responsive with `agent-director version`, then re-run the command. Teardown kills but never deletes rows on any failure path, so it is always safe to retry once agent-director is reachable.
