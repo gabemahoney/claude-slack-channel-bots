@@ -50,9 +50,10 @@
  *      no-op on a pane or a read that could not answer, and a findMissing
  *      sweep, then resume or spawn once its row reads dead, when
  *      agent-director finds no pane of its launch or no row (b.jdc, b.jg5
- *      SRJ-607); pending → the ladder's `pending` step: no-op, or the
- *      replacement when the row is not covered, its `cwd` or `config_dir`
- *      label differing, b.jg5 SRJ-411). Nothing is ever typed
+ *      SRJ-607); pending → the ladder's `pending` step: no-op with the
+ *      persona's retry timer armed in pending-only mode for a covered row
+ *      (b.jg5 SRJ-409), or the replacement when the row is not covered, its
+ *      `cwd` or `config_dir` label differing, b.jg5 SRJ-411). Nothing is ever typed
  *      into a prompt. Before any resume, a row whose `config_dir` label is
  *      missing or differs from the persona's current effective
  *      claude_config_dir is replaced instead (a resume keeps the old config
@@ -421,6 +422,7 @@ import {
 import { getClient } from './agent-director-client.ts'
 import {
   armPendingOnlyAfterLaunchFailure,
+  armPendingOnlyForPendingRow,
   clearOutageFlag,
   getOutageFlags,
   raiseAdConfigMalformed,
@@ -635,9 +637,14 @@ import {
   UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION,
   UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED,
   UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED,
+  UNAVAILABLE_RETRY_PENDING_STEP_KEPT,
+  UNAVAILABLE_RETRY_PENDING_STEP_LATCHED,
+  UNAVAILABLE_RETRY_PENDING_STEP_ROW,
+  UNAVAILABLE_RETRY_PENDING_STEP_SEQUENCE_STARTED,
   UNAVAILABLE_RETRY_ROW_ABSENT,
   type AttemptView,
   type RetryBlockCause,
+  type UnavailableRetryPendingStep,
   type UnavailableRetryRowRead,
   type UnavailableRetryTriggerSink,
 } from './unavailable-retry.ts'
@@ -670,6 +677,7 @@ import {
   LIVE_ROW_SEQUENCE_ENTRY_KILL,
   LIVE_ROW_SEQUENCE_LOG_PREFIX,
   LIVE_ROW_START_ALREADY_RUNNING,
+  LIVE_ROW_START_STARTED,
   LIVE_ROW_SEQUENCE_NO_ROW,
   LIVE_ROW_SEQUENCE_SITE,
   LIVE_ROW_STOP_HOLD_ENDED,
@@ -751,7 +759,26 @@ import {
   pendingLaunchStartOf,
   type LivenessReading,
 } from './liveness-reading.ts'
-import { PENDING_ROW_WAIT_NOT_ARMED, armPendingRowWait, isPendingRowAged, parseLaunchStart } from './pending-row.ts'
+import {
+  PENDING_ROW_COVERED,
+  PENDING_ROW_NO_LAUNCH_START,
+  PENDING_ROW_NOT_COVERED,
+  PENDING_ROW_REASON_CONFIG_DIR_MISMATCH,
+  PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED,
+  PENDING_ROW_REASON_CWD_MISMATCH,
+  PENDING_ROW_REASON_CWD_UNRESOLVED,
+  PENDING_ROW_REASON_RETIRED_OLD_LIFE,
+  PENDING_ROW_UNDECIDED,
+  PENDING_ROW_WAIT_NOT_ARMED,
+  armPendingRowWait,
+  decidePendingRowCover,
+  isPendingRowAged,
+  parseLaunchStart,
+  type PendingRowCover,
+  type PendingRowFields,
+  type PendingRowNotCoveredReason,
+  type PendingRowUndecidedReason,
+} from './pending-row.ts'
 import { isDryRun } from './tokens.ts'
 import {
   DIALOG_READY_TIMEOUT_MS,
@@ -4002,11 +4029,24 @@ interface ApproverRun {
    * `status` failed sets nothing.
    */
   launchStartMs: number | undefined
+  /**
+   * The row state the approver's latest own-row `status` read gave, if any
+   * read answered a row (b.jg5 SRJ-404): at its stop, a row last read
+   * `pending`, or none read, is armed for (`armAfterApproverStop`).
+   */
+  lastStateRead: string | undefined
 }
 
 /** A fresh approver state: no stop asked, no limit armed, no launch start kept. */
 function newApproverRun(): ApproverRun {
-  return { stopRequested: undefined, limitReached: undefined, limit: undefined, wake: undefined, launchStartMs: undefined }
+  return {
+    stopRequested: undefined,
+    limitReached: undefined,
+    limit: undefined,
+    wake: undefined,
+    launchStartMs: undefined,
+    lastStateRead: undefined,
+  }
 }
 
 /** What one approver loop works with: the persona, its run and the clock it took at its start. */
@@ -4359,6 +4399,7 @@ async function approverLap(ctx: ApproverContext): Promise<ApproverStopReason | A
   }
 
   const state = read.state
+  run.lastStateRead = state
   if (AGENT_DIRECTOR_DEAD_STATES.has(state)) {
     const msg = approverFinishedMessage(ref, state)
     console.error(approverLogLine(msg))
@@ -9515,12 +9556,14 @@ function sequenceStartWaitingCause(startAnswer: string, instanceId: string): Seq
  * conversation kept when `keepsConversation`, the request's retired-key flag
  * `retiredKey` (the start entry sets it anyway while the key is recorded,
  * b.jg5 SRJ-805), the ladder's retired-key reading at its start
- * (`run.retiredAtStart`, SRJ-806), ending in a launch, alert context
- * `recovery`. Answers the start entry's answer and the ladder's action for
- * it (`sequenceStartAction`). Never throws.
+ * (`run.retiredAtStart`, SRJ-806; absent for the pending-row step's
+ * read-and-step entry, which holds no ladder, so the start entry reads the
+ * store then), ending in a launch, alert context `recovery`. Answers the
+ * start entry's answer and the ladder's action for it
+ * (`sequenceStartAction`). Never throws.
  */
 function startRecoverySequence(
-  run: LadderRun,
+  run: Pick<LadderRun, 'persona' | 'ref'> & { readonly retiredAtStart?: RetiredKeyAttemptStart },
   lastRead: LatchRowState,
   keepsConversation: boolean,
   retiredKey: boolean,
@@ -9755,7 +9798,8 @@ async function reuseFinishedRow(
  *   - `pending`, a launch in progress: nothing counted or posted, and no
  *     live-row sequence of its own, whatever evidence the path holds; the
  *     row goes to the ladder's `pending` step (`ladderPendingRowStep`),
- *     whose answer is the result: a covered row is left (`no-op`), with no
+ *     whose answer is the result: a covered row is left (`no-op`, the
+ *     persona's retry timer armed in pending-only mode), with no
  *     kill and no launch, and a row that is not covered gets SRJ-411's
  *     sequence through the replace step;
  *   - another known live state (`AGENT_DIRECTOR_LIVE_STATES`), on a path
@@ -10378,52 +10422,365 @@ function lostRaceAtLadder(key: string, log: (outcome: string) => void): SpawnPer
 }
 
 // ---------------------------------------------------------------------------
-// The collision ladder's `pending` step (b.jg5 SRJ-409, SRJ-411)
+// The pending-row step (b.jg5 SRJ-409, SRJ-411)
 // ---------------------------------------------------------------------------
+
+/** The head of the pending-row step's own lines. */
+export const PENDING_ROW_STEP_LOG_PREFIX = '[slack] pending-row:'
+
+/** Who reads, in the own-row lines of the read-and-step entry's `get` (`readAndStepPendingRow`; the persona's ref is added; b.jg5 SRJ-114, SRJ-409). */
+export const PENDING_ROW_STEP_GET_SITE: OwnRowReadSite = Object.freeze({ site: 'pendingRowStep', what: 'pending-row get' })
+
+/** The read-and-step entry's answer when its read latched the persona, or found it latched (b.jg5 SRJ-114, SRJ-502, SRJ-513). */
+export const PENDING_ROW_STEP_LATCHED = 'latched'
+/** The read-and-step entry's answer when its `get` read the row in a state other than `pending`. */
+export const PENDING_ROW_STEP_NOT_PENDING = 'not-pending'
+/** The read-and-step entry's answer when its `get` answered `ErrSpawnNotFound`: the row is gone. */
+export const PENDING_ROW_STEP_NO_ROW = 'no-row'
+/** The read-and-step entry's answer when the shared read refused its `get` (its own error rows applied, its cause armed inside an attempt). */
+export const PENDING_ROW_STEP_REFUSED = 'refused'
+
+/**
+ * What the read-and-step entry answers (`readAndStepPendingRow`; b.jg5
+ * SRJ-409, SRJ-411): the covered row's arm, the undecided row's arm, the
+ * uncovered row's sequence start (the start entry's answer), a latch, the
+ * state another live or finished row read, no row, or a refused read.
+ * `armed` is whether the persona's timer was asked to arm (false for a
+ * latched persona, or with no trigger sink installed).
+ */
+export type PendingRowStepAnswer =
+  | { readonly kind: typeof PENDING_ROW_COVERED; readonly armed: boolean }
+  | { readonly kind: typeof PENDING_ROW_UNDECIDED; readonly reason: PendingRowUndecidedReason; readonly armed: boolean }
+  | {
+      readonly kind: typeof PENDING_ROW_NOT_COVERED
+      readonly reason: PendingRowNotCoveredReason
+      readonly startAnswer: LiveRowSequenceStartEntryAnswer
+    }
+  | { readonly kind: typeof PENDING_ROW_STEP_LATCHED }
+  | { readonly kind: typeof PENDING_ROW_STEP_NOT_PENDING; readonly state: string }
+  | { readonly kind: typeof PENDING_ROW_STEP_NO_ROW }
+  | { readonly kind: typeof PENDING_ROW_STEP_REFUSED; readonly error: unknown }
+
+/**
+ * The replace step's reason, and the uncovered-row line's words, for a
+ * reason a `pending` row is not covered. A function, so the module's later
+ * constants are read at call time. Pure.
+ */
+function pendingRowNotCoveredWhy(reason: PendingRowNotCoveredReason): string {
+  switch (reason) {
+    case PENDING_ROW_REASON_RETIRED_OLD_LIFE:
+      return `${RETIRED_KEY_WHY} and no new life has begun yet, so the row is the old life`
+    case PENDING_ROW_REASON_CWD_MISMATCH:
+      return CWD_MISMATCH_WHY
+    case PENDING_ROW_REASON_CONFIG_DIR_MISMATCH:
+      return CONFIG_DIR_MISMATCH_WHY
+  }
+}
+
+/** The undecided-row line's words for each reason a `pending` row's cover is undecided. */
+const PENDING_ROW_UNDECIDED_WHY: Readonly<Record<PendingRowUndecidedReason, string>> = {
+  [PENDING_ROW_REASON_CWD_UNRESOLVED]: 'its working_directory does not resolve to a real path now',
+  [PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED]: 'its claude_config_dir cannot be resolved now',
+}
+
+/**
+ * The one line for a `pending` row that is not covered, sent to the live-row
+ * sequence (b.jg5 SRJ-411), naming the persona reference `ref` and the
+ * reason:
+ *
+ *   [slack] pending-row: <ref>'s pending row is not covered (<reason>: <why>) — it goes through the live-row sequence, the conversation not kept (alert context recovery); no approver, nothing typed (b.jg5 SRJ-411)
+ *
+ * Pure.
+ */
+export function uncoveredPendingRowLine(ref: string, reason: PendingRowNotCoveredReason): string {
+  return `${PENDING_ROW_STEP_LOG_PREFIX} ${ref}'s pending row is not covered (${reason}: ${pendingRowNotCoveredWhy(reason)}) — it goes through the live-row sequence, the conversation not kept (alert context ${KILL_FAILURE_CONTEXT_RECOVERY}); no approver, nothing typed (b.jg5 SRJ-411)`
+}
+
+/**
+ * The one line for a `pending` row whose cover is undecided (b.jg5 SRJ-409;
+ * b.av2 SR-6.4, b.g57), with whether its timer was asked to arm:
+ *
+ *   [slack] pending-row: <ref>'s pending row is undecided (<reason>: <why>) — no approver, no sequence; its retry timer is armed in pending-only mode, and the next read decides again (b.jg5 SRJ-409)
+ *
+ * Pure.
+ */
+export function undecidedPendingRowLine(ref: string, reason: PendingRowUndecidedReason, armed: boolean): string {
+  const timer = armed ? 'its retry timer is armed in pending-only mode' : 'its retry timer could not be armed'
+  return `${PENDING_ROW_STEP_LOG_PREFIX} ${ref}'s pending row is undecided (${reason}: ${PENDING_ROW_UNDECIDED_WHY[reason]}) — no approver, no sequence; ${timer}, and the next read decides again (b.jg5 SRJ-409)`
+}
+
+/**
+ * The line for a configured persona's own `pending` row with no launch
+ * start that reached the pending-row step (b.jg5 SRJ-513, SRJ-408): the read
+ * that found it latched the persona, so nothing is armed or started:
+ *
+ *   [slack] pending-row: <ref>'s pending row has no launch start — the persona latches on it; nothing armed, no sequence (b.jg5 SRJ-513)
+ */
+export function noLaunchStartPendingRowLine(ref: string): string {
+  return `${PENDING_ROW_STEP_LOG_PREFIX} ${ref}'s pending row has no launch start — the persona latches on it; nothing armed, no sequence (b.jg5 SRJ-513)`
+}
+
+/**
+ * The line for a covered or undecided `pending` row whose persona is latched,
+ * so its retry timer is not armed (b.jg5 SRJ-305, SRJ-409), naming the
+ * persona reference `ref`:
+ *
+ *   [slack] pending-row: not arming <ref>'s retry timer for its pending row — the persona is latched (b.jg5 SRJ-305)
+ *
+ * Pure.
+ */
+export function latchedNoArmPendingRowLine(ref: string): string {
+  return `${PENDING_ROW_STEP_LOG_PREFIX} not arming ${ref}'s retry timer for its pending row — the persona is latched (b.jg5 SRJ-305)`
+}
+
+/**
+ * Arm persona `key`'s retry timer in pending-only mode for its covered (or
+ * undecided) `pending` row (b.jg5 SRJ-301, SRJ-409), through the outage
+ * state's pending-row arm (`armPendingOnlyForPendingRow`), in or outside an
+ * attempt; the controller's armed line, with the `pending-row` cause, is the
+ * arm's line. A latched persona is never armed (b.jg5 SRJ-305): one line
+ * (`latchedNoArmPendingRowLine`), and false. Answers whether the timer was
+ * asked to arm. Never throws.
+ */
+function armPendingRowWatch(key: string, ref: string): boolean {
+  if (personaLatchedNow(key)) {
+    console.error(latchedNoArmPendingRowLine(ref))
+    return false
+  }
+  return armPendingOnlyForPendingRow(key)
+}
+
+/**
+ * Whether persona `persona`'s own `pending` row `row` is covered (b.jg5
+ * SRJ-409, SRJ-411): `decidePendingRowCover` (`src/pending-row.ts`) over the
+ * row, whether the key is a configured persona's (`configuredReadingOf`),
+ * the installed retired-key store's reading of the key now
+ * (`retiredKeyReadingOf`: its in-memory mark counted as set) and the one row
+ * comparison (`compareRowToPersona`, `cwd` and the `config_dir` label).
+ *
+ * `statusOnlySite` is true for a site that read the row with `status` only
+ * and then one `get` for this comparison (the read-and-step entry: the
+ * restart path's deferral and its re-probe, a pending-only retry). There,
+ * a persona working directory with no real path leaves the `cwd` condition
+ * unresolved whatever the row's `cwd` is (`pendingRowComparisonFor`), and
+ * `decidePendingRowCover` is told the site is status-only, so a working
+ * directory or `claude_config_dir` that cannot be resolved leaves the row
+ * undecided before any mismatch is checked, and the next read decides
+ * (b.jg5 SRJ-409, SRJ-411, b.av2 SR-6.4); the lexical comparison never
+ * makes it covered. The collision ladder passes false: its own `cwd` guard
+ * has run before its `pending` branch, and a `cwd` mismatch is checked
+ * first. Answers the decision. Never throws.
+ */
+function pendingRowCoverOf(
+  persona: Persona,
+  row: PendingRowFields & Pick<GetResult, 'cwd' | 'labels'>,
+  statusOnlySite: boolean,
+): PendingRowCover {
+  const comparison = compareRowToPersona(row, persona, spawnHomeDir(), undefined, _configDirFs)
+  return decidePendingRowCover({
+    row,
+    ownConfigured: configuredReadingOf(persona.key).configured,
+    retired: retiredKeyReadingOf(persona.key),
+    comparison: statusOnlySite ? pendingRowComparisonFor(comparison) : comparison,
+    statusOnlySite,
+  })
+}
+
+/**
+ * The row comparison a status-only site's pending-row decision reads
+ * (b.jg5 SRJ-411, b.av2 SR-6.4): `comparison` as is while the persona's
+ * working directory has a real path; otherwise its `cwd` condition is
+ * unresolved (`cwdMatches` false, `cwdCheckDeferred` true), so
+ * `decidePendingRowCover` answers undecided with the `cwd-unresolved`
+ * reason rather than act on the lexical comparison. Pure; never throws.
+ */
+export function pendingRowComparisonFor(comparison: RowPersonaComparison): RowPersonaComparison {
+  if (comparison.workingDirectoryResolved) return comparison
+  return { ...comparison, cwdMatches: false, cwdCheckDeferred: true }
+}
+
+/**
+ * The one pending-row step (b.jg5 SRJ-409, SRJ-411, SRJ-408, SRJ-513) over
+ * persona `persona`'s own row `row`, read `pending`: decides whether it is
+ * covered (`pendingRowCoverOf`) and acts on every answer but "not covered":
+ *   - no launch start: nothing (the read that found it latched the persona;
+ *     one line);
+ *   - covered: the persona's retry timer is armed in pending-only mode
+ *     (`armPendingRowWatch`); no kill, no launch, no approver;
+ *   - undecided: armed the same, with one line; no approver, no sequence;
+ *   - not covered: one line (`uncoveredPendingRowLine`); its caller starts
+ *     the live-row sequence (the collision ladder through its replace step,
+ *     the read-and-step entry through the start entry).
+ * The step never starts an approver, kills or launches. `statusOnlySite`
+ * is passed to `pendingRowCoverOf`. Answers the decision and whether the
+ * timer was asked to arm. Never throws.
+ */
+function pendingRowStep(
+  persona: Persona,
+  ref: string,
+  row: PendingRowFields & Pick<GetResult, 'cwd' | 'labels'>,
+  statusOnlySite: boolean,
+): { readonly cover: PendingRowCover; readonly armed: boolean } {
+  const cover = pendingRowCoverOf(persona, row, statusOnlySite)
+  switch (cover.answer) {
+    case PENDING_ROW_NO_LAUNCH_START:
+      console.error(noLaunchStartPendingRowLine(ref))
+      return { cover, armed: false }
+    case PENDING_ROW_COVERED:
+      return { cover, armed: armPendingRowWatch(persona.key, ref) }
+    case PENDING_ROW_UNDECIDED: {
+      const armed = armPendingRowWatch(persona.key, ref)
+      console.error(undecidedPendingRowLine(ref, cover.reason, armed))
+      return { cover, armed }
+    }
+    case PENDING_ROW_NOT_COVERED:
+      console.error(uncoveredPendingRowLine(ref, cover.reason))
+      return { cover, armed: false }
+  }
+}
 
 /**
  * The collision ladder's `pending` step (b.jg5 SRJ-409, SRJ-411, SRJ-707,
  * SRJ-1504) for persona `run.persona`'s row `row`, read `pending`
  * (`lastRead`): the ladder's `pending` branch, and a re-read that found the
  * row `pending` (the not-resumable step, SRJ-710; the re-read before a
- * resume site's replacement, SRJ-609). A configured persona's own `pending`
- * row with no launch start never reaches it: the read latched it first
- * (SRJ-513).
- *   - A row that is not the persona's current life is not covered
- *     (SRJ-411): its `cwd` differs from the persona's working directory by
- *     real path (a check that cannot be made now is no mismatch, b.av2
- *     SR-6.4), or its `config_dir` label is missing or differs. The replace
- *     step sends it through the live-row sequence (`replacePersonaRow`),
- *     which waits until G past its launch start and ends in a reuse spawn of
- *     the same id.
- *   - A `claude_config_dir` that cannot be resolved gives no verdict and
- *     keeps the deferral (bug b.g57).
- *   - A covered row is left as it is: `no-op`, with no kill and no launch.
- *     Nothing is armed here, and no pending-row rule is applied to the
- *     covered row at this step.
+ * resume site's replacement, SRJ-609). It runs the one pending-row step
+ * (`pendingRowStep`) and answers:
+ *   - covered: `no-op` (counted as before), the persona's retry timer armed
+ *     in pending-only mode, with no kill and no launch;
+ *   - not covered (SRJ-411: a retired key's old life before its new life, a
+ *     `cwd` that differs from the persona's working directory by real path,
+ *     a `config_dir` label missing or different): the replace step
+ *     (`replacePersonaRow`) sends it through the live-row sequence, with the
+ *     conversation not kept and alert context `recovery` (the retired-key
+ *     flag set for an old life), which waits until G past its launch start
+ *     and ends in a reuse spawn of the same id: `sequence-waiting`;
+ *   - undecided: the timer armed the same; a `claude_config_dir` that cannot
+ *     be resolved also keeps its deferral (`deferForUnresolvedConfigDir`,
+ *     `deferred`, bug b.g57), and a `cwd` that cannot be compared answers
+ *     `no-op`;
+ *   - no launch start: `latched` (the collision `get` or re-read latched the
+ *     persona first, so the ladder does not reach here for such a row).
  * Never throws.
  */
-async function ladderPendingRowStep(
-  run: LadderRun,
-  row: Pick<GetResult, 'cwd' | 'labels'>,
-  lastRead: LatchRowState,
-): Promise<SpawnPersonaResult> {
+async function ladderPendingRowStep(run: LadderRun, row: GetResult, lastRead: LatchRowState): Promise<SpawnPersonaResult> {
   const { persona, ref } = run
   const { key } = persona
-  const comparison = compareRowToPersona(row, persona, spawnHomeDir(), undefined, _configDirFs)
-  if (!comparison.cwdMatches && !comparison.cwdCheckDeferred) {
-    console.error(
-      `[slack] spawnForPersona: ${ref} pending row cwd=${row.cwd || '<none>'} differs from working_directory=${persona.working_directory} — not covered; replacing its row by a reuse spawn of the same id`,
-    )
-    return replacePersonaRow(run, lastRead, CWD_MISMATCH_WHY)
+  const { cover } = pendingRowStep(persona, ref, row, false)
+  switch (cover.answer) {
+    case PENDING_ROW_NO_LAUNCH_START:
+      return { key, action: 'latched' }
+    case PENDING_ROW_NOT_COVERED:
+      return replacePersonaRow(
+        run,
+        lastRead,
+        pendingRowNotCoveredWhy(cover.reason),
+        cover.reason === PENDING_ROW_REASON_RETIRED_OLD_LIFE ? true : undefined,
+      )
+    case PENDING_ROW_UNDECIDED:
+      if (cover.reason === PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED) return deferForUnresolvedConfigDir(persona, ref)
+      return { key, action: 'no-op' }
+    case PENDING_ROW_COVERED:
+      console.error(`[slack] spawnForPersona: no action — state=${AGENT_DIRECTOR_PENDING_STATE} for ${ref}`)
+      return { key, action: 'no-op' }
   }
-  if (!comparison.configDirResolved) return deferForUnresolvedConfigDir(persona, ref)
-  if (!comparison.configDirMatches) {
-    console.error(`[slack] spawnForPersona: ${configDirMismatchText(persona, ref, comparison)} on a pending row — not covered; replacing its row by a reuse spawn of the same id`)
-    return replacePersonaRow(run, lastRead, CONFIG_DIR_MISMATCH_WHY)
+}
+
+/**
+ * The read-and-step entry (b.jg5 SRJ-409, SRJ-411) for persona `persona`, for
+ * a caller that holds only a `status` read showing its row `pending` (the
+ * restart path's deferral, `deferPendingRow` in `src/server.ts`, and the
+ * pending-only retry, `retryPendingRowStep`): one `get` of its own row
+ * through the shared own-row read (`readPersonaOwnRow` at
+ * `PENDING_ROW_STEP_GET_SITE`, so its note latch, its launch-start latch,
+ * its retired-entry clear and its old-life read entry apply), then:
+ *   - the read latched the persona (or found it latched after the read):
+ *     `latched`, nothing more;
+ *   - `ErrSpawnNotFound`: `no-row`; any other refused read: `refused`, with
+ *     the error (an UNAVAILABLE armed its cause inside an attempt);
+ *   - a state other than `pending`: `not-pending`, with the state read;
+ *   - `pending`: the one pending-row step (`pendingRowStep`): covered or
+ *     undecided, the timer armed in pending-only mode; not covered, one
+ *     start of the live-row sequence through the start entry
+ *     (`startRecoverySequence`: seeded `pending`, entry at step 1, the
+ *     conversation not kept, the retired-key flag set for a retired key's
+ *     old life and by the start entry for any recorded key, ending in a
+ *     launch, alert context `recovery`), answering the start entry's
+ *     answer; no launch call of its own. A sequence it starts meets the
+ *     old-life hold gate at its step-6 launch.
+ * Never starts an approver, kills or launches; no new `getClient()` site.
+ * Never throws.
+ */
+export async function readAndStepPendingRow(persona: Persona): Promise<PendingRowStepAnswer> {
+  const { key } = persona
+  const ref = personaRef(persona)
+  const read = await readPersonaOwnRow(key, { ...PENDING_ROW_STEP_GET_SITE, ref })
+  if (read.kind === OWN_ROW_READ_LATCHED) return { kind: PENDING_ROW_STEP_LATCHED }
+  if (read.kind === OWN_ROW_READ_ABSENT) return { kind: PENDING_ROW_STEP_NO_ROW }
+  if (read.kind === OWN_ROW_READ_REFUSED) return { kind: PENDING_ROW_STEP_REFUSED, error: read.error }
+  if (read.latched) return { kind: PENDING_ROW_STEP_LATCHED }
+  if (latchedAfterOwnRowRead(key, PENDING_ROW_STEP_GET_SITE.site, PENDING_ROW_STEP_GET_SITE.what, ref)) {
+    return { kind: PENDING_ROW_STEP_LATCHED }
   }
-  console.error(`[slack] spawnForPersona: no action — state=${AGENT_DIRECTOR_PENDING_STATE} for ${ref}`)
-  return { key, action: 'no-op' }
+  const { row } = read
+  if (row.state !== AGENT_DIRECTOR_PENDING_STATE) return { kind: PENDING_ROW_STEP_NOT_PENDING, state: row.state }
+  const { cover, armed } = pendingRowStep(persona, ref, row, true)
+  switch (cover.answer) {
+    case PENDING_ROW_NO_LAUNCH_START:
+      return { kind: PENDING_ROW_STEP_LATCHED }
+    case PENDING_ROW_COVERED:
+      return { kind: PENDING_ROW_COVERED, armed }
+    case PENDING_ROW_UNDECIDED:
+      return { kind: PENDING_ROW_UNDECIDED, reason: cover.reason, armed }
+    case PENDING_ROW_NOT_COVERED: {
+      const { startAnswer } = startRecoverySequence(
+        { persona, ref },
+        latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE),
+        false,
+        cover.reason === PENDING_ROW_REASON_RETIRED_OLD_LIFE,
+      )
+      console.error(`${PENDING_ROW_STEP_LOG_PREFIX} ${ref}'s live-row sequence start answered ${startAnswer}; no other call, nothing counted (b.jg5 SRJ-411, SRJ-706)`)
+      return { kind: PENDING_ROW_NOT_COVERED, reason: cover.reason, startAnswer }
+    }
+  }
+}
+
+/**
+ * The pending-only retry's pending-row step (`FullModeRetryDeps.stepPendingRow`,
+ * bound in `main()`; b.jg5 SRJ-409, SRJ-411) for persona `key`, whose applied
+ * persona is `persona`: the read-and-step entry (`readAndStepPendingRow`),
+ * its answer mapped for the retry action:
+ *   - covered, undecided (the timer armed pending-only) or a refused read:
+ *     `kept`;
+ *   - not covered with the sequence started or already running:
+ *     `sequence-started`; with nothing started (`held`, `closed`,
+ *     `not-installed`): `kept`;
+ *   - latched: `latched`;
+ *   - another state: `row` with that state; no row: `row` with
+ *     `UNAVAILABLE_RETRY_ROW_ABSENT`.
+ * A persona that is not applied (`persona` undefined, or another key's)
+ * reads nothing and answers `kept`; the retry action stops for it on its
+ * own check. Never throws.
+ */
+export async function retryPendingRowStep(key: string, persona: Persona | undefined): Promise<UnavailableRetryPendingStep> {
+  if (persona === undefined || persona.key !== key) return { kind: UNAVAILABLE_RETRY_PENDING_STEP_KEPT }
+  const answer = await readAndStepPendingRow(persona)
+  switch (answer.kind) {
+    case PENDING_ROW_COVERED:
+    case PENDING_ROW_UNDECIDED:
+    case PENDING_ROW_STEP_REFUSED:
+      return { kind: UNAVAILABLE_RETRY_PENDING_STEP_KEPT }
+    case PENDING_ROW_NOT_COVERED:
+      return answer.startAnswer === LIVE_ROW_START_STARTED || answer.startAnswer === LIVE_ROW_START_ALREADY_RUNNING
+        ? { kind: UNAVAILABLE_RETRY_PENDING_STEP_SEQUENCE_STARTED }
+        : { kind: UNAVAILABLE_RETRY_PENDING_STEP_KEPT }
+    case PENDING_ROW_STEP_LATCHED:
+      return { kind: UNAVAILABLE_RETRY_PENDING_STEP_LATCHED }
+    case PENDING_ROW_STEP_NOT_PENDING:
+      return { kind: UNAVAILABLE_RETRY_PENDING_STEP_ROW, state: answer.state }
+    case PENDING_ROW_STEP_NO_ROW:
+      return { kind: UNAVAILABLE_RETRY_PENDING_STEP_ROW, state: UNAVAILABLE_RETRY_ROW_ABSENT }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -10481,7 +10838,8 @@ export const REPLACE_REREAD_PENDING_OUTCOME = "a launch in progress: no live-row
  *       - `ended`, `missing` or no row: the replace step with the re-read
  *         state, so its reuse spawn of the same id;
  *       - `pending`: the ladder's `pending` step (`ladderPendingRowStep`): a
- *         covered row is left (`no-op`); a row that is not covered (a
+ *         covered row is left (`no-op`, the persona's retry timer armed in
+ *         pending-only mode); a row that is not covered (a
  *         `config_dir` mismatch, SRJ-411) gets SRJ-411's sequence there;
  *       - any other live state, or a state CSCB does not know: the lost
  *         race (`lostRaceAtLadder`): nothing killed, deleted or launched,
@@ -10872,7 +11230,53 @@ async function runRegisteredApprover(
     runningApprovers.delete(key)
     lastApproverOutcomes.set(key, outcome)
   }
+  // b.jg5 SRJ-409, SRJ-404: the row an approver leaves `pending` when it stops is watched.
+  armAfterApproverStop(key, entry.ref, reason, entry.run.lastStateRead)
   return outcome
+}
+
+/**
+ * The approver stops after which the row it leaves `pending` arms the
+ * persona's retry timer in pending-only mode (b.jg5 SRJ-409, SRJ-404): B or
+ * the test cap, GONE, not interactive, tmux unavailable, the one-approver
+ * rule (`superseded`), and a loop that threw (`failed`, so a `pending` row
+ * is never left unwatched). Never after shutdown, a latch, the key's
+ * retired-key recording or a teardown; `live`, `finished`, `absent` and
+ * `no-launch-start` leave no covered `pending` row.
+ */
+const APPROVER_STOPS_THAT_ARM: ReadonlySet<ApproverStopReason> = new Set<ApproverStopReason>([
+  APPROVER_STOP_BOUND,
+  APPROVER_STOP_CAP,
+  APPROVER_STOP_GONE,
+  APPROVER_STOP_NOT_INTERACTIVE,
+  APPROVER_STOP_TMUX_UNAVAILABLE,
+  APPROVER_STOP_SUPERSEDED,
+  APPROVER_STOP_FAILED,
+])
+
+/** Whether an approver stopped with `reason` arms the persona's retry timer for the row it leaves `pending` (`APPROVER_STOPS_THAT_ARM`). Pure. */
+export function approverStopArmsPendingRow(reason: ApproverStopReason): boolean {
+  return APPROVER_STOPS_THAT_ARM.has(reason)
+}
+
+/**
+ * At the stop of persona `key`'s registered approver (after it has left the
+ * registry), with `reason` and `lastState`, the state its latest `status`
+ * read gave (b.jg5 SRJ-409, SRJ-404): for a stop that arms
+ * (`approverStopArmsPendingRow`) whose last read was `pending`, or that read
+ * no row, the persona's retry timer is armed in pending-only mode
+ * (`armPendingRowWatch`: never for a latched persona), outside every
+ * attempt; the controller's armed line is its line. Nothing for any other
+ * stop. Never throws.
+ */
+function armAfterApproverStop(key: string, ref: string, reason: ApproverStopReason, lastState: string | undefined): void {
+  try {
+    if (!approverStopArmsPendingRow(reason)) return
+    if (lastState !== undefined && lastState !== AGENT_DIRECTOR_PENDING_STATE) return
+    armPendingRowWatch(key, ref)
+  } catch {
+    /* an arm never changes how the approver ended */
+  }
 }
 
 /**
@@ -11007,9 +11411,18 @@ function renderPreTrustValue(value: unknown): string {
  * (`reuseSpawnForPersona`), including the reuse spawn of the same id after
  * `resume`'s no-transcript answer (b.jg5 SRJ-707, SRJ-712). `verb` names the launch and `launched` is the
  * call's whole result. The step writes the launch's one
- * `pre_trust` line (`preTrustLogLine`, b.jg5 SRJ-413), then starts the
- * persona's dialog approver (`startDialogApprover`) without awaiting it, so
- * the ladder's result is returned as soon as the launch call returned.
+ * `pre_trust` line (`preTrustLogLine`, b.jg5 SRJ-413), then arms the
+ * persona's retry timer in pending-only mode with the `pending-row` cause
+ * (`armPendingRowWatch`; b.jg5 SRJ-301, SRJ-409: the row a launch that
+ * returned leaves reads `pending` until its session reports in, and is the
+ * persona's own current life, built from its own spawn parameters; a
+ * latched persona is not armed), then starts the persona's dialog approver
+ * (`startDialogApprover`) without awaiting it, so the ladder's result is
+ * returned as soon as the launch call returned. Every success site calls
+ * it, so the arm covers each of them: the live-row sequence's final launch,
+ * a `fresh-retired` reuse, and the launch the pending-only retry's hand-off
+ * run makes. A full-mode retry whose launch succeeds still switches to
+ * pending-only mode (`armPendingOnly` is no full-mode cause).
  * The client returns the parsed reply as is, so a `null` or missing result
  * is read as one with no `pre_trust` field. Nothing here or after it reads
  * the `pre_trust` value. Never throws.
@@ -11022,6 +11435,7 @@ function afterLaunchSucceeded(
   launched: Phase1SpawnResult | Phase1ResumeResult,
 ): void {
   console.error(preTrustLogLine(ref, verb, launched?.pre_trust))
+  armPendingRowWatch(key, ref)
   try {
     startDialogApprover(key, isStartup, ref)
   } catch (err) {
@@ -11212,9 +11626,10 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *      (otherwise no-op); CONFLICT or UNUSABLE NAME (the reader latched the
  *      persona) → `latched`.
  *    - pending → the ladder's `pending` step (`ladderPendingRowStep`):
- *      no-op when its `cwd` and `config_dir` label match; a label missing
- *      or different (b.jg5 SRJ-411, SRJ-707) means the row is not covered,
- *      and the replace step sends it through the live-row sequence.
+ *      no-op when its `cwd` and `config_dir` label match, the persona's
+ *      retry timer armed in pending-only mode (b.jg5 SRJ-409); a label
+ *      missing or different (b.jg5 SRJ-411, SRJ-707) means the row is not
+ *      covered, and the replace step sends it through the live-row sequence.
  *    Every resume first checks the row's `config_dir` label; a missing or
  *    different label means the replacement instead (resumeOrFreshSpawn;
  *    b.av2 SR-6.2 as amended, b.jg5 SRJ-1504). A replacement there whose
@@ -11249,7 +11664,9 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *    the held and latched gates, the claude_config_dir deferral and dry run
  *    are no attempt.
  * 8. Every spawn or resume above that returns success is followed by one
- *    after-launch step (`afterLaunchSucceeded`), which starts the persona's
+ *    after-launch step (`afterLaunchSucceeded`), which arms the persona's
+ *    retry timer in pending-only mode for the launch's `pending` row (b.jg5
+ *    SRJ-301, SRJ-409; never for a latched persona) and starts the persona's
  *    dialog approver in its own registry (`startDialogApprover`, b.jg5
  *    SRJ-401) without awaiting it: the result is returned as soon as the
  *    launch call returns, and the launch is no longer in flight
@@ -11783,7 +12200,8 @@ async function ladderGetThenAct(run: LadderRun): Promise<SpawnPersonaResult> {
     // b.jg5 SRJ-513: a configured persona's own `pending` row with no launch
     // start never reaches here: the collision `get` latched it first.
     // b.jg5 SRJ-409, SRJ-411: the ladder's `pending` step: a row that is not
-    // covered goes through the live-row sequence; a covered row is left.
+    // covered goes through the live-row sequence; a covered row is left,
+    // its retry timer armed in pending-only mode.
     return ladderPendingRowStep(run, row, lastRead)
   }
 

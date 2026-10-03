@@ -36,6 +36,22 @@
  * (SRJ-705, which the old-life wait runs too) use them, and SRJ-410's
  * pending-row rule uses them.
  *
+ * Whether a `pending` row is covered (b.jg5 SRJ-409, SRJ-411, SRJ-408):
+ * {@link decidePendingRowCover} answers, from what its caller read and
+ * compared, whether the row is the persona's current life. A configured
+ * persona's own row with no launch start answers
+ * {@link PENDING_ROW_NO_LAUNCH_START} whatever else is true (it latches,
+ * SRJ-513, and is never exempted); a row whose directory could not be
+ * resolved answers {@link PENDING_ROW_UNDECIDED} (at a site that read the
+ * row with `status` only, before any mismatch is checked); a retired key's old life
+ * before its new life has begun, or a row whose `cwd` or `config_dir` label
+ * does not match the persona, answers {@link PENDING_ROW_NOT_COVERED} with
+ * its reason; any other row answers {@link PENDING_ROW_COVERED}. The session
+ * manager's pending-row step acts on the answer: a covered or undecided row
+ * arms the persona's retry timer in pending-only mode and is never killed,
+ * reused or launched over; a row that is not covered goes through the
+ * live-row sequence.
+ *
  * Pure: no module-scope state, no I/O, no agent-director call, no log line,
  * nothing run at import; the clock is always passed in. Nothing names an
  * export only the Phase 1 client has; the result field is typed through
@@ -204,4 +220,138 @@ export function armPendingRowWait(
   if (launchStartMs === undefined) return PENDING_ROW_WAIT_NOT_ARMED
   const cancel = armNeverEarlyWait(clock, launchStartMs, waitMs, callback)
   return { launchStartMs, cancel }
+}
+
+// ---------------------------------------------------------------------------
+// Whether a `pending` row is covered (b.jg5 SRJ-409, SRJ-411, SRJ-408)
+// ---------------------------------------------------------------------------
+
+/** {@link decidePendingRowCover}: a configured persona's own `pending` row with no launch start. It latches (SRJ-513); never covered, never exempted. */
+export const PENDING_ROW_NO_LAUNCH_START = 'no-launch-start'
+/** {@link decidePendingRowCover}: the row is the persona's current life, a launch in progress (SRJ-409). */
+export const PENDING_ROW_COVERED = 'covered'
+/** {@link decidePendingRowCover}: the row is not the persona's current life (SRJ-411); its reason says why. */
+export const PENDING_ROW_NOT_COVERED = 'not-covered'
+/** {@link decidePendingRowCover}: a directory the decision needs could not be resolved, so there is no verdict yet (b.av2 SR-6.4, b.g57). */
+export const PENDING_ROW_UNDECIDED = 'undecided'
+
+/** Not covered: a retired key's old life, read before its new life has begun (SRJ-411, SRJ-805). */
+export const PENDING_ROW_REASON_RETIRED_OLD_LIFE = 'retired-key-old-life'
+/** Not covered: the row's `cwd` is not the persona's working directory by real path (SRJ-411, SRJ-1503). */
+export const PENDING_ROW_REASON_CWD_MISMATCH = 'cwd-mismatch'
+/** Not covered: the row's `config_dir` label is missing or differs from the persona's (SRJ-411, SRJ-1504). */
+export const PENDING_ROW_REASON_CONFIG_DIR_MISMATCH = 'config-dir-mismatch'
+/**
+ * Undecided: the `cwd` condition cannot be evaluated now (b.av2 SR-6.4): the
+ * working directory has no real path, and the row's `cwd` has none either or
+ * equals it lexically; at a status-only site, the working directory has no
+ * real path, whatever the row's `cwd` (SRJ-411).
+ */
+export const PENDING_ROW_REASON_CWD_UNRESOLVED = 'cwd-unresolved'
+/**
+ * Undecided: the persona's `claude_config_dir` has no real path now (b.g57);
+ * at a status-only site, whatever the row's `cwd` (SRJ-409).
+ */
+export const PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED = 'config-dir-unresolved'
+
+/** Why a `pending` row is not covered. */
+export type PendingRowNotCoveredReason =
+  | typeof PENDING_ROW_REASON_RETIRED_OLD_LIFE
+  | typeof PENDING_ROW_REASON_CWD_MISMATCH
+  | typeof PENDING_ROW_REASON_CONFIG_DIR_MISMATCH
+
+/** Why a `pending` row's cover is undecided. */
+export type PendingRowUndecidedReason = typeof PENDING_ROW_REASON_CWD_UNRESOLVED | typeof PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED
+
+/** What {@link decidePendingRowCover} answers. */
+export type PendingRowCover =
+  | { readonly answer: typeof PENDING_ROW_NO_LAUNCH_START }
+  | { readonly answer: typeof PENDING_ROW_COVERED }
+  | { readonly answer: typeof PENDING_ROW_NOT_COVERED; readonly reason: PendingRowNotCoveredReason }
+  | { readonly answer: typeof PENDING_ROW_UNDECIDED; readonly reason: PendingRowUndecidedReason }
+
+/**
+ * How the row compares with the persona, as the session manager's one row
+ * comparison answers it (`compareRowToPersona`, `src/session-manager.ts`),
+ * passed in so this module stays pure.
+ */
+export interface PendingRowComparison {
+  /** The row's `cwd` and the persona's working directory have the same real path. */
+  readonly cwdMatches: boolean
+  /** The `cwd` condition cannot be evaluated now (b.av2 SR-6.4). */
+  readonly cwdCheckDeferred: boolean
+  /** The persona's `claude_config_dir` resolved to a real path (b.g57). */
+  readonly configDirResolved: boolean
+  /** The row carries the persona's `config_dir` label; no verdict while the directory is unresolved. */
+  readonly configDirMatches: boolean | undefined
+}
+
+/** What {@link decidePendingRowCover} decides on. */
+export interface PendingRowCoverInput {
+  /** The row as read: its state (`pending`) and its raw launch start. */
+  readonly row: PendingRowFields
+  /** Whether the row is a configured persona's own (`cscb_<key>` of a persona of the applied configuration). */
+  readonly ownConfigured: boolean
+  /**
+   * The retired-key store's reading of the key (SRJ-805, SRJ-806): recorded,
+   * and whether its "new life has begun" mark is set, a mark held only in
+   * memory after a failed write counted as set.
+   */
+  readonly retired: { readonly recorded: boolean; readonly marked: boolean }
+  /** The row's comparison with the persona. */
+  readonly comparison: PendingRowComparison
+  /**
+   * The row was read at a site that reads it with `status` only and then one
+   * `get` for this decision (the restart path's deferral and its re-probe, a
+   * pending-only retry; SRJ-409, SRJ-411). There, a directory that cannot be
+   * resolved leaves the row undecided before any mismatch is checked. Absent
+   * or false (the collision ladder): the mismatch of a `cwd` that resolves
+   * elsewhere is checked first.
+   */
+  readonly statusOnlySite?: boolean
+}
+
+/**
+ * Whether a `pending` row is the persona's current life (b.jg5 SRJ-409,
+ * SRJ-411, SRJ-408, SRJ-513), decided in this order:
+ *   1. a configured persona's own row with no launch start
+ *      ({@link isPendingWithNoLaunchStart}): {@link PENDING_ROW_NO_LAUNCH_START},
+ *      whatever else is true, so it is never exempted from its latch;
+ *   2. a `cwd` that resolves elsewhere: not covered,
+ *      {@link PENDING_ROW_REASON_CWD_MISMATCH};
+ *   3. a `cwd` that cannot be compared now: undecided,
+ *      {@link PENDING_ROW_REASON_CWD_UNRESOLVED};
+ *   4. a `claude_config_dir` that cannot be resolved: undecided,
+ *      {@link PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED};
+ *   5. a key recorded as retired with no mark: not covered,
+ *      {@link PENDING_ROW_REASON_RETIRED_OLD_LIFE};
+ *   6. a `config_dir` label missing or different: not covered,
+ *      {@link PENDING_ROW_REASON_CONFIG_DIR_MISMATCH};
+ *   7. otherwise {@link PENDING_ROW_COVERED}.
+ * An unresolved directory is decided before the retired-key and label checks,
+ * as the collision ladder decides it before them. At a status-only site
+ * (`statusOnlySite` true, SRJ-409), steps 3 and 4 come before step 2: a
+ * working directory or `claude_config_dir` that cannot be resolved leaves
+ * the row undecided before any mismatch is checked, so the order there is
+ * 1, 3, 4, 2, 5, 6, 7. Pure: no I/O, clock or module state; calls nothing
+ * outside this module. Never throws.
+ */
+export function decidePendingRowCover(input: PendingRowCoverInput): PendingRowCover {
+  const { row, ownConfigured, retired, comparison } = input
+  if (ownConfigured && isPendingWithNoLaunchStart(row)) return { answer: PENDING_ROW_NO_LAUNCH_START }
+  const cwdUnresolved = !comparison.cwdMatches && comparison.cwdCheckDeferred
+  if (input.statusOnlySite === true) {
+    if (cwdUnresolved) return { answer: PENDING_ROW_UNDECIDED, reason: PENDING_ROW_REASON_CWD_UNRESOLVED }
+    if (!comparison.configDirResolved) return { answer: PENDING_ROW_UNDECIDED, reason: PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED }
+  }
+  if (!comparison.cwdMatches && !comparison.cwdCheckDeferred) {
+    return { answer: PENDING_ROW_NOT_COVERED, reason: PENDING_ROW_REASON_CWD_MISMATCH }
+  }
+  if (cwdUnresolved) return { answer: PENDING_ROW_UNDECIDED, reason: PENDING_ROW_REASON_CWD_UNRESOLVED }
+  if (!comparison.configDirResolved) return { answer: PENDING_ROW_UNDECIDED, reason: PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED }
+  if (retired.recorded && !retired.marked) return { answer: PENDING_ROW_NOT_COVERED, reason: PENDING_ROW_REASON_RETIRED_OLD_LIFE }
+  if (comparison.configDirMatches !== true) {
+    return { answer: PENDING_ROW_NOT_COVERED, reason: PENDING_ROW_REASON_CONFIG_DIR_MISMATCH }
+  }
+  return { answer: PENDING_ROW_COVERED }
 }

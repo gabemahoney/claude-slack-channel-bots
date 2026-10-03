@@ -43,6 +43,33 @@
  * gets E16's "launch start not recorded" decision (`decideOwnRowRead`) and
  * is never aged or armed. The old-key leg is `tests/old-life-wait.test.ts`'s.
  *
+ * Whether a `pending` row is covered (b.jg5 SRJ-409, SRJ-411, SRJ-408,
+ * SRJ-513; AC 30, AC 33, AC 35): a table over `decidePendingRowCover`, its
+ * answers and reasons the exported ones: P's own current life is covered; a
+ * retired key's row before its mark is not (its old life), after its mark it
+ * is; a `cwd` or `config_dir` mismatch is not; an unresolved directory is
+ * undecided; a configured persona's own row with no launch start answers "no
+ * launch start" in every shape, never covered; the order of the checks, the
+ * same at every site except that a status-only site decides an unresolved
+ * directory before a `cwd` that resolves elsewhere (the ladder, the other
+ * way round). Then
+ * the session manager's read-and-step entry (`readAndStepPendingRow`) on
+ * `makeRecoveryHarness` (`session_restart_delay` and `health_check_interval`
+ * 0), after one `get`: a covered row (the key not recorded, recorded and
+ * marked, or its mark held in memory after a failed write) and an undecided
+ * one (its `claude_config_dir` unresolvable, or its working directory with no
+ * real path whatever the row's `cwd`: one with no real path, P's configured
+ * path lexically, or an existing directory elsewhere; the comparison these
+ * status-only sites read is `pendingRowComparisonFor`'s, a pure table) arm P's
+ * retry timer in pending-only mode with the controller's own armed line, with
+ * no kill, launch, approver or sequence; a row that is not covered logs its
+ * line and makes exactly one start request (step 1, the conversation not
+ * kept, context `recovery`, the retired-key flag for an old life), with no
+ * arm and no approver; P's own row with no launch start latches P and arms
+ * nothing. Where the step is called from (the deferral, the pending-only
+ * retry, the ladder) is tests/server.test.ts's,
+ * tests/unavailable-retry.test.ts's and tests/session-manager.test.ts's.
+ *
  * E29 (the pending-row rule) extends this file.
  *
  * SPDX-License-Identifier: MIT
@@ -64,13 +91,43 @@ import {
 } from '../src/ad-settings.ts'
 import {
   armPendingRowWait,
+  decidePendingRowCover,
   isPendingRowAged,
   isPendingWithNoLaunchStart,
   parseLaunchStart,
+  PENDING_ROW_COVERED,
+  PENDING_ROW_NO_LAUNCH_START,
+  PENDING_ROW_NOT_COVERED,
+  PENDING_ROW_REASON_CONFIG_DIR_MISMATCH,
+  PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED,
+  PENDING_ROW_REASON_CWD_MISMATCH,
+  PENDING_ROW_REASON_CWD_UNRESOLVED,
+  PENDING_ROW_REASON_RETIRED_OLD_LIFE,
+  PENDING_ROW_UNDECIDED,
   PENDING_ROW_WAIT_NOT_ARMED,
+  type PendingRowComparison,
+  type PendingRowCover,
+  type PendingRowCoverInput,
   type PendingRowFields,
+  type PendingRowNotCoveredReason,
+  type PendingRowUndecidedReason,
   type PendingRowWaitArmed,
 } from '../src/pending-row.ts'
+import { AGENT_DIRECTOR_PENDING_STATE } from '../src/liveness-reading.ts'
+import { KILL_FAILURE_CONTEXT_RECOVERY } from '../src/kill-failure-alert.ts'
+import { LIVE_ROW_SEQUENCE_ENTRY_KILL, LIVE_ROW_START_STARTED, type LiveRowSequenceRequest } from '../src/live-row-sequence.ts'
+import { CONFIG_DIR_LABEL_PREFIX, personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
+import {
+  _resetConfigDirFs,
+  _setConfigDirFs,
+  PENDING_ROW_STEP_LATCHED,
+  pendingRowComparisonFor,
+  readAndStepPendingRow,
+  type RowPersonaComparison,
+  uncoveredPendingRowLine,
+  undecidedPendingRowLine,
+} from '../src/session-manager.ts'
+import { UNAVAILABLE_RETRY_CAUSE_PENDING_ROW } from '../src/unavailable-retry.ts'
 import { MAX_TIMER_DELAY_MS } from '../src/persona-retry-schedule.ts'
 import { decideOwnRowRead, ROW_READ_LAUNCH_START_NOT_RECORDED } from '../src/row-read-rules.ts'
 import {
@@ -81,11 +138,20 @@ import {
   SAMPLE_LAUNCH_START_WHOLE,
   SAMPLE_LAUNCH_STARTS,
   type CannedRowPersona,
+  type PersonaGetResultOverrides,
 } from './test-helpers/agent-director-stub.ts'
 import { writeAgentDirectorConfig, type AdConfigTables } from './test-helpers/ad-settings.ts'
 import { LAUNCH_START_CASE_ROWS } from './test-helpers/conflict-cases.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import {
+  expectPendingOnlyWatch,
+  makeRecoveryHarness,
+  personaOf,
+  personaRow,
+  recordSequenceStarts,
+  type RecoveryHarness,
+} from './test-helpers/recovery-harness.ts'
 
 const MINUTE_MS = 60_000
 
@@ -607,5 +673,329 @@ describe('a configured persona\'s own pending row with no launch start latches t
     expect(clock.pendingCount()).toBe(0)
     await clock.advance(2 * adGraceMsInEffect())
     expect(fired).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Whether a `pending` row is covered (b.jg5 SRJ-409, SRJ-411, SRJ-408, SRJ-513)
+// ---------------------------------------------------------------------------
+
+/** A row comparison that matches P: `cwd` and `config_dir` label both P's, both directories resolved. */
+const MATCHING: PendingRowComparison = { cwdMatches: true, cwdCheckDeferred: false, configDirResolved: true, configDirMatches: true }
+/** The comparison of a row whose `cwd` resolves elsewhere. */
+const CWD_ELSEWHERE: Partial<PendingRowComparison> = { cwdMatches: false }
+/** The comparison when neither P's working directory nor the row's `cwd` resolves now (b.av2 SR-6.4). */
+const CWD_UNRESOLVED: Partial<PendingRowComparison> = { cwdMatches: false, cwdCheckDeferred: true }
+/** The comparison when P's `claude_config_dir` does not resolve (b.g57): no label verdict. */
+const CONFIG_DIR_UNRESOLVED: Partial<PendingRowComparison> = { configDirResolved: false, configDirMatches: undefined }
+/** The comparison of a row whose `config_dir` label is missing or differs. */
+const CONFIG_DIR_ELSEWHERE: Partial<PendingRowComparison> = { configDirMatches: false }
+
+/** The retired-key store's readings of a key. */
+const NOT_RECORDED = { recorded: false, marked: false } as const
+const RECORDED_UNMARKED = { recorded: true, marked: false } as const
+const RECORDED_MARKED = { recorded: true, marked: true } as const
+
+/**
+ * The cover input for a `pending` `get` row with `launch` (the stub's
+ * default sample unless given; `undefined` leaves it out), a configured
+ * persona's own unless `ownConfigured` is false, the key not recorded and the
+ * row matching P unless `retired` or `comparison` says otherwise; the site
+ * flag `statusOnlySite` is left out unless given.
+ */
+function coverInput(
+  options: {
+    launch?: string | null | undefined
+    ownConfigured?: boolean
+    retired?: PendingRowCoverInput['retired']
+    comparison?: Partial<PendingRowComparison>
+    statusOnlySite?: boolean
+  } = {},
+): PendingRowCoverInput {
+  const launch = 'launch' in options ? options.launch : SAMPLE_LAUNCH_START_WHOLE
+  const [, getRow] = ROW_FORMS.find(([form]) => form === 'get row')!
+  return {
+    row: getRow({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: launch }),
+    ownConfigured: options.ownConfigured ?? true,
+    retired: options.retired ?? NOT_RECORDED,
+    comparison: { ...MATCHING, ...options.comparison },
+    ...(options.statusOnlySite === undefined ? {} : { statusOnlySite: options.statusOnlySite }),
+  }
+}
+
+const COVERED: PendingRowCover = { answer: PENDING_ROW_COVERED }
+const NO_LAUNCH_START: PendingRowCover = { answer: PENDING_ROW_NO_LAUNCH_START }
+const notCovered = (reason: PendingRowNotCoveredReason): PendingRowCover => ({ answer: PENDING_ROW_NOT_COVERED, reason })
+const undecided = (reason: PendingRowUndecidedReason): PendingRowCover => ({ answer: PENDING_ROW_UNDECIDED, reason })
+
+/** `coverInput`'s options, without the site flag the tables set themselves. */
+type CoverOptions = Omit<NonNullable<Parameters<typeof coverInput>[0]>, 'statusOnlySite'>
+
+/** The site flag as each kind of site passes it: the collision ladder (absent or false) and a status-only site (true). */
+const SITES: ReadonlyArray<readonly [string, boolean | undefined]> = [
+  ['the ladder (no site flag)', undefined],
+  ['the ladder (site flag false)', false],
+  ['a status-only site', true],
+]
+
+describe('decidePendingRowCover: whether a pending row is P\'s current life (SRJ-409, SRJ-411), never for an own row with no launch start (SRJ-408, SRJ-513)', () => {
+  // None of these inputs pairs a cwd that resolves elsewhere with a directory
+  // that does not resolve, so every site answers the same (the site's order
+  // is the table below).
+  const COVER_CASES: ReadonlyArray<readonly [string, CoverOptions, PendingRowCover]> = [
+    ['P\'s own current life, cwd and config_dir matching (whole launch start)', {}, COVERED],
+    ['P\'s own current life, its launch start with fractional seconds', { launch: SAMPLE_LAUNCH_START_FRACTIONAL }, COVERED],
+    ['a recorded key with no mark: its old life', { retired: RECORDED_UNMARKED }, notCovered(PENDING_ROW_REASON_RETIRED_OLD_LIFE)],
+    ['a recorded key after its mark (written, or held in memory after a failed write)', { retired: RECORDED_MARKED }, COVERED],
+    ['a cwd that resolves elsewhere', { comparison: CWD_ELSEWHERE }, notCovered(PENDING_ROW_REASON_CWD_MISMATCH)],
+    ['a config_dir label missing or different', { comparison: CONFIG_DIR_ELSEWHERE }, notCovered(PENDING_ROW_REASON_CONFIG_DIR_MISMATCH)],
+    ['a working directory and row cwd that do not resolve now', { comparison: CWD_UNRESOLVED }, undecided(PENDING_ROW_REASON_CWD_UNRESOLVED)],
+    ['a claude_config_dir that does not resolve now', { comparison: CONFIG_DIR_UNRESOLVED }, undecided(PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED)],
+    // The order: the directories first, then the retired key, then the label.
+    ['a cwd elsewhere on a recorded key with no mark: the cwd decides', { retired: RECORDED_UNMARKED, comparison: CWD_ELSEWHERE }, notCovered(PENDING_ROW_REASON_CWD_MISMATCH)],
+    ['an unresolved cwd on a recorded key with no mark: undecided', { retired: RECORDED_UNMARKED, comparison: CWD_UNRESOLVED }, undecided(PENDING_ROW_REASON_CWD_UNRESOLVED)],
+    ['an unresolved claude_config_dir on a recorded key with no mark: undecided', { retired: RECORDED_UNMARKED, comparison: CONFIG_DIR_UNRESOLVED }, undecided(PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED)],
+    ['a config_dir label elsewhere on a recorded key with no mark: the old life decides', { retired: RECORDED_UNMARKED, comparison: CONFIG_DIR_ELSEWHERE }, notCovered(PENDING_ROW_REASON_RETIRED_OLD_LIFE)],
+    ['a config_dir label elsewhere on a marked key', { retired: RECORDED_MARKED, comparison: CONFIG_DIR_ELSEWHERE }, notCovered(PENDING_ROW_REASON_CONFIG_DIR_MISMATCH)],
+    ['a cwd and a config_dir label both elsewhere: the cwd decides', { comparison: { ...CWD_ELSEWHERE, ...CONFIG_DIR_ELSEWHERE } }, notCovered(PENDING_ROW_REASON_CWD_MISMATCH)],
+    // Not a configured persona's own row: it latches nothing, so its fields decide.
+    ['a row with no launch start that is no configured persona\'s own, matching', { launch: SAMPLE_LAUNCH_STARTS.none, ownConfigured: false }, COVERED],
+  ]
+  test.each(COVER_CASES.flatMap(([label, options, expected]) => SITES.map(([site, flag]) => [label, site, options, flag, expected] as const)))(
+    '%s, at %s',
+    (_label, _site, options, statusOnlySite, expected) => {
+      expect(decidePendingRowCover(coverInput({ ...options, statusOnlySite }))).toEqual(expected)
+    },
+  )
+
+  // SRJ-409 (ruling R8): at a status-only site a directory that cannot be
+  // resolved leaves the row undecided before any mismatch is checked; the
+  // ladder keeps its order, a cwd that resolves elsewhere first.
+  const CONFIG_DIR_UNDECIDED = undecided(PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED)
+  test.each<[string, CoverOptions, PendingRowCover, PendingRowCover]>([
+    // [label, options, the ladder's answer, a status-only site's answer]
+    ['a cwd elsewhere, P\'s claude_config_dir unresolvable', { comparison: { ...CWD_ELSEWHERE, ...CONFIG_DIR_UNRESOLVED } }, notCovered(PENDING_ROW_REASON_CWD_MISMATCH), CONFIG_DIR_UNDECIDED],
+    [
+      'a cwd elsewhere, P\'s claude_config_dir unresolvable, on a recorded key with no mark',
+      { retired: RECORDED_UNMARKED, comparison: { ...CWD_ELSEWHERE, ...CONFIG_DIR_UNRESOLVED } },
+      notCovered(PENDING_ROW_REASON_CWD_MISMATCH),
+      CONFIG_DIR_UNDECIDED,
+    ],
+    // Both directories unresolved: the cwd is decided first at every site.
+    ['an unresolved cwd and claude_config_dir', { comparison: { ...CWD_UNRESOLVED, ...CONFIG_DIR_UNRESOLVED } }, undecided(PENDING_ROW_REASON_CWD_UNRESOLVED), undecided(PENDING_ROW_REASON_CWD_UNRESOLVED)],
+    // The own row with no launch start still answers first.
+    ['P\'s own row with no launch start, a cwd elsewhere, P\'s claude_config_dir unresolvable', { launch: SAMPLE_LAUNCH_STARTS.none, comparison: { ...CWD_ELSEWHERE, ...CONFIG_DIR_UNRESOLVED } }, NO_LAUNCH_START, NO_LAUNCH_START],
+  ])('the site\'s order: %s → the ladder\'s answer at the ladder, the status-only answer at a status-only site', (_label, options, ladder, statusOnly) => {
+    expect(decidePendingRowCover(coverInput(options))).toEqual(ladder)
+    expect(decidePendingRowCover(coverInput({ ...options, statusOnlySite: false }))).toEqual(ladder)
+    expect(decidePendingRowCover(coverInput({ ...options, statusOnlySite: true }))).toEqual(statusOnly)
+  })
+
+  // SRJ-408, SRJ-513 (the E16 hatch note): every shape, covered or not, answers "no launch start".
+  const NO_LAUNCH_START_SHAPES: ReadonlyArray<readonly [string, Parameters<typeof coverInput>[0]]> = [
+    ['P\'s current life (the covered shape)', {}],
+    ['a recorded key after its mark', { retired: RECORDED_MARKED }],
+    ['a recorded key with no mark', { retired: RECORDED_UNMARKED }],
+    ['a cwd elsewhere', { comparison: CWD_ELSEWHERE }],
+    ['a config_dir label elsewhere', { comparison: CONFIG_DIR_ELSEWHERE }],
+    ['an unresolved cwd', { comparison: CWD_UNRESOLVED }],
+    ['an unresolved claude_config_dir', { comparison: CONFIG_DIR_UNRESOLVED }],
+  ]
+  test.each(NO_LAUNCH_START_SHAPES.flatMap(([shape, options]) => NO_LAUNCH_STARTS.map(([form, launch]) => [shape, form, options, launch] as const)))(
+    'a configured persona\'s own row with no launch start, %s, its launch start %s: no launch start, never covered',
+    (_shape, _form, options, launch) => {
+      expect(decidePendingRowCover(coverInput({ ...options, launch }))).toEqual(NO_LAUNCH_START)
+    },
+  )
+})
+
+// ---------------------------------------------------------------------------
+// The status-only sites' comparison (b.jg5 SRJ-411, hatch A3; b.av2 SR-6.4)
+// ---------------------------------------------------------------------------
+
+/** A row comparison as `compareRowToPersona` answers it: both directories resolved and the row matching P, unless `overrides` says otherwise. */
+function rowComparison(overrides: Partial<RowPersonaComparison> = {}): RowPersonaComparison {
+  return {
+    ...MATCHING,
+    workingDirectoryResolved: true,
+    configDirLabel: 'the label',
+    expectedConfigDirLabel: 'the label',
+    ...overrides,
+  }
+}
+
+describe('pendingRowComparisonFor: a working directory with no real path leaves the cwd condition unresolved at a status-only site, whatever the row\'s cwd', () => {
+  const UNRESOLVED_CWD = { cwdMatches: false, cwdCheckDeferred: true } as const
+
+  test.each<[string, RowPersonaComparison, RowPersonaComparison, PendingRowCover]>([
+    ['resolved, the row matching P: as is (covered)', rowComparison(), rowComparison(), COVERED],
+    ['resolved, the row\'s cwd elsewhere: as is (a cwd mismatch)', rowComparison({ cwdMatches: false }), rowComparison({ cwdMatches: false }), notCovered(PENDING_ROW_REASON_CWD_MISMATCH)],
+    ['not resolved, the row\'s cwd lexically P\'s path', rowComparison({ workingDirectoryResolved: false, cwdMatches: true, cwdCheckDeferred: true }), rowComparison({ workingDirectoryResolved: false, ...UNRESOLVED_CWD }), undecided(PENDING_ROW_REASON_CWD_UNRESOLVED)],
+    ['not resolved, the row\'s cwd an existing directory elsewhere', rowComparison({ workingDirectoryResolved: false, cwdMatches: false, cwdCheckDeferred: false }), rowComparison({ workingDirectoryResolved: false, ...UNRESOLVED_CWD }), undecided(PENDING_ROW_REASON_CWD_UNRESOLVED)],
+    ['not resolved, the row\'s cwd with no real path either', rowComparison({ workingDirectoryResolved: false, ...UNRESOLVED_CWD }), rowComparison({ workingDirectoryResolved: false, ...UNRESOLVED_CWD }), undecided(PENDING_ROW_REASON_CWD_UNRESOLVED)],
+  ])('%s', (_label, comparison, expected, cover) => {
+    const forSite = pendingRowComparisonFor(comparison)
+    expect(forSite).toEqual(expected)
+    expect(decidePendingRowCover({ ...coverInput(), comparison: forSite })).toEqual(cover)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The read-and-step entry (b.jg5 SRJ-409, SRJ-411, SRJ-513)
+// ---------------------------------------------------------------------------
+
+describe('readAndStepPendingRow: one get, then a covered or undecided row armed pending-only, an uncovered one sent to the live-row sequence (recovery harness; SRJ-409, SRJ-411)', () => {
+  let harness: RecoveryHarness | undefined
+
+  afterEach(() => {
+    const h = harness
+    harness = undefined
+    _resetConfigDirFs()
+    if (h === undefined) return
+    try {
+      assertNoLeak(h.captured())
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  /** A harness over P and Q, its restart delay and health-check interval 0, P's `get` reading P's own `pending` row with `row`. */
+  function pendingP(row: PersonaGetResultOverrides = {}): { h: RecoveryHarness; p: string; q: string } {
+    const h = (harness = makeRecoveryHarness())
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    const [p, q] = h.keys as [string, string]
+    h.script({ getResult: personaRow(h, p, { state: AGENT_DIRECTOR_PENDING_STATE, ...row }) })
+    return { h, p, q }
+  }
+
+  /** P's reference, as the step's lines name it. */
+  const refOf = (h: RecoveryHarness, key: string): string => renderPersonaRef(personaOf(h, key).name, key)
+
+  /** The retry controller's own armed lines for persona `key` in pending-only mode with the pending-row cause. */
+  const pendingOnlyArmedLines = (h: RecoveryHarness, key: string): string[] =>
+    h.lines.filter((line) => line.startsWith(`[slack] unavailable-retry: persona=${key} armed in pending-only mode (${UNAVAILABLE_RETRY_CAUSE_PENDING_ROW}) — `))
+
+  /** One `get` of P's row and nothing else for it: no kill, launch, keystroke or pane read; no approver; no sequence. */
+  function expectOneGetOnly(h: RecoveryHarness, key: string): void {
+    const id = personaInstanceId(key)
+    const { getCalls, killCalls, spawnCalls, resumeCalls, sendKeysCalls, readPaneCalls, statusCalls } = h.stub.calls
+    expect(getCalls).toEqual([{ claude_instance_id: id }])
+    expect([killCalls, spawnCalls, resumeCalls, sendKeysCalls, readPaneCalls, statusCalls]).toEqual([[], [], [], [], [], []])
+    expect([h.approverRunning(key), h.sequenceRunning(key)]).toEqual([false, false])
+  }
+
+  test.each<[string, (h: RecoveryHarness, key: string) => void]>([
+    ['the key not recorded', () => {}],
+    ['the key recorded and marked', (h, key) => h.retireKey(key, { mark: true })],
+    [
+      'the key recorded, its mark held in memory after its write failed',
+      (h, key) => {
+        h.retireKey(key)
+        h.failRetiredKeyWrites()
+        h.retiredKeys.mark(key)
+        expect(h.retiredKeyWrites.at(-1)?.ok).toBe(false)
+        expect(h.retiredEntry(key).marked).toBe(true)
+      },
+    ],
+  ])('P\'s own covered pending row, %s: covered and armed; the controller\'s armed line in pending-only mode with the pending-row cause; no kill, launch, approver or sequence', async (_label, arrange) => {
+    const { h, p, q } = pendingP()
+    arrange(h, p)
+
+    expect(await readAndStepPendingRow(personaOf(h, p))).toEqual({ kind: PENDING_ROW_COVERED, armed: true })
+
+    expectPendingOnlyWatch(h, p)
+    expect(pendingOnlyArmedLines(h, p)).toHaveLength(1)
+    expectOneGetOnly(h, p)
+    expect(h.controller.isArmed(q)).toBe(false)
+  })
+
+  /** P's working directory removed, its `get` reading P's `pending` row with `cwd` (P's configured path, lexically equal, when undefined). */
+  function workingDirectoryGone(h: RecoveryHarness, key: string, cwd?: string): void {
+    rmSync(personaOf(h, key).working_directory, { recursive: true, force: true })
+    h.script({ getResult: personaRow(h, key, { state: AGENT_DIRECTOR_PENDING_STATE, ...(cwd === undefined ? {} : { cwd }) }) })
+  }
+
+  // b.jg5 SRJ-411 (hatch A3), b.av2 SR-6.4: at the status-only sites a
+  // working directory with no real path leaves the row undecided whatever its
+  // `cwd` is: a lexically equal `cwd` is never taken as covered, and a `cwd`
+  // that resolves elsewhere is not sent to the sequence.
+  test.each<[string, PendingRowUndecidedReason, (h: RecoveryHarness, key: string) => void]>([
+    [
+      'its working directory gone, the row\'s cwd another directory that does not exist',
+      PENDING_ROW_REASON_CWD_UNRESOLVED,
+      (h, key) => workingDirectoryGone(h, key, join(h.home, 'gone-elsewhere')),
+    ],
+    ['its working directory gone, the row\'s cwd lexically its configured path', PENDING_ROW_REASON_CWD_UNRESOLVED, (h, key) => workingDirectoryGone(h, key)],
+    ['its working directory gone, the row\'s cwd another existing directory', PENDING_ROW_REASON_CWD_UNRESOLVED, (h, key) => workingDirectoryGone(h, key, h.home)],
+    [
+      'its claude_config_dir unresolvable',
+      PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED,
+      () => _setConfigDirFs({ realpath: () => { throw Object.assign(new Error('no such directory'), { code: 'ENOENT' }) } }),
+    ],
+  ])('P\'s pending row with %s: undecided and armed only, with its one line; no kill, launch, approver or sequence', async (_label, reason, arrange) => {
+    const { h, p } = pendingP()
+    arrange(h, p)
+    const starts = recordSequenceStarts()
+
+    expect(await readAndStepPendingRow(personaOf(h, p))).toEqual({ kind: PENDING_ROW_UNDECIDED, reason, armed: true })
+
+    expectPendingOnlyWatch(h, p)
+    expect(pendingOnlyArmedLines(h, p)).toHaveLength(1)
+    expect(h.errors.filter((line) => line === undecidedPendingRowLine(refOf(h, p), reason, true))).toHaveLength(1)
+    expect(starts).toEqual([])
+    expectOneGetOnly(h, p)
+  })
+
+  /** Row labels without the `config_dir` label: a label missing is a mismatch (SRJ-1504). */
+  const withoutConfigDir = (labels: Record<string, string> | undefined): Record<string, string> =>
+    Object.fromEntries(Object.entries(labels ?? {}).filter(([name]) => `${name}=` !== CONFIG_DIR_LABEL_PREFIX))
+
+  test.each<[string, PendingRowNotCoveredReason, (h: RecoveryHarness, key: string) => PersonaGetResultOverrides, boolean]>([
+    [
+      'the key recorded with no mark (its old life)',
+      PENDING_ROW_REASON_RETIRED_OLD_LIFE,
+      (h, key) => {
+        h.retireKey(key)
+        return {}
+      },
+      true,
+    ],
+    ['its cwd another existing directory', PENDING_ROW_REASON_CWD_MISMATCH, (h) => ({ cwd: h.home }), false],
+    ['its config_dir label missing', PENDING_ROW_REASON_CONFIG_DIR_MISMATCH, (h, key) => ({ labels: withoutConfigDir(personaRow(h, key).labels) }), false],
+  ])('P\'s pending row, %s: not covered; its one line and exactly one sequence start (step 1, the conversation not kept, context recovery); no pending-only arm, no approver, no kill or launch of its own', async (_label, reason, mismatch, retiredKey) => {
+    const { h, p } = pendingP()
+    h.script({ getResult: personaRow(h, p, { state: AGENT_DIRECTOR_PENDING_STATE, ...mismatch(h, p) }) })
+    const starts = recordSequenceStarts()
+
+    expect(await readAndStepPendingRow(personaOf(h, p))).toEqual({ kind: PENDING_ROW_NOT_COVERED, reason, startAnswer: LIVE_ROW_START_STARTED })
+
+    expect(starts).toHaveLength(1)
+    expect(starts[0]).toMatchObject({
+      key: p,
+      instanceId: personaInstanceId(p),
+      lastReadState: AGENT_DIRECTOR_PENDING_STATE,
+      entryStep: LIVE_ROW_SEQUENCE_ENTRY_KILL,
+      keepsConversation: false,
+      retiredKey,
+      launches: true,
+      alertContext: KILL_FAILURE_CONTEXT_RECOVERY,
+    } satisfies Partial<LiveRowSequenceRequest>)
+    expect(h.errors.filter((line) => line === uncoveredPendingRowLine(refOf(h, p), reason))).toHaveLength(1)
+    expect([h.triggers, h.controller.isArmed(p), pendingOnlyArmedLines(h, p)]).toEqual([[], false, []])
+    expectOneGetOnly(h, p)
+  })
+
+  /** The launch starts a harness row can carry that are none: absent, empty, and unparseable. */
+  const ROW_NO_LAUNCH_STARTS = NO_LAUNCH_STARTS.filter((entry): entry is [string, string | undefined] => entry[1] !== null)
+
+  test.each(ROW_NO_LAUNCH_STARTS)('P\'s own pending row with no launch start (%s), covered in every other way: P latches; nothing armed, no sequence', async (_form, launch) => {
+    const { h, p } = pendingP({ launch_started_at: launch })
+    const starts = recordSequenceStarts()
+
+    expect(await readAndStepPendingRow(personaOf(h, p))).toEqual({ kind: PENDING_ROW_STEP_LATCHED })
+
+    expect(h.latch.isLatched(p)).toBe(true)
+    expect([starts, h.triggers, h.controller.isArmed(p), pendingOnlyArmedLines(h, p)]).toEqual([[], [], false, []])
+    expectOneGetOnly(h, p)
   })
 })

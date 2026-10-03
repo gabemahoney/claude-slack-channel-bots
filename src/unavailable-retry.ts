@@ -63,10 +63,12 @@
  *   becomes the last row read only when the answer carries no row, or when
  *   the reading is `pending` (a launch call's end during the run, which the
  *   run cannot order against its own read; `deferredReadingApplies`). An
- *   `arm` or `armPendingOnly` that lands later in the same run (a refusal
- *   that started the condition again) cancels the recorded end and its
- *   reading, so the timer is not stopped while the condition holds; an end
- *   that lands after such an arm is recorded and applied as above. A
+ *   `arm` (full mode) that lands later in the same run (a refusal that
+ *   started the condition again) cancels the recorded end and its reading,
+ *   so the timer is not stopped while the condition holds; an end that lands
+ *   after such an arm is recorded and applied as above. An `armPendingOnly`
+ *   in the run is no refusal and cancels nothing: the `pending` row it marks
+ *   keeps the timer when the end is applied. A
  *   `stop` answer makes it moot,
  *   but a pending-only stop that yields to a full-mode cause counts as
  *   `again` here, and when the rule stops the timer the yielded stop's
@@ -246,7 +248,15 @@
  * `old-life-wait-in-flight` by what blocks it, the row kept `pending`). Otherwise it reads the
  * persona's row (`readRow`, one `status` call) inside a recovery attempt for
  * the persona, and the state decides:
- * still `pending`, a refusal (`row-pending`) with no other call; live out of
+ * still `pending`, a refusal (`row-pending`) with no other call, or, with the
+ * pending-row step given (`FullModeRetryDeps.stepPendingRow`, bound in
+ * `main()`), one `get` that decides the row (b.jg5 SRJ-409, SRJ-411): a
+ * covered or undecided row is armed pending-only and kept (`row-pending`); a
+ * row that is not covered (a retired key's old life before its new life, a
+ * `cwd` or `config_dir` mismatch) starts the live-row sequence, a refusal
+ * naming it (`live-row-sequence-started`, the row kept `pending`) with no
+ * launch or approver of the retry's own; a read that latched stops as
+ * latched; another state the `get` read is answered as below; live out of
  * `pending`, a stop with no other call (and, when the optional connection
  * and stream probes both answer true, the end hook ends the persona's
  * `tmux-unresponsive` condition with the row's state as its reading); `ended`, `missing` or no row, a stop
@@ -639,6 +649,41 @@ export const UNAVAILABLE_RETRY_AGAIN_ROW_PENDING = 'row-pending'
  */
 export const UNAVAILABLE_RETRY_AGAIN_SEQUENCE_WAITING = 'live-row-sequence-waiting'
 
+/**
+ * A pending-only retry whose row read `pending` and whose pending-row step
+ * found the row not covered (b.jg5 SRJ-411: a retired key's old life before
+ * its new life, or a `cwd` or `config_dir` mismatch) and started the
+ * live-row sequence for it: no launch or approver of the retry's own; the
+ * last row read stays `pending`, and the timer re-arms at the doubled wait
+ * (SRJ-302: a refusal). Kept apart from `live-row-sequence-waiting`, a
+ * full-mode run that found a sequence already running.
+ */
+export const UNAVAILABLE_RETRY_AGAIN_SEQUENCE_STARTED = 'live-row-sequence-started'
+
+// ---------------------------------------------------------------------------
+// The pending-only retry's pending-row step (b.jg5 SRJ-409, SRJ-411)
+// ---------------------------------------------------------------------------
+
+/** The step kept the row: covered or undecided (P armed pending-only), or its read was refused. */
+export const UNAVAILABLE_RETRY_PENDING_STEP_KEPT = 'kept'
+/** The step found the row not covered and started the live-row sequence for it (SRJ-411). */
+export const UNAVAILABLE_RETRY_PENDING_STEP_SEQUENCE_STARTED = 'sequence-started'
+/** The step's read latched the persona (SRJ-114, SRJ-513), or found it latched. */
+export const UNAVAILABLE_RETRY_PENDING_STEP_LATCHED = 'latched'
+/** The step's read found the row in another state, or no row (`UNAVAILABLE_RETRY_ROW_ABSENT`). */
+export const UNAVAILABLE_RETRY_PENDING_STEP_ROW = 'row'
+
+/**
+ * What the pending-only retry's pending-row step answers
+ * (`FullModeRetryDeps.stepPendingRow`; production: the session manager's
+ * `retryPendingRowStep`).
+ */
+export type UnavailableRetryPendingStep =
+  | { readonly kind: typeof UNAVAILABLE_RETRY_PENDING_STEP_KEPT }
+  | { readonly kind: typeof UNAVAILABLE_RETRY_PENDING_STEP_SEQUENCE_STARTED }
+  | { readonly kind: typeof UNAVAILABLE_RETRY_PENDING_STEP_LATCHED }
+  | { readonly kind: typeof UNAVAILABLE_RETRY_PENDING_STEP_ROW; readonly state: string }
+
 // ---------------------------------------------------------------------------
 // Stop reasons (b.jg5 SRJ-305)
 // ---------------------------------------------------------------------------
@@ -996,10 +1041,11 @@ export interface UnavailableRetryController extends UnavailableRetryTriggerSink 
    * `deferred`: once the run's `again` answer (or a failed run) has set the
    * last row read and the mode, the same rule is applied before the re-arm,
    * with its kept or stopped line; a `stop` answer makes it moot (only the
-   * answer's stopped line), as does a stop during the run. An `arm` or
-   * `armPendingOnly` later in the same run cancels the recorded end and its
-   * reading (the condition started again), so nothing is applied for it; an
-   * end after that arm is recorded again. A pending-only
+   * answer's stopped line), as does a stop during the run. An `arm` (full
+   * mode) later in the same run cancels the recorded end and its reading
+   * (the condition started again), so nothing is applied for it; an end
+   * after that arm is recorded again. An `armPendingOnly` in the run cancels
+   * nothing: its `pending` row keeps the timer when the end is applied. A pending-only
    * stop that yields to a full-mode cause armed during the run counts as
    * `again` here: the rule is applied, and when it stops the timer the
    * yielded stop's hand-off runs after that stop. Answers what it
@@ -1420,8 +1466,8 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
   /**
    * Arm persona `key` with `cause` in `mode` (see `arm` and `armPendingOnly`).
    * An armed entry keeps its due time; a full-mode arm promotes a
-   * pending-only entry. During a run, an arm cancels a condition end deferred
-   * to that run (`conditionEnded`). Answers true when the persona has a timer after the
+   * pending-only entry. During a run, a full-mode arm cancels a condition
+   * end deferred to that run (`conditionEnded`); a pending-only arm does not. Answers true when the persona has a timer after the
    * call. Never throws.
    */
   function armIn(key: string, cause: UnavailableRetryCause, mode: UnavailableRetryMode): boolean {
@@ -1434,14 +1480,21 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
       const description = record(existing, cause)
       if (existing.timer === undefined) {
         existing.runCause = description
-        if (mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY) existing.pendingArmedInRun = true
-        else existing.fullArmedInRun = true
-        // An arm after a condition end deferred to this run is the later
-        // state (a refusal that started the condition again): it cancels that
-        // end, so the timer is not stopped while the condition holds. An end
-        // that lands after this arm is recorded, and applied, as usual.
-        existing.endedInRun = undefined
-        existing.endedReadingInRun = undefined
+        if (mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY) {
+          // A covered `pending` row is no refusal: a condition end deferred
+          // to this run still applies, and the row this arm marks `pending`
+          // keeps the timer when it does (b.jg5 SRJ-306).
+          existing.pendingArmedInRun = true
+        } else {
+          existing.fullArmedInRun = true
+          // A full-mode arm after a condition end deferred to this run is the
+          // later state (a refusal that started the condition again): it
+          // cancels that end, so the timer is not stopped while the
+          // condition holds. An end that lands after this arm is recorded,
+          // and applied, as usual.
+          existing.endedInRun = undefined
+          existing.endedReadingInRun = undefined
+        }
       }
       if (mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY) {
         existing.lastRow = UNAVAILABLE_RETRY_ROW_PENDING
@@ -1640,6 +1693,23 @@ export interface FullModeRetryDeps {
    * swallowed and changes nothing about the retry's answer.
    */
   endTmuxUnresponsive?: (key: string, reading: string) => void
+  /**
+   * The pending-row step (b.jg5 SRJ-409, SRJ-411; production: the session
+   * manager's `retryPendingRowStep` over the applied persona): called by a
+   * pending-only retry, inside its recovery attempt, when its `status` read
+   * answered `pending`. It makes one `get` through the shared own-row read
+   * (its note and launch-start latches and its old-life read entry applying)
+   * and decides whether the row is covered: a covered or undecided row arms
+   * the persona's timer pending-only and is kept (`kept`; a read the shared
+   * read refused is kept too); a row that is not covered starts the live-row
+   * sequence (`sequence-started`); a read that latched the persona answers
+   * `latched`; another state, or no row, answers `row` with what it read.
+   * The `get`'s row supersedes the `status` read's, its launch start
+   * included. Absent: the `status` read's `pending` is a refusal, as before.
+   * A step that throws or rejects rejects the action, which the controller
+   * counts as `again`.
+   */
+  stepPendingRow?: (key: string) => Promise<UnavailableRetryPendingStep>
 }
 
 /**
@@ -1652,7 +1722,11 @@ export interface FullModeRetryDeps {
  * the in-flight predicate answers true or throws, else reads the row inside
  * a recovery attempt for the persona, asks the latched query again (a read
  * that latched the persona, b.jg5 SRJ-512, SRJ-513, stops with the latch's reason and
- * hands nothing on) and answers from its state (`pendingOnlyAnswer`). A latched query that throws counts as latched
+ * hands nothing on) and answers from its state (`pendingOnlyAnswer`); a
+ * `pending` state goes to the optional pending-row step, inside a recovery
+ * attempt too, and its answer decides (`pendingStepAnswer`). The launch start
+ * the `status` read carried is superseded by the step's `get`; ageing the row
+ * at the retries is the pending-row rule's, not this action's. A latched query that throws counts as latched
  * (logged, with what it threw), and so does a held query that throws. A
  * dependency that throws (but the in-flight predicate and the latched and
  * held queries),
@@ -1691,7 +1765,17 @@ export function createFullModeRetryAction(deps: FullModeRetryDeps): UnavailableR
       if (isLiveOutOfPending(row.state) && probe(key, deps.isSessionConnected) && probe(key, deps.hasSessionStream)) {
         endCondition(key, row.state, deps.endTmuxUnresponsive)
       }
-      return pendingOnlyAnswer(row.state, () => deps.retry(key, cwd, deps.isInFlight, deps.retryBlockCause))
+      const restart = (): Promise<unknown> => deps.retry(key, cwd, deps.isInFlight, deps.retryBlockCause)
+      // b.jg5 SRJ-409, SRJ-411: a `pending` row is decided by the pending-row
+      // step's one `get`, whose row supersedes this `status` read's (the
+      // carried launch start included; ageing at the retries is the
+      // pending-row rule's).
+      if (row.state === UNAVAILABLE_RETRY_ROW_PENDING && deps.stepPendingRow !== undefined) {
+        const stepPendingRow = deps.stepPendingRow
+        const step = await runInAttempt(key, 'recovery', () => stepPendingRow(key))
+        return pendingStepAnswer(key, step, deps.isLatched, restart)
+      }
+      return pendingOnlyAnswer(row.state, restart)
     }
     const outcome = await deps.retry(key, cwd, deps.isInFlight, deps.retryBlockCause)
     // Since b.jg5 E9, `already-connected` is answered only for a `live`
@@ -1742,6 +1826,36 @@ function pendingOnlyAnswer(row: string, restart: () => Promise<unknown>): Unavai
     return { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_ROW_GONE, row, handOff: restart, yieldsToFullMode: true }
   }
   return { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_ROW_LIVE, row, yieldsToFullMode: true }
+}
+
+/**
+ * What a pending-only retry answers for its pending-row step's `step`
+ * (b.jg5 SRJ-409, SRJ-411, SRJ-305): `kept` is today's refusal
+ * (`row-pending`, the row kept `pending`); `sequence-started` is a refusal
+ * naming the sequence it started (`live-row-sequence-started`), the row kept
+ * `pending`, with no launch or approver of its own; `latched`, or a persona
+ * the latched query now answers latched, stops with the latch's reason and
+ * hands nothing on; `row` answers as the `status` read would have for that
+ * state (`pendingOnlyAnswer`): `ended`, `missing` or no row stops and hands
+ * the persona to the restart path once. A `step` that is not one of these is
+ * taken as `kept`.
+ */
+function pendingStepAnswer(
+  key: string,
+  step: UnavailableRetryPendingStep,
+  isLatched: ((key: string) => boolean) | undefined,
+  restart: () => Promise<unknown>,
+): UnavailableRetryOutcome {
+  if (step?.kind === UNAVAILABLE_RETRY_PENDING_STEP_LATCHED || latched(key, isLatched)) {
+    return stopWith(UNAVAILABLE_RETRY_STOP_LATCHED)
+  }
+  if (step?.kind === UNAVAILABLE_RETRY_PENDING_STEP_SEQUENCE_STARTED) {
+    return { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_SEQUENCE_STARTED, row: UNAVAILABLE_RETRY_ROW_PENDING }
+  }
+  if (step?.kind === UNAVAILABLE_RETRY_PENDING_STEP_ROW && typeof step.state === 'string') {
+    return pendingOnlyAnswer(step.state, restart)
+  }
+  return pendingOnlyAnswer(UNAVAILABLE_RETRY_ROW_PENDING, restart)
 }
 
 /**

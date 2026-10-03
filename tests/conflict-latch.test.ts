@@ -451,7 +451,7 @@ import {
   type PersonaEpisodeKind,
   type PersonaEpisodes,
 } from '../src/persona-episodes.ts'
-import { personaInstanceId, personaTmuxSessionName } from '../src/persona-identity.ts'
+import { personaInstanceId, personaTmuxSessionName, renderPersonaRef } from '../src/persona-identity.ts'
 import type { PersonaSerialize, PersonaSerializer } from '../src/persona-serializer.ts'
 import { getFailureCount, isAtCap } from '../src/backoff.ts'
 import { _resetHealthCheckState, initHealthCheck, startHealthCheck, stopHealthCheck } from '../src/health-check.ts'
@@ -486,6 +486,7 @@ import {
   OWN_ROW_READ_ROW,
   OWN_ROW_STATUS_LATCHED,
   OWN_ROW_STATUS_STATE,
+  latchedNoArmPendingRowLine,
   readPersonaOwnRow,
   readPersonaOwnRowStatus,
   reconcileOrphans,
@@ -496,6 +497,7 @@ import {
   type OwnRowReadSite,
 } from '../src/session-manager.ts'
 import {
+  UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
   UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
@@ -531,6 +533,7 @@ import {
   UNUSABLE_NAME_FAULTS,
   errUnusableName,
   holdFindMissing,
+  holdSpawns,
   unknownNote,
   type CannedRowPersona,
   type UnusableNameFault,
@@ -595,6 +598,7 @@ import {
   conditionEndedLine,
   conditionRecoveryLine,
   expectLostMessageReports,
+  expectPendingOnlyWatch,
   killFailureLines,
   makeRecoveryHarness,
   pastSampleGrace,
@@ -2174,6 +2178,17 @@ const Q_CALLS_ON_EVERY_PATH = [
   ['the retry timer', { ...RELAUNCH, statusCalls: RELAUNCH.statusCalls + 1 }],
 ] as const
 
+/**
+ * The retry timer path's attempts after `attemptsBefore`, as `[key, retry]`
+ * (b.jg5 SRJ-301, SRJ-409): Q's successful launches on the earlier paths left
+ * its timer armed in pending-only mode, so it fires first while P's timer is
+ * driven, reads Q's row live out of pending and stops; P's timer fires once
+ * and stops latched, with no call; then Q's own timer runs its relaunch,
+ * whose success arms pending-only again, and reads its row live out of
+ * pending.
+ */
+const retryTimerAttempts = (p: string, q: string): Array<[string, number]> => [[q, 1], [p, 1], [q, 1], [q, 2]]
+
 describe('AC 46: no automated path kills, launches or recovers a latched persona (recovery harness)', () => {
   const plainSpawnRow = rowWhere(
     (row) => row.refusedOperation === REFUSED_OPERATION_PLAIN_SPAWN && row.latchCase === LATCH_CASE_LEFTOVER && row.rowState !== LATCH_ROW_STATE_NO_ROW,
@@ -2216,8 +2231,8 @@ describe('AC 46: no automated path kills, launches or recovers a latched persona
       ...[1, 2, 3, 4].map(() => [q, RESTART_OUTCOME_LAUNCHED] as const),
     ])
     expect(isRestartPendingOrActive(p)).toBe(false)
-    // P's timer fired once and stopped as latched, with no call; Q's ran its relaunch, then read its row live out of pending.
-    expect(h.attempts.slice(attemptsBefore).map((a) => [a.key, a.retry])).toEqual([[p, 1], [q, 1], [q, 2]])
+    // P's timer fired once and stopped as latched, with no call (Q's pending-only watch and relaunch around it: retryTimerAttempts).
+    expect(h.attempts.slice(attemptsBefore).map((a) => [a.key, a.retry])).toEqual(retryTimerAttempts(p, q))
     expect(h.stops.filter((stop) => stop.key === p)).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
     expect(h.controller.armedKeys()).toEqual([])
     expect(scheduled).toEqual([q])
@@ -2522,7 +2537,7 @@ describe('SRJ-512: an UNUSABLE NAME from resume and from the working-row read-pa
       ...[1, 2, 3, 4].map(() => [q, RESTART_OUTCOME_LAUNCHED] as const),
     ])
     expect(notScheduledLines).toEqual([[notSchedulingLine(p)], [notSchedulingLine(p)]])
-    expect(h.attempts.slice(attemptsBefore).map((a) => [a.key, a.retry])).toEqual([[p, 1], [q, 1], [q, 2]])
+    expect(h.attempts.slice(attemptsBefore).map((a) => [a.key, a.retry])).toEqual(retryTimerAttempts(p, q))
     expect(h.stops.filter((stop) => stop.key === p)).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
     expect([h.controller.armedKeys(), isRestartPendingOrActive(p)]).toEqual([[], false])
     // Nothing counted, no spawn-failure notice or spawn-failed entry, one latch and exactly one post: SRJ-1019.
@@ -2649,7 +2664,7 @@ describe('SRJ-118, SRJ-505: a CONFLICT or UNUSABLE NAME at the reconnect\'s send
       ...[1, 2, 3, 4].map(() => [q, RESTART_OUTCOME_LAUNCHED] as const),
     ])
     expect(notScheduledLines).toEqual([[notSchedulingLine(p)], [notSchedulingLine(p)]])
-    expect(h.attempts.slice(attemptsBefore).map((a) => [a.key, a.retry])).toEqual([[p, 1], [q, 1], [q, 2]])
+    expect(h.attempts.slice(attemptsBefore).map((a) => [a.key, a.retry])).toEqual(retryTimerAttempts(p, q))
     expect(h.stops.filter((stop) => stop.key === p)).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
     expect([h.controller.armedKeys(), isRestartPendingOrActive(p)]).toEqual([[], false])
     expect(tick.scheduled).toEqual([q])
@@ -3480,7 +3495,7 @@ describe('SRJ-513: a pending row with no launch start holds P for a human on eve
       ...[1, 2, 3, 4].map(() => [q, RESTART_OUTCOME_LAUNCHED] as const),
     ])
     expect(notScheduledLines).toEqual([[notSchedulingLine(p)], [notSchedulingLine(p)]])
-    expect(h.attempts.slice(attemptsBefore).map((a) => [a.key, a.retry])).toEqual([[p, 1], [q, 1], [q, 2]])
+    expect(h.attempts.slice(attemptsBefore).map((a) => [a.key, a.retry])).toEqual(retryTimerAttempts(p, q))
     expect(h.stops.filter((stop) => stop.key === p).slice(pStopsAtLatch)).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
     expect([h.controller.isArmed(p), h.controller.armedKeys(), isRestartPendingOrActive(p)]).toEqual([false, [], false])
     // Nothing counted, no spawn-failure notice or spawn-failed entry, one latch and exactly one post: SRJ-1020.
@@ -3527,6 +3542,33 @@ describe('SRJ-513: a pending row with no launch start holds P for a human on eve
     expect(h.stub.calls.deleteCalls).toEqual([])
     expect(h.episodeNotices).toEqual([{ key: p, text: launchStartNotRecordedNoticeText(p) }])
     expect([h.notices, h.latch.isLatched(q)]).toEqual([[], false])
+  })
+
+  // b.jg5 SRJ-305, SRJ-301: a launch that returned success arms P's
+  // pending-only watch, but never for a latched persona. P latches while its
+  // spawn is in flight (an own-row read of its pending row with no launch
+  // start); the spawn then returns: no pending-only arm, one line saying why.
+  test('P latched while its launch\'s spawn is in flight: the spawn\'s success arms no pending-only watch for P, with one not-arming line; Q\'s launch beside it arms its own', async () => {
+    const h = makeRecoveryHarness()
+    harnesses.push(h)
+    const [p, q] = h.keys as [string, string]
+    const hold = holdSpawns(h.stub.client, (id) => id === personaInstanceId(p))
+    const launch = h.launch(p)
+    await hold.entered(personaInstanceId(p))
+
+    h.script({ getResult: cannedGetResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE }, personaOf(h, p), h.home) })
+    expect(await readPersonaOwnRow(p, { site: 'conflict-latch.test', what: 'own-row read' })).toMatchObject({ latched: true })
+    expect(h.latch.record(p)).toEqual(launchStartRecord(p))
+    hold.release(personaInstanceId(p))
+    await launch
+    await h.settle()
+
+    expect(h.triggers.filter((trigger) => trigger.key === p)).toEqual([])
+    expect(h.controller.isArmed(p)).toBe(false)
+    expect(h.errors.filter((line) => line === latchedNoArmPendingRowLine(renderPersonaRef(personaOf(h, p).name, p)))).toHaveLength(1)
+    expect(await h.launch(q)).toEqual({ key: q, action: 'spawned' })
+    expect(h.triggers).toEqual([{ key: q, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
+    await h.runApproverToStop(q)
   })
 
   /** A key outside the harness's personas, or a persona removed from the applied configuration, whose row reads `pending` with no launch start. */
@@ -3913,13 +3955,22 @@ describe('the dialog approver\'s latches: its own CONFLICT or UNUSABLE NAME latc
     expect(await h.launch(q)).toEqual({ key: q, action: 'spawned' })
     await h.settle()
 
-    // P: its lap's calls up to the refused one and none after; one latch through the latch's set entry, one post; nothing armed, counted or noticed.
+    // P: its lap's calls up to the refused one and none after; one latch through the latch's set entry, one post; nothing counted or noticed.
+    // Each launch armed its persona's timer pending-only (b.jg5 SRJ-301, SRJ-409); the latch's hold stopped P's, Q's stays armed.
     expect((await h.runApproverToStop(p))?.reason).toBe(APPROVER_STOP_LATCHED)
     expect(personaCallCounts(h, p)).toEqual({ spawnCalls: 1, ...lapCallsThrough(c.verb) })
     expect(h.latch.record(p)).toEqual(c.record(p))
     expect(latchSteps(h)).toEqual(oneLatch(p))
     expect(h.episodeNotices).toEqual([{ key: p, text: c.notice(p) }])
-    expect([h.triggers, h.controller.armedKeys(), getFailureCount(p), h.notices]).toEqual([[], [], 0, []])
+    expect([h.triggers, h.controller.armedKeys(), getFailureCount(p), h.notices]).toEqual([
+      [{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }, { key: q, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }],
+      [q],
+      0,
+      [],
+    ])
+    expect(h.stops.filter((stop) => stop.key === p)).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
+    // The approver's latched stop arms nothing (b.jg5 SRJ-404).
+    expect(h.controller.isArmed(p)).toBe(false)
 
     // Q, beside it: its approver pressed Enter on its dialog and ran on until its cap; Q is not latched.
     expect(personaCallCounts(h, q)).toEqual({ spawnCalls: 1, ...lapCallsThrough('send-keys') })
@@ -3936,8 +3987,12 @@ describe('the dialog approver\'s latches: its own CONFLICT or UNUSABLE NAME latc
     expect(tmuxTouchingCallsIn(h.stub.calls, touchingAtLatch).filter((call) => instanceOf(call.params) === personaInstanceId(p))).toEqual([])
     expect(raw.filter((call) => call.target.includes(personaTmuxSessionName(p)))).toEqual([])
     expect(launched).toEqual([{ key: p, action: 'latched' }, { key: q, action: 'spawned' }])
-    expect(h.attempts.slice(attemptsBefore).map((a) => [a.key, a.retry])).toEqual([[p, 1], [q, 1], [q, 2]])
-    expect(h.stops.filter((stop) => stop.key === p)).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
+    expect(h.attempts.slice(attemptsBefore).map((a) => [a.key, a.retry])).toEqual(retryTimerAttempts(p, q))
+    // The latch's hold stopped the pending-only timer P's launch armed; the retry timer path's arm then fired once and stopped latched.
+    expect(h.stops.filter((stop) => stop.key === p)).toEqual([
+      { key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED },
+      { key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED },
+    ])
     expect(qCalls).toEqual([...Q_CALLS_ON_EVERY_PATH])
     // Still the one latch and the one post.
     expect(latchSteps(h)).toEqual(oneLatch(p))
@@ -3995,6 +4050,12 @@ describe('the dialog approver\'s latches: its own CONFLICT or UNUSABLE NAME latc
     expect([h.latch.isLatched(q), h.approverRunning(q)]).toEqual([false, true])
     expect(h.episodeNotices.map((notice) => notice.key)).toEqual([p])
     expect((await h.runApproverToStop(q))?.reason).toBe(APPROVER_STOP_CAP)
+    // Q's launch left its timer armed pending-only (b.jg5 SRJ-301, SRJ-409); P's was stopped by the latch's hold.
+    // Once Q's is stopped, nothing else is pending.
+    expectPendingOnlyWatch(h, q)
+    expect(h.controller.armedKeys()).toEqual([q])
+    expect(h.stops.filter((stop) => stop.key === p)).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
+    h.controller.stop(q, 'the case is over')
     expect(h.clock.pendingCount()).toBe(0)
   })
 })
@@ -4363,6 +4424,10 @@ describe('a running live-row sequence stops when P latches from another path: no
     expect(h.episodeNotices.map((notice) => notice.key)).toEqual([p])
     expect(killFailureLines(h, p)).toEqual([])
     await h.runApproverToStop(q)
+    // Q's sequence's launch left Q's timer armed pending-only (b.jg5 SRJ-301, SRJ-409); P has none. Once it is stopped, nothing is pending.
+    expectPendingOnlyWatch(h, q)
+    expect(h.controller.armedKeys()).toEqual([q])
+    h.controller.stop(q, 'the case is over')
     expect([h.sequenceRunning(p), h.sequenceRunning(q), h.clock.pendingCount()]).toEqual([false, false, 0])
   })
 })

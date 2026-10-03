@@ -142,6 +142,7 @@ import {
   LIVE_ROW_LAUNCH_REASON_NOT_KEPT,
   LIVE_ROW_LAUNCH_REASON_RESUME_DISABLED,
   LIVE_ROW_LAUNCH_ANSWER_LAUNCHED,
+  LIVE_ROW_LAUNCH_CALL_SUCCESS_ACTIONS,
   LIVE_ROW_LAUNCH_REASON_RETIRED_KEY,
   LIVE_ROW_LAUNCH_RESUME,
   LIVE_ROW_LAUNCH_REUSE,
@@ -184,6 +185,7 @@ import {
   decideLiveRowLaunchKind,
   liveRowLaunchSucceeded,
   liveRowSequenceDroppedLine,
+  liveRowSequenceEndArmText,
   liveRowSequenceEndLine,
   liveRowSequenceFailedLine,
   liveRowSequenceGetLine,
@@ -210,7 +212,7 @@ import { AGENT_DIRECTOR_PENDING_STATE, LIVENESS_DEAD_ROW_ENDED, LIVENESS_DEAD_RO
 import { oldLifeWaitRef } from '../src/old-life-wait.ts'
 import { parseLaunchStart } from '../src/pending-row.ts'
 import { describeThrownValue } from '../src/persona-connection-errors.ts'
-import { personaInstanceId, personaTmuxSessionName, renderPersonaRef } from '../src/persona-identity.ts'
+import { CONFIG_DIR_LABEL_PREFIX, personaInstanceId, personaTmuxSessionName, renderPersonaRef } from '../src/persona-identity.ts'
 import { OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL } from '../src/retired-keys.ts'
 import { KILL_FAILURE_END_ROW_FINISHED } from '../src/persona-episodes.ts'
 import { MAX_TIMER_DELAY_MS } from '../src/persona-retry-schedule.ts'
@@ -328,6 +330,7 @@ import {
   unavailableAt,
   unclassifiedStartedLines,
   expectUntouched,
+  expectPendingOnlyWatch,
   type RecoveryHarness,
   type RecoveryHarnessOptions,
   type RecoverySequenceRequest,
@@ -1313,10 +1316,12 @@ describe('the launch: a resume when the row has a session id and P keeps its con
       result: { key: p },
     })
     expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
-    // No reuse after the resume succeeded, and no sequence cause, or any other, armed (SRJ-301).
+    // No reuse after the resume succeeded, and no sequence cause armed (SRJ-301): only the launch's own
+    // pending-only arm for the row it left (b.jg5 SRJ-409).
     expect(h.stub.calls.spawnCalls).toEqual([])
     expect(outcome.armed).toBeUndefined()
-    expect([h.triggers, h.controller.armedKeys(), h.notices]).toEqual([[], [], []])
+    expect([h.triggers, h.controller.armedKeys(), h.notices]).toEqual([[{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }], [p], []])
+    expectPendingOnlyWatch(h, p)
     await h.runApproverToStop(p)
   })
 
@@ -1468,6 +1473,25 @@ const ENDED_ARMED = `the retry timer armed (${LIVE_ROW_ARM_ENDED})`
 const PENDING_ONLY_ARMED = 'the retry timer armed by the launch (pending-only)'
 const RETRYING_ANSWER = { action: SPAWN_ACTION_RETRYING } as const
 
+/** A step-6 reuse's launched outcome with result `action` (one run, one kill), as the end line reads it. */
+function launchedOutcome(action: string): LiveRowSequenceOutcome {
+  return {
+    kind: LIVE_ROW_OUTCOME_LAUNCHED,
+    launchKind: LIVE_ROW_LAUNCH_REUSE,
+    reason: LIVE_ROW_LAUNCH_REASON_NOT_KEPT,
+    result: { key: 'p', action },
+    runs: 1,
+    kills: 1,
+    judgedRuns: 1,
+  }
+}
+
+/** The end line's words for an end that armed nothing (here a stop for teardown). */
+const NO_ARM_SAID = liveRowSequenceEndArmText({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_TEARDOWN, runs: 0, kills: 0, judgedRuns: 0 })
+
+/** The successes that made no launch call: a reconnect, a reconnect that did not connect, and a no-op. */
+const NO_LAUNCH_CALL_SUCCESSES: readonly string[] = ['reconnected', 'not-reconnected', 'no-op']
+
 /** A reuse refused by `cause`'s class, answering `retrying` (b.jg5 SRJ-1015): the refusal's own cause, then the sequence's. */
 const refusedBy = (make: () => Error, cause: string, unclassified?: true): ReuseEnd => ({
   make,
@@ -1493,7 +1517,8 @@ const launchFailure = (noRow?: true): ReuseEnd => ({
 })
 
 const REUSE_ENDS: ReadonlyArray<readonly [string, ReuseEnd]> = [
-  ['succeeds', { make: () => undefined, answer: { action: 'spawned' }, triggers: [], counted: 0, said: 'launched (reuse; result=spawned)', armedSaid: 'no retry timer armed' }],
+  // The launch arms P's timer pending-only for the row it left (b.jg5 SRJ-301, SRJ-409); the sequence arms nothing of its own.
+  ['succeeds', { make: () => undefined, answer: { action: 'spawned' }, triggers: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW], counted: 0, said: 'launched (reuse; result=spawned)', armedSaid: liveRowSequenceEndArmText(launchedOutcome('spawned')) }],
   // SRJ-112, SRJ-602: a directory error is one counted launch failure, with no notice.
   [
     'fails with a directory error (ErrCwdNotFound), counted once',
@@ -1510,6 +1535,23 @@ const REUSE_ENDS: ReadonlyArray<readonly [string, ReuseEnd]> = [
 describe('the launch\'s end: the outcome carries the launch\'s result, and the end line says whether it launched (SRJ-705 step 6, SRJ-301, SRJ-112)', () => {
   test.each(Object.entries(LAUNCH_ACTION_SUCCEEDS))('a launch result %s is a success: %p', (action, succeeds) => {
     expect(liveRowLaunchSucceeded({ key: 'p', action })).toBe(succeeds)
+  })
+
+  // b.jg5 SRJ-301, SRJ-409: a launch call's own success (a spawn, a reuse
+  // spawn or a resume) arms P's pending-only watch through the after-launch
+  // step, so the end line says so rather than that nothing is armed; a
+  // success that made no launch call (a reconnect, a no-op) and a failure
+  // with nothing armed keep the words of an end that armed nothing.
+  test.each(Object.entries(LAUNCH_ACTION_SUCCEEDS).map(([action, succeeds]) => [action, succeeds && !NO_LAUNCH_CALL_SUCCESSES.includes(action)] as const))('a launched outcome whose result is %s, nothing armed (a launch call\'s success: %p): the end line names the launch\'s pending-only arm only for a launch call\'s success', (action, launchCall) => {
+    expect(LIVE_ROW_LAUNCH_CALL_SUCCESS_ACTIONS.has(action)).toBe(launchCall)
+    const said = liveRowSequenceEndArmText(launchedOutcome(action))
+    if (launchCall) {
+      expect(said).not.toBe(NO_ARM_SAID)
+      expect(said).toContain(`${UNAVAILABLE_RETRY_MODE_PENDING_ONLY} watch (${UNAVAILABLE_RETRY_CAUSE_PENDING_ROW})`)
+    } else {
+      expect(said).toBe(NO_ARM_SAID)
+    }
+    expect(liveRowSequenceEndLine('persona=p', launchedOutcome(action))).toContain(`; ${said} (b.jg5 `)
   })
 
   // The reuse's answer to each outcome class (b.jg5 SRJ-112) as the sequence
@@ -2189,6 +2231,67 @@ describe('started at a collision ladder replacement site: the launch answers whi
 })
 
 // ---------------------------------------------------------------------------
+// SRJ-411's Test line, its mismatch leg (b.jg5 SRJ-411, SRJ-409, SRJ-705; the
+// E21 hatch note): a `pending` row whose `cwd` or `config_dir` label differs
+// from P's is not covered, so the pending-only retry's read-and-step sends it
+// through the live-row sequence (the retry timer is a launch path too), with
+// the conversation not kept: its step-1 kill, then its step-2 `get`, which
+// still reads the row `pending` and waits until G past the row's launch
+// start, never earlier; then its run marks the row missing and the reuse is
+// its one and final launch. Nothing is typed and no approver laps before
+// that reuse. P's timer is armed pending-only directly; the retry's answer is
+// tests/unavailable-retry.test.ts's, the step's start request
+// tests/pending-row.test.ts's, the destructive-modify leg
+// tests/reload-apply.test.ts's.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-411: a pending row whose cwd or config_dir differs from P\'s goes through the live-row sequence from the pending-only retry, with no lap: its wait until G from the launch start, then one reuse, the final launch', () => {
+  /** Row labels without the `config_dir` label (a label missing is a mismatch, SRJ-1504). */
+  const withoutConfigDir = (labels: Record<string, string> | undefined): Record<string, string> =>
+    Object.fromEntries(Object.entries(labels ?? {}).filter(([name]) => `${name}=` !== CONFIG_DIR_LABEL_PREFIX))
+
+  test.each<[string, (h: RecoveryHarness, key: string) => PersonaGetResultOverrides]>([
+    ['its cwd another existing directory', (h) => ({ cwd: h.home })],
+    ['its config_dir label missing', (h, key) => ({ labels: withoutConfigDir(personaRow(h, key).labels) })],
+  ])('P\'s pending row with %s: the retry starts one sequence; its kill and get, then no run before G from the launch start and the first exactly at it; no send-keys or pane read for P until the reuse, which is made once, last', async (_label, mismatch) => {
+    const { h, p, q } = build()
+    await clockAt(h, LAUNCH_START_MS)
+    const deadline = LAUNCH_START_MS + adGraceMsInEffect()
+    // The row reads pending, mismatched, until the sequence's run marks it missing.
+    h.script({
+      statusResult: cannedStatusResult({ state: PENDING }),
+      getFn: () => personaRow(h, p, h.stub.calls.findMissingCalls.length === 0 ? { state: PENDING, ...mismatch(h, p) } : { state: MISSING }),
+    })
+    runs(h, placed(p, 'ids'))
+    h.controller.armPendingOnly(p)
+    const calls = recordCallTimes(h)
+
+    const retryAt = await retryNow(h, p)
+    expect(retryAt).toBeLessThan(deadline)
+    expect(h.sequenceRunning(p)).toBe(true)
+    const outcome = await h.driveSequence(h.sequenceSettled(p))
+
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE, reason: LIVE_ROW_LAUNCH_REASON_NOT_KEPT, result: { key: p, action: 'spawned' } })
+    // The retry's status and the step's get; the sequence's step-1 kill and step-2 get; its wait; then the run, its get and the reuse.
+    const expected: Array<readonly [string, number]> = [
+      ['status', retryAt],
+      ['get', retryAt],
+      ['kill', retryAt],
+      ['get', retryAt],
+      ['findMissing', deadline],
+      ['get', deadline],
+      ['spawn', deadline],
+    ]
+    expect(calls.slice(0, expected.length)).toEqual(expected)
+    // After the reuse, only its dialog approver's calls (b.jg5 SRJ-401): no send-keys or pane read for P before it.
+    expectCallsThenApprover(calls.map(([verb]) => verb), expected.map(([verb]) => verb))
+    expectOneReuseOf(h, p)
+    expectUntouched(h, q)
+    await h.runApproverToStop(p)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Started at the collision ladder's ErrSpawnNotResumable with dead evidence
 // (b.jg5 SRJ-710, SRJ-611, SRJ-705, SRJ-706)
 //
@@ -2354,7 +2457,7 @@ describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the 
     expect(h.triggers).toEqual([])
   })
 
-  test('step 6\'s resume answering ErrSpawnNotFound: one plain spawn of the id (no reuse flag) and the sequence launches; no spawn-failure notice, nothing counted, nothing armed', async () => {
+  test('step 6\'s resume answering ErrSpawnNotFound: one plain spawn of the id (no reuse flag) and the sequence launches; no spawn-failure notice, nothing counted, and only the launch\'s pending-only arm', async () => {
     const { h, p } = build()
 
     const { outcome, order } = await runToStep6Resume(h, p, errSpawnNotFound())
@@ -2363,7 +2466,7 @@ describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the 
     expect(outcome.armed).toBeUndefined()
     expectCallsThenApprover(order, [...SEQUENCE_CALLS, 'spawn'])
     expect(h.stub.calls.spawnCalls.map((call) => [call.claude_instance_id, call.reuse_finished])).toEqual([[personaInstanceId(p), undefined]])
-    expect([h.notices, h.triggers, getFailureCount(p)]).toEqual([[], [], 0])
+    expect([h.notices, h.triggers, getFailureCount(p)]).toEqual([[], [{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }], 0])
     await h.runApproverToStop(p)
   })
 

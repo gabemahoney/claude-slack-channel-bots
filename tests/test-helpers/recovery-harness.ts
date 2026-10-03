@@ -32,7 +32,12 @@
  *   `hasSessionStream`, both over `setConnected`) and `endTmuxUnresponsive`,
  *   the condition's end with reason `TMUX_UNRESPONSIVE_END_RETRY` and the
  *   retry's reading followed by the clear of the persona's
- *   `tmux-unavailable` outage with that reading (b.jg5 SRJ-311, SRJ-312).
+ *   `tmux-unavailable` outage with that reading (b.jg5 SRJ-311, SRJ-312),
+ *   and the read-and-step dependency (`stepPendingRow`, b.jg5 SRJ-409,
+ *   SRJ-411): the session manager's `retryPendingRowStep` over the
+ *   applied-persona lookup, so a pending-only retry whose `status` shows
+ *   `pending` makes one `get` and keeps a covered or undecided row armed
+ *   pending-only, or starts the live-row sequence for an uncovered one.
  *   `scriptedAction` is
  *   the scripted action: it answers each persona's queued outcomes
  *   (`answer(key, ...outcomes)`) in order and, once they run out, a bare
@@ -64,14 +69,30 @@
  *   `capReached` and then, as `main()` binds it, calls
  *   `notifyRestartCapReached`, whose notice lands in `notices`, and ends the
  *   persona's unclassified-error episode
- *   (`end(key, UNCLASSIFIED_ERROR_END_CAPPED)`), each isolated. `serialize` is `serializer.run`, one real per-persona
+ *   (`end(key, UNCLASSIFIED_ERROR_END_CAPPED)`), and stops its retry timer
+ *   in either mode (`controller.stop(key, UNAVAILABLE_RETRY_STOP_CAPPED)`,
+ *   b.jg5 SRJ-305, so a real stop shows in `stops`), each isolated. `serialize` is `serializer.run`, one real per-persona
  *   serializer (`createPersonaSerializer`), which a test may hold a turn on.
  *   `armRetryTimer`, the arm hook, is bound as `main()` binds it (b.jg5
  *   SRJ-314, SRJ-301): every `unknown` liveness reading at the restart work,
  *   the re-probe's included, arms the persona's timer on the controller with
  *   `UNAVAILABLE_RETRY_CAUSE_READ_ERROR`, straight to the controller (it is
  *   not recorded in `triggers`); an arm while the timer is armed or running
- *   keeps its due time. `isLatched` is the latch's latched query (`latch`
+ *   keeps its due time. `deferPendingRow`, the `pending` deferral (b.jg5
+ *   SRJ-314, SRJ-409, SRJ-411), is bound as `main()` binds it: every
+ *   `pending` liveness reading at the restart work, the re-probe's included,
+ *   is handed, awaited, to the server's `deferPendingRow` with the reading's
+ *   launch start and the harness's applied-persona lookup (its lines go to
+ *   `errors`). For an applied persona it runs the session manager's
+ *   `readAndStepPendingRow`: one `get`, then a covered or undecided row armed
+ *   pending-only (through the trigger sink: in `triggers` with
+ *   `UNAVAILABLE_RETRY_CAUSE_PENDING_ROW`), an uncovered one sent through the
+ *   live-row sequence (conversation not kept, context `recovery`), a latching
+ *   row latched; its per-answer lines (row no longer pending, gone, refused)
+ *   are written, and a step that throws is logged and still answers
+ *   `pending`. The reconnect adapter is given the same lookup, so its own
+ *   `pending` answer takes the same deferral.
+ *   `isLatched` is the latch's latched query (`latch`
  *   below). `isHeld` is the hold's held query (`invalidFlagsHold` below;
  *   b.jg5 SRJ-207), so the restart work answers `held` with no call for a
  *   held persona and arms no restart timer for it.
@@ -461,9 +482,14 @@
  *   resolving with its `SpawnPersonaResult` (`latched` for a CONFLICT at a
  *   ladder spawn or `resume`, and for a persona already latched). Each persona's working directory
  *   exists, so a row the stub answers in it is the persona's own. A launch
- *   that returns success starts the persona's dialog approver on its own
- *   (b.jg5 SRJ-401): `launch(key)` resolves before the approver's first lap,
- *   which comes once the launch has settled.
+ *   that returns success arms the persona's retry timer in pending-only mode
+ *   (b.jg5 SRJ-301, SRJ-409: through the trigger sink, so one `triggers`
+ *   entry with `UNAVAILABLE_RETRY_CAUSE_PENDING_ROW`, unless the persona is
+ *   latched or `options.triggerSink` is false) and starts its dialog
+ *   approver on its own (b.jg5 SRJ-401): `launch(key)` resolves before the
+ *   approver's first lap, which comes once the launch has settled. Every
+ *   other successful launch (the restart path's, a sequence's step-6 reuse,
+ *   a retry's hand-off run) arms the same way.
  * - The dialog approver runs on the harness clock (`_setApproverClock`): its
  *   sleeps between laps (`DIALOG_POLL_INTERVAL_MS`) and its cap timer are
  *   harness-clock timers, so it makes no lap until the clock moves. Its cap
@@ -747,7 +773,17 @@
  *   settles every sequence and wait it starts, releasing any call it
  *   holds), or a
  *   persona is still armed: the episodes run on the harness clock, so a timer
- *   they armed and left pending fails it too.
+ *   they armed and left pending fails it too. Retry timers are the one
+ *   exception, by design: `stopAll` runs before the count, so a persona's
+ *   armed retry timer (in either mode) is stopped, not counted. That covers
+ *   the pending-only timer every successful launch leaves armed (b.jg5
+ *   SRJ-301, SRJ-409), which a case need not stop; a case asserts it with
+ *   `expectPendingOnlyWatch(h, key)` (or reads `controller.view(key)`, whose
+ *   `mode` and `causes` are the timer's mode and recorded cause kinds), and
+ *   one that wants it gone mid-case stops it with `controller.stop(key,
+ *   reason)` (shown in `stops`). Every other pending timer (an approver's
+ *   timer left by a case, a kill's wait, a sequence or old-life wait timer,
+ *   an episode's alert check) still fails it.
  *
  * Shared case helpers, each over a harness: `personaOf` (a configured
  * persona), `personaRow` (a persona's own row as a `get` reads it, with
@@ -759,7 +795,9 @@
  * launch start, so a `pending` row is waited on no longer), `unavailableAt`
  * (an UNAVAILABLE answer of a verb), `expectUntouched` (a persona left
  * alone: no trigger, timer, notice, outage flag or call),
- * `expectLostMessageReports` (lose one message through the driver
+ * `expectPendingOnlyWatch` (a persona's retry timer armed and waiting in
+ * pending-only mode with the pending-row cause, and its pending-row trigger
+ * recorded), `expectLostMessageReports` (lose one message through the driver
  * and assert its state, its stub calls, by default none in states 1 to 5 and
  * one `status` of the persona's instance after them, and no restart asked
  * for or pending unless `restartRequested`; resolves with the outcome), `collided` (the stub answers of a launch whose optimistic spawn
@@ -816,8 +854,12 @@
  * `persona-kill-failed` entry, no alert text) and
  * `killFailureStoppedEntryLine`.
  *
- * Pending-only mode is armed directly (`controller.armPendingOnly`) until
- * covered `pending` rows exist. Later work extends this harness in place.
+ * Pending-only mode is armed by production paths on the harness (b.jg5
+ * SRJ-301, SRJ-409, SRJ-411): a successful launch, a launch's
+ * `ErrTmuxSessionCreate`, the collision ladder's `pending` branch, the
+ * restart path's `pending` deferral and a pending-only retry's read-and-step,
+ * each through the trigger sink except the retry's own re-arm; a case may
+ * still arm it directly (`controller.armPendingOnly`).
  *
  * Launch starts (b.jg5 SRJ-513): every `pending` row the harness scripts
  * (`rowReadsUntilSpawn`, and a case's own `cannedStatusResult`,
@@ -952,6 +994,7 @@ import {
   _buildKillSessionAdapter,
   _buildReconnectSessionAdapter,
   armMissingTmuxUnavailableRetry,
+  deferPendingRow,
   type TmuxUnavailableRetryDeps,
 } from '../../src/server.ts'
 import {
@@ -987,6 +1030,7 @@ import {
   personaRetryBlockCause,
   readPersonaRowState,
   reconcileOrphans,
+  retryPendingRowStep,
   setConfiguredPersonaQuery,
   setConflictLatch,
   setInvalidFlagsHold,
@@ -1039,8 +1083,10 @@ import {
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE,
+  UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
   UNAVAILABLE_RETRY_ROW_ABSENT,
   UNAVAILABLE_RETRY_RUN_NOW_HOLD_ENDED,
+  UNAVAILABLE_RETRY_STOP_CAPPED,
   UNAVAILABLE_RETRY_STOP_HELD,
   UNAVAILABLE_RETRY_STOP_LATCHED,
   UNAVAILABLE_RETRY_STOP_SHUTDOWN,
@@ -1744,6 +1790,12 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       tmuxUnresponsive.end(key, TMUX_UNRESPONSIVE_END_RETRY, reading)
       clearOutageFlag(key, 'tmux-unavailable', reading)
     },
+    // As main() binds it (b.jg5 SRJ-409, SRJ-411): a pending-only retry whose
+    // row read shows `pending` reads the applied persona's row once more and
+    // takes the one pending-row step: a covered or undecided row is armed
+    // pending-only and kept; one that is not covered starts the live-row
+    // sequence, with no launch or approver of the retry's own.
+    stepPendingRow: (key) => retryPendingRowStep(key, appliedPersona(key)),
   })
   let current: UnavailableRetryAction = options.action === 'scripted' ? scripted : (options.action ?? fullMode)
   const controller = createUnavailableRetryController({
@@ -1974,8 +2026,9 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       return controller.arm(key, cause)
     },
     // As the production sink (the controller) has it: a launch's
-    // `ErrTmuxSessionCreate` arms pending-only through it (b.jg5 SRJ-112,
-    // SRJ-113, SRJ-409), recorded with the cause it arms.
+    // `ErrTmuxSessionCreate`, a successful launch and the one pending-row
+    // step arm pending-only through it (b.jg5 SRJ-112, SRJ-113, SRJ-301,
+    // SRJ-409), recorded with the cause it arms.
     armPendingOnly(key) {
       triggers.push({ key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW })
       controller.armPendingOnly(key)
@@ -2157,15 +2210,17 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     isSessionAlive: isSessionAliveAdapter,
     isSessionConnected: (key) => connected.has(key),
     hasSessionStream: (key) => connected.has(key),
-    reconnectSession: _buildReconnectSessionAdapter(appliedPersona),
+    reconnectSession: _buildReconnectSessionAdapter(appliedPersona, undefined, appliedPersona),
     killSession: _buildKillSessionAdapter(appliedPersona, killRetryClock),
     // As main() binds it: the verdict an escalate-dead relaunch carries is
     // passed on unchanged, into the ladder (b.jg5 SRJ-611).
     launchSession: (key, _cwd, _sessionId, deadEvidence) => launchSession(key, appliedConfig(), { canLaunch: canRelaunch, deadEvidence }),
     getRestartDelay: () => config.session_restart_delay,
     isShuttingDown: () => shuttingDown,
-    // As main() binds it, after recording the key: the cap notice, then the
-    // silent end of the persona's unclassified-error episode, each isolated.
+    // As main() binds it, after recording the key: the cap notice, the
+    // silent end of the persona's unclassified-error episode, then the stop
+    // of its retry timer in either mode (b.jg5 SRJ-305; a real stop shows in
+    // `stops`), each isolated.
     onCapReached: (key) => {
       capReached.push(key)
       try {
@@ -2178,6 +2233,11 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       } catch {
         /* isolated, as in main() */
       }
+      try {
+        controller.stop(key, UNAVAILABLE_RETRY_STOP_CAPPED)
+      } catch {
+        /* isolated, as in main() */
+      }
     },
     serialize: serializer.run,
     // As main() binds it (b.jg5 SRJ-314, SRJ-301): every `unknown` liveness
@@ -2186,6 +2246,19 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     // trigger sink, so it is not recorded in `triggers`).
     armRetryTimer: (key) => {
       controller.arm(key, { kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR })
+    },
+    // As main() binds it (b.jg5 SRJ-314, SRJ-409, SRJ-411): a restart run
+    // whose liveness reads `pending` (its first probe or the re-probe) hands
+    // the reading to the server's `pending` deferral, awaited, with its launch
+    // start, over the harness's applied-persona lookup. For an applied persona
+    // the deferral takes the session manager's read-and-step: one `get`, then
+    // a covered or undecided row armed pending-only (through the trigger
+    // sink, so in `triggers`) or an uncovered one sent through the live-row
+    // sequence, with the deferral's per-answer lines (row no longer pending,
+    // gone, refused) in `errors`; a step that throws is logged there and the
+    // deferral still answers `pending`.
+    deferPendingRow: async (key, reading) => {
+      await deferPendingRow(key, reading.launchStartedAt, appliedPersona)
     },
     // As main() binds it (b.jg5 SRJ-502): a latched persona's restart work
     // makes no agent-director call.
@@ -3106,6 +3179,21 @@ export function expectUntouched(h: RecoveryHarness, other: string): void {
   const otherId = personaInstanceId(other)
   const calls = Object.values(h.stub.calls).flat() as Array<{ claude_instance_id?: unknown }>
   expect(calls.filter((params) => params?.claude_instance_id === otherId)).toEqual([])
+}
+
+/**
+ * Persona `key`'s retry timer watches a `pending` row (b.jg5 SRJ-301,
+ * SRJ-409): armed and waiting in pending-only mode with the pending-row
+ * cause among its recorded causes, and a pending-row trigger recorded for it
+ * (the trigger sink's pending-only arm). A timer already in full mode keeps
+ * its mode on a pending-only arm, so a case expecting that reads
+ * `controller.view(key)` itself.
+ */
+export function expectPendingOnlyWatch(h: RecoveryHarness, key: string): void {
+  const view = h.controller.view(key)
+  expect(view).toMatchObject({ phase: 'waiting', mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY })
+  expect(view?.causes).toContain(UNAVAILABLE_RETRY_CAUSE_PENDING_ROW)
+  expect(h.triggers).toContainEqual({ key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW })
 }
 
 /** States 1 to 5 of SRJ-1011: those that apply before the lost-message row read is made. */

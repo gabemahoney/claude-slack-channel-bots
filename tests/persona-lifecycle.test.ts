@@ -257,6 +257,7 @@ import {
   createUnavailableRetryController,
   runInAttempt,
   UNAVAILABLE_RETRY_CAUSE_CONFIG,
+  UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
   UNAVAILABLE_RETRY_STOP_SHUTDOWN,
   UNAVAILABLE_RETRY_STOP_TORN_DOWN,
@@ -1239,7 +1240,11 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
   // real retry controller on its fake clock and the real launch, its spawn
   // held, then answering UNAVAILABLE inside its attempt; the teardown's
   // retry-timer stop and its wait for the launch bound as main() binds them.
-  test('b.jg5 SRJ-715: P\'s launch in flight meets UNAVAILABLE after the teardown\'s first retry-timer stop and arms P\'s timer; the stop once that launch settled clears it, so no timer is armed for P when the teardown completes; Q\'s timer stays armed', async () => {
+  test.each<[string, (spawns: ReturnType<typeof holdSpawns>, id: string) => void, string]>([
+    ['meets UNAVAILABLE', (spawns, id) => spawns.fail(id, errTmuxUnresponsive('spawn')), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+    // b.jg5 SRJ-301, SRJ-409: a launch that returned success arms P's pending-only watch.
+    ['succeeds (its pending-only watch)', (spawns, id) => spawns.release(id), UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
+  ])('b.jg5 SRJ-715: P\'s launch in flight %s after the teardown\'s first retry-timer stop and arms P\'s timer; the stop once that launch settled clears it, so no timer is armed for P when the teardown completes; Q\'s timer stays armed', async (_label, settle, cause) => {
     const h = makeRecoveryHarness()
     cleanups.push(() => {
       try {
@@ -1275,13 +1280,13 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     expect(f.trail.at(-1)).toBe(`whenLaunchSettled:${p}`)
     expect(h.controller.isArmed(p)).toBe(false)
 
-    spawns.fail(personaInstanceId(p), errTmuxUnresponsive('spawn'))
+    settle(spawns, personaInstanceId(p))
     await launch
     await done
     await h.settle()
 
     // The launch armed P's timer as it settled; the stop right after the wait found it armed and stopped it.
-    expect(h.triggers).toContainEqual({ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE })
+    expect(h.triggers).toContainEqual({ key: p, kind: cause })
     const settledAt = f.trail.indexOf(`whenLaunchSettled:${p}`)
     const stops = f.trail.filter((c) => c.startsWith(`stopRetryTimer:${p}:`))
     expect(stops.filter((c) => c.endsWith(':armed'))).toEqual([`stopRetryTimer:${p}:armed`])

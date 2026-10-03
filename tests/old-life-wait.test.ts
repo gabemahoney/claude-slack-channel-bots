@@ -347,6 +347,7 @@ import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import {
   adConfigMalformedRaiseLines,
   launchThroughSequence,
+  expectPendingOnlyWatch,
   makeRecoveryHarness,
   ownRowsLiveThenMissing,
   pastSampleGrace,
@@ -1019,6 +1020,10 @@ describe('b.jg5 SRJ-809, SRJ-806: a reuse that begins the key\'s new life ends i
     expect(h.retiredEntry(p).marked).toBe(true)
     expect(holdsOf(h)).toEqual([fieldsOf(bHold)])
     expect(endedLinesIn(h.errors)).toEqual([oldLifeHoldEndedLine(pHold, OLD_LIFE_HOLD_END_NEW_LIFE, OLD_LIFE_NEW_LIFE_READ)])
+    // The reuse that began the new life left P's timer armed pending-only for its row (b.jg5 SRJ-301, SRJ-409); B has none.
+    expectPendingOnlyWatch(h, p)
+    expect(h.controller.armedKeys()).toEqual([p])
+    h.controller.stop(p, 'the case is over')
   })
 })
 

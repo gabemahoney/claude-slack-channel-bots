@@ -221,11 +221,14 @@ import {
   errTmuxKillFailed,
   errTmuxSessionConflict,
   errTmuxUnresponsive,
+  SAMPLE_LAUNCH_START_DEFAULT,
   stubCallCount,
   type FindMissingHold,
   type StubClientOptions,
 } from './test-helpers/agent-director-stub.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
+import { adGraceMsInEffect } from '../src/ad-settings.ts'
+import { parseLaunchStart } from '../src/pending-row.ts'
 import { KILL_RETRY_SPACING_MS, KILL_RETRY_TRIES } from '../src/kill-retry.ts'
 import {
   KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN,
@@ -3997,6 +4000,94 @@ describe('b.jg5 SRJ-808, SRJ-715: step 1 stops each recorded key\'s approver bef
     alphaUntouched()
     expect(callsOnSince(run, personaInstanceId(h.key('alpha')), adFrom)).toEqual([])
     expect(run.clock.pendingCount()).toBe(0)
+    expectNoPostNoLeak(run)
+  })
+
+  // b.jg5 SRJ-411's Test line (AC 35), its destructive-modify leg: the case above with bravo's row `pending` (its
+  // launch's, its approver polling it), a same-key old life (a credentials_file change, so SRJ-810's same-key
+  // exception leaves the new half to the retired-key rule). The sequence's step-1 kill succeeds but leaves the
+  // worker's row `pending`, so its step-2 wait holds it until G past the old life's launch start; the old life ends
+  // meanwhile, and the step-6 reuse begins the new life. The mismatch leg is tests/live-row-sequence.test.ts's.
+  test("SRJ-411: a destructive modify of bravo's credentials_file while its own row reads pending, its approver polling it, whose teardown kill fails after its tries: step 1 stops the approver; nothing is typed into the old life; the new half's launch sends it through the live-row sequence with the retired-key flag, whose run waits until G past the old life's launch start; then one reuse begins the new life (real launch)", async () => {
+    const approverClock = createFakeClock()
+    const killQueue: KillQueue = []
+    const findMissingQueue: FindMissingQueue = []
+    const bravoKey = h.key('bravo')
+    const bravoId = personaInstanceId(bravoKey)
+    const bravoRef = renderPersonaRef('bravo', bravoKey)
+    const { run, personas } = await running(['alpha', 'bravo'], {
+      ...REAL_LAUNCH,
+      approverClock,
+      leaveSpawnsPending: (id) => id === bravoId,
+      // A kill that succeeds does not end the old life's worker: its row stays as it was.
+      killLeavesRowLive: (id) => id === bravoId,
+      agentDirector: { killQueue, findMissingQueue },
+    })
+    const [alpha, bravo] = personas
+    await until(() => approverCallsSince(run, bravoId, 0).some((c) => c.verb === 'readPane'))
+    expect(h.rowOf('bravo')).toMatchObject({ state: 'pending', cwd: bravo!.working_directory, launchStartedAt: SAMPLE_LAUNCH_START_DEFAULT })
+    const stopped = _whenDialogApproverStopped(bravoKey)
+    const deadline = parseLaunchStart(SAMPLE_LAUNCH_START_DEFAULT)! + adGraceMsInEffect()
+    killQueue.push(...failedKills())
+    const moved = movedCredentials(bravo!)
+    const alphaUntouched = watchUntouched(run, 'alpha')
+    const instanceFrom = run.composition!.instanceCallsOf('bravo').length
+
+    const { applying } = await confirmConfig(run, [alpha!, moved])
+    await driveTeardownKillTries(run, KILL_RETRY_TRIES)
+    await applying
+
+    // Step 1 stopped the old life's approver with the retired-key reason, before the teardown.
+    expect(await stopped).toMatchObject({ reason: APPROVER_STOP_RETIRED_KEY })
+    const afterStop = run.approverStops[0]!.agentDirectorCalls!
+    // The new half's reuse collided with the pending old life; its sequence killed it (the row stays pending) and read it, and waits.
+    await until(() => callsOnSince(run, bravoId, afterStop).length === 9)
+    expect(run.sequenceRunning('bravo')).toBe(true)
+    expect(launchesOf(run, 'bravo').at(-1)).toEqual({ op: 'launch', key: bravoKey, via: 'apply', action: 'sequence-waiting' })
+    const beforeDeadline = [
+      'kill ErrTmuxKillFailed',
+      'status ok',
+      'kill ErrTmuxKillFailed',
+      'status ok',
+      'kill ErrTmuxKillFailed',
+      'spawn ErrInstanceIdCollision',
+      'get ok',
+      'kill ok',
+      'get ok',
+    ]
+    expect(callsOnSince(run, bravoId, afterStop)).toEqual(beforeDeadline)
+    // Never early: one tick before G past the launch start, no run and no launch.
+    const runsBefore = run.composition!.agentDirector.findMissingCalls.length
+    await run.clock.advanceTo(deadline - 1)
+    await turns()
+    expect([callsOnSince(run, bravoId, afterStop), run.composition!.agentDirector.findMissingCalls.length]).toEqual([beforeDeadline, runsBefore])
+
+    // At G the run lists the old life's row in its ids (agent-director marks it missing), the get reads it so, and the reuse follows.
+    findMissingQueue.push(cannedOk(cannedFindMissing({ rows: { [bravoId]: 'ids' } })))
+    h.seedRow(bravo!, { state: 'missing' })
+    await run.clock.advanceTo(deadline)
+    await until(() => !run.sequenceRunning('bravo'))
+
+    const calls = callsOnSince(run, bravoId, afterStop)
+    const reuseAt = calls.indexOf('spawn ok')
+    expect(calls.slice(0, reuseAt + 1)).toEqual([...beforeDeadline, 'get ok', 'spawn ok'])
+    expect(run.composition!.agentDirector.findMissingCalls.length).toBe(runsBefore + 1)
+    // No lap and no Enter on the old life: nothing typed or read from its pane until the reuse began the new life.
+    expect(calls.slice(0, reuseAt).filter((call) => call.startsWith('sendKeys') || call.startsWith('readPane'))).toEqual([])
+    // The reuse is the sequence's final launch, made once, from the new declaration; it sets the mark and ends the hold.
+    expect(instanceCallsSince(run, 'bravo', instanceFrom)).toEqual([
+      'kill ErrTmuxKillFailed',
+      'kill ErrTmuxKillFailed',
+      'kill ErrTmuxKillFailed',
+      'reuse-spawn ErrInstanceIdCollision',
+      'kill ok',
+      'reuse-spawn ok',
+    ])
+    expect(run.logs.filter((l) => l === liveRowSequenceLaunchLine(bravoRef, { kind: LIVE_ROW_LAUNCH_REUSE, reason: LIVE_ROW_LAUNCH_REASON_RETIRED_KEY }))).toHaveLength(1)
+    expect(lastSpawnOf(run, 'bravo')).toMatchObject({ id: bravoId, reuse: true, cwd: bravo!.working_directory })
+    expect(markWrittenLines(run, bravoKey)).toHaveLength(1)
+    expect(run.oldLifeHolds.snapshot()).toEqual([])
+    alphaUntouched()
     expectNoPostNoLeak(run)
   })
 })

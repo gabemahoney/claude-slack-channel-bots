@@ -152,6 +152,7 @@ import { personaInstanceId } from '../src/persona-identity.ts'
 import {
   UNAVAILABLE_RETRY_CAUSE_CONFIG,
   UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
+  UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
 } from '../src/unavailable-retry.ts'
 import {
   HOLD_LATCH_CASES,
@@ -238,6 +239,7 @@ import {
 } from '../src/session-manager.ts'
 import {
   expectLostMessageReports,
+  expectPendingOnlyWatch,
   holdSequenceReuse,
   launchThroughSequence,
   makeRecoveryHarness,
@@ -264,8 +266,10 @@ import {
   noteOldLifeRowRead,
   readPersonaOwnRow,
   SPAWN_ACTION_FRESH_RETIRED,
+  uncoveredPendingRowLine,
 } from '../src/session-manager.ts'
-import { LIVE_ROW_LAUNCH_REASON_RETIRED_KEY, LIVE_ROW_LAUNCH_REUSE, LIVE_ROW_OUTCOME_LAUNCHED } from '../src/live-row-sequence.ts'
+import { LIVE_ROW_LAUNCH_REASON_RETIRED_KEY, LIVE_ROW_LAUNCH_REUSE, LIVE_ROW_OUTCOME_LAUNCHED, liveRowSequenceStartLine } from '../src/live-row-sequence.ts'
+import { PENDING_ROW_REASON_CWD_MISMATCH, PENDING_ROW_REASON_RETIRED_OLD_LIFE, type PendingRowNotCoveredReason } from '../src/pending-row.ts'
 import { latchRowStateRead } from '../src/conflict-latch.ts'
 import { PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
 import { LIVENESS_STATUS_SITE } from '../src/server.ts'
@@ -1311,6 +1315,25 @@ function expectNothingRaisedOrArmed(h: RecoveryHarness, key: string): void {
   expect(h.clock.pendingCount()).toBe(0)
 }
 
+/**
+ * Nothing raised for `key`, and the one thing armed is the pending-only watch
+ * a successful launch leaves on its new row (b.jg5 SRJ-301, SRJ-409): no
+ * outage flag, no condition, no episode; the timer waiting in pending-only
+ * mode with only the pending-row cause, on the fake clock's one timer; and
+ * `pendingRowArms` pending-row triggers (the launch's, plus one for each
+ * approver stop that arms), no other.
+ */
+function expectOnlyThePendingOnlyWatch(h: RecoveryHarness, key: string, pendingRowArms: number): void {
+  expect([...getOutageFlags(key)]).toEqual([])
+  expect(h.triggers).toEqual(Array.from({ length: pendingRowArms }, () => ({ key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW })))
+  expectPendingOnlyWatch(h, key)
+  expect(h.controller.view(key)?.causes).toEqual([UNAVAILABLE_RETRY_CAUSE_PENDING_ROW])
+  expect(h.controller.armedKeys()).toEqual([key])
+  expect(h.tmuxUnresponsive.holds(key)).toBe(false)
+  expect(h.unclassifiedErrorOpen(key)).toBe(false)
+  expect(h.clock.pendingCount()).toBe(1)
+}
+
 describe('b.jg5 SRJ-1011 through the recovery harness: the read is the liveness adapter\'s one `status`, outside any attempt', () => {
   test('AC 68: a spawn held open, and then P’s dialog approver running after the launch returned (the row `pending`, a dialog shown), each report session starting with no `status` call from the routing and no restart; Q beside it makes its read', async () => {
     const h = makeRecovery()
@@ -1341,15 +1364,20 @@ describe('b.jg5 SRJ-1011 through the recovery harness: the read is the liveness 
     // Q has no approver: its message makes its one read, which finds its row `pending`.
     await expectLostMessageReports(h, other, 'session-starting')
 
+    // The launch's pending-only watch, and the cap stop's arm over the row
+    // still `pending` (b.jg5 SRJ-404, SRJ-409); nothing else.
     expect(await h.runApproverToStop(key)).toMatchObject({ reason: APPROVER_STOP_CAP })
-    expectNothingRaisedOrArmed(h, key)
+    expectOnlyThePendingOnlyWatch(h, key, 2)
   })
 
-  test.each<[string, string, RecoveryRowState, ApproverStopReason, LostMessageState]>([
-    ['its stop entry', 'the row still `pending`', AGENT_DIRECTOR_PENDING_STATE, APPROVER_STOP_TEARDOWN, 'session-starting'],
-    ['its ready cap', 'the row still `pending`', AGENT_DIRECTOR_PENDING_STATE, APPROVER_STOP_CAP, 'session-starting'],
-    ['a lap that reads the row live', 'the row live', 'waiting', APPROVER_STOP_LIVE, 'auto-restart-disabled'],
-  ])('AC 68: after P’s dialog approver stopped at %s, %s, the next lost message makes exactly one `status` call and reports %s, with no restart and no spawn', async (_how, _row, state, reason, lostState) => {
+  // The launch leaves its pending-only watch (b.jg5 SRJ-301, SRJ-409); the
+  // cap stop over a row still `pending` arms it once more, the teardown stop
+  // and a stop on a live row never do (b.jg5 SRJ-404).
+  test.each<[string, string, RecoveryRowState, ApproverStopReason, LostMessageState, number]>([
+    ['its stop entry', 'the row still `pending`', AGENT_DIRECTOR_PENDING_STATE, APPROVER_STOP_TEARDOWN, 'session-starting', 1],
+    ['its ready cap', 'the row still `pending`', AGENT_DIRECTOR_PENDING_STATE, APPROVER_STOP_CAP, 'session-starting', 2],
+    ['a lap that reads the row live', 'the row live', 'waiting', APPROVER_STOP_LIVE, 'auto-restart-disabled', 1],
+  ])('AC 68: after P’s dialog approver stopped at %s, %s, the next lost message makes exactly one `status` call and reports %s, with no restart and no spawn; only the launch’s pending-only watch is armed', async (_how, _row, state, reason, lostState, pendingRowArms) => {
     // A cap past the pace, so a second lap reads the row before it.
     const h = makeRecovery({ approverCapMs: 2 * DIALOG_POLL_INTERVAL_MS })
     const [key] = h.keys as [string]
@@ -1367,7 +1395,7 @@ describe('b.jg5 SRJ-1011 through the recovery harness: the read is the liveness 
     await expectLostMessageReports(h, key, lostState)
     expect(isRestartPendingOrActive(key)).toBe(false)
     expect(h.stub.calls.spawnCalls).toHaveLength(spawnsBefore)
-    expectNothingRaisedOrArmed(h, key)
+    expectOnlyThePendingOnlyWatch(h, key, pendingRowArms)
   })
 
   test('with `session_restart_delay` above 0, a routing read that fails reports starting now; the restart path\'s own read then finds the row `pending` and spawns nothing', async () => {
@@ -1554,6 +1582,75 @@ describe('b.jg5 SRJ-805: a message lost for a retired key asks for a restart tha
       reason: LIVE_ROW_LAUNCH_REASON_RETIRED_KEY,
       result: { key, action: SPAWN_ACTION_FRESH_RETIRED },
     })
+    expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls, h.stub.calls.sendKeysCalls]).toEqual([[reuseSpawnOf(h, key)], [], []])
+    await h.runApproverToStop(key)
+  })
+})
+
+// ===========================================================================
+// b.jg5 SRJ-409, SRJ-411 at the lost-message trigger (hatch note E22): a
+// message lost for P asks for P's restart, whose own liveness read finds P's
+// row `pending` and hands it to the deferral, bound as main() binds it over
+// the harness's applied persona; the deferral reads the row once (`get`). A
+// covered row (P's own directory and labels, a launch start) arms P's retry
+// timer in pending-only mode, with no kill, launch or keystroke. A row that
+// is not covered (another working directory, or a retired key's old life
+// with no mark) is sent through the live-row sequence, the conversation not
+// kept, with nothing typed into the row; the sequence, held at its first
+// bypassing run, then ends in one reuse of P's id. The routing's own read
+// fails (UNCLASSIFIED), so the message reports starting now and asks for
+// the restart; on the recovery harness, at a short `session_restart_delay`
+// so the asked-for restart runs.
+// ===========================================================================
+
+describe('b.jg5 SRJ-409, SRJ-411: a message lost for P whose restart reads P\'s row pending', () => {
+  /** A harness whose routing read of P fails and whose restart read finds P's row `pending`; P's `get`s answer `row`, then `missing`. */
+  function build(row: (h: RecoveryHarness, key: string) => CannedGetResult, retired = false): { h: RecoveryHarness; key: string; ref: string } {
+    const h = makeRecovery({ sessionRestartDelay: FAST_DELAY_S })
+    const [key] = h.keys as [string]
+    if (retired) h.retireKey(key)
+    let gets = 0
+    h.script({
+      statusQueue: [cannedErr(errInternal()), cannedOk(cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }))],
+      getFn: () => (gets++ === 0 ? row(h, key) : personaRow(h, key, { state: LIVENESS_DEAD_ROW_MISSING })),
+    })
+    return { h, key, ref: renderPersonaRef(personaOf(h, key).name, key) }
+  }
+
+  const PENDING_ROW = (h: RecoveryHarness, key: string) => personaRow(h, key, { state: AGENT_DIRECTOR_PENDING_STATE })
+
+  test('a covered row: the message reports starting now; its restart reads the row once and arms P pending-only, with no kill, launch or keystroke; nothing raised', async () => {
+    const { h, key } = build(PENDING_ROW)
+
+    await expectLostMessageReports(h, key, 'starting-now', { restartRequested: true })
+    await waitFor(() => !isRestartPendingOrActive(key), 1000)
+
+    expect(h.stub.calls.statusCalls).toHaveLength(2)
+    expect(h.stub.calls.getCalls).toHaveLength(1)
+    expect([h.stub.calls.killCalls, h.stub.calls.spawnCalls, h.stub.calls.resumeCalls, h.stub.calls.sendKeysCalls]).toEqual([[], [], [], []])
+    expect(h.sequenceRunning(key)).toBe(false)
+    expectOnlyThePendingOnlyWatch(h, key, 1)
+  })
+
+  test.each<[string, PendingRowNotCoveredReason, (h: RecoveryHarness, key: string) => CannedGetResult, boolean]>([
+    ['in another working directory', PENDING_ROW_REASON_CWD_MISMATCH, (h, key) => personaRow(h, key, { state: AGENT_DIRECTOR_PENDING_STATE, cwd: h.home }), false],
+    ['a retired key\'s old life (recorded with no mark)', PENDING_ROW_REASON_RETIRED_OLD_LIFE, PENDING_ROW, true],
+  ])('a row not covered, %s: its restart sends it through the live-row sequence with the reason\'s line, types nothing into it and launches nothing itself; the sequence ends in one reuse of P\'s id', async (_label, reason, row, retired) => {
+    const { h, key, ref } = build(row, retired)
+    const hold = holdFindMissing(h.stub.client)
+
+    await expectLostMessageReports(h, key, 'starting-now', { restartRequested: true })
+    await waitFor(() => !isRestartPendingOrActive(key), 1000)
+    await h.driveSequence(hold.entered(1))
+
+    expect(h.errors).toContain(uncoveredPendingRowLine(ref, reason))
+    expect(h.lines).toContain(liveRowSequenceStartLine(ref, h.sequenceRequest(key, { lastReadState: AGENT_DIRECTOR_PENDING_STATE, retiredKey: retired })))
+    expect(h.sequenceRunning(key)).toBe(true)
+    expect([h.stub.calls.sendKeysCalls, h.stub.calls.spawnCalls, h.stub.calls.resumeCalls]).toEqual([[], [], []])
+    expect(h.triggers).toEqual([])
+
+    hold.release(cannedFindMissing({ rows: { [personaInstanceId(key)]: 'ids' } }))
+    expect(await h.driveSequence(h.sequenceSettled(key))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE, result: { key } })
     expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls, h.stub.calls.sendKeysCalls]).toEqual([[reuseSpawnOf(h, key)], [], []])
     await h.runApproverToStop(key)
   })

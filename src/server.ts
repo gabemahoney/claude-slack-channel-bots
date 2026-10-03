@@ -124,8 +124,14 @@ import {
   notifyRestartCapReached,
   PROMPT_ROW_STATES,
   readPersonaOwnPane,
+  readAndStepPendingRow,
   readPersonaRowState,
   reconcileOrphans,
+  retryPendingRowStep,
+  PENDING_ROW_STEP_LATCHED,
+  PENDING_ROW_STEP_NO_ROW,
+  PENDING_ROW_STEP_NOT_PENDING,
+  PENDING_ROW_STEP_REFUSED,
   reconnectMcpWithCause,
   retiredKeyReadingOf,
   setConfigDirUnresolvableHook,
@@ -213,7 +219,7 @@ import {
 } from './live-row-sequence.ts'
 import { KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN, KILL_FAILURE_CONTEXT_RECOVERY } from './kill-failure-alert.ts'
 import { resolveSlackApiUrlOverride } from './persona-slack-clients.ts'
-import { createUnhandledRejectionHandler, describeThrownValue } from './persona-connection-errors.ts'
+import { createUnhandledRejectionHandler, describeThrownValue, renderLogMessageText } from './persona-connection-errors.ts'
 import { createPersonaEventRouter } from './persona-event-router.ts'
 import {
   composePersonaStatusListeners,
@@ -293,6 +299,7 @@ import {
   UNAVAILABLE_RETRY_RUN_NOW_HOLD_ENDED,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE,
+  UNAVAILABLE_RETRY_STOP_CAPPED,
   UNAVAILABLE_RETRY_STOP_HELD,
   UNAVAILABLE_RETRY_STOP_LATCHED,
   UNAVAILABLE_RETRY_STOP_SHUTDOWN,
@@ -2010,10 +2017,14 @@ export function _buildKillSessionAdapter(
  * b.dup — a row agent-director will not type into. agent-director refuses
  * send-keys to a row that is not interactive (`ErrSpawnNotInteractive`):
  *   - `pending` (its session has not started; SessionStart has not fired) →
- *     defer ('pending'), typing nothing (`deferPendingRow`, passed the row's
- *     raw launch start when the result showed one, b.jg5 SRJ-115): the
- *     keystrokes would be refused, and the session connects its MCP servers
- *     on its own once it starts. The restart work hands a row its liveness
+ *     defer ('pending'), typing nothing (`deferPendingRow`, awaited, passed
+ *     the row's raw launch start when the result showed one, b.jg5 SRJ-115):
+ *     the keystrokes would be refused, and the session connects its MCP
+ *     servers on its own once it starts. The deferral decides whether the
+ *     row is covered (b.jg5 SRJ-409, SRJ-411): a covered row arms the
+ *     persona's retry timer in pending-only mode; a retired key's old life
+ *     before its new life, or a `cwd` or `config_dir` mismatch, goes through
+ *     the live-row sequence, with no `/mcp reconnect` typed. The restart work hands a row its liveness
  *     probe reads `pending` to `deferPendingRow` itself, before it would
  *     call this adapter (b.jg5 SRJ-314); this branch covers a row the probe
  *     read `live` that reads `pending` by this second read. restart.ts
@@ -2096,7 +2107,9 @@ export function _buildKillSessionAdapter(
  * 'transient', never counted (`replaceOwnRowOldLife`). The health tick, the
  * lost-message trigger and the retry timer's full-mode rerun all reach it
  * through the restart path. With the mark set the live row is the new life
- * and is reconnected as below; a `pending` row keeps the `pending` deferral.
+ * and is reconnected as below; a `pending` row goes to the `pending`
+ * deferral, which sends an unmarked key's old life through the live-row
+ * sequence under the uncovered-row rule (b.jg5 SRJ-411).
  *
  * b.jg5 SRJ-810 — never type into a held old life. The same path serves a
  * key that is not recorded whose own row `cscb_<key>` is held for an old
@@ -2138,12 +2151,16 @@ export function _buildKillSessionAdapter(
  *   read.
  * @param isLatched  The latched query (production: the server's latch's
  *   `isLatched`); absent, no persona is latched here.
+ * @param appliedPersona  The applied-persona lookup `deferPendingRow` reads
+ *   for a `pending` row (default `getAppliedPersona`, the server's applied
+ *   config; a caller outside `main()` passes its own).
  * @internal
  */
 export function _buildReconnectSessionAdapter(
   getPersona?: (key: string) => Persona | undefined,
   isLatched?: (key: string) => boolean,
-): (key: string) => Promise<'success' | ReconnectEscalateDead | 'transient' | 'pending'> {
+  appliedPersona: (key: string) => Persona | undefined = getAppliedPersona,
+):(key: string) => Promise<'success' | ReconnectEscalateDead | 'transient' | 'pending'> {
   // `key` is the persona key.
   return async (key: string) => {
     let state: string
@@ -2199,7 +2216,7 @@ export function _buildReconnectSessionAdapter(
     } else if (PROMPT_ROW_STATES.has(state)) {
       return promptRowReconnectVerdict(key, state, latchedNow)
     } else if (state === 'pending') {
-      return deferPendingRow(key, launchStartedAt)
+      return await deferPendingRow(key, launchStartedAt, appliedPersona)
     } else if (state === 'waiting') {
       const check = await checkWaitingRowPane(key, latchedNow)
       // b.f2b: its pane shows a running turn or a prompt, or the read latched
@@ -2699,44 +2716,106 @@ function deferPromptRow(key: string, state: string): 'transient' {
 export const LAUNCH_START_LOG_RE = /^[0-9TZ:.+-]{1,40}$/
 
 /**
- * The `pending` deferral for persona `key` (b.dup; b.jg5 SRJ-314, and the
- * entry point of SRJ-409's pending-row handling): its row reads `pending`, so
- * its session has not started. agent-director would refuse keystrokes to it
- * (`ErrSpawnNotInteractive`, which the reconnect answers as `dead-session`
- * with cause `row-not-interactive`, a route into the restart path's decision
- * only, b.jg5 SRJ-609), and the session connects its MCP servers on its own once it starts. Two
- * callers reach it: the restart work, through `RestartDeps.deferPendingRow`
- * (bound in `main()`), when its liveness probe reads `pending`, whatever the
- * session's connection shows; and the reconnect adapter, when its own
- * `status` read finds the row `pending` (see `_buildReconnectSessionAdapter`).
- * `launchStartedAt` is the row's launch start as that `status` result showed
- * it (raw, never parsed or aged here; b.jg5 SRJ-115, SRJ-406), absent when it
- * showed none. Types nothing, kills and launches nothing, counts nothing and
- * raises no notice (a launch whose session never leaves `pending` raises its
- * own, from its dialog approver); logs the deferral, naming the launch start
- * when one was read and it passes `LAUNCH_START_LOG_RE` (anything else is left
- * out of the line; the value itself stays as carried), and returns 'pending',
- * a deferral like 'transient'. A later tick or retry reads the row again.
+ * `deferPendingRow`'s first line for persona `key` (b.dup; b.jg5 SRJ-409),
+ * naming the launch start `launchStartedAt` only when it passes
+ * `LAUNCH_START_LOG_RE` (anything else is left out):
  *
- * b.jg5 SRJ-513: a configured persona's own `pending` row with no launch
- * start never reaches it from either caller: the `status` read that found
- * it applied the own-row `status` step, which latched the persona first (the
- * liveness probe then reads `unknown`, and the reconnect adapter answers
- * 'transient'). A row under a key no configured persona uses latches nothing
- * and still reaches it, with no launch start to name.
+ *   [slack] Deferring persona=<key>: its row reads pending[ (launch started <ts>)] — its session has not started (SessionStart has not fired) and agent-director refuses send-keys until it does; no reconnect typed, nothing counted; the restart path defers the pending row to the pending-row step, whose own lines say what follows (b.dup; b.jg5 SRJ-409)
+ *
+ * It says only what the deferral itself does: the pending-row step decides
+ * whether the row is armed, left undecided or sent through the live-row
+ * sequence, and logs that. Pure. Exported for tests.
+ *
+ * @internal
+ */
+export function deferringPendingRowLine(key: string, launchStartedAt?: string): string {
+  const launch =
+    typeof launchStartedAt === 'string' && LAUNCH_START_LOG_RE.test(launchStartedAt)
+      ? ` (launch started ${launchStartedAt})`
+      : ''
+  return `[slack] Deferring persona=${key}: its row reads pending${launch} — its session has not started (SessionStart has not fired) and agent-director refuses send-keys until it does; no reconnect typed, nothing counted; the restart path defers the pending row to the pending-row step, whose own lines say what follows (b.dup; b.jg5 SRJ-409)`
+}
+
+/**
+ * The `pending` deferral for persona `key` (b.dup; b.jg5 SRJ-314, SRJ-409,
+ * SRJ-411): its row reads `pending`, so its session has not started.
+ * agent-director would refuse keystrokes to it (`ErrSpawnNotInteractive`,
+ * which the reconnect answers as `dead-session` with cause
+ * `row-not-interactive`, a route into the restart path's decision only,
+ * b.jg5 SRJ-609), and the session connects its MCP servers on its own once
+ * it starts. Two callers reach it, both inside the restart work's recovery
+ * attempt and awaiting it: the restart work, through
+ * `RestartDeps.deferPendingRow` (bound in `main()`), when its liveness probe
+ * or b.d61's re-probe reads `pending`, whatever the session's connection
+ * shows; and the reconnect adapter, when its own `status` read finds the
+ * row `pending` (see `_buildReconnectSessionAdapter`). `launchStartedAt` is
+ * the row's launch start as that `status` result showed it (raw, never
+ * parsed or aged here; b.jg5 SRJ-115, SRJ-406), absent when it showed none.
+ *
+ * It logs the deferral (`deferringPendingRowLine`), naming the launch start
+ * when one was read and it passes `LAUNCH_START_LOG_RE` (anything else is
+ * left out of the line; the value itself stays as carried), then, for the
+ * applied persona with this
+ * key, runs the session manager's read-and-step entry
+ * (`readAndStepPendingRow`): one `get` of its own row through the shared
+ * own-row read, whose row supersedes the `status` read's, and the one
+ * pending-row step:
+ *   - covered, or undecided (a directory that cannot be resolved now): the
+ *     persona's retry timer is armed in pending-only mode (the controller's
+ *     armed line, cause `pending-row`); nothing typed, killed or launched;
+ *   - not covered (an unmarked retired key's old life, before its new life
+ *     has begun, b.jg5 SRJ-805; or a `cwd` or `config_dir` mismatch): one
+ *     start of the live-row sequence, with the conversation
+ *     not kept and alert context `recovery`; nothing typed and no approver;
+ *   - latched by the read (a provenance note, or the persona's own row with
+ *     no launch start, b.jg5 SRJ-513): nothing more; the latch's gates stop
+ *     later work;
+ *   - another state, no row, or a refused read: one line saying so; the
+ *     next run decides again.
+ * A persona that is not applied reads nothing more; `appliedPersona` is the
+ * applied-persona lookup that decides it (default `getAppliedPersona`, the
+ * server's applied config; a caller outside `main()` passes its own). Answers
+ * 'pending' whatever the step did, a deferral like 'transient': nothing is
+ * counted and no notice is raised (a launch whose session never leaves
+ * `pending` raises its own, from its dialog approver). A step that throws is
+ * logged and changes nothing about the answer.
  *
  * Exported for tests.
  *
  * @internal
  */
-export function deferPendingRow(key: string, launchStartedAt?: string): 'pending' {
-  const launch =
-    typeof launchStartedAt === 'string' && LAUNCH_START_LOG_RE.test(launchStartedAt)
-      ? ` (launch started ${launchStartedAt})`
-      : ''
-  console.error(
-    `[slack] Deferring persona=${key}: its row reads pending${launch} — its session has not started (SessionStart has not fired), agent-director refuses send-keys until it does, and it connects on its own once it starts; no reconnect, kill or launch, nothing counted (b.dup)`,
-  )
+export async function deferPendingRow(
+  key: string,
+  launchStartedAt?: string,
+  appliedPersona: (key: string) => Persona | undefined = getAppliedPersona,
+): Promise<'pending'> {
+  console.error(deferringPendingRowLine(key, launchStartedAt))
+  // A key that is not applied is not read again; its restart work stops on its own gates.
+  const persona = appliedPersona(key)
+  if (persona === undefined) return 'pending'
+  try {
+    const step = await readAndStepPendingRow(persona)
+    switch (step.kind) {
+      case PENDING_ROW_STEP_NOT_PENDING:
+        console.error(`[slack] Deferring persona=${key}: its row now reads ${renderLogMessageText(step.state)} — nothing more in this run; the next run decides (b.jg5 SRJ-409)`)
+        break
+      case PENDING_ROW_STEP_NO_ROW:
+        console.error(`[slack] Deferring persona=${key}: its row is gone (ErrSpawnNotFound) — nothing more in this run; the next run decides (b.jg5 SRJ-409)`)
+        break
+      case PENDING_ROW_STEP_REFUSED:
+        console.error(`[slack] Deferring persona=${key}: its row could not be read again (${describeThrownValue(step.error)}) — nothing more in this run; the next run decides (b.jg5 SRJ-409)`)
+        break
+      case PENDING_ROW_STEP_LATCHED:
+        // The shared read logged the latch; the latch's gates stop later work.
+        break
+      default:
+        // Covered or undecided: armed pending-only (the controller's line);
+        // not covered: the sequence started (the step's lines).
+        break
+    }
+  } catch (err) {
+    console.error(`[slack] Deferring persona=${key}: the pending-row step failed: ${describeThrownValue(err)} — nothing more in this run`)
+  }
   return 'pending'
 }
 
@@ -3458,6 +3537,12 @@ export async function main(): Promise<void> {
         tmuxUnresponsive.end(key, TMUX_UNRESPONSIVE_END_RETRY, reading)
         clearOutageFlag(key, 'tmux-unavailable', reading)
       },
+      // b.jg5 SRJ-409, SRJ-411: a pending-only retry whose row read shows
+      // `pending` reads the applied persona's row once more with `get` and
+      // decides whether it is covered: a covered or undecided row is armed
+      // pending-only and kept; one that is not covered goes through the
+      // live-row sequence, with no launch or approver of the retry's own.
+      stepPendingRow: (key) => retryPendingRowStep(key, getAppliedPersona(key)),
     }),
   })
   unavailableRetry = retryTimers
@@ -3979,6 +4064,9 @@ export async function main(): Promise<void> {
     // The persona's restart-cap notice (SR-25.3), built in the session
     // manager. b.jg5 SRJ-313: reaching the cap also ends the persona's
     // unclassified-error episode silently; each step is isolated.
+    // b.jg5 SRJ-305: reaching the cap stops the persona's retry timer at
+    // once, in either mode: a pending-only timer the counted launch failure
+    // that reached the cap armed is not left until its first retry.
     onCapReached: (key) => {
       try {
         notifyRestartCapReached(key)
@@ -3989,6 +4077,11 @@ export async function main(): Promise<void> {
         unclassifiedErrors.end(key, UNCLASSIFIED_ERROR_END_CAPPED)
       } catch {
         /* isolated: the cap notice is unaffected */
+      }
+      try {
+        retryTimers.stop(key, UNAVAILABLE_RETRY_STOP_CAPPED)
+      } catch {
+        /* isolated: the notice and the episode are unaffected */
       }
     },
     // b.av2 SR-6.6: a fired timer's work waits its turn behind any lifecycle
@@ -4001,13 +4094,16 @@ export async function main(): Promise<void> {
     armRetryTimer: (key) => {
       retryTimers.arm(key, { kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR })
     },
-    // b.jg5 SRJ-314: a restart run whose liveness reads `pending` hands the
-    // row, with its launch start, to the `pending` deferral, whatever the
+    // b.jg5 SRJ-314, SRJ-409, SRJ-411: a restart run whose liveness reads
+    // `pending` (its first probe or b.d61's re-probe) hands the row, with its
+    // launch start, to the `pending` deferral, awaited, whatever the
     // session's connection shows; nothing is reconnected, killed, launched or
-    // counted. A configured persona's own `pending` row with no launch start
+    // counted. The deferral arms the persona's retry timer pending-only for a
+    // covered row and sends a row that is not covered through the live-row
+    // sequence. A configured persona's own `pending` row with no launch start
     // never reaches it: the probe latched the persona (b.jg5 SRJ-513).
-    deferPendingRow: (key, reading) => {
-      deferPendingRow(key, reading.launchStartedAt)
+    deferPendingRow: async (key, reading) => {
+      await deferPendingRow(key, reading.launchStartedAt)
     },
     // b.jg5 SRJ-502: a latched persona's restart work (a fired timer, a
     // retry, a human-triggered restart) makes no agent-director call.

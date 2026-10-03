@@ -162,6 +162,7 @@ import {
   UNAVAILABLE_RETRY_BASE_S,
   UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
   UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
+  UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
   UNAVAILABLE_RETRY_CEILING_S,
   UNAVAILABLE_RETRY_ROW_PENDING,
@@ -213,6 +214,7 @@ import {
   conditionSilentEndLine,
   conditionStartedLines,
   expectLostMessageReports,
+  expectPendingOnlyWatch,
   killFailureNotice,
   launchThroughSequence,
   makeRecoveryHarness,
@@ -572,9 +574,11 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
 
   // b.jg5 SRJ-702, SRJ-307: only the outcome that stands reaches the
   // condition. A try's UNAVAILABLE that a later try's success replaces starts
-  // nothing and arms nothing, and the own-row `status` read between the tries
-  // (not tmux-touching) neither starts the condition nor ends it.
-  test('an ErrTmuxUnresponsive try then a success at the live-row sequence\'s kill of a row read live starts no condition and arms nothing; the sequence\'s run and reuse spawn follow, with no delete', async () => {
+  // nothing and arms no cause of its own, and the own-row `status` read
+  // between the tries (not tmux-touching) neither starts the condition nor
+  // ends it. The only arm is the sequence's successful launch's pending-only
+  // watch on its new row (b.jg5 SRJ-301, SRJ-409).
+  test('an ErrTmuxUnresponsive try then a success at the live-row sequence\'s kill of a row read live starts no condition and arms only the launch\'s pending-only watch; the sequence\'s run and reuse spawn follow, with no delete', async () => {
     const { h, p, b } = build()
     scriptLiveRowElsewhere(h, p, { killQueue: [cannedErr(errTmuxUnresponsive('kill')), cannedOk(cannedKillResult(true))] })
 
@@ -583,7 +587,8 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
     expect(h.stub.calls.killCalls).toHaveLength(2)
     expect(h.stub.calls.deleteCalls).toEqual([])
     expect(h.stub.calls.spawnCalls).toHaveLength(2)
-    expect(h.triggers).toEqual([])
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
+    expectPendingOnlyWatch(h, p)
     expectNeverStarted(h, p)
     expectNeverStarted(h, b)
     expectNoPostYet(h)
@@ -670,12 +675,14 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
   // The dialog approver runs after its launch call returned, outside every
   // launch or recovery attempt (SRJ-401, SRJ-307; hatch A2), as the tick's
   // read does: none of its calls starts the condition or arms the timer. One
-  // starting form per pane verb, and AC 27's form at its status.
+  // starting form per pane verb, and AC 27's form at its status. The only arm
+  // is the launch's own pending-only watch on its new row (b.jg5 SRJ-301,
+  // SRJ-409), with no cause of the approver's added to it.
   test.each<[string, ApproverVerb, (verb: string) => Error]>([
     ['ErrTmuxUnresponsive', 'read-pane', errTmuxUnresponsive],
     ['ErrTmuxUnresponsive', 'send-keys', errTmuxUnresponsive],
     ['AC 27: ErrCallTimeout', 'status', errCallTimeout],
-  ])('%s answering the dialog approver’s %s, after the launch returned, starts nothing, posts nothing and arms nothing', async (_what, verb, make) => {
+  ])('%s answering the dialog approver’s %s, after the launch returned, starts nothing, posts nothing and arms nothing beyond the launch’s pending-only watch', async (_what, verb, make) => {
     const { h, p, b } = build()
     const pending = { statusResult: cannedStatusResult({ state: 'pending' }) }
     h.script(
@@ -691,7 +698,9 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
 
     expect(h.stub.calls[APPROVER_VERB_CALLS[verb]]).toHaveLength(1)
     expect(h.approverRunning(p)).toBe(true)
-    expect(h.triggers).toEqual([])
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
+    expectPendingOnlyWatch(h, p)
+    expect(h.controller.view(p)?.causes).toEqual([UNAVAILABLE_RETRY_CAUSE_PENDING_ROW])
     expectNeverStarted(h, p)
     expectNeverStarted(h, b)
     expectNoPostYet(h)

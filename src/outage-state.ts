@@ -65,6 +65,10 @@
  *                                            persona's retry timer at once in pending-only
  *                                            mode, inside an attempt, recording no attempt
  *                                            error (b.jg5 SRJ-112, SRJ-113, SRJ-409)
+ *   - armPendingOnlyForPendingRow(key)     — a covered `pending` row arms the persona's
+ *                                            retry timer in pending-only mode, inside an
+ *                                            attempt or outside every one (b.jg5 SRJ-301,
+ *                                            SRJ-409)
  *   - _resetOutageState()                  — test-only state reset
  *
  * Template exports (used by tests):
@@ -892,6 +896,31 @@ export function reportLostRaceAtSite(key: string): boolean {
 export function armPendingOnlyAfterLaunchFailure(key: string): boolean {
   try {
     if (!isInsideAttempt(key)) return false
+    const sink = deps?.triggerSink
+    if (sink?.armPendingOnly === undefined) return false
+    sink.armPendingOnly(key)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * armPendingOnlyForPendingRow — a covered `pending` row of persona `key`
+ * (b.jg5 SRJ-301, SRJ-409): arm its retry timer in pending-only mode with
+ * the `pending-row` cause through the installed trigger sink's optional
+ * `armPendingOnly` (production: the retry controller), inside an attempt or
+ * outside every one: the row a launch that returned left, a row the
+ * collision ladder, the restart path's deferral or the pending-only retry
+ * read `pending` and found covered or undecided, and the row a dialog
+ * approver leaves when it stops. A timer already in full mode stays in full
+ * mode. Records no attempt error and starts no condition. With no sink, or
+ * none with `armPendingOnly`, it arms nothing. The caller decides whether
+ * the persona may be armed (a latched persona never is). Answers whether
+ * the sink was asked to arm. Never throws.
+ */
+export function armPendingOnlyForPendingRow(key: string): boolean {
+  try {
     const sink = deps?.triggerSink
     if (sink?.armPendingOnly === undefined) return false
     sink.armPendingOnly(key)

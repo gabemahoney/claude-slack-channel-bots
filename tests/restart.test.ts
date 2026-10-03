@@ -125,6 +125,7 @@ import {
   lostRaceOutcome,
   ROW_REREAD_FINISHED,
   spawnNotResumableLine,
+  uncoveredPendingRowLine,
   type PersonaRowReread,
   type CarriedDeadEvidence,
   type DeadEvidenceSource,
@@ -134,9 +135,11 @@ import { FULL_PANE_READ_LINES, PROBE_PANE_READ_LINES } from '../src/pane-read.ts
 import {
   LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION,
   LIVE_ROW_LAUNCH_RESUME,
+  LIVE_ROW_LAUNCH_REUSE,
   LIVE_ROW_OUTCOME_LAUNCHED,
   liveRowSequenceStartLine,
 } from '../src/live-row-sequence.ts'
+import { PENDING_ROW_REASON_CWD_MISMATCH } from '../src/pending-row.ts'
 import { KILL_FAILURE_ROUTE_NOT_CONFIGURED, KILL_FAILURE_VERSION_ORDINARY, PERSONA_KILL_FAILED_LABEL } from '../src/kill-failure-alert.ts'
 import {
   conflictNoticeText,
@@ -240,10 +243,13 @@ import {
   killFailureNotice,
   killFailureRecoveryEntry,
   collided,
+  expectPendingOnlyWatch,
   holdThroughReuse,
   makeRecoveryHarness,
   ordinaryAlertContent,
   personaCallCounts,
+  personaRow,
+  reuseSpawnOf,
   startupEntriesOf,
   retryNow,
   rowReadsUntilSpawn,
@@ -5813,6 +5819,107 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
     expect(errLines).toEqual([])
   })
 
+  // b.jg5 SRJ-409, SRJ-411 (hatch note E9): b.d61's re-probe after an
+  // escalate-dead reconnect that reads `pending` hands its reading to the
+  // same deferral, once, after the re-probe's pending line; the deferral is
+  // awaited at both probe points, and one that rejects is logged like one
+  // that throws.
+  type ProbePoint = 'the first probe' | 'the re-probe after an escalate-dead reconnect'
+  const PROBE_POINTS: ProbePoint[] = ['the first probe', 'the re-probe after an escalate-dead reconnect']
+
+  /** `pendingDeps` whose probe at `point` reads `reading`: at the re-probe, the first probe reads `live` and the reconnect answers escalate-dead with dead evidence. */
+  function pendingAt(point: ProbePoint, reading: LivenessReading): ReturnType<typeof pendingDeps> {
+    if (point === 'the first probe') return pendingDeps(reading, false, true)
+    const built = pendingDeps(LIVENESS_READING_LIVE, false, true)
+    const { deps } = built
+    deps.isSessionAlive = async (key) => {
+      deps.isSessionAliveCalls.push(key)
+      return deps.isSessionAliveCalls.length === 1 ? LIVENESS_READING_LIVE : reading
+    }
+    deps.reconnectSession = async (key) => { deps.reconnectSessionCalls.push(key); return ESCALATE_DEAD_WORKING_GONE }
+    return built
+  }
+
+  /** At the re-probe, the two probes and the one reconnect; nothing killed, launched, counted, notified or armed. */
+  function expectNothingDoneAt(point: ProbePoint, deps: ReturnType<typeof makeDeps>): void {
+    if (point === 'the first probe') {
+      expectNothingDone(deps)
+      return
+    }
+    expect(deps.isSessionAliveCalls).toEqual([P, P])
+    expect(deps.reconnectSessionCalls).toEqual([P])
+    expect(deps.killSessionCalls).toEqual([])
+    expect(deps.launchSessionCalls).toEqual([])
+    expect(getFailureCount(P)).toBe(1)
+    expect(deps.onCapReachedCalls).toEqual([])
+    expect(deps.armRetryTimerCalls).toEqual([])
+    expect(isRestartPendingOrActive(P)).toBe(false)
+  }
+
+  test.each(LAUNCH_STARTS)('after an escalate-dead reconnect, a re-probe reading pending %s → the deferral once with the key and the re-probe\'s reading, after the re-probe\'s pending line; no kill or launch; nothing counted or armed; pending-deferred', async (_startLabel, start) => {
+    recordFailure(P)
+    const reading = pendingLivenessReading(start)
+    const { deps, deferred } = pendingAt('the re-probe after an escalate-dead reconnect', reading)
+    let linesAtDeferral: string[] = []
+    deps.deferPendingRow = (key, r) => {
+      deferred.push([key, r])
+      linesAtDeferral = [...errLines]
+    }
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_PENDING_DEFERRED)
+
+    expect(deferred).toEqual([[P, reading]])
+    expect(deferred[0]![1].launchStartedAt).toBe(start)
+    expect(linesAtDeferral.filter((l) => l === reprobePendingLine(P))).toHaveLength(1)
+    expect(errLines.filter((l) => l === reprobePendingLine(P))).toHaveLength(1)
+    expectNothingDoneAt('the re-probe after an escalate-dead reconnect', deps)
+  })
+
+  test.each(PROBE_POINTS)('the deferral is awaited at %s: the run answers only once the deferral has settled', async (point) => {
+    recordFailure(P)
+    const { deps, deferred } = pendingAt(point, pendingLivenessReading(SAMPLE_LAUNCH_START_FRACTIONAL))
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    deps.deferPendingRow = async (key, r) => {
+      deferred.push([key, r])
+      entered.resolve()
+      await release.promise
+    }
+    initRestart(deps)
+
+    let answered: RestartRetryOutcome | undefined
+    const run = runRestartRetry(P, CWD, notInFlight).then((outcome) => { answered = outcome; return outcome })
+    await entered.promise
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+    expect(answered).toBeUndefined()
+
+    release.resolve()
+    expect(await run).toBe(RESTART_OUTCOME_PENDING_DEFERRED)
+    expect(deferred).toHaveLength(1)
+    expectNothingDoneAt(point, deps)
+  })
+
+  test.each(PROBE_POINTS)('a deferral that rejects at %s → one redacted line; still no kill or launch, nothing counted or armed; pending-deferred', async (point) => {
+    recordFailure(P)
+    const { deps, deferred } = pendingAt(point, pendingLivenessReading(SAMPLE_LAUNCH_START_FRACTIONAL))
+    deps.deferPendingRow = async (key, r) => {
+      deferred.push([key, r])
+      await Promise.resolve()
+      throw Object.assign(new Error(`defer rejected (${sentinelInMessage('defer')})`), { note: LEAK_SENTINEL })
+    }
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_PENDING_DEFERRED)
+
+    expect(deferred).toHaveLength(1)
+    expectNothingDoneAt(point, deps)
+    const failed = errLines.filter((l) => l.startsWith(DEFER_FAILED))
+    expect(failed).toHaveLength(1)
+    expect(failed[0]).toStartWith(`${DEFER_FAILED}: Error message="defer rejected (${REDACTED_SENTINEL_TAIL})" at `)
+    assertNoLeak({ errArgs })
+  })
+
   // `live` and `dead` never reach the deferral: a connected `live` row with
   // its stream is still already-connected, another `live` row is reconnected,
   // and a `dead` one is killed and launched and counted, as before.
@@ -5892,10 +5999,10 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
         isShuttingDown: () => false,
         onCapReached: () => {},
         armRetryTimer: (key) => { armed.push(key) },
-        // As main() binds it.
-        deferPendingRow: (key, reading) => {
+        // As main() binds it: the deferral awaited.
+        deferPendingRow: async (key, reading) => {
           deferred.push([key, reading])
-          deferPendingRow(key, reading.launchStartedAt)
+          await deferPendingRow(key, reading.launchStartedAt)
         },
       })
 
@@ -5912,6 +6019,136 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
       expect(errLines[0]).toStartWith(`[slack] Deferring persona=${KEY}`)
       if (start !== undefined) expect(errLines[0]).toContain(start)
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-409, SRJ-411 (hatch notes E9, E25) on the recovery harness: the
+// restart path's `pending` reading, at its first probe or at b.d61's
+// re-probe after an escalate-dead reconnect, goes through the server's
+// deferral, bound and awaited as `main()` binds it over the harness's
+// applied persona. The deferral reads P's row once (`get`): a covered row
+// (P's own directory and labels, a launch start) arms P's retry timer in
+// pending-only mode; an uncovered one (another working directory) is sent
+// through the live-row sequence, the conversation not kept (alert context
+// `recovery`), its one line naming the reason. The restart run answers
+// `pending-deferred`, counts nothing and makes no kill, launch or keystroke
+// of its own. The re-probe is reached by P's `working` row's `read-pane`
+// answering GONE (verdict `working-tmux-gone`); the row reads `pending` once
+// the escalate-dead sweep has run. One failure is on record first, so a
+// recorded success or failure shows. The uncovered cases hold the
+// sequence at its first bypassing run, then let it end in its reuse.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-409, SRJ-411: on the recovery harness, a pending reading at either probe goes through the deferral, which arms a covered row and sends an uncovered one through the live-row sequence', () => {
+  let harness: RecoveryHarness | undefined
+
+  afterEach(() => {
+    const h = harness
+    harness = undefined
+    if (h === undefined) return
+    try {
+      expect(h.stub.calls.deleteCalls).toEqual([])
+      assertNoLeak(h.captured())
+    } finally {
+      h.cleanup()
+    }
+    expect(h.clock.pendingCount()).toBe(0)
+  })
+
+  type ProbePoint = 'the first probe' | 'the re-probe after an escalate-dead reconnect'
+  const PROBE_POINTS: ProbePoint[] = ['the first probe', 'the re-probe after an escalate-dead reconnect']
+  /** The launch start P's `pending` status reads carry. */
+  const START = SAMPLE_LAUNCH_START_WHOLE
+
+  /**
+   * A harness whose liveness read of P reads `pending` with `START` at
+   * `point` (at the re-probe: `working` until a find-missing run was made,
+   * its `read-pane` answering GONE); P's `get`s answer `rows` in order, then
+   * `missing`. `runs` counts the find-missing runs made, held ones included.
+   */
+  function build(point: ProbePoint, rows: ReadonlyArray<(h: RecoveryHarness, key: string) => ReturnType<typeof personaRow>>, runs: () => number = () => 0) {
+    const h = (harness = makeRecoveryHarness({ alertThresholdMs: false }))
+    const persona = h.config.personas[0]!
+    const p = persona.key
+    recordFailure(p)
+    const pending = cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: START })
+    let gets = 0
+    h.script({
+      getFn: () => {
+        const row = rows[gets++]
+        return row === undefined ? personaRow(h, p, { state: LIVENESS_DEAD_ROW_MISSING }) : row(h, p)
+      },
+      ...(point === 'the first probe'
+        ? { statusResult: pending }
+        : {
+            statusFn: () => (h.stub.calls.findMissingCalls.length + runs() > 0 ? pending : cannedStatusResult({ state: 'working' })),
+            readPaneError: errTmuxCaptureFailed(),
+          }),
+    })
+    return { h, p, persona, ref: renderPersonaRef(persona.name, p), cwd: persona.working_directory }
+  }
+
+  const COVERED = (h: RecoveryHarness, key: string) => personaRow(h, key, { state: AGENT_DIRECTOR_PENDING_STATE })
+  const ELSEWHERE = (h: RecoveryHarness, key: string) => personaRow(h, key, { state: AGENT_DIRECTOR_PENDING_STATE, cwd: h.home })
+
+  /** The run's own deferral line: exactly one, naming the reading's launch start. */
+  function expectOneDeferral(h: RecoveryHarness, p: string): void {
+    const deferrals = h.errors.filter((l) => l.startsWith(`[slack] Deferring persona=${p}: its row reads pending`))
+    expect(deferrals).toHaveLength(1)
+    expect(deferrals[0]).toContain(`(launch started ${START})`)
+  }
+
+  /** At the re-probe, its pending line came first; at the first probe there is none. */
+  function expectReprobeLine(h: RecoveryHarness, p: string, point: ProbePoint): void {
+    expect(h.errors.filter((l) => l === reprobePendingLine(p))).toHaveLength(point === 'the first probe' ? 0 : 1)
+  }
+
+  test.each(PROBE_POINTS)('%s reads a covered pending row → pending-deferred; one deferral naming the launch start, one get, P armed pending-only; no kill, launch, keystroke or sequence; nothing counted', async (point) => {
+    const { h, p, cwd } = build(point, [COVERED])
+
+    expect(await runRestartRetry(p, cwd, isLaunchInFlight)).toBe(RESTART_OUTCOME_PENDING_DEFERRED)
+
+    expectReprobeLine(h, p, point)
+    expectOneDeferral(h, p)
+    expect(h.stub.calls.getCalls).toHaveLength(1)
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
+    expectPendingOnlyWatch(h, p)
+    expect([h.stub.calls.killCalls, h.stub.calls.spawnCalls, h.stub.calls.resumeCalls, h.stub.calls.sendKeysCalls]).toEqual([[], [], [], []])
+    expect(isLiveRowSequenceRunning(p)).toBe(false)
+    expect([getFailureCount(p), h.capReached, h.notices]).toEqual([1, [], []])
+  })
+
+  test.each(PROBE_POINTS)('%s reads a pending row in another working directory (not covered) → pending-deferred; one deferral, the uncovered line and one sequence start at step 1 (conversation not kept, context recovery); the run makes no launch or keystroke and arms nothing; the sequence ends in one reuse', async (point) => {
+    let hold: ReturnType<typeof holdFindMissing> | undefined
+    const { h, p, ref, cwd } = build(point, [ELSEWHERE], () => hold?.calls.length ?? 0)
+    hold = holdFindMissing(h.stub.client)
+
+    const run = runRestartRetry(p, cwd, isLaunchInFlight)
+    // At the re-probe, the escalate-dead sweep is the first run: let it judge nothing.
+    if (point !== 'the first probe') {
+      await hold.entered(1)
+      hold.release(cannedFindMissing())
+    }
+    expect(await run).toBe(RESTART_OUTCOME_PENDING_DEFERRED)
+    const sweeps = point === 'the first probe' ? 0 : 1
+    await h.driveSequence(hold.entered(sweeps + 1))
+
+    expectReprobeLine(h, p, point)
+    expectOneDeferral(h, p)
+    expect(h.errors).toContain(uncoveredPendingRowLine(ref, PENDING_ROW_REASON_CWD_MISMATCH))
+    expect(h.lines).toContain(liveRowSequenceStartLine(ref, h.sequenceRequest(p, { lastReadState: AGENT_DIRECTOR_PENDING_STATE })))
+    expect(isLiveRowSequenceRunning(p)).toBe(true)
+    expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls, h.stub.calls.sendKeysCalls]).toEqual([[], [], []])
+    expect(h.triggers).toEqual([])
+    expect([getFailureCount(p), h.capReached, h.notices]).toEqual([1, [], []])
+
+    hold.release(cannedFindMissing({ rows: { [personaInstanceId(p)]: 'ids' } }))
+    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE, result: { key: p } })
+    // The sequence's own step-1 kill and reuse; never a resume or keystroke.
+    expect(h.stub.calls.killCalls).toHaveLength(1)
+    expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls, h.stub.calls.sendKeysCalls]).toEqual([[reuseSpawnOf(h, p)], [], []])
+    await h.runApproverToStop(p)
   })
 })
 
@@ -6202,7 +6439,9 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNAVAILABLE or UNCLASSIFIED kill, send-keys
       expect(h.episodeNotices).toEqual(cause === UNAVAILABLE_RETRY_CAUSE_KILL_FAILED ? [killFailureNotice(p, ordinaryAlertContent(p, { last: err }))] : [])
     })
 
-    test('the kill after a dead reading answers ErrSpawnNotFound (regression) → the run still launches P; no refusal', async () => {
+    // The launch's own pending-only watch on its new row is the one arm
+    // (b.jg5 SRJ-301, SRJ-409).
+    test('the kill after a dead reading answers ErrSpawnNotFound (regression) → the run still launches P; no refusal, only the launch’s pending-only watch armed', async () => {
       const { h, p, cwd } = build()
       rowReadsUntilSpawn(h, 'ended')
       h.script({ killError: errSpawnNotFound() })
@@ -6214,7 +6453,8 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNAVAILABLE or UNCLASSIFIED kill, send-keys
       expect(h.stub.spawnedIds()).toEqual([personaInstanceId(p)])
       expect(getFailureCount(p)).toBe(0)
       expect(h.errors.filter((l) => l.startsWith(killNotSucceededHead(p)))).toEqual([])
-      expect(h.triggers).toEqual([])
+      expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
+      expectPendingOnlyWatch(h, p)
       expect(h.notices).toEqual([])
     })
 
@@ -6254,11 +6494,12 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNAVAILABLE or UNCLASSIFIED kill, send-keys
 
     // b.jg5 SRJ-104, SRJ-110: for `kill`, gone is success. A GONE answer at
     // the restart path's kill lets the relaunch run once, rendered
-    // session-gone; nothing is armed, counted or posted.
+    // session-gone; nothing is counted or posted, and the one arm is the
+    // launch's pending-only watch on its new row (b.jg5 SRJ-301, SRJ-409).
     test.each([
       ['ErrTmuxSendKeys', () => errTmuxSendKeys()],
       ['ErrTmuxCaptureFailed', () => errTmuxCaptureFailed(undefined, 'kill')],
-    ] as const)('b.jg5 SRJ-104, SRJ-110: the kill after a dead reading answers GONE (%s) → the session-gone success: P is relaunched once; nothing armed, counted or posted', async (_label, make) => {
+    ] as const)('b.jg5 SRJ-104, SRJ-110: the kill after a dead reading answers GONE (%s) → the session-gone success: P is relaunched once; nothing counted or posted, only the launch’s pending-only watch armed', async (_label, make) => {
       const { h, p, cwd } = build()
       rowReadsUntilSpawn(h, 'ended')
       const err = make()
@@ -6271,7 +6512,8 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNAVAILABLE or UNCLASSIFIED kill, send-keys
       expect(h.stub.spawnedIds()).toEqual([personaInstanceId(p)])
       expect(h.errors).toContain(relaunchAfterKillLine(p, cwd, { kind: KILL_OUTCOME_SESSION_GONE, name: err.errName }))
       expect(h.errors.filter((l) => l.startsWith(killNotSucceededHead(p)))).toEqual([])
-      expect(h.triggers).toEqual([])
+      expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
+      expectPendingOnlyWatch(h, p)
       expect(h.unclassifiedErrorOpen(p)).toBe(false)
       expect(getFailureCount(p)).toBe(0)
       expect(h.notices).toEqual([])
@@ -6377,7 +6619,8 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNAVAILABLE or UNCLASSIFIED kill, send-keys
     // b.jg5 SRJ-701, SRJ-703 (HO rev 15): a success with any `kill_sent` lets
     // the relaunch run once; `kill_sent: false` (another store's session, or
     // one with no valid label, holding the name, is GONE for the row) raises
-    // no notice of any kind by itself.
+    // no notice of any kind by itself. The one arm is the launch's
+    // pending-only watch on its new row (b.jg5 SRJ-301, SRJ-409).
     test.each([
       ['true', true],
       ['false', false],
@@ -6393,7 +6636,8 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNAVAILABLE or UNCLASSIFIED kill, send-keys
       expect(h.stub.calls.killCalls).toHaveLength(1)
       expect(h.stub.spawnedIds()).toEqual([personaInstanceId(p)])
       expect(h.errors).toContain(relaunchAfterKillLine(p, cwd, killSent === undefined ? { kind: KILL_OUTCOME_KILLED } : { kind: KILL_OUTCOME_KILLED, killSent }))
-      expect(h.triggers).toEqual([])
+      expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
+      expectPendingOnlyWatch(h, p)
       expect(h.notices).toEqual([])
       expect(h.episodeNotices).toEqual([])
       expect(h.outageNotices).toEqual([])

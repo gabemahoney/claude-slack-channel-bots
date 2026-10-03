@@ -527,6 +527,20 @@ export const LIVE_ROW_LAUNCH_RESULT_LATCHED = 'latched'
  */
 export const LIVE_ROW_LAUNCH_RESULT_HELD = 'held'
 
+/**
+ * The successes that are a launch call's own (a spawn, a reuse spawn or a
+ * `resume` that returned success): the session manager's after-launch step
+ * arms P's retry timer in pending-only mode after each (SRJ-301, SRJ-409).
+ * A reconnect or a no-op made no launch call.
+ */
+export const LIVE_ROW_LAUNCH_CALL_SUCCESS_ACTIONS: ReadonlySet<string> = new Set([
+  'spawned',
+  'fresh-retired',
+  'resumed',
+  'fresh-after-amnesia',
+  'fresh-after-inconclusive-amnesia',
+])
+
 /** Whether a launch call's result is a success (`LIVE_ROW_LAUNCH_SUCCESS_ACTIONS`). */
 export function liveRowLaunchSucceeded(result: LiveRowSequenceLaunchResult): boolean {
   return LIVE_ROW_LAUNCH_SUCCESS_ACTIONS.has(result.action)
@@ -1037,18 +1051,36 @@ function describeOutcome(outcome: LiveRowSequenceOutcome): string {
 }
 
 /**
+ * The end line's account of P's retry timer (b.jg5 SRJ-301, SRJ-409), one of:
+ *   - `the retry timer armed (<cause>)`: the sequence armed a cause at its end;
+ *   - `the retry timer armed by the launch (pending-only)`: a step-6 launch
+ *     whose `ErrTmuxSessionCreate` armed the timer in pending-only mode itself
+ *     (SRJ-112, SRJ-113);
+ *   - `no cause armed by the sequence; the launch's success arms the
+ *     pending-only watch (pending-row)`: a launch call that succeeded
+ *     (`LIVE_ROW_LAUNCH_CALL_SUCCESS_ACTIONS`), whose after-launch step arms
+ *     P's timer in pending-only mode with the `pending-row` cause (a latched
+ *     P excepted);
+ *   - `no retry timer armed`: any other end.
+ */
+export function liveRowSequenceEndArmText(outcome: LiveRowSequenceOutcome): string {
+  if (outcome.armed !== undefined) return `the retry timer armed (${outcome.armed})`
+  if (outcome.kind === LIVE_ROW_OUTCOME_LAUNCHED) {
+    if (outcome.result.pendingOnlyArmed === true) return 'the retry timer armed by the launch (pending-only)'
+    if (LIVE_ROW_LAUNCH_CALL_SUCCESS_ACTIONS.has(outcome.result.action)) {
+      return "no cause armed by the sequence; the launch's success arms the pending-only watch (pending-row)"
+    }
+  }
+  return 'no retry timer armed'
+}
+
+/**
  * The end line, one per sequence:
- *   `[slack] live-row-sequence: <ref>: <outcome> — runs=<n> kills=<n> judged=<n>; <the retry timer armed (<cause>) | the retry timer armed by the launch (pending-only) | no retry timer armed> (b.jg5 SRJ-705, SRJ-717, SRJ-301)`
- * The middle form is a step-6 launch whose `ErrTmuxSessionCreate` armed the
- * timer in pending-only mode itself (SRJ-112, SRJ-113, SRJ-409).
+ *   `[slack] live-row-sequence: <ref>: <outcome> — runs=<n> kills=<n> judged=<n>; <timer> (b.jg5 SRJ-705, SRJ-717, SRJ-301)`
+ * where `<timer>` is `liveRowSequenceEndArmText`'s.
  */
 export function liveRowSequenceEndLine(ref: string, outcome: LiveRowSequenceOutcome): string {
-  const armed =
-    outcome.armed !== undefined
-      ? `the retry timer armed (${outcome.armed})`
-      : outcome.kind === LIVE_ROW_OUTCOME_LAUNCHED && outcome.result.pendingOnlyArmed === true
-        ? 'the retry timer armed by the launch (pending-only)'
-        : 'no retry timer armed'
+  const armed = liveRowSequenceEndArmText(outcome)
   return `${head(ref)}: ${describeOutcome(outcome)} — runs=${outcome.runs} kills=${outcome.kills} judged=${outcome.judgedRuns}; ${armed} (b.jg5 SRJ-705, SRJ-717, SRJ-301)`
 }
 

@@ -173,7 +173,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { readFileSync } from 'node:fs'
+import { readFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 
 import {
@@ -227,8 +227,10 @@ import {
   LIVE_ROW_STOP_SHUTDOWN,
   LIVE_ROW_STOP_TEARDOWN,
   liveRowSequenceGetLine,
+  liveRowSequenceStartLine,
   type LiveRowSequenceOutcome,
 } from '../src/live-row-sequence.ts'
+import { PENDING_ROW_REASON_CWD_MISMATCH, PENDING_ROW_REASON_CWD_UNRESOLVED } from '../src/pending-row.ts'
 import {
   AGENT_DIRECTOR_PENDING_STATE,
   LIVENESS_DEAD_ROW_ENDED,
@@ -340,11 +342,13 @@ import {
   runInAttempt,
   type AttemptErrorRecord,
   type AttemptView,
+  type UnavailableRetryView,
   UNAVAILABLE_RETRY_AGAIN_LAUNCH_FAILED,
   UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT,
   UNAVAILABLE_RETRY_AGAIN_LAUNCHED,
   UNAVAILABLE_RETRY_AGAIN_SEQUENCE_IN_FLIGHT,
   UNAVAILABLE_RETRY_AGAIN_LIVENESS_UNKNOWN,
+  UNAVAILABLE_RETRY_AGAIN_SEQUENCE_STARTED,
   UNAVAILABLE_RETRY_AGAIN_SEQUENCE_WAITING,
   UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED,
   UNAVAILABLE_RETRY_AGAIN_RECONNECT_DEFERRED,
@@ -461,6 +465,7 @@ import {
   conditionRecoveryLine,
   adConfigMalformedRaiseLines,
   expectLostMessageReports,
+  expectPendingOnlyWatch,
   expectUntouched,
   killFailureNotice,
   LATE_KILL_ANSWERS,
@@ -496,7 +501,7 @@ import { INVALID_FLAGS_HOLD_ALERT_TEXT } from '../src/invalid-flags-hold.ts'
 import { PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
 import { PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import { RESTART_OUTCOME_HELD } from '../src/restart.ts'
-import { isDialogApproverRunning } from '../src/session-manager.ts'
+import { isDialogApproverRunning, uncoveredPendingRowLine, undecidedPendingRowLine } from '../src/session-manager.ts'
 import { _buildRestartDisconnectedPersona } from '../src/server.ts'
 import { holdThroughReuse, launchThroughSequence, retiredKeyLinesIn, scriptLiveRowElsewhere, scriptReuseInvalidFlags } from './test-helpers/recovery-harness.ts'
 import { errInvalidFlags } from './test-helpers/agent-director-stub.ts'
@@ -1184,6 +1189,21 @@ function expectNothingArmed(h: RecoveryHarness): void {
   expect(h.clock.pendingCount()).toBe(0)
 }
 
+/**
+ * The one thing armed is persona `key`'s pending-only watch on the row its
+ * launch left (b.jg5 SRJ-301, SRJ-409): `pendingRowArms` pending-row
+ * triggers for it and no other trigger, its timer waiting in pending-only
+ * mode with the pending-row cause alone, no other persona armed, and its
+ * timer the only one on the clock.
+ */
+function expectOnlyThePendingOnlyWatch(h: RecoveryHarness, key: string, pendingRowArms = 1): void {
+  expect(h.triggers).toEqual(Array.from({ length: pendingRowArms }, () => ({ key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW })))
+  expectPendingOnlyWatch(h, key)
+  expect(h.controller.view(key)?.causes).toEqual([UNAVAILABLE_RETRY_CAUSE_PENDING_ROW])
+  expect(h.controller.armedKeys()).toEqual([key])
+  expect(h.clock.pendingCount()).toBe(1)
+}
+
 describe('unavailable retry: what arms the timer (SRJ-301)', () => {
   const unavailableCross = UNAVAILABLE_VALUES.flatMap(([what, make, kind]) =>
     LAUNCH_SITES.map((site) => [what, site.name, site.verb, make, kind, site] as const),
@@ -1279,7 +1299,7 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
     // b.jg5 SRJ-605: the working-row wait's poll reading the row absent is
     // 'dead-session', and the recovery resumes the row the collision read.
     ['ErrSpawnNotFound from the working-row read (status)', (h, p) => ({ ...collided(h, p, { state: 'working' }), statusQueue: [cannedErr(errSpawnNotFound())] }), 'resumed', 0],
-  ])('%s inside a launch arms nothing and marks nothing', async (_what, script, action, reuses) => {
+  ])('%s inside a launch arms nothing of its own and marks nothing; a launch that returned leaves only its pending-only watch', async (_what, script, action, reuses) => {
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
     h.script(script(h, personaOf(h, key)))
@@ -1289,13 +1309,19 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
     expect(result).toEqual({ key, action })
     expect(h.reuseSpawns()).toEqual(Array.from({ length: reuses }, () => reuseSpawnOf(h, key)))
     expect(h.stub.calls.deleteCalls).toEqual([])
-    expect(h.triggers).toEqual([])
-    expect(h.controller.armedKeys()).toEqual([])
+    // A launch that returned (spawned or resumed) arms P's pending-only
+    // watch on its new row (b.jg5 SRJ-301, SRJ-409); the answers met on the
+    // way arm nothing.
+    const launched = action !== 'failed'
+    expect(h.triggers).toEqual(launched ? [{ key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }] : [])
+    expect(h.controller.armedKeys()).toEqual(launched ? [key] : [])
     // A launch that answers spawned starts P's dialog approver, whose cap and
-    // sleep timers are on the same clock; driven to its stop, it leaves none,
-    // so a timer still pending would be one the launch's answer armed.
+    // sleep timers are on the same clock; driven to its stop (the row read
+    // live, which arms nothing), it leaves none, so a timer still pending is
+    // the pending-only watch or one the launch's answer armed.
     await h.runApproverToStop(key)
-    expectNothingArmed(h)
+    if (launched) expectOnlyThePendingOnlyWatch(h, key)
+    else expectNothingArmed(h)
     expect(h.attempts).toEqual([])
   })
 
@@ -1583,6 +1609,23 @@ function approverCallMeets(verb: ApproverVerb, err: Error): RecoveryStubScript {
   return { ...pending, readPaneResults: [{ pane: TRUST_DIALOG_NEEDLE }], sendKeysError: err }
 }
 
+/**
+ * P launched with no timer and Q launched over its full-mode timer: the only
+ * triggers are pending-row arms, `perKey` for each (the launch's, and an
+ * arming approver stop's), in launch order (b.jg5 SRJ-301, SRJ-404,
+ * SRJ-409); P's timer watches its row in pending-only mode with that cause
+ * alone, and Q's stays as it was in full mode, its due time kept, with the
+ * pending-row cause added after its own and its row last read `pending`.
+ */
+function expectOnlyPendingRowArms(h: RecoveryHarness, key: string, other: string, otherView: UnavailableRetryView, perKey: number): void {
+  const round = [key, other].map((k) => ({ key: k, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }))
+  expect(h.triggers).toEqual(perKey === 1 ? round : [...round, ...round])
+  expectPendingOnlyWatch(h, key)
+  expect(h.controller.view(key)?.causes).toEqual([UNAVAILABLE_RETRY_CAUSE_PENDING_ROW])
+  expect([...h.controller.armedKeys()].sort()).toEqual([key, other].sort())
+  expect(h.controller.view(other)).toEqual({ ...otherView, causes: [...otherView.causes, UNAVAILABLE_RETRY_CAUSE_PENDING_ROW], lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
+}
+
 describe('unavailable retry: P’s dialog approver is in flight for P, blocks no retry and makes its calls outside every attempt (SRJ-303, SRJ-315, SRJ-401; hatch A2)', () => {
   test('a launch call held in flight both blocks a retry and is in flight for P; once it returns, P’s approver alone is in flight for P (a lost message for P makes no read, one for Q does) and blocks no retry (the retry makes its row read)', async () => {
     // The approver's cap outlasts the retry's second wait, so it still runs when the retry fires.
@@ -1618,7 +1661,11 @@ describe('unavailable retry: P’s dialog approver is in flight for P, blocks no
     expect(h.approverRunning(key)).toBe(true)
     expect(h.attempts.map((a) => [a.key, a.retry])).toEqual([[key, 1], [key, 2]])
     expect(retryLinesOf(h, key).at(-1)).toBe(reArmedLine(key, 2, UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, 2))
-    expect(h.triggers).toEqual([])
+    // The one trigger is the launch's pending-only arm (b.jg5 SRJ-301,
+    // SRJ-409), which leaves the full-mode timer in full mode; the approver
+    // arms nothing.
+    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
+    expect(h.controller.view(key)?.mode).toBe(UNAVAILABLE_RETRY_MODE_FULL)
   })
 
   test.each<[string, RowState, boolean, ApproverStopReason, LostMessageState]>([
@@ -1641,7 +1688,9 @@ describe('unavailable retry: P’s dialog approver is in flight for P, blocks no
     expect(h.approverRunning(key)).toBe(false)
     expect(isLaunchInFlight(key)).toBe(false)
     await expectLostMessageReports(h, key, lostState)
-    expectNothingArmed(h)
+    // None of these stops arms (b.jg5 SRJ-404): only the launch's
+    // pending-only watch (b.jg5 SRJ-301, SRJ-409).
+    expectOnlyThePendingOnlyWatch(h, key)
   })
 
   // One answer of each class here; the harness-level matrix over every form
@@ -1649,7 +1698,7 @@ describe('unavailable retry: P’s dialog approver is in flight for P, blocks no
   test.each<[string, ApproverVerb, () => Error]>([
     ['UNAVAILABLE (ErrTmuxUnresponsive)', 'read-pane', () => errTmuxUnresponsive('read-pane')],
     ['UNCLASSIFIED (ErrInternal with no recognised phrase)', 'send-keys', () => errInternal()],
-  ])('%s answering the dialog approver’s %s, after the launch returned, arms no timer, adds no cause to an armed one, opens no episode and counts nothing', async (_what, verb, make) => {
+  ])('%s answering the dialog approver’s %s, after the launch returned, arms no timer, adds no cause of its own to an armed one, opens no episode and counts nothing; each launch leaves its pending-only watch', async (_what, verb, make) => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     const [key, other] = h.keys as [string, string]
     // Q's timer is armed first, with a cause no approver answer gives.
@@ -1669,18 +1718,20 @@ describe('unavailable retry: P’s dialog approver is in flight for P, blocks no
       expect(h.tmuxUnresponsive.holds(k)).toBe(false)
       expect(getFailureCount(k)).toBe(0)
     }
-    expect(h.triggers).toEqual([])
-    expect(h.controller.armedKeys()).toEqual([other])
-    expect(h.controller.view(other)).toEqual(otherView)
+    expectOnlyPendingRowArms(h, key, other, otherView!, 1)
     expect(h.episodeNotices).toEqual([])
   })
 
   // b.jg5 SRJ-404, SRJ-118: GONE stops polling, and `ErrSpawnNotInteractive`
   // stops with nothing typed; either way the answer is outside every attempt.
+  // Both stops are among those followed by a pending-row run (b.jg5 SRJ-404,
+  // SRJ-409), so each, with no row read since the launch, arms the persona's
+  // pending-only watch once more: the pending-row cause, no cause of the
+  // answer's own.
   test.each<[string, () => Error, ApproverStopReason]>([
     ['a STATE answer (ErrSpawnNotInteractive)', () => errSpawnNotInteractive('status'), APPROVER_STOP_NOT_INTERACTIVE],
     ['a GONE answer (ErrTmuxCaptureFailed)', () => errTmuxCaptureFailed(undefined, 'status'), APPROVER_STOP_GONE],
-  ])('%s answering the dialog approver’s status, after the launch returned, stops it by its class with nothing read or typed; it arms no timer, adds no cause to an armed one, opens no episode and counts nothing', async (_what, make, reason) => {
+  ])('%s answering the dialog approver’s status, after the launch returned, stops it by its class with nothing read or typed; it adds no cause of its own to an armed one, opens no episode and counts nothing; the launch and the stop each arm the pending-only watch', async (_what, make, reason) => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     const [key, other] = h.keys as [string, string]
     // Q's timer is armed first, with a cause no approver answer gives.
@@ -1700,9 +1751,7 @@ describe('unavailable retry: P’s dialog approver is in flight for P, blocks no
       expect(h.tmuxUnresponsive.holds(k)).toBe(false)
       expect(getFailureCount(k)).toBe(0)
     }
-    expect(h.triggers).toEqual([])
-    expect(h.controller.armedKeys()).toEqual([other])
-    expect(h.controller.view(other)).toEqual(otherView)
+    expectOnlyPendingRowArms(h, key, other, otherView!, 2)
     expect(h.episodeNotices).toEqual([])
   })
 })
@@ -2181,9 +2230,14 @@ interface RowModel {
  * Model each persona's row on the harness stub: `status` reads `initial`
  * (`ErrSpawnNotFound` for `UNAVAILABLE_RETRY_ROW_ABSENT`, no row) until a
  * spawn for that instance resolves, and `waiting` from then on; `set` starts
- * that over from another state. Every spawn call's clock time is recorded.
- * While `refuse`, when given, answers an error, every `status` answers that
- * error instead.
+ * that over from another state. While a persona's row reads `pending`, a
+ * `get` of it (still made on the stub, so logged and scripted as any) answers
+ * that row, in the persona's own directory with its labels and the stub's
+ * default launch start: covered (b.jg5 SRJ-409), so the one `get` the
+ * pending-row step makes reads the row the `status` read; in any other state
+ * a `get` answers as the stub is scripted. Every spawn call's clock time is
+ * recorded. While `refuse`, when given, answers an error, every `status`
+ * answers that error instead.
  */
 function modelRow(h: RecoveryHarness, initial: RowState | typeof UNAVAILABLE_RETRY_ROW_ABSENT, refuse?: () => Error | undefined): RowModel {
   const spawnedAt: number[] = []
@@ -2197,12 +2251,21 @@ function modelRow(h: RecoveryHarness, initial: RowState | typeof UNAVAILABLE_RET
     live.add(String(params.claude_instance_id))
     return result
   }
+  const get = client.get.bind(client)
+  client.get = async (params) => {
+    const result = await get(params)
+    const key = h.keys.find((k) => personaInstanceId(k) === params.claude_instance_id)
+    return key !== undefined && stateOf(String(params.claude_instance_id)) === UNAVAILABLE_RETRY_ROW_PENDING
+      ? personaRow(h, key, { state: UNAVAILABLE_RETRY_ROW_PENDING })
+      : result
+  }
+  const stateOf = (id: string): RowState | typeof UNAVAILABLE_RETRY_ROW_ABSENT => (live.has(id) ? 'waiting' : before)
   h.script({
     statusFn: (params) => {
       const refused = refuse?.()
       if (refused !== undefined) return refused
-      if (live.has(String(params.claude_instance_id))) return cannedStatusResult({ state: 'waiting' })
-      return before === UNAVAILABLE_RETRY_ROW_ABSENT ? errSpawnNotFound() : cannedStatusResult({ state: before })
+      const state = stateOf(String(params.claude_instance_id))
+      return state === UNAVAILABLE_RETRY_ROW_ABSENT ? errSpawnNotFound() : cannedStatusResult({ state })
     },
   })
   return {
@@ -2313,12 +2376,14 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
     posts.push(tmuxUnresponsiveRecoveryText(key))
     expectPosts()
     expect(postedLines('recovery')).toHaveLength(1)
+    // The launch's own pending-only arm (b.jg5 SRJ-301, SRJ-409) adds its
+    // cause to the running timer, whose due time the retry's re-arm sets.
     expect(h.controller.view(key)).toEqual({
       phase: 'waiting',
       dueAt: dueAt + waitMs(refusals + 1),
       waitMs: waitMs(refusals + 1),
       refusals: refusals + 1,
-      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
       mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
       lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
     })
@@ -2440,9 +2505,12 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
     ['live and not connected: a reconnect that succeeds, never a spawn, and nothing left to recover', 'waiting', false, { statusCalls: 2, readPaneCalls: 1, sendKeysCalls: 1 }, UNAVAILABLE_RETRY_STOP_RECOVERED],
     // A `pending` liveness reading is deferred by the restart work itself
     // (b.jg5 SRJ-314), whatever the connection shows: its one status read,
-    // and no reconnect (so no second status read), send-keys, kill or spawn.
-    ['pending and not connected: the liveness read defers it, no reconnect and never a spawn, and the timer runs on in full mode, its last row read pending', 'pending', false, { statusCalls: 1 }, { reason: UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, mode: UNAVAILABLE_RETRY_MODE_FULL, lastRow: UNAVAILABLE_RETRY_ROW_PENDING }],
-    ['pending and connected with its stream: never nothing left to recover; the liveness read defers it, and the timer runs on in full mode, its last row read pending', 'pending', true, { statusCalls: 1 }, { reason: UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, mode: UNAVAILABLE_RETRY_MODE_FULL, lastRow: UNAVAILABLE_RETRY_ROW_PENDING }],
+    // and no reconnect (so no second status read), send-keys, kill or spawn;
+    // the deferral's one `get` finds the row covered and arms the pending-row
+    // cause on the running timer, which stays in full mode (b.jg5 SRJ-409).
+    ['pending and not connected: the liveness read defers it, no reconnect and never a spawn, and the timer runs on in full mode, its last row read pending', 'pending', false, { statusCalls: 1, getCalls: 1 }, { reason: UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, mode: UNAVAILABLE_RETRY_MODE_FULL, lastRow: UNAVAILABLE_RETRY_ROW_PENDING }],
+    ['pending and connected with its stream: never nothing left to recover; the liveness read defers it, and the timer runs on in full mode, its last row read pending', 'pending', true, { statusCalls: 1, getCalls: 1 }, { reason: UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, mode: UNAVAILABLE_RETRY_MODE_FULL, lastRow: UNAVAILABLE_RETRY_ROW_PENDING }],
+    // The launch arms its pending-only watch, adding the pending-row cause.
     ['ended: a kill and a launch, and the timer runs on in pending-only mode, its last row read the launch’s pending', 'ended', false, { statusCalls: 2, killCalls: 1, spawnCalls: 1 }, { reason: UNAVAILABLE_RETRY_AGAIN_LAUNCHED, mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING }],
     ['missing: a kill and a launch, and the timer runs on in pending-only mode, its last row read the launch’s pending', 'missing', false, { statusCalls: 2, killCalls: 1, spawnCalls: 1 }, { reason: UNAVAILABLE_RETRY_AGAIN_LAUNCHED, mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING }],
   ])('a retry that finds the row %s', async (_what, state, connected, calls, outcome) => {
@@ -2467,10 +2535,11 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
         dueAt: h.clock.now() + waitMs(1),
         waitMs: waitMs(1),
         refusals: 1,
-        causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+        causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
         mode: outcome.mode,
         ...(outcome.lastRow !== undefined ? { lastRow: outcome.lastRow } : {}),
       })
+      expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
     }
     expect(getFailureCount(key)).toBe(0)
   })
@@ -2481,9 +2550,9 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
     const deferred: Array<readonly [string, PendingLivenessReading]> = []
     const h = (harness = makeRecoveryHarness({
       restartDeps: {
-        deferPendingRow: (k, reading) => {
+        deferPendingRow: async (k, reading) => {
           deferred.push([k, reading])
-          deferPendingRow(k, reading.launchStartedAt)
+          await deferPendingRow(k, reading.launchStartedAt)
         },
       },
     }))
@@ -2802,9 +2871,13 @@ describe('unavailable retry: the stop rules that exist now on the recovery harne
 
 // ---------------------------------------------------------------------------
 // Pending-only mode (b.jg5 SRJ-301, SRJ-303, SRJ-305) on the recovery harness's
-// default action, armed directly (`armPendingOnly`) until covered `pending`
-// rows exist. The pending-row rule's runs and laps are later work: no case
-// here asserts one.
+// default action, armed directly (`armPendingOnly`) or by a launch that
+// returned (b.jg5 SRJ-409). A retry that reads the row `pending` makes the
+// pending-row step's one `get` (`modelRow` answers it covered unless a case
+// scripts another row), which arms the pending-row cause again on the
+// running timer and keeps it (b.jg5 SRJ-409); an uncovered row's case is in
+// the pending-row step's describe below. The pending-row rule's runs and
+// laps are later work: no case here asserts one.
 // ---------------------------------------------------------------------------
 
 /** The line a direct pending-only arm logs. */
@@ -2829,7 +2902,7 @@ function expectStopped(h: RecoveryHarness, key: string): void {
 }
 
 describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301, SRJ-303, SRJ-305)', () => {
-  test('a row still pending: armed at the base wait, each retry’s only agent-director call is its one row read, and the next wait doubles', async () => {
+  test('a row still pending: armed at the base wait, each retry’s only agent-director calls are its row read and the pending-row step’s one get, which finds the row covered and keeps the timer, and the next wait doubles', async () => {
     const h = (harness = makeRecoveryHarness())
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
     const [key, other] = h.keys as [string, string]
@@ -2850,8 +2923,9 @@ describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301,
     for (const retry of [1, 2]) {
       const before = callCounts(h)
       await retryNow(h, key)
-      expect(callsSince(h, before)).toEqual({ statusCalls: 1 })
+      expect(callsSince(h, before)).toEqual({ statusCalls: 1, getCalls: 1 })
       expect(h.stub.calls.statusCalls.at(-1)).toEqual({ claude_instance_id: personaInstanceId(key) })
+      expect(h.stub.calls.getCalls.at(-1)).toEqual({ claude_instance_id: personaInstanceId(key) })
       expect(retryLinesOf(h, key).slice(-2)).toEqual([
         pendingOnlyRetryLine(key, retry),
         reArmedLine(key, retry, UNAVAILABLE_RETRY_AGAIN_ROW_PENDING, retry, { ranPendingOnly: true }),
@@ -2867,7 +2941,8 @@ describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301,
       })
     }
     expect(h.attempts.map((a) => [a.key, a.mode])).toEqual([[key, UNAVAILABLE_RETRY_MODE_PENDING_ONLY], [key, UNAVAILABLE_RETRY_MODE_PENDING_ONLY]])
-    expect(h.triggers).toEqual([])
+    // Each retry's covered row is armed again through the trigger sink.
+    expect(h.triggers).toEqual([1, 2].map(() => ({ key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW })))
     expect(h.controller.isArmed(other)).toBe(false)
     expect(getFailureCount(key)).toBe(0)
   })
@@ -2890,7 +2965,10 @@ describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301,
     expectStopped(h, key)
   })
 
-  test.each(['ended', 'missing', UNAVAILABLE_RETRY_ROW_ABSENT] as const)('a row read %s: the timer stops, then one run of the restart decision (one kill, one launch), and the timer is done', async (state) => {
+  // Hatch note E8: the hand-off run's successful launch leaves a fresh
+  // pending-only timer watching the new `pending` row (b.jg5 SRJ-301,
+  // SRJ-409), armed through the trigger sink after the stop.
+  test.each(['ended', 'missing', UNAVAILABLE_RETRY_ROW_ABSENT] as const)('a row read %s: the timer stops, then one run of the restart decision (one kill, one launch), whose launch arms a fresh pending-only timer on its row', async (state) => {
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
     const row = modelRow(h, state)
@@ -2907,9 +2985,20 @@ describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301,
       pendingOnlyArmedLine(key),
       pendingOnlyRetryLine(key, 1),
       pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_ROW_GONE, state),
+      pendingOnlyArmedLine(key),
     ])
-    expect(h.triggers).toEqual([])
-    expectStopped(h, key)
+    expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_ROW_GONE }])
+    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
+    expect(h.controller.view(key)).toEqual({
+      phase: 'waiting',
+      dueAt: h.clock.now() + waitMs(0),
+      waitMs: waitMs(0),
+      refusals: 0,
+      causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
+      mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
+      lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
+    })
+    expect(delays(h.clock)).toEqual([waitMs(0)])
     expect(getFailureCount(key)).toBe(0)
   })
 
@@ -2976,7 +3065,8 @@ describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301,
     const before = callCounts(h)
     await retryNow(h, key)
     expect(h.attempts).toEqual([{ key, retry: 1, causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE], mode: UNAVAILABLE_RETRY_MODE_FULL, at: dueAt }])
-    expect(callsSince(h, before)).toEqual({ statusCalls: 1 })
+    // The deferral's one get finds the row covered (b.jg5 SRJ-409).
+    expect(callsSince(h, before)).toEqual({ statusCalls: 1, getCalls: 1 })
     expect(h.lines).toContain(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, 1))
     expect(h.controller.view(key)).toMatchObject({ mode: UNAVAILABLE_RETRY_MODE_FULL, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
   })
@@ -3005,11 +3095,11 @@ describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301,
     expect(h.clock.pending().map((t) => t.dueAt)).toEqual([dueAt])
 
     // The full decision: its liveness read defers the pending row (b.jg5
-    // SRJ-314), its one status read; it answers pending-deferred, not the
-    // pending-only row-pending.
+    // SRJ-314), its one status read, and the deferral's one get (b.jg5
+    // SRJ-409); it answers pending-deferred, not the pending-only row-pending.
     await retryNow(h, key)
     expect(h.attempts.map((a) => [a.mode, a.at])).toEqual([[UNAVAILABLE_RETRY_MODE_FULL, dueAt]])
-    expect(callCounts(h)).toEqual({ statusCalls: 1 })
+    expect(callCounts(h)).toEqual({ statusCalls: 1, getCalls: 1 })
     expect(h.lines).toContain(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, 1))
   })
 
@@ -3022,22 +3112,24 @@ describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301,
     await retryNow(h, key)
     expect(row.spawnedAt).toHaveLength(1)
     expect(h.lines).toContain(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, 1, { switchedTo: UNAVAILABLE_RETRY_MODE_PENDING_ONLY }))
+    // The launch's own pending-only arm adds its cause (b.jg5 SRJ-301, SRJ-409).
     expect(h.controller.view(key)).toEqual({
       phase: 'waiting',
       dueAt: h.clock.now() + waitMs(1),
       waitMs: waitMs(1),
       refusals: 1,
-      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
       mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
       lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
     })
 
-    // The launch's row reads pending: one read, a refusal at the doubled wait.
+    // The launch's row reads pending: its read and the pending-row step's one
+    // get, the row covered, a refusal at the doubled wait.
     row.set(UNAVAILABLE_RETRY_ROW_PENDING)
     const before = callCounts(h)
     await retryNow(h, key)
     expect(h.attempts.map((a) => a.mode)).toEqual([UNAVAILABLE_RETRY_MODE_FULL, UNAVAILABLE_RETRY_MODE_PENDING_ONLY])
-    expect(callsSince(h, before)).toEqual({ statusCalls: 1 })
+    expect(callsSince(h, before)).toEqual({ statusCalls: 1, getCalls: 1 })
     expect(h.stub.calls.statusCalls.at(-1)).toEqual({ claude_instance_id: personaInstanceId(key) })
     expect(h.lines).toContain(reArmedLine(key, 2, UNAVAILABLE_RETRY_AGAIN_ROW_PENDING, 2, { ranPendingOnly: true }))
     expect(h.controller.view(key)).toMatchObject({ dueAt: h.clock.now() + waitMs(2), refusals: 2, mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
@@ -3159,13 +3251,212 @@ describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301,
       expectStopped(h, other)
       return
     }
-    // Each of the other persona's retries made its one row read, and it is
-    // still armed, pending-only, with its one timer the only one pending.
+    // Each of the other persona's retries made its one row read and the
+    // pending-row step's one get, and it is still armed, pending-only, with
+    // its one timer the only one pending.
     expect(otherRetries).toBeGreaterThan(0)
-    expect(callCounts(h)).toEqual({ statusCalls: otherRetries })
+    expect(callCounts(h)).toEqual({ statusCalls: otherRetries, getCalls: otherRetries })
     expect(new Set(h.stub.calls.statusCalls.map((params) => params.claude_instance_id))).toEqual(new Set([personaInstanceId(other)]))
     expect(h.controller.view(other)).toMatchObject({ phase: 'waiting', refusals: otherRetries, mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
     expect(h.clock.pending().map((t) => t.dueAt)).toEqual([h.controller.view(other)!.dueAt!])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The covered-row triggers (b.jg5 SRJ-301, SRJ-409; one case per origin that
+// reaches the controller), the pending-only retry's pending-row step on a row
+// that is not covered (SRJ-303, SRJ-409, SRJ-411), the restart cap's stop
+// of a pending-only timer (SRJ-305), and a pending-only stop while the
+// `tmux-unresponsive` condition holds (SRJ-305, SRJ-309; hatch note E10), on
+// the recovery harness with both settings 0. A covered row is P's own
+// `pending` row in its own directory with its labels and a launch start;
+// the uncovered one is in another working directory.
+// ---------------------------------------------------------------------------
+
+describe('unavailable retry: the covered-row triggers and the pending-only retry\'s pending-row step (SRJ-301, SRJ-303, SRJ-305, SRJ-409, SRJ-411)', () => {
+  /** Persona `key`'s timer was armed fresh in pending-only mode with the pending-row cause, through the trigger sink, at the base wait from now. */
+  function expectArmedPendingOnlyNow(h: RecoveryHarness, key: string): void {
+    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
+    expect(h.controller.view(key)).toEqual({
+      phase: 'waiting',
+      dueAt: h.clock.now() + waitMs(0),
+      waitMs: waitMs(0),
+      refusals: 0,
+      causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
+      mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
+      lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
+    })
+    expect(retryLinesOf(h, key)).toEqual([pendingOnlyArmedLine(key)])
+  }
+
+  test('SRJ-301 trigger: a launch that returned (its spawn answered) arms P\'s timer once, in pending-only mode with the pending-row cause, at the base wait; no other persona is armed', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+
+    expect(await h.launch(key)).toEqual({ key, action: 'spawned' })
+
+    expectArmedPendingOnlyNow(h, key)
+    expect(h.controller.isArmed(other)).toBe(false)
+    expect(h.attempts).toEqual([])
+    await h.runApproverToStop(key)
+  })
+
+  test('SRJ-301 trigger: a row first found pending (the restart path\'s liveness read, its deferral\'s one get finding the row covered) arms P\'s timer once, in pending-only mode with the pending-row cause; no kill or launch, nothing counted', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    modelRow(h, UNAVAILABLE_RETRY_ROW_PENDING)
+
+    expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_PENDING_DEFERRED)
+
+    expect(callCounts(h)).toEqual({ statusCalls: 1, getCalls: 1 })
+    expectArmedPendingOnlyNow(h, key)
+    expect(h.controller.isArmed(other)).toBe(false)
+    expect(getFailureCount(key)).toBe(0)
+  })
+
+  test('SRJ-301 trigger: a failed fresh plain spawn (ErrTmuxSessionCreate) arms P\'s timer at once, in pending-only mode with the pending-row cause, with no get first', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    h.script({ spawnError: errTmuxSessionCreate('spawn') })
+
+    expect(await h.launch(key)).toMatchObject({ key, action: 'failed' })
+
+    expect(callCounts(h)).toEqual({ spawnCalls: 1 })
+    expectArmedPendingOnlyNow(h, key)
+    expect(h.controller.isArmed(other)).toBe(false)
+  })
+
+  // Hatch note E21 (SRJ-411): the pending-only retry sends a row that is not
+  // covered through the live-row sequence with no launch of its own, and
+  // re-arms naming the sequence; its next retry, while the sequence runs, is
+  // skipped with no call (SRJ-303); the sequence's own launch then arms the
+  // pending-only watch again on the new row.
+  test('a pending-only retry whose row is not covered (another working directory) starts one live-row sequence and makes no launch, resume or keystroke of its own; it re-arms naming the sequence, the next retry is skipped with no call while the sequence runs, and the sequence ends in one reuse whose launch arms the watch again', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    const ref = renderPersonaRef(personaOf(h, key).name, key)
+    let gets = 0
+    h.script({
+      statusResult: cannedStatusResult({ state: UNAVAILABLE_RETRY_ROW_PENDING }),
+      getFn: () => (gets++ === 0
+        ? personaRow(h, key, { state: UNAVAILABLE_RETRY_ROW_PENDING, cwd: h.home })
+        : personaRow(h, key, { state: LIVENESS_DEAD_ROW_MISSING })),
+    })
+    const hold = holdFindMissing(h.stub.client)
+    h.controller.armPendingOnly(key)
+
+    await retryNow(h, key)
+    await h.driveSequence(hold.entered(1))
+
+    expect(h.attempts).toEqual([expect.objectContaining({ key, retry: 1, mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY })])
+    expect(h.errors).toContain(uncoveredPendingRowLine(ref, PENDING_ROW_REASON_CWD_MISMATCH))
+    expect(h.lines).toContain(liveRowSequenceStartLine(ref, h.sequenceRequest(key, { lastReadState: UNAVAILABLE_RETRY_ROW_PENDING })))
+    expect(h.sequenceRunning(key)).toBe(true)
+    expect(retryLinesOf(h, key).at(-1)).toBe(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_SEQUENCE_STARTED, 1, { ranPendingOnly: true }))
+    expect(h.controller.view(key)).toEqual({
+      phase: 'waiting',
+      dueAt: expect.any(Number),
+      waitMs: waitMs(1),
+      refusals: 1,
+      causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
+      mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
+      lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
+    })
+    // Nothing armed for the uncovered row, and no launch over it.
+    expect(h.triggers).toEqual([])
+    expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls, h.stub.calls.sendKeysCalls]).toEqual([[], [], []])
+
+    // The sequence runs: the next retry makes no call and re-arms.
+    const before = personaCallCounts(h, key)
+    await retryNow(h, key)
+    expect(personaCallCounts(h, key)).toEqual(before)
+    expect(retryLinesOf(h, key).at(-1)).toBe(reArmedLine(key, 2, UNAVAILABLE_RETRY_AGAIN_SEQUENCE_IN_FLIGHT, 2, { ranPendingOnly: true }))
+
+    hold.release(cannedFindMissing({ rows: { [personaInstanceId(key)]: 'ids' } }))
+    expect(await h.driveSequence(h.sequenceSettled(key))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE, result: { key } })
+    expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls]).toEqual([[reuseSpawnOf(h, key)], []])
+    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
+    expectPendingOnlyWatch(h, key)
+    expect(h.controller.isArmed(other)).toBe(false)
+    await h.runApproverToStop(key)
+  })
+
+  // b.jg5 SRJ-411 (hatch A3), b.av2 SR-6.4: the pending-only retry is a
+  // status-only site, so P's working directory with no real path leaves its
+  // pending row undecided whatever the row's cwd: the timer is kept, with the
+  // undecided line, and nothing is started or launched.
+  test.each<[string, (h: RecoveryHarness) => string | undefined]>([
+    ['lexically its configured path', () => undefined],
+    ['another existing directory', (h) => h.home],
+  ])('a pending-only retry while P\'s working directory does not resolve, its pending row\'s cwd %s: undecided; the timer re-armed pending-only on the pending row (row-pending) with the undecided line; no sequence, launch, resume or keystroke', async (_label, cwd) => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    const elsewhere = cwd(h)
+    h.script({
+      statusResult: cannedStatusResult({ state: UNAVAILABLE_RETRY_ROW_PENDING }),
+      getResult: personaRow(h, key, { state: UNAVAILABLE_RETRY_ROW_PENDING, ...(elsewhere === undefined ? {} : { cwd: elsewhere }) }),
+    })
+    rmSync(personaOf(h, key).working_directory, { recursive: true, force: true })
+    h.controller.armPendingOnly(key)
+
+    await retryNow(h, key)
+
+    expect(callCounts(h)).toEqual({ statusCalls: 1, getCalls: 1 })
+    expect(h.errors.filter((line) => line === undecidedPendingRowLine(renderPersonaRef(personaOf(h, key).name, key), PENDING_ROW_REASON_CWD_UNRESOLVED, true))).toHaveLength(1)
+    expect(retryLinesOf(h, key).at(-1)).toBe(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_ROW_PENDING, 1, { ranPendingOnly: true }))
+    expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', refusals: 1, causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW], mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
+    expect([h.sequenceRunning(key), h.approverRunning(key)]).toEqual([false, false])
+    expect(h.controller.isArmed(other)).toBe(false)
+  })
+
+  // Reconcile note (hatch notes E21-E22), build-lead ruling: the counted
+  // ErrTmuxSessionCreate that brings P to the restart cap leaves no timer
+  // armed: its pending-only arm is stopped at once by the cap's stop
+  // (`onCapReached`, as main() binds it), so no retry runs past the cap.
+  test('the counted ErrTmuxSessionCreate that brings P, with no timer, to the restart cap: its pending-only arm is stopped at once with the cap\'s reason; nothing is pending and no retry runs however far the clock goes', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    for (let i = 1; i < RESTART_FAILURE_CAP; i++) recordFailure(key)
+    modelRow(h, 'missing')
+    h.script({ spawnError: errTmuxSessionCreate('spawn') })
+
+    await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)
+    await h.settle()
+
+    expect(getFailureCount(key)).toBe(RESTART_FAILURE_CAP)
+    expect(h.capReached).toEqual([key])
+    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
+    expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_CAPPED }])
+    expect(retryLinesOf(h, key).at(-1)).toBe(pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_CAPPED))
+    expectStopped(h, key)
+    await h.advance(10 * UNAVAILABLE_RETRY_CEILING_S * 1000)
+    expect(h.attempts).toEqual([])
+    expect(h.stub.calls.spawnCalls).toHaveLength(1)
+  })
+
+  // Hatch note E10, by SRJ-305 and SRJ-309: with the health check off and
+  // P's condition holding, a pending-only retry that finds the row live but
+  // not connected stops the timer, and that stop cancels the condition's
+  // alert check: no "keeps retrying" alert ever posts while no timer runs.
+  test('E10: health check off, P\'s tmux-unresponsive condition holding, its pending-only retry finding the row live (waiting) but not connected: the timer stops, the alert check is cancelled with it, and no alert posts past the threshold', async () => {
+    const h = (harness = makeRecoveryHarness())
+    expect(h.config.health_check_interval).toBe(0)
+    const [key] = h.keys as [string]
+    modelRow(h, 'waiting')
+    const startedAt = h.clock.now()
+    expect(h.tmuxUnresponsive.start(key, 'read-pane', errTmuxUnresponsive('read-pane'))).toBe('started')
+    h.controller.armPendingOnly(key)
+    h.setConnected(key, false)
+
+    await retryNow(h, key)
+
+    expect(retryLinesOf(h, key).at(-1)).toBe(pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_ROW_LIVE, 'waiting'))
+    expect(h.controller.isArmed(key)).toBe(false)
+    expect(h.tmuxUnresponsive.holds(key)).toBe(true)
+    expect(conditionLines(h, key)).toContain(`${conditionLinePrefix(key)}alert check cancelled — its retry timer stopped: ${UNAVAILABLE_RETRY_STOP_ROW_LIVE}`)
+    await h.advance(startedAt + adAlertThresholdMsInEffect() + 1 - h.clock.now())
+    expect(h.episodeNotices).toEqual([])
+    expect(h.clock.pendingCount()).toBe(0)
   })
 })
 
@@ -3312,13 +3603,15 @@ describe('unavailable retry: the pending and kill-failure exceptions (SRJ-306)',
     })
 
     // The next retry's kill answers and its launch succeeds: the kill-failure
-    // cause recorded before keeps the timer out of pending-only mode.
+    // cause recorded before keeps the timer out of pending-only mode, the
+    // launch's own pending-only arm (b.jg5 SRJ-301, SRJ-409) included, which
+    // adds only its cause.
     h.script({ killError: undefined })
     await retryNow(h, key)
 
     expect(callCounts(h)).toEqual({ statusCalls: 3, killCalls: 2, spawnCalls: 1 })
     expect(row.spawnedAt).toHaveLength(1)
-    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }])
+    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }, { key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
     expect(retryLinesOf(h, key).at(-1)).toBe(reArmedLine(key, 2, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, 2))
     expect(h.lines.filter((line) => line.includes(' in pending-only mode'))).toEqual([])
     expect(h.controller.view(key)).toEqual({
@@ -3326,7 +3619,7 @@ describe('unavailable retry: the pending and kill-failure exceptions (SRJ-306)',
       dueAt: h.clock.now() + waitMs(2),
       waitMs: waitMs(2),
       refusals: 2,
-      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, UNAVAILABLE_RETRY_CAUSE_KILL_FAILED],
+      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, UNAVAILABLE_RETRY_CAUSE_KILL_FAILED, UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
       mode: UNAVAILABLE_RETRY_MODE_FULL,
       lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
     })
@@ -3424,9 +3717,11 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
     expectStopped(h, key)
   })
 
+  // A row read `pending` also gets the pending-row step's one `get`, which
+  // finds it covered (b.jg5 SRJ-409).
   test.each<[string, ConditionArm, RowState, boolean, Record<string, number>, (key: string) => string, boolean]>([
-    ['in full mode reads its row pending, connected with its stream (deferred on the pending row; the timer runs on)', FULL_MODE_ARM, 'pending', true, { statusCalls: 1 }, (key) => reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, 1), true],
-    ['in pending-only mode reads its row pending, connected with its stream (the timer runs on)', PENDING_ONLY_ARM, 'pending', true, { statusCalls: 1 }, (key) => reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_ROW_PENDING, 1, { ranPendingOnly: true }), true],
+    ['in full mode reads its row pending, connected with its stream (deferred on the pending row; the timer runs on)', FULL_MODE_ARM, 'pending', true, { statusCalls: 1, getCalls: 1 }, (key) => reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, 1), true],
+    ['in pending-only mode reads its row pending, connected with its stream (the timer runs on)', PENDING_ONLY_ARM, 'pending', true, { statusCalls: 1, getCalls: 1 }, (key) => reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_ROW_PENDING, 1, { ranPendingOnly: true }), true],
     ['in pending-only mode reads its row live (waiting) but not connected (the pending-only row rule stops the timer, not a condition end)', PENDING_ONLY_ARM, 'waiting', false, { statusCalls: 1 }, (key) => pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_ROW_LIVE, 'waiting'), false],
   ])('a retry that %s leaves the condition holding with its first refusal’s time and never reaches the condition-end entry', async (_what, arm, state, connected, calls, last, armed) => {
     const h = (harness = makeRecoveryHarness())
@@ -3488,12 +3783,14 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
       keptLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED, UNAVAILABLE_RETRY_KEPT_ROW_PENDING),
       reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, 1, { switchedTo: UNAVAILABLE_RETRY_MODE_PENDING_ONLY }),
     ])
+    // The launch's success arms the pending-only watch in the run (b.jg5
+    // SRJ-409): the pending-row cause is recorded beside the refusal's.
     expect(h.controller.view(key)).toEqual({
       phase: 'waiting',
       dueAt: h.clock.now() + waitMs(1),
       waitMs: waitMs(1),
       refusals: 1,
-      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
       mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
       lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
     })
@@ -3623,12 +3920,14 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
       keptLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED, UNAVAILABLE_RETRY_KEPT_ROW_PENDING),
       reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, 1, { switchedTo: UNAVAILABLE_RETRY_MODE_PENDING_ONLY }),
     ])
+    // The launch's success arms the pending-only watch in the run (b.jg5
+    // SRJ-409): the pending-row cause is recorded beside the refusal's.
     expect(h.controller.view(key)).toEqual({
       phase: 'waiting',
       dueAt: h.clock.now() + waitMs(1),
       waitMs: waitMs(1),
       refusals: 1,
-      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
       mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
       lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
     })
@@ -3978,13 +4277,35 @@ describe('unavailable retry: the switch, the last row read and a condition end d
     expect(clock.pendingCount()).toBe(0)
   })
 
-  /** Each arm that can land during a full-mode run, with the cause the re-armed line then names. */
-  const ARMS_IN_RUN: ReadonlyArray<readonly [string, (c: UnavailableRetryController) => void, string]> = [
-    ['arm', armUnavailable, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
-    ['armPendingOnly', (c) => { c.armPendingOnly(KEY) }, UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
-  ]
+  test('the tmux-unresponsive condition’s end deferred during a full-mode run, then arm in the same run (a refusal that started the condition again): the arm cancels the end, so no kept or stopped line, and the timer is re-armed at the doubled wait', async () => {
+    const { clock, controller, lines, held } = await heldRun(armUnavailable)
+    const linesBefore = lines.length
 
-  test.each(ARMS_IN_RUN)('the tmux-unresponsive condition’s end deferred during a full-mode run, then %s in the same run (a refusal that started the condition again): the arm cancels the end, so no kept or stopped line, and the timer is re-armed at the doubled wait', async (_what, armAgain, cause) => {
+    expect(controller.conditionEnded(KEY, UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE)).toBe('deferred')
+    armUnavailable(controller)
+    held.answer({ kind: 'again' })
+    await controller.whenRunSettled(KEY)
+
+    expect(lines.slice(linesBefore)).toEqual([reArmedLine(KEY, 1, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, 1)])
+    expect(lines.filter((line) => line.includes(UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED))).toEqual([])
+    expect(controller.view(KEY)).toMatchObject({ phase: 'waiting', dueAt: clock.now() + waitMs(1), waitMs: waitMs(1), refusals: 1, mode: UNAVAILABLE_RETRY_MODE_FULL })
+    expect(delays(clock)).toEqual([waitMs(1)])
+  })
+
+  // b.jg5 SRJ-301, SRJ-306: only a full-mode arm is a refusal that starts the
+  // condition again. A pending-only arm (a covered `pending` row, such as the
+  // one a launch's success arms) cancels nothing: the end deferred before it
+  // is applied after the run, and the row it marks `pending` keeps the timer.
+  test.each<[string, (c: UnavailableRetryController) => void, (key: string) => string[]]>([
+    ['armPendingOnly (no refusal): the end is still applied after the run and kept on the pending row the arm marks', (c) => { c.armPendingOnly(KEY) }, (key) => [
+      keptLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED, UNAVAILABLE_RETRY_KEPT_ROW_PENDING),
+      reArmedLine(key, 1, UNAVAILABLE_RETRY_CAUSE_PENDING_ROW, 1),
+    ]],
+    ['armPendingOnly, then arm (a refusal after it): the full-mode arm cancels the end, so no kept or stopped line', (c) => {
+      c.armPendingOnly(KEY)
+      c.arm(KEY, UNAVAILABLE)
+    }, (key) => [reArmedLine(key, 1, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, 1)]],
+  ])('the tmux-unresponsive condition’s end deferred during a full-mode run, then %s', async (_what, armAgain, expected) => {
     const { clock, controller, lines, held } = await heldRun(armUnavailable)
     const linesBefore = lines.length
 
@@ -3993,9 +4314,16 @@ describe('unavailable retry: the switch, the last row read and a condition end d
     held.answer({ kind: 'again' })
     await controller.whenRunSettled(KEY)
 
-    expect(lines.slice(linesBefore)).toEqual([reArmedLine(KEY, 1, cause, 1)])
-    expect(lines.filter((line) => line.includes(UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED))).toEqual([])
-    expect(controller.view(KEY)).toMatchObject({ phase: 'waiting', dueAt: clock.now() + waitMs(1), waitMs: waitMs(1), refusals: 1, mode: UNAVAILABLE_RETRY_MODE_FULL })
+    expect(lines.slice(linesBefore)).toEqual(expected(KEY))
+    expect(controller.view(KEY)).toMatchObject({
+      phase: 'waiting',
+      dueAt: clock.now() + waitMs(1),
+      waitMs: waitMs(1),
+      refusals: 1,
+      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
+      mode: UNAVAILABLE_RETRY_MODE_FULL,
+      lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
+    })
     expect(delays(clock)).toEqual([waitMs(1)])
   })
 
@@ -6945,14 +7273,18 @@ describe('unavailable retry: a latch stops the timer and ends the unclassified-e
 // the read is the timer's own row read; in full mode (armed by an
 // UNAVAILABLE launch) it is the retry entry's liveness probe. Nothing fires
 // for P however far the clock goes. Control: with a launch start the
-// pending-only retry refuses on the row as E8 T4 left it.
+// pending-only retry refuses on the row as E8 T4 left it, after the
+// pending-row step's one `get` finds the row covered (b.jg5 SRJ-409).
 // ---------------------------------------------------------------------------
 
-/** From now on persona `key`'s `status` reads its own row `pending` with `launchStartedAt` (the key left out for `undefined`); every other persona has no row. */
+/** From now on persona `key`'s `status` and `get` read its own row `pending` with `launchStartedAt` (the key left out for `undefined`), in its own directory with its labels; every other persona has no row. */
 function pendingRowFor(h: RecoveryHarness, key: string, launchStartedAt: string | null | undefined): void {
   h.script({
     statusFn: (params) => params.claude_instance_id === personaInstanceId(key)
       ? cannedStatusResult({ state: UNAVAILABLE_RETRY_ROW_PENDING, launch_started_at: launchStartedAt })
+      : errSpawnNotFound(),
+    getFn: (params) => params.claude_instance_id === personaInstanceId(key)
+      ? personaRow(h, key, { state: UNAVAILABLE_RETRY_ROW_PENDING, launch_started_at: launchStartedAt })
       : errSpawnNotFound(),
   })
 }
@@ -7045,7 +7377,7 @@ describe('unavailable retry: a retry whose row read finds P’s own pending row 
     expectUntouchedEpisode(h, other)
   })
 
-  test('control: pending-only, P’s own pending row with a launch start: no latch, no post; the retry’s one row read refuses on the row and re-arms at the doubled wait, as E8 T4 left it', async () => {
+  test('control: pending-only, P’s own pending row with a launch start: no latch, no post; the retry’s row read and the pending-row step’s one get (the row covered) refuse on the row and re-arm at the doubled wait, as E8 T4 left it', async () => {
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
     pendingRowFor(h, key, SAMPLE_LAUNCH_START_FRACTIONAL)
@@ -7053,7 +7385,7 @@ describe('unavailable retry: a retry whose row read finds P’s own pending row 
 
     await retryNow(h, key)
 
-    expect(callCounts(h)).toEqual({ statusCalls: 1 })
+    expect(callCounts(h)).toEqual({ statusCalls: 1, getCalls: 1 })
     expect(retryLinesOf(h, key).at(-1)).toBe(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_ROW_PENDING, 1, { ranPendingOnly: true }))
     expect(h.controller.view(key)).toEqual({
       phase: 'waiting',
@@ -7404,8 +7736,10 @@ describe('unavailable retry: a message lost in not answering with P’s tmux-una
 
   // b.jg5 SRJ-1011 as amended: the check arms nothing while a launch for P
   // is in flight, so no timer is armed and state 5 does not apply; the launch
-  // running is state 6, with no read.
-  test('raised while a launch for P is in flight, no timer: the check arms nothing, so not state 5: the message reports session starting, with no read', async () => {
+  // running is state 6, with no read. Once the launch returns, the only arm
+  // is its pending-only watch on its new row (b.jg5 SRJ-301, SRJ-409), never
+  // the check's environment cause.
+  test('raised while a launch for P is in flight, no timer: the check arms nothing, so not state 5: the message reports session starting, with no read; the launch, once returned, leaves only its pending-only watch', async () => {
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
     const id = personaInstanceId(key)
@@ -7423,8 +7757,8 @@ describe('unavailable retry: a message lost in not answering with P’s tmux-una
     hold.release(id)
     await launch
     await h.settle()
-    expect(h.controller.armedKeys()).toEqual([])
-    expectStopped(h, key)
+    await h.runApproverToStop(key)
+    expectOnlyThePendingOnlyWatch(h, key)
   })
 
   test('raised while P is latched, no timer: the message reports held for a human and arms nothing', async () => {
@@ -7990,7 +8324,8 @@ describe('unavailable retry: the collision ladder\'s second reuse collision, its
 
     expect(h.attempts).toEqual([expect.objectContaining({ key, retry: 1, mode: UNAVAILABLE_RETRY_MODE_FULL, causes: [UNAVAILABLE_RETRY_CAUSE_LOST_RACE] })])
     expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: personaInstanceId(key) }, { claude_instance_id: personaInstanceId(key) }])
-    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_LOST_RACE }])
+    // The resume's own pending-only arm (b.jg5 SRJ-301, SRJ-409) follows the lost race's.
+    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_LOST_RACE }, { key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
     // P was launched: its timer now waits on the launch's pending row (pending-only mode).
     expect(h.lines).toContain(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, 1, { switchedTo: UNAVAILABLE_RETRY_MODE_PENDING_ONLY }))
     expect(h.controller.view(key)).toMatchObject({ mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY })
@@ -8247,8 +8582,9 @@ describe('unavailable retry: the ErrInvalidFlags hold stops the timer, no retry 
       h.script({ killError: undefined })
       expect(h.controller.view(key)?.causes).toEqual([UNAVAILABLE_RETRY_CAUSE_KILL_FAILED])
     }],
+    // No row model: a `pending` model would answer the hold's collision `get`
+    // with a covered `pending` row instead of its finished one.
     ['in pending-only mode, its last row read pending', async (h, key) => {
-      modelRow(h, UNAVAILABLE_RETRY_ROW_PENDING)
       h.controller.armPendingOnly(key)
       expect(h.controller.view(key)?.lastRow).toBe(UNAVAILABLE_RETRY_ROW_PENDING)
     }],
@@ -8351,7 +8687,7 @@ describe('unavailable retry: the ErrInvalidFlags hold stops the timer, no retry 
   // The retry at once itself (at the re-check's time, by one reuse, P up) is
   // AC 23's end-to-end case in tests/session-manager.test.ts; here only the
   // retry timer's side of it.
-  test('retried at once after a hold set by a retry\'s reuse: the version change\'s retry does not go through P\'s stopped timer: no timer attempt, no new arm and no second stop', async () => {
+  test('retried at once after a hold set by a retry\'s reuse: the version change\'s retry does not go through P\'s stopped timer: no timer attempt and no second stop; the only arm is the launch\'s pending-only watch', async () => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     const [key] = h.keys as [string]
     const rc = h.versionRecheck({ version: PHASE1_RC_VERSION })
@@ -8371,7 +8707,11 @@ describe('unavailable retry: the ErrInvalidFlags hold stops the timer, no retry 
     expect(h.retriesAtOnce.map((retry) => retry.key)).toEqual([key])
     expect(h.attempts).toHaveLength(attempts)
     expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_HELD }])
-    expect(h.controller.isArmed(key)).toBe(false)
+    // P came up: its launch leaves a fresh pending-only watch on its row
+    // (b.jg5 SRJ-301, SRJ-409), the only trigger since the hold's stop.
+    expect(h.controller.view(key)).toMatchObject({ refusals: 0, causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW] })
+    expectPendingOnlyWatch(h, key)
+    expect(h.triggers.at(-1)).toEqual({ key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW })
     await h.runApproverToStop(key)
   })
 })

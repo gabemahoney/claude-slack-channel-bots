@@ -2553,22 +2553,54 @@ describe('main() installs the old-life wait\'s bindings once, beside the live-ro
 // tests/server.test.ts; pinned here: its binding.
 // ---------------------------------------------------------------------------
 
-describe('main() binds the restart module\'s pending deferral (deferPendingRow) to server.ts\'s one deferPendingRow, with the reading\'s launch start (b.jg5 SRJ-314, SRJ-115)', () => {
+describe('main() binds the restart module\'s pending deferral (deferPendingRow) to server.ts\'s one deferPendingRow, awaited, with the reading\'s launch start (b.jg5 SRJ-314, SRJ-115, SRJ-409, SRJ-411)', () => {
   // Tied to src by type: renaming the member or the reading's field fails the typecheck.
   const DEP: keyof RestartDeps = 'deferPendingRow'
   const LAUNCH_FIELD: keyof PendingLivenessReading = 'launchStartedAt'
 
-  test('the hook passes its own key and the reading\'s launch start to the one module-scope deferPendingRow', () => {
+  test('the hook awaits the one module-scope async deferPendingRow with its own key and the reading\'s launch start, and no lookup of its own (the deferral\'s default, the server\'s applied config, decides)', () => {
     const hook = onlyCallProps('initRestart').get(DEP)
     expect(hook).toBeDefined()
-    // `(key, reading) => { deferPendingRow(key, reading.launchStartedAt) }`,
-    // or the same call as an expression body; the parameters' names are free.
+    // `async (key, reading) => { await deferPendingRow(key, reading.launchStartedAt) }`,
+    // the call returned (so the restart work awaits it), or the same call as an
+    // expression body; the parameters' names are free. A block body that
+    // neither awaits nor returns the call would drop the deferral's promise.
     const call = `${DEP}\\(\\1, \\2\\.${LAUNCH_FIELD}\\)`
-    expect(hook).toMatch(new RegExp(`^\\((\\w+), (\\w+)\\) => (?:\\{ ${call};? \\}|${call})$`))
-    // Not an import, and declared once, at module scope.
+    expect(hook).toMatch(new RegExp(`^(?:async )?\\((\\w+), (\\w+)\\) => (?:\\{ (?:await|return) ${call};? \\}|${call})$`))
+    // Not an import, and declared once, at module scope, as an async function.
     expect(importSource(SERVER_CODE, DEP)).toBeUndefined()
     expect(indicesOf(new RegExp(`\\b(?:function|const|let|var)\\s+${DEP}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
-    expect(indicesOf(new RegExp(`^(?:export )?function ${DEP}\\(`, 'gm'), SERVER_CODE)).toHaveLength(1)
+    expect(indicesOf(new RegExp(`^export async function ${DEP}\\(`, 'gm'), SERVER_CODE)).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: b.jg5 SRJ-409, SRJ-411 — the pending-only retry's pending-row
+// step is the session manager's `retryPendingRowStep` over the applied config
+//
+// `FullModeRetryDeps.stepPendingRow` is optional (absent, a pending-only
+// retry whose row reads `pending` is a refusal with no `get`), so a
+// production wiring that dropped it, bound it to a stub or to a lookup other
+// than the applied config would type-check and pass every behaviour suite
+// while an uncovered row at the retry was never sent through the live-row
+// sequence. What the step does is tested in tests/unavailable-retry.test.ts
+// and tests/pending-row.test.ts; pinned here: its binding.
+// ---------------------------------------------------------------------------
+
+describe('main() passes the full-mode retry action the pending-row step, retryPendingRowStep over getAppliedPersona (b.jg5 SRJ-409, SRJ-411)', () => {
+  // Tied to src by type: renaming the member or the step fails the typecheck.
+  const DEP: keyof FullModeRetryDeps = 'stepPendingRow'
+  const STEP: keyof typeof SessionManagerModule = 'retryPendingRowStep'
+
+  test('the member calls the session manager\'s retryPendingRowStep with the key it is given and the live applied-persona lookup\'s persona for that key', () => {
+    // `(key) => retryPendingRowStep(key, getAppliedPersona(key))`; the parameter's name is free.
+    expect(onlyCallProps('createFullModeRetryAction').get(DEP)).toMatch(new RegExp(`^\\(?(\\w+)\\)? => ${STEP}\\(\\1, getAppliedPersona\\(\\1\\)\\)$`))
+    expect(importSource(SERVER_CODE, STEP)).toBe('./session-manager.ts')
+    // The one call of the step in server.ts is this binding's.
+    const [open, close] = balancedAfter(SERVER_CODE, onlyCallOf('createFullModeRetryAction'), '(', ')')
+    const step = onlyCallOf(STEP)
+    expect(step > open && step < close).toBe(true)
+    declaredOnce('getAppliedPersona')
   })
 })
 
@@ -3196,18 +3228,28 @@ describe('main() builds the one unclassified-error episodes instance over the no
     expect(named[0]! > open && named[0]! < close).toBe(true)
   })
 
-  test('the restart module\'s onCapReached raises the cap notice and ends the persona\'s episode with the capped reason, for the key it is given, each in its own try/catch', () => {
+  test('the restart module\'s onCapReached raises the cap notice, ends the persona\'s episode with the capped reason and stops its retry timer with the capped reason (b.jg5 SRJ-305), for the key it is given, each in its own try/catch', () => {
+    // Tied to src by type: renaming either fails the typecheck.
+    const STOP: keyof UnavailableRetryController = 'stop'
+    const STOP_CAPPED: keyof typeof UnavailableRetryModule = 'UNAVAILABLE_RETRY_STOP_CAPPED'
     const unclassified = constOf(FACTORY)
+    const controller = constOf('createUnavailableRetryController')
     const hook = onlyCallProps('initRestart').get(CAP_REACHED)
     expect(hook).toBeDefined()
-    // `(key) => { try { notifyRestartCapReached(key) } catch { } try { <episodes>.end(key, UNCLASSIFIED_ERROR_END_CAPPED) } catch { } }`,
-    // in either order; the parameter's name is free.
-    const notice = isolated('notifyRestartCapReached\\(\\1\\)')
-    const end = isolated(`${unclassified}\\.${END}\\(\\1, ${END_CAPPED}\\)`)
-    expect(hook).toMatch(new RegExp(`^\\(?(\\w+)\\)? => \\{ (?:${notice} ${end}|${end} ${notice}) \\}$`))
+    // `(key) => { try { notifyRestartCapReached(key) } catch { } try { <episodes>.end(key, UNCLASSIFIED_ERROR_END_CAPPED) } catch { }
+    // try { <controller>.stop(key, UNAVAILABLE_RETRY_STOP_CAPPED) } catch { } }`, in any order; the parameter's name is free.
+    const steps = [
+      isolated('notifyRestartCapReached\\(\\1\\)'),
+      isolated(`${unclassified}\\.${END}\\(\\1, ${END_CAPPED}\\)`),
+      isolated(`${controller}\\.${STOP}\\(\\1, ${STOP_CAPPED}\\)`),
+    ]
+    const orders = steps.flatMap((a) => steps.filter((b) => b !== a).flatMap((b) => steps.filter((c) => c !== a && c !== b).map((c) => `${a} ${b} ${c}`)))
+    expect(orders).toHaveLength(6)
+    expect(hook).toMatch(new RegExp(`^\\(?(\\w+)\\)? => \\{ (?:${orders.join('|')}) \\}$`))
     expect(importSource(SERVER_CODE, 'notifyRestartCapReached')).toBe('./session-manager.ts')
     expect(importSource(SERVER_CODE, END_CAPPED)).toBe('./persona-episodes.ts')
-    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+(?:notifyRestartCapReached|${END_CAPPED})\\b`, 'g'), SERVER_CODE)).toEqual([])
+    expect(importSource(SERVER_CODE, STOP_CAPPED)).toBe('./unavailable-retry.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+(?:notifyRestartCapReached|${END_CAPPED}|${STOP_CAPPED})\\b`, 'g'), SERVER_CODE)).toEqual([])
   })
 
   test('the instance is named only at its build, as the sink, in the stop observer, in onCapReached and in the latch\'s unclassified hold (b.jg5 SRJ-502): its end and stop entries are called from those bindings alone, and server.ts reports to it directly nowhere', () => {

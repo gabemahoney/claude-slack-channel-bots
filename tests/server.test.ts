@@ -123,6 +123,7 @@ import {
   SAMPLE_LAUNCH_START_WHOLE,
   type CannedResponse,
   type CloseCountingStubClient,
+  type PersonaGetResultOverrides,
   type StubCallLog,
   type StubClient,
   type StubResolveSystemBinaryOutcome,
@@ -162,6 +163,7 @@ import {
   _buildReconnectSessionAdapter,
   _runCallTimeoutStartStep,
   deferPendingRow,
+  deferringPendingRowLine,
   LAUNCH_START_LOG_RE,
   promptRowAbsentAtPaneReadLine,
   promptRowLatchedLine,
@@ -197,6 +199,8 @@ import {
   _resetNotConnectedEpisodes,
   _resetNow,
   _setNow,
+  _resetConfigDirFs,
+  _setConfigDirFs,
   escalateDeadSweepLine,
   ESCALATE_DEAD_EVIDENCE,
   ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ,
@@ -251,13 +255,18 @@ import {
 } from '../src/persona-episodes.ts'
 import { KILL_FAILURE_CONTEXT_RECOVERY } from '../src/kill-failure-alert.ts'
 import {
+  expectPendingOnlyWatch,
   killFailureEndedLine,
   makeRecoveryHarness,
   ownRowsLiveThenMissing,
+  personaOf,
+  personaRow,
   retiredEntryClearedLine,
   recordSequenceStarts,
   retiredKeyLinesIn,
+  unavailableAt,
   type RecoveryHarness,
+  type RecoveryStubScript,
 } from './test-helpers/recovery-harness.ts'
 import {
   LIVE_ROW_LAUNCH_REASON_RETIRED_KEY,
@@ -266,8 +275,9 @@ import {
   LIVE_ROW_START_ALREADY_RUNNING,
   LIVE_ROW_SEQUENCE_ENTRY_KILL,
   LIVE_ROW_START_STARTED,
+  type LiveRowSequenceRequest,
 } from '../src/live-row-sequence.ts'
-import { _resetLiveRowSequenceRegistry, _resetOldLifeHolds, _resetRetiredKeyStore, setOldLifeHolds, setRetiredKeyStore, SPAWN_ACTION_FRESH_RETIRED } from '../src/session-manager.ts'
+import { _resetLiveRowSequenceRegistry, _resetOldLifeHolds, _resetRetiredKeyStore, setOldLifeHolds, setRetiredKeyStore, SPAWN_ACTION_FRESH_RETIRED, uncoveredPendingRowLine, undecidedPendingRowLine } from '../src/session-manager.ts'
 import {
   createOldLifeHoldSet,
   loadRetiredKeyStore,
@@ -315,9 +325,19 @@ import {
   UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
+  UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
+  UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
   isInsideAttempt,
   runInAttempt,
 } from '../src/unavailable-retry.ts'
+import {
+  PENDING_ROW_REASON_CONFIG_DIR_MISMATCH,
+  PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED,
+  PENDING_ROW_REASON_CWD_MISMATCH,
+  PENDING_ROW_REASON_CWD_UNRESOLVED,
+  PENDING_ROW_REASON_RETIRED_OLD_LIFE,
+  type PendingRowNotCoveredReason,
+} from '../src/pending-row.ts'
 import { describeThrownValue, renderLogMessageText } from '../src/persona-connection-errors.ts'
 import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import {
@@ -328,7 +348,7 @@ import {
   type PersonaConfig,
 } from '../src/config.ts'
 import { resolveJsonlPath } from '../src/cozempic.ts'
-import { personaInstanceId, personaTmuxSessionName } from '../src/persona-identity.ts'
+import { CONFIG_DIR_LABEL_PREFIX, personaInstanceId, personaTmuxSessionName, renderPersonaRef } from '../src/persona-identity.ts'
 import { makePersonaConfig, makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
 import {
   APP_TOKEN_PREFIX,
@@ -2085,18 +2105,27 @@ describe('_buildReconnectSessionAdapter', () => {
   // UNAVAILABLE retry timer knows the row read `pending`. b.jg5 SRJ-115: the
   // row's raw launch start, when its status result shows one, is passed to
   // `deferPendingRow`, and the deferral line names it.
-  /** The deferral line for persona C1, by the launch start it names (`''`: none). */
-  const deferralLine = (launch: string): string =>
-    `[slack] Deferring persona=C1: its row reads pending${launch} — its session has not started (SessionStart has not fired), agent-director refuses send-keys until it does, and it connects on its own once it starts; no reconnect, kill or launch, nothing counted (b.dup)`
-  const DEFERRAL_CASES: ReadonlyArray<readonly [string, string | undefined, string]> = [
-    ['no launch start', SAMPLE_LAUNCH_START_NONE, ''],
-    ...LAUNCH_STARTS.map((start) => [`launch start ${start}`, start, ` (launch started ${start})`] as const),
+  /**
+   * Asserts `lines` is exactly the one deferral line for persona C1, naming
+   * the launch start `logged` (`undefined`: the line with no launch part).
+   * The expected line is built with no launch start when none may be named,
+   * so the builder's own filtering is not what the case relies on.
+   */
+  const expectOneDeferralLine = (lines: string[], logged: string | undefined): void => {
+    expect(lines).toEqual([deferringPendingRowLine('C1', logged)])
+    if (logged === undefined) expect(lines[0]).not.toContain('launch started')
+    else expect(lines[0]).toContain(`its row reads pending (launch started ${logged}) — `)
+  }
+  // [label, launch start passed, launch start the line names]
+  const DEFERRAL_CASES: ReadonlyArray<readonly [string, string | undefined, string | undefined]> = [
+    ['no launch start', SAMPLE_LAUNCH_START_NONE, undefined],
+    ...LAUNCH_STARTS.map((start) => [`launch start ${start}`, start, start] as const),
   ]
 
   // b.jg5 SRJ-408, SRJ-513: the configured-persona query counts no key here,
   // so the row with no launch start latches nothing and is deferred; under a
   // configured persona's key it latches instead (the SRJ-513 describe below).
-  test.each(DEFERRAL_CASES)("REPRO (b.dup), b.jg5 SRJ-303/SRJ-115: a pending row showing %s, under a key no configured persona uses → 'pending' with no send-keys, pane read, tmux call or sweep, no notice, and one line naming its launch start", async (_label, launchStartedAt, launch) => {
+  test.each(DEFERRAL_CASES)("REPRO (b.dup), b.jg5 SRJ-303/SRJ-115: a pending row showing %s, under a key no configured persona uses → 'pending' with no send-keys, pane read, tmux call or sweep, no notice, and one line naming its launch start", async (_label, launchStartedAt, logged) => {
     const raised: string[] = []
     setSessionNotifier((key) => { raised.push(key) })
     setConfiguredPersonaQuery(() => false)
@@ -2118,7 +2147,7 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(tmuxRuns).toEqual([])
       expect(findMissingCalls).toHaveLength(0)
       expect(raised).toEqual([])
-      expect(lines).toEqual([deferralLine(launch)])
+      expectOneDeferralLine(lines, logged)
     } finally {
       console.error = orig
       setSessionNotifier(undefined)
@@ -2127,18 +2156,21 @@ describe('_buildReconnectSessionAdapter', () => {
   })
 
   // b.jg5 SRJ-314: the restart work calls `deferPendingRow` itself (bound in
-  // main()). Called directly it makes no agent-director call (nothing typed,
-  // read or swept), raises no notice, logs its line and answers 'pending'.
-  test.each(DEFERRAL_CASES)("deferPendingRow called directly with %s → 'pending'; no agent-director call, no notice; one line naming its launch start", (_label, launchStartedAt, launch) => {
+  // main()), awaiting it. Called directly for a key that is not applied (no
+  // applied config here), it reads nothing more (b.jg5 SRJ-409: only an
+  // applied persona's row is read again and decided): no agent-director call
+  // (nothing read, typed or swept), no notice, its line, and 'pending'. An
+  // applied persona's decision is the SRJ-409 describe's below.
+  test.each(DEFERRAL_CASES)("deferPendingRow called directly for a key that is not applied, with %s → 'pending'; no agent-director call, no notice; one line naming its launch start", async (_label, launchStartedAt, logged) => {
     const raised: string[] = []
     setSessionNotifier((key) => { raised.push(key) })
-    const { statusCalls, sendKeysCalls, findMissingCalls, readPaneCalls, tmuxRuns } = makeHarness({})
+    const { statusCalls, getCalls, sendKeysCalls, findMissingCalls, readPaneCalls, tmuxRuns } = makeHarness({})
     const lines: string[] = []
     const orig = console.error
     console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
     let result: string | undefined
     try {
-      result = deferPendingRow('C1', launchStartedAt)
+      result = await deferPendingRow('C1', launchStartedAt)
     } finally {
       console.error = orig
       setSessionNotifier(undefined)
@@ -2146,12 +2178,13 @@ describe('_buildReconnectSessionAdapter', () => {
 
     expect(result).toBe('pending')
     expect(statusCalls).toEqual([])
+    expect(getCalls).toEqual([])
     expect(sendKeysCalls).toEqual([])
     expect(readPaneCalls).toEqual([])
     expect(findMissingCalls).toHaveLength(0)
     expect(tmuxRuns).toEqual([])
     expect(raised).toEqual([])
-    expect(lines).toEqual([deferralLine(launch)])
+    expectOneDeferralLine(lines, logged)
   })
 
   // The launch start comes from agent-director, so the deferral line names it
@@ -2173,35 +2206,34 @@ describe('_buildReconnectSessionAdapter', () => {
     expect(LAUNCH_START_LOG_RE.test(OVER_LONG_LAUNCH_START.slice(0, 40))).toBe(true)
   })
 
-  test.each(UNLOGGABLE_LAUNCH_STARTS)("deferPendingRow called directly with a launch start holding %s → 'pending'; exactly one line, without the launch part or the injected text", (_label, launchStartedAt, injected) => {
+  test.each(UNLOGGABLE_LAUNCH_STARTS)("deferPendingRow called directly with a launch start holding %s → 'pending'; exactly one line, without the launch part or the injected text", async (_label, launchStartedAt, injected) => {
     const lines: string[] = []
     const orig = console.error
     console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
     let result: string | undefined
     try {
-      result = deferPendingRow('C1', launchStartedAt)
+      result = await deferPendingRow('C1', launchStartedAt)
     } finally {
       console.error = orig
     }
 
     expect(result).toBe('pending')
-    expect(lines).toEqual([deferralLine('')])
+    expectOneDeferralLine(lines, undefined)
     expect(lines[0]).not.toContain('\n')
-    expect(lines[0]).not.toContain('launch started')
     expect(lines[0]).not.toContain(injected)
   })
 
-  test.each(LAUNCH_STARTS)("deferPendingRow called directly with the valid launch start %s → one line naming it", (start) => {
+  test.each(LAUNCH_STARTS)("deferPendingRow called directly with the valid launch start %s → one line naming it", async (start) => {
     const lines: string[] = []
     const orig = console.error
     console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
     try {
-      deferPendingRow('C1', start)
+      await deferPendingRow('C1', start)
     } finally {
       console.error = orig
     }
 
-    expect(lines).toEqual([deferralLine(` (launch started ${start})`)])
+    expectOneDeferralLine(lines, start)
   })
 
   test('(v) the key passed selects the instance: a non-channel-form key probes and reconnects cscb_<key> (b.av2 SR-2.2)', async () => {
@@ -4792,7 +4824,9 @@ describe('b.jg5 SRJ-809, SRJ-115: the liveness and reconnect adapters\' own-row 
 // read) and answers 'transient'; a second call while that sequence runs starts
 // no second one (one sequence per persona). With the mark set the row is the
 // new life and is reconnected as any other; a key not recorded is unchanged;
-// a `pending` reading keeps its answer.
+// a `pending` reading answers 'pending', and the deferral's one `get` sends
+// the old life through the live-row sequence (b.jg5 SRJ-411; given the
+// applied-persona lookup as main() gives it).
 //
 // On `makeRecoveryHarness`, whose store is installed through the session
 // manager's installer and whose registry is installed as `main()` installs
@@ -4914,12 +4948,256 @@ describe('b.jg5 SRJ-805: the reconnect adapter starts the live-row sequence for 
     if (marked) expect(h.retiredEntry(p)).toMatchObject({ recorded: true, marked: true })
   })
 
-  test('P recorded with no mark, its row reading pending with a launch start: the pending answer as before, nothing typed and no sequence', async () => {
+  // b.jg5 SRJ-411 (the E25 hatch note): the `pending` reading goes to the
+  // deferral, which, given the applied-persona lookup as main() gives it,
+  // reads the row once and finds the unmarked key's old life not covered.
+  test('P recorded with no mark, its row reading pending with a launch start: pending, with nothing typed and no adapter old-life line; the deferral\'s one get finds the old life not covered and makes exactly one start request: seeded pending, entry at step 1, the retired-key flag, the conversation not kept, ending in a launch, context recovery; nothing armed', async () => {
     const { h, p } = retiredReconnect(AGENT_DIRECTOR_PENDING_STATE)
+    h.script({ getFn: undefined, getResult: personaRow(h, p, { state: AGENT_DIRECTOR_PENDING_STATE }) })
+    const starts = recordSequenceStarts()
+    const applied = appliedLookupOf(h)
 
-    expect(await reconnect(h, p)).toBe('pending')
+    expect(await _buildReconnectSessionAdapter(undefined, (k) => h.latch.isLatched(k), applied)(p)).toBe('pending')
 
-    expect([h.stub.calls.sendKeysCalls, h.sequenceRunning(p), oldLifeLinesIn(h)]).toEqual([[], false, []])
+    expect([h.stub.calls.sendKeysCalls, h.stub.calls.readPaneCalls, oldLifeLinesIn(h)]).toEqual([[], [], []])
+    expect(h.stub.calls.getCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+    expect(starts).toEqual([pendingRowStartRequest(h, p, { retiredKey: true, retiredAtStart: { recorded: true, marked: false, generation: 1 } })])
+    expect([h.triggers, h.controller.isArmed(p), getFailureCount(p)]).toEqual([[], false, 0])
+  })
+})
+
+/** The harness's applied-persona lookup, as `main()` gives the deferral the server's applied config. */
+function appliedLookupOf(h: RecoveryHarness): (key: string) => Persona | undefined {
+  return (key) => h.config.personas.find((persona) => persona.key === key)
+}
+
+/**
+ * The one start request the pending-row step makes for persona `key`'s row
+ * read `pending` and not covered (b.jg5 SRJ-411): seeded `pending`, entry at
+ * step 1, the conversation not kept, ending in a launch, alert context
+ * `recovery`, with `fields`' retired-key flag and the start entry's reading.
+ */
+function pendingRowStartRequest(
+  h: RecoveryHarness,
+  key: string,
+  fields: Pick<LiveRowSequenceRequest, 'retiredKey' | 'retiredAtStart'>,
+): LiveRowSequenceRequest {
+  return {
+    key,
+    ref: renderPersonaRef(h.config.personas.find((persona) => persona.key === key)!.name, key),
+    instanceId: personaInstanceId(key),
+    lastReadState: AGENT_DIRECTOR_PENDING_STATE,
+    entryStep: LIVE_ROW_SEQUENCE_ENTRY_KILL,
+    keepsConversation: false,
+    ...fields,
+    launches: true,
+    alertContext: KILL_FAILURE_CONTEXT_RECOVERY,
+  }
+}
+
+/** Row labels without the `config_dir` label: a `pending` row whose label is missing is not covered (b.jg5 SRJ-411, SRJ-1504). */
+function withoutConfigDirLabel(labels: Record<string, string> | undefined): Record<string, string> {
+  return Object.fromEntries(Object.entries(labels ?? {}).filter(([name]) => `${name}=` !== CONFIG_DIR_LABEL_PREFIX))
+}
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-409, SRJ-411 (the E8, E9 and E25 hatch notes): the reconnect
+// adapter's `pending` branch and the restart path's `deferPendingRow` decide
+// whether the row is covered
+//
+// Both reach the deferral, which logs its line (naming the launch start the
+// `status` read carried, raw) and, for an applied persona, reads its row once
+// with `get` and takes the one pending-row step. SRJ-409's `transient` is the
+// deferral's 'pending' answer (E8): nothing counted, no relaunch. A covered
+// row arms P's retry timer in pending-only mode with the pending-row cause,
+// and so does an undecided one (P's working directory with no real path,
+// whatever the row's `cwd`), with its one line; a row that is not covered (a `cwd` or `config_dir` mismatch; a retired
+// key's old life is the SRJ-805 describe's above at the adapter, and here at
+// the deferral) starts one live-row sequence, nothing typed, no approver; a
+// configured persona's own row with no launch start latches and arms
+// nothing; a read that answers no `pending` row logs one line and decides
+// nothing. On `makeRecoveryHarness`; the adapter and the deferral are called
+// directly with the harness's applied-persona lookup, as main() passes the
+// server's. The read-and-step itself is tests/pending-row.test.ts's; the
+// restart path's call of the deferral is tests/restart.test.ts's.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-409, SRJ-411: the reconnect adapter\'s pending branch and deferPendingRow arm a covered pending row pending-only and send an uncovered one through the live-row sequence, answering pending', () => {
+  let harness: RecoveryHarness | undefined
+
+  afterEach(() => {
+    const h = harness
+    harness = undefined
+    _resetConfigDirFs()
+    if (h === undefined) return
+    try {
+      assertNoLeak(h.captured())
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  /** A harness over P and Q, P's `status` reading `pending` with `launch` and its `get` reading P's own `pending` row with `launch`, then `row`. */
+  function pendingP(launch: string | undefined, row: PersonaGetResultOverrides = {}): { h: RecoveryHarness; p: string; q: string } {
+    const h = (harness = makeRecoveryHarness())
+    const [p, q] = h.keys as [string, string]
+    h.script({
+      statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: launch }),
+      getResult: personaRow(h, p, { state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: launch, ...row }),
+    })
+    return { h, p, q }
+  }
+
+  /** Each origin, called with the harness's applied-persona lookup: the reconnect adapter (with the harness's latch), and the deferral with the `status` read's launch start. */
+  const ORIGINS: ReadonlyArray<readonly [string, (h: RecoveryHarness, key: string, launch: string | undefined) => Promise<string>]> = [
+    ['the reconnect adapter', (h, key) => _buildReconnectSessionAdapter(undefined, (k) => h.latch.isLatched(k), appliedLookupOf(h))(key) as Promise<string>],
+    ['deferPendingRow', (h, key, launch) => deferPendingRow(key, launch, appliedLookupOf(h))],
+  ]
+
+  /** The deferral lines for persona `key` among the harness's lines. */
+  const deferralLinesOf = (h: RecoveryHarness, key: string): string[] => h.errors.filter((line) => line.startsWith(`[slack] Deferring persona=${key}: `))
+
+  /** No launch, kill, keystroke or pane read for persona `key`, nothing counted, and no approver. */
+  function expectNothingLaunchedOrTyped(h: RecoveryHarness, key: string): void {
+    const id = personaInstanceId(key)
+    const { spawnCalls, resumeCalls, killCalls, sendKeysCalls, readPaneCalls } = h.stub.calls
+    expect([spawnCalls, resumeCalls, killCalls, sendKeysCalls, readPaneCalls].map((calls) => calls.filter((c) => c.claude_instance_id === id))).toEqual([[], [], [], [], []])
+    expect([getFailureCount(key), h.approverRunning(key)]).toEqual([0, false])
+  }
+
+  test.each(ORIGINS.flatMap(([origin, call]) => [SAMPLE_LAUNCH_START_FRACTIONAL, SAMPLE_LAUNCH_START_WHOLE].map((launch) => [origin, launch, call] as const)))(
+    '%s, P\'s own pending row covered (launch start %s): pending; P\'s timer armed in pending-only mode with the pending-row cause after one get; no relaunch, kill or keystroke, nothing counted, no sequence; the deferral line names the launch start as read',
+    async (_origin, launch, call) => {
+      const { h, p, q } = pendingP(launch)
+
+      expect(await call(h, p, launch)).toBe('pending')
+
+      expectPendingOnlyWatch(h, p)
+      expect(h.controller.view(p)).toMatchObject({ mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW] })
+      expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
+      expect(h.stub.calls.getCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+      expectNothingLaunchedOrTyped(h, p)
+      expect(h.sequenceRunning(p)).toBe(false)
+      expect(deferralLinesOf(h, p)).toEqual([expect.stringContaining(`its row reads pending (launch started ${launch}) — `)])
+      expect(h.controller.isArmed(q)).toBe(false)
+    },
+  )
+
+  /** Each way P's `pending` row is not covered at both origins, by its `get` row. */
+  const UNCOVERED: ReadonlyArray<readonly [string, (h: RecoveryHarness, key: string) => PersonaGetResultOverrides, PendingRowNotCoveredReason]> = [
+    ['its cwd another existing directory', (h) => ({ cwd: h.home }), PENDING_ROW_REASON_CWD_MISMATCH],
+    ['its config_dir label missing', (h, key) => ({ labels: withoutConfigDirLabel(personaRow(h, key).labels) }), PENDING_ROW_REASON_CONFIG_DIR_MISMATCH],
+  ]
+
+  test.each(ORIGINS.flatMap(([origin, call]) => UNCOVERED.map(([label, row, reason]) => [origin, label, call, row, reason] as const)))(
+    '%s, P\'s pending row not covered (%s): pending, with nothing typed and no approver; one uncovered-row line and exactly one start request, seeded pending, entry at step 1, the conversation not kept, ending in a launch, context recovery; no pending-only arm',
+    async (_origin, _label, call, row, reason) => {
+      const { h, p } = pendingP(SAMPLE_LAUNCH_START_WHOLE)
+      h.script({ getResult: personaRow(h, p, { state: AGENT_DIRECTOR_PENDING_STATE, ...row(h, p) }) })
+      const starts = recordSequenceStarts()
+
+      expect(await call(h, p, SAMPLE_LAUNCH_START_WHOLE)).toBe('pending')
+
+      expect(starts).toEqual([pendingRowStartRequest(h, p, { retiredKey: false, retiredAtStart: { recorded: false, marked: false, generation: undefined } })])
+      expect(h.errors.filter((line) => line === uncoveredPendingRowLine(renderPersonaRef(personaOf(h, p).name, p), reason))).toHaveLength(1)
+      expectNothingLaunchedOrTyped(h, p)
+      expect([h.triggers, h.controller.isArmed(p)]).toEqual([[], false])
+    },
+  )
+
+  // b.jg5 SRJ-411 (hatch A3), b.av2 SR-6.4: a status-only site, so P's
+  // working directory with no real path leaves the row undecided whatever its
+  // cwd: never covered on a lexically equal path, never sent to the sequence.
+  test.each(ORIGINS.flatMap(([origin, call]) => ([
+    ['lexically its configured path', undefined],
+    ['another existing directory', (h: RecoveryHarness) => h.home],
+  ] as const).map(([label, cwd]) => [origin, label, call, cwd] as const)))(
+    '%s, P\'s working directory gone and its pending row\'s cwd %s: pending; undecided, P\'s timer armed pending-only with the undecided line; no sequence, nothing typed, no approver',
+    async (_origin, _label, call, cwd) => {
+      const { h, p } = pendingP(SAMPLE_LAUNCH_START_WHOLE)
+      rmSync(personaOf(h, p).working_directory, { recursive: true, force: true })
+      if (cwd !== undefined) h.script({ getResult: personaRow(h, p, { state: AGENT_DIRECTOR_PENDING_STATE, cwd: cwd(h) }) })
+      const starts = recordSequenceStarts()
+
+      expect(await call(h, p, SAMPLE_LAUNCH_START_WHOLE)).toBe('pending')
+
+      expectPendingOnlyWatch(h, p)
+      expect(h.errors.filter((line) => line === undecidedPendingRowLine(renderPersonaRef(personaOf(h, p).name, p), PENDING_ROW_REASON_CWD_UNRESOLVED, true))).toHaveLength(1)
+      expect(starts).toEqual([])
+      expectNothingLaunchedOrTyped(h, p)
+    },
+  )
+
+  // b.jg5 SRJ-409 (ruling R8): at a status-only site P's claude_config_dir
+  // with no real path leaves the row undecided before its cwd is compared, so
+  // a cwd that resolves elsewhere is not sent to the sequence (the ladder
+  // keeps the cwd mismatch first; the pure order is tests/pending-row.test.ts's).
+  test('deferPendingRow, P\'s pending row\'s cwd another existing directory and P\'s claude_config_dir unresolvable: pending; undecided (config dir), P\'s timer armed pending-only with the undecided line; no sequence, nothing typed, no approver', async () => {
+    const { h, p } = pendingP(SAMPLE_LAUNCH_START_WHOLE)
+    h.script({ getResult: personaRow(h, p, { state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_WHOLE, cwd: h.home }) })
+    _setConfigDirFs({ realpath: () => { throw Object.assign(new Error('no such directory'), { code: 'ENOENT' }) } })
+    const starts = recordSequenceStarts()
+
+    expect(await deferPendingRow(p, SAMPLE_LAUNCH_START_WHOLE, appliedLookupOf(h))).toBe('pending')
+
+    expectPendingOnlyWatch(h, p)
+    expect(h.controller.view(p)).toMatchObject({ mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW] })
+    expect(h.errors.filter((line) => line === undecidedPendingRowLine(renderPersonaRef(personaOf(h, p).name, p), PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED, true))).toHaveLength(1)
+    expect(h.errors.filter((line) => line === uncoveredPendingRowLine(renderPersonaRef(personaOf(h, p).name, p), PENDING_ROW_REASON_CWD_MISMATCH))).toEqual([])
+    expect(starts).toEqual([])
+    expect(h.stub.calls.getCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+    expectNothingLaunchedOrTyped(h, p)
+  })
+
+  test('deferPendingRow, P recorded with no mark and its pending row its old life (b.jg5 SRJ-805): pending; one start request with the retired-key flag, nothing typed, no approver, no pending-only arm', async () => {
+    const { h, p } = pendingP(SAMPLE_LAUNCH_START_WHOLE)
+    h.retireKey(p)
+    const starts = recordSequenceStarts()
+
+    expect(await deferPendingRow(p, SAMPLE_LAUNCH_START_WHOLE, appliedLookupOf(h))).toBe('pending')
+
+    expect(starts).toEqual([pendingRowStartRequest(h, p, { retiredKey: true, retiredAtStart: { recorded: true, marked: false, generation: 1 } })])
+    expect(h.errors.filter((line) => line === uncoveredPendingRowLine(renderPersonaRef(personaOf(h, p).name, p), PENDING_ROW_REASON_RETIRED_OLD_LIFE))).toHaveLength(1)
+    expectNothingLaunchedOrTyped(h, p)
+    expect([h.triggers, h.controller.isArmed(p)]).toEqual([[], false])
+  })
+
+  // b.jg5 SRJ-513, SRJ-408 (the E16 hatch note): never covered. At the
+  // adapter its own `status` read latches P first ('transient', no `get`);
+  // at the deferral, whose `status` read carried a launch start, the `get`
+  // shows none and latches P.
+  test.each([
+    ['the reconnect adapter, its status showing no launch start', ORIGINS[0]![1], SAMPLE_LAUNCH_START_NONE, 'transient', 0],
+    ['deferPendingRow, its get showing no launch start', ORIGINS[1]![1], SAMPLE_LAUNCH_START_WHOLE, 'pending', 1],
+  ] as const)('%s: P latches; nothing armed, no sequence, nothing typed', async (_label, call, statusLaunch, answer, gets) => {
+    const { h, p } = pendingP(statusLaunch, { launch_started_at: SAMPLE_LAUNCH_START_NONE })
+    const starts = recordSequenceStarts()
+
+    expect(await call(h, p, statusLaunch)).toBe(answer)
+
+    expect(h.latch.isLatched(p)).toBe(true)
+    expect(h.stub.calls.getCalls).toHaveLength(gets)
+    expect([starts, h.triggers, h.controller.isArmed(p)]).toEqual([[], [], false])
+    expectNothingLaunchedOrTyped(h, p)
+  })
+
+  // A `get` that finds no `pending` row decides nothing in this run: one line, nothing armed or started.
+  test.each<[string, (h: RecoveryHarness, key: string) => RecoveryStubScript, string]>([
+    ['reads the row waiting', (h, key) => ({ getResult: personaRow(h, key) }), 'its row now reads waiting — '],
+    ['answers ErrSpawnNotFound', () => ({ getError: errSpawnNotFound() }), 'its row is gone (ErrSpawnNotFound) — '],
+    ['is refused (UNAVAILABLE)', () => ({ getError: unavailableAt('get') }), 'its row could not be read again ('],
+  ])('deferPendingRow, P\'s get %s: pending; one line saying so after the deferral line; nothing armed, started or typed', async (_label, script, said) => {
+    const { h, p } = pendingP(SAMPLE_LAUNCH_START_WHOLE)
+    h.script({ getResult: undefined, ...script(h, p) })
+    const starts = recordSequenceStarts()
+
+    expect(await deferPendingRow(p, SAMPLE_LAUNCH_START_WHOLE, appliedLookupOf(h))).toBe('pending')
+
+    const lines = deferralLinesOf(h, p)
+    expect(lines).toHaveLength(2)
+    expect(lines[1]).toStartWith(`[slack] Deferring persona=${p}: ${said}`)
+    expect([starts, h.triggers, h.controller.isArmed(p)]).toEqual([[], [], false])
+    expectNothingLaunchedOrTyped(h, p)
   })
 })
 
