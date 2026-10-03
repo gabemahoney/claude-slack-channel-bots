@@ -954,6 +954,108 @@ function expectInOrder(text: string, parts: string[]): void {
   expect([...at].sort((a, b) => a - b)).toEqual(at)
 }
 
+/** A string or template literal (a template without a nested backtick). */
+const SCRIPT_LITERAL = /'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|`(?:\\.|[^`\\])*`/g
+
+/** A shell command word naming tmux or agent-director: the bare name or an absolute path ending in it. */
+const TMUX_OR_AD_WORD = /^(?:\/\S*\/)?(?:tmux|agent-director)$/
+
+/**
+ * The tmux and agent-director commands in the `bash -c` scripts of `text`
+ * (comment-stripped), which the argv scan's `['tmux', …]` literal never sees.
+ * A `-c` argv element (any quote) is followed by its script: a literal, an
+ * array of literals and `...` spreads that is `.join`ed, or a `const` in the
+ * same file holding either (spreads resolved the same way). Each command of
+ * the script (split at newlines, `;`, `&&`, `||`, `|`, `$(` and a backtick,
+ * leading `if`, `then`, `do` and the like dropped) whose first word is tmux or
+ * agent-director is collected. A script that is none of these is returned in
+ * `unresolved`, so an indirection cannot pass silently.
+ */
+function shellScriptCommands(text: string): { commands: string[]; unresolved: string[] } {
+  const resolving = new Set<string>()
+  const constLiterals = (name: string): string[] | null => {
+    const decl = new RegExp(`\\bconst ${name.replace(/\$/g, '\\$')}\\s*(?::[^=]+)?=\\s*`).exec(text)
+    if (decl === null || resolving.has(name)) return null
+    resolving.add(name)
+    const literals = literalsAt(decl.index + decl[0].length, false)
+    resolving.delete(name)
+    return literals
+  }
+  const literalsAt = (at: number, mustJoin: boolean): string[] | null => {
+    const rest = text.slice(at)
+    if (/^['"`]/.test(rest)) {
+      const literal = new RegExp(SCRIPT_LITERAL.source, 'y').exec(rest)?.[0]
+      return literal !== undefined && /^\s*(?:[,\])\n;]|$)/.test(rest.slice(literal.length)) ? [literal] : null
+    }
+    if (rest.startsWith('[')) {
+      const [from, to] = balancedAfter(text, at, '[', ']')
+      if (mustJoin && !text.startsWith('.join(', to + 1)) return null
+      const body = text.slice(from, to)
+      const spreads = [...body.replace(SCRIPT_LITERAL, '""').matchAll(/\.\.\.([A-Za-z_$][\w$]*)/g)].map((m) => constLiterals(m[1]!))
+      if (body.replace(SCRIPT_LITERAL, '').replace(/\.\.\.[A-Za-z_$][\w$]*/g, '').replace(/[\s,]/g, '') !== '') return null
+      if (spreads.some((s) => s === null)) return null
+      return [...(body.match(SCRIPT_LITERAL) ?? []), ...spreads.flatMap((s) => s ?? [])]
+    }
+    const name = /^([A-Za-z_$][\w$]*)\s*(?=[,\]\n]|$)/.exec(rest)?.[1]
+    return name === undefined ? null : constLiterals(name)
+  }
+  /** The script element at `at`, as written: a name or member path, with its call's `(…)` or an array's `[…]`. */
+  const elementAt = (at: number): string => {
+    const head = /^[\w$.]*/.exec(text.slice(at))![0]
+    const open = text[at + head.length]
+    if (open !== '(' && open !== '[') return head
+    const [, to] = balancedAfter(text, at + head.length, open, open === '(' ? ')' : ']')
+    return text.slice(at, to + 1)
+  }
+  const commands: string[] = []
+  const unresolved: string[] = []
+  for (const m of text.matchAll(/(['"`])-c\1\s*,\s*/g)) {
+    const at = m.index! + m[0].length
+    const literals = literalsAt(at, true)
+    if (literals === null) {
+      unresolved.push(elementAt(at))
+      continue
+    }
+    for (const literal of literals) {
+      for (const part of literal.slice(1, -1).split(/\\n|\n|;|&&|\|\||\||\$\(|`/)) {
+        const command = part.trim().replace(/^(?:(?:if|then|do|else|elif|while|until|!|\{|\()\s+)*/, '')
+        const word = (command.split(/\s+/)[0] ?? '').replace(/^[\\'"]+|[\\'"]+$/g, '')
+        if (TMUX_OR_AD_WORD.test(word)) commands.push(command)
+      }
+    }
+  }
+  return { commands, unresolved }
+}
+
+describe('shellScriptCommands (the runner-wiring audit\'s bash -c collector)', () => {
+  test('collects a tmux or agent-director command from an inline -c script in any quote style', () => {
+    expect(shellScriptCommands(`run(['bash', '-c', 'tmux ls', 'sessions'])`).commands).toEqual(['tmux ls'])
+    expect(shellScriptCommands(`run(["bash", "-c", "tmux kill-server"])`).commands).toEqual(['tmux kill-server'])
+    expect(shellScriptCommands('run([`bash`, `-c`, `agent-director list --label ${label}`])').commands).toEqual(['agent-director list --label ${label}'])
+  })
+
+  test('resolves a script held in a const: a string, or an array of lines joined, its spreads resolved too', () => {
+    expect(shellScriptCommands(`const S = 'tmux ls -F x'\nconst a = ['bash', '-c', S, 'list']`).commands).toEqual(['tmux ls -F x'])
+    const joined = `const TAIL = ['tail -c "$n" "$f"', 'tmux has-session -t "$s"']\nexport const S: string = [\n  'set -e',\n  ...TAIL,\n].join('\\n')\nrun(['bash', '-c', S])`
+    expect(shellScriptCommands(joined).commands).toEqual(['tmux has-session -t "$s"'])
+    expect(shellScriptCommands(`run(['bash', '-c', ['set -e', 'agent-director stop x'].join('\\n'), 'seed'])`).commands).toEqual(['agent-director stop x'])
+  })
+
+  test('collects a command after a separator or a shell keyword, and one named by an absolute path', () => {
+    const script = `run(['bash', '-c', 'for i in $(seq 1 5); do if /usr/bin/tmux capture-pane -p; then exit 0; fi; done && x | tmux ls || exit 1'])`
+    expect(shellScriptCommands(script).commands).toEqual(['/usr/bin/tmux capture-pane -p', 'tmux ls'])
+  })
+
+  test('collects nothing from a script that runs neither, nor from log text outside a -c script', () => {
+    expect(shellScriptCommands(`run(['bash', '-c', 'printf "%s" "$1"; echo tmux', 'prompt'])\nconst why = 'tmux ls exit 1'`)).toEqual({ commands: [], unresolved: [] })
+  })
+
+  test('reports a script it cannot read (a call, an import, an array not joined) as unresolved', () => {
+    const text = `run(['bash', '-c', helperScript(script)])\nrun(['bash', '-c', IMPORTED, 'x'])\nrun(['bash', '-c', ['tmux ls'], 'x'])`
+    expect(shellScriptCommands(text)).toEqual({ commands: [], unresolved: ['helperScript(script)', 'IMPORTED', "['tmux ls']"] })
+  })
+})
+
 describe('runner wiring (source audit of ci-live/)', () => {
   test('the host environment reaches a child only through minimalChildEnv or claudeChildEnv', () => {
     const allowed = [
@@ -1084,6 +1186,8 @@ describe('runner wiring (source audit of ci-live/)', () => {
   test("no host command starts, stops or kills CSCB, tmux or agent-director: those appear only in the checks, which reach the container only; the HOST check's two read-only probes are the only host-side agent-director and tmux argv (b.jg5 SRJ-1301's one exception)", () => {
     const failures: string[] = []
     const argvLiterals: string[] = []
+    const shellCommands: string[] = []
+    const unresolvedScripts: string[] = []
     let checkFiles = 0
     let dryRunSeed = ''
     let pinnedTakenOut = false
@@ -1111,8 +1215,28 @@ describe('runner wiring (source audit of ci-live/)', () => {
       if (/kill-session|send-keys|new-session|kill-server/.test(text)) failures.push(`${rel}: builds a tmux command that changes sessions`)
       if (/claude-slack-channel-bots['",\s]+(start|stop|restart)\b/.test(text)) failures.push(`${rel}: builds a CSCB start or stop`)
       for (const m of text.matchAll(/\[\s*'(agent-director|tmux)'[^\]]*\]/g)) argvLiterals.push(`${rel}: ${m[0]}`)
+      const shell = shellScriptCommands(text)
+      shellCommands.push(...shell.commands.map((c) => `${rel}: ${c}`))
+      unresolvedScripts.push(...shell.unresolved.map((s) => `${rel}: ${s}`))
+      if (/\.sh\(/.test(text)) failures.push(`${rel}: runs a script through the container's sh outside the checks`)
     }
     expect(failures).toEqual([])
+    // The bash -c scripts' tmux commands, which the argv literal scan above does not see: each read-only and run in the test
+    // container, never on the host. container-logs.ts's three copy a persona's pane (listSessionsArgv, capturePaneArgv) and
+    // reach a process only through its one o.container.exec (docker exec, lib/container.ts); main.ts's waits for the dry
+    // run's fixture pane in seedDryRunSessions' tc.exec (pinned below). Exact equality, so a new one fails until reviewed.
+    expect(shellCommands.sort()).toEqual([
+      `${join('lib', 'container-logs.ts')}: tmux capture-pane -p -J -S "-$h" -t "$s" > "$f" 2>/dev/null`,
+      `${join('lib', 'container-logs.ts')}: tmux has-session -t "$s" 2>/dev/null`,
+      `${join('lib', 'container-logs.ts')}: tmux ls -F "#{session_name}"`,
+      'main.ts: tmux capture-pane -p -t "$5"',
+    ])
+    const containerLogs = code(join('lib', 'container-logs.ts'))
+    expect(indicesOf(/\bo\.container\.exec\(/g, containerLogs).length).toBe(1)
+    expect(containerLogs).not.toMatch(/\bbunSpawn\b|\bSpawnFn\b|\bBun\.|\bspawn\b|\.docker\b|\bDockerCli\b/)
+    // The closed list of bash -c scripts the collector cannot read: TestContainer.sh's, the checks' own scripts (scanned with
+    // the checks above, in the container only); no runner file outside the checks calls sh (failures above).
+    expect(unresolvedScripts).toEqual([`${join('lib', 'container.ts')}: helperScript(script)`])
     // The checks do kill tmux sessions (Checks 7, 12, 24), in the container; on the host only the HOST check's two read-only probes run.
     // b.jg5 SRJ-1301: these two argv are the one exception to "no host-side agent-director or tmux"; exact equality, so a third fails.
     expect(checkFiles).toBeGreaterThan(0)

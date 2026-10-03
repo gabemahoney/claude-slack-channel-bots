@@ -4,9 +4,10 @@
  * startup code must never run in a unit test; b.av2 SR-13.2).
  *
  * Pass every helper comment-stripped code (`stripComments`). The bracket
- * scanners skip string and template literals, so a bracket or comma inside a
- * string never shifts a match; they do not understand regex literals or type
- * arguments (`<a, b>`), so audit code without them.
+ * scanners skip string and template literals (templates nested inside
+ * `${…}` included), so a bracket or comma inside a string never shifts a
+ * match; they do not understand regex literals or type arguments
+ * (`<a, b>`), so audit code without them.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -14,22 +15,179 @@
 import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-/** A string or template literal (the same shapes `stripComments` keeps). */
-const LITERAL = /'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|`(?:\\.|[^`\\])*`/y
+// ---------------------------------------------------------------------------
+// The lexer behind stripComments, maskLiterals and the bracket scanners
+// ---------------------------------------------------------------------------
+
+/** One piece of source text: code, a comment, or the text of a string, template or regex literal. */
+interface Segment {
+  readonly kind: 'code' | 'comment' | 'literal'
+  readonly text: string
+}
+
+/** Characters after which a `/` starts a regex literal rather than a division. */
+const REGEX_AFTER_PUNCTUATOR = new Set('(,=:[!&|?{};+-*%<>~^}'.split(''))
+
+/** Keywords after which a `/` starts a regex literal rather than a division. */
+const REGEX_AFTER_KEYWORD = new Set(['return', 'typeof', 'case', 'do', 'else', 'in', 'of', 'new', 'delete', 'void', 'throw', 'yield', 'await', 'instanceof'])
+
+/** Whether a `/` that follows the code `before` (comments already dropped) starts a regex literal. */
+function regexMayStart(before: string): boolean {
+  let k = before.length - 1
+  while (k >= 0 && /\s/.test(before[k]!)) k--
+  if (k < 0) return true
+  if (REGEX_AFTER_PUNCTUATOR.has(before[k]!)) return true
+  const word = /[\w$]+$/.exec(before.slice(Math.max(0, k - 11), k + 1))?.[0]
+  return word !== undefined && REGEX_AFTER_KEYWORD.has(word)
+}
+
+/** The offset just past the `'` or `"` string starting at `at`, or undefined when it is not closed on its line. */
+function stringEnd(src: string, at: number): number | undefined {
+  const quote = src[at]
+  for (let i = at + 1; i < src.length; i++) {
+    const ch = src[i]
+    if (ch === '\\') i++
+    else if (ch === quote) return i + 1
+    else if (ch === '\n') return undefined
+  }
+  return undefined
+}
+
+/** The offset just past the regex literal (flags included) starting at `at`, or undefined when none closes on its line. */
+function regexEnd(src: string, at: number): number | undefined {
+  let inClass = false
+  for (let i = at + 1; i < src.length; i++) {
+    const ch = src[i]
+    if (ch === '\\') i++
+    else if (ch === '\n') return undefined
+    else if (inClass) inClass = ch !== ']'
+    else if (ch === '[') inClass = true
+    else if (ch === '/') {
+      let end = i + 1
+      while (end < src.length && /[A-Za-z]/.test(src[end]!)) end++
+      return end
+    }
+  }
+  return undefined
+}
+
+/** How many characters of the code before a `/` `regexMayStart` needs (the longest keyword, with room for spaces). */
+const REGEX_LOOKBEHIND = 32
+
+/**
+ * Lexes `src` from `at` as code, appending to `out`, until its end or, when
+ * `inSubstitution`, until the `}` that closes a template's `${`. Returns the
+ * offset where it stopped (that `}` itself is not consumed).
+ */
+function lexCode(src: string, at: number, inSubstitution: boolean, out: Segment[]): number {
+  let code = ''
+  let depth = 0
+  let before = '' // the tail of the code and literal text lexed at this level before `code`, to decide a `/`
+  const push = (kind: Segment['kind'], text: string): void => {
+    if (code !== '') out.push({ kind: 'code', text: code })
+    if (kind !== 'comment') before = (before + code + text).slice(-REGEX_LOOKBEHIND)
+    else before = (before + code).slice(-REGEX_LOOKBEHIND)
+    code = ''
+    if (text !== '') out.push({ kind, text })
+  }
+  let i = at
+  while (i < src.length) {
+    const ch = src[i]!
+    const next = src[i + 1]
+    let end: number | undefined
+    if (ch === '/' && (next === '/' || next === '*')) {
+      const close = next === '/' ? src.indexOf('\n', i) : src.indexOf('*/', i + 2)
+      end = close < 0 ? src.length : next === '/' ? close : close + 2
+      push('comment', src.slice(i, end))
+    } else if ((ch === '\'' || ch === '"') && (end = stringEnd(src, i)) !== undefined) {
+      push('literal', src.slice(i, end))
+    } else if (ch === '`') {
+      push('literal', '')
+      end = lexTemplate(src, i, out).end
+      before = (before + '`').slice(-REGEX_LOOKBEHIND)
+    } else if (ch === '/' && regexMayStart(before + code.slice(-REGEX_LOOKBEHIND)) && (end = regexEnd(src, i)) !== undefined) {
+      push('literal', src.slice(i, end))
+    } else {
+      if (inSubstitution && ch === '{') depth++
+      else if (inSubstitution && ch === '}' && depth-- === 0) break
+      code += ch
+      end = i + 1
+    }
+    i = end
+  }
+  push('code', '')
+  return i
+}
+
+/**
+ * Lexes the template literal starting at `at` (a backtick), appending its
+ * text as literal segments and each `${…}` as code, nested templates
+ * included. Answers the offset just past its closing backtick (the end of
+ * `src` when it never closes) and whether it closed.
+ */
+function lexTemplate(src: string, at: number, out: Segment[]): { end: number; closed: boolean } {
+  let text = '`'
+  let i = at + 1
+  while (i < src.length) {
+    const ch = src[i]!
+    if (ch === '\\') {
+      text += src.slice(i, i + 2)
+      i += 2
+    } else if (ch === '`') {
+      out.push({ kind: 'literal', text: text + '`' })
+      return { end: i + 1, closed: true }
+    } else if (ch === '$' && src[i + 1] === '{') {
+      out.push({ kind: 'literal', text }, { kind: 'code', text: '${' })
+      text = ''
+      i = lexCode(src, i + 2, true, out)
+      if (i < src.length) {
+        out.push({ kind: 'code', text: '}' })
+        i++
+      }
+    } else {
+      text += ch
+      i++
+    }
+  }
+  out.push({ kind: 'literal', text })
+  return { end: src.length, closed: false }
+}
+
+/** `src` as segments: code, comments, and string, template and regex literal text. */
+function lex(src: string): Segment[] {
+  const out: Segment[] = []
+  lexCode(src, 0, false, out)
+  return out
+}
 
 /**
  * `source` with every comment removed: block comments (JSDoc included) and
- * line comments, whole-line or trailing. String and template literals are
- * matched first and kept, so a `//` inside a string is not taken for a
- * comment. Prose or commented-out code that names a function (e.g. "BEFORE
+ * line comments, whole-line or trailing. String, template and regex literals
+ * are lexed and kept, templates nested inside `${…}` and quotes or backticks
+ * inside a regex literal included, so a `//` or `/*` inside a literal is not
+ * taken for a comment and a quote inside one never shifts what follows.
+ * Prose or commented-out code that names a function (e.g. "BEFORE
  * startupSessionManager", `// await reconcileOrphans(personaConfig)`) can then
  * never satisfy or skew a code-position assertion.
  */
 export function stripComments(source: string): string {
-  return source.replace(
-    /('(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|`(?:\\.|[^`\\])*`)|\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,
-    (_match, literal: string | undefined) => literal ?? '',
-  )
+  return lex(source)
+    .filter((s) => s.kind !== 'comment')
+    .map((s) => s.text)
+    .join('')
+}
+
+/**
+ * `code` (comment-stripped, see `stripComments`) with the text of every
+ * string, template and regex literal, quotes included, replaced by spaces
+ * (newlines kept), so offsets match `code`. Code inside a template's `${…}`
+ * stays. Search it for code positions (a call, an identifier) that text in a
+ * literal must never satisfy, then read the call from `code` at that offset.
+ */
+export function maskLiterals(code: string): string {
+  return lex(code)
+    .map((s) => (s.kind === 'code' ? s.text : s.text.replace(/[^\n]/g, ' ')))
+    .join('')
 }
 
 /** Start offsets of every match of the global regex `re` in `text`. */
@@ -37,10 +195,17 @@ export function indicesOf(re: RegExp, text: string): number[] {
   return [...text.matchAll(re)].map((m) => m.index ?? -1)
 }
 
-/** The offset just past the string or template literal starting at `at`, or `at` when none starts there. */
+/**
+ * The offset just past the string or template literal starting at `at`
+ * (templates nested inside `${…}` included), or `at` when none starts there
+ * or it never closes.
+ */
 function skipLiteral(text: string, at: number): number {
-  LITERAL.lastIndex = at
-  return LITERAL.test(text) ? LITERAL.lastIndex : at
+  const ch = text[at]
+  if (ch === '\'' || ch === '"') return stringEnd(text, at) ?? at
+  if (ch !== '`') return at
+  const { end, closed } = lexTemplate(text, at, [])
+  return closed ? end : at
 }
 
 const OPENERS: Record<string, string> = { '(': ')', '{': '}', '[': ']' }

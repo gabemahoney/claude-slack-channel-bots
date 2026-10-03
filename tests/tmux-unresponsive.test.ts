@@ -352,7 +352,7 @@ const RESTART_RUN_ROWS = ['working', 'waiting', 'check_permission'] as const
  * is refused: the liveness read and the reconnect adapter's state read, the
  * one `read-pane`, and on a `waiting` row the reconnect's `send-keys`, which
  * the refused read lets go ahead (a `check_permission` row's refused read is
- * taken as alive and deferred). No raw tmux call, kill or spawn.
+ * taken as alive and deferred). No kill or spawn.
  */
 function restartRunPaneReadCalls(row: (typeof RESTART_RUN_ROWS)[number]): Record<string, number> {
   return { statusCalls: 2, readPaneCalls: 1, ...(row === 'waiting' ? { sendKeysCalls: 1 } : {}) }

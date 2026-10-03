@@ -281,11 +281,10 @@
  *     the file as it was while the keys read as retired, so a re-added
  *     persona is never resumed, across a restart once the apply wrote them
  *     (hatch A3). SRJ-807's clear applies at a configured persona's listed row.
- *   - b.1ix, b.jg5 SRJ-601: a source audit finds no process start whose
- *     command is tmux in any `src/` file (and finds one planted in a copy of
- *     each); the not-connected notices' `tmux attach` text names the exact
+ *   - b.1ix: the not-connected notices' `tmux attach` text names the exact
  *     `=slack_bot_<key>` target for keys whose session names prefix one
- *     another (`dev`, `dev_2`).
+ *     another (`dev`, `dev_2`). (That `src/` starts no tmux process is
+ *     tests/fmk-source-audit.test.ts's rule, b.jg5 SRJ-601.)
  *   - b.jg5 SRJ-602: `ErrTmuxSessionCreate` from the first spawn, a `resume`
  *     and a reuse spawn is one counted launch failure: no kill of any kind
  *     and no spawn in its place. SRJ-711: no plain spawn carries the reuse
@@ -12255,48 +12254,8 @@ const CWD = '/test/cwd'
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// b.1ix, b.jg5 SRJ-601 — src/ starts no tmux process; the operator's attach
-// text names the exact session
+// b.1ix — the operator's attach text names the exact session
 // ---------------------------------------------------------------------------
-
-/** A process start whose command is `tmux`: a child_process call, `Bun.spawn` or a Bun shell template. */
-const TMUX_PROCESS_START = /\b(?:spawn|spawnSync|exec|execSync|execFile|execFileSync)\(\s*['"`]tmux\b|\bBun\.spawn(?:Sync)?\(\s*\[\s*['"`]tmux\b|\$`tmux\b/g
-
-/** How many tmux process starts the source text `text` holds outside its comments. */
-function tmuxProcessStarts(text: string): number {
-  return [...stripComments(text).matchAll(TMUX_PROCESS_START)].length
-}
-
-/** One planted tmux process start of each form `TMUX_PROCESS_START` names. */
-const PLANTED_TMUX_STARTS: string[] = [
-  "spawn('tmux', ['ls'])",
-  "spawnSync('tmux', ['ls'])",
-  "execFile('tmux', ['ls'])",
-  "execFileSync('tmux', ['ls'])",
-  "exec('tmux ls')",
-  "execSync('tmux ls')",
-  "Bun.spawn(['tmux', 'ls'])",
-  "Bun.spawnSync(['tmux', 'ls'])",
-  '$`tmux ls`',
-]
-
-describe('b.1ix, b.jg5 SRJ-601: src/ starts no tmux process', () => {
-  const srcDir = join(import.meta.dir, '..', 'src')
-  const srcFiles = readdirSync(srcDir).filter((f) => f.endsWith('.ts')).sort()
-  const srcText = (file: string): string => readFileSync(join(srcDir, file), 'utf-8')
-
-  test('no src/ file starts a process whose command is tmux', () => {
-    expect(srcFiles.length).toBeGreaterThan(0)
-    expect(srcFiles.filter((file) => tmuxProcessStarts(srcText(file)) > 0)).toEqual([])
-  })
-
-  test.each(PLANTED_TMUX_STARTS)('the audit finds %s planted in a copy of any src/ file; commented out, it is no start', (planted) => {
-    for (const file of srcFiles) {
-      expect([file, tmuxProcessStarts(`${srcText(file)}\n${planted}\n`)]).toEqual([file, 1])
-    }
-    expect([tmuxProcessStarts(`// ${planted}\n`), tmuxProcessStarts(`/* ${planted} */\n`)]).toEqual([0, 0])
-  })
-})
 
 describe('b.1ix: the operator\'s attach text names the exact session of a persona whose key prefixes another\'s', () => {
   const KEYS = [personaKey('dev'), personaKey('dev_2')] as const

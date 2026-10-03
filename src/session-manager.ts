@@ -7551,9 +7551,9 @@ async function waitForWorkingRow(
   // ended/missing branch and returns 'dead-session' directly in seconds (b.ecw:
   // process-keyed, no tmux probe); a genuinely-alive long-turn row is untouched
   // by the evidence-based sweep and keeps today's polling behavior (b.rmy
-  // long-turn guard preserved). Prefer
-  // AD's findMissing verb over a CSCB-side tmux reconcile per
-  // docs/engineering-guide.md ("Avoiding Duplicated Effort"), mirroring
+  // long-turn guard preserved). Agent-director's findMissing verb is the
+  // reconcile, and CSCB starts no tmux process (b.jg5 SRJ-601;
+  // docs/engineering-guide.md, "Avoiding Duplicated Effort"), mirroring
   // resumeOrFreshSpawn's reconcileMissingFirst branch. On a findMissing
   // error, log and fall through to the existing poll loop (today's
   // behavior), except a refused sweep (b.jg5 SRJ-105): nothing more is
@@ -9775,8 +9775,9 @@ async function resumeOrFreshSpawn(
   // ErrSpawnNotResumable. The ladder answers failed, which the launch
   // answers as `retrying` (`retryingWhenArmed`). On any other findMissing error, fall through to attempting
   // resume anyway (an ErrSpawnNotResumable then takes the not-resumable
-  // step). Prefer AD's findMissing verb over CSCB-side tmux probing per
-  // docs/engineering-guide.md ("Avoiding Duplicated Effort").
+  // step). Agent-director's findMissing verb is the reconcile, and CSCB
+  // starts no tmux process (b.jg5 SRJ-601; docs/engineering-guide.md,
+  // "Avoiding Duplicated Effort").
   if (opts.reconcileMissingFirst) {
     const sweep = await reconcileMissingSweep(key, 'spawnForPersona: before resume', ref)
     if (sweep === FIND_MISSING_REFUSED) return { key, action: 'failed' }

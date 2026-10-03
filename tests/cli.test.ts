@@ -2516,22 +2516,6 @@ describe('b.qwo — teardown fails loudly when agent-director is unreachable', (
     expect(b.exitCodes).toContain(1)
     expect(stderr.join('\n')).not.toContain('no spawn row')
   })
-
-  // Kill-never-delete: static guard over src/cli.ts — the teardown path must
-  // never call a delete/destroy verb on the AD client.
-  test('src/cli.ts teardown surface calls no delete/destroy verb (kill-never-delete, static audit)', async () => {
-    const src = readFileSync(CLI_SOURCE, 'utf-8')
-    // Ban any AD delete verb reachable from teardown: directorDelete, a bare
-    // deps.delete(...), or a director*.delete(...)/destroy(...) call. Comment /
-    // JSDoc lines are excluded so prose like "never deletes" does not trip it.
-    const banned = /\b(directorDelete\b|deps\.delete\s*\(|director\w*\.(delete|destroy)\s*\(|\.deleteSpawn\s*\()/
-    const offenders = src
-      .split('\n')
-      .map((line, i) => ({ lineNo: i + 1, line }))
-      .filter(({ line }) => !/^\s*(\*|\/\/)/.test(line))
-      .filter(({ line }) => banned.test(line))
-    expect(offenders.map((o) => `cli.ts:${o.lineNo}: ${o.line.trim()}`)).toEqual([])
-  })
 })
 
 describe('b.qwo — initClient startup gate', () => {

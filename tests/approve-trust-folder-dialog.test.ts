@@ -2174,28 +2174,13 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
 })
 
 // ---------------------------------------------------------------------------
-// Focused source audit (SRJ-601's approver part)
+// Source audit: the approver's spawn-failure notice at B is gone (b.jg5
+// SRJ-405). The approver's raw tmux path, its seams and the dead-state streak
+// (SRJ-601) are tests/fmk-source-audit.test.ts's removed identifiers.
 // ---------------------------------------------------------------------------
 
-describe('source audit: the approver\'s raw tmux path, its seams, the dead-state streak and its spawn-failure notice at B are gone (b.jg5 SRJ-402, SRJ-405, SRJ-601)', () => {
+describe('source audit: the approver\'s spawn-failure notice at B is gone (b.jg5 SRJ-405)', () => {
   const SRC_DIR = join(import.meta.dir, '..', 'src')
-  const REMOVED = [
-    'defaultTmuxCapturePane',
-    'defaultTmuxSendEnter',
-    '_setTmuxCapturePane',
-    '_setTmuxSendEnter',
-    '_resetTmuxDialogHelpers',
-    'tmuxExactPaneTarget',
-    'DIALOG_DEAD_GRACE_POLLS',
-    '_setDialogDeadGracePolls',
-    '_resetDialogDeadGracePolls',
-    '_setDialogPollIntervalMs',
-    '_resetDialogPollIntervalMs',
-    'DIALOG_READY_STATES',
-    'DIALOG_DEAD_STATES',
-    // The spawn-failure notice the approver posted at its cap (b.jg5 SRJ-405).
-    'DialogApprovalTimeout',
-  ]
   const sources = (readdirSync(SRC_DIR, { recursive: true }) as string[])
     .filter((name) => name.endsWith('.ts'))
     .sort()
@@ -2205,8 +2190,8 @@ describe('source audit: the approver\'s raw tmux path, its seams, the dead-state
     expect(sources.map(([name]) => name)).toContain('session-manager.ts')
   })
 
-  test.each(REMOVED)('no file in src/ names %s outside a comment', (name) => {
-    const re = new RegExp(`(?<![\\w$])${name}(?![\\w$])`)
+  test('no file in src/ names DialogApprovalTimeout outside a comment', () => {
+    const re = /(?<![\w$])DialogApprovalTimeout(?![\w$])/
     expect(sources.filter(([, code]) => re.test(code)).map(([file]) => file)).toEqual([])
   })
 })
