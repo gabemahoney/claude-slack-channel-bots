@@ -156,18 +156,20 @@
  *      latching nothing; its caller raises the alert decision on the
  *      persona-teardown route. No path here deletes a persona's row.
  *
- * Own-row reads (b.jg5 SRJ-114, SRJ-115): every `get` of a persona's own row
- * at SRJ-114's sites goes through `readPersonaOwnRow`, and every own-row
- * `status` the session manager makes, the dialog approver's included, through
- * `readPersonaOwnRowStatus`, which applies the own-row `status` step
- * (`applyOwnRowStatusStep`; the liveness and reconnect adapters in
- * `src/server.ts` apply it after their own calls). Both apply the row-read
- * rule (`decideOwnRowRead`, `src/row-read-rules.ts`) to every row or result
- * they read: a configured persona's own row that reads `pending` with no
- * launch start latches the persona with the case "launch start not
- * recorded" (b.jg5 SRJ-513), whether or not it is the persona's current
- * life, and a `get` row carrying the `provenance_conflict` note latches it
- * with "conflicting labels" (a row with both latches with the first only).
+ * Own-row reads (b.jg5 SRJ-114, SRJ-115, SRJ-116): every `get` of a
+ * persona's own row at SRJ-114's sites goes through `readPersonaOwnRow`, whose
+ * act step (`actOnOwnRowRead`) the start sweep applies to each row of its
+ * `list`, and every own-row `status` the session manager makes, the dialog
+ * approver's included, through `readPersonaOwnRowStatus`, which applies the
+ * own-row `status` step (`applyOwnRowStatusStep`; the liveness and reconnect
+ * adapters in `src/server.ts` apply it after their own calls). Both apply
+ * the row-read rule (`decideOwnRowRead`, `src/row-read-rules.ts`) to every
+ * row or result they read: a configured persona's own row that reads
+ * `pending` with no launch start latches the persona with the case "launch
+ * start not recorded" (b.jg5 SRJ-513), whether or not it is the persona's
+ * current life, and a `get` or `list` row carrying the `provenance_conflict`
+ * note latches it with "conflicting labels" (a row with both latches with
+ * the first only).
  * Any key's own row read live other than `pending` while the installed
  * retired-key store (`setRetiredKeyStore`) has the key recorded with its
  * mark set clears the key's entry, beside any latch the same read decides
@@ -226,13 +228,28 @@
  * A path that only reconnects to a live instance or does nothing runs no
  * reply-guard step (the optimistic spawn's steps are undone on a collision).
  *
- * The start sweep (`reconcileOrphans`, b.av2 SR-6.3) lists every
- * `service=cscb` spawn and kills any with a persona absent from the
+ * The start sweep (`reconcileOrphans`, b.av2 SR-6.3, b.jg5 SRJ-116,
+ * SRJ-714) makes one `list` of every `service=cscb` row in every state; a
+ * list failure records `orphan-cleanup-list-failed` and the sweep does
+ * nothing more. Over the whole list, before any kill, it applies the shared
+ * own-row read's act step to each row whose id is a key's own, so a
+ * configured persona whose own row carries `provenance_conflict` or reads
+ * `pending` with no launch start latches (once per episode, after a restart
+ * too, b.jg5 SRJ-504), and a marked retired key's row read live other than
+ * `pending` clears its entry (SRJ-807); a latched persona's own row and
+ * every row labelled with it are then left unkilled for the whole pass,
+ * whatever else the sweep would decide for them (b.jg5 SRJ-502, AC 55).
+ * Next, in one write before the first kill, it records as retired the key
+ * of every listed row labelled with a persona absent from the applied
+ * configuration, with the cause `absent-at-start` (b.jg5 SRJ-714, SRJ-803);
+ * a failed write leaves the file as it was while the store holds those keys
+ * in memory, and the sweep goes on. Then it kills each remaining row with a
+ * persona absent from the
  * applied configuration, an instance ID other than `cscb_<key>`, or a `cwd`
  * other than its persona's working directory, deleting it only after a kill
  * that succeeded (each kill a checked kill, b.jg5 SRJ-110, SRJ-701, run
- * through the bounded retry with one pass budget, SRJ-702; it latches
- * nothing and arms no retry timer). A pre-persona row (no `persona`
+ * through the bounded retry with one pass budget, SRJ-702; no kill latches
+ * anything or arms a retry timer). A pre-persona row (no `persona`
  * label) is never deleted: it is kept, and killed only when live, with one
  * findMissing sweep after the kills so a killed row reads `missing` once its
  * session is gone and isn't killed again at the next start (b.1ix). While a
@@ -505,8 +522,10 @@ import {
   isPersonaOwnRow,
   type RowReadClearDecision,
   type RowReadLatchDecision,
+  type RowReadRow,
 } from './row-read-rules.ts'
 import {
+  RETIRED_KEY_CAUSE_ABSENT_AT_START,
   RETIRED_KEYS_NOT_RECORDED,
   RETIRED_KEYS_UNCHANGED,
   RETIRED_KEYS_WRITE_FAILED,
@@ -1434,9 +1453,11 @@ export function _resetConfiguredPersonaQuery(): void {
  * failed, at the key's next launch decision (SRJ-806); and
  * `recordGeneration`, read when a launch attempt starts and at a reuse
  * spawn's success, so that a key recorded during the attempt, a re-record
- * that wrote nothing included, gets no mark (`reuseSuccessAction`, SRJ-806).
+ * that wrote nothing included, gets no mark (`reuseSuccessAction`, SRJ-806);
+ * and `record`, the start sweep's one batch record of absent personas' keys
+ * (`recordAbsentPersonaKeys`, SRJ-714, SRJ-803).
  */
-export type SessionRetiredKeys = Pick<RetiredKeyStore, 'isRecorded' | 'isMarked' | 'mark' | 'clear' | 'recordGeneration'>
+export type SessionRetiredKeys = Pick<RetiredKeyStore, 'isRecorded' | 'isMarked' | 'mark' | 'clear' | 'recordGeneration' | 'record'>
 
 /**
  * The installed retired-key store. Production installs the one store
@@ -1812,7 +1833,8 @@ export interface OwnRowReadSite {
 /**
  * The one read of persona `key`'s own row (`cscb_<key>`) at SRJ-114's sites
  * (b.jg5 SRJ-114): one `get` through `withOutageDetection`, then the
- * row-read rule (`decideOwnRowRead`, `src/row-read-rules.ts`). Answers:
+ * row-read rule (`decideOwnRowRead`, `src/row-read-rules.ts`) through the
+ * act step the start sweep's `list` rows share (`actOnOwnRowRead`). Answers:
  *
  *   - `row`, with `latched` true when this read latched the persona: the row
  *     is `key`'s own, `key` is configured (the installed
@@ -1906,12 +1928,33 @@ export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promis
   }
   // b.jg5 SRJ-704, SRJ-1016: a row read `ended` or `missing` ends the kill-failure episode.
   endKillFailureEpisodeOnRead(key, { state: row.state })
+  return { kind: OWN_ROW_READ_ROW, row, latched: actOnOwnRowRead(key, row, at, true) !== undefined }
+}
+
+/**
+ * The shared own-row read's act step (b.jg5 SRJ-114, SRJ-116, SRJ-513,
+ * SRJ-807) over a row of persona `key` already read: a `get` row
+ * (`readPersonaOwnRow`) or a `list` row (the start sweep's latch pass,
+ * `latchFromListedRows`). One code path for both: the same latch record
+ * (case, refused operation, recorded state as the row carries it, quoted
+ * session `slack_bot_<key>`, no description line), the same notice per latch
+ * episode and the same clear, with the lines `readPersonaOwnRow` documents,
+ * headed by `at` (`applyOwnRowRules`). `clearRetiredEntry` false leaves the
+ * retired-key entry clear out of this read (b.jg5 SRJ-807): the start sweep's
+ * `list` row of a key the same sweep records as retired, whose recording
+ * clears its mark instead (SRJ-714). A row that is not `key`'s own, or the
+ * own row of a key the configured-persona query does not count, latches no
+ * one. Makes no agent-director call. Answers the latch decision this read
+ * acted on when it latched the persona (or would have, with no latch
+ * installed or a `set` that threw), else undefined. Never throws.
+ */
+function actOnOwnRowRead(key: string, row: RowReadRow, at: OwnRowReadSite, clearRetiredEntry: boolean): RowReadLatchDecision | undefined {
   try {
-    return { kind: OWN_ROW_READ_ROW, row, latched: applyOwnRowRules(key, row, at) }
+    return applyOwnRowRules(key, row, at, clearRetiredEntry)
   } catch (err) {
     // Not reached (every step below is guarded); a throw reads the row with no latch.
     console.error(`${ownRowReadHead(key, at)}: applying the note rule failed: ${describeThrownValue(err)} (b.jg5 SRJ-114)`)
-    return { kind: OWN_ROW_READ_ROW, row, latched: false }
+    return undefined
   }
 }
 
@@ -1947,19 +1990,25 @@ const nonLatchingNoteLogged = new Map<string, string>()
 
 /**
  * The row-read rule on `row`, read for persona `key` (b.jg5 SRJ-114,
- * SRJ-513): asks `decideOwnRowRead` for every row read; on a clear decision
- * first clears the persona's retired-key entry through the store
- * (`clearRetiredEntryOnRead`, b.jg5 SRJ-807), before any latch handling,
- * changing nothing the read answers; then latches the persona
- * on a latch decision (`latchFromRowRead`) with the line naming why
- * (`rowReadLatchReason`), and otherwise
- * logs the read's note line, if any (a non-latching note's line once per
- * note, `nonLatchingNoteLogged`). True when the read latched the persona (or
- * would have, with no latch installed or a `set` that threw). Never throws.
+ * SRJ-116, SRJ-513): asks `decideOwnRowRead` for every row read; on a clear
+ * decision (only when `clear` is true) first clears the persona's
+ * retired-key entry through the store (`clearRetiredEntryOnRead`, b.jg5
+ * SRJ-807), before any latch handling, changing nothing the read answers;
+ * then latches the persona on a latch decision (`latchFromRowRead`) with the
+ * line naming why (`rowReadLatchReason`), and otherwise logs the read's note
+ * line, if any (a non-latching note's line once per note,
+ * `nonLatchingNoteLogged`). Answers the latch decision when the read latched
+ * the persona (or would have, with no latch installed or a `set` that
+ * threw), else undefined. Never throws.
  */
-function applyOwnRowRules(key: string, row: GetResult, at: OwnRowReadSite): boolean {
+function applyOwnRowRules(key: string, row: RowReadRow, at: OwnRowReadSite, clear: boolean): RowReadLatchDecision | undefined {
   const configured = configuredReadingOf(key)
-  const decision = decideOwnRowRead({ key, row, configured: configured.configured, retiredMarked: retiredMarkOf(key) })
+  const decision = decideOwnRowRead({
+    key,
+    row,
+    configured: configured.configured,
+    retiredMarked: clear ? retiredMarkOf(key) : false,
+  })
   // b.jg5 SRJ-807: the clear applies beside any latch this read decides, and changes nothing the read answers.
   if (decision.clearRetiredEntry !== undefined) clearRetiredEntryOnRead(key, decision.clearRetiredEntry, at)
   const note: unknown = row.liveness_note
@@ -1970,9 +2019,9 @@ function applyOwnRowRules(key: string, row: GetResult, at: OwnRowReadSite): bool
     console.error(
       `${ownRowReadHead(key, at)}: ${rowReadLatchReason(decision.latch)} (state=${describeLatchRowState(decision.latch.rowState)}) — ${outcome}; nothing more is called for it (${rowReadLatchSrjs(decision.latch)})`,
     )
-    return true
+    return decision.latch
   }
-  if (!hasNote) return false
+  if (!hasNote) return undefined
   if (!isLatchingLivenessNote(note)) {
     const noteText = String(note)
     if (nonLatchingNoteLogged.get(key) !== noteText) {
@@ -1981,7 +2030,7 @@ function applyOwnRowRules(key: string, row: GetResult, at: OwnRowReadSite): bool
         `${ownRowReadHead(key, at)}: its row carries the liveness note ${JSON.stringify(renderLogMessageText(note))}, which latches no one — going on (b.jg5 SRJ-114)`,
       )
     }
-    return false
+    return undefined
   }
   const why = !isPersonaOwnRow(row, key)
     ? `the row is not the persona's own (claude_instance_id=${JSON.stringify(renderLogMessageText(row.claude_instance_id))})`
@@ -1989,7 +2038,7 @@ function applyOwnRowRules(key: string, row: GetResult, at: OwnRowReadSite): bool
   console.error(
     `${ownRowReadHead(key, at)}: its row carries the liveness note ${LATCHING_LIVENESS_NOTE}, but ${why} — the note is not applied (b.jg5 SRJ-114)`,
   )
-  return false
+  return undefined
 }
 
 /** Why a row read latched, for the shared `get` read's latch line. */
@@ -5815,10 +5864,21 @@ function startFindMissingRun(
  * query installed no id counts. Pure but for the query; never throws.
  */
 function configuredPersonaKeyOfRowId(id: unknown): string | undefined {
+  const key = ownRowKeyOfRowId(id)
+  if (key === undefined) return undefined
+  return configuredReadingOf(key).configured ? key : undefined
+}
+
+/**
+ * The key whose own row id `id` is (`cscb_<key>`, `personaInstanceId`),
+ * configured or not; undefined for a non-`cscb_` id or the bare prefix. Pure;
+ * never throws.
+ */
+function ownRowKeyOfRowId(id: unknown): string | undefined {
   if (typeof id !== 'string' || !id.startsWith(PERSONA_INSTANCE_ID_PREFIX)) return undefined
   const key = id.slice(PERSONA_INSTANCE_ID_PREFIX.length)
   if (key === '' || personaInstanceId(key) !== id) return undefined
-  return configuredReadingOf(key).configured ? key : undefined
+  return key
 }
 
 /**
@@ -12102,6 +12162,19 @@ export interface OrphanReconcileResult {
   failed: number
   /** Pre-persona rows (no `persona` label), all kept (b.1ix). */
   prePersona: PrePersonaSweepCounts
+  /**
+   * Keys recorded as retired with the cause `absent-at-start`, in the sweep's
+   * one batch record (`recordAbsentPersonaKeys`; b.jg5 SRJ-714, SRJ-803):
+   * every key the batch named, those held only in memory after a failed
+   * write included (hatch A3). 0 with no store installed.
+   */
+  recordedAsRetired: number
+  /**
+   * Listed rows left unkilled because their persona latched in the sweep, or
+   * was latched when it ran (`latchFromListedRows`; b.jg5 SRJ-502, SRJ-714):
+   * each such persona's own row and every row labelled with it, in any state.
+   */
+  leftForLatch: number
 }
 
 /**
@@ -12120,7 +12193,7 @@ export interface PrePersonaSweepCounts {
 
 /** A start sweep that did nothing (dry run, or a failed list). */
 function emptySweepResult(): OrphanReconcileResult {
-  return { found: 0, killed: 0, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 } }
+  return { found: 0, killed: 0, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 }
 }
 
 /**
@@ -12549,9 +12622,182 @@ async function killAndDeleteSweptRow(
   }
 }
 
+/** Who reads, in the own-row lines of the start sweep's `list` rows (`reconcileOrphans`; the persona's ref is added for a configured persona; b.jg5 SRJ-116, SRJ-807). */
+export const START_SWEEP_LIST_SITE: OwnRowReadSite = Object.freeze({ site: 'reconcileOrphans', what: 'start sweep list' })
+
 /**
- * Start sweep (b.av2 SR-6.3; formerly SR-1.6): enumerate every `service=cscb`
- * spawn.
+ * The `startup-errors.log` class of the start sweep's failed `list`
+ * (`reconcileOrphans`; b.jg5 SRJ-116): one entry, after which the sweep does
+ * nothing more.
+ */
+export const ORPHAN_CLEANUP_LIST_FAILED_LABEL = 'orphan-cleanup-list-failed'
+
+/**
+ * The start sweep's latch pass (b.jg5 SRJ-116, SRJ-501, SRJ-502, SRJ-513,
+ * SRJ-714, SRJ-807), made over the whole list before any kill. Each listed
+ * row whose id is a key's own (`cscb_<key>`, `ownRowKeyOfRowId`), whatever
+ * its `persona` label, goes through the shared own-row read's act step
+ * (`actOnOwnRowRead`) at `START_SWEEP_LIST_SITE`, as a `get` row would:
+ *
+ *   - a configured persona's own row (the installed `ConfiguredPersonaQuery`)
+ *     that reads `pending` with no launch start latches it with "launch
+ *     start not recorded", a `provenance_conflict` note too included, and
+ *     one that carries `provenance_conflict` otherwise latches it with
+ *     "conflicting labels", recording the state the row was listed in; the
+ *     latch's notice is posted once per episode;
+ *   - the own row of a key recorded as retired with its mark set, read live
+ *     other than `pending`, clears the key's entry, except for a key in
+ *     `recordedKeys` (the keys this sweep records, `absentPersonaKeysOf`),
+ *     whose recording clears its mark instead (b.jg5 SRJ-714, SRJ-803).
+ *
+ * A row with another id latches no one, a row labelled P included. A
+ * configured persona already latched when the sweep runs (`latchGateReadingOf`)
+ * is held as well (b.jg5 SRJ-502). Answers the set of such personas' keys;
+ * the caller leaves its own row and every row labelled with it unkilled for the
+ * whole pass (`startSweepLatchOf`). Makes no agent-director call. One line
+ * per persona, after the act step's own lines:
+ *
+ *   [slack] reconcileOrphans: <ref> latched from its own listed row instanceId=<id> (case=<case>) — its own row and every row labelled with it are left unkilled (b.jg5 SRJ-116, SRJ-502, SRJ-714)
+ *   [slack] reconcileOrphans: <ref> is latched (case=<case>) — its own row and every row labelled with it are left unkilled (b.jg5 SRJ-502, SRJ-714)
+ *
+ * Never throws.
+ */
+function latchFromListedRows(
+  rows: readonly ListRow[],
+  personasByKey: ReadonlyMap<string, Persona>,
+  recordedKeys: ReadonlySet<string>,
+): ReadonlySet<string> {
+  const latched = new Set<string>()
+  for (const row of rows) {
+    const key = ownRowKeyOfRowId(row.claude_instance_id)
+    if (key === undefined) continue
+    const persona = personasByKey.get(key)
+    const ref = persona === undefined ? keyRef(key) : personaRef(persona)
+    const at: OwnRowReadSite = persona === undefined ? START_SWEEP_LIST_SITE : { ...START_SWEEP_LIST_SITE, ref }
+    const decision = actOnOwnRowRead(key, row, at, !recordedKeys.has(key))
+    if (decision === undefined || latched.has(key)) continue
+    latched.add(key)
+    console.error(
+      `${SWEEP_LOG_PREFIX}: ${ref} latched from its own listed row instanceId=${row.claude_instance_id} (case=${decision.latchCase}) — its own row and every row labelled with it are left unkilled (b.jg5 SRJ-116, SRJ-502, SRJ-714)`,
+    )
+  }
+  for (const persona of personasByKey.values()) {
+    if (latched.has(persona.key)) continue
+    const reading = latchGateReadingOf(persona.key)
+    if (reading === undefined) continue
+    const ref = personaRef(persona)
+    latched.add(persona.key)
+    console.error(
+      `${SWEEP_LOG_PREFIX}: ${ref} is latched (case=${reading.latchCase}) — its own row and every row labelled with it are left unkilled (b.jg5 SRJ-502, SRJ-714)`,
+    )
+  }
+  return latched
+}
+
+/**
+ * The key of the persona whose latch leaves `row` unkilled at the start
+ * sweep (b.jg5 SRJ-502, SRJ-714): the row's own key (`cscb_<key>`) when that
+ * persona latched, else its `persona` label when that persona latched;
+ * undefined when neither did. Pure; never throws.
+ */
+function startSweepLatchOf(row: ListRow, latched: ReadonlySet<string>): string | undefined {
+  const own = ownRowKeyOfRowId(row.claude_instance_id)
+  if (own !== undefined && latched.has(own)) return own
+  const label = row.labels?.[PERSONA_LABEL_KEY]
+  return typeof label === 'string' && latched.has(label) ? label : undefined
+}
+
+/**
+ * The keys the start sweep records as retired (b.jg5 SRJ-714, SRJ-803): the
+ * `persona` label value of each listed row, in any state, that names no
+ * persona of `personasByKey` (the applied configuration), each once, in list
+ * order. A pre-persona row (no `persona` label) gives no key. Pure; never
+ * throws.
+ */
+function absentPersonaKeysOf(rows: readonly ListRow[], personasByKey: ReadonlyMap<string, Persona>): string[] {
+  const keys = new Set<string>()
+  for (const row of rows) {
+    const label = row.labels?.[PERSONA_LABEL_KEY]
+    if (typeof label !== 'string' || label === '' || personasByKey.has(label)) continue
+    keys.add(label)
+  }
+  return [...keys]
+}
+
+/**
+ * The start sweep's one batch record (b.jg5 SRJ-714, SRJ-803): `keys`, each
+ * with the cause `absent-at-start` (`RETIRED_KEY_CAUSE_ABSENT_AT_START`),
+ * through the installed store's `record`, one call per sweep, made after the
+ * latch pass and before the first kill. The store's rules apply: a new key
+ * gets its entry, a marked key has its mark cleared, an unmarked recorded key
+ * writes nothing unless it is held only in memory, and a batch that changes
+ * nothing writes nothing. The store logs its write and its failure; a failed
+ * write is that one line and leaves the file as it was, while the store holds
+ * the keys as retired in memory for this server's life, and the sweep goes on
+ * to its kills, with no `orphan-cleanup` entry; the next start's sweep
+ * records them again (hatch A3). No approver needs stopping: none runs before
+ * the bring-up (SRJ-808).
+ *
+ * Answers the keys recorded: all of `keys` once `record` returned, whatever
+ * it wrote; 0 for no keys (no call), with no store installed, and when
+ * `record` throws, each of the last two with one line:
+ *
+ *   [slack] reconcileOrphans: no retired-key store is installed, so the keys of absent personas' rows are not recorded as retired: <keys> (b.jg5 SRJ-714, SRJ-803)
+ *   [slack] reconcileOrphans: recording the keys of absent personas' rows as retired failed: <error>; nothing is recorded (b.jg5 SRJ-714, SRJ-803)
+ *
+ * Never throws.
+ */
+function recordAbsentPersonaKeys(keys: readonly string[]): number {
+  if (keys.length === 0) return 0
+  const store = retiredKeyStore
+  if (store === undefined) {
+    const named = keys.map((key) => JSON.stringify(renderLogMessageText(key))).join(', ')
+    console.error(
+      `${SWEEP_LOG_PREFIX}: no retired-key store is installed, so the keys of absent personas' rows are not recorded as retired: ${named} (b.jg5 SRJ-714, SRJ-803)`,
+    )
+    return 0
+  }
+  try {
+    store.record(keys.map((key) => ({ key, cause: RETIRED_KEY_CAUSE_ABSENT_AT_START })))
+  } catch (err) {
+    console.error(
+      `${SWEEP_LOG_PREFIX}: recording the keys of absent personas' rows as retired failed: ${describeThrownValue(err)}; nothing is recorded (b.jg5 SRJ-714, SRJ-803)`,
+    )
+    return 0
+  }
+  return keys.length
+}
+
+/**
+ * The start sweep (b.av2 SR-6.3; b.jg5 SRJ-116, SRJ-714), run by `main()`
+ * before any bring-up, in this order:
+ *
+ *   1. One `list` of every `service=cscb` row, in every state: the call
+ *      carries the service label only, with no state filter (b.jg5
+ *      SRJ-116). A list failure records one `orphan-cleanup-list-failed`
+ *      entry and returns at once: nothing is latched, recorded, cleared or
+ *      killed and no findMissing sweep runs; the start pass goes on.
+ *   2. The latch pass over the whole list, before any kill
+ *      (`latchFromListedRows`): each row whose id is a key's own goes
+ *      through the shared own-row read's act step at
+ *      `START_SWEEP_LIST_SITE`, so a configured persona whose own row
+ *      carries `provenance_conflict` or reads `pending` with no launch start
+ *      latches, with one post per latch episode, after a restart too
+ *      (b.jg5 SRJ-114, SRJ-501, SRJ-504, SRJ-513), and a marked retired
+ *      key's row read live other than `pending` clears its entry (SRJ-807),
+ *      except for a key step 3 records. Such a persona, and one already
+ *      latched when the sweep runs, has its own row and every row labelled
+ *      with it left as they are for the whole pass, ahead of `sweepDecision`
+ *      and the directory-broken deferral, a `cwd` or `config_dir` other
+ *      than the persona's included (b.jg5 SRJ-502, AC 55); those rows are
+ *      counted in `leftForLatch`.
+ *   3. One batch record, before the first kill, of the key of every listed
+ *      row, in any state, labelled with a persona absent from
+ *      `personaConfig`, with the cause `absent-at-start`
+ *      (`recordAbsentPersonaKeys`; b.jg5 SRJ-714, SRJ-803); the keys are
+ *      counted in `recordedAsRetired`. A failed write leaves the file as it
+ *      was, the store holds the keys in memory, and the sweep goes on.
+ *   4. The kills, row by row in list order, of the rows step 2 left:
  *
  * A pre-persona row (no `persona` label) is kept, never deleted, and killed
  * only when it is live (`keepPrePersonaRow`, b.1ix). When at least one was
@@ -12561,9 +12807,7 @@ async function killAndDeleteSweptRow(
  *
  * Every other row is swept, killed and then deleted after a kill that
  * succeeded (`killAndDeleteSweptRow`), when it
- *   - names a persona absent from the applied configuration (the kill and
- *     delete stay until b.fmk: agent-director 0.10.0 has no reuse, and a
- *     persona added again must start fresh),
+ *   - names a persona absent from the applied configuration,
  *   - has an instance ID other than `cscb_<key>` for its persona, or
  *   - has a `cwd` other than its persona's working directory, by real path
  *     (`compareRowToPersona`).
@@ -12587,9 +12831,8 @@ async function killAndDeleteSweptRow(
  * (b.jg5 SRJ-205); the summary line is still logged. No
  * sweep kill latches anything or arms a retry timer; an ENVIRONMENT or CONFIG
  * answer raises its outage only for a configured persona's row (hatch A3). A
- * kill that did not succeed and a failed delete record `orphan-cleanup`, a
- * list failure records `orphan-cleanup-list-failed` and does not block
- * startup. One summary line ends the sweep:
+ * kill that did not succeed and a failed delete record `orphan-cleanup`. One
+ * summary line ends the sweep:
  *
  *   [slack] reconcileOrphans: found=<n> killed=<n> failed=<n>; pre-persona rows kept=<n> live=<n> kill-failed=<n>
  */
@@ -12605,12 +12848,13 @@ export async function reconcileOrphans(
   const client = getClient()
   let rows: ListRow[]
   try {
+    // b.jg5 SRJ-116: the service label only, so every row in every state is listed.
     const r = await client.list({ label: [SERVICE_LABEL] })
     rows = r.spawns
   } catch (err) {
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('list', 'UnknownError', String(err))
     recordStartupError(
-      'orphan-cleanup-list-failed',
+      ORPHAN_CLEANUP_LIST_FAILED_LABEL,
       `failed to list spawns for orphan reconciliation: ${describeAgentDirectorFailure(e)}`,
     )
     return emptySweepResult()
@@ -12624,10 +12868,21 @@ export async function reconcileOrphans(
   const stop: SweepStop = { stopping: false }
   const pass: SweepPass = { client, stop, budget: createKillRetryPassBudget(), clock }
 
+  // b.jg5 SRJ-502, SRJ-714: every latch and record decision is made over the
+  // whole list before the first kill.
+  const absentKeys = absentPersonaKeysOf(rows, personasByKey)
+  const latched = latchFromListedRows(rows, personasByKey, new Set(absentKeys))
+  result.recordedAsRetired = recordAbsentPersonaKeys(absentKeys)
+
   for (const row of rows) {
     // b.jg5 SRJ-205: a kill's version re-check decided that the server
     // stops, so the sweep makes no further agent-director call.
     if (stop.stopping) break
+    // b.jg5 SRJ-502 (AC 55): a latched persona's rows are left as they are.
+    if (startSweepLatchOf(row, latched) !== undefined) {
+      result.leftForLatch++
+      continue
+    }
     const personaLabel = row.labels?.[PERSONA_LABEL_KEY]
     if (!personaLabel) {
       if (await keepPrePersonaRow(pass, row, result.prePersona)) {

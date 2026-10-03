@@ -3853,10 +3853,14 @@ export async function main(): Promise<void> {
     slowRecovery,
   })
 
-  // b.av2 SR-6.3: the start sweep, BEFORE the trust patch and any spawn.
-  // `service=cscb` spawns naming a persona absent from the applied config, or
-  // with an instance ID other than `cscb_<key>` or a `cwd` other than the
-  // persona's working directory, get killed + deleted. A spawn with no
+  // b.av2 SR-6.3, b.jg5 SRJ-116, SRJ-714: the start sweep, BEFORE the trust
+  // patch and any spawn. One `list` of every `service=cscb` row in every
+  // state; then, over the whole list and before any kill, the latch pass (a
+  // latched persona's own row and every row labelled with it are left
+  // unkilled) and one batch record of the keys of rows naming a persona absent
+  // from the applied config as retired. The remaining rows naming an absent
+  // persona, or with an instance ID other than `cscb_<key>` or a `cwd` other
+  // than the persona's working directory, get killed + deleted. A row with no
   // `persona` label (a pre-persona row, b.1ix) is never deleted: a live one is
   // killed and kept, and one findMissing sweep after those kills lets a row
   // whose session is gone read `missing`.

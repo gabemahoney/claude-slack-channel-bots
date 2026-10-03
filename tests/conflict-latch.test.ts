@@ -244,7 +244,12 @@
  * timer's pending-only row read and the lost-message read; then every
  * automated path (`driveEveryPath`) makes no call for P's instance, no
  * find-missing, counts nothing and leaves no timer armed, with one SRJ-1020
- * post; such a row under a key outside the configuration latches no one. A
+ * post; such a row under a key outside the configuration latches no one.
+ * The start sweep's `list` of P's own such row (in P's `cwd`, carrying the
+ * note too, or in another `cwd`) latches P with the launch-start case and
+ * one post, and neither the sweep nor the start pass after it makes any
+ * call of P's row; a lost message then reports `held-for-human` (SRJ-116,
+ * SRJ-714). A
  * CONFLICT or an UNUSABLE NAME whose latch-time `status` read finds such a
  * row leaves P latched with the launch-start case alone, one post (hatch
  * A2). A relatch through a real read (the shared own-row `status` read,
@@ -323,7 +328,7 @@ import {
   RETRY_KILL_LATER_PHRASE,
 } from '../src/ad-description-phrases.ts'
 import { adAlertThresholdMsInEffect } from '../src/ad-settings.ts'
-import type { Phase1GetResult } from '../src/ad-phase1-types.ts'
+import type { Phase1GetResult, Phase1ListRow } from '../src/ad-phase1-types.ts'
 import { ERR_TMUX_SESSION_CONFLICT_NAME } from '../src/agent-director-errors.ts'
 import {
   CONFLICT_CASE_ORDER,
@@ -483,6 +488,7 @@ import {
   OWN_ROW_STATUS_STATE,
   readPersonaOwnRow,
   readPersonaOwnRowStatus,
+  reconcileOrphans,
   setSessionNotifier,
   type ApproverVerb,
   type NotConnectedNotice,
@@ -502,6 +508,7 @@ import {
   CONFLICT_CASES,
   cannedFindMissing,
   cannedGetResult,
+  cannedListRow,
   cannedOk,
   cannedStatusResult,
   errGeneric,
@@ -3484,6 +3491,41 @@ describe('SRJ-513: a pending row with no launch start holds P for a human on eve
     expect(h.latch.isLatched(q)).toBe(false)
     // Q, beside it, still reaches the stub on every path.
     expect(qCalls).toEqual([...Q_CALLS_ON_EVERY_PATH])
+  })
+
+  // SRJ-513's list leg at the real start sweep (SRJ-116, SRJ-714; the E16
+  // hatch note): the sweep lists P's own row reading pending with no launch
+  // start, as `main()` runs it before the start pass. Another existing cwd
+  // is a row the sweep kills when P is not latched.
+  const LISTED_NO_LAUNCH_START: ReadonlyArray<readonly [string, (h: RecoveryHarness) => Partial<Phase1ListRow>]> = [
+    ['in P\'s working directory', () => ({})],
+    ['also carrying the provenance_conflict note (the launch-start case only)', () => ({ liveness_note: provenanceNote })],
+    ['in another existing cwd', (h) => ({ cwd: h.home })],
+  ]
+
+  test.each(LISTED_NO_LAUNCH_START)('the start sweep lists P\'s own pending row with no launch start %s: P latches with "launch start not recorded" and one SRJ-1020 post; no kill, send-keys or delete of P\'s row follows from the sweep or the start pass after it; a lost message for P reports held for a human', async (_label, overrides) => {
+    const h = makeRecoveryHarness()
+    harnesses.push(h)
+    const [p, q] = h.keys as [string, string]
+    const row = cannedListRow({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE, ...overrides(h) }, personaOf(h, p), h.home)
+    h.script({ listResult: { spawns: [row] } })
+
+    const result = await h.drive(reconcileOrphans(h.config, h.killRetryClock))
+
+    expect(h.latch.record(p)).toEqual(launchStartRecord(p))
+    expect(harnessSetOutcomes(h)).toEqual([[p, CONFLICT_LATCH_SET_LATCHED]])
+    expect(latchSteps(h)).toEqual(oneLatch(p))
+    expect(result.leftForLatch).toBe(1)
+
+    expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
+    await expectLostMessageReports(h, p, 'held-for-human')
+
+    // Neither the sweep nor the start pass nor the lost message made any call of P's instance, a kill, send-keys or delete included.
+    expect(personaCallCounts(h, p)).toEqual({})
+    expect(tmuxTouchingCallsIn(h.stub.calls)).toEqual([])
+    expect(h.stub.calls.deleteCalls).toEqual([])
+    expect(h.episodeNotices).toEqual([{ key: p, text: launchStartNotRecordedNoticeText(p) }])
+    expect([h.notices, h.latch.isLatched(q)]).toEqual([[], false])
   })
 
   /** A key outside the harness's personas, or a persona removed from the applied configuration, whose row reads `pending` with no launch start. */

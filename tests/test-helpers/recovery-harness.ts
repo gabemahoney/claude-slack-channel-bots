@@ -118,7 +118,8 @@
  *   `teardown(key)`, which keeps production's order (the latch, then the
  *   episodes). The harness does not wait for a launch in flight as the turn
  *   does, so a case settles any launch before `teardown(key)`. `remove(key)`
- *   drops the persona from the applied configuration without a teardown.
+ *   drops the persona from the applied configuration without a teardown;
+ *   `reAdd(key)` puts one of the harness's personas back.
  * - `teardownDeps()` (b.jg5 SRJ-715): the persona teardown's dependencies
  *   that act on what the harness owns, each bound as `main()` binds it in
  *   `createPersonaLifecycle`, so a case hands them to the real lifecycle
@@ -1412,6 +1413,8 @@ export interface RecoveryHarness {
   teardownDeps(): RecoveryTeardownDeps
   /** Drop persona `key` from the applied configuration. */
   remove(key: string): void
+  /** Add persona `key`, one of the harness's own, back to the applied configuration (the counterpart of `remove`). */
+  reAdd(key: string): void
   /** A health tick's end of the condition, as `main()` binds it: reason `tick`, reading `live`. */
   tickEnd(key: string): TmuxUnresponsiveEndResult
   /**
@@ -2534,6 +2537,10 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
     remove(key) {
       applied.delete(key)
+    },
+
+    reAdd(key) {
+      applied.add(key)
     },
 
     tickEnd: (key) => tmuxUnresponsive.end(key, TMUX_UNRESPONSIVE_END_TICK, LIVENESS_LIVE),

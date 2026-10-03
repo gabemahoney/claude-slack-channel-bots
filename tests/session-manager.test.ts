@@ -265,7 +265,21 @@
  *     (AC 4). b.1ix: a pre-persona row (no `persona` label) is kept, never
  *     deleted, and killed only when live; one findMissing sweep after the
  *     kills lets a killed row whose session is gone read `missing`, so the
- *     next start doesn't kill it again.
+ *     next start doesn't kill it again. b.jg5 SRJ-116, SRJ-714: one `list`
+ *     (the service label alone) of rows in every state; a list failure is
+ *     one `orphan-cleanup-list-failed` entry and nothing more. Over the
+ *     whole list, before any kill, a configured persona's own row (by
+ *     instance id, whatever its label) carrying `provenance_conflict` or
+ *     reading `pending` with no launch start latches it with one post (the
+ *     launch-start case alone when both apply), again after a restart
+ *     (AC 45), and none of its rows is killed, another `cwd` included
+ *     (AC 55); a persona latched before the sweep is held the same way. The
+ *     key of every row labelled with an absent persona is recorded
+ *     `absent-at-start` in one write before the first kill (a marked key's
+ *     mark cleared, with no SRJ-807 clear at its row); a failed write leaves
+ *     the file as it was while the keys read as retired, so a re-added
+ *     persona is never resumed, across a restart once the apply wrote them
+ *     (hatch A3). SRJ-807's clear applies at a configured persona's listed row.
  *   - b.1ix raw tmux: the tmux runner seam (`_setTmuxCommandRunner`) is a
  *     failing stand-in by default, so no test reaches a real tmux server,
  *     and `src/` starts tmux nowhere else.
@@ -635,6 +649,7 @@ import {
   readPersonaOwnPane,
   type OwnPaneReadOutcome,
   type PersonaPaneReadRequest,
+  ORPHAN_CLEANUP_LIST_FAILED_LABEL,
   OWN_ROW_READ_ABSENT,
   OWN_ROW_READ_ROW,
   OWN_ROW_STATUS_ABSENT,
@@ -775,6 +790,7 @@ import { MCP_SERVER_NAME, type Persona, type PersonaConfig, resolveRealPath } fr
 import {
   PERSONA_INSTANCE_ID_PREFIX,
   PROMPT_SUGGESTION_OFF_ENV,
+  SERVICE_LABEL,
   configDirLabelValue,
   personaInstanceId,
   personaKey,
@@ -841,6 +857,7 @@ import {
   unknownNote,
   type CannedGetResult,
   type CannedResponse,
+  type CannedRowPersona,
   type FindMissingRowPlacement,
   type PersonaGetResultOverrides,
   type StubCallLog,
@@ -1042,6 +1059,7 @@ import {
 } from './test-helpers/recovery-harness.ts'
 import {
   CONFLICT_CASE_ROWS,
+  LAUNCH_START_ABSENT_PERSONA_KEY,
   LAUNCH_START_AND_NOTE_ROW,
   LAUNCH_START_CASE_ROWS,
   LAUNCH_START_NON_LATCHING_ROWS,
@@ -1147,8 +1165,14 @@ import {
 import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_PENDING_STATE, LIVENESS_DEAD_ROW_ENDED, LIVENESS_DEAD_ROW_MISSING } from '../src/liveness-reading.ts'
 import { adLaunchBoundMsInEffect } from '../src/ad-settings.ts'
 import { parseLaunchStart } from '../src/pending-row.ts'
-import type { Phase1GetResult, Phase1KillResult, Phase1ResumeResult, Phase1SpawnParams, Phase1SpawnResult, Phase1StatusResult, PreTrust } from '../src/ad-phase1-types.ts'
-import { loadRetiredKeyStore, RETIRED_KEY_CAUSE_REMOVED } from '../src/retired-keys.ts'
+import type { Phase1GetResult, Phase1KillResult, Phase1ListRow, Phase1ResumeResult, Phase1SpawnParams, Phase1SpawnResult, Phase1StatusResult, PreTrust } from '../src/ad-phase1-types.ts'
+import {
+  loadRetiredKeyStore,
+  RETIRED_KEY_CAUSE_ABSENT_AT_START,
+  RETIRED_KEY_CAUSE_REMOVED,
+  RETIRED_KEYS_LOG_PREFIX,
+  RETIRED_KEYS_WRITTEN,
+} from '../src/retired-keys.ts'
 import { RETIRED_ENTRY_CLEARING_STATES } from '../src/row-read-rules.ts'
 import {
   _resetRetiredKeyStore,
@@ -1168,11 +1192,12 @@ import {
   reuseRecordedInFlightLine,
   setRetiredKeyStore,
   SPAWN_ACTION_FRESH_RETIRED,
+  START_SWEEP_LIST_SITE,
   TEARDOWN_KILL_STATUS_SITE,
   WORKING_WAIT_STATUS_SITE,
   type ReuseRecordedSince,
 } from '../src/session-manager.ts'
-import { readRetiredKeysRecord, retiredKeysRecordOf, type RetiredKeySeed } from './test-helpers/retired-keys.ts'
+import { readRetiredKeysRecord, retiredKeysRecordOf, RFC3339_UTC, type RetiredKeySeed } from './test-helpers/retired-keys.ts'
 import { expectUntouched, recordSequenceStarts, retiredEntryClearedLine, retiredEntryClearFailedLine, retiredKeyLinesIn } from './test-helpers/recovery-harness.ts'
 
 // ---------------------------------------------------------------------------
@@ -4547,7 +4572,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
     })
 
     expect(listCalls).toEqual([{ label: ['service=cscb'] }])
-    expect(result).toEqual({ found: 3, killed: 3, failed: 0, prePersona: { kept: 1, live: 1, killFailed: 0 } })
+    expect(result).toEqual({ found: 3, killed: 3, failed: 0, prePersona: { kept: 1, live: 1, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
     const swept = ['cscb_alpha_old', 'cscb_departed', 'cscb_gamma']
     expect(killCalls.map((k) => k.claude_instance_id).sort()).toEqual([...swept, 'cscb_legacy'])
     expect(deleteCalls.map((d) => d.claude_instance_id).sort()).toEqual(swept.map((id) => [id]))
@@ -4612,7 +4637,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
         result = await reconcileOrphans(cfg)
       })
 
-      expect(result).toEqual({ found: 3, killed: 3, failed: 0, prePersona: { kept: 1, live: 1, killFailed: 0 } })
+      expect(result).toEqual({ found: 3, killed: 3, failed: 0, prePersona: { kept: 1, live: 1, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
       const swept = ['cscb_delta_old', 'cscb_departed', 'cscb_gamma']
       expect(killCalls.map((k) => k.claude_instance_id).sort()).toEqual([...swept, 'cscb_legacy'])
       expect(deleteCalls.map((d) => d.claude_instance_id).sort()).toEqual(swept.map((id) => [id]))
@@ -4657,7 +4682,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
       result = await reconcileOrphans(cfg)
     })
 
-    expect(result).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 } })
+    expect(result).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
     expect(killCalls).toHaveLength(0)
     expect(deleteCalls).toHaveLength(0)
     expect(errLog).toContain(deferredSweepLine('delta', 'delta', first.workingDirectory))
@@ -4703,7 +4728,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
       result = await reconcileOrphans(cfg)
     })
 
-    expect(result).toEqual({ found: 1, killed: 1, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 } })
+    expect(result).toEqual({ found: 1, killed: 1, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
     expect(killCalls.map((k) => k.claude_instance_id)).toEqual(['cscb_delta'])
     expect(deleteCalls.map((d) => d.claude_instance_id)).toEqual([['cscb_delta']])
     expect(errLog).toContain(`reconcileOrphans: sweeping row (wrong cwd) persona=${renderPersonaRef('delta', 'delta')} instanceId=cscb_delta state=waiting cwd=${alphaWork}`)
@@ -4725,7 +4750,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
 
     const result = await reconcileOrphans(cfg)
 
-    expect(result).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 0, live: 0, killFailed: 0 } })
+    expect(result).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
     expect(killCalls.map((k) => k.claude_instance_id)).toEqual(['cscb_alpha_old'])
     expect(deleteCalls.map((d) => d.claude_instance_id)).toEqual([['cscb_alpha_old']])
     const log = readLog()
@@ -4834,7 +4859,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
 
       const r = await sweepOne('cscb_alpha_old', 'alpha', { killError: err })
 
-      expect(r.result).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 0, live: 0, killFailed: 0 } })
+      expect(r.result).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
       expect(r.killCalls).toEqual(Array.from({ length: tries }, () => 'cscb_alpha_old'))
       expect(r.statusCalls).toEqual(Array.from({ length: tries - 1 }, () => 'cscb_alpha_old'))
       expect(r.deleteCalls).toEqual([])
@@ -4857,7 +4882,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
     ])('b.jg5 SRJ-701, SRJ-104: a swept row whose kill %s: deleted as before, with one line naming the outcome; no orphan-cleanup entry', async (_label, kill, outcome) => {
       const r = await sweepOne('cscb_alpha_old', 'alpha', kill)
 
-      expect(r.result).toEqual({ found: 1, killed: 1, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 } })
+      expect(r.result).toEqual({ found: 1, killed: 1, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
       expect(r.deleteCalls).toEqual([['cscb_alpha_old']])
       expect(r.errLog).toContain(`reconcileOrphans: kill succeeded for orphan instanceId=cscb_alpha_old (${describeKillOutcome(outcome)}) — deleting the row`)
       expect(countStartupEntries(r.entries, ORPHAN_CLEANUP_LABEL)).toBe(0)
@@ -4898,7 +4923,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
 
         expect(resolveCalls).toHaveLength(1)
         expect(stops).toEqual([])
-        expect(r.result).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 0, live: 0, killFailed: 0 } })
+        expect(r.result).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
         expect(r.deleteCalls).toEqual([])
         expect(r.entries).toContain(
           keptEntry('cscb_alpha_old', renderPersonaRef('alpha', 'alpha'), { ...killOutcomeOf({ thrown: err }), recheck: RECHECK_OUTCOME_PASS } as KillOutcome),
@@ -4941,7 +4966,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
         expect(killCalls.map((k) => k.claude_instance_id)).toEqual(['cscb_old_waiting_C0OLD', 'cscb_alpha_old'])
         expect(deleteCalls).toEqual([])
         expect(callLog).toEqual([])
-        expect(result).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 1, live: 1, killFailed: 0 } })
+        expect(result).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 1, live: 1, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
         const entries = readLog()
         expect(countStartupEntries(entries, ORPHAN_CLEANUP_LABEL)).toBe(0)
         const stopLines = errLog.split('\n').filter((l) => l.includes('the version re-check decided that the server stops'))
@@ -4984,7 +5009,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
         expect(killCalls.map((k) => k.claude_instance_id)).toEqual(['cscb_old_waiting_C0OLD'])
         expect(deleteCalls).toEqual([])
         expect(callLog).toEqual([])
-        expect(result).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 1, live: 1, killFailed: 1 } })
+        expect(result).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 1, live: 1, killFailed: 1 }, recordedAsRetired: 0, leftForLatch: 0 })
         expect(countStartupEntries(readLog(), ORPHAN_CLEANUP_LABEL)).toBe(0)
         expect(errLog.split('\n').filter((l) => l.includes('the version re-check decided that the server stops'))).toHaveLength(1)
       })
@@ -5067,7 +5092,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
         expect(r.statusCalls).toEqual(Array.from({ length: KILL_RETRY_TRIES - 1 }, () => 'cscb_alpha_old'))
         expect(r.clock.now()).toBe((KILL_RETRY_TRIES - 1) * KILL_RETRY_SPACING_MS)
         expect(r.deleteCalls).toEqual([])
-        expect(r.result).toEqual({ found: 2, killed: 0, failed: 2, prePersona: { kept: 1, live: 1, killFailed: 1 } })
+        expect(r.result).toEqual({ found: 2, killed: 0, failed: 2, prePersona: { kept: 1, live: 1, killFailed: 1 }, recordedAsRetired: 0, leftForLatch: 0 })
         expect(armed).toEqual([])
       })
 
@@ -5105,7 +5130,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
         expect(r.killCalls).toEqual(['cscb_alpha_old', 'cscb_alpha_old', 'cscb_gamma_old', 'cscb_departed', 'cscb_departed', 'cscb_departed'])
         expect(r.statusCalls).toEqual(['cscb_alpha_old', 'cscb_departed', 'cscb_departed'])
         expect(r.deleteCalls).toEqual([['cscb_alpha_old']])
-        expect(r.result).toEqual({ found: 3, killed: 1, failed: 2, prePersona: { kept: 0, live: 0, killFailed: 0 } })
+        expect(r.result).toEqual({ found: 3, killed: 1, failed: 2, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
       })
 
       test.each<[string, string, string, number, boolean]>([
@@ -5270,7 +5295,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
       })
 
       const failed = killError ? 1 : 0
-      expect(result).toEqual({ found: 1, killed: 1, failed: 0, prePersona: { kept: 1, live: 1, killFailed: failed } })
+      expect(result).toEqual({ found: 1, killed: 1, failed: 0, prePersona: { kept: 1, live: 1, killFailed: failed }, recordedAsRetired: 0, leftForLatch: 0 })
       expect(killCalls.map((k) => k.claude_instance_id)).toEqual(['cscb_old_waiting_C0OLD', 'cscb_departed'])
       expect(deleteCalls.map((d) => d.claude_instance_id)).toEqual([['cscb_departed']])
       expect(errLog).toContain('reconcileOrphans: pre-persona row (no persona label) instanceId=cscb_old_waiting_C0OLD state=waiting tmux_session=slack_bot_old_waiting_C0OLD is live')
@@ -5315,7 +5340,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
         result = await reconcileOrphans(cfg)
       })
 
-      expect(result).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 8, live: 6, killFailed: 0 } })
+      expect(result).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 8, live: 6, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
       expect(killCalls.map((k) => k.claude_instance_id)).toEqual([...liveIds, pendingLeftLive])
       expect(deleteCalls).toHaveLength(0)
       expect(findMissingCalls).toEqual([{}])
@@ -5373,7 +5398,7 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
       })
 
       expect(findMissingCalls).toHaveLength(1)
-      expect(result).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 1, live: 1, killFailed: 0 } })
+      expect(result).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 1, live: 1, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
       expect(errLog).toContain('[slack] reconcileOrphans: findMissing sweep failed for killed pre-persona rows:')
       expect(errLog).toContain(
         '[slack] reconcileOrphans: findMissing after the kills of 1 live pre-persona row(s) failed — they still read live and are killed again at the next start',
@@ -5441,14 +5466,460 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
     })
   })
 
-  test('list failure → recorded + zero counts (no crash)', async () => {
-    const readLog = captureStartupErrors()
-    installStub({ listError: new Error('AD down') })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-    const result = await reconcileOrphans(cfg)
-    expect(result.found).toBe(0)
-    expect(result.killed).toBe(0)
-    expect(readLog()).toContain('[orphan-cleanup-list-failed]')
+  // b.jg5 SRJ-116, SRJ-714 (its list, latch and record parts), SRJ-502
+  // (AC 55), SRJ-504 (AC 45's list half), SRJ-513, SRJ-803, SRJ-807; the
+  // E13, E14, E16 and E24 hatch notes. Every case runs on
+  // `makeRecoveryHarness` over P and B: its latch, configured-persona query
+  // and retired-key store (over its temp state directory) installed as
+  // `main()` installs them, its notice episodes as the recording notice sink;
+  // `srj105AfterEach` leak-checks everything captured and puts every install
+  // back. The sweep runs as `main()` runs it, its kill retries on the
+  // harness clock. A latched persona's rows are never killed; whether the
+  // sweep still kills a finished row or deletes after a kill, and its
+  // summary line, are not checked here.
+  describe('b.jg5 SRJ-116, SRJ-714: the one list latches each configured persona from its own row, records absent personas\' keys as retired in one write before the first kill, clears at its rows, and never kills a latched persona\'s rows', () => {
+    afterEach(srj105AfterEach)
+
+    /** Every state a listed row can be in: each live state, `pending` first, then the finished ones. */
+    const EVERY_STATE = [...AGENT_DIRECTOR_LIVE_STATES, ...AGENT_DIRECTOR_DEAD_STATES]
+    /** A second key no persona of the harness has. */
+    const ABSENT_2 = `${LAUNCH_START_ABSENT_PERSONA_KEY}_2`
+
+    /** Persona `key`'s row as the `list` gives it (its id, labels and directory; `waiting`), with `overrides`. */
+    function listed(h: RecoveryHarness, key: string, overrides: Partial<Phase1ListRow> = {}): Phase1ListRow {
+      return cannedListRow(overrides, harnessPersona(h, key), h.home)
+    }
+
+    /** A row a spawn of `key`, a persona absent from the configuration, left (`cscb_<key>`, labelled `key`), with `overrides`. */
+    function absentRow(h: RecoveryHarness, key: string, overrides: Partial<Phase1ListRow> = {}): Phase1ListRow {
+      return cannedListRow(overrides, { ...harnessPersona(h, h.keys[0]!), key }, h.home)
+    }
+
+    /** The harness's configuration without persona `key`, which is also dropped from the applied set (the configured-persona query). */
+    function withoutPersona(h: RecoveryHarness, key: string): PersonaConfig {
+      h.remove(key)
+      return { ...h.config, personas: h.config.personas.filter((persona) => persona.key !== key) }
+    }
+
+    /** What one sweep did: its result, every stub call in order, and the record writes made and the personas latched when its first kill was sent. */
+    interface SweepRun {
+      readonly result: Awaited<ReturnType<typeof reconcileOrphans>>
+      readonly order: string[]
+      readonly atFirstKill: { readonly writes: number; readonly latched: string[] } | undefined
+    }
+
+    /** Run the start sweep over `rows` with `config` (the harness's own by default), as `main()` runs it. */
+    async function sweepOver(h: RecoveryHarness, rows: readonly Phase1ListRow[], config: PersonaConfig = h.config): Promise<SweepRun> {
+      h.script({ listResult: { spawns: [...rows] } })
+      let atFirstKill: SweepRun['atFirstKill']
+      const kill = h.stub.client.kill.bind(h.stub.client)
+      h.stub.client.kill = (params) => {
+        atFirstKill ??= { writes: h.retiredKeyWrites.length, latched: h.keys.filter((key) => h.latch.isLatched(key)) }
+        return kill(params)
+      }
+      const order = recordCallOrder(h)
+      const result = await h.drive(reconcileOrphans(config, h.killRetryClock))
+      return { result, order, atFirstKill }
+    }
+
+    /** The ids the sweep sent a `kill` for, in order. */
+    const killedIds = (h: RecoveryHarness): string[] => h.stub.calls.killCalls.map((k) => k.claude_instance_id)
+
+    /** The sweep's own latch lines: one per persona it holds. */
+    const sweepLatchLines = (h: RecoveryHarness): string[] =>
+      h.errors.filter((line) => line.startsWith('[slack] reconcileOrphans: ') && (line.includes(' latched from its own listed row ') || line.includes(' is latched (case=')))
+
+    /** The sweep's latch line for persona `p` latched from its own listed row with `latchCase`. */
+    const latchedFromListLine = (p: string, latchCase: string): string =>
+      `[slack] reconcileOrphans: ${renderPersonaRef(p, p)} latched from its own listed row instanceId=${personaInstanceId(p)} (case=${latchCase}) — its own row and every row labelled with it are left unkilled (b.jg5 SRJ-116, SRJ-502, SRJ-714)`
+
+    /** The record file holds exactly `absent`, each recorded `absent-at-start` now with no mark, beside `others` as seeded. */
+    function expectRecordedAbsent(h: RecoveryHarness, absent: readonly string[], others: Readonly<Record<string, RetiredKeySeed>> = {}): void {
+      const record = readRetiredKeysRecord(h.stateDir)
+      expect([...(record?.keys() ?? [])].sort()).toEqual([...absent, ...Object.keys(others)].sort())
+      for (const key of absent) {
+        expect(record?.get(key)).toEqual({ cause: RETIRED_KEY_CAUSE_ABSENT_AT_START, retiredAt: expect.stringMatching(RFC3339_UTC), newLifeBegunAt: null })
+      }
+      for (const [key, entry] of retiredKeysRecordOf(others)) expect(record?.get(key)).toEqual(entry)
+    }
+
+    test('one list carrying the service label alone, with no state filter, and nothing else: a sweep listing no row makes no other call, latches, records and posts nothing', async () => {
+      const { h } = srj105Build()
+
+      const run = await sweepOver(h, [])
+
+      expect(h.stub.calls.listCalls).toEqual([{ label: [SERVICE_LABEL] }])
+      expect(run.order).toEqual(['list'])
+      expect(run.result).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
+      expectNoNoteLatch(h)
+      expect([h.retiredKeyWrites, readRetiredKeysRecord(h.stateDir)]).toEqual([[], null])
+    })
+
+    test.each(EVERY_STATE)('a row listed %s reaches the decisions: an absent persona\'s row in that state has its key recorded absent-at-start, in the one write, before any kill', async (state) => {
+      const { h } = srj105Build()
+
+      const run = await sweepOver(h, [absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY, { state })])
+
+      expectRecordedAbsent(h, [LAUNCH_START_ABSENT_PERSONA_KEY])
+      expect(h.retiredKeyWrites).toEqual([{ path: h.retiredKeys.path, ok: true }])
+      expect(run.result.recordedAsRetired).toBe(1)
+      if (run.atFirstKill !== undefined) expect(run.atFirstKill.writes).toBe(1)
+      expectNoNoteLatch(h)
+    })
+
+    test('several rows of two absent personas, in every state, with configured personas\' rows and a pre-persona row: both keys in one write before the first kill; no configured or pre-persona key is recorded', async () => {
+      const { h, p, b } = srj105Build()
+      const rows = [
+        // Swept first: B's row under another instance id.
+        listed(h, b, { claude_instance_id: `${personaInstanceId(b)}_old` }),
+        ...EVERY_STATE.map((state, i) => absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY, { state, claude_instance_id: `${personaInstanceId(LAUNCH_START_ABSENT_PERSONA_KEY)}_${i}` })),
+        absentRow(h, ABSENT_2, { state: LIVENESS_DEAD_ROW_MISSING }),
+        absentRow(h, ABSENT_2, { state: 'working', claude_instance_id: `${personaInstanceId(ABSENT_2)}_old` }),
+        listed(h, p),
+        prePersonaRow('waiting'),
+      ]
+
+      const run = await sweepOver(h, rows)
+
+      expectRecordedAbsent(h, [LAUNCH_START_ABSENT_PERSONA_KEY, ABSENT_2])
+      expect(h.retiredKeyWrites).toEqual([{ path: h.retiredKeys.path, ok: true }])
+      expect(retiredKeyLinesIn(h.errors)).toHaveLength(1)
+      expect(run.atFirstKill).toEqual({ writes: 1, latched: [] })
+      expect(killedIds(h)[0]).toBe(`${personaInstanceId(b)}_old`)
+      expect(run.result).toMatchObject({ recordedAsRetired: 2, leftForLatch: 0 })
+      expectNoNoteLatch(h)
+    })
+
+    test.each<[string, Readonly<Record<string, RetiredKeySeed>>, (h: RecoveryHarness) => Phase1ListRow[], number]>([
+      ['every absent key already recorded with no mark', { [LAUNCH_START_ABSENT_PERSONA_KEY]: { cause: RETIRED_KEY_CAUSE_REMOVED } }, (h) => [absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY, { state: 'ended' })], 1],
+      ['no absent persona\'s row listed', { [LAUNCH_START_ABSENT_PERSONA_KEY]: { cause: RETIRED_KEY_CAUSE_REMOVED } }, (h) => [listed(h, h.keys[0]!)], 0],
+    ])('nothing new to record (%s): no write, the record file byte-identical and no store line', async (_label, seeded, rows, named) => {
+      const { h } = srj105Build({ retiredKeys: () => seeded })
+      const before = readFileSync(h.retiredKeys.path)
+
+      const run = await sweepOver(h, rows(h))
+
+      expect(readFileSync(h.retiredKeys.path).equals(before)).toBe(true)
+      expect([h.retiredKeyWrites, retiredKeyLinesIn(h.errors)]).toEqual([[], []])
+      expect(run.result.recordedAsRetired).toBe(named)
+    })
+
+    // b.jg5 SRJ-714, SRJ-803, SRJ-807: recording a marked key clears its mark,
+    // so a live row of it is the old life again; the same sweep's SRJ-807
+    // clear does not apply to that row, and the whole is one write.
+    test.each(['waiting', LIVENESS_DEAD_ROW_ENDED])('an absent persona\'s key recorded with its mark set, its own row listed %s: the recording clears the mark (cause absent-at-start) in one write; the entry stays, with no clear; another marked key is untouched', async (state) => {
+      const marked: RetiredKeySeed = { cause: RETIRED_KEY_CAUSE_REMOVED, mark: true }
+      const { h, b } = srj105Build({ retiredKeys: ([, b]) => ({ [LAUNCH_START_ABSENT_PERSONA_KEY]: marked, [b!]: marked }) })
+
+      await sweepOver(h, [absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY, { state })])
+
+      expectRecordedAbsent(h, [LAUNCH_START_ABSENT_PERSONA_KEY], { [b]: marked })
+      expect(h.retiredEntry(LAUNCH_START_ABSENT_PERSONA_KEY)).toMatchObject({ recorded: true, marked: false })
+      expect(h.retiredKeyWrites).toEqual([{ path: h.retiredKeys.path, ok: true }])
+      // The store's one line is the recording's; no clear line.
+      const lines = retiredKeyLinesIn(h.errors)
+      expect(lines).toHaveLength(1)
+      expect(lines[0]).toStartWith(`${RETIRED_KEYS_LOG_PREFIX} recorded `)
+    })
+
+    test.each([...RETIRED_ENTRY_CLEARING_STATES])('a configured persona\'s own row listed %s with its key recorded and marked: the entry leaves the file in one write, with one line naming the list; nothing latches or is killed', async (state) => {
+      const { h, p, b } = retiredBuild()
+
+      const run = await sweepOver(h, [listed(h, p, { state })])
+
+      expectClearedOnce(h, p, b, clearedLine(h, p, state, START_SWEEP_LIST_SITE))
+      expect([killedIds(h), run.result.recordedAsRetired]).toEqual([[], 0])
+      expectNoNoteLatch(h)
+    })
+
+    test.each<[string, boolean, string]>([
+      ['recorded with no mark, its row listed waiting', false, 'waiting'],
+      ['marked, its row listed pending (a launch start recorded)', true, AGENT_DIRECTOR_PENDING_STATE],
+      ['marked, its row listed ended', true, LIVENESS_DEAD_ROW_ENDED],
+    ])('the controls: a configured persona %s: nothing is cleared, written or logged by the store', async (_label, pMarked, state) => {
+      const { h, p } = retiredBuild(pMarked)
+      const before = readFileSync(h.retiredKeys.path)
+
+      await sweepOver(h, [listed(h, p, { state })])
+
+      expectNothingCleared(h, p, before)
+      expect(h.retiredKeys.isMarked(p)).toBe(pMarked)
+    })
+
+    // AC 55: P's own row carrying the note latches P, and the sweep leaves it
+    // as it is, whatever it would otherwise decide (another cwd is swept when
+    // P is not latched).
+    test.each<[string, string, (h: RecoveryHarness) => Partial<Phase1ListRow>]>([
+      ['in P\'s working directory', 'waiting', () => ({})],
+      ['in P\'s working directory', LIVENESS_DEAD_ROW_ENDED, () => ({})],
+      ['in another existing cwd', 'waiting', (h) => ({ cwd: h.home })],
+      ['in another existing cwd', LIVENESS_DEAD_ROW_ENDED, (h) => ({ cwd: h.home })],
+    ])('AC 55: P\'s own row %s, listed %s with provenance_conflict: P latches with "conflicting labels" and one post, recording the state listed; the row is not killed and is left for the latch', async (_where, state, where) => {
+      const { h, p, b } = srj105Build()
+
+      const run = await sweepOver(h, [listed(h, p, { state, liveness_note: provenanceNote, ...where(h) })])
+
+      expectNoteLatchedOnce(h, p, latchRowStateRead(state))
+      expect(killedIds(h)).toEqual([])
+      expect(run.result).toMatchObject({ found: 0, leftForLatch: 1 })
+      expect(sweepLatchLines(h)).toEqual([latchedFromListLine(p, LATCH_CASE_CONFLICTING_LABELS)])
+      expectUntouched(h, b)
+    })
+
+    // b.jg5 SRJ-513, SRJ-1020 (the E16 hatch note): every list row of the
+    // helper's table (P's current life, another cwd, another config_dir; each
+    // form of "no launch start"), and one also carrying the note, which takes
+    // the launch-start case only.
+    const LISTED_LAUNCH_START_ROWS = [
+      ...launchStartRowsOf('list'),
+      ...launchStartCurrentLifeOf('list').slice(0, 1).map((row) => ({
+        ...row,
+        name: `${row.name}, provenance_conflict note`,
+        build: (persona: CannedRowPersona, home: string): Phase1ListRow => ({ ...row.build(persona, home), liveness_note: provenanceNote }),
+      })),
+    ]
+
+    test.each(byName(LISTED_LAUNCH_START_ROWS))('%s: P latches with "launch start not recorded" and one SRJ-1020 post; the row is not killed and is left for the latch', async (_name, row) => {
+      const { h, p, b } = srj105Build()
+
+      const run = await sweepOver(h, [row.build(harnessPersona(h, p), h.home)])
+
+      expectLatchedOnce(h, p, launchStartLatch(p, row))
+      expect(killedIds(h)).toEqual([])
+      expect(run.result.leftForLatch).toBe(1)
+      expect(sweepLatchLines(h)).toEqual([latchedFromListLine(p, LATCH_CASE_LAUNCH_START_NOT_RECORDED)])
+      expectUntouched(h, b)
+    })
+
+    test('P\'s own row (cscb_<key>) labelled with another persona and carrying the note latches P, not that persona, and is left unkilled', async () => {
+      const { h, p, b } = srj105Build()
+      const labels = { ...listed(h, b).labels }
+
+      const run = await sweepOver(h, [listed(h, p, { liveness_note: provenanceNote, labels })])
+
+      expectNoteLatchedOnce(h, p, latchRowStateRead('waiting'))
+      expect([killedIds(h), run.result.leftForLatch]).toEqual([[], 1])
+    })
+
+    // The note on a row that is not a configured persona's own latches no one.
+    // Each such row is live, so with no latch the sweep kills it as today.
+    test.each<[string, (h: RecoveryHarness, p: string) => Phase1ListRow]>([
+      ['a row labelled P under another instance id', (h, p) => listed(h, p, { claude_instance_id: `${personaInstanceId(p)}_old`, liveness_note: provenanceNote })],
+      ['an absent persona\'s own row', (h) => absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY, { liveness_note: provenanceNote })],
+      ['a pre-persona row', () => ({ ...prePersonaRow('waiting'), liveness_note: provenanceNote })],
+    ])('the note on %s latches no one and posts nothing; the row is killed as today', async (_label, build) => {
+      const { h, p } = srj105Build()
+      const row = build(h, p)
+
+      const run = await sweepOver(h, [row])
+
+      expectNoNoteLatch(h)
+      expect(run.result.leftForLatch).toBe(0)
+      expect(killedIds(h)).toEqual([row.claude_instance_id])
+    })
+
+    test.each([
+      ...[...nonLatchingNotes, unknownNote].map((note) => [`P's own row carrying the note ${note}`, (h: RecoveryHarness, p: string) => listed(h, p, { liveness_note: note })] as const),
+      ...LAUNCH_START_NON_LATCHING_ROWS.filter((row): row is LaunchStartNonLatchingRowOf<'list'> => row.shape === 'list').map(
+        (row) => [row.name, (h: RecoveryHarness, p: string) => row.build(harnessPersona(h, p), h.home)] as const,
+      ),
+    ])('%s: latches no one and posts nothing', async (_label, build) => {
+      const { h, p } = srj105Build()
+
+      const run = await sweepOver(h, [build(h, p)])
+
+      expectNoNoteLatch(h)
+      expect(run.result.leftForLatch).toBe(0)
+      expect(sweepLatchLines(h)).toEqual([])
+    })
+
+    // b.jg5 SRJ-502, SRJ-714: decided over the whole list before the first
+    // kill, so the order of P's rows around its latching own row changes
+    // nothing; B's swept row is listed first and still killed.
+    test.each([
+      ['P\'s own row first', [0, 1, 2]],
+      ['P\'s own row between its other rows', [1, 0, 2]],
+      ['P\'s own row last', [1, 2, 0]],
+    ] as const)('P latching from its own row (%s): its rows under another instance id and in another cwd get no kill and are left for the latch; P was latched before the first kill', async (_order, order) => {
+      const { h, p, b } = srj105Build()
+      const pRows = [
+        listed(h, p, { liveness_note: provenanceNote }),
+        listed(h, p, { claude_instance_id: `${personaInstanceId(p)}_old` }),
+        listed(h, p, { claude_instance_id: `${personaInstanceId(p)}_older`, cwd: h.home, state: 'working' }),
+      ]
+      const bOld = `${personaInstanceId(b)}_old`
+
+      const run = await sweepOver(h, [listed(h, b, { claude_instance_id: bOld }), ...order.map((i) => pRows[i]!)])
+
+      expect(killedIds(h)).toEqual([bOld])
+      expect(run.atFirstKill).toEqual({ writes: 0, latched: [p] })
+      expect(run.result).toMatchObject({ found: 1, killed: 1, leftForLatch: 3 })
+      expectNoteLatchedOnce(h, p, latchRowStateRead('waiting'))
+      expect(sweepLatchLines(h)).toEqual([latchedFromListLine(p, LATCH_CASE_CONFLICTING_LABELS)])
+    })
+
+    test('P latched before the sweep runs: none of its rows is killed (its own, another instance id, another cwd), with one line and no second post; B\'s swept row is still killed', async () => {
+      const { h, p, b } = srj105Build()
+      h.script({ getResult: harnessRow(h, harnessPersona(h, p), { liveness_note: provenanceNote }) })
+      await readPersonaOwnRow(p, { site: 'session-manager.test', what: 'own-row read' })
+      expectNoteLatchedOnce(h, p, latchRowStateRead('waiting'))
+      const bOld = `${personaInstanceId(b)}_old`
+
+      const run = await sweepOver(h, [
+        listed(h, p),
+        listed(h, p, { claude_instance_id: `${personaInstanceId(p)}_old` }),
+        listed(h, b, { claude_instance_id: bOld }),
+        listed(h, p, { claude_instance_id: `${personaInstanceId(p)}_older`, cwd: h.home }),
+      ])
+
+      expect(killedIds(h)).toEqual([bOld])
+      expect(run.result).toMatchObject({ found: 1, killed: 1, leftForLatch: 3 })
+      expectNoteLatchedOnce(h, p, latchRowStateRead('waiting'))
+      expect(sweepLatchLines(h)).toEqual([
+        `[slack] reconcileOrphans: ${renderPersonaRef(p, p)} is latched (case=${LATCH_CASE_CONFLICTING_LABELS}) — its own row and every row labelled with it are left unkilled (b.jg5 SRJ-502, SRJ-714)`,
+      ])
+    })
+
+    // AC 45's list half (b.jg5 SRJ-504): a restart is two harness lifetimes
+    // over the same listed row; the second starts with P unlatched.
+    test.each<[string, (h: RecoveryHarness, p: string) => Phase1ListRow, (h: RecoveryHarness, p: string) => void]>([
+      ['carries provenance_conflict', (h, p) => listed(h, p, { liveness_note: provenanceNote }), (h, p) => expectNoteLatchedOnce(h, p, latchRowStateRead('waiting'))],
+      [
+        'reads pending with no launch start',
+        (h, p) => launchStartCurrentLifeOf('list')[0]!.build(harnessPersona(h, p), h.home),
+        (h, p) => expectLatchedOnce(h, p, launchStartLatch(p, launchStartCurrentLifeOf('list')[0]!)),
+      ],
+    ])('AC 45: P\'s own listed row %s: P latches at each server start\'s sweep with exactly one post; after the restart\'s sweep the start pass answers latched for P with no call for it', async (_label, row, expectLatched) => {
+      const first = srj105Build()
+      await sweepOver(first.h, [row(first.h, first.p)])
+      expectLatched(first.h, first.p)
+      // The restart: leak-checked and cleaned up as afterEach does.
+      srj105AfterEach()
+
+      const { h, p } = srj105Build()
+      expect(p).toBe(first.p)
+      expect([h.latch.isLatched(p), h.latchEvents, h.episodeNotices]).toEqual([false, [], []])
+      await sweepOver(h, [row(h, p)])
+      expectLatched(h, p)
+      const pCalls = personaCallCounts(h, p)
+
+      expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+      expect(personaCallCounts(h, p)).toEqual(pCalls)
+      expect(h.episodeNotices).toHaveLength(1)
+    })
+
+    // Hatch A3 (b.jg5 SRJ-714, SRJ-803, SRJ-805): a failed absent-at-start
+    // write is the store's one line; the file is unchanged, this server holds
+    // the key as retired in memory, and the sweep goes on to its kills.
+    async function sweepWithFailedWrite(): Promise<{ h: RecoveryHarness; p: string; bOld: string; before: Buffer; run: SweepRun }> {
+      const { h, p, b } = srj105Build({ resumeEnabled: true, retiredKeys: () => ({ earlier: { cause: RETIRED_KEY_CAUSE_REMOVED } }) })
+      const before = readFileSync(h.retiredKeys.path)
+      const bOld = `${personaInstanceId(b)}_old`
+      h.failRetiredKeyWrites()
+      const run = await sweepOver(h, [listed(h, p, ENDED_WITH_SESSION), listed(h, b, { claude_instance_id: bOld })], withoutPersona(h, p))
+      return { h, p, bOld, before, run }
+    }
+
+    /** P's launch over its row read `ended` with a session id (resumed, were its key not recorded): one reuse spawn, no resume. */
+    async function expectReuseNoResume(h: RecoveryHarness, p: string): Promise<void> {
+      h.script({ getResult: harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION), statusResult: cannedStatusResult({ state: LIVENESS_DEAD_ROW_ENDED }) })
+      const spawnsBefore = h.stub.calls.spawnCalls.length
+      expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_FRESH_RETIRED })
+      expect(h.stub.calls.spawnCalls.slice(spawnsBefore)).toEqual([reuseSpawnOf(h, p)])
+      expect(h.stub.calls.resumeCalls).toEqual([])
+      await h.runApproverToStop(p)
+    }
+
+    test('hatch A3: a failed absent-at-start write is one store line; the file is unchanged, the key reads as retired by this server (held in memory) and is counted, the kills are still made with no orphan-cleanup entry; P re-added before a restart gets one reuse spawn and no resume', async () => {
+      const { h, p, bOld, before, run } = await sweepWithFailedWrite()
+
+      expect(h.retiredKeyWrites).toEqual([{ path: h.retiredKeys.path, ok: false }])
+      expect(readFileSync(h.retiredKeys.path).equals(before)).toBe(true)
+      const lines = retiredKeyLinesIn(h.errors)
+      expect(lines).toHaveLength(1)
+      expect(lines[0]).toStartWith(`${RETIRED_KEYS_LOG_PREFIX} cannot record `)
+      expect(h.errors.filter((line) => line.startsWith('[slack] reconcileOrphans: ') && line.includes(' as retired'))).toEqual([])
+      expect([h.retiredEntry(p).recorded, h.retiredKeys.isHeldInMemory(p)]).toEqual([true, true])
+      expect(run.result.recordedAsRetired).toBe(1)
+      expect(killedIds(h)).toContain(bOld)
+      expect(countStartupEntries(h.startupErrors().join('\n'), ORPHAN_CLEANUP_LABEL)).toBe(0)
+
+      h.reAdd(p)
+      await expectReuseNoResume(h, p)
+    })
+
+    test('hatch A3: the apply that re-adds P writes the key it holds (absent-at-start) before its last-applied write; after a restart over the same state directory P is still recorded and gets one reuse spawn and no resume', async () => {
+      const { h, p } = await sweepWithFailedWrite()
+
+      // Apply step 1's record of a key held only in memory (`retiredKeysToRecord`; the write itself is E24's test).
+      expect(h.retiredKeys.record([{ key: p, cause: h.retiredKeys.entry(p)!.cause }]).outcome).toBe(RETIRED_KEYS_WRITTEN)
+      expectRecordedAbsent(h, [p], { earlier: { cause: RETIRED_KEY_CAUSE_REMOVED } })
+
+      // The restart: the store loaded anew over the same state directory, installed as main() installs it.
+      const restarted = loadRetiredKeyStore(h.stateDir, { log: () => {} })
+      if (restarted.kind !== 'loaded') throw new Error('the retired-key record cannot be loaded again')
+      expect([restarted.store.isRecorded(p), restarted.store.isHeldInMemory(p)]).toEqual([true, false])
+      setRetiredKeyStore(restarted.store)
+
+      h.reAdd(p)
+      await expectReuseNoResume(h, p)
+    })
+
+    test.each<[string, (h: RecoveryHarness) => void, string]>([
+      ['no retired-key store installed', () => _resetRetiredKeyStore(), 'no retired-key store is installed, so the keys of absent personas\' rows are not recorded as retired: '],
+      [
+        'a record that throws',
+        (h) => setRetiredKeyStore({
+          isRecorded: (key) => h.retiredKeys.isRecorded(key),
+          isMarked: (key) => h.retiredKeys.isMarked(key),
+          mark: (key) => h.retiredKeys.mark(key),
+          clear: (key, onRead) => h.retiredKeys.clear(key, onRead),
+          recordGeneration: (key) => h.retiredKeys.recordGeneration(key),
+          record: () => {
+            throw new Error('record broken')
+          },
+        }),
+        'recording the keys of absent personas\' rows as retired failed: ',
+      ],
+    ])('%s: one sweep line, nothing recorded or counted, and the sweep goes on to its kills', async (_label, install, says) => {
+      const { h } = srj105Build()
+      install(h)
+
+      const run = await sweepOver(h, [absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY)])
+
+      expect(h.errors.filter((line) => line.startsWith(`[slack] reconcileOrphans: ${says}`))).toHaveLength(1)
+      expect([run.result.recordedAsRetired, h.retiredKeyWrites, readRetiredKeysRecord(h.stateDir)]).toEqual([0, [], null])
+      expect(killedIds(h)).toEqual([personaInstanceId(LAUNCH_START_ABSENT_PERSONA_KEY)])
+    })
+
+    test('a list failure: one orphan-cleanup-list-failed entry; no latch, post, kill, record write or find-missing; the start pass after it goes on', async () => {
+      const { h, p } = srj105Build()
+      h.script({ listError: errGeneric('list', 'ErrListBroken') })
+      const order = recordCallOrder(h)
+
+      const result = await reconcileOrphans(h.config, h.killRetryClock)
+
+      expect(order).toEqual(['list'])
+      expect(result).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
+      expect(countStartupEntries(h.startupErrors().join('\n'), ORPHAN_CLEANUP_LIST_FAILED_LABEL)).toBe(1)
+      expectNoNoteLatch(h)
+      expect(h.retiredKeyWrites).toEqual([])
+      h.script({ listError: undefined })
+      expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
+      await h.runApproverToStop(p)
+    })
+
+    test('a dry run makes no list and latches, records and kills nothing', async () => {
+      const { h, p } = srj105Build()
+      process.env['SLACK_DRY_RUN'] = '1'
+
+      const run = await sweepOver(h, [listed(h, p, { liveness_note: provenanceNote }), absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY)])
+
+      expect(run.order).toEqual([])
+      expect(run.result).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
+      expectNoNoteLatch(h)
+      expect(h.retiredKeyWrites).toEqual([])
+    })
   })
 })
 
@@ -5604,7 +6075,7 @@ describe('collision ladder: a directory-broken persona keeps its row (b.av2 SR-6
       const sweepLog = await withCapturedErr(async () => {
         sweep = await reconcileOrphans(cfg)
       })
-      expect(sweep).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 } })
+      expect(sweep).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
       expect(sweepLog).toContain(deferredSweepLine('C', 'C', broken.workingDirectory))
 
       broken.recreate()
@@ -14211,11 +14682,11 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
   // SRJ-313: refused with no spawn-failed record; its case follows this table.)
   test.each<[string, string, string, (err: Error) => Promise<void>]>([
     ['a failed orphan delete', ORPHAN_CLEANUP_LABEL, 'delete', async (err) => {
-      expect(await reconcileOrphans(installOrphan('deleteError', err))).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 0, live: 0, killFailed: 0 } })
+      expect(await reconcileOrphans(installOrphan('deleteError', err))).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
     }],
-    ['a failed orphan list', 'orphan-cleanup-list-failed', 'list', async (err) => {
+    ['a failed orphan list', ORPHAN_CLEANUP_LIST_FAILED_LABEL, 'list', async (err) => {
       installStub({ listError: err })
-      expect(await reconcileOrphans(orphanConfig().cfg)).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 } })
+      expect(await reconcileOrphans(orphanConfig().cfg)).toEqual({ found: 0, killed: 0, failed: 0, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
     }],
   ])('%s with a base AgentDirectorError whose errName is token-shaped and whose description holds a URL and a fake token → the %s record names its type and the redacted description once; nothing leaks', async (_label, classLabel, verb, run) => {
     const readLog = captureStartupErrors()
@@ -14242,7 +14713,7 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
       result = await reconcileOrphans(installOrphan('killError', err))
     })
 
-    expect(result).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 0, live: 0, killFailed: 0 } })
+    expect(result).toEqual({ found: 1, killed: 0, failed: 1, prePersona: { kept: 0, live: 0, killFailed: 0 }, recordedAsRetired: 0, leftForLatch: 0 })
     const entry = onlyStartupEntry(readLog(), ORPHAN_CLEANUP_LABEL)
     expect(entry).toContain(`: ${describeKillOutcome(killOutcomeOf({ thrown: err }))}; row kept, no delete was made`)
     expect(entry).toContain(`message="${REDACTED_AD_DESCRIPTION}"`)
@@ -21355,6 +21826,7 @@ describe('b.jg5 SRJ-807: the controls — an unmarked key, a pending row, a conf
             return h.retiredKeys.clear(key, onRead)
           },
           recordGeneration: (key) => h.retiredKeys.recordGeneration(key),
+          record: (batch) => h.retiredKeys.record(batch),
         }),
       1,
     ],
@@ -25265,6 +25737,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
       mark: (key) => store.mark(key),
       clear: (key, onRead) => store.clear(key, onRead),
       recordGeneration: (key) => store.recordGeneration(key),
+      record: (batch) => store.record(batch),
       [query]: () => {
         throw err
       },
