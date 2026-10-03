@@ -14,35 +14,42 @@ to run each kind safely and how the integration suite is laid out.
 ## Running the unit suite
 
 Run `bun test` with a scratch HOME and state directory, and with the token
-environment variables and `CSCB_PERSONA` unset, so nothing can fall back to the
-real config or credentials:
+environment variables, `CSCB_PERSONA` and `CLAUDE_CONFIG_DIR` unset, so nothing
+can fall back to the real config or credentials:
 
 ```sh
 S=$(mktemp -d) && env -u SLACK_BOT_TOKEN -u SLACK_APP_TOKEN -u CSCB_PERSONA \
-  HOME=$S SLACK_STATE_DIR=$S/state bun test <files>
+  -u CLAUDE_CONFIG_DIR HOME=$S SLACK_STATE_DIR=$S/state bun test <files>; rm -rf "$S"
 ```
 
 Omit `<files>` to run the whole suite. `bun test` does not run the bash
 scripts under `tests/integration/`.
 
-Run `bun test` from the repository root or from `tests/`, nowhere else. Bun
-reads only the `bunfig.toml` in the directory `bun test` starts in (it does
-not search upward), and only `bunfig.toml` and `tests/bunfig.toml` load the
-host-safety preload guard (`tests/test-helpers/host-safety-preload.ts`) before
-any test file; started in `tests/<subdir>/` or elsewhere, the run has no
-guard. Bun resolves a relative preload path against the directory the run
-starts in, so each file names the guard relative to its own directory, with an
-entry starting `./`, `../` or `/`. The guard points HOME and
-`SLACK_STATE_DIR` at a fresh temp directory, drops every PATH directory that
-holds an `agent-director` binary and unsets `TMUX`; the rules tests follow on
-top of it are in `docs/testing-guide.md`. The tests also build their own temp
-homes and fake credentials (see Isolation in that guide).
+The `env … HOME=$S` prefix covers one command only. Give every `bun test`
+its own prefix and scratch directory; a second `bun test` chained after the
+first (`… bun test a; bun test b`) starts with your own HOME, and the guard
+refuses it.
 
-Keep the scratch environment anyway. Bun fixes `os.homedir()` to the HOME
-`bun test` started with, so `src/` code that calls `homedir()` directly still
-sees the start-up HOME after the preload has changed `HOME`. Started with
-`HOME=$S`, such a path lands in `$S` and never in the real
-`~/.claude/channels/slack/` or `~/.agent-director/`.
+Run `bun test` only from a directory with a `bunfig.toml` that loads the
+host-safety preload guard (`tests/test-helpers/host-safety-preload.ts`): the
+repository root, `tests/` or `tests/integration/`. Bun reads only the
+`bunfig.toml` in the directory `bun test` starts in (it does not search
+upward). The repository root and every directory holding a `*.test.ts` file
+have one, and `tests/host-safety.test.ts` fails when a directory of test files
+lacks it. Started in a directory with no `bunfig.toml` (outside the
+repository, or `src/`, say), the run has no guard. Bun resolves a relative
+preload path against the directory the run starts in, so each file names the
+guard relative to its own directory, with an entry starting `./`, `../` or
+`/`. The guard is the first `[test]` preload entry in every file, so no other
+preload runs before it.
+
+The guard loads before any test file. It first checks the home the run was
+launched with (see When the guard refuses to start, below). It then points
+HOME and `SLACK_STATE_DIR` at a fresh temp directory, drops every PATH
+directory that holds an `agent-director` binary and unsets `TMUX` and
+`CLAUDE_CONFIG_DIR`. The rules tests follow on top of it are in
+`docs/testing-guide.md`. The tests also build their own temp homes and fake
+credentials (see Isolation in that guide).
 
 Install a development tree's dependencies with lifecycle scripts disabled:
 
@@ -57,6 +64,60 @@ skeleton files under `~/.claude/channels/slack/`. With scripts disabled,
 files bun's extraction dropped from `node_modules/`) does not run either; run
 `bun scripts/fixup-bun-cache.ts` by hand from the repo root when a dependency
 is missing files.
+
+### When the guard refuses to start
+
+Bun fixes `os.homedir()` to the HOME `bun test` was launched with, and the
+guard cannot change it. `src/` code that calls `homedir()` directly (the state
+directory default, the Claude config directory, the default transcript root,
+`~` expansion, the start gate's `state.db` path) resolves against that
+launch-time home for the whole run. So the guard refuses to start when that
+home could reach your real Claude, Slack or agent-director state. It prints
+one line and exits with code 78, before any test file loads and before it
+creates anything:
+
+```text
+host-safety preload: refusing to start: <reason> (launch-time home "<path>"). Start bun test with a scratch HOME and SLACK_STATE_DIR, as tests/README.md shows.
+```
+
+A failing test exits 1, so 78 always means the run never started. The reason
+says what was wrong with the launch-time home. The guard checks the rules in
+this order and reports the first that applies:
+
+| Reason | The launch-time home |
+|---|---|
+| `launch-home-not-absolute` | is empty or a relative path |
+| `launch-home-in-real-home` | is your home directory (your `/etc/passwd` entry) or lies under it, symlinks resolved |
+| `launch-home-temp-dir-is-root` | with no `/etc/passwd` entry for your account, is checked against a temp directory (`TMPDIR`, else `/tmp`) that is `/`, symlinks resolved: every path lies under `/`, so the temp-directory rules below would accept any home |
+| `launch-home-not-under-temp-dir` | with no `/etc/passwd` entry for your account, does not lie strictly under the temp directory (`TMPDIR`, else `/tmp`), symlinks resolved; the temp directory itself is refused |
+| `launch-home-holds-slack-state` | has anything at `.claude/channels/slack` |
+| `launch-home-derived-path-in-real-home` | has a path the code derives from the home (`.claude`, `.claude/channels/slack`, `.claude/projects`, `.claude/skills`, `.claude/slack-mcp.json`, `.agent-director` or a file under it) that leads into your home directory through a symlink, a dangling one included |
+| `launch-home-derived-path-not-under-temp-dir` | with no `/etc/passwd` entry for your account, has one of those paths leading out of the temp directory |
+| `launch-home-holds-agent-director` | has `.agent-director` or the standard agent-director install path |
+
+The guard reads your home from the first `/etc/passwd` line whose user ID
+field is exactly yours. "No `/etc/passwd` entry" covers a file it cannot
+read, no line for your user ID, and a first line for it that is malformed
+(fewer than seven fields, or an empty or relative home); a later line for the
+same user ID is never used. The guard then cannot tell where your home is, so
+it fails closed: the temp directory must not be `/`, and the launch-time home,
+and every path the code derives from it, must lie strictly under it.
+
+The temp-directory rules cannot tell your home from a scratch one when the
+temp directory is another ancestor of your home (`TMPDIR=/home`, say). Your
+home then passes them and is refused only when it holds Slack state or an
+agent-director install. With no `/etc/passwd` entry, leave `TMPDIR` unset or
+point it at a directory that holds no home.
+
+To fix any of them, launch again with a new, empty scratch HOME, as the
+command above shows. `mktemp -d` makes it under `TMPDIR` (else `/tmp`). When
+`TMPDIR` lies under your home directory (or is a symlink into it), that HOME
+is refused as `launch-home-in-real-home`: point `TMPDIR` at a directory
+outside your home, or unset it to use `/tmp`, then launch again. Do the same
+for `launch-home-temp-dir-is-root`, when `TMPDIR` resolves to `/`. Never reuse a
+real or long-lived home, and never work around the guard. Started with a new
+scratch HOME, every `homedir()` path lands in `$S`, never in the real
+`~/.claude/`, `~/.claude/channels/slack/` or `~/.agent-director/`.
 
 ## Docker integration suite
 

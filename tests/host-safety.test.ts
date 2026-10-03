@@ -15,10 +15,20 @@
  *   so strings, regex literals and comments never count: no value import of
  *   `Client` / `resolveSystemBinary` from `agent-director`; every child
  *   process call's `env` is a direct `hostSafeChildEnv` call; no file imports
- *   the preload guard and both `bunfig.toml` files (root and `tests/`) load
- *   it with a path entry Bun resolves from the directory the run starts in;
- *   no named import or re-export of a Phase-1-only error class. Each matcher is pinned with
- *   synthetic flagged and allowed sources, then run over the tree.
+ *   the preload guard, and the repository root and every directory holding a
+ *   test file have a `bunfig.toml` whose first `[test]` preload entry loads
+ *   it with a path Bun resolves from the directory the run starts in (later
+ *   entries allowed, so no other preload runs first); the preload's first
+ *   statement after its imports is the launch-home refusal loop
+ *   (`launchHomeRefusal(<home>, passwdHome(), LIVE_LAUNCH_HOME_PROBE)` over
+ *   `launchTimeHomes()`, exiting with `LAUNCH_HOME_REFUSED_EXIT_CODE`); the
+ *   preload loads only `node:` builtins and `./host-safe-env.ts`, and
+ *   `host-safe-env.ts` only `node:` builtins, in any load form, so no `src/`,
+ *   package or other helper code runs before the refusal; only
+ *   the guard's own files (`REAL_HOME_FILES`) reference `realHome` or
+ *   `passwdHome`, the helpers that answer the real home's path; no named
+ *   import or re-export of a Phase-1-only error class. Each matcher is pinned
+ *   with synthetic flagged and allowed sources, then run over the tree.
  * - SRJ-121's call-site audit over every `*.ts` in `src/` and `scripts/`
  *   (`CALL_SITE_AUDITS`, the same parser): `Client.create` is reached only in
  *   the startup gate's module, `runStartupGate` is referenced only there and
@@ -32,15 +42,15 @@
  * - Preload redirect: the shared, side-effect-free `preloadRedirectedEnv`
  *   on dirty inherited environments (a `PATH` directory holding an
  *   `agent-director` file or dangling symlink, duplicate, empty, relative and
- *   `.` entries, `TMUX` / `TMUX_PANE` set, a foreign `TMUX_TMPDIR`, a stray
- *   `SLACK_STATE_DIR` or HOME), each output asserted exactly and passing the
- *   check.
+ *   `.` entries, `TMUX` / `TMUX_PANE` / `CLAUDE_CONFIG_DIR` set, a foreign
+ *   `TMUX_TMPDIR`, a stray `SLACK_STATE_DIR` or HOME), each output asserted
+ *   exactly and passing the check.
  * - A non-normalized `TMPDIR` (`/tmp//`, `/tmp/.`, `/tmp/../tmp`), in a
  *   `bun` child started with it: `osTempDir()` normalizes it, and
  *   `TMUX_TMPDIR` reuse, the check and the redirect still hold.
  * - Un-injected gate checks: one case checks that the
- *   preload guard applied (HOME, PATH, `TMUX`, `TMUX_PANE`, `TMUX_TMPDIR`,
- *   `SLACK_STATE_DIR`) and only then calls `runStartupGate()`
+ *   preload guard applied (every name in `PRELOAD_ENV_NAMES`, pinned there)
+ *   and only then calls `runStartupGate()`
  *   and `runInstallCheck()` with their defaults, which must fail as not found.
  *
  * Isolation: every case writes only under its own `mkdtempSync` root, except
@@ -76,7 +86,7 @@
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { basename, delimiter, dirname, join, relative, resolve, sep } from 'node:path'
 import ts from 'typescript'
@@ -109,6 +119,7 @@ import {
   resolveToolDir,
 } from './test-helpers/host-safe-env.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
+import { treeSnapshot } from './test-helpers/tree-snapshot.ts'
 import { runStartupGate } from '../src/agent-director-startup.ts'
 import { AD_SYSTEM_INSTALL_NOT_FOUND, resetCacheForTests, runInstallCheck } from '../src/install-check.ts'
 
@@ -157,15 +168,6 @@ function plainFile(path: string): void {
 function fakeToolFile(path: string): void {
   mkdirSync(dirname(path), { recursive: true })
   writeFileSync(path, '#!/bin/sh\nexit 1\n', { mode: 0o755 })
-}
-
-/** Every entry under `dir` with its kind, size and mtime, plus `dir`'s own mtime. */
-function treeSnapshot(dir: string): string[] {
-  const entries = (readdirSync(dir, { recursive: true }) as string[]).sort().map((rel) => {
-    const st = lstatSync(join(dir, rel))
-    return `${rel}:${st.isDirectory() ? 'd' : 'f'}:${st.size}:${st.mtimeMs}`
-  })
-  return [`.:${lstatSync(dir).mtimeMs}`, ...entries]
 }
 
 /** The directory each tool resolves to on the current `PATH` (the test run's). */
@@ -426,9 +428,6 @@ const TESTS_DIR = import.meta.dir
 const TEST_HELPERS_DIR = join(TESTS_DIR, 'test-helpers')
 const SRC_DIR = join(REPO_ROOT, 'src')
 const PRELOAD_PATH = join(TEST_HELPERS_DIR, 'host-safety-preload.ts')
-const BUNFIG_PATH = join(REPO_ROOT, 'bunfig.toml')
-/** The bunfig a `bun test` started in `tests/` reads (Bun reads one only from its working directory). */
-const TESTS_BUNFIG_PATH = join(TESTS_DIR, 'bunfig.toml')
 
 const AGENT_DIRECTOR_MODULE = 'agent-director'
 /** Names a test may not hold as values from agent-director: they find and run the real binary. */
@@ -905,17 +904,195 @@ const PRELOAD_PATH_ENTRY = /^(?:\.{1,2}\/|\/)/
 
 /**
  * Why the `bunfig.toml` text `toml`, read by a `bun test` started in
- * `baseDir`, does not load `preload` before the tests: its `[test]` table's
- * `preload` (a string or a list) must name it with a path entry
- * (`PRELOAD_PATH_ENTRY`) that resolves to it from `baseDir` (Bun resolves a
- * relative preload against the working directory, not the bunfig's own).
+ * `baseDir`, does not load `preload` before the tests and every other
+ * preload: its `[test]` table's `preload` (a string or a list) must name it
+ * first, with a path entry (`PRELOAD_PATH_ENTRY`) that resolves to it from
+ * `baseDir` (Bun resolves a relative preload against the working directory,
+ * not the bunfig's own). Entries after it are allowed; one before it would
+ * run before the refusal.
  */
 function bunfigPreloadFindings(toml: string, baseDir: string, preload: string): string[] {
   const config = Bun.TOML.parse(toml) as { test?: { preload?: unknown } }
   const entries = config.test?.preload
-  const list = typeof entries === 'string' ? [entries] : Array.isArray(entries) ? entries : []
-  if (list.some((entry) => typeof entry === 'string' && PRELOAD_PATH_ENTRY.test(entry) && resolve(baseDir, entry) === preload)) return []
-  return [`[test] preload does not name ${relative(baseDir, preload)}`]
+  const first: unknown = typeof entries === 'string' ? entries : Array.isArray(entries) ? entries[0] : undefined
+  if (typeof first === 'string' && PRELOAD_PATH_ENTRY.test(first) && resolve(baseDir, first) === preload) return []
+  return [`[test] preload does not name ${relative(baseDir, preload)} first`]
+}
+
+/**
+ * Every directory `bun test` could be started in to run this repository's
+ * tests: the repository root and each directory holding a test file
+ * (`BUN_TEST_FILE`, `node_modules` and `.git` skipped), sorted.
+ */
+function testStartDirs(): string[] {
+  const dirs = new Set([REPO_ROOT, ...filesUnder(REPO_ROOT, (path) => BUN_TEST_FILE.test(basename(path))).map((path) => dirname(path))])
+  return [...dirs].sort()
+}
+
+// ---------------------------------------------------------------------------
+// Static audit: the preload refuses before anything else
+// ---------------------------------------------------------------------------
+
+/** The names the preload's refusal loop reads, each imported from `./host-safe-env.ts`. */
+const REFUSAL_LOOP_IMPORTS: readonly string[] = ['launchTimeHomes', 'launchHomeRefusal', 'passwdHome', 'LIVE_LAUNCH_HOME_PROBE', 'LAUNCH_HOME_REFUSED_EXIT_CODE']
+
+/**
+ * Why the preload source `sf` does not refuse before anything else. Its first
+ * statement after the imports must be the refusal loop, in this shape (names
+ * may be aliased on import; the loop and result variables may have any name):
+ *
+ *   for (const <home> of launchTimeHomes()) {
+ *     const <refusal> = launchHomeRefusal(<home>, passwdHome(), LIVE_LAUNCH_HOME_PROBE)
+ *     if (<refusal> !== undefined) {
+ *       <expression statements>
+ *       process.exit(LAUNCH_HOME_REFUSED_EXIT_CODE)
+ *     }
+ *   }
+ *
+ * Each of `REFUSAL_LOOP_IMPORTS` must be a value import from
+ * `./host-safe-env.ts`, and nothing else in the file may declare one of their
+ * local names, `process` or `undefined`.
+ */
+function preloadRefusalFindings(sf: ts.SourceFile): string[] {
+  const findings: string[] = []
+  const flag = (node: ts.Node, what: string): void => {
+    findings.push(finding(sf, node, what))
+  }
+
+  // Imported name → local name, for the value imports from ./host-safe-env.ts.
+  const local = new Map<string, string>()
+  for (const statement of sf.statements) {
+    if (!ts.isImportDeclaration(statement) || statement.importClause?.isTypeOnly === true) continue
+    if (!/^\.\/host-safe-env(?:\.ts)?$/.test(stringText(statement.moduleSpecifier) ?? '')) continue
+    const bindings = statement.importClause?.namedBindings
+    if (bindings === undefined || !ts.isNamedImports(bindings)) continue
+    for (const el of bindings.elements) if (!el.isTypeOnly) local.set((el.propertyName ?? el.name).text, el.name.text)
+  }
+  for (const name of REFUSAL_LOOP_IMPORTS) if (!local.has(name)) flag(sf, `${name} is not imported from ./host-safe-env.ts`)
+  const isName = (node: ts.Node | undefined, name: string | undefined): boolean => node !== undefined && name !== undefined && ts.isIdentifier(node) && node.text === name
+  const isImported = (node: ts.Node | undefined, name: string): boolean => isName(node, local.get(name))
+  const isBareCall = (node: ts.Node | undefined, name: string): boolean => node !== undefined && ts.isCallExpression(node) && node.arguments.length === 0 && isImported(node.expression, name)
+
+  // No other declaration of a name the loop reads.
+  const reserved = new Set([...REFUSAL_LOOP_IMPORTS.map((name) => local.get(name)).filter((name) => name !== undefined), 'process', 'undefined'])
+  forEachNode(sf, (node) => {
+    if (ts.isImportSpecifier(node)) return
+    const name = (node as { name?: ts.Node }).name
+    if ((ts.isVariableDeclaration(node) || ts.isParameter(node) || ts.isBindingElement(node) || ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node))
+      && name !== undefined && ts.isIdentifier(name) && reserved.has(name.text)) {
+      flag(node, `${name.text} is declared again in the file`)
+    }
+  })
+
+  const loop = sf.statements.find((statement) => !ts.isImportDeclaration(statement))
+  if (loop === undefined || !ts.isForOfStatement(loop) || loop.awaitModifier !== undefined) {
+    flag(loop ?? sf, 'the first statement after the imports is not the for…of refusal loop')
+    return findings
+  }
+  const declared = ts.isVariableDeclarationList(loop.initializer) && loop.initializer.declarations.length === 1 ? loop.initializer.declarations[0]!.name : undefined
+  const home = declared !== undefined && ts.isIdentifier(declared) ? declared.text : undefined
+  if (home === undefined) flag(loop.initializer, 'the loop does not bind one launch-time home')
+  if (!isBareCall(loop.expression, 'launchTimeHomes')) flag(loop.expression, 'the loop does not iterate launchTimeHomes()')
+
+  const body = ts.isBlock(loop.statement) ? loop.statement.statements : ts.factory.createNodeArray<ts.Statement>()
+  const [decide, check, ...rest] = body
+  for (const extra of rest) flag(extra, 'the loop does more than decide and refuse')
+
+  // const <refusal> = launchHomeRefusal(<home>, passwdHome(), LIVE_LAUNCH_HOME_PROBE)
+  const declaration = decide !== undefined && ts.isVariableStatement(decide) && decide.declarationList.declarations.length === 1 ? decide.declarationList.declarations[0]! : undefined
+  const call = declaration?.initializer
+  const refusal = declaration !== undefined && ts.isIdentifier(declaration.name) ? declaration.name.text : undefined
+  if (refusal === undefined || call === undefined || !ts.isCallExpression(call) || !isImported(call.expression, 'launchHomeRefusal')) {
+    flag(decide ?? loop, 'the loop does not first decide launchHomeRefusal for its home')
+  } else {
+    const [launchHome, passwd, probe, ...extra] = call.arguments
+    if (!isName(launchHome, home)) flag(launchHome ?? call, 'launchHomeRefusal is not asked about the loop’s home')
+    if (!isBareCall(passwd, 'passwdHome')) flag(passwd ?? call, 'launchHomeRefusal is not given passwdHome()')
+    if (!isImported(probe, 'LIVE_LAUNCH_HOME_PROBE')) flag(probe ?? call, 'launchHomeRefusal is not given LIVE_LAUNCH_HOME_PROBE')
+    for (const arg of extra) flag(arg, 'launchHomeRefusal is given more than three arguments')
+  }
+
+  // if (<refusal> !== undefined) { …; process.exit(LAUNCH_HOME_REFUSED_EXIT_CODE) }
+  const condition = check !== undefined && ts.isIfStatement(check) ? check.expression : undefined
+  const refuses = condition !== undefined && ts.isBinaryExpression(condition) && condition.operatorToken.kind === ts.SyntaxKind.ExclamationEqualsEqualsToken
+    && isName(condition.left, refusal) && isName(condition.right, 'undefined')
+  if (check === undefined || !ts.isIfStatement(check) || !refuses || check.elseStatement !== undefined) {
+    flag(check ?? loop, 'the loop does not refuse exactly when launchHomeRefusal gives a reason')
+    return findings
+  }
+  const then = ts.isBlock(check.thenStatement) ? check.thenStatement.statements : ts.factory.createNodeArray<ts.Statement>([check.thenStatement])
+  for (const statement of then) if (!ts.isExpressionStatement(statement)) flag(statement, 'the refusal does more than run expressions and exit')
+  const exit = then[then.length - 1]
+  const exitCall = exit !== undefined && ts.isExpressionStatement(exit) ? exit.expression : undefined
+  const exits = exitCall !== undefined && ts.isCallExpression(exitCall) && ts.isPropertyAccessExpression(exitCall.expression)
+    && isName(exitCall.expression.expression, 'process') && exitCall.expression.name.text === 'exit'
+    && exitCall.arguments.length === 1 && isImported(exitCall.arguments[0], 'LAUNCH_HOME_REFUSED_EXIT_CODE')
+  if (!exits) flag(exit ?? check, 'the refusal does not end with process.exit(LAUNCH_HOME_REFUSED_EXIT_CODE)')
+  return findings
+}
+
+// ---------------------------------------------------------------------------
+// Static audit: nothing the guard loads runs before the refusal
+// ---------------------------------------------------------------------------
+
+/**
+ * What the preload may load: `node:` builtins and `./host-safe-env.ts` (with
+ * or without the extension). Every module a file imports is evaluated before
+ * the file's first statement, so anything else (a `src/` module, a package,
+ * another test helper) would run its top-level code before the refusal loop.
+ */
+const PRELOAD_LOADS = /^(?:node:.+|\.\/host-safe-env(?:\.ts)?)$/
+
+/** What `host-safe-env.ts` may load: `node:` builtins only. The preload imports it, so whatever it loads runs before the refusal too. */
+const HELPER_LOADS = /^node:.+$/
+
+/**
+ * Where `sf` loads a module whose specifier `allowed` does not match: a static
+ * import (side-effect only and type-only too, so the rule does not depend on
+ * what the transpiler drops), an `export … from`, `import x = require`, a
+ * dynamic `import()` or a `require()`. A dynamic `import()` or `require()`
+ * that is not given one string literal is flagged as well: the audit cannot
+ * tell what it loads. Strings and comments that name a module are not loads.
+ */
+function guardLoadFindings(sf: ts.SourceFile, allowed: RegExp): string[] {
+  const findings: string[] = []
+  forEachNode(sf, (node) => {
+    let specifier: ts.Node | undefined
+    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) specifier = node.moduleSpecifier
+    else if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) specifier = node.moduleReference.expression
+    else if (ts.isCallExpression(node) && (node.expression.kind === ts.SyntaxKind.ImportKeyword || (ts.isIdentifier(node.expression) && node.expression.text === 'require'))) {
+      specifier = node.arguments.length === 1 ? node.arguments[0] : node
+    }
+    if (specifier === undefined) return
+    const text = stringText(specifier)
+    if (text === undefined) findings.push(finding(sf, node, 'a module load the audit cannot follow'))
+    else if (!allowed.test(text)) findings.push(finding(sf, node, `loads ${text}`))
+  })
+  return findings
+}
+
+// ---------------------------------------------------------------------------
+// Static audit: where the real home is named
+// ---------------------------------------------------------------------------
+
+/** The `host-safe-env.ts` functions that answer the real home's path. */
+const REAL_HOME_NAMES: readonly string[] = ['realHome', 'passwdHome']
+
+/**
+ * The only files (by repository path) that may reference `REAL_HOME_NAMES`:
+ * the helper that declares them, the preload guard, and the two suites that
+ * test the guard and `hostSafeChildEnv`'s real-home refusals.
+ */
+const REAL_HOME_FILES: readonly string[] = [
+  'tests/host-safety.test.ts',
+  'tests/launch-home-guard.test.ts',
+  'tests/test-helpers/host-safe-env.ts',
+  'tests/test-helpers/host-safety-preload.ts',
+]
+
+/** Where `sf` references one of `REAL_HOME_NAMES` (`nameReferenceFindings` for each). */
+function realHomeFindings(sf: ts.SourceFile): string[] {
+  return REAL_HOME_NAMES.flatMap((name) => nameReferenceFindings(sf, name))
 }
 
 // ---------------------------------------------------------------------------
@@ -1326,6 +1503,7 @@ describe('static audit: the preload guard', () => {
     ['a preload under [run]', '[run]\npreload = ["./tests/test-helpers/host-safety-preload.ts"]'],
     ['a bare path (Bun looks it up as a package)', '[test]\npreload = ["tests/test-helpers/host-safety-preload.ts"]'],
     ['a path relative to tests/ (read from the root, it names nothing)', '[test]\npreload = ["./test-helpers/host-safety-preload.ts"]'],
+    ['a [test] preload list naming it after another (that one runs before the refusal)', '[test]\npreload = ["./tests/other-preload.ts", "./tests/test-helpers/host-safety-preload.ts"]'],
   ]
 
   test.each(bunfigFlagged)('a bunfig.toml with %s does not load it', (_label, toml) => {
@@ -1335,7 +1513,7 @@ describe('static audit: the preload guard', () => {
   const bunfigAllowed: [label: string, toml: string][] = [
     ['a [test] preload list naming it', '[test]\npreload = ["./tests/test-helpers/host-safety-preload.ts"]'],
     ['a [test] preload string naming it', '[test]\npreload = "./tests/test-helpers/host-safety-preload.ts"'],
-    ['a [test] preload list naming it after another', '[test]\npreload = ["./tests/other-preload.ts", "./tests/test-helpers/host-safety-preload.ts"]'],
+    ['a [test] preload list naming it first, then another', '[test]\npreload = ["./tests/test-helpers/host-safety-preload.ts", "./tests/other-preload.ts"]'],
     ['a [test] preload naming it by absolute path', `[test]\npreload = [${JSON.stringify(PRELOAD_PATH)}]`],
   ]
 
@@ -1349,13 +1527,199 @@ describe('static audit: the preload guard', () => {
     expect(bunfigPreloadFindings('[test]\npreload = ["./tests/test-helpers/host-safety-preload.ts"]', TESTS_DIR, PRELOAD_PATH).length).toBeGreaterThan(0)
   })
 
-  test('the current tree: both bunfig.toml files’ [test] preload name it and no file in the repository imports it', () => {
+  test('the current tree: no file in the repository imports it', () => {
     expect(existsSync(PRELOAD_PATH)).toBe(true)
-    expect(bunfigPreloadFindings(readFileSync(BUNFIG_PATH, 'utf-8'), REPO_ROOT, PRELOAD_PATH)).toEqual([])
-    expect(bunfigPreloadFindings(readFileSync(TESTS_BUNFIG_PATH, 'utf-8'), TESTS_DIR, PRELOAD_PATH)).toEqual([])
     const files = filesUnder(REPO_ROOT, (path) => SCRIPT_FILE.test(path))
     expect(files).toContain(join(TESTS_DIR, 'host-safety.test.ts'))
     expect(auditTree(files, (sf, path) => importsOfFile(sf, path, PRELOAD_PATH))).toEqual([])
+  })
+
+  test('the current tree: the repository root and every directory holding a test file have a bunfig.toml whose [test] preload names it first', () => {
+    const dirs = testStartDirs()
+
+    expect(dirs).toEqual(expect.arrayContaining([REPO_ROOT, TESTS_DIR, join(TESTS_DIR, 'integration')]))
+    expect(dirs.map((dir) => {
+      const bunfig = join(dir, 'bunfig.toml')
+      return [relative(REPO_ROOT, dir), existsSync(bunfig) ? bunfigPreloadFindings(readFileSync(bunfig, 'utf-8'), dir, PRELOAD_PATH) : ['no bunfig.toml']]
+    })).toEqual(dirs.map((dir) => [relative(REPO_ROOT, dir), []]))
+  })
+})
+
+describe('static audit: the preload refuses before anything else', () => {
+  const IMPORT = "import { LAUNCH_HOME_REFUSED_EXIT_CODE, LIVE_LAUNCH_HOME_PROBE, launchHomeRefusal, launchHomeRefusalMessage, launchTimeHomes, passwdHome, realHome } from './host-safe-env.ts'"
+  const ARGS = 'launchHome, passwdHome(), LIVE_LAUNCH_HOME_PROBE'
+  const EXIT = 'process.exit(LAUNCH_HOME_REFUSED_EXIT_CODE)'
+
+  /** A preload source holding the refusal loop with `parts` replaced, then the rest of the guard. */
+  function preloadSource(parts: { imports?: string; before?: string; homes?: string; args?: string; check?: string; refuse?: string; after?: string } = {}): string {
+    return lines(
+      parts.imports ?? IMPORT,
+      "import { mkdtempSync } from 'node:fs'",
+      parts.before ?? '',
+      `for (const launchHome of ${parts.homes ?? 'launchTimeHomes()'}) {`,
+      `  const refusal = launchHomeRefusal(${parts.args ?? ARGS})`,
+      `  if (${parts.check ?? 'refusal !== undefined'}) {`,
+      '    process.stderr.write(`${launchHomeRefusalMessage(refusal, launchHome)}\\n`)',
+      `    ${parts.refuse ?? EXIT}`,
+      '  }',
+      '}',
+      parts.after ?? "const home = mkdtempSync('/tmp/x-')",
+    )
+  }
+
+  const flagged: [label: string, source: string][] = [
+    ['undefined as the passwd home', preloadSource({ args: 'launchHome, undefined, LIVE_LAUNCH_HOME_PROBE' })],
+    ['realHome() as the passwd home', preloadSource({ args: 'launchHome, realHome(), LIVE_LAUNCH_HOME_PROBE' })],
+    ['a missing argument', preloadSource({ args: 'launchHome, passwdHome()' })],
+    ['an extra argument', preloadSource({ args: `${ARGS}, true` })],
+    ['passwdHome passed uncalled', preloadSource({ args: 'launchHome, passwdHome, LIVE_LAUNCH_HOME_PROBE' })],
+    ['homedir() as the launch home', preloadSource({ args: 'homedir(), passwdHome(), LIVE_LAUNCH_HOME_PROBE' })],
+    ['a hand-built probe', preloadSource({ args: "launchHome, passwdHome(), { exists: () => false, canonical: (p) => p, tempDir: () => '/tmp' }" })],
+    ['a loop over [homedir()] instead of launchTimeHomes()', preloadSource({ homes: '[homedir()]' })],
+    ['realHome imported under the name passwdHome', preloadSource({
+      imports: "import { LAUNCH_HOME_REFUSED_EXIT_CODE, LIVE_LAUNCH_HOME_PROBE, launchHomeRefusal, launchHomeRefusalMessage, launchTimeHomes, realHome as passwdHome } from './host-safe-env.ts'",
+    })],
+    ['launchHomeRefusal imported from another module', preloadSource({
+      imports: lines(
+        "import { LAUNCH_HOME_REFUSED_EXIT_CODE, LIVE_LAUNCH_HOME_PROBE, launchHomeRefusalMessage, launchTimeHomes, passwdHome } from './host-safe-env.ts'",
+        "import { launchHomeRefusal } from './other.ts'",
+      ),
+    })],
+    ['passwdHome declared again in the file', preloadSource({ after: 'function passwdHome() { return undefined }' })],
+    ['process declared again in the file', preloadSource({ after: 'var process = { exit() {} }' })],
+    ['the refusal inverted', preloadSource({ check: 'refusal === undefined' })],
+    ['the refusal checked loosely', preloadSource({ check: 'refusal' })],
+    ['an exit code other than LAUNCH_HOME_REFUSED_EXIT_CODE', preloadSource({ refuse: 'process.exit(1)' })],
+    ['a throw in place of the exit', preloadSource({ refuse: "throw new Error('refused')" })],
+    ['no exit', preloadSource({ refuse: "process.stderr.write('refused')" })],
+    ['a continue before the exit', preloadSource({ refuse: lines('continue', EXIT) })],
+    ['the HOME made before the loop', preloadSource({ before: "const home = mkdtempSync('/tmp/x-')", after: '' })],
+    ['the loop inside a try block', lines(
+      IMPORT,
+      'try {',
+      '  for (const launchHome of launchTimeHomes()) {',
+      `    const refusal = launchHomeRefusal(${ARGS})`,
+      `    if (refusal !== undefined) ${EXIT}`,
+      '  }',
+      '} catch {}',
+    )],
+    ['no loop at all', lines(IMPORT, "const home = mkdtempSync('/tmp/x-')")],
+  ]
+
+  test.each(flagged)('flags %s', (_label, source) => {
+    expect(preloadRefusalFindings(parse(source)).length).toBeGreaterThan(0)
+  })
+
+  const allowed: [label: string, source: string][] = [
+    ['the refusal loop first, then the rest of the guard', preloadSource()],
+    ['other names for the loop and result variables', lines(
+      IMPORT,
+      'for (const candidate of launchTimeHomes()) {',
+      '  const reason = launchHomeRefusal(candidate, passwdHome(), LIVE_LAUNCH_HOME_PROBE)',
+      '  if (reason !== undefined) {',
+      '    process.exit(LAUNCH_HOME_REFUSED_EXIT_CODE)',
+      '  }',
+      '}',
+    )],
+    ['the names imported under aliases', lines(
+      "import { LAUNCH_HOME_REFUSED_EXIT_CODE as REFUSED, LIVE_LAUNCH_HOME_PROBE as PROBE, launchHomeRefusal as decide, launchTimeHomes as homes, passwdHome as accountHome } from './host-safe-env.ts'",
+      'for (const launchHome of homes()) {',
+      '  const refusal = decide(launchHome, accountHome(), PROBE)',
+      '  if (refusal !== undefined) {',
+      '    process.exit(REFUSED)',
+      '  }',
+      '}',
+    )],
+    ['comments and a type import before the loop', lines("import type { LaunchHomeRefusal } from './host-safe-env.ts'", '// The refusal comes first.', preloadSource())],
+  ]
+
+  test.each(allowed)('allows %s', (_label, source) => {
+    expect(preloadRefusalFindings(parse(source))).toEqual([])
+  })
+
+  test('the current tree: the preload’s first statement after its imports is the refusal loop', () => {
+    expect(preloadRefusalFindings(parseFile(PRELOAD_PATH))).toEqual([])
+  })
+})
+
+describe('static audit: the guard loads nothing that runs before the refusal', () => {
+  const flagged: [label: string, rule: RegExp, source: string][] = [
+    ['in the preload, a side-effect import of a src/ module', PRELOAD_LOADS, "import '../../src/config.ts'"],
+    ['in the preload, a named import from ../../src/config.ts', PRELOAD_LOADS, "import { resolveServerStateDir } from '../../src/config.ts'"],
+    ['in the preload, a third-party package import', PRELOAD_LOADS, "import { parse } from 'smol-toml'"],
+    ['in the preload, another test helper (it may load src/)', PRELOAD_LOADS, "import { fakeToken } from './credentials.ts'"],
+    ['in the preload, a type-only import from a src/ module', PRELOAD_LOADS, "import type { ServerPathSetting } from '../../src/config.ts'"],
+    ['in the preload, a re-export from a src/ module', PRELOAD_LOADS, "export { resolveServerStateDir } from '../../src/config.ts'"],
+    ['in the preload, an import-equals require of a src/ module', PRELOAD_LOADS, "import config = require('../../src/config.ts')"],
+    ['in the preload, a dynamic import of a src/ module', PRELOAD_LOADS, "await import('../../src/config.ts')"],
+    ['in the preload, a require of a src/ module', PRELOAD_LOADS, "require('../../src/config.ts')"],
+    ['in the preload, a dynamic import of a computed specifier', PRELOAD_LOADS, 'await import(modulePath)'],
+    ['in host-safe-env.ts, a side-effect import of a src/ module', HELPER_LOADS, "import '../../src/config.ts'"],
+    ['in host-safe-env.ts, a named import from ../../src/config.ts', HELPER_LOADS, "import { resolveServerStateDir } from '../../src/config.ts'"],
+    ['in host-safe-env.ts, a third-party package import', HELPER_LOADS, "import { parse } from 'smol-toml'"],
+    ['in host-safe-env.ts, another test helper', HELPER_LOADS, "import { treeSnapshot } from './tree-snapshot.ts'"],
+  ]
+
+  test.each(flagged)('flags %s', (_label, rule, source) => {
+    expect(guardLoadFindings(parse(source), rule).length).toBeGreaterThan(0)
+  })
+
+  const allowed: [label: string, rule: RegExp, source: string][] = [
+    ['in the preload, node:fs', PRELOAD_LOADS, "import { mkdtempSync } from 'node:fs'"],
+    ['in the preload, ./host-safe-env.ts', PRELOAD_LOADS, "import { launchTimeHomes } from './host-safe-env.ts'"],
+    ['in the preload, ./host-safe-env without the extension', PRELOAD_LOADS, "import { launchTimeHomes } from './host-safe-env'"],
+    ['in host-safe-env.ts, node: builtins and a local export', HELPER_LOADS, lines("import { lstatSync } from 'node:fs'", "import { homedir } from 'node:os'", 'const x = 1', 'export { x }')],
+    ['text naming a src/ module in strings and comments', PRELOAD_LOADS, lines("// import '../../src/config.ts'", "const s = \"require('../../src/config.ts')\"")],
+  ]
+
+  test.each(allowed)('allows %s', (_label, rule, source) => {
+    expect(guardLoadFindings(parse(source), rule)).toEqual([])
+  })
+
+  test('the current tree: the preload loads only node: builtins and ./host-safe-env.ts, and host-safe-env.ts only node: builtins', () => {
+    expect(guardLoadFindings(parseFile(PRELOAD_PATH), PRELOAD_LOADS)).toEqual([])
+    expect(guardLoadFindings(parseFile(HELPER_PATH), HELPER_LOADS)).toEqual([])
+  })
+})
+
+describe('static audit: only the guard’s own files name the real home (realHome, passwdHome)', () => {
+  const HELPER_NS = "import * as h from './test-helpers/host-safe-env.ts'"
+
+  const flagged: [label: string, source: string][] = [
+    ['a named import of realHome', "import { realHome } from './test-helpers/host-safe-env.ts'"],
+    ['an aliased import of passwdHome', "import { passwdHome as accountHome } from './test-helpers/host-safe-env.ts'"],
+    ['a namespace read', lines(HELPER_NS, "const settings = join(h.realHome(), '.claude', 'settings.json')")],
+    ['a namespace element read', lines(HELPER_NS, "h['passwdHome']()")],
+    ['a destructured dynamic import', "const { realHome } = await import('./test-helpers/host-safe-env.ts')"],
+    ['a read on a dynamic import', "(await import('./test-helpers/host-safe-env.ts')).passwdHome()"],
+    ['a re-export', "export { realHome } from './host-safe-env.ts'"],
+  ]
+
+  test.each(flagged)('flags %s', (_label, source) => {
+    expect(realHomeFindings(parse(source)).length).toBeGreaterThan(0)
+  })
+
+  const allowed: [label: string, source: string][] = [
+    ['other helpers', "import { hostSafeChildEnv, isRealHome, osTempDir } from './test-helpers/host-safe-env.ts'"],
+    ['the names as object keys', "const labels = { realHome: 'real', passwdHome: 'passwd' }"],
+    ['text in strings, templates, regex literals and comments', lines(
+      '// realHome() and passwdHome()',
+      "const s = 'realHome()'",
+      'const t = `passwdHome()`',
+      'const r = /realHome\\(\\)/',
+    )],
+  ]
+
+  test.each(allowed)('allows %s', (_label, source) => {
+    expect(realHomeFindings(parse(source))).toEqual([])
+  })
+
+  test('the current tree: every script file in the repository outside REAL_HOME_FILES names neither, and each of them is still a script file', () => {
+    const files = filesUnder(REPO_ROOT, (path) => SCRIPT_FILE.test(path))
+    const allowedFiles = new Set(REAL_HOME_FILES)
+
+    expect(files).toEqual(expect.arrayContaining([join(SRC_DIR, 'server.ts'), ...REAL_HOME_FILES.map((path) => join(REPO_ROOT, path))]))
+    expect(auditTree(files.filter((path) => !allowedFiles.has(relative(REPO_ROOT, path))), realHomeFindings)).toEqual([])
   })
 })
 
@@ -1585,6 +1949,8 @@ describe('preload check', () => {
     ['TMUX is set but empty', PRELOAD_CHECK.tmuxSet, () => ({ ...preloadEnv(), TMUX: '' })],
     ['TMUX_PANE is set', PRELOAD_CHECK.tmuxPaneSet, () => ({ ...preloadEnv(), TMUX_PANE: '%0' })],
     ['TMUX_PANE is set but empty', PRELOAD_CHECK.tmuxPaneSet, () => ({ ...preloadEnv(), TMUX_PANE: '' })],
+    ['CLAUDE_CONFIG_DIR is set (a persona’s, inherited from a bot’s session)', PRELOAD_CHECK.claudeConfigDirSet, () => ({ ...preloadEnv(), CLAUDE_CONFIG_DIR: dirUnder('persona-claude') })],
+    ['CLAUDE_CONFIG_DIR is set but empty', PRELOAD_CHECK.claudeConfigDirSet, () => ({ ...preloadEnv(), CLAUDE_CONFIG_DIR: '' })],
     ['TMUX_TMPDIR is unset', PRELOAD_CHECK.tmuxTmpDirNotFenced, () => preloadEnvWithout('TMUX_TMPDIR')],
     ['TMUX_TMPDIR is relative', PRELOAD_CHECK.tmuxTmpDirNotFenced, () => ({ ...preloadEnv(), TMUX_TMPDIR: basename(childTmuxTmpDir()) })],
     ['TMUX_TMPDIR is a temp directory without the prefix', PRELOAD_CHECK.tmuxTmpDirNotFenced, () => ({ ...preloadEnv(), TMUX_TMPDIR: root })],
@@ -1637,11 +2003,13 @@ describe('preload check', () => {
   })
 
   test('each clean-environment row fails for its own reason alone', () => {
-    // The TMUX, TMUX_TMPDIR and SLACK_STATE_DIR rows start from preloadEnv(),
-    // so each must report exactly its failure and nothing about HOME or PATH.
+    // The TMUX, CLAUDE_CONFIG_DIR, TMUX_TMPDIR and SLACK_STATE_DIR rows start
+    // from preloadEnv(), so each must report exactly its failure and nothing
+    // about HOME or PATH.
     const fromCleanEnv = new Set<PreloadCheckFailure>([
       PRELOAD_CHECK.tmuxSet,
       PRELOAD_CHECK.tmuxPaneSet,
+      PRELOAD_CHECK.claudeConfigDirSet,
       PRELOAD_CHECK.tmuxTmpDirNotFenced,
       PRELOAD_CHECK.tmuxTmpDirNotProcess,
       PRELOAD_CHECK.stateDirUnset,
@@ -1714,6 +2082,10 @@ describe('preload redirect (preloadRedirectedEnv)', () => {
       const a = dirUnder('a')
       return { inherited: { PATH: a, TMUX: `${join(root, 'tmux-socket')},1,0`, TMUX_PANE: '%0' }, expectedPath: a }
     }],
+    ['an inherited CLAUDE_CONFIG_DIR is unset', () => {
+      const a = dirUnder('a')
+      return { inherited: { PATH: a, CLAUDE_CONFIG_DIR: dirUnder('persona-claude') }, expectedPath: a }
+    }],
     ['a foreign TMUX_TMPDIR is replaced by the fenced one', () => {
       const a = dirUnder('a')
       return { inherited: { PATH: a, TMUX_TMPDIR: dirUnder('foreign-tmux') }, expectedPath: a }
@@ -1736,6 +2108,7 @@ describe('preload redirect (preloadRedirectedEnv)', () => {
           TMUX_PANE: '%0',
           TMUX_TMPDIR: dirUnder('foreign-tmux'),
           SLACK_STATE_DIR: dirUnder('stray-state'),
+          CLAUDE_CONFIG_DIR: dirUnder('persona-claude'),
         },
         expectedPath: path(a, b),
       }
@@ -1749,7 +2122,7 @@ describe('preload redirect (preloadRedirectedEnv)', () => {
 
     const redirected = preloadRedirectedEnv(inherited, home, fenced)
 
-    // Exactly these names: TMUX and TMUX_PANE are absent, so the preload deletes them.
+    // Exactly these names: TMUX, TMUX_PANE and CLAUDE_CONFIG_DIR are absent, so the preload deletes them.
     expect(redirected).toStrictEqual({
       HOME: home,
       PATH: expectedPath,
@@ -1767,6 +2140,7 @@ describe('preload redirect (preloadRedirectedEnv)', () => {
       TMUX_PANE: '%0',
       TMUX_TMPDIR: dirUnder('foreign-tmux'),
       SLACK_STATE_DIR: dirUnder('stray-state'),
+      CLAUDE_CONFIG_DIR: dirUnder('persona-claude'),
     }
     const inheritedBefore = { ...inherited }
     const processBefore = Object.fromEntries(PRELOAD_ENV_NAMES.map((name) => [name, process.env[name]]))
@@ -1840,19 +2214,14 @@ describe('a non-normalized OS temp directory (TMPDIR)', () => {
 
 describe('un-injected gate checks (after the preload check)', () => {
   test('with the preload applied, runStartupGate() and runInstallCheck() with their defaults fail as not found', async () => {
-    const env: PreloadEnv = {
-      HOME: process.env['HOME'],
-      PATH: process.env['PATH'],
-      TMUX: process.env['TMUX'],
-      TMUX_PANE: process.env['TMUX_PANE'],
-      TMUX_TMPDIR: process.env['TMUX_TMPDIR'],
-      SLACK_STATE_DIR: process.env['SLACK_STATE_DIR'],
-    }
+    // Every one of the preload's variables (PRELOAD_ENV_NAMES), as this run has it.
+    const env = Object.fromEntries(PRELOAD_ENV_NAMES.map((name) => [name, process.env[name]])) as PreloadEnv
     // The gate calls below run only when this passes: with this HOME and PATH
     // the client's discovery finds no candidate, so it throws
     // ErrSystemInstallNotFound before its version probe could start a process.
-    // TMUX, TMUX_PANE, TMUX_TMPDIR and SLACK_STATE_DIR are what the preload
-    // set; nothing else in the run pins them.
+    // TMUX, TMUX_PANE, CLAUDE_CONFIG_DIR, TMUX_TMPDIR and SLACK_STATE_DIR are
+    // what the preload set; nothing else in the run pins them.
+    expect(Object.keys(env)).toEqual(['HOME', 'PATH', 'TMUX', 'TMUX_PANE', 'TMUX_TMPDIR', 'SLACK_STATE_DIR', 'CLAUDE_CONFIG_DIR'])
     expect(preloadCheckFailures(env)).toEqual([])
 
     const gate = await runStartupGate()

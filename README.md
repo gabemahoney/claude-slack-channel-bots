@@ -1832,7 +1832,7 @@ The bump kind is **required** — there is no default. The skill exits with a us
 Before any side-effecting step runs, `/publish` enforces seven fail-fast gates. Any failure aborts before the version is bumped, the tarball is packed, or anything is committed:
 
 1. **Clean working tree on `main` in sync with origin/main.** No uncommitted changes; HEAD branch is `main`; `main` is exactly equal to `origin/main` after `git fetch origin`.
-2. **Tests exist and pass.** At least one `*.test.ts` file under `tests/` and `bun test` exits zero.
+2. **Tests exist and pass.** At least one `*.test.ts` file under `tests/`, and `bun test`, run with a fresh scratch HOME, exits zero.
 3. **Typecheck passes.** `bun run typecheck` exits zero.
 4. **npm authenticated.** `npm whoami` exits zero (run `npm login` first if not).
 5. **Next version not already published.** `npm view claude-slack-channel-bots@<next-version> version` must report nothing.

@@ -16,7 +16,10 @@
 #   10  SR-2.1  working tree dirty OR not on main
 #   11  SR-2.1  git fetch origin failed
 #   12  SR-2.1  local main is not a fast-forward of origin/main
-#   13  SR-2.2/SR-2.3  install/test/typecheck failed (incl. zero test files)
+#   13  SR-2.2/SR-2.3  install/test/typecheck failed (incl. zero test files),
+#                OR 'mktemp -d' could not make the suite's scratch HOME,
+#                OR the test preload guard refused to start 'bun test'
+#                (its exit 78; commonly a TMPDIR inside the home directory)
 #   14  SR-2.4  npm not authenticated, OR next version already on npm,
 #                OR npm registry is non-canonical (SR-2.4a),
 #                OR 'bun pm whoami' did not succeed (SR-2.4b)
@@ -121,7 +124,26 @@ if [ -z "${TEST_FILES}" ]; then
   sr_exit 13
 fi
 
-if ! bun test; then
+# The suite runs with a scratch HOME and state directory and without the Slack
+# token variables, CSCB_PERSONA or CLAUDE_CONFIG_DIR: its preload guard refuses
+# to start under the real home (tests/README.md). The scratch directory is
+# removed afterwards.
+if ! TEST_HOME="$(mktemp -d)"; then
+  echo "SR-2.3 (preflight): 'mktemp -d' failed, so 'bun test' could not be given a scratch HOME. Make sure the temp directory (TMPDIR, else /tmp) exists and is writable, then rerun '/publish ${BUMP_KIND}'." >&2
+  sr_exit 13
+fi
+# The exit code of a run the test preload guard refused to start
+# (LAUNCH_HOME_REFUSED_EXIT_CODE in tests/test-helpers/host-safe-env.ts).
+PRELOAD_REFUSED_EXIT=78
+TEST_RC=0
+env -u SLACK_BOT_TOKEN -u SLACK_APP_TOKEN -u CSCB_PERSONA -u CLAUDE_CONFIG_DIR \
+  HOME="${TEST_HOME}" SLACK_STATE_DIR="${TEST_HOME}/state" bun test || TEST_RC=$?
+rm -rf "${TEST_HOME}" || true
+if [ "${TEST_RC}" -eq "${PRELOAD_REFUSED_EXIT}" ]; then
+  echo "SR-2.3 (preflight): the test preload guard refused to start 'bun test' (exit ${PRELOAD_REFUSED_EXIT}): its scratch HOME could reach the operator's real Claude, Slack or agent-director state. The guard's 'host-safety preload: refusing to start' line above names the rule and the home. The common cause is a TMPDIR inside the home directory (or a symlink into it): point TMPDIR at a directory outside the home, or unset it to use /tmp, then rerun '/publish ${BUMP_KIND}'." >&2
+  sr_exit 13
+fi
+if [ "${TEST_RC}" -ne 0 ]; then
   echo "SR-2.3 (preflight): 'bun test' did not pass. Fix the failing tests, commit to main, then rerun '/publish ${BUMP_KIND}'." >&2
   sr_exit 13
 fi

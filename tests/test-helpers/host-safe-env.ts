@@ -68,15 +68,20 @@
  * - an extra is reserved or its value is not a string.
  *
  * The real home is the account's passwd home: the `/etc/passwd` entry for
- * this process's user ID. Bun fixes `os.homedir()` and `os.userInfo().homedir`
- * at start-up from the launch-time `HOME` (not from the passwd database), and
- * the preload guard replaces `process.env.HOME`, so neither is the real home
- * on its own. `isRealHome` also matches the launch-time home, so a HOME the
- * run started with is never handed to a child either. `realHome()` falls back
- * to the launch-time home only when the passwd file has no entry for the user.
+ * this process's user ID (`passwdHome()`, which reads the file once and
+ * parses it with the pure `passwdHomeFrom`). Bun fixes `os.homedir()` and
+ * `os.userInfo().homedir` at start-up from the launch-time `HOME` (not from
+ * the passwd database), and the preload guard replaces `process.env.HOME`, so
+ * neither is the real home on its own. `isRealHome` also matches the
+ * launch-time home, so a HOME the run started with is never handed to a child
+ * either. `realHome()` falls back to the launch-time home only when
+ * `passwdHome()` is `undefined` (no usable entry for the user).
  *
- * The `bun test` preload guard's redirect and check live here too, so the
- * guard and the host-safety test share one implementation:
+ * The `bun test` preload guard's refusal, redirect and check live here too,
+ * so the guard and the tests share one implementation:
+ * `launchHomeRefusal(launchHome, passwdHome, probe)` decides, without side
+ * effects, whether a launch-time home (`launchTimeHomes()`) is one the guard
+ * must refuse to start with (labels in `LAUNCH_HOME_REFUSAL`);
  * `preloadRedirectedEnv(inherited, home, tmuxTmpDir)` computes the guard's
  * variables (`PRELOAD_ENV_NAMES`) without side effects, and
  * `preloadCheckFailures(env)` lists what is wrong with them (labels in
@@ -85,15 +90,18 @@
  *
  * Isolation: it starts no process and imports nothing from `agent-director`.
  * It reads only the entries it checks (lstat under `home`, each `PATH`
- * directory and an inherited `TMUX_TMPDIR`) and `/etc/passwd`, and creates
- * nothing under `home`: its only write is the one `TMUX_TMPDIR` directory
- * under the OS temp directory, made only when none was inherited. Callers may
- * snapshot their HOME tree around the call.
+ * directory and an inherited `TMUX_TMPDIR`; through `LIVE_LAUNCH_HOME_PROBE`,
+ * lstat, realpath and readlink of the launch-time home, the paths
+ * `launchHomeRefusal` names under it, the passwd home itself and the OS temp
+ * directory) and `/etc/passwd`, and creates nothing under `home`: its only
+ * write is the one `TMUX_TMPDIR` directory under the OS temp directory, made
+ * only when none was inherited. Callers may snapshot their HOME tree around
+ * the call.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { accessSync, constants as fsConstants, lstatSync, mkdtempSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import { accessSync, constants as fsConstants, lstatSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, statSync } from 'node:fs'
 import { homedir, tmpdir, userInfo } from 'node:os'
 import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 
@@ -234,12 +242,50 @@ export function homeHoldsAgentDirectorInstall(home: string): boolean {
   return entryExists(join(home, AGENT_DIRECTOR_INSTALL_DIR)) || entryExists(join(home, AGENT_DIRECTOR_INSTALL_PATH))
 }
 
+/** How many `:`-separated fields a passwd entry has: name, password, uid, gid, GECOS, home, shell. */
+const PASSWD_ENTRY_FIELDS = 7
+
+/** The index of the uid field in a passwd entry. */
+const PASSWD_UID_FIELD = 2
+
+/** The index of the home field in a passwd entry. */
+const PASSWD_HOME_FIELD = 5
+
+/**
+ * The home of the passwd entry for `uid` in `passwdText` (the text of a
+ * passwd file, lines separated by `\n`), or `undefined`. Pure: it reads
+ * nothing but its arguments. The lines are scanned in order, and the first
+ * line whose third `:`-separated field (the uid field) equals `String(uid)`
+ * exactly decides (so `01000` or ` 1000` is not uid 1000); a line too short
+ * to have a uid field cannot match. That line gives its sixth field (the home
+ * field) as written when the line has at least seven fields and the home
+ * field is an absolute path, and `undefined` otherwise (fewer than seven
+ * fields, or an empty or relative home field). The scan stops at that first
+ * match whatever it gives: a later line with the same uid is never used, so a
+ * malformed first match leaves the home unknown, and the preload guard then
+ * fails closed, instead of taking another line's home. It is `undefined` too
+ * when no line matches, and when `uid` is not a non-negative safe integer.
+ */
+export function passwdHomeFrom(passwdText: string, uid: number): string | undefined {
+  if (typeof passwdText !== 'string' || !Number.isSafeInteger(uid) || uid < 0) return undefined
+  const wanted = String(uid)
+  for (const line of passwdText.split('\n')) {
+    const fields = line.split(':')
+    if (fields[PASSWD_UID_FIELD] !== wanted) continue
+    const home = fields[PASSWD_HOME_FIELD]
+    return fields.length >= PASSWD_ENTRY_FIELDS && home !== undefined && isAbsolute(home) ? home : undefined
+  }
+  return undefined
+}
+
 let passwdHomeCache: { value: string | undefined } | undefined
 
 /**
- * This process's user's home from `/etc/passwd` (the account's passwd home),
- * or `undefined` when the file has no entry for its user ID or cannot be read.
- * Read once per process.
+ * This process's user's home from `/etc/passwd` (the account's passwd home):
+ * `passwdHomeFrom` over the file's text and this process's user ID. It is
+ * `undefined` when `passwdHomeFrom` gives `undefined`, when the process has
+ * no user ID, or when the file cannot be read. The file is read once per
+ * process; later calls return the cached value.
  */
 export function passwdHome(): string | undefined {
   if (passwdHomeCache === undefined) {
@@ -247,13 +293,7 @@ export function passwdHome(): string | undefined {
     const uid = process.getuid?.()
     if (uid !== undefined) {
       try {
-        for (const line of readFileSync('/etc/passwd', 'utf-8').split('\n')) {
-          const fields = line.split(':')
-          if (fields.length >= 7 && fields[2] === String(uid) && isAbsolute(fields[5]!)) {
-            value = fields[5]!
-            break
-          }
-        }
+        value = passwdHomeFrom(readFileSync('/etc/passwd', 'utf-8'), uid)
       } catch {
         value = undefined
       }
@@ -453,7 +493,7 @@ export function hostSafeChildEnv(home: string, options: HostSafeChildEnvOptions 
 // ---------------------------------------------------------------------------
 
 /** The variables the preload guard sets or unsets, and nothing else. */
-export const PRELOAD_ENV_NAMES = Object.freeze(['HOME', 'PATH', 'TMUX', 'TMUX_PANE', 'TMUX_TMPDIR', 'SLACK_STATE_DIR'] as const)
+export const PRELOAD_ENV_NAMES = Object.freeze(['HOME', 'PATH', 'TMUX', 'TMUX_PANE', 'TMUX_TMPDIR', 'SLACK_STATE_DIR', 'CLAUDE_CONFIG_DIR'] as const)
 
 export type PreloadEnvName = (typeof PRELOAD_ENV_NAMES)[number]
 
@@ -483,8 +523,11 @@ export type PreloadEnvSource = Readonly<PreloadEnv> | Readonly<NodeJS.ProcessEnv
  * - `SLACK_STATE_DIR`: `<home>/PRELOAD_STATE_DIR_PATH`
  *   (`<home>/.claude/channels/slack`), the server's default state directory
  *   under the new HOME.
- * `TMUX` and `TMUX_PANE` are absent (unset). Nothing else is read from
- * `inherited`.
+ * `TMUX`, `TMUX_PANE` and `CLAUDE_CONFIG_DIR` are absent (unset):
+ * `CLAUDE_CONFIG_DIR` names a Claude configuration directory (a run started
+ * from a bot's session can inherit its persona's), and Claude Code, a hook
+ * or any code that honours it would read and write that directory. Nothing
+ * else is read from `inherited`.
  */
 export function preloadRedirectedEnv(inherited: PreloadEnvSource, home: string, tmuxTmpDir: string): PreloadEnv {
   const dirs = [...new Set(absolutePathEntries(inherited.PATH))].filter((dir) => !dirHoldsAgentDirector(dir))
@@ -508,6 +551,7 @@ export const PRELOAD_CHECK = Object.freeze({
   pathDirHoldsAgentDirector: 'path-dir-holds-agent-director',
   tmuxSet: 'tmux-set',
   tmuxPaneSet: 'tmux-pane-set',
+  claudeConfigDirSet: 'claude-config-dir-set',
   tmuxTmpDirNotFenced: 'tmux-tmpdir-not-fenced',
   tmuxTmpDirNotProcess: 'tmux-tmpdir-not-process',
   stateDirUnset: 'state-dir-unset',
@@ -524,8 +568,8 @@ export type PreloadCheckFailure = (typeof PRELOAD_CHECK)[keyof typeof PRELOAD_CH
  * (`osTempDir()`) whose name carries `PRELOAD_HOME_PREFIX`, not the real home
  * (passwd or launch-time) nor under it, and hold no agent-director install; it
  * need not be empty (every test file shares it). `PATH` must be set and every
- * entry absolute and holding no `agent-director` entry. `TMUX` and
- * `TMUX_PANE` must be unset. `TMUX_TMPDIR` must be a directory
+ * entry absolute and holding no `agent-director` entry. `TMUX`, `TMUX_PANE`
+ * and `CLAUDE_CONFIG_DIR` must be unset. `TMUX_TMPDIR` must be a directory
  * `inheritedChildTmuxTmpDir` accepts and this process's one
  * (`childTmuxTmpDir()`). `SLACK_STATE_DIR` must be set and non-empty (unset,
  * the state-directory resolvers fall back to the launch-time home) and the
@@ -565,6 +609,7 @@ export function preloadCheckFailures(env: PreloadEnvSource): PreloadCheckFailure
   }
   if (env.TMUX !== undefined) failures.push(PRELOAD_CHECK.tmuxSet)
   if (env.TMUX_PANE !== undefined) failures.push(PRELOAD_CHECK.tmuxPaneSet)
+  if (env.CLAUDE_CONFIG_DIR !== undefined) failures.push(PRELOAD_CHECK.claudeConfigDirSet)
   const tmuxTmpDir = env.TMUX_TMPDIR
   if (tmuxTmpDir === undefined || inheritedChildTmuxTmpDir(tmuxTmpDir) !== tmuxTmpDir) failures.push(PRELOAD_CHECK.tmuxTmpDirNotFenced)
   else if (tmuxTmpDir !== childTmuxTmpDir()) failures.push(PRELOAD_CHECK.tmuxTmpDirNotProcess)
@@ -577,4 +622,215 @@ export function preloadCheckFailures(env: PreloadEnvSource): PreloadCheckFailure
     }
   }
   return failures
+}
+
+// ---------------------------------------------------------------------------
+// The bun test preload guard: its launch-home refusal
+// ---------------------------------------------------------------------------
+
+/** The Claude configuration directory under a home, relative to it. */
+export const CLAUDE_DIR = '.claude'
+
+/**
+ * The paths under a home that `src/` and the agent-director client it loads
+ * derive from `homedir()`, relative to the home. `launchHomeRefusal` follows
+ * the symlinks on each one:
+ * - `.claude`: Claude's default configuration directory
+ *   (`resolveClaudeConfigDir`, the directory the Stop-hook patcher refuses,
+ *   the default transcript root in `cozempic.ts`);
+ * - `.claude/channels/slack`: the server's default state directory
+ *   (`PRELOAD_STATE_DIR_PATH`);
+ * - `.claude/projects`: the default JSONL transcript root
+ *   (`resolveJsonlRoots`, `resolveJsonlPath`) and the root of the memory Read
+ *   rules;
+ * - `.claude/skills`: where postinstall links the shipped skills;
+ * - `.claude/slack-mcp.json`: postinstall's MCP configuration and the default
+ *   `mcp_config_path`;
+ * - `.agent-director` and, under it, `state.db` (the start gate's same-user
+ *   probe and the client's store), `config.toml` (agent-director's settings
+ *   file) and `bin/agent-director` (`AGENT_DIRECTOR_INSTALL_PATH`).
+ */
+export const LAUNCH_HOME_DERIVED_PATHS: readonly string[] = Object.freeze([
+  CLAUDE_DIR,
+  PRELOAD_STATE_DIR_PATH,
+  join(CLAUDE_DIR, 'projects'),
+  join(CLAUDE_DIR, 'skills'),
+  join(CLAUDE_DIR, 'slack-mcp.json'),
+  AGENT_DIRECTOR_INSTALL_DIR,
+  join(AGENT_DIRECTOR_INSTALL_DIR, 'state.db'),
+  join(AGENT_DIRECTOR_INSTALL_DIR, 'config.toml'),
+  AGENT_DIRECTOR_INSTALL_PATH,
+])
+
+/** Why the preload guard refuses to start (`launchHomeRefusal`). */
+export const LAUNCH_HOME_REFUSAL = Object.freeze({
+  notAbsolute: 'launch-home-not-absolute',
+  inRealHome: 'launch-home-in-real-home',
+  tempDirIsRoot: 'launch-home-temp-dir-is-root',
+  notUnderTempDir: 'launch-home-not-under-temp-dir',
+  holdsSlackState: 'launch-home-holds-slack-state',
+  derivedPathInRealHome: 'launch-home-derived-path-in-real-home',
+  derivedPathNotUnderTempDir: 'launch-home-derived-path-not-under-temp-dir',
+  holdsAgentDirector: 'launch-home-holds-agent-director',
+} as const)
+
+export type LaunchHomeRefusal = (typeof LAUNCH_HOME_REFUSAL)[keyof typeof LAUNCH_HOME_REFUSAL]
+
+/**
+ * The exit code of a run the preload guard refused to start: sysexits'
+ * `EX_CONFIG`, so a refusal is told apart from a failing test (exit code 1).
+ * `scripts/preflight.sh` names the same code.
+ */
+export const LAUNCH_HOME_REFUSED_EXIT_CODE = 78
+
+/** The host reads `launchHomeRefusal` makes, injected so the decision stays pure. */
+export interface LaunchHomeProbe {
+  /**
+   * Whether anything exists at `path` (lstat: a dangling symlink counts, and
+   * an entry that cannot be looked at counts as present).
+   */
+  exists(path: string): boolean
+  /**
+   * `path` made absolute with every symlink on it followed as far as the
+   * path exists: the real path of its deepest existing part, a dangling
+   * symlink followed to its target, with the rest appended. It names the
+   * entry a write to `path` would reach.
+   */
+  canonical(path: string): string
+  /** The OS temp directory (`osTempDir()`). */
+  tempDir(): string
+}
+
+/** How many symlinks `resolveLinks` follows before it stops (Linux's own limit). */
+const MAX_LINK_HOPS = 40
+
+/** `LIVE_LAUNCH_HOME_PROBE.canonical`: `path`, absolute, with every symlink on it followed as far as it exists. */
+function resolveLinks(path: string): string {
+  return resolveLinksWithin(resolve(path), { hops: 0 })
+}
+
+/**
+ * `resolveLinks` for an absolute `path`, sharing one symlink budget across the
+ * walk: once `MAX_LINK_HOPS` symlinks (a loop, say) have been followed, the
+ * rest of the path is appended as it stands.
+ */
+function resolveLinksWithin(path: string, budget: { hops: number }): string {
+  try {
+    return realpathSync(path)
+  } catch {
+    // Absent, a dangling symlink on the way, or not readable: resolve the parent, then look at the last entry.
+  }
+  const parent = dirname(path)
+  if (parent === path) return path
+  const realParent = resolveLinksWithin(parent, budget)
+  const entry = join(realParent, basename(path))
+  if (budget.hops >= MAX_LINK_HOPS) return entry
+  let target: string
+  try {
+    target = readlinkSync(entry)
+  } catch {
+    return entry // Absent, not a symlink, or not readable.
+  }
+  budget.hops += 1
+  return resolveLinksWithin(resolve(realParent, target), budget)
+}
+
+/** The live host's `LaunchHomeProbe`, the one the preload guard passes. */
+export const LIVE_LAUNCH_HOME_PROBE: LaunchHomeProbe = Object.freeze({ exists: entryExists, canonical: resolveLinks, tempDir: osTempDir })
+
+/**
+ * The homes this process was launched with, as Bun fixed them at start-up:
+ * `os.homedir()` and `os.userInfo().homedir`, in that order, duplicates
+ * dropped (`userInfo()` is skipped when it throws). Setting or deleting
+ * `process.env.HOME` later changes neither, so code that calls `homedir()`
+ * during a run resolves its paths against one of these.
+ */
+export function launchTimeHomes(): string[] {
+  const homes = [homedir()]
+  try {
+    homes.push(userInfo().homedir)
+  } catch {
+    // No passwd entry for this user: os.homedir() is the only launch-time home.
+  }
+  return [...new Set(homes)]
+}
+
+/**
+ * Why the preload guard must refuse a run launched with `launchHome` (a
+ * launch-time home, `launchTimeHomes()`), or `undefined` when it may start.
+ * `passwdHome` is the account's passwd home (`passwdHome()`), the real home
+ * the rules keep the run out of. When it is `undefined` or not absolute (no
+ * `/etc/passwd` entry, as for an account served by NSS or LDAP), the real
+ * home is unknown, so the guard fails closed: the run must then stay strictly
+ * under the OS temp directory (`probe.tempDir()`), which must not be the file
+ * system root. Pure: its only reads are `probe`'s, and it changes nothing.
+ * Below, a path "resolves" to `probe.canonical` of it (every symlink on it
+ * followed as far as it exists), and the temp directory is compared
+ * resolved. The first rule that applies wins:
+ * - `notAbsolute`: `launchHome` is not an absolute path (empty included);
+ * - `inRealHome` (passwd home known): `launchHome` is the real home or lies
+ *   under it, compared lexically first (nothing is probed for a home that
+ *   matches) and then with both resolved;
+ * - `tempDirIsRoot` (passwd home unknown): the temp directory resolves to the
+ *   file system root (`/`), under which every absolute path lies, so the
+ *   temp-directory rules would accept any home. Nothing about `launchHome` is
+ *   probed. The root is the only ancestor of a home refused as the temp
+ *   directory: with the temp directory set to another one (`TMPDIR=/home`,
+ *   say), a home under it, the real one included, passes `notUnderTempDir`,
+ *   and passes `derivedPathNotUnderTempDir` unless one of its derived paths
+ *   resolves out of that directory, so it is then refused only by
+ *   `holdsSlackState` or `holdsAgentDirector`;
+ * - `notUnderTempDir` (passwd home unknown): `launchHome` does not resolve
+ *   to a path strictly under the temp directory;
+ * - `holdsSlackState`: anything exists at `<launchHome>/.claude/channels/slack`
+ *   (`PRELOAD_STATE_DIR_PATH`, the server's default state directory), a
+ *   dangling symlink or an entry that cannot be looked at included;
+ * - `derivedPathInRealHome` (passwd home known): one of
+ *   `LAUNCH_HOME_DERIVED_PATHS` under `launchHome` resolves to the real home
+ *   (as given or resolved) or a path under it;
+ * - `derivedPathNotUnderTempDir` (passwd home unknown): one of them does not
+ *   resolve to a path strictly under the temp directory;
+ * - `holdsAgentDirector`: `launchHome` holds an agent-director install
+ *   (`.agent-director`, or an entry at `AGENT_DIRECTOR_INSTALL_PATH`).
+ * For a home none of these apply to, no path in `LAUNCH_HOME_DERIVED_PATHS`
+ * resolves into the real home (with the passwd home unknown: each resolves
+ * strictly under the temp directory, which is not the root), and nothing
+ * exists at its `.claude/channels/slack` or its agent-director install paths.
+ */
+export function launchHomeRefusal(launchHome: string, passwdHome: string | undefined, probe: LaunchHomeProbe): LaunchHomeRefusal | undefined {
+  if (typeof launchHome !== 'string' || !isAbsolute(launchHome)) return LAUNCH_HOME_REFUSAL.notAbsolute
+  const real = typeof passwdHome === 'string' && isAbsolute(passwdHome) ? passwdHome : undefined
+  // Whether a resolved path leaves where the run may reach: into the real home, or, with it unknown, out of the temp directory.
+  let leaves: (resolved: string) => boolean
+  if (real !== undefined) {
+    if (isUnder(resolve(launchHome), resolve(real))) return LAUNCH_HOME_REFUSAL.inRealHome
+    const realForms = [resolve(real), probe.canonical(real)]
+    leaves = (resolved) => realForms.some((form) => isUnder(resolved, form))
+    if (leaves(probe.canonical(launchHome))) return LAUNCH_HOME_REFUSAL.inRealHome
+  } else {
+    const temp = probe.canonical(probe.tempDir())
+    // Every absolute path lies under the root, so a root temp directory would let any home through.
+    if (dirname(temp) === temp) return LAUNCH_HOME_REFUSAL.tempDirIsRoot
+    leaves = (resolved) => resolved === temp || !isUnder(resolved, temp)
+    if (leaves(probe.canonical(launchHome))) return LAUNCH_HOME_REFUSAL.notUnderTempDir
+  }
+  if (probe.exists(join(launchHome, PRELOAD_STATE_DIR_PATH))) return LAUNCH_HOME_REFUSAL.holdsSlackState
+  if (LAUNCH_HOME_DERIVED_PATHS.some((path) => leaves(probe.canonical(join(launchHome, path))))) {
+    return real !== undefined ? LAUNCH_HOME_REFUSAL.derivedPathInRealHome : LAUNCH_HOME_REFUSAL.derivedPathNotUnderTempDir
+  }
+  if (probe.exists(join(launchHome, AGENT_DIRECTOR_INSTALL_DIR)) || probe.exists(join(launchHome, AGENT_DIRECTOR_INSTALL_PATH))) {
+    return LAUNCH_HOME_REFUSAL.holdsAgentDirector
+  }
+  return undefined
+}
+
+/**
+ * The one line the preload guard writes to stderr when it refuses: the
+ * reason and the launch-time home (JSON-quoted), never the environment.
+ */
+export function launchHomeRefusalMessage(reason: LaunchHomeRefusal, launchHome: string): string {
+  return (
+    `host-safety preload: refusing to start: ${reason} (launch-time home ${JSON.stringify(launchHome)}). ` +
+    'Start bun test with a scratch HOME and SLACK_STATE_DIR, as tests/README.md shows.'
+  )
 }
