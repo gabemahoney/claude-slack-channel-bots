@@ -1583,7 +1583,7 @@ describe('main() reads the retired-key record once, behind no branch, after the 
 // ---------------------------------------------------------------------------
 
 describe('startupSessionManager runs the SR-6.1 bring-up over the loaded persona config through the bring-up controller, which shutdown cancels (SR-6.1, SR-6.4)', () => {
-  test('is the reload controller\'s start bring-up: it gets the applied config the controller supplies and, as its bring-up, the bring-up controller', () => {
+  test('is the reload controller\'s start bring-up: it gets the applied config the controller supplies, as its bring-up the bring-up controller, and as its shutdown query a live read of `shuttingDown` (b.jg5 SRJ-205)', () => {
     // The only startupSessionManager call is the whole body of the controller's
     // lifecycle `startBringUp`, and its first argument is that closure's
     // parameter: the controller's applied config (the record's at a start
@@ -1608,8 +1608,13 @@ describe('startupSessionManager runs the SR-6.1 bring-up over the loaded persona
     expect(args).toHaveLength(2)
     expect(args[0]).toBe(arrow![1])
     const options = objectProperties(args[1]!)
-    expect([...options.keys()]).toEqual(['bringUp'])
+    expect([...options.keys()]).toEqual(['bringUp', 'isShuttingDown'])
     expect(options.get('bringUp')).toBe(constOf('createPersonaBringUpController'))
+    // b.jg5 SRJ-205 (the E4 gate): the launch pool asks the query before each
+    // launch, so it is an arrow reading the flag at call time, never a value
+    // captured when the pass began. The flag is server.ts's one module-level
+    // `let shuttingDown` (tests/start-sweep-wiring.test.ts pins that).
+    expect(options.get('isShuttingDown')).toBe('() => shuttingDown')
 
     expect(insideMain(bringUpAt)).toBe(true)
     expect(SERVER_CODE.slice(bringUpAt)).toMatch(/^runStartBringUp\s*\(\s*\)/)

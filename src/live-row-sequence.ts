@@ -33,7 +33,7 @@
  *      of the same id (`decideLiveRowLaunchKind`), made through the session
  *      manager's sequence-launch entry, whose reuse is the session manager's
  *      one reuse spawn (SRJ-112). A launch whose result is no success
- *      (`liveRowLaunchSucceeded`: `failed`, `deferred`, `latched`, `held`), a reuse
+ *      (`liveRowLaunchSucceeded`: `failed`, `retrying`, `deferred`, `latched`, `held`), a reuse
  *      that collided with a live row (not launched, `reuse-collision`), a
  *      `resume` that answered `ErrSpawnNotResumable` (not launched, after the
  *      entry's one re-read of the row: `not-resumable` for a lost race,
@@ -425,7 +425,6 @@ export function decideLiveRowLaunchKind(input: LiveRowLaunchKindInput): LiveRowL
 export interface LiveRowSequenceLaunchResult {
   readonly key: string
   readonly action: string
-  readonly refused?: true
   readonly stopping?: true
   /**
    * The launch's `ErrTmuxSessionCreate` armed P's retry timer at once in
@@ -974,7 +973,7 @@ function describeStopReason(reason: LiveRowSequenceStopReason): string {
 function describeOutcome(outcome: LiveRowSequenceOutcome): string {
   switch (outcome.kind) {
     case LIVE_ROW_OUTCOME_LAUNCHED:
-      return `${liveRowLaunchSucceeded(outcome.result) ? 'launched' : 'the launch failed'} (${outcome.launchKind}; result=${renderState(outcome.result.action)}${outcome.result.refused === true ? ', refused' : ''}${outcome.result.stopping === true ? ', stopping' : ''})`
+      return `${liveRowLaunchSucceeded(outcome.result) ? 'launched' : 'the launch failed'} (${outcome.launchKind}; result=${renderState(outcome.result.action)}${outcome.result.stopping === true ? ', stopping' : ''})`
     case LIVE_ROW_OUTCOME_NOT_LAUNCHED:
       return `not launched (${outcome.launchKind}; ${outcome.notLaunched})`
     case LIVE_ROW_OUTCOME_ROW_FINISHED:

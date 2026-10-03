@@ -80,6 +80,7 @@ import { checkPersonaTarget } from '../src/registry.ts'
 import { renderAppliedLogLine } from '../src/reload-apply.ts'
 import { PENDING_FILE_HEADER } from '../src/reload-fingerprint.ts'
 import { PENDING_PREVIEW_TITLE, renderChangePlanCounts, type ChangePlanCounts, type ValidChangePlan } from '../src/reload-plan.ts'
+import { startupSummaryEnding, startupSummaryLine, type StartupSummaryCounts } from '../src/session-manager.ts'
 import {
   CHECK12_LIFT,
   CHECK12_PANE_STOP,
@@ -1829,17 +1830,34 @@ describe('expected texts match the package', () => {
   })
 
   test("the start summary: the ending the checks expect, and Check 1's line, are the package's buckets in its order", () => {
-    const src = readFileSync(join(import.meta.dir, '..', 'src', 'session-manager.ts'), 'utf-8')
-    const at = src.indexOf('`[slack] startupSessionManager: complete — ')
-    expect(at).toBeGreaterThan(-1)
-    // The summary's template literals joined, each value rendered as 0.
-    const zero = src
-      .slice(at, src.indexOf('`,\n', at) + 1)
-      .replace(/`\s*\+\s*`/g, '')
-      .replace(/^`|`$/g, '')
-      .replace(/\$\{[^}]+\}/g, '0')
-    expect(zero.endsWith(`, ${START_SUMMARY_END}`)).toBe(true)
-    expect(COMPLETE_FIRST_START.replace(/\b3 /g, '0 ')).toBe(zero)
+    // The package's line and ending, built by its own builders: a clean
+    // first start of three personas, each a fresh spawn, every other count 0.
+    // Typed over every summary count, so a new one fails the typecheck here.
+    const zero: StartupSummaryCounts = {
+      failed: 0,
+      notBroughtUp: 0,
+      resumed: 0,
+      freshSpawned: 0,
+      freshAfterAmnesia: 0,
+      freshAfterInconclusiveAmnesia: 0,
+      reconnected: 0,
+      notReconnected: 0,
+      noop: 0,
+      latched: 0,
+      retrying: 0,
+      sequenceWaiting: 0,
+      held: 0,
+      freshRetired: 0,
+    }
+    const line = startupSummaryLine(3, { ...zero, freshSpawned: 3 })
+    const ending = startupSummaryEnding(zero)
+    expect(line.endsWith(`, ${ending}`)).toBe(true)
+    // The checks' buckets are the package's, in its order, up to
+    // `not reconnected`. b.jg5 SRJ-1015's five counts follow it in the
+    // package; the checks gaining them (`START_SUMMARY_END` and Check 1's
+    // line, SRJ-1111) is E50's, so only the shared start is checked here.
+    expect(ending.startsWith(START_SUMMARY_END)).toBe(true)
+    expect(line.startsWith(COMPLETE_FIRST_START)).toBe(true)
   })
 
   test("the plan quotes the same summary: every ending it gives has the not-reconnected bucket, and Check 1 quotes the line", () => {

@@ -152,7 +152,7 @@ import {
 import { personaInstanceId } from '../src/persona-identity.ts'
 import { RESTART_FAILURE_CAP } from '../src/restart.ts'
 import { _buildIsSessionAliveAdapter } from '../src/server.ts'
-import { KILL_CONTEXT_TEARDOWN, killPersonaInstance, reconcileOrphans, TRUST_DIALOG_NEEDLE, type ApproverVerb } from '../src/session-manager.ts'
+import { KILL_CONTEXT_TEARDOWN, killPersonaInstance, reconcileOrphans, SPAWN_ACTION_RETRYING, TRUST_DIALOG_NEEDLE, type ApproverVerb } from '../src/session-manager.ts'
 import { KILL_OUTCOME_NOT_KILLED } from '../src/checked-kill.ts'
 import { KILL_RETRY_SPACING_MS, KILL_RETRY_TRIES } from '../src/kill-retry.ts'
 import {
@@ -488,7 +488,7 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
 
     const outcome = await h.runSequence(p, { lastReadState: cannedStatusResult().state, entryStep: LIVE_ROW_SEQUENCE_ENTRY_GET })
 
-    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, result: { key: p, action: 'failed', refused: true } })
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, result: { key: p, action: SPAWN_ACTION_RETRYING } })
     expectHolds(h, p, 'spawn', at)
     expect([h.reuseSpawns().length, h.stub.calls.killCalls.length, getFailureCount(p)]).toEqual([1, 0, 0])
     // A tick started at the refusal's own time posts no onset.

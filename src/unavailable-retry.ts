@@ -1867,7 +1867,7 @@ export function runOutsideAttempts<T>(fn: () => T): T {
  * Run `fn` as a recovery attempt for persona `key` of its own, detached from
  * whatever attempt the caller runs in (`runOutsideAttempts`, then
  * `runInAttempt`): an error met in it is recorded there only and arms by the
- * attempt rule for `key`, never marking the caller's launch as refused. For
+ * attempt rule for `key`, never turning the caller's launch into `retrying`. For
  * work a caller starts in the background and does not await: each live-row
  * sequence (b.jg5 SRJ-706, the registry's attempt runner in
  * `src/live-row-sequence.ts`).
@@ -1914,7 +1914,7 @@ export function isInsideAttempt(key: string): boolean {
  * Outside an attempt for `key`, any other cause arms nothing. Inside one,
  * the innermost attempt then records the error as its last, armed when the
  * sink answered true (the persona has a timer after the call), so a launch
- * ended by it is refused; a sink that answers anything else, or throws, armed
+ * ended by it answers `retrying` (b.jg5 SRJ-1015); a sink that answers anything else, or throws, armed
  * nothing. Answers whether the sink armed. Never throws.
  */
 export function reportAttemptError(

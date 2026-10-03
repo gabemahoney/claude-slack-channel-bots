@@ -490,6 +490,7 @@ import {
   readPersonaOwnRowStatus,
   reconcileOrphans,
   setSessionNotifier,
+  SPAWN_ACTION_RETRYING,
   type ApproverVerb,
   type NotConnectedNotice,
   type OwnRowReadSite,
@@ -2244,7 +2245,7 @@ describe('AC 46: no automated path kills, launches or recovers a latched persona
 
     // P's condition holds and its timer is armed: a launch whose spawn tmux did not answer.
     h.script({ spawnError: errTmuxUnresponsive('spawn') })
-    expect((await h.launch(p)).action).toBe('failed')
+    expect((await h.launch(p)).action).toBe(SPAWN_ACTION_RETRYING)
     expect([h.tmuxUnresponsive.holds(p), h.controller.isArmed(p)]).toEqual([true, true])
 
     // Then a launch whose first spawn answers a CONFLICT; nothing was read before it, so one status read follows.
@@ -2567,7 +2568,7 @@ describe('SRJ-512: an UNUSABLE NAME from resume and from the working-row read-pa
     const err = errInternal()
     h.script({ ...collided(h, personaOf(h, p), { state: 'ended' }), resumeError: err })
 
-    expect(await h.launch(p)).toEqual({ key: p, action: 'failed', refused: true })
+    expect(await h.launch(p)).toEqual({ key: p, action: SPAWN_ACTION_RETRYING })
 
     // No latch and no hold notice.
     expect([h.latch.isLatched(p), h.latchEvents, h.episodeNotices]).toEqual([false, [], []])

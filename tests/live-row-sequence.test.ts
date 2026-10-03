@@ -210,6 +210,7 @@ import {
   SEQUENCE_NOT_RESUMABLE_LOST_RACE_OUTCOME,
   SEQUENCE_NOT_RESUMABLE_PENDING_OUTCOME,
   SPAWN_ACTION_FRESH_RETIRED,
+  SPAWN_ACTION_RETRYING,
   spawnNotResumableLine,
   startLiveRowSequence,
   sweepDeadTmuxChannel,
@@ -1405,6 +1406,7 @@ const LAUNCH_ACTION_SUCCEEDS: Readonly<Record<SpawnPersonaResult['action'], bool
   'fresh-after-amnesia': true,
   'fresh-after-inconclusive-amnesia': true,
   failed: false,
+  [SPAWN_ACTION_RETRYING]: false,
   deferred: false,
   latched: false,
   'sequence-waiting': false,
@@ -1435,20 +1437,20 @@ interface ReuseEnd {
 }
 
 const REUSE_FAILED = 'the launch failed (reuse; result=failed)'
-const REUSE_REFUSED = 'the launch failed (reuse; result=failed, refused)'
+const REUSE_RETRYING = `the launch failed (reuse; result=${SPAWN_ACTION_RETRYING})`
 const ENDED_ARMED = `the retry timer armed (${LIVE_ROW_ARM_ENDED})`
 const PENDING_ONLY_ARMED = 'the retry timer armed by the launch (pending-only)'
-const REFUSED_ANSWER = { action: 'failed', refused: true } as const
+const RETRYING_ANSWER = { action: SPAWN_ACTION_RETRYING } as const
 
-/** A reuse refused by `cause`'s class: the refusal's own cause, then the sequence's. */
+/** A reuse refused by `cause`'s class, answering `retrying` (b.jg5 SRJ-1015): the refusal's own cause, then the sequence's. */
 const refusedBy = (make: () => Error, cause: string, unclassified?: true): ReuseEnd => ({
   make,
-  answer: REFUSED_ANSWER,
+  answer: RETRYING_ANSWER,
   armed: LIVE_ROW_ARM_ENDED,
   triggers: [cause, UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED],
   counted: 0,
   ...(unclassified === undefined ? {} : { unclassified }),
-  said: REUSE_REFUSED,
+  said: REUSE_RETRYING,
   armedSaid: ENDED_ARMED,
 })
 
@@ -1471,10 +1473,10 @@ const REUSE_ENDS: ReadonlyArray<readonly [string, ReuseEnd]> = [
     'fails with a directory error (ErrCwdNotFound), counted once',
     { make: () => errCwdNotFound(), answer: { action: 'failed', countedClass: true }, armed: LIVE_ROW_ARM_ENDED, triggers: [UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED], counted: 1, said: REUSE_FAILED, armedSaid: ENDED_ARMED },
   ],
-  ['fails with UNAVAILABLE (ErrTmuxUnresponsive), refused', refusedBy(() => errTmuxUnresponsive('spawn'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)],
-  ['fails with ENVIRONMENT (ErrTmuxNotAvailable), refused', refusedBy(() => errTmuxNotAvailable(), UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT)],
-  ['fails with CONFIG (ErrConfigMalformed), refused', refusedBy(() => errConfigMalformed(), UNAVAILABLE_RETRY_CAUSE_CONFIG)],
-  ['fails with UNCLASSIFIED (ErrInternal), refused', refusedBy(() => errInternal(), UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, true)],
+  ['fails with UNAVAILABLE (ErrTmuxUnresponsive), retrying', refusedBy(() => errTmuxUnresponsive('spawn'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)],
+  ['fails with ENVIRONMENT (ErrTmuxNotAvailable), retrying', refusedBy(() => errTmuxNotAvailable(), UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT)],
+  ['fails with CONFIG (ErrConfigMalformed), retrying', refusedBy(() => errConfigMalformed(), UNAVAILABLE_RETRY_CAUSE_CONFIG)],
+  ['fails with UNCLASSIFIED (ErrInternal), retrying', refusedBy(() => errInternal(), UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, true)],
   ['fails with ErrTmuxSessionCreate, armed pending-only', launchFailure()],
   ['of an id with no row (step 3\'s get read none) fails with ErrTmuxSessionCreate, armed pending-only', launchFailure(true)],
 ]
@@ -2496,7 +2498,7 @@ describe('a retired key\'s sequence: its final launch is a reuse that sets the m
   })
 
   test.each<[string, () => Error, Partial<LiveRowSequenceOutcome>]>([
-    ['UNAVAILABLE (ErrTmuxUnresponsive)', () => errTmuxUnresponsive('spawn'), { kind: LIVE_ROW_OUTCOME_LAUNCHED, result: { key: 'p', action: 'failed', refused: true } }],
+    ['UNAVAILABLE (ErrTmuxUnresponsive)', () => errTmuxUnresponsive('spawn'), { kind: LIVE_ROW_OUTCOME_LAUNCHED, result: { key: 'p', action: SPAWN_ACTION_RETRYING } }],
     ['a collision (ErrInstanceIdCollision)', () => errInstanceIdCollision(), { kind: LIVE_ROW_OUTCOME_NOT_LAUNCHED, notLaunched: LIVE_ROW_NOT_LAUNCHED_REUSE_COLLISION }],
     ['ErrInvalidFlags (P held)', () => errInvalidFlags('spawn'), { kind: LIVE_ROW_OUTCOME_LAUNCHED, result: { key: 'p', action: 'held' } }],
   ])('the final reuse answering %s: no resume, and no mark set or held', async (_label, make, ended) => {

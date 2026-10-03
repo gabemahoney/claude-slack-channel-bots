@@ -2952,7 +2952,11 @@ export async function main(): Promise<void> {
     // rewrite and the teardown's kill; no pending-row rule run follows.
     stopApprover: (key) => stopDialogApprover(key, APPROVER_STOP_RETIRED_KEY),
     lifecycle: {
-      startBringUp: (applied) => startupSessionManager(applied, { bringUp: personaBringUps }),
+      // b.jg5 SRJ-205 (the E4 gate): the pass's launch pool reads
+      // `shuttingDown` live before starting each launch, so a shutdown begun
+      // during the pass (a version re-check's stop included) starts no
+      // queued launch and changes no agent-director row.
+      startBringUp: (applied) => startupSessionManager(applied, { bringUp: personaBringUps, isShuttingDown: () => shuttingDown }),
       teardown: (persona) => personaLifecycleOps.teardown(persona),
       updateInPlace: (change) => personaLifecycleOps.updateInPlace(change),
       bringUp: (persona, applied, options) => personaLifecycleOps.bringUp(persona, applied, options),

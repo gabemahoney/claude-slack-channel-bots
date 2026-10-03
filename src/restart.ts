@@ -409,9 +409,9 @@ export interface RestartDeps {
    * `cwd` is the persona's working directory. `'skipped'`: the launch was
    * declined (the persona stopped being up after the last `canRestart`
    * check, or the server is stopping), which counts as neither a success nor
-   * a failure. `'refused'`: the launch failed and its UNAVAILABLE retry timer
-   * was armed for it (b.jg5 SRJ-301), so the timer owns the persona; it
-   * counts as neither either (SRJ-302). `deadEvidence`: the verdict an
+   * a failure. `'refused'`: the launch answered `retrying` (b.jg5 SRJ-1015:
+   * its retry timer was armed for it, SRJ-301, so the timer owns the
+   * persona) or `sequence-waiting`; it counts as neither either (SRJ-302). `deadEvidence`: the verdict an
    * escalate-dead answer carried (`ReconnectEscalateDead`, b.jg5 SRJ-611),
    * passed on unchanged to the relaunch after it, which carries it into the
    * ladder; absent for any other launch, and for a bare 'escalate-dead'.
@@ -1210,9 +1210,9 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     // the work answers sequence-waiting too, so a retry's re-armed line
     // names the sequence. Nothing is recorded.
     if (skipIfSequenceRunning(d, key, 'after its launch')) return RESTART_OUTCOME_SEQUENCE_WAITING
-    // b.jg5 SRJ-302: refused, not failed. The launch met an UNAVAILABLE
-    // outcome (or a read error) that armed the persona's retry timer, which
-    // owns the persona from here. A persona is never given up on for
+    // b.jg5 SRJ-302, SRJ-1015: refused, not failed. The launch answered
+    // `retrying`: it met an outcome that armed the persona's retry timer,
+    // which owns the persona from here. A persona is never given up on for
     // UNAVAILABLE alone, so the failure counter, backoff and cap latch are
     // left exactly as they were.
     console.error(`[slack] Session relaunch refused for persona=${key} — not counted; its UNAVAILABLE retry timer owns the persona`)
@@ -1267,7 +1267,7 @@ function countLaunchFailure(
  * latch; a counted failure is recorded, with the cap notice through the
  * installed restart dependencies' `onCapReached` once per episode (none when
  * `initRestart` has not run). The caller decides which results count (a
- * refused, stopping, latched, held or deferred launch records nothing). Answers
+ * retrying, stopping, latched, held or deferred launch records nothing). Answers
  * `launched`, `counted-failure` or `capped`.
  */
 export function recordLaunchResultOutsideRestartWork(

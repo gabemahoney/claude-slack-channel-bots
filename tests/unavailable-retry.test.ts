@@ -32,7 +32,9 @@
  * The retry action's decisions, in both modes, run over a stand-in row read
  * and retry entry; the full-mode retry end to end (AC 26 with the
  * `tmux-unresponsive` condition's onset, alert and recovery along its
- * schedule, SRJ-302's alert half, and AC 30's alert part; the in-flight skip,
+ * schedule, SRJ-302's alert half, and AC 30's alert part; a start pass
+ * counting its UNAVAILABLE launch under `retrying`, b.jg5 SRJ-1015, whose
+ * retry re-arms at the doubled wait; the in-flight skip,
  * the row decisions, the serializer wait, a liveness `status` error read
  * `unknown` with the arm hook wired as `main()` wires it), the stop rules that exist now
  * (AC 28), pending-only mode (armed directly, AC 33's timer half) and the
@@ -302,6 +304,8 @@ import {
   KILL_CONTEXT_TEARDOWN,
   launchSession,
   SPAWN_ACTION_FRESH_RETIRED,
+  SPAWN_ACTION_RETRYING,
+  startupSessionManager,
   killPersonaInstance,
   reconcileOrphans,
   retryPersonaKill,
@@ -1086,12 +1090,12 @@ const READ_ERRORS: ReadonlyArray<readonly [string, (verb: string) => Error]> = [
 
 /**
  * The result a launch that met an arming error at a site with `action`
- * answers: a failure carries the refusal marker; any other action (the
- * working-row wait's, which goes on past a failed read, b.jg5 SRJ-605) is
- * the wait's own outcome, unmarked.
+ * answers: a failure is answered `retrying` (b.jg5 SRJ-1015); any other
+ * action (the working-row wait's, which goes on past a failed read, b.jg5
+ * SRJ-605) is the wait's own outcome, as it is.
  */
 function armedResult(key: string, action: SpawnPersonaResult['action']): SpawnPersonaResult {
-  return action === 'failed' ? { key, action, refused: true } : { key, action }
+  return action === 'failed' ? { key, action: SPAWN_ACTION_RETRYING } : { key, action }
 }
 
 /**
@@ -1355,7 +1359,6 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
     }
 
     expect(result).toMatchObject({ key, action })
-    expect(result.refused).toBeUndefined()
     expect(h.stub.callCount()).toBe(0)
     expectNothingArmed(h)
   })
@@ -1381,7 +1384,7 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
     expect(h.attempts).toEqual([{ key, retry: 1, causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE], mode: UNAVAILABLE_RETRY_MODE_FULL, at: dueAt }])
   })
 
-  test('a launch that joins one in flight, which then fails UNAVAILABLE, gets the same marked result, and one timer is armed', async () => {
+  test('a launch that joins one in flight, which then fails UNAVAILABLE, gets the same retrying result, and one timer is armed', async () => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     const [key] = h.keys as [string]
     const hold = holdSpawns(h.stub.client)
@@ -1392,14 +1395,14 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
     hold.fail(personaInstanceId(key), errTmuxUnresponsive('spawn'))
     await h.settle()
 
-    const marked: SpawnPersonaResult = { key, action: 'failed', refused: true }
-    expect(await first).toEqual(marked)
-    expect(await joined).toEqual(marked)
+    const retrying: SpawnPersonaResult = { key, action: SPAWN_ACTION_RETRYING }
+    expect(await first).toEqual(retrying)
+    expect(await joined).toEqual(retrying)
     expect(hold.calls).toHaveLength(1)
     expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)
   })
 
-  test('with no trigger sink installed, a launch fed UNAVAILABLE schedules no timer, throws nothing and is not marked', async () => {
+  test('with no trigger sink installed, a launch fed UNAVAILABLE schedules no timer, throws nothing and answers failed, not retrying', async () => {
     const h = (harness = makeRecoveryHarness({ ...RETRY_TIMER_ONLY, triggerSink: false }))
     const [key] = h.keys as [string]
     h.script({ spawnError: errTmuxUnresponsive('spawn') })
@@ -2203,7 +2206,7 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
     h.script({ spawnError: errTmuxUnresponsive('spawn') })
 
     const refusedAt = h.clock.now()
-    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
     expect(row.spawnedAt).toEqual([refusedAt])
     expect(h.tmuxUnresponsive.firstRefusalAt(key)).toBe(refusedAt)
 
@@ -2302,6 +2305,50 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
     expect(getFailureCount(key)).toBe(0)
     expect(h.capReached).toEqual([])
     expectPosts()
+  })
+
+  // b.jg5 SRJ-1015, SRJ-302: the start pass's own tally of the launch that
+  // met UNAVAILABLE; tests/session-manager.test.ts covers every action's count.
+  test('a start pass whose launch of P meets UNAVAILABLE counts it under retrying, never failed or succeeded, and arms P\'s timer once; its first retry, refused again, re-arms at the doubled wait with nothing counted', async () => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [key] = h.keys as [string]
+    const row = modelRow(h, 'missing')
+    h.script({ spawnError: errTmuxUnresponsive('spawn') })
+    const startedAt = h.clock.now()
+
+    const result = await startupSessionManager({ ...h.config, personas: [personaOf(h, key)] })
+
+    expect(result).toEqual({
+      succeeded: 0,
+      failed: 0,
+      notBroughtUp: 0,
+      resumed: 0,
+      freshSpawned: 0,
+      freshAfterAmnesia: 0,
+      freshAfterInconclusiveAmnesia: 0,
+      reconnected: 0,
+      notReconnected: 0,
+      noop: 0,
+      latched: 0,
+      retrying: 1,
+      sequenceWaiting: 0,
+      held: 0,
+      freshRetired: 0,
+      waitingInBackground: 0,
+      perPersona: [{ key, action: SPAWN_ACTION_RETRYING }],
+    })
+    expect(row.spawnedAt).toEqual([startedAt])
+    expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)
+    expect([getFailureCount(key), h.notices, h.startupErrors()]).toEqual([0, [], []])
+
+    // The retry's relaunch (`launchSession`) meets UNAVAILABLE again: the
+    // `retrying` result is its uncounted refusal, so the timer re-arms at the
+    // next wait of its one sequence and the failure count is untouched.
+    const dueAt = await retryNow(h, key)
+    expect(dueAt).toBe(startedAt + waitMs(0))
+    expect(row.spawnedAt).toEqual([startedAt, dueAt])
+    expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', dueAt: dueAt + waitMs(1), waitMs: waitMs(1), refusals: 1, causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE] })
+    expect([getFailureCount(key), h.capReached, h.notices]).toEqual([0, [], []])
   })
 
   test('AC 30 (its alert part): with both settings 0, a condition that ends through a successful read-pane after its onset, while a retry last read the row pending, posts one recovery, cancels its alert check and leaves the retry timer armed with its due time; that retry fires and no alert is ever posted', async () => {
@@ -2705,7 +2752,7 @@ describe('unavailable retry: the stop rules that exist now on the recovery harne
 
     h.shutdown()
     // The closed controller refuses the arm (its sink answers false), so the
-    // launch is a plain failure, not marked refused.
+    // launch is a plain failure, not retrying.
     expect(await h.launch(key)).toEqual({ key, action: 'failed' })
     await h.advance(waitMs(refusalsToCeiling()) * (RESTART_FAILURE_CAP + 2))
 
@@ -2873,7 +2920,7 @@ describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301,
     await h.advance(waitMs(0) / 2)
 
     h.script({ spawnError: errTmuxUnresponsive('spawn') })
-    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
     h.script({ spawnError: undefined })
 
     expect(retryLinesOf(h, key).slice(1)).toEqual([
@@ -3283,7 +3330,7 @@ describe('unavailable retry: the pending and kill-failure exceptions (SRJ-306)',
 async function refuseLaunch(h: RecoveryHarness, key: string): Promise<number> {
   h.script({ spawnError: errTmuxUnresponsive('spawn') })
   const refusedAt = h.clock.now()
-  expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+  expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
   h.script({ spawnError: undefined })
   expect(h.tmuxUnresponsive.firstRefusalAt(key)).toBe(refusedAt)
   expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE], mode: UNAVAILABLE_RETRY_MODE_FULL })
@@ -4732,7 +4779,7 @@ function tmuxUnavailableAllClear(key: string): { key: string; text: string } {
 async function environmentLaunch(h: RecoveryHarness, key: string): Promise<number> {
   h.script({ spawnError: errTmuxNotAvailable() })
   const armedAt = h.clock.now()
-  expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+  expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
   expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key)])
   expect(h.controller.view(key)).toEqual({
     phase: 'waiting',
@@ -5705,7 +5752,7 @@ function refuseConfig(h: RecoveryHarness, initial: RowState | typeof UNAVAILABLE
  */
 async function configLaunch(h: RecoveryHarness, key: string, err: Error): Promise<number> {
   const armedAt = h.clock.now()
-  expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+  expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
   expect(h.outageNotices).toEqual([configOnset(key, err)])
   expect(h.controller.view(key)).toEqual({
     phase: 'waiting',
@@ -6014,7 +6061,7 @@ function alertRetry(armedAt: number, thresholdMs: number): { retry: number; dueA
 async function unclassifiedLaunch(h: RecoveryHarness, key: string, err: Error): Promise<number> {
   h.script({ spawnError: err })
   const armedAt = h.clock.now()
-  expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+  expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
   expect(h.controller.view(key)).toEqual({
     phase: 'waiting',
     dueAt: armedAt + waitMs(0),
@@ -6077,7 +6124,7 @@ const UNCLASSIFIED_ATTEMPTS: ReadonlyArray<readonly [string, UnclassifiedAttempt
     row: UNAVAILABLE_RETRY_ROW_ABSENT,
     script: (err) => ({ spawnError: err }),
     run: async (h, key) => {
-      expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+      expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
     },
     firstCalls: { spawnCalls: 1 },
     // The dead reading's kill comes before the relaunch; the refused spawn is the retry's last call.
@@ -6207,7 +6254,7 @@ describe('unavailable retry: UNCLASSIFIED outcomes are never destructive or coun
     const err = errInternal()
     h.script({ ...collided(h, persona, { state: 'waiting' }), getError: err })
 
-    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
     expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_READ_ERROR)
     expect(callCounts(h)).toEqual({ spawnCalls: 1, getCalls: 1 })
     expect(h.unclassifiedErrorOpen(key)).toBe(true)
@@ -6215,7 +6262,7 @@ describe('unavailable retry: UNCLASSIFIED outcomes are never destructive or coun
 
     await h.advance(waitMs(0) - 1)
     h.script({ ...collided(h, persona, { state: 'waiting' }), getError: err })
-    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
 
     expect(callCounts(h)).toEqual({ spawnCalls: 2, getCalls: 2 })
     expect(h.unclassifiedErrorOpen(key)).toBe(true)
@@ -6379,7 +6426,7 @@ describe('unavailable retry: the no-transcript reuse spawn after resume’s ErrN
     const reuse = noSessionIdReuse(h, key, () => err)
     const armedAt = h.clock.now()
 
-    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
 
     expect(callCounts(h)).toEqual(NO_SESSION_ID_REUSE_LAUNCH)
     expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, key)])
@@ -6426,7 +6473,7 @@ describe('unavailable retry: the no-transcript reuse spawn after resume’s ErrN
     const [key, other] = h.keys as [string, string]
     const reuse = noSessionIdReuse(h, key, () => errInternal())
     const armedAt = h.clock.now()
-    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
     const thresholdMs = adAlertThresholdMsInEffect()
     const alert = alertRetry(armedAt, thresholdMs)
     for (let n = 0; n < alert.retry - 1; n++) await retryNow(h, key)
@@ -6461,7 +6508,7 @@ describe('unavailable retry: the no-transcript reuse spawn after resume’s ErrN
     const reuse = noSessionIdReuse(h, key, () => errTmuxUnresponsive('spawn'))
     const armedAt = h.clock.now()
 
-    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
     expect(callCounts(h)).toEqual(NO_SESSION_ID_REUSE_LAUNCH)
     expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)
 
@@ -6727,10 +6774,10 @@ describe('unavailable retry: a latch stops the timer and ends the unclassified-e
     const refusal = errCallTimeout('spawn')
     h.script({ spawnError: refusal })
     const armedAt = h.clock.now()
-    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
     await h.advance(waitMs(0) / 2)
     const otherArmedAt = h.clock.now()
-    expect(await h.launch(other)).toEqual({ key: other, action: 'failed', refused: true })
+    expect(await h.launch(other)).toEqual({ key: other, action: SPAWN_ACTION_RETRYING })
     expect(h.controller.armedKeys()).toEqual([key, other])
     const otherView = h.controller.view(other)
 
@@ -6940,7 +6987,7 @@ describe('unavailable retry: a retry whose row read finds P’s own pending row 
     const [key, other] = h.keys as [string, string]
     modelRow(h, UNAVAILABLE_RETRY_ROW_ABSENT)
     h.script({ spawnError: errCallTimeout('spawn') })
-    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
     expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', mode: UNAVAILABLE_RETRY_MODE_FULL })
     h.script({ spawnError: undefined })
     pendingRowFor(h, key, NO_LAUNCH_START_FORMS[form])
@@ -7179,7 +7226,7 @@ describe('unavailable retry: a message lost while P’s tmux-unavailable or ad-c
     const [key, other] = h.keys as [string, string]
     const row = modelRow(h, 'missing')
     h.script({ spawnError: make() })
-    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
     expect([...getOutageFlags(key)]).toEqual([raised])
     expect(h.tmuxUnresponsive.holds(key)).toBe(false)
     expectArmedOnce(h, key, cause)
@@ -7260,7 +7307,7 @@ describe('unavailable retry: a message lost in not answering with P’s tmux-una
    */
   async function stoppedWithFlagRaised(h: RecoveryHarness, key: string, make: () => Error, flag: OutageClass, cause: string): Promise<void> {
     h.script({ spawnError: make() })
-    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
     expectArmedOnce(h, key, cause)
     h.setUp(key, false)
     await retryNow(h, key)
@@ -7732,7 +7779,7 @@ describe('unavailable retry: the live-row sequence — SRJ-316\'s pending-row le
 
     const outcome = await h.runSequence(key, { lastReadState: LIVE_STATE })
 
-    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE, result: { key, action: 'failed', refused: true }, armed: LIVE_ROW_ARM_ENDED })
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE, result: { key, action: SPAWN_ACTION_RETRYING }, armed: LIVE_ROW_ARM_ENDED })
     expect(h.reuseSpawns()).toHaveLength(1)
     const redacted = h.errors.filter((line) => line.includes(REDACTED_SENTINEL_TAIL))
     expect(redacted.length).toBeGreaterThan(0)
@@ -7870,7 +7917,7 @@ describe('unavailable retry: the collision ladder\'s second reuse collision, its
     const [key, other] = h.keys as [string, string]
     h.script(collided(h, personaOf(h, key), { cwd: h.home, state: LIVENESS_DEAD_ROW_ENDED }, errInstanceIdCollision(), errInstanceIdCollision()))
 
-    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
 
     expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION)
     expect(callCounts(h)).toEqual({ spawnCalls: 3, getCalls: 2 })
@@ -7897,7 +7944,7 @@ describe('unavailable retry: the collision ladder\'s second reuse collision, its
       resumeQueue: [cannedErr(errSpawnNotResumable())],
     })
 
-    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
 
     expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_LOST_RACE)
     expect(callCounts(h)).toEqual({ spawnCalls: 1, getCalls: 2, resumeCalls: 1 })
@@ -8125,10 +8172,10 @@ describe('unavailable retry: the ErrInvalidFlags hold stops the timer, no retry 
     const refusal = errCallTimeout('spawn')
     h.script({ spawnError: refusal })
     const armedAt = h.clock.now()
-    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
     await h.advance(waitMs(0) / 2)
     const otherArmedAt = h.clock.now()
-    expect(await h.launch(other)).toEqual({ key: other, action: 'failed', refused: true })
+    expect(await h.launch(other)).toEqual({ key: other, action: SPAWN_ACTION_RETRYING })
     const otherView = h.controller.view(other)
 
     // P's first retry: no row, so it launches; the launch replaces P's row,
@@ -8278,7 +8325,7 @@ describe('unavailable retry: the ErrInvalidFlags hold stops the timer, no retry 
     const rc = h.versionRecheck({ version: PHASE1_RC_VERSION })
     modelRow(h, UNAVAILABLE_RETRY_ROW_ABSENT)
     h.script({ spawnError: errCallTimeout('spawn') })
-    expect(await h.launch(key)).toEqual({ key, action: 'failed', refused: true })
+    expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
     scriptReuseInvalidFlags(h, key)
     await retryNow(h, key)
     expectStoppedByHold(h, key)
@@ -8313,9 +8360,9 @@ describe('unavailable retry: a retired key\'s retries launch by the reuse, never
   const markedLines = (h: RecoveryHarness, key: string): string[] => retiredKeyLinesIn(h.errors).filter((line) => line.includes(`persona=${key} marked: `))
 
   test.each<[string, (h: RecoveryHarness, key: string) => Promise<unknown>, unknown]>([
-    ['the start pass (spawnForPersona, isStartup true)', (h, key) => h.launch(key), { action: 'failed', refused: true }],
+    ['the start pass (spawnForPersona, isStartup true)', (h, key) => h.launch(key), { action: SPAWN_ACTION_RETRYING }],
     ['a non-start launch (launchSession)', (h, key) => launchSession(key, h.config), 'refused'],
-  ])('P recorded with no mark, its row ended with a session id: %s refused UNAVAILABLE arms P\'s timer; each retry relaunches by the reuse and never resumes; the retry whose reuse succeeds launches, sets the mark and runs on in pending-only mode, whose next retry stops the timer', async (_path, launch, refused) => {
+  ])('P recorded with no mark, its row ended with a session id: %s refused UNAVAILABLE arms P\'s timer; each retry relaunches by the reuse and never resumes; the retry whose reuse succeeds launches, sets the mark and runs on in pending-only mode, whose next retry stops the timer', async (_path, launch, expected) => {
     const h = (harness = makeRecoveryHarness({ ...RETRY_TIMER_ONLY, resumeEnabled: true }))
     const [key] = h.keys as [string]
     h.retireKey(key)
@@ -8323,7 +8370,7 @@ describe('unavailable retry: a retired key\'s retries launch by the reuse, never
     h.script({ spawnError: errTmuxUnresponsive('spawn'), getResult: personaRow(h, key, { state: LIVENESS_DEAD_ROW_ENDED, claude_session_id: 'a-session-id' }) })
 
     const answer = await launch(h, key)
-    expect(answer).toEqual(typeof refused === 'object' ? { key, ...refused } : refused)
+    expect(answer).toEqual(typeof expected === 'object' ? { key, ...expected } : expected)
     expect(h.controller.view(key)?.causes).toEqual([UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE])
 
     for (let retry = 1; retry <= 2; retry++) {

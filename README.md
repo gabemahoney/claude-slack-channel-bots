@@ -1437,6 +1437,29 @@ To verify recovery in the field, tail `server.log` for a stranded persona and co
 
 At a server start, a persona whose instance agent-director reports as `working` is reconnected once its turn ends, and it doesn't hold up the other personas or the health check. `server.log` shows `[slack] startupSessionManager: "<name>" (key=<key>) is waiting for its working row to settle — the start pass goes on without it; its launch stays in flight in the background (b.f2b)`, then, when the wait ends, `[slack] startupSessionManager: background launch for "<name>" (key=<key>) settled: <outcome> (b.f2b)`. `reconnected` means the reconnect was typed into the session; `not-reconnected` means the session was left running without it, and the line just before says what happens next. An idle screen and a transcript ending with a finished reply (or with a turn you interrupted), both unchanged for a minute, end the wait with a reconnect, and a prompt or dialog on screen for a minute raises a *Waiting on a prompt* notice. Otherwise the wait gives up after 10 minutes; if agent-director still reports the persona as `working` then, its destination gets a *Not connected* notice. While agent-director can't report the persona's state, the wait keeps waiting and posts nothing; if it still can't after 10 minutes, the instance is left running for the health check (with `session_restart_delay` set to `0`, a *Not connected* notice reports it), with no `spawn-failed` entry and nothing counted toward the restart limit. If agent-director no longer has a row for the persona, it is relaunched. Removing the persona with a confirmed change ends its wait at once, with nothing typed.
 
+**Reading the start summary**
+Each server start logs one summary line in `server.log` when its launches have settled or are waiting in the background:
+
+```text
+[slack] startupSessionManager: complete — <N> persona(s): <n> resumed, <n> fresh-spawned, <n> fresh-after-amnesia, <n> fresh-after-inconclusive-amnesia, <n> reconnected, <n> no-op, <n> failed, <n> not brought up, <n> not reconnected, <n> latched, <n> retrying, <n> waiting on a live-row sequence, <n> held on invalid flags, <n> fresh as retired keys
+```
+
+Each persona is counted once, except one whose launch is still waiting in the background (see above): it is in no count, and the next line gives how many:
+
+```text
+[slack] startupSessionManager: <n> persona(s) still waiting in the background for a working row to settle — not counted above; each logs its outcome when it settles (b.f2b)
+```
+
+None of the last five counts is a failure, and none is counted as `fresh-spawned`:
+
+- `latched`: the persona is held until a human acts (see the *Held* entries below).
+- `retrying`: agent-director refused the launch, and the persona is retried on its own (see "A persona is retried after agent-director refuses it" above).
+- `waiting on a live-row sequence`: the persona's old instance, still running, is ended first, and its new launch follows (see "Bots come back with no memory of the prior conversation after a reboot" below).
+- `held on invalid flags`: agent-director rejected the persona's launch flags (see "A persona posts a *Cannot launch* notice" below).
+- `fresh as retired keys`: a persona whose key was retired came back on a new conversation (see "Bots come back with no memory of the prior conversation after a reboot" below).
+
+`not brought up` counts personas held before their launch: missing credentials, a missing working directory, a `claude_config_dir` that can't be resolved yet, or Slack refusing or unreachable. A persona whose Slack connection is still being retried is counted there, never under `retrying`. A start stopped by the agent-director version re-check launches no persona still waiting for its turn: each logs a `not launching … — the server has begun shutting down` line and is in no count.
+
 **A persona posts a *Waiting on a prompt*, *Not connected* or *Not receiving messages* notice**
 Each of these notices means the persona's session is running but messages can't reach it, so messages sent to it are lost. At most one of them is posted to the persona's destination per episode: after one is posted, none is posted again until the persona's session connects to the server again or the health check finds it reachable again. `server.log` shows `[slack] session-manager: persona=<key> is not connected (<reason>) — raising a not-connected notice (b.f2b)` when it is posted. The `=` in the attach commands below and in the notices attaches to that exact session only, never to another persona's session whose name starts with it.
 

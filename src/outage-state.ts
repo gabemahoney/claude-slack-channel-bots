@@ -753,7 +753,8 @@ export async function withOutageDetection<T>(
  * - Inside a launch or recovery attempt for `key`, any other error the
  *   arming predicate answers a cause for is sent once to the trigger sink,
  *   and the attempt records the error (ENVIRONMENT and CONFIG included) as
- *   its last, so a launch it ends is refused and never counted.
+ *   its last, so a launch it ends is never counted and answers `retrying`
+ *   when the timer was armed.
  * - Inside such an attempt, when the call is tmux-touching
  *   (`isTmuxTouchingCall`) and the arming predicate answers the UNAVAILABLE
  *   cause (never the kill-failure, ENVIRONMENT, CONFIG or UNCLASSIFIED
@@ -820,9 +821,9 @@ export function reportDeferredUnavailable(key: string, err: unknown, call: AdCal
  * STATE name other than `ErrSpawnNotFound`, LAUNCH FAILURE, DIRECTORY).
  * `classification` is the step's answer. Inside a launch or recovery attempt
  * for `key` it arms the persona's retry timer with the UNCLASSIFIED cause
- * through the installed trigger sink (the
- * attempt records it as its last error, so a launch it ends is refused) and
- * reports the outcome once to the installed unclassified sink with the
+ * through the installed trigger sink (the attempt records it as its last
+ * error, so a launch it ends answers `retrying` when the timer was armed)
+ * and reports the outcome once to the installed unclassified sink with the
  * classification; outside one it does nothing. The wrapper's own report of
  * the same value armed and reported nothing (`ErrInvalidFlags` is STATE to
  * the arming predicate), so the outcome is reported once. It starts no
@@ -849,9 +850,9 @@ export function reportUnclassifiedAtSite(
  * for `key` it arms the persona's retry timer with the reuse-collision cause
  * (`UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION`) through the installed trigger
  * sink, and the attempt records it as its last error, so a launch it ends is
- * refused and never counted; outside one it does nothing. It starts no
- * condition, posts nothing and never throws. Answers whether the timer was
- * armed.
+ * never counted and answers `retrying` when the timer was armed; outside one
+ * it does nothing. It starts no condition, posts nothing and never throws.
+ * Answers whether the timer was armed.
  */
 export function reportReuseCollisionAtSite(key: string): boolean {
   return reportAttemptCause(key, { kind: UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION }, 'spawn', deps?.triggerSink)
@@ -866,9 +867,9 @@ export function reportReuseCollisionAtSite(key: string): boolean {
  * recovery attempt for `key` it arms the persona's retry timer with the
  * lost-race cause (`UNAVAILABLE_RETRY_CAUSE_LOST_RACE`) through the
  * installed trigger sink, and the attempt records it as its last error, so
- * a launch it ends is refused and never counted; outside one it does
- * nothing. It starts no condition, posts nothing and never throws. Answers
- * whether the timer was armed.
+ * a launch it ends is never counted and answers `retrying` when the timer
+ * was armed; outside one it does nothing. It starts no condition, posts
+ * nothing and never throws. Answers whether the timer was armed.
  */
 export function reportLostRaceAtSite(key: string): boolean {
   return reportAttemptCause(key, { kind: UNAVAILABLE_RETRY_CAUSE_LOST_RACE }, 'resume', deps?.triggerSink)
@@ -885,8 +886,8 @@ export function reportLostRaceAtSite(key: string): boolean {
  * full mode (another SRJ-301 cause holds). Only inside a launch or recovery
  * attempt for `key`; outside one, or with no sink or none with
  * `armPendingOnly`, it arms nothing. It records no attempt error, so the
- * launch's counted `failed` result is never marked refused. Answers whether
- * the sink was asked to arm. Never throws.
+ * launch's counted `failed` result is never answered as `retrying`. Answers
+ * whether the sink was asked to arm. Never throws.
  */
 export function armPendingOnlyAfterLaunchFailure(key: string): boolean {
   try {
