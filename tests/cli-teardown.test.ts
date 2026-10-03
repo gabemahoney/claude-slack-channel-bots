@@ -7,15 +7,21 @@
  * answer, its state-read verdict over one `status` answer and its
  * per-persona outcome; the kill's mapping from the bounded retry's result to
  * that outcome with its kill-failure alert decision, and its read between
- * tries (b.jg5 SRJ-904, SRJ-702, SRJ-907); and the bounds of the precheck's
- * and the teardown's cost (SRJ-908). The precheck runner, the teardown's tries,
- * poll and kill on the CLI's injected clock and both commands' order are
+ * tries (b.jg5 SRJ-904, SRJ-702, SRJ-907); the teardown's report: each
+ * persona's failure line, its `cli-teardown-failed` entry message, the last
+ * line and the per-persona report plan (lines printed, `server.log` lines and
+ * at most one startup-errors entry; b.jg5 SRJ-907, SRJ-909, SRJ-1013); and the
+ * bounds of the precheck's and the teardown's cost (SRJ-908). The precheck
+ * runner, the teardown's tries, poll and kill on the CLI's injected clock,
+ * both commands' order and where each report line goes are
  * tests/cli.test.ts's.
  *
  * Every agent-director error is built by name with the stub's builders; class
  * labels, finished and live states, notes and launch starts are imported. The
  * SRD's numbers (3 tries, 2 s apart), the config file's name and one line of
- * each builder are pinned once as literals, the forms SRJ-901 states.
+ * each builder are pinned once as literals, the forms SRJ-901 and SRJ-907
+ * state. The kill-failure alert's text and closing sentences come from
+ * `src/kill-failure-alert.ts`'s builders.
  *
  * Each kill outcome is the checked kill's under `TEARDOWN_KILL_OPTIONS`, as the
  * CLI's kill makes it; the GONE cases and a survivor-naming try before one run
@@ -54,6 +60,7 @@ import {
   ERR_SCHEMA_MISMATCH_NAME,
   ERR_SPAWN_NOT_FOUND_NAME,
   ERR_STORE_OPEN_NAME,
+  ERR_TMUX_KILL_FAILED_NAME,
   ERR_TMUX_SESSION_CONFLICT_NAME,
   STORE_OPEN_ERR_NAMES,
 } from '../src/agent-director-errors.ts'
@@ -61,6 +68,7 @@ import {
   AD_CONFIG_FILE_DISPLAY_NAME,
   CLI_COMMAND_CLEAN_RESTART,
   CLI_COMMAND_STOP_BOTS,
+  CLI_TEARDOWN_FAILED_LABEL,
   PRECHECK_CALL_GET,
   PRECHECK_CALL_READ_PANE,
   PRECHECK_TRIES,
@@ -85,14 +93,17 @@ import {
   TEARDOWN_STEP_PAUSE,
   TEARDOWN_STEP_POLL,
   TEARDOWN_STEP_STATE_READ,
+  TEARDOWN_STEP_UNEXPECTED,
   TEARDOWN_STOPPED_ALREADY_FINISHED,
   TEARDOWN_STOPPED_EXITED,
   TEARDOWN_STOPPED_KILLED,
   TEARDOWN_STOPPED_NO_ROW,
+  cliTeardownFailedEntryText,
   exitTimeoutMsOf,
   onlyServerStoppedLine,
   pauseVerdictAfterLastTry,
   pauseVerdictOf,
+  personaTeardownReportOf,
   precheckBoundMs,
   precheckFailureLine,
   precheckNothingStoppedLine,
@@ -101,10 +112,15 @@ import {
   teardownBoundMs,
   teardownErrorReportOf,
   teardownFailed,
+  teardownFailureLine,
   teardownKillOutcomeOf,
   teardownKillReadIsConfig,
   teardownKillReadOf,
+  teardownNotStoppedLine,
+  teardownRejectedOutcomeOf,
   teardownStopped,
+  type CliTeardownCommand,
+  type CliTeardownPersona,
   type PauseVerdict,
   type PersonaTeardownOutcome,
   type PrecheckCall,
@@ -113,6 +129,7 @@ import {
   type StateReadVerdict,
   type TeardownErrorReport,
   type TeardownKillReport,
+  type TeardownStoppedReason,
 } from '../src/cli-teardown.ts'
 import {
   KILL_OUTCOME_NOT_KILLED,
@@ -152,12 +169,29 @@ import {
   type KillRetryRead,
   type KillRetryResult,
 } from '../src/kill-retry.ts'
+import {
+  KILL_FAILURE_CLOSING_CLI_TEARDOWN,
+  KILL_FAILURE_ORDINARY_CLI_TEARDOWN_CLOSING,
+  KILL_FAILURE_SURVIVOR_CLI_TEARDOWN_CLOSING,
+  KILL_FAILURE_VERSION_ORDINARY,
+  KILL_FAILURE_VERSION_SURVIVOR,
+  PERSONA_KILL_FAILED_LABEL,
+  PERSONA_KILL_SURVIVOR_LABEL,
+  killFailureAlertEntryText,
+  killFailureAlertText,
+  killFailureCliTeardownEntryContext,
+  type KillFailureAlertContent,
+  type KillFailureOrdinaryQuotes,
+} from '../src/kill-failure-alert.ts'
 import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_LIVE_STATES, AGENT_DIRECTOR_PENDING_STATE } from '../src/liveness-reading.ts'
+import { personaInstanceId, personaKey, personaTmuxSessionName, renderPersonaRef } from '../src/persona-identity.ts'
 import {
   CONFLICT_CASES,
+  KILL_FAILED_DESCRIPTIONS,
   SAMPLE_LAUNCH_START_DEFAULT,
   SAMPLE_LAUNCH_START_NONE,
   STUB_INSTANCE_ID,
+  STUB_SURVIVOR_PIDS,
   STUB_TMUX_SOCKET_PATH,
   UNAVAILABLE_FORMS,
   UNUSABLE_NAME_FAULTS,
@@ -528,7 +562,7 @@ describe('the teardown\'s per-persona outcome and its error report (b.jg5 SRJ-90
       expect(teardownStopped(reason)).toEqual({ kind: TEARDOWN_OUTCOME_STOPPED, reason })
     }
     const report = teardownErrorReportOf(errConfigMalformed())
-    for (const step of [TEARDOWN_STEP_STATE_READ, TEARDOWN_STEP_PAUSE, TEARDOWN_STEP_POLL, TEARDOWN_STEP_KILL] as const) {
+    for (const step of [TEARDOWN_STEP_STATE_READ, TEARDOWN_STEP_PAUSE, TEARDOWN_STEP_POLL, TEARDOWN_STEP_KILL, TEARDOWN_STEP_UNEXPECTED] as const) {
       expect(teardownFailed(step, { ...report, extra: 'not copied' } as TeardownErrorReport)).toEqual({ kind: TEARDOWN_OUTCOME_FAILED, step, ...report })
     }
   })
@@ -866,6 +900,284 @@ describe('teardownKillReadOf and teardownKillReadIsConfig: the read between kill
     ['a latching read', { kind: KILL_RETRY_READ_LATCHED }],
   ])('%s is no CONFIG read', (_label, read) => {
     expect(teardownKillReadIsConfig(read)).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The teardown's report (b.jg5 SRJ-907, SRJ-909, SRJ-1013, SRJ-1007; hatch A3)
+// ---------------------------------------------------------------------------
+
+/** Both teardown commands. */
+const REPORT_COMMANDS: CliTeardownCommand[] = [CLI_COMMAND_STOP_BOTS, CLI_COMMAND_CLEAN_RESTART]
+
+/** The persona every report below is for: its name differs from its key. */
+const REPORT_PERSONA: CliTeardownPersona = { name: 'Ops Bot', key: personaKey('Ops Bot') }
+
+/** Each row of `rows` for each command: `[command, ...row]`. */
+function forEachReportCommand<R extends readonly unknown[]>(rows: ReadonlyArray<R>): Array<[CliTeardownCommand, ...R]> {
+  return REPORT_COMMANDS.flatMap((command) => rows.map((row): [CliTeardownCommand, ...R] => [command, ...row]))
+}
+
+/**
+ * The kill-failure alert line a CLI teardown under `command` gives for
+ * `content` (b.jg5 SRJ-704, SRJ-1007, SRJ-909): E20's log-line and entry form
+ * with the persona's reference and the CLI teardown's context naming the
+ * command, the text unescaped with the CLI closing sentence.
+ */
+function cliAlertLine(command: CliTeardownCommand, content: KillFailureAlertContent): string {
+  return killFailureAlertEntryText(
+    `persona ${renderPersonaRef(REPORT_PERSONA.name, REPORT_PERSONA.key)}`,
+    killFailureCliTeardownEntryContext(command),
+    killFailureAlertText(content, KILL_FAILURE_CLOSING_CLI_TEARDOWN, false),
+  )
+}
+
+/** The ordinary version's alert line for the report persona quoting `quotes`; it ends with the ordinary CLI closing sentence. */
+function ordinaryAlertLine(command: CliTeardownCommand, quotes: KillFailureOrdinaryQuotes): string {
+  const line = cliAlertLine(command, {
+    version: KILL_FAILURE_VERSION_ORDINARY,
+    session: personaTmuxSessionName(REPORT_PERSONA.key),
+    instanceId: personaInstanceId(REPORT_PERSONA.key),
+    quotes,
+  })
+  expect(line.endsWith(KILL_FAILURE_ORDINARY_CLI_TEARDOWN_CLOSING)).toBe(true)
+  return line
+}
+
+/** The survivor version's alert line for the report persona quoting `description`; it ends with the survivor CLI closing sentence. */
+function survivorAlertLine(command: CliTeardownCommand, description: string): string {
+  const line = cliAlertLine(command, {
+    version: KILL_FAILURE_VERSION_SURVIVOR,
+    session: personaTmuxSessionName(REPORT_PERSONA.key),
+    survivorDescription: description,
+  })
+  expect(line.endsWith(KILL_FAILURE_SURVIVOR_CLI_TEARDOWN_CLOSING)).toBe(true)
+  return line
+}
+
+/** The failed outcome a kill that threw `value` gives after its tries, carrying `alert`; its class is checked against `errorClass`. */
+function failedKillOutcome(value: unknown, errorClass: AdErrorClass, alert: KillRetryAlert, tries = 1): PersonaTeardownOutcome {
+  const end = tries === KILL_RETRY_TRIES ? KILL_RETRY_END_EXHAUSTED : KILL_RETRY_END_SETTLED
+  const outcome = teardownKillOutcomeOf({ result: retryResult(thrownOutcome(value), end, tries, tries - 1, alert) })
+  if (outcome.kind !== TEARDOWN_OUTCOME_FAILED) throw new Error('precondition: a failed kill outcome')
+  expect(outcome.errorClass).toBe(errorClass)
+  return outcome
+}
+
+/** The raw `ErrTmuxKillFailed` description a kill answering `value` stands on. */
+function killFailedDescriptionOf(value: unknown): string {
+  const outcome = thrownOutcome(value)
+  if (outcome.kind !== KILL_OUTCOME_NOT_KILLED || outcome.errorClass !== AD_ERROR_CLASS_UNAVAILABLE || outcome.killFailedDescription === undefined) {
+    throw new Error('precondition: an ErrTmuxKillFailed keeps its description')
+  }
+  return outcome.killFailedDescription
+}
+
+describe('the failure line, the cli-teardown-failed entry message and the last line (b.jg5 SRJ-907, SRJ-1013)', () => {
+  test.each(forEachReportCommand<[number]>([[1], [2]]))('%s: SRJ-907\'s forms, exactly (pinned once), with no [slack] prefix: the failure line, and the last line for a count of %p', (command, count) => {
+    const persona: CliTeardownPersona = { name: 'Ops Bot', key: 'ops_bot' }
+    expect(teardownFailureLine(command, persona, { errorClass: AD_ERROR_CLASS_CONFLICT, description: 'what agent-director said' })).toBe(
+      `${command}: could not stop persona "Ops Bot" (key=ops_bot), session "slack_bot_ops_bot": CONFLICT: what agent-director said`,
+    )
+    expect(teardownNotStoppedLine(command, count)).toBe(
+      `${command}: could not stop ${count} persona(s); rows are never deleted, so running the command again is safe`,
+    )
+  })
+
+  /** A failure the line reports: its label, its builder and the class the classifier gives it. */
+  const LINE_ROWS: ReadonlyArray<readonly [string, () => unknown, AdErrorClass, names: readonly string[]]> = [
+    ['a CONFLICT', () => errTmuxSessionConflict(KILL_VERB, 'not-this-launch', personaTmuxSessionName(REPORT_PERSONA.key)), AD_ERROR_CLASS_CONFLICT, []],
+    ['a CONFIG', () => errConfigMalformed(), AD_ERROR_CLASS_CONFIG, [AD_CONFIG_FILE_DISPLAY_NAME]],
+    [`a store name (${ERR_SCHEMA_MISMATCH_NAME})`, () => errSchemaMismatch(), AD_ERROR_CLASS_UNCLASSIFIED, [ERR_SCHEMA_MISMATCH_NAME]],
+    ...STORE_OPEN_ERR_NAMES.filter((name) => name !== ERR_SCHEMA_MISMATCH_NAME)
+      .map((name) => [`a store name (${name})`, () => errUnknownErrorName(name), AD_ERROR_CLASS_UNCLASSIFIED, [name]] as const),
+  ]
+
+  test.each(forEachReportCommand(LINE_ROWS))('%s: the line for %s holds, in SRJ-907\'s order, the command, the persona, its session, the class and the redacted description; the cli-teardown-failed entry message is that line', (command, _label, make, errorClass, names) => {
+    const value = make()
+    const report = teardownErrorReportOf(value)
+    expectTeardownReport(report, value, errorClass)
+    const line = teardownFailureLine(command, REPORT_PERSONA, report)
+    const pieces = [
+      `${command}: `,
+      renderPersonaRef(REPORT_PERSONA.name, REPORT_PERSONA.key),
+      JSON.stringify(personaTmuxSessionName(REPORT_PERSONA.key)),
+      `: ${errorClass}: `,
+      report.description,
+    ]
+    const at = pieces.map((piece) => line.indexOf(piece))
+    expect(at[0]).toBe(0)
+    expect(at.every((i) => i >= 0)).toBe(true)
+    expect([...at].sort((a, b) => a - b)).toEqual(at)
+    expect(line.endsWith(report.description)).toBe(true)
+    for (const name of names) expect(line).toContain(name)
+    expect(line.includes('\n')).toBe(false)
+    expect(cliTeardownFailedEntryText(command, REPORT_PERSONA, report)).toBe(line)
+    assertNoLeak(line)
+  })
+
+  test.each(REPORT_COMMANDS)('%s: a CONFLICT and an UNCLASSIFIED description carrying fake tokens come out redacted on one line, in the line and the entry message', (command) => {
+    const outputs = [
+      errGeneric(KILL_VERB, ERR_TMUX_SESSION_CONFLICT_NAME, `session refused (${sentinelInMessage('line-conflict')})`),
+      errGeneric(KILL_VERB, 'ErrNoHandlingInCscb', `refused (${sentinelInMessage('line-unclassified')})`),
+    ].flatMap((value) => {
+      const report = teardownErrorReportOf(value)
+      return [teardownFailureLine(command, REPORT_PERSONA, report), cliTeardownFailedEntryText(command, REPORT_PERSONA, report)]
+    })
+    for (const output of outputs) {
+      expect(output).toContain(REDACTED_SENTINEL_TAIL)
+      expect(output.includes('\n')).toBe(false)
+    }
+    assertNoLeak(outputs)
+  })
+})
+
+describe('teardownRejectedOutcomeOf: a persona\'s teardown that rejected fails it (the CLI waits for every persona to settle)', () => {
+  test.each<[string, () => unknown]>([
+    ['a plain Error whose message carries fake tokens', () => new Error(`teardown broke (${sentinelInMessage('rejected')})`)],
+    ['an agent-director error', () => errInternal()],
+    ['a string', () => 'boom'],
+    ['undefined', () => undefined],
+  ])('%s → failed at no known step, reporting the classifier\'s class and the redacted description; never throws', (_label, make) => {
+    const reason = make()
+    const outcome = teardownRejectedOutcomeOf(reason)
+    expect(outcome).toEqual(teardownFailed(TEARDOWN_STEP_UNEXPECTED, teardownErrorReportOf(reason)))
+    expect(outcome.description.includes('\n')).toBe(false)
+    assertNoLeak(outcome)
+  })
+})
+
+describe('personaTeardownReportOf: each persona\'s report plan (b.jg5 SRJ-907, SRJ-909, SRJ-1013, SRJ-1007)', () => {
+  const STOPPED_REASONS: readonly TeardownStoppedReason[] = [TEARDOWN_STOPPED_NO_ROW, TEARDOWN_STOPPED_ALREADY_FINISHED, TEARDOWN_STOPPED_EXITED, TEARDOWN_STOPPED_KILLED]
+
+  test.each(forEachReportCommand<[string, () => PersonaTeardownOutcome]>([
+    ...STOPPED_REASONS.map((reason) => [`stopped (${reason})`, () => teardownStopped(reason)] as [string, () => PersonaTeardownOutcome]),
+    ...SUCCESS_RESULTS.map(([label, make]) => [`stopped by a kill ending in ${label}, no alert`, () => teardownKillOutcomeOf({ result: make() })] as [string, () => PersonaTeardownOutcome]),
+  ]))('%s: %s → nothing printed, logged or recorded; not failed', (command, _label, make) => {
+    expect(personaTeardownReportOf(command, REPORT_PERSONA, make())).toEqual({ failed: false, printed: [], logged: [] })
+  })
+
+  test.each(forEachReportCommand(SUCCESS_RESULTS))('%s: stopped by a kill ending in %s after a survivor-naming try → no failure line, not failed; the survivor version with the CLI closing sentence printed and logged as one line, and one persona-kill-survivor entry holding it, its context naming the command', (command, _label, make) => {
+    const description = survivorDescription()
+    const outcome = teardownKillOutcomeOf({ result: { ...make(), alert: { kind: KILL_RETRY_ALERT_SURVIVOR, survivorDescription: description } } })
+    const alert = survivorAlertLine(command, description)
+    const report = personaTeardownReportOf(command, REPORT_PERSONA, outcome)
+    expect(report).toEqual({ failed: false, printed: [alert], logged: [alert], entry: { classLabel: PERSONA_KILL_SURVIVOR_LABEL, message: alert } })
+    expect(report.printed.filter((line) => line.startsWith(`${command}: `))).toEqual([])
+    expect(alert).toContain(command)
+    for (const pid of STUB_SURVIVOR_PIDS) expect(alert).toContain(String(pid))
+    assertNoLeak(report)
+  })
+
+  /** A failed kill whose decision is the ordinary version, with the quotes that decision carries. */
+  const ORDINARY_ROWS: ReadonlyArray<readonly [string, () => readonly [PersonaTeardownOutcome, KillFailureOrdinaryQuotes, unknown]]> = [
+    ...KILL_FAILED_DESCRIPTIONS.map((d) => [`ErrTmuxKillFailed (${d}) standing after the tries`, () => {
+      const value = errTmuxKillFailed(undefined, d)
+      const quotes = { lastKillFailedDescription: killFailedDescriptionOf(value) }
+      return [failedKillOutcome(value, AD_ERROR_CLASS_UNAVAILABLE, { kind: KILL_RETRY_ALERT_ORDINARY, ...quotes }, KILL_RETRY_TRIES), quotes, value] as const
+    }] as const),
+    ['ErrTmuxKillFailed naming no survivor standing after a survivor-naming try (both quoted)', () => {
+      const value = errTmuxKillFailed(undefined, 'outlived-exit-wait')
+      const quotes = { lastKillFailedDescription: killFailedDescriptionOf(value), earlierSurvivorDescription: survivorDescription() }
+      return [failedKillOutcome(value, AD_ERROR_CLASS_UNAVAILABLE, { kind: KILL_RETRY_ALERT_ORDINARY, ...quotes }, KILL_RETRY_TRIES), quotes, value] as const
+    }],
+    ...([
+      ['ErrTmuxUnresponsive', () => errTmuxUnresponsive(KILL_VERB), AD_ERROR_CLASS_UNAVAILABLE, KILL_RETRY_TRIES],
+      ['CONFLICT', () => errTmuxSessionConflict(KILL_VERB, 'not-this-launch'), AD_ERROR_CLASS_CONFLICT, 2],
+      ['GONE (ErrTmuxSendKeys)', () => errTmuxSendKeys(), AD_ERROR_CLASS_GONE, 2],
+      ['UNCLASSIFIED (a plain ErrInternal)', () => errInternal(), AD_ERROR_CLASS_UNCLASSIFIED, 2],
+    ] as const).map(([label, make, errorClass, tries]) => [`${label} after a survivor-naming try`, () => {
+      const value = make()
+      const quotes = { earlierSurvivorDescription: survivorDescription() }
+      return [failedKillOutcome(value, errorClass, { kind: KILL_RETRY_ALERT_ORDINARY, ...quotes }, tries), quotes, value] as const
+    }] as const),
+  ]
+
+  test.each(forEachReportCommand(ORDINARY_ROWS))('%s: failed with %s → the failure line, then the ordinary version with the CLI closing sentence, printed and logged as two lines; one persona-kill-failed entry holding the line followed by the alert, its context naming the command', (command, _label, make) => {
+    const [outcome, quotes, value] = make()
+    const line = teardownFailureLine(command, REPORT_PERSONA, teardownErrorReportOf(value))
+    const alert = ordinaryAlertLine(command, quotes)
+    const report = personaTeardownReportOf(command, REPORT_PERSONA, outcome)
+    expect(report).toEqual({
+      failed: true,
+      printed: [line, alert],
+      logged: [line, alert],
+      entry: { classLabel: PERSONA_KILL_FAILED_LABEL, message: `${line} ${alert}` },
+    })
+    expect(alert).toContain(command)
+    assertNoLeak(report)
+  })
+
+  /** A failure no alert follows: its outcome and the value it reports. */
+  const NO_ALERT_ROWS: ReadonlyArray<readonly [string, () => readonly [PersonaTeardownOutcome, unknown]]> = [
+    ['a pause CONFLICT', () => {
+      const value = errTmuxSessionConflict(PAUSE_VERB, 'leftover')
+      return [teardownFailed(TEARDOWN_STEP_PAUSE, teardownErrorReportOf(value)), value] as const
+    }],
+    ['a pause CONFIG', () => {
+      const value = errConfigMalformed()
+      return [teardownFailed(TEARDOWN_STEP_PAUSE, teardownErrorReportOf(value)), value] as const
+    }],
+    ['a state read UNAVAILABLE', () => {
+      const value = errCallTimeout(STATUS_VERB)
+      return [teardownFailed(TEARDOWN_STEP_STATE_READ, teardownErrorReportOf(value)), value] as const
+    }],
+    ['a kill ErrTmuxUnresponsive standing after the tries, with no survivor-naming try', () => {
+      const value = errTmuxUnresponsive(KILL_VERB)
+      return [failedKillOutcome(value, AD_ERROR_CLASS_UNAVAILABLE, { kind: KILL_RETRY_ALERT_NONE }, KILL_RETRY_TRIES), value] as const
+    }],
+    ['a kill CONFLICT with no survivor-naming try', () => {
+      const value = errTmuxSessionConflict(KILL_VERB, 'not-this-launch')
+      return [failedKillOutcome(value, AD_ERROR_CLASS_CONFLICT, { kind: KILL_RETRY_ALERT_NONE }), value] as const
+    }],
+    ['a kill UNUSABLE NAME', () => {
+      const value = errUnusableName()
+      return [failedKillOutcome(value, AD_ERROR_CLASS_UNUSABLE_NAME, { kind: KILL_RETRY_ALERT_NONE }), value] as const
+    }],
+    ['a teardown that rejected', () => {
+      const value = new Error('teardown broke')
+      return [teardownRejectedOutcomeOf(value), value] as const
+    }],
+  ]
+
+  test.each(forEachReportCommand(NO_ALERT_ROWS))('%s: failed with %s → the failure line alone, printed and logged; one cli-teardown-failed entry holding that line', (command, _label, make) => {
+    const [outcome, value] = make()
+    const line = teardownFailureLine(command, REPORT_PERSONA, teardownErrorReportOf(value))
+    const report = personaTeardownReportOf(command, REPORT_PERSONA, outcome)
+    expect(report).toEqual({ failed: true, printed: [line], logged: [line], entry: { classLabel: CLI_TEARDOWN_FAILED_LABEL, message: line } })
+    assertNoLeak(report)
+  })
+
+  test.each(REPORT_COMMANDS)('%s: a version that does not fit the outcome is never reported: a stopped persona given the ordinary decision reports nothing, and a failed one given the survivor decision only its line under cli-teardown-failed', (command) => {
+    const description = survivorDescription()
+    const success = SUCCESS_RESULTS[0]![1]()
+    const stopped = { ...teardownKillOutcomeOf({ result: success }), kill: { ...success, alert: { kind: KILL_RETRY_ALERT_ORDINARY, earlierSurvivorDescription: description } } }
+    expect(personaTeardownReportOf(command, REPORT_PERSONA, stopped as unknown as PersonaTeardownOutcome)).toEqual({ failed: false, printed: [], logged: [] })
+
+    const value = errInternal()
+    const failed = failedKillOutcome(value, AD_ERROR_CLASS_UNCLASSIFIED, { kind: KILL_RETRY_ALERT_NONE })
+    const withSurvivor = { ...failed, kill: { ...(failed.kill as TeardownKillReport), alert: { kind: KILL_RETRY_ALERT_SURVIVOR, survivorDescription: description } } }
+    const line = teardownFailureLine(command, REPORT_PERSONA, teardownErrorReportOf(value))
+    expect(personaTeardownReportOf(command, REPORT_PERSONA, withSurvivor as unknown as PersonaTeardownOutcome)).toEqual({
+      failed: true, printed: [line], logged: [line], entry: { classLabel: CLI_TEARDOWN_FAILED_LABEL, message: line },
+    })
+  })
+
+  test.each(REPORT_COMMANDS)('%s: descriptions carrying fake tokens, in the failure line and in both versions\' quotes, come out redacted in every printed line, logged line and entry', (command) => {
+    const killValue = errGeneric(KILL_VERB, ERR_TMUX_KILL_FAILED_NAME, `the kill was refused (${sentinelInMessage('report-last')})`)
+    const survivorWithToken = `${survivorDescription()} (${sentinelInMessage('report-survivor')})`
+    const failed = personaTeardownReportOf(command, REPORT_PERSONA, failedKillOutcome(killValue, AD_ERROR_CLASS_UNAVAILABLE, {
+      kind: KILL_RETRY_ALERT_ORDINARY, lastKillFailedDescription: killFailedDescriptionOf(killValue), earlierSurvivorDescription: survivorWithToken,
+    }, KILL_RETRY_TRIES))
+    const survivor = personaTeardownReportOf(command, REPORT_PERSONA, teardownKillOutcomeOf({
+      result: { ...SUCCESS_RESULTS[0]![1](), alert: { kind: KILL_RETRY_ALERT_SURVIVOR, survivorDescription: survivorWithToken } },
+    }))
+    expect([failed.printed.length, survivor.printed.length]).toEqual([2, 1])
+    for (const text of [...failed.printed, ...failed.logged, failed.entry!.message, ...survivor.printed, ...survivor.logged, survivor.entry!.message]) {
+      expect(text).toContain(REDACTED_SENTINEL_TAIL)
+      expect(text.includes('\n')).toBe(false)
+    }
+    assertNoLeak({ failed, survivor })
   })
 })
 

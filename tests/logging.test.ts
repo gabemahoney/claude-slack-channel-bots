@@ -1,14 +1,17 @@
 /**
- * logging.test.ts — Tests for initLogging() in src/logging.ts.
+ * logging.test.ts — Tests for initLogging() and appendLogLine() in
+ * src/logging.ts: the console redirect, the one-line append to a named log
+ * file (the CLI's `server.log` lines, b.jg5 SRJ-909) and the rotation both
+ * share (`CSCB_LOG_MAX_BYTES`, `CSCB_LOG_KEEP`).
  *
  * SPDX-License-Identifier: MIT
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { mkdtempSync, mkdirSync, symlinkSync, unlinkSync, readFileSync, existsSync, statSync, rmSync, closeSync, openSync } from 'fs'
+import { mkdtempSync, mkdirSync, symlinkSync, unlinkSync, readFileSync, existsSync, statSync, rmSync, closeSync, openSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { initLogging } from '../src/logging.ts'
+import { appendLogLine, initLogging } from '../src/logging.ts'
 
 // ---------------------------------------------------------------------------
 // Test isolation
@@ -541,5 +544,131 @@ describe('initLogging — reopen recovery after a failed post-rotation open', ()
     console.log('single healthy write')
     const lines = readLines().filter(l => l.includes('single healthy write'))
     expect(lines).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// appendLogLine — one line to a named log file (b.jg5 SRJ-909)
+// ---------------------------------------------------------------------------
+
+describe('appendLogLine — one line in the log form, through the shared rotation', () => {
+  /** A fixed line time, in milliseconds since the epoch. */
+  const AT = Date.UTC(2026, 0, 2, 3, 4, 5, 678)
+  /** The rotation threshold and generation count the rotation cases set. */
+  const MAX_BYTES = 64
+  const KEEP = 3
+
+  /** The line `appendLogLine` writes for `text` at `at`: the log form, newline-terminated. */
+  const expectedLine = (text: string, at: number): string => `[${new Date(at).toISOString()}] ${text}\n`
+
+  /** Set the rotation environment (restored by the file's afterEach). */
+  function setRotation(maxBytes: number, keep: number): void {
+    process.env['CSCB_LOG_MAX_BYTES'] = String(maxBytes)
+    process.env['CSCB_LOG_KEEP'] = String(keep)
+  }
+
+  test('one call creates the missing file and appends exactly one line, [<ISO time of at>] <text>; a second call appends a second line', () => {
+    expect(appendLogLine(logFile, 'first appended line', AT)).toEqual({ written: true })
+    expect(readFileSync(logFile, 'utf-8')).toBe(expectedLine('first appended line', AT))
+
+    expect(appendLogLine(logFile, 'second appended line', AT + 1)).toEqual({ written: true })
+    expect(readFileSync(logFile, 'utf-8')).toBe(expectedLine('first appended line', AT) + expectedLine('second appended line', AT + 1))
+  })
+
+  test('with no time given, the line carries the current time', () => {
+    const before = Date.now()
+    appendLogLine(logFile, 'timed now')
+    const after = Date.now()
+
+    const [line] = readLines()
+    expect(ISO_TIMESTAMP_RE.test(line!)).toBe(true)
+    const at = new Date(line!.slice(1, line!.indexOf(']'))).getTime()
+    expect(at).toBeGreaterThanOrEqual(before)
+    expect(at).toBeLessThanOrEqual(after)
+  })
+
+  test('every line break in the text (\\n, \\r\\n, \\r) becomes a space: the text stays one line', () => {
+    appendLogLine(logFile, 'one\ntwo\r\nthree\rfour', AT)
+
+    expect(readFileSync(logFile, 'utf-8')).toBe(expectedLine('one two three four', AT))
+  })
+
+  test('a file at the threshold is rotated to .1 first; the active file then holds the new line alone', () => {
+    setRotation(MAX_BYTES, KEEP)
+    const old = 'o'.repeat(MAX_BYTES)
+    writeFileSync(logFile, old)
+
+    expect(appendLogLine(logFile, 'after rotation', AT)).toEqual({ written: true })
+    expect(readFileSync(`${logFile}.1`, 'utf-8')).toBe(old)
+    expect(readFileSync(logFile, 'utf-8')).toBe(expectedLine('after rotation', AT))
+  })
+
+  test('a file one byte under the threshold is not rotated', () => {
+    setRotation(MAX_BYTES, KEEP)
+    const old = 'u'.repeat(MAX_BYTES - 1)
+    writeFileSync(logFile, old)
+
+    appendLogLine(logFile, 'no rotation', AT)
+    expect(existsSync(`${logFile}.1`)).toBe(false)
+    expect(readFileSync(logFile, 'utf-8')).toBe(old + expectedLine('no rotation', AT))
+  })
+
+  test('rotation keeps the configured generations: each shifts down one, the oldest is dropped', () => {
+    setRotation(MAX_BYTES, KEEP)
+    const generations = Array.from({ length: KEEP }, (_, i) => `generation ${i + 1}`)
+    generations.forEach((content, i) => writeFileSync(`${logFile}.${i + 1}`, content))
+    const active = 'a'.repeat(MAX_BYTES)
+    writeFileSync(logFile, active)
+
+    appendLogLine(logFile, 'after shift', AT)
+
+    expect(Array.from({ length: KEEP }, (_, i) => readFileSync(`${logFile}.${i + 1}`, 'utf-8'))).toEqual([active, ...generations.slice(0, KEEP - 1)])
+    expect(existsSync(`${logFile}.${KEEP + 1}`)).toBe(false)
+    expect(readFileSync(logFile, 'utf-8')).toBe(expectedLine('after shift', AT))
+  })
+
+  test('with no generation kept, a file at the threshold is replaced: no .1, the new line alone', () => {
+    setRotation(MAX_BYTES, 0)
+    writeFileSync(logFile, 'z'.repeat(MAX_BYTES))
+
+    appendLogLine(logFile, 'kept nothing', AT)
+    expect(existsSync(`${logFile}.1`)).toBe(false)
+    expect(readFileSync(logFile, 'utf-8')).toBe(expectedLine('kept nothing', AT))
+  })
+
+  test('an active console redirect to another file is unaffected: its lines stay in its file, the appended line in the named one', () => {
+    setRotation(MAX_BYTES, KEEP)
+    const consoleFile = join(tempDir, 'console.log')
+    initLogging(consoleFile)
+    console.log('before the append')
+    writeFileSync(logFile, 'r'.repeat(MAX_BYTES))
+
+    appendLogLine(logFile, 'appended elsewhere', AT)
+    console.log('after the append')
+
+    const consoleLines = readFileSync(consoleFile, 'utf-8').split('\n').filter((l) => l.length > 0)
+    expect(consoleLines.map((l) => l.slice(l.indexOf('] ') + 2))).toEqual(['before the append', 'after the append'])
+    expect(existsSync(`${consoleFile}.1`)).toBe(false)
+    expect(readFileSync(logFile, 'utf-8')).toBe(expectedLine('appended elsewhere', AT))
+  })
+
+  test.each<[string, () => string]>([
+    ['a path under a regular file', () => {
+      const file = join(tempDir, 'not-a-dir')
+      writeFileSync(file, '')
+      return join(file, 'server.log')
+    }],
+    ['a directory', () => {
+      const dir = join(tempDir, 'a-dir')
+      mkdirSync(dir)
+      return dir
+    }],
+  ])('a write that fails (%s) does not throw: it answers written false with the error', (_label, pathOf) => {
+    const path = pathOf()
+    let result: ReturnType<typeof appendLogLine> | undefined
+    expect(() => { result = appendLogLine(path, 'never written', AT) }).not.toThrow()
+
+    expect(result!.written).toBe(false)
+    expect(result!.written === false ? result!.error : undefined).toBeInstanceOf(Error)
   })
 })

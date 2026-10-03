@@ -210,6 +210,9 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
     `stop --stop-bots` printed `only the server was stopped` and exited 1?
     The installed agent-director is too old for the client. See
     [The two CLI commands on an old binary](#the-two-cli-commands-on-an-old-binary).
+    Printed `could not stop persona` and exited 1? The server is stopped
+    and that persona could not be. See
+    [`stop --stop-bots` or `clean_restart` could not stop a persona](#stop---stop-bots-or-clean_restart-could-not-stop-a-persona).
 
 ---
 
@@ -248,9 +251,13 @@ ls -l "$STATE"/server.log*
   it is not quoted, not joined onto one line and gets no `…` mark. An error
   reading or parsing a credentials file is never quoted: its line states a
   fixed cause instead. The
-  `stop --stop-bots` lines `agent-director initialization failed:` and
-  `bot teardown failed:` print the startup gate's or the teardown's own
-  message in full, on the terminal only. The `precheck failed for persona`
+  `stop --stop-bots` line `agent-director initialization failed:` prints
+  the startup gate's own message in full, on the terminal only. The
+  `could not stop persona` lines of `stop --stop-bots` and `clean_restart`
+  show agent-director's error name and description in the same redacted
+  one-line form, and are also written to `server.log` and
+  `startup-errors.log` (see
+  [`stop --stop-bots` or `clean_restart` could not stop a persona](#stop---stop-bots-or-clean_restart-could-not-stop-a-persona)). The `precheck failed for persona`
   lines of `stop --stop-bots` and `clean_restart` show agent-director's
   error name and its description in the redacted one-line form above, on
   the terminal (and in `clean_restart.log` for `clean_restart`); neither
@@ -266,7 +273,15 @@ ls -l "$STATE"/server.log*
   and `persona-unclassified-error`, the *Unclassified agent-director error*
   notice of a persona no longer in the applied configuration (see
   **agent-director returns an error the server can't classify** under
-  [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own)).
+  [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own)),
+  the kill-failure notices with no Slack destination (`persona-kill-failed`,
+  `persona-kill-survivor`; see
+  [A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice))
+  and the notices raised during a persona teardown
+  (`persona-teardown-notice`). `stop --stop-bots` and `clean_restart` write
+  `cli-teardown-failed`, `persona-kill-failed` and `persona-kill-survivor`
+  entries while the server is stopped (see
+  [`stop --stop-bots` or `clean_restart` could not stop a persona](#stop---stop-bots-or-clean_restart-could-not-stop-a-persona)).
   Each entry is also a line in `server.log`. The persona diagnostic classes
   below never go there, and no configuration or last-applied record refusal
   either.
@@ -2077,6 +2092,17 @@ destination:
   last sentences as above. Nothing is held. The persona's row is kept either
   way (see
   [A notice raised during a teardown](#a-notice-raised-during-a-teardown)).
+- The force-kill of `stop --stop-bots` or `clean_restart`: nothing is
+  posted. The command prints the text, appends it to `server.log` and
+  records it in `startup-errors.log`, led by
+  `persona "<name>" (key=<key>) (CLI teardown, <command>): `. A *Kill
+  failed* text follows the persona's `could not stop persona` line, and the
+  two make one `persona-kill-failed` entry; it ends `The CLI does not retry
+  this kill: once the worker is ended, run the command again.` A *Process
+  outlived kill* text is one `persona-kill-survivor` entry, the persona
+  counts as stopped, and it ends `This persona's teardown has finished;
+  nothing in CSCB checks this process again.` (see
+  [`stop --stop-bots` or `clean_restart` could not stop a persona](#stop---stop-bots-or-clean_restart-could-not-stop-a-persona)).
 - A kill whose tries were stopped (the persona was removed, torn down or
   stopped being up, the server is stopping, or the check of agent-director's
   version stops the server) raises neither notice, during a teardown too:
@@ -2086,9 +2112,9 @@ destination:
 
 | Class | Cause | Fix |
 |---|---|---|
-| `persona-kill-failed` | A *Kill failed* notice for a persona no longer in the applied configuration; or, with no notice text, the `not raised` line of a kill whose tries were stopped for a persona removed during them. | A human checks the worker the entry names, following the "Operator actions" section of agent-director's README. Nothing needs doing for the removed persona itself. |
+| `persona-kill-failed` | A *Kill failed* notice for a persona no longer in the applied configuration; a `could not stop persona` line of `stop --stop-bots` or `clean_restart` followed by the *Kill failed* text (context `CLI teardown, <command>`); or, with no notice text, the `not raised` line of a kill whose tries were stopped for a persona removed during them. | A human checks the worker the entry names, following the "Operator actions" section of agent-director's README. Nothing needs doing for the removed persona itself. |
 | `persona-teardown-notice` | A notice raised for a persona while a confirmed change tore it down (a removed persona, or the old half of a destructive change), whether or not the persona is still in the configuration: here, a *Kill failed* notice. The row is kept. | As for `persona-kill-failed`; see [A notice raised during a teardown](#a-notice-raised-during-a-teardown). |
-| `persona-kill-survivor` | A *Process outlived kill* notice with no Slack destination: a persona no longer in the applied configuration, a persona being torn down by a confirmed change, or the clean-up's kill at a start. | A human deals with the process the entry names by pid, following "Operator actions". |
+| `persona-kill-survivor` | A *Process outlived kill* notice with no Slack destination: a persona no longer in the applied configuration, a persona being torn down by a confirmed change, the clean-up's kill at a start, or the force-kill of `stop --stop-bots` or `clean_restart` (context `CLI teardown, <command>`; the persona counts as stopped). | A human deals with the process the entry names by pid, following "Operator actions". |
 | `orphan-cleanup` carrying `; kill-failure alert:` | A start's clean-up could not end an old instance after its tries. Its row is kept. | As for `persona-kill-failed`. The next start's clean-up tries the kill again. |
 
 **The fix is a human's.** A human follows the "Operator actions" section
@@ -2999,7 +3025,8 @@ grep -h -E '(kill try [0-9]+ of [0-9]+|status read before kill try [0-9]+|kill t
 ```
 
 `<site>` is `killSession (restart adapter)`, `spawnForPersona` or
-`reconcileOrphans`; `<outcome>` says how the try went, as in the
+`reconcileOrphans`, or `teardownBots: persona "<name>" (key=<key>)` for the
+force-kill of `stop --stop-bots` and `clean_restart`; `<outcome>` says how the try went, as in the
 `killSession (restart adapter): kill for persona=<key>` line above.
 
 | Line | Meaning | What to do |
@@ -3019,12 +3046,33 @@ grep -h -E '(kill try [0-9]+ of [0-9]+|status read before kill try [0-9]+|kill t
 | `[slack] <site>: kill tries for <id> ended (<end>) after <n> kill(s) and <m> read(s): <outcome> — alert=<none\|survivor\|ordinary> (b.jg5 SRJ-702)` | The summary of a kill that took more than one call, or whose tries met agent-director's report that it couldn't stop the session. `<outcome>` is the result that stands. `alert=` records which kind of human alert the tries call for: `survivor` (the kill ended as a success, but an earlier try named a surviving process: a *Process outlived kill* notice) or `ordinary` (agent-director couldn't stop the session: a *Kill failed* notice), or `none`. The notice, or the entry or line that stands in for it, comes after this line. | Nothing for `none`. Otherwise see [A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice); the tries' lines above it for `<id>` quote agent-director's answer. |
 | `[slack] reconcileOrphans: the status read between kill tries for instanceId=<id> answered CONFIG; the row names no persona of the applied configuration, so no outage is raised — logged only (b.jg5 SRJ-110, SRJ-316)` | At a start, agent-director refused its config file while the server was reading a leftover instance (a removed persona's, or one from before personas) between its kill's tries. No persona's notice is raised for it. | See **agent-director refuses its config file** above. |
 
+
+**In `stop --stop-bots` and `clean_restart`.** Their force-kill writes the
+same try, read and end lines with the prefix
+`[slack] teardownBots: persona "<name>" (key=<key>)`, on the terminal for
+`stop --stop-bots` and in `clean_restart.log` for `clean_restart`, never in
+`server.log`. Only `class=UNAVAILABLE` is tried again; a GONE answer is not
+tried again and fails the persona. A read between tries latches nothing:
+one that fails lets the try go ahead, and a CONFIG answer ends the tries
+(`the row was last read pending: no further kill …`, or
+`kill tries for cscb_<key> stop before try <n>: the caller's keep-going check answered false`)
+and fails the persona as CONFIG. The `ended (<end>) … alert=<…>` line's
+`alert=` value says which notice text the command prints for the persona
+(see
+[`stop --stop-bots` or `clean_restart` could not stop a persona](#stop---stop-bots-or-clean_restart-could-not-stop-a-persona)).
+
 ---
 
 ## Other lines you may see
 
 | Line | Meaning |
 |---|---|
+| `[slack] teardownBots: no spawn row for persona "<name>" (key=<key>) — skipping`, `[slack] teardownBots: persona "<name>" (key=<key>) already terminal (state=<state>) — skipping` | `stop --stop-bots` or `clean_restart` found no instance for the persona, or a finished one: it counts as stopped. On the terminal for `stop --stop-bots`, in `clean_restart.log` for `clean_restart`. Nothing. |
+| `[slack] teardownBots: pause failed for persona "<name>" (key=<key>) — escalating to kill: <description>` | The pause was refused for a reason that leads on to the force-kill (the session already gone, the bot still launching, a pause timeout, agent-director not answering after 3 tries, or an answer the teardown gives no other meaning). Nothing: the force-kill's lines follow. |
+| `[slack] teardownBots: persona "<name>" (key=<key>) exited cleanly in <ms>ms`, `[slack] teardownBots: persona "<name>" (key=<key>) force-killed after <ms>ms` | The persona was stopped, after its pause or by the force-kill at `exit_timeout`. Nothing. |
+| `[slack] teardownBots: kill failed for persona "<name>" (key=<key>): <description>` | The force-kill at `exit_timeout` did not stop the persona; its `could not stop persona` line follows once every persona has finished. See [`stop --stop-bots` or `clean_restart` could not stop a persona](#stop---stop-bots-or-clean_restart-could-not-stop-a-persona). |
+| `[slack] <command>: could not append a line to server.log: <error>` | `stop --stop-bots` or `clean_restart` could not append one of its report lines to `server.log` (for example, the state directory isn't writable). For `stop --stop-bots` the line is on the terminal; for `clean_restart` it is in `clean_restart.log` only. The print, `startup-errors.log` and the exit status are unchanged. Check the state directory's permissions and free space. |
+| `[<time>] [startup-errors] WARNING: could not write to <path>: <error>` (terminal) | The command could not record one of its entries in `startup-errors.log` at `<path>`. The print, `server.log` and the exit status are unchanged. Check the state directory's permissions and free space. |
 | `[slack] persona "<name>" (key=<key>): up after its bring-up retry (directory\|Slack) — launching` | A retrying persona came up and is launched from its retry. Normal recovery. |
 | `[slack] reconcileOrphans: kill succeeded for orphan instanceId=<id> (<outcome>) — deleting the row` | At a start, the server stopped a leftover instance (a removed persona's, or one with the wrong instance id or working directory) and now removes its row. `<outcome>` says how the kill went (`outcome=killed kill_sent=…`, `outcome=row-gone …`, `outcome=session-gone …`, or `outcome=row-finished read=…` when a read between tries found it already finished; see [A kill that is tried again](#a-kill-that-is-tried-again)). Normal. A kill that did not succeed logs no such line: the row is kept, no delete is attempted, and an `orphan-cleanup` record in `startup-errors.log` reads `kill did not succeed for orphan instanceId=<id> persona=<persona>: <outcome>; row kept, no delete was made, its session may still be running`. That record holds nobody and arms no retries; an `ENVIRONMENT` or `CONFIG` class there also raises the outage of a persona still in the configuration. When agent-director couldn't stop the instance's session after its tries, the record goes on with the *Kill failed* text (`; kill-failure alert: …`), and after a kill that succeeded once an earlier try named a surviving process, a `persona-kill-survivor` entry names the instance; see [A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice). Nothing to do unless it repeats start after start: then check the row with `agent-director get --claude-instance-id <id>` and follow the "Operator actions" section of agent-director's README. |
 | `[slack] reconcileOrphans: kill succeeded for pre-persona row instanceId=<id> (<outcome>) — row kept` | At a start, the server stopped a live instance left over from a build before personas; the row is kept, as such rows always are. A kill that did not succeed records `kill did not succeed for pre-persona row instanceId=<id>: <outcome>; row kept, its session may still be running` in `orphan-cleanup` instead, with the *Kill failed* text after it as for a removed persona's instance (row above). Nothing to do, unless that text or a `persona-kill-survivor` entry is there: then see [A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice). |
@@ -3214,6 +3262,113 @@ one is skipped. When the check fails, the command stops nothing and exits 1.
 A passed check doesn't prove that the session running under a persona's
 name is that persona's own: the teardown that follows acts only on the
 persona's own launch.
+
+## `stop --stop-bots` or `clean_restart` could not stop a persona
+
+After a passed precheck, `stop --stop-bots` and `clean_restart` stop the
+server, then tear every persona down in parallel: pause, wait up to
+`exit_timeout` for the bot to exit, then force-kill. Once every persona's
+teardown has finished, the command reports each persona in configuration
+order.
+
+- **Failure line:** one per persona it could not stop:
+
+  ```
+  <command>: could not stop persona "<name>" (key=<key>), session "slack_bot_<key>": <CLASS>: <description>
+  ```
+
+  `<command>` is `stop --stop-bots` or `clean_restart`. `<description>` is
+  agent-director's error name and its description, redacted and on one line
+  (see [The server log](#the-server-log)); a CONFIG one starts
+  `agent-director refuses its config file ~/.agent-director/config.toml: `.
+  The line has no `[slack]` prefix.
+- ***Kill failed* after it:** when the force-kill failed because
+  agent-director could not end the worker, or failed in any way after an
+  earlier try named a process that outlived the kill, the failure line is
+  followed by the *Kill failed* text, led by
+  `persona "<name>" (key=<key>) (CLI teardown, <command>): ` and ending
+  `The CLI does not retry this kill: once the worker is ended, run the
+  command again.` The worker may still be running.
+- ***Process outlived kill*:** a persona whose force-kill ended as a
+  success after an earlier try named a surviving process counts as stopped.
+  It gets no failure line and is not counted; the *Process outlived kill*
+  text is printed instead, led the same way and ending `This persona's
+  teardown has finished; nothing in CSCB checks this process again.` It
+  changes no exit status, and on `clean_restart` the server is started as
+  usual.
+- **Last line:** when at least one persona could not be stopped, after
+  every persona's lines:
+
+  ```
+  <command>: could not stop <N> persona(s); rows are never deleted, so running the command again is safe
+  ```
+
+  For `clean_restart`,
+  `[slack] clean_restart: bot teardown failed — aborting restart; the server was not started`
+  comes just before it.
+- **Where:** every line is printed on the terminal (stderr) once;
+  `clean_restart` also writes it to `clean_restart.log`. The failure lines
+  and the two notice texts are also appended to `server.log` in the state
+  directory (the server is stopped, so the command writes it, timestamped and
+  rotated as the server does) and recorded in `startup-errors.log`, one entry
+  per persona: `cli-teardown-failed` for a failure line alone,
+  `persona-kill-failed` for a failure line and its *Kill failed* text (both
+  on one line), `persona-kill-survivor` for a *Process outlived kill* text.
+  The last line and the abort line go to neither file. A `server.log` write
+  that fails prints one `[slack] <command>: could not append a line to
+  server.log: …` line (on the terminal for `stop --stop-bots`, in
+  `clean_restart.log` only for `clean_restart`); a `startup-errors.log`
+  write that fails prints `[<time>] [startup-errors] WARNING: could not
+  write to <path>: …` on the terminal (both under
+  [Other lines you may see](#other-lines-you-may-see)). Neither changes the
+  print, the other file or the exit status.
+- **Effect:** the server stays stopped. `stop --stop-bots` exits 1;
+  `clean_restart` exits 1 and does not start the server. Every row is kept.
+  Nothing is posted to Slack, and nothing is held or latched.
+- **Fix:** fix the cause the class names, below. When a *Kill failed* text
+  follows the line, a human deals with the worker by following the
+  "Operator actions" section of agent-director's README; this skill
+  describes no step of it and takes none. Then, with the operator's say-so,
+  run the command again.
+
+| Class | Meaning | Cause | Fix |
+|---|---|---|---|
+| `UNAVAILABLE` | agent-director didn't answer, or couldn't act right now. A read of the instance fails at once; a force-kill fails after 3 tries, 2 s apart, with a read before each further try. | It is unreachable or timed out; or the force-kill could not end the worker (`ErrTmuxKillFailed`, with the *Kill failed* text after the line) or tmux did not answer (`ErrTmuxUnresponsive`); or it gave an error name this agent-director client doesn't recognise. | As under [agent-director can't report a persona's state](#agent-director-cant-report-a-personas-state); a call that keeps timing out may need a longer call timeout ([The call timeout](#the-call-timeout)). For a *Kill failed* text, see [A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice). |
+| `CONFLICT` | agent-director refused the pause or the force-kill because of a tmux session conflict; no further force-kill follows. | A session left over from an earlier launch, or another session, holds the persona's session name. | As under [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice). The command holds nothing. |
+| `UNUSABLE_NAME` | The tmux session name recorded on the persona's row can't be used. | agent-director's store was edited by hand. | As under [A persona posts a Held: unusable tmux session name notice](#a-persona-posts-a-held-unusable-tmux-session-name-notice). The command holds nothing. |
+| `CONFIG` | agent-director refuses its config file, at any step or at the read before a further force-kill. No further force-kill follows. | `~/.agent-director/config.toml` is malformed. | As under **agent-director refuses its config file** in [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own). |
+| `ENVIRONMENT` | tmux can't be used for the persona. | tmux is missing or not usable on the host. | As under **tmux isn't available** in [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own). |
+| `GONE` | The force-kill answered that the persona's tmux session is already gone (`ErrTmuxSendKeys`, `ErrTmuxCaptureFailed`). A force-kill should not give this answer, so the command cannot confirm that the bot stopped. | Not known from the line. | Report the line to the operator as written; take no action on it. The one-line `read-pane` check under [Listing instances](#listing-instances), with its caveats, is read-only. |
+| `UNCLASSIFIED` | An answer the teardown doesn't handle. | An `ErrInternal`; a store agent-director can't open (`ErrSchemaMismatch`, `ErrSchemaMigrationRequired`, `ErrStoreOpen`), never retried; any other error name agent-director reports. | Report the line to the operator as written; take no action on it. |
+| `STATE`, `DIRECTORY`, `LAUNCH_FAILURE` | An answer to the force-kill, or to a read of the instance, that does not fit it. | Not known from the line. | Report the line to the operator as written; take no action on it. |
+
+Only some steps print lines of their own: the force-kill's try, read and
+end lines (under [A kill that is tried again](#a-kill-that-is-tried-again))
+and `[slack] teardownBots: pause failed for persona <ref> — escalating to
+kill: …`. A failure line with no kill lines before it came from the state
+read, the pause or the poll, which print nothing of their own. These lines
+are on the terminal for `stop --stop-bots`, in `clean_restart.log` for
+`clean_restart`.
+
+Read-only checks:
+
+```sh
+STATE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+grep -h -E 'could not stop persona|\(CLI teardown, ' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
+grep -h -E '\[(cli-teardown-failed|persona-kill-failed|persona-kill-survivor)\]' "$STATE"/startup-errors.log
+grep -h -E 'teardownBots|clean_restart' "$STATE"/clean_restart.log | tail -n 60
+agent-director get --claude-instance-id cscb_<key>
+```
+
+`cli-teardown-failed`, the one class only these commands write:
+
+| Class | Cause | Fix |
+|---|---|---|
+| `cli-teardown-failed` | `stop --stop-bots` or `clean_restart` could not stop a persona, and no *Kill failed* text follows its line. The entry is the failure line. | Fix the cause its class names, above, then run the command again. |
+
+The same commands' `persona-kill-failed` and `persona-kill-survivor` entries
+are described under
+[A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice).
 
 ## The server refuses the agent-director binary at start
 

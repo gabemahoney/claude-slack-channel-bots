@@ -37,6 +37,25 @@
  * starts the server. `stop --stop-bots` with an unreadable configuration has
  * no per-persona step: it stops the server and skips the teardown.
  *
+ * Personas are torn down in parallel, and once every persona has settled
+ * each persona's report is written in configuration order (b.jg5 SRJ-907,
+ * SRJ-909; `personaTeardownReportOf`, `src/cli-teardown.ts`): a persona that
+ * could not be stopped gets its failure line, followed by the kill-failure
+ * alert's ordinary version where its outcome's alert decision says so; a
+ * persona stopped after a survivor-naming kill failure gets the alert's
+ * survivor version instead and counts as stopped. Each line is printed
+ * (stderr; for `clean_restart` through its fatal path, so it reaches the
+ * terminal once and `clean_restart.log` once), appended to `server.log` in
+ * the state directory (`appendServerLogLine`), and recorded in
+ * `startup-errors.log` with no copy on the terminal
+ * (`recordStartupErrorEntry`): `persona-kill-failed`, `cli-teardown-failed`
+ * or `persona-kill-survivor`. Both writes are best effort and change no exit
+ * status. When any persona failed, the command ends with the last line
+ * (`teardownNotStoppedLine`), printed only. `stop --stop-bots` then exits 1,
+ * and otherwise with the server stop's code; `clean_restart` with a failed
+ * persona aborts without a start and exits 1. Nothing is posted to Slack and
+ * nothing latches (b.jg5 SRJ-1002).
+ *
  * `clean_restart`'s initialization runs the whole startup gate, CSCB's
  * Phase 1 floor included, and any failure of it stops nothing (b.jg5
  * SRJ-203). `stop --stop-bots`'s initialization leaves the floor out, so the
@@ -77,7 +96,8 @@ import {
   type PersonaConfig,
 } from './config.ts'
 import { readAppliedPersonaConfig, reloadFilePaths } from './reload.ts'
-import { initLogging } from './logging.ts'
+import { appendLogLine, initLogging, type AppendLogLineResult } from './logging.ts'
+import { recordStartupError } from './startup-errors.ts'
 import { ERR_SPAWN_NOT_FOUND_NAME } from './agent-director-errors.ts'
 import { hasAdErrorName } from './ad-error-class.ts'
 import { checkedKill, type PlainKillParams } from './checked-kill.ts'
@@ -119,6 +139,7 @@ import {
   exitTimeoutMsOf,
   onlyServerStoppedLine,
   pauseVerdictAfterLastTry,
+  personaTeardownReportOf,
   pauseVerdictOf,
   precheckFailureLine,
   precheckNothingStoppedLine,
@@ -128,8 +149,11 @@ import {
   teardownKillOutcomeOf,
   teardownKillReadIsConfig,
   teardownKillReadOf,
+  teardownNotStoppedLine,
+  teardownRejectedOutcomeOf,
   teardownStopped,
   type CliTeardownCommand,
+  type CliTeardownStartupErrorEntry,
   type PauseAnswer,
   type PauseVerdict,
   type PersonaTeardownOutcome,
@@ -337,6 +361,25 @@ export interface CliDeps {
    * (b.jg5 SRJ-110, SRJ-902).
    */
   directorKill: (instanceId: string) => Promise<unknown>
+  /**
+   * Append one line to `server.log` in the state directory, in the server
+   * log's `[<ISO time>] <text>` form at `at` (ms since the epoch, from
+   * `now`), through the shared rotation (`appendLogLine`, `src/logging.ts`,
+   * in production on `resolveServerStateDir()`'s `server.log`). The CLI
+   * writes it while the server is stopped (b.jg5 SRJ-909). Answers whether
+   * the line was written; best effort: a failure (answered or thrown) is
+   * reported in one line and changes no exit status. Writes nothing else.
+   */
+  appendServerLogLine: (line: string, at: number) => AppendLogLineResult
+  /**
+   * Record one `startup-errors.log` entry of `classLabel` with `message` in
+   * the state directory, with no copy on fd 2, since the CLI prints each
+   * line itself (`recordStartupError` with `logDir` the resolved state
+   * directory and `omitStderr`, in production; b.jg5 SRJ-909, SRJ-1013).
+   * Best effort: a throw is reported in one line and changes no exit status.
+   * Writes nothing else: no reload file, no retired-key record.
+   */
+  recordStartupErrorEntry: (classLabel: string, message: string) => void
 }
 
 // ---------------------------------------------------------------------------
@@ -365,28 +408,12 @@ export class StartupGateFailedError extends Error {
 }
 
 /**
- * `teardownBots`' aggregate failure. Its message is CSCB's own (a persona
- * count and the retry advice); each failed persona was already logged with
- * its step, class and redacted description.
- */
-class TeardownIncompleteError extends Error {
-  constructor(rejected: number) {
-    super(
-      `teardownBots: agent-director error — teardown incomplete for ${rejected} persona(s); ` +
-        `other personas may already have been paused or killed; rows are never deleted, safe to retry`,
-    )
-    this.name = 'TeardownIncompleteError'
-  }
-}
-
-/**
  * The tail of a CLI failure line: the message of a failure CSCB authored
- * ({@link StartupGateFailedError}, {@link TeardownIncompleteError}), else
- * `describeThrownValue` of the thrown value (its message only through
- * `redactSlackLogText`).
+ * ({@link StartupGateFailedError}), else `describeThrownValue` of the thrown
+ * value (its message only through `redactSlackLogText`).
  */
 function describeCliFailure(err: unknown): string {
-  if (err instanceof StartupGateFailedError || err instanceof TeardownIncompleteError) return err.message
+  if (err instanceof StartupGateFailedError) return err.message
   return describeThrownValue(err)
 }
 
@@ -490,37 +517,79 @@ export function createCli(deps: CliDeps): CliHandlers {
    * the last-applied record, or the configuration file without one), addressing
    * each persona's instance as `cscb_<key>`; see `teardownPersona`. A config
    * with no personas tears down nothing. Answers the per-persona outcomes in
-   * configuration order when every persona was stopped; when any persona's
-   * teardown failed, logs each failure and throws `TeardownIncompleteError`.
+   * configuration order once every persona's teardown has settled; it never
+   * throws. The caller reports them (`reportTeardown`).
    */
   async function teardownBots(
     personas: readonly Persona[],
     exit_timeout: number,
   ): Promise<readonly PersonaTeardownOutcome[]> {
     // Personas are torn down in parallel; each answers its outcome and never
-    // throws for an agent-director answer. The outcomes are in configuration
-    // order.
-    const outcomes = await Promise.all(personas.map((persona) => teardownPersona(persona, exit_timeout)))
+    // throws for an agent-director answer. Every persona settles before any
+    // is reported: a teardown that rejects all the same is a failed outcome
+    // (b.qwo: a teardown is never a silent no-op), so no persona is left
+    // un-awaited and none is reported stopped without proof.
+    const settled = await Promise.allSettled(personas.map((persona) => teardownPersona(persona, exit_timeout)))
+    return settled.map((result) => (result.status === 'fulfilled' ? result.value : teardownRejectedOutcomeOf(result.reason)))
+  }
 
-    // b.qwo: a teardown is never a silent no-op. An agent-director error at
-    // any step (agent-director unreachable at the state read included: the
-    // b.qps root cause) is a failed outcome, never a "no spawn row" skip.
-    // Each failed outcome is logged with its step, class and redacted
-    // description; any failure ends in the aggregate failure, so the caller
-    // exits non-zero and never proceeds to `start`.
+  /**
+   * Report every persona's teardown outcome under `command` (b.jg5 SRJ-907,
+   * SRJ-909), in configuration order, from each persona's report
+   * (`personaTeardownReportOf`, `src/cli-teardown.ts`): its lines through
+   * `print`, its `server.log` lines through `deps.appendServerLogLine` (timed
+   * by `deps.now`), and its `startup-errors.log` entry through
+   * `deps.recordStartupErrorEntry`. Answers the number of personas that
+   * could not be stopped; a persona stopped with the kill-failure alert's
+   * survivor version counts as stopped. When that number is above 0, the
+   * caller ends with the last line (`teardownNotStoppedLine`), printed last
+   * and only printed.
+   *
+   * The writes are best effort: a failed `server.log` or startup-errors write
+   * is reported in one line (`console.error`) and stops neither the other
+   * destination nor the print. Nothing is posted to Slack and nothing
+   * latches (b.jg5 SRJ-1002).
+   */
+  function reportTeardown(
+    command: CliTeardownCommand,
+    personas: readonly Persona[],
+    outcomes: readonly PersonaTeardownOutcome[],
+    print: (line: string) => void,
+  ): number {
     let failed = 0
     outcomes.forEach((outcome, i) => {
-      if (outcome.kind !== TEARDOWN_OUTCOME_FAILED) return
-      failed++
-      const persona = personas[i]
-      console.error(
-        `[slack] teardownBots: agent-director error during teardown of persona ` +
-          `${renderPersonaRef(persona.name, persona.key)}, step ${outcome.step}: ` +
-          `${outcome.errorClass}: ${outcome.description}`,
-      )
+      const report = personaTeardownReportOf(command, personas[i], outcome)
+      for (const line of report.printed) print(line)
+      for (const line of report.logged) appendServerLog(command, line)
+      if (report.entry !== undefined) recordEntry(command, report.entry)
+      if (report.failed) failed++
     })
-    if (failed > 0) throw new TeardownIncompleteError(failed)
-    return outcomes
+    return failed
+  }
+
+  /** One best-effort `server.log` line (b.jg5 SRJ-909): a failure is reported in one line. */
+  function appendServerLog(command: CliTeardownCommand, line: string): void {
+    let failure: { readonly error: unknown } | undefined
+    try {
+      const result = deps.appendServerLogLine(line, deps.now())
+      if (!result.written) failure = { error: result.error }
+    } catch (error) {
+      failure = { error }
+    }
+    if (failure !== undefined) {
+      console.error(`[slack] ${command}: could not append a line to server.log: ${describeThrownValue(failure.error)}`)
+    }
+  }
+
+  /** One best-effort `startup-errors.log` entry (b.jg5 SRJ-909): a failure is reported in one line. */
+  function recordEntry(command: CliTeardownCommand, entry: CliTeardownStartupErrorEntry): void {
+    try {
+      deps.recordStartupErrorEntry(entry.classLabel, entry.message)
+    } catch (error) {
+      console.error(
+        `[slack] ${command}: could not record a ${entry.classLabel} entry in startup-errors.log: ${describeThrownValue(error)}`,
+      )
+    }
   }
 
   /**
@@ -952,13 +1021,18 @@ export function createCli(deps: CliDeps): CliHandlers {
     // Gracefully exit managed bots (only for --stop-bots with a readable
     // configuration). b.qwo: a teardown failure (AD unreachable) is a LOUD
     // failure — exit non-zero rather than swallowing it and reporting a clean
-    // stop.
+    // stop. Each persona's report is printed to stderr, appended to
+    // server.log and recorded in startup-errors.log once every persona has
+    // settled (b.jg5 SRJ-907, SRJ-909); any persona that could not be stopped
+    // exits 1 (b.jg5 SRJ-905). A persona stopped with the kill-failure
+    // alert's survivor version counts as stopped: the survivor text changes
+    // no exit status.
     if (config !== null) {
       console.error('[slack] stop --stop-bots: gracefully exiting managed bots')
-      try {
-        await teardownBots(config.personas, config.exit_timeout)
-      } catch (err) {
-        console.error(`[slack] stop --stop-bots: bot teardown failed: ${describeCliFailure(err)}`)
+      const outcomes = await teardownBots(config.personas, config.exit_timeout)
+      const failed = reportTeardown(CLI_COMMAND_STOP_BOTS, config.personas, outcomes, (line) => console.error(line))
+      if (failed > 0) {
+        console.error(teardownNotStoppedLine(CLI_COMMAND_STOP_BOTS, failed))
         deps.exit(1)
       }
     }
@@ -1167,14 +1241,21 @@ export function createCli(deps: CliDeps): CliHandlers {
 
     // Phase 5: SR-11 Event 12 — per-persona pause/poll/kill teardown via
     // agent-director (shared with `stop --stop-bots`), addressing `cscb_<key>`.
+    // Each persona's report goes through the fatal path (the terminal once
+    // and clean_restart.log), server.log and startup-errors.log once every
+    // persona has settled (b.jg5 SRJ-907, SRJ-909), the survivor text
+    // included on a teardown that succeeded.
     //
-    // b.qwo: teardownBots throws when any persona's teardown failed (AD
-    // unreachable at its state read included). A failed teardown must abort
-    // the restart — never proceed to `start` on top of bots we could not reach.
-    try {
-      await teardownBots(personas, exit_timeout)
-    } catch (err) {
-      fatal('[slack] clean_restart: bot teardown failed — aborting restart:', err)
+    // b.qwo: a failed persona (AD unreachable at its state read included)
+    // aborts the restart — never proceed to `start` on top of bots we could
+    // not reach. The abort line comes before the last line, which is printed
+    // last. A persona stopped with the survivor version counts as stopped and
+    // the start goes ahead.
+    const outcomes = await teardownBots(personas, exit_timeout)
+    const failed = reportTeardown(CLI_COMMAND_CLEAN_RESTART, personas, outcomes, (line) => fatal(line))
+    if (failed > 0) {
+      fatal('[slack] clean_restart: bot teardown failed — aborting restart; the server was not started')
+      fatal(teardownNotStoppedLine(CLI_COMMAND_CLEAN_RESTART, failed))
       deps.exit(1)
     }
 
@@ -1421,6 +1502,12 @@ if (import.meta.main) {
     directorStatus: directorOps.directorStatus,
     directorPause: directorOps.directorPause,
     directorKill: directorOps.directorKill,
+    // b.jg5 SRJ-909: the teardown's server.log lines and startup-errors.log
+    // entries, in the state directory the server uses, the entries with no
+    // copy on fd 2.
+    appendServerLogLine: (line, at) => appendLogLine(join(resolveServerStateDir(), 'server.log'), line, at),
+    recordStartupErrorEntry: (classLabel, message) =>
+      recordStartupError(classLabel, message, undefined, { logDir: resolveServerStateDir(), omitStderr: true }),
   }
 
   const cli = createCli(realDeps)

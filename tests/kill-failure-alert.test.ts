@@ -2,7 +2,9 @@
  * kill-failure-alert.test.ts — the kill-failure alert's texts and its route
  * selection (`src/kill-failure-alert.ts`; b.jg5 SRJ-1007's texts, SRJ-704's
  * routing and survivor class, SRJ-1013's two new classes, SRJ-1001's common
- * rules for a quoted description, SRJ-613's read-pane statement).
+ * rules for a quoted description, SRJ-613's read-pane statement), and the
+ * log-line and entry form, whose CLI-teardown context names the command
+ * (SRJ-909).
  *
  * SRJ-1007's Test line names `tests/live-row-sequence.test.ts` (E21's file),
  * which drives the sequence form; E20 tests every text through the module's
@@ -27,6 +29,7 @@ import { describe, expect, test } from 'bun:test'
 
 import { killFailedDescriptionOf } from '../src/ad-error-class.ts'
 import { NEVER_DELETE_ROW_PHRASE, RETRY_KILL_LATER_PHRASE, survivorPids } from '../src/ad-description-phrases.ts'
+import { CLI_COMMAND_CLEAN_RESTART, CLI_COMMAND_STOP_BOTS, type CliTeardownCommand } from '../src/cli-teardown.ts'
 import {
   KILL_FAILURE_CLOSING_CLI_TEARDOWN,
   KILL_FAILURE_CLOSING_DESTINATION,
@@ -60,10 +63,12 @@ import {
   killFailureAlertContentOf,
   killFailureAlertEntryText,
   killFailureAlertText,
+  killFailureCliTeardownEntryContext,
   killFailureClosingSentence,
   killFailureOrdinaryBody,
   killFailureSurvivorBody,
   killFailureSurvivorPidList,
+  renderKillFailureAlertEntryContext,
   selectKillFailureAlertRoute,
   type KillFailureAlertContent,
   type KillFailureAlertContext,
@@ -149,6 +154,9 @@ const CLOSINGS: readonly KillFailureClosing[] = [
 
 /** Both versions. */
 const VERSIONS: readonly KillFailureAlertVersion[] = [KILL_FAILURE_VERSION_ORDINARY, KILL_FAILURE_VERSION_SURVIVOR]
+
+/** The two commands that run a CLI teardown. */
+const CLI_COMMANDS: readonly CliTeardownCommand[] = [CLI_COMMAND_STOP_BOTS, CLI_COMMAND_CLEAN_RESTART]
 
 /** The ordinary version's closing sentences, every row of its table. */
 const ORDINARY_CLOSINGS: readonly string[] = [
@@ -418,6 +426,34 @@ describe('kill-failure alert: the log-line and startup-errors form (b.jg5 SRJ-10
       const entry = killFailureAlertEntryText(ref, context, text)
 
       expect(entry).toBe(`${ref} (${context}): ${text}`)
+      expect(renderKillFailureAlertEntryContext(context)).toBe(context)
+      assertNoLeak(entry)
+    },
+  )
+
+  // b.jg5 SRJ-909, SRJ-1013: the CLI's `persona-kill-failed` and
+  // `persona-kill-survivor` entries name the command that ran the teardown.
+  test.each(CLI_COMMANDS.flatMap((command) => VERSIONS.map((version) => [command, version] as const)))(
+    'a CLI teardown run by %s, %s version: the context names the command after the CLI-teardown context',
+    (command, version) => {
+      const content: KillFailureAlertContent =
+        version === KILL_FAILURE_VERSION_SURVIVOR
+          ? { version, session: personaTmuxSessionName(KEY), survivorDescription: survivorDescription() }
+          : { version, session: personaTmuxSessionName(KEY), instanceId: personaInstanceId(KEY), quotes: { lastKillFailedDescription: stubDescription('outlived-exit-wait') } }
+      const route = selectKillFailureAlertRoute({ version, context: KILL_FAILURE_CONTEXT_CLI_TEARDOWN, configured: true, latched: false })
+      const text = killFailureAlertText(content, route.closing, false)
+      const context = killFailureCliTeardownEntryContext(command)
+      const ref = `persona=${KEY}`
+      const entry = killFailureAlertEntryText(ref, context, text)
+
+      expect(context).toEqual({ context: KILL_FAILURE_CONTEXT_CLI_TEARDOWN, command })
+      expect(Object.isFrozen(context)).toBe(true)
+      expect(renderKillFailureAlertEntryContext(context)).toBe(`${KILL_FAILURE_CONTEXT_CLI_TEARDOWN}, ${command}`)
+      expect(entry).toBe(`${ref} (${KILL_FAILURE_CONTEXT_CLI_TEARDOWN}, ${command}): ${text}`)
+      expect(entry).not.toBe(killFailureAlertEntryText(ref, KILL_FAILURE_CONTEXT_CLI_TEARDOWN, text))
+      for (const other of CLI_COMMANDS.filter((c) => c !== command)) {
+        expect(entry).not.toBe(killFailureAlertEntryText(ref, killFailureCliTeardownEntryContext(other), text))
+      }
       assertNoLeak(entry)
     },
   )
@@ -552,5 +588,7 @@ describe('kill-failure alert: import boundary', () => {
     expect(loads.modules.has('ad-description-phrases.ts')).toBe(true)
     expect(loads.modules.has('persona-connection-errors.ts')).toBe(true)
     expect(forbidden).toEqual([])
+    // The CLI-teardown context takes its command as a plain string: the module loads neither CLI module.
+    expect([loads.modules.has('cli.ts'), loads.modules.has('cli-teardown.ts')]).toEqual([false, false])
   })
 })

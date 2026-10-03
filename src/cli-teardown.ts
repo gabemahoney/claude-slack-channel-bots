@@ -3,10 +3,12 @@
  * `stop --stop-bots` and `clean_restart` (`src/cli.ts`): the precheck's
  * verdict over one answer, its tries and spacing, its two operator lines,
  * `stop --stop-bots`' too-old line and the config-file display name (b.jg5
- * SRJ-901, SRJ-902, SRJ-117, SRJ-908); and the teardown's per-persona
+ * SRJ-901, SRJ-902, SRJ-117, SRJ-908); the teardown's per-persona
  * outcome, its pause verdict, its state-read verdict, its kill's mapping
  * and the bounds of its cost (SRJ-903, SRJ-904, SRJ-119, SRJ-316, SRJ-908;
- * hatch note E12).
+ * hatch note E12); and the teardown's report: each persona's failure line,
+ * kill-failure alert and startup-errors entry, and the last line (SRJ-907,
+ * SRJ-909, SRJ-1013).
  *
  * The precheck. Before either command stops anything, it reads each persona
  * of the configuration the server runs: one `get` of `cscb_<key>`, then, for
@@ -50,7 +52,8 @@
  * teardown (`teardownPersona`) answers one {@link PersonaTeardownOutcome}:
  * stopped, with its reason (no row, already finished, exited after the
  * pause, killed), or failed, with the step that failed (state read, pause,
- * poll or kill), the classifier's class (never relabelled UNCLASSIFIED, as
+ * poll or kill; or an unexpected rejection of the teardown itself, which the
+ * CLI maps to a failed outcome), the classifier's class (never relabelled UNCLASSIFIED, as
  * the precheck's `get` relabels), the redacted one-line description
  * `describeReportedAdFailure` renders (SRJ-104) and whether it is a CONFIG
  * failure naming {@link AD_CONFIG_FILE_DISPLAY_NAME} (SRJ-316).
@@ -98,6 +101,22 @@
  * outcome carries the kill's report with the kill-failure alert decision
  * (never the survivor version for a failed persona, never the ordinary
  * version for a stopped one).
+ *
+ * The report (SRJ-907, SRJ-909, SRJ-1013, SRJ-704, SRJ-1007): after every
+ * persona has settled, {@link personaTeardownReportOf} gives each persona's
+ * lines to print, lines to append to `server.log` and at most one
+ * `startup-errors.log` entry. A failed persona gets
+ * {@link teardownFailureLine}; where its outcome's alert decision is the
+ * ordinary version, that line is followed by the kill-failure alert's
+ * ordinary version with the CLI closing sentence, recorded together as one
+ * `persona-kill-failed` entry, and any other failure is recorded as one
+ * {@link CLI_TEARDOWN_FAILED_LABEL} entry. A persona stopped with the
+ * survivor decision gets no failure line: the survivor version, with its CLI
+ * closing sentence, is printed, logged and recorded as one
+ * `persona-kill-survivor` entry. The alert's text, closing sentence, route
+ * and class come from `src/kill-failure-alert.ts`; its log-line and entry
+ * form names the command as the context. When any persona failed, the
+ * command ends with {@link teardownNotStoppedLine}, printed only.
  *
  * The cost (SRJ-908): {@link teardownBoundMs} bounds one persona's teardown
  * and {@link precheckBoundMs} its precheck, each call taking the call
@@ -168,7 +187,15 @@ import {
   PANE_READ_UNCLASSIFIED,
   paneReadFailureOf,
 } from './pane-read.ts'
-import { personaTmuxSessionName, renderPersonaRef } from './persona-identity.ts'
+import {
+  KILL_FAILURE_CONTEXT_CLI_TEARDOWN,
+  killFailureAlertContentOf,
+  killFailureAlertEntryText,
+  killFailureAlertText,
+  killFailureCliTeardownEntryContext,
+  selectKillFailureAlertRoute,
+} from './kill-failure-alert.ts'
+import { personaInstanceId, personaTmuxSessionName, renderPersonaRef } from './persona-identity.ts'
 
 // ---------------------------------------------------------------------------
 // Commands and names
@@ -381,12 +408,20 @@ export const TEARDOWN_STEP_POLL = 'poll'
 /** The teardown's `kill`, after an escalated pause or at `exit_timeout`. */
 export const TEARDOWN_STEP_KILL = 'kill'
 
+/**
+ * A persona's teardown that rejected rather than answering its outcome, at no
+ * known step: the CLI waits for every persona to settle, and such a
+ * rejection fails that persona ({@link teardownRejectedOutcomeOf}).
+ */
+export const TEARDOWN_STEP_UNEXPECTED = 'unexpected rejection'
+
 /** The step of a persona's teardown that failed. */
 export type TeardownStep =
   | typeof TEARDOWN_STEP_STATE_READ
   | typeof TEARDOWN_STEP_PAUSE
   | typeof TEARDOWN_STEP_POLL
   | typeof TEARDOWN_STEP_KILL
+  | typeof TEARDOWN_STEP_UNEXPECTED
 
 /** The state read found no row (`ErrSpawnNotFound`). */
 export const TEARDOWN_STOPPED_NO_ROW = 'no row'
@@ -495,6 +530,15 @@ export function teardownFailed(step: TeardownStep, report: TeardownErrorReport):
  */
 export function teardownErrorReportOf(error: unknown): TeardownErrorReport {
   return errorReportOfClass(classifyAdError(error).errorClass, error)
+}
+
+/**
+ * The failed outcome of a persona's teardown that rejected with `reason`
+ * instead of answering its outcome: step {@link TEARDOWN_STEP_UNEXPECTED},
+ * reporting {@link teardownErrorReportOf} of `reason`. Pure; never throws.
+ */
+export function teardownRejectedOutcomeOf(reason: unknown): TeardownFailedOutcome {
+  return teardownFailed(TEARDOWN_STEP_UNEXPECTED, teardownErrorReportOf(reason))
 }
 
 /** What a teardown failure of `errorClass` reports for `error`: see {@link teardownErrorReportOf}. */
@@ -906,4 +950,191 @@ export function precheckNothingStoppedLine(command: CliTeardownCommand): string 
  */
 export function onlyServerStoppedLine(): string {
   return `${CLI_COMMAND_STOP_BOTS}: only the server was stopped; every worker and row was left as it is`
+}
+
+// ---------------------------------------------------------------------------
+// The teardown's report (b.jg5 SRJ-907, SRJ-909, SRJ-1013)
+// ---------------------------------------------------------------------------
+
+/**
+ * The `startup-errors.log` class of a CLI teardown failure whose line the
+ * kill-failure alert does not follow (b.jg5 SRJ-1013, SRJ-909).
+ */
+export const CLI_TEARDOWN_FAILED_LABEL = 'cli-teardown-failed'
+
+/** A persona as the CLI's lines name it. */
+export interface CliTeardownPersona {
+  readonly name: string
+  readonly key: string
+}
+
+/** What a failure line reports: the outcome's class and its redacted one-line description. */
+export type TeardownFailureLineReport = Pick<TeardownErrorReport, 'errorClass' | 'description'>
+
+/**
+ * One persona's teardown failure line (b.jg5 SRJ-907):
+ * `<command>: could not stop persona "<name>" (key=<key>), session "slack_bot_<key>": <class>: <description>`.
+ * The class is the outcome's (the classifier's, never relabelled); the
+ * description is the outcome's `describeReportedAdFailure` rendering,
+ * redacted on one line, a CONFIG failure's naming
+ * {@link AD_CONFIG_FILE_DISPLAY_NAME}. Pure; never throws.
+ */
+export function teardownFailureLine(
+  command: CliTeardownCommand,
+  persona: CliTeardownPersona,
+  failure: TeardownFailureLineReport,
+): string {
+  const session = JSON.stringify(personaTmuxSessionName(persona.key))
+  return (
+    `${command}: could not stop persona ${renderPersonaRef(persona.name, persona.key)}, ` +
+    `session ${session}: ${failure.errorClass}: ${failure.description}`
+  )
+}
+
+/**
+ * The message of a {@link CLI_TEARDOWN_FAILED_LABEL} entry (b.jg5 SRJ-1013):
+ * the command, the persona, its session, the class and the redacted
+ * description, which is the persona's failure line
+ * ({@link teardownFailureLine}). Pure; never throws.
+ */
+export function cliTeardownFailedEntryText(
+  command: CliTeardownCommand,
+  persona: CliTeardownPersona,
+  failure: TeardownFailureLineReport,
+): string {
+  return teardownFailureLine(command, persona, failure)
+}
+
+/**
+ * The teardown's last line when at least one persona could not be stopped
+ * (b.jg5 SRJ-907): `<command>: could not stop <N> persona(s); rows are never
+ * deleted, so running the command again is safe`. `failedCount` counts only
+ * the failed personas, never one stopped with the survivor version. Printed
+ * only, never logged or recorded. Pure; never throws.
+ */
+export function teardownNotStoppedLine(command: CliTeardownCommand, failedCount: number): string {
+  return `${command}: could not stop ${failedCount} persona(s); rows are never deleted, so running the command again is safe`
+}
+
+/** A startup-errors entry the report records: its class and its one-line message. */
+export interface CliTeardownStartupErrorEntry {
+  readonly classLabel: string
+  readonly message: string
+}
+
+/**
+ * One persona's report (b.jg5 SRJ-907, SRJ-909): the lines to print (stderr;
+ * for `clean_restart` also `clean_restart.log`), the lines to append to
+ * `server.log`, and at most one `startup-errors.log` entry.
+ */
+export interface PersonaTeardownReport {
+  /** True when the persona could not be stopped: it has a failure line and counts in the last line. */
+  readonly failed: boolean
+  /** The lines to print, in order. */
+  readonly printed: readonly string[]
+  /** The lines to append to `server.log`, one line each, in order. */
+  readonly logged: readonly string[]
+  /** The startup-errors entry, when the persona has one. */
+  readonly entry?: CliTeardownStartupErrorEntry
+}
+
+const NOTHING_TO_REPORT: PersonaTeardownReport = Object.freeze({ failed: false, printed: [], logged: [] })
+
+/** A kill-failure alert as the CLI teardown's route gives it. */
+interface CliTeardownAlert {
+  /** The alert in the log-line and entry form, its context naming the command. */
+  readonly line: string
+  /** The route's startup-errors class. */
+  readonly classLabel: string
+  /** True when the route prints it. */
+  readonly printed: boolean
+}
+
+/**
+ * The kill-failure alert for `decision`, routed for a CLI teardown (b.jg5
+ * SRJ-704, SRJ-1007, SRJ-1013): the route selection's closing sentence and
+ * class, the text unescaped (`forSlack` false), in the log-line and entry
+ * form with the persona and the CLI teardown's context naming `command`.
+ * Undefined for a `none` decision.
+ */
+function cliTeardownAlertOf(
+  command: CliTeardownCommand,
+  persona: CliTeardownPersona,
+  decision: KillRetryAlert,
+): CliTeardownAlert | undefined {
+  const content = killFailureAlertContentOf(decision, personaTmuxSessionName(persona.key), personaInstanceId(persona.key))
+  if (content === undefined) return undefined
+  // The CLI-teardown context matches before the configured and latched
+  // inputs are read (SRJ-704's first match).
+  const route = selectKillFailureAlertRoute({
+    version: content.version,
+    context: KILL_FAILURE_CONTEXT_CLI_TEARDOWN,
+    configured: true,
+    latched: false,
+  })
+  if (route.classLabel === undefined) return undefined
+  const text = killFailureAlertText(content, route.closing, false)
+  const line = killFailureAlertEntryText(
+    `persona ${renderPersonaRef(persona.name, persona.key)}`,
+    killFailureCliTeardownEntryContext(command),
+    text,
+  )
+  return { line, classLabel: route.classLabel, printed: route.printed }
+}
+
+/**
+ * One persona's report from its teardown outcome under `command` (b.jg5
+ * SRJ-907, SRJ-909, SRJ-1013), following the outcome's own alert decision
+ * (a failed persona's is never the survivor version, a stopped persona's
+ * never the ordinary version). Pure; never throws.
+ *
+ *   - stopped with no alert: nothing;
+ *   - stopped with the survivor decision: the survivor text with its CLI
+ *     closing sentence, printed and logged as one line, and one
+ *     `persona-kill-survivor` entry holding that line; not failed, so no
+ *     failure line and not counted;
+ *   - failed with the ordinary decision: the failure line, then the ordinary
+ *     text with its CLI closing sentence, printed and logged as two lines,
+ *     and one `persona-kill-failed` entry holding the failure line followed
+ *     by the alert line;
+ *   - any other failure: the failure line, printed and logged, and one
+ *     {@link CLI_TEARDOWN_FAILED_LABEL} entry.
+ *
+ * The alert line is E20's log-line and entry form
+ * (`persona "<name>" (key=<key>) (CLI teardown, <command>): <text>`); its
+ * route, closing sentence and class come from `selectKillFailureAlertRoute`.
+ */
+export function personaTeardownReportOf(
+  command: CliTeardownCommand,
+  persona: CliTeardownPersona,
+  outcome: PersonaTeardownOutcome,
+): PersonaTeardownReport {
+  if (outcome.kind === TEARDOWN_OUTCOME_STOPPED) {
+    const decision = outcome.kill?.alert
+    const alert = decision?.kind === KILL_RETRY_ALERT_SURVIVOR ? cliTeardownAlertOf(command, persona, decision) : undefined
+    if (alert === undefined) return NOTHING_TO_REPORT
+    return {
+      failed: false,
+      printed: alert.printed ? [alert.line] : [],
+      logged: [alert.line],
+      entry: { classLabel: alert.classLabel, message: alert.line },
+    }
+  }
+  const failureLine = teardownFailureLine(command, persona, outcome)
+  const decision = outcome.kill?.alert
+  const alert = decision?.kind === KILL_RETRY_ALERT_ORDINARY ? cliTeardownAlertOf(command, persona, decision) : undefined
+  if (alert === undefined) {
+    return {
+      failed: true,
+      printed: [failureLine],
+      logged: [failureLine],
+      entry: { classLabel: CLI_TEARDOWN_FAILED_LABEL, message: cliTeardownFailedEntryText(command, persona, outcome) },
+    }
+  }
+  return {
+    failed: true,
+    printed: alert.printed ? [failureLine, alert.line] : [failureLine],
+    logged: [failureLine, alert.line],
+    entry: { classLabel: alert.classLabel, message: `${failureLine} ${alert.line}` },
+  }
 }

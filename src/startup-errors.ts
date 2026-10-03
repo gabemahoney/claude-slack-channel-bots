@@ -5,7 +5,8 @@
  *   recordStartupError(classLabel, message, cause?, options?): void
  *
  * Writes one timestamped, single-line entry to:
- *   1. fd 2 (stderr) directly — never console.error
+ *   1. fd 2 (stderr) directly — never console.error — unless
+ *      `options.omitStderr` is set
  *   2. <stateDir>/startup-errors.log — append-only, created on demand
  *
  * <stateDir> resolution:
@@ -16,6 +17,10 @@
  * failure and emits a one-line warning.
  *
  * Tests inject `options.logDir` to redirect the log file into a temp directory.
+ * The CLI's teardown recorder (`stop --stop-bots`, `clean_restart`) sets
+ * `options.omitStderr`: it prints each line to the terminal itself, so the
+ * entry goes to the log file alone and each line reaches the terminal once
+ * (b.jg5 SRJ-909). A disk failure still writes its one-line warning to fd 2.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -27,6 +32,8 @@ import { join, resolve } from 'node:path'
 export interface StartupErrorOptions {
   /** Override the directory where startup-errors.log is written. */
   logDir?: string
+  /** Leave out the entry's copy on fd 2: the entry goes to startup-errors.log alone. */
+  omitStderr?: boolean
 }
 
 function resolveStateDir(): string {
@@ -61,7 +68,8 @@ function writeStderr(line: string): void {
 
 /**
  * Record a startup error: writes one grep-friendly timestamped line to both
- * fd 2 (stderr) and <stateDir>/startup-errors.log.
+ * fd 2 (stderr) and <stateDir>/startup-errors.log, or to the log file alone
+ * with `options.omitStderr`.
  */
 export function recordStartupError(
   classLabel: string,
@@ -76,7 +84,7 @@ export function recordStartupError(
     ? `[${timestamp}] [${classLabel}] ${flatMessage} — ${causeStr}`
     : `[${timestamp}] [${classLabel}] ${flatMessage}`
 
-  writeStderr(line)
+  if (options?.omitStderr !== true) writeStderr(line)
 
   const logDir = options?.logDir ?? resolveStateDir()
   const logPath = join(logDir, 'startup-errors.log')

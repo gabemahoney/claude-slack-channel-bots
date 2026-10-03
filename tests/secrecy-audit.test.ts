@@ -786,11 +786,6 @@ const RAW_ERROR_ALLOWED: { file: string; anchor: string; reason: string }[] = [
   },
   {
     file: 'src/cli.ts',
-    anchor: 'clean_restart: bot teardown failed',
-    reason: "teardownBots' TeardownIncompleteError, whose message CSCB wrote (a persona count and retry advice); each persona's error was already logged described",
-  },
-  {
-    file: 'src/cli.ts',
     anchor: "'[slack] Fatal:'",
     reason: "the CLI entry point's last-resort catch-all for an unexpected throw from start, stop or clean_restart",
   },

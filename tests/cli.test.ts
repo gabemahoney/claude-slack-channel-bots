@@ -53,6 +53,20 @@
  * call order. The verdicts and the kill's mapping per answer are
  * tests/cli-teardown.test.ts's.
  *
+ * The teardown's report (b.jg5 SRJ-907, SRJ-909, SRJ-1013): once every
+ * persona has settled, each failed persona's failure line, followed by the
+ * kill-failure alert's ordinary version where the kill's decision says so,
+ * and a stopped persona's survivor version, in configuration order, then the
+ * last line when any persona failed. Each line and alert is printed once
+ * (for `clean_restart` once in `clean_restart.log` too), appended to the real
+ * `<stateDir>/server.log` through the fixture's `appendServerLogLine` seam
+ * (`appendLogLine` over the temp tree, timed by the fake clock) and recorded
+ * in the real `<stateDir>/startup-errors.log` through its
+ * `recordStartupErrorEntry` seam (`recordStartupError` with the temp state
+ * directory and no copy on fd 2); the last line is printed only. Every
+ * expected line comes from the builders of `src/cli-teardown.ts` and
+ * `src/kill-failure-alert.ts`.
+ *
  * The client's initialization (b.jg5 SRJ-203, SRJ-902): the fixture's
  * `initClient` records the call timeout and the gate each command asks for
  * (`clean_restart` the whole gate, `stop --stop-bots` the gate without CSCB's
@@ -114,10 +128,7 @@ import {
   TEARDOWN_POLL_FIRST_WAIT_MS,
   TEARDOWN_KILL_OPTIONS,
   TEARDOWN_POLL_MAX_WAIT_MS,
-  TEARDOWN_STEP_KILL,
-  TEARDOWN_STEP_PAUSE,
-  TEARDOWN_STEP_POLL,
-  TEARDOWN_STEP_STATE_READ,
+  CLI_TEARDOWN_FAILED_LABEL,
   exitTimeoutMsOf,
   onlyServerStoppedLine,
   precheckBoundMs,
@@ -126,11 +137,13 @@ import {
   precheckVerdictOf,
   teardownBoundMs,
   teardownErrorReportOf,
+  teardownFailureLine,
+  teardownNotStoppedLine,
   type CliTeardownCommand,
+  type CliTeardownPersona,
   type PrecheckCall,
   type PrecheckFailure,
   type PrecheckRow,
-  type TeardownStep,
 } from '../src/cli-teardown.ts'
 import {
   AD_ERROR_CLASS_CONFIG,
@@ -167,7 +180,24 @@ import {
   type StartupGateRefusalKind,
 } from '../src/agent-director-startup.ts'
 import { getClient, resetClientForTests, setClientForTests } from '../src/agent-director-client.ts'
-import { KILL_OUTCOME_SESSION_GONE, describeKillOutcome, killOutcomeOf } from '../src/checked-kill.ts'
+import { KILL_OUTCOME_NOT_KILLED, KILL_OUTCOME_SESSION_GONE, describeKillOutcome, killOutcomeOf } from '../src/checked-kill.ts'
+import {
+  KILL_FAILURE_CLOSING_CLI_TEARDOWN,
+  KILL_FAILURE_ORDINARY_CLI_TEARDOWN_CLOSING,
+  KILL_FAILURE_SURVIVOR_CLI_TEARDOWN_CLOSING,
+  KILL_FAILURE_VERSION_ORDINARY,
+  KILL_FAILURE_VERSION_SURVIVOR,
+  PERSONA_KILL_FAILED_LABEL,
+  PERSONA_KILL_SURVIVOR_LABEL,
+  killFailureAlertEntryText,
+  killFailureAlertText,
+  killFailureCliTeardownEntryContext,
+  type KillFailureAlertContent,
+  type KillFailureOrdinaryQuotes,
+} from '../src/kill-failure-alert.ts'
+import { appendLogLine } from '../src/logging.ts'
+import { describeThrownValue } from '../src/persona-connection-errors.ts'
+import { recordStartupError } from '../src/startup-errors.ts'
 import {
   KILL_RETRY_ALERT_NONE,
   KILL_RETRY_ALERT_ORDINARY,
@@ -211,6 +241,7 @@ import {
   REDACTED_SENTINEL_TAIL,
   sentinelInMessage,
   writeCredentialsFile,
+  writtenFile,
 } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import {
@@ -218,6 +249,7 @@ import {
   KILL_FAILED_DESCRIPTIONS,
   SAMPLE_LAUNCH_START_DEFAULT,
   SAMPLE_LAUNCH_START_NONE,
+  STUB_SURVIVOR_PIDS,
   STUB_TMUX_SOCKET_PATH,
   UNAVAILABLE_FORMS,
   UNUSABLE_NAME_FAULTS,
@@ -377,6 +409,8 @@ function snapshotTree(): Record<string, string | null> {
 const OPS_NAME = 'Ops Bot'
 const OPS_CHANNEL = 'C0TEST001'
 const opsId = (): string => personaInstanceId(personaKey(OPS_NAME))
+/** The Ops persona as the teardown's lines name it. */
+const OPS_PERSONA: CliTeardownPersona = Object.freeze({ name: OPS_NAME, key: personaKey(OPS_NAME) })
 
 /** The last-applied record beside the per-test config.json. */
 const recordPath = (): string => `${configPath}.last-applied`
@@ -467,6 +501,22 @@ interface Overrides {
   loadConfigFile?: (path: string) => PersonaConfig
   /** The credentials script's exit status the fake runner returns; default 0. */
   credentialsScriptStatus?: number
+  /**
+   * Called with each `sleep`'s time before the fake clock moves; a throw
+   * rejects that `sleep`. Default: none, every sleep only moves the clock.
+   */
+  sleep?: (ms: number) => Promise<void>
+  /**
+   * The teardown's `server.log` appender; default the real `appendLogLine`
+   * on `<stateDir>/server.log` in the temp tree (b.jg5 SRJ-909).
+   */
+  appendServerLogLine?: CliDeps['appendServerLogLine']
+  /**
+   * The teardown's startup-errors recorder; default the real
+   * `recordStartupError` into `<stateDir>/startup-errors.log` in the temp
+   * tree, with no copy on fd 2 (b.jg5 SRJ-909, SRJ-1013).
+   */
+  recordStartupErrorEntry?: CliDeps['recordStartupErrorEntry']
 }
 
 interface Bundle {
@@ -580,6 +630,7 @@ function makeDeps(o: Overrides = {}): Bundle {
     now: () => clock.now(),
     sleep: async (ms) => {
       events.push('sleep')
+      await o.sleep?.(ms)
       await clock.advance(ms)
     },
     unlinkSync: () => { /* the stale PID file stays; nothing reads it again */ },
@@ -610,6 +661,15 @@ function makeDeps(o: Overrides = {}): Bundle {
       credentialsRuns.push(credentialsFile)
       events.push('runCredentialsScript')
       return o.credentialsScriptStatus ?? 0
+    },
+    appendServerLogLine: (line, at) => {
+      events.push('appendServerLogLine')
+      return o.appendServerLogLine ? o.appendServerLogLine(line, at) : appendLogLine(logPath, line, at)
+    },
+    recordStartupErrorEntry: (classLabel, message) => {
+      events.push('recordStartupErrorEntry')
+      if (o.recordStartupErrorEntry) return o.recordStartupErrorEntry(classLabel, message)
+      recordStartupError(classLabel, message, undefined, { logDir: stateDir, omitStderr: true })
     },
     ...(o.initClient
       ? {
@@ -735,16 +795,168 @@ function makeLiveStopDeps(o: Overrides = {}): Bundle {
   return makeDeps({ serverPid: 4242, isProcessRunning: () => { const was = alive; alive = false; return was }, ...o })
 }
 
+// ---------------------------------------------------------------------------
+// The teardown's report and its three destinations (b.jg5 SRJ-907, SRJ-909,
+// SRJ-1013)
+// ---------------------------------------------------------------------------
+
+/** `<stateDir>/startup-errors.log`, where the fixture's recorder writes. */
+const startupErrorsPath = (): string => join(stateDir, 'startup-errors.log')
+
 /**
- * The per-persona teardown failure line `teardownBots` logs for the persona
- * named `persona` whose teardown failed at `step` with `error` (b.jg5
- * SRJ-903): the persona, the step, the classifier's class and the reported,
- * redacted description (SRJ-104), as `teardownErrorReportOf` renders them.
+ * The texts of `server.log`'s lines, in order, each after its `[<ISO time>] `
+ * stamp, which must be `at`'s (the fake clock's time of the report); none
+ * when the file was never written.
  */
-function teardownFailureLogLine(persona: string, step: TeardownStep, error: unknown): string {
+function serverLogTexts(at: number): string[] {
+  if (!existsSync(logPath)) return []
+  const stamp = `[${new Date(at).toISOString()}] `
+  return readFileSync(logPath, 'utf-8').split('\n').filter((l) => l !== '').map((line) => {
+    expect(line.startsWith(stamp)).toBe(true)
+    return line.slice(stamp.length)
+  })
+}
+
+/** One `startup-errors.log` entry: its class and its message. */
+interface StartupErrorEntry {
+  readonly classLabel: string
+  readonly message: string
+}
+
+/** `startup-errors.log`'s entries, in order, as class and message; none when the file was never written. */
+function startupErrorEntries(): StartupErrorEntry[] {
+  if (!existsSync(startupErrorsPath())) return []
+  return readFileSync(startupErrorsPath(), 'utf-8').split('\n').filter((l) => l !== '').map((line) => {
+    const m = /^\[[^\]]+\] \[([^\]]+)\] (.*)$/.exec(line)
+    if (m === null) throw new Error(`not a startup-errors entry: ${line}`)
+    return { classLabel: m[1]!, message: m[2]! }
+  })
+}
+
+/** The teardown's two log files that exist, for `assertNoLeak`. */
+const writtenTeardownLogs = (): unknown[] => [logPath, startupErrorsPath()].filter((p) => existsSync(p)).map((p) => writtenFile(p))
+
+/** {@link snapshotTree} without the teardown's `server.log` and `startup-errors.log`, whose content each case checks itself. */
+function snapshotTreeExceptTeardownLogs(): Record<string, string | null> {
+  const logs = new Set([relative(root, logPath), relative(root, startupErrorsPath())])
+  return Object.fromEntries(Object.entries(snapshotTree()).filter(([rel]) => !logs.has(rel)))
+}
+
+/** A persona as the teardown's lines name it. */
+const personaOf = (name: string): CliTeardownPersona => ({ name, key: personaKey(name) })
+
+/** What one persona's teardown reports (b.jg5 SRJ-907, SRJ-909): its lines in order and its startup-errors entry. */
+interface ExpectedReport {
+  /** Printed (for `clean_restart` through its fatal path) and appended to `server.log`, one line each. */
+  readonly lines: readonly string[]
+  /** The one `startup-errors.log` entry. */
+  readonly entry: StartupErrorEntry
+  /** Whether the persona counts in the last line. */
+  readonly failed: boolean
+}
+
+/**
+ * The kill-failure alert line a CLI teardown under `command` gives for
+ * `persona` (b.jg5 SRJ-704, SRJ-1007, SRJ-909): E20's log-line and entry form,
+ * the CLI teardown's context naming the command, the text unescaped with its
+ * CLI closing sentence.
+ */
+function cliAlertLine(command: CliTeardownCommand, persona: CliTeardownPersona, content: KillFailureAlertContent): string {
+  return killFailureAlertEntryText(
+    `persona ${renderPersonaRef(persona.name, persona.key)}`,
+    killFailureCliTeardownEntryContext(command),
+    killFailureAlertText(content, KILL_FAILURE_CLOSING_CLI_TEARDOWN, false),
+  )
+}
+
+/**
+ * A failed persona's report: `teardownFailureLine` over the classifier's
+ * class (`errorClass`, checked) and `describeReportedAdFailure`'s redacted
+ * description of `error` (SRJ-104; a CONFIG one led by the config file's
+ * name), naming the persona's session. With `quotes` it is followed by the
+ * ordinary version quoting them, ending with the ordinary CLI closing
+ * sentence, both recorded as one `persona-kill-failed` entry; without, the
+ * line alone is recorded under `cli-teardown-failed`.
+ */
+function failedReport(
+  command: CliTeardownCommand,
+  persona: CliTeardownPersona,
+  error: unknown,
+  errorClass: AdErrorClass,
+  quotes?: KillFailureOrdinaryQuotes,
+): ExpectedReport {
   const report = teardownErrorReportOf(error)
-  return `[slack] teardownBots: agent-director error during teardown of persona ${renderPersonaRef(persona, personaKey(persona))}, ` +
-    `step ${step}: ${report.errorClass}: ${report.description}`
+  expect(report.errorClass).toBe(errorClass)
+  const reported = describeReportedAdFailure(error)
+  if (errorClass === AD_ERROR_CLASS_CONFIG) {
+    expect(report.description).toContain(AD_CONFIG_FILE_DISPLAY_NAME)
+    expect(report.description.endsWith(reported)).toBe(true)
+  } else {
+    expect(report.description).toBe(reported)
+  }
+  const line = teardownFailureLine(command, persona, report)
+  expect(line).toContain(JSON.stringify(personaTmuxSessionName(persona.key)))
+  if (quotes === undefined) return { lines: [line], entry: { classLabel: CLI_TEARDOWN_FAILED_LABEL, message: line }, failed: true }
+  const alert = cliAlertLine(command, persona, {
+    version: KILL_FAILURE_VERSION_ORDINARY,
+    session: personaTmuxSessionName(persona.key),
+    instanceId: personaInstanceId(persona.key),
+    quotes,
+  })
+  expect(alert.endsWith(KILL_FAILURE_ORDINARY_CLI_TEARDOWN_CLOSING)).toBe(true)
+  return { lines: [line, alert], entry: { classLabel: PERSONA_KILL_FAILED_LABEL, message: `${line} ${alert}` }, failed: true }
+}
+
+/**
+ * A persona stopped after a survivor-naming kill failure: no failure line;
+ * the survivor version quoting `survivorDescription` and naming the stub's
+ * survivor pids, ending with the survivor CLI closing sentence, recorded under
+ * `persona-kill-survivor`; not counted.
+ */
+function survivorReport(command: CliTeardownCommand, persona: CliTeardownPersona, survivorDescription: string): ExpectedReport {
+  const alert = cliAlertLine(command, persona, {
+    version: KILL_FAILURE_VERSION_SURVIVOR,
+    session: personaTmuxSessionName(persona.key),
+    survivorDescription,
+  })
+  expect(alert.endsWith(KILL_FAILURE_SURVIVOR_CLI_TEARDOWN_CLOSING)).toBe(true)
+  for (const pid of STUB_SURVIVOR_PIDS) expect(alert).toContain(String(pid))
+  return { lines: [alert], entry: { classLabel: PERSONA_KILL_SURVIVOR_LABEL, message: alert }, failed: false }
+}
+
+/** The raw description of the `ErrTmuxKillFailed` `error`, as the kill's alert decision quotes it. */
+function killFailedDescriptionOf(error: unknown): string {
+  const outcome = killOutcomeOf({ thrown: error }, TEARDOWN_KILL_OPTIONS)
+  if (outcome.kind !== KILL_OUTCOME_NOT_KILLED || outcome.errorClass !== AD_ERROR_CLASS_UNAVAILABLE || outcome.killFailedDescription === undefined) {
+    throw new Error('precondition: an ErrTmuxKillFailed keeps its description')
+  }
+  return outcome.killFailedDescription
+}
+
+/** Which of the report's files a case expects written; a seam made to fail leaves its file unwritten. */
+interface ReportDestinations {
+  readonly serverLog?: boolean
+  readonly startupErrors?: boolean
+}
+
+/**
+ * The teardown's report under `command` is exactly `reports`, in
+ * configuration order (b.jg5 SRJ-907, SRJ-909): its lines on the terminal
+ * once each, in order, and when any persona failed the last line, counting
+ * only the failed ones, as the last line of all; one `server.log` line per
+ * report line, stamped with the fake clock's time, and one
+ * `startup-errors.log` entry per persona that has one; the last line neither
+ * logged nor recorded. Nothing printed, logged or recorded leaks.
+ */
+function expectReported(b: Bundle, command: CliTeardownCommand, reports: readonly ExpectedReport[], to: ReportDestinations = {}): void {
+  const lines = reports.flatMap((r) => r.lines)
+  const failed = reports.filter((r) => r.failed).length
+  const last = failed > 0 ? [teardownNotStoppedLine(command, failed)] : []
+  expect(stderr.filter((l) => l.startsWith(`${command}: `) || lines.includes(l))).toEqual([...lines, ...last])
+  if (failed > 0) expect(stderr.at(-1)).toBe(last[0])
+  expect(serverLogTexts(b.clock.now())).toEqual(to.serverLog === false ? [] : lines)
+  expect(startupErrorEntries()).toEqual(to.startupErrors === false ? [] : reports.map((r) => r.entry))
+  assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls, files: writtenTeardownLogs() })
 }
 
 /** A scripted answer that is thrown rather than returned; see {@link scripted}. */
@@ -1659,7 +1871,7 @@ describe('start — server.log descriptor', () => {
     expect(props.get('openLogAppend')).toBe("(path) => openSync(path, 'a')")
     expect(props.get('closeFd')).toBe('(fd) => closeSync(fd)')
     expect(props.get('initLogging')).toBe('initLogging')
-    expect(code).toMatch(/import\s*\{\s*initLogging\s*\}\s*from\s*'\.\/logging\.ts'/)
+    expect(code).toMatch(/import\s*\{[^}]*\binitLogging\b[^}]*\}\s*from\s*'\.\/logging\.ts'/)
   })
 })
 
@@ -1829,11 +2041,12 @@ describe('persona-set teardown', () => {
     expect(b.exitCodes).toEqual([0])
   })
 
-  test('one persona failing loudly still lets the other be torn down; the aggregate counts one persona', async () => {
+  test('one persona failing loudly still lets the other be torn down; the last line counts one persona', async () => {
+    const alphaError = errCallTimeout('status')
     const b = makeDeps({
       config: twoPersonas(),
       directorStatus: async (id) => {
-        if (id === alphaId()) throw errCallTimeout('status')
+        if (id === alphaId()) throw alphaError
         return { state: 'waiting' }
       },
       directorPause: async () => { throw errTmuxSendKeys() }, // GONE: one pause, then the kill (b.jg5 SRJ-903)
@@ -1841,7 +2054,7 @@ describe('persona-set teardown', () => {
     await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
     expect(b.killCalls).toEqual([betaId()])
     expect(b.exitCodes).toEqual([1])
-    expect(stderr.join('\n')).toContain('teardown incomplete for 1 persona(s)')
+    expectReported(b, CLI_COMMAND_CLEAN_RESTART, [failedReport(CLI_COMMAND_CLEAN_RESTART, personaOf(ALPHA.name), alphaError, AD_ERROR_CLASS_UNAVAILABLE)])
     expect(startedServer(b)).toBe(false)
   })
 
@@ -1850,14 +2063,13 @@ describe('persona-set teardown', () => {
   // (b.jg5 SRJ-104: the reported name and redacted description of an
   // agent-director error, else its type, safe code, message through
   // `redactSlackLogText` and frames), never the error itself; the failure
-  // line also names the persona, the step and the class (b.jg5 SRJ-903). The
-  // errors carry fake tokens (in a message, with a URL); the raw
-  // console.error arguments are checked. With a successful pause and
-  // `exit_timeout: 0` the poll loop never runs, so the timeout path's kill is
-  // reached at once.
-  /** {@link teardownFailureLogLine}, cut before its first stack frame. */
-  const failureLine = (persona: string, step: TeardownStep, error: unknown): string =>
-    teardownFailureLogLine(persona, step, error).split(' at ')[0]!
+  // line also names the persona, its session and the class (b.jg5 SRJ-907).
+  // The errors carry fake tokens (in a message, with a URL); the raw
+  // console.error arguments, server.log and startup-errors.log are checked.
+  // With a successful pause and `exit_timeout: 0` the poll loop never runs,
+  // so the timeout path's kill is reached at once.
+  /** The command's report lines that name a class (SRJ-907's failure lines). */
+  const failureLines = (): string[] => stderr.filter((l) => l.startsWith(`${CLI_COMMAND_CLEAN_RESTART}: `))
 
   test('AC 20: a pause answering UNAVAILABLE on every try and then its escalation kill failing, with errors carrying fake tokens — the pause and teardown lines name each error with its message redacted; clean_restart exits 1; nothing logged leaks', async () => {
     const killError = new AgentDirectorError('kill', 'ErrKillBroken', `kill refused (${sentinelInMessage('kill', APP_TOKEN_PREFIX)})`)
@@ -1879,8 +2091,8 @@ describe('persona-set teardown', () => {
     expect(line('pause failed').map((l) => l.split(' at ')[0])).toEqual([
       `[slack] teardownBots: pause failed for persona ${ref} — escalating to kill: Error code=ECONNRESET message="pause refused (${REDACTED_SENTINEL_TAIL})"`,
     ])
-    expect(line('error during teardown').map((l) => l.split(' at ')[0])).toEqual([failureLine(OPS_NAME, TEARDOWN_STEP_KILL, killError)])
-    expect(line('error during teardown')[0]).toContain(`step ${TEARDOWN_STEP_KILL}: ${AD_ERROR_CLASS_UNCLASSIFIED}: ErrKillBroken message="kill refused (${REDACTED_SENTINEL_TAIL})"`)
+    expectReported(b, CLI_COMMAND_CLEAN_RESTART, [failedReport(CLI_COMMAND_CLEAN_RESTART, OPS_PERSONA, killError, AD_ERROR_CLASS_UNCLASSIFIED)])
+    expect(failureLines()[0]).toContain(`: ${AD_ERROR_CLASS_UNCLASSIFIED}: ErrKillBroken message="kill refused (${REDACTED_SENTINEL_TAIL})"`)
     expect(b.exitCodes).toEqual([1])
     expect(startedServer(b)).toBe(false)
     assertNoLeak({ consoleErrorArgs: errorSpy.mock.calls, stderr })
@@ -1906,10 +2118,9 @@ describe('persona-set teardown', () => {
     expect(line('kill failed').map((l) => l.split(' at ')[0])).toEqual([
       `[slack] teardownBots: kill failed for persona ${ref}: Error code=ECONNRESET message="kill refused (${REDACTED_SENTINEL_TAIL})"`,
     ])
-    expect(line('error during teardown').map((l) => l.split(' at ')[0])).toEqual([failureLine(OPS_NAME, TEARDOWN_STEP_KILL, killError)])
-    expect(line('error during teardown')[0]).toContain(
-      `step ${TEARDOWN_STEP_KILL}: ${AD_ERROR_CLASS_UNAVAILABLE}: Error code=ECONNRESET message="kill refused (${REDACTED_SENTINEL_TAIL})"`,
-    )
+    // A plain Error is no ErrTmuxKillFailed: no alert follows its line (b.jg5 SRJ-907).
+    expectReported(b, CLI_COMMAND_CLEAN_RESTART, [failedReport(CLI_COMMAND_CLEAN_RESTART, OPS_PERSONA, killError, AD_ERROR_CLASS_UNAVAILABLE)])
+    expect(failureLines()[0]).toContain(`: ${AD_ERROR_CLASS_UNAVAILABLE}: Error code=ECONNRESET message="kill refused (${REDACTED_SENTINEL_TAIL})"`)
     expect(b.exitCodes).toEqual([1])
     expect(startedServer(b)).toBe(false)
     assertNoLeak({ consoleErrorArgs: errorSpy.mock.calls, stderr })
@@ -1960,9 +2171,10 @@ describe('clean_restart', () => {
 
   // b.dnt: AD dies between the precheck and the pause. The escalation kill
   // answers ErrCallTimeout (UNAVAILABLE) on every try: KILL_RETRY_TRIES kills
-  // with a status read before each further one, then the persona fails → the
-  // aggregate failure → clean_restart exit(1), no start (b.jg5 SRJ-904).
-  test('b.dnt: escalation kill failing with ErrCallTimeout on every try: KILL_RETRY_TRIES kills, then it rejects loudly (AD died mid-teardown)', async () => {
+  // with a status read before each further one, then the persona fails → its
+  // failure line and the last line → clean_restart exit(1), no start (b.jg5
+  // SRJ-904, SRJ-907).
+  test('b.dnt: escalation kill failing with ErrCallTimeout on every try: KILL_RETRY_TRIES kills, then the persona fails loudly (AD died mid-teardown)', async () => {
     const b = makeDeps({
       directorStatus: async () => ({ state: 'waiting' }),
       directorPause: async () => { throw errTmuxSendKeys() },
@@ -1999,6 +2211,9 @@ describe('clean_restart — clean_restart.log and the terminal', () => {
     console.error = (...args: unknown[]) => { log.push(formatLine(args)) }
   }
 
+  /** The state read's answer in the "teardown fails" case. */
+  const teardownError = new Error('AD connection refused')
+
   /** Each case's fatal lines, in order: each terminal line starts with its entry. */
   const FATAL: Array<[string, Overrides, () => string[]]> = [
     ['config load fails', { loadConfig: () => { throw new Error('config boom') } }, () => ['[slack] clean_restart: failed to load config: config boom']],
@@ -2011,10 +2226,15 @@ describe('clean_restart — clean_restart.log and the terminal', () => {
         precheckNothingStoppedLine(CLI_COMMAND_CLEAN_RESTART),
       ],
     ],
+    // b.jg5 SRJ-907: the persona's failure line, the abort line, then the last line, printed last.
     [
       'teardown fails',
-      { directorStatus: async () => { throw new Error('AD connection refused') } },
-      () => ['[slack] clean_restart: bot teardown failed — aborting restart: teardownBots: agent-director error'],
+      { directorStatus: async () => { throw teardownError } },
+      () => [
+        teardownFailureLine(CLI_COMMAND_CLEAN_RESTART, OPS_PERSONA, teardownErrorReportOf(teardownError)),
+        '[slack] clean_restart: bot teardown failed — aborting restart; the server was not started',
+        teardownNotStoppedLine(CLI_COMMAND_CLEAN_RESTART, 1),
+      ],
     ],
     // stop's non-zero exit is a non-fatal line: log only.
     ['start fails', { spawnSyncStatus: 3 }, () => ['[slack] clean_restart: start failed with exit code 3']],
@@ -2252,9 +2472,9 @@ describe('stop --stop-bots (b.4dk)', () => {
   })
 
   // b.dnt: a timeout-path kill answering ErrCallTimeout (UNAVAILABLE) on every
-  // try is tried KILL_RETRY_TRIES times, then fails into the aggregate →
-  // exit(1), not the stale-PID exit(0) (b.jg5 SRJ-904).
-  test('stopBots: timeout-path kill failing with ErrCallTimeout on every try: KILL_RETRY_TRIES kills, then it rejects loudly (b.dnt)', async () => {
+  // try is tried KILL_RETRY_TRIES times, then the persona fails →
+  // exit(1), not the stale-PID exit(0) (b.jg5 SRJ-904, SRJ-905).
+  test('stopBots: timeout-path kill failing with ErrCallTimeout on every try: KILL_RETRY_TRIES kills, then the persona fails loudly (b.dnt)', async () => {
     const b = makeStopDeps({
       config: opsConfig({ exit_timeout: 0 }),
       directorStatus: async () => ({ state: 'waiting' }),
@@ -2340,8 +2560,8 @@ describe('clean_restart teardown-via-closure regression (b.4dk)', () => {
 // CLI process (no server startup gate) and the error was collapsed into a
 // per-bot "no spawn row — skipping". Every bot was skipped and clean_restart
 // proceeded to `start`. Now directorStatus errors propagate (null only for
-// ErrSpawnNotFound); teardownBots throws an aggregate; clean_restart and
-// `stop --stop-bots` exit(1) and never start.
+// ErrSpawnNotFound) and fail that persona, which gets its failure line;
+// clean_restart and `stop --stop-bots` then exit(1) and never start.
 // ---------------------------------------------------------------------------
 
 describe('b.qwo — teardown fails loudly when agent-director is unreachable', () => {
@@ -2832,20 +3052,22 @@ describe('precheck before anything is stopped (b.jg5 SRJ-901, AC 74)', () => {
   })
 
   // SRJ-613 (E19 note): a pane passes the precheck but proves nothing; the teardown's own calls are the backstop.
-  test.each(COMMANDS)('%s: after a precheck whose read-pane answered a pane, the server is stopped and the teardown still makes its own status, pause and kill; a kill answering CONFLICT "not this launch\'s session" fails the teardown (exit 1) and latches nothing', async (command, make, run) => {
+  test.each(COMMANDS)('%s: after a precheck whose read-pane answered a pane, the server is stopped and the teardown still makes its own status, pause and kill; a kill answering CONFLICT "not this launch\'s session" fails the teardown (exit 1) with its line naming the session, and latches nothing', async (command, make, run) => {
+    const conflict = errTmuxSessionConflict('kill', 'not-this-launch', personaTmuxSessionName(OPS.key))
     const b = make({
       config: opsConfig({ exit_timeout: 0 }),
       directorStatus: async () => ({ state: 'waiting' }),
-      directorKill: async () => { throw errTmuxSessionConflict('kill', 'not-this-launch', personaTmuxSessionName(OPS.key)) },
+      directorKill: async () => { throw conflict },
     })
-    const before = snapshotTree()
+    const before = snapshotTreeExceptTeardownLogs()
     await run(b)
     expect(b.readPaneCalls).toEqual(opsPaneReads(1))
     expect([b.statusCalls, b.pauseCalls, b.killCalls]).toEqual([[idOf(OPS)], [idOf(OPS)], [idOf(OPS)]])
     if (command === CLI_COMMAND_STOP_BOTS) expect(b.serverSignals).toEqual(['SIGTERM'])
     else expect(b.spawnCalls.map((c) => c.args.at(-1))).toEqual(['stop'])
     expect(b.exitCodes).toEqual([1])
-    expect(snapshotTree()).toEqual(before)
+    expectReported(b, command, [failedReport(command, OPS, conflict, AD_ERROR_CLASS_CONFLICT)])
+    expect(snapshotTreeExceptTeardownLogs()).toEqual(before)
     assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
   })
 })
@@ -2861,9 +3083,9 @@ describe('precheck before anything is stopped (b.jg5 SRJ-901, AC 74)', () => {
 // no status read between, then escalates; CONFLICT, ENVIRONMENT, UNUSABLE
 // NAME, another ErrInternal and CONFIG fail the persona at once with no kill.
 // The verdict per answer is tests/cli-teardown.test.ts's; here each class's
-// calls, times, exit and failure line. Until the teardown's own failure lines
-// are built, a failure shows as teardownBots' per-persona line and the
-// aggregate failure.
+// calls, times, exit and report: a failed pause gives its failure line alone
+// (no kill-failure alert), recorded under `cli-teardown-failed`, then the
+// last line (b.jg5 SRJ-907, SRJ-909).
 // ---------------------------------------------------------------------------
 
 /** A `status` row: the fixture's `directorStatus` answer. */
@@ -2873,10 +3095,13 @@ const ENDED_ROW: StatusRow = Object.freeze({ state: 'ended' })
 
 /**
  * Every persona was stopped: `stop --stop-bots` stopped the server and exits
- * 0; `clean_restart` spawned the stop and then the start; no teardown failure
- * was logged.
+ * 0; `clean_restart` spawned the stop and then the start. The report is
+ * `reports` alone: none by default, so no line is printed and neither log
+ * file is written; a persona stopped with the survivor version has its
+ * survivor report and counts as stopped (b.jg5 SRJ-904, SRJ-905, SRJ-906;
+ * AC 64).
  */
-function expectTeardownStopped(b: Bundle, command: CliTeardownCommand): void {
+function expectTeardownStopped(b: Bundle, command: CliTeardownCommand, reports: readonly ExpectedReport[] = [], to: ReportDestinations = {}): void {
   if (command === CLI_COMMAND_STOP_BOTS) {
     expect(b.serverSignals).toEqual(['SIGTERM'])
     expect(b.exitCodes).toEqual([0])
@@ -2884,32 +3109,22 @@ function expectTeardownStopped(b: Bundle, command: CliTeardownCommand): void {
     expect(b.spawnCalls.map((c) => c.args.at(-1))).toEqual(['stop', 'start'])
     expect(b.exitCodes).toEqual([])
   }
-  expect(stderr.filter((l) => l.includes('error during teardown'))).toEqual([])
+  expect(reports.filter((r) => r.failed)).toEqual([])
+  if (reports.length === 0) expect([existsSync(logPath), existsSync(startupErrorsPath())]).toEqual([false, false])
+  expectReported(b, command, reports, to)
 }
 
 /**
- * The persona named `persona` alone failed, at `step`, with `error` of class
- * `errorClass`: exit 1 after the server stop (`clean_restart` spawns no
- * start); one failure line naming the persona, the step, the class and the
- * reported description, a CONFIG one naming the config file; the aggregate
- * counts one persona.
+ * At least one persona failed: exit 1 after the server stop (`clean_restart`
+ * spawns no start), and the report is exactly `reports`, in configuration
+ * order, then the last line (b.jg5 SRJ-905, SRJ-907, SRJ-909).
  */
-function expectTeardownFailed(
-  b: Bundle,
-  command: CliTeardownCommand,
-  persona: string,
-  step: TeardownStep,
-  error: unknown,
-  errorClass: AdErrorClass,
-): void {
+function expectTeardownFailed(b: Bundle, command: CliTeardownCommand, reports: readonly ExpectedReport[], to: ReportDestinations = {}): void {
   expect(b.exitCodes).toEqual([1])
   if (command === CLI_COMMAND_STOP_BOTS) expect(b.serverSignals).toEqual(['SIGTERM'])
   else expect(b.spawnCalls.map((c) => c.args.at(-1))).toEqual(['stop'])
-  expect(teardownErrorReportOf(error).errorClass).toBe(errorClass)
-  const lines = stderr.filter((l) => l.includes('error during teardown'))
-  expect(lines).toEqual([teardownFailureLogLine(persona, step, error)])
-  if (errorClass === AD_ERROR_CLASS_CONFIG) expect(lines[0]).toContain(AD_CONFIG_FILE_DISPLAY_NAME)
-  expect(stderr.join('\n')).toContain('teardown incomplete for 1 persona(s)')
+  expect(reports.some((r) => r.failed)).toBe(true)
+  expectReported(b, command, reports, to)
 }
 
 /** A pause answer: its builder, what the teardown does with it and the class the classifier gives it. */
@@ -2956,7 +3171,8 @@ describe('the teardown\'s pause by class (b.jg5 SRJ-903, SRJ-119; AC 73, AC 4)',
     expect(b.statusCalls).toEqual([opsId()])
     if (outcome === PAUSE_VERDICT_FAIL) {
       expect([pauses.length, kills]).toEqual([1, []])
-      expectTeardownFailed(b, command, OPS_NAME, TEARDOWN_STEP_PAUSE, error, errorClass)
+      // A failed pause carries no kill-failure alert: its line alone, under cli-teardown-failed (b.jg5 SRJ-907, SRJ-909).
+      expectTeardownFailed(b, command, [failedReport(command, OPS_PERSONA, error, errorClass)])
     } else {
       // UNAVAILABLE: exactly PRECHECK_TRIES pauses at t, t + gap, t + 2 gaps; then, like every escalation, one kill at once.
       const tries = outcome === PAUSE_VERDICT_RETRY ? PRECHECK_TRIES : 1
@@ -3021,22 +3237,22 @@ describe('the teardown\'s pause by class (b.jg5 SRJ-903, SRJ-119; AC 73, AC 4)',
     expect([...b.pauseCalls].sort()).toEqual([alphaId(), betaId()].sort())
     expect(b.killCalls).toEqual([])
     expect(callTimesOf(b, 'status', betaId())).toHaveLength(2) // the state read, then a poll read of ended
-    expectTeardownFailed(b, command, ALPHA.name, TEARDOWN_STEP_PAUSE, conflict, AD_ERROR_CLASS_CONFLICT)
+    expectTeardownFailed(b, command, [failedReport(command, personaOf(ALPHA.name), conflict, AD_ERROR_CLASS_CONFLICT)])
     assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
   })
 
   // E32's SRJ-613 backstop, pause leg: a pane passes the precheck but proves nothing; the pause answers CONFLICT.
-  test.each(COMMANDS)('%s: after a precheck whose read-pane answered a pane, a pause answering CONFLICT "not this launch\'s session" fails that persona with no kill; exit 1, and nothing is latched or written', async (command, make, run) => {
+  test.each(COMMANDS)('%s: after a precheck whose read-pane answered a pane, a pause answering CONFLICT "not this launch\'s session" fails that persona with no kill; exit 1, nothing is latched, and nothing is written but its server.log line and startup-errors entry', async (command, make, run) => {
     const conflict = errTmuxSessionConflict(PAUSE_VERB, 'not-this-launch', personaTmuxSessionName(personaKey(OPS_NAME)))
     const b = make({ directorStatus: async () => WAITING_ROW, directorPause: async () => { throw conflict } })
-    const before = snapshotTree()
+    const before = snapshotTreeExceptTeardownLogs()
 
     await run(b)
 
     expect(b.readPaneCalls).toEqual([[opsId(), PROBE_PANE_READ_LINES]])
     expect([b.statusCalls, b.pauseCalls, b.killCalls]).toEqual([[opsId()], [opsId()], []])
-    expectTeardownFailed(b, command, OPS_NAME, TEARDOWN_STEP_PAUSE, conflict, AD_ERROR_CLASS_CONFLICT)
-    expect(snapshotTree()).toEqual(before)
+    expectTeardownFailed(b, command, [failedReport(command, OPS_PERSONA, conflict, AD_ERROR_CLASS_CONFLICT)])
+    expect(snapshotTreeExceptTeardownLogs()).toEqual(before)
     assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
   })
 
@@ -3143,7 +3359,7 @@ describe('the teardown\'s state read and poll on the injected clock (b.jg5 SRJ-9
     await run(b)
 
     expect([b.statusCalls, b.pauseCalls, b.killCalls]).toEqual([[opsId()], [], []])
-    expectTeardownFailed(b, command, OPS_NAME, TEARDOWN_STEP_STATE_READ, error, errorClass)
+    expectTeardownFailed(b, command, [failedReport(command, OPS_PERSONA, error, errorClass)])
     assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
   })
 
@@ -3154,7 +3370,7 @@ describe('the teardown\'s state read and poll on the injected clock (b.jg5 SRJ-9
     await run(b)
 
     expect([b.statusCalls, b.pauseCalls, b.killCalls]).toEqual([[opsId(), opsId()], [opsId()], []])
-    expectTeardownFailed(b, command, OPS_NAME, TEARDOWN_STEP_POLL, error, errorClass)
+    expectTeardownFailed(b, command, [failedReport(command, OPS_PERSONA, error, errorClass)])
     assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
   })
 
@@ -3194,9 +3410,13 @@ describe('the teardown\'s state read and poll on the injected clock (b.jg5 SRJ-9
 // latches nothing. Each try is the checked kill under TEARDOWN_KILL_OPTIONS,
 // so a GONE answer is a non-success the retry logs as such and never tries
 // again; after a survivor-naming try its end line carries alert=ordinary. The
-// mapping of each retry result is tests/cli-teardown.test.ts's; the alert
-// texts are not built yet, so after a survivor-naming try these cases assert
-// stopped or failed, the exit and, for GONE, the retry's lines.
+// mapping of each retry result is tests/cli-teardown.test.ts's. Each case
+// checks the persona's report (b.jg5 SRJ-907, SRJ-909): a failure line, then
+// the kill-failure alert's ordinary version exactly after an ErrTmuxKillFailed
+// that stands or any failure after a survivor-naming try (GONE included),
+// quoting the descriptions the retry's decision carries; or, for a persona
+// stopped after a survivor-naming try, the survivor version alone, the
+// persona counting as stopped (AC 64).
 // ---------------------------------------------------------------------------
 
 const KILL_VERB = 'kill'
@@ -3219,10 +3439,27 @@ interface KillCase {
   readonly fails: null | readonly [error: unknown, errorClass: AdErrorClass]
   /** Text the failure line must also carry (the session a CONFLICT names, a store name). */
   readonly names?: readonly string[]
+  /** A failed persona's ordinary kill-failure alert: the descriptions it quotes; absent, no alert follows the line. */
+  readonly alert?: KillFailureOrdinaryQuotes
+  /** A stopped persona's survivor version: the survivor-naming description it quotes; absent, nothing is reported. */
+  readonly survivor?: string
 }
 
 const stops = (kills: ReadonlyArray<unknown>, calls: KillCase['calls'], reads?: KillCase['reads']): KillCase =>
   ({ kills, calls, fails: null, ...(reads === undefined ? {} : { reads }) })
+
+/** {@link stops} after a survivor-naming first try: the survivor version quoting its description is reported. */
+const stopsWithSurvivor = (kills: ReadonlyArray<unknown>, calls: KillCase['calls'], reads?: KillCase['reads']): KillCase =>
+  ({ ...stops(kills, calls, reads), survivor: killFailedDescriptionOf(survivorKillFailed()) })
+
+/** A failure after a survivor-naming first try: the ordinary version quoting the survivor-naming description follows the line. */
+const failsAfterSurvivor = (kills: ReadonlyArray<unknown>, calls: KillCase['calls'], error: unknown, errorClass: AdErrorClass, reads?: KillCase['reads']): KillCase => ({
+  kills: [thrown(survivorKillFailed()), ...kills],
+  calls,
+  fails: [error, errorClass],
+  alert: { earlierSurvivorDescription: killFailedDescriptionOf(survivorKillFailed()) },
+  ...(reads === undefined ? {} : { reads }),
+})
 
 /**
  * Overrides that reach the kill along `path` and answer `kc`: every status
@@ -3312,12 +3549,12 @@ const GONE_KILL_ANSWERS: ReadonlyArray<readonly [string, () => unknown]> = UNLIS
   .filter(([, , errorClass]) => errorClass === AD_ERROR_CLASS_GONE)
   .map(([label, make]) => [label, make] as const)
 
-/** Every UNAVAILABLE kill answer: each form but the survivor-naming ErrTmuxKillFailed, and each other ErrTmuxKillFailed description. */
-const UNAVAILABLE_KILL_ANSWERS: ReadonlyArray<readonly [string, () => unknown]> = [
-  ...UNAVAILABLE_FORMS.filter(([label]) => label !== 'ErrTmuxKillFailed').map(([label, make]) => [label, () => make(KILL_VERB)] as const),
-  ...KILL_FAILED_DESCRIPTIONS.filter((d) => d !== 'pane-process-survived')
-    .map((d) => [`ErrTmuxKillFailed (${d})`, () => errTmuxKillFailed(opsSession(), d)] as const),
-]
+/**
+ * Every UNAVAILABLE kill answer but ErrTmuxKillFailed: each failure after its
+ * tries, with no kill-failure alert (b.jg5 SRJ-907).
+ */
+const UNAVAILABLE_KILL_ANSWERS: ReadonlyArray<readonly [string, () => unknown]> =
+  UNAVAILABLE_FORMS.filter(([label]) => label !== 'ErrTmuxKillFailed').map(([label, make]) => [label, () => make(KILL_VERB)] as const)
 
 /** SRJ-904's kill answers, one row each, with the reads between tries that each one meets. */
 const KILL_CLASS_ROWS: ReadonlyArray<readonly [string, () => KillCase]> = [
@@ -3331,6 +3568,16 @@ const KILL_CLASS_ROWS: ReadonlyArray<readonly [string, () => KillCase]> = [
   ...UNAVAILABLE_KILL_ANSWERS.map(([label, make]) => [`UNAVAILABLE (${label}) on every try`, (): KillCase => {
     const error = make()
     return { kills: [thrown(error)], calls: [KILL_RETRY_TRIES, KILL_RETRY_TRIES - 1], fails: [error, AD_ERROR_CLASS_UNAVAILABLE] }
+  }] as const),
+  // ErrTmuxKillFailed standing after the tries, one row per description: the ordinary version quotes it (b.jg5 SRJ-907, SRJ-1007).
+  ...KILL_FAILED_DESCRIPTIONS.map((d) => [`UNAVAILABLE (ErrTmuxKillFailed, ${d}) on every try`, (): KillCase => {
+    const error = errTmuxKillFailed(opsSession(), d)
+    return {
+      kills: [thrown(error)],
+      calls: [KILL_RETRY_TRIES, KILL_RETRY_TRIES - 1],
+      fails: [error, AD_ERROR_CLASS_UNAVAILABLE],
+      alert: { lastKillFailedDescription: killFailedDescriptionOf(error) },
+    }
   }] as const),
   ['UNAVAILABLE (ErrTmuxUnresponsive) and then a success on the 2nd try', () => stops([thrown(errTmuxUnresponsive(KILL_VERB)), cannedKillResult(true)], [2, 1])],
   // Every other answer: one kill, no read, the persona fails at once.
@@ -3360,42 +3607,71 @@ const KILL_READ_ROWS: ReadonlyArray<readonly [string, () => KillCase]> = [
   }] as const),
 ]
 
-/** A survivor-naming ErrTmuxKillFailed at the first try, then each end of the tries. */
+/**
+ * A survivor-naming ErrTmuxKillFailed at the first try, then each end of the
+ * tries: an end as a success stops the persona with the survivor version
+ * (AC 64); any failure, whatever its class, fails it with the ordinary
+ * version quoting the survivor-naming description, never the survivor one
+ * (b.jg5 SRJ-904 bullet 7, SRJ-907).
+ */
 const KILL_SURVIVOR_ROWS: ReadonlyArray<readonly [string, () => KillCase]> = [
-  ['a read of ended (stopped)', () => stops([thrown(survivorKillFailed())], [1, 1], [ENDED_ROW])],
-  ['a 2nd try answering kill_sent true (stopped)', () => stops([thrown(survivorKillFailed()), cannedKillResult(true)], [2, 1])],
-  ['a 2nd try answering kill_sent false (stopped)', () => stops([thrown(survivorKillFailed()), cannedKillResult(false)], [2, 1])],
+  ['a read of ended (stopped)', () => stopsWithSurvivor([thrown(survivorKillFailed())], [1, 1], [ENDED_ROW])],
+  ['a 2nd try answering kill_sent true (stopped)', () => stopsWithSurvivor([thrown(survivorKillFailed()), cannedKillResult(true)], [2, 1])],
+  ['a 2nd try answering kill_sent false (stopped)', () => stopsWithSurvivor([thrown(survivorKillFailed()), cannedKillResult(false)], [2, 1])],
   ['two tries answering ErrTmuxUnresponsive (failed)', (): KillCase => {
     const error = errTmuxUnresponsive(KILL_VERB)
-    return { kills: [thrown(survivorKillFailed()), thrown(error)], calls: [KILL_RETRY_TRIES, KILL_RETRY_TRIES - 1], fails: [error, AD_ERROR_CLASS_UNAVAILABLE] }
+    return failsAfterSurvivor([thrown(error)], [KILL_RETRY_TRIES, KILL_RETRY_TRIES - 1], error, AD_ERROR_CLASS_UNAVAILABLE)
+  }],
+  ['two tries answering ErrTmuxKillFailed naming no survivor (failed; both descriptions quoted)', (): KillCase => {
+    const error = errTmuxKillFailed(opsSession(), 'outlived-exit-wait')
+    const kc = failsAfterSurvivor([thrown(error)], [KILL_RETRY_TRIES, KILL_RETRY_TRIES - 1], error, AD_ERROR_CLASS_UNAVAILABLE)
+    return { ...kc, alert: { lastKillFailedDescription: killFailedDescriptionOf(error), ...kc.alert } }
   }],
   ['a 2nd try answering CONFLICT (failed)', (): KillCase => {
     const error = errTmuxSessionConflict(KILL_VERB, 'not-this-launch', opsSession())
-    return { kills: [thrown(survivorKillFailed()), thrown(error)], calls: [2, 1], fails: [error, AD_ERROR_CLASS_CONFLICT] }
+    return failsAfterSurvivor([thrown(error)], [2, 1], error, AD_ERROR_CLASS_CONFLICT)
+  }],
+  ['a 2nd try answering CONFIG (failed)', (): KillCase => {
+    const error = errConfigMalformed()
+    return failsAfterSurvivor([thrown(error)], [2, 1], error, AD_ERROR_CLASS_CONFIG)
+  }],
+  ['a read answering CONFIG (failed, no further kill)', (): KillCase => {
+    const error = errConfigMalformed()
+    return failsAfterSurvivor([], [1, 1], error, AD_ERROR_CLASS_CONFIG, [thrown(error)])
+  }],
+  ['a 2nd try answering UNCLASSIFIED (a plain ErrInternal; failed)', (): KillCase => {
+    const error = errInternal()
+    return failsAfterSurvivor([thrown(error)], [2, 1], error, AD_ERROR_CLASS_UNCLASSIFIED)
   }],
   // A GONE answer at the 2nd try ends the tries as a failure with its own class, like every unlisted answer.
   ...UNLISTED_ANSWERS.map(([label, make, errorClass]) => [`a 2nd try answering ${label} (failed)`, (): KillCase => {
     const error = make()
-    return { kills: [thrown(survivorKillFailed()), thrown(error)], calls: [2, 1], fails: [error, errorClass] }
+    return failsAfterSurvivor([thrown(error)], [2, 1], error, errorClass)
   }] as const),
 ]
 
-/** Run `kc` along `overrides`' path: its kill tries, its outcome, the exit, an unchanged state directory and no leak. */
+/**
+ * Run `kc` along `overrides`' path: its kill tries, its outcome and report
+ * (the failure line, followed by the ordinary alert when `kc.alert` is set;
+ * or, when stopped, the survivor version when `kc.survivor` is set, else
+ * nothing), the exit, a state directory unchanged but for the report's two
+ * log files, and no leak.
+ */
 async function runKillCase(command: CliTeardownCommand, [, mk, run]: Command, overrides: () => Overrides, kc: KillCase): Promise<Bundle> {
   const b = mk(killCaseOverrides(overrides(), kc))
-  const before = snapshotTree() // after make, so the PID file is in it
+  const before = snapshotTreeExceptTeardownLogs() // after make, so the PID file is in it
   await run(b)
   expectKillTries(b, kc.calls)
   if (kc.fails === null) {
-    expectTeardownStopped(b, command)
+    expectTeardownStopped(b, command, kc.survivor === undefined ? [] : [survivorReport(command, OPS_PERSONA, kc.survivor)])
   } else {
     const [error, errorClass] = kc.fails
-    expectTeardownFailed(b, command, OPS_NAME, TEARDOWN_STEP_KILL, error, errorClass)
-    const [line] = stderr.filter((l) => l.includes('error during teardown'))
-    for (const name of kc.names ?? []) expect(line).toContain(name)
+    const report = failedReport(command, OPS_PERSONA, error, errorClass, kc.alert)
+    expectTeardownFailed(b, command, [report])
+    for (const name of kc.names ?? []) expect(report.lines[0]).toContain(name)
   }
-  expect(snapshotTree()).toEqual(before)
-  assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
+  expect(snapshotTreeExceptTeardownLogs()).toEqual(before)
+  assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls, files: writtenTeardownLogs() })
   return b
 }
 
@@ -3424,7 +3700,7 @@ describe('the teardown\'s kill by class (b.jg5 SRJ-904, SRJ-702, SRJ-110; AC 64,
 
   test.each(forEachKillPath(GONE_KILL_ANSWERS, 'a first try answering the survivor-naming ErrTmuxKillFailed, then a 2nd try answering '))('%s: %s: the 2nd try line is the GONE failure not tried again, and the end line carries it with alert=ordinary', async (command, _label, { overrides, make }, cmd) => {
     const [first, error] = [survivorKillFailed(), make()]
-    await runKillCase(command, cmd, overrides, { kills: [thrown(first), thrown(error)], calls: [2, 1], fails: [error, AD_ERROR_CLASS_GONE] })
+    await runKillCase(command, cmd, overrides, failsAfterSurvivor([thrown(error)], [2, 1], error, AD_ERROR_CLASS_GONE))
     const outcome = killOutcomeOf({ thrown: error }, TEARDOWN_KILL_OPTIONS)
     const lines = opsKillRetryLines()
     expect(lines).toHaveLength(4) // try 1, the read, try 2, the end
@@ -3471,7 +3747,7 @@ describe('the teardown\'s kill by class (b.jg5 SRJ-904, SRJ-702, SRJ-110; AC 64,
   ], 'a first try answering UNAVAILABLE, then '))('%s: %s: no further kill, and the persona fails as CONFIG naming the config file', async (command, _label, { overrides, make }, cmd) => {
     const { kc, end, killError } = make()
     await runKillCase(command, cmd, overrides, kc)
-    expect(stderr.filter((l) => l.includes('error during teardown')).join('\n')).toContain(AD_CONFIG_FILE_DISPLAY_NAME)
+    expect(stderr.filter((l) => l.startsWith(`${command}: `))[0]).toContain(AD_CONFIG_FILE_DISPLAY_NAME)
     // Precondition: the tries ended the way this row says.
     const [tries, reads] = kc.calls
     expect(stderr).toContain(killRetryEndLine(opsKillLogPrefix(), opsId(), {
@@ -3500,7 +3776,7 @@ describe('the teardown\'s kill by class (b.jg5 SRJ-904, SRJ-702, SRJ-110; AC 64,
     expect(indicesOf(/\bsetTimeout\b/g, code)).toHaveLength(1)
     expect(indicesOf(/\bsetInterval\b/g, code)).toEqual([])
     expect(code.match(/\binstanceof\s+(?:Err[A-Z]\w*|AgentDirectorError)\b/g)).toBeNull()
-    expect(code.match(/\binstanceof\s+\w+/g)?.filter((m) => !/\b(?:Error|StartupGateFailedError|TeardownIncompleteError)$/.test(m))).toEqual([]) // CSCB's own classes and Error only
+    expect(code.match(/\binstanceof\s+\w+/g)?.filter((m) => !/\b(?:Error|StartupGateFailedError)$/.test(m))).toEqual([]) // CSCB's own class and Error only
   })
 })
 
@@ -3547,14 +3823,15 @@ describe('a human-initiated teardown\'s ordinary kill (b.jg5 SRJ-503, SRJ-513; A
       directorPause: async () => { throw errSpawnNotPausable(PAUSE_VERB) },
       directorKill: async () => { throw conflict },
     })
-    const before = snapshotTree()
+    const before = snapshotTreeExceptTeardownLogs()
 
     await run(b)
 
     expect([b.statusCalls, b.pauseCalls, b.killCalls]).toEqual([[opsId()], [opsId()], [opsId()]])
-    expectTeardownFailed(b, command, OPS_NAME, TEARDOWN_STEP_KILL, conflict, AD_ERROR_CLASS_CONFLICT)
-    expect(stderr.filter((l) => l.includes('error during teardown')).join('\n')).toContain(opsSession())
-    expect(snapshotTree()).toEqual(before)
+    const report = failedReport(command, OPS_PERSONA, conflict, AD_ERROR_CLASS_CONFLICT)
+    expectTeardownFailed(b, command, [report])
+    expect(report.lines[0]).toContain(opsSession())
+    expect(snapshotTreeExceptTeardownLogs()).toEqual(before)
     assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
   })
 
@@ -3586,11 +3863,250 @@ describe('a human-initiated teardown\'s ordinary kill (b.jg5 SRJ-503, SRJ-513; A
       expect([ids(log.readPaneCalls), ids(log.statusCalls), ids(log.pauseCalls)]).toEqual([[betaId()], [alphaId(), betaId()].sort(), [betaId()]])
       expect(log.killCalls).toEqual([{ claude_instance_id: betaId() }])
       for (const request of log.killCalls) expect(Object.keys(request)).toEqual(['claude_instance_id'])
-      expect(b.serverSignals).toEqual(['SIGTERM'])
-      expect(b.exitCodes).toEqual([0])
-      expect(stderr.filter((l) => l.includes('error during teardown'))).toEqual([])
+      expectTeardownStopped(b, CLI_COMMAND_STOP_BOTS)
       assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls, log })
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The teardown's report and where each line goes (b.jg5 SRJ-907, SRJ-909,
+// SRJ-1013, SRJ-1002; AC 64, AC 73, AC 77; hatch notes E19–E20 bullet 1, E21)
+//
+// Personas are torn down in parallel; once every one has settled (a teardown
+// that rejects included, as a failure), each persona's report is written in
+// configuration order: printed (for `clean_restart` through its fatal path,
+// so once on the terminal and once in clean_restart.log, the survivor version
+// on a successful run included), then its server.log lines, then its
+// startup-errors entry; the last line, counting the failed personas only, is
+// printed last and only printed. Both writes are best effort: a failed one
+// prints one line, leaves the print and the other destination as they are and
+// changes no exit status. Both CLI closing sentences of the kill-failure
+// alert are reached here, through the CLI (hatch note E21).
+// ---------------------------------------------------------------------------
+
+describe('the teardown\'s report and where each line goes (b.jg5 SRJ-907, SRJ-909, SRJ-1013; AC 64, AC 73, AC 77)', () => {
+  const GAMMA = { name: 'Gamma', channels: [{ id: 'C0GAMMA01', delivery: 'all' as const }] }
+  const [alphaP, betaP, gammaP] = [ALPHA.name, BETA.name, GAMMA.name].map(personaOf) as [CliTeardownPersona, CliTeardownPersona, CliTeardownPersona]
+  const idOf = (p: CliTeardownPersona): string => personaInstanceId(p.key)
+  const sessionOf = (p: CliTeardownPersona): string => personaTmuxSessionName(p.key)
+
+  /** An initLogging that sends console.error to `log`, as the real one sends it to clean_restart.log. */
+  const redirectTo = (log: string[]) => (): void => {
+    console.error = (...args: unknown[]) => { log.push(formatLine(args)) }
+  }
+
+  /** A run's overrides and the reports it gives, in configuration order. */
+  interface Scenario {
+    readonly overrides: Overrides
+    readonly reports: readonly ExpectedReport[]
+  }
+
+  /**
+   * Alpha's kill answers ErrTmuxKillFailed naming no survivor on every try
+   * (failed, with the ordinary version quoting it); Beta's first kill names a
+   * survivor and the read after it finds the row ended (stopped, with the
+   * survivor version). Both pauses answer GONE.
+   */
+  function failedAndSurvivor(command: CliTeardownCommand): Scenario {
+    const alphaError = errTmuxKillFailed(sessionOf(alphaP), 'outlived-exit-wait')
+    const betaSurvivor = errTmuxKillFailed(sessionOf(betaP), 'pane-process-survived')
+    let betaKills = 0
+    return {
+      overrides: {
+        config: makeMultiPersonaConfig([ALPHA, BETA], root),
+        directorStatus: async (id) => (id === idOf(betaP) && betaKills > 0 ? ENDED_ROW : WAITING_ROW),
+        directorPause: async () => { throw errTmuxSendKeys() },
+        directorKill: async (id) => {
+          if (id === idOf(alphaP)) throw alphaError
+          betaKills++
+          throw betaSurvivor
+        },
+      },
+      reports: [
+        failedReport(command, alphaP, alphaError, AD_ERROR_CLASS_UNAVAILABLE, { lastKillFailedDescription: killFailedDescriptionOf(alphaError) }),
+        survivorReport(command, betaP, killFailedDescriptionOf(betaSurvivor)),
+      ],
+    }
+  }
+
+  /** Alpha is stopped by its kill; Beta's first kill names a survivor and its 2nd succeeds: every persona stopped. */
+  function survivorOnly(command: CliTeardownCommand): Scenario {
+    const betaSurvivor = errTmuxKillFailed(sessionOf(betaP), 'pane-process-survived')
+    const betaKills = scripted<unknown>(thrown(betaSurvivor), cannedKillResult(false))
+    return {
+      overrides: {
+        config: makeMultiPersonaConfig([ALPHA, BETA], root),
+        directorStatus: async () => WAITING_ROW,
+        directorPause: async () => { throw errTmuxSendKeys() },
+        directorKill: async (id) => (id === idOf(betaP) ? betaKills() : cannedKillResult(true)),
+      },
+      reports: [survivorReport(command, betaP, killFailedDescriptionOf(betaSurvivor))],
+    }
+  }
+
+  const SCENARIOS: ReadonlyArray<readonly [string, (command: CliTeardownCommand) => Scenario]> = [
+    ['a persona failed with the ordinary version beside one stopped with the survivor version', failedAndSurvivor],
+    ['every persona stopped, one with the survivor version', survivorOnly],
+  ]
+
+  /** The report's exit and lines: {@link expectTeardownFailed} when any persona failed, else {@link expectTeardownStopped}. */
+  function expectRun(b: Bundle, command: CliTeardownCommand, reports: readonly ExpectedReport[], to: ReportDestinations = {}): void {
+    if (reports.some((r) => r.failed)) expectTeardownFailed(b, command, reports, to)
+    else expectTeardownStopped(b, command, reports, to)
+  }
+
+  test.each(COMMANDS)('%s: three personas settling in the reverse of configuration order are reported in configuration order — Alpha\'s failure line and the ordinary version, Beta\'s failure line alone, Gamma\'s survivor version — then the last line counting 2, printed last and neither logged nor recorded; each persona\'s print, server.log lines and entry in turn; exit 1, no start', async (command, make, run) => {
+    const alphaError = errTmuxKillFailed(sessionOf(alphaP), 'unverifiable-session-present')
+    const betaError = errTmuxSessionConflict(PAUSE_VERB, 'leftover', sessionOf(betaP))
+    const gammaSurvivor = errTmuxKillFailed(sessionOf(gammaP), 'pane-process-survived')
+    const gammaKills = scripted<unknown>(thrown(gammaSurvivor), cannedKillResult(true))
+    const b = make({
+      config: makeMultiPersonaConfig([ALPHA, BETA, GAMMA], root),
+      directorStatus: async () => WAITING_ROW,
+      directorPause: async (id) => { throw id === idOf(betaP) ? betaError : errTmuxSendKeys() },
+      directorKill: async (id) => {
+        if (id === idOf(alphaP)) throw alphaError
+        return gammaKills()
+      },
+    })
+
+    await run(b)
+
+    // Precondition: Beta settled first (no kill), Gamma next (2 kills), Alpha last (KILL_RETRY_TRIES kills).
+    const lastCallOf = (verb: string, p: CliTeardownPersona): number => callTimesOf(b, verb, idOf(p)).at(-1)!
+    expect(callTimesOf(b, KILL_VERB, idOf(betaP))).toEqual([])
+    expect([callTimesOf(b, KILL_VERB, idOf(alphaP)).length, callTimesOf(b, KILL_VERB, idOf(gammaP)).length]).toEqual([KILL_RETRY_TRIES, 2])
+    expect(lastCallOf(PAUSE_VERB, betaP)).toBeLessThan(lastCallOf(KILL_VERB, gammaP))
+    expect(lastCallOf(KILL_VERB, gammaP)).toBeLessThan(lastCallOf(KILL_VERB, alphaP))
+
+    const reports = [
+      failedReport(command, alphaP, alphaError, AD_ERROR_CLASS_UNAVAILABLE, { lastKillFailedDescription: killFailedDescriptionOf(alphaError) }),
+      failedReport(command, betaP, betaError, AD_ERROR_CLASS_CONFLICT),
+      survivorReport(command, gammaP, killFailedDescriptionOf(gammaSurvivor)),
+    ]
+    expectTeardownFailed(b, command, reports)
+    const last = teardownNotStoppedLine(command, 2)
+    expect(stderr.at(-1)).toBe(last)
+    expect(serverLogTexts(b.clock.now())).not.toContain(last)
+    expect(startupErrorEntries().map((e) => e.classLabel)).toEqual([PERSONA_KILL_FAILED_LABEL, CLI_TEARDOWN_FAILED_LABEL, PERSONA_KILL_SURVIVOR_LABEL])
+    expect(startupErrorEntries().filter((e) => e.message.includes(last))).toEqual([])
+    // The alert entries' context names the command (hatch note E19–E20 bullet 1).
+    const context = killFailureAlertEntryText('', killFailureCliTeardownEntryContext(command), '')
+    expect(context).toContain(command)
+    for (const i of [0, 2]) expect(startupErrorEntries()[i]!.message).toContain(context)
+    // Both CLI closing sentences reach the terminal (hatch note E21).
+    expect(stderr.filter((l) => l.endsWith(KILL_FAILURE_ORDINARY_CLI_TEARDOWN_CLOSING))).toEqual([reports[0]!.lines[1]])
+    expect(stderr.filter((l) => l.endsWith(KILL_FAILURE_SURVIVOR_CLI_TEARDOWN_CLOSING))).toEqual([reports[2]!.lines[0]])
+    // Per persona in turn: its server.log lines, then its entry.
+    const writes = b.events.filter((e) => e === 'appendServerLogLine' || e === 'recordStartupErrorEntry').map((e) => (e === 'appendServerLogLine' ? 'log' : 'entry'))
+    expect(writes).toEqual(['log', 'log', 'entry', 'log', 'entry', 'log', 'entry'])
+  })
+
+  test.each(COMMANDS)('%s: AC 64: every persona stopped, Alpha after a survivor-naming kill failure and a read of ended: only the survivor version is printed, logged and recorded under persona-kill-survivor; Alpha counts as stopped, so there is no failure line and no last line; stop --stop-bots exits 0 and clean_restart starts the server', async (command, make, run) => {
+    const alphaSurvivor = errTmuxKillFailed(sessionOf(alphaP), 'pane-process-survived')
+    let alphaKills = 0
+    const b = make({
+      config: makeMultiPersonaConfig([ALPHA, BETA], root),
+      directorStatus: async (id) => (id === idOf(alphaP) && alphaKills > 0 ? ENDED_ROW : WAITING_ROW),
+      directorPause: async () => { throw errTmuxSendKeys() },
+      directorKill: async (id) => {
+        if (id !== idOf(alphaP)) return cannedKillResult(true)
+        alphaKills++
+        throw alphaSurvivor
+      },
+    })
+
+    await run(b)
+
+    expect([b.killCalls.filter((id) => id === idOf(alphaP)), b.killCalls.filter((id) => id === idOf(betaP))]).toEqual([[idOf(alphaP)], [idOf(betaP)]])
+    expectTeardownStopped(b, command, [survivorReport(command, alphaP, killFailedDescriptionOf(alphaSurvivor))])
+  })
+
+  test.each(forEachCommand(SCENARIOS))('%s: %s: each report line reaches the terminal exactly once and, for clean_restart, clean_restart.log exactly once; nothing else reaches the terminal from clean_restart but its abort line', async (command, _label, scenario, [, make, run]) => {
+    const log: string[] = []
+    const { overrides, reports } = scenario(command)
+    const b = make({ ...overrides, initLogging: redirectTo(log) })
+
+    await run(b)
+
+    expectRun(b, command, reports)
+    const failed = reports.filter((r) => r.failed).length
+    const printed = [...reports.flatMap((r) => r.lines), ...(failed > 0 ? [teardownNotStoppedLine(command, failed)] : [])]
+    for (const line of printed) expect([line, stderr.filter((l) => l === line).length]).toEqual([line, 1])
+    if (command === CLI_COMMAND_CLEAN_RESTART) {
+      expect(b.logInits).toEqual([join(stateDir, 'clean_restart.log')])
+      for (const line of printed) expect([line, log.filter((l) => l === line).length]).toEqual([line, 1])
+      expect(stderr).toHaveLength(printed.length + (failed > 0 ? 1 : 0))
+    } else {
+      expect(log).toEqual([])
+    }
+    assertNoLeak({ stderr, log, files: writtenTeardownLogs() })
+  })
+
+  /** A write failure carrying fake tokens: its description, never itself, reaches the one line that reports it. */
+  const writeError = (): Error => Object.assign(new Error(`disk refused (${sentinelInMessage('write')})`), { code: 'ENOSPC', note: LEAK_SENTINEL })
+
+  /** A failing write: the seam's override and which destination it leaves unwritten. */
+  type WriteFailure = (error: Error) => { readonly overrides: Overrides; readonly to: ReportDestinations }
+  const WRITE_FAILURES: ReadonlyArray<readonly [string, WriteFailure]> = [
+    ['the server.log append throws', (error) => ({ overrides: { appendServerLogLine: () => { throw error } }, to: { serverLog: false } })],
+    ['the server.log append answers not written', (error) => ({ overrides: { appendServerLogLine: () => ({ written: false, error }) }, to: { serverLog: false } })],
+    ['the startup-errors recorder throws', (error) => ({ overrides: { recordStartupErrorEntry: () => { throw error } }, to: { startupErrors: false } })],
+  ]
+
+  test.each(forEachCommand(WRITE_FAILURES.flatMap(([failure, fail]) => SCENARIOS.map(([label, scenario]) => [`${failure}, ${label}`, { fail, scenario }] as const))))(
+    '%s: %s: every line is still printed, the other destination still written and the exit status unchanged; each failed write is reported in one line naming its error by description only',
+    async (command, _label, { fail, scenario }, [, make, run]) => {
+      const error = writeError()
+      const { overrides, reports } = scenario(command)
+      const failure = fail(error)
+      const b = make({ ...overrides, ...failure.overrides })
+
+      await run(b)
+
+      expectRun(b, command, reports, failure.to)
+      const failedWrites = failure.to.serverLog === false ? reports.flatMap((r) => r.lines).length : reports.length
+      const reported = stderr.filter((l) => l.includes(describeThrownValue(error)))
+      expect(reported).toHaveLength(failedWrites)
+      for (const line of reported) expect(line.startsWith(`[slack] ${command}: `)).toBe(true)
+      assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls, files: writtenTeardownLogs() })
+    },
+  )
+
+  test.each(COMMANDS)('%s: a persona\'s teardown that rejects (its pause tries\' wait fails) is waited for and fails that persona with the rejection\'s class and description, while the other is still torn down; the last line counts 1', async (command, make, run) => {
+    const sleepError = new Error(`the wait broke (${sentinelInMessage('sleep')})`)
+    let alphaPaused = false
+    const b = make({
+      config: makeMultiPersonaConfig([ALPHA, BETA], root),
+      directorStatus: async () => WAITING_ROW,
+      directorPause: async (id) => {
+        if (id !== idOf(alphaP)) throw errTmuxSendKeys()
+        alphaPaused = true
+        throw errTmuxUnresponsive(PAUSE_VERB) // UNAVAILABLE: the next try waits on deps.sleep
+      },
+      sleep: async () => { if (alphaPaused) throw sleepError },
+    })
+
+    await run(b)
+
+    expect([b.pauseCalls.filter((id) => id === idOf(alphaP)), b.killCalls]).toEqual([[idOf(alphaP)], [idOf(betaP)]])
+    expectTeardownFailed(b, command, [failedReport(command, alphaP, sleepError, AD_ERROR_CLASS_UNAVAILABLE)])
+  })
+
+  test('production deps append the teardown\'s lines to server.log in the server\'s state directory through appendLogLine, at the time given, and record its entries with recordStartupError there with no copy on fd 2 (static; b.jg5 SRJ-909)', () => {
+    const code = stripComments(readFileSync(CLI_SOURCE, 'utf-8'))
+    const main = indicesOf(/\bif\s*\(\s*import\.meta\.main\s*\)/g, code)
+    expect(main).toHaveLength(1)
+    const mainBlock = code.slice(...balancedAfter(code, main[0]!, '{', '}'))
+    const props = objectProperties(mainBlock.slice(mainBlock.indexOf('const realDeps: CliDeps =')))
+    expect(props.get('appendServerLogLine')).toMatch(
+      /^\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*=>\s*appendLogLine\(\s*join\(\s*resolveServerStateDir\(\)\s*,\s*'server\.log'\s*\)\s*,\s*\1\s*,\s*\2\s*\)$/,
+    )
+    const record = props.get('recordStartupErrorEntry')
+    expect(record).toMatch(/^\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*=>\s*recordStartupError\(\s*\1\s*,\s*\2\s*,\s*undefined\s*,\s*\{[^}]*\}\s*\)$/)
+    const options = objectProperties(record!.slice(record!.lastIndexOf('{')))
+    expect([...options].sort()).toEqual([['logDir', 'resolveServerStateDir()'], ['omitStderr', 'true']])
   })
 })
 
@@ -3811,21 +4327,26 @@ describe('stop --stop-bots failure lines (AC 20)', () => {
     expect(initClient).toMatch(/^\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*=>\s*initProductionClient\(\s*\1\s*,\s*\2\s*\)$/)
   })
 
-  test('an incomplete teardown (TeardownIncompleteError) prints its count and retry advice on the teardown-failed line; the underlying error, carrying fake tokens, is only described on the persona\'s failure line (its step and class named), its message redacted; exit 1; nothing logged leaks', async () => {
+  test('a teardown that could not stop a persona prints the persona\'s failure line and then the last line, its count and retry advice; the underlying error, carrying fake tokens, is only described on the failure line (its class named), its message redacted, there and in server.log and startup-errors.log; no other line names the teardown\'s failure; exit 1; nothing logged leaks', async () => {
     const statusError = Object.assign(new Error(`status refused (${sentinelInMessage('status')})`), { code: 'ECONNREFUSED', note: LEAK_SENTINEL })
     const b = makeStopDeps({ directorStatus: async () => { throw statusError } })
 
     await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
 
-    expect(stderr.filter((l) => l.includes('bot teardown failed'))).toEqual([
-      '[slack] stop --stop-bots: bot teardown failed: teardownBots: agent-director error — teardown incomplete for 1 persona(s); ' +
-        'other personas may already have been paused or killed; rows are never deleted, safe to retry',
-    ])
-    expect(teardownErrorReportOf(statusError).errorClass).toBe(AD_ERROR_CLASS_UNAVAILABLE)
-    expect(linesWith('error during teardown')).toEqual([teardownFailureLogLine(OPS_NAME, TEARDOWN_STEP_STATE_READ, statusError).split(' at ')[0]!])
-    expect(linesWith('error during teardown')[0]).toContain(`Error code=ECONNREFUSED message="status refused (${REDACTED_SENTINEL_TAIL})"`)
+    const report = failedReport(CLI_COMMAND_STOP_BOTS, OPS_PERSONA, statusError, AD_ERROR_CLASS_UNAVAILABLE)
+    expectReported(b, CLI_COMMAND_STOP_BOTS, [report])
+    expect(stderr.slice(-2)).toEqual([report.lines[0], teardownNotStoppedLine(CLI_COMMAND_STOP_BOTS, 1)])
+    expect(report.lines[0]).toContain(`: ${AD_ERROR_CLASS_UNAVAILABLE}: Error code=ECONNREFUSED message="status refused (${REDACTED_SENTINEL_TAIL})"`)
+    expect(linesWith('bot teardown failed')).toEqual([])
     expect(b.exitCodes).toEqual([1])
-    assertNoLeak({ consoleErrorArgs: errorSpy.mock.calls, stderr })
+    assertNoLeak({ consoleErrorArgs: errorSpy.mock.calls, stderr, files: writtenTeardownLogs() })
+  })
+
+  test('no aggregate teardown failure: TeardownIncompleteError appears nowhere in src/ (static; b.jg5 SRJ-907)', () => {
+    const srcDir = resolve(import.meta.dir, '..', 'src')
+    const files = (readdirSync(srcDir, { recursive: true }) as string[]).filter((rel) => rel.endsWith('.ts'))
+    expect(files).toContain('cli.ts') // the walk is not vacuous
+    expect(files.filter((rel) => readFileSync(join(srcDir, rel), 'utf-8').includes('TeardownIncompleteError'))).toEqual([])
   })
 
   test.each<[string, () => unknown, string]>([
