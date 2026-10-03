@@ -38,11 +38,11 @@
  *    config-file onset quotes agent-director, the conflict latch, whose
  *    lines and record carry agent-director's CONFLICT description, the kill
  *    modules (the checked kill, its bounded retry and the kill-failure
- *    alert's texts), the read-pane outcome, the persona routing, the
- *    live-row sequence, whose step lines carry agent-director failure text,
- *    and the old-life wait's round end, whose notice texts carry
- *    agent-director's CONFLICT and unusable-name answers), a value
- *    import of one
+ *    alert's texts), the read-pane outcome, the CLI precheck's verdict and
+ *    failure lines, the persona routing, the live-row sequence, whose step
+ *    lines carry agent-director failure text, and the old-life wait's round
+ *    end, whose notice texts carry agent-director's CONFLICT and
+ *    unusable-name answers), a value import of one
  *    of the `HELPER_SURFACES` helpers (the token builders and sentinel, the
  *    config-file writer, the agent-director settings-file writer, the reload,
  *    connection, routing and recovery harnesses, the Slack client factory
@@ -134,6 +134,7 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/persona-destination[\w-]*\.ts$/, "the destination resolver and hold, which open DMs through a persona's client and describe Slack failures"],
   [/^src\/health-check\.ts$/, 'the health check, whose lines carry agent-director failure text'],
   [/^src\/cli\.ts$/, 'the CLI, which loads the config and logs agent-director failure text'],
+  [/^src\/cli-teardown\.ts$/, "the CLI teardown commands' pure pieces, whose precheck failure lines and teardown verdicts and outcomes carry agent-director failure text (described, redacted) to the terminal and clean_restart.log"],
   [/^src\/agent-director-template\.ts$/, "the template install and refresh, whose lines and startup error carry agent-director failure text"],
   [/^src\/ad-error-class\.ts$/, "the agent-director error classifier, whose reported message carries agent-director failure text (an error's description) to log lines"],
   [/^src\/ad-settings\.ts$/, "the agent-director settings reader, which reads agent-director's config.toml and logs a refused read's reason"],
@@ -527,6 +528,22 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     expect([callsAssertNoLeak(suite), suite in EXEMPT]).toEqual([true, false])
   })
 
+  // b.jg5 SRJ-901, SRJ-903: a precheck failure line, and a teardown verdict or outcome, carries the described
+  // agent-director failure to the terminal and clean_restart.log.
+  test('src/cli-teardown.ts is a source surface: its verdict and line builders touch, its constants and types alone do not, and every suite that touches it leak-checks with no exemption', () => {
+    const suite = 'tests/cli-teardown.test.ts'
+    expect(SOURCE_SURFACES.some(([re]) => re.test('src/cli-teardown.ts'))).toBe(true)
+    expect(touchReasonsOf(suite, "import { precheckVerdictOf } from '../src/cli-teardown.ts'").length).toBe(1)
+    expect(touchReasonsOf(suite, "import { precheckFailureLine as line } from '../src/cli-teardown.ts'").length).toBe(1)
+    expect(touchReasonsOf(suite, "import { pauseVerdictOf, stateReadVerdictOf, teardownErrorReportOf } from '../src/cli-teardown.ts'").length).toBe(3)
+    expect(touchReasonsOf(suite, "import { PRECHECK_TRIES, PRECHECK_TRY_SPACING_MS } from '../src/cli-teardown.ts'")).toEqual([])
+    expect(touchReasonsOf(suite, "import type { PrecheckVerdict } from '../src/cli-teardown.ts'")).toEqual([])
+    expect(touchReasons(suite).some((r) => r.includes('src/cli-teardown.ts'))).toBe(true)
+    const touching = SUITES.filter((file) => touchReasons(file).some((r) => r.includes('src/cli-teardown.ts')))
+    expect(touching).toContain(suite)
+    expect(touching.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map((file) => [file, true, false]))
+  })
+
   test("each suite that builds the reload harness leak-checks a run's captured() artifacts", () => {
     const harnessSuites = SUITES.filter((file) =>
       valueImports(file, codeOf(file)).some((b) => b.module === 'tests/test-helpers/reload-harness.ts' && b.imported === 'makeReloadHarness'),
@@ -775,17 +792,6 @@ const RAW_ERROR_ALLOWED: { file: string; anchor: string; reason: string }[] = [
     anchor: 'credentials: cannot read the personas in',
     reason:
       "the config loader's error (loadPersonaConfig on config.json), which never echoes a credential value (the config leg); the CLI process reads no credentials file and no token",
-  },
-  {
-    file: 'src/cli.ts',
-    anchor: 'clean_restart: agent-director initialization failed:',
-    reason:
-      "the startup gate's failure (StartupGateFailedError: CSCB's message naming versions, paths and the fix) in a short-lived CLI process that reads no credentials",
-  },
-  {
-    file: 'src/cli.ts',
-    anchor: 'clean_restart: bot teardown failed',
-    reason: "teardownBots' TeardownIncompleteError, whose message CSCB wrote (a persona count and retry advice); each persona's error was already logged described",
   },
   {
     file: 'src/cli.ts',

@@ -11,7 +11,10 @@
  * delay is recorded, so the schedule is asserted on what the code asked for
  * and no case waits in real time. Every value (the try count, the spacing,
  * the ends, the alert kinds, the class labels) comes from `src/`; every
- * description from the stub's builders. The alert decision carries
+ * description from the stub's builders. A caller whose checked kill counts
+ * GONE as no success (`goneIsFailure`, the CLI's teardown) runs the same
+ * retry; its GONE answer ends the tries as a failure, beside the server
+ * default's session-gone success. The alert decision carries
  * agent-director's descriptions raw by design (T3 redacts at its post), so
  * the leak check covers the log lines, never the decision.
  *
@@ -39,6 +42,7 @@ import {
   AD_ERROR_CLASS_CONFIG,
   AD_ERROR_CLASS_CONFLICT,
   AD_ERROR_CLASS_ENVIRONMENT,
+  AD_ERROR_CLASS_GONE,
   AD_ERROR_CLASS_UNAVAILABLE,
 } from '../src/ad-error-class.ts'
 import type { Phase1KillResult, Phase1StatusResult } from '../src/ad-phase1-types.ts'
@@ -54,8 +58,11 @@ import {
   KILL_ROW_FINISHED_NO_ROW,
   checkedKill,
   killOutcomeOf,
+  type AnyKillOutcome,
+  type CheckedKillOptions,
   type KillOutcome,
   type KillRowFinishedRead,
+  type PlainKillParams,
 } from '../src/checked-kill.ts'
 import {
   KILL_RETRY_ALERT_NONE,
@@ -69,6 +76,8 @@ import {
   KILL_RETRY_END_ROW_FINISHED,
   KILL_RETRY_END_SETTLED,
   KILL_RETRY_END_STOPPED,
+  KILL_RETRY_NEXT_NOT_RETRIED,
+  KILL_RETRY_NEXT_SUCCESS,
   KILL_RETRY_READ_FAILED,
   KILL_RETRY_READ_LATCHED,
   KILL_RETRY_READ_NO_ROW,
@@ -78,10 +87,12 @@ import {
   KILL_RETRY_SPACING_MS,
   KILL_RETRY_TRIES,
   createKillRetryPassBudget,
+  killRetryEndLine,
   killRetrySeedIsLive,
   killRetrySeedOfState,
   killRetryHoldEndedLine,
   killRetryStopped,
+  killRetryTryLine,
   runKillRetry,
   type KillRetryAlert,
   type KillRetryPassBudget,
@@ -104,6 +115,7 @@ import {
   errTmuxCaptureFailed,
   errTmuxKillFailed,
   errTmuxNotAvailable,
+  errTmuxSendKeys,
   errTmuxSessionConflict,
   errTmuxUnresponsive,
   errUnusableName,
@@ -152,11 +164,15 @@ interface RunSpec {
   readonly onKill?: (n: number) => void
   /** Told the number of each read once it has its answer, before the retry reads it. */
   readonly onRead?: (n: number) => void
+  /** The checked kill's options for every try; absent, none (every server site). */
+  readonly killOptions?: CheckedKillOptions
+  /** The retry's `configReadEndsTries`; absent, the server's rule. */
+  readonly configReadEndsTries?: boolean
 }
 
 /** What one scripted retry did. */
 interface Run {
-  readonly result: KillRetryResult
+  readonly result: KillRetryResult<AnyKillOutcome>
   /** `kill` and `status` in call order. */
   readonly calls: string[]
   /** The clock time of each kill. */
@@ -208,12 +224,13 @@ async function run(spec: RunSpec): Promise<Run> {
   const statusQueue: CannedResponse<Phase1StatusResult>[] = []
   const client = makeStubClient({ killQueue: [...spec.kills], statusQueue })
   const reads = [...(spec.reads ?? [])]
-  const work = runKillRetry({
+  const work = runKillRetry<AnyKillOutcome>({
     instanceId: STUB_INSTANCE_ID,
     kill: async () => {
       calls.push('kill')
       killTimes.push(clock.now())
-      const outcome = await checkedKill(STUB_INSTANCE_ID, (params) => client.kill(params))
+      const kill = (params: PlainKillParams): Promise<unknown> => client.kill(params)
+      const outcome = await (spec.killOptions === undefined ? checkedKill(STUB_INSTANCE_ID, kill) : checkedKill(STUB_INSTANCE_ID, kill, spec.killOptions))
       spec.onKill?.(killTimes.length)
       return outcome
     },
@@ -240,6 +257,7 @@ async function run(spec: RunSpec): Promise<Run> {
     ...(spec.keepGoing === undefined ? {} : { keepGoing: spec.keepGoing }),
     ...(spec.budget === undefined ? {} : { budget: spec.budget }),
     ...(spec.holdEnded === undefined ? {} : { holdEnded: spec.holdEnded }),
+    ...(spec.configReadEndsTries === undefined ? {} : { configReadEndsTries: spec.configReadEndsTries }),
     log: (line) => {
       lines.push(line)
     },
@@ -474,11 +492,20 @@ describe('runKillRetry: one status read before each further try (b.jg5 SRJ-702, 
     expect(killRetryStopped(r.result)).toBe(false)
   })
 
-  test('a CONFIG read on a row last read waiting lets the next try go ahead', async () => {
-    const r = await run({ kills: failing(KILL_RETRY_TRIES, () => errTmuxUnresponsive('kill')), reads: [cannedErr(errConfigMalformed()), cannedErr(errConfigMalformed())], lastRead: SEED_WAITING })
+  test.each<[string, boolean | undefined]>([
+    ['absent (the server\'s rule)', undefined],
+    ['false', false],
+  ])('a CONFIG read on a row last read waiting, configReadEndsTries %s, lets the next try go ahead; the result keeps no read', async (_label, configReadEndsTries) => {
+    const r = await run({
+      kills: failing(KILL_RETRY_TRIES, () => errTmuxUnresponsive('kill')),
+      reads: [cannedErr(errConfigMalformed()), cannedErr(errConfigMalformed())],
+      lastRead: SEED_WAITING,
+      ...(configReadEndsTries === undefined ? {} : { configReadEndsTries }),
+    })
 
     expect(r.calls).toEqual(['kill', 'status', 'kill', 'status', 'kill'])
     expect(r.result.end).toBe(KILL_RETRY_END_EXHAUSTED)
+    expect('configRead' in r.result).toBe(false)
   })
 
   // The state last read is the seed, then each live read: a later CONFIG
@@ -491,6 +518,62 @@ describe('runKillRetry: one status read before each further try (b.jg5 SRJ-702, 
 
     expect(r.calls).toEqual(calls)
     expect(r.result.end).toBe(end)
+  })
+
+  // The CLI's teardown (configReadEndsTries): any CONFIG read ends the tries, whatever state was last read, and
+  // the result keeps the read's error for the caller to describe.
+  test.each<[string, KillRetrySeed, string]>([
+    ['waiting', SEED_WAITING, 'the row was last read waiting, and this caller ends the tries on any CONFIG read: no further kill'],
+    ['pending', SEED_PENDING, 'the row was last read pending: no further kill'],
+  ])('configReadEndsTries: a CONFIG read on a row last read %s ends the tries (read-config) with no further kill, the last try\'s outcome standing and the read\'s error kept; its read line says why, then the end line, and no stop line', async (_label, lastRead, why) => {
+    const [last, configError] = [errTmuxUnresponsive('kill'), errConfigMalformed()]
+
+    const r = await run({
+      kills: [cannedErr(last), ...failing(KILL_RETRY_TRIES, () => errTmuxUnresponsive('kill'))],
+      reads: [cannedErr(configError)],
+      lastRead,
+      configReadEndsTries: true,
+    })
+
+    expect(r.calls).toEqual(['kill', 'status'])
+    expect(r.delays).toEqual([KILL_RETRY_SPACING_MS])
+    expect(r.result).toEqual({
+      outcome: notKilled(last), end: KILL_RETRY_END_READ_CONFIG, tries: 1, reads: 1, alert: { kind: KILL_RETRY_ALERT_NONE }, configRead: { error: configError },
+    })
+    expect(r.result.configRead!.error).toBe(configError)
+    expect(killRetryStopped(r.result)).toBe(false)
+    const [, readLine, ...rest] = r.lines
+    expect(readLine).toContain(`status read before kill try 2 for ${STUB_INSTANCE_ID}: `)
+    expect(readLine).toContain(`class=${AD_ERROR_CLASS_CONFIG}`)
+    expect(readLine).toContain(why)
+    expect(rest).toEqual([killRetryEndLine(PREFIX, STUB_INSTANCE_ID, r.result)])
+    expect(r.lines.filter((l) => l.includes('stop before try'))).toEqual([])
+  })
+
+  test('configReadEndsTries: after a live read, a CONFIG read at the next read ends the tries after 2 kills and 2 reads, the 2nd try\'s outcome standing', async () => {
+    const [second, configError] = [errCallTimeout('kill'), errConfigMalformed()]
+
+    const r = await run({
+      kills: [cannedErr(errTmuxUnresponsive('kill')), cannedErr(second), ...failing(1, () => errTmuxUnresponsive('kill'))],
+      reads: [readState('waiting'), cannedErr(configError)],
+      configReadEndsTries: true,
+    })
+
+    expect(r.calls).toEqual(['kill', 'status', 'kill', 'status'])
+    expect(r.result).toEqual({
+      outcome: notKilled(second), end: KILL_RETRY_END_READ_CONFIG, tries: 2, reads: 2, alert: { kind: KILL_RETRY_ALERT_NONE }, configRead: { error: configError },
+    })
+  })
+
+  test.each<[string, Error]>([
+    ['UNAVAILABLE (ErrCallTimeout)', errCallTimeout('status')],
+    ['UNUSABLE NAME', errUnusableName()],
+  ])('configReadEndsTries: a failed read that is no CONFIG (%s) still lets the next try go ahead; the result keeps no read', async (_label, readErr) => {
+    const r = await run({ kills: failing(KILL_RETRY_TRIES, () => errTmuxUnresponsive('kill')), reads: [cannedErr(readErr), cannedErr(readErr)], configReadEndsTries: true })
+
+    expect(r.calls).toEqual(['kill', 'status', 'kill', 'status', 'kill'])
+    expect(r.result.end).toBe(KILL_RETRY_END_EXHAUSTED)
+    expect('configRead' in r.result).toBe(false)
   })
 
   test('a read that latched the persona ends the tries with no further kill; the last try\'s outcome stands and the tries count as stopped', async () => {
@@ -703,6 +786,57 @@ describe('runKillRetry: the survivor rule and the alert decision (b.jg5 SRJ-702,
 
     expect(r.result.outcome).toEqual({ kind: KILL_OUTCOME_KILLED, killSent: false })
     expect(r.result.alert).toEqual({ kind: KILL_RETRY_ALERT_NONE })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A caller whose checked kill counts GONE as no success (goneIsFailure; the
+// CLI's teardown, b.jg5 SRJ-904)
+// ---------------------------------------------------------------------------
+
+describe('runKillRetry over checked kills with goneIsFailure (b.jg5 SRJ-702, SRJ-904, SRJ-1007; hatch A3)', () => {
+  const GONE_IS_FAILURE: CheckedKillOptions = { goneIsFailure: true }
+
+  const GONE_ANSWERS: ReadonlyArray<readonly [string, () => Error]> = [
+    ['ErrTmuxSendKeys', () => errTmuxSendKeys()],
+    ['ErrTmuxCaptureFailed', () => errTmuxCaptureFailed(undefined, 'kill')],
+  ]
+
+  test.each(GONE_ANSWERS)('GONE (%s) at the first try: one kill, no read, no wait; the GONE non-success stands with no alert, logged as not tried again, with no end line', async (_label, make) => {
+    const err = make()
+
+    const r = await run({ kills: [cannedErr(err), ...failing(KILL_RETRY_TRIES, () => errTmuxUnresponsive('kill'))], killOptions: GONE_IS_FAILURE })
+
+    const outcome = killOutcomeOf({ thrown: err }, GONE_IS_FAILURE)
+    expect(outcome).toMatchObject({ kind: KILL_OUTCOME_NOT_KILLED, errorClass: AD_ERROR_CLASS_GONE })
+    expect(r.calls).toEqual(['kill'])
+    expect(r.delays).toEqual([])
+    expect(r.result).toEqual({ outcome, end: KILL_RETRY_END_SETTLED, tries: 1, reads: 0, alert: { kind: KILL_RETRY_ALERT_NONE } })
+    expect(r.lines).toEqual([killRetryTryLine(PREFIX, STUB_INSTANCE_ID, 1, KILL_RETRY_TRIES, outcome, KILL_RETRY_NEXT_NOT_RETRIED)])
+  })
+
+  // The same answers with no options (every server site): GONE is the session-gone success.
+  test.each(GONE_ANSWERS.flatMap(([label, make]) => [
+    [label, 'with goneIsFailure', make, GONE_IS_FAILURE] as const,
+    [label, 'with no options (the server default)', make, undefined] as const,
+  ]))('a survivor-naming first try, then GONE (%s) at the 2nd try %s: no third try; the decision and the end line follow that outcome', async (_label, _how, make, killOptions) => {
+    const first = survivorKillFailed()
+    const err = make()
+
+    const r = await run({ kills: [cannedErr(first), cannedErr(err), ...failing(1, () => errTmuxUnresponsive('kill'))], ...(killOptions === undefined ? {} : { killOptions }) })
+
+    const outcome = killOptions === undefined ? killOutcomeOf({ thrown: err }) : killOutcomeOf({ thrown: err }, killOptions)
+    const alert: KillRetryAlert = killOptions === undefined
+      ? { kind: KILL_RETRY_ALERT_SURVIVOR, survivorDescription: descriptionOf(first) }
+      : { kind: KILL_RETRY_ALERT_ORDINARY, earlierSurvivorDescription: descriptionOf(first) }
+    expect(outcome.kind).toBe(killOptions === undefined ? KILL_OUTCOME_SESSION_GONE : KILL_OUTCOME_NOT_KILLED)
+    expect(r.calls).toEqual(['kill', 'status', 'kill'])
+    expect(r.result).toEqual({ outcome, end: KILL_RETRY_END_SETTLED, tries: 2, reads: 1, alert })
+    const next = killOptions === undefined ? KILL_RETRY_NEXT_SUCCESS : KILL_RETRY_NEXT_NOT_RETRIED
+    expect(r.lines.slice(-2)).toEqual([
+      killRetryTryLine(PREFIX, STUB_INSTANCE_ID, 2, KILL_RETRY_TRIES, outcome, next),
+      killRetryEndLine(PREFIX, STUB_INSTANCE_ID, r.result),
+    ])
   })
 })
 

@@ -13,20 +13,26 @@
  *     unknown error) of a row the path last read live is tried again; every
  *     other outcome stands at once: a success, CONFLICT (never retried as a
  *     kill), UNUSABLE NAME, CONFIG, ENVIRONMENT (`ErrTmuxNotAvailable`, as
- *     when the tmux server is exiting after a kill ended its last session)
- *     and UNCLASSIFIED. A seed that is not live (the row read finished, or no
+ *     when the tmux server is exiting after a kill ended its last session),
+ *     UNCLASSIFIED, and the GONE non-success of a caller whose checked kill
+ *     counts GONE as no success (`goneIsFailure`, `src/checked-kill.ts`; the
+ *     CLI's teardown): that caller's GONE answer is a failure end, logged
+ *     and decided as one. A seed that is not live (the row read finished, or no
  *     row) makes one try: on a finished row `kill` is a no-op success that
  *     proves nothing;
  *   - before each further try, after the 2 s wait, exactly one `status` read
  *     of the row through the caller's read: `ended`, `missing` or
  *     `ErrSpawnNotFound` ends the tries as the `row-finished` success with no
  *     further kill; a read that latched the persona ends them with no further
- *     kill, the last try's outcome standing; a CONFIG answer ends them, the
- *     last try's outcome standing, only when the last state read (the seed,
- *     then each read) is `pending`, and lets the try go ahead otherwise; any
- *     other failed read lets the try go ahead; a live state read becomes the
- *     last state read. The read's own side effects (outage flags, the
- *     `ad-config-malformed` raise, the latch) are the read function's;
+ *     kill, the last try's outcome standing; a CONFIG answer ends them
+ *     (`read-config`), the last try's outcome standing, when the last state
+ *     read (the seed, then each read) is `pending`, or whatever that state
+ *     under the caller's `configReadEndsTries` (the CLI's teardown, whose
+ *     result then keeps the read's error), and lets the try go ahead
+ *     otherwise; any other failed read lets the try go ahead; a live state
+ *     read becomes the last state read. The read's own side effects (outage
+ *     flags, the `ad-config-malformed` raise, the latch) are the read
+ *     function's;
  *   - the keep-going check, asked after the wait and again after the read, ends
  *     the tries with no further kill when it answers false (or throws), the
  *     last try's outcome standing; the result says so (`stopped`), so a
@@ -52,12 +58,13 @@
  *   - `survivor`, quoting the latest survivor-naming description, on any
  *     success end after a survivor-naming failure (a read of `ended`,
  *     `missing` or `ErrSpawnNotFound`; a later try's success, whatever its
- *     `kill_sent`; a later try's `ErrSpawnNotFound` or GONE; an old-life
- *     wait's hold's end, the try it fell in included);
+ *     `kill_sent`; a later try's `ErrSpawnNotFound` or `session-gone`; an
+ *     old-life wait's hold's end, the try it fell in included);
  *   - `ordinary` on a failure end whose last outcome is `ErrTmuxKillFailed`,
  *     quoting its description, and on any failure end after a
  *     survivor-naming failure (a stop by a read or by the keep-going check
- *     included), quoting the latest survivor-naming description, and both
+ *     included, and a later try's GONE non-success under `goneIsFailure`),
+ *     quoting the latest survivor-naming description, and both
  *     when the last outcome is an `ErrTmuxKillFailed` naming no survivor;
  *   - `none` otherwise.
  * The decision is made by class only; the caller does the last outcome's own
@@ -100,6 +107,7 @@ import {
   describeKillOutcome,
   killLetsNextStepRun,
   killOutcomeOf,
+  type AnyKillOutcome,
   type KillOutcome,
   type KillRowFinishedRead,
 } from './checked-kill.ts'
@@ -247,7 +255,10 @@ export const KILL_RETRY_END_EXHAUSTED = 'exhausted'
 export const KILL_RETRY_END_BUDGET_SPENT = 'budget-spent'
 /** A read found the row finished (`ended`, `missing`, `ErrSpawnNotFound`): the `row-finished` success. */
 export const KILL_RETRY_END_ROW_FINISHED = 'row-finished'
-/** A read answered CONFIG with the row last read `pending`: the last try's outcome stands. */
+/**
+ * A read answered CONFIG with the row last read `pending`, or with any state
+ * last read under `configReadEndsTries`: the last try's outcome stands.
+ */
 export const KILL_RETRY_END_READ_CONFIG = 'read-config'
 /** A read latched the persona: the last try's outcome stands. */
 export const KILL_RETRY_END_READ_LATCHED = 'read-latched'
@@ -301,10 +312,14 @@ export type KillRetryAlert =
       readonly earlierSurvivorDescription?: string
     }
 
-/** What the bounded retry answers. */
-export interface KillRetryResult {
+/**
+ * What the bounded retry answers. `O` is the form of the caller's tries: a
+ * server site's checked kill answers a `KillOutcome`; a caller whose checked
+ * kill counts GONE as no success, an `AnyKillOutcome`.
+ */
+export interface KillRetryResult<O extends AnyKillOutcome = KillOutcome> {
   /** The outcome that stands: the last try's, or the `row-finished` success a read gave. */
-  readonly outcome: KillOutcome
+  readonly outcome: O | KillOutcome
   /** How the tries ended. */
   readonly end: KillRetryEnd
   /** Kills made. */
@@ -313,6 +328,12 @@ export interface KillRetryResult {
   readonly reads: number
   /** Which kill-failure alert the tries call for; the caller raises it. */
   readonly alert: KillRetryAlert
+  /**
+   * Under `configReadEndsTries` only, on a `read-config` end: the value the
+   * CONFIG read failed with, raw (redact it before any line, record or
+   * print), so the caller can describe it.
+   */
+  readonly configRead?: { readonly error: unknown }
 }
 
 /**
@@ -321,7 +342,7 @@ export interface KillRetryResult {
  * reports nothing more for the kill, and answers `latched` when the persona
  * is latched.
  */
-export function killRetryStopped(result: KillRetryResult): boolean {
+export function killRetryStopped(result: KillRetryResult<AnyKillOutcome>): boolean {
   return result.end === KILL_RETRY_END_READ_LATCHED || result.end === KILL_RETRY_END_STOPPED
 }
 
@@ -329,12 +350,12 @@ export function killRetryStopped(result: KillRetryResult): boolean {
 // The entry
 // ---------------------------------------------------------------------------
 
-/** What {@link runKillRetry} is given. */
-export interface KillRetryOptions {
+/** What {@link runKillRetry} is given; `O` is the form of the caller's tries ({@link KillRetryResult}). */
+export interface KillRetryOptions<O extends AnyKillOutcome = KillOutcome> {
   /** The row's instance id, for the log lines. */
   readonly instanceId: string
   /** One try: the checked kill or a caller's binding of it. Should never throw; a throw is taken as its outcome. */
-  readonly kill: () => Promise<KillOutcome>
+  readonly kill: () => Promise<O>
   /** One `status` read of the row; its side effects are its own. A throw is a failed read. */
   readonly read: () => Promise<KillRetryRead>
   /** The wait between tries. */
@@ -343,6 +364,13 @@ export interface KillRetryOptions {
   readonly lastRead: KillRetrySeed
   /** Asked after each wait and again after each read; false (or a throw) ends the tries with no further kill. Absent: always true. */
   readonly keepGoing?: () => boolean
+  /**
+   * True: a CONFIG answer at a read between tries ends them (`read-config`)
+   * whatever state was last read, and the result keeps the read's error
+   * (`configRead`); the CLI's teardown. Absent or false: only on a row last
+   * read `pending` (the server's rule), with no `configRead`.
+   */
+  readonly configReadEndsTries?: boolean
   /** The start sweep's pass budget. Absent: every live row's kill gets its tries. */
   readonly budget?: KillRetryPassBudget
   /**
@@ -371,23 +399,33 @@ interface SurvivorTrack {
  * The bounded retry of a kill (SRJ-702). Never throws or rejects, and leaves
  * no timer pending once it settles.
  */
-export async function runKillRetry(options: KillRetryOptions): Promise<KillRetryResult> {
+export async function runKillRetry<O extends AnyKillOutcome = KillOutcome>(
+  options: KillRetryOptions<O>,
+): Promise<KillRetryResult<O>> {
   const live = killRetrySeedIsLive(options.lastRead)
   const budgetSpent = live && budgetIsSpent(options.budget)
   const maxTries = live && !budgetSpent ? KILL_RETRY_TRIES : 1
+  const configEndsTries = options.configReadEndsTries === true
   const track: SurvivorTrack = {}
   let lastRead = options.lastRead
   let tries = 0
   let reads = 0
-  const finish = (outcome: KillOutcome, end: KillRetryEnd): KillRetryResult => {
-    const result: KillRetryResult = { outcome, end, tries, reads, alert: alertDecision(outcome, track) }
+  const finish = (outcome: O | KillOutcome, end: KillRetryEnd, configRead?: { readonly error: unknown }): KillRetryResult<O> => {
+    const result: KillRetryResult<O> = {
+      outcome,
+      end,
+      tries,
+      reads,
+      alert: alertDecision(outcome, track),
+      ...(configRead === undefined ? {} : { configRead }),
+    }
     if (tries + reads > 1 || result.alert.kind !== KILL_RETRY_ALERT_NONE) {
       emit(options, killRetryEndLine(options.logPrefix, options.instanceId, result))
     }
     return result
   }
   /** The `hold-ended` success when the old-life hold has ended (SRJ-702, SRJ-811; option A), with its one line. */
-  const endedByHold = (when: string): KillRetryResult | undefined => {
+  const endedByHold = (when: string): KillRetryResult<O> | undefined => {
     if (!holdHasEnded(options)) return undefined
     emit(options, killRetryHoldEndedLine(options.logPrefix, options.instanceId, when))
     return finish({ kind: KILL_OUTCOME_ROW_FINISHED, read: KILL_ROW_FINISHED_HOLD_ENDED }, KILL_RETRY_END_HOLD_ENDED)
@@ -427,7 +465,7 @@ export async function runKillRetry(options: KillRetryOptions): Promise<KillRetry
     }
     reads++
     const read = await readOnce(options.read)
-    const verdict = judgeRead(read, lastRead)
+    const verdict = judgeRead(read, lastRead, configEndsTries)
     emit(options, killRetryReadLine(options.logPrefix, options.instanceId, tries + 1, read, verdict.kind, lastRead))
     if (verdict.kind === KILL_RETRY_VERDICT_FINISHED) {
       return finish({ kind: KILL_OUTCOME_ROW_FINISHED, read: verdict.read }, KILL_RETRY_END_ROW_FINISHED)
@@ -436,7 +474,9 @@ export async function runKillRetry(options: KillRetryOptions): Promise<KillRetry
     const heldAfterRead = endedByHold(`before try ${tries + 1}`)
     if (heldAfterRead !== undefined) return heldAfterRead
     if (verdict.kind === KILL_RETRY_VERDICT_LATCHED) return finish(outcome, KILL_RETRY_END_READ_LATCHED)
-    if (verdict.kind === KILL_RETRY_VERDICT_CONFIG_STOP) return finish(outcome, KILL_RETRY_END_READ_CONFIG)
+    if (verdict.kind === KILL_RETRY_VERDICT_CONFIG_STOP) {
+      return finish(outcome, KILL_RETRY_END_READ_CONFIG, configEndsTries ? { error: verdict.error } : undefined)
+    }
     if (verdict.lastRead !== undefined) lastRead = verdict.lastRead
     if (!keepGoing(options)) {
       emit(options, killRetryStopLine(options.logPrefix, options.instanceId, tries + 1, "the caller's keep-going check answered false"))
@@ -456,7 +496,7 @@ function budgetIsSpent(budget: KillRetryPassBudget | undefined): boolean {
 }
 
 /** One try; a throw is taken as its outcome. */
-async function tryOnce(kill: () => Promise<KillOutcome>): Promise<KillOutcome> {
+async function tryOnce<O extends AnyKillOutcome>(kill: () => Promise<O>): Promise<O | KillOutcome> {
   try {
     return await kill()
   } catch (thrown) {
@@ -474,7 +514,7 @@ async function readOnce(read: () => Promise<KillRetryRead>): Promise<KillRetryRe
 }
 
 /** The old-life hold-end query; absent is false, a throw is false. */
-function holdHasEnded(options: KillRetryOptions): boolean {
+function holdHasEnded(options: Pick<KillRetryOptions<AnyKillOutcome>, 'holdEnded'>): boolean {
   if (options.holdEnded === undefined) return false
   try {
     return options.holdEnded() === true
@@ -484,12 +524,12 @@ function holdHasEnded(options: KillRetryOptions): boolean {
 }
 
 /** True when `outcome` is an UNAVAILABLE non-success (`ErrTmuxKillFailed` included). */
-function isUnavailableOutcome(outcome: KillOutcome): boolean {
+function isUnavailableOutcome(outcome: AnyKillOutcome): boolean {
   return outcome.kind === KILL_OUTCOME_NOT_KILLED && outcome.errorClass === AD_ERROR_CLASS_UNAVAILABLE
 }
 
 /** The keep-going check; absent is true, a throw is false. */
-function keepGoing(options: KillRetryOptions): boolean {
+function keepGoing(options: Pick<KillRetryOptions<AnyKillOutcome>, 'keepGoing'>): boolean {
   if (options.keepGoing === undefined) return true
   try {
     return options.keepGoing() === true
@@ -499,7 +539,7 @@ function keepGoing(options: KillRetryOptions): boolean {
 }
 
 /** Hand `line` to the sink, ignoring a throw. */
-function emit(options: KillRetryOptions, line: string): void {
+function emit(options: Pick<KillRetryOptions<AnyKillOutcome>, 'log'>, line: string): void {
   try {
     options.log(line)
   } catch {
@@ -534,7 +574,7 @@ export type KillRetryTryNext =
   | typeof KILL_RETRY_NEXT_BUDGET_SPENT
 
 /** What follows try number `tries` of at most `maxTries`. */
-function afterTry(outcome: KillOutcome, tries: number, maxTries: number, live: boolean, budgetSpent: boolean): KillRetryTryNext {
+function afterTry(outcome: AnyKillOutcome, tries: number, maxTries: number, live: boolean, budgetSpent: boolean): KillRetryTryNext {
   if (killLetsNextStepRun(outcome)) return KILL_RETRY_NEXT_SUCCESS
   if (outcome.kind !== KILL_OUTCOME_NOT_KILLED || outcome.errorClass !== AD_ERROR_CLASS_UNAVAILABLE) return KILL_RETRY_NEXT_NOT_RETRIED
   if (!live) return KILL_RETRY_NEXT_NOT_LIVE
@@ -557,7 +597,7 @@ function endOfTryNext(next: KillRetryTryNext): KillRetryEnd {
 const KILL_RETRY_VERDICT_FINISHED = 'finished'
 /** The read latched the persona: the tries end. */
 const KILL_RETRY_VERDICT_LATCHED = 'latched'
-/** A CONFIG answer on a row last read `pending`: the tries end. */
+/** A CONFIG answer on a row last read `pending`, or on any row under `configReadEndsTries`: the tries end. */
 const KILL_RETRY_VERDICT_CONFIG_STOP = 'config-stop'
 /** The try goes ahead. */
 const KILL_RETRY_VERDICT_GO = 'go'
@@ -572,11 +612,14 @@ type KillRetryReadVerdict =
 type JudgedRead =
   | { readonly kind: typeof KILL_RETRY_VERDICT_FINISHED; readonly read: KillRowFinishedRead }
   | { readonly kind: typeof KILL_RETRY_VERDICT_LATCHED }
-  | { readonly kind: typeof KILL_RETRY_VERDICT_CONFIG_STOP }
+  | { readonly kind: typeof KILL_RETRY_VERDICT_CONFIG_STOP; readonly error: unknown }
   | { readonly kind: typeof KILL_RETRY_VERDICT_GO; readonly lastRead?: KillRetrySeed }
 
-/** What `read` decides, given the last state read. */
-function judgeRead(read: KillRetryRead, lastRead: KillRetrySeed): JudgedRead {
+/**
+ * What `read` decides, given the last state read; a CONFIG answer ends the
+ * tries on a row last read `pending`, or on any row when `configEndsTries`.
+ */
+function judgeRead(read: KillRetryRead, lastRead: KillRetrySeed, configEndsTries: boolean): JudgedRead {
   switch (read.kind) {
     case KILL_RETRY_READ_STATE:
       if (read.state === KILL_ROW_FINISHED_ENDED) return { kind: KILL_RETRY_VERDICT_FINISHED, read: KILL_ROW_FINISHED_ENDED }
@@ -591,7 +634,9 @@ function judgeRead(read: KillRetryRead, lastRead: KillRetrySeed): JudgedRead {
   }
   const error = read.kind === KILL_RETRY_READ_FAILED ? read.error : undefined
   if (hasAdErrorName(error, ERR_SPAWN_NOT_FOUND_NAME)) return { kind: KILL_RETRY_VERDICT_FINISHED, read: KILL_ROW_FINISHED_NO_ROW }
-  if (classOf(error) === AD_ERROR_CLASS_CONFIG && seedIsPending(lastRead)) return { kind: KILL_RETRY_VERDICT_CONFIG_STOP }
+  if (classOf(error) === AD_ERROR_CLASS_CONFIG && (configEndsTries || seedIsPending(lastRead))) {
+    return { kind: KILL_RETRY_VERDICT_CONFIG_STOP, error }
+  }
   return { kind: KILL_RETRY_VERDICT_GO }
 }
 
@@ -609,14 +654,14 @@ function classOf(error: unknown): string {
 // ---------------------------------------------------------------------------
 
 /** `outcome`'s `ErrTmuxKillFailed` description, when it is one and the description is a string. */
-function killFailedDescriptionOfOutcome(outcome: KillOutcome): string | undefined {
+function killFailedDescriptionOfOutcome(outcome: AnyKillOutcome): string | undefined {
   if (outcome.kind !== KILL_OUTCOME_NOT_KILLED || outcome.errorClass !== AD_ERROR_CLASS_UNAVAILABLE) return undefined
   if (!outcome.killFailed) return undefined
   return typeof outcome.killFailedDescription === 'string' ? outcome.killFailedDescription : undefined
 }
 
 /** True when `outcome` is an `ErrTmuxKillFailed`. */
-function isKillFailed(outcome: KillOutcome): boolean {
+function isKillFailed(outcome: AnyKillOutcome): boolean {
   return outcome.kind === KILL_OUTCOME_NOT_KILLED && outcome.errorClass === AD_ERROR_CLASS_UNAVAILABLE && outcome.killFailed
 }
 
@@ -631,13 +676,13 @@ function namesSurvivor(description: string | undefined): description is string {
 }
 
 /** Keep a try's survivor-naming description. */
-function noteTry(track: SurvivorTrack, outcome: KillOutcome): void {
+function noteTry(track: SurvivorTrack, outcome: AnyKillOutcome): void {
   const description = killFailedDescriptionOfOutcome(outcome)
   if (namesSurvivor(description)) track.latestSurvivor = description
 }
 
 /** The alert decision for the outcome that stands (SRJ-702, SRJ-704, SRJ-1007). */
-function alertDecision(outcome: KillOutcome, track: SurvivorTrack): KillRetryAlert {
+function alertDecision(outcome: AnyKillOutcome, track: SurvivorTrack): KillRetryAlert {
   const survivor = track.latestSurvivor
   if (killLetsNextStepRun(outcome)) {
     return survivor === undefined
@@ -701,7 +746,7 @@ export function killRetryTryLine(
   instanceId: string,
   tryNumber: number,
   maxTries: number,
-  outcome: KillOutcome,
+  outcome: AnyKillOutcome,
   next: KillRetryTryNext,
 ): string {
   const survivor = namesSurvivor(killFailedDescriptionOfOutcome(outcome)) ? ' (names a surviving pid)' : ''
@@ -750,7 +795,13 @@ function readVerdictText(verdict: KillRetryReadVerdict, read: KillRetryRead, las
     case KILL_RETRY_VERDICT_LATCHED:
       return "no further kill (no call is made for a latched persona); the last try's outcome stands"
     case KILL_RETRY_VERDICT_CONFIG_STOP:
-      return "the row was last read pending: no further kill while agent-director's config is unreadable; the last try's outcome stands"
+      if (seedIsPending(lastRead)) {
+        return "the row was last read pending: no further kill while agent-director's config is unreadable; the last try's outcome stands"
+      }
+      return (
+        `the row was last read ${describeSeed(lastRead)}, and this caller ends the tries on any CONFIG read: ` +
+        "no further kill while agent-director's config is unreadable; the last try's outcome stands"
+      )
     case KILL_RETRY_VERDICT_GO:
       if (read.kind === KILL_RETRY_READ_FAILED && classOf(read.error) === AD_ERROR_CLASS_CONFIG) {
         return `the row was last read ${describeSeed(lastRead)}: the try goes ahead`
@@ -799,6 +850,6 @@ export function killRetryHoldEndedLine(prefix: string, instanceId: string, when:
  * called for:
  *   `<prefix>: kill tries for <id> ended (<end>) after <n> kill(s) and <m> read(s): <describeKillOutcome> — alert=<none|survivor|ordinary>`
  */
-export function killRetryEndLine(prefix: string, instanceId: string, result: KillRetryResult): string {
+export function killRetryEndLine(prefix: string, instanceId: string, result: KillRetryResult<AnyKillOutcome>): string {
   return `${prefix}: kill tries for ${renderId(instanceId)} ended (${result.end}) after ${result.tries} kill(s) and ${result.reads} read(s): ${describeKillOutcome(result.outcome)} — alert=${result.alert.kind} (b.jg5 SRJ-702)`
 }

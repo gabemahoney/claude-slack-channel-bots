@@ -2,8 +2,9 @@
  * ad-settings.ts — agent-director's timing settings, read the way
  * agent-director reads them (b.jg5 SRJ-209).
  *
- * Scope: the settings file's path, table and key names, the defaults and
- * minimums, the read with agent-director's rule, the values in effect and
+ * Scope: the settings file's path (defined in `src/ad-config-file.ts`),
+ * table and key names, the defaults and minimums, the read with
+ * agent-director's rule, the values in effect and
  * `[pause] timeout_seconds` (b.jg5 SRJ-209); the waits derived from the
  * values in effect (G, the alert threshold and B), their whole-minute
  * rendering for notices, and the never-early wait helper that arms a derived
@@ -118,6 +119,7 @@ import { join } from 'node:path'
 
 import { parse, TomlError } from 'smol-toml'
 
+import { AD_CONFIG_FILE_DISPLAY_NAME, AD_SETTINGS_RELATIVE_PATH } from './ad-config-file.ts'
 import { onAdVersionRecheckTick, PHASE1_RUNBOOK_SECTION_TITLE } from './ad-version-gate.ts'
 import {
   FILE_TOO_LARGE_CODE,
@@ -134,8 +136,8 @@ import { MAX_TIMER_DELAY_MS } from './persona-retry-schedule.ts'
 // Names, defaults and minimums
 // ---------------------------------------------------------------------------
 
-/** The settings file's path relative to a home directory. */
-export const AD_SETTINGS_RELATIVE_PATH = join('.agent-director', 'config.toml')
+/** The settings file's path relative to a home directory (`src/ad-config-file.ts`). */
+export { AD_SETTINGS_RELATIVE_PATH }
 
 /** The table that holds the nine timing keys. */
 export const AD_TMUX_TABLE = 'tmux'
@@ -495,7 +497,7 @@ export function createAdSettingsReader(deps: AdSettingsReaderDeps): AdSettingsRe
       if (!inRefusedRun) {
         inRefusedRun = true
         try {
-          deps.log(buildAdSettingsRefusedReadLine(path ?? join('~', AD_SETTINGS_RELATIVE_PATH), outcome.reason, hadAcceptedRead))
+          deps.log(buildAdSettingsRefusedReadLine(path ?? AD_CONFIG_FILE_DISPLAY_NAME, outcome.reason, hadAcceptedRead))
         } catch {
           /* non-critical: the log sink failing changes no value */
         }

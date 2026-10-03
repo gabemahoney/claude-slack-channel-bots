@@ -9,7 +9,10 @@
  * with `new` on the client's own class), and every class and outcome label is
  * imported from `src/`. Only a success (`kill_sent` true, false or absent),
  * `ErrSpawnNotFound` and GONE (SRJ-104: for `kill`, gone is success) pass the
- * predicate; each value of HO C2's non-success list, the unusable-name value,
+ * predicate, GONE only with no options (every server site); under
+ * `goneIsFailure` (the CLI's teardown, SRJ-904) GONE is the GONE non-success
+ * and every other answer gives the same outcome as with no options; each
+ * value of HO C2's non-success list, the unusable-name value,
  * `ErrConfigMalformed`, a value that is not an agent-director error and a
  * value of a class SRJ-110 has no kill row for (UNCLASSIFIED, its class kept
  * as `unlistedClass`) keep their thrown value and their class. The
@@ -70,6 +73,8 @@ import {
   killOutcomeStopsServer,
   teardownKillNotSucceededNoticeText,
   teardownKillRefusalNoticeText,
+  type AnyKillOutcome,
+  type CheckedKillOptions,
   type KillFailure,
   type KillOutcome,
   type KillRecheckKind,
@@ -125,6 +130,17 @@ async function killThroughStub(opts: StubClientOptions): Promise<{ outcome: Kill
   const outcome = await checkedKill(STUB_INSTANCE_ID, (params) => client.kill(params))
   return { outcome, calls }
 }
+
+/** The same checked kill under `options`, with the recorded kill calls. */
+async function killThroughStubWith(opts: StubClientOptions, options: CheckedKillOptions): Promise<{ outcome: AnyKillOutcome; calls: unknown[] }> {
+  const calls: unknown[] = []
+  const client = makeStubClient({ ...opts, killCalls: calls as NonNullable<StubClientOptions['killCalls']> })
+  const outcome = await checkedKill(STUB_INSTANCE_ID, (params) => client.kill(params), options)
+  return { outcome, calls }
+}
+
+/** The CLI teardown's rule: a GONE answer is no success (b.jg5 SRJ-904). */
+const GONE_IS_FAILURE: CheckedKillOptions = { goneIsFailure: true }
 
 /** A DIRECTORY value the stub has no builder for, built with `new` on the client's own class, its `errName` the class name. */
 function errCwd(Cls: typeof ErrCwdNotFound | typeof ErrCwdNotADirectory): Error {
@@ -354,6 +370,51 @@ describe('checkedKill: one plain call that never throws (SRJ-106, SRJ-701)', () 
 })
 
 // ---------------------------------------------------------------------------
+// A caller's rule: GONE is no success (the CLI's teardown; b.jg5 SRJ-904)
+// ---------------------------------------------------------------------------
+
+describe('checkedKill with goneIsFailure (b.jg5 SRJ-904, SRJ-110; hatch A3)', () => {
+  test.each(GONE_ROWS.map(([label, build]) => [label, build] as const))(
+    '%s (GONE) is the GONE non-success carrying the thrown value and its name, and never lets the next step run',
+    async (_label, build) => {
+      const thrown = build()
+      const { outcome, calls } = await killThroughStubWith({ killError: thrown }, GONE_IS_FAILURE)
+      expect(outcome).toEqual({ kind: KILL_OUTCOME_NOT_KILLED, errorClass: AD_ERROR_CLASS_GONE, error: thrown, name: thrown.errName })
+      if (outcome.kind === KILL_OUTCOME_NOT_KILLED) expect(outcome.error).toBe(thrown)
+      expect(killLetsNextStepRun(outcome)).toBe(false)
+      expect(isKillOutcome(outcome)).toBe(true)
+      expect(killOutcomeStopsServer(outcome)).toBe(false)
+      expect(calls).toEqual([PLAIN_KILL_CALL])
+    },
+  )
+
+  // The server's sites pass no options: GONE stays the session-gone success there.
+  test.each(GONE_ROWS.flatMap(([label, build]) => ([
+    ['no options', undefined],
+    ['empty options', {}],
+    ['goneIsFailure false', { goneIsFailure: false }],
+  ] as const).map(([how, options]) => [label, how, build, options] as const)))(
+    '%s (GONE) with %s is the session-gone success, exactly as with no options',
+    async (_label, _how, build, options) => {
+      const thrown = build()
+      const { outcome } = options === undefined ? await killThroughStub({ killError: thrown }) : await killThroughStubWith({ killError: thrown }, options)
+      expect(outcome).toEqual({ kind: KILL_OUTCOME_SESSION_GONE, name: thrown.errName })
+      expect(killLetsNextStepRun(outcome)).toBe(true)
+    },
+  )
+
+  test.each<[string, StubClientOptions]>([
+    ...KILL_SENT_VALUES.map((v): [string, StubClientOptions] => [`a kill result with kill_sent ${String(v)}`, { killResult: cannedKillResult(v) }]),
+    ['ErrSpawnNotFound', { killError: errSpawnNotFound() }],
+    ...NON_SUCCESS_ROWS.map(([label, build]): [string, StubClientOptions] => [label, { killError: build() as Error }]),
+  ])('%s: the same outcome with and without goneIsFailure', async (_label, opts) => {
+    const [withOption, without] = await Promise.all([killThroughStubWith(opts, GONE_IS_FAILURE), killThroughStub(opts)])
+    expect(withOption.outcome).toEqual(without.outcome)
+    expect(withOption.calls).toEqual([PLAIN_KILL_CALL])
+  })
+})
+
+// ---------------------------------------------------------------------------
 // The predicate on answers that are not outcomes
 // ---------------------------------------------------------------------------
 
@@ -417,6 +478,10 @@ describe('describeKillOutcome', () => {
     )
     expect(describeKillOutcome({ kind: KILL_OUTCOME_SESSION_GONE })).toBe(`outcome=${KILL_OUTCOME_SESSION_GONE}`)
     expect(describeKillOutcome({ kind: KILL_OUTCOME_SESSION_GONE, name: 'NotAGoneName' })).toBe(`outcome=${KILL_OUTCOME_SESSION_GONE}`)
+    const sendKeys = errTmuxSendKeys()
+    expect(describeKillOutcome(killOutcomeOf({ thrown: sendKeys }, GONE_IS_FAILURE))).toBe(
+      `outcome=${KILL_OUTCOME_NOT_KILLED} class=${AD_ERROR_CLASS_GONE} ${sendKeys.errName} message=${JSON.stringify(sendKeys.errDescription)}`,
+    )
     const collision = errInstanceIdCollision()
     const unlisted = killOutcomeOf({ thrown: collision })
     expect(describeKillOutcome(unlisted)).toBe(
@@ -469,6 +534,15 @@ describe('describeKillOutcome', () => {
     ['errTmuxUnresponsive (still stopping)', () => errTmuxUnresponsive('kill', `the agent in tmux session ${JSON.stringify(TOKEN_SESSION)} is still stopping`)],
   ])('%s: a fake token in its session name comes out redacted, on one line', (_label, build) => {
     const line = describeKillOutcome(killOutcomeOf({ thrown: build() }))
+    expect(line).toContain(REDACTED_TOKEN_PLACEHOLDER)
+    expect(line).not.toMatch(/[\r\n]/)
+    assertNoLeak({ line })
+  })
+
+  test('the GONE non-success (goneIsFailure) of errTmuxCaptureFailed: a fake token in its session name comes out redacted, on one line, never as the session-gone form', () => {
+    const line = describeKillOutcome(killOutcomeOf({ thrown: errTmuxCaptureFailed(TOKEN_SESSION, 'kill') }, GONE_IS_FAILURE))
+    expect(line.startsWith(`outcome=${KILL_OUTCOME_NOT_KILLED} class=${AD_ERROR_CLASS_GONE} `)).toBe(true)
+    expect(line).not.toContain(KILL_OUTCOME_SESSION_GONE)
     expect(line).toContain(REDACTED_TOKEN_PLACEHOLDER)
     expect(line).not.toMatch(/[\r\n]/)
     assertNoLeak({ line })

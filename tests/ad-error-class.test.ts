@@ -7,7 +7,9 @@
  * UNAVAILABLE by SRJ-104, answers nothing), the kill-failure description
  * accessor `killFailedDescriptionOf` (b.jg5 SRJ-110, SRJ-702; by name, so an
  * `ErrUnknownErrorName` carrying the `ErrTmuxKillFailed` name answers its
- * envelope's description), and the
+ * envelope's description), the one-line description
+ * `describeReportedAdFailure` (b.jg5 SRJ-104: what agent-director reported,
+ * else `describeAgentDirectorFailure`'s description), and the
  * stub's error builders it is fed with (b.jg5 SRJ-1303; their shape checks
  * live here).
  *
@@ -47,6 +49,8 @@ import {
   classifyWithInvalidFlagsRecheck,
   conflictDescriptionOf,
   describeAdErrorClassification,
+  describeAgentDirectorFailure,
+  describeReportedAdFailure,
   hasAdErrorName,
   isDifferentTmuxServerError,
   isInvalidFlagsError,
@@ -1407,6 +1411,130 @@ describe('unclassifiedClassificationOf (b.jg5 SRJ-104, SRJ-110)', () => {
     const value = build()
     expect(() => unclassifiedClassificationOf(value)).not.toThrow()
     expect(unclassifiedClassificationOf(value)).toEqual({ errorClass: AD_ERROR_CLASS_UNCLASSIFIED })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// describeReportedAdFailure (b.jg5 SRJ-104): the one-line description that
+// names what agent-director reported
+// ---------------------------------------------------------------------------
+
+describe('describeReportedAdFailure (b.jg5 SRJ-104)', () => {
+  /** The envelope's `err_description` of an `ErrUnknownErrorName`. */
+  const envelopeDescription = (value: ErrUnknownErrorName): string => (value.envelope as { err_description: string }).err_description
+
+  test.each<readonly [string, () => ErrUnknownErrorName, AdErrorClass]>([
+    ['a plain ErrInternal', () => errInternal(), AD_ERROR_CLASS_UNCLASSIFIED],
+    ['the unusable-name ErrInternal', () => errUnusableName(), AD_ERROR_CLASS_UNUSABLE_NAME],
+    ['ErrConfigMalformed', () => errConfigMalformed(), AD_ERROR_CLASS_CONFIG],
+    ['ErrSchemaMismatch', () => errSchemaMismatch(), AD_ERROR_CLASS_UNCLASSIFIED],
+    [ERR_STORE_OPEN_NAME, () => errUnknownErrorName(ERR_STORE_OPEN_NAME, 'the store could not be opened'), AD_ERROR_CLASS_UNCLASSIFIED],
+  ])('an ErrUnknownErrorName (%s, %s) → its unknownName and the envelope description, not the client\'s own text', (_label, build, classified) => {
+    const value = build()
+    expect(classifyAdError(value).errorClass).toBe(classified)
+    const line = describeReportedAdFailure(value)
+    expect(line).toBe(`${value.unknownName} message=${JSON.stringify(envelopeDescription(value))}`)
+    expect(line).not.toContain(value.errName)
+    expect(line).not.toContain(value.errDescription)
+    expect(line).not.toBe(describeAgentDirectorFailure(value))
+  })
+
+  test('an error of its own class with a name CSCB gives no handling → its errName and its errDescription', () => {
+    const value = errSendKeysWhileRelayed()
+    expect(describeReportedAdFailure(value)).toBe(`${value.errName} message=${JSON.stringify(value.errDescription)}`)
+  })
+
+  test.each([
+    ['empty', ''],
+    ['whitespace only', ' \n '],
+  ])('an %s description → the name alone', (_label, description) => {
+    expect(describeReportedAdFailure(errInternal(description))).toBe(ERR_INTERNAL)
+    expect(describeReportedAdFailure(errGeneric('get', 'ErrNoHandlingInCscb', description))).toBe('ErrNoHandlingInCscb')
+  })
+
+  test.each([
+    ['with a space', () => 'not a safe name'],
+    ['token-shaped', () => fakeToken(BOT_TOKEN_PREFIX, 'name')],
+    ['overlong', () => `Err${'x'.repeat(MAX_LOGGED_MESSAGE_LENGTH)}`],
+  ])('an errName that is not a safe identifier (%s) → the message alone, never the name', (_label, buildName) => {
+    const name = buildName()
+    const value = errGeneric('get', name, 'described')
+    expect(classifyAdError(value).errorClass).toBe(AD_ERROR_CLASS_UNCLASSIFIED)
+    const line = describeReportedAdFailure(value)
+    expect(line).toBe(`message=${JSON.stringify('described')}`)
+    expect(line).not.toContain(name)
+    assertNoLeak(line)
+  })
+
+  test.each<Built>([
+    ...CONFLICT_CASES.map((c): Built => [`CONFLICT (${c})`, () => errTmuxSessionConflict('read-pane', c)]),
+    ['GONE (errTmuxSendKeys)', () => errTmuxSendKeys()],
+    ['STATE (errSpawnNotFound)', () => errSpawnNotFound()],
+    ['UNAVAILABLE (errTmuxUnresponsive)', () => errTmuxUnresponsive()],
+    ['UNAVAILABLE (an ErrUnknownErrorName with a later name)', () => errUnknownErrorName()],
+    ['a wrapped UnknownError', () => baseError(CSCB_UNKNOWN_ERROR_NAME, 'Error: boom')],
+    ['a plain Error', () => new Error('boom')],
+    ['a string', () => 'boom'],
+    ['undefined', () => undefined],
+    ['null', () => null],
+  ])('%s, which reports no name or message → describeAgentDirectorFailure\'s description', (_label, build) => {
+    const value = build()
+    const classification = classifyAdError(value)
+    expect([classification.reportedName, classification.message]).toEqual([undefined, undefined])
+    expect(describeReportedAdFailure(value)).toBe(describeAgentDirectorFailure(value))
+  })
+
+  test('a CONFLICT is described by its own errName and errDescription', () => {
+    const value = errTmuxSessionConflict('read-pane', 'not-this-launch')
+    expect(describeReportedAdFailure(value)).toBe(`${ERR_TMUX_SESSION_CONFLICT_NAME} message=${JSON.stringify(value.errDescription)}`)
+  })
+
+  // What is still readable is reported; a value that reports nothing gets describeAgentDirectorFailure's description.
+  test.each<readonly [string, () => unknown, (value: unknown) => string]>([
+    [
+      'an errName getter that throws (its description is still reported)',
+      () => Object.defineProperty(errSpawnNotFound(), 'errName', { get: () => { throw new Error('boom') } }),
+      (value) => `message=${JSON.stringify((value as { readonly errDescription: string }).errDescription)}`,
+    ],
+    [
+      'an envelope whose err_description getter throws (its name is still reported)',
+      () => unknownWithEnvelope(ERR_INTERNAL, Object.defineProperty({}, 'err_description', { get: () => { throw new Error('boom') } })),
+      () => ERR_INTERNAL,
+    ],
+    [
+      'an unknownName getter that throws (nothing is reported)',
+      () => Object.defineProperty(errInternal(), 'unknownName', { get: () => { throw new Error('boom') } }),
+      (value) => describeAgentDirectorFailure(value),
+    ],
+    ['a proxy whose every trap throws (nothing is reported)', hostileProxy, (value) => describeAgentDirectorFailure(value)],
+  ])('%s: never throws', (_label, build, expected) => {
+    const value = build()
+    expect(() => describeReportedAdFailure(value)).not.toThrow()
+    expect(describeReportedAdFailure(value)).toBe(expected(value))
+  })
+
+  test('a description carrying a token comes out redacted; nothing bare leaks', () => {
+    const secret = `failed (${sentinelInMessage('reported')})`
+    const redacted = `failed (${REDACTED_SENTINEL_TAIL})`
+    // Every value also carries the sentinel bare where nothing is reported.
+    const unknownNamed = (name: string): ErrUnknownErrorName =>
+      Object.assign(
+        new ErrUnknownErrorName(name, { err_name: name, err_description: secret, detail: LEAK_SENTINEL }),
+        { note: LEAK_SENTINEL },
+      )
+    const ownClass = Object.assign(errGeneric('get', 'ErrNoHandlingInCscb', secret), { note: LEAK_SENTINEL })
+    const cases = [
+      [unknownNamed(ERR_INTERNAL), ERR_INTERNAL],
+      [unknownNamed(ERR_CONFIG_MALFORMED), ERR_CONFIG_MALFORMED],
+      [ownClass, ownClass.errName],
+    ] as const
+    const lines = cases.map(([value]) => describeReportedAdFailure(value))
+    expect(lines).toEqual(cases.map(([, name]) => `${name} message=${JSON.stringify(redacted)}`))
+    // A token-shaped unknownName reports nothing: the fallback describes it, still token-safe.
+    const tokenNamed = unknownNamed(fakeToken(BOT_TOKEN_PREFIX, 'unknown'))
+    const fallback = describeReportedAdFailure(tokenNamed)
+    expect(fallback).toBe(describeAgentDirectorFailure(tokenNamed))
+    assertNoLeak({ lines, fallback })
   })
 })
 

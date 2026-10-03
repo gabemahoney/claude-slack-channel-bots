@@ -71,8 +71,12 @@
  * persona teardown (`runTeardown`, `src/persona-lifecycle.ts`, through the
  * `raiseKillFailureAlert` that `main()` binds to the same kill-failure
  * alerts with the context `persona teardown`) raises the persona-teardown
- * route. The CLI teardown's, the old-life wait's and the stuck-launch
- * abort's routes are selected here; no site raises them.
+ * route. The CLI teardown (`stop --stop-bots` and `clean_restart`,
+ * `src/cli.ts`, through `src/cli-teardown.ts`'s per-persona report plan)
+ * raises the CLI-teardown route: printed, a `server.log` line and a
+ * startup-errors entry, whose context names the command
+ * ({@link killFailureCliTeardownEntryContext}). The old-life wait's and the
+ * stuck-launch abort's routes are selected here; no site raises them.
  *
  * Pure module: no module-scope state, no environment or file access, no
  * server-only import (no notifier, Slack client, latch, episodes, outage
@@ -295,9 +299,26 @@ export interface KillFailureAlertRoute {
 }
 
 /**
+ * The route of a CLI teardown's alert: log-only and printed, always with its
+ * startup-errors class (SRJ-704, SRJ-1013).
+ */
+export interface KillFailureCliTeardownRoute extends KillFailureAlertRoute {
+  readonly route: typeof KILL_FAILURE_ROUTE_CLI_TEARDOWN
+  readonly destination: false
+  readonly classLabel: string
+  readonly printed: true
+}
+
+/**
  * SRJ-704's route for an alert, first match wins (see the module comment),
  * with SRJ-1013's class and SRJ-1007's closing sentence. Pure; never throws.
+ * The CLI teardown's context always takes its own route
+ * ({@link KillFailureCliTeardownRoute}).
  */
+export function selectKillFailureAlertRoute(
+  input: KillFailureAlertRouteInput & { readonly context: typeof KILL_FAILURE_CONTEXT_CLI_TEARDOWN },
+): KillFailureCliTeardownRoute
+export function selectKillFailureAlertRoute(input: KillFailureAlertRouteInput): KillFailureAlertRoute
 export function selectKillFailureAlertRoute(input: KillFailureAlertRouteInput): KillFailureAlertRoute {
   const { version, context } = input
   const survivor = version === KILL_FAILURE_VERSION_SURVIVOR
@@ -529,11 +550,44 @@ export function killFailureAlertText(content: KillFailureAlertContent, closing: 
 }
 
 /**
+ * A CLI teardown's context in the log-line and startup-errors form, naming
+ * the command that ran the teardown (`stop --stop-bots` or `clean_restart`,
+ * SRJ-909, SRJ-1013). The command is a plain string: this module imports
+ * neither `src/cli.ts` nor `src/cli-teardown.ts`.
+ */
+export interface KillFailureCliTeardownEntryContext {
+  readonly context: typeof KILL_FAILURE_CONTEXT_CLI_TEARDOWN
+  readonly command: string
+}
+
+/**
+ * The context of a log line or entry: one of {@link KILL_FAILURE_CONTEXTS},
+ * or a CLI teardown's context naming its command.
+ */
+export type KillFailureAlertEntryContext = KillFailureAlertContext | KillFailureCliTeardownEntryContext
+
+/** The CLI teardown's entry context for `command`. Pure. */
+export function killFailureCliTeardownEntryContext(command: string): KillFailureCliTeardownEntryContext {
+  return Object.freeze({ context: KILL_FAILURE_CONTEXT_CLI_TEARDOWN, command })
+}
+
+/**
+ * A context as the log-line and startup-errors form renders it: a context
+ * of {@link KILL_FAILURE_CONTEXTS} as it is; a CLI teardown's naming its
+ * command, `CLI teardown, <command>`. Pure.
+ */
+export function renderKillFailureAlertEntryContext(context: KillFailureAlertEntryContext): string {
+  return typeof context === 'string' ? context : `${context.context}, ${context.command}`
+}
+
+/**
  * The log-line and startup-errors form (SRJ-1007): the persona reference or
  * the row's id (`ref`, e.g. `persona=<key>` or `instanceId=<id>`), the
- * context, then the text: `<ref> (<context>): <text>`. `text` is the
- * unescaped full text ({@link killFailureAlertText} with `forSlack` false).
+ * context, then the text: `<ref> (<context>): <text>`; a CLI teardown's
+ * context names its command, `<ref> (CLI teardown, <command>): <text>`.
+ * `text` is the unescaped full text ({@link killFailureAlertText} with
+ * `forSlack` false).
  */
-export function killFailureAlertEntryText(ref: string, context: KillFailureAlertContext, text: string): string {
-  return `${ref} (${context}): ${text}`
+export function killFailureAlertEntryText(ref: string, context: KillFailureAlertEntryContext, text: string): string {
+  return `${ref} (${renderKillFailureAlertEntryContext(context)}): ${text}`
 }
