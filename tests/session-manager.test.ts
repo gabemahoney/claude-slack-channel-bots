@@ -475,6 +475,20 @@
  *     literally. SRJ-205 (the E4 gate): the launch pool starts no queued
  *     launch once the shutdown query answers true (or throws); those
  *     personas get the not-launched outcome, counted in no count.
+ *   - b.jg5 SRJ-811, SRJ-812, SRJ-1512, SRJ-1015 (E27 T2), on
+ *     `makeRecoveryHarness`: `ensureOldLifeWait` answers `started`,
+ *     `already-running`, `closed`, `not-held` and `not-installed`;
+ *     `buildOldLifeWaitDeps` reads the old id, with the shared own-row read
+ *     (its provenance latch) only for a configured persona's own row, a
+ *     latch never stopping the wait and nothing armed for the old key;
+ *     `personaRetryBlockCause`, `isOldLifeWaitRunningFor` and
+ *     `isSequenceOrOldLifeWaitRunning` for nothing running, P's sequence, a
+ *     wait on a row in P's directory or on P's own row, a removed P and a
+ *     launch in flight; a launch of P, the restart gate and P's sequence
+ *     start refused because a wait runs on P's own row arm P's timer with
+ *     the old-life cause, `launchSession` answers the uncounted `refused`
+ *     for a wait and for a sequence, and the start pass counts the wait's
+ *     `sequence-waiting` once.
  *
  * Most blocks use a stand-in persona keyed by its channel ID
  * (`makeStandInPersonaConfig`), so their `cscb_<channelId>` ids and outage
@@ -1231,6 +1245,29 @@ import {
 } from '../src/session-manager.ts'
 import { readRetiredKeysRecord, retiredKeysRecordOf, RFC3339_UTC, type RetiredKeySeed } from './test-helpers/retired-keys.ts'
 import { expectUntouched, recordSequenceStarts, retiredEntryClearedLine, retiredEntryClearFailedLine, retiredKeyLinesIn } from './test-helpers/recovery-harness.ts'
+import {
+  OLD_LIFE_WAIT_START_NOT_HELD,
+  SEQUENCE_WAITING_CAUSE_OLD_LIFE_HOLD,
+  _resetOldLifeWaitBindings,
+  buildOldLifeWaitDeps,
+  createOldLifeWaitRecord,
+  ensureOldLifeWait,
+  isOldLifeWaitRunningFor,
+  isSequenceOrOldLifeWaitRunning,
+  liveRowSequenceGate,
+  oldLifeWaitNotAppliedLine,
+  oldLifeWaitNotStartedLine,
+  oldLifeWaitRefusalLine,
+  personaRetryBlockCause,
+} from '../src/session-manager.ts'
+import { LIVE_ROW_START_ALREADY_RUNNING, LIVE_ROW_START_CLOSED } from '../src/live-row-sequence.ts'
+import {
+  RETRY_BLOCK_LAUNCH,
+  RETRY_BLOCK_LIVE_ROW_SEQUENCE,
+  RETRY_BLOCK_OLD_LIFE_WAIT,
+  UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD,
+  type RetryBlockCause,
+} from '../src/unavailable-retry.ts'
 import {
   START_SWEEP_KILL_STATUS_SITE,
   START_SWEEP_KILL_STOP_RECHECK,
@@ -27212,5 +27249,303 @@ describe('b.jg5 SRJ-205 (the E4 gate): the start pass\'s launch pool starts no q
     expect(startCountsOf(result)).toEqual(NO_START_COUNTS)
     expect([held.calls, h.stub.callCount()]).toEqual([[], 0])
     expect(keys.map((key) => h.errors.filter((line) => line === notStartedLine(h, key)).length)).toEqual([1, 1, 1])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The old-life wait's entry, its dependency builder and its queries (b.jg5
+// SRJ-811, SRJ-812, SRJ-1512, SRJ-1015; E27 T2), on the recovery harness
+// (its wait bindings, registry and holds composed as main() composes them).
+// The wait's steps and results by class are tests/old-life-wait.test.ts's;
+// the no-launch form's attempt rule, stop and query
+// tests/live-row-sequence.test.ts's.
+// ---------------------------------------------------------------------------
+
+/** A pre-persona row's instance id, held in a persona's working directory. */
+const OLD_PRE_PERSONA_ID = 'cscb_old_C0OLD'
+
+/** Hold `instanceId` (old key `oldKey`) at persona `dirOf`'s working directory, as a start-sweep kill that did not succeed begins it. */
+function holdOldAt(h: RecoveryHarness, instanceId: string, oldKey: string, dirOf: string): void {
+  h.beginOldLifeHold({ instanceId, oldKey, directory: harnessPersona(h, dirOf).working_directory, cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL })
+}
+
+/**
+ * Start the wait on `instanceId` (held already) and resolve once its first
+ * `find-missing` run is held by `hold`, the row read live; answers the
+ * outcome promise.
+ */
+async function waitHeldAtRun(h: RecoveryHarness, instanceId: string, hold: ReturnType<typeof holdFindMissing>): Promise<{ readonly outcome: Promise<unknown> }> {
+  const outcome = h.startOldLifeWait(instanceId)
+  await h.driveSequence(hold.entered(hold.calls.length + 1))
+  return { outcome }
+}
+
+/** Release every held run with the empty result and drive `outcome` to its end. */
+async function releaseWait(h: RecoveryHarness, hold: ReturnType<typeof holdFindMissing>, outcome: Promise<unknown>, rows: Record<string, 'ids'> = {}): Promise<void> {
+  hold.release(cannedFindMissing({ rows }))
+  await h.driveSequence(outcome)
+}
+
+describe('b.jg5 SRJ-811 (E27 T2): ensureOldLifeWait answers started, already-running, closed, not-held and not-installed', () => {
+  afterEach(() => {
+    srj105Harness?.controller.stopAll('the case is over')
+    srj105AfterEach()
+  })
+
+  test('a held id with nothing running: started, before the wait\'s first call; a second ensure while it runs: already-running, with no second chain', async () => {
+    const { h, p } = srj105Build()
+    holdOldAt(h, OLD_PRE_PERSONA_ID, OLD_PRE_PERSONA_ID, p)
+    h.script({ getResult: cannedGetResult({ claude_instance_id: OLD_PRE_PERSONA_ID, cwd: harnessPersona(h, p).working_directory }) })
+    const hold = holdFindMissing(h.stub.client)
+
+    expect([ensureOldLifeWait(OLD_PRE_PERSONA_ID), h.stub.callCount()]).toEqual([LIVE_ROW_START_STARTED, 0])
+    await h.driveSequence(hold.entered(1))
+    expect(ensureOldLifeWait(OLD_PRE_PERSONA_ID)).toBe(LIVE_ROW_START_ALREADY_RUNNING)
+    await h.clock.flush()
+
+    expect([h.stub.calls.killCalls.length, hold.calls.length]).toEqual([1, 1])
+    await releaseWait(h, hold, h.oldLifeWaitSettled(OLD_PRE_PERSONA_ID), { [OLD_PRE_PERSONA_ID]: 'ids' })
+    expect(h.oldLifeWaitRunning(OLD_PRE_PERSONA_ID)).toBe(false)
+  })
+
+  test.each<[string, (h: RecoveryHarness, p: string) => void, ReturnType<typeof ensureOldLifeWait>, (id: string) => string | undefined]>([
+    ['no hold on the id: not-held, with one line', () => {}, OLD_LIFE_WAIT_START_NOT_HELD, (id) => oldLifeWaitNotStartedLine(id, OLD_LIFE_WAIT_START_NOT_HELD)],
+    ['a held id with no wait bindings installed: not-installed, with one line', (h, p) => {
+      holdOldAt(h, OLD_PRE_PERSONA_ID, OLD_PRE_PERSONA_ID, p)
+      _resetOldLifeWaitBindings()
+    }, LIVE_ROW_START_NOT_INSTALLED, (id) => oldLifeWaitNotStartedLine(id, LIVE_ROW_START_NOT_INSTALLED)],
+    ['a held id after the registry\'s close (shutdown): closed', (h, p) => {
+      holdOldAt(h, OLD_PRE_PERSONA_ID, OLD_PRE_PERSONA_ID, p)
+      h.shutdown()
+    }, LIVE_ROW_START_CLOSED, () => undefined],
+  ])('%s; no call', (_label, arrange, answer, line) => {
+    const { h, p } = srj105Build()
+    arrange(h, p)
+
+    expect(ensureOldLifeWait(OLD_PRE_PERSONA_ID)).toBe(answer)
+
+    expect([h.stub.callCount(), h.oldLifeWaitRunning(OLD_PRE_PERSONA_ID)]).toEqual([0, false])
+    const expected = line(OLD_PRE_PERSONA_ID)
+    if (expected !== undefined) expect(h.errors.filter((l) => l === expected)).toHaveLength(1)
+  })
+})
+
+describe('b.jg5 SRJ-811, SRJ-114, SRJ-1512 (E27 T2): buildOldLifeWaitDeps reads the old id, with the shared own-row read only for a configured persona\'s own row, and arms nothing for the old key', () => {
+  afterEach(srj105AfterEach)
+
+  test.each<[string, (h: RecoveryHarness, p: string, b: string) => { readonly id: string; readonly oldKey: string }, boolean]>([
+    ['P\'s own row (configured): the shared own-row read, whose provenance_conflict note latches P', (_h, p) => ({ id: personaInstanceId(p), oldKey: p }), true],
+    ['a renamed-away key\'s own row (B, no longer applied): a plain get, latching no one', (h, _p, b) => {
+      h.remove(b)
+      return { id: personaInstanceId(b), oldKey: b }
+    }, false],
+    ['a pre-persona row: a plain get, latching no one', () => ({ id: OLD_PRE_PERSONA_ID, oldKey: OLD_PRE_PERSONA_ID }), false],
+  ])('%s', async (_label, form, shared) => {
+    const { h, p, b } = srj105Build()
+    const { id, oldKey } = form(h, p, b)
+    const row = id === personaInstanceId(p)
+      ? cannedGetResult({ liveness_note: provenanceNote }, harnessPersona(h, p), h.home)
+      : cannedGetResult({ claude_instance_id: id, liveness_note: provenanceNote })
+    h.script({ getResult: row })
+    const deps = buildOldLifeWaitDeps({ target: { instanceId: id, oldKey }, record: createOldLifeWaitRecord(), clock: h.clock, log: () => {} })
+
+    const read = await deps.readRow(oldKey, `persona=${oldKey}`)
+    deps.armRetry(oldKey, LIVE_ROW_ARM_ENDED)
+
+    expect(h.stub.calls.getCalls).toEqual([{ claude_instance_id: id }])
+    expect(read.kind).toBe(shared ? LIVE_ROW_READ_LATCHED : LIVE_ROW_READ_ROW)
+    expect(h.keys.map((key) => h.latch.isLatched(key))).toEqual(h.keys.map((key) => shared && key === p))
+    // Only the configured persona's own row answers its latch (SRJ-502, SRJ-513); nothing is armed for the old key (SRJ-1512).
+    expect(deps.isLatched(oldKey)).toBe(shared)
+    expect(h.triggers).toEqual([])
+    expect(h.controller.isArmed(oldKey)).toBe(false)
+  })
+
+  test('a waiting persona\'s latch never answers for another id: P latched by a read of its own row, a wait on a pre-persona row held in P\'s directory answers not latched (SRJ-702, SRJ-811; AC 64)', async () => {
+    const { h, p } = srj105Build()
+    holdOldAt(h, OLD_PRE_PERSONA_ID, OLD_PRE_PERSONA_ID, p)
+    h.script({ getResult: cannedGetResult({ liveness_note: provenanceNote }, harnessPersona(h, p), h.home) })
+    await readPersonaOwnRow(p, { site: 'session-manager.test', what: 'own-row get' })
+    const deps = buildOldLifeWaitDeps({ target: { instanceId: OLD_PRE_PERSONA_ID, oldKey: OLD_PRE_PERSONA_ID }, record: createOldLifeWaitRecord(), clock: h.clock, log: () => {} })
+
+    expect([h.latch.isLatched(p), deps.isLatched(OLD_PRE_PERSONA_ID)]).toEqual([true, false])
+  })
+})
+
+describe('b.jg5 SRJ-303, SRJ-811, SRJ-1011 (E27 T2): what blocks P\'s retry, and whether a wait step runs for P', () => {
+  afterEach(() => {
+    srj105Harness?.controller.stopAll('the case is over')
+    srj105AfterEach()
+  })
+
+  type Answers = [cause: RetryBlockCause | undefined, waitRunsForP: boolean, sequenceOrWait: boolean]
+
+  test.each<[string, (h: RecoveryHarness, p: string, b: string, hold: ReturnType<typeof holdFindMissing>) => Promise<{ readonly outcome?: Promise<unknown> }>, Answers]>([
+    ['nothing runs', async () => ({}), [undefined, false, false]],
+    ['P\'s live-row sequence runs (its first run held)', async (h, p, _b, hold) => {
+      ownRowsLiveThenMissing(h)
+      return { outcome: (await startSequenceHeldAtRun(h, p, hold)).outcome }
+    }, [RETRY_BLOCK_LIVE_ROW_SEQUENCE, false, true]],
+    ['a wait runs on a pre-persona row held in P\'s directory (its first run held)', async (h, p, _b, hold) => {
+      holdOldAt(h, OLD_PRE_PERSONA_ID, OLD_PRE_PERSONA_ID, p)
+      h.script({ getResult: cannedGetResult({ claude_instance_id: OLD_PRE_PERSONA_ID, cwd: harnessPersona(h, p).working_directory }) })
+      return waitHeldAtRun(h, OLD_PRE_PERSONA_ID, hold)
+    }, [RETRY_BLOCK_OLD_LIFE_WAIT, true, true]],
+    ['a wait runs on P\'s own row (its first run held)', async (h, p, _b, hold) => {
+      holdOldAt(h, personaInstanceId(p), p, p)
+      h.script({ getResult: cannedGetResult({}, harnessPersona(h, p), h.home) })
+      return waitHeldAtRun(h, personaInstanceId(p), hold)
+    }, [RETRY_BLOCK_OLD_LIFE_WAIT, true, true]],
+    ['a wait runs on a row held in P\'s directory, but P is no longer applied', async (h, p, _b, hold) => {
+      holdOldAt(h, OLD_PRE_PERSONA_ID, OLD_PRE_PERSONA_ID, p)
+      h.script({ getResult: cannedGetResult({ claude_instance_id: OLD_PRE_PERSONA_ID, cwd: harnessPersona(h, p).working_directory }) })
+      const started = await waitHeldAtRun(h, OLD_PRE_PERSONA_ID, hold)
+      h.remove(p)
+      return started
+    }, [undefined, false, false]],
+  ])('%s: P\'s answers; B, which waits on nothing, answers none', async (_label, arrange, [cause, waitRuns, either]) => {
+    const { h, p, b } = srj105Build()
+    const hold = holdFindMissing(h.stub.client)
+    const { outcome } = await arrange(h, p, b, hold)
+
+    expect([personaRetryBlockCause(p), isOldLifeWaitRunningFor(p), isSequenceOrOldLifeWaitRunning(p)]).toEqual([cause, waitRuns, either])
+    expect([personaRetryBlockCause(b), isOldLifeWaitRunningFor(b), isSequenceOrOldLifeWaitRunning(b)]).toEqual([undefined, false, false])
+
+    if (outcome !== undefined) {
+      hold.release(cannedFindMissing({ rows: { [OLD_PRE_PERSONA_ID]: 'ids', [personaInstanceId(p)]: 'ids' } }))
+      await h.driveSequence(outcome)
+      await h.settle()
+      if (h.approverRunning(p)) await h.runApproverToStop(p)
+    }
+  })
+
+  test('a launch call of P in flight (its spawn held): the cause is a launch, and no wait step runs for P', async () => {
+    const { h, p } = srj105Build()
+    const spawns = holdSpawns(h.stub.client, (id) => id === personaInstanceId(p))
+    const launch = h.launch(p)
+    await spawns.entered(personaInstanceId(p))
+
+    expect([personaRetryBlockCause(p), isOldLifeWaitRunningFor(p), isSequenceOrOldLifeWaitRunning(p)]).toEqual([RETRY_BLOCK_LAUNCH, false, false])
+
+    spawns.release(personaInstanceId(p))
+    await launch
+    await h.runApproverToStop(p)
+  })
+})
+
+describe('b.jg5 SRJ-811, SRJ-810, SRJ-1015 (E27 T2): a launch of P refused because a wait runs on its own row arms P\'s timer and answers the old-life sequence-waiting; launchSession answers the uncounted refused', () => {
+  afterEach(() => {
+    srj105Harness?.controller.stopAll('the case is over')
+    srj105AfterEach()
+  })
+
+  /** P's own row held, with its wait running and its first run held. */
+  async function waitOnOwnRow(): Promise<{ h: RecoveryHarness; p: string; release: () => Promise<void> }> {
+    const { h, p } = srj105Build()
+    holdOldAt(h, personaInstanceId(p), p, p)
+    h.script({ getResult: cannedGetResult({}, harnessPersona(h, p), h.home) })
+    const hold = holdFindMissing(h.stub.client)
+    const { outcome } = await waitHeldAtRun(h, personaInstanceId(p), hold)
+    return { h, p, release: () => releaseWait(h, hold, outcome, { [personaInstanceId(p)]: 'ids' }) }
+  }
+
+  test.each<[string, (h: RecoveryHarness, p: string) => Promise<unknown> | unknown, unknown, string, (h: RecoveryHarness, p: string) => string]>([
+    ['a start-pass launch (spawnForPersona)', (h, p) => h.launch(p), 'spawned-shape', 'spawnForPersona', (h, p) => renderPersonaRef(harnessPersona(h, p).name, p)],
+    ['the restart path\'s gate (liveRowSequenceGate)', (_h, p) => liveRowSequenceGate(p, 'runRestartWork'), true, 'runRestartWork', (_h, p) => `persona=${p}`],
+  ])('%s: P\'s timer armed once with the old-life cause, one line, no call for P and nothing counted', async (_label, act, answer, site, ref) => {
+    const { h, p, release } = await waitOnOwnRow()
+    const calls = h.stub.callCount()
+
+    const got = await act(h, p)
+
+    expect(got).toEqual(answer === 'spawned-shape' ? { key: p, action: 'sequence-waiting', sequenceWaitingCause: SEQUENCE_WAITING_CAUSE_OLD_LIFE_HOLD } : answer)
+    expect(h.stub.callCount()).toBe(calls)
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD }])
+    expect(h.controller.isArmed(p)).toBe(true)
+    expect(h.errors.filter((line) => line === oldLifeWaitRefusalLine(site, ref(h, p), true))).toHaveLength(1)
+    expect([getFailureCount(p), h.notices]).toEqual([0, []])
+    await release()
+  })
+
+  test('the start entry for P\'s own live-row sequence: already-running, with P\'s timer armed with the old-life cause', async () => {
+    const { h, p, release } = await waitOnOwnRow()
+
+    expect(startLiveRowSequence(h.sequenceRequest(p, { lastReadState: 'waiting' }))).toBe(LIVE_ROW_START_ALREADY_RUNNING)
+
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD }])
+    await release()
+  })
+
+  // b.jg5 SRJ-1512, b.av2 SR-8.6: the wait is the one exception to SR-8.6 for
+  // a key outside the applied set, and it never launches that key, so a key
+  // removed while a wait runs on its own row gets no retry timer.
+  test('P removed while a wait runs on its own row: the restart path\'s gate answers false with nothing armed and no line, so the relaunch gate answers for P', async () => {
+    const { h, p, release } = await waitOnOwnRow()
+    h.remove(p)
+    const calls = h.stub.callCount()
+
+    expect(liveRowSequenceGate(p, 'runRestartWork')).toBe(false)
+
+    expect(h.stub.callCount()).toBe(calls)
+    expect([h.triggers, h.controller.isArmed(p)]).toEqual([[], false])
+    expect(h.errors.filter((line) => line.includes('waits on the old-life wait running on its own row') || line === oldLifeWaitNotAppliedLine(p))).toEqual([])
+    expect(getFailureCount(p)).toBe(0)
+    await release()
+  })
+
+  test('P removed while a wait runs on its own row: the start entry for P\'s launching sequence answers already-running, refuses to arm P\'s timer with one not-in-the-applied-configuration line, and its refusal line says the timer could not be armed', async () => {
+    const { h, p, release } = await waitOnOwnRow()
+    h.remove(p)
+    const calls = h.stub.callCount()
+
+    expect(startLiveRowSequence(h.sequenceRequest(p, { lastReadState: 'waiting' }))).toBe(LIVE_ROW_START_ALREADY_RUNNING)
+
+    expect(h.stub.callCount()).toBe(calls)
+    expect([h.triggers, h.controller.isArmed(p)]).toEqual([[], false])
+    expect(h.errors.filter((line) => line === oldLifeWaitNotAppliedLine(p))).toHaveLength(1)
+    expect(h.errors.filter((line) => line === oldLifeWaitRefusalLine(startLiveRowSequence.name, `persona=${p}`, false))).toHaveLength(1)
+    expect(h.errors.filter((line) => line === oldLifeWaitRefusalLine(startLiveRowSequence.name, `persona=${p}`, true))).toEqual([])
+    expect(getFailureCount(p)).toBe(0)
+    await release()
+  })
+
+  test.each<[string, boolean]>([
+    ['an old-life wait on P\'s own row', true],
+    ['P\'s live-row sequence (no cause on the result)', false],
+  ])('launchSession while %s runs answers refused, nothing counted, P\'s timer armed only for the wait', async (_label, wait) => {
+    let h: RecoveryHarness
+    let p: string
+    let release: () => Promise<void>
+    if (wait) ({ h, p, release } = await waitOnOwnRow())
+    else {
+      ;({ h, p } = srj105Build())
+      const hold = holdFindMissing(h.stub.client)
+      ownRowsLiveThenMissing(h)
+      const run = await startSequenceHeldAtRun(h, p, hold)
+      release = async () => {
+        hold.release(cannedFindMissing({ rows: { [personaInstanceId(p)]: 'ids' } }))
+        await h.driveSequence(run.outcome)
+        await h.runApproverToStop(p)
+      }
+    }
+
+    expect(await launchSession(p, h.config)).toBe('refused')
+
+    expect([getFailureCount(p), h.notices, h.controller.isArmed(p)]).toEqual([0, [], wait])
+    await release()
+  })
+
+  test('the start pass over P while a wait runs on its own row: P\'s result is sequence-waiting, counted once, under sequence-waiting (a sequence\'s is START_RESULT_ROWS\'s)', async () => {
+    const { h, p, release } = await waitOnOwnRow()
+
+    const result = await h.drive(startupSessionManager(h.config, { concurrency: 1 }))
+
+    const b = h.keys[1]!
+    expect(result.perPersona.find((r) => r.key === p)).toEqual({ key: p, action: 'sequence-waiting' })
+    expect(result.sequenceWaiting).toBe(1)
+    expect(h.errors.filter((line) => line.startsWith('[slack] startupSessionManager: complete — '))).toEqual([startupSummaryLine(2, result)])
+    await release()
+    await h.settle()
+    if (h.approverRunning(b)) await h.runApproverToStop(b)
   })
 })

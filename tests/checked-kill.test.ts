@@ -58,6 +58,7 @@ import {
   KILL_REFUSAL_AT_KILL,
   KILL_REFUSAL_AT_READ,
   KILL_ROW_FINISHED_ENDED,
+  KILL_ROW_FINISHED_HOLD_ENDED,
   KILL_ROW_FINISHED_MISSING,
   KILL_ROW_FINISHED_NO_ROW,
   KILL_UNLISTED_CLASSES,
@@ -225,7 +226,8 @@ describe('checkedKill: success (SRJ-110, SRJ-703)', () => {
     },
   )
 
-  test.each<KillRowFinishedRead>([KILL_ROW_FINISHED_ENDED, KILL_ROW_FINISHED_MISSING, KILL_ROW_FINISHED_NO_ROW])(
+  // KILL_ROW_FINISHED_HOLD_ENDED: an old-life wait's kill whose hold ended while its tries ran (b.jg5 SRJ-702, SRJ-811; option A).
+  test.each<KillRowFinishedRead>([KILL_ROW_FINISHED_ENDED, KILL_ROW_FINISHED_MISSING, KILL_ROW_FINISHED_NO_ROW, KILL_ROW_FINISHED_HOLD_ENDED])(
     'the row-finished success (read %s) lets the next step run',
     (read) => {
       const outcome: KillOutcome = { kind: KILL_OUTCOME_ROW_FINISHED, read }
@@ -426,6 +428,13 @@ describe('describeKillOutcome', () => {
     )
     expect(describeKillOutcome({ kind: KILL_OUTCOME_ROW_FINISHED, read: KILL_ROW_FINISHED_MISSING })).toBe(
       `outcome=${KILL_OUTCOME_ROW_FINISHED} read=${KILL_ROW_FINISHED_MISSING}`,
+    )
+    // b.jg5 SRJ-702, SRJ-811 (option A): the old-life hold's end, named as its read; a read of no known kind is `unknown`.
+    expect(describeKillOutcome({ kind: KILL_OUTCOME_ROW_FINISHED, read: KILL_ROW_FINISHED_HOLD_ENDED })).toBe(
+      `outcome=${KILL_OUTCOME_ROW_FINISHED} read=${KILL_ROW_FINISHED_HOLD_ENDED}`,
+    )
+    expect(describeKillOutcome({ kind: KILL_OUTCOME_ROW_FINISHED, read: 'not-a-read' } as unknown as KillOutcome)).toBe(
+      `outcome=${KILL_OUTCOME_ROW_FINISHED} read=unknown`,
     )
     expect(describeKillOutcome(killOutcomeOf({ thrown: killFailed }))).toBe(
       `outcome=${KILL_OUTCOME_NOT_KILLED} class=${AD_ERROR_CLASS_UNAVAILABLE} ${ERR_TMUX_KILL_FAILED_NAME} message=${JSON.stringify(killFailed.errDescription)}`,

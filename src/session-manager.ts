@@ -338,6 +338,26 @@
  * start flag false, so it writes no startup-errors entry (the lost-transcript
  * diagnosis at its `resume` keeps its lines and notices).
  *
+ * The old-life wait (b.jg5 SRJ-811, SRJ-812, SRJ-1512) is the sequence's
+ * no-launch form on a held old row's instance id, started in the same
+ * registry through `ensureOldLifeWait` with its own dependencies
+ * (`buildOldLifeWaitDeps`): every call under the old key (or the instance id
+ * standing in), arming nothing for it, its kill keeping its tries until a
+ * shutdown, the last waiter's teardown or, on a configured persona's own
+ * row, that persona's latch, and ending them as a success when the hold
+ * ends; its end handler routes the round's results by class
+ * (`src/old-life-wait.ts`): log-only entries, the old row's
+ * unclassified-error episode (keyed by the instance id), the hold's
+ * kill-failed mark, and each waiting persona's retry timer. A hold's end
+ * stops its wait and ends that episode; the
+ * registry's close stops it at shutdown. While a wait runs for a hold a
+ * persona waits on, that persona's retries are blocked
+ * (`personaRetryBlockCause`) and a lost message reports `restarting`
+ * (`isSequenceOrOldLifeWaitRunning`); once the hold's kill has failed, it
+ * reports `kill-failed` (`waitsOnKillFailedHold`). A launch of a persona
+ * whose own row carries a wait answers `sequence-waiting` with its retry
+ * timer armed.
+ *
  * No tmux process-tree walks, no JSONL existence checks for resume eligibility:
  * the library encapsulates both.
  *
@@ -382,6 +402,7 @@ import {
 import { getClient } from './agent-director-client.ts'
 import {
   armPendingOnlyAfterLaunchFailure,
+  clearOutageFlag,
   getOutageFlags,
   raiseAdConfigMalformed,
   raiseTmuxUnavailable,
@@ -393,6 +414,7 @@ import {
   setOutageFlag,
   withOutageDetection,
   withSpawnDetection,
+  type OutageDetectionOptions,
 } from './outage-state.ts'
 import {
   AgentDirectorError,
@@ -415,6 +437,7 @@ import {
   AD_ERROR_CLASS_GONE,
   AD_ERROR_CLASS_LAUNCH_FAILURE,
   AD_ERROR_CLASS_UNAVAILABLE,
+  AD_ERROR_CLASS_UNCLASSIFIED,
   AD_ERROR_CLASS_UNUSABLE_NAME,
   adKillCall,
   type AdErrorClass,
@@ -450,6 +473,7 @@ import {
   type KillRefusal,
 } from './checked-kill.ts'
 import {
+  KILL_FAILURE_CONTEXT_OLD_LIFE_WAIT,
   KILL_FAILURE_CONTEXT_RECOVERY,
   KILL_FAILURE_CONTEXT_START_SWEEP,
   KILL_FAILURE_VERSION_ORDINARY,
@@ -465,8 +489,14 @@ import {
 import {
   KILL_FAILURE_END_ROW_FINISHED,
   KILL_FAILURE_END_ROW_GONE,
+  PERSONA_UNCLASSIFIED_ERROR_LABEL,
+  UNCLASSIFIED_ERROR_END_HOLD_ENDED,
+  createPersonaEpisodes,
+  createUnclassifiedErrorEpisodes,
   type KillFailureAlerts,
   type KillFailureEndReason,
+  type PersonaEpisodesClock,
+  type UnclassifiedErrorEpisodes,
 } from './persona-episodes.ts'
 import {
   KILL_RETRY_ALERT_NONE,
@@ -481,6 +511,7 @@ import {
   KILL_RETRY_SEED_NOT_LIVE_VALUE,
   KILL_RETRY_SYSTEM_CLOCK,
   createKillRetryPassBudget,
+  killRetrySeedIsLive,
   killRetrySeedOfState,
   killRetryStopped,
   runKillRetry,
@@ -565,20 +596,26 @@ import {
   RETIRED_KEYS_WRITE_FAILED,
   RETIRED_KEYS_WRITTEN,
   oldLifeKeyOf,
+  type OldLifeHold,
   type OldLifeHoldEndReason,
   type OldLifeHoldSet,
   type RetiredKeyStore,
 } from './retired-keys.ts'
 import {
+  RETRY_BLOCK_LAUNCH,
+  RETRY_BLOCK_LIVE_ROW_SEQUENCE,
+  RETRY_BLOCK_OLD_LIFE_WAIT,
   runInAttempt,
   runOutsideAttempts,
   unavailableRetryCauseFor,
   UNAVAILABLE_RETRY_CAUSE_LOST_RACE,
+  UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD,
   UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION,
   UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED,
   UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED,
   UNAVAILABLE_RETRY_ROW_ABSENT,
   type AttemptView,
+  type RetryBlockCause,
   type UnavailableRetryRowRead,
   type UnavailableRetryTriggerSink,
 } from './unavailable-retry.ts'
@@ -610,14 +647,20 @@ import {
   LIVE_ROW_RUN_REFUSED,
   LIVE_ROW_SEQUENCE_ENTRY_KILL,
   LIVE_ROW_SEQUENCE_LOG_PREFIX,
+  LIVE_ROW_START_ALREADY_RUNNING,
   LIVE_ROW_SEQUENCE_NO_ROW,
   LIVE_ROW_SEQUENCE_SITE,
+  LIVE_ROW_STOP_HOLD_ENDED,
   LIVE_ROW_STOP_LATCHED,
+  LIVE_ROW_STOP_SHUTDOWN,
+  LIVE_ROW_STOP_TEARDOWN,
+  liveRowStopCauseText,
   type LiveRowSequenceArmCause,
   type LiveRowSequenceDeps,
   type LiveRowSequenceLastRead,
   type LiveRowSequenceLaunchKind,
   type LiveRowSequenceNotLaunchedReason,
+  type LiveRowSequenceOutcome,
   type LiveRowSequenceRead,
   type LiveRowSequenceRegistry,
   type LiveRowSequenceRequest,
@@ -627,6 +670,23 @@ import {
   type LiveRowSequenceStopSignal,
   type RetiredKeyAttemptStart,
 } from './live-row-sequence.ts'
+import {
+  OLD_LIFE_WAIT_AT_FIND_MISSING,
+  OLD_LIFE_WAIT_AT_GET,
+  OLD_LIFE_WAIT_AT_KILL,
+  OLD_LIFE_WAIT_AT_STATUS_READ,
+  OLD_LIFE_WAIT_LOG_PREFIX,
+  OLD_LIFE_WAIT_ROUTED_CONTEXT,
+  OLD_LIFE_WAIT_SEED_LIVE_UNREAD,
+  OLD_LIFE_WAIT_SITE,
+  decideOldLifeWaitEnd,
+  oldLifeWaitEndLine,
+  oldLifeWaitRef,
+  oldLifeWaitRefusalNoticeText,
+  type OLD_LIFE_WAIT_ARM_CAUSE,
+  type OldLifeWaitRefusal,
+  type OldLifeWaitRefusalAt,
+} from './old-life-wait.ts'
 import { recordStartupError } from './startup-errors.ts'
 import {
   locateTranscript,
@@ -636,7 +696,15 @@ import {
   type TranscriptSnapshot,
 } from './session-transcript.ts'
 import type { ReplyGuardUndo } from './stop-hook-bootstrap.ts'
-import { firstNoticeLine, notifySafely, type PersonaNoticeOptions, type PersonaNotify } from './persona-notifier.ts'
+import {
+  PERSONA_TEARDOWN_NOTICE_DURING_WAIT,
+  PERSONA_TEARDOWN_NOTICE_LABEL,
+  firstNoticeLine,
+  notifySafely,
+  personaTeardownNoticeEntryText,
+  type PersonaNoticeOptions,
+  type PersonaNotify,
+} from './persona-notifier.ts'
 import type { PersonaBringUpFailure } from './persona-start.ts'
 import type { PersonaBringUpController, PersonaBringUpOutcome } from './persona-bringup-controller.ts'
 import {
@@ -1533,14 +1601,67 @@ export function _resetRetiredKeyStore(): void {
  */
 let oldLifeHolds: OldLifeHoldSet | undefined
 
-/** Install the server's old-life hold set (production: `main()`), or remove it with undefined (b.jg5 SRJ-809). */
+/**
+ * The state of each held row last read, by instance id (`noteOldLifeRowRead`):
+ * the seed of the next wait's request on it. Dropped when its hold ends.
+ */
+const oldLifeLastReadState = new Map<string, string>()
+
+/**
+ * The tmux session of each held row, by instance id, as the start sweep's
+ * listing named it when it began or kept the row's hold
+ * (`noteOldLifeHoldSession`): the session a wait's kill-failure alert names
+ * before a `get` of the row has read one. Dropped when its hold ends.
+ */
+const oldLifeSessionNames = new Map<string, string>()
+
+/** Removes the hold-end observer from the installed hold set; undefined while none is registered. */
+let removeOldLifeHoldEndObserver: (() => void) | undefined
+
+/**
+ * Install the server's old-life hold set (production: `main()`), or remove it
+ * with undefined (b.jg5 SRJ-809). One end observer is registered on it
+ * (`onOldLifeHoldEnd`): a hold's end ends its old-life wait (b.jg5 SRJ-811).
+ */
 export function setOldLifeHolds(holds: OldLifeHoldSet | undefined): void {
+  removeOldLifeHoldEndObserver?.()
+  removeOldLifeHoldEndObserver = undefined
   oldLifeHolds = holds
+  oldLifeLastReadState.clear()
+  oldLifeSessionNames.clear()
+  if (holds !== undefined) removeOldLifeHoldEndObserver = holds.onEnd(onOldLifeHoldEnd)
 }
 
-/** Test-only seam: remove any installed old-life hold set. */
+/** Test-only seam: remove any installed old-life hold set and its end observer. */
 export function _resetOldLifeHolds(): void {
-  oldLifeHolds = undefined
+  setOldLifeHolds(undefined)
+}
+
+/**
+ * The hold set's end observer (b.jg5 SRJ-811, SRJ-809): a hold that ends
+ * ends its old-life wait through the registry's no-launch stop (reason
+ * `hold-ended`), which never stops a live-row sequence that ends in a launch
+ * on the same id. A wait whose kill is between tries, or in a try whose
+ * UNAVAILABLE outcome would stand, ends those tries as a success (the kill's
+ * hold-end query; SRJ-702, option A), never as a stopped retry. The hold's
+ * end also ends the wait's unclassified-error episode on the id, which
+ * nothing else ends (b.jg5 SRJ-313; `OldLifeWaitBindings.unclassifiedErrorEpisodes`).
+ * Called synchronously inside the hold's end; returns nothing to await.
+ * Never throws.
+ */
+function onOldLifeHoldEnd(hold: OldLifeHold): void {
+  oldLifeLastReadState.delete(hold.instanceId)
+  oldLifeSessionNames.delete(hold.instanceId)
+  try {
+    oldLifeWaitBindings?.unclassifiedErrorEpisodes?.end(hold.instanceId, UNCLASSIFIED_ERROR_END_HOLD_ENDED)
+  } catch (err) {
+    console.error(`[slack] old-life hold: ending the unclassified-error episode of instanceId=${hold.instanceId} failed: ${describeThrownValue(err)} (b.jg5 SRJ-313)`)
+  }
+  try {
+    void liveRowSequenceRegistry?.stopNoLaunch(hold.instanceId, LIVE_ROW_STOP_HOLD_ENDED)
+  } catch (err) {
+    console.error(`[slack] old-life hold: stopping the wait on instanceId=${hold.instanceId} failed: ${describeThrownValue(err)} (b.jg5 SRJ-811)`)
+  }
 }
 
 /** A read of a row gave its state (and, from a `get` or a `list` row, its `cwd`). */
@@ -1592,6 +1713,8 @@ export function noteOldLifeRowRead(instanceId: string, read: OldLifeRowRead, by:
       holds.end(instanceId, reason, by)
       return
     }
+    // b.jg5 SRJ-811: the state a live read gave seeds the hold's next wait.
+    if (isSafeIdentifier(read.state)) oldLifeLastReadState.set(instanceId, read.state)
     if (typeof read.cwd === 'string' && read.cwd !== '') holds.replaceDirectory(instanceId, read.cwd)
   } catch (err) {
     // Not reached (the hold set never throws); the hold stays as it was.
@@ -5795,14 +5918,43 @@ async function reconcileMissingSweep(
   logPrefix: string,
   ref: string = keyRef(key),
   opts: FindMissingSweepOptions = {},
+  call: FindMissingCallOptions = {},
 ): Promise<FindMissingSweepAnswer> {
   return sharedFindMissingSweep(
-    () => withOutageDetection(key, undefined, 'find-missing', (client) => client.findMissing({})),
+    async () => {
+      try {
+        return await withOutageDetection(key, undefined, 'find-missing', (client) => client.findMissing({}), call.outage)
+      } catch (err) {
+        noteFindMissingFailure(call, err)
+        throw err
+      }
+    },
     logPrefix,
     ref,
     key,
     opts,
   )
+}
+
+/**
+ * How a persona's own findMissing call is made (`bypassingFindMissingSweep`):
+ * its wrapper's options (an old-life wait's calls arm nothing for the old
+ * key, b.jg5 SRJ-811, SRJ-1512) and a sink told the call's failure before it
+ * is handled (the wait's record of what its calls met). Absent: the wrapper's
+ * defaults, no sink.
+ */
+export interface FindMissingCallOptions {
+  readonly outage?: OutageDetectionOptions
+  readonly onFailure?: (err: unknown) => void
+}
+
+/** Tell `call.onFailure` the run's failure; a throw is ignored. */
+function noteFindMissingFailure(call: FindMissingCallOptions, err: unknown): void {
+  try {
+    call.onFailure?.(err)
+  } catch {
+    /* the sink's own failure changes nothing about the run */
+  }
 }
 
 /**
@@ -6316,14 +6468,16 @@ async function readListedPersonaRows(
  * @param key the persona the run is made for: its outage key and log context.
  * @param logPrefix distinguishes the call site in the log lines.
  * @param nextStepGetKey the persona whose own row the caller reads next with a `get`, if any.
+ * @param call how the run's call is made (`FindMissingCallOptions`: an old-life wait's arms nothing for its old key).
  */
 export async function bypassingFindMissingSweep(
   key: string,
   logPrefix: string,
   nextStepGetKey?: string,
+  call?: FindMissingCallOptions,
 ): Promise<FindMissingSweepAnswer> {
   try {
-    return await reconcileMissingSweep(key, logPrefix, keyRef(key), { kind: FIND_MISSING_RUN_BYPASSING, nextStepGetKey })
+    return await reconcileMissingSweep(key, logPrefix, keyRef(key), { kind: FIND_MISSING_RUN_BYPASSING, nextStepGetKey }, call)
   } catch (err) {
     // Not reached (`reconcileMissingSweep` never throws).
     console.error(`[slack] ${logPrefix}: bypassing findMissing sweep failed for ${keyRef(key)}: ${describeThrownValue(err)} — proceeding`)
@@ -7570,6 +7724,14 @@ export const SPAWN_ACTION_FRESH_RETIRED = 'fresh-retired'
  */
 export const SPAWN_ACTION_RETRYING = 'retrying'
 
+/** `sequence-waiting` held back by a live-row sequence (b.jg5 SRJ-706). */
+export const SEQUENCE_WAITING_CAUSE_LIVE_ROW_SEQUENCE = 'live-row-sequence'
+/** `sequence-waiting` held back by an old-life hold or its wait (b.jg5 SRJ-810, SRJ-811). */
+export const SEQUENCE_WAITING_CAUSE_OLD_LIFE_HOLD = 'old-life-hold'
+
+/** What a `sequence-waiting` result was held back by. */
+export type SequenceWaitingCause = typeof SEQUENCE_WAITING_CAUSE_LIVE_ROW_SEQUENCE | typeof SEQUENCE_WAITING_CAUSE_OLD_LIFE_HOLD
+
 export interface SpawnPersonaResult {
   /** Persona key. */
   key: string
@@ -7657,6 +7819,15 @@ export interface SpawnPersonaResult {
      * (`PersonaBringUpOutcome`), which is counted under `not brought up`.
      */
     | typeof SPAWN_ACTION_RETRYING
+  /**
+   * For `sequence-waiting` (b.jg5 SRJ-706, SRJ-811, SRJ-1015): what holds
+   * the launch back, a live-row sequence (`SEQUENCE_WAITING_CAUSE_LIVE_ROW_SEQUENCE`)
+   * or an old-life hold or its wait (`SEQUENCE_WAITING_CAUSE_OLD_LIFE_HOLD`),
+   * which launches no one, so the persona's retry timer was armed at the
+   * refusal. Either way `launchSession` answers the uncounted `'refused'`.
+   * Set only for the old-life cause; absent means a live-row sequence.
+   */
+  sequenceWaitingCause?: SequenceWaitingCause
   /** For `deferred`: the claude_config_dir cause (`claude-config-dir` step). */
   deferredBy?: PersonaBringUpFailure
   /**
@@ -9198,6 +9369,18 @@ function sequenceStartAction(startAnswer: string): 'held' | 'sequence-waiting' {
 }
 
 /**
+ * What held back a `sequence-waiting` answered for the start entry's answer
+ * `startAnswer` on `instanceId` (b.jg5 SRJ-811): an old-life wait running on
+ * the id (the start entry armed the persona's timer), else a live-row
+ * sequence. Never throws.
+ */
+function sequenceStartWaitingCause(startAnswer: string, instanceId: string): SequenceWaitingCause {
+  return startAnswer === LIVE_ROW_START_ALREADY_RUNNING && liveRowSequenceRegistry?.isNoLaunchRunning(instanceId) === true
+    ? SEQUENCE_WAITING_CAUSE_OLD_LIFE_HOLD
+    : SEQUENCE_WAITING_CAUSE_LIVE_ROW_SEQUENCE
+}
+
+/**
  * One start of the live-row sequence (SRJ-705) for a collision ladder site's
  * live row of persona `run.persona`, through the start entry
  * (`startLiveRowSequence`): seeded with `lastRead`, entry at step 1, the
@@ -9213,7 +9396,7 @@ function startRecoverySequence(
   lastRead: LatchRowState,
   keepsConversation: boolean,
   retiredKey: boolean,
-): { startAnswer: LiveRowSequenceStartEntryAnswer; action: 'held' | 'sequence-waiting' } {
+): { startAnswer: LiveRowSequenceStartEntryAnswer; action: 'held' | 'sequence-waiting'; result: SpawnPersonaResult } {
   const { persona, ref } = run
   const { key } = persona
   const startAnswer = startLiveRowSequence({
@@ -9228,7 +9411,12 @@ function startRecoverySequence(
     launches: true,
     alertContext: KILL_FAILURE_CONTEXT_RECOVERY,
   })
-  return { startAnswer, action: sequenceStartAction(startAnswer) }
+  const action = sequenceStartAction(startAnswer)
+  const result: SpawnPersonaResult =
+    action === 'sequence-waiting' && sequenceStartWaitingCause(startAnswer, personaInstanceId(key)) === SEQUENCE_WAITING_CAUSE_OLD_LIFE_HOLD
+      ? { key, action, sequenceWaitingCause: SEQUENCE_WAITING_CAUSE_OLD_LIFE_HOLD }
+      : { key, action }
+  return { startAnswer, action, result }
 }
 
 /**
@@ -9279,11 +9467,11 @@ async function replacePersonaRow(
     )
   }
   const retired = retiredKey ?? retiredKeyReadingOf(key).recorded
-  const { startAnswer, action } = startRecoverySequence(run, lastRead, false, retired)
+  const { startAnswer, action, result } = startRecoverySequence(run, lastRead, false, retired)
   console.error(
     `[slack] spawnForPersona: replacing the row of ${ref} (${replacing}; last read ${describeLatchRowState(lastRead)}): a live row goes through the live-row sequence first${retired ? ' (its key is retired)' : ''}, which ends in a reuse spawn of the same id; start answered ${startAnswer} — answering ${action}; no other call, nothing counted (b.jg5 SRJ-707, SRJ-705, SRJ-706${retired ? ', SRJ-805' : ''})`,
   )
-  return { key, action }
+  return result
 }
 
 /**
@@ -10045,9 +10233,9 @@ async function spawnNotResumableAtLadder(run: LadderRun, err: unknown, deadEvide
     case NOT_RESUMABLE_SEQUENCE: {
       // A `resume` was made, so the key was not recorded at the path's
       // decision; the start entry sets the flag if it is recorded now (b.jg5 SRJ-805).
-      const { startAnswer, action } = startRecoverySequence(run, decision.reread.lastRead, true, false)
+      const { startAnswer, result } = startRecoverySequence(run, decision.reread.lastRead, true, false)
       log(notResumableSequenceOutcome(startAnswer))
-      return { key, action }
+      return result
     }
     case NOT_RESUMABLE_LOST_RACE:
       return lostRaceAtLadder(key, log)
@@ -11869,7 +12057,13 @@ export function startLiveRowSequence(request: LiveRowSequenceRequest): LiveRowSe
     console.error(`${LIVE_ROW_SEQUENCE_LOG_PREFIX} ${ref}: no sequence registry is installed — nothing started (b.jg5 SRJ-706)`)
     return LIVE_ROW_START_NOT_INSTALLED
   }
-  return registry.start(retiredKeyRequest(request, ref))
+  const answer = registry.start(retiredKeyRequest(request, ref))
+  // b.jg5 SRJ-811: a request that ends in a launch refused because an
+  // old-life wait runs on its id arms its persona's retry timer.
+  if (answer === LIVE_ROW_START_ALREADY_RUNNING && request.launches && registry.isNoLaunchRunning(request.instanceId)) {
+    oldLifeWaitRefusal(request.key, ref, LIVE_ROW_SEQUENCE_START_SITE)
+  }
+  return answer
 }
 
 /**
@@ -11924,6 +12118,11 @@ export function stopLiveRowSequence(key: string, reason: LiveRowSequenceStopReas
 function sequenceWaitingResult(key: string, ref: string, site: string): SpawnPersonaResult | undefined {
   if (!isLiveRowSequenceRunning(key)) return undefined
   if (latchGateReadingOf(key) !== undefined) return undefined
+  // b.jg5 SRJ-811: an old-life wait on P's own row launches no one, so P's
+  // retry timer is armed at the refusal (`oldLifeWaitRefusal`).
+  if (oldLifeWaitRefusal(key, ref, site)) {
+    return { key, action: 'sequence-waiting', sequenceWaitingCause: SEQUENCE_WAITING_CAUSE_OLD_LIFE_HOLD }
+  }
   console.error(
     `[slack] ${site}: not launching ${ref} — its live-row sequence runs; no agent-director call (sequence-waiting; b.jg5 SRJ-706)`,
   )
@@ -12467,7 +12666,16 @@ async function readSequenceRow(key: string, ref: string): Promise<LiveRowSequenc
  * any other failure. Never throws.
  */
 async function runSequenceFindMissing(key: string, instanceId: string, stateBefore: string): Promise<LiveRowSequenceRunPlacement> {
-  const answer = await bypassingFindMissingSweep(key, LIVE_ROW_SEQUENCE_SITE, key)
+  return runPlacementOf(await bypassingFindMissingSweep(key, LIVE_ROW_SEQUENCE_SITE, key), instanceId, stateBefore)
+}
+
+/**
+ * Where a bypassing run's `answer` put row `instanceId`, last read
+ * `stateBefore` (`readFindMissingRow`), or how it failed: refused by class
+ * (`FIND_MISSING_REFUSED`), the persona latched (`FIND_MISSING_LATCHED`), any
+ * other failure. Pure; never throws.
+ */
+function runPlacementOf(answer: FindMissingSweepAnswer, instanceId: string, stateBefore: string): LiveRowSequenceRunPlacement {
   if (answer === FIND_MISSING_REFUSED) return LIVE_ROW_RUN_REFUSED
   if (answer === FIND_MISSING_LATCHED) return LIVE_ROW_RUN_LATCHED
   if (answer === undefined) return LIVE_ROW_RUN_FAILED
@@ -12507,6 +12715,994 @@ function raiseSequenceEscalationAlert(
   } catch (err) {
     console.error(`${LIVE_ROW_SEQUENCE_LOG_PREFIX} ${ref}: raising the kill-failure alert failed: ${describeThrownValue(err)}`)
   }
+}
+
+// ---------------------------------------------------------------------------
+// The old-life wait (b.jg5 SRJ-811, SRJ-812, SRJ-1512)
+// ---------------------------------------------------------------------------
+
+/**
+ * What `main()` gives the old-life wait (b.jg5 SRJ-811): the retry
+ * controller's arm (each waiting persona's timer; never the old key's), the
+ * wait's clock and line sink, the applied configuration read at each call
+ * (the waiting personas), and the alert sinks the persona teardown's are
+ * given: the server's kill-failure alerts (over its one episodes instance;
+ * absent, the installed ones) and the startup-errors recorder (absent,
+ * `recordStartupError`); and the wait's unclassified-error episodes
+ * (`createOldLifeWaitUnclassifiedErrors`), keyed by the held instance id.
+ */
+export interface OldLifeWaitBindings {
+  readonly retryArm: UnavailableRetryTriggerSink
+  readonly clock: NeverEarlyWaitClock
+  readonly log: (line: string) => void
+  readonly appliedConfig: () => PersonaConfig | null | undefined
+  readonly killFailureAlerts?: KillFailureAlerts
+  readonly recordStartupError?: (classLabel: string, entry: string) => void
+  /**
+   * The wait's unclassified-error episodes (b.jg5 SRJ-313, SRJ-811;
+   * `createOldLifeWaitUnclassifiedErrors`): each round that keeps the hold
+   * reports its first UNCLASSIFIED answer under the held instance id, and the
+   * hold's end ends that episode. Absent: the answer is not reported, with
+   * one line (`oldLifeWaitUnclassifiedNotReportedLine`).
+   */
+  readonly unclassifiedErrorEpisodes?: UnclassifiedErrorEpisodes
+}
+
+/**
+ * The installed old-life wait bindings. Production installs them in `main()`
+ * beside the live-row sequence registry, before the start pass. With none
+ * installed (unit tests that install none) no wait starts
+ * (`ensureOldLifeWait` answers `not-installed`), no persona is armed by a
+ * wait, and the wait queries answer false.
+ */
+let oldLifeWaitBindings: OldLifeWaitBindings | undefined
+
+/** Install the old-life wait's bindings (production: `main()`), or remove them with undefined (b.jg5 SRJ-811). */
+export function setOldLifeWaitBindings(bindings: OldLifeWaitBindings | undefined): void {
+  oldLifeWaitBindings = bindings
+}
+
+/** Test-only seam: remove any installed old-life wait bindings. */
+export function _resetOldLifeWaitBindings(): void {
+  oldLifeWaitBindings = undefined
+}
+
+/** What `createOldLifeWaitUnclassifiedErrors` is given. */
+export interface OldLifeWaitUnclassifiedErrorsDeps {
+  /** Receives the episodes' `[slack]` lines (the server log). */
+  readonly log: (line: string) => void
+  /** The alert threshold in effect, in milliseconds (production: `adAlertThresholdMsInEffect`), read at each check. */
+  readonly alertThresholdMs: () => number
+  /** The startup-errors recorder the alert's log-only route writes through (production: `recordStartupError`). */
+  readonly recordStartupError: (classLabel: string, entry: string) => void
+  /** The episodes' clock; `SYSTEM_PERSONA_CONNECTION_CLOCK` by default. */
+  readonly clock?: PersonaEpisodesClock
+}
+
+/** The old-life wait's unclassified-error episodes, with the close of the episodes instance they are held in (shutdown). */
+export interface OldLifeWaitUnclassifiedErrors extends UnclassifiedErrorEpisodes {
+  /** End every episode silently and refuse every later one (the server's shutdown). */
+  close(): void
+}
+
+/**
+ * The old-life wait's unclassified-error episodes (b.jg5 SRJ-313, SRJ-811,
+ * SRJ-1013): E12's episodes (`createUnclassifiedErrorEpisodes`) over an
+ * episodes instance of their own, so an episode keyed by a held instance id
+ * never shares a persona's own, nor a persona's teardown window. Every key
+ * is taken as not configured, so the one alert per episode always takes the
+ * log-only route: one `persona-unclassified-error` entry through
+ * `deps.recordStartupError` (which writes the server-log line too), its text
+ * the wait's reference and the unescaped alert
+ * (`oldLifeWaitUnclassifiedEntryText`); nothing reaches Slack. No retry
+ * timer's stop, latch, cap or teardown ends an episode: only the hold's end
+ * (`onOldLifeHoldEnd`) and `close`. Nothing is read, posted or logged at
+ * creation.
+ */
+export function createOldLifeWaitUnclassifiedErrors(deps: OldLifeWaitUnclassifiedErrorsDeps): OldLifeWaitUnclassifiedErrors {
+  const episodes = createPersonaEpisodes({
+    // Not reached: every key takes the log-only route and no teardown window opens here.
+    sink: (instanceId) => {
+      deps.log(`${OLD_LIFE_WAIT_LOG_PREFIX} instanceId=${renderLogMessageText(instanceId)}: an unclassified-error notice reached no destination — the wait's alerts are log-only (b.jg5 SRJ-313, SRJ-811)`)
+    },
+    log: deps.log,
+    ...(deps.clock === undefined ? {} : { clock: deps.clock }),
+  })
+  const errors = createUnclassifiedErrorEpisodes({
+    episodes,
+    log: deps.log,
+    alertThresholdMs: deps.alertThresholdMs,
+    isConfigured: () => false,
+    logOnly: (instanceId, text) => deps.recordStartupError(PERSONA_UNCLASSIFIED_ERROR_LABEL, oldLifeWaitUnclassifiedEntryText(instanceId, text)),
+  })
+  return {
+    report: (key, error, classification) => errors.report(key, error, classification),
+    end: (key, reason) => errors.end(key, reason),
+    retryStopped: (key, stopReason) => errors.retryStopped(key, stopReason),
+    isOpen: (key) => errors.isOpen(key),
+    close: () => episodes.close(),
+  }
+}
+
+/**
+ * The `persona-unclassified-error` entry text of an old-life wait's
+ * unclassified-error alert on held row `instanceId` (b.jg5 SRJ-1007,
+ * SRJ-1013): `<ref>: <text>`, `<ref>` the wait's reference
+ * (`oldLifeWaitRef`) over the installed hold's old key, the instance id
+ * standing in when no hold is on it. Never throws.
+ */
+export function oldLifeWaitUnclassifiedEntryText(instanceId: string, text: string): string {
+  let oldKey = instanceId
+  try {
+    oldKey = oldLifeHolds?.holdOf(instanceId)?.oldKey ?? instanceId
+  } catch {
+    /* not reached (the hold set never throws) */
+  }
+  return `${oldLifeWaitRef(instanceId, oldKey)}: ${text}`
+}
+
+/**
+ * The line of an UNCLASSIFIED answer a wait's round met when no
+ * unclassified-error episodes are installed (b.jg5 SRJ-313, SRJ-811):
+ *
+ *   [slack] old-life-wait: <ref>: no unclassified-error episodes are installed — the UNCLASSIFIED answer is not reported (b.jg5 SRJ-313, SRJ-811)
+ *
+ * Pure.
+ */
+export function oldLifeWaitUnclassifiedNotReportedLine(ref: string): string {
+  return `${OLD_LIFE_WAIT_LOG_PREFIX} ${ref}: no unclassified-error episodes are installed — the UNCLASSIFIED answer is not reported (b.jg5 SRJ-313, SRJ-811)`
+}
+
+/** One old-life wait's old row: its instance id and the old key (the hold's, `oldLifeKeyOf`; the instance id when it stands in). */
+export interface OldLifeWaitTarget {
+  readonly instanceId: string
+  readonly oldKey: string
+}
+
+/**
+ * Whether the wait's old row is a configured persona's own row
+ * (`cscb_<key>` of a key the installed configured-persona query counts): a
+ * row the start sweep swept for its `cwd`. Its `get`s and between-try reads
+ * are then the shared own-row reads, so SRJ-114's and SRJ-513's row rules
+ * apply (b.jg5 SRJ-811). Never throws.
+ */
+function isConfiguredOwnRow(target: OldLifeWaitTarget): boolean {
+  return target.oldKey !== target.instanceId && personaInstanceId(target.oldKey) === target.instanceId && configuredReadingOf(target.oldKey).configured
+}
+
+/**
+ * The wrapper options of every call the wait makes itself (b.jg5 SRJ-811,
+ * SRJ-1512): arm nothing for the old key (no retry timer, no
+ * `tmux-unresponsive` condition, no unclassified episode), and raise an
+ * ENVIRONMENT or CONFIG outage under the old key only for a configured
+ * persona's own row; the waiting personas' outages are raised by
+ * `noteOldLifeWaitAnswer`.
+ */
+function oldLifeWaitCallOptions(target: OldLifeWaitTarget): OutageDetectionOptions {
+  return { armsNothing: { personaConfigured: () => isConfiguredOwnRow(target) } }
+}
+
+/** What one round of a wait met, as its dependencies record it (`OldLifeWaitAnswers`, `src/old-life-wait.ts`). */
+export interface OldLifeWaitRecord {
+  readonly refusals: OldLifeWaitRefusal[]
+  unclassified?: unknown
+  lastKill?: KillRetryResult
+  /** The old row's tmux session as a `get` read it, for the kill-failure alert's text; absent until read. */
+  session?: string
+}
+
+/** A new, empty record for one wait round. */
+export function createOldLifeWaitRecord(): OldLifeWaitRecord {
+  return { refusals: [] }
+}
+
+/**
+ * Whether the installed bindings' configuration shows `key` outside the
+ * applied set (b.av2 SR-8.6): no applied configuration, or none of its
+ * personas has the key. False with no bindings installed or when the read
+ * throws, so a key is never taken as removed on a reading that could not
+ * be made. Never throws.
+ */
+function isKnownUnapplied(key: string, bindings: OldLifeWaitBindings | undefined = oldLifeWaitBindings): boolean {
+  if (bindings === undefined) return false
+  try {
+    const config = bindings.appliedConfig()
+    return config === null || config === undefined || !config.personas.some((p) => p.key === key)
+  } catch {
+    return false
+  }
+}
+
+/** The applied persona with key `key` (the installed bindings' configuration), or undefined. Never throws. */
+function oldLifeAppliedPersona(key: string, bindings: OldLifeWaitBindings | undefined = oldLifeWaitBindings): Persona | undefined {
+  try {
+    return bindings?.appliedConfig()?.personas.find((p) => p.key === key)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The applied personas waiting on the hold on `instanceId` (b.jg5 SRJ-810,
+ * SRJ-811): each persona of the applied configuration whose working
+ * directory is the held directory, or whose own `cscb_<key>` is the held
+ * row (the hold set's waits-on query). None with no hold set or no bindings
+ * installed. Never throws.
+ */
+export function oldLifeWaitingPersonas(instanceId: string, bindings: OldLifeWaitBindings | undefined = oldLifeWaitBindings): Persona[] {
+  const holds = oldLifeHolds
+  if (holds === undefined) return []
+  try {
+    const personas = bindings?.appliedConfig()?.personas ?? []
+    return personas.filter((p) => holds.holdsWaitedOnBy(p).some((hold) => hold.instanceId === instanceId))
+  } catch (err) {
+    console.error(`${OLD_LIFE_WAIT_LOG_PREFIX} the waiting personas of instanceId=${instanceId} could not be read: ${describeThrownValue(err)} — none`)
+    return []
+  }
+}
+
+/**
+ * One answer an old-life wait's call met (b.jg5 SRJ-811, SRJ-1002), by class
+ * through `src/ad-error-class.ts` (by name): a CONFLICT or an UNUSABLE NAME
+ * answer is recorded for its `persona-teardown-notice` entry and latches no
+ * one; an ENVIRONMENT answer raises `tmux-unavailable`, and a CONFIG answer
+ * `ad-config-malformed`, for each persona waiting on the hold (hatch A3; the
+ * calling agent's reading of SRJ-311 for ENVIRONMENT); the first
+ * UNCLASSIFIED answer is recorded for the end handler's report to the old
+ * row's unclassified-error episode. `errorClass` is the class the caller
+ * decided (a kill outcome's),
+ * else the classifier's. Never throws.
+ */
+function noteOldLifeWaitAnswer(
+  target: OldLifeWaitTarget,
+  record: OldLifeWaitRecord,
+  err: unknown,
+  at: OldLifeWaitRefusalAt,
+  errorClass: string = classifyAdError(err).errorClass,
+): void {
+  try {
+    if (errorClass === AD_ERROR_CLASS_CONFLICT || errorClass === AD_ERROR_CLASS_UNUSABLE_NAME) {
+      record.refusals.push({ at, errorClass, error: err })
+      return
+    }
+    if (errorClass === AD_ERROR_CLASS_ENVIRONMENT || errorClass === AD_ERROR_CLASS_CONFIG) {
+      for (const persona of oldLifeWaitingPersonas(target.instanceId)) {
+        try {
+          if (errorClass === AD_ERROR_CLASS_ENVIRONMENT) raiseTmuxUnavailable(persona.key, err)
+          else raiseAdConfigMalformed(persona.key, err)
+        } catch (raiseErr) {
+          console.error(`${OLD_LIFE_WAIT_LOG_PREFIX} raising the outage for persona=${persona.key} failed: ${describeThrownValue(raiseErr)}`)
+        }
+      }
+      return
+    }
+    if (errorClass === AD_ERROR_CLASS_UNCLASSIFIED && record.unclassified === undefined) record.unclassified = err
+  } catch {
+    /* recording an answer never changes the call's own outcome */
+  }
+}
+
+/**
+ * A call the wait made itself succeeded (b.jg5 SRJ-312, SRJ-316, SRJ-811):
+ * agent-director read its store, so the `ad-config-malformed` outage is
+ * cleared for each persona waiting on the hold, through the outage state's
+ * clear (`clearOutageFlag`), as a persona's own successful call clears it;
+ * an outage not raised is left as it is. `tmux-unavailable` is not cleared
+ * here: its clear stops the persona's retry timer (the condition-end entry),
+ * which would drop the held-for-old-life arm the wait relies on. Never
+ * throws.
+ */
+function clearOldLifeWaitConfigOutage(target: OldLifeWaitTarget): void {
+  try {
+    for (const persona of oldLifeWaitingPersonas(target.instanceId)) {
+      try {
+        if (getOutageFlags(persona.key).has('ad-config-malformed')) clearOutageFlag(persona.key, 'ad-config-malformed')
+      } catch (clearErr) {
+        console.error(`${OLD_LIFE_WAIT_LOG_PREFIX} clearing the outage for persona=${persona.key} failed: ${describeThrownValue(clearErr)}`)
+      }
+    }
+  } catch {
+    /* a clear never changes the call's own outcome */
+  }
+}
+
+/** What the wait's dependency builder is given (`buildOldLifeWaitDeps`). */
+export interface OldLifeWaitDepsInput {
+  /** The old row. */
+  readonly target: OldLifeWaitTarget
+  /** Where the round records what its calls met (`createOldLifeWaitRecord`). */
+  readonly record: OldLifeWaitRecord
+  /** The wait's clock: its waits, pauses and its kills' waits between tries. */
+  readonly clock: NeverEarlyWaitClock
+  /** Where the sequence's own lines go. */
+  readonly log: (line: string) => void
+  /** The server's kill-failure alerts; absent: the installed ones (`setKillFailureAlerts`). */
+  readonly killFailureAlerts?: KillFailureAlerts
+}
+
+/** The stop cause a wait's kill names when a shutdown stopped its tries (b.jg5 SRJ-702, SRJ-811). */
+export const OLD_LIFE_WAIT_STOP_CAUSE_SHUTDOWN = 'its old-life wait was stopped: the server is shutting down'
+
+/** The stop cause a wait's kill names when the teardown of the last persona waiting on its hold stopped its tries (b.jg5 SRJ-702, SRJ-811). */
+export const OLD_LIFE_WAIT_STOP_CAUSE_TEARDOWN = 'its old-life wait was stopped: the last persona waiting on its hold was torn down'
+
+/** The stop cause of a wait's kill for the sequence's stop cause `given` (`liveRowStopCauseText`). */
+function oldLifeWaitStopCause(given: string | undefined): string {
+  if (given === liveRowStopCauseText(LIVE_ROW_STOP_SHUTDOWN)) return OLD_LIFE_WAIT_STOP_CAUSE_SHUTDOWN
+  if (given === liveRowStopCauseText(LIVE_ROW_STOP_TEARDOWN)) return OLD_LIFE_WAIT_STOP_CAUSE_TEARDOWN
+  return given ?? OLD_LIFE_WAIT_STOP_CAUSE_SHUTDOWN
+}
+
+/**
+ * The tmux session the wait's kill-failure alert names (b.jg5 SRJ-1001,
+ * SRJ-811): the one a `get` of the row read; else the one the start sweep's
+ * listing named when it began or kept the hold (`noteOldLifeHoldSession`);
+ * else the old key's `slack_bot_<key>` for its own `cscb_<key>` row; else
+ * none (empty), which the alert builders render as `"unknown"`. An instance
+ * id is never named as a session.
+ */
+function oldLifeWaitSession(target: OldLifeWaitTarget, record: OldLifeWaitRecord): string {
+  if (record.session !== undefined) return record.session
+  const listed = oldLifeSessionNames.get(target.instanceId)
+  if (listed !== undefined) return listed
+  return target.oldKey !== target.instanceId ? personaTmuxSessionName(target.oldKey) : ''
+}
+
+/** The line head of the wait's kill tries, reads and alerts. */
+const OLD_LIFE_WAIT_KILL_LOG_PREFIX = `[slack] ${OLD_LIFE_WAIT_SITE}`
+
+/**
+ * The old-life wait's dependencies for one old row (b.jg5 SRJ-811, SRJ-705
+ * steps 1 to 5 with no launch): the live-row sequence's dependency interface
+ * (`LiveRowSequenceDeps`) bound to `input.target`'s instance id, so the
+ * sequence's no-launch form runs on it. Every call is reported under the old
+ * key (or the instance id standing in for it):
+ *   - the `get`s: for a configured persona's own row, the shared own-row read
+ *     (`readPersonaOwnRow`, SRJ-114, SRJ-513), its UNUSABLE NAME answer routed
+ *     per SRJ-1002 (no latch); for any other id, one plain `get` that applies
+ *     no row-read rule. Every answer reaches the old-life read entry
+ *     (`noteOldLifeRowRead`), so a read of `ended` or `missing`, or no row,
+ *     ends the hold;
+ *   - the runs: the bypassing entry (`bypassingFindMissingSweep`, E14 T2),
+ *     with the old key's next-step `get` only for a configured persona's own
+ *     row; a run's `ids` end the hold through the run's own read entry;
+ *   - each kill: the checked kill of the instance id inside the bounded retry
+ *     (`runKillRetry`) in the deferred-report form: its tries and its
+ *     between-try `status` reads arm nothing; the read is the shared own-row
+ *     `status` step for a configured persona's own row (its UNUSABLE NAME
+ *     answer latching nothing) and a plain `status` otherwise; its
+ *     keep-going check is the sequence's stop and the latch query below, so
+ *     a shutdown, the last waiter's teardown or the own-row persona's latch
+ *     stops it, never a persona not up nor any other persona's latch (AC
+ *     64); and its hold-end query ends the tries as a success when the hold
+ *     ends between tries or during a try whose UNAVAILABLE outcome would
+ *     stand, or the sequence was stopped for the hold's end, even with a new
+ *     hold begun on the id since (SRJ-702; option A);
+ *   - the launch start: the sequence's own reader (`src/pending-row.ts`), so
+ *     a `pending` row with no launch start under a key no configured persona
+ *     uses gets no wait for G and latches nothing (SRJ-408);
+ *   - the alerts: the kill-failure alerts with the context `old-life wait`,
+ *     always on the not-configured, log-only route (a server-log line and a
+ *     `persona-kill-failed` or `persona-kill-survivor` entry), naming the old
+ *     row's instance id and session (`oldLifeWaitSession`); a kill whose
+ *     tries a stop ended writes its one line and the old key's
+ *     `persona-kill-failed` entry with no alert text;
+ *   - the latch query (`isLatched`): for a configured persona's own row, that
+ *     persona's latch, so no kill or call is made for its row while it is
+ *     latched (SRJ-502, SRJ-408, SRJ-513; AC 46); for any other id, never;
+ *   - no latching (`latchOnKillOutcome` latches nothing), no launch and no
+ *     retry arm: the no-launch form never reaches them, and the waiting
+ *     personas are armed by the end handler.
+ * Each answer is recorded in `input.record` (`noteOldLifeWaitAnswer`): a
+ * CONFLICT or UNUSABLE NAME answer for its notice, ENVIRONMENT and CONFIG
+ * raising their outage for each waiting persona, the first UNCLASSIFIED
+ * answer, and the last kill's result. Each call that succeeds clears the
+ * waiting personas' `ad-config-malformed` outage
+ * (`clearOldLifeWaitConfigOutage`). No new `getClient()` site: every call
+ * goes through `withOutageDetection` or the shared reads. The builder reads
+ * nothing and starts nothing when called.
+ */
+export function buildOldLifeWaitDeps(input: OldLifeWaitDepsInput): LiveRowSequenceDeps {
+  const { target, record } = input
+  const { instanceId, oldKey } = target
+  return {
+    clock: input.clock,
+    log: input.log,
+    // SRJ-502, SRJ-408, SRJ-513: a configured persona's own row is never
+    // killed or called while that persona is latched. Any other latch never
+    // stops the wait (SRJ-702, SRJ-811; AC 64).
+    isLatched: () => isConfiguredOwnRow(target) && personaLatchedNow(oldKey),
+    isConfigMalformedRaised: () =>
+      getOutageFlags(oldKey).has('ad-config-malformed') ||
+      oldLifeWaitingPersonas(instanceId).some((p) => getOutageFlags(p.key).has('ad-config-malformed')),
+    graceMs: adGraceMsInEffect,
+    readRow: (_key, ref) => readOldLifeRow(target, record, ref),
+    runFindMissing: async (_key, runInstanceId, stateBefore) => {
+      const answer = await bypassingFindMissingSweep(oldKey, OLD_LIFE_WAIT_SITE, isConfiguredOwnRow(target) ? oldKey : undefined, {
+        outage: oldLifeWaitCallOptions(target),
+        onFailure: (err) => noteOldLifeWaitAnswer(target, record, err, OLD_LIFE_WAIT_AT_FIND_MISSING),
+      })
+      // A completed run (its next-step `get` included) read agent-director's store.
+      if (answer !== undefined && answer !== FIND_MISSING_REFUSED && answer !== FIND_MISSING_LATCHED) clearOldLifeWaitConfigOutage(target)
+      return runPlacementOf(answer, runInstanceId, stateBefore)
+    },
+    killWithRetry: async (_key, options) => {
+      const seed =
+        options.lastReadState === LIVE_ROW_SEQUENCE_NO_ROW
+          ? KILL_RETRY_SEED_NOT_LIVE_VALUE
+          : options.lastReadState === OLD_LIFE_WAIT_SEED_LIVE_UNREAD
+            ? KILL_RETRY_SEED_LIVE_UNREAD
+            : killRetrySeedOfState(options.lastReadState)
+      const call = adKillCall(killRetrySeedIsLive(seed))
+      const result = await runKillRetry({
+        instanceId,
+        kill: () => tryOldLifeKill(target, record, call),
+        read: () => readOldLifeKillRow(target, record, options.ref),
+        wait: options.wait,
+        lastRead: seed,
+        keepGoing: options.keepGoing,
+        // SRJ-702, SRJ-811 (option A): the hold's end ends the tries as a
+        // success, a stop for it included when a new hold has begun on the id.
+        holdEnded: () => options.stoppedForHoldEnd?.() === true || oldLifeHoldEnded(instanceId),
+        log: (line) => console.error(line),
+        logPrefix: `${OLD_LIFE_WAIT_KILL_LOG_PREFIX} for ${options.ref}`,
+      })
+      record.lastKill = result
+      return result
+    },
+    latchOnKillOutcome: async () => false,
+    raiseKillAlert: (_key, retried, _context, ref, stopCause) =>
+      raiseOldLifeWaitKillAlert(target, record, retried, ref, stopCause, input.killFailureAlerts),
+    raiseEscalationAlert: (_key, _context, ref) => raiseOldLifeWaitEscalationAlert(target, record, ref, input.killFailureAlerts),
+    personaFacts: () => undefined,
+    launch: async (_key, _kind, _lastRead, ref) => {
+      // Not reached: the no-launch form never reaches step 6's launch (SRJ-1512).
+      console.error(`${OLD_LIFE_WAIT_LOG_PREFIX} ${ref}: the old-life wait never launches its old key — no launch (b.jg5 SRJ-811, SRJ-1512)`)
+      return { kind: LIVE_ROW_OUTCOME_NOT_LAUNCHED, reason: LIVE_ROW_NOT_LAUNCHED_NOT_APPLIED }
+    },
+    armRetry: () => {
+      /* SRJ-1512: no retry timer is armed for the old key */
+    },
+  }
+}
+
+/**
+ * Whether the hold on `instanceId` has ended (the wait's kill's hold-end
+ * query, b.jg5 SRJ-702, SRJ-811): no hold on it in the installed hold set.
+ * With no hold set installed, never. Never throws.
+ */
+function oldLifeHoldEnded(instanceId: string): boolean {
+  const holds = oldLifeHolds
+  if (holds === undefined) return false
+  try {
+    return holds.holdOf(instanceId) === undefined
+  } catch {
+    return false
+  }
+}
+
+/**
+ * One try of a wait's kill (b.jg5 SRJ-110, SRJ-811): one checked kill of the
+ * old row's instance id through `withOutageDetection` under the old key,
+ * arming nothing (`oldLifeWaitCallOptions`), with the `ErrInvalidFlags`
+ * re-check (`recheckKillOnInvalidFlags`). A non-success's class is recorded
+ * (`noteOldLifeWaitAnswer`); an UNAVAILABLE one is the bounded retry's.
+ * Never throws.
+ */
+async function tryOldLifeKill(target: OldLifeWaitTarget, record: OldLifeWaitRecord, call: AdKillCall): Promise<KillOutcome> {
+  const outcome = await recheckKillOnInvalidFlags(
+    await checkedKill(target.instanceId, async (params) => {
+      const answer = await withOutageDetection(target.oldKey, undefined, call, (client) => client.kill(params), oldLifeWaitCallOptions(target))
+      clearOldLifeWaitConfigOutage(target)
+      return answer
+    }),
+  )
+  if (outcome.kind === KILL_OUTCOME_NOT_KILLED && outcome.errorClass !== AD_ERROR_CLASS_UNAVAILABLE && !killOutcomeStopsServer(outcome)) {
+    noteOldLifeWaitAnswer(target, record, outcome.error, OLD_LIFE_WAIT_AT_KILL, outcome.errorClass)
+  }
+  return outcome
+}
+
+/** Who reads, in the own-row lines of an old-life wait's `get`s of a configured persona's own row (b.jg5 SRJ-114, SRJ-811). */
+const OLD_LIFE_WAIT_GET_WHAT = 'get'
+
+/** Who reads, in the own-row lines of an old-life wait's kill's between-try `status` reads (b.jg5 SRJ-115, SRJ-811). */
+const OLD_LIFE_WAIT_STATUS_WHAT = 'status read between kill tries'
+
+/** The tmux session a `get` row names, when it is a non-empty string. */
+function rowSessionName(row: unknown): string | undefined {
+  try {
+    const session = (row as { tmux_session_name?: unknown }).tmux_session_name
+    return typeof session === 'string' && session !== '' ? session : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * One `get` of the wait's old row (b.jg5 SRJ-811), as the sequence takes it.
+ * A configured persona's own row: the shared own-row read
+ * (`readPersonaOwnRow`), its UNUSABLE NAME answer routed per SRJ-1002 (no
+ * latch; a failed read). Any other id: one plain `get` under the old key,
+ * arming nothing, that applies no row-read rule, its answer given to the
+ * old-life read entry (`noteOldLifeRowRead`). A failed read's class is
+ * recorded (`noteOldLifeWaitAnswer`). Never throws.
+ */
+async function readOldLifeRow(target: OldLifeWaitTarget, record: OldLifeWaitRecord, ref: string): Promise<LiveRowSequenceRead> {
+  const { instanceId, oldKey } = target
+  if (isConfiguredOwnRow(target)) {
+    const read = await readPersonaOwnRow(oldKey, {
+      site: OLD_LIFE_WAIT_SITE,
+      what: OLD_LIFE_WAIT_GET_WHAT,
+      ref,
+      unusableNameRoutedIn: OLD_LIFE_WAIT_ROUTED_CONTEXT,
+    })
+    switch (read.kind) {
+      case OWN_ROW_READ_ROW:
+        record.session = rowSessionName(read.row) ?? record.session
+        clearOldLifeWaitConfigOutage(target)
+        return read.latched ? { kind: LIVE_ROW_READ_LATCHED } : { kind: LIVE_ROW_READ_ROW, row: read.row as Phase1GetResult }
+      case OWN_ROW_READ_ABSENT:
+        return { kind: LIVE_ROW_READ_ABSENT }
+      case OWN_ROW_READ_LATCHED:
+        return { kind: LIVE_ROW_READ_LATCHED }
+      case OWN_ROW_READ_REFUSED:
+        noteOldLifeWaitAnswer(target, record, read.error, OLD_LIFE_WAIT_AT_GET)
+        return { kind: LIVE_ROW_READ_REFUSED, error: read.error }
+    }
+  }
+  try {
+    const row = await withOutageDetection(oldKey, undefined, 'get', (client) => client.get({ claude_instance_id: instanceId }), oldLifeWaitCallOptions(target))
+    clearOldLifeWaitConfigOutage(target)
+    record.session = rowSessionName(row) ?? record.session
+    // b.jg5 SRJ-809: a row read `ended` or `missing` ends the hold; a live one's `cwd` becomes the held directory.
+    noteOldLifeRowRead(instanceId, { kind: OLD_LIFE_ROW_READ_STATE, state: row.state, cwd: row.cwd }, `${OLD_LIFE_WAIT_SITE}: ${OLD_LIFE_WAIT_GET_WHAT}`)
+    return { kind: LIVE_ROW_READ_ROW, row: row as Phase1GetResult }
+  } catch (err) {
+    if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) {
+      noteOldLifeRowRead(instanceId, { kind: OLD_LIFE_ROW_READ_NO_ROW }, `${OLD_LIFE_WAIT_SITE}: ${OLD_LIFE_WAIT_GET_WHAT}`)
+      return { kind: LIVE_ROW_READ_ABSENT }
+    }
+    noteOldLifeWaitAnswer(target, record, err, OLD_LIFE_WAIT_AT_GET)
+    return { kind: LIVE_ROW_READ_REFUSED, error: err }
+  }
+}
+
+/**
+ * One `status` read of the wait's old row between its kill's tries (b.jg5
+ * SRJ-702, SRJ-811), through `withOutageDetection` under the old key arming
+ * nothing. A configured persona's own row: the own-row `status` step
+ * (`applyOwnRowStatusStep`: the episode end, the old-life read entry, the
+ * entry clear and SRJ-513's latch of its own `pending` row with no launch
+ * start), but an UNUSABLE NAME answer is routed per SRJ-1002 and latches
+ * nothing (one line). Any other id: the answer goes to the old-life read
+ * entry only. A failed read's class is recorded (`noteOldLifeWaitAnswer`).
+ * Never throws.
+ */
+async function readOldLifeKillRow(target: OldLifeWaitTarget, record: OldLifeWaitRecord, ref: string): Promise<KillRetryRead> {
+  const { instanceId, oldKey } = target
+  const own = isConfiguredOwnRow(target)
+  const at: OwnRowReadSite = { site: OLD_LIFE_WAIT_SITE, what: OLD_LIFE_WAIT_STATUS_WHAT, ref }
+  let result: Phase1StatusResult
+  try {
+    result = await withOutageDetection(oldKey, undefined, 'status', (client) => client.status({ claude_instance_id: instanceId }), oldLifeWaitCallOptions(target))
+    clearOldLifeWaitConfigOutage(target)
+  } catch (err) {
+    if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) {
+      if (own) applyOwnRowStatusStep(oldKey, { thrown: err }, at)
+      else noteOldLifeRowRead(instanceId, { kind: OLD_LIFE_ROW_READ_NO_ROW }, oldLifeReadName(at))
+      return { kind: KILL_RETRY_READ_NO_ROW }
+    }
+    if (own && isUnusableNameError(err)) {
+      // b.jg5 SRJ-512, SRJ-1002: met in an old-life wait, routed, so nothing latches.
+      logUnusableNameRouted(oldKey, at, OLD_LIFE_WAIT_ROUTED_CONTEXT, err)
+    } else if (own) {
+      applyOwnRowStatusStep(oldKey, { thrown: err }, at)
+    }
+    noteOldLifeWaitAnswer(target, record, err, OLD_LIFE_WAIT_AT_STATUS_READ)
+    return { kind: KILL_RETRY_READ_FAILED, error: err }
+  }
+  if (own) {
+    if (applyOwnRowStatusStep(oldKey, { result }, at)) return { kind: KILL_RETRY_READ_LATCHED }
+    return { kind: KILL_RETRY_READ_STATE, state: result.state }
+  }
+  noteOldLifeRowRead(instanceId, { kind: OLD_LIFE_ROW_READ_STATE, state: result.state }, oldLifeReadName(at))
+  return { kind: KILL_RETRY_READ_STATE, state: result.state }
+}
+
+/**
+ * Raise the kill-failure alert a wait's kill decided (b.jg5 SRJ-704,
+ * SRJ-1007, SRJ-811): through the kill-failure alerts (`alerts`, the
+ * installed ones by default) with the context `old-life wait`, which always
+ * takes the not-configured, log-only route (a server-log line and a
+ * `persona-kill-failed` or `persona-kill-survivor` entry, nothing to Slack),
+ * naming the old row's instance id and its session; the entry names the
+ * wait's reference (`oldLifeWaitRef`: `persona=<old key>` for a
+ * `cscb_<old key>` row, `instanceId=<id>` for an id standing in), as the
+ * wait's other entries do. A kill whose tries a stop ended (a shutdown,
+ * or the last waiter's teardown; b.jg5 SRJ-702) raises neither version: one
+ * line quoting the latest survivor-naming description and the same
+ * reference's `persona-kill-failed` entry with no alert text, whatever the decision (an
+ * ordinary decision with no description when the tries decided none), with
+ * the wait's stop cause. A survivor version after the hold's end is raised
+ * as for any success. With no alerts installed, one line instead. Never
+ * throws.
+ */
+function raiseOldLifeWaitKillAlert(
+  target: OldLifeWaitTarget,
+  record: OldLifeWaitRecord,
+  retried: KillRetryResult,
+  ref: string,
+  stopCause: string | undefined,
+  alerts: KillFailureAlerts | undefined = killFailureAlerts,
+): void {
+  try {
+    const stopsServer = killOutcomeStopsServer(retried.outcome)
+    const stopped = stopsServer || retried.end === KILL_RETRY_END_STOPPED
+    if (!stopped && retried.alert.kind === KILL_RETRY_ALERT_NONE) return
+    const decision: KillRetryAlert = stopped && retried.alert.kind === KILL_RETRY_ALERT_NONE ? { kind: KILL_RETRY_ALERT_ORDINARY } : retried.alert
+    if (alerts === undefined) {
+      console.error(
+        `${OLD_LIFE_WAIT_LOG_PREFIX} ${ref}: the kill-failure alert's ${decision.kind} version is not raised — no kill-failure alerts are installed; ${describeKillFailureDescriptions(decision)} (b.jg5 SRJ-704, SRJ-811)`,
+      )
+      return
+    }
+    const { outcome } = retried
+    const stop = stopped
+      ? {
+          stopped: true,
+          lastOutcomeClass: outcome.kind === KILL_OUTCOME_NOT_KILLED ? outcome.errorClass : outcome.kind,
+          stopCause: stopsServer ? PERSONA_KILL_STOP_CAUSE_RECHECK : oldLifeWaitStopCause(stopCause),
+        }
+      : {}
+    alerts.raise({
+      key: target.oldKey,
+      decision,
+      latched: false,
+      context: KILL_FAILURE_CONTEXT_OLD_LIFE_WAIT,
+      session: oldLifeWaitSession(target, record),
+      instanceId: target.instanceId,
+      ref: oldLifeWaitRef(target.instanceId, target.oldKey),
+      ...stop,
+    })
+  } catch (err) {
+    console.error(`${OLD_LIFE_WAIT_LOG_PREFIX} ${ref}: raising the kill-failure alert failed: ${describeThrownValue(err)}`)
+  }
+}
+
+/**
+ * Step 5's kill-failure alert in a wait (b.jg5 SRJ-705, SRJ-704, SRJ-1007,
+ * SRJ-811): the ordinary version with no description, context `old-life
+ * wait`, on the not-configured, log-only route, naming the old row's
+ * instance id and session, its entry the wait's reference
+ * (`oldLifeWaitRef`). With no alerts installed, one line instead.
+ * Never throws.
+ */
+function raiseOldLifeWaitEscalationAlert(
+  target: OldLifeWaitTarget,
+  record: OldLifeWaitRecord,
+  ref: string,
+  alerts: KillFailureAlerts | undefined = killFailureAlerts,
+): void {
+  try {
+    if (alerts === undefined) {
+      console.error(
+        `${OLD_LIFE_WAIT_LOG_PREFIX} ${ref}: the kill-failure alert's ordinary version is not raised — no kill-failure alerts are installed (b.jg5 SRJ-704, SRJ-705, SRJ-811)`,
+      )
+      return
+    }
+    alerts.raise({
+      key: target.oldKey,
+      decision: { kind: KILL_RETRY_ALERT_ORDINARY },
+      latched: false,
+      context: KILL_FAILURE_CONTEXT_OLD_LIFE_WAIT,
+      session: oldLifeWaitSession(target, record),
+      instanceId: target.instanceId,
+      ref: oldLifeWaitRef(target.instanceId, target.oldKey),
+    })
+  } catch (err) {
+    console.error(`${OLD_LIFE_WAIT_LOG_PREFIX} ${ref}: raising the kill-failure alert failed: ${describeThrownValue(err)}`)
+  }
+}
+
+/** The ensure entry's answer when no hold is on the instance id: nothing was started. */
+export const OLD_LIFE_WAIT_START_NOT_HELD = 'not-held'
+
+/** What `ensureOldLifeWait` answers: the registry's answer, that nothing is installed, or that no hold is on the id. */
+export type OldLifeWaitEnsureAnswer =
+  | LiveRowSequenceStartAnswer
+  | typeof LIVE_ROW_START_NOT_INSTALLED
+  | typeof OLD_LIFE_WAIT_START_NOT_HELD
+
+/**
+ * Make sure the hold on `instanceId` has its wait running (b.jg5 SRJ-811,
+ * SRJ-1512): when the installed hold set holds the id, start, through the
+ * installed live-row sequence registry, the sequence's no-launch form on it:
+ * its key the hold's old key (or the instance id standing in), seeded with
+ * the state last read of the row (`live, unread` when none), entry at step
+ * 1, no conversation kept, no launch, alert context `old-life wait`, with
+ * the wait's own dependencies (`buildOldLifeWaitDeps`) and its end handler
+ * (`handleOldLifeWaitEnd`). Answers the registry's answer (`started`;
+ * `already-running` when a wait or a live-row sequence runs on the id, so
+ * one wait runs per held instance id and never at once with a sequence on
+ * it; `closed` after the registry's close), `not-held` with one line when no
+ * hold is on the id, or `not-installed` with one line when no registry or
+ * no wait bindings are installed. Never blocks on the wait; never throws. In
+ * this build it is started only through this entry: no production gate calls
+ * it yet.
+ *
+ *   [slack] old-life-wait: instanceId=<id>: no old-life hold is on it — no wait started (b.jg5 SRJ-811)
+ *   [slack] old-life-wait: instanceId=<id>: no sequence registry or wait bindings are installed — no wait started (b.jg5 SRJ-811)
+ */
+export function ensureOldLifeWait(instanceId: string): OldLifeWaitEnsureAnswer {
+  const holds = oldLifeHolds
+  let hold: OldLifeHold | undefined
+  try {
+    hold = holds?.holdOf(instanceId)
+  } catch {
+    hold = undefined
+  }
+  if (hold === undefined) {
+    console.error(oldLifeWaitNotStartedLine(instanceId, OLD_LIFE_WAIT_START_NOT_HELD))
+    return OLD_LIFE_WAIT_START_NOT_HELD
+  }
+  const registry = liveRowSequenceRegistry
+  const bindings = oldLifeWaitBindings
+  if (registry === undefined || bindings === undefined) {
+    console.error(oldLifeWaitNotStartedLine(instanceId, LIVE_ROW_START_NOT_INSTALLED))
+    return LIVE_ROW_START_NOT_INSTALLED
+  }
+  const target: OldLifeWaitTarget = { instanceId, oldKey: hold.oldKey }
+  const record = createOldLifeWaitRecord()
+  const request: LiveRowSequenceRequest = {
+    key: hold.oldKey,
+    ref: oldLifeWaitRef(instanceId, hold.oldKey),
+    instanceId,
+    lastReadState: oldLifeLastReadState.get(instanceId) ?? OLD_LIFE_WAIT_SEED_LIVE_UNREAD,
+    entryStep: LIVE_ROW_SEQUENCE_ENTRY_KILL,
+    keepsConversation: false,
+    retiredKey: false,
+    launches: false,
+    alertContext: KILL_FAILURE_CONTEXT_OLD_LIFE_WAIT,
+  }
+  return registry.start(request, {
+    deps: buildOldLifeWaitDeps({
+      target,
+      record,
+      clock: bindings.clock,
+      log: bindings.log,
+      ...(bindings.killFailureAlerts === undefined ? {} : { killFailureAlerts: bindings.killFailureAlerts }),
+    }),
+    onSettled: (outcome) => handleOldLifeWaitEnd(target, record, outcome, bindings),
+  })
+}
+
+/**
+ * The ensure entry's line when it starts no wait (b.jg5 SRJ-811): no hold on
+ * the id, or no registry or wait bindings installed:
+ *
+ *   [slack] old-life-wait: instanceId=<id>: no old-life hold is on it — no wait started (b.jg5 SRJ-811)
+ *   [slack] old-life-wait: instanceId=<id>: no sequence registry or wait bindings are installed — no wait started (b.jg5 SRJ-811)
+ *
+ * Pure.
+ */
+export function oldLifeWaitNotStartedLine(
+  instanceId: string,
+  why: typeof OLD_LIFE_WAIT_START_NOT_HELD | typeof LIVE_ROW_START_NOT_INSTALLED,
+): string {
+  const what = why === OLD_LIFE_WAIT_START_NOT_HELD ? 'no old-life hold is on it' : 'no sequence registry or wait bindings are installed'
+  return `${OLD_LIFE_WAIT_LOG_PREFIX} instanceId=${renderLogMessageText(instanceId)}: ${what} — no wait started (b.jg5 SRJ-811)`
+}
+
+/**
+ * The no-launch form's end handler (b.jg5 SRJ-811, SRJ-812, SRJ-1002,
+ * SRJ-1013): decides what follows the round (`decideOldLifeWaitEnd`,
+ * `src/old-life-wait.ts`) and applies it:
+ *   - each CONFLICT and UNUSABLE NAME answer met: one `persona-teardown-notice`
+ *     entry through the startup-errors recorder (which writes the server-log
+ *     line too), worded "during the wait"
+ *     (`personaTeardownNoticeEntryText` with
+ *     `PERSONA_TEARDOWN_NOTICE_DURING_WAIT`), naming the old key or the
+ *     instance id standing in, with the kill outcome's one-line rendering
+ *     (`oldLifeWaitRefusalNoticeText`); nothing latches;
+ *   - the round's first UNCLASSIFIED answer, when the hold goes on: reported
+ *     to the wait's unclassified-error episode on the held instance id
+ *     (`OldLifeWaitBindings.unclassifiedErrorEpisodes`): the round that begins the
+ *     episode writes nothing, the first round met longer than the alert
+ *     threshold after it writes its one `persona-unclassified-error` entry
+ *     on the log-only route, and later rounds write none;
+ *   - the kill-failed mark on the hold (SRJ-812), when the round's kill
+ *     decided the ordinary alert unstopped, or at step 5;
+ *   - each waiting persona's retry timer armed with
+ *     `UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD`, uncounted, when the hold goes
+ *     on; never the old key's (SRJ-1512);
+ * then one end line (`oldLifeWaitEndLine`). Nothing reaches Slack. Never throws.
+ */
+function handleOldLifeWaitEnd(
+  target: OldLifeWaitTarget,
+  record: OldLifeWaitRecord,
+  outcome: LiveRowSequenceOutcome,
+  bindings: OldLifeWaitBindings,
+): void {
+  try {
+    const holds = oldLifeHolds
+    const decision = decideOldLifeWaitEnd({ outcome, answers: record, holdEnded: holds === undefined || holds.holdOf(target.instanceId) === undefined })
+    const write = bindings.recordStartupError ?? recordStartupError
+    const ref = oldLifeWaitRef(target.instanceId, target.oldKey)
+    for (const refusal of decision.notices) {
+      write(
+        PERSONA_TEARDOWN_NOTICE_LABEL,
+        personaTeardownNoticeEntryText(ref, oldLifeWaitRefusalNoticeText(target.instanceId, refusal), PERSONA_TEARDOWN_NOTICE_DURING_WAIT),
+      )
+    }
+    if (decision.reportUnclassified) {
+      // SRJ-313: one report per round to the old row's episode, keyed by the held instance id.
+      if (bindings.unclassifiedErrorEpisodes === undefined) console.error(oldLifeWaitUnclassifiedNotReportedLine(ref))
+      else bindings.unclassifiedErrorEpisodes.report(target.instanceId, record.unclassified)
+    }
+    if (decision.markKillFailed && holds !== undefined) holds.markKillFailed(target.instanceId)
+    const armed: string[] = []
+    if (decision.armWaiting) {
+      for (const persona of oldLifeWaitingPersonas(target.instanceId, bindings)) {
+        if (armOldLifeWaiter(persona.key, bindings)) armed.push(persona.key)
+      }
+    }
+    console.error(oldLifeWaitEndLine({ instanceId: target.instanceId, oldKey: target.oldKey, decision, armed }))
+  } catch (err) {
+    console.error(`${OLD_LIFE_WAIT_LOG_PREFIX} the end of the wait on instanceId=${target.instanceId} could not be handled: ${describeThrownValue(err)}`)
+  }
+}
+
+/**
+ * Arm persona `key`'s retry timer with the held-for-an-old-life cause
+ * (`UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD`; b.jg5 SRJ-811, SRJ-301), never
+ * counted, through the installed bindings' arm. A key the bindings'
+ * configuration shows outside the applied set is never armed (b.jg5
+ * SRJ-1512, b.av2 SR-8.6: no retry timer for the old key), with one line:
+ *
+ *   [slack] old-life-wait: persona=<key>: not in the applied configuration — no retry timer armed (b.jg5 SRJ-1512, b.av2 SR-8.6)
+ *
+ * Answers whether it was armed. Never throws.
+ */
+function armOldLifeWaiter(key: string, bindings: OldLifeWaitBindings | undefined = oldLifeWaitBindings): boolean {
+  if (bindings === undefined) return false
+  if (isKnownUnapplied(key, bindings)) {
+    console.error(oldLifeWaitNotAppliedLine(key))
+    return false
+  }
+  try {
+    return bindings.retryArm.arm(key, { kind: OLD_LIFE_HOLD_ARM_CAUSE_LABEL }) === true
+  } catch (err) {
+    console.error(`${OLD_LIFE_WAIT_LOG_PREFIX} persona=${key}: arming the retry timer failed: ${describeThrownValue(err)}`)
+    return false
+  }
+}
+
+/**
+ * The line of a waiting persona's key the applied configuration does not
+ * hold, so no retry timer is armed for it (`armOldLifeWaiter`; b.jg5
+ * SRJ-1512, b.av2 SR-8.6):
+ *
+ *   [slack] old-life-wait: persona=<key>: not in the applied configuration — no retry timer armed (b.jg5 SRJ-1512, b.av2 SR-8.6)
+ *
+ * Pure.
+ */
+export function oldLifeWaitNotAppliedLine(key: string): string {
+  return `${OLD_LIFE_WAIT_LOG_PREFIX} persona=${key}: not in the applied configuration — no retry timer armed (b.jg5 SRJ-1512, b.av2 SR-8.6)`
+}
+
+/** The wait's arm cause, held to the retry controller's label by its type (the same string). */
+const OLD_LIFE_HOLD_ARM_CAUSE_LABEL: typeof OLD_LIFE_WAIT_ARM_CAUSE = UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD
+
+/**
+ * Whether an old-life wait step runs for a hold persona `key` waits on
+ * (b.jg5 SRJ-811, SRJ-303; the glossary's "in flight for P"): the hold set's
+ * waits-on query over the applied persona (its working directory, its own
+ * `cscb_<key>`), each hold's instance id asked of the registry's no-launch
+ * query. False with no hold set, registry or bindings installed, or for a
+ * key not applied. Never throws.
+ */
+export function isOldLifeWaitRunningFor(key: string): boolean {
+  const holds = oldLifeHolds
+  const registry = liveRowSequenceRegistry
+  if (holds === undefined || registry === undefined) return false
+  const persona = oldLifeAppliedPersona(key)
+  if (persona === undefined) return false
+  try {
+    return holds.holdsWaitedOnBy(persona).some((hold) => registry.isNoLaunchRunning(hold.instanceId))
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Whether persona `key` waits on an old-life hold whose kill is marked failed
+ * (b.jg5 SRJ-812, SRJ-1011 state 4): the hold set's `waitsOnKillFailed` over
+ * the applied persona. The mark lasts until the hold ends. False with no hold
+ * set or bindings installed, or for a key not applied. Never throws.
+ */
+export function waitsOnKillFailedHold(key: string): boolean {
+  const holds = oldLifeHolds
+  if (holds === undefined) return false
+  const persona = oldLifeAppliedPersona(key)
+  if (persona === undefined) return false
+  try {
+    return holds.waitsOnKillFailed(persona) === true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * "A live-row sequence or an old-life wait step runs for P" (b.jg5 SRJ-1011,
+ * SRJ-812; E15's sequence/wait input): `isLiveRowSequenceRunning` or
+ * `isOldLifeWaitRunningFor`. Never throws.
+ */
+export function isSequenceOrOldLifeWaitRunning(key: string): boolean {
+  return isLiveRowSequenceRunning(key) || isOldLifeWaitRunningFor(key)
+}
+
+/**
+ * Which work in flight blocks a retry of persona `key`'s timer (b.jg5
+ * SRJ-303), first that holds: a launch call (`isLaunchInFlight`); an
+ * old-life wait on its own `cscb_<key>`; its live-row sequence
+ * (`isLiveRowSequenceRunning`); an old-life wait step for a hold it waits on
+ * (`isOldLifeWaitRunningFor`). Undefined when none does. The server's
+ * "blocks a retry" is true exactly when this answers a cause. Never throws.
+ */
+export function personaRetryBlockCause(key: string): RetryBlockCause | undefined {
+  if (isLaunchInFlight(key)) return RETRY_BLOCK_LAUNCH
+  if (liveRowSequenceRegistry?.isNoLaunchRunning(personaInstanceId(key)) === true) return RETRY_BLOCK_OLD_LIFE_WAIT
+  if (isLiveRowSequenceRunning(key)) return RETRY_BLOCK_LIVE_ROW_SEQUENCE
+  if (isOldLifeWaitRunningFor(key)) return RETRY_BLOCK_OLD_LIFE_WAIT
+  return undefined
+}
+
+/**
+ * The live-row sequence gate for persona `key` at `site`, as the restart
+ * path asks it (b.jg5 SRJ-706, SRJ-811): `isLiveRowSequenceRunning(key)`;
+ * when what runs on its own `cscb_<key>` is an old-life wait, which launches
+ * no one, the persona's retry timer is armed with the held-for-an-old-life
+ * cause too (`oldLifeWaitRefusal`), so the persona is retried once the wait
+ * is over. For a key outside the applied set whose own row's old-life wait
+ * runs (the wait on a removed key's row, b.jg5 SRJ-1512) the gate answers
+ * false with nothing armed, so the restart path's not-up gate (the relaunch
+ * gate, b.av2 SR-8.6) answers for the key. Never throws.
+ */
+export function liveRowSequenceGate(key: string, site: string): boolean {
+  if (!isLiveRowSequenceRunning(key)) return false
+  if (isKnownUnapplied(key) && liveRowSequenceRegistry?.isNoLaunchRunning(personaInstanceId(key)) === true) return false
+  oldLifeWaitRefusal(key, keyRef(key), site)
+  return true
+}
+
+/**
+ * When an old-life wait runs on persona `key`'s own `cscb_<key>` (b.jg5
+ * SRJ-811 bullet 2, SRJ-810): arm its retry timer with the
+ * held-for-an-old-life cause (`armOldLifeWaiter`), log one line and answer
+ * true; otherwise false, with nothing done. Never throws.
+ *
+ *   [slack] <site>: <ref> waits on the old-life wait running on its own row — its retry timer is armed (held-for-old-life) (sequence-waiting; b.jg5 SRJ-811)
+ */
+function oldLifeWaitRefusal(key: string, ref: string, site: string): boolean {
+  if (liveRowSequenceRegistry?.isNoLaunchRunning(personaInstanceId(key)) !== true) return false
+  console.error(oldLifeWaitRefusalLine(site, ref, armOldLifeWaiter(key)))
+  return true
+}
+
+/**
+ * The line of a launch refused because an old-life wait runs on the
+ * persona's own row (b.jg5 SRJ-811; `armed`: whether its retry timer was
+ * armed):
+ *
+ *   [slack] <site>: <ref> waits on the old-life wait running on its own row — its retry timer is armed (held-for-old-life) (sequence-waiting; b.jg5 SRJ-811)
+ *   [slack] <site>: <ref> waits on the old-life wait running on its own row — its retry timer could not be armed (sequence-waiting; b.jg5 SRJ-811)
+ *
+ * Pure.
+ */
+export function oldLifeWaitRefusalLine(site: string, ref: string, armed: boolean): string {
+  const timer = armed ? `its retry timer is armed (${UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD})` : 'its retry timer could not be armed'
+  return `[slack] ${site}: ${ref} waits on the old-life wait running on its own row — ${timer} (sequence-waiting; b.jg5 SRJ-811)`
 }
 
 // ---------------------------------------------------------------------------
@@ -13620,6 +14816,7 @@ function beginStartSweepListingHolds(pass: SweepPass, rows: readonly ListRow[]):
         directory: row.cwd,
         cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_LISTING,
       })
+      noteOldLifeHoldSession(row.claude_instance_id, row.tmux_session_name)
     } catch (err) {
       // Not reached (the hold set and the reading never throw).
       console.error(`${SWEEP_LOG_PREFIX}: beginning the old-life hold of instanceId=${row.claude_instance_id} failed: ${describeThrownValue(err)} (b.jg5 SRJ-809)`)
@@ -13660,12 +14857,30 @@ function beginStartSweepKillHold(pass: SweepPass, record: SweepRowRecord): void 
         cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL,
       })
     }
+    noteOldLifeHoldSession(id, row.tmux_session_name)
   } catch (err) {
     // Not reached (the hold set never throws).
     console.error(`${SWEEP_LOG_PREFIX}: beginning the old-life hold of instanceId=${id} failed: ${describeThrownValue(err)} (b.jg5 SRJ-809)`)
     return
   }
   markOldLifeHoldKillFailed(id, record.kill)
+}
+
+/**
+ * Keep the tmux session the start sweep's listing names for held row
+ * `instanceId` (b.jg5 SRJ-811, SRJ-1001), when it is a non-empty string and
+ * the row is held: the session a wait's kill-failure alert names until a
+ * `get` of the row reads one (`oldLifeWaitSession`). A session already kept
+ * for the hold stays. Never throws.
+ */
+function noteOldLifeHoldSession(instanceId: string, session: unknown): void {
+  try {
+    if (typeof session !== 'string' || session === '' || oldLifeSessionNames.has(instanceId)) return
+    if (oldLifeHolds?.holdOf(instanceId) === undefined) return
+    oldLifeSessionNames.set(instanceId, session)
+  } catch {
+    /* not reached (the hold set never throws); the alert names no session then */
+  }
 }
 
 /** What the start sweep decides each listed row by, once its latch pass is done. */
@@ -14341,9 +15556,10 @@ export async function launchSession(
   if (result.action === 'deferred' || result.action === 'latched' || result.action === 'held' || result.stopping) {
     return 'skipped'
   }
-  // b.jg5 SRJ-1015, SRJ-706: a launch handed to P's retry timer, or held for
-  // P's live-row sequence, records nothing and is a refusal at a retry, which
-  // re-arms the timer (SRJ-302).
+  // b.jg5 SRJ-1015, SRJ-706, SRJ-811: a launch handed to P's retry timer, or
+  // held for P's live-row sequence or an old-life hold or its wait (either
+  // `sequenceWaitingCause`), records nothing and is a refusal at a retry,
+  // which re-arms the timer (SRJ-302).
   if (result.action === SPAWN_ACTION_RETRYING || result.action === 'sequence-waiting') return 'refused'
   return result.action !== 'failed'
 }

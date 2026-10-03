@@ -15,6 +15,15 @@
  * agent-director's descriptions raw by design (T3 redacts at its post), so
  * the leak check covers the log lines, never the decision.
  *
+ * An old-life wait's hold-end query (`holdEnded`, b.jg5 SRJ-702, SRJ-811;
+ * option A): asked after each wait, after each read that did not find the
+ * row finished and when a last UNAVAILABLE outcome would stand, never for
+ * another class or a success; a hold that ends during a try, the read
+ * before the next one or the last try ends the tries as the `hold-ended`
+ * success (the survivor decision after a survivor-naming try, else none),
+ * with its one line; its end wins over a keep-going check or a failed wait
+ * in the same window; a query that throws counts as not ended.
+ *
  * The module's import boundary is checked by walking its runtime imports
  * through `src/` (`forbiddenServerLoads`, `tests/test-helpers/source-audit.ts`).
  *
@@ -40,6 +49,7 @@ import {
   KILL_OUTCOME_ROW_GONE,
   KILL_OUTCOME_SESSION_GONE,
   KILL_ROW_FINISHED_ENDED,
+  KILL_ROW_FINISHED_HOLD_ENDED,
   KILL_ROW_FINISHED_MISSING,
   KILL_ROW_FINISHED_NO_ROW,
   checkedKill,
@@ -53,6 +63,7 @@ import {
   KILL_RETRY_ALERT_SURVIVOR,
   KILL_RETRY_END_BUDGET_SPENT,
   KILL_RETRY_END_EXHAUSTED,
+  KILL_RETRY_END_HOLD_ENDED,
   KILL_RETRY_END_READ_CONFIG,
   KILL_RETRY_END_READ_LATCHED,
   KILL_RETRY_END_ROW_FINISHED,
@@ -69,6 +80,7 @@ import {
   createKillRetryPassBudget,
   killRetrySeedIsLive,
   killRetrySeedOfState,
+  killRetryHoldEndedLine,
   killRetryStopped,
   runKillRetry,
   type KillRetryAlert,
@@ -134,6 +146,12 @@ interface RunSpec {
   readonly lastRead?: KillRetrySeed
   readonly keepGoing?: () => boolean
   readonly budget?: KillRetryPassBudget
+  /** An old-life wait's hold-end query (b.jg5 SRJ-702, SRJ-811; option A); absent: none. */
+  readonly holdEnded?: () => boolean
+  /** Told the number of each try once its kill has its answer, before the retry reads it. */
+  readonly onKill?: (n: number) => void
+  /** Told the number of each read once it has its answer, before the retry reads it. */
+  readonly onRead?: (n: number) => void
 }
 
 /** What one scripted retry did. */
@@ -192,27 +210,36 @@ async function run(spec: RunSpec): Promise<Run> {
   const reads = [...(spec.reads ?? [])]
   const work = runKillRetry({
     instanceId: STUB_INSTANCE_ID,
-    kill: () => {
+    kill: async () => {
       calls.push('kill')
       killTimes.push(clock.now())
-      return checkedKill(STUB_INSTANCE_ID, (params) => client.kill(params))
+      const outcome = await checkedKill(STUB_INSTANCE_ID, (params) => client.kill(params))
+      spec.onKill?.(killTimes.length)
+      return outcome
     },
     read: async (): Promise<KillRetryRead> => {
       calls.push('status')
+      const n = calls.filter((call) => call === 'status').length
       const step = reads.shift()
-      if (step !== undefined && !isCanned(step)) return step
-      if (step !== undefined) statusQueue.push(step)
-      try {
-        const row = await client.status({ claude_instance_id: STUB_INSTANCE_ID })
-        return { kind: KILL_RETRY_READ_STATE, state: row.state }
-      } catch (error) {
-        return { kind: KILL_RETRY_READ_FAILED, error }
+      let answer: KillRetryRead
+      if (step !== undefined && !isCanned(step)) answer = step
+      else {
+        if (step !== undefined) statusQueue.push(step)
+        try {
+          const row = await client.status({ claude_instance_id: STUB_INSTANCE_ID })
+          answer = { kind: KILL_RETRY_READ_STATE, state: row.state }
+        } catch (error) {
+          answer = { kind: KILL_RETRY_READ_FAILED, error }
+        }
       }
+      spec.onRead?.(n)
+      return answer
     },
     wait: clock,
     lastRead: spec.lastRead ?? SEED_WAITING,
     ...(spec.keepGoing === undefined ? {} : { keepGoing: spec.keepGoing }),
     ...(spec.budget === undefined ? {} : { budget: spec.budget }),
+    ...(spec.holdEnded === undefined ? {} : { holdEnded: spec.holdEnded }),
     log: (line) => {
       lines.push(line)
     },
@@ -682,6 +709,146 @@ describe('runKillRetry: the survivor rule and the alert decision (b.jg5 SRJ-702,
 // ---------------------------------------------------------------------------
 // The start sweep's pass budget (AC 56)
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// An old-life wait's hold-end query (b.jg5 SRJ-702, SRJ-811; option A)
+// ---------------------------------------------------------------------------
+
+/** The `hold-ended` success. */
+const HOLD_ENDED_SUCCESS: KillOutcome = { kind: KILL_OUTCOME_ROW_FINISHED, read: KILL_ROW_FINISHED_HOLD_ENDED }
+
+/** A hold-end query that answers `ended()`, counting its asks. */
+function holdQuery(ended: () => boolean): { readonly asked: () => number; readonly query: () => boolean } {
+  let asks = 0
+  return {
+    asked: () => asks,
+    query: () => {
+      asks++
+      return ended()
+    },
+  }
+}
+
+describe('runKillRetry: an old-life wait\'s hold that ends while the tries run ends them as the hold-ended success, never a stop (b.jg5 SRJ-702, SRJ-811; option A)', () => {
+  test('a query that never answers ended is asked after each wait, after each read that did not find the row finished, and once when the last UNAVAILABLE outcome would stand; the tries run as without it', async () => {
+    const hold = holdQuery(() => false)
+
+    const r = await run({ kills: failing(KILL_RETRY_TRIES, plainKillFailed), holdEnded: hold.query })
+
+    expect(hold.asked()).toBe(2 * (KILL_RETRY_TRIES - 1) + 1)
+    expect([r.result.end, r.result.tries, r.result.reads, r.result.alert.kind]).toEqual([KILL_RETRY_END_EXHAUSTED, KILL_RETRY_TRIES, KILL_RETRY_TRIES - 1, KILL_RETRY_ALERT_ORDINARY])
+  })
+
+  test.each<[string, () => Error, KillRetryAlert['kind']]>([
+    ['a survivor-naming ErrTmuxKillFailed: the survivor decision quoting it', survivorKillFailed, KILL_RETRY_ALERT_SURVIVOR],
+    ['ErrTmuxUnresponsive: no alert', () => errTmuxUnresponsive('kill'), KILL_RETRY_ALERT_NONE],
+  ])('the hold ends during the first try, which answers %s: asked after the wait, the tries end before try 2 with no read and no further kill', async (_label, make, alert) => {
+    let ended = false
+    const first = make()
+
+    const r = await run({ kills: [cannedErr(first), ...failing(KILL_RETRY_TRIES - 1, plainKillFailed)], holdEnded: () => ended, onKill: () => { ended = true } })
+
+    expect(r.calls).toEqual(['kill'])
+    expect(r.result).toEqual({
+      outcome: HOLD_ENDED_SUCCESS,
+      end: KILL_RETRY_END_HOLD_ENDED,
+      tries: 1,
+      reads: 0,
+      alert: alert === KILL_RETRY_ALERT_SURVIVOR ? { kind: KILL_RETRY_ALERT_SURVIVOR, survivorDescription: descriptionOf(first) } : { kind: KILL_RETRY_ALERT_NONE },
+    })
+    expect(killRetryStopped(r.result)).toBe(false)
+    expect(r.lines.filter((line) => line === killRetryHoldEndedLine(PREFIX, STUB_INSTANCE_ID, 'before try 2'))).toHaveLength(1)
+  })
+
+  test('the hold ends during the read before try 2, which reads the row live: the tries end with no further kill', async () => {
+    let ended = false
+
+    const r = await run({ kills: failing(KILL_RETRY_TRIES, plainKillFailed), holdEnded: () => ended, onRead: () => { ended = true } })
+
+    expect(r.calls).toEqual(['kill', 'status'])
+    expect([r.result.outcome, r.result.end, r.result.tries, r.result.reads]).toEqual([HOLD_ENDED_SUCCESS, KILL_RETRY_END_HOLD_ENDED, 1, 1])
+    expect(r.lines.filter((line) => line === killRetryHoldEndedLine(PREFIX, STUB_INSTANCE_ID, 'before try 2'))).toHaveLength(1)
+  })
+
+  test.each<[string, () => Error, boolean]>([
+    ['ErrTmuxUnresponsive, after a survivor-naming first try: the survivor decision', () => errTmuxUnresponsive('kill'), true],
+    ['ErrTmuxKillFailed, after a survivor-naming first try: the survivor decision, never the ordinary one', plainKillFailed, true],
+    ['ErrTmuxKillFailed, no try naming a survivor: no alert', plainKillFailed, false],
+  ])('the hold ends during the last try, which answers %s: the success, asked after that try', async (_label, make, survivorFirst) => {
+    let ended = false
+    const first = survivorFirst ? survivorKillFailed() : make()
+
+    const r = await run({
+      kills: [cannedErr(first), ...failing(KILL_RETRY_TRIES - 1, make)],
+      holdEnded: () => ended,
+      onKill: (n) => { if (n === KILL_RETRY_TRIES) ended = true },
+    })
+
+    expect([r.result.outcome, r.result.end, r.result.tries, r.result.reads]).toEqual([HOLD_ENDED_SUCCESS, KILL_RETRY_END_HOLD_ENDED, KILL_RETRY_TRIES, KILL_RETRY_TRIES - 1])
+    expect(r.result.alert).toEqual(survivorFirst ? { kind: KILL_RETRY_ALERT_SURVIVOR, survivorDescription: descriptionOf(first) } : { kind: KILL_RETRY_ALERT_NONE })
+    expect(r.lines.filter((line) => line === killRetryHoldEndedLine(PREFIX, STUB_INSTANCE_ID, `after try ${KILL_RETRY_TRIES}`))).toHaveLength(1)
+  })
+
+  test('the hold\'s end and a keep-going check answering false in the same window: the hold\'s end wins (it is asked first), the success with the survivor decision', async () => {
+    let ended = false
+    const first = survivorKillFailed()
+
+    const r = await run({
+      kills: [cannedErr(first), ...failing(KILL_RETRY_TRIES - 1, plainKillFailed)],
+      holdEnded: () => ended,
+      keepGoing: () => !ended,
+      onKill: () => { ended = true },
+    })
+
+    expect([r.result.outcome, r.result.end, r.result.alert]).toEqual([HOLD_ENDED_SUCCESS, KILL_RETRY_END_HOLD_ENDED, { kind: KILL_RETRY_ALERT_SURVIVOR, survivorDescription: descriptionOf(first) }])
+    expect(killRetryStopped(r.result)).toBe(false)
+  })
+
+  test('a wait between tries that fails while the hold has ended: the hold\'s end wins over the failed wait\'s stop', async () => {
+    let ended = false
+    const result = await runKillRetry({
+      instanceId: STUB_INSTANCE_ID,
+      kill: async () => {
+        ended = true
+        return notKilled(errTmuxUnresponsive('kill'))
+      },
+      read: async () => ({ kind: KILL_RETRY_READ_STATE, state: 'waiting' }),
+      wait: async () => {
+        throw new Error('the wait failed')
+      },
+      lastRead: SEED_WAITING,
+      holdEnded: () => ended,
+      log: (line) => {
+        captured.push(line)
+      },
+      logPrefix: PREFIX,
+    })
+
+    expect([result.outcome, result.end, result.tries]).toEqual([HOLD_ENDED_SUCCESS, KILL_RETRY_END_HOLD_ENDED, 1])
+  })
+
+  test.each<[string, CannedResponse<Phase1KillResult>[], KillOutcome['kind'], KillRetryResult['end']]>([
+    ['a CONFLICT (no UNAVAILABLE outcome to stand)', [cannedErr(errTmuxSessionConflict('kill', 'not-this-launch'))], KILL_OUTCOME_NOT_KILLED, KILL_RETRY_END_SETTLED],
+    ['a success', [cannedOk(cannedKillResult(true))], KILL_OUTCOME_KILLED, KILL_RETRY_END_SETTLED],
+  ])('a hold already ended when the first try answers %s: that outcome stands, the query never asked', async (_label, kills, kind, end) => {
+    const hold = holdQuery(() => true)
+
+    const r = await run({ kills, holdEnded: hold.query })
+
+    expect([r.result.outcome.kind, r.result.end, r.result.tries, hold.asked()]).toEqual([kind, end, 1, 0])
+  })
+
+  test('a query that throws counts as not ended: the tries run to their end, the ordinary decision standing', async () => {
+    const r = await run({
+      kills: failing(KILL_RETRY_TRIES, plainKillFailed),
+      holdEnded: () => {
+        throw new Error('the hold set failed')
+      },
+    })
+
+    expect([r.result.end, r.result.tries, r.result.alert.kind]).toEqual([KILL_RETRY_END_EXHAUSTED, KILL_RETRY_TRIES, KILL_RETRY_ALERT_ORDINARY])
+  })
+})
 
 describe('runKillRetry: the pass budget (b.jg5 SRJ-702, AC 56)', () => {
   test('a kill that uses its tries on UNAVAILABLE spends the budget; a later kill with it makes one try, no read and no wait', async () => {

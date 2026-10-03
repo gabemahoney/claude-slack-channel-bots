@@ -105,6 +105,16 @@
  * resumes P or types into its old life: an `ended` row is launched by one
  * reuse of P's id, and a live row goes through the live-row sequence, during
  * which a further lost message reports restarting with no read.
+ * A message lost while Q waits on an old-life hold (b.jg5 SRJ-812, SRJ-1011
+ * state 4; E27 T2), the driver's kill-failed input also bound to the hold's
+ * mark and its sequence/wait input and read gate to a wait step running for
+ * a hold Q waits on, as main() binds them: before any kill of the old key
+ * failed (a hold begun at apply step 1, or from the start sweep's list) it
+ * reports today's state with Q's one read, and `restarting` with no read
+ * while a wait step runs (Q's own row `pending` included); once the old
+ * key's kill failed (the wait's, a teardown's or the sweep's) it reports
+ * `kill-failed` until the hold ends; after a survivor version, a CONFLICT or
+ * a `kill_sent: false` success it never does.
  *
  * main() in src/server.ts cannot run in a test (startup gate, real port, real
  * Slack connections), so describe (7) audits its source for the wiring only:
@@ -244,9 +254,17 @@ import {
 import { holdThroughReuse, personaCallCounts, personaRow, reuseSpawnOf, unavailableAt } from './test-helpers/recovery-harness.ts'
 import { retiredEntryClearedLine, retiredKeyLinesIn } from './test-helpers/recovery-harness.ts'
 import { readRetiredKeysRecord, retiredKeysRecordOf, type RetiredKeySeed } from './test-helpers/retired-keys.ts'
-import { RETIRED_KEY_CAUSE_REMOVED } from '../src/retired-keys.ts'
-import { errInvalidFlags, provenanceNote } from './test-helpers/agent-director-stub.ts'
-import { launchForLiveRowSequence, readPersonaOwnRow, SPAWN_ACTION_FRESH_RETIRED } from '../src/session-manager.ts'
+import { OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1, RETIRED_KEY_CAUSE_REMOVED } from '../src/retired-keys.ts'
+import type { Phase1ListRow } from '../src/ad-phase1-types.ts'
+import { cannedKillResult, cannedListRow, errInvalidFlags, provenanceNote, type CannedGetResult } from './test-helpers/agent-director-stub.ts'
+import {
+  OLD_LIFE_ROW_READ_STATE,
+  killPersonaInstanceForTeardown,
+  launchForLiveRowSequence,
+  noteOldLifeRowRead,
+  readPersonaOwnRow,
+  SPAWN_ACTION_FRESH_RETIRED,
+} from '../src/session-manager.ts'
 import { LIVE_ROW_LAUNCH_REASON_RETIRED_KEY, LIVE_ROW_LAUNCH_REUSE, LIVE_ROW_OUTCOME_LAUNCHED } from '../src/live-row-sequence.ts'
 import { latchRowStateRead } from '../src/conflict-latch.ts'
 import { PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
@@ -2445,5 +2463,134 @@ describe('b.kvq (7) server.ts holds no copy of the lost-message branch', () => {
       expect(block).not.toBeNull()
       expect(block![0]).toMatch(/\bhasSessionStream\s*(?:,|:\s*hasSessionStream\b)/)
     }
+  })
+})
+
+// ===========================================================================
+// b.jg5 SRJ-812, SRJ-1011 state 4 (E27 T2; AC 54; hatch note E15): a message
+// lost while Q waits on an old-life hold
+//
+// Through the recovery harness's lost-message driver, whose kill-failed input
+// is the kill-failure episode or Q waiting on a hold marked kill-failed, and
+// whose sequence/wait input and read gate count a wait step running for a
+// hold Q waits on, all as main() binds them. Q is the harness's first
+// persona; the old row is held at Q's working directory, so Q waits on it.
+// Before any kill of the old key failed the message reports today's states;
+// while a wait step runs (its run held), `restarting` with no read and no
+// restart; once the old key's kill failed (the ordinary version: the wait's,
+// a teardown's or the start sweep's), `kill-failed` until the hold ends;
+// never after a survivor version, a CONFLICT or a `kill_sent: false` success.
+// The restart clause ("brings the persona up only once the hold ends") is
+// T3's case. States and wordings come from src/lost-message.ts
+// (`expectLostMessageReports`); every message raises one notice for Q and
+// the wait posts nothing.
+// ===========================================================================
+
+/** An absent persona's key (no persona of the harness has it). */
+const ABSENT_KEY = 'absent_persona'
+
+/** A hold Q waits on, begun one way; answers the held instance id. */
+type QHold = (h: RecoveryHarness, q: string, b: string) => Promise<string>
+
+/** A live row of an absent persona in Q's working directory, as the start sweep's `list` gives it. */
+function absentRowIn(h: RecoveryHarness, q: string): Phase1ListRow {
+  return cannedListRow({ claude_instance_id: personaInstanceId(ABSENT_KEY), cwd: personaOf(h, q).working_directory, labels: { service: 'cscb', persona: ABSENT_KEY } })
+}
+
+const Q_HOLDS: ReadonlyArray<readonly [string, QHold]> = [
+  ['begun at apply step 1 (B removed, its own cscb_<B> held at Q\'s directory)', async (h, q, b) => {
+    h.remove(b)
+    h.beginOldLifeHold({ instanceId: personaInstanceId(b), oldKey: b, directory: personaOf(h, q).working_directory, cause: OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1 })
+    return personaInstanceId(b)
+  }],
+  ['begun from the start sweep\'s list (an absent persona\'s live row in Q\'s directory, its sweep kill succeeding)', async (h, q) => {
+    const row = absentRowIn(h, q)
+    h.script({ listResult: { spawns: [row] } })
+    await h.startSweep()
+    return row.claude_instance_id
+  }],
+]
+
+/** Every lost-message notice went to Q, one per message; the wait posted nothing. */
+function expectOnlyQNotices(h: RecoveryHarness, q: string, messages: number): void {
+  expect(h.lostMessageNotices.map((n) => n.key)).toEqual(Array.from({ length: messages }, () => q))
+  expect([h.episodeNotices, h.notices]).toEqual([[], []])
+}
+
+describe('b.jg5 SRJ-812, SRJ-1011 (AC 54): a message lost while Q waits on an old-life hold, before any kill of the old key failed: today\'s states, and restarting while a wait step runs', () => {
+  test.each(Q_HOLDS)('the hold %s: no wait step, today\'s state with Q\'s one read; a wait step running (its run held), restarting with no read, Q\'s own row read pending or not; once the run lists the row in ids and the hold ends, today\'s state again', async (_label, begin) => {
+    const h = makeRecovery()
+    const [q, b] = h.keys as [string, string]
+    const id = await begin(h, q, b)
+    h.script({ getResult: cannedGetResult({ claude_instance_id: id, cwd: personaOf(h, q).working_directory }) })
+
+    await expectLostMessageReports(h, q, 'auto-restart-disabled')
+
+    const hold = holdFindMissing(h.stub.client)
+    const outcome = h.startOldLifeWait(id)
+    await h.driveSequence(hold.entered(1))
+    await expectLostMessageReports(h, q, 'restarting', { calls: {} })
+    h.script({ statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }) })
+    await expectLostMessageReports(h, q, 'restarting', { calls: {} })
+
+    h.script({ statusResult: cannedStatusResult() })
+    hold.release(cannedFindMissing({ rows: { [id]: 'ids' } }))
+    await h.driveSequence(outcome)
+    expect(h.oldLifeHolds.holdOf(id)).toBeUndefined()
+    await expectLostMessageReports(h, q, 'auto-restart-disabled')
+    expectOnlyQNotices(h, q, 4)
+  })
+})
+
+describe('b.jg5 SRJ-812, SRJ-1011 state 4 (AC 54): once the old key\'s kill failed, a message lost for a persona waiting on the hold reports kill failed, until the hold ends', () => {
+  test.each<[string, (h: RecoveryHarness, q: string, b: string) => Promise<string>]>([
+    ['the wait\'s own kill (ErrTmuxKillFailed after its tries)', async (h, q, b) => {
+      const id = await Q_HOLDS[0]![1](h, q, b)
+      h.script({ killError: errTmuxKillFailed() })
+      await h.runOldLifeWait(id)
+      return id
+    }],
+    ['B\'s teardown kill (ErrTmuxKillFailed after its tries)', async (h, q, b) => {
+      const id = await Q_HOLDS[0]![1](h, q, b)
+      h.script({ killError: errTmuxKillFailed() })
+      await h.drive(killPersonaInstanceForTeardown(b, { clock: h.killRetryClock }))
+      return id
+    }],
+    ['the start sweep\'s kill of an absent persona\'s row (ErrTmuxKillFailed after its tries)', async (h, q, b) => {
+      h.script({ killError: errTmuxKillFailed() })
+      return Q_HOLDS[1]![1](h, q, b)
+    }],
+  ])('%s: the hold is marked; a lost message reports kill failed with its wording and no read; another call\'s read of the old row ended ends the hold, and the next message reports today\'s state', async (_label, fail) => {
+    const h = makeRecovery()
+    const [q, b] = h.keys as [string, string]
+    const id = await fail(h, q, b)
+    h.script({ killError: undefined })
+    expect(h.oldLifeHolds.holdOf(id)?.killFailed).toBe(true)
+    expect(h.killFailureOpen(q)).toBe(false)
+
+    await expectLostMessageReports(h, q, 'kill-failed')
+    await expectLostMessageReports(h, q, 'kill-failed')
+
+    noteOldLifeRowRead(id, { kind: OLD_LIFE_ROW_READ_STATE, state: LIVENESS_DEAD_ROW_ENDED }, 'another call')
+    await expectLostMessageReports(h, q, 'auto-restart-disabled')
+    expect([h.episodeNotices, h.notices]).toEqual([[], []])
+  })
+
+  test.each<[string, (h: RecoveryHarness, row: CannedGetResult) => void]>([
+    ['a survivor-naming ErrTmuxKillFailed, then a success (the survivor version)', (h, row) => h.script({ killQueue: [cannedErr(errTmuxKillFailed(undefined, 'pane-process-survived')), cannedOk(cannedKillResult(true))], getResult: row })],
+    ['a CONFLICT', (h, row) => h.script({ killError: errTmuxSessionConflict('kill', 'not-this-launch'), getResult: row })],
+    ['a success with kill_sent false', (h, row) => h.script({ killResult: cannedKillResult(false), getResult: row })],
+  ])('the wait\'s kill answering %s, its round then stopped by a run that did not judge the pending old row: the hold goes on unmarked, and a lost message reports today\'s state, never kill failed', async (_label, arrange) => {
+    const h = makeRecovery()
+    const [q, b] = h.keys as [string, string]
+    await pastSampleGrace(h)
+    const id = await Q_HOLDS[0]![1](h, q, b)
+    arrange(h, cannedGetResult({ claude_instance_id: id, cwd: personaOf(h, q).working_directory, state: AGENT_DIRECTOR_PENDING_STATE }))
+
+    await h.runOldLifeWait(id)
+
+    expect(h.oldLifeHolds.holdOf(id)?.killFailed).toBe(false)
+    await expectLostMessageReports(h, q, 'auto-restart-disabled')
+    expect(h.lostMessageNotices.map((n) => n.key)).toEqual([q])
   })
 })

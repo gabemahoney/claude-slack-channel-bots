@@ -69,8 +69,9 @@
  * - The onset (SRJ-308): with the health check on, at the end of the first
  *   health tick that started after the first refusal while the condition
  *   still holds; with it off, at the first retry at least the floor after
- *   the first refusal, a retry skipped for a launch in flight or a running
- *   live-row sequence (b.jg5 SRJ-706) included; once
+ *   the first refusal, a retry skipped for a launch in flight, a running
+ *   live-row sequence (b.jg5 SRJ-706) or an old-life wait step for a hold
+ *   the persona waits on (b.jg5 SRJ-811, E27 T2) included; once
  *   per episode, and never for `ErrTmuxKillFailed`.
  * - The alert (SRJ-309): once the condition has lasted strictly longer than
  *   the threshold in effect, once per episode, with no onset needed; retries
@@ -152,7 +153,9 @@ import {
 import { personaInstanceId } from '../src/persona-identity.ts'
 import { RESTART_FAILURE_CAP } from '../src/restart.ts'
 import { _buildIsSessionAliveAdapter } from '../src/server.ts'
-import { KILL_CONTEXT_TEARDOWN, killPersonaInstance, reconcileOrphans, SPAWN_ACTION_RETRYING, TRUST_DIALOG_NEEDLE, type ApproverVerb } from '../src/session-manager.ts'
+import { KILL_CONTEXT_TEARDOWN, killPersonaInstance, personaRetryBlockCause, reconcileOrphans, SPAWN_ACTION_RETRYING, TRUST_DIALOG_NEEDLE, type ApproverVerb } from '../src/session-manager.ts'
+import { OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL } from '../src/retired-keys.ts'
+import { RETRY_BLOCK_OLD_LIFE_WAIT } from '../src/unavailable-retry.ts'
 import { KILL_OUTCOME_NOT_KILLED } from '../src/checked-kill.ts'
 import { KILL_RETRY_SPACING_MS, KILL_RETRY_TRIES } from '../src/kill-retry.ts'
 import {
@@ -1390,6 +1393,44 @@ describe('tmux-unresponsive: the onset with the health check off (SRJ-308)', () 
 
     hold.release(cannedFindMissing({ rows: { [personaInstanceId(p)]: 'ids' } }))
     await h.driveSequence(run.outcome)
+    expectNeverStarted(h, b)
+  })
+
+  // E10's hatch note carried by E27 T2 (SRJ-308, hatch A2): the retry skipped
+  // because an old-life wait step runs for a hold P waits on (it blocks a
+  // retry, SRJ-303, SRJ-811) still posts the onset. The wait runs on a
+  // pre-persona row held in P's working directory, started through the
+  // session manager's ensure entry, and its first run is held; its calls are
+  // on the old id only.
+  test('a retry skipped because an old-life wait step runs for a hold P waits on, at or past the floor, posts the onset once and makes no agent-director call for P', async () => {
+    const { h, p, b } = build(RETRY_MODE)
+    const at = await refuse(h, p)
+    while (h.controller.view(p)!.dueAt! - at < FLOOR_MS) await nextRetry(h, p)
+    expectPosts(h, [])
+
+    const oldId = 'cscb_old_C0OLD'
+    h.beginOldLifeHold({ instanceId: oldId, oldKey: oldId, directory: personaOf(h, p).working_directory, cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL })
+    h.script({ getResult: cannedGetResult({ claude_instance_id: oldId, cwd: personaOf(h, p).working_directory }) })
+    const hold = holdFindMissing(h.stub.client)
+    const outcome = h.startOldLifeWait(oldId)
+    await h.driveSequence(hold.entered(1))
+    expect([h.tmuxUnresponsive.holds(p), personaRetryBlockCause(p)]).toEqual([true, RETRY_BLOCK_OLD_LIFE_WAIT])
+    // The server's retry action, which skips a retry while a wait step P waits on runs.
+    h.setAction(undefined)
+    const calls = h.stub.callCount()
+
+    const firedAt = await nextRetry(h, p)
+
+    expect([h.stub.callCount(), hold.calls.length]).toEqual([calls, 1])
+    expect(firedAt - at).toBeGreaterThanOrEqual(FLOOR_MS)
+    expect(h.controller.isArmed(p)).toBe(true)
+    expectPosts(h, [onset(p)])
+    expect(noticeAndEndLines(h, p)).toEqual([conditionOnsetLine(p, 'a retry', firedAt - at)])
+
+    await nextRetry(h, p)
+    expectPosts(h, [onset(p)])
+    hold.release(cannedFindMissing({ rows: { [oldId]: 'ids' } }))
+    await h.driveSequence(outcome)
     expectNeverStarted(h, b)
   })
 

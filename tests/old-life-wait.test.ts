@@ -1,9 +1,10 @@
 /**
  * old-life-wait.test.ts — The old-life hold: start and end (b.jg5 SRJ-809;
  * SRJ-703's old-life clause, SRJ-714's sweep holds, SRJ-715's teardown hold,
- * SRJ-812's kill-failed mark). E27 T1 builds the holds; T2 (the wait's
- * steps, SRJ-811) and T3 (what a hold refuses, SRJ-810, and SRJ-809's
- * admission clause, AC 53) extend this file.
+ * SRJ-812's kill-failed mark), and the old-life wait's steps (SRJ-811,
+ * SRJ-812, SRJ-1512). E27 T1 builds the holds; T2 the wait's steps; T3
+ * (what a hold refuses, SRJ-810, SRJ-809's admission clause, AC 53, and the
+ * gates that start a wait in production) extends this file.
  *
  * - The hold set (`createOldLifeHoldSet`, src/retired-keys.ts) over its own
  *   log: begin, a second begin on one instance id (only the cause changes;
@@ -47,6 +48,45 @@
  *   whose teardown kill failed) keeps P's own live row, whose `cwd` matches
  *   P, and begins its hold; a row that reads `ended` rebuilds none.
  *
+ * - The wait (E27 T2), started through the session manager's ensure entry
+ *   (`h.startOldLifeWait`, `h.runOldLifeWait`) on an old row held at P's
+ *   working directory, so P waits on it, for each id form (a renamed-away
+ *   key's own `cscb_<old>`, a pre-persona row's id, an id that is not its
+ *   label's `cscb_<key>`, and P's own row): its calls are the kill, the
+ *   `status` reads between tries, the `get`s and the bypassing runs, all on
+ *   the old id, with no launch and no timer for the old key; a configured
+ *   persona's own row in a run's `unverified_ids` gets its one `get`; a
+ *   wait and a live-row sequence never run at once on one id (held
+ *   `find-missing`). Its results by class (SRJ-811, SRJ-702, SRJ-717,
+ *   SRJ-1002, SRJ-1013), for every id form: what the calls are, whether the
+ *   hold goes on and is marked kill-failed (SRJ-812), the waiting persona
+ *   armed uncounted, the exact startup-errors entries (`persona-kill-failed`,
+ *   `persona-kill-survivor`, `persona-teardown-notice` "during the wait"),
+ *   no latch and no post; ENVIRONMENT raising `tmux-unavailable` and CONFIG
+ *   `ad-config-malformed` for the waiting persona, a later round's
+ *   successful call clearing `ad-config-malformed` but never
+ *   `tmux-unavailable`; UNCLASSIFIED reported once per round that keeps the
+ *   hold to the wait's own unclassified-error episode on the held id (E12:
+ *   nothing at the first round, the one log-only `persona-unclassified-error`
+ *   entry at the first round past the alert threshold, none later; the
+ *   hold's end ends it; a round a shutdown stopped reports nothing); the
+ *   session a stand-in id's alert names (the start sweep's listing, else
+ *   "unknown"); an UNUSABLE NAME at a `get`, a run or a `status` read
+ *   routed; SRJ-408's old `pending` row with no launch start killed and run
+ *   at once; a configured persona's own row stopping at that persona's
+ *   latch (a read latch keeps the ordinary alert and marks the hold; a
+ *   latched persona's row gets no kill and no `get`), a waiting persona's
+ *   latch never stopping a wait on another id, and two waiters' own
+ *   launching sequences starting beside a wait on another id. The wait's
+ *   ends (its hold's end, the registry's close), its kill keeping its tries
+ *   while no persona is up and stopped by a shutdown (AC 64), and a hold
+ *   that ends while its kill runs (SRJ-811's Test line, option A): between
+ *   tries (also when a new hold is begun on the id before the next try), at
+ *   the `status` read, during the third try that answers UNAVAILABLE, in the
+ *   very try that names the survivor, and in the same window as a shutdown
+ *   stop, each a success. Step 5's exact alert text per id form is
+ *   tests/live-row-sequence.test.ts's.
+ *
  * Every harness case but one runs on `makeRecoveryHarness`, whose one hold
  * set is built and installed as `main()` builds and installs it; its sweep is
  * `h.startSweep` on the harness clock. The one exception is the start-1 end
@@ -65,10 +105,62 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import type { Phase1ListRow } from '../src/ad-phase1-types.ts'
+import {
+  AD_ERROR_CLASS_CONFLICT,
+  AD_ERROR_CLASS_UNAVAILABLE,
+  AD_ERROR_CLASS_UNUSABLE_NAME,
+  classifyAdError,
+  killFailedDescriptionOf,
+} from '../src/ad-error-class.ts'
+import { adAlertThresholdMsInEffect } from '../src/ad-settings.ts'
+import { getFailureCount } from '../src/backoff.ts'
 import type { PersonaConfig, PersonaInput } from '../src/config.ts'
-import { KILL_RETRY_TRIES } from '../src/kill-retry.ts'
-import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_LIVE_STATES, AGENT_DIRECTOR_PENDING_STATE } from '../src/liveness-reading.ts'
-import { personaInstanceId } from '../src/persona-identity.ts'
+import {
+  KILL_FAILURE_CLOSING_LOG_ONLY,
+  KILL_FAILURE_CONTEXT_OLD_LIFE_WAIT,
+  PERSONA_KILL_FAILED_LABEL,
+  PERSONA_KILL_SURVIVOR_LABEL,
+  PERSONA_TEARDOWN_NOTICE_LABEL,
+  killFailureAlertContentOf,
+  killFailureAlertEntryText,
+  killFailureAlertText,
+} from '../src/kill-failure-alert.ts'
+import { KILL_RETRY_ALERT_ORDINARY, KILL_RETRY_ALERT_SURVIVOR, KILL_RETRY_TRIES, killRetryHoldEndedLine, type KillRetryAlert } from '../src/kill-retry.ts'
+import {
+  LIVE_ROW_OUTCOME_ESCALATED,
+  LIVE_ROW_OUTCOME_LAUNCHED,
+  LIVE_ROW_OUTCOME_NOT_JUDGED,
+  LIVE_ROW_OUTCOME_STOPPED,
+  LIVE_ROW_SEQUENCE_MAX_RUNS,
+  LIVE_ROW_SEQUENCE_STEP3_RUNS,
+  LIVE_ROW_START_ALREADY_RUNNING,
+  LIVE_ROW_STOP_HOLD_ENDED,
+  LIVE_ROW_STOP_LATCHED,
+  LIVE_ROW_STOP_SHUTDOWN,
+  type LiveRowSequenceOutcome,
+} from '../src/live-row-sequence.ts'
+import {
+  AGENT_DIRECTOR_DEAD_STATES,
+  AGENT_DIRECTOR_LIVE_STATES,
+  AGENT_DIRECTOR_PENDING_STATE,
+  LIVENESS_DEAD_ROW_ENDED,
+  LIVENESS_DEAD_ROW_MISSING,
+} from '../src/liveness-reading.ts'
+import {
+  OLD_LIFE_WAIT_AT_FIND_MISSING,
+  OLD_LIFE_WAIT_AT_GET,
+  OLD_LIFE_WAIT_AT_KILL,
+  OLD_LIFE_WAIT_AT_STATUS_READ,
+  OLD_LIFE_WAIT_SITE,
+  oldLifeWaitRef,
+  oldLifeWaitRefusalNoticeText,
+  type OldLifeWaitRefusal,
+  type OldLifeWaitRefusalAt,
+} from '../src/old-life-wait.ts'
+import { getOutageFlags } from '../src/outage-state.ts'
+import { PERSONA_UNCLASSIFIED_ERROR_LABEL, UNCLASSIFIED_ERROR_END_HOLD_ENDED, killFailureStoppedRetryText, unclassifiedErrorAlertText } from '../src/persona-episodes.ts'
+import { personaInstanceId, personaTmuxSessionName } from '../src/persona-identity.ts'
+import { PERSONA_TEARDOWN_NOTICE_DURING_WAIT, personaTeardownNoticeEntryText } from '../src/persona-notifier.ts'
 import { oldLifeHoldsToBegin } from '../src/reload.ts'
 import { buildChangePlan, type ValidChangePlan } from '../src/reload-plan.ts'
 import {
@@ -97,33 +189,59 @@ import {
   OLD_LIFE_ROW_READ_FIND_MISSING_IDS,
   OLD_LIFE_ROW_READ_NO_ROW,
   OLD_LIFE_ROW_READ_STATE,
+  OLD_LIFE_WAIT_STOP_CAUSE_SHUTDOWN,
   OWN_ROW_READ_ROW,
   SPAWN_ACTION_FRESH_RETIRED,
   _resetOldLifeHolds,
+  ensureOldLifeWait,
   killPersonaInstanceForTeardown,
   noteOldLifeRowRead,
+  oldLifeWaitUnclassifiedEntryText,
+  oldLifeWaitUnclassifiedNotReportedLine,
   readPersonaOwnRow,
   setOldLifeHolds,
+  setOldLifeWaitBindings,
+  startLiveRowSequence,
+  waitsOnKillFailedHold,
   type OldLifeRowRead,
 } from '../src/session-manager.ts'
+import { UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD } from '../src/unavailable-retry.ts'
 import {
   cannedErr,
+  cannedFindMissing,
+  cannedGetResult,
   cannedKillResult,
   cannedListRow,
   cannedOk,
+  cannedStatusResult,
+  errConfigMalformed,
+  errInternal,
   errSpawnNotFound,
   errTmuxKillFailed,
+  errTmuxNotAvailable,
   errTmuxSessionConflict,
   errTmuxUnresponsive,
   errUnusableName,
+  holdFindMissing,
   provenanceNote,
+  SAMPLE_LAUNCH_START_NONE,
+  type CannedGetResult,
+  type PersonaGetResultOverrides,
 } from './test-helpers/agent-director-stub.ts'
 import { LAUNCH_START_ABSENT_PERSONA_KEY } from './test-helpers/conflict-cases.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import {
+  adConfigMalformedRaiseLines,
   makeRecoveryHarness,
+  ownRowsLiveThenMissing,
+  pastSampleGrace,
   personaOf,
+  personaRow,
+  recordCallOrder,
+  startSequenceHeldAtRun,
+  unclassifiedEndedLine,
+  unclassifiedStartedLine,
   type RecoveryHarness,
   type RecoveryHarnessOptions,
   type RecoveryStubScript,
@@ -825,5 +943,852 @@ describe('b.jg5 SRJ-809, SRJ-714 (hatch A3): after a restart the start sweep reb
 
     expect(holdsOf(h)).toEqual([])
     expect(holdLinesIn(h.errors)).toEqual([])
+  })
+})
+
+// ===========================================================================
+// The wait's steps (b.jg5 SRJ-811, SRJ-812, SRJ-1512; E27 T2)
+//
+// Every case holds an old row at P's working directory (so P waits on it)
+// and starts its wait through the session manager's ensure entry
+// (`h.startOldLifeWait`, `h.runOldLifeWait`), on the recovery harness whose
+// wait bindings, registry and holds are composed as `main()` composes them.
+// T3 adds the gates that start a wait in production and the end-to-end
+// rename and persona-waits cases.
+// ===========================================================================
+
+/** A pre-persona row's instance id (b.1ix): no persona label. */
+const PRE_PERSONA_ID = 'cscb_old_C0OLD'
+
+/** An old row a wait runs on (b.jg5 SRJ-809, SRJ-1007): its id, its old key, and the row as a `get` reads it (live `waiting` unless overridden). */
+interface OldRow {
+  readonly instanceId: string
+  readonly oldKey: string
+  readonly row: (overrides?: PersonaGetResultOverrides) => CannedGetResult
+}
+
+/** A non-persona old row in P's working directory, with `extra` fields (its labels). */
+function oldRowAt(h: RecoveryHarness, p: string, instanceId: string, oldKey: string, extra: PersonaGetResultOverrides): OldRow {
+  return { instanceId, oldKey, row: (overrides = {}) => cannedGetResult({ claude_instance_id: instanceId, cwd: personaOf(h, p).working_directory, ...extra, ...overrides }) }
+}
+
+/** The id forms an old row comes in (SRJ-809's old key, SRJ-1007's ids), each on a harness over P and B; P waits on each. */
+const OLD_ROWS: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string, b: string) => OldRow]> = [
+  ['a renamed-away key\'s own cscb_<old> (B, no longer applied)', (h, p, b) => {
+    h.remove(b)
+    return oldRowAt(h, p, personaInstanceId(b), b, {})
+  }],
+  ['a pre-persona row\'s id', (h, p) => oldRowAt(h, p, PRE_PERSONA_ID, PRE_PERSONA_ID, { labels: { service: 'cscb', channel: 'C0OLD' } })],
+  ['an id that is not its label\'s cscb_<key> (B\'s, B still applied)', (h, p, b) => oldRowAt(h, p, `${personaInstanceId(b)}_old`, `${personaInstanceId(b)}_old`, { labels: { service: 'cscb', persona: b } })],
+  ['P\'s own row (P configured)', (h, p) => ({ instanceId: personaInstanceId(p), oldKey: p, row: (overrides = {}) => personaRow(h, p, overrides) })],
+]
+
+/** Hold `old` at P's working directory, as a start-sweep kill that did not succeed begins it, and answer the hold. */
+function holdOld(h: RecoveryHarness, p: string, old: OldRow): OldLifeHold {
+  return h.beginOldLifeHold({ instanceId: old.instanceId, oldKey: old.oldKey, directory: personaOf(h, p).working_directory, cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL })
+}
+
+/** A harness over P and B with `form`'s old row held at P's working directory. */
+function heldOld(form: (h: RecoveryHarness, p: string, b: string) => OldRow, options?: RecoveryHarnessOptions): { h: RecoveryHarness; p: string; b: string; old: OldRow } {
+  const { h, p, b } = build(options)
+  const old = form(h, p, b)
+  holdOld(h, p, old)
+  return { h, p, b, old }
+}
+
+/** Every wait case: the retry timers a wait armed for its waiting personas are stopped, then the harness checks as every case does (no timer of the wait's own left). */
+function waitAfterEach(): void {
+  harness?.controller.stopAll('the case is over')
+  harnessAfterEach()
+}
+
+/**
+ * The session the wait's kill-failure alert names before any `get` read the
+ * row and with no start-sweep listing naming one (b.jg5 SRJ-1001): the old
+ * key's `slack_bot_<key>` for its own `cscb_<key>` row; none for an id
+ * standing in (never the id itself), which the alert renders as "unknown".
+ */
+function sessionBeforeGet(old: OldRow): string {
+  return old.oldKey === old.instanceId ? '' : personaTmuxSessionName(old.oldKey)
+}
+
+/** The startup-errors entries the case wrote, each as its class and its text (no timestamp), in order. */
+function entriesOf(h: RecoveryHarness): Array<readonly [string, string]> {
+  return h.startupErrors().map((line) => {
+    const match = /^\[[^\]]+\] \[([^\]]+)\] (.*)$/.exec(line)
+    if (match === null) throw new Error(`not a startup-errors entry: ${line}`)
+    return [match[1]!, match[2]!] as const
+  })
+}
+
+/** The kill-failure entry text for `decision` under the wait's reference (`oldLifeWaitRef`, SRJ-1007; context `old-life wait`, log-only closing), naming `session`. */
+function waitAlertEntry(old: OldRow, decision: KillRetryAlert, session: string): string {
+  const content = killFailureAlertContentOf(decision, session, old.instanceId)
+  if (content === undefined) throw new Error('no alert for a none decision')
+  return killFailureAlertEntryText(oldLifeWaitRef(old.instanceId, old.oldKey), KILL_FAILURE_CONTEXT_OLD_LIFE_WAIT, killFailureAlertText(content, KILL_FAILURE_CLOSING_LOG_ONLY, false))
+}
+
+/** The old key's `persona-teardown-notice` entry for a CONFLICT or UNUSABLE NAME `err` met at `at` (worded "during the wait"). */
+function waitRefusalEntry(old: OldRow, at: OldLifeWaitRefusalAt, errorClass: OldLifeWaitRefusal['errorClass'], err: Error): string {
+  return personaTeardownNoticeEntryText(
+    oldLifeWaitRef(old.instanceId, old.oldKey),
+    oldLifeWaitRefusalNoticeText(old.instanceId, { at, errorClass, error: err }),
+    PERSONA_TEARDOWN_NOTICE_DURING_WAIT,
+  )
+}
+
+/** The raw description an `ErrTmuxKillFailed` carries. */
+function descriptionOf(err: Error): string {
+  const description = killFailedDescriptionOf(err)
+  if (description === undefined) throw new Error('no ErrTmuxKillFailed description')
+  return description
+}
+
+/** A survivor-naming `ErrTmuxKillFailed` (`pane-process-survived`). */
+const survivorFailure = (): Error => errTmuxKillFailed(undefined, 'pane-process-survived')
+
+/** The calls of a step-3 run and its `get`, `count` times. */
+const runsAndGets = (count: number): string[] => Array.from({ length: count }, () => ['findMissing', 'get']).flat()
+
+/** A kill's tries all answering UNAVAILABLE: each try after the first follows one `status` read. */
+const killTries = (tries = KILL_RETRY_TRIES): string[] => ['kill', ...Array.from({ length: tries - 1 }, () => ['status', 'kill']).flat()]
+
+/** Every call that names an instance id names `id`; and no launch (`spawn`, `resume`) was made. */
+function expectOnlyOn(h: RecoveryHarness, id: string): void {
+  const named = (Object.values(h.stub.calls).flat() as Array<{ claude_instance_id?: unknown } | undefined>).filter((params) => params?.claude_instance_id !== undefined)
+  expect(named.filter((params) => params?.claude_instance_id !== id)).toEqual([])
+  expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls]).toEqual([[], []])
+}
+
+/** Nothing latched, posted or noticed: no latch event, no episode post, no session-manager notice and no Slack call on any persona's stub. */
+function expectNoLatchOrPost(h: RecoveryHarness): void {
+  expect(h.keys.map((key) => h.latch.isLatched(key))).toEqual(h.keys.map(() => false))
+  expect([h.latchEvents, h.episodeNotices, h.notices]).toEqual([[], [], []])
+  for (const key of h.keys) expect(h.slack(key).callLog).toEqual([])
+}
+
+/** The triggers of the old-life cause, by key. */
+function oldLifeArms(h: RecoveryHarness): string[] {
+  return h.triggers.filter((t) => t.kind === UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD).map((t) => t.key)
+}
+
+describe('b.jg5 SRJ-811, SRJ-1512: the wait\'s steps run on the old id only, with no launch and no retry timer for the old key', () => {
+  afterEach(waitAfterEach)
+
+  test.each(OLD_ROWS)('%s, read live at every get and judged alive by every run: one kill, the step-2 get, three runs each with its get (each run reaching the stub: the memo is bypassed), the step-4 kill, one more run and get; every call on the old id; no spawn or resume; no timer or trigger for the old key', async (_label, form) => {
+    const { h, p, old } = heldOld(form)
+    h.script({ getResult: old.row() })
+    const order = recordCallOrder(h)
+
+    const outcome = await h.runOldLifeWait(old.instanceId)
+
+    expect(outcome.kind).toBe(LIVE_ROW_OUTCOME_ESCALATED)
+    expect(order).toEqual(['kill', 'get', ...runsAndGets(LIVE_ROW_SEQUENCE_STEP3_RUNS), 'kill', ...runsAndGets(1)])
+    expect(h.stub.calls.findMissingCalls).toHaveLength(LIVE_ROW_SEQUENCE_MAX_RUNS)
+    expectOnlyOn(h, old.instanceId)
+    // The waiting persona is armed (P, in the held directory); never the old key, unless it is P itself.
+    expect(oldLifeArms(h)).toEqual([p])
+    if (old.oldKey !== p) {
+      expect(h.triggers.filter((t) => t.key === old.oldKey)).toEqual([])
+      expect(h.controller.isArmed(old.oldKey)).toBe(false)
+    }
+  })
+
+  test('a run that lists P\'s own row and Q\'s in unverified_ids, in a wait on P\'s own row: P\'s row gets only the wait\'s one get after each run, Q\'s its one get from the run (E14)', async () => {
+    const { h, p, b, old } = heldOld(OLD_ROWS[3]![1])
+    const q = b
+    h.script({
+      getFn: (params) => (params.claude_instance_id === personaInstanceId(q) ? personaRow(h, q) : personaRow(h, p)),
+      findMissingResult: cannedFindMissing({ rows: { [personaInstanceId(p)]: 'unverified_ids', [personaInstanceId(q)]: 'unverified_ids' } }),
+    })
+
+    await h.runOldLifeWait(old.instanceId)
+
+    const gets = h.stub.calls.getCalls.map((params) => params.claude_instance_id)
+    // Step 2's get, then each of the four runs: Q's provenance get, then the wait's get of P's row.
+    expect(gets).toEqual([personaInstanceId(p), ...Array.from({ length: LIVE_ROW_SEQUENCE_MAX_RUNS }, () => [personaInstanceId(q), personaInstanceId(p)]).flat()])
+  })
+})
+
+describe('b.jg5 SRJ-811 (AC 54): the wait and a live-row sequence never run at once on one instance id', () => {
+  afterEach(waitAfterEach)
+
+  test('while P\'s live-row sequence runs (its first run held), a hold on cscb_<P> gets no wait: the ensure entry answers already-running and makes no call', async () => {
+    const { h, p } = build()
+    const hold = holdFindMissing(h.stub.client)
+    ownRowsLiveThenMissing(h)
+    const run = await startSequenceHeldAtRun(h, p, hold)
+    beginApplyHold(h, p)
+    const calls = h.stub.callCount()
+
+    expect(ensureOldLifeWait(personaInstanceId(p))).toBe(LIVE_ROW_START_ALREADY_RUNNING)
+    await h.clock.flush()
+
+    expect([h.stub.callCount(), hold.calls.length, h.oldLifeWaitRunning(personaInstanceId(p))]).toEqual([calls, 1, false])
+    hold.release(cannedFindMissing({ rows: { [personaInstanceId(p)]: 'ids' } }))
+    expect((await h.driveSequence(run.outcome)).kind).toBe(LIVE_ROW_OUTCOME_LAUNCHED)
+    await h.runApproverToStop(p)
+    expect(h.oldLifeWaitRunning(personaInstanceId(p))).toBe(false)
+  })
+
+  test('while a wait runs on cscb_<P> (its first run held), a start of P\'s live-row sequence answers already-running and makes no call; once the run lists the row in ids the hold and the wait end', async () => {
+    const { h, p } = build()
+    const hold = holdFindMissing(h.stub.client)
+    beginApplyHold(h, p)
+    h.script({ getResult: personaRow(h, p) })
+    const id = personaInstanceId(p)
+    const outcome = h.startOldLifeWait(id)
+    await h.driveSequence(hold.entered(1))
+    const calls = h.stub.callCount()
+
+    expect(startLiveRowSequence(h.sequenceRequest(p, { lastReadState: 'waiting' }))).toBe(LIVE_ROW_START_ALREADY_RUNNING)
+    await h.clock.flush()
+
+    expect([h.stub.callCount(), hold.calls.length, h.oldLifeWaitRunning(id)]).toEqual([calls, 1, true])
+    hold.release(cannedFindMissing({ rows: { [id]: 'ids' } }))
+    expect(await h.driveSequence(outcome)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_HOLD_ENDED })
+    expect([h.oldLifeHolds.holdOf(id), h.oldLifeWaitRunning(id)]).toEqual([undefined, false])
+  })
+})
+
+describe('b.jg5 SRJ-811, SRJ-706: a wait on one id never refuses a waiting persona\'s own live-row sequence on its cscb_<key>', () => {
+  let shared: string | undefined
+
+  afterEach(() => {
+    try {
+      waitAfterEach()
+    } finally {
+      if (shared !== undefined) rmSync(shared, { recursive: true, force: true })
+      shared = undefined
+    }
+  })
+
+  test('P and B both waiting on a pre-persona row held in their one directory, its wait held at its first run: the second waiter\'s ensure answers already-running with no call; P\'s and B\'s own launching sequences each start, and once the runs list every row in ids the wait ends and both launch', async () => {
+    shared = mkdtempSync(join(tmpdir(), 'old-life-shared-'))
+    const { h, p, b } = build({ personas: [{ working_directory: shared }, { working_directory: shared }] })
+    const old = oldRowAt(h, p, PRE_PERSONA_ID, PRE_PERSONA_ID, { labels: { service: 'cscb', channel: 'C0OLD' } })
+    holdOld(h, p, old)
+    expect([p, b].map((key) => h.oldLifeHolds.holdsWaitedOnBy(personaOf(h, key)).map((view) => view.instanceId))).toEqual([[PRE_PERSONA_ID], [PRE_PERSONA_ID]])
+    const read = new Set<string>()
+    h.script({
+      getFn: (params) => {
+        if (params.claude_instance_id === PRE_PERSONA_ID) return old.row()
+        const key = h.keys.find((k) => personaInstanceId(k) === params.claude_instance_id)!
+        const first = !read.has(key)
+        read.add(key)
+        return personaRow(h, key, first ? {} : { state: LIVENESS_DEAD_ROW_MISSING })
+      },
+    })
+    const hold = holdFindMissing(h.stub.client)
+    const wait = h.startOldLifeWait(PRE_PERSONA_ID)
+    await h.driveSequence(hold.entered(1))
+    const calls = h.stub.callCount()
+
+    expect(ensureOldLifeWait(PRE_PERSONA_ID)).toBe(LIVE_ROW_START_ALREADY_RUNNING)
+    await h.clock.flush()
+    expect([h.stub.callCount(), hold.calls.length]).toEqual([calls, 1])
+
+    const runs = [await startSequenceHeldAtRun(h, p, hold), await startSequenceHeldAtRun(h, b, hold)]
+
+    expect([h.sequenceRunning(p), h.sequenceRunning(b), h.oldLifeWaitRunning(PRE_PERSONA_ID)]).toEqual([true, true, true])
+    expect(h.errors.filter((line) => line.includes(' waits on the old-life wait running on its own row '))).toEqual([])
+    const ids = cannedFindMissing({ rows: { [PRE_PERSONA_ID]: 'ids', [personaInstanceId(p)]: 'ids', [personaInstanceId(b)]: 'ids' } })
+    for (let i = 0; i < 3; i++) hold.release(ids)
+    expect(await h.driveSequence(wait)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_HOLD_ENDED })
+    for (const run of runs) expect((await h.driveSequence(run.outcome)).kind).toBe(LIVE_ROW_OUTCOME_LAUNCHED)
+    for (const key of [p, b]) await h.runApproverToStop(key)
+    expect(h.oldLifeHolds.holdOf(PRE_PERSONA_ID)).toBeUndefined()
+  })
+})
+
+/** What a results row arranges: the stub's answers for the old row, and the errors the expected entries quote. */
+type ResultArrange = (h: RecoveryHarness, old: OldRow) => readonly Error[]
+
+/** One row of the results table (SRJ-811, SRJ-812, SRJ-702, SRJ-717). */
+interface ResultRow {
+  /** The calls, in order. */
+  readonly order: readonly string[]
+  /** Whether the hold goes on after the round (false: the round ended it, and the wait). */
+  readonly kept: boolean
+  /** Whether the hold is marked kill-failed (SRJ-812). */
+  readonly marked: boolean
+  /** The startup-errors entries, in order: the class and the exact text, or undefined for a text pinned elsewhere. */
+  readonly entries: (old: OldRow, errors: readonly Error[]) => Array<readonly [string, string | undefined]>
+}
+
+const RESULTS: ReadonlyArray<readonly [string, ResultArrange, ResultRow]> = [
+  ['UNAVAILABLE at every try (ErrTmuxUnresponsive)', (h) => {
+    h.script({ killError: errTmuxUnresponsive('kill') })
+    return []
+  }, { order: killTries(), kept: true, marked: false, entries: () => [] }],
+  ['ENVIRONMENT at the kill (ErrTmuxNotAvailable)', (h) => {
+    h.script({ killError: errTmuxNotAvailable(undefined, 'kill') })
+    return []
+  }, { order: ['kill'], kept: true, marked: false, entries: () => [] }],
+  ['ErrTmuxKillFailed after the tries', (h) => {
+    const err = errTmuxKillFailed()
+    h.script({ killError: err })
+    return [err]
+  }, {
+    order: killTries(),
+    kept: true,
+    marked: true,
+    entries: (old, [err]) => [[PERSONA_KILL_FAILED_LABEL, waitAlertEntry(old, { kind: KILL_RETRY_ALERT_ORDINARY, lastKillFailedDescription: descriptionOf(err!) }, sessionBeforeGet(old))]],
+  }],
+  ['a CONFLICT at the kill', (h) => {
+    const err = errTmuxSessionConflict('kill', 'not-this-launch')
+    h.script({ killError: err })
+    return [err]
+  }, { order: ['kill'], kept: true, marked: false, entries: (old, [err]) => [[PERSONA_TEARDOWN_NOTICE_LABEL, waitRefusalEntry(old, OLD_LIFE_WAIT_AT_KILL, AD_ERROR_CLASS_CONFLICT, err!)]] }],
+  ['an UNUSABLE NAME at the kill', (h) => {
+    const err = errUnusableName()
+    h.script({ killError: err })
+    return [err]
+  }, { order: ['kill'], kept: true, marked: false, entries: (old, [err]) => [[PERSONA_TEARDOWN_NOTICE_LABEL, waitRefusalEntry(old, OLD_LIFE_WAIT_AT_KILL, AD_ERROR_CLASS_UNUSABLE_NAME, err!)]] }],
+  ['a survivor-naming ErrTmuxKillFailed, then a success; the steps go on to the get, which reads the row ended', (h, old) => {
+    const err = survivorFailure()
+    h.script({ killQueue: [cannedErr(err), cannedOk(cannedKillResult(true))], getResult: old.row({ state: LIVENESS_DEAD_ROW_ENDED }) })
+    return [err]
+  }, {
+    order: [...killTries(2), 'get'],
+    kept: false,
+    marked: false,
+    entries: (old, [err]) => [[PERSONA_KILL_SURVIVOR_LABEL, waitAlertEntry(old, { kind: KILL_RETRY_ALERT_SURVIVOR, survivorDescription: descriptionOf(err!) }, sessionBeforeGet(old))]],
+  }],
+  ['a success with kill_sent false: it goes on to the get and a run (a pending row the run does not judge), and ends nothing', (h, old) => {
+    h.script({ killResult: cannedKillResult(false), getResult: old.row({ state: AGENT_DIRECTOR_PENDING_STATE }) })
+    return []
+  }, { order: ['kill', 'get', 'findMissing'], kept: true, marked: false, entries: () => [] }],
+  ['a pending row the run does not judge: the round stops with no alert and nothing counted (SRJ-717)', (h, old) => {
+    h.script({ getResult: old.row({ state: AGENT_DIRECTOR_PENDING_STATE }) })
+    return []
+  }, { order: ['kill', 'get', 'findMissing'], kept: true, marked: false, entries: () => [] }],
+  ['still live after runs that judged it (step 5): the ordinary version to the log and persona-kill-failed', (h, old) => {
+    h.script({ getResult: old.row() })
+    return []
+  }, {
+    order: ['kill', 'get', ...runsAndGets(LIVE_ROW_SEQUENCE_STEP3_RUNS), 'kill', ...runsAndGets(1)],
+    kept: true,
+    marked: true,
+    // Step 5's exact text for each id form is tests/live-row-sequence.test.ts's (SRJ-1007's Test line).
+    entries: () => [[PERSONA_KILL_FAILED_LABEL, undefined]],
+  }],
+  ['the row listed in a run\'s ids: the hold ends, and the wait with it before its next call', (h, old) => {
+    h.script({ getResult: old.row(), findMissingResult: cannedFindMissing({ rows: { [old.instanceId]: 'ids' } }) })
+    return []
+  }, { order: ['kill', 'get', 'findMissing'], kept: false, marked: false, entries: () => [] }],
+  ['the row read ended at the get', (h, old) => {
+    h.script({ getResult: old.row({ state: LIVENESS_DEAD_ROW_ENDED }) })
+    return []
+  }, { order: ['kill', 'get'], kept: false, marked: false, entries: () => [] }],
+  ['the row read missing at the get', (h, old) => {
+    h.script({ getResult: old.row({ state: LIVENESS_DEAD_ROW_MISSING }) })
+    return []
+  }, { order: ['kill', 'get'], kept: false, marked: false, entries: () => [] }],
+]
+
+const RESULT_CASES = RESULTS.flatMap(([result, arrange, row]) => OLD_ROWS.map(([form, make]) => [result, form, arrange, row, make] as const))
+
+describe('b.jg5 SRJ-811, SRJ-812, SRJ-1002, SRJ-702, SRJ-717 (AC 54, AC 63): the wait\'s results follow their class, for every id form; nothing latches and nothing is posted', () => {
+  afterEach(waitAfterEach)
+
+  test.each(RESULT_CASES)('%s — %s', async (_result, _form, arrange, expected, form) => {
+    const { h, p, old } = heldOld(form)
+    // A pending row's launch start is past G: it is waited on no longer, and a configured persona's own such row latches no one.
+    await pastSampleGrace(h)
+    const errors = arrange(h, old)
+    const order = recordCallOrder(h)
+
+    await h.runOldLifeWait(old.instanceId)
+
+    expect(order).toEqual([...expected.order])
+    expectOnlyOn(h, old.instanceId)
+    const held = h.oldLifeHolds.holdOf(old.instanceId)
+    expect(held === undefined ? undefined : { killFailed: held.killFailed }).toEqual(expected.kept ? { killFailed: expected.marked } : undefined)
+    expect(waitsOnKillFailedHold(p)).toBe(expected.kept && expected.marked)
+    // A round that keeps the hold arms each waiting persona's timer, uncounted; a round that ended it arms nothing.
+    expect(oldLifeArms(h)).toEqual(expected.kept ? [p] : [])
+    expect(getFailureCount(p)).toBe(0)
+    expect(h.oldLifeWaitRunning(old.instanceId)).toBe(false)
+    const entries = entriesOf(h)
+    const want = expected.entries(old, errors)
+    expect(entries.map(([cls]) => cls)).toEqual(want.map(([cls]) => cls))
+    entries.forEach(([, text], i) => {
+      const exact = want[i]![1]
+      if (exact === undefined) expect(text.startsWith(`${oldLifeWaitRef(old.instanceId, old.oldKey)} (${KILL_FAILURE_CONTEXT_OLD_LIFE_WAIT}): `)).toBe(true)
+      else expect(text).toBe(exact)
+    })
+    expectNoLatchOrPost(h)
+    if (old.oldKey !== p) expect(getOutageFlags(old.oldKey).size).toBe(0)
+  })
+
+  test.each(OLD_ROWS)('ENVIRONMENT at the kill raises tmux-unavailable for the waiting persona (%s)', async (_label, form) => {
+    const { h, p, old } = heldOld(form)
+    h.script({ killError: errTmuxNotAvailable(undefined, 'kill') })
+
+    await h.runOldLifeWait(old.instanceId)
+
+    expect(getOutageFlags(p).has('tmux-unavailable')).toBe(true)
+    expect(h.outageNotices.filter((n) => n.key !== p)).toEqual([])
+  })
+})
+
+describe('b.jg5 SRJ-1001, SRJ-811: the session a wait\'s kill-failure alert names for an id standing in, before any get', () => {
+  afterEach(waitAfterEach)
+
+  test('a pre-persona row the start sweep listed and failed to kill (a CONFLICT): the wait\'s persona-kill-failed entry names the listing\'s tmux_session_name', async () => {
+    const { h, p } = build()
+    const row: Phase1ListRow = { ...prePersonaRow(), cwd: personaOf(h, p).working_directory }
+    h.script({ killQueue: [cannedErr(errTmuxSessionConflict('kill', 'different-id'))] })
+    await sweepOver(h, [row])
+    expect(holdsOf(h)).toEqual([hold(row.claude_instance_id, row.claude_instance_id, row.cwd, OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL)])
+    const before = entriesOf(h).length
+    const err = errTmuxKillFailed()
+    h.script({ killQueue: [], killError: err })
+    const old = oldRowAt(h, p, row.claude_instance_id, row.claude_instance_id, {})
+
+    await h.runOldLifeWait(old.instanceId)
+
+    const entries = entriesOf(h).slice(before)
+    expect(entries).toEqual([[PERSONA_KILL_FAILED_LABEL, waitAlertEntry(old, { kind: KILL_RETRY_ALERT_ORDINARY, lastKillFailedDescription: descriptionOf(err) }, row.tmux_session_name)]])
+    expect(entries[0]![1]).toContain(`in session "${row.tmux_session_name}"`)
+  })
+
+  test('a pre-persona row held with no listing naming its session: the entry names the session "unknown", never the instance id', async () => {
+    const { h, old } = heldOld(OLD_ROWS[1]![1])
+    h.script({ killError: errTmuxKillFailed() })
+
+    await h.runOldLifeWait(old.instanceId)
+
+    const [[, text]] = entriesOf(h) as [readonly [string, string]]
+    expect(text).toContain('in session "unknown"')
+    expect(text).not.toContain(`in session "${old.instanceId}"`)
+  })
+})
+
+/** Where else a refusal is met (SRJ-1002, SRJ-1013): the form it is met on, its arrangement, where, how many times, and the calls. */
+const REFUSALS_ELSEWHERE: ReadonlyArray<readonly [string, number, (h: RecoveryHarness, old: OldRow, err: Error) => void, OldLifeWaitRefusalAt, number, readonly string[]]> = [
+  ['an UNUSABLE NAME at the get of P\'s own row (routed, SRJ-1002)', 3, (h, _old, err) => h.script({ getError: err }), OLD_LIFE_WAIT_AT_GET, 1, ['kill', 'get']],
+  ['an UNUSABLE NAME at the get of a pre-persona row', 1, (h, _old, err) => h.script({ getError: err }), OLD_LIFE_WAIT_AT_GET, 1, ['kill', 'get']],
+  // A failed run judges nothing and the step goes on (SRJ-120): every run fails, so no run judged the row and step 5 raises no alert.
+  [
+    'an UNUSABLE NAME at every run',
+    1,
+    (h, old, err) => h.script({ getResult: old.row(), findMissingError: err }),
+    OLD_LIFE_WAIT_AT_FIND_MISSING,
+    LIVE_ROW_SEQUENCE_MAX_RUNS,
+    ['kill', 'get', ...runsAndGets(LIVE_ROW_SEQUENCE_STEP3_RUNS), 'kill', ...runsAndGets(1)],
+  ],
+  [
+    'an UNUSABLE NAME at each status read between the kill\'s tries (ErrTmuxUnresponsive), on P\'s own row',
+    3,
+    (h, _old, err) => h.script({ killError: errTmuxUnresponsive('kill'), statusError: err }),
+    OLD_LIFE_WAIT_AT_STATUS_READ,
+    KILL_RETRY_TRIES - 1,
+    killTries(),
+  ],
+]
+
+describe('b.jg5 SRJ-811, SRJ-1002, SRJ-1013: an UNUSABLE NAME met at a get, a run or a status read between tries is one persona-teardown-notice entry each, "during the wait", and latches no one', () => {
+  afterEach(waitAfterEach)
+
+  test.each(REFUSALS_ELSEWHERE)('%s', async (_label, form, arrange, at, times, calls) => {
+    const { h, p, old } = heldOld(OLD_ROWS[form]![1])
+    const err = errUnusableName()
+    arrange(h, old, err)
+    const order = recordCallOrder(h)
+
+    await h.runOldLifeWait(old.instanceId)
+
+    expect(order).toEqual([...calls])
+    const entry = waitRefusalEntry(old, at, AD_ERROR_CLASS_UNUSABLE_NAME, err)
+    expect(entriesOf(h)).toEqual(Array.from({ length: times }, () => [PERSONA_TEARDOWN_NOTICE_LABEL, entry] as const))
+    expect(h.oldLifeHolds.holdOf(old.instanceId)?.killFailed).toBe(false)
+    expect(oldLifeArms(h)).toEqual([p])
+    expectNoLatchOrPost(h)
+  })
+})
+
+describe('b.jg5 SRJ-811, E12: UNCLASSIFIED and CONFIG in the wait', () => {
+  afterEach(waitAfterEach)
+
+  test.each(OLD_ROWS)('UNCLASSIFIED at the kill (%s), round after round while the hold goes on: the first round begins the wait\'s episode on the held id and writes nothing; the first round past the alert threshold writes the one log-only persona-unclassified-error entry; a later round writes none; the hold\'s end ends the episode. P is armed uncounted each round; nothing latches or is posted, and the old key\'s own episode never opens', async (_label, form) => {
+    const { h, p, old } = heldOld(form)
+    const err = errInternal()
+    h.script({ killError: err })
+    /** One round, then P's timer it armed stopped, so the clock can pass the threshold with no retry firing. */
+    const round = async (): Promise<void> => {
+      await h.runOldLifeWait(old.instanceId)
+      h.controller.stopAll('the round is over')
+    }
+    const entry = [PERSONA_UNCLASSIFIED_ERROR_LABEL, oldLifeWaitUnclassifiedEntryText(old.instanceId, unclassifiedErrorAlertText(classifyAdError(err), { escapeForSlack: false }))] as const
+
+    await round()
+    expect([entriesOf(h), h.oldLifeWaitUnclassifiedOpen(old.instanceId)]).toEqual([[], true])
+    expect(h.errors.filter((line) => line === unclassifiedStartedLine(old.instanceId, err))).toHaveLength(1)
+
+    await h.clock.advance(adAlertThresholdMsInEffect() + 1)
+    await round()
+    expect(entriesOf(h)).toEqual([entry])
+    expect(entry[1]).toBe(`${oldLifeWaitRef(old.instanceId, old.oldKey)}: ${unclassifiedErrorAlertText(classifyAdError(err), { escapeForSlack: false })}`)
+
+    await h.clock.advance(adAlertThresholdMsInEffect() + 1)
+    await round()
+    expect(entriesOf(h)).toEqual([entry])
+
+    expect(h.oldLifeHolds.holdOf(old.instanceId)?.killFailed).toBe(false)
+    expect([oldLifeArms(h), getFailureCount(p)]).toEqual([[p, p, p], 0])
+    expect(h.unclassifiedErrorOpen(old.oldKey)).toBe(false)
+    expectNoLatchOrPost(h)
+
+    endHoldByAnotherRead(old)
+    expect(h.oldLifeWaitUnclassifiedOpen(old.instanceId)).toBe(false)
+    expect(h.errors.filter((line) => line === unclassifiedEndedLine(old.instanceId, UNCLASSIFIED_ERROR_END_HOLD_ENDED))).toHaveLength(1)
+  })
+
+  test('with no unclassified-error episodes in the wait\'s bindings, a round that met UNCLASSIFIED writes no entry and logs the not-reported line once', async () => {
+    const { h, old } = heldOld(OLD_ROWS[1]![1])
+    setOldLifeWaitBindings({ retryArm: { arm: () => false, armPendingOnly: () => {} }, clock: h.clock, log: () => {}, appliedConfig: () => h.config })
+    h.script({ killError: errInternal() })
+
+    await h.runOldLifeWait(old.instanceId)
+
+    expect([entriesOf(h), h.oldLifeWaitUnclassifiedOpen(old.instanceId)]).toEqual([[], false])
+    expect(h.errors.filter((line) => line === oldLifeWaitUnclassifiedNotReportedLine(oldLifeWaitRef(old.instanceId, old.oldKey)))).toHaveLength(1)
+  })
+
+  test('an UNCLASSIFIED answer at a status read between tries, in a round a shutdown then stopped, is reported to no episode (SRJ-706): only the stopped kill\'s persona-kill-failed entry', async () => {
+    const { h, old } = heldOld(OLD_ROWS[1]![1])
+    h.script({ killError: errTmuxUnresponsive('kill'), statusError: errInternal() })
+    // The shutdown lands during the second try, after the status read met UNCLASSIFIED.
+    const order = recordCallOrder(h, { at: 2, run: () => h.shutdown() })
+
+    expect(await h.runOldLifeWait(old.instanceId)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_SHUTDOWN })
+    expect(order).toEqual(['kill', 'status', 'kill'])
+    expect(h.oldLifeWaitUnclassifiedOpen(old.instanceId)).toBe(false)
+    expect(entriesOf(h).map(([cls]) => cls)).toEqual([PERSONA_KILL_FAILED_LABEL])
+    expect(oldLifeArms(h)).toEqual([])
+  })
+
+  test.each(OLD_ROWS)('CONFIG at the kill (%s): ad-config-malformed is raised for the waiting persona, the hold goes on and P\'s timer is armed', async (_label, form) => {
+    const { h, p, old } = heldOld(form)
+    h.script({ killError: errConfigMalformed() })
+
+    await h.runOldLifeWait(old.instanceId)
+
+    expect(adConfigMalformedRaiseLines(h, p)).toHaveLength(1)
+    expect(getOutageFlags(p).has('ad-config-malformed')).toBe(true)
+    expect(h.oldLifeHolds.holdOf(old.instanceId)?.killFailed).toBe(false)
+    expect(oldLifeArms(h)).toEqual([p])
+    expect(h.controller.isArmed(p)).toBe(true)
+    expect(entriesOf(h)).toEqual([])
+    if (old.oldKey !== p) expect(getOutageFlags(old.oldKey).size).toBe(0)
+  })
+
+  test.each(OLD_ROWS.slice(0, 3))('a later round whose kill succeeds clears the ad-config-malformed a CONFIG round raised for the waiting persona; the tmux-unavailable an ENVIRONMENT round raised stays raised (%s)', async (_label, form) => {
+    const { h, p, old } = heldOld(form)
+    await pastSampleGrace(h)
+    h.script({ killError: errTmuxNotAvailable(undefined, 'kill') })
+    await h.runOldLifeWait(old.instanceId)
+    h.script({ killError: errConfigMalformed() })
+    await h.runOldLifeWait(old.instanceId)
+    expect([...getOutageFlags(p)].sort()).toEqual(['ad-config-malformed', 'tmux-unavailable'])
+
+    // The kill succeeds; a pending row the run does not judge keeps the hold.
+    h.script({ killError: undefined, getResult: old.row({ state: AGENT_DIRECTOR_PENDING_STATE }) })
+    const order = recordCallOrder(h)
+    await h.runOldLifeWait(old.instanceId)
+
+    expect(order).toEqual(['kill', 'get', 'findMissing'])
+    expect(h.oldLifeHolds.holdOf(old.instanceId)).toBeDefined()
+    expect([...getOutageFlags(p)]).toEqual(['tmux-unavailable'])
+    if (old.oldKey !== p) expect(getOutageFlags(old.oldKey).size).toBe(0)
+  })
+})
+
+describe('b.jg5 SRJ-408 (E16): an old key\'s pending row with no launch start gets the wait\'s kill and its run at once, with no wait for G, and latches nothing', () => {
+  afterEach(waitAfterEach)
+
+  test.each(OLD_ROWS.slice(0, 3))('%s, read pending with no launch start: the kill, the get and the first run all at the start\'s clock time; no latch', async (_label, form) => {
+    const { h, old } = heldOld(form)
+    h.script({ getResult: old.row({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE }) })
+    const startedAt = h.clock.now()
+    const calls: Array<readonly [string, number]> = []
+    const order = recordCallOrder(h)
+    const client = h.stub.client as unknown as Record<string, (...args: unknown[]) => unknown>
+    for (const verb of ['kill', 'get', 'findMissing'] as const) {
+      const call = client[verb]!
+      client[verb] = (...args: unknown[]) => {
+        calls.push([verb, h.clock.now()])
+        return call.apply(client, args)
+      }
+    }
+
+    const outcome = await h.runOldLifeWait(old.instanceId)
+
+    expect(outcome.kind).toBe(LIVE_ROW_OUTCOME_NOT_JUDGED)
+    expect(order).toEqual(['kill', 'get', 'findMissing'])
+    expect(calls).toEqual([['kill', startedAt], ['get', startedAt], ['findMissing', startedAt]])
+    expectNoLatchOrPost(h)
+  })
+})
+
+describe('b.jg5 SRJ-502, SRJ-513, SRJ-812, SRJ-811: a wait on a configured persona\'s own row stops at that persona\'s latch, keeps the hold and arms the waiting personas', () => {
+  afterEach(waitAfterEach)
+
+  test('a status read between the kill\'s tries reads P\'s own row pending with no launch start, latching P: the round ends stopped (latched) after one kill, the hold goes on marked kill-failed (the read-latch end keeps the ordinary alert), P is armed and the persona-kill-failed entry is written', async () => {
+    const { h, p, old } = heldOld(OLD_ROWS[3]![1])
+    const err = errTmuxKillFailed()
+    h.script({ killError: err, statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE }) })
+    const order = recordCallOrder(h)
+
+    expect(await h.runOldLifeWait(old.instanceId)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED, kills: 1 })
+
+    expect(order).toEqual(['kill', 'status'])
+    expect(h.latch.isLatched(p)).toBe(true)
+    expect(h.oldLifeHolds.holdOf(old.instanceId)?.killFailed).toBe(true)
+    expect(waitsOnKillFailedHold(p)).toBe(true)
+    expect([oldLifeArms(h), getFailureCount(p)]).toEqual([[p], 0])
+    expect(entriesOf(h)).toEqual([[PERSONA_KILL_FAILED_LABEL, waitAlertEntry(old, { kind: KILL_RETRY_ALERT_ORDINARY, lastKillFailedDescription: descriptionOf(err) }, sessionBeforeGet(old))]])
+  })
+
+  test('P\'s own row read pending with no launch start at the get latches P; a second round while P is latched makes no kill and no get, ends stopped (latched), keeps the hold unmarked and arms P', async () => {
+    const { h, p, old } = heldOld(OLD_ROWS[3]![1])
+    h.script({ getResult: old.row({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE }) })
+    const order = recordCallOrder(h)
+
+    expect(await h.runOldLifeWait(old.instanceId)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED })
+    expect([order, h.latch.isLatched(p)]).toEqual([['kill', 'get'], true])
+    const calls = h.stub.callCount()
+
+    expect(await h.runOldLifeWait(old.instanceId)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED, kills: 0 })
+
+    expect([order, h.stub.callCount()]).toEqual([['kill', 'get'], calls])
+    expect(h.oldLifeHolds.holdOf(old.instanceId)?.killFailed).toBe(false)
+    expect([oldLifeArms(h), getFailureCount(p)]).toEqual([[p, p], 0])
+    expect(entriesOf(h)).toEqual([])
+  })
+
+  test('a waiting persona\'s latch never stops a wait on a row it does not own: P latched by a read of its own row, the wait on a pre-persona row held in P\'s directory makes its kill and its get, which reads the row ended and ends the hold', async () => {
+    const { h, p, old } = heldOld(OLD_ROWS[1]![1])
+    h.script({ getFn: (params) => (params.claude_instance_id === personaInstanceId(p) ? personaRow(h, p, { liveness_note: provenanceNote }) : old.row({ state: LIVENESS_DEAD_ROW_ENDED })) })
+    await readPersonaOwnRow(p, { site: 'old-life-wait.test', what: 'own-row get' })
+    expect(h.latch.isLatched(p)).toBe(true)
+    const order = recordCallOrder(h)
+
+    expect(await h.runOldLifeWait(old.instanceId)).not.toMatchObject({ reason: LIVE_ROW_STOP_LATCHED })
+
+    expect(order).toEqual(['kill', 'get'])
+    expect(h.oldLifeHolds.holdOf(old.instanceId)).toBeUndefined()
+  })
+})
+
+describe('b.jg5 SRJ-812: the kill-failed mark, and the per-persona query', () => {
+  afterEach(waitAfterEach)
+
+  test('a failed kill marks the hold P waits on: P\'s query answers true, Q\'s (in its own directory) false; the hold\'s end clears it', async () => {
+    const { h, p, b, old } = heldOld(OLD_ROWS[1]![1])
+    h.script({ killError: errTmuxKillFailed() })
+
+    await h.runOldLifeWait(old.instanceId)
+
+    expect([waitsOnKillFailedHold(p), waitsOnKillFailedHold(b)]).toEqual([true, false])
+    noteOldLifeRowRead(old.instanceId, { kind: OLD_LIFE_ROW_READ_STATE, state: LIVENESS_DEAD_ROW_ENDED }, 'another call')
+    expect(waitsOnKillFailedHold(p)).toBe(false)
+  })
+})
+
+describe('b.jg5 SRJ-811: the wait ends at its hold\'s end and at the registry\'s close, with no further call and no timer left', () => {
+  afterEach(waitAfterEach)
+
+  test.each<[string, (h: RecoveryHarness, old: OldRow) => void, string]>([
+    ['its hold\'s end (another call reads the old row ended)', (_h, old) => noteOldLifeRowRead(old.instanceId, { kind: OLD_LIFE_ROW_READ_STATE, state: LIVENESS_DEAD_ROW_ENDED }, 'another call'), LIVE_ROW_STOP_HOLD_ENDED],
+    ['the registry\'s close at shutdown', (h) => h.shutdown(), LIVE_ROW_STOP_SHUTDOWN],
+  ])('%s while its first run is held: once the run is released no further call follows, nothing is armed and no timer is left', async (_label, end, reason) => {
+    const { h, p, old } = heldOld(OLD_ROWS[1]![1])
+    const hold = holdFindMissing(h.stub.client)
+    h.script({ getResult: old.row() })
+    const order = recordCallOrder(h)
+    const outcome = h.startOldLifeWait(old.instanceId)
+    await h.driveSequence(hold.entered(1))
+
+    end(h, old)
+    hold.release(cannedFindMissing())
+
+    expect(await h.driveSequence(outcome)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason })
+    expect(order).toEqual(['kill', 'get', 'findMissing'])
+    expect([oldLifeArms(h), h.controller.isArmed(p), h.oldLifeWaitRunning(old.instanceId), h.clock.pendingCount()]).toEqual([[], false, false, 0])
+    expect(entriesOf(h)).toEqual([])
+  })
+})
+
+/**
+ * Start the wait on `old` and step its microtasks until its kill has made
+ * `tries` tries and waits on the clock before the next one. Answers the
+ * outcome promise.
+ */
+async function startedUntilKillWait(h: RecoveryHarness, old: OldRow, tries: number): Promise<{ readonly outcome: Promise<LiveRowSequenceOutcome> }> {
+  const outcome = h.startOldLifeWait(old.instanceId)
+  for (let turn = 0; turn < 100 && !(h.stub.calls.killCalls.length === tries && h.clock.pendingCount() === 1); turn++) await h.clock.flush()
+  expect([h.stub.calls.killCalls.length, h.clock.pendingCount()]).toEqual([tries, 1])
+  return { outcome }
+}
+
+/** The stopped-retry text for the old key's kill stopped at a shutdown (b.jg5 SRJ-702): its line and its entry, quoting `quoted`. */
+function stoppedAtShutdown(old: OldRow, quoted: KillRetryAlert): { readonly line: string; readonly entry: string } {
+  return killFailureStoppedRetryText({
+    key: old.oldKey,
+    decision: quoted,
+    context: KILL_FAILURE_CONTEXT_OLD_LIFE_WAIT,
+    lastOutcomeClass: AD_ERROR_CLASS_UNAVAILABLE,
+    stopCause: OLD_LIFE_WAIT_STOP_CAUSE_SHUTDOWN,
+  })
+}
+
+describe('b.jg5 SRJ-702, SRJ-811 (AC 64): the wait\'s kill keeps its tries while no persona is up, and a shutdown is its stop', () => {
+  afterEach(waitAfterEach)
+
+  test.each(OLD_ROWS.slice(0, 3))('no persona is up (%s): the kill answering ErrTmuxKillFailed keeps its 3 tries and raises the ordinary version', async (_label, form) => {
+    const { h, old } = heldOld(form)
+    for (const key of h.keys) h.setUp(key, false)
+    h.script({ killError: errTmuxKillFailed() })
+
+    await h.runOldLifeWait(old.instanceId)
+
+    expect(h.stub.calls.killCalls).toHaveLength(KILL_RETRY_TRIES)
+    expect(entriesOf(h).map(([cls]) => cls)).toEqual([PERSONA_KILL_FAILED_LABEL])
+  })
+
+  test.each<[string, () => Error, (err: Error) => KillRetryAlert]>([
+    ['a try that returned a survivor-naming ErrTmuxKillFailed: the line quotes it', survivorFailure, (err) => ({ kind: KILL_RETRY_ALERT_ORDINARY, lastKillFailedDescription: descriptionOf(err) })],
+    ['a try that returned ErrTmuxUnresponsive: no description', () => errTmuxUnresponsive('kill'), () => ({ kind: KILL_RETRY_ALERT_ORDINARY })],
+  ])('stopped between tries by the registry\'s close at shutdown, after %s: no further kill or status read, neither version, nothing posted or armed; one line and the old key\'s persona-kill-failed entry with no alert text', async (_label, make, decision) => {
+    const { h, p, old } = heldOld(OLD_ROWS[0]![1])
+    const err = make()
+    h.script({ killError: err })
+    const order = recordCallOrder(h)
+    const { outcome } = await startedUntilKillWait(h, old, 1)
+
+    h.shutdown()
+
+    expect(await h.driveSequence(outcome)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_SHUTDOWN })
+    expect(order).toEqual(['kill'])
+    const stopped = stoppedAtShutdown(old, decision(err))
+    expect(h.lines.filter((line) => line === stopped.line)).toHaveLength(1)
+    expect(entriesOf(h)).toEqual([[PERSONA_KILL_FAILED_LABEL, stopped.entry]])
+    expect(h.oldLifeHolds.holdOf(old.instanceId)?.killFailed).toBe(false)
+    expect([oldLifeArms(h), h.controller.isArmed(p)]).toEqual([[], false])
+    expectNoLatchOrPost(h)
+  })
+})
+
+/** End `old`'s hold as another call's read of the row as `ended` ends it (the session manager's one read entry). */
+function endHoldByAnotherRead(old: OldRow): void {
+  noteOldLifeRowRead(old.instanceId, { kind: OLD_LIFE_ROW_READ_STATE, state: LIVENESS_DEAD_ROW_ENDED }, 'another call')
+}
+
+/**
+ * The kill tries ended by the hold's end, asked `when` (`before try <n>` or
+ * `after try <n>`), as a success with no stopped-retry line, no
+ * persona-kill-failed entry and no mark; and the wait with them.
+ */
+function expectHoldEndedSuccess(h: RecoveryHarness, p: string, old: OldRow, outcome: LiveRowSequenceOutcome, survivor: Error | undefined, when: string): void {
+  expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED })
+  const prefix = `[slack] ${OLD_LIFE_WAIT_SITE} for ${oldLifeWaitRef(old.instanceId, old.oldKey)}`
+  expect(h.errors.filter((line) => line === killRetryHoldEndedLine(prefix, old.instanceId, when))).toHaveLength(1)
+  expect(h.lines.some((line) => line.includes(' alert not raised — its tries were stopped '))).toBe(false)
+  expect(entriesOf(h)).toEqual(
+    survivor === undefined
+      ? []
+      : [[PERSONA_KILL_SURVIVOR_LABEL, waitAlertEntry(old, { kind: KILL_RETRY_ALERT_SURVIVOR, survivorDescription: descriptionOf(survivor) }, sessionBeforeGet(old))]],
+  )
+  expect([h.oldLifeHolds.holdOf(old.instanceId), waitsOnKillFailedHold(p), oldLifeArms(h)]).toEqual([undefined, false, []])
+  expectNoLatchOrPost(h)
+}
+
+describe('b.jg5 SRJ-811\'s Test line, SRJ-702 (AC 64; option A): a hold that ends while the wait\'s kill runs ends its tries as a success', () => {
+  afterEach(waitAfterEach)
+
+  test.each<[string, () => Error, boolean]>([
+    ['a survivor-naming ErrTmuxKillFailed: one persona-kill-survivor entry quoting it', survivorFailure, true],
+    ['ErrTmuxUnresponsive: no entry at all', () => errTmuxUnresponsive('kill'), false],
+  ])('between tries (the 2 s wait after the first try answered %s): no further kill or status read', async (_label, make, names) => {
+    const { h, p, old } = heldOld(OLD_ROWS[0]![1])
+    const err = make()
+    h.script({ killError: err })
+    const order = recordCallOrder(h)
+    const { outcome } = await startedUntilKillWait(h, old, 1)
+
+    endHoldByAnotherRead(old)
+
+    expectHoldEndedSuccess(h, p, old, await h.driveSequence(outcome), names ? err : undefined, 'before try 2')
+    expect(order).toEqual(['kill'])
+  })
+
+  test('between tries, during the status read before try 2 (it reads the row live): no further kill, one persona-kill-survivor entry', async () => {
+    const { h, p, old } = heldOld(OLD_ROWS[1]![1])
+    const err = survivorFailure()
+    h.script({ killError: err })
+    const order = recordCallOrder(h, { at: 1, run: () => endHoldByAnotherRead(old) })
+
+    expectHoldEndedSuccess(h, p, old, await h.runOldLifeWait(old.instanceId), err, 'before try 2')
+    expect(order).toEqual(['kill', 'status'])
+  })
+
+  test.each<[string, () => Error, boolean]>([
+    ['ErrTmuxUnresponsive, after a survivor-naming first try: one persona-kill-survivor entry', () => errTmuxUnresponsive('kill'), true],
+    ['ErrTmuxKillFailed, after a survivor-naming first try: no persona-kill-failed entry, no mark, one persona-kill-survivor entry', () => errTmuxKillFailed(), true],
+    ['ErrTmuxKillFailed, no try naming a survivor: no entry at all', () => errTmuxKillFailed(), false],
+  ])('during the third try, which then answers %s', async (_label, make, survivorFirst) => {
+    const { h, p, old } = heldOld(OLD_ROWS[0]![1])
+    const first = survivorFirst ? survivorFailure() : make()
+    h.script({ killQueue: [cannedErr(first)], killError: make() })
+    const order = recordCallOrder(h, { at: killTries().length - 1, run: () => endHoldByAnotherRead(old) })
+
+    expectHoldEndedSuccess(h, p, old, await h.runOldLifeWait(old.instanceId), survivorFirst ? first : undefined, `after try ${KILL_RETRY_TRIES}`)
+    expect(order).toEqual(killTries())
+  })
+
+  test('in the very try that names the survivor (the first): one persona-kill-survivor entry quoting it, no further kill', async () => {
+    const { h, p, old } = heldOld(OLD_ROWS[2]![1])
+    const err = survivorFailure()
+    h.script({ killError: err })
+    const order = recordCallOrder(h, { at: 0, run: () => endHoldByAnotherRead(old) })
+
+    expectHoldEndedSuccess(h, p, old, await h.runOldLifeWait(old.instanceId), err, 'before try 2')
+    expect(order).toEqual(['kill'])
+  })
+
+  test('a shutdown stop in the same window as the hold\'s end (the shutdown first): the hold\'s end wins — a success, no persona-kill-failed entry and no stopped-retry line; the survivor version is still written', async () => {
+    const { h, p, old } = heldOld(OLD_ROWS[0]![1])
+    const err = survivorFailure()
+    h.script({ killError: err })
+    const order = recordCallOrder(h)
+    const { outcome } = await startedUntilKillWait(h, old, 1)
+
+    h.shutdown()
+    endHoldByAnotherRead(old)
+
+    expectHoldEndedSuccess(h, p, old, await h.driveSequence(outcome), err, 'before try 2')
+    expect(order).toEqual(['kill'])
+  })
+
+  test('a hold that ends between tries and is begun again on the same id before try 2: the tries still end as a success — no further kill, no persona-kill-failed entry, no stopped-retry line; the new hold stands unmarked and nothing is armed', async () => {
+    const { h, p, old } = heldOld(OLD_ROWS[1]![1])
+    h.script({ killError: errTmuxKillFailed() })
+    const order = recordCallOrder(h)
+    const { outcome } = await startedUntilKillWait(h, old, 1)
+
+    endHoldByAnotherRead(old)
+    holdOld(h, p, old)
+
+    expect(await h.driveSequence(outcome)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_HOLD_ENDED })
+    expect(order).toEqual(['kill'])
+    const prefix = `[slack] ${OLD_LIFE_WAIT_SITE} for ${oldLifeWaitRef(old.instanceId, old.oldKey)}`
+    expect(h.errors.filter((line) => line === killRetryHoldEndedLine(prefix, old.instanceId, 'before try 2'))).toHaveLength(1)
+    expect(h.lines.some((line) => line.includes(' alert not raised — its tries were stopped '))).toBe(false)
+    expect(entriesOf(h)).toEqual([])
+    expect([h.oldLifeHolds.holdOf(old.instanceId)?.killFailed, waitsOnKillFailedHold(p), oldLifeArms(h), h.oldLifeWaitRunning(old.instanceId)]).toEqual([false, false, [], false])
+    expectNoLatchOrPost(h)
   })
 })

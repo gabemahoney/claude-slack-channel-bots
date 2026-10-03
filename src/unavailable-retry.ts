@@ -225,7 +225,8 @@
  * unless another cause armed during that retry or a `kill-failed` cause is
  * recorded. Each `again` carries its again-reason
  * (the labels under "Again-reasons" below: `launch-in-flight`,
- * `launch-failed`, `reconnect-deferred`, `pending-deferred`, `launched`,
+ * `live-row-sequence-in-flight` and `old-life-wait-in-flight`, which name
+ * what blocks the retry, `launch-failed`, `reconnect-deferred`, `pending-deferred`, `launched`,
  * `restart-not-initialised`, `liveness-unknown`,
  * `live-row-sequence-waiting`) for the re-armed line, except a refused launch,
  * whose line names the UNAVAILABLE cause that armed during the run. The
@@ -235,7 +236,8 @@
  *
  * In pending-only mode, a retry that finds the in-flight predicate true (a
  * throw counts as in flight) makes no agent-director call and is a refusal
- * (`launch-in-flight`, the row kept `pending`). Otherwise it reads the
+ * (`launch-in-flight`, `live-row-sequence-in-flight` or
+ * `old-life-wait-in-flight` by what blocks it, the row kept `pending`). Otherwise it reads the
  * persona's row (`readRow`, one `status` call) inside a recovery attempt for
  * the persona, and the state decides:
  * still `pending`, a refusal (`row-pending`) with no other call; live out of
@@ -422,6 +424,21 @@ export const UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION = 'reuse-collision'
  */
 export const UNAVAILABLE_RETRY_CAUSE_LOST_RACE = 'spawn-not-resumable-lost-race'
 
+/**
+ * The cause of a persona held for an old life (b.jg5 SRJ-811, SRJ-810,
+ * SRJ-301): an old-life wait it waits on ended with its hold going on (an
+ * UNAVAILABLE, ENVIRONMENT, CONFIG or UNCLASSIFIED answer, a kill failure, a
+ * CONFLICT or an unusable recorded name met for the old key, a run that did
+ * not judge the old row, or the old row still live after runs that judged
+ * it), or its launch was refused because a wait runs on its own row
+ * (`sequence-waiting`). Armed outside any launch or recovery attempt for the
+ * persona, by the session manager's old-life wait (`src/session-manager.ts`;
+ * the same string as `OLD_LIFE_WAIT_ARM_CAUSE`, `src/old-life-wait.ts`).
+ * Never counted, and it never starts or continues the `tmux-unresponsive`
+ * condition. No timer is ever armed with it for the old key itself (SRJ-1512).
+ */
+export const UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD = 'held-for-old-life'
+
 // ---------------------------------------------------------------------------
 // Modes (b.jg5 SRJ-301, SRJ-303)
 // ---------------------------------------------------------------------------
@@ -494,6 +511,77 @@ export const UNAVAILABLE_RETRY_KEPT_KILL_FAILED = 'a kill-failed cause is record
 
 /** A retry, in either mode, that found a launch call in flight for the persona, and made no call (b.jg5 SRJ-302, SRJ-303: a refusal). */
 export const UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT = 'launch-in-flight'
+
+/**
+ * A retry, in either mode, that found the persona's live-row sequence running
+ * (its "blocks a retry" check, b.jg5 SRJ-303, SRJ-706), and made no call: a
+ * refusal (SRJ-302).
+ */
+export const UNAVAILABLE_RETRY_AGAIN_SEQUENCE_IN_FLIGHT = 'live-row-sequence-in-flight'
+
+/**
+ * A retry, in either mode, that found an old-life wait step running for a
+ * hold the persona waits on (its "blocks a retry" check, b.jg5 SRJ-303,
+ * SRJ-811), and made no call: a refusal (SRJ-302).
+ */
+export const UNAVAILABLE_RETRY_AGAIN_OLD_LIFE_WAIT_IN_FLIGHT = 'old-life-wait-in-flight'
+
+/** "Blocks a retry" cause: a launch call is in flight for the persona (b.jg5 SRJ-303). */
+export const RETRY_BLOCK_LAUNCH = 'launch'
+/** "Blocks a retry" cause: the persona's live-row sequence runs (b.jg5 SRJ-303, SRJ-706). */
+export const RETRY_BLOCK_LIVE_ROW_SEQUENCE = 'live-row-sequence'
+/** "Blocks a retry" cause: an old-life wait step runs for a hold the persona waits on (b.jg5 SRJ-303, SRJ-811). */
+export const RETRY_BLOCK_OLD_LIFE_WAIT = 'old-life-wait'
+
+/** Which work in flight blocks a retry of the persona's timer (b.jg5 SRJ-303). */
+export type RetryBlockCause = typeof RETRY_BLOCK_LAUNCH | typeof RETRY_BLOCK_LIVE_ROW_SEQUENCE | typeof RETRY_BLOCK_OLD_LIFE_WAIT
+
+/**
+ * The again-reason of a retry skipped because `cause` blocks it (b.jg5
+ * SRJ-302, SRJ-303): `launch-in-flight`, `live-row-sequence-in-flight` or
+ * `old-life-wait-in-flight`; `launch-in-flight` when the cause is not known.
+ * Pure.
+ */
+export function retryBlockAgainReason(cause: RetryBlockCause | undefined): string {
+  switch (cause) {
+    case RETRY_BLOCK_LIVE_ROW_SEQUENCE:
+      return UNAVAILABLE_RETRY_AGAIN_SEQUENCE_IN_FLIGHT
+    case RETRY_BLOCK_OLD_LIFE_WAIT:
+      return UNAVAILABLE_RETRY_AGAIN_OLD_LIFE_WAIT_IN_FLIGHT
+    default:
+      return UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT
+  }
+}
+
+/**
+ * What the restart retry's skip line says blocks it (b.jg5 SRJ-303; the
+ * line's `<what>`): `a launch is in flight`, `its live-row sequence runs` or
+ * `an old-life wait step it waits on runs`; the first when the cause is not
+ * known. Pure.
+ */
+export function retryBlockSkipText(cause: RetryBlockCause | undefined): string {
+  switch (cause) {
+    case RETRY_BLOCK_LIVE_ROW_SEQUENCE:
+      return 'its live-row sequence runs'
+    case RETRY_BLOCK_OLD_LIFE_WAIT:
+      return 'an old-life wait step it waits on runs'
+    default:
+      return 'a launch is in flight'
+  }
+}
+
+/** The cause of a "blocks a retry" check (`FullModeRetryDeps.retryBlockCause`), a throw and an answer that is not a cause counted as not known. Never throws. */
+export function readRetryBlockCause(key: string, query: ((key: string) => RetryBlockCause | undefined) | undefined): RetryBlockCause | undefined {
+  if (query === undefined) return undefined
+  try {
+    const cause = query(key)
+    return cause === RETRY_BLOCK_LAUNCH || cause === RETRY_BLOCK_LIVE_ROW_SEQUENCE || cause === RETRY_BLOCK_OLD_LIFE_WAIT
+      ? cause
+      : undefined
+  } catch {
+    return undefined
+  }
+}
 
 /** A full-mode retry whose launch failed and was counted, below the restart cap. */
 export const UNAVAILABLE_RETRY_AGAIN_LAUNCH_FAILED = 'launch-failed'
@@ -1320,9 +1408,15 @@ export interface FullModeRetryDeps {
   /**
    * The restart module's retry entry (`runRestartRetry`): the restart path's
    * decision for the persona, through its serializer, without the delay gate,
-   * with `isInFlight` as its first step.
+   * with `isInFlight` as its first step; `blockCause`, when given, names what
+   * blocks it in the entry's skip line (b.jg5 SRJ-303).
    */
-  retry: (key: string, cwd: string, isInFlight: (key: string) => boolean) => Promise<RestartRetryOutcome>
+  retry: (
+    key: string,
+    cwd: string,
+    isInFlight: (key: string) => boolean,
+    blockCause?: (key: string) => RetryBlockCause | undefined,
+  ) => Promise<RestartRetryOutcome>
   /** The applied persona with this key (its working directory), or `undefined` when it is not applied. */
   appliedPersona: (key: string) => { readonly working_directory: string } | undefined
   /** The not-up gate (the server's relaunch gate): false while the persona is not up. */
@@ -1358,13 +1452,24 @@ export interface FullModeRetryDeps {
   /**
    * Whether work in flight for the persona blocks a retry (b.jg5 SRJ-303;
    * production: the server's `isPersonaRetryBlocked`: a launch call,
-   * `isLaunchInFlight`, or a running live-row sequence,
-   * `isLiveRowSequenceRunning`). A running dialog approver never counts here: it
+   * `isLaunchInFlight`, a running live-row sequence,
+   * `isLiveRowSequenceRunning`, or an old-life wait step for a hold the
+   * persona waits on, `isOldLifeWaitRunningFor`). A running dialog approver never counts here: it
    * runs after its launch call has returned and never blocks a retry
    * (SRJ-401). A retry in either mode that finds it true makes no
    * agent-director call and is a refusal; a throw counts as in flight.
    */
   isInFlight: (key: string) => boolean
+  /**
+   * Which work in flight blocks a retry (b.jg5 SRJ-303; production: the
+   * session manager's `personaRetryBlockCause`): a launch call, the
+   * persona's live-row sequence, or an old-life wait step for a hold it waits
+   * on. Asked only when `isInFlight` answered true (or a full-mode run
+   * answered `in-flight`), to name the cause in the again-reason
+   * (`retryBlockAgainReason`) and the restart retry's skip line. Absent, or
+   * an answer that is not a cause: `launch-in-flight`.
+   */
+  retryBlockCause?: (key: string) => RetryBlockCause | undefined
   /**
    * Whether the persona's session is connected (production: its registry
    * entry with `connected === true`). Read only by a pending-only retry that
@@ -1412,6 +1517,11 @@ export function createFullModeRetryAction(deps: FullModeRetryDeps): UnavailableR
   return async (key, attempt) => {
     if (deps.isShuttingDown()) return stopWith(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
     const persona = deps.appliedPersona(key)
+    // b.av2 SR-8.6 (b.jg5 SRJ-1512): a retry does nothing for a key outside
+    // the applied set. Its one exception, an old-life wait's kill and
+    // find-missing steps on a retired key (SRJ-811), runs in the session
+    // manager's live-row sequence registry, never on this timer, and never
+    // launches that key; no timer is armed for the old key.
     if (persona === undefined) return stopWith(UNAVAILABLE_RETRY_STOP_NOT_APPLIED)
     if (latched(key, deps.isLatched)) return stopWith(UNAVAILABLE_RETRY_STOP_LATCHED)
     // b.jg5 SRJ-207, SRJ-303: no attempt while the persona is held on ErrInvalidFlags.
@@ -1421,7 +1531,9 @@ export function createFullModeRetryAction(deps: FullModeRetryDeps): UnavailableR
     const cwd = persona.working_directory
     if (attempt.mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY) {
       if (inFlight(key, deps.isInFlight)) {
-        return { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT, row: UNAVAILABLE_RETRY_ROW_PENDING }
+        // b.jg5 SRJ-303: the again-reason names what blocks the retry.
+        const reason = retryBlockAgainReason(readRetryBlockCause(key, deps.retryBlockCause))
+        return { kind: 'again', reason, row: UNAVAILABLE_RETRY_ROW_PENDING }
       }
       const row = await runInAttempt(key, 'recovery', () => deps.readRow(key))
       // b.jg5 SRJ-305, SRJ-512, SRJ-513: a row read that latched the persona
@@ -1433,9 +1545,11 @@ export function createFullModeRetryAction(deps: FullModeRetryDeps): UnavailableR
       if (isLiveOutOfPending(row.state) && probe(key, deps.isSessionConnected) && probe(key, deps.hasSessionStream)) {
         endCondition(key, row.state, deps.endTmuxUnresponsive)
       }
-      return pendingOnlyAnswer(row.state, () => deps.retry(key, cwd, deps.isInFlight))
+      return pendingOnlyAnswer(row.state, () => deps.retry(key, cwd, deps.isInFlight, deps.retryBlockCause))
     }
-    const outcome = await deps.retry(key, cwd, deps.isInFlight)
+    const outcome = await deps.retry(key, cwd, deps.isInFlight, deps.retryBlockCause)
+    // b.jg5 SRJ-303: a run skipped for work in flight names what blocked it.
+    if (outcome === 'in-flight') return againWith(retryBlockAgainReason(readRetryBlockCause(key, deps.retryBlockCause)))
     // Since b.jg5 E9, `already-connected` is answered only for a `live`
     // reading (never `pending`) whose session is connected with its stream.
     if (outcome === 'already-connected') endCondition(key, LIVENESS_LIVE, deps.endTmuxUnresponsive)

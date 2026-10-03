@@ -69,6 +69,20 @@
  * stopped by a latch, a teardown or shutdown set none; an escalation raises
  * the ordinary alert for P's own id on its configured destination.
  *
+ * The no-launch form as an old-life wait (b.jg5 SRJ-811, SRJ-1512,
+ * SRJ-1007; E27 T2): started through the session manager's ensure entry on
+ * a held row, still live after runs that judged it, its step-5 ordinary
+ * version for a renamed-away key's own `cscb_<old>` and for a pre-persona
+ * row's id is one `persona-kill-failed` entry with the context `old-life
+ * wait`, the id and the row's session in the text and the log-only closing,
+ * built with `src/kill-failure-alert.ts`'s builders. A no-launch request
+ * started from inside a recovery attempt runs outside every attempt (its
+ * UNAVAILABLE `get` arms nothing), where a launch-ending one runs in its own;
+ * a hold's end stops only a no-launch request on its id, never a
+ * launch-ending sequence there, P's own stop never stops a no-launch
+ * request, and the no-launch query tells the two apart. The wait's steps
+ * and results by class are tests/old-life-wait.test.ts's.
+ *
  * Every spacing, limit, outcome, cause, context, state and class is
  * imported from `src/` or the stub builders, and every expected alert text
  * is built with `src/kill-failure-alert.ts`'s builders (through the
@@ -103,11 +117,15 @@ import { killOutcomeOf, type KillFailureClass } from '../src/checked-kill.ts'
 import {
   KILL_FAILURE_CLOSING_DESTINATION,
   KILL_FAILURE_CLOSING_DESTINATION_LATCHED,
+  KILL_FAILURE_CLOSING_LOG_ONLY,
+  KILL_FAILURE_CONTEXT_OLD_LIFE_WAIT,
   KILL_FAILURE_CONTEXT_RECOVERY,
   KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT,
   KILL_FAILURE_ROUTE_NOT_CONFIGURED,
   KILL_FAILURE_VERSION_ORDINARY,
   PERSONA_KILL_FAILED_LABEL,
+  killFailureAlertEntryText,
+  killFailureAlertText,
 } from '../src/kill-failure-alert.ts'
 import { KILL_RETRY_ALERT_NONE, KILL_RETRY_ALERT_ORDINARY, KILL_RETRY_END_SETTLED, KILL_RETRY_END_STOPPED, KILL_RETRY_SPACING_MS, KILL_RETRY_TRIES, type KillRetryResult } from '../src/kill-retry.ts'
 import {
@@ -157,6 +175,7 @@ import {
   LIVE_ROW_START_ALREADY_RUNNING,
   LIVE_ROW_START_CLOSED,
   LIVE_ROW_START_STARTED,
+  LIVE_ROW_STOP_HOLD_ENDED,
   LIVE_ROW_STOP_LATCHED,
   LIVE_ROW_STOP_NOT_UP,
   LIVE_ROW_STOP_SHUTDOWN,
@@ -188,18 +207,22 @@ import {
   type RetiredKeyAttemptStart,
 } from '../src/live-row-sequence.ts'
 import { AGENT_DIRECTOR_PENDING_STATE, LIVENESS_DEAD_ROW_ENDED, LIVENESS_DEAD_ROW_MISSING } from '../src/liveness-reading.ts'
+import { oldLifeWaitRef } from '../src/old-life-wait.ts'
 import { parseLaunchStart } from '../src/pending-row.ts'
 import { describeThrownValue } from '../src/persona-connection-errors.ts'
-import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
+import { personaInstanceId, personaTmuxSessionName, renderPersonaRef } from '../src/persona-identity.ts'
+import { OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL } from '../src/retired-keys.ts'
 import { KILL_FAILURE_END_ROW_FINISHED } from '../src/persona-episodes.ts'
 import { MAX_TIMER_DELAY_MS } from '../src/persona-retry-schedule.ts'
 import {
   ESCALATE_DEAD_WAITING_ROW_PANE_GONE,
+  OLD_LIFE_ROW_READ_STATE,
   _resetFindMissingMemo,
   _resetNow,
   _setNow,
   isLaunchInFlight,
   launchSession,
+  noteOldLifeRowRead,
   readPersonaRowState,
   ROW_REREAD_FINISHED,
   ROW_REREAD_LATCHED,
@@ -218,6 +241,7 @@ import {
   type SpawnPersonaResult,
 } from '../src/session-manager.ts'
 import {
+  isInsideAttempt,
   runInAttempt,
   UNAVAILABLE_RETRY_CAUSE_CONFIG,
   UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
@@ -235,6 +259,7 @@ import { raiseAdConfigMalformed } from '../src/outage-state.ts'
 import {
   cannedErr,
   cannedFindMissing,
+  cannedGetResult,
   cannedKillResult,
   cannedOk,
   cannedStatusResult,
@@ -2543,5 +2568,98 @@ describe('a retired key\'s sequence: its final launch is a reuse that sets the m
     expect(killFailurePosts(h, p)).toEqual([killFailurePostedLine(p, content, KILL_FAILURE_CLOSING_DESTINATION, KILL_FAILURE_CONTEXT_RECOVERY)])
     expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls]).toEqual([[], []])
     expect(markOf(h, p)).toEqual([false, false])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The no-launch form as an old-life wait (b.jg5 SRJ-811, SRJ-1512, SRJ-1007;
+// E27 T2): step 5's alert text for an old key's id and a pre-persona id, the
+// attempt rule, and the no-launch-only stop and query. The wait's steps and
+// results by class are tests/old-life-wait.test.ts's.
+// ---------------------------------------------------------------------------
+
+describe('the no-launch form as an old-life wait: step 5\'s ordinary text for an old key\'s id and a pre-persona row\'s id, with the log-only closing (b.jg5 SRJ-1007, SRJ-811)', () => {
+  test.each<[string, (h: RecoveryHarness, p: string, q: string) => { readonly id: string; readonly oldKey: string; readonly session: string; readonly labels: Record<string, string> }]>([
+    ['a renamed-away key\'s own cscb_<old> (Q, no longer applied)', (h, _p, q) => {
+      h.remove(q)
+      return { id: personaInstanceId(q), oldKey: q, session: personaTmuxSessionName(q), labels: { service: 'cscb', persona: q } }
+    }],
+    ['a pre-persona row\'s id (no persona label)', () => ({ id: 'cscb_old_C0OLD', oldKey: 'cscb_old_C0OLD', session: 'slack_bot_old_C0OLD', labels: { service: 'cscb', channel: 'C0OLD' } })],
+  ])('%s: still live after runs that judged it, one persona-kill-failed entry and one log line, the context old-life wait, the id and the row\'s session in the text; nothing to Slack', async (_label, form) => {
+    const { h, p, q } = build()
+    const old = form(h, p, q)
+    h.beginOldLifeHold({ instanceId: old.id, oldKey: old.oldKey, directory: h.home, cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL })
+    h.script({ getResult: cannedGetResult({ claude_instance_id: old.id, cwd: h.home, tmux_session_name: old.session, labels: old.labels }) })
+
+    expect(await h.runOldLifeWait(old.id)).toMatchObject({ kind: LIVE_ROW_OUTCOME_ESCALATED })
+
+    const text = killFailureAlertText({ version: KILL_FAILURE_VERSION_ORDINARY, session: old.session, instanceId: old.id, quotes: {} }, KILL_FAILURE_CLOSING_LOG_ONLY, false)
+    expect(text).toContain(`--claude-instance-id ${old.id}`)
+    expect(startupEntriesOf(h, PERSONA_KILL_FAILED_LABEL)).toEqual([killFailureAlertEntryText(oldLifeWaitRef(old.id, old.oldKey), KILL_FAILURE_CONTEXT_OLD_LIFE_WAIT, text)])
+    expect(killFailureLines(h, old.oldKey)).toEqual([
+      killFailureLoggedLine(old.oldKey, KILL_FAILURE_VERSION_ORDINARY, PERSONA_KILL_FAILED_LABEL, KILL_FAILURE_ROUTE_NOT_CONFIGURED),
+    ])
+    expect([h.episodeNotices, h.notices]).toEqual([[], []])
+    // The waiting persona has none here (the hold is in the harness HOME): nothing is armed.
+    expect(h.triggers).toEqual([])
+  })
+})
+
+describe('the no-launch form\'s contract (b.jg5 SRJ-811, SRJ-1512): it runs outside every attempt, only the no-launch stop ends it, and the query tells it from a launch-ending sequence', () => {
+  test.each<[string, boolean, boolean]>([
+    ['a request that ends in a launch runs in its own recovery attempt for P', true, true],
+    ['a no-launch request runs outside every attempt, so its UNAVAILABLE get arms nothing for P', false, false],
+  ])('started from inside a recovery attempt for P: %s', async (_label, launches, inside) => {
+    const { h, p } = build()
+    const insideAtGet: boolean[] = []
+    const get = h.stub.client.get.bind(h.stub.client)
+    h.stub.client.get = (params) => {
+      insideAtGet.push(isInsideAttempt(p))
+      return get(params)
+    }
+    h.script({ getError: unavailableAt('get') })
+
+    expect(await runInAttempt(p, 'recovery', async () => startLiveRowSequence(h.sequenceRequest(p, { lastReadState: LIVE, launches })))).toBe(LIVE_ROW_START_STARTED)
+    const outcome = await h.driveSequence(h.sequenceSettled(p))
+
+    expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_READ_REFUSED })
+    expect(insideAtGet).toEqual([inside])
+    expect(h.triggers).toEqual(launches ? [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED].map((kind) => ({ key: p, kind })) : [])
+    expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls]).toEqual([[], []])
+  })
+
+  test('a hold on cscb_<P> that ends while P\'s launch-ending sequence runs there (its first run held) stops no sequence: the no-launch query answers false, the running query true, and the sequence goes on to its launch', async () => {
+    const { h, p } = build()
+    const hold = holdFindMissing(h.stub.client)
+    ownRowsLiveThenMissing(h)
+    const run = await startSequenceHeldAtRun(h, p, hold)
+    h.beginOldLifeHold({ instanceId: personaInstanceId(p), oldKey: p, directory: h.home, cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL })
+
+    noteOldLifeRowRead(personaInstanceId(p), { kind: OLD_LIFE_ROW_READ_STATE, state: ENDED }, 'another call')
+
+    expect([h.oldLifeWaitRunning(personaInstanceId(p)), h.sequenceRunning(p)]).toEqual([false, true])
+    hold.release(placed(p, 'ids'))
+    expect(await h.driveSequence(run.outcome)).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE })
+    expectOneReuseOf(h, p)
+    await h.runApproverToStop(p)
+  })
+
+  test('a no-launch request keyed P on cscb_<P> (its first run held): P\'s stop (a teardown) leaves it running, the no-launch query and the running query both answer true, and the end of a hold on its id stops it before its next call', async () => {
+    const { h, p } = build()
+    const hold = holdFindMissing(h.stub.client)
+    h.script({ getResult: personaRow(h, p) })
+    const order = recordCallOrder(h)
+    const run = await startSequenceHeldAtRun(h, p, hold, { launches: false })
+    h.beginOldLifeHold({ instanceId: personaInstanceId(p), oldKey: p, directory: h.home, cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL })
+
+    expect(await run.stop(LIVE_ROW_STOP_TEARDOWN)).toBe(false)
+    expect([h.oldLifeWaitRunning(personaInstanceId(p)), h.sequenceRunning(p)]).toEqual([true, true])
+
+    noteOldLifeRowRead(personaInstanceId(p), { kind: OLD_LIFE_ROW_READ_STATE, state: ENDED }, 'another call')
+    hold.release(cannedFindMissing())
+
+    expect(await h.driveSequence(run.outcome)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_HOLD_ENDED })
+    expect(order).toEqual(['kill', 'get', 'findMissing'])
+    expect([h.oldLifeWaitRunning(personaInstanceId(p)), h.sequenceRunning(p), h.triggers]).toEqual([false, false, []])
   })
 })

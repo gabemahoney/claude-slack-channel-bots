@@ -356,8 +356,19 @@ export const PERSONA_TEARDOWN_NOTICE_RAISED = 'raised during its teardown'
  */
 export const PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER = 'the all-clear of an outage raised during its teardown'
 
+/**
+ * A `persona-teardown-notice` entry's occasion: a CONFLICT or an unusable
+ * recorded name met in an old-life wait for the old key (b.jg5 SRJ-811,
+ * SRJ-1002, SRJ-1013: "or during the wait"), written by the session manager's
+ * wait end handler, never by the teardown window.
+ */
+export const PERSONA_TEARDOWN_NOTICE_DURING_WAIT = 'raised during its old-life wait'
+
 /** Which occasion a teardown-route entry names. */
-export type PersonaTeardownNoticeOccasion = typeof PERSONA_TEARDOWN_NOTICE_RAISED | typeof PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER
+export type PersonaTeardownNoticeOccasion =
+  | typeof PERSONA_TEARDOWN_NOTICE_RAISED
+  | typeof PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER
+  | typeof PERSONA_TEARDOWN_NOTICE_DURING_WAIT
 
 /**
  * One teardown-route startup-errors entry (b.jg5 SRJ-1003, SRJ-1013): the

@@ -99,25 +99,37 @@
  *     silent end. The routing asks its `isHeld`, as `main()` binds it
  *     (b.jg5 SRJ-207, SRJ-1011 state 3); the `heldOnInvalidFlags` option
  *     holds the named personas once the harness is built;
- *   - kill failed (`kill-failed`): the key sets `h.killFailed` (seeded by the
- *     option of the same name, with persona names);
+ *   - kill failed (`kill-failed`, b.jg5 SRJ-1011 state 4, SRJ-812): as
+ *     `main()` composes it, P's kill-failure episode open (the key in
+ *     `h.killFailed`, seeded by the option of the same name, with persona
+ *     names: a case's own arrangement of the episode half) or P waiting on an
+ *     old-life hold whose old key's kill failed: the session manager's
+ *     `waitsOnKillFailedHold` (false while no hold set and wait bindings are
+ *     installed; `waitOnKillFailedHold(h, key)` installs both with a hold of
+ *     P's own row marked kill-failed, the shared table's arrangement), or the
+ *     key in `h.oldLifeKillFailed` (seeded by `oldLifeKillFailed`), the
+ *     settable old-life input;
  *   - a live-row sequence or old-life wait step running (`restarting`): as
- *     `main()` binds it (b.jg5 SRJ-706), the session manager's
- *     `isLiveRowSequenceRunning` for the key, read at call time (false while
- *     no sequence registry is installed, as here unless a case installs
- *     one), or the key in `h.sequenceOrWaitRunning` (seeded by the option of
- *     the same name, with persona names), a case's own arrangement;
+ *     `main()` binds it (b.jg5 SRJ-706, SRJ-811), the session manager's
+ *     `isSequenceOrOldLifeWaitRunning` for the key, read at call time (false
+ *     while no sequence registry, hold set and wait bindings are installed,
+ *     as here unless a case installs them), or the key in
+ *     `h.sequenceOrWaitRunning` (seeded by the option of the same name, with
+ *     persona names), a case's own arrangement, or in `h.waitStepRunning`
+ *     (seeded by `waitStepRunning`), the settable wait-step input;
  *   - in flight for P (the read gate's `isWorkInFlight`): as `main()`
  *     composes "in flight for P" (`isPersonaWorkInFlight`) from "blocks a
  *     retry" (`isPersonaRetryBlocked`) and a running dialog approver: one of
  *     the harness's own restart launches in flight (`h.isLaunchInFlight`),
- *     the session manager's `isLiveRowSequenceRunning` answering true for the
- *     key (b.jg5 SRJ-706), the key in `h.workInFlight` (seeded by
- *     `workInFlight`, with persona names), work in flight that is not a
- *     launch (a later Epic's wait step), or the session manager's
- *     `isDialogApproverRunning` answering true for the key (b.jg5 SRJ-401).
- *     With no approver and no sequence running, a harness built with no
- *     option behaves as before;
+ *     the session manager's `personaRetryBlockCause` naming a cause for the
+ *     key (a launch call, a live-row sequence, b.jg5 SRJ-706, or an old-life
+ *     wait step P waits on, SRJ-811), the key in `h.waitStepRunning` (the
+ *     wait-step input), the key in `h.workInFlight` (seeded by
+ *     `workInFlight`, with persona names), other work in flight that is not a
+ *     launch, or the session manager's `isDialogApproverRunning` answering
+ *     true for the key (b.jg5 SRJ-401). With no approver, sequence or wait
+ *     running, a harness built with no option behaves as before. The
+ *     state-6 launch-or-approver input is unchanged;
  *   - the one lost-message row read (`readRowLiveness`), only with the
  *     `rowRead` option; without it the routing gets no read and makes none.
  *     Each persona's answer is scripted in `h.rowReadScripts` (by key, read at
@@ -160,7 +172,8 @@
  *
  * The harness calls `initRestart` (and, with `outageState`,
  * `initOutageState`) and registers sessions; reset the registry, restart,
- * backoff, ack-tracker and outage state between tests with
+ * backoff, ack-tracker and outage state, and any old-life hold set and wait
+ * bindings an arrangement installed, between tests with
  * `resetRoutingState()`. A case that can hold a notice (a failing destination)
  * calls `h.hold.cancelAll()` in teardown; the hold's timers are on
  * `h.holdClock`, so nothing fires unless the test moves it.
@@ -194,7 +207,18 @@ import {
   type TmuxUnresponsiveCondition,
 } from '../../src/persona-episodes.ts'
 import { _resetOutageState, initOutageState } from '../../src/outage-state.ts'
-import { isDialogApproverRunning, isLiveRowSequenceRunning } from '../../src/session-manager.ts'
+import {
+  _resetOldLifeHolds,
+  _resetOldLifeWaitBindings,
+  isDialogApproverRunning,
+  isSequenceOrOldLifeWaitRunning,
+  personaRetryBlockCause,
+  setOldLifeHolds,
+  setOldLifeWaitBindings,
+  waitsOnKillFailedHold,
+} from '../../src/session-manager.ts'
+import { OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1, createOldLifeHoldSet } from '../../src/retired-keys.ts'
+import { personaInstanceId } from '../../src/persona-identity.ts'
 import { createSessionServer, registerSession, _resetRegistry, type SessionEntry, type SessionToolDeps } from '../../src/registry.ts'
 import {
   initRestart,
@@ -305,6 +329,30 @@ export function putAtRestartCap(key: string): void {
 }
 
 /**
+ * Make persona `key` wait on an old-life hold whose old key's kill failed
+ * (b.jg5 SRJ-809, SRJ-812), as production reaches it: a real hold set
+ * (`createOldLifeHoldSet`) installed in the session manager
+ * (`setOldLifeHolds`) with the old-life wait's bindings over the harness's
+ * applied config (`setOldLifeWaitBindings`: the waiting personas are read
+ * from it; an arm that arms nothing, since no wait starts here), one hold on
+ * P's own `cscb_<key>` at its working directory, as apply step 1 begins it,
+ * marked kill-failed as a failed teardown kill marks it. Throws unless the
+ * session manager's `waitsOnKillFailedHold` then answers true for P.
+ * `resetRoutingState()` removes both installs.
+ */
+export function waitOnKillFailedHold(h: RoutingHarness, key: string): void {
+  const persona = h.config?.personas.find((p) => p.key === key)
+  if (persona === undefined) throw new Error(`lost-message state arrangement failed: no applied persona ${JSON.stringify(key)}`)
+  const holds = createOldLifeHoldSet({ log: () => {} })
+  setOldLifeHolds(holds)
+  setOldLifeWaitBindings({ retryArm: { arm: () => false }, clock: h.holdClock, log: () => {}, appliedConfig: () => h.config })
+  const instanceId = personaInstanceId(key)
+  holds.begin({ instanceId, oldKey: key, directory: persona.working_directory, cause: OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1 })
+  holds.markKillFailed(instanceId)
+  arranged(waitsOnKillFailedHold(key), 'P does not wait on an old-life hold marked kill-failed')
+}
+
+/**
  * The one per-state table for a lost message's recovery state (b.jg5
  * SRJ-1011, SRJ-1501): each state of `LOST_MESSAGE_STATES` arranged through
  * the harness's real inputs, with what it leaves. Only `starting-now`
@@ -340,7 +388,10 @@ export const LOST_STATE_SETUPS: Readonly<Record<LostMessageState, LostStateSetup
     pending: false,
     launches: 0,
   },
-  'kill-failed': { opts: {}, arrange: (h, key) => { h.killFailed.add(key) }, pending: false, launches: 0 },
+  // SRJ-812's old-life half, through the session manager's real query
+  // (`waitsOnKillFailedHold`, as main() binds it): P waits on a hold of its
+  // own row whose old key's kill failed (`waitOnKillFailedHold`).
+  'kill-failed': { opts: {}, arrange: (h, key) => { waitOnKillFailedHold(h, key) }, pending: false, launches: 0 },
   // E10's entry: a refusal from a tmux-touching verb starts the condition,
   // with P's retry timer armed (state 5 applies only while it is, b.jg5
   // SRJ-1011 as amended; production arms it at the same refusal).
@@ -658,8 +709,12 @@ export interface RoutingHarnessOptions {
   heldOnInvalidFlags?: readonly string[]
   /** Names whose kill failed first (`h.killFailed`, `kill-failed`). */
   killFailed?: readonly string[]
+  /** Names that wait on an old-life hold whose old key's kill failed first (`h.oldLifeKillFailed`, `kill-failed`). */
+  oldLifeKillFailed?: readonly string[]
   /** Names with a live-row sequence or old-life wait step running first (`h.sequenceOrWaitRunning`, `restarting`). */
   sequenceOrWaitRunning?: readonly string[]
+  /** Names with an old-life wait step running for a hold they wait on first (`h.waitStepRunning`: `restarting`, in flight). */
+  waitStepRunning?: readonly string[]
   /**
    * Names with work in flight that is not a launch first (`h.workInFlight`),
    * read by the routing's in-flight gate beside the harness's own launches
@@ -722,8 +777,15 @@ export interface RoutingHarness {
   invalidFlagsHold: InvalidFlagsHold
   /** Keys whose kill failed (`kill-failed`), read at call time. */
   killFailed: Set<string>
+  /** Keys that wait on an old-life hold whose old key's kill failed (`kill-failed`, b.jg5 SRJ-812), read at call time. */
+  oldLifeKillFailed: Set<string>
   /** Keys with a live-row sequence or old-life wait step running (`restarting`), read at call time. */
   sequenceOrWaitRunning: Set<string>
+  /**
+   * Keys with an old-life wait step running for a hold they wait on (b.jg5
+   * SRJ-811): `restarting` and "in flight for P", read at call time.
+   */
+  waitStepRunning: Set<string>
   /** Keys with work in flight that is not a launch, read by the in-flight gate at call time. */
   workInFlight: Set<string>
   /** Each persona's scripted row read, by key, read at call time (with the `rowRead` option). */
@@ -943,7 +1005,9 @@ export function makeRoutingHarness(
     outageNotices: [],
     invalidFlagsHold,
     killFailed: keySet(opts.killFailed),
+    oldLifeKillFailed: keySet(opts.oldLifeKillFailed),
     sequenceOrWaitRunning: keySet(opts.sequenceOrWaitRunning),
+    waitStepRunning: keySet(opts.waitStepRunning),
     workInFlight: keySet(opts.workInFlight),
     rowReadScripts: new Map(Object.entries(opts.rowRead ?? {}).map(([name, v]) => [byName(name).persona.key, toRowReadScript(v)])),
     rowReads: [],
@@ -1047,17 +1111,30 @@ export function makeRoutingHarness(
     // As main() binds it (b.jg5 SRJ-207, SRJ-1011 state 3): the one hold's
     // isHeld, read at call time.
     isHeldOnInvalidFlags: (key) => h.invalidFlagsHold.isHeld(key) === true,
-    // A case's own arrangement (production binds it to its kill-failure
-    // alerts' episode).
-    isKillFailed: (key) => h.killFailed.has(key),
-    // As main() binds it (b.jg5 SRJ-706, SRJ-1011): the session manager's
-    // running query, read at call time, or a case's own arrangement.
-    isSequenceOrWaitRunning: (key) => h.sequenceOrWaitRunning.has(key) || isLiveRowSequenceRunning(key),
-    // As main() composes "in flight for P": "blocks a retry" (a launch call
-    // or a running live-row sequence, plus the non-launch work a case marks),
-    // or a running dialog approver (b.jg5 SRJ-401).
+    // As main() composes it (b.jg5 SRJ-1011 state 4, SRJ-812): P's
+    // kill-failure episode is open (a case's own arrangement, `h.killFailed`;
+    // production binds the kill-failure alerts' episode) or P waits on an
+    // old-life hold whose old key's kill failed (the session manager's
+    // `waitsOnKillFailedHold`, as main() binds it, or the settable old-life
+    // input `h.oldLifeKillFailed`), read at call time.
+    isKillFailed: (key) => h.killFailed.has(key) || h.oldLifeKillFailed.has(key) || waitsOnKillFailedHold(key),
+    // As main() binds it (b.jg5 SRJ-706, SRJ-811, SRJ-1011): the session
+    // manager's `isSequenceOrOldLifeWaitRunning` (P's live-row sequence, or an
+    // old-life wait step for a hold P waits on), read at call time, or a
+    // case's own arrangement: `h.sequenceOrWaitRunning`, or the settable
+    // wait-step input `h.waitStepRunning`.
+    isSequenceOrWaitRunning: (key) => h.sequenceOrWaitRunning.has(key) || h.waitStepRunning.has(key) || isSequenceOrOldLifeWaitRunning(key),
+    // As main() composes "in flight for P": "blocks a retry" (the session
+    // manager's `personaRetryBlockCause`: a launch call, a running live-row
+    // sequence or an old-life wait step P waits on; the harness's own restart
+    // launches; the wait-step input; the non-launch work a case marks), or a
+    // running dialog approver (b.jg5 SRJ-401).
     isWorkInFlight: (key) =>
-      h.isLaunchInFlight(key) || isLiveRowSequenceRunning(key) || h.workInFlight.has(key) || isDialogApproverRunning(key),
+      h.isLaunchInFlight(key) ||
+      personaRetryBlockCause(key) !== undefined ||
+      h.waitStepRunning.has(key) ||
+      h.workInFlight.has(key) ||
+      isDialogApproverRunning(key),
     readRowLiveness,
     ...(opts.armRetryTimer === true
       ? {
@@ -1078,8 +1155,9 @@ export function makeRoutingHarness(
 
 /**
  * Reset the registry, restart (timers cancelled), backoff, ack-tracker and
- * outage state the harness drives: afterwards no outage flag is raised and no
- * outage state is installed.
+ * outage state the harness drives, and the session manager's old-life hold
+ * set and wait bindings a `kill-failed` arrangement installed: afterwards no
+ * outage flag is raised, no outage state is installed and no hold is held.
  */
 export function resetRoutingState(): void {
   _resetRestartState()
@@ -1087,6 +1165,8 @@ export function resetRoutingState(): void {
   _resetBackoffState()
   _resetAckTracker()
   _resetOutageState()
+  _resetOldLifeHolds()
+  _resetOldLifeWaitBindings()
 }
 
 /** Poll `cond` every 5 ms for at most `ms` (the fast restart timer fires within this). */

@@ -123,7 +123,7 @@ import {
 } from './backoff.ts'
 import type { PersonaSerialize } from './persona-serializer.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
-import { runInAttempt } from './unavailable-retry.ts'
+import { readRetryBlockCause, retryBlockSkipText, runInAttempt, type RetryBlockCause } from './unavailable-retry.ts'
 import { AD_ERROR_CLASS_CONFLICT, AD_ERROR_CLASS_UNUSABLE_NAME } from './ad-error-class.ts'
 import {
   KILL_OUTCOME_NOT_KILLED,
@@ -859,8 +859,10 @@ async function runNow<T>(_key: string, operation: () => T | Promise<T>): Promise
 /**
  * Rerun the restart path's decision for persona `key` now, for the
  * UNAVAILABLE retry timer's full mode (b.jg5 SRJ-303). `cwd` is the persona's
- * working directory; `isInFlight(key)` is the caller's in-flight check (a
- * launch call for the persona in flight).
+ * working directory; `isInFlight(key)` is the caller's in-flight check (the
+ * server's "blocks a retry": a launch call, the persona's live-row sequence,
+ * or an old-life wait step for a hold it waits on), and `blockCause(key)`,
+ * when given, names which one in the skip line (`restartRetrySkippedLine`).
  *
  * The key is active (`isRestartPendingOrActive`) while the entry runs. Its
  * work goes through the same per-persona serializer as a fired restart
@@ -891,6 +893,7 @@ export async function runRestartRetry(
   key: string,
   cwd: string,
   isInFlight: (key: string) => boolean,
+  blockCause?: (key: string) => RetryBlockCause | undefined,
 ): Promise<RestartRetryOutcome> {
   const d = deps
   if (!d) {
@@ -905,7 +908,8 @@ export async function runRestartRetry(
       // b.jg5 SRJ-207, SRJ-303: nor does a persona held on ErrInvalidFlags.
       if (skipIfHeld(d, key)) return RESTART_OUTCOME_HELD
       if (launchInFlight(key, isInFlight)) {
-        console.error(`[slack] Restart retry skipped for persona=${key} — a launch is in flight; no agent-director call`)
+        // b.jg5 SRJ-303: the skip line names what blocks the retry.
+        console.error(restartRetrySkippedLine(key, readRetryBlockCause(key, blockCause)))
         return RESTART_OUTCOME_IN_FLIGHT
       }
       if (isAtCap(key, RESTART_FAILURE_CAP)) {
@@ -917,6 +921,20 @@ export async function runRestartRetry(
   } finally {
     unmarkActive(key)
   }
+}
+
+/**
+ * The retry entry's skip line for work in flight (b.jg5 SRJ-303), naming what
+ * blocks the retry (`retryBlockSkipText`: a launch call, the persona's
+ * live-row sequence, or an old-life wait step for a hold it waits on; a
+ * launch when the cause is not known):
+ *
+ *   [slack] Restart retry skipped for persona=<key> — <a launch is in flight|its live-row sequence runs|an old-life wait step it waits on runs>; no agent-director call
+ *
+ * Pure.
+ */
+export function restartRetrySkippedLine(key: string, cause: RetryBlockCause | undefined): string {
+  return `[slack] Restart retry skipped for persona=${key} — ${retryBlockSkipText(cause)}; no agent-director call`
 }
 
 /** The retry entry's in-flight check: `isInFlight(key)`, with a throw counted as in flight (logged). */
@@ -963,6 +981,9 @@ async function runRestartWork(d: RestartDeps, key: string, cwd: string, sessionI
   if (skipIfHeld(d, key)) return RESTART_OUTCOME_HELD
   // b.jg5 SRJ-706, SRJ-303: while P's live-row sequence runs, no other launch
   // path for P starts: no liveness read, kill or launch, nothing recorded.
+  // A key outside the applied set beside the old-life wait on its own row
+  // passes this gate with nothing armed (b.jg5 SRJ-1512; main()'s
+  // `liveRowSequenceGate`), and the not-up gate below refuses it.
   if (skipIfSequenceRunning(d, key)) return RESTART_OUTCOME_SEQUENCE_WAITING
   return runInAttempt(key, 'recovery', () => restartWorkSteps(d, key, cwd, sessionId))
 }
@@ -1712,7 +1733,11 @@ function skipIfSequenceRunning(d: RestartDeps, key: string, askedAgain?: string)
  * The timer-time not-up check (b.av2 SR-6.4): when `canRestart` answers false,
  * log that the restart is skipped and the instance left as it is, and return
  * true so the caller returns before touching the persona. Records neither a
- * success nor a failure.
+ * success nor a failure. `canRestart` answers false for a key outside the
+ * applied set too (b.av2 SR-8.6): the restart path does nothing for it. Its
+ * one exception, an old-life wait's kill and find-missing steps on a retired
+ * key (b.jg5 SRJ-1512, SRJ-811), runs in the session manager's live-row
+ * sequence registry, never through this path, and never launches that key.
  */
 function skipIfNotUp(d: RestartDeps, key: string): boolean {
   if (d.canRestart(key)) return false

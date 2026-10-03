@@ -34,7 +34,14 @@
  *   - a pass budget (the start sweep's, AC 56): once one kill with it has used
  *     all its tries with an UNAVAILABLE outcome standing, every later kill
  *     with it makes one try. A kill that ends in a success, in another class,
- *     or by a read or a stop does not spend it.
+ *     or by a read or a stop does not spend it;
+ *   - an old-life wait's hold-end query (SRJ-702, SRJ-811; option A): asked
+ *     after each wait between tries, before the keep-going check and before
+ *     the read, again after a read that did not find the row finished, and
+ *     once more when a try's UNAVAILABLE outcome would stand. A hold that has
+ *     ended ends the tries as the `hold-ended` success, with no further kill
+ *     or read, as a finished read does; asked before the keep-going check,
+ *     the hold's end wins over a stop that lands in the same window.
  *
  * Survivor tracking (SRJ-702, SRJ-110, SRJ-1007): a try's `ErrTmuxKillFailed`
  * whose description names a surviving pid (`survivorPids` from
@@ -45,7 +52,8 @@
  *   - `survivor`, quoting the latest survivor-naming description, on any
  *     success end after a survivor-naming failure (a read of `ended`,
  *     `missing` or `ErrSpawnNotFound`; a later try's success, whatever its
- *     `kill_sent`; a later try's `ErrSpawnNotFound` or GONE);
+ *     `kill_sent`; a later try's `ErrSpawnNotFound` or GONE; an old-life
+ *     wait's hold's end, the try it fell in included);
  *   - `ordinary` on a failure end whose last outcome is `ErrTmuxKillFailed`,
  *     quoting its description, and on any failure end after a
  *     survivor-naming failure (a stop by a read or by the keep-going check
@@ -86,6 +94,7 @@ import {
   KILL_OUTCOME_NOT_KILLED,
   KILL_OUTCOME_ROW_FINISHED,
   KILL_ROW_FINISHED_ENDED,
+  KILL_ROW_FINISHED_HOLD_ENDED,
   KILL_ROW_FINISHED_MISSING,
   KILL_ROW_FINISHED_NO_ROW,
   describeKillOutcome,
@@ -244,6 +253,13 @@ export const KILL_RETRY_END_READ_CONFIG = 'read-config'
 export const KILL_RETRY_END_READ_LATCHED = 'read-latched'
 /** The keep-going check answered false (or the wait failed): the last try's outcome stands. */
 export const KILL_RETRY_END_STOPPED = 'stopped'
+/**
+ * An old-life wait's kill only (SRJ-702, SRJ-811; option A): its hold ended
+ * while the tries ran (`KillRetryOptions.holdEnded`), between tries or during
+ * a try whose UNAVAILABLE outcome would stand: the `row-finished` success
+ * (read `hold-ended`), never a stop.
+ */
+export const KILL_RETRY_END_HOLD_ENDED = 'hold-ended'
 
 /** How the tries ended. */
 export type KillRetryEnd =
@@ -254,6 +270,7 @@ export type KillRetryEnd =
   | typeof KILL_RETRY_END_READ_CONFIG
   | typeof KILL_RETRY_END_READ_LATCHED
   | typeof KILL_RETRY_END_STOPPED
+  | typeof KILL_RETRY_END_HOLD_ENDED
 
 /** No kill-failure alert. */
 export const KILL_RETRY_ALERT_NONE = 'none'
@@ -328,6 +345,16 @@ export interface KillRetryOptions {
   readonly keepGoing?: () => boolean
   /** The start sweep's pass budget. Absent: every live row's kill gets its tries. */
   readonly budget?: KillRetryPassBudget
+  /**
+   * An old-life wait's kill only (SRJ-702, SRJ-811; option A): whether the
+   * hold the kill serves has ended. Asked after each wait between tries
+   * (before the keep-going check and the read), after a read that did not
+   * find the row finished (before the keep-going check), and when a try's
+   * UNAVAILABLE outcome would stand; true ends the tries as the `hold-ended`
+   * success with no further kill or read. A throw counts as not ended.
+   * Absent: never asked.
+   */
+  readonly holdEnded?: () => boolean
   /** Where each line goes. A throw is ignored. */
   readonly log: (line: string) => void
   /** Each line's head, e.g. `[slack] reconcileOrphans`. */
@@ -359,6 +386,12 @@ export async function runKillRetry(options: KillRetryOptions): Promise<KillRetry
     }
     return result
   }
+  /** The `hold-ended` success when the old-life hold has ended (SRJ-702, SRJ-811; option A), with its one line. */
+  const endedByHold = (when: string): KillRetryResult | undefined => {
+    if (!holdHasEnded(options)) return undefined
+    emit(options, killRetryHoldEndedLine(options.logPrefix, options.instanceId, when))
+    return finish({ kind: KILL_OUTCOME_ROW_FINISHED, read: KILL_ROW_FINISHED_HOLD_ENDED }, KILL_RETRY_END_HOLD_ENDED)
+  }
   for (;;) {
     tries++
     const outcome = await tryOnce(options.kill)
@@ -366,12 +399,25 @@ export async function runKillRetry(options: KillRetryOptions): Promise<KillRetry
     const next = afterTry(outcome, tries, maxTries, live, budgetSpent)
     emit(options, killRetryTryLine(options.logPrefix, options.instanceId, tries, maxTries, outcome, next))
     if (next !== KILL_RETRY_NEXT_AGAIN) {
+      // SRJ-702, SRJ-811 (option A): a hold that ended during the try whose
+      // UNAVAILABLE outcome would stand, the last try included, ends the tries as a success.
+      if (isUnavailableOutcome(outcome)) {
+        const held = endedByHold(`after try ${tries}`)
+        if (held !== undefined) return held
+      }
       if (next === KILL_RETRY_NEXT_EXHAUSTED && maxTries === KILL_RETRY_TRIES) options.budget?.spend()
       return finish(outcome, endOfTryNext(next))
     }
+    let waited = true
     try {
       await waitOn(options.wait, KILL_RETRY_SPACING_MS)
     } catch {
+      waited = false
+    }
+    // SRJ-702, SRJ-811 (option A): the hold's end is asked first, so it wins over a stop in the same window.
+    const heldBeforeTry = endedByHold(`before try ${tries + 1}`)
+    if (heldBeforeTry !== undefined) return heldBeforeTry
+    if (!waited) {
       emit(options, killRetryStopLine(options.logPrefix, options.instanceId, tries + 1, 'the wait between tries failed'))
       return finish(outcome, KILL_RETRY_END_STOPPED)
     }
@@ -386,6 +432,9 @@ export async function runKillRetry(options: KillRetryOptions): Promise<KillRetry
     if (verdict.kind === KILL_RETRY_VERDICT_FINISHED) {
       return finish({ kind: KILL_OUTCOME_ROW_FINISHED, read: verdict.read }, KILL_RETRY_END_ROW_FINISHED)
     }
+    // SRJ-702, SRJ-811 (option A): a hold that ended while the read ran ends the tries as a success.
+    const heldAfterRead = endedByHold(`before try ${tries + 1}`)
+    if (heldAfterRead !== undefined) return heldAfterRead
     if (verdict.kind === KILL_RETRY_VERDICT_LATCHED) return finish(outcome, KILL_RETRY_END_READ_LATCHED)
     if (verdict.kind === KILL_RETRY_VERDICT_CONFIG_STOP) return finish(outcome, KILL_RETRY_END_READ_CONFIG)
     if (verdict.lastRead !== undefined) lastRead = verdict.lastRead
@@ -422,6 +471,21 @@ async function readOnce(read: () => Promise<KillRetryRead>): Promise<KillRetryRe
   } catch (error) {
     return { kind: KILL_RETRY_READ_FAILED, error }
   }
+}
+
+/** The old-life hold-end query; absent is false, a throw is false. */
+function holdHasEnded(options: KillRetryOptions): boolean {
+  if (options.holdEnded === undefined) return false
+  try {
+    return options.holdEnded() === true
+  } catch {
+    return false
+  }
+}
+
+/** True when `outcome` is an UNAVAILABLE non-success (`ErrTmuxKillFailed` included). */
+function isUnavailableOutcome(outcome: KillOutcome): boolean {
+  return outcome.kind === KILL_OUTCOME_NOT_KILLED && outcome.errorClass === AD_ERROR_CLASS_UNAVAILABLE
 }
 
 /** The keep-going check; absent is true, a throw is false. */
@@ -717,6 +781,17 @@ function killRetryReadLine(
  */
 function killRetryStopLine(prefix: string, instanceId: string, nextTry: number, why: string): string {
   return `${prefix}: kill tries for ${renderId(instanceId)} stop before try ${nextTry}: ${why} — no further kill; the last try's outcome stands (b.jg5 SRJ-702)`
+}
+
+/**
+ * The line when an old-life wait's hold ended while its kill's tries ran
+ * (SRJ-702, SRJ-811, SRJ-1014; option A); `when` is `before try <n>` or
+ * `after try <n>`:
+ *   `<prefix>: kill tries for <id> end <when>: the old-life hold ended (another call read the old row finished) — the tries end as a success with no further kill or status read`
+ * Never throws.
+ */
+export function killRetryHoldEndedLine(prefix: string, instanceId: string, when: string): string {
+  return `${prefix}: kill tries for ${renderId(instanceId)} end ${when}: the old-life hold ended (another call read the old row finished) — the tries end as a success with no further kill or status read (b.jg5 SRJ-702, SRJ-811)`
 }
 
 /**

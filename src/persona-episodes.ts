@@ -1359,6 +1359,13 @@ export const UNCLASSIFIED_ERROR_END_CAPPED = 'the persona reached the restart ca
  */
 export const UNCLASSIFIED_ERROR_END_LATCHED = 'the persona latched'
 
+/**
+ * End reason: the old-life hold on the row ended (b.jg5 SRJ-313, SRJ-811):
+ * an old-life wait's episode, keyed by the held instance id, ends with its
+ * hold, and with nothing else.
+ */
+export const UNCLASSIFIED_ERROR_END_HOLD_ENDED = 'its old-life hold ended'
+
 /** Why an unclassified-error episode ended. */
 export type UnclassifiedErrorEndReason =
   | typeof UNCLASSIFIED_ERROR_END_RECOVERED
@@ -1367,6 +1374,7 @@ export type UnclassifiedErrorEndReason =
   | typeof UNCLASSIFIED_ERROR_END_ROW_GONE
   | typeof UNCLASSIFIED_ERROR_END_CAPPED
   | typeof UNCLASSIFIED_ERROR_END_LATCHED
+  | typeof UNCLASSIFIED_ERROR_END_HOLD_ENDED
 
 /** What the alert quotes: the classifier's reported name (a safe identifier) and rendered message. */
 export type UnclassifiedErrorQuote = Pick<AdErrorClassification, 'reportedName' | 'message'>
@@ -1643,7 +1651,7 @@ const KILL_FAILURE_STOPPED_SUBJECT = "stopped retry's log line (no alert text)"
 export const KILL_FAILURE_STOP_CAUSE_DEFAULT = 'the persona is not up or is torn down, or the server is shutting down'
 
 /** What the stopped-retry line and entry are built from (`killFailureStoppedRetryText`). */
-export type KillFailureStoppedRetryInput = Pick<KillFailureRaiseInput, 'key' | 'decision' | 'context' | 'lastOutcomeClass' | 'stopCause'>
+export type KillFailureStoppedRetryInput = Pick<KillFailureRaiseInput, 'key' | 'decision' | 'context' | 'lastOutcomeClass' | 'stopCause' | 'ref'>
 
 /**
  * The one line, and the entry text, of an ordinary kill-failure decision
@@ -1651,10 +1659,11 @@ export type KillFailureStoppedRetryInput = Pick<KillFailureRaiseInput, 'key' | '
  * persona, the stop's cause (`KILL_FAILURE_STOP_CAUSE_DEFAULT` when none is
  * given), the last outcome's class when given, the redacted descriptions and
  * the context; the entry (written only for a persona no longer configured,
- * as `persona-kill-failed`) carries the same content with no alert text:
+ * as `persona-kill-failed`) carries the same content with no alert text,
+ * naming the entry reference (`ref`; `persona=<key>` when absent):
  *
  *   line:  [slack] persona-episodes: persona=<key> kill-failure ordinary alert not raised — its tries were stopped (<cause>)[; its last outcome's class: <class>], so nothing retries this kill; <descriptions> (<context>)
- *   entry: persona=<key> (<context>): the kill-failure ordinary alert not raised — its tries were stopped (<cause>)[; its last outcome's class: <class>], so nothing retries this kill; <descriptions>
+ *   entry: <ref> (<context>): the kill-failure ordinary alert not raised — its tries were stopped (<cause>)[; its last outcome's class: <class>], so nothing retries this kill; <descriptions>
  *
  * Pure; never throws for a well-formed decision.
  */
@@ -1667,7 +1676,7 @@ export function killFailureStoppedRetryText(input: KillFailureStoppedRetryInput)
     `so nothing retries this kill; ${describeKillFailureDescriptions(input.decision)}`
   return {
     line: `[slack] persona-episodes: persona=${key} ${PERSONA_EPISODE_KIND_KILL_FAILURE} ${what} (${context})`,
-    entry: killFailureAlertEntryText(`persona=${key}`, context, `the ${PERSONA_EPISODE_KIND_KILL_FAILURE} ${what}`),
+    entry: killFailureAlertEntryText(entryRefOf(input), context, `the ${PERSONA_EPISODE_KIND_KILL_FAILURE} ${what}`),
   }
 }
 
@@ -1719,8 +1728,8 @@ export interface KillFailureRaiseInput {
    * (`lastOutcomeClass`), the stop's cause (`stopCause`) and the redacted
    * descriptions, the latest survivor-naming one included. For a persona no
    * longer in the applied configuration (or an old-life wait's old key) that
-   * line's content is also written as one `persona-kill-failed` entry, with
-   * no alert text; a configured persona's stop writes the line only.
+   * line's content is also written as one `persona-kill-failed` entry naming
+   * `ref`, with no alert text; a configured persona's stop writes the line only.
    */
   readonly stopped?: boolean
   /**
@@ -1735,6 +1744,21 @@ export interface KillFailureRaiseInput {
   readonly session?: string
   /** The row's instance id; `cscb_<key>` when absent. */
   readonly instanceId?: string
+  /**
+   * The persona reference or the row's id a log-only entry names (b.jg5
+   * SRJ-1007, SRJ-1013), as `killFailureAlertEntryText` takes it:
+   * `persona=<key>` when absent. An old-life wait gives its own reference
+   * (`oldLifeWaitRef`, `src/old-life-wait.ts`): `persona=<old key>` for a
+   * `cscb_<old key>` row, `instanceId=<id>` for an id standing in for the
+   * old key (a pre-persona or wrong-id row). The `[slack] persona-episodes:`
+   * lines name `persona=<key>` whatever it is.
+   */
+  readonly ref?: string
+}
+
+/** The reference a log-only entry names (`KillFailureRaiseInput.ref`; `persona=<key>` when absent). */
+function entryRefOf(input: Pick<KillFailureRaiseInput, 'key' | 'ref'>): string {
+  return input.ref ?? `persona=${input.key}`
 }
 
 /** Dependencies of `createKillFailureAlerts`. */
@@ -1753,7 +1777,8 @@ export interface KillFailureAlertsDeps {
    * The log-only route (production: `recordStartupError(classLabel, entry)`,
    * which writes the server-log line and the startup-errors entry). Given
    * the route's class and the entry (`killFailureAlertEntryText`: the
-   * persona reference, the context and the unescaped text). Never posts to
+   * persona reference or the row's id, `KillFailureRaiseInput.ref`, the
+   * context and the unescaped text). Never posts to
    * Slack. Absent: one line says the alert had no route.
    */
   logOnly?: (classLabel: string, entry: string) => void
@@ -1952,12 +1977,14 @@ export function createKillFailureAlerts(deps: KillFailureAlertsDeps): KillFailur
     const route = selectKillFailureAlertRoute({ version, context, configured: configured(key), latched: input.latched === true })
     if (!route.destination) {
       const text = killFailureAlertText(content, route.closing, false)
-      // b.jg5 SRJ-1013: a persona-teardown-notice entry names the persona and
-      // "raised during its teardown" (only the key is known here).
+      // b.jg5 SRJ-1007, SRJ-1013: the entry names the persona reference or
+      // the row's id (`ref`); a persona-teardown-notice entry also says
+      // "raised during its teardown".
+      const ref = entryRefOf(input)
       const entry =
         route.classLabel === PERSONA_TEARDOWN_NOTICE_LABEL
-          ? personaTeardownNoticeEntryText(`persona=${key}`, text)
-          : killFailureAlertEntryText(`persona=${key}`, context, text)
+          ? personaTeardownNoticeEntryText(ref, text)
+          : killFailureAlertEntryText(ref, context, text)
       return writeLogOnly(key, version, route.classLabel, entry, route.route) ? 'logged' : 'not-routed'
     }
     const text = killFailureAlertText(content, route.closing, true)

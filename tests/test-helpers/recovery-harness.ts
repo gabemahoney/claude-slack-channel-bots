@@ -22,8 +22,11 @@
  *   latched query (`latch` below), the hold's held query (`invalidFlagsHold`
  *   below) and "blocks a retry" (as `main()`'s
  *   `isPersonaRetryBlocked`, b.jg5 SRJ-303: the session manager's
- *   `isLaunchInFlight` or its `isLiveRowSequenceRunning`, SRJ-706; a running
- *   dialog approver alone never skips a retry, SRJ-401), and the condition's
+ *   `personaRetryBlockCause` names a cause, `isLaunchInFlight`, its
+ *   `isLiveRowSequenceRunning`, SRJ-706, or an old-life wait step for a hold
+ *   the persona waits on, SRJ-811; a running dialog approver alone never
+ *   skips a retry, SRJ-401), with that cause query as `retryBlockCause` (the
+ *   skip's again-reason and the restart retry's skip line), and the condition's
  *   retry hooks: the
  *   connection and stream probes (`isSessionConnected` and
  *   `hasSessionStream`, both over `setConnected`) and `endTmuxUnresponsive`,
@@ -72,9 +75,12 @@
  *   below). `isHeld` is the hold's held query (`invalidFlagsHold` below;
  *   b.jg5 SRJ-207), so the restart work answers `held` with no call for a
  *   held persona and arms no restart timer for it.
- *   `isLiveRowSequenceRunning` is the session manager's running
- *   query (b.jg5 SRJ-706, SRJ-303), so the restart work answers
- *   `sequence-waiting` with no call while the persona's sequence runs.
+ *   `isLiveRowSequenceRunning` is the session manager's gate
+ *   (`liveRowSequenceGate(key, 'runRestartWork')`, b.jg5 SRJ-706, SRJ-303,
+ *   SRJ-811), as `main()` binds it, so the restart work answers
+ *   `sequence-waiting` with no call while the persona's sequence runs, and
+ *   while an old-life wait runs on its own `cscb_<key>` the gate also arms
+ *   its timer (`held-for-old-life`, through the wait bindings' arm).
  *   `slowRecovery`, the slow-recovery observer, is the harness's
  *   slow-recovery tracker (below), as `main()` binds it (b.jg5 SRJ-610).
  *   `options.restartDeps` replaces any of these. Every ask of the
@@ -368,6 +374,34 @@
  *   with `drive`, its shutdown query the harness's shutting-down flag
  *   (`shutdown()`) as `main()` binds it unless the case passes another; its
  *   rows are the stub's `list` answer (`script({ listResult })`).
+ * - The old-life wait (b.jg5 SRJ-811, SRJ-812, SRJ-1512), composed as
+ *   `main()` composes it: the registry below takes `runOutsideAttempt`
+ *   (`runOutsideAttempts`), so a wait runs outside every attempt, and the
+ *   wait's bindings (`setOldLifeWaitBindings`) are installed right after the
+ *   kill-failure alerts: each waiting persona's arm through the trigger sink
+ *   (in `triggers`, kind `held-for-old-life`, then armed on the controller),
+ *   the sequence clock (its waits and its kill's waits between tries are
+ *   sequence timers, so `driveSequence` moves the clock to them), `lines` as
+ *   its sequence log, the live applied set, the harness's kill-failure
+ *   alerts, the startup-errors recorder over `stateDir`, and the wait's own
+ *   unclassified-error episodes (`createOldLifeWaitUnclassifiedErrors`, on
+ *   the harness clock at E6's alert threshold in effect, keyed by the held
+ *   instance id; their lines to `errors`, their alert the log-only
+ *   `persona-unclassified-error` entry in `startupErrors()`; read with
+ *   `oldLifeWaitUnclassifiedOpen(id)`; closed by `shutdown()` and
+ *   `cleanup()`). The wait's own end lines and kill-try lines go to
+ *   `console.error` (`errors`).
+ *   `startOldLifeWait(id)` starts the wait on a held id through the session
+ *   manager's ensure entry (`ensureOldLifeWait`), throwing unless it
+ *   answered `started`, and answers the outcome promise (its end handler has
+ *   run once it resolves); `runOldLifeWait(id)` starts one and drives it to
+ *   its end; `oldLifeWaitRunning(id)` is the registry's no-launch query and
+ *   `oldLifeWaitSettled(id)` its settle query by instance id
+ *   (`_whenSettledOn`), both read-only. A case holds the wait at a run with
+ *   the stub's `holdFindMissing`, as for a sequence. The waiting personas are
+ *   computed from the applied configuration (a persona whose working
+ *   directory is the held directory, and the persona whose own `cscb_<key>`
+ *   is held). `shutdown()`'s close stops every wait.
  * - `tickEnd(key)`: what a health tick's healthy branch does to the
  *   condition, as `main()` binds `HealthCheckDeps.endTmuxUnresponsive`: the
  *   condition's end with reason `TMUX_UNRESPONSIVE_END_TICK` and the `live`
@@ -556,15 +590,19 @@
  *   flag raised, no timer armed, below the restart cap, not latched and
  *   nothing in flight arms its timer before the state is decided, and so
  *   reports `not-answering`, with no restart asked for.
- *   Its `isKillFailed` (b.jg5 SRJ-1011 state 4) is bound as `main()` binds
- *   it: the harness's kill-failure alerts' "episode open" query
- *   (`killFailureOpen`, below), read at call time, so a message lost while
- *   P's kill-failure episode is open reports `kill-failed`.
- *   Its `isSequenceOrWaitRunning` (b.jg5 SRJ-706, SRJ-1011) is the session
- *   manager's running query, read at call time as `main()` binds it, so a
- *   message lost while P's live-row sequence runs reports `restarting`, and
- *   since the sequence is in "in flight for P" no row read is made; state
- *   6's `isLaunchOrApproverRunning` does not include it.
+ *   Its `isKillFailed` (b.jg5 SRJ-1011 state 4, SRJ-812) is bound as
+ *   `main()` binds it: the harness's kill-failure alerts' "episode open"
+ *   query (`killFailureOpen`, below) or the session manager's
+ *   `waitsOnKillFailedHold` (P waits on an old-life hold marked kill-failed),
+ *   read at call time, so a message lost while P's kill-failure episode is
+ *   open, or while P waits on a hold whose old key's kill failed, reports
+ *   `kill-failed`.
+ *   Its `isSequenceOrWaitRunning` (b.jg5 SRJ-706, SRJ-811, SRJ-1011) is the
+ *   session manager's `isSequenceOrOldLifeWaitRunning`, read at call time as
+ *   `main()` binds it, so a message lost while P's live-row sequence, or an
+ *   old-life wait step for a hold P waits on, runs reports `restarting`, and
+ *   since either is in "in flight for P" no row read is made; state 6's
+ *   `isLaunchOrApproverRunning` does not include them.
  *   Its `isHeldOnInvalidFlags` (b.jg5 SRJ-1011 state 3, SRJ-207) is the
  *   harness's hold's held query, read at call time as `main()` binds it, so
  *   a message lost while P is held reports `cannot-launch`.
@@ -649,14 +687,17 @@
  *   findMissing memo, the tmux seams, the settings install, the version
  *   re-check's install when `recheckAnswers` or `versionRecheck` made one
  *   (disposed first, before the pending timers are counted), the sequence
- *   registry's install (`_resetLiveRowSequenceRegistry`), `SLACK_STATE_DIR`) and
+ *   registry's install (`_resetLiveRowSequenceRegistry`), the old-life wait
+ *   bindings (`_resetOldLifeWaitBindings`), `SLACK_STATE_DIR`) and
  *   removes the temporary directory. The registry is closed (every live-row
- *   sequence still running stopped with the shutdown reason) after the
- *   pending timers and the running sequences are counted. It
+ *   sequence and old-life wait still running stopped with the shutdown
+ *   reason) after the pending timers, the running sequences and the running
+ *   waits are counted. It
  *   throws, after undoing everything, when a timer is still pending on the
- *   clock (a sequence timer included, which the message counts apart), a
- *   live-row sequence still runs (a case settles every sequence it starts,
- *   releasing any call it holds), or a
+ *   clock (a sequence or wait timer included, which the message counts
+ *   apart), a live-row sequence or an old-life wait still runs (a case
+ *   settles every sequence and wait it starts, releasing any call it
+ *   holds), or a
  *   persona is still armed: the episodes run on the harness clock, so a timer
  *   they armed and left pending fails it too.
  *
@@ -841,6 +882,7 @@ import {
   type LiveRowSequenceDeps,
   type LiveRowSequenceEntryStep,
   type LiveRowSequenceOutcome,
+  type LiveRowSequenceRegistry,
   type LiveRowSequenceRequest,
   type LiveRowSequenceStopReason,
   type RetiredKeyAttemptStart,
@@ -868,6 +910,8 @@ import {
   _resetConfiguredPersonaQuery,
   _resetDialogApprovers,
   _resetOldLifeHolds,
+  _resetOldLifeWaitBindings,
+  createOldLifeWaitUnclassifiedErrors,
   _resetRetiredKeyStore,
   _resetFindMissingMemo,
   _resetInvalidFlagsHold,
@@ -877,12 +921,16 @@ import {
   _whenDialogApproverStopped,
   buildLiveRowSequenceDeps,
   cancelWorkingRowWait,
+  ensureOldLifeWait,
   isDialogApproverRunning,
   isLaunchInFlight,
   isLiveRowSequenceRunning,
+  isSequenceOrOldLifeWaitRunning,
   killPersonaInstanceForTeardown,
   launchSession,
+  liveRowSequenceGate,
   notifyRestartCapReached,
+  personaRetryBlockCause,
   readPersonaRowState,
   reconcileOrphans,
   setConfiguredPersonaQuery,
@@ -891,6 +939,7 @@ import {
   setKillFailureAlerts,
   setLiveRowSequenceRegistry,
   setOldLifeHolds,
+  setOldLifeWaitBindings,
   setPersonaKillKeepGoingQuery,
   setRetiredKeyStore,
   setSessionNotifier,
@@ -899,6 +948,7 @@ import {
   stopAllDialogApprovers,
   stopDialogApprover,
   stopLiveRowSequence,
+  waitsOnKillFailedHold,
   whenLaunchSettled,
   type ApproverClock,
   type ApproverOutcome,
@@ -928,6 +978,7 @@ import {
   createFullModeRetryAction,
   createUnavailableRetryController,
   runDetachedRecoveryAttempt,
+  runOutsideAttempts,
   UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
   UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
@@ -1429,6 +1480,27 @@ export interface RecoveryHarness {
   /** Await `work` while moving the clock to each pending live-row sequence timer as it is set; see the module comment. */
   driveSequence<T>(work: Promise<T>): Promise<T>
   /**
+   * Start the old-life wait on held instance id `instanceId` through the
+   * session manager's ensure entry (`ensureOldLifeWait`, b.jg5 SRJ-811),
+   * resolving at once, before its first call; throws unless the entry
+   * answered `started`. Answers the outcome promise (the registry's
+   * `_whenSettledOn`), which resolves once the wait has settled and its end
+   * handler has run.
+   */
+  startOldLifeWait(instanceId: string): Promise<LiveRowSequenceOutcome>
+  /** Start the old-life wait on `instanceId` (`startOldLifeWait`) and drive it to its end (`driveSequence`). */
+  runOldLifeWait(instanceId: string): Promise<LiveRowSequenceOutcome>
+  /** Whether an old-life wait runs on `instanceId` (read-only; the registry's `isNoLaunchRunning`). */
+  oldLifeWaitRunning(instanceId: string): boolean
+  /** Whether the old-life wait's unclassified-error episode on held instance id `instanceId` is open (read-only; b.jg5 SRJ-313, SRJ-811). */
+  oldLifeWaitUnclassifiedOpen(instanceId: string): boolean
+  /**
+   * The registry's test-only settle query by instance id (`_whenSettledOn`):
+   * the running wait's outcome once it settles (its end handler run), else
+   * the last one's on `instanceId`; starts and stops nothing.
+   */
+  oldLifeWaitSettled(instanceId: string): Promise<LiveRowSequenceOutcome | undefined>
+  /**
    * Install agent-director's version re-check with its binary resolve
    * answering `version`; answers the resolves it made and the exit codes its
    * stop was asked for. See the module comment.
@@ -1552,14 +1624,17 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   const canRelaunch = createPersonaRelaunchGate({ status: () => SERVING }, log, upQuery)
 
   // As main()'s two in-flight bindings. "Blocks a retry"
-  // (`isPersonaRetryBlocked`, b.jg5 SRJ-303): a launch call
-  // (`isLaunchInFlight`) or a running live-row sequence
-  // (`isLiveRowSequenceRunning`, SRJ-706), never a running dialog approver
-  // (SRJ-401); the full-mode retry action receives it. "In flight for P"
-  // (`isPersonaWorkInFlight`, SRJ-315, SRJ-1011), built from it: that, or a
-  // running dialog approver (`isDialogApproverRunning`); the driver's read
-  // gate and its `tmux-unavailable` retry check receive it.
-  const isPersonaRetryBlocked = (key: string): boolean => isLaunchInFlight(key) || isLiveRowSequenceRunning(key)
+  // (`isPersonaRetryBlocked`, b.jg5 SRJ-303): exactly when the session
+  // manager's `personaRetryBlockCause` names a cause: a launch call
+  // (`isLaunchInFlight`), a running live-row sequence
+  // (`isLiveRowSequenceRunning`, SRJ-706) or an old-life wait step for a
+  // hold P waits on (`isOldLifeWaitRunningFor`, SRJ-811), never a running
+  // dialog approver (SRJ-401); the full-mode retry action receives it, with
+  // the cause query. "In flight for P" (`isPersonaWorkInFlight`, SRJ-315,
+  // SRJ-1011), built from it: that, or a running dialog approver
+  // (`isDialogApproverRunning`); the driver's read gate and its
+  // `tmux-unavailable` retry check receive it.
+  const isPersonaRetryBlocked = (key: string): boolean => personaRetryBlockCause(key) !== undefined
   const isPersonaWorkInFlight = (key: string): boolean => isPersonaRetryBlocked(key) || isDialogApproverRunning(key)
 
   const queued = new Map<string, UnavailableRetryOutcome[]>()
@@ -1578,8 +1653,10 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     // of a persona held on ErrInvalidFlags.
     isHeld: (key) => invalidFlagsHold.isHeld(key),
     // As main() binds it (b.jg5 SRJ-303): only work that blocks a retry
-    // skips it; a running dialog approver alone never does (SRJ-401).
+    // skips it; a running dialog approver alone never does (SRJ-401). The
+    // skip's again-reason and the restart retry's skip line name the cause.
     isInFlight: isPersonaRetryBlocked,
+    retryBlockCause: personaRetryBlockCause,
     isSessionConnected: (key) => connected.has(key),
     hasSessionStream: (key) => connected.has(key),
     endTmuxUnresponsive: (key, reading) => {
@@ -1852,11 +1929,29 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     log,
     appliedConfig,
   })
-  // As main() builds it (b.jg5 SRJ-706): the one registry over those
-  // dependencies, each sequence in its own recovery attempt detached from its
-  // starter's (`runDetachedRecoveryAttempt`); installed below, after the
-  // latch. Cleanup closes and removes it.
-  const sequences = createLiveRowSequenceRegistry({ deps: sequenceDeps, runAttempt: runDetachedRecoveryAttempt })
+  // As main() builds it (b.jg5 SRJ-706, SRJ-811): the one registry over those
+  // dependencies, each sequence that ends in a launch in its own recovery
+  // attempt detached from its starter's (`runDetachedRecoveryAttempt`), each
+  // old-life wait outside every attempt (`runOutsideAttempts`); installed
+  // below, after the latch. Its start is wrapped only to record the instance
+  // id of every no-launch request (an old-life wait), so `cleanup()` can tell
+  // a wait still running; everything else is the registry's own. Cleanup
+  // closes and removes it.
+  const registry = createLiveRowSequenceRegistry({
+    deps: sequenceDeps,
+    runAttempt: runDetachedRecoveryAttempt,
+    runOutsideAttempt: (run) => runOutsideAttempts(run),
+  })
+  const waitIds = new Set<string>()
+  const sequences: LiveRowSequenceRegistry = {
+    ...registry,
+    start(request, startOptions) {
+      if (request.launches === false) waitIds.add(request.instanceId)
+      return registry.start(request, startOptions)
+    },
+  }
+  /** The instance ids an old-life wait still runs on. */
+  const waitsRunning = (): string[] => [...waitIds].filter((id) => sequences.isNoLaunchRunning(id))
   // Set by `recheckAnswers`; cleanup removes the install it made.
   let recheckInstalled = false
   _resetOutageState()
@@ -1907,6 +2002,39 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   // the restart path's kill and the live-row sequence's kills raise through
   // them, and the session manager's own-row reads end a persona's episode.
   setKillFailureAlerts(killFailureAlerts)
+  // As main() installs them with the registry (b.jg5 SRJ-811, SRJ-812,
+  // SRJ-1512): the old-life wait's bindings. Each waiting persona's timer is
+  // armed through the trigger sink (recorded in `triggers`, then armed on the
+  // controller; main() hands the controller itself), never the old key's; the
+  // wait's waits are sequence timers (`driveSequence` moves the clock to
+  // them); its sequence lines go to `lines`; the applied configuration is the
+  // live applied set; the alerts are the harness's kill-failure alerts, whose
+  // log-only route writes the harness's `startup-errors.log`, and the
+  // startup-errors recorder writes there too (the `persona-teardown-notice`
+  // entries "during the wait" and the old key's unclassified entry). A wait
+  // starts only through the session manager's entry (`ensureOldLifeWait`,
+  // `startOldLifeWait`); a hold's end and `shutdown()`'s close stop it. The
+  // wait's own unclassified-error episodes (b.jg5 SRJ-313), built as main()
+  // builds them, on the harness clock: keyed by the held instance id, at E6's
+  // alert threshold in effect, their lines to `console.error` (`errors`),
+  // their one alert per episode the log-only `persona-unclassified-error`
+  // entry in the harness's `startup-errors.log`; `shutdown()` and
+  // `cleanup()` close them.
+  const waitUnclassifiedErrors = createOldLifeWaitUnclassifiedErrors({
+    log: (line) => console.error(line),
+    alertThresholdMs: adAlertThresholdMsInEffect,
+    recordStartupError: (classLabel, entry) => recordStartupError(classLabel, entry),
+    clock,
+  })
+  setOldLifeWaitBindings({
+    retryArm: triggerSink,
+    clock: sequenceClock,
+    log,
+    appliedConfig,
+    killFailureAlerts,
+    recordStartupError: (classLabel, entry) => recordStartupError(classLabel, entry),
+    unclassifiedErrorEpisodes: waitUnclassifiedErrors,
+  })
   // As main() installs it (b.jg5 SRJ-702, SRJ-305): a kill's tries stop once
   // the persona is not up (the up predicate over the relaunch gate's
   // connection, bring-up outcome and live applied set) or the server is
@@ -1965,9 +2093,11 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     isLatched: (key) => latch.isLatched(key),
     // As main() binds it (b.jg5 SRJ-207, SRJ-303): nor does a held persona's.
     isHeld: (key) => invalidFlagsHold.isHeld(key),
-    // As main() binds it (b.jg5 SRJ-706, SRJ-303): while the persona's
-    // live-row sequence runs, its restart work makes no agent-director call.
-    isLiveRowSequenceRunning,
+    // As main() binds it (b.jg5 SRJ-706, SRJ-303, SRJ-811): while the
+    // persona's live-row sequence runs, its restart work makes no
+    // agent-director call; when what runs on its own row is an old-life
+    // wait, the gate also arms its retry timer (`held-for-old-life`).
+    isLiveRowSequenceRunning: (key) => liveRowSequenceGate(key, 'runRestartWork'),
     // As main() binds it (b.jg5 SRJ-610): each run's readings and verdicts
     // feed the slow-recovery tracker.
     slowRecovery,
@@ -2235,6 +2365,18 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     return { outcome, stop: (reason) => stopLiveRowSequence(key, reason) }
   }
 
+  /** Start the old-life wait on `instanceId` through the session manager's ensure entry; throws unless it started. */
+  function startOldLifeWait(instanceId: string): Promise<LiveRowSequenceOutcome> {
+    const answer = ensureOldLifeWait(instanceId)
+    if (answer !== LIVE_ROW_START_STARTED) {
+      throw new Error(`recovery harness: the ensure entry answered ${answer} for ${instanceId}, not ${LIVE_ROW_START_STARTED}`)
+    }
+    return sequences._whenSettledOn(instanceId).then((settled) => {
+      if (settled === undefined) throw new Error(`recovery harness: the old-life wait on ${instanceId} settled with no outcome`)
+      return settled
+    })
+  }
+
   function startupErrors(): string[] {
     const path = join(stateDir, 'startup-errors.log')
     if (!existsSync(path)) return []
@@ -2313,12 +2455,14 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       // read is the harness's liveness adapter, so it shows as a stub `status`.
       isWorkInFlight: isPersonaWorkInFlight,
       readRowLiveness: isSessionAliveAdapter,
-      // As main() binds it (b.jg5 SRJ-706, SRJ-1011): while P's live-row
-      // sequence runs, the message reports `restarting`, read at call time.
-      isSequenceOrWaitRunning: (key) => isLiveRowSequenceRunning(key),
-      // As main() binds it (b.jg5 SRJ-1011 state 4): P's kill-failure
-      // episode is open, read at call time from the harness's alerts.
-      isKillFailed: (key) => killFailureAlerts.isOpen(key) === true,
+      // As main() binds it (b.jg5 SRJ-706, SRJ-811, SRJ-1011): while P's
+      // live-row sequence, or an old-life wait step for a hold P waits on,
+      // runs, the message reports `restarting`, read at call time.
+      isSequenceOrWaitRunning: (key) => isSequenceOrOldLifeWaitRunning(key),
+      // As main() binds it (b.jg5 SRJ-1011 state 4, SRJ-812): P's
+      // kill-failure episode is open, read at call time from the harness's
+      // alerts, or P waits on an old-life hold marked kill-failed.
+      isKillFailed: (key) => killFailureAlerts.isOpen(key) === true || waitsOnKillFailedHold(key),
       // As main() binds it (b.jg5 SRJ-1011 state 3, SRJ-207): P is held on
       // ErrInvalidFlags, read at call time from the harness's hold.
       isHeldOnInvalidFlags: (key) => invalidFlagsHold.isHeld(key) === true,
@@ -2525,6 +2669,15 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
     driveSequence,
 
+    startOldLifeWait,
+
+    runOldLifeWait: (instanceId) => driveSequence(startOldLifeWait(instanceId)),
+
+    oldLifeWaitRunning: (instanceId) => sequences.isNoLaunchRunning(instanceId),
+    oldLifeWaitUnclassifiedOpen: (instanceId) => waitUnclassifiedErrors.isOpen(instanceId),
+
+    oldLifeWaitSettled: (instanceId) => sequences._whenSettledOn(instanceId),
+
     settle: settleLaunches,
 
     approverRunning: (key) => isDialogApproverRunning(key),
@@ -2566,6 +2719,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       void sequences.close()
       controller.close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
       episodes.close()
+      waitUnclassifiedErrors.close()
       // As main()'s shutdown (b.jg5 SRJ-404): every approver is marked and
       // woken now, not awaited; none starts after it.
       void stopAllDialogApprovers()
@@ -2669,6 +2823,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       approverTimers.clear()
       controller.stopAll('the recovery harness is cleaned up')
       episodes.forgetAll()
+      waitUnclassifiedErrors.close()
       lostMessageDriver?.hold.cancelAll()
       lostMessageDriver = undefined
       // The version re-check first, so its own timer is not counted as left
@@ -2679,9 +2834,11 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       const sequenceTimersPending = sequenceTimers.size
       const armed = controller.armedKeys()
       const sequencesRunning = keys.filter((key) => sequences.isRunning(key))
-      // A sequence still running is stopped, so it makes no call after this.
+      const oldLifeWaitsRunning = waitsRunning()
+      // A sequence or wait still running is stopped, so it makes no call after this.
       void sequences.close()
       _resetLiveRowSequenceRegistry()
+      _resetOldLifeWaitBindings()
       _resetRestartState()
       _resetBackoffState()
       _resetOutageState()
@@ -2702,9 +2859,9 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       if (savedStateDir === undefined) delete process.env['SLACK_STATE_DIR']
       else process.env['SLACK_STATE_DIR'] = savedStateDir
       rmSync(root, { recursive: true, force: true })
-      if (pendingTimers !== 0 || armed.length !== 0 || sequencesRunning.length !== 0) {
+      if (pendingTimers !== 0 || armed.length !== 0 || sequencesRunning.length !== 0 || oldLifeWaitsRunning.length !== 0) {
         throw new Error(
-          `recovery harness: ${pendingTimers} timer(s) still pending (${sequenceTimersPending} of them live-row sequence timers), ${armed.length} persona(s) still armed after stopAll, and live-row sequences still running for ${JSON.stringify(sequencesRunning)} at cleanup`,
+          `recovery harness: ${pendingTimers} timer(s) still pending (${sequenceTimersPending} of them live-row sequence or old-life wait timers), ${armed.length} persona(s) still armed after stopAll, live-row sequences still running for ${JSON.stringify(sequencesRunning)} and old-life waits still running on ${JSON.stringify(oldLifeWaitsRunning)} at cleanup`,
         )
       }
     },
@@ -2865,10 +3022,13 @@ export function recordSequenceStarts(): LiveRowSequenceRequest[] {
       return LIVE_ROW_START_STARTED
     },
     stop: async () => false,
+    stopNoLaunch: async () => false,
     stopAll: async () => {},
     close: async () => {},
     isRunning: () => false,
+    isNoLaunchRunning: () => false,
     _whenSettled: async () => undefined,
+    _whenSettledOn: async () => undefined,
   })
   return starts
 }

@@ -167,11 +167,12 @@
  *   only `tmux-unavailable` clear (every other clear there is
  *   `ad-unreachable`). These are the only two `conditionEnded` reports in
  *   server.ts.
- * - b.jg5 SRJ-303 / SRJ-315 / SRJ-401 / SRJ-706: two named in-flight
- *   bindings, each a module-scope function declared once: "blocks a retry"
- *   is the session manager's `isLaunchInFlight` or its
- *   `isLiveRowSequenceRunning` and is the full-mode retry action's
- *   `isInFlight` (a running dialog approver never skips a retry); "in flight
+ * - b.jg5 SRJ-303 / SRJ-315 / SRJ-401 / SRJ-706 / SRJ-811: two named
+ *   in-flight bindings, each a module-scope function declared once: "blocks
+ *   a retry" is the session manager's `personaRetryBlockCause` answering a
+ *   cause (a launch call, a live-row sequence or an old-life wait step) and
+ *   is the full-mode retry action's `isInFlight`, beside that cause query as
+ *   its `retryBlockCause` (a running dialog approver never skips a retry); "in flight
  *   for P" is built from it and the session manager's
  *   `isDialogApproverRunning`, and is the health check's `isLaunchInFlight`,
  *   the persona routing's read-gate member `isWorkInFlight` (b.jg5 SRJ-1011)
@@ -186,15 +187,28 @@
  * - b.jg5 SRJ-706 / SRJ-303: the one live-row sequence registry is built
  *   once in main()'s own statement list over the session manager's
  *   dependency builder (the retry controller's arm, the system clock, the
- *   server log, the applied configuration at call time) and production's
- *   detached attempt runner, installed once (`setLiveRowSequenceRegistry`)
- *   after the latch and before the restart module and the start pass, and
- *   held in one module-scope holder that `shutdown()` closes once, after the
- *   shutting-down flag, before the retry controller closes, before it first
- *   yields and before `closeClient()`; the restart work's running query and
- *   the persona routing's sequence/wait member are the session manager's
- *   `isLiveRowSequenceRunning`. (The teardown's sequence stop is pinned in
- *   tests/reload-wiring.test.ts.)
+ *   server log, the applied configuration at call time), production's
+ *   detached attempt runner and its outside-every-attempt runner
+ *   (`runOutsideAttempts`, b.jg5 SRJ-1512), installed once
+ *   (`setLiveRowSequenceRegistry`) after the latch and before the restart
+ *   module and the start pass, and held in one module-scope holder that
+ *   `shutdown()` closes once, after the shutting-down flag, before the retry
+ *   controller closes, before it first yields and before `closeClient()`; the
+ *   restart work's running query is the session manager's gate
+ *   (`liveRowSequenceGate`, which also arms a persona whose own row carries
+ *   an old-life wait, b.jg5 SRJ-811), and server.ts asks the bare
+ *   `isLiveRowSequenceRunning` nowhere. (The teardown's sequence stop is
+ *   pinned in tests/reload-wiring.test.ts.)
+ * - b.jg5 SRJ-811 / SRJ-812 / SRJ-1512: the old-life wait's bindings are
+ *   installed once (`setOldLifeWaitBindings`), in main()'s own statement
+ *   list, after the registry's install and before the restart module, the
+ *   start sweep, the start pass and the health check, with exactly the one
+ *   retry controller, the system clock, the server log, the applied
+ *   configuration at call time, the one kill-failure alerts instance, one
+ *   `recordStartupError(<class>, <entry>)` and the wait's own
+ *   unclassified-error episodes (`createOldLifeWaitUnclassifiedErrors`, built
+ *   once in main() with the alert threshold in effect, and closed once by
+ *   `shutdown()` through its module-scope holder; b.jg5 SRJ-313).
  * - b.jg5 SRJ-501 / SRJ-508: the one per-persona latch is built once,
  *   imported from the latch module, in main()'s own statement list, after the
  *   notice episodes and before the retry controller and the start pass, with
@@ -258,8 +272,8 @@
  *   installed in the session manager once (`setKillFailureAlerts`), after
  *   their build and before the restart module, the start sweep and the start
  *   pass, and named only at the build, the install, the routing holder's
- *   assignment and the persona teardown's alert raiser (b.jg5 SRJ-715); the
- *   restart kill adapter raises the kill retry's decision once, after the
+ *   assignment, the persona teardown's alert raiser (b.jg5 SRJ-715) and the
+ *   old-life wait's bindings (b.jg5 SRJ-811); the restart kill adapter raises the kill retry's decision once, after the
  *   outcome's own handling.
  * - b.jg5 SRJ-1011: the module-scope persona routing's lost-message inputs
  *   are read at call time: its latched query through a module-scope holder
@@ -270,12 +284,14 @@
  *   `isDialogApproverRunning` for the key at call time, and is neither
  *   in-flight binding; its kill-failed query reads the one kill-failure
  *   alerts' `isOpen` through a module-scope holder assigned that instance
- *   once in main() before the start bring-up; its held-on-invalid-flags
+ *   once in main() before the start bring-up, or the session manager's
+ *   `waitsOnKillFailedHold` (b.jg5 SRJ-812); its held-on-invalid-flags
  *   query (state 3, cannot launch) reads the one `ErrInvalidFlags` hold's
  *   `isHeld` through a module-scope holder assigned that hold once in main()
  *   before the start bring-up, which shutdown's forget-all also reads; its
- *   sequence/wait query asks the session manager's `isLiveRowSequenceRunning`
- *   for the key at call time. Its read gate's in-flight member (`isWorkInFlight`)
+ *   sequence/wait query asks the session manager's
+ *   `isSequenceOrOldLifeWaitRunning` for the key at call time (b.jg5
+ *   SRJ-811). Its read gate's in-flight member (`isWorkInFlight`)
  *   is "in flight for P", and its one row read
  *   (`readRowLiveness`) is the one liveness adapter main() builds
  *   (`_buildIsSessionAliveAdapter`, built once, the restart module's and the
@@ -388,6 +404,7 @@ import type * as KillRetryModule from '../src/kill-retry.ts'
 import type * as SessionManagerModule from '../src/session-manager.ts'
 import type * as LiveRowSequenceModule from '../src/live-row-sequence.ts'
 import type { LiveRowSequenceRegistry, LiveRowSequenceRegistryOptions } from '../src/live-row-sequence.ts'
+import type { OldLifeWaitBindings } from '../src/session-manager.ts'
 import type { HealthCheckDeps } from '../src/health-check.ts'
 import type * as OutageStateModule from '../src/outage-state.ts'
 import type { OutageClass, OutageStateDeps } from '../src/outage-state.ts'
@@ -582,6 +599,10 @@ const LAUNCH_IN_FLIGHT: keyof typeof SessionManagerModule = 'isLaunchInFlight'
 const APPROVER_RUNNING: keyof typeof SessionManagerModule = 'isDialogApproverRunning'
 /** The session manager's live-row sequence running query (b.jg5 SRJ-706); renaming it fails the typecheck. */
 const SEQUENCE_RUNNING: keyof typeof SessionManagerModule = 'isLiveRowSequenceRunning'
+/** The session manager's "which work blocks a retry" query (b.jg5 SRJ-303, SRJ-706, SRJ-811); renaming it fails the typecheck. */
+const RETRY_BLOCK_CAUSE: keyof typeof SessionManagerModule = 'personaRetryBlockCause'
+/** The retry action's cause member (b.jg5 SRJ-303: the again-reason and skip line name the cause); renaming it fails the typecheck. */
+const RETRY_BLOCK_CAUSE_MEMBER: keyof FullModeRetryDeps = 'retryBlockCause'
 
 /**
  * The two named in-flight bindings main() hands out (b.jg5 SRJ-303, SRJ-315,
@@ -589,15 +610,20 @@ const SEQUENCE_RUNNING: keyof typeof SessionManagerModule = 'isLiveRowSequenceRu
  * server.ts (see moduleFunction), not imported, with one parameter, its key:
  * - "blocks a retry" (`retryBlocked`), as the full-mode retry action's
  *   `isInFlight` binds it: its whole body is
- *   `return isLaunchInFlight(<key>) || isLiveRowSequenceRunning(<key>)`, a
- *   launch call or a running live-row sequence (b.jg5 SRJ-706; E27 extends
- *   it), never a running dialog approver (SRJ-303: a running approver does
- *   not skip a retry). No other function or
- *   const/let/var arrow in server.ts wraps `isLaunchInFlight` alone (no second
- *   narrow predicate). It is named exactly four times: its declaration, the
- *   retry action's `isInFlight`, the body of "in flight for P" and the
+ *   `return personaRetryBlockCause(<key>) !== undefined`, the session
+ *   manager's cause query (a launch call, a running live-row sequence, or an
+ *   old-life wait step for a hold the persona waits on: b.jg5 SRJ-706,
+ *   SRJ-811), never a running dialog approver (SRJ-303: a running approver
+ *   does not skip a retry). No other function or const/let/var arrow in
+ *   server.ts starts by asking `isLaunchInFlight` or `personaRetryBlockCause`
+ *   for its own key (no second narrow predicate, none that drops the
+ *   sequence or the wait). It is named exactly four times: its declaration,
+ *   the retry action's `isInFlight`, the body of "in flight for P" and the
  *   `ErrInvalidFlags` hold's version-changed listener, whose retry at once
  *   runs the restart module's retry entry with it (b.jg5 SRJ-207, SRJ-303).
+ *   The cause query itself is named exactly three times: its import, that
+ *   body and the retry action's `retryBlockCause` (bare), so the skip's
+ *   again-reason names the same cause that blocked it.
  * - "in flight for P" (`workInFlight`), as the health tick's
  *   `isLaunchInFlight` binds it: its whole body is
  *   `return <blocks a retry>(<key>) || isDialogApproverRunning(<key>)`, built
@@ -607,13 +633,13 @@ const SEQUENCE_RUNNING: keyof typeof SessionManagerModule = 'isLiveRowSequenceRu
  *   session-disconnect handler's and the routing's arm, which mirror the
  *   tick's check, b.jg5 SRJ-311) and the persona routing's read-gate member
  *   `isWorkInFlight` (b.jg5 SRJ-1011), each bound to the bare name.
- * The two names differ, and `isLaunchInFlight`, `isLiveRowSequenceRunning` and
+ * The two names differ, and `isLaunchInFlight`, `personaRetryBlockCause` and
  * `isDialogApproverRunning` are the session manager's imports, declared
  * nowhere in server.ts. Replaces
  * the one shared predicate E11 and E15 pinned. Returns both names.
  */
 function inFlightBindings(): { retryBlocked: string; workInFlight: string } {
-  for (const query of [LAUNCH_IN_FLIGHT, SEQUENCE_RUNNING, APPROVER_RUNNING]) {
+  for (const query of [LAUNCH_IN_FLIGHT, RETRY_BLOCK_CAUSE, APPROVER_RUNNING]) {
     expect([query, importSource(SERVER_CODE, query)]).toEqual([query, './session-manager.ts'])
     expect([query, indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${query}\\b`, 'g'), SERVER_CODE)]).toEqual([query, []])
   }
@@ -624,16 +650,29 @@ function inFlightBindings(): { retryBlocked: string; workInFlight: string } {
   expect(importSource(SERVER_CODE, retryBlocked!)).toBeUndefined()
   const narrow = moduleFunction(retryBlocked!)
   expect(narrow.params).toHaveLength(1)
-  expect(narrow.body.replace(/\s+/g, ' ').trim()).toBe(`return ${LAUNCH_IN_FLIGHT}(${narrow.params[0]}) || ${SEQUENCE_RUNNING}(${narrow.params[0]})`)
+  expect(narrow.body.replace(/\s+/g, ' ').trim()).toBe(`return ${RETRY_BLOCK_CAUSE}(${narrow.params[0]}) !== undefined`)
   // No second narrow predicate: this is server.ts's only declared function or
-  // const/let/var arrow whose body starts by calling isLaunchInFlight with its
-  // own key. (The persona routing's launch-or-approver member is an inline
-  // arrow, pinned separately, b.jg5 SRJ-1011.)
+  // const/let/var arrow whose body starts by calling isLaunchInFlight or the
+  // cause query with its own key, so none can block a retry on a launch alone
+  // while a sequence or an old-life wait step runs. (The persona routing's
+  // launch-or-approver member is an inline arrow, pinned separately, b.jg5
+  // SRJ-1011.)
+  const narrowCall = `(?:${LAUNCH_IN_FLIGHT}|${RETRY_BLOCK_CAUSE})\\(\\s*\\1\\s*\\)`
   const wrappers = [
-    ...indicesOf(/\bfunction\s+\w+\s*\(\s*(\w+)(?:\s*:\s*string)?\s*\)(?:\s*:\s*boolean)?\s*\{\s*return\s+isLaunchInFlight\(\s*\1\s*\)/g, SERVER_CODE),
-    ...indicesOf(/\b(?:const|let|var)\s+\w+(?:\s*:[^=\n]+)?\s*=\s*\(?\s*(\w+)(?:\s*:\s*string)?\s*\)?(?:\s*:\s*boolean)?\s*=>\s*\{?\s*(?:return\s+)?isLaunchInFlight\(\s*\1\s*\)/g, SERVER_CODE),
+    ...indicesOf(new RegExp(`\\bfunction\\s+\\w+\\s*\\(\\s*(\\w+)(?:\\s*:\\s*string)?\\s*\\)(?:\\s*:\\s*boolean)?\\s*\\{\\s*return\\s+${narrowCall}`, 'g'), SERVER_CODE),
+    ...indicesOf(new RegExp(`\\b(?:const|let|var)\\s+\\w+(?:\\s*:[^=\\n]+)?\\s*=\\s*\\(?\\s*(\\w+)(?:\\s*:\\s*string)?\\s*\\)?(?:\\s*:\\s*boolean)?\\s*=>\\s*\\{?\\s*(?:return\\s+)?${narrowCall}`, 'g'), SERVER_CODE),
   ]
   expect(wrappers).toEqual([narrow.at])
+  // The cause query: its import, the narrow one's body, the retry action's
+  // cause member (bare), so the again-reason names what blocked the retry,
+  // and the hold's version-changed listener's retry (its 4th argument, so a
+  // skip line there names the cause too, b.jg5 SRJ-207).
+  const causeNamed = indicesOf(new RegExp(`\\b${RETRY_BLOCK_CAUSE}\\b`, 'g'), SERVER_CODE)
+  expect(causeNamed).toHaveLength(4)
+  expect(causeNamed.filter((offset) => offset > narrow.start && offset < narrow.end)).toHaveLength(1)
+  expect(onlyCallProps('createFullModeRetryAction').get(RETRY_BLOCK_CAUSE_MEMBER)).toBe(RETRY_BLOCK_CAUSE)
+  expect(withinCall(causeNamed, onlyCallOf('createFullModeRetryAction'))).toBe(1)
+  expect(withinCall(causeNamed, onlyCallOf('onAdVersionChanged'))).toBe(1)
 
   // "In flight for P": the health tick's binding, built from the narrow one.
   const workInFlight = onlyCallProps('initHealthCheck').get(TICK_IN_FLIGHT_MEMBER)
@@ -707,8 +746,11 @@ const ROUTING_TMUX_UNRESPONSIVE: keyof PersonaRoutingDeps = 'isTmuxUnresponsive'
  * (the latch's: the check's `isLatched`, which the session-disconnect handler
  * and the routing's arm ask, b.jg5 SRJ-311, SRJ-502), and once inside each
  * range of `alsoIn` ([start, end) offsets; the `ErrInvalidFlags` hold's:
- * shutdown's body, whose forget-all reads it, b.jg5 SRJ-207). Returns the
- * holder's name and the [start, end) of its assignment.
+ * shutdown's body, whose forget-all reads it, b.jg5 SRJ-207). With `orCall`
+ * (a call name), the member is that read `|| <orCall>(key)` instead, both
+ * halves for the member's own parameter (the kill-failed member's old-life
+ * half, b.jg5 SRJ-812). Returns the holder's name and the [start, end) of its
+ * assignment.
  */
 function routingHolder(
   member: keyof PersonaRoutingDeps,
@@ -716,10 +758,12 @@ function routingHolder(
   instance: string,
   checkReaders: Array<keyof TmuxUnavailableRetryDeps> = [],
   alsoIn: Array<readonly [number, number]> = [],
+  orCall?: string,
 ): { holder: string; at: number; end: number } {
   const binding = onlyCallProps('createPersonaRouting').get(member)
   expect(binding).toBeDefined()
-  const form = binding!.match(new RegExp(`^\\(?(\\w+)\\)? => (\\w+)\\?\\.${query}\\(\\1\\) (?:\\?\\? false|=== true)$`))
+  const tail = orCall === undefined ? '' : ` \\|\\| ${orCall}\\(\\1\\)`
+  const form = binding!.match(new RegExp(`^\\(?(\\w+)\\)? => (\\w+)\\?\\.${query}\\(\\1\\) (?:\\?\\? false|=== true)${tail}$`))
   expect(form).not.toBeNull()
   const holder = form![2]!
 
@@ -2086,7 +2130,7 @@ describe('main() installs one UNAVAILABLE retry controller as the trigger sink b
   // makes sure production binds the real one: a stub in-flight or cap read
   // would still launch over an in-flight launch or past the cap. Only these
   // members are pinned, not the full key set.
-  test('the controller\'s action is the full-mode retry action over the restart module\'s retry entry, the live applied persona lookup, the relaunch gate, the restart cap, the restart module\'s shutdown flag, "blocks a retry" (the session manager\'s isLaunchInFlight or isLiveRowSequenceRunning, never a running dialog approver) and its row read (readPersonaRowState)', () => {
+  test('the controller\'s action is the full-mode retry action over the restart module\'s retry entry, the live applied persona lookup, the relaunch gate, the restart cap, the restart module\'s shutdown flag, "blocks a retry" (the session manager\'s personaRetryBlockCause answering a cause, never a running dialog approver) with that cause query, and its row read (readPersonaRowState)', () => {
     expect(onlyCallProps('createUnavailableRetryController').get('action')!.startsWith('createFullModeRetryAction(')).toBe(true)
     expect(importSource(SERVER_CODE, 'createFullModeRetryAction')).toBe('./unavailable-retry.ts')
     const props = onlyCallProps('createFullModeRetryAction')
@@ -2110,10 +2154,12 @@ describe('main() installs one UNAVAILABLE retry controller as the trigger sink b
     expect(props.get('isShuttingDown')).toBeDefined()
     expect(props.get('isShuttingDown')).toBe(onlyCallProps('initRestart').get('isShuttingDown')!)
 
-    // b.jg5 SRJ-303, SRJ-706: "blocks a retry", a launch call or a running
-    // live-row sequence, so a running dialog approver alone never skips a
-    // retry (SRJ-401; see inFlightBindings).
+    // b.jg5 SRJ-303, SRJ-706, SRJ-811: "blocks a retry", a launch call, a
+    // running live-row sequence or an old-life wait step, so a running dialog
+    // approver alone never skips a retry (SRJ-401), and its cause query for
+    // the again-reason (see inFlightBindings).
     expect(props.get(RETRY_IN_FLIGHT_MEMBER)).toBe(inFlightBindings().retryBlocked)
+    expect(props.get(RETRY_BLOCK_CAUSE_MEMBER)).toBe(RETRY_BLOCK_CAUSE)
 
     // b.jg5 SRJ-303, SRJ-115: a pending-only retry's row read is the session
     // manager's, one `status` call through the outage wrapper.
@@ -2288,6 +2334,9 @@ describe('main() builds the one live-row sequence registry and installs it befor
   const RESTART_QUERY: keyof RestartDeps = 'isLiveRowSequenceRunning'
   const DEPS: keyof LiveRowSequenceRegistryOptions = 'deps'
   const RUN_ATTEMPT: keyof LiveRowSequenceRegistryOptions = 'runAttempt'
+  const RUN_OUTSIDE_ATTEMPT: keyof LiveRowSequenceRegistryOptions = 'runOutsideAttempt'
+  const OUTSIDE_ATTEMPTS: keyof typeof UnavailableRetryModule = 'runOutsideAttempts'
+  const RESTART_GATE: keyof typeof SessionManagerModule = 'liveRowSequenceGate'
 
   /** The module-scope holder shutdown() closes: `let <name>: LiveRowSequenceRegistry | undefined`. */
   function holder(): string {
@@ -2296,19 +2345,26 @@ describe('main() builds the one live-row sequence registry and installs it befor
     return match![1]!
   }
 
-  test('the registry is built exactly once, in main()\'s own statement list, from the sequence module, over the session manager\'s one dependency builder (the retry controller\'s arm, the system clock, the server log and the applied configuration read at call time) and production\'s detached attempt runner', () => {
+  test('the registry is built exactly once, in main()\'s own statement list, from the sequence module, over the session manager\'s one dependency builder (the retry controller\'s arm, the system clock, the server log and the applied configuration read at call time), production\'s detached attempt runner and its outside-every-attempt runner (b.jg5 SRJ-811, SRJ-1512)', () => {
     expect(importSource(SERVER_CODE, FACTORY)).toBe('./live-row-sequence.ts')
     expect(importSource(SERVER_CODE, BUILDER)).toBe('./session-manager.ts')
     expect(importSource(SERVER_CODE, ATTEMPT)).toBe('./unavailable-retry.ts')
-    for (const name of [FACTORY, BUILDER, ATTEMPT, INSTALL]) {
+    expect(importSource(SERVER_CODE, OUTSIDE_ATTEMPTS)).toBe('./unavailable-retry.ts')
+    for (const name of [FACTORY, BUILDER, ATTEMPT, OUTSIDE_ATTEMPTS, INSTALL]) {
       expect([name, indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${name}\\b`, 'g'), SERVER_CODE)]).toEqual([name, []])
     }
     const registry = constOf(FACTORY)
     declaredOnce(registry)
     expect(atMainTopLevel(SERVER_CODE, SERVER_CODE.search(new RegExp(`\\bconst\\s+${registry}\\s*=\\s*${FACTORY}\\s*\\(`)))).toBe(true)
     const props = onlyCallProps(FACTORY)
-    expect([...props.keys()].sort()).toEqual([DEPS, RUN_ATTEMPT].sort())
+    expect([...props.keys()].sort()).toEqual([DEPS, RUN_ATTEMPT, RUN_OUTSIDE_ATTEMPT].sort())
     expect(props.get(RUN_ATTEMPT)).toBe(ATTEMPT)
+    // An old-life wait runs outside every recovery attempt: the unavailable
+    // retry module's runner, bare or as a pass-through arrow.
+    const outside = props.get(RUN_OUTSIDE_ATTEMPT)!
+    expect(outside === OUTSIDE_ATTEMPTS || new RegExp(`^\\(?(\\w+)\\)? => ${OUTSIDE_ATTEMPTS}\\(\\1\\)$`).test(outside)).toBe(true)
+    // Named in server.ts only at its import and this member.
+    expect(indicesOf(new RegExp(`\\b${OUTSIDE_ATTEMPTS}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
     expect(props.get(DEPS)!.startsWith(`${BUILDER}(`)).toBe(true)
     const deps = onlyCallProps(BUILDER)
     // The kill-failure alerts are the builder's default, the installed instance.
@@ -2337,15 +2393,22 @@ describe('main() builds the one live-row sequence registry and installs it befor
     expect(atMainTopLevel(SERVER_CODE, assigned[0]!.at)).toBe(true)
   })
 
-  test('the restart work\'s running query is the session manager\'s isLiveRowSequenceRunning, by name (shorthand or bare)', () => {
+  // b.jg5 SRJ-811: the bare running query would refuse a restart over an
+  // old-life wait on the persona's own row without arming its retry timer,
+  // so nothing would retry it once the wait is over.
+  test('the restart work\'s running query is the session manager\'s gate (liveRowSequenceGate) for the key it is given and a site of its own, which also arms a persona whose own row carries an old-life wait; server.ts asks the bare running query nowhere', () => {
     const query = onlyCallProps('initRestart').get(RESTART_QUERY)
-    expect(query === SEQUENCE_RUNNING || query === `${RESTART_QUERY}`).toBe(true)
-    expect(importSource(SERVER_CODE, SEQUENCE_RUNNING)).toBe('./session-manager.ts')
-    // Named in server.ts only at its import, "blocks a retry", the routing's sequence/wait member and the restart deps.
-    const named = indicesOf(new RegExp(`\\b${SEQUENCE_RUNNING}\\b`, 'g'), SERVER_CODE)
-    expect(named).toHaveLength(4)
-    expect(withinCall(named, onlyCallOf('initRestart'))).toBe(1)
-    expect(withinCall(named, onlyCallOf('createPersonaRouting'))).toBe(1)
+    expect(query).toMatch(new RegExp(`^\\(?(\\w+)\\)? => ${RESTART_GATE}\\(\\1, '[^']+'\\)$`))
+    expect(importSource(SERVER_CODE, RESTART_GATE)).toBe('./session-manager.ts')
+    // The gate: named only at its import and this member.
+    const gates = indicesOf(new RegExp(`\\b${RESTART_GATE}\\b`, 'g'), SERVER_CODE)
+    expect(gates).toHaveLength(2)
+    expect(withinCall(gates, onlyCallOf('initRestart'))).toBe(1)
+    // The bare query is neither imported nor called: its name appears only as
+    // the restart deps' member.
+    expect(importSource(SERVER_CODE, SEQUENCE_RUNNING)).toBeUndefined()
+    expect(callsOf(SEQUENCE_RUNNING)).toEqual([])
+    expect(indicesOf(new RegExp(`\\b${SEQUENCE_RUNNING}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
   })
 
   test('shutdown() closes the registry exactly once, through its holder, after the shutting-down flag, before the retry controller closes, before it first yields and before closeClient(); nothing else closes or stops every sequence', () => {
@@ -2371,6 +2434,98 @@ describe('main() builds the one live-row sequence registry and installs it befor
     const clientCloses = indicesOf(/(?<![\w.$])closeClient\s*\(/g, SERVER_CODE).filter(inShutdown)
     expect(clientCloses).toHaveLength(1)
     expect(at).toBeLessThan(clientCloses[0]!)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: b.jg5 SRJ-811 / SRJ-812 / SRJ-1512 — the old-life wait's
+// bindings
+//
+// The bindings' alert sinks are optional (absent, the session manager falls
+// back to its installed kill-failure alerts and `recordStartupError`), and
+// absent bindings start no wait at all, so a production wiring that dropped
+// the install, installed it after the start pass, or bound a second retry
+// controller, alerts or episodes instance would type-check and pass every
+// behaviour suite while no old life was killed, a waiting persona's timer
+// was armed on a controller nothing closes, or the wait's kill-failure entry
+// bypassed the one episodes instance a teardown forgets. What the wait does
+// is tested in tests/old-life-wait.test.ts and through the recovery harness;
+// pinned here: the install and its members.
+// ---------------------------------------------------------------------------
+
+describe('main() installs the old-life wait\'s bindings once, beside the live-row sequence registry and before the start pass, over the one retry controller, the system clock, the server log, the applied configuration, the one kill-failure alerts instance and recordStartupError (b.jg5 SRJ-811, SRJ-812, SRJ-1512)', () => {
+  // Tied to src by type: renaming any of these fails the typecheck.
+  const INSTALL: keyof typeof SessionManagerModule = 'setOldLifeWaitBindings'
+  const REGISTRY_INSTALL: keyof typeof SessionManagerModule = 'setLiveRowSequenceRegistry'
+  const START_SWEEP: keyof typeof SessionManagerModule = 'reconcileOrphans'
+  const RETRY_ARM: keyof OldLifeWaitBindings = 'retryArm'
+  const CLOCK: keyof OldLifeWaitBindings = 'clock'
+  const LOG: keyof OldLifeWaitBindings = 'log'
+  const APPLIED: keyof OldLifeWaitBindings = 'appliedConfig'
+  const ALERTS: keyof OldLifeWaitBindings = 'killFailureAlerts'
+  const RECORD: keyof OldLifeWaitBindings = 'recordStartupError'
+  const EPISODES: keyof OldLifeWaitBindings = 'unclassifiedErrorEpisodes'
+  const EPISODES_FACTORY: keyof typeof SessionManagerModule = 'createOldLifeWaitUnclassifiedErrors'
+
+  test('installed exactly once, in main()\'s own statement list, the session manager\'s import, after the registry\'s install and before the restart module, the start sweep, the start bring-up and the health check', () => {
+    expect(importSource(SERVER_CODE, INSTALL)).toBe('./session-manager.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${INSTALL}\\b`, 'g'), SERVER_CODE)).toEqual([])
+    const at = onlyCallOf(INSTALL)
+    expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+    expect(at).toBeGreaterThan(onlyCallOf(REGISTRY_INSTALL))
+    for (const later of [onlyCallOf('initRestart'), onlyCallOf(START_SWEEP), startResolution(SERVER_CODE).bringUpAt, onlyCallOf('initHealthCheck')]) {
+      expect(at).toBeLessThan(later)
+    }
+    // Named in server.ts only at its import and this call.
+    expect(indicesOf(new RegExp(`\\b${INSTALL}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
+  })
+
+  test('its members are exactly the one retry controller, the system clock, the server log, the applied configuration read at call time, the one kill-failure alerts instance, one recordStartupError call with the class and entry it is given, and the wait\'s one unclassified-error episodes instance', () => {
+    const props = onlyCallProps(INSTALL)
+    expect([...props.keys()].sort()).toEqual([RETRY_ARM, CLOCK, LOG, APPLIED, ALERTS, RECORD, EPISODES].sort())
+    // b.jg5 SRJ-313: the wait's own episodes instance, built before the install, never a persona's.
+    expect(props.get(EPISODES)).toBe(constOf(EPISODES_FACTORY))
+    expect(onlyCallOf(INSTALL)).toBeGreaterThan(onlyCallOf(EPISODES_FACTORY))
+    // Each waiting persona's timer is armed on the one controller shutdown closes.
+    expect(props.get(RETRY_ARM)).toBe(constOf('createUnavailableRetryController'))
+    expect(props.get(CLOCK)).toBe('SYSTEM_PERSONA_CONNECTION_CLOCK')
+    expect(props.get(LOG)).toMatch(/^\(?(\w+)\)? => console\.error\(\1\)$/)
+    expect(props.get(APPLIED)).toBe(`() => ${loadedConfigName(SERVER_CODE)}`)
+    // The one alerts instance, over the one notice episodes (pinned in the
+    // kill-failure alerts' describe), never a second one.
+    expect(props.get(ALERTS)).toBe(constOf('createKillFailureAlerts'))
+    expect(onlyCallOf(INSTALL)).toBeGreaterThan(onlyCallOf('createKillFailureAlerts'))
+    const call = 'recordStartupError\\(\\1, \\2\\)'
+    expect(props.get(RECORD)).toMatch(new RegExp(`^\\((\\w+), (\\w+)\\) => (?:\\{ ${call};? \\}|${call})$`))
+  })
+
+  test('the wait\'s unclassified-error episodes are built exactly once, in main()\'s own statement list, from the session manager, on the system clock, with the server log, E6\'s alert threshold in effect and one recordStartupError call (b.jg5 SRJ-313, SRJ-811)', () => {
+    expect(importSource(SERVER_CODE, EPISODES_FACTORY)).toBe('./session-manager.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${EPISODES_FACTORY}\\b`, 'g'), SERVER_CODE)).toEqual([])
+    expect(atMainTopLevel(SERVER_CODE, onlyCallOf(EPISODES_FACTORY))).toBe(true)
+    const props = onlyCallProps(EPISODES_FACTORY)
+    expect([...props.keys()].sort()).toEqual(['alertThresholdMs', 'log', 'recordStartupError'])
+    expect(props.get('log')).toMatch(/^\(?(\w+)\)? => console\.error\(\1\)$/)
+    expect(props.get('alertThresholdMs')).toBe('adAlertThresholdMsInEffect')
+    const call = 'recordStartupError\\(\\1, \\2\\)'
+    expect(props.get('recordStartupError')).toMatch(new RegExp(`^\\((\\w+), (\\w+)\\) => (?:\\{ ${call};? \\}|${call})$`))
+  })
+
+  test('shutdown() closes the wait\'s unclassified-error episodes exactly once, through the module-scope holder main() assigns them to once, after the shutting-down flag (b.jg5 SRJ-313, SRJ-811)', () => {
+    const handles = [...SERVER_CODE.matchAll(/^let\s+(\w+)\s*:\s*OldLifeWaitUnclassifiedErrors\s*\|\s*undefined\s*$/gm)]
+    expect(handles).toHaveLength(1)
+    const handle = handles[0]![1]!
+    const assigned = assignmentsTo(handle)
+    expect(assigned.map((a) => a.value)).toEqual([constOf(EPISODES_FACTORY)])
+    expect(atMainTopLevel(SERVER_CODE, assigned[0]!.at)).toBe(true)
+    const [start, end] = shutdownBody(SERVER_CODE)
+    const closes = indicesOf(new RegExp(`(?<![\\w.$])${handle}\\s*\\?\\.\\s*close\\s*\\(\\s*\\)`, 'g'), SERVER_CODE)
+    expect(closes).toHaveLength(1)
+    expect(closes[0]! > start && closes[0]! < end).toBe(true)
+    const raises = indicesOf(/(?<![\w.$])shuttingDown\s*=\s*true\b/g, SERVER_CODE)
+    expect(closes[0]!).toBeGreaterThan(raises[0]!)
+    // The holder is named only at its declaration, its assignment and this close.
+    expect(indicesOf(new RegExp(`(?<![\\w.$])${handle}\\b`, 'g'), SERVER_CODE)).toHaveLength(3)
   })
 })
 
@@ -3150,12 +3305,19 @@ describe('main() builds the one kill-failure alerts instance over the notice epi
     }
   })
 
-  test('the instance is named only at its build, its install, the routing holder\'s assignment and the persona teardown\'s alert raiser (no module-scope copy, no second use)', () => {
+  test('the instance is named only at its build, its install, the routing holder\'s assignment, the persona teardown\'s alert raiser and the old-life wait\'s bindings (no module-scope copy, no second use)', () => {
     const alerts = constOf(FACTORY)
     const ALERT_RAISE: keyof KillFailureAlerts = 'raise'
     const TEARDOWN_RAISER: keyof PersonaLifecycleDeps = 'raiseKillFailureAlert'
+    const WAIT_ALERTS: keyof OldLifeWaitBindings = 'killFailureAlerts'
     const named = indicesOf(new RegExp(`\\b${alerts}\\b`, 'g'), SERVER_CODE)
-    expect(named).toHaveLength(4)
+    expect(named).toHaveLength(5)
+    // The fifth is the old-life wait's alert sink (b.jg5 SRJ-811): that one
+    // member of its bindings and nothing else there (its install is pinned in
+    // the old-life wait's describe).
+    const waitProps = onlyCallProps('setOldLifeWaitBindings')
+    expect(withinCall(named, onlyCallOf('setOldLifeWaitBindings'))).toBe(1)
+    expect([...waitProps].filter(([, value]) => new RegExp(`\\b${alerts}\\b`).test(value)).map(([prop]) => prop)).toEqual([WAIT_ALERTS])
     // The install's one argument starts right at its opening parenthesis.
     expect(named).toContain(balancedAfter(SERVER_CODE, onlyCallOf(INSTALL), '(', ')')[0])
     // The third is the routing holder's assignment (pinned in the routing's describe below).
@@ -3725,13 +3887,14 @@ describe('main() builds the one ErrInvalidFlags hold before the start pass, inst
     expect(props.get(VC_LOG)).toMatch(/^\(?(\w+)\)? => console\.error\(\1\)$/)
     // Retried at once: the restart module's retry entry (no delay gate) for
     // the key, in the applied persona's working directory, with "blocks a
-    // retry", only while the persona is applied.
+    // retry" and its cause query (so a skip line names what blocks it), only
+    // while the persona is applied.
     const { retryBlocked } = inFlightBindings()
     const retry = props.get(VC_RETRY)!
     expect(retry).toMatch(
       new RegExp(
         `^\\(?(\\w+)\\)? => \\{ const (\\w+) = getAppliedPersona\\(\\1\\);? if \\(\\2 === undefined\\) return undefined;? ` +
-          `return ${RETRY_ENTRY}\\(\\1, \\2\\.working_directory, ${retryBlocked}\\)`,
+          `return ${RETRY_ENTRY}\\(\\1, \\2\\.working_directory, ${retryBlocked}, ${RETRY_BLOCK_CAUSE}\\)`,
       ),
     )
     expect(indicesOf(new RegExp(`\\b${RETRY_ENTRY}\\s*\\(`, 'g'), retry)).toHaveLength(1)
@@ -3813,7 +3976,11 @@ describe('main() builds the one ErrInvalidFlags hold before the start pass, inst
 // here: the bindings.
 // ---------------------------------------------------------------------------
 
-describe('server.ts binds the persona routing\'s lost-message state inputs to the one latch, the one tmux-unresponsive condition, the one kill-failure alerts\' episode and the session manager\'s launch-in-flight and approver-running queries, each read at call time (b.jg5 SRJ-1011, SRJ-502, SRJ-307, SRJ-401, SRJ-704)', () => {
+describe('server.ts binds the persona routing\'s lost-message state inputs to the one latch, the one tmux-unresponsive condition, the one kill-failure alerts\' episode or the old-life hold\'s kill-failed mark, and the session manager\'s launch-in-flight, approver-running and sequence-or-wait queries, each read at call time (b.jg5 SRJ-1011, SRJ-502, SRJ-307, SRJ-401, SRJ-704, SRJ-812)', () => {
+  /** The session manager's old-life kill-failed query (b.jg5 SRJ-812); renaming it fails the typecheck. */
+  const KILL_FAILED_HOLD: keyof typeof SessionManagerModule = 'waitsOnKillFailedHold'
+  /** The session manager's sequence-or-wait query (b.jg5 SRJ-811, SRJ-1011); renaming it fails the typecheck. */
+  const SEQUENCE_OR_WAIT: keyof typeof SessionManagerModule = 'isSequenceOrOldLifeWaitRunning'
   // Tied to src by type: renaming any of these fails the typecheck.
   const IS_LATCHED: keyof ConflictLatch = 'isLatched'
   const HOLDS: keyof TmuxUnresponsiveCondition = 'holds'
@@ -3876,25 +4043,38 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
     expect(withinCall(asked, onlyCallOf('createPersonaRouting'))).toBe(1)
   })
 
-  // b.jg5 SRJ-1011 state 4, SRJ-704 (E20): P's kill-failure episode is open.
-  // The alerts are built in main() over the notice episodes (pinned in the
-  // kill-failure alerts' describe below); the routing reads their episode
-  // through a holder assigned that one instance, never a second one or a copy.
-  test('the kill-failed query reads the one kill-failure alerts\' isOpen at call time, through a module-scope holder assigned that instance once in main(), after its build and before the start bring-up (state 4, kill failed)', () => {
+  // b.jg5 SRJ-1011 state 4, SRJ-704 (E20), SRJ-812 (E27): P's kill-failure
+  // episode is open, or P waits on an old-life hold whose old key's kill
+  // failed. The alerts are built in main() over the notice episodes (pinned
+  // in the kill-failure alerts' describe below); the routing reads their
+  // episode through a holder assigned that one instance, never a second one
+  // or a copy, and the hold's mark through the session manager's query, each
+  // for the key it is given, at call time.
+  test('the kill-failed query reads the one kill-failure alerts\' isOpen at call time, through a module-scope holder assigned that instance once in main(), after its build and before the start bring-up, or the session manager\'s old-life kill-failed query (state 4, kill failed)', () => {
     const alerts = constOf('createKillFailureAlerts')
     declaredOnce(alerts)
-    const { at } = routingHolder(KILL_FAILED, IS_OPEN, alerts)
+    const { at } = routingHolder(KILL_FAILED, IS_OPEN, alerts, [], [], KILL_FAILED_HOLD)
     expect(at).toBeGreaterThan(onlyCallOf('createKillFailureAlerts'))
+    expect(importSource(SERVER_CODE, KILL_FAILED_HOLD)).toBe('./session-manager.ts')
+    // Named in server.ts only at its import and this member.
+    const named = indicesOf(new RegExp(`\\b${KILL_FAILED_HOLD}\\b`, 'g'), SERVER_CODE)
+    expect(named).toHaveLength(2)
+    expect(withinCall(named, onlyCallOf('createPersonaRouting'))).toBe(1)
   })
 
-  // b.jg5 SRJ-706, SRJ-1011: the sequence/wait input is the session
-  // manager's running query for the key it is given, read at call time (the
-  // registry is installed in main(), after the routing is built), never the
-  // state-6 launch-or-approver member (whose exact form is pinned above).
-  test('the sequence/wait query answers, for the key it is given, from the session manager\'s isLiveRowSequenceRunning at call time; the state-6 launch-or-approver member does not include it', () => {
+  // b.jg5 SRJ-706, SRJ-811, SRJ-1011: the sequence/wait input is the session
+  // manager's sequence-or-wait query for the key it is given, read at call
+  // time (the registry, the hold set and the wait's bindings are installed in
+  // main(), after the routing is built), never the bare sequence query (which
+  // misses a wait step for a hold P waits on) nor the state-6
+  // launch-or-approver member (whose exact form is pinned above).
+  test('the sequence/wait query answers, for the key it is given, from the session manager\'s isSequenceOrOldLifeWaitRunning at call time; the state-6 launch-or-approver member does not include it', () => {
     const props = onlyCallProps('createPersonaRouting')
-    expect(props.get(SEQUENCE_WAIT)).toMatch(new RegExp(`^\\(?(\\w+)\\)? => ${SEQUENCE_RUNNING}\\(\\1\\)$`))
-    expect(props.get(LAUNCH_RUNNING)).not.toContain(SEQUENCE_RUNNING)
+    expect(props.get(SEQUENCE_WAIT)).toMatch(new RegExp(`^\\(?(\\w+)\\)? => ${SEQUENCE_OR_WAIT}\\(\\1\\)$`))
+    expect(props.get(LAUNCH_RUNNING)).not.toContain(SEQUENCE_OR_WAIT)
+    expect(importSource(SERVER_CODE, SEQUENCE_OR_WAIT)).toBe('./session-manager.ts')
+    // Named in server.ts only at its import and this member.
+    expect(indicesOf(new RegExp(`\\b${SEQUENCE_OR_WAIT}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
   })
 
   // b.jg5 SRJ-1011 state 3, SRJ-207: P is held on ErrInvalidFlags. The
@@ -4384,7 +4564,7 @@ describe('main() builds one old-life hold set, installs it for the session manag
 // ---------------------------------------------------------------------------
 
 describe('server.ts wires the b.f2b stale-working-row recovery', () => {
-  test('the health check gets "in flight for P" (the session manager\'s isLaunchInFlight or isDialogApproverRunning), hasPendingWorkingRowEvidence, notifyDisconnectedWithAutoRestartDisabled and forgetNotConnectedEpisode, and reads session_restart_delay 0 from the config the restart module reads', () => {
+  test('the health check gets "in flight for P" ("blocks a retry" or the session manager\'s isDialogApproverRunning), hasPendingWorkingRowEvidence, notifyDisconnectedWithAutoRestartDisabled and forgetNotConnectedEpisode, and reads session_restart_delay 0 from the config the restart module reads', () => {
     const props = onlyCallProps('initHealthCheck')
     // b.jg5 SRJ-315, SRJ-401: "in flight for P", built from "blocks a retry"
     // and the approver-running query (see inFlightBindings), so the tick makes

@@ -151,6 +151,17 @@
  * resumes, the retry whose reuse succeeds sets the mark; a live old life read
  * at a retry goes through the live-row sequence with nothing typed; a held
  * retired key's retry makes no call.
+ * An old-life wait step (b.jg5 SRJ-303, SRJ-811, SRJ-1512; E27 T2): while one
+ * runs for a hold Q waits on, a retry fire for Q, in either mode, makes no
+ * call for Q and re-arms at the doubled wait with the again-reason
+ * `old-life-wait-in-flight` (the restart retry's skip line naming the wait),
+ * the health tick over Q makes no attempt, and B, waiting on nothing, goes
+ * ahead; once the step has ended Q's next retry reads its row. A timer armed
+ * with the old-life cause is never counted and never gives up. Beside a
+ * running wait on a removed key's own row, that key's retry and restart
+ * retry are refused (no probe, spawn or timer for it) while Q's retry runs.
+ * A running live-row sequence's skip names the sequence
+ * (`live-row-sequence-in-flight`).
  * Only the pin case holds the SRD's numbers; every other case derives its
  * waits from the exported base and ceiling through `doublingBackoffDelay`. No
  * retry timer is real; the only real-time waits are the spawn path's 1 ms
@@ -332,6 +343,7 @@ import {
   UNAVAILABLE_RETRY_AGAIN_LAUNCH_FAILED,
   UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT,
   UNAVAILABLE_RETRY_AGAIN_LAUNCHED,
+  UNAVAILABLE_RETRY_AGAIN_SEQUENCE_IN_FLIGHT,
   UNAVAILABLE_RETRY_AGAIN_LIVENESS_UNKNOWN,
   UNAVAILABLE_RETRY_AGAIN_SEQUENCE_WAITING,
   UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED,
@@ -488,6 +500,13 @@ import { isDialogApproverRunning } from '../src/session-manager.ts'
 import { _buildRestartDisconnectedPersona } from '../src/server.ts'
 import { holdThroughReuse, launchThroughSequence, retiredKeyLinesIn, scriptLiveRowElsewhere, scriptReuseInvalidFlags } from './test-helpers/recovery-harness.ts'
 import { errInvalidFlags } from './test-helpers/agent-director-stub.ts'
+import type { FindMissingHold } from './test-helpers/agent-director-stub.ts'
+import { _resetHealthCheckState, _runHealthCheckTickForTest, initHealthCheck } from '../src/health-check.ts'
+import { LIVENESS_READING_DEAD } from '../src/liveness-reading.ts'
+import { restartRetrySkippedLine } from '../src/restart.ts'
+import { OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1, OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL } from '../src/retired-keys.ts'
+import { personaRetryBlockCause } from '../src/session-manager.ts'
+import { RETRY_BLOCK_OLD_LIFE_WAIT, UNAVAILABLE_RETRY_AGAIN_OLD_LIFE_WAIT_IN_FLIGHT, UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD } from '../src/unavailable-retry.ts'
 
 const KEY = 'alpha'
 const OTHER = 'beta'
@@ -7838,7 +7857,7 @@ describe('unavailable retry: a running live-row sequence blocks P\'s retry and i
     await h.advance(waitMs(0))
 
     expect(personaCallCounts(h, key)).toEqual(pCalls)
-    expect(h.lines).toContain(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT, 1))
+    expect(h.lines).toContain(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_SEQUENCE_IN_FLIGHT, 1))
     expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', dueAt: h.clock.now() + waitMs(1), refusals: 1 })
     // Q's retry ran: its row read found it live and connected, nothing left to recover.
     expect(h.stops).toEqual([{ key: other, reason: UNAVAILABLE_RETRY_STOP_RECOVERED }])
@@ -8067,7 +8086,7 @@ describe('unavailable retry: ErrSpawnNotResumable\'s re-read as a trigger: pendi
     await h.advance(waitMs(0))
 
     expect(personaCallCounts(h, key)).toEqual(pCalls)
-    expect(h.lines).toContain(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT, 1))
+    expect(h.lines).toContain(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_SEQUENCE_IN_FLIGHT, 1))
     expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', refusals: 1 })
     expect(h.triggers.filter((t) => t.kind === UNAVAILABLE_RETRY_CAUSE_LOST_RACE)).toEqual([])
     expect(getFailureCount(key)).toBe(0)
@@ -8435,5 +8454,169 @@ describe('unavailable retry: a retired key\'s retries launch by the reuse, never
 
     expect(callsSince(h, before)).toEqual({})
     expectStoppedByHold(h, key)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// An old-life wait step blocks the retry of a persona waiting on its hold
+// (b.jg5 SRJ-302, SRJ-303, SRJ-315, SRJ-811, SRJ-1512; the E11 and E17 notes;
+// E27 T2)
+//
+// On the recovery harness, whose "blocks a retry" is the session manager's
+// `personaRetryBlockCause` and whose cause query names it in the again-reason
+// and the restart retry's skip line, as main() binds them. Q (the first
+// persona) waits on a pre-persona row held in its working directory; the
+// wait is started through the session manager's ensure entry and its first
+// run held. The health tick's in-flight member is main()'s "in flight for P"
+// composition over the same queries. A key outside the applied set beside a
+// running wait on it is refused by the relaunch gate (SRJ-1512: the wait is
+// the one exception to SR-8.6, and it never launches the key).
+// ---------------------------------------------------------------------------
+
+/** A pre-persona row's instance id, held in Q's working directory. */
+const WAIT_ROW_ID = 'cscb_old_C0OLD'
+
+/** Hold the pre-persona row in `q`'s working directory, start its wait and resolve once its first run is held; answers the outcome and the hold. */
+async function waitHeldForQ(h: RecoveryHarness, q: string): Promise<{ readonly outcome: Promise<unknown>; readonly hold: FindMissingHold }> {
+  h.beginOldLifeHold({ instanceId: WAIT_ROW_ID, oldKey: WAIT_ROW_ID, directory: personaOf(h, q).working_directory, cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL })
+  h.script({ getResult: cannedGetResult({ claude_instance_id: WAIT_ROW_ID, cwd: personaOf(h, q).working_directory }) })
+  const hold = holdFindMissing(h.stub.client)
+  const outcome = h.startOldLifeWait(WAIT_ROW_ID)
+  await h.driveSequence(hold.entered(1))
+  return { outcome, hold }
+}
+
+/**
+ * One health tick body over persona `key` alone (`_runHealthCheckTickForTest`),
+ * which it reads `dead`, its in-flight member main()'s "in flight for P"
+ * (`isPersonaWorkInFlight`: "blocks a retry", the session manager's
+ * `personaRetryBlockCause`, or a running dialog approver). Resolves with the
+ * keys it scheduled a restart for.
+ */
+async function tickOver(h: RecoveryHarness, key: string): Promise<string[]> {
+  const scheduled: string[] = []
+  initHealthCheck({
+    getPersonas: () => ({ [key]: personaOf(h, key).working_directory }),
+    isShuttingDown: () => false,
+    now: () => h.clock.now(),
+    isSessionAlive: async () => LIVENESS_READING_DEAD,
+    isSessionConnected: () => false,
+    hasSessionStream: () => false,
+    isRestartPendingOrActive: () => false,
+    isLaunchInFlight: (k) => personaRetryBlockCause(k) !== undefined || isDialogApproverRunning(k),
+    isAtCap: () => false,
+    statRoute: async () => true,
+    scheduleRestart: (k) => void scheduled.push(k),
+  })
+  try {
+    await _runHealthCheckTickForTest()
+  } finally {
+    _resetHealthCheckState()
+  }
+  return scheduled
+}
+
+describe('unavailable retry: an old-life wait step for a hold Q waits on blocks Q\'s retry and its health tick, a refusal at the doubled wait, never counted (SRJ-303, SRJ-811)', () => {
+  test.each<[string, (h: RecoveryHarness, key: string) => void]>([
+    ['full mode (the restart retry\'s skip line names the wait)', (h, key) => h.controller.arm(key, UNAVAILABLE)],
+    ['pending-only mode', (h, key) => h.controller.armPendingOnly(key)],
+  ])('a retry fire for Q in %s while the wait step runs makes no agent-director call for Q and re-arms at the doubled wait naming the wait, while B\'s retry beside it runs; once the step has ended, Q\'s next retry makes its row read', async (label, arm) => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [q, b] = h.keys as [string, string]
+    const { outcome, hold } = await waitHeldForQ(h, q)
+    arm(h, q)
+    h.controller.arm(b, UNAVAILABLE)
+    h.setConnected(b, true)
+    const qCalls = personaCallCounts(h, q)
+
+    await h.advance(waitMs(0))
+
+    expect(personaCallCounts(h, q)).toEqual(qCalls)
+    const pendingOnly = label === 'pending-only mode'
+    expect(h.lines).toContain(reArmedLine(q, 1, UNAVAILABLE_RETRY_AGAIN_OLD_LIFE_WAIT_IN_FLIGHT, 1, pendingOnly ? { ranPendingOnly: true } : {}))
+    expect(h.errors.filter((line) => line === restartRetrySkippedLine(q, RETRY_BLOCK_OLD_LIFE_WAIT))).toHaveLength(pendingOnly ? 0 : 1)
+    expect(h.controller.view(q)).toMatchObject({ phase: 'waiting', dueAt: h.clock.now() + waitMs(1), refusals: 1 })
+    expect(h.stops).toEqual([{ key: b, reason: UNAVAILABLE_RETRY_STOP_RECOVERED }])
+    expect(getFailureCount(q)).toBe(0)
+
+    hold.release(cannedFindMissing({ rows: { [WAIT_ROW_ID]: 'ids' } }))
+    await h.driveSequence(outcome)
+    expect(h.oldLifeWaitRunning(WAIT_ROW_ID)).toBe(false)
+    h.setConnected(q, true)
+    const before = personaCallCounts(h, q)
+    await retryNow(h, q)
+
+    expect(callCountsSince(personaCallCounts(h, q), before)).toEqual({ statusCalls: 1 })
+    // Q's row reads live and its session is connected: nothing left to recover (pending-only: live out of pending).
+    expect(h.stops).toEqual([{ key: b, reason: UNAVAILABLE_RETRY_STOP_RECOVERED }, { key: q, reason: pendingOnly ? UNAVAILABLE_RETRY_STOP_ROW_LIVE : UNAVAILABLE_RETRY_STOP_RECOVERED }])
+  })
+
+  test('the health tick over Q, which reads it dead, makes no attempt while the wait step runs; once the step has ended it schedules Q\'s restart. A wait for Q\'s hold blocks nothing for B', async () => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [q, b] = h.keys as [string, string]
+    const { outcome, hold } = await waitHeldForQ(h, q)
+
+    expect(await tickOver(h, q)).toEqual([])
+    expect(await tickOver(h, b)).toEqual([b])
+
+    hold.release(cannedFindMissing({ rows: { [WAIT_ROW_ID]: 'ids' } }))
+    await h.driveSequence(outcome)
+    expect(await tickOver(h, q)).toEqual([q])
+  })
+
+  test('a timer armed with the old-life cause (a wait round that kept the hold) is never counted and never gives up: retry after retry refused while the next wait step runs, no failure counted, no stop', async () => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [q] = h.keys as [string]
+    h.beginOldLifeHold({ instanceId: WAIT_ROW_ID, oldKey: WAIT_ROW_ID, directory: personaOf(h, q).working_directory, cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL })
+    h.script({ killError: errTmuxUnresponsive('kill'), getResult: cannedGetResult({ claude_instance_id: WAIT_ROW_ID, cwd: personaOf(h, q).working_directory }) })
+    await h.runOldLifeWait(WAIT_ROW_ID)
+    expect(h.triggers).toEqual([{ key: q, kind: UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD }])
+    h.script({ killError: undefined })
+    const hold = holdFindMissing(h.stub.client)
+    const outcome = h.startOldLifeWait(WAIT_ROW_ID)
+    await h.driveSequence(hold.entered(1))
+
+    const fires = RESTART_FAILURE_CAP + 2
+    for (let retry = 1; retry <= fires; retry++) {
+      await retryNow(h, q)
+      expect(retryLinesOf(h, q).at(-1)).toBe(reArmedLine(q, retry, UNAVAILABLE_RETRY_AGAIN_OLD_LIFE_WAIT_IN_FLIGHT, retry))
+    }
+
+    expect(h.controller.view(q)).toMatchObject({ phase: 'waiting', refusals: fires, causes: [UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD] })
+    expect([getFailureCount(q), h.stops, h.capReached]).toEqual([0, [], []])
+    hold.release(cannedFindMissing({ rows: { [WAIT_ROW_ID]: 'ids' } }))
+    await h.driveSequence(outcome)
+  })
+
+  test('SRJ-1512: beside a running wait on B\'s own row (B removed, its hold in B\'s directory), a retry and a restart retry for B are refused by the relaunch gate, with no probe or spawn of B, and no timer for B; Q\'s retry beside it runs', async () => {
+    const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
+    const [q, b] = h.keys as [string, string]
+    const bId = personaInstanceId(b)
+    h.remove(b)
+    h.beginOldLifeHold({ instanceId: bId, oldKey: b, directory: personaOf(h, b).working_directory, cause: OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1 })
+    h.script({ getResult: cannedGetResult({ claude_instance_id: bId, cwd: personaOf(h, b).working_directory }) })
+    const hold = holdFindMissing(h.stub.client)
+    const outcome = h.startOldLifeWait(bId)
+    await h.driveSequence(hold.entered(1))
+    h.controller.arm(b, UNAVAILABLE)
+    h.controller.arm(q, UNAVAILABLE)
+    h.setConnected(q, true)
+    const bCalls = personaCallCounts(h, b)
+
+    await h.advance(waitMs(0))
+    const restart = await runRestartRetry(b, personaOf(h, b).working_directory, () => false)
+    const bArmed = [h.controller.isArmed(b), h.triggers.filter((t) => t.key === b)]
+    // The wait is released first, so a failed check below leaves nothing running.
+    hold.release(cannedFindMissing({ rows: { [bId]: 'ids' } }))
+    await h.driveSequence(outcome)
+
+    // No timer is ever armed for the old key (SRJ-1512), and the relaunch gate refuses the key outside the applied set.
+    expect(bArmed).toEqual([false, []])
+    expect(restart).toBe(RESTART_OUTCOME_NOT_UP)
+    expect(h.lines.filter((line) => line.startsWith(`[slack] persona=${b}: not relaunched — `))).toHaveLength(1)
+    expect(personaCallCounts(h, b)).toEqual(bCalls)
+    expect(bCalls).not.toHaveProperty('statusCalls')
+    expect(h.stub.calls.spawnCalls).toEqual([])
+    expect(h.stops).toEqual([{ key: b, reason: UNAVAILABLE_RETRY_STOP_NOT_APPLIED }, { key: q, reason: UNAVAILABLE_RETRY_STOP_RECOVERED }])
   })
 })

@@ -103,7 +103,9 @@ import {
   holdLaunchIfConfigDirUnresolvable,
   isDialogApproverRunning,
   isLaunchInFlight,
-  isLiveRowSequenceRunning,
+  isSequenceOrOldLifeWaitRunning,
+  liveRowSequenceGate,
+  personaRetryBlockCause,
   killPersonaInstanceForTeardown,
   latchOnRestartKillOutcome,
   raisePersonaKillFailureAlert,
@@ -127,6 +129,10 @@ import {
   setInvalidFlagsHold,
   setLiveRowSequenceRegistry,
   setOldLifeHolds,
+  setOldLifeWaitBindings,
+  createOldLifeWaitUnclassifiedErrors,
+  type OldLifeWaitUnclassifiedErrors,
+  waitsOnKillFailedHold,
   setPreLaunchReplyGuard,
   setPreLaunchTrustPatcher,
   setRetiredKeyStore,
@@ -275,6 +281,7 @@ import {
   createFullModeRetryAction,
   createUnavailableRetryController,
   runDetachedRecoveryAttempt,
+  runOutsideAttempts,
   UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE,
@@ -449,6 +456,13 @@ let unavailableRetry: UnavailableRetryController | undefined
 let personaEpisodes: PersonaEpisodes | undefined
 
 /**
+ * The old-life wait's unclassified-error episodes (b.jg5 SRJ-313, SRJ-811),
+ * keyed by held instance id in an episodes instance of their own; built in
+ * main() with the wait's bindings, every episode ended on shutdown.
+ */
+let oldLifeWaitUnclassifiedErrors: OldLifeWaitUnclassifiedErrors | undefined
+
+/**
  * The kill-failure alerts (b.jg5 SRJ-704, SRJ-1016), for the lost-message
  * state's kill-failed query (SRJ-1011 state 4); built in main() over the
  * notice episodes, before the start pass. Undefined before then, when no
@@ -480,17 +494,21 @@ let liveRowSequences: LiveRowSequenceRegistry | undefined
 
 /**
  * b.jg5 SRJ-303: true while work in flight for the persona blocks a retry of
- * its retry timer: a launch call (`isLaunchInFlight`) or a running live-row
- * sequence (`isLiveRowSequenceRunning`, b.jg5 SRJ-706; false before main()
- * installs the registry). A running dialog
- * approver is not here: it runs after its launch call has returned and
- * never blocks a retry (SRJ-401). Given to the retry controller
- * (`isInFlight`). Every member here is also in flight for the persona
- * (`isPersonaWorkInFlight` is built from this), so the tick never attempts
- * over work that holds back the retry timer.
+ * its retry timer: a launch call (`isLaunchInFlight`), a running live-row
+ * sequence (`isLiveRowSequenceRunning`, b.jg5 SRJ-706), or an old-life wait
+ * step for a hold the persona waits on (`isOldLifeWaitRunningFor`, b.jg5
+ * SRJ-811), each false before main() installs the registry, the hold set and
+ * the wait's bindings: exactly when the session manager's
+ * `personaRetryBlockCause` names one, which the retry controller also gets
+ * (`retryBlockCause`) to name it in the again-reason and the restart retry's
+ * skip line. A running dialog approver is not here: it runs after its
+ * launch call has returned and never blocks a retry (SRJ-401). Given to the
+ * retry controller (`isInFlight`). Every member here is also in flight for
+ * the persona (`isPersonaWorkInFlight` is built from this), so the tick
+ * never attempts over work that holds back the retry timer.
  */
 function isPersonaRetryBlocked(key: string): boolean {
-  return isLaunchInFlight(key) || isLiveRowSequenceRunning(key)
+  return personaRetryBlockCause(key) !== undefined
 }
 
 /**
@@ -1089,14 +1107,14 @@ const personaRouting = createPersonaRouting({
   // health tick's (isPersonaWorkInFlight: a running approver and a running
   // live-row sequence included), so in-flight work reaches the gate through it.
   isWorkInFlight: isPersonaWorkInFlight,
-  // b.jg5 SRJ-706, SRJ-1011: while P's live-row sequence runs, a lost message
+  // b.jg5 SRJ-706, SRJ-811, SRJ-812, SRJ-1011: while P's live-row sequence,
+  // or an old-life wait step for a hold P waits on, runs, a lost message
   // reports `restarting`, asked after states 1 to 5 and before
   // `session-starting`, even while its row reads `pending`, with no status
   // read and no human-triggered restart. Resolved at call time through the
-  // session manager's running query, which answers false before main()
-  // installs the registry. The registry is keyed by instance id, so an
-  // old-life wait's steps registered there are covered by the same query.
-  isSequenceOrWaitRunning: (key) => isLiveRowSequenceRunning(key),
+  // session manager's queries, which answer false before main() installs
+  // the registry, the hold set and the wait's bindings.
+  isSequenceOrWaitRunning: (key) => isSequenceOrOldLifeWaitRunning(key),
   // b.jg5 SRJ-115, SRJ-1011: the lost-message read is the liveness adapter's
   // one `status` for P (no new getClient() site), read at call time; before
   // main() builds the adapter no read is made and the answer is `unknown`,
@@ -1133,11 +1151,15 @@ const personaRouting = createPersonaRouting({
   },
   // b.jg5 SRJ-1011 state 4: P's kill-failure episode is open (the ordinary
   // version of the kill-failure alert was raised at P's destination and its
-  // row has not since read `ended` or `missing`, or been found gone). Read at
-  // call time through the holder main() sets: before main() builds the
-  // alerts no episode is open. The survivor version opens no episode, so it
-  // never reports this state. Only an open episode reports it.
-  isKillFailed: (key) => personaKillFailureAlerts?.isOpen(key) === true,
+  // row has not since read `ended` or `missing`, or been found gone), or P
+  // waits on an old-life hold whose old key's kill has failed (b.jg5
+  // SRJ-812: a teardown, start-sweep or wait kill decided the ordinary
+  // version, or the wait's step 5 found the row still live; until the hold
+  // ends). Read at call time through the holder main() sets and the session
+  // manager's hold query: before main() builds the alerts and installs the
+  // hold set, neither holds. The survivor version opens no episode and marks
+  // no hold, so it never reports this state.
+  isKillFailed: (key) => personaKillFailureAlerts?.isOpen(key) === true || waitsOnKillFailedHold(key),
   // b.jg5 SRJ-1011 state 3, SRJ-207: P is held on ErrInvalidFlags (a reuse
   // spawn's ErrInvalidFlags whose re-check did not stop the server): a lost
   // message reports `cannot-launch` and fires no human-triggered restart.
@@ -1308,6 +1330,9 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   // flight that meets UNAVAILABLE or UNCLASSIFIED starts no condition and no
   // episode), so nothing is posted and no alert check is pending after this.
   personaEpisodes?.close()
+  // b.jg5 SRJ-313, SRJ-811: the old-life waits' unclassified-error episodes
+  // end silently with them, and none begins again.
+  oldLifeWaitUnclassifiedErrors?.close()
   // b.jg5 SRJ-207: every persona's ErrInvalidFlags hold ends with the server,
   // with no post and no retry; nothing persists it, so a restart holds nothing.
   personaInvalidFlagsHold?.forgetAll()
@@ -3222,8 +3247,8 @@ export async function main(): Promise<void> {
   // version differs from the new one, or that began under none; each ended
   // persona's hold episode ends silently and, when it is still applied, it
   // is retried at once: one run of the restart path's retry entry, without
-  // the delay gate. A new ErrInvalidFlags then starts a new episode with one
-  // new alert.
+  // the delay gate, given the cause query so a skip line names what blocks
+  // it. A new ErrInvalidFlags then starts a new episode with one new alert.
   onAdVersionChanged((_previousVersion, newVersion) => {
     endInvalidFlagsHoldsOnVersionChange(invalidFlagsHold, newVersion, {
       episodes: noticeEpisodes,
@@ -3231,7 +3256,7 @@ export async function main(): Promise<void> {
       retryAtOnce: (key) => {
         const persona = getAppliedPersona(key)
         if (persona === undefined) return undefined
-        return runRestartRetry(key, persona.working_directory, isPersonaRetryBlocked).then((outcome) => {
+        return runRestartRetry(key, persona.working_directory, isPersonaRetryBlocked, personaRetryBlockCause).then((outcome) => {
           console.error(`[slack] invalid-flags-hold: persona=${key} retry after its hold ended answered ${outcome} (b.jg5 SRJ-207)`)
         })
       },
@@ -3362,8 +3387,10 @@ export async function main(): Promise<void> {
       // ErrInvalidFlags, whatever its causes.
       isHeld: (key) => invalidFlagsHold.isHeld(key),
       // b.jg5 SRJ-303: only work that blocks a retry skips it; a running
-      // dialog approver alone never does (SRJ-401).
+      // dialog approver alone never does (SRJ-401). The skip's again-reason
+      // and the restart retry's skip line name what blocks it.
       isInFlight: isPersonaRetryBlocked,
+      retryBlockCause: personaRetryBlockCause,
       readRow: readPersonaRowState,
       isSessionConnected: (key) => getSessionByPersona(key)?.connected === true,
       hasSessionStream,
@@ -3395,9 +3422,42 @@ export async function main(): Promise<void> {
       appliedConfig: () => personaConfig,
     }),
     runAttempt: runDetachedRecoveryAttempt,
+    // b.jg5 SRJ-811, SRJ-1512: an old-life wait runs outside every attempt.
+    runOutsideAttempt: (run) => runOutsideAttempts(run),
   })
   liveRowSequences = sequences
   setLiveRowSequenceRegistry(sequences)
+
+  // b.jg5 SRJ-811, SRJ-812, SRJ-1512: the old-life wait's bindings, installed
+  // with the registry its waits run in: each waiting persona's retry timer
+  // through the retry controller's arm (never the old key's), the system
+  // clock, the applied configuration read at each call, and the alert sinks
+  // the persona teardown's are given: the kill-failure alerts over the one
+  // episodes instance (its log-only route for the context 'old-life wait')
+  // and the startup-errors recorder (the `persona-teardown-notice` entries
+  // worded "during the wait"); and the wait's own unclassified-error
+  // episodes (SRJ-313), keyed by the held instance id, apart from every
+  // persona's: each round that keeps the hold reports its first UNCLASSIFIED
+  // answer, the one alert per episode is the `persona-unclassified-error`
+  // entry naming the wait's reference (log-only, against the alert threshold
+  // in effect), and the hold's end ends the episode. Nothing reaches Slack. A
+  // wait is started only through the session manager's ensure entry; its
+  // hold's end and shutdown's close of the registry stop it.
+  const waitUnclassifiedErrors = createOldLifeWaitUnclassifiedErrors({
+    log: (line) => console.error(line),
+    alertThresholdMs: adAlertThresholdMsInEffect,
+    recordStartupError: (classLabel, entry) => recordStartupError(classLabel, entry),
+  })
+  oldLifeWaitUnclassifiedErrors = waitUnclassifiedErrors
+  setOldLifeWaitBindings({
+    retryArm: retryTimers,
+    clock: SYSTEM_PERSONA_CONNECTION_CLOCK,
+    log: (line) => console.error(line),
+    appliedConfig: () => personaConfig,
+    killFailureAlerts,
+    recordStartupError: (classLabel, entry) => recordStartupError(classLabel, entry),
+    unclassifiedErrorEpisodes: waitUnclassifiedErrors,
+  })
 
   // b.jg5 SRJ-307, SRJ-310: the per-persona tmux-unresponsive condition,
   // held in the notice episodes, apart from the outage flags. The outage
@@ -3882,8 +3942,10 @@ export async function main(): Promise<void> {
     // restart work (a fired timer, a retry, a human-triggered restart) makes
     // no agent-director call and answers sequence-waiting; the work asks
     // again wherever it asks the latch again and before its launch, and a
-    // launch the sequence held answers sequence-waiting too.
-    isLiveRowSequenceRunning,
+    // launch the sequence held answers sequence-waiting too. b.jg5 SRJ-811:
+    // when an old-life wait runs on the persona's own row, the gate also arms
+    // its retry timer, since the wait launches no one.
+    isLiveRowSequenceRunning: (key) => liveRowSequenceGate(key, 'runRestartWork'),
     // b.jg5 SRJ-610: each run's readings and verdicts feed the slow-recovery
     // count; nothing in the run changes because of it.
     slowRecovery,

@@ -126,12 +126,19 @@ export const KILL_ROW_FINISHED_ENDED = 'ended'
 export const KILL_ROW_FINISHED_MISSING = 'missing'
 /** The read answered `ErrSpawnNotFound`. */
 export const KILL_ROW_FINISHED_NO_ROW = 'no-row'
+/**
+ * An old-life wait's kill only (SRJ-702, SRJ-811; option A): the hold the
+ * kill serves ended while its tries ran, because another call read the old
+ * row finished; the tries end as a success, as a finished read does.
+ */
+export const KILL_ROW_FINISHED_HOLD_ENDED = 'hold-ended'
 
-/** What a `status` read between tries found that ends the tries as a success. */
+/** What ended the tries as a success: a `status` read between tries, or an old-life wait's hold's end. */
 export type KillRowFinishedRead =
   | typeof KILL_ROW_FINISHED_ENDED
   | typeof KILL_ROW_FINISHED_MISSING
   | typeof KILL_ROW_FINISHED_NO_ROW
+  | typeof KILL_ROW_FINISHED_HOLD_ENDED
 
 /** A success with a kill result. `killSent` is absent from a binary older than Phase 1. */
 export interface KillKilled {
@@ -154,7 +161,7 @@ export interface KillSessionGone {
   readonly name?: string
 }
 
-/** A success because a `status` read between tries found the row finished. */
+/** A success because a `status` read between tries found the row finished, or an old-life wait's hold ended. */
 export interface KillRowFinished {
   readonly kind: typeof KILL_OUTCOME_ROW_FINISHED
   readonly read: KillRowFinishedRead
@@ -404,7 +411,7 @@ export async function checkedKill(instanceId: string, kill: KillCall): Promise<K
  *   `outcome=row-gone (ErrSpawnNotFound)`;
  *   `outcome=session-gone (<GONE name>)`, or `outcome=session-gone` when
  *   the name cannot be read;
- *   `outcome=row-finished read=<ended|missing|no-row>`;
+ *   `outcome=row-finished read=<ended|missing|no-row|hold-ended>`;
  *   `outcome=not-killed class=<class> <name> message="…"`, the name and
  *   message by `describeAgentDirectorFailure`; for a class SRJ-110 has no
  *   row for, `outcome=not-killed class=UNCLASSIFIED from=<class> <name>
@@ -509,9 +516,12 @@ function renderSessionGone(name: unknown): string {
     : `outcome=${KILL_OUTCOME_SESSION_GONE}`
 }
 
-/** A finished read's label, only when it is one of the three. */
+/** A finished read's label, only when it is one of the four. */
 function renderFinishedRead(read: unknown): string {
-  return read === KILL_ROW_FINISHED_ENDED || read === KILL_ROW_FINISHED_MISSING || read === KILL_ROW_FINISHED_NO_ROW
+  return read === KILL_ROW_FINISHED_ENDED ||
+    read === KILL_ROW_FINISHED_MISSING ||
+    read === KILL_ROW_FINISHED_NO_ROW ||
+    read === KILL_ROW_FINISHED_HOLD_ENDED
     ? read
     : 'unknown'
 }

@@ -38,8 +38,10 @@
  *    config-file onset quotes agent-director, the conflict latch, whose
  *    lines and record carry agent-director's CONFLICT description, the kill
  *    modules (the checked kill, its bounded retry and the kill-failure
- *    alert's texts), the read-pane outcome, the persona routing and the
- *    live-row sequence, whose step lines carry agent-director failure text), a value
+ *    alert's texts), the read-pane outcome, the persona routing, the
+ *    live-row sequence, whose step lines carry agent-director failure text,
+ *    and the old-life wait's round end, whose notice texts carry
+ *    agent-director's CONFLICT and unusable-name answers), a value
  *    import of one
  *    of the `HELPER_SURFACES` helpers (the token builders and sentinel, the
  *    config-file writer, the agent-director settings-file writer, the reload,
@@ -143,6 +145,7 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/kill-retry\.ts$/, "the bounded retry of a live row's kill, whose per-try and per-read lines carry agent-director failure text (described, redacted) and whose alert decision keeps agent-director's kill-failure descriptions raw"],
   [/^src\/kill-failure-alert\.ts$/, "the kill-failure alert's texts, which quote agent-director's kill-failure descriptions (redacted) in Slack posts, log lines and startup-errors entries"],
   [/^src\/live-row-sequence\.ts$/, "the live-row sequence, whose step lines carry agent-director failure text (a failed get's failure and each kill's outcome, described, redacted) and whose kill results keep agent-director's kill-failure descriptions raw"],
+  [/^src\/old-life-wait\.ts$/, "the old-life wait's round end, whose persona-teardown-notice texts carry agent-director's CONFLICT and unusable-name answers (described, redacted) to log lines and startup-errors entries, and whose answers keep the thrown agent-director errors and kill results raw"],
   [/^src\/pane-read\.ts$/, "the read-pane outcome, whose failure outcomes carry the described agent-director failure text (redacted) to the callers' log lines"],
   [/^src\/invalid-flags-hold\.ts$/, "the ErrInvalidFlags hold, which posts its operator alert and logs the agent-director versions a re-check reported (a version that is not a short version string is logged as unreadable) and its reactions' failures (described, redacted)"],
   [/^src\/persona-routing\.ts$/, "the persona routing, which receives a persona's Slack events, archives through its client and logs Slack failure text and its lost-message row read's agent-director failure text (described, redacted)"],
@@ -485,6 +488,19 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     expect(touching.length).toBeGreaterThan(0)
     expect(touching.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map((file) => [file, true, false]))
     expect([callsAssertNoLeak(suite), suite in EXEMPT]).toEqual([true, false])
+  })
+
+  // b.jg5 SRJ-811, SRJ-1002, SRJ-1013: a round's CONFLICT and unusable-name answers reach a log line and a
+  // `persona-teardown-notice` entry (described, redacted), and its answers keep the thrown errors raw.
+  test('src/old-life-wait.ts is a source surface: its functions touch, its constants and types alone do not, and every suite that touches it leak-checks with no exemption', () => {
+    const suite = 'tests/some-old-life-wait-user.test.ts'
+    expect(SOURCE_SURFACES.some(([re]) => re.test('src/old-life-wait.ts'))).toBe(true)
+    expect(touchReasonsOf(suite, "import { decideOldLifeWaitEnd } from '../src/old-life-wait.ts'").length).toBe(1)
+    expect(touchReasonsOf(suite, "import { oldLifeWaitRefusalNoticeText as notice } from '../src/old-life-wait.ts'").length).toBe(1)
+    expect(touchReasonsOf(suite, "import { OLD_LIFE_WAIT_END_KILL_FAILED, OLD_LIFE_WAIT_LOG_PREFIX } from '../src/old-life-wait.ts'")).toEqual([])
+    expect(touchReasonsOf(suite, "import type { OldLifeWaitEndDecision } from '../src/old-life-wait.ts'")).toEqual([])
+    const touching = SUITES.filter((file) => touchReasons(file).some((r) => r.includes('src/old-life-wait.ts')))
+    expect(touching.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map((file) => [file, true, false]))
   })
 
   // b.jg5 SRJ-207, SRJ-1008: the hold posts its operator alert and logs the versions agent-director reported, and
