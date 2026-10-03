@@ -264,6 +264,16 @@
  *   install and before the start sweep, every launch path, the liveness
  *   adapter, the connection manager and `Bun.serve`; server.ts never names
  *   the test-only reset, and no other src file builds or installs a set.
+ * - b.jg5 SRJ-810 / SRJ-1505 / SRJ-812: what a hold refuses.
+ *   handleInitialized gives `decideSessionAdmission` the session manager's
+ *   held-directory query (`oldLifeHeldDirectory`, by its bare name, so the
+ *   hold set is read at call time) beside `isPersonaUp`; the restart work's
+ *   old-life hook (`isHeldForOldLife`) runs the session manager's hold step
+ *   (`oldLifeHoldStep`) over the live applied persona; the end-retry
+ *   observer (`createOldLifeHoldEndRetry`) is registered once on the one
+ *   hold set's `onEnd`, after its install, over the one retry controller's
+ *   `runNow` (held-for-an-old-life cause, hold-ended label) and the live
+ *   applied-persona lookup; none of them names `getClient()`.
  * - b.jg5 SRJ-704 / SRJ-1007 / SRJ-1016: the kill-failure alerts are built
  *   exactly once (`createKillFailureAlerts`), in main()'s own statement list,
  *   over the one notice episodes instance and the server log, with the live
@@ -404,7 +414,9 @@ import type * as KillRetryModule from '../src/kill-retry.ts'
 import type * as SessionManagerModule from '../src/session-manager.ts'
 import type * as LiveRowSequenceModule from '../src/live-row-sequence.ts'
 import type { LiveRowSequenceRegistry, LiveRowSequenceRegistryOptions } from '../src/live-row-sequence.ts'
-import type { OldLifeWaitBindings } from '../src/session-manager.ts'
+import type { OldLifeHoldEndRetryDeps, OldLifeWaitBindings } from '../src/session-manager.ts'
+import type { SessionAdmissionOptions } from '../src/registry.ts'
+import type { OldLifeHoldSet } from '../src/retired-keys.ts'
 import type { HealthCheckDeps } from '../src/health-check.ts'
 import type * as OutageStateModule from '../src/outage-state.ts'
 import type { OutageClass, OutageStateDeps } from '../src/outage-state.ts'
@@ -4546,6 +4558,107 @@ describe('main() builds one old-life hold set, installs it for the session manag
     // Beside the store's install: nothing awaited between the two.
     const store = onlyCallOf(STORE_INSTALL)
     expect(indicesOf(/\bawait\b/g, SERVER_CODE.slice(Math.min(store, install), Math.max(store, install)))).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: b.jg5 SRJ-810, SRJ-1505, SRJ-812 — what a hold refuses
+//
+// The held-directory query, the restart path's old-life hook and the
+// end-retry observer are all optional where main() binds them (absent: no
+// session is held, no restart is held back, a hold's end retries no one), so
+// a production wiring that dropped one, bound a stub or captured the hold
+// set at build time would type-check and pass every behaviour suite while a
+// session from a held directory was served, a restart launched into an old
+// life's directory, or a waiting persona waited for its timer. What each
+// does is tested in tests/registry.test.ts, tests/restart.test.ts,
+// tests/session-manager.test.ts and, end to end, tests/reload-apply.test.ts
+// and tests/old-life-wait.test.ts; pinned here: the bindings.
+// ---------------------------------------------------------------------------
+
+describe('main() binds what a hold refuses: the held-directory query into the MCP admission, the old-life hook into the restart work, and the end-retry observer over the retry controller\'s run-now entry on the one hold set (b.jg5 SRJ-810, SRJ-1505, SRJ-812)', () => {
+  // Tied to src by type: renaming any of these fails the typecheck.
+  const HELD_QUERY: keyof typeof SessionManagerModule = 'oldLifeHeldDirectory'
+  const ADMISSION_HELD: keyof SessionAdmissionOptions = 'heldDirectory'
+  const HOLD_STEP: keyof typeof SessionManagerModule = 'oldLifeHoldStep'
+  const RESTART_HOOK: keyof RestartDeps = 'isHeldForOldLife'
+  const END_RETRY: keyof typeof SessionManagerModule = 'createOldLifeHoldEndRetry'
+  const RUN_NOW_DEP: keyof OldLifeHoldEndRetryDeps = 'runNow'
+  const APPLIED_DEP: keyof OldLifeHoldEndRetryDeps = 'isApplied'
+  const RUN_NOW: keyof UnavailableRetryController = 'runNow'
+  const ON_END: keyof OldLifeHoldSet = 'onEnd'
+  const HOLD_CAUSE: keyof typeof UnavailableRetryModule = 'UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD'
+  const HOLD_ENDED: keyof typeof UnavailableRetryModule = 'UNAVAILABLE_RETRY_RUN_NOW_HOLD_ENDED'
+  const HOLDS_INSTALL: keyof typeof SessionManagerModule = 'setOldLifeHolds'
+  const START_SWEEP: keyof typeof SessionManagerModule = 'reconcileOrphans'
+
+  /** `name` is imported from `module` and declared nowhere in server.ts. */
+  function importedOnly(name: string, module: string): void {
+    expect([name, importSource(SERVER_CODE, name)]).toEqual([name, module])
+    expect([name, indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${name}\\b`, 'g'), SERVER_CODE)]).toEqual([name, []])
+  }
+
+  test('handleInitialized gives decideSessionAdmission the session manager\'s held-directory query, by its bare name (the hold set read at call time), beside isPersonaUp; the options are exactly these four, and server.ts names the query nowhere else', () => {
+    const props = objectProperties(onlyCallArgs('decideSessionAdmission')[2]!)
+    expect([...props.keys()].sort()).toEqual(['describeNotUp', ADMISSION_HELD, 'isPersonaUp', 'log'].sort())
+    expect(props.get(ADMISSION_HELD)).toBe(HELD_QUERY)
+    expect(props.get('isPersonaUp')).toBe('isPersonaUp')
+    importedOnly(HELD_QUERY, './session-manager.ts')
+    // Named only at its import and this member: never called with a captured set, never wrapped.
+    const named = indicesOf(new RegExp(`\\b${HELD_QUERY}\\b`, 'g'), SERVER_CODE)
+    expect(named).toHaveLength(2)
+    expect(withinCall(named, onlyCallOf('decideSessionAdmission'))).toBe(1)
+  })
+
+  test('the restart work\'s old-life hook runs the session manager\'s hold step over the live applied persona for the key it is given, with a site of its own, and answers false for a key that is not applied; the step is named nowhere else', () => {
+    const hook = onlyCallProps('initRestart').get(RESTART_HOOK)
+    expect(hook).toBeDefined()
+    const shape = new RegExp(
+      `^\\(?(\\w+)\\)? => \\{ const (\\w+) = getAppliedPersona\\(\\1\\);? return \\2 !== undefined && ${HOLD_STEP}\\(\\2, '[^']+'\\);? \\}$`,
+    )
+    expect(hook).toMatch(shape)
+    importedOnly(HOLD_STEP, './session-manager.ts')
+    const named = indicesOf(new RegExp(`\\b${HOLD_STEP}\\b`, 'g'), SERVER_CODE)
+    expect(named).toHaveLength(2)
+    expect(withinCall(named, onlyCallOf('initRestart'))).toBe(1)
+  })
+
+  test('the end-retry observer is built once, as the one argument of its registration on the one hold set\'s onEnd, a statement of main()\'s own list, after the set\'s install (so after the session manager\'s own end observer) and before the start sweep and the start bring-up', () => {
+    importedOnly(END_RETRY, './session-manager.ts')
+    const at = onlyCallOf(END_RETRY)
+    const holds = constOf('createOldLifeHoldSet')
+    const registrations = indicesOf(new RegExp(`(?<![\\w.$])${holds}\\s*\\.\\s*${ON_END}\\s*\\(`, 'g'), SERVER_CODE)
+    expect(registrations).toHaveLength(1)
+    // The observer is the registration's one argument, and nothing else in server.ts registers an end observer.
+    expect(indicesOf(new RegExp(`\\.\\s*${ON_END}\\s*\\(`, 'g'), SERVER_CODE)).toHaveLength(1)
+    expect(withinCall([at], registrations[0]!)).toBe(1)
+    expect(splitTopLevel(callArguments(SERVER_CODE, registrations[0]!))).toHaveLength(1)
+    expect(atMainTopLevel(SERVER_CODE, registrations[0]!)).toBe(true)
+    expect(registrations[0]!).toBeGreaterThan(onlyCallOf(HOLDS_INSTALL))
+    for (const later of [onlyCallOf(START_SWEEP), startResolution(SERVER_CODE).bringUpAt]) expect(registrations[0]!).toBeLessThan(later)
+  })
+
+  test('its members are exactly the one retry controller\'s run-now entry for the key, with the held-for-an-old-life cause and the hold-ended label, and the live applied-persona lookup', () => {
+    const props = onlyCallProps(END_RETRY)
+    expect([...props.keys()].sort()).toEqual([RUN_NOW_DEP, APPLIED_DEP].sort())
+    const controller = constOf('createUnavailableRetryController')
+    expect(props.get(RUN_NOW_DEP)).toMatch(
+      new RegExp(`^\\(?(\\w+)\\)? => ${controller}\\.${RUN_NOW}\\(\\1, \\{ kind: ${HOLD_CAUSE} \\}, ${HOLD_ENDED}\\)$`),
+    )
+    expect(props.get(APPLIED_DEP)).toMatch(/^\(?(\w+)\)? => getAppliedPersona\(\1\) !== undefined$/)
+    importedOnly(HOLD_CAUSE, './unavailable-retry.ts')
+    importedOnly(HOLD_ENDED, './unavailable-retry.ts')
+    // Built after the controller whose entry it calls.
+    expect(onlyCallOf(END_RETRY)).toBeGreaterThan(onlyCallOf('createUnavailableRetryController'))
+  })
+
+  test('no binding above reaches agent-director itself: none names getClient() or builds a client (no new getClient() site)', () => {
+    const bindings = [
+      objectProperties(onlyCallArgs('decideSessionAdmission')[2]!).get(ADMISSION_HELD)!,
+      onlyCallProps('initRestart').get(RESTART_HOOK)!,
+      onlyCallArguments(SERVER_CODE, END_RETRY),
+    ]
+    for (const binding of bindings) expect(binding).not.toMatch(/\bgetClient\b|\bnew\s+Client\b|\binitClient\b/)
   })
 })
 

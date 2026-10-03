@@ -340,6 +340,39 @@
  *   `holdsWaitedOnBy`, `waitsOnKillFailed`, `snapshot`). Holds live in server
  *   memory: a later run over the same directories (a restart) starts with a
  *   new, empty set, and the harness runs no start sweep to rebuild one;
+ * - what a hold refuses, and its end (b.jg5 SRJ-810, SRJ-811, SRJ-301;
+ *   realLaunch runs only): the run builds, as `main()` builds its one
+ *   controller, UNAVAILABLE retry timers (`createUnavailableRetryController`
+ *   on `run.clock`, its lines to `run.logs`; read-only as `run.retryTimers`),
+ *   whose retry action stands in for the restart module's retry entry (the
+ *   harness has none): a stopped run, a key outside the applied set, a
+ *   latched or `ErrInvalidFlags`-held persona and one the relaunch gate
+ *   refuses stop the timer; work that blocks a retry
+ *   (`personaRetryBlockCause`) is a refusal with no call; else one launch
+ *   in the persona's serializer turn, a `launch` record via
+ *   `unavailable-retry` with its `action`, which stops the timer once the
+ *   persona is up and is a refusal on `sequence-waiting` or a failure. Bound
+ *   as `main()` binds them: the lifecycle's `stopRetryTimer` (the timers'
+ *   `stop` with the torn-down reason) and its forget-and-stop member
+ *   (`forgetOldLifeWaits`, recorded as `'forgetOldLifeWaits'`), and, right
+ *   after the hold set is installed (so after the session manager's own end
+ *   observer), the end-retry observer on the run's hold set
+ *   (`createOldLifeHoldEndRetry` over the timers' `runNow`, cause
+ *   held-for-old-life, label `old-life-hold-ended`), so a hold's end retries
+ *   each applied, unlatched waiting persona at once. `run.admitSession`
+ *   passes the session manager's held-directory query
+ *   (`oldLifeHeldDirectory`), as server.ts does. Unless `opts.oldLifeWait`
+ *   is `false`, the old-life wait's bindings are installed too, as `main()`
+ *   always installs them (`setOldLifeWaitBindings`:
+ *   the timers as its arm, `run.clock`, `run.logs`, the configuration the
+ *   server runs, the run's kill-failure alerts and a startup-errors
+ *   recorder into `run.composition.killFailureEntries`), so a launch the
+ *   old-life gate holds back starts the hold's wait; with `false` no wait
+ *   starts and no waiting persona is armed. `opts.killLeavesRowLive` keeps a
+ *   row live through a kill that succeeds, so a wait's round reaches its
+ *   `find-missing` steps. `run.stop()` removes the observer, closes the
+ *   timers (no timer is left pending) and removes the bindings when they
+ *   are the run's; `h.cleanup()` always removes the bindings;
  * - a stop between writes: `opts.stopBeforeWrite` names a path; just before
  *   the run's writer is first called for it, the harness keeps an image of
  *   every regular file under the configuration and state directories, and
@@ -593,7 +626,7 @@ import { _resetAckTracker, consumeAck, forgetPersonaAcks } from '../../src/ack-t
 import { resetClientForTests, setClientForTests } from '../../src/agent-director-client.ts'
 import { buildTemplateParams, type TemplateRefreshResult } from '../../src/agent-director-template.ts'
 import { bindConflictNotice, createConflictLatch, type ConflictLatch } from '../../src/conflict-latch.ts'
-import { createKillFailureAlerts, createPersonaEpisodes } from '../../src/persona-episodes.ts'
+import { createKillFailureAlerts, createPersonaEpisodes, type KillFailureAlerts } from '../../src/persona-episodes.ts'
 import { bindInvalidFlagsHoldSetReaction, createInvalidFlagsHold, type InvalidFlagsHold } from '../../src/invalid-flags-hold.ts'
 import {
   LIVE_ROW_SEQUENCE_ENTRY_KILL,
@@ -605,7 +638,24 @@ import {
 } from '../../src/live-row-sequence.ts'
 import { KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN, KILL_FAILURE_CONTEXT_RECOVERY } from '../../src/kill-failure-alert.ts'
 import { AGENT_DIRECTOR_DEAD_STATES } from '../../src/liveness-reading.ts'
-import { runDetachedRecoveryAttempt } from '../../src/unavailable-retry.ts'
+import {
+  UNAVAILABLE_RETRY_AGAIN_LAUNCH_FAILED,
+  UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD,
+  UNAVAILABLE_RETRY_RUN_NOW_HOLD_ENDED,
+  UNAVAILABLE_RETRY_STOP_HELD,
+  UNAVAILABLE_RETRY_STOP_LATCHED,
+  UNAVAILABLE_RETRY_STOP_NOT_APPLIED,
+  UNAVAILABLE_RETRY_STOP_NOT_UP,
+  UNAVAILABLE_RETRY_STOP_RECOVERED,
+  UNAVAILABLE_RETRY_STOP_SHUTDOWN,
+  UNAVAILABLE_RETRY_STOP_TORN_DOWN,
+  createUnavailableRetryController,
+  retryBlockAgainReason,
+  runDetachedRecoveryAttempt,
+  sequenceWaitingAgainReason,
+  type UnavailableRetryController,
+  type UnavailableRetryOutcome,
+} from '../../src/unavailable-retry.ts'
 import { personaInstanceId, personaKey, renderPersonaRef } from '../../src/persona-identity.ts'
 import { createPersonaEventRouter } from '../../src/persona-event-router.ts'
 import { createPersonaLifecycle, type PersonaLifecycle } from '../../src/persona-lifecycle.ts'
@@ -642,6 +692,7 @@ import {
   _resetInvalidFlagsHold,
   _resetLiveRowSequenceRegistry,
   _resetOldLifeHolds,
+  _resetOldLifeWaitBindings,
   _resetPreLaunchReplyGuard,
   _resetPreLaunchTrustPatcher,
   _resetRetiredKeyStore,
@@ -651,7 +702,11 @@ import {
   _setSpawnHomeDir,
   buildLiveRowSequenceDeps,
   checkLaunchConfigDir,
+  createOldLifeHoldEndRetry,
+  forgetOldLifeWaits,
   isLiveRowSequenceRunning,
+  oldLifeHeldDirectory,
+  personaRetryBlockCause,
   killPersonaInstanceForTeardown,
   launchSession,
   personaConfigDirLabelValue,
@@ -661,10 +716,12 @@ import {
   setInvalidFlagsHold,
   setLiveRowSequenceRegistry,
   setOldLifeHolds,
+  setOldLifeWaitBindings,
   setPreLaunchReplyGuard,
   setPreLaunchTrustPatcher,
   setRetiredKeyStore,
   setSessionNotifier,
+  SPAWN_ACTION_FRESH_RETIRED,
   spawnForPersona,
   startLiveRowSequence,
   stopDialogApprover,
@@ -865,10 +922,12 @@ export type ReloadLifecycleOp = 'bring-up' | 'launch' | 'teardown' | 'reconnect'
 /**
  * What caused it: the start pass (`start`), the bring-up controller's own
  * retry (`retry`, launches only), a lifecycle op the controller called for
- * one persona (`apply`), or the restart module's launch (`restart`, launches
- * only, `run.relaunch`).
+ * one persona (`apply`), the restart module's launch (`restart`, launches
+ * only, `run.relaunch`), or a retry of the run's UNAVAILABLE retry timer
+ * (`unavailable-retry`, launches only, with `opts.realLaunch`; see
+ * `run.retryTimers`).
  */
-export type ReloadLifecycleVia = 'start' | 'retry' | 'apply' | 'restart'
+export type ReloadLifecycleVia = 'start' | 'retry' | 'apply' | 'restart' | 'unavailable-retry'
 
 /** The key of a `template-refresh` record and timeline entry: it belongs to no persona. */
 export const TEMPLATE_REFRESH_KEY = ''
@@ -1015,7 +1074,9 @@ export interface LifecycleTimelineEntry {
  * binds it, so a teardown stops the key's dialog approver first, b.jg5
  * SRJ-404, SRJ-715), its real live-row sequence stop right after
  * (`stopLiveRowSequence`: the session manager's `stopLiveRowSequence` with
- * the teardown reason, as `main()` binds it, b.jg5 SRJ-706, SRJ-715), and a
+ * the teardown reason, as `main()` binds it, b.jg5 SRJ-706, SRJ-715), with
+ * the real launch path the run's retry timers' stop (`stopRetryTimer`) and
+ * the session manager's `forgetOldLifeWaits` (b.jg5 SRJ-811, SRJ-715), and a
  * recording stand-in for every other dependency.
  */
 export interface RealLifecycleComposition {
@@ -1038,6 +1099,7 @@ export interface RealLifecycleComposition {
    * `'bringUps.cancel'`, `'cancelRestartTimer'`, `'stopRetryTimer'`, `'whenLaunchSettled'`,
    * `'connections.stop'`, `'routing.forget'`, `'forgetAcks'`, `'destinations.forget'`,
    * `'destinationHold.cancel'`, `'notifier.forget'`, `'forgetPersonaPrompts'`,
+   * `'forgetOldLifeWaits'` (with the real launch path only),
    * `'dropSession'`, `'resetOutageState'`, `'killInstance'`,
    * `'raiseKillFailureAlert'`, `'forgetFailures'`, `'forgetDisconnectedStreak'`,
    * `'forgetConflictLatch'`, `'forgetInvalidFlagsHold'`, `'forgetNoticeEpisodes'`, `'replyGuard.launchedWithDir'`, `'replyGuard.teardown'`,
@@ -1107,7 +1169,10 @@ export interface RealLifecycleComposition {
    * `startup-errors.log`), in order, as its class label and entry text: a
    * persona teardown's alert (b.jg5 SRJ-704, SRJ-715) is one
    * `persona-teardown-notice` (ordinary) or `persona-kill-survivor` entry.
-   * Nothing on this route reaches Slack.
+   * Unless `opts.oldLifeWait` is `false`, the old-life wait's entries join them: its
+   * kill-failure alerts (`persona-kill-failed`, `persona-kill-survivor`)
+   * and its startup-errors recorder's (`persona-teardown-notice` "during
+   * the wait", b.jg5 SRJ-811, SRJ-1002). Nothing on this route reaches Slack.
    */
   readonly killFailureEntries: ReadonlyArray<{ readonly classLabel: string; readonly entry: string }>
 }
@@ -1204,6 +1269,22 @@ function launchStartOf(row: TableRow): { launch_started_at?: string } {
 /** The verbs `instanceCallsOf` keeps: those that start, stop or remove an instance. */
 const INSTANCE_VERBS: ReadonlySet<string> = new Set(['spawn', 'resume', 'kill', 'delete'])
 
+/**
+ * The launch actions after which a retry of the run's retry timer stops it,
+ * the persona being up (`UNAVAILABLE_RETRY_STOP_RECOVERED`): the launch
+ * brought it up, or found it running (see `retryLaunch`).
+ */
+const RETRY_LAUNCH_UP_ACTIONS: ReadonlySet<SpawnPersonaResult['action']> = new Set<SpawnPersonaResult['action']>([
+  'spawned',
+  SPAWN_ACTION_FRESH_RETIRED,
+  'resumed',
+  'reconnected',
+  'not-reconnected',
+  'no-op',
+  'fresh-after-amnesia',
+  'fresh-after-inconclusive-amnesia',
+])
+
 /** The label naming a row's config dir (`config_dir=<value>`). */
 const CONFIG_DIR_LABEL = 'config_dir'
 
@@ -1269,10 +1350,14 @@ export interface BotTokenRevocation {
   queues?: readonly StubWebApiQueue[]
 }
 
-/** `run.admitSession`'s answer: the registered session when the persona was admitted. */
+/**
+ * `run.admitSession`'s answer: the registered session when the persona was
+ * admitted; `held` when its working directory is held for an old life (b.jg5
+ * SRJ-810, SRJ-1505; with `opts.realLaunch` only).
+ */
 export type ReloadSessionAdmission =
   | { readonly kind: 'admitted'; readonly session: SessionEntry }
-  | { readonly kind: 'not-up' | 'unmatched' }
+  | { readonly kind: 'not-up' | 'unmatched' | 'held' }
 
 /** One message the routing delivered to a persona's registered session (`run.deliveries`). Holds no token. */
 export interface ReloadDelivery {
@@ -1591,6 +1676,29 @@ export interface ReloadRunOptions {
    */
   leaveSpawnsPending?: (id: string) => boolean
   /**
+   * With `realLaunch`: install the old-life wait's bindings
+   * (`setOldLifeWaitBindings`, b.jg5 SRJ-811), as `main()` installs them
+   * beside the live-row sequence registry, so a launch the old-life gate
+   * holds back starts the hold's wait (its kill and `find-missing` steps on
+   * the old key, with no launch), and the waiting persona's retry timer is
+   * armed on the run's retry timers (`run.retryTimers`). On by default, as
+   * `main()` always installs it; `false` installs none (and removes any left
+   * installed), so the run starts no wait (`ensureOldLifeWait` answers
+   * `not-installed`) and arms no waiting persona. The teardown member and
+   * the end-retry observer are bound either way. Removed at `run.stop()` and
+   * `h.cleanup()`.
+   */
+  oldLifeWait?: boolean
+  /**
+   * With `realLaunch`: a kill that succeeds on a row whose instance ID this
+   * picks (asked at each kill) leaves the row's state as it was, instead of
+   * `ended`: a worker the kill did not end, so the reads after it (a live-row
+   * sequence's or an old-life wait's `get`, `status`) still read it live and
+   * the sequence goes on to its `find-missing` steps (b.jg5 SRJ-705,
+   * SRJ-811). Absent: every successful kill ends the row.
+   */
+  killLeavesRowLive?: (id: string) => boolean
+  /**
    * Called with the path before every call of the controller's writer (the
    * record, the pending file, the retired-key record), e.g. to observe what
    * exists when the record is written.
@@ -1637,6 +1745,9 @@ export type ReloadInvalidFlagsHoldView = Pick<InvalidFlagsHold, 'isHeld' | 'bega
 /** A run's old-life hold set, read-only: its queries (b.jg5 SRJ-809). */
 export type ReloadOldLifeHoldsView = Pick<OldLifeHoldSet, 'holdOf' | 'holdsOnDirectory' | 'holdsWaitedOnBy' | 'waitsOnKillFailed' | 'snapshot'>
 
+/** A realLaunch run's UNAVAILABLE retry timers, read-only: their queries (b.jg5 SRJ-301, SRJ-810). */
+export type ReloadRetryTimersView = Pick<UnavailableRetryController, 'view' | 'isArmed' | 'armedKeys' | 'whenRunSettled'>
+
 /** One server start over the harness's files; see the file comment. */
 export interface ReloadRun {
   /** The real reload controller. */
@@ -1679,6 +1790,13 @@ export interface ReloadRun {
    * with a new, empty set.
    */
   readonly oldLifeHolds: ReloadOldLifeHoldsView
+  /**
+   * With `opts.realLaunch`: the run's UNAVAILABLE retry timers, read-only
+   * (`createUnavailableRetryController` on `run.clock`, its lines to
+   * `run.logs`; see the file comment's old-life wait paragraph). Undefined
+   * without the real launch path.
+   */
+  readonly retryTimers: ReloadRetryTimersView | undefined
   /** Whether the run reached its `opts.stopBeforeWrite` stop point (the disk image was kept). */
   readonly stoppedBeforeWrite: boolean
   /**
@@ -2249,6 +2367,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
   let installedRetiredKeys: RetiredKeyStore | undefined
   /** The old-life hold set installed in the session manager now (the latest realLaunch run's), likewise. */
   let installedOldLifeHolds: OldLifeHoldSet | undefined
+  /** The run whose old-life wait bindings are installed in the session manager now (the latest realLaunch run's), likewise. */
+  let installedWaitBindingsOwner: ReloadRun | undefined
   /** `console.error` before the harness captured it (a realLaunch run), restored at cleanup. */
   const originalConsoleError = console.error
   let consoleCaptured = false
@@ -2421,12 +2541,13 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
      * launch path over the configuration the server runs (never a startup
      * launch, so nothing reaches `startup-errors.log`).
      */
-    async function launch(persona: Persona, via: ReloadLifecycleVia): Promise<void> {
+    async function launch(persona: Persona, via: ReloadLifecycleVia): Promise<ReloadLifecycleRecord> {
       const entry = record('launch', persona.key, via)
-      if (!realLaunch) return
+      if (!realLaunch) return entry
       const config = serverConfig()
       if (config === undefined) throw new Error('reload-harness: a real launch ran before the start applied a configuration')
       entry.action = (await spawnForPersona(persona, config, false)).action
+      return entry
     }
 
     const bringUps = createPersonaBringUpController({
@@ -2526,12 +2647,65 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       (key, status) => bringUps.onConnectionStatus(key, status),
     )
 
+    /**
+     * The run's UNAVAILABLE retry timers (`opts.realLaunch`; b.jg5 SRJ-301,
+     * SRJ-810), as `main()` builds its one controller: on `run.clock`, its
+     * lines to `run.logs`, its action `retryLaunch`. Bound below as `main()`
+     * binds it: the old-life wait's arm (`setOldLifeWaitBindings`), the hold
+     * set's end observer (`createOldLifeHoldEndRetry` over its `runNow`) and
+     * the teardown's retry-timer stop. Closed at `run.stop()`.
+     */
+    const retryTimers: UnavailableRetryController | undefined = realLaunch
+      ? createUnavailableRetryController({ log, clock: connections.clock, action: (key) => retryLaunch(key) })
+      : undefined
+    /** Removes the run's end-retry observer from its hold set (installed with the launch seams). */
+    let removeOldLifeEndRetry: (() => void) | undefined
+
+    /**
+     * One retry of the run's retry timer for persona `key`: a stand-in for
+     * `main()`'s full-mode action over the restart module's retry entry (the
+     * harness has no restart module), with its gates in its order: a stopped
+     * run, a key outside the applied set, a latched or `ErrInvalidFlags`-held
+     * persona and one the relaunch gate refuses stop the timer with the
+     * production reason; work that blocks a retry (`personaRetryBlockCause`:
+     * a launch in flight, a live-row sequence, an old-life wait step for a
+     * hold the persona waits on) is a refusal naming it, with no call. Else
+     * the launch, in the persona's serializer turn, recorded as a `launch`
+     * record via `unavailable-retry` with its `action`: a launch that brought
+     * the persona up stops the timer (`UNAVAILABLE_RETRY_STOP_RECOVERED`), a
+     * `sequence-waiting` one (an old-life hold or a live-row sequence) is a
+     * refusal naming what blocks it (`sequenceWaitingAgainReason`), a latch
+     * or hold stops it, and any other answer is a refusal.
+     */
+    async function retryLaunch(key: string): Promise<UnavailableRetryOutcome> {
+      const stop = (reason: string): UnavailableRetryOutcome => ({ kind: 'stop', reason })
+      if (stopped) return stop(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
+      const persona = getAppliedPersona(key)
+      if (persona === undefined) return stop(UNAVAILABLE_RETRY_STOP_NOT_APPLIED)
+      if (latch.isLatched(key)) return stop(UNAVAILABLE_RETRY_STOP_LATCHED)
+      if (invalidFlagsHold.isHeld(key)) return stop(UNAVAILABLE_RETRY_STOP_HELD)
+      if (!relaunchGate(key)) return stop(UNAVAILABLE_RETRY_STOP_NOT_UP)
+      const blocked = personaRetryBlockCause(key)
+      if (blocked !== undefined) return { kind: 'again', reason: retryBlockAgainReason(blocked) }
+      const entry = await serializer!.run(key, () => launch(persona, 'unavailable-retry'))
+      const action = entry.action
+      if (action !== undefined && RETRY_LAUNCH_UP_ACTIONS.has(action)) return stop(UNAVAILABLE_RETRY_STOP_RECOVERED)
+      if (action === 'sequence-waiting') return { kind: 'again', reason: sequenceWaitingAgainReason(personaRetryBlockCause(key)) }
+      if (action === 'latched') return stop(UNAVAILABLE_RETRY_STOP_LATCHED)
+      if (action === 'held') return stop(UNAVAILABLE_RETRY_STOP_HELD)
+      return { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LAUNCH_FAILED }
+    }
+
     const composition = realLifecycle ? buildComposition() : undefined
     /** The run's live-row sequence registry (`opts.realLaunch`), built and installed with the launch seams. */
     let sequences: LiveRowSequenceRegistry | undefined
 
     /** The real composition over this run (`opts.realLifecycle`); see `RealLifecycleComposition`. */
-    function buildComposition(): RealLifecycleComposition & { readonly client: unknown } {
+    function buildComposition(): RealLifecycleComposition & {
+      readonly client: unknown
+      readonly killFailureAlerts: KillFailureAlerts
+      readonly recordStartupError: (classLabel: string, entry: string) => void
+    } {
       const calls: Array<readonly [string, string]> = []
       const agentDirector = makeStubCallLog()
       const agentDirectorOrder: string[] = []
@@ -2568,7 +2742,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           return tracked({ verb: 'kill', id }, async () => {
             const result = await stub.kill(params)
             const row = rows.get(id)
-            if (row !== undefined) row.state = 'ended'
+            if (row !== undefined && runOpts.killLeavesRowLive?.(id) !== true) row.state = 'ended'
             return result
           })
         },
@@ -2734,8 +2908,15 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         stopLiveRowSequence: rec('stopLiveRowSequence', (key) => stopLiveRowSequence(key, LIVE_ROW_STOP_TEARDOWN)),
         whenLaunchSettled: rec('whenLaunchSettled', (key) => whenLaunchSettled(key)),
         cancelRestartTimer: rec('cancelRestartTimer', () => false),
-        // A recording no-op: the run arms no UNAVAILABLE retry timer.
-        stopRetryTimer: rec('stopRetryTimer'),
+        // With the real launch path, as main() binds it: the run's retry
+        // timers stop the key's timer (b.jg5 SRJ-305); else a recording
+        // no-op, as such a run arms no UNAVAILABLE retry timer.
+        stopRetryTimer: rec('stopRetryTimer', (key) => retryTimers?.stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)),
+        // With the real launch path, as main() binds it (b.jg5 SRJ-811):
+        // right after each retry-timer stop before the kill, the key is
+        // forgotten from every old-life hold's waiting record, and a wait no
+        // persona left in the applied configuration waits on is stopped.
+        ...(realLaunch ? { forgetOldLifeWaits: rec('forgetOldLifeWaits', (key) => forgetOldLifeWaits(key)) } : {}),
         forgetFailures: rec('forgetFailures'),
         forgetDisconnectedStreak: rec('forgetDisconnectedStreak'),
         // As main() binds them (b.jg5 SRJ-504, SRJ-1016): the run's latch
@@ -2811,6 +2992,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         holdSpawns: (shouldHold) => holdSpawns(stub, shouldHold),
         killFailureEntries,
         client,
+        killFailureAlerts,
+        // The old-life wait's startup-errors recorder (production's
+        // `recordStartupError`): into the same log-only record.
+        recordStartupError: (classLabel: string, entry: string) => void killFailureEntries.push({ classLabel, entry }),
       }
     }
 
@@ -3253,6 +3438,15 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       writes,
       removes,
       retiredKeys,
+      retryTimers:
+        retryTimers === undefined
+          ? undefined
+          : Object.freeze({
+              view: (key: string) => retryTimers.view(key),
+              isArmed: (key: string) => retryTimers.isArmed(key),
+              armedKeys: () => retryTimers.armedKeys(),
+              whenRunSettled: (key: string) => retryTimers.whenRunSettled(key),
+            }),
       oldLifeHolds: Object.freeze({
         holdOf: (instanceId: string) => oldLifeHolds.holdOf(instanceId),
         holdsOnDirectory: (directory: string) => oldLifeHolds.holdsOnDirectory(directory),
@@ -3394,6 +3588,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           isPersonaUp,
           describeNotUp: (k) => describePersonaNotUp(bringUps.state(k)),
           log,
+          // As server.ts passes it (b.jg5 SRJ-810, SRJ-1505): the session
+          // manager's held-directory query over the installed hold set, the
+          // run's own with the real launch path.
+          ...(realLaunch ? { heldDirectory: oldLifeHeldDirectory } : {}),
         })
         if (admission.kind !== 'admitted') return { kind: admission.kind }
         return { kind: 'admitted', session: registerRunSession(admission.persona.name) }
@@ -3464,6 +3662,14 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           _resetOldLifeHolds()
           installedOldLifeHolds = undefined
         }
+        // Its end-retry observer leaves its set, and its old-life wait bindings
+        // the session manager, when they are the installed ones (b.jg5 SRJ-810, SRJ-811).
+        removeOldLifeEndRetry?.()
+        removeOldLifeEndRetry = undefined
+        if (installedWaitBindingsOwner === run) {
+          _resetOldLifeWaitBindings()
+          installedWaitBindingsOwner = undefined
+        }
         controller.stopDetection()
         bringUps.cancelAll()
         noticeStack.hold.cancelAll()
@@ -3472,6 +3678,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         // As main()'s shutdown (b.jg5 SRJ-706): every live-row sequence is
         // stopped, none starts after it.
         void sequences?.close()
+        // As main()'s shutdown (b.jg5 SRJ-301): every retry timer is stopped,
+        // and no later arm is taken.
+        retryTimers?.close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
         for (const client of toolClients.values()) await client.close()
         await connections.manager.stopAll()
       },
@@ -3549,6 +3758,42 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         runAttempt: runDetachedRecoveryAttempt,
       })
       setLiveRowSequenceRegistry(sequences)
+      // As main() installs them beside the registry (b.jg5 SRJ-811, SRJ-812,
+      // SRJ-1512): the old-life wait's bindings, its arm the run's retry
+      // timers (a waiting persona's arm, cause held-for-old-life), its waits
+      // and its kill's waits between tries on `run.clock`, its lines to
+      // `run.logs`, the configuration the server runs, the run's kill-failure
+      // alerts (their log-only route in `killFailureEntries`) and the
+      // startup-errors recorder, which records into `killFailureEntries`
+      // too. No unclassified-error episode is bound (its line says so).
+      // Unless `opts.oldLifeWait` is `false` (see the option); then none is
+      // installed, a stopped run's included.
+      if (runOpts.oldLifeWait !== false) {
+        setOldLifeWaitBindings({
+          retryArm: retryTimers!,
+          clock: connections.clock,
+          log,
+          appliedConfig: serverConfig,
+          killFailureAlerts: composition!.killFailureAlerts,
+          recordStartupError: composition!.recordStartupError,
+        })
+        installedWaitBindingsOwner = run
+      } else {
+        _resetOldLifeWaitBindings()
+        installedWaitBindingsOwner = undefined
+      }
+      // As main() registers it, after the session manager's own end observer
+      // (`setOldLifeHolds` above), so a hold's wait is stopped first (b.jg5
+      // SRJ-810): once a hold ends, each persona recorded as waiting on it
+      // that is still applied and not latched is retried at once through the
+      // run's retry timers (`runNow`, armed with the held-for-an-old-life
+      // cause when it was not). Removed at `run.stop()`.
+      removeOldLifeEndRetry = oldLifeHolds.onEnd(
+        createOldLifeHoldEndRetry({
+          runNow: (key) => retryTimers!.runNow(key, { kind: UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD }, UNAVAILABLE_RETRY_RUN_NOW_HOLD_ENDED),
+          isApplied: (key) => getAppliedPersona(key) !== undefined,
+        }),
+      )
     }
   }
 
@@ -3870,6 +4115,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           installedRetiredKeys = undefined
           _resetOldLifeHolds()
           installedOldLifeHolds = undefined
+          _resetOldLifeWaitBindings()
+          installedWaitBindingsOwner = undefined
           _resetLiveRowSequenceRegistry()
         }
         if (outageStateInstalled) _resetOutageState()

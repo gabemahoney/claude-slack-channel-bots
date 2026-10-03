@@ -103,8 +103,13 @@ import {
   holdLaunchIfConfigDirUnresolvable,
   isDialogApproverRunning,
   isLaunchInFlight,
+  createOldLifeHoldEndRetry,
+  forgetOldLifeWaits,
+  isOwnRowOldLifeHeld,
   isSequenceOrOldLifeWaitRunning,
   liveRowSequenceGate,
+  oldLifeHeldDirectory,
+  oldLifeHoldStep,
   personaRetryBlockCause,
   killPersonaInstanceForTeardown,
   latchOnRestartKillOutcome,
@@ -283,7 +288,9 @@ import {
   runDetachedRecoveryAttempt,
   runOutsideAttempts,
   UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
+  UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
+  UNAVAILABLE_RETRY_RUN_NOW_HOLD_ENDED,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE,
   UNAVAILABLE_RETRY_STOP_HELD,
@@ -954,9 +961,11 @@ function initPendingSession(): { pendingId: string; transport: WebStandardStream
 // Called after the MCP initialized notification. Calls roots/list on the
 // client and matches the first root's directory, by real path, to exactly one
 // applied persona (b.av2 SR-6.3), admitting it only while that persona is up
-// (SR-6.4, `decideSessionAdmission`). On admission: promotes the pending
-// session to registered under the persona key. On no match, a persona that is
-// not up, or an error: disconnects it.
+// (SR-6.4, `decideSessionAdmission`), and never while that directory is held
+// for an old life that may still be running (SR-6.3 as amended by b.jg5
+// SRJ-1505; SRJ-810). On admission: promotes the pending session to
+// registered under the persona key. On no match, a held directory, a persona
+// that is not up, or an error: disconnects it.
 // ---------------------------------------------------------------------------
 
 /**
@@ -1033,12 +1042,17 @@ async function handleInitialized(
   const realCwd = resolveRealPath(rootsPath)
 
   // b.av2 SR-6.3 / SR-6.4: match by real path, then admit only an up persona.
+  // b.jg5 SRJ-810, SRJ-1505: before any persona is matched, a session opened
+  // from a directory held for an old life is refused, whichever persona
+  // names it, with the one line the admission logs; the hold set is read at
+  // call time, so before main() installs it nothing is held.
   // A refused session is disconnected like an unmatched one; the persona's
   // registered session, if any, is left as it is.
   const admission = decideSessionAdmission(rootsPath, personaConfig?.personas ?? [], {
     isPersonaUp,
     describeNotUp: describePersonaNotUpByKey,
     log: (line) => console.error(line),
+    heldDirectory: oldLifeHeldDirectory,
   })
 
   if (admission.kind !== 'admitted') {
@@ -2075,18 +2089,27 @@ export function _buildKillSessionAdapter(
  * know) of a key the installed retired-key store has recorded with no "new
  * life has begun" mark (`retiredKeyReadingOf`, the session manager's one
  * reader of that store; a mark held in memory after a failed write counts as
- * set) is the old life (`isRetiredOldLife`): no pane is read and nothing is
+ * set) is the old life (`ownRowOldLifeOf`): no pane is read and nothing is
  * typed; the live-row sequence is started through the session manager's
  * start entry with the retired-key flag, the conversation not kept and alert
  * context `recovery`, seeded with the state read, and the adapter answers
- * 'transient', never counted (`replaceRetiredOldLife`). The health tick, the
+ * 'transient', never counted (`replaceOwnRowOldLife`). The health tick, the
  * lost-message trigger and the retry timer's full-mode rerun all reach it
  * through the restart path. With the mark set the live row is the new life
- * and is reconnected as below; a `pending` row keeps the `pending` deferral;
- * a key not recorded is unchanged. The `working` and `waiting` branches read
- * the pane, which is awaited, so the store is asked again right before
- * `/mcp reconnect` is typed, after the latch, and a key recorded meanwhile
- * takes the same replacement with nothing typed. The state read itself
+ * and is reconnected as below; a `pending` row keeps the `pending` deferral.
+ *
+ * b.jg5 SRJ-810 — never type into a held old life. The same path serves a
+ * key that is not recorded whose own row `cscb_<key>` is held for an old
+ * life (`isOwnRowOldLifeHeld`: a row the start sweep swept for its `cwd`
+ * whose kill did not succeed), read live other than `pending`: the live-row
+ * sequence is started with no retired-key flag and the adapter answers
+ * 'transient'. While the old-life wait runs on that row the start answers
+ * `already-running` and the persona's retry timer is armed (b.jg5 SRJ-811).
+ * Any other key is unchanged. The `working` and `waiting` branches read
+ * the pane, which is awaited, so the store and the hold set are asked again
+ * right before `/mcp reconnect` is typed, after the latch, and a key
+ * recorded or held meanwhile takes the same replacement with nothing typed.
+ * The state read itself
  * clears a marked key's entry when the row reads `waiting`, `working`,
  * `ask_user` or `check_permission` (b.jg5 SRJ-807).
  *
@@ -2156,9 +2179,11 @@ export function _buildReconnectSessionAdapter(
     // or notice, and nothing typed.
     const latchedNow = (): boolean => reconnectLatchedAt(key, isLatched)
     if (latchedNow()) return 'transient'
-    // b.jg5 SRJ-805: a retired key's old life is never typed into; the
-    // live-row sequence replaces it and the adapter reports 'transient'.
-    if (isRetiredOldLife(key, state)) return replaceRetiredOldLife(key, state)
+    // b.jg5 SRJ-805, SRJ-810: a retired key's old life, and a held own row,
+    // are never typed into; the live-row sequence replaces it and the adapter
+    // reports 'transient'.
+    const oldLife = ownRowOldLifeOf(key, state)
+    if (oldLife !== undefined) return replaceOwnRowOldLife(key, state, oldLife)
     // b.f2b: the evidence for a `working` row spans consecutive attempts that
     // read the row `working`; any other reading ends it, and the run of
     // deferrals on the row with it.
@@ -2227,10 +2252,12 @@ export function _buildReconnectSessionAdapter(
     // meanwhile. Ask the latch right before typing: a latched persona (or a
     // query that throws: fail safe) gets nothing typed, 'transient'.
     if (latchedNow()) return 'transient'
-    // b.jg5 SRJ-805: the pane reads above are awaited, and the key may have
-    // been recorded meanwhile (an apply's step 1): the store is asked again
-    // right before typing, so an old life is never typed into.
-    if (isRetiredOldLife(key, state)) return replaceRetiredOldLife(key, state)
+    // b.jg5 SRJ-805, SRJ-810: the pane reads above are awaited, and the key
+    // may have been recorded meanwhile (an apply's step 1), or its own row
+    // held: the store and the hold set are asked again right before typing,
+    // so an old life is never typed into.
+    const oldLifeNow = ownRowOldLifeOf(key, state)
+    if (oldLifeNow !== undefined) return replaceOwnRowOldLife(key, state, oldLifeNow)
     // b.jg5 SRJ-118, SRJ-501: the reconnect's last read is this adapter's
     // `status` read (`waiting`, or a stale `working` row).
     const result = await reconnectMcpWithCause(key, latchRowStateRead(state))
@@ -2271,42 +2298,61 @@ export function _buildReconnectSessionAdapter(
 /** Who reads, in the own-row `status` step's lines for the reconnect adapter's state read. */
 export const RECONNECT_STATUS_SITE = { site: 'reconnectSession', what: 'status check' } as const
 
+/** `ownRowOldLifeOf`: the key is recorded as retired with no "new life has begun" mark (b.jg5 SRJ-805). */
+const OWN_ROW_OLD_LIFE_RETIRED = 'retired'
+/** `ownRowOldLifeOf`: the key's own row is held for an old life while the key is not recorded (b.jg5 SRJ-810). */
+const OWN_ROW_OLD_LIFE_HELD = 'held'
+
+/** Why the reconnect adapter reads persona `key`'s own live row as an old life. */
+type OwnRowOldLife = typeof OWN_ROW_OLD_LIFE_RETIRED | typeof OWN_ROW_OLD_LIFE_HELD
+
 /**
- * Whether persona `key`'s row, read `state` by the reconnect adapter's
- * `status` read, is a retired key's old life (b.jg5 SRJ-805): the installed
- * retired-key store has the key recorded with no "new life has begun" mark
- * (`retiredKeyReadingOf`, the in-memory mark of a failed write counting as
- * set), and the row reads live other than `pending`: `waiting`, `working`, a
- * prompt state, or a state CSCB does not know. A `pending` row keeps the
- * `pending` deferral, and an `ended` or `missing` row the adapter's own
- * handling. With the mark set the live row is the new life, reconnected as
- * any other; a key not recorded is unchanged. Never throws.
+ * Whether persona `key`'s own row, read `state` by the reconnect adapter's
+ * `status` read, is an old life, and why. Only a row that reads live other
+ * than `pending` (`waiting`, `working`, a prompt state, or a state CSCB does
+ * not know) can be one; a `pending` row keeps the `pending` deferral, and an
+ * `ended` or `missing` row the adapter's own handling. Then:
+ *   - `retired` (b.jg5 SRJ-805): the installed retired-key store has the key
+ *     recorded with no "new life has begun" mark (`retiredKeyReadingOf`, the
+ *     in-memory mark of a failed write counting as set). With the mark set
+ *     the live row is the new life, reconnected as any other;
+ *   - `held` (b.jg5 SRJ-810): the key is not recorded, and its own row
+ *     `cscb_<key>` is held for an old life (`isOwnRowOldLifeHeld`): a row the
+ *     start sweep swept for its `cwd` whose kill did not succeed.
+ * Undefined otherwise: the row is reconnected as before. Never throws.
  */
-function isRetiredOldLife(key: string, state: string): boolean {
-  if (state === AGENT_DIRECTOR_PENDING_STATE || AGENT_DIRECTOR_DEAD_STATES.has(state)) return false
+function ownRowOldLifeOf(key: string, state: string): OwnRowOldLife | undefined {
+  if (state === AGENT_DIRECTOR_PENDING_STATE || AGENT_DIRECTOR_DEAD_STATES.has(state)) return undefined
   const retired = retiredKeyReadingOf(key)
-  return retired.recorded && !retired.marked
+  if (retired.recorded) return retired.marked ? undefined : OWN_ROW_OLD_LIFE_RETIRED
+  return isOwnRowOldLifeHeld(key) ? OWN_ROW_OLD_LIFE_HELD : undefined
 }
 
 /**
- * The reconnect adapter's answer for a retired key's old life (b.jg5
- * SRJ-805; `isRetiredOldLife`), read `state`: no `/mcp reconnect` is typed
- * into it and no pane is read. The `working`-row evidence and the runs of
- * deferrals on the row are ended (they were the old life's), one live-row
- * sequence is started through the session manager's start entry
- * (`startLiveRowSequence`: seeded with `state`, entry at step 1, the
- * conversation not kept, the retired-key flag set, ending in a launch, alert
- * context `recovery`), so its step 6 is the reuse spawn that begins the new
- * life, and one line names the start's answer:
+ * The reconnect adapter's answer for persona `key`'s own row read `state`
+ * that is an old life (`ownRowOldLifeOf`; b.jg5 SRJ-805, SRJ-810): no
+ * `/mcp reconnect` is typed into it and no pane is read. One path serves a
+ * retired key's old life and a held own row of a key that is not recorded:
+ * the `working`-row evidence and the runs of deferrals on the row are ended
+ * (they were the old life's), one live-row sequence is started through the
+ * session manager's start entry (`startLiveRowSequence`: seeded with
+ * `state`, entry at step 1, the conversation not kept, the retired-key flag
+ * set only for a retired key, ending in a launch, alert context
+ * `recovery`), so its step 6 is the reuse spawn that begins the new life,
+ * and one line names the start's answer:
  *
  *   [slack] reconnectSession: persona=<key> is <state> and its key is retired with no new life begun — not typing /mcp reconnect into its old life; the live-row sequence replaces it (start answered <answer>); deferring (b.jg5 SRJ-805)
+ *   [slack] reconnectSession: persona=<key> is <state> and its own row is held for an old life — not typing /mcp reconnect into it; the live-row sequence replaces it (start answered <answer>); deferring (b.jg5 SRJ-810, SRJ-805)
  *
- * The answer is 'transient', which restart.ts neither counts nor escalates
- * (`RESTART_OUTCOME_RECONNECT_DEFERRED`), whatever the start answered; the
- * running sequence then holds every other launch path for the persona
- * (SRJ-706). Never throws.
+ * While the old-life wait runs on the row the start answers `already-running`
+ * and the start entry arms the persona's retry timer with the
+ * held-for-an-old-life cause (b.jg5 SRJ-811), so no sequence starts beside
+ * the wait. The answer is 'transient', which restart.ts neither counts nor
+ * escalates (`RESTART_OUTCOME_RECONNECT_DEFERRED`), whatever the start
+ * answered; the running sequence then holds every other launch path for the
+ * persona (SRJ-706). Never throws.
  */
-function replaceRetiredOldLife(key: string, state: string): 'transient' {
+function replaceOwnRowOldLife(key: string, state: string, why: OwnRowOldLife): 'transient' {
   forgetWorkingRowEvidence(key)
   endWorkingRowDeferral(key)
   endPromptRowDeferral(key)
@@ -2317,14 +2363,28 @@ function replaceRetiredOldLife(key: string, state: string): 'transient' {
     lastReadState: state,
     entryStep: LIVE_ROW_SEQUENCE_ENTRY_KILL,
     keepsConversation: false,
-    retiredKey: true,
+    retiredKey: why === OWN_ROW_OLD_LIFE_RETIRED,
     launches: true,
     alertContext: KILL_FAILURE_CONTEXT_RECOVERY,
   })
   console.error(
-    `[slack] reconnectSession: persona=${key} is ${state} and its key is retired with no new life begun — not typing /mcp reconnect into its old life; the live-row sequence replaces it (start answered ${startAnswer}); deferring (b.jg5 SRJ-805)`,
+    why === OWN_ROW_OLD_LIFE_RETIRED
+      ? `[slack] reconnectSession: persona=${key} is ${state} and its key is retired with no new life begun — not typing /mcp reconnect into its old life; the live-row sequence replaces it (start answered ${startAnswer}); deferring (b.jg5 SRJ-805)`
+      : reconnectHeldOwnRowLine(key, state, startAnswer),
   )
   return 'transient'
+}
+
+/**
+ * The reconnect adapter's line for a held own row of a key that is not
+ * recorded (b.jg5 SRJ-810; `replaceOwnRowOldLife`):
+ *
+ *   [slack] reconnectSession: persona=<key> is <state> and its own row is held for an old life — not typing /mcp reconnect into it; the live-row sequence replaces it (start answered <answer>); deferring (b.jg5 SRJ-810, SRJ-805)
+ *
+ * Pure.
+ */
+export function reconnectHeldOwnRowLine(key: string, state: string, startAnswer: string): string {
+  return `[slack] reconnectSession: persona=${key} is ${state} and its own row is held for an old life — not typing /mcp reconnect into it; the live-row sequence replaces it (start answered ${startAnswer}); deferring (b.jg5 SRJ-810, SRJ-805)`
 }
 
 /**
@@ -3458,6 +3518,20 @@ export async function main(): Promise<void> {
     recordStartupError: (classLabel, entry) => recordStartupError(classLabel, entry),
     unclassifiedErrorEpisodes: waitUnclassifiedErrors,
   })
+  // b.jg5 SRJ-810: once a hold ends, each persona recorded as waiting on it
+  // that is still applied and not latched is retried at once through the
+  // retry controller's run-now entry (armed with the held-for-an-old-life
+  // cause when it was not); one waiting on its own row, once the wait the
+  // end stopped there has settled. Registered on the one hold set after the
+  // session manager's own end observer (`setOldLifeHolds` above), so the
+  // hold's wait is stopped first. The set lives for the server's life;
+  // nothing removes it.
+  oldLifeHolds.onEnd(
+    createOldLifeHoldEndRetry({
+      runNow: (key) => retryTimers.runNow(key, { kind: UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD }, UNAVAILABLE_RETRY_RUN_NOW_HOLD_ENDED),
+      isApplied: (key) => getAppliedPersona(key) !== undefined,
+    }),
+  )
 
   // b.jg5 SRJ-307, SRJ-310: the per-persona tmux-unresponsive condition,
   // held in the notice episodes, apart from the outage flags. The outage
@@ -3629,6 +3703,10 @@ export async function main(): Promise<void> {
       retryTimers.stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
       tmuxUnresponsive.cancelAlert(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
     },
+    // b.jg5 SRJ-811: right after each of those stops before the kill, the
+    // key is forgotten from every old-life hold's waiting record, and a wait
+    // no persona left in the applied configuration waits on is stopped.
+    forgetOldLifeWaits,
     forgetFailures,
     forgetDisconnectedStreak,
     forgetNotConnectedEpisode,
@@ -3946,6 +4024,16 @@ export async function main(): Promise<void> {
     // when an old-life wait runs on the persona's own row, the gate also arms
     // its retry timer, since the wait launches no one.
     isLiveRowSequenceRunning: (key) => liveRowSequenceGate(key, 'runRestartWork'),
+    // b.jg5 SRJ-810, SRJ-812: while an old life may still run in the applied
+    // persona's working directory (a hold on its own row excepted), its
+    // restart work (a fired timer, a retry, a human-triggered restart, the
+    // lost-message trigger's included) makes no agent-director call: the
+    // session manager's hold step records it as waiting, starts the hold's
+    // wait and arms its retry timer, and the work answers sequence-waiting.
+    isHeldForOldLife: (key) => {
+      const persona = getAppliedPersona(key)
+      return persona !== undefined && oldLifeHoldStep(persona, 'runRestartWork')
+    },
     // b.jg5 SRJ-610: each run's readings and verdicts feed the slow-recovery
     // count; nothing in the run changes because of it.
     slowRecovery,

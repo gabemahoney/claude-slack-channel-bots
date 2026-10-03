@@ -13,6 +13,16 @@
  *   launches the persona itself through the injected `launch`, which joins a
  *   launch already in flight for the persona (`spawnForPersona`). A launch
  *   failure is not a new outcome: it takes today's spawn-failure path.
+ *   Step 4 is SR-6.1's as amended by b.jg5 SRJ-1502: "(4) launch, which
+ *   waits while an old life that may still be running holds the persona's
+ *   working directory (b.jg5 SRJ-809, SRJ-810); the persona is retried on
+ *   its UNAVAILABLE retry timer (b.jg5 SRJ-301) until that wait ends." Every
+ *   launch of a persona, the start pass's, an apply's and this controller's
+ *   after a retry, goes through `spawnForPersona`, whose old-life gate makes
+ *   that wait: no agent-director call, the hold's wait started, the
+ *   persona's retry timer armed, `sequence-waiting` answered. The persona is
+ *   still `up` (its Slack connection serves), so the retry timer's not-up
+ *   gate does not stop that timer, and the launch's result is not read here.
  * - `broken` (credentials-broken): the credentials file is missing,
  *   unreadable or locally invalid, or Slack refused a token (at bring-up, on
  *   a reopen of a running persona, or in a Web API call of a running persona,
@@ -348,7 +358,10 @@ export interface PersonaBringUpControllerDeps
   /**
    * Launch a persona that reached `up` through a retry: the persona launch
    * path, which joins a launch already in flight for it. Its result is not
-   * inspected; a throw or rejection is logged.
+   * inspected; a throw or rejection is logged. Production passes
+   * `spawnForPersona`, whose old-life gate holds the launch back while an old
+   * life holds the persona's working directory (b.av2 SR-6.1 step 4 as
+   * amended by b.jg5 SRJ-1502; SRJ-810), with its retry timer armed.
    */
   launch: (persona: Persona) => Promise<unknown>
   /**

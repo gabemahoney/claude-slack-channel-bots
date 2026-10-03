@@ -119,10 +119,22 @@
  * after the last-applied write and before the teardown runs; a failed
  * retired-key write or rewrite begins none; the teardown kill marks the hold
  * kill-failed only when its tries decided the ordinary alert, and no kill
- * outcome ends it, the next read of the old row does; a rename's new key
- * still comes up while the old key's hold is on its directory (nothing is
- * refused yet); and a stopped, plain or cleaned-up run leaves no set
- * installed.
+ * outcome ends it, the next read of the old row does; a rename's new key is
+ * recorded as waiting on the old key's hold and held back; and a stopped,
+ * plain or cleaned-up run leaves no set installed.
+ *
+ * The hold-refusal block (b.jg5 SRJ-810, SRJ-811, SRJ-711 bullet 2,
+ * SRJ-715, SRJ-1515; AC 54) runs the real launch path with the old-life wait
+ * installed (the harness's default, as `main()`): a rename whose teardown kill fails holds the new
+ * key back while the old row is live (no call on its id), the wait's rounds
+ * make only kill, status, get and `find-missing` calls on the old key, its
+ * CONFLICT and its kill failure each write one startup-errors entry and end
+ * nothing, and the new key's plain first spawn comes at once, only after the
+ * read that shows the old row `ended` or lists it in a `find-missing` run's
+ * `ids`; a persona added in a removed persona's held directory waits the
+ * same way; a destructive modify's same-key new half is left to the
+ * retired-key rule (no wait, no waiter). AC 50's rename shows the same order
+ * after a teardown kill that succeeds.
  *
  * Confirmation processing, invalid, stale and no-op candidates and step 1's
  * write sequence are pinned in `tests/reload.test.ts`; the preview's wording in
@@ -138,7 +150,7 @@ import { dirname, join, relative } from 'node:path'
 
 import type { PersonaConfigInput, PersonaInput } from '../src/config.ts'
 import { isCredentialsBroken, type PersonaBringUpOutcome } from '../src/persona-bringup-controller.ts'
-import { formatPersonaNotice } from '../src/persona-notifier.ts'
+import { formatPersonaNotice, PERSONA_TEARDOWN_NOTICE_DURING_WAIT } from '../src/persona-notifier.ts'
 import {
   PERSONA_CONFIG_DIR_UNRESOLVABLE,
   PERSONA_CREDENTIALS_CHANGE_FAILED,
@@ -185,6 +197,10 @@ import {
   isDialogApproverRunning,
   noteOldLifeRowRead,
   OLD_LIFE_ROW_READ_NO_ROW,
+  ensureOldLifeWait,
+  LIVE_ROW_START_NOT_INSTALLED,
+  oldLifeHoldEndRetryLine,
+  oldLifeHoldLaunchLine,
   personaConfigDirLabelValue,
   readPersonaRowState,
   RETRY_ROW_READ_SITE,
@@ -192,6 +208,7 @@ import {
   REUSE_RECORDED_SINCE_RECORDED_AGAIN,
   reuseRecordedInFlightLine,
   SPAWN_ACTION_FRESH_RETIRED,
+  type OldLifeHoldStepWait,
 } from '../src/session-manager.ts'
 import {
   cannedErr,
@@ -209,13 +226,21 @@ import {
 } from './test-helpers/agent-director-stub.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { KILL_RETRY_SPACING_MS, KILL_RETRY_TRIES } from '../src/kill-retry.ts'
-import { KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN, KILL_FAILURE_VERSION_ORDINARY, selectKillFailureAlertRoute } from '../src/kill-failure-alert.ts'
+import {
+  KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN,
+  KILL_FAILURE_VERSION_ORDINARY,
+  PERSONA_KILL_FAILED_LABEL,
+  PERSONA_TEARDOWN_NOTICE_LABEL,
+  selectKillFailureAlertRoute,
+} from '../src/kill-failure-alert.ts'
+import { OLD_LIFE_WAIT_LOG_PREFIX, OLD_LIFE_WAIT_SITE } from '../src/old-life-wait.ts'
 import { INVALID_FLAGS_HOLD_ALERT_TEXT } from '../src/invalid-flags-hold.ts'
 import {
   LIVE_ROW_LAUNCH_REASON_RETIRED_KEY,
   LIVE_ROW_LAUNCH_REUSE,
   LIVE_ROW_OUTCOME_LAUNCHED,
   LIVE_ROW_OUTCOME_STOPPED,
+  LIVE_ROW_START_STARTED,
   LIVE_ROW_STOP_TEARDOWN,
   liveRowSequenceLaunchLine,
   type LiveRowSequenceOutcome,
@@ -1434,27 +1459,55 @@ describe('a retired key is launched by a reuse spawn at every launch path, never
     expectNoPostNoLeak(again)
   })
 
-  test("AC 50: a renamed persona's new key gets a plain first spawn and its old key is recorded; renamed back, the old key comes up by a reuse spawn of its id, never a resume, and the other key is now recorded", async () => {
+  // b.jg5 SRJ-810, SRJ-711 bullet 2: the old key's hold is on the directory
+  // the new key names, and a successful teardown kill ends no hold by itself,
+  // so the new key's bring-up is held back and starts the hold's wait; the
+  // wait's first read of the old row (ended) ends the hold, whose end retries
+  // the new key at once: its plain first spawn comes only after that read.
+  test("AC 50: a renamed persona's new key gets a plain first spawn, only after the old-life wait's first read of the old row ends the hold, and its old key is recorded; renamed back, the old key comes up the same way by a reuse spawn of its id, never a resume, and the other key is now recorded", async () => {
     const { run, personas } = await running(['alpha', 'bravo'], REAL_LAUNCH)
     const [alpha, bravo] = personas
     const [bravoKey, renamedKey] = keysOf('bravo', 'bravo2')
+    const [bravoId, renamedId] = [bravoKey, renamedKey].map(personaInstanceId)
     const renamed = { ...bravo!, name: 'bravo2' }
+    const adFrom = run.composition!.agentDirectorCalls.length
 
     await applyConfig(run, [alpha!, renamed])
+    await until(() => launchesOf(run, 'bravo2').at(-1)?.action === 'spawned')
 
-    expect(launchesOf(run, 'bravo2')).toEqual([{ op: 'launch', key: renamedKey, via: 'apply', action: 'spawned' }])
+    // Step 6's bring-up was held back (no call on its id); the hold's end retried it at once.
+    expect(launchesOf(run, 'bravo2')).toEqual([
+      { op: 'launch', key: renamedKey, via: 'apply', action: 'sequence-waiting' },
+      { op: 'launch', key: renamedKey, via: 'unavailable-retry', action: 'spawned' },
+    ])
     expect(instanceCallsSince(run, 'bravo2', 0)).toEqual(['spawn ok'])
-    expect(lastSpawnOf(run, 'bravo2')).toMatchObject({ id: personaInstanceId(renamedKey), reuse: false })
+    expect(lastSpawnOf(run, 'bravo2')).toMatchObject({ id: renamedId, reuse: false })
+    // The order: the teardown's kill, the wait's kill and its read of the old row, then the new key's spawn.
+    expect(rowCallsUntilSpawnOf(run, adFrom, renamedId, [bravoId, renamedId])).toEqual([
+      `kill ${bravoId} ok`,
+      `kill ${bravoId} ok`,
+      `get ${bravoId} ok`,
+      `spawn ${renamedId} ok`,
+    ])
+    expect(run.oldLifeHolds.snapshot()).toEqual([])
+    expect(run.logs.filter((line) => line === oldLifeHoldEndRetryLine(bravoId, [renamedKey], []))).toHaveLength(1)
+    expect(run.retryTimers!.armedKeys()).toEqual([])
     expect(run.retiredKeys.isRecorded(bravoKey)).toBe(true)
     expect(run.retiredKeys.isRecorded(renamedKey)).toBe(false)
     expect(markWrittenLines(run, renamedKey)).toEqual([])
     // The old key's row, killed and kept by its teardown (b.jg5 SRJ-715).
     expect(h.rowOf('bravo')).toMatchObject({ state: 'ended', cwd: bravo!.working_directory })
     const bravoFrom = run.composition!.instanceCallsOf('bravo').length
+    const bravoLaunches = launchesOf(run, 'bravo').length
 
     await applyConfig(run, [alpha!, bravo!])
+    await until(() => launchesOf(run, 'bravo').at(-1)?.action === SPAWN_ACTION_FRESH_RETIRED)
 
-    expect(launchesOf(run, 'bravo').at(-1)).toEqual({ op: 'launch', key: bravoKey, via: 'apply', action: SPAWN_ACTION_FRESH_RETIRED })
+    // The renamed key's old row now holds the directory: the same wait, then the retired key's reuse.
+    expect(launchesOf(run, 'bravo').slice(bravoLaunches)).toEqual([
+      { op: 'launch', key: bravoKey, via: 'apply', action: 'sequence-waiting' },
+      { op: 'launch', key: bravoKey, via: 'unavailable-retry', action: SPAWN_ACTION_FRESH_RETIRED },
+    ])
     expect(instanceCallsSince(run, 'bravo', bravoFrom)).toEqual(['reuse-spawn ok'])
     expect(lastSpawnOf(run, 'bravo')).toMatchObject({ id: personaInstanceId(bravoKey), reuse: true })
     expect(markWrittenLines(run, bravoKey)).toHaveLength(1)
@@ -3953,7 +4006,8 @@ describe('b.jg5 SRJ-808, SRJ-715: step 1 stops each recorded key\'s approver bef
 // the session manager's (`run.oldLifeHolds`). How a hold ends and what it
 // will refuse are tested in tests/old-life-wait.test.ts; here: which holds a
 // confirmed apply begins and when, that a failed apply begins none, the
-// teardown kill's kill-failed mark, and that nothing is refused yet.
+// teardown kill's kill-failed mark, and that a rename's new key is held back
+// (the hold-refusal block below follows it to the hold's end).
 // ---------------------------------------------------------------------------
 
 /** The hold apply step 1 begins on `name`'s key at `directory` (the old declaration's working directory), waited on by no one recorded. */
@@ -4108,32 +4162,45 @@ describe('b.jg5 SRJ-809: apply step 1 begins an old-life hold on each key it rec
     expect(run.oldLifeHolds.waitsOnKillFailed(holdPersonaOf(bravo!))).toBe(killFailed)
     expect(holdLines(run)).toEqual([oldLifeHoldBeganLine(stepOneHold('bravo', bravo!.working_directory))])
 
-    // The next read of the old row (the retry timer's row read): ended ends the hold with one end line; live keeps it as it is.
+    // The next read of the old row (the retry timer's row read): ended ends the hold with one end line, then the
+    // end-retry observer's line (no persona waited); live keeps it as it is.
     expect((await readPersonaRowState(bravoKey)).state).toBe(live ? 'waiting' : 'ended')
 
     expect(run.oldLifeHolds.snapshot()).toEqual(live ? [hold] : [])
     const readName = `${RETRY_ROW_READ_SITE.site}: ${RETRY_ROW_READ_SITE.what}`
-    expect(holdLines(run).slice(1)).toEqual(live ? [] : [oldLifeHoldEndedLine(hold, OLD_LIFE_HOLD_END_READ_ENDED, readName)])
+    expect(holdLines(run).slice(1)).toEqual(
+      live ? [] : [oldLifeHoldEndedLine(hold, OLD_LIFE_HOLD_END_READ_ENDED, readName), oldLifeHoldEndRetryLine(bravoId, [], [])],
+    )
     expect(run.clock.pendingCount()).toBe(0)
     expectNoPostNoLeak(run)
   })
 
-  test("nothing is refused yet: a rename whose teardown kill fails leaves the old key's hold, marked kill-failed, on the working directory the new key names, and the new key still comes up by a plain first spawn (real launch)", async () => {
+  // b.jg5 SRJ-810: the hold now refuses the launch. The wait the gate starts
+  // meets a CONFLICT at its kill here, so its round ends with the hold kept;
+  // how the wait goes on and ends is the SRJ-810/SRJ-811 block's.
+  test("a rename whose teardown kill fails leaves the old key's hold, marked kill-failed, on the working directory the new key names: the new key is recorded as waiting on it and held, its bring-up's launch answering sequence-waiting with no agent-director call on its id and its retry timer armed (real launch)", async () => {
     const killQueue: KillQueue = []
     const { run, personas } = await running(['alpha', 'bravo'], { realLaunch: true, agentDirector: { killQueue } })
     const [alpha, bravo] = personas
     const renamed = { ...bravo!, name: 'bravo2' }
+    const renamedKey = h.key('bravo2')
     for (let i = 0; i < KILL_RETRY_TRIES; i++) killQueue.push(cannedErr(errTmuxKillFailed()))
+    killQueue.push(cannedErr(errTmuxSessionConflict('kill', 'different-id')))
 
     const { applying } = await confirmConfig(run, [alpha!, renamed])
     await driveTeardownKillTries(run, KILL_RETRY_TRIES)
     await applying
+    await until(() => waitEndLines(run, 'bravo').length === 1)
 
     expect(h.rowOf('bravo')).toMatchObject({ state: 'waiting', cwd: bravo!.working_directory })
-    expect(run.oldLifeHolds.holdsWaitedOnBy(holdPersonaOf(renamed))).toEqual([stepOneHold('bravo', bravo!.working_directory, true)])
+    const held = { ...stepOneHold('bravo', bravo!.working_directory, true), waiting: [renamedKey] }
+    expect(run.oldLifeHolds.snapshot()).toEqual([held])
+    expect(run.oldLifeHolds.holdsWaitedOnBy(holdPersonaOf(renamed))).toEqual([held])
     expect(run.oldLifeHolds.waitsOnKillFailed(holdPersonaOf(renamed))).toBe(true)
-    expect(launchesOf(run, 'bravo2')).toEqual([{ op: 'launch', key: h.key('bravo2'), via: 'apply', action: 'spawned' }])
-    expect(instanceCallsSince(run, 'bravo2', 0)).toEqual(['spawn ok'])
+    expect(launchesOf(run, 'bravo2')).toEqual([{ op: 'launch', key: renamedKey, via: 'apply', action: 'sequence-waiting' }])
+    expect(instanceCallsSince(run, 'bravo2', 0)).toEqual([])
+    expect(run.composition!.agentDirectorCalls.filter((call) => call.id === personaInstanceId(renamedKey))).toEqual([])
+    expect(run.retryTimers!.armedKeys()).toEqual([renamedKey])
     expect(run.appliedKeys()).toEqual(keysOf('alpha', 'bravo2'))
     expectNoPostNoLeak(run)
   })
@@ -4175,6 +4242,282 @@ describe('b.jg5 SRJ-809: apply step 1 begins an old-life hold on each key it rec
     h = makeReloadHarness({ personaConfigDirs: true })
     noRow(deltaId)
     expect(restarted.oldLifeHolds.snapshot().map((hold) => hold.instanceId)).toEqual([deltaId])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// What a hold refuses, end to end (b.jg5 SRJ-810, SRJ-811, SRJ-711 bullet 2,
+// SRJ-715, SRJ-1515; AC 54)
+//
+// Real launch with the old-life wait installed (the harness's default): a launch the
+// old-life gate holds back starts the hold's wait (the live-row sequence's
+// kill and `find-missing` steps on the old key, with no launch) and arms the
+// waiting persona's retry timer on the run's retry timers; each later retry
+// is held back again and starts the next round; the hold's end retries the
+// waiting persona at once (the end-retry observer). Each round's kill takes
+// the next answer on the stub's kill queue; `driveUntil` moves `run.clock`
+// to each timer in turn (kill tries, retries, `find-missing` waits). The
+// startup-errors entries are the run's log-only record
+// (`run.composition.killFailureEntries`). How a wait's answers map to
+// entries, outages and alerts, one class at a time, is
+// tests/old-life-wait.test.ts's; the gate's unit cases are
+// tests/session-manager.test.ts's.
+// ---------------------------------------------------------------------------
+
+/** The stub's `find-missing` answers, in order (each run takes the next; an empty queue answers no row). */
+type FindMissingQueue = NonNullable<StubClientOptions['findMissingQueue']>
+
+/** The old-life wait's end lines for the old key `name` (one per round), in order. */
+function waitEndLines(run: ReloadRun, name: string): string[] {
+  const key = h.key(name)
+  return run.logs.filter((line) => line.startsWith(`${OLD_LIFE_WAIT_LOG_PREFIX} persona=${key} (instanceId=${personaInstanceId(key)}): ended`))
+}
+
+/**
+ * Yield turns, then move `run.clock` to its next timer, until `cond` holds;
+ * fails when nothing is pending and `cond` does not hold, or after 40 moves.
+ */
+async function driveUntil(run: ReloadRun, cond: () => boolean): Promise<void> {
+  for (let moves = 0; moves < 40; moves++) {
+    await turns()
+    if (cond()) return
+    const next = run.clock.pending().map((timer) => timer.dueAt)
+    if (next.length === 0) break
+    await run.clock.advanceTo(Math.min(...next))
+  }
+  await turns()
+  expect(cond()).toBe(true)
+}
+
+/**
+ * The calls on `ids` and every `find-missing` run, from `from` (an
+ * `agentDirectorCalls` length) up to and including the first spawn of
+ * `spawnId`, as `<verb> <id> <result>` (`findMissing <result>` for a run).
+ */
+function rowCallsUntilSpawnOf(run: ReloadRun, from: number, spawnId: string, ids: readonly string[]): string[] {
+  const calls = adCallsSince(run, from).filter((c) => c.verb === 'findMissing' || (c.id !== undefined && ids.includes(c.id)))
+  const spawnAt = calls.findIndex((c) => c.verb === 'spawn' && c.id === spawnId)
+  return calls.slice(0, spawnAt === -1 ? undefined : spawnAt + 1).map((c) => (c.verb === 'findMissing' ? `findMissing ${c.result}` : `${c.verb} ${c.id} ${c.result}`))
+}
+
+/** The class labels of the run's startup-errors entries, in order. */
+function entryLabels(run: ReloadRun): string[] {
+  return run.composition!.killFailureEntries.map((entry) => entry.classLabel)
+}
+
+/** `n` kill answers of ErrTmuxKillFailed: a kill that fails after all its tries (the ordinary alert). */
+function failedKills(n = KILL_RETRY_TRIES): KillQueue {
+  return Array.from({ length: n }, () => cannedErr(errTmuxKillFailed()))
+}
+
+/** The old-life gate's line for `name`, held back by the hold on `heldId` at `directory`, whose wait it started. */
+function heldLaunchLine(name: string, directory: string, heldId: string): string {
+  const waits: OldLifeHoldStepWait[] = [{ instanceId: heldId, wait: LIVE_ROW_START_STARTED }]
+  return oldLifeHoldLaunchLine('spawnForPersona', renderPersonaRef(name, h.key(name)), realpathSync(directory), waits, true)
+}
+
+describe('b.jg5 SRJ-810, SRJ-811, SRJ-711: no persona is brought up into a directory an old life holds; once the old row reads ended or is listed missing, it comes up at once by a plain first spawn (real launch, AC 54)', () => {
+  test.each<{ label: string; end: 'ended' | 'ids' }>([
+    { label: "the old row set ended, read by the wait's next round", end: 'ended' },
+    { label: "the old row, still live after the wait's next kill, listed in a find-missing run's ids", end: 'ids' },
+  ])("a rename whose teardown kill fails: bravo2 is held back while bravo's row is live, the wait makes only kill, status, get and find-missing calls on the old key, its CONFLICT and its kill failure each write one entry and end nothing; $label, bravo2's first spawn is plain and comes only after that read", async ({ end }) => {
+    const killQueue: KillQueue = []
+    const findMissingQueue: FindMissingQueue = []
+    const [bravoKey, renamedKey] = keysOf('bravo', 'bravo2')
+    const [bravoId, renamedId] = [bravoKey, renamedKey].map(personaInstanceId)
+    let rowSurvivesKill = false
+    const { run, personas } = await running(['alpha', 'bravo'], {
+      realLaunch: true,
+      agentDirector: { killQueue, findMissingQueue },
+      killLeavesRowLive: (id) => rowSurvivesKill && id === bravoId,
+    })
+    const [alpha, bravo] = personas
+    const renamed = { ...bravo!, name: 'bravo2' }
+    const alphaUntouched = watchUntouched(run, 'alpha')
+    const adFrom = run.composition!.agentDirectorCalls.length
+    const bravoFrom = run.composition!.instanceCallsOf('bravo').length
+    // The teardown's tries, then the wait's first round: a CONFLICT at its kill.
+    killQueue.push(...failedKills(), cannedErr(errTmuxSessionConflict('kill', 'different-id')))
+
+    const { applying } = await confirmConfig(run, [alpha!, renamed])
+    await driveTeardownKillTries(run, KILL_RETRY_TRIES)
+    await applying
+    await until(() => waitEndLines(run, 'bravo').length === 1)
+
+    // Step 6's bring-up was held back with no call on bravo2's id, started the wait and armed bravo2 only.
+    expect(launchesOf(run, 'bravo2')).toEqual([{ op: 'launch', key: renamedKey, via: 'apply', action: 'sequence-waiting' }])
+    expect(run.logs.filter((line) => line === heldLaunchLine('bravo2', bravo!.working_directory, bravoId))).toHaveLength(1)
+    expect(run.retryTimers!.armedKeys()).toEqual([renamedKey])
+    // The teardown's alert, then the wait's CONFLICT: one persona-teardown-notice entry "during the wait".
+    expect(entryLabels(run)).toEqual([TEARDOWN_ALERT_CLASS, PERSONA_TEARDOWN_NOTICE_LABEL])
+    expect(run.composition!.killFailureEntries[1]!.entry).toContain(PERSONA_TEARDOWN_NOTICE_DURING_WAIT)
+
+    // The retry timer's next retry is held back again and starts the next round, whose kill fails after its tries.
+    killQueue.push(...failedKills())
+    await driveUntil(run, () => waitEndLines(run, 'bravo').length === 2)
+
+    expect(entryLabels(run)).toEqual([TEARDOWN_ALERT_CLASS, PERSONA_TEARDOWN_NOTICE_LABEL, PERSONA_KILL_FAILED_LABEL])
+    expect(run.composition!.killFailureEntries[2]!.entry).toContain(bravoId)
+    // Neither ended the wait: the row is live, the hold is on (kill-failed, bravo2 waiting), bravo2 not brought up.
+    expect(h.rowOf('bravo')).toMatchObject({ state: 'waiting', cwd: bravo!.working_directory })
+    expect(run.oldLifeHolds.snapshot()).toEqual([{ ...stepOneHold('bravo', bravo!.working_directory, true), waiting: [renamedKey] }])
+    expect(instanceCallsSince(run, 'bravo2', 0)).toEqual([])
+    expect(launchesOf(run, 'bravo2').map((r) => r.action)).toEqual(['sequence-waiting', 'sequence-waiting'])
+    expect(run.retryTimers!.armedKeys()).toEqual([renamedKey])
+
+    // The old row ends: set ended, or listed in the next find-missing run's ids with the row still live.
+    if (end === 'ended') h.seedRow(bravo!, { state: 'ended' })
+    else {
+      // That round's kill answers kill_sent false (nothing was signalled), which ends nothing (SRJ-811):
+      // only the run's ids end the hold.
+      rowSurvivesKill = true
+      killQueue.push(cannedOk(cannedKillResult(false)))
+      findMissingQueue.push(cannedOk(cannedFindMissing({ rows: { [bravoId]: 'ids' } })))
+    }
+    await driveUntil(run, () => instanceCallsSince(run, 'bravo2', 0).length > 0)
+    await until(() => run.retryTimers!.armedKeys().length === 0)
+
+    // bravo2's first spawn is plain, after the read that ended the hold, from the hold's end at once: each retry
+    // before it (the one that started the last round included) was held back.
+    expect(launchesOf(run, 'bravo2').map((r) => [r.via, r.action])).toEqual([
+      ['apply', 'sequence-waiting'],
+      ['unavailable-retry', 'sequence-waiting'],
+      ['unavailable-retry', 'sequence-waiting'],
+      ['unavailable-retry', 'spawned'],
+    ])
+    expect(instanceCallsSince(run, 'bravo2', 0)).toEqual(['spawn ok'])
+    expect(lastSpawnOf(run, 'bravo2')).toMatchObject({ id: renamedId, reuse: false, cwd: bravo!.working_directory })
+    const teardownTries = [`kill ${bravoId} ErrTmuxKillFailed`, `status ${bravoId} ok`, `kill ${bravoId} ErrTmuxKillFailed`, `status ${bravoId} ok`, `kill ${bravoId} ErrTmuxKillFailed`]
+    const finalRound = end === 'ended' ? [`kill ${bravoId} ok`, `get ${bravoId} ok`] : [`kill ${bravoId} ok`, `get ${bravoId} ok`, 'findMissing ok']
+    expect(rowCallsUntilSpawnOf(run, adFrom, renamedId, [bravoId, renamedId])).toEqual([
+      ...teardownTries,
+      `kill ${bravoId} ErrTmuxSessionConflict`,
+      ...teardownTries,
+      ...finalRound,
+      `spawn ${renamedId} ok`,
+    ])
+    // Every scripted kill answer was taken: in the ids variant, the final round's kill took kill_sent false.
+    expect(killQueue).toEqual([])
+    expect(run.logs.filter((line) => line === oldLifeHoldEndRetryLine(bravoId, [renamedKey], []))).toHaveLength(1)
+    expect(run.oldLifeHolds.snapshot()).toEqual([])
+    // The old key: only kills of its row, never a spawn, resume or delete, and never a retry timer.
+    expect(instanceCallsSince(run, 'bravo', bravoFrom).every((call) => call.startsWith('kill '))).toBe(true)
+    expect(run.retryTimers!.view(bravoKey)).toBeUndefined()
+    // Nothing more was written once the hold ended; alpha untouched; nothing posted; no timer left.
+    expect(run.composition!.killFailureEntries).toHaveLength(3)
+    alphaUntouched()
+    expect(run.clock.pendingCount()).toBe(0)
+    expectNoPostNoLeak(run)
+  })
+
+  test("a removal whose teardown kill fails, then charlie added in bravo's old working directory: charlie is held back the same way, with no call on its id, until the old row reads ended, then comes up at once by a plain first spawn", async () => {
+    const killQueue: KillQueue = []
+    const { run, personas } = await running(['alpha', 'bravo'], { realLaunch: true, agentDirector: { killQueue } })
+    const [alpha, bravo] = personas
+    const [bravoId, charlieKey] = [personaInstanceId(h.key('bravo')), h.key('charlie')]
+    const charlieId = personaInstanceId(charlieKey)
+    killQueue.push(...failedKills())
+    const { applying } = await confirmConfig(run, [alpha!])
+    await driveTeardownKillTries(run, KILL_RETRY_TRIES)
+    await applying
+    // No persona waits yet: the hold is on, marked, and no wait runs.
+    expect(run.oldLifeHolds.snapshot()).toEqual([stepOneHold('bravo', bravo!.working_directory, true)])
+    expect(waitEndLines(run, 'bravo')).toEqual([])
+    const charlie = h.persona('charlie', { working_directory: bravo!.working_directory })
+    h.writeCredentials(charlie)
+    const adFrom = run.composition!.agentDirectorCalls.length
+    // The wait's first round meets a CONFLICT, so the hold goes on.
+    killQueue.push(cannedErr(errTmuxSessionConflict('kill', 'different-id')))
+
+    await applyConfig(run, [alpha!, charlie])
+    await until(() => waitEndLines(run, 'bravo').length === 1)
+
+    expect(launchesOf(run, 'charlie')).toEqual([{ op: 'launch', key: charlieKey, via: 'apply', action: 'sequence-waiting' }])
+    expect(run.logs.filter((line) => line === heldLaunchLine('charlie', bravo!.working_directory, bravoId))).toHaveLength(1)
+    expect(run.oldLifeHolds.snapshot()).toEqual([{ ...stepOneHold('bravo', bravo!.working_directory, true), waiting: [charlieKey] }])
+    expect(run.composition!.agentDirectorCalls.filter((call) => call.id === charlieId)).toEqual([])
+    expect(run.retryTimers!.armedKeys()).toEqual([charlieKey])
+
+    h.seedRow(bravo!, { state: 'ended' })
+    await driveUntil(run, () => run.composition!.instanceCallsOf('charlie').length > 0)
+    await until(() => run.retryTimers!.armedKeys().length === 0)
+
+    expect(launchesOf(run, 'charlie').at(-1)).toEqual({ op: 'launch', key: charlieKey, via: 'unavailable-retry', action: 'spawned' })
+    expect(instanceCallsSince(run, 'charlie', 0)).toEqual(['spawn ok'])
+    expect(lastSpawnOf(run, 'charlie')).toMatchObject({ id: charlieId, reuse: false, cwd: bravo!.working_directory })
+    expect(rowCallsUntilSpawnOf(run, adFrom, charlieId, [bravoId, charlieId]).slice(-3)).toEqual([`kill ${bravoId} ok`, `get ${bravoId} ok`, `spawn ${charlieId} ok`])
+    expect(run.oldLifeHolds.snapshot()).toEqual([])
+    expect(run.clock.pendingCount()).toBe(0)
+    expectNoPostNoLeak(run)
+  })
+
+  test("a stopped run leaves nothing of the hold's refusal behind: its retry timers are closed with no timer pending, and the next real-launch run without the wait installed starts no wait on a hold its apply begins (the stopped run's wait bindings were removed)", async () => {
+    const killQueue: KillQueue = []
+    const { run, personas } = await running(['alpha', 'bravo'], { realLaunch: true, agentDirector: { killQueue } })
+    const [alpha, bravo] = personas
+    const renamedKey = h.key('bravo2')
+    killQueue.push(...failedKills(), cannedErr(errTmuxSessionConflict('kill', 'different-id')))
+    const { applying } = await confirmConfig(run, [alpha!, { ...bravo!, name: 'bravo2' }])
+    await driveTeardownKillTries(run, KILL_RETRY_TRIES)
+    await applying
+    await until(() => waitEndLines(run, 'bravo').length === 1)
+    expect(run.retryTimers!.armedKeys()).toEqual([renamedKey])
+    expect(run.clock.pendingCount()).toBe(1)
+
+    await run.stop()
+
+    expect(run.retryTimers!.armedKeys()).toEqual([])
+    expect(run.clock.pendingCount()).toBe(0)
+    const next = await h.startDetecting({ ...REAL_LAUNCH, oldLifeWait: false })
+    await next.ticks.tick()
+    await applyConfig(next, [alpha!])
+    // The removal of bravo2 (applied before the stop) begins a hold on its key in the new run's set.
+    const renamedId = personaInstanceId(renamedKey)
+    expect(next.oldLifeHolds.holdOf(renamedId)).toBeDefined()
+    expect(ensureOldLifeWait(renamedId)).toBe(LIVE_ROW_START_NOT_INSTALLED)
+    expect(next.retryTimers!.armedKeys()).toEqual([])
+    expectNoPostNoLeak(next)
+  })
+
+  // SRJ-810's exception: the hold step 1 begins on cscb_bravo is on the directory the new half names, and is on the
+  // new half's own row, so the old-life gate leaves the new half to the retired-key rule (SRJ-805).
+  test("a destructive modify of credentials_file whose teardown kill fails: the new half, whose own row is the old life, goes through the live-row sequence with the retired-key flag; its own launch starts no old-life wait on cscb_<key> and records no waiter (real launch, the wait installed)", async () => {
+    const killQueue: KillQueue = []
+    const { run, personas } = await running(['alpha', 'bravo'], { realLaunch: true, agentDirector: { killQueue } })
+    const [alpha, bravo] = personas
+    const bravoKey = h.key('bravo')
+    const bravoId = personaInstanceId(bravoKey)
+    const bravoRef = renderPersonaRef('bravo', bravoKey)
+    killQueue.push(...failedKills())
+    const moved = movedCredentials(bravo!)
+    const instanceFrom = run.composition!.instanceCallsOf('bravo').length
+    const logFrom = run.logs.length
+
+    const { applying } = await confirmConfig(run, [alpha!, moved])
+    await driveTeardownKillTries(run, KILL_RETRY_TRIES)
+    await applying
+    await until(() => !run.sequenceRunning('bravo'))
+
+    expect(launchesOf(run, 'bravo').at(-1)).toEqual({ op: 'launch', key: bravoKey, via: 'apply', action: 'sequence-waiting' })
+    expect(instanceCallsSince(run, 'bravo', instanceFrom)).toEqual([
+      'kill ErrTmuxKillFailed',
+      'kill ErrTmuxKillFailed',
+      'kill ErrTmuxKillFailed',
+      'reuse-spawn ErrInstanceIdCollision',
+      'kill ok',
+      'reuse-spawn ok',
+    ])
+    expect(run.logs.filter((l) => l === liveRowSequenceLaunchLine(bravoRef, { kind: LIVE_ROW_LAUNCH_REUSE, reason: LIVE_ROW_LAUNCH_REASON_RETIRED_KEY }))).toHaveLength(1)
+    expect(lastSpawnOf(run, 'bravo')).toMatchObject({ id: bravoId, reuse: true, cwd: bravo!.working_directory })
+    // No wait and no waiter: no wait line at all, and the hold the sequence's own read of the killed row ended
+    // had no persona recorded as waiting on it (the gate would have recorded bravo).
+    const since = run.logs.slice(logFrom)
+    expect(since.filter((line) => line.startsWith(`[slack] ${OLD_LIFE_WAIT_SITE}`))).toEqual([])
+    expect(since.filter((line) => line === oldLifeHoldEndRetryLine(bravoId, [], []))).toHaveLength(1)
+    expect(run.oldLifeHolds.snapshot()).toEqual([])
+    expect(run.retryTimers!.armedKeys()).toEqual([])
+    expect(run.clock.pendingCount()).toBe(0)
+    expectNoPostNoLeak(run)
   })
 })
 

@@ -5,7 +5,12 @@
  * Session identity (b.av2 SR-6.3): an MCP session is identified by the working
  * directory its client reports through `roots/list`. That directory is
  * compared by real path (`resolveRealPath`) with the applied personas' working
- * directories and maps to exactly one persona (`matchPersonaByRootsPath`). A
+ * directories and maps to exactly one persona (`matchPersonaByRootsPath`),
+ * except that a session opened from the working directory of an old life
+ * that may still be running is registered as no persona's session until
+ * that wait ends (b.av2 SR-6.3 as amended by b.jg5 SRJ-1505; SRJ-809,
+ * SRJ-810): `decideSessionAdmission` asks the injected held-directory query
+ * before it matches any persona, and refuses such a session (`held`). A
  * session is admitted only while that persona is up (b.av2 SR-6.4,
  * `decideSessionAdmission`, with the up check injected), and a persona that
  * stops being up has its session dropped (`dropPersonaSession`). The
@@ -42,7 +47,7 @@ import { join, resolve } from 'path'
 import { DM_CONTACT_RE, MCP_SERVER_NAME, resolveRealPath, type Persona, type ReplySettings } from './config.ts'
 import { chunkText, sanitizeFilename } from './lib.ts'
 import { renderPersonaRef } from './persona-identity.ts'
-import { describeSlackCallFailure, describeThrownValue, slackPlatformReason } from './persona-connection-errors.ts'
+import { describeSlackCallFailure, describeThrownValue, renderLogMessageText, slackPlatformReason } from './persona-connection-errors.ts'
 import { DM_OPEN_SCOPE, MISSING_SCOPE_ERROR } from './persona-destination.ts'
 import { isDryRun } from './tokens.ts'
 // Peer-PID + sessions.json registry have been deleted (SR-7.1). The
@@ -152,8 +157,21 @@ export function matchPersonaByRootsPath(
 }
 
 // ---------------------------------------------------------------------------
-// Session admission (b.av2 SR-6.3, SR-6.4)
+// Session admission (b.av2 SR-6.3 as amended by b.jg5 SRJ-1505, SR-6.4)
 // ---------------------------------------------------------------------------
+
+/**
+ * A directory held for an old life that may still be running (b.jg5
+ * SRJ-809, SRJ-810), as the held-directory query answers it: the held
+ * directory and every held old instance id on it (two holds on one
+ * directory give two ids).
+ */
+export interface SessionHeldDirectory {
+  /** The held directory, as its real path. */
+  readonly directory: string
+  /** Every held old instance id on it, in the hold set's begin order. */
+  readonly instanceIds: readonly string[]
+}
 
 /** Options for `decideSessionAdmission`. */
 export interface SessionAdmissionOptions extends MatchPersonaOptions {
@@ -169,6 +187,16 @@ export interface SessionAdmissionOptions extends MatchPersonaOptions {
    * state). The line omits it when absent.
    */
   describeNotUp?: (key: string) => string
+  /**
+   * The held-directory query (b.jg5 SRJ-810, SRJ-1505): given the session's
+   * roots real path, the held directory and every held old instance id on
+   * it, or undefined when that path is not held (production: the session
+   * manager's `oldLifeHeldDirectory`, which answers undefined before `main()`
+   * has installed the hold set). Asked before any persona is matched. A
+   * query that throws counts as held (fail safe), with no id known. Absent:
+   * nothing is held.
+   */
+  heldDirectory?: (rootsRealPath: string) => SessionHeldDirectory | undefined
 }
 
 /** What `decideSessionAdmission` decided for a session. */
@@ -179,11 +207,56 @@ export type SessionAdmission =
   | { kind: 'unmatched' }
   /** The matched persona is not up: refuse the session and keep any session already registered for it. */
   | { kind: 'not-up'; persona: Persona }
+  /**
+   * The roots working directory is held for an old life that may still be
+   * running (b.jg5 SRJ-810, SRJ-1505): refuse the session, whichever persona
+   * names the directory; register it as no persona's.
+   */
+  | { kind: 'held'; directory: string; instanceIds: readonly string[] }
+
+/**
+ * The one line `decideSessionAdmission` logs when it refuses a session
+ * opened from a held directory (b.jg5 SRJ-810, SRJ-1505): the held directory
+ * and every held old instance id, each JSON-quoted, with, when the query
+ * threw, what it threw:
+ *
+ *   [slack] Session refused: its working directory "<D>" is held for an old life that may still be running (instanceId="<id>"[, instanceId="<id>" …]) — registered as no persona's session until the hold ends (b.jg5 SRJ-810, SRJ-1505)
+ *   [slack] Session refused: its working directory "<D>" is held for an old life that may still be running (the held-directory query failed: <thrown> — taken as held) — registered as no persona's session until the hold ends (b.jg5 SRJ-810, SRJ-1505)
+ *
+ * Carries no token. Pure.
+ */
+export function sessionHeldRefusalLine(directory: string, instanceIds: readonly string[], failure?: string): string {
+  const quote = (text: string): string => JSON.stringify(renderLogMessageText(text))
+  const what =
+    failure !== undefined
+      ? `the held-directory query failed: ${failure} — taken as held`
+      : instanceIds.length === 0
+        ? 'no instance id given'
+        : instanceIds.map((id) => `instanceId=${quote(id)}`).join(', ')
+  return (
+    `[slack] Session refused: its working directory ${quote(directory)} is held for an old life that may still be running ` +
+    `(${what}) — registered as no persona's session until the hold ends (b.jg5 SRJ-810, SRJ-1505)`
+  )
+}
 
 /**
  * Decide whether a session whose roots working directory is `rootsPath` may
- * register (b.av2 SR-6.3, SR-6.4): match it to one persona by real path
- * (`matchPersonaByRootsPath`), then admit it only when that persona is up.
+ * register (b.av2 SR-6.3 as amended by b.jg5 SRJ-1505, SR-6.4): "MCP sessions
+ * still identify by the roots/list working directory, compared by real path,
+ * which maps to exactly one persona, except that a session opened from the
+ * working directory of an old life that may still be running (a retired
+ * key's, or a live pre-persona row's or any other swept row's whose
+ * start-sweep kill did not succeed) is registered as no persona's session
+ * until that wait ends (b.jg5 SRJ-809, SRJ-810)."
+ *
+ * First, before any persona is matched, the held-directory query
+ * (`options.heldDirectory`) is asked with the roots real path
+ * (`resolveRealPath`: a symlink resolves, and a missing directory compares by
+ * its lexical path): a held directory answers `held`, whichever persona now
+ * names it, up or not, and when none does, with one line naming the
+ * directory and every held old instance id (`sessionHeldRefusalLine`). Then
+ * the session is matched to one persona by real path
+ * (`matchPersonaByRootsPath`) and admitted only when that persona is up.
  * A persona that is not up (broken or retrying) keeps its instance, but the
  * instance's session is refused until the persona is up; the refusal logs one
  * line through `options.log`, with no token and no diagnostic class label:
@@ -199,16 +272,47 @@ export function decideSessionAdmission(
   personas: readonly Persona[],
   options: SessionAdmissionOptions,
 ): SessionAdmission {
+  const log = options.log ?? ((line: string) => console.error(line))
+  const held = heldDirectoryReading(rootsPath, options)
+  if (held !== undefined) {
+    log(sessionHeldRefusalLine(held.directory, held.instanceIds, held.failure))
+    return { kind: 'held', directory: held.directory, instanceIds: held.instanceIds }
+  }
   const persona = matchPersonaByRootsPath(rootsPath, personas, options)
   if (!persona) return { kind: 'unmatched' }
   if (options.isPersonaUp(persona.key)) return { kind: 'admitted', persona }
-  const log = options.log ?? ((line: string) => console.error(line))
   const why = options.describeNotUp ? ` (${options.describeNotUp(persona.key)})` : ''
   log(
     `[slack] Session refused: persona ${renderPersonaRef(persona.name, persona.key)} is not up${why} — ` +
       'not registered; its instance is kept and may register once the persona is up',
   )
   return { kind: 'not-up', persona }
+}
+
+/**
+ * The held-directory query's reading of `rootsPath` (b.jg5 SRJ-810): asked
+ * with its real path; an answer naming at least one instance id is held
+ * (its directory, or the real path when the answer names none); undefined,
+ * an answer with no id, or no query is not held. A query that throws counts
+ * as held, at the real path, with no id and `failure` set. Never throws.
+ */
+function heldDirectoryReading(
+  rootsPath: string,
+  options: SessionAdmissionOptions,
+): { directory: string; instanceIds: readonly string[]; failure?: string } | undefined {
+  const query = options.heldDirectory
+  if (query === undefined) return undefined
+  const target = resolveRealPath(rootsPath, options.realpath)
+  let answer: SessionHeldDirectory | undefined
+  try {
+    answer = query(target)
+  } catch (err) {
+    return { directory: target, instanceIds: [], failure: describeThrownValue(err) }
+  }
+  const ids = Array.isArray(answer?.instanceIds) ? answer.instanceIds.filter((id) => typeof id === 'string' && id !== '') : []
+  if (ids.length === 0) return undefined
+  const directory = typeof answer?.directory === 'string' && answer.directory !== '' ? answer.directory : target
+  return { directory, instanceIds: ids }
 }
 
 // ---------------------------------------------------------------------------

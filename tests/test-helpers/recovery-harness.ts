@@ -81,6 +81,15 @@
  *   `sequence-waiting` with no call while the persona's sequence runs, and
  *   while an old-life wait runs on its own `cscb_<key>` the gate also arms
  *   its timer (`held-for-old-life`, through the wait bindings' arm).
+ *   `isHeldForOldLife`, the old-life hook (b.jg5 SRJ-810, SRJ-812), is the
+ *   session manager's hold step over the applied persona
+ *   (`oldLifeHoldStep(persona, 'runRestartWork')`), as `main()` binds it:
+ *   while a hold other than one on the persona's own row is on its working
+ *   directory, the step records the persona as waiting, starts the hold's
+ *   wait unless one runs and arms its timer (`held-for-old-life`, through the
+ *   wait bindings' arm, so in `triggers`), and the restart work answers
+ *   `sequence-waiting` with no call; a key outside the applied set is never
+ *   held there.
  *   `slowRecovery`, the slow-recovery observer, is the harness's
  *   slow-recovery tracker (below), as `main()` binds it (b.jg5 SRJ-610).
  *   `options.restartDeps` replaces any of these. Every ask of the
@@ -112,6 +121,11 @@
  *   and cancels its alert check (`tmuxUnresponsive.cancelAlert(key,
  *   UNAVAILABLE_RETRY_STOP_TORN_DOWN)`, which logs nothing more when the
  *   stop observer has already cancelled it), the condition kept; then it
+ *   forgets the persona's old-life waits (the session manager's
+ *   `forgetOldLifeWaits(key)`, not awaited: the key is forgotten as waiting
+ *   on every hold, and a wait no persona left in the applied configuration
+ *   waits on is stopped with the teardown reason; b.jg5 SRJ-811), the step
+ *   production's turn takes right after the timer's stop; then it
  *   forgets the persona's latch silently (`latch.forget(key)`: no post, no
  *   set observer call, no line), the turn's step that production's
  *   `forgetConflictLatch` binds (b.jg5 SRJ-504), and then its
@@ -136,7 +150,8 @@
  *   LIVE_ROW_STOP_TEARDOWN)`), `whenLaunchSettled`, `cancelLaunchWait`
  *   (`cancelWorkingRowWait`), `stopRetryTimer` (the controller's
  *   `stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)`, then the condition's
- *   `cancelAlert` with the same reason), `forgetConflictLatch` (`latch`'s
+ *   `cancelAlert` with the same reason), `forgetOldLifeWaits` (the session
+ *   manager's teardown member, b.jg5 SRJ-811), `forgetConflictLatch` (`latch`'s
  *   `forget`), `forgetInvalidFlagsHold` (`invalidFlagsHold`'s `forget`),
  *   `forgetNoticeEpisodes` (`episodes.forget`), `resetOutageState`
  *   (`resetAllToHealthy`), `killInstance` (`killPersonaInstanceForTeardown`
@@ -402,6 +417,33 @@
  *   computed from the applied configuration (a persona whose working
  *   directory is the held directory, and the persona whose own `cscb_<key>`
  *   is held). `shutdown()`'s close stops every wait.
+ * - What a hold refuses (b.jg5 SRJ-810, SRJ-1502, SRJ-1505), composed as
+ *   `main()` composes it. Every launch (`launch(key)`, the restart path's
+ *   `launchSession`, a live-row sequence's step-6 launch) meets the session
+ *   manager's old-life gate in the real `spawnForPersona`: a persona whose
+ *   working directory a hold other than one on its own row holds is
+ *   recorded as waiting on it, the hold's wait is started unless one runs,
+ *   its timer is armed (`held-for-old-life`, in `triggers`) and the launch
+ *   answers `sequence-waiting` with no call; the restart work's old-life
+ *   hook (above) is the same step. The reconnect guard and the reconnect
+ *   adapter's held-own-row branch are the production code's own. The hold
+ *   set's end observer that retries the waiting personas
+ *   (`createOldLifeHoldEndRetry`) is registered after the session manager's
+ *   own, as `main()` registers it: its run-now is the controller's
+ *   `runNow(key, { kind: UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD },
+ *   UNAVAILABLE_RETRY_RUN_NOW_HOLD_ENDED)` and its applied query the live
+ *   applied set, so once a hold ends each persona recorded as waiting on it,
+ *   still applied and not latched, is retried at once, at the clock time of
+ *   the end, with no clock advance (the retry's run is awaited by
+ *   `settle()`). Each run-now is recorded in `holdEndRetries` (`{ key, at,
+ *   result }`). `admitSession(rootsPath)` is the admission driver: one
+ *   `decideSessionAdmission` call as `handleInitialized` makes it, over the
+ *   applied personas, the real up predicate (`createPersonaUpPredicate` over
+ *   the same serving connection, bring-up outcome and live applied set as the
+ *   relaunch gate), its line to `console.error` (`errors`) and the session
+ *   manager's held-directory query (`oldLifeHeldDirectory`) over the one hold
+ *   set; it answers the admission (`held`, `admitted`, `not-up`,
+ *   `unmatched`) and registers nothing.
  * - `tickEnd(key)`: what a health tick's healthy branch does to the
  *   condition, as `main()` binds `HealthCheckDeps.endTmuxUnresponsive`: the
  *   condition's end with reason `TMUX_UNRESPONSIVE_END_TICK` and the `live`
@@ -659,7 +701,8 @@
  *   `console.error` lines, the four notice lists, the startup-errors
  *   entries, the attempts, the triggers, the condition ends, the outage
  *   clears, the stops, the latch events, the stub's recorded spawn calls,
- *   the retries at once, the driver's Slack calls and the state directory as
+ *   the retries at once, the hold-end retries, the driver's Slack calls and
+ *   the state directory as
  *   a written file.
  * - `cleanup()`: first stops and forgets every dialog approver
  *   (`_resetDialogApprovers`, silently: none makes a call after the one in
@@ -680,8 +723,10 @@
  *   the configured-persona query (`_resetConfiguredPersonaQuery`), so two
  *   harnesses built one after the other share no query,
  *   the retired-key store's install (`_resetRetiredKeyStore`), so none is
- *   left installed after it, the old-life hold set's install
- *   (`_resetOldLifeHolds`), so no hold outlives the harness,
+ *   left installed after it, the hold set's end-retry observer (removed
+ *   first, so no hold a later step ends retries anyone) and the old-life
+ *   hold set's install (`_resetOldLifeHolds`), so no hold outlives the
+ *   harness,
  *   the stub spawn path and client with every launch still in flight and the
  *   approver's clock and cap, the
  *   findMissing memo, the tmux seams, the settings install, the version
@@ -887,7 +932,7 @@ import {
   type LiveRowSequenceStopReason,
   type RetiredKeyAttemptStart,
 } from '../../src/live-row-sequence.ts'
-import { getSessionByPersona } from '../../src/registry.ts'
+import { decideSessionAdmission, getSessionByPersona, type SessionAdmission } from '../../src/registry.ts'
 import {
   _resetRestartState,
   initRestart,
@@ -921,7 +966,9 @@ import {
   _whenDialogApproverStopped,
   buildLiveRowSequenceDeps,
   cancelWorkingRowWait,
+  createOldLifeHoldEndRetry,
   ensureOldLifeWait,
+  forgetOldLifeWaits,
   isDialogApproverRunning,
   isLaunchInFlight,
   isLiveRowSequenceRunning,
@@ -930,6 +977,8 @@ import {
   launchSession,
   liveRowSequenceGate,
   notifyRestartCapReached,
+  oldLifeHeldDirectory,
+  oldLifeHoldStep,
   personaRetryBlockCause,
   readPersonaRowState,
   reconcileOrphans,
@@ -980,11 +1029,13 @@ import {
   runDetachedRecoveryAttempt,
   runOutsideAttempts,
   UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
+  UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD,
   UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE,
   UNAVAILABLE_RETRY_ROW_ABSENT,
+  UNAVAILABLE_RETRY_RUN_NOW_HOLD_ENDED,
   UNAVAILABLE_RETRY_STOP_HELD,
   UNAVAILABLE_RETRY_STOP_LATCHED,
   UNAVAILABLE_RETRY_STOP_SHUTDOWN,
@@ -995,6 +1046,7 @@ import {
   type UnavailableRetryController,
   type UnavailableRetryMode,
   type UnavailableRetryOutcome,
+  type UnavailableRetryRunNowResult,
 } from '../../src/unavailable-retry.ts'
 import {
   installAdVersionRecheck,
@@ -1275,6 +1327,18 @@ export interface RecoveryRetryAtOnce {
 }
 
 /**
+ * One retry at once the old-life hold's end observer ran (b.jg5 SRJ-810;
+ * `createOldLifeHoldEndRetry` bound to the controller's `runNow`, as `main()`
+ * binds it): the persona, the clock time the hold ended at, and what
+ * `runNow` answered.
+ */
+export interface RecoveryHoldEndRetry {
+  readonly key: string
+  readonly at: number
+  readonly result: UnavailableRetryRunNowResult
+}
+
+/**
  * The version re-check `versionRecheck` installed on the harness clock
  * (b.jg5 SRJ-204): what its binary resolve answers, set by the case, and what
  * it did.
@@ -1305,6 +1369,7 @@ export type RecoveryTeardownDeps = Required<
     | 'whenLaunchSettled'
     | 'cancelLaunchWait'
     | 'stopRetryTimer'
+    | 'forgetOldLifeWaits'
     | 'forgetConflictLatch'
     | 'forgetInvalidFlagsHold'
     | 'forgetNoticeEpisodes'
@@ -1492,6 +1557,17 @@ export interface RecoveryHarness {
   runOldLifeWait(instanceId: string): Promise<LiveRowSequenceOutcome>
   /** Whether an old-life wait runs on `instanceId` (read-only; the registry's `isNoLaunchRunning`). */
   oldLifeWaitRunning(instanceId: string): boolean
+  /**
+   * Every retry at once the old-life hold's end observer ran, in order
+   * (b.jg5 SRJ-810); see the module comment.
+   */
+  readonly holdEndRetries: readonly RecoveryHoldEndRetry[]
+  /**
+   * Decide one MCP session whose roots working directory is `rootsPath`, as
+   * `handleInitialized` decides it (b.av2 SR-6.3, SR-6.4; b.jg5 SRJ-810,
+   * SRJ-1505); see the module comment.
+   */
+  admitSession(rootsPath: string): SessionAdmission
   /** Whether the old-life wait's unclassified-error episode on held instance id `instanceId` is open (read-only; b.jg5 SRJ-313, SRJ-811). */
   oldLifeWaitUnclassifiedOpen(instanceId: string): boolean
   /**
@@ -2035,6 +2111,24 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     recordStartupError: (classLabel, entry) => recordStartupError(classLabel, entry),
     unclassifiedErrorEpisodes: waitUnclassifiedErrors,
   })
+  // As main() registers it (b.jg5 SRJ-810), on the one hold set after the
+  // session manager's own end observer (`setOldLifeHolds` above), so the
+  // hold's wait is stopped first: each persona recorded as waiting on the
+  // hold that ended, still applied and not latched, is retried at once
+  // through the controller's run-now entry, armed with the
+  // held-for-an-old-life cause when it was not. Each run-now is recorded in
+  // `holdEndRetries`. Cleanup removes it.
+  const holdEndRetries: RecoveryHoldEndRetry[] = []
+  const removeHoldEndRetry = oldLifeHolds.onEnd(
+    createOldLifeHoldEndRetry({
+      runNow: (key) => {
+        const result = controller.runNow(key, { kind: UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD }, UNAVAILABLE_RETRY_RUN_NOW_HOLD_ENDED)
+        holdEndRetries.push({ key, at: clock.now(), result })
+        return result
+      },
+      isApplied: (key) => appliedPersona(key) !== undefined,
+    }),
+  )
   // As main() installs it (b.jg5 SRJ-702, SRJ-305): a kill's tries stop once
   // the persona is not up (the up predicate over the relaunch gate's
   // connection, bring-up outcome and live applied set) or the server is
@@ -2098,6 +2192,15 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     // agent-director call; when what runs on its own row is an old-life
     // wait, the gate also arms its retry timer (`held-for-old-life`).
     isLiveRowSequenceRunning: (key) => liveRowSequenceGate(key, 'runRestartWork'),
+    // As main() binds it (b.jg5 SRJ-810, SRJ-812): while an old life may
+    // still run in the applied persona's working directory (a hold on its
+    // own row excepted), the session manager's hold step records it as
+    // waiting, starts the hold's wait and arms its timer, and the restart
+    // work answers sequence-waiting with no agent-director call.
+    isHeldForOldLife: (key) => {
+      const persona = appliedPersona(key)
+      return persona !== undefined && oldLifeHoldStep(persona, 'runRestartWork')
+    },
     // As main() binds it (b.jg5 SRJ-610): each run's readings and verdicts
     // feed the slow-recovery tracker.
     slowRecovery,
@@ -2674,6 +2777,20 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     runOldLifeWait: (instanceId) => driveSequence(startOldLifeWait(instanceId)),
 
     oldLifeWaitRunning: (instanceId) => sequences.isNoLaunchRunning(instanceId),
+
+    holdEndRetries,
+
+    // As handleInitialized decides it (b.av2 SR-6.3, SR-6.4; b.jg5 SRJ-810,
+    // SRJ-1505): the applied personas, the real up predicate over the same
+    // serving connection, bring-up outcome and live applied set as the
+    // relaunch gate, its line to `console.error` (`errors`), and the session
+    // manager's held-directory query over the one hold set.
+    admitSession: (rootsPath) =>
+      decideSessionAdmission(rootsPath, appliedConfig().personas, {
+        isPersonaUp: createPersonaUpPredicate({ status: () => SERVING }, upQuery),
+        log: (line) => console.error(line),
+        heldDirectory: oldLifeHeldDirectory,
+      }),
     oldLifeWaitUnclassifiedOpen: (instanceId) => waitUnclassifiedErrors.isOpen(instanceId),
 
     oldLifeWaitSettled: (instanceId) => sequences._whenSettledOn(instanceId),
@@ -2736,6 +2853,11 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       void stopLiveRowSequence(key, LIVE_ROW_STOP_TEARDOWN)
       controller.stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
       tmuxUnresponsive.cancelAlert(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
+      // As main()'s `forgetOldLifeWaits` (b.jg5 SRJ-811), right after the
+      // timer's stop: the key is forgotten as waiting, and a wait no persona
+      // left in the applied configuration waits on is stopped; not awaited
+      // here (the teardown's turn awaits it; `oldLifeWaitSettled` reads it).
+      void forgetOldLifeWaits(key)
       // As main()'s `forgetConflictLatch` (b.jg5 SRJ-504): silently, before
       // the turn's episodes forget (the case's `episodes.forget(key)`).
       latch.forget(key)
@@ -2756,6 +2878,8 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
         controller.stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
         tmuxUnresponsive.cancelAlert(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
       },
+      // b.jg5 SRJ-811: the session manager's teardown member, over the harness's one hold set and registry.
+      forgetOldLifeWaits: (key) => forgetOldLifeWaits(key),
       // b.jg5 SRJ-504, SRJ-207, SRJ-1016: silently, each over the harness's one instance.
       forgetConflictLatch: (key) => latch.forget(key),
       forgetInvalidFlagsHold: (key) => invalidFlagsHold.forget(key),
@@ -2809,6 +2933,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       stops: [...stops],
       latchEvents: [...latchEvents],
       retriesAtOnce: [...retriesAtOnce],
+      holdEndRetries: [...holdEndRetries],
       spawnCalls: [...stub.calls.spawnCalls],
       lostMessageNotices: [...lostMessageNotices],
       slackCalls: Object.fromEntries([...slackStubs].map(([key, slack]) => [key, slack.callLog])),
@@ -2849,6 +2974,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       setKillFailureAlerts(undefined)
       _resetConfiguredPersonaQuery()
       _resetRetiredKeyStore()
+      removeHoldEndRetry()
       _resetOldLifeHolds()
       setPersonaKillKeepGoingQuery(undefined)
       for (const unbind of unbindLatch) unbind()

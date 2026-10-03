@@ -173,6 +173,7 @@ import {
   workingRowPaneGoneLine,
   LIVENESS_STATUS_SITE,
   RECONNECT_STATUS_SITE,
+  reconnectHeldOwnRowLine,
 } from '../src/server.ts'
 import { buildPersonaClientOrExit, type PersonaClientDeps } from '../src/agent-director-startup.ts'
 import {
@@ -271,6 +272,7 @@ import {
   createOldLifeHoldSet,
   loadRetiredKeyStore,
   OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1,
+  OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL,
   OLD_LIFE_HOLD_END_READ_ENDED,
   OLD_LIFE_HOLD_END_READ_MISSING,
   OLD_LIFE_HOLD_LOG_PREFIX,
@@ -310,6 +312,7 @@ import {
   UNAVAILABLE_RETRY_CAUSE_CONFIG,
   UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
   UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
+  UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
   isInsideAttempt,
@@ -4730,7 +4733,7 @@ describe('b.jg5 SRJ-809, SRJ-115: the liveness and reconnect adapters\' own-row 
   }
 
   /** The holds' end lines. */
-  const endLines = (): string[] => holdLines.filter((line) => line.startsWith(`${OLD_LIFE_HOLD_LOG_PREFIX} ended `))
+  const endLines = (): string[] => holdLines.filter((line) => line.startsWith(`${OLD_LIFE_HOLD_LOG_PREFIX} ended on `))
 
   test.each(ADAPTERS.flatMap(([name, readName, adapter]) => [
     [name, 'ended', adapter, () => cannedStatusResult({ state: 'ended' }), OLD_LIFE_HOLD_END_READ_ENDED, readName],
@@ -4917,6 +4920,116 @@ describe('b.jg5 SRJ-805: the reconnect adapter starts the live-row sequence for 
     expect(await reconnect(h, p)).toBe('pending')
 
     expect([h.stub.calls.sendKeysCalls, h.sequenceRunning(p), oldLifeLinesIn(h)]).toEqual([[], false, []])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-810 (hatch A3), SRJ-805, SRJ-811: the reconnect adapter's
+// held-own-row branch. A persona's own row `cscb_<key>` held for an old life
+// while its key is not recorded (a row the start sweep swept for its `cwd`,
+// its kill failed: held at the row's `cwd`), read live other than `pending`,
+// takes the retired key's path: no pane read, nothing typed, one live-row
+// sequence started with no retired-key flag, 'transient', nothing counted,
+// one line naming the start's answer. While the old-life wait runs on that
+// row the start answers already-running, no sequence starts and the start
+// entry arms P's timer with the old-life cause. A row that is not held is
+// reconnected as before. The recorded-key branch is the describe above's.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-810: the reconnect adapter starts the live-row sequence for a held own row of a key not recorded and answers transient, never typing into it', () => {
+  let harness: RecoveryHarness | undefined
+
+  afterEach(() => {
+    const h = harness
+    harness = undefined
+    if (h === undefined) return
+    try {
+      h.controller.stopAll('the case is over')
+      assertNoLeak(h.captured())
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  /** A harness over P and Q, P's own row held at the harness home (swept for its cwd, its kill failed), each row's status reading `state`. */
+  function heldOwnRow(state: string): { h: RecoveryHarness; p: string; q: string } {
+    const h = (harness = makeRecoveryHarness())
+    const [p, q] = h.keys as [string, string]
+    h.beginOldLifeHold({ instanceId: personaInstanceId(p), oldKey: p, directory: h.home, cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL })
+    h.script({ statusResult: cannedStatusResult({ state }) })
+    return { h, p, q }
+  }
+
+  /** The adapter as the harness's restart path builds it, with the harness's latch. */
+  const reconnect = (h: RecoveryHarness, key: string) => _buildReconnectSessionAdapter(undefined, (k) => h.latch.isLatched(k))(key)
+
+  /** The adapter's held-own-row lines, logged by the case. */
+  const heldLinesIn = (h: RecoveryHarness): string[] => h.errors.filter((line) => line.startsWith('[slack] reconnectSession: ') && line.includes(' and its own row is held for an old life '))
+
+  test.each(['waiting', 'working', 'ask_user'])('P\'s held own row reading %s: transient, with no pane read and nothing typed, nothing counted or armed; one line naming the start\'s answer; exactly one start request, with no retired-key flag, ending in a launch; Q, not held, is reconnected with its one send-keys', async (state) => {
+    const { h, p, q } = heldOwnRow(state)
+    const starts = recordSequenceStarts()
+
+    expect(await reconnect(h, p)).toBe('transient')
+
+    expect([h.stub.calls.sendKeysCalls, h.stub.calls.readPaneCalls]).toEqual([[], []])
+    expect(heldLinesIn(h)).toEqual([reconnectHeldOwnRowLine(p, state, LIVE_ROW_START_STARTED)])
+    expect(starts).toEqual([
+      {
+        key: p,
+        ref: `persona=${p}`,
+        instanceId: personaInstanceId(p),
+        lastReadState: state,
+        entryStep: LIVE_ROW_SEQUENCE_ENTRY_KILL,
+        keepsConversation: false,
+        retiredKey: false,
+        // The start entry's reading of P when the request came: not recorded (b.jg5 SRJ-806).
+        retiredAtStart: { recorded: false, marked: false, generation: undefined },
+        launches: true,
+        alertContext: KILL_FAILURE_CONTEXT_RECOVERY,
+      },
+    ])
+    expect([getFailureCount(p), h.triggers, h.controller.isArmed(p)]).toEqual([0, [], false])
+
+    h.script({ statusResult: cannedStatusResult({ state: 'waiting' }) })
+    expect(await reconnect(h, q)).toBe('success')
+    expect(h.stub.calls.sendKeysCalls.map((call) => call.claude_instance_id)).toEqual([personaInstanceId(q)])
+  })
+
+  test('a second call while P\'s sequence runs (its first run held): transient again, no second sequence and nothing typed; once the run lists the row in its ids the hold ends and the sequence ends in its launch', async () => {
+    const { h, p } = heldOwnRow('waiting')
+    ownRowsLiveThenMissing(h)
+    const hold = holdFindMissing(h.stub.client)
+
+    expect(await reconnect(h, p)).toBe('transient')
+    await h.driveSequence(hold.entered(1))
+    expect(await reconnect(h, p)).toBe('transient')
+
+    expect(heldLinesIn(h)).toEqual([reconnectHeldOwnRowLine(p, 'waiting', LIVE_ROW_START_STARTED), reconnectHeldOwnRowLine(p, 'waiting', LIVE_ROW_START_ALREADY_RUNNING)])
+    expect([h.stub.calls.sendKeysCalls, h.stub.calls.killCalls.length, h.sequenceRunning(p)]).toEqual([[], 1, true])
+    hold.release(cannedFindMissing({ rows: { [personaInstanceId(p)]: 'ids' } }))
+    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED })
+    expect([h.oldLifeHolds.holdOf(personaInstanceId(p)), h.stub.calls.killCalls.length, h.stub.calls.sendKeysCalls]).toEqual([undefined, 1, []])
+    await h.runApproverToStop(p)
+  })
+
+  test('while the old-life wait runs on P\'s own row (its first run held): transient, no sequence starts and nothing is typed; the start entry arms P\'s timer with the old-life cause, uncounted; the line names already-running', async () => {
+    const { h, p } = heldOwnRow('waiting')
+    h.script({ getResult: cannedGetResult({ claude_instance_id: personaInstanceId(p), cwd: h.home }) })
+    const hold = holdFindMissing(h.stub.client)
+    const wait = h.startOldLifeWait(personaInstanceId(p))
+    await h.driveSequence(hold.entered(1))
+    const kills = h.stub.calls.killCalls.length
+
+    expect(await reconnect(h, p)).toBe('transient')
+
+    expect(heldLinesIn(h)).toEqual([reconnectHeldOwnRowLine(p, 'waiting', LIVE_ROW_START_ALREADY_RUNNING)])
+    // The wait is still the one thing running on the id: no kill or call beyond its own.
+    expect([h.oldLifeWaitRunning(personaInstanceId(p)), h.stub.calls.sendKeysCalls, h.stub.calls.killCalls.length]).toEqual([true, [], kills])
+    expect([h.triggers, h.controller.isArmed(p), getFailureCount(p)]).toEqual([[{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD }], true, 0])
+    hold.release(cannedFindMissing({ rows: { [personaInstanceId(p)]: 'ids' } }))
+    await h.driveSequence(wait)
+    expect(h.oldLifeHolds.holdOf(personaInstanceId(p))).toBeUndefined()
   })
 })
 

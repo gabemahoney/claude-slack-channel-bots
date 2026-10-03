@@ -109,6 +109,18 @@
  * ladder started the sequence, or met it, and answered `sequence-waiting`)
  * answers `RESTART_OUTCOME_SEQUENCE_WAITING` too, so a retry's re-armed line
  * names the sequence.
+ * Right after the sequence gate comes the old-life gate (b.jg5 SRJ-810,
+ * SRJ-812, SRJ-302; the optional `RestartDeps.isHeldForOldLife`): while an
+ * old life that may still be running holds P's working directory (a hold on
+ * P's own row excepted), the hook records P as waiting, starts the hold's
+ * wait and arms P's retry timer, and a fired restart timer, the retry entry
+ * and a human-triggered restart (the lost-message trigger's included)
+ * answer `RESTART_OUTCOME_SEQUENCE_WAITING` with no agent-director call:
+ * no liveness read, reconnect, kill or launch, nothing recorded and nothing
+ * toward the cap. A persona already running from a directory that becomes
+ * held is held the same way, and its worker is not killed. The gate is asked
+ * again wherever the sequence gate is asked again before the instance is
+ * touched, so the persona comes up only once the hold ends.
  * Isolated from server.ts side effects — injectable deps make it testable.
  *
  * SPDX-License-Identifier: MIT
@@ -281,9 +293,12 @@ export const RESTART_OUTCOME_HELD = 'held'
  * reconnect, before the kill, before the launch) found it so, and nothing
  * more was called; or the launch answered `'refused'` while the sequence ran
  * (the launch's ladder started it at a replacement site, or met it, and
- * answered `sequence-waiting`, b.jg5 SRJ-707). Nothing was recorded and
- * nothing counts toward the cap. A refusal at a retry (SRJ-302): the retry
- * timer re-arms at the doubled wait.
+ * answered `sequence-waiting`, b.jg5 SRJ-707); or the old-life hook
+ * (`RestartDeps.isHeldForOldLife`, b.jg5 SRJ-810) held the persona: an old
+ * life that may still be running holds its working directory. Nothing was
+ * recorded and nothing counts toward the cap. A refusal at a retry
+ * (SRJ-302): the retry timer re-arms at the doubled wait, its again-reason
+ * `old-life-wait-in-flight` when an old-life wait step it waits on runs.
  */
 export const RESTART_OUTCOME_SEQUENCE_WAITING = 'sequence-waiting'
 /** Retry entry only: a launch was in flight for the persona, so no agent-director call was made. */
@@ -523,6 +538,33 @@ export interface RestartDeps {
    * line); any other answer is not. Absent: no sequence runs.
    */
   isLiveRowSequenceRunning?(key: string): boolean
+  /**
+   * The old-life hook (b.jg5 SRJ-810, SRJ-812, SRJ-302; production: the
+   * session manager's hold step, `oldLifeHoldStep`, over the applied persona,
+   * bound in `main()`): runs the hold step for the persona (records it as
+   * waiting on each hold on its working directory other than one on its own
+   * row, starts each hold's wait when it is not running, arms its retry
+   * timer with the held-for-an-old-life cause) and answers whether it is
+   * held. Asked right after the live-row sequence gate of the serialized
+   * work, before the shutdown and not-up checks and the liveness read, by
+   * every path that reaches it (a fired restart timer, the retry entry, a
+   * human-triggered restart, so the lost-message trigger's restart too):
+   * while it answers true the work makes no agent-director call (no
+   * liveness read, reconnect, kill or launch), records no success or
+   * failure, adds nothing toward the cap and answers
+   * `RESTART_OUTCOME_SEQUENCE_WAITING`, which a retry takes as a refusal
+   * (SRJ-302: "an old-life hold still holding"). A persona already running
+   * from a directory that becomes held is held the same way, and its worker
+   * is not killed. Asked again wherever the sequence gate is asked again
+   * before the instance is touched (after each liveness probe, after an
+   * 'escalate-dead' reconnect, right before the kill and right before the
+   * launch). A hold on the persona's own row is not this hook's (SRJ-810's
+   * exception: the reconnect adapter starts its live-row sequence). An
+   * answer of exactly `true` is held, and so is a hook that throws (fail
+   * safe, logged in the one line); any other answer is not. Absent: nothing
+   * is held.
+   */
+  isHeldForOldLife?(key: string): boolean
   /**
    * The slow-recovery observer (b.jg5 SRJ-610, SRJ-1016; production: the
    * server's slow-recovery tracker, `src/slow-recovery.ts`). It is told what
@@ -985,6 +1027,10 @@ async function runRestartWork(d: RestartDeps, key: string, cwd: string, sessionI
   // passes this gate with nothing armed (b.jg5 SRJ-1512; main()'s
   // `liveRowSequenceGate`), and the not-up gate below refuses it.
   if (skipIfSequenceRunning(d, key)) return RESTART_OUTCOME_SEQUENCE_WAITING
+  // b.jg5 SRJ-810, SRJ-812: while an old life may still run in P's working
+  // directory, the restart path attempts nothing for P: the hook records P
+  // as waiting, starts the hold's wait and arms P's retry timer.
+  if (skipIfHeldForOldLife(d, key)) return RESTART_OUTCOME_SEQUENCE_WAITING
   return runInAttempt(key, 'recovery', () => restartWorkSteps(d, key, cwd, sessionId))
 }
 
@@ -1023,6 +1069,10 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   // is: a launch outside the serializer may have started P's live-row
   // sequence while the probe ran (a collision ladder's replacement site).
   if (skipIfSequenceRunning(d, key, 'after its liveness probe')) return RESTART_OUTCOME_SEQUENCE_WAITING
+  // b.jg5 SRJ-810: so is the old-life hook: a hold may have begun on P's
+  // working directory while the probe ran; then nothing is reconnected,
+  // killed or launched.
+  if (skipIfHeldForOldLife(d, key, 'after its liveness probe')) return RESTART_OUTCOME_SEQUENCE_WAITING
 
   // b.jg5 SRJ-314: agent-director could not report on the persona (a
   // `status` error, or a probe that threw). Never read as dead: no
@@ -1158,6 +1208,7 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
     if (skipIfHeld(d, key, 'after its escalate-dead reconnect')) return RESTART_OUTCOME_HELD
     if (skipIfSequenceRunning(d, key, 'after its escalate-dead reconnect')) return RESTART_OUTCOME_SEQUENCE_WAITING
+    if (skipIfHeldForOldLife(d, key, 'after its escalate-dead reconnect')) return RESTART_OUTCOME_SEQUENCE_WAITING
     const reprobed = await reprobeDeadAfterEscalate(d, key)
     if (typeof reprobed === 'string') return reprobed
     deadRead = reprobed
@@ -1176,6 +1227,8 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
   if (skipIfHeld(d, key, 'before its kill')) return RESTART_OUTCOME_HELD
   if (skipIfSequenceRunning(d, key, 'before its kill')) return RESTART_OUTCOME_SEQUENCE_WAITING
+  // b.jg5 SRJ-810: a held persona's worker is not killed.
+  if (skipIfHeldForOldLife(d, key, 'before its kill')) return RESTART_OUTCOME_SEQUENCE_WAITING
   if (killBeforeLaunch) {
     const stopped = await killBeforeRelaunch(d, key, cwd, deadRead)
     if (stopped !== undefined) return stopped
@@ -1184,6 +1237,7 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     console.error(relaunchAfterKillLine(key, cwd, RELAUNCH_KILL_NONE))
   }
   if (skipIfSequenceRunning(d, key, 'before its launch')) return RESTART_OUTCOME_SEQUENCE_WAITING
+  if (skipIfHeldForOldLife(d, key, 'before its launch')) return RESTART_OUTCOME_SEQUENCE_WAITING
 
   let ok: LaunchSessionResult
   try {
@@ -1726,6 +1780,45 @@ function skipIfSequenceRunning(d: RestartDeps, key: string, askedAgain?: string)
       ? `[slack] Skipping restart for persona=${key} — its live-row sequence runs${failure}; no agent-director call, nothing recorded (sequence-waiting; b.jg5 SRJ-706, SRJ-303)`
       : `[slack] Restart for persona=${key} goes no further ${askedAgain} — its live-row sequence runs${failure}; nothing more is called for it, nothing recorded (sequence-waiting; b.jg5 SRJ-706, SRJ-303)`,
   )
+  return true
+}
+
+/**
+ * The restart work's line when the old-life hook holds persona `key` (b.jg5
+ * SRJ-810, SRJ-812): the work makes no attempt (`askedAgain` absent), or
+ * goes no further from `askedAgain` on; `failure`, when given, is what the
+ * hook threw (counted as held):
+ *
+ *   [slack] Skipping restart for persona=<key> — its working directory is held for an old life that may still be running[ (the old-life hook failed: <thrown> — taken as held)]; no agent-director call, nothing recorded (sequence-waiting; b.jg5 SRJ-810, SRJ-812)
+ *   [slack] Restart for persona=<key> goes no further <askedAgain> — its working directory is held for an old life that may still be running[ (…)]; nothing more is called for it, nothing recorded (sequence-waiting; b.jg5 SRJ-810, SRJ-812)
+ *
+ * Pure.
+ */
+export function restartOldLifeHeldLine(key: string, askedAgain?: string, failure?: string): string {
+  const why = `its working directory is held for an old life that may still be running${failure === undefined ? '' : ` (the old-life hook failed: ${failure} — taken as held)`}`
+  return askedAgain === undefined
+    ? `[slack] Skipping restart for persona=${key} — ${why}; no agent-director call, nothing recorded (sequence-waiting; b.jg5 SRJ-810, SRJ-812)`
+    : `[slack] Restart for persona=${key} goes no further ${askedAgain} — ${why}; nothing more is called for it, nothing recorded (sequence-waiting; b.jg5 SRJ-810, SRJ-812)`
+}
+
+/**
+ * The old-life gate (b.jg5 SRJ-810, SRJ-812, SRJ-302): asks the old-life
+ * hook (`RestartDeps.isHeldForOldLife`), which itself runs the hold step for
+ * a held persona (records it as waiting, starts the hold's wait, arms its
+ * retry timer). When it answers true, or throws (counted as held: fail
+ * safe), logs one line (`restartOldLifeHeldLine`) and returns true, so the
+ * caller returns `RESTART_OUTCOME_SEQUENCE_WAITING` with nothing more
+ * called. Records neither a success nor a failure. Absent: false.
+ */
+function skipIfHeldForOldLife(d: RestartDeps, key: string, askedAgain?: string): boolean {
+  if (d.isHeldForOldLife === undefined) return false
+  let failure: string | undefined
+  try {
+    if (d.isHeldForOldLife(key) !== true) return false
+  } catch (err) {
+    failure = describeThrownValue(err)
+  }
+  console.error(restartOldLifeHeldLine(key, askedAgain, failure))
   return true
 }
 

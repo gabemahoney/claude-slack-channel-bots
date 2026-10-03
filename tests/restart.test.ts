@@ -48,6 +48,7 @@ import {
   reprobePendingLine,
   reprobeUnhandledLine,
   reprobeUnknownLine,
+  restartOldLifeHeldLine,
   type KillSessionResult,
   type LaunchSessionResult,
   type ReconnectEscalateDead,
@@ -7521,6 +7522,227 @@ describe('b.jg5 SRJ-706, SRJ-303: the restart path makes no attempt while P\'s l
 
     expect([deps.isSessionAliveCalls, deps.killSessionCalls, deps.launchSessionCalls.map((call) => call.key)]).toEqual([[P], [P], [P]])
     expect(errLines.filter((line) => line.includes('live-row sequence'))).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-810, SRJ-812, SRJ-302 — the restart path's old-life gate
+//
+// Over the file's deps, with the optional old-life hook
+// (`RestartDeps.isHeldForOldLife`; production binds the session manager's
+// hold step, which records P as waiting, starts the hold's wait and arms P's
+// timer) answering for P. Right after the sequence gate, a held P answers
+// `RESTART_OUTCOME_SEQUENCE_WAITING` for a fired restart timer (a scheduled
+// restart, a human-triggered restart request: the lost-message trigger's
+// restart is one) and for the retry entry: nothing is probed, reconnected,
+// killed or launched, nothing is recorded and nothing counts toward the cap,
+// and the hook is asked once. A persona already running whose directory
+// becomes held during the run (the hook first answering true at a later ask)
+// is not reconnected, killed or launched from there on. The sequence gate
+// answers first. Q restarts as before, and fixtures with no hook, or one
+// answering false, behave as before. Every line is leak-checked. What the
+// hook itself does is tests/session-manager.test.ts's; the retry timer's
+// reading of the outcome is tests/unavailable-retry.test.ts's.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-810, SRJ-812: the restart path makes no attempt while an old life holds P\'s working directory', () => {
+  const P = 'persona_p'
+  const Q = 'persona_q'
+  const CWD: Record<string, string> = { [P]: '/cwd/p', [Q]: '/cwd/q' }
+  /**
+   * Q's asks of the hook in one run over a dead row that launches: at the work's start, after its probe, before its
+   * kill and before its launch (b.jg5 SRJ-810: asked again wherever the sequence gate is, before the instance is touched).
+   */
+  const Q_RUN_ASKS = [Q, Q, Q, Q]
+  let errLines: string[]
+  let origConsoleError: typeof console.error
+  /** Each serialized work's outcome, in order. */
+  let outcomes: Array<{ key: string; outcome: unknown }>
+  /** Every ask of the old-life hook, by key. */
+  let asked: string[]
+
+  beforeEach(() => {
+    errLines = []
+    outcomes = []
+    asked = []
+    origConsoleError = console.error
+    console.error = (...args: unknown[]) => { errLines.push(args.map(String).join(' ')) }
+  })
+
+  afterEach(() => {
+    console.error = origConsoleError
+    cancelAllRestartTimers()
+    assertNoLeak({ errLines })
+  })
+
+  /**
+   * The file's deps over a dead row, every launch succeeding, the old-life
+   * hook answering `held(key)` (each ask recorded) and a serializer that
+   * records each work's outcome.
+   */
+  function heldDeps(held: (key: string) => boolean): ReturnType<typeof makeDeps> {
+    const deps = makeDeps()
+    deps.isHeldForOldLife = (key) => {
+      asked.push(key)
+      return held(key)
+    }
+    deps.serialize = async <T>(key: string, operation: () => T | Promise<T>): Promise<T> => {
+      const outcome = await operation()
+      outcomes.push({ key, outcome })
+      return outcome
+    }
+    return deps
+  }
+
+  /** The old-life gate's lines among the captured lines. */
+  const heldLines = (): string[] => errLines.filter((line) => line.includes(' held for an old life '))
+
+  /**
+   * P made no agent-director call and recorded nothing: its one failure on
+   * record kept (a success would reset it, a counted failure raise it; one
+   * keeps P's backoff inside WAIT_MS), no cap notice, nothing armed, and the
+   * one skip line.
+   */
+  function expectNothingForP(deps: ReturnType<typeof makeDeps>): void {
+    expect(deps.isSessionAliveCalls.filter((key) => key === P)).toEqual([])
+    expect(deps.reconnectSessionCalls).toEqual([])
+    expect(deps.killSessionCalls.filter((key) => key === P)).toEqual([])
+    expect(deps.launchSessionCalls.filter((call) => call.key === P)).toEqual([])
+    expect(getFailureCount(P)).toBe(1)
+    expect(deps.onCapReachedCalls).toEqual([])
+    expect(deps.armRetryTimerCalls).toEqual([])
+    expect(isRestartPendingOrActive(P)).toBe(false)
+    expect(heldLines()).toEqual([restartOldLifeHeldLine(P)])
+  }
+
+  test.each<[string, { humanTrigger: true } | undefined]>([
+    ['a scheduled restart', undefined],
+    ['a human-triggered restart request (the lost-message trigger\'s)', { humanTrigger: true }],
+  ])('%s for a held P: the work answers sequence-waiting with no probe, reconnect, kill or launch, nothing recorded and nothing toward the cap, the hook asked once; Q beside it restarts as before', async (_entry, opts) => {
+    recordFailure(P)
+    const deps = heldDeps((key) => key === P)
+    initRestart(deps)
+
+    scheduleRestart(P, CWD[P]!, undefined, opts)
+    scheduleRestart(Q, CWD[Q]!, undefined, opts)
+    await Bun.sleep(WAIT_MS)
+
+    // Q, with no failure on record, fires first.
+    expect(outcomes).toEqual([{ key: Q, outcome: RESTART_OUTCOME_LAUNCHED }, { key: P, outcome: RESTART_OUTCOME_SEQUENCE_WAITING }])
+    expectNothingForP(deps)
+    expect(deps.killSessionCalls).toEqual([Q])
+    expect(deps.launchSessionCalls.map((call) => call.key)).toEqual([Q])
+    expect(asked).toEqual([...Q_RUN_ASKS, P])
+  })
+
+  test('the retry entry for a held P: sequence-waiting, with no agent-director call, nothing recorded and the hook asked once', async () => {
+    recordFailure(P)
+    const deps = heldDeps((key) => key === P)
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD[P]!, () => false)).toBe(RESTART_OUTCOME_SEQUENCE_WAITING)
+    expect(await runRestartRetry(Q, CWD[Q]!, () => false)).toBe(RESTART_OUTCOME_LAUNCHED)
+
+    expectNothingForP(deps)
+    expect(asked).toEqual([P, ...Q_RUN_ASKS])
+  })
+
+  // b.jg5 SRJ-810 (hatch A3): a persona already running whose directory
+  // becomes held while its run awaits gets no reconnect, kill or launch from
+  // there on, and its worker is not killed. Driven on the escalate-dead path
+  // (a live row whose reconnect answers 'escalate-dead', then a dead
+  // re-probe), where every ask is made: the hook first answers held at the
+  // given ask, and the work goes no further.
+  test.each<[number, string, { probes: number; reconnects: number; kills: number }]>([
+    [2, 'after its liveness probe', { probes: 1, reconnects: 0, kills: 0 }],
+    [3, 'after its escalate-dead reconnect', { probes: 1, reconnects: 1, kills: 0 }],
+    [4, 'before its kill', { probes: 2, reconnects: 1, kills: 0 }],
+    [5, 'before its launch', { probes: 2, reconnects: 1, kills: 1 }],
+  ])('the hook first answering held at ask %i (%s): the work goes no further, answers sequence-waiting, records nothing and arms nothing', async (heldFrom, where, made) => {
+    recordFailure(P)
+    const deps = heldDeps((key) => key === P && asked.filter((k) => k === P).length >= heldFrom)
+    const probes = [LIVENESS_READING_LIVE, LIVENESS_READING_DEAD]
+    deps.isSessionAlive = async (key) => {
+      deps.isSessionAliveCalls.push(key)
+      return probes[deps.isSessionAliveCalls.length - 1] ?? LIVENESS_READING_DEAD
+    }
+    deps.reconnectSession = async (key) => {
+      deps.reconnectSessionCalls.push(key)
+      return ESCALATE_DEAD_WORKING_GONE
+    }
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD[P]!, () => false)).toBe(RESTART_OUTCOME_SEQUENCE_WAITING)
+
+    expect(asked).toEqual(Array(heldFrom).fill(P))
+    expect({
+      probes: deps.isSessionAliveCalls.length,
+      reconnects: deps.reconnectSessionCalls.length,
+      kills: deps.killSessionCalls.length,
+    }).toEqual(made)
+    expect(deps.launchSessionCalls).toEqual([])
+    expect(getFailureCount(P)).toBe(1)
+    expect([deps.onCapReachedCalls, deps.armRetryTimerCalls]).toEqual([[], []])
+    expect(heldLines()).toEqual([restartOldLifeHeldLine(P, where)])
+  })
+
+  test('the sequence gate answers first: with P\'s sequence running and P held, the hook is not asked and the line is the sequence\'s', async () => {
+    recordFailure(P)
+    const deps = heldDeps(() => true)
+    deps.isLiveRowSequenceRunning = (key) => key === P
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD[P]!, () => false)).toBe(RESTART_OUTCOME_SEQUENCE_WAITING)
+
+    expect(asked).toEqual([])
+    expect(heldLines()).toEqual([])
+    expect([deps.isSessionAliveCalls, deps.killSessionCalls, deps.launchSessionCalls]).toEqual([[], [], []])
+  })
+
+  test('a latched P answers latched first: the hook is not asked', async () => {
+    const latch = createConflictLatch({ log: (line) => { errLines.push(line) } })
+    latch.setFromConflict(P, errTmuxSessionConflict('spawn', 'scan-leftover'), { refusedOperation: REFUSED_OPERATION_PLAIN_SPAWN, rowState: latchRowStateRead(LIVENESS_DEAD_ROW_ENDED) })
+    const deps = heldDeps(() => true)
+    deps.isLatched = (key) => latch.isLatched(key)
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD[P]!, () => false)).toBe(RESTART_OUTCOME_LATCHED)
+
+    expect(asked).toEqual([])
+    expect([deps.isSessionAliveCalls, deps.killSessionCalls, deps.launchSessionCalls]).toEqual([[], [], []])
+  })
+
+  test('a hook that throws counts as held (fail safe): sequence-waiting, its one line naming what it threw, redacted', async () => {
+    recordFailure(P)
+    const deps = heldDeps((key) => {
+      if (key === P) throw Object.assign(new Error(`hold step broke (${sentinelInMessage('hold')})`), { note: LEAK_SENTINEL })
+      return false
+    })
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD[P]!, () => false)).toBe(RESTART_OUTCOME_SEQUENCE_WAITING)
+
+    const lines = heldLines()
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toStartWith(`[slack] Skipping restart for persona=${P} — its working directory is held for an old life that may still be running (the old-life hook failed: `)
+    expect(lines[0]).toContain(`Error message="hold step broke (${REDACTED_SENTINEL_TAIL})"`)
+    expect([deps.isSessionAliveCalls, deps.killSessionCalls, deps.launchSessionCalls]).toEqual([[], [], []])
+    expect(getFailureCount(P)).toBe(1)
+  })
+
+  test.each<[string, (deps: ReturnType<typeof makeDeps>) => void]>([
+    ['a hand-built RestartDeps with no old-life hook', (deps) => { delete deps.isHeldForOldLife }],
+    ['the hook answering false', () => {}],
+    ['the hook answering a value that is not exactly true', (deps) => { deps.isHeldForOldLife = () => 'held' as unknown as boolean }],
+  ])('%s: P\'s retry runs as before — one probe, one kill, one launch, launched', async (_label, setHook) => {
+    const deps = heldDeps(() => false)
+    setHook(deps)
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD[P]!, () => false)).toBe(RESTART_OUTCOME_LAUNCHED)
+
+    expect([deps.isSessionAliveCalls, deps.killSessionCalls, deps.launchSessionCalls.map((call) => call.key)]).toEqual([[P], [P], [P]])
+    expect(heldLines()).toEqual([])
   })
 })
 

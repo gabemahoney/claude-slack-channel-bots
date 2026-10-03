@@ -355,8 +355,27 @@
  * (`personaRetryBlockCause`) and a lost message reports `restarting`
  * (`isSequenceOrOldLifeWaitRunning`); once the hold's kill has failed, it
  * reports `kill-failed` (`waitsOnKillFailedHold`). A launch of a persona
- * whose own row carries a wait answers `sequence-waiting` with its retry
- * timer armed.
+ * whose own row carries a wait answers `sequence-waiting` with the persona
+ * recorded as waiting on that hold and its retry timer armed.
+ *
+ * What a hold refuses (b.jg5 SRJ-810, SRJ-1502, SRJ-1505): while a directory
+ * D is held, session admission refuses a session opened from D
+ * (`oldLifeHeldDirectory`, the held-directory query `main()` gives
+ * `decideSessionAdmission`); no `/mcp reconnect` is typed into a held own
+ * row (`reconnectMcpWithCause`'s guard, `isOwnRowOldLifeHeld`); and no
+ * persona whose working directory is D is launched: the hold step
+ * (`oldLifeHoldStep`), at `spawnForPersona`'s old-life gate, at the
+ * sequence-launch entry and at the restart path's old-life hook, records the
+ * persona as waiting, starts the hold's wait (`ensureOldLifeWait`) when it is
+ * not running and arms its retry timer, and the launch answers
+ * `sequence-waiting`. A hold on the persona's own row is not the gate's: a
+ * destructive modify's same-key new half waits by the retired-key rule, and
+ * a held own row of a key not recorded is replaced through the live-row
+ * sequence. Once a hold ends, `main()`'s end observer
+ * (`createOldLifeHoldEndRetry`) retries each persona recorded as waiting on
+ * it at once, one waiting on its own row once the wait the end stopped
+ * there has settled; a persona teardown forgets the key's waits and stops a
+ * wait no persona left waits on (`forgetOldLifeWaits`).
  *
  * No tmux process-tree walks, no JSONL existence checks for resume eligibility:
  * the library encapsulates both.
@@ -590,6 +609,7 @@ import {
   OLD_LIFE_HOLD_END_NEW_LIFE,
   OLD_LIFE_HOLD_END_READ_ENDED,
   OLD_LIFE_HOLD_END_READ_MISSING,
+  OLD_LIFE_HOLD_LOG_PREFIX,
   RETIRED_KEY_CAUSE_ABSENT_AT_START,
   RETIRED_KEYS_NOT_RECORDED,
   RETIRED_KEYS_UNCHANGED,
@@ -597,7 +617,9 @@ import {
   RETIRED_KEYS_WRITTEN,
   oldLifeKeyOf,
   type OldLifeHold,
+  type OldLifeHoldEndObserver,
   type OldLifeHoldEndReason,
+  type OldLifeHoldPersona,
   type OldLifeHoldSet,
   type RetiredKeyStore,
 } from './retired-keys.ts'
@@ -688,6 +710,9 @@ import {
   type OldLifeWaitRefusalAt,
 } from './old-life-wait.ts'
 import { recordStartupError } from './startup-errors.ts'
+// Type only: the held-directory answer session admission takes; nothing of
+// the registry is loaded here.
+import type { SessionHeldDirectory } from './registry.ts'
 import {
   locateTranscript,
   readTranscriptTurnState,
@@ -1615,6 +1640,16 @@ const oldLifeLastReadState = new Map<string, string>()
  */
 const oldLifeSessionNames = new Map<string, string>()
 
+/**
+ * The stop of each old-life wait a hold's end stopped while it ran
+ * (`onOldLifeHoldEnd`), by the held instance id: the registry's
+ * `stopNoLaunch` promise, which resolves once the stopped wait has settled.
+ * The end-retry observer (`createOldLifeHoldEndRetry`) retries a persona
+ * whose own `cscb_<key>` that wait was on only once it has settled. Each
+ * entry is dropped when its stop resolves.
+ */
+const oldLifeHoldEndStops = new Map<string, Promise<boolean>>()
+
 /** Removes the hold-end observer from the installed hold set; undefined while none is registered. */
 let removeOldLifeHoldEndObserver: (() => void) | undefined
 
@@ -1629,6 +1664,7 @@ export function setOldLifeHolds(holds: OldLifeHoldSet | undefined): void {
   oldLifeHolds = holds
   oldLifeLastReadState.clear()
   oldLifeSessionNames.clear()
+  oldLifeHoldEndStops.clear()
   if (holds !== undefined) removeOldLifeHoldEndObserver = holds.onEnd(onOldLifeHoldEnd)
 }
 
@@ -1646,8 +1682,11 @@ export function _resetOldLifeHolds(): void {
  * hold-end query; SRJ-702, option A), never as a stopped retry. The hold's
  * end also ends the wait's unclassified-error episode on the id, which
  * nothing else ends (b.jg5 SRJ-313; `OldLifeWaitBindings.unclassifiedErrorEpisodes`).
- * Called synchronously inside the hold's end; returns nothing to await.
- * Never throws.
+ * The stop of a wait that ran is kept until it resolves
+ * (`oldLifeHoldEndStops`), so the end-retry observer can retry a persona
+ * waiting on its own row once the stopped wait has settled. Called
+ * synchronously inside the hold's end; returns nothing to await. Never
+ * throws.
  */
 function onOldLifeHoldEnd(hold: OldLifeHold): void {
   oldLifeLastReadState.delete(hold.instanceId)
@@ -1658,10 +1697,34 @@ function onOldLifeHoldEnd(hold: OldLifeHold): void {
     console.error(`[slack] old-life hold: ending the unclassified-error episode of instanceId=${hold.instanceId} failed: ${describeThrownValue(err)} (b.jg5 SRJ-313)`)
   }
   try {
-    void liveRowSequenceRegistry?.stopNoLaunch(hold.instanceId, LIVE_ROW_STOP_HOLD_ENDED)
+    const registry = liveRowSequenceRegistry
+    const ran = registry?.isNoLaunchRunning(hold.instanceId) === true
+    const stopped = registry?.stopNoLaunch(hold.instanceId, LIVE_ROW_STOP_HOLD_ENDED)
+    if (ran && stopped !== undefined) keepOldLifeHoldEndStop(hold.instanceId, stopped)
   } catch (err) {
     console.error(`[slack] old-life hold: stopping the wait on instanceId=${hold.instanceId} failed: ${describeThrownValue(err)} (b.jg5 SRJ-811)`)
   }
+}
+
+/**
+ * Keep the stop of the wait a hold's end stopped on `instanceId` until it
+ * resolves (`oldLifeHoldEndStops`). Never throws.
+ */
+function keepOldLifeHoldEndStop(instanceId: string, stopped: Promise<boolean>): void {
+  oldLifeHoldEndStops.set(instanceId, stopped)
+  const drop = (): void => {
+    if (oldLifeHoldEndStops.get(instanceId) === stopped) oldLifeHoldEndStops.delete(instanceId)
+  }
+  void stopped.then(drop, drop)
+}
+
+/**
+ * The stop a hold's end made of the wait on `instanceId` while it ran
+ * (`onOldLifeHoldEnd`), until that stopped wait has settled; undefined when
+ * none is pending. Never throws.
+ */
+function pendingOldLifeHoldEndStop(instanceId: string): Promise<boolean> | undefined {
+  return oldLifeHoldEndStops.get(instanceId)
 }
 
 /** A read of a row gave its state (and, from a `get` or a `list` row, its `cwd`). */
@@ -3226,6 +3289,16 @@ export async function reconnectMcp(
  *
  *   - a persona already latched (`personaLatchedNow`, b.jg5 SRJ-502): no
  *     `send-keys`; `transient` (latched);
+ *   - a persona whose own `cscb_<key>` is held for an old life
+ *     (`isOwnRowOldLifeHeld`, b.jg5 SRJ-810: CSCB types no `/mcp reconnect`
+ *     into the old life's session): no `send-keys`; the persona recorded as
+ *     waiting on that hold (`recordOwnRowWaiting`), its retry timer armed
+ *     with the held-for-an-old-life cause (`armOldLifeWaiter`), one line
+ *     (`reconnectHeldLine`) naming the persona and the held instance id;
+ *     `transient`. This guards every caller: the ladder's `waiting` branch,
+ *     the launch's working-row wait and the restart path's reconnect
+ *     adapter, which itself starts the persona's live-row sequence for such
+ *     a row before it would get here;
  *   - success: `ok`;
  *   - GONE (`ErrTmuxSendKeys`): `dead-session` with cause `tmux-gone`, at once;
  *   - `ErrSpawnNotInteractive`: `dead-session` with cause
@@ -3290,6 +3363,13 @@ export async function reconnectMcpWithCause(
   if (personaLatchedNow(key)) {
     console.error(reconnectLatchedLine(ref))
     return { outcome: 'transient', latched: true }
+  }
+  // b.jg5 SRJ-810: no `/mcp reconnect` is typed into a held old life; the
+  // persona waits on that hold, so the hold's end retries it at once.
+  if (isOwnRowOldLifeHeld(key)) {
+    recordOwnRowWaiting(key)
+    console.error(reconnectHeldLine(ref, personaInstanceId(key), armOldLifeWaiter(key)))
+    return { outcome: 'transient' }
   }
   console.error(reconnectStartLine(ref))
   try {
@@ -3385,6 +3465,24 @@ export function reconnectStartLine(ref: string): string {
 /** The reconnect's line for a persona already latched: no `send-keys` is made (b.jg5 SRJ-502). */
 export function reconnectLatchedLine(ref: string): string {
   return `[slack] reconnectMcp: ${ref} is latched — no send-keys; transient, nothing typed (b.jg5 SRJ-118, SRJ-502)`
+}
+
+/**
+ * The reconnect's line for a persona whose own row is held for an old life
+ * (b.jg5 SRJ-810): no `send-keys` is made; `armed` says whether its retry
+ * timer was armed with the held-for-an-old-life cause:
+ *
+ *   [slack] reconnectMcp: <ref> — its own row instanceId="<id>" is held for an old life that may still be running: no send-keys; transient, nothing typed; its retry timer is armed (held-for-old-life) (b.jg5 SRJ-810)
+ *   [slack] reconnectMcp: <ref> — its own row instanceId="<id>" is held for an old life that may still be running: no send-keys; transient, nothing typed; its retry timer could not be armed (b.jg5 SRJ-810)
+ *
+ * Pure.
+ */
+export function reconnectHeldLine(ref: string, instanceId: string, armed: boolean): string {
+  const timer = armed ? `its retry timer is armed (${UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD})` : 'its retry timer could not be armed'
+  return (
+    `[slack] reconnectMcp: ${ref} — its own row instanceId=${JSON.stringify(renderLogMessageText(instanceId))} is held for an old life ` +
+    `that may still be running: no send-keys; transient, nothing typed; ${timer} (b.jg5 SRJ-810)`
+  )
 }
 
 /**
@@ -10940,6 +11038,30 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *    no reply-guard step, no record written, nothing armed. The sequence's
  *    own launch (`launchForLiveRowSequence`) does not come through here and
  *    is exempt. A latched persona goes on to the latched gate.
+ * 0a. The old-life gate (b.jg5 SRJ-810 bullet 3; b.av2 SR-6.1 as amended by
+ *    b.jg5 SRJ-1502: "(4) launch, which waits while an old life that may
+ *    still be running holds the persona's working directory (b.jg5 SRJ-809,
+ *    SRJ-810); the persona is retried on its UNAVAILABLE retry timer (b.jg5
+ *    SRJ-301) until that wait ends"): while a hold whose instance id is not
+ *    the persona's own `cscb_<key>` is on its working directory, by real
+ *    path, and it is not latched, the hold step (`oldLifeHoldStep`) records
+ *    the persona as waiting on each such hold, starts each hold's wait when
+ *    it is not running (`ensureOldLifeWait`; one wait per held instance id),
+ *    arms its retry timer with the held-for-an-old-life cause and logs one
+ *    line (`oldLifeHoldLaunchLine`), and the call answers `sequence-waiting`
+ *    (`sequenceWaitingCause` `old-life-hold`) before any other step, joining
+ *    no launch in flight: no agent-director call, no trust patch, no
+ *    reply-guard step, no record written. `launchSession` answers it with
+ *    the uncounted `'refused'`, so the timer stays armed, and the start
+ *    summary counts it under "waiting on a live-row sequence" (b.jg5
+ *    SRJ-1015). A hold on the persona's own row does not hold it here: a
+ *    destructive modify's same-key new half waits by the retired-key rule
+ *    through its live-row sequence (step 4a; SRJ-805), and a held own row of
+ *    a key that is not recorded is replaced through the live-row sequence by
+ *    the ladder's `cwd` replace step or the restart path's reconnect adapter.
+ *    Once no such hold is left, the launch takes the ladder unchanged; a
+ *    renamed persona's new key then gets its plain first spawn (b.jg5
+ *    SRJ-711). A latched persona goes on to the latched gate.
  * 1. One in-flight launch per persona (b.av2 SR-6.3): while a launch for the
  *    key is in flight, a second call joins it and receives its result instead
  *    of starting a second ladder. The start's worker pool and the restart
@@ -11113,8 +11235,8 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  * and every `resumeOrFreshSpawn` call it makes holds dead evidence when that
  * verdict is dead evidence or the path's own cause is. A call that joins a
  * launch already in flight gets that launch's result, and its verdict is
- * dropped with one line. The held and `sequence-waiting` gates run before the
- * join check, so they answer either way; the latched gate runs after it, so
+ * dropped with one line. The held, `sequence-waiting` and old-life gates run
+ * before the join check, so they answer either way; the latched gate runs after it, so
  * it answers only a call that starts a ladder (a joining call gets the
  * in-flight launch's result).
  */
@@ -11139,6 +11261,14 @@ export async function spawnForPersona(
   // A latched persona still gets the latched gate's answer.
   const sequenceWaiting = sequenceWaitingResult(key, ref, 'spawnForPersona')
   if (sequenceWaiting !== undefined) return sequenceWaiting
+  // b.jg5 SRJ-810, SRJ-1502: while an old life may still run in P's working
+  // directory, P is not brought up: no agent-director call, no trust patch,
+  // no reply-guard step, no record. P is recorded as waiting, the hold's wait
+  // is started and P's retry timer armed. A hold on P's own row is not this
+  // gate's (SRJ-805's retired-key rule). A latched persona still gets the
+  // latched gate's answer.
+  const oldLifeHeld = oldLifeHoldResult(persona, ref, 'spawnForPersona')
+  if (oldLifeHeld !== undefined) return oldLifeHeld
   // b.jg5 SRJ-611: decided again from its cause or verdict, so a value cast
   // past the brand carries only what its source proves.
   const carriedIn = carriedDeadEvidenceOf(deadEvidence?.source)
@@ -12130,6 +12260,357 @@ function sequenceWaitingResult(key: string, ref: string, site: string): SpawnPer
 }
 
 // ---------------------------------------------------------------------------
+// The old-life gate (b.jg5 SRJ-810, SRJ-1502)
+// ---------------------------------------------------------------------------
+
+/** The wait on a held instance id was already running when the hold step asked: nothing was started. */
+export const OLD_LIFE_HOLD_WAIT_RUNNING = 'running'
+
+/** What the hold step did for one held instance id's wait: it was running, or `ensureOldLifeWait`'s answer. */
+export type OldLifeHoldWaitStart = typeof OLD_LIFE_HOLD_WAIT_RUNNING | OldLifeWaitEnsureAnswer
+
+/** One held instance id the hold step met, with what it did for its wait. */
+export interface OldLifeHoldStepWait {
+  readonly instanceId: string
+  readonly wait: OldLifeHoldWaitStart
+}
+
+/**
+ * The holds on persona `persona`'s working directory that hold it back
+ * (b.jg5 SRJ-810 bullet 3): each hold of the installed hold set whose
+ * directory is the persona's working directory by real path and whose
+ * instance id is not the persona's own `cscb_<key>`. A hold on the persona's
+ * own row is SRJ-810's exception (a destructive modify's same-key new half,
+ * which waits by the retired-key rule through its live-row sequence,
+ * SRJ-805; or a held own row the restart path's reconnect adapter replaces
+ * by that sequence), so it never holds the launch back here. None with no
+ * hold set installed. Never throws.
+ */
+function launchHoldsOn(persona: OldLifeHoldPersona): OldLifeHold[] {
+  const holds = oldLifeHolds
+  if (holds === undefined) return []
+  try {
+    const own = personaInstanceId(persona.key)
+    return holds.holdsOnDirectory(persona.working_directory).filter((hold) => hold.instanceId !== own)
+  } catch {
+    // Not reached (the hold set never throws).
+    return []
+  }
+}
+
+/**
+ * The old-life hold step for persona `persona` at `site` (b.jg5 SRJ-810,
+ * SRJ-811, SRJ-301, SRJ-1502), shared by the launch gate in
+ * `spawnForPersona` (`oldLifeHoldResult`) and the restart path's old-life
+ * hook (`RestartDeps.isHeldForOldLife`, bound in `main()`): when a hold other
+ * than one on the persona's own row is on its working directory
+ * (`launchHoldsOn`) and the persona is not latched (a latched persona meets
+ * the latched gate instead):
+ *   - the persona is recorded as waiting on each such hold
+ *     (`OldLifeHoldSet.recordWaiting`), so the hold's end retries it at once;
+ *   - each hold's wait is started when it is not running
+ *     (`ensureOldLifeWait`); a wait already running on the id is left as it
+ *     is, so a second launch starts none;
+ *   - the persona's retry timer is armed with the held-for-an-old-life
+ *     cause, uncounted (`armOldLifeWaiter`);
+ *   - one line names the persona, the held directory, every held instance id
+ *     with what was done for its wait, and the timer
+ *     (`oldLifeHoldLaunchLine`);
+ * and it answers true. Otherwise it answers false with nothing done. Makes
+ * no agent-director call: no trust patch, no reply-guard step and no record
+ * write precede or follow it. Never throws.
+ */
+export function oldLifeHoldStep(persona: OldLifeHoldPersona, site: string, ref: string = keyRef(persona.key)): boolean {
+  const holds = oldLifeHolds
+  const held = launchHoldsOn(persona)
+  if (holds === undefined || held.length === 0) return false
+  if (personaLatchedNow(persona.key)) return false
+  const waits: OldLifeHoldStepWait[] = []
+  for (const hold of held) {
+    try {
+      holds.recordWaiting(hold.instanceId, persona.key)
+    } catch {
+      // Not reached (the hold set never throws).
+    }
+    waits.push({ instanceId: hold.instanceId, wait: startOldLifeWaitUnlessRunning(hold.instanceId) })
+  }
+  const armed = armOldLifeWaiter(persona.key)
+  console.error(oldLifeHoldLaunchLine(site, ref, held[0]!.realDirectory, waits, armed))
+  return true
+}
+
+/**
+ * Start the wait on held instance id `instanceId` unless one already runs
+ * there (b.jg5 SRJ-811: one wait per held instance id): `running` with no
+ * call when the registry's no-launch query finds it running, otherwise
+ * `ensureOldLifeWait`'s answer. Never throws.
+ */
+function startOldLifeWaitUnlessRunning(instanceId: string): OldLifeHoldWaitStart {
+  if (liveRowSequenceRegistry?.isNoLaunchRunning(instanceId) === true) return OLD_LIFE_HOLD_WAIT_RUNNING
+  return ensureOldLifeWait(instanceId)
+}
+
+/**
+ * The old-life hold step's line (b.jg5 SRJ-810, SRJ-1502): the persona, the
+ * held directory (its real path), each held instance id with what was done
+ * for its wait (`running`, or `ensureOldLifeWait`'s answer), and whether its
+ * retry timer was armed:
+ *
+ *   [slack] <site>: not launching <ref> — its working directory "<D>" is held for an old life that may still be running (instanceId="<id>": wait <started|running|already-running|closed|not-held|not-installed>[, …]); waiting on it, its retry timer is armed (held-for-old-life); no agent-director call (sequence-waiting; b.jg5 SRJ-810, SRJ-1502)
+ *
+ * `… its retry timer could not be armed …` when it was not. Pure.
+ */
+export function oldLifeHoldLaunchLine(
+  site: string,
+  ref: string,
+  directory: string,
+  waits: readonly OldLifeHoldStepWait[],
+  armed: boolean,
+): string {
+  const quote = (text: string): string => JSON.stringify(renderLogMessageText(text))
+  const held = waits.map((w) => `instanceId=${quote(w.instanceId)}: wait ${w.wait}`).join(', ')
+  const timer = armed ? `its retry timer is armed (${UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD})` : 'its retry timer could not be armed'
+  return (
+    `[slack] ${site}: not launching ${ref} — its working directory ${quote(directory)} is held for an old life that may still be running ` +
+    `(${held}); waiting on it, ${timer}; no agent-director call (sequence-waiting; b.jg5 SRJ-810, SRJ-1502)`
+  )
+}
+
+/**
+ * The old-life gate of `spawnForPersona` (b.jg5 SRJ-810 bullet 3, SRJ-1502):
+ * when the hold step holds persona `persona` back (`oldLifeHoldStep`), the
+ * `sequence-waiting` result with the old-life cause, which `launchSession`
+ * answers with the uncounted `'refused'`, so the retry timer the step armed
+ * stays armed (SRJ-1015); otherwise undefined.
+ */
+function oldLifeHoldResult(persona: Persona, ref: string, site: string): SpawnPersonaResult | undefined {
+  if (!oldLifeHoldStep(persona, site, ref)) return undefined
+  return { key: persona.key, action: 'sequence-waiting', sequenceWaitingCause: SEQUENCE_WAITING_CAUSE_OLD_LIFE_HOLD }
+}
+
+/** What `createOldLifeHoldEndRetry` is given (production: `main()`). */
+export interface OldLifeHoldEndRetryDeps {
+  /**
+   * Run persona `key`'s retry at once (production: the retry controller's
+   * `runNow`, with the held-for-an-old-life cause and the hold-ended label).
+   * A throw is logged and the next persona is still retried.
+   */
+  readonly runNow: (key: string) => unknown
+  /** Whether persona `key` is in the applied configuration now (production: `getAppliedPersona`). A throw counts as not applied. */
+  readonly isApplied: (key: string) => boolean
+}
+
+/**
+ * The old-life hold set's end observer that retries the waiting personas
+ * (b.jg5 SRJ-810: "once the hold ends, each persona that waited on it is
+ * retried at once"). `main()` registers it on the hold set after the session
+ * manager's own observer (`setOldLifeHolds`), so the hold's wait is stopped
+ * first (SRJ-811). For each persona recorded as waiting on the hold that
+ * ended (`OldLifeHold.waiting`, recorded by the hold step, by a launch
+ * refused because the wait runs on the persona's own row, and by the
+ * reconnect's held-row guard), in key order:
+ *   - a persona whose own `cscb_<key>` is the held id, while the wait the
+ *     hold's end stopped there has not settled (`pendingOldLifeHoldEndStop`),
+ *     is retried once that stopped wait has settled, so neither its sequence
+ *     gate nor its retry's block cause still finds the wait running; it is
+ *     then checked as below, with its own line
+ *     (`oldLifeHoldEndSettledRetryLine`);
+ *   - any other persona still in the applied configuration and not latched
+ *     is retried at once (`deps.runNow`); a persona torn down or removed, or
+ *     latched (b.jg5 SRJ-305: the latch stops its timer), is not.
+ * One line names them all:
+ *
+ *   [slack] old-life hold: ended for instanceId="<id>" — retrying its waiting personas at once: <keys|none>[; once the stopped wait on its own row has settled: <key>][; not retried: <key> (<not applied|latched>)[, …]] (b.jg5 SRJ-810)
+ *
+ * Makes no agent-director call itself; never throws.
+ */
+export function createOldLifeHoldEndRetry(deps: OldLifeHoldEndRetryDeps): OldLifeHoldEndObserver {
+  return (hold) => {
+    try {
+      const retried: string[] = []
+      const deferred: string[] = []
+      const skipped: string[] = []
+      const stopped = pendingOldLifeHoldEndStop(hold.instanceId)
+      for (const key of hold.waiting) {
+        if (stopped !== undefined && personaInstanceId(key) === hold.instanceId) {
+          deferred.push(key)
+          retryOldLifeWaiterOnceSettled(deps, hold.instanceId, key, stopped)
+          continue
+        }
+        const notRetried = retryOldLifeWaiter(deps, key)
+        if (notRetried === undefined) retried.push(key)
+        else skipped.push(`${key} (${notRetried})`)
+      }
+      console.error(oldLifeHoldEndRetryLine(hold.instanceId, retried, skipped, deferred))
+    } catch (err) {
+      // Not reached: every step above is guarded.
+      console.error(`${OLD_LIFE_HOLD_LOG_PREFIX} retrying the waiting personas of instanceId=${hold.instanceId} failed: ${describeThrownValue(err)} (b.jg5 SRJ-810)`)
+    }
+  }
+}
+
+/**
+ * Retry persona `key`, waiting on a hold that ended, now (b.jg5 SRJ-810;
+ * `createOldLifeHoldEndRetry`): when it is still in the applied
+ * configuration and not latched, `deps.runNow(key)` and undefined; otherwise
+ * why it was not retried (`not applied`, `latched`, or `its retry failed:
+ * <error>`). Never throws.
+ */
+function retryOldLifeWaiter(deps: OldLifeHoldEndRetryDeps, key: string): string | undefined {
+  let applied: boolean
+  try {
+    applied = deps.isApplied(key) === true
+  } catch {
+    applied = false
+  }
+  if (!applied) return 'not applied'
+  if (personaLatchedNow(key)) return 'latched'
+  try {
+    deps.runNow(key)
+    return undefined
+  } catch (err) {
+    return `its retry failed: ${describeThrownValue(err)}`
+  }
+}
+
+/**
+ * Retry persona `key`, waiting on the hold on its own row `instanceId`, once
+ * the wait the hold's end stopped there (`stopped`) has settled (b.jg5
+ * SRJ-810; `createOldLifeHoldEndRetry`), with one line
+ * (`oldLifeHoldEndSettledRetryLine`). Never throws; the promise it chains
+ * never rejects.
+ */
+function retryOldLifeWaiterOnceSettled(
+  deps: OldLifeHoldEndRetryDeps,
+  instanceId: string,
+  key: string,
+  stopped: Promise<boolean>,
+): void {
+  const retry = (): void => {
+    try {
+      console.error(oldLifeHoldEndSettledRetryLine(instanceId, key, retryOldLifeWaiter(deps, key)))
+    } catch (err) {
+      // Not reached: `retryOldLifeWaiter` never throws.
+      console.error(`${OLD_LIFE_HOLD_LOG_PREFIX} retrying persona=${key} after the wait on instanceId=${instanceId} settled failed: ${describeThrownValue(err)} (b.jg5 SRJ-810)`)
+    }
+  }
+  void stopped.then(retry, retry)
+}
+
+/**
+ * The line of a persona retried once the wait a hold's end stopped on its
+ * own row has settled (b.jg5 SRJ-810; `createOldLifeHoldEndRetry`):
+ * `notRetried` is undefined when it was retried, otherwise why not:
+ *
+ *   [slack] old-life hold: the stopped wait on instanceId="<id>" has settled — persona=<key> retried at once (b.jg5 SRJ-810)
+ *   [slack] old-life hold: the stopped wait on instanceId="<id>" has settled — persona=<key> not retried (<why>) (b.jg5 SRJ-810)
+ *
+ * Pure.
+ */
+export function oldLifeHoldEndSettledRetryLine(instanceId: string, key: string, notRetried: string | undefined): string {
+  const what = notRetried === undefined ? 'retried at once' : `not retried (${notRetried})`
+  return `${OLD_LIFE_HOLD_LOG_PREFIX} the stopped wait on instanceId=${JSON.stringify(renderLogMessageText(instanceId))} has settled — persona=${key} ${what} (b.jg5 SRJ-810)`
+}
+
+/**
+ * The end-retry observer's line (b.jg5 SRJ-810; `createOldLifeHoldEndRetry`):
+ * `retried` were retried at once, `skipped` were not (each with why), and
+ * `deferred` wait on the hold on their own row and are retried once the
+ * wait the hold's end stopped there has settled:
+ *
+ *   [slack] old-life hold: ended for instanceId="<id>" — retrying its waiting personas at once: <keys|none>[; once the stopped wait on its own row has settled: <keys>][; not retried: <key> (<why>)[, …]] (b.jg5 SRJ-810)
+ *
+ * Pure.
+ */
+export function oldLifeHoldEndRetryLine(
+  instanceId: string,
+  retried: readonly string[],
+  skipped: readonly string[],
+  deferred: readonly string[] = [],
+): string {
+  const now = retried.length === 0 ? 'none' : retried.join(', ')
+  const later = deferred.length === 0 ? '' : `; once the stopped wait on its own row has settled: ${deferred.join(', ')}`
+  const not = skipped.length === 0 ? '' : `; not retried: ${skipped.join(', ')}`
+  return `${OLD_LIFE_HOLD_LOG_PREFIX} ended for instanceId=${JSON.stringify(renderLogMessageText(instanceId))} — retrying its waiting personas at once: ${now}${later}${not} (b.jg5 SRJ-810)`
+}
+
+/**
+ * The persona teardown's old-life step (b.jg5 SRJ-811, SRJ-715;
+ * `PersonaLifecycleDeps.forgetOldLifeWaits`): forget persona `key` from
+ * every hold's waiting record (`OldLifeHoldSet.forgetWaiting`), so the
+ * hold's end never retries it; then, for each hold it was recorded as
+ * waiting on, stop that hold's wait (the registry's `stopNoLaunch`, reason
+ * `teardown`) only when no persona left in the applied configuration waits
+ * on the hold: none recorded as waiting on it and still applied, and none
+ * whose working directory is the held directory or whose own row is the
+ * held row (`oldLifeWaitingPersonas`). A destructive modify's new half,
+ * still applied under the key, counts as one that waits. One line per such
+ * hold (`oldLifeWaitTeardownLine`). Resolves once each wait it stopped has
+ * settled; with no hold set installed, at once. Makes no agent-director
+ * call; never rejects.
+ */
+export async function forgetOldLifeWaits(key: string): Promise<void> {
+  const holds = oldLifeHolds
+  if (holds === undefined) return
+  const stops: Promise<boolean>[] = []
+  try {
+    const waitedOn = holds.snapshot().filter((hold) => hold.waiting.includes(key))
+    holds.forgetWaiting(key)
+    for (const hold of waitedOn) {
+      const others = remainingOldLifeWaiters(hold.instanceId)
+      const registry = liveRowSequenceRegistry
+      const running = registry?.isNoLaunchRunning(hold.instanceId) === true
+      if (others.length === 0 && running) stops.push(registry!.stopNoLaunch(hold.instanceId, LIVE_ROW_STOP_TEARDOWN))
+      console.error(oldLifeWaitTeardownLine(key, hold.instanceId, others, running))
+    }
+  } catch (err) {
+    // Not reached (the hold set and the registry never throw).
+    console.error(`${OLD_LIFE_WAIT_LOG_PREFIX} persona=${key}: forgetting its old-life waits failed: ${describeThrownValue(err)} (b.jg5 SRJ-811)`)
+  }
+  await Promise.all(stops.map((stop) => stop.catch(() => false)))
+}
+
+/**
+ * The applied personas that still wait on the hold on `instanceId` (b.jg5
+ * SRJ-811), by key, sorted: each recorded as waiting on it that the
+ * installed bindings' configuration does not show outside the applied set
+ * (`isKnownUnapplied`), and each the waits-on query finds
+ * (`oldLifeWaitingPersonas`). Never throws.
+ */
+function remainingOldLifeWaiters(instanceId: string): string[] {
+  const keys = new Set<string>()
+  try {
+    for (const key of oldLifeHolds?.holdOf(instanceId)?.waiting ?? []) if (!isKnownUnapplied(key)) keys.add(key)
+    for (const persona of oldLifeWaitingPersonas(instanceId)) keys.add(persona.key)
+  } catch {
+    // Not reached (the hold set never throws).
+  }
+  return [...keys].sort()
+}
+
+/**
+ * The teardown's old-life line for one hold persona `key` was recorded as
+ * waiting on (b.jg5 SRJ-811; `forgetOldLifeWaits`): `others` are the applied
+ * personas that still wait on it, `running` whether its wait ran:
+ *
+ *   [slack] old-life-wait: persona=<key> torn down — forgotten as waiting on instanceId="<id>"; the wait is stopped: no other persona waits on the hold (b.jg5 SRJ-811)
+ *   [slack] old-life-wait: persona=<key> torn down — forgotten as waiting on instanceId="<id>"; no wait runs on it, and no other persona waits on the hold (b.jg5 SRJ-811)
+ *   [slack] old-life-wait: persona=<key> torn down — forgotten as waiting on instanceId="<id>"; the wait goes on: <keys> still wait on the hold (b.jg5 SRJ-811)
+ *   [slack] old-life-wait: persona=<key> torn down — forgotten as waiting on instanceId="<id>"; no wait runs on it; <keys> still wait on the hold (b.jg5 SRJ-811)
+ *
+ * Pure.
+ */
+export function oldLifeWaitTeardownLine(key: string, instanceId: string, others: readonly string[], running: boolean): string {
+  const what =
+    others.length > 0
+      ? `${running ? 'the wait goes on: ' : 'no wait runs on it; '}${others.join(', ')} still wait on the hold`
+      : running
+        ? 'the wait is stopped: no other persona waits on the hold'
+        : 'no wait runs on it, and no other persona waits on the hold'
+  return `${OLD_LIFE_WAIT_LOG_PREFIX} persona=${key} torn down — forgotten as waiting on instanceId=${JSON.stringify(renderLogMessageText(instanceId))}; ${what} (b.jg5 SRJ-811)`
+}
+
+// ---------------------------------------------------------------------------
 // The live-row sequence's final launch and its dependencies (b.jg5 SRJ-705)
 // ---------------------------------------------------------------------------
 
@@ -12181,7 +12662,11 @@ export type LiveRowSequenceLaunchEntryResult = SpawnPersonaResult | LiveRowSeque
  *     paths (`spawnForPersona`): it is the sequence's own launch, made from
  *     inside it, and never passes through that gate;
  *   - the latched gate, the held gate (b.jg5 SRJ-207: a persona held on
- *     `ErrInvalidFlags` answers `held` with no call), the pre-launch
+ *     `ErrInvalidFlags` answers `held` with no call), the old-life gate
+ *     (b.jg5 SRJ-810, SRJ-1502: a hold other than one on the persona's own
+ *     row on its working directory answers `sequence-waiting` with no call,
+ *     through the hold step `oldLifeHoldStep`, so the sequence ends without
+ *     its launch), the pre-launch
  *     `claude_config_dir` check and dry run come first, as in
  *     `spawnForPersona`; then the launch runs as a launch attempt for the
  *     persona (SRJ-301), the trust patch once before it;
@@ -12343,6 +12828,13 @@ async function sequenceLaunchAttempt(
   // b.jg5 SRJ-207: a persona held on ErrInvalidFlags gets no launch.
   const held = heldResult(key, ref, LIVE_ROW_SEQUENCE_LAUNCH_SITE)
   if (held !== undefined) return held
+  // b.jg5 SRJ-810, SRJ-1502: nor is P launched into a working directory an
+  // old life that may still run holds (a hold on P's own row excepted: the
+  // sequence's own reads have ended it by now); the hold step records P as
+  // waiting, starts the hold's wait and arms P's retry timer, and the
+  // sequence ends without its launch.
+  const oldLifeHeld = oldLifeHoldResult(persona, ref, LIVE_ROW_SEQUENCE_LAUNCH_SITE)
+  if (oldLifeHeld !== undefined) return oldLifeHeld
   const configDir = checkLaunchConfigDir(persona)
   if (!configDir.ok) {
     deferLaunchForConfigDir(persona, configDir)
@@ -13427,9 +13919,9 @@ export type OldLifeWaitEnsureAnswer =
  * one wait runs per held instance id and never at once with a sequence on
  * it; `closed` after the registry's close), `not-held` with one line when no
  * hold is on the id, or `not-installed` with one line when no registry or
- * no wait bindings are installed. Never blocks on the wait; never throws. In
- * this build it is started only through this entry: no production gate calls
- * it yet.
+ * no wait bindings are installed. Never blocks on the wait; never throws. A
+ * wait is started only through this entry; the hold step
+ * (`oldLifeHoldStep`) calls it for each hold that holds a launch back.
  *
  *   [slack] old-life-wait: instanceId=<id>: no old-life hold is on it — no wait started (b.jg5 SRJ-811)
  *   [slack] old-life-wait: instanceId=<id>: no sequence registry or wait bindings are installed — no wait started (b.jg5 SRJ-811)
@@ -13515,7 +14007,8 @@ export function oldLifeWaitNotStartedLine(
  *     decided the ordinary alert unstopped, or at step 5;
  *   - each waiting persona's retry timer armed with
  *     `UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD`, uncounted, when the hold goes
- *     on; never the old key's (SRJ-1512);
+ *     on; never the old key's (SRJ-1512), and never a latched persona's
+ *     (`armOldLifeWaiter`; SRJ-305);
  * then one end line (`oldLifeWaitEndLine`). Nothing reaches Slack. Never throws.
  */
 function handleOldLifeWaitEnd(
@@ -13558,9 +14051,14 @@ function handleOldLifeWaitEnd(
  * (`UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD`; b.jg5 SRJ-811, SRJ-301), never
  * counted, through the installed bindings' arm. A key the bindings'
  * configuration shows outside the applied set is never armed (b.jg5
- * SRJ-1512, b.av2 SR-8.6: no retry timer for the old key), with one line:
+ * SRJ-1512, b.av2 SR-8.6: no retry timer for the old key), and neither is a
+ * latched persona (`personaLatchedNow`; b.jg5 SRJ-305: the latch stops the
+ * timer, whatever the case; SRJ-301: a sequence stopped by P's latch arms
+ * nothing), so a wait's round that a configured persona's own-row latch
+ * ended arms only the waiting personas that are not latched. One line each:
  *
  *   [slack] old-life-wait: persona=<key>: not in the applied configuration — no retry timer armed (b.jg5 SRJ-1512, b.av2 SR-8.6)
+ *   [slack] old-life-wait: persona=<key>: latched — no retry timer armed (b.jg5 SRJ-305, SRJ-502)
  *
  * Answers whether it was armed. Never throws.
  */
@@ -13568,6 +14066,10 @@ function armOldLifeWaiter(key: string, bindings: OldLifeWaitBindings | undefined
   if (bindings === undefined) return false
   if (isKnownUnapplied(key, bindings)) {
     console.error(oldLifeWaitNotAppliedLine(key))
+    return false
+  }
+  if (personaLatchedNow(key)) {
+    console.error(oldLifeWaitLatchedLine(key))
     return false
   }
   try {
@@ -13589,6 +14091,18 @@ function armOldLifeWaiter(key: string, bindings: OldLifeWaitBindings | undefined
  */
 export function oldLifeWaitNotAppliedLine(key: string): string {
   return `${OLD_LIFE_WAIT_LOG_PREFIX} persona=${key}: not in the applied configuration — no retry timer armed (b.jg5 SRJ-1512, b.av2 SR-8.6)`
+}
+
+/**
+ * The line of a waiting persona that is latched, so no retry timer is armed
+ * for it (`armOldLifeWaiter`; b.jg5 SRJ-305, SRJ-502):
+ *
+ *   [slack] old-life-wait: persona=<key>: latched — no retry timer armed (b.jg5 SRJ-305, SRJ-502)
+ *
+ * Pure.
+ */
+export function oldLifeWaitLatchedLine(key: string): string {
+  return `${OLD_LIFE_WAIT_LOG_PREFIX} persona=${key}: latched — no retry timer armed (b.jg5 SRJ-305, SRJ-502)`
 }
 
 /** The wait's arm cause, held to the retry controller's label by its type (the same string). */
@@ -13634,6 +14148,40 @@ export function waitsOnKillFailedHold(key: string): boolean {
 }
 
 /**
+ * Whether persona `key`'s own row (`cscb_<key>`) is held for an old life
+ * (b.jg5 SRJ-809, SRJ-810): the installed hold set holds that instance id. A
+ * destructive modify's same-key old life and a row the start sweep swept for
+ * its `cwd` whose kill did not succeed are such rows. False with no hold set
+ * installed. Makes no agent-director call; never throws.
+ */
+export function isOwnRowOldLifeHeld(key: string): boolean {
+  const holds = oldLifeHolds
+  if (holds === undefined) return false
+  try {
+    return holds.holdOf(personaInstanceId(key)) !== undefined
+  } catch {
+    return false
+  }
+}
+
+/**
+ * The held-directory query of session admission (b.jg5 SRJ-810, SRJ-1505;
+ * `SessionAdmissionOptions.heldDirectory`, `src/registry.ts`): every hold of
+ * the installed hold set whose directory is `path` by real path, as the held
+ * directory (the first hold's real path) and every held old instance id, in
+ * begin order; undefined when none is, or with no hold set installed (before
+ * `main()` has built it). A hold-set read that throws is passed on, so the
+ * admission counts it as held. Makes no agent-director call.
+ */
+export function oldLifeHeldDirectory(path: string): SessionHeldDirectory | undefined {
+  const holds = oldLifeHolds
+  if (holds === undefined) return undefined
+  const held = holds.holdsOnDirectory(path)
+  if (held.length === 0) return undefined
+  return { directory: held[0]!.realDirectory, instanceIds: held.map((hold) => hold.instanceId) }
+}
+
+/**
  * "A live-row sequence or an old-life wait step runs for P" (b.jg5 SRJ-1011,
  * SRJ-812; E15's sequence/wait input): `isLiveRowSequenceRunning` or
  * `isOldLifeWaitRunningFor`. Never throws.
@@ -13662,9 +14210,9 @@ export function personaRetryBlockCause(key: string): RetryBlockCause | undefined
  * The live-row sequence gate for persona `key` at `site`, as the restart
  * path asks it (b.jg5 SRJ-706, SRJ-811): `isLiveRowSequenceRunning(key)`;
  * when what runs on its own `cscb_<key>` is an old-life wait, which launches
- * no one, the persona's retry timer is armed with the held-for-an-old-life
- * cause too (`oldLifeWaitRefusal`), so the persona is retried once the wait
- * is over. For a key outside the applied set whose own row's old-life wait
+ * no one, the persona is recorded as waiting on that hold and its retry
+ * timer is armed with the held-for-an-old-life cause too
+ * (`oldLifeWaitRefusal`), so the persona is retried once the wait is over. For a key outside the applied set whose own row's old-life wait
  * runs (the wait on a removed key's row, b.jg5 SRJ-1512) the gate answers
  * false with nothing armed, so the restart path's not-up gate (the relaunch
  * gate, b.av2 SR-8.6) answers for the key. Never throws.
@@ -13678,7 +14226,9 @@ export function liveRowSequenceGate(key: string, site: string): boolean {
 
 /**
  * When an old-life wait runs on persona `key`'s own `cscb_<key>` (b.jg5
- * SRJ-811 bullet 2, SRJ-810): arm its retry timer with the
+ * SRJ-811 bullet 2, SRJ-810): record the persona as waiting on that hold
+ * (`recordOwnRowWaiting`), so the hold's end retries it at once and its
+ * teardown forgets it there; arm its retry timer with the
  * held-for-an-old-life cause (`armOldLifeWaiter`), log one line and answer
  * true; otherwise false, with nothing done. Never throws.
  *
@@ -13686,8 +14236,29 @@ export function liveRowSequenceGate(key: string, site: string): boolean {
  */
 function oldLifeWaitRefusal(key: string, ref: string, site: string): boolean {
   if (liveRowSequenceRegistry?.isNoLaunchRunning(personaInstanceId(key)) !== true) return false
+  recordOwnRowWaiting(key)
   console.error(oldLifeWaitRefusalLine(site, ref, armOldLifeWaiter(key)))
   return true
+}
+
+/**
+ * Record persona `key` as waiting on the hold on its own `cscb_<key>`
+ * (b.jg5 SRJ-810; `OldLifeHoldSet.recordWaiting`), as the hold step records
+ * a persona on a hold on its working directory: the hold's end then retries
+ * it (`createOldLifeHoldEndRetry`), and its teardown forgets it there and
+ * stops the wait when no persona left waits on the hold
+ * (`forgetOldLifeWaits`). A key the installed bindings' configuration shows
+ * outside the applied set is not recorded (b.jg5 SRJ-1512), nor anything
+ * with no hold set installed or no hold on that id. Never throws.
+ */
+function recordOwnRowWaiting(key: string): void {
+  const holds = oldLifeHolds
+  if (holds === undefined || isKnownUnapplied(key)) return
+  try {
+    holds.recordWaiting(personaInstanceId(key), key)
+  } catch {
+    // Not reached (the hold set never throws).
+  }
 }
 
 /**
@@ -15144,7 +15715,16 @@ export function startLaunchNotStartedForShutdownLine(ref: string): string {
  * each persona goes through the b.av2 SR-6.1 procedure, in order: the local
  * credentials check (skipped in dry run), the working-directory check, Slack
  * validation and connection (the controller's `bringUp`, which also logs the
- * persona's `persona-start` line), then the launch (`spawnForPersona`). Steps
+ * persona's `persona-start` line), then the launch (`spawnForPersona`). The
+ * launch is step 4 as amended by b.jg5 SRJ-1502: "(4) launch, which waits
+ * while an old life that may still be running holds the persona's working
+ * directory (b.jg5 SRJ-809, SRJ-810); the persona is retried on its
+ * UNAVAILABLE retry timer (b.jg5 SRJ-301) until that wait ends."
+ * `spawnForPersona`'s old-life gate makes that wait: a persona whose working
+ * directory such a hold holds (one on its own row excepted) makes no
+ * agent-director call, starts the hold's wait, has its retry timer armed and
+ * answers `sequence-waiting`, counted under "waiting on a live-row sequence"
+ * (b.jg5 SRJ-1015); it is `up`, its Slack connection serving. Steps
  * 1–3 run for every persona at once, so no persona's Slack connection waits
  * behind another persona's launch; only the launches share a pool of at most
  * `concurrency` (default 3), taken in the order the personas become ready. The

@@ -143,6 +143,7 @@ import {
   createPersonaLifecycle,
   LIVE_ROW_SEQUENCE_STOP_AGAIN_STEP,
   LIVE_ROW_SEQUENCE_STOP_STEP,
+  OLD_LIFE_WAITS_STEP,
   TEARDOWN_RETRY_TIMER_STOP_AFTER_KILL_STEP,
   type PersonaLifecycle,
   type PersonaLifecycleDeps,
@@ -170,6 +171,7 @@ import {
   approverLogLine,
   approverNotStartedMessage,
   killPersonaInstanceForTeardown,
+  oldLifeWaitTeardownLine,
   setConfiguredPersonaQuery,
   setConflictLatch,
   stopLiveRowSequence,
@@ -177,7 +179,9 @@ import {
   type PersonaTeardownKillRefusal,
   type PersonaTeardownKillResult,
 } from '../src/session-manager.ts'
-import { LIVE_ROW_OUTCOME_STOPPED, LIVE_ROW_STOP_TEARDOWN } from '../src/live-row-sequence.ts'
+import { LIVE_ROW_OUTCOME_STOPPED, LIVE_ROW_STOP_HOLD_ENDED, LIVE_ROW_STOP_TEARDOWN } from '../src/live-row-sequence.ts'
+import { OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL } from '../src/retired-keys.ts'
+import { UNAVAILABLE_RETRY_ROW_ABSENT } from '../src/unavailable-retry.ts'
 import {
   callCounts,
   callCountsSince,
@@ -185,6 +189,7 @@ import {
   makeRecoveryHarness,
   ordinaryAlertContent,
   personaOf,
+  rowReadsUntilSpawn,
   scriptLiveRowElsewhere,
   survivorAlertContent,
   type RecoveryHarness,
@@ -281,6 +286,9 @@ import {
   type StubResolveSystemBinaryOutcome,
   errUnknownErrorName,
   errUnusableName,
+  cannedFindMissing,
+  cannedGetResult,
+  holdFindMissing,
   holdSpawns,
   makeStubCallLog,
   makeStubClient,
@@ -810,6 +818,58 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     expect(f.lines).toEqual(cleanTeardownLines(f.b))
     expect(f.trail.join('\n')).not.toContain(f.a.key + ':')
     expect(f.submitted).toEqual([f.b.key])
+  })
+
+  // b.jg5 SRJ-811: the optional old-life member (production: the session
+  // manager's forgetOldLifeWaits) runs right after each stop of B's retry
+  // timer before the kill; the fixture's other teardowns, built without it,
+  // keep the trail above.
+  test('b.jg5 SRJ-811: with the optional old-life member, B\'s old-life waits are forgotten right after each retry-timer stop before the kill (in the first group, and again once its launch in flight settled), for B only; none after the kill', async () => {
+    const f = makeFixture({
+      overrides: {
+        forgetOldLifeWaits: (key: string) => {
+          f.trail.push(`forgetOldLifeWaits:${key}`)
+        },
+      },
+    })
+
+    await f.lifecycle.teardown(f.b)
+
+    const k = f.b.key
+    const want: string[] = []
+    let timerStops = 0
+    for (const step of fullTeardownTrail(f.b, launchPassOf(f, undefined))) {
+      want.push(step)
+      if (step === `stopRetryTimer:${k}` && ++timerStops <= 2) want.push(`forgetOldLifeWaits:${k}`)
+    }
+    expect(f.trail).toEqual(want)
+    expect(f.trail.filter((c) => c.startsWith('forgetOldLifeWaits:'))).toEqual([`forgetOldLifeWaits:${k}`, `forgetOldLifeWaits:${k}`])
+    expect(f.trail.lastIndexOf(`forgetOldLifeWaits:${k}`)).toBeLessThan(f.trail.indexOf(`killInstance:${k}`))
+    expect(f.lines).toEqual(cleanTeardownLines(f.b))
+  })
+
+  test.each<['throws' | 'rejects']>([['throws'], ['rejects']])('b.jg5 SRJ-811: the old-life member failing (it %s) is one token-safe line per step naming B, and every later step still runs', async (how) => {
+    const f = makeFixture({
+      overrides: {
+        forgetOldLifeWaits: (key: string) => {
+          f.trail.push(`forgetOldLifeWaits:${key}`)
+          if (how === 'rejects') return Promise.reject(failure())
+          throw failure()
+        },
+      },
+    })
+
+    await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
+
+    expect(f.trail.filter((c) => c.startsWith('killInstance:') || c.startsWith('replyGuard.launchPass:'))).toHaveLength(2)
+    expect(f.lines).toEqual([
+      `${teardownPrefix(f.b)}: starting`,
+      expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: ${OLD_LIFE_WAITS_STEP} failed: Error`)}( |$)`)),
+      expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: ${OLD_LIFE_WAITS_STEP} again, after its launch in flight settled failed: Error`)}( |$)`)),
+      killOutcomeLine(f.b),
+      `${teardownPrefix(f.b)}: complete, with 2 failed step(s)`,
+    ])
+    assertNoLeak({ lines: f.lines })
   })
 
   test('the launch pass reads the applied set when it runs, not when the teardown started', async () => {
@@ -1953,6 +2013,69 @@ describe('persona teardown end to end over the recovery harness (b.jg5 SRJ-715):
     await h.drive(done)
     expect(f.lines.at(-1)).toBe(`${teardownPrefix(personaOf(h, p))}: complete`)
     expect(h.approverRunning(p)).toBe(false)
+  })
+  // b.jg5 SRJ-811 (hatch A3): the teardown's old-life step (the session
+  // manager's forgetOldLifeWaits, through `teardownDeps()`) forgets P as
+  // waiting and stops the hold's wait only when no persona left in the
+  // applied configuration waits on it. P waits on a pre-persona row held in
+  // its working directory (its launch held back by the gate, the wait's first
+  // run held); with Q in the same directory, Q waits too. Configuration
+  // validation refuses two personas in one working directory (src/config.ts),
+  // so the shared row is a unit case of the teardown's other-waiter rule only;
+  // the multi-waiter setup production reaches (B's own row swept into P's
+  // directory, B waiting on its own row, its teardown as the last waiter
+  // stopping the wait) is tests/old-life-wait.test.ts's.
+  test.each<[string, boolean]>([
+    ['P the only waiting persona: the wait is stopped (teardown), and the hold goes on with no one waiting', false],
+    ['Q in P\'s directory waiting too: the wait goes on, Q still waiting, and once the hold ends Q, not P, is retried at once', true],
+  ])('%s', async (_label, shared) => {
+    const workDir = join(dir, 'shared-work')
+    mkdirSync(workDir)
+    const h = makeRecoveryHarness(shared ? { personas: [{ working_directory: workDir }, { working_directory: workDir }] } : {})
+    cleanups.push(() => {
+      try {
+        h.controller.stopAll('the case is over')
+        assertNoLeak(h.captured())
+      } finally {
+        h.cleanup()
+      }
+    })
+    const [p, q] = h.keys as [string, string]
+    const oldId = 'cscb_old_C0OLD'
+    const held = personaOf(h, p).working_directory
+    h.beginOldLifeHold({ instanceId: oldId, oldKey: oldId, directory: held, cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL })
+    h.script({ getResult: cannedGetResult({ claude_instance_id: oldId, cwd: held }) })
+    rowReadsUntilSpawn(h, UNAVAILABLE_RETRY_ROW_ABSENT)
+    const hold = holdFindMissing(h.stub.client)
+    expect((await h.launch(p)).action).toBe('sequence-waiting')
+    await h.driveSequence(hold.entered(1))
+    if (shared) expect((await h.launch(q)).action).toBe('sequence-waiting')
+    h.remove(p) // apply step 1
+    const f = makeFixture({ overrides: h.teardownDeps() })
+    const others = shared ? [q] : []
+    const line = oldLifeWaitTeardownLine(p, oldId, others, true)
+
+    const done = f.lifecycle.teardown(personaOf(h, p))
+    for (let turn = 0; turn < 100 && !h.errors.includes(line); turn++) await flush()
+    expect(h.errors.filter((l) => l === line)).toHaveLength(1)
+    // The wait's held run returns: a stopped wait makes no further call, a running one goes on to its next step.
+    hold.release(shared ? cannedFindMissing({ rows: { [oldId]: 'ids' } }) : cannedFindMissing())
+    await h.driveSequence(h.drive(done))
+    await h.settle()
+
+    expect(f.lines.at(-1)).toBe(`${teardownPrefix(personaOf(h, p))}: complete`)
+    expect(await h.oldLifeWaitSettled(oldId)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: shared ? LIVE_ROW_STOP_HOLD_ENDED : LIVE_ROW_STOP_TEARDOWN })
+    expect(h.oldLifeWaitRunning(oldId)).toBe(false)
+    if (shared) {
+      expect(h.oldLifeHolds.holdOf(oldId)).toBeUndefined()
+      expect(h.holdEndRetries.map((r) => r.key)).toEqual([q])
+      expect(h.stub.calls.spawnCalls.map((params) => params.claude_instance_id)).toEqual([personaInstanceId(q)])
+      await h.runApproverToStop(q)
+    } else {
+      expect(h.oldLifeHolds.holdOf(oldId)?.waiting).toEqual([])
+      // No run after the stopped one.
+      expect([h.holdEndRetries, hold.calls.length, h.stub.calls.getCalls.length]).toEqual([[], 1, 1])
+    }
   })
 })
 

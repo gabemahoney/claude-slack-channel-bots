@@ -25,10 +25,12 @@
  *     through the round's alert sink); no mark, nothing armed, no notice;
  *   - stopped because a configured persona's own row is latched (a read of
  *     it latched the persona, or the persona was latched already; SRJ-114,
- *     SRJ-513, SRJ-502): the hold goes on, the waiting personas are armed
- *     as below, and the hold is marked kill-failed when the round's kill
- *     decided the ordinary alert and no stop ended its tries (a read-latch
- *     end is a failure end, its alert standing; SRJ-812);
+ *     SRJ-513, SRJ-502): the hold goes on, the waiting personas that are not
+ *     latched are armed as below (the session manager's arm never arms a
+ *     latched persona: SRJ-305, SRJ-301), and the hold is marked
+ *     kill-failed when the round's kill decided the ordinary alert and no
+ *     stop ended its tries (a read-latch end is a failure end, its alert
+ *     standing; SRJ-812);
  *   - every other end keeps the hold and arms each waiting persona's retry
  *     timer with {@link OLD_LIFE_WAIT_ARM_CAUSE}, uncounted: an UNAVAILABLE,
  *     ENVIRONMENT, CONFIG or UNCLASSIFIED answer (the outages were raised for
@@ -280,7 +282,8 @@ export function decideOldLifeWaitEnd(input: OldLifeWaitEndInput): OldLifeWaitEnd
     if (outcome.reason === LIVE_ROW_STOP_LATCHED) {
       // SRJ-114, SRJ-513, SRJ-502: a configured persona's own row is latched.
       // The hold goes on and the waiting personas are armed, as after every
-      // end that keeps the hold other than a stop. A read-latch end of the
+      // end that keeps the hold other than a stop; the session manager's arm
+      // skips a latched persona (SRJ-305, SRJ-301). A read-latch end of the
       // kill's tries is a failure end whose ordinary alert stands, so it
       // marks the hold (SRJ-812); only tries a stop ended do not.
       const marks = lastKill !== undefined && lastKill.alert.kind === KILL_RETRY_ALERT_ORDINARY && lastKill.end !== KILL_RETRY_END_STOPPED

@@ -10,6 +10,12 @@
  * The not-up block (b.av2 SR-6.3, SR-6.4) brings personas up through the real
  * bring-up controller on the real connection manager (stub Slack, fake clock)
  * and drives the real admission decision, up predicate and session drop.
+ * Its held-directory block (b.jg5 SRJ-810, SRJ-1505) installs a real
+ * old-life hold set in the session manager and gives the admission its
+ * production held-directory query (`oldLifeHeldDirectory`): a session from a
+ * held directory is refused as held, whichever persona names it, with one
+ * line naming the directory and every held id, before any persona is
+ * matched; a throwing query refuses as held.
  * The global `fetch` is stubbed for every test (it throws unless a test sets
  * `h.fetchHandler`), so no test reaches the network, and every tool result
  * and log line is leak-checked in `afterEach`.
@@ -25,7 +31,16 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import { DEFAULT_REPLY_CHUNK_LIMIT, DEFAULT_REPLY_CHUNK_MODE, MCP_SERVER_NAME, type Persona, type ReplySettings } from '../src/config.ts'
 import { assertSendable } from '../src/lib.ts'
-import { renderPersonaRef } from '../src/persona-identity.ts'
+import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
+import { describeThrownValue } from '../src/persona-connection-errors.ts'
+import {
+  createOldLifeHoldSet,
+  OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1,
+  OLD_LIFE_HOLD_END_READ_ENDED,
+  type OldLifeHold,
+  type OldLifeHoldSet,
+} from '../src/retired-keys.ts'
+import { _resetOldLifeHolds, oldLifeHeldDirectory, setOldLifeHolds } from '../src/session-manager.ts'
 import {
   createNotUpSessionDropper,
   createPersonaBringUpController,
@@ -38,7 +53,9 @@ import {
   closePendingSession,
   decideSessionAdmission,
   dropPersonaSession,
+  sessionHeldRefusalLine,
   type SessionAdmission,
+  type SessionAdmissionOptions,
   registerSession,
   unregisterSession,
   unregisterByMcpSessionId,
@@ -906,6 +923,253 @@ describe('not-up personas: MCP session admission and drop (b.av2 SR-6.3, SR-6.4)
     expect(h.lines.filter((l) => l.includes('MCP session dropped'))).toEqual([])
     expect(getSessionByPersona(s.beta.key)).toBe(b)
     expect((b.transport as any).closeCalls).toBe(0)
+  })
+
+  // -------------------------------------------------------------------------
+  // A directory held for an old life (b.jg5 SRJ-810 bullet 1, SRJ-1505; AC 53)
+  //
+  // As main() wires it: one real hold set (`createOldLifeHoldSet`) installed
+  // in the session manager (`setOldLifeHolds`), whose held-directory query
+  // (`oldLifeHeldDirectory`) handleInitialized gives `decideSessionAdmission`
+  // beside the real up predicate. Holds are begun on the set directly, as
+  // apply step 1 and the start sweep begin them; how they begin and end is
+  // tests/old-life-wait.test.ts's.
+  // -------------------------------------------------------------------------
+
+  describe('b.jg5 SRJ-810, SRJ-1505: a session opened from a directory held for an old life is registered as no persona\'s, whichever persona names it', () => {
+    let holds: OldLifeHoldSet
+
+    beforeEach(() => {
+      holds = createOldLifeHoldSet({ log: (line) => void h.lines.push(line) })
+      setOldLifeHolds(holds)
+    })
+
+    afterEach(() => {
+      _resetOldLifeHolds()
+    })
+
+    /** Begin a hold on `instanceId` (old key `oldKey`) at `directory`, as apply step 1 does. */
+    function hold(instanceId: string, oldKey: string, directory: string): OldLifeHold {
+      return holds.begin({ instanceId, oldKey, directory, cause: OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1 })
+    }
+
+    /** What the admission logged and answered for `rootsPath`, with the production query (or `heldDirectory`). */
+    function admitHeld(
+      s: Started,
+      rootsPath: string,
+      heldDirectory: SessionAdmissionOptions['heldDirectory'] = oldLifeHeldDirectory,
+    ): { admission: SessionAdmission; lines: string[]; upAsked: string[] } {
+      const lines: string[] = []
+      const upAsked: string[] = []
+      const isPersonaUp = createPersonaUpPredicate(s.c.manager, s.controller)
+      const admission = decideSessionAdmission(rootsPath, s.c.personas, {
+        isPersonaUp: (key) => {
+          upAsked.push(key)
+          return isPersonaUp(key)
+        },
+        describeNotUp: (key) => describePersonaNotUp(s.controller.state(key)),
+        log: (line) => void lines.push(line),
+        heldDirectory,
+      })
+      h.lines.push(...lines)
+      return { admission, lines, upAsked }
+    }
+
+    /** The answer and the one line for a session from `directory`, held for `ids`. */
+    function heldOutcome(directory: string, ids: readonly string[]): { admission: SessionAdmission; lines: string[] } {
+      const real = realpathSync(directory)
+      return { admission: { kind: 'held', directory: real, instanceIds: ids }, lines: [sessionHeldRefusalLine(real, ids)] }
+    }
+
+    /** The beta persona, in another directory and up, is still admitted with no line. */
+    function expectBetaAdmitted(s: Started): void {
+      const beta = admitHeld(s, s.beta.working_directory)
+      expect(beta.admission).toEqual({ kind: 'admitted', persona: s.beta })
+      expect(beta.lines).toEqual([])
+    }
+
+    test.each<{ label: string; up: boolean; held: (s: Started) => { id: string; oldKey: string; directory: string } }>([
+      {
+        label: "the old key's own persona, up, names D",
+        up: true,
+        held: (s) => ({ id: personaInstanceId(s.alpha.key), oldKey: s.alpha.key, directory: s.alpha.working_directory }),
+      },
+      {
+        label: "the old key's own persona, not up (broken), names D",
+        up: false,
+        held: (s) => ({ id: personaInstanceId(s.alpha.key), oldKey: s.alpha.key, directory: s.alpha.working_directory }),
+      },
+      {
+        label: 'a different persona, up, now names D (the old key is a retired one)',
+        up: true,
+        held: (s) => ({ id: personaInstanceId('retired_bot'), oldKey: 'retired_bot', directory: s.alpha.working_directory }),
+      },
+      {
+        label: 'no persona names D',
+        up: true,
+        held: () => {
+          const directory = join(h.dir, 'unconfigured-held')
+          mkdirSync(directory)
+          return { id: personaInstanceId('retired_bot'), oldKey: 'retired_bot', directory }
+        },
+      },
+    ])('$label: refused as held with exactly one line naming D by its real path and the old instance id; no persona is asked whether it is up; beta, up in its own directory, is still admitted', async ({ up, held }) => {
+      const s = await start(up ? {} : { breakAlpha: (a) => rmSync(a.credentials_file) })
+      expect(s.controller.state(s.alpha.key)?.outcome).toBe(up ? 'up' : 'broken')
+      const { id, oldKey, directory } = held(s)
+      hold(id, oldKey, directory)
+
+      const result = admitHeld(s, directory)
+
+      expect({ admission: result.admission, lines: result.lines }).toEqual(heldOutcome(directory, [id]))
+      expect(result.lines[0]).toContain(JSON.stringify(realpathSync(directory)))
+      expect(result.lines[0]).toContain(JSON.stringify(id))
+      // The held check comes before any persona is matched or asked whether it is up.
+      expect(result.upAsked).toEqual([])
+      expect(getSessionByPersona(s.alpha.key)).toBeUndefined()
+      expectBetaAdmitted(s)
+    })
+
+    test('two holds on D (two old instance ids) refuse it with one line naming both ids, in begin order', async () => {
+      const s = await start()
+      const ids = [personaInstanceId(s.alpha.key), personaInstanceId('retired_bot')]
+      hold(ids[0]!, s.alpha.key, s.alpha.working_directory)
+      hold(ids[1]!, 'retired_bot', s.alpha.working_directory)
+
+      const result = admitHeld(s, s.alpha.working_directory)
+
+      expect({ admission: result.admission, lines: result.lines }).toEqual(heldOutcome(s.alpha.working_directory, ids))
+      for (const id of ids) expect(result.lines[0]).toContain(JSON.stringify(id))
+      expectBetaAdmitted(s)
+    })
+
+    test('D reached through a symlink, and a hold begun through a symlink with the session from D itself: both refused as held, naming D by its real path', async () => {
+      const s = await start()
+      const link = join(h.dir, 'alpha-link')
+      symlinkSync(s.alpha.working_directory, link)
+      const id = personaInstanceId(s.alpha.key)
+      hold(id, s.alpha.key, s.alpha.working_directory)
+
+      for (const rootsPath of [link, `${link}/`, join(link, 'child-gone', '..')]) {
+        const result = admitHeld(s, rootsPath)
+        expect({ admission: result.admission, lines: result.lines }).toEqual(heldOutcome(s.alpha.working_directory, [id]))
+      }
+
+      holds.end(id, OLD_LIFE_HOLD_END_READ_ENDED)
+      const other = personaInstanceId('retired_bot')
+      hold(other, 'retired_bot', link)
+      const result = admitHeld(s, s.alpha.working_directory)
+      expect({ admission: result.admission, lines: result.lines }).toEqual(heldOutcome(s.alpha.working_directory, [other]))
+      expectBetaAdmitted(s)
+    })
+
+    test('a missing D compares by its lexical path: a session from it, with or without a trailing slash or a `..` segment, is refused as held, never as not up, and nothing throws', async () => {
+      const s = await start({ breakAlpha: rmDir })
+      const wd = s.alpha.working_directory
+      expect(existsSync(wd)).toBe(false)
+      const id = personaInstanceId(s.alpha.key)
+      hold(id, s.alpha.key, wd)
+
+      for (const rootsPath of [wd, `${wd}/`, join(wd, 'gone', '..')]) {
+        let result: ReturnType<typeof admitHeld> | undefined
+        expect(() => {
+          result = admitHeld(s, rootsPath)
+        }).not.toThrow()
+        expect(result!.admission).toEqual({ kind: 'held', directory: wd, instanceIds: [id] })
+        expect(result!.lines).toEqual([sessionHeldRefusalLine(wd, [id])])
+      }
+      expectBetaAdmitted(s)
+    })
+
+    test.each<{ label: string; up: boolean }>([
+      { label: 'an up persona naming D is admitted with no line', up: true },
+      { label: "a persona naming D that is not up is refused with today's not-up line", up: false },
+    ])('once the hold ends, a session from D is decided as before: $label', async ({ up }) => {
+      const s = await start(up ? {} : { breakAlpha: (a) => rmSync(a.credentials_file) })
+      const id = personaInstanceId(s.alpha.key)
+      hold(id, s.alpha.key, s.alpha.working_directory)
+      expect(admitHeld(s, s.alpha.working_directory).admission.kind).toBe('held')
+
+      holds.end(id, OLD_LIFE_HOLD_END_READ_ENDED)
+      const result = admitHeld(s, s.alpha.working_directory)
+
+      if (up) {
+        expect(result.admission).toEqual({ kind: 'admitted', persona: s.alpha })
+        expect(result.lines).toEqual([])
+      } else {
+        expect(result.admission).toEqual({ kind: 'not-up', persona: s.alpha })
+        expect(result.lines).toEqual([refusedLine(s.alpha, describePersonaNotUp(s.controller.state(s.alpha.key)))])
+      }
+    })
+
+    test('the held check comes before persona matching: two personas sharing D match nothing and the matcher would log a line, but a hold on D answers held with the one refusal line only', async () => {
+      const s = await start()
+      const link = join(h.dir, 'alpha-twin-link')
+      symlinkSync(s.alpha.working_directory, link)
+      const twin: Persona = { ...s.beta, working_directory: link }
+      const personas = [s.alpha, twin]
+      const id = personaInstanceId('retired_bot')
+      const decide = () => {
+        const lines: string[] = []
+        const admission = decideSessionAdmission(s.alpha.working_directory, personas, {
+          isPersonaUp: () => true,
+          log: (line) => void lines.push(line),
+          heldDirectory: oldLifeHeldDirectory,
+        })
+        h.lines.push(...lines)
+        return { admission, lines }
+      }
+      // Not held yet: the matcher's ambiguity, one line of its own.
+      const before = decide()
+      expect(before.admission).toEqual({ kind: 'unmatched' })
+      expect(before.lines).toHaveLength(1)
+
+      hold(id, 'retired_bot', s.alpha.working_directory)
+
+      expect(decide()).toEqual(heldOutcome(s.alpha.working_directory, [id]))
+    })
+
+    test('a held-directory query that throws refuses the session as held (fail safe), at its real path with no id, in one line naming what it threw; an up persona is not admitted', async () => {
+      const s = await start()
+      const failure = new Error('hold set unreadable')
+      const result = admitHeld(s, s.alpha.working_directory, () => {
+        throw failure
+      })
+
+      const real = realpathSync(s.alpha.working_directory)
+      expect(result.admission).toEqual({ kind: 'held', directory: real, instanceIds: [] })
+      expect(result.lines).toEqual([sessionHeldRefusalLine(real, [], describeThrownValue(failure))])
+      expect(result.upAsked).toEqual([])
+      expect(getSessionByPersona(s.alpha.key)).toBeUndefined()
+    })
+
+    test('the query is asked with the roots real path; an answer of undefined, or one naming no id, is not held, and the persona is decided as before', async () => {
+      const s = await start()
+      const link = join(h.dir, 'alpha-link')
+      symlinkSync(s.alpha.working_directory, link)
+      const asked: string[] = []
+      const answers = [undefined, { directory: s.alpha.working_directory, instanceIds: [] }]
+      for (const answer of answers) {
+        const result = admitHeld(s, link, (path) => {
+          asked.push(path)
+          return answer
+        })
+        expect(result.admission).toEqual({ kind: 'admitted', persona: s.alpha })
+        expect(result.lines).toEqual([])
+      }
+      expect(asked).toEqual([realpathSync(s.alpha.working_directory), realpathSync(s.alpha.working_directory)])
+    })
+
+    test('with no held-directory query given, a hold changes nothing: the decisions are as before', async () => {
+      const s = await start({ breakAlpha: (a) => rmSync(a.credentials_file) })
+      hold(personaInstanceId(s.alpha.key), s.alpha.key, s.alpha.working_directory)
+      hold(personaInstanceId('retired_bot'), 'retired_bot', s.beta.working_directory)
+      const linesBefore = h.lines.length
+
+      expect(s.admit(s.alpha.working_directory)).toEqual({ kind: 'not-up', persona: s.alpha })
+      expect(s.admit(s.beta.working_directory)).toEqual({ kind: 'admitted', persona: s.beta })
+      expect(h.lines.slice(linesBefore)).toEqual([refusedLine(s.alpha, describePersonaNotUp(s.controller.state(s.alpha.key)))])
+    })
   })
 })
 

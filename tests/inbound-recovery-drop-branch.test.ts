@@ -269,6 +269,8 @@ import { LIVE_ROW_LAUNCH_REASON_RETIRED_KEY, LIVE_ROW_LAUNCH_REUSE, LIVE_ROW_OUT
 import { latchRowStateRead } from '../src/conflict-latch.ts'
 import { PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
 import { LIVENESS_STATUS_SITE } from '../src/server.ts'
+import { restartOldLifeHeldLine } from '../src/restart.ts'
+import { UNAVAILABLE_RETRY_ROW_ABSENT, UNAVAILABLE_RETRY_RUN_NOW_RAN } from '../src/unavailable-retry.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -2592,5 +2594,54 @@ describe('b.jg5 SRJ-812, SRJ-1011 state 4 (AC 54): once the old key\'s kill fail
     expect(h.oldLifeHolds.holdOf(id)?.killFailed).toBe(false)
     await expectLostMessageReports(h, q, 'auto-restart-disabled')
     expect(h.lostMessageNotices.map((n) => n.key)).toEqual([q])
+  })
+})
+
+// ===========================================================================
+// b.jg5 SRJ-812's restart clause, SRJ-810 (E27 T3; AC 54): a restart a lost
+// message triggers while Q waits on an old-life hold brings Q up only once
+// the hold ends, at once
+//
+// Through the recovery harness's lost-message driver, at a short
+// `session_restart_delay` so the asked-for restart runs. Q's row is absent,
+// no wait step runs and no kill of the old key failed, so the message reports
+// starting now (SRJ-812, hatch A3: the notice is kept) and asks for Q's
+// restart; the restart work's old-life hook holds Q: no launch, the wait
+// started (its first run held) and Q's timer armed. Once the run lists the
+// old row in its ids the hold ends and the end-retry observer runs Q's retry
+// at once, which brings Q up. Only the state's notice is posted, at Q's
+// destination; B's stub sees nothing.
+// ===========================================================================
+
+describe('b.jg5 SRJ-812, SRJ-810 (AC 54): a restart a lost message triggers while Q waits on a hold launches nothing, and Q comes up only once the hold ends, at once', () => {
+  test.each(Q_HOLDS)('the hold %s: the message reports starting now and asks for Q\'s restart, which launches nothing, starts the wait and arms Q\'s timer; the hold\'s end retries Q at once and Q comes up; one post, the notice', async (_label, begin) => {
+    const h = makeRecovery({ sessionRestartDelay: FAST_DELAY_S })
+    const [q, b] = h.keys as [string, string]
+    const id = await begin(h, q, b)
+    h.script({ getResult: cannedGetResult({ claude_instance_id: id, cwd: personaOf(h, q).working_directory }) })
+    rowReadsUntilSpawn(h, UNAVAILABLE_RETRY_ROW_ABSENT)
+    const hold = holdFindMissing(h.stub.client)
+
+    await expectLostMessageReports(h, q, 'starting-now', { restartRequested: true })
+    await waitFor(() => !isRestartPendingOrActive(q), 1000)
+    await h.driveSequence(hold.entered(1))
+
+    expect(h.stub.calls.spawnCalls).toEqual([])
+    expect(h.errors.filter((line) => line === restartOldLifeHeldLine(q))).toHaveLength(1)
+    expect([h.oldLifeWaitRunning(id), h.oldLifeHolds.holdOf(id)?.waiting, h.controller.isArmed(q)]).toEqual([true, [q], true])
+
+    const endedAt = h.clock.now()
+    hold.release(cannedFindMissing({ rows: { [id]: 'ids' } }))
+    await h.driveSequence(h.oldLifeWaitSettled(id))
+    await h.settle()
+
+    expect(h.oldLifeHolds.holdOf(id)).toBeUndefined()
+    expect(h.holdEndRetries).toEqual([{ key: q, at: endedAt, result: UNAVAILABLE_RETRY_RUN_NOW_RAN }])
+    expect(h.stub.calls.spawnCalls.map((params) => params.claude_instance_id)).toEqual([personaInstanceId(q)])
+    await h.runApproverToStop(q)
+    h.controller.stopAll('the case is over')
+    expectOnlyQNotices(h, q, 1)
+    expect(h.slack(q).callLog.filter((call) => call.method === 'chat.postMessage')).toHaveLength(1)
+    expect(h.slack(b).callLog).toEqual([])
   })
 })

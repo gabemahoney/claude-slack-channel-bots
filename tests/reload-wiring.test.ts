@@ -48,7 +48,9 @@
  * (b.jg5 SRJ-504), that the teardown kills through the session manager's
  * bounded-retry teardown kill on the production clock, raises its
  * kill-failure alert on the one alerts instance with the context 'persona
- * teardown' and is given no delete (b.jg5 SRJ-715, SRJ-704), that apply step
+ * teardown' and is given no delete (b.jg5 SRJ-715, SRJ-704), that the
+ * teardown forgets the key's old-life waits through the session manager's
+ * `forgetOldLifeWaits` (b.jg5 SRJ-811), that apply step
  * 1 stops each recorded key's dialog approver with the retired-key reason
  * (b.jg5 SRJ-808), that the one persona notifier, built at module scope, is
  * given startup-errors.ts's `recordStartupError` with its default log
@@ -507,6 +509,12 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       // without it an ENVIRONMENT or CONFIG outcome counts as covered by an
       // onset while the key is applied, raised or not.
       ['outageFlags', 'getOutageFlags'],
+      // b.jg5 SRJ-811, SRJ-715: optional in the deps, so only this pin makes
+      // sure a production teardown forgets the key from every old-life
+      // hold's waiting record (no hold's end retries a persona that is gone)
+      // and stops a wait no persona left in the applied configuration waits
+      // on: the session manager's own entry, not a stub.
+      ['forgetOldLifeWaits', 'forgetOldLifeWaits'],
     ])
     // Functions and objects with a parameter name of the source's choosing.
     // (`templateRefresh` is pinned in the test after this one.)
@@ -530,6 +538,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       APPROVER_STOP_TEARDOWN: './session-manager.ts',
       stopLiveRowSequence: './session-manager.ts',
       LIVE_ROW_STOP_TEARDOWN: './live-row-sequence.ts',
+      forgetOldLifeWaits: './session-manager.ts',
       cancelRestartTimer: './restart.ts',
       forgetFailures: './backoff.ts',
       forgetDisconnectedStreak: './health-check.ts',

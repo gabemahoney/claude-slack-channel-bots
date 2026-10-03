@@ -1262,10 +1262,22 @@ import {
 } from '../src/session-manager.ts'
 import { LIVE_ROW_START_ALREADY_RUNNING, LIVE_ROW_START_CLOSED } from '../src/live-row-sequence.ts'
 import {
+  OLD_LIFE_HOLD_WAIT_RUNNING,
+  createOldLifeHoldEndRetry,
+  isOwnRowOldLifeHeld,
+  oldLifeHeldDirectory,
+  oldLifeHoldEndRetryLine,
+  oldLifeHoldEndSettledRetryLine,
+  oldLifeHoldLaunchLine,
+  oldLifeHoldStep,
+  reconnectHeldLine,
+} from '../src/session-manager.ts'
+import {
   RETRY_BLOCK_LAUNCH,
   RETRY_BLOCK_LIVE_ROW_SEQUENCE,
   RETRY_BLOCK_OLD_LIFE_WAIT,
   UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD,
+  UNAVAILABLE_RETRY_RUN_NOW_RAN,
   type RetryBlockCause,
 } from '../src/unavailable-retry.ts'
 import {
@@ -6510,7 +6522,8 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     })
 
     /** The hold set's lines among the case's errors. */
-    const holdLines = (h: RecoveryHarness, what: 'began' | 'ended'): string[] => h.errors.filter((line) => line.startsWith(`${OLD_LIFE_HOLD_LOG_PREFIX} ${what} `))
+    /** The hold set's own began or ended lines (`ended on`, not the end-retry observer's `ended for` line). */
+    const holdLines = (h: RecoveryHarness, what: 'began' | 'ended'): string[] => h.errors.filter((line) => line.startsWith(`${OLD_LIFE_HOLD_LOG_PREFIX} ${what} ${what === 'ended' ? 'on ' : ''}`))
 
     test('an absent persona\'s live row: its key\'s record line, then the hold\'s began line, both before the first kill; one write and one hold when the kill is sent', async () => {
       const { h } = srj105Build()
@@ -22663,8 +22676,8 @@ const HOLD_KEEPING_ANSWERS: ReadonlyArray<readonly [string, HoldReadAnswer]> = [
   ['pending (a launch start)', { state: AGENT_DIRECTOR_PENDING_STATE }],
 ]
 
-/** The hold set's end lines among the case's errors. */
-const holdEndedLines = (h: RecoveryHarness): string[] => h.errors.filter((line) => line.startsWith(`${OLD_LIFE_HOLD_LOG_PREFIX} ended `))
+/** The hold set's end lines among the case's errors (not the end-retry observer's `ended for` line). */
+const holdEndedLines = (h: RecoveryHarness): string[] => h.errors.filter((line) => line.startsWith(`${OLD_LIFE_HOLD_LOG_PREFIX} ended on `))
 
 /** Apply step 1's hold on persona `key`'s own row at its working directory. */
 function beginApplyStepHold(h: RecoveryHarness, key: string): OldLifeHold {
@@ -27449,6 +27462,25 @@ describe('b.jg5 SRJ-811, SRJ-810, SRJ-1015 (E27 T2): a launch of P refused becau
     return { h, p, release: () => releaseWait(h, hold, outcome, { [personaInstanceId(p)]: 'ids' }) }
   }
 
+  /**
+   * P was recorded as waiting on the hold on its own row (b.jg5 SRJ-810); the
+   * run that lists the row in its ids (`release`) ends the hold while the wait
+   * still runs there, so the end-retry observer retries P only once the
+   * stopped wait has settled, at the end's clock time, with one end line
+   * naming P as deferred and one settled line.
+   */
+  async function expectRetriedOnceSettled(h: RecoveryHarness, p: string, release: () => Promise<void>): Promise<void> {
+    const id = personaInstanceId(p)
+    expect(h.oldLifeHolds.holdOf(id)?.waiting).toEqual([p])
+    const endedAt = h.clock.now()
+    await release()
+    await h.settle()
+    expect(h.holdEndRetries).toEqual([{ key: p, at: endedAt, result: UNAVAILABLE_RETRY_RUN_NOW_RAN }])
+    expect(h.errors.filter((line) => line === oldLifeHoldEndRetryLine(id, [], [], [p]))).toHaveLength(1)
+    expect(h.errors.filter((line) => line === oldLifeHoldEndSettledRetryLine(id, p, undefined))).toHaveLength(1)
+    if (h.approverRunning(p)) await h.runApproverToStop(p)
+  }
+
   test.each<[string, (h: RecoveryHarness, p: string) => Promise<unknown> | unknown, unknown, string, (h: RecoveryHarness, p: string) => string]>([
     ['a start-pass launch (spawnForPersona)', (h, p) => h.launch(p), 'spawned-shape', 'spawnForPersona', (h, p) => renderPersonaRef(harnessPersona(h, p).name, p)],
     ['the restart path\'s gate (liveRowSequenceGate)', (_h, p) => liveRowSequenceGate(p, 'runRestartWork'), true, 'runRestartWork', (_h, p) => `persona=${p}`],
@@ -27464,7 +27496,7 @@ describe('b.jg5 SRJ-811, SRJ-810, SRJ-1015 (E27 T2): a launch of P refused becau
     expect(h.controller.isArmed(p)).toBe(true)
     expect(h.errors.filter((line) => line === oldLifeWaitRefusalLine(site, ref(h, p), true))).toHaveLength(1)
     expect([getFailureCount(p), h.notices]).toEqual([0, []])
-    await release()
+    await expectRetriedOnceSettled(h, p, release)
   })
 
   test('the start entry for P\'s own live-row sequence: already-running, with P\'s timer armed with the old-life cause', async () => {
@@ -27473,7 +27505,7 @@ describe('b.jg5 SRJ-811, SRJ-810, SRJ-1015 (E27 T2): a launch of P refused becau
     expect(startLiveRowSequence(h.sequenceRequest(p, { lastReadState: 'waiting' }))).toBe(LIVE_ROW_START_ALREADY_RUNNING)
 
     expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD }])
-    await release()
+    await expectRetriedOnceSettled(h, p, release)
   })
 
   // b.jg5 SRJ-1512, b.av2 SR-8.6: the wait is the one exception to SR-8.6 for
@@ -27487,7 +27519,7 @@ describe('b.jg5 SRJ-811, SRJ-810, SRJ-1015 (E27 T2): a launch of P refused becau
     expect(liveRowSequenceGate(p, 'runRestartWork')).toBe(false)
 
     expect(h.stub.callCount()).toBe(calls)
-    expect([h.triggers, h.controller.isArmed(p)]).toEqual([[], false])
+    expect([h.triggers, h.controller.isArmed(p), h.oldLifeHolds.holdOf(personaInstanceId(p))?.waiting]).toEqual([[], false, []])
     expect(h.errors.filter((line) => line.includes('waits on the old-life wait running on its own row') || line === oldLifeWaitNotAppliedLine(p))).toEqual([])
     expect(getFailureCount(p)).toBe(0)
     await release()
@@ -27501,7 +27533,7 @@ describe('b.jg5 SRJ-811, SRJ-810, SRJ-1015 (E27 T2): a launch of P refused becau
     expect(startLiveRowSequence(h.sequenceRequest(p, { lastReadState: 'waiting' }))).toBe(LIVE_ROW_START_ALREADY_RUNNING)
 
     expect(h.stub.callCount()).toBe(calls)
-    expect([h.triggers, h.controller.isArmed(p)]).toEqual([[], false])
+    expect([h.triggers, h.controller.isArmed(p), h.oldLifeHolds.holdOf(personaInstanceId(p))?.waiting]).toEqual([[], false, []])
     expect(h.errors.filter((line) => line === oldLifeWaitNotAppliedLine(p))).toHaveLength(1)
     expect(h.errors.filter((line) => line === oldLifeWaitRefusalLine(startLiveRowSequence.name, `persona=${p}`, false))).toHaveLength(1)
     expect(h.errors.filter((line) => line === oldLifeWaitRefusalLine(startLiveRowSequence.name, `persona=${p}`, true))).toEqual([])
@@ -27547,5 +27579,237 @@ describe('b.jg5 SRJ-811, SRJ-810, SRJ-1015 (E27 T2): a launch of P refused becau
     await release()
     await h.settle()
     if (h.approverRunning(b)) await h.runApproverToStop(b)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3) — what a hold refuses, at the
+// session manager's entries
+//
+// On the recovery harness (its hold set installed as main() installs it), a
+// pre-persona row held at P's working directory holds P back: every launch
+// entry (`spawnForPersona` at the start pass and the bring-up, launchSession,
+// the sequence-launch entry) answers sequence-waiting with the old-life cause
+// ('refused' at launchSession) before any other step: no agent-director call
+// for P, no trust patch, no reply-guard step, no approver, nothing recorded;
+// P is recorded as waiting, the hold's wait is started (held at its first
+// run) and P's timer armed, uncounted, with one gate line. A hold on P's own
+// row is not the gate's (SRJ-810's exception), and a latched P meets the
+// latched gate. The start pass counts a held P under sequence-waiting while B
+// beside it comes up. `reconnectMcpWithCause` types nothing into a held own
+// row. The end-retry observer retries each waiting persona still applied and
+// not latched. The end-to-end flows are tests/old-life-wait.test.ts's.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the launch entries, the start pass\'s count, the reconnect guard and the end-retry observer', () => {
+  afterEach(() => {
+    srj105Harness?.controller.stopAll('the case is over')
+    srj105AfterEach()
+  })
+
+  /** The old-life gate's launch lines among the case's errors. */
+  const gateLines = (h: RecoveryHarness): string[] => h.errors.filter((line) => line.includes(': not launching ') && line.includes(' is held for an old life that may still be running '))
+
+  /** The gate's line for P held by the pre-persona row's hold at `site`, its wait `wait`, its timer armed. */
+  const gateLineFor = (h: RecoveryHarness, p: string, site: string, wait: string, ref = renderPersonaRef(harnessPersona(h, p).name, p)): string =>
+    oldLifeHoldLaunchLine(site, ref, realpathSync(harnessPersona(h, p).working_directory), [{ instanceId: OLD_PRE_PERSONA_ID, wait: wait as typeof OLD_LIFE_HOLD_WAIT_RUNNING }], true)
+
+  /**
+   * A pre-persona row held at P's working directory, its row read live, the
+   * wait's first run held by `hold`; the trust patch and the reply guard
+   * record each call in `steps`.
+   */
+  function heldAtP(): { h: RecoveryHarness; p: string; b: string; hold: ReturnType<typeof holdFindMissing>; steps: string[] } {
+    const { h, p, b } = srj105Build()
+    holdOldAt(h, OLD_PRE_PERSONA_ID, OLD_PRE_PERSONA_ID, p)
+    h.script({ getResult: cannedGetResult({ claude_instance_id: OLD_PRE_PERSONA_ID, cwd: harnessPersona(h, p).working_directory }) })
+    const hold = holdFindMissing(h.stub.client)
+    const steps: string[] = []
+    setPreLaunchTrustPatcher((persona) => {
+      steps.push(`patch ${persona.key}`)
+    })
+    setPreLaunchReplyGuard((persona) => {
+      steps.push(`guard ${persona.key}`)
+    })
+    return { h, p, b, hold, steps }
+  }
+
+  /** End the case's wait as a shutdown does, its held run released, so nothing is retried. */
+  async function shutDownWait(h: RecoveryHarness, hold: ReturnType<typeof holdFindMissing>): Promise<void> {
+    h.shutdown()
+    for (let i = hold.heldCount(); i > 0; i--) hold.release(cannedFindMissing())
+    expect(await h.driveSequence(h.oldLifeWaitSettled(OLD_PRE_PERSONA_ID))).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_SHUTDOWN })
+  }
+
+  const HELD_BACK = (p: string): SpawnPersonaResult => ({ key: p, action: 'sequence-waiting', sequenceWaitingCause: SEQUENCE_WAITING_CAUSE_OLD_LIFE_HOLD })
+  const LAST_READ_ENDED = latchRowStateRead(LIVENESS_DEAD_ROW_ENDED)
+
+  test.each<[string, (h: RecoveryHarness, p: string) => Promise<unknown>, (p: string) => unknown, string]>([
+    ['the start pass (spawnForPersona, isStartup true)', (h, p) => spawnForPersona(harnessPersona(h, p), h.config, true), HELD_BACK, spawnForPersona.name],
+    ['the bring-up (spawnForPersona, isStartup false)', (h, p) => spawnForPersona(harnessPersona(h, p), h.config, false), HELD_BACK, spawnForPersona.name],
+    ['the restart path (launchSession): the uncounted refused', (h, p) => launchSession(p, h.config), () => 'refused', spawnForPersona.name],
+    ['a live-row sequence\'s step-6 launch (the sequence-launch entry)', (h, p) => launchForLiveRowSequence(harnessPersona(h, p), h.config, { kind: LIVE_ROW_LAUNCH_REUSE, lastRead: LAST_READ_ENDED }), HELD_BACK, launchForLiveRowSequence.name],
+  ])('%s for P in a held directory: no call for P, no trust patch, reply-guard step or approver, nothing recorded; P waits on the hold, the wait started once, P\'s timer armed with the old-life cause; one gate line; B launches normally', async (_label, call, answer, site) => {
+    const { h, p, b, hold, steps } = heldAtP()
+    // One failure on record: a success recorded for P would clear it, a failure add one.
+    recordFailure(p)
+
+    expect(await call(h, p)).toStrictEqual(answer(p))
+    await h.driveSequence(hold.entered(1))
+
+    expect(personaCallCounts(h, p)).toEqual({})
+    expect([steps, h.approverRunning(p), getFailureCount(p), h.notices]).toEqual([[], false, 1, []])
+    expect(h.oldLifeHolds.holdOf(OLD_PRE_PERSONA_ID)?.waiting).toEqual([p])
+    expect(h.oldLifeWaitRunning(OLD_PRE_PERSONA_ID)).toBe(true)
+    expect([h.triggers, h.controller.isArmed(p)]).toEqual([[{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD }], true])
+    expect(gateLines(h)).toEqual([gateLineFor(h, p, site, LIVE_ROW_START_STARTED)])
+
+    expect(await h.launch(b)).toStrictEqual({ key: b, action: 'spawned' })
+    expect(steps).toEqual([`patch ${b}`, `guard ${b}`])
+    await h.runApproverToStop(b)
+    await shutDownWait(h, hold)
+  })
+
+  test('a second launch while the wait runs starts no second wait: its gate line says the wait is running, and the stub sees no second kill', async () => {
+    const { h, p, hold } = heldAtP()
+    expect(await h.launch(p)).toStrictEqual(HELD_BACK(p))
+    await h.driveSequence(hold.entered(1))
+
+    expect(await h.launch(p)).toStrictEqual(HELD_BACK(p))
+
+    expect(gateLines(h)).toEqual([gateLineFor(h, p, spawnForPersona.name, LIVE_ROW_START_STARTED), gateLineFor(h, p, spawnForPersona.name, OLD_LIFE_HOLD_WAIT_RUNNING)])
+    expect([h.stub.calls.killCalls.length, hold.calls.length]).toEqual([1, 1])
+    await shutDownWait(h, hold)
+  })
+
+  test('the restart path\'s hold step (main()\'s isHeldForOldLife): true for a held P, recording it and arming its timer, with a line naming it by its key; false for B, with nothing done', async () => {
+    const { h, p, b, hold } = heldAtP()
+
+    expect(oldLifeHoldStep(harnessPersona(h, p), 'runRestartWork')).toBe(true)
+    expect(oldLifeHoldStep(harnessPersona(h, b), 'runRestartWork')).toBe(false)
+    await h.driveSequence(hold.entered(1))
+
+    expect(gateLines(h)).toEqual([gateLineFor(h, p, 'runRestartWork', LIVE_ROW_START_STARTED, `persona=${p}`)])
+    expect([h.triggers.map((t) => t.key), h.oldLifeHolds.holdOf(OLD_PRE_PERSONA_ID)?.waiting]).toEqual([[p], [p]])
+    await shutDownWait(h, hold)
+  })
+
+  test('the latched gate still wins: a latched P in a held directory answers latched with no call, no gate line, no wait and nothing recorded or armed; the hold step answers false for it', async () => {
+    const { h, p } = srj105Build()
+    const row = conflictRowsFor('spawn')[0]!
+    h.script({ spawnError: row.build(), ...statusAnswering(row.rowState) })
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+    h.script({ spawnError: undefined, statusError: undefined })
+    holdOldAt(h, OLD_PRE_PERSONA_ID, OLD_PRE_PERSONA_ID, p)
+    const order = recordCallOrder(h)
+
+    expect(await spawnForPersona(harnessPersona(h, p), h.config, false)).toStrictEqual({ key: p, action: 'latched' })
+    expect(oldLifeHoldStep(harnessPersona(h, p), 'runRestartWork')).toBe(false)
+
+    expect([order, gateLines(h), h.oldLifeWaitRunning(OLD_PRE_PERSONA_ID), h.oldLifeHolds.holdOf(OLD_PRE_PERSONA_ID)?.waiting]).toEqual([[], [], false, []])
+    expect(h.triggers.filter((t) => t.kind === UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD)).toEqual([])
+  })
+
+  test('SRJ-810\'s exception: a hold on P\'s own row is not the gate\'s (the hold step answers false, nothing recorded); with a pre-persona row also held in P\'s directory, only that hold holds P back and only its id is in the line', async () => {
+    const { h, p, hold } = (() => {
+      const built = srj105Build()
+      return { ...built, hold: holdFindMissing(built.h.stub.client) }
+    })()
+    holdOldAt(h, personaInstanceId(p), p, p)
+
+    expect(oldLifeHoldStep(harnessPersona(h, p), 'runRestartWork')).toBe(false)
+    expect([gateLines(h), h.triggers, h.oldLifeHolds.holdOf(personaInstanceId(p))?.waiting]).toEqual([[], [], []])
+
+    holdOldAt(h, OLD_PRE_PERSONA_ID, OLD_PRE_PERSONA_ID, p)
+    h.script({ getResult: cannedGetResult({ claude_instance_id: OLD_PRE_PERSONA_ID, cwd: harnessPersona(h, p).working_directory }) })
+    expect(oldLifeHoldStep(harnessPersona(h, p), 'runRestartWork')).toBe(true)
+    await h.driveSequence(hold.entered(1))
+
+    expect(gateLines(h)).toEqual([gateLineFor(h, p, 'runRestartWork', LIVE_ROW_START_STARTED, `persona=${p}`)])
+    expect([h.oldLifeHolds.holdOf(personaInstanceId(p))?.waiting, h.oldLifeHolds.holdOf(OLD_PRE_PERSONA_ID)?.waiting]).toEqual([[], [p]])
+    expect(h.oldLifeWaitRunning(personaInstanceId(p))).toBe(false)
+    await shutDownWait(h, hold)
+  })
+
+  test('SRJ-1015: the start pass over a held P and B: P\'s result is the old-life sequence-waiting, counted once under sequence-waiting, neither failed nor succeeded, with no call for P; B is spawned and counted', async () => {
+    const { h, p, b, hold } = heldAtP()
+
+    const result = await h.drive(startupSessionManager(h.config, { concurrency: 1 }))
+    await h.driveSequence(hold.entered(1))
+
+    expect(result.perPersona.find((r) => r.key === p)).toMatchObject({ key: p, action: 'sequence-waiting' })
+    expect(result.perPersona.find((r) => r.key === b)).toEqual({ key: b, action: 'spawned' })
+    expect([result.sequenceWaiting, result.succeeded, result.failed, result.freshSpawned]).toEqual([1, 1, 0, 1])
+    expect(h.errors.filter((line) => line.startsWith('[slack] startupSessionManager: complete — '))).toEqual([startupSummaryLine(2, result)])
+    expect(personaCallCounts(h, p)).toEqual({})
+    expect([getFailureCount(p), h.controller.isArmed(p)]).toEqual([0, true])
+    await h.settle()
+    await h.runApproverToStop(b)
+    await shutDownWait(h, hold)
+  })
+
+  test.each<[string, boolean]>([
+    ['P applied: its timer armed with the old-life cause', true],
+    ['P no longer applied: its timer not armed, P not recorded', false],
+  ])('reconnectMcpWithCause for P whose own row is held (%s): no send-keys, transient, one line naming the held id; P recorded as waiting on the hold only while applied; B, not held, gets its one send-keys', async (_label, applied) => {
+    const { h, p, b } = srj105Build()
+    holdOldAt(h, personaInstanceId(p), p, p)
+    if (!applied) h.remove(p)
+    expect([isOwnRowOldLifeHeld(p), isOwnRowOldLifeHeld(b)]).toEqual([true, false])
+
+    expect(await reconnectMcpWithCause(p, latchRowStateRead('waiting'))).toEqual({ outcome: 'transient' })
+
+    expect(h.stub.calls.sendKeysCalls).toEqual([])
+    expect(h.errors.filter((line) => line === reconnectHeldLine(`persona=${p}`, personaInstanceId(p), applied))).toHaveLength(1)
+    expect([h.controller.isArmed(p), getFailureCount(p)]).toEqual([applied, 0])
+    // b.jg5 SRJ-810, SRJ-1512: the hold's end retries an applied P; a key outside the applied set is never recorded.
+    expect(h.oldLifeHolds.holdOf(personaInstanceId(p))?.waiting).toEqual(applied ? [p] : [])
+
+    expect(await reconnectMcpWithCause(b, latchRowStateRead('waiting'))).toEqual({ outcome: 'ok' })
+    expect(h.stub.calls.sendKeysCalls.map((params) => params.claude_instance_id)).toEqual([personaInstanceId(b)])
+  })
+
+  test('the held-directory query: every hold on a directory by real path, in begin order, with the first hold\'s real path; undefined for a directory not held', () => {
+    const { h, p, b } = srj105Build()
+    holdOldAt(h, OLD_PRE_PERSONA_ID, OLD_PRE_PERSONA_ID, p)
+    holdOldAt(h, personaInstanceId(p), p, p)
+    const real = realpathSync(harnessPersona(h, p).working_directory)
+
+    expect(oldLifeHeldDirectory(harnessPersona(h, p).working_directory)).toEqual({ directory: real, instanceIds: [OLD_PRE_PERSONA_ID, personaInstanceId(p)] })
+    expect(oldLifeHeldDirectory(harnessPersona(h, b).working_directory)).toBeUndefined()
+  })
+
+  test('the end-retry observer: each waiting persona still applied and not latched is retried at once, in the waiting order; one removed, one latched and one whose retry throws are not, each named; one line', async () => {
+    const { h, p, b } = srj105Build()
+    const row = conflictRowsFor('spawn')[0]!
+    h.script({ spawnError: row.build(), ...statusAnswering(row.rowState) })
+    expect(await h.launch(b)).toStrictEqual({ key: b, action: 'latched' })
+    const ran: string[] = []
+    const observer = createOldLifeHoldEndRetry({
+      runNow: (key) => {
+        if (key === 'throws_key') throw new Error('run-now broke')
+        ran.push(key)
+      },
+      isApplied: (key) => key !== 'removed_key',
+    })
+    const ended: OldLifeHold = {
+      instanceId: OLD_PRE_PERSONA_ID,
+      oldKey: OLD_PRE_PERSONA_ID,
+      directory: harnessPersona(h, p).working_directory,
+      realDirectory: realpathSync(harnessPersona(h, p).working_directory),
+      cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL,
+      killFailed: false,
+      waiting: [b, p, 'removed_key', 'throws_key'],
+    }
+
+    observer(ended, OLD_LIFE_HOLD_END_READ_ENDED)
+
+    expect(ran).toEqual([p])
+    const tag = ' (b.jg5 SRJ-810)'
+    const head = oldLifeHoldEndRetryLine(OLD_PRE_PERSONA_ID, [p], [`${b} (latched)`, 'removed_key (not applied)', 'throws_key (its retry failed: ']).slice(0, -tag.length)
+    const lines = h.errors.filter((line) => line.includes(' — retrying its waiting personas at once: '))
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toStartWith(`${head}Error message="run-now broke"`)
+    expect(lines[0]).toEndWith(`)${tag}`)
   })
 })

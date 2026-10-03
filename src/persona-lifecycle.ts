@@ -44,6 +44,9 @@
  *      step-6 launch it had started included), so the sequence makes no
  *      further call and the retry-timer stop that follows clears an arm it
  *      made. Then its UNAVAILABLE retry timer is stopped (b.jg5 SRJ-305), its
+ *      old-life waits forgotten (b.jg5 SRJ-811: no hold's end retries it, and
+ *      the wait of a hold it waited on is stopped only when no persona left
+ *      in the applied configuration waits on that hold), its
  *      latch forgotten silently (b.jg5 SRJ-504: no post, no line claiming a
  *      clear), its `ErrInvalidFlags` hold forgotten (b.jg5 SRJ-207: no post
  *      and no retry) and its notice episodes of every kind ended silently
@@ -60,7 +63,8 @@
  *      settles promptly, and the apply is not held up by it (SR-8.6);
  *   4. once that launch has settled (b.jg5 SRJ-715): its live-row sequence
  *      is stopped again, awaited, its UNAVAILABLE retry timer stopped again,
- *      its latch forgotten silently again, and its `ErrInvalidFlags` hold
+ *      its old-life waits forgotten again (that launch can have recorded it
+ *      as waiting), its latch forgotten silently again, and its `ErrInvalidFlags` hold
  *      and its notice episodes ended again, since that launch can have
  *      started a sequence at a collision ladder replacement site (b.jg5
  *      SRJ-707), armed the timer, set a latch or a hold, or opened an
@@ -450,6 +454,19 @@ export interface PersonaLifecycleDeps {
    * `forgetNoticeEpisodes`.
    */
   stopRetryTimer: (key: string) => unknown
+  /**
+   * Forget the key's old-life waits (b.jg5 SRJ-811, SRJ-810; production the
+   * session manager's `forgetOldLifeWaits`): the key is forgotten from every
+   * old-life hold's waiting record, so no hold's end retries it, and the wait
+   * of a hold it waited on is stopped only when no persona left in the
+   * applied configuration waits on that hold. The returned promise settles
+   * once each wait it stopped has settled. Right after each stop of the
+   * key's UNAVAILABLE retry timer before the kill: in the teardown's first
+   * group, and again once its launch in flight settled, since that launch
+   * can have recorded the key as waiting again. Optional, so hand-built
+   * fixtures stay valid; production always passes it.
+   */
+  forgetOldLifeWaits?: (key: string) => unknown
   /** Forget the key's restart failure count and cap latch (`forgetFailures`). */
   forgetFailures: (key: string) => void
   /** Forget the key's health-check disconnected streak (`forgetDisconnectedStreak`). */
@@ -641,6 +658,13 @@ export const LIVE_ROW_SEQUENCE_STOP_AGAIN_STEP = 'stopping its live-row sequence
 
 /** The suffix of each teardown step repeated once its launch in flight settled (b.jg5 SRJ-715). */
 const AGAIN_AFTER_LAUNCH = 'again, after its launch in flight settled'
+
+/**
+ * The teardown step that forgets the persona's old-life waits (b.jg5
+ * SRJ-811; `PersonaLifecycleDeps.forgetOldLifeWaits`): its log label. Its
+ * repeat once the launch in flight settled carries the usual suffix.
+ */
+export const OLD_LIFE_WAITS_STEP = 'forgetting its old-life waits'
 
 /** The teardown's last stop of the persona's UNAVAILABLE retry timer, after its kill: its log label. */
 export const TEARDOWN_RETRY_TIMER_STOP_AFTER_KILL_STEP = 'stopping its UNAVAILABLE retry timer once more, after the kill'
@@ -919,6 +943,9 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     // right after clears an arm that call made.
     await step(LIVE_ROW_SEQUENCE_STOP_STEP, () => deps.stopLiveRowSequence?.(key))
     await step('stopping its UNAVAILABLE retry timer', () => deps.stopRetryTimer(key))
+    // b.jg5 SRJ-811: no hold's end retries a persona that is going, and a
+    // wait no persona left waits on stops.
+    await step(OLD_LIFE_WAITS_STEP, () => deps.forgetOldLifeWaits?.(key))
     // b.jg5 SRJ-504, SRJ-207, SRJ-1016: silently, its latch, then its
     // ErrInvalidFlags hold (no post, no retry), then its notice episodes, the
     // CONFLICT and hold episodes included, so none is left open.
@@ -941,6 +968,7 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     // episode. The teardown latches nothing.
     await step(LIVE_ROW_SEQUENCE_STOP_AGAIN_STEP, () => deps.stopLiveRowSequence?.(key))
     await step(`stopping its UNAVAILABLE retry timer ${AGAIN_AFTER_LAUNCH}`, () => deps.stopRetryTimer(key))
+    await step(`${OLD_LIFE_WAITS_STEP} ${AGAIN_AFTER_LAUNCH}`, () => deps.forgetOldLifeWaits?.(key))
     await step(`forgetting its latch ${AGAIN_AFTER_LAUNCH}`, () => deps.forgetConflictLatch(key))
     await step(`forgetting its ErrInvalidFlags hold ${AGAIN_AFTER_LAUNCH}`, () => deps.forgetInvalidFlagsHold(key))
     await step(`forgetting its notice episodes ${AGAIN_AFTER_LAUNCH}`, () => deps.forgetNoticeEpisodes(key))

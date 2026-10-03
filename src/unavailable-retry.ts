@@ -41,6 +41,12 @@
  *   a later timer. `stopAll(reason)` stops every persona. `close(reason)`,
  *   the server's shutdown, stops every persona and refuses every later `arm`
  *   (one `not armed` line each), so no timer is pending after it.
+ * - `runNow(key, cause, why)`: the persona's retry runs at once (b.jg5
+ *   SRJ-810: an old-life hold that ends retries each persona that waited on
+ *   it at once). A waiting timer is cleared and its retry runs now in its
+ *   mode, its wait count carrying on; a retry already running is left to
+ *   re-arm the timer; a persona not armed is armed with `cause` and run at
+ *   once; after `close` nothing runs. One line; never throws.
  * - `conditionEnded(key, condition, reading?)`: the end of
  *   `tmux-unresponsive` or the clearing of `tmux-unavailable` stops the
  *   timer, unless its last row read was `pending` or a `kill-failed` cause is
@@ -570,6 +576,18 @@ export function retryBlockSkipText(cause: RetryBlockCause | undefined): string {
   }
 }
 
+/**
+ * The again-reason of a full-mode retry whose restart run answered
+ * `sequence-waiting` (b.jg5 SRJ-302, SRJ-706, SRJ-810), by what blocks a
+ * retry once the run is over (`cause`): `old-life-wait-in-flight` when it is
+ * an old-life wait step the persona waits on (the restart path's old-life
+ * gate started it, or the wait runs on the persona's own row), otherwise
+ * `live-row-sequence-waiting`. Pure.
+ */
+export function sequenceWaitingAgainReason(cause: RetryBlockCause | undefined): string {
+  return cause === RETRY_BLOCK_OLD_LIFE_WAIT ? UNAVAILABLE_RETRY_AGAIN_OLD_LIFE_WAIT_IN_FLIGHT : UNAVAILABLE_RETRY_AGAIN_SEQUENCE_WAITING
+}
+
 /** The cause of a "blocks a retry" check (`FullModeRetryDeps.retryBlockCause`), a throw and an answer that is not a cause counted as not known. Never throws. */
 export function readRetryBlockCause(key: string, query: ((key: string) => RetryBlockCause | undefined) | undefined): RetryBlockCause | undefined {
   if (query === undefined) return undefined
@@ -699,6 +717,29 @@ export const UNAVAILABLE_RETRY_TERMINAL_STOPS: ReadonlySet<string> = new Set([
   UNAVAILABLE_RETRY_STOP_NOT_APPLIED,
   UNAVAILABLE_RETRY_STOP_SHUTDOWN,
 ])
+
+// ---------------------------------------------------------------------------
+// Run now (b.jg5 SRJ-810)
+// ---------------------------------------------------------------------------
+
+/** `runNow`: the pending retry was run at once, its wait count carried on. */
+export const UNAVAILABLE_RETRY_RUN_NOW_RAN = 'ran'
+/** `runNow`: the persona was not armed; it was armed with the given cause and its retry run at once. */
+export const UNAVAILABLE_RETRY_RUN_NOW_ARMED = 'armed'
+/** `runNow`: the persona's retry was running; nothing was done (that run's answer re-arms it). */
+export const UNAVAILABLE_RETRY_RUN_NOW_RUNNING = 'running'
+/** `runNow`: the controller is closed; nothing was done. */
+export const UNAVAILABLE_RETRY_RUN_NOW_CLOSED = 'closed'
+
+/** What `runNow` did. */
+export type UnavailableRetryRunNowResult =
+  | typeof UNAVAILABLE_RETRY_RUN_NOW_RAN
+  | typeof UNAVAILABLE_RETRY_RUN_NOW_ARMED
+  | typeof UNAVAILABLE_RETRY_RUN_NOW_RUNNING
+  | typeof UNAVAILABLE_RETRY_RUN_NOW_CLOSED
+
+/** `runNow`'s label when an old-life hold the persona waited on has ended (b.jg5 SRJ-810). */
+export const UNAVAILABLE_RETRY_RUN_NOW_HOLD_ENDED = 'old-life-hold-ended'
 
 /** A cause kind that is not a short lower-case label is logged as this. */
 const UNNAMED_CAUSE_KIND = 'unnamed'
@@ -944,6 +985,29 @@ export interface UnavailableRetryController extends UnavailableRetryTriggerSink 
    * leaves the last row read as it is.
    */
   conditionEnded(key: string, condition: UnavailableRetryCondition, reading?: string): UnavailableRetryConditionEndResult
+  /**
+   * Run persona `key`'s retry at once (b.jg5 SRJ-810: once an old-life hold
+   * ends, each persona that waited on it is retried at once), with `why`, a
+   * short CSCB-written label, named in its one line:
+   *   - waiting for its due time: the pending timer is cleared and the retry
+   *     runs now, in its current mode, its wait count carrying on (a later
+   *     refusal re-arms at the next wait of the one sequence); `ran`;
+   *   - its retry running: nothing is done, since that run's answer re-arms
+   *     or stops the timer; `running`;
+   *   - not armed: it is armed with `cause` (full mode, wait count 0) and its
+   *     retry runs now; `armed`;
+   *   - after `close`: nothing is done; `closed`.
+   * Two runs never overlap for one persona (the run waits for one still in
+   * flight from before a `stop`). One line each:
+   *
+   *   [slack] unavailable-retry: persona=<key> retrying now[ (pending-only)] (<why>) — its pending retry is run at once, its wait count carried on
+   *   [slack] unavailable-retry: persona=<key> retrying now (<why>) — armed (<cause>) and run at once
+   *   [slack] unavailable-retry: persona=<key> not retried now (<why>) — its retry is running; that run's answer re-arms it
+   *   [slack] unavailable-retry: persona=<key> not retried now (<why>) — <close reason>
+   *
+   * Never throws.
+   */
+  runNow(key: string, cause: UnavailableRetryCause, why: string): UnavailableRetryRunNowResult
   /**
    * Stop persona `key`'s timer: clear the pending timer and forget the
    * persona, logging one stopped line with `reason` (CSCB-written text).
@@ -1267,6 +1331,60 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
     stopped(entry.key, reason)
   }
 
+  /** A fresh, unscheduled entry for persona `key` in `mode`, its wait count at 0. */
+  function newEntry(key: string, mode: UnavailableRetryMode): RetryEntry {
+    return {
+      key,
+      timer: undefined,
+      dueAt: undefined,
+      waitMs: undefined,
+      refusals: 0,
+      causes: [],
+      runCause: undefined,
+      mode,
+      lastRow: mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY ? UNAVAILABLE_RETRY_ROW_PENDING : undefined,
+      fullArmedInRun: false,
+      pendingArmedInRun: false,
+      endedInRun: undefined,
+      endedReadingInRun: undefined,
+    }
+  }
+
+  /**
+   * Run persona `key`'s retry at once (see `runNow` on the controller). Never
+   * throws: a clock that throws while the pending timer is cleared leaves the
+   * timer to fire into a no-op, since the run now replaces it.
+   */
+  function runNowFor(key: string, cause: UnavailableRetryCause, why: string): UnavailableRetryRunNowResult {
+    const reason = labelOf(why)
+    if (closedReason !== undefined) {
+      log(`[slack] unavailable-retry: persona=${key} not retried now (${reason}) — ${closedReason}`)
+      return UNAVAILABLE_RETRY_RUN_NOW_CLOSED
+    }
+    const existing = entries.get(key)
+    if (existing !== undefined && existing.timer === undefined) {
+      log(`[slack] unavailable-retry: persona=${key} not retried now (${reason}) — its retry is running; that run's answer re-arms it`)
+      return UNAVAILABLE_RETRY_RUN_NOW_RUNNING
+    }
+    if (existing !== undefined) {
+      try {
+        clearTimer(existing)
+      } catch {
+        /* the run below replaces the timer; one that still fires finds no timer of its own and does nothing */
+      }
+      const ran = existing.mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY ? ' (pending-only)' : ''
+      log(`[slack] unavailable-retry: persona=${key} retrying now${ran} (${reason}) — its pending retry is run at once, its wait count carried on`)
+      fire(existing)
+      return UNAVAILABLE_RETRY_RUN_NOW_RAN
+    }
+    const entry = newEntry(key, UNAVAILABLE_RETRY_MODE_FULL)
+    entries.set(key, entry)
+    const description = record(entry, cause ?? UNNAMED_CAUSE)
+    log(`[slack] unavailable-retry: persona=${key} retrying now (${reason}) — armed (${description}) and run at once`)
+    fire(entry)
+    return UNAVAILABLE_RETRY_RUN_NOW_ARMED
+  }
+
   /**
    * Arm persona `key` with `cause` in `mode` (see `arm` and `armPendingOnly`).
    * An armed entry keeps its due time; a full-mode arm promotes a
@@ -1301,21 +1419,7 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
       }
       return true
     }
-    const entry: RetryEntry = {
-      key,
-      timer: undefined,
-      dueAt: undefined,
-      waitMs: undefined,
-      refusals: 0,
-      causes: [],
-      runCause: undefined,
-      mode,
-      lastRow: mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY ? UNAVAILABLE_RETRY_ROW_PENDING : undefined,
-      fullArmedInRun: false,
-      pendingArmedInRun: false,
-      endedInRun: undefined,
-      endedReadingInRun: undefined,
-    }
+    const entry = newEntry(key, mode)
     entries.set(key, entry)
     const description = record(entry, cause)
     const waitMs = waitAfter(0)
@@ -1351,6 +1455,16 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
       }
       if (row !== undefined) entry.lastRow = row
       return applyConditionEnd(entry, condition) ? 'kept' : 'stopped'
+    },
+
+    runNow(key, cause, why) {
+      try {
+        return runNowFor(key, cause, why)
+      } catch (err) {
+        // Not reached: the steps above never throw.
+        log(`[slack] unavailable-retry: persona=${key} not retried now — ${describeThrownValue(err)}`)
+        return UNAVAILABLE_RETRY_RUN_NOW_CLOSED
+      }
     },
 
     stop(key, reason) {
@@ -1550,6 +1664,9 @@ export function createFullModeRetryAction(deps: FullModeRetryDeps): UnavailableR
     const outcome = await deps.retry(key, cwd, deps.isInFlight, deps.retryBlockCause)
     // b.jg5 SRJ-303: a run skipped for work in flight names what blocked it.
     if (outcome === 'in-flight') return againWith(retryBlockAgainReason(readRetryBlockCause(key, deps.retryBlockCause)))
+    // b.jg5 SRJ-810, SRJ-302: a run the old-life gate held, which started
+    // the hold's wait, names that wait, as a run skipped for it does.
+    if (outcome === 'sequence-waiting') return againWith(sequenceWaitingAgainReason(readRetryBlockCause(key, deps.retryBlockCause)))
     // Since b.jg5 E9, `already-connected` is answered only for a `live`
     // reading (never `pending`) whose session is connected with its stream.
     if (outcome === 'already-connected') endCondition(key, LIVENESS_LIVE, deps.endTmuxUnresponsive)
