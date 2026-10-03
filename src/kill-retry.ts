@@ -13,8 +13,11 @@
  *     unknown error) of a row the path last read live is tried again; every
  *     other outcome stands at once: a success, CONFLICT (never retried as a
  *     kill), UNUSABLE NAME, CONFIG, ENVIRONMENT (`ErrTmuxNotAvailable`, as
- *     when the tmux server is exiting after a kill ended its last session)
- *     and UNCLASSIFIED. A seed that is not live (the row read finished, or no
+ *     when the tmux server is exiting after a kill ended its last session),
+ *     UNCLASSIFIED, and the GONE non-success of a caller whose checked kill
+ *     counts GONE as no success (`goneIsFailure`, `src/checked-kill.ts`; the
+ *     CLI's teardown): that caller's GONE answer is a failure end, logged
+ *     and decided as one. A seed that is not live (the row read finished, or no
  *     row) makes one try: on a finished row `kill` is a no-op success that
  *     proves nothing;
  *   - before each further try, after the 2 s wait, exactly one `status` read
@@ -45,11 +48,12 @@
  *   - `survivor`, quoting the latest survivor-naming description, on any
  *     success end after a survivor-naming failure (a read of `ended`,
  *     `missing` or `ErrSpawnNotFound`; a later try's success, whatever its
- *     `kill_sent`; a later try's `ErrSpawnNotFound` or GONE);
+ *     `kill_sent`; a later try's `ErrSpawnNotFound` or `session-gone`);
  *   - `ordinary` on a failure end whose last outcome is `ErrTmuxKillFailed`,
  *     quoting its description, and on any failure end after a
  *     survivor-naming failure (a stop by a read or by the keep-going check
- *     included), quoting the latest survivor-naming description, and both
+ *     included, and a later try's GONE non-success under `goneIsFailure`),
+ *     quoting the latest survivor-naming description, and both
  *     when the last outcome is an `ErrTmuxKillFailed` naming no survivor;
  *   - `none` otherwise.
  * The decision is made by class only; the caller does the last outcome's own
@@ -91,6 +95,7 @@ import {
   describeKillOutcome,
   killLetsNextStepRun,
   killOutcomeOf,
+  type AnyKillOutcome,
   type KillOutcome,
   type KillRowFinishedRead,
 } from './checked-kill.ts'
@@ -284,10 +289,14 @@ export type KillRetryAlert =
       readonly earlierSurvivorDescription?: string
     }
 
-/** What the bounded retry answers. */
-export interface KillRetryResult {
+/**
+ * What the bounded retry answers. `O` is the form of the caller's tries: a
+ * server site's checked kill answers a `KillOutcome`; a caller whose checked
+ * kill counts GONE as no success, an `AnyKillOutcome`.
+ */
+export interface KillRetryResult<O extends AnyKillOutcome = KillOutcome> {
   /** The outcome that stands: the last try's, or the `row-finished` success a read gave. */
-  readonly outcome: KillOutcome
+  readonly outcome: O | KillOutcome
   /** How the tries ended. */
   readonly end: KillRetryEnd
   /** Kills made. */
@@ -304,7 +313,7 @@ export interface KillRetryResult {
  * reports nothing more for the kill, and answers `latched` when the persona
  * is latched.
  */
-export function killRetryStopped(result: KillRetryResult): boolean {
+export function killRetryStopped(result: KillRetryResult<AnyKillOutcome>): boolean {
   return result.end === KILL_RETRY_END_READ_LATCHED || result.end === KILL_RETRY_END_STOPPED
 }
 
@@ -312,12 +321,12 @@ export function killRetryStopped(result: KillRetryResult): boolean {
 // The entry
 // ---------------------------------------------------------------------------
 
-/** What {@link runKillRetry} is given. */
-export interface KillRetryOptions {
+/** What {@link runKillRetry} is given; `O` is the form of the caller's tries ({@link KillRetryResult}). */
+export interface KillRetryOptions<O extends AnyKillOutcome = KillOutcome> {
   /** The row's instance id, for the log lines. */
   readonly instanceId: string
   /** One try: the checked kill or a caller's binding of it. Should never throw; a throw is taken as its outcome. */
-  readonly kill: () => Promise<KillOutcome>
+  readonly kill: () => Promise<O>
   /** One `status` read of the row; its side effects are its own. A throw is a failed read. */
   readonly read: () => Promise<KillRetryRead>
   /** The wait between tries. */
@@ -344,7 +353,9 @@ interface SurvivorTrack {
  * The bounded retry of a kill (SRJ-702). Never throws or rejects, and leaves
  * no timer pending once it settles.
  */
-export async function runKillRetry(options: KillRetryOptions): Promise<KillRetryResult> {
+export async function runKillRetry<O extends AnyKillOutcome = KillOutcome>(
+  options: KillRetryOptions<O>,
+): Promise<KillRetryResult<O>> {
   const live = killRetrySeedIsLive(options.lastRead)
   const budgetSpent = live && budgetIsSpent(options.budget)
   const maxTries = live && !budgetSpent ? KILL_RETRY_TRIES : 1
@@ -352,8 +363,8 @@ export async function runKillRetry(options: KillRetryOptions): Promise<KillRetry
   let lastRead = options.lastRead
   let tries = 0
   let reads = 0
-  const finish = (outcome: KillOutcome, end: KillRetryEnd): KillRetryResult => {
-    const result: KillRetryResult = { outcome, end, tries, reads, alert: alertDecision(outcome, track) }
+  const finish = (outcome: O | KillOutcome, end: KillRetryEnd): KillRetryResult<O> => {
+    const result: KillRetryResult<O> = { outcome, end, tries, reads, alert: alertDecision(outcome, track) }
     if (tries + reads > 1 || result.alert.kind !== KILL_RETRY_ALERT_NONE) {
       emit(options, killRetryEndLine(options.logPrefix, options.instanceId, result))
     }
@@ -407,7 +418,7 @@ function budgetIsSpent(budget: KillRetryPassBudget | undefined): boolean {
 }
 
 /** One try; a throw is taken as its outcome. */
-async function tryOnce(kill: () => Promise<KillOutcome>): Promise<KillOutcome> {
+async function tryOnce<O extends AnyKillOutcome>(kill: () => Promise<O>): Promise<O | KillOutcome> {
   try {
     return await kill()
   } catch (thrown) {
@@ -425,7 +436,7 @@ async function readOnce(read: () => Promise<KillRetryRead>): Promise<KillRetryRe
 }
 
 /** The keep-going check; absent is true, a throw is false. */
-function keepGoing(options: KillRetryOptions): boolean {
+function keepGoing(options: Pick<KillRetryOptions<AnyKillOutcome>, 'keepGoing'>): boolean {
   if (options.keepGoing === undefined) return true
   try {
     return options.keepGoing() === true
@@ -435,7 +446,7 @@ function keepGoing(options: KillRetryOptions): boolean {
 }
 
 /** Hand `line` to the sink, ignoring a throw. */
-function emit(options: KillRetryOptions, line: string): void {
+function emit(options: Pick<KillRetryOptions<AnyKillOutcome>, 'log'>, line: string): void {
   try {
     options.log(line)
   } catch {
@@ -470,7 +481,7 @@ export type KillRetryTryNext =
   | typeof KILL_RETRY_NEXT_BUDGET_SPENT
 
 /** What follows try number `tries` of at most `maxTries`. */
-function afterTry(outcome: KillOutcome, tries: number, maxTries: number, live: boolean, budgetSpent: boolean): KillRetryTryNext {
+function afterTry(outcome: AnyKillOutcome, tries: number, maxTries: number, live: boolean, budgetSpent: boolean): KillRetryTryNext {
   if (killLetsNextStepRun(outcome)) return KILL_RETRY_NEXT_SUCCESS
   if (outcome.kind !== KILL_OUTCOME_NOT_KILLED || outcome.errorClass !== AD_ERROR_CLASS_UNAVAILABLE) return KILL_RETRY_NEXT_NOT_RETRIED
   if (!live) return KILL_RETRY_NEXT_NOT_LIVE
@@ -545,14 +556,14 @@ function classOf(error: unknown): string {
 // ---------------------------------------------------------------------------
 
 /** `outcome`'s `ErrTmuxKillFailed` description, when it is one and the description is a string. */
-function killFailedDescriptionOfOutcome(outcome: KillOutcome): string | undefined {
+function killFailedDescriptionOfOutcome(outcome: AnyKillOutcome): string | undefined {
   if (outcome.kind !== KILL_OUTCOME_NOT_KILLED || outcome.errorClass !== AD_ERROR_CLASS_UNAVAILABLE) return undefined
   if (!outcome.killFailed) return undefined
   return typeof outcome.killFailedDescription === 'string' ? outcome.killFailedDescription : undefined
 }
 
 /** True when `outcome` is an `ErrTmuxKillFailed`. */
-function isKillFailed(outcome: KillOutcome): boolean {
+function isKillFailed(outcome: AnyKillOutcome): boolean {
   return outcome.kind === KILL_OUTCOME_NOT_KILLED && outcome.errorClass === AD_ERROR_CLASS_UNAVAILABLE && outcome.killFailed
 }
 
@@ -567,13 +578,13 @@ function namesSurvivor(description: string | undefined): description is string {
 }
 
 /** Keep a try's survivor-naming description. */
-function noteTry(track: SurvivorTrack, outcome: KillOutcome): void {
+function noteTry(track: SurvivorTrack, outcome: AnyKillOutcome): void {
   const description = killFailedDescriptionOfOutcome(outcome)
   if (namesSurvivor(description)) track.latestSurvivor = description
 }
 
 /** The alert decision for the outcome that stands (SRJ-702, SRJ-704, SRJ-1007). */
-function alertDecision(outcome: KillOutcome, track: SurvivorTrack): KillRetryAlert {
+function alertDecision(outcome: AnyKillOutcome, track: SurvivorTrack): KillRetryAlert {
   const survivor = track.latestSurvivor
   if (killLetsNextStepRun(outcome)) {
     return survivor === undefined
@@ -637,7 +648,7 @@ export function killRetryTryLine(
   instanceId: string,
   tryNumber: number,
   maxTries: number,
-  outcome: KillOutcome,
+  outcome: AnyKillOutcome,
   next: KillRetryTryNext,
 ): string {
   const survivor = namesSurvivor(killFailedDescriptionOfOutcome(outcome)) ? ' (names a surviving pid)' : ''
@@ -724,6 +735,6 @@ function killRetryStopLine(prefix: string, instanceId: string, nextTry: number, 
  * called for:
  *   `<prefix>: kill tries for <id> ended (<end>) after <n> kill(s) and <m> read(s): <describeKillOutcome> — alert=<none|survivor|ordinary>`
  */
-export function killRetryEndLine(prefix: string, instanceId: string, result: KillRetryResult): string {
+export function killRetryEndLine(prefix: string, instanceId: string, result: KillRetryResult<AnyKillOutcome>): string {
   return `${prefix}: kill tries for ${renderId(instanceId)} ended (${result.end}) after ${result.tries} kill(s) and ${result.reads} read(s): ${describeKillOutcome(result.outcome)} — alert=${result.alert.kind} (b.jg5 SRJ-702)`
 }

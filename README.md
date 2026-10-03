@@ -788,7 +788,7 @@ For each persona in the last-applied record (or in `config.json` when there is n
 
 `clean_restart` loads the last-applied record first, or `config.json` when there is no record, and takes `exit_timeout` from it. If it cannot (a record that can't be read or is invalid, or a missing or pre-persona file), it exits 1 with `[slack] clean_restart: failed to load config:` and the loader's error, and nothing is stopped. For a bad record, the error says that deleting it makes the next start apply `config.json` (see [Reload](#reload)). `clean_restart` doesn't apply a pending `config.json` edit: the server comes back on the record.
 
-A benign kill outcome — the row already being gone — is tolerated per persona and does not abort the restart. Any per-persona teardown failure is fatal: it fails loudly and aborts the restart (non-zero exit). That includes a pause refused for a reason that fails the teardown at once, and a force-kill that fails (see [When a bot can't be paused](#when-a-bot-cant-be-paused)).
+A persona whose force-kill succeeds, or whose instance is found already ended, missing or gone, counts as stopped and does not abort the restart. Any per-persona teardown failure is fatal: it fails loudly and aborts the restart (non-zero exit). That includes a pause refused for a reason that fails the teardown at once (see [When a bot can't be paused](#when-a-bot-cant-be-paused)) and a force-kill that fails (see [When a bot can't be force-killed](#when-a-bot-cant-be-force-killed)).
 
 Behavior by case:
 
@@ -821,6 +821,42 @@ That persona's teardown fails at once, with no force-kill, when:
 - agent-director refuses its config file, `~/.agent-director/config.toml`. The error names the file.
 
 The other personas are still torn down. A persona whose teardown fails makes the command exit non-zero (see [`stop`](#claude-slack-channel-bots-stop) and [`clean_restart`](#claude-slack-channel-bots-clean_restart)).
+
+#### When a bot can't be force-killed
+
+The force-kill, after the pause or once `exit_timeout` passes, ends the bot's session and keeps its row. No force-kill ever removes a row.
+
+The persona counts as stopped when:
+
+- the force-kill succeeds. A force-kill through an agent-director older than Phase 1, which only `stop --stop-bots` reaches, is a plain success;
+- agent-director finds no instance for the persona;
+- the read of the bot's instance before a further try finds it already ended, missing or gone. No further force-kill is made.
+
+When agent-director does not answer in time, answers that it could not end the worker, or answers with an error the agent-director client does not recognise, the force-kill is tried up to 3 times, 2 s apart. Before each further try the bot's instance is read; a read that fails, for any reason but the config file below, lets the try go ahead. If the last try still fails, the persona's teardown fails.
+
+That persona's teardown fails at once, with no further force-kill, when:
+
+- a tmux session conflict holds the persona's session, which may not be the bot's own; a session left over from an earlier launch of the bot included. The error names the session;
+- tmux is unavailable;
+- the tmux session name recorded on the persona's instance can't be used. The command puts no hold on the persona; only the server does that;
+- agent-director answers that the bot's tmux session is already gone;
+- agent-director reports an internal error, an error about its store, or another error that does not fit a force-kill;
+- agent-director refuses its config file, `~/.agent-director/config.toml`, at a try or at the read before a further try. The error names the file.
+
+When agent-director answered that a process outlived the force-kill, a persona that then counts as stopped still counts as stopped, and the command's exit status is unchanged.
+
+The server may be holding a persona for a human (see [Troubleshooting](#troubleshooting)). `stop --stop-bots` and `clean_restart` still stop it, because running them is a human's deliberate action. For a bot whose launch has no recorded start, the force-kill ends no session.
+
+#### How long a teardown can take
+
+Personas are torn down in parallel. Each persona's teardown takes at most the sum of:
+
+- the read of its instance;
+- the pause: up to 3 tries, 2 s apart;
+- the wait for the bot to exit: up to [`exit_timeout`](#server-wide-settings) seconds, then one last read;
+- the force-kill: up to 3 tries, 2 s apart, with one read of the instance before each further try.
+
+Each agent-director call takes at most `agent_director_call_timeout_ms` (see [Sizing the agent-director call timeout](#sizing-the-agent-director-call-timeout)). The [precheck](#precheck-before-stopping-bots) that runs before it is bounded the same way: up to 3 tries, 2 s apart, of each of its two calls per persona.
 
 ### Precheck before stopping bots
 
@@ -1735,7 +1771,7 @@ The precheck failed, so nothing was stopped: the server and every bot keep runni
 The installed agent-director is below the agent-director client's own minimum, so only the server was stopped. See [`stop`](#claude-slack-channel-bots-stop) for what was left running and how to read the server stop's lines, then follow the README section "Switching over to agent-director Phase 1".
 
 **`clean_restart` or `stop --stop-bots` exits non-zero with an agent-director teardown error**
-This is intentional: when agent-director is unreachable, the teardown cannot run, so the command fails loudly rather than silently no-op'ing and (for `clean_restart`) restarting on top of bots it never touched. Confirm agent-director is installed and responsive with `agent-director version`, then re-run the command. A teardown also fails, with no force-kill, when a bot's pause is refused for one of the reasons in [When a bot can't be paused](#when-a-bot-cant-be-paused); fix that cause first. Teardown kills but never deletes rows on any failure path, so it is always safe to retry once agent-director is reachable.
+This is intentional: when agent-director is unreachable, the teardown cannot run, so the command fails loudly rather than silently no-op'ing and (for `clean_restart`) restarting on top of bots it never touched. Confirm agent-director is installed and responsive with `agent-director version`, then re-run the command. A teardown also fails, with no force-kill, when a bot's pause is refused for one of the reasons in [When a bot can't be paused](#when-a-bot-cant-be-paused), and when its force-kill fails as [When a bot can't be force-killed](#when-a-bot-cant-be-force-killed) describes; fix that cause first. Teardown kills but never deletes rows on any failure path, so it is always safe to retry once agent-director is reachable.
 
 **Bots come back with no memory of the prior conversation after a reboot**
 With `resume_enabled: true`, a bot whose host rebooted (or pod resumed) should return with its conversation history. If it comes back amnesiac, confirm the system-installed `agent-director` is **≥ 0.8.0** (`agent-director version`) — reboot recovery relies on capabilities added in that release. Note that `bun run install-check` does **not** confirm this: its client floor is `0.7.0`, lower than the reboot-recovery requirement, so install-check passes on a `0.7.x` binary that still yields amnesiac bots. Verify the resume requirement directly with `agent-director version`. Note: legacy sessions created before upgrading to 0.8.0 may lose history exactly once on their first post-upgrade recovery, then resume cleanly thereafter.

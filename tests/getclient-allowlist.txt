@@ -52,4 +52,4 @@ src/cli.ts | directorGet | const r: Phase1GetResult = await getClient().get({ cl
 src/cli.ts | directorReadPane | const r = await getClient().readPane({ claude_instance_id: id, n_lines: nLines })  # CLI precheck: one-line read-pane of cscb_<key>
 src/cli.ts | directorStatus | const r = await getClient().status({ claude_instance_id: id })  # CLI persona teardown: status of cscb_<key>
 src/cli.ts | directorPause | await getClient().pause({ claude_instance_id: id })  # CLI persona teardown: pause cscb_<key>
-src/cli.ts | directorKill | await getClient().kill({ claude_instance_id: id })  # CLI persona teardown: kill cscb_<key>
+src/cli.ts | directorKill | return getClient().kill({ claude_instance_id: id })  # CLI persona teardown: kill cscb_<key>

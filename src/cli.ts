@@ -80,6 +80,8 @@ import { readAppliedPersonaConfig, reloadFilePaths } from './reload.ts'
 import { initLogging } from './logging.ts'
 import { ERR_SPAWN_NOT_FOUND_NAME } from './agent-director-errors.ts'
 import { hasAdErrorName } from './ad-error-class.ts'
+import { checkedKill, type PlainKillParams } from './checked-kill.ts'
+import { killRetrySeedOfState, runKillRetry, type KillRetryRead } from './kill-retry.ts'
 import type { Phase1GetResult } from './ad-phase1-types.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import { getClient } from './agent-director-client.ts'
@@ -107,14 +109,14 @@ import {
   TEARDOWN_OUTCOME_FAILED,
   TEARDOWN_POLL_FIRST_WAIT_MS,
   TEARDOWN_POLL_MAX_WAIT_MS,
-  TEARDOWN_STEP_KILL,
   TEARDOWN_STEP_PAUSE,
   TEARDOWN_STEP_POLL,
   TEARDOWN_STEP_STATE_READ,
   TEARDOWN_STOPPED_ALREADY_FINISHED,
   TEARDOWN_STOPPED_EXITED,
-  TEARDOWN_STOPPED_KILLED,
   TEARDOWN_STOPPED_NO_ROW,
+  TEARDOWN_KILL_OPTIONS,
+  exitTimeoutMsOf,
   onlyServerStoppedLine,
   pauseVerdictAfterLastTry,
   pauseVerdictOf,
@@ -122,8 +124,10 @@ import {
   precheckNothingStoppedLine,
   precheckVerdictOf,
   stateReadVerdictOf,
-  teardownErrorReportOf,
   teardownFailed,
+  teardownKillOutcomeOf,
+  teardownKillReadIsConfig,
+  teardownKillReadOf,
   teardownStopped,
   type CliTeardownCommand,
   type PauseAnswer,
@@ -223,9 +227,9 @@ export interface CliDeps {
   fileSize: (path: string) => number
   /** A file's bytes from `offset` to the end, as UTF-8 text; '' when it cannot be read. */
   readFileFrom: (path: string, offset: number) => string
-  /** Current time in milliseconds (the clock of the daemon startup wait, `stop`'s exit polls, the precheck's tries and the teardown's pause tries and poll). */
+  /** Current time in milliseconds (the clock of the daemon startup wait, `stop`'s exit polls, the precheck's tries and the teardown's pause tries, poll and kill tries). */
   now: () => number
-  /** Resolve after `ms` milliseconds (the clock of the daemon startup wait, `stop`'s exit polls, the precheck's tries and the teardown's pause tries and poll). */
+  /** Resolve after `ms` milliseconds (the clock of the daemon startup wait, `stop`'s exit polls, the precheck's tries and the teardown's pause tries, poll and kill tries). */
   sleep: (ms: number) => Promise<void>
   /** Remove a file. */
   unlinkSync: (path: string) => void
@@ -322,14 +326,17 @@ export interface CliDeps {
    */
   directorPause: (instanceId: string) => Promise<void>
   /**
-   * Hard-terminate a persona's instance (`cscb_<key>`) via client.kill. May
-   * throw ErrSpawnNotFound for an already-gone row; the real deps absorb it
-   * and the teardown's kill also tolerates it, by name — the double-layer
-   * leniency is intentional (b.dnt). A kill result with no `kill_sent` field
-   * (a binary older than Phase 1, reached only by `stop --stop-bots`) is a
-   * plain success (b.jg5 SRJ-110, SRJ-902).
+   * One plain `kill` of a persona's instance (`cscb_<key>`) via client.kill,
+   * with the instance ID alone: never `include_finished` (b.jg5 SRJ-106,
+   * SRJ-904). Answers the client's kill result as given, `kill_sent` true,
+   * false or absent, and rejects with every error unchanged, ErrSpawnNotFound
+   * included: the teardown's checked kill (`checkedKill`,
+   * `src/checked-kill.ts`) is the one place that decides what the result or
+   * the error means, a result with no `kill_sent` (a binary older than
+   * Phase 1, reached only by `stop --stop-bots`) being a plain success
+   * (b.jg5 SRJ-110, SRJ-902).
    */
-  directorKill: (instanceId: string) => Promise<void>
+  directorKill: (instanceId: string) => Promise<unknown>
 }
 
 // ---------------------------------------------------------------------------
@@ -532,10 +539,15 @@ export function createCli(deps: CliDeps): CliHandlers {
    *      the row is `ended`, `missing` or absent, or `exit_timeout` passes;
    *      the last wait is cut short at `exit_timeout`; a read error fails the
    *      persona (`stateReadVerdictOf`);
-   *   4. at `exit_timeout`, the kill.
+   *   4. at `exit_timeout`, or after an escalated pause, the kill's bounded
+   *      retry by class (`teardownKill`, b.jg5 SRJ-904).
    *
-   * Every wait is on the CLI's injected clock (`deps.now`, `deps.sleep`;
-   * b.jg5 SRJ-908). A kill does not guarantee an `ended` row; the next
+   * Every wait is on the CLI's injected clock (`deps.now`, `deps.sleep`), and
+   * the whole teardown, with every call taking the call timeout, ends within
+   * `teardownBoundMs(exit_timeout, callTimeoutMs)` (`src/cli-teardown.ts`;
+   * b.jg5 SRJ-908): no other wait, no sleep past `exit_timeout` and no call
+   * beyond the state read, the pause's tries, the poll and the kill's tries
+   * with their reads. A kill does not guarantee an `ended` row; the next
    * server's start recovers such a row. Log lines name the persona as its
    * JSON-quoted name with its key (b.av2 SR-2.2).
    */
@@ -563,11 +575,16 @@ export function createCli(deps: CliDeps): CliHandlers {
     // above that wait (b.jg5 SRJ-213), so a slow `/exit` ends in
     // agent-director's ErrPauseTimeout, which escalates, rather than in
     // ErrCallTimeout (b.jg5 SRJ-119).
+    // No latch check holds the kill back: a human-initiated teardown makes
+    // its ordinary checked kill of a row the server would hold, a `pending`
+    // row with or without a launch start included, which goes pause,
+    // ErrSpawnNotPausable, then the kill (b.jg5 SRJ-503, SRJ-513; hatch
+    // note E16).
     const pause = await pauseTries(id)
     if (pause.kind === PAUSE_VERDICT_FAIL) return teardownFailed(TEARDOWN_STEP_PAUSE, pause)
     if (pause.kind !== PAUSE_VERDICT_DONE) {
       console.error(`[slack] teardownBots: pause failed for persona ${ref} — escalating to kill: ${pause.description}`)
-      return teardownKill(id)
+      return teardownKill(id, ref, initial.state)
     }
 
     // Poll for `ended` or `missing`. Each read goes through the same verdict
@@ -576,8 +593,9 @@ export function createCli(deps: CliDeps): CliHandlers {
     // b.jg5 SRJ-801: the CLI never writes retired-keys.json and installs no
     // store).
     const startTime = deps.now()
-    const deadline = startTime + exit_timeout * 1000
+    const deadline = startTime + exitTimeoutMsOf(exit_timeout)
     let wait = TEARDOWN_POLL_FIRST_WAIT_MS
+    let lastState = initial.state
     while (deps.now() < deadline) {
       await deps.sleep(Math.min(wait, deadline - deps.now()))
       wait = Math.min(wait * 2, TEARDOWN_POLL_MAX_WAIT_MS)
@@ -587,11 +605,12 @@ export function createCli(deps: CliDeps): CliHandlers {
         console.error(`[slack] teardownBots: persona ${ref} exited cleanly in ${deps.now() - startTime}ms`)
         return teardownStopped(TEARDOWN_STOPPED_EXITED)
       }
+      lastState = polled.state
     }
 
     // exit_timeout passed: the kill.
     const elapsed = deps.now() - startTime
-    const killed = await teardownKill(id)
+    const killed = await teardownKill(id, ref, lastState)
     if (killed.kind === TEARDOWN_OUTCOME_FAILED) {
       console.error(`[slack] teardownBots: kill failed for persona ${ref}: ${killed.description}`)
     } else {
@@ -636,19 +655,57 @@ export function createCli(deps: CliDeps): CliHandlers {
   }
 
   /**
-   * The teardown's kill of `id`, after an escalated pause or at
-   * `exit_timeout`: one `kill`. Success, or no row (ErrSpawnNotFound, by
-   * name), stops the persona; any other error fails it at the kill with its
-   * class (b.dnt: agent-director failing mid-teardown is never a benign
-   * already-gone row).
+   * The teardown's kill of `id` (persona `ref`), after an escalated pause or
+   * at `exit_timeout`, whose path last read the row in `lastState` (b.jg5
+   * SRJ-904, SRJ-702, SRJ-110): one bounded retry (`runKillRetry`,
+   * `src/kill-retry.ts`), mapped to the persona's outcome by
+   * `teardownKillOutcomeOf` (`src/cli-teardown.ts`).
+   *
+   *   - each try is one checked kill (`checkedKill`, `src/checked-kill.ts`)
+   *     over `deps.directorKill`: a plain kill, never `include_finished`
+   *     (b.jg5 SRJ-106), under `TEARDOWN_KILL_OPTIONS`: a GONE answer is a
+   *     non-success, which the retry never tries again and logs as the
+   *     failure it is for the persona (b.jg5 SRJ-904, SRJ-702);
+   *   - an UNAVAILABLE try is tried again, up to KILL_RETRY_TRIES kills
+   *     KILL_RETRY_SPACING_MS apart on the CLI's injected clock
+   *     (`deps.sleep`), with one `status` read (`deps.directorStatus`,
+   *     `teardownKillReadOf`) before each further try;
+   *   - a CONFIG answer at that read (`teardownKillReadIsConfig`) ends the
+   *     tries with no further kill, whatever state was last read: the retry
+   *     itself ends them on a row last read `pending`, and the keep-going
+   *     check, asked after each wait and again after each read, on any other;
+   *   - an UNUSABLE NAME answer at that read, or a `pending` row with no
+   *     launch start, lets the try go ahead: nothing latches in the CLI, which
+   *     imports no latch and writes no retired-key record (b.jg5 SRJ-115,
+   *     SRJ-801, SRJ-1002);
+   *   - each try, read and end goes to stderr with the teardown's prefix.
+   * Raises no outage, arms no retry timer and starts no condition: the CLI
+   * has none. Never throws for an agent-director answer.
    */
-  async function teardownKill(id: string): Promise<PersonaTeardownOutcome> {
-    try {
-      await deps.directorKill(id)
-    } catch (err) {
-      if (!hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) return teardownFailed(TEARDOWN_STEP_KILL, teardownErrorReportOf(err))
-    }
-    return teardownStopped(TEARDOWN_STOPPED_KILLED)
+  async function teardownKill(id: string, ref: string, lastState: string): Promise<PersonaTeardownOutcome> {
+    let configRead: { readonly value: unknown } | undefined
+    const kill = (params: PlainKillParams): Promise<unknown> => deps.directorKill(params.claude_instance_id)
+    const result = await runKillRetry({
+      instanceId: id,
+      kill: () => checkedKill(id, kill, TEARDOWN_KILL_OPTIONS),
+      read: async (): Promise<KillRetryRead> => {
+        let answer: StateReadAnswer
+        try {
+          answer = { row: await deps.directorStatus(id) }
+        } catch (error) {
+          answer = { error }
+        }
+        const read = teardownKillReadOf(answer)
+        if (teardownKillReadIsConfig(read)) configRead = { value: read.error }
+        return read
+      },
+      wait: deps.sleep,
+      lastRead: killRetrySeedOfState(lastState),
+      keepGoing: () => configRead === undefined,
+      log: (line) => console.error(line),
+      logPrefix: `[slack] teardownBots: persona ${ref}`,
+    })
+    return teardownKillOutcomeOf({ result, ...(configRead === undefined ? {} : { configRead }) })
   }
 
   /**
@@ -1231,13 +1288,13 @@ export type DirectorClient = Pick<Client, 'get' | 'readPane' | 'status' | 'pause
  * picked up and an uninstalled one throws at the call.
  *
  * Each `id` is a persona's instance ID, `cscb_<key>` (b.av2 SR-8.7). b.qwo:
- * only ErrSpawnNotFound means "no row" — `directorGet` and `directorStatus`
- * return null and `directorKill` returns normally; every other error (AD
- * unreachable, no Client installed, a call timeout, …) propagates so the
+ * `directorGet` and `directorStatus` return null for ErrSpawnNotFound alone,
+ * recognised by name (`hasAdErrorName`), and pass every other error (AD
+ * unreachable, no Client installed, a call timeout, …) through, so the
  * precheck or the teardown classifies it and a failure is loud.
- * `directorReadPane` and `directorPause` pass every error through,
- * ErrSpawnNotFound included. ErrSpawnNotFound is recognised by name
- * (`hasAdErrorName`).
+ * `directorReadPane`, `directorPause` and `directorKill` pass every error
+ * through, ErrSpawnNotFound included. `directorKill` answers the kill result
+ * as given, for the teardown's checked kill (b.jg5 SRJ-110, SRJ-904).
  *
  * b.jg5 SRJ-114, SRJ-801, SRJ-807: `directorGet` and `directorStatus` apply
  * no row-read rule and the CLI installs no latch and no retired-key store, so
@@ -1270,16 +1327,14 @@ export function createDirectorOps(getClient: () => DirectorClient): DirectorOps 
     directorPause: async (id) => {
       await getClient().pause({ claude_instance_id: id })
     },
+    // The kill's parameters are the instance ID alone, never
+    // `include_finished` (b.jg5 SRJ-106, SRJ-904). The result is answered as
+    // given and every error passes through, ErrSpawnNotFound included: the
+    // teardown's checked kill reads both, and a result with no `kill_sent`
+    // field (a binary older than Phase 1, which only `stop --stop-bots`
+    // reaches) is a plain success there (b.jg5 SRJ-110, SRJ-902).
     directorKill: async (id) => {
-      try {
-        // The result is not read: a result with no `kill_sent` field (a
-        // binary older than Phase 1, which only `stop --stop-bots` reaches)
-        // is a plain success (b.jg5 SRJ-110, SRJ-902).
-        await getClient().kill({ claude_instance_id: id })
-      } catch (err) {
-        if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) return
-        throw err
-      }
+      return getClient().kill({ claude_instance_id: id })
     },
   }
 }

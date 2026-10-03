@@ -8,7 +8,10 @@
  * run; `ErrSpawnNotFound` and a GONE answer count as success. Every other
  * outcome keeps the row and follows its class: retry later, latch, or outage.
  * The caller decides that by its own context; this module decides nothing
- * beyond the outcome.
+ * beyond the outcome. One caller rule changes the outcome itself: a caller
+ * for which a GONE answer is no success (the CLI's teardown, SRJ-904) passes
+ * {@link CheckedKillOptions.goneIsFailure}, and the GONE answer is then the
+ * GONE non-success ({@link KillFailureGone}) instead of `session-gone`.
  *
  * The outcome ({@link KillOutcome}):
  *   - a success ({@link KillSuccess}):
@@ -23,7 +26,8 @@
  *       `session-gone`  the kill answered GONE (`ErrTmuxSendKeys`,
  *                       `ErrTmuxCaptureFailed`): agent-director found the
  *                       tmux session gone. For `kill`, gone is success
- *                       (SRJ-104, SRJ-110); `name` is the GONE name;
+ *                       (SRJ-104, SRJ-110); `name` is the GONE name. Not
+ *                       given under `goneIsFailure`;
  *       `row-finished`  a `status` read of the row between tries read it
  *                       `ended` or `missing`, or answered `ErrSpawnNotFound`
  *                       (SRJ-110, SRJ-702). No code here makes that read: the
@@ -33,7 +37,8 @@
  *     UNAVAILABLE (`ErrTmuxKillFailed`, told apart as `killFailed` with its
  *     description, read raw through `killFailedDescriptionOf`; and every
  *     other UNAVAILABLE value), CONFLICT, UNUSABLE_NAME, CONFIG, ENVIRONMENT
- *     or UNCLASSIFIED. A value of a class SRJ-110 gives no row (LAUNCH
+ *     or UNCLASSIFIED; and, only under `goneIsFailure`, GONE (its name
+ *     kept as `name`). A value of a class SRJ-110 gives no row (LAUNCH
  *     FAILURE, a STATE name other than `ErrSpawnNotFound`, DIRECTORY) is
  *     UNCLASSIFIED, its classifier class kept as `unlistedClass`, so a caller
  *     inside a launch or recovery attempt reports it as an UNCLASSIFIED
@@ -49,7 +54,8 @@
  * {@link checkedKill} makes exactly one plain `kill` call through the
  * injected call, with `claude_instance_id` alone (CSCB never sets
  * `include_finished`, SRJ-106), and answers the outcome. It never throws and
- * never retries.
+ * never retries. Every server site calls it with no options: GONE is the
+ * `session-gone` success there.
  *
  * {@link describeKillOutcome} renders an outcome for one log line: its form,
  * its class (and the unlisted class it came from), `kill_sent` when present,
@@ -231,14 +237,53 @@ export interface KillFailureOther {
   readonly recheck?: KillRecheckKind
 }
 
+/**
+ * A non-success because the kill answered GONE (`ErrTmuxSendKeys`,
+ * `ErrTmuxCaptureFailed`) for a caller that counts GONE as no success
+ * ({@link CheckedKillOptions.goneIsFailure}; the CLI's teardown, SRJ-904).
+ * Only that option gives it; a server site never sees one. `name` is the GONE
+ * name, absent when it cannot be read. It is not UNAVAILABLE, so the bounded
+ * retry never tries it again (SRJ-702).
+ */
+export interface KillFailureGone {
+  readonly kind: typeof KILL_OUTCOME_NOT_KILLED
+  readonly errorClass: typeof AD_ERROR_CLASS_GONE
+  /** The thrown value, for the caller's own handling. Never logged raw. */
+  readonly error: unknown
+  readonly name?: string
+}
+
 /** Every non-success: no launch, reuse or delete may follow. */
 export type KillFailure = KillFailureUnavailable | KillFailureOther
 
 /** A kill's outcome (SRJ-110, SRJ-701). */
 export type KillOutcome = KillSuccess | KillFailure
 
+/** Every non-success form, the GONE non-success of {@link CheckedKillOptions.goneIsFailure} included. */
+export type AnyKillFailure = KillFailure | KillFailureGone
+
+/**
+ * Every outcome form, the GONE non-success of
+ * {@link CheckedKillOptions.goneIsFailure} included. A call with no options
+ * answers a {@link KillOutcome}, so a server site's type never holds the
+ * GONE non-success.
+ */
+export type AnyKillOutcome = KillOutcome | KillFailureGone
+
 /** How a kill settled: its result, or what it threw. */
 export type KillSettled = { readonly result: unknown } | { readonly thrown: unknown }
+
+/** A caller's rule for what a kill's answer means. Absent, or every field absent: SRJ-110's server rules. */
+export interface CheckedKillOptions {
+  /**
+   * True: a GONE answer is the GONE non-success ({@link KillFailureGone}),
+   * not the `session-gone` success, so it lets no next step run and the
+   * bounded retry ends at once on it (only UNAVAILABLE is tried again). For a
+   * caller where only SRJ-110's success forms count, the CLI's teardown
+   * (SRJ-904). Absent or false: `session-gone`.
+   */
+  readonly goneIsFailure?: boolean
+}
 
 // ---------------------------------------------------------------------------
 // Classification
@@ -253,15 +298,18 @@ const UNLISTED_CLASSES: ReadonlySet<string> = new Set<string>(KILL_UNLISTED_CLAS
  * success with its `kill_sent` kept as given (absent when the result has no
  * boolean `kill_sent`). A thrown `ErrSpawnNotFound` (by name) is the
  * `row-gone` success, and a thrown GONE value the `session-gone` success
- * (SRJ-104: for `kill`, gone is success); any other thrown value is a
+ * (SRJ-104: for `kill`, gone is success), or the GONE non-success under
+ * `options.goneIsFailure`; any other thrown value is a
  * non-success of the class `classifyAdError` answers by name, a class SRJ-110
  * has no row for counting as UNCLASSIFIED with that class kept as
  * `unlistedClass`. Pure; never throws.
  */
-export function killOutcomeOf(settled: KillSettled): KillOutcome {
+export function killOutcomeOf(settled: KillSettled): KillOutcome
+export function killOutcomeOf(settled: KillSettled, options: CheckedKillOptions): AnyKillOutcome
+export function killOutcomeOf(settled: KillSettled, options?: CheckedKillOptions): AnyKillOutcome {
   try {
     if ('result' in settled) return killedOutcome(settled.result)
-    return thrownOutcome(settled.thrown)
+    return thrownOutcome(settled.thrown, options?.goneIsFailure === true)
   } catch {
     return { kind: KILL_OUTCOME_NOT_KILLED, errorClass: AD_ERROR_CLASS_UNCLASSIFIED, error: undefined }
   }
@@ -284,13 +332,16 @@ function readKillSent(result: unknown): boolean | undefined {
   }
 }
 
-/** The outcome for a value a kill threw. */
-function thrownOutcome(error: unknown): KillOutcome {
+/** The outcome for a value a kill threw; a GONE value is a non-success when `goneIsFailure`. */
+function thrownOutcome(error: unknown, goneIsFailure: boolean): AnyKillOutcome {
   if (hasAdErrorName(error, ERR_SPAWN_NOT_FOUND_NAME)) return { kind: KILL_OUTCOME_ROW_GONE }
   const { errorClass } = classifyAdError(error)
   if (errorClass === AD_ERROR_CLASS_GONE) {
     const name = AD_GONE_ERR_NAMES.find((goneName) => hasAdErrorName(error, goneName))
-    return name === undefined ? { kind: KILL_OUTCOME_SESSION_GONE } : { kind: KILL_OUTCOME_SESSION_GONE, name }
+    const named = name === undefined ? {} : { name }
+    return goneIsFailure
+      ? { kind: KILL_OUTCOME_NOT_KILLED, errorClass, error, ...named }
+      : { kind: KILL_OUTCOME_SESSION_GONE, ...named }
   }
   if (errorClass === AD_ERROR_CLASS_UNAVAILABLE) {
     const killFailedDescription = killFailedDescriptionOf(error)
@@ -379,18 +430,20 @@ export type KillCall = (params: PlainKillParams) => Promise<unknown>
 /**
  * One checked kill of `instanceId` (SRJ-110, SRJ-701): exactly one call of
  * `kill` with `{ claude_instance_id: instanceId }` and nothing else, and its
- * outcome (`killOutcomeOf`). A call that throws, synchronously or by
- * rejecting, gives the outcome of what it threw. Never throws or rejects,
- * and never retries.
+ * outcome (`killOutcomeOf`, under `options`). A call that throws,
+ * synchronously or by rejecting, gives the outcome of what it threw. Never
+ * throws or rejects, and never retries.
  */
-export async function checkedKill(instanceId: string, kill: KillCall): Promise<KillOutcome> {
+export function checkedKill(instanceId: string, kill: KillCall): Promise<KillOutcome>
+export function checkedKill(instanceId: string, kill: KillCall, options: CheckedKillOptions): Promise<AnyKillOutcome>
+export async function checkedKill(instanceId: string, kill: KillCall, options?: CheckedKillOptions): Promise<AnyKillOutcome> {
   let result: unknown
   try {
     result = await kill({ claude_instance_id: instanceId })
   } catch (thrown) {
-    return killOutcomeOf({ thrown })
+    return killOutcomeOf({ thrown }, options ?? {})
   }
-  return killOutcomeOf({ result })
+  return killOutcomeOf({ result }, options ?? {})
 }
 
 // ---------------------------------------------------------------------------
@@ -406,7 +459,9 @@ export async function checkedKill(instanceId: string, kill: KillCall): Promise<K
  *   the name cannot be read;
  *   `outcome=row-finished read=<ended|missing|no-row>`;
  *   `outcome=not-killed class=<class> <name> message="…"`, the name and
- *   message by `describeAgentDirectorFailure`; for a class SRJ-110 has no
+ *   message by `describeAgentDirectorFailure` (the GONE non-success
+ *   included: `outcome=not-killed class=GONE ErrTmuxSendKeys message="…"`);
+ *   for a class SRJ-110 has no
  *   row for, `outcome=not-killed class=UNCLASSIFIED from=<class> <name>
  *   message="…"`, followed by ` recheck=<kind>` when an immediate version
  *   re-check was made after an `ErrInvalidFlags`; for a value whose
@@ -420,7 +475,7 @@ export async function checkedKill(instanceId: string, kill: KillCall): Promise<K
  * capped (`renderLogMessageText`); a name appears only when it is a safe
  * identifier; no raw thrown value is rendered. Never throws.
  */
-export function describeKillOutcome(outcome: KillOutcome): string {
+export function describeKillOutcome(outcome: AnyKillOutcome): string {
   try {
     switch (outcome.kind) {
       case KILL_OUTCOME_KILLED:
@@ -528,7 +583,8 @@ function renderFailureClass(errorClass: unknown): string {
  * `ErrUnknownErrorName`) when it carries either; else the redacting
  * describer's name and message.
  */
-function describeFailure(outcome: KillFailure): string {
+function describeFailure(outcome: AnyKillFailure): string {
+  if (outcome.errorClass === AD_ERROR_CLASS_GONE) return `class=${AD_ERROR_CLASS_GONE} ${describeAgentDirectorFailure(outcome.error)}`
   const label = `class=${renderFailureClass(outcome.errorClass)}`
   if (outcome.errorClass === AD_ERROR_CLASS_UNAVAILABLE) {
     if (outcome.killFailed) {

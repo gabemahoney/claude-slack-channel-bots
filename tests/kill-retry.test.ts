@@ -11,7 +11,10 @@
  * delay is recorded, so the schedule is asserted on what the code asked for
  * and no case waits in real time. Every value (the try count, the spacing,
  * the ends, the alert kinds, the class labels) comes from `src/`; every
- * description from the stub's builders. The alert decision carries
+ * description from the stub's builders. A caller whose checked kill counts
+ * GONE as no success (`goneIsFailure`, the CLI's teardown) runs the same
+ * retry; its GONE answer ends the tries as a failure, beside the server
+ * default's session-gone success. The alert decision carries
  * agent-director's descriptions raw by design (T3 redacts at its post), so
  * the leak check covers the log lines, never the decision.
  *
@@ -30,6 +33,7 @@ import {
   AD_ERROR_CLASS_CONFIG,
   AD_ERROR_CLASS_CONFLICT,
   AD_ERROR_CLASS_ENVIRONMENT,
+  AD_ERROR_CLASS_GONE,
   AD_ERROR_CLASS_UNAVAILABLE,
 } from '../src/ad-error-class.ts'
 import type { Phase1KillResult, Phase1StatusResult } from '../src/ad-phase1-types.ts'
@@ -44,8 +48,11 @@ import {
   KILL_ROW_FINISHED_NO_ROW,
   checkedKill,
   killOutcomeOf,
+  type AnyKillOutcome,
+  type CheckedKillOptions,
   type KillOutcome,
   type KillRowFinishedRead,
+  type PlainKillParams,
 } from '../src/checked-kill.ts'
 import {
   KILL_RETRY_ALERT_NONE,
@@ -58,6 +65,8 @@ import {
   KILL_RETRY_END_ROW_FINISHED,
   KILL_RETRY_END_SETTLED,
   KILL_RETRY_END_STOPPED,
+  KILL_RETRY_NEXT_NOT_RETRIED,
+  KILL_RETRY_NEXT_SUCCESS,
   KILL_RETRY_READ_FAILED,
   KILL_RETRY_READ_LATCHED,
   KILL_RETRY_READ_NO_ROW,
@@ -67,9 +76,11 @@ import {
   KILL_RETRY_SPACING_MS,
   KILL_RETRY_TRIES,
   createKillRetryPassBudget,
+  killRetryEndLine,
   killRetrySeedIsLive,
   killRetrySeedOfState,
   killRetryStopped,
+  killRetryTryLine,
   runKillRetry,
   type KillRetryAlert,
   type KillRetryPassBudget,
@@ -92,6 +103,7 @@ import {
   errTmuxCaptureFailed,
   errTmuxKillFailed,
   errTmuxNotAvailable,
+  errTmuxSendKeys,
   errTmuxSessionConflict,
   errTmuxUnresponsive,
   errUnusableName,
@@ -134,11 +146,13 @@ interface RunSpec {
   readonly lastRead?: KillRetrySeed
   readonly keepGoing?: () => boolean
   readonly budget?: KillRetryPassBudget
+  /** The checked kill's options for every try; absent, none (every server site). */
+  readonly killOptions?: CheckedKillOptions
 }
 
 /** What one scripted retry did. */
 interface Run {
-  readonly result: KillRetryResult
+  readonly result: KillRetryResult<AnyKillOutcome>
   /** `kill` and `status` in call order. */
   readonly calls: string[]
   /** The clock time of each kill. */
@@ -190,12 +204,13 @@ async function run(spec: RunSpec): Promise<Run> {
   const statusQueue: CannedResponse<Phase1StatusResult>[] = []
   const client = makeStubClient({ killQueue: [...spec.kills], statusQueue })
   const reads = [...(spec.reads ?? [])]
-  const work = runKillRetry({
+  const work = runKillRetry<AnyKillOutcome>({
     instanceId: STUB_INSTANCE_ID,
     kill: () => {
       calls.push('kill')
       killTimes.push(clock.now())
-      return checkedKill(STUB_INSTANCE_ID, (params) => client.kill(params))
+      const kill = (params: PlainKillParams): Promise<unknown> => client.kill(params)
+      return spec.killOptions === undefined ? checkedKill(STUB_INSTANCE_ID, kill) : checkedKill(STUB_INSTANCE_ID, kill, spec.killOptions)
     },
     read: async (): Promise<KillRetryRead> => {
       calls.push('status')
@@ -676,6 +691,57 @@ describe('runKillRetry: the survivor rule and the alert decision (b.jg5 SRJ-702,
 
     expect(r.result.outcome).toEqual({ kind: KILL_OUTCOME_KILLED, killSent: false })
     expect(r.result.alert).toEqual({ kind: KILL_RETRY_ALERT_NONE })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A caller whose checked kill counts GONE as no success (goneIsFailure; the
+// CLI's teardown, b.jg5 SRJ-904)
+// ---------------------------------------------------------------------------
+
+describe('runKillRetry over checked kills with goneIsFailure (b.jg5 SRJ-702, SRJ-904, SRJ-1007; hatch A3)', () => {
+  const GONE_IS_FAILURE: CheckedKillOptions = { goneIsFailure: true }
+
+  const GONE_ANSWERS: ReadonlyArray<readonly [string, () => Error]> = [
+    ['ErrTmuxSendKeys', () => errTmuxSendKeys()],
+    ['ErrTmuxCaptureFailed', () => errTmuxCaptureFailed(undefined, 'kill')],
+  ]
+
+  test.each(GONE_ANSWERS)('GONE (%s) at the first try: one kill, no read, no wait; the GONE non-success stands with no alert, logged as not tried again, with no end line', async (_label, make) => {
+    const err = make()
+
+    const r = await run({ kills: [cannedErr(err), ...failing(KILL_RETRY_TRIES, () => errTmuxUnresponsive('kill'))], killOptions: GONE_IS_FAILURE })
+
+    const outcome = killOutcomeOf({ thrown: err }, GONE_IS_FAILURE)
+    expect(outcome).toMatchObject({ kind: KILL_OUTCOME_NOT_KILLED, errorClass: AD_ERROR_CLASS_GONE })
+    expect(r.calls).toEqual(['kill'])
+    expect(r.delays).toEqual([])
+    expect(r.result).toEqual({ outcome, end: KILL_RETRY_END_SETTLED, tries: 1, reads: 0, alert: { kind: KILL_RETRY_ALERT_NONE } })
+    expect(r.lines).toEqual([killRetryTryLine(PREFIX, STUB_INSTANCE_ID, 1, KILL_RETRY_TRIES, outcome, KILL_RETRY_NEXT_NOT_RETRIED)])
+  })
+
+  // The same answers with no options (every server site): GONE is the session-gone success.
+  test.each(GONE_ANSWERS.flatMap(([label, make]) => [
+    [label, 'with goneIsFailure', make, GONE_IS_FAILURE] as const,
+    [label, 'with no options (the server default)', make, undefined] as const,
+  ]))('a survivor-naming first try, then GONE (%s) at the 2nd try %s: no third try; the decision and the end line follow that outcome', async (_label, _how, make, killOptions) => {
+    const first = survivorKillFailed()
+    const err = make()
+
+    const r = await run({ kills: [cannedErr(first), cannedErr(err), ...failing(1, () => errTmuxUnresponsive('kill'))], ...(killOptions === undefined ? {} : { killOptions }) })
+
+    const outcome = killOptions === undefined ? killOutcomeOf({ thrown: err }) : killOutcomeOf({ thrown: err }, killOptions)
+    const alert: KillRetryAlert = killOptions === undefined
+      ? { kind: KILL_RETRY_ALERT_SURVIVOR, survivorDescription: descriptionOf(first) }
+      : { kind: KILL_RETRY_ALERT_ORDINARY, earlierSurvivorDescription: descriptionOf(first) }
+    expect(outcome.kind).toBe(killOptions === undefined ? KILL_OUTCOME_SESSION_GONE : KILL_OUTCOME_NOT_KILLED)
+    expect(r.calls).toEqual(['kill', 'status', 'kill'])
+    expect(r.result).toEqual({ outcome, end: KILL_RETRY_END_SETTLED, tries: 2, reads: 1, alert })
+    const next = killOptions === undefined ? KILL_RETRY_NEXT_SUCCESS : KILL_RETRY_NEXT_NOT_RETRIED
+    expect(r.lines.slice(-2)).toEqual([
+      killRetryTryLine(PREFIX, STUB_INSTANCE_ID, 2, KILL_RETRY_TRIES, outcome, next),
+      killRetryEndLine(PREFIX, STUB_INSTANCE_ID, r.result),
+    ])
   })
 })
 

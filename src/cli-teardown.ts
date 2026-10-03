@@ -4,8 +4,9 @@
  * verdict over one answer, its tries and spacing, its two operator lines,
  * `stop --stop-bots`' too-old line and the config-file display name (b.jg5
  * SRJ-901, SRJ-902, SRJ-117, SRJ-908); and the teardown's per-persona
- * outcome, its pause verdict and its state-read verdict (SRJ-903, SRJ-119,
- * SRJ-316; hatch note E12).
+ * outcome, its pause verdict, its state-read verdict, its kill's mapping
+ * and the bounds of its cost (SRJ-903, SRJ-904, SRJ-119, SRJ-316, SRJ-908;
+ * hatch note E12).
  *
  * The precheck. Before either command stops anything, it reads each persona
  * of the configuration the server runs: one `get` of `cscb_<key>`, then, for
@@ -83,6 +84,26 @@
  * `/exit` ends in `ErrPauseTimeout`, which escalates, rather than in
  * `ErrCallTimeout` (SRJ-119).
  *
+ * The kill (SRJ-904, SRJ-702, SRJ-110), after an escalated pause or at
+ * `exit_timeout`, is one bounded retry (`runKillRetry`, `src/kill-retry.ts`)
+ * of checked kills (`checkedKill`, `src/checked-kill.ts`), run by the CLI
+ * with `goneIsFailure`, so a GONE answer is a non-success that ends the tries
+ * at once in the retry's own lines and alert decision.
+ * {@link teardownKillReadOf} maps each `status` read between tries (no row,
+ * a state, or a failed read; never a latching read), and
+ * {@link teardownKillReadIsConfig} tells the CLI a CONFIG read, which ends
+ * the tries. {@link teardownKillOutcomeOf} maps the retry's result to the
+ * persona's outcome: a success stops it, every non-success class (GONE
+ * included) and a CONFIG read fail it with the classifier's class, and the
+ * outcome carries the kill's report with the kill-failure alert decision
+ * (never the survivor version for a failed persona, never the ordinary
+ * version for a stopped one).
+ *
+ * The cost (SRJ-908): {@link teardownBoundMs} bounds one persona's teardown
+ * and {@link precheckBoundMs} its precheck, each call taking the call
+ * timeout, from {@link PRECHECK_TRIES}, {@link PRECHECK_TRY_SPACING_MS},
+ * `KILL_RETRY_TRIES`, `KILL_RETRY_SPACING_MS` and `exit_timeout`.
+ *
  * The precheck and the teardown have no side effects beyond the teardown's
  * own `pause` and `kill` (SRJ-114, SRJ-115, SRJ-801, SRJ-1002): nothing
  * latches, no record is written and no retired-key entry is cleared. This
@@ -101,6 +122,7 @@ import {
   AD_ERROR_CLASS_CONFIG,
   AD_ERROR_CLASS_CONFLICT,
   AD_ERROR_CLASS_ENVIRONMENT,
+  AD_ERROR_CLASS_GONE,
   AD_ERROR_CLASS_UNAVAILABLE,
   AD_ERROR_CLASS_UNCLASSIFIED,
   AD_ERROR_CLASS_UNUSABLE_NAME,
@@ -111,6 +133,32 @@ import {
 } from './ad-error-class.ts'
 import { AD_SETTINGS_RELATIVE_PATH } from './ad-settings.ts'
 import { ERR_INTERNAL_NAME, ERR_SPAWN_NOT_FOUND_NAME } from './agent-director-errors.ts'
+import {
+  KILL_OUTCOME_KILLED,
+  KILL_OUTCOME_NOT_KILLED,
+  KILL_OUTCOME_ROW_FINISHED,
+  KILL_OUTCOME_ROW_GONE,
+  KILL_OUTCOME_SESSION_GONE,
+  type AnyKillFailure,
+  type AnyKillOutcome,
+  type CheckedKillOptions,
+} from './checked-kill.ts'
+import {
+  KILL_RETRY_ALERT_NONE,
+  KILL_RETRY_ALERT_ORDINARY,
+  KILL_RETRY_ALERT_SURVIVOR,
+  KILL_RETRY_END_READ_CONFIG,
+  KILL_RETRY_END_STOPPED,
+  KILL_RETRY_READ_FAILED,
+  KILL_RETRY_READ_NO_ROW,
+  KILL_RETRY_READ_STATE,
+  KILL_RETRY_SPACING_MS,
+  KILL_RETRY_TRIES,
+  type KillRetryAlert,
+  type KillRetryEnd,
+  type KillRetryRead,
+  type KillRetryResult,
+} from './kill-retry.ts'
 import { AGENT_DIRECTOR_DEAD_STATES } from './liveness-reading.ts'
 import {
   PANE_READ_ABSENT,
@@ -374,16 +422,50 @@ export interface TeardownErrorReport {
   readonly namesConfigFile: boolean
 }
 
-/** A persona's teardown that stopped it. */
+/**
+ * The kill-failure alert decision a stopped persona's kill carries: none, or
+ * the survivor version quoting the latest survivor-naming description (b.jg5
+ * SRJ-904, SRJ-1007). A stopped persona never carries the ordinary version.
+ */
+export type TeardownStoppedKillAlert = Exclude<KillRetryAlert, { readonly kind: typeof KILL_RETRY_ALERT_ORDINARY }>
+
+/**
+ * The kill-failure alert decision a failed persona's kill carries: none, or
+ * the ordinary version with the descriptions it quotes (b.jg5 SRJ-904,
+ * SRJ-907, SRJ-1007). A failed persona never carries the survivor version.
+ */
+export type TeardownFailedKillAlert = Exclude<KillRetryAlert, { readonly kind: typeof KILL_RETRY_ALERT_SURVIVOR }>
+
+/**
+ * What a persona's teardown kill did (b.jg5 SRJ-904, SRJ-702): the outcome
+ * that stood at the end of the bounded retry (`runKillRetry`,
+ * `src/kill-retry.ts`), how the tries ended, the kills and `status` reads
+ * made, and the kill-failure alert decision, every description in it raw as
+ * agent-director wrote it (redact before any line, record or print).
+ */
+export interface TeardownKillReport<Alert extends KillRetryAlert = KillRetryAlert> {
+  readonly outcome: AnyKillOutcome
+  readonly end: KillRetryEnd
+  readonly tries: number
+  readonly reads: number
+  readonly alert: Alert
+}
+
+/** A persona's teardown that stopped it; `kill` is present when the kill stopped it. */
 export interface TeardownStoppedOutcome {
   readonly kind: typeof TEARDOWN_OUTCOME_STOPPED
   readonly reason: TeardownStoppedReason
+  readonly kill?: TeardownKillReport<TeardownStoppedKillAlert>
 }
 
-/** A persona's teardown that failed, at `step`, with what the answer reports. */
+/**
+ * A persona's teardown that failed, at `step`, with what the answer reports;
+ * `kill` is present when the kill failed it.
+ */
 export interface TeardownFailedOutcome extends TeardownErrorReport {
   readonly kind: typeof TEARDOWN_OUTCOME_FAILED
   readonly step: TeardownStep
+  readonly kill?: TeardownKillReport<TeardownFailedKillAlert>
 }
 
 /** One persona's teardown outcome. */
@@ -412,7 +494,11 @@ export function teardownFailed(step: TeardownStep, report: TeardownErrorReport):
  * {@link AD_CONFIG_FILE_DISPLAY_NAME} for a CONFIG answer. Pure; never throws.
  */
 export function teardownErrorReportOf(error: unknown): TeardownErrorReport {
-  const { errorClass } = classifyAdError(error)
+  return errorReportOfClass(classifyAdError(error).errorClass, error)
+}
+
+/** What a teardown failure of `errorClass` reports for `error`: see {@link teardownErrorReportOf}. */
+function errorReportOfClass(errorClass: AdErrorClass, error: unknown): TeardownErrorReport {
   const description = describeReportedAdFailure(error)
   if (errorClass === AD_ERROR_CLASS_CONFIG) {
     return { errorClass, description: configFailureDescription(description), namesConfigFile: true }
@@ -585,6 +671,205 @@ export const TEARDOWN_POLL_FIRST_WAIT_MS = 100
 
 /** The poll's longest wait between two `status` reads; the last wait is also cut short at `exit_timeout`. */
 export const TEARDOWN_POLL_MAX_WAIT_MS = 2_000
+
+/** Milliseconds in one second, for `exit_timeout`, which the configuration gives in seconds. */
+const MS_PER_SECOND = 1_000
+
+/**
+ * `exit_timeout` (seconds) in milliseconds: how long the poll after a
+ * successful pause waits for the row to end before the kill. A negative or
+ * non-finite value is 0. Pure; never throws.
+ */
+export function exitTimeoutMsOf(exitTimeoutSeconds: number): number {
+  return Number.isFinite(exitTimeoutSeconds) && exitTimeoutSeconds > 0 ? exitTimeoutSeconds * MS_PER_SECOND : 0
+}
+
+// ---------------------------------------------------------------------------
+// The teardown's kill
+// ---------------------------------------------------------------------------
+
+/**
+ * The read between kill tries as the bounded retry takes it (b.jg5 SRJ-904,
+ * SRJ-702, SRJ-115), from one `status` answer: no row → `KILL_RETRY_READ_NO_ROW`;
+ * a row → `KILL_RETRY_READ_STATE` with its state, `pending` with no launch
+ * start being a live read; a thrown value → `KILL_RETRY_READ_FAILED`, an
+ * UNUSABLE NAME answer included. Never `KILL_RETRY_READ_LATCHED`: nothing
+ * latches in the CLI, so each of those lets the next try go ahead (the
+ * retry itself ends the tries as a success on `ended`, `missing` or a thrown
+ * `ErrSpawnNotFound`). Pure; never throws.
+ */
+export function teardownKillReadOf(answer: StateReadAnswer): KillRetryRead {
+  if ('error' in answer) return { kind: KILL_RETRY_READ_FAILED, error: answer.error }
+  if (answer.row === null) return { kind: KILL_RETRY_READ_NO_ROW }
+  return { kind: KILL_RETRY_READ_STATE, state: answer.row.state }
+}
+
+/**
+ * The checked kill's options for every try of the teardown's kill (b.jg5
+ * SRJ-904, SRJ-110; hatch A3): only SRJ-110's success forms stop a persona in
+ * the CLI, so a GONE answer is a non-success. The bounded retry then never
+ * tries it again (SRJ-702), logs the try and the end as that failure, and
+ * decides the ordinary alert version (quoting a survivor-naming description
+ * of an earlier try) rather than the survivor version.
+ */
+export const TEARDOWN_KILL_OPTIONS: CheckedKillOptions = Object.freeze({ goneIsFailure: true })
+
+/**
+ * True when `read` is a failed read whose answer is CONFIG
+ * (`ErrConfigMalformed`, by name through `classifyAdError`): in the CLI it
+ * ends the tries with no further kill and fails the persona's teardown,
+ * whatever state was last read (b.jg5 SRJ-904, SRJ-702). Pure; never throws.
+ */
+export function teardownKillReadIsConfig(
+  read: KillRetryRead,
+): read is Extract<KillRetryRead, { readonly kind: typeof KILL_RETRY_READ_FAILED }> {
+  return read.kind === KILL_RETRY_READ_FAILED && classifyAdError(read.error).errorClass === AD_ERROR_CLASS_CONFIG
+}
+
+/** What the teardown's kill hands {@link teardownKillOutcomeOf}. */
+export interface TeardownKillTries {
+  /** The bounded retry's result, its tries checked kills with `goneIsFailure`. */
+  readonly result: KillRetryResult<AnyKillOutcome>
+  /**
+   * The CONFIG answer of the `status` read between tries that ended them,
+   * when one did ({@link teardownKillReadIsConfig}). The retry's own result
+   * then carries the last try's outcome, not CONFIG.
+   */
+  readonly configRead?: { readonly value: unknown }
+}
+
+/** The ends a CONFIG read between tries gives: the retry's own (`pending` last read) or the keep-going check's. */
+const CONFIG_READ_ENDS: ReadonlySet<KillRetryEnd> = new Set<KillRetryEnd>([KILL_RETRY_END_READ_CONFIG, KILL_RETRY_END_STOPPED])
+
+/**
+ * The persona's teardown outcome from its kill's bounded retry, under the
+ * CLI's rules (b.jg5 SRJ-904, SRJ-702, SRJ-907; hatch A3). Pure; never throws.
+ *
+ *   - a CONFIG answer at a read between tries, whichever end it gave
+ *     (`read-config` or `stopped`): failed, class CONFIG, its description
+ *     naming {@link AD_CONFIG_FILE_DISPLAY_NAME};
+ *   - a success (`killed`, whatever its `kill_sent`, absent included;
+ *     `row-gone`; `row-finished`): stopped, reason killed, carrying the
+ *     retry's decision (none, or the survivor version after a
+ *     survivor-naming `ErrTmuxKillFailed`);
+ *   - `not-killed`: failed with its class (UNAVAILABLE after its tries,
+ *     GONE (`ErrTmuxSendKeys`, `ErrTmuxCaptureFailed`; the checked kill's
+ *     `goneIsFailure` non-success, never tried again), CONFLICT, ENVIRONMENT,
+ *     UNUSABLE NAME, CONFIG, UNCLASSIFIED with the three store names and
+ *     `ErrInternal`), an unlisted class (a STATE name other than
+ *     `ErrSpawnNotFound`, DIRECTORY, LAUNCH FAILURE) reported under the
+ *     classifier's class, never relabelled UNCLASSIFIED;
+ *   - `session-gone`, which a checked kill with `goneIsFailure` never
+ *     answers: failed, class GONE, its description the GONE name. Only
+ *     SRJ-110's success forms stop a persona in the CLI.
+ * A failure's description is `describeReportedAdFailure` of the thrown value
+ * (SRJ-104): redacted, on one line. A failed persona carries the retry's
+ * decision (none or the ordinary version) as it is; a survivor decision,
+ * which the retry gives only on a success end, becomes the ordinary version
+ * quoting that survivor-naming description, so a failed persona never
+ * carries the survivor version.
+ */
+export function teardownKillOutcomeOf(tries: TeardownKillTries): PersonaTeardownOutcome {
+  const { result } = tries
+  const { outcome } = result
+  const base = { outcome, end: result.end, tries: result.tries, reads: result.reads }
+  const failed = (report: TeardownErrorReport): TeardownFailedOutcome => ({
+    ...teardownFailed(TEARDOWN_STEP_KILL, report),
+    kill: { ...base, alert: failedKillAlertOf(result.alert) },
+  })
+  if (tries.configRead !== undefined && CONFIG_READ_ENDS.has(result.end)) {
+    return failed(errorReportOfClass(AD_ERROR_CLASS_CONFIG, tries.configRead.value))
+  }
+  switch (outcome.kind) {
+    case KILL_OUTCOME_KILLED:
+    case KILL_OUTCOME_ROW_GONE:
+    case KILL_OUTCOME_ROW_FINISHED:
+      return { ...teardownStopped(TEARDOWN_STOPPED_KILLED), kill: { ...base, alert: stoppedKillAlertOf(result.alert) } }
+    case KILL_OUTCOME_SESSION_GONE:
+      return failed({ errorClass: AD_ERROR_CLASS_GONE, description: outcome.name ?? AD_ERROR_CLASS_GONE, namesConfigFile: false })
+    case KILL_OUTCOME_NOT_KILLED:
+      return failed(errorReportOfClass(killFailureClassOf(outcome), outcome.error))
+  }
+}
+
+/** A non-success's class as the CLI reports it: the classifier's own for an unlisted class. */
+function killFailureClassOf(outcome: AnyKillFailure): AdErrorClass {
+  if (outcome.errorClass === AD_ERROR_CLASS_UNAVAILABLE || outcome.errorClass === AD_ERROR_CLASS_GONE) return outcome.errorClass
+  return outcome.unlistedClass ?? outcome.errorClass
+}
+
+/** A stopped persona's decision: the retry's (none or survivor); an ordinary decision, which no success gives, is none. */
+function stoppedKillAlertOf(alert: KillRetryAlert): TeardownStoppedKillAlert {
+  return alert.kind === KILL_RETRY_ALERT_ORDINARY ? { kind: KILL_RETRY_ALERT_NONE } : alert
+}
+
+/**
+ * A failed persona's decision: the retry's, a survivor decision (a success
+ * end's, so never one of a CLI kill that fails the persona) becoming the
+ * ordinary version quoting its description.
+ */
+function failedKillAlertOf(alert: KillRetryAlert): TeardownFailedKillAlert {
+  return alert.kind === KILL_RETRY_ALERT_SURVIVOR
+    ? { kind: KILL_RETRY_ALERT_ORDINARY, earlierSurvivorDescription: alert.survivorDescription }
+    : alert
+}
+
+// ---------------------------------------------------------------------------
+// Bounded cost (b.jg5 SRJ-908)
+// ---------------------------------------------------------------------------
+
+/** The precheck's calls of one persona, each with its own tries: the `get`, then the `read-pane`. */
+const PRECHECK_CALLS_PER_PERSONA: readonly PrecheckCall[] = [PRECHECK_CALL_GET, PRECHECK_CALL_READ_PANE]
+
+/** A call timeout as a bound: a negative or non-finite value is 0. */
+function callBoundMs(callTimeoutMs: number): number {
+  return Number.isFinite(callTimeoutMs) && callTimeoutMs > 0 ? callTimeoutMs : 0
+}
+
+/**
+ * The longest time `tries` calls of one call take, `spacingMs` apart, each
+ * call taking `callMs`, with `readsBetween` further calls (the bounded kill
+ * retry's `status` read) after each wait.
+ */
+function triesBoundMs(tries: number, spacingMs: number, callMs: number, readsBetween: number): number {
+  return tries * callMs + (tries - 1) * (spacingMs + readsBetween * callMs)
+}
+
+/**
+ * The longest time, in ms, one persona's precheck takes (b.jg5 SRJ-908,
+ * SRJ-901), each call taking `callTimeoutMs`: its `get`'s
+ * {@link PRECHECK_TRIES} calls {@link PRECHECK_TRY_SPACING_MS} apart, then its
+ * `read-pane`'s. Personas are checked in parallel, so this also bounds the
+ * precheck of a persona set. Pure; never throws.
+ */
+export function precheckBoundMs(callTimeoutMs: number): number {
+  const call = callBoundMs(callTimeoutMs)
+  return PRECHECK_CALLS_PER_PERSONA.length * triesBoundMs(PRECHECK_TRIES, PRECHECK_TRY_SPACING_MS, call, 0)
+}
+
+/**
+ * The longest time, in ms, one persona's teardown takes (b.jg5 SRJ-908), each
+ * call taking `callTimeoutMs`. Personas are torn down in parallel, so this
+ * also bounds the teardown of a persona set. Pure; never throws.
+ *
+ *   the state read                     1 call
+ *   the pause                          PRECHECK_TRIES calls, PRECHECK_TRY_SPACING_MS apart
+ *   the poll                           exit_timeout, then its last `status` call
+ *   the kill                           KILL_RETRY_TRIES calls, KILL_RETRY_SPACING_MS apart,
+ *                                      one `status` read after each wait
+ *
+ * The poll's last wait is cut short at `exit_timeout`, so a read that starts
+ * before it is the poll's last; a pause that escalates goes to the kill with
+ * no poll, so the sum is an upper bound of every path.
+ */
+export function teardownBoundMs(exitTimeoutSeconds: number, callTimeoutMs: number): number {
+  const call = callBoundMs(callTimeoutMs)
+  const stateRead = call
+  const pause = triesBoundMs(PRECHECK_TRIES, PRECHECK_TRY_SPACING_MS, call, 0)
+  const poll = exitTimeoutMsOf(exitTimeoutSeconds) + call
+  const kill = triesBoundMs(KILL_RETRY_TRIES, KILL_RETRY_SPACING_MS, call, 1)
+  return stateRead + pause + poll + kill
+}
 
 // ---------------------------------------------------------------------------
 // Lines
