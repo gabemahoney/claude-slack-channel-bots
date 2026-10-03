@@ -772,7 +772,7 @@ If agent-director can't be reached, or a persona's instance can't be read, the p
 
   The exit status is 1 whatever the server stop did, so read the lines between the first and the last to tell whether the server is really down: `[slack] Server stopped.`, `[slack] Server killed.` or `server is not running` mean it is; `[slack] Warning: server did not die after SIGKILL.` means it is still running; `[slack] Could not read PID file: …` means the PID file could not be read, so the server's state is unknown. This happens whether or not the configuration could be loaded.
 
-A configuration that cannot be loaded, a bad record or a missing or pre-persona file included, is best-effort: it prints `[slack] stop --stop-bots: could not load config — skipping bot teardown:` with the cause, no persona is checked, the server is stopped, and the teardown is skipped.
+A configuration that cannot be loaded, a bad record or a missing or pre-persona file included, is best-effort: it prints `[slack] stop --stop-bots: could not load config — skipping bot teardown:` with the cause, and no persona is checked. The command still connects to agent-director, with the default call timeout. Once the connection succeeds, the server is stopped and the teardown is skipped. A failed connection stops nothing (see [Precheck before stopping bots](#precheck-before-stopping-bots)); on an agent-director below the client's own minimum only the server is stopped, as described above.
 
 ### `claude-slack-channel-bots clean_restart`
 
@@ -798,7 +798,7 @@ Behavior by case:
 - **Server fails to start again:** `clean_restart` exits non-zero with `[slack] clean_restart: start failed with exit code <n>`; the reason is in `server.log`.
 - **agent-director unreachable, or a persona's instance can't be read:** the precheck fails and nothing is stopped: the old server and every bot keep running, and `clean_restart` exits 1 (see [Precheck before stopping bots](#precheck-before-stopping-bots)).
 - **An agent-director older than CSCB needs:** `clean_restart` runs the same version checks as the server's start, so on an agent-director below CSCB's Phase 1 floor, or below the client's own minimum, its precheck fails at the connection and nothing is stopped. Follow the README section "Switching over to agent-director Phase 1". To stop the bots before the switch-over, use `stop --stop-bots`, which works on any agent-director the client accepts (see [`stop`](#claude-slack-channel-bots-stop)).
-- **agent-director fails during the teardown:** that persona can't be stopped, so the command exits 1. It starts the server once agent-director answers its check, and otherwise leaves the server stopped and records `clean-restart-not-restarted` (see [When `clean_restart` can't stop a bot](#when-clean_restart-cant-stop-a-bot)). The `no spawn row` message appears only when a persona genuinely has no spawn, never when the client failed to reach agent-director.
+- **agent-director fails during the teardown:** that persona can't be stopped, so the command exits 1. It starts the server if agent-director answers its check (3 tries, 2 s apart), and otherwise leaves the server stopped and records `clean-restart-not-restarted` (see [When `clean_restart` can't stop a bot](#when-clean_restart-cant-stop-a-bot)). The `no spawn row` message appears only when a persona genuinely has no spawn, never when the client failed to reach agent-director.
 
 #### When a bot can't be paused
 
@@ -832,7 +832,7 @@ The persona counts as stopped when:
 - agent-director finds no instance for the persona;
 - the read of the bot's instance before a further try finds it already ended, missing or gone. No further force-kill is made.
 
-When agent-director does not answer in time, answers that it could not end the worker, or answers with an error the agent-director client does not recognise, the force-kill is tried up to 3 times, 2 s apart. Before each further try the bot's instance is read; a read that fails, for any reason but the config file below, lets the try go ahead. If the last try still fails, the persona's teardown fails.
+When agent-director does not answer in time, answers that it could not end the worker or that tmux did not answer, or answers with an error the agent-director client does not recognise, the force-kill is tried up to 3 times, 2 s apart. Before each further try the bot's instance is read; a read that fails, for any reason but the config file below, lets the try go ahead. If the last try still fails, the persona's teardown fails.
 
 That persona's teardown fails at once, with no further force-kill, when:
 
@@ -866,7 +866,7 @@ The server may be holding a persona for a human (see [Troubleshooting](#troubles
 | `CONFIG` | agent-director refuses its config file, `~/.agent-director/config.toml` |
 | `GONE` | The force-kill answered that the bot's tmux session is already gone, so the command cannot confirm that the bot stopped |
 | `UNCLASSIFIED` | An internal error, an error about agent-director's store, or another answer CSCB doesn't recognise |
-| `STATE`, `DIRECTORY`, `LAUNCH_FAILURE` | Another agent-director answer that does not fit a force-kill |
+| `STATE`, `DIRECTORY`, `LAUNCH_FAILURE` | An answer to the force-kill, or to a read of the instance, that does not fit it |
 
 When the force-kill failed because agent-director could not end the worker, or failed in any way after agent-director reported a process that outlived an earlier try, the line is followed by the *Kill failed* notice's text, led by `persona "<name>" (key=<key>) (CLI teardown, <command>): ` and ending `The CLI does not retry this kill: once the worker is ended, run the command again.`
 
@@ -893,7 +893,7 @@ The server is stopped at that point, so the command writes `server.log` itself, 
 
 #### When `clean_restart` can't stop a bot
 
-A bot that can't be stopped never leaves the whole fleet down. Once every persona's line is printed, `clean_restart` checks that agent-director answers: it lists CSCB's instances, up to 3 tries, 2 s apart. Each failed try, whatever the error, writes `[slack] clean_restart: agent-director answer check: list try <n> of 3 failed: <CLASS>: <description>` to `clean_restart.log`.
+While agent-director answers, a bot that can't be stopped never leaves the whole fleet down. Once every persona's line is printed, `clean_restart` checks that agent-director answers: it lists CSCB's instances, up to 3 tries, 2 s apart. Each failed try, whatever the error, writes `[slack] clean_restart: agent-director answer check: list try <n> of 3 failed: <CLASS>: <description>` to `clean_restart.log`.
 
 - **agent-director answers:** the server is started, as at any start. The new server keeps each configured persona's own instance that is still running, one the command could not stop included, and brings up the others. A persona whose launch meets a tmux session conflict is held for a human (see "A persona posts a *Held: tmux session conflict* notice" in [Troubleshooting](#troubleshooting)). A start that fails prints `[slack] clean_restart: start failed with exit code <n>`, and records no `clean-restart-not-restarted` entry.
 - **agent-director doesn't answer:** the server is not started, so nothing starts on top of bots the command could not reach. The command prints one alert naming every persona it could not stop, with its session and class, appends it to `server.log` and records it as one `clean-restart-not-restarted` entry in `startup-errors.log`:
@@ -946,7 +946,7 @@ Every persona is checked, even after one fails. A conflicting-labels note on a p
 
 A failed precheck prints one line per persona it could not check, then a closing line, and exits 1:
 
-```
+```text
 clean_restart: precheck failed for persona "<name>" (key=<key>), session "slack_bot_<key>": <CLASS>: <description>
 clean_restart: nothing was stopped
 ```

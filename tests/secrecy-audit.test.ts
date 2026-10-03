@@ -780,12 +780,6 @@ const RAW_ERROR_ALLOWED: { file: string; anchor: string; reason: string }[] = [
   },
   {
     file: 'src/cli.ts',
-    anchor: 'clean_restart: agent-director initialization failed:',
-    reason:
-      "the startup gate's failure (StartupGateFailedError: CSCB's message naming versions, paths and the fix) in a short-lived CLI process that reads no credentials",
-  },
-  {
-    file: 'src/cli.ts',
     anchor: "'[slack] Fatal:'",
     reason: "the CLI entry point's last-resort catch-all for an unexpected throw from start, stop or clean_restart",
   },

@@ -1494,7 +1494,7 @@ describe('describeReportedAdFailure (b.jg5 SRJ-104)', () => {
     [
       'an errName getter that throws (its description is still reported)',
       () => Object.defineProperty(errSpawnNotFound(), 'errName', { get: () => { throw new Error('boom') } }),
-      () => `message=${JSON.stringify('spawn not found')}`,
+      (value) => `message=${JSON.stringify((value as { readonly errDescription: string }).errDescription)}`,
     ],
     [
       'an envelope whose err_description getter throws (its name is still reported)',

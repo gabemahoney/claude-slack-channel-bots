@@ -299,9 +299,26 @@ export interface KillFailureAlertRoute {
 }
 
 /**
+ * The route of a CLI teardown's alert: log-only and printed, always with its
+ * startup-errors class (SRJ-704, SRJ-1013).
+ */
+export interface KillFailureCliTeardownRoute extends KillFailureAlertRoute {
+  readonly route: typeof KILL_FAILURE_ROUTE_CLI_TEARDOWN
+  readonly destination: false
+  readonly classLabel: string
+  readonly printed: true
+}
+
+/**
  * SRJ-704's route for an alert, first match wins (see the module comment),
  * with SRJ-1013's class and SRJ-1007's closing sentence. Pure; never throws.
+ * The CLI teardown's context always takes its own route
+ * ({@link KillFailureCliTeardownRoute}).
  */
+export function selectKillFailureAlertRoute(
+  input: KillFailureAlertRouteInput & { readonly context: typeof KILL_FAILURE_CONTEXT_CLI_TEARDOWN },
+): KillFailureCliTeardownRoute
+export function selectKillFailureAlertRoute(input: KillFailureAlertRouteInput): KillFailureAlertRoute
 export function selectKillFailureAlertRoute(input: KillFailureAlertRouteInput): KillFailureAlertRoute {
   const { version, context } = input
   const survivor = version === KILL_FAILURE_VERSION_SURVIVOR

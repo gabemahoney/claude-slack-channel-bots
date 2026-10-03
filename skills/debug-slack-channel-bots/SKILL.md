@@ -253,8 +253,10 @@ ls -l "$STATE"/server.log*
   it is not quoted, not joined onto one line and gets no `…` mark. An error
   reading or parsing a credentials file is never quoted: its line states a
   fixed cause instead. The
-  `stop --stop-bots` line `agent-director initialization failed:` prints
-  the startup gate's own message in full, on the terminal only. The
+  `agent-director initialization failed:` line of `stop --stop-bots` and
+  `clean_restart` prints the startup gate's own message in full, and any
+  other failure in the redacted form above, on one line: on the terminal
+  (and in `clean_restart.log` for `clean_restart`). The
   `could not stop persona` lines of `stop --stop-bots` and `clean_restart`
   show agent-director's error name and description in the same redacted
   one-line form, and are also written to `server.log` and
@@ -3043,6 +3045,7 @@ force-kill of `stop --stop-bots` and `clean_restart`; `<outcome>` says how the t
 | `[slack] <site>: status read before kill try <n> for <id>: <answer> — the row is finished: the tries end as a success with no further kill (b.jg5 SRJ-702)` | Between tries, agent-director reported the instance finished (`state=ended`, `state=missing`) or gone (`no row (ErrSpawnNotFound)`): the kill counts as a success and the next step goes on. | Nothing. |
 | `[slack] <site>: status read before kill try <n> for <id>: the read latched the persona — no further kill (no call is made for a latched persona); the last try's outcome stands (b.jg5 SRJ-702)` | Reading the instance between tries put the persona on hold (its *Held:* notice follows), so nothing more is called for it. | See the *Held:* entry the persona's notice names. |
 | `[slack] <site>: status read before kill try <n> for <id>: failed: <failure> — the row was last read pending: no further kill while agent-director's config is unreadable; the last try's outcome stands (b.jg5 SRJ-702)` | Between tries agent-director refused its config file, and the instance was last read as still starting, so it is not killed while that lasts. | See **agent-director refuses its config file** above. |
+| `[slack] teardownBots: persona "<name>" (key=<key>): status read before kill try <n> for <id>: failed: <failure> — the row was last read <state>, and this caller ends the tries on any CONFIG read: no further kill while agent-director's config is unreadable; the last try's outcome stands (b.jg5 SRJ-702)` | `stop --stop-bots` or `clean_restart` only: between force-kill tries agent-director refused its config file, so no further force-kill is made, whatever the instance was last read as. The persona fails as CONFIG. | See **agent-director refuses its config file** above, then see [`stop --stop-bots` or `clean_restart` could not stop a persona](#stop---stop-bots-or-clean_restart-could-not-stop-a-persona). |
 | `[slack] <site>: status read before kill try <n> for <id>: failed: <failure> — the row was last read <state>: the try goes ahead (b.jg5 SRJ-702)` | Between tries agent-director refused its config file; the instance was last read running (`<state>`), so the next try is made. | See **agent-director refuses its config file** above. |
 | `[slack] <site>: status read before kill try <n> for <id>: <answer> — the try goes ahead (b.jg5 SRJ-702)` | Between tries the instance still read running (`state=<state>`), or the read failed for another reason (`failed: <failure>`); the next try is made. | Nothing: wait for the tries' outcome. |
 | `[slack] <site>: kill tries for <id> stop before try <n>: <why> — no further kill; the last try's outcome stands (b.jg5 SRJ-702)` | The tries stopped early. `<why>`: `the caller's keep-going check answered false` (the persona was put on hold, removed or is no longer up, or the server is stopping) or `the wait between tries failed` (an internal error). | For a hold, see the *Held:* entry; for a removal or a stopping server, nothing. `the wait between tries failed`: report it as a bug, with the persona's lines. |
@@ -3056,10 +3059,10 @@ same try, read and end lines with the prefix
 `stop --stop-bots` and in `clean_restart.log` for `clean_restart`, never in
 `server.log`. Only `class=UNAVAILABLE` is tried again; a GONE answer is not
 tried again and fails the persona. A read between tries latches nothing:
-one that fails lets the try go ahead, and a CONFIG answer ends the tries
-(`the row was last read pending: no further kill …`, or
-`kill tries for cscb_<key> stop before try <n>: the caller's keep-going check answered false`)
-and fails the persona as CONFIG. The `ended (<end>) … alert=<…>` line's
+one that fails lets the try go ahead, and a CONFIG answer ends the tries,
+whatever state was last read (`the row was last read pending: no further kill …`,
+or `the row was last read <state>, and this caller ends the tries on any CONFIG read: …`;
+then `ended (read-config)`), and fails the persona as CONFIG. The `ended (<end>) … alert=<…>` line's
 `alert=` value says which notice text the command prints for the persona
 (see
 [`stop --stop-bots` or `clean_restart` could not stop a persona](#stop---stop-bots-or-clean_restart-could-not-stop-a-persona)).
@@ -3232,7 +3235,7 @@ one is skipped. When the check fails, the command stops nothing and exits 1.
 - **Lines:** one line per persona it could not check, in configuration
   order, then the closing line:
 
-  ```
+  ```text
   <command>: precheck failed for persona "<name>" (key=<key>), session "slack_bot_<key>": <CLASS>: <description>
   <command>: nothing was stopped
   ```
@@ -3278,7 +3281,7 @@ order.
 
 - **Failure line:** one per persona it could not stop:
 
-  ```
+  ```text
   <command>: could not stop persona "<name>" (key=<key>), session "slack_bot_<key>": <CLASS>: <description>
   ```
 
@@ -3305,7 +3308,7 @@ order.
   every persona's lines (for `clean_restart`, after the restart's outcome,
   below):
 
-  ```
+  ```text
   <command>: could not stop <N> persona(s); rows are never deleted, so running the command again is safe
   ```
 - **Where:** every line is printed on the terminal (stderr) once;
@@ -3353,13 +3356,13 @@ read, the pause or the poll, which print nothing of their own. These lines
 are on the terminal for `stop --stop-bots`, in `clean_restart.log` for
 `clean_restart`.
 
-**`clean_restart`'s restart after a failed teardown.** A persona it could
-not stop never leaves every bot down. Once every persona's lines are out,
+**`clean_restart`'s restart after a failed teardown.** While agent-director
+answers, a persona it could not stop never leaves every bot down. Once every persona's lines are out,
 `clean_restart` checks that agent-director answers: one list of CSCB's
 instances, up to 3 tries, 2 s apart, any error a failed try. Each failed
 try writes one line to `clean_restart.log` only:
 
-```
+```text
 [slack] clean_restart: agent-director answer check: list try <n> of 3 failed: <CLASS>: <description>
 ```
 

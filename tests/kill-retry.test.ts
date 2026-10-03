@@ -148,6 +148,8 @@ interface RunSpec {
   readonly budget?: KillRetryPassBudget
   /** The checked kill's options for every try; absent, none (every server site). */
   readonly killOptions?: CheckedKillOptions
+  /** The retry's `configReadEndsTries`; absent, the server's rule. */
+  readonly configReadEndsTries?: boolean
 }
 
 /** What one scripted retry did. */
@@ -228,6 +230,7 @@ async function run(spec: RunSpec): Promise<Run> {
     lastRead: spec.lastRead ?? SEED_WAITING,
     ...(spec.keepGoing === undefined ? {} : { keepGoing: spec.keepGoing }),
     ...(spec.budget === undefined ? {} : { budget: spec.budget }),
+    ...(spec.configReadEndsTries === undefined ? {} : { configReadEndsTries: spec.configReadEndsTries }),
     log: (line) => {
       lines.push(line)
     },
@@ -462,11 +465,20 @@ describe('runKillRetry: one status read before each further try (b.jg5 SRJ-702, 
     expect(killRetryStopped(r.result)).toBe(false)
   })
 
-  test('a CONFIG read on a row last read waiting lets the next try go ahead', async () => {
-    const r = await run({ kills: failing(KILL_RETRY_TRIES, () => errTmuxUnresponsive('kill')), reads: [cannedErr(errConfigMalformed()), cannedErr(errConfigMalformed())], lastRead: SEED_WAITING })
+  test.each<[string, boolean | undefined]>([
+    ['absent (the server\'s rule)', undefined],
+    ['false', false],
+  ])('a CONFIG read on a row last read waiting, configReadEndsTries %s, lets the next try go ahead; the result keeps no read', async (_label, configReadEndsTries) => {
+    const r = await run({
+      kills: failing(KILL_RETRY_TRIES, () => errTmuxUnresponsive('kill')),
+      reads: [cannedErr(errConfigMalformed()), cannedErr(errConfigMalformed())],
+      lastRead: SEED_WAITING,
+      ...(configReadEndsTries === undefined ? {} : { configReadEndsTries }),
+    })
 
     expect(r.calls).toEqual(['kill', 'status', 'kill', 'status', 'kill'])
     expect(r.result.end).toBe(KILL_RETRY_END_EXHAUSTED)
+    expect('configRead' in r.result).toBe(false)
   })
 
   // The state last read is the seed, then each live read: a later CONFIG
@@ -479,6 +491,62 @@ describe('runKillRetry: one status read before each further try (b.jg5 SRJ-702, 
 
     expect(r.calls).toEqual(calls)
     expect(r.result.end).toBe(end)
+  })
+
+  // The CLI's teardown (configReadEndsTries): any CONFIG read ends the tries, whatever state was last read, and
+  // the result keeps the read's error for the caller to describe.
+  test.each<[string, KillRetrySeed, string]>([
+    ['waiting', SEED_WAITING, 'the row was last read waiting, and this caller ends the tries on any CONFIG read: no further kill'],
+    ['pending', SEED_PENDING, 'the row was last read pending: no further kill'],
+  ])('configReadEndsTries: a CONFIG read on a row last read %s ends the tries (read-config) with no further kill, the last try\'s outcome standing and the read\'s error kept; its read line says why, then the end line, and no stop line', async (_label, lastRead, why) => {
+    const [last, configError] = [errTmuxUnresponsive('kill'), errConfigMalformed()]
+
+    const r = await run({
+      kills: [cannedErr(last), ...failing(KILL_RETRY_TRIES, () => errTmuxUnresponsive('kill'))],
+      reads: [cannedErr(configError)],
+      lastRead,
+      configReadEndsTries: true,
+    })
+
+    expect(r.calls).toEqual(['kill', 'status'])
+    expect(r.delays).toEqual([KILL_RETRY_SPACING_MS])
+    expect(r.result).toEqual({
+      outcome: notKilled(last), end: KILL_RETRY_END_READ_CONFIG, tries: 1, reads: 1, alert: { kind: KILL_RETRY_ALERT_NONE }, configRead: { error: configError },
+    })
+    expect(r.result.configRead!.error).toBe(configError)
+    expect(killRetryStopped(r.result)).toBe(false)
+    const [, readLine, ...rest] = r.lines
+    expect(readLine).toContain(`status read before kill try 2 for ${STUB_INSTANCE_ID}: `)
+    expect(readLine).toContain(`class=${AD_ERROR_CLASS_CONFIG}`)
+    expect(readLine).toContain(why)
+    expect(rest).toEqual([killRetryEndLine(PREFIX, STUB_INSTANCE_ID, r.result)])
+    expect(r.lines.filter((l) => l.includes('stop before try'))).toEqual([])
+  })
+
+  test('configReadEndsTries: after a live read, a CONFIG read at the next read ends the tries after 2 kills and 2 reads, the 2nd try\'s outcome standing', async () => {
+    const [second, configError] = [errCallTimeout('kill'), errConfigMalformed()]
+
+    const r = await run({
+      kills: [cannedErr(errTmuxUnresponsive('kill')), cannedErr(second), ...failing(1, () => errTmuxUnresponsive('kill'))],
+      reads: [readState('waiting'), cannedErr(configError)],
+      configReadEndsTries: true,
+    })
+
+    expect(r.calls).toEqual(['kill', 'status', 'kill', 'status'])
+    expect(r.result).toEqual({
+      outcome: notKilled(second), end: KILL_RETRY_END_READ_CONFIG, tries: 2, reads: 2, alert: { kind: KILL_RETRY_ALERT_NONE }, configRead: { error: configError },
+    })
+  })
+
+  test.each<[string, Error]>([
+    ['UNAVAILABLE (ErrCallTimeout)', errCallTimeout('status')],
+    ['UNUSABLE NAME', errUnusableName()],
+  ])('configReadEndsTries: a failed read that is no CONFIG (%s) still lets the next try go ahead; the result keeps no read', async (_label, readErr) => {
+    const r = await run({ kills: failing(KILL_RETRY_TRIES, () => errTmuxUnresponsive('kill')), reads: [cannedErr(readErr), cannedErr(readErr)], configReadEndsTries: true })
+
+    expect(r.calls).toEqual(['kill', 'status', 'kill', 'status', 'kill'])
+    expect(r.result.end).toBe(KILL_RETRY_END_EXHAUSTED)
+    expect('configRead' in r.result).toBe(false)
   })
 
   test('a read that latched the persona ends the tries with no further kill; the last try\'s outcome stands and the tries count as stopped', async () => {

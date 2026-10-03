@@ -157,7 +157,12 @@ import {
   TEARDOWN_STOPPED_EXITED,
   TEARDOWN_STOPPED_NO_ROW,
   TEARDOWN_KILL_OPTIONS,
+  TEARDOWN_KILL_RETRY_OPTIONS,
+  agentDirectorInitFailedLine,
+  answerCheckFailedTryLine,
   cleanRestartNotRestartedAlert,
+  cleanRestartStartFailedLine,
+  cleanRestartStartingAfterFailedTeardownLine,
   exitTimeoutMsOf,
   onlyServerStoppedLine,
   pauseVerdictAfterLastTry,
@@ -170,7 +175,6 @@ import {
   teardownErrorReportOf,
   teardownFailed,
   teardownKillOutcomeOf,
-  teardownKillReadIsConfig,
   teardownKillReadOf,
   teardownNotStoppedLine,
   teardownRejectedOutcomeOf,
@@ -801,22 +805,24 @@ export function createCli(deps: CliDeps): CliHandlers {
    *     KILL_RETRY_SPACING_MS apart on the CLI's injected clock
    *     (`deps.sleep`), with one `status` read (`deps.directorStatus`,
    *     `teardownKillReadOf`) before each further try;
-   *   - a CONFIG answer at that read (`teardownKillReadIsConfig`) ends the
-   *     tries with no further kill, whatever state was last read: the retry
-   *     itself ends them on a row last read `pending`, and the keep-going
-   *     check, asked after each wait and again after each read, on any other;
+   *   - a CONFIG answer at that read ends the tries (`read-config`) with no
+   *     further kill, whatever state was last read, under
+   *     `TEARDOWN_KILL_RETRY_OPTIONS`; the result keeps the read's error,
+   *     which fails the persona with class CONFIG;
    *   - an UNUSABLE NAME answer at that read, or a `pending` row with no
    *     launch start, lets the try go ahead: nothing latches in the CLI, which
    *     imports no latch and writes no retired-key record (b.jg5 SRJ-115,
    *     SRJ-801, SRJ-1002);
-   *   - each try, read and end goes to stderr with the teardown's prefix.
+   *   - each try, read and end line goes through `console.error` with the
+   *     teardown's prefix: stderr for `stop --stop-bots`, `clean_restart.log`
+   *     for `clean_restart`, which has redirected it.
    * Raises no outage, arms no retry timer and starts no condition: the CLI
    * has none. Never throws for an agent-director answer.
    */
   async function teardownKill(id: string, ref: string, lastState: string): Promise<PersonaTeardownOutcome> {
-    let configRead: { readonly value: unknown } | undefined
     const kill = (params: PlainKillParams): Promise<unknown> => deps.directorKill(params.claude_instance_id)
     const result = await runKillRetry({
+      ...TEARDOWN_KILL_RETRY_OPTIONS,
       instanceId: id,
       kill: () => checkedKill(id, kill, TEARDOWN_KILL_OPTIONS),
       read: async (): Promise<KillRetryRead> => {
@@ -826,17 +832,14 @@ export function createCli(deps: CliDeps): CliHandlers {
         } catch (error) {
           answer = { error }
         }
-        const read = teardownKillReadOf(answer)
-        if (teardownKillReadIsConfig(read)) configRead = { value: read.error }
-        return read
+        return teardownKillReadOf(answer)
       },
       wait: deps.sleep,
       lastRead: killRetrySeedOfState(lastState),
-      keepGoing: () => configRead === undefined,
       log: (line) => console.error(line),
       logPrefix: `[slack] teardownBots: persona ${ref}`,
     })
-    return teardownKillOutcomeOf({ result, ...(configRead === undefined ? {} : { configRead }) })
+    return teardownKillOutcomeOf(result)
   }
 
   /**
@@ -899,11 +902,13 @@ export function createCli(deps: CliDeps): CliHandlers {
    * true when one `list` of `service=cscb` rows (`deps.directorList`)
    * succeeds within PRECHECK_TRIES calls, PRECHECK_TRY_SPACING_MS apart on
    * the injected clock (`callWithCliTries`). Any error is a failed try,
-   * CONFIG included, and goes to stderr in one line with its class and
-   * redacted description (`teardownErrorReportOf`). Latches, records and
-   * writes nothing else; never throws for an agent-director answer.
+   * CONFIG included, and is written in one line with its class and redacted
+   * description (`answerCheckFailedTryLine`) through `console.error`, which
+   * `clean_restart` has redirected, so the line reaches only
+   * `clean_restart.log`. Latches, records and writes nothing else; never
+   * throws for an agent-director answer.
    */
-  async function agentDirectorAnswers(command: CliTeardownCommand): Promise<boolean> {
+  async function agentDirectorAnswers(): Promise<boolean> {
     let tries = 0
     return callWithCliTries(
       async (): Promise<boolean> => {
@@ -912,11 +917,8 @@ export function createCli(deps: CliDeps): CliHandlers {
           await deps.directorList()
           return true
         } catch (error) {
-          const report = teardownErrorReportOf(error)
-          console.error(
-            `[slack] ${command}: agent-director answer check: list try ${tries} of ${PRECHECK_TRIES} failed: ` +
-              `${report.errorClass}: ${report.description}`,
-          )
+          const { errorClass, description } = teardownErrorReportOf(error)
+          console.error(answerCheckFailedTryLine(tries, { errorClass, description }))
           return false
         }
       },
@@ -1175,7 +1177,7 @@ export function createCli(deps: CliDeps): CliHandlers {
       try {
         await deps.initClient(agentDirectorCallTimeoutMsOf(config), { skipPhase1Floor: true })
       } catch (err) {
-        console.error(`[slack] stop --stop-bots: agent-director initialization failed: ${describeCliFailure(err)}`)
+        console.error(agentDirectorInitFailedLine(CLI_COMMAND_STOP_BOTS, describeCliFailure(err)))
         if (isClientTooOldRefusal(err)) {
           // b.jg5 SRJ-902: no agent-director call can be made, so the server
           // alone is stopped, with no precheck and no teardown; every worker
@@ -1308,7 +1310,7 @@ export function createCli(deps: CliDeps): CliHandlers {
       console.error('[slack] clean_restart: starting server')
       const startResult = deps.spawnSync(process.execPath, [process.argv[1], 'start'])
       if (startResult.status !== 0) {
-        fatal(`[slack] clean_restart: start failed with exit code ${startResult.status}`)
+        fatal(cleanRestartStartFailedLine(startResult.status))
       }
       return startResult.status
     }
@@ -1336,7 +1338,7 @@ export function createCli(deps: CliDeps): CliHandlers {
       try {
         await deps.initClient(agentDirectorCallTimeoutMsOf(config!))
       } catch (err) {
-        fatal('[slack] clean_restart: agent-director initialization failed:', err)
+        fatal(agentDirectorInitFailedLine(CLI_COMMAND_CLEAN_RESTART, describeCliFailure(err)))
         fatal(precheckNothingStoppedLine(CLI_COMMAND_CLEAN_RESTART))
         deps.exit(1)
       }
@@ -1386,8 +1388,8 @@ export function createCli(deps: CliDeps): CliHandlers {
     // start-failed line and records no not-restarted entry. Either way the
     // last line follows the restart's outcome and the exit is 1. Rows are
     // never deleted.
-    if (await agentDirectorAnswers(CLI_COMMAND_CLEAN_RESTART)) {
-      console.error('[slack] clean_restart: agent-director answers — starting server after the failed teardown')
+    if (await agentDirectorAnswers()) {
+      console.error(cleanRestartStartingAfterFailedTeardownLine())
       spawnStart()
       fatal(teardownNotStoppedLine(CLI_COMMAND_CLEAN_RESTART, failed))
       deps.exit(1)
