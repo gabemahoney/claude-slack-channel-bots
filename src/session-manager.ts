@@ -751,7 +751,7 @@ import {
   pendingLaunchStartOf,
   type LivenessReading,
 } from './liveness-reading.ts'
-import { parseLaunchStart } from './pending-row.ts'
+import { PENDING_ROW_WAIT_NOT_ARMED, armPendingRowWait, isPendingRowAged, parseLaunchStart } from './pending-row.ts'
 import { isDryRun } from './tokens.ts'
 import {
   DIALOG_READY_TIMEOUT_MS,
@@ -759,6 +759,7 @@ import {
   adLaunchBoundMsInEffect,
   armNeverEarlyWait,
   type NeverEarlyWaitClock,
+  type NeverEarlyWaitLength,
 } from './ad-settings.ts'
 // Import cycle with jsonl-persistence-check.ts: use these imports only inside functions, never at module top level.
 import {
@@ -3621,20 +3622,22 @@ export function _resetDialogReadyTimeoutMs(): void {
  * The time to wait from one lap's pane read (or, for a lap that read no
  * pane, its start) to the next lap's start (b.jg5 SRJ-403, SRJ-404):
  * `DIALOG_SLOW_POLL_INTERVAL_MS` after a lap that backed off (an
- * UNAVAILABLE or CONFIG answer), or once `graceMs` (G in effect) has passed
- * at `nowMs` since `launchStartMs`, the launch start the lap's `status` read
- * carried, by a plain comparison; otherwise `DIALOG_POLL_INTERVAL_MS`. A lap
- * with no launch start, and a G of `AD_WAIT_NEVER_ENDS`, keep the 1 s pace.
- * Pure.
+ * UNAVAILABLE or CONFIG answer), or once `graceMs` (G: the accessor itself,
+ * read at this call) has passed at `nowMs` since the launch start
+ * `launchStartedAt` names, the raw launch start the lap's `status` read
+ * carried (`isPendingRowAged`, `src/pending-row.ts`; b.jg5 SRJ-406, never
+ * `started_at`); otherwise `DIALOG_POLL_INTERVAL_MS`. A lap with no launch
+ * start (never aged, SRJ-408), and a G of `AD_WAIT_NEVER_ENDS`, keep the 1 s
+ * pace. Pure.
  */
 export function approverPaceMs(
   backOff: boolean,
-  launchStartMs: number | undefined,
+  launchStartedAt: unknown,
   nowMs: number,
-  graceMs: number,
+  graceMs: NeverEarlyWaitLength,
 ): number {
   if (backOff) return DIALOG_SLOW_POLL_INTERVAL_MS
-  if (launchStartMs !== undefined && nowMs - launchStartMs >= graceMs) return DIALOG_SLOW_POLL_INTERVAL_MS
+  if (isPendingRowAged(launchStartedAt, graceMs, nowMs)) return DIALOG_SLOW_POLL_INTERVAL_MS
   return DIALOG_POLL_INTERVAL_MS
 }
 
@@ -3961,16 +3964,15 @@ export function approverFailedMessage(ref: string, failure: string): string {
 const PRE_SESSION_DIALOG_NEEDLES = [TRUST_DIALOG_NEEDLE, DEV_CHANNELS_DIALOG_NEEDLE]
 
 /**
- * One armed time limit of an approver (B, or the cap): its reason, the start
- * it is measured from, the wait (B's accessor itself, so a value raised while
- * armed never ends it early), where B was measured from, and the cancel of
- * its never-early timer.
+ * One armed time limit of an approver (B, or the cap): its reason, where B
+ * was measured from, the plain check of whether it has passed at a given now
+ * (against the wait in effect then: B's accessor itself, so a value raised
+ * while armed never ends it early), and the cancel of its never-early timer.
  */
 interface ApproverLimit {
   readonly reason: ApproverLimitReason
-  readonly fromMs: number
-  readonly waitMs: () => number
   readonly measuredFrom: ApproverBoundFrom
+  readonly passed: (nowMs: number) => boolean
   readonly cancel: () => void
 }
 
@@ -4018,10 +4020,12 @@ interface ApproverContext {
 }
 
 /**
- * Arm `run`'s time limit (`reason`, measured from `fromMs` with `waitMs`)
- * with `armNeverEarlyWait` on `clock`, replacing (and cancelling) any limit
- * armed before. The timer marks the limit reached and wakes any sleep.
- * `fromMs` is always a finite time here.
+ * Arm `run`'s time limit (`reason`) from the approver's own start `fromMs`
+ * (a time on `clock`, never a row's launch start) with `waitMs`, through
+ * `armNeverEarlyWait` on `clock`, replacing (and cancelling) any limit armed
+ * before. The timer marks the limit reached and wakes any sleep. The limit's
+ * check compares the time since `fromMs` with the wait in effect (a wait
+ * that cannot be read is not reached).
  */
 function armApproverLimit(
   clock: ApproverClock,
@@ -4029,11 +4033,38 @@ function armApproverLimit(
   reason: ApproverLimitReason,
   fromMs: number,
   waitMs: () => number,
-  measuredFrom: ApproverBoundFrom,
 ): void {
   run.limit?.cancel()
   const cancel = armNeverEarlyWait(clock, fromMs, waitMs, () => markApproverLimit(run, reason))
-  run.limit = { reason, fromMs, waitMs, measuredFrom, cancel }
+  const passed = (nowMs: number): boolean => {
+    let currentWaitMs: number
+    try {
+      currentWaitMs = waitMs()
+    } catch {
+      return false
+    }
+    return nowMs - fromMs >= currentWaitMs
+  }
+  run.limit = { reason, measuredFrom: APPROVER_BOUND_FROM_APPROVER_START, passed, cancel }
+}
+
+/**
+ * Re-arm `run`'s B from the launch start `launchStartedAt` names (raw, as
+ * the lap's `status` read carried it), through `armPendingRowWait`
+ * (`src/pending-row.ts`) with `adLaunchBoundMsInEffect` itself, replacing
+ * (and cancelling) the limit armed before; its check is `isPendingRowAged`
+ * against B in effect (b.jg5 SRJ-406: measured from the launch start, never
+ * `started_at`). A launch start that is absent or does not parse arms
+ * nothing and keeps the limit armed before (SRJ-408: never aged).
+ */
+function armApproverBoundFromLaunchStart(clock: ApproverClock, run: ApproverRun, launchStartedAt: unknown): void {
+  const armed = armPendingRowWait(clock, launchStartedAt, adLaunchBoundMsInEffect, () =>
+    markApproverLimit(run, APPROVER_STOP_BOUND),
+  )
+  if (armed === PENDING_ROW_WAIT_NOT_ARMED) return
+  run.limit?.cancel()
+  const passed = (nowMs: number): boolean => isPendingRowAged(launchStartedAt, adLaunchBoundMsInEffect, nowMs)
+  run.limit = { reason: APPROVER_STOP_BOUND, measuredFrom: APPROVER_BOUND_FROM_LAUNCH_START, passed, cancel: armed.cancel }
 }
 
 /** Mark `run`'s limit reached (the first mark is kept) and wake its sleep. */
@@ -4053,14 +4084,8 @@ function approverStopMark(ctx: ApproverContext): ApproverStopReason | undefined 
   const { run } = ctx
   if (run.stopRequested !== undefined) return run.stopRequested
   const limit = run.limit
-  if (run.limitReached === undefined && limit !== undefined) {
-    let waitMs: number
-    try {
-      waitMs = limit.waitMs()
-    } catch {
-      waitMs = Number.NaN
-    }
-    if (ctx.clock.now() - limit.fromMs >= waitMs) markApproverLimit(run, limit.reason)
+  if (run.limitReached === undefined && limit !== undefined && limit.passed(ctx.clock.now())) {
+    markApproverLimit(run, limit.reason)
   }
   return run.limitReached
 }
@@ -4155,8 +4180,10 @@ function approverStopOrLatched(ctx: ApproverContext): ApproverStopReason | undef
  *
  * B (b.jg5 SRJ-210, SRJ-404): armed never-early (`armNeverEarlyWait` with
  * `adLaunchBoundMsInEffect` itself) from the approver's own start until a
- * lap keeps a launch start, then re-armed from that launch start; also
- * checked by a plain comparison before each call. While the test cap
+ * lap keeps a launch start, then re-armed from that launch start through
+ * `armPendingRowWait` (`src/pending-row.ts`; SRJ-406: never from
+ * `started_at`); also checked by a plain comparison before each call
+ * (`isPendingRowAged` once measured from the launch start). While the test cap
  * (`_setDialogReadyTimeoutMs`) is set, the cap is armed from the approver's
  * own start in place of B. All of it runs on the approver's clock
  * (`_setApproverClock`). At B or the cap it logs one line and, for a
@@ -4198,10 +4225,10 @@ async function runApproverLoop(key: string, isStartup: boolean, ref: string, run
   }
   const startMs = clock.now()
   if (capMs !== undefined) {
-    armApproverLimit(clock, run, APPROVER_STOP_CAP, startMs, () => capMs, APPROVER_BOUND_FROM_APPROVER_START)
+    armApproverLimit(clock, run, APPROVER_STOP_CAP, startMs, () => capMs)
   } else {
     // b.jg5 E17 ruling: before any launch start is read, B runs from the approver's own start.
-    armApproverLimit(clock, run, APPROVER_STOP_BOUND, startMs, adLaunchBoundMsInEffect, APPROVER_BOUND_FROM_APPROVER_START)
+    armApproverLimit(clock, run, APPROVER_STOP_BOUND, startMs, adLaunchBoundMsInEffect)
   }
   let reason: ApproverStopReason
   try {
@@ -4217,7 +4244,7 @@ async function runApproverLoop(key: string, isStartup: boolean, ref: string, run
         reason = mark
         break
       }
-      const paceMs = approverPaceMs(lap.backOff, lap.launchStartMs, clock.now(), adGraceMsInEffect())
+      const paceMs = approverPaceMs(lap.backOff, lap.launchStartedAt, clock.now(), adGraceMsInEffect)
       // b.jg5 SRJ-403: the pace runs from the lap's pane read, so the next
       // read (after the next lap's `status` read) is never closer than it.
       const paceFromMs = lap.paneReadAtMs ?? lapStartMs
@@ -4274,26 +4301,28 @@ function approverLimitReached(ctx: ApproverContext, reason: ApproverLimitReason,
  * and re-arm B from it (b.jg5 E17 ruling: B runs from the approver's own
  * start only until a lap reads a launch start). The approver's start is
  * never earlier than the launch start, so the bound armed first was never
- * early. With the test cap set nothing is re-armed. `launchStartMs` is a
- * finite time (`parseLaunchStart`); a value that is not is never armed.
+ * early. With the test cap set nothing is re-armed. `launchStartedAt` is
+ * the raw launch start the lap read and `launchStartMs` its instant
+ * (`parseLaunchStart`); B is re-armed from the raw value through
+ * `armApproverBoundFromLaunchStart`, which arms nothing for one that does
+ * not parse.
  */
-function keepApproverLaunchStart(ctx: ApproverContext, launchStartMs: number): void {
+function keepApproverLaunchStart(ctx: ApproverContext, launchStartedAt: unknown, launchStartMs: number): void {
   const { run } = ctx
   run.launchStartMs = launchStartMs
-  if (!Number.isFinite(launchStartMs)) return
   if (run.limit === undefined || run.limit.reason !== APPROVER_STOP_BOUND) return
-  armApproverLimit(ctx.clock, run, APPROVER_STOP_BOUND, launchStartMs, adLaunchBoundMsInEffect, APPROVER_BOUND_FROM_LAUNCH_START)
+  armApproverBoundFromLaunchStart(ctx.clock, run, launchStartedAt)
 }
 
 /**
- * How a lap that stops nothing ended: whether it backed off, the launch
- * start its `status` read carried, and when (on the approver's clock) it
- * made its `read-pane` call, `undefined` when it made none (b.jg5 SRJ-403:
- * the pace runs from it).
+ * How a lap that stops nothing ended: whether it backed off, the raw launch
+ * start its `status` read carried (`undefined` when it read none), and when
+ * (on the approver's clock) it made its `read-pane` call, `undefined` when
+ * it made none (b.jg5 SRJ-403: the pace runs from it).
  */
 interface ApproverLapGoesOn {
   readonly backOff: boolean
-  readonly launchStartMs: number | undefined
+  readonly launchStartedAt: unknown
   readonly paneReadAtMs: number | undefined
 }
 
@@ -4326,7 +4355,7 @@ async function approverLap(ctx: ApproverContext): Promise<ApproverStopReason | A
   if (read.kind === OWN_ROW_STATUS_REFUSED) {
     // A failed read keeps no launch start (b.jg5 SRJ-401; hatch A2).
     const answer = approverAnswerTo(ctx, 'status', read.error)
-    return 'stop' in answer ? answer.stop : { backOff: answer.backOff, launchStartMs: undefined, paneReadAtMs: undefined }
+    return 'stop' in answer ? answer.stop : { backOff: answer.backOff, launchStartedAt: undefined, paneReadAtMs: undefined }
   }
 
   const state = read.state
@@ -4339,9 +4368,10 @@ async function approverLap(ctx: ApproverContext): Promise<ApproverStopReason | A
   if (state !== AGENT_DIRECTOR_PENDING_STATE) {
     if (AGENT_DIRECTOR_LIVE_STATES.has(state)) return APPROVER_STOP_LIVE
     console.error(approverLogLine(approverUnknownStateMessage(ref, state)))
-    return { backOff: false, launchStartMs: undefined, paneReadAtMs: undefined }
+    return { backOff: false, launchStartedAt: undefined, paneReadAtMs: undefined }
   }
-  const launchStartMs = parseLaunchStart(read.launchStartedAt)
+  const launchStartedAt = read.launchStartedAt
+  const launchStartMs = parseLaunchStart(launchStartedAt)
   if (launchStartMs === undefined) {
     // `pending` with no launch start, or one that does not parse (as `isPendingWithNoLaunchStart` reads it).
     console.error(approverLogLine(approverNoLaunchStartMessage(ref)))
@@ -4350,7 +4380,7 @@ async function approverLap(ctx: ApproverContext): Promise<ApproverStopReason | A
   // b.jg5 SRJ-401 (hatch A2): the first lap that reads a launch start keeps
   // it; a later one that reads another belongs to a newer launch.
   if (run.launchStartMs === undefined) {
-    keepApproverLaunchStart(ctx, launchStartMs)
+    keepApproverLaunchStart(ctx, launchStartedAt, launchStartMs)
   } else if (run.launchStartMs !== launchStartMs) {
     console.error(approverLogLine(approverLaunchStartChangedMessage(ref)))
     return APPROVER_STOP_SUPERSEDED
@@ -4360,7 +4390,7 @@ async function approverLap(ctx: ApproverContext): Promise<ApproverStopReason | A
 
   const claude_instance_id = personaInstanceId(key)
   // b.jg5 SRJ-403: the next lap is paced from this pane read.
-  const goesOn: ApproverLapGoesOn = { backOff: false, launchStartMs, paneReadAtMs: ctx.clock.now() }
+  const goesOn: ApproverLapGoesOn = { backOff: false, launchStartedAt, paneReadAtMs: ctx.clock.now() }
   let pane: string
   try {
     const result = await withOutageDetection(key, undefined, 'read-pane', (client) =>

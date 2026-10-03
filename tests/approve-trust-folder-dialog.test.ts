@@ -20,8 +20,10 @@
  *
  * The pace (b.jg5 SRJ-403, AC 80): pane reads are `DIALOG_POLL_INTERVAL_MS`
  * apart until G past the launch start and `DIALOG_SLOW_POLL_INTERVAL_MS`
- * apart from G on, at the default G and at a G of 120 s, on a resumed row
- * whose `started_at` is older (never read); an approver that starts more
+ * apart from G on, for both launch-start forms (fractional and whole), at
+ * the default G and at a G of 120 s, on a resumed row whose `started_at` is
+ * older (never read), the switch coming at G from the launch start
+ * (b.jg5 SRJ-406); an approver that starts more
  * than G after the launch start keeps the slow pace from its first lap; a G
  * beyond the timer maximum keeps the fast pace and throws nothing. The pace
  * runs from the previous lap's `read-pane` call: with the stub's `status`
@@ -883,30 +885,37 @@ describe('approvePreSessionDialogs: the pace, from the launch start (b.jg5 SRJ-4
     ['starting at the launch start', () => 0],
     ['starting more than G after the launch start', (graceMs) => graceMs + FAST],
   ]
-  const ROWS = GRACE_SETTINGS.flatMap(([grace, tables]) =>
-    APPROVER_STARTS.map(([where, offset]) => [grace, where, tables, offset] as const),
+  /** Both launch-start forms the row may show: [form, the raw value]. */
+  const FORMS = (['fractional', 'whole'] as const).map((form) => [form, SAMPLE_LAUNCH_STARTS[form]!] as const)
+  const ROWS = FORMS.flatMap(([form, raw]) =>
+    GRACE_SETTINGS.flatMap(([grace, tables]) =>
+      APPROVER_STARTS.map(([where, offset]) => [form, grace, where, raw, tables, offset] as const),
+    ),
   )
 
   test.each(ROWS)(
-    '%s, the approver %s, on a resumed row whose started_at is older than B: pane reads are the fast pace apart until G from launch_started_at and the slow pace apart from G on, until B',
-    async (_grace, _where, tables, offset) => {
+    'launch start %s, %s, the approver %s, on a resumed row whose started_at is older than B: pane reads are the fast pace apart until G from launch_started_at and the slow pace apart from G on, until B',
+    async (_form, _grace, _where, raw, tables, offset) => {
       installSettings(tables)
       const graceMs = adGraceMsInEffect()
       const boundMs = adLaunchBoundMsInEffect()
       if (tables !== undefined) expect(graceMs).toBe(2 * adGraceMs(DEFAULT_AD_SETTINGS_IN_EFFECT))
-      const startMs = LAUNCH_START_MS + offset(graceMs)
+      const launchStartMs = parseLaunchStart(raw)!
+      const startMs = launchStartMs + offset(graceMs)
       startClockAt(startMs)
-      installStub([resumedRow(isoAt(LAUNCH_START_MS), LAUNCH_START_MS - boundMs - graceMs)], { readPaneResults: [CLEAR_PANE] })
+      installStub([resumedRow(raw, launchStartMs - boundMs - graceMs)], { readPaneResults: [CLEAR_PANE] })
 
       expect(await runToStop(startApprover(PLAIN, false), MANY_TIMERS)).toBe(APPROVER_STOP_BOUND)
 
-      expect(readPaneAt).toEqual(paceLapTimes(startMs, LAUNCH_START_MS, graceMs, LAUNCH_START_MS + boundMs))
+      expect(readPaneAt).toEqual(paceLapTimes(startMs, launchStartMs, graceMs, launchStartMs + boundMs))
       const gaps = gapsOf(readPaneAt)
       expect(gaps.every((gap) => gap >= FAST)).toBe(true)
-      expect(gapsOf(readPaneAt.filter((t) => t - LAUNCH_START_MS >= graceMs)).every((gap) => gap >= SLOW)).toBe(true)
+      expect(gapsOf(readPaneAt.filter((t) => t - launchStartMs >= graceMs)).every((gap) => gap >= SLOW)).toBe(true)
       // From the launch start: G's worth of fast laps; none for an approver that starts past G.
       expect(gaps.filter((gap) => gap < SLOW)).toHaveLength(offset(graceMs) === 0 ? graceMs / FAST : 0)
-      expect(clock.now()).toBe(LAUNCH_START_MS + boundMs)
+      // The switch to the slow pace comes at G from the launch start, never from started_at.
+      if (offset(graceMs) === 0) expect(readPaneAt.find((t, i) => readPaneAt[i + 1]! - t === SLOW)).toBe(launchStartMs + graceMs)
+      expect(clock.now()).toBe(launchStartMs + boundMs)
       expect(approverLines()).toEqual([
         approverLogLine(approverBoundMessage(PLAIN.ref, boundMs, APPROVER_BOUND_FROM_LAUNCH_START)),
       ])

@@ -10,7 +10,8 @@
  *      kill-failure alert decision is raised (SRJ-702, SRJ-704). A starter
  *      that made the first kill itself enters at step 2.
  *   2. one `get`: a `pending` row is waited on until G past its launch start
- *      (`armNeverEarlyWait` with the G accessor itself; SRJ-406, SRJ-210). A
+ *      (`armPendingRowWait`, `src/pending-row.ts`, with the G accessor
+ *      itself; never from `started_at`; SRJ-406, SRJ-210). A
  *      row with no launch start has no wait; a configured persona's own such
  *      row has latched P through the shared read, which stops the sequence
  *      (SRJ-513). A row read `ended`, `missing` or absent here still goes on
@@ -158,7 +159,7 @@ import {
   describeAdErrorClassification,
   describeAgentDirectorFailure,
 } from './ad-error-class.ts'
-import { AD_WAIT_NEVER_ENDS, armNeverEarlyWait, type NeverEarlyWaitClock } from './ad-settings.ts'
+import { AD_WAIT_NEVER_ENDS, type NeverEarlyWaitClock } from './ad-settings.ts'
 import {
   KILL_OUTCOME_NOT_KILLED,
   describeKillOutcome,
@@ -178,7 +179,7 @@ import {
 } from './kill-retry.ts'
 import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_PENDING_STATE } from './liveness-reading.ts'
 import { describeThrownValue, isSafeIdentifier, renderLogMessageText } from './persona-connection-errors.ts'
-import { parseLaunchStart } from './pending-row.ts'
+import { PENDING_ROW_WAIT_NOT_ARMED, armPendingRowWait, parseLaunchStart, type PendingRowWaitArm } from './pending-row.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1154,8 +1155,13 @@ export async function runLiveRowSequence(
     })
   }
 
-  /** Wait until G past `launchStartMs` (never early, with G read at every fire); ends early (false) once stopped. */
-  const waitForGrace = (launchStartMs: number): Promise<boolean> => {
+  /**
+   * Wait until G past the launch start `launchStartedAt` names (raw), through
+   * `armPendingRowWait` (`src/pending-row.ts`: never early, with the G
+   * accessor read at every fire; SRJ-406, never from `started_at`); ends
+   * early (false) once stopped.
+   */
+  const waitForGrace = (launchStartedAt: unknown): Promise<boolean> => {
     if (stop.reason !== undefined) return Promise.resolve(false)
     return new Promise<boolean>((resolve) => {
       let done = false
@@ -1168,13 +1174,20 @@ export async function runLiveRowSequence(
         cancel()
         resolve(elapsed)
       }
+      let armed: PendingRowWaitArm
       try {
-        cancel = armNeverEarlyWait(deps.clock, launchStartMs, deps.graceMs, () => settle(true))
+        armed = armPendingRowWait(deps.clock, launchStartedAt, deps.graceMs, () => settle(true))
       } catch {
-        // Not reached: the launch start is finite and G a number; no wait then.
+        // Not reached: G is a number while arming; no wait then.
         settle(true)
         return
       }
+      if (armed === PENDING_ROW_WAIT_NOT_ARMED) {
+        // Not reached: step 2 read a launch start; a row with none has no wait (SRJ-408).
+        settle(true)
+        return
+      }
+      cancel = armed.cancel
       unsubscribe = stop.onStop(() => settle(false))
     })
   }
@@ -1382,13 +1395,14 @@ export async function runLiveRowSequence(
   /** Step 2's wait on a `pending` row until G past its launch start. */
   const graceWait = async (): Promise<StepEnd> => {
     if (lastRead.kind !== 'state' || lastRead.state !== AGENT_DIRECTOR_PENDING_STATE) return undefined
-    const launchStartMs = parseLaunchStart(lastRead.row?.launch_started_at)
+    const launchStartedAt = lastRead.row?.launch_started_at
+    const launchStartMs = parseLaunchStart(launchStartedAt)
     if (launchStartMs === undefined) {
       log(liveRowSequenceNoWaitLine(ref))
       return undefined
     }
     log(liveRowSequenceWaitArmedLine(ref, launchStartMs, graceInEffect()))
-    if (!(await waitForGrace(launchStartMs))) return halted() ?? stoppedNow()
+    if (!(await waitForGrace(launchStartedAt))) return halted() ?? stoppedNow()
     log(liveRowSequenceWaitEndedLine(ref))
     return undefined
   }

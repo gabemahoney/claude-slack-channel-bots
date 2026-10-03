@@ -14,27 +14,39 @@
  *
  * {@link isPendingWithNoLaunchStart} is true for a row, or a `status` result
  * as the client returns it, that reads `pending` and has no launch start by
- * that reader. For a `status` result the raw value is the one E9's raw
+ * that reader. For a `status` result the raw value is the one the raw
  * reader carries (`pendingLaunchStartOf`, `src/liveness-reading.ts`), and a
  * `get` or `list` row is read the same way. The row-read rule
  * (`decideOwnRowRead`, `src/row-read-rules.ts`) latches a configured
  * persona's own such row with the case "launch start not recorded"
  * (SRJ-513); a row under a key no configured persona uses latches nothing.
  *
- * Where later work plugs in: E28 builds the launch start's uses and the
- * row's ageing on this reader, E29 adds the pending-row rule to this module,
- * and E17 (the dialog approver), E21 (the live-row sequence) and E27 (the
- * old-life wait) read the launch start through it.
+ * A `pending` row's ageing (b.jg5 SRJ-406, SRJ-408): every wait on a
+ * `pending` row is measured from its launch start by this reader, never from
+ * `started_at` (a resumed row's `started_at` is its original spawn time, and
+ * agent-director counts its grace period from the launch start), and a row
+ * with no launch start is never aged. {@link isPendingRowAged} answers
+ * whether a wait has passed since a row's launch start at a given now, for a
+ * lap or a retry tick; {@link armPendingRowWait} arms such a wait never-early
+ * (`armNeverEarlyWait`, `src/ad-settings.ts`, with the derived-wait accessor
+ * itself, b.jg5 SRJ-210) and, for a row with no launch start, arms nothing
+ * and answers {@link PENDING_ROW_WAIT_NOT_ARMED}, so no caller hands the
+ * never-early helper a start that is not a finite time. The dialog approver's
+ * B and pace (SRJ-403, SRJ-404) and the live-row sequence's step-2 wait
+ * (SRJ-705, which the old-life wait runs too) use them, and SRJ-410's
+ * pending-row rule uses them.
  *
- * Pure: no module-scope state, no clock, no I/O, no agent-director call, no
- * log line, nothing run at import. Nothing names an export only the Phase 1
- * client has; the result field is typed through CSCB's own Phase 1
- * declarations (`src/ad-phase1-types.ts`, a type-only import).
+ * Pure: no module-scope state, no I/O, no agent-director call, no log line,
+ * nothing run at import; the clock is always passed in. Nothing names an
+ * export only the Phase 1 client has; the result field is typed through
+ * CSCB's own Phase 1 declarations (`src/ad-phase1-types.ts`, a type-only
+ * import).
  *
  * SPDX-License-Identifier: MIT
  */
 
 import type { Phase1StatusResult } from './ad-phase1-types.ts'
+import { armNeverEarlyWait, type NeverEarlyWaitClock, type NeverEarlyWaitLength } from './ad-settings.ts'
 import { AGENT_DIRECTOR_PENDING_STATE, pendingLaunchStartOf } from './liveness-reading.ts'
 
 // ---------------------------------------------------------------------------
@@ -113,7 +125,7 @@ export type PendingRowFields = Pick<Phase1StatusResult, 'state' | 'launch_starte
 /**
  * True when `row` (a `get` or `list` row, or a `status` result as the client
  * returns it) reads `pending` and has no launch start: its raw launch start
- * (`pendingLaunchStartOf`, E9's raw reader) is absent or does not parse
+ * (the raw reader `pendingLaunchStartOf`) is absent or does not parse
  * ({@link parseLaunchStart}). False for a `pending` row with a valid launch
  * start, for a row in any other state, and for no row. Pure; never throws.
  */
@@ -124,4 +136,72 @@ export function isPendingWithNoLaunchStart(row: PendingRowFields | null | undefi
   } catch {
     return false
   }
+}
+
+// ---------------------------------------------------------------------------
+// A `pending` row's ageing (b.jg5 SRJ-406, SRJ-408)
+// ---------------------------------------------------------------------------
+
+/**
+ * True when `waitMs` has passed at `nowMs` since the launch start
+ * `rawLaunchStart` names ({@link parseLaunchStart}), by a plain
+ * `elapsed >= wait` comparison (b.jg5 SRJ-406). `waitMs` is a fixed number
+ * or the derived-wait accessor itself (for example `adGraceMsInEffect`),
+ * read once at this call. False for a launch start that is absent or does
+ * not parse (a row with no launch start is never aged, SRJ-408), for a wait
+ * of `AD_WAIT_NEVER_ENDS`, and for an accessor that throws or answers NaN.
+ * Pure; never throws.
+ */
+export function isPendingRowAged(rawLaunchStart: unknown, waitMs: NeverEarlyWaitLength, nowMs: number): boolean {
+  const launchStartMs = parseLaunchStart(rawLaunchStart)
+  if (launchStartMs === undefined) return false
+  let currentWaitMs: number
+  try {
+    currentWaitMs = typeof waitMs === 'function' ? waitMs() : waitMs
+  } catch {
+    return false
+  }
+  return nowMs - launchStartMs >= currentWaitMs
+}
+
+/** {@link armPendingRowWait}'s answer for a row with no launch start: nothing was armed. */
+export const PENDING_ROW_WAIT_NOT_ARMED = 'not-armed'
+
+/** A wait {@link armPendingRowWait} armed: the launch start it runs from (epoch ms) and its cancel. */
+export interface PendingRowWaitArmed {
+  /** The launch start the wait is measured from, as {@link parseLaunchStart} read it: always a finite time. */
+  readonly launchStartMs: number
+  /** Clears the pending timer and stops the wait; a second call, or one after the callback ran, does nothing. */
+  readonly cancel: () => void
+}
+
+/** What {@link armPendingRowWait} answers. */
+export type PendingRowWaitArm = PendingRowWaitArmed | typeof PENDING_ROW_WAIT_NOT_ARMED
+
+/**
+ * Arm a wait of `waitMs` on a `pending` row, measured from the launch start
+ * `rawLaunchStart` names ({@link parseLaunchStart}), never from `started_at`
+ * (b.jg5 SRJ-406): `armNeverEarlyWait` on `clock` with `waitMs` passed
+ * through, so the accessor itself (for example `adGraceMsInEffect` or
+ * `adLaunchBoundMsInEffect`) is read at every fire and a value raised while
+ * armed is honoured (SRJ-210). `callback` runs once, from a timer, when the
+ * wait has passed. Answers the launch start and the cancel.
+ *
+ * For a launch start that is absent or does not parse, arms nothing, never
+ * runs `callback`, and answers {@link PENDING_ROW_WAIT_NOT_ARMED} (SRJ-408:
+ * such a row is never aged), so no `RangeError` for the start ever escapes.
+ * A fixed `waitMs` that is NaN, or an accessor that answers NaN or throws
+ * while arming, throws out of this call as from `armNeverEarlyWait`, before
+ * anything is armed.
+ */
+export function armPendingRowWait(
+  clock: NeverEarlyWaitClock,
+  rawLaunchStart: unknown,
+  waitMs: NeverEarlyWaitLength,
+  callback: () => void,
+): PendingRowWaitArm {
+  const launchStartMs = parseLaunchStart(rawLaunchStart)
+  if (launchStartMs === undefined) return PENDING_ROW_WAIT_NOT_ARMED
+  const cancel = armNeverEarlyWait(clock, launchStartMs, waitMs, callback)
+  return { launchStartMs, cancel }
 }
