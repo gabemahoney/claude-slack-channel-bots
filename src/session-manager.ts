@@ -144,6 +144,10 @@
  * recorded" (b.jg5 SRJ-513), whether or not it is the persona's current
  * life, and a `get` row carrying the `provenance_conflict` note latches it
  * with "conflicting labels" (a row with both latches with the first only).
+ * Any key's own row read live other than `pending` while the installed
+ * retired-key store (`setRetiredKeyStore`) has the key recorded with its
+ * mark set clears the key's entry, beside any latch the same read decides
+ * (b.jg5 SRJ-807).
  * An UNUSABLE NAME answer to either read latches the persona with the state
  * unreadable. A read that latched answers `latched`, and the caller calls
  * nothing more for the persona: no `send-keys`, kill, delete or launch, and
@@ -468,8 +472,10 @@ import {
   decideOwnRowRead,
   isLatchingLivenessNote,
   isPersonaOwnRow,
+  type RowReadClearDecision,
   type RowReadLatchDecision,
 } from './row-read-rules.ts'
+import type { RetiredKeyStore } from './retired-keys.ts'
 import {
   runInAttempt,
   runOutsideAttempts,
@@ -1380,6 +1386,76 @@ export function _resetConfiguredPersonaQuery(): void {
 }
 
 /**
+ * What the session manager uses of the server's one retired-key store
+ * (`src/retired-keys.ts`, b.jg5 SRJ-807): `isMarked`, asked at every own-row
+ * read, and `clear`, on the row-read rule's clear decision.
+ */
+export type SessionRetiredKeys = Pick<RetiredKeyStore, 'isMarked' | 'clear'>
+
+/**
+ * The installed retired-key store. Production installs the one store
+ * `main()` loads, before the start sweep, so the clear is active at the first
+ * row the server reads. With none installed (unit tests, the integration
+ * driver, the CLI, which never writes the record, b.jg5 SRJ-801) no key
+ * counts as marked, so no own-row read clears an entry and every read
+ * behaves as it does with no store (`readPersonaOwnRow`,
+ * `applyOwnRowStatusStep`).
+ */
+let retiredKeyStore: SessionRetiredKeys | undefined
+
+/** Install the server's retired-key store (production: `main()`), or remove it with undefined (b.jg5 SRJ-807). */
+export function setRetiredKeyStore(store: SessionRetiredKeys | undefined): void {
+  retiredKeyStore = store
+}
+
+/** Test-only seam: remove any installed retired-key store. */
+export function _resetRetiredKeyStore(): void {
+  retiredKeyStore = undefined
+}
+
+/**
+ * Whether key `key` is recorded as retired with its "new life has begun" mark
+ * set, by the installed store, for the row-read rule (b.jg5 SRJ-807). No store
+ * installed, or an `isMarked` that throws, counts as not marked, so nothing
+ * is cleared. Never throws.
+ */
+function retiredMarkOf(key: string): boolean {
+  const store = retiredKeyStore
+  if (store === undefined) return false
+  try {
+    return store.isMarked(key) === true
+  } catch (err) {
+    console.error(`[slack] retired-keys: the mark query for ${keyRef(key)} failed: ${describeThrownValue(err)}; nothing is cleared (b.jg5 SRJ-807)`)
+    return false
+  }
+}
+
+/**
+ * Act on a clear decision of the row-read rule over one read of key `key`'s
+ * own row (b.jg5 SRJ-807): clear the key's entry through the installed store,
+ * whose one line names the persona reference, the file and this read (the
+ * state read, `at`'s site and what it read):
+ *
+ *   [slack] retired-keys: persona=<key> entry cleared from "<path>" on its row read <state> with its mark set (<site>: <what>) (b.jg5 SRJ-807)
+ *   [slack] retired-keys: cannot clear persona=<key> from "<path>" on its row read <state> with its mark set (<site>: <what>)<failure>; the entry stays, and the next qualifying read clears it again (b.jg5 SRJ-807)
+ *
+ * A failed write leaves the entry, in memory and in the file, and the next
+ * qualifying read tries again; the read's answer to its caller is the same
+ * whatever the clear did. Applied beside any latch the same read decided.
+ * Never throws.
+ */
+function clearRetiredEntryOnRead(key: string, decision: RowReadClearDecision, at: OwnRowReadSite): void {
+  const store = retiredKeyStore
+  if (store === undefined) return
+  try {
+    store.clear(key, `its row read ${decision.stateRead} with its mark set (${at.site}: ${at.what})`)
+  } catch (err) {
+    // Not reached (the store's clear never throws); the entry stays, and the read goes on.
+    console.error(`[slack] retired-keys: clearing ${keyRef(key)}'s entry failed: ${describeThrownValue(err)}; the entry stays (b.jg5 SRJ-807)`)
+  }
+}
+
+/**
  * The installed kill-failure alerts (b.jg5 SRJ-704, SRJ-1016;
  * `createKillFailureAlerts`, `src/persona-episodes.ts`). Production installs
  * `main()`'s, built over its notice episodes. The persona kills' alert
@@ -1502,6 +1578,15 @@ export interface OwnRowReadSite {
  * persona's kill-failure episode silently (`endKillFailureEpisodeOnRead`;
  * b.jg5 SRJ-704, SRJ-1016).
  *
+ * A row that is the key's own, read `waiting`, `working`, `ask_user` or
+ * `check_permission` while the installed retired-key store has the key
+ * recorded with its mark set, clears the key's entry, durably, whether or
+ * not the key is configured and beside any latch the same read decides
+ * (`clearRetiredEntryOnRead`; b.jg5 SRJ-807). A `pending` row never clears.
+ * The answer is the same whatever the clear did; a clear whose write fails
+ * leaves the entry for the next qualifying read. With no store installed
+ * nothing is cleared.
+ *
  * Log lines (no line carries a token: the note and the instance id are
  * agent-director's text, rendered by `renderLogMessageText`, and an
  * UNUSABLE NAME answer by the redacting describer):
@@ -1586,7 +1671,10 @@ const nonLatchingNoteLogged = new Map<string, string>()
 
 /**
  * The row-read rule on `row`, read for persona `key` (b.jg5 SRJ-114,
- * SRJ-513): asks `decideOwnRowRead` for every row read, latches the persona
+ * SRJ-513): asks `decideOwnRowRead` for every row read; on a clear decision
+ * first clears the persona's retired-key entry through the store
+ * (`clearRetiredEntryOnRead`, b.jg5 SRJ-807), before any latch handling,
+ * changing nothing the read answers; then latches the persona
  * on a latch decision (`latchFromRowRead`) with the line naming why
  * (`rowReadLatchReason`), and otherwise
  * logs the read's note line, if any (a non-latching note's line once per
@@ -1595,7 +1683,9 @@ const nonLatchingNoteLogged = new Map<string, string>()
  */
 function applyOwnRowRules(key: string, row: GetResult, at: OwnRowReadSite): boolean {
   const configured = configuredReadingOf(key)
-  const decision = decideOwnRowRead({ key, row, configured: configured.configured })
+  const decision = decideOwnRowRead({ key, row, configured: configured.configured, retiredMarked: retiredMarkOf(key) })
+  // b.jg5 SRJ-807: the clear applies beside any latch this read decides, and changes nothing the read answers.
+  if (decision.clearRetiredEntry !== undefined) clearRetiredEntryOnRead(key, decision.clearRetiredEntry, at)
   const note: unknown = row.liveness_note
   const hasNote = note !== undefined && note !== null && note !== ''
   if (!hasNote || isLatchingLivenessNote(note)) nonLatchingNoteLogged.delete(key)
@@ -1755,6 +1845,14 @@ export type OwnRowStatusAnswer =
  *     name) latches the persona with the state unreadable
  *     (`latchOnUnusableNameRead`: one line, no further read). Any other
  *     value, `ErrSpawnNotFound` included, is left to the caller.
+ *   - A returned result reading `waiting`, `working`, `ask_user` or
+ *     `check_permission` while the installed retired-key store has the key
+ *     recorded with its mark set clears the key's entry, durably, whether or
+ *     not the key is configured and beside any latch the same result decides
+ *     (`clearRetiredEntryOnRead`; b.jg5 SRJ-807). A `pending` result never
+ *     clears. What the step answers is the same whatever the clear did; a
+ *     clear whose write fails leaves the entry for the next qualifying read.
+ *     The liveness and reconnect adapters get the clear through this step.
  *   - Either way, first: a result reading `ended` or `missing`, or an
  *     `ErrSpawnNotFound` answer (the row is gone), ends the persona's
  *     kill-failure episode silently (`endKillFailureEpisodeOnRead`; b.jg5
@@ -1773,7 +1871,14 @@ export function applyOwnRowStatusStep(key: string, answer: OwnRowStatusAnswer, a
     endKillFailureEpisodeOnRead(key, 'thrown' in answer ? { thrown: answer.thrown } : { state: answer.result.state })
     if ('thrown' in answer) return latchOnUnusableNameRead(key, answer.thrown, at)
     const row = { ...answer.result, claude_instance_id: personaInstanceId(key) }
-    const decision = decideOwnRowRead({ key, row, configured: configuredReadingOf(key).configured })
+    const decision = decideOwnRowRead({
+      key,
+      row,
+      configured: configuredReadingOf(key).configured,
+      retiredMarked: retiredMarkOf(key),
+    })
+    // b.jg5 SRJ-807: the clear applies beside any latch this read decides, and changes nothing the step answers.
+    if (decision.clearRetiredEntry !== undefined) clearRetiredEntryOnRead(key, decision.clearRetiredEntry, at)
     if (decision.latch === undefined) return false
     const outcome = latchFromRowRead(key, decision.latch)
     console.error(
@@ -11450,7 +11555,8 @@ async function sweepKillTry(client: Client, instanceId: string): Promise<KillOut
  * `ad-config-malformed` for `configuredKey` only, through its raise entry,
  * arming no retry timer, and is otherwise only logged (b.jg5 SRJ-110,
  * SRJ-316; hatch A3); the retry then ends the tries when the row was last
- * read `pending`. Never throws.
+ * read `pending`. No own-row step applies to this read: it latches nothing
+ * and clears no retired-key entry (b.jg5 SRJ-807). Never throws.
  */
 async function sweepKillRead(client: Client, instanceId: string, configuredKey: string | undefined): Promise<KillRetryRead> {
   try {

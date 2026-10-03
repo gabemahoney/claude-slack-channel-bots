@@ -232,6 +232,13 @@
  *   (`(key) => getAppliedPersona(key) !== undefined`), never reset; it and
  *   the latch's install both come before the start sweep (`reconcileOrphans`)
  *   and the start pass, with no await between them.
+ * - b.jg5 SRJ-807 / SRJ-802: the one retired-key store (the start read's
+ *   binding, the reload controller's `retiredKeys`) is installed for the
+ *   session manager's own-row reads once (`setRetiredKeyStore`), in main()'s
+ *   own statement list, behind no branch, after its binding and before the
+ *   start sweep, every launch path, the liveness adapter, the connection
+ *   manager and `Bun.serve`; server.ts never names the test-only reset, and
+ *   no other src file (the CLI included) installs a store.
  * - b.jg5 SRJ-704 / SRJ-1007 / SRJ-1016: the kill-failure alerts are built
  *   exactly once (`createKillFailureAlerts`), in main()'s own statement list,
  *   over the one notice episodes instance and the server log, with the live
@@ -4144,6 +4151,77 @@ describe('main() installs the configured-persona query over the live applied con
     }
     // Installed together: nothing else runs between the two installs.
     expect(indicesOf(/\bawait\b/g, SERVER_CODE.slice(Math.min(query, latch), Math.max(query, latch)))).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: b.jg5 SRJ-807 / SRJ-802 — the retired-key store for the
+// session manager's own-row reads
+//
+// The session manager's install is optional: with no store installed no read
+// clears an entry, so an entry whose new life reads live stays retired. A
+// store of its own (a second in-memory view beside the one the reload
+// controller records through), an install after the start sweep or a launch
+// path, or an install behind a branch would type-check and pass every
+// behaviour suite. What the clear does is tested in tests/retired-keys.test.ts
+// and through the shared reads in tests/session-manager.test.ts and
+// tests/server.test.ts; pinned here: the install.
+// ---------------------------------------------------------------------------
+
+describe('main() installs the one retired-key store for the session manager once, behind no branch, before the start sweep and every launch path (b.jg5 SRJ-807, SRJ-802)', () => {
+  // Tied to src by type: renaming any of these fails the typecheck.
+  const INSTALL: keyof typeof SessionManagerModule = 'setRetiredKeyStore'
+  const RESET: keyof typeof SessionManagerModule = '_resetRetiredKeyStore'
+  const START_READ: keyof typeof RetiredKeysModule = 'readRetiredKeysAtStart'
+  const STORE_DEP: keyof ReloadControllerDeps = 'retiredKeys'
+  const START_SWEEP: keyof typeof SessionManagerModule = 'reconcileOrphans'
+  const LIVENESS_ADAPTER: keyof typeof ServerModule = '_buildIsSessionAliveAdapter'
+
+  /** The `const <store> = <outcome>.store` binding of the one start read: its name and offset. */
+  function storeBinding(): { store: string; at: number } {
+    const outcome = constOf(START_READ)
+    const bindings = [...SERVER_CODE.matchAll(new RegExp(`\\bconst\\s+(\\w+)(?:\\s*:\\s*\\w+)?\\s*=\\s*${outcome}\\s*\\.\\s*store\\b`, 'g'))]
+    expect(bindings).toHaveLength(1)
+    return { store: bindings[0]![1]!, at: bindings[0]!.index! }
+  }
+
+  test('the store is installed exactly once, in main()\'s own statement list (behind no branch), through the session manager\'s own install; no other src file installs one and the test-only reset is never named', () => {
+    const at = onlyCallOf(INSTALL)
+    expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+    expect(importSource(SERVER_CODE, INSTALL)).toBe('./session-manager.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${INSTALL}\\b`, 'g'), SERVER_CODE)).toEqual([])
+    expect(indicesOf(new RegExp(`\\b${RESET}\\b`, 'g'), SERVER_CODE)).toEqual([])
+    // b.jg5 SRJ-801: only the server writes the record, so the CLI and every
+    // other module install no store; the session manager only declares it.
+    const installers = srcFiles()
+      .filter(([path]) => path !== 'src/server.ts' && path !== 'src/session-manager.ts')
+      .filter(([, source]) => indicesOf(new RegExp(`\\b${INSTALL}\\s*\\(`, 'g'), stripComments(source)).length > 0)
+      .map(([path]) => path)
+    expect(installers).toEqual([])
+  })
+
+  test('its one argument is the one store main() loaded, by the binding the start read\'s store was bound to: the very binding the reload controller records through, never a second store', () => {
+    const { store } = storeBinding()
+    declaredOnce(store)
+    expect(onlyCallArgs(INSTALL)).toEqual([store])
+    expect(onlyCallProps('createReloadController').get(STORE_DEP)).toBe(store)
+  })
+
+  test('it is installed after the store is bound and before the start sweep, every launch path (the retry controller, the restart module, the start bring-up, the health check), the liveness adapter, the connection manager and Bun.serve', () => {
+    const install = onlyCallOf(INSTALL)
+    expect(install).toBeGreaterThan(storeBinding().at)
+    const sweep = onlyCallOf(START_SWEEP)
+    expect(insideMain(sweep)).toBe(true)
+    const adapterBuilds = indicesOf(new RegExp(`(?<![\\w.$]|function\\s+)${LIVENESS_ADAPTER}\\s*\\(`, 'g'), SERVER_CODE)
+    expect(adapterBuilds).toHaveLength(1)
+    const later = [
+      sweep,
+      ...latchStartPass(),
+      ...adapterBuilds,
+      onlyCallOf('createPersonaConnectionManager'),
+      onlyCallOf('Bun\\.serve'),
+    ]
+    for (const at of later) expect(install).toBeLessThan(at)
   })
 })
 

@@ -917,6 +917,10 @@ export type DirectorClient = Pick<Client, 'status' | 'pause' | 'kill'>
  * `directorKill` returns normally; every other error (AD unreachable, no
  * Client installed, a call timeout, …) propagates so the teardown fails
  * loudly. `directorPause` passes every error through.
+ *
+ * b.jg5 SRJ-801, SRJ-807: `directorStatus` applies no row-read rule and the
+ * CLI installs no retired-key store, so no read the CLI makes clears a
+ * retired-key entry.
  */
 export function createDirectorOps(getClient: () => DirectorClient): DirectorOps {
   return {

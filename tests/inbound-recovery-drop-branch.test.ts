@@ -95,6 +95,11 @@
  * reuse reports `cannot-launch` with no restart and no call; above an open
  * kill-failure episode it still does; under a latch `held-for-human` comes
  * first; once the binary's version changes and the hold ends it never does.
+ * The read clears a retired key's entry there too (b.jg5 SRJ-807, through the
+ * liveness adapter's own-row step, the harness's one retired-key store
+ * installed as main() installs it): P recorded with its mark set and its row
+ * read `waiting` reports as before with P's entry cleared, and a `pending`
+ * row reports session starting with nothing cleared.
  *
  * main() in src/server.ts cannot run in a test (startup gate, real port, real
  * Slack connections), so describe (7) audits its source for the wiring only:
@@ -232,6 +237,9 @@ import {
   type RecoveryRowState,
 } from './test-helpers/recovery-harness.ts'
 import { holdThroughReuse, personaCallCounts, personaRow, unavailableAt } from './test-helpers/recovery-harness.ts'
+import { retiredEntryClearedLine, retiredKeyLinesIn } from './test-helpers/recovery-harness.ts'
+import { readRetiredKeysRecord, retiredKeysRecordOf, type RetiredKeySeed } from './test-helpers/retired-keys.ts'
+import { RETIRED_KEY_CAUSE_REMOVED } from '../src/retired-keys.ts'
 import { errInvalidFlags, provenanceNote } from './test-helpers/agent-director-stub.ts'
 import { launchForLiveRowSequence, readPersonaOwnRow } from '../src/session-manager.ts'
 import { LIVE_ROW_LAUNCH_REUSE } from '../src/live-row-sequence.ts'
@@ -1413,6 +1421,56 @@ describe('b.jg5 SRJ-1011 through the recovery harness: the read is the liveness 
     expect(h.controller.armedKeys()).toEqual([])
     expect(h.unclassifiedErrorOpen(key)).toBe(false)
     expect(h.clock.pendingCount()).toBe(0)
+  })
+})
+
+// ===========================================================================
+// b.jg5 SRJ-807 at the lost-message read (SRJ-115, SRJ-1011): the routing's
+// one row read is the liveness adapter's `status`, whose own-row step clears
+// a retired key's entry, so a message lost for P whose key is recorded with
+// its mark set, its row read live other than `pending`, clears P's entry
+// (durably, with the store's one line naming the adapter's read) and reports
+// what it reports today; a `pending` row reports session starting and clears
+// nothing. On the recovery harness, its one retired-key store installed as
+// main() installs it, the record seeded with P and Q both marked, so Q's
+// entry shows the read clears no other key's.
+// ===========================================================================
+
+describe('b.jg5 SRJ-807: the lost-message read clears a retired key\'s entry on its row read live other than pending with its mark set, and reports as before', () => {
+  const SEED: RetiredKeySeed = { cause: RETIRED_KEY_CAUSE_REMOVED, mark: true }
+  /** A recovery harness whose record holds every persona's key with its mark set. */
+  const makeMarkedRecovery = () => makeRecovery({ retiredKeys: (keys) => Object.fromEntries(keys.map((key) => [key, SEED])) })
+
+  test('P\'s row read waiting: the message reports auto-restart disabled from its one status read, as before; P\'s entry leaves the file with one write and one line naming the liveness adapter\'s read; Q\'s entry stays', async () => {
+    const h = makeMarkedRecovery()
+    const [key, other] = h.keys as [string, string]
+    const path = h.retiredKeys.path
+    h.script({ statusResult: cannedStatusResult({ state: 'waiting' }) })
+
+    await expectLostMessageReports(h, key, 'auto-restart-disabled')
+
+    expect(readRetiredKeysRecord(h.stateDir)).toEqual(retiredKeysRecordOf({ [other]: SEED }))
+    expect([h.retiredKeys.isRecorded(key), h.retiredKeys.isMarked(other)]).toEqual([false, true])
+    expect(h.retiredKeyWrites).toEqual([{ path, ok: true }])
+    expect(retiredKeyLinesIn(h.errors)).toEqual([retiredEntryClearedLine(path, key, 'waiting', { site: 'isSessionAlive', what: 'status' })])
+    expect(isRestartPendingOrActive(key)).toBe(false)
+    expectNothingRaisedOrArmed(h, key)
+  })
+
+  test('P\'s row read pending (a launch start recorded): the message reports session starting from its one status read, as before; nothing is cleared: the file byte-identical, no write, no line', async () => {
+    const h = makeMarkedRecovery()
+    const [key] = h.keys as [string]
+    const before = readFileSync(h.retiredKeys.path)
+    h.script({ statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }) })
+
+    await expectLostMessageReports(h, key, 'session-starting')
+
+    expect(readFileSync(h.retiredKeys.path).equals(before)).toBe(true)
+    expect(h.retiredKeyWrites).toEqual([])
+    expect(retiredKeyLinesIn(h.errors)).toEqual([])
+    expect(h.retiredKeys.isMarked(key)).toBe(true)
+    expect(isRestartPendingOrActive(key)).toBe(false)
+    expectNothingRaisedOrArmed(h, key)
   })
 })
 

@@ -128,6 +128,7 @@ import {
   setLiveRowSequenceRegistry,
   setPreLaunchReplyGuard,
   setPreLaunchTrustPatcher,
+  setRetiredKeyStore,
   setSessionNotifier,
   spawnForPersona,
   startupSessionManager,
@@ -3024,6 +3025,14 @@ export async function main(): Promise<void> {
   // state, so shutdown has nothing to undo. Installed with the latch, before
   // the start sweep and the start pass.
   setConfiguredPersonaQuery((key) => getAppliedPersona(key) !== undefined)
+  // b.jg5 SRJ-807: the one retired-key store loaded above, for the clear at
+  // every own-row read: any key's own row read waiting, working, ask_user or
+  // check_permission while the key is recorded with its mark set clears the
+  // key's entry. Installed here, with no branch, before the start sweep, the
+  // start bring-up pass, the health tick and the restart path, so the first
+  // row the server reads already clears; with no store installed no read
+  // would clear, and an entry whose new life reads live would stay retired.
+  setRetiredKeyStore(retiredKeys)
   // b.jg5 SRJ-702, SRJ-305: a persona's kill retry (the restart path's kill,
   // the live-row sequence's kills) makes no further try once the
   // persona is torn down or not up (`isPersonaUp`: serving, its bring-up

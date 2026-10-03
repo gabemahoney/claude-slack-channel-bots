@@ -188,6 +188,23 @@
  *     branch, a key the configured-persona query does not hold latches no
  *     one, and the permission poller's and the JSONL persistence
  *     safeguard's `get`s (SRJ-122) latch and post nothing.
+ *   - b.jg5 SRJ-807, with SRJ-114's and SRJ-115's sites, on
+ *     `makeRecoveryHarness` (its one retired-key store installed as `main()`
+ *     installs it, the record seeded with P and B marked): a retired key's
+ *     own row read `waiting`, `working`, `ask_user` or `check_permission`
+ *     with its mark set clears its entry, durably, with one write and one
+ *     line naming the read, at the shared own-row `get` read (each state;
+ *     the ladder's collision `get`, which then reconnects as before; a key
+ *     outside the applied set; a read that also latches on the
+ *     `provenance_conflict` note) and at the own-row `status` step (each
+ *     state; the working-row wait's poll); every answer is the read's as
+ *     before, and B's entry stays. Controls: an unmarked key, a `pending` row
+ *     with a launch start, and a configured persona's own `pending` row with
+ *     none (which latches P), an absent row (`ErrSpawnNotFound` to the `get`
+ *     and the `status` read), no store installed and a mark query that
+ *     throws leave the file byte-identical with no write. A
+ *     refused write leaves the entry, in memory and in the file, with one
+ *     line, the ladder acting as usual, and the next qualifying read clears it.
  *   - b.jg5 SRJ-303 / SRJ-115 the retry timer's row read
  *     (`readPersonaRowState`): one `status` call for `cscb_<key>` and no
  *     other, answering each state as is (`pending` included), a `pending`
@@ -617,6 +634,7 @@ import {
   readPersonaOwnPane,
   type OwnPaneReadOutcome,
   type PersonaPaneReadRequest,
+  OWN_ROW_READ_ABSENT,
   OWN_ROW_READ_ROW,
   OWN_ROW_STATUS_ABSENT,
   OWN_ROW_STATUS_LATCHED,
@@ -1103,6 +1121,11 @@ import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_PENDING_STATE, LIVENESS_DEAD
 import { adLaunchBoundMsInEffect } from '../src/ad-settings.ts'
 import { parseLaunchStart } from '../src/pending-row.ts'
 import type { Phase1GetResult, Phase1KillResult, Phase1ResumeResult, Phase1SpawnParams, Phase1SpawnResult, Phase1StatusResult, PreTrust } from '../src/ad-phase1-types.ts'
+import { RETIRED_KEY_CAUSE_REMOVED } from '../src/retired-keys.ts'
+import { RETIRED_ENTRY_CLEARING_STATES } from '../src/row-read-rules.ts'
+import { _resetRetiredKeyStore, setRetiredKeyStore } from '../src/session-manager.ts'
+import { readRetiredKeysRecord, retiredKeysRecordOf, type RetiredKeySeed } from './test-helpers/retired-keys.ts'
+import { expectUntouched, retiredEntryClearedLine, retiredEntryClearFailedLine, retiredKeyLinesIn } from './test-helpers/recovery-harness.ts'
 
 // ---------------------------------------------------------------------------
 // Test fixture helpers
@@ -1268,6 +1291,8 @@ afterEach(() => {
   setConflictLatch(undefined)
   // b.jg5 SRJ-114: nor its own configured-persona query.
   _resetConfiguredPersonaQuery()
+  // b.jg5 SRJ-807: nor a retired-key store.
+  _resetRetiredKeyStore()
   installedHold?.cancelAll()
   installedHold = undefined
   process.env = savedEnv as NodeJS.ProcessEnv
@@ -20689,6 +20714,281 @@ describe('b.jg5 SRJ-122, SRJ-513 (hatch A2): the gets SRJ-122 leaves alone latch
     expectNoNoteLatch(h)
     expect(launchStartLinesOf(h, p)).toEqual([])
     assertNoLeak({ posted })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-807, with SRJ-114's and SRJ-115's sites: a retired key's own row
+// read `waiting`, `working`, `ask_user` or `check_permission` while its mark
+// is set clears its entry from the retired-key record, durably, at the shared
+// own-row `get` read (`readPersonaOwnRow`; the ladder's collision `get` among
+// its sites) and at the own-row `status` step (`readPersonaOwnRowStatus`; the
+// working-row wait's poll among its sites). The read's answer, and what its
+// site does next, are those of the same read with no record; the store logs
+// one line naming the read. Every case runs on `makeRecoveryHarness`, whose
+// one store is read over its state directory and installed as `main()`
+// installs it (removed by its cleanup, which `srj105AfterEach` runs after
+// leak-checking everything captured, the record file included). The record
+// is seeded through `options.retiredKeys`: P and B both recorded, B with its
+// mark set, so B's entry beside P's shows that a read of P's row clears no
+// other key's. Controls: P recorded with no mark, and P's own row `pending`
+// (with a launch start, and, for a configured persona, with none, which
+// latches P through the launch-start decision), P's own row absent
+// (`ErrSpawnNotFound`), no store installed and a mark query that throws (one
+// line) leave the file byte-identical with no write. A clear whose write is refused leaves the entry,
+// in memory and in the file, with one line, the site acting on its read as
+// usual, and the next qualifying read clears it. The decision table over
+// every state and read form is tests/retired-keys.test.ts's.
+// ---------------------------------------------------------------------------
+
+/** B's seeded entry, and P's unless a case leaves P's mark unset: recorded as removed, its mark set. */
+const MARKED_SEED: RetiredKeySeed = { cause: RETIRED_KEY_CAUSE_REMOVED, mark: true }
+
+/** A recovery harness over P and B whose record holds both, B marked and P marked unless `pMarked` is false. */
+function retiredBuild(pMarked = true): { h: RecoveryHarness; p: string; b: string } {
+  return srj105Build({
+    retiredKeys: ([p, b]) => ({ [p!]: { ...MARKED_SEED, mark: pMarked }, [b!]: MARKED_SEED }),
+  })
+}
+
+/** The clearing states, as `test.each` rows. */
+const CLEARING_STATES = [...RETIRED_ENTRY_CLEARING_STATES].map((state) => [state] as const)
+
+/** The ladder's collision `get` site, as its clear line names it. */
+const COLLISION_GET_SITE: OwnRowReadSite = { site: 'spawnForPersona', what: 'collision get' }
+
+/** The working-row wait's poll `status` site, as its clear line names it. */
+const WAIT_POLL_SITE: OwnRowReadSite = { site: 'waitForWaitingAndReconnect', what: 'status read' }
+
+/**
+ * P's entry was cleared by one read: the file holds B's entry alone, the store
+ * no longer records P and still has B marked, one write went through, and the
+ * store's lines end with `line`, the only clear line (`before` counts the
+ * store's earlier lines and writes, a mark's).
+ */
+function expectClearedOnce(h: RecoveryHarness, p: string, b: string, line: string, before = 0): void {
+  expect(readRetiredKeysRecord(h.stateDir)).toEqual(retiredKeysRecordOf({ [b]: MARKED_SEED }))
+  expect([h.retiredKeys.isRecorded(p), h.retiredKeys.isMarked(b)]).toEqual([false, true])
+  expect(h.retiredKeyWrites.slice(before)).toEqual([{ path: h.retiredKeys.path, ok: true }])
+  expect(retiredKeyLinesIn(h.errors).slice(before)).toEqual([line])
+}
+
+/** No read cleared anything: the record file is the bytes `before` held, with no write and no line of the store; P still recorded. */
+function expectNothingCleared(h: RecoveryHarness, p: string, before: Buffer): void {
+  expect(readFileSync(h.retiredKeys.path).equals(before)).toBe(true)
+  expect(h.retiredKeyWrites).toEqual([])
+  expect(retiredKeyLinesIn(h.errors)).toEqual([])
+  expect(h.retiredKeys.isRecorded(p)).toBe(true)
+}
+
+/** The store's clear line for P's entry, on its row read `state` at `at`. */
+function clearedLine(h: RecoveryHarness, p: string, state: string, at: OwnRowReadSite): string {
+  return retiredEntryClearedLine(h.retiredKeys.path, p, state, at)
+}
+
+describe('b.jg5 SRJ-807, SRJ-114: a retired key\'s own row read live other than pending with its mark set clears its entry at the shared own-row get read; the read answers as before', () => {
+  afterEach(srj105AfterEach)
+
+  test.each(CLEARING_STATES)('the shared get read of P\'s own row reading %s with P\'s mark set answers the row, unlatched; P\'s entry leaves the file with one write and one line naming the read; B\'s entry stays and B is untouched', async (state) => {
+    const { h, p, b } = retiredBuild()
+    const row = harnessRow(h, harnessPersona(h, p), { state })
+    h.script({ getResult: row })
+
+    expect(await readPersonaOwnRow(p, DEDUP_SITE)).toEqual({ kind: OWN_ROW_READ_ROW, row, latched: false })
+
+    expectClearedOnce(h, p, b, clearedLine(h, p, state, DEDUP_SITE))
+    expectNoNoteLatch(h)
+    expectUntouched(h, b)
+  })
+
+  test('the ladder\'s collision get reading P\'s own row waiting with P\'s mark set clears P\'s entry, and the ladder reconnects as it does today: one spawn, one send-keys, reconnected', async () => {
+    const { h, p, b } = retiredBuild()
+    h.script(collided(h, harnessPersona(h, p), { state: 'waiting' }))
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'reconnected' })
+
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: 1 }))
+    expect(getIds(h)).toEqual([personaInstanceId(p)])
+    expectClearedOnce(h, p, b, clearedLine(h, p, 'waiting', COLLISION_GET_SITE))
+    expectUntouched(h, b)
+  })
+
+  test('P outside the applied configuration: its own row read waiting with its mark set still clears its entry (the clear does not ask whether the key is configured)', async () => {
+    const { h, p, b } = retiredBuild()
+    h.remove(p)
+    const row = harnessRow(h, harnessPersona(h, p), { state: 'waiting' })
+    h.script({ getResult: row })
+
+    expect(await readPersonaOwnRow(p, DEDUP_SITE)).toEqual({ kind: OWN_ROW_READ_ROW, row, latched: false })
+
+    expectClearedOnce(h, p, b, clearedLine(h, p, 'waiting', DEDUP_SITE))
+  })
+
+  test('one read latches and clears: the collision get reading P\'s own row waiting with provenance_conflict and P\'s mark set latches P with "conflicting labels" and clears P\'s entry', async () => {
+    const { h, p, b } = retiredBuild()
+    h.script(collided(h, harnessPersona(h, p), { state: 'waiting', liveness_note: provenanceNote }))
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1 }))
+    expectNoteLatchedOnce(h, p, latchRowStateRead('waiting'))
+    expectClearedOnce(h, p, b, clearedLine(h, p, 'waiting', COLLISION_GET_SITE))
+  })
+})
+
+describe('b.jg5 SRJ-807, SRJ-115: a retired key\'s own row read live other than pending with its mark set clears its entry at the own-row status step; the read answers as before', () => {
+  afterEach(srj105AfterEach)
+
+  test.each(CLEARING_STATES)('the shared status read of P\'s own row reading %s with P\'s mark set answers the state; P\'s entry leaves the file with one write and one line naming the read; B\'s entry stays and B is untouched', async (state) => {
+    const { h, p, b } = retiredBuild()
+    h.script({ statusResult: cannedStatusResult({ state }) })
+
+    expect(await readPersonaOwnRowStatus(p, STATUS_READ_SITE)).toStrictEqual({ kind: OWN_ROW_STATUS_STATE, state })
+
+    expectClearedOnce(h, p, b, clearedLine(h, p, state, STATUS_READ_SITE))
+    expectNoNoteLatch(h)
+    expectUntouched(h, b)
+  })
+
+  // P's mark is set during the wait's poll (as a reuse that began P's new life
+  // would set it), so the collision get, which read P's row working while P
+  // was unmarked, cleared nothing, and the clear is the poll's.
+  test('a launch whose working-row wait\'s poll reads P\'s own row waiting once P\'s mark is set: the poll clears P\'s entry, and the wait reconnects as it does today (one spawn, one send-keys, reconnected); the collision get before it, unmarked, cleared nothing', async () => {
+    const { h, p, b } = retiredBuild(false)
+    fastPolls(h)
+    h.script({
+      ...collided(h, harnessPersona(h, p), { state: 'working' }),
+      statusFn: () => {
+        h.retiredKeys.mark(p)
+        return cannedStatusResult({ state: 'waiting' })
+      },
+    })
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'reconnected' })
+
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: 1 }))
+    expect(h.retiredKeyWrites[0]).toEqual({ path: h.retiredKeys.path, ok: true })
+    expect(retiredKeyLinesIn(h.errors)[0]).toStartWith(`[slack] retired-keys: persona=${p} marked: `)
+    expectClearedOnce(h, p, b, clearedLine(h, p, 'waiting', WAIT_POLL_SITE), 1)
+    expectUntouched(h, b)
+  })
+})
+
+describe('b.jg5 SRJ-807: the controls — an unmarked key, a pending row, a configured persona\'s own pending row with no launch start, an absent row, no store installed and a throwing mark query clear nothing', () => {
+  afterEach(srj105AfterEach)
+
+  test.each<[string, boolean, string]>([
+    ['P recorded with no mark, its own row read waiting', false, 'waiting'],
+    ['P\'s mark set, its own row read pending (a launch start recorded)', true, AGENT_DIRECTOR_PENDING_STATE],
+  ])('%s: the shared get read and the shared status read answer as read, latch no one, and leave the record file byte-identical with no write and no line', async (_label, pMarked, state) => {
+    const { h, p } = retiredBuild(pMarked)
+    const before = readFileSync(h.retiredKeys.path)
+    const row = harnessRow(h, harnessPersona(h, p), { state })
+    const result = cannedStatusResult({ state })
+    h.script({ getResult: row, statusResult: result })
+
+    expect(await readPersonaOwnRow(p, DEDUP_SITE)).toEqual({ kind: OWN_ROW_READ_ROW, row, latched: false })
+    const read = await readPersonaOwnRowStatus(p, STATUS_READ_SITE)
+
+    expect(read.kind === OWN_ROW_STATUS_STATE && read.state).toBe(state)
+    expectNoNoteLatch(h)
+    expectNothingCleared(h, p, before)
+    expect(h.retiredKeys.isMarked(p)).toBe(pMarked)
+  })
+
+  test.each(byName(launchStartCurrentLifeOf('get')))('the collision get reading P\'s own row %s with P\'s mark set: P latched with "launch start not recorded" through that decision, whatever its mark; nothing cleared', async (_name, row) => {
+    const { h, p } = retiredBuild()
+    const before = readFileSync(h.retiredKeys.path)
+    h.script({ spawnQueue: [cannedErr(errInstanceIdCollision())], getResult: row.build(harnessPersona(h, p), h.home) })
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+
+    expectLatchedOnce(h, p, launchStartLatch(p, row))
+    expectNothingCleared(h, p, before)
+    expect(h.retiredKeys.isMarked(p)).toBe(true)
+  })
+
+  test('P\'s mark set, its own row absent (ErrSpawnNotFound): the shared get read and the shared status read answer absent, latch no one, and leave the record file byte-identical with no write and no line', async () => {
+    const { h, p } = retiredBuild()
+    const before = readFileSync(h.retiredKeys.path)
+    h.script({ getError: errSpawnNotFound(), statusError: errSpawnNotFound() })
+
+    expect(await readPersonaOwnRow(p, DEDUP_SITE)).toStrictEqual({ kind: OWN_ROW_READ_ABSENT })
+    expect(await readPersonaOwnRowStatus(p, STATUS_READ_SITE)).toStrictEqual({ kind: OWN_ROW_STATUS_ABSENT })
+
+    expectNoNoteLatch(h)
+    expectNothingCleared(h, p, before)
+    expect(h.retiredKeys.isMarked(p)).toBe(true)
+  })
+
+  // With no store installed no key counts as marked; a mark query that throws
+  // counts as not marked, with one line. Either way the read answers as before.
+  test.each<[string, (h: RecoveryHarness, cleared: string[]) => void, number]>([
+    ['no retired-key store installed', () => _resetRetiredKeyStore(), 0],
+    [
+      'the installed store\'s mark query throws (taken as not marked)',
+      (h, cleared) =>
+        setRetiredKeyStore({
+          isMarked: () => {
+            throw new Error('mark query broken')
+          },
+          clear: (key, onRead) => {
+            cleared.push(key)
+            return h.retiredKeys.clear(key, onRead)
+          },
+        }),
+      1,
+    ],
+  ])('%s: the shared get read of P\'s own row reading waiting with P\'s mark set in the file answers the row, unlatched, and clears nothing', async (_label, install, queryLines) => {
+    const { h, p } = retiredBuild()
+    const before = readFileSync(h.retiredKeys.path)
+    const cleared: string[] = []
+    install(h, cleared)
+    const row = harnessRow(h, harnessPersona(h, p), { state: 'waiting' })
+    h.script({ getResult: row })
+
+    expect(await readPersonaOwnRow(p, DEDUP_SITE)).toEqual({ kind: OWN_ROW_READ_ROW, row, latched: false })
+
+    expect(cleared).toEqual([])
+    expect(readFileSync(h.retiredKeys.path).equals(before)).toBe(true)
+    expect(h.retiredKeyWrites).toEqual([])
+    const lines = retiredKeyLinesIn(h.errors)
+    expect(lines).toHaveLength(queryLines)
+    for (const line of lines) {
+      expect(line).toStartWith(`[slack] retired-keys: the mark query for persona=${p} failed: `)
+      expect(line).toEndWith('; nothing is cleared (b.jg5 SRJ-807)')
+    }
+  })
+})
+
+describe('b.jg5 SRJ-807: a clear whose write fails leaves the entry and changes nothing the site does; the next qualifying read clears it', () => {
+  afterEach(srj105AfterEach)
+
+  test('the collision get reading P\'s own row waiting with P\'s mark set, its clear\'s write refused: the ladder reconnects as usual; P\'s entry stays in memory and in the file, with one line; the next qualifying read (the shared get read) clears it, with one line', async () => {
+    const { h, p, b } = retiredBuild()
+    const path = h.retiredKeys.path
+    const before = readFileSync(path)
+    h.failRetiredKeyWrites()
+    h.script(collided(h, harnessPersona(h, p), { state: 'waiting' }))
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'reconnected' })
+
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: 1 }))
+    expect(readFileSync(path).equals(before)).toBe(true)
+    expect([h.retiredKeys.isRecorded(p), h.retiredKeys.isMarked(p)]).toEqual([true, true])
+    expect(h.retiredKeyWrites).toEqual([{ path, ok: false }])
+    const failed = retiredEntryClearFailedLine(path, p, 'waiting', COLLISION_GET_SITE)
+    expect(retiredKeyLinesIn(h.errors)).toEqual([failed])
+
+    const row = harnessRow(h, harnessPersona(h, p), { state: 'waiting' })
+    h.script({ getResult: row })
+    expect(await readPersonaOwnRow(p, DEDUP_SITE)).toEqual({ kind: OWN_ROW_READ_ROW, row, latched: false })
+
+    expect(readRetiredKeysRecord(h.stateDir)).toEqual(retiredKeysRecordOf({ [b]: MARKED_SEED }))
+    expect(h.retiredKeys.isRecorded(p)).toBe(false)
+    expect(h.retiredKeyWrites).toEqual([{ path, ok: false }, { path, ok: true }])
+    expect(retiredKeyLinesIn(h.errors)).toEqual([failed, clearedLine(h, p, 'waiting', DEDUP_SITE)])
+    expectUntouched(h, b)
   })
 })
 

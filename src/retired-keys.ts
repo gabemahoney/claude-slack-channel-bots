@@ -50,7 +50,10 @@
  *   - `isHeldInMemory`: the apply's step 1, which writes the record for a
  *     persona it brings up whose key is held only in memory (SRJ-803);
  *   - `mark`: a reuse spawn that began the key's new life (SRJ-806);
- *   - `clear`: the row-read rule, for a marked key's row read live (SRJ-807);
+ *   - `clear`: the session manager's shared own-row reads
+ *     (`readPersonaOwnRow`, `applyOwnRowStatusStep`), on the row-read rule's
+ *     clear decision for a marked key's row read live other than `pending`
+ *     (SRJ-807);
  *   - `isRecorded`, `isMarked` and `entry`: the launch rule (SRJ-805), the
  *     row-read rule and the old-life hold (SRJ-809).
  *
@@ -61,7 +64,7 @@
  *
  *   [slack] retired-keys: recorded persona=<key> (cause=<cause>), … in "<path>" …
  *   [slack] retired-keys: persona=<key> marked: its new life has begun …
- *   [slack] retired-keys: persona=<key> entry cleared …
+ *   [slack] retired-keys: persona=<key> entry cleared from "<path>"[ on <read>] …
  *   [slack] retired-keys: restored the record held before the apply …
  *   [slack] retired-keys: cannot <action> …
  *
@@ -435,8 +438,12 @@ export interface RetiredKeyStore {
    * failed write keeps the mark set in memory, held for a later write.
    */
   mark(key: string): RetiredKeysChangeOutcome
-  /** Remove `key`'s entry with one write (SRJ-807). Writes nothing for a key not recorded; a failed write keeps the entry. */
-  clear(key: string): RetiredKeysChangeOutcome
+  /**
+   * Remove `key`'s entry with one write (SRJ-807). Writes nothing for a key
+   * not recorded; a failed write keeps the entry. `onRead`, when given, says
+   * which read cleared it, and the one line the clear logs carries it.
+   */
+  clear(key: string, onRead?: string): RetiredKeysChangeOutcome
   /** The record in memory now, unwritten changes included. */
   snapshot(): RetiredKeysSnapshot
   /**
@@ -666,20 +673,21 @@ function createRetiredKeyStore(
     return RETIRED_KEYS_WRITE_FAILED
   }
 
-  function clear(key: string): RetiredKeysChangeOutcome {
+  function clear(key: string, onRead?: string): RetiredKeysChangeOutcome {
     if (!entries.has(key)) return RETIRED_KEYS_NOT_RECORDED
     const next = new Map(entries)
     next.delete(key)
     const carried = carriedSuffix()
+    const read = onRead === undefined || onRead === '' ? '' : ` on ${onRead}`
     const attempt = writeWhole(next)
     if (attempt.ok) {
       committed(next)
-      safeLog(deps.log, `${RETIRED_KEYS_LOG_PREFIX} ${keyRef(key)} entry cleared from ${file}${carried} (b.jg5 SRJ-807)`)
+      safeLog(deps.log, `${RETIRED_KEYS_LOG_PREFIX} ${keyRef(key)} entry cleared from ${file}${read}${carried} (b.jg5 SRJ-807)`)
       return RETIRED_KEYS_WRITTEN
     }
     safeLog(
       deps.log,
-      `${RETIRED_KEYS_LOG_PREFIX} cannot clear ${keyRef(key)} from ${file}${attempt.detail}; the entry stays, and the next ` +
+      `${RETIRED_KEYS_LOG_PREFIX} cannot clear ${keyRef(key)} from ${file}${read}${attempt.detail}; the entry stays, and the next ` +
         'qualifying read clears it again (b.jg5 SRJ-807)',
     )
     return RETIRED_KEYS_WRITE_FAILED

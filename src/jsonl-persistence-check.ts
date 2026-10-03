@@ -399,10 +399,11 @@ function defaultStatFn(path: string): boolean {
 /**
  * Default AD row fetch — routed through withOutageDetection (the sanctioned
  * single CSCB→AD entry point) so an AD outage is flagged against this persona.
- * b.jg5 SRJ-122: this `get` is not one of SRJ-114's sites, so neither
- * decision of `src/row-read-rules.ts` applies here: a liveness note on the
+ * b.jg5 SRJ-122: this `get` is not one of SRJ-114's sites, so none of the
+ * decisions of `src/row-read-rules.ts` applies here: a liveness note on the
  * row, `provenance_conflict` included, and a `pending` row with no launch
- * start (SRJ-513) latch no one and change nothing.
+ * start (SRJ-513) latch no one, and a retired key's row read live with its
+ * mark set clears no retired-key entry (SRJ-807); they change nothing.
  */
 function defaultGetRow(key: string, claudeInstanceId: string): Promise<GetResult> {
   return withOutageDetection(key, undefined, 'get', (client) =>

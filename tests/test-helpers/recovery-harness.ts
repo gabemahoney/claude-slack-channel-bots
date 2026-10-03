@@ -301,6 +301,21 @@
  *   it is applied, so a `provenance_conflict` note on a configured persona's
  *   own row latches it through `latch`, and a key outside the harness's
  *   personas, or one `remove(key)` dropped, counts as not configured.
+ * - `retiredKeys` (b.jg5 SRJ-807): the one retired-key store, read at build
+ *   over `stateDir` as `main()`'s start read reads it
+ *   (`readRetiredKeysAtStart`, its lines to `console.error`, so to `errors`)
+ *   and installed in the session manager right after the configured-persona
+ *   query (`setRetiredKeyStore`), as `main()` installs it; so any key's own
+ *   row read live other than `pending` while its mark is set clears its
+ *   entry. The store reads the record once, so a case seeds it through
+ *   `options.retiredKeys` (the entries by key, given the persona keys),
+ *   which the harness writes with `writeRetiredKeysRecord` into `stateDir`
+ *   before the load; with none there is no file. Its writes go through the
+ *   production durable writer, each recorded in `retiredKeyWrites` (path,
+ *   and whether it went through); `failRetiredKeyWrites(count?)` refuses the
+ *   next `count` (1 by default) with `RECOVERY_RETIRED_KEY_WRITE_FAILURE_CODE`
+ *   before they touch the file. A record the store refuses to read fails the
+ *   build, with everything it installed put back.
  * - `tickEnd(key)`: what a health tick's healthy branch does to the
  *   condition, as `main()` binds `HealthCheckDeps.endTmuxUnresponsive`: the
  *   condition's end with reason `TMUX_UNRESPONSIVE_END_TICK` and the `live`
@@ -572,6 +587,8 @@
  *   the kill retry's keep-going query,
  *   the configured-persona query (`_resetConfiguredPersonaQuery`), so two
  *   harnesses built one after the other share no query,
+ *   the retired-key store's install (`_resetRetiredKeyStore`), so none is
+ *   left installed after it,
  *   the stub spawn path and client with every launch still in flight and the
  *   approver's clock and cap, the
  *   findMissing memo, the tmux seams, the settings install, the version
@@ -590,7 +607,11 @@
  *
  * Shared case helpers, each over a harness: `personaOf` (a configured
  * persona), `personaRow` (a persona's own row as a `get` reads it, with
- * overrides), `pastSampleGrace` (the clock moved to G past the stub's sample
+ * overrides), the retired-key store's clear lines (b.jg5 SRJ-807; src
+ * exports no builder for them): `retiredEntryClearedLine` and
+ * `retiredEntryClearFailedLine` (a write `failRetiredKeyWrites` refused), each
+ * for the record's path, the key, the state read and the read's site, and
+ * `retiredKeyLinesIn` (the store's lines among some lines), `pastSampleGrace` (the clock moved to G past the stub's sample
  * launch start, so a `pending` row is waited on no longer), `unavailableAt`
  * (an UNAVAILABLE answer of a verb), `expectUntouched` (a persona left
  * alone: no trigger, timer, notice, outage flag or call),
@@ -740,7 +761,7 @@ import {
   type TmuxUnresponsiveEndResult,
   type UnclassifiedErrorEndReason,
 } from '../../src/persona-episodes.ts'
-import { personaInstanceId, personaSpawnEnv, personaTmuxSessionName } from '../../src/persona-identity.ts'
+import { PERSONA_KEY_RE, personaInstanceId, personaSpawnEnv, personaTmuxSessionName } from '../../src/persona-identity.ts'
 import { createPersonaRouting, type PersonaRouting } from '../../src/persona-routing.ts'
 import { createPersonaSerializer, type PersonaSerializer } from '../../src/persona-serializer.ts'
 import { createPersonaRelaunchGate, createPersonaUpPredicate, type PersonaUpQuery } from '../../src/persona-start.ts'
@@ -781,6 +802,7 @@ import {
   DIALOG_POLL_INTERVAL_MS,
   _resetConfiguredPersonaQuery,
   _resetDialogApprovers,
+  _resetRetiredKeyStore,
   _resetFindMissingMemo,
   _resetInvalidFlagsHold,
   _resetLiveRowSequenceRegistry,
@@ -800,6 +822,7 @@ import {
   setKillFailureAlerts,
   setLiveRowSequenceRegistry,
   setPersonaKillKeepGoingQuery,
+  setRetiredKeyStore,
   setSessionNotifier,
   spawnForPersona,
   startLiveRowSequence,
@@ -811,6 +834,9 @@ import {
   type ApproverOutcome,
   type SpawnPersonaResult,
 } from '../../src/session-manager.ts'
+import { durableWriteFileSync } from '../../src/atomic-write.ts'
+import type { OwnRowReadSite } from '../../src/session-manager.ts'
+import { readRetiredKeysAtStart, RETIRED_KEYS_LOG_PREFIX, type RetiredKeyStore, type RetiredKeysWriter } from '../../src/retired-keys.ts'
 import { createSlowRecoveryTracker, type SlowRecoveryTracker } from '../../src/slow-recovery.ts'
 import { recordStartupError } from '../../src/startup-errors.ts'
 import {
@@ -881,6 +907,7 @@ import { makeMultiPersonaConfig, type PersonaSpec } from './persona-config.ts'
 import { makeNotifierStack } from './persona-notifier.ts'
 import { stateOf } from './persona-routing-harness.ts'
 import { makeChannelMessage, makeStubSlack, type StubSlack } from './slack-stub.ts'
+import { writeRetiredKeysRecord, type RetiredKeySeed } from './retired-keys.ts'
 
 /** Clock flushes `advance` waits at most for the in-flight retry runs, before and after each firing. */
 const DEFAULT_SETTLE_FLUSHES = 20
@@ -940,7 +967,23 @@ export interface RecoveryHarnessOptions {
    * that needs later laps passes a larger cap.
    */
   approverCapMs?: number
+  /**
+   * The retired-key record the store reads at build (b.jg5 SRJ-807): the
+   * entries by key, given the harness's persona keys, written into `stateDir`
+   * through `writeRetiredKeysRecord` before the store loads; no file (an
+   * empty record) when unset.
+   */
+  retiredKeys?: (keys: readonly string[]) => Readonly<Record<string, RetiredKeySeed>>
 }
+
+/** One write the harness's retired-key store made: its path, and whether it went through (false: `failRetiredKeyWrites` refused it). */
+export interface RecoveryRetiredKeyWrite {
+  readonly path: string
+  readonly ok: boolean
+}
+
+/** The errno a write refused by `failRetiredKeyWrites` throws with, before it touches the file. */
+export const RECOVERY_RETIRED_KEY_WRITE_FAILURE_CODE = 'ENOSPC'
 
 /** The stub's answer knobs: every `StubClientOptions` field but the capture lists. */
 export type RecoveryStubScript = Omit<StubClientOptions, keyof StubCallLog | 'callLog'>
@@ -1142,6 +1185,16 @@ export interface RecoveryHarness {
   readonly invalidFlagsHold: RecoveryInvalidFlagsHoldView
   /** Every retry at once the version-changed listener ran, in order. */
   readonly retriesAtOnce: RecoveryRetryAtOnce[]
+  /**
+   * The harness's one retired-key store (b.jg5 SRJ-807), loaded over
+   * `stateDir` and installed in the session manager as `main()` loads and
+   * installs it; see the module comment.
+   */
+  readonly retiredKeys: RetiredKeyStore
+  /** Every write the retired-key store made, in order. */
+  readonly retiredKeyWrites: readonly RecoveryRetiredKeyWrite[]
+  /** Refuse the retired-key store's next `count` writes (1 when unset), each before it touches the file. */
+  failRetiredKeyWrites(count?: number): void
   /**
    * Install agent-director's version re-check on the harness clock as
    * `main()` installs it, its binary resolve answering `initial` until the
@@ -1520,6 +1573,34 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     errors.push(args.map(String).join(' '))
   }
 
+  // As main() reads its one retired-key store at start (b.jg5 SRJ-802), over
+  // the harness's state directory, its lines to `console.error` (so to
+  // `errors`); the record a case asked for is written there first. Its writes
+  // go through the production durable writer, each recorded, and the next
+  // `failRetiredKeyWrites` ones refused before they touch the file. Installed
+  // in the session manager below, beside the configured-persona query.
+  const retiredKeyWrites: RecoveryRetiredKeyWrite[] = []
+  let refuseRetiredKeyWrites = 0
+  const writeRetiredKeys: RetiredKeysWriter = (path, bytes) => {
+    if (refuseRetiredKeyWrites > 0) {
+      refuseRetiredKeyWrites--
+      retiredKeyWrites.push({ path, ok: false })
+      throw Object.assign(new Error(`${RECOVERY_RETIRED_KEY_WRITE_FAILURE_CODE}: no space left on device`), { code: RECOVERY_RETIRED_KEY_WRITE_FAILURE_CODE })
+    }
+    durableWriteFileSync(path, bytes)
+    retiredKeyWrites.push({ path, ok: true })
+  }
+  if (options.retiredKeys !== undefined) writeRetiredKeysRecord(stateDir, options.retiredKeys(keys))
+  const retiredKeysStart = readRetiredKeysAtStart(stateDir, { log: (line) => console.error(line), write: writeRetiredKeys })
+  if (retiredKeysStart.kind !== 'loaded') {
+    console.error = savedConsoleError
+    if (savedStateDir === undefined) delete process.env['SLACK_STATE_DIR']
+    else process.env['SLACK_STATE_DIR'] = savedStateDir
+    rmSync(root, { recursive: true, force: true })
+    throw new Error('recovery harness: the retired-key record the case seeded cannot be read')
+  }
+  const retiredKeys = retiredKeysStart.store
+
   const stub = installStubSpawnPath(home)
   // The dialog approver runs on the harness clock (b.jg5 SRJ-401): its sleeps
   // between laps and its cap timer are harness-clock timers, tracked here so
@@ -1644,6 +1725,10 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   // configured while it is in the live applied set, so a note on a persona's
   // own row latches it and a key outside the set, or removed from it, does not.
   setConfiguredPersonaQuery((key) => appliedPersona(key) !== undefined)
+  // As main() installs it, right after the configured-persona query (b.jg5
+  // SRJ-807): any key's own row read live other than pending while the store
+  // has the key recorded with its mark set clears its entry.
+  setRetiredKeyStore(retiredKeys)
   // As main() installs them, before any launch (b.jg5 SRJ-704, SRJ-1016):
   // the restart path's kill and the live-row sequence's kills raise through
   // them, and the session manager's own-row reads end a persona's episode.
@@ -2137,6 +2222,11 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       heldKeys: () => invalidFlagsHold.heldKeys(),
     }),
     retriesAtOnce,
+    retiredKeys,
+    retiredKeyWrites,
+    failRetiredKeyWrites(count = 1) {
+      refuseRetiredKeyWrites = count
+    },
     versionRecheck(initial = { version: PHASE1_RC_VERSION }) {
       // As main() installs it: one re-check, never two (a leftover install
       // would answer the triggers instead of this one).
@@ -2371,6 +2461,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       unbindHold()
       setKillFailureAlerts(undefined)
       _resetConfiguredPersonaQuery()
+      _resetRetiredKeyStore()
       setPersonaKillKeepGoingQuery(undefined)
       for (const unbind of unbindLatch) unbind()
       resetStubSpawnPath()
@@ -2427,6 +2518,40 @@ export function personaOf(h: RecoveryHarness, key: string): Persona {
  */
 export function personaRow(h: RecoveryHarness, key: string, overrides: PersonaGetResultOverrides = {}): CannedGetResult {
   return cannedGetResult(overrides, personaOf(h, key), h.home)
+}
+
+/** How the retired-key store's lines name key `key`: `persona=<key>`, the key JSON-quoted unless it is a persona key. */
+function retiredKeyRef(key: string): string {
+  return `persona=${PERSONA_KEY_RE.test(key) ? key : JSON.stringify(key)}`
+}
+
+/** How the retired-key store's clear lines name the read that cleared (b.jg5 SRJ-807): the state it read and the site's `<site>: <what>`. */
+function retiredClearReadText(state: string, at: Pick<OwnRowReadSite, 'site' | 'what'>): string {
+  return `its row read ${state} with its mark set (${at.site}: ${at.what})`
+}
+
+/**
+ * The retired-key store's one line for a clear of persona `key`'s entry from
+ * the record at `path`, on its row read `state` at `at` (b.jg5 SRJ-807).
+ */
+export function retiredEntryClearedLine(path: string, key: string, state: string, at: Pick<OwnRowReadSite, 'site' | 'what'>): string {
+  return `${RETIRED_KEYS_LOG_PREFIX} ${retiredKeyRef(key)} entry cleared from ${JSON.stringify(path)} on ${retiredClearReadText(state, at)} (b.jg5 SRJ-807)`
+}
+
+/**
+ * The retired-key store's one line for that clear when its write was refused
+ * before it touched the file (`failRetiredKeyWrites`): the entry stays.
+ */
+export function retiredEntryClearFailedLine(path: string, key: string, state: string, at: Pick<OwnRowReadSite, 'site' | 'what'>): string {
+  return (
+    `${RETIRED_KEYS_LOG_PREFIX} cannot clear ${retiredKeyRef(key)} from ${JSON.stringify(path)} on ${retiredClearReadText(state, at)} ` +
+    `(${RECOVERY_RETIRED_KEY_WRITE_FAILURE_CODE}); the file is unchanged; the entry stays, and the next qualifying read clears it again (b.jg5 SRJ-807)`
+  )
+}
+
+/** The retired-key store's lines among `lines`, in order. */
+export function retiredKeyLinesIn(lines: readonly string[]): string[] {
+  return lines.filter((line) => line.startsWith(`${RETIRED_KEYS_LOG_PREFIX} `))
 }
 
 /**

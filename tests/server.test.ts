@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative, resolve } from 'node:path'
 import {
@@ -246,7 +246,11 @@ import {
   type PersonaEpisodes,
 } from '../src/persona-episodes.ts'
 import { KILL_FAILURE_CONTEXT_RECOVERY } from '../src/kill-failure-alert.ts'
-import { killFailureEndedLine } from './test-helpers/recovery-harness.ts'
+import { killFailureEndedLine, retiredEntryClearedLine, retiredKeyLinesIn } from './test-helpers/recovery-harness.ts'
+import { _resetRetiredKeyStore, setRetiredKeyStore } from '../src/session-manager.ts'
+import { loadRetiredKeyStore, RETIRED_KEY_CAUSE_REMOVED, retiredKeysPath, type RetiredKeyStore } from '../src/retired-keys.ts'
+import { RETIRED_ENTRY_CLEARING_STATES } from '../src/row-read-rules.ts'
+import { readRetiredKeysRecord, retiredKeysRecordOf, writeRetiredKeysRecord, type RetiredKeySeed } from './test-helpers/retired-keys.ts'
 import {
   KILL_OUTCOME_KILLED,
   KILL_OUTCOME_NOT_KILLED,
@@ -4423,6 +4427,152 @@ describe('b.jg5 SRJ-704, SRJ-1016: the liveness and reconnect adapters\' own-row
 
     expect(alerts.isOpen('C1')).toBe(true)
     expect(lines.filter((line) => line.includes(' ended — '))).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-807 at SRJ-115's adapter sites: the liveness and reconnect
+// adapters clear a retired key's entry through their own-row step
+//
+// Both adapters apply the session manager's own-row `status` step after their
+// own call, so C1's own row read `waiting`, `working`, `ask_user` or
+// `check_permission` while C1 is recorded with its mark set clears C1's entry
+// from the retired-key record, durably, with the store's one line naming the
+// adapter's read; the reading (the health tick's, the restart path's, the
+// re-probe's and the lost-message read's) and the reconnect's answer are the
+// ones the same row gives today. `pending`, `ended`, `missing`, a failed read
+// and `ErrSpawnNotFound` clear nothing and keep their readings. The store is
+// loaded over the case's own `mkdtempSync` state directory, its record
+// seeded with C1 and C2 both marked (so C2's entry shows a read of C1's row
+// clears no other key's), and installed with `setRetiredKeyStore` as main()
+// installs it, removed in `afterEach`. The lost-message read through the real
+// routing is tests/inbound-recovery-drop-branch.test.ts's; the shared reads
+// themselves are tests/session-manager.test.ts's.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-807, SRJ-115: the liveness and reconnect adapters clear a retired key\'s entry on its own row read live other than pending with its mark set, and read and answer as before', () => {
+  const SEED: RetiredKeySeed = { cause: RETIRED_KEY_CAUSE_REMOVED, mark: true }
+  const LIVENESS_SITE = { site: 'isSessionAlive', what: 'status' }
+  const RECONNECT_SITE = { site: 'reconnectSession', what: 'status check' }
+
+  let dir: string
+  let store: RetiredKeyStore
+  /** The record file's bytes as seeded. */
+  let seeded: Buffer
+  /** The store's own lines. */
+  let storeLines: string[]
+  let captured: unknown[][]
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'server-retired-clear-'))
+    storeLines = []
+    captured = []
+    writeRetiredKeysRecord(dir, { C1: SEED, C2: SEED })
+    seeded = readFileSync(retiredKeysPath(dir))
+    const loaded = loadRetiredKeyStore(dir, { log: (line) => { storeLines.push(line) } })
+    if (loaded.kind !== 'loaded') throw new Error(loaded.message)
+    store = loaded.store
+    setRetiredKeyStore(store)
+    setConfiguredPersonaQuery((key) => key === 'C1' || key === 'C2')
+  })
+
+  afterEach(() => {
+    _resetRetiredKeyStore()
+    _resetConfiguredPersonaQuery()
+    resetClientForTests()
+    _resetOutageState()
+    _resetFindMissingMemo()
+    _resetNotConnectedEpisodes()
+    setSessionNotifier(undefined)
+    rmSync(dir, { recursive: true, force: true })
+    assertNoLeak({ captured, storeLines })
+  })
+
+  /** A stub whose `status` answers `answer` for C1's row (thrown when an error) and `waiting` for every other row; every send-keys succeeds. */
+  function install(answer: Error | Phase1StatusResult): StubCallLog {
+    const log = makeStubCallLog()
+    const stub = makeStubClient({
+      ...log,
+      statusFn: ({ claude_instance_id }) => (claude_instance_id === personaInstanceId('C1') ? answer : cannedStatusResult({ state: 'waiting' })),
+      sendKeysResult: {},
+    })
+    _resetOutageState()
+    initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
+    setClientForTests(stub as unknown as Client)
+    setSessionNotifier(() => {})
+    return log
+  }
+
+  /** `fn`'s result, its `console.error` lines kept for the leak check. */
+  async function run<T>(fn: () => Promise<T>): Promise<T> {
+    const { result, errArgs } = await capturingErrorArgs(fn)
+    captured.push(...errArgs)
+    return result
+  }
+
+  const livenessRead = (key: string) => {
+    const config = makeStandInPersonaConfig({ C1: {}, C2: {} }, dir)
+    return run(() => _buildIsSessionAliveAdapter(() => config)(key))
+  }
+  const reconnectRead = (key: string) => run(() => _buildReconnectSessionAdapter(undefined, () => false)(key))
+
+  /** C1's entry was cleared once, at `site`'s read of `state`: the file holds C2's alone, C2 still marked, one line. */
+  function expectC1Cleared(state: string, site: { site: string; what: string }): void {
+    expect(readRetiredKeysRecord(dir)).toEqual(retiredKeysRecordOf({ C2: SEED }))
+    expect([store.isRecorded('C1'), store.isMarked('C2')]).toEqual([false, true])
+    expect(retiredKeyLinesIn(storeLines)).toEqual([retiredEntryClearedLine(store.path, 'C1', state, site)])
+  }
+
+  /** Nothing cleared: the file as seeded, no line, C1 still marked. */
+  function expectNothingCleared(): void {
+    expect(readFileSync(store.path).equals(seeded)).toBe(true)
+    expect(storeLines).toEqual([])
+    expect(store.isMarked('C1')).toBe(true)
+  }
+
+  test.each([...RETIRED_ENTRY_CLEARING_STATES].map((state) => [state] as const))('liveness adapter, C1\'s row reading %s with C1\'s mark set: reads live, and C1\'s entry is cleared with one line naming the read; C2\'s entry stays', async (state) => {
+    const log = install(cannedStatusResult({ state }))
+
+    expect(await livenessRead('C1')).toEqual(LIVENESS_READING_LIVE)
+
+    expect(log.statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
+    expect(stubCallCount(log)).toBe(1)
+    expectC1Cleared(state, LIVENESS_SITE)
+  })
+
+  test.each<[string, () => Error | Phase1StatusResult, LivenessReading]>([
+    ['pending (a launch start recorded)', () => cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_WHOLE }), { ...LIVENESS_READING_PENDING, launchStartedAt: SAMPLE_LAUNCH_START_WHOLE }],
+    ['ended', () => cannedStatusResult({ state: 'ended' }), LIVENESS_READING_DEAD_ENDED],
+    ['missing', () => cannedStatusResult({ state: 'missing' }), LIVENESS_READING_DEAD_MISSING],
+    ['a failed read (ErrTmuxUnresponsive)', () => errTmuxUnresponsive('status'), LIVENESS_READING_UNKNOWN],
+    ['ErrSpawnNotFound', () => errSpawnNotFound(), LIVENESS_READING_DEAD_NO_ROW],
+  ])('liveness adapter, C1\'s status answering %s with C1\'s mark set: the reading is unchanged and nothing is cleared', async (_label, answer, reading) => {
+    install(answer())
+
+    expect(await livenessRead('C1')).toEqual(reading)
+
+    expectNothingCleared()
+  })
+
+  test('reconnect adapter, C1\'s row reading waiting with C1\'s mark set: success, /mcp reconnect typed into C1 once as today, and C1\'s entry is cleared with one line naming the read; C2\'s entry stays', async () => {
+    const log = install(cannedStatusResult({ state: 'waiting' }))
+
+    expect(await reconnectRead('C1')).toBe('success')
+
+    expect(log.sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
+    expectC1Cleared('waiting', RECONNECT_SITE)
+  })
+
+  test.each<[string, () => Error | Phase1StatusResult, AdapterAnswer]>([
+    ['pending (a launch start recorded)', () => cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_WHOLE }), 'pending'],
+    ['a failed read (ErrTmuxUnresponsive)', () => errTmuxUnresponsive('status'), 'transient'],
+  ])('reconnect adapter, C1\'s status answering %s with C1\'s mark set: the answer is unchanged, nothing is typed and nothing is cleared', async (_label, answer, expected) => {
+    const log = install(answer())
+
+    expect(await reconnectRead('C1')).toEqual(expected)
+
+    expect(log.sendKeysCalls).toEqual([])
+    expectNothingCleared()
   })
 })
 

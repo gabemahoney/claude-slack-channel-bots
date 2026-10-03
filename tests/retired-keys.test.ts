@@ -30,12 +30,30 @@
  * - Held changes (SRJ-714, SRJ-806, SRJ-807; hatch A3): the keys of a failed
  *   `absent-at-start` batch and a failed mark stay in memory, the next write
  *   that succeeds carries them, and `isHeldInMemory` tells which keys are held.
+ * - When an entry is cleared (SRJ-807, SRJ-114, SRJ-115, SRJ-116, SRJ-513;
+ *   hatch A3), over src/row-read-rules.ts's decision with the mark answered
+ *   by a real store: a decision table over a `status` result, a `get` row and
+ *   a `list` row, in which each of the four clearing states of the key's own
+ *   row with the mark set decides the clear alone, configured or not; a
+ *   `pending` row (with or without a launch start), `ended`, `missing` and a
+ *   state CSCB does not know never clear, and the mark changes nothing the
+ *   rule decides for them; a key recorded with no mark, a key not recorded,
+ *   another key's or caller's row and no mark answer never clear; a
+ *   configured persona's own `pending` row with no launch start, recorded as
+ *   a destructive modify's old half, with and without the mark, decides the
+ *   launch-start latch only; a live row carrying the latching note with the
+ *   mark set decides both the note latch and the clear. End to end over the
+ *   store: a clear decided on a read removes only that entry, in one write,
+ *   durably, with one line naming the read; no other read, record or mark
+ *   removes an entry; a clear whose write fails keeps the entry in memory and
+ *   in the file, and the next qualifying read clears it.
  *
  * Isolation: every file sits under a per-test `mkdtempSync` root removed in
  * `afterEach`; the store's clock is a `createFakeClock`; the record is
  * seeded and read only through tests/test-helpers/retired-keys.ts or the
  * module's own serialiser; constants, causes, labels and texts come from
- * src/, but for the one pin case. No `mock.module`.
+ * src/, but for the pin cases; rows, notes and launch starts come from the
+ * stub's builders. No `mock.module`.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -93,6 +111,26 @@ import {
   type RetiredKeysWriter,
 } from '../src/retired-keys.ts'
 import { recordStartupError } from '../src/startup-errors.ts'
+import { LATCH_CASE_CONFLICTING_LABELS, latchRowStateRead, REFUSED_OPERATION_BRING_UP } from '../src/conflict-latch.ts'
+import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_LIVE_STATES, AGENT_DIRECTOR_PENDING_STATE } from '../src/liveness-reading.ts'
+import { personaInstanceId } from '../src/persona-identity.ts'
+import {
+  decideOwnRowRead,
+  decideRetiredEntryClear,
+  RETIRED_ENTRY_CLEARING_STATES,
+  ROW_READ_LAUNCH_START_NOT_RECORDED,
+  ROW_READ_NO_DECISION,
+  type RowReadDecision,
+  type RowReadRow,
+} from '../src/row-read-rules.ts'
+import { cannedGetResult, cannedListRow, cannedStatusResult, provenanceNote, SAMPLE_LAUNCH_START_NONE } from './test-helpers/agent-director-stub.ts'
+import {
+  LAUNCH_START_ANOTHER_CALLERS_ID,
+  LAUNCH_START_READ_SHAPES,
+  NO_LAUNCH_START_FORM_NAMES,
+  NO_LAUNCH_START_FORMS,
+  type LaunchStartReadShape,
+} from './test-helpers/conflict-cases.ts'
 import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, writtenFile } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { makeFifo, mkfifoAvailable } from './test-helpers/fifo.ts'
@@ -913,5 +951,241 @@ describe('changes held in memory after a failed write (b.jg5 SRJ-714, SRJ-803, S
     rig.store.record([{ key: 'swept', cause: RETIRED_KEY_CAUSE_ABSENT_AT_START }])
     expect(rig.store.isRecorded('swept')).toBe(true)
     expect(rig.store.isHeldInMemory('swept')).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// When an entry is cleared (SRJ-807; the clear rule of SRJ-114, SRJ-115 and
+// SRJ-116; SRJ-513's latch beside it)
+// ---------------------------------------------------------------------------
+
+/** The fields a read's row is built from; a `status` result carries no note. */
+interface RowFields {
+  readonly state: string
+  readonly launch_started_at?: string | null
+  readonly liveness_note?: string
+}
+
+/**
+ * Row `rowId` as the rule reads it, from the stub's builder for `shape`: a
+ * `get` or `list` row as built; a `status` result given `rowId`, as the
+ * own-row `status` step gives it (its note, which `status` never carries,
+ * dropped). A `pending` row with no `launch_started_at` key gets the stub's
+ * default launch start.
+ */
+function rowRead(shape: LaunchStartReadShape, rowId: string, fields: RowFields): RowReadRow {
+  if (shape === 'status') {
+    const { liveness_note: _status_carries_no_note, ...statusFields } = fields
+    return { ...cannedStatusResult(statusFields), claude_instance_id: rowId }
+  }
+  return shape === 'get' ? cannedGetResult({ claude_instance_id: rowId, ...fields }) : cannedListRow({ claude_instance_id: rowId, ...fields })
+}
+
+/** Key `key`'s own row (`cscb_<key>`), read with `shape`. */
+const ownRow = (shape: LaunchStartReadShape, key: string, fields: RowFields): RowReadRow => rowRead(shape, personaInstanceId(key), fields)
+
+/** The rule's decision over a read made for `key`, its mark answered by `store`, as the shared reads ask it. */
+function decide(store: RetiredKeyStore, key: string, row: RowReadRow, configured: boolean): RowReadDecision {
+  return decideOwnRowRead({ key, row, configured, retiredMarked: store.isMarked(key) })
+}
+
+/** A store over a record holding `seed`. */
+function storeOver(seed: Readonly<Record<string, RetiredKeySeed>>): RetiredKeyStore {
+  writeRetiredKeysRecord(dir, seed)
+  return openStore().store
+}
+
+/** The four states that clear, in agent-director's order, as the pin case checks them. */
+const CLEARING_STATES = [...RETIRED_ENTRY_CLEARING_STATES]
+
+/** A state CSCB does not know: a clearing state's spelling with more after it, so a prefix match clears on it. */
+const UNKNOWN_STATE = `${CLEARING_STATES[0]}_elsewhere`
+
+/** Every read shape × every clearing state × configured or not. */
+const CLEARING_ROWS = LAUNCH_START_READ_SHAPES.flatMap((shape) =>
+  CLEARING_STATES.flatMap((state) => [true, false].map((configured) => [shape, state, configured] as const)),
+)
+
+/** The row fields that never clear, by name: `pending` with and without a launch start, the dead states, and a state CSCB does not know. */
+const NON_CLEARING_FIELDS: ReadonlyArray<readonly [string, RowFields]> = [
+  ['pending with a launch start', { state: AGENT_DIRECTOR_PENDING_STATE }],
+  ...NO_LAUNCH_START_FORM_NAMES.map((form) => [
+    `pending with no launch start (${form})`,
+    { state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: NO_LAUNCH_START_FORMS[form] },
+  ] as const),
+  ...[...AGENT_DIRECTOR_DEAD_STATES].map((state) => [state, { state }] as const),
+  ['a state CSCB does not know', { state: UNKNOWN_STATE }],
+]
+
+/** Every read shape × every non-clearing row × configured or not. */
+const NON_CLEARING_ROWS = LAUNCH_START_READ_SHAPES.flatMap((shape) =>
+  NON_CLEARING_FIELDS.flatMap(([name, fields]) => [true, false].map((configured) => [shape, name, configured, fields] as const)),
+)
+
+/**
+ * Reads that never clear whatever their state, over {@link SEED} (`alpha`
+ * marked, `beta` not, `gamma` not recorded), by name: the key the read is
+ * made for and the id of the row it reads.
+ */
+const OTHER_KEY_READS: ReadonlyArray<readonly [string, string, string]> = [
+  ['the own row of a key recorded with no mark', 'beta', personaInstanceId('beta')],
+  ['the own row of a key not recorded', 'gamma', personaInstanceId('gamma')],
+  ['the marked key\'s own row, read for an unmarked key', 'beta', personaInstanceId('alpha')],
+  ['another key\'s own row, read for the marked key', 'alpha', personaInstanceId('beta')],
+  ['another caller\'s row, read for the marked key', 'alpha', LAUNCH_START_ANOTHER_CALLERS_ID],
+  ['a row whose id only starts with the marked key\'s own, read for it', 'alpha', `${personaInstanceId('alpha')}_x`],
+]
+
+describe('the entry-clear decision over one read of a key\'s row (b.jg5 SRJ-807, SRJ-114, SRJ-115, SRJ-116)', () => {
+  test('pin: the clearing states are waiting, working, ask_user and check_permission: the live states other than pending', () => {
+    expect(CLEARING_STATES).toEqual(['waiting', 'working', 'ask_user', 'check_permission'])
+    expect(CLEARING_STATES).toEqual([...AGENT_DIRECTOR_LIVE_STATES].filter((state) => state !== AGENT_DIRECTOR_PENDING_STATE))
+  })
+
+  test.each(CLEARING_ROWS)('the marked key\'s own %s row read %s (configured: %p) decides the clear alone, with the state read', (shape, state, configured) => {
+    const store = storeOver(SEED)
+    expect(decide(store, 'alpha', ownRow(shape, 'alpha', { state }), configured)).toEqual({ clearRetiredEntry: { stateRead: state } })
+  })
+
+  test.each(NON_CLEARING_ROWS)('the marked key\'s own %s row reading %s (configured: %p) never clears: the mark changes nothing the rule decides', (shape, _name, configured, fields) => {
+    const store = storeOver(SEED)
+    const row = ownRow(shape, 'alpha', fields)
+
+    const decision = decide(store, 'alpha', row, configured)
+
+    expect(decision.clearRetiredEntry).toBeUndefined()
+    expect(decision).toEqual(decideOwnRowRead({ key: 'alpha', row, configured, retiredMarked: false }))
+  })
+
+  test.each(LAUNCH_START_READ_SHAPES.flatMap((shape) => OTHER_KEY_READS.map(([name, key, rowId]) => [shape, name, key, rowId] as const)))(
+    'a %s read of %s, in a clearing state, never clears',
+    (shape, _name, key, rowId) => {
+      const store = storeOver(SEED)
+      const row = rowRead(shape, rowId, { state: 'working' })
+      expect(decide(store, key, row, true)).toEqual(ROW_READ_NO_DECISION)
+      expect(decideRetiredEntryClear({ key, row, configured: true, retiredMarked: store.isMarked(key) })).toBeUndefined()
+    },
+  )
+
+  test.each([...LAUNCH_START_READ_SHAPES])('a %s read of the marked key\'s own live row with no mark answer given clears nothing (absent counts as unmarked)', (shape) => {
+    expect(decideOwnRowRead({ key: 'alpha', row: ownRow(shape, 'alpha', { state: 'working' }), configured: true })).toEqual(ROW_READ_NO_DECISION)
+  })
+
+  test.each(
+    LAUNCH_START_READ_SHAPES.flatMap((shape) => NO_LAUNCH_START_FORM_NAMES.flatMap((form) => [true, false].map((mark) => [shape, form, mark] as const))),
+  )(
+    'a configured persona\'s own %s row reading pending with no launch start (%s), recorded as a destructive modify\'s old half (mark: %p), decides the launch-start latch only, never a clear (SRJ-513)',
+    (shape, form, mark) => {
+      const store = storeOver({ alpha: { cause: RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY, mark } })
+      const row = ownRow(shape, 'alpha', { state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: NO_LAUNCH_START_FORMS[form] })
+      expect(decide(store, 'alpha', row, true)).toEqual(ROW_READ_LAUNCH_START_NOT_RECORDED)
+    },
+  )
+
+  test.each(
+    (['get', 'list'] as const).flatMap((shape) => [...CLEARING_STATES, AGENT_DIRECTOR_PENDING_STATE].map((state) => [shape, state] as const)),
+  )('the marked key\'s own %s row read %s with the latching note: configured, the note latch and the clear (only off pending) on the one read; not configured, the clear alone (SRJ-114)', (shape, state) => {
+    const store = storeOver(SEED)
+    const row = ownRow(shape, 'alpha', { state, liveness_note: provenanceNote })
+    const clears = state !== AGENT_DIRECTOR_PENDING_STATE
+    const clear = clears ? { clearRetiredEntry: { stateRead: state } } : {}
+
+    expect(decide(store, 'alpha', row, true)).toEqual({
+      latch: { latchCase: LATCH_CASE_CONFLICTING_LABELS, refusedOperation: REFUSED_OPERATION_BRING_UP, rowState: latchRowStateRead(state) },
+      ...clear,
+    })
+    expect(decide(store, 'alpha', row, false)).toEqual(clears ? clear : ROW_READ_NO_DECISION)
+  })
+})
+
+describe('the clear end to end over the store: only a qualifying read removes an entry, durably (b.jg5 SRJ-807; hatch A3)', () => {
+  /** The seed with a second marked key, so a clear that removes more than its own entry shows. */
+  const MARKED_SEED: Readonly<Record<string, RetiredKeySeed>> = { ...SEED, delta: { cause: RETIRED_KEY_CAUSE_ABSENT_AT_START, mark: true } }
+
+  /** What the clear's line names of the read, as the shared reads hand it to the store. */
+  const readNamed = (state: string): string => `its row read ${state} with its mark set (retired-keys.test: own-row read)`
+
+  /**
+   * One read acted on as the shared reads act on it: the rule asked with the
+   * store's mark, and its clear decision handed to the store's `clear`.
+   * Answers the decision and the clear's outcome (undefined with no clear).
+   */
+  function readAndAct(rig: Rig, key: string, row: RowReadRow, configured = true): { decision: RowReadDecision; cleared: string | undefined } {
+    const decision = decide(rig.store, key, row, configured)
+    const clear = decision.clearRetiredEntry
+    return { decision, cleared: clear === undefined ? undefined : rig.store.clear(key, readNamed(clear.stateRead)) }
+  }
+
+  /** The seed's record without `key`'s entry. */
+  function seedWithout(key: string): RetiredKeyRecord {
+    const record = new Map(retiredKeysRecordOf(MARKED_SEED))
+    record.delete(key)
+    return record
+  }
+
+  test.each([...LAUNCH_START_READ_SHAPES])('a %s read of the marked key\'s own working row removes only its entry, in one write, durably, with one line naming the file and the read; the next read of it writes nothing', (shape) => {
+    writeRetiredKeysRecord(dir, MARKED_SEED)
+    const rig = openStore()
+    const row = ownRow(shape, 'alpha', { state: 'working' })
+
+    expect(readAndAct(rig, 'alpha', row).cleared).toBe(RETIRED_KEYS_WRITTEN)
+
+    expect(rig.writes).toHaveLength(1)
+    expect(rig.store.snapshot().entries).toEqual(seedWithout('alpha'))
+    expect(freshRecord()).toEqual(seedWithout('alpha'))
+    expect(rig.logs).toHaveLength(1)
+    expect(rig.logs[0]).toContain(rig.store.path)
+    expect(rig.logs[0]).toContain(readNamed('working'))
+
+    // No longer recorded, so no longer marked: the same read decides nothing more.
+    expect(readAndAct(rig, 'alpha', row)).toEqual({ decision: ROW_READ_NO_DECISION, cleared: undefined })
+    expect(rig.writes).toHaveLength(1)
+  })
+
+  test('no other read, record or mark removes an entry: every non-qualifying read of every key, a record of a new key and a mark leave every entry, on disk too', async () => {
+    writeRetiredKeysRecord(dir, MARKED_SEED)
+    const rig = openStore()
+
+    for (const shape of LAUNCH_START_READ_SHAPES) {
+      for (const key of ['alpha', 'beta', 'delta', 'gamma']) {
+        for (const [, fields] of NON_CLEARING_FIELDS) {
+          for (const configured of [true, false]) expect(readAndAct(rig, key, ownRow(shape, key, fields), configured).cleared).toBeUndefined()
+        }
+      }
+      for (const [, key, rowId] of OTHER_KEY_READS) {
+        expect(readAndAct(rig, key, rowRead(shape, rowId, { state: 'working' })).cleared).toBeUndefined()
+      }
+    }
+    expect([rig.writes, rig.logs]).toEqual([[], []])
+
+    await rig.clock.advance(1_000)
+    expect(rig.store.record([{ key: 'gamma', cause: RETIRED_KEY_CAUSE_REMOVED }]).outcome).toBe(RETIRED_KEYS_WRITTEN)
+    expect(rig.store.mark('beta')).toBe(RETIRED_KEYS_WRITTEN)
+
+    const expected = new Map(retiredKeysRecordOf(MARKED_SEED))
+    expected.set('gamma', { retiredAt: rig.stamp(), cause: RETIRED_KEY_CAUSE_REMOVED, newLifeBegunAt: null })
+    expected.set('beta', { ...expected.get('beta')!, newLifeBegunAt: rig.stamp() })
+    expect(freshRecord()).toEqual(expected)
+  })
+
+  test('a clear whose write fails keeps the entry, in memory and in the file, with one line naming the read; the next qualifying read clears it', () => {
+    writeRetiredKeysRecord(dir, MARKED_SEED)
+    const before = fileBytes()
+    const rig = openStore()
+    rig.writeFails = errnoError('EIO')
+
+    const failed = readAndAct(rig, 'alpha', ownRow('status', 'alpha', { state: 'ask_user' }))
+
+    expect(failed.cleared).toBe(RETIRED_KEYS_WRITE_FAILED)
+    expect(rig.store.snapshot().entries).toEqual(retiredKeysRecordOf(MARKED_SEED))
+    expect(rig.store.isMarked('alpha')).toBe(true)
+    expect(fileBytes()).toEqual(before)
+    expect(rig.logs).toHaveLength(1)
+    expect(rig.logs[0]).toContain(rig.store.path)
+    expect(rig.logs[0]).toContain(readNamed('ask_user'))
+
+    rig.writeFails = undefined
+    expect(readAndAct(rig, 'alpha', ownRow('get', 'alpha', { state: 'check_permission' })).cleared).toBe(RETIRED_KEYS_WRITTEN)
+    expect(freshRecord()).toEqual(seedWithout('alpha'))
   })
 })
