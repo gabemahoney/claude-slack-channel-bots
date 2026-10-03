@@ -1,8 +1,9 @@
 /**
  * docker.ts — the live image and container, as docker argv.
  *
- * Pure builders plus one guard, `assertSafeRunArgs`, which every `docker run`
- * passes before it is spawned. It accepts only the flags `buildRunArgs` uses
+ * Pure builders, the live image build's failure message
+ * (`liveBuildFailureMessage`), and one guard, `assertSafeRunArgs`, which every
+ * `docker run` passes before it is spawned. It accepts only the flags `buildRunArgs` uses
  * (`-d`, `--init`, `--name`, `--hostname`, `--label`, `--memory`,
  * `--memory-swap`, `--pids-limit`, `--mount`, `--env`/`-e`) in any spelling
  * (`--flag value`, `--flag=value`, `-eVALUE`), then the image and nothing
@@ -72,7 +73,7 @@ export const CONTAINER_PIDS_LIMIT = 2048
 export const CONTAINER_TARBALL = '/tmp/package.tgz'
 export const CONTAINER_CREDENTIALS_DIR = `${CONTAINER_HOME}/.config/cscb`
 
-/** The named build context that holds the host's agent-director binary (Dockerfile.live copies it). */
+/** The named build context that holds the staged agent-director binary (Dockerfile.live copies it). */
 export const AGENT_DIRECTOR_BUILD_CONTEXT = 'agent-director-bin'
 
 /** The Claude gateway variables: container name ← host name. */
@@ -235,8 +236,8 @@ export interface ImageBuildSpec {
   uid: number
   gid: number
   /**
-   * The directory holding the host's `agent-director` binary, staged by the
-   * runner. Required: without it `COPY --from=agent-director-bin` would look
+   * The directory holding the `agent-director` binary the runner staged (the
+   * one given with `--agent-director-binary`, or the host's). Required: without it `COPY --from=agent-director-bin` would look
    * for an image of that name in a registry.
    */
   agentDirectorDir?: string
@@ -259,6 +260,60 @@ export function buildImageArgs(spec: ImageBuildSpec): string[] {
     spec.tag ?? LIVE_IMAGE,
     spec.repoRoot,
   ]
+}
+
+/** A BuildKit plain-progress prefix on a build output line: `#12 0.345 ` (or `#12 ` alone). */
+const BUILDKIT_PREFIX_RE = /^#\d+ (?:\d+(?:\.\d+)? )?/
+
+/** docker's own failure lines, which repeat the failed RUN's whole command text (its echoed ERROR texts too). */
+const DOCKER_OWN_ERROR_RE = /^ERROR: (?:failed to (?:build|solve)|process ")/
+
+/**
+ * The ERROR lines the live image build's own commands printed (Dockerfile.live
+ * and the rc-client check), each without its BuildKit prefix: only lines that
+ * start with `ERROR: `, never docker's own failure lines, nor the Dockerfile
+ * excerpt or the shell trace that quote the RUN text.
+ */
+export function liveBuildErrorLines(stderr: string): string[] {
+  return stderr
+    .split('\n')
+    .map((line) => line.replace(BUILDKIT_PREFIX_RE, '').trimEnd())
+    .filter((line) => line.startsWith('ERROR: ') && !DOCKER_OWN_ERROR_RE.test(line))
+}
+
+/**
+ * Dockerfile.live's routed ERROR lines (each a line's start) and what the
+ * runner says for each. Only a staged binary that is not the release
+ * candidate is the runner's to fix, with `--agent-director-binary`.
+ */
+const LIVE_BUILD_FAILURES: ReadonlyArray<readonly [string, string]> = [
+  [
+    'ERROR: the staged agent-director binary is not the release candidate ',
+    "the staged agent-director binary is not the release candidate this image's agent-director client is checked against: give the release candidate's binary with --agent-director-binary <path>",
+  ],
+  [
+    "ERROR: the release candidate's agent-director binary and client do not pair ",
+    "the release candidate's agent-director binary and client do not pair: the release candidate pinned in docker/Dockerfile.test.base is not usable as is",
+  ],
+  [
+    "ERROR: the base image's global agent-director client or its rc-client check failed ",
+    `the base image ${BASE_IMAGE} predates this tree's docker/Dockerfile.test.base or docker/rc-client-check.sh: bump the base image version (docker/README.md)`,
+  ],
+  [
+    'ERROR: agent-director on PATH is ',
+    "the staged agent-director binary is not the first agent-director on the image's PATH",
+  ],
+]
+
+/**
+ * The runner's message for a failed live image build: which of
+ * Dockerfile.live's ERROR lines it printed, read from its own ERROR lines
+ * only (`liveBuildErrorLines`), never from text that merely quotes them.
+ */
+export function liveBuildFailureMessage(code: number, stderr: string): string {
+  const lines = liveBuildErrorLines(stderr)
+  const routed = LIVE_BUILD_FAILURES.find(([start]) => lines.some((line) => line.startsWith(start)))
+  return `docker build of the live image failed (exit ${code})${routed ? `: ${routed[1]} (see run.log)` : ''}`
 }
 
 export interface RunSpec {

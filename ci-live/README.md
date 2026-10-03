@@ -31,10 +31,16 @@ exception is `hgx`, which takes a value only as an argument (see
 - On the VM: docker, the `/ci` base image (if
   `docker image inspect cscb-ci-base:v5` fails, run `/ci` once, with
   `CSCB_AD_RC_DIR` and `CSCB_AD_SRC_DIR` set: see `docker/README.md`), Google
-  Chrome (`google-chrome --version`), bun, and an agent-director binary for
-  the runner to stage into the live image. The build checks that binary
-  against the release candidate's client in the base image (see "The live
-  image's agent-director" in `docker/README.md`).
+  Chrome (`google-chrome --version`), bun, and the release candidate's
+  directory in `CSCB_AD_RC_DIR`. A run on the release candidate takes its
+  binary explicitly: steps 5 and 6 pass
+  `--agent-director-binary "$CSCB_AD_RC_DIR/agent-director-linux-amd64"`,
+  and the runner stages that file in the live image without running it on
+  the host. The image build checks it against the release candidate's
+  client in the base image. Without the option the runner stages the host's
+  own agent-director binary, which the build refuses unless it is the
+  release candidate (see "The live image's agent-director" in
+  `docker/README.md`).
 
 Not there yet: the refresh token (step 1), the Claude credentials if your
 shell lacks them (step 2), the test human's browser session (step 4), and the
@@ -243,11 +249,16 @@ address, confirm it with `mailbox --forwarding`, and point the filter's
 ## 5. Check the harness (optional)
 
 ```sh
-bun ci-live/run.ts --dry-run
+bun ci-live/run.ts --dry-run --agent-director-binary "$CSCB_AD_RC_DIR/agent-director-linux-amd64"
 ```
 
 It reads no secret, needs no Claude credentials, takes about a minute (a few
-when the image is rebuilt) and must end with `VERDICT: PASS`. Among its rows,
+when the image is rebuilt) and must end with `VERDICT: PASS`. It builds the
+live image with the given binary, which the runner checks by reading only
+(it must be an executable regular file, else the run exits 2 naming the
+option) and never runs on the host. A binary that is not the release
+candidate fails the image build, and the `container` row says to give the
+release candidate's binary with `--agent-director-binary`. Among its rows,
 `prompt-guard` shows the prompt guard denying a fixture prompt no check
 expects. It has a lock of its own, so it can run beside a real run.
 
@@ -257,8 +268,13 @@ From the repo root of the checkout you want to test, in a tmux session (a run
 takes about 2 to 3 hours):
 
 ```sh
-bun ci-live/run.ts
+bun ci-live/run.ts --agent-director-binary "$CSCB_AD_RC_DIR/agent-director-linux-amd64"
 ```
+
+`--agent-director-binary` takes the binary to stage in the live image, as in
+step 5. It combines with the other run flags (`--only`, `--keep-container`,
+`--clean`, `--create-apps`), never with `--provision-only` or `--stage`,
+which build no image.
 
 The first line is `RESULTS_DIR=<dir>`, the run's results directory. The run
 packs the working tree as it is on disk (the Build column marks uncommitted

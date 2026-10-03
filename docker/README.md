@@ -36,6 +36,10 @@ Nothing from agent-director's release candidate is installed or run on the
 host. The release candidate's files and its install script reach only the
 base build, through named build contexts, and are checked and installed
 inside the image (see [How the base gets the release candidate](#how-the-base-gets-the-release-candidate)).
+The release candidate's binary given to `/ci-live` with
+`--agent-director-binary` reaches only the live image build, the same way,
+and is checked there (see
+[The live image's agent-director](#the-live-images-agent-director)).
 
 The base build fetches bun and agent-director 0.10.0's binary from GitHub and
 two npm tarballs from the registry, and `/ci` runs it with
@@ -310,10 +314,12 @@ runner lives in `ci-live/` and is not part of the npm package.
 
 1. Prints `RESULTS_DIR=<dir>` as its first line (see [Outputs](#outputs)).
 2. Takes the run lock (see [One run at a time](#one-run-at-a-time)).
-3. Checks its preconditions: docker, the base image, the host's
-   agent-director binary, the Claude credentials, the modes of the secret
-   files, and a password or saved session for the test human. It stops with
-   exit 2 if one fails.
+3. Checks its preconditions: docker, the base image, the agent-director
+   binary to stage in the live image (the one given with
+   `--agent-director-binary <path>`, else the host's, found by search: see
+   [The live image's agent-director](#the-live-images-agent-director)), the
+   Claude credentials, the modes of the secret files, and a password or
+   saved session for the test human. It stops with exit 2 if one fails.
 4. Starts the memory watchdog, which samples until the results are written
    (see [Memory bounds](#memory-bounds)).
 5. Takes the HOST snapshot (see [Isolation](#isolation-from-the-production-bots)).
@@ -439,7 +445,15 @@ install shares nothing with them:
   `~/.claude/channels/slack/config.json`. Any difference fails the run, and
   so does a probe that fails before or after (`probe failed: …`), since two
   failures would otherwise compare equal. It runs even when provisioning or
-  an earlier check failed.
+  an earlier check failed. Its two probes, `agent-director … list` on the
+  host's store and `tmux ls`, are the only agent-director and tmux commands
+  the runner runs on the host.
+- **The staged binary never runs on the host.** The runner only reads the
+  agent-director binary it stages (its real path, its type and its execute
+  bit) and copies it into a temporary directory for the image build. Its
+  version is checked inside the image build (see
+  [The live image's agent-director](#the-live-images-agent-director)).
+  Nothing is copied into a host install location.
 
 A change the production side makes on its own during the run also fails the
 HOST check. Leave the production install, its config and its tmux sessions
@@ -595,10 +609,23 @@ it.
   candidate's (see [What the base holds](#what-the-base-holds)), and the
   package under test is switched to it by the install check (see
   [The client under test](#the-client-under-test)).
-- **The binary.** The runner copies an agent-director binary
-  (`~/.agent-director/bin/agent-director`, else the first one on `PATH`) into
-  a temporary directory that the build sees as the named context
-  `agent-director-bin`. The image copies it over the base's
+- **The binary.** The binary to stage is given with
+  `--agent-director-binary <path>`, for a run or a dry run: for the release
+  candidate, its directory's `agent-director-linux-amd64`. The runner checks
+  the given path by reading only: it must resolve (a missing file or a
+  dangling symlink does not) to a regular file with the execute bit for the
+  runner's user. It stages that file by its real path. A given path that
+  fails the check stops the run (exit 2) with the reason, and the runner
+  never falls back to a binary of the host's. With no
+  `--agent-director-binary`, the runner stages the host's own binary,
+  `~/.agent-director/bin/agent-director`, else the first one on `PATH`;
+  while the host's binary is not the release candidate, the build refuses
+  it (step 3, below). The runner copies the binary into a fresh temporary
+  directory under the OS temp directory (`cscb-ci-live-ad-<RUN_ID>-…`) that
+  the build sees as the named context `agent-director-bin`, and removes that
+  directory after the build, a failed one included. It never runs the
+  binary on the host. `run.log` names the staged binary by path, and
+  whether it was given or found. The image copies it over the base's
   `/opt/agent-director-rc/bin/agent-director`, first on `PATH`, and the
   build checks that it is the first agent-director there.
 - **The check.** The build then runs `rc-client-check.sh --client` on the
@@ -617,9 +644,19 @@ it.
     `ERROR: the base image's global agent-director client or its rc-client check failed (the line above names what failed): the base image cscb-ci-base:v5 predates this tree's docker/Dockerfile.test.base or docker/rc-client-check.sh; bump the base image version as the When to bump the base image version section of docker/README.md describes`.
 
   Whichever line it is, the run reports a `container` FAIL row for the failed
-  build, and `run.log` has the build's `ERROR:` lines.
-- With no agent-director binary to stage, a run, a dry run included, stops
-  with exit 2.
+  build, `docker build of the live image failed (exit N)`, followed by what
+  that line means, read only from the lines the build's own commands
+  printed (never from docker's lines that quote the RUN text): for step 3,
+  the staged binary is not the release candidate and the release
+  candidate's binary is to be given with `--agent-director-binary <path>`;
+  for steps 4 and 5, the release candidate does not pair; for anything else
+  the check reports, a stale base image; for the `PATH` check, the staged
+  binary is not the first agent-director on the image's `PATH`. A build
+  that fails elsewhere gets no reason. `run.log` has the build's `ERROR:`
+  lines.
+- A run, a dry run included, stops with exit 2 when the given binary fails
+  the runner's check, or when none is given and the host has none:
+  `no agent-director binary to stage in the live image: none was given with --agent-director-binary, and none was found at ~/.agent-director/bin/agent-director or on PATH; give the binary to stage with --agent-director-binary <path>, then rerun`.
 
 **Claude Code.** The live image installs Claude Code at the build arg
 `CLAUDE_CODE_VERSION`, pinned at `2.1.280` in `docker/Dockerfile.live`; the
@@ -911,8 +948,11 @@ secret store refuses any path under the real one.
 - The verdict is PASS when every check is PASS or SKIPPED. The closing scan
   must also find none of the stub's fake tokens in the outputs.
 
-It needs docker, the base image, an agent-director binary to stage, Google
-Chrome and the runner's dependency (`bun install --ignore-scripts` in
+It needs docker, the base image, the release candidate's agent-director
+binary given with `--agent-director-binary <path>` (`bun ci-live/run.ts
+--dry-run --agent-director-binary <path>`; without the option it stages the
+host's binary, which the image build refuses unless it is the release
+candidate), Google Chrome and the runner's dependency (`bun install --ignore-scripts` in
 `ci-live/`). It takes about a minute on a warm image cache, and holds its own
 lock, never the real one. The `/ci-live` skill runs it first, as a gate.
 
@@ -1084,8 +1124,10 @@ given.
 Exit codes: `0` PASS, `1` FAIL (an interrupted run included), `2` not
 runnable. A not-runnable run prints one line that names the file or variable
 to fix, never a value. The reasons include: another run holding the lock,
-docker not running, a missing base image, no agent-director binary on the
-host, missing Claude credentials, a secret file or the config directory open
+docker not running, a missing base image, a path given with
+`--agent-director-binary` that is missing, a dangling symlink, not a regular
+file or not executable, no `--agent-director-binary` and no agent-director
+binary found on the host, missing Claude credentials, a secret file or the config directory open
 to group or others, a missing `workspace_domain` or `test_email`, no password
 and no saved session, a missing, refused or expired configuration token (no
 refresh token, or a refused rotation) while `apps.json` doesn't record all
@@ -1114,6 +1156,7 @@ not answer (see [The test mailbox](#the-test-mailbox)).
 | `--keep-container` | Leaves the container for inspection (after a memory watchdog stop, stopped with `docker stop`) |
 | `--clean` | Removes the results directory when the run passes |
 | `--create-apps` | Lets a real run create the four apps although no `apps.json` exists (only when the apps are really gone) |
+| `--agent-director-binary <path>` | The agent-director binary a run or a dry run stages in the live image, checked by reading only and never run on the host (see [The live image's agent-director](#the-live-images-agent-director)). Without it, the host's binary is staged. Not with `--provision-only` or `--stage`, nor with `login`, `mailbox`, `config-token` or `apps`, which build no image; a refusal names the option's position and never repeats the path |
 
 ### Reruns
 

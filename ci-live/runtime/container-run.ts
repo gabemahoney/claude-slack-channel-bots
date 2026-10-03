@@ -1,7 +1,9 @@
 /**
  * container-run.ts — the throwaway container's life: pack the package under
- * test, build the live image (with the host's agent-director binary staged
- * as a named build context), start the container on the default network with
+ * test, build the live image (with the selected agent-director binary, the
+ * one given with `--agent-director-binary` or else the host's, copied into a
+ * fresh temp dir staged as a named build context; it is never run on the
+ * host), start the container on the default network with
  * the tarball and the credentials dir mounted read-only and hard memory, swap
  * and PID caps (`CONTAINER_MEMORY`, `CONTAINER_PIDS_LIMIT`), wait for the
  * entrypoint's boot, restart it (Check 28) and wait for that new boot, read
@@ -27,7 +29,8 @@ import { chmodSync, copyFileSync, mkdtempSync, rmSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { hostAgentDirectorBinary } from '../lib/agent-director-binary.ts'
+import { selectAgentDirectorBinary } from '../lib/agent-director-binary.ts'
+import { AGENT_DIRECTOR_BINARY_OPTION } from '../lib/args.ts'
 import { BOOT_DONE_FILE, bootProblem, bootReached, parseBootDone, type BootRecord } from '../lib/container-boot.ts'
 import { TestContainer } from '../lib/container.ts'
 import {
@@ -48,6 +51,8 @@ import {
   type ContainerEnd,
   INSPECT_OWNER_FORMAT,
   isLiveContainerName,
+  liveBuildErrorLines,
+  liveBuildFailureMessage,
   parseContainerOwnership,
   parseContainerStats,
   type ContainerOwnership,
@@ -63,6 +68,12 @@ export interface Packed {
   dir: string
   version: string
   commit: string
+}
+
+/** The agent-director binary the live image is built with, and whether it was given or found on the host. */
+export interface StagedBinary {
+  path: string
+  source: 'given' | 'found'
 }
 
 /** What removing this run's container came to: `foreign` and `unknown` remove nothing. */
@@ -84,12 +95,16 @@ export class ContainerRun {
   private pendingStart: Promise<unknown> | null = null
   /** `docker run` was attempted: the container may exist. */
   private runAttempted = false
+  /** The temp dir holding the staged agent-director binary while `buildImage` runs; null once removed. */
+  private stageDir: string | null = null
 
   constructor(
     private readonly spawn: SpawnFn,
     private readonly log: RunLog,
     readonly runId: string,
     private readonly repoRoot: string,
+    /** The path given with `--agent-director-binary`, if any: staged instead of searching the host. */
+    private readonly givenAgentDirectorBinary?: string,
   ) {
     this.docker = new DockerCli(spawn, minimalChildEnv(process.env))
     this.name = containerName(runId, process.pid)
@@ -106,13 +121,22 @@ export class ContainerRun {
     if (base.code !== 0) throw new NotRunnableError(`the /ci base image ${BASE_IMAGE} is missing: run /ci once to build it, then rerun`)
   }
 
-  /** The host's agent-director binary for the live image; not runnable when there is none. */
-  agentDirectorBinary(): string {
-    const binary = hostAgentDirectorBinary(homedir(), minimalChildEnv(process.env).PATH)
-    if (!binary) {
-      throw new NotRunnableError('no agent-director binary on this host (~/.agent-director/bin/agent-director or PATH): the live image pairs CSCB with it; install agent-director, then rerun')
+  /**
+   * The agent-director binary for the live image: the one given with
+   * `--agent-director-binary` (checked by reading only; no host path is
+   * searched), else the host's, found by search. Not runnable when the given
+   * one cannot be staged or, with none given, none is found. Never runs it.
+   */
+  agentDirectorBinary(): StagedBinary {
+    const selected = selectAgentDirectorBinary(this.givenAgentDirectorBinary, homedir(), minimalChildEnv(process.env).PATH)
+    if (selected.path !== null) return { path: selected.path, source: selected.source }
+    if (selected.source === 'given') {
+      throw new NotRunnableError(`${selected.reason}: give ${AGENT_DIRECTOR_BINARY_OPTION} the path of an executable agent-director binary to stage in the live image, then rerun`)
     }
-    return binary
+    throw new NotRunnableError(
+      `no agent-director binary to stage in the live image: none was given with ${AGENT_DIRECTOR_BINARY_OPTION}, and none was found at ~/.agent-director/bin/agent-director or on PATH; ` +
+        `give the binary to stage with ${AGENT_DIRECTOR_BINARY_OPTION} <path>, then rerun`,
+    )
   }
 
   /**
@@ -159,29 +183,48 @@ export class ContainerRun {
   }
 
   /**
-   * Build the live image. The host's agent-director binary is copied (read
-   * only) into a temporary dir that the build sees as the named context
-   * `agent-director-bin`; the Dockerfile checks it against the npm package at
-   * package.json's range and its version floor, and fails the build on a
-   * mismatch.
+   * Build the live image. The selected agent-director binary
+   * (`agentDirectorBinary()`) is copied, read only, into a fresh temp dir
+   * under the OS temp dir that the build sees as the named context
+   * `agent-director-bin`, and that dir is removed after the build, on a
+   * failure too, and by the run's cleanup (`removeStage`) when a stop ends
+   * the run mid-build; nothing else is copied on the host and the binary is
+   * never run here. Dockerfile.live checks it against the release
+   * candidate's client in the base image and fails the build with one ERROR
+   * line on a mismatch; the failure message is `liveBuildFailureMessage`'s.
    */
   async buildImage(): Promise<void> {
     const uid = process.getuid?.() ?? 1000
     const gid = process.getgid?.() ?? 1000
+    const binary = this.agentDirectorBinary()
     const staged = mkdtempSync(join(tmpdir(), `cscb-ci-live-ad-${this.runId}-`))
+    this.stageDir = staged
     try {
-      copyFileSync(this.agentDirectorBinary(), join(staged, 'agent-director'))
+      copyFileSync(binary.path, join(staged, 'agent-director'))
       chmodSync(join(staged, 'agent-director'), 0o755)
-      this.log.info('container: building the live image (with the host agent-director binary)')
+      const how = binary.source === 'given' ? `given with ${AGENT_DIRECTOR_BINARY_OPTION}` : `found on this host (none was given with ${AGENT_DIRECTOR_BINARY_OPTION})`
+      this.log.info(`container: building the live image with the agent-director binary ${binary.path}, ${how}`)
       const r = await this.docker.run(buildImageArgs({ repoRoot: this.repoRoot, uid, gid, agentDirectorDir: staged }), { timeoutMs: 600_000, cwd: this.repoRoot })
       if (r.code !== 0) {
         this.log.detail(`docker build stderr tail: ${r.stderr.split('\n').slice(-15).join(' | ')}`)
-        const adMismatch = /agent-director (binary|version)/.test(r.stderr) && /ERROR:/.test(r.stderr)
-        throw new Error(`docker build of the live image failed (exit ${r.code})${adMismatch ? ': the host agent-director binary does not match the npm package (see run.log)' : ''}`)
+        const errors = liveBuildErrorLines(r.stderr)
+        if (errors.length > 0) this.log.detail(`docker build ERROR lines: ${errors.join(' | ')}`)
+        throw new Error(liveBuildFailureMessage(r.code, r.stderr))
       }
     } finally {
-      rmSync(staged, { recursive: true, force: true })
+      this.removeStage()
     }
+  }
+
+  /**
+   * Remove the staged agent-director binary's temp dir, if one is left:
+   * `buildImage`'s end and the run's cleanup (a stop during the build) both
+   * call it; a second call does nothing.
+   */
+  removeStage(): void {
+    if (this.stageDir === null) return
+    rmSync(this.stageDir, { recursive: true, force: true })
+    this.stageDir = null
   }
 
   /** Start the container; the Claude credentials go by name only, their values in the child env. */

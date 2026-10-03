@@ -12,6 +12,11 @@
  *   flags at most once); an unknown argument
  *   is named by its position, never echoed, unless it is a plain
  *   `--flag-name`;
+ * - `--agent-director-binary <path>` sets the binary a run stages in the live
+ *   image (set only when given, with `--dry-run`, `--only` and the other run
+ *   flags); it is refused without a path, twice, with `--provision-only` or
+ *   `--stage` (no image is built) and by every maintenance command, each
+ *   refusal naming the option's position and never echoing the path;
  * - the config.json the runner writes for A, B and C (and D's entry for
  *   Check 25) loads through the package's own config loader, and the system
  *   prompt keeps the shipped template up to its Role section;
@@ -34,7 +39,7 @@ import { join } from 'node:path'
 
 import { parsePersonaConfigBytes } from '../src/config.ts'
 import { DRY_RUN_IDS } from '../ci-live/checks/context.ts'
-import { parseArgs, USAGE, UsageError, type RunOptions } from '../ci-live/lib/args.ts'
+import { AGENT_DIRECTOR_BINARY_OPTION, parseArgs, USAGE, UsageError, type RunOptions } from '../ci-live/lib/args.ts'
 import type { HumanApi } from '../ci-live/lib/browser-types.ts'
 import {
   HumanCallError,
@@ -87,8 +92,11 @@ describe('parseArgs', () => {
     ])
   })
 
-  test('the usage names the maintenance and mailbox commands', () => {
-    expect(USAGE.split('\n').slice(-3)).toEqual([
+  test('the usage names the run flags, the maintenance and mailbox commands', () => {
+    expect(USAGE.split('\n')).toEqual([
+      'usage: bun ci-live/run.ts [--dry-run] [--provision-only] [--stage apps|install|tokens|channels] ' +
+        `[--only <check ids, comma-separated>] [--keep-container] [--clean] [--create-apps] [${AGENT_DIRECTOR_BINARY_OPTION} <path>]`,
+      '       bun ci-live/run.ts login [--second]',
       '       bun ci-live/run.ts config-token --rotate',
       '       bun ci-live/run.ts apps --list|--delete-strays',
       '       bun ci-live/run.ts mailbox --latest|--forwarding [--show-body]',
@@ -162,6 +170,69 @@ describe('parseArgs', () => {
     expect(err).toBeInstanceOf(UsageError)
     expect((err as Error).message).toBe(`unknown argument ${ref}`)
     assertNoLeak(err)
+  })
+
+  describe(`${AGENT_DIRECTOR_BINARY_OPTION} <path>`, () => {
+    const AD = AGENT_DIRECTOR_BINARY_OPTION
+    // Distinctive and sentinel-bearing: a refusal that echoes any part of it fails.
+    const PATH = `/opt/rc-stage/${LEAK_SENTINEL}/agent-director`
+
+    test.each([
+      [[AD, PATH], { agentDirectorBinary: PATH }],
+      [['--dry-run', AD, PATH], { dryRun: true, agentDirectorBinary: PATH }],
+      [[AD, PATH, '--only', '1,S2'], { only: ['1', 'S2'], agentDirectorBinary: PATH }],
+      [['--dry-run', '--only', 'HOST', AD, PATH, '--keep-container', '--clean'], { dryRun: true, only: ['HOST'], keepContainer: true, clean: true, agentDirectorBinary: PATH }],
+    ])('%j', (argv, expected) => {
+      expect(parseArgs(argv)).toEqual({ ...defaults, ...expected } as RunOptions)
+    })
+
+    test('is absent when not given', () => {
+      expect([[], ['--dry-run', '--only', '1'], ['--provision-only'], ['--stage', 'apps'], ['login'], ['mailbox', '--latest']].map((argv) => 'agentDirectorBinary' in parseArgs(argv))).toEqual([
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+      ])
+    })
+
+    const needsPath = (n: number) => `${AD} (argument #${n}) needs the path of the agent-director binary to stage in the live image`
+    const buildsNoImage = (n: number, other: string) => `${AD} (argument #${n}) stages the binary the live image is built with; ${other} builds no image, so they do not combine`
+    const maintenance = (command: string, n: number) => `${command} builds no image: it does not take ${AD} (argument #${n})`
+
+    test.each([
+      ['no value', [AD], needsPath(1)],
+      ['no value after other flags', ['--dry-run', '--clean', AD], needsPath(3)],
+      ['a following flag in place of the value', [AD, '--dry-run', PATH], needsPath(1)],
+      ['a dash-led value', ['--keep-container', AD, `-${PATH}`], needsPath(2)],
+      ['an empty value', ['--only', '1', AD, ''], needsPath(3)],
+      ['given twice', [AD, PATH, '--dry-run', AD, `${PATH}-2`], `${AD} is given twice (arguments #1 and #4): give it once`],
+      ['given twice, the second with no value', ['--dry-run', AD, PATH, AD], `${AD} is given twice (arguments #2 and #4): give it once`],
+      ['before --provision-only', [AD, PATH, '--provision-only'], buildsNoImage(1, '--provision-only')],
+      ['after --provision-only', ['--provision-only', '--dry-run', AD, PATH], buildsNoImage(3, '--provision-only')],
+      ['before --stage', [AD, PATH, '--stage', 'install'], buildsNoImage(1, '--stage')],
+      ['after --stage', ['--stage', 'apps', AD, PATH], buildsNoImage(3, '--stage')],
+      ['after --provision-only and --stage', ['--provision-only', '--stage', 'tokens', AD, PATH], buildsNoImage(4, '--stage')],
+      ['to login', ['login', AD, PATH], maintenance('login', 2)],
+      ['to login --second', ['login', '--second', AD, PATH], maintenance('login', 3)],
+      ['to mailbox', ['mailbox', '--latest', AD, PATH], maintenance('mailbox', 3)],
+      ['to mailbox before its view', ['mailbox', AD, PATH, '--forwarding'], maintenance('mailbox', 2)],
+      ['to config-token', ['config-token', '--rotate', AD, PATH], maintenance('config-token', 3)],
+      ['to apps', ['apps', AD, PATH, '--list'], maintenance('apps', 2)],
+      ['to apps --delete-strays', ['apps', '--delete-strays', AD, PATH], maintenance('apps', 3)],
+    ])('refuses it %s, naming its position and never echoing the path', (_what, argv, message) => {
+      let err: unknown
+      try {
+        parseArgs(argv)
+      } catch (e) {
+        err = e
+      }
+      expect(err).toBeInstanceOf(UsageError)
+      expect((err as Error).message).toBe(message)
+      expect((err as Error).message).not.toContain(PATH)
+      assertNoLeak(err)
+    })
   })
 })
 

@@ -1217,7 +1217,7 @@ async function openSessions(ws: Workspace, log: RunLog): Promise<{ human: HumanS
 async function runFull(env: RunEnv, signals: SignalControl): Promise<number> {
   const dry = env.options.dryRun
   const mode = dry ? 'dry-run' : 'real'
-  const container = new ContainerRun(bunSpawn, env.log, env.runId, REPO_ROOT)
+  const container = new ContainerRun(bunSpawn, env.log, env.runId, REPO_ROOT, env.options.agentDirectorBinary)
   const state: RunState = {
     results: [],
     runNotes: [],
@@ -1284,6 +1284,7 @@ async function runFull(env: RunEnv, signals: SignalControl): Promise<number> {
         await ws.close()
         ended.browserClosed = true
         if (state.packed) rmSync(state.packed.dir, { recursive: true, force: true })
+        container.removeStage()
       } finally {
         await watchdogStopped
       }
