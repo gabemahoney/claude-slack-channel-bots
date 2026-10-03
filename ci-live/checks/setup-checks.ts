@@ -1,7 +1,10 @@
 /**
  * setup-checks.ts — testplans/b.yko Part 1 in the container: the pre-flight,
  * the install from the README (1.4), the persona setup (1.5, written by the
- * runner as the wizard's answers would be), and Checks S1–S3.
+ * runner as the wizard's answers would be), and Checks S1–S3. After the
+ * install, the image's client-under-test check (`RC_CLIENT_CHECK`) swaps
+ * agent-director's release-candidate client into the installed package and
+ * checks it, before the package checksums Check S2 compares against.
  *
  * These need no workspace, so a dry run runs them for real (with placeholder
  * IDs in config.json).
@@ -9,11 +12,21 @@
 
 import { SYSTEM_PROMPT_PATH, buildLiveConfig, renderConfig, systemPromptFromTemplate } from '../lib/live-config.ts'
 import { CONTAINER_HOME, CONTAINER_TARBALL } from '../lib/docker.ts'
+import { RC_CLIENT_CHECK, RC_CLIENT_CHECK_PASSED } from '../lib/rc-client.ts'
 import type { CheckContext } from './context.ts'
 import { Findings, pass, type CheckDef } from './framework.ts'
 import { guarded, lines, run, S } from './helpers.ts'
 
 const PREFLIGHT_OK = (phase: string) => `pre-flight passed (${phase})`
+
+/**
+ * How the install check's reason starts when the client-under-test check
+ * fails; the check's own `ERROR:` line follows it.
+ */
+export const RC_CLIENT_CHECK_FAILED = 'the release-candidate client check on the installed package failed'
+
+/** The client-under-test check's bound: a copy, a tarball unpack and three bun runs. */
+const RC_CLIENT_CHECK_TIMEOUT_MS = 120_000
 
 export const preflightCheck: CheckDef<CheckContext> = {
   id: 'preflight',
@@ -59,6 +72,17 @@ export const installCheck: CheckDef<CheckContext> = {
     ctx.shared.packageVersion = pkg[2]
     const layout = await run(ctx, '[ -f "$PKG/README.md" ] && [ -f "$PKG/slack-app-manifest.yml" ] && [ -d "$PKG/skills" ]')
     f.expect(layout.code === 0, 'PKG does not hold README.md, slack-app-manifest.yml and skills/')
+
+    // The client under test: the release candidate's client swapped into
+    // the package's resolved agent-director and checked, before the checksums
+    // S2 compares against.
+    const rc = await guarded(ctx, `${RC_CLIENT_CHECK} --package "$PKG"`, RC_CLIENT_CHECK_TIMEOUT_MS)
+    const passed = rc.out.split('\n').find((l) => l.startsWith(RC_CLIENT_CHECK_PASSED))
+    if (passed !== undefined) f.add(passed)
+    const rcError = rc.err.split('\n').find((l) => l.startsWith('ERROR:')) ?? (rc.ok ? `exit ${rc.code}` : 'the guard refused the container shell')
+    if (!f.expect(rc.ok && rc.code === 0 && passed !== undefined, `${RC_CLIENT_CHECK_FAILED}: ${rcError}`)) {
+      return f.result()
+    }
 
     // Step 3: what postinstall wrote, and the package checksums for S2.
     const state = await lines(ctx, 'ls -A "$S"')

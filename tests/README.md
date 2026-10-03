@@ -146,7 +146,7 @@ only skip.
 ```
 tests/
   integration/
-    test-1-install-startup.sh      # b.j9i: install the package; a pre-persona config fails start; the persona config starts in dry run
+    test-1-install-startup.sh      # b.j9i: install the package, then swap the release candidate's agent-director client into it and check it (rc-client-check.sh --package); a pre-persona config fails start; the persona config starts in dry run
     test-2-dryrun-spawn-skip.sh    # b.3hy: persona load line, per-persona dry-run spawn skip, /interject 404 and 503
     test-3-cozempic-restart.sh     # b.set: cozempic probe, stop --stop-bots per persona, clean restart
     test-4-resume-dialog.sh        # no ticket: non-dry-run spawn, then resume past the dev-channels dialog (b.vub)
@@ -173,6 +173,7 @@ tests/
   README.md
 docker/
   Dockerfile.test.base             # source-independent base image (see docker/README.md)
+  rc-client-check.sh               # the client-under-test check, copied into the base (see docker/README.md)
   Dockerfile.test                  # top image: the tests and the packed package
   entrypoint.sh                    # sets up testuser's Claude config, then runs tests/runner.sh
 ```

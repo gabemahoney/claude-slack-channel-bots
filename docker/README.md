@@ -8,8 +8,9 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
 
 - **`cscb-ci-base:v5`** (built from `docker/Dockerfile.test.base`) — slow base
   layers (apt deps incl. tmux, bun, nodejs, cozempic, agent-director). Built
-  lazily once per host. ~1+ GB. No CSCB source inside, and nothing from the
-  repo build context: it reads no `package.json`. What it holds is in
+  lazily once per host. ~1+ GB. No CSCB source inside. From the repo build
+  context it reads one file, `docker/rc-client-check.sh`, and no
+  `package.json`. What it holds is in
   [What the base holds](#what-the-base-holds).
 - **`cscb-ci:latest`** (built from `docker/Dockerfile.test`, `FROM cscb-ci-base:v5`)
   — adds `docker/entrypoint.sh`, `tests/`, `testplans/`, the `testuser` account,
@@ -18,7 +19,8 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
 - **`cscb-ci-live:latest`** (built from `docker/Dockerfile.live`, `FROM cscb-ci-base:v5`)
   — the `/ci-live` image (see [/ci-live](#ci-live-the-live-slack-acceptance-run)
   below). It adds Claude Code at a pinned version with auto-update off, the
-  agent-director the production host runs (see
+  agent-director binary the runner stages, checked against the release
+  candidate's client (see
   [The live image's agent-director](#the-live-images-agent-director)), a
   `testuser` with the host's uid and gid, and `docker/live/`: the entrypoint,
   and the testplan's shell helpers and pre-flight adapted to the container.
@@ -56,6 +58,8 @@ Every path is readable by every user, `testuser` included.
 | `/opt/agent-director-rc/client/agent-director/` | That tarball unpacked |
 | `/opt/agent-director-rc/client/release.json` | The release record: `version`, `commit`, `client_tarball` (the tarball's path above) and `client_tarball_sha256` |
 | `/opt/agent-director-rc/install/install.sh` | The release candidate's install script (mode 0755), from agent-director's source tree at the pinned commit. Off `PATH`; its directory holds nothing else |
+| `/opt/agent-director-rc/check/rc-client-check.sh` | The client-under-test check (`docker/rc-client-check.sh`, mode 0755; `ci-live/lib/rc-client.ts` exports the path as `RC_CLIENT_CHECK`). Off `PATH`, outside the release candidate's binary directory. See [The client under test](#the-client-under-test) |
+| `/root/.bun/install/global/node_modules/agent-director` | The global agent-director client: the release candidate's, installed with `bun add -g --ignore-scripts` from the tarball `release.json` names (it has no dependencies, so nothing comes from the registry), then checked by the build with `rc-client-check.sh --client` |
 | `/opt/agent-director-0.10.0/bin/agent-director` | agent-director 0.10.0's binary, off `PATH` |
 | `/opt/agent-director-0.10.0/agent-director-0.10.0.tgz` | The published agent-director 0.10.0 client, from npm |
 | `/opt/claude-slack-channel-bots-0.10.0/claude-slack-channel-bots-0.10.0.tgz` | The published pre-persona claude-slack-channel-bots 0.10.0 package, from npm |
@@ -63,8 +67,61 @@ Every path is readable by every user, `testuser` included.
 
 It also installs `sqlite3` (the harness's store reads and edits) and `file`
 (the install script's pre-flight) with apt. No agent-director client is
-installed globally. The 0.10.0 tarballs are fetched by exact version with
-`npm pack --ignore-scripts`; nothing in the base installs them.
+installed from the npm registry. The 0.10.0 tarballs are fetched by exact
+version with `npm pack --ignore-scripts`; nothing in the base installs them.
+
+## The client under test
+
+Every package under test in the images resolves agent-director's
+release-candidate client, and a check proves it. The check is
+`docker/rc-client-check.sh`, at `/opt/agent-director-rc/check/rc-client-check.sh`
+in the image, off `PATH`. It runs an agent-director binary, so it refuses to
+run (exit 3) without the [image marker](#image-marker); it never runs on the
+host.
+
+It has two uses:
+
+- **`--package <dir>`**: `<dir>` is an installed package. The check finds the
+  agent-director client the package resolves (bun's resolver, as the package's
+  own imports resolve it), replaces that directory whole with a copy of the
+  release candidate's unpacked client (`/opt/agent-director-rc/client/agent-director`,
+  copied beside it, then renamed into place), resolves again, and checks the
+  result.
+- **`--client <dir>`**: `<dir>` is an agent-director client. It is checked
+  as it is; nothing changes.
+
+The check, in order, stopping at the first failure (`release.json` is the
+release record in [What the base holds](#what-the-base-holds)):
+
+1. **content**: the client tarball's SHA-256 is `release.json`'s, and the
+   client's files equal a fresh unpack of that tarball;
+2. **exports**: the client exports `ErrTmuxKillFailed`, `ErrTmuxUnresponsive`
+   and `ErrTmuxSessionConflict`, each an `AgentDirectorError` subclass;
+3. **binary**: the first agent-director on `PATH` reports `release.json`'s
+   version and commit;
+4. **floor**: that version is at or above the client's
+   `dist/version-floor.json` minimum;
+5. **client-create**: `Client.create()`, imported from the client's entry
+   point, reports a `binaryVersion` equal to that version.
+
+A version comparison cannot tell the clients apart: the release candidate's
+client and the published agent-director 0.10.0 client both carry package
+version `0.10.0`. So step 1 compares content, not versions.
+
+On success it prints one line on stdout:
+`rc-client check passed: <dir> is the release-candidate client (tarball sha256 <sha>); agent-director <version> (<commit>) at <binary>; client floor <floor>`.
+A failed check or swap prints one line on stderr,
+`ERROR: rc-client check <step>: <what differs>`, and exits 1; a usage error
+exits 2.
+
+It runs in four places:
+
+| Where | What it checks | On failure |
+|---|---|---|
+| The base build (`docker/Dockerfile.test.base`) | `--client` on the global client, right after `bun add -g` of the release candidate's tarball | The build stops |
+| `/ci`'s test-1 (`tests/integration/test-1-install-startup.sh`) | `--package /test-repo/node_modules/claude-slack-channel-bots`, right after the install. Tests 2 onward use this install | One `FAIL:` line carrying the check's `ERROR:` line |
+| `/ci-live`'s install check (`ci-live/checks/setup-checks.ts`, Part 1.4) | `--package "$PKG"` after the install and the package layout check, before the state check and the checksums Check S2 compares against. The success line is recorded as a finding | A blocking FAIL, reason `the release-candidate client check on the installed package failed: <ERROR line>` |
+| The live image build (`docker/Dockerfile.live`) | `--client` on the base's global client, against the binary the runner staged | The build stops (see [The live image's agent-director](#the-live-images-agent-director)) |
 
 ## How the base gets the release candidate
 
@@ -143,7 +200,8 @@ rm -rf "$AD_INSTALL_CTX"
 Only the `cscb-ci` images carry `/etc/cscb-ci-image`, written by the base
 build (so `cscb-ci` and `cscb-ci-live` have it too). `tests/runner.sh` checks
 for it first and, when it is absent, prints one line on stderr and exits 2,
-so the runner never runs outside a `cscb-ci` image.
+so the runner never runs outside a `cscb-ci` image. `rc-client-check.sh`
+checks for it the same way and exits 3.
 
 ## Credential env vars passed to the container
 
@@ -166,7 +224,8 @@ Bump `cscb-ci-base`'s version tag (e.g. `v5` → `v6`) whenever you change
 `docker/Dockerfile.test.base`, its pins included: the release candidate's
 `AD_RC_VERSION` and `AD_RC_COMMIT`, the install script's
 `AD_INSTALL_SH_COMMIT` and `AD_INSTALL_SH_SHA256`, and the 0.10.0 legs'
-`AD_PREV_VERSION` and `CSCB_PREV_VERSION`. `/ci` builds a base only when its
+`AD_PREV_VERSION` and `CSCB_PREV_VERSION`, or its one repo input,
+`docker/rc-client-check.sh`. `/ci` builds a base only when its
 tag is missing, so without a bump every host keeps testing the base it
 already has. The base reads no `package.json`, so a change there needs no
 bump. There is **no** automatic version derivation — bump it manually in
@@ -194,11 +253,9 @@ is a change to the Dockerfile alone (with `AD_INSTALL_SH_SHA256` and the tag
 bump). The source audit fails when the skill types a commit.
 
 Common reasons to bump: a new release candidate or install script, a change
-of the 0.10.0 pins, bumping the bun installer, changing the nodejs major,
-adding/removing an apt package, or changing the cozempic install.
-The live image needs no bump of its own for a change of `package.json`'s
-`agent-director` range: it reads the range at every build (see
-[The live image's agent-director](#the-live-images-agent-director)).
+of the 0.10.0 pins, a change to `docker/rc-client-check.sh`, bumping the bun
+installer, changing the nodejs major, adding/removing an apt package, or
+changing the cozempic install.
 
 After bumping, the next `/ci` on every host will rebuild the base. Leave the
 old tag's image in place: other branches and worktrees on the same host that
@@ -529,24 +586,46 @@ sampled. `results.json` has them under
 
 ### The live image's agent-director
 
-The live image pairs CSCB with the agent-director the host's production bots
-run, whichever one the base image was built with:
+The live image pairs CSCB with agent-director's release candidate: the
+base's release-candidate client and a staged binary the build checks against
+it.
 
-- It installs the npm package `agent-director` at the range in
-  `package.json`, as a customer's install resolves it.
-- The runner copies the host's `agent-director` binary
+- **The client.** The live image installs no agent-director client and reads
+  no `package.json`. Its client is the base's global client, the release
+  candidate's (see [What the base holds](#what-the-base-holds)), and the
+  package under test is switched to it by the install check (see
+  [The client under test](#the-client-under-test)).
+- **The binary.** The runner copies an agent-director binary
   (`~/.agent-director/bin/agent-director`, else the first one on `PATH`) into
   a temporary directory that the build sees as the named context
   `agent-director-bin`. The image copies it over the base's
   `/opt/agent-director-rc/bin/agent-director`, first on `PATH`, and the
   build checks that it is the first agent-director there.
-- The build fails when the binary's version is not the npm package's, or is
-  below the package's version floor (`dist/version-floor.json`). The run then
-  reports a `container` FAIL row saying the host binary does not match the
-  npm package; `run.log` has the build's message. Upgrade the host binary to
-  the npm package's version (the `install-agent-director` skill), then rerun.
-- With no agent-director binary on the host, a run, a dry run included,
-  stops with exit 2.
+- **The check.** The build then runs `rc-client-check.sh --client` on the
+  base's global client, so the staged binary must report `release.json`'s
+  version and commit, be at or above the client's floor, and be the version
+  `Client.create()` reports. On a failure the build prints the check's own
+  `ERROR:` line, then one of three lines, chosen by that line:
+  - Step 3 (binary), a staged binary that is not the release candidate:
+    `ERROR: the staged agent-director binary is not the release candidate this image's agent-director client is checked against (the rc-client check line above names what differs): stage the release candidate's binary with the runner's --agent-director-binary option`.
+  - Steps 4 (floor) and 5 (client-create), a release candidate whose binary
+    and client do not pair:
+    `ERROR: the release candidate's agent-director binary and client do not pair (the rc-client check line above names what differs): the release candidate pinned by AD_RC_VERSION and AD_RC_COMMIT in docker/Dockerfile.test.base is not usable as is; pin one whose binary and client pair and bump the base image version as the When to bump the base image version section of docker/README.md describes`.
+  - Anything else (a missing or malformed release record, steps 1 (content)
+    and 2 (exports), a missing check script, the check's refusal or usage
+    error):
+    `ERROR: the base image's global agent-director client or its rc-client check failed (the line above names what failed): the base image cscb-ci-base:v5 predates this tree's docker/Dockerfile.test.base or docker/rc-client-check.sh; bump the base image version as the When to bump the base image version section of docker/README.md describes`.
+
+  Whichever line it is, the run reports a `container` FAIL row for the failed
+  build, and `run.log` has the build's `ERROR:` lines.
+- With no agent-director binary to stage, a run, a dry run included, stops
+  with exit 2.
+
+**Claude Code.** The live image installs Claude Code at the build arg
+`CLAUDE_CODE_VERSION`, pinned at `2.1.280` in `docker/Dockerfile.live`; the
+runner passes no override. `2.1.280` is the minimum Claude Code version
+agent-director states, and agent-director's hooks are exec form, which Claude
+Code runs from `2.1.139`.
 
 ### Secrets
 
@@ -832,7 +911,7 @@ secret store refuses any path under the real one.
 - The verdict is PASS when every check is PASS or SKIPPED. The closing scan
   must also find none of the stub's fake tokens in the outputs.
 
-It needs docker, the base image, the host's agent-director binary, Google
+It needs docker, the base image, an agent-director binary to stage, Google
 Chrome and the runner's dependency (`bun install --ignore-scripts` in
 `ci-live/`). It takes about a minute on a warm image cache, and holds its own
 lock, never the real one. The `/ci-live` skill runs it first, as a gate.
@@ -852,7 +931,7 @@ as "not yet", not as a FAIL.
 | Check | In `/ci-live` |
 |---|---|
 | Provisioning | A result row of its own (the stages above) |
-| Pre-flight, Part 1.4 install | Automated in the container. The install is `bun install -g --ignore-scripts` of the tarball, then `bun pm -g trust` |
+| Pre-flight, Part 1.4 install | Automated in the container. The install is `bun install -g --ignore-scripts` of the tarball, then `bun pm -g trust`; then `rc-client-check.sh --package "$PKG"` swaps the release candidate's client into the installed package and checks it (see [The client under test](#the-client-under-test)), before the package checksums Check S2 compares against |
 | Part 1.5 setup | The runner writes `config.json` and the system prompt as the wizard's answers would (a deviation noted in the results) |
 | S1 | `SKIPPED (manual only: the wizard chat)` |
 | S2, S3 | Automated, also in a dry run |

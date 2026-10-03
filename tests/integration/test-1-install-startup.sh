@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Test 1 (b.j9i): install package, start daemon in dry-run, verify startup.
 #
+# Right after the install, the image's client-under-test check
+# (/opt/agent-director-rc/check/rc-client-check.sh --package) replaces the
+# agent-director client the installed package resolves with the release
+# candidate's and checks it; a failed check ends the test with one FAIL line
+# carrying the check's ERROR line. Tests 2 onward use this install.
+#
 # The config is a persona config (b.av2 SR-13.5): persona "alpha" in two
 # channels (delivery all, prompts to the first), and the zero-channel persona
 # "bravo" with DMs on and prompts to its DM contact. Neither credentials file
@@ -30,6 +36,18 @@ cd /test-repo
 
 bun install /tmp/package.tgz >/tmp/bun-install.log 2>&1 \
     || fail "bun install /tmp/package.tgz failed (see /tmp/bun-install.log)"
+
+# --- The client under test: the release candidate's ----------------------
+# The image's check swaps agent-director's release-candidate client into the
+# agent-director the installed package resolves, then checks it (content,
+# Phase 1 classes, the binary first on PATH, the floor, Client.create()).
+RC_CLIENT_CHECK=/opt/agent-director-rc/check/rc-client-check.sh
+INSTALLED_PKG=/test-repo/node_modules/claude-slack-channel-bots
+if ! RC_CHECK_OUT=$("${RC_CLIENT_CHECK}" --package "${INSTALLED_PKG}" 2>/tmp/test-1-rc-client-check.err); then
+    RC_CHECK_ERR=$(grep -m 1 '^ERROR:' /tmp/test-1-rc-client-check.err || true)
+    fail "the release-candidate client check on ${INSTALLED_PKG} failed: ${RC_CHECK_ERR:-no ERROR line (see /tmp/test-1-rc-client-check.err)}"
+fi
+echo "${RC_CHECK_OUT}"
 
 test -x "${CLI}" \
     || fail "binary ${CLI} not installed or not executable"

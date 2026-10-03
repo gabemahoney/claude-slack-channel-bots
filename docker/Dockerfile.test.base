@@ -1,8 +1,9 @@
 # docker/Dockerfile.test.base — the /ci base image, cscb-ci-base:v5.
 #
 # Source-independent layers shared by the /ci image (docker/Dockerfile.test)
-# and the /ci-live image (docker/Dockerfile.live). It reads nothing from the
-# repo build context. Built once per host by the /ci skill:
+# and the /ci-live image (docker/Dockerfile.live). From the repo build context
+# it reads one file, docker/rc-client-check.sh (no package.json). Built once
+# per host by the /ci skill:
 #
 #   docker build --network=host --secret id=gh_token,env=GH_TOKEN \
 #     --build-context agent-director-rc=<release-candidate directory> \
@@ -25,6 +26,15 @@
 #   /opt/agent-director-rc/install/install.sh
 #       the release candidate's install script, from agent-director's source
 #       tree at the pinned commit; off PATH; its directory holds nothing else.
+#   /opt/agent-director-rc/check/rc-client-check.sh
+#       the client-under-test check (docker/rc-client-check.sh), off PATH:
+#       `--package <dir>` swaps the release candidate's client into an
+#       installed package's resolved agent-director and checks it;
+#       `--client <dir>` checks a client only. test-1,
+#       ci-live/checks/setup-checks.ts and docker/Dockerfile.live run it.
+#   /root/.bun/install/global/node_modules/agent-director
+#       the global agent-director client: the release candidate's, installed
+#       from its tarball above and checked by the build.
 #   /opt/agent-director-0.10.0/bin/agent-director
 #       agent-director 0.10.0's binary, off PATH.
 #   /opt/agent-director-0.10.0/agent-director-0.10.0.tgz
@@ -33,9 +43,11 @@
 #       the published pre-persona claude-slack-channel-bots 0.10.0 package,
 #       from npm.
 #   /etc/cscb-ci-image
-#       the image marker: tests/runner.sh refuses to run without it.
-# No agent-director client is installed globally, and /usr/local/bin holds
-# no agent-director.
+#       the image marker: tests/runner.sh and rc-client-check.sh refuse to
+#       run without it.
+# No agent-director client is installed from the npm registry (the 0.10.0
+# client is only kept as its tarball), and /usr/local/bin holds no
+# agent-director.
 #
 # Every failed check prints one line starting `ERROR:` naming its cause.
 
@@ -268,3 +280,29 @@ RUN --mount=type=bind,from=agent-director-rc,target=/mnt/agent-director-rc \
         exit 1; \
     fi; \
     echo "agent-director ${RC_REPORTED_VERSION} (${RC_REPORTED_COMMIT}) installed at ${RC_BIN}; client ${CLIENT_TGZ_SHA256} at ${RC_CLIENT_TGZ}; install.sh at ${RC_INSTALL_SH}"
+
+# The client-under-test check, the one file this image reads from the repo
+# context, at a fixed path off PATH and outside the release candidate's
+# binary directory. It refuses to run without /etc/cscb-ci-image (written
+# above).
+COPY --chmod=0755 docker/rc-client-check.sh /opt/agent-director-rc/check/rc-client-check.sh
+
+# The global agent-director client: the release candidate's, installed from
+# the tarball the release record names (it has no dependencies, so nothing is
+# fetched from the registry), then checked with the check's client-only use:
+# its files equal the tarball's, it exports the Phase 1 classes, and it pairs
+# with the release candidate's binary first on PATH. The check's summary line
+# is the last line this layer prints.
+RUN set -eu; \
+    RC_CHECK=/opt/agent-director-rc/check/rc-client-check.sh; \
+    GLOBAL_CLIENT=/root/.bun/install/global/node_modules/agent-director; \
+    RC_CLIENT_TGZ=$(jq -er '.client_tarball | strings' /opt/agent-director-rc/client/release.json) \
+        || { echo "ERROR: /opt/agent-director-rc/client/release.json names no client_tarball" >&2; exit 1; }; \
+    bun add -g --ignore-scripts "${RC_CLIENT_TGZ}" > /tmp/rc-client-install.log 2>&1 \
+        || { echo "ERROR: bun add -g ${RC_CLIENT_TGZ} failed: $(tail -n 1 /tmp/rc-client-install.log)" >&2; exit 1; }; \
+    rm -f /tmp/rc-client-install.log; \
+    if [ ! -f "${GLOBAL_CLIENT}/package.json" ]; then \
+        echo "ERROR: bun add -g ${RC_CLIENT_TGZ} left no client at ${GLOBAL_CLIENT}" >&2; \
+        exit 1; \
+    fi; \
+    "${RC_CHECK}" --client "${GLOBAL_CLIENT}"

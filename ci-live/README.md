@@ -31,10 +31,10 @@ exception is `hgx`, which takes a value only as an argument (see
 - On the VM: docker, the `/ci` base image (if
   `docker image inspect cscb-ci-base:v5` fails, run `/ci` once, with
   `CSCB_AD_RC_DIR` and `CSCB_AD_SRC_DIR` set: see `docker/README.md`), Google
-  Chrome (`google-chrome --version`), bun, and agent-director
-  (`agent-director version`). The live image pairs CSCB with this host's
-  agent-director binary, so its version must be the one that `package.json`'s
-  `agent-director` range installs from npm.
+  Chrome (`google-chrome --version`), bun, and an agent-director binary for
+  the runner to stage into the live image. The build checks that binary
+  against the release candidate's client in the base image (see "The live
+  image's agent-director" in `docker/README.md`).
 
 Not there yet: the refresh token (step 1), the Claude credentials if your
 shell lacks them (step 2), the test human's browser session (step 4), and the

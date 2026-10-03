@@ -57,16 +57,28 @@
  *   behind the plan's `guard`;
  * - the /ci images name one base tag, `BASE_IMAGE`: the `FROM` lines of
  *   `docker/Dockerfile.test` and `docker/Dockerfile.live` and the `/ci` and
- *   `/ci-live` skills; the base (`docker/Dockerfile.test.base`) reads nothing
- *   from the repo context (no `package.json`, no agent-director client from
- *   the registry), takes the release candidate and `install.sh` only from
- *   their named build contexts, checks them (SHA256SUMS, the pinned version
- *   and commit, the pinned SHA-256) before installing them, puts the release
- *   candidate's binary in a directory of its own first on PATH (never
- *   /usr/local/bin) and the 0.10.0 binary, fetched for its pinned release, off
- *   PATH, installs `sqlite3` and `file` and writes the marker
- *   /etc/cscb-ci-image; `Dockerfile.live` and the three `docker/live` scripts'
- *   PATH lines use the base's release-candidate directory.
+ *   `/ci-live` skills; the base (`docker/Dockerfile.test.base`) reads one
+ *   file from the repo context, the client-under-test check
+ *   (`RC_CLIENT_CHECK_SOURCE`, never `package.json`), and installs nothing
+ *   but its global agent-director client, from the release candidate's
+ *   client tarball (no registry); it takes the release candidate and
+ *   `install.sh` only from their named build contexts, checks them
+ *   (SHA256SUMS, the pinned version and commit, the pinned SHA-256) before
+ *   installing them, puts the release candidate's binary in a directory of
+ *   its own first on PATH (never /usr/local/bin) and the 0.10.0 binary,
+ *   fetched for its pinned release, off PATH, installs `sqlite3` and `file`
+ *   and writes the marker /etc/cscb-ci-image; `Dockerfile.live` and the three
+ *   `docker/live` scripts' PATH lines use the base's release-candidate
+ *   directory;
+ * - the client under test (`ci-live/lib/rc-client.ts`): the base copies the
+ *   check to `RC_CLIENT_CHECK` and installs its global client from the path
+ *   in the release record, then runs `--client` on it; `Dockerfile.live`
+ *   copies no `package.json`, installs no agent-director (its one package
+ *   install is Claude Code's) and runs `--client` on that global client after
+ *   staging its binary, stopping the build on failure; test-1 runs
+ *   `--package` on the package it installed into /test-repo right after the
+ *   install, failing the test on failure. The check's path is imported, never
+ *   typed.
  *
  * Nothing here runs docker: spawns go to a recording fake. The wiring that
  * lives in `ci-live/runtime/` and `ci-live/main.ts` (which load
@@ -108,6 +120,7 @@ import {
 } from '../ci-live/lib/docker.ts'
 import { CHILD_ENV_ALLOWLIST, minimalChildEnv, type ProcResult, type SpawnOptions } from '../ci-live/lib/proc.ts'
 import { isLiveRunnerPid, lockHolder, lockPid, nodeLockDeps, RunLock, type LockDeps } from '../ci-live/lib/run-lock.ts'
+import { RC_CLIENT_CHECK, RC_CLIENT_CHECK_SOURCE } from '../ci-live/lib/rc-client.ts'
 import { NotRunnableError } from '../ci-live/lib/secrets.ts'
 import { balancedAfter, callArguments, callsOf, indicesOf, objectProperties, onlyCallArguments, splitTopLevel, stripComments } from './test-helpers/source-audit.ts'
 import { APP_TOKEN_PREFIX, assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL } from './test-helpers/credentials.ts'
@@ -1576,6 +1589,37 @@ function baseImage() {
   return { instructions, args, mounts, path, rcBinDir: path[0]! }
 }
 
+/**
+ * The shell statements of `lines` (RUN instructions, or a script's joined
+ * lines), split at `;`, `&&`, `||` and `|`, with every `echo "…"` string
+ * emptied (an ERROR line naming a command does not run it) and redirections
+ * dropped.
+ */
+function shellStatements(lines: string[]): string[] {
+  return lines.flatMap((line) => line
+    .replace(/\becho\s+"(?:[^"\\]|\\.)*"/g, 'echo ""')
+    .split(/;|&&|\|\|?/)
+    .map((s) => s.replace(/\s\d*>&?\s*[^\s;]+/g, '').trim())
+    .filter((s) => s !== ''))
+}
+
+/** The statements of the `if` at `statements[at]` up to its own `fi`, each with its nesting depth (0: the if's own body). */
+function ifBody(statements: string[], at: number): { depth: number, text: string }[] {
+  const body: { depth: number, text: string }[] = []
+  let depth = 0
+  for (const statement of statements.slice(at + 1)) {
+    if (statement === 'fi') {
+      if (depth === 0) return body
+      depth--
+      continue
+    }
+    const text = statement.replace(/^(then|else)\s+/, '')
+    if (/^if\s/.test(text)) depth++
+    body.push({ depth, text })
+  }
+  throw new Error(`no fi closes ${statements[at]}`)
+}
+
 describe('the /ci images (source audit)', () => {
   const baseRepo = BASE_IMAGE.slice(0, BASE_IMAGE.indexOf(':'))
 
@@ -1601,10 +1645,12 @@ describe('the /ci images (source audit)', () => {
     expect(skill).toContain('-f docker/Dockerfile.test.base -t "${BASE_TAG}" .')
   })
 
-  test('the base reads nothing from the repo context (no COPY or ADD, so no package.json) and installs no agent-director client from the registry; the 0.10.0 legs are packed at exact versions', () => {
+  test("the base reads one file from the repo context, the client-under-test check (no other COPY or ADD, so no package.json), and its one install is the global client from the release candidate's tarball (none from the registry); the 0.10.0 legs are packed at exact versions", () => {
     const { instructions, args } = baseImage()
-    expect(instructions.filter((i) => /^(COPY|ADD)\s/i.test(i))).toEqual([])
-    expect(instructions.filter((i) => /\bnpm\s+(i|install|add)\b|\bbun\s+(add|install)\b|\s(-g|--global)\b/.test(i))).toEqual([])
+    expect(instructions.filter((i) => /^(COPY|ADD)\s/i.test(i))).toEqual([`COPY --chmod=0755 ${RC_CLIENT_CHECK_SOURCE} ${RC_CLIENT_CHECK}`])
+    expect(shellStatements(instructions).filter((s) => /\bnpm\s+(i|install|add)\b|\bbun\s+(add|install)\b|\s(-g|--global)\b/.test(s))).toEqual([
+      'bun add -g --ignore-scripts "${RC_CLIENT_TGZ}"',
+    ])
     expect([args.AD_PREV_VERSION, args.CSCB_PREV_VERSION].map((v) => /^\d+\.\d+\.\d+$/.test(v ?? ''))).toEqual([true, true])
     const pack = runWith(instructions, 'npm pack')
     expect([pack.includes('"agent-director@${AD_PREV_VERSION}"'), pack.includes('"claude-slack-channel-bots@${CSCB_PREV_VERSION}"')]).toEqual([true, true])
@@ -1693,5 +1739,110 @@ describe('the /ci images (source audit)', () => {
     const firsts = [...repoFile(join('docker', 'live', file)).matchAll(/^\s*export PATH="([^"]*)"/gm)].map((m) => m[1]!.split(':')[0])
     expect(firsts.length).toBeGreaterThan(0)
     expect(firsts.filter((dir) => dir !== rcBinDir)).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The client under test (source audit of the base, Dockerfile.live and test-1)
+// ---------------------------------------------------------------------------
+
+const LIVE_DOCKERFILE = join('docker', 'Dockerfile.live')
+const TEST_1 = join('tests', 'integration', 'test-1-install-startup.sh')
+
+const escapeRegExp = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+/** The base's RUN that installs and checks its global client: the RUN, its position, its plain assignments and its statements. */
+function baseGlobalClientRun() {
+  const { instructions, args } = baseImage()
+  const run = runWith(instructions, ' --client ')
+  return { instructions, args, run, at: instructions.indexOf(run), vars: shellVars(run, args), statements: shellStatements([run]) }
+}
+
+describe('the client under test (source audit)', () => {
+  test("the base copies the check from RC_CLIENT_CHECK_SOURCE to RC_CLIENT_CHECK, then installs its global client from the tarball path the release record holds and runs the check's --client on it", () => {
+    const { instructions, args, run, at, vars, statements } = baseGlobalClientRun()
+    const copy = instructions.indexOf(`COPY --chmod=0755 ${RC_CLIENT_CHECK_SOURCE} ${RC_CLIENT_CHECK}`)
+    expect([copy >= 0, copy < at]).toEqual([true, true])
+    expect(statSync(join(REPO, RC_CLIENT_CHECK_SOURCE)).isFile()).toBe(true)
+
+    // The release record the release candidate's RUN writes holds the client tarball's fixed path.
+    const rc = runWith(instructions, 'from=agent-director-rc,')
+    const rcVars = shellVars(rc, args)
+    const record = expand(/>\s*"?([^\s";]*\/release\.json)"?/.exec(rc)![1]!, rcVars)
+    expect(rc).toContain('--arg client_tarball "${RC_CLIENT_TGZ}"')
+    expect(rcVars.get('RC_CLIENT_TGZ')).toMatch(/^\/[^$]*\.tgz$/)
+    expect(instructions.indexOf(rc)).toBeLessThan(at)
+
+    // The global client: read from that record, installed from that path, then checked under set -e.
+    expect(run).toMatch(/^RUN set -[a-z]*e[a-z]*;/)
+    expect(/(?:^|;)\s*RC_CLIENT_TGZ=\$\(jq -er '\.client_tarball \| strings' (\S+)\)/.exec(run)?.[1]).toBe(record)
+    expect(vars.get('RC_CHECK')).toBe(RC_CLIENT_CHECK)
+    expect(vars.get('GLOBAL_CLIENT')).toBe('/root/.bun/install/global/node_modules/agent-director')
+    const install = statements.indexOf('bun add -g --ignore-scripts "${RC_CLIENT_TGZ}"')
+    const check = statements.indexOf('"${RC_CHECK}" --client "${GLOBAL_CLIENT}"')
+    expect([install >= 0, check > install]).toEqual([true, true])
+  })
+
+  test("Dockerfile.live copies no package.json, installs no agent-director (its one package install is Claude Code's), and after staging its binary runs RC_CLIENT_CHECK --client on the base's global client, stopping the build when it fails", () => {
+    const live = dockerInstructions(LIVE_DOCKERFILE)
+    expect(live.filter((i) => i.includes('package.json'))).toEqual([])
+    expect(shellStatements(live).filter((s) => /\b(npm|npx|bunx?|pnpm|yarn)\s/.test(s) || s.includes('agent-director@'))).toEqual([
+      'npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"',
+    ])
+
+    const run = runWith(live, 'command -v agent-director')
+    expect(live.indexOf(run)).toBeGreaterThan(live.findIndex((i) => i.startsWith('COPY --from=agent-director-bin ')))
+    const statements = shellStatements([run])
+    const checkRe = new RegExp(`^if ! "?${escapeRegExp(RC_CLIENT_CHECK)}"? --client "?([^\\s"]+)"?$`)
+    const checks = statements.flatMap((s, i) => checkRe.test(s) ? [i] : [])
+    expect(checks.length).toBe(1)
+    expect(checkRe.exec(statements[checks[0]!]!)![1]).toBe(baseGlobalClientRun().vars.get('GLOBAL_CLIENT')!)
+    expect(checks[0]!).toBeGreaterThan(statements.findIndex((s) => s.includes('command -v agent-director')))
+    expect(ifBody(statements, checks[0]!).filter((s) => s.depth === 0).at(-1)?.text).toBe('exit 1')
+  })
+
+  test("Dockerfile.live's failed-check line names --agent-director-binary only for the check's step 3 (binary), routing each ERROR line the check can print", () => {
+    const run = runWith(dockerInstructions(LIVE_DOCKERFILE), 'command -v agent-director')
+    const echoed = '"((?:[^"\\\\]|\\\\.)*)"'
+    const routes = [...run.matchAll(new RegExp(`\\b(?:if|elif)\\s+grep\\s+-qE\\s+'([^']*)'\\s+\\S+;\\s*then\\s+echo\\s+${echoed}`, 'g'))].map((m) => ({ re: new RegExp(m[1]!), text: m[2]! }))
+    const fallback = new RegExp(`\\belse\\s+echo\\s+${echoed}`).exec(run)?.[1]
+    expect(routes.length).toBeGreaterThan(0)
+    expect(fallback).toBeDefined()
+    const lineFor = (error: string) => routes.find((r) => r.re.test(error))?.text ?? fallback!
+
+    // Every step the check fails at, in the check's own ERROR shape, plus its usage and refusal lines.
+    const script = repoFile(RC_CLIENT_CHECK_SOURCE).split('\n').filter((l) => !l.trimStart().startsWith('#')).join('\n')
+    const steps = [...new Set([...script.matchAll(/\bfail (?:'([^']+)'|(\w+))\s/g)].map((m) => m[1] ?? m[2]!))]
+    expect(steps).toContain('3 (binary)')
+    expect(steps).toContain('4 (floor)')
+    const errors = [
+      ...steps.map((step) => `ERROR: rc-client check ${step}: what differs`),
+      'ERROR: rc-client-check.sh: /etc/cscb-ci-image is absent: this check runs only in a cscb-ci image (it runs agent-director); refusing to run',
+      'ERROR: rc-client-check.sh: unknown mode --x (usage: rc-client-check.sh --package <dir> | --client <dir>)',
+    ]
+    expect(errors.filter((e) => lineFor(e).includes('--agent-director-binary'))).toEqual(['ERROR: rc-client check 3 (binary): what differs'])
+  })
+
+  test("test-1 runs RC_CLIENT_CHECK --package on the package it installed into /test-repo, directly after the install, and fails the test when the check fails", () => {
+    const lines = dockerInstructions(TEST_1)
+    const install = lines.findIndex((l) => /^bun install \/tmp\/package\.tgz\s/.test(l))
+    expect(install).toBeGreaterThan(0)
+    const repoDir = lines.slice(0, install).flatMap((l) => /^cd (\/\S+)$/.exec(l)?.[1] ?? []).at(-1)
+    expect(repoDir).toBe('/test-repo')
+
+    // Directly after: plain assignments only, then the check.
+    const vars = new Map<string, string>()
+    let at = install + 1
+    for (let m; (m = /^([A-Z_][A-Z0-9_]*)=([^\s$"'`;()]+)$/.exec(lines[at] ?? '')); at++) vars.set(m[1]!, m[2]!)
+    const call = /^if ! (?:\w+=\$\()?"?([^\s"]+)"? --package "?([^\s")]+)"?[\s)]/.exec(lines[at]!)
+    expect(call).not.toBeNull()
+    expect(expand(call![1]!, vars)).toBe(RC_CLIENT_CHECK)
+    const pkgName = JSON.parse(repoFile('package.json')).name as string
+    expect(expand(call![2]!, vars)).toBe(join(repoDir!, 'node_modules', pkgName))
+    expect(lines[at]).toMatch(/; then$/)
+
+    // A failed check fails the test.
+    const fi = lines.indexOf('fi', at)
+    expect(lines.slice(at + 1, fi).filter((l) => /^fail\s/.test(l)).length).toBe(1)
   })
 })
