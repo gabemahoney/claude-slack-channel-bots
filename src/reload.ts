@@ -1,6 +1,7 @@
 /**
  * reload.ts — The reload controller: the last-applied record and the start
- * rules (b.av2 SR-8.1, SR-8.7, SR-13.1).
+ * rules (b.av2 SR-8.1, SR-8.7, SR-13.1), and apply step 1's retired keys
+ * (b.jg5 SRJ-803, SRJ-804, SRJ-1511).
  *
  * Saving `config.json` does not change what runs. The server keeps a byte
  * copy of the last applied configuration, `config.json.last-applied` (the
@@ -40,8 +41,16 @@
  * before anything is applied. A confirmation whose fingerprint matches the
  * pass's applies the bytes and the change plan that pass derived: an invalid
  * candidate logs `reload-invalid` and changes nothing; a valid one runs step
- * 1 (rewrite the record, then swap the applied state and tell `onApplied`),
- * then steps 2–6 of `reload-apply.ts` in order (by default through the
+ * 1 (b.jg5 SRJ-1511: record the retired keys of removed personas, a renamed
+ * persona's old key included, and of the old halves of destructive modifies,
+ * and the key of each persona it brings up that is held as retired only in
+ * memory, durably through the injected retired-key store, a failure of that
+ * write failing the apply with nothing applied, SRJ-803, SRJ-804; then
+ * rewrite the record; if the rewrite fails, nothing is applied,
+ * `reload-record-write-failed` is logged, and the keys this apply recorded
+ * are removed again, a key held as retired before the apply staying retired,
+ * SRJ-804; then swap the applied state and tell `onApplied`), then steps 2–6
+ * of `reload-apply.ts` in order (by default through the
  * lifecycle operations: step 2 tears down each removed persona and the old
  * half of each destructive modify, steps 3 and 4 update in place and
  * reconnect, step 5 refreshes the agent-director template when the config
@@ -54,12 +63,15 @@
  *
  * The controller (`createReloadController`) is built with every dependency
  * injected, as `createCronScheduler` is: the SR-8.1 paths, the durable
- * writer and delete, the log sink, the lifecycle operations (the start
- * bring-up pass, and the apply's per-step operations), the tick driver, the dry-run flag, the held
- * credentials digests and bring-up states, and the Slack client factory that later work binds
- * (applying a confirmed change). It keeps the applied bytes and configuration
- * in memory. `readAppliedPersonaConfig` is the CLI's read-only resolver over
- * the same rules.
+ * writer and delete, the server's retired-key store (`retired-keys.ts`,
+ * whose writes go through the same writer), the log sink, the lifecycle
+ * operations (the start bring-up pass, and the apply's per-step operations),
+ * the tick driver, the dry-run flag, the held credentials digests and
+ * bring-up states, and the Slack client factory that later work binds
+ * (applying a confirmed change). The start resolution records no retired
+ * key. It keeps the applied bytes and configuration in memory.
+ * `readAppliedPersonaConfig` is the CLI's read-only resolver over the same
+ * rules.
  *
  * Importable without side effects (b.av2 SR-13.1): importing it creates no
  * timer or Slack client, reads no file or environment variable and logs
@@ -152,7 +164,18 @@ import {
   type ChangePlanCandidate,
   type ChangePlanFacts,
   type FactUnknown,
+  type ValidChangePlan,
 } from './reload-plan.ts'
+import {
+  RETIRED_KEY_CAUSE_ABSENT_AT_START,
+  RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY,
+  RETIRED_KEY_CAUSE_REMOVED,
+  RETIRED_KEYS_WRITE_FAILED,
+  RETIRED_KEYS_WRITTEN,
+  type RetiredKeyStore,
+  type RetiredKeysRestoreOutcome,
+  type RetiredKeyToRecord,
+} from './retired-keys.ts'
 
 export { RELOAD_INVALID, RELOAD_PREVIEW } from './reload-plan.ts'
 export { RELOAD_APPLIED, RELOAD_NOOP, RELOAD_STALE_CONFIRMATION } from './reload-apply.ts'
@@ -164,9 +187,29 @@ export { RELOAD_APPLIED, RELOAD_NOOP, RELOAD_STALE_CONFIRMATION } from './reload
 /**
  * The last-applied record could not be written. At a start without a record,
  * the server does not start and nothing is applied; at a confirmed apply,
- * nothing is applied and the change stays pending.
+ * nothing is applied and the change stays pending. At a confirmed apply the
+ * same class names a failed write of the retired-key record at step 1, and
+ * a failed rewrite's line says how the retired-key record's restore went
+ * (b.jg5 SRJ-804).
  */
 export const RELOAD_RECORD_WRITE_FAILED = 'reload-record-write-failed'
+
+/**
+ * How the restore went, in the `reload-record-write-failed` line of a failed
+ * write of the retired-key record at step 1 (b.jg5 SRJ-804): the restore
+ * succeeded. True whether the restore wrote the record held before the apply
+ * back or wrote a key held only in memory to the file for the first time.
+ */
+export const RELOAD_RETIRED_KEYS_RESTORED =
+  'the retired-key record holds what this server held as retired before this apply'
+
+/**
+ * How the restore went, in the same line as {@link RELOAD_RETIRED_KEYS_RESTORED}:
+ * the restore failed too.
+ */
+export const RELOAD_RETIRED_KEYS_RESTORE_FAILED =
+  'putting the retired-key record back to what it held before this apply failed too, so a key this apply ' +
+  'recorded that reached the file stays retired'
 
 /**
  * Nothing is pending any more: the configuration file and the credentials
@@ -360,6 +403,16 @@ export interface ReloadControllerDeps {
   write?: ReloadFileWriter
   /** The durable delete (of `config.json.pending` and `config.json.apply`); `durableUnlinkSync` by default. */
   remove?: ReloadFileRemover
+  /**
+   * The server's retired-key store (`src/retired-keys.ts`, b.jg5 SRJ-802):
+   * production passes the one store `main()` loaded at start. A confirmed
+   * apply's step 1 records through it, and restores it after a failed
+   * rewrite of the last-applied record (SRJ-803, SRJ-804, SRJ-1511). Its
+   * writes must reach the disk through the same writer as `write`: production
+   * builds it with the default `durableWriteFileSync`, the default of `write`
+   * too, and a test builds it over the writer (and delete) it gives here.
+   */
+  retiredKeys: RetiredKeyStore
   /** The detection tick's driver; without one, `startDetection` arms nothing. */
   tickDriver?: ReloadTickDriver
   /**
@@ -456,6 +509,35 @@ export interface ReloadControllerDeps {
  */
 export function configInEffect(startTime: PersonaConfig, applied: PersonaConfig): PersonaConfig {
   return { ...startTime, personas: applied.personas }
+}
+
+// ---------------------------------------------------------------------------
+// Apply step 1's retired keys (b.jg5 SRJ-803, SRJ-1511)
+// ---------------------------------------------------------------------------
+
+/**
+ * The keys a confirmed apply's step 1 records as retired, one batch for one
+ * write (SRJ-803): the key of each removed persona as `removed` (a
+ * key-changing rename is a removal of its old key and an addition of its new
+ * one, so its old key is among them), the key of each destructive modify as
+ * `destructive-modify` (a change of `name` that keeps the key,
+ * `credentials_file` or `working_directory`), and the key of each persona
+ * the plan adds (a key-changing rename's new key included) that `store`
+ * holds only in memory after a failed start-sweep write, with the cause it
+ * holds, so the batch writes it before the bring-up is applied. Empty when
+ * there is none. Reads only `store`'s queries; writes nothing.
+ */
+export function retiredKeysToRecord(
+  plan: ValidChangePlan,
+  store: Pick<RetiredKeyStore, 'isHeldInMemory' | 'entry'>,
+): RetiredKeyToRecord[] {
+  return [
+    ...plan.removed.map(({ key }): RetiredKeyToRecord => ({ key, cause: RETIRED_KEY_CAUSE_REMOVED })),
+    ...plan.destructive.map(({ key }): RetiredKeyToRecord => ({ key, cause: RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY })),
+    ...plan.added
+      .filter(({ key }) => store.isHeldInMemory(key))
+      .map(({ key }): RetiredKeyToRecord => ({ key, cause: store.entry(key)?.cause ?? RETIRED_KEY_CAUSE_ABSENT_AT_START })),
+  ]
 }
 
 // ---------------------------------------------------------------------------
@@ -1293,25 +1375,24 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
   }
 
   /**
-   * Step 1's record write (b.av2 SR-8.6): the candidate bytes, byte for byte,
-   * through the durable writer. True when it succeeded. On a failure before
-   * the rename the old record is intact; on a directory-sync failure after it
-   * the previous bytes are written back (best effort). Either way one
-   * `reload-record-write-failed` line is logged and false returned, and the
-   * caller leaves the applied state as it was, so the change stays pending.
+   * Step 1's rewrite of the last-applied record (b.av2 SR-8.6, b.jg5
+   * SRJ-1511): the candidate bytes, byte for byte, through the durable
+   * writer. Answers undefined when it succeeded. On a failure before the
+   * rename the old record is intact; on a directory-sync failure after it the
+   * previous bytes are written back (best effort). Either way it answers the
+   * `reload-record-write-failed` line, unlogged, for the caller to complete
+   * with the retired-key record's restore and log once; the caller leaves the
+   * applied state as it was, so the change stays pending.
    */
-  function writeRecord(bytes: Uint8Array, previous: Uint8Array): boolean {
+  function writeRecord(bytes: Uint8Array, previous: Uint8Array): string | undefined {
     const record = JSON.stringify(paths.lastApplied)
     const notApplied = 'the confirmed change is not applied and stays pending'
     try {
       write(paths.lastApplied, bytes)
-      return true
+      return undefined
     } catch (err) {
       if (!(err instanceof DurableWriteUnsyncedError)) {
-        deps.log(
-          `[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot write the last-applied record ${record}${errnoSuffix(err)}; ${notApplied}`,
-        )
-        return false
+        return `[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot write the last-applied record ${record}${errnoSuffix(err)}; ${notApplied}`
       }
       let restored: string
       try {
@@ -1323,12 +1404,42 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
             ? 'the previous record was written back, though its directory could not be synced either'
             : `writing the previous record back failed too${errnoSuffix(restoreErr)}, so the next start may run the unapplied change`
       }
-      deps.log(
+      return (
         `[slack] ${RELOAD_RECORD_WRITE_FAILED}: wrote the last-applied record ${record} but could not sync its ` +
-          `directory${errnoSuffix(err)}; ${restored}; ${notApplied}`,
+        `directory${errnoSuffix(err)}; ${restored}; ${notApplied}`
       )
-      return false
     }
+  }
+
+  /**
+   * The one `reload-record-write-failed` line of a failed write of the
+   * retired-key record at step 1 (b.jg5 SRJ-804): names the file, says the
+   * last-applied record was not rewritten and nothing is applied, and how the
+   * restore of the record held before the apply went. The store's own line
+   * carries the write's error. No file content, no token.
+   */
+  function retiredKeysWriteFailedLine(store: RetiredKeyStore, restore: RetiredKeysRestoreOutcome): string {
+    const restored = restore === RETIRED_KEYS_WRITE_FAILED ? RELOAD_RETIRED_KEYS_RESTORE_FAILED : RELOAD_RETIRED_KEYS_RESTORED
+    return (
+      `[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot write the retired-key record ${JSON.stringify(store.path)}; ` +
+      `the last-applied record ${JSON.stringify(paths.lastApplied)} is not rewritten, and the confirmed change is ` +
+      `not applied and stays pending; ${restored} (b.jg5 SRJ-803, SRJ-804)`
+    )
+  }
+
+  /**
+   * What a failed rewrite's `reload-record-write-failed` line adds once step 1
+   * wrote the retired-key record (b.jg5 SRJ-804): the record put back to what
+   * it held before the apply, or, when that restore failed, that the keys
+   * this apply recorded stay retired.
+   */
+  function retiredKeysRestoredClause(store: RetiredKeyStore, restore: RetiredKeysRestoreOutcome): string {
+    const file = JSON.stringify(store.path)
+    return restore === RETIRED_KEYS_WRITE_FAILED
+      ? `; putting the retired-key record ${file} back to what it held before this apply failed, so the keys this ` +
+          'apply recorded stay retired (b.jg5 SRJ-804)'
+      : `; the retired-key record ${file} is put back to what it held before this apply: the keys this apply ` +
+          'recorded are removed again, and keys recorded before it stay (b.jg5 SRJ-804)'
   }
 
   /** Tell the server the new applied configuration; a throw is logged, never raised. */
@@ -1344,13 +1455,30 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
    * Apply a confirmed candidate (b.av2 SR-8.6): the exact bytes and the plan
    * the tick derived from them, never a second read or diff. An invalid
    * candidate logs one `reload-invalid` line and changes nothing. A valid one
-   * runs step 1 (record rewrite, then the applied-state swap and `onApplied`
-   * in the same synchronous step), then the bound steps 2–6 in order
-   * (`applyStepsFor`: none but the template refresh for a no-op, and that
-   * only when the config directories changed), then logs `reload-applied`
-   * or `reload-noop`. Resolves whether the applied state changed. Rejects
-   * only on a programming error (a plan naming a key its configuration
-   * lacks), before anything is written; the tick logs it as a failed pass.
+   * runs step 1 (b.jg5 SRJ-1511) in one synchronous stretch, with no await
+   * between its writes:
+   *   1. record the retired keys (`retiredKeysToRecord`, SRJ-803) with one
+   *      write of the retired-key store, when there are any: each removed
+   *      persona's key (a renamed persona's old key included) as `removed`,
+   *      each destructive modify's key as `destructive-modify`, and the key
+   *      of each persona the apply adds that the store holds only in memory.
+   *      When that write fails, the store is restored to the record it held
+   *      before the apply, as far as it can be, one
+   *      `reload-record-write-failed` line naming the retired-key file is
+   *      logged, and nothing is applied: the last-applied record is not
+   *      rewritten and the change stays pending (SRJ-804);
+   *   2. rewrite the last-applied record. When that fails, the retired-key
+   *      record, if step 1 wrote it, is restored to what it held before the
+   *      apply (the keys this apply recorded removed again, keys and marks
+   *      held before it kept), one `reload-record-write-failed` line says how
+   *      the restore went, and nothing is applied (SRJ-804);
+   *   3. swap the applied state and tell `onApplied`.
+   * Then the bound steps 2–6 run in order (`applyStepsFor`: none but the
+   * template refresh for a no-op, and that only when the config directories
+   * changed), then `reload-applied` or `reload-noop` is logged. Resolves
+   * whether the applied state changed. Rejects only on a programming error (a
+   * plan naming a key its configuration lacks), before anything is written;
+   * the tick logs it as a failed pass.
    */
   async function applyConfirmed(state: PendingState): Promise<boolean> {
     const current = appliedState
@@ -1364,7 +1492,24 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     if (candidate.kind !== 'valid' || bytes === undefined) return false
     const inputs = applyStepInputs(plan, current.config, candidate.config)
 
-    if (!writeRecord(bytes, current.bytes)) return false
+    // Step 1 (SRJ-1511): record, rewrite and restore in one synchronous
+    // stretch, so no mark, clear or other write of the store comes between.
+    const store = deps.retiredKeys
+    const batch = retiredKeysToRecord(plan, store)
+    const recorded = batch.length === 0 ? undefined : store.record(batch)
+    if (recorded !== undefined && recorded.outcome === RETIRED_KEYS_WRITE_FAILED) {
+      deps.log(retiredKeysWriteFailedLine(store, store.restore(recorded.snapshot)))
+      return false
+    }
+    const rewriteFailed = writeRecord(bytes, current.bytes)
+    if (rewriteFailed !== undefined) {
+      const restored =
+        recorded !== undefined && recorded.outcome === RETIRED_KEYS_WRITTEN
+          ? retiredKeysRestoredClause(store, store.restore(recorded.snapshot))
+          : ''
+      deps.log(rewriteFailed + restored)
+      return false
+    }
     appliedState = { config: candidate.config, bytes, source: 'config' }
     notifyApplied(candidate.config)
 

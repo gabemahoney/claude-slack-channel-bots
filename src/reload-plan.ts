@@ -1,6 +1,6 @@
 /**
  * reload-plan.ts — The structured change plan and the pending-change preview
- * (b.av2 SR-8.4, SR-8.6, SR-10.3).
+ * (b.av2 SR-8.4, SR-8.6, SR-10.3; b.jg5 SRJ-1510, SRJ-1511).
  *
  * `buildChangePlan` classifies a candidate configuration against the applied
  * one, persona by persona and setting by setting, in the terms of the SR-8.6
@@ -16,8 +16,11 @@
  *   (b.av2 SR-8.4). A header with the counts (`changePlanCounts`,
  *   `renderChangePlanCounts`, reused by E12's `reload-applied`), then one
  *   line per affected persona and changed setting; removals and destructive
- *   modifies start with `DESTRUCTIVE:`. An invalid candidate renders one
- *   `INVALID` line, a plan with no effect `no effective change`;
+ *   modifies start with `DESTRUCTIVE:` and say the persona will be retired:
+ *   its session stopped and never resumed, and a destructive modify's brought
+ *   up fresh (`removedLine`, `destructiveLine`, b.jg5 SRJ-1510). An invalid
+ *   candidate renders one `INVALID` line, a plan with no effect `no effective
+ *   change`;
  * - `renderPreviewLogLines`: the same lines, each classed `reload-preview`
  *   (one class label per line, b.av2 SR-10.3);
  * - `renderInvalidLogLine`: the one `reload-invalid` line of an invalid
@@ -184,10 +187,15 @@ export interface ChangePlanPersonaRef {
   index: number
 }
 
-/** The settings whose change destroys a persona's instance (b.av2 SR-8.6), in the order they are reported. */
+/**
+ * The settings whose change retires a persona (b.av2 SR-8.6, b.jg5 SRJ-1511):
+ * its session is stopped and never resumed, its key recorded as retired at
+ * apply step 1 (SRJ-803), and it is brought up fresh. In the order they are
+ * reported.
+ */
 export const DESTRUCTIVE_SETTINGS = ['name', 'credentials_file', 'working_directory'] as const
 
-/** A setting whose change destroys the persona's instance. */
+/** A setting whose change retires the persona and brings it up fresh (SRJ-1511). */
 export type DestructiveSetting = (typeof DESTRUCTIVE_SETTINGS)[number]
 
 /** The settings applied in place, immediately (b.av2 SR-8.6), in the order they are reported. */
@@ -219,7 +227,11 @@ export interface AddedPersonaChange extends ChangePlanPersonaRef {
  */
 export type ConfigDirUnresolvable = string | FactUnknown
 
-/** A persona whose `name`, `credentials_file` or `working_directory` (by real path) changed: torn down, then brought up. */
+/**
+ * A persona whose `name`, `credentials_file` or `working_directory` (by real
+ * path) changed: retired (its key recorded at apply step 1, its session
+ * stopped and never resumed), then brought up fresh (b.jg5 SRJ-803, SRJ-1511).
+ */
 export interface DestructivePersonaChange extends ChangePlanPersonaRef {
   /** The changed settings, in `DESTRUCTIVE_SETTINGS` order. */
   settings: DestructiveSetting[]
@@ -489,7 +501,8 @@ function configDirsDiffer(applied: PersonaConfig, candidate: PersonaConfig, home
  * removal of the old key and an addition of the new one. For a persona
  * present in both:
  * - destructively modified: its `name` (same key), `credentials_file` or
- *   `working_directory` (by real path) changed. It is not also listed as
+ *   `working_directory` (by real path) changed, so the confirmation retires
+ *   it and brings it up fresh (b.jg5 SRJ-1511). It is not also listed as
  *   modified in place, credentials-changed or next-launch: the new half reads
  *   everything fresh;
  * - modified in place: `channels` (the set of IDs), a kept channel's
@@ -691,8 +704,15 @@ export const PENDING_PREVIEW_TITLE = 'A configuration change is pending; nothing
 /** The text of a plan with no effect. */
 export const NO_EFFECTIVE_CHANGE = 'no effective change'
 
-/** Start of every line that removes a persona or destroys its instance. */
+/** Start of every line that retires a persona: a removal or a destructive modify (b.jg5 SRJ-1510). */
 export const DESTRUCTIVE_PREFIX = 'DESTRUCTIVE:'
+
+/** What a removal's line says the confirmation does to the persona (b.jg5 SRJ-1510). */
+export const REMOVED_RETIRED_CLAUSE = 'the persona will be retired: its session stopped and never resumed'
+
+/** What a destructive modify's line says the confirmation does to the persona (b.jg5 SRJ-1510). */
+export const DESTRUCTIVE_RETIRED_CLAUSE =
+  'the persona will be retired and brought up fresh: its session stopped and never resumed'
 
 /** Start of an invalid candidate's preview. */
 export const INVALID_PREFIX = 'INVALID:'
@@ -704,8 +724,13 @@ function personaRef(p: ChangePlanPersonaRef): string {
   return `persona ${renderPersonaRef(p.name, p.key)}`
 }
 
-function removedLine(p: ChangePlanPersonaRef): string {
-  return `${DESTRUCTIVE_PREFIX} ${personaRef(p)} is removed: its live session will be destroyed (its instance is torn down).`
+/**
+ * A removal's preview line (b.jg5 SRJ-1510): `DESTRUCTIVE: persona "<name>"
+ * (key=<key>) is removed: the persona will be retired: its session stopped
+ * and never resumed.` Pure; unescaped (`renderPreviewLines` escapes).
+ */
+export function removedLine(p: ChangePlanPersonaRef): string {
+  return `${DESTRUCTIVE_PREFIX} ${personaRef(p)} is removed: ${REMOVED_RETIRED_CLAUSE}.`
 }
 
 /**
@@ -721,13 +746,22 @@ function configDirWarning(unresolvable: ConfigDirUnresolvable | undefined, when:
   return `; but${at} it cannot come up: ${unresolvable}`
 }
 
-function destructiveLine(p: DestructivePersonaChange): string {
+/**
+ * A destructive modify's preview line (b.jg5 SRJ-1510): `DESTRUCTIVE: persona
+ * "<name>" (key=<key>) <what changed>: the persona will be retired and
+ * brought up fresh: its session stopped and never resumed<warning>.`, where
+ * `<what changed>` is each changed setting in `DESTRUCTIVE_SETTINGS` order
+ * (`name changed`, `<setting> changed to "<path>"`) joined by ` and `, and
+ * `<warning>` the claude_config_dir warning (`configDirWarning`), empty when
+ * nothing stops it. Pure; unescaped (`renderPreviewLines` escapes).
+ */
+export function destructiveLine(p: DestructivePersonaChange): string {
   const what = p.settings.map((setting) =>
     setting === 'name' ? 'name changed' : `${setting} changed to ${JSON.stringify(p[setting])}`,
   )
   return (
-    `${DESTRUCTIVE_PREFIX} ${personaRef(p)} ${what.join(' and ')}: its live session will be destroyed, ` +
-    `then it is brought up fresh${configDirWarning(p.configDirUnresolvable, '')}.`
+    `${DESTRUCTIVE_PREFIX} ${personaRef(p)} ${what.join(' and ')}: ${DESTRUCTIVE_RETIRED_CLAUSE}` +
+    `${configDirWarning(p.configDirUnresolvable, '')}.`
   )
 }
 

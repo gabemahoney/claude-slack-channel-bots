@@ -23,7 +23,11 @@
  * `reload-preview.test.ts`'s. Confirmation and apply (SR-8.5, SR-8.6): the
  * rename that applies (AC 73), invalid (AC 63), stale (AC 69), malformed,
  * unreadable and undeletable confirmations, step 1's record write and its
- * failures, the pending file rewritten after a consumed confirmation (AC 56),
+ * failures (an apply that removes a persona writes the retired-key record
+ * first, b.jg5 SRJ-803, and a failed rewrite puts it back, SRJ-804: here
+ * only as the writes, deletes and lines each case asserts exactly; what step
+ * 1 records and restores is `reload-apply.test.ts`'s), the pending file
+ * rewritten after a consumed confirmation (AC 56),
  * `reload-noop`, and the order of the step 2–6 slots. Confirmed credentials
  * changes end to end (SR-6.4, SR-8.3, SR-8.6): a persona credentials-broken
  * at start comes up once its file is fixed and the change confirmed, and
@@ -90,6 +94,8 @@ import {
 } from '../src/reload-apply.ts'
 import { composePendingFile, PENDING_FILE_HEADER, reloadFingerprint } from '../src/reload-fingerprint.ts'
 import { createReloadTickDriver } from '../src/reload-timer.ts'
+import { DESTRUCTIVE_PREFIX, DESTRUCTIVE_RETIRED_CLAUSE, REMOVED_RETIRED_CLAUSE } from '../src/reload-plan.ts'
+import { RETIRED_KEYS_LOG_PREFIX, retiredKeysPath } from '../src/retired-keys.ts'
 import {
   APP_TOKEN_PREFIX,
   assertNoLeak,
@@ -300,17 +306,18 @@ function personaRef(name: string): string {
   return `persona ${JSON.stringify(name)} (key=${h.key(name)})`
 }
 
-/** The `DESTRUCTIVE:` line of a removed persona. */
+/** The `DESTRUCTIVE:` line of a removed persona: it will be retired (b.jg5 SRJ-1510), from the exported clause. */
 function removedLine(name: string): string {
-  return `DESTRUCTIVE: ${personaRef(name)} is removed: its live session will be destroyed (its instance is torn down).`
+  return `${DESTRUCTIVE_PREFIX} ${personaRef(name)} is removed: ${REMOVED_RETIRED_CLAUSE}.`
 }
 
-/** The `DESTRUCTIVE:` line of a persona whose one destructive `setting` changed to `path`. */
+/**
+ * The `DESTRUCTIVE:` line of a persona whose one destructive `setting`
+ * changed to `path`: it will be retired and brought up fresh (b.jg5
+ * SRJ-1510), from the exported clause.
+ */
 function destructiveLine(name: string, setting: 'credentials_file' | 'working_directory', path: string): string {
-  return (
-    `DESTRUCTIVE: ${personaRef(name)} ${setting} changed to ${JSON.stringify(path)}: ` +
-    'its live session will be destroyed, then it is brought up fresh.'
-  )
+  return `${DESTRUCTIVE_PREFIX} ${personaRef(name)} ${setting} changed to ${JSON.stringify(path)}: ${DESTRUCTIVE_RETIRED_CLAUSE}.`
 }
 
 /** The line of an added persona: brought up and launched, or `causes` saying why it cannot come up. */
@@ -2611,6 +2618,30 @@ function applyNotRemoved(): ReloadRunActivity['removes'][number] {
 }
 
 /**
+ * Apply step 1's write of the retired-key record (b.jg5 SRJ-803), through
+ * the run's writer, in `h.stateDir`: made before the last-applied write by
+ * every confirmed apply that removes or destructively modifies a persona.
+ */
+function retiredKeysWrite(ok = true): ReloadRunActivity['writes'][number] {
+  return { path: retiredKeysPath(h.stateDir), ok }
+}
+
+/** The retired-key record removed durably: a failed rewrite's restore to the empty record held before the apply (b.jg5 SRJ-804). */
+function retiredKeysRemoved(): ReloadRunActivity['removes'][number] {
+  return { path: retiredKeysPath(h.stateDir), ok: true, removed: true, unsynced: false }
+}
+
+/**
+ * The retired-key store's own line for `action` (`recorded`, `restored`):
+ * its wording is the store's, so it is matched by the store's prefix and
+ * the action only.
+ */
+function retiredKeysLogged(action: 'recorded' | 'restored'): string {
+  const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return expect.stringMatching(new RegExp(`^${escape(`${RETIRED_KEYS_LOG_PREFIX} ${action} `)}`))
+}
+
+/**
  * `activity` with its lifecycle records left out: a confirmed change's
  * teardowns and bring-ups are pinned in `tests/reload-apply.test.ts`, so
  * these cases neither assert them nor their absence for a changed persona.
@@ -2766,11 +2797,11 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
     expect(run.appliedConfigs.map((c) => c.personas.map((p) => p.key))).toEqual([keysOf('alpha')])
     expect(run.controller.applied()?.bytes).toEqual(new Uint8Array(configBytes))
     expect(h.configDirEntries()).toEqual(['config.json', 'config.json.last-applied'])
-    // No reload-nothing-pending line: the apply's own line says what happened.
+    // No reload-nothing-pending line: the apply's own line says what happened. Step 1 writes the retired-key record first.
     expect(outsideLifecycle(run.since(cp))).toEqual({
       ...NO_RUN_ACTIVITY,
-      logs: [appliedLogged({ removed: 1 })],
-      writes: [{ path: h.paths.lastApplied, ok: true }],
+      logs: [retiredKeysLogged('recorded'), appliedLogged({ removed: 1 })],
+      writes: [retiredKeysWrite(), { path: h.paths.lastApplied, ok: true }],
       removes: [applyRemoved()],
     })
 
@@ -3115,8 +3146,8 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
 
     expect(outsideLifecycle(run.since(cp))).toEqual({
       ...NO_RUN_ACTIVITY,
-      logs: [undeletableLogged('EIO'), appliedLogged({ removed: 1 })],
-      writes: [{ path: h.paths.lastApplied, ok: true }],
+      logs: [undeletableLogged('EIO'), retiredKeysLogged('recorded'), appliedLogged({ removed: 1 })],
+      writes: [retiredKeysWrite(), { path: h.paths.lastApplied, ok: true }],
       removes: [applyNotRemoved()],
     })
     expect(h.readRecord()).toEqual(configBytes)
@@ -3215,8 +3246,8 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
 
     expect(outsideLifecycle(run.since(cp))).toEqual({
       ...NO_RUN_ACTIVITY,
-      logs: [removedUnsyncedLogged('EIO'), appliedLogged({ removed: 1 })],
-      writes: [{ path: h.paths.lastApplied, ok: true }],
+      logs: [removedUnsyncedLogged('EIO'), retiredKeysLogged('recorded'), appliedLogged({ removed: 1 })],
+      writes: [retiredKeysWrite(), { path: h.paths.lastApplied, ok: true }],
       removes: [{ path: h.paths.apply, ok: true, removed: true, unsynced: true }],
     })
     expect(h.readRecord()).toEqual(configBytes)
@@ -3249,16 +3280,19 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
     expectNoPostNoLeak(run)
   })
 
+  // Step 1 writes the retired-key record first (b.jg5 SRJ-803): that durable write opens and fsyncs its
+  // temporary file and its directory, so the last-applied write's own open is the third openSync and its
+  // directory fsync the fourth fsyncSync, counted from failWrites.
   test.each([
     {
       label: 'before the rename (openSync)',
-      failure: { step: 'openSync', call: 1 },
+      failure: { step: 'openSync', call: 3 },
       line: () => failureLine(`[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot write `, h.paths.lastApplied, 'EIO'),
       recordWrites: [false],
     },
     {
       label: 'at the directory fsync after the rename, the previous record written back',
-      failure: { step: 'fsyncSync', call: 2 },
+      failure: { step: 'fsyncSync', call: 4 },
       // The restore is shown by the second record write and the record's bytes below.
       line: () => failureLine(`[slack] ${RELOAD_RECORD_WRITE_FAILED}: wrote `, h.paths.lastApplied, 'EIO'),
       recordWrites: [false, true],
@@ -3276,11 +3310,16 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
 
     await run.ticks.tick()
 
+    // The retired-key record step 1 wrote is put back to the empty record held before the apply: removed (b.jg5 SRJ-804).
     expect(run.since(cp)).toEqual({
       ...NO_RUN_ACTIVITY,
-      logs: [line()],
-      writes: [...recordWrites.map((ok) => ({ path: h.paths.lastApplied, ok })), { path: h.paths.pending, ok: true }],
-      removes: [applyRemoved()],
+      logs: [retiredKeysLogged('recorded'), retiredKeysLogged('restored'), line()],
+      writes: [
+        retiredKeysWrite(),
+        ...recordWrites.map((ok) => ({ path: h.paths.lastApplied, ok })),
+        { path: h.paths.pending, ok: true },
+      ],
+      removes: [applyRemoved(), retiredKeysRemoved()],
     })
     expect(h.readRecord()).toEqual(started.recordBytes)
     expect(run.controller.applied()).toBe(applied)
@@ -3475,6 +3514,7 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
     expect(outsideLifecycle(run.since(cp))).toEqual({
       ...NO_RUN_ACTIVITY,
       logs: [
+        retiredKeysLogged('recorded'),
         expect.stringMatching(
           new RegExp(
             "^\\[slack\\] reload: updating the server's applied configuration failed: Error " +
@@ -3483,7 +3523,7 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
         ),
         appliedLogged({ removed: 1 }),
       ],
-      writes: [{ path: h.paths.lastApplied, ok: true }],
+      writes: [retiredKeysWrite(), { path: h.paths.lastApplied, ok: true }],
       removes: [applyRemoved()],
     })
     // Every step this removal runs (no config directory changed, so no template refresh), after step 1.

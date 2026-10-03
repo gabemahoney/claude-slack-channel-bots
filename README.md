@@ -536,7 +536,7 @@ These files sit in the same directory as `config.json` (`~/.claude/channels/slac
 | `config.json.last-applied` | The record: a byte copy of the last configuration the server applied. The server writes it. |
 | `config.json.pending` | A preview of what applying the edit would do, written by the server. It exists only while a change is pending. |
 | `config.json.apply` | Your confirmation: the pending file, renamed. The server deletes it at its next check (see [Confirming a change](#confirming-a-change)). |
-| `retired-keys.json` | The retired-key record: the persona keys the server holds as retired. Only the server writes it, never the CLI. It is kept across restarts and is absent until a key is first recorded. If it can't be read, the server doesn't start; moving it aside is the fix (see `retired-keys-unreadable` under [Startup errors](#startup-errors)). |
+| `retired-keys.json` | The retired-key record: the persona keys the server holds as retired. A confirmed change records the key of each removed persona (a renamed persona's old key included) and of each persona whose `name`, `credentials_file` or `working_directory` changed, before `config.json.last-applied` is rewritten. Only the server writes it, never the CLI. It is kept across restarts and is absent until a key is first recorded. If it can't be read, the server doesn't start; moving it aside is the fix (see `retired-keys-unreadable` under [Startup errors](#startup-errors)). |
 
 ### Start rules
 
@@ -584,7 +584,7 @@ claude-slack-channel-bots: pending configuration change (written by the server)
 fingerprint: sha256:<64 hex digits>
 
 A configuration change is pending; nothing has been applied. personas: 1 added, 1 removed, 0 destructively modified, 1 modified in place, 1 with changed credentials; server-wide settings: 2 changed.
-DESTRUCTIVE: persona "scribe" (key=scribe) is removed: its live session will be destroyed (its instance is torn down).
+DESTRUCTIVE: persona "scribe" (key=scribe) is removed: the persona will be retired: its session stopped and never resumed.
 persona "helper" (key=helper) is added but cannot come up: working directory does not exist.
 persona "planner" (key=planner): channels changed: applied in place immediately, instance kept.
 persona "reviewer" (key=reviewer): credentials file "/home/operator/.config/cscb/reviewer-credentials.json" changed: a new connection opens, then the old one closes, instance kept.
@@ -598,7 +598,7 @@ Paths in the preview are absolute: a `~` in `config.json` is shown expanded. In 
 
 | Line | Meaning |
 |---|---|
-| `DESTRUCTIVE: …` | Applying it destroys that persona's live session: its instance and its conversation. A removed persona is torn down. A persona whose `name`, `credentials_file` or `working_directory` changed is torn down and brought up fresh. |
+| `DESTRUCTIVE: …` | Applying it retires that persona: its session is stopped and never resumed. A removed persona is retired. A persona whose `name`, `credentials_file` or `working_directory` changed is retired and brought up fresh. |
 | `… is added but cannot come up: …` | The new persona would fail to come up, for the reasons given: its credentials file, its working directory, and its `claude_config_dir` (`claude_config_dir cannot be resolved to a real path (<errno>)`, for example a symlink on its path that points to nothing). Every reason found is listed. A `claude_config_dir` that doesn't exist yet but whose parent does is fine. |
 | `credentials file "<path>" changed: …` | The persona's credentials file changed at the same path. The line names the persona and the path, never a token, and says what applying it does: a persona that is up opens a new connection, then closes the old one; a persona still retrying retries with the new content; a persona down because of its credentials `will be brought up`. |
 | `credentials file "<path>" changed, but it cannot be used (<cause>): …` | The new content is missing, unreadable or invalid, for example `credentials file does not exist`. A persona that is up keeps its current connection, and a persona still retrying keeps retrying with its current content; confirming logs `persona-credentials-change-failed` in `server.log`, and the change stays pending. A persona down because of its credentials stays down, and confirming logs its usual credentials line and leaves nothing pending. Every start reads the file as it stands, so after a restart the persona is down until the file is fixed and the change confirmed. |
@@ -636,7 +636,7 @@ grep -E 'reload-(applied|noop|invalid|stale-confirmation|record-write-failed)' "
 | `[slack] reload-noop: the confirmed configuration has no effective change, …` | Nothing that runs changed. The record was rewritten, and nothing is left pending. |
 | `[slack] reload-invalid: the confirmed configuration is invalid, so nothing is applied: <error>` | `config.json` was invalid or missing when you confirmed. The line carries the full error. Fix the file, then confirm the new preview. |
 | `[slack] reload-stale-confirmation: the confirmation "<path>" …; nothing is applied` | See [Stale confirmations](#stale-confirmations). |
-| `[slack] reload-record-write-failed: … the confirmed change is not applied and stays pending` | `config.json.last-applied` couldn't be written, so nothing is applied. Fix the state directory (permissions, free space), then confirm again. |
+| `[slack] reload-record-write-failed: … the confirmed change is not applied and stays pending…` | `config.json.last-applied` or the retired-key record (`retired-keys.json`) couldn't be written, so nothing is applied; the line also says whether the keys the confirmation recorded as retired were removed again. Fix the state directory (permissions, free space), then confirm again. |
 
 ### What a confirmation applies
 
@@ -648,9 +648,9 @@ Each row is one kind of change: what happens once you confirm it, and what happe
 | A credentials file's content changes (same path), such as a rotated token | Only that persona reconnects: the new connection opens, then the old one closes. If the new file can't be used or Slack refuses it, the old connection keeps running, `server.log` shows `persona-credentials-change-failed`, and the change stays pending. If Slack can't be reached, the old connection stays in use while the new one retries. A persona that is retrying (Slack unreachable, its working directory unusable, or held for its `claude_config_dir` by `persona-config-dir-unresolvable`) has no connection and retries with the new content. A persona down because of its credentials comes up on the confirmed change, with no restart; if its new file can't be used, it stays down with its usual line, such as `persona-credentials-invalid`, and nothing stays pending. | Kept |
 | `claude_config_dir` changes (the persona's own or inherited) | Recorded. The persona's next launch uses it and starts a new conversation on the same instance when the directory changed: the conversation is not resumed, nothing is deleted, and the old transcript stays in the old directory. | Kept until the next launch |
 | `stop_hook_bootstrap` changes (the persona's own or inherited) | Recorded. The persona's next launch uses it. | Kept |
-| A persona is removed | Torn down. Its agent-director row is destroyed too. Its posted permission prompts stay in Slack, and clicking one has no effect. Previewed `DESTRUCTIVE:`. | Destroyed |
-| A persona's `credentials_file` path or `working_directory` changes | Torn down, then brought up fresh from its new entry, with no restart. Its agent-director row is destroyed too, and the new credentials file is read. Previewed `DESTRUCTIVE:`. See [Destructive changes](#destructive-changes). | Destroyed |
-| A persona's `name` changes | A removal plus an addition: the name sets the key. The old persona is torn down and the new one brought up fresh. The removal half is previewed `DESTRUCTIVE:` (`DESTRUCTIVE: persona "<old name>" … is removed`), followed by an `… is added` line for the new name. | Destroyed |
+| A persona is removed | Torn down. Its agent-director row is destroyed too. Its posted permission prompts stay in Slack, and clicking one has no effect. Previewed `DESTRUCTIVE:`. | Retired: never resumed |
+| A persona's `credentials_file` path or `working_directory` changes | Torn down, then brought up fresh from its new entry, with no restart. Its agent-director row is destroyed too, and the new credentials file is read. Previewed `DESTRUCTIVE:`. See [Destructive changes](#destructive-changes). | Retired: never resumed |
+| A persona's `name` changes | A removal plus an addition: the name sets the key. The old persona is torn down and the new one brought up fresh. The removal half is previewed `DESTRUCTIVE:` (`DESTRUCTIVE: persona "<old name>" … is removed`), followed by an `… is added` line for the new name. | Retired: never resumed |
 | A server-wide setting changes, such as `port` | Recorded. The running server keeps its current value, and the next server start uses the recorded one. `stop_timeout` and `exit_timeout` are an exception: only the CLI uses them, and it takes them from the record at once, so the next `stop` or `clean_restart` uses them. `agent_director_call_timeout_ms` is the other: the CLI takes it from the record at once, and the running server uses it from its next start. | Not affected |
 | A persona is added | Brought up exactly as at start, including the storage check (`jsonl-non-persistent`, see [Startup errors](#startup-errors)). If its credentials file or working directory is bad, it logs the same lines as at start and never affects running personas. See "A persona doesn't come up or doesn't answer" in [Troubleshooting](#troubleshooting). | New session |
 
@@ -667,7 +667,7 @@ To make them take effect sooner, wait for the `reload-applied` line, then run `c
 
 ### Destructive changes
 
-`DESTRUCTIVE:` lines in the preview name the sessions the change destroys when you confirm it (see the table above). Read the preview before you rename it. There is no undo. Re-adding a removed persona brings up a fresh session, and the old conversation isn't guaranteed to resume.
+`DESTRUCTIVE:` lines in the preview name the personas the change retires when you confirm it (see the table above). A retired persona's session is stopped and never resumed. Read the preview before you rename it. There is no undo. Re-adding a removed persona brings up a fresh session.
 
 If the teardown can't delete the persona's agent-director row (for example, agent-director is unreachable), `server.log` shows `[slack] persona teardown of "<name>" (key=<key>): agent-director delete of cscb_<key> failed: …`, and the bring-up finds that row. A row whose working directory or config directory no longer matches is replaced. When neither changed (for example, only the `credentials_file` path changed), the row still matches, so the bring-up may resume it with its conversation instead of starting fresh.
 

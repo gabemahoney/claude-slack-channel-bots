@@ -98,7 +98,10 @@
  *   (default `openSync`, `EIO`) until `h.clearWriteFailure()`: every call of
  *   the step, or only its `call`-th call (1-based, counted from
  *   `failWrites`), e.g. `{ step: 'fsyncSync', call: 2 }` for the directory
- *   fsync after the rename. `h.failRemoves(...)` / `h.clearRemoveFailure()`
+ *   fsync after the rename. The retired-key store's writes go through the
+ *   same writer, so a confirmed apply with a retired key to record makes the
+ *   retired-key write first and the last-applied write second (count `call`
+ *   accordingly). `h.failRemoves(...)` / `h.clearRemoveFailure()`
  *   do the same for the controller's durable delete (`durableUnlinkSync`
  *   over its own seam, default `unlinkSync`; `{ step: 'fsyncSync' }` fails
  *   the directory fsync after the unlink). The two seams count calls apart.
@@ -261,7 +264,8 @@
  *   `opts.tickDriver` swaps in another driver (the production one on
  *   `run.clock`) for the single 5 s cadence case; `run.ticks` is then unused;
  * - `run.controller`: the real `createReloadController` over `h.paths`, the
- *   recorder's ops, the seam writer and remover, `run.ticks`, the dry-run
+ *   recorder's ops, the seam writer and remover, the run's retired-key store
+ *   (below), `run.ticks`, the dry-run
  *   flag, `heldCredentialsDigest` bound to `run.bringUps.credentialsDigest`
  *   (as `server.ts` binds it; `opts.heldCredentialsDigest` wraps that lookup,
  *   e.g. to make it throw so a detection pass fails), `bringUpState` bound
@@ -287,6 +291,30 @@
  *   controller's applied persona keys now (`controller.applied()`).
  *   `opts.beforeWrite(path)` runs before every writer call, e.g. to see
  *   whether `paths.apply` still exists when the record is written;
+ * - the retired-key store (b.jg5 SRJ-802, SRJ-803, SRJ-804): every run
+ *   loads one store over `h.stateDir` (`loadRetiredKeyStore`, as `main()`
+ *   loads its one store before the start resolution) and hands it to the
+ *   controller as `retiredKeys`, so a confirmed apply's step 1 records
+ *   through it and restores it after a failed rewrite. The store writes and
+ *   deletes through the run's own writer and delete, so its writes are in
+ *   `run.writes` and its deletes in `run.removes`, `h.failWrites` /
+ *   `h.failRemoves` count its calls with the controller's, `run.captured()`
+ *   holds the record while it exists and `h.serverSideFiles` sweeps it; its
+ *   lines go to `run.logs` and its times come from `run.clock`. `run
+ *   .retiredKeys` is the store (to seed a key held only in memory, record a
+ *   batch through it with the writer failing). The record's path is
+ *   `retiredKeysPath(h.stateDir)`; seed and read it with
+ *   `tests/test-helpers/retired-keys.ts`. A later run over the same
+ *   directories (a restart) loads a new store from the disk; a record it
+ *   cannot load makes `h.build` throw;
+ * - a stop between writes: `opts.stopBeforeWrite` names a path; just before
+ *   the run's writer is first called for it, the harness keeps an image of
+ *   every regular file under the configuration and state directories, and
+ *   `run.stop()` puts that image back, so the next run (a restart) sees the
+ *   disk as it stood when that write was about to start. The run itself goes
+ *   on and the controller sees no failure, so no failure path (no restore)
+ *   runs for it; `run.stoppedBeforeWrite` says the point was reached, and
+ *   `h.build` throws until such a run is stopped;
  * - captures: `run.logs` is the one `[slack]` stream (reload controller,
  *   bring-up controller and connection manager lines, in order), and
  *   `run.logsOf(label)` its lines starting `[slack] <label>: ` (a class such
@@ -305,7 +333,8 @@
  *   `previewEmissions(lines)` and `previewEmissionText(emission, path)` do
  *   the same over any slice, e.g. `run.since(cp).logs`. A `reload-invalid`
  *   line is not an emission;
- * - `run.writes` every call of the controller's writer (path, success);
+ * - `run.writes` every call of the controller's writer (path, success), the
+ *   retired-key store's included;
  *   `run.removes` every call of its durable delete as what happened to the
  *   file (`ok`: it is gone; `removed`: this call removed it; `unsynced`: it
  *   was removed but the directory sync failed, so the delete threw although
@@ -618,6 +647,7 @@ import {
   type ReloadTick,
   type ReloadTickDriver,
 } from '../../src/reload.ts'
+import { loadRetiredKeyStore, type RetiredKeyStore } from '../../src/retired-keys.ts'
 import {
   cannedGetResult,
   cannedStatusResult,
@@ -1211,6 +1241,9 @@ export interface ReloadRemoveRecord {
   readonly unsynced: boolean
 }
 
+/** The regular files under the configuration and state directories at one moment, by path (`opts.stopBeforeWrite`). */
+type DiskImage = Map<string, Buffer>
+
 /** Positions in a run's captures, taken by `run.checkpoint()`; compare with `run.since(cp)`. */
 export interface ReloadRunCheckpoint {
   readonly logs: number
@@ -1423,10 +1456,24 @@ export interface ReloadRunOptions {
   agentDirector?: StubClientOptions
   /**
    * Called with the path before every call of the controller's writer (the
-   * record, the pending file), e.g. to observe what exists when the record
-   * is written.
+   * record, the pending file, the retired-key record), e.g. to observe what
+   * exists when the record is written.
    */
   beforeWrite?: (path: string) => void
+  /**
+   * A server stop (a crash) just before the run's writer is first called for
+   * this path (e.g. `h.paths.lastApplied`, to stop between apply step 1's
+   * retired-key write and its last-applied write). At that moment the
+   * harness keeps an image of every regular file under the configuration
+   * and state directories; `run.stop()` puts that image back, so the next
+   * run over the same directories (a restart) starts from the disk as it
+   * stood when that write was about to start. The write itself, and the rest
+   * of this run, go on as usual and the controller sees no failure, so no
+   * failure path (no restore of the retired-key record) runs for it.
+   * `run.stoppedBeforeWrite` says whether the stop point was reached. A run
+   * that reached it must be stopped before the next run is built.
+   */
+  stopBeforeWrite?: string
 }
 
 /** A run's latch, read-only: the latched query and the record. */
@@ -1455,6 +1502,18 @@ export interface ReloadRun {
   readonly writes: readonly ReloadWriteRecord[]
   /** Every call of the controller's durable delete, in order. */
   readonly removes: readonly ReloadRemoveRecord[]
+  /**
+   * The run's retired-key store (`loadRetiredKeyStore` over `h.stateDir`,
+   * b.jg5 SRJ-802), built at the run's start as `main()` builds its one
+   * store, and handed to the controller (`retiredKeys`): its writes and
+   * deletes go through the run's writer and delete, so they are in
+   * `run.writes` / `run.removes` and `h.failWrites` / `h.failRemoves` count
+   * them with the record's; its lines go to `run.logs`; its times come from
+   * `run.clock`. A later run (a restart) loads a new store from the disk.
+   */
+  readonly retiredKeys: RetiredKeyStore
+  /** Whether the run reached its `opts.stopBeforeWrite` stop point (the disk image was kept). */
+  readonly stoppedBeforeWrite: boolean
   /** The latest `run.resolveStart()` outcome (also set by `h.start`). */
   readonly outcome: ReloadStartOutcome | undefined
   /** The real lifecycle composition, with `opts.realLifecycle`; undefined otherwise. */
@@ -1684,7 +1743,12 @@ export interface ReloadRun {
    * to the persona's destination).
    */
   readonly episodeNotices: ReadonlyArray<{ readonly key: string; readonly text: string }>
-  /** Stop detection (`controller.stopDetection()`, which stops `run.ticks`), cancel every bring-up retry and stop every connection. Idempotent. */
+  /**
+   * Stop detection (`controller.stopDetection()`, which stops `run.ticks`),
+   * cancel every bring-up retry and stop every connection; when the run
+   * reached its `opts.stopBeforeWrite` stop point, put the disk image back
+   * first. Idempotent.
+   */
   stop(): Promise<void>
 }
 
@@ -2070,7 +2134,38 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
   const writeSeam = makeFailureSeam('openSync')
   const removeSeam = makeFailureSeam('unlinkSync')
 
+  /** Runs that reached their `opts.stopBeforeWrite` stop point and were not stopped yet. */
+  const runsStoppedBeforeWrite = new Set<ReloadRun>()
+
+  /** Every regular file under the configuration and state directories, with its bytes. */
+  function diskImage(): DiskImage {
+    const image: DiskImage = new Map()
+    const walk = (at: string): void => {
+      for (const entry of readdirSync(at, { withFileTypes: true })) {
+        const path = join(at, entry.name)
+        if (entry.isDirectory()) walk(path)
+        else if (entry.isFile()) image.set(path, readFileSync(path))
+      }
+    }
+    walk(dir)
+    walk(stateDir)
+    return image
+  }
+
+  /** Make the configuration and state directories hold exactly `image`'s regular files again. */
+  function putDiskImageBack(image: DiskImage): void {
+    const now = diskImage()
+    for (const path of now.keys()) if (!image.has(path)) rmSync(path, { force: true })
+    for (const [path, bytes] of image) {
+      mkdirSync(dirname(path), { recursive: true })
+      writeFileSync(path, bytes)
+    }
+  }
+
   function build(runOpts: ReloadRunOptions = {}): ReloadRun {
+    if (runsStoppedBeforeWrite.size > 0) {
+      throw new Error('reload-harness: a run reached its stopBeforeWrite stop point; await run.stop() before building the next run')
+    }
     const dryRun = runOpts.dryRun ?? false
     const realLaunch = runOpts.realLaunch === true
     const realLifecycle = runOpts.realLifecycle === true || realLaunch
@@ -2093,6 +2188,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     const startPasses: PersonaConfig[] = []
     const writes: ReloadWriteRecord[] = []
     const removes: ReloadRemoveRecord[] = []
+    /** The disk as it stood at `opts.stopBeforeWrite`'s stop point; put back by `run.stop()`. */
+    let stopImage: DiskImage | undefined
+    let stopImagePutBack = false
     const appliedConfigs: PersonaConfig[] = []
     let startHold: Promise<void> | undefined
     let outcome: ReloadStartOutcome | undefined
@@ -2733,32 +2831,47 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         return DEFAULT_WORKING_DIRECTORY_FS.stat(path)
       },
     }
+    // The run's writer and delete: the controller's, and the retired-key
+    // store's, so both reach the disk through the same seams and records.
+    const write = (path: string, bytes: Uint8Array): void => {
+      if (stopImage === undefined && runOpts.stopBeforeWrite === path) {
+        stopImage = diskImage()
+        runsStoppedBeforeWrite.add(run)
+      }
+      runOpts.beforeWrite?.(path)
+      try {
+        durableWriteFileSync(path, bytes, writeSeam.fs)
+      } catch (err) {
+        writes.push({ path, ok: false })
+        throw err
+      }
+      writes.push({ path, ok: true })
+    }
+    const remove = (path: string): boolean => {
+      let removed: boolean
+      try {
+        removed = durableUnlinkSync(path, removeSeam.fs)
+      } catch (err) {
+        const unsynced = err instanceof DurableUnlinkUnsyncedError
+        removes.push(unsynced ? { path, ok: true, removed: true, unsynced } : { path, ok: false, removed: undefined, unsynced })
+        throw err
+      }
+      removes.push({ path, ok: true, removed, unsynced: false })
+      return removed
+    }
+    // As main() loads its one store before the start resolution (b.jg5 SRJ-802).
+    const loadedRetiredKeys = loadRetiredKeyStore(stateDir, { write, remove, log, now: () => connections.clock.now() })
+    if (loadedRetiredKeys.kind !== 'loaded') {
+      throw new Error(`reload-harness: the run cannot load the retired-key record: ${loadedRetiredKeys.message}`)
+    }
+    const retiredKeys = loadedRetiredKeys.store
     controller = createReloadController({
       paths,
+      retiredKeys,
       lifecycle: ops,
       log,
-      write: (path, bytes) => {
-        runOpts.beforeWrite?.(path)
-        try {
-          durableWriteFileSync(path, bytes, writeSeam.fs)
-        } catch (err) {
-          writes.push({ path, ok: false })
-          throw err
-        }
-        writes.push({ path, ok: true })
-      },
-      remove: (path) => {
-        let removed: boolean
-        try {
-          removed = durableUnlinkSync(path, removeSeam.fs)
-        } catch (err) {
-          const unsynced = err instanceof DurableUnlinkUnsyncedError
-          removes.push(unsynced ? { path, ok: true, removed: true, unsynced } : { path, ok: false, removed: undefined, unsynced })
-          throw err
-        }
-        removes.push({ path, ok: true, removed, unsynced: false })
-        return removed
-      },
+      write,
+      remove,
       tickDriver: runOpts.tickDriver?.({ clock: connections.clock, log }) ?? ticks,
       dryRun,
       heldCredentialsDigest: (key) => {
@@ -2896,6 +3009,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       logs,
       writes,
       removes,
+      retiredKeys,
+      get stoppedBeforeWrite() {
+        return stopImage !== undefined
+      },
       get outcome() {
         return outcome
       },
@@ -3078,6 +3195,12 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       async stop() {
         if (stopped) return
         stopped = true
+        // The server stopped at `opts.stopBeforeWrite`: nothing it wrote after that point survives.
+        if (stopImage !== undefined && !stopImagePutBack) {
+          stopImagePutBack = true
+          putDiskImageBack(stopImage)
+          runsStoppedBeforeWrite.delete(run)
+        }
         controller.stopDetection()
         bringUps.cancelAll()
         noticeStack.hold.cancelAll()

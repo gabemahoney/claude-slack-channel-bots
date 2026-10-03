@@ -5,8 +5,15 @@
  * A confirmed, valid candidate is applied in six steps; each step completes
  * for every persona before the next starts (b.av2 SR-8.6):
  *
- *   1. rewrite the last-applied record and swap the applied set (the reload
- *      controller in `reload.ts` does this itself);
+ *   1. record the retired keys of removed personas (a renamed persona's old
+ *      key included) and of the old halves of destructive modifies, and the
+ *      key of each persona brought up that is held as retired only in
+ *      memory, durably, a failure of that write failing the apply with
+ *      nothing applied (b.jg5 SRJ-803, SRJ-804); then rewrite the
+ *      last-applied record, a failed rewrite applying nothing and removing
+ *      again the keys this apply recorded (SRJ-804); then swap the applied
+ *      set (b.jg5 SRJ-1511; the reload controller in `reload.ts` does this
+ *      itself);
  *   2. teardowns of removed personas (and the old half of a destructive
  *      modify);
  *   3. in-place updates;

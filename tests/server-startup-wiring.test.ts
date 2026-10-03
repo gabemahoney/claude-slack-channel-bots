@@ -90,7 +90,9 @@
  *   the PID file, the connection manager and `Bun.serve`; a refused read
  *   exits 1 in the next statement, and the loaded store is bound once, the
  *   one store; server.ts names the file only through the module and builds no
- *   other store, and no other src file reads the record at start.
+ *   other store, and no other src file reads the record at start. The reload
+ *   controller gets that store by its binding (`retiredKeys`), so a confirmed
+ *   apply's step 1 records through the one store (b.jg5 SRJ-803).
  * - b.jg5 SRJ-301 / SRJ-305: one UNAVAILABLE retry controller is built in
  *   main()'s own statement list on the production clock, held in the one
  *   module-scope handle, and installed as the trigger sink of the one
@@ -342,6 +344,7 @@ import type {
   InvalidFlagsHoldVersionChangeDeps,
 } from '../src/invalid-flags-hold.ts'
 import type { PendingLivenessReading } from '../src/liveness-reading.ts'
+import type { ReloadControllerDeps } from '../src/reload.ts'
 import { RETIRED_KEYS_FILE_NAME } from '../src/retired-keys.ts'
 import type * as RetiredKeysModule from '../src/retired-keys.ts'
 import type * as ConflictLatchModule from '../src/conflict-latch.ts'
@@ -840,6 +843,21 @@ describe('main() resolves the start through the reload controller and exits on a
     for (const { value } of assigns) {
       expect(value).not.toMatch(/\bCONFIG_PATH\b|\breadFileSync\b|\b(?:load|parse|read)\w*Config\w*\s*\(/)
     }
+  })
+
+  test('hands the controller the one retired-key store main() loaded, by the binding the start read\'s store was bound to, so apply step 1 records through it (b.jg5 SRJ-802, SRJ-803)', () => {
+    /** The controller's store dependency and the start read; typed, so a rename fails the typecheck. */
+    const STORE_DEP: keyof ReloadControllerDeps = 'retiredKeys'
+    const START_READ: keyof typeof RetiredKeysModule = 'readRetiredKeysAtStart'
+    // `const <store> = <outcome>.store`, where `<outcome>` binds the one start read.
+    const outcome = constOf(START_READ)
+    const stores = [
+      ...SERVER_CODE.matchAll(new RegExp(`\\bconst\\s+(\\w+)(?:\\s*:\\s*\\w+)?\\s*=\\s*${outcome}\\s*\\.\\s*store\\b`, 'g')),
+    ].map((m) => m[1]!)
+    expect(stores).toHaveLength(1)
+    declaredOnce(stores[0]!)
+    // Exactly that binding: a store of the controller's own (an inline build, another name) or none fails.
+    expect(onlyCallProps('createReloadController').get(STORE_DEP)).toBe(stores[0])
   })
 
   test('the start resolution comes AFTER the PID check, so a duplicate start never writes the record', () => {

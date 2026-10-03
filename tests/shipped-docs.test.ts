@@ -307,7 +307,8 @@ describe('README.md', () => {
    * confirmation applies" in the Reload section. Each expected row is found by
    * the setting names in its Change cell (or a keyword where it names none),
    * and pinned by its Live session cell and whether its Once confirmed cell
-   * carries `DESTRUCTIVE:`. Wording is not pinned.
+   * carries `DESTRUCTIVE:`. Wording is not pinned. SR-8.6 as amended by b.jg5
+   * SRJ-1511: removal and destructive rows read "Retired: never resumed".
    */
   describe('What a confirmation applies (SR-8.6 rows)', () => {
     const reload = markdownSection(readme, '## Reload')
@@ -327,6 +328,12 @@ describe('README.md', () => {
       claude_config_dir: 'Kept until the next launch',
       stop_hook_bootstrap: 'Kept',
     }
+
+    /**
+     * A removal or a destructive modify retires the persona: its session is
+     * stopped and never resumed (b.jg5 SRJ-1511).
+     */
+    const RETIRED_SESSION = 'Retired: never resumed'
 
     /**
      * One entry per change kind the plan classifies (`ValidChangePlan`'s lists),
@@ -359,14 +366,14 @@ describe('README.md', () => {
         {
           label: 'a persona is removed',
           find: (row) => /\bremoved\b/i.test(row.change) && codeSpans(row.change).length === 0,
-          session: 'Destroyed',
+          session: RETIRED_SESSION,
           destructive: true,
         },
       ],
       destructive: DESTRUCTIVE_SETTINGS.map((setting) => ({
         label: setting,
         find: naming(setting),
-        session: 'Destroyed',
+        session: RETIRED_SESSION,
         destructive: true,
       })),
       settings: [

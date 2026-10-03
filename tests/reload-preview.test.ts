@@ -17,9 +17,16 @@
  * inheritance as the loader applies them), and every I/O fact (real paths,
  * credentials digests, bring-up states, why an added persona cannot come up)
  * is injected as data. One row per SR-8.6 change kind pins its class, its
- * effect wording, the `DESTRUCTIVE:` prefix exactly when the instance is
- * destroyed, and its header count. What the detection tick gathers and when
+ * effect wording, the `DESTRUCTIVE:` prefix exactly when the persona is
+ * retired, and its header count. What the detection tick gathers and when
  * it writes and logs the preview is covered in tests/reload.test.ts.
+ *
+ * The retired lines (b.jg5 SRJ-1510): one case pins a removal's line and a
+ * destructive modify's line literally, character for character, and checks
+ * `removedLine` and `destructiveLine` against them; every other case builds
+ * its expected removal or destructive line through those two builders, from
+ * a plan entry the case states itself. No line of any kind says "destroyed"
+ * (AC 76).
  *
  * Every rendered output (preview lines, the joined text and both log forms)
  * goes through `render`, which runs `assertNoLeak` over it; fixtures carry
@@ -56,6 +63,8 @@ import type { PersonaBringUpStep } from '../src/persona-start.ts'
 import {
   buildChangePlan,
   changePlanCounts,
+  DESTRUCTIVE_RETIRED_CLAUSE,
+  destructiveLine,
   FACT_UNKNOWN,
   isCredentialsBroken,
   renderChangePlanCounts,
@@ -64,11 +73,13 @@ import {
   renderPreviewLines,
   renderPreviewLogLines,
   PENDING_PREVIEW_TITLE,
+  removedLine,
   type AddedPersonaCause,
   type ChangePlan,
   type ChangePlanCandidate,
   type ChangePlanCounts,
   type ChangePlanFacts,
+  type DestructivePersonaChange,
   type InPlaceSetting,
   type InvalidChangePlan,
   type NextLaunchSetting,
@@ -261,6 +272,27 @@ function preview(candidate: PersonaConfig, f: ChangePlanFacts = facts()): { plan
 
 const destructiveLines = (lines: string[]): string[] => lines.filter((l) => l.startsWith('DESTRUCTIVE:'))
 
+/** bravo's working directory in the base config. */
+const bravoWork = (): string => join(root, 'personas', 'bravo', 'work')
+
+/**
+ * bravo's destructive-modify plan entry: `settings` changed, its paths the
+ * base ones unless `overrides` moves them. The expected line of a case is
+ * `destructiveLine` of this entry (b.jg5 SRJ-1510).
+ */
+function bravoDestructive(
+  settings: DestructivePersonaChange['settings'],
+  overrides: Partial<DestructivePersonaChange> = {},
+): DestructivePersonaChange {
+  return {
+    ...ref('bravo', 1),
+    settings,
+    credentials_file: credentialsOf('bravo'),
+    working_directory: bravoWork(),
+    ...overrides,
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Added
 // ---------------------------------------------------------------------------
@@ -347,17 +379,32 @@ describe('added personas', () => {
 // ---------------------------------------------------------------------------
 
 describe('removed and renamed personas', () => {
-  test('a removal is one DESTRUCTIVE: line saying the live session will be destroyed', () => {
+  test("SRJ-1510's exact lines: a removal says the persona will be retired, a destructive modify that it will be retired and brought up fresh", () => {
+    // Fixed paths, compared through the identity real path: nothing is read from disk.
+    const ops = { key: 'ops', credentials_file: '/srv/ops/credentials.json', working_directory: '/srv/ops/work' }
+    const before = makeMultiPersonaConfig([{ name: 'Ops', ...ops }, { name: 'bravo' }], root)
+    const after = makeMultiPersonaConfig([{ name: 'Ops Bot', ...ops, working_directory: '/srv/ops/work-2' }], root)
+    const plan = buildChangePlan(before, valid(after), facts())
+    if (!plan.valid) throw new Error('expected a valid plan')
+
+    const removal =
+      'DESTRUCTIVE: persona "bravo" (key=bravo) is removed: the persona will be retired: its session stopped and never resumed.'
+    const modify =
+      'DESTRUCTIVE: persona "Ops Bot" (key=ops) name changed and working_directory changed to "/srv/ops/work-2": ' +
+      'the persona will be retired and brought up fresh: its session stopped and never resumed.'
+    expect(render(plan)).toEqual([header({ removed: 1, destructive: 1 }), removal, modify])
+    expect(removedLine(plan.removed[0]!)).toBe(removal)
+    expect(destructiveLine(plan.destructive[0]!)).toBe(modify)
+  })
+
+  test('a removal is one DESTRUCTIVE: line saying the persona will be retired', () => {
     const { plan, lines } = preview(edited((c) => c.personas.splice(1, 1)))
 
     // bravo was the only user of its own config dir.
     expect(plan).toEqual(
       planWith({ removed: [ref('bravo', 1)], unchanged: [ref('alpha', 0), ref('charlie', 1)], configDirsChanged: true }),
     )
-    expect(lines).toEqual([
-      header({ removed: 1 }),
-      'DESTRUCTIVE: persona "bravo" (key=bravo) is removed: its live session will be destroyed (its instance is torn down).',
-    ])
+    expect(lines).toEqual([header({ removed: 1 }), removedLine(ref('bravo', 1))])
   })
 
   test('a name change that changes the key is a removal of the old key and an addition of the new', () => {
@@ -367,9 +414,7 @@ describe('removed and renamed personas', () => {
     expect(plan.added).toEqual([{ ...ref('bravo_two', 1), cannotComeUp: [] }])
     expect(plan.destructive).toEqual([])
     expect(changePlanCounts(plan)).toEqual(counts({ added: 1, removed: 1 }))
-    expect(destructiveLines(lines)).toEqual([
-      'DESTRUCTIVE: persona "bravo" (key=bravo) is removed: its live session will be destroyed (its instance is torn down).',
-    ])
+    expect(destructiveLines(lines)).toEqual([removedLine(ref('bravo', 1))])
     expect(lines).toContain('persona "bravo_two" (key=bravo_two) is added: it will be brought up and launched.')
   })
 
@@ -380,11 +425,9 @@ describe('removed and renamed personas', () => {
     const plan = buildChangePlan(before, valid(after), facts())
     if (!plan.valid) throw new Error('expected a valid plan')
 
-    expect(plan.destructive.map((p) => [p.key, p.settings])).toEqual([['ops', ['name']]])
-    expect(render(plan)).toEqual([
-      header({ destructive: 1 }),
-      'DESTRUCTIVE: persona "Ops Bot" (key=ops) name changed: its live session will be destroyed, then it is brought up fresh.',
-    ])
+    const expected: DestructivePersonaChange = { name: 'Ops Bot', index: 0, settings: ['name'], ...paths }
+    expect(plan.destructive).toEqual([expected])
+    expect(render(plan)).toEqual([header({ destructive: 1 }), destructiveLine(expected)])
   })
 })
 
@@ -394,25 +437,15 @@ describe('removed and renamed personas', () => {
 
 describe('destructive modify', () => {
   test.each(['credentials_file', 'working_directory'] as const)(
-    'a %s whose real path changed is DESTRUCTIVE: torn down, then brought up fresh',
+    'a %s whose real path changed is DESTRUCTIVE: retired, then brought up fresh',
     (setting) => {
       const moved = join(root, 'moved', setting)
       const { plan, lines } = preview(edited((c) => (entry(c, 'bravo')[setting] = moved)))
 
-      expect(plan.destructive).toEqual([
-        {
-          ...ref('bravo', 1),
-          settings: [setting],
-          credentials_file: setting === 'credentials_file' ? moved : credentialsOf('bravo'),
-          working_directory: setting === 'working_directory' ? moved : join(root, 'personas', 'bravo', 'work'),
-        },
-      ])
+      const expected = bravoDestructive([setting], { [setting]: moved })
+      expect(plan.destructive).toEqual([expected])
       expect(plan.unchanged).toEqual([ref('alpha', 0), ref('charlie', 2)])
-      expect(lines).toEqual([
-        header({ destructive: 1 }),
-        `DESTRUCTIVE: persona "bravo" (key=bravo) ${setting} changed to ${JSON.stringify(moved)}: ` +
-          'its live session will be destroyed, then it is brought up fresh.',
-      ])
+      expect(lines).toEqual([header({ destructive: 1 }), destructiveLine(expected)])
     },
   )
 
@@ -424,13 +457,12 @@ describe('destructive modify', () => {
       }),
     )
 
-    expect(plan.destructive.map((p) => p.settings)).toEqual([['credentials_file', 'working_directory']])
-    expect(lines).toEqual([
-      header({ destructive: 1 }),
-      `DESTRUCTIVE: persona "bravo" (key=bravo) credentials_file changed to ${JSON.stringify(join(root, 'new-creds.json'))} ` +
-        `and working_directory changed to ${JSON.stringify(join(root, 'new-work'))}: ` +
-        'its live session will be destroyed, then it is brought up fresh.',
-    ])
+    const expected = bravoDestructive(['credentials_file', 'working_directory'], {
+      credentials_file: join(root, 'new-creds.json'),
+      working_directory: join(root, 'new-work'),
+    })
+    expect(plan.destructive).toEqual([expected])
+    expect(lines).toEqual([header({ destructive: 1 }), destructiveLine(expected)])
   })
 })
 
@@ -1148,12 +1180,15 @@ describe('a changed claude_config_dir that cannot be resolved warns, as an added
     )
 
     expect(asked).toEqual([['bravo', newDir]])
-    expect(plan.destructive.map((p) => [p.key, p.configDirUnresolvable])).toEqual([['bravo', answer]])
+    const expected = bravoDestructive(['working_directory'], {
+      working_directory: work,
+      ...(answer === undefined ? {} : { configDirUnresolvable: answer }),
+    })
+    expect(plan.destructive).toEqual([expected])
     expect(plan.nextLaunch).toEqual([])
-    expect(destructiveLines(lines)).toEqual([
-      `DESTRUCTIVE: persona "bravo" (key=bravo) working_directory changed to ${JSON.stringify(work)}: ` +
-        `its live session will be destroyed, then it is brought up fresh${warning}.`,
-    ])
+    expect(destructiveLines(lines)).toEqual([destructiveLine(expected)])
+    // The warning form follows the retired clause and ends the line.
+    expect(lines[1]).toEndWith(`${DESTRUCTIVE_RETIRED_CLAUSE}${warning}.`)
   })
 
   test("a destructive modify whose claude_config_dir did not change is not asked about, whatever the check would say", () => {
@@ -1721,5 +1756,84 @@ describe('a combined edit', () => {
     }
     expect(readdirSync(root, { recursive: true })).toEqual(before)
     expect(appliedConfig).toEqual(snapshot)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// No preview line says "destroyed" (b.jg5 SRJ-1510, AC 76)
+// ---------------------------------------------------------------------------
+
+describe('no preview line says "destroyed"', () => {
+  /**
+   * Applied: alpha, bravo, charlie, foxtrot, golf. Candidate: foxtrot removed;
+   * bravo and charlie destructively modified, bravo with a claude_config_dir
+   * that cannot be resolved; alpha modified in place and at its next launch,
+   * and inheriting a changed default that could not be checked; golf's
+   * credentials rotated; delta added, echo added but unable to come up; port
+   * changed.
+   */
+  function everyKind(): ValidChangePlan {
+    const problem = 'claude_config_dir cannot be resolved to a real path (ENOENT)'
+    const appliedInput = baseInput()
+    appliedInput.personas.push(persona('foxtrot', 'C0F0001'), persona('golf', 'C0G0001'))
+    const [alpha, bravo, charlie, , golf] = structuredClone(appliedInput.personas)
+    alpha!.channels![0]!.delivery = 'mentions'
+    alpha!.stop_hook_bootstrap = false
+    bravo!.working_directory = join(root, 'bravo-new-work')
+    bravo!.claude_config_dir = join(root, 'bravo-claude-2')
+    charlie!.working_directory = join(root, 'charlie-new-work')
+    const candidateInput = {
+      ...appliedInput,
+      port: 3200,
+      claude_config_dir: join(root, 'claude-default-2'),
+      personas: [alpha!, bravo!, charlie!, golf!, persona('delta', 'C0D0001'), persona('echo', 'C0E0001')],
+    }
+    const plan = buildChangePlan(parse(appliedInput), valid(parse(candidateInput)), {
+      ...credentialsFacts({ held: { golf: DIGEST_OLD }, current: { [credentialsOf('golf')]: DIGEST_NEW } }),
+      configDirProblem: (p) => ({ bravo: problem, alpha: FACT_UNKNOWN })[p.key],
+      addedCannotComeUp: new Map([['echo', [{ step: 'working-directory', cause: 'working directory does not exist' }]]]),
+    })
+    if (!plan.valid) throw new Error('expected a valid plan')
+    return plan
+  }
+
+  test('over a plan with every line kind, an invalid candidate and no effective change, no rendered form says "destroyed"', () => {
+    const plan = everyKind()
+    const lines = render(plan)
+
+    // Every line kind is there, so the check below covers each of them.
+    expect(lines[0]).toBe(header(changePlanCounts(plan)))
+    expect(plan.removed.map((p) => p.key)).toEqual(['foxtrot'])
+    expect(plan.destructive.map((p) => [p.key, p.configDirUnresolvable !== undefined])).toEqual([
+      ['bravo', true],
+      ['charlie', false],
+    ])
+    expect(destructiveLines(lines)).toEqual([
+      removedLine(plan.removed[0]!),
+      destructiveLine(plan.destructive[0]!),
+      destructiveLine(plan.destructive[1]!),
+    ])
+    expect(destructiveLines(lines)[1]).toContain('cannot come up')
+    expect(lines.filter((l) => l.includes(' is added: it will be brought up'))).toHaveLength(1)
+    expect(lines.filter((l) => l.includes(' is added but cannot come up'))).toHaveLength(1)
+    expect(lines.filter((l) => l.includes('applied in place immediately') && l.includes('at its next launch'))).toHaveLength(1)
+    expect(lines.filter((l) => l.includes('a new connection opens'))).toHaveLength(1)
+    expect(lines.filter((l) => l.startsWith('server-wide setting claude_config_dir') && l.includes('could not be checked'))).toHaveLength(1)
+    expect(lines.filter((l) => l.startsWith('server-wide setting port'))).toHaveLength(1)
+
+    const invalid = buildChangePlan(applied(), { kind: 'invalid', error: 'e' }, facts()) as InvalidChangePlan
+    const noEffect = preview(applied()).plan
+    expect(render(invalid)).toEqual(['INVALID: e Nothing will be applied.'])
+    expect(render(noEffect)).toEqual([NO_EFFECT_LINE])
+
+    const forms = [
+      ...lines,
+      renderPreview(plan),
+      ...renderPreviewLogLines(plan, PENDING_FILE),
+      renderPreview(invalid),
+      renderInvalidLogLine(invalid, PENDING_FILE),
+      ...renderPreviewLogLines(noEffect, PENDING_FILE),
+    ]
+    expect(forms.filter((form) => /destroyed/i.test(form))).toEqual([])
   })
 })

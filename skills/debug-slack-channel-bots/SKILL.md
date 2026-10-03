@@ -3393,8 +3393,8 @@ settings.
 
 | Line | Meaning |
 |---|---|
-| `DESTRUCTIVE: persona "<name>" (key=<key>) is removed: its live session will be destroyed (its instance is torn down).` | The persona is gone from `config.json`. Renaming a persona changes its key, so a rename shows as this line for the old name plus an `is added` line for the new one. |
-| `DESTRUCTIVE: persona "<name>" (key=<key>) working_directory changed to "<path>": its live session will be destroyed, then it is brought up fresh.` | Its `credentials_file` or `working_directory` (compared by real path) changed, or its `name` changed without changing its key (`name changed`). Several are joined by ` and `, e.g. `credentials_file changed to "<path>" and working_directory changed to "<path>"`. At the confirmation the persona is torn down and brought up fresh: the instance is replaced and loses its session history. |
+| `DESTRUCTIVE: persona "<name>" (key=<key>) is removed: the persona will be retired: its session stopped and never resumed.` | The persona is gone from `config.json`. At the confirmation it is retired: its session is stopped and never resumed. Renaming a persona changes its key, so a rename shows as this line for the old name plus an `is added` line for the new one. |
+| `DESTRUCTIVE: persona "<name>" (key=<key>) working_directory changed to "<path>": the persona will be retired and brought up fresh: its session stopped and never resumed.` | Its `credentials_file` or `working_directory` (compared by real path) changed, or its `name` changed without changing its key (`name changed`). Several are joined by ` and `, e.g. `credentials_file changed to "<path>" and working_directory changed to "<path>"`. At the confirmation the persona is retired (its session stopped and never resumed) and brought up fresh: the instance is replaced and loses its session history. |
 | `persona "<name>" (key=<key>) is added: it will be brought up and launched.` | A new persona. |
 | `persona "<name>" (key=<key>) is added but cannot come up: <cause>; <cause>.` | A new persona whose bring-up would fail now. The causes, in this order, are the credentials and working-directory cause texts under [Persona diagnostic classes](#persona-diagnostic-classes) (for example `credentials file does not exist`, `credentials file is invalid: …`, `working directory does not exist`), then `claude_config_dir cannot be resolved to a real path (<errno>)`, or `(<errno>: a symlink on its path points to nothing)` for a dangling symlink (see [`persona-config-dir-unresolvable`](#persona-config-dir-unresolvable)). Every check runs, so one cause never hides another. A `claude_config_dir` not created yet under an existing parent is not listed. Fix them before the change is applied. |
 | `persona "<name>" (key=<key>): <settings> changed: applied in place immediately, instance kept.` | `<settings>` lists one or more of `channels` (a channel added or removed), `delivery` (a kept channel's mode), `permission_prompts`, `dm.enabled`, `dm.contact`. Reordering channels isn't a change. |
@@ -3600,7 +3600,7 @@ Look in `server.log` for the lines logged after the rename (the `grep` in
 | [`reload-noop`](#reload-noop) | The change had no effect (whitespace, key order, a default written out); the record now matches `config.json`. Nothing else happens. |
 | [`reload-invalid`](#reload-invalid), `the confirmed configuration is invalid, so nothing is applied` | `config.json` was invalid. Nothing is applied and the confirmation is used up. Fix the file, then confirm the new preview. |
 | [`reload-stale-confirmation`](#reload-stale-confirmation) | The confirmation didn't match the files as they stand, or couldn't be read. Nothing is applied. |
-| [`reload-record-write-failed`](#reload-record-write-failed), `the confirmed change is not applied and stays pending` | The record couldn't be written. Nothing is applied; fix the state directory, then confirm again. |
+| [`reload-record-write-failed`](#reload-record-write-failed), `the confirmed change is not applied and stays pending` | The record, or the retired-key record written before it, couldn't be written. Nothing is applied; fix the state directory, then confirm again. |
 | `[slack] reload: cannot remove the confirmation "<apply path>" (<errno>); it was acted on once and is ignored until its content changes` | The confirmation was acted on once (one of the lines above), but the server couldn't delete it. It is ignored while its content stays the same. Fix the directory's permissions (or the read-only filesystem), then remove `config.json.apply` by hand. |
 | `[slack] reload: apply step <n> (<step>) failed …` or `[slack] reload: updating the server's applied configuration failed: <error>` | An internal error during the apply. Report it as a bug, with the lines around it. |
 
@@ -3706,8 +3706,11 @@ code.
 - **Fix:** Fix the cause below, then start the server again.
 
 **At a confirmed apply.** A running server acting on a confirmation
-(`config.json.apply`) writes the record first, before it changes anything
-else.
+(`config.json.apply`) first records the keys of the personas the change
+retires (removed personas, a renamed persona's old key, and personas whose
+`name`, `credentials_file` or `working_directory` changed) in the retired-key
+record, `retired-keys.json` in the state directory, then writes the record,
+before it changes anything else.
 
 - **Line:** one of:
   - `[slack] reload-record-write-failed: cannot write the last-applied record "<record path>" (<errno>); the confirmed change is not applied and stays pending`:
@@ -3720,6 +3723,17 @@ else.
     `writing the previous record back failed too (<errno>), so the next start may run the unapplied change`:
     then the record may hold the unapplied change, and the next start would
     run it.
+  - `[slack] reload-record-write-failed: cannot write the retired-key record "<path>"; the last-applied record "<record path>" is not rewritten, and the confirmed change is not applied and stays pending; the retired-key record holds what this server held as retired before this apply (b.jg5 SRJ-803, SRJ-804)`:
+    the retired-key record couldn't be written, so the last-applied record wasn't touched.
+    A `[slack] retired-keys: cannot record …` line before it carries the
+    error, followed by the store's `[slack] retired-keys: restored …` or
+    `[slack] retired-keys: cannot restore …` line. The end can instead read
+    `putting the retired-key record back to what it held before this apply failed too, so a key this apply recorded that reached the file stays retired`.
+
+  When the retired-key record was written first, the first two lines end with
+  `; the retired-key record "<path>" is put back to what it held before this apply: the keys this apply recorded are removed again, and keys recorded before it stay (b.jg5 SRJ-804)`,
+  or, when putting it back failed,
+  `; putting the retired-key record "<path>" back to what it held before this apply failed, so the keys this apply recorded stay retired (b.jg5 SRJ-804)`.
 - **Effect:** Nothing is applied. The server keeps running what it ran, the
   change stays pending, and within about 5 s `config.json.pending` is written
   again. The confirmation was used up: it isn't acted on again.
@@ -3773,7 +3787,7 @@ or a filesystem that doesn't support syncing a directory).
 
   ```text
   [slack] reload-preview: A configuration change is pending; nothing has been applied. personas: 0 added, 1 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 0 changed. (preview in "<pending path>")
-  [slack] reload-preview: DESTRUCTIVE: persona "<name>" (key=<key>) is removed: its live session will be destroyed (its instance is torn down).
+  [slack] reload-preview: DESTRUCTIVE: persona "<name>" (key=<key>) is removed: the persona will be retired: its session stopped and never resumed.
   ```
 
   The ` (preview in "<pending path>")` part is missing when the pending file

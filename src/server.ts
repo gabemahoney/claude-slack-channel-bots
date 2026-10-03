@@ -2834,8 +2834,16 @@ export async function main(): Promise<void> {
   // Declared here for the same reason as appliedConfig; an apply runs only
   // after the start bring-up pass, long after it is set.
   let personaLifecycleOps!: PersonaLifecycle
+  // b.jg5 SRJ-803, SRJ-804, SRJ-1511: a confirmed apply's step 1 records the
+  // retired keys (removed personas, a rename's old key, destructive modifies'
+  // old halves, and an added persona's key held only in memory) in
+  // `retiredKeys`, the one store loaded above, before it rewrites the
+  // last-applied record, and restores the store when that rewrite fails. The
+  // store writes with durableWriteFileSync, the controller's default writer.
+  // The start resolution records nothing.
   const reload = createReloadController({
     paths: reloadFilePaths(CONFIG_PATH),
+    retiredKeys,
     lifecycle: {
       startBringUp: (applied) => startupSessionManager(applied, { bringUp: personaBringUps }),
       teardown: (persona) => personaLifecycleOps.teardown(persona),
