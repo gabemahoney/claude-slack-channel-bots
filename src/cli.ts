@@ -7,10 +7,10 @@
  *                    server in the background, and report an early startup
  *                    failure of the daemon.
  *   stop           — Send SIGTERM to a running server via its PID file.
- *                    `--stop-bots` also exits every configured persona's
- *                    instance.
- *   clean_restart  — Exit every configured persona's instance, then stop and
- *                    start the server.
+ *                    `--stop-bots` first runs the precheck, then stops the
+ *                    server and exits every configured persona's instance.
+ *   clean_restart  — Run the precheck, then stop the server, exit every
+ *                    configured persona's instance and start the server.
  *   credentials    — `credentials <persona>`: write that persona's
  *                    credentials file from the operator's terminal, by
  *                    running the packaged `scripts/write-credentials.sh`
@@ -25,6 +25,19 @@
  * which is built with its `agent_director_call_timeout_ms`, or the default
  * when `stop --stop-bots` cannot read it (b.jg5 SRJ-213); `clean_restart`
  * stops on an unreadable configuration before building any client.
+ *
+ * Before either stops anything, `stop --stop-bots` and `clean_restart` run
+ * the precheck (b.jg5 SRJ-901): the client's initialization, then per persona
+ * of that configuration one `get` of its row and, for a live row, one
+ * one-line `read-pane`, decided by `precheckVerdictOf` (`src/cli-teardown.ts`).
+ * A failed initialization or precheck stops neither the server nor any
+ * persona: the command prints its lines, ending `<command>: nothing was
+ * stopped`, and exits 1. The precheck latches nothing and writes no file.
+ * After a passed precheck the server is stopped, then every persona torn
+ * down; `clean_restart` then starts the server. `stop --stop-bots` with an
+ * unreadable configuration has no per-persona step: it stops the server and
+ * skips the teardown.
+ *
  * `credentials` reads the configuration file as it stands
  * (`loadPersonaConfig`), where a persona being added is declared before any
  * confirmation. The CLI never writes any reload file, and this process reads
@@ -49,13 +62,35 @@ import {
 } from './config.ts'
 import { readAppliedPersonaConfig, reloadFilePaths } from './reload.ts'
 import { initLogging } from './logging.ts'
-import { ErrSpawnNotFound } from './agent-director-errors.ts'
+import { ERR_SPAWN_NOT_FOUND_NAME, ErrSpawnNotFound } from './agent-director-errors.ts'
+import { hasAdErrorName } from './ad-error-class.ts'
+import type { Phase1GetResult } from './ad-phase1-types.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import { getClient } from './agent-director-client.ts'
 import type { Client } from 'agent-director'
 import { personaInstanceId, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
 import { runStartupGate } from './agent-director-startup.ts'
 import type { StartupGateDeps, StartupGateRefusalKind } from './agent-director-startup.ts'
+import { PROBE_PANE_READ_LINES } from './pane-read.ts'
+import {
+  CLI_COMMAND_CLEAN_RESTART,
+  CLI_COMMAND_STOP_BOTS,
+  PRECHECK_CALL_GET,
+  PRECHECK_CALL_READ_PANE,
+  PRECHECK_TRIES,
+  PRECHECK_TRY_SPACING_MS,
+  PRECHECK_VERDICT_PASS,
+  PRECHECK_VERDICT_RETRY,
+  PRECHECK_VERDICT_SKIP,
+  precheckFailureLine,
+  precheckNothingStoppedLine,
+  precheckVerdictOf,
+  type CliTeardownCommand,
+  type PrecheckAnswer,
+  type PrecheckFailure,
+  type PrecheckRow,
+  type PrecheckVerdict,
+} from './cli-teardown.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -136,9 +171,9 @@ export interface CliDeps {
   fileSize: (path: string) => number
   /** A file's bytes from `offset` to the end, as UTF-8 text; '' when it cannot be read. */
   readFileFrom: (path: string, offset: number) => string
-  /** Current time in milliseconds (the clock of the daemon startup wait and of `stop`'s exit polls). */
+  /** Current time in milliseconds (the clock of the daemon startup wait, `stop`'s exit polls and the precheck's tries). */
   now: () => number
-  /** Resolve after `ms` milliseconds (the clock of the daemon startup wait and of `stop`'s exit polls). */
+  /** Resolve after `ms` milliseconds (the clock of the daemon startup wait, `stop`'s exit polls and the precheck's tries). */
   sleep: (ms: number) => Promise<void>
   /** Remove a file. */
   unlinkSync: (path: string) => void
@@ -182,14 +217,15 @@ export interface CliDeps {
    */
   runCredentialsScript: (credentialsFile: string) => number
   /**
-   * b.qwo: initialize the agent-director Client singleton before any per-persona
-   * teardown work. clean_restart / `stop --stop-bots` run in a short-lived CLI
-   * process that never runs the server startup gate, so getClient() would throw
-   * (the b.qps root cause). Production wires this to {@link initProductionClient},
-   * the non-exiting runStartupGate variant; on failure the caller exits loudly
-   * (AD-unreachable is never a silent skip). Optional so tests that install a
-   * stub singleton via setClientForTests can omit it — when absent, callers
-   * skip init and use the already-installed stub.
+   * b.qwo: initialize the agent-director Client singleton before the precheck
+   * and any per-persona teardown work (b.jg5 SRJ-901 step 1). clean_restart /
+   * `stop --stop-bots` run in a short-lived CLI process that never runs the
+   * server startup gate, so getClient() would throw (the b.qps root cause).
+   * Production wires this to {@link initProductionClient}, the non-exiting
+   * runStartupGate variant; on failure the caller stops nothing and exits
+   * loudly (AD-unreachable is never a silent skip). Optional so tests that
+   * install a stub singleton via setClientForTests can omit it — when absent,
+   * callers skip init and use the already-installed stub.
    *
    * `callTimeoutMs` is the client's call timeout (b.jg5 SRJ-213): the
    * configuration's `agent_director_call_timeout_ms` (its default when the
@@ -197,6 +233,22 @@ export interface CliDeps {
    * read the configuration. Both commands read the configuration before this.
    */
   initClient?: (callTimeoutMs: number) => Promise<void>
+  /**
+   * The precheck's read of a persona's row (b.jg5 SRJ-901): one `get` of its
+   * instance ID (`cscb_<key>`), answering the row's state, `liveness_note` and
+   * launch start. Returns null only when the row is absent (ErrSpawnNotFound,
+   * by name); every other error propagates for the precheck to classify.
+   * Latches, records and logs nothing.
+   */
+  directorGet: (instanceId: string) => Promise<PrecheckRow | null>
+  /**
+   * The precheck's one-line read of a persona's live row (b.jg5 SRJ-901,
+   * SRJ-117): one `read-pane` of its instance ID (`cscb_<key>`) asking for
+   * `nLines` trailing lines, answering the pane. Every error propagates,
+   * ErrSpawnNotFound included, for the precheck to classify. Latches,
+   * records and logs nothing.
+   */
+  directorReadPane: (instanceId: string, nLines: number) => Promise<string>
   /**
    * Query the agent-director state of a persona's instance, addressed by its
    * instance ID (`cscb_<key>`). Returns null only when the row is absent
@@ -336,6 +388,12 @@ export interface CliHandlers {
   credentials: (args: readonly string[]) => Promise<void>
 }
 
+/** A persona the precheck could not reach, with its failure (b.jg5 SRJ-901). */
+interface PrecheckPersonaFailure {
+  readonly persona: Persona
+  readonly failure: PrecheckFailure
+}
+
 /**
  * Build CLI handlers bound to injectable dependencies.
  * Call with real deps from top-level code; call with stubs in tests.
@@ -352,11 +410,11 @@ export function createCli(deps: CliDeps): CliHandlers {
    * with no personas tears down nothing.
    */
   async function teardownBots(personas: readonly Persona[], exit_timeout: number): Promise<void> {
-    // b.qwo: the precheck's directorStatus() reaches agent-director. If AD is
+    // b.qwo: the first state read's directorStatus() reaches agent-director. If AD is
     // unreachable (the b.qps/incident-2026-09-18 root cause: getClient() throws
     // in the short-lived CLI process, or the AD binary is down), that error MUST
     // NOT be swallowed as a per-persona "no spawn row — skipping" no-op. We let
-    // the precheck error propagate to Promise.allSettled as a rejection, then
+    // the read's error propagate to Promise.allSettled as a rejection, then
     // throw a loud aggregate error after the loop so callers exit non-zero and
     // never proceed to `start`. b.dnt: escalation/timeout kill failures on a
     // present row also reject into the aggregate now — only the benign
@@ -364,7 +422,7 @@ export function createCli(deps: CliDeps): CliHandlers {
     const results = await Promise.allSettled(personas.map((persona) => teardownPersona(persona, exit_timeout)))
 
     // b.qwo: loud AD-unreachable failure. A rejected settlement here is an
-    // agent-director error — from the connectivity/precheck at the top of a
+    // agent-director error — from the state read at the top of a
     // persona's teardown, from a directorStatus poll-loop call, or
     // (b.dnt) from an escalation/timeout kill that failed with anything other
     // than the benign ErrSpawnNotFound already-gone race — never a normal
@@ -381,7 +439,7 @@ export function createCli(deps: CliDeps): CliHandlers {
   }
 
   /**
-   * One persona's teardown: precheck the row state of `cscb_<key>`; skip an
+   * One persona's teardown: read the row state of `cscb_<key>`; skip an
    * absent/terminal row; client.pause() (sends `/exit` → SessionEnd reason
    * prompt_input_exit → the row reaches `ended`); poll client.status() with
    * exponential backoff until ended/missing or exit_timeout elapses; on
@@ -394,17 +452,17 @@ export function createCli(deps: CliDeps): CliHandlers {
     const id = personaInstanceId(persona.key)
     const ref = renderPersonaRef(persona.name, persona.key)
 
-    // Precheck: any row? If not, nothing to do.
+    // State read: any row? If not, nothing to do.
     // NOTE (b.qwo): errors here (AD unreachable / uninitialized client)
     // intentionally propagate — they become allSettled rejections handled
     // by teardownBots' loud-failure check. "no spawn row" is reported ONLY
     // when directorStatus resolves to null (row genuinely absent).
-    const precheck = await deps.directorStatus(id)
-    if (precheck === null) {
+    const initial = await deps.directorStatus(id)
+    if (initial === null) {
       console.error(`[slack] teardownBots: no spawn row for persona ${ref} — skipping`)
       return
     }
-    const state = precheck.state
+    const state = initial.state
     if (state === 'ended' || state === 'missing') {
       console.error(`[slack] teardownBots: persona ${ref} already terminal (state=${state}) — skipping`)
       return
@@ -456,6 +514,75 @@ export function createCli(deps: CliDeps): CliHandlers {
       // rejects into the aggregate; swallow only the benign ErrSpawnNotFound.
       if (!(err instanceof ErrSpawnNotFound)) throw err
     }
+  }
+
+  /**
+   * The precheck over `personas` (b.jg5 SRJ-901 steps 2 to 5), run after the
+   * client's initialization and before anything is stopped. Answers the
+   * personas it could not reach, each with its failure, in configuration
+   * order; an empty answer is a pass (an empty persona set included).
+   * Personas are checked in parallel. Makes only `get` and `read-pane` calls,
+   * latches nothing, writes nothing and prints nothing.
+   */
+  async function runPrecheck(personas: readonly Persona[]): Promise<PrecheckPersonaFailure[]> {
+    const results = await Promise.all(personas.map((persona) => precheckPersona(persona)))
+    return results.flatMap((failure, i) => (failure === null ? [] : [{ persona: personas[i], failure }]))
+  }
+
+  /**
+   * One persona's precheck: one `get` of `cscb_<key>`; for a live row, one
+   * `read-pane` of the one-line count (`PROBE_PANE_READ_LINES`). Answers its
+   * failure, or null when it passes.
+   */
+  async function precheckPersona(persona: Persona): Promise<PrecheckFailure | null> {
+    const id = personaInstanceId(persona.key)
+    const got = await precheckTries(async (): Promise<PrecheckAnswer> => {
+      try {
+        return { call: PRECHECK_CALL_GET, row: await deps.directorGet(id) }
+      } catch (error) {
+        return { call: PRECHECK_CALL_GET, error }
+      }
+    })
+    if (got.kind === PRECHECK_VERDICT_SKIP) return null
+    if (got.kind !== PRECHECK_VERDICT_PASS) return { errorClass: got.errorClass, description: got.description }
+    const read = await precheckTries(async (): Promise<PrecheckAnswer> => {
+      try {
+        return { call: PRECHECK_CALL_READ_PANE, pane: await deps.directorReadPane(id, PROBE_PANE_READ_LINES) }
+      } catch (error) {
+        return { call: PRECHECK_CALL_READ_PANE, error }
+      }
+    })
+    if (read.kind === PRECHECK_VERDICT_SKIP || read.kind === PRECHECK_VERDICT_PASS) return null
+    return { errorClass: read.errorClass, description: read.description }
+  }
+
+  /**
+   * One precheck call and its verdict, the call made again while it answers
+   * UNAVAILABLE: at most PRECHECK_TRIES calls, PRECHECK_TRY_SPACING_MS apart
+   * on the injected clock (b.jg5 SRJ-901 step 3, SRJ-908). A retry verdict
+   * that stands after the last try is the persona's failure.
+   */
+  async function precheckTries(call: () => Promise<PrecheckAnswer>): Promise<PrecheckVerdict> {
+    let verdict = precheckVerdictOf(await call())
+    for (let tries = 1; verdict.kind === PRECHECK_VERDICT_RETRY && tries < PRECHECK_TRIES; tries++) {
+      await deps.sleep(PRECHECK_TRY_SPACING_MS)
+      verdict = precheckVerdictOf(await call())
+    }
+    return verdict
+  }
+
+  /**
+   * Print a failed precheck through `print` (b.jg5 SRJ-901): one line per
+   * persona it could not reach, then `<command>: nothing was stopped`. The
+   * caller exits 1.
+   */
+  function printPrecheckFailure(
+    command: CliTeardownCommand,
+    failures: readonly PrecheckPersonaFailure[],
+    print: (line: string) => void,
+  ): void {
+    for (const { persona, failure } of failures) print(precheckFailureLine(command, persona, failure))
+    print(precheckNothingStoppedLine(command))
   }
 
   async function start(): Promise<void> {
@@ -613,62 +740,84 @@ export function createCli(deps: CliDeps): CliHandlers {
     // WITHOUT the restart phase. Plain `stop` leaves the bots running (they
     // are meant to survive server restarts).
     //
-    // Order matters: stop the server FIRST, then run teardownBots — mirroring
-    // clean_restart's production-proven order (phase 2 server stop before
-    // teardown). If teardown ran while the daemon were still alive, a bot's
-    // graceful `/exit` would close its MCP session and the live server's
-    // onsessionclosed handler (src/server.ts) would scheduleRestart the
-    // persona, respawning it fresh (deleting its `ended` row and history) before
-    // SIGTERM lands. directorPause is an agent-director client subprocess that
-    // needs no live CSCB daemon (SessionEnd hooks are wired by agent-director
-    // into the spawned claude process and call the AD binary), so teardown works
-    // fine after the server is down.
+    // Order (b.jg5 SRJ-901): the configuration, the client's initialization
+    // and the precheck come first, so a failed one stops nothing. Then the
+    // server stops, then teardownBots runs — clean_restart's order too. If
+    // teardown ran while the daemon were still alive, a bot's graceful `/exit`
+    // would close its MCP session and the live server's onsessionclosed
+    // handler (src/server.ts) would scheduleRestart the persona, respawning it
+    // before SIGTERM lands. directorPause is an agent-director client
+    // subprocess that needs no live CSCB daemon (SessionEnd hooks are wired by
+    // agent-director into the spawned claude process and call the AD binary),
+    // so teardown works fine after the server is down.
+    const config = opts?.stopBots ? await precheckStopBots() : null
 
-    // Phase 1: stop the server daemon. Returns the intended exit code so
-    // teardown can run before we actually exit.
+    // Stop the server daemon. Returns the intended exit code so teardown can
+    // run before we actually exit.
     const stopServerCode = await stopServer()
 
-    // Phase 2: gracefully exit managed bots (only for --stop-bots).
-    if (opts?.stopBots) {
-      // Config load is best-effort: a config problem (a pre-persona file
-      // included) logs and skips teardown without failing the stop (the server
-      // is already down; b.4dk behavior). It comes before the client's
-      // initialization, which takes its call timeout from it, or the default
-      // when it cannot be read (b.jg5 SRJ-213).
-      let config: PersonaConfig | null = null
+    // Gracefully exit managed bots (only for --stop-bots with a readable
+    // configuration). b.qwo: a teardown failure (AD unreachable) is a LOUD
+    // failure — exit non-zero rather than swallowing it and reporting a clean
+    // stop.
+    if (config !== null) {
+      console.error('[slack] stop --stop-bots: gracefully exiting managed bots')
       try {
-        config = deps.loadConfig(deps.resolveConfigPath())
+        await teardownBots(config.personas, config.exit_timeout)
       } catch (err) {
-        console.error('[slack] stop --stop-bots: could not load config — skipping bot teardown:', err)
-      }
-
-      // Phase 2.4 (b.qwo): initialize the AD Client singleton before teardown.
-      // Like clean_restart, `stop --stop-bots` runs in a short-lived CLI process
-      // that never runs the server startup gate; without init getClient() throws
-      // and teardown becomes a silent no-op (the b.qps root cause).
-      if (deps.initClient) {
-        try {
-          await deps.initClient(agentDirectorCallTimeoutMsOf(config))
-        } catch (err) {
-          console.error(`[slack] stop --stop-bots: agent-director initialization failed: ${describeCliFailure(err)}`)
-          deps.exit(1)
-        }
-      }
-
-      // b.qwo: a teardown failure (AD unreachable) is a LOUD failure — exit
-      // non-zero rather than swallowing it and reporting a clean stop.
-      if (config !== null) {
-        console.error('[slack] stop --stop-bots: gracefully exiting managed bots')
-        try {
-          await teardownBots(config.personas, config.exit_timeout)
-        } catch (err) {
-          console.error(`[slack] stop --stop-bots: bot teardown failed: ${describeCliFailure(err)}`)
-          deps.exit(1)
-        }
+        console.error(`[slack] stop --stop-bots: bot teardown failed: ${describeCliFailure(err)}`)
+        deps.exit(1)
       }
     }
 
     deps.exit(stopServerCode)
+  }
+
+  /**
+   * `stop --stop-bots`' steps before anything is stopped (b.jg5 SRJ-901):
+   * load the configuration the server runs, initialize the client with its
+   * call timeout, and run the precheck over its personas. Answers the
+   * configuration to tear down, or null when it cannot be read: then there is
+   * no per-persona step, the client takes the default call timeout, and the
+   * teardown is skipped after the server stop. A failed initialization or
+   * precheck prints its lines, ending with the "nothing was stopped" line,
+   * and exits 1 with nothing stopped.
+   */
+  async function precheckStopBots(): Promise<PersonaConfig | null> {
+    // Config load is best-effort: a config problem (a pre-persona file
+    // included) logs and skips the precheck and the teardown without failing
+    // the stop (b.4dk behavior). It comes before the client's initialization,
+    // which takes its call timeout from it, or the default when it cannot be
+    // read (b.jg5 SRJ-213).
+    let config: PersonaConfig | null = null
+    try {
+      config = deps.loadConfig(deps.resolveConfigPath())
+    } catch (err) {
+      console.error('[slack] stop --stop-bots: could not load config — skipping bot teardown:', err)
+    }
+
+    // b.qwo: initialize the AD Client singleton before the precheck. Like
+    // clean_restart, `stop --stop-bots` runs in a short-lived CLI process that
+    // never runs the server startup gate; without init getClient() throws and
+    // the precheck and teardown could reach no row (the b.qps root cause).
+    if (deps.initClient) {
+      try {
+        await deps.initClient(agentDirectorCallTimeoutMsOf(config))
+      } catch (err) {
+        console.error(`[slack] stop --stop-bots: agent-director initialization failed: ${describeCliFailure(err)}`)
+        console.error(precheckNothingStoppedLine(CLI_COMMAND_STOP_BOTS))
+        deps.exit(1)
+      }
+    }
+
+    if (config !== null) {
+      const failures = await runPrecheck(config.personas)
+      if (failures.length > 0) {
+        printPrecheckFailure(CLI_COMMAND_STOP_BOTS, failures, (line) => console.error(line))
+        deps.exit(1)
+      }
+    }
+    return config
   }
 
   // Stop the server daemon. Returns the intended process exit code instead of
@@ -762,7 +911,8 @@ export function createCli(deps: CliDeps): CliHandlers {
       if (console.error !== terminalError) terminalError(...args)
     }
 
-    // Phase 1: Load config (the persona set to tear down)
+    // Phase 1: Load config (the persona set to check and tear down). An
+    // unreadable configuration is fatal before anything is stopped.
     let config: PersonaConfig
     try {
       config = deps.loadConfig(deps.resolveConfigPath())
@@ -772,33 +922,43 @@ export function createCli(deps: CliDeps): CliHandlers {
     }
     const { personas, exit_timeout } = config!
 
-    // Phase 2: Stop the server daemon
-    console.error('[slack] clean_restart: stopping server')
-    const stopResult = deps.spawnSync(process.execPath, [process.argv[1], 'stop'])
-    if (stopResult.status !== 0) {
-      console.error(`[slack] clean_restart: stop returned non-zero exit code: ${stopResult.status}`)
-    }
-
-    // Phase 2.5 (b.qwo): initialize the AD Client singleton before per-persona
-    // work. This CLI process does NOT run the server startup gate, so without
+    // Phase 2 (b.qwo): initialize the AD Client singleton before the precheck.
+    // This CLI process does NOT run the server startup gate, so without
     // explicit init getClient() throws (the b.qps root cause). We use the
     // non-exiting runStartupGate variant so a gate failure surfaces here as a
-    // distinct loud non-zero exit rather than a silently skipped teardown.
+    // distinct loud non-zero exit, with nothing stopped (b.jg5 SRJ-901 step 1).
     // The client takes the loaded configuration's call timeout (b.jg5 SRJ-213).
     if (deps.initClient) {
       try {
         await deps.initClient(agentDirectorCallTimeoutMsOf(config!))
       } catch (err) {
         fatal('[slack] clean_restart: agent-director initialization failed:', err)
+        fatal(precheckNothingStoppedLine(CLI_COMMAND_CLEAN_RESTART))
         deps.exit(1)
       }
     }
 
-    // Phases 3-4: SR-11 Event 12 — per-persona pause/poll/kill teardown via
+    // Phase 3 (b.jg5 SRJ-901): the precheck, before anything is stopped. A
+    // failed precheck stops neither the server nor any persona; its lines go
+    // to the terminal and clean_restart.log only.
+    const failures = await runPrecheck(personas)
+    if (failures.length > 0) {
+      printPrecheckFailure(CLI_COMMAND_CLEAN_RESTART, failures, (line) => fatal(line))
+      deps.exit(1)
+    }
+
+    // Phase 4: Stop the server daemon
+    console.error('[slack] clean_restart: stopping server')
+    const stopResult = deps.spawnSync(process.execPath, [process.argv[1], 'stop'])
+    if (stopResult.status !== 0) {
+      console.error(`[slack] clean_restart: stop returned non-zero exit code: ${stopResult.status}`)
+    }
+
+    // Phase 5: SR-11 Event 12 — per-persona pause/poll/kill teardown via
     // agent-director (shared with `stop --stop-bots`), addressing `cscb_<key>`.
     //
-    // b.qwo: teardownBots throws if AD is unreachable during the precheck. A
-    // failed teardown must abort the restart — never proceed to `start` on top
+    // b.qwo: teardownBots throws if AD is unreachable during its state reads.
+    // A failed teardown must abort the restart — never proceed to `start` on top
     // of bots we could not reach.
     try {
       await teardownBots(personas, exit_timeout)
@@ -807,7 +967,7 @@ export function createCli(deps: CliDeps): CliHandlers {
       deps.exit(1)
     }
 
-    // Phases 5-6: Start new server and exit
+    // Phase 6: Start new server and exit
     console.error('[slack] clean_restart: starting server')
     const startResult = deps.spawnSync(process.execPath, [process.argv[1], 'start'])
     if (startResult.status !== 0) {
@@ -897,33 +1057,52 @@ function runCredentialsScript(credentialsFile: string): number {
 }
 
 // ---------------------------------------------------------------------------
-// Production agent-director operations for the persona teardown
+// Production agent-director operations for the precheck and the persona teardown
 // ---------------------------------------------------------------------------
 
-/** The agent-director operations `teardownBots` uses (the `director*` CliDeps). */
-export type DirectorOps = Pick<CliDeps, 'directorStatus' | 'directorPause' | 'directorKill'>
+/** The agent-director operations the precheck and `teardownBots` use (the `director*` CliDeps). */
+export type DirectorOps = Pick<
+  CliDeps,
+  'directorGet' | 'directorReadPane' | 'directorStatus' | 'directorPause' | 'directorKill'
+>
 
 /** The part of the agent-director Client that `createDirectorOps` calls. */
-export type DirectorClient = Pick<Client, 'status' | 'pause' | 'kill'>
+export type DirectorClient = Pick<Client, 'get' | 'readPane' | 'status' | 'pause' | 'kill'>
 
 /**
- * Build the production `directorStatus` / `directorPause` / `directorKill`
- * deps over `getClient` (the agent-director singleton accessor in production).
- * `getClient` is called on every operation, so the Client installed by
- * `initClient` is picked up and an uninstalled one throws at the call.
+ * Build the production `directorGet` / `directorReadPane` /
+ * `directorStatus` / `directorPause` / `directorKill` deps over `getClient`
+ * (the agent-director singleton accessor in production). `getClient` is
+ * called on every operation, so the Client installed by `initClient` is
+ * picked up and an uninstalled one throws at the call.
  *
  * Each `id` is a persona's instance ID, `cscb_<key>` (b.av2 SR-8.7). b.qwo:
- * only ErrSpawnNotFound means "no row" — `directorStatus` returns null and
- * `directorKill` returns normally; every other error (AD unreachable, no
- * Client installed, a call timeout, …) propagates so the teardown fails
- * loudly. `directorPause` passes every error through.
+ * only ErrSpawnNotFound means "no row" — `directorGet` and `directorStatus`
+ * return null and `directorKill` returns normally; every other error (AD
+ * unreachable, no Client installed, a call timeout, …) propagates so the
+ * precheck classifies it and the teardown fails loudly. `directorReadPane`
+ * and `directorPause` pass every error through, ErrSpawnNotFound included.
+ * `directorGet` recognises ErrSpawnNotFound by name (`hasAdErrorName`).
  *
- * b.jg5 SRJ-801, SRJ-807: `directorStatus` applies no row-read rule and the
- * CLI installs no retired-key store, so no read the CLI makes clears a
- * retired-key entry.
+ * b.jg5 SRJ-114, SRJ-801, SRJ-807: `directorGet` and `directorStatus` apply
+ * no row-read rule and the CLI installs no latch and no retired-key store, so
+ * no read the CLI makes latches a persona or clears a retired-key entry.
  */
 export function createDirectorOps(getClient: () => DirectorClient): DirectorOps {
   return {
+    directorGet: async (id) => {
+      try {
+        const r: Phase1GetResult = await getClient().get({ claude_instance_id: id })
+        return { state: r.state, liveness_note: r.liveness_note, launch_started_at: r.launch_started_at }
+      } catch (err) {
+        if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) return null
+        throw err
+      }
+    },
+    directorReadPane: async (id, nLines) => {
+      const r = await getClient().readPane({ claude_instance_id: id, n_lines: nLines })
+      return r.pane
+    },
     directorStatus: async (id) => {
       try {
         const r = await getClient().status({ claude_instance_id: id })
@@ -1017,8 +1196,11 @@ if (import.meta.main) {
     loadConfigFile: (path) => loadPersonaConfig(path),
     runCredentialsScript,
     // b.qwo: install the AD Client singleton via the non-exiting startup gate
-    // before teardown, with the configuration's call timeout (b.jg5 SRJ-213).
+    // before the precheck and teardown, with the configuration's call timeout
+    // (b.jg5 SRJ-213).
     initClient: (callTimeoutMs) => initProductionClient(callTimeoutMs),
+    directorGet: directorOps.directorGet,
+    directorReadPane: directorOps.directorReadPane,
     directorStatus: directorOps.directorStatus,
     directorPause: directorOps.directorPause,
     directorKill: directorOps.directorKill,

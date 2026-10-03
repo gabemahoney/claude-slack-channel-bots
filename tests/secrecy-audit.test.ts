@@ -38,7 +38,8 @@
  *    config-file onset quotes agent-director, the conflict latch, whose
  *    lines and record carry agent-director's CONFLICT description, the kill
  *    modules (the checked kill, its bounded retry and the kill-failure
- *    alert's texts), the read-pane outcome, the persona routing and the
+ *    alert's texts), the read-pane outcome, the CLI precheck's verdict and
+ *    failure lines, the persona routing and the
  *    live-row sequence, whose step lines carry agent-director failure text), a value
  *    import of one
  *    of the `HELPER_SURFACES` helpers (the token builders and sentinel, the
@@ -132,6 +133,7 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/persona-destination[\w-]*\.ts$/, "the destination resolver and hold, which open DMs through a persona's client and describe Slack failures"],
   [/^src\/health-check\.ts$/, 'the health check, whose lines carry agent-director failure text'],
   [/^src\/cli\.ts$/, 'the CLI, which loads the config and logs agent-director failure text'],
+  [/^src\/cli-teardown\.ts$/, "the CLI teardown commands' pure pieces, whose precheck failure lines carry agent-director failure text (described, redacted) to the terminal and clean_restart.log"],
   [/^src\/agent-director-template\.ts$/, "the template install and refresh, whose lines and startup error carry agent-director failure text"],
   [/^src\/ad-error-class\.ts$/, "the agent-director error classifier, whose reported message carries agent-director failure text (an error's description) to log lines"],
   [/^src\/ad-settings\.ts$/, "the agent-director settings reader, which reads agent-director's config.toml and logs a refused read's reason"],
@@ -509,6 +511,21 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     expect(touchReasonsOf(suite, "import { FULL_PANE_READ_LINES, PANE_READ_GONE } from '../src/pane-read.ts'")).toEqual([])
     expect(touchReasons(suite).some((r) => r.includes('src/pane-read.ts'))).toBe(true)
     expect([callsAssertNoLeak(suite), suite in EXEMPT]).toEqual([true, false])
+  })
+
+  // b.jg5 SRJ-901: a precheck failure line carries the described agent-director failure to the terminal and
+  // clean_restart.log.
+  test('src/cli-teardown.ts is a source surface: its verdict and line builders touch, its constants and types alone do not, and every suite that touches it leak-checks with no exemption', () => {
+    const suite = 'tests/cli-teardown.test.ts'
+    expect(SOURCE_SURFACES.some(([re]) => re.test('src/cli-teardown.ts'))).toBe(true)
+    expect(touchReasonsOf(suite, "import { precheckVerdictOf } from '../src/cli-teardown.ts'").length).toBe(1)
+    expect(touchReasonsOf(suite, "import { precheckFailureLine as line } from '../src/cli-teardown.ts'").length).toBe(1)
+    expect(touchReasonsOf(suite, "import { PRECHECK_TRIES, PRECHECK_TRY_SPACING_MS } from '../src/cli-teardown.ts'")).toEqual([])
+    expect(touchReasonsOf(suite, "import type { PrecheckVerdict } from '../src/cli-teardown.ts'")).toEqual([])
+    expect(touchReasons(suite).some((r) => r.includes('src/cli-teardown.ts'))).toBe(true)
+    const touching = SUITES.filter((file) => touchReasons(file).some((r) => r.includes('src/cli-teardown.ts')))
+    expect(touching).toContain(suite)
+    expect(touching.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map((file) => [file, true, false]))
   })
 
   test("each suite that builds the reload harness leak-checks a run's captured() artifacts", () => {

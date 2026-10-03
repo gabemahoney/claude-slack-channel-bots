@@ -749,19 +749,21 @@ Behavior by case:
 - **Stale PID file** (process no longer running): removes the PID file, prints `server is not running (removed stale PID file)`, exits 0.
 - **Live process:** sends `SIGTERM`, polls for exit for up to `stop_timeout` seconds (default 30s), read from the last-applied record when there is one. Prints `[slack] Server stopped.` on clean exit. Escalates to `SIGKILL` if the process does not exit within `stop_timeout`.
 
-Plain `stop` leaves the managed bots running — they are meant to survive a server restart. Pass `--stop-bots` to gracefully exit the bots first:
+Plain `stop` leaves the managed bots running — they are meant to survive a server restart. Pass `--stop-bots` to gracefully exit the bots too:
 
 ```sh
 claude-slack-channel-bots stop --stop-bots
 ```
 
-This mirrors `clean_restart`'s order: the server is stopped **first**, then the bot teardown runs for each persona in the last-applied record (or in `config.json` when there is no record), addressing its instance as `cscb_<key>` — pause the bot, poll until it exits (or up to `exit_timeout` seconds), then force-kill on timeout. Teardown kills but never deletes each row, preserving its `claude_session_id` so the bots can resume their conversation history on the next start. Stopping the server first prevents its `onsessionclosed`/`scheduleRestart` handler from respawning a just-exited bot mid-teardown (which would delete its `ended` row and history). Use it when you want a clean, flushed shutdown of the bots (for example before a host reboot).
+This follows `clean_restart`'s order. It runs the [precheck](#precheck-before-stopping-bots) first, and stops nothing if it fails. When it passes, the server is stopped, then the bot teardown runs for each persona in the last-applied record (or in `config.json` when there is no record), addressing its instance as `cscb_<key>` — pause the bot, poll until it exits (or up to `exit_timeout` seconds), then force-kill on timeout. Teardown kills but never deletes each row, preserving its `claude_session_id` so the bots can resume their conversation history on the next start. Stopping the server before the teardown prevents its `onsessionclosed`/`scheduleRestart` handler from respawning a just-exited bot mid-teardown (which would delete its `ended` row and history). Use it when you want a clean, flushed shutdown of the bots (for example before a host reboot).
 
-If agent-director is unreachable, the teardown **fails loudly** — the command prints the error and exits non-zero rather than silently reporting a clean stop. (A configuration that cannot be loaded, a bad record or a missing or pre-persona file included, is best-effort: teardown is skipped with `[slack] stop --stop-bots: could not load config — skipping bot teardown:` and the server stop still succeeds, since the server is already down.)
+If agent-director can't be reached, or a persona's instance can't be read, the precheck fails: nothing is stopped and the command exits 1 (see [Precheck before stopping bots](#precheck-before-stopping-bots)). If the teardown itself fails after a passed precheck, the command prints the error and exits non-zero rather than silently reporting a clean stop.
+
+A configuration that cannot be loaded, a bad record or a missing or pre-persona file included, is best-effort: it prints `[slack] stop --stop-bots: could not load config — skipping bot teardown:` with the cause, no persona is checked, the server is stopped, and the teardown is skipped.
 
 ### `claude-slack-channel-bots clean_restart`
 
-Gracefully exits all managed Claude Code sessions, then stops and starts the server.
+Runs the [precheck](#precheck-before-stopping-bots), then stops the server, gracefully exits all managed Claude Code sessions, and starts the server again.
 
 ```sh
 claude-slack-channel-bots clean_restart
@@ -769,7 +771,7 @@ claude-slack-channel-bots clean_restart
 
 For each persona in the last-applied record (or in `config.json` when there is no record), calls `client.pause({claude_instance_id})` via agent-director with the persona's instance ID `cscb_<key>`, and polls `client.status(...)` until the spawn transitions to `ended` / `missing` (or `client.status(...)` fails with `ErrSpawnNotFound` because the row is gone). If the spawn does not exit within `exit_timeout` seconds (default 120s), the spawn is force-killed via `client.kill(...)`. Teardown kills but never deletes each row, preserving its `claude_session_id` so bots resume their conversation history on the next start. All personas are processed in parallel. After the server restarts, the SR-1.4 collision-then-act dispatcher decides resume-vs-fresh per persona — agent-director owns Claude session-id state, not CSCB.
 
-`clean_restart` logs its progress to `STATE_DIR/clean_restart.log`. The lines that end it with an error (config load failure, agent-director initialization failure, teardown failure, start failure) are also printed to the terminal.
+`clean_restart` logs its progress to `STATE_DIR/clean_restart.log`. The lines that end it with an error (config load failure, agent-director initialization failure, a failed precheck, teardown failure, start failure) are also printed to the terminal.
 
 `clean_restart` loads the last-applied record first, or `config.json` when there is no record, and takes `exit_timeout` from it. If it cannot (a record that can't be read or is invalid, or a missing or pre-persona file), it exits 1 with `[slack] clean_restart: failed to load config:` and the loader's error, and nothing is stopped. For a bad record, the error says that deleting it makes the next start apply `config.json` (see [Reload](#reload)). `clean_restart` doesn't apply a pending `config.json` edit: the server comes back on the record.
 
@@ -781,7 +783,41 @@ Behavior by case:
 - **A persona with no instance:** logs `[slack] teardownBots: no spawn row for persona "<name>" (key=<key>) — skipping` and continues.
 - **Server already stopped:** `stop` reports `server is not running`; `start` then brings up a fresh server.
 - **Server fails to start again:** `clean_restart` exits non-zero with `[slack] clean_restart: start failed with exit code <n>`; the reason is in `server.log`.
-- **agent-director unreachable:** teardown fails loudly and the restart is aborted (non-zero exit); no new server is started. The `no spawn row` message appears only when a persona genuinely has no spawn, never when the client failed to reach agent-director.
+- **agent-director unreachable, or a persona's instance can't be read:** the precheck fails and nothing is stopped: the old server and every bot keep running, and `clean_restart` exits 1 (see [Precheck before stopping bots](#precheck-before-stopping-bots)).
+- **agent-director fails during the teardown:** the teardown fails loudly and the restart is aborted (non-zero exit); no new server is started. The `no spawn row` message appears only when a persona genuinely has no spawn, never when the client failed to reach agent-director.
+
+### Precheck before stopping bots
+
+Before `stop --stop-bots` or `clean_restart` stops anything, it checks that agent-director answers and that each persona's instance can be read:
+
+1. It connects to agent-director, with the same version checks as the server's start.
+2. For each persona in the last-applied record (or in `config.json` when there is no record), it reads the persona's instance, `cscb_<key>`. A persona with no instance, or whose instance has finished, is skipped. A running instance has one line of its screen read.
+
+A persona fails the precheck when agent-director answers with one of these classes:
+
+| Class | Meaning |
+|---|---|
+| `CONFLICT` | A tmux session conflict holds the persona's session (see "A persona posts a *Held: tmux session conflict* notice" under [Troubleshooting](#troubleshooting)) |
+| `UNUSABLE_NAME` | The tmux session name recorded on the persona's instance can't be used (see "A persona posts a *Held: unusable tmux session name* notice" under [Troubleshooting](#troubleshooting)) |
+| `ENVIRONMENT` | tmux is unavailable |
+| `UNCLASSIFIED` | An answer CSCB doesn't recognise |
+| `UNAVAILABLE` | agent-director didn't answer, or timed out, after 3 tries 2 s apart |
+| `CONFIG` | agent-director refuses its config file, `~/.agent-director/config.toml`. Fails at once, with no retry, and the line names the file |
+
+Every persona is checked, even after one fails. A conflicting-labels note on a persona's instance fails nothing on its own.
+
+A failed precheck prints one line per persona it could not check, then a closing line, and exits 1:
+
+```
+clean_restart: precheck failed for persona "<name>" (key=<key>), session "slack_bot_<key>": <CLASS>: <description>
+clean_restart: nothing was stopped
+```
+
+The lines start with the command, `stop --stop-bots` or `clean_restart`. `<description>` is the error's name and agent-director's description, as `<name> message="…"`, on one line, with anything that looks like a token replaced by a redaction marker. `stop --stop-bots` prints the lines on the terminal only; `clean_restart` prints them on the terminal and in `clean_restart.log`. When the connection in step 1 fails (an agent-director binary older than CSCB needs included), the command prints `[slack] <command>: agent-director initialization failed:` with the reason, then `<command>: nothing was stopped`, and exits 1.
+
+Nothing was stopped: the server and every bot keep running. Fix the cause, then run the command again.
+
+A passed precheck doesn't prove that the session running under a persona's name is that persona's own. The teardown that follows still acts only on the persona's own launch.
 
 ### `claude-slack-channel-bots credentials`
 
@@ -1655,6 +1691,9 @@ grep -E 'persona-episodes: persona=<key> unclassified-error |unavailable-retry: 
 
 **Session stuck during clean_restart**
 If a session does not exit within `exit_timeout` seconds (default 120s), `clean_restart` force-kills the spawn via `agent-director kill` and proceeds. To manually recover, run `agent-director list --label service=cscb` to find lingering spawns and `agent-director kill <claude_instance_id>` to clear them, then `claude-slack-channel-bots stop && claude-slack-channel-bots start`.
+
+**`clean_restart` or `stop --stop-bots` exits non-zero with `nothing was stopped`**
+The precheck failed, so nothing was stopped: the server and every bot keep running. The `precheck failed for persona` lines name each persona it could not check and why, by class (see [Precheck before stopping bots](#precheck-before-stopping-bots)); an `agent-director initialization failed:` line means agent-director could not be reached or its version was refused. Fix the cause, then re-run the command.
 
 **`clean_restart` or `stop --stop-bots` exits non-zero with an agent-director teardown error**
 This is intentional: when agent-director is unreachable, the teardown cannot run, so the command fails loudly rather than silently no-op'ing and (for `clean_restart`) restarting on top of bots it never touched. Confirm agent-director is installed and responsive with `agent-director version`, then re-run the command. Teardown kills but never deletes rows on any failure path, so it is always safe to retry once agent-director is reachable.

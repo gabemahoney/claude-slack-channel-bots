@@ -203,6 +203,10 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    line. A persona broken by its credentials whose app was fixed on Slack's
    side, with nothing pending? See
    [Fixed on Slack's side, same tokens](#fixed-on-slacks-side-same-tokens).
+10. **`stop --stop-bots` or `clean_restart` printed `nothing was stopped`
+    and exited 1?** Its precheck failed and the server and every bot still
+    run. See
+    [A precheck failed: nothing was stopped](#a-precheck-failed-nothing-was-stopped).
 
 ---
 
@@ -243,7 +247,12 @@ ls -l "$STATE"/server.log*
   fixed cause instead. The
   `stop --stop-bots` lines `agent-director initialization failed:` and
   `bot teardown failed:` print the startup gate's or the teardown's own
-  message in full. The `[slack] Fatal:` line of a start that failed
+  message in full, on the terminal only. The `precheck failed for persona`
+  lines of `stop --stop-bots` and `clean_restart` show agent-director's
+  error name and its description in the redacted one-line form above, on
+  the terminal (and in `clean_restart.log` for `clean_restart`); neither
+  command writes them to `server.log` or `startup-errors.log` (see
+  [A precheck failed: nothing was stopped](#a-precheck-failed-nothing-was-stopped)). The `[slack] Fatal:` line of a start that failed
   unexpectedly prints the raw error.
 - **`startup-errors.log`** in the same directory is a separate file, never
   rotated by CSCB. Most entries are written at start: the agent-director
@@ -3156,6 +3165,52 @@ grep -h -E '(kill try [0-9]+ of [0-9]+|status read before kill try [0-9]+|kill t
 
 ---
 
+## A precheck failed: nothing was stopped
+
+`stop --stop-bots` and `clean_restart` check agent-director before they stop
+anything: they connect to it, then, for each persona in the last-applied
+record (else `config.json`), read its instance `cscb_<key>` and, when it is
+running, one line of its screen. A persona with no instance or a finished
+one is skipped. When the check fails, the command stops nothing and exits 1.
+
+- **Lines:** one line per persona it could not check, in configuration
+  order, then the closing line:
+
+  ```
+  <command>: precheck failed for persona "<name>" (key=<key>), session "slack_bot_<key>": <CLASS>: <description>
+  <command>: nothing was stopped
+  ```
+
+  `<command>` is `stop --stop-bots` or `clean_restart`. `<description>` is
+  agent-director's error name and its description, redacted and on one line
+  (see [The server log](#the-server-log)). When it could not connect to
+  agent-director at all, there is no per-persona line: it prints
+  `[slack] <command>: agent-director initialization failed: <failure>`,
+  then `<command>: nothing was stopped`. A binary the startup gate refuses
+  fails here too (see
+  [The server refuses the agent-director binary at start](#the-server-refuses-the-agent-director-binary-at-start)).
+- **Where:** on the terminal. `clean_restart` also writes them to
+  `clean_restart.log` in the state directory. Neither command writes them to
+  `server.log` or `startup-errors.log`.
+- **Effect:** nothing was stopped: the server and every bot keep running as
+  before. The check latches nothing, posts no notice and writes no record.
+  A conflicting-labels note on an instance fails nothing on its own.
+- **Fix:** fix the cause the class names, below, then, with the operator's
+  say-so, run the command again.
+
+| Class | Meaning | Cause | Fix |
+|---|---|---|---|
+| `CONFLICT` | agent-director refuses the persona's tmux session because of a session conflict. | A session left over from an earlier launch, or another session, holds the persona's session name. | As under [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice). |
+| `UNUSABLE_NAME` | The tmux session name recorded on the persona's row can't be used. | agent-director's store was edited by hand. | As under [A persona posts a Held: unusable tmux session name notice](#a-persona-posts-a-held-unusable-tmux-session-name-notice). |
+| `CONFIG` | agent-director refuses its config file. The description starts `agent-director refuses its config file ~/.agent-director/config.toml:`. Not retried. | `~/.agent-director/config.toml` is malformed. | As under **agent-director refuses its config file** in [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own). |
+| `ENVIRONMENT` | tmux can't be used for the persona. | tmux is missing or not usable on the host. | As under **tmux isn't available** in [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own). |
+| `UNAVAILABLE` | agent-director didn't answer after 3 tries, 2 s apart. | It is unreachable, it timed out, or it gave an error name this agent-director client doesn't recognise. | As under [agent-director can't report a persona's state](#agent-director-cant-report-a-personas-state); a call that keeps timing out may need a longer call timeout ([The call timeout](#the-call-timeout)). |
+| `UNCLASSIFIED` | An answer the check doesn't handle. | An `ErrInternal` that isn't an unusable session name; a store agent-director can't open (`ErrSchemaMismatch`, `ErrSchemaMigrationRequired`, `ErrStoreOpen`); `ErrSystemInstallDisappeared`; any other error name agent-director reports; or an answer the check gives no meaning: a STATE name other than `ErrSpawnNotFound`, a LAUNCH FAILURE or a DIRECTORY answer, from either call, or a GONE answer to the `get`. A GONE answer to the `read-pane` passes the persona. | Report the line to the operator as written; take no action on it. |
+
+A passed check doesn't prove that the session running under a persona's
+name is that persona's own: the teardown that follows acts only on the
+persona's own launch.
+
 ## The server refuses the agent-director binary at start
 
 The startup gate reads the version of the system-installed `agent-director`
@@ -3855,13 +3910,28 @@ applied. Compared with a confirmation:
   changed `claude_config_dir`) doesn't reach a bot that kept running. If the
   server is still running, stop it with `stop --stop-bots` instead of `stop`.
 
-With the operator's say-so, stop the server if it is still running, keep a
-copy of the record if it can be read, delete it and start. Keep the `.bak`
-copy until the new configuration runs as intended:
+With the operator's say-so, stop the server if it is still running:
+
+```sh
+claude-slack-channel-bots stop --stop-bots
+```
+
+Go on only once the server is stopped. If the command exits 1 with
+`stop --stop-bots: nothing was stopped`, nothing was stopped: the server and
+every bot still run. Don't delete the record; follow
+[A precheck failed: nothing was stopped](#a-precheck-failed-nothing-was-stopped)
+first, then run it again. Otherwise confirm the server is down: `stop`
+prints `server is not running`.
+
+```sh
+claude-slack-channel-bots stop
+```
+
+Then keep a copy of the record if it can be read, delete it and start. Keep
+the `.bak` copy until the new configuration runs as intended:
 
 ```sh
 STATE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
-claude-slack-channel-bots stop --stop-bots
 cp "$STATE/config.json.last-applied" "$STATE/config.json.last-applied.bak"
 diff "$STATE/config.json.last-applied.bak" "$STATE/config.json"
 rm "$STATE/config.json.last-applied" &&
@@ -4252,9 +4322,11 @@ or a filesystem that doesn't support syncing a directory).
     shared-path rules, which a record start leaves to the bring-up.
 - **Effect:** The server exits 1 and doesn't fall back to `config.json`.
   Until the record is fixed or deleted, `clean_restart` fails with
-  `[slack] clean_restart: failed to load config:`, and `stop --stop-bots`
-  logs `could not load config — skipping bot teardown` and stops only the
-  server. `stop` logs one line saying it could not load the applied
+  `[slack] clean_restart: failed to load config:` and stops nothing, and
+  `stop --stop-bots` logs `could not load config — skipping bot teardown`,
+  checks no persona and stops only the server. If it can't connect to
+  agent-director first, it stops nothing (see
+  [A precheck failed: nothing was stopped](#a-precheck-failed-nothing-was-stopped)). `stop` logs one line saying it could not load the applied
   configuration, and uses a 30 s `stop_timeout`.
 - **Fix:** If it can't be read, make it a readable file and start again; the
   record is kept. Otherwise, with the operator's say-so, delete the record and

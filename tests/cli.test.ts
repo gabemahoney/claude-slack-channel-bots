@@ -29,8 +29,15 @@
  * run the CLI script through `runCli`, whose env is a direct `hostSafeChildEnv`
  * call (temp HOME, no PATH directory, its own TMUX_TMPDIR, plus temp
  * SLACK_STATE_DIR and BUN_RUNTIME_TRANSPILER_CACHE_PATH=0). Waits in `start` and
- * `stop` (the daemon startup wait, the SIGTERM and SIGKILL polls) run on the
- * per-test fake clock; none waits in real time.
+ * `stop` (the daemon startup wait, the SIGTERM and SIGKILL polls) and the
+ * precheck's tries run on the per-test fake clock; none waits in real time,
+ * and no case leaves a timer pending.
+ *
+ * The precheck (b.jg5 SRJ-901): before `stop --stop-bots` or `clean_restart`
+ * stops anything, one `get` and, for a live row, one one-line `read-pane` of
+ * each persona's `cscb_<key>` (the fixture's `directorGet` and
+ * `directorReadPane`, by default a live `waiting` row and a pane). The
+ * verdict over each answer is tests/cli-teardown.test.ts's.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -69,7 +76,33 @@ import {
   type DirectorClient,
   type DirectorOps,
 } from '../src/cli.ts'
-import { AgentDirectorError, ErrCallTimeout, ErrSpawnNotFound } from '../src/agent-director-errors.ts'
+import {
+  AD_CONFIG_FILE_DISPLAY_NAME,
+  CLI_COMMAND_CLEAN_RESTART,
+  CLI_COMMAND_STOP_BOTS,
+  PRECHECK_CALL_GET,
+  PRECHECK_CALL_READ_PANE,
+  PRECHECK_TRIES,
+  PRECHECK_TRY_SPACING_MS,
+  precheckFailureLine,
+  precheckNothingStoppedLine,
+  precheckVerdictOf,
+  type CliTeardownCommand,
+  type PrecheckCall,
+  type PrecheckFailure,
+  type PrecheckRow,
+} from '../src/cli-teardown.ts'
+import {
+  AD_ERROR_CLASS_CONFIG,
+  AD_ERROR_CLASS_CONFLICT,
+  AD_ERROR_CLASS_ENVIRONMENT,
+  AD_ERROR_CLASS_UNAVAILABLE,
+  AD_ERROR_CLASS_UNCLASSIFIED,
+  AD_ERROR_CLASS_UNUSABLE_NAME,
+  type AdErrorClass,
+} from '../src/ad-error-class.ts'
+import { AgentDirectorError, ERR_TMUX_SESSION_CONFLICT_NAME, ErrCallTimeout, ErrSpawnNotFound } from '../src/agent-director-errors.ts'
+import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_LIVE_STATES, AGENT_DIRECTOR_PENDING_STATE } from '../src/liveness-reading.ts'
 import {
   REFUSAL_KIND_BELOW_PHASE1_FLOOR,
   REFUSAL_KIND_CLIENT_TOO_OLD,
@@ -95,7 +128,8 @@ import {
   type PersonaConfigFs,
   type PersonaConfigInput,
 } from '../src/config.ts'
-import { personaInstanceId, personaKey, renderPersonaRef } from '../src/persona-identity.ts'
+import { personaInstanceId, personaKey, personaTmuxSessionName, renderPersonaRef } from '../src/persona-identity.ts'
+import { PROBE_PANE_READ_LINES } from '../src/pane-read.ts'
 import { readAppliedPersonaConfig } from '../src/reload.ts'
 import { RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY, RETIRED_KEY_CAUSE_REMOVED, retiredKeysPath } from '../src/retired-keys.ts'
 import type * as RetiredKeysModule from '../src/retired-keys.ts'
@@ -111,10 +145,32 @@ import {
 } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import {
+  CONFLICT_CASES,
+  SAMPLE_LAUNCH_START_DEFAULT,
+  STUB_TMUX_SOCKET_PATH,
+  UNAVAILABLE_FORMS,
+  UNUSABLE_NAME_FAULTS,
+  cannedGetResult,
   cannedStatusResult,
+  errCallTimeout,
+  errConfigMalformed,
+  errCwdNotFound,
+  errGeneric,
+  errInternal,
+  errSchemaMismatch,
+  errSpawnNotFound,
+  errSpawnNotInteractive,
+  errSystemInstallDisappeared,
   errSystemInstallNotFound,
   errSystemInstallTooOld,
+  errTmuxCaptureFailed,
+  errTmuxNotAvailable,
+  errTmuxSessionConflict,
+  errTmuxSessionCreate,
+  errTmuxUnresponsive,
+  errUnusableName,
   makePassingGateDeps,
+  provenanceNote,
   makeStubClient,
   makeStubCreateClient,
   type StubClientOptions,
@@ -134,6 +190,7 @@ import {
   balancedAfter,
   callArguments,
   callsOf,
+  importedSpecifiers,
   indicesOf,
   objectProperties,
   onlyCallArguments,
@@ -184,8 +241,11 @@ let pidPath: string
 let stderr: string[]
 let errorSpy: ReturnType<typeof spyOn>
 let savedArgv: string[]
+/** The fake clock of the case's last `makeDeps` bundle; checked for pending timers after each case. */
+let currentClock: FakeClock | null
 
 beforeEach(() => {
+  currentClock = null
   root = mkdtempSync(join(tmpdir(), 'cscb-cli-'))
   stateDir = join(root, 'state')
   mkdirSync(stateDir)
@@ -210,6 +270,8 @@ afterEach(() => {
   delete process.env['_CLI_DAEMON_CHILD']
   for (const name of TOKEN_VARS) delete process.env[name]
   rmSync(root, { recursive: true, force: true })
+  // Every wait ran on the fake clock and none is left behind (b.jg5 SRJ-908).
+  expect(currentClock?.pending() ?? []).toEqual([])
 })
 
 /**
@@ -269,6 +331,11 @@ class FakeDaemon extends EventEmitter {
   }
 }
 
+/** The precheck `get`'s default answer: a live `waiting` row with no note and no launch start. */
+const LIVE_ROW: PrecheckRow = Object.freeze({ state: 'waiting' })
+/** The precheck `read-pane`'s default answer: a pane. */
+const FAKE_PANE = '> '
+
 const DAEMON_PID = 999_999
 /** The descriptor the fake `openLogAppend` returns; never a real open file. */
 const LOG_FD = 57
@@ -301,6 +368,10 @@ interface Overrides {
   initLogging?: (path: string) => void
   /** Answers each `initClient` call, given the call timeout it received. */
   initClient?: (callTimeoutMs: number) => Promise<void>
+  /** The precheck's `get`; default a live `waiting` row with no note ({@link LIVE_ROW}). */
+  directorGet?: (id: string) => Promise<PrecheckRow | null>
+  /** The precheck's `read-pane`; default a pane ({@link FAKE_PANE}). */
+  directorReadPane?: (id: string, nLines: number) => Promise<string>
   directorStatus?: (id: string) => Promise<{ state: string } | null>
   directorPause?: (id: string) => Promise<void>
   directorKill?: (id: string) => Promise<void>
@@ -322,6 +393,12 @@ interface Bundle {
   closedFds: number[]
   logInits: string[]
   loadPaths: string[]
+  /** The id of each precheck `get`, in call order. */
+  getCalls: string[]
+  /** The id and line count of each precheck `read-pane`, in call order. */
+  readPaneCalls: Array<[id: string, nLines: number]>
+  /** Each director call (`get`, `read-pane`, `status`, `pause`, `kill`) as `<verb>:<id>`, with its fake-clock time. */
+  directorCallTimes: Array<[call: string, at: number]>
   statusCalls: string[]
   pauseCalls: string[]
   killCalls: string[]
@@ -344,6 +421,15 @@ interface Bundle {
  */
 function makeDeps(o: Overrides = {}): Bundle {
   const clock = createFakeClock()
+  currentClock = clock
+  const getCalls: string[] = []
+  const readPaneCalls: Bundle['readPaneCalls'] = []
+  const directorCallTimes: Bundle['directorCallTimes'] = []
+  /** Record one director call in the event order with its fake-clock time. */
+  const directorCall = (call: string): void => {
+    events.push(call)
+    directorCallTimes.push([call, clock.now()])
+  }
   const exitCodes: number[] = []
   const exitTimes: number[] = []
   const spawnCalls: Bundle['spawnCalls'] = []
@@ -366,6 +452,7 @@ function makeDeps(o: Overrides = {}): Bundle {
   const deps: CliDeps = {
     spawnSync: (cmd, args) => {
       spawnCalls.push({ cmd, args })
+      events.push(`spawnSync:${args.at(-1)}`)
       return { status: o.spawnSyncStatus !== undefined ? o.spawnSyncStatus : 0 }
     },
     spawnDaemon: (cmd, args, opts) => {
@@ -437,24 +524,35 @@ function makeDeps(o: Overrides = {}): Bundle {
           },
         }
       : {}),
+    directorGet: async (id) => {
+      getCalls.push(id)
+      directorCall(`${PRECHECK_CALL_GET}:${id}`)
+      return o.directorGet ? o.directorGet(id) : LIVE_ROW
+    },
+    directorReadPane: async (id, nLines) => {
+      readPaneCalls.push([id, nLines])
+      directorCall(`${PRECHECK_CALL_READ_PANE}:${id}`)
+      return o.directorReadPane ? o.directorReadPane(id, nLines) : FAKE_PANE
+    },
     directorStatus: async (id) => {
       statusCalls.push(id)
+      directorCall(`status:${id}`)
       return o.directorStatus ? o.directorStatus(id) : null
     },
     directorPause: async (id) => {
       pauseCalls.push(id)
-      events.push(`pause:${id}`)
+      directorCall(`pause:${id}`)
       if (o.directorPause) return o.directorPause(id)
     },
     directorKill: async (id) => {
       killCalls.push(id)
-      events.push(`kill:${id}`)
+      directorCall(`kill:${id}`)
       if (o.directorKill) return o.directorKill(id)
     },
   }
   return {
     deps, clock, exitCodes, exitTimes, spawnCalls, daemonSpawns, logOpens, closedFds, logInits, loadPaths,
-    statusCalls, pauseCalls, killCalls,
+    getCalls, readPaneCalls, directorCallTimes, statusCalls, pauseCalls, killCalls,
     serverSignals, events, initClientCalls, configFileLoads, credentialsRuns,
     get startServerCalled() { return startServerCalled },
   }
@@ -462,9 +560,26 @@ function makeDeps(o: Overrides = {}): Bundle {
 
 const startedServer = (b: Bundle): boolean => b.spawnCalls.some((c) => c.args.includes('start'))
 
+/** The precheck made exactly one `get` and one one-line `read-pane` of each of `ids`, and of no other instance (b.jg5 SRJ-901). */
+function expectOnePrecheckEach(b: Bundle, ids: readonly string[]): void {
+  const sorted = [...ids].sort()
+  expect([...b.getCalls].sort()).toEqual(sorted)
+  expect([...b.readPaneCalls].sort(([a], [c]) => a.localeCompare(c))).toEqual(sorted.map((id) => [id, PROBE_PANE_READ_LINES]))
+}
+
 /** A `stop` bundle whose server is already gone (stale PID file → exit 0). */
 function makeStopDeps(o: Overrides = {}): Bundle {
   return makeDeps({ serverPid: 4242, isProcessRunning: () => false, ...o })
+}
+
+/**
+ * A `stop` bundle whose server is up at the liveness check and gone by the
+ * first poll: a stop that goes ahead sends SIGTERM, so "no server signal"
+ * shows that nothing was stopped.
+ */
+function makeLiveStopDeps(o: Overrides = {}): Bundle {
+  let alive = true
+  return makeDeps({ serverPid: 4242, isProcessRunning: () => { const was = alive; alive = false; return was }, ...o })
 }
 
 // ---------------------------------------------------------------------------
@@ -568,11 +683,11 @@ describe('shared config path (SR-8.7)', () => {
     expect(b.exitCodes).toEqual([0])
   })
 
-  test('stop --stop-bots (live server) loads <stateDir>/config.json for the stop and again for the teardown', async () => {
-    let alive = true
-    const b = makeDeps({ serverPid: 4242, isProcessRunning: () => { const was = alive; alive = false; return was } })
+  test('stop --stop-bots (live server) loads <stateDir>/config.json for the precheck and teardown, and again for the stop', async () => {
+    const b = makeLiveStopDeps()
     await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
     expect(b.loadPaths).toEqual([configPath, configPath])
+    expect(b.getCalls).toEqual([opsId()])
     expect(b.statusCalls).toEqual([opsId()])
   })
 
@@ -594,7 +709,9 @@ describe('shared config path (SR-8.7)', () => {
 
     await createCli(b.deps).clean_restart()
 
-    expect(new Set(b.statusCalls)).toEqual(new Set([personaInstanceId(personaKey(ALPHA.name)), personaInstanceId(personaKey(BETA.name))]))
+    const ids = [personaInstanceId(personaKey(ALPHA.name)), personaInstanceId(personaKey(BETA.name))]
+    expectOnePrecheckEach(b, ids)
+    expect(new Set(b.statusCalls)).toEqual(new Set(ids))
     expect(b.statusCalls).toHaveLength(2)
     expect(startedServer(b)).toBe(true)
   })
@@ -607,7 +724,7 @@ describe('shared config path (SR-8.7)', () => {
 
     expect(b.exitCodes).toEqual([1])
     expect(stderr.join('\n')).toContain(prePersonaConversionMessage(PRE_PERSONA_KEY))
-    expect([...b.statusCalls, ...b.pauseCalls, ...b.killCalls]).toEqual([])
+    expect(b.directorCallTimes).toEqual([]) // no precheck call and no teardown call
     expect(b.spawnCalls).toEqual([]) // neither stop nor start ran
   })
 
@@ -624,7 +741,8 @@ describe('shared config path (SR-8.7)', () => {
 
     expect(b.serverSignals).toEqual(['SIGTERM'])
     expect(b.exitCodes).toEqual([0])
-    expect([...b.statusCalls, ...b.pauseCalls, ...b.killCalls]).toEqual([])
+    // b.jg5 SRJ-901: no per-persona step (no get or read-pane), and the teardown skipped.
+    expect(b.directorCallTimes).toEqual([])
     expect(stderr.join('\n')).toContain('could not load config — skipping bot teardown')
   })
 })
@@ -807,7 +925,7 @@ describe('last-applied record (SR-8.7)', () => {
   test.each([
     ...SOURCES.map(([label, source]) => ['clean_restart', label, source, runCleanRestart] as const),
     ...SOURCES.map(([label, source]) => ['stop --stop-bots', label, source, runStopBots] as const),
-  ])('%s: persona set, exit_timeout and the client\'s agent_director_call_timeout_ms come from %s — exactly cscb_<key> of Alpha and Beta, each paused then killed at once, never Gamma; initClient gets the call timeout once, after the configuration is read', async (name, _label, source, run) => {
+  ])('%s: persona set, exit_timeout and the client\'s agent_director_call_timeout_ms come from %s — exactly cscb_<key> of Alpha and Beta, each prechecked, then paused and killed at once, never Gamma; initClient gets the call timeout once, after the configuration is read and before the precheck', async (name, _label, source, run) => {
     // Precondition: the three values differ, so any wrong source shows.
     expect(new Set([APPLIED_CALL_TIMEOUT_MS, EDITED_CALL_TIMEOUT_MS, DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS]).size).toBe(3)
     writeSource(source)
@@ -822,11 +940,13 @@ describe('last-applied record (SR-8.7)', () => {
     await run(b)
 
     const ids = [alphaId(), betaId()].sort()
+    // b.jg5 SRJ-901: one get and one one-line read-pane of each persona of the configuration the server runs.
+    expectOnePrecheckEach(b, ids)
     // exit_timeout 0: no status poll after the pause, straight to kill.
     expect([...b.statusCalls].sort()).toEqual(ids)
     expect([...b.pauseCalls].sort()).toEqual(ids)
     expect([...b.killCalls].sort()).toEqual(ids)
-    expect([...b.statusCalls, ...b.pauseCalls, ...b.killCalls]).not.toContain(gammaId())
+    expect(b.directorCallTimes.map(([call]) => call).filter((call) => call.endsWith(gammaId()))).toEqual([])
     if (name === 'stop --stop-bots') {
       expect(b.serverSignals).toEqual(['SIGTERM', 'SIGKILL'])
       expect(b.exitCodes).toEqual([0])
@@ -835,9 +955,22 @@ describe('last-applied record (SR-8.7)', () => {
       expect(startedServer(b)).toBe(true)
     }
     expect(b.initClientCalls).toEqual([APPLIED_CALL_TIMEOUT_MS])
-    // Every configuration read comes before the client is built.
-    expect(b.events.slice(0, b.events.indexOf('initClient'))).toContain('loadConfig')
-    expect(b.events.slice(b.events.indexOf('initClient'))).not.toContain('loadConfig')
+    // The configuration read that sizes the client comes before it is built,
+    // and the client is built before the precheck's first call.
+    const initAt = b.events.indexOf('initClient')
+    expect(b.events.slice(0, initAt)).toContain('loadConfig')
+    expect(initAt).toBeLessThan(b.events.indexOf(`${PRECHECK_CALL_GET}:${alphaId()}`))
+    expect(initAt).toBeLessThan(b.events.indexOf(`${PRECHECK_CALL_GET}:${betaId()}`))
+    // After it, only `stop`'s own stop_timeout read, once the precheck has passed.
+    const lastPrecheck = Math.max(...b.events.flatMap((e, i) => (e.startsWith(`${PRECHECK_CALL_READ_PANE}:`) ? [i] : [])))
+    const laterLoads = b.events.flatMap((e, i) => (e === 'loadConfig' && i > initAt ? [i] : []))
+    if (name === 'stop --stop-bots') {
+      expect(laterLoads).toHaveLength(1)
+      expect(laterLoads[0]).toBeGreaterThan(lastPrecheck)
+      expect(laterLoads[0]).toBeLessThan(b.events.indexOf('server:SIGTERM'))
+    } else {
+      expect(laterLoads).toEqual([])
+    }
     assertNoLeak({ stderr, exitCodes: b.exitCodes }, `${name} (${source})`)
   })
 
@@ -860,8 +993,14 @@ describe('last-applied record (SR-8.7)', () => {
 
     await run(b)
 
-    // Precondition: the run read the intended source and tore down its set.
-    if (name !== 'stop') expect([...b.killCalls].sort()).toEqual([alphaId(), betaId()].sort())
+    // Precondition: the run read the intended source, prechecked and tore down
+    // its set; plain `stop` makes no director call.
+    if (name !== 'stop') {
+      expectOnePrecheckEach(b, [alphaId(), betaId()])
+      expect([...b.killCalls].sort()).toEqual([alphaId(), betaId()].sort())
+    } else {
+      expect(b.directorCallTimes).toEqual([])
+    }
     expect(existsSync(recordPath())).toBe(source === 'record')
     expect(snapshotTree()).toEqual(before)
     assertNoLeak({ stderr, exitCodes: b.exitCodes }, `${name} (${source}, no writes)`)
@@ -933,6 +1072,7 @@ describe('last-applied record (SR-8.7)', () => {
     await run(b)
 
     const ids = [alphaId(), betaId()].sort()
+    expectOnePrecheckEach(b, ids)
     expect([...b.pauseCalls].sort()).toEqual(ids)
     expect([...b.killCalls].sort()).toEqual(ids)
     expect(stderr.join('\n')).not.toContain('could not load config')
@@ -964,7 +1104,7 @@ describe('last-applied record (SR-8.7)', () => {
     expect(stderr[0]!.startsWith('[slack] clean_restart: failed to load config:')).toBe(true)
     expect(stderr[0]).toContain(deletionHint())
     expect(b.initClientCalls).toEqual([]) // b.jg5 SRJ-213: fatal before any client is built
-    expect([...b.statusCalls, ...b.pauseCalls, ...b.killCalls]).toEqual([])
+    expect(b.directorCallTimes).toEqual([]) // no get, read-pane, status, pause or kill
     expect(b.spawnCalls).toEqual([])
     assertNoLeak({ stderr, exitCodes: b.exitCodes }, 'clean_restart (malformed record)')
   })
@@ -992,7 +1132,7 @@ describe('last-applied record (SR-8.7)', () => {
     expect(stopLine[0]).toContain(deletionHint())
     // b.jg5 SRJ-213: the default, never the edited config.json's value.
     expect(b.initClientCalls).toEqual([DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS])
-    expect([...b.statusCalls, ...b.pauseCalls, ...b.killCalls]).toEqual([])
+    expect(b.directorCallTimes).toEqual([]) // no get, read-pane, status, pause or kill
     assertNoLeak({ stderr, exitCodes: b.exitCodes }, 'stop --stop-bots (malformed record)')
   })
 
@@ -1078,7 +1218,7 @@ describe('last-applied record (SR-8.7)', () => {
       expect(stderr).toHaveLength(1)
       expect(stderr[0]!.startsWith('[slack] clean_restart: failed to load config:')).toBe(true)
       expect(stderr[0]).toContain(f.cause)
-      expect([...b.statusCalls, ...b.pauseCalls, ...b.killCalls]).toEqual([])
+      expect(b.directorCallTimes).toEqual([]) // no get, read-pane, status, pause or kill
       expect(b.spawnCalls).toEqual([])
       expect(b.clock.now()).toBe(0)
       f.assertUnreadAndClosed()
@@ -1107,7 +1247,7 @@ describe('last-applied record (SR-8.7)', () => {
       expect(skip).toHaveLength(1)
       expect(skip[0]).toContain(f.cause)
       expect(stderr.filter((l) => l.startsWith(STOP_LOAD_FAILURE_PREFIX))).toEqual([`${STOP_LOAD_FAILURE_PREFIX}${f.cause}`])
-      expect([...b.statusCalls, ...b.pauseCalls, ...b.killCalls]).toEqual([])
+      expect(b.directorCallTimes).toEqual([]) // no get, read-pane, status, pause or kill
       f.assertUnreadAndClosed()
       assertNoLeak({ stderr, exitCodes: b.exitCodes }, `stop --stop-bots (${source}, ${kind})`)
     },
@@ -1410,7 +1550,7 @@ describe('persona-set teardown', () => {
   test.each([
     ['clean_restart', (b: Bundle) => createCli(b.deps).clean_restart()],
     ['stop --stop-bots', (b: Bundle) => createCli(b.deps).stop({ stopBots: true }).catch((e) => { if (!(e instanceof ExitError)) throw e })],
-  ])('%s: two personas (two channels; zero channels with DMs) each get one status, pause and kill on cscb_<key>, none by channel', async (_name, run) => {
+  ])('%s: two personas (two channels; zero channels with DMs) each get one get, one one-line read-pane, one status, pause and kill on cscb_<key>, none by channel', async (_name, run) => {
     const b = makeStopDeps({
       config: twoPersonas(),
       directorStatus: async () => ({ state: 'waiting' }),
@@ -1420,11 +1560,12 @@ describe('persona-set teardown', () => {
     await run(b)
 
     const ids = [alphaId(), betaId()].sort()
+    expectOnePrecheckEach(b, ids)
     expect([...b.statusCalls].sort()).toEqual(ids)
     expect([...b.pauseCalls].sort()).toEqual(ids)
     expect([...b.killCalls].sort()).toEqual(ids)
     const channelIds = [...ALPHA.channels.map((c) => c.id)]
-    for (const call of [...b.statusCalls, ...b.pauseCalls, ...b.killCalls]) {
+    for (const [call] of b.directorCallTimes) {
       expect(channelIds.some((c) => call.includes(c))).toBe(false)
     }
     expect(b.exitCodes).not.toContain(1)
@@ -1434,6 +1575,7 @@ describe('persona-set teardown', () => {
     const b = makeDeps({ directorStatus: async () => ({ state: 'ended' }) })
     await createCli(b.deps).clean_restart()
     expect(personaKey(OPS_NAME)).not.toBe(OPS_NAME) // precondition: name ≠ key
+    expectOnePrecheckEach(b, [opsId()])
     expect(b.statusCalls).toEqual([opsId()])
   })
 
@@ -1446,7 +1588,7 @@ describe('persona-set teardown', () => {
   test('clean_restart with an empty personas array: no director call, still stops and starts', async () => {
     const b = makeDeps({ config: makeMultiPersonaConfig([], root), directorStatus: async () => ({ state: 'waiting' }) })
     await createCli(b.deps).clean_restart()
-    expect([...b.statusCalls, ...b.pauseCalls, ...b.killCalls]).toEqual([])
+    expect(b.directorCallTimes).toEqual([]) // no get, read-pane, status, pause or kill
     expect(b.spawnCalls.map((c) => c.args.at(-1))).toEqual(['stop', 'start'])
     expect(b.exitCodes).toEqual([])
   })
@@ -1454,7 +1596,7 @@ describe('persona-set teardown', () => {
   test('stop --stop-bots with an empty personas array: no director call, server stop exit 0', async () => {
     const b = makeStopDeps({ config: makeMultiPersonaConfig([], root), directorStatus: async () => ({ state: 'waiting' }) })
     await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
-    expect([...b.statusCalls, ...b.pauseCalls, ...b.killCalls]).toEqual([])
+    expect(b.directorCallTimes).toEqual([]) // no get, read-pane, status, pause or kill
     expect(b.exitCodes).toEqual([0])
   })
 
@@ -1616,32 +1758,40 @@ describe('clean_restart — clean_restart.log and the terminal', () => {
     console.error = (...args: unknown[]) => { log.push(formatLine(args)) }
   }
 
-  const FATAL: Array<[string, Overrides, string]> = [
-    ['config load fails', { loadConfig: () => { throw new Error('config boom') } }, '[slack] clean_restart: failed to load config: config boom'],
+  /** Each case's fatal lines, in order: each terminal line starts with its entry. */
+  const FATAL: Array<[string, Overrides, () => string[]]> = [
+    ['config load fails', { loadConfig: () => { throw new Error('config boom') } }, () => ['[slack] clean_restart: failed to load config: config boom']],
+    // b.jg5 SRJ-901: an initialization failure is a precheck failure; it stops nothing and says so.
     [
       'agent-director initialization fails',
       { initClient: async () => { throw new Error('startup gate failed') } },
-      '[slack] clean_restart: agent-director initialization failed: startup gate failed',
+      () => [
+        '[slack] clean_restart: agent-director initialization failed: startup gate failed',
+        precheckNothingStoppedLine(CLI_COMMAND_CLEAN_RESTART),
+      ],
     ],
     [
       'teardown fails',
       { directorStatus: async () => { throw new Error('AD connection refused') } },
-      '[slack] clean_restart: bot teardown failed — aborting restart: teardownBots: agent-director error',
+      () => ['[slack] clean_restart: bot teardown failed — aborting restart: teardownBots: agent-director error'],
     ],
     // stop's non-zero exit is a non-fatal line: log only.
-    ['start fails', { spawnSyncStatus: 3 }, '[slack] clean_restart: start failed with exit code 3'],
+    ['start fails', { spawnSyncStatus: 3 }, () => ['[slack] clean_restart: start failed with exit code 3']],
   ]
 
-  test.each(FATAL)('%s: the fatal line reaches the terminal once and the log once; no other line reaches the terminal', async (_name, o, line) => {
+  test.each(FATAL)('%s: each fatal line reaches the terminal once and the log once; no other line reaches the terminal', async (_name, o, lines) => {
     const log: string[] = []
     const b = makeDeps({ ...o, initLogging: redirectTo(log) })
 
     await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
 
     expect(b.logInits).toEqual([join(stateDir, 'clean_restart.log')])
-    expect(stderr).toHaveLength(1)
-    expect(stderr[0]!.startsWith(line)).toBe(true)
-    expect(log.filter((l) => l === stderr[0])).toHaveLength(1)
+    const expected = lines()
+    expect(stderr).toHaveLength(expected.length)
+    expected.forEach((line, i) => {
+      expect(stderr[i]!.startsWith(line)).toBe(true)
+      expect(log.filter((l) => l === stderr[i])).toHaveLength(1)
+    })
   })
 
   test('a successful run redirects to <stateDir>/clean_restart.log before loading the config; every line goes to the log, none to the terminal', async () => {
@@ -1673,25 +1823,44 @@ describe('clean_restart — clean_restart.log and the terminal', () => {
 // ---------------------------------------------------------------------------
 
 describe('createDirectorOps', () => {
-  const OPS: Array<keyof DirectorOps> = ['directorStatus', 'directorPause', 'directorKill']
+  const OPS: Array<keyof DirectorOps> = ['directorGet', 'directorReadPane', 'directorStatus', 'directorPause', 'directorKill']
+
+  /** The `get` row the fake Client answers: a live row carrying a note and a launch start, so each field read shows. */
+  const GET_ROW: PrecheckRow = { state: 'pending', liveness_note: provenanceNote, launch_started_at: SAMPLE_LAUNCH_START_DEFAULT }
 
   /** A fake Client whose verbs record [verb, request] and throw `fail` when given. */
-  function fakeClient(fail?: Error): { client: DirectorClient; calls: Array<[string, unknown]> } {
+  function fakeClient(fail?: unknown): { client: DirectorClient; calls: Array<[string, unknown]> } {
     const calls: Array<[string, unknown]> = []
     const verb = (name: string, result: object) => async (req: unknown) => {
       calls.push([name, req])
-      if (fail) throw fail
+      if (fail !== undefined) throw fail
       return result
     }
-    const client = { status: verb('status', { state: 'working' }), pause: verb('pause', {}), kill: verb('kill', {}) }
+    const client = {
+      get: verb('get', { ...GET_ROW, claude_instance_id: opsId() }),
+      readPane: verb('readPane', { pane: FAKE_PANE }),
+      status: verb('status', { state: 'working' }),
+      pause: verb('pause', {}),
+      kill: verb('kill', {}),
+    }
     return { client: client as unknown as DirectorClient, calls }
   }
+
+  /** Call `op` on `ops` for the Ops persona; `directorReadPane` with the one-line count. */
+  const callOp = (ops: DirectorOps, op: keyof DirectorOps): Promise<unknown> =>
+    op === 'directorReadPane' ? ops.directorReadPane(opsId(), PROBE_PANE_READ_LINES) : ops[op](opsId())
 
   const notFound = (): Error => new ErrSpawnNotFound('status', 'ErrSpawnNotFound', 'row gone')
   const refused = (): Error => new Error('AD connection refused')
   const timeout = (): Error => new ErrCallTimeout('status', 35000, 30000)
 
   test.each([
+    ['directorGet', 'ErrSpawnNotFound', 'resolves null', notFound],
+    ['directorGet', 'a connection error', 'rejects', refused],
+    ['directorGet', 'ErrCallTimeout', 'rejects', timeout],
+    ['directorReadPane', 'ErrSpawnNotFound', 'rejects', notFound],
+    ['directorReadPane', 'a connection error', 'rejects', refused],
+    ['directorReadPane', 'ErrCallTimeout', 'rejects', timeout],
     ['directorStatus', 'ErrSpawnNotFound', 'resolves null', notFound],
     ['directorStatus', 'a connection error', 'rejects', refused],
     ['directorStatus', 'ErrCallTimeout', 'rejects', timeout],
@@ -1703,17 +1872,42 @@ describe('createDirectorOps', () => {
     ['directorPause', 'ErrCallTimeout', 'rejects', timeout],
   ] as const)('%s when the Client throws %s: %s', async (op, _name, outcome, makeErr) => {
     const err = makeErr()
-    const call = createDirectorOps(() => fakeClient(err).client)[op](opsId())
+    const call = callOp(createDirectorOps(() => fakeClient(err).client), op)
     if (outcome === 'rejects') await expect(call).rejects.toBe(err)
     else expect(await call).toBe(outcome === 'resolves null' ? null : undefined)
   })
 
-  test.each(OPS)('%s rejects with getClient\'s own error when getClient throws (no Client installed)', async (op) => {
-    const err = new Error('agent-director client not initialized')
-    await expect(createDirectorOps(() => { throw err })[op](opsId())).rejects.toBe(err)
+  // b.jg5 SRJ-117, SRJ-901: the precheck classifies every read-pane error itself (ErrSpawnNotFound takes the GONE
+  // column), and every get error but ErrSpawnNotFound; each reaches it as the same value, built by name.
+  const PRECHECK_ERRORS: Array<[string, () => unknown]> = [
+    ['ErrTmuxSessionConflict', () => errTmuxSessionConflict(PRECHECK_CALL_READ_PANE, 'not-this-launch')],
+    ['the unusable-name ErrInternal', () => errUnusableName()],
+    ['ErrConfigMalformed', () => errConfigMalformed()],
+    ['ErrTmuxCaptureFailed', () => errTmuxCaptureFailed()],
+  ]
+  test.each([...PRECHECK_ERRORS, ['the stub\'s ErrSpawnNotFound', () => errSpawnNotFound()] as [string, () => unknown]])(
+    'directorReadPane rejects with the same value when the Client throws %s',
+    async (_label, make) => {
+      const err = make()
+      await expect(createDirectorOps(() => fakeClient(err).client).directorReadPane(opsId(), PROBE_PANE_READ_LINES)).rejects.toBe(err)
+    },
+  )
+
+  test.each(PRECHECK_ERRORS)('directorGet rejects with the same value when the Client throws %s', async (_label, make) => {
+    const err = make()
+    await expect(createDirectorOps(() => fakeClient(err).client).directorGet(opsId())).rejects.toBe(err)
   })
 
-  test('getClient is called on every op (a Client installed later is used) and each verb gets cscb_<key> as claude_instance_id', async () => {
+  test('directorGet resolves null for the stub\'s ErrSpawnNotFound (recognised by name)', async () => {
+    expect(await createDirectorOps(() => fakeClient(errSpawnNotFound()).client).directorGet(opsId())).toBeNull()
+  })
+
+  test.each(OPS)('%s rejects with getClient\'s own error when getClient throws (no Client installed)', async (op) => {
+    const err = new Error('agent-director client not initialized')
+    await expect(callOp(createDirectorOps(() => { throw err }), op)).rejects.toBe(err)
+  })
+
+  test('getClient is called on every op (a Client installed later is used); each verb gets cscb_<key> as claude_instance_id, read-pane the given n_lines; get answers the row\'s state, note and launch start, read-pane the pane', async () => {
     let installed: DirectorClient | null = null
     let gets = 0
     const ops = createDirectorOps(() => {
@@ -1725,16 +1919,25 @@ describe('createDirectorOps', () => {
     const { client, calls } = fakeClient()
     installed = client
 
+    expect(await ops.directorGet(opsId())).toEqual(GET_ROW)
+    expect(await ops.directorReadPane(opsId(), PROBE_PANE_READ_LINES)).toBe(FAKE_PANE)
     expect(await ops.directorStatus(opsId())).toEqual({ state: 'working' })
     await ops.directorPause(opsId())
     await ops.directorKill(opsId())
 
-    expect(gets).toBe(4)
+    expect(gets).toBe(6)
     const req = { claude_instance_id: opsId() }
-    expect(calls).toEqual([['status', req], ['pause', req], ['kill', req]])
+    expect(calls).toEqual([
+      ['get', req],
+      ['readPane', { ...req, n_lines: PROBE_PANE_READ_LINES }],
+      ['status', req],
+      ['pause', req],
+      ['kill', req],
+    ])
+    assertNoLeak({ calls })
   })
 
-  test('production deps take directorStatus / directorPause / directorKill from createDirectorOps(getClient) (static)', () => {
+  test('production deps take directorGet / directorReadPane / directorStatus / directorPause / directorKill from createDirectorOps(getClient) (static)', () => {
     const code = stripComments(readFileSync(CLI_SOURCE, 'utf-8'))
     expect(code).toMatch(/import\s*\{\s*getClient\s*\}\s*from\s*'\.\/agent-director-client\.ts'/)
     const made = [...code.matchAll(/\bconst\s+(\w+)\s*=\s*createDirectorOps\s*\(\s*getClient\s*\)/g)]
@@ -1807,25 +2010,30 @@ describe('stop --stop-bots (b.4dk)', () => {
     const b = makeStopDeps({ loadConfig: () => { throw new Error('config boom') } })
     await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
     expect(b.exitCodes).toEqual([0])
-    expect([...b.statusCalls, ...b.pauseCalls, ...b.killCalls]).toEqual([])
+    expect(b.directorCallTimes).toEqual([]) // no get, read-pane, status, pause or kill
   })
 
   // b.4dk ordering: the server is stopped BEFORE any bot teardown begins, so the
-  // live daemon cannot respawn a persona mid-teardown.
-  test('stopBots: server SIGTERM precedes any director verb (teardown-first regression guard)', async () => {
-    let alive = true
-    const b = makeDeps({
-      serverPid: 4242,
-      isProcessRunning: () => { const was = alive; alive = false; return was },
+  // live daemon cannot respawn a persona mid-teardown. b.jg5 SRJ-901: the
+  // precheck's get and read-pane come before the server stop, so a failed
+  // precheck stops nothing.
+  test('stopBots: every precheck call precedes the server SIGTERM, which precedes the teardown\'s first status, pause and kill (teardown-first regression guard)', async () => {
+    const b = makeLiveStopDeps({
       config: opsConfig({ stop_timeout: 1, exit_timeout: 0 }),
       directorStatus: async () => ({ state: 'waiting' }),
     })
     await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
     const firstServer = b.events.indexOf('server:SIGTERM')
-    const firstPause = b.events.findIndex((e) => e.startsWith('pause:'))
+    const at = (verb: string): number[] => b.events.flatMap((e, i) => (e.startsWith(`${verb}:`) ? [i] : []))
     expect(firstServer).toBeGreaterThanOrEqual(0)
-    expect(firstPause).toBeGreaterThanOrEqual(0)
-    expect(firstServer).toBeLessThan(firstPause)
+    const precheck = [...at(PRECHECK_CALL_GET), ...at(PRECHECK_CALL_READ_PANE)]
+    expect(precheck).toHaveLength(2)
+    expect(Math.max(...precheck)).toBeLessThan(firstServer)
+    for (const verb of ['status', 'pause', 'kill']) {
+      expect(at(verb).length).toBeGreaterThan(0)
+      expect(Math.min(...at(verb))).toBeGreaterThan(firstServer)
+    }
+    assertNoLeak({ stderr, events: b.events })
   })
 
   test.each([[undefined], [{}]])(
@@ -1833,9 +2041,7 @@ describe('stop --stop-bots (b.4dk)', () => {
     async (opts) => {
       const b = makeStopDeps({ directorStatus: async () => ({ state: 'waiting' }) })
       await expect(createCli(b.deps).stop(opts)).rejects.toBeInstanceOf(ExitError)
-      expect(b.pauseCalls).toEqual([])
-      expect(b.killCalls).toEqual([])
-      expect(b.statusCalls).toEqual([])
+      expect(b.directorCallTimes).toEqual([]) // no precheck and no teardown
     },
   )
 })
@@ -1900,7 +2106,7 @@ describe('b.qwo — teardown fails loudly when agent-director is unreachable', (
 })
 
 describe('b.qwo — initClient startup gate', () => {
-  test('clean_restart calls initClient once, with the configuration\'s call timeout, before any director verb', async () => {
+  test('clean_restart calls initClient once, with the configuration\'s call timeout, before any director verb; then the precheck, then the stop spawn, then the teardown', async () => {
     let n = 0
     const b = makeDeps({
       initClient: async () => { /* gate ok */ },
@@ -1908,21 +2114,33 @@ describe('b.qwo — initClient startup gate', () => {
     })
     await createCli(b.deps).clean_restart()
     expect(b.initClientCalls).toEqual([DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS])
-    const initIdx = b.events.indexOf('initClient')
-    const firstPause = b.events.findIndex((e) => e.startsWith('pause:'))
-    expect(initIdx).toBeGreaterThanOrEqual(0)
-    expect(firstPause).toBeGreaterThan(initIdx)
+    // b.jg5 SRJ-901: init, get, read-pane, the stop spawn, then the teardown's status and pause, then start.
+    expect(b.events.filter((e) => e !== 'loadConfig' && e !== 'initLogging' && e !== 'sleep')).toEqual([
+      'initClient',
+      `${PRECHECK_CALL_GET}:${opsId()}`,
+      `${PRECHECK_CALL_READ_PANE}:${opsId()}`,
+      'spawnSync:stop',
+      `status:${opsId()}`,
+      `pause:${opsId()}`,
+      `status:${opsId()}`,
+      'spawnSync:start',
+    ])
+    assertNoLeak({ stderr, events: b.events })
   })
 
-  test('clean_restart exits 1 (no start) when initClient throws', async () => {
+  test('clean_restart exits 1 when initClient throws: the initialization-failed line, then "nothing was stopped"; no precheck call, no stop spawn, no teardown, no start', async () => {
     const b = makeDeps({
       initClient: async () => { throw new Error('startup gate failed') },
       directorStatus: async () => ({ state: 'waiting' }),
     })
     await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
-    expect(b.exitCodes).toContain(1)
-    expect(startedServer(b)).toBe(false)
-    expect(b.statusCalls).toEqual([])
+    expect(b.exitCodes).toEqual([1])
+    expect(b.spawnCalls).toEqual([]) // neither the stop nor the start spawn
+    expect(b.directorCallTimes).toEqual([])
+    expect(stderr).toHaveLength(2)
+    expect(stderr[0]!.startsWith('[slack] clean_restart: agent-director initialization failed:')).toBe(true)
+    expect(stderr[1]).toBe(precheckNothingStoppedLine(CLI_COMMAND_CLEAN_RESTART))
+    assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
   })
 
   // b.jg5 SRJ-213: an unreadable configuration still builds the client, with
@@ -1938,19 +2156,402 @@ describe('b.qwo — initClient startup gate', () => {
     expect(b.initClientCalls).toEqual([DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS])
     expect(b.events.filter((e) => e === 'loadConfig' || e === 'initClient')).toEqual(['loadConfig', 'initClient'])
     expect(stderr.filter((l) => l.startsWith('[slack] stop --stop-bots: could not load config — skipping bot teardown:'))).toHaveLength(1)
-    expect([...b.statusCalls, ...b.pauseCalls, ...b.killCalls]).toEqual([])
+    expect(b.directorCallTimes).toEqual([]) // no get, read-pane, status, pause or kill
     expect(b.exitCodes).toEqual([0])
     assertNoLeak({ stderr, exitCodes: b.exitCodes })
   })
 
-  test('stop --stop-bots exits 1 when initClient throws', async () => {
-    const b = makeStopDeps({
+  test('stop --stop-bots exits 1 when initClient throws: the initialization-failed line, then "nothing was stopped"; no server signal, no precheck call, no teardown', async () => {
+    const b = makeLiveStopDeps({
       initClient: async () => { throw new Error('startup gate failed') },
       directorStatus: async () => ({ state: 'waiting' }),
     })
     await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
-    expect(b.exitCodes).toContain(1)
-    expect(b.statusCalls).toEqual([])
+    expect(b.exitCodes).toEqual([1])
+    expect(b.serverSignals).toEqual([])
+    expect(b.directorCallTimes).toEqual([])
+    expect(stderr).toHaveLength(2)
+    expect(stderr[0]!.startsWith('[slack] stop --stop-bots: agent-director initialization failed:')).toBe(true)
+    expect(stderr[1]).toBe(precheckNothingStoppedLine(CLI_COMMAND_STOP_BOTS))
+    assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The precheck (b.jg5 SRJ-901; SRJ-117's CLI-precheck column; AC 74)
+//
+// Before either command stops anything, it reads each persona of the
+// configuration the server runs: one `get` of `cscb_<key>` and, for a live
+// row, one one-line `read-pane`. A failed precheck stops nothing (no server
+// signal, no `stop` spawn, no teardown call, no start), prints one line per
+// failing persona and then "nothing was stopped", and exits 1. The verdict
+// over each answer (its class and description) is tests/cli-teardown.test.ts's;
+// here each failure line is the builder's over that verdict. Every wait runs on
+// the bundle's fake clock.
+// ---------------------------------------------------------------------------
+
+describe('precheck before anything is stopped (b.jg5 SRJ-901, AC 74)', () => {
+  type Persona = { readonly name: string; readonly key: string }
+  const OPS: Persona = { name: OPS_NAME, key: personaKey(OPS_NAME) }
+  const ALPHA_P: Persona = { name: ALPHA.name, key: personaKey(ALPHA.name) }
+  const BETA_P: Persona = { name: BETA.name, key: personaKey(BETA.name) }
+  const idOf = (p: Persona): string => personaInstanceId(p.key)
+  const twoPersonas = (): PersonaConfig => makeMultiPersonaConfig([ALPHA, BETA], root)
+
+  /** A row state CSCB does not know: live (SRJ-901 step 2, hatch A3). */
+  const UNKNOWN_STATE = 'a_state_cscb_does_not_know'
+
+  const settled = (p: Promise<void>): Promise<void> => p.catch((e) => { if (!(e instanceof ExitError)) throw e })
+
+  /** A command: its name, its bundle (a live server for `stop --stop-bots`) and its run. */
+  type Command = readonly [command: CliTeardownCommand, make: (o?: Overrides) => Bundle, run: (b: Bundle) => Promise<void>]
+  const COMMANDS: readonly Command[] = [
+    [CLI_COMMAND_STOP_BOTS, makeLiveStopDeps, (b) => settled(createCli(b.deps).stop({ stopBots: true }))],
+    [CLI_COMMAND_CLEAN_RESTART, makeDeps, (b) => settled(createCli(b.deps).clean_restart())],
+  ]
+
+  /** Each row of `rows` for each command: `[command, label, spec, Command]`. */
+  function forEachCommand<S>(rows: ReadonlyArray<readonly [string, S]>): Array<readonly [CliTeardownCommand, string, S, Command]> {
+    return COMMANDS.flatMap((cmd) => rows.map(([label, spec]) => [cmd[0], label, spec, cmd] as const))
+  }
+
+  /** The failure the precheck reports for `error` thrown by `call` (the verdict is tests/cli-teardown.test.ts's). */
+  function failureOf(call: PrecheckCall, error: unknown): PrecheckFailure {
+    const verdict = precheckVerdictOf({ call, error })
+    if (!('errorClass' in verdict)) throw new Error(`precondition: ${call} verdict ${verdict.kind} carries no failure`)
+    return verdict
+  }
+
+  /** Nothing was stopped: no server signal, no `stop` or `start` spawn, no `status`, `pause` or `kill`; exit 1. */
+  function expectNothingStopped(b: Bundle): void {
+    expect(b.exitCodes).toEqual([1])
+    expect(b.serverSignals).toEqual([])
+    expect(b.spawnCalls).toEqual([])
+    expect([b.statusCalls, b.pauseCalls, b.killCalls]).toEqual([[], [], []])
+  }
+
+  /**
+   * The precheck failed for `failures` ([persona, call, thrown value, class
+   * shown], in configuration order): nothing stopped, and exactly one line per
+   * failing persona from the builder, then the closing line, each printed once.
+   */
+  function expectPrecheckFailed(
+    b: Bundle,
+    command: CliTeardownCommand,
+    failures: ReadonlyArray<readonly [Persona, PrecheckCall, unknown, AdErrorClass]>,
+  ): void {
+    expectNothingStopped(b)
+    const lines = failures.map(([persona, call, error, shown]) => {
+      const failure = failureOf(call, error)
+      expect(failure.errorClass).toBe(shown)
+      const line = precheckFailureLine(command, persona, failure)
+      if (shown === AD_ERROR_CLASS_CONFIG) expect(line).toContain(AD_CONFIG_FILE_DISPLAY_NAME)
+      return line
+    })
+    expect(stderr).toEqual([...lines, precheckNothingStoppedLine(command)])
+  }
+
+  /** The precheck passed and the command went on: the server stopped, the teardown read each row; clean_restart started the server. */
+  function expectWentOn(b: Bundle, command: CliTeardownCommand): void {
+    if (command === CLI_COMMAND_STOP_BOTS) {
+      expect(b.serverSignals).toEqual(['SIGTERM'])
+      expect(b.exitCodes).toEqual([0])
+    } else {
+      expect(b.spawnCalls.map((c) => c.args.at(-1))).toEqual(['stop', 'start'])
+      expect(b.exitCodes).toEqual([])
+    }
+    expect(b.statusCalls.length).toBeGreaterThan(0)
+    expect(stderr.filter((l) => l.startsWith(`${command}: `))).toEqual([])
+  }
+
+  const nOf = <T>(n: number, value: T): T[] => Array.from({ length: n }, () => value)
+  const opsPaneReads = (n: number): Array<[string, number]> => nOf(n, [idOf(OPS), PROBE_PANE_READ_LINES])
+
+  // -------------------------------------------------------------------------
+  // Step 2: which rows get a read-pane
+  // -------------------------------------------------------------------------
+
+  test.each(forEachCommand<string>([...AGENT_DIRECTOR_LIVE_STATES, UNKNOWN_STATE].map((s) => [s, s] as const)))(
+    '%s: a %s row is live: one get, then one read-pane of the one-line count; a pane passes and the command goes on',
+    async (command, _label, state, [, make, run]) => {
+      const b = make({ directorGet: async () => ({ state }) })
+      await run(b)
+      expect(b.getCalls).toEqual([idOf(OPS)])
+      expect(b.readPaneCalls).toEqual(opsPaneReads(1))
+      expectWentOn(b, command)
+      assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
+    },
+  )
+
+  test.each(forEachCommand<() => Promise<PrecheckRow | null>>([
+    ...[...AGENT_DIRECTOR_DEAD_STATES].map((state) => [`a finished row (${state})`, async () => ({ state })] as const),
+    ['no row (null)', async () => null],
+    ['no row (ErrSpawnNotFound thrown at the get)', async () => { throw errSpawnNotFound() }],
+  ]))('%s: %s is skipped: one get, no read-pane, and the command goes on (AC 74: skips finished rows)', async (command, _label, answer, [, make, run]) => {
+    const b = make({ directorGet: answer })
+    await run(b)
+    expect(b.getCalls).toEqual([idOf(OPS)])
+    expect(b.readPaneCalls).toEqual([])
+    expectWentOn(b, command)
+    assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
+  })
+
+  // SRJ-901 step 5 and SRJ-114: a note alone fails nothing; the read-pane decides. SRJ-513 latches only in the server.
+  test.each(forEachCommand<PrecheckRow>([
+    [`a live row carrying the ${provenanceNote} note`, { state: 'waiting', liveness_note: provenanceNote }],
+    ['a pending row with no launch start', { state: AGENT_DIRECTOR_PENDING_STATE }],
+  ]))('%s: %s gets its one-line read-pane and passes on a pane (AC 74)', async (command, _label, row, [, make, run]) => {
+    const b = make({ directorGet: async () => row })
+    await run(b)
+    expect(b.readPaneCalls).toEqual(opsPaneReads(1))
+    expectWentOn(b, command)
+    assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
+  })
+
+  // -------------------------------------------------------------------------
+  // SRJ-117's CLI-precheck column, one case per cell, at read-pane and at get
+  // -------------------------------------------------------------------------
+
+  const PASSES = 'passes'
+  const RETRIED = 'is tried PRECHECK_TRIES times, then fails'
+  const FAILS = 'fails with no retry'
+  const FAILS_AT_ONCE = 'fails after one call (CONFIG)'
+  type Cell = { readonly make: () => unknown; readonly outcome: string; readonly shown: AdErrorClass | null }
+  const cell = (make: () => unknown, outcome: string, shown: AdErrorClass | null = null): Cell => ({ make, outcome, shown })
+
+  const READ_PANE_CELLS: ReadonlyArray<readonly [string, Cell]> = [
+    ['GONE (ErrTmuxCaptureFailed)', cell(() => errTmuxCaptureFailed(), PASSES)],
+    ['ErrSpawnNotFound (its GONE column)', cell(() => errSpawnNotFound(), PASSES)],
+    ...UNAVAILABLE_FORMS.map(([label, make]) => [`UNAVAILABLE (${label})`, cell(() => make(PRECHECK_CALL_READ_PANE), RETRIED, AD_ERROR_CLASS_UNAVAILABLE)] as const),
+    ...CONFLICT_CASES.map((c) => [`CONFLICT (${c})`, cell(() => errTmuxSessionConflict(PRECHECK_CALL_READ_PANE, c), FAILS, AD_ERROR_CLASS_CONFLICT)] as const),
+    ['ENVIRONMENT (ErrTmuxNotAvailable)', cell(() => errTmuxNotAvailable(STUB_TMUX_SOCKET_PATH, PRECHECK_CALL_READ_PANE), FAILS, AD_ERROR_CLASS_ENVIRONMENT)],
+    ['UNCLASSIFIED (a plain ErrInternal)', cell(() => errInternal(), FAILS, AD_ERROR_CLASS_UNCLASSIFIED)],
+    ['UNCLASSIFIED (ErrSchemaMismatch)', cell(() => errSchemaMismatch(), FAILS, AD_ERROR_CLASS_UNCLASSIFIED)],
+    ['UNCLASSIFIED (ErrSystemInstallDisappeared)', cell(() => errSystemInstallDisappeared(PRECHECK_CALL_READ_PANE), FAILS, AD_ERROR_CLASS_UNCLASSIFIED)],
+    ['UNCLASSIFIED (ErrSpawnNotInteractive, a STATE name other than ErrSpawnNotFound)', cell(() => errSpawnNotInteractive(PRECHECK_CALL_READ_PANE), FAILS, AD_ERROR_CLASS_UNCLASSIFIED)],
+    ...UNUSABLE_NAME_FAULTS.map((f) => [`UNUSABLE NAME (the unusable-name ErrInternal, ${f})`, cell(() => errUnusableName(f), FAILS, AD_ERROR_CLASS_UNUSABLE_NAME)] as const),
+    ['CONFIG (ErrConfigMalformed)', cell(() => errConfigMalformed(), FAILS_AT_ONCE, AD_ERROR_CLASS_CONFIG)],
+  ]
+
+  test.each(forEachCommand(READ_PANE_CELLS))('%s: a live row whose one-line read-pane answers %s', async (command, _label, c, [, make, run]) => {
+    const error = c.make()
+    const b = make({ directorReadPane: async () => { throw error } })
+    await run(b)
+    expect(b.getCalls).toEqual([idOf(OPS)])
+    expect(b.readPaneCalls).toEqual(opsPaneReads(c.outcome === RETRIED ? PRECHECK_TRIES : 1))
+    if (c.outcome === PASSES) expectWentOn(b, command)
+    else expectPrecheckFailed(b, command, [[OPS, PRECHECK_CALL_READ_PANE, error, c.shown!]])
+    assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
+  })
+
+  // A get's UNAVAILABLE is retried and its CONFIG fails at once; every other class fails with no retry and no
+  // read-pane, a class SRJ-117 gives a get no meaning for reported as UNCLASSIFIED.
+  const GET_CELLS: ReadonlyArray<readonly [string, Cell]> = [
+    ...UNAVAILABLE_FORMS.map(([label, make]) => [`UNAVAILABLE (${label})`, cell(() => make(PRECHECK_CALL_GET), RETRIED, AD_ERROR_CLASS_UNAVAILABLE)] as const),
+    ['CONFIG (ErrConfigMalformed)', cell(() => errConfigMalformed(), FAILS_AT_ONCE, AD_ERROR_CLASS_CONFIG)],
+    ...UNUSABLE_NAME_FAULTS.map((f) => [`UNUSABLE NAME (the unusable-name ErrInternal, ${f})`, cell(() => errUnusableName(f), FAILS, AD_ERROR_CLASS_UNUSABLE_NAME)] as const),
+    ['CONFLICT (ErrTmuxSessionConflict)', cell(() => errTmuxSessionConflict(PRECHECK_CALL_GET, 'unrecognised'), FAILS, AD_ERROR_CLASS_CONFLICT)],
+    ['ENVIRONMENT (ErrTmuxNotAvailable)', cell(() => errTmuxNotAvailable(undefined, PRECHECK_CALL_GET), FAILS, AD_ERROR_CLASS_ENVIRONMENT)],
+    ['UNCLASSIFIED (a plain ErrInternal)', cell(() => errInternal(), FAILS, AD_ERROR_CLASS_UNCLASSIFIED)],
+    ['GONE (ErrTmuxCaptureFailed)', cell(() => errTmuxCaptureFailed(undefined, PRECHECK_CALL_GET), FAILS, AD_ERROR_CLASS_UNCLASSIFIED)],
+    ['STATE (ErrSpawnNotInteractive)', cell(() => errSpawnNotInteractive(PRECHECK_CALL_GET), FAILS, AD_ERROR_CLASS_UNCLASSIFIED)],
+    ['LAUNCH FAILURE (ErrTmuxSessionCreate)', cell(() => errTmuxSessionCreate(PRECHECK_CALL_GET), FAILS, AD_ERROR_CLASS_UNCLASSIFIED)],
+    ['DIRECTORY (ErrCwdNotFound)', cell(() => errCwdNotFound(PRECHECK_CALL_GET), FAILS, AD_ERROR_CLASS_UNCLASSIFIED)],
+  ]
+
+  test.each(forEachCommand(GET_CELLS))('%s: a get answering %s, and no read-pane follows', async (command, _label, c, [, make, run]) => {
+    const error = c.make()
+    const b = make({ directorGet: async () => { throw error } })
+    await run(b)
+    expect(b.getCalls).toEqual(nOf(c.outcome === RETRIED ? PRECHECK_TRIES : 1, idOf(OPS)))
+    expect(b.readPaneCalls).toEqual([])
+    expectPrecheckFailed(b, command, [[OPS, PRECHECK_CALL_GET, error, c.shown!]])
+    assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
+  })
+
+  // -------------------------------------------------------------------------
+  // Step 3: tries on the injected clock
+  // -------------------------------------------------------------------------
+
+  test.each(forEachCommand<PrecheckCall>([
+    ['get', PRECHECK_CALL_GET],
+    ['read-pane', PRECHECK_CALL_READ_PANE],
+  ]))('%s: a %s answering UNAVAILABLE every time is called at t, t + gap and t + 2 gaps on the fake clock, never a fourth time; the persona is named and nothing is stopped (AC 74)', async (command, _label, call, [, make, run]) => {
+    const error = errTmuxUnresponsive(call)
+    const throwIt = async (): Promise<never> => { throw error }
+    const b = make(call === PRECHECK_CALL_GET ? { directorGet: throwIt } : { directorReadPane: throwIt })
+    await run(b)
+    const times = b.directorCallTimes.filter(([c]) => c.startsWith(`${call}:`)).map(([, at]) => at)
+    expect(times).toEqual(Array.from({ length: PRECHECK_TRIES }, (_, i) => i * PRECHECK_TRY_SPACING_MS))
+    expect(b.exitTimes).toEqual([(PRECHECK_TRIES - 1) * PRECHECK_TRY_SPACING_MS])
+    expectPrecheckFailed(b, command, [[OPS, call, error, AD_ERROR_CLASS_UNAVAILABLE]])
+    assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
+  })
+
+  test.each(forEachCommand<PrecheckCall>([
+    ['get', PRECHECK_CALL_GET],
+    ['read-pane', PRECHECK_CALL_READ_PANE],
+  ]))('%s: a %s answering UNAVAILABLE, UNAVAILABLE, then its answer passes; only that call is repeated, and the command stops the server and tears down', async (command, _label, call, [, make, run]) => {
+    let tries = 0
+    const flaky = <T>(answer: T) => async (): Promise<T> => {
+      if (++tries < PRECHECK_TRIES) throw errCallTimeout(call)
+      return answer
+    }
+    let reads = 0
+    const b = make({
+      ...(call === PRECHECK_CALL_GET ? { directorGet: flaky<PrecheckRow | null>(LIVE_ROW) } : { directorReadPane: flaky(FAKE_PANE) }),
+      directorStatus: async () => (++reads === 1 ? { state: 'waiting' } : { state: 'ended' }),
+    })
+    await run(b)
+    const calls = (c: PrecheckCall): number => b.directorCallTimes.filter(([e]) => e.startsWith(`${c}:`)).length
+    expect([calls(PRECHECK_CALL_GET), calls(PRECHECK_CALL_READ_PANE)]).toEqual(
+      call === PRECHECK_CALL_GET ? [PRECHECK_TRIES, 1] : [1, PRECHECK_TRIES],
+    )
+    expectWentOn(b, command)
+    expect(b.pauseCalls).toEqual([idOf(OPS)])
+    assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
+  })
+
+  // -------------------------------------------------------------------------
+  // A failed precheck over several personas
+  // -------------------------------------------------------------------------
+
+  test.each(COMMANDS)('%s: of two personas only Beta fails (CONFLICT at its read-pane): only Beta is named, and Alpha is not torn down either', async (command, make, run) => {
+    const error = errTmuxSessionConflict(PRECHECK_CALL_READ_PANE, 'not-this-launch', personaTmuxSessionName(BETA_P.key))
+    const b = make({
+      config: twoPersonas(),
+      directorReadPane: async (id) => { if (id === idOf(BETA_P)) throw error; return FAKE_PANE },
+      directorStatus: async () => ({ state: 'waiting' }),
+    })
+    await run(b)
+    expectOnePrecheckEach(b, [idOf(ALPHA_P), idOf(BETA_P)])
+    expectPrecheckFailed(b, command, [[BETA_P, PRECHECK_CALL_READ_PANE, error, AD_ERROR_CLASS_CONFLICT]])
+    assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
+  })
+
+  test.each(COMMANDS)('%s: both personas fail: one line each in configuration order (Alpha, whose tries end last, first), then one closing line', async (command, make, run) => {
+    const alphaError = errTmuxUnresponsive(PRECHECK_CALL_READ_PANE)
+    const betaError = errUnusableName()
+    const b = make({
+      config: twoPersonas(),
+      directorGet: async (id) => { if (id === idOf(BETA_P)) throw betaError; return LIVE_ROW },
+      directorReadPane: async () => { throw alphaError },
+    })
+    await run(b)
+    expectPrecheckFailed(b, command, [
+      [ALPHA_P, PRECHECK_CALL_READ_PANE, alphaError, AD_ERROR_CLASS_UNAVAILABLE],
+      [BETA_P, PRECHECK_CALL_GET, betaError, AD_ERROR_CLASS_UNUSABLE_NAME],
+    ])
+    assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
+  })
+
+  test.each(COMMANDS)('%s: CONFIG at Alpha\'s get fails only Alpha, at once, and Beta is still checked: Alpha gets one get and no read-pane, Beta its get and its one-line read-pane (CONFLICT); two lines in configuration order, Alpha\'s naming the agent-director config file, then one closing line', async (command, make, run) => {
+    const alphaError = errConfigMalformed()
+    const betaError = errTmuxSessionConflict(PRECHECK_CALL_READ_PANE, 'not-this-launch', personaTmuxSessionName(BETA_P.key))
+    const b = make({
+      config: twoPersonas(),
+      directorGet: async (id) => { if (id === idOf(ALPHA_P)) throw alphaError; return LIVE_ROW },
+      directorReadPane: async (id) => { if (id === idOf(BETA_P)) throw betaError; return FAKE_PANE },
+    })
+    await run(b)
+    expect([...b.getCalls].sort()).toEqual([idOf(ALPHA_P), idOf(BETA_P)].sort())
+    expect(b.readPaneCalls).toEqual([[idOf(BETA_P), PROBE_PANE_READ_LINES]])
+    expectPrecheckFailed(b, command, [
+      [ALPHA_P, PRECHECK_CALL_GET, alphaError, AD_ERROR_CLASS_CONFIG],
+      [BETA_P, PRECHECK_CALL_READ_PANE, betaError, AD_ERROR_CLASS_CONFLICT],
+    ])
+    expect(stderr[0]).toContain(AD_CONFIG_FILE_DISPLAY_NAME)
+    assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
+  })
+
+  // -------------------------------------------------------------------------
+  // Where the lines go, redaction and no side effects
+  // -------------------------------------------------------------------------
+
+  /** An initLogging that sends console.error to `log`, as the real one sends it to clean_restart.log. */
+  const redirectTo = (log: string[]) => (): void => {
+    console.error = (...args: unknown[]) => { log.push(formatLine(args)) }
+  }
+
+  test.each(COMMANDS)('%s: the precheck lines are printed only: once each on the terminal, for clean_restart also once each in clean_restart.log, and no file is written (no server.log, no startup-errors.log)', async (command, make, run) => {
+    const log: string[] = []
+    const error = errTmuxSessionConflict(PRECHECK_CALL_READ_PANE, 'leftover', personaTmuxSessionName(OPS.key))
+    const b = make({ directorReadPane: async () => { throw error }, initLogging: redirectTo(log) })
+    const before = snapshotTree()
+    await run(b)
+    const lines = [precheckFailureLine(command, OPS, failureOf(PRECHECK_CALL_READ_PANE, error)), precheckNothingStoppedLine(command)]
+    expect(stderr).toEqual(lines)
+    if (command === CLI_COMMAND_CLEAN_RESTART) {
+      for (const line of lines) expect(log.filter((l) => l === line)).toHaveLength(1)
+    } else {
+      expect(log).toEqual([])
+    }
+    expect(snapshotTree()).toEqual(before)
+    assertNoLeak({ stderr, log })
+  })
+
+  test.each(COMMANDS)('%s: a CONFLICT and an UNCLASSIFIED description carrying fake tokens render redacted; nothing printed leaks', async (command, make, run) => {
+    const conflict = errGeneric(PRECHECK_CALL_READ_PANE, ERR_TMUX_SESSION_CONFLICT_NAME, `session refused (${sentinelInMessage('conflict')})`)
+    const unclassified = errGeneric(PRECHECK_CALL_READ_PANE, 'ErrNoHandlingInCscb', `refused (${sentinelInMessage('unclassified', APP_TOKEN_PREFIX)})`)
+    const b = make({
+      config: twoPersonas(),
+      directorReadPane: async (id) => { throw id === idOf(ALPHA_P) ? conflict : unclassified },
+    })
+    await run(b)
+    expectPrecheckFailed(b, command, [
+      [ALPHA_P, PRECHECK_CALL_READ_PANE, conflict, AD_ERROR_CLASS_CONFLICT],
+      [BETA_P, PRECHECK_CALL_READ_PANE, unclassified, AD_ERROR_CLASS_UNCLASSIFIED],
+    ])
+    expect(stderr.slice(0, 2).every((l) => l.includes(REDACTED_SENTINEL_TAIL))).toBe(true)
+    assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
+  })
+
+  // SRJ-114, SRJ-115, SRJ-801: the precheck latches nothing, writes no record and never clears a retired-key entry.
+  test.each(forEachCommand<Overrides>([
+    [`a live row carrying the ${provenanceNote} note (passes)`, { directorGet: async () => ({ state: 'waiting', liveness_note: provenanceNote }) }],
+    ['a pending row with no launch start (passes)', { directorGet: async () => ({ state: AGENT_DIRECTOR_PENDING_STATE }) }],
+    ['a CONFLICT at the read-pane (fails)', { directorReadPane: async () => { throw errTmuxSessionConflict(PRECHECK_CALL_READ_PANE, 'conflicting-labels') } }],
+    ['an UNUSABLE NAME at the get (fails)', { directorGet: async () => { throw errUnusableName('control-character') } }],
+  ]))('%s: after %s the state directory is unchanged and the seeded retired-key record byte-identical', async (_command, _label, o, [, make, run]) => {
+    writeRetiredKeysRecord(stateDir, { [OPS.key]: { cause: RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY, mark: true } })
+    const b = make(o)
+    const before = snapshotTree() // after make, so the PID file is in it
+    await run(b)
+    expect(b.getCalls).toEqual([idOf(OPS)])
+    expect(snapshotTree()).toEqual(before)
+    assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
+  })
+
+  test('src/cli.ts imports nothing from the session manager, the conflict latch or the retired-key record module, and its precheck reads no clock but the injected one (static)', () => {
+    const code = stripComments(readFileSync(CLI_SOURCE, 'utf-8'))
+    const banned = ['./session-manager.ts', './conflict-latch.ts', './retired-keys.ts']
+    expect(importedSpecifiers(code).filter((s) => banned.includes(s))).toEqual([])
+    for (const name of ['runPrecheck', 'precheckPersona', 'precheckTries', 'precheckStopBots']) {
+      const at = indicesOf(new RegExp(`\\bfunction\\s+${name}\\s*\\(`, 'g'), code)
+      expect([name, at.length]).toEqual([name, 1])
+      const body = code.slice(...balancedAfter(code, at[0]!, '{', '}'))
+      expect([name, /\bDate\.now\b|\bsetTimeout\b|\bsetInterval\b/.test(body)]).toEqual([name, false])
+    }
+    const tries = code.slice(...balancedAfter(code, indicesOf(/\bfunction\s+precheckTries\s*\(/g, code)[0]!, '{', '}'))
+    expect(tries).toMatch(/\bdeps\.sleep\(\s*PRECHECK_TRY_SPACING_MS\s*\)/)
+  })
+
+  // SRJ-613 (E19 note): a pane passes the precheck but proves nothing; the teardown's own calls are the backstop.
+  test.each(COMMANDS)('%s: after a precheck whose read-pane answered a pane, the server is stopped and the teardown still makes its own status, pause and kill; a kill answering CONFLICT "not this launch\'s session" fails the teardown (exit 1) and latches nothing', async (command, make, run) => {
+    const b = make({
+      config: opsConfig({ exit_timeout: 0 }),
+      directorStatus: async () => ({ state: 'waiting' }),
+      directorKill: async () => { throw errTmuxSessionConflict('kill', 'not-this-launch', personaTmuxSessionName(OPS.key)) },
+    })
+    const before = snapshotTree()
+    await run(b)
+    expect(b.readPaneCalls).toEqual(opsPaneReads(1))
+    expect([b.statusCalls, b.pauseCalls, b.killCalls]).toEqual([[idOf(OPS)], [idOf(OPS)], [idOf(OPS)]])
+    if (command === CLI_COMMAND_STOP_BOTS) expect(b.serverSignals).toEqual(['SIGTERM'])
+    else expect(b.spawnCalls.map((c) => c.args.at(-1))).toEqual(['stop'])
+    expect(b.exitCodes).toEqual([1])
+    expect(snapshotTree()).toEqual(before)
+    assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls })
   })
 })
 
@@ -1980,18 +2581,21 @@ describe('stop --stop-bots failure lines (AC 20)', () => {
   test('a startup gate failure (StartupGateFailedError) prints the gate\'s class label and message on the initialization-failed line; exit 1, no director verb', async () => {
     const detail = buildBelowPhase1FloorMessage({ foundVersion: OLD_AD_VERSION, binaryPath: join(root, 'bin', 'agent-director') })
     const gateError = new StartupGateFailedError(AD_BELOW_PHASE1_FLOOR, detail, REFUSAL_KIND_BELOW_PHASE1_FLOOR)
-    const b = makeStopDeps({
+    const b = makeLiveStopDeps({
       initClient: async () => { throw gateError },
       directorStatus: async () => ({ state: 'waiting' }),
     })
 
     await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
 
-    expect(stderr.filter((l) => l.includes('initialization failed'))).toEqual([
+    // b.jg5 SRJ-901, SRJ-902: any initClient failure but the too-old refusal is a precheck failure that stops nothing.
+    expect(stderr).toEqual([
       `[slack] stop --stop-bots: agent-director initialization failed: agent-director startup gate failed (${AD_BELOW_PHASE1_FLOOR}): ${detail}`,
+      precheckNothingStoppedLine(CLI_COMMAND_STOP_BOTS),
     ])
     expect(b.exitCodes).toEqual([1])
-    expect(b.statusCalls).toEqual([])
+    expect(b.serverSignals).toEqual([])
+    expect(b.directorCallTimes).toEqual([])
     assertNoLeak({ consoleErrorArgs: errorSpy.mock.calls, stderr })
   })
 
@@ -2074,7 +2678,7 @@ describe('stop --stop-bots failure lines (AC 20)', () => {
     ],
     ['a rejected string', () => `down (${sentinelInMessage('str')})`, `string message="down (${REDACTED_SENTINEL_TAIL})"`],
   ])('initClient throwing %s carrying fake tokens → the initialization-failed line names it by description, its message redacted; exit 1; nothing logged leaks', async (_label, makeErr, shown) => {
-    const b = makeStopDeps({
+    const b = makeLiveStopDeps({
       initClient: async () => { throw makeErr() },
       directorStatus: async () => ({ state: 'waiting' }),
     })
@@ -2082,8 +2686,10 @@ describe('stop --stop-bots failure lines (AC 20)', () => {
     await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
 
     expect(linesWith('initialization failed')).toEqual([`[slack] stop --stop-bots: agent-director initialization failed: ${shown}`])
+    expect(stderr.at(-1)).toBe(precheckNothingStoppedLine(CLI_COMMAND_STOP_BOTS))
     expect(b.exitCodes).toEqual([1])
-    expect(b.statusCalls).toEqual([])
+    expect(b.serverSignals).toEqual([])
+    expect(b.directorCallTimes).toEqual([])
     assertNoLeak({ consoleErrorArgs: errorSpy.mock.calls, stderr })
   })
 })
@@ -2334,14 +2940,23 @@ describe('no CLI command writes the retired-key record (b.jg5 SRJ-801)', () => {
    * applied-config loader, and whose agent-director verbs are the stub
    * client's through createDirectorOps; its `status` reports every row live.
    */
-  function actingDeps(o: Overrides): { b: Bundle; statusCalls: unknown[] } {
+  function actingDeps(o: Overrides): { b: Bundle; statusCalls: unknown[]; getCalls: unknown[]; readPaneCalls: unknown[] } {
     writeConfigFile(stateDir, makePersonaConfigInput({ personas: [makePersona({ name: OPS_NAME }, root)], stop_timeout: 0, exit_timeout: 0 }, root))
     writeFileSync(recordPath(), readFileSync(configPath))
     const statusCalls: NonNullable<StubClientOptions['statusCalls']> = []
-    const client = makeStubClient({ statusResult: cannedStatusResult({ state: 'waiting' }), statusCalls })
+    const getCalls: NonNullable<StubClientOptions['getCalls']> = []
+    const readPaneCalls: NonNullable<StubClientOptions['readPaneCalls']> = []
+    // The precheck's get reads the marked key's row live (b.jg5 SRJ-114: the CLI applies no clear).
+    const client = makeStubClient({
+      statusResult: cannedStatusResult({ state: 'waiting' }),
+      statusCalls,
+      getResult: cannedGetResult({ claude_instance_id: opsId(), state: 'waiting' }),
+      getCalls,
+      readPaneCalls,
+    })
     const ops = createDirectorOps(() => client as unknown as DirectorClient)
     const b = makeDeps({ loadConfig: appliedLoader, ...ops, ...o })
-    return { b, statusCalls }
+    return { b, statusCalls, getCalls, readPaneCalls }
   }
 
   /** A server up at the first liveness check and gone after. */
@@ -2363,16 +2978,20 @@ describe('no CLI command writes the retired-key record (b.jg5 SRJ-801)', () => {
     [label, 'with no record none is created', overrides, run, readsRows, false] as const,
   ]))('%s: %s', async (_label, _outcome, overrides, run, readsRows, seeded) => {
     const before = seeded ? seedRecord() : null
-    const { b, statusCalls } = actingDeps(overrides())
+    const { b, statusCalls, getCalls, readPaneCalls } = actingDeps(overrides())
 
     await run(b).catch((err) => { if (!(err instanceof ExitError)) throw err })
 
     // The command acted: the daemon spawned, the server signalled, the rows
-    // read and torn down, or the script run.
+    // prechecked, read and torn down, or the script run.
     expect(b.daemonSpawns.length + b.serverSignals.length + b.credentialsRuns.length + b.spawnCalls.length).toBeGreaterThan(0)
     if (readsRows) {
+      expect(getCalls).toEqual([{ claude_instance_id: opsId() }])
+      expect(readPaneCalls).toEqual([{ claude_instance_id: opsId(), n_lines: PROBE_PANE_READ_LINES }])
       expect(statusCalls.length).toBeGreaterThan(0)
       expect(b.killCalls).toEqual([opsId()])
+    } else {
+      expect([getCalls, readPaneCalls, statusCalls]).toEqual([[], [], []])
     }
     const path = retiredKeysPath(stateDir)
     if (before === null) expect(existsSync(path)).toBe(false)

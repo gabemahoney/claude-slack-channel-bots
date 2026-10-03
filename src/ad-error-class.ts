@@ -514,6 +514,25 @@ export function describeAgentDirectorFailure(err: unknown): string {
 }
 
 /**
+ * Token-safe description of a failed agent-director call that names what
+ * agent-director reported (b.jg5 SRJ-104): for a value {@link classifyAdError}
+ * gives a reported name or message (an UNCLASSIFIED, UNUSABLE NAME or CONFIG
+ * error), `<reported name>[ message="<message>"]` in
+ * {@link describeAgentDirectorFailure}'s form, so an `ErrUnknownErrorName`
+ * shows its `unknownName` and the envelope's `err_description` rather than
+ * the client's own text; for any other value,
+ * {@link describeAgentDirectorFailure}'s description. Never throws.
+ */
+export function describeReportedAdFailure(err: unknown): string {
+  const { reportedName, message } = classifyAdError(err)
+  if (reportedName === undefined && message === undefined) return describeAgentDirectorFailure(err)
+  const parts: string[] = []
+  if (reportedName !== undefined) parts.push(reportedName)
+  if (message !== undefined) parts.push(`message=${JSON.stringify(message)}`)
+  return parts.join(' ')
+}
+
+/**
  * The UNCLASSIFIED classification of `value`, for a site that takes a value
  * of another class as UNCLASSIFIED because it gives that class no meaning
  * (b.jg5 SRJ-104, SRJ-110: at a kill, a STATE name other than
