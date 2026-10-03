@@ -332,6 +332,7 @@ import {
   type RecoveryHarnessOptions,
   type RecoverySequenceRequest,
 } from './test-helpers/recovery-harness.ts'
+import { PRE_PERSONA_ID, PRE_PERSONA_LABELS, PRE_PERSONA_SESSION } from './test-helpers/old-life.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -1744,8 +1745,9 @@ describe('the stop signal: a result that arrives after the sequence was stopped 
 // b.jg5 SRJ-702: a kill retry the sequence's own stop ended raises its alert
 // with that stop's cause (`liveRowStopCauseText`), the fifth argument of the
 // alert dependency; tries the keep-going check ended with no stop of the
-// sequence's own (P latched meanwhile) raise it with no cause, so the
-// binding tells the cause itself (tests/session-manager.test.ts).
+// sequence's own because P latched meanwhile raise it with the latch's cause
+// (`liveRowStopCauseText(LIVE_ROW_STOP_LATCHED)`), the keep-going check's
+// other stop.
 describe('the stop\'s cause of a kill retry the sequence\'s stop ended (b.jg5 SRJ-702)', () => {
   test('each stop reason\'s cause (pin)', () => {
     expect(([LIVE_ROW_STOP_TEARDOWN, LIVE_ROW_STOP_SHUTDOWN, LIVE_ROW_STOP_NOT_UP, LIVE_ROW_STOP_LATCHED] as const).map((reason) => liveRowStopCauseText(reason))).toEqual([
@@ -1792,7 +1794,7 @@ describe('the stop\'s cause of a kill retry the sequence\'s stop ended (b.jg5 SR
     expect(raises[0]!.slice(2)).toEqual([KILL_FAILURE_CONTEXT_RECOVERY, `persona=${p}`, liveRowStopCauseText(reason)])
   })
 
-  test('tries the keep-going check ended because P latched, with no stop of the sequence\'s own: one alert raise with no stop\'s cause (four arguments); the sequence ends stopped as latched', async () => {
+  test('tries the keep-going check ended because P latched, with no stop of the sequence\'s own: one alert raise naming the latch as the stop\'s cause; the sequence ends stopped as latched', async () => {
     const { h, p } = build()
     const stop = createLiveRowSequenceStop()
     const raises: unknown[][] = []
@@ -1811,8 +1813,7 @@ describe('the stop\'s cause of a kill retry the sequence\'s stop ended (b.jg5 SR
     expect(stop.reason).toBeUndefined()
     expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED })
     expect(raises).toHaveLength(1)
-    expect(raises[0]!).toHaveLength(4)
-    expect(raises[0]!.slice(2)).toEqual([KILL_FAILURE_CONTEXT_RECOVERY, `persona=${p}`])
+    expect(raises[0]!.slice(2)).toEqual([KILL_FAILURE_CONTEXT_RECOVERY, `persona=${p}`, liveRowStopCauseText(LIVE_ROW_STOP_LATCHED)])
   })
 })
 
@@ -2584,7 +2585,7 @@ describe('the no-launch form as an old-life wait: step 5\'s ordinary text for an
       h.remove(q)
       return { id: personaInstanceId(q), oldKey: q, session: personaTmuxSessionName(q), labels: { service: 'cscb', persona: q } }
     }],
-    ['a pre-persona row\'s id (no persona label)', () => ({ id: 'cscb_old_C0OLD', oldKey: 'cscb_old_C0OLD', session: 'slack_bot_old_C0OLD', labels: { service: 'cscb', channel: 'C0OLD' } })],
+    ['a pre-persona row\'s id (no persona label)', () => ({ id: PRE_PERSONA_ID, oldKey: PRE_PERSONA_ID, session: PRE_PERSONA_SESSION, labels: { ...PRE_PERSONA_LABELS } })],
   ])('%s: still live after runs that judged it, one persona-kill-failed entry and one log line, the context old-life wait, the id and the row\'s session in the text; nothing to Slack', async (_label, form) => {
     const { h, p, q } = build()
     const old = form(h, p, q)

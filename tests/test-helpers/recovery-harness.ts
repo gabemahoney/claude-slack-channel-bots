@@ -440,7 +440,10 @@
  *   `decideSessionAdmission` call as `handleInitialized` makes it, over the
  *   applied personas, the real up predicate (`createPersonaUpPredicate` over
  *   the same serving connection, bring-up outcome and live applied set as the
- *   relaunch gate), its line to `console.error` (`errors`) and the session
+ *   relaunch gate), the not-up description `handleInitialized` passes
+ *   (`describePersonaNotUp` of the persona's bring-up state, a persona
+ *   `setUp(key, false)` set down being `retrying`), its line to
+ *   `console.error` (`errors`) and the session
  *   manager's held-directory query (`oldLifeHeldDirectory`) over the one hold
  *   set; it answers the admission (`held`, `admitted`, `not-up`,
  *   `unmatched`) and registers nothing.
@@ -799,6 +802,7 @@
  * destination post as `episodeNotices` holds it), `killFailureRecoveryEntry`
  * (the not-configured route's entry, context `recovery` unless given), with
  * `startupEntriesOf` (one class's entries without their timestamp),
+ * `startupEntries` (every entry as its class and text, in order),
  * `killFailureLines` (the alerts' own lines) and the alerts' line builders
  * (context `recovery`; `killFailurePostedLine` takes another):
  * `killFailureEndedLine`, `killFailurePostedLine`,
@@ -915,6 +919,7 @@ import { PERSONA_KEY_RE, personaInstanceId, personaSpawnEnv, personaTmuxSessionN
 import { createPersonaRouting, type PersonaRouting } from '../../src/persona-routing.ts'
 import { createPersonaSerializer, type PersonaSerializer } from '../../src/persona-serializer.ts'
 import { createPersonaRelaunchGate, createPersonaUpPredicate, type PersonaUpQuery } from '../../src/persona-start.ts'
+import { describePersonaNotUp } from '../../src/persona-bringup-controller.ts'
 import type { PersonaDestinationHold } from '../../src/persona-destination-hold.ts'
 import { createNameResolver, type NameResolverWebClient } from '../../src/message-archive.ts'
 import { KILL_RETRY_ALERT_ORDINARY, KILL_RETRY_TRIES, type KillRetryAlert, type KillRetryClock } from '../../src/kill-retry.ts'
@@ -2788,6 +2793,10 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     admitSession: (rootsPath) =>
       decideSessionAdmission(rootsPath, appliedConfig().personas, {
         isPersonaUp: createPersonaUpPredicate({ status: () => SERVING }, upQuery),
+        // As handleInitialized's `describePersonaNotUpByKey`: the persona's
+        // bring-up state rendered by `describePersonaNotUp`; the harness's
+        // bring-up outcome is `setUp`'s, a persona set down `retrying`.
+        describeNotUp: (key) => describePersonaNotUp({ outcome: down.has(key) ? 'retrying' : 'up', causes: {} }),
         log: (line) => console.error(line),
         heldDirectory: oldLifeHeldDirectory,
       }),
@@ -3626,6 +3635,15 @@ export function startupEntriesOf(h: RecoveryHarness, classLabel: string): string
   return h.startupErrors().flatMap((line) => {
     const at = line.indexOf(marker)
     return at === -1 ? [] : [line.slice(at + marker.length)]
+  })
+}
+
+/** Every startup-errors entry the harness wrote, each as its class and its text (no timestamp), in order; a line that is no entry throws. */
+export function startupEntries(h: RecoveryHarness): Array<readonly [string, string]> {
+  return h.startupErrors().map((line) => {
+    const match = /^\[[^\]]+\] \[([^\]]+)\] (.*)$/.exec(line)
+    if (match === null) throw new Error(`recovery harness: not a startup-errors entry: ${line}`)
+    return [match[1]!, match[2]!] as const
   })
 }
 

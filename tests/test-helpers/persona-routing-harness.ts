@@ -106,25 +106,21 @@
  *     old-life hold whose old key's kill failed: the session manager's
  *     `waitsOnKillFailedHold` (false while no hold set and wait bindings are
  *     installed; `waitOnKillFailedHold(h, key)` installs both with a hold of
- *     P's own row marked kill-failed, the shared table's arrangement), or the
- *     key in `h.oldLifeKillFailed` (seeded by `oldLifeKillFailed`), the
- *     settable old-life input;
+ *     P's own row marked kill-failed, the shared table's arrangement);
  *   - a live-row sequence or old-life wait step running (`restarting`): as
  *     `main()` binds it (b.jg5 SRJ-706, SRJ-811), the session manager's
  *     `isSequenceOrOldLifeWaitRunning` for the key, read at call time (false
  *     while no sequence registry, hold set and wait bindings are installed,
  *     as here unless a case installs them), or the key in
  *     `h.sequenceOrWaitRunning` (seeded by the option of the same name, with
- *     persona names), a case's own arrangement, or in `h.waitStepRunning`
- *     (seeded by `waitStepRunning`), the settable wait-step input;
+ *     persona names), a case's own arrangement;
  *   - in flight for P (the read gate's `isWorkInFlight`): as `main()`
  *     composes "in flight for P" (`isPersonaWorkInFlight`) from "blocks a
  *     retry" (`isPersonaRetryBlocked`) and a running dialog approver: one of
  *     the harness's own restart launches in flight (`h.isLaunchInFlight`),
  *     the session manager's `personaRetryBlockCause` naming a cause for the
  *     key (a launch call, a live-row sequence, b.jg5 SRJ-706, or an old-life
- *     wait step P waits on, SRJ-811), the key in `h.waitStepRunning` (the
- *     wait-step input), the key in `h.workInFlight` (seeded by
+ *     wait step P waits on, SRJ-811), the key in `h.workInFlight` (seeded by
  *     `workInFlight`, with persona names), other work in flight that is not a
  *     launch, or the session manager's `isDialogApproverRunning` answering
  *     true for the key (b.jg5 SRJ-401). With no approver, sequence or wait
@@ -709,12 +705,8 @@ export interface RoutingHarnessOptions {
   heldOnInvalidFlags?: readonly string[]
   /** Names whose kill failed first (`h.killFailed`, `kill-failed`). */
   killFailed?: readonly string[]
-  /** Names that wait on an old-life hold whose old key's kill failed first (`h.oldLifeKillFailed`, `kill-failed`). */
-  oldLifeKillFailed?: readonly string[]
   /** Names with a live-row sequence or old-life wait step running first (`h.sequenceOrWaitRunning`, `restarting`). */
   sequenceOrWaitRunning?: readonly string[]
-  /** Names with an old-life wait step running for a hold they wait on first (`h.waitStepRunning`: `restarting`, in flight). */
-  waitStepRunning?: readonly string[]
   /**
    * Names with work in flight that is not a launch first (`h.workInFlight`),
    * read by the routing's in-flight gate beside the harness's own launches
@@ -777,15 +769,8 @@ export interface RoutingHarness {
   invalidFlagsHold: InvalidFlagsHold
   /** Keys whose kill failed (`kill-failed`), read at call time. */
   killFailed: Set<string>
-  /** Keys that wait on an old-life hold whose old key's kill failed (`kill-failed`, b.jg5 SRJ-812), read at call time. */
-  oldLifeKillFailed: Set<string>
   /** Keys with a live-row sequence or old-life wait step running (`restarting`), read at call time. */
   sequenceOrWaitRunning: Set<string>
-  /**
-   * Keys with an old-life wait step running for a hold they wait on (b.jg5
-   * SRJ-811): `restarting` and "in flight for P", read at call time.
-   */
-  waitStepRunning: Set<string>
   /** Keys with work in flight that is not a launch, read by the in-flight gate at call time. */
   workInFlight: Set<string>
   /** Each persona's scripted row read, by key, read at call time (with the `rowRead` option). */
@@ -1005,9 +990,7 @@ export function makeRoutingHarness(
     outageNotices: [],
     invalidFlagsHold,
     killFailed: keySet(opts.killFailed),
-    oldLifeKillFailed: keySet(opts.oldLifeKillFailed),
     sequenceOrWaitRunning: keySet(opts.sequenceOrWaitRunning),
-    waitStepRunning: keySet(opts.waitStepRunning),
     workInFlight: keySet(opts.workInFlight),
     rowReadScripts: new Map(Object.entries(opts.rowRead ?? {}).map(([name, v]) => [byName(name).persona.key, toRowReadScript(v)])),
     rowReads: [],
@@ -1115,24 +1098,21 @@ export function makeRoutingHarness(
     // kill-failure episode is open (a case's own arrangement, `h.killFailed`;
     // production binds the kill-failure alerts' episode) or P waits on an
     // old-life hold whose old key's kill failed (the session manager's
-    // `waitsOnKillFailedHold`, as main() binds it, or the settable old-life
-    // input `h.oldLifeKillFailed`), read at call time.
-    isKillFailed: (key) => h.killFailed.has(key) || h.oldLifeKillFailed.has(key) || waitsOnKillFailedHold(key),
+    // `waitsOnKillFailedHold`, as main() binds it), read at call time.
+    isKillFailed: (key) => h.killFailed.has(key) || waitsOnKillFailedHold(key),
     // As main() binds it (b.jg5 SRJ-706, SRJ-811, SRJ-1011): the session
     // manager's `isSequenceOrOldLifeWaitRunning` (P's live-row sequence, or an
     // old-life wait step for a hold P waits on), read at call time, or a
-    // case's own arrangement: `h.sequenceOrWaitRunning`, or the settable
-    // wait-step input `h.waitStepRunning`.
-    isSequenceOrWaitRunning: (key) => h.sequenceOrWaitRunning.has(key) || h.waitStepRunning.has(key) || isSequenceOrOldLifeWaitRunning(key),
+    // case's own arrangement, `h.sequenceOrWaitRunning`.
+    isSequenceOrWaitRunning: (key) => h.sequenceOrWaitRunning.has(key) || isSequenceOrOldLifeWaitRunning(key),
     // As main() composes "in flight for P": "blocks a retry" (the session
     // manager's `personaRetryBlockCause`: a launch call, a running live-row
     // sequence or an old-life wait step P waits on; the harness's own restart
-    // launches; the wait-step input; the non-launch work a case marks), or a
+    // launches; the non-launch work a case marks), or a
     // running dialog approver (b.jg5 SRJ-401).
     isWorkInFlight: (key) =>
       h.isLaunchInFlight(key) ||
       personaRetryBlockCause(key) !== undefined ||
-      h.waitStepRunning.has(key) ||
       h.workInFlight.has(key) ||
       isDialogApproverRunning(key),
     readRowLiveness,

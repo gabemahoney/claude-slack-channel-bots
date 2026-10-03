@@ -804,9 +804,10 @@ export interface LiveRowSequenceDeps {
   latchOnKillOutcome(key: string, outcome: KillOutcome, lastRead: LiveRowSequenceLastRead, ref: string): Promise<boolean>
   /**
    * Raise a kill retry's alert decision with the request's context. For tries
-   * the sequence's own stop ended, `stopCause` names that stop
-   * (`liveRowStopCauseText`; b.jg5 SRJ-702: the stop's cause); absent, the
-   * binding tells the cause itself.
+   * the sequence's own stop ended, `stopCause` names that stop, and for tries
+   * P's latch ended (the keep-going check, or a between-try read that
+   * latched P), the latch (`liveRowStopCauseText`; b.jg5 SRJ-702: the stop's
+   * cause); absent, the binding tells the cause itself.
    */
   raiseKillAlert(key: string, retried: KillRetryResult, context: KillFailureAlertContext, ref: string, stopCause?: string): void
   /** Raise step 5's alert: the ordinary version with no description, with the request's context. */
@@ -1279,11 +1280,13 @@ export async function runLiveRowSequence(
       return halted()
     }
     if (killRetryStopped(retried)) {
-      // SRJ-702: the stop's cause, when the sequence's own stop ended the tries.
-      raiseKillAlert(retried, stop.reason === undefined ? undefined : liveRowStopCauseText(stop.reason))
-      if (stop.reason !== undefined) return { kind: LIVE_ROW_OUTCOME_STOPPED, reason: stop.reason }
       // SRJ-513, SRJ-502: a between-try read that latched the row's persona ends as a latch.
-      const latched = retried.end === KILL_RETRY_END_READ_LATCHED || latchedNow()
+      const latched = stop.reason === undefined && (retried.end === KILL_RETRY_END_READ_LATCHED || latchedNow())
+      // SRJ-702: the stop's cause, when the sequence's own stop or P's latch
+      // (the keep-going check's other stop) ended the tries.
+      const stoppedBy = stop.reason ?? (latched ? LIVE_ROW_STOP_LATCHED : undefined)
+      raiseKillAlert(retried, stoppedBy === undefined ? undefined : liveRowStopCauseText(stoppedBy))
+      if (stop.reason !== undefined) return { kind: LIVE_ROW_OUTCOME_STOPPED, reason: stop.reason }
       return { kind: LIVE_ROW_OUTCOME_STOPPED, reason: latched ? LIVE_ROW_STOP_LATCHED : LIVE_ROW_STOP_NOT_UP }
     }
     if (outcome.kind !== KILL_OUTCOME_NOT_KILLED) return halted()

@@ -1085,6 +1085,19 @@ export function oldLifeHoldEndedLine(hold: OldLifeHold, reason: OldLifeHoldEndRe
 }
 
 /**
+ * The line a hold's end logs when one of its end observers threw (SRJ-809);
+ * the other observers still run. `failure` is what it threw, rendered
+ * (`describeThrownValue`):
+ *
+ *   [slack] old-life hold: an end observer failed for instanceId="<id>": <failure> (b.jg5 SRJ-809)
+ *
+ * Pure.
+ */
+export function oldLifeHoldEndObserverFailedLine(instanceId: string, failure: string): string {
+  return `${OLD_LIFE_HOLD_LOG_PREFIX} an end observer failed for instanceId=${holdQuoted(instanceId)}: ${failure} (b.jg5 SRJ-809)`
+}
+
+/**
  * Build one server's old-life hold set (SRJ-809): in memory, empty, with no
  * timer, no file read or write and no agent-director call; nothing is shared
  * between two sets. Directories are compared by `deps.realPath` (default
@@ -1164,7 +1177,7 @@ export function createOldLifeHoldSet(deps: OldLifeHoldSetDeps): OldLifeHoldSet {
       try {
         observer(view, reason)
       } catch (err) {
-        log(`${OLD_LIFE_HOLD_LOG_PREFIX} an end observer failed for instanceId=${holdQuoted(instanceId)}: ${describeThrownValue(err)} (b.jg5 SRJ-809)`)
+        log(oldLifeHoldEndObserverFailedLine(instanceId, describeThrownValue(err)))
       }
     }
     return view

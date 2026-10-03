@@ -180,7 +180,6 @@ import {
   type PersonaTeardownKillResult,
 } from '../src/session-manager.ts'
 import { LIVE_ROW_OUTCOME_STOPPED, LIVE_ROW_STOP_HOLD_ENDED, LIVE_ROW_STOP_TEARDOWN } from '../src/live-row-sequence.ts'
-import { OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL } from '../src/retired-keys.ts'
 import { UNAVAILABLE_RETRY_ROW_ABSENT } from '../src/unavailable-retry.ts'
 import {
   callCounts,
@@ -194,6 +193,7 @@ import {
   survivorAlertContent,
   type RecoveryHarness,
 } from './test-helpers/recovery-harness.ts'
+import { PRE_PERSONA_ID, holdOldAt } from './test-helpers/old-life.ts'
 import { conflictForPersona } from './test-helpers/conflict-cases.ts'
 import {
   KILL_RETRY_ALERT_NONE,
@@ -2041,9 +2041,9 @@ describe('persona teardown end to end over the recovery harness (b.jg5 SRJ-715):
       }
     })
     const [p, q] = h.keys as [string, string]
-    const oldId = 'cscb_old_C0OLD'
+    const oldId = PRE_PERSONA_ID
     const held = personaOf(h, p).working_directory
-    h.beginOldLifeHold({ instanceId: oldId, oldKey: oldId, directory: held, cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL })
+    holdOldAt(h, oldId, oldId, p)
     h.script({ getResult: cannedGetResult({ claude_instance_id: oldId, cwd: held }) })
     rowReadsUntilSpawn(h, UNAVAILABLE_RETRY_ROW_ABSENT)
     const hold = holdFindMissing(h.stub.client)

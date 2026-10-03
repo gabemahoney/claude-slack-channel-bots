@@ -515,9 +515,11 @@ import {
   UNAVAILABLE_RETRY_RUN_NOW_RAN,
   UNAVAILABLE_RETRY_RUN_NOW_RUNNING,
   sequenceWaitingAgainReason,
+  unavailableRetryRunNowLine,
 } from '../src/unavailable-retry.ts'
 import { OLD_LIFE_ROW_READ_STATE, SEQUENCE_WAITING_CAUSE_OLD_LIFE_HOLD, noteOldLifeRowRead, spawnForPersona } from '../src/session-manager.ts'
 import { rowReadsUntilSpawn } from './test-helpers/recovery-harness.ts'
+import { PRE_PERSONA_ID, holdOldAt } from './test-helpers/old-life.ts'
 
 const KEY = 'alpha'
 const OTHER = 'beta'
@@ -8485,11 +8487,11 @@ describe('unavailable retry: a retired key\'s retries launch by the reuse, never
 // ---------------------------------------------------------------------------
 
 /** A pre-persona row's instance id, held in Q's working directory. */
-const WAIT_ROW_ID = 'cscb_old_C0OLD'
+const WAIT_ROW_ID = PRE_PERSONA_ID
 
 /** Hold the pre-persona row in `q`'s working directory, start its wait and resolve once its first run is held; answers the outcome and the hold. */
 async function waitHeldForQ(h: RecoveryHarness, q: string): Promise<{ readonly outcome: Promise<unknown>; readonly hold: FindMissingHold }> {
-  h.beginOldLifeHold({ instanceId: WAIT_ROW_ID, oldKey: WAIT_ROW_ID, directory: personaOf(h, q).working_directory, cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL })
+  holdOldAt(h, WAIT_ROW_ID, WAIT_ROW_ID, q)
   h.script({ getResult: cannedGetResult({ claude_instance_id: WAIT_ROW_ID, cwd: personaOf(h, q).working_directory }) })
   const hold = holdFindMissing(h.stub.client)
   const outcome = h.startOldLifeWait(WAIT_ROW_ID)
@@ -8578,7 +8580,7 @@ describe('unavailable retry: an old-life wait step for a hold Q waits on blocks 
   test('a timer armed with the old-life cause (a wait round that kept the hold) is never counted and never gives up: retry after retry refused while the next wait step runs, no failure counted, no stop', async () => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     const [q] = h.keys as [string]
-    h.beginOldLifeHold({ instanceId: WAIT_ROW_ID, oldKey: WAIT_ROW_ID, directory: personaOf(h, q).working_directory, cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL })
+    holdOldAt(h, WAIT_ROW_ID, WAIT_ROW_ID, q)
     h.script({ killError: errTmuxUnresponsive('kill'), getResult: cannedGetResult({ claude_instance_id: WAIT_ROW_ID, cwd: personaOf(h, q).working_directory }) })
     await h.runOldLifeWait(WAIT_ROW_ID)
     expect(h.triggers).toEqual([{ key: q, kind: UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD }])
@@ -8711,10 +8713,10 @@ describe('unavailable retry: the run-now entry (SRJ-810: an old-life hold that e
   const HELD_FOR_OLD_LIFE = { kind: UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD } as const
   const WHY = UNAVAILABLE_RETRY_RUN_NOW_HOLD_ENDED
 
-  test.each<[string, (c: UnavailableRetryController) => void, string]>([
-    ['full mode', (c) => c.arm(KEY, UNAVAILABLE), ''],
-    ['pending-only mode', (c) => c.armPendingOnly(KEY), ` (${UNAVAILABLE_RETRY_MODE_PENDING_ONLY})`],
-  ])('a timer waiting for its due time (%s): its pending retry runs at once, in its mode, its wait count carried on; one line; a refusal re-arms at the next wait of the one sequence', async (_label, arm, ran) => {
+  test.each<[string, (c: UnavailableRetryController) => void, boolean]>([
+    ['full mode', (c) => c.arm(KEY, UNAVAILABLE), false],
+    ['pending-only mode', (c) => c.armPendingOnly(KEY), true],
+  ])('a timer waiting for its due time (%s): its pending retry runs at once, in its mode, its wait count carried on; one line; a refusal re-arms at the next wait of the one sequence', async (_label, arm, pendingOnly) => {
     const { clock, controller, lines, attempts } = makeRig()
     arm(controller)
     await clock.advance(waitMs(0))
@@ -8726,7 +8728,7 @@ describe('unavailable retry: the run-now entry (SRJ-810: an old-life hold that e
     await controller.whenRunSettled(KEY)
 
     expect(attempts.map((a) => [a.retry, a.at, a.mode])).toEqual([[1, waitMs(0), attempts[0]!.mode], [2, at, attempts[0]!.mode]])
-    expect(lines).toContain(`[slack] unavailable-retry: persona=${KEY} retrying now${ran} (${WHY}) — its pending retry is run at once, its wait count carried on`)
+    expect(lines).toContain(unavailableRetryRunNowLine(KEY, WHY, { result: UNAVAILABLE_RETRY_RUN_NOW_RAN, pendingOnly }))
     expect(controller.view(KEY)).toMatchObject({ phase: 'waiting', dueAt: at + waitMs(2), refusals: 2 })
     expect(delays(clock)).toEqual([waitMs(2)])
   })
@@ -8738,7 +8740,7 @@ describe('unavailable retry: the run-now entry (SRJ-810: an old-life hold that e
     await controller.whenRunSettled(KEY)
 
     expect(attempts).toEqual([{ key: KEY, retry: 1, causes: [UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD], mode: UNAVAILABLE_RETRY_MODE_FULL, at: 0 }])
-    expect(lines.filter((line) => line.includes(' retrying now '))).toEqual([`[slack] unavailable-retry: persona=${KEY} retrying now (${WHY}) — armed (${UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD}) and run at once`])
+    expect(lines.filter((line) => line.includes(' retrying now '))).toEqual([unavailableRetryRunNowLine(KEY, WHY, { result: UNAVAILABLE_RETRY_RUN_NOW_ARMED, description: UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD })])
     expect(controller.view(KEY)).toMatchObject({ phase: 'waiting', dueAt: clock.now() + waitMs(1), refusals: 1 })
   })
 
@@ -8747,7 +8749,7 @@ describe('unavailable retry: the run-now entry (SRJ-810: an old-life hold that e
 
     expect(controller.runNow(KEY, HELD_FOR_OLD_LIFE, WHY)).toBe(UNAVAILABLE_RETRY_RUN_NOW_RUNNING)
     expect(attempts).toHaveLength(1)
-    expect(lines.at(-1)).toBe(`[slack] unavailable-retry: persona=${KEY} not retried now (${WHY}) — its retry is running; that run's answer re-arms it`)
+    expect(lines.at(-1)).toBe(unavailableRetryRunNowLine(KEY, WHY, { result: UNAVAILABLE_RETRY_RUN_NOW_RUNNING }))
 
     held.answer({ kind: 'again' })
     await controller.whenRunSettled(KEY)
@@ -8766,6 +8768,6 @@ describe('unavailable retry: the run-now entry (SRJ-810: an old-life hold that e
 
     expect(attempts).toEqual([])
     expect([controller.isArmed(KEY), controller.isArmed(OTHER), clock.pendingCount()]).toEqual([false, false, 0])
-    expect(lines.filter((line) => line.includes(' not retried now '))).toEqual([KEY, OTHER].map((key) => `[slack] unavailable-retry: persona=${key} not retried now (${WHY}) — ${UNAVAILABLE_RETRY_STOP_SHUTDOWN}`))
+    expect(lines.filter((line) => line.includes(' not retried now '))).toEqual([KEY, OTHER].map((key) => unavailableRetryRunNowLine(key, WHY, { result: UNAVAILABLE_RETRY_RUN_NOW_CLOSED, closedReason: UNAVAILABLE_RETRY_STOP_SHUTDOWN })))
   })
 })

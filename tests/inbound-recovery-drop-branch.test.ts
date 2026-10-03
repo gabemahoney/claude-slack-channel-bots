@@ -187,7 +187,8 @@ import {
 } from './test-helpers/slack-stub.ts'
 import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
 import { indicesOf, stripComments } from './test-helpers/source-audit.ts'
-import { CONFLICT_CASE_ROWS, conflictForPersona } from './test-helpers/conflict-cases.ts'
+import { CONFLICT_CASE_ROWS, LAUNCH_START_ABSENT_PERSONA_KEY, conflictForPersona } from './test-helpers/conflict-cases.ts'
+import { absentRow } from './test-helpers/old-life.ts'
 import {
   cannedErr,
   cannedFindMissing,
@@ -255,8 +256,7 @@ import { holdThroughReuse, personaCallCounts, personaRow, reuseSpawnOf, unavaila
 import { retiredEntryClearedLine, retiredKeyLinesIn } from './test-helpers/recovery-harness.ts'
 import { readRetiredKeysRecord, retiredKeysRecordOf, type RetiredKeySeed } from './test-helpers/retired-keys.ts'
 import { OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1, RETIRED_KEY_CAUSE_REMOVED } from '../src/retired-keys.ts'
-import type { Phase1ListRow } from '../src/ad-phase1-types.ts'
-import { cannedKillResult, cannedListRow, errInvalidFlags, provenanceNote, type CannedGetResult } from './test-helpers/agent-director-stub.ts'
+import { cannedKillResult, errInvalidFlags, provenanceNote, type CannedGetResult } from './test-helpers/agent-director-stub.ts'
 import {
   OLD_LIFE_ROW_READ_STATE,
   killPersonaInstanceForTeardown,
@@ -2488,16 +2488,8 @@ describe('b.kvq (7) server.ts holds no copy of the lost-message branch', () => {
 // the wait posts nothing.
 // ===========================================================================
 
-/** An absent persona's key (no persona of the harness has it). */
-const ABSENT_KEY = 'absent_persona'
-
 /** A hold Q waits on, begun one way; answers the held instance id. */
 type QHold = (h: RecoveryHarness, q: string, b: string) => Promise<string>
-
-/** A live row of an absent persona in Q's working directory, as the start sweep's `list` gives it. */
-function absentRowIn(h: RecoveryHarness, q: string): Phase1ListRow {
-  return cannedListRow({ claude_instance_id: personaInstanceId(ABSENT_KEY), cwd: personaOf(h, q).working_directory, labels: { service: 'cscb', persona: ABSENT_KEY } })
-}
 
 const Q_HOLDS: ReadonlyArray<readonly [string, QHold]> = [
   ['begun at apply step 1 (B removed, its own cscb_<B> held at Q\'s directory)', async (h, q, b) => {
@@ -2505,8 +2497,9 @@ const Q_HOLDS: ReadonlyArray<readonly [string, QHold]> = [
     h.beginOldLifeHold({ instanceId: personaInstanceId(b), oldKey: b, directory: personaOf(h, q).working_directory, cause: OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1 })
     return personaInstanceId(b)
   }],
-  ['begun from the start sweep\'s list (an absent persona\'s live row in Q\'s directory, its sweep kill succeeding)', async (h, q) => {
-    const row = absentRowIn(h, q)
+  // Q is the harness's first persona, whose directory `absentRow` puts the row in.
+  ['begun from the start sweep\'s list (an absent persona\'s live row in Q\'s directory, its sweep kill succeeding)', async (h) => {
+    const row = absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY)
     h.script({ listResult: { spawns: [row] } })
     await h.startSweep()
     return row.claude_instance_id

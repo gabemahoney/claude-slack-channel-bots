@@ -7531,7 +7531,9 @@ describe('b.jg5 SRJ-706, SRJ-303: the restart path makes no attempt while P\'s l
 // Over the file's deps, with the optional old-life hook
 // (`RestartDeps.isHeldForOldLife`; production binds the session manager's
 // hold step, which records P as waiting, starts the hold's wait and arms P's
-// timer) answering for P. Right after the sequence gate, a held P answers
+// timer) answering for P. After the sequence gate and the shutdown and
+// not-up checks (a server shutting down or a P not up never reaches the
+// hook; SRJ-305), a held P answers
 // `RESTART_OUTCOME_SEQUENCE_WAITING` for a fired restart timer (a scheduled
 // restart, a human-triggered restart request: the lost-message trigger's
 // restart is one) and for the retry entry: nothing is probed, reconnected,
@@ -7712,10 +7714,31 @@ describe('b.jg5 SRJ-810, SRJ-812: the restart path makes no attempt while an old
     expect([deps.isSessionAliveCalls, deps.killSessionCalls, deps.launchSessionCalls]).toEqual([[], [], []])
   })
 
+  // b.jg5 SRJ-305, SRJ-810: the hook is asked only after the shutdown and
+  // not-up checks, so a server shutting down or a persona not up never
+  // reaches it (its hold step would arm a timer that must stay stopped).
+  test.each<[string, (deps: ReturnType<typeof makeDeps>) => void, RestartRetryOutcome]>([
+    ['the server shutting down', (deps) => { deps.isShuttingDown = () => true }, RESTART_OUTCOME_SHUTTING_DOWN],
+    ['P not up', (deps) => { deps.canRestart = (key) => key !== P }, RESTART_OUTCOME_NOT_UP],
+  ])('%s with P held: the hook is not asked and the work answers its own outcome, with no old-life line and no call', async (_label, arrange, outcome) => {
+    recordFailure(P)
+    const deps = heldDeps(() => true)
+    arrange(deps)
+    initRestart(deps)
+
+    expect(await runRestartRetry(P, CWD[P]!, () => false)).toBe(outcome)
+
+    expect(asked).toEqual([])
+    expect(heldLines()).toEqual([])
+    expect([deps.isSessionAliveCalls, deps.killSessionCalls, deps.launchSessionCalls, deps.armRetryTimerCalls]).toEqual([[], [], [], []])
+    expect(getFailureCount(P)).toBe(1)
+  })
+
   test('a hook that throws counts as held (fail safe): sequence-waiting, its one line naming what it threw, redacted', async () => {
     recordFailure(P)
+    const thrown = Object.assign(new Error(`hold step broke (${sentinelInMessage('hold')})`), { note: LEAK_SENTINEL })
     const deps = heldDeps((key) => {
-      if (key === P) throw Object.assign(new Error(`hold step broke (${sentinelInMessage('hold')})`), { note: LEAK_SENTINEL })
+      if (key === P) throw thrown
       return false
     })
     initRestart(deps)
@@ -7723,8 +7746,7 @@ describe('b.jg5 SRJ-810, SRJ-812: the restart path makes no attempt while an old
     expect(await runRestartRetry(P, CWD[P]!, () => false)).toBe(RESTART_OUTCOME_SEQUENCE_WAITING)
 
     const lines = heldLines()
-    expect(lines).toHaveLength(1)
-    expect(lines[0]).toStartWith(`[slack] Skipping restart for persona=${P} — its working directory is held for an old life that may still be running (the old-life hook failed: `)
+    expect(lines).toEqual([restartOldLifeHeldLine(P, undefined, describeThrownValue(thrown))])
     expect(lines[0]).toContain(`Error message="hold step broke (${REDACTED_SENTINEL_TAIL})"`)
     expect([deps.isSessionAliveCalls, deps.killSessionCalls, deps.launchSessionCalls]).toEqual([[], [], []])
     expect(getFailureCount(P)).toBe(1)

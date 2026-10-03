@@ -709,6 +709,7 @@ import {
   personaRetryBlockCause,
   killPersonaInstanceForTeardown,
   launchSession,
+  oldLifeHoldStep,
   personaConfigDirLabelValue,
   setConfigDirUnresolvableHook,
   setConfiguredPersonaQuery,
@@ -2669,7 +2670,14 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
      * persona and one the relaunch gate refuses stop the timer with the
      * production reason; work that blocks a retry (`personaRetryBlockCause`:
      * a launch in flight, a live-row sequence, an old-life wait step for a
-     * hold the persona waits on) is a refusal naming it, with no call. Else
+     * hold the persona waits on) is a refusal naming it, with no call. Then
+     * the restart path's old-life hook, bound as `main()` binds
+     * `RestartDeps.isHeldForOldLife` (`oldLifeHoldStep(persona,
+     * 'runRestartWork')`, asked after the shutdown and not-up checks; b.jg5
+     * SRJ-810, SRJ-812): a held persona is recorded as waiting, the hold's
+     * wait started and its timer armed by the step, and the retry is a
+     * refusal naming what blocks it (`sequenceWaitingAgainReason`) with no
+     * call and no launch record. Else
      * the launch, in the persona's serializer turn, recorded as a `launch`
      * record via `unavailable-retry` with its `action`: a launch that brought
      * the persona up stops the timer (`UNAVAILABLE_RETRY_STOP_RECOVERED`), a
@@ -2687,6 +2695,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       if (!relaunchGate(key)) return stop(UNAVAILABLE_RETRY_STOP_NOT_UP)
       const blocked = personaRetryBlockCause(key)
       if (blocked !== undefined) return { kind: 'again', reason: retryBlockAgainReason(blocked) }
+      if (oldLifeHoldStep(persona, 'runRestartWork')) return { kind: 'again', reason: sequenceWaitingAgainReason(personaRetryBlockCause(key)) }
       const entry = await serializer!.run(key, () => launch(persona, 'unavailable-retry'))
       const action = entry.action
       if (action !== undefined && RETRY_LAUNCH_UP_ACTIONS.has(action)) return stop(UNAVAILABLE_RETRY_STOP_RECOVERED)

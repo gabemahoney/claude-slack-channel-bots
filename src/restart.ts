@@ -109,8 +109,10 @@
  * ladder started the sequence, or met it, and answered `sequence-waiting`)
  * answers `RESTART_OUTCOME_SEQUENCE_WAITING` too, so a retry's re-armed line
  * names the sequence.
- * Right after the sequence gate comes the old-life gate (b.jg5 SRJ-810,
- * SRJ-812, SRJ-302; the optional `RestartDeps.isHeldForOldLife`): while an
+ * After the sequence gate, and after the shutdown and not-up checks, so a
+ * persona not up or a server shutting down never reaches it, comes the
+ * old-life gate (b.jg5 SRJ-810, SRJ-812, SRJ-302, SRJ-305; the optional
+ * `RestartDeps.isHeldForOldLife`): while an
  * old life that may still be running holds P's working directory (a hold on
  * P's own row excepted), the hook records P as waiting, starts the hold's
  * wait and arms P's retry timer, and a fired restart timer, the retry entry
@@ -545,8 +547,9 @@ export interface RestartDeps {
    * waiting on each hold on its working directory other than one on its own
    * row, starts each hold's wait when it is not running, arms its retry
    * timer with the held-for-an-old-life cause) and answers whether it is
-   * held. Asked right after the live-row sequence gate of the serialized
-   * work, before the shutdown and not-up checks and the liveness read, by
+   * held. Asked after the live-row sequence gate and the shutdown and
+   * not-up checks of the serialized work, before the liveness read (SRJ-305:
+   * a persona not up, or a server shutting down, never reaches it), by
    * every path that reaches it (a fired restart timer, the retry entry, a
    * human-triggered restart, so the lost-message trigger's restart too):
    * while it answers true the work makes no agent-director call (no
@@ -1027,10 +1030,6 @@ async function runRestartWork(d: RestartDeps, key: string, cwd: string, sessionI
   // passes this gate with nothing armed (b.jg5 SRJ-1512; main()'s
   // `liveRowSequenceGate`), and the not-up gate below refuses it.
   if (skipIfSequenceRunning(d, key)) return RESTART_OUTCOME_SEQUENCE_WAITING
-  // b.jg5 SRJ-810, SRJ-812: while an old life may still run in P's working
-  // directory, the restart path attempts nothing for P: the hook records P
-  // as waiting, starts the hold's wait and arms P's retry timer.
-  if (skipIfHeldForOldLife(d, key)) return RESTART_OUTCOME_SEQUENCE_WAITING
   return runInAttempt(key, 'recovery', () => restartWorkSteps(d, key, cwd, sessionId))
 }
 
@@ -1046,6 +1045,15 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   // and its row alone: no liveness probe, reconnect, kill or launch, and
   // no success or failure recorded.
   if (skipIfNotUp(d, key)) return RESTART_OUTCOME_NOT_UP
+
+  // b.jg5 SRJ-810, SRJ-812: while an old life may still run in P's working
+  // directory, the restart path attempts nothing for P: the hook records P
+  // as waiting, starts the hold's wait and arms P's retry timer. Asked only
+  // after the shutdown and not-up checks, so a persona not up, or a server
+  // shutting down, never reaches the hook (SRJ-305: P's timer stays stopped
+  // while P is not up). The hook makes no agent-director call, and the
+  // wait it starts runs outside every attempt (the registry's no-launch form).
+  if (skipIfHeldForOldLife(d, key)) return RESTART_OUTCOME_SEQUENCE_WAITING
 
   const probe = await probeLiveness(d, key)
 

@@ -12415,12 +12415,13 @@ export interface OldLifeHoldEndRetryDeps {
  *     gate nor its retry's block cause still finds the wait running; it is
  *     then checked as below, with its own line
  *     (`oldLifeHoldEndSettledRetryLine`);
- *   - any other persona still in the applied configuration and not latched
- *     is retried at once (`deps.runNow`); a persona torn down or removed, or
- *     latched (b.jg5 SRJ-305: the latch stops its timer), is not.
+ *   - any other persona still in the applied configuration, not latched,
+ *     not held on `ErrInvalidFlags` and up is retried at once
+ *     (`deps.runNow`); a persona torn down or removed, latched, held or not
+ *     up (b.jg5 SRJ-305: each stops its timer) is not (`retryOldLifeWaiter`).
  * One line names them all:
  *
- *   [slack] old-life hold: ended for instanceId="<id>" — retrying its waiting personas at once: <keys|none>[; once the stopped wait on its own row has settled: <key>][; not retried: <key> (<not applied|latched>)[, …]] (b.jg5 SRJ-810)
+ *   [slack] old-life hold: ended for instanceId="<id>" — retrying its waiting personas at once: <keys|none>[; once the stopped wait on its own row has settled: <key>][; not retried: <key> (<not applied|latched|held on ErrInvalidFlags|not up|its retry failed: <error>>)[, …]] (b.jg5 SRJ-810)
  *
  * Makes no agent-director call itself; never throws.
  */
@@ -12449,12 +12450,33 @@ export function createOldLifeHoldEndRetry(deps: OldLifeHoldEndRetryDeps): OldLif
   }
 }
 
+/** Why a waiting persona was not retried at a hold's end: it is no longer in the applied configuration (b.jg5 SRJ-810). */
+export const OLD_LIFE_HOLD_END_NOT_RETRIED_NOT_APPLIED = 'not applied'
+
+/** Why a waiting persona was not retried at a hold's end: it is latched (b.jg5 SRJ-810, SRJ-305). */
+export const OLD_LIFE_HOLD_END_NOT_RETRIED_LATCHED = 'latched'
+
+/** Why a waiting persona was not retried at a hold's end: it is held on `ErrInvalidFlags` (b.jg5 SRJ-810, SRJ-305, SRJ-207). */
+export const OLD_LIFE_HOLD_END_NOT_RETRIED_HELD = 'held on ErrInvalidFlags'
+
+/** Why a waiting persona was not retried at a hold's end: it is not up, so its bring-up owns it (b.jg5 SRJ-810, SRJ-305). */
+export const OLD_LIFE_HOLD_END_NOT_RETRIED_NOT_UP = 'not up'
+
+/** The head of why a waiting persona was not retried at a hold's end when its retry threw; what it threw follows (b.jg5 SRJ-810). */
+export const OLD_LIFE_HOLD_END_RETRY_FAILED_PREFIX = 'its retry failed: '
+
+/** The tag that ends the end-retry observer's lines (`oldLifeHoldEndRetryLine`, `oldLifeHoldEndSettledRetryLine`). */
+export const OLD_LIFE_HOLD_END_RETRY_TAG = ' (b.jg5 SRJ-810)'
+
 /**
  * Retry persona `key`, waiting on a hold that ended, now (b.jg5 SRJ-810;
  * `createOldLifeHoldEndRetry`): when it is still in the applied
- * configuration and not latched, `deps.runNow(key)` and undefined; otherwise
- * why it was not retried (`not applied`, `latched`, or `its retry failed:
- * <error>`). Never throws.
+ * configuration, not latched, not held on `ErrInvalidFlags` and up,
+ * `deps.runNow(key)` and undefined; otherwise why it was not retried
+ * (`OLD_LIFE_HOLD_END_NOT_RETRIED_NOT_APPLIED`, `…_LATCHED`, `…_HELD`,
+ * `…_NOT_UP`, or `OLD_LIFE_HOLD_END_RETRY_FAILED_PREFIX` and what the retry
+ * threw). SRJ-305: the timer stays stopped while P is latched, held or not
+ * up. Never throws.
  */
 function retryOldLifeWaiter(deps: OldLifeHoldEndRetryDeps, key: string): string | undefined {
   let applied: boolean
@@ -12463,13 +12485,15 @@ function retryOldLifeWaiter(deps: OldLifeHoldEndRetryDeps, key: string): string 
   } catch {
     applied = false
   }
-  if (!applied) return 'not applied'
-  if (personaLatchedNow(key)) return 'latched'
+  if (!applied) return OLD_LIFE_HOLD_END_NOT_RETRIED_NOT_APPLIED
+  if (personaLatchedNow(key)) return OLD_LIFE_HOLD_END_NOT_RETRIED_LATCHED
+  if (heldGateReadingOf(key) !== undefined) return OLD_LIFE_HOLD_END_NOT_RETRIED_HELD
+  if (!personaUpNow(key)) return OLD_LIFE_HOLD_END_NOT_RETRIED_NOT_UP
   try {
     deps.runNow(key)
     return undefined
   } catch (err) {
-    return `its retry failed: ${describeThrownValue(err)}`
+    return `${OLD_LIFE_HOLD_END_RETRY_FAILED_PREFIX}${describeThrownValue(err)}`
   }
 }
 
@@ -12509,7 +12533,7 @@ function retryOldLifeWaiterOnceSettled(
  */
 export function oldLifeHoldEndSettledRetryLine(instanceId: string, key: string, notRetried: string | undefined): string {
   const what = notRetried === undefined ? 'retried at once' : `not retried (${notRetried})`
-  return `${OLD_LIFE_HOLD_LOG_PREFIX} the stopped wait on instanceId=${JSON.stringify(renderLogMessageText(instanceId))} has settled — persona=${key} ${what} (b.jg5 SRJ-810)`
+  return `${OLD_LIFE_HOLD_LOG_PREFIX} the stopped wait on instanceId=${JSON.stringify(renderLogMessageText(instanceId))} has settled — persona=${key} ${what}${OLD_LIFE_HOLD_END_RETRY_TAG}`
 }
 
 /**
@@ -12531,7 +12555,7 @@ export function oldLifeHoldEndRetryLine(
   const now = retried.length === 0 ? 'none' : retried.join(', ')
   const later = deferred.length === 0 ? '' : `; once the stopped wait on its own row has settled: ${deferred.join(', ')}`
   const not = skipped.length === 0 ? '' : `; not retried: ${skipped.join(', ')}`
-  return `${OLD_LIFE_HOLD_LOG_PREFIX} ended for instanceId=${JSON.stringify(renderLogMessageText(instanceId))} — retrying its waiting personas at once: ${now}${later}${not} (b.jg5 SRJ-810)`
+  return `${OLD_LIFE_HOLD_LOG_PREFIX} ended for instanceId=${JSON.stringify(renderLogMessageText(instanceId))} — retrying its waiting personas at once: ${now}${later}${not}${OLD_LIFE_HOLD_END_RETRY_TAG}`
 }
 
 /**
@@ -13518,11 +13542,27 @@ export const OLD_LIFE_WAIT_STOP_CAUSE_SHUTDOWN = 'its old-life wait was stopped:
 /** The stop cause a wait's kill names when the teardown of the last persona waiting on its hold stopped its tries (b.jg5 SRJ-702, SRJ-811). */
 export const OLD_LIFE_WAIT_STOP_CAUSE_TEARDOWN = 'its old-life wait was stopped: the last persona waiting on its hold was torn down'
 
-/** The stop cause of a wait's kill for the sequence's stop cause `given` (`liveRowStopCauseText`). */
+/**
+ * The stop cause a wait's kill names when the latch of the configured persona
+ * whose own row the wait is on stopped its tries (b.jg5 SRJ-702, SRJ-502,
+ * SRJ-811).
+ */
+export const OLD_LIFE_WAIT_STOP_CAUSE_LATCHED = 'its old-life wait was stopped: the persona whose own row it is latched'
+
+/** The stop cause a wait's kill names when the sequence names no stop cause it knows (b.jg5 SRJ-702, SRJ-811). */
+export const OLD_LIFE_WAIT_STOP_CAUSE_UNKNOWN = 'its old-life wait was stopped'
+
+/**
+ * The stop cause of a wait's kill for the sequence's stop cause `given`
+ * (`liveRowStopCauseText`): a shutdown, the last waiter's teardown or the
+ * own-row persona's latch; any other cause, or none, the neutral
+ * `OLD_LIFE_WAIT_STOP_CAUSE_UNKNOWN`. Pure.
+ */
 function oldLifeWaitStopCause(given: string | undefined): string {
   if (given === liveRowStopCauseText(LIVE_ROW_STOP_SHUTDOWN)) return OLD_LIFE_WAIT_STOP_CAUSE_SHUTDOWN
   if (given === liveRowStopCauseText(LIVE_ROW_STOP_TEARDOWN)) return OLD_LIFE_WAIT_STOP_CAUSE_TEARDOWN
-  return given ?? OLD_LIFE_WAIT_STOP_CAUSE_SHUTDOWN
+  if (given === liveRowStopCauseText(LIVE_ROW_STOP_LATCHED)) return OLD_LIFE_WAIT_STOP_CAUSE_LATCHED
+  return OLD_LIFE_WAIT_STOP_CAUSE_UNKNOWN
 }
 
 /**
@@ -13566,7 +13606,7 @@ const OLD_LIFE_WAIT_KILL_LOG_PREFIX = `[slack] ${OLD_LIFE_WAIT_SITE}`
  *     keep-going check is the sequence's stop and the latch query below, so
  *     a shutdown, the last waiter's teardown or the own-row persona's latch
  *     stops it, never a persona not up nor any other persona's latch (AC
- *     64); and its hold-end query ends the tries as a success when the hold
+ *     64), each stop naming its own cause (`oldLifeWaitStopCause`); and its hold-end query ends the tries as a success when the hold
  *     ends between tries or during a try whose UNAVAILABLE outcome would
  *     stand, or the sequence was stopped for the hold's end, even with a new
  *     hold begun on the id since (SRJ-702; option A);
@@ -13577,8 +13617,10 @@ const OLD_LIFE_WAIT_KILL_LOG_PREFIX = `[slack] ${OLD_LIFE_WAIT_SITE}`
  *     always on the not-configured, log-only route (a server-log line and a
  *     `persona-kill-failed` or `persona-kill-survivor` entry), naming the old
  *     row's instance id and session (`oldLifeWaitSession`); a kill whose
- *     tries a stop ended writes its one line and the old key's
- *     `persona-kill-failed` entry with no alert text;
+ *     tries a shutdown or the last waiter's teardown stopped writes its one
+ *     line and the old key's `persona-kill-failed` entry with no alert text,
+ *     and one whose tries the own-row persona's latch stopped writes the
+ *     line only;
  *   - the latch query (`isLatched`): for a configured persona's own row, that
  *     persona's latch, so no kill or call is made for its row while it is
  *     latched (SRJ-502, SRJ-408, SRJ-513; AC 46); for any other id, never;
@@ -13816,9 +13858,13 @@ async function readOldLifeKillRow(target: OldLifeWaitTarget, record: OldLifeWait
  * line quoting the latest survivor-naming description and the same
  * reference's `persona-kill-failed` entry with no alert text, whatever the decision (an
  * ordinary decision with no description when the tries decided none), with
- * the wait's stop cause. A survivor version after the hold's end is raised
- * as for any success. With no alerts installed, one line instead. Never
- * throws.
+ * the wait's stop cause (`oldLifeWaitStopCause`). A kill whose tries the
+ * latch of the configured persona whose own row the wait is on stopped is
+ * that persona's stop: the same line, with the latch's cause
+ * (`OLD_LIFE_WAIT_STOP_CAUSE_LATCHED`), and no entry (SRJ-702: a configured
+ * persona's stop writes the log line only). A survivor version after the
+ * hold's end is raised as for any success. With no alerts installed, one
+ * line instead. Never throws.
  */
 function raiseOldLifeWaitKillAlert(
   target: OldLifeWaitTarget,
@@ -13840,11 +13886,16 @@ function raiseOldLifeWaitKillAlert(
       return
     }
     const { outcome } = retried
+    const cause = stopsServer ? PERSONA_KILL_STOP_CAUSE_RECHECK : oldLifeWaitStopCause(stopCause)
+    // SRJ-702: a configured persona's stop writes the log line only: the
+    // latch of the configured persona whose own row the wait is on.
+    const lineOnly = cause === OLD_LIFE_WAIT_STOP_CAUSE_LATCHED && isConfiguredOwnRow(target)
     const stop = stopped
       ? {
           stopped: true,
           lastOutcomeClass: outcome.kind === KILL_OUTCOME_NOT_KILLED ? outcome.errorClass : outcome.kind,
-          stopCause: stopsServer ? PERSONA_KILL_STOP_CAUSE_RECHECK : oldLifeWaitStopCause(stopCause),
+          stopCause: cause,
+          ...(lineOnly ? { lineOnly: true } : {}),
         }
       : {}
     alerts.raise({
@@ -14007,7 +14058,8 @@ export function oldLifeWaitNotStartedLine(
  *     decided the ordinary alert unstopped, or at step 5;
  *   - each waiting persona's retry timer armed with
  *     `UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD`, uncounted, when the hold goes
- *     on; never the old key's (SRJ-1512), and never a latched persona's
+ *     on; never the old key's (SRJ-1512), and never a latched persona's, a
+ *     persona's held on `ErrInvalidFlags` or a persona's not up
  *     (`armOldLifeWaiter`; SRJ-305);
  * then one end line (`oldLifeWaitEndLine`). Nothing reaches Slack. Never throws.
  */
@@ -14054,11 +14106,17 @@ function handleOldLifeWaitEnd(
  * SRJ-1512, b.av2 SR-8.6: no retry timer for the old key), and neither is a
  * latched persona (`personaLatchedNow`; b.jg5 SRJ-305: the latch stops the
  * timer, whatever the case; SRJ-301: a sequence stopped by P's latch arms
- * nothing), so a wait's round that a configured persona's own-row latch
- * ended arms only the waiting personas that are not latched. One line each:
+ * nothing), a persona held on `ErrInvalidFlags` (`heldGateReadingOf`; a
+ * held query that throws counts as held) or a persona not up
+ * (`personaUpNow`; SRJ-305: the timer stays stopped while P is held or not
+ * up, its bring-up owning a persona not up), so a wait's round that a
+ * configured persona's own-row latch ended arms only the waiting personas
+ * that are not latched. One line each:
  *
  *   [slack] old-life-wait: persona=<key>: not in the applied configuration — no retry timer armed (b.jg5 SRJ-1512, b.av2 SR-8.6)
  *   [slack] old-life-wait: persona=<key>: latched — no retry timer armed (b.jg5 SRJ-305, SRJ-502)
+ *   [slack] old-life-wait: persona=<key>: held on ErrInvalidFlags — no retry timer armed (b.jg5 SRJ-305, SRJ-207)
+ *   [slack] old-life-wait: persona=<key>: not up — no retry timer armed; its bring-up owns it (b.jg5 SRJ-305)
  *
  * Answers whether it was armed. Never throws.
  */
@@ -14070,6 +14128,14 @@ function armOldLifeWaiter(key: string, bindings: OldLifeWaitBindings | undefined
   }
   if (personaLatchedNow(key)) {
     console.error(oldLifeWaitLatchedLine(key))
+    return false
+  }
+  if (heldGateReadingOf(key) !== undefined) {
+    console.error(oldLifeWaitHeldLine(key))
+    return false
+  }
+  if (!personaUpNow(key)) {
+    console.error(oldLifeWaitNotUpLine(key))
     return false
   }
   try {
@@ -14103,6 +14169,46 @@ export function oldLifeWaitNotAppliedLine(key: string): string {
  */
 export function oldLifeWaitLatchedLine(key: string): string {
   return `${OLD_LIFE_WAIT_LOG_PREFIX} persona=${key}: latched — no retry timer armed (b.jg5 SRJ-305, SRJ-502)`
+}
+
+/**
+ * The line of a waiting persona held on `ErrInvalidFlags`, so no retry timer
+ * is armed for it (`armOldLifeWaiter`; b.jg5 SRJ-305, SRJ-207):
+ *
+ *   [slack] old-life-wait: persona=<key>: held on ErrInvalidFlags — no retry timer armed (b.jg5 SRJ-305, SRJ-207)
+ *
+ * Pure.
+ */
+export function oldLifeWaitHeldLine(key: string): string {
+  return `${OLD_LIFE_WAIT_LOG_PREFIX} persona=${key}: held on ErrInvalidFlags — no retry timer armed (b.jg5 SRJ-305, SRJ-207)`
+}
+
+/**
+ * The line of a waiting persona that is not up, so no retry timer is armed
+ * for it; its bring-up owns it (`armOldLifeWaiter`; b.jg5 SRJ-305):
+ *
+ *   [slack] old-life-wait: persona=<key>: not up — no retry timer armed; its bring-up owns it (b.jg5 SRJ-305)
+ *
+ * Pure.
+ */
+export function oldLifeWaitNotUpLine(key: string): string {
+  return `${OLD_LIFE_WAIT_LOG_PREFIX} persona=${key}: not up — no retry timer armed; its bring-up owns it (b.jg5 SRJ-305)`
+}
+
+/**
+ * Whether persona `key` is up now, as the server's keep-going query tells
+ * (`PersonaKillKeepGoingQuery.isPersonaUp`: serving, its bring-up `up`, its
+ * key applied; b.jg5 SRJ-305). With no query installed, up (nothing tells
+ * otherwise); a query that throws counts as not up. Never throws.
+ */
+function personaUpNow(key: string): boolean {
+  const query = personaKillKeepGoingQuery
+  if (query === undefined) return true
+  try {
+    return query.isPersonaUp(key) === true
+  } catch {
+    return false
+  }
 }
 
 /** The wait's arm cause, held to the retry controller's label by its type (the same string). */
@@ -14435,6 +14541,51 @@ function startSweepRowName(instanceId: string, persona: string | undefined): str
   return persona === undefined ? `pre-persona row instanceId=${instanceId}` : `orphan instanceId=${instanceId} persona=${persona}`
 }
 
+/**
+ * The start sweep's line for a kill of row `instanceId` (named `persona`;
+ * none for a pre-persona row) whose success stands with `outcome`
+ * (`killStartSweepRow`; b.jg5 SRJ-714), `<outcome>` being
+ * `describeKillOutcome`'s rendering:
+ *
+ *   [slack] reconcileOrphans: kill succeeded for <row name> (<outcome>) — row kept
+ *
+ * Pure.
+ */
+export function startSweepKillSucceededLine(instanceId: string, persona: string | undefined, outcome: KillOutcome): string {
+  return `${SWEEP_LOG_PREFIX}: kill succeeded for ${startSweepRowName(instanceId, persona)} (${describeKillOutcome(outcome)}) — row kept`
+}
+
+/** What the start sweep's swept-row line is built from (`startSweepSweepingRowLine`). */
+export interface StartSweepSweepingRowLineInput {
+  /** Why the row is swept: `absent persona`, `wrong instance ID` or `wrong cwd`. */
+  readonly reason: string
+  /** The persona reference when the persona is applied, else the row's `persona` label value. */
+  readonly persona: string
+  readonly instanceId: string
+  readonly state: string
+  /** The row's `cwd`, named for a row swept for it only. */
+  readonly cwd?: string
+  /** Whether the row is live, so it is killed; a finished row is never killed. */
+  readonly live: boolean
+}
+
+/**
+ * The start sweep's line for a swept row (b.jg5 SRJ-714): why it is swept
+ * and whether it is killed; the row is kept either way:
+ *
+ *   [slack] reconcileOrphans: sweeping row (<reason>) persona=<persona> instanceId=<id> state=<state>[ cwd=<cwd>] — it is live, so it is killed; the row is kept (b.jg5 SRJ-714)
+ *   [slack] reconcileOrphans: sweeping row (<reason>) persona=<persona> instanceId=<id> state=<state>[ cwd=<cwd>] — it is finished, so it is not killed (a finished row is never killed); the row is kept (b.jg5 SRJ-714)
+ *
+ * Pure.
+ */
+export function startSweepSweepingRowLine(input: StartSweepSweepingRowLineInput): string {
+  const cwdDetail = input.cwd === undefined ? '' : ` cwd=${input.cwd}`
+  const what = input.live
+    ? 'it is live, so it is killed; the row is kept'
+    : 'it is finished, so it is not killed (a finished row is never killed); the row is kept'
+  return `${SWEEP_LOG_PREFIX}: sweeping row (${input.reason}) persona=${input.persona} instanceId=${input.instanceId} state=${input.state}${cwdDetail} — ${what} (b.jg5 SRJ-714)`
+}
+
 /** What a start-sweep kill's `orphan-cleanup` entry is built from (`startSweepKillFailedEntry`). */
 export interface StartSweepKillFailedEntryInput {
   /** The row's instance id. */
@@ -14559,7 +14710,7 @@ async function killStartSweepRow(pass: SweepPass, row: ListRow, target: StartSwe
   const retried = await sweepKill(pass, id, row.state, target.configuredKey)
   const { outcome, alert } = retried
   if (killLetsNextStepRun(outcome)) {
-    console.error(`${SWEEP_LOG_PREFIX}: kill succeeded for ${name} (${describeKillOutcome(outcome)}) — row kept`)
+    console.error(startSweepKillSucceededLine(id, target.persona, outcome))
     recordSweepSurvivorAlert(row, alert)
     return retried
   }
@@ -14721,11 +14872,16 @@ function sweepStopped(pass: SweepPass): boolean {
  * `key` that arrived after the sweep stopped (`sweepStopped`; b.jg5 SRJ-714):
  *
  *   [slack] reconcileOrphans: the <class> answer to the <call> for persona=<key> came after the sweep stopped — no outage is raised (b.jg5 SRJ-714)
+ *
+ * Pure.
  */
+export function startSweepOutageNotRaisedLine(key: string, errorClass: string, call: string): string {
+  return `${SWEEP_LOG_PREFIX}: the ${errorClass} answer to the ${call} for persona=${key} came after the sweep stopped — no outage is raised (b.jg5 SRJ-714)`
+}
+
+/** Log `startSweepOutageNotRaisedLine`. */
 function logSweepOutageNotRaised(key: string, errorClass: string, call: string): void {
-  console.error(
-    `${SWEEP_LOG_PREFIX}: the ${errorClass} answer to the ${call} for persona=${key} came after the sweep stopped — no outage is raised (b.jg5 SRJ-714)`,
-  )
+  console.error(startSweepOutageNotRaisedLine(key, errorClass, call))
 }
 
 /**
@@ -15068,9 +15224,7 @@ function latchFromListedRows(
     const decision = actOnOwnRowRead(key, row, at, !recordedKeys.has(key))
     if (decision === undefined || latched.has(key)) continue
     latched.add(key)
-    console.error(
-      `${SWEEP_LOG_PREFIX}: ${ref} latched from its own listed row instanceId=${row.claude_instance_id} (case=${decision.latchCase}) — its own row and every row labelled with it are left unkilled (b.jg5 SRJ-116, SRJ-502, SRJ-714)`,
-    )
+    console.error(startSweepLatchedFromOwnRowLine(ref, row.claude_instance_id, decision.latchCase))
   }
   for (const persona of personasByKey.values()) {
     if (latched.has(persona.key)) continue
@@ -15078,11 +15232,35 @@ function latchFromListedRows(
     if (reading === undefined) continue
     const ref = personaRef(persona)
     latched.add(persona.key)
-    console.error(
-      `${SWEEP_LOG_PREFIX}: ${ref} is latched (case=${reading.latchCase}) — its own row and every row labelled with it are left unkilled (b.jg5 SRJ-502, SRJ-714)`,
-    )
+    console.error(startSweepLatchedLine(ref, reading.latchCase))
   }
   return latched
+}
+
+/**
+ * The start sweep's line for a persona latched from its own listed row
+ * (`latchFromListedRows`; b.jg5 SRJ-116, SRJ-502, SRJ-714), `ref` its
+ * reference:
+ *
+ *   [slack] reconcileOrphans: <ref> latched from its own listed row instanceId=<id> (case=<case>) — its own row and every row labelled with it are left unkilled (b.jg5 SRJ-116, SRJ-502, SRJ-714)
+ *
+ * Pure.
+ */
+export function startSweepLatchedFromOwnRowLine(ref: string, instanceId: string, latchCase: string): string {
+  return `${SWEEP_LOG_PREFIX}: ${ref} latched from its own listed row instanceId=${instanceId} (case=${latchCase}) — its own row and every row labelled with it are left unkilled (b.jg5 SRJ-116, SRJ-502, SRJ-714)`
+}
+
+/**
+ * The start sweep's line for a configured persona already latched when the
+ * sweep runs (`latchFromListedRows`; b.jg5 SRJ-502, SRJ-714), `ref` its
+ * reference:
+ *
+ *   [slack] reconcileOrphans: <ref> is latched (case=<case>) — its own row and every row labelled with it are left unkilled (b.jg5 SRJ-502, SRJ-714)
+ *
+ * Pure.
+ */
+export function startSweepLatchedLine(ref: string, latchCase: string): string {
+  return `${SWEEP_LOG_PREFIX}: ${ref} is latched (case=${latchCase}) — its own row and every row labelled with it are left unkilled (b.jg5 SRJ-502, SRJ-714)`
 }
 
 /**
@@ -15313,16 +15491,6 @@ export async function reconcileOrphans(
     return endStartSweep(pass, records, 0)
   }
 
-  // b.jg5 SRJ-809: each listed row is a read of it: a finished one ends an
-  // old-life hold on it, and a live one's `cwd` becomes its held directory.
-  for (const row of rows) {
-    noteOldLifeRowRead(
-      row.claude_instance_id,
-      { kind: OLD_LIFE_ROW_READ_STATE, state: row.state, cwd: row.cwd },
-      oldLifeReadName(START_SWEEP_LIST_SITE),
-    )
-  }
-
   // b.jg5 SRJ-502, SRJ-714: every latch and record decision is made over the
   // whole list before the first kill.
   const personasByKey = new Map(personaConfig.personas.map((p) => [p.key, p]))
@@ -15333,6 +15501,18 @@ export async function reconcileOrphans(
   // the listing's holds: every live row of a key recorded without its mark,
   // whatever the sweep then does with it.
   beginStartSweepListingHolds(pass, rows)
+  // b.jg5 SRJ-809, SRJ-811: then each listed row is a read of it, through the
+  // one read entry: a finished one ends an old-life hold on it, and a live
+  // one's state seeds the hold's first wait (so a row listed `pending` gets
+  // its wait seeded `pending`, and SRJ-316's rule applies) and its `cwd` is
+  // the held directory.
+  for (const row of rows) {
+    noteOldLifeRowRead(
+      row.claude_instance_id,
+      { kind: OLD_LIFE_ROW_READ_STATE, state: row.state, cwd: row.cwd },
+      oldLifeReadName(START_SWEEP_LIST_SITE),
+    )
+  }
 
   const context: StartSweepRowContext = { latched, personasByKey, home: spawnHomeDir(), deferredLogged: new Set<string>() }
   for (const row of rows) {
@@ -15500,12 +15680,15 @@ async function sweepListedRow(pass: SweepPass, row: ListRow, context: StartSweep
     }
     // The persona reference when the persona exists, else the raw label value.
     const displayPersona = persona ? personaRef(persona) : personaLabel
-    const cwdDetail = decision.reason === 'wrong cwd' ? ` cwd=${row.cwd}` : ''
-    const what = live
-      ? 'it is live, so it is killed; the row is kept'
-      : 'it is finished, so it is not killed (a finished row is never killed); the row is kept'
     console.error(
-      `${SWEEP_LOG_PREFIX}: sweeping row (${decision.reason}) persona=${displayPersona} instanceId=${row.claude_instance_id} state=${row.state}${cwdDetail} — ${what} (b.jg5 SRJ-714)`,
+      startSweepSweepingRowLine({
+        reason: decision.reason,
+        persona: displayPersona,
+        instanceId: row.claude_instance_id,
+        state: row.state,
+        ...(decision.reason === 'wrong cwd' ? { cwd: row.cwd } : {}),
+        live,
+      }),
     )
     target = persona ? { persona: displayPersona, configuredKey: persona.key } : { persona: displayPersona }
   }

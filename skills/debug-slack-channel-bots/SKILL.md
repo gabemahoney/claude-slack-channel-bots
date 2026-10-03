@@ -3158,8 +3158,10 @@ tracked, or when the old instance is its own earlier one.
   or that answers a session conflict ends nothing by itself: only
   agent-director reading the old instance finished ends the tracking.
 - When a round ends with the old instance still tracked, each persona that
-  waits on it and is not held gets its retries (`armed (held-for-old-life)`), never counted
-  toward the restart limit. The old instance's own name never gets retries
+  waits on it, is not held and is up gets its retries (`armed (held-for-old-life)`), never counted
+  toward the restart limit. A waiting persona that is held for a human, held
+  because agent-director rejected its launch flags, or not up gets none, with
+  one line saying which, and is not retried when the old instance ends. The old instance's own name never gets retries
   and is never launched.
 - `tmux isn't available` or `agent-director refuses its config file` met
   here raises that notice for each persona waiting on the old instance. Each
@@ -3173,7 +3175,17 @@ tracked, or when the old instance is its own earlier one.
   between kill tries holds that persona, the round ends there: the old
   instance stays tracked, the waiting personas get their retries, the
   round's entries are kept, and when the kill had failed it counts as a
-  failed kill (`the hold is marked kill-failed`).
+  failed kill (`the hold is marked kill-failed`). If that persona is held
+  between the kill's tries any other way, the tries stop: one line naming
+  `its old-life wait was stopped: the persona whose own row it is latched`,
+  and no `persona-kill-failed` entry (the persona's *Held:* notice is what
+  to follow).
+- When a server start's clean-up lists the old instance `pending` (still
+  starting), the first round starts from that reading: while
+  *agent-director refuses its config file* is raised, it makes no kill and
+  no call, and the round ends `a CONFIG answer, or no kill of a row last
+  read pending while agent-director refuses its config file`, the waiting
+  personas getting their retries.
 - Otherwise the kill keeps its tries until the server stops: a waiting
   persona being held (on another instance) or not being up never stops it.
   When agent-director reads the old instance finished while the kill is
@@ -3229,7 +3241,7 @@ Its `startup-errors.log` entries (none is posted):
 | Entry | Meaning | What to do |
 |---|---|---|
 | `[persona-kill-failed] <ref> (old-life wait): <text>` | The *Kill failed* text, with its log-only last sentence: agent-director could not end the old instance after its tries, or it still read running after `find-missing` checks that judged it. | A human checks the instance, following the "Operator actions" section of agent-director's README. |
-| `[persona-kill-failed] <ref> (old-life wait): the kill-failure ordinary alert not raised — its tries were stopped (its old-life wait was stopped: the server is shutting down)…` | The server stopped while the old instance's kill was being tried; no *Kill failed* text. Its `descriptions` quote agent-director's answers, a surviving process included. | Nothing: the next start's clean-up picks the instance up again. If a surviving process is named, a human deals with it by pid, following "Operator actions". |
+| `[persona-kill-failed] <ref> (old-life wait): the kill-failure ordinary alert not raised — its tries were stopped (its old-life wait was stopped: the server is shutting down)…` (or `… (its old-life wait was stopped: the last persona waiting on its hold was torn down)…`) | The server stopped, or the last persona waiting on the old instance was removed or changed, while the old instance's kill was being tried; no *Kill failed* text. A stop by the latch of the persona whose own earlier instance it is writes no entry, only its server-log line (`… (its old-life wait was stopped: the persona whose own row it is latched)…`). `(its old-life wait was stopped)` with no cause after it is a stop the server has no name for: report it, with the lines around it. Its `descriptions` quote agent-director's answers, a surviving process included. | Nothing: the next start's clean-up picks the instance up again. If a surviving process is named, a human deals with it by pid, following "Operator actions". |
 | `[persona-kill-survivor] <ref> (old-life wait): <text>` | The *Process outlived kill* text: the old instance ended, but an earlier try named a process of its session that outlived the kill. | A human deals with the process by pid, following "Operator actions". |
 | `[persona-teardown-notice] <ref>, raised during its old-life wait: agent-director kill of <id> refused at a try: <outcome>` (or `… at a status read between its tries: …`, or `agent-director <get\|find-missing> for <id> refused: class=<CLASS> …`) | A session conflict or an unusable session name met while ending the old instance. Nobody is held. | If it repeats, check the instance with `agent-director get --claude-instance-id <id>` and follow "Operator actions". |
 | `[persona-unclassified-error] <ref>: <text>` | The *Unclassified agent-director error* text for an error met while ending the old instance, still met past the alert threshold; at most one while the instance is tracked. | See **agent-director returns an error the server can't classify** under [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own). |
@@ -3256,7 +3268,8 @@ could not stop it) waits on it too: a launch refused while the server is
 ending that instance, or a reconnect that would have typed into it, records
 the persona as waiting. When the old instance ends, the other waiting
 personas are retried at once, and this one as soon as the server has
-stopped ending its instance, unless it was removed or held meanwhile. If it
+stopped ending its instance, unless it was removed, held or stopped being
+up meanwhile. If it
 is removed while it is the last persona waiting, the server stops ending
 the old instance.
 
@@ -3264,7 +3277,12 @@ A destructively changed persona whose own earlier instance is the old one is
 not held back this way: its own replacement of the old instance ends it
 first (see **Destructively modified persona** under
 [A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change)).
-A held persona (see its *Held:* entry) is not retried while it is held.
+A held persona (see its *Held:* entry, or its *Cannot launch* notice for
+rejected launch flags) is not retried while it is held, and gets no retries
+from the old instance's steps. Neither does a persona that is not up (its
+Slack connection, credentials or working directory is not ready): its own
+bring-up brings it up, and a restart of it ends before the old-instance
+check, so it logs no `Skipping restart … held for an old life` line.
 
 A message lost for a waiting persona reports `restarting` while the steps
 above run, `kill failed` once the old instance's kill failed, and otherwise
@@ -3277,21 +3295,23 @@ the old instance has ended.
 
 ```sh
 STATE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
-grep -h -E 'held for an old life|old-life hold: |old-life-wait|retrying now \(old-life-hold-ended\)' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
+grep -h -E 'held for an old life|old-life hold: |old-life-wait|retrying now( \(pending-only\))? \(old-life-hold-ended\)' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
 agent-director get --claude-instance-id <id>
 ```
 
 | Line | Meaning | What to do |
 |---|---|---|
 | `[slack] <site>: not launching <ref> — its working directory "<path>" is held for an old life that may still be running (instanceId="<id>": wait <what>[, …]); waiting on it, its retry timer is armed (held-for-old-life); no agent-director call (sequence-waiting; b.jg5 SRJ-810, SRJ-1502)` | A launch of the persona (`<site>` `spawnForPersona`, `launchForLiveRowSequence` for a replacement's last step, or `runRestartWork` for a restart) was held back because the old instance `<id>` may still run in its directory. `<what>` is `started` (the steps above began on it), `running` or `already-running` (they were already running), or `closed`, `not-held` or `not-installed` (none started: the server is stopping, the instance stopped being tracked, or it wasn't set up yet). Its retries were started; `… its retry timer could not be armed …` when they weren't. At a start it is counted under `waiting on a live-row sequence`. | Nothing while the old instance's lines show it being ended. If its kill keeps failing (a `persona-kill-failed` entry above), a human follows the "Operator actions" section of agent-director's README for `<id>`; the persona then comes up with no restart. |
-| `[slack] Skipping restart for persona=<key> — its working directory is held for an old life that may still be running; no agent-director call, nothing recorded (sequence-waiting; b.jg5 SRJ-810, SRJ-812)`, `[slack] Restart for persona=<key> goes no further <where> — its working directory is held for an old life that may still be running; nothing more is called for it, nothing recorded (sequence-waiting; b.jg5 SRJ-810, SRJ-812)` | A restart of the persona (a health check's, a retry's, or one a lost message started) did nothing: nothing was read, reconnected, killed or launched, and nothing counted. A running persona's worker is left as it is. With `(the old-life hook failed: <error> — taken as held)`, the server could not tell and held it to be safe. | Nothing. The `taken as held` form: report it as a bug. |
+| `[slack] Skipping restart for persona=<key> — its working directory is held for an old life that may still be running; no agent-director call, nothing recorded (sequence-waiting; b.jg5 SRJ-810, SRJ-812)`, `[slack] Restart for persona=<key> goes no further <where> — its working directory is held for an old life that may still be running; nothing more is called for it, nothing recorded (sequence-waiting; b.jg5 SRJ-810, SRJ-812)` | A restart of the persona (a health check's, a retry's, or one a lost message started) did nothing: nothing was read, reconnected, killed or launched, and nothing counted. A running persona's worker is left as it is. With `(the old-life hook failed: <error> — taken as held)`, the server could not tell and held it to be safe. A restart while the server is stopping, or for a persona that is not up, ends before this check, so neither logs it. | Nothing. The `taken as held` form: report it as a bug. |
 | `[slack] unavailable-retry: persona=<key> retry <n>: old-life-wait-in-flight — re-armed, next retry in <s> s` | A retry found the persona still waiting while the steps above ran; it retries later. | Nothing. |
 | `[slack] reconnectMcp: <ref> — its own row instanceId="<id>" is held for an old life that may still be running: no send-keys; transient, nothing typed; its retry timer is armed (held-for-old-life) (b.jg5 SRJ-810)` (or `… its retry timer could not be armed …`) | A reconnect of the persona would have typed into its own earlier instance, which is the tracked old instance, so nothing was typed. If it is still configured, it waits on that instance and is retried once it ends. | Nothing. |
 | `[slack] reconnectSession: persona=<key> is <state> and its own row is held for an old life — not typing /mcp reconnect into it; the live-row sequence replaces it (start answered <answer>); deferring (b.jg5 SRJ-810, SRJ-805)` | The persona's own instance is a tracked old instance a start's clean-up could not stop (it ran in another directory), so a restart replaces it instead of reconnecting it. `already-running` means the steps above are running on it; the persona waits for them. | Nothing. |
-| `[slack] old-life hold: ended for instanceId="<id>" — retrying its waiting personas at once: <keys\|none>[; once the stopped wait on its own row has settled: <keys>][; not retried: <key> (<why>)[, …]] (b.jg5 SRJ-810)` | The old instance ended; each waiting persona still configured and not held is retried at once (`not applied`: removed meanwhile; `latched`: held for a human). A `retrying now (old-life-hold-ended)` line follows for each, then its launch. `once the stopped wait on its own row has settled` names a persona whose own earlier instance was the old one: it is retried once the server has stopped ending that instance (the next line). | Nothing. |
-| `[slack] old-life hold: the stopped wait on instanceId="<id>" has settled — persona=<key> retried at once (b.jg5 SRJ-810)`, `[slack] old-life hold: the stopped wait on instanceId="<id>" has settled — persona=<key> not retried (<why>) (b.jg5 SRJ-810)` | The server has stopped ending the persona's own earlier instance, and the persona is retried (a `retrying now (old-life-hold-ended)` line follows), or not: `not applied` (removed meanwhile) or `latched` (held for a human). | Nothing; for `latched`, follow its *Held:* notice. |
+| `[slack] old-life hold: ended for instanceId="<id>" — retrying its waiting personas at once: <keys\|none>[; once the stopped wait on its own row has settled: <keys>][; not retried: <key> (<why>)[, …]] (b.jg5 SRJ-810)` | The old instance ended; each waiting persona still configured, not held and up is retried at once (`not applied`: removed meanwhile; `latched`: held for a human; `held on ErrInvalidFlags`: held until its launch flags are fixed; `not up`: its Slack connection or bring-up is not up, and its bring-up brings it up; `its retry failed: <error>`: report it as a bug). A `retrying now (old-life-hold-ended)` line follows for each, then its launch. `once the stopped wait on its own row has settled` names a persona whose own earlier instance was the old one: it is retried once the server has stopped ending that instance (the next line). | Nothing. |
+| `[slack] old-life hold: the stopped wait on instanceId="<id>" has settled — persona=<key> retried at once (b.jg5 SRJ-810)`, `[slack] old-life hold: the stopped wait on instanceId="<id>" has settled — persona=<key> not retried (<why>) (b.jg5 SRJ-810)` | The server has stopped ending the persona's own earlier instance, and the persona is retried (a `retrying now (old-life-hold-ended)` line follows), or not: `not applied` (removed meanwhile), `latched` (held for a human), `held on ErrInvalidFlags` or `not up`, as in the line above. | Nothing; for `latched`, follow its *Held:* notice; for `held on ErrInvalidFlags`, its *Cannot launch* notice; for `not up`, see [Persona diagnostic classes](#persona-diagnostic-classes). |
 | `[slack] old-life-wait: persona=<key> torn down — forgotten as waiting on instanceId="<id>"; <what>` | A waiting persona was removed or changed. `the wait is stopped: no other persona waits on the hold` means the server stopped ending the old instance; the next persona that waits on it, or the next start, starts again. `the wait goes on: <keys> still wait on the hold` means it keeps going for them. | Nothing. |
 | `[slack] old-life-wait: persona=<key>: latched — no retry timer armed (b.jg5 SRJ-305, SRJ-502)` | A waiting persona is held for a human, so it gets no retries. | Follow its *Held:* notice. |
+| `[slack] old-life-wait: persona=<key>: held on ErrInvalidFlags — no retry timer armed (b.jg5 SRJ-305, SRJ-207)` | A waiting persona is held because agent-director rejected its launch flags, so it gets no retries, and it is not retried when the old instance ends. | Follow its *Cannot launch* notice. |
+| `[slack] old-life-wait: persona=<key>: not up — no retry timer armed; its bring-up owns it (b.jg5 SRJ-305)` | A waiting persona is not up (its Slack connection, credentials or working directory is not ready), so the old-instance steps arm no retries for it, and it is not retried when the old instance ends; its own bring-up retries bring it up. | Follow its bring-up lines (see [Persona diagnostic classes](#persona-diagnostic-classes)). |
 | `[slack] old-life hold: retrying the waiting personas of instanceId=<id> failed: <error> (b.jg5 SRJ-810)`, `[slack] old-life hold: retrying persona=<key> after the wait on instanceId=<id> settled failed: <error> (b.jg5 SRJ-810)`, `[slack] old-life-wait: persona=<key>: forgetting its old-life waits failed: <error> (b.jg5 SRJ-811)` | An internal error. | Report it as a bug, with the lines around it. |
 
 ---

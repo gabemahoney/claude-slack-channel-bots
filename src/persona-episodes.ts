@@ -1740,6 +1740,15 @@ export interface KillFailureRaiseInput {
   readonly lastOutcomeClass?: string
   /** With `stopped`: why the tries were stopped, for the stop's line and entry; a generic cause when absent. */
   readonly stopCause?: string
+  /**
+   * With `stopped`: the stop is a configured persona's, so only the line is
+   * written, whatever the context's route (b.jg5 SRJ-702: a configured
+   * persona's stop writes the log line only). An old-life wait's kill
+   * stopped by the latch of the configured persona whose own row it is gives
+   * it, since that context's route is otherwise always the log-only one.
+   * Absent: the route decides.
+   */
+  readonly lineOnly?: boolean
   /** The session the alert names, unquoted; `slack_bot_<key>` when absent. */
   readonly session?: string
   /** The row's instance id; `cscb_<key>` when absent. */
@@ -1928,12 +1937,13 @@ export function createKillFailureAlerts(deps: KillFailureAlertsDeps): KillFailur
    * persona no longer in the applied configuration (or an old-life wait's
    * old key), that line's content as one entry of the not-configured route's
    * class, `persona-kill-failed`. A configured persona's stop writes the line
-   * only.
+   * only, and so does a stop given `lineOnly`.
    */
   function raiseStopped(input: KillFailureRaiseInput): KillFailureRaiseResult {
     const { key, context } = input
     const stopped = killFailureStoppedRetryText(input)
     safeLog(deps.log, stopped.line)
+    if (input.lineOnly === true) return 'stopped'
     const route = selectKillFailureAlertRoute({
       version: KILL_FAILURE_VERSION_ORDINARY,
       context,

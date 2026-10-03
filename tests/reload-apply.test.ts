@@ -190,6 +190,8 @@ import {
   type RetiredKeyCause,
   type RetiredKeyRecord,
 } from '../src/retired-keys.ts'
+import { oldLifeGateLine, waitEndLine, waitEndLinePrefix } from './test-helpers/old-life.ts'
+import { killFailureLoggedLine } from './test-helpers/recovery-harness.ts'
 import { readRetiredKeysRecord, retiredKeysRecordOf, RFC3339_UTC, writeRetiredKeysRecord } from './test-helpers/retired-keys.ts'
 import {
   _whenDialogApproverStopped,
@@ -200,7 +202,6 @@ import {
   ensureOldLifeWait,
   LIVE_ROW_START_NOT_INSTALLED,
   oldLifeHoldEndRetryLine,
-  oldLifeHoldLaunchLine,
   personaConfigDirLabelValue,
   readPersonaRowState,
   RETRY_ROW_READ_SITE,
@@ -208,7 +209,7 @@ import {
   REUSE_RECORDED_SINCE_RECORDED_AGAIN,
   reuseRecordedInFlightLine,
   SPAWN_ACTION_FRESH_RETIRED,
-  type OldLifeHoldStepWait,
+  spawnForPersona,
 } from '../src/session-manager.ts'
 import {
   cannedErr,
@@ -228,12 +229,13 @@ import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { KILL_RETRY_SPACING_MS, KILL_RETRY_TRIES } from '../src/kill-retry.ts'
 import {
   KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN,
+  KILL_FAILURE_ROUTE_NOT_CONFIGURED,
   KILL_FAILURE_VERSION_ORDINARY,
   PERSONA_KILL_FAILED_LABEL,
   PERSONA_TEARDOWN_NOTICE_LABEL,
   selectKillFailureAlertRoute,
 } from '../src/kill-failure-alert.ts'
-import { OLD_LIFE_WAIT_LOG_PREFIX, OLD_LIFE_WAIT_SITE } from '../src/old-life-wait.ts'
+import { OLD_LIFE_WAIT_END_HOLD_ENDED, OLD_LIFE_WAIT_END_KILL_FAILED, OLD_LIFE_WAIT_END_REFUSED, OLD_LIFE_WAIT_SITE } from '../src/old-life-wait.ts'
 import { INVALID_FLAGS_HOLD_ALERT_TEXT } from '../src/invalid-flags-hold.ts'
 import {
   LIVE_ROW_LAUNCH_REASON_RETIRED_KEY,
@@ -4267,10 +4269,11 @@ describe('b.jg5 SRJ-809: apply step 1 begins an old-life hold on each key it rec
 /** The stub's `find-missing` answers, in order (each run takes the next; an empty queue answers no row). */
 type FindMissingQueue = NonNullable<StubClientOptions['findMissingQueue']>
 
-/** The old-life wait's end lines for the old key `name` (one per round), in order. */
+/** The old-life wait's end lines for the old key `name` (one per round), in order: those with the head its end lines share (`waitEndLinePrefix`). */
 function waitEndLines(run: ReloadRun, name: string): string[] {
   const key = h.key(name)
-  return run.logs.filter((line) => line.startsWith(`${OLD_LIFE_WAIT_LOG_PREFIX} persona=${key} (instanceId=${personaInstanceId(key)}): ended`))
+  const head = waitEndLinePrefix(personaInstanceId(key), key)
+  return run.logs.filter((line) => line.startsWith(head))
 }
 
 /**
@@ -4310,11 +4313,6 @@ function failedKills(n = KILL_RETRY_TRIES): KillQueue {
   return Array.from({ length: n }, () => cannedErr(errTmuxKillFailed()))
 }
 
-/** The old-life gate's line for `name`, held back by the hold on `heldId` at `directory`, whose wait it started. */
-function heldLaunchLine(name: string, directory: string, heldId: string): string {
-  const waits: OldLifeHoldStepWait[] = [{ instanceId: heldId, wait: LIVE_ROW_START_STARTED }]
-  return oldLifeHoldLaunchLine('spawnForPersona', renderPersonaRef(name, h.key(name)), realpathSync(directory), waits, true)
-}
 
 describe('b.jg5 SRJ-810, SRJ-811, SRJ-711: no persona is brought up into a directory an old life holds; once the old row reads ended or is listed missing, it comes up at once by a plain first spawn (real launch, AC 54)', () => {
   test.each<{ label: string; end: 'ended' | 'ids' }>([
@@ -4346,7 +4344,7 @@ describe('b.jg5 SRJ-810, SRJ-811, SRJ-711: no persona is brought up into a direc
 
     // Step 6's bring-up was held back with no call on bravo2's id, started the wait and armed bravo2 only.
     expect(launchesOf(run, 'bravo2')).toEqual([{ op: 'launch', key: renamedKey, via: 'apply', action: 'sequence-waiting' }])
-    expect(run.logs.filter((line) => line === heldLaunchLine('bravo2', bravo!.working_directory, bravoId))).toHaveLength(1)
+    expect(run.logs.filter((line) => line === oldLifeGateLine(spawnForPersona.name, renderPersonaRef('bravo2', renamedKey), realpathSync(bravo!.working_directory), bravoId, LIVE_ROW_START_STARTED))).toHaveLength(1)
     expect(run.retryTimers!.armedKeys()).toEqual([renamedKey])
     // The teardown's alert, then the wait's CONFLICT: one persona-teardown-notice entry "during the wait".
     expect(entryLabels(run)).toEqual([TEARDOWN_ALERT_CLASS, PERSONA_TEARDOWN_NOTICE_LABEL])
@@ -4358,11 +4356,15 @@ describe('b.jg5 SRJ-810, SRJ-811, SRJ-711: no persona is brought up into a direc
 
     expect(entryLabels(run)).toEqual([TEARDOWN_ALERT_CLASS, PERSONA_TEARDOWN_NOTICE_LABEL, PERSONA_KILL_FAILED_LABEL])
     expect(run.composition!.killFailureEntries[2]!.entry).toContain(bravoId)
+    // The wait's alert line: the old key's ordinary version, on the not-configured, log-only route.
+    expect(run.logs.filter((line) => line === killFailureLoggedLine(bravoKey, KILL_FAILURE_VERSION_ORDINARY, PERSONA_KILL_FAILED_LABEL, KILL_FAILURE_ROUTE_NOT_CONFIGURED))).toHaveLength(1)
     // Neither ended the wait: the row is live, the hold is on (kill-failed, bravo2 waiting), bravo2 not brought up.
     expect(h.rowOf('bravo')).toMatchObject({ state: 'waiting', cwd: bravo!.working_directory })
     expect(run.oldLifeHolds.snapshot()).toEqual([{ ...stepOneHold('bravo', bravo!.working_directory, true), waiting: [renamedKey] }])
     expect(instanceCallsSince(run, 'bravo2', 0)).toEqual([])
-    expect(launchesOf(run, 'bravo2').map((r) => r.action)).toEqual(['sequence-waiting', 'sequence-waiting'])
+    // The retry that started that round met the restart path's old-life hook (as main() binds it): no launch, one hook line.
+    expect(launchesOf(run, 'bravo2').map((r) => r.action)).toEqual(['sequence-waiting'])
+    expect(run.logs.filter((line) => line === oldLifeGateLine('runRestartWork', `persona=${renamedKey}`, realpathSync(bravo!.working_directory), bravoId, LIVE_ROW_START_STARTED))).toHaveLength(1)
     expect(run.retryTimers!.armedKeys()).toEqual([renamedKey])
 
     // The old row ends: set ended, or listed in the next find-missing run's ids with the row still live.
@@ -4378,12 +4380,19 @@ describe('b.jg5 SRJ-810, SRJ-811, SRJ-711: no persona is brought up into a direc
     await until(() => run.retryTimers!.armedKeys().length === 0)
 
     // bravo2's first spawn is plain, after the read that ended the hold, from the hold's end at once: each retry
-    // before it (the one that started the last round included) was held back.
+    // before it (the one that started the last round included) was held back by the restart path's old-life hook,
+    // with no launch, each starting the next round.
     expect(launchesOf(run, 'bravo2').map((r) => [r.via, r.action])).toEqual([
       ['apply', 'sequence-waiting'],
-      ['unavailable-retry', 'sequence-waiting'],
-      ['unavailable-retry', 'sequence-waiting'],
       ['unavailable-retry', 'spawned'],
+    ])
+    expect(run.logs.filter((line) => line === oldLifeGateLine('runRestartWork', `persona=${renamedKey}`, realpathSync(bravo!.working_directory), bravoId, LIVE_ROW_START_STARTED))).toHaveLength(2)
+    // One end line per round: the CONFLICT and the kill failure keep the hold (the second marks it), each arming bravo2;
+    // the last round's read ends the hold, arming no one.
+    expect(waitEndLines(run, 'bravo')).toEqual([
+      waitEndLine(bravoId, bravoKey, { kind: OLD_LIFE_WAIT_END_REFUSED, kept: true }, [renamedKey]),
+      waitEndLine(bravoId, bravoKey, { kind: OLD_LIFE_WAIT_END_KILL_FAILED, kept: true, marked: true }, [renamedKey]),
+      waitEndLine(bravoId, bravoKey, { kind: OLD_LIFE_WAIT_END_HOLD_ENDED, kept: false }, []),
     ])
     expect(instanceCallsSince(run, 'bravo2', 0)).toEqual(['spawn ok'])
     expect(lastSpawnOf(run, 'bravo2')).toMatchObject({ id: renamedId, reuse: false, cwd: bravo!.working_directory })
@@ -4433,7 +4442,7 @@ describe('b.jg5 SRJ-810, SRJ-811, SRJ-711: no persona is brought up into a direc
     await until(() => waitEndLines(run, 'bravo').length === 1)
 
     expect(launchesOf(run, 'charlie')).toEqual([{ op: 'launch', key: charlieKey, via: 'apply', action: 'sequence-waiting' }])
-    expect(run.logs.filter((line) => line === heldLaunchLine('charlie', bravo!.working_directory, bravoId))).toHaveLength(1)
+    expect(run.logs.filter((line) => line === oldLifeGateLine(spawnForPersona.name, renderPersonaRef('charlie', charlieKey), realpathSync(bravo!.working_directory), bravoId, LIVE_ROW_START_STARTED))).toHaveLength(1)
     expect(run.oldLifeHolds.snapshot()).toEqual([{ ...stepOneHold('bravo', bravo!.working_directory, true), waiting: [charlieKey] }])
     expect(run.composition!.agentDirectorCalls.filter((call) => call.id === charlieId)).toEqual([])
     expect(run.retryTimers!.armedKeys()).toEqual([charlieKey])

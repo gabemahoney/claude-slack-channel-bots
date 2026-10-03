@@ -154,7 +154,6 @@ import { personaInstanceId } from '../src/persona-identity.ts'
 import { RESTART_FAILURE_CAP } from '../src/restart.ts'
 import { _buildIsSessionAliveAdapter } from '../src/server.ts'
 import { KILL_CONTEXT_TEARDOWN, killPersonaInstance, personaRetryBlockCause, reconcileOrphans, SPAWN_ACTION_RETRYING, TRUST_DIALOG_NEEDLE, type ApproverVerb } from '../src/session-manager.ts'
-import { OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL } from '../src/retired-keys.ts'
 import { RETRY_BLOCK_OLD_LIFE_WAIT } from '../src/unavailable-retry.ts'
 import { KILL_OUTCOME_NOT_KILLED } from '../src/checked-kill.ts'
 import { KILL_RETRY_SPACING_MS, KILL_RETRY_TRIES } from '../src/kill-retry.ts'
@@ -228,6 +227,7 @@ import {
   type RecoveryNotice,
   type RecoveryStubScript,
 } from './test-helpers/recovery-harness.ts'
+import { PRE_PERSONA_ID, holdOldAt } from './test-helpers/old-life.ts'
 
 const KIND = PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE
 
@@ -1408,8 +1408,8 @@ describe('tmux-unresponsive: the onset with the health check off (SRJ-308)', () 
     while (h.controller.view(p)!.dueAt! - at < FLOOR_MS) await nextRetry(h, p)
     expectPosts(h, [])
 
-    const oldId = 'cscb_old_C0OLD'
-    h.beginOldLifeHold({ instanceId: oldId, oldKey: oldId, directory: personaOf(h, p).working_directory, cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL })
+    const oldId = PRE_PERSONA_ID
+    holdOldAt(h, oldId, oldId, p)
     h.script({ getResult: cannedGetResult({ claude_instance_id: oldId, cwd: personaOf(h, p).working_directory }) })
     const hold = holdFindMissing(h.stub.client)
     const outcome = h.startOldLifeWait(oldId)
