@@ -231,7 +231,8 @@
  *     `resumeOrFreshSpawn` (a collision `get` that read the row `ended` with
  *     a session id) and the sequence-launch entry's `resume`
  *     leg: success `resumed`; UNAVAILABLE (each form) refused and never
- *     counted, P armed; ENVIRONMENT `tmux-unavailable`; `ErrTmuxSessionCreate`
+ *     counted, P armed, with one `get` after it (b.jg5 SRJ-407) reading the
+ *     row `ended`; ENVIRONMENT `tmux-unavailable`; `ErrTmuxSessionCreate`
  *     counted once with no kill, P armed at once in pending-only mode (also
  *     when its description says the row stays pending, with no `get` first);
  *     the DIRECTORY errors `cwd-unreachable`, counted; the no-transcript
@@ -244,7 +245,8 @@
  *     CONFLICT rows (HO rev 15's "another agent-director store" and rev 20's
  *     "conflicting labels" after "duplicate session" included) latch "resume"
  *     with the state last read and kill nothing. HO rev 28's four restore
- *     sentences change no outcome (the stub's `withRestoreSentence`), and no
+ *     sentences change no outcome (the stub's `withRestoreSentence`; its
+ *     UNAVAILABLE failure gets its one `get` with or without one), and no
  *     file in `src/` holds one.
  *   - b.jg5 SRJ-710: `ErrSpawnNotResumable` makes one `get` through
  *     the shared own-row read (`decideNotResumable` over each re-read):
@@ -330,7 +332,13 @@
  *     settled, and the approver's `status` and `read-pane` follow the launch
  *     call on the persona's row; no other branch, result or dry run starts
  *     one; a stop made while the launch is in flight cancels the approver
- *     that launch would start. On `makeRecoveryHarness`, its calls are
+ *     that launch would start. The site table's launch-timeout legs (b.jg5
+ *     SRJ-407): each of those launch calls ending in a launch timeout (both
+ *     forms), its one `get` reading a covered `pending` row whose launch
+ *     start lies in the call's window, answers `retrying` while the approver
+ *     it started through the start entry runs, its first call after the
+ *     launch returned; the row is this launch's and the pending-only arm
+ *     comes before the approver. On `makeRecoveryHarness`, its calls are
  *     outside the launch attempt: an UNAVAILABLE or UNCLASSIFIED answer to its
  *     `status`, `read-pane` or `send-keys` arms nothing and starts or opens
  *     nothing while it polls on (backing off after UNAVAILABLE), while
@@ -464,7 +472,8 @@
  *     `resume_enabled` and the row comparison.
  *   - b.jg5 SRJ-1015 (AC 72), on `makeRecoveryHarness` over one persona:
  *     the start pass counts each launch result (`spawned`, `latched`,
- *     `retrying` from an UNAVAILABLE spawn, a launch timeout, a `transient`
+ *     `retrying` from an UNAVAILABLE spawn and a launch timeout (each with
+ *     its one `get`, b.jg5 SRJ-407), a `transient`
  *     reconnect, SRJ-710's two lost races and a reuse's second collision,
  *     `sequence-waiting`, `held`, `fresh-retired`) once, in its own count,
  *     never failed, `fresh-retired` never a fresh spawn; `launchSession`
@@ -475,6 +484,22 @@
  *     literally. SRJ-205 (the E4 gate): the launch pool starts no queued
  *     launch once the shutdown query answers true (or throws); those
  *     personas get the not-launched outcome, counted in no count.
+ *   - b.jg5 SRJ-407 (E28 T3), on `makeRecoveryHarness` with the session
+ *     manager's clock on the harness clock (`harnessNow`, `scriptTimedLaunch`):
+ *     each launch call's window (`launchCallWindowOf`) on success and on a
+ *     launch timeout, at the ladder's first spawn, a reuse spawn and a
+ *     `resume`; after a launch timeout in either form, exactly one `get`,
+ *     one case per answer of its table at each verb, asserting the calls
+ *     (none after the `get`), the "this launch's row" record (only inside
+ *     the window, both bounds included: AC 31), the approver (only for a
+ *     covered `pending` row), the arms and the answer (`retrying`,
+ *     `latched`, `sequence-waiting`); every other UNAVAILABLE launch outcome
+ *     (tmux unreadable, still stopping or starting, HO rev 15's scan, HO rev
+ *     20's holder) gets the one `get` too, with no approver and no record;
+ *     AC 35 (a recorded key's timed-out reuse over its old life: no mark, no
+ *     approver, the sequence), AC 83 (no retry launch while the row reads
+ *     `pending`) and AC 29 end to end (the approver clears a startup dialog
+ *     after the timeout; retries launch nothing).
  *   - b.jg5 SRJ-811, SRJ-812, SRJ-1512, SRJ-1015 (E27 T2), on
  *     `makeRecoveryHarness`: `ensureOldLifeWait` answers `started`,
  *     `already-running`, `closed`, `not-held` and `not-installed`;
@@ -1333,6 +1358,42 @@ import {
   startSweepSummaryLine,
   type OrphanReconcileResult,
 } from '../src/session-manager.ts'
+import {
+  LAUNCH_CALL_END_LAUNCH_TIMEOUT,
+  LAUNCH_CALL_END_RETURNED,
+  LAUNCH_UNAVAILABLE_GET_SITE,
+  LAUNCH_UNAVAILABLE_OUTCOME_APPROVER,
+  LAUNCH_UNAVAILABLE_OUTCOME_COVERED_NO_APPROVER,
+  LAUNCH_UNAVAILABLE_OUTCOME_FINISHED,
+  LAUNCH_UNAVAILABLE_OUTCOME_LATCHED,
+  LAUNCH_UNAVAILABLE_OUTCOME_LIVE,
+  LAUNCH_UNAVAILABLE_OUTCOME_NO_ROW,
+  LAUNCH_UNAVAILABLE_OUTCOME_REFUSED,
+  LAUNCH_UNAVAILABLE_OUTCOME_UNKNOWN,
+  LAUNCH_UNAVAILABLE_OUTCOME_APPROVER_NOT_STARTED,
+  approverStartedAfterLaunchTimeoutMessage,
+  launchCallWindowOf,
+  launchUnavailableFormText,
+  launchUnavailableSequenceOutcome,
+  thisLaunchRowOf,
+  type LaunchCallWindowRecord,
+} from '../src/session-manager.ts'
+import { LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT, LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE, type LaunchTimeoutForm } from '../src/ad-error-class.ts'
+import { TMUX_UNRESPONSIVE_END_TMUX_VERB } from '../src/persona-episodes.ts'
+import { PENDING_ROW_REASON_CWD_MISMATCH, PENDING_ROW_REASON_RETIRED_OLD_LIFE } from '../src/pending-row.ts'
+import {
+  errTmuxUnresponsiveLaunchTimeout,
+  errTmuxUnresponsiveStillStarting,
+  errTmuxUnresponsiveStillStopping,
+} from './test-helpers/agent-director-stub.ts'
+import {
+  TIMED_LAUNCH_SUCCESS,
+  conditionEndedLine,
+  conditionEndedLines,
+  scriptTimedLaunch,
+  type TimedLaunch,
+  type TimedLaunchStart,
+} from './test-helpers/recovery-harness.ts'
 
 // ---------------------------------------------------------------------------
 // Test fixture helpers
@@ -11897,6 +11958,14 @@ const SUCCESS_SITES_WITH_PRE_TRUST = SUCCESS_SITES.map(
   ([name, site], i) => [name, PRE_TRUST_VALUES[i % PRE_TRUST_VALUES.length]!, site] as const,
 )
 
+/** Both forms of a launch timeout (b.jg5 SRJ-407): `ErrCallTimeout`, and `ErrTmuxUnresponsive` carrying "the session may have been created". */
+const LAUNCH_TIMEOUT_FORMS: readonly LaunchTimeoutForm[] = [LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT, LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE]
+
+/** The launch timeout of `form` ending a `verb` call of instance `id`, built by name. */
+function launchTimeoutOf(form: LaunchTimeoutForm, verb: 'spawn' | 'resume', id: string): Error {
+  return form === LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT ? errCallTimeout(verb) : errTmuxUnresponsiveLaunchTimeout(verb, id)
+}
+
 /** Event-loop turns (`setImmediate`) given to a launch's approver to make its first lap, with the approver's clock held. */
 const APPROVER_FIRST_LAP_TURNS = 10
 
@@ -11939,14 +12008,14 @@ describe('b.jg5 SRJ-401: the approver runs after every launch that returns succe
   /**
    * The `status` answers for persona `key`: `waiting` while its launch is in
    * flight (the ladder's own reads), and after it the approver's laps:
-   * `pending` with `LAUNCH_START`, then `waiting`.
+   * `pending` with `launchStart` (`LAUNCH_START` by default), then `waiting`.
    */
-  function approverReadsPendingThenLive(key: string): () => Phase1StatusResult {
+  function approverReadsPendingThenLive(key: string, launchStart: string = LAUNCH_START): () => Phase1StatusResult {
     let laps = 0
     return () => {
       if (isLaunchInFlight(key)) return cannedStatusResult({ state: 'waiting' })
       laps++
-      return laps === 1 ? cannedStatusResult({ state: 'pending', launch_started_at: LAUNCH_START }) : cannedStatusResult({ state: 'waiting' })
+      return laps === 1 ? cannedStatusResult({ state: 'pending', launch_started_at: launchStart }) : cannedStatusResult({ state: 'waiting' })
     }
   }
 
@@ -12033,6 +12102,114 @@ describe('b.jg5 SRJ-401: the approver runs after every launch that returns succe
     expectLaunchThenApprover(calls, 'spawn')
     expect(await _whenDialogApproverStopped(KEY)).toEqual({ reason: APPROVER_STOP_LIVE, launchStartMs: Date.parse(LAUNCH_START) })
     expect(readLog()).toBe('')
+    assertNoLeak({ errLog })
+  })
+
+  // b.jg5 SRJ-401, SRJ-407 (E28 T3): the site table's launch-timeout legs.
+  // Each launch call a success site makes, ending instead in a launch timeout
+  // (either form), whose one `get` reads P's own row `pending` with its
+  // launch start inside the call's window: the approver starts through the
+  // start entry after the launch call returned, never inside it. The window
+  // is read on the approver's clock (`_setNow`), which the launch does not
+  // move, so the launch start lies on both of its bounds. The rows that get
+  // no approver (an old life, a `cwd` or `config_dir` mismatch, no launch
+  // start) are the SRJ-407 describe's.
+
+  /** A launch call of the ladder, or of the sequence's launch entry, that a launch timeout ends. */
+  interface LaunchTimeoutSite {
+    /** The stub answers that reach the call, which answers `err`; every `get` after the earlier ones reads `pendingRow`. */
+    readonly script: (cfg: PersonaConfig, err: Error, pendingRow: CannedGetResult) => StubClientOptions
+    readonly launchVerb: LaunchVerb
+    /** The launch that reaches the call; the start pass's `spawnForPersona` when unset. */
+    readonly launch?: (cfg: PersonaConfig) => Promise<SpawnPersonaResult>
+  }
+
+  /** The collision `get` reads the persona's row `ended`; the call after `resume` answers `resumeErr` is the timed one. */
+  const afterResume = (resumeErr: Error) => (cfg: PersonaConfig, err: Error, pendingRow: CannedGetResult): StubClientOptions => ({
+    spawnQueue: [collision(), cannedErr<SpawnResultOf>(err)],
+    getQueue: [cannedOk<Phase1GetResult>(endedRow(cfg))],
+    getResult: pendingRow,
+    resumeError: resumeErr,
+  })
+
+  const LAUNCH_TIMEOUT_SITES: ReadonlyArray<readonly [string, LaunchTimeoutSite]> = [
+    ['the first spawn', { script: (_cfg, err, pendingRow) => ({ spawnQueue: [cannedErr<SpawnResultOf>(err)], getResult: pendingRow }), launchVerb: 'spawn' }],
+    [
+      'the retry spawn after the collision get answers ErrSpawnNotFound',
+      {
+        script: (_cfg, err, pendingRow) => ({ spawnQueue: [collision(), cannedErr<SpawnResultOf>(err)], getQueue: [cannedErr<Phase1GetResult>(errSpawnNotFound())], getResult: pendingRow }),
+        launchVerb: 'spawn',
+      },
+    ],
+    [
+      'the reuse spawn replacing an ended row in another directory',
+      {
+        script: (cfg, err, pendingRow) => ({
+          spawnQueue: [collision(), cannedErr<SpawnResultOf>(err)],
+          getQueue: [cannedOk<Phase1GetResult>(personaRow(cfg, KEY, { state: 'ended', cwd: fixtureSubdir('elsewhere') }))],
+          getResult: pendingRow,
+        }),
+        launchVerb: LAUNCH_VERB_REUSE_SPAWN,
+      },
+    ],
+    ['the reuse spawn after resume\'s ErrNoSessionId', { script: afterResume(errNoSessionId()), launchVerb: LAUNCH_VERB_REUSE_SPAWN }],
+    ['the spawn after resume\'s ErrSpawnNotFound', { script: afterResume(errSpawnNotFound()), launchVerb: 'spawn' }],
+    [
+      'the resume of an ended row',
+      {
+        script: (cfg, err, pendingRow) => ({ spawnQueue: [collision()], getQueue: [cannedOk<Phase1GetResult>(endedRow(cfg))], getResult: pendingRow, resumeError: err }),
+        launchVerb: 'resume',
+      },
+    ],
+    [
+      'the reuse spawn at the live-row sequence\'s final launch',
+      { script: (_cfg, err, pendingRow) => ({ spawnError: err, getResult: pendingRow }), launchVerb: LAUNCH_VERB_REUSE_SPAWN, launch: REUSE_SPAWN_SUCCESS_SITE.launch },
+    ],
+  ]
+
+  test.each(LAUNCH_TIMEOUT_SITES.flatMap(([name, site]) => LAUNCH_TIMEOUT_FORMS.map((form) => [name, form, site] as const)))('%s, ending in a launch timeout (%s) whose one get reads P\'s covered pending row with its launch start inside the call\'s window: the launch answers retrying while the approver it started runs, with no launch in flight; the get is the launch\'s last call, then P\'s status and read-pane follow until a live read stops the approver; the row is this launch\'s; one pending-only arm, before the approver started; no pre_trust line, no kill (b.jg5 SRJ-401, SRJ-407)', async (_name, form, site) => {
+    const clock = useApproverClock(SAMPLE_LAUNCH_START_MS)
+    _setNow(clock.now)
+    const launchStart = new Date(SAMPLE_LAUNCH_START_MS).toISOString()
+    const cfg = launchConfig()
+    const log = makeStubCallLog()
+    const arms = recordPendingOnlyArms(log)
+    const verb = launchCallVerb(site.launchVerb)
+    const pendingRow = personaRow(cfg, KEY, { state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: launchStart })
+    const stub = installStub({ ...log, ...site.script(cfg, launchTimeoutOf(form, verb, ID), pendingRow), statusFn: approverReadsPendingThenLive(KEY, launchStart) })
+    const calls = recordCallsWithInFlight(stub, KEY)
+
+    let result: SpawnPersonaResult | undefined
+    let runningAtReturn: boolean | undefined
+    let inFlightAtReturn: boolean | undefined
+    let ownRow: ReturnType<typeof thisLaunchRowOf>
+    let outcome: ApproverOutcome | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await settleOffApproverClock(site.launch === undefined ? spawnForPersona(personaOf(cfg, KEY), cfg) : site.launch(cfg))
+      runningAtReturn = isDialogApproverRunning(KEY)
+      inFlightAtReturn = isLaunchInFlight(KEY)
+      await approverFirstLapTurns()
+      ownRow = thisLaunchRowOf(KEY)
+      outcome = await runOnApproverClock(clock, _whenDialogApproverStopped(KEY))
+    })
+
+    expect(result).toStrictEqual({ key: KEY, action: SPAWN_ACTION_RETRYING })
+    expect([runningAtReturn, inFlightAtReturn]).toEqual([true, false])
+    const window: LaunchCallWindowRecord = { verb, startMs: SAMPLE_LAUNCH_START_MS, endMs: SAMPLE_LAUNCH_START_MS, end: LAUNCH_CALL_END_LAUNCH_TIMEOUT }
+    expect(launchCallWindowOf(KEY)).toEqual(window)
+    expect(ownRow).toEqual({ launchStartMs: SAMPLE_LAUNCH_START_MS, window })
+    let launchCall = calls.length - 1
+    while (launchCall >= 0 && calls[launchCall]!.verb !== 'spawn' && calls[launchCall]!.verb !== 'resume') launchCall--
+    expect(calls[launchCall]).toMatchObject({ verb, id: ID })
+    expect(calls.slice(1, launchCall + 1).every((c) => c.inFlight)).toBe(true)
+    expect(calls.slice(launchCall + 1)).toEqual([{ verb: 'get', id: ID, inFlight: true }, ...APPROVER_LAPS])
+    expect(outcome).toEqual({ reason: APPROVER_STOP_LIVE, launchStartMs: SAMPLE_LAUNCH_START_MS })
+    expect(linesWith(errLog, APPROVER_LOG_PREFIX)).toContain(approverLogLine(approverStartedAfterLaunchTimeoutMessage(REF)))
+    // A timed-out launch has no result, so no pre_trust line.
+    expect(preTrustLines(errLog)).toEqual([])
+    expect(arms.pendingOnly).toEqual([{ key: KEY, approverRunning: false, launchCalls: log.spawnCalls.length + log.resumeCalls.length }])
+    expect(arms.full).toEqual([{ key: KEY, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
+    expect([log.killCalls, log.deleteCalls]).toEqual([[], []])
     assertNoLeak({ errLog })
   })
 
@@ -23628,8 +23805,11 @@ describe('b.jg5 SRJ-118, SRJ-609: the ladder\'s waiting and working branches map
 // launch and read calls from the `resume` on, the retry causes sent for P,
 // the outage flags raised, the failures counted (the entry counts its own
 // launch; the restart path counts a ladder launch from its answer), the
-// spawn-failure notices and the reuse spawns. A `get` after an
-// UNAVAILABLE outcome is not pinned. The CONFLICT rows are the case table's
+// spawn-failure notices and the reuse spawns. An UNAVAILABLE outcome is
+// followed by exactly one `get` of the row (b.jg5 SRJ-407), which reads it
+// `ended` at both sites, so nothing more is called and the launch still
+// answers `retrying`; that `get`'s other answers are the SRJ-407
+// describe's. The CONFLICT rows are the case table's
 // (`tests/test-helpers/conflict-cases.ts`): at the ladder every `resume`
 // row crossed with every `resume` site (`LATCH_CROSS`), at the entry the
 // sequence `resume` rows.
@@ -23657,8 +23837,6 @@ interface ResumeSiteOutcome {
 interface ResumeOutcomeRow {
   readonly name: string
   readonly make?: () => Error
-  /** A `get` after the outcome: not pinned. */
-  readonly getNotPinned?: true
   /** Install agent-director's version re-check (ErrInvalidFlags's one immediate re-check, b.jg5 SRJ-204). */
   readonly recheck?: true
   readonly ladder: ResumeSiteOutcome
@@ -23687,10 +23865,10 @@ const RESUME_OUTCOME_ROWS: readonly ResumeOutcomeRow[] = [
   // A launch that returned arms P's pending-only watch over the `pending` row it left (b.jg5 SRJ-301, SRJ-409).
   { name: 'success → resumed', ...atBothSites({ answer: { action: 'resumed' }, calls: ['resume'], triggers: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW] }) },
   ...RESUME_UNAVAILABLE_FORMS.map(([label, make, cause]): ResumeOutcomeRow => ({
-    name: `UNAVAILABLE (${label}) → refused, never counted, no notice, P's timer armed`,
+    // b.jg5 SRJ-407: one `get` after the outcome, reading the row `ended`; no launch after it.
+    name: `UNAVAILABLE (${label}) → refused, never counted, no notice, P's timer armed; one get of the row, nothing after it`,
     make: () => make('resume'),
-    getNotPinned: true,
-    ...atBothSites({ answer: RETRYING_ANSWER, calls: ['resume'], triggers: [cause] }),
+    ...atBothSites({ answer: RETRYING_ANSWER, calls: ['resume', 'get'], triggers: [cause] }),
   })),
   {
     name: 'ENVIRONMENT (ErrTmuxNotAvailable) → tmux-unavailable, refused, never counted',
@@ -23755,24 +23933,23 @@ const RESUME_OUTCOME_ROWS: readonly ResumeOutcomeRow[] = [
 ]
 
 /**
- * Assert what `row`'s outcome `outcome` shows for persona `p` once the launch
- * answered `result`: the answer, the calls from the `resume` on (`order`,
- * every stub call in order), the causes sent, the flags raised, the
- * failures counted, the notices and the reuse spawns; no kill or delete;
+ * Assert what a row's outcome at one site, `outcome`, shows for persona `p`
+ * once the launch answered `result`: the answer, the calls from the `resume`
+ * on (`order`, every stub call in order), the causes sent, the flags raised,
+ * the failures counted, the notices and the reuse spawns; no kill or delete;
  * one version re-check where the row makes one. Then P's dialog approver,
  * when a launch started it, is run to its stop.
  */
 async function expectResumeOutcome(
   h: RecoveryHarness,
   p: string,
-  row: ResumeOutcomeRow,
   outcome: ResumeSiteOutcome,
   result: unknown,
   order: readonly string[],
   rechecks: { readonly resolves: readonly unknown[] } | undefined,
 ): Promise<void> {
   expect(result).toStrictEqual({ key: p, ...outcome.answer })
-  const fromResume = order.slice(order.indexOf('resume')).filter((verb) => LAUNCH_AND_READ_VERBS.has(verb) && !(row.getNotPinned === true && verb === 'get'))
+  const fromResume = order.slice(order.indexOf('resume')).filter((verb) => LAUNCH_AND_READ_VERBS.has(verb))
   expect(fromResume).toEqual([...outcome.calls])
   expect(h.triggers.filter((t) => t.key === p).map((t) => t.kind)).toEqual([...outcome.triggers])
   expect([...getOutageFlags(p)]).toEqual([...(outcome.flags ?? [])])
@@ -23998,7 +24175,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
 
     const result = await launchEntry(h, p, LIVE_ROW_LAUNCH_RESUME)
 
-    await expectResumeOutcome(h, p, row, row.entry, result, order, rechecks)
+    await expectResumeOutcome(h, p, row.entry, result, order, rechecks)
     // No second sequence: the entry starts none, whatever the answer.
     expect(h.sequenceRunning(p)).toBe(false)
   })
@@ -24212,6 +24389,13 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
       readonly latched?: (key: string) => ConflictLatchRecord
       /** Whether the answer is reported once to P's unclassified-error episode. */
       readonly unclassified?: true
+      /**
+       * Whether one `get` of P's row follows the reuse (an UNAVAILABLE outcome,
+       * b.jg5 SRJ-407); the case has it read the row `ended`, as the sequence
+       * last read it, so nothing more is called. That `get`'s other answers
+       * are the SRJ-407 describe's.
+       */
+      readonly oneGet?: true
     }
 
     const RETRYING = { action: SPAWN_ACTION_RETRYING } as const
@@ -24243,8 +24427,8 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
         ),
         ['a value that is no agent-director error', () => new Error('the call broke'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE] as const,
       ].map(([label, make, cause]): readonly [string, ReuseOutcome] => [
-        `UNAVAILABLE (${label}): refused, not counted, no notice`,
-        { make: () => make('spawn'), answer: RETRYING, armed: [cause], counted: 0 },
+        `UNAVAILABLE (${label}): refused, not counted, no notice; one get of the row follows`,
+        { make: () => make('spawn'), answer: RETRYING, armed: [cause], counted: 0, oneGet: true },
       ]),
       [
         `CONFLICT (${CONFLICT_ROW!.name}): latched with the reuse spawn refused, nothing counted`,
@@ -24307,15 +24491,16 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
       ]),
     ]
 
-    test.each(REUSE_OUTCOMES)('SRJ-112, %s; the one reuse spawn is the last call: no kill, delete, resume or second spawn', async (_label, row) => {
+    test.each(REUSE_OUTCOMES)('SRJ-112, %s; the one reuse spawn is the last launch: no kill, delete, resume or second spawn', async (_label, row) => {
       const { h, p, b } = srj105Build()
       const err = row.make()
       if (err !== undefined) h.script({ spawnError: err })
+      if (row.oneGet === true) h.script({ getResult: harnessRow(h, harnessPersona(h, p), { state: LIVENESS_DEAD_ROW_ENDED }) })
       const order = recordCallOrder(h)
 
       expect<unknown>(await reuseEntry(h, p)).toStrictEqual({ key: p, ...row.answer })
 
-      expect(order).toEqual(['spawn'])
+      expect(order).toEqual(row.oneGet === true ? ['spawn', 'get'] : ['spawn'])
       expect(h.reuseSpawns()).toEqual(oneReuseOf(h, p))
       expect(h.triggers).toEqual(row.armed.map((kind) => ({ key: p, kind })))
       expect(getFailureCount(p)).toBe(row.counted)
@@ -24750,14 +24935,14 @@ describe('b.jg5 SRJ-707, SRJ-712: resume\'s no-transcript answers go on to one r
   // after ErrJsonlMissing is a row of the class describes'
   // (`SPAWN_AND_RESUME_SITES`), each asserting no notice; this case shows the
   // diagnosis did run there.
-  test('at the collision ladder, resume answering ErrJsonlMissing, its diagnosis inconclusive, then a reuse refused as UNAVAILABLE: the diagnosis line is logged and its inconclusive entry written, but no diagnosis notice is posted; refused, nothing counted', async () => {
+  test('at the collision ladder, resume answering ErrJsonlMissing, its diagnosis inconclusive, then a reuse refused as UNAVAILABLE: the diagnosis line is logged and its inconclusive entry written, but no diagnosis notice is posted; refused, nothing counted; the reuse\'s one get (b.jg5 SRJ-407) reads the row ended and nothing follows it', async () => {
     const { h, p } = srj105Build()
     h.script({ ...collided(h, harnessPersona(h, p), ENDED_WITH_SESSION, errTmuxUnresponsive('spawn')), resumeError: errJsonlMissing() })
     const order = recordCallOrder(h)
 
     expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_RETRYING })
 
-    expect(order).toEqual(['spawn', 'get', 'resume', 'get', 'spawn'])
+    expect(order).toEqual(['spawn', 'get', 'resume', 'get', 'spawn', 'get'])
     expect(h.errors.filter((line) => line.includes(JSONL_DIAGNOSIS_REUSE_WORDING))).toHaveLength(1)
     expect(countStartupEntries(h.startupErrors().join('\n'), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(1)
     expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
@@ -25533,7 +25718,7 @@ describe('b.jg5 SRJ-113: resume\'s outcome table at resumeOrFreshSpawn, one case
 
     const result = await h.launch(p)
 
-    await expectResumeOutcome(h, p, row, row.ladder, result, order, rechecks)
+    await expectResumeOutcome(h, p, row.ladder, result, order, rechecks)
     expect(h.sequenceRunning(p)).toBe(false)
   })
 
@@ -25567,7 +25752,13 @@ describe('b.jg5 SRJ-113: resume\'s outcome table at resumeOrFreshSpawn, one case
     expect(h.controller.view(p)).toMatchObject({ phase: 'waiting', mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY })
   })
 
-  /** One of HO rev 28's four failures met after the `resume`'s move, and the outcome it has whatever restore sentence ends its description. */
+  /**
+   * One of HO rev 28's four failures met after the `resume`'s move, and the
+   * outcome it has whatever restore sentence ends its description. Only the
+   * UNAVAILABLE one is followed by a call: one `get` of the row (b.jg5
+   * SRJ-407), which reads it `ended` here; the row it reads decides, never the
+   * sentence.
+   */
   const RESTORE_FAILURES: ReadonlyArray<readonly [string, () => Error, (h: RecoveryHarness, p: string, err: Error) => void]> = [
     ['ErrTmuxSessionCreate', () => errTmuxSessionCreate('resume'), (h, p) => {
       expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
@@ -25596,7 +25787,7 @@ describe('b.jg5 SRJ-113: resume\'s outcome table at resumeOrFreshSpawn, one case
     'ErrTmuxNotAvailable': RETRYING_ANSWER,
   }
 
-  test.each(RESTORE_FAILURES.flatMap(([label, make, check]) => [undefined, ...RESTORE_SENTENCES].map((sentence) => [label, sentence ?? '(no restore sentence)', make, check, sentence] as const)))('SRJ-113, SRJ-1303 (HO rev 28): resume answering %s ending with %s has the same outcome: the launch\'s answer, its causes and latch, no kill, nothing after the resume', async (label, _sentenceLabel, make, check, sentence) => {
+  test.each(RESTORE_FAILURES.flatMap(([label, make, check]) => [undefined, ...RESTORE_SENTENCES].map((sentence) => [label, sentence ?? '(no restore sentence)', make, check, sentence] as const)))('SRJ-113, SRJ-1303 (HO rev 28): resume answering %s ending with %s has the same outcome: the launch\'s answer, its causes and latch, no kill, nothing after the resume but an UNAVAILABLE outcome\'s one get', async (label, _sentenceLabel, make, check, sentence) => {
     const { h, p } = srj105Build()
     const base = make() as AgentDirectorError
     const err = sentence === undefined ? base : withRestoreSentence(base, sentence)
@@ -25606,7 +25797,7 @@ describe('b.jg5 SRJ-113: resume\'s outcome table at resumeOrFreshSpawn, one case
     expect(await h.launch(p)).toStrictEqual({ key: p, ...RESTORE_ANSWERS[label] })
 
     expect(classifyAdError(err).errorClass).toBe(classifyAdError(base).errorClass)
-    expect(order.slice(order.indexOf('resume'))).toEqual(['resume'])
+    expect(order.slice(order.indexOf('resume'))).toEqual(classifyAdError(base).errorClass === AD_ERROR_CLASS_UNAVAILABLE ? ['resume', 'get'] : ['resume'])
     expect(h.stub.calls.killCalls).toEqual([])
     check(h, p, err)
   })
@@ -27360,6 +27551,8 @@ interface StartResultRow {
   readonly armed?: string
   /** `launchSession`'s answer for the same launch; not driven here when unset. */
   readonly launched?: LaunchSessionResult
+  /** The launch and read calls P's launch makes (`LAUNCH_AND_READ_VERBS`), in order; not checked when unset. */
+  readonly calls?: readonly string[]
 }
 
 /** A launch of P whose optimistic spawn collides and whose `get`s read `row`, with `more` on top. */
@@ -27379,13 +27572,29 @@ const START_RESULT_ROWS: ReadonlyArray<readonly [string, StartResultRow]> = [
       launched: 'skipped',
     },
   ],
+  // b.jg5 SRJ-407: each UNAVAILABLE launch outcome is followed by one get of
+  // P's row, and no launch: here it reads the row ended, or finds none.
   [
-    'an UNAVAILABLE spawn inside the attempt',
-    { arrange: (h) => h.script({ spawnError: errTmuxUnresponsive('spawn') }), action: SPAWN_ACTION_RETRYING, counts: { retrying: 1 }, armed: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, launched: 'refused' },
+    'an UNAVAILABLE spawn inside the attempt, its one get reading the row ended',
+    {
+      arrange: (h, p) => h.script({ spawnError: errTmuxUnresponsive('spawn'), getResult: harnessRow(h, harnessPersona(h, p), { state: LIVENESS_DEAD_ROW_ENDED }) }),
+      action: SPAWN_ACTION_RETRYING,
+      counts: { retrying: 1 },
+      armed: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
+      launched: 'refused',
+      calls: ['spawn', 'get'],
+    },
   ],
   [
-    'a launch timeout (ErrCallTimeout at the spawn)',
-    { arrange: (h) => h.script({ spawnError: errCallTimeout('spawn') }), action: SPAWN_ACTION_RETRYING, counts: { retrying: 1 }, armed: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, launched: 'refused' },
+    'a launch timeout (ErrCallTimeout at the spawn), its one get finding no row (ErrSpawnNotFound)',
+    {
+      arrange: (h) => h.script({ spawnError: errCallTimeout('spawn'), getError: errSpawnNotFound() }),
+      action: SPAWN_ACTION_RETRYING,
+      counts: { retrying: 1 },
+      armed: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
+      launched: 'refused',
+      calls: ['spawn', 'get'],
+    },
   ],
   [
     'a transient reconnect at the ladder\'s waiting branch',
@@ -27465,10 +27674,12 @@ describe('b.jg5 SRJ-1015 (AC 72): the start pass counts each launch result once,
     const { h, p } = buildP()
     await row.arrange(h, p)
     const triggersBefore = h.triggers.length
+    const order = recordCallOrder(h)
 
     const result = await h.drive(startupSessionManager(h.config, { concurrency: 1 }))
 
     expect(result.perPersona).toEqual([{ key: p, action: row.action }])
+    if (row.calls !== undefined) expect(order.filter((verb) => LAUNCH_AND_READ_VERBS.has(verb))).toEqual([...row.calls])
     expect(startCountsOf(result)).toEqual({ ...NO_START_COUNTS, ...row.counts })
     expect(h.errors.filter((line) => line.startsWith('[slack] startupSessionManager: complete — '))).toEqual([startupSummaryLine(1, result)])
     expect(h.triggers.slice(triggersBefore)).toEqual(row.armed === undefined ? [] : [{ key: p, kind: row.armed }])
@@ -28168,5 +28379,502 @@ describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the l
       `${throws} (${OLD_LIFE_HOLD_END_RETRY_FAILED_PREFIX}${describeThrownValue(failure)})`,
     ])
     expect(h.errors.filter((l) => l === line)).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-407 (E28 T3), with SRJ-401, SRJ-409, SRJ-411, SRJ-114, SRJ-513,
+// SRJ-806 and SRJ-310 (AC 29, AC 31, AC 35, AC 83), on `makeRecoveryHarness`
+// with the session manager's clock on the harness clock (`harnessNow`):
+// each launch call's window, and the one `get` after a launch timeout or any
+// other UNAVAILABLE launch outcome.
+//
+// A launch call is timed through the harness's driver (`scriptTimedLaunch`):
+// it takes `TIMED_CALL_MS` on the harness clock and ends in either form of a
+// launch timeout (or success), and from its end on the persona's `get`
+// reads its row with the launch start placed against the call's window. The
+// three launch verbs are reached as the start pass reaches them: the
+// ladder's first spawn, a reuse spawn replacing an `ended` row in another
+// directory and a `resume` of an `ended` row. For each verb and form, one
+// case per answer of SRJ-407's `get` table asserts the launch and read calls
+// (the `get` is the last: no launch in the attempt, and nothing after it),
+// the window (`launchCallWindowOf`), the "this launch's row" record
+// (`thisLaunchRowOf`: only a `pending` row whose launch start lies inside the
+// window, both bounds included; AC 31 for `resume`), the approver (only for
+// a covered `pending` row, started after the launch call returned), the arms
+// and the answer: the uncounted `retrying`, `latched` or `sequence-waiting`.
+// A live-row sequence's start is read from a recording registry
+// (`recordSequenceStarts`), so none runs. Every other UNAVAILABLE launch
+// outcome gets the one `get` too, and a `pending` row then gets no approver
+// and is never this launch's row. AC 35 (a recorded key's timed-out reuse
+// over its old life), AC 83 (no retry launch while the row is `pending`) and
+// AC 29 end to end (the approver clears a startup dialog after the timeout;
+// SRJ-310's rule 3 ends the condition) follow. Rule 3's own table is
+// tests/tmux-unresponsive.test.ts's; the next retry after each answer
+// tests/unavailable-retry.test.ts's; a recorded key's mark after a timed-out
+// reuse tests/retired-keys.test.ts's. No case kills, deletes, counts a
+// failure or sets `include_finished`.
+// ---------------------------------------------------------------------------
+
+/** How long a timed launch call takes on the harness clock: its window's length. */
+const TIMED_CALL_MS = 3_000
+
+/** A launch verb SRJ-407's cases end: how P's start-pass launch reaches the call, and its launch and read calls up to it. */
+interface TimedVerb {
+  readonly verb: 'spawn' | 'resume'
+  readonly reuse: boolean
+  /** Script the answers that bring P's launch to the call. */
+  readonly arrange: (h: RecoveryHarness, p: string) => void
+  /** The launch and read calls (`LAUNCH_AND_READ_VERBS`) up to and including the call. */
+  readonly calls: readonly string[]
+}
+
+const TIMED_VERBS: ReadonlyArray<readonly [string, TimedVerb]> = [
+  ['the ladder\'s first spawn', { verb: 'spawn', reuse: false, arrange: () => {}, calls: ['spawn'] }],
+  [
+    'a reuse spawn (the ladder replacing an ended row in another directory)',
+    { verb: 'spawn', reuse: true, arrange: (h, p) => h.script(collided(h, harnessPersona(h, p), { state: LIVENESS_DEAD_ROW_ENDED, cwd: h.home })), calls: ['spawn', 'get', 'spawn'] },
+  ],
+  ['a resume (the ladder resuming an ended row)', { verb: 'resume', reuse: false, arrange: (h, p) => h.script(collided(h, harnessPersona(h, p), ENDED_WITH_SESSION)), calls: ['spawn', 'get', 'resume'] }],
+]
+
+/** One answer of SRJ-407's `get` after a launch timeout, and what follows it. */
+interface AfterTimeoutRow {
+  /** Where the row's launch start lies against the call's window; `inside` when unset. */
+  readonly launchStart?: TimedLaunchStart
+  /** The row the `get` reads (`personaRow` overrides); P's own row `pending` when unset. */
+  readonly row?: (h: RecoveryHarness) => PersonaGetResultOverrides
+  /** The `get` answers this error instead of a row. */
+  readonly getError?: () => Error
+  readonly action: SpawnPersonaResult['action']
+  /** The step's outcome, as its one line ends. */
+  readonly outcome: string
+  /** How the step's line names the row state the `get` read; not asserted when unset. */
+  readonly read?: string
+  /** Whether the row is this launch's (`thisLaunchRowOf`). */
+  readonly ownRow?: true
+  /** Whether the approver starts. */
+  readonly approver?: true
+  /** Whether the pending-row step arms P's timer in pending-only mode, after the launch's own UNAVAILABLE arm. */
+  readonly pendingOnly?: true
+  /** The cause the `get`'s own answer arms P's timer with, after the launch's own UNAVAILABLE arm. */
+  readonly getArmed?: string
+  /** The live-row sequence the step starts: its seed is `pending`, the conversation not kept, context `recovery`. */
+  readonly sequence?: true
+  /** The latch case the read latches P with. */
+  readonly latchCase?: string
+}
+
+const AFTER_TIMEOUT_ROWS: ReadonlyArray<readonly [string, AfterTimeoutRow]> = [
+  ['finding no row (ErrSpawnNotFound): no launch in the attempt, retrying', { getError: () => errSpawnNotFound(), action: SPAWN_ACTION_RETRYING, outcome: LAUNCH_UNAVAILABLE_OUTCOME_NO_ROW }],
+  [
+    'refused (UNAVAILABLE): its own refusal arms P\'s timer by its class; nothing more, retrying',
+    { getError: () => errTmuxUnresponsive('get'), action: SPAWN_ACTION_RETRYING, outcome: LAUNCH_UNAVAILABLE_OUTCOME_REFUSED, getArmed: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE },
+  ],
+  ...([
+    ['at the call\'s start', 'at-start'],
+    ['at the call\'s timeout', 'at-end'],
+  ] as const).map(([where, launchStart]): readonly [string, AfterTimeoutRow] => [
+    `reading P's covered pending row, its launch start ${where} (inside the window): this launch's row, CSCB's own (AC 31); the approver starts after the launch call returned; pending-only armed; retrying`,
+    { launchStart, action: SPAWN_ACTION_RETRYING, outcome: LAUNCH_UNAVAILABLE_OUTCOME_APPROVER, ownRow: true, approver: true, pendingOnly: true },
+  ]),
+  ...([
+    ['earlier than the call', 'before'],
+    ['later than its timeout', 'after'],
+  ] as const).map(([where, launchStart]): readonly [string, AfterTimeoutRow] => [
+    `reading P's covered pending row, its launch start ${where}: not this launch's row (AC 31); the approver still starts; pending-only armed; retrying, nothing killed`,
+    { launchStart, action: SPAWN_ACTION_RETRYING, outcome: LAUNCH_UNAVAILABLE_OUTCOME_APPROVER, approver: true, pendingOnly: true },
+  ]),
+  [
+    'reading a pending row in another directory (not covered): the live-row sequence, no approver and no send-keys; sequence-waiting',
+    {
+      launchStart: 'before',
+      row: (h) => ({ state: AGENT_DIRECTOR_PENDING_STATE, cwd: h.home }),
+      action: 'sequence-waiting',
+      outcome: launchUnavailableSequenceOutcome(PENDING_ROW_REASON_CWD_MISMATCH, LIVE_ROW_START_STARTED, 'sequence-waiting'),
+      sequence: true,
+    },
+  ],
+  [
+    'reading P\'s own pending row with no launch start: P latches, no approver; latched',
+    { launchStart: 'none', action: 'latched', outcome: LAUNCH_UNAVAILABLE_OUTCOME_LATCHED, latchCase: LATCH_CASE_LAUNCH_START_NOT_RECORDED },
+  ],
+  [
+    'reading P\'s pending row carrying a provenance_conflict note: P latches, no approver; latched',
+    { row: () => ({ state: AGENT_DIRECTOR_PENDING_STATE, liveness_note: provenanceNote }), action: 'latched', outcome: LAUNCH_UNAVAILABLE_OUTCOME_LATCHED, latchCase: LATCH_CASE_CONFLICTING_LABELS },
+  ],
+  ['reading another live state (waiting): no call after the get, retrying', { row: () => ({ state: 'waiting' }), action: SPAWN_ACTION_RETRYING, outcome: LAUNCH_UNAVAILABLE_OUTCOME_LIVE }],
+  ...[LIVENESS_DEAD_ROW_ENDED, LIVENESS_DEAD_ROW_MISSING].map((state): readonly [string, AfterTimeoutRow] => [
+    `reading the row ${state}: no launch in the attempt, retrying`,
+    { row: () => ({ state }), action: SPAWN_ACTION_RETRYING, outcome: LAUNCH_UNAVAILABLE_OUTCOME_FINISHED },
+  ]),
+  // The line names a short identifier as read, and any other value only as `unknown`.
+  ...([
+    ['a state CSCB does not know', 'hibernating', 'hibernating'],
+    ['an unreadable state', 'not a state', 'unknown'],
+  ] as const).map(([name, state, read]): readonly [string, AfterTimeoutRow] => [
+    `reading ${name} (${JSON.stringify(state)}): no call after the get, the line naming it ${read}; retrying`,
+    { row: () => ({ state }), action: SPAWN_ACTION_RETRYING, outcome: LAUNCH_UNAVAILABLE_OUTCOME_UNKNOWN, read },
+  ]),
+]
+
+/** The head of the step's one line per decision (b.jg5 SRJ-407). */
+const LAUNCH_UNAVAILABLE_LINE_HEAD = `[slack] ${LAUNCH_UNAVAILABLE_GET_SITE.site}: one get after the `
+
+/** The step's lines among the harness's errors. */
+const launchUnavailableLines = (h: RecoveryHarness): string[] => h.errors.filter((line) => line.startsWith(LAUNCH_UNAVAILABLE_LINE_HEAD))
+
+/** One call of persona `key`'s row by the dialog approver's verbs, with whether a launch of `key` was in flight then. */
+interface RowCallInFlight {
+  readonly verb: string
+  readonly inFlight: boolean
+}
+
+/** Record each `status`, `read-pane` and `send-keys` of persona `key`'s instance from now on, in order, with `isLaunchInFlight(key)` at the call. */
+function recordRowCallsInFlight(h: RecoveryHarness, key: string): RowCallInFlight[] {
+  const calls: RowCallInFlight[] = []
+  const client = h.stub.client as unknown as Record<string, (params: { claude_instance_id?: unknown }) => Promise<unknown>>
+  for (const verb of ['status', 'readPane', 'sendKeys']) {
+    const original = client[verb]!
+    client[verb] = (params) => {
+      if (params.claude_instance_id === personaInstanceId(key)) calls.push({ verb, inFlight: isLaunchInFlight(key) })
+      return original.call(client, params)
+    }
+  }
+  return calls
+}
+
+/** A harness over P and B, the session manager's clock on the harness clock, moved to the stub's sample launch start; `options` on top. */
+async function timedLaunchBuild(options: RecoveryHarnessOptions = {}): Promise<{ h: RecoveryHarness; p: string; b: string }> {
+  const built = srj105Build({ harnessNow: true, ...options })
+  await built.h.clock.advanceTo(SAMPLE_LAUNCH_START_MS)
+  return built
+}
+
+/** Keep P's `status` reads on the timed row (`pending`, its launch start) once the call has ended; the stub's default before. */
+function statusOnTimedRow(h: RecoveryHarness, t: TimedLaunch): void {
+  h.script({ statusFn: () => (t.window()?.endMs !== undefined ? t.statusRow() : cannedStatusResult()) })
+}
+
+describe('b.jg5 SRJ-407: launchUnavailableFormText (pure)', () => {
+  const failures = [describeAgentDirectorFailure(errTmuxUnresponsive('spawn')), describeAgentDirectorFailure(errSpawnNotFound())]
+
+  test.each(LAUNCH_TIMEOUT_FORMS.map((form) => [form] as const))('a launch timeout (%s): names its form, the same whatever the described failure, and never the failure', (form) => {
+    const texts = failures.map((failure) => launchUnavailableFormText(form, failure))
+    expect(texts[0]).toContain(form)
+    expect(texts[1]).toBe(texts[0]!)
+    for (const failure of failures) expect(texts[0]).not.toContain(failure)
+    expect(launchUnavailableFormText(LAUNCH_TIMEOUT_FORMS.find((other) => other !== form)!, failures[0]!)).not.toBe(texts[0]!)
+  })
+
+  test('no launch timeout: names the described failure, never as a launch timeout', () => {
+    for (const failure of failures) {
+      const text = launchUnavailableFormText(undefined, failure)
+      expect(text).toContain(`(${failure})`)
+      for (const form of LAUNCH_TIMEOUT_FORMS) expect(text).not.toBe(launchUnavailableFormText(form, failure))
+    }
+  })
+})
+
+describe('b.jg5 SRJ-407: each launch call\'s window, and one get after a launch timeout or any other UNAVAILABLE launch outcome, never launching over what it reads', () => {
+  afterEach(() => {
+    expectNoDeleteOrIncludeFinished(srj105Harness)
+    srj105AfterEach()
+  })
+
+  // The window on success: the call's start and its return.
+  test.each(TIMED_VERBS)('%s that returns success: the window is its start and its return on the harness clock, ended returned; no row is this launch\'s and no get follows', async (_name, verb) => {
+    const { h, p } = await timedLaunchBuild()
+    verb.arrange(h, p)
+    const t = scriptTimedLaunch(h, p, { verb: verb.verb, reuse: verb.reuse, takesMs: TIMED_CALL_MS, end: TIMED_LAUNCH_SUCCESS })
+    const order = recordCallOrder(h)
+
+    expect((await h.launch(p)).action).toBe(verb.verb === 'resume' ? 'resumed' : 'spawned')
+
+    expect(launchCallWindowOf(p)).toEqual({ verb: verb.verb, startMs: SAMPLE_LAUNCH_START_MS, endMs: SAMPLE_LAUNCH_START_MS + TIMED_CALL_MS, end: LAUNCH_CALL_END_RETURNED })
+    expect(t.window()).toEqual({ startMs: SAMPLE_LAUNCH_START_MS, endMs: SAMPLE_LAUNCH_START_MS + TIMED_CALL_MS })
+    expect(thisLaunchRowOf(p)).toBeUndefined()
+    expect(order.filter((v) => LAUNCH_AND_READ_VERBS.has(v))).toEqual([...verb.calls])
+    await h.runApproverToStop(p)
+  })
+
+  test.each(
+    TIMED_VERBS.flatMap(([verbName, verb]) =>
+      LAUNCH_TIMEOUT_FORMS.flatMap((form) => AFTER_TIMEOUT_ROWS.map(([rowName, row]) => [verbName, form, rowName, verb, row] as const)),
+    ),
+  )('%s ending in a launch timeout (%s), its one get %s', async (_verbName, form, _rowName, verb, row) => {
+    const { h, p, b } = await timedLaunchBuild()
+    const starts = recordSequenceStarts()
+    verb.arrange(h, p)
+    const t = scriptTimedLaunch(h, p, {
+      verb: verb.verb,
+      reuse: verb.reuse,
+      takesMs: TIMED_CALL_MS,
+      end: form,
+      launchStart: row.launchStart ?? 'inside',
+      row: row.row?.(h) ?? { state: AGENT_DIRECTOR_PENDING_STATE },
+    })
+    const getError = row.getError
+    if (getError !== undefined) h.script({ getFn: (params) => (t.window()?.endMs !== undefined && params.claude_instance_id === personaInstanceId(p) ? getError() : undefined) })
+    statusOnTimedRow(h, t)
+    const order = recordCallOrder(h)
+    const rowCalls = recordRowCallsInFlight(h, p)
+
+    const result = await h.launch(p)
+    const ownRowAtReturn = thisLaunchRowOf(p)
+    const inFlightAtReturn = isLaunchInFlight(p)
+
+    expect(result).toStrictEqual({ key: p, action: row.action })
+    // The get is the launch's last call: no launch in the attempt, and nothing after it.
+    expect(order.filter((v) => LAUNCH_AND_READ_VERBS.has(v))).toEqual([...verb.calls, 'get'])
+    const window: LaunchCallWindowRecord = { verb: verb.verb, ...t.window()!, end: LAUNCH_CALL_END_LAUNCH_TIMEOUT }
+    expect(launchCallWindowOf(p)).toEqual(window)
+    expect(window.endMs! - window.startMs).toBe(TIMED_CALL_MS)
+    expect(ownRowAtReturn).toEqual(row.ownRow === true ? { launchStartMs: Date.parse(t.launchStartedAt()!), window } : undefined)
+    const lines = launchUnavailableLines(h)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toContain(` ended in ${launchUnavailableFormText(form, describeAgentDirectorFailure(t.error))}: `)
+    if (row.read !== undefined) expect(lines[0]).toContain(`: read ${row.read}; `)
+    expect(lines[0]).toEndWith(` — ${row.outcome}; no launch in this attempt (b.jg5 SRJ-407)`)
+    expect(h.triggers.filter((trigger) => trigger.key === p)).toEqual([
+      { key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE },
+      ...(row.pendingOnly === true ? [{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }] : []),
+      ...(row.getArmed === undefined ? [] : [{ key: p, kind: row.getArmed }]),
+    ])
+    expect(starts).toEqual(
+      row.sequence === true
+        ? [expect.objectContaining({ key: p, lastReadState: AGENT_DIRECTOR_PENDING_STATE, keepsConversation: false, retiredKey: false, alertContext: KILL_FAILURE_CONTEXT_RECOVERY })]
+        : [],
+    )
+    expect<string | undefined>(h.latch.record(p)?.latchCase).toBe(row.latchCase)
+    if (row.approver === true) {
+      // Started outside the launch call: its first status and read-pane come once the launch has settled.
+      expect([inFlightAtReturn, h.approverRunning(p)]).toEqual([false, true])
+      await h.settle()
+      expect(rowCalls.slice(0, 2)).toEqual([
+        { verb: 'status', inFlight: false },
+        { verb: 'readPane', inFlight: false },
+      ])
+      expect(h.errors).toContain(approverLogLine(approverStartedAfterLaunchTimeoutMessage(renderPersonaRef(p, p))))
+      await h.runApproverToStop(p)
+    } else {
+      await h.settle()
+      expect([h.approverRunning(p), await _whenDialogApproverStopped(p)]).toEqual([false, undefined])
+      // No call of any verb after the get: no approver lap, keystroke or pane read.
+      expect(order).toEqual([...verb.calls, 'get'])
+    }
+    expect([h.stub.calls.killCalls, getFailureCount(p), h.notices]).toEqual([[], 0, []])
+    expect(personaCallCounts(h, b)).toEqual({})
+  })
+
+  /** The UNAVAILABLE outcomes of a launch call that are no launch timeout, at the verbs that meet them, each with its builder. */
+  const OTHER_UNAVAILABLE: ReadonlyArray<readonly [string, string, TimedVerb, () => Error]> = TIMED_VERBS.flatMap(
+    ([verbName, verb]): Array<readonly [string, string, TimedVerb, () => Error]> => [
+      [verbName, 'tmux unreadable (ErrTmuxUnresponsive)', verb, () => errTmuxUnresponsive(verb.verb)],
+      ...(verb.verb === 'spawn' && !verb.reuse
+        ? [[verbName, 'HO rev 15: the pre-spawn scan could not answer, no row written (ErrTmuxUnresponsive)', verb, () => errTmuxUnresponsive(verb.verb, 'the pre-spawn scan could not list tmux sessions; no row was written; retry later')] as const]
+        : [
+            [verbName, 'still stopping (ErrTmuxUnresponsive)', verb, () => errTmuxUnresponsiveStillStopping(verb.verb)] as const,
+            [verbName, 'still starting (ErrTmuxUnresponsive)', verb, () => errTmuxUnresponsiveStillStarting(verb.verb)] as const,
+            [verbName, 'HO rev 20: "duplicate session" and its holder could not be read (ErrTmuxUnresponsive)', verb, () => errTmuxUnresponsiveAfterDuplicateSession(verb.verb)] as const,
+          ]),
+    ],
+  )
+
+  test.each(OTHER_UNAVAILABLE)('%s answering an UNAVAILABLE outcome that is no launch timeout, %s: the window keeps no end; one get, reading P\'s covered pending row with its launch start at the call\'s start; no approver, never this launch\'s row; pending-only armed; retrying, no launch after the get', async (_verbName, _label, verb, make) => {
+    const { h, p } = await timedLaunchBuild()
+    const starts = recordSequenceStarts()
+    verb.arrange(h, p)
+    const err = make()
+    h.script(verb.verb === 'resume' ? { resumeError: err } : verb.reuse ? collided(h, harnessPersona(h, p), { state: LIVENESS_DEAD_ROW_ENDED, cwd: h.home }, err) : { spawnError: err })
+    // The `get` after the call reads the row pending, its launch start the call's start (the clock does not move).
+    const getsBefore = verb.calls.filter((v) => v === 'get').length
+    let gets = 0
+    h.script({
+      getFn: () => (++gets > getsBefore ? harnessRow(h, harnessPersona(h, p), { state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: new Date(SAMPLE_LAUNCH_START_MS).toISOString() }) : undefined),
+      statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }),
+    })
+    const order = recordCallOrder(h)
+    const rowCalls = recordRowCallsInFlight(h, p)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_RETRYING })
+
+    expect(order.filter((v) => LAUNCH_AND_READ_VERBS.has(v))).toEqual([...verb.calls, 'get'])
+    expect(launchCallWindowOf(p)).toEqual({ verb: verb.verb, startMs: SAMPLE_LAUNCH_START_MS })
+    expect(thisLaunchRowOf(p)).toBeUndefined()
+    const lines = launchUnavailableLines(h)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toContain(` ended in ${launchUnavailableFormText(undefined, describeAgentDirectorFailure(err))}: `)
+    expect(lines[0]).toEndWith(` — ${LAUNCH_UNAVAILABLE_OUTCOME_COVERED_NO_APPROVER}; no launch in this attempt (b.jg5 SRJ-407)`)
+    expect(h.triggers.filter((trigger) => trigger.key === p)).toEqual([
+      { key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE },
+      { key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW },
+    ])
+    await h.settle()
+    expect([h.approverRunning(p), await _whenDialogApproverStopped(p), rowCalls, starts]).toEqual([false, undefined, [], []])
+    expect([h.stub.calls.killCalls, getFailureCount(p), h.notices]).toEqual([[], 0, []])
+  })
+
+  // A stop that comes between the launch timeout and the approver's start (a
+  // teardown's stop of P's approver while its launch is in flight, or the
+  // shutdown's), here while the one `get` is answered: the start entry
+  // refuses the approver, so the covered row gets none, and the step's line
+  // says so.
+  test.each(
+    ([
+      ['the teardown\'s stop of P\'s approver', (p: string) => stopDialogApprover(p, APPROVER_STOP_TEARDOWN), APPROVER_STOP_TEARDOWN],
+      ['the shutdown\'s stop of every approver', () => stopAllDialogApprovers(), APPROVER_STOP_SHUTDOWN],
+    ] as const).flatMap(([name, stop, reason]) => LAUNCH_TIMEOUT_FORMS.map((form) => [name, form, stop, reason] as const)),
+  )('%s during the one get after a launch timeout (%s) reading P\'s covered pending row: the approver is not started, no call after the get; this launch\'s row; pending-only armed; retrying', async (_name, form, stop, reason) => {
+    const { h, p } = await timedLaunchBuild()
+    const t = scriptTimedLaunch(h, p, { verb: 'spawn', reuse: false, takesMs: TIMED_CALL_MS, end: form })
+    const timedGet = (h.stub.calls as StubClientOptions).getFn!
+    let stopped: Promise<unknown> | undefined
+    h.script({
+      getFn: (params) => {
+        if (t.window()?.endMs !== undefined && params.claude_instance_id === personaInstanceId(p)) stopped ??= stop(p)
+        return timedGet(params)
+      },
+    })
+    statusOnTimedRow(h, t)
+    const order = recordCallOrder(h)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_RETRYING })
+    await stopped
+
+    expect(order.filter((v) => LAUNCH_AND_READ_VERBS.has(v))).toEqual(['spawn', 'get'])
+    expect(thisLaunchRowOf(p)).toEqual({ launchStartMs: Date.parse(t.launchStartedAt()!), window: { verb: 'spawn', ...t.window()!, end: LAUNCH_CALL_END_LAUNCH_TIMEOUT } })
+    const lines = launchUnavailableLines(h)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toEndWith(` — ${LAUNCH_UNAVAILABLE_OUTCOME_APPROVER_NOT_STARTED}; no launch in this attempt (b.jg5 SRJ-407)`)
+    expect(h.errors).toContain(approverLogLine(approverNotStartedMessage(renderPersonaRef(p, p), reason)))
+    expect(h.errors).not.toContain(approverLogLine(approverStartedAfterLaunchTimeoutMessage(renderPersonaRef(p, p))))
+    expect(h.triggers.filter((trigger) => trigger.key === p)).toEqual([
+      { key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE },
+      { key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW },
+    ])
+    await h.settle()
+    expect([h.approverRunning(p), await _whenDialogApproverStopped(p)]).toEqual([false, undefined])
+    expect(order).toEqual(['spawn', 'get'])
+    expect([h.stub.calls.killCalls, getFailureCount(p), h.notices]).toEqual([[], 0, []])
+  })
+
+  // AC 35 (b.jg5 SRJ-806, SRJ-411): P's key is recorded as retired (no
+  // mark), so its launch is a reuse spawn; the reuse times out, and its one
+  // `get` reads the old life `pending` with a launch start earlier than the
+  // call: not this launch's row, so no mark and the row is not covered.
+  test.each(LAUNCH_TIMEOUT_FORMS.map((form) => [form] as const))('AC 35: a recorded key\'s reuse ending in a launch timeout (%s) while its old life reads pending with an earlier launch start: no approver, lap or keystroke, no mark (nothing written), the live-row sequence with the retired-key flag; sequence-waiting', async (form) => {
+    const { h, p } = await timedLaunchBuild()
+    h.retireKey(p)
+    const starts = recordSequenceStarts()
+    const t = scriptTimedLaunch(h, p, { verb: 'spawn', reuse: true, takesMs: TIMED_CALL_MS, end: form, launchStart: 'before' })
+    statusOnTimedRow(h, t)
+    const writes = h.retiredKeyWrites.length
+    const order = recordCallOrder(h)
+    const rowCalls = recordRowCallsInFlight(h, p)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
+
+    expect(order.filter((v) => LAUNCH_AND_READ_VERBS.has(v))).toEqual(['spawn', 'get'])
+    expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, p)])
+    expect(thisLaunchRowOf(p)).toBeUndefined()
+    expect([h.retiredEntry(p).marked, h.retiredKeyWrites.slice(writes)]).toEqual([false, []])
+    expect(starts).toEqual([
+      expect.objectContaining({ key: p, lastReadState: AGENT_DIRECTOR_PENDING_STATE, keepsConversation: false, retiredKey: true, alertContext: KILL_FAILURE_CONTEXT_RECOVERY }),
+    ])
+    expect(launchUnavailableLines(h)).toEqual([
+      expect.stringContaining(` — ${launchUnavailableSequenceOutcome(PENDING_ROW_REASON_RETIRED_OLD_LIFE, LIVE_ROW_START_STARTED, 'sequence-waiting')}; `),
+    ])
+    await h.settle()
+    expect([h.approverRunning(p), rowCalls, h.stub.calls.killCalls]).toEqual([false, [], []])
+    expect(h.triggers.filter((trigger) => trigger.key === p)).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
+  })
+
+  // AC 83: ErrCallTimeout from a spawn and from a resume; the `get` reads P's
+  // covered row `pending` (handed to the pending-row step). P's retries read
+  // the row and launch nothing while it reads `pending`; once it reads
+  // `ended`, the next retry launches P again. Nothing is counted.
+  test.each(TIMED_VERBS.filter(([, verb]) => !verb.reuse))('AC 83: %s ending in ErrCallTimeout, its one get reading P\'s covered pending row: the pending-row step arms; a retry while the row reads pending launches nothing; once it reads ended the next retry launches P; nothing counted', async (_name, verb) => {
+    const { h, p } = await timedLaunchBuild()
+    verb.arrange(h, p)
+    const t = scriptTimedLaunch(h, p, { verb: verb.verb, takesMs: TIMED_CALL_MS, end: LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT })
+    let state: string = AGENT_DIRECTOR_PENDING_STATE
+    h.script({ statusFn: () => (t.window()?.endMs !== undefined ? t.statusRow({ state }) : cannedStatusResult()) })
+    const launches = (): number => h.stub.calls.spawnCalls.length + h.stub.calls.resumeCalls.length
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_RETRYING })
+    expect(h.controller.view(p)?.causes).toEqual([UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, UNAVAILABLE_RETRY_CAUSE_PENDING_ROW])
+    const launched = launches()
+
+    await retryNow(h, p)
+    expect(h.attempts).toEqual([expect.objectContaining({ key: p, retry: 1 })])
+    expect([launches(), h.stub.calls.killCalls]).toEqual([launched, []])
+
+    state = LIVENESS_DEAD_ROW_ENDED
+    t.setRow({ state })
+    await retryNow(h, p)
+    expect(h.attempts).toEqual([expect.objectContaining({ key: p, retry: 1 }), expect.objectContaining({ key: p, retry: 2 })])
+    expect(launches()).toBe(launched + 1)
+    expect([getFailureCount(p), h.notices]).toEqual([0, []])
+    if (h.approverRunning(p)) await h.runApproverToStop(p)
+  })
+
+  // AC 29 (its unit half): a spawn, a reuse and a `resume`, each ending in a
+  // launch timeout and stopped at a startup dialog the pane shows only after
+  // P's first retry. The `get` reads this launch's row `pending`; the approver
+  // polls on it, its first successful `read-pane` ending the tmux-unresponsive
+  // condition (b.jg5 SRJ-310 rule 1, before the row leaves `pending`; rule 3
+  // is tests/tmux-unresponsive.test.ts's); the retry reads the row and
+  // launches nothing; once the dialog shows, the approver's Enter clears it
+  // and the row reads `waiting`, which forgets the "this launch's row"
+  // record; the next retry reads it live and launches nothing either. The
+  // approver's cap is set past the first retry.
+  test.each(TIMED_VERBS.flatMap(([name, verb]) => LAUNCH_TIMEOUT_FORMS.map((form) => [name, form, verb] as const)))('AC 29: %s ending in a launch timeout (%s), stopped at a startup dialog: the row reads pending and is this launch\'s; the approver\'s first read-pane ends the condition; a retry reads the row and launches nothing; the approver\'s Enter clears the dialog and the row reaches waiting; the next retry launches nothing either; no kill, counted failure or CONFLICT', async (_name, form, verb) => {
+    const { h, p } = await timedLaunchBuild({ approverCapMs: 2 * UNAVAILABLE_RETRY_BASE_S * 1000 })
+    verb.arrange(h, p)
+    const t = scriptTimedLaunch(h, p, { verb: verb.verb, reuse: verb.reuse, takesMs: TIMED_CALL_MS, end: form })
+    let dialogShown = false
+    let cleared = false
+    h.script({ statusFn: () => (t.window()?.endMs === undefined ? cannedStatusResult() : cleared ? t.statusRow({ state: 'waiting' }) : t.statusRow()) })
+    const client = h.stub.client
+    const readPane = client.readPane.bind(client)
+    client.readPane = async (params) => {
+      const read = await readPane(params)
+      return dialogShown ? { ...read, pane: DEV_CHANNELS_DIALOG_PANE } : read
+    }
+    const sendKeys = client.sendKeys.bind(client)
+    client.sendKeys = async (params) => {
+      const sent = await sendKeys(params)
+      // The Enter clears the dialog: the pane no longer shows it, and the row reads waiting.
+      dialogShown = false
+      cleared = true
+      t.setRow({ state: 'waiting' })
+      return sent
+    }
+    const launches = (): number => h.stub.calls.spawnCalls.length + h.stub.calls.resumeCalls.length
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_RETRYING })
+    expect(thisLaunchRowOf(p)).toEqual({ launchStartMs: Date.parse(t.launchStartedAt()!), window: launchCallWindowOf(p)! })
+    expect(conditionStartedLines(h, p)).toHaveLength(1)
+    const launched = launches()
+    await h.settle()
+    expect(h.approverRunning(p)).toBe(true)
+
+    await retryNow(h, p)
+    expect(h.attempts).toEqual([expect.objectContaining({ key: p, retry: 1 })])
+    expect(launches()).toBe(launched)
+    expect([h.approverRunning(p), h.stub.calls.sendKeysCalls, thisLaunchRowOf(p)?.launchStartMs]).toEqual([true, [], Date.parse(t.launchStartedAt()!)])
+    expect([conditionEndedLines(h, p), h.tmuxUnresponsive.holds(p)]).toEqual([[conditionEndedLine(p, TMUX_UNRESPONSIVE_END_TMUX_VERB)], false])
+
+    dialogShown = true
+    expect(await h.runApproverToStop(p)).toMatchObject({ reason: APPROVER_STOP_LIVE })
+
+    expect(h.stub.calls.sendKeysCalls).toHaveLength(1)
+    expect(thisLaunchRowOf(p)).toBeUndefined()
+    await retryNow(h, p)
+    expect(h.attempts).toHaveLength(2)
+    expect(launches()).toBe(launched)
+    expect(conditionEndedLines(h, p)).toHaveLength(1)
+    expect([h.stub.calls.killCalls, getFailureCount(p), h.notices, h.latch.isLatched(p)]).toEqual([[], 0, [], false])
   })
 })

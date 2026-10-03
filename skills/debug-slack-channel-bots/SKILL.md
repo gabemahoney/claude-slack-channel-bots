@@ -1410,7 +1410,10 @@ for it. The refused call is retried on its own (see
 The record ends as soon as the session answers again: a call that acts on
 its session succeeds or is told the session is gone, or a health check or
 retry finds its instance running
-with its session connected and receiving messages. A `status`, `get` or
+with its session connected and receiving messages. After a launch that timed
+out (see [A launch that timed out](#a-launch-that-timed-out)), it also ends
+once a read finds that launch's instance started; usually the startup-prompt
+watcher's first screen read ends it earlier. A `status`, `get` or
 `list` failure alone (a call that only reads the persona's state) never
 starts it, ends it or produces these notices, and neither does a failure to
 stop the instance's session (the `kill-failed` cause), which posts a *Kill
@@ -1485,7 +1488,7 @@ grep -h -E 'persona-episodes: persona=ops_bot tmux-unresponsive |unavailable-ret
 | `[slack] persona-episodes: persona=<key> tmux-unresponsive onset not posted — its retry timer stopped and no refusal has re-armed it` | *Not answering* was due, but the persona's retries had stopped (see the `unavailable-retry` `stopped` line before it) and no later refusal had started them again, so it was skipped. It can still be posted in this episode if a later refusal starts the retries again; after a `stopped` reason of `the persona was torn down`, `the persona is not in the applied configuration` or `the server is shutting down`, it never is. Logged once per episode. | Follow the `stopped` line's reason (see [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own)). |
 | `[slack] persona-episodes: persona=<key> tmux-unresponsive alert check cancelled — its retry timer stopped: <reason>` | The persona's retries stopped (`<reason>` matches the `unavailable-retry` `stopped` line) before *Still not answering* was due, so it will not be posted unless the retries start again. With `<reason>` `the persona was torn down`, `the persona is not in the applied configuration` or `the server is shutting down`, it never comes back in this episode, even when an earlier stop had already cancelled it (that later stop logs no second line). | Follow the `stopped` line's reason (see [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own)). |
 | `[slack] persona-episodes: persona=<key> tmux-unresponsive alert check armed again — a new refusal armed its retry timer again` | A new refusal restarted the retries in the same episode, so *Still not answering* is due again, timed from the first refusal. Never logged after the persona was torn down or removed from the configuration, or the server began shutting down, in this episode. | Nothing yet. |
-| `[slack] persona-episodes: persona=<key> tmux-unresponsive ended — <reason>` | The persona's session answers again. `<reason>`: `a tmux-touching call succeeded or answered GONE` (a call on its session went through, or agent-director reported the session gone, which the recovery then handles), `a health tick found its row live and its session connected with its stream` or `a retry found its row live and its session connected with its stream` (the persona is being served), or `the persona latched` (see [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice); no *Answering again* follows, and the retries were already stopped). Otherwise the retries then stop (`stopped — the tmux-unresponsive condition ended`), or go on when a `kept` line follows. When the end came during a retry and a later call in that same retry was refused again (a `tmux-unresponsive started` line follows), a new episode begins and the retries go on with no `stopped` line. When the call that went through launched the instance (`spawn` or `resume`), its new session may not have started yet, so the `kept — … its row last read pending` line follows and the next retry checks the instance. | Nothing. |
+| `[slack] persona-episodes: persona=<key> tmux-unresponsive ended — <reason>` | The persona's session answers again. `<reason>`: `a tmux-touching call succeeded or answered GONE` (a call on its session went through, or agent-director reported the session gone, which the recovery then handles), `a health tick found its row live and its session connected with its stream` or `a retry found its row live and its session connected with its stream` (the persona is being served), `after a launch timeout, this launch's row left pending for a live state` (a read found the timed-out launch's instance started; the `this launch's row left pending` line follows, see [A launch that timed out](#a-launch-that-timed-out)), or `the persona latched` (see [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice); no *Answering again* follows, and the retries were already stopped). Otherwise the retries then stop (`stopped — the tmux-unresponsive condition ended`), or go on when a `kept` line follows. When the end came during a retry and a later call in that same retry was refused again (a `tmux-unresponsive started` line follows), a new episode begins and the retries go on with no `stopped` line. When the call that went through launched the instance (`spawn` or `resume`), its new session may not have started yet, so the `kept — … its row last read pending` line follows and the next retry checks the instance. | Nothing. |
 | `[slack] persona-episodes: persona=<key> tmux-unresponsive recovery posted` | *Answering again* was posted, right after the `ended` line. | Nothing. |
 | `[slack] persona-episodes: persona=<key> tmux-unresponsive onset not posted — muted, its persona teardown was submitted; …`, `… alert not posted — muted, its persona teardown was submitted; …`, `… recovery not posted — muted, its persona teardown was submitted` | A confirmed change queued the persona's teardown, so the notice was not posted (it counts as posted). Once the teardown starts, such a notice goes to a `persona-teardown-notice` entry instead (see [A notice raised during a teardown](#a-notice-raised-during-a-teardown)). | Nothing. |
 | `[slack] persona-episodes: persona=<key> tmux-unresponsive recovery not posted — a silent end (a CONFLICT answer ended it)` | The record ended, after *Not answering* or *Still not answering*, on an answer whose own notice follows, so *Answering again* was not posted. | Follow that notice. |
@@ -2689,8 +2692,13 @@ are, `0` included. Each retry reads the persona's state first, never starts a
 second instance over one that is running, and reconnects or relaunches it as
 the restart path would. Once agent-director answers again, the next retry
 brings the persona back, so in the common case there is nothing to do.
+A launch that timed out, or that agent-director refused as not answering or
+not able to act right now, is followed by one read of the persona's row and
+no further launch in that attempt (see
+[A launch that timed out](#a-launch-that-timed-out)).
 After any launch of the persona (a start, a restart, a confirmed change's
-bring-up, a replacement or a retry's relaunch), and whenever the server finds
+bring-up, a replacement or a retry's relaunch), after a launch that timed out
+while its instance is still starting, and whenever the server finds
 its instance still starting, the later retries only read its state (the
 lines say `pending-only`): they wait while its session is still starting,
 never end it or launch over it, stop once it has started, and hand the
@@ -2995,6 +3003,50 @@ notice, don't install or repair tmux: a human follows the "Operator actions"
 section of agent-director's README, and no bot acts on it (see
 **tmux isn't available** above). If both answer normally but the
 retries keep failing, report it as a bug, with the persona's lines.
+
+### A launch that timed out
+
+A launch of a persona (a spawn, a reuse of its instance or a `resume`) times
+out when the server's call to agent-director runs past
+`agent_director_call_timeout_ms` (`ErrCallTimeout`), or when agent-director
+answers `ErrTmuxUnresponsive` saying the session may have been created. Such a
+launch may still have started the instance, perhaps held at a startup prompt.
+So the server reads the persona's row once with `get` and launches nothing
+more in that attempt. It makes the same one read after every other launch
+agent-director refuses as not answering ("still stopping", "still starting",
+tmux unreadable, a "duplicate session" whose holder it could not read, or a
+pre-spawn scan that could not answer). The launch is never counted, nothing
+is ended, and the retries start as for any refusal:
+
+- **A still-starting row of this persona's own launch:** after a timed-out
+  launch the server answers its startup prompt (the `approvePreSessionDialogs`
+  lines, below), and the retries only read it until its session starts.
+  After any other refusal nothing is typed into it; the retries still watch
+  it.
+- **A still-starting old instance** (a retired persona's, or one in another
+  working directory or with another config directory): replaced as any old
+  instance is, never typed into (`live-row-sequence` lines).
+- **A running instance:** never launched over; the next retry reconnects it.
+- **Ended, missing or no row:** the next retry launches the persona again.
+
+After a timed-out reuse of a retired persona's key that read its own new
+row, the key's new life has begun: the server records that, as after a reuse
+that succeeded.
+
+To follow it (replace `ops_bot` with the key):
+
+```sh
+grep -h -E 'one get after the .* \(key=ops_bot\)|\(key=ops_bot\)(.s key)? .*timed out but launched|approvePreSessionDialogs: (starting|not starting) the approver for "[^"]*" \(key=ops_bot\) \(launch-timeout\)|\(key=ops_bot\): this launch.s row left pending' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
+```
+
+| Line | Meaning | What to do |
+|---|---|---|
+| `[slack] spawnForPersona: one get after the <call> of "<name>" (key=<key>) ended in <form>: read <read>; this launch's row: <yes (launch start <time>)\|no> — <outcome>; no launch in this attempt (b.jg5 SRJ-407)` | The one read after a launch timeout or another refusal. `<call>` is `spawn`, `retry-spawn`, `fresh spawn after ErrSpawnNotFound on resume`, `reuse spawn` or `resume`. `<form>` is `a launch timeout (ErrCallTimeout)`, `a launch timeout (ErrTmuxUnresponsive)` or `UNAVAILABLE (<error>)` for another refusal. `<read>` is the row's state, `no row (ErrSpawnNotFound)`, `nothing (a refused read)` or `an UNUSABLE NAME answer`. `this launch's row: yes` means the row's launch start lies within the timed-out call, so it is this launch's own; `no` for any other row, and always after a refusal that was not a timeout. `<outcome>` says what follows: `covered: the approver starts once the launch call has returned; …` (the startup prompt is answered), `covered, but the approver was not started; …`, `covered: no approver after this outcome; …` (a refusal that was not a timeout), `undecided: …` (its directory or config directory can't be resolved right now; read again at the next retry), `not covered (<reason>): the live-row sequence, no approver; …` (an old instance being replaced), `the row is finished: …`, `no row: …`, `another live state: no launch over it; …`, `the read was refused: …` (a refusal line comes before it), `a state CSCB does not know: …`, or `the persona is latched: …` / `no launch start: …` (see the *Held:* entry the persona's notice names) | Nothing: the retries go on on their own. A read-only check, `agent-director get --claude-instance-id cscb_<key>`, shows the row as it is now. If timeouts repeat, check the call timeout against its need (see [The call timeout](#the-call-timeout)) |
+| `[slack] approvePreSessionDialogs: starting the approver for "<name>" (key=<key>) (launch-timeout): its launch call timed out and the get after it read its pending row covered — the approver runs after the launch call returned, under the same stop rules as after a returned launch (b.jg5 SRJ-401, SRJ-404, SRJ-407)` | The server answers the startup prompt of an instance whose launch timed out, as after a launch that returned; its other `approvePreSessionDialogs` lines follow | Nothing |
+| `[slack] approvePreSessionDialogs: not starting the approver for "<name>" (key=<key>) (launch-timeout): its pending row <why> — no status, read-pane or send-keys (b.jg5 SRJ-401, SRJ-407)` | The row read after a timeout is not one the server may type into: `has no launch start`, `is not covered (<reason>)` (an old instance) or `is undecided (<reason>)`. Nothing is typed | Nothing; the one-read line says what follows |
+| `[slack] <site>: <what> for "<name>" (key=<key>): this launch's row left pending for <state> after its launch timeout — the tmux-unresponsive condition ends if it holds (SRJ-310 rule 3; b.jg5 SRJ-407)` | A later read (`<site>: <what>`, for example the approver's `approvePreSessionDialogs: readiness status read`, a retry's read or a health check's) found the timed-out launch's instance started. The `persona-episodes … tmux-unresponsive ended — after a launch timeout, …` line comes just before it when the record was open (see [A persona posts a Not answering notice](#a-persona-posts-a-not-answering-notice)) | Nothing |
+| `[slack] spawnForPersona: "<name>" (key=<key>)'s key is retired and its reuse spawn timed out but launched (its row is this launch's) — its new life has begun; <mark>; the launch answers retrying (b.jg5 SRJ-407, SRJ-806)` | A reuse of a retired persona's key timed out, and the read found its own new row: the key's new life is recorded (`<mark>` says whether the record was written), and an old instance the persona's directory waited on is no longer waited on | Nothing. If `<mark>` says the write failed, see [The retired-key record can't be read or is invalid](#the-retired-key-record-cant-be-read-or-is-invalid) |
+| `[slack] spawnForPersona: "<name>" (key=<key>)'s key was recorded as retired while its reuse spawn's launch attempt was in flight (<how>) — the reuse timed out but launched; its life is the old life: no mark is set (b.jg5 SRJ-407, SRJ-806)` | A confirmed change recorded the key during the timed-out launch, so the row it started is treated as the old life and replaced | Nothing |
 
 ### A persona's session stops answering
 
@@ -3956,7 +4008,9 @@ nine keys and their defaults.
 `agent_director_call_timeout_ms` in `config.json` (default 60000 ms) bounds
 how long CSCB waits on each agent-director call it makes for a persona. A call
 that runs past it ends in an error while agent-director may still be carrying
-out the verb. The server takes it from the configuration its start runs;
+out the verb. A launch that times out this way is followed by one read of the
+persona's row and is never launched over (see
+[A launch that timed out](#a-launch-that-timed-out)). The server takes it from the configuration its start runs;
 `stop --stop-bots` and `clean_restart` take it from the last-applied record
 (else `config.json`), and `stop --stop-bots` uses the default when it can't
 read that configuration.

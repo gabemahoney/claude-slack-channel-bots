@@ -12,7 +12,8 @@
  *   over those rows as `main()` runs it, with the calls in order and what the
  *   first kill met).
  * - Holds begun by hand: `beginApplyHold` (apply step 1's hold on a
- *   persona's own row at its declared directory) and `holdOldAt` (an id held
+ *   persona's own row at its declared directory, or at another persona's for
+ *   a destructive modify that moved it out of there) and `holdOldAt` (an id held
  *   at a persona's directory, as a start-sweep kill that did not succeed
  *   begins it).
  * - The old-life gate (SRJ-810, SRJ-1502): `gateLine` / `oldLifeGateLine`
@@ -128,9 +129,14 @@ export async function sweepOver(
 // Holds begun by hand
 // ---------------------------------------------------------------------------
 
-/** Apply step 1's hold on persona `key`'s own row at its declared working directory, as the reload controller begins it. */
-export function beginApplyHold(h: RecoveryHarness, key: string): OldLifeHold {
-  return h.beginOldLifeHold({ instanceId: personaInstanceId(key), oldKey: key, directory: personaOf(h, key).working_directory, cause: OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1 })
+/**
+ * Apply step 1's hold on persona `key`'s own row, as the reload controller
+ * begins it, at the old declaration's working directory: persona `dirOf`'s
+ * (`key`'s own declared directory by default; another persona's for a
+ * destructive modify that moved `key` out of the directory `dirOf` now names).
+ */
+export function beginApplyHold(h: RecoveryHarness, key: string, dirOf: string = key): OldLifeHold {
+  return h.beginOldLifeHold({ instanceId: personaInstanceId(key), oldKey: key, directory: personaOf(h, dirOf).working_directory, cause: OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1 })
 }
 
 /** Hold `instanceId` (old key `oldKey`) at persona `dirOf`'s working directory, as a start-sweep kill that did not succeed begins it. */

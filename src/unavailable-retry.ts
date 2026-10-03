@@ -2280,6 +2280,22 @@ export function isInsideAttempt(key: string): boolean {
 }
 
 /**
+ * The last agent-director error the innermost running attempt for persona
+ * `key` recorded so far, or `undefined` when the current call runs inside no
+ * attempt for `key` or none was recorded. For a step that makes a further
+ * call after a launch's error and must know what that error armed before the
+ * further call's answer is recorded in its place (b.jg5 SRJ-407). Read-only;
+ * never throws.
+ */
+export function currentAttemptLastError(key: string): AttemptErrorRecord | undefined {
+  try {
+    return innermostFrame(key)?.lastError
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * Report an agent-director error for persona `key`, thrown by a call made
  * with `verb` (b.jg5 SRJ-301, SRJ-311). When the arming predicate answers a
  * cause and `sink` is given, the sink is called once with `key` and the

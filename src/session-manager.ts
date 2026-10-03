@@ -424,6 +424,7 @@ import {
   armPendingOnlyAfterLaunchFailure,
   armPendingOnlyForPendingRow,
   clearOutageFlag,
+  endTmuxUnresponsiveForLaunchRow,
   getOutageFlags,
   raiseAdConfigMalformed,
   raiseTmuxUnavailable,
@@ -471,7 +472,12 @@ import {
   describeAgentDirectorFailure,
   hasAdErrorName,
   isInvalidFlagsError,
+  isLaunchTimeoutError,
+  LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT,
+  LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE,
+  launchTimeoutFormOf,
   unclassifiedClassificationOf,
+  type LaunchTimeoutForm,
   type InvalidFlagsError,
 } from './ad-error-class.ts'
 import { RECHECK_OUTCOME_STOP, lastAdVersionSeen } from './ad-version-gate.ts'
@@ -629,6 +635,7 @@ import {
   RETRY_BLOCK_LAUNCH,
   RETRY_BLOCK_LIVE_ROW_SEQUENCE,
   RETRY_BLOCK_OLD_LIFE_WAIT,
+  currentAttemptLastError,
   runInAttempt,
   runOutsideAttempts,
   unavailableRetryCauseFor,
@@ -772,8 +779,11 @@ import {
   PENDING_ROW_WAIT_NOT_ARMED,
   armPendingRowWait,
   decidePendingRowCover,
+  describeLaunchStartForLog,
+  isLaunchStartInWindow,
   isPendingRowAged,
   parseLaunchStart,
+  type LaunchCallWindow,
   type PendingRowCover,
   type PendingRowFields,
   type PendingRowNotCoveredReason,
@@ -1839,15 +1849,17 @@ function noteOldLifeStatusAnswer(key: string, answer: OwnRowStatusAnswer, at: Ow
  * End the old-life hold on persona key `key`'s own row (`cscb_<key>`)
  * because a reuse spawn for the key began its new life (b.jg5 SRJ-809,
  * SRJ-806): a reuse that succeeded reset a finished row, so the old life is
- * over. Called at a recorded key's reuse success (`reuseSuccessAction`),
- * whatever the mark's write did. With no hold set installed, or no hold on
- * the id, nothing happens. Never throws.
+ * over. Called at a recorded key's reuse success (`reuseSuccessAction`), and
+ * at a reuse that timed out but launched, whose `get` read this launch's row
+ * (`markNewLifeAfterTimedOutReuse`, b.jg5 SRJ-407), whatever the mark's write
+ * did; `readName` names that read in the hold's end line. With no hold set
+ * installed, or no hold on the id, nothing happens. Never throws.
  */
-function endOldLifeHoldForNewLife(key: string): void {
+function endOldLifeHoldForNewLife(key: string, readName: string = OLD_LIFE_NEW_LIFE_READ): void {
   const holds = oldLifeHolds
   if (holds === undefined) return
   try {
-    holds.end(personaInstanceId(key), OLD_LIFE_HOLD_END_NEW_LIFE, OLD_LIFE_NEW_LIFE_READ)
+    holds.end(personaInstanceId(key), OLD_LIFE_HOLD_END_NEW_LIFE, readName)
   } catch (err) {
     // Not reached (the hold set never throws).
     console.error(`[slack] old-life hold: ending the hold of ${keyRef(key)} for its new life failed: ${describeThrownValue(err)} (b.jg5 SRJ-809)`)
@@ -2041,9 +2053,57 @@ export function reuseRecordedInFlightLine(ref: string, how: ReuseRecordedSince):
  * Never throws.
  */
 function reuseSuccessAction(key: string, ref: string, start: RetiredKeyAttemptStart): 'spawned' | typeof SPAWN_ACTION_FRESH_RETIRED {
+  const decided = setNewLifeMarkForReuse(key, start)
+  switch (decided.kind) {
+    case NEW_LIFE_MARK_NOT_RECORDED:
+      return 'spawned'
+    case NEW_LIFE_MARK_RECORDED_SINCE:
+      console.error(reuseRecordedInFlightLine(ref, decided.how))
+      return 'spawned'
+    case NEW_LIFE_MARK_SET:
+      console.error(
+        `[slack] ${REUSE_SPAWN_SITE}: ${ref}'s key is retired and its new life has begun — answering ${SPAWN_ACTION_FRESH_RETIRED}; ${decided.mark} (b.jg5 SRJ-806, SRJ-112)`,
+      )
+      // b.jg5 SRJ-809: the new life implies the old row was finished, so the
+      // key's old-life hold ends, whatever the mark's write did.
+      endOldLifeHoldForNewLife(key)
+      return SPAWN_ACTION_FRESH_RETIRED
+  }
+}
+
+/** `setNewLifeMarkForReuse`: the key is not recorded now; nothing is written. */
+const NEW_LIFE_MARK_NOT_RECORDED = 'not-recorded'
+/** `setNewLifeMarkForReuse`: the key was recorded since the launch attempt started; no mark is set. */
+const NEW_LIFE_MARK_RECORDED_SINCE = 'recorded-since'
+/** `setNewLifeMarkForReuse`: the key's "new life has begun" mark is set (`mark` says what the write did). */
+const NEW_LIFE_MARK_SET = 'set'
+
+/** What `setNewLifeMarkForReuse` did. */
+type NewLifeMarkDecision =
+  | { readonly kind: typeof NEW_LIFE_MARK_NOT_RECORDED }
+  | { readonly kind: typeof NEW_LIFE_MARK_RECORDED_SINCE; readonly how: ReuseRecordedSince }
+  | { readonly kind: typeof NEW_LIFE_MARK_SET; readonly mark: string }
+
+/**
+ * The mark step of a reuse spawn of persona `key` that began a new life
+ * (b.jg5 SRJ-806), shared by a reuse that succeeded (`reuseSuccessAction`)
+ * and one that timed out but launched (`markNewLifeAfterTimedOutReuse`,
+ * b.jg5 SRJ-407), given `start`, the store's reading of the key and its
+ * record generation when the launch attempt started:
+ *   - not recorded now (or no store installed): nothing written;
+ *   - recorded since the attempt started (not recorded then, recorded again
+ *     since, or a generation that could not be read): no mark, with `how`;
+ *   - otherwise the "new life has begun" mark is set through the store's
+ *     `mark`, the mark's one writer, unless it is already set; `mark` says
+ *     what the write did (a failed write is held in memory by the store).
+ * Logs nothing and ends no hold: each caller writes its own line and then
+ * ends the key's old-life hold (`endOldLifeHoldForNewLife`) for a set mark.
+ * Never throws.
+ */
+function setNewLifeMarkForReuse(key: string, start: RetiredKeyAttemptStart): NewLifeMarkDecision {
   const reading = retiredKeyReadingOf(key)
   const store = retiredKeyStore
-  if (!reading.recorded || store === undefined) return 'spawned'
+  if (!reading.recorded || store === undefined) return { kind: NEW_LIFE_MARK_NOT_RECORDED }
   // b.jg5 SRJ-806: a recording made since the launch attempt started retires
   // the life this launch began, so that life is never marked as the new one.
   // The record generation shows a re-record of an unmarked key, which writes nothing.
@@ -2055,10 +2115,7 @@ function reuseSuccessAction(key: string, ref: string, start: RetiredKeyAttemptSt
       : generationNow !== start.generation
         ? REUSE_RECORDED_SINCE_RECORDED_AGAIN
         : undefined
-  if (recordedSince !== undefined) {
-    console.error(reuseRecordedInFlightLine(ref, recordedSince))
-    return 'spawned'
-  }
+  if (recordedSince !== undefined) return { kind: NEW_LIFE_MARK_RECORDED_SINCE, how: recordedSince }
   let mark: string
   if (reading.marked) {
     mark = 'its mark was already set, so nothing is written'
@@ -2078,7 +2135,7 @@ function reuseSuccessAction(key: string, ref: string, start: RetiredKeyAttemptSt
         break
       case RETIRED_KEYS_NOT_RECORDED:
         // Not reached: the key was read recorded just above, and nothing runs in between.
-        return 'spawned'
+        return { kind: NEW_LIFE_MARK_NOT_RECORDED }
       case RETIRED_KEYS_WRITE_FAILED:
         mark =
           "writing its mark failed, so this server holds the mark in memory and writes it again at the key's next launch decision"
@@ -2087,13 +2144,68 @@ function reuseSuccessAction(key: string, ref: string, start: RetiredKeyAttemptSt
         mark = `setting its mark ${outcome}; this server reads the key as it did before`
     }
   }
-  console.error(
-    `[slack] ${REUSE_SPAWN_SITE}: ${ref}'s key is retired and its new life has begun — answering ${SPAWN_ACTION_FRESH_RETIRED}; ${mark} (b.jg5 SRJ-806, SRJ-112)`,
-  )
-  // b.jg5 SRJ-809: the new life implies the old row was finished, so the
-  // key's old-life hold ends, whatever the mark's write did.
-  endOldLifeHoldForNewLife(key)
-  return SPAWN_ACTION_FRESH_RETIRED
+  return { kind: NEW_LIFE_MARK_SET, mark }
+}
+
+/**
+ * The read name the old-life hold's end line gives a reuse that timed out
+ * but launched, whose `get` read this launch's row (b.jg5 SRJ-407, SRJ-806,
+ * SRJ-809).
+ */
+export const OLD_LIFE_NEW_LIFE_AFTER_TIMEOUT_READ = "spawnForPersona: get after the reuse spawn's launch timeout read this launch's row"
+
+/**
+ * The line of a reuse of a retired key that timed out but launched (b.jg5
+ * SRJ-407, SRJ-806): its `get` read this launch's row, so the key's new life
+ * has begun; `mark` says what the mark's write did. The launch still answers
+ * `retrying`:
+ *
+ *   [slack] spawnForPersona: <ref>'s key is retired and its reuse spawn timed out but launched (its row is this launch's) — its new life has begun; <mark>; the launch answers retrying (b.jg5 SRJ-407, SRJ-806)
+ */
+export function timedOutReuseNewLifeLine(ref: string, mark: string): string {
+  return `[slack] spawnForPersona: ${ref}'s key is retired and its reuse spawn timed out but launched (its row is this launch's) — its new life has begun; ${mark}; the launch answers ${SPAWN_ACTION_RETRYING} (b.jg5 SRJ-407, SRJ-806)`
+}
+
+/**
+ * The line of a reuse of a key recorded as retired during its launch attempt
+ * (`how`), which timed out but launched (b.jg5 SRJ-407, SRJ-806): no mark is
+ * set, so its row is the old life:
+ *
+ *   [slack] spawnForPersona: <ref>'s key was recorded as retired while its reuse spawn's launch attempt was in flight (<how>) — the reuse timed out but launched; its life is the old life: no mark is set (b.jg5 SRJ-407, SRJ-806)
+ */
+export function timedOutReuseRecordedInFlightLine(ref: string, how: ReuseRecordedSince): string {
+  return `[slack] spawnForPersona: ${ref}'s key was recorded as retired while its reuse spawn's launch attempt was in flight (${how}) — the reuse timed out but launched; its life is the old life: no mark is set (b.jg5 SRJ-407, SRJ-806)`
+}
+
+/**
+ * SRJ-806's second trigger (b.jg5 SRJ-407, SRJ-806, SRJ-809): a reuse spawn
+ * of persona `key` that ended in a launch timeout, and whose one `get` read
+ * this launch's row (its launch start inside the call's window), began the
+ * key's new life. Through the same mark step as a reuse success
+ * (`setNewLifeMarkForReuse`, with `start`, the attempt's start): for a key
+ * recorded then and still, with no recording since, the mark is set (a
+ * failed write held in memory) with one line (`timedOutReuseNewLifeLine`),
+ * and the key's old-life hold ends with the new-life reason
+ * (`endOldLifeHoldForNewLife`, read name
+ * `OLD_LIFE_NEW_LIFE_AFTER_TIMEOUT_READ`), whose end observer retries a
+ * persona waiting on it at once; a key recorded since gets one line
+ * (`timedOutReuseRecordedInFlightLine`) and no mark; a key not recorded,
+ * nothing. Answers whether the mark was set. The launch's result is not
+ * changed by it. Never throws.
+ */
+function markNewLifeAfterTimedOutReuse(key: string, ref: string, start: RetiredKeyAttemptStart): boolean {
+  const decided = setNewLifeMarkForReuse(key, start)
+  switch (decided.kind) {
+    case NEW_LIFE_MARK_NOT_RECORDED:
+      return false
+    case NEW_LIFE_MARK_RECORDED_SINCE:
+      console.error(timedOutReuseRecordedInFlightLine(ref, decided.how))
+      return false
+    case NEW_LIFE_MARK_SET:
+      console.error(timedOutReuseNewLifeLine(ref, decided.mark))
+      endOldLifeHoldForNewLife(key, OLD_LIFE_NEW_LIFE_AFTER_TIMEOUT_READ)
+      return true
+  }
 }
 
 /**
@@ -2286,6 +2398,8 @@ function ownRowActGoes(key: string, at: OwnRowReadSite): boolean {
  * b.jg5 SRJ-704, SRJ-1016), and ends an old-life hold on `cscb_<key>`, with
  * its one end line; a row read in any other state keeps the hold, and its
  * `cwd` becomes the held directory (`noteOldLifeRowRead`; b.jg5 SRJ-809).
+ * While the persona holds a "this launch's row" record (b.jg5 SRJ-407), the
+ * read applies SRJ-310's third end rule to it (`checkThisLaunchRowOnRead`).
  *
  * When `at.actGoes` answers that the caller has stopped once the `get`
  * settles (`ownRowActGoes`; b.jg5 SRJ-714), nothing below is acted on: no
@@ -2339,6 +2453,8 @@ export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promis
       endKillFailureEpisodeOnRead(key, { thrown: err })
       // b.jg5 SRJ-809: no row ends an old-life hold on it.
       noteOldLifeRowRead(personaInstanceId(key), { kind: OLD_LIFE_ROW_READ_NO_ROW }, oldLifeReadName(at))
+      // b.jg5 SRJ-310 rule 3: no row is no longer this launch's row.
+      checkThisLaunchRowOnRead(key, THIS_LAUNCH_ROW_READ_ABSENT, false, at)
       return { kind: OWN_ROW_READ_ABSENT }
     }
     if (at.unusableNameRoutedIn !== undefined) {
@@ -2356,7 +2472,10 @@ export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promis
   // b.jg5 SRJ-809: a row read `ended` or `missing` ends an old-life hold on
   // it, and a live one's `cwd` becomes the held directory.
   noteOldLifeRowRead(personaInstanceId(key), { kind: OLD_LIFE_ROW_READ_STATE, state: row.state, cwd: row.cwd }, oldLifeReadName(at))
-  return { kind: OWN_ROW_READ_ROW, row, latched: actOnOwnRowRead(key, row, at, true) !== undefined }
+  const latched = actOnOwnRowRead(key, row, at, true) !== undefined
+  // b.jg5 SRJ-310 rule 3, SRJ-407: this launch's row read live other than `pending` ends the condition.
+  checkThisLaunchRowOnRead(key, { state: row.state, launchStartedAt: (row as Phase1GetResult).launch_started_at }, latched, at)
+  return { kind: OWN_ROW_READ_ROW, row, latched }
 }
 
 /**
@@ -2614,6 +2733,11 @@ export type OwnRowStatusAnswer =
  *     state keeps it. So every own-row `status` the server makes ends the
  *     hold this way: the shared own-row `status` read, a persona kill
  *     retry's between-try read, and the liveness and reconnect adapters.
+ *   - While the persona holds a "this launch's row" record (b.jg5 SRJ-407),
+ *     the answer applies SRJ-310's third end rule to it
+ *     (`checkThisLaunchRowOnRead`), so every own-row `status` the server
+ *     makes, an approver's lap and a health tick's included, can end the
+ *     condition by it.
  *
  * With no latch installed a latching answer still answers true, with
  * nothing latched, as at the CONFLICT row. Log lines:
@@ -2629,7 +2753,11 @@ export function applyOwnRowStatusStep(key: string, answer: OwnRowStatusAnswer, a
     // b.jg5 SRJ-809: a row read `ended` or `missing`, or gone, ends an
     // old-life hold on it, whoever made the call.
     noteOldLifeStatusAnswer(key, answer, at)
-    if ('thrown' in answer) return latchOnUnusableNameRead(key, answer.thrown, at)
+    if ('thrown' in answer) {
+      // b.jg5 SRJ-310 rule 3: no row is no longer this launch's row.
+      if (hasAdErrorName(answer.thrown, ERR_SPAWN_NOT_FOUND_NAME)) checkThisLaunchRowOnRead(key, THIS_LAUNCH_ROW_READ_ABSENT, false, at)
+      return latchOnUnusableNameRead(key, answer.thrown, at)
+    }
     const row = { ...answer.result, claude_instance_id: personaInstanceId(key) }
     const decision = decideOwnRowRead({
       key,
@@ -2639,6 +2767,13 @@ export function applyOwnRowStatusStep(key: string, answer: OwnRowStatusAnswer, a
     })
     // b.jg5 SRJ-807: the clear applies beside any latch this read decides, and changes nothing the step answers.
     if (decision.clearRetiredEntry !== undefined) clearRetiredEntryOnRead(key, decision.clearRetiredEntry, at)
+    // b.jg5 SRJ-310 rule 3, SRJ-407: this launch's row read live other than `pending` ends the condition.
+    checkThisLaunchRowOnRead(
+      key,
+      { state: answer.result.state, launchStartedAt: answer.result.launch_started_at },
+      decision.latch !== undefined,
+      at,
+    )
     if (decision.latch === undefined) return false
     const outcome = latchFromRowRead(key, decision.latch)
     console.error(
@@ -3987,6 +4122,70 @@ export function approverFailedMessage(ref: string, failure: string): string {
   return `the approver for ${ref} failed: ${failure} — it stops; nothing more is called`
 }
 
+/** An approver started because a launch call of the persona returned success (`afterLaunchSucceeded`; b.jg5 SRJ-401). */
+export const APPROVER_ORIGIN_AFTER_LAUNCH = 'after-launch'
+/**
+ * An approver started after a launch call of the persona ended in a launch
+ * timeout and the one `get` that followed read a covered `pending` row
+ * (`afterLaunchUnavailable`; b.jg5 SRJ-401, SRJ-407).
+ */
+export const APPROVER_ORIGIN_LAUNCH_TIMEOUT = 'launch-timeout'
+
+/** Why an approver is started (`startDialogApprover`). */
+export type ApproverOrigin = typeof APPROVER_ORIGIN_AFTER_LAUNCH | typeof APPROVER_ORIGIN_LAUNCH_TIMEOUT
+
+/**
+ * What the start entry (`startDialogApprover`) is told about why it starts
+ * an approver: after a launch that returned, with nothing more; or after a
+ * launch timeout, with the decision the pending-row step made on the row the
+ * `get` read (`cover`, `decidePendingRowCover`) and that row's raw launch
+ * start (`launchStartedAt`), which the entry checks before it starts one.
+ */
+export type ApproverStart =
+  | { readonly origin: typeof APPROVER_ORIGIN_AFTER_LAUNCH }
+  | {
+      readonly origin: typeof APPROVER_ORIGIN_LAUNCH_TIMEOUT
+      readonly cover: PendingRowCover
+      readonly launchStartedAt: unknown
+    }
+
+/** The start entry's default: an approver after a launch that returned. */
+export const APPROVER_START_AFTER_LAUNCH: ApproverStart = Object.freeze({ origin: APPROVER_ORIGIN_AFTER_LAUNCH })
+
+/** The message for an approver started after a launch timeout (b.jg5 SRJ-401, SRJ-407). */
+export function approverStartedAfterLaunchTimeoutMessage(ref: string): string {
+  return `starting the approver for ${ref} (${APPROVER_ORIGIN_LAUNCH_TIMEOUT}): its launch call timed out and the get after it read its pending row covered — the approver runs after the launch call returned, under the same stop rules as after a returned launch (b.jg5 SRJ-401, SRJ-404, SRJ-407)`
+}
+
+/**
+ * The message for an approver the start entry refuses after a launch timeout
+ * because the row the `get` read is not covered, is undecided or has no
+ * launch start (b.jg5 SRJ-401, SRJ-407); `why` says which.
+ */
+export function approverRefusedRowMessage(ref: string, why: string): string {
+  return `not starting the approver for ${ref} (${APPROVER_ORIGIN_LAUNCH_TIMEOUT}): its pending row ${why} — no status, read-pane or send-keys (b.jg5 SRJ-401, SRJ-407)`
+}
+
+/**
+ * Why the start entry refuses an approver after a launch timeout, in
+ * `approverRefusedRowMessage`'s words, or `undefined` when it may start one:
+ * the decision is covered and the row's launch start parses. Pure.
+ */
+function approverRowRefusal(start: ApproverStart): string | undefined {
+  if (start.origin !== APPROVER_ORIGIN_LAUNCH_TIMEOUT) return undefined
+  const { cover } = start
+  switch (cover.answer) {
+    case PENDING_ROW_NO_LAUNCH_START:
+      return 'has no launch start'
+    case PENDING_ROW_NOT_COVERED:
+      return `is not covered (${cover.reason})`
+    case PENDING_ROW_UNDECIDED:
+      return `is undecided (${cover.reason})`
+    case PENDING_ROW_COVERED:
+      return parseLaunchStart(start.launchStartedAt) === undefined ? 'has no launch start' : undefined
+  }
+}
+
 /** Every pre-SessionStart dialog the approver answers (option 1 pre-selected; Enter accepts). Both kept: a folder-trust prompt can follow a `pre_trust` of `skipped` or `failed`. */
 const PRE_SESSION_DIALOG_NEEDLES = [TRUST_DIALOG_NEEDLE, DEV_CHANNELS_DIALOG_NEEDLE]
 
@@ -4608,12 +4807,14 @@ export function _resetWaitForWaitingTimeoutMs(): void {
  * `waitForWaitingAndReconnect`'s deadline and loop, the launch wait's
  * evidence reads (`staleWorkingRowIsIdle`) and the restart path's fold
  * (`checkWorkingRowPane`), pane and transcript alike, and the findMissing
- * memo's window (`sharedFindMissingSweep`, `FIND_MISSING_MEMO_TTL_MS`).
- * Test-only override below.
+ * memo's window (`sharedFindMissingSweep`, `FIND_MISSING_MEMO_TTL_MS`),
+ * and each launch call's window (`launchCallWithWindow`, b.jg5 SRJ-407),
+ * whose times are wall-clock instants compared with a row's
+ * `launch_started_at`. Test-only override below.
  */
 let _now: () => number = () => Date.now()
 
-/** Test-only seam: override the clock of the `working`-row wait and evidence and of the findMissing memo (a suite passes `createFakeClock().now`). */
+/** Test-only seam: override the clock of the `working`-row wait and evidence, of the findMissing memo and of each launch call's window (a suite passes `createFakeClock().now`). */
 export function _setNow(now: () => number): void {
   _now = now
 }
@@ -8697,11 +8898,17 @@ function teardownRefusalClassOf(err: unknown): PersonaTeardownKillRefusal['error
  * kept (b.jg5 SRJ-715). Each try and read is logged by the retry under
  * `[slack] persona teardown kill`. Never throws or rejects, and leaves no
  * timer pending once it settles.
+ *
+ * Before its first try it forgets the persona's launch-call window and its
+ * "this launch's row" record (`forgetLaunchCalls`, b.jg5 SRJ-407, SRJ-310):
+ * the teardown calls it once the persona's launch in flight has settled, so
+ * no launch of the persona is left to record either.
  */
 export async function killPersonaInstanceForTeardown(
   key: string,
   options: PersonaTeardownKillOptions,
 ): Promise<PersonaTeardownKillResult> {
+  forgetLaunchCalls(key)
   const ref = options.ref ?? keyRef(key)
   const refusals: PersonaTeardownKillRefusal[] = []
   const result = await runKillRetry({
@@ -8920,24 +9127,35 @@ function launchFailureResult(key: string): SpawnPersonaResult {
  * quietly (the spawn's wrapper raised `cwd-unreachable`);
  * then the refusal handling (`launchRefusalAt`: a CONFLICT latches with the
  * refused operation "plain spawn" and `lastRead`, an UNUSABLE NAME latches,
- * a refusal answers `failed`); any other error writes one line (`what`
+ * a refusal answers `failed`), an UNAVAILABLE refusal (a launch timeout, the
+ * pre-spawn scan that could not answer and "duplicate session"'s unreadable
+ * or ambiguous holder included) followed by the one `get` and its decision
+ * (`afterLaunchUnavailable`, b.jg5 SRJ-407); any other error writes one line (`what`
  * names the spawn), a `spawn-failed` entry at start and the spawn-failure
  * notice, and answers `failed`. An `ErrTmuxSessionCreate` among those is one
  * counted launch failure (`launchFailureResult`): nothing is killed and no
  * spawn is made in its place (SRJ-602). Never throws.
  */
 async function plainSpawnFailedAt(
-  key: string,
+  persona: Persona,
   err: unknown,
   isStartup: boolean,
   ref: string,
   what: string,
   lastRead: LastRowRead,
 ): Promise<SpawnPersonaResult> {
+  const { key } = persona
   // b.av2 SR-6.4: `cwd-unreachable` was raised by the spawn's wrapper.
   if (classifyAdError(err).errorClass === AD_ERROR_CLASS_DIRECTORY) return { key, action: 'failed' }
   const refused = await launchRefusalAt(key, err, 'spawn', what, ref, lastRead)
-  if (refused) return refused
+  // b.jg5 SRJ-407: an UNAVAILABLE outcome (a launch timeout, HO rev 15's
+  // pre-spawn scan that could not answer, HO rev 20's holder, HO rev 26's
+  // re-lookup included) is followed by one `get`, and no launch, in this attempt.
+  if (refused) {
+    return isUnavailableRefusal(refused, err)
+      ? afterLaunchUnavailable({ persona, isStartup, ref, verb: 'spawn', what }, err, refused)
+      : refused
+  }
   const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('spawn', 'UnknownError', String(err))
   const described = describeAgentDirectorFailure(e)
   const launchFailure = isLaunchFailure(err)
@@ -9711,8 +9929,10 @@ async function reuseFinishedRow(
  *   - every other outcome → `resumeFailedAt`: a CONFLICT latches (below),
  *     never a kill; UNAVAILABLE (the launch-timeout forms included) and
  *     ENVIRONMENT take the refusal rows, and nothing assumes the row was
- *     restored, since a failed `resume`'s restore is conditional (HO rev 28;
- *     no `get` is made here after them); an `ErrTmuxSessionCreate` is one
+ *     restored, since a failed `resume`'s restore is conditional (HO rev 28);
+ *     an UNAVAILABLE outcome is followed by one `get`, whose row decides
+ *     with no launch in the attempt (`afterLaunchUnavailable`, b.jg5
+ *     SRJ-407); an `ErrTmuxSessionCreate` is one
  *     counted launch failure that kills nothing, makes no spawn in its place
  *     and arms the persona's retry timer at once in pending-only mode, so
  *     that the retry's read of the row decides (SRJ-409; HO rev 28); the
@@ -10081,7 +10301,9 @@ interface ResumeSite<R> {
  *     notice for the `ErrSpawnNotFound` itself;
  *   - any other outcome: `resumeFailedAt` (CONFLICT latches with the refused
  *     operation "resume" and `site.lastRead`, never a kill; UNAVAILABLE,
- *     ENVIRONMENT, CONFIG and UNCLASSIFIED take the refusal rows; UNUSABLE
+ *     ENVIRONMENT, CONFIG and UNCLASSIFIED take the refusal rows, an
+ *     UNAVAILABLE one followed by the one `get` and its decision
+ *     (`afterLaunchUnavailable`, b.jg5 SRJ-407); UNUSABLE
  *     NAME latches; `ErrTmuxSessionCreate` is one counted launch failure
  *     that arms the retry timer at once in pending-only mode; the DIRECTORY
  *     errors give `cwd-unreachable`, counted; `ErrInvalidFlags` takes the
@@ -10107,7 +10329,7 @@ async function resumeAtSite<R>(site: ResumeSite<R>): Promise<SpawnPersonaResult 
     if (isNoTranscriptResumeError(err)) return site.noTranscript(err)
     if (hasAdErrorName(err, ERR_SPAWN_NOT_RESUMABLE_NAME)) return site.notResumable(err)
     if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) return plainSpawnAfterResumeNotFound(site)
-    const notResumed = await resumeFailedAt(key, err, isStartup, ref, lastRead)
+    const notResumed = await resumeFailedAt(persona, err, isStartup, ref, lastRead)
     return site.marksDirectoryCounted ? withDirectoryCounted(notResumed, err) : notResumed
   }
 }
@@ -10145,7 +10367,7 @@ async function plainSpawnAfterResumeNotFound(site: ResumeSite<unknown>): Promise
     afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, launched)
     return { key, action: 'spawned' }
   } catch (err2) {
-    const notSpawned = await plainSpawnFailedAt(key, err2, isStartup, ref, 'fresh spawn after ErrSpawnNotFound on resume', lastRead)
+    const notSpawned = await plainSpawnFailedAt(persona, err2, isStartup, ref, 'fresh spawn after ErrSpawnNotFound on resume', lastRead)
     return site.marksDirectoryCounted ? withDirectoryCounted(notSpawned, err2) : notSpawned
   }
 }
@@ -10900,12 +11122,13 @@ async function replaceAtResumeSite(
  * Never throws.
  */
 async function resumeFailedAt(
-  key: string,
+  persona: Persona,
   err: unknown,
   isStartup: boolean,
   ref: string,
   lastRead: LastRowRead,
 ): Promise<SpawnPersonaResult> {
+  const { key } = persona
   if (isInvalidFlagsError(err)) {
     // b.jg5 SRJ-104: the resume site gives ErrInvalidFlags no meaning: one
     // immediate version re-check, then UNCLASSIFIED. The line is built from
@@ -10934,7 +11157,13 @@ async function resumeFailedAt(
   // b.jg5 SRJ-113: a CONFLICT latches the persona (refused operation
   // "resume"); never a kill.
   const refused = await launchRefusalAt(key, err, 'resume', 'resume', ref, lastRead)
-  if (refused) return refused
+  // b.jg5 SRJ-407: an UNAVAILABLE outcome (a launch timeout included) is
+  // followed by one `get`, and no launch, in this attempt.
+  if (refused) {
+    return isUnavailableRefusal(refused, err)
+      ? afterLaunchUnavailable({ persona, isStartup, ref, verb: 'resume', what: 'resume' }, err, refused)
+      : refused
+  }
   const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('resume', 'UnknownError', String(err))
   const described = describeAgentDirectorFailure(e)
   if (!isLaunchFailure(err)) {
@@ -10946,6 +11175,267 @@ async function resumeFailedAt(
   if (isStartup) recordStartupError('spawn-failed', `resume failed for ${ref}: ${described}`)
   notifySpawnFailure(key, e, isStartup)
   return launchFailureResult(key)
+}
+
+// ---------------------------------------------------------------------------
+// The one `get` after a launch's UNAVAILABLE outcome (b.jg5 SRJ-407)
+// ---------------------------------------------------------------------------
+
+/** Who reads, in the own-row lines of the one `get` after a launch's UNAVAILABLE outcome (`afterLaunchUnavailable`; the persona's ref is added; b.jg5 SRJ-407, SRJ-114). */
+export const LAUNCH_UNAVAILABLE_GET_SITE: OwnRowReadSite = Object.freeze({
+  site: 'spawnForPersona',
+  what: "get after the launch's UNAVAILABLE outcome",
+})
+
+/** The step's outcome: the read latched the persona (or found it latched). */
+export const LAUNCH_UNAVAILABLE_OUTCOME_LATCHED = 'the persona is latched: answering latched; nothing more is called for it'
+/** The step's outcome: no row (`ErrSpawnNotFound`). */
+export const LAUNCH_UNAVAILABLE_OUTCOME_NO_ROW = 'no row: nothing more in this attempt; the retry the outcome armed brings the persona up'
+/** The step's outcome: the read was refused (the shared read's own error rows applied). */
+export const LAUNCH_UNAVAILABLE_OUTCOME_REFUSED = 'the read was refused: nothing more in this attempt'
+/** The step's outcome: the row reads `ended` or `missing`. */
+export const LAUNCH_UNAVAILABLE_OUTCOME_FINISHED = 'the row is finished: nothing more in this attempt; the retry the outcome armed launches it again'
+/** The step's outcome: the row reads another live state. */
+export const LAUNCH_UNAVAILABLE_OUTCOME_LIVE =
+  "another live state: no launch over it; the retry the outcome armed runs the restart path, whose reconnect adapter handles the row"
+/** The step's outcome: the row reads a state CSCB does not know. */
+export const LAUNCH_UNAVAILABLE_OUTCOME_UNKNOWN = 'a state CSCB does not know: nothing more in this attempt'
+/** The step's outcome: a covered `pending` row after a launch timeout, the approver started. */
+export const LAUNCH_UNAVAILABLE_OUTCOME_APPROVER = 'covered: the approver starts once the launch call has returned; the retry timer watches the row'
+/** The step's outcome: a covered `pending` row after a launch timeout whose approver the start entry did not start. */
+export const LAUNCH_UNAVAILABLE_OUTCOME_APPROVER_NOT_STARTED = 'covered, but the approver was not started; the retry timer watches the row'
+/** The step's outcome: a covered `pending` row after an UNAVAILABLE outcome that was no launch timeout. */
+export const LAUNCH_UNAVAILABLE_OUTCOME_COVERED_NO_APPROVER =
+  'covered: no approver after this outcome; the retry timer watches the row'
+/** The step's outcome: a `pending` row whose cover is undecided. */
+export const LAUNCH_UNAVAILABLE_OUTCOME_UNDECIDED = 'undecided: no approver, no sequence; the retry timer watches the row'
+/** The step's outcome: a configured persona's own `pending` row with no launch start. */
+export const LAUNCH_UNAVAILABLE_OUTCOME_NO_LAUNCH_START = 'no launch start: the persona latches on it; answering latched'
+
+/** The step's outcome for a `pending` row that is not covered, started through the live-row sequence's start entry. */
+export function launchUnavailableSequenceOutcome(reason: PendingRowNotCoveredReason, startAnswer: string, action: string): string {
+  return `not covered (${reason}): the live-row sequence, no approver; start answered ${startAnswer} — answering ${action}`
+}
+
+/**
+ * The step's line text for each launch-timeout form: CSCB's own text, picked
+ * by the form, so no agent-director text reaches the line through it.
+ */
+const LAUNCH_TIMEOUT_FORM_TEXT: Readonly<Record<LaunchTimeoutForm, string>> = Object.freeze({
+  [LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT]: `a launch timeout (${LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT})`,
+  [LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE]: `a launch timeout (${LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE})`,
+})
+
+/**
+ * How the step's line names the launch's outcome: for a launch timeout
+ * (`timeoutForm`, from `launchTimeoutFormOf`) its form (`a launch timeout
+ * (ErrCallTimeout)`, `a launch timeout (ErrTmuxUnresponsive)`), else
+ * `UNAVAILABLE (<failure>)`, where `failure` is the outcome already rendered
+ * by `describeAgentDirectorFailure`. Takes no caught error, so none reaches
+ * the line except through the describer. Pure; never throws.
+ */
+export function launchUnavailableFormText(timeoutForm: LaunchTimeoutForm | undefined, failure: string): string {
+  return timeoutForm !== undefined ? LAUNCH_TIMEOUT_FORM_TEXT[timeoutForm] : `UNAVAILABLE (${failure})`
+}
+
+/**
+ * The step's one line per decision (b.jg5 SRJ-407), naming the persona
+ * reference, the call (`what`), the outcome's form or kind (`form`), the row
+ * state the `get` read (`read`: a state through `isSafeIdentifier`, or what
+ * the read found), whether the row is this launch's (with its launch start
+ * only as CSCB renders it, `describeLaunchStartForLog`), and the outcome:
+ *
+ *   [slack] spawnForPersona: one get after the <what> of <ref> ended in <form>: read <read>; this launch's row: <yes (launch start <iso>)|no> — <outcome>; no launch in this attempt (b.jg5 SRJ-407)
+ */
+export function launchUnavailableGetLine(
+  ref: string,
+  what: string,
+  form: string,
+  read: string,
+  thisLaunchRow: ThisLaunchRowRecord | undefined,
+  outcome: string,
+): string {
+  const own =
+    thisLaunchRow === undefined ? 'no' : `yes (launch start ${describeLaunchStartForLog(thisLaunchRow.launchStartMs)})`
+  return `[slack] spawnForPersona: one get after the ${what} of ${ref} ended in ${form}: read ${read}; this launch's row: ${own} — ${outcome}; no launch in this attempt (b.jg5 SRJ-407)`
+}
+
+/** What a launch call whose UNAVAILABLE outcome the step follows was. */
+interface LaunchUnavailableSite {
+  readonly persona: Persona
+  /** Whether the launch is part of the start pass (passed to the approver). */
+  readonly isStartup: boolean
+  readonly ref: string
+  /** The call's declared verb: `spawn` (plain or reuse) or `resume`. */
+  readonly verb: 'spawn' | 'resume'
+  /** What the step's line calls the call. */
+  readonly what: string
+  /**
+   * Present for a reuse spawn: the store's reading of the key and its record
+   * generation when the launch attempt started (b.jg5 SRJ-806), for the mark
+   * of a reuse that timed out but launched.
+   */
+  readonly reuseRetiredAtStart?: RetiredKeyAttemptStart
+}
+
+/** Whether a launch's refusal result `refused` is for an UNAVAILABLE outcome (`err`'s class), the step's trigger. Never throws. */
+function isUnavailableRefusal(refused: SpawnPersonaResult, err: unknown): boolean {
+  return refused.action === 'failed' && classifyAdError(err).errorClass === AD_ERROR_CLASS_UNAVAILABLE
+}
+
+/** A row state for the step's line: the state when it is a short identifier, else `unknown`. */
+function launchUnavailableReadText(state: unknown): string {
+  return isSafeIdentifier(state) ? state : 'unknown'
+}
+
+/**
+ * The one post-UNAVAILABLE step (b.jg5 SRJ-407), run inside the launch
+ * attempt right after a launch call of `site.persona` (a plain spawn at any
+ * of its sites, a reuse spawn at any of its sites, the live-row sequence's
+ * final one included, or a `resume` at either site) ended in an UNAVAILABLE
+ * outcome (`err`, by class) and the refusal handling answered `refused` and
+ * armed the persona's retry timer. No launch call follows in this attempt,
+ * whatever the read shows. One `get` of the persona's own row through the
+ * shared own-row read (`readPersonaOwnRow` at `LAUNCH_UNAVAILABLE_GET_SITE`,
+ * so its note latch, its no-launch-start latch, its retired-entry clear and
+ * its old-life read entry apply; SRJ-114, SRJ-513, SRJ-807, SRJ-809), then:
+ *   - the read latched the persona, or it was latched meanwhile: `latched`;
+ *   - `ErrSpawnNotFound`: nothing more; the retry the outcome armed brings
+ *     the persona up, never a launch in this attempt;
+ *   - a refused read: the shared read's own error rows (`refusalAt`: one
+ *     line; inside the attempt its UNAVAILABLE arms its read-error cause);
+ *   - `ended` or `missing`: nothing more; launched again at the next retry;
+ *   - another live state, or one CSCB does not know: nothing more; the retry
+ *     the outcome armed runs the restart path, whose reconnect adapter
+ *     handles the row; never a launch over it;
+ *   - `pending` after a launch timeout (`launchTimeoutFormOf`, either form):
+ *     first, when its launch start lies inside the call's window
+ *     (`isLaunchStartInWindow` over `launchCallWindowOf`, both ends
+ *     included), the row is this launch's: the persona's "this launch's row"
+ *     record is set (`thisLaunchRows`: its launch start and the window, for
+ *     SRJ-310's rule 3, `checkThisLaunchRowOnRead`), and for a reuse spawn
+ *     of a recorded key the "new life has begun" mark is set and the key's
+ *     old-life hold ended (`markNewLifeAfterTimedOutReuse`, SRJ-806,
+ *     SRJ-809), before the cover decision, so the reuse's own row is covered
+ *     as the new life; then the one pending-row step (`pendingRowStep`)
+ *     decides and arms; a covered row gets the dialog approver through the
+ *     start entry with the launch-timeout origin (`startDialogApprover`,
+ *     `APPROVER_ORIGIN_LAUNCH_TIMEOUT`; not awaited, its first call after the
+ *     launch call returned), never through the after-launch step;
+ *   - `pending` after any other UNAVAILABLE outcome: the pending-row step
+ *     only: never this launch's row, no mark and no approver;
+ *   - a `pending` row that is not covered (a retired key's old life, a `cwd`
+ *     or `config_dir` mismatch): the live-row sequence through the start
+ *     entry (`startRecoverySequence`: seeded `pending`, the conversation not
+ *     kept, alert context `recovery`), no approver, answering
+ *     `sequence-waiting` (`held` for a persona held on `ErrInvalidFlags`);
+ *   - a configured persona's own `pending` row with no launch start:
+ *     `latched` (its read latched it).
+ * Any other answer is the launch's refusal result (b.jg5 SRJ-1015): `retrying` when the
+ * attempt's error before or during the step armed the persona's timer
+ * (`currentAttemptLastError`), else `refused` as it came. One line per
+ * decision (`launchUnavailableGetLine`). Nothing here kills, deletes,
+ * launches or counts. Never throws.
+ */
+async function afterLaunchUnavailable(
+  site: LaunchUnavailableSite,
+  err: unknown,
+  refused: SpawnPersonaResult,
+): Promise<SpawnPersonaResult> {
+  const { persona, ref, verb, what } = site
+  const { key } = persona
+  // The launch's own UNAVAILABLE was recorded (and armed) before this step;
+  // the `get` below records its own answer in its place.
+  const launchArmed = currentAttemptLastError(key)?.armed === true
+  const notLaunched = (): SpawnPersonaResult =>
+    launchArmed || currentAttemptLastError(key)?.armed === true ? { key, action: SPAWN_ACTION_RETRYING } : refused
+  const timeoutForm = launchTimeoutFormOf(err, verb)
+  const formText = launchUnavailableFormText(timeoutForm, describeAgentDirectorFailure(err))
+  const log = (read: string, thisLaunchRow: ThisLaunchRowRecord | undefined, outcome: string): void => {
+    console.error(launchUnavailableGetLine(ref, what, formText, read, thisLaunchRow, outcome))
+  }
+  const at: OwnRowReadSite = { ...LAUNCH_UNAVAILABLE_GET_SITE, ref }
+  const read = await readPersonaOwnRow(key, at)
+  if (read.kind === OWN_ROW_READ_LATCHED || (read.kind === OWN_ROW_READ_ROW && read.latched)) {
+    log(read.kind === OWN_ROW_READ_ROW ? launchUnavailableReadText(read.row.state) : 'an UNUSABLE NAME answer', undefined, LAUNCH_UNAVAILABLE_OUTCOME_LATCHED)
+    return { key, action: 'latched' }
+  }
+  // b.jg5 SRJ-502: the get is awaited, and the persona may have latched elsewhere meanwhile.
+  if (latchedAfterOwnRowRead(key, at.site, at.what, ref)) {
+    log(read.kind === OWN_ROW_READ_ROW ? launchUnavailableReadText(read.row.state) : read.kind, undefined, LAUNCH_UNAVAILABLE_OUTCOME_LATCHED)
+    return { key, action: 'latched' }
+  }
+  if (read.kind === OWN_ROW_READ_ABSENT) {
+    log('no row (ErrSpawnNotFound)', undefined, LAUNCH_UNAVAILABLE_OUTCOME_NO_ROW)
+    return notLaunched()
+  }
+  if (read.kind === OWN_ROW_READ_REFUSED) {
+    if (refusalAt(key, read.error, 'get', at.site, at.what, ref) === undefined) {
+      // Not reached: every `get` error but ErrSpawnNotFound and UNUSABLE NAME is a refusal.
+      console.error(`[slack] ${at.site}: ${at.what} failed for ${ref}: ${describeAgentDirectorFailure(read.error)} — nothing more is called`)
+    }
+    log('nothing (a refused read)', undefined, LAUNCH_UNAVAILABLE_OUTCOME_REFUSED)
+    return notLaunched()
+  }
+  // The row whole, so its launch start is read (`src/ad-phase1-types.ts`).
+  const row: Phase1GetResult = read.row
+  const readText = launchUnavailableReadText(row.state)
+  if (row.state !== AGENT_DIRECTOR_PENDING_STATE) {
+    const outcome = AGENT_DIRECTOR_DEAD_STATES.has(row.state)
+      ? LAUNCH_UNAVAILABLE_OUTCOME_FINISHED
+      : AGENT_DIRECTOR_LIVE_STATES.has(row.state)
+        ? LAUNCH_UNAVAILABLE_OUTCOME_LIVE
+        : LAUNCH_UNAVAILABLE_OUTCOME_UNKNOWN
+    log(readText, undefined, outcome)
+    return notLaunched()
+  }
+  // b.jg5 SRJ-407, SRJ-806: after a launch timeout, a launch start inside the
+  // call's window makes the row this launch's; a reuse of a recorded key then
+  // begins its new life before the cover decision, so its row is covered.
+  let thisLaunchRow: ThisLaunchRowRecord | undefined
+  if (timeoutForm !== undefined) {
+    const window = launchCallWindowOf(key)
+    const launchStartMs = parseLaunchStart(row.launch_started_at)
+    if (window !== undefined && launchStartMs !== undefined && isLaunchStartInWindow(row.launch_started_at, window)) {
+      thisLaunchRow = { launchStartMs, window }
+      thisLaunchRows.set(key, thisLaunchRow)
+      if (site.reuseRetiredAtStart !== undefined) markNewLifeAfterTimedOutReuse(key, ref, site.reuseRetiredAtStart)
+    }
+  }
+  const { cover } = pendingRowStep(persona, ref, row, false)
+  switch (cover.answer) {
+    case PENDING_ROW_NO_LAUNCH_START:
+      log(readText, thisLaunchRow, LAUNCH_UNAVAILABLE_OUTCOME_NO_LAUNCH_START)
+      return { key, action: 'latched' }
+    case PENDING_ROW_UNDECIDED:
+      log(readText, thisLaunchRow, LAUNCH_UNAVAILABLE_OUTCOME_UNDECIDED)
+      return notLaunched()
+    case PENDING_ROW_COVERED: {
+      if (timeoutForm === undefined) {
+        log(readText, thisLaunchRow, LAUNCH_UNAVAILABLE_OUTCOME_COVERED_NO_APPROVER)
+        return notLaunched()
+      }
+      // b.jg5 SRJ-401, SRJ-407: started outside the launch call; its first
+      // call waits until this launch has settled.
+      const started = startDialogApprover(key, site.isStartup, ref, {
+        origin: APPROVER_ORIGIN_LAUNCH_TIMEOUT,
+        cover,
+        launchStartedAt: row.launch_started_at,
+      })
+      log(readText, thisLaunchRow, started ? LAUNCH_UNAVAILABLE_OUTCOME_APPROVER : LAUNCH_UNAVAILABLE_OUTCOME_APPROVER_NOT_STARTED)
+      return notLaunched()
+    }
+    case PENDING_ROW_NOT_COVERED: {
+      const { startAnswer, result } = startRecoverySequence(
+        { persona, ref, retiredAtStart: site.reuseRetiredAtStart },
+        latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE),
+        false,
+        cover.reason === PENDING_ROW_REASON_RETIRED_OLD_LIFE,
+      )
+      log(readText, thisLaunchRow, launchUnavailableSequenceOutcome(cover.reason, startAnswer, result.action))
+      return result
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -11049,7 +11539,8 @@ function undoPreLaunchReplyGuard(undo: ReplyGuardUndo | undefined, ref: string):
  * first spawn, which also undoes the steps when it meets a live instance,
  * and the reuse spawn (`reuseSpawnForPersona`), which makes the same two
  * steps itself so that a retired key's first launch can undo them the same
- * way (b.jg5 SRJ-805).
+ * way (b.jg5 SRJ-805). The call records its window (`launchCallWithWindow`,
+ * b.jg5 SRJ-407).
  */
 function launchWithReplyGuard<T>(
   persona: Persona,
@@ -11058,7 +11549,199 @@ function launchWithReplyGuard<T>(
   call: (client: Client) => Promise<T>,
 ): Promise<T> {
   runPreLaunchReplyGuard(persona, ref)
-  return withSpawnDetection(persona.key, persona.working_directory, verb, call)
+  return launchCallWithWindow(persona.key, persona.working_directory, verb, call)
+}
+
+// ---------------------------------------------------------------------------
+// Each launch call's window (b.jg5 SRJ-407)
+// ---------------------------------------------------------------------------
+
+/** A launch call's window ended because the call returned success. */
+export const LAUNCH_CALL_END_RETURNED = 'returned'
+/** A launch call's window ended because the call ended in a launch timeout (`isLaunchTimeoutError`). */
+export const LAUNCH_CALL_END_LAUNCH_TIMEOUT = 'launch-timeout'
+
+/** How a launch call's window ended. */
+export type LaunchCallEnd = typeof LAUNCH_CALL_END_RETURNED | typeof LAUNCH_CALL_END_LAUNCH_TIMEOUT
+
+/**
+ * The window of a persona's latest launch call (b.jg5 SRJ-407): the verb the
+ * call declared (`spawn`, plain or reuse, or `resume`), its start, and, once
+ * it returned success or ended in a launch timeout, its end and how it ended.
+ * A call that ended any other way keeps no end.
+ */
+export interface LaunchCallWindowRecord extends LaunchCallWindow {
+  readonly verb: 'spawn' | 'resume'
+  readonly end?: LaunchCallEnd
+}
+
+/**
+ * Each persona's latest launch call's window (b.jg5 SRJ-407), kept beside the
+ * launch-in-flight state (`inFlightLaunches`). Replaced at each launch call
+ * for the persona; forgotten at its teardown's kill (`forgetLaunchCalls`)
+ * and by `_resetInFlightLaunches`.
+ */
+const launchCallWindows = new Map<string, LaunchCallWindowRecord>()
+
+/**
+ * The window of persona `key`'s latest launch call (b.jg5 SRJ-407), or
+ * `undefined` when none is kept. Its times are wall-clock epoch
+ * milliseconds on the session manager's clock (`_setNow`). Read-only.
+ */
+export function launchCallWindowOf(key: string): LaunchCallWindowRecord | undefined {
+  return launchCallWindows.get(key)
+}
+
+/**
+ * Forget persona `key`'s launch-call window and its "this launch's row"
+ * record (b.jg5 SRJ-407, SRJ-310), as its teardown does
+ * (`killPersonaInstanceForTeardown`, which runs once the persona's launch in
+ * flight has settled). Silent; never throws.
+ */
+export function forgetLaunchCalls(key: string): void {
+  launchCallWindows.delete(key)
+  thisLaunchRows.delete(key)
+}
+
+/**
+ * One launch call of persona `key` (`client.spawn`, plain or reuse, or
+ * `client.resume`, declared as `verb`) through spawn detection
+ * (`withSpawnDetection`), recording its window (b.jg5 SRJ-407): a new window
+ * starts just before the call, on the session manager's clock (`_now`),
+ * replacing the persona's earlier one, and the call forgets the persona's
+ * "this launch's row" record (`thisLaunchRows`); the window's end is taken
+ * when the call returns success or, for a launch timeout
+ * (`isLaunchTimeoutError`: `ErrCallTimeout`, or `ErrTmuxUnresponsive` whose
+ * description carries "the session may have been created"), when the call's
+ * error reaches CSCB. Any other error leaves the window with no end. The
+ * call's answer or error is passed on unchanged. Every launch call goes
+ * through here: the ladder's first spawn and a reuse spawn directly, and
+ * every other spawn and `resume` through `launchWithReplyGuard`.
+ */
+async function launchCallWithWindow<T>(
+  key: string,
+  workingDirectory: string | undefined,
+  verb: 'spawn' | 'resume',
+  call: (client: Client) => Promise<T>,
+): Promise<T> {
+  thisLaunchRows.delete(key)
+  const started: LaunchCallWindowRecord = { verb, startMs: _now() }
+  launchCallWindows.set(key, started)
+  let result: T
+  try {
+    result = await withSpawnDetection(key, workingDirectory, verb, call)
+  } catch (err) {
+    if (isLaunchTimeoutError(err, verb)) endLaunchCallWindow(key, started, LAUNCH_CALL_END_LAUNCH_TIMEOUT)
+    throw err
+  }
+  endLaunchCallWindow(key, started, LAUNCH_CALL_END_RETURNED)
+  return result
+}
+
+/**
+ * "This launch's row" (b.jg5 SRJ-407, SRJ-310 rule 3): after a launch call
+ * of persona P ended in a launch timeout, the one `get` that followed it read
+ * P's row `pending` with a launch start inside that call's window. The
+ * record keeps that launch start (epoch ms, as `parseLaunchStart` reads it)
+ * and the window.
+ */
+export interface ThisLaunchRowRecord {
+  readonly launchStartMs: number
+  readonly window: LaunchCallWindowRecord
+}
+
+/**
+ * Each persona's "this launch's row" record (`ThisLaunchRowRecord`), set by
+ * the step after a launch's UNAVAILABLE outcome (`afterLaunchUnavailable`)
+ * and checked at every shared own-row read (`checkThisLaunchRowOnRead`).
+ * Forgotten at a new launch call for the persona (`launchCallWithWindow`),
+ * by rule 3's check, at its teardown's kill (`forgetLaunchCalls`) and by
+ * `_resetInFlightLaunches`.
+ */
+const thisLaunchRows = new Map<string, ThisLaunchRowRecord>()
+
+/** Persona `key`'s "this launch's row" record, or `undefined` when none is kept (b.jg5 SRJ-407). Read-only. */
+export function thisLaunchRowOf(key: string): ThisLaunchRowRecord | undefined {
+  return thisLaunchRows.get(key)
+}
+
+/** `checkThisLaunchRowOnRead`'s reading for a read that found no row (`ErrSpawnNotFound`). */
+const THIS_LAUNCH_ROW_READ_ABSENT = 'absent'
+
+/** What one own-row read found, for `checkThisLaunchRowOnRead`: the row's state and its raw launch start, or no row. */
+type ThisLaunchRowReading = { readonly state: string; readonly launchStartedAt: unknown } | typeof THIS_LAUNCH_ROW_READ_ABSENT
+
+/**
+ * The line of SRJ-310's third end rule (b.jg5 SRJ-310, SRJ-407), at the read
+ * `at` that found persona `ref`'s row, this launch's, in the live state
+ * `state` (through `isSafeIdentifier`), with whether the condition was asked
+ * to end:
+ *
+ *   [slack] <site>: <what> for <ref>: this launch's row left pending for <state> after its launch timeout — the tmux-unresponsive condition ends if it holds (SRJ-310 rule 3; b.jg5 SRJ-407)
+ *   [slack] <site>: <what> for <ref>: this launch's row left pending for <state> after its launch timeout — no condition sink is installed, so nothing ends (SRJ-310 rule 3; b.jg5 SRJ-407)
+ */
+export function thisLaunchRowLiveLine(at: OwnRowReadSite, ref: string, state: string, asked: boolean): string {
+  const ended = asked ? 'the tmux-unresponsive condition ends if it holds' : 'no condition sink is installed, so nothing ends'
+  return `[slack] ${at.site}: ${at.what} for ${ref}: this launch's row left pending for ${isSafeIdentifier(state) ? state : 'unknown'} after its launch timeout — ${ended} (SRJ-310 rule 3; b.jg5 SRJ-407)`
+}
+
+/**
+ * SRJ-310's third end rule (b.jg5 SRJ-310, SRJ-303, SRJ-407), applied by the
+ * shared own-row reads (`readPersonaOwnRow`'s `get`, and the own-row `status`
+ * step, `applyOwnRowStatusStep`, which every own-row `status` goes through:
+ * the retry's row read, the liveness and reconnect adapters, the approver's
+ * laps, the live-row sequence's reads) to persona `key`'s "this launch's row"
+ * record, if any. The rule applies only once this launch's row was
+ * established: after a launch timeout, by a `pending` read whose launch
+ * start lay inside the call's window (`afterLaunchUnavailable`); a first read
+ * already live other than `pending` sets no record and is left to rules 1
+ * and 2. On the read's answer (`reading`):
+ *   - a live state other than `pending` (`AGENT_DIRECTOR_LIVE_STATES`): the
+ *     record is forgotten, then, unless the same read latched the persona
+ *     (`latched`: the latch's own silent end applies), the condition is
+ *     ended once through the outage state's end entry
+ *     (`endTmuxUnresponsiveForLaunchRow`) with that state as its reading,
+ *     with one line (`thisLaunchRowLiveLine`); the condition's own rules
+ *     decide the recovery post, and its condition-end hook stops the retry
+ *     timer unless another cause holds (SRJ-306). Whichever read sees it
+ *     first ends it, and no later read ends it again;
+ *   - `ended`, `missing`, no row, or `pending` with a launch start other than
+ *     the record's (none included): the record is forgotten, with no end;
+ *   - `pending` with the record's launch start, or a state CSCB does not
+ *     know: the record is kept.
+ * Never throws.
+ */
+function checkThisLaunchRowOnRead(key: string, reading: ThisLaunchRowReading, latched: boolean, at: OwnRowReadSite): void {
+  try {
+    const record = thisLaunchRows.get(key)
+    if (record === undefined) return
+    if (reading === THIS_LAUNCH_ROW_READ_ABSENT) {
+      thisLaunchRows.delete(key)
+      return
+    }
+    const { state } = reading
+    if (state === AGENT_DIRECTOR_PENDING_STATE) {
+      if (parseLaunchStart(reading.launchStartedAt) !== record.launchStartMs) thisLaunchRows.delete(key)
+      return
+    }
+    if (AGENT_DIRECTOR_DEAD_STATES.has(state)) {
+      thisLaunchRows.delete(key)
+      return
+    }
+    if (!AGENT_DIRECTOR_LIVE_STATES.has(state)) return
+    thisLaunchRows.delete(key)
+    if (latched) return
+    const asked = endTmuxUnresponsiveForLaunchRow(key, state)
+    console.error(thisLaunchRowLiveLine(at, at.ref ?? keyRef(key), state, asked))
+  } catch {
+    /* the rule never changes what the read answers */
+  }
+}
+
+/** End `started`, persona `key`'s window, now, with `end`, while it is still the persona's latest. */
+function endLaunchCallWindow(key: string, started: LaunchCallWindowRecord, end: LaunchCallEnd): void {
+  if (launchCallWindows.get(key) !== started) return
+  launchCallWindows.set(key, { ...started, endMs: _now(), end })
 }
 
 /**
@@ -11072,7 +11755,8 @@ const inFlightLaunches = new Map<string, Promise<SpawnPersonaResult>>()
 
 /**
  * Test-only seam: forget every in-flight launch (and, b.f2b, every cancel of
- * a wait one had not started); cancel, wake and forget every running wait for
+ * a wait one had not started), every launch call's window and every "this
+ * launch's row" record (b.jg5 SRJ-407); cancel, wake and forget every running wait for
  * a `working` row, as `cancelWorkingRowWait` does but without its log line, so
  * the wait types nothing more and returns `cancelled` instead of polling on
  * to its deadline; and stop and forget every dialog approver
@@ -11081,6 +11765,8 @@ const inFlightLaunches = new Map<string, Promise<SpawnPersonaResult>>()
 export function _resetInFlightLaunches(): void {
   inFlightLaunches.clear()
   cancelledLaunchWaits.clear()
+  launchCallWindows.clear()
+  thisLaunchRows.clear()
   for (const wait of workingRowWaits.values()) {
     wait.cancelled = true
     wait.wake()
@@ -11177,13 +11863,38 @@ function requestApproverStop(entry: RegisteredApprover, reason: ApproverStopRequ
  * the answer false. Otherwise answers true. A failure inside the loop is
  * logged and the approver stops (`failed`); it never becomes an unhandled
  * rejection. The entry is removed when the approver stops. Never throws.
+ *
+ * `start` says why it starts (b.jg5 SRJ-401, SRJ-407): after a launch that
+ * returned (`APPROVER_START_AFTER_LAUNCH`, the default; `afterLaunchSucceeded`),
+ * or after a launch timeout whose `get` read the persona's row `pending`
+ * (`APPROVER_ORIGIN_LAUNCH_TIMEOUT`; `afterLaunchUnavailable`). For the
+ * launch-timeout origin the entry first checks the pending-row step's
+ * decision on that row, as a guard beside its caller's: a row that is not
+ * covered, undecided, or with no launch start (by the decision, or a launch
+ * start that does not parse) gets no approver, with one line
+ * (`approverRefusedRowMessage`), and the answer false. An approver it starts
+ * logs one line naming the origin (`approverStartedAfterLaunchTimeoutMessage`)
+ * and then runs exactly as one started after a returned launch: the same
+ * loop, stop rules, pace, B from the launch start its first lap keeps, and
+ * the one-approver rule (SRJ-404).
  */
-export function startDialogApprover(key: string, isStartup: boolean, ref: string = keyRef(key)): boolean {
+export function startDialogApprover(
+  key: string,
+  isStartup: boolean,
+  ref: string = keyRef(key),
+  start: ApproverStart = APPROVER_START_AFTER_LAUNCH,
+): boolean {
+  const rowRefusal = approverRowRefusal(start)
+  if (rowRefusal !== undefined) {
+    console.error(approverLogLine(approverRefusedRowMessage(ref, rowRefusal)))
+    return false
+  }
   const refusal = approversClosed ? APPROVER_STOP_SHUTDOWN : cancelledComingApprovers.get(key)
   if (refusal !== undefined) {
     console.error(approverLogLine(approverNotStartedMessage(ref, refusal)))
     return false
   }
+  if (start.origin === APPROVER_ORIGIN_LAUNCH_TIMEOUT) console.error(approverLogLine(approverStartedAfterLaunchTimeoutMessage(ref)))
   const previous = runningApprovers.get(key)
   if (previous !== undefined) requestApproverStop(previous, APPROVER_STOP_SUPERSEDED, true)
   const run = newApproverRun()
@@ -11655,6 +12366,12 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *    `failed` marked `countedClass`; nothing is killed because of it, no
  *    spawn is made in its place, and the persona's retry timer is armed at
  *    once in pending-only mode (`launchFailureResult`; SRJ-301, SRJ-409).
+ *    An UNAVAILABLE outcome of any spawn or resume above (a launch timeout,
+ *    either form, included) is a refusal followed by one `get` of the
+ *    persona's row and no launch in the attempt (`afterLaunchUnavailable`,
+ *    b.jg5 SRJ-407): a covered `pending` row after a launch timeout gets the
+ *    dialog approver, a row that is not covered the live-row sequence, and
+ *    the launch answers `retrying`, `latched` or `sequence-waiting`.
  * 7. Steps 4 to 6 run as a launch attempt for the key (b.jg5 SRJ-301,
  *    `runInAttempt`): an agent-director error there that the arming predicate
  *    answers a cause for arms the persona's retry timer through the installed
@@ -11671,7 +12388,10 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *    SRJ-401) without awaiting it: the result is returned as soon as the
  *    launch call returns, and the launch is no longer in flight
  *    (`isLaunchInFlight`) while the approver runs. The approver runs outside
- *    the launch attempt. No other branch, result or dry run starts one.
+ *    the launch attempt. Besides it, only the step after a launch timeout
+ *    whose `get` read a covered `pending` row starts one, through the same
+ *    start entry with the launch-timeout origin (`afterLaunchUnavailable`,
+ *    b.jg5 SRJ-407); no other branch, result or dry run starts one.
  *
  * `hooks` belong to the ladder this call starts; a call that joins a launch
  * already in flight gets none of them.
@@ -11911,7 +12631,7 @@ async function runPersonaLadder(
   let replyGuardUndo: ReplyGuardUndo | undefined
   try {
     replyGuardUndo = runPreLaunchReplyGuard(persona, ref)
-    const r: Phase1SpawnResult = await withSpawnDetection(key, persona.working_directory, 'spawn', (client) => client.spawn(params))
+    const r: Phase1SpawnResult = await launchCallWithWindow(key, persona.working_directory, 'spawn', (client) => client.spawn(params))
     console.error(`[slack] spawnForPersona: spawned ${ref} instanceId=${r.claude_instance_id}`)
     afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, r)
     return { key, action: 'spawned' }
@@ -11929,7 +12649,7 @@ async function runPersonaLadder(
       // nothing is killed and no spawn is made in its place, and the
       // persona's retry timer is armed at once in pending-only mode
       // (b.jg5 SRJ-602, SRJ-713, SRJ-409).
-      return plainSpawnFailedAt(key, err, isStartup, ref, 'spawn', NOTHING_READ)
+      return plainSpawnFailedAt(persona, err, isStartup, ref, 'spawn', NOTHING_READ)
     }
   }
 
@@ -12063,7 +12783,7 @@ async function ladderGetThenAct(run: LadderRun): Promise<SpawnPersonaResult> {
         return { key, action: 'spawned' }
       } catch (err2) {
         // b.jg5 SRJ-501: the collision `get` read no row.
-        return plainSpawnFailedAt(key, err2, isStartup, ref, 'retry-spawn', LATCH_ROW_STATE_NO_ROW)
+        return plainSpawnFailedAt(persona, err2, isStartup, ref, 'retry-spawn', LATCH_ROW_STATE_NO_ROW)
       }
     }
     // b.jg5 SRJ-105, SRJ-311, SRJ-313, SRJ-316: a read error is a refusal,
@@ -12365,10 +13085,10 @@ export async function reuseSpawnForPersona(
   // gets no mark at the reuse's success (`reuseSuccessAction`).
   const retiredAtStart = options.retiredAtStart ?? retiredKeyAttemptStartOf(key)
   try {
-    launched = await withSpawnDetection(key, persona.working_directory, 'spawn', (client) => client.spawn(params))
+    launched = await launchCallWithWindow(key, persona.working_directory, 'spawn', (client) => client.spawn(params))
   } catch (err) {
     if (options.firstLaunch === true && hasAdErrorName(err, ERR_INSTANCE_ID_COLLISION_NAME)) undoPreLaunchReplyGuard(replyGuardUndo, ref)
-    return reuseSpawnFailedAt(persona, err, options.isStartup, ref, options.lastRead)
+    return reuseSpawnFailedAt(persona, err, options.isStartup, ref, options.lastRead, retiredAtStart)
   }
   // b.jg5 SRJ-112: a reuse of an id with no row is an ordinary fresh spawn; no earlier life is kept.
   const earlierLife =
@@ -12416,7 +13136,12 @@ export async function reuseSpawnForPersona(
  *     launch answers as `retrying` when the attempt's last error armed the
  *     retry timer (`retryingWhenArmed`): never counted, no notice; the
  *     reporting point has armed the retry timer, started the condition or
- *     raised the outage, and fed the unclassified-error episode, by class;
+ *     raised the outage, and fed the unclassified-error episode, by class.
+ *     An UNAVAILABLE one is then followed by one `get` and its decision, with
+ *     no launch in the attempt (`afterLaunchUnavailable`, b.jg5 SRJ-407): a
+ *     reuse of a recorded key that timed out but launched, whose `get` reads
+ *     this launch's row, sets the key's mark and ends its old-life hold
+ *     there (SRJ-806, SRJ-809), and still answers `retrying`;
  *   - LAUNCH FAILURE (`ErrTmuxSessionCreate`): one counted launch failure
  *     (one line, the spawn-failure notice, a `spawn-failed` entry at start,
  *     `failed`), never a kill and never a spawn in its place (SRJ-602); the
@@ -12436,6 +13161,7 @@ async function reuseSpawnFailedAt(
   isStartup: boolean,
   ref: string,
   lastRead: LastRowRead,
+  retiredAtStart: RetiredKeyAttemptStart,
 ): Promise<ReuseSpawnResult> {
   const { key } = persona
   if (hasAdErrorName(err, ERR_INSTANCE_ID_COLLISION_NAME)) {
@@ -12450,7 +13176,18 @@ async function reuseSpawnFailedAt(
     (await unusableNameAt(key, err, lastRead, REUSE_SPAWN_SITE, REUSE_SPAWN_WHAT, ref))
   if (latched) return latched
   const refused = refusalAt(key, err, 'spawn', REUSE_SPAWN_SITE, REUSE_SPAWN_WHAT, ref)
-  if (refused) return refused
+  // b.jg5 SRJ-407, SRJ-112: an UNAVAILABLE outcome (a launch timeout, HO rev
+  // 20's holder included) is followed by one `get`, and no launch, in this
+  // attempt; a reuse that timed out but launched sets the key's mark there.
+  if (refused) {
+    return isUnavailableRefusal(refused, err)
+      ? afterLaunchUnavailable(
+          { persona, isStartup, ref, verb: 'spawn', what: REUSE_SPAWN_WHAT, reuseRetiredAtStart: retiredAtStart },
+          err,
+          refused,
+        )
+      : refused
+  }
   const { errorClass } = classifyAdError(err)
   // The class is decided by name above; the `instanceof` check only narrows
   // the type for the describer and the notice.

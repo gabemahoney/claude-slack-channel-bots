@@ -624,6 +624,8 @@ const SAFE_DESCRIBERS = [
   'isSafeIdentifier',
   'slackPlatformReason',
   'errnoSuffix',
+  // Returns only one of CSCB's fixed launch-timeout form constants or `undefined`, never error text.
+  'launchTimeoutFormOf',
 ]
 
 const SAFE_CALL = new RegExp(`(?<![\\w$.])(?:${SAFE_DESCRIBERS.join('|')})\\s*\\(`)

@@ -52,6 +52,14 @@
  * reused or launched over; a row that is not covered goes through the
  * live-row sequence.
  *
+ * A launch call's window (b.jg5 SRJ-407): the session manager records, for
+ * each launch call, when it made the call and when the call returned success
+ * or ended in a launch timeout ({@link LaunchCallWindow}).
+ * {@link isLaunchStartInWindow} answers whether a row's launch start lies
+ * inside such a window, both ends included; a row whose launch start does so
+ * after a launch timeout is that launch's own row.
+ * {@link describeLaunchStartForLog} renders a launch start for a log line.
+ *
  * Pure: no module-scope state, no I/O, no agent-director call, no log line,
  * nothing run at import; the clock is always passed in. Nothing names an
  * export only the Phase 1 client has; the result field is typed through
@@ -354,4 +362,60 @@ export function decidePendingRowCover(input: PendingRowCoverInput): PendingRowCo
     return { answer: PENDING_ROW_NOT_COVERED, reason: PENDING_ROW_REASON_CONFIG_DIR_MISMATCH }
   }
   return { answer: PENDING_ROW_COVERED }
+}
+
+// ---------------------------------------------------------------------------
+// A launch call's window (b.jg5 SRJ-407)
+// ---------------------------------------------------------------------------
+
+/**
+ * One launch call's window (b.jg5 SRJ-407), in wall-clock epoch milliseconds
+ * on the session manager's clock: `startMs`, taken just before the call, and
+ * `endMs`, taken when the call returned success or ended in a launch timeout
+ * (when CSCB received the `ErrTmuxUnresponsive` answer, or when the client
+ * threw `ErrCallTimeout`). A call that ended any other way has no end.
+ */
+export interface LaunchCallWindow {
+  readonly startMs: number
+  readonly endMs?: number
+}
+
+/**
+ * True when the raw launch start `rawLaunchStart` ({@link parseLaunchStart})
+ * lies inside `window`, both ends included (b.jg5 SRJ-407): the window's
+ * start is at or before it and its end at or after it. False for a launch
+ * start that is absent or does not parse, for no window, for a window with
+ * no end, and for a bound that is not a finite time. The check fails safe:
+ * a clock stepped between the call and agent-director's write makes this
+ * launch's row read as another launch's. Pure; never throws.
+ */
+export function isLaunchStartInWindow(rawLaunchStart: unknown, window: LaunchCallWindow | undefined): boolean {
+  try {
+    if (window === undefined) return false
+    const { startMs, endMs } = window
+    if (endMs === undefined || !Number.isFinite(startMs) || !Number.isFinite(endMs)) return false
+    const launchStartMs = parseLaunchStart(rawLaunchStart)
+    if (launchStartMs === undefined) return false
+    return startMs <= launchStartMs && launchStartMs <= endMs
+  } catch {
+    return false
+  }
+}
+
+/**
+ * A launch start for a log line, only in a form CSCB builds itself: given a
+ * number, that instant (epoch ms, as {@link parseLaunchStart} answers it);
+ * given anything else, the instant {@link parseLaunchStart} reads from it;
+ * either as an ISO 8601 UTC timestamp, or `none` for a launch start that is
+ * absent, does not parse or is not a finite time. The raw text agent-director
+ * wrote never reaches the line. Pure; never throws.
+ */
+export function describeLaunchStartForLog(launchStart: unknown): string {
+  const launchStartMs = typeof launchStart === 'number' ? launchStart : parseLaunchStart(launchStart)
+  if (launchStartMs === undefined || !Number.isFinite(launchStartMs)) return 'none'
+  try {
+    return new Date(launchStartMs).toISOString()
+  } catch {
+    return 'none'
+  }
 }

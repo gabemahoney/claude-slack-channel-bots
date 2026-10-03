@@ -69,6 +69,11 @@
  *                                            retry timer in pending-only mode, inside an
  *                                            attempt or outside every one (b.jg5 SRJ-301,
  *                                            SRJ-409)
+ *   - endTmuxUnresponsiveForLaunchRow(key, reading) — SRJ-310's third end rule: after a
+ *                                            launch timeout, this launch's row read live
+ *                                            other than `pending` ends the persona's
+ *                                            tmux-unresponsive condition (b.jg5 SRJ-310,
+ *                                            SRJ-407)
  *   - _resetOutageState()                  — test-only state reset
  *
  * Template exports (used by tests):
@@ -90,7 +95,9 @@
  * `OutageClass`: this module only tells the installed condition sink when it
  * starts (a tmux-touching call's UNAVAILABLE, other than `ErrTmuxKillFailed`,
  * inside a launch or recovery attempt for the persona) and when a
- * tmux-touching call ends it (a success, or a GONE answer, in any context).
+ * tmux-touching call ends it (a success, or a GONE answer, in any context),
+ * and offers the end entry of SRJ-310's third rule
+ * (`endTmuxUnresponsiveForLaunchRow`).
  * Neither touches a flag, posts a notice or records bad-stretch history.
  *
  * The unclassified-error episode (b.jg5 SRJ-313) is kept in
@@ -129,6 +136,7 @@ import {
 import { describeThrownValue, renderLogMessageText } from './persona-connection-errors.ts'
 import { escapeSlackControlCharacters } from './slack-text-escape.ts'
 import {
+  TMUX_UNRESPONSIVE_END_LAUNCH_ROW_LIVE,
   TMUX_UNRESPONSIVE_END_TMUX_VERB,
   type TmuxUnresponsiveSink,
   type UnclassifiedErrorSink,
@@ -985,6 +993,32 @@ function endTmuxUnresponsive(key: string, reading?: string): void {
     deps?.conditionSink?.end(key, TMUX_UNRESPONSIVE_END_TMUX_VERB, reading)
   } catch {
     /* a failing condition sink changes nothing about the call's own outcome */
+  }
+}
+
+/**
+ * endTmuxUnresponsiveForLaunchRow — SRJ-310's third end rule (b.jg5 SRJ-310,
+ * SRJ-407): after a launch timeout, this launch's row (its launch start
+ * inside the launch call's window) was read in `reading`, a live state other
+ * than `pending`, so persona `key`'s `tmux-unresponsive` condition ends
+ * through the installed condition sink with the end reason
+ * `TMUX_UNRESPONSIVE_END_LAUNCH_ROW_LIVE` and that reading, which the
+ * condition hands to its condition-end hook (the retry controller's
+ * condition-end entry, so SRJ-306's exceptions apply). The condition posts
+ * its recovery only when an onset or alert was posted, and does nothing for
+ * a persona it does not hold. Works in any context. The caller decides that
+ * the rule applies (the session manager's shared own-row reads, once a
+ * `pending` read established this launch's row). With no sink installed
+ * nothing ends. Answers whether the sink was asked to end it. Never throws.
+ */
+export function endTmuxUnresponsiveForLaunchRow(key: string, reading: string): boolean {
+  try {
+    const sink = deps?.conditionSink
+    if (sink === undefined) return false
+    sink.end(key, TMUX_UNRESPONSIVE_END_LAUNCH_ROW_LIVE, reading)
+    return true
+  } catch {
+    return false
   }
 }
 

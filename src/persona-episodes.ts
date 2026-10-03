@@ -167,9 +167,11 @@
  *   `main()`'s latch hold ends it so, with `TMUX_UNRESPONSIVE_END_LATCHED`);
  *   the episode ends, which cancels the alert check; one ended line names
  *   the reason; and the injected condition-end hook is called once with the
- *   reading the end brings (a tick's or a retry's live reading; `pending`
- *   for a successful `spawn` or `resume`; none for any other tmux-touching
- *   success or GONE). It answers whether either notice had been posted
+ *   reading the end brings (a tick's or a retry's live reading; the live
+ *   state this launch's row was read in, for SRJ-310's rule 3 after a launch
+ *   timeout, `TMUX_UNRESPONSIVE_END_LAUNCH_ROW_LIVE`; `pending` for a
+ *   successful `spawn` or `resume`; none for any other tmux-touching success
+ *   or GONE). It answers whether either notice had been posted
  *   (`ended-after-notice`). On a persona that does not hold it, it does
  *   nothing.
  * - The episodes' `forget(key)` (a teardown), `forgetAll()` and `close()`
@@ -885,12 +887,22 @@ export const TMUX_UNRESPONSIVE_END_RETRY = 'retry'
  */
 export const TMUX_UNRESPONSIVE_END_LATCHED = 'latched'
 
+/**
+ * End reason: after a launch timeout, this launch's row (its launch start
+ * inside the launch call's window) left `pending` for a live state (SRJ-310
+ * rule 3, b.jg5 SRJ-407). The session manager's shared own-row reads end the
+ * condition so through `src/outage-state.ts`'s end entry, once "this launch's
+ * row" was established by a `pending` read.
+ */
+export const TMUX_UNRESPONSIVE_END_LAUNCH_ROW_LIVE = 'launch-row-live'
+
 /** Why a `tmux-unresponsive` condition ended. */
 export type TmuxUnresponsiveEndReason =
   | typeof TMUX_UNRESPONSIVE_END_TMUX_VERB
   | typeof TMUX_UNRESPONSIVE_END_TICK
   | typeof TMUX_UNRESPONSIVE_END_RETRY
   | typeof TMUX_UNRESPONSIVE_END_LATCHED
+  | typeof TMUX_UNRESPONSIVE_END_LAUNCH_ROW_LIVE
 
 /** The text each end reason's ended line carries. */
 export const TMUX_UNRESPONSIVE_END_TEXT: Readonly<Record<TmuxUnresponsiveEndReason, string>> = Object.freeze({
@@ -898,6 +910,7 @@ export const TMUX_UNRESPONSIVE_END_TEXT: Readonly<Record<TmuxUnresponsiveEndReas
   [TMUX_UNRESPONSIVE_END_TICK]: 'a health tick found its row live and its session connected with its stream',
   [TMUX_UNRESPONSIVE_END_RETRY]: 'a retry found its row live and its session connected with its stream',
   [TMUX_UNRESPONSIVE_END_LATCHED]: 'the persona latched',
+  [TMUX_UNRESPONSIVE_END_LAUNCH_ROW_LIVE]: "after a launch timeout, this launch's row left pending for a live state",
 })
 
 /** What `start` did: started the condition, continued one already holding, or nothing after the episodes' `close` (shutdown). */
@@ -931,7 +944,8 @@ export interface TmuxUnresponsiveSink {
 
 /**
  * The condition-end hook: called once per end of a holding condition, with
- * the reading the end brings (a tick's or a retry's live reading, a row state
+ * the reading the end brings (a tick's or a retry's live reading, or the live
+ * state this launch's row left `pending` for (SRJ-310 rule 3), a row state
  * other than `pending`; `pending` for a successful launch call, `spawn` or
  * `resume`, whose row its success leaves `pending`), none for any other
  * tmux-touching success or GONE. Production

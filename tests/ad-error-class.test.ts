@@ -7,7 +7,12 @@
  * UNAVAILABLE by SRJ-104, answers nothing), the kill-failure description
  * accessor `killFailedDescriptionOf` (b.jg5 SRJ-110, SRJ-702; by name, so an
  * `ErrUnknownErrorName` carrying the `ErrTmuxKillFailed` name answers its
- * envelope's description), the one-line description
+ * envelope's description), the launch-timeout predicate
+ * `isLaunchTimeoutError` / `launchTimeoutFormOf` (b.jg5 SRJ-407; by name and
+ * the declared call: `ErrCallTimeout`, or `ErrTmuxUnresponsive` whose
+ * description carries `LAUNCH_TIMEOUT_PHRASE`, an `ErrUnknownErrorName`
+ * carrying that name included, only at a launch call; both forms stay
+ * UNAVAILABLE), the one-line description
  * `describeReportedAdFailure` (b.jg5 SRJ-104: what agent-director reported,
  * else `describeAgentDirectorFailure`'s description), and the
  * stub's error builders it is fed with (b.jg5 SRJ-1303; their shape checks
@@ -32,6 +37,8 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 
 import {
+  AD_CALL_KILL_ROW_NOT_READ_LIVE,
+  AD_CALL_KILL_ROW_READ_LIVE,
   AD_ERROR_CLASSES,
   AD_ERROR_CLASS_CONFIG,
   AD_ERROR_CLASS_CONFLICT,
@@ -43,7 +50,12 @@ import {
   AD_ERROR_CLASS_UNAVAILABLE,
   AD_ERROR_CLASS_UNCLASSIFIED,
   AD_ERROR_CLASS_UNUSABLE_NAME,
+  AD_LAUNCH_VERBS,
+  AD_VERBS,
+  AD_VERB_KILL,
   CSCB_UNKNOWN_ERROR_NAME,
+  LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT,
+  LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE,
   TRIGGER_FAILED_DESCRIPTION,
   classifyAdError,
   classifyWithInvalidFlagsRecheck,
@@ -54,11 +66,16 @@ import {
   hasAdErrorName,
   isDifferentTmuxServerError,
   isInvalidFlagsError,
+  isLaunchTimeoutError,
   killFailedDescriptionOf,
+  launchTimeoutFormOf,
   unclassifiedClassificationOf,
+  type AdCall,
   type AdErrorClass,
   type AdErrorClassification,
+  type AdVerb,
   type AdVersionRecheckTrigger,
+  type LaunchTimeoutForm,
 } from '../src/ad-error-class.ts'
 import {
   CONFLICT_ANOTHER_STORE_PHRASE,
@@ -150,6 +167,7 @@ import {
   errTmuxSessionConflict,
   errTmuxSessionCreate,
   errTmuxUnresponsive,
+  errTmuxUnresponsiveAfterDuplicateSession,
   errTmuxUnresponsiveLaunchTimeout,
   errTmuxUnresponsiveStillStarting,
   errTmuxUnresponsiveStillStopping,
@@ -1351,6 +1369,171 @@ describe('killFailedDescriptionOf', () => {
         const first = killFailedDescriptionOf(value)
         expect({ d, same: killFailedDescriptionOf(value) }).toEqual({ d, same: first })
         expect({ d, value: snapshot(value) }).toEqual({ d, value: before })
+      }
+    }
+    expect(stubCallCount(log)).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// isLaunchTimeoutError / launchTimeoutFormOf (b.jg5 SRJ-407): a launch call's
+// `ErrCallTimeout`, or its `ErrTmuxUnresponsive` carrying the launch-timeout
+// words; recognised by name, the declared call deciding whether it is a launch
+// ---------------------------------------------------------------------------
+
+/** The launch calls a site declares (`AD_LAUNCH_VERBS`): `spawn`, plain or reuse alike, and `resume`. */
+const LAUNCH_CALLS: readonly AdCall[] = AD_VERBS.filter((verb): verb is Exclude<AdVerb, typeof AD_VERB_KILL> => verb !== AD_VERB_KILL && AD_LAUNCH_VERBS.has(verb))
+
+/** Every other declared call: each verb that is no launch (`status` and `get` among them), and `kill` in both declarations. */
+const NON_LAUNCH_CALLS: readonly AdCall[] = [
+  ...AD_VERBS.filter((verb): verb is Exclude<AdVerb, typeof AD_VERB_KILL> => verb !== AD_VERB_KILL && !AD_LAUNCH_VERBS.has(verb)),
+  AD_CALL_KILL_ROW_READ_LIVE,
+  AD_CALL_KILL_ROW_NOT_READ_LIVE,
+]
+
+/** A declared call as a case label names it. */
+const callLabel = (call: AdCall): string => (typeof call === 'string' ? call : `${call.verb} (row read live: ${call.rowReadLive})`)
+
+/** One launch-timeout form, built for the declared launch call `verb`, and the form it is. */
+type LaunchTimeoutRow = readonly [label: string, build: (verb: string) => unknown, form: LaunchTimeoutForm]
+
+/**
+ * Every value that ends a launch call as a launch timeout: the client's
+ * `ErrCallTimeout` (whatever verb it carries: the site's declared call
+ * decides), agent-director's `ErrTmuxUnresponsive` carrying the phrase, and
+ * the 0.10.0 client's `ErrUnknownErrorName` carrying that name, the phrase in
+ * its envelope's description.
+ */
+const LAUNCH_TIMEOUT_ROWS: readonly LaunchTimeoutRow[] = [
+  ['errCallTimeout', (verb) => errCallTimeout(verb), LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT],
+  ['errCallTimeout carrying another verb (the client\'s default)', () => errCallTimeout(), LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT],
+  ['errTmuxUnresponsiveLaunchTimeout', (verb) => errTmuxUnresponsiveLaunchTimeout(verb), LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE],
+  [
+    'errTmuxUnresponsiveLaunchTimeout on another instance id',
+    (verb) => errTmuxUnresponsiveLaunchTimeout(verb, `${STUB_TMUX_SESSION_NAME}_other_id`),
+    LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE,
+  ],
+  ['a base error named ErrTmuxUnresponsive whose description is exactly the phrase', () => baseError(ERR_TMUX_UNRESPONSIVE_NAME, LAUNCH_TIMEOUT_PHRASE), LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE],
+  [
+    'the 0.10.0 client\'s ErrUnknownErrorName carrying ErrTmuxUnresponsive, the phrase in its envelope\'s description',
+    (verb) => {
+      const err = errUnknownErrorName(ERR_TMUX_UNRESPONSIVE_NAME, errTmuxUnresponsiveLaunchTimeout(verb).errDescription)
+      // Precondition: the phrase is only in the envelope, never in the client's own text.
+      expect((err.envelope as { err_description: string }).err_description).toContain(LAUNCH_TIMEOUT_PHRASE)
+      expect(err.errDescription).not.toContain(LAUNCH_TIMEOUT_PHRASE)
+      return err
+    },
+    LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE,
+  ],
+]
+
+/** The ROWS labels that are launch timeouts when declared at a launch call. */
+const LAUNCH_TIMEOUT_ROW_LABELS: ReadonlySet<string> = new Set([
+  'errCallTimeout',
+  'errTmuxUnresponsiveLaunchTimeout (spawn)',
+  'errTmuxUnresponsiveLaunchTimeout (resume)',
+])
+
+describe('isLaunchTimeoutError and launchTimeoutFormOf (b.jg5 SRJ-407)', () => {
+  test('the forms are the two names, by value: ErrCallTimeout\'s and ErrTmuxUnresponsive\'s', () => {
+    expect([LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT, LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE]).toEqual([errCallTimeout().errName, ERR_TMUX_UNRESPONSIVE_NAME])
+    expect(LAUNCH_CALLS).toEqual(['spawn', 'resume'])
+    expect(NON_LAUNCH_CALLS).toContain('status')
+    expect(NON_LAUNCH_CALLS).toContain('get')
+  })
+
+  test('the ROWS labels taken as launch timeouts are all in the table (none is vacuous)', () => {
+    expect(ROWS.filter(([label]) => LAUNCH_TIMEOUT_ROW_LABELS.has(label)).map(([label]) => label).sort()).toEqual([...LAUNCH_TIMEOUT_ROW_LABELS].sort())
+  })
+
+  test.each(LAUNCH_TIMEOUT_ROWS.flatMap(([label, build, form]) => LAUNCH_CALLS.map((call) => [`${label} from ${callLabel(call)}`, call, form, build] as const)))(
+    '%s is a launch timeout in its form, and still UNAVAILABLE',
+    (_label, call, form, build) => {
+      const value = build(callLabel(call))
+      expect(launchTimeoutFormOf(value, call)).toBe(form)
+      expect(isLaunchTimeoutError(value, call)).toBe(true)
+      expect(classifyAdError(value)).toEqual({ errorClass: AD_ERROR_CLASS_UNAVAILABLE })
+    },
+  )
+
+  test.each(LAUNCH_TIMEOUT_ROWS.flatMap(([label, build]) => NON_LAUNCH_CALLS.map((call) => [`${label} declared at ${callLabel(call)}`, call, build] as const)))(
+    '%s is no launch timeout: only a launch call times out as a launch',
+    (_label, call, build) => {
+      const value = build(callLabel(call))
+      expect(launchTimeoutFormOf(value, call)).toBeUndefined()
+      expect(isLaunchTimeoutError(value, call)).toBe(false)
+    },
+  )
+
+  test.each<Built>([
+    ['errTmuxUnresponsive (plain: a tmux call that did not answer and did nothing)', () => errTmuxUnresponsive()],
+    ['errTmuxUnresponsiveStillStopping', () => errTmuxUnresponsiveStillStopping()],
+    ['errTmuxUnresponsiveStillStarting', () => errTmuxUnresponsiveStillStarting()],
+    ['errTmuxUnresponsiveAfterDuplicateSession (its holder could not be read)', () => errTmuxUnresponsiveAfterDuplicateSession()],
+    ['an ErrUnknownErrorName carrying ErrTmuxUnresponsive with no phrase', () => errUnknownErrorName(ERR_TMUX_UNRESPONSIVE_NAME, errTmuxUnresponsive().errDescription)],
+    ...ROWS.filter(([label]) => !LAUNCH_TIMEOUT_ROW_LABELS.has(label)).map(([label, build]): Built => [`${label} (SRJ-104's row)`, build]),
+  ])('%s, at either launch call, is no launch timeout', (_label, build) => {
+    for (const call of LAUNCH_CALLS) {
+      const value = build()
+      expect({ call, form: launchTimeoutFormOf(value, call) }).toEqual({ call, form: undefined })
+      expect({ call, timeout: isLaunchTimeoutError(value, call) }).toEqual({ call, timeout: false })
+    }
+  })
+
+  test.each<Built>([
+    ['ErrTmuxKillFailed', () => baseError(ERR_TMUX_KILL_FAILED_NAME, LAUNCH_TIMEOUT_PHRASE)],
+    ['ErrTmuxSessionCreate', () => baseError(errTmuxSessionCreate().errName, errTmuxUnresponsiveLaunchTimeout().errDescription)],
+    ['ErrTmuxSessionConflict', () => baseError(ERR_TMUX_SESSION_CONFLICT_NAME, LAUNCH_TIMEOUT_PHRASE)],
+    ['ErrSpawnNotFound', () => baseError(ERR_SPAWN_NOT_FOUND_NAME, LAUNCH_TIMEOUT_PHRASE)],
+    ['CSCB\'s wrapped UnknownError', () => baseError(CSCB_UNKNOWN_ERROR_NAME, LAUNCH_TIMEOUT_PHRASE)],
+    ['an ErrInternal (envelope description)', () => errInternal(LAUNCH_TIMEOUT_PHRASE)],
+    ['an ErrUnknownErrorName of another name (envelope description)', () => errUnknownErrorName('ErrFromALaterBinary', LAUNCH_TIMEOUT_PHRASE)],
+  ])('%s carrying the phrase is no launch timeout: the name decides, never the words alone', (_label, build) => {
+    for (const call of LAUNCH_CALLS) expect({ call, timeout: isLaunchTimeoutError(build(), call) }).toEqual({ call, timeout: false })
+  })
+
+  test.each<Built>([
+    ['an Error named ErrCallTimeout', () => plainErrorNamed(LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT)],
+    ['an Error named ErrTmuxUnresponsive whose message carries the phrase', () => Object.assign(plainErrorNamed(ERR_TMUX_UNRESPONSIVE_NAME), { message: LAUNCH_TIMEOUT_PHRASE })],
+    [
+      'an object shaped like the launch-timeout ErrTmuxUnresponsive',
+      () => ({ verb: 'spawn', errName: ERR_TMUX_UNRESPONSIVE_NAME, errDescription: errTmuxUnresponsiveLaunchTimeout().errDescription, name: ERR_TMUX_UNRESPONSIVE_NAME }),
+    ],
+    ['an object shaped like an ErrCallTimeout', () => ({ errName: LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT, name: LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT })],
+    ['the launch-timeout description string itself', () => errTmuxUnresponsiveLaunchTimeout().errDescription],
+    ['undefined', () => undefined],
+    ['null', () => null],
+    ['an errName getter that throws', () => Object.defineProperty(errCallTimeout('spawn'), 'errName', { get: () => { throw new Error('boom') } })],
+    ['an errDescription getter that throws', () => Object.defineProperty(errTmuxUnresponsiveLaunchTimeout(), 'errDescription', { get: () => { throw new Error('boom') } })],
+    ['an errDescription that is not a string', () => Object.defineProperty(errTmuxUnresponsiveLaunchTimeout(), 'errDescription', { value: [LAUNCH_TIMEOUT_PHRASE] })],
+    [
+      'an ErrUnknownErrorName carrying ErrTmuxUnresponsive whose envelope getter throws',
+      () => Object.defineProperty(errUnknownErrorName(ERR_TMUX_UNRESPONSIVE_NAME, LAUNCH_TIMEOUT_PHRASE), 'envelope', { get: () => { throw new Error('boom') } }),
+    ],
+    [
+      'an ErrUnknownErrorName carrying ErrTmuxUnresponsive whose envelope has no description',
+      () => Object.defineProperty(errUnknownErrorName(ERR_TMUX_UNRESPONSIVE_NAME, LAUNCH_TIMEOUT_PHRASE), 'envelope', { value: { err_name: ERR_TMUX_UNRESPONSIVE_NAME } }),
+    ],
+    ['a proxy whose every trap throws', hostileProxy],
+    ['a proxy over an ErrCallTimeout whose every read throws', () => new Proxy(errCallTimeout('spawn'), { get: () => { throw new Error('boom') } })],
+  ])('%s is no launch timeout at either launch call, and nothing throws', (_label, build) => {
+    for (const call of LAUNCH_CALLS) {
+      const value = build()
+      expect(() => launchTimeoutFormOf(value, call)).not.toThrow()
+      expect({ call, form: launchTimeoutFormOf(value, call), timeout: isLaunchTimeoutError(value, call) }).toEqual({ call, form: undefined, timeout: false })
+    }
+  })
+
+  test('deciding changes no value, makes no agent-director call and answers the same twice', () => {
+    const log = makeStubCallLog()
+    setClientForTests(makeStubClient(log) as unknown as Parameters<typeof setClientForTests>[0])
+    for (const [label, build] of LAUNCH_TIMEOUT_ROWS) {
+      for (const call of [...LAUNCH_CALLS, ...NON_LAUNCH_CALLS]) {
+        const value = build(callLabel(call))
+        const before = snapshot(value)
+        const first = launchTimeoutFormOf(value, call)
+        expect({ label, call, same: launchTimeoutFormOf(value, call), timeout: isLaunchTimeoutError(value, call) }).toEqual({ label, call, same: first, timeout: first !== undefined })
+        expect({ label, call, value: snapshot(value) }).toEqual({ label, call, value: before })
       }
     }
     expect(stubCallCount(log)).toBe(0)

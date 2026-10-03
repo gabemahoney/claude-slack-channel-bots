@@ -9,7 +9,9 @@
  * (`tests/test-helpers/agent-director-stub.ts`) take the words from here
  * (SRJ-1303), and the error classifier (`src/ad-error-class.ts`; b.jg5
  * SRJ-104) matches `UNUSABLE_RECORDED_NAME_PHRASE` and
- * `DIFFERENT_TMUX_SERVER_PHRASE` from here; the conflict latch
+ * `DIFFERENT_TMUX_SERVER_PHRASE` from here, and its launch-timeout predicate
+ * (`isLaunchTimeoutError`; b.jg5 SRJ-407) matches `LAUNCH_TIMEOUT_PHRASE`;
+ * the conflict latch
  * (`src/conflict-latch.ts`; b.jg5 SRJ-507) matches the nine CONFLICT case
  * words from here, in the order it defines; and the bounded kill retry
  * (`src/kill-retry.ts`; b.jg5 SRJ-702) and the kill-failure alert

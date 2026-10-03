@@ -42,7 +42,13 @@
  *   mark it kill-failed (SRJ-812), a failure after a survivor-naming one
  *   (UNAVAILABLE, a CONFLICT) included, never the survivor version.
  * - The new life: a reuse that begins the key's new life ends its hold,
- *   also when the mark's write failed; another key's reuse ends none.
+ *   also when the mark's write failed; another key's reuse ends none. A
+ *   reuse that timed out but launched (SRJ-407, SRJ-806; on a harness built
+ *   with `harnessNow`, the reuse timed by `scriptTimedLaunch`), its one `get`
+ *   reading this launch's row inside the call's window, ends the hold with
+ *   the new-life reason and its own read name, and the persona waiting on it
+ *   is retried at once; a launch start before or after the window keeps the
+ *   hold.
  * - The restart: holds live in memory; a fresh harness over a record where
  *   P is recorded without its mark (a `credentials_file` destructive modify
  *   whose teardown kill failed) keeps P's own live row, whose `cwd` matches
@@ -154,8 +160,11 @@ import {
   AD_ERROR_CLASS_CONFLICT,
   AD_ERROR_CLASS_UNAVAILABLE,
   AD_ERROR_CLASS_UNUSABLE_NAME,
+  LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT,
+  LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE,
   classifyAdError,
   killFailedDescriptionOf,
+  type LaunchTimeoutForm,
 } from '../src/ad-error-class.ts'
 import { adAlertThresholdMsInEffect } from '../src/ad-settings.ts'
 import { getFailureCount } from '../src/backoff.ts'
@@ -268,6 +277,7 @@ import {
   OLD_LIFE_HOLD_END_NOT_RETRIED_NOT_APPLIED,
   OLD_LIFE_HOLD_END_NOT_RETRIED_NOT_UP,
   OLD_LIFE_HOLD_WAIT_RUNNING,
+  OLD_LIFE_NEW_LIFE_AFTER_TIMEOUT_READ,
   OLD_LIFE_NEW_LIFE_READ,
   OLD_LIFE_ROW_READ_FIND_MISSING_IDS,
   OLD_LIFE_ROW_READ_NO_ROW,
@@ -277,6 +287,7 @@ import {
   OLD_LIFE_WAIT_STOP_CAUSE_TEARDOWN,
   OWN_ROW_READ_ROW,
   SPAWN_ACTION_FRESH_RETIRED,
+  SPAWN_ACTION_RETRYING,
   _resetOldLifeHolds,
   ensureOldLifeWait,
   isLaunchInFlight,
@@ -355,11 +366,13 @@ import {
   personaOf,
   personaRow,
   recordCallOrder,
+  recordSequenceStarts,
   killFailureLines,
   killFailureLoggedLine,
   holdThroughReuse,
   killFailureStoppedEntryLine,
   rowReadsUntilSpawn,
+  scriptTimedLaunch,
   startSequenceHeldAtRun,
   startupEntries,
   unavailableAt,
@@ -368,6 +381,8 @@ import {
   type RecoveryHarness,
   type RecoveryHarnessOptions,
   type RecoveryStubScript,
+  type TimedLaunch,
+  type TimedLaunchStart,
 } from './test-helpers/recovery-harness.ts'
 import { makeReloadHarness, type ReloadHarness } from './test-helpers/reload-harness.ts'
 
@@ -2531,4 +2546,105 @@ describe('b.jg5 SRJ-810, SRJ-811 (Q-9): B\'s own row swept into P\'s directory, 
     expect(spawnsOf(h, b)).toEqual([])
     await expectRetriedAtOnceAndUp(h, p, endedAt)
   })
+})
+
+// ===========================================================================
+// A reuse that timed out but launched (b.jg5 SRJ-407, SRJ-806, SRJ-809; E28)
+//
+// On the recovery harness built with `harnessNow`, so the session manager
+// reads each launch call's window on the harness clock, P's reuse spawn timed
+// by `scriptTimedLaunch`. P is recorded as a destructive modify that moved it
+// out of the directory B now names: apply step 1's hold on cscb_<P> is at B's
+// directory, so B's launch is held back by the gate and starts the wait on
+// cscb_<P>, whose round ends with the hold kept and B waiting on it. P's own
+// launch, whose hold is on its own row, is not held back once no wait runs on
+// that row (a launch while one runs makes no call, so no launch timeout can
+// happen there). When the one `get` after P's timed-out reuse reads this
+// launch's row (its launch start inside the call's window), the key's new
+// life has begun: the hold ends with E27's new-life reason, and B, waiting on
+// it, is retried at once (the end observer's run-now). A launch start outside
+// the window is the old life: the hold stays, and P's row goes to the
+// live-row sequence (its start recorded, not run, here).
+// ===========================================================================
+
+describe('b.jg5 SRJ-809, SRJ-806, SRJ-407: a reuse that timed out but launched ends its key\'s hold for its new life, and the persona waiting on it is retried at once; a launch start outside the window keeps the hold', () => {
+  afterEach(waitAfterEach)
+
+  /** How long P's timed reuse spawn takes on the harness clock. */
+  const CALL_MS = 1_000
+
+  /** Both launch-timeout forms. */
+  const FORMS = [LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT, LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE] as const
+
+  /**
+   * P recorded (a destructive modify) and its own row held at B's working
+   * directory. B's launch is held back by the gate; the wait it starts runs
+   * one round on the old life, which every get reads live in B's directory
+   * and every run judges alive, so the round ends escalated with the hold
+   * kept and B still waiting on it (armed, no wait running: P's own launch
+   * is then no launch blocked by a wait on its row). P's next reuse spawn is
+   * timed to end in `form`, its row's launch start placed at `launchStart`,
+   * every `status` of P's row from then on reading it `pending` with that
+   * launch start.
+   */
+  async function bWaitsOnP(form: LaunchTimeoutForm, launchStart: TimedLaunchStart): Promise<{ h: RecoveryHarness; p: string; b: string; id: string; t: TimedLaunch }> {
+    const { h, p, b } = build({ harnessNow: true })
+    const id = personaInstanceId(p)
+    h.retireKey(p, { cause: RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY })
+    beginApplyHold(h, p, b)
+    const bReads = rowReadsUntilSpawn(h, UNAVAILABLE_RETRY_ROW_ABSENT)
+    h.script({ getFn: (params) => (params.claude_instance_id === id ? personaRow(h, p, { state: 'waiting', cwd: personaOf(h, b).working_directory }) : undefined) })
+
+    expect(await h.launch(b)).toStrictEqual(heldBack(b))
+    expect(await h.driveSequence(h.oldLifeWaitSettled(id))).toMatchObject({ kind: LIVE_ROW_OUTCOME_ESCALATED })
+    await h.settle()
+    expect([h.oldLifeWaitRunning(id), h.oldLifeHolds.holdOf(id)?.waiting, h.holdEndRetries, h.controller.isArmed(b)]).toEqual([false, [b], [], true])
+
+    const t = scriptTimedLaunch(h, p, { reuse: true, takesMs: CALL_MS, end: form, launchStart, offMs: CALL_MS })
+    h.script({ statusFn: (params) => (params.claude_instance_id === id && t.window()?.endMs !== undefined ? t.statusRow() : bReads(params)) })
+    // B's retry is due well after P's timed call ends: only the hold's end retries it.
+    expect(h.controller.view(b)?.dueAt).toBeGreaterThan(h.clock.now() + CALL_MS * 2)
+    return { h, p, b, id, t }
+  }
+
+  test.each([...FORMS])('%s, the get reading this launch\'s row: P\'s hold ends with the new-life reason and its timed-out reuse\'s read name, one end line; B is retried at once at the end\'s clock time and comes up; P\'s launch still answers retrying', async (form) => {
+    const { h, p, b, id, t } = await bWaitsOnP(form, 'inside')
+    const held = h.oldLifeHolds.holdOf(id)!
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_RETRYING })
+    const endedAt = t.window()!.endMs!
+
+    expect(h.oldLifeHolds.holdOf(id)).toBeUndefined()
+    expect(h.retiredEntry(p).marked).toBe(true)
+    // The get's pending read of the held row re-pointed the hold to the row's cwd, P's directory, before the end (E27's read entry).
+    const atEnd: OldLifeHold = { ...held, directory: personaOf(h, p).working_directory, realDirectory: realDirOf(h, p) }
+    expect(endedLinesIn(h.errors)).toEqual([oldLifeHoldEndedLine(atEnd, OLD_LIFE_HOLD_END_NEW_LIFE, OLD_LIFE_NEW_LIFE_AFTER_TIMEOUT_READ)])
+    expect(h.holdEndRetries).toEqual([{ key: b, at: endedAt, result: UNAVAILABLE_RETRY_RUN_NOW_RAN }])
+    await h.settle()
+    await expectRetriedAtOnceAndUp(h, b, endedAt)
+    await h.runApproverToStop(p)
+    // P's reuse is P's one spawn: nothing launched over its new life.
+    expect(spawnsOf(h, p)).toHaveLength(1)
+  })
+
+  test.each(FORMS.flatMap((form) => (['before', 'after'] as const).map((launchStart) => [form, launchStart] as const)))(
+    '%s, the row\'s launch start %s the window: the old life — no mark, the hold stays with B waiting, no end line and no retry at once, P\'s row to the live-row sequence; B is retried at once only when the hold ends later',
+    async (form, launchStart) => {
+      const { h, p, b, id } = await bWaitsOnP(form, launchStart)
+      const sequences = recordSequenceStarts()
+
+      expect(await h.launch(p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
+
+      expect(h.retiredEntry(p).marked).toBe(false)
+      expect(h.oldLifeHolds.holdOf(id)?.waiting).toEqual([b])
+      expect([endedLinesIn(h.errors), h.holdEndRetries, spawnsOf(h, b)]).toEqual([[], [], []])
+
+      expect(sequences.map((request) => request.key)).toEqual([p])
+      const endedAt = h.clock.now()
+      noteOldLifeRowRead(id, { kind: OLD_LIFE_ROW_READ_STATE, state: LIVENESS_DEAD_ROW_ENDED }, 'another call')
+      expect(h.holdEndRetries).toEqual([{ key: b, at: endedAt, result: UNAVAILABLE_RETRY_RUN_NOW_RAN }])
+      await h.settle()
+      await expectRetriedAtOnceAndUp(h, b, endedAt)
+    },
+  )
 })

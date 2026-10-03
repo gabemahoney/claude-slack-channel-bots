@@ -186,7 +186,16 @@
  *   (`initOutageState`) as its client. No launch path kills a tmux session
  *   or runs tmux: every launch reaches only the stub.
  *   `script(knobs)` sets the stub's answers (`StubClientOptions` knobs such
- *   as `spawnError` or `getQueue`), read at each call.
+ *   as `spawnError`, `getQueue` or the per-call `spawnFn` and `resumeFn`),
+ *   read at each call.
+ * - `harnessNow`: with `options.harnessNow`, the session manager's clock
+ *   (`_setNow`) is the harness clock, set where the approver's clock is:
+ *   each launch call's window (b.jg5 SRJ-407, `launchCallWindowOf`) is
+ *   recorded on harness-clock times, and the working-row wait, its deferral
+ *   runs and the findMissing memo's window read it too; `cleanup()` restores
+ *   the real one (`_resetNow`). Without it the harness leaves that clock
+ *   alone (real unless the case sets its own), since a case that bounds the
+ *   working-row wait in real ms needs a clock that moves on its own.
  * - `triggers`: the outage state's trigger sink (b.jg5 SRJ-301) is the
  *   controller, behind a recorder: every trigger an agent-director error
  *   inside a launch or recovery attempt sends (`{ key, kind }`, the cause
@@ -757,7 +766,8 @@
  *   hold set's install (`_resetOldLifeHolds`), so no hold outlives the
  *   harness,
  *   the stub spawn path and client with every launch still in flight and the
- *   approver's clock and cap, the
+ *   approver's clock and cap, the session manager's clock when
+ *   `options.harnessNow` set it (`_resetNow`), the
  *   findMissing memo, the tmux seams, the settings install, the version
  *   re-check's install when `recheckAnswers` or `versionRecheck` made one
  *   (disposed first, before the pending timers are counted), the sequence
@@ -823,7 +833,16 @@
  * `rowReadsUntilSpawn` (each row reads a
  * state until its spawn resolves, then `waiting`; a `pending` row shows the
  * stub's default launch start unless the case asks for none; it returns the
- * `statusFn` it scripts), and the condition's log
+ * `statusFn` it scripts), `scriptTimedLaunch` (b.jg5 SRJ-407, on a harness
+ * built with `harnessNow`: persona
+ * `key`'s next `spawn` or `resume` takes a given time on the harness clock
+ * and ends in either launch-timeout form, `LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT`
+ * or `LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE`, or `TIMED_LAUNCH_SUCCESS`;
+ * from its end on, the persona's `get` reads its row with the launch start
+ * placed against the call's window, `TimedLaunchStart`: on either bound,
+ * inside, before, after or none; its handle gives the error, the window, the
+ * launch start, the row, and a `status` answer with the same launch start
+ * for the case's own `statusFn`), and the condition's log
  * lines: `conditionLinePrefix`, `conditionLines`, `conditionStartedLines`,
  * `conditionEndedLines` and the line builders `conditionOnsetLine`,
  * `conditionAlertLine`, `conditionEndedLine`, `conditionRecoveryLine` and
@@ -890,7 +909,7 @@ import { join } from 'node:path'
 import type { WebClient } from '@slack/web-api'
 import type { Client, SpawnResult } from 'agent-director'
 
-import type { Phase1SpawnParams } from '../../src/ad-phase1-types.ts'
+import type { Phase1SpawnParams, Phase1StatusResult } from '../../src/ad-phase1-types.ts'
 
 import {
   adAlertThresholdMsInEffect,
@@ -913,7 +932,14 @@ import {
   type ConflictNoticeEpisodes,
 } from '../../src/conflict-latch.ts'
 import { LIVENESS_DEAD_ROW_ENDED, LIVENESS_DEAD_ROW_MISSING, LIVENESS_LIVE } from '../../src/liveness-reading.ts'
-import { AD_ERROR_CLASS_UNAVAILABLE, classifyAdError, describeAdErrorClassification, killFailedDescriptionOf } from '../../src/ad-error-class.ts'
+import {
+  AD_ERROR_CLASS_UNAVAILABLE,
+  LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT,
+  classifyAdError,
+  describeAdErrorClassification,
+  killFailedDescriptionOf,
+  type LaunchTimeoutForm,
+} from '../../src/ad-error-class.ts'
 import {
   KILL_FAILURE_CLOSING_DESTINATION,
   KILL_FAILURE_CLOSING_LOG_ONLY,
@@ -930,7 +956,7 @@ import {
   type KillFailureClosing,
 } from '../../src/kill-failure-alert.ts'
 import { LOST_MESSAGE_STATES, STATE_WORDING, type LostMessageState } from '../../src/lost-message.ts'
-import { parseLaunchStart } from '../../src/pending-row.ts'
+import { parseLaunchStart, type LaunchCallWindow } from '../../src/pending-row.ts'
 import { _resetOutageState, clearOutageFlag, getOutageFlags, initOutageState, resetAllToHealthy, type OutageClass } from '../../src/outage-state.ts'
 import type { PersonaLifecycleDeps } from '../../src/persona-lifecycle.ts'
 import type { PersonaConnectionStatus } from '../../src/persona-connections.ts'
@@ -1009,7 +1035,9 @@ import {
   _resetFindMissingMemo,
   _resetInvalidFlagsHold,
   _resetLiveRowSequenceRegistry,
+  _resetNow,
   _setApproverClock,
+  _setNow,
   _setDialogReadyTimeoutMs,
   _whenDialogApproverStopped,
   buildLiveRowSequenceDeps,
@@ -1120,17 +1148,20 @@ import {
   cannedKillResult,
   cannedOk,
   cannedStatusResult,
+  errCallTimeout,
   errInstanceIdCollision,
   errInvalidFlags,
   errSpawnNotFound,
   errTmuxKillFailed,
   errTmuxSessionConflict,
   errTmuxUnresponsive,
+  errTmuxUnresponsiveLaunchTimeout,
   holdSpawns,
   installStubSpawnPath,
   makeStubResolveSystemBinary,
   resetStubSpawnPath,
   SAMPLE_LAUNCH_START_DEFAULT,
+  SAMPLE_LAUNCH_START_NONE,
   unavailableForms,
   type CannedGetResult,
   type FindMissingHold,
@@ -1213,6 +1244,16 @@ export interface RecoveryHarnessOptions {
    * empty record) when unset.
    */
   retiredKeys?: (keys: readonly string[]) => Readonly<Record<string, RetiredKeySeed>>
+  /**
+   * Put the session manager's clock (`_setNow`) on the harness clock at
+   * build, and back on the real one at `cleanup()` (`_resetNow`), so each
+   * launch call's window (b.jg5 SRJ-407, `launchCallWindowOf`) is recorded on
+   * harness-clock times; `scriptTimedLaunch` needs it. False when unset: the
+   * working-row wait, its deferral runs and the findMissing memo's window
+   * read the same clock, and a case that bounds the wait in real ms (a short
+   * `_setWaitForWaitingTimeoutMs`) needs the real one.
+   */
+  harnessNow?: boolean
 }
 
 /** One write the harness's retired-key store made: its path, and whether it went through (false: `failRetiredKeyWrites` refused it). */
@@ -1443,6 +1484,8 @@ export type RecoverySlowRecoveryView = Pick<SlowRecoveryTracker, 'count' | 'isOp
 /** What `makeRecoveryHarness` returns; see the module comment. */
 export interface RecoveryHarness {
   readonly clock: FakeClock
+  /** Whether the session manager's clock (`_setNow`) is the harness clock (`options.harnessNow`). */
+  readonly harnessNow: boolean
   readonly controller: UnavailableRetryController
   readonly config: PersonaConfig
   readonly keys: readonly string[]
@@ -2004,6 +2047,12 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   }
   _setApproverClock(approverClock)
   if (options.approverCapMs !== undefined) _setDialogReadyTimeoutMs(options.approverCapMs)
+  // With `options.harnessNow`, the session manager's own clock (`_setNow`) is
+  // the harness clock too: each launch call's window (b.jg5 SRJ-407) is read
+  // on it, as are the working-row wait, its deferral runs and the findMissing
+  // memo's window. Undone by `cleanup()` (`_resetNow`).
+  const harnessNow = options.harnessNow === true
+  if (harnessNow) _setNow(clock.now)
   // The bounded retry of a kill (b.jg5 SRJ-702) waits on the harness clock,
   // each wait between tries tracked so `drive` can move the clock to it. As
   // main() binds it: the restart kill adapter gets this clock (below); the
@@ -2694,6 +2743,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
   return {
     clock,
+    harnessNow,
     controller,
     config,
     keys,
@@ -3062,6 +3112,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       for (const unbind of unbindLatch) unbind()
       resetStubSpawnPath()
       _resetFindMissingMemo()
+      if (harnessNow) _resetNow()
       resetAdSettingsForTests()
       console.error = savedConsoleError
       if (savedStateDir === undefined) delete process.env['SLACK_STATE_DIR']
@@ -3550,6 +3601,172 @@ export function rowReadsUntilSpawn(
   }
   h.script({ statusFn })
   return statusFn
+}
+
+/** `scriptTimedLaunch`'s end for a call that succeeds (answered by the verb's other knobs). */
+export const TIMED_LAUNCH_SUCCESS = 'success'
+
+/** How `scriptTimedLaunch`'s call ends: either launch-timeout form (`src/ad-error-class.ts`), or success. */
+export type TimedLaunchEnd = LaunchTimeoutForm | typeof TIMED_LAUNCH_SUCCESS
+
+/**
+ * Where `scriptTimedLaunch` places the row's launch start against the call's
+ * window `[start, end]` (b.jg5 SRJ-407; both ends belong to the window):
+ * `at-start` and `at-end` on a bound, `inside` at `start + floor(takes / 2)`,
+ * `before` at `start - offMs`, `after` at `end + offMs`, `none` with no
+ * launch start (`SAMPLE_LAUNCH_START_NONE`: the field left out).
+ */
+export type TimedLaunchStart = 'at-start' | 'inside' | 'at-end' | 'before' | 'after' | 'none'
+
+/** Options of `scriptTimedLaunch`; every one is optional. */
+export interface TimedLaunchOptions {
+  /** The launch verb to time: `spawn` (plain or reuse) by default, or `resume`. */
+  readonly verb?: 'spawn' | 'resume'
+  /** For `spawn`: time only a reuse spawn (true) or only a plain one (false); either when unset. */
+  readonly reuse?: boolean
+  /** How long the call takes on the harness clock, in ms (0 by default). */
+  readonly takesMs?: number
+  /** How the call ends: `LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT` by default. */
+  readonly end?: TimedLaunchEnd
+  /** Where the row's launch start lies against the call's window: `inside` by default. */
+  readonly launchStart?: TimedLaunchStart
+  /** How far `before` and `after` lie outside the window, in ms (1 by default). */
+  readonly offMs?: number
+  /** The persona's row as `get` reads it from the call's end on (`personaRow` overrides); `{ state: 'pending' }` by default. */
+  readonly row?: PersonaGetResultOverrides
+}
+
+/** The handle `scriptTimedLaunch` returns. */
+export interface TimedLaunch {
+  /** What the call ends with: the error it rejects with, or undefined for success. */
+  readonly error: Error | undefined
+  /** The call's window as the stub saw it on the harness clock (no `endMs` while the call is in progress); undefined before the call. */
+  window(): LaunchCallWindow | undefined
+  /** The launch start the row carries (ISO 8601), placed once the call ends; undefined before that or for `none`. */
+  launchStartedAt(): string | undefined
+  /** The persona's row as `get` reads it now; throws before the call ends. */
+  row(): CannedGetResult
+  /** Replace the row overrides `get` reads from now on; the placed launch start stays unless `overrides` give `launch_started_at`. */
+  setRow(overrides: PersonaGetResultOverrides): void
+  /**
+   * A `status` answer for the row (`cannedStatusResult`): `pending` with the
+   * placed launch start, with `overrides`. The driver scripts no `status`;
+   * a case hands this to its own `statusFn` or `statusQueue` (an approver's
+   * lap reads `status`). Throws before the call ends.
+   */
+  statusRow(overrides?: Partial<Phase1StatusResult>): Phase1StatusResult
+}
+
+/**
+ * Script persona `key`'s next launch call of `options.verb` (b.jg5 SRJ-407)
+ * through the stub's per-call knobs (`spawnFn`, `resumeFn`, `getFn`):
+ *
+ * - The first matching call (persona `key`'s instance; for `spawn`, of the
+ *   kind `options.reuse` asks for) takes `takesMs` on the harness clock: the
+ *   stub moves the clock (`clock.advance`, so harness-clock timers due by
+ *   then fire) while the call is in progress, then ends it with `end`:
+ *   `errCallTimeout(verb)`, `errTmuxUnresponsiveLaunchTimeout(verb, id)`, or
+ *   success, which leaves the answer to the verb's other knobs (the stub's
+ *   default success when none). The harness must be built with
+ *   `harnessNow` (it throws otherwise), so the harness clock is the session
+ *   manager's `_setNow` clock and the window the session manager records
+ *   for the call (`launchCallWindowOf`) is the handle's `window()`.
+ * - Every other call of the verb goes to the knob scripted before (its
+ *   `spawnFn` or `resumeFn`), then to the verb's other knobs.
+ * - From the call's end on, every `get` of persona `key`'s instance reads
+ *   `personaRow(h, key, row)` with the launch start placed by
+ *   `options.launchStart` against the window, as an ISO 8601 string. Every
+ *   other `get` goes to the `getFn` scripted before, then to the other `get`
+ *   knobs. A case that scripts its own `getFn` afterwards replaces this.
+ *
+ * A row in the `pending` state with its launch start inside the window
+ * (`at-start`, `inside`, `at-end`) is this launch's row; `before`, `after`
+ * and `none` are not. Script it before the launch, then drive the launch
+ * (`h.launch(key)`, a retry, a restart path call).
+ */
+export function scriptTimedLaunch(h: RecoveryHarness, key: string, options: TimedLaunchOptions = {}): TimedLaunch {
+  if (!h.harnessNow) throw new Error('scriptTimedLaunch: build the harness with { harnessNow: true }, so the session manager reads the launch window on the harness clock')
+  const id = personaInstanceId(key)
+  const verb = options.verb ?? 'spawn'
+  const takesMs = options.takesMs ?? 0
+  const end = options.end ?? LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT
+  const offMs = options.offMs ?? 1
+  const placement = options.launchStart ?? 'inside'
+  const error =
+    end === TIMED_LAUNCH_SUCCESS ? undefined
+    : end === LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT ? errCallTimeout(verb)
+    : errTmuxUnresponsiveLaunchTimeout(verb, id)
+  const knobs = h.stub.calls as StubClientOptions
+  let rowOverrides: PersonaGetResultOverrides = options.row ?? { state: 'pending' }
+  let window: LaunchCallWindow | undefined
+  let launchStartMs: number | undefined
+  let timed = false
+
+  const placedStart = (startMs: number, endMs: number): number | undefined => {
+    switch (placement) {
+      case 'at-start': return startMs
+      case 'inside': return startMs + Math.floor((endMs - startMs) / 2)
+      case 'at-end': return endMs
+      case 'before': return startMs - offMs
+      case 'after': return endMs + offMs
+      case 'none': return undefined
+    }
+  }
+  const launchStartedAt = (): string | undefined => (launchStartMs === undefined ? undefined : new Date(launchStartMs).toISOString())
+  const ended = (): boolean => window?.endMs !== undefined
+  const row = (): CannedGetResult => {
+    if (!ended()) throw new Error(`scriptTimedLaunch: persona ${key}'s timed ${verb} has not ended`)
+    return personaRow(h, key, { launch_started_at: launchStartedAt() ?? SAMPLE_LAUNCH_START_NONE, ...rowOverrides })
+  }
+  // The timed call: take `takesMs` on the harness clock, place the launch
+  // start, then end the call as asked.
+  const timedCall = async (): Promise<Error | undefined> => {
+    timed = true
+    const startMs = h.clock.now()
+    window = { startMs }
+    if (takesMs > 0) await h.clock.advance(takesMs)
+    const endMs = h.clock.now()
+    launchStartMs = placedStart(startMs, endMs)
+    window = { startMs, endMs }
+    return error
+  }
+
+  if (verb === 'spawn') {
+    const before = knobs.spawnFn
+    h.script({
+      spawnFn: (params) => {
+        const kind = options.reuse === undefined || (params.reuse_finished === true) === options.reuse
+        if (!timed && String(params.claude_instance_id) === id && kind) return timedCall()
+        return before?.(params)
+      },
+    })
+  } else {
+    const before = knobs.resumeFn
+    h.script({
+      resumeFn: (params) => {
+        if (!timed && String(params.claude_instance_id) === id) return timedCall()
+        return before?.(params)
+      },
+    })
+  }
+  const beforeGet = knobs.getFn
+  h.script({
+    getFn: (params) => (ended() && params.claude_instance_id === id ? row() : beforeGet?.(params)),
+  })
+
+  return {
+    error,
+    window: () => window,
+    launchStartedAt,
+    row,
+    setRow(overrides) {
+      rowOverrides = overrides
+    },
+    statusRow(overrides = {}) {
+      if (!ended()) throw new Error(`scriptTimedLaunch: persona ${key}'s timed ${verb} has not ended`)
+      return cannedStatusResult({ state: 'pending', launch_started_at: launchStartedAt() ?? SAMPLE_LAUNCH_START_NONE, ...overrides })
+    },
+  }
 }
 
 // The `tmux-unresponsive` condition's log lines (SRJ-307 to SRJ-310). The

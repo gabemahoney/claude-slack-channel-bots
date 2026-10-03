@@ -76,7 +76,15 @@
  * set by another site through the installed latch stops P's approver (its
  * calls end at the latch) and a latch of another persona does not; with a
  * latch that has no set observer, P latched before a lap, or while its
- * `status` or `read-pane` is awaited, gets no further call. Its cases hold a
+ * `status` or `read-pane` is awaited, gets no further call. The start entry's
+ * launch-timeout origin (b.jg5 SRJ-401, SRJ-407): an approver started after
+ * a launch timeout whose `get` read P's row covered logs one line and then
+ * stops under every SRJ-404 rule exactly as one started after a returned
+ * launch (each rule run from both origins: a live, finished or absent row,
+ * another launch start, a later launch's approver, each class, the test cap
+ * and B from the launch start); a row not covered, undecided or with no
+ * launch start gets no approver, no call and one line, and leaves an
+ * approver already running alone. Its cases hold a
  * chosen call of a chosen persona open with a gate and record every call's
  * start in one ordered event list.
  *
@@ -117,6 +125,8 @@ import {
   approverNotInteractiveMessage,
   approverNotStartedMessage,
   approverPaneCallFailedMessage,
+  approverRefusedRowMessage,
+  approverStartedAfterLaunchTimeoutMessage,
   approverStatusRefusedMessage,
   approverStopRequestedMessage,
   approverTmuxUnavailableMessage,
@@ -126,6 +136,9 @@ import {
   APPROVER_BOUND_FROM_LAUNCH_START,
   APPROVER_LOG_PREFIX,
   APPROVER_LOG_SITE,
+  APPROVER_ORIGIN_AFTER_LAUNCH,
+  APPROVER_ORIGIN_LAUNCH_TIMEOUT,
+  APPROVER_START_AFTER_LAUNCH,
   APPROVER_STATUS_READ_WHAT,
   APPROVER_STOP_ABSENT,
   APPROVER_STOP_BOUND,
@@ -166,10 +179,23 @@ import {
   setConfiguredPersonaQuery,
   setConflictLatch,
   type ApproverOutcome,
+  type ApproverStart,
   type ApproverStopReason,
   type ApproverVerb,
 } from '../src/session-manager.ts'
-import { parseLaunchStart } from '../src/pending-row.ts'
+import {
+  parseLaunchStart,
+  PENDING_ROW_COVERED,
+  PENDING_ROW_NO_LAUNCH_START,
+  PENDING_ROW_NOT_COVERED,
+  PENDING_ROW_REASON_CONFIG_DIR_MISMATCH,
+  PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED,
+  PENDING_ROW_REASON_CWD_MISMATCH,
+  PENDING_ROW_REASON_CWD_UNRESOLVED,
+  PENDING_ROW_REASON_RETIRED_OLD_LIFE,
+  PENDING_ROW_UNDECIDED,
+  type PendingRowCover,
+} from '../src/pending-row.ts'
 import {
   isInsideAttempt,
   runInAttempt,
@@ -2187,6 +2213,272 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
 
     expect(await runUntilStopped(PLAIN)).toEqual({ reason, launchStartMs: kept })
     expect(sendKeysCount(PLAIN)).toBe(0)
+  })
+
+  // -------------------------------------------------------------------------
+  // The launch-timeout origin (b.jg5 SRJ-401, SRJ-404, SRJ-407): an approver
+  // started after a launch timeout whose get read P's row covered follows
+  // every stop rule as one started after a returned launch; the start entry
+  // refuses a row that is not covered, undecided or has no launch start.
+  // Its lap that reads this launch's row live ending the condition (SRJ-310
+  // rule 3) is tests/tmux-unresponsive.test.ts's, where the launch sets the
+  // record of this launch's row.
+  // -------------------------------------------------------------------------
+
+  /** The launch-timeout origin's start: the get read P's pending row covered, with the stub's default launch start. */
+  const LAUNCH_TIMEOUT_START: ApproverStart = {
+    origin: APPROVER_ORIGIN_LAUNCH_TIMEOUT,
+    cover: { answer: PENDING_ROW_COVERED },
+    launchStartedAt: SAMPLE_LAUNCH_START_DEFAULT,
+  }
+
+  /** Both origins, each with the lines its start logs: one for the launch-timeout origin, none after a returned launch. */
+  const ORIGINS: ReadonlyArray<readonly [string, ApproverStart, (who: ApproverPersona) => string[]]> = [
+    [APPROVER_ORIGIN_AFTER_LAUNCH, APPROVER_START_AFTER_LAUNCH, () => []],
+    [APPROVER_ORIGIN_LAUNCH_TIMEOUT, LAUNCH_TIMEOUT_START, (who) => [approverLogLine(approverStartedAfterLaunchTimeoutMessage(who.ref))]],
+  ]
+
+  /**
+   * One SRJ-404 stop rule, the same for both origins: the stub's answers for
+   * P (and, for a class cell, the error its call answers with), what the case
+   * does once the approver runs, the stop it resolves with, P's calls in
+   * order (left out for B's many laps), and the approver's own lines after
+   * the start's.
+   */
+  interface StopRule {
+    readonly name: string
+    setup(who: ApproverPersona): Error | undefined
+    /** The approver's run once started: by default, fire timers until it stops. */
+    run?(who: ApproverPersona, start: ApproverStart): Promise<ApproverOutcome | undefined>
+    readonly reason: ApproverStopReason
+    readonly kept: number | undefined
+    readonly calls?: readonly ApproverVerb[]
+    lines(who: ApproverPersona, err: Error | undefined): string[] | ((lines: string[]) => void)
+  }
+
+  const DEAD_STATE = [...AGENT_DIRECTOR_DEAD_STATES][0]!
+
+  const STOP_RULES: readonly StopRule[] = [
+    {
+      name: 'a lap reading the row live',
+      setup: (who) => void rows.set(who.id, [PENDING_ROW, LIVE_ROW]),
+      reason: APPROVER_STOP_LIVE,
+      kept: LAUNCH_START_MS,
+      calls: ['status', 'read-pane', 'status'],
+      lines: () => [],
+    },
+    {
+      name: 'a lap reading the row finished',
+      setup: (who) => void rows.set(who.id, [PENDING_ROW, cannedStatusResult({ state: DEAD_STATE })]),
+      reason: APPROVER_STOP_FINISHED,
+      kept: LAUNCH_START_MS,
+      calls: ['status', 'read-pane', 'status'],
+      lines: (who) => [approverLogLine(approverFinishedMessage(who.ref, DEAD_STATE))],
+    },
+    {
+      name: 'a lap finding no row',
+      setup: (who) => void rows.set(who.id, [PENDING_ROW, errSpawnNotFound()]),
+      reason: APPROVER_STOP_ABSENT,
+      kept: LAUNCH_START_MS,
+      calls: ['status', 'read-pane', 'status'],
+      lines: (who) => [approverLogLine(approverAbsentMessage(who.ref))],
+    },
+    {
+      name: 'a lap reading another launch start',
+      setup: (who) => void rows.set(who.id, [PENDING_ROW, NEWER_PENDING_ROW]),
+      reason: APPROVER_STOP_SUPERSEDED,
+      kept: LAUNCH_START_MS,
+      calls: ['status', 'read-pane', 'status'],
+      lines: (who) => [approverLogLine(approverLaunchStartChangedMessage(who.ref))],
+    },
+    {
+      name: 'a later launch’s approver',
+      setup: (who) => void rows.set(who.id, [PENDING_ROW]),
+      run: async (who, start) => {
+        startDialogApprover(who.key, false, who.ref, start)
+        await clock.flush()
+        const first = _whenDialogApproverStopped(who.key)
+        expect(startDialogApprover(who.key, false, who.ref)).toBe(true)
+        const outcome = await first
+        // The later approver runs on, then stops on the row live.
+        rows.set(who.id, [LIVE_ROW])
+        expect((await runUntilStopped(who))?.reason).toBe(APPROVER_STOP_LIVE)
+        return outcome
+      },
+      reason: APPROVER_STOP_SUPERSEDED,
+      kept: LAUNCH_START_MS,
+      calls: ['status', 'read-pane', 'status'],
+      lines: (who) => [approverLogLine(approverStopRequestedMessage(who.ref, APPROVER_STOP_SUPERSEDED))],
+    },
+    {
+      name: 'GONE at its read-pane',
+      setup: (who) => {
+        rows.set(who.id, [PENDING_ROW])
+        const err = errTmuxCaptureFailed(undefined, 'read-pane')
+        failures.set(call('read-pane', who.id), err)
+        return err
+      },
+      reason: APPROVER_STOP_GONE,
+      kept: LAUNCH_START_MS,
+      calls: ['status', 'read-pane'],
+      lines: (who, err) => [approverLogLine(approverGoneMessage(who.ref, 'read-pane', describeAgentDirectorFailure(err)))],
+    },
+    {
+      name: 'ErrSpawnNotInteractive at its Enter (a needle on screen)',
+      setup: (who) => {
+        rows.set(who.id, [PENDING_ROW])
+        panes.set(who.id, dialogPane(TRUST_DIALOG_NEEDLE))
+        const err = errSpawnNotInteractiveLeftover(undefined, 'send-keys')
+        failures.set(call('send-keys', who.id), err)
+        return err
+      },
+      reason: APPROVER_STOP_NOT_INTERACTIVE,
+      kept: LAUNCH_START_MS,
+      calls: ['status', 'read-pane', 'send-keys'],
+      lines: (who, err) => [approverLogLine(approverNotInteractiveMessage(who.ref, 'send-keys', describeAgentDirectorFailure(err)))],
+    },
+    {
+      name: 'ENVIRONMENT (ErrTmuxNotAvailable) at its status',
+      setup: (who) => {
+        rows.set(who.id, [PENDING_ROW])
+        const err = errTmuxNotAvailable(undefined, 'status')
+        failures.set(call('status', who.id), err)
+        return err
+      },
+      reason: APPROVER_STOP_TMUX_UNAVAILABLE,
+      kept: undefined,
+      calls: ['status'],
+      lines: (who, err) => [approverLogLine(approverTmuxUnavailableMessage(who.ref, 'status', describeAgentDirectorFailure(err)))],
+    },
+    {
+      name: 'UNAVAILABLE at its read-pane (polling goes on), then a lap reading the row live',
+      setup: (who) => {
+        rows.set(who.id, [PENDING_ROW, LIVE_ROW])
+        const err = errTmuxUnresponsive('read-pane')
+        failures.set(call('read-pane', who.id), err)
+        return err
+      },
+      reason: APPROVER_STOP_LIVE,
+      kept: LAUNCH_START_MS,
+      calls: ['status', 'read-pane', 'status'],
+      lines: (who, err) => [approverLogLine(approverPaneCallFailedMessage(who.ref, 'read-pane', describeAgentDirectorFailure(err)))],
+    },
+    {
+      name: 'CONFLICT at its read-pane (P latched)',
+      setup: (who) => {
+        installLatch(true)
+        rows.set(who.id, [PENDING_ROW])
+        const err = STOP_CONFLICT_ROW.build()
+        failures.set(call('read-pane', who.id), err)
+        return err
+      },
+      reason: APPROVER_STOP_LATCHED,
+      kept: LAUNCH_START_MS,
+      calls: ['status', 'read-pane'],
+      lines: (who, err) => (lines) => {
+        expect(lines).toHaveLength(1)
+        expectLineAroundOutcome(lines[0], (outcome) => approverConflictMessage(who.ref, 'read-pane', describeAgentDirectorFailure(err), outcome))
+      },
+    },
+    {
+      name: 'the test cap',
+      setup: (who) => {
+        _setDialogReadyTimeoutMs(DIALOG_POLL_INTERVAL_MS)
+        rows.set(who.id, [PENDING_ROW])
+        return undefined
+      },
+      reason: APPROVER_STOP_CAP,
+      kept: LAUNCH_START_MS,
+      calls: ['status', 'read-pane'],
+      lines: (who) => [approverLogLine(approverCapMessage(who.ref, DIALOG_POLL_INTERVAL_MS))],
+    },
+    {
+      name: 'B, from the launch start',
+      setup: (who) => {
+        // The approver starts once the launch call has returned, after the launch start.
+        startClockAt(LAUNCH_START_MS + FAST)
+        rows.set(who.id, [PENDING_ROW])
+        return undefined
+      },
+      run: async (who, start) => {
+        startDialogApprover(who.key, false, who.ref, start)
+        const outcome = await runUntilStopped(who, MANY_TIMERS)
+        expect(clock.now()).toBe(LAUNCH_START_MS + adLaunchBoundMsInEffect())
+        return outcome
+      },
+      reason: APPROVER_STOP_BOUND,
+      kept: LAUNCH_START_MS,
+      lines: (who) => [approverLogLine(approverBoundMessage(who.ref, adLaunchBoundMsInEffect(), APPROVER_BOUND_FROM_LAUNCH_START))],
+    },
+  ]
+
+  test.each(STOP_RULES.flatMap((rule) => ORIGINS.map(([origin, start, startLines]) => [rule.name, origin, rule, start, startLines] as const)))(
+    'stop rule %s, the approver started from the %s origin: the same stop, the launch start kept, P\'s calls and the rule\'s lines as for every origin, after the start\'s own line',
+    async (_name, _origin, rule, start, startLines) => {
+      const err = rule.setup(PLAIN)
+
+      const outcome = rule.run !== undefined ? await rule.run(PLAIN, start) : (startDialogApprover(PLAIN.key, false, PLAIN.ref, start), await runUntilStopped(PLAIN))
+
+      expect(outcome).toEqual({ reason: rule.reason, launchStartMs: rule.kept })
+      if (rule.calls !== undefined) expect(callsOf(PLAIN).slice(0, rule.calls.length)).toEqual(lap(PLAIN, ...rule.calls))
+      if (rule.calls !== undefined && rule.run === undefined) expect(callsOf(PLAIN)).toEqual(lap(PLAIN, ...rule.calls))
+      const lines = approverLines()
+      const own = startLines(PLAIN)
+      expect(lines.slice(0, own.length)).toEqual(own)
+      const expected = rule.lines(PLAIN, err)
+      if (typeof expected === 'function') expected(lines.slice(own.length))
+      else expect(lines.slice(own.length)).toEqual(expected)
+      expect(startupEntries()).toEqual([])
+    },
+  )
+
+  /** The launch-timeout origin with `cover` and `launchStartedAt` (the raw field, `undefined` when absent) for the row the get read. */
+  const timedOutStart = (cover: PendingRowCover, launchStartedAt: unknown): ApproverStart => ({
+    origin: APPROVER_ORIGIN_LAUNCH_TIMEOUT,
+    cover,
+    launchStartedAt,
+  })
+
+  /** The rows the start entry refuses after a launch timeout, each with the reason its line names, if the decision has one. */
+  const REFUSED_ROWS: ReadonlyArray<readonly [string, ApproverStart, string | undefined]> = [
+    ['not covered: a retired key’s old life', timedOutStart({ answer: PENDING_ROW_NOT_COVERED, reason: PENDING_ROW_REASON_RETIRED_OLD_LIFE }, SAMPLE_LAUNCH_START_DEFAULT), PENDING_ROW_REASON_RETIRED_OLD_LIFE],
+    ['not covered: a cwd that resolves elsewhere', timedOutStart({ answer: PENDING_ROW_NOT_COVERED, reason: PENDING_ROW_REASON_CWD_MISMATCH }, SAMPLE_LAUNCH_START_DEFAULT), PENDING_ROW_REASON_CWD_MISMATCH],
+    ['not covered: a config_dir label missing or different', timedOutStart({ answer: PENDING_ROW_NOT_COVERED, reason: PENDING_ROW_REASON_CONFIG_DIR_MISMATCH }, SAMPLE_LAUNCH_START_DEFAULT), PENDING_ROW_REASON_CONFIG_DIR_MISMATCH],
+    ['undecided: a cwd that cannot be compared now', timedOutStart({ answer: PENDING_ROW_UNDECIDED, reason: PENDING_ROW_REASON_CWD_UNRESOLVED }, SAMPLE_LAUNCH_START_DEFAULT), PENDING_ROW_REASON_CWD_UNRESOLVED],
+    ['undecided: a claude_config_dir that cannot be resolved', timedOutStart({ answer: PENDING_ROW_UNDECIDED, reason: PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED }, SAMPLE_LAUNCH_START_DEFAULT), PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED],
+    ['no launch start, by the decision', timedOutStart({ answer: PENDING_ROW_NO_LAUNCH_START }, NO_LAUNCH_START_FORMS.absent), undefined],
+    ...NO_LAUNCH_START_FORM_NAMES.map((form) => [`covered, but its launch start ${form}`, timedOutStart({ answer: PENDING_ROW_COVERED }, NO_LAUNCH_START_FORMS[form]), undefined] as const),
+  ]
+
+  test.each(REFUSED_ROWS)('after a launch timeout, a row %s gets no approver: the start entry answers false, makes no status, read-pane or send-keys, starts no timer and logs one line naming why', async (_what, start, reason) => {
+    rows.set(PLAIN.id, [PENDING_ROW, LIVE_ROW])
+
+    expect(startDialogApprover(PLAIN.key, false, PLAIN.ref, start)).toBe(false)
+    await clock.flush()
+
+    expect(isDialogApproverRunning(PLAIN.key)).toBe(false)
+    expect(events).toEqual([])
+    expect(clock.pending()).toEqual([])
+    const lines = approverLines()
+    expect(lines).toHaveLength(1)
+    expectLineAroundOutcome(lines[0], (why) => approverRefusedRowMessage(PLAIN.ref, why))
+    if (reason !== undefined) expect(lines[0]).toContain(reason)
+  })
+
+  test('a refused launch-timeout start leaves P\'s running approver alone: no supersede, and it goes on to its own stop', async () => {
+    rows.set(PLAIN.id, [PENDING_ROW])
+    startDialogApprover(PLAIN.key, false, PLAIN.ref)
+    await clock.flush()
+    const mark = events.length
+
+    expect(startDialogApprover(PLAIN.key, false, PLAIN.ref, timedOutStart({ answer: PENDING_ROW_NOT_COVERED, reason: PENDING_ROW_REASON_CWD_MISMATCH }, SAMPLE_LAUNCH_START_DEFAULT))).toBe(false)
+    await clock.flush()
+
+    expect(events.slice(mark)).toEqual([])
+    expect(isDialogApproverRunning(PLAIN.key)).toBe(true)
+    rows.set(PLAIN.id, [LIVE_ROW])
+    expect(await runUntilStopped(PLAIN)).toEqual({ reason: APPROVER_STOP_LIVE, launchStartMs: LAUNCH_START_MS })
+    expect(approverLines().filter((line) => line.includes(approverLogLine(approverStopRequestedMessage(PLAIN.ref, APPROVER_STOP_SUPERSEDED))))).toEqual([])
   })
 })
 

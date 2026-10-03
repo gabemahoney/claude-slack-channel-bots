@@ -11,7 +11,15 @@
  * timer (b.jg5 SRJ-301) runs on the harness with the controller as the outage
  * state's trigger sink: real launches through `spawnForPersona` over the
  * stub, the arming predicate on its own, and the reads made outside every
- * attempt. A `status` error at the launch's working-row wait (b.jg5 SRJ-605)
+ * attempt; a launch call's UNAVAILABLE refusal is followed by its one `get`
+ * and no launch (b.jg5 SRJ-407). The next retry after a launch timeout's
+ * `get` (b.jg5 SRJ-407, SRJ-301, SRJ-409) runs there too, on the harness
+ * clock (`harnessNow`, `scriptTimedLaunch`), in both timeout forms: a `get`
+ * finding no row, or the row `ended` or `missing`, leaves the attempt with no
+ * launch and P's timer armed with the UNAVAILABLE cause, and the next retry
+ * makes exactly one launch; a covered `pending` row adds the pending-row
+ * cause and `pending` as the last row read to the full-mode timer, and the
+ * next retry, the row still `pending`, launches nothing. A `status` error at the launch's working-row wait (b.jg5 SRJ-605)
  * runs there too: the wait goes on past a failed poll (polling every
  * `WAIT_POLL_MS` of real time) while P's timer is armed, and its next poll
  * reading `waiting` reconnects; an error that lasts to the timeout read (the
@@ -181,6 +189,8 @@ import {
   AD_ERROR_CLASS_UNCLASSIFIED,
   classifyAdError,
   describeAgentDirectorFailure,
+  LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT,
+  LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE,
 } from '../src/ad-error-class.ts'
 import { KILL_OUTCOME_NOT_KILLED } from '../src/checked-kill.ts'
 import {
@@ -523,7 +533,7 @@ import {
   unavailableRetryRunNowLine,
 } from '../src/unavailable-retry.ts'
 import { OLD_LIFE_ROW_READ_STATE, SEQUENCE_WAITING_CAUSE_OLD_LIFE_HOLD, noteOldLifeRowRead, spawnForPersona } from '../src/session-manager.ts'
-import { rowReadsUntilSpawn } from './test-helpers/recovery-harness.ts'
+import { rowReadsUntilSpawn, scriptTimedLaunch } from './test-helpers/recovery-harness.ts'
 import { PRE_PERSONA_ID, holdOldAt } from './test-helpers/old-life.ts'
 
 const KEY = 'alpha'
@@ -1053,7 +1063,8 @@ interface LaunchSite {
    * For the sites whose refusal stops the launch at once (b.jg5 SRJ-105): the
    * stub calls the launch makes in all. An UNAVAILABLE at the reuse spawn
    * that replaces a finished row means no further launch, kill or delete
-   * after it; one at the sweep before a working-row wait means no row read
+   * after it, only its one `get` (b.jg5 SRJ-407); one at the sweep before a
+   * working-row wait means no row read
    * and no reconnect after it.
    */
   readonly ladderCalls?: Readonly<Record<string, number>>
@@ -1094,12 +1105,14 @@ const LAUNCH_SITES: readonly LaunchSite[] = [
   // b.jg5 SRJ-707, SRJ-1503: the collision get reads a finished row in
   // another directory, so the ladder replaces it by one reuse spawn of the
   // same id, with no kill and no delete; that reuse's refusal stops the
-  // launch with nothing counted (b.jg5 SRJ-112).
+  // launch with nothing counted (b.jg5 SRJ-112). Its UNAVAILABLE outcome is
+  // followed by one `get` (b.jg5 SRJ-407), which reads the same finished row,
+  // so no launch follows it in the attempt: two gets, two spawns.
   {
     name: 'the reuse spawn of a finished row in another directory',
     verb: 'spawn',
     action: 'failed',
-    ladderCalls: { spawnCalls: 2, getCalls: 1 },
+    ladderCalls: { spawnCalls: 2, getCalls: 2 },
     leavesConditionHeld: true,
     script: (h, p, err) => collided(h, p, { cwd: h.home, state: 'ended' }, err),
   },
@@ -1470,6 +1483,117 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
     expect(result).toEqual({ key, action: 'failed' })
     expectNothingArmed(h)
   })
+})
+
+// ---------------------------------------------------------------------------
+// The next retry after a launch timeout's one `get` (b.jg5 SRJ-407, SRJ-301,
+// SRJ-409): the timed-out attempt makes no launch whatever the `get` reads;
+// a row that is gone or finished is brought up by the next retry, and a
+// covered `pending` row is watched, launched over by no retry while it is live
+// ---------------------------------------------------------------------------
+
+/** Both launch-timeout forms (b.jg5 SRJ-407), by the exported form names. */
+const LAUNCH_TIMEOUT_FORMS = [LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT, LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE] as const
+
+/**
+ * What the one `get` after the launch timeout reads with no row to watch:
+ * `ErrSpawnNotFound`, and the two finished states. Each with the row's state
+ * as `status` reads it until the next retry's spawn resolves.
+ */
+const GONE_OR_FINISHED: ReadonlyArray<readonly [string, RowState | typeof UNAVAILABLE_RETRY_ROW_ABSENT]> = [
+  ['no row (ErrSpawnNotFound)', UNAVAILABLE_RETRY_ROW_ABSENT],
+  [LIVENESS_DEAD_ROW_ENDED, LIVENESS_DEAD_ROW_ENDED],
+  [LIVENESS_DEAD_ROW_MISSING, LIVENESS_DEAD_ROW_MISSING],
+]
+
+/** The launch calls (`spawn`, `resume`) made since `before` (a `callCounts` snapshot). */
+function launchesSince(h: RecoveryHarness, before: Record<string, number>): number {
+  const since = callsSince(h, before)
+  return (since['spawnCalls'] ?? 0) + (since['resumeCalls'] ?? 0)
+}
+
+describe('unavailable retry: the next retry after a launch timeout\'s one get (SRJ-407, SRJ-301, SRJ-409)', () => {
+  test.each(LAUNCH_TIMEOUT_FORMS.flatMap((form) => GONE_OR_FINISHED.map(([read, state]) => [form, read, state] as const)))(
+    'a spawn ending in a launch timeout (%s) whose one get reads %s: that attempt makes no launch after it, P\'s timer is armed once with the UNAVAILABLE cause, nothing is counted, and the next retry makes exactly one launch',
+    async (form, _read, state) => {
+      const h = (harness = makeRecoveryHarness({ ...RETRY_TIMER_ONLY, harnessNow: true }))
+      const [key] = h.keys as [string]
+      rowReadsUntilSpawn(h, state)
+      scriptTimedLaunch(h, key, { end: form, row: { state: state === UNAVAILABLE_RETRY_ROW_ABSENT ? LIVENESS_DEAD_ROW_MISSING : state } })
+      if (state === UNAVAILABLE_RETRY_ROW_ABSENT) h.script({ getFn: () => errSpawnNotFound() })
+
+      expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
+
+      // The timed-out spawn and its one get, and no launch after it.
+      expect(callCounts(h)).toEqual({ spawnCalls: 1, getCalls: 1 })
+      expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
+      expect(h.controller.view(key)).toMatchObject({
+        phase: 'waiting',
+        dueAt: h.clock.now() + waitMs(0),
+        refusals: 0,
+        causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+        mode: UNAVAILABLE_RETRY_MODE_FULL,
+      })
+      expect(delays(h.clock)).toEqual([waitMs(0)])
+      expect(h.approverRunning(key)).toBe(false)
+      expect(getFailureCount(key)).toBe(0)
+
+      const before = callCounts(h)
+      await retryNow(h, key)
+      await h.runApproverToStop(key)
+
+      expect(launchesSince(h, before)).toBe(1)
+      expect(h.stub.calls.spawnCalls.at(-1)).toMatchObject({ claude_instance_id: personaInstanceId(key) })
+      expect(h.attempts).toEqual([expect.objectContaining({ key, retry: 1, mode: UNAVAILABLE_RETRY_MODE_FULL })])
+      expect(h.lines).toContain(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, 1, { switchedTo: UNAVAILABLE_RETRY_MODE_PENDING_ONLY }))
+      expect([getFailureCount(key), h.capReached, h.notices]).toEqual([0, [], []])
+    },
+  )
+
+  test.each(LAUNCH_TIMEOUT_FORMS.map((form) => [form] as const))(
+    'a spawn ending in a launch timeout (%s) whose one get reads its row pending and covered: the full-mode timer gains the pending-row cause with pending as the last row read, and the next retry, the row still pending, launches nothing and re-arms deferred on it',
+    async (form) => {
+      const h = (harness = makeRecoveryHarness({ ...RETRY_TIMER_ONLY, harnessNow: true }))
+      const [key] = h.keys as [string]
+      const t = scriptTimedLaunch(h, key, { end: form })
+      // The row stays pending at every status read, the approver's laps included.
+      h.script({ statusFn: () => t.statusRow() })
+
+      expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
+
+      expect(callCounts(h)).toEqual({ spawnCalls: 1, getCalls: 1 })
+      expect(h.triggers).toEqual([UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, UNAVAILABLE_RETRY_CAUSE_PENDING_ROW].map((kind) => ({ key, kind })))
+      expect(h.controller.view(key)).toEqual({
+        phase: 'waiting',
+        dueAt: h.clock.now() + waitMs(0),
+        waitMs: waitMs(0),
+        refusals: 0,
+        causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
+        mode: UNAVAILABLE_RETRY_MODE_FULL,
+        lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
+      })
+      expect(getFailureCount(key)).toBe(0)
+
+      // The approver started on the covered row stops at its cap, the row still
+      // pending; then the retry reads the row pending and defers on it.
+      await h.runApproverToStop(key)
+      const before = callCounts(h)
+      await retryNow(h, key)
+
+      expect(launchesSince(h, before)).toBe(0)
+      expect(h.stub.calls.spawnCalls).toHaveLength(1)
+      expect(h.stub.calls.killCalls).toEqual([])
+      expect(retryLinesOf(h, key).at(-1)).toBe(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, 1))
+      expect(h.controller.view(key)).toMatchObject({
+        phase: 'waiting',
+        refusals: 1,
+        causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
+        mode: UNAVAILABLE_RETRY_MODE_FULL,
+        lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
+      })
+      expect([getFailureCount(key), h.capReached, h.notices]).toEqual([0, [], []])
+    },
+  )
 })
 
 // ---------------------------------------------------------------------------
@@ -2453,7 +2577,7 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
     const [key] = h.keys as [string]
     modelRow(h, UNAVAILABLE_RETRY_ROW_PENDING)
-    const refusedAt = await refuseLaunch(h, key)
+    const refusedAt = await refuseLaunch(h, key, true)
     const alertDueAt = refusedAt + adAlertThresholdMsInEffect() + 1
 
     // Each retry reads the row pending, which ends nothing (its liveness read
@@ -3649,25 +3773,44 @@ describe('unavailable retry: the pending and kill-failure exceptions (SRJ-306)',
 /**
  * A start-pass launch of persona `key` whose optimistic spawn is refused
  * UNAVAILABLE (`ErrTmuxUnresponsive`): it starts the condition and arms the
- * timer in full mode. The stub's spawn answers again afterwards. Resolves with
- * the first refusal's time.
+ * timer in full mode. The refusal is followed by its one `get` and no launch
+ * (b.jg5 SRJ-407). With `readsPending` (the case's row reads `pending`, as
+ * `modelRow` serves it, covered), that `get` reads the row covered and the
+ * pending-row step adds its cause to the full-mode timer, `pending` the last
+ * row read (b.jg5 SRJ-409); a row in any other state adds nothing. The stub's
+ * spawn answers again afterwards. Resolves with the first refusal's time.
  */
-async function refuseLaunch(h: RecoveryHarness, key: string): Promise<number> {
+async function refuseLaunch(h: RecoveryHarness, key: string, readsPending = false): Promise<number> {
   h.script({ spawnError: errTmuxUnresponsive('spawn') })
   const refusedAt = h.clock.now()
+  const before = callCounts(h)
   expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
   h.script({ spawnError: undefined })
+  // The refused spawn and its one get, of P's own row, and nothing else.
+  expect(callsSince(h, before)).toEqual({ spawnCalls: 1, getCalls: 1 })
+  expect(h.stub.calls.getCalls.at(-1)).toMatchObject({ claude_instance_id: personaInstanceId(key) })
   expect(h.tmuxUnresponsive.firstRefusalAt(key)).toBe(refusedAt)
-  expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE], mode: UNAVAILABLE_RETRY_MODE_FULL })
+  expect(h.controller.view(key)).toMatchObject({
+    phase: 'waiting',
+    causes: readsPending ? [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, UNAVAILABLE_RETRY_CAUSE_PENDING_ROW] : [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+    mode: UNAVAILABLE_RETRY_MODE_FULL,
+    ...(readsPending ? { lastRow: UNAVAILABLE_RETRY_ROW_PENDING } : {}),
+  })
+  if (!readsPending) expect(h.controller.view(key)?.lastRow).toBeUndefined()
   return refusedAt
 }
 
 /** How a case starts persona `key`'s condition and arms its timer. */
 type ConditionArm = (h: RecoveryHarness, key: string) => Promise<void>
 
-/** Full mode: a launch refused UNAVAILABLE (`refuseLaunch`). */
+/** Full mode: a launch refused UNAVAILABLE (`refuseLaunch`) over a row that does not read `pending`. */
 const FULL_MODE_ARM: ConditionArm = async (h, key) => {
   await refuseLaunch(h, key)
+}
+
+/** Full mode over a row that reads `pending`: the refusal's one `get` adds the pending-row cause (`refuseLaunch`). */
+const FULL_MODE_ARM_ON_PENDING: ConditionArm = async (h, key) => {
+  await refuseLaunch(h, key, true)
 }
 
 /**
@@ -3720,7 +3863,7 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
   // A row read `pending` also gets the pending-row step's one `get`, which
   // finds it covered (b.jg5 SRJ-409).
   test.each<[string, ConditionArm, RowState, boolean, Record<string, number>, (key: string) => string, boolean]>([
-    ['in full mode reads its row pending, connected with its stream (deferred on the pending row; the timer runs on)', FULL_MODE_ARM, 'pending', true, { statusCalls: 1, getCalls: 1 }, (key) => reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, 1), true],
+    ['in full mode reads its row pending, connected with its stream (deferred on the pending row; the timer runs on)', FULL_MODE_ARM_ON_PENDING, 'pending', true, { statusCalls: 1, getCalls: 1 }, (key) => reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, 1), true],
     ['in pending-only mode reads its row pending, connected with its stream (the timer runs on)', PENDING_ONLY_ARM, 'pending', true, { statusCalls: 1, getCalls: 1 }, (key) => reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_ROW_PENDING, 1, { ranPendingOnly: true }), true],
     ['in pending-only mode reads its row live (waiting) but not connected (the pending-only row rule stops the timer, not a condition end)', PENDING_ONLY_ARM, 'waiting', false, { statusCalls: 1 }, (key) => pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_ROW_LIVE, 'waiting'), false],
   ])('a retry that %s leaves the condition holding with its first refusal’s time and never reaches the condition-end entry', async (_what, arm, state, connected, calls, last, armed) => {
@@ -3844,7 +3987,7 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
   /** Persona `key`'s condition holding and its full-mode timer's row last read `pending` by a retry. */
   async function holdingOnAPendingRow(h: RecoveryHarness, key: string): Promise<NonNullable<ReturnType<UnavailableRetryController['view']>>> {
     modelRow(h, UNAVAILABLE_RETRY_ROW_PENDING)
-    await refuseLaunch(h, key)
+    await refuseLaunch(h, key, true)
     await retryNow(h, key)
     // The retry's status read succeeded: that alone ends nothing.
     expect(h.tmuxUnresponsive.holds(key)).toBe(true)
@@ -6777,6 +6920,16 @@ const NO_SESSION_ID_REUSE_LAUNCH = { spawnCalls: 2, getCalls: 1, resumeCalls: 1 
 /** The calls of each retry: its liveness read, the kill of the dead row, then the launch to the reuse. */
 const NO_SESSION_ID_REUSE_RETRY = { statusCalls: 1, killCalls: 1, ...NO_SESSION_ID_REUSE_LAUNCH } as const
 
+/**
+ * The bring-up's launch to a reuse refused UNAVAILABLE: the refused reuse is
+ * followed by its one `get` (b.jg5 SRJ-407), which reads the row `ended`, so
+ * no launch follows it in the attempt.
+ */
+const NO_SESSION_ID_REUSE_UNAVAILABLE_LAUNCH = { ...NO_SESSION_ID_REUSE_LAUNCH, getCalls: NO_SESSION_ID_REUSE_LAUNCH.getCalls + 1 } as const
+
+/** Each retry whose launch reaches a reuse refused UNAVAILABLE: its liveness read, the kill of the dead row, then that launch. */
+const NO_SESSION_ID_REUSE_UNAVAILABLE_RETRY = { statusCalls: 1, killCalls: 1, ...NO_SESSION_ID_REUSE_UNAVAILABLE_LAUNCH } as const
+
 describe('unavailable retry: the no-transcript reuse spawn after resume’s ErrNoSessionId, refused UNCLASSIFIED or UNAVAILABLE, is retried at each due time and never counted (SRJ-313, SRJ-112, SRJ-707, AC 69)', () => {
   test('AC 69: an ErrInternal from the reuse at every retry, with both settings 0: no delete, no condition post and no spawn-failure notice; never counted past the restart cap; a retry at each due time; exactly one alert, at the first retry strictly past the alert threshold in effect; once the reuse succeeds P is up and its timer stops', async () => {
     const h = (harness = makeRecoveryHarness())
@@ -6869,7 +7022,8 @@ describe('unavailable retry: the no-transcript reuse spawn after resume’s ErrN
     const armedAt = h.clock.now()
 
     expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
-    expect(callCounts(h)).toEqual(NO_SESSION_ID_REUSE_LAUNCH)
+    // The refused reuse's one get reads the row ended: no launch in that attempt.
+    expect(callCounts(h)).toEqual(NO_SESSION_ID_REUSE_UNAVAILABLE_LAUNCH)
     expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)
 
     let dueAt = armedAt
@@ -6880,8 +7034,9 @@ describe('unavailable retry: the no-transcript reuse spawn after resume’s ErrN
       await h.advance(dueAt - 1 - h.clock.now())
       expect([n, callsSince(h, before)]).toEqual([n, {}])
       expect(await retryNow(h, key)).toBe(dueAt)
-      // The launch that succeeds is followed by its approver's first lap, which reads the row live.
-      expect([n, callsSince(h, before)]).toEqual([n, n === 0 ? NO_SESSION_ID_REUSE_RETRY : { ...NO_SESSION_ID_REUSE_RETRY, statusCalls: 2 }])
+      // The refused reuse is followed by its one get; the launch that succeeds
+      // by its approver's first lap, which reads the row live.
+      expect([n, callsSince(h, before)]).toEqual([n, n === 0 ? NO_SESSION_ID_REUSE_UNAVAILABLE_RETRY : { ...NO_SESSION_ID_REUSE_RETRY, statusCalls: 2 }])
     }
 
     // The second retry's reuse launched P: the timer runs on in pending-only mode.
@@ -7919,8 +8074,9 @@ interface FailedLaunchSetup {
 
 /**
  * A step-6 launch that does not succeed: its label, its setup, the calls it
- * makes, the causes its own handling sends before the sequence's, its launch
- * kind, and the failures it counts.
+ * makes (an UNAVAILABLE launch's one `get` after it included, b.jg5 SRJ-407),
+ * the causes its own handling sends before the sequence's, its launch kind,
+ * and the failures it counts.
  */
 type FailedLaunch = readonly [
   label: string,
@@ -7932,10 +8088,12 @@ type FailedLaunch = readonly [
 ]
 
 const STEP6_FAILED_LAUNCHES: readonly FailedLaunch[] = [
+  // b.jg5 SRJ-407: the refused resume is followed by its one get, which
+  // reads the row ended, and by no launch.
   ['a resume answering UNAVAILABLE, refused, whose own handling armed the timer first', (h, key) => {
     h.script({ getResult: personaRow(h, key, ENDED_WITH_SESSION), resumeError: errTmuxUnresponsive('resume') })
     return { request: { lastReadState: LIVE_STATE, keepsConversation: true } }
-  }, ['resume'], [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE], LIVE_ROW_LAUNCH_RESUME, 0],
+  }, ['resume', 'get'], [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE], LIVE_ROW_LAUNCH_RESUME, 0],
   ['a launch deferred on an unresolvable claude_config_dir', (h, key) => {
     h.script({ getResult: personaRow(h, key, { state: LIVENESS_DEAD_ROW_ENDED }) })
     _setConfigDirFs({ realpath: () => { throw Object.assign(new Error('no such directory'), { code: 'ENOENT' }) } })
@@ -8081,7 +8239,7 @@ describe('unavailable retry: the live-row sequence — SRJ-316\'s pending-row le
   // `ended` at step 2 and after its one run, so its calls before the launch
   // are one kill, one get, one run and one get.
 
-  test.each(STEP6_FAILED_LAUNCHES)('SRJ-301: a step-6 launch that does not succeed — %s — ends the sequence with P\'s timer armed with the other-end cause, after any cause the launch sent, and no call after the launch', async (_label, setup, launchCalls, before, launchKind, counted) => {
+  test.each(STEP6_FAILED_LAUNCHES)('SRJ-301: a step-6 launch that does not succeed — %s — ends the sequence with P\'s timer armed with the other-end cause, after any cause the launch sent, and no call after the launch but an UNAVAILABLE outcome\'s one get', async (_label, setup, launchCalls, before, launchKind, counted) => {
     const h = (harness = makeRecoveryHarness())
     const [key, other] = h.keys as [string, string]
     const { request, undo } = setup(h, key)
@@ -8098,7 +8256,8 @@ describe('unavailable retry: the live-row sequence — SRJ-316\'s pending-row le
     expect(h.triggers).toEqual([...before, UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED].map((kind) => ({ key, kind })))
     expect(h.controller.view(key)?.causes).toEqual([...before, UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED])
     expect(h.controller.armedKeys()).toEqual([key])
-    // No delete, kill, plain spawn, second launch or get after the launch.
+    // No delete, kill, plain spawn or second launch after the launch, and no
+    // get but an UNAVAILABLE outcome's one (b.jg5 SRJ-407).
     expect(order).toEqual(['kill', 'get', 'findMissing', 'get', ...launchCalls])
     expect(h.stub.calls.spawnCalls).toEqual([...h.reuseSpawns()])
     // No spawn-failure notice; only a counted failure is counted, once.

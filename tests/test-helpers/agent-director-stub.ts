@@ -46,6 +46,14 @@
  * so a test reads the flag from `spawnCalls` with no cast, and answers it like
  * any spawn, from the same queue and knobs.
  *
+ * Per-call answers: `statusFn`, `getFn`, `spawnFn` and `resumeFn` compute a
+ * verb's answer from each call's parameters and win over its queue, error
+ * and result. `spawnFn` and `resumeFn` may be async, so a case runs code
+ * while a launch call is in progress, such as moving a fake clock and then
+ * rejecting with `errCallTimeout` or `errTmuxUnresponsiveLaunchTimeout`
+ * (b.jg5 SRJ-407's launch-call window). `spawnFn`, `resumeFn` and `getFn`
+ * answer `undefined` to leave a call to the verb's other knobs.
+ *
  * Held calls: `holdSpawns` keeps a stub's `spawn` calls open, and
  * `holdFindMissing` its `find-missing` calls (b.jg5 SRJ-706: a live-row
  * sequence's run held while the start pass, an apply, a stop or a lost
@@ -1551,6 +1559,13 @@ export const cannedOk = <T>(value: T): CannedResponse<T> => ({ kind: 'resolve', 
 export const cannedErr = <T>(error: Error): CannedResponse<T> => ({ kind: 'reject', error })
 
 /**
+ * What a per-call launch knob (`spawnFn`, `resumeFn`) answers, at once or
+ * through a promise: a result resolves the call, an `Error` rejects it, and
+ * `undefined` leaves the call to the verb's other knobs.
+ */
+export type StubCallAnswer<T> = T | Error | undefined | Promise<T | Error | undefined>
+
+/**
  * Injection points for `makeStubClient`. Each verb has two knobs:
  *
  *   - `<verb>Result` / `<verb>Error`: single canned response, returned for
@@ -1564,9 +1579,14 @@ export const cannedErr = <T>(error: Error): CannedResponse<T> => ({ kind: 'rejec
  * Verbs with a queue: `spawn`, `status`, `get`, `sendKeys`, `readPane`,
  * `kill`, `decide`, `resume`, `findMissing`, `list`, `getPermission`.
  * `statusFn` and `getFn` compute a response per call and take precedence
- * over every other knob of their verb.
+ * over every other knob of their verb. `spawnFn` and `resumeFn` do the same
+ * for the two launch verbs, and may be async, so a test can run code while
+ * the call is in progress (move a fake clock, then answer or reject it:
+ * b.jg5 SRJ-407's launch-call window). `spawnFn`, `resumeFn` and `getFn` may
+ * answer `undefined` to leave that call to the verb's other knobs.
  *
  * Plus capture arrays — `<verb>Calls` — for assertion against call shape.
+ * Every call is recorded there before any knob answers it.
  */
 export interface StubClientOptions {
   // Client surface getters added in AD 0.7.0
@@ -1596,6 +1616,18 @@ export interface StubClientOptions {
   spawnError?: Error
   spawnQueue?: CannedResponse<Phase1SpawnResult>[]
   spawnCalls?: Phase1SpawnParams[]
+  /**
+   * Per-call `spawn` answer (b.jg5 SRJ-407), like `getFn`: when supplied, it
+   * is called with each call's parameters, after the call is recorded in
+   * `spawnCalls`, and takes precedence over `spawnQueue`/`spawnError`/
+   * `spawnResult`. It may be async and run test code while the call is in
+   * progress (for example, advance a fake clock). Returning (or resolving
+   * with) an `Error` rejects the call; a result resolves it; `undefined`
+   * leaves the call to the other `spawn` knobs, the queue first, as if no
+   * `spawnFn` were set. A reuse spawn reaches it too (its parameters carry
+   * `reuse_finished`).
+   */
+  spawnFn?: (params: Phase1SpawnParams) => StubCallAnswer<Phase1SpawnResult>
 
   // status() — a result may carry the Phase 1 `launch_started_at`
   // (`cannedStatusResult`). Default: `cannedStatusResult()`, a `waiting` row
@@ -1622,10 +1654,12 @@ export interface StubClientOptions {
   /**
    * Computed `get` row, like `statusFn`: when supplied, takes precedence over
    * `getQueue`/`getError`/`getResult` and computes the row from the current
-   * call params. Returning an `Error` rejects; returning a row resolves.
-   * The call is still recorded in `getCalls`.
+   * call params. Returning an `Error` rejects; returning a row resolves;
+   * returning `undefined` leaves the call to the other `get` knobs, the
+   * queue first, as if no `getFn` were set. The call is still recorded in
+   * `getCalls`.
    */
-  getFn?: (params: GetParams) => Phase1GetResult | Error
+  getFn?: (params: GetParams) => Phase1GetResult | Error | undefined
 
   // sendKeys()
   sendKeysResult?: SendKeysResult
@@ -1666,6 +1700,14 @@ export interface StubClientOptions {
   resumeError?: Error
   resumeQueue?: CannedResponse<Phase1ResumeResult>[]
   resumeCalls?: ResumeParams[]
+  /**
+   * Per-call `resume` answer (b.jg5 SRJ-407), as `spawnFn` is for `spawn`:
+   * called after the call is recorded in `callLog` and `resumeCalls`, it
+   * takes precedence over `resumeQueue`/`resumeError`/`resumeResult`, may be
+   * async, rejects with an `Error`, resolves with a result, and leaves the
+   * call to the other `resume` knobs on `undefined`.
+   */
+  resumeFn?: (params: ResumeParams) => StubCallAnswer<Phase1ResumeResult>
 
   // findMissing() — b.4dk: dead-session recovery runs one findMissing before
   // resume so AD transitions the dead live-state row to `missing`. Defaults to
@@ -1780,6 +1822,11 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
     },
     async spawn(params: Phase1SpawnParams): Promise<Phase1SpawnResult> {
       opts.spawnCalls?.push(params)
+      if (opts.spawnFn) {
+        const r = await opts.spawnFn(params)
+        if (r instanceof Error) throw r
+        if (r !== undefined) return r
+      }
       return nextResponse('spawn', opts.spawnQueue, opts.spawnResult, opts.spawnError, {
         claude_instance_id: params.claude_instance_id ?? 'cscb_test',
       })
@@ -1799,7 +1846,7 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
       if (opts.getFn) {
         const r = opts.getFn(params)
         if (r instanceof Error) throw r
-        return r
+        if (r !== undefined) return r
       }
       return nextResponse('get', opts.getQueue, opts.getResult, opts.getError, cannedGetResult({
         claude_instance_id: params.claude_instance_id,
@@ -1835,6 +1882,11 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
     async resume(params: ResumeParams): Promise<Phase1ResumeResult> {
       opts.callLog?.push('resume')
       opts.resumeCalls?.push(params)
+      if (opts.resumeFn) {
+        const r = await opts.resumeFn(params)
+        if (r instanceof Error) throw r
+        if (r !== undefined) return r
+      }
       return nextResponse('resume', opts.resumeQueue, opts.resumeResult, opts.resumeError, {
         claude_instance_id: params.claude_instance_id,
       })

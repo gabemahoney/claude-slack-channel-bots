@@ -82,6 +82,12 @@
  * classifier, its description carrying `DIFFERENT_TMUX_SERVER_PHRASE`
  * (`src/ad-description-phrases.ts`). Never throws.
  *
+ * {@link isLaunchTimeoutError} answers whether a value ends a declared launch
+ * call as a launch timeout (b.jg5 SRJ-407): `ErrCallTimeout`, or an
+ * `ErrTmuxUnresponsive` whose description carries `LAUNCH_TIMEOUT_PHRASE`;
+ * {@link launchTimeoutFormOf} names the form. Both forms keep their
+ * UNAVAILABLE class. Never throws.
+ *
  * {@link classifyWithInvalidFlagsRecheck} is the step for a site that gives
  * `ErrInvalidFlags` no meaning (b.jg5 SRJ-104: any site but a plain or reuse
  * spawn): an `ErrInvalidFlags` gets exactly one immediate version re-check
@@ -117,7 +123,11 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { DIFFERENT_TMUX_SERVER_PHRASE, UNUSABLE_RECORDED_NAME_PHRASE } from './ad-description-phrases.ts'
+import {
+  DIFFERENT_TMUX_SERVER_PHRASE,
+  LAUNCH_TIMEOUT_PHRASE,
+  UNUSABLE_RECORDED_NAME_PHRASE,
+} from './ad-description-phrases.ts'
 import {
   RECHECK_OUTCOME_COULD_NOT_RUN,
   triggerAdVersionRecheck,
@@ -312,6 +322,9 @@ const STORE_OPEN_NAMES: ReadonlySet<unknown> = new Set<unknown>(STORE_OPEN_ERR_N
 /** `errName` of CSCB's own wrapper around a thrown value that was not an agent-director error. */
 export const CSCB_UNKNOWN_ERROR_NAME = 'UnknownError'
 
+/** `errName` of the client's own per-call timeout (any verb). */
+const ERR_CALL_TIMEOUT_NAME = 'ErrCallTimeout'
+
 /** `errName` of the error agent-director returns for flags this binary does not accept. */
 const ERR_INVALID_FLAGS_NAME = 'ErrInvalidFlags'
 
@@ -325,7 +338,7 @@ const CLASS_BY_ERR_NAME: ReadonlyMap<string, AdErrorClass> = new Map<string, AdE
   ...AD_GONE_ERR_NAMES.map((name): [string, AdErrorClass] => [name, AD_ERROR_CLASS_GONE]),
   [ERR_TMUX_UNRESPONSIVE_NAME, AD_ERROR_CLASS_UNAVAILABLE],
   [ERR_TMUX_KILL_FAILED_NAME, AD_ERROR_CLASS_UNAVAILABLE],
-  ['ErrCallTimeout', AD_ERROR_CLASS_UNAVAILABLE],
+  [ERR_CALL_TIMEOUT_NAME, AD_ERROR_CLASS_UNAVAILABLE],
   [ERR_TMUX_SESSION_CONFLICT_NAME, AD_ERROR_CLASS_CONFLICT],
   ['ErrTmuxNotAvailable', AD_ERROR_CLASS_ENVIRONMENT],
   ['ErrTmuxSessionCreate', AD_ERROR_CLASS_LAUNCH_FAILURE],
@@ -460,6 +473,59 @@ export function hasAdErrorName(value: unknown, name: string): boolean {
   } catch {
     return false
   }
+}
+
+/** A launch timeout's form: the client's own `ErrCallTimeout` for the launch call (b.jg5 SRJ-407). */
+export const LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT = ERR_CALL_TIMEOUT_NAME
+/** A launch timeout's form: agent-director's `ErrTmuxUnresponsive` carrying `LAUNCH_TIMEOUT_PHRASE` (b.jg5 SRJ-407). */
+export const LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE = ERR_TMUX_UNRESPONSIVE_NAME
+
+/** The two forms of a launch timeout. */
+export type LaunchTimeoutForm = typeof LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT | typeof LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE
+
+/**
+ * The form in which `value` ends the declared launch call `call` as a launch
+ * timeout (b.jg5 SRJ-407), or `undefined` when it does not: `call` is a
+ * launch call ({@link isLaunchCall}: `spawn`, plain or reuse, or `resume`),
+ * and either the client threw `ErrCallTimeout` for it
+ * ({@link LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT}), or agent-director answered
+ * `ErrTmuxUnresponsive` whose description contains `LAUNCH_TIMEOUT_PHRASE`
+ * ("the session may have been created"; `src/ad-description-phrases.ts`;
+ * {@link LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE}). Recognition is by name
+ * ({@link hasAdErrorName}; b.jg5 SRJ-101 interim rule); an
+ * `ErrUnknownErrorName` whose `unknownName` is `ErrTmuxUnresponsive` (a client
+ * with no class of that name) is read the same way, its description taken
+ * from the envelope's `err_description`. The value's class is unchanged:
+ * both forms stay UNAVAILABLE. Pure; never throws.
+ */
+export function launchTimeoutFormOf(value: unknown, call: AdCall): LaunchTimeoutForm | undefined {
+  try {
+    if (!isLaunchCall(call)) return undefined
+    if (hasAdErrorName(value, ERR_CALL_TIMEOUT_NAME)) return LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT
+    let description: unknown
+    if (hasAdErrorName(value, ERR_TMUX_UNRESPONSIVE_NAME)) {
+      description = readProp(value, 'errDescription')
+    } else if (
+      hasAdErrorName(value, ERR_UNKNOWN_ERROR_NAME) &&
+      readProp(value, 'unknownName') === ERR_TMUX_UNRESPONSIVE_NAME
+    ) {
+      description = readProp(readProp(value, 'envelope'), 'err_description')
+    }
+    return typeof description === 'string' && description.includes(LAUNCH_TIMEOUT_PHRASE)
+      ? LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * True when `value` ends the declared launch call `call` as a launch timeout
+ * (b.jg5 SRJ-407), in either form ({@link launchTimeoutFormOf}). Pure; never
+ * throws.
+ */
+export function isLaunchTimeoutError(value: unknown, call: AdCall): boolean {
+  return launchTimeoutFormOf(value, call) !== undefined
 }
 
 /**

@@ -41,6 +41,25 @@
  *   and the tick's end; a read's success does not. Ends are idempotent, and
  *   each end of a holding condition reaches the retry timer's condition-end
  *   entry once.
+ * - SRJ-310's third end rule (b.jg5 SRJ-407), on a harness whose session
+ *   manager reads the harness clock (`harnessNow`), the spawn timed and
+ *   ended by `scriptTimedLaunch`: a launch timeout in either form starts the
+ *   condition when its answer reaches CSCB; once the one `get` after it read
+ *   this launch's row `pending` (launch start inside the call's window), the
+ *   first read that sees the row live other than `pending` ends it once with
+ *   `TMUX_UNRESPONSIVE_END_LAUNCH_ROW_LIVE`, whether that read is the
+ *   approver's lap, a retry or a health tick's liveness read (the pane reads
+ *   refused UNAVAILABLE, so no tmux-touching success ends it first), with the
+ *   recovery post only after a notice and E8's condition-end entry called
+ *   once (the timer stops, or is kept while a kill-failure cause holds);
+ *   an approver's successful pane read ends it first by the first rule, and
+ *   the row read live later ends nothing more. It ends nothing for a row
+ *   still `pending`, a launch start outside the window, a first read already
+ *   live (left to rules 1 and 2), or an UNAVAILABLE outcome that was no
+ *   launch timeout. The E10 note on E28: with the health check off, a
+ *   pending-only retry reading the row live but not connected stops the
+ *   timer and cancels its alert check, nothing posts while no timer runs,
+ *   and a later refusal arms the check again from the first refusal.
  * - Isolation: the other persona's condition, ends and notices are untouched.
  * - A lost message (SRJ-1011), through the harness's lost-message driver (the
  *   real routing bound as `main()` binds it): while P's condition holds it
@@ -123,14 +142,18 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import {
   AD_CALL_KILL_ROW_NOT_READ_LIVE,
   AD_CALL_KILL_ROW_READ_LIVE,
+  LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT,
+  LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE,
   type AdCall,
+  type LaunchTimeoutForm,
 } from '../src/ad-error-class.ts'
+import type { Phase1StatusResult } from '../src/ad-phase1-types.ts'
 import { adAlertThresholdMs, adAlertThresholdMsInEffect, DEFAULT_AD_SETTINGS_IN_EFFECT } from '../src/ad-settings.ts'
 import { ErrCwdNotFound } from '../src/agent-director-errors.ts'
 import { doublingBackoffDelay, getFailureCount, isAtCap, recordFailure } from '../src/backoff.ts'
 import type { Persona } from '../src/config.ts'
 import { _resetHealthCheckState, _runHealthCheckTickForTest, initHealthCheck, type HealthCheckDeps } from '../src/health-check.ts'
-import { LIVENESS_DEAD_ROW_ENDED, LIVENESS_LIVE, LIVENESS_READING_DEAD, LIVENESS_READING_LIVE, LIVENESS_READING_UNKNOWN } from '../src/liveness-reading.ts'
+import { AGENT_DIRECTOR_PENDING_STATE, LIVENESS_DEAD_ROW_ENDED, LIVENESS_LIVE, LIVENESS_READING_DEAD, LIVENESS_READING_LIVE, LIVENESS_READING_UNKNOWN } from '../src/liveness-reading.ts'
 import {
   ALL_CLEAR_TEMPLATE,
   getOutageFlags,
@@ -141,6 +164,7 @@ import {
 import {
   PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE,
   TMUX_UNRESPONSIVE_END_LATCHED,
+  TMUX_UNRESPONSIVE_END_LAUNCH_ROW_LIVE,
   TMUX_UNRESPONSIVE_END_TEXT,
   TMUX_UNRESPONSIVE_END_TICK,
   TMUX_UNRESPONSIVE_END_TMUX_VERB,
@@ -153,7 +177,21 @@ import {
 import { personaInstanceId } from '../src/persona-identity.ts'
 import { RESTART_FAILURE_CAP } from '../src/restart.ts'
 import { _buildIsSessionAliveAdapter } from '../src/server.ts'
-import { KILL_CONTEXT_TEARDOWN, killPersonaInstance, personaRetryBlockCause, reconcileOrphans, SPAWN_ACTION_RETRYING, TRUST_DIALOG_NEEDLE, type ApproverVerb } from '../src/session-manager.ts'
+import {
+  APPROVER_STOP_CAP,
+  APPROVER_STOP_LIVE,
+  DIALOG_SLOW_POLL_INTERVAL_MS,
+  KILL_CONTEXT_TEARDOWN,
+  killPersonaInstance,
+  launchCallWindowOf,
+  personaRetryBlockCause,
+  reconcileOrphans,
+  SPAWN_ACTION_RETRYING,
+  thisLaunchRowLiveLine,
+  thisLaunchRowOf,
+  TRUST_DIALOG_NEEDLE,
+  type ApproverVerb,
+} from '../src/session-manager.ts'
 import { RETRY_BLOCK_OLD_LIFE_WAIT } from '../src/unavailable-retry.ts'
 import { KILL_OUTCOME_NOT_KILLED } from '../src/checked-kill.ts'
 import { KILL_RETRY_SPACING_MS, KILL_RETRY_TRIES } from '../src/kill-retry.ts'
@@ -170,6 +208,7 @@ import {
   UNAVAILABLE_RETRY_STOP_LATCHED,
   UNAVAILABLE_RETRY_STOP_NOT_APPLIED,
   UNAVAILABLE_RETRY_STOP_NOT_UP,
+  UNAVAILABLE_RETRY_STOP_ROW_LIVE,
   UNAVAILABLE_RETRY_STOP_SHUTDOWN,
   UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED,
   UNAVAILABLE_RETRY_STOP_TORN_DOWN,
@@ -221,13 +260,17 @@ import {
   ordinaryAlertContent,
   ownRowsLiveThenMissing,
   personaOf,
+  personaRow,
   retryNow,
   scriptLiveRowElsewhere,
+  scriptTimedLaunch,
   startSequenceHeldAtRun,
   type RecoveryHarness,
   type RecoveryHarnessOptions,
   type RecoveryNotice,
   type RecoveryStubScript,
+  type TimedLaunch,
+  type TimedLaunchOptions,
 } from './test-helpers/recovery-harness.ts'
 import { PRE_PERSONA_ID, holdOldAt } from './test-helpers/old-life.ts'
 
@@ -2333,6 +2376,303 @@ describe('tmux-unresponsive: a CONFLICT ends it silently (SRJ-310, SRJ-502)', ()
     expect(h.notices).toEqual([])
     expect(getFailureCount(p)).toBe(0)
     expectNeverStarted(h, b)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SRJ-310's third end rule after a launch timeout (b.jg5 SRJ-310, SRJ-407,
+// SRJ-306): the condition ends once this launch's row (its launch start
+// inside the call's window, established by the one `get` reading it
+// `pending`) is read in a live state other than `pending`, by whichever
+// shared read sees it first
+// ---------------------------------------------------------------------------
+
+/** Both launch-timeout forms (b.jg5 SRJ-407), by the exported form names. */
+const LAUNCH_TIMEOUT_FORMS = [LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT, LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE] as const
+
+/** The live state other than `pending` the cases' row reaches (the stub's default live row). */
+const LIVE_STATE = cannedStatusResult().state
+
+/** How long the timed-out spawn takes on the harness clock: its window's length. */
+const LAUNCH_TAKES_MS = halfFirstWaitMs()
+
+/** P's spawn, timed out, and the row its reads see from then on. */
+interface TimedOutSpawn {
+  readonly launch: TimedLaunch
+  /** From now on P's `status` reads its row in `state`, with the launch start the `get` read. */
+  reads(state: string): void
+}
+
+/**
+ * Persona `key`'s start-pass launch whose spawn takes `LAUNCH_TAKES_MS` and
+ * ends in launch-timeout `form` (`scriptTimedLaunch`, on a harness built with
+ * `harnessNow`), its one `get` reading the row as `options` place it
+ * (`pending`, its launch start inside the window, by default). P's `status`
+ * reads the same row `pending` until `reads` moves it. Unless `paneAnswers`,
+ * tmux stays unresponsive to pane reads: every `read-pane` (the approver's)
+ * is refused UNAVAILABLE, so no tmux-touching success ends the condition by
+ * the first rule before the case's reader reads the row. Resolves once the
+ * launch answered `retrying` (b.jg5 SRJ-407).
+ */
+async function spawnTimingOut(h: RecoveryHarness, key: string, form: LaunchTimeoutForm, options: TimedLaunchOptions = {}, paneAnswers = false): Promise<TimedOutSpawn> {
+  const launch = scriptTimedLaunch(h, key, { end: form, takesMs: LAUNCH_TAKES_MS, ...options })
+  let state: string = AGENT_DIRECTOR_PENDING_STATE
+  const id = personaInstanceId(key)
+  h.script({
+    statusFn: (params) => (params.claude_instance_id === id ? launch.statusRow({ state: state as Phase1StatusResult['state'] }) : cannedStatusResult()),
+    ...(paneAnswers ? {} : { readPaneError: errTmuxUnresponsive('read-pane') }),
+  })
+  expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
+  return {
+    launch,
+    reads(next) {
+      state = next
+    },
+  }
+}
+
+/**
+ * Rule 3's lines for persona `key` reaching `state` (`thisLaunchRowLiveLine`,
+ * with the condition asked to end), at whichever read site: the builder's
+ * own words after the site and the persona reference.
+ */
+function launchRowLiveLines(h: RecoveryHarness, key: string, state: string): string[] {
+  const one = thisLaunchRowLiveLine({ site: 'a', what: 'b' }, 'c', state, true)
+  const other = thisLaunchRowLiveLine({ site: 'x', what: 'y' }, 'z', state, true)
+  let n = 0
+  while (n < one.length && one.at(-1 - n) === other.at(-1 - n)) n++
+  const words = one.slice(one.length - n)
+  return h.errors.filter((line) => line.includes(key) && line.endsWith(words))
+}
+
+/** One health tick's liveness read of persona `key`, as `main()` builds the adapter. */
+function tickRead(h: RecoveryHarness, key: string): Promise<unknown> {
+  return _buildIsSessionAliveAdapter(() => h.config)(key)
+}
+
+/**
+ * A shared read that sees this launch's row live: the reader, the harness
+ * options it needs, what the condition-end entry answers for it, and how it
+ * reads. The approver's cap is above its slow pace for the approver's second
+ * lap; for the other readers it stays below, so the approver stops at its cap
+ * with the row still `pending` before they read.
+ */
+interface RuleThreeReader {
+  readonly options: RecoveryHarnessOptions
+  readonly result: UnavailableRetryConditionEndResult
+  read(h: RecoveryHarness, key: string): Promise<unknown>
+}
+
+const READERS: ReadonlyArray<readonly [string, RuleThreeReader]> = [
+  [
+    'the approver’s next lap',
+    {
+      // A refused pane read backs the approver off to the slow pace before its next lap.
+      options: { approverCapMs: 2 * DIALOG_SLOW_POLL_INTERVAL_MS },
+      result: 'stopped',
+      read: async (h, key) => expect(await h.runApproverToStop(key)).toMatchObject({ reason: APPROVER_STOP_LIVE }),
+    },
+  ],
+  [
+    'a retry (connected with its stream: nothing left to recover)',
+    {
+      options: {},
+      // The retry runs while it ends the condition: the entry defers, and the retry's own stop follows.
+      result: 'deferred',
+      read: async (h, key) => {
+        h.setConnected(key, true)
+        return retryNow(h, key)
+      },
+    },
+  ],
+  ['a health tick’s liveness read', { options: {}, result: 'stopped', read: tickRead }],
+]
+
+describe('tmux-unresponsive: SRJ-310’s third end rule after a launch timeout (SRJ-310, SRJ-407)', () => {
+  test.each(LAUNCH_TIMEOUT_FORMS.map((form) => [form] as const))('a spawn ending in a launch timeout (%s) starts P’s condition when its answer reaches CSCB, at its window’s end; its one get reading this launch’s row pending ends nothing, nor do the approver’s lap and a tick reading it still pending; B’s never starts', async (form) => {
+    const { h, p, b } = build({ harnessNow: true })
+
+    const { launch } = await spawnTimingOut(h, p, form)
+
+    const window = launch.window()!
+    expect(window.endMs! - window.startMs).toBe(LAUNCH_TAKES_MS)
+    expectHolds(h, p, 'spawn', window.endMs!)
+    expect(thisLaunchRowOf(p)).toEqual({ launchStartMs: Date.parse(launch.launchStartedAt()!), window: launchCallWindowOf(p)! })
+    // The approver started on the covered row reads it pending at its lap, and stops at its cap.
+    expect(await h.runApproverToStop(p)).toMatchObject({ reason: APPROVER_STOP_CAP })
+    await tickRead(h, p)
+    expect(h.stub.calls.statusCalls.length).toBeGreaterThanOrEqual(2)
+
+    expectHolds(h, p, 'spawn', window.endMs!)
+    expect(thisLaunchRowOf(p)).toBeDefined()
+    expect(h.conditionEnds).toEqual([])
+    expect(launchRowLiveLines(h, p, LIVE_STATE)).toEqual([])
+    expectNeverStarted(h, b)
+    expectNoPostYet(h)
+  })
+
+  const readerCases = READERS.flatMap(([what, reader], i) =>
+    [false, true].map((withOnset) => [what, withOnset ? 'after its onset' : 'with no notice posted', LAUNCH_TIMEOUT_FORMS[i % 2]!, reader, withOnset] as const),
+  )
+
+  test.each(readerCases)('%s reading this launch’s row live other than pending, %s (a launch timeout, %s): the condition ends once with rule 3’s reason, the recovery posted only after a notice; the condition-end entry is called once with the live reading and the timer stops; a later read ends nothing more', async (_what, _when, form, reader, withOnset) => {
+    const { h, p, b } = build({ harnessNow: true, healthCheckInterval: HEALTH_CHECK_S, ...reader.options })
+    const { reads } = await spawnTimingOut(h, p, form)
+    const at = h.tmuxUnresponsive.firstRefusalAt(p)!
+    // The approver's first lap reads the row pending.
+    await h.settle()
+    const lines: string[] = []
+    if (withOnset) {
+      await h.advance(1)
+      tick(h)
+      expectPosts(h, [onset(p)])
+      lines.push(conditionOnsetLine(p, 'a health tick', h.clock.now() - at))
+    }
+    if (reader !== READERS[0]![1]) expect(await h.runApproverToStop(p)).toMatchObject({ reason: APPROVER_STOP_CAP })
+    expect(h.tmuxUnresponsive.holds(p)).toBe(true)
+    reads(LIVE_STATE)
+
+    await reader.read(h, p)
+
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+    expect(thisLaunchRowOf(p)).toBeUndefined()
+    lines.push(conditionEndedLine(p, TMUX_UNRESPONSIVE_END_LAUNCH_ROW_LIVE), ...(withOnset ? [conditionRecoveryLine(p)] : []))
+    expect(noticeAndEndLines(h, p)).toEqual(lines)
+    expectPosts(h, withOnset ? [onset(p), recovery(p)] : [])
+    expect(h.conditionEnds).toEqual([{ key: p, reading: LIVE_STATE, result: reader.result }])
+    expect(launchRowLiveLines(h, p, LIVE_STATE)).toHaveLength(1)
+    expect(h.controller.isArmed(p)).toBe(false)
+
+    // A later read of the same live row, and a tick's healthy branch, end nothing more.
+    await tickRead(h, p)
+    expect(h.tickEnd(p)).toBe('not-holding')
+    expect(conditionEndedLines(h, p)).toHaveLength(1)
+    expect(h.conditionEnds).toHaveLength(1)
+    expect(launchRowLiveLines(h, p, LIVE_STATE)).toHaveLength(1)
+    expect(getFailureCount(p)).toBe(0)
+    expectNeverStarted(h, b)
+  })
+
+  test('an approver lap whose read-pane succeeds ends the condition first, by the first rule (a tmux-touching success), with this launch’s row still pending; the row read live afterwards ends nothing more', async () => {
+    const { h, p } = build({ harnessNow: true })
+    const { reads } = await spawnTimingOut(h, p, LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE, {}, true)
+    await h.settle()
+
+    expect(h.stub.calls.readPaneCalls).toHaveLength(1)
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+    expect(conditionEndedLines(h, p)).toEqual([conditionEndedLine(p, TMUX_UNRESPONSIVE_END_TMUX_VERB)])
+    expect(thisLaunchRowOf(p)).toBeDefined()
+    expect(await h.runApproverToStop(p)).toMatchObject({ reason: APPROVER_STOP_CAP })
+    reads(LIVE_STATE)
+
+    await tickRead(h, p)
+
+    expect(thisLaunchRowOf(p)).toBeUndefined()
+    expect(conditionEndedLines(h, p)).toHaveLength(1)
+    expect(h.conditionEnds).toEqual([{ key: p, reading: undefined, result: 'kept' }])
+    expectNoPostYet(h)
+  })
+
+  test('with a kill-failure cause recorded, rule 3’s end reaches the condition-end entry once and the timer is kept with its due time', async () => {
+    const { h, p } = build({ harnessNow: true })
+    h.controller.arm(p, { kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED })
+    const { reads } = await spawnTimingOut(h, p, LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT)
+    expect(await h.runApproverToStop(p)).toMatchObject({ reason: APPROVER_STOP_CAP })
+    const before = h.controller.view(p)!
+    reads(LIVE_STATE)
+
+    await tickRead(h, p)
+
+    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
+    expect(conditionEndedLines(h, p)).toEqual([conditionEndedLine(p, TMUX_UNRESPONSIVE_END_LAUNCH_ROW_LIVE)])
+    expect(h.conditionEnds).toEqual([{ key: p, reading: LIVE_STATE, result: 'kept' }])
+    expect(h.controller.view(p)).toEqual({ ...before, lastRow: LIVE_STATE })
+    expect(h.clock.pending().map((t) => t.dueAt)).toEqual([before.dueAt!])
+  })
+
+  // Rule 3 ends nothing unless a `pending` read established this launch's
+  // row: the row read afterwards is not this launch's, or the outcome was no
+  // launch timeout. A first read already live other than `pending` is left to
+  // rules 1 and 2 (here a health tick's healthy branch).
+  test.each<[string, (h: RecoveryHarness, key: string) => Promise<TimedOutSpawn | undefined>]>([
+    ['a launch start before the call’s window', (h, key) => spawnTimingOut(h, key, LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT, { launchStart: 'before' })],
+    ['a launch start after the call’s window', (h, key) => spawnTimingOut(h, key, LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE, { launchStart: 'after' })],
+    ['a first get that already reads the row live (no pending read)', (h, key) => spawnTimingOut(h, key, LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT, { row: { state: LIVE_STATE } })],
+    ['an UNAVAILABLE outcome that is no launch timeout (ErrTmuxUnresponsive, still stopping), its get reading the row pending', async (h, key) => {
+      h.script({ spawnError: errTmuxUnresponsiveStillStopping('spawn'), getResult: personaRow(h, key, { state: AGENT_DIRECTOR_PENDING_STATE }) })
+      expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
+      return undefined
+    }],
+  ])('%s: no record of this launch’s row, and a later read of the row live ends nothing; a tick’s healthy branch (rule 2) still ends it', async (_what, launch) => {
+    const { h, p, b } = build({ harnessNow: true })
+
+    const timed = await launch(h, p)
+
+    expect(thisLaunchRowOf(p)).toBeUndefined()
+    expect(h.tmuxUnresponsive.holds(p)).toBe(true)
+    if (timed === undefined) h.script({ statusResult: cannedStatusResult({ state: LIVE_STATE }) })
+    else timed.reads(LIVE_STATE)
+    await h.runApproverToStop(p)
+    await tickRead(h, p)
+
+    expect(h.tmuxUnresponsive.holds(p)).toBe(true)
+    expect(h.conditionEnds).toEqual([])
+    expect(conditionEndedLines(h, p)).toEqual([])
+    expect(launchRowLiveLines(h, p, LIVE_STATE)).toEqual([])
+
+    expect(h.tickEnd(p)).toBe('ended')
+    expect(conditionEndedLines(h, p)).toEqual([conditionEndedLine(p, TMUX_UNRESPONSIVE_END_TICK)])
+    expectNeverStarted(h, b)
+    expectNoPostYet(h)
+  })
+})
+
+// The E10 note on E28 (b.jg5 SRJ-303, SRJ-309): a pending-only retry that
+// reads the row live but not connected stops the timer while the condition
+// still holds; no "keeps retrying" alert may post while no timer runs.
+describe('tmux-unresponsive: a pending-only stop while the condition holds leaves no alert to post with no timer running (SRJ-303, SRJ-309)', () => {
+  test('with the health check off, a pending-only retry reading P’s row live but not connected stops the timer and cancels its alert check with one line; nothing posts past the threshold while no timer runs; a later refusal arms the check again from the first refusal, and the alert then posts once', async () => {
+    const { h, p } = build({ action: 'scripted' })
+    expect(h.config.health_check_interval).toBe(0)
+    const thresholdMs = adAlertThresholdMsInEffect()
+    const at = h.clock.now()
+    expect(h.tmuxUnresponsive.start(p, 'read-pane', errTmuxUnresponsive('read-pane'))).toBe('started')
+    h.controller.armPendingOnly(p)
+    h.setConnected(p, false)
+
+    // Only this retry runs the server's action; its row read finds the row live (the stub's default row).
+    h.setAction(h.fullModeAction)
+    const calls = callCounts(h)
+    await retryNow(h, p)
+    h.setAction(h.scriptedAction)
+
+    expect(callCountsSince(callCounts(h), calls)).toEqual({ statusCalls: 1 })
+    expect(h.stops).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_ROW_LIVE }])
+    expect(h.controller.isArmed(p)).toBe(false)
+    expect(h.tmuxUnresponsive.holds(p)).toBe(true)
+    expect(noticeAndEndLines(h, p)).toEqual([alertCancelledLine(p, UNAVAILABLE_RETRY_STOP_ROW_LIVE)])
+    expect(h.clock.pendingCount()).toBe(0)
+
+    // Past the floor, with no timer running, no retry posts the onset either.
+    await h.advance(at + thresholdMs / 2 - h.clock.now())
+    expect(h.clock.now() - at).toBeGreaterThanOrEqual(FLOOR_MS)
+    expectPosts(h, [])
+    expect(h.attempts).toHaveLength(1)
+    await refuse(h, p)
+    expect(h.controller.isArmed(p)).toBe(true)
+    expect(h.tmuxUnresponsive.firstRefusalAt(p)).toBe(at)
+    const lines = [alertCancelledLine(p, UNAVAILABLE_RETRY_STOP_ROW_LIVE), alertRearmedLine(p)]
+    expect(noticeAndEndLines(h, p)).toEqual(lines)
+
+    // The refusal re-armed the timer: its first retry, past the floor, posts the onset.
+    const firedAt = await nextRetry(h, p)
+    expectPosts(h, [onset(p)])
+    lines.push(conditionOnsetLine(p, 'a retry', firedAt - at))
+    await h.advance(at + thresholdMs - h.clock.now())
+    expectPosts(h, [onset(p)])
+    await h.advance(1)
+    expectPosts(h, [onset(p), alert(p, thresholdMs)])
+    expect(noticeAndEndLines(h, p)).toEqual([...lines, conditionAlertLine(p, thresholdMs + 1, thresholdMs)])
   })
 })
 
