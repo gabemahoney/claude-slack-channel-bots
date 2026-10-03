@@ -660,8 +660,8 @@ export function resolveRealPathStrict(path: string, fs?: Partial<StrictRealPathF
  * The current file is read tolerantly and not validated, so a file with an
  * invalid edit still protects the paths it names. It is read through
  * `readPersonaConfigBytes`, so a path that is not a regular file (a FIFO or a
- * device) is never read. It is the one read of that reader without the 64 KiB
- * cap (`uncapped`): a configuration file larger than `MAX_RELOAD_FILE_BYTES`
+ * device) is never read. It reads without the 64 KiB cap (`uncapped`, as the
+ * retired-key record's read does): a configuration file larger than `MAX_RELOAD_FILE_BYTES`
  * still protects the paths it names, so the cap never shrinks what the guard
  * refuses. An unreadable or non-regular file, unparseable JSON, or a file
  * without a `personas` array contributes nothing; this never throws. The
@@ -1572,12 +1572,15 @@ export const CONFIG_NOT_REGULAR_FILE_CODE = 'not a regular file'
  * `config.json.apply` (`readPersonaConfigBytes`), and a credentials file
  * (`readCredentialsFile` in `persona-credentials.ts`). A larger file is
  * refused as unreadable and never read past `MAX_RELOAD_FILE_BYTES + 1`
- * bytes. No legitimate file comes near it; the cap bounds the memory and
- * hashing work a file grown by mistake could cost. Applied in the readers
+ * bytes. No legitimate capped file comes near it; the cap bounds the memory
+ * and hashing work a file grown by mistake could cost. Applied in the readers
  * rather than by one caller, so the start, the bring-up and the reload tick
  * see the same outcome (and the same credentials digest marker) for one file.
- * One read is exempt: the SR-5.2 file guard's read of the configuration file
- * (`credentialsFilesToProtect`, `readPersonaConfigBytes` with `uncapped`).
+ * Two reads are exempt (`readPersonaConfigBytes` with `uncapped`): the SR-5.2
+ * file guard's read of the configuration file (`credentialsFilesToProtect`),
+ * and the start's read of the retired-key record (`loadRetiredKeyStore` in
+ * `retired-keys.ts`), a file only the server writes that can legitimately
+ * grow past the cap, read once at start and never hashed or compared.
  */
 export const MAX_RELOAD_FILE_BYTES = 64 * 1024
 
@@ -1599,7 +1602,7 @@ export const FILE_TOO_LARGE_CODE = 'EFBIG'
  * Returns a buffer of exactly the bytes read. Throws an errno-style error
  * (with `code`) on failure. The real-fs bounded read of both shared readers;
  * `maxBytes` defaults to one byte more than the readers' limit. A `maxBytes`
- * of `Infinity` is the one unbounded read: the whole file, to end of file
+ * of `Infinity` is an unbounded read: the whole file, to end of file
  * (`readPersonaConfigBytes` with `uncapped`).
  */
 export function readFdAtMost(fd: number, maxBytes: number = MAX_RELOAD_FILE_BYTES + 1): Buffer {
@@ -1672,9 +1675,10 @@ export interface PersonaConfigFs {
 /** How `readPersonaConfigBytes` reads. */
 export interface ReadPersonaConfigBytesOptions {
   /**
-   * Read the whole file, with no `MAX_RELOAD_FILE_BYTES` cap. Only the SR-5.2
-   * file guard's read (`credentialsFilesToProtect`) sets it; every other
-   * caller stays capped. Stat-first is unchanged: a directory or a
+   * Read the whole file, with no `MAX_RELOAD_FILE_BYTES` cap. Only two reads
+   * set it: the SR-5.2 file guard's read (`credentialsFilesToProtect`) and
+   * the start's read of the retired-key record (`loadRetiredKeyStore`); every
+   * other caller stays capped. Stat-first is unchanged: a directory or a
    * non-regular file is still refused and never read.
    */
   uncapped?: boolean
@@ -1776,16 +1780,21 @@ export function parsePersonaConfigBytes(
  * so a file that grows after the stat, or a stat that under-reports, is still
  * refused and never read in full.
  *
- * The one exception is `options.uncapped`, set only by the SR-5.2 file guard
- * (`credentialsFilesToProtect`): the file guard must never protect fewer
- * credentials files because the configuration file grew past the cap, so
- * that read has no size limit and reads the whole file (stat-first still
- * applies). Every other caller (the start, the record, the pending and apply
- * files, the reload tick) is capped.
+ * The exception is `options.uncapped`, which reads the whole file with no size
+ * limit (stat-first still applies). Two reads set it: the SR-5.2 file guard
+ * (`credentialsFilesToProtect`), which must never protect fewer credentials
+ * files because the configuration file grew past the cap; and the start's
+ * read of the retired-key record (`loadRetiredKeyStore` in
+ * `retired-keys.ts`), a file only the server writes, which grows with every
+ * retired key until a clear or a restore removes it, is read once at start
+ * and is never hashed or compared, so a record past the cap is still one the
+ * server wrote and must not stop the start. Every other caller (the start's
+ * configuration file, the last-applied record, the pending and apply files,
+ * the reload tick) is capped.
  *
  * @param configPath  Absolute path of the file.
  * @param fs          File-system overrides; unset operations use `DEFAULT_PERSONA_CONFIG_FS`.
- * @param options     `uncapped` for the file guard's read only.
+ * @param options     `uncapped` for the file guard's and the retired-key record's reads only.
  */
 export function readPersonaConfigBytes(
   configPath: string,

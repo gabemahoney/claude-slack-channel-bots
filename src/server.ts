@@ -327,6 +327,7 @@ import { handleInterject } from './interject.ts'
 import { createCronScheduler, type CronScheduler } from './cron-scheduler.ts'
 import { configInEffect, createReloadController, reloadFilePaths, type ReloadController } from './reload.ts'
 import { createReloadTickDriver } from './reload-timer.ts'
+import { readRetiredKeysAtStart, type RetiredKeyStore } from './retired-keys.ts'
 import { PRODUCTION_SLACK_CLIENT_FACTORY } from './persona-slack-clients.ts'
 import { initOutageState, getOutageFlags, setOutageFlag, clearOutageFlag, raiseAdConfigMalformed, raiseTmuxUnavailable, resetAllToHealthy, withOutageDetection, reportAgentDirectorError } from './outage-state.ts'
 
@@ -2784,6 +2785,21 @@ export async function main(): Promise<void> {
   // (crontable bootstrap now happens later, inside the scheduler started after
   // Bun.serve). A duplicate start must fail fast without mutating shared state.
   checkPidConflict(PID_FILE)
+
+  // b.jg5 SRJ-801, SRJ-802: the retired-key record (retired-keys.json in the
+  // state directory) is read once here, after the PID check (so a duplicate
+  // start reads nothing) and before the reload controller's start resolution
+  // below (which can write config.json.last-applied), the start sweep and
+  // every bring-up; in dry run too. A record that exists but cannot be read,
+  // parsed or validated records one retired-keys-unreadable startup-errors
+  // entry naming the file and the move-aside remedy, and the start stops here,
+  // before any port, PID file, Slack connection, sweep, launch or last-applied
+  // write: the start never guesses. Otherwise `retiredKeys` is the server's
+  // one store: only the server writes the file, through it, and nothing else
+  // builds a store.
+  const retiredKeysStart = readRetiredKeysAtStart(STATE_DIR, { log: (line) => console.error(line) })
+  if (retiredKeysStart.kind === 'refused') process.exit(1)
+  const retiredKeys: RetiredKeyStore = retiredKeysStart.store
 
   // The agent-director store owns session-id state; CSCB's own sessions.json
   // registry was deleted (SR-7.1, Epic 2).

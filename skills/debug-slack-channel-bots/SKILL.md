@@ -99,6 +99,8 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    [Configuration rejections](#configuration-rejections). A
    `Fatal: last-applied record error` line or a `reload-record-write-failed`
    line is covered under [The last-applied record](#the-last-applied-record).
+   A `[retired-keys-unreadable]` line is covered under
+   [The retired-key record can't be read or is invalid](#the-retired-key-record-cant-be-read-or-is-invalid).
    A first start that failed binding its port, then failed the same way after
    `config.json` was fixed, is covered under
    [A first start that fails after recording](#a-first-start-that-fails-after-recording).
@@ -239,7 +241,8 @@ ls -l "$STATE"/server.log*
   unexpectedly prints the raw error.
 - **`startup-errors.log`** in the same directory is a separate file, never
   rotated by CSCB. Most entries are written at start: the agent-director
-  startup gate and a few start-time warnings. Some are written while the
+  startup gate, the retired-key record's refusal
+  (`retired-keys-unreadable`) and a few start-time warnings. Some are written while the
   server runs: the runtime version re-check's stop (see
   [Found while the server was running](#found-while-the-server-was-running))
   and `persona-unclassified-error`, the *Unclassified agent-director error*
@@ -2929,6 +2932,7 @@ grep -h -E '(kill try [0-9]+ of [0-9]+|status read before kill try [0-9]+|kill t
 | `[slack] persona-destination-hold: persona or client lookup threw for persona=<key>: … — held notices wait and retry with backoff` | An internal error while retrying the persona's held notices. They keep waiting and are retried with backoff. Report it as a bug, with the persona's lines around it. |
 | `[slack] Fatal: configuration error — …` | There was no last-applied record, and the server refused `config.json` and exited. See [Configuration rejections](#configuration-rejections). |
 | `[slack] Fatal: last-applied record error — …` | The server couldn't read or validate its last-applied record and exited. See [The last-applied record can't be read or is invalid](#the-last-applied-record-cant-be-read-or-is-invalid). |
+| `[<timestamp>] [retired-keys-unreadable] The retired-key record "<path>" …` | The server couldn't read, parse or validate its retired-key record and exited 1. See [The retired-key record can't be read or is invalid](#the-retired-key-record-cant-be-read-or-is-invalid). |
 | `[slack] Starting from the last-applied record "<path>"` or `[slack] No last-applied record: recorded the configuration file "<path>" as "<path>"` | Which configuration a start runs. See [The last-applied record](#the-last-applied-record). |
 | `[slack] agent-director version re-check: the runtime re-check could not run: <description>; the server keeps running and checks again at the next 120 s re-check` | The server's 120 s check of the agent-director binary couldn't run: the binary is missing, unreadable, unreachable, or didn't answer within 30 s. `<description>` says which (an error name such as `ErrSystemInstallUnreachable (reason <reason>, binary at <path>)`, or `no answer within the 30 s time limit`). Nothing changes: the server keeps running and checks again every 120 s. One line per run of failures: the first failure after start, or after a check that passed, logs it, and the failures after it log nothing until a check passes. Nothing goes to `startup-errors.log` or Slack. If the line keeps coming back, check that the agent-director binary is present and executable. If a later check finds a version the server refuses, the server stops as in [Found while the server was running](#found-while-the-server-was-running). |
 | `[slack] agent-director settings: the read of "<path>" was refused: <reason>; <kept> stay in effect until a read is accepted (b.jg5 SRJ-209)` | The server refused agent-director's timing settings file and keeps its last accepted values (`the defaults` at start). One line per run of refused reads. See [agent-director's timing settings](#agent-directors-timing-settings). |
@@ -4024,6 +4028,39 @@ or a filesystem that doesn't support syncing a directory).
 - **Warning:** Deleting the record makes the next start run whatever is in
   `config.json` now, including any edit that was never applied. Read
   `config.json` before deleting the record.
+
+### The retired-key record can't be read or is invalid
+
+The server keeps the persona keys it holds as retired in `retired-keys.json`,
+in the state directory beside `config.json.last-applied`. Only the server
+writes it; it is absent until a key is first recorded. Never edit it.
+
+- **Line:** `[<timestamp>] [retired-keys-unreadable] The retired-key record "<path>" <problem>, so the server does not start: it never guesses which persona keys are retired. Moving the file aside (for example, renaming it) lets the server start, at the cost that the keys it held are no longer retired, so a persona whose key it held may resume the conversation of the life that was retired.`
+  The same line is in `startup-errors.log` and `server.log`.
+- **Cause:** `<problem>` is one of:
+  - `cannot be read (<errno>)`: the server's user can't read the file, or the
+    path is a directory (`EISDIR`); `(not a regular file)` means a FIFO,
+    socket or device, which is never read;
+  - `is not valid UTF-8`, or `is not valid JSON at line <L>, column <C>`: the
+    file was edited or damaged;
+  - `is invalid: …`: the JSON breaks a rule of the format (a missing or
+    unknown field, a `version` other than 1, a cause or time it doesn't
+    accept); an entry is named by its position in `keys`, never by its key.
+- **Effect:** The server exits 1 before it records the configuration,
+  writes its PID file, connects to Slack or launches anything. The start
+  never guesses which keys are retired.
+- **Fix:** If it can't be read, make it a readable regular file and start
+  again; the record is kept. Otherwise, with the operator's say-so, move it
+  aside and start:
+
+  ```sh
+  STATE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+  mv "$STATE/retired-keys.json" "$STATE/retired-keys.json.moved-aside"
+  ```
+
+- **Cost:** The keys the moved file held are no longer retired, so a persona
+  whose key it held may resume the conversation of the life that was retired.
+  Keep the moved file for the operator to read.
 
 ---
 

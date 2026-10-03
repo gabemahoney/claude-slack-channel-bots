@@ -536,6 +536,7 @@ These files sit in the same directory as `config.json` (`~/.claude/channels/slac
 | `config.json.last-applied` | The record: a byte copy of the last configuration the server applied. The server writes it. |
 | `config.json.pending` | A preview of what applying the edit would do, written by the server. It exists only while a change is pending. |
 | `config.json.apply` | Your confirmation: the pending file, renamed. The server deletes it at its next check (see [Confirming a change](#confirming-a-change)). |
+| `retired-keys.json` | The retired-key record: the persona keys the server holds as retired. Only the server writes it, never the CLI. It is kept across restarts and is absent until a key is first recorded. If it can't be read, the server doesn't start; moving it aside is the fix (see `retired-keys-unreadable` under [Startup errors](#startup-errors)). |
 
 ### Start rules
 
@@ -678,7 +679,7 @@ To fix it, wait for the server to write `config.json.pending` again (within abou
 
 ### Size limit
 
-`config.json`, the files beside it and each credentials file are read only up to 64 KiB; a larger file is treated as unreadable. If a very large change makes `config.json.pending` itself larger, its rename is refused as stale, so split the change into smaller edits.
+`config.json`, the files beside it and each credentials file are read only up to 64 KiB; a larger file is treated as unreadable. The retired-key record (`retired-keys.json`) has no size cap: only the server writes it. If a very large change makes `config.json.pending` itself larger, its rename is refused as stale, so split the change into smaller edits.
 
 ### No reload command
 
@@ -1700,6 +1701,12 @@ Fatal classes you may see:
 - `ad-same-user` — `~/.agent-director/state.db` is owned by a different UID than the CSCB process. Reinstall agent-director as the correct user or remove the mismatched file.
 - `ad-same-user-stat` — Non-ENOENT stat error on the state DB (permissions, I/O). Investigate the file before re-launching.
 - `ad-template-install` — `client.makeTemplate(...)` rejected the boot-time refresh of the `slack-channel-bot` template. The line names the template and includes agent-director's error name and its description.
+- `retired-keys-unreadable` — the retired-key record, `retired-keys.json` in the state directory, exists but can't be read, parsed or validated (it was edited or damaged, or the path isn't a regular file), so the server doesn't start: it never guesses which persona keys are retired. The entry names the file and what is wrong with it. Moving the file aside lets the server start, at the cost that the keys it held are no longer retired, so a persona whose key it held may resume the conversation of the life that was retired:
+
+  ```sh
+  STATE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+  mv "$STATE/retired-keys.json" "$STATE/retired-keys.json.moved-aside"
+  ```
 
 **Found while the server was running.** `ad-system-install-too-old` and `ad-below-phase1-floor` can also be written by the runtime re-check: while the server runs, it re-checks the agent-director binary every 120 s, whatever `health_check_interval` is (`0` included), and stops with a non-zero exit when the binary fails either check. The entry names the version found, the version required, the binary path and that it was found by a runtime re-check while the server was running, so the server stopped. The stop posts nothing to Slack and leaves every bot and its agent-director row as it was: the bots keep running, but nothing serves them. Follow the README section "Switching over to agent-director Phase 1", then start the server again.
 

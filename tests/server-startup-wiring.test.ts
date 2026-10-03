@@ -81,6 +81,16 @@
  *   start's configuration resolution and the settings install, and before the
  *   template install and the start bring-up, with the start-time applied
  *   config as its only argument; it is on no tick and no timer.
+ * - b.jg5 SRJ-801 / SRJ-802: the retired-key record's start read
+ *   (`readRetiredKeysAtStart`) is called once, bound to a const in main()'s
+ *   own statement list (so in dry run too), over the server state directory
+ *   (`STATE_DIR`) with only a log of its own, after the startup gate and the
+ *   PID check and before the reload controller, its start resolution (which
+ *   can write the last-applied record), the start sweep, the start bring-up,
+ *   the PID file, the connection manager and `Bun.serve`; a refused read
+ *   exits 1 in the next statement, and the loaded store is bound once, the
+ *   one store; server.ts names the file only through the module and builds no
+ *   other store, and no other src file reads the record at start.
  * - b.jg5 SRJ-301 / SRJ-305: one UNAVAILABLE retry controller is built in
  *   main()'s own statement list on the production clock, held in the one
  *   module-scope handle, and installed as the trigger sink of the one
@@ -332,6 +342,8 @@ import type {
   InvalidFlagsHoldVersionChangeDeps,
 } from '../src/invalid-flags-hold.ts'
 import type { PendingLivenessReading } from '../src/liveness-reading.ts'
+import { RETIRED_KEYS_FILE_NAME } from '../src/retired-keys.ts'
+import type * as RetiredKeysModule from '../src/retired-keys.ts'
 import type * as ConflictLatchModule from '../src/conflict-latch.ts'
 import type { ConflictLatch, ConflictLatchDeps, ConflictLatchHolds } from '../src/conflict-latch.ts'
 import type * as PersonaEpisodesModule from '../src/persona-episodes.ts'
@@ -1444,6 +1456,103 @@ describe('main() runs the call-timeout start step once, after the startup gate, 
 
     const body = SERVER_CODE.slice(...stepBody())
     expect(body).toMatch(/\{\s*\.\.\.PRODUCTION_CALL_TIMEOUT_START_STEP_DEPS\s*,\s*\.\.\.deps\s*\}/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: the retired-key record's start read (b.jg5 SRJ-801, SRJ-802)
+//
+// What the read does (a missing file, each unreadable form and its one
+// startup-errors entry, the store) is driven through the module in
+// tests/retired-keys.test.ts. What only server.ts holds is where main() reads
+// the record, over which directory, that a refusal exits, and that main()
+// holds the one store.
+// ---------------------------------------------------------------------------
+
+describe('main() reads the retired-key record once, behind no branch, after the PID check and before the start resolution, the start sweep and the start bring-up, exits on a refusal and holds the one store (b.jg5 SRJ-801, SRJ-802)', () => {
+  /** The start read; typed against its module, so a rename fails the typecheck. */
+  const START_READ: keyof typeof RetiredKeysModule = 'readRetiredKeysAtStart'
+  /** What else could build a store, or name or write the file; typed against the module. */
+  const OTHER_RECORD_NAMES: ReadonlyArray<keyof typeof RetiredKeysModule> = [
+    'loadRetiredKeyStore',
+    'retiredKeysPath',
+    'serializeRetiredKeys',
+    'parseRetiredKeys',
+    'RETIRED_KEYS_FILE_NAME',
+  ]
+
+  /** The `const <outcome> = readRetiredKeysAtStart(` binding: its name and the call's offset. */
+  const startRead = (): { outcome: string; at: number } => ({ outcome: constOf(START_READ), at: onlyCallOf(START_READ) })
+
+  test('imports the start read from the record module, declares it nowhere, and binds its one call to a const in main()\'s own statement list (so in dry run too)', () => {
+    expect(importSource(SERVER_CODE, START_READ)).toBe('./retired-keys.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${START_READ}\\b`, 'g'), SERVER_CODE)).toEqual([])
+    expect(indicesOf(new RegExp(`\\b${START_READ}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
+    const { outcome, at } = startRead()
+    const decl = SERVER_CODE.slice(0, at).search(new RegExp(`\\bconst\\s+${outcome}\\b[^=]*=\\s*$`))
+    expect(decl).toBeGreaterThanOrEqual(0)
+    expect(atMainTopLevel(SERVER_CODE, decl)).toBe(true)
+  })
+
+  test('reads over the server state directory (STATE_DIR, resolveServerStateDir()) with only a log to console.error, so production\'s reader, writer, clock and startup-errors recorder are used', () => {
+    expect(SERVER_CODE).toMatch(/^const\s+STATE_DIR\s*=\s*resolveServerStateDir\s*\(\s*\)/m)
+    const args = onlyCallArgs(START_READ)
+    expect(args).toHaveLength(2)
+    expect(args[0]).toBe('STATE_DIR')
+    const props = objectProperties(args[1]!)
+    expect([...props.keys()]).toEqual(['log'])
+    expect(props.get('log')).toMatch(/^\(\s*(\w+)\s*\)\s*=>\s*console\.error\(\s*\1\s*\)$/)
+  })
+
+  test('a refused read exits 1 in the next statement, and the loaded store is bound once, to a const, from the outcome', () => {
+    const { outcome, at } = startRead()
+    const [, argsEnd] = balancedAfter(SERVER_CODE, at, '(', ')')
+    const after = SERVER_CODE.slice(argsEnd + 1)
+    const sequence = new RegExp(
+      `^\\s*;?\\s*if\\s*\\(\\s*${outcome}\\s*\\.\\s*kind\\s*===\\s*'refused'\\s*\\)\\s*\\{?\\s*process\\s*\\.\\s*exit\\s*\\(\\s*1\\s*\\)\\s*;?\\s*\\}?\\s*` +
+        `const\\s+(\\w+)(?:\\s*:\\s*\\w+)?\\s*=\\s*${outcome}\\s*\\.\\s*store\\b`,
+    )
+    const match = after.match(sequence)
+    expect(match).not.toBeNull()
+    declaredOnce(match![1]!)
+    // The outcome is named only at its binding, the refusal check and the store's binding.
+    expect(indicesOf(new RegExp(`\\b${outcome}\\b`, 'g'), SERVER_CODE)).toHaveLength(3)
+  })
+
+  test.each<[string, () => number]>([
+    ['the startup gate (runAgentDirectorStartupGate)', () => onlyCallOf('runAgentDirectorStartupGate')],
+    ['the PID check (checkPidConflict)', () => onlyCallOf('checkPidConflict')],
+  ])('reads AFTER %s', (_label, anchor) => {
+    expect(startRead().at).toBeGreaterThan(anchor())
+  })
+
+  // The start sweep (reconcileOrphans) runs inside the start bring-up, which
+  // the controller runs after the start resolution; its call is also later in
+  // the source.
+  test.each<[string, () => number[]]>([
+    ['the reload controller (createReloadController)', () => [startResolution(SERVER_CODE).createAt]],
+    ['the start resolution, which can write the last-applied record (<controller>.resolveStart)', () => [startResolution(SERVER_CODE).resolveAt]],
+    ['the start sweep (reconcileOrphans)', () => callsOf('reconcileOrphans')],
+    ['the start bring-up (<controller>.runStartBringUp)', () => [startResolution(SERVER_CODE).bringUpAt]],
+    ['the PID file (writePidFile)', () => callsOf('writePidFile')],
+    ['the connection manager (createPersonaConnectionManager)', () => callsOf('createPersonaConnectionManager')],
+    ['Bun.serve', () => callsOf('Bun\\.serve')],
+  ])('reads BEFORE %s', (_label, anchors) => {
+    const later = anchors()
+    expect(later.length).toBeGreaterThan(0)
+    for (const at of later) expect(startRead().at).toBeLessThan(at)
+  })
+
+  test('main() builds no second store and server.ts names the file only through the module; no other src file reads the record at start or builds a store', () => {
+    for (const name of OTHER_RECORD_NAMES) {
+      expect([name, indicesOf(new RegExp(`\\b${name}\\b`, 'g'), SERVER_CODE)]).toEqual([name, []])
+    }
+    expect(SERVER_CODE.includes(RETIRED_KEYS_FILE_NAME)).toBe(false)
+    const builders = srcFiles()
+      .filter(([path]) => path !== 'src/retired-keys.ts')
+      .filter(([, source]) => new RegExp(`\\b(?:${START_READ}|loadRetiredKeyStore)\\s*\\(`).test(stripComments(source)))
+      .map(([path]) => path)
+    expect(builders).toEqual(['src/server.ts'])
   })
 })
 
@@ -4366,27 +4475,41 @@ describe('server.ts\'s file guard refuses every persona credentials file (b.av2 
     expect(props.get('clientFor')).toBe('clientFor')
   })
 
-  // The 64 KiB cap exempts one read: the file guard's read of the config file,
-  // so an oversized config still protects the credentials files it names
-  // (behaviour in tests/config.test.ts). Every other reader (the start, the
-  // record, the pending and apply files, the reload tick) must stay capped;
-  // this audit fails if any other call site passes the option.
-  test('readPersonaConfigBytes is called uncapped only by credentialsFilesToProtect, and nothing outside config.ts names the option', () => {
+  // The 64 KiB cap exempts two reads: the file guard's read of the config
+  // file, so an oversized config still protects the credentials files it
+  // names (behaviour in tests/config.test.ts), and the start's read of the
+  // retired-key record, which only the server writes, so a record grown past
+  // the cap never stops a start (behaviour in tests/retired-keys.test.ts).
+  // Every other reader (the start's config, the last-applied record, the
+  // pending and apply files, the reload tick) must stay capped; this audit
+  // fails if any other call site passes the option, or names it.
+  test('readPersonaConfigBytes is called uncapped only by credentialsFilesToProtect and loadRetiredKeyStore, and nothing else names the option', () => {
     const files = srcFiles().map(([path, source]) => [path, stripComments(source)] as const)
-    expect(files.filter(([path, code]) => path !== 'src/config.ts' && /\buncapped\b/.test(code)).map(([path]) => path)).toEqual([])
+    const UNCAPPED_SITES: ReadonlyArray<[string, RegExp]> = [
+      ['src/config.ts', /\bexport\s+function\s+credentialsFilesToProtect\s*\(/],
+      ['src/retired-keys.ts', /\bexport\s+function\s+loadRetiredKeyStore\s*\(/],
+    ]
+    const sitePaths = UNCAPPED_SITES.map(([path]) => path)
+    // src/config.ts declares the option; any other file may name it only at its one allowed call.
+    const namesOutsideCalls = files
+      .filter(([path]) => path !== 'src/config.ts')
+      .map(([path, code]) => [path, indicesOf(/\buncapped\b/g, code).length] as const)
+      .filter(([path, count]) => count > (sitePaths.includes(path) ? 1 : 0))
+    expect(namesOutsideCalls).toEqual([])
 
     const withOptions = files.flatMap(([path, code]) =>
       indicesOf(/(?<![\w.$]|function\s+)readPersonaConfigBytes\s*\(/g, code)
         .map((at) => ({ path, code, at, args: splitTopLevel(callArguments(code, at)) }))
         .filter((call) => call.args.length > 2),
     )
-    expect(withOptions.map((c) => [c.path, c.args[2]])).toEqual([['src/config.ts', '{ uncapped: true }']])
-    const { code, at } = withOptions[0]!
-    const guard = code.search(/\bexport\s+function\s+credentialsFilesToProtect\s*\(/)
-    expect(guard).toBeGreaterThan(-1)
-    const [bodyStart, bodyEnd] = balancedAfter(code, balancedAfter(code, guard, '(', ')')[1], '{', '}')
-    expect(at).toBeGreaterThan(bodyStart)
-    expect(at).toBeLessThan(bodyEnd)
+    expect(withOptions.map((c) => [c.path, c.args[2]]).sort()).toEqual(sitePaths.map((path) => [path, '{ uncapped: true }']).sort())
+    for (const [path, fnRe] of UNCAPPED_SITES) {
+      const { code, at } = withOptions.find((c) => c.path === path)!
+      const fn = code.search(fnRe)
+      expect([path, fn]).not.toEqual([path, -1])
+      const [bodyStart, bodyEnd] = balancedAfter(code, balancedAfter(code, fn, '(', ')')[1], '{', '}')
+      expect([path, at > bodyStart && at < bodyEnd]).toEqual([path, true])
+    }
   })
 })
 

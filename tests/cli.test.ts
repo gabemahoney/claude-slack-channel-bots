@@ -13,6 +13,11 @@
  * directory when it exists, otherwise `config.json`), and tears down exactly
  * that configuration's personas, addressing each instance as `cscb_<key>`.
  *
+ * The retired-key record (b.jg5 SRJ-801): only the server writes it. Every
+ * command that acts leaves a record seeded by `writeRetiredKeysRecord`
+ * byte-identical, a marked key whose row the stub client reports live
+ * included, and creates none where there was none.
+ *
  * Isolation (b.av2 SR-13.2): every real path sits under a per-test
  * `mkdtempSync` directory removed in `afterEach`. The token variables are
  * removed for the whole file (restored afterwards), so no case or failure
@@ -92,6 +97,8 @@ import {
 } from '../src/config.ts'
 import { personaInstanceId, personaKey, renderPersonaRef } from '../src/persona-identity.ts'
 import { readAppliedPersonaConfig } from '../src/reload.ts'
+import { RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY, RETIRED_KEY_CAUSE_REMOVED, retiredKeysPath } from '../src/retired-keys.ts'
+import type * as RetiredKeysModule from '../src/retired-keys.ts'
 import {
   APP_TOKEN_PREFIX,
   assertNoLeak,
@@ -104,11 +111,13 @@ import {
 } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import {
+  cannedStatusResult,
   errSystemInstallNotFound,
   errSystemInstallTooOld,
   makePassingGateDeps,
   makeStubClient,
   makeStubCreateClient,
+  type StubClientOptions,
   type StubCreateClientOptions,
 } from './test-helpers/agent-director-stub.ts'
 import { OLD_AD_VERSION } from './test-helpers/agent-director-versions.ts'
@@ -120,6 +129,7 @@ import {
   writeConfigFile,
 } from './test-helpers/persona-config.ts'
 import { reloadTermsIn } from './test-helpers/reload-terms.ts'
+import { writeRetiredKeysRecord } from './test-helpers/retired-keys.ts'
 import {
   balancedAfter,
   callArguments,
@@ -2285,6 +2295,93 @@ describe('credentials <persona>', () => {
     expect(result.stderr).toContain(`credentials: no persona in ${configPath} has that name or key`)
     expect(result.output).not.toContain('bot_token (')
     expect(snapshotTree()).toEqual(before)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The retired-key record: only the server writes it (b.jg5 SRJ-801)
+//
+// The CLI shares modules with the server (src/reload.ts, src/config.ts), so
+// the check is behavioural: each command that acts runs here over a state
+// directory with and without a seeded record. The CLI's own imports are also
+// checked directly.
+// ---------------------------------------------------------------------------
+
+describe('no CLI command writes the retired-key record (b.jg5 SRJ-801)', () => {
+  /** What could build a store or write the record; typed against the module, so a rename fails the typecheck. */
+  const WRITING_NAMES: ReadonlyArray<keyof typeof RetiredKeysModule> = [
+    'loadRetiredKeyStore',
+    'readRetiredKeysAtStart',
+    'serializeRetiredKeys',
+  ]
+
+  /**
+   * The record: the Ops persona's key with its mark set (its row, which the
+   * stub reports live, would clear the entry on a server read; SRJ-807), and
+   * a key with no mark. Answers the file's bytes.
+   */
+  function seedRecord(): Uint8Array {
+    writeRetiredKeysRecord(stateDir, {
+      [personaKey(OPS_NAME)]: { cause: RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY, mark: true },
+      [personaKey('Retired Bot')]: { cause: RETIRED_KEY_CAUSE_REMOVED },
+    })
+    return new Uint8Array(readFileSync(retiredKeysPath(stateDir)))
+  }
+
+  /**
+   * A bundle whose configuration is the last-applied record (copied from
+   * config.json, both with stop_timeout and exit_timeout 0) read by the real
+   * applied-config loader, and whose agent-director verbs are the stub
+   * client's through createDirectorOps; its `status` reports every row live.
+   */
+  function actingDeps(o: Overrides): { b: Bundle; statusCalls: unknown[] } {
+    writeConfigFile(stateDir, makePersonaConfigInput({ personas: [makePersona({ name: OPS_NAME }, root)], stop_timeout: 0, exit_timeout: 0 }, root))
+    writeFileSync(recordPath(), readFileSync(configPath))
+    const statusCalls: NonNullable<StubClientOptions['statusCalls']> = []
+    const client = makeStubClient({ statusResult: cannedStatusResult({ state: 'waiting' }), statusCalls })
+    const ops = createDirectorOps(() => client as unknown as DirectorClient)
+    const b = makeDeps({ loadConfig: appliedLoader, ...ops, ...o })
+    return { b, statusCalls }
+  }
+
+  /** A server up at the first liveness check and gone after. */
+  const upOnce = (): Overrides => {
+    let calls = 0
+    return { serverPid: 4242, isProcessRunning: () => ++calls === 1 }
+  }
+
+  const COMMANDS: Array<[string, () => Overrides, (b: Bundle) => Promise<void>, boolean]> = [
+    ['start (pre-flight and daemon start)', () => ({}), (b) => createCli(b.deps).start(), false],
+    ['stop', upOnce, (b) => createCli(b.deps).stop(), false],
+    ['stop --stop-bots', upOnce, (b) => createCli(b.deps).stop({ stopBots: true }), true],
+    ['clean_restart', () => ({}), (b) => createCli(b.deps).clean_restart(), true],
+    ['credentials <persona>', () => ({}), (b) => createCli(b.deps).credentials([OPS_NAME]), false],
+  ]
+
+  test.each(COMMANDS.flatMap(([label, overrides, run, readsRows]) => [
+    [label, 'a seeded record is left byte-identical', overrides, run, readsRows, true] as const,
+    [label, 'with no record none is created', overrides, run, readsRows, false] as const,
+  ]))('%s: %s', async (_label, _outcome, overrides, run, readsRows, seeded) => {
+    const before = seeded ? seedRecord() : null
+    const { b, statusCalls } = actingDeps(overrides())
+
+    await run(b).catch((err) => { if (!(err instanceof ExitError)) throw err })
+
+    // The command acted: the daemon spawned, the server signalled, the rows
+    // read and torn down, or the script run.
+    expect(b.daemonSpawns.length + b.serverSignals.length + b.credentialsRuns.length + b.spawnCalls.length).toBeGreaterThan(0)
+    if (readsRows) {
+      expect(statusCalls.length).toBeGreaterThan(0)
+      expect(b.killCalls).toEqual([opsId()])
+    }
+    const path = retiredKeysPath(stateDir)
+    if (before === null) expect(existsSync(path)).toBe(false)
+    else expect(new Uint8Array(readFileSync(path)) as Uint8Array).toEqual(before)
+  })
+
+  test('src/cli.ts names no store factory, start read or serialiser of the record module, so it imports none (static)', () => {
+    const code = stripComments(readFileSync(CLI_SOURCE, 'utf-8'))
+    for (const name of WRITING_NAMES) expect([name, indicesOf(new RegExp(`\\b${name}\\b`, 'g'), code)]).toEqual([name, []])
   })
 })
 
