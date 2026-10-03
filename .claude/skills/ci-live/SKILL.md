@@ -9,7 +9,7 @@ allowed-tools: [Bash]
 
 The live, pre-deploy acceptance run of CSCB: every `testplans/b.yko` check that can
 be automated, against the **test workspace** only (never a production workspace),
-in a fresh container built from the `/ci` base (`cscb-ci-base:v4`), with the
+in a fresh container built from the `/ci` base (`cscb-ci-base:v5`), with the
 package under test installed the way a customer installs it. The production
 bots on this host are never touched: the container has its own HOME, config,
 tmux, agent-director store and port, runs on the default docker network (no
@@ -27,6 +27,11 @@ tmux, agent-director store and port, runs on the default docker network (no
 - Never export `ANTHROPIC_*` for this. The container's Claude credentials come
   from `CI_ANTHROPIC_API_KEY`, `CI_ANTHROPIC_BASE_URL`, `CI_ANTHROPIC_MODEL`.
 - Never `bun install` in `ci-live/` without `--ignore-scripts`.
+- Never run the agent-director binary given with `--agent-director-binary`
+  (or any agent-director binary) on the host, and never install, copy or
+  upgrade one there (`~/.agent-director`, `~/.local/bin`, anything on
+  `PATH`, `node_modules`). The runner only reads the given binary and stages
+  a copy in the live image build; its version is checked inside the build.
 - Never run `bun ci-live/run.ts apps --delete-strays` or
   `bun ci-live/run.ts config-token --rotate` unless the operator asks: the
   first deletes apps in the test workspace, the second spends the refresh
@@ -69,19 +74,49 @@ installed Google Chrome, headless; no browser download):
 ## Procedure
 
 1. Check docker (`docker info`) and the `/ci` base image (`docker image inspect
-   cscb-ci-base:v4`; if missing, run `/ci` once).
-2. Gate first: `bun ci-live/run.ts --dry-run`. It reads no secret: a local stub
+   cscb-ci-base:v5`; if missing, run `/ci` once). Check the release
+   candidate's binary, which both runs below stage in the live image: it is
+   `agent-director-linux-amd64` in the directory the operator sets in
+   `CSCB_AD_RC_DIR` (the same variable as `/ci`). Test it by type only,
+   never run it:
+
+   ```bash
+   if [ -z "${CSCB_AD_RC_DIR:-}" ]; then
+     echo "non-runnable: CSCB_AD_RC_DIR is unset: set it to agent-director's release-candidate directory"
+   elif [ ! -f "${CSCB_AD_RC_DIR}/agent-director-linux-amd64" ]; then
+     echo "non-runnable: CSCB_AD_RC_DIR (${CSCB_AD_RC_DIR}) holds no agent-director-linux-amd64: set CSCB_AD_RC_DIR to agent-director's release-candidate directory"
+   else
+     echo "release candidate binary: ${CSCB_AD_RC_DIR}/agent-director-linux-amd64"
+   fi
+   ```
+
+   On a `non-runnable:` line, stop and relay it: the operator sets
+   `CSCB_AD_RC_DIR`. Without `--agent-director-binary` the runner stages the
+   host's own agent-director binary, which the image build refuses while it
+   is not the release candidate, so both runs below always pass the option.
+2. Gate first:
+   `bun ci-live/run.ts --dry-run --agent-director-binary "${CSCB_AD_RC_DIR}/agent-director-linux-amd64"`.
+   It reads no secret: a local stub
    stands in for Slack and fixture pages for the sign-in, install and token
-   pages. It builds the live image (with the host's agent-director binary; a
-   version mismatch with the npm package fails the build, and the reason
-   names the fix), runs the pre-flight, the install, the setup, S2, S3 and
+   pages. It builds the live image with the given binary, which the runner
+   checks by reading only (never runs it) and copies into the build as a
+   named context, and which the build checks against the base's
+   release-candidate client. A binary that is not the release candidate
+   fails the build: the `container` FAIL row says to give the release
+   candidate's binary with `--agent-director-binary`, and `run.log` holds
+   the build's `ERROR:` lines; nothing asks for a change on the host. It
+   then runs the pre-flight, the install (with the
+   swap of the release candidate's client into the installed package and its
+   check), the setup, S2, S3 and
    29a in a real container, the prompt guard's self-test (it must deny a
    stub prompt no check expects), then Teardown, the HOST check, and a
    secrecy scan of every output. Must print `VERDICT: PASS`. It takes about a minute
    (a few when the image is rebuilt), so run it in the foreground (one Bash
    call, timeout 600000). It has its own lock, so it can run beside a real
    run.
-3. The live run: `bun ci-live/run.ts` (about 2–3 hours: most checks wait for
+3. The live run:
+   `bun ci-live/run.ts --agent-director-binary "${CSCB_AD_RC_DIR}/agent-director-linux-amd64"`
+   (about 2–3 hours: most checks wait for
    bot Claudes to answer). It provisions idempotently (the four apps "CSCB
    Test A"–"D" from `slack-app-manifest.yml`, installs, app-level tokens, the
    channels `a-home`, `coordination`, `d-home`), then runs every check in the
@@ -97,6 +132,10 @@ installed Google Chrome, headless; no browser download):
    old, and any prompt a check left open when it ends (Check 27's excepted),
    so one bot Claude's detour doesn't block its persona for the rest of the
    run. A denial is a note, not a FAIL.
+   - `--agent-director-binary <path>`: the agent-director binary to stage in
+     the live image (always the release candidate's, as above). It combines
+     with the flags below, but not with `--provision-only` or `--stage`,
+     which build no image.
    - `--provision-only [--stage apps|install|tokens|channels]`: provisioning only.
    - `--only 1,2,5`: run only these checks. The pre-flight, install, setup and
      Check 1 always run, as later checks need their state, and so do 29a,
@@ -121,7 +160,7 @@ installed Google Chrome, headless; no browser download):
    ```bash
    ID=$(date +%s); LOG="/tmp/cscb-live-run-$ID.log"
    tmux -L cscb-live new-session -d -s "cscb-live-run-$ID" \
-     "cd '$PWD' && bun ci-live/run.ts 2>&1 | tee '$LOG'"
+     "cd '$PWD' && bun ci-live/run.ts --agent-director-binary '${CSCB_AD_RC_DIR}/agent-director-linux-amd64' 2>&1 | tee '$LOG'"
    echo "session cscb-live-run-$ID, log $LOG"
    ```
 
@@ -172,6 +211,14 @@ installed Google Chrome, headless; no browser download):
      it shows. The operator decides on `apps --delete-strays`; rerun after.
    - `apps.manifest.create … got no answer`: rerun; the next run finds the
      app that create may have made.
+   - "the path given with --agent-director-binary does not exist", "… is
+     not a regular file", "… cannot be read", or "the file given with
+     --agent-director-binary is not executable": relay it. The release
+     candidate's directory lacks a usable `agent-director-linux-amd64`; the
+     operator fixes `CSCB_AD_RC_DIR` (or the file's execute bit there), then
+     rerun. Never run, install or replace an agent-director on the host.
+   - "no agent-director binary to stage in the live image": the option was
+     not passed; rerun with it as in steps 2 and 3.
 5. Read the first line of `<RESULTS_DIR>/verdict.txt`:
    - `PASS` → exit 0, report `✓ Live acceptance passed.` and the results dir.
    - `FAIL: <check>: <reason>` → relay it verbatim with the results dir path.
