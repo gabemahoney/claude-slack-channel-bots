@@ -133,7 +133,7 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/persona-destination[\w-]*\.ts$/, "the destination resolver and hold, which open DMs through a persona's client and describe Slack failures"],
   [/^src\/health-check\.ts$/, 'the health check, whose lines carry agent-director failure text'],
   [/^src\/cli\.ts$/, 'the CLI, which loads the config and logs agent-director failure text'],
-  [/^src\/cli-teardown\.ts$/, "the CLI teardown commands' pure pieces, whose precheck failure lines carry agent-director failure text (described, redacted) to the terminal and clean_restart.log"],
+  [/^src\/cli-teardown\.ts$/, "the CLI teardown commands' pure pieces, whose precheck failure lines and teardown verdicts and outcomes carry agent-director failure text (described, redacted) to the terminal and clean_restart.log"],
   [/^src\/agent-director-template\.ts$/, "the template install and refresh, whose lines and startup error carry agent-director failure text"],
   [/^src\/ad-error-class\.ts$/, "the agent-director error classifier, whose reported message carries agent-director failure text (an error's description) to log lines"],
   [/^src\/ad-settings\.ts$/, "the agent-director settings reader, which reads agent-director's config.toml and logs a refused read's reason"],
@@ -513,13 +513,14 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     expect([callsAssertNoLeak(suite), suite in EXEMPT]).toEqual([true, false])
   })
 
-  // b.jg5 SRJ-901: a precheck failure line carries the described agent-director failure to the terminal and
-  // clean_restart.log.
+  // b.jg5 SRJ-901, SRJ-903: a precheck failure line, and a teardown verdict or outcome, carries the described
+  // agent-director failure to the terminal and clean_restart.log.
   test('src/cli-teardown.ts is a source surface: its verdict and line builders touch, its constants and types alone do not, and every suite that touches it leak-checks with no exemption', () => {
     const suite = 'tests/cli-teardown.test.ts'
     expect(SOURCE_SURFACES.some(([re]) => re.test('src/cli-teardown.ts'))).toBe(true)
     expect(touchReasonsOf(suite, "import { precheckVerdictOf } from '../src/cli-teardown.ts'").length).toBe(1)
     expect(touchReasonsOf(suite, "import { precheckFailureLine as line } from '../src/cli-teardown.ts'").length).toBe(1)
+    expect(touchReasonsOf(suite, "import { pauseVerdictOf, stateReadVerdictOf, teardownErrorReportOf } from '../src/cli-teardown.ts'").length).toBe(3)
     expect(touchReasonsOf(suite, "import { PRECHECK_TRIES, PRECHECK_TRY_SPACING_MS } from '../src/cli-teardown.ts'")).toEqual([])
     expect(touchReasonsOf(suite, "import type { PrecheckVerdict } from '../src/cli-teardown.ts'")).toEqual([])
     expect(touchReasons(suite).some((r) => r.includes('src/cli-teardown.ts'))).toBe(true)

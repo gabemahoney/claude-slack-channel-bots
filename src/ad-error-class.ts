@@ -33,9 +33,10 @@
  *
  * Recognition is by name (b.jg5 SRJ-101 interim rule): the value's `errName`,
  * and for an `ErrUnknownErrorName` its `unknownName` and the envelope's
- * `err_description`; never the value's `name`. The three Phase-1-only names
- * and the three store-open names come from `src/agent-director-errors.ts` as
- * strings, and nothing here imports the Phase-1-only classes, which the
+ * `err_description`; never the value's `name`. The three Phase-1-only names,
+ * the three store-open names and `ErrInternal` come from
+ * `src/agent-director-errors.ts` as strings, and nothing here imports the
+ * Phase-1-only classes, which the
  * branch's 0.10.0 client lacks. Only the base `AgentDirectorError` is tested
  * by class. `ErrInternal`, `ErrConfigMalformed` and the three store-open names
  * arrive as `ErrUnknownErrorName`, matched exactly (a differently cased name
@@ -124,6 +125,7 @@ import {
 } from './ad-version-gate.ts'
 import {
   AgentDirectorError,
+  ERR_INTERNAL_NAME,
   ERR_SPAWN_NOT_FOUND_NAME,
   ERR_TMUX_KILL_FAILED_NAME,
   ERR_TMUX_SESSION_CONFLICT_NAME,
@@ -300,9 +302,6 @@ const ERR_UNKNOWN_ERROR_NAME = 'ErrUnknownErrorName'
 
 /** The agent-director error names the table classes GONE; the one source of them. */
 export const AD_GONE_ERR_NAMES = ['ErrTmuxSendKeys', 'ErrTmuxCaptureFailed'] as const
-
-/** `unknownName` of an agent-director internal error (no class in any client). */
-const ERR_INTERNAL_NAME = 'ErrInternal'
 
 /** `unknownName` of a malformed agent-director config (no class in any client). */
 const ERR_CONFIG_MALFORMED_NAME = 'ErrConfigMalformed'

@@ -3,7 +3,9 @@
  * `stop --stop-bots` and `clean_restart` (`src/cli.ts`): the precheck's
  * verdict over one answer, its tries and spacing, its two operator lines,
  * `stop --stop-bots`' too-old line and the config-file display name (b.jg5
- * SRJ-901, SRJ-902, SRJ-117, SRJ-908).
+ * SRJ-901, SRJ-902, SRJ-117, SRJ-908); and the teardown's per-persona
+ * outcome, its pause verdict and its state-read verdict (SRJ-903, SRJ-119,
+ * SRJ-316; hatch note E12).
  *
  * The precheck. Before either command stops anything, it reads each persona
  * of the configuration the server runs: one `get` of `cscb_<key>`, then, for
@@ -43,7 +45,46 @@
  * When the client refuses the binary as too old, `stop --stop-bots` stops
  * only the server and ends with {@link onlyServerStoppedLine} (SRJ-902).
  *
- * The precheck has no side effects (SRJ-114, SRJ-115, SRJ-801): nothing
+ * The teardown. After a passed precheck and the server stop, each persona's
+ * teardown (`teardownPersona`) answers one {@link PersonaTeardownOutcome}:
+ * stopped, with its reason (no row, already finished, exited after the
+ * pause, killed), or failed, with the step that failed (state read, pause,
+ * poll or kill), the classifier's class (never relabelled UNCLASSIFIED, as
+ * the precheck's `get` relabels), the redacted one-line description
+ * `describeReportedAdFailure` renders (SRJ-104) and whether it is a CONFIG
+ * failure naming {@link AD_CONFIG_FILE_DISPLAY_NAME} (SRJ-316).
+ *
+ * {@link stateReadVerdictOf} decides each of the teardown's own `status`
+ * reads (the read before the pause and every read of the poll): a finished
+ * row (`ended`, `missing`) or no row (`ErrSpawnNotFound`, by name) ends the
+ * persona's teardown as stopped; any other state is live and goes on; any
+ * other error fails the persona at once with its class, with no retry.
+ *
+ * {@link pauseVerdictOf} decides each `pause` answer on a live row by class
+ * (SRJ-903; hatch note E12: every answer through `classifyAdError`):
+ *
+ *   - success: done, and the poll follows;
+ *   - UNAVAILABLE (`ErrCallTimeout` and a non-agent-director throw
+ *     included): retry, only the `pause` being repeated, at most
+ *     {@link PRECHECK_TRIES} calls {@link PRECHECK_TRY_SPACING_MS} apart on
+ *     the CLI's injected clock, then escalate to the kill
+ *     ({@link pauseVerdictAfterLastTry});
+ *   - CONFLICT, ENVIRONMENT, UNUSABLE NAME or another `ErrInternal` (an
+ *     UNCLASSIFIED answer whose reported name is `ERR_INTERNAL_NAME`): fail
+ *     at once, with no kill;
+ *   - CONFIG (`ErrConfigMalformed`): fail at once, naming the config file;
+ *   - GONE (`ErrTmuxSendKeys`), STATE (`ErrSpawnNotPausable` on a `pending`
+ *     row, `ErrSpawnNotFound`), `ErrPauseTimeout`, the three store names and
+ *     every other UNCLASSIFIED name, LAUNCH FAILURE and DIRECTORY: escalate
+ *     to the kill.
+ *
+ * `pause` waits up to the host's `[pause] timeout_seconds` for the row to
+ * end; CSCB's call timeout is sized above that wait (SRJ-213), so a slow
+ * `/exit` ends in `ErrPauseTimeout`, which escalates, rather than in
+ * `ErrCallTimeout` (SRJ-119).
+ *
+ * The precheck and the teardown have no side effects beyond the teardown's
+ * own `pause` and `kill` (SRJ-114, SRJ-115, SRJ-801, SRJ-1002): nothing
  * latches, no record is written and no retired-key entry is cleared. This
  * module therefore imports only pure modules and never the session manager,
  * the conflict latch, the retired-key record or `src/cli.ts`.
@@ -69,7 +110,7 @@ import {
   type AdErrorClass,
 } from './ad-error-class.ts'
 import { AD_SETTINGS_RELATIVE_PATH } from './ad-settings.ts'
-import { ERR_SPAWN_NOT_FOUND_NAME } from './agent-director-errors.ts'
+import { ERR_INTERNAL_NAME, ERR_SPAWN_NOT_FOUND_NAME } from './agent-director-errors.ts'
 import { AGENT_DIRECTOR_DEAD_STATES } from './liveness-reading.ts'
 import {
   PANE_READ_ABSENT,
@@ -257,8 +298,13 @@ function configVerdict(description: string): PrecheckFailureVerdict {
   return {
     kind: PRECHECK_VERDICT_FAIL_AT_ONCE,
     errorClass: AD_ERROR_CLASS_CONFIG,
-    description: `agent-director refuses its config file ${AD_CONFIG_FILE_DISPLAY_NAME}: ${description}`,
+    description: configFailureDescription(description),
   }
+}
+
+/** A CONFIG failure's description: the reported description, after a lead naming the config file. */
+function configFailureDescription(description: string): string {
+  return `agent-director refuses its config file ${AD_CONFIG_FILE_DISPLAY_NAME}: ${description}`
 }
 
 /** The classes a failed `get` keeps on its line; every other is reported UNCLASSIFIED. */
@@ -273,6 +319,272 @@ const GET_FAILURE_CLASSES: ReadonlySet<AdErrorClass> = new Set<AdErrorClass>([
 function reportedClassOf(errorClass: AdErrorClass): AdErrorClass {
   return GET_FAILURE_CLASSES.has(errorClass) ? errorClass : AD_ERROR_CLASS_UNCLASSIFIED
 }
+
+// ---------------------------------------------------------------------------
+// The teardown's per-persona outcome
+// ---------------------------------------------------------------------------
+
+/** The teardown's `status` read of the row before the pause. */
+export const TEARDOWN_STEP_STATE_READ = 'state read'
+/** The teardown's `pause` of a live row. */
+export const TEARDOWN_STEP_PAUSE = 'pause'
+/** The teardown's `status` reads after a pause, waiting for `ended` or `missing`. */
+export const TEARDOWN_STEP_POLL = 'poll'
+/** The teardown's `kill`, after an escalated pause or at `exit_timeout`. */
+export const TEARDOWN_STEP_KILL = 'kill'
+
+/** The step of a persona's teardown that failed. */
+export type TeardownStep =
+  | typeof TEARDOWN_STEP_STATE_READ
+  | typeof TEARDOWN_STEP_PAUSE
+  | typeof TEARDOWN_STEP_POLL
+  | typeof TEARDOWN_STEP_KILL
+
+/** The state read found no row (`ErrSpawnNotFound`). */
+export const TEARDOWN_STOPPED_NO_ROW = 'no row'
+/** The state read found the row finished (`ended`, `missing`). */
+export const TEARDOWN_STOPPED_ALREADY_FINISHED = 'already finished'
+/** After the pause, the poll found the row finished or gone. */
+export const TEARDOWN_STOPPED_EXITED = 'exited after the pause'
+/** The kill ended the persona's teardown as a success. */
+export const TEARDOWN_STOPPED_KILLED = 'killed'
+
+/** Why a persona's teardown counts as stopped. */
+export type TeardownStoppedReason =
+  | typeof TEARDOWN_STOPPED_NO_ROW
+  | typeof TEARDOWN_STOPPED_ALREADY_FINISHED
+  | typeof TEARDOWN_STOPPED_EXITED
+  | typeof TEARDOWN_STOPPED_KILLED
+
+/** The persona was stopped. */
+export const TEARDOWN_OUTCOME_STOPPED = 'stopped'
+/** The persona could not be stopped. */
+export const TEARDOWN_OUTCOME_FAILED = 'failed'
+
+/** What a teardown failure reports about the agent-director answer that failed it. */
+export interface TeardownErrorReport {
+  /** The classifier's class, as reported (never relabelled). */
+  readonly errorClass: AdErrorClass
+  /**
+   * `describeReportedAdFailure` of the answer: redacted, on one line; a
+   * CONFIG failure's names {@link AD_CONFIG_FILE_DISPLAY_NAME}.
+   */
+  readonly description: string
+  /** True for a CONFIG failure, whose description names the config file (b.jg5 SRJ-316). */
+  readonly namesConfigFile: boolean
+}
+
+/** A persona's teardown that stopped it. */
+export interface TeardownStoppedOutcome {
+  readonly kind: typeof TEARDOWN_OUTCOME_STOPPED
+  readonly reason: TeardownStoppedReason
+}
+
+/** A persona's teardown that failed, at `step`, with what the answer reports. */
+export interface TeardownFailedOutcome extends TeardownErrorReport {
+  readonly kind: typeof TEARDOWN_OUTCOME_FAILED
+  readonly step: TeardownStep
+}
+
+/** One persona's teardown outcome. */
+export type PersonaTeardownOutcome = TeardownStoppedOutcome | TeardownFailedOutcome
+
+/** The stopped outcome for `reason`. */
+export function teardownStopped(reason: TeardownStoppedReason): TeardownStoppedOutcome {
+  return { kind: TEARDOWN_OUTCOME_STOPPED, reason }
+}
+
+/** The failed outcome at `step`, reporting `report`. */
+export function teardownFailed(step: TeardownStep, report: TeardownErrorReport): TeardownFailedOutcome {
+  return {
+    kind: TEARDOWN_OUTCOME_FAILED,
+    step,
+    errorClass: report.errorClass,
+    description: report.description,
+    namesConfigFile: report.namesConfigFile,
+  }
+}
+
+/**
+ * What a teardown failure reports for a value an agent-director call threw
+ * (b.jg5 SRJ-104, SRJ-316; hatch note E12): the classifier's class, unchanged,
+ * and `describeReportedAdFailure`'s description, after a lead naming
+ * {@link AD_CONFIG_FILE_DISPLAY_NAME} for a CONFIG answer. Pure; never throws.
+ */
+export function teardownErrorReportOf(error: unknown): TeardownErrorReport {
+  const { errorClass } = classifyAdError(error)
+  const description = describeReportedAdFailure(error)
+  if (errorClass === AD_ERROR_CLASS_CONFIG) {
+    return { errorClass, description: configFailureDescription(description), namesConfigFile: true }
+  }
+  return { errorClass, description, namesConfigFile: false }
+}
+
+// ---------------------------------------------------------------------------
+// The teardown's state reads
+// ---------------------------------------------------------------------------
+
+/** What the teardown reads of a `status` row: its state. */
+export interface TeardownStateRow {
+  readonly state: string
+}
+
+/** A `status` read that answered: the row, or null for no row (`ErrSpawnNotFound`). */
+export interface StateReadRowAnswer {
+  readonly row: TeardownStateRow | null
+}
+
+/** A `status` read that threw or rejected: the value as thrown. */
+export interface StateReadErrorAnswer {
+  readonly error: unknown
+}
+
+/** One answer to one of the teardown's `status` reads. */
+export type StateReadAnswer = StateReadRowAnswer | StateReadErrorAnswer
+
+/** No row (`ErrSpawnNotFound`): the persona is stopped. */
+export const STATE_READ_VERDICT_ABSENT = 'absent'
+/** A finished row (`ended`, `missing`): the persona is stopped. */
+export const STATE_READ_VERDICT_FINISHED = 'finished'
+/** A row in any other state, one CSCB does not know included: the teardown goes on. */
+export const STATE_READ_VERDICT_LIVE = 'live'
+/** Any other error: the persona's teardown fails at once, with no retry. */
+export const STATE_READ_VERDICT_FAIL = 'fail'
+
+/** The verdict over a read that found no row. */
+export interface StateReadAbsentVerdict {
+  readonly kind: typeof STATE_READ_VERDICT_ABSENT
+}
+
+/** The verdict over a read that found a row, finished or live, with its state. */
+export interface StateReadRowVerdict {
+  readonly kind: typeof STATE_READ_VERDICT_FINISHED | typeof STATE_READ_VERDICT_LIVE
+  readonly state: string
+}
+
+/** The verdict over a read that failed, with what the failure reports. */
+export interface StateReadFailVerdict extends TeardownErrorReport {
+  readonly kind: typeof STATE_READ_VERDICT_FAIL
+}
+
+/** The verdict over one of the teardown's `status` reads. */
+export type StateReadVerdict = StateReadAbsentVerdict | StateReadRowVerdict | StateReadFailVerdict
+
+const STATE_READ_ABSENT: StateReadAbsentVerdict = Object.freeze({ kind: STATE_READ_VERDICT_ABSENT })
+
+/**
+ * The verdict over one of the teardown's own `status` reads, the read before
+ * the pause and each read of the poll (b.jg5 SRJ-903, SRJ-316): no row
+ * (`ErrSpawnNotFound`, by name) is absent; a finished row is finished; any
+ * other state is live; any other error fails at once with its class, a
+ * CONFIG answer naming the config file. Pure; never throws.
+ */
+export function stateReadVerdictOf(answer: StateReadAnswer): StateReadVerdict {
+  if ('error' in answer) {
+    if (hasAdErrorName(answer.error, ERR_SPAWN_NOT_FOUND_NAME)) return STATE_READ_ABSENT
+    return { kind: STATE_READ_VERDICT_FAIL, ...teardownErrorReportOf(answer.error) }
+  }
+  if (answer.row === null) return STATE_READ_ABSENT
+  const { state } = answer.row
+  return { kind: AGENT_DIRECTOR_DEAD_STATES.has(state) ? STATE_READ_VERDICT_FINISHED : STATE_READ_VERDICT_LIVE, state }
+}
+
+// ---------------------------------------------------------------------------
+// The teardown's pause
+// ---------------------------------------------------------------------------
+
+/** A `pause` that answered success. */
+export interface PauseDoneAnswer {
+  readonly paused: true
+}
+
+/** A `pause` that threw or rejected: the value as thrown. */
+export interface PauseErrorAnswer {
+  readonly error: unknown
+}
+
+/** One answer to one `pause` call. */
+export type PauseAnswer = PauseDoneAnswer | PauseErrorAnswer
+
+/** The pause succeeded: the poll follows. */
+export const PAUSE_VERDICT_DONE = 'done'
+/** UNAVAILABLE: the `pause` alone is made again, up to {@link PRECHECK_TRIES} calls in all. */
+export const PAUSE_VERDICT_RETRY = 'retry'
+/** The teardown goes on to the kill. */
+export const PAUSE_VERDICT_ESCALATE = 'escalate'
+/** The persona's teardown fails at once, with no kill. */
+export const PAUSE_VERDICT_FAIL = 'fail'
+
+/** The verdict over a `pause` that succeeded. */
+export interface PauseDoneVerdict {
+  readonly kind: typeof PAUSE_VERDICT_DONE
+}
+
+/** A verdict that retries or escalates, with the answer's class and description for the log. */
+export interface PauseEscalationVerdict {
+  readonly kind: typeof PAUSE_VERDICT_RETRY | typeof PAUSE_VERDICT_ESCALATE
+  readonly errorClass: AdErrorClass
+  /** `describeReportedAdFailure` of the answer: redacted, on one line. */
+  readonly description: string
+}
+
+/** The verdict that fails the persona's teardown at once, with what the failure reports. */
+export interface PauseFailVerdict extends TeardownErrorReport {
+  readonly kind: typeof PAUSE_VERDICT_FAIL
+}
+
+/** The verdict over one `pause` answer. */
+export type PauseVerdict = PauseDoneVerdict | PauseEscalationVerdict | PauseFailVerdict
+
+const PAUSE_DONE: PauseDoneVerdict = Object.freeze({ kind: PAUSE_VERDICT_DONE })
+
+/** The classes whose `pause` answer fails the persona's teardown at once, with no kill (b.jg5 SRJ-903). */
+const PAUSE_FAIL_CLASSES: ReadonlySet<AdErrorClass> = new Set<AdErrorClass>([
+  AD_ERROR_CLASS_CONFLICT,
+  AD_ERROR_CLASS_ENVIRONMENT,
+  AD_ERROR_CLASS_UNUSABLE_NAME,
+  AD_ERROR_CLASS_CONFIG,
+])
+
+/**
+ * The verdict over one `pause` answer on a live row (b.jg5 SRJ-903,
+ * SRJ-119); see the module comment. "Another `ErrInternal`" is an
+ * UNCLASSIFIED classification whose reported name is `ERR_INTERNAL_NAME`.
+ * Pure; never throws.
+ */
+export function pauseVerdictOf(answer: PauseAnswer): PauseVerdict {
+  if (!('error' in answer)) return PAUSE_DONE
+  const { errorClass, reportedName } = classifyAdError(answer.error)
+  if (PAUSE_FAIL_CLASSES.has(errorClass) || (errorClass === AD_ERROR_CLASS_UNCLASSIFIED && reportedName === ERR_INTERNAL_NAME)) {
+    return { kind: PAUSE_VERDICT_FAIL, ...teardownErrorReportOf(answer.error) }
+  }
+  const description = describeReportedAdFailure(answer.error)
+  if (errorClass === AD_ERROR_CLASS_UNAVAILABLE) return { kind: PAUSE_VERDICT_RETRY, errorClass, description }
+  // Every other class escalates: GONE, STATE (`ErrSpawnNotPausable` on a
+  // `pending` row, `ErrSpawnNotFound`), LAUNCH FAILURE, DIRECTORY, and every
+  // UNCLASSIFIED name but `ErrInternal` (`ErrPauseTimeout` and the three store
+  // names included), which the kill then decides.
+  return { kind: PAUSE_VERDICT_ESCALATE, errorClass, description }
+}
+
+/**
+ * The verdict that stands after the last of the {@link PRECHECK_TRIES}
+ * `pause` calls (b.jg5 SRJ-903): a retry escalates to the kill; any other
+ * verdict stands as it is. Pure; never throws.
+ */
+export function pauseVerdictAfterLastTry(verdict: PauseVerdict): PauseVerdict {
+  return verdict.kind === PAUSE_VERDICT_RETRY ? { ...verdict, kind: PAUSE_VERDICT_ESCALATE } : verdict
+}
+
+// ---------------------------------------------------------------------------
+// The teardown's poll
+// ---------------------------------------------------------------------------
+
+/** The poll's first wait after a successful pause; each later wait doubles, up to {@link TEARDOWN_POLL_MAX_WAIT_MS}. */
+export const TEARDOWN_POLL_FIRST_WAIT_MS = 100
+
+/** The poll's longest wait between two `status` reads; the last wait is also cut short at `exit_timeout`. */
+export const TEARDOWN_POLL_MAX_WAIT_MS = 2_000
 
 // ---------------------------------------------------------------------------
 // Lines

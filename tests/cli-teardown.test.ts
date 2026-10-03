@@ -1,10 +1,12 @@
 /**
  * cli-teardown.test.ts — The pure pieces of the CLI's teardown commands
- * (`src/cli-teardown.ts`; b.jg5 SRJ-901, SRJ-117's CLI-precheck column):
- * the precheck's verdict over one `get` or `read-pane` answer, its two
- * operator line builders, its tries and spacing, and the config-file display
- * name. The precheck runner, its tries on the CLI's injected clock and both
- * commands' order are tests/cli.test.ts's.
+ * (`src/cli-teardown.ts`; b.jg5 SRJ-901, SRJ-117's CLI-precheck column,
+ * SRJ-903, SRJ-316): the precheck's verdict over one `get` or `read-pane`
+ * answer, its two operator line builders, its tries and spacing, and the
+ * config-file display name; the teardown's pause verdict over one `pause`
+ * answer, its state-read verdict over one `status` answer and its
+ * per-persona outcome. The precheck runner, the teardown's tries and poll on
+ * the CLI's injected clock and both commands' order are tests/cli.test.ts's.
  *
  * Every agent-director error is built by name with the stub's builders; class
  * labels, finished and live states, notes and launch starts are imported. The
@@ -23,19 +25,26 @@ import { join } from 'node:path'
 import {
   AD_ERROR_CLASS_CONFIG,
   AD_ERROR_CLASS_CONFLICT,
+  AD_ERROR_CLASS_DIRECTORY,
   AD_ERROR_CLASS_ENVIRONMENT,
+  AD_ERROR_CLASS_GONE,
+  AD_ERROR_CLASS_LAUNCH_FAILURE,
+  AD_ERROR_CLASS_STATE,
   AD_ERROR_CLASS_UNAVAILABLE,
   AD_ERROR_CLASS_UNCLASSIFIED,
   AD_ERROR_CLASS_UNUSABLE_NAME,
   classifyAdError,
   describeAgentDirectorFailure,
+  describeReportedAdFailure,
   type AdErrorClass,
 } from '../src/ad-error-class.ts'
 import { AD_SETTINGS_RELATIVE_PATH } from '../src/ad-settings.ts'
 import {
   ERR_SCHEMA_MIGRATION_REQUIRED_NAME,
+  ERR_SCHEMA_MISMATCH_NAME,
   ERR_STORE_OPEN_NAME,
   ERR_TMUX_SESSION_CONFLICT_NAME,
+  STORE_OPEN_ERR_NAMES,
 } from '../src/agent-director-errors.ts'
 import {
   AD_CONFIG_FILE_DISPLAY_NAME,
@@ -50,13 +59,40 @@ import {
   PRECHECK_VERDICT_PASS,
   PRECHECK_VERDICT_RETRY,
   PRECHECK_VERDICT_SKIP,
+  PAUSE_VERDICT_DONE,
+  PAUSE_VERDICT_ESCALATE,
+  PAUSE_VERDICT_FAIL,
+  PAUSE_VERDICT_RETRY,
+  STATE_READ_VERDICT_ABSENT,
+  STATE_READ_VERDICT_FAIL,
+  STATE_READ_VERDICT_FINISHED,
+  STATE_READ_VERDICT_LIVE,
+  TEARDOWN_OUTCOME_FAILED,
+  TEARDOWN_OUTCOME_STOPPED,
+  TEARDOWN_STEP_KILL,
+  TEARDOWN_STEP_PAUSE,
+  TEARDOWN_STEP_POLL,
+  TEARDOWN_STEP_STATE_READ,
+  TEARDOWN_STOPPED_ALREADY_FINISHED,
+  TEARDOWN_STOPPED_EXITED,
+  TEARDOWN_STOPPED_KILLED,
+  TEARDOWN_STOPPED_NO_ROW,
   onlyServerStoppedLine,
+  pauseVerdictAfterLastTry,
+  pauseVerdictOf,
   precheckFailureLine,
   precheckNothingStoppedLine,
   precheckVerdictOf,
+  stateReadVerdictOf,
+  teardownErrorReportOf,
+  teardownFailed,
+  teardownStopped,
+  type PauseVerdict,
   type PrecheckCall,
   type PrecheckRow,
   type PrecheckVerdict,
+  type StateReadVerdict,
+  type TeardownErrorReport,
 } from '../src/cli-teardown.ts'
 import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_LIVE_STATES, AGENT_DIRECTOR_PENDING_STATE } from '../src/liveness-reading.ts'
 import {
@@ -69,12 +105,15 @@ import {
   errCwdNotFound,
   errGeneric,
   errInternal,
+  errPauseTimeout,
   errRelayModeOff,
   errSchemaMismatch,
   errSpawnNotFound,
   errSpawnNotInteractive,
+  errSpawnNotPausable,
   errSystemInstallDisappeared,
   errTmuxCaptureFailed,
+  errTmuxSendKeys,
   errTmuxNotAvailable,
   errTmuxNotAvailableDifferentServer,
   errTmuxSessionConflict,
@@ -266,6 +305,185 @@ describe('precheck failure lines (b.jg5 SRJ-901)', () => {
     for (const line of lines.slice(1)) expect(line).toContain(REDACTED_SENTINEL_TAIL)
     for (const line of lines) expect(line.includes('\n')).toBe(false)
     assertNoLeak(lines)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The teardown (b.jg5 SRJ-903, SRJ-119, SRJ-316; hatch note E12)
+// ---------------------------------------------------------------------------
+
+/** The verb of every `pause` answer below. */
+const PAUSE_VERB = 'pause'
+/** The verb of every `status` answer below. */
+const STATUS_VERB = 'status'
+
+/**
+ * A teardown failure's report: the classifier's class, unchanged; the
+ * description `describeReportedAdFailure` renders (SRJ-104), redacted and on
+ * one line; a CONFIG failure's description led by the config file's name
+ * (SRJ-316) and flagged as naming it.
+ */
+function expectTeardownReport(report: TeardownErrorReport, value: unknown, errorClass: AdErrorClass): void {
+  expect(report.errorClass).toBe(errorClass)
+  expect(report.errorClass).toBe(classifyAdError(value).errorClass)
+  expect(report.description.includes('\n')).toBe(false)
+  const reported = describeReportedAdFailure(value)
+  if (errorClass === AD_ERROR_CLASS_CONFIG) {
+    expect(report.namesConfigFile).toBe(true)
+    expect(report.description).toContain(AD_CONFIG_FILE_DISPLAY_NAME)
+    expect(report.description.endsWith(reported)).toBe(true)
+  } else {
+    expect(report.namesConfigFile).toBe(false)
+    expect(report.description).toBe(reported)
+  }
+  assertNoLeak(report.description)
+}
+
+/** One `pause` answer that threw: its label, its builder, the verdict kind and the class the classifier gives it. */
+type PauseRow = readonly [label: string, make: () => unknown, kind: PauseVerdict['kind'], errorClass: AdErrorClass]
+
+/**
+ * SRJ-903's table, one row per answer: GONE escalates; UNAVAILABLE retries;
+ * CONFLICT, ENVIRONMENT, UNUSABLE NAME and another `ErrInternal` fail at
+ * once; CONFIG fails at once naming the config file; `ErrSpawnNotPausable`
+ * on a `pending` row, `ErrSpawnNotFound`, `ErrPauseTimeout`, the three store
+ * names and every other answer escalate to the kill (hatch A3).
+ */
+const PAUSE_ERROR_ROWS: readonly PauseRow[] = [
+  ['ErrTmuxSendKeys (GONE)', () => errTmuxSendKeys(), PAUSE_VERDICT_ESCALATE, AD_ERROR_CLASS_GONE],
+  ...UNAVAILABLE_FORMS.map(([label, make]): PauseRow => [`${label} (UNAVAILABLE)`, () => make(PAUSE_VERB), PAUSE_VERDICT_RETRY, AD_ERROR_CLASS_UNAVAILABLE]),
+  ...CONFLICT_CASES.map((c): PauseRow => [`ErrTmuxSessionConflict, ${c} (CONFLICT)`, () => errTmuxSessionConflict(PAUSE_VERB, c), PAUSE_VERDICT_FAIL, AD_ERROR_CLASS_CONFLICT]),
+  ['ErrTmuxNotAvailable, tmux not runnable (ENVIRONMENT)', () => errTmuxNotAvailable(undefined, PAUSE_VERB), PAUSE_VERDICT_FAIL, AD_ERROR_CLASS_ENVIRONMENT],
+  ['ErrTmuxNotAvailable, socket not accessible (ENVIRONMENT)', () => errTmuxNotAvailable(STUB_TMUX_SOCKET_PATH, PAUSE_VERB), PAUSE_VERDICT_FAIL, AD_ERROR_CLASS_ENVIRONMENT],
+  ['ErrTmuxNotAvailable, a different tmux server (ENVIRONMENT)', () => errTmuxNotAvailableDifferentServer(STUB_TMUX_SOCKET_PATH, PAUSE_VERB), PAUSE_VERDICT_FAIL, AD_ERROR_CLASS_ENVIRONMENT],
+  ...UNUSABLE_NAME_FAULTS.map((f): PauseRow => [`the unusable-name ErrInternal, ${f} (UNUSABLE NAME)`, () => errUnusableName(f), PAUSE_VERDICT_FAIL, AD_ERROR_CLASS_UNUSABLE_NAME]),
+  ['a plain ErrInternal (another ErrInternal)', () => errInternal(), PAUSE_VERDICT_FAIL, AD_ERROR_CLASS_UNCLASSIFIED],
+  ['a plain ErrInternal whose description carries fake tokens', () => errInternal(`the store could not be read (${sentinelInMessage('pause-internal')})`), PAUSE_VERDICT_FAIL, AD_ERROR_CLASS_UNCLASSIFIED],
+  ['ErrConfigMalformed (CONFIG)', () => errConfigMalformed(), PAUSE_VERDICT_FAIL, AD_ERROR_CLASS_CONFIG],
+  ['ErrSpawnNotPausable, a pending row (STATE)', () => errSpawnNotPausable(PAUSE_VERB), PAUSE_VERDICT_ESCALATE, AD_ERROR_CLASS_STATE],
+  ['ErrSpawnNotFound (STATE)', () => errSpawnNotFound(), PAUSE_VERDICT_ESCALATE, AD_ERROR_CLASS_STATE],
+  ['ErrPauseTimeout (UNCLASSIFIED)', () => errPauseTimeout(), PAUSE_VERDICT_ESCALATE, AD_ERROR_CLASS_UNCLASSIFIED],
+  [`${ERR_SCHEMA_MISMATCH_NAME} (a store name)`, () => errSchemaMismatch(), PAUSE_VERDICT_ESCALATE, AD_ERROR_CLASS_UNCLASSIFIED],
+  ...STORE_OPEN_ERR_NAMES.filter((name) => name !== ERR_SCHEMA_MISMATCH_NAME)
+    .map((name): PauseRow => [`${name} (a store name)`, () => errUnknownErrorName(name), PAUSE_VERDICT_ESCALATE, AD_ERROR_CLASS_UNCLASSIFIED]),
+  ['ErrSystemInstallDisappeared (UNCLASSIFIED)', () => errSystemInstallDisappeared(PAUSE_VERB), PAUSE_VERDICT_ESCALATE, AD_ERROR_CLASS_UNCLASSIFIED],
+  ['ErrRelayModeOff, another UNCLASSIFIED name', () => errRelayModeOff(), PAUSE_VERDICT_ESCALATE, AD_ERROR_CLASS_UNCLASSIFIED],
+  ['ErrSpawnNotInteractive, another STATE name', () => errSpawnNotInteractive(PAUSE_VERB), PAUSE_VERDICT_ESCALATE, AD_ERROR_CLASS_STATE],
+  ['ErrTmuxSessionCreate (LAUNCH FAILURE)', () => errTmuxSessionCreate(PAUSE_VERB), PAUSE_VERDICT_ESCALATE, AD_ERROR_CLASS_LAUNCH_FAILURE],
+  ['ErrCwdNotFound (DIRECTORY)', () => errCwdNotFound(PAUSE_VERB), PAUSE_VERDICT_ESCALATE, AD_ERROR_CLASS_DIRECTORY],
+]
+
+describe('pauseVerdictOf: each pause answer by class (b.jg5 SRJ-903, SRJ-119; hatch note E12)', () => {
+  test('a pause that succeeded is done: the poll follows', () => {
+    expect(pauseVerdictOf({ paused: true })).toEqual({ kind: PAUSE_VERDICT_DONE })
+  })
+
+  test.each(PAUSE_ERROR_ROWS)('%s → its verdict, the classifier\'s class and the reported description', (_label, make, kind, errorClass) => {
+    const value = make()
+    const verdict = pauseVerdictOf({ error: value })
+    expect(verdict.kind).toBe(kind)
+    if (verdict.kind === PAUSE_VERDICT_DONE) throw new Error('precondition: a thrown pause answer is never done')
+    if (verdict.kind === PAUSE_VERDICT_FAIL) {
+      expectTeardownReport(verdict, value, errorClass)
+      return
+    }
+    expect(verdict).toEqual({ kind: verdict.kind, errorClass, description: describeReportedAdFailure(value) })
+    assertNoLeak(verdict.description)
+  })
+
+  test('the rows reach every verdict kind a thrown answer has', () => {
+    expect(new Set(PAUSE_ERROR_ROWS.map(([, , kind]) => kind))).toEqual(new Set([PAUSE_VERDICT_RETRY, PAUSE_VERDICT_ESCALATE, PAUSE_VERDICT_FAIL]))
+  })
+
+  test.each(PAUSE_ERROR_ROWS)('after the last try, %s: a retry escalates with its class and description; every other verdict stands', (_label, make, kind) => {
+    const verdict = pauseVerdictOf({ error: make() })
+    const last = pauseVerdictAfterLastTry(verdict)
+    if (kind === PAUSE_VERDICT_RETRY && verdict.kind === PAUSE_VERDICT_RETRY) expect(last).toEqual({ ...verdict, kind: PAUSE_VERDICT_ESCALATE })
+    else expect([kind, last]).toEqual([kind, verdict])
+  })
+
+  test('after the last try, a pause that succeeded is still done', () => {
+    expect(pauseVerdictAfterLastTry(pauseVerdictOf({ paused: true }))).toEqual({ kind: PAUSE_VERDICT_DONE })
+  })
+})
+
+/** One `status` answer that threw: its label, its builder and the class the read fails with (null: no row). */
+type StateReadErrorRow = readonly [label: string, make: () => unknown, errorClass: AdErrorClass | null]
+
+/**
+ * The teardown's own `status` read: `ErrSpawnNotFound` is no row; every
+ * other answer fails at once with the classifier's class, never relabelled
+ * UNCLASSIFIED as the precheck's `get` relabels.
+ */
+const STATE_READ_ERROR_ROWS: readonly StateReadErrorRow[] = [
+  ['ErrSpawnNotFound (no row)', () => errSpawnNotFound(), null],
+  ...UNAVAILABLE_FORMS.map(([label, make]): StateReadErrorRow => [`${label} (UNAVAILABLE)`, () => make(STATUS_VERB), AD_ERROR_CLASS_UNAVAILABLE]),
+  ['ErrConfigMalformed (CONFIG)', () => errConfigMalformed(), AD_ERROR_CLASS_CONFIG],
+  ['ErrTmuxSessionConflict (CONFLICT)', () => errTmuxSessionConflict(STATUS_VERB, 'unrecognised'), AD_ERROR_CLASS_CONFLICT],
+  ['ErrTmuxNotAvailable (ENVIRONMENT)', () => errTmuxNotAvailable(undefined, STATUS_VERB), AD_ERROR_CLASS_ENVIRONMENT],
+  ...UNUSABLE_NAME_FAULTS.map((f): StateReadErrorRow => [`the unusable-name ErrInternal, ${f} (UNUSABLE NAME)`, () => errUnusableName(f), AD_ERROR_CLASS_UNUSABLE_NAME]),
+  ['a plain ErrInternal (UNCLASSIFIED)', () => errInternal(), AD_ERROR_CLASS_UNCLASSIFIED],
+  [`${ERR_SCHEMA_MISMATCH_NAME} (UNCLASSIFIED)`, () => errSchemaMismatch(), AD_ERROR_CLASS_UNCLASSIFIED],
+  ['ErrTmuxCaptureFailed (GONE, kept)', () => errTmuxCaptureFailed(undefined, STATUS_VERB), AD_ERROR_CLASS_GONE],
+  ['ErrSpawnNotInteractive (STATE, kept)', () => errSpawnNotInteractive(STATUS_VERB), AD_ERROR_CLASS_STATE],
+  ['ErrTmuxSessionCreate (LAUNCH FAILURE, kept)', () => errTmuxSessionCreate(STATUS_VERB), AD_ERROR_CLASS_LAUNCH_FAILURE],
+  ['ErrCwdNotFound (DIRECTORY, kept)', () => errCwdNotFound(STATUS_VERB), AD_ERROR_CLASS_DIRECTORY],
+]
+
+describe('stateReadVerdictOf: the teardown\'s own status reads, before the pause and in the poll (b.jg5 SRJ-903, SRJ-316)', () => {
+  test('no row (null) is absent: the persona is stopped', () => {
+    expect(stateReadVerdictOf({ row: null })).toEqual({ kind: STATE_READ_VERDICT_ABSENT })
+  })
+
+  test.each([...AGENT_DIRECTOR_DEAD_STATES])('a %s row is finished: the persona is stopped', (state) => {
+    expect(stateReadVerdictOf({ row: { state } })).toEqual({ kind: STATE_READ_VERDICT_FINISHED, state })
+  })
+
+  test.each([...AGENT_DIRECTOR_LIVE_STATES, AGENT_DIRECTOR_PENDING_STATE, UNKNOWN_STATE])('a %s row is live: the teardown goes on', (state) => {
+    expect(stateReadVerdictOf({ row: { state } })).toEqual({ kind: STATE_READ_VERDICT_LIVE, state })
+  })
+
+  test.each(STATE_READ_ERROR_ROWS)('%s → absent, or a failure at once with the classifier\'s class and the reported description', (_label, make, errorClass) => {
+    const value = make()
+    const verdict: StateReadVerdict = stateReadVerdictOf({ error: value })
+    if (errorClass === null) {
+      expect(verdict).toEqual({ kind: STATE_READ_VERDICT_ABSENT })
+      return
+    }
+    expect(verdict.kind).toBe(STATE_READ_VERDICT_FAIL)
+    if (verdict.kind !== STATE_READ_VERDICT_FAIL) return
+    expectTeardownReport(verdict, value, errorClass)
+  })
+})
+
+describe('the teardown\'s per-persona outcome and its error report (b.jg5 SRJ-903, SRJ-104, SRJ-316)', () => {
+  test('teardownStopped carries its reason; teardownFailed its step and the report, field by field', () => {
+    for (const reason of [TEARDOWN_STOPPED_NO_ROW, TEARDOWN_STOPPED_ALREADY_FINISHED, TEARDOWN_STOPPED_EXITED, TEARDOWN_STOPPED_KILLED] as const) {
+      expect(teardownStopped(reason)).toEqual({ kind: TEARDOWN_OUTCOME_STOPPED, reason })
+    }
+    const report = teardownErrorReportOf(errConfigMalformed())
+    for (const step of [TEARDOWN_STEP_STATE_READ, TEARDOWN_STEP_PAUSE, TEARDOWN_STEP_POLL, TEARDOWN_STEP_KILL] as const) {
+      expect(teardownFailed(step, { ...report, extra: 'not copied' } as TeardownErrorReport)).toEqual({ kind: TEARDOWN_OUTCOME_FAILED, step, ...report })
+    }
+  })
+
+  test('a CONFLICT, an UNCLASSIFIED and a plain ErrInternal description carrying fake tokens come out redacted on one line, at the pause (failing or escalating) and at a status read', () => {
+    const values = [
+      errGeneric(PAUSE_VERB, ERR_TMUX_SESSION_CONFLICT_NAME, `session refused (${sentinelInMessage('teardown-conflict')})`),
+      errGeneric(PAUSE_VERB, 'ErrNoHandlingInCscb', `refused (${sentinelInMessage('teardown-unclassified')})`),
+      errInternal(`the store could not be read (${sentinelInMessage('teardown-internal')})`),
+    ]
+    const descriptions = values.flatMap((value) => {
+      const pause = pauseVerdictOf({ error: value })
+      const read = stateReadVerdictOf({ error: value })
+      if (pause.kind === PAUSE_VERDICT_DONE || read.kind !== STATE_READ_VERDICT_FAIL) throw new Error('precondition: each is reported at the pause and fails the read')
+      return [pause.description, read.description, teardownErrorReportOf(value).description]
+    })
+    for (const description of descriptions) {
+      expect(description).toContain(REDACTED_SENTINEL_TAIL)
+      expect(description.includes('\n')).toBe(false)
+    }
+    assertNoLeak(descriptions)
   })
 })
 

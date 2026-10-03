@@ -80,9 +80,11 @@
  *   - ErrClientClosed           (post-close verb call; TS-only)
  *   - ErrCallTimeout            (any verb / per-call timeout exceeded)
  *
- * ErrPauseTimeout is intentionally omitted (SR-0.2): SR-11 Event 12 owns its
- * own pause timeout via CSCB-side polling and never relies on the library's
- * pause budget, so the class never reaches a CSCB handler.
+ * ErrPauseTimeout (pause / the row did not end within the host's
+ * `[pause] timeout_seconds`) is not re-exported: the CLI teardown's pause
+ * (`teardownPersona`, `src/cli.ts`) meets it and escalates to the kill (b.jg5
+ * SRJ-119, SRJ-903), recognised by its class through the classifier
+ * (UNCLASSIFIED, by name), never imported.
  *
  * CSCB-synthetic subclasses (NOT emitted by the agent-director library — minted
  * inside CSCB and branched on via `instanceof` so SR-0.2 holds for them too):
@@ -144,6 +146,17 @@ export type Phase1OnlyErrName = (typeof PHASE1_ONLY_ERR_NAMES)[number]
 export const ERR_SCHEMA_MISMATCH_NAME = 'ErrSchemaMismatch'
 export const ERR_SCHEMA_MIGRATION_REQUIRED_NAME = 'ErrSchemaMigrationRequired'
 export const ERR_STORE_OPEN_NAME = 'ErrStoreOpen'
+
+/**
+ * `unknownName` of agent-director's internal error (b.jg5 SRJ-104). No client
+ * declares a class of this name, so every client delivers it as
+ * `ErrUnknownErrorName`; the classifier answers UNUSABLE NAME when its
+ * description carries the unusable-name phrase and UNCLASSIFIED, reporting
+ * this name, otherwise. A site that must tell "another `ErrInternal`" apart
+ * from other UNCLASSIFIED answers, such as the CLI teardown's pause (SRJ-903),
+ * compares the classification's reported name with this constant.
+ */
+export const ERR_INTERNAL_NAME = 'ErrInternal'
 
 /**
  * `errName` of the error agent-director answers when no row has the instance

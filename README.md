@@ -755,7 +755,7 @@ Plain `stop` leaves the managed bots running — they are meant to survive a ser
 claude-slack-channel-bots stop --stop-bots
 ```
 
-This follows `clean_restart`'s order. It runs the [precheck](#precheck-before-stopping-bots) first, and stops nothing if it fails. When it passes, the server is stopped, then the bot teardown runs for each persona in the last-applied record (or in `config.json` when there is no record), addressing its instance as `cscb_<key>` — pause the bot, poll until it exits (or up to `exit_timeout` seconds), then force-kill on timeout. Teardown kills but never deletes each row, preserving its `claude_session_id` so the bots can resume their conversation history on the next start. Stopping the server before the teardown prevents its `onsessionclosed`/`scheduleRestart` handler from respawning a just-exited bot mid-teardown (which would delete its `ended` row and history). Use it when you want a clean, flushed shutdown of the bots (for example before a host reboot).
+This follows `clean_restart`'s order. It runs the [precheck](#precheck-before-stopping-bots) first, and stops nothing if it fails. When it passes, the server is stopped, then the bot teardown runs for each persona in the last-applied record (or in `config.json` when there is no record), addressing its instance as `cscb_<key>` — pause the bot, poll until it exits (or up to `exit_timeout` seconds), then force-kill on timeout. A bot that can't be paused is handled as [When a bot can't be paused](#when-a-bot-cant-be-paused) describes. Teardown kills but never deletes each row, preserving its `claude_session_id` so the bots can resume their conversation history on the next start. Stopping the server before the teardown prevents its `onsessionclosed`/`scheduleRestart` handler from respawning a just-exited bot mid-teardown (which would delete its `ended` row and history). Use it when you want a clean, flushed shutdown of the bots (for example before a host reboot).
 
 If agent-director can't be reached, or a persona's instance can't be read, the precheck fails: nothing is stopped and the command exits 1 (see [Precheck before stopping bots](#precheck-before-stopping-bots)). If the teardown itself fails after a passed precheck, the command prints the error and exits non-zero rather than silently reporting a clean stop.
 
@@ -788,7 +788,7 @@ For each persona in the last-applied record (or in `config.json` when there is n
 
 `clean_restart` loads the last-applied record first, or `config.json` when there is no record, and takes `exit_timeout` from it. If it cannot (a record that can't be read or is invalid, or a missing or pre-persona file), it exits 1 with `[slack] clean_restart: failed to load config:` and the loader's error, and nothing is stopped. For a bad record, the error says that deleting it makes the next start apply `config.json` (see [Reload](#reload)). `clean_restart` doesn't apply a pending `config.json` edit: the server comes back on the record.
 
-A benign kill outcome — the row already being gone — is tolerated per persona and does not abort the restart. Any other per-persona teardown failure, including a pause failure that escalates to a kill which then fails to reach agent-director, is fatal: it fails loudly and aborts the restart (non-zero exit).
+A benign kill outcome — the row already being gone — is tolerated per persona and does not abort the restart. Any per-persona teardown failure is fatal: it fails loudly and aborts the restart (non-zero exit). That includes a pause refused for a reason that fails the teardown at once, and a force-kill that fails (see [When a bot can't be paused](#when-a-bot-cant-be-paused)).
 
 Behavior by case:
 
@@ -799,6 +799,28 @@ Behavior by case:
 - **agent-director unreachable, or a persona's instance can't be read:** the precheck fails and nothing is stopped: the old server and every bot keep running, and `clean_restart` exits 1 (see [Precheck before stopping bots](#precheck-before-stopping-bots)).
 - **An agent-director older than CSCB needs:** `clean_restart` runs the same version checks as the server's start, so on an agent-director below CSCB's Phase 1 floor, or below the client's own minimum, its precheck fails at the connection and nothing is stopped. Follow the README section "Switching over to agent-director Phase 1". To stop the bots before the switch-over, use `stop --stop-bots`, which works on any agent-director the client accepts (see [`stop`](#claude-slack-channel-bots-stop)).
 - **agent-director fails during the teardown:** the teardown fails loudly and the restart is aborted (non-zero exit); no new server is started. The `no spawn row` message appears only when a persona genuinely has no spawn, never when the client failed to reach agent-director.
+
+#### When a bot can't be paused
+
+`stop --stop-bots` and `clean_restart` share one bot teardown. When agent-director refuses to pause a persona's bot, what happens depends on why.
+
+The bot is force-killed instead, and its row is kept, when:
+
+- its session is already gone;
+- agent-director keeps not answering: the pause is tried 3 times, 2 s apart, before the force-kill;
+- the bot is still launching (its instance is `pending`, for example at a launch dialog). Its instance stays `pending` until agent-director marks it `missing`;
+- the pause times out. agent-director waits up to its `[pause] timeout_seconds` for the bot to exit, and the default call timeout covers that wait (see [Sizing the agent-director call timeout](#sizing-the-agent-director-call-timeout));
+- agent-director refuses it for any reason not listed below.
+
+That persona's teardown fails at once, with no force-kill, when:
+
+- a tmux session conflict holds the persona's session, which may not be the bot's own;
+- the tmux session name recorded on the persona's instance can't be used. The command puts no hold on the persona; only the server does that;
+- tmux is unavailable;
+- agent-director reports an internal error;
+- agent-director refuses its config file, `~/.agent-director/config.toml`. The error names the file.
+
+The other personas are still torn down. A persona whose teardown fails makes the command exit non-zero (see [`stop`](#claude-slack-channel-bots-stop) and [`clean_restart`](#claude-slack-channel-bots-clean_restart)).
 
 ### Precheck before stopping bots
 
@@ -1713,7 +1735,7 @@ The precheck failed, so nothing was stopped: the server and every bot keep runni
 The installed agent-director is below the agent-director client's own minimum, so only the server was stopped. See [`stop`](#claude-slack-channel-bots-stop) for what was left running and how to read the server stop's lines, then follow the README section "Switching over to agent-director Phase 1".
 
 **`clean_restart` or `stop --stop-bots` exits non-zero with an agent-director teardown error**
-This is intentional: when agent-director is unreachable, the teardown cannot run, so the command fails loudly rather than silently no-op'ing and (for `clean_restart`) restarting on top of bots it never touched. Confirm agent-director is installed and responsive with `agent-director version`, then re-run the command. Teardown kills but never deletes rows on any failure path, so it is always safe to retry once agent-director is reachable.
+This is intentional: when agent-director is unreachable, the teardown cannot run, so the command fails loudly rather than silently no-op'ing and (for `clean_restart`) restarting on top of bots it never touched. Confirm agent-director is installed and responsive with `agent-director version`, then re-run the command. A teardown also fails, with no force-kill, when a bot's pause is refused for one of the reasons in [When a bot can't be paused](#when-a-bot-cant-be-paused); fix that cause first. Teardown kills but never deletes rows on any failure path, so it is always safe to retry once agent-director is reachable.
 
 **Bots come back with no memory of the prior conversation after a reboot**
 With `resume_enabled: true`, a bot whose host rebooted (or pod resumed) should return with its conversation history. If it comes back amnesiac, confirm the system-installed `agent-director` is **≥ 0.8.0** (`agent-director version`) — reboot recovery relies on capabilities added in that release. Note that `bun run install-check` does **not** confirm this: its client floor is `0.7.0`, lower than the reboot-recovery requirement, so install-check passes on a `0.7.x` binary that still yields amnesiac bots. Verify the resume requirement directly with `agent-director version`. Note: legacy sessions created before upgrading to 0.8.0 may lose history exactly once on their first post-upgrade recovery, then resume cleanly thereafter.
