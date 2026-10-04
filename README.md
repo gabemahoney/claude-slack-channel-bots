@@ -50,7 +50,7 @@ See the sections below for manual configuration details if you prefer not to use
 
 - [Bun](https://bun.sh) `>= 1.0.21` (agent-director minimum)
 - [Claude Code](https://claude.ai/code) installed and authenticated
-- [`agent-director`](https://github.com/gabemahoney/agent-director) **installed system-wide** as a prerequisite — like `git` or `docker`. CSCB no longer vendors the AD binary. The npm `agent-director` package CSCB depends on is now a thin TypeScript shim that locates the system-installed binary at startup via `resolveSystemBinary()` / `Client.create()` and refuses to start when the binary is missing, too old, or unreachable. The startup gate enforces AD's required version (declared by AD in `dist/version-floor.json`), also refuses a binary older than agent-director Phase 1 (see [Startup errors](#startup-errors)), and reports the required version on mismatch. agent-director itself requires [tmux](https://github.com/tmux/tmux) on the operator's PATH; CSCB no longer probes for it directly.
+- [`agent-director`](https://github.com/gabemahoney/agent-director) **installed system-wide** as a prerequisite — like `git` or `docker`. CSCB no longer vendors the AD binary. The npm `agent-director` package CSCB depends on is now a thin TypeScript shim that locates the system-installed binary at startup via `resolveSystemBinary()` / `Client.create()` and refuses to start when the binary is missing, too old, or unreachable. This release requires agent-director Phase 1, installed on the host together with it, and the two are rolled back together; CSCB changes no agent-director code (see "Switching over to agent-director Phase 1" under [Migration](#migration)). The startup gate enforces AD's required version (declared by AD in `dist/version-floor.json`), also refuses a binary older than agent-director Phase 1 (see [Startup errors](#startup-errors)), and reports the required version on mismatch. agent-director itself requires [tmux](https://github.com/tmux/tmux) on the operator's PATH; CSCB no longer probes for it directly.
 - Slack workspace admin access (to create and configure one Slack app per persona)
 - **cozempic** (optional) — Python 3.10+ and `pip install cozempic` — used by JSONL path resolution helpers retained for downstream callers.
 
@@ -2098,7 +2098,7 @@ Fix the cause first: for `UNAVAILABLE`, confirm agent-director is installed and 
 **Bots come back with no memory of the prior conversation after a reboot**
 With `resume_enabled: true`, a bot whose host rebooted (or pod resumed) should return with its conversation history. If it comes back amnesiac, confirm the system-installed `agent-director` is **≥ 0.8.0** (`agent-director version`) — reboot recovery relies on capabilities added in that release. Note that `bun run install-check` does **not** confirm this: its client floor is `0.7.0`, lower than the reboot-recovery requirement, so install-check passes on a `0.7.x` binary that still yields amnesiac bots. Verify the resume requirement directly with `agent-director version`. Note: legacy sessions created before upgrading to 0.8.0 may lose history exactly once on their first post-upgrade recovery, then resume cleanly thereafter.
 
-A bot also starts a new conversation, by design, when its session no longer matches the applied configuration. A config edit takes effect only once it is applied (see [Reload](#reload)); a restart or reboot alone runs the last-applied record. When a change to a persona's `working_directory` is applied, the persona is torn down and brought up fresh, once its old instance has ended (see "A persona waits on an old instance in its working directory" above). When a change to a persona's effective `claude_config_dir` (its own or the top-level default) is applied, the bot starts a new conversation the next time it would be resumed (see [When next-launch and server-wide changes take effect](#when-next-launch-and-server-wide-changes-take-effect)); a bot that keeps running keeps its old config directory until then. A bot whose instance no longer matches its working directory or config directory, or whose `resume_enabled` is false, starts a new conversation on the same instance: the old conversation stays in its directory as an earlier life of that instance, and nothing is deleted. A bot that is still running is first ended, with each kill checked, before the new conversation starts; one that is still starting is never typed into: it is ended with a checked kill, and the new conversation starts only once agent-director's grace period has passed since its launch start (see "A persona's instance is still starting" above). A persona retired by a confirmed change (removed and added again with the same key, renamed back, or brought up from its new entry after a `credentials_file` path or `working_directory` change) starts a new conversation on the same instance, restarts included, and its old conversation is never resumed. So does a persona whose instance a server start found while the persona was not in the applied configuration (for example, after `config.json.last-applied` was deleted) and that is added back later: that start recorded its key as retired. After upgrading from an earlier release, each bot also starts fresh once: a bot instance from before the upgrade is never resumed (see [Upgrading to personas](#upgrading-to-personas)). The log names the reason: search `server.log` for `sweeping row`, `pre-persona row`, `replacing the row`, `not resuming; replacing its row` or `key is retired`.
+A bot also starts a new conversation, by design, when its session no longer matches the applied configuration. A config edit takes effect only once it is applied (see [Reload](#reload)); a restart or reboot alone runs the last-applied record. When a change to a persona's `working_directory` is applied, the persona is torn down and brought up fresh, once its old instance has ended (see "A persona waits on an old instance in its working directory" above). When a change to a persona's effective `claude_config_dir` (its own or the top-level default) is applied, the bot starts a new conversation the next time it would be resumed (see [When next-launch and server-wide changes take effect](#when-next-launch-and-server-wide-changes-take-effect)); a bot that keeps running keeps its old config directory until then. A bot whose instance no longer matches its working directory or config directory, or whose `resume_enabled` is false, starts a new conversation on the same instance: the old conversation stays in its directory as an earlier life of that instance, and nothing is deleted. A bot that is still running is first ended, with each kill checked, before the new conversation starts; one that is still starting is never typed into: it is ended with a checked kill, and the new conversation starts only once agent-director's grace period has passed since its launch start (see "A persona's instance is still starting" above). A persona retired by a confirmed change (removed and added again with the same key, renamed back, or brought up from its new entry after a `credentials_file` path or `working_directory` change) starts a new conversation on the same instance, restarts included, and its old conversation is never resumed. So does a persona whose instance a server start found while the persona was not in the applied configuration (for example, after `config.json.last-applied` was deleted) and that is added back later: that start recorded its key as retired. After upgrading from an earlier release, each bot also starts fresh once: a bot instance from before the upgrade is never resumed (see [Step 10: Start the new CSCB](#step-10-start-the-new-cscb)). The log names the reason: search `server.log` for `sweeping row`, `pre-persona row`, `replacing the row`, `not resuming; replacing its row` or `key is retired`.
 
 **Session crashes on resume with "sandbox required but unavailable"**
 This is a known regression in certain Claude Code releases (e.g. v2.1.120) where `--resume` triggers a sandbox check that fails in headless environments. Set `resume_enabled: false` in `config.json`, apply the change and restart the server (server-wide settings take effect at the next start; see [Reload](#reload)) to disable `--resume` entirely — the bot will always start a fresh Claude session instead of resuming a prior conversation, both on startup and on runtime auto-restart:
@@ -2258,7 +2258,7 @@ This gracefully exits the managed Claude Code sessions, stops and restarts the s
 
 For operators upgrading from a pre-`agent-director` install:
 
-1. **Install the new CSCB**: `bun remove claude-director` (if present) and `bun install -g claude-slack-channel-bots@^<new>`. The `agent-director` library is pulled in transitively — no separate install step.
+1. **Install the new CSCB together with agent-director Phase 1**: installing the npm package is not the whole install. This release needs agent-director Phase 1 on the host, installed with it by the runbook in [Switching over to agent-director Phase 1](#switching-over-to-agent-director-phase-1), which also says when to install the package. The npm `agent-director` package CSCB pulls in is only the client; the binary is installed system-wide (see [Prerequisites](#prerequisites)). Remove `claude-director` first if present: `bun remove claude-director`.
 2. **Delete any old relay hooks** — see [Upgrading from pre-Epic-2 (v0.5.x → v0.6.x)](#upgrading-from-pre-epic-2-v05x--v06x) for the cleanup commands.
 3. **(Optional) Configure an agent-director `find-missing` sweep**. CSCB itself runs `find-missing` once before a resume during dead-session recovery, so a bot that died on reboot comes back with its history intact. If agent-director doesn't answer that sweep (it times out or reports tmux not answering), CSCB stops the recovery there, with no resume and no fresh session, and retries it later. A standalone periodic sweep is no longer required for CSCB recovery, but remains useful if you want stuck rows from non-CSCB spawns reconciled on a cadence. To add one, use a cron entry (or systemd timer):
    ```cron
@@ -2274,36 +2274,181 @@ For operators upgrading from a pre-`agent-director` install:
 
 After step 1, every CSCB bot is spawned through `client.spawn(...)` with `relay_mode='on'`. The green/red Slack button UX is byte-identical to the pre-migration behavior; the action_id shape changes from `perm_(allow|deny)_<uuid>` to `perm_(allow|deny)_cscb_<key>_<request_token>` (where `<key>` is the persona key and `<request_token>` is a UUIDv4 minted by agent-director) but this is invisible to end users.
 
+### Switching over to agent-director Phase 1
+
+This release requires agent-director Phase 1, installed on the host together with it; CSCB changes no agent-director code. The two are installed together, by this runbook, and rolled back together, by "Rolling back the switch-over".
+
+- Every agent on the host, with every long-running agent-director process (`agent-director serve` included), is stopped before either binary change and started again after it.
+- The old CSCB never runs against Phase 1, and the new one never against 0.10.0: no bot server runs between step 3 and step 10, and no side-by-side install under another path is used.
+- The switch-over log is your own record, kept wherever you choose until rollback is no longer wanted. Each step says what to record in it.
+- Run every command as the workers' user (the user the bot server launches workers as), in the tmux environment step 1 pins.
+- Steps marked "operator action" are done by a human on the host; nothing in CSCB does them.
+
+#### Arrived here from a startup refusal?
+
+Your new CSCB is installed and its server refused to start with `ad-below-phase1-floor` or `ad-system-install-too-old`. The refusal launched, killed and deleted nothing, and left your bots as they were.
+
+This block covers only a refusal before agent-director Phase 1 is installed on the host, by step 8 or otherwise. Act in this order:
+
+1. If `config.json` is in persona form and no pre-persona copy of it exists, neither step 1's copy nor one you kept elsewhere, stop here and change nothing: no reinstall, no start and no step 1. Rebuild the pre-persona `config.json` by hand, as step 8 of "Rolling back the switch-over" says. Once you have rebuilt it, follow this block again from its start.
+2. Otherwise, first rebuild by hand to their pre-persona form, as step 8 of "Rolling back the switch-over" says, the crontable targets and `/interject` callers that the conversion to personas left in persona form where step 1's copy of them is missing. Then reinstall the previous CSCB, the version step 1 recorded or else the version the host ran before, with the pre-persona `config.json`, crontable, `/interject` callers, `access.json` and Slack token environment variables: from step 1's files, or a pre-persona copy of `config.json` you kept, where they exist, and otherwise from those still in place. Start it, re-enabling the host's autostart for CSCB if it was disabled, as step 8's "no go" branch does.
+3. Then, if agent-director is not 0.10.0 (below 0.7.0 under `ad-system-install-too-old`; 0.7.0 to 0.9.x under `ad-below-phase1-floor`), bring it to 0.10.0 outside this runbook. This block gives no command for it.
+4. Then start the runbook at [step 1](#step-1-check-the-host-and-stage-the-release). Step 3 is then the old CSCB's own stop.
+
+**A refusal after Phase 1 was installed.** Installing agent-director Phase 1 migrates agent-director's store. A refusal at step 10, or at any later start of the new CSCB (an autostart, `clean_restart` or the restart in step 4 of "Rolling back the switch-over" included), on a host whose Phase 1 install was step 8's or agent-director's own install on a publishing host, means the server finds the wrong agent-director binary. For that refusal, and only for it:
+
+1. Check the binary. The server finds `$HOME/.agent-director/bin/agent-director` first, then the first `agent-director` on `PATH`. Take the binary path the startup-errors entry names and run `<path> version`, as the workers' user in the bot server's launcher environment.
+2. Then either put agent-director Phase 1 back as the binary the server finds, or follow "Rolling back the switch-over", which starts the previous CSCB. To put it back, stop every agent on the host and every long-running agent-director process (`agent-director serve` included) before that binary change, and start them again after it. A human stops any CSCB bot still running through the item "Stopping a set of agents before a binary change" in the "Operator actions" section of agent-director's README. Once the server finds Phase 1, start the new CSCB as [step 10](#step-10-start-the-new-cscb) does.
+
+Never reinstall the old CSCB onto the migrated store. At the restart in step 4 of "Rolling back the switch-over", an agent that could not be stopped still runs: put nothing back and don't follow the rollback again. The new CSCB stays stopped until agent-director has dealt with that agent (as that step says), and then this branch applies.
+
+**Phase 1 installed some other way.** A host where agent-director Phase 1 was installed in any other way outside this runbook is not a target of this runbook, the same way step 1 sends a host on any version but 0.10.0 outside it. Follow "Rolling back the switch-over" and the item "agent-director was installed outside the caller's switch-over" in the "Operator actions" section of agent-director's README. Don't put Phase 1 back and start the new CSCB.
+
+**A stop by the runtime re-check** is not a switch-over case. See [Found while the server was running](skills/debug-slack-channel-bots/SKILL.md#found-while-the-server-was-running) in the debugging skill.
+
+#### The publishing host
+
+`/publish` checks that the publishing host has an agent-director binary the client accepts: 0.7.0, the client's minimum, or later. This runbook starts by staging a release that is already published, so the host that publishes it is covered here:
+
+1. Publish from a host that already passes that check. This is the first choice.
+2. A host with no agent-director installs agent-director's Phase 1 release by agent-director's own install, then publishes. It has no agents and nothing to back up.
+3. A host below the client's minimum (0.7.0) publishes from another host, and is not a target of this runbook: it brings agent-director to 0.10.0 first, outside this runbook, since step 1 stops on any version but 0.10.0. This block gives no command for it.
+
+A publishing host needs no install-gate go line.
+
+#### Step 1: Check the host and stage the release
+
+Do this beforehand, with the old CSCB running and still installed as the global package. Nothing goes down in this step.
+
+1. **The go line.** Confirm that agent-director's Phase 1 install-gate record has this host's dated go line. It is written before the Phase 1 install and is the approval for the switch-over. If it does not, stop here, before anything goes down. This runbook never writes the go line.
+2. **agent-director's version.** Run `agent-director version` in the bot server's launcher environment, as the workers' user, the same as the Claude Code check below, and confirm that it shows 0.10.0, the only supported starting point. If it does not, stop here, before anything goes down. A host on an earlier version (below 0.7.0, or 0.7.0 to 0.9.x) first brings agent-director to 0.10.0, outside this runbook; this step names no command for it.
+3. **The tmux socket (operator action).** Pin the tmux socket for the bot server's launcher, `find-missing-loop.sh` and the workers. Run `tmux display-message -p '#{socket_path}'` from the bot server's launcher, the loop's environment and a worker's. Confirm that all three print the same path, that it is the pinned path (a `TMUX_TMPDIR` that names a missing path falls back silently to `/tmp`), and that the three share one HOME. Record the result in the switch-over log.
+4. **tmux.** Confirm tmux 3.2 or later, with `remain-on-exit` off.
+5. **Claude Code.** Run `claude --version` in the bot server's launcher environment (the same user and `PATH` the server launches workers with), and confirm that the workers' Claude Code is 2.1.280 or later: the minimum agent-director states for its exec-form hooks, and the version the fleet runs. On a Claude Code too old for exec-form hooks (older than 2.1.139), each hook prints nothing, agent-director records `ad.hook.ignored` with the reason `no_exec_form`, and every launch stays `pending`. If it is older than 2.1.280, stop here, before anything goes down.
+6. **agent-director's timing settings.** Read all nine keys of the `[tmux]` table of `~/.agent-director/config.toml` (see [agent-director's timing settings](#agent-directors-timing-settings); a missing file, a missing key or `0` means the default) and its `[pause] timeout_seconds` (30 s when the file or the key is missing). Record the effective values in the switch-over log. Confirm that the three windows, `pending_grace_seconds`, `stopping_window_seconds` and `starting_session_seconds`, are the values you intend and each is at or above its minimum: `starting_session_seconds` 60, `stopping_window_seconds` 30, and `pending_grace_seconds` the larger of 30 and ⌈(`create_timeout_ms` + `pipe_close_wait_ms`) / 1000⌉ + 20. A `pending_grace_seconds` above 540 s shortens agent-director's SessionStart wait to 540 s.
+7. **The call timeout.** Always computing from this host's values, confirm that the `agent_director_call_timeout_ms` the persona configuration will carry (staged below; `60000` when it leaves the setting out) exceeds the need: the largest ceiling among the verbs CSCB calls, plus the 15 s margin (15000 ms). Record the computed need in the switch-over log. With Q, A, C, W and E the host's `query_timeout_ms`, `action_timeout_ms`, `create_timeout_ms`, `pipe_close_wait_ms` and `kill_exit_wait_ms`, and B its `sweep_budget_seconds` in ms, the ceilings, in ms, are:
+   - `kill`: the larger of 2Q + 2A + E + 4W and 3Q + 2A + 5W;
+   - `read-pane`: 3Q + A + 4W;
+   - `send-keys`: 3Q + 2A + 5W;
+   - `pause`: 3Q + 2A + 5W, plus `[pause] timeout_seconds` (times 1000);
+   - the launch row, `resume/spawn-with-reuse/plain-spawn` (`resume`, a spawn with reuse and a plain spawn): the larger of Q + C + 2A + 4W and 2Q + C + 3W;
+   - `find-missing`: B + Q + W.
+
+   `expire` is not among them: CSCB never calls it. [Sizing the agent-director call timeout](#sizing-the-agent-director-call-timeout) works through examples.
+8. **Leftover sessions.** As the workers' user, on the pinned socket, compare `tmux ls` with `agent-director list`, and record in the switch-over log every `slack_bot_` session that no row names.
+9. **Stage the new release without installing it.** Choose its exact version, record it in the switch-over log and confirm that it is available to install. Write the persona configuration, with `agent_director_call_timeout_ms`, in a separate file, never `config.json`, which the old CSCB reads. Prepare the Slack apps. Nothing is installed over the global package yet, so step 3's `stop --stop-bots` is the old version's own and reads the old, pre-persona `config.json`. Steps 1, 2, 3, 5 and 6 of [Upgrading to personas](#upgrading-to-personas) belong here.
+10. **Copies for rollback.** Keep copies of the pre-persona `config.json`, the crontable, the `/interject` callers (the host crontab's `curl` lines included), `access.json` and the Slack token environment variables the old CSCB uses. Record the old CSCB's exact version in the switch-over log beside them.
+11. **The orchestrator prompt (operator action).** The orchestrator system prompt's "ship now" wording may go out any time before the switch-over.
+
+#### Step 2: Disable CSCB's autostart
+
+Disable the host's autostart for CSCB until step 10 (operator action), and record it in the switch-over log.
+
+#### Step 3: Stop the old CSCB with its bots
+
+With the old CSCB still installed, run its own stop:
+
+```sh
+claude-slack-channel-bots stop --stop-bots
+```
+
+This is the old version's own `stop --stop-bots`, which reads the old, pre-persona `config.json`, since nothing new is installed before step 7. An operator arriving from a startup refusal has first reinstalled the previous CSCB (see [Arrived here from a startup refusal?](#arrived-here-from-a-startup-refusal)), so this holds for them too. From here until step 10, no bot server runs.
+
+#### Step 4: Wait for the old rows to end
+
+Run `agent-director find-missing`, then wait at most 5 minutes for every `service=cscb` row to read `ended` or `missing`:
+
+```sh
+agent-director find-missing
+agent-director list --label service=cscb
+```
+
+A row still live after that is handled in step 5.
+
+#### Step 5: Check for leftover sessions
+
+As the workers' user, on the socket pinned in step 1, run a read-only `tmux ls`. Look for any old `slack_bot_<name>_<channel>` or `slack_bot_<channel ID>` session, and any live old row. Handle each leftover by its kind:
+
+- **A leftover with a row** (live or finished) is ended in step 6, before the Phase 1 install.
+- **A leftover with no row, whose name cannot equal any new persona's `slack_bot_<key>`:** record it in the switch-over log and go on; agent-director matches session names exactly. You may end it later with the exact-name `tmux kill-session -t =<name>`.
+- **A leftover with no row, whose name equals a new persona's `slack_bot_<key>`:** note its window ids with a read-only `tmux list-windows -t =<name>`, end it with the exact-name `tmux kill-session -t =<name>`, and make the gone check.
+
+**The gone check**, as the workers' user on the pinned socket: a read-only `tmux ls` no longer shows the session, and a read-only `tmux list-windows -a` shows none of its windows in any other session. A grouped session or a linked window keeps the worker running after its session is ended.
+
+#### Step 6: End the leftovers that have a row
+
+Only if step 5 found a leftover with a row. End each such leftover now, with the still-installed 0.10.0 binary. After the Phase 1 install, a row from before it has no launch token or recorded socket, so no session is ever its current launch's: Phase 1's `kill` fails closed on it, and not even agent-director's option for a finished row ends its session.
+
+For each one:
+
+1. Note the session's window ids, as in step 5.
+2. Run `agent-director kill --claude-instance-id <id>`, then make the gone check.
+3. If the session or one of its windows remains, end the session with the exact-name `tmux kill-session -t =<name>`, and make the gone check again.
+4. Run `agent-director find-missing` until the row reads `ended` or `missing`, for at most 5 minutes.
+
+A leftover that cannot be ended this way means no Phase 1 install: take step 8's "no go" branch, and investigate the leftover with `agent-director list --tmux-session-name <name>`.
+
+#### Step 7: Install the new CSCB without starting it
+
+1. Install the staged package over the global install, without starting it; the autostart stays disabled from step 2:
+   ```sh
+   bun install -g claude-slack-channel-bots@<the version recorded in step 1>
+   ```
+2. Put the persona configuration in place as `config.json`.
+3. Write each persona's credentials file with the new CLI (see [`claude-slack-channel-bots credentials`](#claude-slack-channel-bots-credentials)).
+4. Rewrite crontable targets and `/interject` callers to name personas.
+5. Run the new install check (see [Checking your agent-director install](#checking-your-agent-director-install)). It passes on the still-installed 0.10.0, with its note.
+
+Steps 4, 7 and 8 of [Upgrading to personas](#upgrading-to-personas) belong here. From this step the new CSCB is deployed but not started.
+
+#### Step 8: Install agent-director Phase 1
+
+1. **The go line.** Confirm that the install-gate record has this host's dated go line.
+
+   **No go.** If it does not, there is no Phase 1 install. Reinstall the previous CSCB, the version step 1 recorded, with the `config.json`, crontable, `/interject` callers, `access.json` and Slack token environment variables saved in step 1. Start it on 0.10.0 and re-enable its autostart (operator action). Every other agent this step already stopped is started again on 0.10.0 by its owner (operator action). The runbook stops there.
+2. **Stop every other agent (operator action).** Otherwise, before the install, stop every other agent on the host: orchestrators' workers, hand-started sessions and sessions with an `agent-director serve`. Confirm with `agent-director list` that each stopped agent's row reads `ended` or `missing` (a row that 0.10.0 left stuck live for a dead agent is expected), and with a read-only `tmux ls` that no agent session is left. Record it in the switch-over log. An agent that cannot be stopped means "no go".
+3. **Back up the store.** Back up `~/.agent-director/state.db` with an online-consistent copy, sqlite3's `.backup`, not a plain file copy, because the store runs in WAL mode:
+   ```sh
+   sqlite3 ~/.agent-director/state.db ".backup '<backup file>'"
+   ```
+   The backup is for disaster recovery only. It is not the rollback path.
+4. **Install agent-director Phase 1.** Its schema migration adds thirteen columns and the one-row `store_meta` table, which holds the store's id. Confirm that `agent-director version` shows the Phase 1 version.
+5. **Write the `[tmux]` values.** Right after the install, before the restarts that follow and so before the new CSCB starts, write any non-default `[tmux]` values you want into `~/.agent-director/config.toml`. A long-running agent-director process reads the file only when it starts.
+6. **Restart `serve` (operator action).** Restart every `agent-director serve` process and every other long-running agent-director process still running. Compare process start times to confirm that none is older than the install. Record the version and that result in the switch-over log.
+7. **Check the settings again.** Read the nine timing settings and `[pause] timeout_seconds` again as in step 1, and record the effective values. Confirm them and the call timeout as in step 1; if the need has grown, raise `agent_director_call_timeout_ms` in `config.json` before step 10. Confirm that `agent-director list` answers without `ErrConfigMalformed`.
+
+#### Step 9: Start the other agents again
+
+Every other agent on the host is started again by its owner (operator action), which also starts its `serve` processes on the Phase 1 binary.
+
+#### Step 10: Start the new CSCB
+
+1. **The orchestrator prompt's worker cleanup (operator action).** Before the new CSCB starts, change worker cleanup in the shared orchestrator prompt, `~/.claude/channels/slack/system-prompt.md`, and its source copy, `~/projects/horde_admin/cscb_system_prompt.md`, from row-delete cleanup to "kill, then leave the row". This change goes out in the same deploy as agent-director Phase 1. Kill-then-leave works on 0.10.0 too, so a rollback does not revert it.
+2. **Start the new CSCB**, then re-enable the host's autostart for CSCB (operator action):
+   ```sh
+   claude-slack-channel-bots start
+   ```
+   The first start has no last-applied record yet, so it checks `config.json`, records it and applies it; after that, edits wait until you apply them (see [Reload](#reload)). Each persona starts fresh once. Pre-persona rows are kept and never resumed.
+3. **The post-install check (operator action).** Once every agent has been started again, confirm that `agent-director list --state pending` shows a `launch_started_at` on every row. Record the result in the switch-over log, and as this host's dated post-install check line in agent-director's install-gate record. A row without one is a human's to look at, and the persona whose row it is is held (see "A persona posts a *Held: launch start not recorded* notice" and "How a hold ends" in [Troubleshooting](#troubleshooting)).
+
+#### Step 11: Schedule the daily expire
+
+Schedule a daily `agent-director expire` at the default retention, never `--older-than 0d`, as the workers' user in the tmux environment step 1 pinned (operator action). Add it to the host's sweep loop, `~/startup/find-missing-loop.sh`, the script step 1's socket check names: nothing on the host runs `expire` before this step.
+
+The orchestrator system prompt's "hold until after" wording goes out now (operator action).
+
 ### Upgrading to personas
 
-This major version accepts only the persona configuration format. When you upgrade from an earlier major version, take these steps in order:
+This major version accepts only the persona configuration format. These are the configuration steps of an upgrade from an earlier major version. Do them inside the switch-over runbook, not on their own: steps 1, 2, 3, 5 and 6 (the persona file, names, reply settings, Slack apps and who can reach each persona) at [step 1 of the switch-over](#step-1-check-the-host-and-stage-the-release), and steps 4, 7 and 8 (credentials files, crontable and `/interject` callers) at [step 7 of the switch-over](#step-7-install-the-new-cscb-without-starting-it). At switch-over step 1, these steps are written into the separate staged file, not `config.json`; step 7 puts that file in place as `config.json`.
 
-1. **Stop the old bots first.** Before you install this version or change `config.json`, stop the earlier version with its bots and check that none is left: follow steps 1–3 of [First start on a host with running bots](#first-start-on-a-host-with-running-bots) below. Then install this version.
-2. **Rewrite `config.json` by hand.** A configuration from an earlier major version stops the server at start, with an error that names the offending setting and says the configuration must be converted to personas. Nothing is converted automatically and the file is not changed. Write a `personas` list as described in [Personas (config.json)](#personas-configjson); the server-wide settings keep their names. The `debug-slack-channel-bots` skill covers this error under "Pre-persona configuration".
-3. **Pick persona names whose keys don't start with one another.** The configuration check rejects such a pair. If your bots were named `horde`, `horde_admin`, …, don't name a persona `horde` beside `horde_admin`: give the shorter name a suffix, such as `horde_main` (see [Persona name and key](#persona-name-and-key)).
-4. **Set the reply settings in `config.json`.** Nothing else carries an acknowledgement reaction over: to keep one, set `ack_reaction` as a top-level setting. If you had changed how replies are split, set `reply_chunk_limit` and `reply_chunk_mode` there too. See [Server-wide settings](#server-wide-settings).
-5. **Move the tokens into credentials files.** Tokens come only from each persona's credentials file. Create one [credentials file](#credentials-files) per persona, then remove any token environment variables you exported for the previous version.
-6. **Give each persona its own Slack app.** Your existing app can serve one persona; create another app for each additional persona. Re-install the existing app from the current `slack-app-manifest.yml` so it gains the `im:write` scope; the `debug-slack-channel-bots` skill has the steps under "A persona can't open a DM".
-7. **Decide who can reach each persona.** Who can reach a persona is decided only by its `channels`, each channel's `delivery` and its `dm.enabled` switch (see [Channel delivery](#channel-delivery) and [Direct messages](#direct-messages-dmenabled)).
-8. **Rewrite crontable lines to name personas.** A crontable target that names a channel matches no persona, and the line is logged `unknown-persona` each time it fires. Rewrite each target as a persona's name or key (see [Scheduled Prompts](#scheduled-prompts-cscb_cron)).
-9. **Update `/interject` callers to send `persona`.** A request without `persona` is refused with 400, and a successful response holds only `ok` and `persona`. Change every script that calls `/interject`, including host crontab `curl` lines, to name a persona by name or key (see [Interject](#interject)).
-10. **Start this version** with `claude-slack-channel-bots start`. The first start has no last-applied record yet, so it checks `config.json`, records it and applies it. After that, edits wait until you apply them; see [Reload](#reload).
-11. **Expect each bot to start fresh once.** Bot instances created before this version are never resumed, so each persona starts once without its prior conversation. Their agent-director rows are kept, never deleted: no persona reuses their instance IDs. If one is still running at the first start, the start kills it and logs `pre-persona row` in `server.log`.
-
-#### First start on a host with running bots
-
-Stop the earlier version's bots, and check that none is left, before this version starts for the first time. Its start kills an old bot that is still running, but agent-director can report that kill as done while the bot's tmux session keeps running, and nothing would find that bot afterwards.
-
-1. **Stop the earlier version with its bots**, before you install this version or rewrite `config.json` (this command reads the configuration the earlier version runs):
-   ```sh
-   claude-slack-channel-bots stop --stop-bots
-   ```
-2. **Wait until every old row reads `ended` or `missing`.** Run this until the `state` of every row it lists is `ended` or `missing`:
-   ```sh
-   agent-director list --label service=cscb
-   ```
-3. **Check by hand that no old bot session is left.** As the user that runs the bots, run `tmux ls`. No session named `slack_bot_<name>_<channel ID>` (or `slack_bot_<channel ID>`) may be listed; this version hasn't started, so every `slack_bot_` session is an old bot. If one is, end it by its exact name, `tmux kill-session -t '=<session name>'` (the `=` matches that name only), and run `tmux ls` again.
-4. **Install this version and go on with the upgrade** from step 2 of [Upgrading to personas](#upgrading-to-personas): `config.json`, credentials files and Slack apps, then `claude-slack-channel-bots start`.
+1. **Rewrite `config.json` by hand.** A configuration from an earlier major version stops the server at start, with an error that names the offending setting and says the configuration must be converted to personas. Nothing is converted automatically and the file is not changed. Write a `personas` list as described in [Personas (config.json)](#personas-configjson); the server-wide settings keep their names. The `debug-slack-channel-bots` skill covers this error under "Pre-persona configuration".
+2. **Pick persona names whose keys don't start with one another.** The configuration check rejects such a pair. If your bots were named `horde`, `horde_admin`, …, don't name a persona `horde` beside `horde_admin`: give the shorter name a suffix, such as `horde_main` (see [Persona name and key](#persona-name-and-key)).
+3. **Set the reply settings in `config.json`.** Nothing else carries an acknowledgement reaction over: to keep one, set `ack_reaction` as a top-level setting. If you had changed how replies are split, set `reply_chunk_limit` and `reply_chunk_mode` there too. See [Server-wide settings](#server-wide-settings).
+4. **Move the tokens into credentials files.** Tokens come only from each persona's credentials file. Create one [credentials file](#credentials-files) per persona, then remove any token environment variables you exported for the previous version.
+5. **Give each persona its own Slack app.** Your existing app can serve one persona; create another app for each additional persona. Re-install the existing app from the current `slack-app-manifest.yml` so it gains the `im:write` scope; the `debug-slack-channel-bots` skill has the steps under "A persona can't open a DM".
+6. **Decide who can reach each persona.** Who can reach a persona is decided only by its `channels`, each channel's `delivery` and its `dm.enabled` switch (see [Channel delivery](#channel-delivery) and [Direct messages](#direct-messages-dmenabled)).
+7. **Rewrite crontable lines to name personas.** A crontable target that names a channel matches no persona, and the line is logged `unknown-persona` each time it fires. Rewrite each target as a persona's name or key (see [Scheduled Prompts](#scheduled-prompts-cscb_cron)).
+8. **Update `/interject` callers to send `persona`.** A request without `persona` is refused with 400, and a successful response holds only `ok` and `persona`. Change every script that calls `/interject`, including host crontab `curl` lines, to name a persona by name or key (see [Interject](#interject)).
 
 ---
 
