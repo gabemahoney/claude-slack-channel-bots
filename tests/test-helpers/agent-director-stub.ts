@@ -46,13 +46,19 @@
  * so a test reads the flag from `spawnCalls` with no cast, and answers it like
  * any spawn, from the same queue and knobs.
  *
- * Per-call answers: `statusFn`, `getFn`, `spawnFn` and `resumeFn` compute a
- * verb's answer from each call's parameters and win over its queue, error
- * and result. `spawnFn` and `resumeFn` may be async, so a case runs code
- * while a launch call is in progress, such as moving a fake clock and then
+ * Per-call answers: `statusFn`, `getFn`, `spawnFn`, `resumeFn`,
+ * `findMissingFn`, `readPaneFn`, `sendKeysFn` and `killFn` compute a verb's
+ * answer from each call's parameters and win over its queue, error and
+ * result; each call is still recorded in the verb's capture list first.
+ * Every one but `statusFn` and `getFn` may be async, so a case runs code
+ * while a call is in progress, such as moving a fake clock and then
  * rejecting with `errCallTimeout` or `errTmuxUnresponsiveLaunchTimeout`
- * (b.jg5 SRJ-407's launch-call window). `spawnFn`, `resumeFn` and `getFn`
- * answer `undefined` to leave a call to the verb's other knobs.
+ * (b.jg5 SRJ-407's launch-call window). Each answers `undefined` to leave a
+ * call to the verb's other knobs. The last four let a row's answers follow
+ * what CSCB did to it (b.jg5 SRJ-410, SRJ-412): an Enter that clears a
+ * startup dialog, a `find-missing` run that judges the row only from G, a
+ * `kill` that ends it (`tests/test-helpers/pending-row-model.ts` scripts one
+ * persona's row through them).
  *
  * Held calls: `holdSpawns` keeps a stub's `spawn` calls open, and
  * `holdFindMissing` its `find-missing` calls (b.jg5 SRJ-706: a live-row
@@ -1611,7 +1617,8 @@ export const cannedOk = <T>(value: T): CannedResponse<T> => ({ kind: 'resolve', 
 export const cannedErr = <T>(error: Error): CannedResponse<T> => ({ kind: 'reject', error })
 
 /**
- * What a per-call launch knob (`spawnFn`, `resumeFn`) answers, at once or
+ * What a per-call knob that may be async (`spawnFn`, `resumeFn`,
+ * `findMissingFn`, `readPaneFn`, `sendKeysFn`, `killFn`) answers, at once or
  * through a promise: a result resolves the call, an `Error` rejects it, and
  * `undefined` leaves the call to the verb's other knobs.
  */
@@ -1630,12 +1637,14 @@ export type StubCallAnswer<T> = T | Error | undefined | Promise<T | Error | unde
  *
  * Verbs with a queue: `spawn`, `status`, `get`, `sendKeys`, `readPane`,
  * `kill`, `decide`, `resume`, `findMissing`, `list`, `getPermission`.
- * `statusFn` and `getFn` compute a response per call and take precedence
- * over every other knob of their verb. `spawnFn` and `resumeFn` do the same
- * for the two launch verbs, and may be async, so a test can run code while
- * the call is in progress (move a fake clock, then answer or reject it:
- * b.jg5 SRJ-407's launch-call window). `spawnFn`, `resumeFn` and `getFn` may
- * answer `undefined` to leave that call to the verb's other knobs.
+ * Per-call function knobs compute a response per call and take precedence
+ * over every other knob of their verb: `statusFn` and `getFn`; `spawnFn`
+ * and `resumeFn` for the two launch verbs; `findMissingFn`, `readPaneFn`,
+ * `sendKeysFn` and `killFn` (b.jg5 SRJ-410, SRJ-412). All but `statusFn`
+ * and `getFn` may be async, so a test can run code while the call is in
+ * progress (move a fake clock, then answer or reject it: b.jg5 SRJ-407's
+ * launch-call window). Each may answer `undefined` to leave that call to the
+ * verb's other knobs, the queue first, as if it were not set.
  *
  * Plus capture arrays — `<verb>Calls` — for assertion against call shape.
  * Every call is recorded there before any knob answers it.
@@ -1693,9 +1702,13 @@ export interface StubClientOptions {
    * `statusResult`/`statusQueue`/`statusError` and computes the result from the
    * current call params — lets a test model an AD row whose state depends on
    * whether an earlier verb (e.g. the up-front `findMissing` reconcile sweep)
-   * has run. Returning an `Error` rejects; returning a `StatusResult` resolves.
+   * has run. Returning an `Error` rejects; returning a `StatusResult` resolves;
+   * returning `undefined` leaves the call to the other `status` knobs, the
+   * queue first, as if no `statusFn` were set (so a knob that answers for
+   * one persona's instance can leave every other instance alone). The call
+   * is still recorded in `statusCalls` and `callLog`.
    */
-  statusFn?: (params: StatusParams) => Phase1StatusResult | Error
+  statusFn?: (params: StatusParams) => Phase1StatusResult | Error | undefined
 
   // get() — a row may carry the Phase 1 `launch_started_at` and
   // `liveness_note` (`cannedGetResult`).
@@ -1718,6 +1731,16 @@ export interface StubClientOptions {
   sendKeysError?: Error
   sendKeysQueue?: CannedResponse<SendKeysResult>[]
   sendKeysCalls?: SendKeysParams[]
+  /**
+   * Per-call `send-keys` answer (b.jg5 SRJ-410, SRJ-118), as `spawnFn` is for
+   * `spawn`: called with each call's parameters after the call is recorded
+   * in `sendKeysCalls`, it takes precedence over `sendKeysQueue`/
+   * `sendKeysError`/`sendKeysResult`, may be async, rejects with an `Error`
+   * (e.g. `errSpawnNotInteractive('send-keys')`), resolves with a result, and
+   * leaves the call to the other `send-keys` knobs on `undefined`. Lets an
+   * Enter on a dialog pane clear the dialog and move the row to `waiting`.
+   */
+  sendKeysFn?: (params: SendKeysParams) => StubCallAnswer<SendKeysResult>
 
   // readPane() — `readPaneResults` is a FIFO sequence of canned panes whose
   // last entry sticks once consumed; `readPaneError` rejects every call and
@@ -1733,6 +1756,15 @@ export interface StubClientOptions {
    * (`{ pane: '' }`); unlike `readPaneResults`, its last entry does not stick.
    */
   readPaneQueue?: CannedResponse<ReadPaneResult>[]
+  /**
+   * Per-call `read-pane` answer (b.jg5 SRJ-410, SRJ-117), as `spawnFn` is for
+   * `spawn`: called with each call's parameters (`n_lines`, `allow_pending`
+   * included) after the call is recorded in `readPaneCalls`, it takes
+   * precedence over `readPaneQueue`/`readPaneError`/`readPaneResults`, may
+   * be async, rejects with an `Error`, resolves with a pane, and leaves the
+   * call to the other `read-pane` knobs on `undefined`.
+   */
+  readPaneFn?: (params: ReadPaneParams) => StubCallAnswer<ReadPaneResult>
 
   // kill() — a result may carry the Phase 1 `kill_sent` (`cannedKillResult`).
   // Default: `{}` (no `kill_sent`, as from a binary older than Phase 1).
@@ -1740,6 +1772,16 @@ export interface StubClientOptions {
   killError?: Error
   killQueue?: CannedResponse<Phase1KillResult>[]
   killCalls?: KillParams[]
+  /**
+   * Per-call `kill` answer (b.jg5 SRJ-412, SRJ-702), as `spawnFn` is for
+   * `spawn`: called with each call's parameters after the call is recorded
+   * in `killCalls`, it takes precedence over `killQueue`/`killError`/
+   * `killResult`, may be async, rejects with an `Error` (e.g.
+   * `errTmuxKillFailed()`), resolves with a result (`cannedKillResult`), and
+   * leaves the call to the other `kill` knobs on `undefined`. Lets a kill's
+   * success end the row the case scripts.
+   */
+  killFn?: (params: KillParams) => StubCallAnswer<Phase1KillResult>
 
   // decide()
   decideResult?: DecideResult
@@ -1768,6 +1810,18 @@ export interface StubClientOptions {
   findMissingError?: Error
   findMissingQueue?: CannedResponse<FindMissingResult>[]
   findMissingCalls?: FindMissingParams[]
+  /**
+   * Per-call `find-missing` answer (b.jg5 SRJ-410, SRJ-120), as `spawnFn` is
+   * for `spawn`: called with each call's parameters after the call is
+   * recorded in `callLog` and `findMissingCalls`, it takes precedence over
+   * `findMissingQueue`/`findMissingError`/`findMissingResult`, may be async,
+   * rejects with an `Error`, resolves with a result (`cannedFindMissing`,
+   * e.g. in its placement form), and leaves the call to the other
+   * `find-missing` knobs on `undefined`. Lets a run judge a row only from a
+   * given clock time (not judged inside G, marked `missing` after). A stub
+   * whose `findMissing` `holdFindMissing` replaced never reaches it.
+   */
+  findMissingFn?: (params: FindMissingParams) => StubCallAnswer<FindMissingResult>
 
   // delete()
   deleteResult?: DeleteResult
@@ -1889,7 +1943,7 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
       if (opts.statusFn) {
         const r = opts.statusFn(params)
         if (r instanceof Error) throw r
-        return r
+        if (r !== undefined) return r
       }
       return nextResponse('status', opts.statusQueue, opts.statusResult, opts.statusError, cannedStatusResult())
     },
@@ -1906,10 +1960,20 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
     },
     async sendKeys(params: SendKeysParams): Promise<SendKeysResult> {
       opts.sendKeysCalls?.push(params)
+      if (opts.sendKeysFn) {
+        const r = await opts.sendKeysFn(params)
+        if (r instanceof Error) throw r
+        if (r !== undefined) return r
+      }
       return nextResponse('send-keys', opts.sendKeysQueue, opts.sendKeysResult, opts.sendKeysError, {})
     },
     async readPane(params: ReadPaneParams): Promise<ReadPaneResult> {
       opts.readPaneCalls?.push(params)
+      if (opts.readPaneFn) {
+        const r = await opts.readPaneFn(params)
+        if (r instanceof Error) throw r
+        if (r !== undefined) return r
+      }
       const queued = opts.readPaneQueue?.shift()
       if (queued) {
         if (queued.kind === 'reject') throw queued.error
@@ -1925,6 +1989,11 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
     },
     async kill(params: KillParams): Promise<Phase1KillResult> {
       opts.killCalls?.push(params)
+      if (opts.killFn) {
+        const r = await opts.killFn(params)
+        if (r instanceof Error) throw r
+        if (r !== undefined) return r
+      }
       return nextResponse('kill', opts.killQueue, opts.killResult, opts.killError, {})
     },
     async decide(params: DecideParams): Promise<DecideResult> {
@@ -1946,6 +2015,11 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
     async findMissing(params: FindMissingParams): Promise<FindMissingResult> {
       opts.callLog?.push('findMissing')
       opts.findMissingCalls?.push(params)
+      if (opts.findMissingFn) {
+        const r = await opts.findMissingFn(params)
+        if (r instanceof Error) throw r
+        if (r !== undefined) return r
+      }
       return nextResponse(
         'find-missing',
         opts.findMissingQueue,

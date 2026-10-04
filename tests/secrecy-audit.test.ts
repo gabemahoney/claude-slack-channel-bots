@@ -40,9 +40,10 @@
  *    modules (the checked kill, its bounded retry and the kill-failure
  *    alert's texts), the read-pane outcome, the CLI precheck's verdict and
  *    failure lines, the persona routing, the live-row sequence, whose step
- *    lines carry agent-director failure text, and the old-life wait's round
+ *    lines carry agent-director failure text, the old-life wait's round
  *    end, whose notice texts carry agent-director's CONFLICT and
- *    unusable-name answers), a value import of one
+ *    unusable-name answers, and the pending-row rule, whose lines quote
+ *    the lap's and the run's agent-director outcomes), a value import of one
  *    of the `HELPER_SURFACES` helpers (the token builders and sentinel, the
  *    config-file writer, the agent-director settings-file writer, the reload,
  *    connection, routing and recovery harnesses, the Slack client factory
@@ -149,6 +150,7 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/old-life-wait\.ts$/, "the old-life wait's round end, whose persona-teardown-notice texts carry agent-director's CONFLICT and unusable-name answers (described, redacted) to log lines and startup-errors entries, and whose answers keep the thrown agent-director errors and kill results raw"],
   [/^src\/pane-read\.ts$/, "the read-pane outcome, whose failure outcomes carry the described agent-director failure text (redacted) to the callers' log lines"],
   [/^src\/invalid-flags-hold\.ts$/, "the ErrInvalidFlags hold, which posts its operator alert and logs the agent-director versions a re-check reported (a version that is not a short version string is logged as unreadable) and its reactions' failures (described, redacted)"],
+  [/^src\/pending-row\.ts$/, "the pending-row rule, whose round, gate and failure lines quote the lap's and the bypassing run's agent-director outcomes (described, redacted) and whose lap Enter outcomes keep the thrown agent-director error raw"],
   [/^src\/persona-routing\.ts$/, "the persona routing, which receives a persona's Slack events, archives through its client and logs Slack failure text and its lost-message row read's agent-director failure text (described, redacted)"],
 ]
 
@@ -526,6 +528,22 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     expect(touchReasonsOf(suite, "import { FULL_PANE_READ_LINES, PANE_READ_GONE } from '../src/pane-read.ts'")).toEqual([])
     expect(touchReasons(suite).some((r) => r.includes('src/pane-read.ts'))).toBe(true)
     expect([callsAssertNoLeak(suite), suite in EXEMPT]).toEqual([true, false])
+  })
+
+  // b.jg5 SRJ-410, SRJ-117: the pending-row rule's round, gate and failure lines quote the lap's and the run's
+  // agent-director outcomes (described, redacted), and a lap Enter's latching outcome keeps the thrown error raw.
+  test('src/pending-row.ts is a source surface: its functions touch, its constants and types alone do not, and every suite that touches it leak-checks with no exemption', () => {
+    const suite = 'tests/pending-row.test.ts'
+    expect(SOURCE_SURFACES.some(([re]) => re.test('src/pending-row.ts'))).toBe(true)
+    expect(touchReasonsOf(suite, "import { createPendingRowRule } from '../src/pending-row.ts'").length).toBe(1)
+    expect(touchReasonsOf(suite, "import { pendingRowRuleRoundLine as line } from '../src/pending-row.ts'").length).toBe(1)
+    expect(touchReasonsOf(suite, "import * as rule from '../src/pending-row.ts'").length).toBe(1)
+    expect(touchReasonsOf(suite, "import { PENDING_ROW_RULE_HELD, PENDING_ROW_LAP_ENTER_CONFLICT } from '../src/pending-row.ts'")).toEqual([])
+    expect(touchReasonsOf(suite, "import type { PendingRowRuleAnswer } from '../src/pending-row.ts'")).toEqual([])
+    expect(touchReasons(suite).some((r) => r.includes('src/pending-row.ts') && r.includes('the pending-row rule'))).toBe(true)
+    const touching = SUITES.filter((file) => touchReasons(file).some((r) => r.includes('src/pending-row.ts')))
+    expect(touching).toContain(suite)
+    expect(touching.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map((file) => [file, true, false]))
   })
 
   // b.jg5 SRJ-901, SRJ-903: a precheck failure line, and a teardown verdict or outcome, carries the described

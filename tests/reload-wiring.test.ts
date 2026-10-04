@@ -442,14 +442,16 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
   // defaults to running the close at once, so only this audit makes sure
   // production passes it: without it, the deferred close of a socket whose
   // Web API call was refused for its token would not wait behind a lifecycle
-  // operation holding the persona.
-  test('one per-persona serializer, built once at module scope: its run is the serialize of initRestart, the connection manager, the bring-up controller and the lifecycle, and is used nowhere else', () => {
+  // operation holding the persona. The pending-row rule's install
+  // (`setPendingRowRule`) takes the same run, so the one run at an approver's
+  // stop is queued in P's turn (b.jg5 SRJ-410).
+  test('one per-persona serializer, built once at module scope: its run is the serialize of initRestart, the connection manager, the bring-up controller, the lifecycle and the pending-row rule\'s install, and is used nowhere else', () => {
     const serializer = constOf('createPersonaSerializer')
     expect(callsOf(SERVER_CODE, 'createPersonaSerializer')).toHaveLength(1)
     const decl = SERVER_CODE.search(new RegExp(`^const\\s+${serializer}\\s*=\\s*createPersonaSerializer\\s*\\(\\s*\\)\\s*$`, 'm'))
     expect(decl).toBeGreaterThanOrEqual(0)
     expect(insideMain(SERVER_CODE, decl)).toBe(false)
-    const factories = ['initRestart', 'createPersonaConnectionManager', 'createPersonaBringUpController', 'createPersonaLifecycle']
+    const factories = ['initRestart', 'createPersonaConnectionManager', 'createPersonaBringUpController', 'createPersonaLifecycle', 'setPendingRowRule']
     for (const factory of factories) {
       expect([factory, onlyCallProps(factory).get('serialize')]).toEqual([factory, `${serializer}.run`])
     }

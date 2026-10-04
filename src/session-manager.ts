@@ -213,16 +213,19 @@
  * pane `checkWorkingRowPane` folds, and b.jdc's one-line reads of an
  * `ask_user` or `check_permission` row: the prompt-row verdict
  * `promptRowReconnectVerdict` in `src/server.ts` and the ladder's
- * `launchOnPromptRow`) latch on a CONFLICT answer,
+ * `launchOnPromptRow`; and the pending-row rule's lap,
+ * `readPendingRowLapPane`, the only read made with `allow_pending`) latch on
+ * a CONFLICT answer,
  * with the refused operation "P's next check or recovery", and on an
  * UNUSABLE NAME answer, each with the state its caller last read; a latched
  * persona is not read, and its caller ends with nothing typed. A pane that
  * any of them reads, or the dialog approver reads, may be a single
  * leftover's (b.jg5 SRJ-613), so none acts on a pane alone: the `send-keys`
  * that follows is the backstop (the reconnect's CONFLICT "not this launch's
- * session" latches P with nothing typed; the approver's
- * `ErrSpawnNotInteractive` on a `pending` row stops it with nothing typed
- * and no kill; see `src/pane-read.ts`).
+ * session" latches P with nothing typed; the approver's and the pending-row
+ * lap's Enter answering `ErrSpawnNotInteractive` on a `pending` row types
+ * nothing, stops the approver with no kill, and ends the lap with no
+ * further lap on that launch; see `src/pane-read.ts`).
  *
  * Both row checks go through `compareRowToPersona`. At most one launch per
  * persona is in flight (b.av2 SR-6.3): a concurrent call for the same key
@@ -646,7 +649,10 @@ import {
   RETRY_BLOCK_LAUNCH,
   RETRY_BLOCK_LIVE_ROW_SEQUENCE,
   RETRY_BLOCK_OLD_LIFE_WAIT,
+  claimTimerRetryRuleRun,
   currentAttemptLastError,
+  isInsideTimerRetry,
+  runDetachedRecoveryAttempt,
   runInAttempt,
   runOutsideAttempts,
   unavailableRetryCauseFor,
@@ -780,6 +786,51 @@ import {
 } from './liveness-reading.ts'
 import {
   PENDING_ROW_COVERED,
+  PENDING_ROW_GET_ABSENT,
+  PENDING_ROW_GET_LATCHED,
+  PENDING_ROW_GET_REFUSED,
+  PENDING_ROW_GET_ROW,
+  PENDING_ROW_LAP_ENTER_CONFLICT,
+  PENDING_ROW_LAP_ENTER_LATCHED,
+  PENDING_ROW_LAP_ENTER_NOT_SENT_LATCHED,
+  PENDING_ROW_LAP_ENTER_SENT,
+  PENDING_ROW_LAP_ENTER_UNCLASSIFIED,
+  PENDING_ROW_LAP_ENTER_UNUSABLE_NAME,
+  PENDING_ROW_RELAUNCH_KEPT,
+  PENDING_ROW_RELAUNCH_LATCHED,
+  PENDING_ROW_RELAUNCH_SEQUENCE_STARTED,
+  PENDING_ROW_RULE_GONE,
+  PENDING_ROW_RULE_HELD,
+  PENDING_ROW_RULE_LATCHED,
+  PENDING_ROW_RULE_LIVE,
+  PENDING_ROW_RULE_ORIGIN_APPROVER_STOP,
+  PENDING_ROW_RULE_ORIGIN_RETRY,
+  PENDING_ROW_RULE_READ_REFUSED,
+  PENDING_ROW_RULE_REFUSAL,
+  PENDING_ROW_RULE_RELAUNCH,
+  PENDING_ROW_RUN_FAILED,
+  PENDING_ROW_RUN_JUDGED_ALIVE,
+  PENDING_ROW_RUN_LATCHED,
+  PENDING_ROW_RUN_LEFT_LIVE,
+  PENDING_ROW_RUN_MARKED_MISSING,
+  PENDING_ROW_RUN_NOT_JUDGED,
+  PENDING_ROW_RUN_REFUSED,
+  STUCK_LAUNCH_SUPPRESSED,
+  describePendingRowRuleAnswer,
+  pendingRowLapEnterFailureOf,
+  pendingRowRuleFailedLine,
+  postStuckLaunchHeld,
+  type PendingRowLapEnterFailure,
+  type PendingRowLapEnterLatching,
+  type PendingRowLapEnterOutcome,
+  type PendingRowLapEnterUnclassified,
+  type PendingRowRule,
+  type PendingRowRuleAnswer,
+  type PendingRowRuleDeps,
+  type PendingRowRuleGet,
+  type PendingRowRuleRow,
+  type PendingRowRunPlacement,
+  type StuckLaunchPostEpisodes,
   PENDING_ROW_NO_LAUNCH_START,
   PENDING_ROW_NOT_COVERED,
   PENDING_ROW_REASON_CONFIG_DIR_MISMATCH,
@@ -805,6 +856,7 @@ import {
   type PendingRowNotCoveredReason,
   type PendingRowUndecidedReason,
 } from './pending-row.ts'
+import type { PersonaSerialize } from './persona-serializer.ts'
 import { isDryRun } from './tokens.ts'
 import {
   DIALOG_READY_TIMEOUT_MS,
@@ -2926,6 +2978,13 @@ export interface PersonaPaneReadRequest {
   readonly lastRead: LatchRowState
   /** A short site label, the head of the reader's latch line. */
   readonly site: string
+  /**
+   * Read a `pending` row's pane (`allow_pending: true` on the call, b.jg5
+   * SRJ-117, SRJ-402). Only the pending-row rule's lap sets it
+   * (`readPendingRowLapPane`); every other site leaves it unset, and its call
+   * carries no `allow_pending`.
+   */
+  readonly allowPending?: boolean
 }
 
 /**
@@ -2941,7 +3000,9 @@ export type OwnPaneReadOutcome = Exclude<PaneReadOutcome, PaneReadConflict | Pan
  * `read-pane` verb (tmux-touching: inside an attempt an UNAVAILABLE starts
  * `tmux-unresponsive` and a pane or GONE ends it, and ENVIRONMENT and CONFIG
  * raise their outages, all in the wrapper), with `claude_instance_id` and
- * `n_lines` only. Answers the read's outcome (`src/pane-read.ts`):
+ * `n_lines` only, and `allow_pending: true` when `request.allowPending` is
+ * set (the pending-row rule's lap, b.jg5 SRJ-410). Answers the read's
+ * outcome (`src/pane-read.ts`):
  *
  *   - a persona already latched (`personaLatchedNow`, b.jg5 SRJ-502) gets no
  *     call and answers latched with no cause;
@@ -2968,11 +3029,15 @@ export type OwnPaneReadOutcome = Exclude<PaneReadOutcome, PaneReadConflict | Pan
  * agent-director answers the leftover's pane (b.jg5 SRJ-117, SRJ-613). The
  * reader treats it as no proof that the worker's own session is there, and
  * no caller acts on it alone: a pane leads at most to a deferral, no action,
- * a positive-idle fold or the reconnect. The backstop is the reconnect's
- * one `send-keys` (`reconnectMcpWithCause`), which on a live row that is not
- * `pending` answers CONFLICT "not this launch's session": CSCB then latches
- * P (b.jg5 SRJ-501) with nothing typed and never retries the refused
- * `send-keys` (SRJ-118, SRJ-505).
+ * a positive-idle fold, the reconnect, or the pending-row lap's Enter. The
+ * backstop is the `send-keys` that follows: the reconnect's
+ * (`reconnectMcpWithCause`), which on a live row that is not `pending`
+ * answers CONFLICT "not this launch's session": CSCB then latches P (b.jg5
+ * SRJ-501) with nothing typed and never retries the refused `send-keys`
+ * (SRJ-118, SRJ-505); and the lap's Enter (`sendPendingRowLapEnter`), which
+ * on a `pending` row whose session is not this launch's answers
+ * `ErrSpawnNotInteractive` with nothing typed, after which no further lap is
+ * made on the row's launch (b.jg5 SRJ-410, SRJ-613).
  *
  * With no latch installed a CONFLICT or UNUSABLE NAME still answers latched
  * with nothing latched, as the latch's entries do elsewhere (`conflictAt`,
@@ -2989,8 +3054,13 @@ export async function readPersonaOwnPane(key: string, request: PersonaPaneReadRe
   if (personaLatchedNow(key)) return PANE_READ_NOT_READ_LATCHED
   let failure: PaneReadFailure
   try {
+    const claude_instance_id = personaInstanceId(key)
     const result = await withOutageDetection(key, undefined, 'read-pane', (client) =>
-      client.readPane({ claude_instance_id: personaInstanceId(key), n_lines: request.nLines }),
+      client.readPane(
+        request.allowPending === true
+          ? { claude_instance_id, n_lines: request.nLines, allow_pending: true }
+          : { claude_instance_id, n_lines: request.nLines },
+      ),
     )
     return { kind: PANE_READ_PANE, pane: result.pane }
   } catch (err) {
@@ -3056,6 +3126,137 @@ function logPaneReadLatch(
   const [label, srj] = cause.kind === PANE_READ_CONFLICT ? ['CONFLICT', 'SRJ-501'] : ['UNUSABLE NAME', 'SRJ-512']
   console.error(
     `[slack] ${request.site}: pane read refused for ${keyRef(key)}: ${cause.description} — ${label}: ${outcome}; ` +
+      `nothing is typed and nothing more is called for it (b.jg5 SRJ-105, ${srj})`,
+  )
+}
+
+// ---------------------------------------------------------------------------
+// The pending-row rule's lap: its read-pane and its Enter (b.jg5 SRJ-410)
+// ---------------------------------------------------------------------------
+
+/** The site label of the pending-row rule's own calls and lines. */
+export const PENDING_ROW_RULE_SITE = 'pendingRowRule'
+
+/** Who reads, in the own-row lines of the pending-row rule's `get` (the persona's ref is added; b.jg5 SRJ-114, SRJ-410). */
+export const PENDING_ROW_RULE_GET_SITE: OwnRowReadSite = Object.freeze({ site: PENDING_ROW_RULE_SITE, what: 'pending-row rule get' })
+
+/**
+ * Whether `pane` shows a startup dialog the dialog approver recognises: one
+ * of its needles (`PRE_SESSION_DIALOG_NEEDLES`: the folder-trust and
+ * dev-channels option labels; b.jg5 SRJ-402). The approver's laps and the
+ * pending-row rule's lap (b.jg5 SRJ-410) both read a pane through it. A pane
+ * may be a single leftover's (b.jg5 SRJ-613), so a dialog on it leads at
+ * most to Enter through `send-keys`, the backstop. Pure; never throws.
+ */
+export function paneShowsStartupDialog(pane: string): boolean {
+  return typeof pane === 'string' && PRE_SESSION_DIALOG_NEEDLES.some((needle) => pane.includes(needle))
+}
+
+/**
+ * The pending-row rule's lap `read-pane` of persona `key`'s own row (b.jg5
+ * SRJ-410, SRJ-117's pending-row lap column): the shared reader
+ * (`readPersonaOwnPane`) with 40 lines (`FULL_PANE_READ_LINES`) and
+ * `allow_pending`, the row last read `pending`. The reader latches on
+ * CONFLICT (refused operation "P's next check or recovery") and UNUSABLE
+ * NAME, reads nothing for a latched persona, and answers every other
+ * outcome by class. Its pane may be a single leftover's (b.jg5 SRJ-613): the
+ * lap acts on it at most by Enter (`sendPendingRowLapEnter`), the backstop.
+ * Never throws.
+ */
+export function readPendingRowLapPane(key: string, ref: string = keyRef(key)): Promise<OwnPaneReadOutcome> {
+  return readPersonaOwnPane(key, {
+    nLines: FULL_PANE_READ_LINES,
+    lastRead: latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE),
+    site: `${PENDING_ROW_RULE_SITE} ${ref} lap`,
+    allowPending: true,
+  })
+}
+
+/**
+ * The pending-row rule's lap Enter on persona `key`'s own row (b.jg5
+ * SRJ-410, SRJ-118's approver-and-lap row): one `send-keys` with an empty
+ * text and `allow_pending: true`, which presses Enter, through
+ * `withOutageDetection` declaring the `send-keys` verb (tmux-touching:
+ * inside an attempt an UNAVAILABLE starts `tmux-unresponsive`, an
+ * UNCLASSIFIED opens the persona's unclassified-error episode, and
+ * ENVIRONMENT and CONFIG raise their outages, all in the wrapper). Answers
+ * the outcome (`PendingRowLapEnterOutcome`, `src/pending-row.ts`), by class
+ * and name through `src/ad-error-class.ts`, never by testing the value
+ * against an error class:
+ *
+ *   - a persona already latched (b.jg5 SRJ-502) gets no call: latched;
+ *   - success: sent;
+ *   - CONFLICT: the persona latches through the latch's CONFLICT entry
+ *     (`setFromConflict`) with the refused operation "P's next check or
+ *     recovery" and the recorded state `pending` (b.jg5 SRJ-501): latched,
+ *     with one line;
+ *   - UNUSABLE NAME: the persona latches through the unusable-name entry
+ *     (b.jg5 SRJ-512), recorded `pending`: latched, with one line;
+ *   - `ErrInvalidFlags`, to which `send-keys` gives no meaning: one immediate
+ *     version re-check, then UNCLASSIFIED (carrying the stop mark when the
+ *     re-check decided that the server stops; otherwise reported through
+ *     the outage state's UNCLASSIFIED site entry), with one line;
+ *   - every other answer returned by class: GONE, `ErrSpawnNotFound`,
+ *     `ErrSpawnNotInteractive` (nothing was typed: the session holding the
+ *     name is not this launch's, b.jg5 SRJ-613), UNAVAILABLE, CONFIG,
+ *     ENVIRONMENT, UNCLASSIFIED (`ErrSendKeysWhileRelayed` included).
+ *
+ * It types nothing but on success, posts nothing and counts nothing. Never
+ * throws.
+ */
+export async function sendPendingRowLapEnter(key: string, ref: string = keyRef(key)): Promise<PendingRowLapEnterOutcome> {
+  if (personaLatchedNow(key)) return PENDING_ROW_LAP_ENTER_NOT_SENT_LATCHED
+  let failure: PendingRowLapEnterFailure
+  try {
+    await withOutageDetection(key, undefined, 'send-keys', (client) =>
+      client.sendKeys({ claude_instance_id: personaInstanceId(key), text: '', allow_pending: true }),
+    )
+    return { kind: PENDING_ROW_LAP_ENTER_SENT }
+  } catch (err) {
+    if (isInvalidFlagsError(err)) return lapEnterInvalidFlagsOutcome(key, ref, err)
+    failure = pendingRowLapEnterFailureOf(err)
+  }
+  const lastRead = latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE)
+  if (failure.kind === PENDING_ROW_LAP_ENTER_CONFLICT) {
+    logLapEnterLatch(ref, failure, latchOnConflict(key, failure.error, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, lastRead))
+    return { kind: PENDING_ROW_LAP_ENTER_LATCHED, cause: failure }
+  }
+  if (failure.kind === PENDING_ROW_LAP_ENTER_UNUSABLE_NAME) {
+    logLapEnterLatch(ref, failure, latchOnUnusableName(key, failure.error, lastRead))
+    return { kind: PENDING_ROW_LAP_ENTER_LATCHED, cause: failure }
+  }
+  return failure
+}
+
+/**
+ * `sendPendingRowLapEnter`'s answer to an `ErrInvalidFlags`: one immediate
+ * version re-check (`classifyWithInvalidFlagsRecheck`, b.jg5 SRJ-204), then
+ * UNCLASSIFIED, marked `stopping` when the re-check decided that the server
+ * stops (b.jg5 SRJ-205), in which case nothing is reported; otherwise it
+ * takes SRJ-105's UNCLASSIFIED row through the outage state's site entry
+ * (`reportUnclassifiedAtSite`), since the wrapper took the value as STATE.
+ * One line. Never throws.
+ */
+async function lapEnterInvalidFlagsOutcome(key: string, ref: string, err: InvalidFlagsError): Promise<PendingRowLapEnterUnclassified> {
+  const step = await classifyWithInvalidFlagsRecheck(err)
+  const stopping = step.recheck.kind === RECHECK_OUTCOME_STOP
+  if (!stopping) reportUnclassifiedAtSite(key, err, 'send-keys', step.classification)
+  console.error(
+    `[slack] ${PENDING_ROW_RULE_SITE}: lap Enter for ${ref} answered ${describeAdErrorClassification(step.classification)} — UNCLASSIFIED after one immediate agent-director version re-check: ${step.recheck.kind}; nothing typed (b.jg5 SRJ-104, SRJ-204)`,
+  )
+  const outcome: PendingRowLapEnterUnclassified = {
+    kind: PENDING_ROW_LAP_ENTER_UNCLASSIFIED,
+    errorClass: step.classification.errorClass,
+    description: describeAgentDirectorFailure(err),
+  }
+  return stopping ? { ...outcome, stopping: true } : outcome
+}
+
+/** `sendPendingRowLapEnter`'s one line for a latch it set (`outcome`: what became of the latch). */
+function logLapEnterLatch(ref: string, cause: PendingRowLapEnterLatching, outcome: string): void {
+  const [label, srj] = cause.kind === PENDING_ROW_LAP_ENTER_CONFLICT ? ['CONFLICT', 'SRJ-501'] : ['UNUSABLE NAME', 'SRJ-512']
+  console.error(
+    `[slack] ${PENDING_ROW_RULE_SITE}: lap Enter refused for ${ref}: ${cause.description} — ${label}: ${outcome}; ` +
       `nothing is typed and nothing more is called for it (b.jg5 SRJ-105, ${srj})`,
   )
 }
@@ -4279,6 +4480,13 @@ interface ApproverRun {
    * `pending`, or none read, is armed for (`armAfterApproverStop`).
    */
   lastStateRead: string | undefined
+  /**
+   * The raw launch start the approver's latest own-row `status` read carried
+   * (`undefined` for a read that showed none, or a state other than
+   * `pending`): with `lastStateRead`, the row read the pending-row rule's one
+   * run at the approver's stop runs on (b.jg5 SRJ-404, SRJ-410).
+   */
+  lastLaunchStartedAt: unknown
 }
 
 /** A fresh approver state: no stop asked, no limit armed, no launch start kept. */
@@ -4290,6 +4498,7 @@ function newApproverRun(): ApproverRun {
     wake: undefined,
     launchStartMs: undefined,
     lastStateRead: undefined,
+    lastLaunchStartedAt: undefined,
   }
 }
 
@@ -4648,6 +4857,7 @@ async function approverLap(ctx: ApproverContext): Promise<ApproverStopReason | A
 
   const state = read.state
   run.lastStateRead = state
+  run.lastLaunchStartedAt = read.launchStartedAt
   if (AGENT_DIRECTOR_DEAD_STATES.has(state)) {
     const msg = approverFinishedMessage(ref, state)
     console.error(approverLogLine(msg))
@@ -4693,7 +4903,7 @@ async function approverLap(ctx: ApproverContext): Promise<ApproverStopReason | A
   }
   const afterPane = approverStopOrLatched(ctx)
   if (afterPane !== undefined) return afterPane
-  if (!PRE_SESSION_DIALOG_NEEDLES.some((n) => pane.includes(n))) return goesOn
+  if (!paneShowsStartupDialog(pane)) return goesOn
   try {
     // An empty text presses Enter. The pane may be a single leftover's
     // (b.jg5 SRJ-613): this `send-keys` is the backstop, and its
@@ -11225,7 +11435,12 @@ export const PENDING_ROW_STEP_REFUSED = 'refused'
  * latched persona, or with no trigger sink installed).
  */
 export type PendingRowStepAnswer =
-  | { readonly kind: typeof PENDING_ROW_COVERED; readonly armed: boolean }
+  | {
+      readonly kind: typeof PENDING_ROW_COVERED
+      readonly armed: boolean
+      /** The row the `get` read (`pending`, with its raw launch start): the row read the pending-row rule runs on (b.jg5 SRJ-410). */
+      readonly row: PendingRowRuleRow
+    }
   | { readonly kind: typeof PENDING_ROW_UNDECIDED; readonly reason: PendingRowUndecidedReason; readonly armed: boolean }
   | {
       readonly kind: typeof PENDING_ROW_NOT_COVERED
@@ -11423,7 +11638,13 @@ function pendingRowStep(
  * resume site's replacement, SRJ-609). It runs the one pending-row step
  * (`pendingRowStep`) and answers:
  *   - covered: `no-op` (counted as before), the persona's retry timer armed
- *     in pending-only mode, with no kill and no launch;
+ *     in pending-only mode, with no kill and no launch; at a retry of the
+ *     persona's timer only (full mode, the not-resumable re-read
+ *     included), the pending-row rule's one run of that retry on the row
+ *     read (`runPendingRowRuleAtRetry`, P's own launch in flight not
+ *     blocking it), whose answer `ladderResultOfRuleAnswer` maps; from any
+ *     other origin (the start pass, an apply's bring-up, a restart timer, a
+ *     human-triggered restart) no rule run (b.jg5 SRJ-410);
  *   - not covered (SRJ-411: a retired key's old life before its new life, a
  *     `cwd` that differs from the persona's working directory by real path,
  *     a `config_dir` label missing or different): the replace step
@@ -11456,10 +11677,59 @@ async function ladderPendingRowStep(run: LadderRun, row: GetResult, lastRead: La
     case PENDING_ROW_UNDECIDED:
       if (cover.reason === PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED) return deferForUnresolvedConfigDir(persona, ref)
       return { key, action: 'no-op' }
-    case PENDING_ROW_COVERED:
+    case PENDING_ROW_COVERED: {
       console.error(`[slack] spawnForPersona: no action — state=${AGENT_DIRECTOR_PENDING_STATE} for ${ref}`)
-      return { key, action: 'no-op' }
+      // b.jg5 SRJ-410: at a retry of P's timer (full mode), the rule's one
+      // run of that retry; from any other origin the arm above only.
+      const ruled = await runPendingRowRuleAtRetry(persona, pendingRowRuleRowOf(row), { withinOwnLaunch: true })
+      return ruled === undefined ? { key, action: 'no-op' } : ladderResultOfRuleAnswer(key, ref, ruled)
+    }
   }
+}
+
+/**
+ * The collision ladder's result for the pending-row rule's answer at its
+ * `pending` step (b.jg5 SRJ-410, SRJ-409, SRJ-1015), for persona `key`
+ * (`ref`):
+ *   - a refusal, the held post or a row the rule read live: `no-op`, as for
+ *     a covered row (nothing counted, no kill and no launch);
+ *   - a latch: `latched`;
+ *   - a row the rule read gone, or a `get` it had refused: `retrying`, with
+ *     one line: nothing is launched in this attempt (the launch never goes
+ *     over a row it has not read since), and the retry timer, armed in
+ *     pending-only mode by the step, owns the persona, so its next retry
+ *     reads the row and hands a gone row to the restart path's decision;
+ *   - the own-launch branch's abort: `sequence-waiting` for a sequence it
+ *     started, `latched` for a latch, `no-op` otherwise.
+ * Logs the gone line only. Pure but for that line.
+ */
+function ladderResultOfRuleAnswer(key: string, ref: string, ruled: PendingRowRuleAnswer): SpawnPersonaResult {
+  switch (ruled.kind) {
+    case PENDING_ROW_RULE_REFUSAL:
+    case PENDING_ROW_RULE_HELD:
+    case PENDING_ROW_RULE_LIVE:
+      return { key, action: 'no-op' }
+    case PENDING_ROW_RULE_LATCHED:
+      return { key, action: 'latched' }
+    case PENDING_ROW_RULE_GONE:
+    case PENDING_ROW_RULE_READ_REFUSED:
+      console.error(ladderRuleRetryingLine(ref, describePendingRowRuleAnswer(ruled)))
+      return { key, action: SPAWN_ACTION_RETRYING }
+    case PENDING_ROW_RULE_RELAUNCH:
+      switch (ruled.answer.kind) {
+        case PENDING_ROW_RELAUNCH_SEQUENCE_STARTED:
+          return { key, action: 'sequence-waiting' }
+        case PENDING_ROW_RELAUNCH_LATCHED:
+          return { key, action: 'latched' }
+        case PENDING_ROW_RELAUNCH_KEPT:
+          return { key, action: 'no-op' }
+      }
+  }
+}
+
+/** The ladder's line when the pending-row rule at its `pending` step read the row gone, or its `get` was refused: nothing launched now; the retry timer owns the persona. */
+export function ladderRuleRetryingLine(ref: string, answer: string): string {
+  return `[slack] spawnForPersona: the pending-row rule for ${ref} answered ${answer} — nothing launched in this attempt; answering ${SPAWN_ACTION_RETRYING}, its retry timer owns it and its next retry reads the row (b.jg5 SRJ-410, SRJ-1015)`
 }
 
 /**
@@ -11476,7 +11746,9 @@ async function ladderPendingRowStep(run: LadderRun, row: GetResult, lastRead: La
  *     the error (an UNAVAILABLE armed its cause inside an attempt);
  *   - a state other than `pending`: `not-pending`, with the state read;
  *   - `pending`: the one pending-row step (`pendingRowStep`): covered or
- *     undecided, the timer armed in pending-only mode; not covered, one
+ *     undecided, the timer armed in pending-only mode (a covered answer
+ *     carries the row the `get` read, for the pending-row rule's run at a
+ *     retry, `runPendingRowRuleAtRetry`); not covered, one
  *     start of the live-row sequence through the start entry
  *     (`startRecoverySequence`: seeded `pending`, entry at step 1, the
  *     conversation not kept, the retired-key flag set for a retired key's
@@ -11505,7 +11777,7 @@ export async function readAndStepPendingRow(persona: Persona): Promise<PendingRo
     case PENDING_ROW_NO_LAUNCH_START:
       return { kind: PENDING_ROW_STEP_LATCHED }
     case PENDING_ROW_COVERED:
-      return { kind: PENDING_ROW_COVERED, armed }
+      return { kind: PENDING_ROW_COVERED, armed, row: pendingRowRuleRowOf(row) }
     case PENDING_ROW_UNDECIDED:
       return { kind: PENDING_ROW_UNDECIDED, reason: cover.reason, armed }
     case PENDING_ROW_NOT_COVERED: {
@@ -11523,11 +11795,15 @@ export async function readAndStepPendingRow(persona: Persona): Promise<PendingRo
 
 /**
  * The pending-only retry's pending-row step (`FullModeRetryDeps.stepPendingRow`,
- * bound in `main()`; b.jg5 SRJ-409, SRJ-411) for persona `key`, whose applied
- * persona is `persona`: the read-and-step entry (`readAndStepPendingRow`),
- * its answer mapped for the retry action:
- *   - covered, undecided (the timer armed pending-only) or a refused read:
- *     `kept`;
+ * bound in `main()`; b.jg5 SRJ-409, SRJ-411, SRJ-410) for persona `key`, whose
+ * applied persona is `persona`: the read-and-step entry
+ * (`readAndStepPendingRow`), its answer mapped for the retry action:
+ *   - covered (the timer armed pending-only): the pending-row rule's one run
+ *     of this retry on the row the `get` read (`runPendingRowRuleAtRetry`),
+ *     its answer mapped by `pendingStepOfRuleAnswer`; with no rule
+ *     installed, `kept`;
+ *   - undecided (the timer armed pending-only, no rule run) or a refused
+ *     read: `kept`;
  *   - not covered with the sequence started or already running:
  *     `sequence-started`; with nothing started (`held`, `closed`,
  *     `not-installed`): `kept`;
@@ -11542,7 +11818,10 @@ export async function retryPendingRowStep(key: string, persona: Persona | undefi
   if (persona === undefined || persona.key !== key) return { kind: UNAVAILABLE_RETRY_PENDING_STEP_KEPT }
   const answer = await readAndStepPendingRow(persona)
   switch (answer.kind) {
-    case PENDING_ROW_COVERED:
+    case PENDING_ROW_COVERED: {
+      const ruled = await runPendingRowRuleAtRetry(persona, answer.row)
+      return ruled === undefined ? { kind: UNAVAILABLE_RETRY_PENDING_STEP_KEPT } : pendingStepOfRuleAnswer(ruled)
+    }
     case PENDING_ROW_UNDECIDED:
     case PENDING_ROW_STEP_REFUSED:
       return { kind: UNAVAILABLE_RETRY_PENDING_STEP_KEPT }
@@ -11557,6 +11836,361 @@ export async function retryPendingRowStep(key: string, persona: Persona | undefi
     case PENDING_ROW_STEP_NO_ROW:
       return { kind: UNAVAILABLE_RETRY_PENDING_STEP_ROW, state: UNAVAILABLE_RETRY_ROW_ABSENT }
   }
+}
+
+// ---------------------------------------------------------------------------
+// The pending-row rule: its production dependencies, its one instance and
+// where it runs (b.jg5 SRJ-410, SRJ-404, SRJ-303)
+// ---------------------------------------------------------------------------
+
+/** The row read the pending-row rule runs on, from a row read `pending` (its state and raw launch start). Pure. */
+function pendingRowRuleRowOf(row: PendingRowFields): PendingRowRuleRow {
+  return { state: row.state, launchStartedAt: pendingLaunchStartOf(row) }
+}
+
+/** What `main()` gives the pending-row rule's dependency builder (`buildPendingRowRuleDeps`). */
+export interface PendingRowRuleDepsInput {
+  /** The applied persona with this key, read at each call (production: `getAppliedPersona`); the old-life hold gate reads it. */
+  readonly appliedPersona: (key: string) => Persona | undefined
+  /**
+   * The server's one notice episodes instance, the held text's poster's
+   * (production: `main()`'s notice episodes). Absent: the stuck-launch
+   * episodes installed with `setStuckLaunchEpisodes`, read at each post.
+   */
+  readonly episodes?: StuckLaunchPostEpisodes
+  /** Receives the rule's lines and its poster's (default: the server log). */
+  readonly log?: (line: string) => void
+}
+
+/**
+ * What work in flight blocks the pending-row rule for persona `key` (b.jg5
+ * SRJ-303, SRJ-410), by name, or `undefined`: `personaRetryBlockCause`'s
+ * cause, except that `withinOwnLaunch` (the collision ladder's `pending`
+ * step, inside the launch it belongs to, before any launch call of its own)
+ * leaves that launch in flight out and asks the other causes. A running
+ * dialog approver never counts. Never throws.
+ */
+function pendingRowRuleBlockCause(key: string, withinOwnLaunch: boolean): RetryBlockCause | undefined {
+  if (!withinOwnLaunch) return personaRetryBlockCause(key)
+  if (liveRowSequenceRegistry?.isNoLaunchRunning(personaInstanceId(key)) === true) return RETRY_BLOCK_OLD_LIFE_WAIT
+  if (isLiveRowSequenceRunning(key)) return RETRY_BLOCK_LIVE_ROW_SEQUENCE
+  if (isOldLifeWaitRunningFor(key)) return RETRY_BLOCK_OLD_LIFE_WAIT
+  return undefined
+}
+
+/**
+ * Whether persona `key`'s working directory is held for an old life, for
+ * the pending-row rule's gate (b.jg5 SRJ-810): its own row held
+ * (`isOwnRowOldLifeHeld`), or a hold on its working directory, through the
+ * old-life hold step the restart path's hook uses (`oldLifeHoldStep`, at
+ * `PENDING_ROW_RULE_SITE`), which records the persona as waiting, starts the
+ * hold's wait and arms its retry timer, as SRJ-810 does for any persona it
+ * holds back. A persona that is not applied is not held here. Never throws.
+ */
+function pendingRowRuleHeldForOldLife(key: string, appliedPersona: (key: string) => Persona | undefined): boolean {
+  if (isOwnRowOldLifeHeld(key)) return true
+  const persona = appliedPersona(key)
+  return persona !== undefined && oldLifeHoldStep(persona, PENDING_ROW_RULE_SITE)
+}
+
+/** The step-2 `find-missing` run of the pending-row rule for persona `key`: one bypassing run, its key as the next-step `get`, read against `pending`. Never throws. */
+async function runPendingRowRuleFindMissing(key: string): Promise<PendingRowRunPlacement> {
+  const answer = await bypassingFindMissingSweep(key, PENDING_ROW_RULE_SITE, key)
+  if (answer === FIND_MISSING_REFUSED) return PENDING_ROW_RUN_REFUSED
+  if (answer === FIND_MISSING_LATCHED) return PENDING_ROW_RUN_LATCHED
+  if (answer === undefined) return PENDING_ROW_RUN_FAILED
+  switch (readFindMissingRow(answer, personaInstanceId(key), AGENT_DIRECTOR_PENDING_STATE)) {
+    case FIND_MISSING_ROW_MARKED_MISSING:
+      return PENDING_ROW_RUN_MARKED_MISSING
+    case FIND_MISSING_ROW_LEFT_LIVE:
+      return PENDING_ROW_RUN_LEFT_LIVE
+    case FIND_MISSING_ROW_NOT_JUDGED:
+      return PENDING_ROW_RUN_NOT_JUDGED
+    case FIND_MISSING_ROW_JUDGED_ALIVE:
+      return PENDING_ROW_RUN_JUDGED_ALIVE
+  }
+}
+
+/** The step-2 `get` of the pending-row rule: one `get` of persona `key`'s own row through the shared own-row read (its note, launch-start and UNUSABLE NAME latches applying). Never throws. */
+async function readPendingRowRuleRow(key: string, ref: string): Promise<PendingRowRuleGet> {
+  const read = await readPersonaOwnRow(key, { ...PENDING_ROW_RULE_GET_SITE, ref })
+  switch (read.kind) {
+    case OWN_ROW_READ_ROW:
+      if (read.latched) return { kind: PENDING_ROW_GET_LATCHED }
+      return { kind: PENDING_ROW_GET_ROW, state: read.row.state, launchStartedAt: pendingLaunchStartOf(read.row) }
+    case OWN_ROW_READ_ABSENT:
+      return { kind: PENDING_ROW_GET_ABSENT }
+    case OWN_ROW_READ_LATCHED:
+      return { kind: PENDING_ROW_GET_LATCHED }
+    case OWN_ROW_READ_REFUSED:
+      return { kind: PENDING_ROW_GET_REFUSED, error: read.error }
+  }
+}
+
+/** The line for a held post with no episodes instance to post through: nothing posted. */
+export function pendingRowRuleNoEpisodesLine(key: string): string {
+  return `[slack] pending-row: persona=${key} stuck-launch held text not posted — no notice episodes are installed (b.jg5 SRJ-1017)`
+}
+
+/**
+ * The pending-row rule's production dependencies (b.jg5 SRJ-410), bound to
+ * the shared entries, so `main()` and the recovery harness compose the rule
+ * identically:
+ *   - the session manager's injected clock (`_setNow`) and the log;
+ *   - the latch's latched query (`personaLatchedNow`), the "blocks a retry"
+ *     causes (`personaRetryBlockCause`, P's own launch left out from its
+ *     ladder) and the old-life hold gate (`isOwnRowOldLifeHeld`,
+ *     `oldLifeHoldStep`);
+ *   - the dialog approver's running query (`isDialogApproverRunning`) and
+ *     its startup-dialog recognition (`paneShowsStartupDialog`);
+ *   - the record of a launch whose `send-keys` met `ErrSpawnNotInteractive`
+ *     (`launchMetSendKeysNotInteractive`, `recordSendKeysNotInteractive`);
+ *   - the lap's `read-pane` (`readPendingRowLapPane`, the shared reader with
+ *     `allow_pending`) and Enter (`sendPendingRowLapEnter`);
+ *   - the bypassing `find-missing` run (`bypassingFindMissingSweep`, P's key
+ *     as its next-step `get`, read with `readFindMissingRow`) and the shared
+ *     own-row `get` (`readPersonaOwnRow`);
+ *   - the outage flags (`getOutageFlags`: `tmux-unavailable`,
+ *     `ad-config-malformed`);
+ *   - the held text's poster (`postStuckLaunchHeld`) over the one episodes
+ *     instance.
+ * Every agent-director call goes through `withOutageDetection` inside those
+ * entries; there is no new `getClient()` site. The builder reads nothing and
+ * starts nothing when called.
+ */
+export function buildPendingRowRuleDeps(input: PendingRowRuleDepsInput): PendingRowRuleDeps {
+  const log = input.log ?? ((line: string): void => console.error(line))
+  const tmuxUnavailableRaised = (key: string): boolean => getOutageFlags(key).has('tmux-unavailable')
+  return {
+    now: () => _now(),
+    log,
+    isLatched: (key) => personaLatchedNow(key),
+    retryBlockedBy: (key, withinOwnLaunch) => pendingRowRuleBlockCause(key, withinOwnLaunch),
+    isHeldForOldLife: (key) => pendingRowRuleHeldForOldLife(key, input.appliedPersona),
+    isApproverRunning: (key) => isDialogApproverRunning(key),
+    launchMetNotInteractive: (key, launchStart) => launchMetSendKeysNotInteractive(key, launchStart),
+    recordNotInteractive: (key, launchStart) => recordSendKeysNotInteractive(key, launchStart),
+    readLapPane: (key, ref) => readPendingRowLapPane(key, ref),
+    paneShowsStartupDialog: (pane) => paneShowsStartupDialog(pane),
+    sendLapEnter: (key, ref) => sendPendingRowLapEnter(key, ref),
+    runFindMissing: (key) => runPendingRowRuleFindMissing(key),
+    readRow: (key, ref) => readPendingRowRuleRow(key, ref),
+    isTmuxUnavailableRaised: tmuxUnavailableRaised,
+    isConfigMalformedRaised: (key) => getOutageFlags(key).has('ad-config-malformed'),
+    postHeld: (key, launchStart, metNotInteractive) => {
+      const episodes = input.episodes ?? stuckLaunchEpisodes
+      if (episodes === undefined) {
+        log(pendingRowRuleNoEpisodesLine(key))
+        return STUCK_LAUNCH_SUPPRESSED
+      }
+      return postStuckLaunchHeld({ episodes, tmuxUnavailableRaised, log }, key, launchStart, metNotInteractive)
+    },
+  }
+}
+
+/** What `main()` installs: the one pending-row rule instance and P's lifecycle serializer. */
+export interface PendingRowRuleInstall {
+  /** The rule, built through `createPendingRowRule` over `buildPendingRowRuleDeps`. */
+  readonly rule: PendingRowRule
+  /**
+   * P's lifecycle serializer (production: `main()`'s `personaLifecycle.run`):
+   * the rule's one run at the dialog approver's stop takes P's turn there.
+   * Absent: that run starts at once, on its own.
+   */
+  readonly serialize?: PersonaSerialize
+}
+
+/**
+ * The installed pending-row rule (b.jg5 SRJ-410). Production installs it in
+ * `main()` beside the live-row sequence registry, before the start pass.
+ * With none installed (unit tests that install none) no rule run is made:
+ * the retries and the approver's stop keep the pending-only arm only, with
+ * one line where a run would have been made.
+ */
+let pendingRowRule: PendingRowRuleInstall | undefined
+
+/** Install the pending-row rule (production: `main()`), or remove it with undefined (b.jg5 SRJ-410). */
+export function setPendingRowRule(install: PendingRowRuleInstall | undefined): void {
+  pendingRowRule = install
+}
+
+/** Test-only seam: remove any installed pending-row rule. */
+export function _resetPendingRowRule(): void {
+  pendingRowRule = undefined
+}
+
+/** The line for a retry that would run the pending-row rule with none installed: the pending-only arm only. */
+export function pendingRowRuleNotInstalledLine(ref: string): string {
+  return `[slack] pending-row: ${ref}: no pending-row rule is installed — its covered pending row keeps its pending-only arm only; no lap, run or post (b.jg5 SRJ-410)`
+}
+
+/** The line for a second rule run asked in one retry of the persona's timer: none is made. */
+export function pendingRowRuleAlreadyRanLine(ref: string): string {
+  return `[slack] pending-row: ${ref}: the pending-row rule already ran in this retry — no second lap, run or post (b.jg5 SRJ-410)`
+}
+
+/**
+ * Run the pending-row rule once for persona `persona` at a retry of its
+ * retry timer (b.jg5 SRJ-410, SRJ-303), on `row`, the covered `pending` row
+ * the caller's read holds: the pending-only retry's step
+ * (`retryPendingRowStep`), the restart path's deferral (`deferPendingRow`,
+ * `src/server.ts`) and the collision ladder's `pending` step
+ * (`ladderPendingRowStep`, `withinOwnLaunch`), the not-resumable re-read
+ * included. Only inside a retry of the persona's timer, in either mode
+ * (`isInsideTimerRetry`): reached from any other origin (the start pass, an
+ * apply's bring-up, a restart timer, a human-triggered restart, the
+ * hand-off run after a pending-only stop) it answers `undefined` with no
+ * call and no line, so the site keeps its pending-only arm only. At most once per retry
+ * (`claimTimerRetryRuleRun`): a second site reached in the same retry gets
+ * `undefined` with one line. With no rule installed, `undefined` with one
+ * line. Otherwise the rule's answer. Never throws.
+ */
+export async function runPendingRowRuleAtRetry(
+  persona: Persona,
+  row: PendingRowRuleRow,
+  options: { readonly withinOwnLaunch?: boolean } = {},
+): Promise<PendingRowRuleAnswer | undefined> {
+  const { key } = persona
+  if (!isInsideTimerRetry(key)) return undefined
+  const ref = personaRef(persona)
+  const installed = pendingRowRule
+  if (installed === undefined) {
+    console.error(pendingRowRuleNotInstalledLine(ref))
+    return undefined
+  }
+  if (!claimTimerRetryRuleRun(key)) {
+    console.error(pendingRowRuleAlreadyRanLine(ref))
+    return undefined
+  }
+  return installed.rule.run({
+    key,
+    ref,
+    row,
+    origin: PENDING_ROW_RULE_ORIGIN_RETRY,
+    ...(options.withinOwnLaunch === true ? { withinOwnLaunch: true } : {}),
+  })
+}
+
+/**
+ * The pending-only retry's step answer for the pending-row rule's answer
+ * (b.jg5 SRJ-410, SRJ-303): a refusal, the held post or a read the `get`
+ * refused keep the row `pending` (`kept`: the retry is a refusal); a row
+ * the rule read gone is `row` with `ended`, `missing` or absent (the retry
+ * stops and hands P to the restart path's decision); a row it read live is
+ * `row` with that state (the retry stops, with no call beyond that read); a
+ * latch is `latched`; the own-launch branch's abort answers
+ * `sequence-started` for a sequence it started, `latched` for a latch, and
+ * `kept` otherwise. Pure.
+ */
+export function pendingStepOfRuleAnswer(answer: PendingRowRuleAnswer): UnavailableRetryPendingStep {
+  switch (answer.kind) {
+    case PENDING_ROW_RULE_REFUSAL:
+    case PENDING_ROW_RULE_HELD:
+    case PENDING_ROW_RULE_READ_REFUSED:
+      return { kind: UNAVAILABLE_RETRY_PENDING_STEP_KEPT }
+    case PENDING_ROW_RULE_GONE:
+      return {
+        kind: UNAVAILABLE_RETRY_PENDING_STEP_ROW,
+        state: answer.state === LIVENESS_DEAD_ROW_NO_ROW ? UNAVAILABLE_RETRY_ROW_ABSENT : answer.state,
+      }
+    case PENDING_ROW_RULE_LIVE:
+      return { kind: UNAVAILABLE_RETRY_PENDING_STEP_ROW, state: answer.state }
+    case PENDING_ROW_RULE_LATCHED:
+      return { kind: UNAVAILABLE_RETRY_PENDING_STEP_LATCHED }
+    case PENDING_ROW_RULE_RELAUNCH:
+      switch (answer.answer.kind) {
+        case PENDING_ROW_RELAUNCH_SEQUENCE_STARTED:
+          return { kind: UNAVAILABLE_RETRY_PENDING_STEP_SEQUENCE_STARTED }
+        case PENDING_ROW_RELAUNCH_LATCHED:
+          return { kind: UNAVAILABLE_RETRY_PENDING_STEP_LATCHED }
+        case PENDING_ROW_RELAUNCH_KEPT:
+          return { kind: UNAVAILABLE_RETRY_PENDING_STEP_KEPT }
+      }
+  }
+}
+
+/**
+ * The line of the pending-row rule's one run at persona `ref`'s dialog
+ * approver's stop (b.jg5 SRJ-404, SRJ-410): the stop's reason and the
+ * rule's answer:
+ *
+ *   [slack] pending-row: <ref> rule (approver-stop): its dialog approver stopped (<reason>) with the row pending — the run answered <answer> (b.jg5 SRJ-404, SRJ-410)
+ *
+ * Pure.
+ */
+export function pendingRowRuleApproverStopLine(ref: string, reason: ApproverStopReason, answer: PendingRowRuleAnswer): string {
+  return `[slack] pending-row: ${ref} rule (${PENDING_ROW_RULE_ORIGIN_APPROVER_STOP}): its dialog approver stopped (${reason}) with the row pending — the run answered ${describePendingRowRuleAnswer(answer)} (b.jg5 SRJ-404, SRJ-410)`
+}
+
+/** The line for a queued approver-stop run dropped because the server is shutting down: no call. */
+export function pendingRowRuleApproverStopDroppedLine(ref: string): string {
+  return `[slack] pending-row: ${ref} rule (${PENDING_ROW_RULE_ORIGIN_APPROVER_STOP}): dropped — the server is shutting down; no call (b.jg5 SRJ-404)`
+}
+
+/** The line for an approver stop that would run the rule with none installed: the pending-only arm only. */
+export function pendingRowRuleApproverStopNotInstalledLine(ref: string, reason: ApproverStopReason): string {
+  return `[slack] pending-row: ${ref}: its dialog approver stopped (${reason}) with the row pending, and no pending-row rule is installed — the pending-only arm only; no lap, run or post (b.jg5 SRJ-404, SRJ-410)`
+}
+
+/**
+ * At the stop of persona `key`'s registered approver (after it has left the
+ * registry and its pending-only arm, `armAfterApproverStop`), with `reason` and the
+ * approver's state `run` (b.jg5 SRJ-404, SRJ-410; a loop that threw,
+ * `failed`, is in the set too): when the reason is one after which the rule runs
+ * (`approverStopArmsPendingRow`, `APPROVER_STOPS_THAT_ARM`: B or the test
+ * cap, GONE, not interactive, tmux unavailable, superseded, failed; never
+ * shutdown, a latch, the key's retired-key recording or a teardown) and the
+ * approver's last `status` read gave the row `pending` with a launch start,
+ * one rule run for P is queued in P's lifecycle serializer turn
+ * (`PendingRowRuleInstall.serialize`), not awaited by the approver. It runs
+ * as a recovery attempt of its own (`runDetachedRecoveryAttempt`; hatch A2:
+ * its UNAVAILABLE arms, a tmux-touching call's UNAVAILABLE starts
+ * `tmux-unresponsive`, its UNCLASSIFIED opens an episode), on that last
+ * read, exempt from the retry timer's cadence; the rule's own gates apply
+ * when it starts. A run that starts after shutdown began is dropped with no
+ * call. Its answer is logged in one line; a gone row is left to the timer
+ * the stop's arm armed. No run for any other reason, for a last read in another
+ * state, with none, or with no launch start. With no rule installed, one
+ * line and nothing more. Never throws.
+ */
+function queueApproverStopRuleRun(key: string, ref: string, reason: ApproverStopReason, run: ApproverRun): void {
+  try {
+    if (!approverStopArmsPendingRow(reason)) return
+    if (run.lastStateRead !== AGENT_DIRECTOR_PENDING_STATE) return
+    const launchStartedAt = run.lastLaunchStartedAt
+    if (parseLaunchStart(launchStartedAt) === undefined) return
+    const installed = pendingRowRule
+    if (installed === undefined) {
+      console.error(pendingRowRuleApproverStopNotInstalledLine(ref, reason))
+      return
+    }
+    const row: PendingRowRuleRow = { state: AGENT_DIRECTOR_PENDING_STATE, launchStartedAt }
+    const operation = (): Promise<void> => approverStopRuleRun(key, ref, reason, row, installed.rule)
+    const queued = installed.serialize === undefined ? operation() : installed.serialize(key, operation)
+    void queued.catch((err: unknown) => {
+      console.error(pendingRowRuleFailedLine(ref, PENDING_ROW_RULE_ORIGIN_APPROVER_STOP, describeThrownValue(err)))
+    })
+  } catch {
+    /* a queued run never changes how the approver ended */
+  }
+}
+
+/** The queued approver-stop run itself (`queueApproverStopRuleRun`): dropped after shutdown began, else one rule run as a recovery attempt, and its line. */
+async function approverStopRuleRun(
+  key: string,
+  ref: string,
+  reason: ApproverStopReason,
+  row: PendingRowRuleRow,
+  rule: PendingRowRule,
+): Promise<void> {
+  if (approversClosed) {
+    console.error(pendingRowRuleApproverStopDroppedLine(ref))
+    return
+  }
+  const ruled = await runDetachedRecoveryAttempt(key, () =>
+    rule.run({ key, ref, row, origin: PENDING_ROW_RULE_ORIGIN_APPROVER_STOP }),
+  )
+  console.error(pendingRowRuleApproverStopLine(ref, reason, ruled))
 }
 
 // ---------------------------------------------------------------------------
@@ -12530,6 +13164,8 @@ async function runRegisteredApprover(
   }
   // b.jg5 SRJ-409, SRJ-404: the row an approver leaves `pending` when it stops is watched.
   armAfterApproverStop(key, entry.ref, reason, entry.run.lastStateRead)
+  // b.jg5 SRJ-404, SRJ-410: and gets the pending-row rule's one run, queued, not awaited.
+  queueApproverStopRuleRun(key, entry.ref, reason, entry.run)
   return outcome
 }
 
@@ -12540,7 +13176,10 @@ async function runRegisteredApprover(
  * rule (`superseded`), and a loop that threw (`failed`, so a `pending` row
  * is never left unwatched). Never after shutdown, a latch, the key's
  * retired-key recording or a teardown; `live`, `finished`, `absent` and
- * `no-launch-start` leave no covered `pending` row.
+ * `no-launch-start` leave no covered `pending` row. The same set is the one
+ * after which the pending-row rule runs once for P (b.jg5 SRJ-404, SRJ-410;
+ * `queueApproverStopRuleRun`), for a last read of `pending` with a launch
+ * start; there is no second list.
  */
 const APPROVER_STOPS_THAT_ARM: ReadonlySet<ApproverStopReason> = new Set<ApproverStopReason>([
   APPROVER_STOP_BOUND,
@@ -13548,7 +14187,9 @@ async function ladderGetThenAct(run: LadderRun): Promise<SpawnPersonaResult> {
     // start never reaches here: the collision `get` latched it first.
     // b.jg5 SRJ-409, SRJ-411: the ladder's `pending` step: a row that is not
     // covered goes through the live-row sequence; a covered row is left,
-    // its retry timer armed in pending-only mode.
+    // its retry timer armed in pending-only mode, and, at a retry of the
+    // persona's timer only, gets the pending-row rule's one run of that
+    // retry (b.jg5 SRJ-410); from any other origin it is only armed.
     return ladderPendingRowStep(run, row, lastRead)
   }
 

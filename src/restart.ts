@@ -56,8 +56,12 @@
  * whatever the session's connection shows, and the work returns with no
  * reconnect, kill, launch or accounting; the deferral decides whether the
  * row is covered (b.jg5 SRJ-409, SRJ-411: armed pending-only, or sent
- * through the live-row sequence). So does a `pending` re-probe after an
- * 'escalate-dead' reconnect. `unknown` (a `status` error the adapter could not
+ * through the live-row sequence), and at a retry of the persona's timer
+ * only, runs the pending-row rule once on a covered row (b.jg5 SRJ-410).
+ * So does a `pending` re-probe after an 'escalate-dead' reconnect. When the
+ * deferral, at a retry, answers that the row is gone (`ended`, `missing` or
+ * no row), the same run goes on to its relaunch with a `dead` reading that
+ * read the row, so no kill (`pendingDeferralGoneLine`). `unknown` (a `status` error the adapter could not
  * read as dead, or a probe that throws) makes the work return with no
  * reconnect, kill, launch or accounting, and call the arm hook
  * (`RestartDeps.armRetryTimer`); so does an `unknown` re-probe after an
@@ -242,7 +246,8 @@ export const RESTART_OUTCOME_RECONNECT_DEFERRED = 'reconnect-deferred'
  * deferred (`pending`); or b.d61's re-probe after an 'escalate-dead'
  * reconnect read it `pending`, which goes to the deferral too. No
  * reconnect, kill or launch, nothing counted. Never "nothing left to
- * recover" (SRJ-305).
+ * recover" (SRJ-305). A deferral that answered the row gone (at a retry,
+ * b.jg5 SRJ-410) does not end here: the run goes on to its relaunch.
  */
 export const RESTART_OUTCOME_PENDING_DEFERRED = 'pending-deferred'
 /**
@@ -379,7 +384,9 @@ export interface RestartDeps {
    * `RESTART_OUTCOME_PENDING_DEFERRED` with no reconnect, kill, launch or
    * accounting (`pending` on the b.d61 re-probe after an 'escalate-dead'
    * reconnect goes to `deferPendingRow` too, and returns
-   * `RESTART_OUTCOME_PENDING_DEFERRED` with its own line); `unknown`, a probe that
+   * `RESTART_OUTCOME_PENDING_DEFERRED` with its own line), unless the
+   * deferral answers the row gone at a retry (b.jg5 SRJ-410): then the run
+   * goes on to its relaunch with no kill; `unknown`, a probe that
    * throws and an answer that is not a reading all read `unknown`: the work
    * returns `RESTART_OUTCOME_LIVENESS_UNKNOWN` with no reconnect, kill,
    * launch or accounting, and calls `armRetryTimer`.
@@ -503,17 +510,26 @@ export interface RestartDeps {
    * when the b.d61 re-probe after an 'escalate-dead' reconnect reads
    * `pending` (after its own line). The work then answers
    * `RESTART_OUTCOME_PENDING_DEFERRED` with no reconnect, kill, launch or
-   * accounting, whatever the deferral did. Production binds the server's
-   * `deferPendingRow`, which reads the row once and decides whether it is
-   * covered: a covered or undecided row arms the persona's retry timer in
-   * pending-only mode; a row that is not covered (a retired key's old life
+   * accounting, whatever the deferral did, unless the deferral answers that
+   * the row is gone (`ended`, `missing` or no row, as a `DeadRowRead`): then
+   * the same run goes on to its dead branch with a `dead` reading that read
+   * the row (`deadLivenessReading`), so the relaunch makes no kill
+   * (`killBeforeRelaunch`: `RELAUNCH_NO_KILL_ROW_READ`, or
+   * `RELAUNCH_NO_KILL_VERDICT_VOIDED` after an escalate-dead verdict) and is
+   * never made over a `pending` row (b.jg5 SRJ-410, SRJ-303). Production
+   * binds the server's `deferPendingRow`, which reads the row once and
+   * decides whether it is covered: a covered or undecided row arms the
+   * persona's retry timer in pending-only mode, and at a retry of the
+   * persona's timer only, a covered row gets the pending-row rule's one run
+   * of that retry; a row that is not covered (a retired key's old life
    * before its new life, a `cwd` or `config_dir` mismatch) goes through the
-   * live-row sequence, with nothing typed. Its `get` runs inside the work's
-   * recovery attempt, so its UNAVAILABLE arms the timer. A member that
-   * throws or rejects is logged and changes nothing else. Absent: nothing is
-   * called, and the work answers the same.
+   * live-row sequence, with nothing typed. It answers gone only at a retry
+   * of the persona's timer (a row the rule, or its own `get`, read gone).
+   * Its calls run inside the work's recovery attempt, so their UNAVAILABLE
+   * arms the timer. A member that throws or rejects is logged and changes
+   * nothing else. Absent: nothing is called, and the work answers the same.
    */
-  deferPendingRow?(key: string, reading: PendingLivenessReading): void | Promise<void>
+  deferPendingRow?(key: string, reading: PendingLivenessReading): RestartPendingDeferralAnswer | Promise<RestartPendingDeferralAnswer>
   /**
    * The latched query (b.jg5 SRJ-502): true while the persona is latched
    * (production: the server's latch's `isLatched`). Asked first inside the
@@ -1280,10 +1296,17 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   // reconnect, kill or launch, nothing counted.
   // b.jg5 SRJ-610: a `pending` first probe resets the slow-recovery count; an
   // open episode stays open.
+  // b.jg5 SRJ-410, SRJ-303: at a retry of the persona's timer the deferral
+  // may answer that the row is gone (the pending-row rule's read, or its own
+  // `get`): the run then goes on to its dead branch below, with a `dead`
+  // reading that read the row, so no kill and never a launch over `pending`.
+  let goneAfterDeferral: DeadRowRead | undefined
   if (probe.kind === LIVENESS_PENDING) {
     tellSlowRecovery(d, key, 'noteOther', RESTART_SLOW_RECOVERY_OTHER_PENDING_PROBE)
-    await deferPending(d, key, probe)
-    return RESTART_OUTCOME_PENDING_DEFERRED
+    goneAfterDeferral = await deferPending(d, key, probe)
+    if (goneAfterDeferral === undefined) return RESTART_OUTCOME_PENDING_DEFERRED
+    console.error(pendingDeferralGoneLine(key, goneAfterDeferral))
+    tellSlowRecovery(d, key, 'noteDead')
   }
 
   // b.jg5 SRJ-610: a `dead` first probe resets the slow-recovery count; a
@@ -1298,8 +1321,8 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   // escalate-dead answer and the verdict it carried (b.jg5 SRJ-611); a first
   // `dead` reading has none.
   let escalation: EscalateDeadAnswer | undefined
-  let deadRead = deadReadingOf(probe)
-  if (probe.kind !== LIVENESS_DEAD) {
+  let deadRead = goneAfterDeferral === undefined ? deadReadingOf(probe) : deadLivenessReading(goneAfterDeferral)
+  if (probe.kind !== LIVENESS_DEAD && goneAfterDeferral === undefined) {
     // If the session already re-established its MCP connection (e.g. Claude
     // Code refreshed the SSE stream on its own), skip the reconnect. A
     // session is only truly healed when it is connected AND its standalone
@@ -1720,7 +1743,9 @@ function deadReadingOf(probe: LivenessProbe): DeadLivenessReading {
  * reading, the third in a row posting SRJ-1010 once per episode),
  * `RESTART_OUTCOME_PENDING_DEFERRED` (the row reads `pending`: its session
  * has not started; the reading is handed to the `pending` deferral, awaited,
- * as the first probe's is, b.jg5 SRJ-409, SRJ-411),
+ * as the first probe's is, b.jg5 SRJ-409, SRJ-411; a deferral that answers
+ * the row gone, at a retry, gives the `dead` reading it read instead, so the
+ * run relaunches with no kill, b.jg5 SRJ-410),
  * `RESTART_OUTCOME_LIVENESS_UNKNOWN` (the re-probe read
  * `unknown` or threw: agent-director could not report on the persona, and the
  * arm hook is called), `RESTART_OUTCOME_SHUTTING_DOWN`,
@@ -1766,12 +1791,18 @@ async function reprobeDeadAfterEscalate(d: RestartDeps, key: string): Promise<Re
       console.error(reprobeUnknownLine(key, probe.failure))
       armOnUnknown(d, key)
       return RESTART_OUTCOME_LIVENESS_UNKNOWN
-    case LIVENESS_PENDING:
+    case LIVENESS_PENDING: {
       console.error(reprobePendingLine(key))
       tellSlowRecovery(d, key, 'noteOther', RESTART_SLOW_RECOVERY_OTHER_PENDING_REPROBE)
       // b.jg5 SRJ-409, SRJ-411: the re-probe's `pending` goes to the deferral too.
-      await deferPending(d, key, probe)
-      return RESTART_OUTCOME_PENDING_DEFERRED
+      const gone = await deferPending(d, key, probe)
+      if (gone === undefined) return RESTART_OUTCOME_PENDING_DEFERRED
+      // b.jg5 SRJ-410, SRJ-303: at a retry, the deferral read the row gone;
+      // the relaunch follows in this run, with no kill for a row read finished.
+      console.error(pendingDeferralGoneLine(key, gone))
+      tellSlowRecovery(d, key, 'noteDead')
+      return deadLivenessReading(gone)
+    }
     case LIVENESS_LIVE:
       console.error(reprobeLiveLine(key))
       tellSlowRecovery(d, key, 'noteLive')
@@ -1870,13 +1901,39 @@ async function probeLiveness(d: RestartDeps, key: string): Promise<LivenessProbe
  * re-probe's `pending` alike. Absent, nothing is called. A member that
  * throws or rejects is logged; never rejects.
  */
-async function deferPending(d: RestartDeps, key: string, probe: LivenessProbe): Promise<void> {
-  if (d.deferPendingRow === undefined) return
+async function deferPending(d: RestartDeps, key: string, probe: LivenessProbe): Promise<DeadRowRead | undefined> {
+  if (d.deferPendingRow === undefined) return undefined
   try {
-    await d.deferPendingRow(key, pendingLivenessReading(probe.launchStartedAt))
+    const answer = await d.deferPendingRow(key, pendingLivenessReading(probe.launchStartedAt))
+    return isDeadRowRead(answer) ? answer : undefined
   } catch (err) {
     console.error(`[slack] restart: the pending deferral failed for persona=${key}: ${describeThrownValue(err)}`)
+    return undefined
   }
+}
+
+/** True for a `DeadRowRead` (`ended`, `missing`, no row): the deferral's gone answer. Pure. */
+function isDeadRowRead(value: unknown): value is DeadRowRead {
+  return value === LIVENESS_DEAD_ROW_ENDED || value === LIVENESS_DEAD_ROW_MISSING || value === LIVENESS_DEAD_ROW_NO_ROW
+}
+
+/**
+ * What the `pending` deferral (`RestartDeps.deferPendingRow`) may answer:
+ * nothing, or `'pending'` (the row is deferred), or, at a retry of the
+ * persona's timer, the `DeadRowRead` of a row it read gone (b.jg5 SRJ-410).
+ */
+export type RestartPendingDeferralAnswer = void | 'pending' | DeadRowRead
+
+/**
+ * The restart work's line when its `pending` deferral (`deferPendingRow`)
+ * answered that the row is gone (b.jg5 SRJ-410, SRJ-303), at the first probe
+ * or the re-probe: the row is no longer `pending`, so the same run goes on
+ * to its relaunch, with no kill for a row read finished:
+ *
+ *   [slack] Pending deferral for persona=<key> read its row <ended|missing|no-row> — no longer pending; this restart run goes on to its relaunch, with no kill for a row read finished (b.jg5 SRJ-410, SRJ-303)
+ */
+export function pendingDeferralGoneLine(key: string, gone: DeadRowRead): string {
+  return `[slack] Pending deferral for persona=${key} read its row ${gone} — no longer pending; this restart run goes on to its relaunch, with no kill for a row read finished (b.jg5 SRJ-410, SRJ-303)`
 }
 
 /** ` (isSessionAlive failed: <why>)` for a probe that threw, else empty: the part of an unknown line that names the failure. */

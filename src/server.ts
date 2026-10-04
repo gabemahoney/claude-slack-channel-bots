@@ -129,6 +129,9 @@ import {
   readPersonaRowState,
   reconcileOrphans,
   retryPendingRowStep,
+  runPendingRowRuleAtRetry,
+  buildPendingRowRuleDeps,
+  setPendingRowRule,
   PENDING_ROW_STEP_LATCHED,
   PENDING_ROW_STEP_NO_ROW,
   PENDING_ROW_STEP_NOT_PENDING,
@@ -197,7 +200,7 @@ import {
   latchRowStateRead,
   type ConflictLatch,
 } from './conflict-latch.ts'
-import { endStuckLaunchEpisodeForLatch } from './pending-row.ts'
+import { createPendingRowRule, endStuckLaunchEpisodeForLatch, PENDING_ROW_COVERED, PENDING_ROW_RULE_GONE } from './pending-row.ts'
 import {
   bindInvalidFlagsHoldSetReaction,
   createInvalidFlagsHold,
@@ -256,6 +259,9 @@ import {
 import {
   AGENT_DIRECTOR_DEAD_STATES,
   AGENT_DIRECTOR_PENDING_STATE,
+  LIVENESS_DEAD_ROW_ENDED,
+  LIVENESS_DEAD_ROW_MISSING,
+  LIVENESS_DEAD_ROW_NO_ROW,
   LIVENESS_LIVE,
   LIVENESS_READING_DEAD,
   LIVENESS_READING_DEAD_NO_ROW,
@@ -265,6 +271,7 @@ import {
   livenessReadingForStatus,
   pendingLaunchStartOf,
   type DeadLivenessReading,
+  type DeadRowRead,
   type LivenessReading,
 } from './liveness-reading.ts'
 import { getClient, closeClient } from './agent-director-client.ts'
@@ -293,6 +300,7 @@ import {
 import {
   createFullModeRetryAction,
   createUnavailableRetryController,
+  isInsideTimerRetry,
   runDetachedRecoveryAttempt,
   runOutsideAttempts,
   UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
@@ -2033,7 +2041,10 @@ export function _buildKillSessionAdapter(
  *     the live-row sequence, with no `/mcp reconnect` typed. The restart work hands a row its liveness
  *     probe reads `pending` to `deferPendingRow` itself, before it would
  *     call this adapter (b.jg5 SRJ-314); this branch covers a row the probe
- *     read `live` that reads `pending` by this second read. restart.ts
+ *     read `live` that reads `pending` by this second read. Its deferral
+ *     makes no pending-row rule run and never answers gone
+ *     (`mayRunRule: false`): the next retry's first probe reads the row
+ *     and runs the rule there (b.jg5 SRJ-410). restart.ts
  *     treats it as it treats 'transient', and answers
  *     `RESTART_OUTCOME_PENDING_DEFERRED`, so the UNAVAILABLE retry timer
  *     knows the row read `pending`.
@@ -2222,7 +2233,13 @@ export function _buildReconnectSessionAdapter(
     } else if (PROMPT_ROW_STATES.has(state)) {
       return promptRowReconnectVerdict(key, state, latchedNow)
     } else if (state === 'pending') {
-      return await deferPendingRow(key, launchStartedAt, appliedPersona)
+      // A deliberate deviation from b.jg5 SRJ-410 ("at each retry"): no
+      // pending-row rule run here. This branch is reached only in a race,
+      // since the probe had just read the row live and not `pending`, and
+      // its 'pending' answer cannot carry a gone answer. The cost is the
+      // rule running at the next retry, whose first probe reads the row.
+      await deferPendingRow(key, launchStartedAt, appliedPersona, { mayRunRule: false })
+      return 'pending'
     } else if (state === 'waiting') {
       const check = await checkWaitingRowPane(key, latchedNow)
       // b.f2b: its pane shows a running turn or a prompt, or the read latched
@@ -2780,13 +2797,27 @@ export function deferringPendingRowLine(key: string, launchStartedAt?: string): 
  *     later work;
  *   - another state, no row, or a refused read: one line saying so; the
  *     next run decides again.
+ * At a retry of the persona's retry timer only (`isInsideTimerRetry`; b.jg5
+ * SRJ-410, rulings: the rule runs there and nowhere else, and a read-and-step
+ * `get` reading `ended` counts as gone in a full-mode retry), and unless
+ * `options.mayRunRule` is false:
+ *   - covered: the pending-row rule's one run of that retry on the row the
+ *     `get` read (`runPendingRowRuleAtRetry`); a row it reads `ended`,
+ *     `missing` or gone answers gone, anything else 'pending';
+ *   - `ended`, `missing` or no row from the step's own `get`: gone.
+ * A gone answer (the `DeadRowRead`) lets the restart work go
+ * on to its dead branch in the same run, with no kill for a row read
+ * finished and never a launch over `pending`. Reached from any other origin
+ * (the start pass, a restart timer, a human-triggered restart, the
+ * lost-message trigger), the deferral only arms, as before.
  * A persona that is not applied reads nothing more; `appliedPersona` is the
  * applied-persona lookup that decides it (default `getAppliedPersona`, the
- * server's applied config; a caller outside `main()` passes its own). Answers
- * 'pending' whatever the step did, a deferral like 'transient': nothing is
- * counted and no notice is raised (a launch whose session never leaves
- * `pending` raises its own, from its dialog approver). A step that throws is
- * logged and changes nothing about the answer.
+ * server's applied config; a caller outside `main()` passes its own).
+ * Otherwise answers 'pending' whatever the step did, a deferral like
+ * 'transient': nothing is counted and no notice is raised (a launch whose
+ * session never leaves `pending` gets the pending-row rule's stuck-launch
+ * post at B, its only post about the launch, b.jg5 SRJ-405). A step that
+ * throws is logged and changes nothing about the answer.
  *
  * Exported for tests.
  *
@@ -2796,20 +2827,31 @@ export async function deferPendingRow(
   key: string,
   launchStartedAt?: string,
   appliedPersona: (key: string) => Persona | undefined = getAppliedPersona,
-): Promise<'pending'> {
+  options: DeferPendingRowOptions = {},
+): Promise<DeferPendingRowAnswer> {
   console.error(deferringPendingRowLine(key, launchStartedAt))
   // A key that is not applied is not read again; its restart work stops on its own gates.
   const persona = appliedPersona(key)
   if (persona === undefined) return 'pending'
+  // b.jg5 SRJ-410: the rule, and a gone answer, only at a retry of P's timer.
+  const atRetry = options.mayRunRule !== false && isInsideTimerRetry(key)
   try {
     const step = await readAndStepPendingRow(persona)
     switch (step.kind) {
       case PENDING_ROW_STEP_NOT_PENDING:
+        if (atRetry && isDeadRowRead(step.state)) return deferralGone(key, step.state)
         console.error(`[slack] Deferring persona=${key}: its row now reads ${renderLogMessageText(step.state)} — nothing more in this run; the next run decides (b.jg5 SRJ-409)`)
         break
       case PENDING_ROW_STEP_NO_ROW:
+        if (atRetry) return deferralGone(key, LIVENESS_DEAD_ROW_NO_ROW)
         console.error(`[slack] Deferring persona=${key}: its row is gone (ErrSpawnNotFound) — nothing more in this run; the next run decides (b.jg5 SRJ-409)`)
         break
+      case PENDING_ROW_COVERED: {
+        if (!atRetry) break
+        const ruled = await runPendingRowRuleAtRetry(persona, step.row)
+        if (ruled?.kind === PENDING_ROW_RULE_GONE) return deferralGone(key, ruled.state)
+        break
+      }
       case PENDING_ROW_STEP_REFUSED:
         console.error(`[slack] Deferring persona=${key}: its row could not be read again (${describeThrownValue(step.error)}) — nothing more in this run; the next run decides (b.jg5 SRJ-409)`)
         break
@@ -2817,14 +2859,57 @@ export async function deferPendingRow(
         // The shared read logged the latch; the latch's gates stop later work.
         break
       default:
-        // Covered or undecided: armed pending-only (the controller's line);
-        // not covered: the sequence started (the step's lines).
+        // Undecided: armed pending-only (the controller's line); not
+        // covered: the sequence started (the step's lines).
         break
     }
   } catch (err) {
     console.error(`[slack] Deferring persona=${key}: the pending-row step failed: ${describeThrownValue(err)} — nothing more in this run`)
   }
   return 'pending'
+}
+
+/** What `deferPendingRow` is told about its caller. */
+export interface DeferPendingRowOptions {
+  /**
+   * False for the reconnect adapter's deferral (`_buildReconnectSessionAdapter`),
+   * whose answer the restart path reads as `pending` only: no pending-row
+   * rule run and no gone answer there (the next retry's first probe reads
+   * the row and runs the rule). Absent or true: the restart work's deferral,
+   * at its first probe and its re-probe.
+   */
+  readonly mayRunRule?: boolean
+}
+
+/**
+ * What `deferPendingRow` answers: 'pending' (the row is deferred, nothing
+ * counted), or, at a retry of the persona's timer only, that the row is gone
+ * (its `DeadRowRead`: `ended`, `missing` or `no-row`), for the restart work
+ * to go on to its dead branch in the same run (b.jg5 SRJ-410, SRJ-303).
+ */
+export type DeferPendingRowAnswer = 'pending' | DeadRowRead
+
+/** True for a row state the deferral's gone answer carries (`ended` or `missing`). Pure. */
+function isDeadRowRead(state: string): state is typeof LIVENESS_DEAD_ROW_ENDED | typeof LIVENESS_DEAD_ROW_MISSING {
+  return state === LIVENESS_DEAD_ROW_ENDED || state === LIVENESS_DEAD_ROW_MISSING
+}
+
+/**
+ * The deferral's line when, at a retry of the persona's timer, the row is
+ * gone (b.jg5 SRJ-410, SRJ-303): no longer `pending`, so the restart work
+ * goes on to its dead branch in this run, with no kill. Pure. Exported for
+ * tests.
+ *
+ * @internal
+ */
+export function deferringPendingRowGoneLine(key: string, gone: DeadRowRead): string {
+  return `[slack] Deferring persona=${key}: at this retry its row reads ${gone} — no longer pending; the restart run goes on to its relaunch, with no kill for a row read finished (b.jg5 SRJ-410, SRJ-303)`
+}
+
+/** The deferral's gone answer for persona `key`, with its line. */
+function deferralGone(key: string, gone: DeadRowRead): DeferPendingRowAnswer {
+  console.error(deferringPendingRowGoneLine(key, gone))
+  return gone
 }
 
 /**
@@ -3590,6 +3675,24 @@ export async function main(): Promise<void> {
   liveRowSequences = sequences
   setLiveRowSequenceRegistry(sequences)
 
+  // b.jg5 SRJ-410, SRJ-404: the one pending-row rule, built through its
+  // factory over the session manager's one dependency builder (the notice
+  // episodes above for its held post) and installed beside the sequence
+  // registry, before the start pass. It runs only at a retry of a persona's
+  // timer (the pending-only step, the restart path's deferral, the ladder's
+  // `pending` step) and once at a dialog approver's stop, which takes the
+  // persona's turn in the lifecycle serializer; every other origin only arms.
+  setPendingRowRule({
+    rule: createPendingRowRule(
+      buildPendingRowRuleDeps({
+        appliedPersona: getAppliedPersona,
+        episodes: noticeEpisodes,
+        log: (line) => console.error(line),
+      }),
+    ),
+    serialize: personaLifecycle.run,
+  })
+
   // b.jg5 SRJ-811, SRJ-812, SRJ-1512: the old-life wait's bindings, installed
   // with the registry its waits run in: each waiting persona's retry timer
   // through the retry controller's arm (never the old key's), the system
@@ -4120,9 +4223,9 @@ export async function main(): Promise<void> {
     // covered row and sends a row that is not covered through the live-row
     // sequence. A configured persona's own `pending` row with no launch start
     // never reaches it: the probe latched the persona (b.jg5 SRJ-513).
-    deferPendingRow: async (key, reading) => {
-      await deferPendingRow(key, reading.launchStartedAt)
-    },
+    // b.jg5 SRJ-410: at a retry, a row the deferral reads gone lets the
+    // restart work go on to its relaunch in the same run.
+    deferPendingRow: async (key, reading) => deferPendingRow(key, reading.launchStartedAt),
     // b.jg5 SRJ-502: a latched persona's restart work (a fired timer, a
     // retry, a human-triggered restart) makes no agent-director call.
     isLatched: (key) => conflictLatch.isLatched(key),

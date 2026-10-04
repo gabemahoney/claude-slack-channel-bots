@@ -102,6 +102,24 @@
  * chosen call of a chosen persona open with a gate and record every call's
  * start in one ordered event list.
  *
+ * The pending-row rule's one run at the approver's stop (b.jg5 SRJ-404,
+ * SRJ-410; ruling R3), with the rule installed as `main()` installs it and a
+ * serializer that holds each turn until the case runs it: one case per typed
+ * stop reason (a table keyed by the reason type), each driven through the
+ * registry. Its hand-written run column must agree with the arm's export
+ * (`approverStopArmsPendingRow`) and with what happened: B or the test cap,
+ * GONE, not interactive, tmux unavailable, superseded and a loop that threw
+ * (`failed`) each ask one turn for P and, once it runs, make one lap
+ * `read-pane` (none after the approver's `send-keys` met
+ * `ErrSpawnNotInteractive`), one bypassing `find-missing` and one `get` on
+ * the approver's last read, with one answer line, the held post at B, and no
+ * kill or launch; live, finished, absent, no launch start, latched,
+ * teardown, the retired-key recording (E25: its calls end at the stop) and
+ * shutdown ask none and make no call. A stop in the run set whose last read
+ * was not `pending` runs nothing; a run before G makes no call; a later stop
+ * asks no second run; a run still queued at shutdown is dropped with one
+ * line.
+ *
  * Time: every case runs on `createFakeClock` through the approver's clock
  * seam (`_setApproverClock`); laps are driven with `runNext`, never a real
  * sleep, and `afterEach` asserts no timer is left pending. A case about B or
@@ -187,11 +205,21 @@ import {
   _resetConfiguredPersonaQuery,
   _resetDialogApprovers,
   _resetDialogReadyTimeoutMs,
+  _resetFindMissingMemo,
+  _resetNow,
+  _resetPendingRowRule,
   _resetTmuxCommandRunner,
   _setApproverClock,
   _setDialogReadyTimeoutMs,
+  _setNow,
   _setTmuxCommandRunner,
   _whenDialogApproverStopped,
+  APPROVER_STOP_FAILED,
+  approverStopArmsPendingRow,
+  buildPendingRowRuleDeps,
+  pendingRowRuleApproverStopDroppedLine,
+  pendingRowRuleApproverStopLine,
+  setPendingRowRule,
   setConfiguredPersonaQuery,
   setConflictLatch,
   type ApproverOutcome,
@@ -211,7 +239,17 @@ import {
   PENDING_ROW_REASON_RETIRED_OLD_LIFE,
   PENDING_ROW_UNDECIDED,
   type PendingRowCover,
+  createPendingRowRule,
+  describeLaunchStartForLog,
+  PENDING_ROW_RULE_HELD,
+  PENDING_ROW_RULE_LOG_HEAD,
+  PENDING_ROW_RULE_ORIGIN_APPROVER_STOP,
+  PENDING_ROW_RULE_REFUSAL,
+  STUCK_LAUNCH_POSTED,
+  stuckLaunchHeldText,
+  type PendingRowRuleAnswer,
 } from '../src/pending-row.ts'
+import { createPersonaEpisodes } from '../src/persona-episodes.ts'
 import {
   isInsideAttempt,
   runInAttempt,
@@ -222,6 +260,7 @@ import {
   AGENT_DIRECTOR_DEAD_STATES,
   AGENT_DIRECTOR_LIVE_STATES,
   AGENT_DIRECTOR_PENDING_STATE,
+  LIVENESS_DEAD_ROW_ENDED,
 } from '../src/liveness-reading.ts'
 import {
   CONFLICT_LATCH_SET_LATCHED,
@@ -260,6 +299,7 @@ import {
 } from '../src/outage-state.ts'
 import {
   cannedErr,
+  cannedGetResult,
   cannedOk,
   cannedStatusResult,
   errConfigMalformed,
@@ -2706,6 +2746,360 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
     rows.set(PLAIN.id, [LIVE_ROW])
     expect(await runUntilStopped(PLAIN)).toEqual({ reason: APPROVER_STOP_LIVE, launchStartMs: LAUNCH_START_MS })
     expect(approverLines().filter((line) => line.includes(approverLogLine(approverStopRequestedMessage(PLAIN.ref, APPROVER_STOP_SUPERSEDED))))).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The pending-row rule's one run at the approver's stop (b.jg5 SRJ-404,
+// SRJ-410; ruling R3)
+//
+// The rule is installed as `main()` installs it (`createPendingRowRule` over
+// `buildPendingRowRuleDeps`, the session manager's clock on the case's fake
+// clock), with a serializer that queues each turn until the case runs it, so
+// a case sees the run asked for P's turn before any of its calls. Every
+// typed stop reason has one case (the table is keyed by the reason type),
+// driven through the registry's start entry; its hand-written `runs` must
+// match both the export the arm reads (`approverStopArmsPendingRow`) and
+// what happened: one turn for P and, once it runs, one lap `read-pane`
+// (none after the approver's `send-keys` met `ErrSpawnNotInteractive`), one
+// bypassing `find-missing` and one `get`, with one answer line; or no turn
+// and no call after the stop. A stop whose last read was not `pending` with a
+// launch start runs nothing. At B the run's held post is the only post; no
+// kill or launch follows any stop.
+// ---------------------------------------------------------------------------
+
+/** One serializer turn the case holds: P's key and the operation, run when the case runs it. */
+interface QueuedTurn {
+  readonly key: string
+  readonly run: () => Promise<void>
+}
+
+/** The stub's call counts by call list, leaving out the lists with none. */
+function callCountsOf(log: StubCallLog): Record<string, number> {
+  return Object.fromEntries(
+    Object.entries(log)
+      .filter(([, list]) => (list as unknown[]).length > 0)
+      .map(([verb, list]) => [verb, (list as unknown[]).length]),
+  )
+}
+
+/** The calls `after` holds beyond `before`, by call list, leaving out the lists with none. */
+function countsSince(after: Record<string, number>, before: Record<string, number>): Record<string, number> {
+  return Object.fromEntries(Object.entries(after).map(([verb, n]) => [verb, n - (before[verb] ?? 0)] as const).filter(([, n]) => n > 0))
+}
+
+describe('the pending-row rule runs once at the approver\'s stop, for the stops that leave the row to it (b.jg5 SRJ-404, SRJ-410)', () => {
+  const who = PLAIN
+  /** P's own row as the rule's `get` reads it: `pending`, with the stub's default launch start. */
+  const PENDING_GET = cannedGetResult({ claude_instance_id: who.id, state: AGENT_DIRECTOR_PENDING_STATE })
+  /** The test cap of the cap cases: past the approver's second slow lap, before its third. */
+  const CAP_MS = SLOW + FAST
+  /** The run's lap, its run and its get, as call-list counts. */
+  const LAP_RUN_GET = { readPaneCalls: 1, findMissingCalls: 1, getCalls: 1 }
+  /** The run and its get, with no lap. */
+  const RUN_GET = { findMissingCalls: 1, getCalls: 1 }
+  /** The answer of a run from G, before B, on a row the run did not judge. */
+  const NOT_JUDGED: PendingRowRuleAnswer = { kind: PENDING_ROW_RULE_REFUSAL, reason: 'not-judged' }
+  /** The answer of a run at B on a row never CSCB's own: the held text posted. */
+  const HELD_POSTED: PendingRowRuleAnswer = { kind: PENDING_ROW_RULE_HELD, post: STUCK_LAUNCH_POSTED }
+
+  let turns: QueuedTurn[]
+  let posts: Notice[]
+  let episodeLines: string[]
+
+  beforeEach(() => {
+    _resetDialogApprovers()
+    _resetFindMissingMemo()
+    turns = []
+    posts = []
+    episodeLines = []
+    _setNow(() => clock.now())
+    const episodes = createPersonaEpisodes({
+      sink: (key, text) => {
+        posts.push({ key, text })
+      },
+      log: (line) => {
+        episodeLines.push(line)
+      },
+      clock,
+    })
+    setPendingRowRule({
+      rule: createPendingRowRule(buildPendingRowRuleDeps({ appliedPersona: () => undefined, episodes })),
+      serialize: <T,>(key: string, operation: () => T | Promise<T>): Promise<T> =>
+        new Promise<T>((resolve, reject) => {
+          turns.push({ key, run: () => Promise.resolve().then(operation).then(resolve, reject) })
+        }),
+    })
+  })
+
+  afterEach(async () => {
+    await runTurns()
+    _resetPendingRowRule()
+    _resetNow()
+    _resetDialogApprovers()
+    _resetFindMissingMemo()
+    assertNoLeak({ posts, episodeLines })
+  })
+
+  /** Run every queued turn, in order, and let each finish. */
+  async function runTurns(): Promise<void> {
+    for (const turn of turns.splice(0)) await turn.run()
+    await clock.flush()
+  }
+
+  /** Fire timers until P's registered approver has stopped; answers its outcome. */
+  async function untilStopped(maxTimers = MANY_TIMERS): Promise<ApproverOutcome | undefined> {
+    for (let fired = 0; ; fired++) {
+      await clock.flush()
+      if (!isDialogApproverRunning(who.key)) return _whenDialogApproverStopped(who.key)
+      if (fired >= maxTimers) throw new Error(`the approver did not stop within ${maxTimers} timers`)
+      await clock.runNext()
+    }
+  }
+
+  /** The head of every line of the run at the stop (its round, its answer, its drop). */
+  const runHead = `${PENDING_ROW_RULE_LOG_HEAD} ${who.ref} rule (${PENDING_ROW_RULE_ORIGIN_APPROVER_STOP}): `
+  /** The session manager's lines for the run at the stop: its answer, or its drop. */
+  const approverStopRunLines = (): string[] =>
+    errLines.filter((line) => line.startsWith(`${runHead}its dialog approver stopped (`) || line.startsWith(`${runHead}dropped`))
+
+  /** The clock at G past the stub's default launch start: the rule acts on a row read `pending` from then on. */
+  const startAtG = (): void => startClockAt(LAUNCH_START_MS + adGraceMsInEffect())
+
+  /** How a case ends P's approver, and what follows the stop. */
+  interface StopCase {
+    /** Installs the stub (and anything else the stop needs) on the clock at G. */
+    readonly arrange: () => void
+    /** Stops the approver from outside once its first lap has run; unset, it runs to its own stop. */
+    readonly stop?: () => Promise<unknown>
+    /** Whether the approver's last `status` read gave the row `pending` with a launch start. */
+    readonly pendingRead: boolean
+    /** Written by hand: whether the rule runs once after this stop. */
+    readonly runs: boolean
+    /** The run's calls, when it runs. */
+    readonly calls?: Record<string, number>
+    /** The run's answer, when it runs. */
+    readonly answer?: PendingRowRuleAnswer
+    /** The launch start the approver last read, which the run uses. */
+    readonly lastLaunchStart?: string
+  }
+
+  const pendingNoDialog = (knobs: Omit<StubClientOptions, keyof StubCallLog | 'statusFn'> = {}): void =>
+    installStub([PENDING_ROW], { getResult: PENDING_GET, ...knobs })
+
+  /** One case per typed stop reason: the key type makes a new reason fail the typecheck until it has a case. */
+  const STOP_CASES: { readonly [R in ApproverStopReason]: StopCase } = {
+    // B, from the launch start: the run at B gives the held post on a row never CSCB's own.
+    [APPROVER_STOP_BOUND]: {
+      arrange: () => pendingNoDialog(),
+      pendingRead: true,
+      runs: true,
+      calls: LAP_RUN_GET,
+      answer: HELD_POSTED,
+      lastLaunchStart: SAMPLE_LAUNCH_START_DEFAULT,
+    },
+    [APPROVER_STOP_CAP]: {
+      arrange: () => {
+        _setDialogReadyTimeoutMs(CAP_MS)
+        pendingNoDialog()
+      },
+      pendingRead: true,
+      runs: true,
+      calls: LAP_RUN_GET,
+      answer: NOT_JUDGED,
+      lastLaunchStart: SAMPLE_LAUNCH_START_DEFAULT,
+    },
+    [APPROVER_STOP_GONE]: {
+      arrange: () => pendingNoDialog({ readPaneQueue: [cannedErr(errTmuxCaptureFailed())] }),
+      pendingRead: true,
+      runs: true,
+      calls: LAP_RUN_GET,
+      answer: NOT_JUDGED,
+      lastLaunchStart: SAMPLE_LAUNCH_START_DEFAULT,
+    },
+    // b.jg5 SRJ-118: no further lap on a launch whose send-keys met ErrSpawnNotInteractive.
+    [APPROVER_STOP_NOT_INTERACTIVE]: {
+      arrange: () => pendingNoDialog({ readPaneResults: [dialogPane(TRUST_DIALOG_NEEDLE)], sendKeysQueue: [cannedErr(errSpawnNotInteractiveLeftover(undefined, 'send-keys'))] }),
+      pendingRead: true,
+      runs: true,
+      calls: RUN_GET,
+      answer: NOT_JUDGED,
+      lastLaunchStart: SAMPLE_LAUNCH_START_DEFAULT,
+    },
+    [APPROVER_STOP_TMUX_UNAVAILABLE]: {
+      arrange: () => pendingNoDialog({ readPaneQueue: [cannedErr(errTmuxNotAvailable(undefined, 'read-pane'))] }),
+      pendingRead: true,
+      runs: true,
+      calls: LAP_RUN_GET,
+      answer: NOT_JUDGED,
+      lastLaunchStart: SAMPLE_LAUNCH_START_DEFAULT,
+    },
+    // The one-approver rule: a later lap reads another launch start; the run uses that last read.
+    [APPROVER_STOP_SUPERSEDED]: {
+      arrange: () => installStub([PENDING_ROW, NEWER_PENDING_ROW], { getResult: PENDING_GET }),
+      pendingRead: true,
+      runs: true,
+      calls: LAP_RUN_GET,
+      answer: NOT_JUDGED,
+      lastLaunchStart: SAMPLE_LAUNCH_START_WHOLE,
+    },
+    // Ruling R3: a loop that threw (its clock failing after a lap read the row pending) gets the one run.
+    [APPROVER_STOP_FAILED]: {
+      arrange: () => {
+        let failing = false
+        pendingNoDialog({
+          readPaneFn: () => {
+            failing = true
+            return undefined
+          },
+        })
+        const base = clock
+        _setApproverClock({
+          now: () => {
+            if (failing) throw new Error('the approver clock failed')
+            return base.now()
+          },
+          setTimeout: (callback, delayMs) => base.setTimeout(callback, delayMs),
+          clearTimeout: (handle) => base.clearTimeout(handle),
+        })
+      },
+      pendingRead: true,
+      runs: true,
+      calls: LAP_RUN_GET,
+      answer: NOT_JUDGED,
+      lastLaunchStart: SAMPLE_LAUNCH_START_DEFAULT,
+    },
+    // No pending row is left: a live, finished, absent row, or one with no launch start.
+    [APPROVER_STOP_LIVE]: { arrange: () => installStub([LIVE_ROW]), pendingRead: false, runs: false },
+    [APPROVER_STOP_FINISHED]: { arrange: () => installStub([cannedStatusResult({ state: LIVENESS_DEAD_ROW_ENDED })]), pendingRead: false, runs: false },
+    [APPROVER_STOP_ABSENT]: { arrange: () => installStub([errSpawnNotFound()]), pendingRead: false, runs: false },
+    [APPROVER_STOP_NO_LAUNCH_START]: {
+      arrange: () => installStub([cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: NO_LAUNCH_START_FORMS[NO_LAUNCH_START_FORM_NAMES[0]!] })]),
+      pendingRead: false,
+      runs: false,
+    },
+    // SRJ-404: the row is pending, yet these stops leave it to no run.
+    [APPROVER_STOP_LATCHED]: {
+      arrange: () => {
+        setConflictLatch(createConflictLatch({ log: () => {} }))
+        const row = APPROVER_CONFLICT_CASE_ROWS.find((caseRow) => caseRow.verb === 'read-pane')!
+        pendingNoDialog({ readPaneQueue: [cannedErr(row.build())] })
+      },
+      pendingRead: true,
+      runs: false,
+    },
+    [APPROVER_STOP_TEARDOWN]: { arrange: () => pendingNoDialog(), stop: () => stopDialogApprover(who.key, APPROVER_STOP_TEARDOWN), pendingRead: true, runs: false },
+    // E25: the retired-key recording's stop; the recorded calls end at it.
+    [APPROVER_STOP_RETIRED_KEY]: { arrange: () => pendingNoDialog(), stop: () => stopDialogApprover(who.key, APPROVER_STOP_RETIRED_KEY), pendingRead: true, runs: false },
+    [APPROVER_STOP_SHUTDOWN]: { arrange: () => pendingNoDialog(), stop: () => stopAllDialogApprovers(), pendingRead: true, runs: false },
+  }
+
+  test.each(Object.entries(STOP_CASES) as Array<[ApproverStopReason, StopCase]>)(
+    'a stop (%s): the run follows exactly when the reason is in the run set and the last read was pending with a launch start, once, in P\'s serializer turn; no kill or launch',
+    async (reason, row) => {
+      startAtG()
+      row.arrange()
+      expect(startDialogApprover(who.key, false, who.ref)).toBe(true)
+      if (row.stop !== undefined) {
+        await clock.flush()
+        await row.stop()
+      }
+      expect((await untilStopped())?.reason).toBe(reason)
+
+      // The run set is the arm's (`approverStopArmsPendingRow`); the hand column pins it.
+      expect(approverStopArmsPendingRow(reason) && row.pendingRead).toBe(row.runs)
+      // Asked for P's turn; nothing called before the turn runs.
+      expect(turns.map((turn) => turn.key)).toEqual(row.runs ? [who.key] : [])
+      const atStop = callCountsOf(calls)
+      await runTurns()
+
+      expect(countsSince(callCountsOf(calls), atStop)).toEqual(row.runs ? row.calls! : {})
+      expect(approverStopRunLines()).toEqual(row.runs ? [pendingRowRuleApproverStopLine(who.ref, reason, row.answer!)] : [])
+      if (row.runs) {
+        // The run read the approver's last read: its round line names that launch start.
+        const roundHead = `${runHead}launch started ${describeLaunchStartForLog(row.lastLaunchStart)}; `
+        expect(errLines.filter((line) => line.startsWith(roundHead))).toHaveLength(1)
+      }
+      expect(posts).toEqual(row.answer?.kind === PENDING_ROW_RULE_HELD ? [{ key: who.key, text: stuckLaunchHeldText(who.key, SAMPLE_LAUNCH_START_DEFAULT, false) }] : [])
+      expect([calls.killCalls, calls.spawnCalls, calls.resumeCalls, calls.deleteCalls]).toEqual([[], [], [], []])
+    },
+  )
+
+  /** Stops in the run set whose last read leaves no `pending` row with a launch start. */
+  const NO_PENDING_READ: ReadonlyArray<readonly [string, ApproverStopReason, () => void]> = [
+    [
+      'the test cap after its last status read a state CSCB does not know',
+      APPROVER_STOP_CAP,
+      () => {
+        _setDialogReadyTimeoutMs(CAP_MS)
+        installStub([PENDING_ROW, cannedStatusResult({ state: 'hibernating' })], { getResult: PENDING_GET })
+      },
+    ],
+    ['ErrTmuxNotAvailable at its first status (no row read)', APPROVER_STOP_TMUX_UNAVAILABLE, () => installStub([errTmuxNotAvailable(undefined, 'status')], { getResult: PENDING_GET })],
+  ]
+
+  test.each(NO_PENDING_READ)('%s: a stop in the run set (%s) runs nothing; no turn, no call after the stop', async (_name, reason, arrange) => {
+    startAtG()
+    arrange()
+    startDialogApprover(who.key, false, who.ref)
+    expect((await untilStopped())?.reason).toBe(reason)
+    expect(approverStopArmsPendingRow(reason)).toBe(true)
+    const atStop = callCountsOf(calls)
+
+    await runTurns()
+
+    expect(turns).toEqual([])
+    expect(countsSince(callCountsOf(calls), atStop)).toEqual({})
+    expect(approverStopRunLines()).toEqual([])
+  })
+
+  test('before G the run makes no call: its answer is the refusal for a row younger than G, and nothing is posted', async () => {
+    startClockAt(LAUNCH_START_MS)
+    _setDialogReadyTimeoutMs(CAP_MS)
+    pendingNoDialog()
+    startDialogApprover(who.key, false, who.ref)
+    expect((await untilStopped())?.reason).toBe(APPROVER_STOP_CAP)
+    const atStop = callCountsOf(calls)
+
+    await runTurns()
+
+    expect(countsSince(callCountsOf(calls), atStop)).toEqual({})
+    expect(approverStopRunLines()).toEqual([pendingRowRuleApproverStopLine(who.ref, APPROVER_STOP_CAP, { kind: PENDING_ROW_RULE_REFUSAL, reason: 'younger-than-g' })])
+    expect(posts).toEqual([])
+  })
+
+  test('the run happens once, whatever stops are asked afterwards: a later teardown or shutdown stop asks no second turn and makes no call', async () => {
+    startAtG()
+    _setDialogReadyTimeoutMs(CAP_MS)
+    pendingNoDialog()
+    startDialogApprover(who.key, false, who.ref)
+    expect((await untilStopped())?.reason).toBe(APPROVER_STOP_CAP)
+    await runTurns()
+    const afterRun = callCountsOf(calls)
+
+    expect(await stopDialogApprover(who.key, APPROVER_STOP_TEARDOWN)).toBe(false)
+    await stopAllDialogApprovers()
+    await runTurns()
+
+    expect(turns).toEqual([])
+    expect(countsSince(callCountsOf(calls), afterRun)).toEqual({})
+    expect(approverStopRunLines()).toEqual([pendingRowRuleApproverStopLine(who.ref, APPROVER_STOP_CAP, NOT_JUDGED)])
+  })
+
+  test('a run still queued when the shutdown begins is dropped with one line and no call', async () => {
+    startAtG()
+    _setDialogReadyTimeoutMs(CAP_MS)
+    pendingNoDialog()
+    startDialogApprover(who.key, false, who.ref)
+    expect((await untilStopped())?.reason).toBe(APPROVER_STOP_CAP)
+    expect(turns.map((turn) => turn.key)).toEqual([who.key])
+    const atStop = callCountsOf(calls)
+
+    await stopAllDialogApprovers()
+    await runTurns()
+
+    expect(countsSince(callCountsOf(calls), atStop)).toEqual({})
+    expect(approverStopRunLines()).toEqual([pendingRowRuleApproverStopDroppedLine(who.ref)])
   })
 })
 

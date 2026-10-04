@@ -1,8 +1,9 @@
 /**
  * pending-row.ts — A `pending` row's launch start (b.jg5 SRJ-406, SRJ-408),
- * the pending-with-no-launch-start predicate (b.jg5 SRJ-513), and the
+ * the pending-with-no-launch-start predicate (b.jg5 SRJ-513), the
  * stuck-launch post's texts, posters and episode end (b.jg5 SRJ-1017,
- * SRJ-1016).
+ * SRJ-1016), and the pending-row rule (b.jg5 SRJ-410): its pure decisions
+ * and its driver.
  *
  * agent-director shows a row's launch start (`launch_started_at`) on `pending`
  * rows only, from `status`, `get` and `list` alike: an RFC 3339 UTC timestamp
@@ -90,21 +91,87 @@
  * ({@link isStuckLaunchEpisodeEndState}; the session manager's shared
  * own-row reads), when P latches ({@link endStuckLaunchEpisodeForLatch}, the
  * latch's hold observer), and at P's teardown (the episodes' `forget`); a
- * read of `pending`, `ended`, `missing` or no row does not end it.
+ * read of `pending`, `ended`, `missing` or no row does not end it. The
+ * stuck-launch post is P's only post about a launch that does not report
+ * in (b.jg5 SRJ-405, SRJ-1010): the dialog approver posts nothing at B, and
+ * a `pending` re-probe counts toward no slow-recovery notice.
+ *
+ * The pending-row rule (b.jg5 SRJ-410). While P's covered row reads
+ * `pending`, P is not latched and no launch call, live-row sequence or
+ * old-life wait step for P is in flight, the rule acts on the row's age from
+ * its launch start, at each retry of P's retry timer and once when P's
+ * dialog approver stops with the row still `pending`: nothing before G
+ * ({@link pendingRowAgeOf}); from G, one approver lap when no approver runs
+ * and the launch has not met `ErrSpawnNotInteractive`
+ * ({@link isPendingRowLapEligible}, {@link decidePendingRowLapPane},
+ * {@link decidePendingRowLapEnter}), then one bypassing `find-missing` run
+ * and one `get` ({@link readPendingRowRun}: before B a run that did not judge
+ * the row leads to nothing that round); still `pending` at B, judged or not,
+ * step 3 ({@link decidePendingRowStepThree}): nothing while `tmux-unavailable`
+ * is raised, CSCB's own stuck launch through the own-launch slot, any other
+ * row the held text, never a kill. The driver
+ * ({@link createPendingRowRule}) is a factory over injected dependencies
+ * (the session manager builds the production ones), runs one round per
+ * call, and never kills, launches or reuses the row. The lap's pane is no
+ * proof that this launch's session shows a dialog (b.jg5 SRJ-613): it leads
+ * at most to Enter through `send-keys`, which is the backstop, answering
+ * `ErrSpawnNotInteractive` with nothing typed on a `pending` row whose
+ * session is not this launch's; no further lap is then made on that launch.
  *
  * No module-scope state, no I/O, no agent-director call and nothing run at
- * import; the clock is always passed in. Every function but the posters and
- * the episode's end is pure; those act only through the dependencies they
- * are given. Nothing names an export only the Phase 1 client has; the
- * result field is typed through CSCB's own Phase 1 declarations
- * (`src/ad-phase1-types.ts`, a type-only import).
+ * import; the clock is always passed in. Every function but the posters, the
+ * episode's end and the rule's driver is pure; those act only through the
+ * dependencies they are given. Errors are classified by class and name
+ * through `src/ad-error-class.ts`. Nothing names an export only the Phase 1
+ * client has; the result field is typed through CSCB's own Phase 1
+ * declarations (`src/ad-phase1-types.ts`, a type-only import).
  *
  * SPDX-License-Identifier: MIT
  */
 
+import {
+  AD_ERROR_CLASS_CONFIG,
+  AD_ERROR_CLASS_CONFLICT,
+  AD_ERROR_CLASS_ENVIRONMENT,
+  AD_ERROR_CLASS_GONE,
+  AD_ERROR_CLASS_UNAVAILABLE,
+  AD_ERROR_CLASS_UNUSABLE_NAME,
+  classifyAdError,
+  describeAgentDirectorFailure,
+  hasAdErrorName,
+  type AdErrorClass,
+} from './ad-error-class.ts'
 import type { Phase1StatusResult } from './ad-phase1-types.ts'
-import { armNeverEarlyWait, wholeMinutes, type NeverEarlyWaitClock, type NeverEarlyWaitLength } from './ad-settings.ts'
-import { AGENT_DIRECTOR_LIVE_STATES, AGENT_DIRECTOR_PENDING_STATE, pendingLaunchStartOf } from './liveness-reading.ts'
+import {
+  adGraceMsInEffect,
+  adLaunchBoundMsInEffect,
+  armNeverEarlyWait,
+  wholeMinutes,
+  type NeverEarlyWaitClock,
+  type NeverEarlyWaitLength,
+} from './ad-settings.ts'
+import { ERR_SPAWN_NOT_FOUND_NAME, ERR_SPAWN_NOT_INTERACTIVE_NAME } from './agent-director-errors.ts'
+import {
+  AGENT_DIRECTOR_DEAD_STATES,
+  AGENT_DIRECTOR_LIVE_STATES,
+  AGENT_DIRECTOR_PENDING_STATE,
+  LIVENESS_DEAD_ROW_NO_ROW,
+  pendingLaunchStartOf,
+  type DeadRowRead,
+} from './liveness-reading.ts'
+import {
+  PANE_READ_ABSENT,
+  PANE_READ_CONFIG,
+  PANE_READ_CONFLICT,
+  PANE_READ_ENVIRONMENT,
+  PANE_READ_GONE,
+  PANE_READ_LATCHED,
+  PANE_READ_PANE,
+  PANE_READ_UNAVAILABLE,
+  PANE_READ_UNCLASSIFIED,
+  PANE_READ_UNUSABLE_NAME,
+  type PaneReadOutcome,
+} from './pane-read.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import type { MUTED_BY_TEARDOWN, PERSONA_EPISODE_KIND_STUCK_LAUNCH, PersonaEpisodes } from './persona-episodes.ts'
 import { personaTmuxSessionName, quotedPersonaSessionName, tmuxExactSessionTarget } from './persona-identity.ts'
@@ -811,4 +878,948 @@ export function endStuckLaunchEpisode(
  */
 export function endStuckLaunchEpisodeForLatch(episodes: Pick<PersonaEpisodes, 'end'>, key: string, log: (line: string) => void): void {
   endStuckLaunchEpisode(episodes, key, STUCK_LAUNCH_END_LATCHED, log)
+}
+
+// ---------------------------------------------------------------------------
+// The pending-row lap's Enter: its outcome by class (b.jg5 SRJ-118, SRJ-410)
+// ---------------------------------------------------------------------------
+
+/** The lap's Enter was typed: `send-keys` answered success. */
+export const PENDING_ROW_LAP_ENTER_SENT = 'sent'
+/** GONE (`ErrTmuxSendKeys`): nothing was typed. */
+export const PENDING_ROW_LAP_ENTER_GONE = 'gone'
+/** `ErrSpawnNotFound`: the row is absent; nothing was typed. */
+export const PENDING_ROW_LAP_ENTER_ABSENT = 'absent'
+/**
+ * `ErrSpawnNotInteractive`: the session holding the name is not this
+ * launch's (by its label's token), or the row has no launch start; nothing
+ * was typed (b.jg5 SRJ-118, SRJ-613).
+ */
+export const PENDING_ROW_LAP_ENTER_NOT_INTERACTIVE = 'not-interactive'
+/** CONFLICT, the thrown value kept so the caller can latch (b.jg5 SRJ-501). */
+export const PENDING_ROW_LAP_ENTER_CONFLICT = 'conflict'
+/** UNUSABLE NAME, the thrown value kept so the caller can latch (b.jg5 SRJ-512). */
+export const PENDING_ROW_LAP_ENTER_UNUSABLE_NAME = 'unusable-name'
+/** CONFIG: the wrapper raised `ad-config-malformed`; otherwise the UNAVAILABLE column (b.jg5 SRJ-316). */
+export const PENDING_ROW_LAP_ENTER_CONFIG = 'config'
+/** ENVIRONMENT (`ErrTmuxNotAvailable`): the wrapper raised `tmux-unavailable`. */
+export const PENDING_ROW_LAP_ENTER_ENVIRONMENT = 'environment'
+/** UNAVAILABLE, timeouts included. */
+export const PENDING_ROW_LAP_ENTER_UNAVAILABLE = 'unavailable'
+/** UNCLASSIFIED (`ErrSendKeysWhileRelayed` included): nothing was typed. */
+export const PENDING_ROW_LAP_ENTER_UNCLASSIFIED = 'unclassified'
+/** The persona is latched: no call was made, or the Enter's CONFLICT or UNUSABLE NAME latched it. */
+export const PENDING_ROW_LAP_ENTER_LATCHED = 'latched'
+
+/** What every failed Enter carries: the class `classifyAdError` gave it and its redacted one-line description. */
+interface PendingRowLapEnterFailureFields {
+  readonly errorClass: AdErrorClass
+  readonly description: string
+}
+
+/** A failed Enter whose thrown value the caller does not need. */
+export interface PendingRowLapEnterPlainFailure extends PendingRowLapEnterFailureFields {
+  readonly kind:
+    | typeof PENDING_ROW_LAP_ENTER_GONE
+    | typeof PENDING_ROW_LAP_ENTER_ABSENT
+    | typeof PENDING_ROW_LAP_ENTER_NOT_INTERACTIVE
+    | typeof PENDING_ROW_LAP_ENTER_CONFIG
+    | typeof PENDING_ROW_LAP_ENTER_ENVIRONMENT
+    | typeof PENDING_ROW_LAP_ENTER_UNAVAILABLE
+}
+
+/**
+ * An UNCLASSIFIED Enter. `stopping` marks one whose `ErrInvalidFlags`
+ * version re-check decided that the server stops (b.jg5 SRJ-204, SRJ-205):
+ * only the session manager's Enter (`sendPendingRowLapEnter`) sets it; the
+ * caller then calls nothing more for the persona.
+ */
+export interface PendingRowLapEnterUnclassified extends PendingRowLapEnterFailureFields {
+  readonly kind: typeof PENDING_ROW_LAP_ENTER_UNCLASSIFIED
+  readonly stopping?: true
+}
+
+/** A CONFLICT Enter, the thrown value kept so the caller can latch through the latch's CONFLICT entry. */
+export interface PendingRowLapEnterConflict extends PendingRowLapEnterFailureFields {
+  readonly kind: typeof PENDING_ROW_LAP_ENTER_CONFLICT
+  readonly error: unknown
+}
+
+/** An UNUSABLE NAME Enter, the thrown value kept so the caller can latch through the unusable-name entry. */
+export interface PendingRowLapEnterUnusableName extends PendingRowLapEnterFailureFields {
+  readonly kind: typeof PENDING_ROW_LAP_ENTER_UNUSABLE_NAME
+  readonly error: unknown
+}
+
+/** A CONFLICT or UNUSABLE NAME Enter: either latches the persona. */
+export type PendingRowLapEnterLatching = PendingRowLapEnterConflict | PendingRowLapEnterUnusableName
+
+/** What {@link pendingRowLapEnterFailureOf} answers: exactly one failure. */
+export type PendingRowLapEnterFailure = PendingRowLapEnterPlainFailure | PendingRowLapEnterUnclassified | PendingRowLapEnterLatching
+
+/** The persona is latched: `cause` is the answer that latched it, absent when it was latched before the call and none was made. */
+export interface PendingRowLapEnterLatched {
+  readonly kind: typeof PENDING_ROW_LAP_ENTER_LATCHED
+  readonly cause?: PendingRowLapEnterLatching
+}
+
+/** The outcome of the lap's one Enter (`sendPendingRowLapEnter`, `src/session-manager.ts`). */
+export type PendingRowLapEnterOutcome =
+  | { readonly kind: typeof PENDING_ROW_LAP_ENTER_SENT }
+  | PendingRowLapEnterPlainFailure
+  | PendingRowLapEnterUnclassified
+  | PendingRowLapEnterLatched
+
+/** The Enter not made because the persona is latched. */
+export const PENDING_ROW_LAP_ENTER_NOT_SENT_LATCHED: PendingRowLapEnterLatched = Object.freeze({ kind: PENDING_ROW_LAP_ENTER_LATCHED })
+
+/**
+ * The failure of a value thrown by the lap's Enter (`send-keys` with an
+ * empty text and `allow_pending`, b.jg5 SRJ-118's approver-and-lap row), by
+ * class and by name through `src/ad-error-class.ts`, never by testing the
+ * value against an error class: GONE; `ErrSpawnNotFound` (absent);
+ * `ErrSpawnNotInteractive`; CONFLICT; UNUSABLE NAME; CONFIG; ENVIRONMENT;
+ * UNAVAILABLE; and every other value UNCLASSIFIED (`ErrSendKeysWhileRelayed`
+ * included). Pure; never throws.
+ */
+export function pendingRowLapEnterFailureOf(value: unknown): PendingRowLapEnterFailure {
+  const { errorClass } = classifyAdError(value)
+  const description = describeAgentDirectorFailure(value)
+  if (errorClass === AD_ERROR_CLASS_GONE) return { kind: PENDING_ROW_LAP_ENTER_GONE, errorClass, description }
+  if (hasAdErrorName(value, ERR_SPAWN_NOT_FOUND_NAME)) return { kind: PENDING_ROW_LAP_ENTER_ABSENT, errorClass, description }
+  if (hasAdErrorName(value, ERR_SPAWN_NOT_INTERACTIVE_NAME)) {
+    return { kind: PENDING_ROW_LAP_ENTER_NOT_INTERACTIVE, errorClass, description }
+  }
+  switch (errorClass) {
+    case AD_ERROR_CLASS_CONFLICT:
+      return { kind: PENDING_ROW_LAP_ENTER_CONFLICT, errorClass, description, error: value }
+    case AD_ERROR_CLASS_UNUSABLE_NAME:
+      return { kind: PENDING_ROW_LAP_ENTER_UNUSABLE_NAME, errorClass, description, error: value }
+    case AD_ERROR_CLASS_CONFIG:
+      return { kind: PENDING_ROW_LAP_ENTER_CONFIG, errorClass, description }
+    case AD_ERROR_CLASS_ENVIRONMENT:
+      return { kind: PENDING_ROW_LAP_ENTER_ENVIRONMENT, errorClass, description }
+    case AD_ERROR_CLASS_UNAVAILABLE:
+      return { kind: PENDING_ROW_LAP_ENTER_UNAVAILABLE, errorClass, description }
+    default:
+      return { kind: PENDING_ROW_LAP_ENTER_UNCLASSIFIED, errorClass, description }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The pending-row rule's pure decisions (b.jg5 SRJ-410, SRJ-117, SRJ-118)
+// ---------------------------------------------------------------------------
+
+/** {@link pendingRowAgeOf}: the row has no launch start (absent, or it does not parse): never aged (SRJ-408). */
+export const PENDING_ROW_AGE_NO_LAUNCH_START = 'no-launch-start'
+/** {@link pendingRowAgeOf}: younger than G: step 1, nothing (a refusal). */
+export const PENDING_ROW_AGE_YOUNGER_THAN_G = 'younger-than-g'
+/** {@link pendingRowAgeOf}: G or older, younger than B: step 2. */
+export const PENDING_ROW_AGE_FROM_G = 'from-g'
+/** {@link pendingRowAgeOf}: B or older: step 2, then step 3 for a row still `pending`. */
+export const PENDING_ROW_AGE_AT_B = 'at-b'
+
+/** What {@link pendingRowAgeOf} answers. */
+export type PendingRowAge =
+  | typeof PENDING_ROW_AGE_NO_LAUNCH_START
+  | typeof PENDING_ROW_AGE_YOUNGER_THAN_G
+  | typeof PENDING_ROW_AGE_FROM_G
+  | typeof PENDING_ROW_AGE_AT_B
+
+/** The waits the rule's age reads: G and B, each a fixed number or the derived-wait accessor itself. */
+export interface PendingRowRuleWaits {
+  /** G (default `adGraceMsInEffect`, read at each call). */
+  readonly graceMs?: NeverEarlyWaitLength
+  /** B (default `adLaunchBoundMsInEffect`, read at each call). */
+  readonly launchBoundMs?: NeverEarlyWaitLength
+}
+
+/**
+ * The pending-row rule's step for a `pending` row whose raw launch start is
+ * `rawLaunchStart`, at `nowMs` (b.jg5 SRJ-410, SRJ-406, SRJ-408): no launch
+ * start (it never ages); younger than G (step 1); G or older (step 2); B or
+ * older. G and B are read from their accessors at this call (b.jg5
+ * SRJ-210), through {@link isPendingRowAged}, so a wait of
+ * `AD_WAIT_NEVER_ENDS`, NaN or a throwing accessor never ages the row early,
+ * and a wait beyond the timer maximum is compared, never armed. G is
+ * checked first: a row not past G is younger than G whatever B says. Pure;
+ * never throws.
+ */
+export function pendingRowAgeOf(rawLaunchStart: unknown, nowMs: number, waits: PendingRowRuleWaits = {}): PendingRowAge {
+  if (parseLaunchStart(rawLaunchStart) === undefined) return PENDING_ROW_AGE_NO_LAUNCH_START
+  if (!isPendingRowAged(rawLaunchStart, waits.graceMs ?? adGraceMsInEffect, nowMs)) return PENDING_ROW_AGE_YOUNGER_THAN_G
+  return isPendingRowAged(rawLaunchStart, waits.launchBoundMs ?? adLaunchBoundMsInEffect, nowMs)
+    ? PENDING_ROW_AGE_AT_B
+    : PENDING_ROW_AGE_FROM_G
+}
+
+/**
+ * Whether step 2 makes its approver lap (b.jg5 SRJ-410, SRJ-118): only when
+ * no dialog approver runs for P and the row's current launch has not met a
+ * `send-keys` that answered `ErrSpawnNotInteractive` ("no further lap is
+ * made on the row until it leaves `pending`"). Pure.
+ */
+export function isPendingRowLapEligible(input: { readonly approverRunning: boolean; readonly metNotInteractive: boolean }): boolean {
+  return !input.approverRunning && !input.metNotInteractive
+}
+
+/** {@link PendingRowLapDecision}: press Enter (a pane showing a startup dialog the approver recognises). */
+export const PENDING_ROW_LAP_NEXT_ENTER = 'enter'
+/** {@link PendingRowLapDecision}: the lap is over; step 2's run goes on (a "Stop" cell ends the lap only, hatch A3). */
+export const PENDING_ROW_LAP_NEXT_RUN = 'run'
+/** {@link PendingRowLapDecision}: P latched: no run, no further call this round. */
+export const PENDING_ROW_LAP_NEXT_LATCHED = 'latched'
+/** {@link PendingRowLapDecision}: the version re-check decided that the server stops: no further call this round. */
+export const PENDING_ROW_LAP_NEXT_STOPPING = 'stopping'
+
+/** What follows one lap call. */
+export type PendingRowLapNext =
+  | typeof PENDING_ROW_LAP_NEXT_ENTER
+  | typeof PENDING_ROW_LAP_NEXT_RUN
+  | typeof PENDING_ROW_LAP_NEXT_LATCHED
+  | typeof PENDING_ROW_LAP_NEXT_STOPPING
+
+/**
+ * What the lap does after one call (b.jg5 SRJ-117's pending-row lap column,
+ * SRJ-118's approver-and-lap row): what follows, whether to set the record
+ * of a launch whose `send-keys` met `ErrSpawnNotInteractive`, and the lap's
+ * words for the round's line (descriptions already redacted, on one line).
+ */
+export interface PendingRowLapDecision {
+  readonly next: PendingRowLapNext
+  readonly setNotInteractiveRecord: boolean
+  readonly note: string
+}
+
+/** A lap decision with no record set. */
+function lapDecision(next: PendingRowLapNext, note: string): PendingRowLapDecision {
+  return { next, setNotInteractiveRecord: false, note }
+}
+
+/**
+ * The lap's decision over its `read-pane` outcome (b.jg5 SRJ-117's
+ * pending-row lap column), with `showsStartupDialog` the approver's
+ * recognition of a startup dialog on a pane (the session manager's
+ * `paneShowsStartupDialog`, over the approver's needles):
+ *
+ *   | outcome                       | next                                     |
+ *   |-------------------------------|------------------------------------------|
+ *   | a pane showing a dialog        | Enter                                    |
+ *   | a pane showing none            | the run (nothing typed)                  |
+ *   | GONE, `ErrSpawnNotFound`       | the run (nothing typed; GONE's column)   |
+ *   | UNAVAILABLE, CONFIG            | the run (nothing typed; CONFIG is UNAVAILABLE's column) |
+ *   | ENVIRONMENT                    | the run (the outage was raised)          |
+ *   | UNCLASSIFIED                   | the run (SRJ-105); with the stop mark, nothing more |
+ *   | CONFLICT, UNUSABLE NAME, latched | latched: no run                        |
+ *
+ * A pane never proves that this launch's session shows the dialog (b.jg5
+ * SRJ-613): it leads at most to Enter, whose `send-keys` is the backstop.
+ * Pure; never throws (a predicate that throws counts as no dialog).
+ */
+export function decidePendingRowLapPane(outcome: PaneReadOutcome, showsStartupDialog: (pane: string) => boolean): PendingRowLapDecision {
+  switch (outcome.kind) {
+    case PANE_READ_PANE: {
+      let shows = false
+      try {
+        shows = showsStartupDialog(outcome.pane) === true
+      } catch {
+        shows = false
+      }
+      return shows
+        ? lapDecision(PENDING_ROW_LAP_NEXT_ENTER, 'read-pane: a startup dialog shows')
+        : lapDecision(PENDING_ROW_LAP_NEXT_RUN, 'read-pane: no startup dialog shows, nothing typed')
+    }
+    case PANE_READ_GONE:
+      return lapDecision(PENDING_ROW_LAP_NEXT_RUN, `read-pane GONE (${outcome.description}), nothing typed`)
+    case PANE_READ_ABSENT:
+      return lapDecision(PENDING_ROW_LAP_NEXT_RUN, `read-pane found no row (${outcome.description}), nothing typed`)
+    case PANE_READ_UNAVAILABLE:
+      return lapDecision(PENDING_ROW_LAP_NEXT_RUN, `read-pane UNAVAILABLE (${outcome.description}), nothing typed`)
+    case PANE_READ_CONFIG:
+      return lapDecision(PENDING_ROW_LAP_NEXT_RUN, `read-pane CONFIG (${outcome.description}): ad-config-malformed raised, nothing typed`)
+    case PANE_READ_ENVIRONMENT:
+      return lapDecision(PENDING_ROW_LAP_NEXT_RUN, `read-pane ENVIRONMENT (${outcome.description}): tmux-unavailable raised, nothing typed`)
+    case PANE_READ_UNCLASSIFIED:
+      return outcome.stopping === true
+        ? lapDecision(PENDING_ROW_LAP_NEXT_STOPPING, `read-pane UNCLASSIFIED (${outcome.description}): the version re-check decided that the server stops, nothing typed`)
+        : lapDecision(PENDING_ROW_LAP_NEXT_RUN, `read-pane UNCLASSIFIED (${outcome.description}), nothing typed`)
+    case PANE_READ_CONFLICT:
+    case PANE_READ_UNUSABLE_NAME:
+      // The shared reader latches on both and answers latched; taken the same here.
+      return lapDecision(PENDING_ROW_LAP_NEXT_LATCHED, `read-pane ${outcome.kind} (${outcome.description}): the persona latches, nothing typed`)
+    case PANE_READ_LATCHED:
+      return lapDecision(
+        PENDING_ROW_LAP_NEXT_LATCHED,
+        outcome.cause === undefined
+          ? 'read-pane: none, the persona is latched'
+          : `read-pane ${outcome.cause.kind} (${outcome.cause.description}): the persona latched, nothing typed`,
+      )
+  }
+}
+
+/**
+ * The lap's decision over its Enter's outcome (b.jg5 SRJ-118's
+ * approver-and-lap row; SRJ-410: a "Stop" cell ends the lap only, and the
+ * run goes on unless the answer latched P):
+ *
+ *   | outcome                    | next                                                       |
+ *   |----------------------------|------------------------------------------------------------|
+ *   | success                    | the run (the lap is done)                                  |
+ *   | GONE, `ErrSpawnNotFound`   | the run (nothing typed)                                    |
+ *   | `ErrSpawnNotInteractive`   | the run (nothing typed); set the record: no further lap on this launch |
+ *   | UNAVAILABLE, CONFIG        | the run (nothing typed)                                    |
+ *   | ENVIRONMENT                | the run (the outage was raised)                            |
+ *   | UNCLASSIFIED               | the run (SRJ-105); with the stop mark, nothing more         |
+ *   | CONFLICT, UNUSABLE NAME, latched | latched: no run                                      |
+ *
+ * Pure; never throws.
+ */
+export function decidePendingRowLapEnter(outcome: PendingRowLapEnterOutcome): PendingRowLapDecision {
+  switch (outcome.kind) {
+    case PENDING_ROW_LAP_ENTER_SENT:
+      return lapDecision(PENDING_ROW_LAP_NEXT_RUN, 'Enter typed')
+    case PENDING_ROW_LAP_ENTER_GONE:
+      return lapDecision(PENDING_ROW_LAP_NEXT_RUN, `Enter GONE (${outcome.description}), nothing typed`)
+    case PENDING_ROW_LAP_ENTER_ABSENT:
+      return lapDecision(PENDING_ROW_LAP_NEXT_RUN, `Enter found no row (${outcome.description}), nothing typed`)
+    case PENDING_ROW_LAP_ENTER_NOT_INTERACTIVE:
+      return {
+        next: PENDING_ROW_LAP_NEXT_RUN,
+        setNotInteractiveRecord: true,
+        note: `Enter refused as not interactive (${outcome.description}), nothing typed: the session holding the name is not this launch's, no further lap on this launch`,
+      }
+    case PENDING_ROW_LAP_ENTER_UNAVAILABLE:
+      return lapDecision(PENDING_ROW_LAP_NEXT_RUN, `Enter UNAVAILABLE (${outcome.description}), nothing typed`)
+    case PENDING_ROW_LAP_ENTER_CONFIG:
+      return lapDecision(PENDING_ROW_LAP_NEXT_RUN, `Enter CONFIG (${outcome.description}): ad-config-malformed raised, nothing typed`)
+    case PENDING_ROW_LAP_ENTER_ENVIRONMENT:
+      return lapDecision(PENDING_ROW_LAP_NEXT_RUN, `Enter ENVIRONMENT (${outcome.description}): tmux-unavailable raised, nothing typed`)
+    case PENDING_ROW_LAP_ENTER_UNCLASSIFIED:
+      return outcome.stopping === true
+        ? lapDecision(PENDING_ROW_LAP_NEXT_STOPPING, `Enter UNCLASSIFIED (${outcome.description}): the version re-check decided that the server stops, nothing typed`)
+        : lapDecision(PENDING_ROW_LAP_NEXT_RUN, `Enter UNCLASSIFIED (${outcome.description}), nothing typed`)
+    case PENDING_ROW_LAP_ENTER_LATCHED:
+      return lapDecision(
+        PENDING_ROW_LAP_NEXT_LATCHED,
+        outcome.cause === undefined
+          ? 'Enter: none, the persona is latched'
+          : `Enter ${outcome.cause.kind} (${outcome.cause.description}): the persona latched, nothing typed`,
+      )
+  }
+}
+
+/** Where step 2's bypassing `find-missing` run put P's row: marked `missing` (in `ids`). */
+export const PENDING_ROW_RUN_MARKED_MISSING = 'marked-missing'
+/** Judged and left live (in `unverified_ids`). */
+export const PENDING_ROW_RUN_LEFT_LIVE = 'judged-left-live'
+/** In neither list while last read `pending`: the run did not judge it (b.jg5 SRJ-120). */
+export const PENDING_ROW_RUN_NOT_JUDGED = 'not-judged'
+/** In neither list while last read in another state: judged alive. */
+export const PENDING_ROW_RUN_JUDGED_ALIVE = 'judged-alive'
+/** The run, or the post-run `get` of P's row, was refused by class (b.jg5 SRJ-105, SRJ-120): the round ends. */
+export const PENDING_ROW_RUN_REFUSED = 'refused'
+/** P is latched once the run is done (b.jg5 SRJ-502): no further call. */
+export const PENDING_ROW_RUN_LATCHED = 'latched'
+/** The run failed in any other way (logged, not memoized): the caller goes on, with no judgment of the row. */
+export const PENDING_ROW_RUN_FAILED = 'failed'
+
+/** Where step 2's run put P's row, or how it failed (the session manager maps `bypassingFindMissingSweep`'s answer). */
+export type PendingRowRunPlacement =
+  | typeof PENDING_ROW_RUN_MARKED_MISSING
+  | typeof PENDING_ROW_RUN_LEFT_LIVE
+  | typeof PENDING_ROW_RUN_NOT_JUDGED
+  | typeof PENDING_ROW_RUN_JUDGED_ALIVE
+  | typeof PENDING_ROW_RUN_REFUSED
+  | typeof PENDING_ROW_RUN_LATCHED
+  | typeof PENDING_ROW_RUN_FAILED
+
+/** Step 2's `get` read P's row: its state and raw launch start. */
+export const PENDING_ROW_GET_ROW = 'row'
+/** Step 2's `get` answered `ErrSpawnNotFound`: no row. */
+export const PENDING_ROW_GET_ABSENT = 'absent'
+/** Step 2's `get` latched P (a note, UNUSABLE NAME, a configured persona's own `pending` row with no launch start), or found it latched. */
+export const PENDING_ROW_GET_LATCHED = 'latched'
+/** Step 2's `get` failed with any other error (its own error rows applied, b.jg5 SRJ-105). */
+export const PENDING_ROW_GET_REFUSED = 'refused'
+
+/** What step 2's one `get` of P's row answered, through the shared own-row read. */
+export type PendingRowRuleGet =
+  | { readonly kind: typeof PENDING_ROW_GET_ROW; readonly state: string; readonly launchStartedAt: unknown }
+  | { readonly kind: typeof PENDING_ROW_GET_ABSENT }
+  | { readonly kind: typeof PENDING_ROW_GET_LATCHED }
+  | { readonly kind: typeof PENDING_ROW_GET_REFUSED; readonly error: unknown }
+
+/** {@link readPendingRowRun}: P is latched: nothing more. */
+export const PENDING_ROW_READING_LATCHED = 'latched'
+/** {@link readPendingRowRun}: the run was refused: the round ends with nothing more (a refusal). */
+export const PENDING_ROW_READING_RUN_REFUSED = 'run-refused'
+/** {@link readPendingRowRun}: the `get` failed: the round ends with nothing more, never step 3 on an earlier read. */
+export const PENDING_ROW_READING_READ_REFUSED = 'read-refused'
+/** {@link readPendingRowRun}: the row reads `ended` or `missing`, or there is no row: the restart path's decision recovers it. */
+export const PENDING_ROW_READING_GONE = 'gone'
+/** {@link readPendingRowRun}: the row is live out of `pending`: no action from this rule. */
+export const PENDING_ROW_READING_LIVE = 'live'
+/** {@link readPendingRowRun}: the row reads a state CSCB does not know: nothing more this round. */
+export const PENDING_ROW_READING_UNKNOWN_STATE = 'unknown-state'
+/** {@link readPendingRowRun}: the row is still `pending`; `judged` says whether the run judged it. */
+export const PENDING_ROW_READING_PENDING = 'pending'
+
+/** The round's reading of its run and `get`. */
+export type PendingRowRunReading =
+  | { readonly kind: typeof PENDING_ROW_READING_LATCHED }
+  | { readonly kind: typeof PENDING_ROW_READING_RUN_REFUSED }
+  | { readonly kind: typeof PENDING_ROW_READING_READ_REFUSED; readonly error: unknown }
+  | { readonly kind: typeof PENDING_ROW_READING_GONE; readonly state: DeadRowRead }
+  | { readonly kind: typeof PENDING_ROW_READING_LIVE; readonly state: string }
+  | { readonly kind: typeof PENDING_ROW_READING_UNKNOWN_STATE; readonly state: string }
+  | { readonly kind: typeof PENDING_ROW_READING_PENDING; readonly judged: boolean; readonly launchStartedAt: unknown }
+
+/**
+ * Whether the round stops at its run, before its `get` (b.jg5 SRJ-410,
+ * SRJ-120): latched, or refused by class (a refusal: the round ends).
+ * `undefined` when the `get` follows: every placement, and a failure of any
+ * other kind. Pure.
+ */
+export function pendingRowRunStops(
+  run: PendingRowRunPlacement,
+): { readonly kind: typeof PENDING_ROW_READING_LATCHED } | { readonly kind: typeof PENDING_ROW_READING_RUN_REFUSED } | undefined {
+  if (run === PENDING_ROW_RUN_LATCHED) return { kind: PENDING_ROW_READING_LATCHED }
+  if (run === PENDING_ROW_RUN_REFUSED) return { kind: PENDING_ROW_READING_RUN_REFUSED }
+  return undefined
+}
+
+/**
+ * The round's reading over step 2's run (`run`) and the `get` after it
+ * (`get`) (b.jg5 SRJ-410, SRJ-120, SRJ-105):
+ *
+ *   - the run latched or was refused: {@link pendingRowRunStops}' answer;
+ *   - the `get` latched: latched; failed: read refused (nothing more, never
+ *     step 3 on an earlier read);
+ *   - no row, `ended` or `missing`: gone, with what it read;
+ *   - live out of `pending`: live; a state CSCB does not know: unknown;
+ *   - `pending`: still pending, `judged` true when the run put the row in
+ *     `ids` or `unverified_ids` (or judged it alive), false when it was in
+ *     neither list while `pending` (not judged), or the run failed in a way
+ *     that is no refusal (no judgment either).
+ *
+ * Pure; never throws.
+ */
+export function readPendingRowRun(run: PendingRowRunPlacement, get: PendingRowRuleGet): PendingRowRunReading {
+  const stops = pendingRowRunStops(run)
+  if (stops !== undefined) return stops
+  switch (get.kind) {
+    case PENDING_ROW_GET_LATCHED:
+      return { kind: PENDING_ROW_READING_LATCHED }
+    case PENDING_ROW_GET_REFUSED:
+      return { kind: PENDING_ROW_READING_READ_REFUSED, error: get.error }
+    case PENDING_ROW_GET_ABSENT:
+      return { kind: PENDING_ROW_READING_GONE, state: LIVENESS_DEAD_ROW_NO_ROW }
+    case PENDING_ROW_GET_ROW:
+      break
+  }
+  const { state } = get
+  if (AGENT_DIRECTOR_DEAD_STATES.has(state)) return { kind: PENDING_ROW_READING_GONE, state: state as DeadRowRead }
+  if (state === AGENT_DIRECTOR_PENDING_STATE) {
+    const judged = run === PENDING_ROW_RUN_MARKED_MISSING || run === PENDING_ROW_RUN_LEFT_LIVE || run === PENDING_ROW_RUN_JUDGED_ALIVE
+    return { kind: PENDING_ROW_READING_PENDING, judged, launchStartedAt: get.launchStartedAt }
+  }
+  if (AGENT_DIRECTOR_LIVE_STATES.has(state)) return { kind: PENDING_ROW_READING_LIVE, state }
+  return { kind: PENDING_ROW_READING_UNKNOWN_STATE, state }
+}
+
+/** {@link decidePendingRowStepThree}: P's `tmux-unavailable` outage is raised: no stuck-launch post and no abort (its onset is P's notice). */
+export const PENDING_ROW_STEP3_TMUX_UNAVAILABLE = 'tmux-unavailable'
+/** {@link decidePendingRowStepThree}: P is latched: nothing (SRJ-502). */
+export const PENDING_ROW_STEP3_LATCHED = 'latched'
+/** {@link decidePendingRowStepThree}: CSCB's own stuck launch while `ad-config-malformed` is raised: neither text and no abort until it clears. */
+export const PENDING_ROW_STEP3_CONFIG_MALFORMED = 'config-malformed'
+/** {@link decidePendingRowStepThree}: CSCB's own stuck launch: the relaunching text, then the abort (SRJ-412). */
+export const PENDING_ROW_STEP3_RELAUNCH = 'relaunch'
+/** {@link decidePendingRowStepThree}: any other `pending` row: the held text; the row is left and never killed. */
+export const PENDING_ROW_STEP3_HELD = 'held'
+
+/** What step 3 decides on, for a row still `pending` at B or older after step 2's lap and run. */
+export interface PendingRowStepThreeInput {
+  /** P's `tmux-unavailable` outage is raised. */
+  readonly tmuxUnavailableRaised: boolean
+  /** P is latched. */
+  readonly latched: boolean
+  /** The row's current launch is CSCB's own (SRJ-412); always false until the own-launch record is consulted. */
+  readonly ownLaunch: boolean
+  /** P's `ad-config-malformed` outage is raised. */
+  readonly configMalformedRaised: boolean
+  /** The stuck-launch episode's one abort is still available. */
+  readonly abortAvailable: boolean
+  /** A `send-keys` on the row answered `ErrSpawnNotInteractive` during its current launch: the held text drops the attach line. */
+  readonly metNotInteractive: boolean
+}
+
+/** What step 3 answers. */
+export type PendingRowStepThree =
+  | { readonly kind: typeof PENDING_ROW_STEP3_TMUX_UNAVAILABLE }
+  | { readonly kind: typeof PENDING_ROW_STEP3_LATCHED }
+  | { readonly kind: typeof PENDING_ROW_STEP3_CONFIG_MALFORMED }
+  | { readonly kind: typeof PENDING_ROW_STEP3_RELAUNCH }
+  | { readonly kind: typeof PENDING_ROW_STEP3_HELD; readonly attachLine: boolean }
+
+/**
+ * Step 3 of the pending-row rule (b.jg5 SRJ-410, SRJ-412, SRJ-1017), for a
+ * row still `pending` at B or older after step 2, whether or not the run
+ * judged it (HO C21 steps 2 and 3):
+ *   1. `tmux-unavailable` raised: nothing, whatever else holds;
+ *   2. P latched: nothing;
+ *   3. CSCB's own stuck launch with its one abort still available: nothing
+ *      while `ad-config-malformed` is raised, else the relaunching text and
+ *      the abort;
+ *   4. any other row: the held text, with the attach line unless the
+ *      launch met `ErrSpawnNotInteractive`.
+ * Pure; never throws.
+ */
+export function decidePendingRowStepThree(input: PendingRowStepThreeInput): PendingRowStepThree {
+  if (input.tmuxUnavailableRaised) return { kind: PENDING_ROW_STEP3_TMUX_UNAVAILABLE }
+  if (input.latched) return { kind: PENDING_ROW_STEP3_LATCHED }
+  if (input.ownLaunch && input.abortAvailable) {
+    return input.configMalformedRaised ? { kind: PENDING_ROW_STEP3_CONFIG_MALFORMED } : { kind: PENDING_ROW_STEP3_RELAUNCH }
+  }
+  return { kind: PENDING_ROW_STEP3_HELD, attachLine: !input.metNotInteractive }
+}
+
+// ---------------------------------------------------------------------------
+// The pending-row rule's driver (b.jg5 SRJ-410, SRJ-404, SRJ-502, SRJ-810)
+// ---------------------------------------------------------------------------
+
+/** The rule runs at a retry of P's retry timer (either mode). */
+export const PENDING_ROW_RULE_ORIGIN_RETRY = 'retry'
+/** The rule's one run when P's dialog approver stops with the row still `pending` (b.jg5 SRJ-404). */
+export const PENDING_ROW_RULE_ORIGIN_APPROVER_STOP = 'approver-stop'
+
+/** Where the rule runs from. */
+export type PendingRowRuleOrigin = typeof PENDING_ROW_RULE_ORIGIN_RETRY | typeof PENDING_ROW_RULE_ORIGIN_APPROVER_STOP
+
+/** The row read the caller holds: its state and its raw launch start. */
+export interface PendingRowRuleRow {
+  readonly state: string
+  readonly launchStartedAt: unknown
+}
+
+/** One run of the rule for P. */
+export interface PendingRowRuleInput {
+  readonly key: string
+  /** P's log reference. */
+  readonly ref: string
+  /** The row read the caller holds, decided covered (`decidePendingRowCover`), or the approver's last read. */
+  readonly row: PendingRowRuleRow
+  readonly origin: PendingRowRuleOrigin
+  /**
+   * The run is made from inside P's own launch (the collision ladder's
+   * `pending` step), which has made no launch call of its own then: that
+   * launch's in-flight state does not count as work in flight here.
+   */
+  readonly withinOwnLaunch?: boolean
+}
+
+/** {@link PendingRowRelaunchAnswer}: the abort's live-row sequence started. */
+export const PENDING_ROW_RELAUNCH_SEQUENCE_STARTED = 'sequence-started'
+/** {@link PendingRowRelaunchAnswer}: the abort latched P. */
+export const PENDING_ROW_RELAUNCH_LATCHED = 'latched'
+/** {@link PendingRowRelaunchAnswer}: the abort did not end the launch this round; the row is kept `pending`. */
+export const PENDING_ROW_RELAUNCH_KEPT = 'kept'
+
+/** What step 3's own-launch branch (the relaunching post and the abort) answers. */
+export type PendingRowRelaunchAnswer =
+  | { readonly kind: typeof PENDING_ROW_RELAUNCH_SEQUENCE_STARTED }
+  | { readonly kind: typeof PENDING_ROW_RELAUNCH_LATCHED }
+  | { readonly kind: typeof PENDING_ROW_RELAUNCH_KEPT; readonly why: string }
+
+/**
+ * The slot for step 3's own-launch branch (b.jg5 SRJ-412): whether the row's
+ * current launch is CSCB's own, whether the stuck-launch episode's one abort
+ * is still available, and the branch itself (the relaunching post and the
+ * abort). Absent: no row is CSCB's own, and every row at B takes the held
+ * branch.
+ */
+export interface PendingRowOwnLaunchHooks {
+  readonly isOwnLaunch: (key: string, launchStart: unknown) => boolean
+  readonly isAbortAvailable: (key: string) => boolean
+  readonly relaunch: (key: string, ref: string, launchStart: unknown) => Promise<PendingRowRelaunchAnswer>
+}
+
+/**
+ * The rule's injected dependencies (production: the session manager's one
+ * builder, `buildPendingRowRuleDeps`). Every agent-director call is made
+ * through them; the rule itself makes none.
+ */
+export interface PendingRowRuleDeps {
+  /** The wall clock the launch start is compared with (epoch ms). */
+  readonly now: () => number
+  /** Receives the rule's `[slack] pending-row:` lines (the server log). A throwing log is swallowed. */
+  readonly log: (line: string) => void
+  /** The latch's latched query (SRJ-502). A throw counts as latched. */
+  readonly isLatched: (key: string) => boolean
+  /**
+   * What work in flight blocks a retry of P (SRJ-303: a launch call, a
+   * live-row sequence or an old-life wait step), by name, or `undefined`;
+   * `withinOwnLaunch` leaves out P's own launch in flight. A running dialog
+   * approver never counts. A throw counts as blocked.
+   */
+  readonly retryBlockedBy: (key: string, withinOwnLaunch: boolean) => string | undefined
+  /** Whether P's working directory is held for an old life (SRJ-810). A throw counts as held. */
+  readonly isHeldForOldLife: (key: string) => boolean
+  /** Whether a dialog approver runs for P (SRJ-401). A throw counts as running (no lap). */
+  readonly isApproverRunning: (key: string) => boolean
+  /** Whether the launch with this launch start met a `send-keys` that answered `ErrSpawnNotInteractive`. A throw counts as met. */
+  readonly launchMetNotInteractive: (key: string, launchStart: unknown) => boolean
+  /** Record that the launch with this launch start met a `send-keys` that answered `ErrSpawnNotInteractive`. */
+  readonly recordNotInteractive: (key: string, launchStart: unknown) => void
+  /** The lap's one `read-pane` (40 lines, `allow_pending`), through the shared reader (it latches on CONFLICT and UNUSABLE NAME). */
+  readonly readLapPane: (key: string, ref: string) => Promise<PaneReadOutcome>
+  /** The approver's recognition of a startup dialog on a pane. */
+  readonly paneShowsStartupDialog: (pane: string) => boolean
+  /** The lap's one Enter (`send-keys`, empty text, `allow_pending`; it latches on CONFLICT and UNUSABLE NAME). */
+  readonly sendLapEnter: (key: string, ref: string) => Promise<PendingRowLapEnterOutcome>
+  /** Step 2's one bypassing `find-missing` run, P's key as its next-step `get`, read against `pending`. */
+  readonly runFindMissing: (key: string, ref: string) => Promise<PendingRowRunPlacement>
+  /** Step 2's one `get` of P's row through the shared own-row read. */
+  readonly readRow: (key: string, ref: string) => Promise<PendingRowRuleGet>
+  /** Whether P's `tmux-unavailable` outage is raised. A throw counts as raised. */
+  readonly isTmuxUnavailableRaised: (key: string) => boolean
+  /** Whether P's `ad-config-malformed` outage is raised. A throw counts as raised. */
+  readonly isConfigMalformedRaised: (key: string) => boolean
+  /** The held text's poster ({@link postStuckLaunchHeld} over the server's one episodes instance). */
+  readonly postHeld: (key: string, launchStart: unknown, metNotInteractive: boolean) => StuckLaunchPostAnswer
+  /** G and B (default: the derived waits' accessors, read at each check). */
+  readonly waits?: PendingRowRuleWaits
+  /** Step 3's own-launch branch. Absent: every row at B takes the held branch. */
+  readonly ownLaunch?: PendingRowOwnLaunchHooks
+}
+
+/** The rule's answer: a refusal (the row kept `pending`; the retry is a refusal, SRJ-302). */
+export const PENDING_ROW_RULE_REFUSAL = 'refusal'
+/** The rule's answer: the row reads `ended` or `missing`, or there is no row: the restart path's decision recovers it. */
+export const PENDING_ROW_RULE_GONE = 'gone'
+/** The rule's answer: the row is live out of `pending`: no action from this rule. */
+export const PENDING_ROW_RULE_LIVE = 'live'
+/** The rule's answer: P is latched (before the round, or by one of its calls): no further call. */
+export const PENDING_ROW_RULE_LATCHED = 'latched'
+/** The rule's answer: the `get` after the run failed: nothing more this round. */
+export const PENDING_ROW_RULE_READ_REFUSED = 'read-refused'
+/** The rule's answer: at B, the held text's poster was called; the row is left. */
+export const PENDING_ROW_RULE_HELD = 'held'
+/** The rule's answer: at B, step 3's own-launch branch ran. */
+export const PENDING_ROW_RULE_RELAUNCH = 'relaunch'
+
+/** Why the rule answered a refusal. */
+export const PENDING_ROW_RULE_REFUSAL_REASONS = [
+  'blocked',
+  'held-for-old-life',
+  'not-pending',
+  'no-launch-start',
+  'younger-than-g',
+  'lap-only',
+  'run-refused',
+  'not-judged',
+  'still-pending',
+  'unknown-state',
+  'tmux-unavailable',
+  'config-malformed',
+  'failed',
+] as const
+
+/** One refusal reason. */
+export type PendingRowRuleRefusalReason = (typeof PENDING_ROW_RULE_REFUSAL_REASONS)[number]
+
+/** What one run of the rule answers. */
+export type PendingRowRuleAnswer =
+  | { readonly kind: typeof PENDING_ROW_RULE_REFUSAL; readonly reason: PendingRowRuleRefusalReason }
+  | { readonly kind: typeof PENDING_ROW_RULE_GONE; readonly state: DeadRowRead }
+  | { readonly kind: typeof PENDING_ROW_RULE_LIVE; readonly state: string }
+  | { readonly kind: typeof PENDING_ROW_RULE_LATCHED }
+  | { readonly kind: typeof PENDING_ROW_RULE_READ_REFUSED; readonly error: unknown }
+  | { readonly kind: typeof PENDING_ROW_RULE_HELD; readonly post: StuckLaunchPostAnswer }
+  | { readonly kind: typeof PENDING_ROW_RULE_RELAUNCH; readonly answer: PendingRowRelaunchAnswer }
+
+/** One rule instance: run the rule once for P. */
+export interface PendingRowRule {
+  readonly run: (input: PendingRowRuleInput) => Promise<PendingRowRuleAnswer>
+}
+
+/** The head of every pending-row rule line. */
+export const PENDING_ROW_RULE_LOG_HEAD = '[slack] pending-row:'
+
+/** The head of the rule's lines for P (`ref`) at `origin`. */
+function pendingRowRuleLineHead(ref: string, origin: PendingRowRuleOrigin): string {
+  return `${PENDING_ROW_RULE_LOG_HEAD} ${ref} rule (${origin})`
+}
+
+/**
+ * The rule's one line for an acting round (b.jg5 SRJ-410): P's reference,
+ * where it runs from, the launch start (the one renderer,
+ * {@link describeLaunchStartForLog}), what each step did (`steps`, whose
+ * agent-director descriptions are already redacted and on one line) and
+ * what follows:
+ *
+ *   [slack] pending-row: <ref> rule (<origin>): launch started <ISO>; <step>; <step>… — <follows> (b.jg5 SRJ-410)
+ *
+ * Pure.
+ */
+export function pendingRowRuleRoundLine(
+  ref: string,
+  origin: PendingRowRuleOrigin,
+  launchStart: unknown,
+  steps: readonly string[],
+  follows: string,
+): string {
+  return `${pendingRowRuleLineHead(ref, origin)}: launch started ${describeLaunchStartForLog(launchStart)}; ${steps.join('; ')} — ${follows} (b.jg5 SRJ-410)`
+}
+
+/**
+ * The rule's line for a run its gate refused before any call (b.jg5
+ * SRJ-410, SRJ-502, SRJ-303, SRJ-810), with why:
+ *
+ *   [slack] pending-row: <ref> rule (<origin>): no lap, run or post — <why> (b.jg5 SRJ-410)
+ *
+ * None is logged for a row younger than G. Pure.
+ */
+export function pendingRowRuleGateLine(ref: string, origin: PendingRowRuleOrigin, why: string): string {
+  return `${pendingRowRuleLineHead(ref, origin)}: no lap, run or post — ${why} (b.jg5 SRJ-410)`
+}
+
+/** The rule's line for a run that threw inside (`described`, through `describeThrownValue`): nothing more was done. */
+export function pendingRowRuleFailedLine(ref: string, origin: PendingRowRuleOrigin, described: string): string {
+  return `${pendingRowRuleLineHead(ref, origin)}: failed: ${described} — nothing more this round (b.jg5 SRJ-410)`
+}
+
+/** The rule's answer in words, for a caller's line. Pure. */
+export function describePendingRowRuleAnswer(answer: PendingRowRuleAnswer): string {
+  switch (answer.kind) {
+    case PENDING_ROW_RULE_REFUSAL:
+      return `refusal (${answer.reason})`
+    case PENDING_ROW_RULE_GONE:
+      return `gone (${answer.state})`
+    case PENDING_ROW_RULE_LIVE:
+      return `live (${answer.state})`
+    case PENDING_ROW_RULE_LATCHED:
+      return 'latched'
+    case PENDING_ROW_RULE_READ_REFUSED:
+      return 'read refused'
+    case PENDING_ROW_RULE_HELD:
+      return `held (${answer.post})`
+    case PENDING_ROW_RULE_RELAUNCH:
+      return `relaunch (${answer.answer.kind})`
+  }
+}
+
+/** A query's answer: exactly `true` is true; a throw answers `onThrow`. */
+function askQuery(query: () => boolean, onThrow: boolean): boolean {
+  try {
+    return query() === true
+  } catch {
+    return onThrow
+  }
+}
+
+/** What step 2's `get` answered, in the round's line. */
+function describeRuleGet(get: PendingRowRuleGet): string {
+  switch (get.kind) {
+    case PENDING_ROW_GET_ROW:
+      return `get: ${AGENT_DIRECTOR_LIVE_STATES.has(get.state) || AGENT_DIRECTOR_DEAD_STATES.has(get.state) ? get.state : 'unknown state'}`
+    case PENDING_ROW_GET_ABSENT:
+      return 'get: no row (ErrSpawnNotFound)'
+    case PENDING_ROW_GET_LATCHED:
+      return 'get: the persona latched'
+    case PENDING_ROW_GET_REFUSED:
+      return `get failed (${describeAgentDirectorFailure(get.error)})`
+  }
+}
+
+/** A refusal answer. */
+function refusal(reason: PendingRowRuleRefusalReason): PendingRowRuleAnswer {
+  return { kind: PENDING_ROW_RULE_REFUSAL, reason }
+}
+
+/** The latched answer. */
+const RULE_LATCHED: PendingRowRuleAnswer = Object.freeze({ kind: PENDING_ROW_RULE_LATCHED })
+
+/**
+ * Build one pending-row rule instance over `deps` (b.jg5 SRJ-410). Its one
+ * entry, `run`, runs the rule once for P on the row read the caller holds
+ * (a row the cover decision answered covered, or the dialog approver's last
+ * read), and answers what it found:
+ *
+ *   - **Gate**, before any call: P latched (SRJ-502) answers latched; work
+ *     in flight that blocks a retry (a launch call, a live-row sequence or
+ *     an old-life wait step, SRJ-303; P's own launch left out from its
+ *     ladder), P's working directory held for an old life (SRJ-810), a row
+ *     not `pending`, or a row with no launch start (SRJ-408) answer a
+ *     refusal, each with one gate line.
+ *   - **Step 1**, younger than G: a refusal, no call and no line.
+ *   - **Step 2**, G or older: when no approver runs and the launch has not
+ *     met `ErrSpawnNotInteractive`, one lap (`read-pane`, then Enter when a
+ *     startup dialog shows; a lap's `ErrSpawnNotInteractive` sets the
+ *     record); a lap answer that stops polling ends the lap only, and the
+ *     run goes on unless it latched P (hatch A3); then one bypassing
+ *     `find-missing` run and one `get`. A refused run or a failed `get` ends
+ *     the round (never step 3 on an earlier read); a row gone or live is
+ *     answered; before B, a row still `pending` is a refusal, judged or not.
+ *   - **Step 3**, still `pending` at B or older, judged or not
+ *     ({@link decidePendingRowStepThree}): nothing while `tmux-unavailable`
+ *     is raised; CSCB's own stuck launch through the own-launch slot (none
+ *     until it is filled); any other row the held text through its poster,
+ *     and nothing else: the row is never killed.
+ *
+ * The latched query is asked again after every call, and no further call is
+ * made once P latched. The rule never kills, launches or reuses the row. One
+ * line per acting round ({@link pendingRowRuleRoundLine}); one gate line for
+ * a gate refusal ({@link pendingRowRuleGateLine}); none for a row younger
+ * than G. A dependency that throws ends the round with one line
+ * ({@link pendingRowRuleFailedLine}) and a refusal. Never rejects.
+ *
+ * The lap's pane may be a single leftover's (b.jg5 SRJ-613): it leads at
+ * most to Enter, and the Enter's `send-keys` is the backstop, answering
+ * `ErrSpawnNotInteractive` with nothing typed on a `pending` row whose
+ * session is not this launch's.
+ */
+export function createPendingRowRule(deps: PendingRowRuleDeps): PendingRowRule {
+  const log = (line: string): void => safePendingRowLog(deps.log, line)
+  const latchedNow = (key: string): boolean => askQuery(() => deps.isLatched(key), true)
+
+  const blockedBy = (key: string, withinOwnLaunch: boolean): string | undefined => {
+    try {
+      return deps.retryBlockedBy(key, withinOwnLaunch)
+    } catch (err) {
+      return `the work-in-flight query failed (${describeThrownValue(err)}), taken as blocked`
+    }
+  }
+
+  /** Step 2's lap; answers what follows it and its words. */
+  const lap = async (key: string, ref: string, launchStart: unknown): Promise<PendingRowLapDecision> => {
+    const paneDecision = decidePendingRowLapPane(await deps.readLapPane(key, ref), (pane) => deps.paneShowsStartupDialog(pane))
+    if (paneDecision.next !== PENDING_ROW_LAP_NEXT_ENTER) return paneDecision
+    if (latchedNow(key)) return lapDecision(PENDING_ROW_LAP_NEXT_LATCHED, `${paneDecision.note}; Enter: none, the persona is latched`)
+    const enterDecision = decidePendingRowLapEnter(await deps.sendLapEnter(key, ref))
+    if (enterDecision.setNotInteractiveRecord) deps.recordNotInteractive(key, launchStart)
+    return { ...enterDecision, note: `${paneDecision.note}; ${enterDecision.note}` }
+  }
+
+  const runRound = async (input: PendingRowRuleInput): Promise<PendingRowRuleAnswer> => {
+    const { key, ref, row, origin } = input
+    const gate = (why: string, answer: PendingRowRuleAnswer): PendingRowRuleAnswer => {
+      log(pendingRowRuleGateLine(ref, origin, why))
+      return answer
+    }
+    if (latchedNow(key)) return gate('the persona is latched', RULE_LATCHED)
+    const blocked = blockedBy(key, input.withinOwnLaunch === true)
+    if (blocked !== undefined) return gate(`work in flight blocks it (${blocked})`, refusal('blocked'))
+    if (askQuery(() => deps.isHeldForOldLife(key), true)) {
+      return gate('its working directory is held for an old life, SRJ-810', refusal('held-for-old-life'))
+    }
+    if (row.state !== AGENT_DIRECTOR_PENDING_STATE) return gate('the row it was given is not pending', refusal('not-pending'))
+    const launchStart = row.launchStartedAt
+    const age = pendingRowAgeOf(launchStart, deps.now(), deps.waits)
+    if (age === PENDING_ROW_AGE_NO_LAUNCH_START) return gate('the row has no launch start, so it is never aged, SRJ-408', refusal('no-launch-start'))
+    if (age === PENDING_ROW_AGE_YOUNGER_THAN_G) return refusal('younger-than-g')
+
+    const steps: string[] = []
+    const round = (follows: string, answer: PendingRowRuleAnswer): PendingRowRuleAnswer => {
+      log(pendingRowRuleRoundLine(ref, origin, launchStart, steps, follows))
+      return answer
+    }
+    const latchedAfterCall = (): PendingRowRuleAnswer | undefined =>
+      latchedNow(key) ? round('the persona latched: nothing more', RULE_LATCHED) : undefined
+
+    // Step 2: the lap, when no approver runs and the launch has not met ErrSpawnNotInteractive.
+    const approverRunning = askQuery(() => deps.isApproverRunning(key), true)
+    const metNotInteractive = askQuery(() => deps.launchMetNotInteractive(key, launchStart), true)
+    if (isPendingRowLapEligible({ approverRunning, metNotInteractive })) {
+      const decision = await lap(key, ref, launchStart)
+      steps.push(`lap: ${decision.note}`)
+      if (decision.next === PENDING_ROW_LAP_NEXT_LATCHED) return round('the persona latched: no run', RULE_LATCHED)
+      if (decision.next === PENDING_ROW_LAP_NEXT_STOPPING) return round('the server stops: no run', refusal('lap-only'))
+      const latched = latchedAfterCall()
+      if (latched !== undefined) return latched
+    } else {
+      steps.push(approverRunning ? 'lap: none, a dialog approver runs' : "lap: none, this launch's send-keys met ErrSpawnNotInteractive")
+    }
+
+    // Step 2: one bypassing find-missing run, then one get.
+    const placement = await deps.runFindMissing(key, ref)
+    steps.push(`find-missing: ${placement}`)
+    const stops = pendingRowRunStops(placement)
+    if (stops?.kind === PENDING_ROW_READING_LATCHED) return round('the persona latched: nothing more', RULE_LATCHED)
+    if (stops?.kind === PENDING_ROW_READING_RUN_REFUSED) return round('the run was refused: nothing more this round', refusal('run-refused'))
+    const latchedAfterRun = latchedAfterCall()
+    if (latchedAfterRun !== undefined) return latchedAfterRun
+    const get = await deps.readRow(key, ref)
+    steps.push(describeRuleGet(get))
+    const reading = readPendingRowRun(placement, get)
+    if (reading.kind !== PENDING_ROW_READING_LATCHED) {
+      const latchedAfterGet = latchedAfterCall()
+      if (latchedAfterGet !== undefined) return latchedAfterGet
+    }
+    switch (reading.kind) {
+      case PENDING_ROW_READING_LATCHED:
+        return round('the persona latched: nothing more', RULE_LATCHED)
+      case PENDING_ROW_READING_RUN_REFUSED:
+        return round('the run was refused: nothing more this round', refusal('run-refused'))
+      case PENDING_ROW_READING_READ_REFUSED:
+        return round('the get failed: nothing more this round', { kind: PENDING_ROW_RULE_READ_REFUSED, error: reading.error })
+      case PENDING_ROW_READING_GONE:
+        return round('the row is gone: the restart path decides', { kind: PENDING_ROW_RULE_GONE, state: reading.state })
+      case PENDING_ROW_READING_LIVE:
+        return round('the row left pending: no action from this rule', { kind: PENDING_ROW_RULE_LIVE, state: reading.state })
+      case PENDING_ROW_READING_UNKNOWN_STATE:
+        return round('nothing more this round', refusal('unknown-state'))
+      case PENDING_ROW_READING_PENDING:
+        break
+    }
+    const currentStart = reading.launchStartedAt
+    if (pendingRowAgeOf(currentStart, deps.now(), deps.waits) !== PENDING_ROW_AGE_AT_B) {
+      return reading.judged
+        ? round('still pending before B: nothing more this round', refusal('still-pending'))
+        : round('not judged before B: nothing more this round', refusal('not-judged'))
+    }
+
+    // Step 3: still pending at B or older, judged or not.
+    const metNow = askQuery(() => deps.launchMetNotInteractive(key, currentStart), true)
+    const hooks = deps.ownLaunch
+    const ownLaunch = hooks !== undefined && askQuery(() => hooks.isOwnLaunch(key, currentStart), false)
+    const branch = decidePendingRowStepThree({
+      tmuxUnavailableRaised: askQuery(() => deps.isTmuxUnavailableRaised(key), true),
+      latched: latchedNow(key),
+      ownLaunch,
+      configMalformedRaised: askQuery(() => deps.isConfigMalformedRaised(key), true),
+      abortAvailable: ownLaunch && hooks !== undefined && askQuery(() => hooks.isAbortAvailable(key), false),
+      metNotInteractive: metNow,
+    })
+    switch (branch.kind) {
+      case PENDING_ROW_STEP3_TMUX_UNAVAILABLE:
+        return round('at B: its tmux-unavailable outage is raised, whose onset is its notice: no stuck-launch post', refusal('tmux-unavailable'))
+      case PENDING_ROW_STEP3_LATCHED:
+        return round('the persona latched: nothing more', RULE_LATCHED)
+      case PENDING_ROW_STEP3_CONFIG_MALFORMED:
+        return round("at B: CSCB's own stuck launch while ad-config-malformed is raised: neither text and no abort until it clears", refusal('config-malformed'))
+      case PENDING_ROW_STEP3_RELAUNCH: {
+        // Reached only with the own-launch slot filled (`ownLaunch` is false without it).
+        if (hooks === undefined) return round('nothing more this round', refusal('still-pending'))
+        const answer = await hooks.relaunch(key, ref, currentStart)
+        return round(`at B: CSCB's own stuck launch: the relaunching post and the abort (${answer.kind})`, { kind: PENDING_ROW_RULE_RELAUNCH, answer })
+      }
+      case PENDING_ROW_STEP3_HELD: {
+        const text = branch.attachLine ? 'the held text' : 'the held text without the attach line'
+        log(pendingRowRuleRoundLine(ref, origin, launchStart, steps, `at B: ${text}; the row is left, never killed`))
+        return { kind: PENDING_ROW_RULE_HELD, post: deps.postHeld(key, currentStart, !branch.attachLine) }
+      }
+    }
+  }
+
+  return {
+    run: async (input) => {
+      try {
+        return await runRound(input)
+      } catch (err) {
+        log(pendingRowRuleFailedLine(input.ref, input.origin, describeThrownValue(err)))
+        return refusal('failed')
+      }
+    },
+  }
 }

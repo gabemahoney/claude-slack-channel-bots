@@ -163,7 +163,10 @@ import {
   _buildReconnectSessionAdapter,
   _runCallTimeoutStartStep,
   deferPendingRow,
+  deferringPendingRowGoneLine,
   deferringPendingRowLine,
+  type DeferPendingRowAnswer,
+  type DeferPendingRowOptions,
   LAUNCH_START_LOG_RE,
   promptRowAbsentAtPaneReadLine,
   promptRowLatchedLine,
@@ -227,6 +230,8 @@ import {
   carriedDeadEvidenceOf,
   DEAD_SESSION_CAUSE_ROW_READ_FINISHED,
   promptRowSweepFinishedLine,
+  pendingRowRuleAlreadyRanLine,
+  pendingRowRuleNotInstalledLine,
   type DeadEvidenceSource,
   type EscalateDeadVerdict,
 } from '../src/session-manager.ts'
@@ -261,6 +266,7 @@ import {
   killFailureEndedLine,
   makeRecoveryHarness,
   ownRowsLiveThenMissing,
+  pastSampleGrace,
   personaOf,
   personaRow,
   retiredEntryClearedLine,
@@ -270,6 +276,7 @@ import {
   type RecoveryHarness,
   type RecoveryStubScript,
 } from './test-helpers/recovery-harness.ts'
+import { judgeMissingFromG, makePendingRowModel, PENDING_ROW_MODEL_NO_ROW, type PendingRowModelOptions } from './test-helpers/pending-row-model.ts'
 import {
   LIVE_ROW_LAUNCH_REASON_RETIRED_KEY,
   LIVE_ROW_LAUNCH_REUSE,
@@ -331,6 +338,7 @@ import {
   UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
   isInsideAttempt,
   runInAttempt,
+  runInTimerRetry,
 } from '../src/unavailable-retry.ts'
 import {
   PENDING_ROW_REASON_CONFIG_DIR_MISMATCH,
@@ -338,6 +346,8 @@ import {
   PENDING_ROW_REASON_CWD_MISMATCH,
   PENDING_ROW_REASON_CWD_UNRESOLVED,
   PENDING_ROW_REASON_RETIRED_OLD_LIFE,
+  PENDING_ROW_RULE_LOG_HEAD,
+  PENDING_ROW_RULE_ORIGIN_RETRY,
   STUCK_LAUNCH_POSTED,
   postStuckLaunchHeld,
   stuckLaunchEndRowLiveReason,
@@ -5312,6 +5322,191 @@ describe('b.jg5 SRJ-409, SRJ-411: the reconnect adapter\'s pending branch and de
     expect(lines[1]).toStartWith(`[slack] Deferring persona=${p}: ${said}`)
     expect([starts, h.triggers, h.controller.isArmed(p)]).toEqual([[], [], false])
     expectNothingLaunchedOrTyped(h, p)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-410, SRJ-303 (E29): where deferPendingRow runs the pending-row
+// rule. Only inside a retry of the persona's own timer (`runInTimerRetry`,
+// which the retry action wraps its runs in) and unless its caller says it
+// may not (`mayRunRule: false`, the reconnect adapter's deferral), a covered
+// `pending` row gets the rule's one run of that retry on the row the step's
+// `get` read: 'pending', unless the rule reads the row gone, which answers
+// its `DeadRowRead` after one gone line; the step's own `get` reading the
+// row `ended`, `missing` or gone answers gone too (ruling R15). Reached from
+// any other origin the deferral only arms, as E28 built it, and an
+// uncovered, an undecided or an own no-launch-start row never reaches the
+// rule. P's row is the pending-row model's (P's own covered `pending` row),
+// with the harness clock at G past its launch start, so a rule run shows as
+// a lap (no approver runs), one bypassing find-missing and one more get. The
+// rule's own answers are tests/pending-row.test.ts's; what the restart run
+// does with a gone answer is tests/restart.test.ts's.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-410: deferPendingRow runs the pending-row rule only at a retry of the persona\'s timer, and answers gone only there', () => {
+  let harness: RecoveryHarness | undefined
+
+  afterEach(() => {
+    const h = harness
+    harness = undefined
+    if (h === undefined) return
+    try {
+      assertNoLeak(h.captured())
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  /** A harness over P and Q (`options` for the harness), P's row the pending-row model's with `model(h)`, the clock at G past the row's launch start. */
+  async function rowAtG(
+    model: (h: RecoveryHarness) => PendingRowModelOptions = () => ({}),
+    options: { pendingRowRule?: boolean } = {},
+  ): Promise<{ h: RecoveryHarness; p: string; q: string }> {
+    const h = (harness = makeRecoveryHarness(options))
+    const [p, q] = h.keys as [string, string]
+    makePendingRowModel(h, p, model(h))
+    await pastSampleGrace(h)
+    return { h, p, q }
+  }
+
+  /** The deferral for persona `key` as the restart path calls it, inside a retry of `key`'s timer when `atRetry`. */
+  function defer(h: RecoveryHarness, key: string, atRetry: boolean, options?: DeferPendingRowOptions): Promise<DeferPendingRowAnswer> {
+    const call = (): Promise<DeferPendingRowAnswer> => deferPendingRow(key, SAMPLE_LAUNCH_START_FRACTIONAL, appliedLookupOf(h), options)
+    return atRetry ? runInTimerRetry(key, call) : call()
+  }
+
+  const ORIGINS = [['inside a retry of P\'s timer', true], ['outside every retry', false]] as const
+
+  /** The pending-row rule's lines for persona `key` at a retry. */
+  const ruleLinesOf = (h: RecoveryHarness, key: string): string[] =>
+    h.errors.filter((line) => line.startsWith(`${PENDING_ROW_RULE_LOG_HEAD} ${renderPersonaRef(personaOf(h, key).name, key)} rule (${PENDING_ROW_RULE_ORIGIN_RETRY})`))
+
+  /** The deferral's gone lines for persona `key`, over every gone answer. */
+  const goneLinesOf = (h: RecoveryHarness, key: string): string[] => {
+    const states: readonly DeadRowRead[] = [LIVENESS_DEAD_ROW_ENDED, LIVENESS_DEAD_ROW_MISSING, LIVENESS_DEAD_ROW_NO_ROW]
+    const gone = states.map((state) => deferringPendingRowGoneLine(key, state))
+    return h.errors.filter((line) => gone.includes(line))
+  }
+
+  /** Persona `key`'s stub calls of the rule's verbs: [read-pane, find-missing, get]. */
+  const ruleVerbCalls = (h: RecoveryHarness, key: string): number[] => {
+    const id = personaInstanceId(key)
+    const { readPaneCalls, findMissingCalls, getCalls } = h.stub.calls
+    return [readPaneCalls.filter((c) => c.claude_instance_id === id).length, findMissingCalls.length, getCalls.filter((c) => c.claude_instance_id === id).length]
+  }
+
+  test.each(ORIGINS)('a covered pending row the run leaves unjudged, %s: pending, P\'s timer armed pending-only; the rule\'s one run (lap, find-missing, get) and its line only at the retry; no gone line, kill or launch', async (_origin, atRetry) => {
+    const { h, p, q } = await rowAtG()
+
+    expect(await defer(h, p, atRetry)).toBe('pending')
+
+    expect(ruleVerbCalls(h, p)).toEqual(atRetry ? [1, 1, 2] : [0, 0, 1])
+    expect(ruleLinesOf(h, p)).toHaveLength(atRetry ? 1 : 0)
+    expect(goneLinesOf(h, p)).toEqual([])
+    expectPendingOnlyWatch(h, p)
+    expect([h.stub.calls.killCalls, h.stub.calls.spawnCalls, h.stub.calls.resumeCalls]).toEqual([[], [], []])
+    expect(h.controller.isArmed(q)).toBe(false)
+  })
+
+  test.each(ORIGINS)('a covered pending row a run would mark missing, %s: at the retry the rule\'s run marks it and the deferral answers missing after one gone line; outside, pending with no run', async (_origin, atRetry) => {
+    const { h, p } = await rowAtG(() => ({ judgment: judgeMissingFromG() }))
+
+    expect(await defer(h, p, atRetry)).toBe(atRetry ? LIVENESS_DEAD_ROW_MISSING : 'pending')
+
+    expect(ruleVerbCalls(h, p)).toEqual(atRetry ? [1, 1, 2] : [0, 0, 1])
+    expect(goneLinesOf(h, p)).toEqual(atRetry ? [deferringPendingRowGoneLine(p, LIVENESS_DEAD_ROW_MISSING)] : [])
+    expect([h.stub.calls.killCalls, h.stub.calls.spawnCalls, h.stub.calls.resumeCalls]).toEqual([[], [], []])
+  })
+
+  // Ruling R15: the read-and-step get's own `ended`, `missing` or no row is
+  // gone at a retry; a live state is not.
+  test.each(ORIGINS.flatMap(([origin, atRetry]) => ([
+    [LIVENESS_DEAD_ROW_ENDED, LIVENESS_DEAD_ROW_ENDED],
+    [LIVENESS_DEAD_ROW_MISSING, LIVENESS_DEAD_ROW_MISSING],
+    [PENDING_ROW_MODEL_NO_ROW, LIVENESS_DEAD_ROW_NO_ROW],
+    ['waiting', undefined],
+  ] as const).map(([state, gone]) => [state, origin, atRetry, gone] as const)))('the step\'s own get reading %s, %s: gone only at the retry, with one gone line; no rule run either way', async (state, _origin, atRetry, gone) => {
+    const { h, p } = await rowAtG(() => ({ state }))
+
+    expect(await defer(h, p, atRetry)).toBe(atRetry && gone !== undefined ? gone : 'pending')
+
+    expect(ruleVerbCalls(h, p)).toEqual([0, 0, 1])
+    expect(goneLinesOf(h, p)).toEqual(atRetry && gone !== undefined ? [deferringPendingRowGoneLine(p, gone)] : [])
+    expect(h.controller.isArmed(p)).toBe(false)
+  })
+
+  test.each<[string, (h: RecoveryHarness, key: string) => Promise<string>]>([
+    ['deferPendingRow told it may not run the rule', (h, key) => defer(h, key, true, { mayRunRule: false })],
+    ['the reconnect adapter\'s pending branch', (h, key) => runInTimerRetry(key, () => _buildReconnectSessionAdapter(undefined, (k) => h.latch.isLatched(k), appliedLookupOf(h))(key) as Promise<string>)],
+  ])('%s, inside a retry of P\'s timer, a covered pending row a run would mark missing: pending, P\'s timer armed pending-only; no rule run and no gone answer', async (_label, call) => {
+    const { h, p } = await rowAtG(() => ({ judgment: judgeMissingFromG() }))
+
+    expect(await call(h, p)).toBe('pending')
+
+    expect(ruleVerbCalls(h, p).slice(0, 2)).toEqual([0, 0])
+    expect(ruleLinesOf(h, p)).toEqual([])
+    expect(goneLinesOf(h, p)).toEqual([])
+    expectPendingOnlyWatch(h, p)
+  })
+
+  test('deferPendingRow told it may not run the rule, inside a retry of P\'s timer, its get reading the row ended: pending, with the next-run-decides line and no gone line', async () => {
+    const { h, p } = await rowAtG(() => ({ state: LIVENESS_DEAD_ROW_ENDED }))
+
+    expect(await defer(h, p, true, { mayRunRule: false })).toBe('pending')
+
+    expect(goneLinesOf(h, p)).toEqual([])
+    expect(h.errors.filter((line) => line.startsWith(`[slack] Deferring persona=${p}: its row now reads ended — `))).toHaveLength(1)
+  })
+
+  // E28's answers kept: none of these rows is handed to the rule.
+  test.each<[string, (h: RecoveryHarness, key: string) => PendingRowModelOptions, (h: RecoveryHarness, key: string) => void, (h: RecoveryHarness, key: string, starts: LiveRowSequenceRequest[]) => void]>([
+    ['not covered (its cwd another existing directory)', (h) => ({ row: { cwd: h.home } }), () => {}, (h, key, starts) => {
+      expect(starts).toEqual([pendingRowStartRequest(h, key, { retiredKey: false, retiredAtStart: { recorded: false, marked: false, generation: undefined } })])
+      expect(h.controller.isArmed(key)).toBe(false)
+    }],
+    ['undecided (P\'s working directory gone)', () => ({}), (h, key) => rmSync(personaOf(h, key).working_directory, { recursive: true, force: true }), (h, key, starts) => {
+      expect(starts).toEqual([])
+      expectPendingOnlyWatch(h, key)
+    }],
+    ['P\'s own row with no launch start', () => ({ launchStartedAt: SAMPLE_LAUNCH_START_NONE }), () => {}, (h, key, starts) => {
+      expect(starts).toEqual([])
+      expect([h.latch.isLatched(key), h.controller.isArmed(key)]).toEqual([true, false])
+    }],
+  ])('inside a retry of P\'s timer, a pending row %s keeps E28\'s answer (pending) and never reaches the rule, though a run would mark it missing', async (_label, model, prepare, check) => {
+    const { h, p } = await rowAtG((hh) => ({ judgment: judgeMissingFromG(), ...model(hh, hh.keys[0]!) }))
+    prepare(h, p)
+    const starts = recordSequenceStarts()
+
+    expect(await defer(h, p, true)).toBe('pending')
+
+    expect(ruleVerbCalls(h, p)).toEqual([0, 0, 1])
+    expect(ruleLinesOf(h, p)).toEqual([])
+    expect(goneLinesOf(h, p)).toEqual([])
+    check(h, p, starts)
+  })
+
+  test('two deferrals in one retry of P\'s timer: the rule runs once, at the first; the second makes only its get and logs that the rule already ran', async () => {
+    const { h, p } = await rowAtG()
+    const ref = renderPersonaRef(personaOf(h, p).name, p)
+
+    expect(await runInTimerRetry(p, async () => [
+      await deferPendingRow(p, SAMPLE_LAUNCH_START_FRACTIONAL, appliedLookupOf(h)),
+      await deferPendingRow(p, SAMPLE_LAUNCH_START_FRACTIONAL, appliedLookupOf(h)),
+    ])).toEqual(['pending', 'pending'])
+
+    expect(ruleVerbCalls(h, p)).toEqual([1, 1, 3])
+    expect(ruleLinesOf(h, p)).toHaveLength(1)
+    expect(h.errors.filter((line) => line === pendingRowRuleAlreadyRanLine(ref))).toHaveLength(1)
+  })
+
+  test('with no rule installed, inside a retry of P\'s timer: pending, P\'s timer armed pending-only, one line saying no rule is installed, and no lap or run', async () => {
+    const { h, p } = await rowAtG(() => ({ judgment: judgeMissingFromG() }), { pendingRowRule: false })
+
+    expect(await defer(h, p, true)).toBe('pending')
+
+    expect(ruleVerbCalls(h, p)).toEqual([0, 0, 1])
+    expect(h.errors.filter((line) => line === pendingRowRuleNotInstalledLine(renderPersonaRef(personaOf(h, p).name, p)))).toHaveLength(1)
+    expectPendingOnlyWatch(h, p)
   })
 })
 

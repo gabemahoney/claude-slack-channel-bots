@@ -112,7 +112,17 @@
  * - b.jg5 SRJ-314 / SRJ-115: the restart module's pending deferral
  *   (`deferPendingRow`) is bound to server.ts's one module-scope
  *   `deferPendingRow` (no import, local shadow or second declaration), passed
- *   the persona's key and the reading's `launchStartedAt`.
+ *   the persona's key and the reading's `launchStartedAt`, its answer
+ *   returned to the restart work (b.jg5 SRJ-410: a gone answer goes on to the
+ *   relaunch).
+ * - b.jg5 SRJ-410 / SRJ-404: the one pending-row rule is built once, by the
+ *   pending-row module's factory over the session manager's dependency
+ *   builder (the live applied-persona lookup, the one notice episodes
+ *   instance and the server log), and installed once (`setPendingRowRule`)
+ *   in main()'s own statement list with the persona lifecycle serializer's
+ *   `run`, after the live-row sequence registry's install and before the
+ *   restart module, the start sweep, the start bring-up and the health check;
+ *   no other src file builds or installs one.
  * - b.jg5 SRJ-1016: the one set of per-persona notice episodes is built once,
  *   imported from the episodes module, in main()'s own statement list, before
  *   the retry controller, the restart module, the start bring-up and the
@@ -423,7 +433,7 @@ import type * as KillRetryModule from '../src/kill-retry.ts'
 import type * as SessionManagerModule from '../src/session-manager.ts'
 import type * as LiveRowSequenceModule from '../src/live-row-sequence.ts'
 import type { LiveRowSequenceRegistry, LiveRowSequenceRegistryOptions } from '../src/live-row-sequence.ts'
-import type { OldLifeHoldEndRetryDeps, OldLifeWaitBindings } from '../src/session-manager.ts'
+import type { OldLifeHoldEndRetryDeps, OldLifeWaitBindings, PendingRowRuleDepsInput, PendingRowRuleInstall } from '../src/session-manager.ts'
 import type { SessionAdmissionOptions } from '../src/registry.ts'
 import type { OldLifeHoldSet } from '../src/retired-keys.ts'
 import type { HealthCheckDeps } from '../src/health-check.ts'
@@ -2563,20 +2573,21 @@ describe('main() installs the old-life wait\'s bindings once, beside the live-ro
 // tests/server.test.ts; pinned here: its binding.
 // ---------------------------------------------------------------------------
 
-describe('main() binds the restart module\'s pending deferral (deferPendingRow) to server.ts\'s one deferPendingRow, awaited, with the reading\'s launch start (b.jg5 SRJ-314, SRJ-115, SRJ-409, SRJ-411)', () => {
+describe('main() binds the restart module\'s pending deferral (deferPendingRow) to server.ts\'s one deferPendingRow, its answer returned to the restart work, with the reading\'s launch start (b.jg5 SRJ-314, SRJ-115, SRJ-409, SRJ-411, SRJ-410)', () => {
   // Tied to src by type: renaming the member or the reading's field fails the typecheck.
   const DEP: keyof RestartDeps = 'deferPendingRow'
   const LAUNCH_FIELD: keyof PendingLivenessReading = 'launchStartedAt'
 
-  test('the hook awaits the one module-scope async deferPendingRow with its own key and the reading\'s launch start, and no lookup of its own (the deferral\'s default, the server\'s applied config, decides)', () => {
+  test('the hook returns the one module-scope async deferPendingRow\'s answer for its own key and the reading\'s launch start, and makes no lookup of its own (the deferral\'s default, the server\'s applied config, decides)', () => {
     const hook = onlyCallProps('initRestart').get(DEP)
     expect(hook).toBeDefined()
-    // `async (key, reading) => { await deferPendingRow(key, reading.launchStartedAt) }`,
-    // the call returned (so the restart work awaits it), or the same call as an
-    // expression body; the parameters' names are free. A block body that
-    // neither awaits nor returns the call would drop the deferral's promise.
+    // `async (key, reading) => deferPendingRow(key, reading.launchStartedAt)`,
+    // or the call returned from a block body; the parameters' names are free.
+    // b.jg5 SRJ-410: the restart work reads the deferral's answer (a row read
+    // gone at a retry goes on to the relaunch in the same run), so a body that
+    // only awaits the call, or drops it, would lose the gone answer.
     const call = `${DEP}\\(\\1, \\2\\.${LAUNCH_FIELD}\\)`
-    expect(hook).toMatch(new RegExp(`^(?:async )?\\((\\w+), (\\w+)\\) => (?:\\{ (?:await|return) ${call};? \\}|${call})$`))
+    expect(hook).toMatch(new RegExp(`^(?:async )?\\((\\w+), (\\w+)\\) => (?:\\{ return ${call};? \\}|${call})$`))
     // Not an import, and declared once, at module scope, as an async function.
     expect(importSource(SERVER_CODE, DEP)).toBeUndefined()
     expect(indicesOf(new RegExp(`\\b(?:function|const|let|var)\\s+${DEP}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
@@ -2611,6 +2622,89 @@ describe('main() passes the full-mode retry action the pending-row step, retryPe
     const step = onlyCallOf(STEP)
     expect(step > open && step < close).toBe(true)
     declaredOnce('getAppliedPersona')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: b.jg5 SRJ-410, SRJ-404 — main()'s one pending-row rule
+//
+// The session manager's install is optional (with none installed, a retry or
+// an approver's stop that would run the rule logs one line and keeps the
+// pending-only arm only), and its dependency builder takes any lookup,
+// episodes and log. So a production wiring that dropped the install, built
+// the rule over a hand-made deps object, gave its held post episodes other
+// than the one notice episodes instance (whose posts the stuck-launch
+// episode counts), ran the approver-stop run outside the persona's lifecycle
+// serializer, or installed the rule after the start pass would type-check and
+// pass every behaviour suite. The rule is reached from the retry action, the
+// restart deferral and the approver's stop over this one instance. What it
+// does is tested in tests/pending-row.test.ts and through the recovery
+// harness, which composes it the same way; pinned here: the build and the
+// install.
+// ---------------------------------------------------------------------------
+
+describe('main() builds the one pending-row rule through its factory over the session manager\'s dependency builder, and installs it with the persona lifecycle serializer after the live-row sequence registry and before the start pass (b.jg5 SRJ-410, SRJ-404)', () => {
+  // Tied to src by type: renaming any of these fails the typecheck.
+  const FACTORY: keyof typeof PendingRowModule = 'createPendingRowRule'
+  const BUILDER: keyof typeof SessionManagerModule = 'buildPendingRowRuleDeps'
+  const INSTALL: keyof typeof SessionManagerModule = 'setPendingRowRule'
+  const RESET: keyof typeof SessionManagerModule = '_resetPendingRowRule'
+  const REGISTRY_INSTALL: keyof typeof SessionManagerModule = 'setLiveRowSequenceRegistry'
+  const START_SWEEP: keyof typeof SessionManagerModule = 'reconcileOrphans'
+  const RULE: keyof PendingRowRuleInstall = 'rule'
+  const SERIALIZE: keyof PendingRowRuleInstall = 'serialize'
+  const APPLIED: keyof PendingRowRuleDepsInput = 'appliedPersona'
+  const EPISODES: keyof PendingRowRuleDepsInput = 'episodes'
+  const LOG: keyof PendingRowRuleDepsInput = 'log'
+
+  test('installed exactly once, in main()\'s own statement list, the session manager\'s import, after the live-row sequence registry\'s install and before the restart module, the start sweep, the start bring-up and the health check; server.ts never removes it', () => {
+    expect(importSource(SERVER_CODE, INSTALL)).toBe('./session-manager.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${INSTALL}\\b`, 'g'), SERVER_CODE)).toEqual([])
+    const at = onlyCallOf(INSTALL)
+    expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+    expect(at).toBeGreaterThan(onlyCallOf(REGISTRY_INSTALL))
+    for (const later of [onlyCallOf('initRestart'), onlyCallOf(START_SWEEP), startResolution(SERVER_CODE).bringUpAt, onlyCallOf('initHealthCheck')]) {
+      expect(at).toBeLessThan(later)
+    }
+    // Named in server.ts only at its import and this call; the test-only reset never.
+    expect(indicesOf(new RegExp(`\\b${INSTALL}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
+    expect(indicesOf(new RegExp(`\\b${RESET}\\b`, 'g'), SERVER_CODE)).toEqual([])
+  })
+
+  test('the install is exactly the rule, the pending-row module\'s factory called on the session manager\'s one dependency builder, and the persona lifecycle serializer\'s run, the turn the approver-stop run takes', () => {
+    const props = onlyCallProps(INSTALL)
+    expect([...props.keys()].sort()).toEqual([RULE, SERIALIZE].sort())
+    expect(props.get(SERIALIZE)).toBe(`${constOf('createPersonaSerializer')}.run`)
+    const rule = props.get(RULE)!
+    expect(rule.startsWith(`${FACTORY}(`)).toBe(true)
+    const ruleArgs = splitTopLevel(onlyCallArguments(rule, FACTORY))
+    expect(ruleArgs).toHaveLength(1)
+    expect(ruleArgs[0]!.startsWith(`${BUILDER}(`)).toBe(true)
+    expect(importSource(SERVER_CODE, FACTORY)).toBe('./pending-row.ts')
+    expect(importSource(SERVER_CODE, BUILDER)).toBe('./session-manager.ts')
+    for (const name of [FACTORY, BUILDER]) {
+      expect([name, indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${name}\\b`, 'g'), SERVER_CODE)]).toEqual([name, []])
+      // Called once in server.ts, inside the install.
+      expect([name, withinCall([onlyCallOf(name)], onlyCallOf(INSTALL))]).toEqual([name, 1])
+    }
+  })
+
+  test('the rule\'s dependencies are exactly the live applied-persona lookup, the one notice episodes instance (its held post\'s), built before the install, and the server log', () => {
+    const deps = onlyCallProps(BUILDER)
+    expect([...deps.keys()].sort()).toEqual([APPLIED, EPISODES, LOG].sort())
+    expect(deps.get(APPLIED)).toBe('getAppliedPersona')
+    declaredOnce('getAppliedPersona')
+    expect(deps.get(EPISODES)).toBe(constOf('createPersonaEpisodes'))
+    expect(onlyCallOf(INSTALL)).toBeGreaterThan(onlyCallOf('createPersonaEpisodes'))
+    expect(deps.get(LOG)).toMatch(/^\(?(\w+)\)? => console\.error\(\1\)$/)
+  })
+
+  test('no other file under src/ builds or installs a pending-row rule', () => {
+    const callers = (name: string): string[] =>
+      srcFiles()
+        .filter(([, text]) => new RegExp(`(?<!function\\s)\\b${name}\\s*\\(`).test(stripComments(text)))
+        .map(([path]) => path)
+    expect([FACTORY, INSTALL].map(callers)).toEqual([['src/server.ts'], ['src/server.ts']])
   })
 })
 

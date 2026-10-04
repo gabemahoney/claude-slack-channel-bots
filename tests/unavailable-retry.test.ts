@@ -170,6 +170,16 @@
  * retry are refused (no probe, spawn or timer for it) while Q's retry runs.
  * A running live-row sequence's skip names the sequence
  * (`live-row-sequence-in-flight`).
+ * The pending-row rule at the retries (b.jg5 SRJ-410, SRJ-303): the retry
+ * marker over stand-ins (it holds inside the action in both modes for its
+ * own key only, never inside `runOutsideAttempts` or the hand-off after a
+ * pending-only stop, and grants one rule run per retry), and on the harness,
+ * with P's row scripted by the pending-row model, what each retry does with
+ * the rule's answer in both modes: nothing but the read before G, a refusal
+ * from G at the timer's pace, the hand-off once a run marks the row missing
+ * (in full mode, the same restart run's launch with no kill), the stop on a
+ * row the lap brought to `waiting`, the held post at B, and a retry that
+ * finds only P's approver running making the run and no lap.
  * Only the pin case holds the SRD's numbers; every other case derives its
  * waits from the exported base and ceiling through `doublingBackoffDelay`. No
  * retry timer is real; the only real-time waits are the spawn path's 1 ms
@@ -204,7 +214,7 @@ import {
   killRetrySeedOfState,
   type KillRetryResult,
 } from '../src/kill-retry.ts'
-import { adAlertThresholdMs, adAlertThresholdMsInEffect, DEFAULT_AD_SETTINGS_IN_EFFECT } from '../src/ad-settings.ts'
+import { adAlertThresholdMs, adAlertThresholdMsInEffect, adGraceMsInEffect, adLaunchBoundMsInEffect, DEFAULT_AD_SETTINGS_IN_EFFECT } from '../src/ad-settings.ts'
 import type { Phase1GetResult, Phase1SpawnParams } from '../src/ad-phase1-types.ts'
 import { ERR_SCHEMA_MISMATCH_NAME, ErrCwdNotFound } from '../src/agent-director-errors.ts'
 import { _resetBackoffState, doublingBackoffDelay, getFailureCount, isAtCap, recordFailure } from '../src/backoff.ts'
@@ -240,7 +250,13 @@ import {
   liveRowSequenceStartLine,
   type LiveRowSequenceOutcome,
 } from '../src/live-row-sequence.ts'
-import { PENDING_ROW_REASON_CWD_MISMATCH, PENDING_ROW_REASON_CWD_UNRESOLVED } from '../src/pending-row.ts'
+import {
+  PENDING_ROW_REASON_CWD_MISMATCH,
+  PENDING_ROW_REASON_CWD_UNRESOLVED,
+  PENDING_ROW_RULE_LOG_HEAD,
+  PENDING_ROW_RULE_ORIGIN_RETRY,
+  stuckLaunchHeldText,
+} from '../src/pending-row.ts'
 import {
   AGENT_DIRECTOR_PENDING_STATE,
   LIVENESS_DEAD_ROW_ENDED,
@@ -355,9 +371,13 @@ import {
   createFullModeRetryAction,
   createUnavailableRetryController,
   type FullModeRetryDeps,
+  claimTimerRetryRuleRun,
   isInsideAttempt,
+  isInsideTimerRetry,
   reportAttemptError,
   runInAttempt,
+  runInTimerRetry,
+  runOutsideAttempts,
   type AttemptErrorRecord,
   type AttemptView,
   type UnavailableRetryView,
@@ -543,6 +563,14 @@ import {
 import { OLD_LIFE_ROW_READ_STATE, SEQUENCE_WAITING_CAUSE_OLD_LIFE_HOLD, noteOldLifeRowRead, spawnForPersona } from '../src/session-manager.ts'
 import { rowReadsUntilSpawn, scriptTimedLaunch } from './test-helpers/recovery-harness.ts'
 import { PRE_PERSONA_ID, holdOldAt } from './test-helpers/old-life.ts'
+import {
+  judgeMissingFromG,
+  makePendingRowModel,
+  PENDING_ROW_DIALOG_TRUST,
+  PENDING_ROW_MODEL_NO_ROW,
+  type PendingRowModel,
+  type PendingRowModelOptions,
+} from './test-helpers/pending-row-model.ts'
 
 const KEY = 'alpha'
 const OTHER = 'beta'
@@ -2355,6 +2383,75 @@ describe('unavailable retry: the retry action’s decisions over stand-ins', () 
 })
 
 // ---------------------------------------------------------------------------
+// The retry marker (b.jg5 SRJ-410, SRJ-303): the pending-row rule runs only
+// inside a retry of the persona's own timer, in either mode, at most once per
+// retry; work the retry starts outside every attempt, and the hand-off run
+// after a pending-only stop, are no retry of the timer.
+// ---------------------------------------------------------------------------
+
+describe('unavailable retry: the retry marker the pending-row rule runs inside (SRJ-410, SRJ-303)', () => {
+  /** What the marker answered at one point of a run: for KEY, for OTHER, and for KEY inside `runOutsideAttempts`. */
+  type MarkerSeen = readonly [forKey: boolean, forOther: boolean, outsideAttempts: boolean]
+  const seen = (): MarkerSeen => [isInsideTimerRetry(KEY), isInsideTimerRetry(OTHER), runOutsideAttempts(() => isInsideTimerRetry(KEY))]
+
+  test.each([FULL_RETRY, PENDING_ONLY_RETRY])('$mode mode: inside the action (its row read or its retry entry) the marker holds for its own key only, not inside runOutsideAttempts, and not once the action has settled', async (attempt) => {
+    const marks: MarkerSeen[] = []
+    const base = fullModeDeps(RESTART_OUTCOME_REFUSED, {}, UNAVAILABLE_RETRY_ROW_PENDING)
+    const deps: StandInDeps = {
+      ...base,
+      readRow: async (key) => {
+        marks.push(seen())
+        return base.readRow(key)
+      },
+      retry: async (key, cwd, isInFlight, cause) => {
+        marks.push(seen())
+        return base.retry(key, cwd, isInFlight, cause)
+      },
+    }
+
+    expect(isInsideTimerRetry(KEY)).toBe(false)
+    await createFullModeRetryAction(deps)(KEY, attempt)
+
+    expect(marks).toEqual([[true, false, false]])
+    expect(isInsideTimerRetry(KEY)).toBe(false)
+  })
+
+  test('pending-only: the hand-off a stop carries (a row read ended) runs after the retry, outside it', async () => {
+    const marks: MarkerSeen[] = []
+    const base = fullModeDeps(RESTART_OUTCOME_LAUNCHED, {}, LIVENESS_DEAD_ROW_ENDED)
+    const deps: StandInDeps = {
+      ...base,
+      readRow: async (key) => {
+        marks.push(seen())
+        return base.readRow(key)
+      },
+      retry: async (key, cwd, isInFlight, cause) => {
+        marks.push(seen())
+        return base.retry(key, cwd, isInFlight, cause)
+      },
+    }
+
+    const answer = await createFullModeRetryAction(deps)(KEY, PENDING_ONLY_RETRY)
+    await (answer as { handOff: () => Promise<unknown> }).handOff()
+
+    // The row read inside the retry; the hand-off's retry entry outside it.
+    expect(marks).toEqual([[true, false, false], [false, false, false]])
+    expect(deps.calls).toEqual([[KEY, `/work/${KEY}`]])
+  })
+
+  test('the rule\'s one run per retry: the first claim in a retry of KEY\'s timer is granted, a second in the same retry is not, nor one for another key; the next retry grants one again; outside every retry none is', async () => {
+    const claims = (): boolean[] => [claimTimerRetryRuleRun(KEY), claimTimerRetryRuleRun(KEY), claimTimerRetryRuleRun(OTHER)]
+
+    expect(await runInTimerRetry(KEY, claims)).toEqual([true, false, false])
+    expect(await runInTimerRetry(KEY, async () => {
+      await Promise.resolve()
+      return claims()
+    })).toEqual([true, false, false])
+    expect(claims()).toEqual([false, false, false])
+  })
+})
+
+// ---------------------------------------------------------------------------
 // The full-mode retry end to end (b.jg5 SRJ-302, SRJ-303, SRJ-305) on the
 // recovery harness's default action: the real restart entry over the
 // production adapters, the relaunch gate and one serializer, against the stub
@@ -3646,6 +3743,203 @@ describe('unavailable retry: the covered-row triggers and the pending-only retry
     await h.advance(startedAt + adAlertThresholdMsInEffect() + 1 - h.clock.now())
     expect(h.episodeNotices).toEqual([])
     expect(h.clock.pendingCount()).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The pending-row rule at the retries (b.jg5 SRJ-410, SRJ-303), on the
+// recovery harness with the rule installed as main() installs it and P's own
+// covered `pending` row scripted by the pending-row model (its launch start
+// the stub's sample). What each retry does with the rule's answer: before G
+// only the row read and the step's get; from G the rule's round (a lap when
+// no approver runs, one bypassing find-missing and one get), a refusal at the
+// timer's pace; a run that marks the row missing hands P to the restart
+// decision once; a lap that clears the dialog stops the timer on the live
+// row; at B the held post, no kill. A retry that finds only P's approver
+// running makes the run and no lap (SRJ-303's Test line). In full mode the
+// rule runs through the restart path's deferral. The rule's own decisions,
+// lines and texts are tests/pending-row.test.ts's; the deferral's answers are
+// tests/server.test.ts's and the restart run's tests/restart.test.ts's.
+// ---------------------------------------------------------------------------
+
+/**
+ * P's own covered `pending` row (the pending-row model with `options`), and
+ * P's timer armed in `mode` so that its first retry falls due `ageMs` past
+ * the row's launch start.
+ */
+async function armAtRowAge(
+  h: RecoveryHarness,
+  key: string,
+  ageMs: number,
+  mode: UnavailableRetryMode,
+  options: PendingRowModelOptions = {},
+): Promise<PendingRowModel> {
+  const row = makePendingRowModel(h, key, options)
+  await h.clock.advanceTo(row.launchStartMs()! + ageMs - waitMs(0))
+  if (mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY) h.controller.armPendingOnly(key)
+  else h.controller.arm(key, UNAVAILABLE)
+  return row
+}
+
+/** The pending-row rule's lines for persona `key` at a retry. */
+function ruleLinesOf(h: RecoveryHarness, key: string): string[] {
+  const head = `${PENDING_ROW_RULE_LOG_HEAD} ${renderPersonaRef(personaOf(h, key).name, key)} rule (${PENDING_ROW_RULE_ORIGIN_RETRY})`
+  return h.errors.filter((line) => line.startsWith(head))
+}
+
+/** The stub verbs (by method name) called at clock time `at` for persona `key`'s instance or for no instance (`findMissing`), in call order. */
+function verbsAt(h: RecoveryHarness, key: string, at: number): string[] {
+  const id = personaInstanceId(key)
+  return h.timedCalls.filter((call) => call.at === at && (call.instanceId === id || call.instanceId === undefined)).map((call) => call.verb)
+}
+
+/** No kill, spawn, resume or keystroke was made. */
+function expectNoKillLaunchOrKeys(h: RecoveryHarness): void {
+  const { killCalls, spawnCalls, resumeCalls, sendKeysCalls } = h.stub.calls
+  expect([killCalls, spawnCalls, resumeCalls, sendKeysCalls]).toEqual([[], [], [], []])
+}
+
+describe('unavailable retry: the pending-row rule at each retry of P\'s timer (SRJ-410, SRJ-303)', () => {
+  test('pending-only, younger than G (a run would mark it missing): the retry makes only its row read and the step\'s get, logs no rule line and re-arms on the pending row', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    await armAtRowAge(h, key, adGraceMsInEffect() - 1, UNAVAILABLE_RETRY_MODE_PENDING_ONLY, { judgment: judgeMissingFromG() })
+
+    await retryNow(h, key)
+
+    expect(callCounts(h)).toEqual({ statusCalls: 1, getCalls: 1 })
+    expect(ruleLinesOf(h, key)).toEqual([])
+    expect(retryLinesOf(h, key).at(-1)).toBe(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_ROW_PENDING, 1, { ranPendingOnly: true }))
+  })
+
+  test('pending-only, from G until B, not judged: each retry adds the rule\'s round (a lap, as no approver runs; one bypassing find-missing; one get) with one rule line and stays a refusal; the runs come one per retry at its due time, never closer than the timer\'s interval; no kill, launch, keystroke or post', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    const row = await armAtRowAge(h, key, adGraceMsInEffect(), UNAVAILABLE_RETRY_MODE_PENDING_ONLY)
+    const dueTimes: number[] = []
+
+    for (const retry of [1, 2, 3]) {
+      const before = callCounts(h)
+      dueTimes.push(await retryNow(h, key))
+      expect(callsSince(h, before)).toEqual({ statusCalls: 1, getCalls: 2, readPaneCalls: 1, findMissingCalls: 1 })
+      expect(ruleLinesOf(h, key)).toHaveLength(retry)
+      expect(retryLinesOf(h, key).at(-1)).toBe(reArmedLine(key, retry, UNAVAILABLE_RETRY_AGAIN_ROW_PENDING, retry, { ranPendingOnly: true }))
+    }
+
+    expect(dueTimes.at(-1)! - row.launchStartMs()!).toBeLessThan(adLaunchBoundMsInEffect())
+    expect(h.callTimes('findMissing')).toEqual(dueTimes)
+    expect(dueTimes.slice(1).map((at, i) => at - dueTimes[i]!)).toEqual([waitMs(1), waitMs(2)])
+    expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', refusals: 3, mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
+    expectNoKillLaunchOrKeys(h)
+    expect(h.episodeNotices).toEqual([])
+    expect(h.controller.isArmed(other)).toBe(false)
+  })
+
+  test('pending-only, from G, a run that marks the row missing: the retry stops on the gone row and hands P to the restart decision once, one launch with no kill, whose new pending row is watched again', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    const row = await armAtRowAge(h, key, adGraceMsInEffect(), UNAVAILABLE_RETRY_MODE_PENDING_ONLY, { judgment: judgeMissingFromG() })
+
+    const dueAt = await retryNow(h, key)
+
+    expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_ROW_GONE }])
+    expect(retryLinesOf(h, key)).toEqual([
+      pendingOnlyArmedLine(key),
+      pendingOnlyRetryLine(key, 1),
+      pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_ROW_GONE, LIVENESS_DEAD_ROW_MISSING),
+      pendingOnlyArmedLine(key),
+    ])
+    expectLaunchedWithNoKill(h, key, LIVENESS_DEAD_ROW_MISSING)
+    expect(row.callTimes('spawn')).toEqual([dueAt])
+    expect(h.stub.calls.killCalls).toEqual([])
+    expect(row.state()).toBe(AGENT_DIRECTOR_PENDING_STATE)
+    expectPendingOnlyWatch(h, key)
+    expect(getFailureCount(key)).toBe(0)
+  })
+
+  test('pending-only, from G, no approver running and the trust dialog showing: the lap reads the pane and sends Enter, the row reaches waiting, the run and its get follow, and the timer stops on the live row with no kill or launch', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    const row = await armAtRowAge(h, key, adGraceMsInEffect(), UNAVAILABLE_RETRY_MODE_PENDING_ONLY, { dialog: PENDING_ROW_DIALOG_TRUST })
+
+    const dueAt = await retryNow(h, key)
+
+    expect(verbsAt(h, key, dueAt)).toEqual(['status', 'get', 'readPane', 'sendKeys', 'findMissing', 'get'])
+    expect(row.state()).toBe('waiting')
+    expect(retryLinesOf(h, key).at(-1)).toBe(pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_ROW_LIVE, 'waiting'))
+    expectStopped(h, key)
+    expect([h.stub.calls.killCalls, h.stub.calls.spawnCalls, h.stub.calls.resumeCalls]).toEqual([[], [], []])
+  })
+
+  test('pending-only, at B, not judged: one held post, the row never killed, and the retry a refusal that keeps the timer on the pending row', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    const row = await armAtRowAge(h, key, adLaunchBoundMsInEffect(), UNAVAILABLE_RETRY_MODE_PENDING_ONLY)
+
+    await retryNow(h, key)
+
+    expect(h.episodeNotices).toEqual([{ key, text: stuckLaunchHeldText(key, row.launchStartedAt(), false) }])
+    expectNoKillLaunchOrKeys(h)
+    expect(retryLinesOf(h, key).at(-1)).toBe(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_ROW_PENDING, 1, { ranPendingOnly: true }))
+    expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
+  })
+
+  // SRJ-303's Test line: "one that finds only the approver running makes the
+  // rule's find-missing run and no lap". The timer is armed half a lap before
+  // the launch, so no retry falls due at one of the approver's lap times and
+  // each verb's clock time tells the retry's calls from the approver's.
+  test('SRJ-303: a pending-only retry from G that finds only P\'s dialog approver running is not skipped, and its rule makes no lap: the row read, the step\'s get, one bypassing find-missing and one get, with no read-pane or send-keys', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    // The approver stops at B, so it still runs at the retry from G.
+    h.setApproverCap(undefined)
+    const row = makePendingRowModel(h, key, { state: PENDING_ROW_MODEL_NO_ROW })
+    h.controller.armPendingOnly(key)
+    await h.advance(DIALOG_POLL_INTERVAL_MS / 2)
+    expect(await h.launch(key)).toEqual({ key, action: 'spawned' })
+    await h.settle()
+    expect(h.approverRunning(key)).toBe(true)
+
+    const beforeG = await retryNow(h, key)
+    expect(beforeG - row.launchStartMs()!).toBeLessThan(adGraceMsInEffect())
+    expect(verbsAt(h, key, beforeG)).toEqual(['status', 'get'])
+    const fromG = await retryNow(h, key)
+    expect(fromG - row.launchStartMs()!).toBeGreaterThanOrEqual(adGraceMsInEffect())
+
+    expect(h.approverRunning(key)).toBe(true)
+    expect(verbsAt(h, key, fromG)).toEqual(['status', 'get', 'findMissing', 'get'])
+    expect(ruleLinesOf(h, key)).toHaveLength(1)
+    expect(retryLinesOf(h, key).at(-1)).toBe(reArmedLine(key, 2, UNAVAILABLE_RETRY_AGAIN_ROW_PENDING, 2, { ranPendingOnly: true }))
+    await h.runApproverToStop(key)
+  })
+
+  test('full mode, from G, not judged: the restart path\'s liveness read finds the row pending and its deferral runs the rule once (lap, find-missing, get); the retry stays a refusal (pending-deferred), with no kill, launch or keystroke', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    await armAtRowAge(h, key, adGraceMsInEffect(), UNAVAILABLE_RETRY_MODE_FULL)
+
+    const dueAt = await retryNow(h, key)
+
+    expect(verbsAt(h, key, dueAt)).toEqual(['status', 'get', 'readPane', 'findMissing', 'get'])
+    expect(ruleLinesOf(h, key)).toHaveLength(1)
+    expect(h.lines).toContain(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, 1))
+    expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', mode: UNAVAILABLE_RETRY_MODE_FULL, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
+    expectNoKillLaunchOrKeys(h)
+  })
+
+  test('full mode, from G, a run that marks the row missing: the deferral answers gone and the same restart run launches once with no kill (its liveness read found the row pending, its rule read it missing); the timer goes on in pending-only mode on the new row', async () => {
+    const h = (harness = makeRecoveryHarness())
+    const [key] = h.keys as [string]
+    const row = await armAtRowAge(h, key, adGraceMsInEffect(), UNAVAILABLE_RETRY_MODE_FULL, { judgment: judgeMissingFromG() })
+
+    const dueAt = await retryNow(h, key)
+
+    expect(verbsAt(h, key, dueAt).slice(0, 5)).toEqual(['status', 'get', 'readPane', 'findMissing', 'get'])
+    expectLaunchedWithNoKill(h, key, LIVENESS_DEAD_ROW_MISSING)
+    expect(row.callTimes('spawn')).toEqual([dueAt])
+    expect(h.stub.calls.killCalls).toEqual([])
+    expect(h.lines).toContain(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, 1, { switchedTo: UNAVAILABLE_RETRY_MODE_PENDING_ONLY }))
+    expect(getFailureCount(key)).toBe(0)
   })
 })
 

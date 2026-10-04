@@ -51,8 +51,10 @@ import {
   reprobePendingLine,
   reprobeUnhandledLine,
   reprobeUnknownLine,
+  pendingDeferralGoneLine,
   restartOldLifeHeldLine,
   type KillSessionResult,
+  type RestartPendingDeferralAnswer,
   type LaunchSessionResult,
   type ReconnectEscalateDead,
   type ReconnectSessionResult,
@@ -298,6 +300,7 @@ import {
   AGENT_DIRECTOR_PENDING_STATE,
   LIVENESS_DEAD_ROW_ENDED,
   LIVENESS_DEAD_ROW_MISSING,
+  LIVENESS_DEAD_ROW_NO_ROW,
   LIVENESS_READING_DEAD,
   LIVENESS_READING_DEAD_ENDED,
   LIVENESS_READING_DEAD_INSTALL_GONE,
@@ -309,6 +312,7 @@ import {
   LIVENESS_PENDING,
   pendingLivenessReading,
   type DeadLivenessReading,
+  type DeadRowRead,
   type LivenessReading,
   type PendingLivenessReading,
 } from '../src/liveness-reading.ts'
@@ -6329,6 +6333,83 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
       expect(errLines).toHaveLength(1)
       expect(errLines[0]).toStartWith(`[slack] Deferring persona=${KEY}`)
       if (start !== undefined) expect(errLines[0]).toContain(start)
+    })
+  })
+
+  // b.jg5 SRJ-410, SRJ-303 (E29): at a retry of P's timer the deferral may
+  // answer that the row is gone, its `DeadRowRead` (the pending-row rule, or
+  // the deferral's own `get`, read it `ended`, `missing` or no row). The same
+  // run then goes on to its dead branch with a `dead` reading that read the
+  // row: one line saying so, the slow-recovery observer told dead, no kill
+  // (`killBeforeRelaunch`), and one relaunch whose no-kill line names why (at
+  // the first probe, the row read; at the re-probe after an escalate-dead
+  // verdict that is dead evidence, the read voids it). Any other answer
+  // relaunches nothing: never a launch over a row last read `pending`.
+  describe('b.jg5 SRJ-410: a deferral answering the row gone continues the restart run to its relaunch, with no kill', () => {
+    const GONE: ReadonlyArray<readonly [DeadRowRead, DeadLivenessReading]> = [
+      [LIVENESS_DEAD_ROW_ENDED, LIVENESS_READING_DEAD_ENDED],
+      [LIVENESS_DEAD_ROW_MISSING, LIVENESS_READING_DEAD_MISSING],
+      [LIVENESS_DEAD_ROW_NO_ROW, LIVENESS_READING_DEAD_NO_ROW],
+    ]
+    const GONE_LINES = GONE.map(([gone]) => pendingDeferralGoneLine(P, gone))
+
+    test.each(PROBE_POINTS.flatMap((point) => GONE.map(([gone, reading]) => [point, gone, reading] as const)))('at %s, the deferral answering %s → its gone line and the observer told dead, then one relaunch in the same run with no kill, its no-kill line naming why; the failed launch is counted', async (point, gone, reading) => {
+      recordFailure(P)
+      const timeline: unknown[] = []
+      const { deps, deferred } = pendingAt(point, pendingLivenessReading(SAMPLE_LAUNCH_START_FRACTIONAL))
+      deps.deferPendingRow = (key, r) => {
+        deferred.push([key, r])
+        return gone
+      }
+      deps.launchSession = async (key, cwd, sessionId, deadEvidence) => {
+        deps.launchSessionCalls.push({ key, cwd, sessionId, ...(deadEvidence === undefined ? {} : { deadEvidence }) })
+        timeline.push(['launch', key])
+        return false
+      }
+      deps.slowRecovery = recordingSlowRecovery(timeline)
+      initRestart(deps)
+
+      expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_COUNTED_FAILURE)
+
+      const atReprobe = point !== 'the first probe'
+      expect(deferred).toHaveLength(1)
+      expect(deps.killSessionCalls).toEqual([])
+      // At the re-probe, the read voids the escalate-dead verdict: the relaunch carries none.
+      expect(deps.launchSessionCalls).toEqual([{ key: P, cwd: CWD, sessionId: undefined }])
+      expect(timeline).toEqual([
+        ['noteOther', P, atReprobe ? RESTART_SLOW_RECOVERY_OTHER_PENDING_REPROBE : RESTART_SLOW_RECOVERY_OTHER_PENDING_PROBE],
+        ['noteDead', P],
+        ['launch', P],
+      ])
+      expect(errLines.filter((l) => GONE_LINES.includes(l))).toEqual([pendingDeferralGoneLine(P, gone)])
+      const noKill = atReprobe
+        ? relaunchWithoutKillLine(P, ESCALATE_DEAD_WORKING_GONE.deadEvidence, RELAUNCH_NO_KILL_VERDICT_VOIDED, reading)
+        : relaunchWithoutKillLine(P, undefined, RELAUNCH_NO_KILL_ROW_READ, reading)
+      expect(errLines.filter((l) => l.startsWith('[slack] No kill before the '))).toEqual([noKill])
+      expect(errLines.filter((l) => l.startsWith(`[slack] Relaunching session for persona=${P} `))).toEqual([relaunchAfterKillLine(P, CWD, RELAUNCH_KILL_NONE)])
+      expect(getFailureCount(P)).toBe(2)
+      expect(deps.armRetryTimerCalls).toEqual([])
+      expect(isRestartPendingOrActive(P)).toBe(false)
+    })
+
+    test.each(PROBE_POINTS.flatMap((point) => ([
+      ["'pending'", 'pending'],
+      ['nothing', undefined],
+      ['a value that is no gone answer (cast)', 'waiting'],
+    ] as const).map(([label, answer]) => [point, label, answer] as const)))('at %s, the deferral answering %s → pending-deferred with no gone line: nothing killed or launched, nothing counted or armed', async (point, _label, answer) => {
+      recordFailure(P)
+      const { deps, deferred } = pendingAt(point, pendingLivenessReading(SAMPLE_LAUNCH_START_FRACTIONAL))
+      deps.deferPendingRow = (key, r) => {
+        deferred.push([key, r])
+        return answer as RestartPendingDeferralAnswer
+      }
+      initRestart(deps)
+
+      expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_PENDING_DEFERRED)
+
+      expect(deferred).toHaveLength(1)
+      expectNothingDoneAt(point, deps)
+      expect(errLines.filter((l) => GONE_LINES.includes(l))).toEqual([])
     })
   })
 })

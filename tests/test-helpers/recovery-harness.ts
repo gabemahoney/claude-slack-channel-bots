@@ -37,7 +37,11 @@
  *   SRJ-411): the session manager's `retryPendingRowStep` over the
  *   applied-persona lookup, so a pending-only retry whose `status` shows
  *   `pending` makes one `get` and keeps a covered or undecided row armed
- *   pending-only, or starts the live-row sequence for an uncovered one.
+ *   pending-only, or starts the live-row sequence for an uncovered one; a
+ *   covered row then gets the pending-row rule's one run of that retry (the
+ *   pending-row rule, below), its answer mapped for the action
+ *   (`pendingStepOfRuleAnswer`: a gone row hands the persona to the restart
+ *   path's decision in the same retry).
  *   `scriptedAction` is
  *   the scripted action: it answers each persona's queued outcomes
  *   (`answer(key, ...outcomes)`) in order and, once they run out, a bare
@@ -90,8 +94,14 @@
  *   live-row sequence (conversation not kept, context `recovery`), a latching
  *   row latched; its per-answer lines (row no longer pending, gone, refused)
  *   are written, and a step that throws is logged and still answers
- *   `pending`. The reconnect adapter is given the same lookup, so its own
- *   `pending` answer takes the same deferral.
+ *   `pending`. At a retry of the persona's timer (b.jg5 SRJ-410) a covered
+ *   row gets the pending-row rule's one run, and a row the rule or the
+ *   step's own `get` reads `ended`, `missing` or gone answers gone; the
+ *   binding returns the deferral's answer, as `main()`'s does, so a gone
+ *   answer takes the restart work on to its dead branch in the same run (no
+ *   kill for a row read finished). The reconnect adapter is given the same
+ *   lookup, so its own `pending` answer takes the same deferral, with no
+ *   rule run (`mayRunRule: false`).
  *   `isLatched` is the latch's latched query (`latch`
  *   below). `isHeld` is the hold's held query (`invalidFlagsHold` below;
  *   b.jg5 SRJ-207), so the restart work answers `held` with no call for a
@@ -186,8 +196,9 @@
  *   (`initOutageState`) as its client. No launch path kills a tmux session
  *   or runs tmux: every launch reaches only the stub.
  *   `script(knobs)` sets the stub's answers (`StubClientOptions` knobs such
- *   as `spawnError`, `getQueue` or the per-call `spawnFn` and `resumeFn`),
- *   read at each call.
+ *   as `spawnError`, `getQueue` or the per-call `spawnFn`, `resumeFn`,
+ *   `findMissingFn`, `readPaneFn`, `sendKeysFn` and `killFn`), read at each
+ *   call.
  * - `harnessNow`: with `options.harnessNow`, the session manager's clock
  *   (`_setNow`) is the harness clock, set where the approver's clock is:
  *   each launch call's window (b.jg5 SRJ-407, `launchCallWindowOf`) is
@@ -300,6 +311,65 @@
  *   case posts through `postStuckLaunchHeld` / `postStuckLaunchRelaunching`
  *   (`src/pending-row.ts`) over `episodes`, and the post lands in
  *   `episodeNotices`.
+ * - The pending-row rule (b.jg5 SRJ-410, SRJ-404, SRJ-303), composed as
+ *   `main()` composes it and installed right after the live-row sequence
+ *   registry (`setPendingRowRule`, removed by `cleanup()` with
+ *   `_resetPendingRowRule`): `createPendingRowRule` over the session
+ *   manager's one builder (`buildPendingRowRuleDeps`), given the
+ *   applied-persona lookup, `episodes` (so its held post, SRJ-1017's held
+ *   text, lands in `episodeNotices`) and `console.error` as its log (its
+ *   `[slack] pending-row:` lines go to `errors`), with the harness's
+ *   serializer (`serializer.run`, as `main()`'s `personaLifecycle.run`) as
+ *   the turn its one run at a dialog approver's stop takes. So the
+ *   production rule runs at each retry of a persona's timer that reaches a
+ *   covered `pending` row (a pending-only retry's step, a full-mode retry's
+ *   `pending` deferral, the collision ladder's `pending` step) and once at
+ *   an approver's stop with the row last read `pending`; every other origin
+ *   only arms. Its lap and its calls go through the stub; its latched query,
+ *   "blocks a retry", old-life hold gate, outage flags and episodes are the
+ *   harness's own. Its clock is the session manager's (`_setNow`): with
+ *   `options.harnessNow` that is the harness clock already; without it the
+ *   rule's `now` alone is the harness clock, so a row is aged by moving the
+ *   harness clock either way (`pastSampleGrace` moves it to G past the
+ *   stub's sample launch start; the clock starts at 0, so a row with that
+ *   launch start is younger than G until the case moves it). Each
+ *   approver-stop run is tracked and `settle()` awaits it. With
+ *   `options.pendingRowRule: false` none is installed, and each retry or
+ *   stop that would run it logs its "no pending-row rule is installed" line.
+ *   Step 3's own-launch slot (`PendingRowRuleDeps.ownLaunch`) is whatever
+ *   the builder sets: none yet, so every row at B takes the held branch.
+ *   A case scripts the row with `makePendingRowModel`
+ *   (`tests/test-helpers/pending-row-model.ts`), which takes a harness as
+ *   its host.
+ * - `timedCalls` and `callTimes(verb, key?)` (b.jg5 SRJ-410, AC 33): every
+ *   agent-director verb of the stub client (`RECOVERY_STUB_VERBS`, by method
+ *   name) is wrapped at build, in place, so each call is stamped with the
+ *   harness clock when it is made (`{ verb, at, instanceId }`, the instance
+ *   id the call named, undefined for `findMissing` and `list`), before the
+ *   stub records and answers it; `callTimes` reads one verb's times, of one
+ *   persona's instance with `key`. A verb a case replaces afterwards
+ *   (`holdFindMissing`, `holdSpawns`' held calls) is stamped only if its
+ *   replacement calls the wrapped verb.
+ * - `setApproverCap(ms)`: the approver's test cap mid-case
+ *   (`_setDialogReadyTimeoutMs(ms)`, or `_resetDialogReadyTimeoutMs()` for
+ *   `undefined`, so the approver stops at B), read by approvers started from
+ *   then on; `options.approverCapMs` sets it at build, and `cleanup()`
+ *   unsets it.
+ * - `restartServer(key)`: a server restart as persona `key` sees it (b.jg5
+ *   SRJ-410's "a server restart mid-launch"). It forgets what a new process
+ *   starts without for the persona: its retry timer stopped with
+ *   `UNAVAILABLE_RETRY_STOP_SHUTDOWN` (a real stop, in `stops`), its dialog
+ *   approver stopped with `APPROVER_STOP_SHUTDOWN` (no pending-row run
+ *   follows) and awaited, its launch records forgotten (`forgetLaunchCalls`:
+ *   the launch-call window and "this launch's row" record, SRJ-407, and the
+ *   not-interactive record, SRJ-412), and its episodes and counts forgotten,
+ *   every kind (`episodes.forget(key)`, the stuck-launch episode included).
+ *   The stub's row is untouched; the latch, the outage flags, the holds, the
+ *   retired-key store, the restart module's counts and the findMissing memo
+ *   are kept (a case that needs them gone builds a new harness). It throws
+ *   while the persona has a launch in flight or a live-row sequence running
+ *   (settle them first). The case then runs the start pass itself
+ *   (`launch(key)`).
  * - `latch` and `latchEvents` (b.jg5 SRJ-501, SRJ-502, SRJ-508): one latch
  *   per harness (`createConflictLatch`, its lines to `lines`), composed as
  *   `main()` composes it: installed in the session manager
@@ -520,7 +590,8 @@
  *   is `installStubSpawnPath`'s 200 ms, below the pace, so it makes one lap
  *   and stops at the cap once the clock reaches it; `options.approverCapMs`
  *   sets another (a case that needs a second lap passes one above
- *   `DIALOG_POLL_INTERVAL_MS`). `approverRunning(key)` is the session
+ *   `DIALOG_POLL_INTERVAL_MS`), and `setApproverCap` sets or unsets it
+ *   mid-case. `approverRunning(key)` is the session
  *   manager's `isDialogApproverRunning(key)`, read-only. So a case launches
  *   P, calls `settle()` (the first lap's calls are then made, and P's
  *   approver sleeps until its next lap), and holds P there until it moves the
@@ -631,8 +702,10 @@
  *   listener, so it registers the harness's again.
  * - `settle()`: awaits every configured persona's launch in flight
  *   (`whenLaunchSettled`), every retry run in flight (`whenRunSettled`),
- *   with its re-arm or stop, and every retry at once in flight
- *   (`retriesAtOnce`), and then until every running dialog approver
+ *   with its re-arm or stop, every retry at once in flight
+ *   (`retriesAtOnce`) and every pending-row rule run queued at an
+ *   approver's stop (so a case holding a turn of `serializer` for the
+ *   persona while one is queued gets the bound's error), and then until every running dialog approver
  *   waits for its next lap on the harness clock or has stopped (each holds
  *   its cap timer and, while it sleeps, its sleep timer, so all sleep when
  *   their pending timers number twice the running approvers). The spawn path
@@ -773,6 +846,9 @@
  *   hold's install and its set reaction, the version-changed listener,
  *   the kill-failure alerts' install,
  *   the stuck-launch episodes' install,
+ *   the pending-row rule's install (`_resetPendingRowRule`; a run already
+ *   queued at an approver's stop is not cancelled, so a case that stops an
+ *   approver with its row past G settles before it ends),
  *   the kill retry's keep-going query,
  *   the configured-persona query (`_resetConfiguredPersonaQuery`), so two
  *   harnesses built one after the other share no query,
@@ -977,7 +1053,7 @@ import {
   type KillFailureClosing,
 } from '../../src/kill-failure-alert.ts'
 import { LOST_MESSAGE_STATES, STATE_WORDING, type LostMessageState } from '../../src/lost-message.ts'
-import { endStuckLaunchEpisodeForLatch, parseLaunchStart, type LaunchCallWindow } from '../../src/pending-row.ts'
+import { createPendingRowRule, endStuckLaunchEpisodeForLatch, parseLaunchStart, type LaunchCallWindow } from '../../src/pending-row.ts'
 import { _resetOutageState, clearOutageFlag, getOutageFlags, initOutageState, resetAllToHealthy, type OutageClass } from '../../src/outage-state.ts'
 import type { PersonaLifecycleDeps } from '../../src/persona-lifecycle.ts'
 import type { PersonaConnectionStatus } from '../../src/persona-connections.ts'
@@ -1006,7 +1082,7 @@ import {
 } from '../../src/persona-episodes.ts'
 import { PERSONA_KEY_RE, personaInstanceId, personaSpawnEnv, personaTmuxSessionName } from '../../src/persona-identity.ts'
 import { createPersonaRouting, type PersonaRouting } from '../../src/persona-routing.ts'
-import { createPersonaSerializer, type PersonaSerializer } from '../../src/persona-serializer.ts'
+import { createPersonaSerializer, type PersonaSerialize, type PersonaSerializer } from '../../src/persona-serializer.ts'
 import { createPersonaRelaunchGate, createPersonaUpPredicate, type PersonaUpQuery } from '../../src/persona-start.ts'
 import { describePersonaNotUp } from '../../src/persona-bringup-controller.ts'
 import type { PersonaDestinationHold } from '../../src/persona-destination-hold.ts'
@@ -1045,10 +1121,16 @@ import {
   type TmuxUnavailableRetryDeps,
 } from '../../src/server.ts'
 import {
+  APPROVER_STOP_SHUTDOWN,
   APPROVER_STOP_TEARDOWN,
   DIALOG_POLL_INTERVAL_MS,
   _resetConfiguredPersonaQuery,
   _resetDialogApprovers,
+  _resetDialogReadyTimeoutMs,
+  _resetPendingRowRule,
+  buildPendingRowRuleDeps,
+  forgetLaunchCalls,
+  setPendingRowRule,
   _resetOldLifeHolds,
   _resetOldLifeWaitBindings,
   createOldLifeWaitUnclassifiedErrors,
@@ -1276,6 +1358,46 @@ export interface RecoveryHarnessOptions {
    * `_setWaitForWaitingTimeoutMs`) needs the real one.
    */
   harnessNow?: boolean
+  /**
+   * Install the pending-row rule (b.jg5 SRJ-410) in the session manager as
+   * `main()` installs it; true when unset. False installs none, so a retry
+   * or an approver stop that would run it logs its "no pending-row rule is
+   * installed" line and keeps the pending-only arm only.
+   */
+  pendingRowRule?: boolean
+}
+
+/** The stub client's agent-director verbs, by method name, whose calls the harness stamps with the harness clock. */
+export const RECOVERY_STUB_VERBS = [
+  'version',
+  'makeTemplate',
+  'spawn',
+  'status',
+  'get',
+  'sendKeys',
+  'readPane',
+  'kill',
+  'decide',
+  'resume',
+  'findMissing',
+  'delete',
+  'list',
+  'pause',
+  'getPermission',
+] as const
+
+/** One of `RECOVERY_STUB_VERBS`. */
+export type RecoveryStubVerb = (typeof RECOVERY_STUB_VERBS)[number]
+
+/**
+ * One stub call as the harness stamped it when it was made (b.jg5 SRJ-410,
+ * AC 33): the verb, the harness clock's time, and the `claude_instance_id`
+ * it named (undefined for a verb that names none, such as `findMissing`).
+ */
+export interface RecoveryTimedCall {
+  readonly verb: RecoveryStubVerb
+  readonly at: number
+  readonly instanceId: string | undefined
 }
 
 /** One write the harness's retired-key store made: its path, and whether it went through (false: `failRetiredKeyWrites` refused it). */
@@ -1700,6 +1822,27 @@ export interface RecoveryHarness {
    */
   recheckAnswers(version: string): { readonly resolves: readonly unknown[]; readonly stops: readonly number[] }
   settle(): Promise<void>
+  /**
+   * Every stub call made since the build, stamped with the harness clock when
+   * it was made, in order (read-only); see the module comment.
+   */
+  readonly timedCalls: readonly RecoveryTimedCall[]
+  /** The harness-clock times of `verb`'s calls, in order; with `key`, only those naming persona `key`'s instance. */
+  callTimes(verb: RecoveryStubVerb, key?: string): number[]
+  /**
+   * Set the dialog approver's test cap (`_setDialogReadyTimeoutMs`) to `ms`
+   * for approvers started from now on, or unset it with `undefined`
+   * (`_resetDialogReadyTimeoutMs`: the approver stops at B). `cleanup()`
+   * unsets it.
+   */
+  setApproverCap(ms: number | undefined): void
+  /**
+   * A server restart as persona `key` sees it (b.jg5 SRJ-410's "a server
+   * restart mid-launch"): forget what a new process starts without; the
+   * stub's row is untouched. Resolves once the persona's approver has
+   * stopped. See the module comment.
+   */
+  restartServer(key: string): Promise<void>
   /** Whether persona `key`'s dialog approver is running (read-only; the session manager's `isDialogApproverRunning`). */
   approverRunning(key: string): boolean
   /**
@@ -2056,6 +2199,23 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   const oldLifeHolds = createOldLifeHoldSet({ log: (line) => console.error(line) })
 
   const stub = installStubSpawnPath(home)
+  // Every agent-director verb of the stub client is wrapped, in place, so
+  // each call is stamped with the harness clock when it is made (b.jg5
+  // SRJ-410, AC 33: the cadence of a persona's calls), before the stub
+  // records and answers it. A verb a case replaces later (`holdFindMissing`,
+  // `holdSpawns`' held calls) is stamped only through its replacement.
+  const timedCalls: RecoveryTimedCall[] = []
+  {
+    const client = stub.client as unknown as Record<RecoveryStubVerb, (...args: unknown[]) => unknown>
+    for (const verb of RECOVERY_STUB_VERBS) {
+      const call = client[verb]
+      client[verb] = (...args: unknown[]): unknown => {
+        const named = (args[0] as { claude_instance_id?: unknown } | undefined)?.claude_instance_id
+        timedCalls.push({ verb, at: clock.now(), instanceId: typeof named === 'string' ? named : undefined })
+        return call.apply(client, args)
+      }
+    }
+  }
   // The dialog approver runs on the harness clock (b.jg5 SRJ-401): its sleeps
   // between laps and its cap timer are harness-clock timers, tracked here so
   // `settle()` can tell an approver waiting for its next lap and `cleanup()`
@@ -2200,6 +2360,35 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   // latch and before any launch, so the latch's set observer stops a latched
   // persona's running sequence.
   setLiveRowSequenceRegistry(sequences)
+  // As main() installs it, right after the registry and before any launch
+  // (b.jg5 SRJ-410, SRJ-404): the one pending-row rule, built through its
+  // factory over the session manager's one dependency builder, given the
+  // applied-persona lookup, the one episodes instance (so its held post
+  // lands in `episodeNotices`) and `console.error` as its log (so its lines
+  // go to `errors`); its approver-stop run takes the persona's turn in the
+  // harness's serializer, as main()'s in `personaLifecycle.run`. Each such
+  // run is tracked so `settle()` awaits it. Its clock is the session
+  // manager's (`_setNow`), which is the harness clock with
+  // `options.harnessNow`; without it the rule's `now` alone is put on the
+  // harness clock, so a case ages a row with `advance` either way. Removed
+  // by `cleanup()` (`_resetPendingRowRule`).
+  const ruleRunsInFlight = new Set<Promise<unknown>>()
+  const serializeRuleRun: PersonaSerialize = (key, operation) => {
+    const run = serializer.run(key, operation)
+    ruleRunsInFlight.add(run)
+    const done = (): void => {
+      ruleRunsInFlight.delete(run)
+    }
+    void run.then(done, done)
+    return run
+  }
+  if (options.pendingRowRule !== false) {
+    const ruleDeps = buildPendingRowRuleDeps({ appliedPersona, episodes, log: (line) => console.error(line) })
+    setPendingRowRule({
+      rule: createPendingRowRule(harnessNow ? ruleDeps : { ...ruleDeps, now: () => clock.now() }),
+      serialize: serializeRuleRun,
+    })
+  }
   // As main() installs it, beside the latch (b.jg5 SRJ-114): a key counts as
   // configured while it is in the live applied set, so a note on a persona's
   // own row latches it and a key outside the set, or removed from it, does not.
@@ -2341,10 +2530,13 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     // sink, so in `triggers`) or an uncovered one sent through the live-row
     // sequence, with the deferral's per-answer lines (row no longer pending,
     // gone, refused) in `errors`; a step that throws is logged there and the
-    // deferral still answers `pending`.
-    deferPendingRow: async (key, reading) => {
-      await deferPendingRow(key, reading.launchStartedAt, appliedPersona)
-    },
+    // deferral still answers `pending`. At a retry of the persona's timer
+    // (b.jg5 SRJ-410) a covered row gets the pending-row rule's one run, and
+    // a row the rule or the step's own `get` reads `ended`, `missing` or gone
+    // answers gone. The answer is returned, as main()'s binding returns it,
+    // so a gone row lets the restart work go on to its dead branch in the
+    // same run.
+    deferPendingRow: async (key, reading) => deferPendingRow(key, reading.launchStartedAt, appliedPersona),
     // As main() binds it (b.jg5 SRJ-502): a latched persona's restart work
     // makes no agent-director call.
     isLatched: (key) => latch.isLatched(key),
@@ -2483,6 +2675,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       ...keys.map((key) => whenLaunchSettled(key)),
       ...runKeys().map((key) => controller.whenRunSettled(key)),
       ...retriesAtOnceInFlight,
+      ...ruleRunsInFlight,
     ]).then(() => {
       settled = true
     })
@@ -2965,6 +3158,38 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
     settle: settleLaunches,
 
+    timedCalls,
+
+    callTimes(verb, key) {
+      const id = key === undefined ? undefined : personaInstanceId(key)
+      return timedCalls.filter((call) => call.verb === verb && (id === undefined || call.instanceId === id)).map((call) => call.at)
+    },
+
+    setApproverCap(ms) {
+      if (ms === undefined) _resetDialogReadyTimeoutMs()
+      else _setDialogReadyTimeoutMs(ms)
+    },
+
+    async restartServer(key) {
+      if (!keys.includes(key)) throw new Error(`recovery harness: no configured persona ${JSON.stringify(key)}`)
+      // A new process has no launch call or live-row sequence in flight: the
+      // case settles them first (the harness does not stand in for a call cut
+      // off mid-flight).
+      if (isLaunchInFlight(key)) throw new Error(`recovery harness: persona ${key} has a launch in flight; settle it before restartServer`)
+      if (sequences.isRunning(key)) throw new Error(`recovery harness: persona ${key}'s live-row sequence runs; settle it before restartServer`)
+      // Its retry timer, as a shutdown stops it (a real stop, in `stops`).
+      controller.stop(key, UNAVAILABLE_RETRY_STOP_SHUTDOWN)
+      // Its dialog approver, with the shutdown reason (b.jg5 SRJ-404: no
+      // pending-row run follows), awaited.
+      await stopDialogApprover(key, APPROVER_STOP_SHUTDOWN)
+      // Its launch records: the launch-call window and "this launch's row"
+      // record (b.jg5 SRJ-407) and the not-interactive record (SRJ-412).
+      forgetLaunchCalls(key)
+      // Its episodes and counts, every kind (the stuck-launch episode
+      // included, b.jg5 SRJ-1016, SRJ-1017).
+      episodes.forget(key)
+    },
+
     approverRunning: (key) => isDialogApproverRunning(key),
 
     async runApproverToStop(key, maxSteps = DEFAULT_APPROVER_STEPS) {
@@ -3141,6 +3366,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       unbindHold()
       setKillFailureAlerts(undefined)
       setStuckLaunchEpisodes(undefined)
+      _resetPendingRowRule()
       _resetConfiguredPersonaQuery()
       _resetRetiredKeyStore()
       removeHoldEndRetry()

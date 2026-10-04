@@ -1429,6 +1429,37 @@ import {
   type StuckLaunchPosterDeps,
 } from '../src/pending-row.ts'
 import { PERSONA_EPISODE_KIND_STUCK_LAUNCH } from '../src/persona-episodes.ts'
+import {
+  ladderRuleRetryingLine,
+  PENDING_ROW_RULE_SITE,
+  readPendingRowLapPane,
+  sendPendingRowLapEnter,
+} from '../src/session-manager.ts'
+import {
+  describePendingRowRuleAnswer,
+  PENDING_ROW_LAP_ENTER_ABSENT,
+  PENDING_ROW_LAP_ENTER_CONFIG,
+  PENDING_ROW_LAP_ENTER_CONFLICT,
+  PENDING_ROW_LAP_ENTER_ENVIRONMENT,
+  PENDING_ROW_LAP_ENTER_GONE,
+  PENDING_ROW_LAP_ENTER_LATCHED,
+  PENDING_ROW_LAP_ENTER_NOT_INTERACTIVE,
+  PENDING_ROW_LAP_ENTER_NOT_SENT_LATCHED,
+  PENDING_ROW_LAP_ENTER_SENT,
+  PENDING_ROW_LAP_ENTER_UNAVAILABLE,
+  PENDING_ROW_LAP_ENTER_UNCLASSIFIED,
+  PENDING_ROW_LAP_ENTER_UNUSABLE_NAME,
+  PENDING_ROW_RULE_GONE,
+  PENDING_ROW_RULE_LOG_HEAD,
+  PENDING_ROW_RULE_ORIGIN_RETRY,
+  PENDING_ROW_RULE_READ_REFUSED,
+  stuckLaunchHeldText,
+  type PendingRowLapEnterOutcome,
+  type PendingRowRuleAnswer,
+} from '../src/pending-row.ts'
+import { runInTimerRetry } from '../src/unavailable-retry.ts'
+import { LIVENESS_DEAD_ROW_NO_ROW, type DeadRowRead } from '../src/liveness-reading.ts'
+import { pastSampleGrace } from './test-helpers/recovery-harness.ts'
 
 // ---------------------------------------------------------------------------
 // Test fixture helpers
@@ -30082,5 +30113,417 @@ describe('b.jg5 SRJ-111: the plain spawn\'s outcome table through the one handle
     expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
     await h.runApproverToStop(p)
     h.controller.stop(p, UNAVAILABLE_RETRY_STOP_RECOVERED)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-410, SRJ-117, SRJ-118 (E29 T2): the pending-row rule's lap in the
+// session manager, and the collision ladder's `pending` step.
+//
+// The lap's `read-pane` is the shared reader (`readPersonaOwnPane`) with
+// `allow_pending`: only the lap's call carries it, and the reader's latch
+// cells are the same with it. The lap's Enter (`sendPendingRowLapEnter`) is
+// one `send-keys` (the instance id, an empty text, `allow_pending`), one case
+// per cell of SRJ-118's approver-and-lap row as the lap meets it, made inside
+// a recovery attempt for P as the rule's runs are; a CONFLICT or an
+// UNUSABLE NAME latches P recorded `pending` (the approver's `send-keys` rows
+// of the case table, whose records are the lap's), and a latched P gets no
+// call. The ladder's `pending` step on P's covered row runs the rule once
+// only inside a retry of P's timer (`runInTimerRetry`, the marker the retry
+// action sets) and maps its answer; from any other origin it only arms. Every
+// case runs on `makeRecoveryHarness`, the rule installed as `main()` installs
+// it, the clock at G past the stub's sample launch start (`pastSampleGrace`)
+// unless a case says otherwise; `srj105AfterEach` runs `assertNoLeak`.
+// ---------------------------------------------------------------------------
+
+/** The site label the lap's `read-pane` gives the shared reader for persona reference `ref`. */
+function lapPaneSite(ref: string): string {
+  return `${PENDING_ROW_RULE_SITE} ${ref} lap`
+}
+
+/** The approver's case-table rows at `site`, whose records (P's next check or recovery, `pending`) are the lap's. */
+const approverConflictRowsAt = (site: string): readonly ConflictCaseRow[] => CONFLICT_CASE_ROWS.filter((row) => row.site === site)
+
+describe('b.jg5 SRJ-410, SRJ-117: the lap\'s read-pane is the shared reader with allow_pending; no other read carries it, and its latch cells are unchanged', () => {
+  afterEach(srj105AfterEach)
+
+  test.each<[string, (p: string) => Promise<OwnPaneReadOutcome>, boolean]>([
+    ['the lap (readPendingRowLapPane)', (p) => readPendingRowLapPane(p), true],
+    ['the shared reader asked with no option (every other caller)', (p) => readPersonaOwnPane(p, fullPaneRead(WORKING_READ)), false],
+    ['the shared reader asked with the option false', (p) => readPersonaOwnPane(p, { ...fullPaneRead(WORKING_READ), allowPending: false }), false],
+  ])('%s: one read-pane of P\'s own row with the full-read line count, answered as the pane; allow_pending on the call: %p', async (_label, read, carries) => {
+    const { h, p } = srj105Build()
+    h.script({ readPaneResults: [{ pane: IDLE_PANE }] })
+    const order = recordEveryCall(h)
+
+    expect(await read(p)).toStrictEqual({ kind: PANE_READ_PANE, pane: IDLE_PANE })
+
+    expect(order).toEqual(['readPane'])
+    expect(h.stub.calls.readPaneCalls).toStrictEqual([carries ? { ...paneReadOf(p), allow_pending: true } : paneReadOf(p)])
+  })
+
+  test.each(approverConflictRowsAt('approver read-pane').map((row) => [row.name, row] as const))('CONFLICT at the lap\'s read-pane (%s): answered latched with it as the cause; P latched once, "P\'s next check or recovery", recorded pending; that read is the only call, and the next lap reads nothing', async (_name, row) => {
+    const { h, p } = srj105Build()
+    const ref = renderPersonaRef(p, p)
+    const err = row.build()
+    h.script({ readPaneError: err })
+    const order = recordEveryCall(h)
+
+    expect(await readPendingRowLapPane(p, ref)).toStrictEqual(paneLatchedBy(PANE_READ_CONFLICT, AD_ERROR_CLASS_CONFLICT, err))
+
+    expect(order).toEqual(['readPane'])
+    expectLatchedOnce(h, p, paneConflictLatch(p, row, lapPaneSite(ref)))
+    expect(h.latch.record(p)?.rowState).toEqual(latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE))
+    expect(await readPendingRowLapPane(p, ref)).toStrictEqual(PANE_READ_NOT_READ_LATCHED)
+    expect(order).toEqual(['readPane'])
+  })
+
+  test.each(PANE_UNUSABLE_NAME_ROWS.map((row) => [row.fault, row] as const))('UNUSABLE NAME at the lap\'s read-pane (%s): answered latched with it as the cause; P latched once, refused operation none, recorded pending; that read is the only call', async (_fault, row) => {
+    const { h, p } = srj105Build()
+    const ref = renderPersonaRef(p, p)
+    const err = row.build()
+    h.script({ readPaneError: err })
+    const order = recordEveryCall(h)
+
+    expect(await readPendingRowLapPane(p, ref)).toStrictEqual(paneLatchedBy(PANE_READ_UNUSABLE_NAME, AD_ERROR_CLASS_UNUSABLE_NAME, err))
+
+    expect(order).toEqual(['readPane'])
+    expectLatchedOnce(h, p, paneUnusableNameLatch(p, row, latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE), lapPaneSite(ref)))
+  })
+
+  test('a P already latched: the lap reads nothing and answers latched with no cause', async () => {
+    const { h, p } = srj105Build()
+    const before = await latchBeforeRun(h, p)
+    const order = recordEveryCall(h)
+
+    expect(await readPendingRowLapPane(p)).toStrictEqual(PANE_READ_NOT_READ_LATCHED)
+
+    expect(order).toEqual([])
+    expectNoRelatch(h, before)
+  })
+})
+
+describe('b.jg5 SRJ-410, SRJ-118: the lap\'s Enter (sendPendingRowLapEnter) is one send-keys with allow_pending, answered by class, one case per cell', () => {
+  /** Every `resolveSystemBinary` call the installed re-check made (the `ErrInvalidFlags` cells). */
+  let resolveCalls: Array<object | undefined>
+  /** The exit codes the re-check stopped with. */
+  let stops: number[]
+
+  beforeEach(() => {
+    resolveCalls = []
+    stops = []
+  })
+
+  afterEach(() => {
+    resetAdVersionRecheckForTests()
+    srj105AfterEach()
+  })
+
+  /** Install the real re-check over a counting stub `resolveSystemBinary` answering `outcome` (the baseline when none). */
+  function installRecheck(outcome?: StubResolveSystemBinaryOutcome): void {
+    installAdVersionRecheck({
+      resolveSystemBinary: makeStubResolveSystemBinary({ calls: resolveCalls, ...(outcome === undefined ? {} : { outcomes: [outcome] }) }),
+      baselineVersion: PHASE1_RC_VERSION,
+      recordStartupError: () => {},
+      stop: (exitCode) => {
+        stops.push(exitCode)
+      },
+      log: () => {},
+      clock: createFakeClock(),
+    })
+  }
+
+  /** P's lap Enter, made inside a recovery attempt for P (as the rule's runs are) over `script`; answers the outcome and every call from then on. */
+  async function enterOnce(script: RecoveryStubScript) {
+    const { h, p } = srj105Build()
+    h.script(script)
+    const order = recordEveryCall(h)
+    const ref = renderPersonaRef(p, p)
+    const outcome = await runInAttempt(p, 'recovery', () => sendPendingRowLapEnter(p, ref))
+    return { h, p, ref, order, outcome }
+  }
+
+  /** Exactly one send-keys, Enter on P's own row with allow_pending and nothing else, and no other call, raw tmux included; nothing posted or counted. */
+  function expectOneEnterOnly(h: RecoveryHarness, p: string, order: readonly string[]): void {
+    expect(order).toEqual(['sendKeys'])
+    expect(h.stub.calls.sendKeysCalls).toStrictEqual([{ claude_instance_id: personaInstanceId(p), text: '', allow_pending: true }])
+    expect(h.notices).toEqual([])
+    expect(getFailureCount(p)).toBe(0)
+  }
+
+  /** A failed Enter's outcome: its kind, the class given and the redacting describer's text. */
+  const enterFailure = (kind: string, errorClass: string, err: unknown): PendingRowLapEnterOutcome =>
+    ({ kind, errorClass, description: describeAgentDirectorFailure(err) }) as PendingRowLapEnterOutcome
+
+  /** The lap Enter's latch lines of `kind` for P (`ref`). */
+  const lapEnterLatchLines = (h: RecoveryHarness, ref: string, kind: 'CONFLICT' | 'UNUSABLE NAME'): string[] =>
+    h.errors.filter((line) => line.startsWith(`[slack] ${PENDING_ROW_RULE_SITE}: lap Enter refused for ${ref}: `) && line.includes(` — ${kind}: `))
+
+  test('success: sent; nothing armed, latched or logged', async () => {
+    const { h, p, ref, order, outcome } = await enterOnce({})
+
+    expect(outcome).toStrictEqual({ kind: PENDING_ROW_LAP_ENTER_SENT })
+    expectOneEnterOnly(h, p, order)
+    expect(h.triggers).toEqual([])
+    expect(h.latch.isLatched(p)).toBe(false)
+    expect(h.errors.filter((line) => line.includes(`lap Enter refused for ${ref}`))).toEqual([])
+  })
+
+  test.each<[string, () => Error, string, string]>([
+    ['GONE (ErrTmuxSendKeys)', () => errTmuxSendKeys(), PENDING_ROW_LAP_ENTER_GONE, AD_ERROR_CLASS_GONE],
+    ['the row absent (ErrSpawnNotFound)', () => errSpawnNotFound(), PENDING_ROW_LAP_ENTER_ABSENT, AD_ERROR_CLASS_STATE],
+    ['ErrSpawnNotInteractive (a finished row)', () => errSpawnNotInteractive('send-keys'), PENDING_ROW_LAP_ENTER_NOT_INTERACTIVE, AD_ERROR_CLASS_STATE],
+    ['ErrSpawnNotInteractive (a leftover\'s session holds the name)', () => errSpawnNotInteractiveLeftover(undefined, 'send-keys'), PENDING_ROW_LAP_ENTER_NOT_INTERACTIVE, AD_ERROR_CLASS_STATE],
+    ['ErrSpawnNotInteractive (a pending row with no launch start)', () => errSpawnNotInteractiveNoLaunchStart('send-keys'), PENDING_ROW_LAP_ENTER_NOT_INTERACTIVE, AD_ERROR_CLASS_STATE],
+  ])('%s: answered by class with nothing typed; nothing armed, latched or posted', async (_what, make, kind, errorClass) => {
+    const err = make()
+    const { h, p, outcome, order } = await enterOnce({ sendKeysError: err })
+
+    expect(outcome).toStrictEqual(enterFailure(kind, errorClass, err))
+    expectOneEnterOnly(h, p, order)
+    expect(h.triggers).toEqual([])
+    expect(h.latch.isLatched(p)).toBe(false)
+    expect(h.episodeNotices).toEqual([])
+  })
+
+  test.each(PANE_UNAVAILABLE_FORMS)('UNAVAILABLE (%s): answered UNAVAILABLE; P\'s retry timer armed with its cause; no notice', async (_what, make, cause) => {
+    const err = make('send-keys')
+    const { h, p, outcome, order } = await enterOnce({ sendKeysError: err })
+
+    expect(outcome).toStrictEqual(enterFailure(PENDING_ROW_LAP_ENTER_UNAVAILABLE, AD_ERROR_CLASS_UNAVAILABLE, err))
+    expectOneEnterOnly(h, p, order)
+    expect(h.triggers).toEqual([{ key: p, kind: cause }])
+    expect(h.outageNotices).toEqual([])
+  })
+
+  test.each(SRJ311_ENVIRONMENT.map(([what, make, onset]) => [what, make, onset] as const))('ENVIRONMENT (%s): answered ENVIRONMENT; P\'s tmux-unavailable raised once with its onset; armed with the ENVIRONMENT cause', async (_what, make, onset) => {
+    const err = make('send-keys')
+    const { h, p, outcome, order } = await enterOnce({ sendKeysError: err })
+
+    expect(outcome).toStrictEqual(enterFailure(PENDING_ROW_LAP_ENTER_ENVIRONMENT, AD_ERROR_CLASS_ENVIRONMENT, err))
+    expectOneEnterOnly(h, p, order)
+    expect(h.outageNotices).toEqual([{ key: p, text: onset }])
+    expect([...getOutageFlags(p)]).toEqual([TMUX_UNAVAILABLE_CLASS])
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT }])
+  })
+
+  test('CONFIG (ErrConfigMalformed): answered CONFIG; P\'s ad-config-malformed raised once; armed with the CONFIG cause', async () => {
+    const err = errConfigMalformed()
+    const { h, p, outcome, order } = await enterOnce({ sendKeysError: err })
+
+    expect(outcome).toStrictEqual(enterFailure(PENDING_ROW_LAP_ENTER_CONFIG, AD_ERROR_CLASS_CONFIG, err))
+    expectOneEnterOnly(h, p, order)
+    expect(h.outageNotices).toEqual([{ key: p, text: adConfigMalformedOnset(err) }])
+    expect([...getOutageFlags(p)]).toEqual([AD_CONFIG_MALFORMED_CLASS])
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_CONFIG }])
+  })
+
+  test.each([
+    ['ErrInternal with no phrase', () => errInternal()],
+    ['an error name CSCB gives no handling', () => errGeneric('send-keys', 'ErrBroken')],
+    ['ErrSendKeysWhileRelayed', () => errSendKeysWhileRelayed()],
+  ] as const)('UNCLASSIFIED (%s): answered UNCLASSIFIED with nothing typed; reported once to P\'s unclassified-error episode and armed with the UNCLASSIFIED cause', async (_what, make) => {
+    const err = make()
+    expect(classifyAdError(err).errorClass).toBe(AD_ERROR_CLASS_UNCLASSIFIED)
+    const { h, p, outcome, order } = await enterOnce({ sendKeysError: err })
+
+    expect(outcome).toStrictEqual(enterFailure(PENDING_ROW_LAP_ENTER_UNCLASSIFIED, AD_ERROR_CLASS_UNCLASSIFIED, err))
+    expectOneEnterOnly(h, p, order)
+    expect(unclassifiedStartedLines(h, p)).toEqual([unclassifiedStartedLine(p, err)])
+    expect(h.unclassifiedErrorOpen(p)).toBe(true)
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
+  })
+
+  // b.jg5 SRJ-104, SRJ-204, SRJ-205: send-keys gives ErrInvalidFlags no meaning.
+  test.each([
+    [RECHECK_OUTCOME_PASS, undefined, false],
+    [RECHECK_OUTCOME_STOP, { version: OLD_AD_VERSION }, true],
+  ] as const)('ErrInvalidFlags, the re-check answering %s: one re-check, then UNCLASSIFIED (marked stopping when the re-check stops the server, and then nothing reported); one line', async (kind, outcome, stopping) => {
+    installRecheck(outcome)
+    const err = errInvalidFlags('send-keys')
+    const { h, p, ref, outcome: entered, order } = await enterOnce({ sendKeysError: err })
+
+    const unclassified = enterFailure(PENDING_ROW_LAP_ENTER_UNCLASSIFIED, AD_ERROR_CLASS_UNCLASSIFIED, err)
+    expect(entered).toStrictEqual(stopping ? ({ ...unclassified, stopping: true } as PendingRowLapEnterOutcome) : unclassified)
+    expect(resolveCalls).toHaveLength(1)
+    expect(stops).toHaveLength(stopping ? 1 : 0)
+    expectOneEnterOnly(h, p, order)
+    const classification = `class=${AD_ERROR_CLASS_UNCLASSIFIED} name=${err.errName} message=${JSON.stringify(err.errDescription)}`
+    const lines = h.errors.filter((line) => line.startsWith(`[slack] ${PENDING_ROW_RULE_SITE}: lap Enter for ${ref} answered ${classification} — `))
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toContain(`: ${kind}; nothing typed`)
+    expect(h.triggers).toEqual(stopping ? [] : [{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
+  })
+
+  test.each(approverConflictRowsAt('approver send-keys').map((row) => [row.name, row] as const))('CONFLICT (%s): latched with it as the cause; P latched once through the CONFLICT entry, "P\'s next check or recovery", recorded pending; one hold post; the next Enter makes no call', async (_name, row) => {
+    const err = row.build()
+    const { h, p, ref, outcome, order } = await enterOnce({ sendKeysError: err })
+
+    expect(outcome).toStrictEqual({
+      kind: PENDING_ROW_LAP_ENTER_LATCHED,
+      cause: { kind: PENDING_ROW_LAP_ENTER_CONFLICT, errorClass: AD_ERROR_CLASS_CONFLICT, description: describeAgentDirectorFailure(err), error: err },
+    })
+    expectOneEnterOnly(h, p, order)
+    expectLatchedOnce(h, p, { ...conflictLatch(p, row, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE)), lines: () => lapEnterLatchLines(h, ref, 'CONFLICT') })
+
+    expect(await sendPendingRowLapEnter(p, ref)).toStrictEqual(PENDING_ROW_LAP_ENTER_NOT_SENT_LATCHED)
+    expect(order).toEqual(['sendKeys'])
+    expect(h.episodeNotices).toHaveLength(1)
+  })
+
+  test.each(unusableNameRowsAt('approver send-keys').map((row) => [row.name, row] as const))('UNUSABLE NAME (%s): latched with it as the cause; P latched once, refused operation none, recorded pending; one post; the next Enter makes no call', async (_name, row) => {
+    const err = row.build()
+    const { h, p, ref, outcome, order } = await enterOnce({ sendKeysError: err })
+
+    expect(outcome).toStrictEqual({
+      kind: PENDING_ROW_LAP_ENTER_LATCHED,
+      cause: { kind: PENDING_ROW_LAP_ENTER_UNUSABLE_NAME, errorClass: AD_ERROR_CLASS_UNUSABLE_NAME, description: describeAgentDirectorFailure(err), error: err },
+    })
+    expectOneEnterOnly(h, p, order)
+    expectLatchedOnce(h, p, { ...unusableNameLatch(p, row, latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE)), lines: () => lapEnterLatchLines(h, ref, 'UNUSABLE NAME') })
+
+    expect(await sendPendingRowLapEnter(p, ref)).toStrictEqual(PENDING_ROW_LAP_ENTER_NOT_SENT_LATCHED)
+    expect(order).toEqual(['sendKeys'])
+  })
+
+  test('a P already latched: no send-keys and no other call, raw tmux included; latched with no cause; nothing set or posted', async () => {
+    const { h, p } = srj105Build()
+    const before = await latchBeforeRun(h, p)
+    const order = recordEveryCall(h)
+
+    expect(await runInAttempt(p, 'recovery', () => sendPendingRowLapEnter(p))).toStrictEqual(PENDING_ROW_LAP_ENTER_NOT_SENT_LATCHED)
+
+    expect(order).toEqual([])
+    expectNoRelatch(h, before)
+  })
+})
+
+describe('b.jg5 SRJ-410, SRJ-409, SRJ-710: the ladder\'s pending step on P\'s covered row runs the rule once only inside a retry of P\'s timer, and stays no-op for a row still pending; E23\'s re-read included', () => {
+  afterEach(() => {
+    expectNoDeleteOrIncludeFinished(srj105Harness)
+    srj105AfterEach()
+  })
+
+  /** P's own row read `pending` (covered: its own directory and labels), with the stub's sample launch start. */
+  const pendingRowOf = (h: RecoveryHarness, p: string): CannedGetResult => harnessRow(h, harnessPersona(h, p), { state: AGENT_DIRECTOR_PENDING_STATE })
+
+  /** The one arm P's covered row gets at the step: pending-only, the pending-row cause. */
+  const expectStepArmOnly = (h: RecoveryHarness, p: string): void => {
+    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
+    expectPendingOnlyWatch(h, p)
+  }
+
+  /** The rule's lines for P at a retry (its round, its gate). */
+  const ruleLines = (h: RecoveryHarness, p: string): string[] => h.errors.filter((line) => line.startsWith(`${PENDING_ROW_RULE_LOG_HEAD} ${renderPersonaRef(p, p)} rule (${PENDING_ROW_RULE_ORIGIN_RETRY})`))
+
+  test.each<[string, boolean]>([
+    ['inside a retry of P\'s timer', true],
+    ['outside every retry (the start pass)', false],
+  ])('%s, the row past G at the collision get: no-op with one pending-only arm; inside a retry one lap read-pane, one bypassing find-missing and one get follow the collision get, with one round line; outside, none; nothing counted, posted, killed or launched', async (_where, inRetry) => {
+    const { h, p } = srj105Build()
+    await pastSampleGrace(h)
+    h.script(collided(h, harnessPersona(h, p), { state: AGENT_DIRECTOR_PENDING_STATE }))
+    const order = recordCallOrder(h)
+
+    const launch = (): Promise<SpawnPersonaResult> => h.launch(p)
+    expect(await (inRetry ? runInTimerRetry(p, launch) : launch())).toStrictEqual({ key: p, action: 'no-op' })
+
+    expect(order).toEqual(inRetry ? ['spawn', 'get', 'readPane', 'findMissing', 'get'] : ['spawn', 'get'])
+    expect(ruleLines(h, p)).toHaveLength(inRetry ? 1 : 0)
+    expectStepArmOnly(h, p)
+    expect([getFailureCount(p), h.notices, h.episodeNotices, h.stub.calls.killCalls]).toEqual([0, [], [], []])
+  })
+
+  /** The rule's answer for a row it read gone (`ended`, `missing` or no row). */
+  const goneAnswer = (state: DeadRowRead): PendingRowRuleAnswer => ({ kind: PENDING_ROW_RULE_GONE, state })
+
+  /** What the rule's `get` after its run reads, and the ladder's answer for it. */
+  const RULE_GETS: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string) => CannedResponse<Phase1GetResult>, SpawnPersonaResult['action'], PendingRowRuleAnswer | undefined]> = [
+    ['still pending (not judged): a refusal', (h, p) => cannedOk<Phase1GetResult>(pendingRowOf(h, p)), 'no-op', undefined],
+    ['waiting: live', (h, p) => cannedOk<Phase1GetResult>(harnessRow(h, harnessPersona(h, p), { state: 'waiting' })), 'no-op', undefined],
+    ...([LIVENESS_DEAD_ROW_ENDED, LIVENESS_DEAD_ROW_MISSING] as const).map(
+      (state) => [`${state}: gone`, (h: RecoveryHarness, p: string) => cannedOk<Phase1GetResult>(harnessRow(h, harnessPersona(h, p), { state })), SPAWN_ACTION_RETRYING, goneAnswer(state)] as const,
+    ),
+    ['no row (ErrSpawnNotFound): gone', () => cannedErr<Phase1GetResult>(errSpawnNotFound()), SPAWN_ACTION_RETRYING, goneAnswer(LIVENESS_DEAD_ROW_NO_ROW)],
+  ]
+
+  test.each(RULE_GETS)('inside a retry, the rule\'s get reading %s: the ladder answers %s, with one retrying line for a gone row; nothing launched, killed, counted or posted; no arm beyond the step\'s', async (_what, ruleGet, action, gone) => {
+    const { h, p } = srj105Build()
+    await pastSampleGrace(h)
+    h.script({ ...collided(h, harnessPersona(h, p), { state: AGENT_DIRECTOR_PENDING_STATE }), getQueue: [cannedOk<Phase1GetResult>(pendingRowOf(h, p)), ruleGet(h, p)] })
+    const order = recordCallOrder(h)
+
+    expect(await runInTimerRetry(p, () => h.launch(p))).toStrictEqual({ key: p, action })
+
+    expect(order).toEqual(['spawn', 'get', 'readPane', 'findMissing', 'get'])
+    const ref = renderPersonaRef(p, p)
+    expect(h.errors.filter((line) => line.startsWith(`[slack] spawnForPersona: the pending-row rule for ${ref} answered `))).toEqual(
+      gone === undefined ? [] : [ladderRuleRetryingLine(ref, describePendingRowRuleAnswer(gone))],
+    )
+    expectStepArmOnly(h, p)
+    expect([getFailureCount(p), h.notices, h.episodeNotices, h.stub.calls.killCalls, h.stub.calls.resumeCalls]).toEqual([0, [], [], [], []])
+  })
+
+  test('inside a retry, the rule\'s get refused (UNAVAILABLE): retrying with one retrying line; the get arms its own cause after the step\'s arm; nothing launched or counted', async () => {
+    const { h, p } = srj105Build()
+    await pastSampleGrace(h)
+    const err = unavailableAt('get')
+    h.script({ ...collided(h, harnessPersona(h, p), { state: AGENT_DIRECTOR_PENDING_STATE }), getQueue: [cannedOk<Phase1GetResult>(pendingRowOf(h, p)), cannedErr<Phase1GetResult>(err)] })
+
+    expect(await runInTimerRetry(p, () => h.launch(p))).toStrictEqual({ key: p, action: SPAWN_ACTION_RETRYING })
+
+    const ref = renderPersonaRef(p, p)
+    expect(h.errors.filter((line) => line.startsWith(`[slack] spawnForPersona: the pending-row rule for ${ref} answered `))).toEqual([
+      ladderRuleRetryingLine(ref, describePendingRowRuleAnswer({ kind: PENDING_ROW_RULE_READ_REFUSED, error: err })),
+    ])
+    expect(h.triggers.map((t) => t.kind)).toEqual([UNAVAILABLE_RETRY_CAUSE_PENDING_ROW, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE])
+    expect([getFailureCount(p), h.notices, h.stub.calls.spawnCalls.length, h.stub.calls.killCalls]).toEqual([0, [], 1, []])
+  })
+
+  test('inside a retry, the lap\'s read-pane CONFLICT latches P: the ladder answers latched, with no run and no get after it', async () => {
+    const { h, p } = srj105Build()
+    await pastSampleGrace(h)
+    const row = approverConflictRowsAt('approver read-pane')[0]!
+    h.script({ ...collided(h, harnessPersona(h, p), { state: AGENT_DIRECTOR_PENDING_STATE }), readPaneError: row.build() })
+    const order = recordCallOrder(h)
+
+    expect(await runInTimerRetry(p, () => h.launch(p))).toStrictEqual({ key: p, action: 'latched' })
+
+    expect(order).toEqual(['spawn', 'get', 'readPane'])
+    expect(h.latch.isLatched(p)).toBe(true)
+    expect([getFailureCount(p), h.notices, h.stub.calls.killCalls]).toEqual([0, [], []])
+  })
+
+  test('inside a retry at B, the row still pending and never CSCB\'s own: the held post, and the ladder stays no-op; no kill or launch', async () => {
+    const { h, p } = srj105Build()
+    await h.clock.advanceTo(parseLaunchStart(SAMPLE_LAUNCH_START_DEFAULT)! + adLaunchBoundMsInEffect())
+    h.script(collided(h, harnessPersona(h, p), { state: AGENT_DIRECTOR_PENDING_STATE }))
+
+    expect(await runInTimerRetry(p, () => h.launch(p))).toStrictEqual({ key: p, action: 'no-op' })
+
+    expect(h.episodeNotices).toEqual([{ key: p, text: stuckLaunchHeldText(p, SAMPLE_LAUNCH_START_DEFAULT, false) }])
+    expectStepArmOnly(h, p)
+    expect([getFailureCount(p), h.stub.calls.killCalls, h.stub.calls.spawnCalls.length, h.stub.calls.resumeCalls]).toEqual([0, [], 1, []])
+  })
+
+  // Hatch note E23: the not-resumable re-read reads P's covered row pending.
+  test('E23: inside a retry, ErrSpawnNotResumable\'s re-read reading P\'s covered row pending reaches the step: the same no-op, one rule run after the re-read, nothing counted or posted, no arm beyond the step\'s', async () => {
+    const { h, p } = srj105Build()
+    await pastSampleGrace(h)
+    const persona = harnessPersona(h, p)
+    h.script({
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getQueue: [cannedOk<Phase1GetResult>(harnessRow(h, persona, ENDED_WITH_SESSION)), cannedOk<Phase1GetResult>(pendingRowOf(h, p))],
+      getResult: pendingRowOf(h, p),
+      resumeQueue: [cannedErr(errSpawnNotResumable())],
+    })
+    const order = recordCallOrder(h)
+
+    expect(await runInTimerRetry(p, () => h.launch(p))).toStrictEqual({ key: p, action: 'no-op' })
+
+    expect(order).toEqual(['spawn', 'get', 'resume', 'get', 'readPane', 'findMissing', 'get'])
+    expect(ruleLines(h, p)).toHaveLength(1)
+    expectStepArmOnly(h, p)
+    expect([h.sequenceRunning(p), getFailureCount(p), h.notices, h.episodeNotices, h.stub.calls.killCalls, h.startupErrors()]).toEqual([false, 0, [], [], [], []])
   })
 })

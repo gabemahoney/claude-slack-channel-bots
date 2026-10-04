@@ -1704,9 +1704,14 @@ export interface FullModeRetryDeps {
    * answered `pending`. It makes one `get` through the shared own-row read
    * (its note and launch-start latches and its old-life read entry applying)
    * and decides whether the row is covered: a covered or undecided row arms
-   * the persona's timer pending-only and is kept (`kept`; a read the shared
-   * read refused is kept too); a row that is not covered starts the live-row
-   * sequence (`sequence-started`); a read that latched the persona answers
+   * the persona's timer pending-only; a covered row then gets the
+   * pending-row rule's one run of this retry (b.jg5 SRJ-410), whose answer
+   * maps here: a refusal or the held post is `kept`, a row the rule read
+   * gone or live is `row` with that state, a latch is `latched`, and the
+   * own-launch abort's sequence is `sequence-started`; an undecided row is
+   * kept with no rule run (a read the shared read refused is kept too); a
+   * row that is not covered starts the live-row sequence
+   * (`sequence-started`); a read that latched the persona answers
    * `latched`; another state, or no row, answers `row` with what it read.
    * The `get`'s row supersedes the `status` read's, its launch start
    * included. Absent: the `status` read's `pending` is a refusal, as before.
@@ -1730,7 +1735,12 @@ export interface FullModeRetryDeps {
  * `pending` state goes to the optional pending-row step, inside a recovery
  * attempt too, and its answer decides (`pendingStepAnswer`). The launch start
  * the `status` read carried is superseded by the step's `get`; ageing the row
- * at the retries is the pending-row rule's, not this action's. A latched query that throws counts as latched
+ * at the retries is the pending-row rule's, not this action's: the step runs
+ * it on a covered row. The whole run, in either mode, is marked as a retry
+ * of the persona's timer (`runInTimerRetry`, b.jg5 SRJ-410): the pending-row
+ * rule runs only inside one, at most once per retry, whether reached here
+ * (pending-only) or through the restart path's deferral or the ladder's
+ * `pending` step (full mode). A latched query that throws counts as latched
  * (logged, with what it threw), and so does a held query that throws. A
  * dependency that throws (but the in-flight predicate and the latched and
  * held queries),
@@ -1738,55 +1748,64 @@ export interface FullModeRetryDeps {
  * the controller counts as `again`.
  */
 export function createFullModeRetryAction(deps: FullModeRetryDeps): UnavailableRetryAction {
-  return async (key, attempt) => {
-    if (deps.isShuttingDown()) return stopWith(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
-    const persona = deps.appliedPersona(key)
-    // b.av2 SR-8.6 (b.jg5 SRJ-1512): a retry does nothing for a key outside
-    // the applied set. Its one exception, an old-life wait's kill and
-    // find-missing steps on a retired key (SRJ-811), runs in the session
-    // manager's live-row sequence registry, never on this timer, and never
-    // launches that key; no timer is armed for the old key.
-    if (persona === undefined) return stopWith(UNAVAILABLE_RETRY_STOP_NOT_APPLIED)
-    if (latched(key, deps.isLatched)) return stopWith(UNAVAILABLE_RETRY_STOP_LATCHED)
-    // b.jg5 SRJ-207, SRJ-303: no attempt while the persona is held on ErrInvalidFlags.
-    if (held(key, deps.isHeld)) return stopWith(UNAVAILABLE_RETRY_STOP_HELD)
-    if (!deps.canRelaunch(key)) return stopWith(UNAVAILABLE_RETRY_STOP_NOT_UP)
-    if (deps.isAtCap(key)) return stopWith(UNAVAILABLE_RETRY_STOP_CAPPED)
-    const cwd = persona.working_directory
-    if (attempt.mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY) {
-      if (inFlight(key, deps.isInFlight)) {
-        // b.jg5 SRJ-303: the again-reason names what blocks the retry.
-        const reason = retryBlockAgainReason(readRetryBlockCause(key, deps.retryBlockCause))
-        return { kind: 'again', reason, row: UNAVAILABLE_RETRY_ROW_PENDING }
-      }
-      const row = await runInAttempt(key, 'recovery', () => deps.readRow(key))
-      // b.jg5 SRJ-305, SRJ-512, SRJ-513: a row read that latched the persona
-      // stops the timer with the latch's reason; nothing is handed to the
-      // restart path. A configured persona's own `pending` row with no launch
-      // start latches at that read, so it never reaches `pendingOnlyAnswer`;
-      // a row under an unconfigured key latches nothing and still does.
-      if (latched(key, deps.isLatched)) return stopWith(UNAVAILABLE_RETRY_STOP_LATCHED)
-      if (isLiveOutOfPending(row.state) && probe(key, deps.isSessionConnected) && probe(key, deps.hasSessionStream)) {
-        endCondition(key, row.state, deps.endTmuxUnresponsive)
-      }
-      const restart = (): Promise<unknown> => deps.retry(key, cwd, deps.isInFlight, deps.retryBlockCause)
-      // b.jg5 SRJ-409, SRJ-411: a `pending` row is decided by the pending-row
-      // step's one `get`, whose row supersedes this `status` read's (the
-      // carried launch start included; ageing at the retries is the
-      // pending-row rule's).
-      if (row.state === UNAVAILABLE_RETRY_ROW_PENDING && deps.stepPendingRow !== undefined) {
-        const stepPendingRow = deps.stepPendingRow
-        const step = await runInAttempt(key, 'recovery', () => stepPendingRow(key))
-        return pendingStepAnswer(key, step, deps.isLatched, restart)
-      }
-      return pendingOnlyAnswer(row.state, restart)
+  // b.jg5 SRJ-410: the whole run is a retry of the persona's timer, in either
+  // mode (`runInTimerRetry`), so the pending-row rule may run once in it.
+  return (key, attempt) => runInTimerRetry(key, () => retryActionRun(deps, key, attempt))
+}
+
+/** One run of the retry action (`createFullModeRetryAction`) for persona `key`, inside its retry marker. */
+async function retryActionRun(
+  deps: FullModeRetryDeps,
+  key: string,
+  attempt: UnavailableRetryAttempt,
+): Promise<UnavailableRetryOutcome> {
+  if (deps.isShuttingDown()) return stopWith(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
+  const persona = deps.appliedPersona(key)
+  // b.av2 SR-8.6 (b.jg5 SRJ-1512): a retry does nothing for a key outside
+  // the applied set. Its one exception, an old-life wait's kill and
+  // find-missing steps on a retired key (SRJ-811), runs in the session
+  // manager's live-row sequence registry, never on this timer, and never
+  // launches that key; no timer is armed for the old key.
+  if (persona === undefined) return stopWith(UNAVAILABLE_RETRY_STOP_NOT_APPLIED)
+  if (latched(key, deps.isLatched)) return stopWith(UNAVAILABLE_RETRY_STOP_LATCHED)
+  // b.jg5 SRJ-207, SRJ-303: no attempt while the persona is held on ErrInvalidFlags.
+  if (held(key, deps.isHeld)) return stopWith(UNAVAILABLE_RETRY_STOP_HELD)
+  if (!deps.canRelaunch(key)) return stopWith(UNAVAILABLE_RETRY_STOP_NOT_UP)
+  if (deps.isAtCap(key)) return stopWith(UNAVAILABLE_RETRY_STOP_CAPPED)
+  const cwd = persona.working_directory
+  if (attempt.mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY) {
+    if (inFlight(key, deps.isInFlight)) {
+      // b.jg5 SRJ-303: the again-reason names what blocks the retry.
+      const reason = retryBlockAgainReason(readRetryBlockCause(key, deps.retryBlockCause))
+      return { kind: 'again', reason, row: UNAVAILABLE_RETRY_ROW_PENDING }
     }
-    const outcome = await deps.retry(key, cwd, deps.isInFlight, deps.retryBlockCause)
-    // Since b.jg5 E9, `already-connected` is answered only for a `live`
-    // reading (never `pending`) whose session is connected with its stream.
-    if (outcome === 'already-connected') endCondition(key, LIVENESS_LIVE, deps.endTmuxUnresponsive)
-    return answerFor(outcome, () => readRetryBlockCause(key, deps.retryBlockCause))
+    const row = await runInAttempt(key, 'recovery', () => deps.readRow(key))
+    // b.jg5 SRJ-305, SRJ-512, SRJ-513: a row read that latched the persona
+    // stops the timer with the latch's reason; nothing is handed to the
+    // restart path. A configured persona's own `pending` row with no launch
+    // start latches at that read, so it never reaches `pendingOnlyAnswer`;
+    // a row under an unconfigured key latches nothing and still does.
+    if (latched(key, deps.isLatched)) return stopWith(UNAVAILABLE_RETRY_STOP_LATCHED)
+    if (isLiveOutOfPending(row.state) && probe(key, deps.isSessionConnected) && probe(key, deps.hasSessionStream)) {
+      endCondition(key, row.state, deps.endTmuxUnresponsive)
+    }
+    const restart = (): Promise<unknown> => deps.retry(key, cwd, deps.isInFlight, deps.retryBlockCause)
+    // b.jg5 SRJ-409, SRJ-411: a `pending` row is decided by the pending-row
+    // step's one `get`, whose row supersedes this `status` read's (the
+    // carried launch start included; ageing at the retries is the
+    // pending-row rule's).
+    if (row.state === UNAVAILABLE_RETRY_ROW_PENDING && deps.stepPendingRow !== undefined) {
+      const stepPendingRow = deps.stepPendingRow
+      const step = await runInAttempt(key, 'recovery', () => stepPendingRow(key))
+      return pendingStepAnswer(key, step, deps.isLatched, restart)
+    }
+    return pendingOnlyAnswer(row.state, restart)
   }
+  const outcome = await deps.retry(key, cwd, deps.isInFlight, deps.retryBlockCause)
+  // Since b.jg5 E9, `already-connected` is answered only for a `live`
+  // reading (never `pending`) whose session is connected with its stream.
+  if (outcome === 'already-connected') endCondition(key, LIVENESS_LIVE, deps.endTmuxUnresponsive)
+  return answerFor(outcome, () => readRetryBlockCause(key, deps.retryBlockCause))
 }
 
 /** True when `state` is a live row state other than `pending`. */
@@ -2243,7 +2262,9 @@ export async function runInAttempt<T>(
  * attempt-scoped, `src/outage-state.ts`).
  */
 export function runOutsideAttempts<T>(fn: () => T): T {
-  return attemptContext.exit(fn)
+  // Outside every retry too: work a retry starts and does not await (a
+  // dialog approver, a live-row sequence) is no retry of the timer.
+  return attemptContext.exit(() => timerRetryContext.exit(fn))
 }
 
 /**
@@ -2257,6 +2278,93 @@ export function runOutsideAttempts<T>(fn: () => T): T {
  */
 export function runDetachedRecoveryAttempt<T>(key: string, fn: () => Promise<T>): Promise<T> {
   return runOutsideAttempts(() => runInAttempt(key, 'recovery', fn))
+}
+
+// ---------------------------------------------------------------------------
+// The retry marker (b.jg5 SRJ-410, SRJ-303)
+// ---------------------------------------------------------------------------
+
+/**
+ * One retry of a persona's retry timer as the marker holds it: its parent
+ * is the nearest retry still running when it was started, if any; `ruleRan`
+ * is set by the first pending-row rule run claimed in it.
+ */
+interface TimerRetryFrame {
+  readonly key: string
+  readonly parent: TimerRetryFrame | undefined
+  /** False once the retry's function has settled; a continuation that outlives it is then outside it. */
+  open: boolean
+  ruleRan: boolean
+}
+
+/**
+ * The retry of a persona's retry timer the current call runs in (b.jg5
+ * SRJ-410: the pending-row rule runs only inside one, in either mode),
+ * carried across awaits, timers and microtasks by `AsyncLocalStorage`, as
+ * the attempt context is. Set by the retry action (`createFullModeRetryAction`)
+ * around its whole run, in both modes; `runOutsideAttempts` leaves it, so a
+ * dialog approver or a live-row sequence a retry starts is outside it. It
+ * holds only the running retries' frames.
+ */
+const timerRetryContext = new AsyncLocalStorage<TimerRetryFrame>()
+
+/**
+ * Run `fn` as a retry of persona `key`'s retry timer (b.jg5 SRJ-303,
+ * SRJ-410), and settle with its result: inside `fn`, and in every await it
+ * makes, `isInsideTimerRetry(key)` answers true, and the pending-row rule
+ * may be run once (`claimTimerRetryRuleRun`). A continuation of `fn` that
+ * outlives it (a timer it set, the hand-off run the controller makes after
+ * the action answered) is outside the retry.
+ */
+export async function runInTimerRetry<T>(key: string, fn: () => T | Promise<T>): Promise<T> {
+  let parent = timerRetryContext.getStore()
+  while (parent !== undefined && !parent.open) parent = parent.parent
+  const frame: TimerRetryFrame = { key, parent, open: true, ruleRan: false }
+  try {
+    return await timerRetryContext.run(frame, fn)
+  } finally {
+    frame.open = false
+  }
+}
+
+/** The innermost running retry for persona `key` the current call is inside, if any. */
+function innermostRetryFrame(key: string): TimerRetryFrame | undefined {
+  for (let frame = timerRetryContext.getStore(); frame !== undefined; frame = frame.parent) {
+    if (frame.open && frame.key === key) return frame
+  }
+  return undefined
+}
+
+/**
+ * True when the current call runs inside a retry of persona `key`'s retry
+ * timer, in either mode (b.jg5 SRJ-410: the restart path's deferral and the
+ * ladder's `pending` step run the pending-row rule only then; reached from
+ * any other origin they only arm). Read-only; never throws.
+ */
+export function isInsideTimerRetry(key: string): boolean {
+  try {
+    return innermostRetryFrame(key) !== undefined
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Claim the one pending-row rule run of the retry of persona `key`'s timer
+ * the current call runs in (b.jg5 SRJ-410: at most one rule run per retry,
+ * even when a retry reaches both the restart path's deferral and the
+ * ladder's `pending` step): true the first time in a retry, false after,
+ * and false outside every retry for `key`. Never throws.
+ */
+export function claimTimerRetryRuleRun(key: string): boolean {
+  try {
+    const frame = innermostRetryFrame(key)
+    if (frame === undefined || frame.ruleRan) return false
+    frame.ruleRan = true
+    return true
+  } catch {
+    return false
+  }
 }
 
 /** A live view of `frame`: its `lastError` reads the frame's current record. */

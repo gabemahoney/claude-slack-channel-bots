@@ -18,7 +18,8 @@
  * verdict), no action (b.jdc's ladder action), a positive-idle fold that
  * also needs the transcript (the working-row verdict and the launch wait's
  * evidence read), the reconnect (the waiting-row check) or Enter (the dialog
- * approver). The backstop is the `send-keys` that follows, which
+ * approver and the pending-row rule's lap). The backstop is the `send-keys`
+ * that follows, which
  * agent-director answers by the row's current launch and which types nothing
  * when it refuses:
  *   - the reconnect's `/mcp reconnect` (`reconnectMcpWithCause`) on a live
@@ -28,7 +29,11 @@
  *     never retried (SRJ-118, SRJ-505);
  *   - the approver's Enter on a `pending` row answers
  *     `ErrSpawnNotInteractive`: the approver stops with nothing typed, no
- *     kill and one log line (b.jg5 SRJ-404).
+ *     kill and one log line (b.jg5 SRJ-404);
+ *   - the pending-row rule's lap Enter (`sendPendingRowLapEnter`) on a
+ *     `pending` row answers `ErrSpawnNotInteractive` the same way: nothing
+ *     is typed, the lap ends, no further lap is made on that launch, and the
+ *     rule's run goes on (b.jg5 SRJ-410).
  * A pane that leads to a deferral or to no action is followed by no
  * keystroke at all; once a later tick reads the row `waiting`, or shows a
  * `working` row stale, the reconnect's `send-keys` is the backstop again.
@@ -43,7 +48,9 @@
  * verdict (`promptRowReconnectVerdict` in `src/server.ts`) and the ladder
  * action (`launchOnPromptRow`), which read with the one-line probe count
  * ({@link PROBE_PANE_READ_LINES}); both of b.jdc's columns of SRJ-117's
- * table are built. b.jg5 SRJ-117 holds the full table of sites
+ * table are built; and the pending-row rule's lap (`readPendingRowLapPane`,
+ * 40 lines, the only read made with `allow_pending`), whose pane leads at
+ * most to Enter. b.jg5 SRJ-117 holds the full table of sites
  * that read a persona's pane and how each handles each outcome. The dialog
  * approver (`approvePreSessionDialogs`) keeps its own classification and
  * does not use this module.
