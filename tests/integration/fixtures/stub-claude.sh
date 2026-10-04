@@ -85,14 +85,18 @@ ensure_transcript() {
 # into --settings. Firing these is how we deterministically move the AD row
 # (pending→waiting on SessionStart, waiting→ended on SessionEnd) — pure DB
 # writes, no /proc probe (b.vub: find-missing is unreliable under Linux/gosu).
+# A hook entry may carry its arguments in a separate `args` array (agent-director
+# 0.11.0 injects `"command": "<binary>", "args": ["hook"]`); Claude Code runs
+# the command with those arguments, so the stub appends them too.
 # ---------------------------------------------------------------------------
+HOOK_CMD_JQ='select(.command) | [.command] + (.args // []) | join(" ")'
 START_HOOK_CMD=""
 END_HOOK_CMD=""
 if [[ -n "${SETTINGS_JSON}" ]]; then
     START_HOOK_CMD=$(printf '%s' "${SETTINGS_JSON}" \
-        | jq -r '.hooks.SessionStart[0].hooks[0].command // empty' 2>/dev/null || true)
+        | jq -r ".hooks.SessionStart[0].hooks[0] | ${HOOK_CMD_JQ}" 2>/dev/null || true)
     END_HOOK_CMD=$(printf '%s' "${SETTINGS_JSON}" \
-        | jq -r '.hooks.SessionEnd[0].hooks[0].command // empty' 2>/dev/null || true)
+        | jq -r ".hooks.SessionEnd[0].hooks[0] | ${HOOK_CMD_JQ}" 2>/dev/null || true)
 fi
 
 # Sentinel line the driver sends via `agent-director send-keys` to request a
