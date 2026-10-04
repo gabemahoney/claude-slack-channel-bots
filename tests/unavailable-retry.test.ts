@@ -196,10 +196,10 @@
  * `armPendingOnly` and the reporting point refusing every cause inside it
  * while the persona is latched, an attempt recording the error as not armed,
  * and arming as ever once the latch has cleared; and, on the harness, the
- * restart work's arm hook not called on an `unknown` reading and every
- * no-information answer, under a launch attempt opened in the re-check,
- * arming nothing and feeding no unclassified-error episode. The wrappers'
- * side is tests/outage-state.test.ts's.
+ * restart work's arm hook not called on an `unknown` reading. The wrappers'
+ * side (every no-information answer at each place in the re-check, a launch
+ * attempt opened in it included, reaching no trigger, condition or
+ * unclassified sink) is tests/outage-state.test.ts's.
  * Only the pin case holds the SRD's numbers; every other case derives its
  * waits from the exported base and ceiling through `doublingBackoffDelay`. No
  * retry timer is real; the only real-time waits are the spawn path's 1 ms
@@ -600,7 +600,6 @@ import {
   type PendingRowModel,
   type PendingRowModelOptions,
 } from './test-helpers/pending-row-model.ts'
-import { withSpawnDetection } from '../src/outage-state.ts'
 import {
   UNAVAILABLE_RETRY_ANY_CONTEXT_CAUSES,
   holdsLatchRecheckPermit,
@@ -610,6 +609,7 @@ import {
   runInLatchRecheck,
   type LatchRecheckPermit,
   type LatchRecheckScope,
+  unavailableRetryNotArmedInLatchRecheckLine,
 } from '../src/unavailable-retry.ts'
 
 const KEY = 'alpha'
@@ -9738,9 +9738,10 @@ describe('unavailable retry: the run-now entry (SRJ-810: an old-life hold that e
 // ---------------------------------------------------------------------------
 // The latch re-check's no-information scope (b.jg5 SRJ-505, SRJ-502,
 // SRJ-313): its queries, the bare controller and the reporting point inside
-// it, and on the harness the restart work's arm hook and the
-// unclassified-error episode. The scope's latch query is a stand-in each
-// case clears; the re-check round end to end is tests/conflict-latch.test.ts's.
+// it, and on the harness the restart work's arm hook. The wrappers inside the
+// scope are tests/outage-state.test.ts's. The scope's latch query is a
+// stand-in each case clears; the re-check round end to end is
+// tests/conflict-latch.test.ts's.
 // ---------------------------------------------------------------------------
 
 /** A latch re-check scope for `key`, carrying `permit` when given, over a stand-in latch query: latched until `clear()`. */
@@ -9751,11 +9752,6 @@ function standInLatch(key: string, permit?: LatchRecheckPermit): { readonly scop
     clear: () => { latched = false },
     relatch: () => { latched = true },
   }
-}
-
-/** The controller's one line for an arm of persona `key` with a cause of `kind` refused inside its latch re-check. */
-function notArmedInRecheckLine(key: string, kind: string): string {
-  return `[slack] unavailable-retry: persona=${key} not armed (${kind}) — inside its latch re-check, an answer gives no information`
 }
 
 /** Where a call runs in KEY's re-check. */
@@ -9942,7 +9938,7 @@ describe('unavailable retry: nothing arms a persona\'s timer inside its latch re
 
       expect({ place, ...result }).toEqual({ place, answered: refused, other: true })
       expect({ place, armed: controller.armedKeys(), view: controller.view(KEY), timers: delays(clock) }).toEqual({ place, armed: [OTHER], view: undefined, timers: [waitMs(0)] })
-      expect({ place, lines: lines.filter((line) => line.includes(`persona=${KEY} `)) }).toEqual({ place, lines: [notArmedInRecheckLine(KEY, kind)] })
+      expect({ place, lines: lines.filter((line) => line.includes(`persona=${KEY} `)) }).toEqual({ place, lines: [unavailableRetryNotArmedInLatchRecheckLine(KEY, kind)] })
     }
   })
 
@@ -9960,7 +9956,7 @@ describe('unavailable retry: nothing arms a persona\'s timer inside its latch re
     })
 
     expect(controller.view(KEY)).toEqual(before)
-    expect(lines.slice(linesBefore)).toEqual([notArmedInRecheckLine(KEY, UNAVAILABLE_RETRY_CAUSE_CONFIG)])
+    expect(lines.slice(linesBefore)).toEqual([unavailableRetryNotArmedInLatchRecheckLine(KEY, UNAVAILABLE_RETRY_CAUSE_CONFIG)])
   })
 
   test('once KEY\'s latch has cleared, in the same re-check, arm and armPendingOnly arm as ever, with no not-armed line', async () => {
@@ -10037,40 +10033,5 @@ describe('unavailable retry: nothing arms a persona\'s timer inside its latch re
     expect(hooked).toEqual([key])
     expect(h.controller.view(key)?.causes).toContain(UNAVAILABLE_RETRY_CAUSE_READ_ERROR)
     expectUntouched(h, other)
-  })
-
-  /** A no-information answer met in a launch attempt opened in the re-check: `[name, its call, its value]`. */
-  const HARNESS_ANSWERS: ReadonlyArray<readonly [string, 'read-pane' | 'status' | 'spawn' | 'resume', () => Error, string]> = [
-    ['UNAVAILABLE (ErrTmuxUnresponsive) from a read-pane probe', 'read-pane', () => errTmuxUnresponsive('read-pane'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
-    ['a failed read of the row (ErrCallTimeout from status)', 'status', () => errCallTimeout('status'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
-    ['ENVIRONMENT (ErrTmuxNotAvailable) from a resume retry', 'resume', () => errTmuxNotAvailable(undefined, 'resume'), UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
-    ['CONFIG (ErrConfigMalformed) from a spawn retry', 'spawn', () => errConfigMalformed(), UNAVAILABLE_RETRY_CAUSE_CONFIG],
-    ...UNCLASSIFIED_ERRORS.map(([what, make]) => [`UNCLASSIFIED (${what}) from a spawn retry`, 'spawn', () => make('spawn'), UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED] as const),
-  ]
-
-  test.each(HARNESS_ANSWERS)('on the harness, %s in a launch attempt opened in the re-check of a latched persona arms no trigger and no timer, starts no tmux-unresponsive condition and feeds no unclassified-error episode; once its latch has cleared, the same answer arms its cause as ever (an UNCLASSIFIED one beginning the episode)', async (_what, call, make, kind) => {
-    const h = (harness = makeRecoveryHarness())
-    const [key, other] = h.keys as [string, string]
-    const latch = standInLatch(key)
-    const meet = (err: Error): Promise<unknown> => runInLatchRecheck(latch.scope, () =>
-      runInAttempt(key, 'launch', () => {
-        const wrap = call === 'spawn' || call === 'resume' ? withSpawnDetection : withOutageDetection
-        return wrap(key, personaOf(h, key).working_directory, call, async () => { throw err }).catch((rejected: unknown) => rejected)
-      }))
-
-    const err = make()
-    expect(await meet(err)).toBe(err)
-    expect({ triggers: h.triggers, armed: h.controller.isArmed(key), condition: h.tmuxUnresponsive.holds(key), conditionLines: conditionLines(h, key) })
-      .toEqual({ triggers: [], armed: false, condition: false, conditionLines: [] })
-    expect({ episode: h.unclassifiedErrorOpen(key), lines: unclassifiedLines(h, key), posts: h.episodeNotices }).toEqual({ episode: false, lines: [], posts: [] })
-    expect(getOutageFlags(key).has('tmux-unavailable')).toBe(false)
-
-    latch.clear()
-    const again = make()
-    expect(await meet(again)).toBe(again)
-    expect(h.triggers).toEqual([{ key, kind }])
-    expect(h.controller.view(key)?.causes).toEqual([kind])
-    expect(h.unclassifiedErrorOpen(key)).toBe(kind === UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED)
-    expectUntouchedEpisode(h, other)
   })
 })

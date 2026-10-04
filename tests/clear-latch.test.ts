@@ -34,7 +34,10 @@
  *   (`fakeHttp`, below: fake `node:http` request and response emitters) for
  *   its options, body, answer and each way it rejects, and once for real
  *   against the port-0 listener with `HTTP_PROXY`/`http_proxy` naming a
- *   closed proxy, restored in `finally`.
+ *   proxy the case holds that answers nothing and counts each connection
+ *   (`holdResettingListener`, below), restored in `finally`. The same holder
+ *   keeps a stopped server's released port, so the command's "cannot reach"
+ *   run never dials a port another process may have taken.
  *
  * Every value compared (the route, the log lines, the causes, the cap, the
  * command's lines and wait) comes from src/; the response bodies are the
@@ -50,6 +53,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, te
 import { EventEmitter } from 'node:events'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import type { ClientRequest, IncomingMessage, RequestOptions } from 'node:http'
+import { createServer as createTcpServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -222,11 +226,11 @@ function bodyOfBytes(bytes: number): string {
 // does. Never port 3100. Start it in `beforeAll` and stop it in `afterAll`.
 // ---------------------------------------------------------------------------
 
-/** A running `/clear-latch` listener: its bound port, the route's URL and its stop. */
+/** A running `/clear-latch` listener: its bound port, the route's URL and its stop (settled once the port is released). */
 interface ClearLatchServer {
   readonly port: number
   readonly url: string
-  stop(): void
+  stop(): Promise<void>
 }
 
 /**
@@ -243,6 +247,43 @@ function startClearLatchServer(depsFor: () => ClearLatchDeps): ClearLatchServer 
   const port = server.port
   if (port === undefined) throw new Error('startClearLatchServer: no bound port')
   return { port, url: `http://127.0.0.1:${port}${CLEAR_LATCH_ROUTE}`, stop: () => server.stop(true) }
+}
+
+/** A loopback TCP listener the case holds: every connection it accepts is counted and closed unanswered. */
+interface ResettingListener {
+  readonly port: number
+  /** How many connections it has accepted. */
+  hits(): number
+  close(): Promise<void>
+}
+
+/**
+ * Hold `port` (port 0: a fresh one) on {@link CLEAR_LATCH_DIAL_HOST} with a
+ * listener that answers nothing: each connection is counted and destroyed, so
+ * a request sent there fails and the case can tell it was sent there. While
+ * it is held no other process can take the port. Rejects when the port cannot
+ * be bound.
+ */
+async function holdResettingListener(port = 0): Promise<ResettingListener> {
+  let hits = 0
+  const listener = createTcpServer((socket) => {
+    hits += 1
+    socket.destroy()
+  })
+  await new Promise<void>((resolve, reject) => {
+    listener.once('error', reject)
+    listener.listen(port, CLEAR_LATCH_DIAL_HOST, () => {
+      listener.off('error', reject)
+      resolve()
+    })
+  })
+  const address = listener.address()
+  if (address === null || typeof address === 'string') throw new Error('holdResettingListener: no bound TCP port')
+  return {
+    port: address.port,
+    hits: () => hits,
+    close: () => new Promise<void>((resolve) => listener.close(() => resolve())),
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -423,8 +464,8 @@ describe('POST /clear-latch: the route', () => {
     beforeAll(() => {
       server = startClearLatchServer(() => deps())
     })
-    afterAll(() => {
-      server.stop()
+    afterAll(async () => {
+      await server.stop()
     })
 
     test('a POST naming A by key → 200 with the clear\'s answer; only A is cleared', async () => {
@@ -1286,7 +1327,7 @@ describe('clear-latch: the command (SRJ-509; SRJ-510\'s CLI half)', () => {
       expect(stderr).toEqual([clearLatchCliNotConfirmedLine()])
     })
 
-    test('over real HTTP: the production dial reaches the handler on 127.0.0.1 at the recorded port; once the server stops, the same run cannot reach it', async () => {
+    test('over real HTTP: the production dial reaches the handler on 127.0.0.1 at the recorded port; once the server stops, the same run cannot reach it (the port held by a listener that answers nothing)', async () => {
       /** The production dial, its failures recorded, with a sleep that ends once the dial has settled (no real timer). */
       function loopback(failures: unknown[]): CliRunOptions {
         const settled = Promise.withResolvers<void>()
@@ -1313,18 +1354,26 @@ describe('clear-latch: the command (SRJ-509; SRJ-510\'s CLI half)', () => {
         expect(live).toMatchObject({ code: 0, stderr: [clearLatchCliClearedLine(A_NAME)], dials: [[port, A_NAME]] })
         expect(clearCalls).toEqual([A_KEY])
       } finally {
-        server.stop()
+        await server.stop()
       }
 
-      const failures: unknown[] = []
-      const gone = await runClearLatch([A_NAME], loopback(failures))
-      expect(failures).toHaveLength(1)
-      expect(gone).toMatchObject({
-        code: 1,
-        stderr: [clearLatchCliNotAnsweredLine(describeThrownValue(failures[0]))],
-        dials: [[port, A_NAME]],
-      })
-      expect(clearCalls).toEqual([A_KEY])
+      // The released port is held at once, so no other process can take it and answer the dial.
+      const holder = await holdResettingListener(port)
+      try {
+        const failures: unknown[] = []
+        const gone = await runClearLatch([A_NAME], loopback(failures))
+        expect(failures).toHaveLength(1)
+        expect(gone).toMatchObject({
+          code: 1,
+          stderr: [clearLatchCliNotAnsweredLine(describeThrownValue(failures[0]))],
+          dials: [[port, A_NAME]],
+        })
+        expect(clearCalls).toEqual([A_KEY])
+        // Not vacuous: the dial went to the recorded port, and found no handler there.
+        expect(holder.hits()).toBeGreaterThan(0)
+      } finally {
+        await holder.close()
+      }
     })
   })
 })
@@ -1443,19 +1492,31 @@ describe('dialClearLatch: the production dial', () => {
     await expect(dialled).rejects.toBe(err)
   })
 
-  test('a response aborted before its end rejects, and an end after it answers nothing', async () => {
-    const http = fakeHttp()
-    const dialled = dialClearLatch(3101, A_NAME, http.requestFn)
-    const res = http.respond(200)
+  test('a response aborted before its end rejects at the abort, with no end: a plain Error of the dial\'s own naming neither the persona nor the body read; the same body ended with no abort is answered', async () => {
     const truncated = okBody(A_NAME, true).slice(0, 8)
+
+    const aborted = fakeHttp()
+    const dialled = dialClearLatch(3101, A_NAME, aborted.requestFn)
+    const res = aborted.respond(200)
     res.emit('data', Buffer.from(truncated, 'utf-8'))
     res.emit('aborted')
-    res.emit('end')
+    // No `end` follows: the abort alone settles the dial (a dial waiting for an end would never settle).
     const failure = await dialled.then(
-      (answer) => answer,
+      (answer) => ({ answered: answer }),
       (err: unknown) => err,
     )
     expect(failure).toBeInstanceOf(Error)
+    expect(Object.getPrototypeOf(failure)).toBe(Error.prototype)
+    const message = (failure as Error).message
+    expect({ persona: message.includes(A_NAME), body: message.includes(truncated) }).toEqual({ persona: false, body: false })
+
+    // Control: the same body, ended with no abort, is answered as read.
+    const ended = fakeHttp()
+    const answered = dialClearLatch(3101, A_NAME, ended.requestFn)
+    const endedRes = ended.respond(200)
+    endedRes.emit('data', Buffer.from(truncated, 'utf-8'))
+    endedRes.emit('end')
+    expect(await answered).toEqual({ status: 200, body: truncated })
   })
 
   test('a proxy in HTTP_PROXY and http_proxy, with no NO_PROXY, is not used: the dial still reaches the real handler on 127.0.0.1 (SRJ-510)', async () => {
@@ -1469,12 +1530,13 @@ describe('dialClearLatch: the production dial', () => {
       env[name] = ''
       delete env[name]
     }
-    // A closed port: a request sent through this proxy cannot connect.
-    const closedProxy = `http://${CLEAR_LATCH_DIAL_HOST}:9`
+    // The proxy is a listener the case holds, answering nothing: a request sent through it fails, and is counted.
+    const proxy = await holdResettingListener()
+    const proxyUrl = `http://${CLEAR_LATCH_DIAL_HOST}:${proxy.port}`
     const server = startClearLatchServer(() => deps())
     try {
-      env.HTTP_PROXY = closedProxy
-      env.http_proxy = closedProxy
+      env.HTTP_PROXY = proxyUrl
+      env.http_proxy = proxyUrl
       unset('NO_PROXY')
       unset('no_proxy')
 
@@ -1489,14 +1551,19 @@ describe('dialClearLatch: the production dial', () => {
       )
       expect(viaFetch).toBeInstanceOf(Error)
       expect(clearCalls).toEqual([])
+      const proxyHitsByFetch = proxy.hits()
+      expect(proxyHitsByFetch).toBeGreaterThan(0)
 
       const answer = await dialClearLatch(server.port, A_NAME)
       const body: unknown = JSON.parse(answer.body)
       bodies.push(body)
       expect({ status: answer.status, body }).toEqual({ status: 200, body: { ok: true, persona: A_NAME, cleared: true } })
       expect(clearCalls).toEqual([A_KEY])
+      // The dial never touched the proxy.
+      expect(proxy.hits()).toBe(proxyHitsByFetch)
     } finally {
-      server.stop()
+      await server.stop()
+      await proxy.close()
       for (const [name, value] of saved) {
         if (value === undefined) unset(name)
         else env[name] = value

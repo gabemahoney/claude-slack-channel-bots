@@ -286,16 +286,28 @@ describe('agent-director-versions helper', () => {
     expect(MIN_CLAUDE_CODE_VERSION).toMatch(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/)
   })
 
-  test('no tests/ TypeScript file but the helper writes MIN_CLAUDE_CODE_VERSION in code (comments stripped)', () => {
-    const testsDir = import.meta.dir
-    const helper = join('test-helpers', 'agent-director-versions.ts')
-    const codeOf = (rel: string): string => stripComments(readFileSync(join(testsDir, rel), 'utf-8'))
-    const files = readdirSync(testsDir, { recursive: true, encoding: 'utf-8' })
+  /** Every TypeScript file under `dir`, relative to it, and a reader of one's code with its comments stripped. */
+  function typeScriptCodeIn(dir: string): { readonly files: string[]; codeOf(rel: string): string } {
+    const files = readdirSync(dir, { recursive: true, encoding: 'utf-8' })
       .filter((rel) => /\.[cm]?tsx?$/.test(rel) && !rel.split(sep).includes('node_modules'))
+    return { files, codeOf: (rel) => stripComments(readFileSync(join(dir, rel), 'utf-8')) }
+  }
+
+  test('no tests/ TypeScript file but the helper writes MIN_CLAUDE_CODE_VERSION in code (comments stripped)', () => {
+    const helper = join('test-helpers', 'agent-director-versions.ts')
+    const { files, codeOf } = typeScriptCodeIn(import.meta.dir)
     // Not vacuous: the scan reads the helper, and the needle is found in its code.
     expect(files).toContain(helper)
     expect(codeOf(helper)).toContain(MIN_CLAUDE_CODE_VERSION)
     expect(files.filter((rel) => rel !== helper && codeOf(rel).includes(MIN_CLAUDE_CODE_VERSION)).sort()).toEqual([])
+  })
+
+  test('no src/ TypeScript file writes MIN_CLAUDE_CODE_VERSION in code (comments stripped): no src/ module defines or reads a Claude Code version', () => {
+    const { files, codeOf } = typeScriptCodeIn(join(import.meta.dir, '..', 'src'))
+    // Not vacuous: the scan reads src/, the gate module included.
+    expect(files).toContain('ad-version-gate.ts')
+    expect(codeOf('ad-version-gate.ts')).toContain('PHASE1_FLOOR_VERSION')
+    expect(files.filter((rel) => codeOf(rel).includes(MIN_CLAUDE_CODE_VERSION)).sort()).toEqual([])
   })
 })
 

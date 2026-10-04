@@ -30,7 +30,8 @@
  * reads a Claude Code version, and every test that needs it (a fixture's
  * recorded version, the runbook, docs and `Dockerfile.live` pin checks)
  * imports it from here. `tests/ad-version-gate.test.ts` checks that no other
- * `tests/` TypeScript file writes its value in code.
+ * `tests/` TypeScript file, and no `src/` TypeScript file, writes its value
+ * in code (comments stripped).
  *
  * Starts no process and holds no value import of `Client` or
  * `resolveSystemBinary` (host-safety audit, b.jg5 SRJ-1301). It imports only
@@ -63,7 +64,8 @@ export const DEV_UNPARSEABLE_VERSION = 'dev'
  * The minimum Claude Code version agent-director states for its exec-form
  * hooks, having checked its hooks on it, and the version the fleet runs
  * (RN-9; HO rev 31). Exec-form hooks (`command` with `args`) need Claude Code
- * 2.1.139 or later. The one place this value is written in `tests/`.
+ * 2.1.139 or later. The one place this value is written in `tests/` or
+ * `src/` code.
  */
 export const MIN_CLAUDE_CODE_VERSION = '2.1.280'
 

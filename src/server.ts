@@ -3473,6 +3473,11 @@ export async function main(): Promise<void> {
     appliedConfig: () => personaConfig,
     log: (line) => console.error(line),
     episodes: noticeEpisodes,
+    // b.av2 SR-6.4: a round's launch asks the relaunch gate the restart path
+    // asks. It is built below; the first round comes 120 s after a latch,
+    // and a round that asks before it is built finds it throwing, which the
+    // round reads as not up (no launch).
+    canRelaunch: (key) => canRelaunch(key),
   })
   latchRecheckTimers = latchRecheck
   bindLatchRecheck(conflictLatch, latchRecheck)

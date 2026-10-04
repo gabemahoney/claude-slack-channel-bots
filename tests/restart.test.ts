@@ -5281,11 +5281,14 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
 // real-timer exception.
 // ---------------------------------------------------------------------------
 
+/** The retry entry's line for persona `key` at the restart cap. */
+const capSkipLine = (key: string): string =>
+  `[slack] Restart retry skipped for persona=${key} — the persona is at the restart cap; nothing killed or launched`
+
 describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the delay gate or a restart timer', () => {
   const P = 'persona_p'
   const CWD = '/cwd/p'
   const skipLine = `[slack] Restart retry skipped for persona=${P} — a launch is in flight; no agent-director call`
-  const capSkipLine = `[slack] Restart retry skipped for persona=${P} — the persona is at the restart cap; nothing killed or launched`
   let errLines: string[]
   let errArgs: unknown[][]
   let origConsoleError: typeof console.error
@@ -5519,14 +5522,14 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
     // b.jg5 SRJ-110, SRJ-314: no kill for a `dead` reading that is no install-gone one.
     expect(deps.killSessionCalls).toEqual([])
     expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([P, P])
-    expect(errLines).not.toContain(capSkipLine)
+    expect(errLines).not.toContain(capSkipLine(P))
 
     expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_CAPPED)
     expect(getFailureCount(P)).toBe(RESTART_FAILURE_CAP)
     expect(deps.onCapReachedCalls).toEqual([P])
     expect(deps.killSessionCalls).toEqual([])
     expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([P, P])
-    expect(errLines.filter((l) => l === capSkipLine)).toHaveLength(1)
+    expect(errLines.filter((l) => l === capSkipLine(P))).toHaveLength(1)
   })
 
   test('cap re-check: a retry for P already at RESTART_FAILURE_CAP answers capped after the in-flight check, with no shutdown or not-up check, no probe, reconnect, kill or launch, nothing counted, no notice, and one skip line', async () => {
@@ -5545,7 +5548,7 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
     expect(getFailureCount(P)).toBe(RESTART_FAILURE_CAP)
     expect(deps.onCapReachedCalls).toEqual([])
     expect(isRestartPendingOrActive(P)).toBe(false)
-    expect(errLines).toEqual([capSkipLine])
+    expect(errLines).toEqual([capSkipLine(P)])
   })
 
   test('cap re-check: two retries queued through serialize one failure short of the cap — the first\'s launch fails and answers capped; the second answers capped with no launch (exactly one launch, one notice)', async () => {
@@ -5573,7 +5576,7 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
     expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([P])
     expect(getFailureCount(P)).toBe(RESTART_FAILURE_CAP)
     expect(deps.onCapReachedCalls).toEqual([P])
-    expect(errLines.filter((l) => l === capSkipLine)).toHaveLength(1)
+    expect(errLines.filter((l) => l === capSkipLine(P))).toHaveLength(1)
     expect(isRestartPendingOrActive(P)).toBe(false)
   })
 
@@ -5610,7 +5613,7 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
     expect(getFailureCount(P)).toBe(RESTART_FAILURE_CAP)
     expect(deps.onCapReachedCalls).toEqual([P])
     expect(inFlightAsked).toEqual([P])
-    expect(errLines.filter((l) => l === capSkipLine)).toHaveLength(1)
+    expect(errLines.filter((l) => l === capSkipLine(P))).toHaveLength(1)
     await flush()
     expect(isRestartPendingOrActive(P)).toBe(false)
   })
@@ -9303,15 +9306,13 @@ describe('b.jg5 SRJ-506: runRestartRetryInTurn is the retry entry\'s gates and w
 
   /** One gate: how the deps and the in-flight query are set, the outcome, and the one skip line. */
   type Gate = readonly [string, (deps: ReturnType<typeof makeDeps>) => void, boolean, RestartRetryOutcome, string]
-  const latchedLine = `[slack] Skipping restart for persona=${P} — the persona is latched; no agent-director call, nothing recorded (b.jg5 SRJ-502)`
   const heldLine = `[slack] Skipping restart for persona=${P} — the persona is held on ErrInvalidFlags; no agent-director call, nothing recorded (b.jg5 SRJ-207)`
-  const capLine = `[slack] Restart retry skipped for persona=${P} — the persona is at the restart cap; nothing killed or launched`
   const GATES: Gate[] = [
     // Each gate is checked first among the later ones: every later one also holds.
-    ['latched (held, in flight and capped too)', (deps) => { deps.isLatched = () => true; deps.isHeld = () => true }, true, RESTART_OUTCOME_LATCHED, latchedLine],
+    ['latched (held, in flight and capped too)', (deps) => { deps.isLatched = () => true; deps.isHeld = () => true }, true, RESTART_OUTCOME_LATCHED, latchedSkipLine(P)],
     ['held on ErrInvalidFlags (in flight and capped too)', (deps) => { deps.isHeld = () => true }, true, RESTART_OUTCOME_HELD, heldLine],
     ['blocked by its live-row sequence (capped too)', () => {}, true, RESTART_OUTCOME_IN_FLIGHT, restartRetrySkippedLine(P, RETRY_BLOCK_LIVE_ROW_SEQUENCE)],
-    ['at the restart cap', () => {}, false, RESTART_OUTCOME_CAPPED, capLine],
+    ['at the restart cap', () => {}, false, RESTART_OUTCOME_CAPPED, capSkipLine(P)],
   ]
 
   test.each(GATES)('%s: the same outcome and skip line as runRestartRetry, no probe, kill or launch, nothing counted, no submission, and P inactive after', async (_label, setUp, inFlight, outcome, line) => {

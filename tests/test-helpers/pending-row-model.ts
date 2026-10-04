@@ -359,12 +359,16 @@ export const PENDING_ROW_RESTORES: readonly PendingRowRestore[] = Object.freeze(
   PENDING_ROW_RESTORE_STAYS_PENDING,
 ] as const)
 
-if (RESTORE_SENTENCES.length !== PENDING_ROW_RESTORES.length || RESTORE_SENTENCES[3] !== RESTORE_SENTENCE_STAYS_PENDING) {
-  throw new Error('pending-row-model: the stub\'s RESTORE_SENTENCES no longer hold the four restore outcomes in their documented order')
-}
-
-/** The restore sentence each outcome's description ends with: the stub's `RESTORE_SENTENCES`, in their documented order. */
+/**
+ * The restore sentence each outcome's description ends with: the stub's
+ * `RESTORE_SENTENCES`, in their documented order. Checked here, when a case
+ * builds a restore refusal, so a stub whose sentences moved fails only the
+ * cases that use them.
+ */
 function restoreSentenceOf(restore: PendingRowRestore): string {
+  if (RESTORE_SENTENCES.length !== PENDING_ROW_RESTORES.length || RESTORE_SENTENCES[3] !== RESTORE_SENTENCE_STAYS_PENDING) {
+    throw new Error('pending-row-model: the stub\'s RESTORE_SENTENCES no longer hold the four restore outcomes in their documented order')
+  }
   return RESTORE_SENTENCES[PENDING_ROW_RESTORES.indexOf(restore)]!
 }
 

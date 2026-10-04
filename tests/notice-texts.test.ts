@@ -163,6 +163,11 @@ import {
   STUB_SURVIVOR_PIDS,
   UNUSABLE_NAME_FAULTS,
 } from './test-helpers/agent-director-stub.ts'
+import {
+  BELOW_CLIENT_MIN_VERSION,
+  CLIENT_MIN_VERSION,
+  DEV_PLACEHOLDER_VERSION,
+} from './test-helpers/agent-director-versions.ts'
 import { CLEAR_LATCH_TERMS, clearLatchTermsIn } from './test-helpers/clear-latch-terms.ts'
 import { CONFLICT_CASE_ROWS } from './test-helpers/conflict-cases.ts'
 import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
@@ -377,7 +382,7 @@ function slowRecoveryEntries(): NoticeEntry[] {
 /** SRJ-1011: the lost-message notice in every state. */
 function lostMessageEntries(): NoticeEntry[] {
   return LOST_MESSAGE_STATES.map((state) =>
-    entry('SRJ-1011', 'buildLostMessageNotice', state, () => buildLostMessageNotice('Ada Lovelace', state)),
+    entry('SRJ-1011', 'buildLostMessageNotice', state, () => buildLostMessageNotice('stub-user', state)),
   )
 }
 
@@ -444,10 +449,10 @@ function startupErrorEntries(): NoticeEntry[] {
   return [
     ...([FOUND_BY_STARTUP_CHECK, FOUND_BY_RUNTIME_RECHECK] as const).flatMap((foundBy) => [
       entry('SRJ-1013', 'buildBelowPhase1FloorMessage', `ad-below-phase1-floor, ${foundBy}`, () =>
-        buildBelowPhase1FloorMessage({ foundVersion: '0.0.0-dev', binaryPath: STUB_RESOLVE_DEFAULT_PATH }, foundBy),
+        buildBelowPhase1FloorMessage({ foundVersion: DEV_PLACEHOLDER_VERSION, binaryPath: STUB_RESOLVE_DEFAULT_PATH }, foundBy),
       ),
       entry('SRJ-1013', 'buildSystemInstallTooOldMessage', `ad-system-install-too-old, ${foundBy}`, () =>
-        buildSystemInstallTooOldMessage({ foundVersion: '0.5.0', requiredVersion: '0.7.0', binaryPath: STUB_RESOLVE_DEFAULT_PATH }, foundBy),
+        buildSystemInstallTooOldMessage({ foundVersion: BELOW_CLIENT_MIN_VERSION, requiredVersion: CLIENT_MIN_VERSION, binaryPath: STUB_RESOLVE_DEFAULT_PATH }, foundBy),
       ),
     ]),
     ...contexts.map(([label, context]) =>

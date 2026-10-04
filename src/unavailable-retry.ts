@@ -812,6 +812,19 @@ export type UnavailableRetryRunNowLineInput =
   | { readonly result: typeof UNAVAILABLE_RETRY_RUN_NOW_ARMED; readonly description: string }
 
 /**
+ * The line of an arm of persona `key` refused inside its latch re-check
+ * (b.jg5 SRJ-505), `cause` the refused cause's description (its kind, with
+ * its error's description when it carries one):
+ *
+ *   [slack] unavailable-retry: persona=<key> not armed (<cause>) — inside its latch re-check, an answer gives no information
+ *
+ * Pure.
+ */
+export function unavailableRetryNotArmedInLatchRecheckLine(key: string, cause: string): string {
+  return `[slack] unavailable-retry: persona=${key} not armed (${cause}) — inside its latch re-check, an answer gives no information`
+}
+
+/**
  * The one line of a `runNow` of persona `key` (b.jg5 SRJ-810), `why` its
  * label (a label that is not a short lower-case one is logged as `unnamed`):
  *
@@ -1505,7 +1518,7 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
     // arms its timer, whichever path asks (the reporting step, the restart
     // work's arm hook, a gate's own arm).
     if (isInsideLatchRecheck(key)) {
-      log(`[slack] unavailable-retry: persona=${key} not armed (${describeCause(cause)}) — inside its latch re-check, an answer gives no information`)
+      log(unavailableRetryNotArmedInLatchRecheckLine(key, describeCause(cause)))
       return false
     }
     const existing = entries.get(key)

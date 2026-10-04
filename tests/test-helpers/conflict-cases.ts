@@ -423,8 +423,8 @@
  * `STUB_TMUX_SESSION_NAME` or, for a persona, `personaTmuxSessionName(key)`
  * (its instance id `personaInstanceId(key)`). No timestamp is written here:
  * launch starts come from the stub's `SAMPLE_LAUNCH_START*` constants, the
- * unparseable one derived from a sample (and checked at import, through
- * `parseLaunchStart`, not to parse).
+ * unparseable one derived from a sample (checked not to parse by
+ * `tests/conflict-latch.test.ts`, never at import).
  * No Phase-1-only export
  * is named, and no `mock.module()` is used.
  *
@@ -439,7 +439,6 @@ import {
   LIVENESS_DEAD_ROW_ENDED,
   LIVENESS_DEAD_ROW_MISSING,
 } from '../../src/liveness-reading.ts'
-import { parseLaunchStart } from '../../src/pending-row.ts'
 import type { OwnRowReadInput, RowReadRow } from '../../src/row-read-rules.ts'
 import {
   CONFLICT_CASE_SENTENCES,
@@ -1365,12 +1364,20 @@ function recheckCallVerb(call: LatchRecheckCall): string | undefined {
   }
 }
 
-/** A CONFLICT answer built through the stub, checked to recognise as `expected` (or, with `not`, as any other case). */
+/**
+ * A CONFLICT answer built through the stub, checked at each build to
+ * recognise as `expected` (or, with `not`, as any other case): the check
+ * runs when a case builds the answer, never at import, so a stub
+ * description that drifted fails only the cases that build it.
+ */
 function conflictAnswer(name: string, verb: string, stubCase: ConflictCase, options: ConflictOptions, expected: LatchCase, not = false): RecheckAnswer {
-  const answer = (): Error => errTmuxSessionConflict(verb, stubCase, STUB_TMUX_SESSION_NAME, options)
-  const recognised = recogniseConflictCase(conflictDescriptionOf(answer()))
-  if ((recognised === expected) === not) {
-    throw new Error(`conflict-cases: the ${verb} CONFLICT ${stubCase} recognises as ${recognised}, ${not ? 'which must differ from' : 'not'} ${expected}`)
+  const answer = (): Error => {
+    const err = errTmuxSessionConflict(verb, stubCase, STUB_TMUX_SESSION_NAME, options)
+    const recognised = recogniseConflictCase(conflictDescriptionOf(err))
+    if ((recognised === expected) === not) {
+      throw new Error(`conflict-cases: the ${verb} CONFLICT ${stubCase} recognises as ${recognised}, ${not ? 'which must differ from' : 'not'} ${expected}`)
+    }
+    return err
   }
   return Object.freeze({ name, answer })
 }
@@ -2339,12 +2346,11 @@ export type NoLaunchStartForm = 'absent' | 'null' | 'unparseable'
 
 /**
  * An unparseable launch start: the stub's whole-second sample with its zone
- * dropped, which RFC 3339 requires. No timestamp is typed here.
+ * dropped, which RFC 3339 requires. No timestamp is typed here. That it
+ * does not parse is checked by `tests/conflict-latch.test.ts`'s launch-start
+ * decision cases, never at import.
  */
 export const UNPARSEABLE_LAUNCH_START: string = SAMPLE_LAUNCH_START_WHOLE.replace(/(?:[Zz]|[+-]\d{2}:\d{2})$/, '')
-if (UNPARSEABLE_LAUNCH_START === SAMPLE_LAUNCH_START_WHOLE || parseLaunchStart(UNPARSEABLE_LAUNCH_START) !== undefined) {
-  throw new Error('conflict-cases: UNPARSEABLE_LAUNCH_START must not parse as a launch start')
-}
 
 /**
  * Each form of "no launch start" as a builder override: `SAMPLE_LAUNCH_START_NONE`

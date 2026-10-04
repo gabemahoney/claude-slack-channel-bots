@@ -423,8 +423,8 @@
  *   ended silently) and the stuck-launch episode's end
  *   (`endStuckLaunchEpisodeForLatch(episodes, key, log)`, `src/pending-row.ts`:
  *   the episode ended silently, with one line when one was open). `latch` is
- *   read-only: `isLatched(key)`
- *   and `record(key)`. `latchEvents` holds, in order, each set as the
+ *   read-only: `isLatched(key)`, `record(key)` and the latch's own
+ *   `addSetObserver(observer)` (answering its remover). `latchEvents` holds, in order, each set as the
  *   observers see it (`{ step: 'set', key, outcome, record }`, recorded by an
  *   observer added before the holds), each of the first three holds as it is
  *   called (`{ step: 'hold', key, hold }`; the slow-recovery and stuck-launch
@@ -445,8 +445,11 @@
  *   composes it (`buildLatchRecheck` over the latch, the harness clock, the
  *   harness's serializer `serializer.run` as `main()`'s
  *   `personaLifecycle.run`, the live applied configuration, `console.error`
- *   as its log, so its lines and its round's lines go to `errors`, and the
- *   latch notice's episodes; its clear goes through the one clear entry:
+ *   as its log, so its lines and its round's lines go to `errors`, the
+ *   latch notice's episodes, and the harness's relaunch gate as its
+ *   `canRelaunch`, so a persona `setUp(key, false)` set down gets no launch
+ *   in a round, b.av2 SR-6.4; every operation it submits through the
+ *   serializer is tracked until it settles); its clear goes through the one clear entry:
  *   one recovery post, the episode ended, the timer stopped, then, after a
  *   clear that launched nothing, the after-clear sequence's run in the same
  *   serializer turn, b.jg5 SRJ-506). With `options.latchRecheck` (false when unset, so the
@@ -968,7 +971,9 @@
  *   clock (a sequence or wait timer included, which the message counts
  *   apart), a live-row sequence or an old-life wait still runs (a case
  *   settles every sequence and wait it starts, releasing any call it
- *   holds), or a
+ *   holds), a latch re-check round or an after-clear job (a clear by
+ *   hand's included) the re-check submitted has not settled (a case awaits
+ *   the round, or `serializer.whenIdle(key)`, before it ends), or a
  *   persona is still armed: the episodes run on the harness clock, so a timer
  *   they armed and left pending fails it too. Retry timers are the one
  *   exception, by design: `stopAll` runs before the count, so a persona's
@@ -1485,7 +1490,7 @@ function releaseRecoveryAmbient(frame: RecoveryAmbientFrame): void {
 }
 
 /** The connection status the relaunch gate reads for every persona: serving. */
-const SERVING: PersonaConnectionStatus =Object.freeze({ state: 'up', identity: Object.freeze({ botUserId: 'U0RECOVERY', botId: 'B0RECOVERY' }) })
+const SERVING: PersonaConnectionStatus = Object.freeze({ state: 'up', identity: Object.freeze({ botUserId: 'U0RECOVERY', botId: 'B0RECOVERY' }) })
 
 /** Options of `makeRecoveryHarness`; every one is optional. */
 export interface RecoveryHarnessOptions {
@@ -1746,8 +1751,8 @@ interface LostMessageDriver {
   readonly hold: PersonaDestinationHold
 }
 
-/** The harness's latch, read-only: the latched query and the record. */
-export type RecoveryLatchView = Pick<ConflictLatch, 'isLatched' | 'record'>
+/** The harness's latch, read-only: the latched query, the record and the latch's own set observer entry. */
+export type RecoveryLatchView = Pick<ConflictLatch, 'isLatched' | 'record' | 'addSetObserver'>
 
 /** The harness latch's own set entries, through which a latching site sets it (and the probe-dropped mark, b.jg5 SRJ-505). */
 export type RecoveryLatchSetEntries = Pick<ConflictLatch, 'set' | 'setFromConflict' | 'setFromUnusableName' | 'setLaunchStartNotRecorded' | 'setProbeDropped'>
@@ -1888,7 +1893,7 @@ export interface RecoveryHarness {
   unclassifiedErrorOpen(key: string): boolean
   /** Whether persona `key`'s kill-failure episode is open (read-only; the alerts' `isOpen`, the driver's kill-failed input). */
   killFailureOpen(key: string): boolean
-  /** The harness's one latch, read-only (`isLatched`, `record`); composed as `main()` composes it. */
+  /** The harness's one latch, read-only (`isLatched`, `record`, `addSetObserver`); composed as `main()` composes it. */
   readonly latch: RecoveryLatchView
   /** The latch's own set entries: latch P as a latching site does, every observer running; see the module comment. */
   readonly latchSet: RecoveryLatchSetEntries
@@ -2436,13 +2441,29 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       clock.clearTimeout(handle)
     },
   }
+  // Every operation the re-check submits through the serializer (each
+  // round, each after-clear job, a clear by hand's among them) until it
+  // settles, so `cleanup()` fails on one still in flight.
+  const latchRecheckWork = new Set<Promise<unknown>>()
+  const latchRecheckSerialize: typeof serializer.run = (key, operation) => {
+    const work = serializer.run(key, operation)
+    latchRecheckWork.add(work)
+    const done = (): void => {
+      latchRecheckWork.delete(work)
+    }
+    work.then(done, done)
+    return work
+  }
   const latchRecheck = buildLatchRecheck({
     latch,
     clock: latchRecheckClock,
-    serialize: serializer.run,
+    serialize: latchRecheckSerialize,
     appliedConfig,
     log: (line) => console.error(line),
     episodes: noticeEpisodes,
+    // As main() passes it (b.av2 SR-6.4): each round's launch asks the
+    // harness's relaunch gate, so `setUp(key, false)` refuses it.
+    canRelaunch: (key) => canRelaunch(key),
   })
   if (options.latchRecheck === true) unbindLatch.push(bindLatchRecheck(latch, latchRecheck))
   /** Every key a latch re-check round may run for: the configured and the armed. */
@@ -3317,7 +3338,11 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     stops,
     unclassifiedErrorOpen: (key) => unclassifiedErrors.isOpen(key),
     killFailureOpen: (key) => killFailureAlerts.isOpen(key),
-    latch: Object.freeze({ isLatched: (key: string) => latch.isLatched(key), record: (key: string) => latch.record(key) }),
+    latch: Object.freeze({
+      isLatched: (key: string) => latch.isLatched(key),
+      record: (key: string) => latch.record(key),
+      addSetObserver: (observer: Parameters<ConflictLatch['addSetObserver']>[0]) => latch.addSetObserver(observer),
+    }),
     invalidFlagsHold: Object.freeze({
       isHeld: (key: string) => invalidFlagsHold.isHeld(key),
       beganUnder: (key: string) => invalidFlagsHold.beganUnder(key),
@@ -3723,6 +3748,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       const armed = controller.armedKeys()
       const sequencesRunning = keys.filter((key) => sequences.isRunning(key))
       const oldLifeWaitsRunning = waitsRunning()
+      const latchRecheckWorkInFlight = latchRecheckWork.size
       // A sequence or wait still running is stopped, so it makes no call after this.
       void sequences.close()
       _resetLiveRowSequenceRegistry()
@@ -3749,9 +3775,9 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       resetAdSettingsForTests()
       releaseRecoveryAmbient(ambient)
       rmSync(root, { recursive: true, force: true })
-      if (pendingTimers !== 0 || armed.length !== 0 || sequencesRunning.length !== 0 || oldLifeWaitsRunning.length !== 0) {
+      if (pendingTimers !== 0 || armed.length !== 0 || sequencesRunning.length !== 0 || oldLifeWaitsRunning.length !== 0 || latchRecheckWorkInFlight !== 0) {
         throw new Error(
-          `recovery harness: ${pendingTimers} timer(s) still pending (${sequenceTimersPending} of them live-row sequence or old-life wait timers), ${armed.length} persona(s) still armed after stopAll, live-row sequences still running for ${JSON.stringify(sequencesRunning)} and old-life waits still running on ${JSON.stringify(oldLifeWaitsRunning)} at cleanup`,
+          `recovery harness: ${pendingTimers} timer(s) still pending (${sequenceTimersPending} of them live-row sequence or old-life wait timers), ${armed.length} persona(s) still armed after stopAll, live-row sequences still running for ${JSON.stringify(sequencesRunning)}, old-life waits still running on ${JSON.stringify(oldLifeWaitsRunning)} and ${latchRecheckWorkInFlight} latch re-check round(s) or after-clear job(s) still in flight at cleanup`,
         )
       }
     },
