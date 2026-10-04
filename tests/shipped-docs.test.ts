@@ -45,7 +45,8 @@
  * - the switch-over runbook, README "Switching over to agent-director
  *   Phase 1" (b.jg5 SRJ-1108; the E2-gate and E5 hatch notes): its steps
  *   1–11 read in order by the file-local step reader, one named case per
- *   SRJ-1108 element over each carrier (`SWITCH_OVER_CARRIERS`), the
+ *   SRJ-1108 element over each carrier (`SWITCH_OVER_CARRIERS`: the README
+ *   section and the CHANGELOG release entry's copy), the
  *   negative and order checks, the "Arrived here from a startup refusal?"
  *   block's ordered elements and branches, the publishing-host block, the
  *   sections the runbook replaced or kept, and the reader's self-checks.
@@ -55,14 +56,30 @@
  *   SRJ-1109; hatch A3): exactly one `###` heading under `## Migration`,
  *   after the switch-over section; its steps 1–9 read in order by the same
  *   step reader, one named case per SRJ-1109 element over each carrier
- *   (`ROLLBACK_CARRIERS`), the order rows (steps 6, 8 and 9), the cross-step
+ *   (`ROLLBACK_CARRIERS`, the same two), the order rows (steps 6, 8 and 9), the cross-step
  *   rows (no `tmux kill-session`, no `include-finished`, "Operator actions"
  *   named by title), step 8's no-conversion-tool check, and ruling C-2: the
  *   switch-over refusal block's pointers to the rollback runbook and its
  *   step 8 are links that resolve, as are the runbooks' other links and the
  *   registry-install runbook's scope note links to both sections.
- * CHANGELOG.md and docs/ are not shipped descriptions and are not audited;
- * the one docs/ file read is docs/registry-install-runbook.md, for its links.
+ * - `OPERATOR_TEXTS` (b.jg5 SRJ-1101's seven operator texts: the README, the
+ *   debugging, install and setup skills, docs/architecture.md,
+ *   docs/engineering-guide.md and CHANGELOG.md), read for SRJ-1107's checks:
+ *   no "Upgrade steps" heading or link and no "checks its tmux session first"
+ *   in any of them; the CHANGELOG release entry's elements, one case each
+ *   (exactly one unreleased entry, first; the breaking note's parts; the
+ *   retired access file kept until rollback is no longer wanted and never
+ *   deleted; the relaunch through agent-director; the dropped tmux-commands
+ *   note; the prefix-key reason without the old agent-director version; the
+ *   fresh-once note's runbook pointer), each self-checked against b.ob2's
+ *   wording; the names the hatch-note entries introduce, through their `src/`
+ *   exports; the two runbook copies, which join `SWITCH_OVER_CARRIERS` and
+ *   `ROLLBACK_CARRIERS`, name the README as the maintained copy and match it
+ *   word for word; and every CHANGELOG link resolves (hatch A3).
+ * CHANGELOG.md and docs/ are not shipped descriptions: the forbidden-term
+ * audit still reads only `SHIPPED_TEXTS`, which holds neither. Besides the
+ * two docs read through `OPERATOR_TEXTS`, the one docs/ file read is
+ * docs/registry-install-runbook.md, for its links.
  *
  * Reads repo files resolved from this file's location, so the working
  * directory doesn't matter. The one writer is the complete-example load: it
@@ -107,7 +124,7 @@ import { UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
 import { CRONTABLE_TEMPLATE_HEADER } from '../src/cron-bootstrap.ts'
 import type { Via } from '../src/delivery-decision.ts'
 import { MCP_INSTRUCTIONS } from '../src/registry.ts'
-import { PHASE1_RUNBOOK_SECTION_TITLE } from '../src/ad-version-gate.ts'
+import { PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_SECTION_TITLE } from '../src/ad-version-gate.ts'
 import { AD_BELOW_PHASE1_FLOOR, AD_SYSTEM_INSTALL_TOO_OLD } from '../src/install-check.ts'
 import {
   AD_CALL_TIMEOUT_NEED_MARGIN_MS,
@@ -127,6 +144,10 @@ import { AD_ERROR_CLASS_CONFLICT, AD_ERROR_CLASS_UNAVAILABLE } from '../src/ad-e
 import { PERSONA_INSTANCE_ID_PREFIX, PERSONA_TMUX_SESSION_PREFIX, SERVICE_LABEL } from '../src/persona-identity.ts'
 import { LAST_APPLIED_FILE_SUFFIX } from '../src/reload.ts'
 import { RETIRED_KEYS_FILE_NAME } from '../src/retired-keys.ts'
+import { CLEAR_LATCH_COMMAND, SERVER_PORT_FILE_NAME } from '../src/clear-latch.ts'
+import { CLEAN_RESTART_NOT_RESTARTED_LABEL, CLI_TEARDOWN_FAILED_LABEL } from '../src/cli-teardown.ts'
+import { PERSONA_KILL_FAILED_LABEL, PERSONA_KILL_SURVIVOR_LABEL } from '../src/kill-failure-alert.ts'
+import { startupSummaryEnding } from '../src/session-manager.ts'
 import { CLIENT_MIN_VERSION, MIN_CLAUDE_CODE_VERSION, OLD_AD_VERSION } from './test-helpers/agent-director-versions.ts'
 import {
   PUBLISHING_HOST_BLOCK_HEADING,
@@ -705,6 +726,35 @@ const SHIPPED_TEXTS: [name: string, read: () => string][] = [
   [`${REPLY_GUARD_FILE} (reminder text)`, replyGuardReminderText],
   ['CRONTABLE_TEMPLATE_HEADER (src/cron-bootstrap.ts)', crontableHeaderText],
 ]
+
+const DEBUG_SKILL_FILE = 'skills/debug-slack-channel-bots/SKILL.md'
+const INSTALL_SKILL_FILE = 'skills/install-cscb/SKILL.md'
+const CHANGELOG_FILE = 'CHANGELOG.md'
+
+/**
+ * b.jg5 SRJ-1101's operator texts, [name, text], read from the repository:
+ * the README, the debugging, install and setup skills, the architecture doc,
+ * the engineering guide and the CHANGELOG. SRJ-1107's checks (the CHANGELOG
+ * release entry, at the end of this file) read their texts through this
+ * list. It is not `SHIPPED_TEXTS`: the forbidden-term audit still reads only
+ * that list, which holds neither the CHANGELOG nor `docs/`.
+ */
+const OPERATOR_TEXTS: [name: string, read: () => string][] = [
+  'README.md',
+  DEBUG_SKILL_FILE,
+  INSTALL_SKILL_FILE,
+  WIZARD_FILE,
+  'docs/architecture.md',
+  'docs/engineering-guide.md',
+  CHANGELOG_FILE,
+].map((file): [string, () => string] => [file, () => readRepoFile(file)])
+
+/** One operator text by its name; throws naming a name `OPERATOR_TEXTS` lacks. */
+function operatorText(name: string): string {
+  const entry = OPERATOR_TEXTS.find(([text]) => text === name)
+  if (entry === undefined) throw new Error(`OPERATOR_TEXTS has no text "${name}"`)
+  return entry[1]()
+}
 
 /**
  * b.av2 SR-12: the claim that a first @mention activates (wakes, unlocks)
@@ -1448,8 +1498,6 @@ describe('AC 47: the MCP instructions and the Reply Guard reminder do not name c
 /** The two startup refusal classes for an agent-director binary that is too old. */
 const REFUSAL_LABELS: string[] = [AD_BELOW_PHASE1_FLOOR, AD_SYSTEM_INSTALL_TOO_OLD]
 
-const DEBUG_SKILL_FILE = 'skills/debug-slack-channel-bots/SKILL.md'
-const INSTALL_SKILL_FILE = 'skills/install-cscb/SKILL.md'
 const STARTUP_ERRORS_HEADING = '## Startup errors'
 
 /** The debugging skill's section holding the refusal entries, which its triage points to. */
@@ -1572,6 +1620,9 @@ const MIGRATION_HEADING = '## Migration'
 
 /** The switch-over section's heading as the README writes it: a `###` under `## Migration`. */
 const SWITCH_OVER_HEADING = `### ${PHASE1_RUNBOOK_SECTION_TITLE}`
+
+/** The README section the switch-over runbook replaced (b.jg5 SRJ-1103): no heading carries it and no link reaches it. */
+const GONE_TITLE = 'First start on a host with running bots'
 
 /**
  * What is wrong with the README heading the refusals name (E2 gate, b.jg5
@@ -1770,9 +1821,14 @@ function readRunbookCarrier(file: string, text: string, heading: string, count: 
   }
 }
 
-/** Every carrier of the switch-over runbook: its name and its reader. The CHANGELOG copy joins in b.jg5 E35 T3. */
+/**
+ * Every carrier of the switch-over runbook: its name and its reader. The
+ * README section, and the CHANGELOG release entry's copy (b.jg5 SRJ-1107;
+ * hatch A3), read through `OPERATOR_TEXTS` from the entry only.
+ */
 const SWITCH_OVER_CARRIERS: [name: string, read: () => RunbookCarrier][] = [
   ['README.md', lazy(() => readRunbookCarrier('README.md', readRepoFile('README.md'), SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT))],
+  [CHANGELOG_FILE, lazy(() => readRunbookCarrier(CHANGELOG_FILE, releaseEntry(operatorText(CHANGELOG_FILE)), SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT))],
 ]
 
 /** The numbered items with a bold lead (`1. **Lead.** …`) in a step's flattened text, each running to the next. */
@@ -2486,8 +2542,6 @@ describe(`the switch-over runbook, "${PHASE1_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-
       expect(line > parent!.start && line < parent!.end).toBe(true)
     })
 
-    const GONE_TITLE = 'First start on a host with running bots'
-
     test(`no README heading is "${GONE_TITLE}"`, () => {
       expect(headings(readme).filter((h) => h.title === GONE_TITLE).map((h) => h.text)).toEqual([])
     })
@@ -2535,9 +2589,10 @@ describe(`the switch-over runbook, "${PHASE1_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-
 /** The rollback runbook's step count (SRJ-1109: steps 1 to 9). */
 const ROLLBACK_STEP_COUNT = 9
 
-/** Every carrier of the rollback runbook: its name and its reader. The CHANGELOG copy joins in b.jg5 E35 T3. */
+/** Every carrier of the rollback runbook: its name and its reader. The README section and the CHANGELOG release entry's copy, as for `SWITCH_OVER_CARRIERS`. */
 const ROLLBACK_CARRIERS: [name: string, read: () => RunbookCarrier][] = [
   ['README.md', lazy(() => readRunbookCarrier('README.md', readRepoFile('README.md'), ROLLBACK_HEADING, ROLLBACK_STEP_COUNT))],
+  [CHANGELOG_FILE, lazy(() => readRunbookCarrier(CHANGELOG_FILE, releaseEntry(operatorText(CHANGELOG_FILE)), ROLLBACK_HEADING, ROLLBACK_STEP_COUNT))],
 ]
 
 /** One rollback carrier's place, for the cases that run over every carrier. */
@@ -2663,7 +2718,7 @@ const ROLLBACK_ELEMENTS: [where: string, element: string, required: readonly Ite
   ['step 5', `a read-only tmux ls, as the workers' user on the pinned socket, confirms no ${PERSONA_TMUX_SESSION_PREFIX}<key> session is left`, [
     ci("as the workers' user, on the socket switch-over step 1 pinned, run a read-only `tmux ls`"),
     ci(`confirm that no ${code(`${PERSONA_TMUX_SESSION_PREFIX}<key>`)} session is left`),
-    ci("handle each leftover by its row's current state"),
+    ci("handle each leftover by whether it has a row and, if it has one, by that row's current state"),
   ]],
   ['step 5', `a live row's leftover: agent-director kill of ${PERSONA_INSTANCE_ID_PREFIX}<key>; refused with "${vocab('notThisLaunch')}", ${vocab('operatorActions')}`, [
     ci('a leftover whose row is live'),
@@ -2746,7 +2801,7 @@ const ROLLBACK_ELEMENTS: [where: string, element: string, required: readonly Ite
   ]],
   ['step 8', 'the previous CSCB reinstalled: the version switch-over step 1 recorded, or else the version the host ran before (hatch A3)', [
     ci('reinstall the previous CSCB, the version switch-over step 1 recorded, or else the version the host ran before'),
-    'bun install -g claude-slack-channel-bots@<the version switch-over step 1 recorded>',
+    'bun install -g claude-slack-channel-bots@<the previous version>',
   ]],
   ['step 8', "switch-over step 1's files put back: the pre-persona config.json, crontable, /interject callers, access.json and the Slack token environment variables (SRJ-1516)", [
     ci('put back what switch-over step 1 saved'),
@@ -2778,8 +2833,10 @@ const OPERATOR_ACTIONS_STEPS: readonly number[] = [3, 4, 5]
  * What in a rollback step-8 text names a tool or command for the rebuild by
  * hand (hatch A3): a fenced block other than the previous CSCB's reinstall, a
  * code span naming a script or a CSCB subcommand, a link to a file, or
- * conversion wording tied to a tool, script or command. Takes the flattened
- * step text. Pure; `[]` when none.
+ * conversion wording tied to a tool, script or command. A link to a heading
+ * of `README.md` is the CHANGELOG copy's form of the README's same-file link
+ * (b.jg5 SRJ-1107), not a file. Takes the flattened step text. Pure; `[]`
+ * when none.
  */
 function conversionToolsIn(stepText: string): string[] {
   const REINSTALL = /^bun install -g claude-slack-channel-bots@<[^>]+>$/
@@ -2788,7 +2845,9 @@ function conversionToolsIn(stepText: string): string[] {
   return [
     ...blocks.filter((body) => !REINSTALL.test(body)).map((body) => `fenced block: ${body}`),
     ...[...prose.matchAll(/`[^`]*(?:\.(?:sh|ts|js|py)\b|claude-slack-channel-bots\s+\w)[^`]*`/g)].map((m) => `code span: ${m[0]}`),
-    ...markdownLinks(prose).filter((link) => link.path !== '').map((link) => `link to a file: ${link.target}`),
+    ...markdownLinks(prose)
+      .filter((link) => link.path !== '' && !(link.path === 'README.md' && link.anchor !== ''))
+      .map((link) => `link to a file: ${link.target}`),
     ...[...prose.matchAll(/\b(?:conver\w*|migrat\w*)\b[^.]*\b(?:tool|script|command|subcommand)s?\b|\b(?:tool|script|command|subcommand)s?\b[^.]*\bconver\w*/gi)].map((m) => `wording: ${m[0]}`),
   ]
 }
@@ -2983,6 +3042,14 @@ describe(`the rollback runbook, "${ROLLBACK_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-1
     ])('self-check (hatch A3): a step 8 naming %s is flagged', (_label, text, kind) => {
       expect(conversionToolsIn(flat(`Reinstall: \`\`\`sh bun install -g claude-slack-channel-bots@<v> \`\`\` ${text}`)).map((found) => found.split(':')[0])).toEqual([kind])
     })
+
+    test.each([
+      ['a same-file heading link', '(see [Upgrading to personas](#upgrading-to-personas))', []],
+      ["a README heading link, the CHANGELOG copy's form of it (SRJ-1107)", '(see [Upgrading to personas](README.md#upgrading-to-personas))', []],
+      ['a link to the README file itself', '(see [the README](README.md))', ['link to a file']],
+    ] as const)('self-check (hatch A3): a step 8 with %s', (_label, text, kinds) => {
+      expect(conversionToolsIn(flat(`Rebuild it by hand ${text}.`)).map((found) => found.split(':')[0])).toEqual([...kinds])
+    })
   })
 
   describe('README.md: ruling C-2 and the runbooks\' links', () => {
@@ -3029,6 +3096,360 @@ describe(`the rollback runbook, "${ROLLBACK_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-1
         expect(anchors).toContain(anchor)
         expect(headingAt(readme, anchor)?.text).toBe(heading)
       }
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The CHANGELOG release entry (b.jg5 SRJ-1107; hatch A3), read through OPERATOR_TEXTS
+// ---------------------------------------------------------------------------
+
+/** The CHANGELOG's release entry: the first `##` section's body. Throws when the file has no `##` heading. */
+function releaseEntry(changelog: string): string {
+  const first = headings(changelog).find((h) => h.level === 2)
+  if (first === undefined) throw new Error(`${CHANGELOG_FILE} has no \`##\` release entry`)
+  return requiredSection(changelog, first.text, CHANGELOG_FILE)
+}
+
+/** The release entry's notes: the entry without its two runbook copies, so a note is never found in a runbook's words. */
+function releaseNotes(changelog: string): string {
+  const entry = releaseEntry(changelog)
+  const ranges = [SWITCH_OVER_HEADING, ROLLBACK_HEADING].flatMap((heading) => sectionRange(entry, heading) ?? [])
+  return entry
+    .split('\n')
+    .filter((_, i) => !ranges.some((range) => i >= range.start && i < range.end))
+    .join('\n')
+}
+
+/** `text` with each inline link replaced by its link text. */
+function linkTexts(text: string): string {
+  return text.replace(/\[([^\]]*)\]\([^)\s]+\)/g, '$1')
+}
+
+/**
+ * `text`'s units, flattened: each heading, list item (with its continuation
+ * lines) and paragraph. A unit that ends with a colon is read together with
+ * the one it introduces (a list item or a fenced command), so an instruction
+ * and its command are one unit. Pure.
+ */
+function textUnits(text: string): string[] {
+  const units: string[][] = []
+  let open = false
+  for (const line of text.split('\n')) {
+    if (line.trim() === '') {
+      open = false
+      continue
+    }
+    const heading = /^#{1,6}\s/.test(line)
+    if (!open || heading || /^\s*(?:[-*]|\d+\.)\s/.test(line)) units.push([line])
+    else units[units.length - 1].push(line)
+    open = !heading
+  }
+  return units
+    .map((lines) => flat(lines.join('\n')).trim())
+    .reduce<string[]>((out, unit) => {
+      if (out.length > 0 && out[out.length - 1].endsWith(':')) out[out.length - 1] += ` ${unit}`
+      else out.push(unit)
+      return out
+    }, [])
+}
+
+/** Each of `required` that `text` lacks, as a problem line. */
+function lacking(text: string, required: readonly (string | RegExp)[]): string[] {
+  return required.filter((item) => (typeof item === 'string' ? !text.includes(item) : !item.test(text))).map((item) => `lacks ${String(item)}`)
+}
+
+/** `check`'s problems on the one release-note unit matching `anchor`, or a problem naming the anchor unless exactly one unit does. */
+function noteUnitProblems(changelog: string, anchor: RegExp, check: (unit: string) => string[]): string[] {
+  const units = textUnits(releaseNotes(changelog)).filter((unit) => anchor.test(unit))
+  if (units.length !== 1) return [`${units.length} release-note units match ${String(anchor)}, expected 1`]
+  return check(units[0])
+}
+
+/** The heading title of b.ob2's dropped section (SRJ-1107: replaced by the switch-over runbook). */
+const UPGRADE_STEPS_TITLE = 'Upgrade steps'
+
+/** Each heading titled `UPGRADE_STEPS_TITLE` in `text`, and each link to its anchor. Pure. */
+function upgradeStepsProblems(text: string): string[] {
+  return [
+    ...headings(text).filter((h) => h.title.toLowerCase() === UPGRADE_STEPS_TITLE.toLowerCase()).map((h) => `heading "${h.text}"`),
+    ...markdownLinks(text).filter((link) => link.anchor === headingSlug(UPGRADE_STEPS_TITLE)).map((link) => `link (${link.target})`),
+  ]
+}
+
+/** b.ob2's wording for the prompt-open relaunch, which SRJ-1107 replaces with a check through agent-director. */
+const TMUX_FIRST = ci('checks its tmux session first')
+
+/** Each "checks its tmux session first" in `text`, flattened. Pure. */
+function tmuxFirstProblems(text: string): string[] {
+  return [...flat(text).matchAll(new RegExp(TMUX_FIRST.source, 'gi'))].map((m) => m[0])
+}
+
+/** A word that tells the reader to delete a file. */
+const DELETE_WORDS = /\b(?:delet\w*|remov\w*|rm|eras\w*|discard\w*)\b/i
+
+/** SRJ-1107's breaking note, one row per part, each found in the release notes' text with links read as their text. */
+const BREAKING_NOTE: [part: string, pattern: RegExp][] = [
+  ['this release requires agent-director Phase 1 or later', ci('requires agent-director Phase 1 or later')],
+  ['it exits at startup on an older binary', ci('exits at startup on an older agent-director binary')],
+  ['no older CSCB may run on the Phase 1 binary', ci('no older CSCB may run on the Phase 1 binary')],
+  ['the two are installed, and rolled back, together', /\binstalled together\b[^.]*\brolled back together\b/i],
+  ['every agent and long-running agent-director process is stopped before either binary change and started again after it (HO C15; ADA question 9)', ci(
+    'every agent on the host, with every long-running agent-director process, is stopped before either binary change and started again after it',
+  )],
+]
+
+/** An agent-director version named in prose ("agent-director <version>"), its version captured; a sentence's closing full stop is not taken. */
+const AD_NAMED_VERSION = /\bagent-director v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)/g
+
+/** The release entry's row-deletion note: the one note naming agent-director's admin binary. */
+const ROW_DELETION_ELEMENT = 'the row-deletion note names `agent-director-admin`, and the agent-director version it names is the Phase 1 floor'
+
+/**
+ * One row per SRJ-1107 element of the release entry: its name and its check,
+ * which returns the CHANGELOG text's problems (`[]` when the element holds).
+ * Each check is self-checked below on the CHANGELOG with that element reverted
+ * to b.ob2's wording, or, for an element b.ob2 lacked, broken.
+ */
+const RELEASE_ENTRY_CHECKS: [element: string, problems: (changelog: string) => string[]][] = [
+  ['exactly one unreleased entry, the first `##` entry in the file', (changelog) => {
+    const entries = headings(changelog).filter((h) => h.level === 2)
+    const unreleased = entries.filter((h) => /\bunreleased\b/i.test(h.title))
+    return [
+      ...(unreleased.length === 1 ? [] : [`${unreleased.length} unreleased \`##\` entries, expected 1`]),
+      ...(entries.length > 0 && unreleased.includes(entries[0]) ? [] : [`the first \`##\` entry, "${entries[0]?.text}", is not an unreleased one`]),
+    ]
+  }],
+  ...BREAKING_NOTE.map(([part, pattern]): [string, (changelog: string) => string[]] => [
+    `the breaking note: ${part}`,
+    (changelog) => lacking(flat(linkTexts(releaseNotes(changelog))), [pattern]),
+  ]),
+  ['`access.json` is kept until rollback is no longer wanted, because the previous CSCB reads it', (changelog) =>
+    lacking(flat(releaseNotes(changelog)), [ci('keep `access.json` until rollback is no longer wanted, because the previous CSCB reads it')])],
+  ['nothing in the file tells the reader to delete `access.json`', (changelog) =>
+    textUnits(changelog).filter((unit) => /\baccess\.json\b/.test(unit) && DELETE_WORDS.test(unit)).map((unit) => `a delete instruction: ${unit}`)],
+  ['the prompt-open relaunch note says the server checks the session through agent-director', (changelog) =>
+    noteUnitProblems(changelog, ci('prompt or question open'), (unit) => lacking(unit, [ci('checks the session through agent-director')]))],
+  [`the note "The server's own tmux commands act only on a bot's own session" is gone (E17, E18)`, (changelog) =>
+    [...flat(changelog).matchAll(/the server's own tmux commands/gi)].map((m) => `the dropped note is back: ${m[0]}`)],
+  [`the prefix-key note's reason does not name agent-director ${OLD_AD_VERSION} (SRJ-1102)`, (changelog) =>
+    noteUnitProblems(changelog, ci("may start with another persona's key"), (unit) => (unit.includes(OLD_AD_VERSION) ? [`names ${OLD_AD_VERSION}: ${unit}`] : []))],
+  ['the fresh-once note stays, its rows kept and never resumed, pointing to the switch-over runbook', (changelog) =>
+    noteUnitProblems(changelog, ci('starts fresh once'), (unit) => [
+      ...lacking(unit, [/\brows? (?:are|is) kept\b/i, ci('never resumed')]),
+      ...(linksWithText(unit).some((link) => link.anchor === headingSlug(PHASE1_RUNBOOK_SECTION_TITLE) && (link.path === '' || link.path === 'README.md'))
+        ? []
+        : [`no link to "${PHASE1_RUNBOOK_SECTION_TITLE}"`]),
+    ])],
+  [ROW_DELETION_ELEMENT, (changelog) =>
+    noteUnitProblems(changelog, ci(code('agent-director-admin')), (unit) => {
+      const versions = [...unit.matchAll(AD_NAMED_VERSION)].map((m) => m[1])
+      return [
+        ...(versions.length > 0 ? [] : ['names no agent-director version']),
+        ...versions.filter((v) => v !== PHASE1_FLOOR_VERSION).map((v) => `names agent-director ${v}, not the Phase 1 floor ${PHASE1_FLOOR_VERSION}`),
+      ]
+    })],
+]
+
+/** One release-entry check by its element; throws naming an element the table lacks. */
+function releaseCheck(element: string): (changelog: string) => string[] {
+  const row = RELEASE_ENTRY_CHECKS.find(([name]) => name === element)
+  if (row === undefined) throw new Error(`RELEASE_ENTRY_CHECKS has no element "${element}"`)
+  return row[1]
+}
+
+/**
+ * The names the hatch-note entries introduce (the Task's ruling: only these
+ * are pinned, each through the `src/` export that defines it, no sentence
+ * pinned), with the Epic and source of each.
+ */
+const HATCH_NOTE_NAMES: [name: string, source: string][] = [
+  [CLEAR_LATCH_COMMAND, 'E31: src/clear-latch.ts CLEAR_LATCH_COMMAND (SRJ-509)'],
+  [SERVER_PORT_FILE_NAME, 'E31: src/clear-latch.ts SERVER_PORT_FILE_NAME (SRJ-510)'],
+  [CLI_TEARDOWN_FAILED_LABEL, 'E33: src/cli-teardown.ts CLI_TEARDOWN_FAILED_LABEL (SRJ-909, SRJ-1013)'],
+  [PERSONA_KILL_FAILED_LABEL, 'E33: src/kill-failure-alert.ts PERSONA_KILL_FAILED_LABEL (SRJ-1013)'],
+  [PERSONA_KILL_SURVIVOR_LABEL, 'E33: src/kill-failure-alert.ts PERSONA_KILL_SURVIVOR_LABEL (SRJ-1013)'],
+  [CLEAN_RESTART_NOT_RESTARTED_LABEL, 'E33: src/cli-teardown.ts CLEAN_RESTART_NOT_RESTARTED_LABEL (SRJ-906, SRJ-1013)'],
+  ...startSummaryCountLabels().map((label): [string, string] => [label, 'E26: src/session-manager.ts startupSummaryEnding (SRJ-1015)']),
+]
+
+/**
+ * The start summary's five counts SRJ-1015 added, as src/session-manager.ts's
+ * `startupSummaryEnding` writes them: each count given its own number, then
+ * its label read after that number. Throws naming a count it can't find.
+ */
+function startSummaryCountLabels(): string[] {
+  const numbered = { failed: 1, notBroughtUp: 2, notReconnected: 3, latched: 4, retrying: 5, sequenceWaiting: 6, held: 7, freshRetired: 8 }
+  const parts = startupSummaryEnding(numbered).split(', ')
+  return (['latched', 'retrying', 'sequenceWaiting', 'held', 'freshRetired'] as const).map((key) => {
+    const part = parts.find((p) => p.startsWith(`${numbered[key]} `))
+    if (part === undefined) throw new Error(`startupSummaryEnding wrote no "${numbered[key]} …" part for ${key}`)
+    return part.slice(`${numbered[key]} `.length)
+  })
+}
+
+/** Every link from `text` (the repository-root `file`) that resolves nowhere: a same-file anchor `text` lacks, or a repository file or its heading that does not exist. */
+function brokenRepoLinks(file: string, text: string): { checked: number; broken: string[] } {
+  const own = headingAnchors(text)
+  const links = markdownLinks(text).filter((link) => !/^[a-z][a-z0-9+.-]*:/i.test(link.path))
+  const broken = links.flatMap((link) => {
+    if (link.path === '') return own.includes(link.anchor) ? [] : [`${file} -> ${link.target} (no such heading in ${file})`]
+    const target = resolve(REPO_ROOT, link.path)
+    if (!existsSync(target)) return [`${file} -> ${link.target} (no such file)`]
+    if (link.anchor === '') return []
+    return headingAnchors(readFileSync(target, 'utf-8')).includes(link.anchor) ? [] : [`${file} -> ${link.target} (no such heading in ${link.path})`]
+  })
+  return { checked: links.length, broken }
+}
+
+/** Each part of a runbook section (its text before the first subsection, then each subsection by heading), flattened, for a word-for-word comparison. */
+function sectionChunks(section: string): { heading: string; text: string }[] {
+  const lines = section.split('\n')
+  const hs = headings(section)
+  return [-1, ...hs.map((h) => h.line)].map((start, k) => ({
+    heading: k === 0 ? '(before the first subsection)' : hs[k - 1].text,
+    text: flat(lines.slice(start + 1, k < hs.length ? hs[k].line : lines.length).join('\n')).trim(),
+  }))
+}
+
+/** The line of a CHANGELOG runbook copy that names the README section as the maintained copy. */
+const MAINTAINED_COPY = ci('is the maintained copy of this runbook')
+
+/** A CHANGELOG runbook copy as the README writes it: its maintained-copy line dropped, and each `README.md#` link read as a same-file link. */
+function asReadmeText(section: string): string {
+  return section
+    .split('\n')
+    .filter((line) => !MAINTAINED_COPY.test(line))
+    .join('\n')
+    .replaceAll('](README.md#', '](#')
+}
+
+/** The two runbooks the release entry copies: each section's title and heading. */
+const RUNBOOK_COPIES: [title: string, heading: string][] = [
+  [PHASE1_RUNBOOK_SECTION_TITLE, SWITCH_OVER_HEADING],
+  [ROLLBACK_RUNBOOK_SECTION_TITLE, ROLLBACK_HEADING],
+]
+
+describe('the CHANGELOG release entry, read through OPERATOR_TEXTS (b.jg5 SRJ-1107; SRJ-1101 list)', () => {
+  const changelog = () => operatorText(CHANGELOG_FILE)
+
+  describe('OPERATOR_TEXTS', () => {
+    test("holds exactly SRJ-1101's seven operator texts, each read from the repository", () => {
+      expect(OPERATOR_TEXTS.map(([name]) => name)).toEqual([
+        'README.md',
+        'skills/debug-slack-channel-bots/SKILL.md',
+        'skills/install-cscb/SKILL.md',
+        'skills/setup-slack-channel-bots/SKILL.md',
+        'docs/architecture.md',
+        'docs/engineering-guide.md',
+        'CHANGELOG.md',
+      ])
+      expect(OPERATOR_TEXTS.filter(([, read]) => read().trim() === '').map(([name]) => name)).toEqual([])
+    })
+
+    test('SHIPPED_TEXTS, which the forbidden-term audit reads, still holds neither the CHANGELOG nor any docs/ file', () => {
+      expect(SHIPPED_TEXTS.map(([name]) => name).filter((name) => name === CHANGELOG_FILE || name.startsWith('docs/'))).toEqual([])
+    })
+
+    test.each(OPERATOR_TEXTS)(`%s: no heading titled "${UPGRADE_STEPS_TITLE}" and no link to its anchor (SRJ-1107)`, (_name, read) => {
+      expect(upgradeStepsProblems(read())).toEqual([])
+    })
+
+    test.each(OPERATOR_TEXTS)('%s: no "checks its tmux session first" (SRJ-1107)', (_name, read) => {
+      expect(tmuxFirstProblems(read())).toEqual([])
+    })
+
+    test.each([
+      ['a heading', `### ${UPGRADE_STEPS_TITLE}\n\nTake these steps in order.`, upgradeStepsProblems, [`heading "### ${UPGRADE_STEPS_TITLE}"`]],
+      ['a link to its anchor', `Stop the old bots (step 1 of [${UPGRADE_STEPS_TITLE}](#${headingSlug(UPGRADE_STEPS_TITLE)})).`, upgradeStepsProblems, [`link (#${headingSlug(UPGRADE_STEPS_TITLE)})`]],
+      ['the relaunch wording, wrapped', 'but the server checks its tmux\nsession first and relaunches it', tmuxFirstProblems, ['checks its tmux session first']],
+    ] as const)("self-check: b.ob2's %s is reported", (_label, text, problems, expected) => {
+      expect(problems(text)).toEqual([...expected])
+    })
+  })
+
+  describe('the release entry', () => {
+    test.each(RELEASE_ENTRY_CHECKS)('%s', (element, problems) => {
+      expect({ element, problems: problems(changelog()) }).toEqual({ element, problems: [] })
+    })
+
+    const breakingNote = (text: string) => text.replace(/^### Requires agent-director Phase 1\n[\s\S]*?(?=^### )/m, '')
+    const REVERTS: [element: string, how: string, edit: (text: string) => string][] = [
+      [RELEASE_ENTRY_CHECKS[0][0], 'an earlier release entry placed first', (text) => text.replace(/^## /m, '## 1.0.0\n\nAn earlier release.\n\n## ')],
+      [RELEASE_ENTRY_CHECKS[0][0], 'a second unreleased entry', (text) => `${text}\n## Unreleased (patch)\n\nMore.\n`],
+      ...BREAKING_NOTE.map(([part]): [string, string, (text: string) => string] => [`the breaking note: ${part}`, "the breaking note dropped, as in b.ob2's entry", breakingNote]),
+      ['`access.json` is kept until rollback is no longer wanted, because the previous CSCB reads it', 'the keep sentence dropped', (text) =>
+        text.replace(/ Keep `access\.json` until rollback is no longer wanted, because the previous CSCB reads it\./, '')],
+      ['nothing in the file tells the reader to delete `access.json`', "b.ob2's upgrade note back", (text) =>
+        `${text}\n### Upgrade note: leftover \`access.json\`\n\nAn upgraded host keeps any existing \`access.json\` in the state directory. The server never reads it, so it is an ignored file. Delete it by hand once the personas are running:\n\n\`\`\`sh\nrm "\${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}/access.json"\n\`\`\`\n`],
+      ['the prompt-open relaunch note says the server checks the session through agent-director', "b.ob2's tmux-first wording", (text) =>
+        text.replace('checks the session through agent-director', 'checks its tmux session first')],
+      [RELEASE_ENTRY_CHECKS.find(([e]) => e.startsWith('the note "'))![0], "b.ob2's note back", (text) =>
+        text.replace(/^- \*\*One stuck persona/m, "- **The server's own tmux commands act only on a bot's own session.** When the server ends a bot's leftover tmux session before a relaunch, it now names the session exactly.\n- **One stuck persona")],
+      [RELEASE_ENTRY_CHECKS.find(([e]) => e.startsWith("the prefix-key note's"))![0], "b.ob2's reason", (text) =>
+        text.replace(/The reason: [^\n]*?could reach another persona's session\./, `agent-director ${OLD_AD_VERSION} finds a persona's tmux session by a name that also matches the start of a longer one, so with such a pair it could read, type into or end the other persona's session.`)],
+      ['the fresh-once note stays, its rows kept and never resumed, pointing to the switch-over runbook', "b.ob2's pointer to the upgrade steps", (text) =>
+        text.replace(/(starts fresh once\.[^\n]*?)\(see \[[^\]]*\]\([^)]*\)\)/i, `$1(step 1 of [${UPGRADE_STEPS_TITLE}](#${headingSlug(UPGRADE_STEPS_TITLE)}))`)],
+      [ROW_DELETION_ELEMENT, 'another agent-director version named', (text) =>
+        text.replace(`agent-director ${PHASE1_FLOOR_VERSION}, its Phase 1 release`, `agent-director ${OLD_AD_VERSION}, its Phase 1 release`)],
+      [ROW_DELETION_ELEMENT, 'a release candidate of the floor named', (text) =>
+        text.replace(`agent-director ${PHASE1_FLOOR_VERSION}, its Phase 1 release`, `agent-director ${PHASE1_FLOOR_VERSION}-rc.1, its Phase 1 release`)],
+      [ROW_DELETION_ELEMENT, 'no version named', (text) =>
+        text.replace(`agent-director ${PHASE1_FLOOR_VERSION}, its Phase 1 release`, "agent-director's Phase 1 release")],
+      [ROW_DELETION_ELEMENT, '`agent-director-admin` dropped', (text) =>
+        text.replace('its separate `agent-director-admin` binary', 'a separate binary')],
+    ]
+
+    test.each(REVERTS)('self-check: "%s" fails with %s', (element, _how, edit) => {
+      const text = changelog()
+      const edited = edit(text)
+      expect(edited).not.toBe(text)
+      expect(releaseCheck(element)(edited)).not.toEqual([])
+    })
+
+    test.each(HATCH_NOTE_NAMES)('the release notes name %s as a code span (%s)', (name) => {
+      expect(flat(releaseNotes(changelog()))).toContain(code(name))
+    })
+  })
+
+  describe('the runbook copies (SRJ-1107; hatch A3: the README is the maintained copy)', () => {
+    test.each(RUNBOOK_COPIES)('the copy of "%s" names the README section as the maintained copy, by a link that resolves', (title, heading) => {
+      const units = textUnits(requiredSection(releaseEntry(changelog()), heading, CHANGELOG_FILE)).filter((unit) => MAINTAINED_COPY.test(unit))
+      expect(units).toHaveLength(1)
+      const anchor = headingSlug(title)
+      expect(linksWithText(units[0]).filter((link) => link.path === 'README.md' && link.anchor === anchor).map((link) => link.target)).toEqual([`README.md#${anchor}`])
+      expect(headingAt(readRepoFile('README.md'), anchor)?.text).toBe(heading)
+    })
+
+    test.each(RUNBOOK_COPIES)("the copy of \"%s\" is the README section word for word, headings included, once its maintained-copy line is dropped and its README.md# links read as the README's own", (_title, heading) => {
+      const readmeSection = requiredSection(readRepoFile('README.md'), heading, 'README.md')
+      const copy = asReadmeText(requiredSection(releaseEntry(changelog()), heading, CHANGELOG_FILE))
+      expect(sectionChunks(copy)).toEqual(sectionChunks(readmeSection))
+    })
+
+    // The audit reads only SHIPPED_TEXTS, so the README copies' token-variable check does not reach the CHANGELOG's.
+    test.each(RUNBOOK_COPIES)('the copy of "%s" names no Slack token environment variable (SRJ-1516: the runbooks never name one)', (_title, heading) => {
+      const group = FORBIDDEN_TERMS.find((g) => g.name === 'the token environment variables')
+      if (group === undefined) throw new Error('FORBIDDEN_TERMS has no group "the token environment variables"')
+      const section = requiredSection(releaseEntry(changelog()), heading, CHANGELOG_FILE)
+      expect(findTerms(CHANGELOG_FILE, section, group.terms).map(formatHit)).toEqual([])
+      expect(flat(section)).toMatch(ci('the Slack token environment variables'))
+    })
+  })
+
+  describe('links', () => {
+    test(`every link in ${CHANGELOG_FILE} resolves: a same-file anchor to a heading in it, a README.md or other repository link to an existing file and heading`, () => {
+      const { checked, broken } = brokenRepoLinks(CHANGELOG_FILE, changelog())
+      expect(broken).toEqual([])
+      expect(checked).toBeGreaterThan(0)
+    })
+
+    test.each([
+      [`a link to the removed "${GONE_TITLE}"`, `See [${GONE_TITLE}](README.md#${headingSlug(GONE_TITLE)}).`, `${CHANGELOG_FILE} -> README.md#${headingSlug(GONE_TITLE)} (no such heading in README.md)`],
+      ['a same-file anchor with no heading', `See [${UPGRADE_STEPS_TITLE}](#${headingSlug(UPGRADE_STEPS_TITLE)}).`, `${CHANGELOG_FILE} -> #${headingSlug(UPGRADE_STEPS_TITLE)} (no such heading in ${CHANGELOG_FILE})`],
+      ['a missing file', 'See [the notes](docs/no-such-file.md).', `${CHANGELOG_FILE} -> docs/no-such-file.md (no such file)`],
+    ])('self-check: %s fails naming the link', (_label, text, problem) => {
+      expect(brokenRepoLinks(CHANGELOG_FILE, text).broken).toEqual([problem])
     })
   })
 })

@@ -2439,7 +2439,7 @@ The orchestrator system prompt's "hold until after" wording goes out now (operat
 
 ### Rolling back the switch-over
 
-This runbook takes a host that ran [Switching over to agent-director Phase 1](#switching-over-to-agent-director-phase-1) back to the previous CSCB on agent-director 0.10.0. Both binaries are rolled back together, the same way they were installed together.
+This runbook takes the host back to the previous CSCB on agent-director 0.10.0, whether agent-director Phase 1 was installed by [Switching over to agent-director Phase 1](#switching-over-to-agent-director-phase-1) or some other way. Both binaries are rolled back together.
 
 - The previous agent-director is restored only with agent-director's emergency downgrade recipe, in step 6. Never restore `state.db` from the switch-over's backup: the store is shared by every agent-director user on the host, and a restore would drop the rows of other services' workers spawned since the switch-over, leaving them running with no row.
 - Every agent on the host, with every long-running agent-director process (`agent-director serve` included), is stopped before the previous binary is restored and started again after it.
@@ -2490,7 +2490,7 @@ Nothing goes on to step 6 while such a worker runs, because every agent must be 
 
 #### Step 5: Check for leftover persona sessions
 
-As the workers' user, on the socket switch-over step 1 pinned, run a read-only `tmux ls`, and confirm that no `slack_bot_<key>` session is left. Handle each leftover by its row's current state:
+As the workers' user, on the socket switch-over step 1 pinned, run a read-only `tmux ls`, and confirm that no `slack_bot_<key>` session is left. Handle each leftover by whether it has a row and, if it has one, by that row's current state:
 
 - **A leftover whose row is live:** end it with `agent-director kill --claude-instance-id cscb_<key>`. When that `kill` is refused with "not this launch's session", handle it as "Operator actions" describes.
 - **A finished row's own leftover session:** handle it as "Operator actions" describes.
@@ -2518,7 +2518,7 @@ Revert the orchestrator system prompt's "hold until after" wording that switch-o
 1. Move aside `config.json.last-applied` and `retired-keys.json` (see [Files beside the config file](#files-beside-the-config-file)).
 2. Reinstall the previous CSCB, the version switch-over step 1 recorded, or else the version the host ran before, without starting it:
    ```sh
-   bun install -g claude-slack-channel-bots@<the version switch-over step 1 recorded>
+   bun install -g claude-slack-channel-bots@<the previous version>
    ```
 3. Put back what switch-over step 1 saved: the pre-persona `config.json`, the crontable, the `/interject` callers (the host crontab's `curl` lines included), `access.json` and the Slack token environment variables.
 4. Where switch-over step 1's copy of a file is missing, the operator rebuilds the pre-persona file by hand from the persona configuration, reversing the manual conversion in [Upgrading to personas](#upgrading-to-personas). No tooling does this: CSCB ships no conversion tooling in either direction.
