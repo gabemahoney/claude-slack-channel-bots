@@ -32,9 +32,22 @@
  *   naming its path and why it is stale (every command that takes the lock
  *   passes a sink for it), then replaced, and a leftover container whose
  *   runner is alive is never removed;
- * - the image's agent-director binary is the host's own, found as its client
- *   finds it (`~/.agent-director/bin` first, then PATH in order), by real
- *   path, and only a regular executable file (`lib/agent-director-binary.ts`);
+ * - the image's agent-director binary is the one given with
+ *   `--agent-director-binary`, checked by reading only the given path and its
+ *   real path (it must resolve to a regular file with the execute bit) and
+ *   staged by its real path; a given path that does not qualify is refused
+ *   with a reason naming the option, never replaced by a host binary. With
+ *   none given it is the host's own, found as its client finds it
+ *   (`~/.agent-director/bin` first, then PATH in order), by real path, and
+ *   only a regular executable file (`lib/agent-director-binary.ts`). The
+ *   runner only reads it and copies it into a fresh temp dir under the OS
+ *   temp dir, the build's named context, removed in a finally: it never runs
+ *   it on the host;
+ * - a failed live image build is told apart by `Dockerfile.live`'s own ERROR
+ *   lines (`liveBuildErrorLines`, `liveBuildFailureMessage`), never by docker's
+ *   lines that quote the RUN text; no failure text, the runner's or
+ *   `Dockerfile.live`'s, advises upgrading or installing the host's
+ *   agent-director or names the install-agent-director skill;
  * - the runner waits for the boot it caused and accepts only that boot
  *   number with status `ok` (`lib/container-boot.ts`);
  * - every command that changes CSCB, tmux or agent-director runs through
@@ -54,11 +67,36 @@
  *   around each, stopped before Teardown, halted by a stop's cleanup, its
  *   report in the results), reaches the container only through the checks'
  *   helpers, and its one agent-director command, the fallback deny, runs
- *   behind the plan's `guard`.
+ *   behind the plan's `guard`;
+ * - the /ci images name one base tag, `BASE_IMAGE`: the `FROM` lines of
+ *   `docker/Dockerfile.test` and `docker/Dockerfile.live` and the `/ci` and
+ *   `/ci-live` skills; the base (`docker/Dockerfile.test.base`) reads one
+ *   file from the repo context, the client-under-test check
+ *   (`RC_CLIENT_CHECK_SOURCE`, never `package.json`), and installs nothing
+ *   but its global agent-director client, from the release candidate's
+ *   client tarball (no registry); it takes the release candidate and
+ *   `install.sh` only from their named build contexts, checks them
+ *   (SHA256SUMS, the pinned version and commit, the pinned SHA-256) before
+ *   installing them, puts the release candidate's binary in a directory of
+ *   its own first on PATH (never /usr/local/bin) and the 0.10.0 binary,
+ *   fetched for its pinned release, off PATH, installs `sqlite3` and `file`
+ *   and writes the marker /etc/cscb-ci-image; `Dockerfile.live` and the three
+ *   `docker/live` scripts' PATH lines use the base's release-candidate
+ *   directory;
+ * - the client under test (`ci-live/lib/rc-client.ts`): the base copies the
+ *   check to `RC_CLIENT_CHECK` and installs its global client from the path
+ *   in the release record, then runs `--client` on it; `Dockerfile.live`
+ *   copies no `package.json`, installs no agent-director (its one package
+ *   install is Claude Code's) and runs `--client` on that global client after
+ *   staging its binary, stopping the build on failure; test-1 runs
+ *   `--package` on the package it installed into /test-repo right after the
+ *   install, failing the test on failure. The check's path is imported, never
+ *   typed.
  *
  * Nothing here runs docker: spawns go to a recording fake. The wiring that
  * lives in `ci-live/runtime/` and `ci-live/main.ts` (which load
- * playwright-core, so no test imports them) is pinned by a source audit.
+ * playwright-core, so no test imports them) and the /ci images' Dockerfiles,
+ * skills and scripts are pinned by source audits.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -68,12 +106,14 @@ import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathS
 import { tmpdir } from 'node:os'
 import { basename, delimiter, dirname, join, relative, resolve } from 'node:path'
 
-import { hostAgentDirectorBinary, type BinaryProbe } from '../ci-live/lib/agent-director-binary.ts'
+import { hostAgentDirectorBinary, selectAgentDirectorBinary, type BinaryProbe } from '../ci-live/lib/agent-director-binary.ts'
+import { AGENT_DIRECTOR_BINARY_OPTION } from '../ci-live/lib/args.ts'
 import { BOOT_DONE_FILE, bootProblem, bootReached, parseBootDone, type BootRecord } from '../ci-live/lib/container-boot.ts'
 import { HELPERS_PATH, TestContainer } from '../ci-live/lib/container.ts'
 import { CONTAINER_LOGS_URGENT_WAIT_MS, CONTAINER_LOGS_WAIT_MS } from '../ci-live/lib/container-logs.ts'
 import {
   assertSafeRunArgs,
+  BASE_IMAGE,
   buildExecArgs,
   buildImageArgs,
   buildRunArgs,
@@ -86,6 +126,8 @@ import {
   DockerCli,
   INSPECT_OWNER_FORMAT,
   isLiveContainerName,
+  liveBuildErrorLines,
+  liveBuildFailureMessage,
   parseContainerOwnership,
   parseContainerStats,
   parseMemorySize,
@@ -94,6 +136,7 @@ import {
 } from '../ci-live/lib/docker.ts'
 import { CHILD_ENV_ALLOWLIST, minimalChildEnv, type ProcResult, type SpawnOptions } from '../ci-live/lib/proc.ts'
 import { isLiveRunnerPid, lockHolder, lockPid, nodeLockDeps, RunLock, type LockDeps } from '../ci-live/lib/run-lock.ts'
+import { RC_CLIENT_CHECK, RC_CLIENT_CHECK_SOURCE } from '../ci-live/lib/rc-client.ts'
 import { NotRunnableError } from '../ci-live/lib/secrets.ts'
 import { balancedAfter, callArguments, callsOf, indicesOf, objectProperties, onlyCallArguments, splitTopLevel, stripComments } from './test-helpers/source-audit.ts'
 import { APP_TOKEN_PREFIX, assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL } from './test-helpers/credentials.ts'
@@ -746,7 +789,7 @@ describe('RunLock', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The host's agent-director binary (the image's build context)
+// The agent-director binary the image is built with: the given one, else the host's (the image's build context)
 // ---------------------------------------------------------------------------
 
 describe('hostAgentDirectorBinary', () => {
@@ -841,6 +884,56 @@ describe('hostAgentDirectorBinary', () => {
     expect(accessed(none.calls)).toEqual([HOME_BIN, '/usr/bin/agent-director', '/bin/agent-director'])
   })
 
+  describe(`selectAgentDirectorBinary: the binary given with ${AGENT_DIRECTOR_BINARY_OPTION}, else the host search`, () => {
+    const OPTION = AGENT_DIRECTOR_BINARY_OPTION
+    const GIVEN = '/rc/agent-director'
+    /** A home install and a PATH binary, both executable: a fallback to the search would find them. */
+    const SEARCHABLE: Record<string, Entry> = { [HOME_BIN]: 'exec', '/opt/a/agent-director': 'exec', '/opt/dir': 'dir' }
+    /** Every path the probe read, once each. */
+    const touched = (calls: string[]) => [...new Set(calls.map((c) => c.slice(c.indexOf(' ') + 1)))]
+
+    test('a given binary is returned by its real path, and the given path and its real path are all the probe reads: no home install or PATH candidate', () => {
+      const real = '/rc/store/agent-director-0.11.0-rc.1'
+      const p = fakeProbe({ ...SEARCHABLE, [GIVEN]: `-> ${real}`, [real]: 'exec' })
+      expect(selectAgentDirectorBinary(GIVEN, HOME, onPath('/opt/a'), p.probe)).toEqual({ source: 'given', path: real })
+      expect(p.calls).toEqual([`realpath ${GIVEN}`, `isFile ${real}`, `access ${real}`])
+    })
+
+    // The fake's realpath answers a missing path with itself, so the exact reason for a missing path and a dangling
+    // symlink is pinned on the real file system below; here every kind shows the refusal and that nothing else is read.
+    test.each<[string, Entry | undefined, string]>([
+      ['missing', undefined, expect.stringContaining(` given with ${OPTION} `)],
+      ['a dangling symlink', '-> /gone/agent-director', expect.stringContaining(` given with ${OPTION} `)],
+      ['not executable', 'noexec', `the file given with ${OPTION} is not executable (no execute bit for this user)`],
+      ['a directory', 'dir', `the path given with ${OPTION} is not a regular file`],
+      ['a symlink to a directory', '-> /opt/dir', `the path given with ${OPTION} is not a regular file`],
+      ['a symlink loop (its realpath fails)', 'realpath-fails', `the path given with ${OPTION} does not exist (a missing file or a dangling symlink)`],
+      ['unreadable (its stat fails)', 'stat-fails', `the path given with ${OPTION} cannot be read (its stat failed)`],
+    ])('a given path that is %s is refused with a reason naming the option, never replaced by the search', (_what, entry, reason) => {
+      const entries: Record<string, Entry> = { ...SEARCHABLE }
+      if (entry !== undefined) entries[GIVEN] = entry
+      const p = fakeProbe(entries)
+      expect(selectAgentDirectorBinary(GIVEN, HOME, onPath('/opt/a'), p.probe)).toEqual({ source: 'given', path: null, reason })
+      const real = entry?.startsWith('-> ') ? entry.slice(3) : GIVEN
+      expect(p.calls.length).toBeGreaterThan(0)
+      expect(touched(p.calls).filter((path) => path !== GIVEN && path !== real)).toEqual([])
+    })
+
+    test.each<[string, Record<string, Entry>, string | undefined]>([
+      ['the home install', { [HOME_BIN]: 'exec', '/opt/a/agent-director': 'exec' }, onPath('/opt/a')],
+      ['the first PATH match', { '/opt/b/agent-director': 'exec', '/opt/c/agent-director': 'exec' }, onPath('/opt/a', '/opt/b', '/opt/c')],
+      ['a PATH symlink, by real path', { '/usr/local/bin/agent-director': '-> /opt/ad/2.0/agent-director', '/opt/ad/2.0/agent-director': 'exec' }, onPath('/usr/local/bin')],
+      ['nothing (null)', { '/opt/a/agent-director': 'noexec' }, onPath('/opt/a', '/bin')],
+      ['an undefined PATH (the home install only)', { '/usr/bin/agent-director': 'exec' }, undefined],
+    ])("with none given, the host search answers, reading what it reads: %s", (_what, entries, path) => {
+      const host = fakeProbe(entries)
+      const selected = fakeProbe(entries)
+      expect(selectAgentDirectorBinary(undefined, HOME, path, selected.probe)).toEqual({ source: 'found', path: hostAgentDirectorBinary(HOME, path, host.probe) })
+      expect(selected.calls).toEqual(host.calls)
+      expect(accessed(selected.calls)[0]).toBe(HOME_BIN)
+    })
+  })
+
   describe('on the real file system (the default probe)', () => {
     let root: string
     beforeEach(() => {
@@ -872,6 +965,45 @@ describe('hostAgentDirectorBinary', () => {
       expect(hostAgentDirectorBinary(home, onPath(join(root, 'noexec'), join(root, 'dir')))).toBeNull()
       const homeBin = file('home/.agent-director/bin/agent-director', 0o700)
       expect(hostAgentDirectorBinary(home, path)).toBe(homeBin)
+    })
+
+    /** A temp home install and a temp PATH directory (passed as an argument, never on the process PATH), each holding an executable agent-director. */
+    function searchable(): { home: string; path: string } {
+      file('home/.agent-director/bin/agent-director', 0o755)
+      file('path/agent-director', 0o755)
+      return { home: join(root, 'home'), path: onPath(join(root, 'path')) }
+    }
+
+    test(`a file given with ${AGENT_DIRECTOR_BINARY_OPTION} behind a symlink is selected by its real path, over the home install and PATH binaries`, () => {
+      const { home, path } = searchable()
+      const real = file('rc/agent-director-0.11.0-rc.1', 0o755)
+      mkdirSync(join(root, 'given'))
+      symlinkSync(real, join(root, 'given', 'agent-director'))
+      expect(selectAgentDirectorBinary(join(root, 'given', 'agent-director'), home, path)).toEqual({ source: 'given', path: real })
+    })
+
+    test.each<[string, () => string, string]>([
+      ['missing', () => join(root, 'absent'), `the path given with ${AGENT_DIRECTOR_BINARY_OPTION} does not exist (a missing file or a dangling symlink)`],
+      [
+        'a dangling symlink',
+        () => {
+          symlinkSync(join(root, 'gone'), join(root, 'dangling'))
+          return join(root, 'dangling')
+        },
+        `the path given with ${AGENT_DIRECTOR_BINARY_OPTION} does not exist (a missing file or a dangling symlink)`,
+      ],
+      [
+        'a directory',
+        () => {
+          mkdirSync(join(root, 'dir'))
+          return join(root, 'dir')
+        },
+        `the path given with ${AGENT_DIRECTOR_BINARY_OPTION} is not a regular file`,
+      ],
+      ['a file with no execute bit', () => file('noexec/agent-director', 0o644), `the file given with ${AGENT_DIRECTOR_BINARY_OPTION} is not executable (no execute bit for this user)`],
+    ])('a given path that is %s is refused with its reason; the home install and PATH binaries are not used', (_what, given, reason) => {
+      const { home, path } = searchable()
+      expect(selectAgentDirectorBinary(given(), home, path)).toEqual({ source: 'given', path: null, reason })
     })
   })
 })
@@ -1096,7 +1228,7 @@ describe('runner wiring (source audit of ci-live/)', () => {
     expect(calls[0]).toContain('{ env: minimalChildEnv(process.env),')
     expect(calls[1]).toBe('argv, { env, timeoutMs: 30_000 }')
     expect(text).toContain('const env = minimalChildEnv(process.env)\n  return {\n    run: (argv: readonly string[]) => bunSpawn(argv, { env, timeoutMs: 30_000 }),')
-    expect(text).toContain('new ContainerRun(bunSpawn, env.log, env.runId, REPO_ROOT)')
+    expect(text).toContain('new ContainerRun(bunSpawn, env.log, env.runId, REPO_ROOT, env.options.agentDirectorBinary)')
   })
 
   test('ContainerRun runs on the host only npm pack, git rev-parse and git status, and only these docker commands', () => {
@@ -1561,9 +1693,116 @@ describe('runner wiring (source audit of ci-live/)', () => {
     expect(text).toContain('return parseBootDone(r.code, r.stdout)')
     expect(text).toContain('bootReached(await this.lastBoot(), n)')
     expect(text).toContain('const problem = bootProblem(done, n)')
-    expect(text).toContain('hostAgentDirectorBinary(homedir(), minimalChildEnv(process.env).PATH)')
+    // The binary: only through selectAgentDirectorBinary, given the option's path, the host home and the child PATH, once in the runner.
+    const selections = runnerSources().flatMap((p) => {
+      const t = stripComments(readFileSync(p, 'utf-8'))
+      return ['selectAgentDirectorBinary', 'checkGivenAgentDirectorBinary', 'hostAgentDirectorBinary'].flatMap((fn) => callsOf(t, fn).map((at) => `${relative(CI_LIVE, p)}: ${fn}(${callArguments(t, at)})`))
+    })
+    expect(selections.filter((s) => !s.startsWith(`${join('lib', 'agent-director-binary.ts')}: `))).toEqual([
+      `${join('runtime', 'container-run.ts')}: selectAgentDirectorBinary(this.givenAgentDirectorBinary, homedir(), minimalChildEnv(process.env).PATH)`,
+    ])
     // No second copy of the parsing or the search: no boot-record regex, no direct file-system probe.
     expect([/\(\\d\+\) \(\[a-z-\]\+\)/.test(text), /\b(accessSync|realpathSync|statSync)\b/.test(text)]).toEqual([false, false])
+  })
+
+  test("the selected binary's path is only read and copied into a fresh temp dir under tmpdir(), the build's named context, removed through removeStage in a finally; it reaches no spawn, host argv or docker argv", () => {
+    const text = code(join('runtime', 'container-run.ts'))
+    // The option's path is set by parseArgs and reaches only ContainerRun's constructor, which keeps it for the selection.
+    /** Every line of the runner's sources holding a match of `re`, as `<file>: <line>`. */
+    const linesIn = (re: RegExp) =>
+      runnerSources()
+        .flatMap((p) => {
+          const t = stripComments(readFileSync(p, 'utf-8'))
+          return indicesOf(re, t).map((at) => `${relative(CI_LIVE, p)}: ${t.slice(t.lastIndexOf('\n', at) + 1, t.indexOf('\n', at)).trim()}`)
+        })
+        .sort()
+    expect(linesIn(/\boptions\.agentDirectorBinary\b/g)).toEqual([
+      `${join('lib', 'args.ts')}: options.agentDirectorBinary = value`,
+      'main.ts: const container = new ContainerRun(bunSpawn, env.log, env.runId, REPO_ROOT, env.options.agentDirectorBinary)',
+    ])
+    expect([...text.matchAll(/\bgivenAgentDirectorBinary\b[^\n]*/g)].map((m) => m[0])).toEqual([
+      'givenAgentDirectorBinary?: string,',
+      'givenAgentDirectorBinary, homedir(), minimalChildEnv(process.env).PATH)',
+    ])
+    // The selection runs twice: main.ts's precondition (its answer dropped) and buildImage's, which stages it.
+    expect(linesIn(/\.agentDirectorBinary\(\)/g)).toEqual(['main.ts: container.agentDirectorBinary()', `${join('runtime', 'container-run.ts')}: const binary = this.agentDirectorBinary()`])
+    // buildImage: select, a fresh temp dir under the OS temp dir (kept for removeStage), the copy and its mode, the build, and the dir's removal in the finally.
+    const build = text.slice(...balancedAfter(text, text.indexOf('async buildImage('), '{', '}'))
+    expectInOrder(build, [
+      'const binary = this.agentDirectorBinary()',
+      'const staged = mkdtempSync(join(tmpdir(), `cscb-ci-live-ad-${this.runId}-`))',
+      'this.stageDir = staged',
+      'try {',
+      "copyFileSync(binary.path, join(staged, 'agent-director'))",
+      "chmodSync(join(staged, 'agent-director'), 0o755)",
+      'buildImageArgs({ repoRoot: this.repoRoot, uid, gid, agentDirectorDir: staged })',
+      'finally {',
+    ])
+    expect(build.slice(...balancedAfter(build, build.indexOf('finally {'), '{', '}')).trim()).toBe('this.removeStage()')
+    // Every line naming the binary or the staged dir: the path is read by the copy and logged, nothing else.
+    const linesWith = (re: RegExp) => build.split('\n').filter((l) => re.test(l)).map((l) => l.trim())
+    expect(linesWith(/\bbinary\b/)).toEqual([
+      'const binary = this.agentDirectorBinary()',
+      "copyFileSync(binary.path, join(staged, 'agent-director'))",
+      "const how = binary.source === 'given' ? `given with ${AGENT_DIRECTOR_BINARY_OPTION}` : `found on this host (none was given with ${AGENT_DIRECTOR_BINARY_OPTION})`",
+      'this.log.info(`container: building the live image with the agent-director binary ${binary.path}, ${how}`)',
+    ])
+    expect(linesWith(/\bstaged\b/)).toEqual([
+      'const staged = mkdtempSync(join(tmpdir(), `cscb-ci-live-ad-${this.runId}-`))',
+      'this.stageDir = staged',
+      "copyFileSync(binary.path, join(staged, 'agent-director'))",
+      "chmodSync(join(staged, 'agent-director'), 0o755)",
+      'const r = await this.docker.run(buildImageArgs({ repoRoot: this.repoRoot, uid, gid, agentDirectorDir: staged }), { timeoutMs: 600_000, cwd: this.repoRoot })',
+    ])
+    // The file system: these four calls only, and the two temp dirs (the pack's, the binary's) are fresh ones under tmpdir().
+    expect(text).toMatch(/^import \{ chmodSync, copyFileSync, mkdtempSync, rmSync \} from 'node:fs'$/m)
+    expect(indicesOf(/from 'node:fs|from 'fs/g, text).length).toBe(1)
+    expect(callsOf(text, 'mkdtempSync').map((at) => callArguments(text, at))).toEqual(['join(tmpdir(), `cscb-ci-live-pack-${this.runId}-`)', 'join(tmpdir(), `cscb-ci-live-ad-${this.runId}-`)'])
+    expect([callsOf(text, 'copyFileSync').length, callsOf(text, 'chmodSync').length]).toEqual([1, 1])
+    // No spawn, host argv or docker argv names the binary; the staged dir only as buildImageArgs' named context.
+    const spawned = indicesOf(/\bthis\.(host|spawn|docker\.run)\(/g, text).map((at) => callArguments(text, at).replace(/\s+/g, ' ').trim())
+    expect(spawned.filter((args) => /\bbinary\b|AgentDirectorBinary|\bselected\b/.test(args))).toEqual([])
+    expect(spawned.filter((args) => /\bstaged\b/.test(args))).toEqual(['buildImageArgs({ repoRoot: this.repoRoot, uid, gid, agentDirectorDir: staged }), { timeoutMs: 600_000, cwd: this.repoRoot }'])
+  })
+
+  test("the staged binary's temp dir is removed only by removeStage, once: buildImage's finally and the run's one cleanup (a signal's or the memory watchdog's stop mid-build) call it", () => {
+    const text = code(join('runtime', 'container-run.ts'))
+    // The field: null until buildImage's mkdtempSync, set on the very next line (before the try), and cleared only by removeStage.
+    const build = text.slice(...balancedAfter(text, text.indexOf('async buildImage('), '{', '}'))
+    expect(build).toMatch(/^\s*const staged = mkdtempSync\(join\(tmpdir\(\), `cscb-ci-live-ad-\$\{this\.runId\}-`\)\)\n\s*this\.stageDir = staged\n\s*try \{$/m)
+    expect([...text.matchAll(/^.*\bstageDir\b.*$/gm)].map((m) => m[0].trim())).toEqual([
+      'private stageDir: string | null = null',
+      'this.stageDir = staged',
+      'if (this.stageDir === null) return',
+      'rmSync(this.stageDir, { recursive: true, force: true })',
+      'this.stageDir = null',
+    ])
+    // removeStage: nothing once the dir is gone (or was never made); else the dir removed, then forgotten, so a second call does nothing.
+    const remove = text.slice(...balancedAfter(text, text.indexOf('removeStage(): void {'), '{', '}'))
+    expect(remove.split('\n').map((l) => l.trim()).filter(Boolean)).toEqual([
+      'if (this.stageDir === null) return',
+      'rmSync(this.stageDir, { recursive: true, force: true })',
+      'this.stageDir = null',
+    ])
+    // The file's removals: the failed pack's dir and the staged dir, nothing else.
+    expect(callsOf(text, 'rmSync').map((at) => callArguments(text, at))).toEqual(['dir, { recursive: true, force: true }', 'this.stageDir, { recursive: true, force: true }'])
+    // Its callers: buildImage's finally and runFull's cleanup, once each.
+    const callers = runnerSources()
+      .flatMap((p) => {
+        const t = stripComments(readFileSync(p, 'utf-8'))
+        return indicesOf(/\bremoveStage\(/g, t).map((at) => `${relative(CI_LIVE, p)}: ${t.slice(t.lastIndexOf('\n', at) + 1, t.indexOf('\n', at)).trim()}`)
+      })
+      .sort()
+    expect(callers).toEqual(['main.ts: container.removeStage()', `${join('runtime', 'container-run.ts')}: removeStage(): void {`, `${join('runtime', 'container-run.ts')}: this.removeStage()`])
+    // runFull's cleanup: in its try, on the line after the packed dir's removal.
+    const main = code('main.ts')
+    const runFull = main.slice(...balancedAfter(main, main.indexOf('async function runFull('), '{', '}'))
+    const cleanup = runFull.slice(...balancedAfter(runFull, runFull.indexOf('const cleanup = (cause?: StopCause): Promise<void> =>'), '{', '}'))
+    const cleanupTry = cleanup.slice(...balancedAfter(cleanup, cleanup.indexOf('try {'), '{', '}'))
+    expect(cleanupTry).toMatch(/\n\s*if \(state\.packed\) rmSync\(state\.packed\.dir, \{ recursive: true, force: true \}\)\n\s*container\.removeStage\(\)\n/)
+    // That cleanup is the run's only one, the one setActive hands the stop path (a signal's stopRun and the memory watchdog's abort run it).
+    expect(indicesOf(/\bconst cleanup = /g, runFull).length).toBe(1)
+    expect(objectProperties(runFull.slice(runFull.indexOf('{', runFull.indexOf('signals.setActive(')))).get('cleanup')).toBe('cleanup')
   })
 
   test("a dry run's secret store gets no environment, the dry-run flag and the real config dir to refuse", () => {
@@ -1613,5 +1852,466 @@ describe('runner wiring (source audit of ci-live/)', () => {
       ["'human'", 'humanMailbox'],
       ["'second'", 'null'],
     ])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The /ci images (source audit of docker/ and the /ci and /ci-live skills)
+// ---------------------------------------------------------------------------
+
+const REPO = join(import.meta.dir, '..')
+const BASE_DOCKERFILE = join('docker', 'Dockerfile.test.base')
+
+function repoFile(rel: string): string {
+  return readFileSync(join(REPO, rel), 'utf-8')
+}
+
+/** A Dockerfile's instructions: comment and blank lines dropped, continuation lines joined. */
+function dockerInstructions(rel: string): string[] {
+  const out: string[] = []
+  let current = ''
+  for (const line of repoFile(rel).split('\n')) {
+    const body = line.trim()
+    if (body.startsWith('#') || body === '') continue
+    if (body.endsWith('\\')) {
+      current += `${body.slice(0, -1)} `
+      continue
+    }
+    out.push(`${current}${body}`)
+    current = ''
+  }
+  return out
+}
+
+/** The one RUN instruction holding `fragment`. */
+function runWith(instructions: string[], fragment: string): string {
+  const runs = instructions.filter((i) => i.startsWith('RUN ') && i.includes(fragment))
+  expect(runs.length).toBe(1)
+  return runs[0]!
+}
+
+function expand(value: string, vars: Map<string, string>): string {
+  return value.replace(/\$\{(\w+)\}/g, (all, name: string) => vars.get(name) ?? all)
+}
+
+/** A RUN's plain assignments (`NAME=value;`, `NAME="value";`), each expanded over the ARG defaults and the assignments before it. */
+function shellVars(run: string, args: Record<string, string>): Map<string, string> {
+  const vars = new Map(Object.entries(args))
+  for (const statement of run.split(';')) {
+    const m = /^\s*([A-Z_][A-Z0-9_]*)=(?:"((?:[^"$]|\$\{\w+\})*)"|([\w./:-]+))\s*$/.exec(statement)
+    if (m) vars.set(m[1]!, expand(m[2] ?? m[3]!, vars))
+  }
+  return vars
+}
+
+/** Where a RUN's `install -m <mode> <src>/<file> <target>` statement puts `file` (expanded), and where the statement is. */
+function installTarget(run: string, file: string, vars: Map<string, string>): { at: number, target: string } {
+  const m = new RegExp(`(?:^|;)\\s*install\\s+-m\\s+\\d+\\s+"?[^\\s";]*/${file.replace(/\./g, '\\.')}"?\\s+"?([^\\s";]+)"?\\s*(?:;|$)`).exec(run)
+  expect(m).not.toBeNull()
+  return { at: m!.index, target: expand(m![1]!, vars) }
+}
+
+/** `docker/Dockerfile.test.base`: its instructions, ARG defaults, bind mounts (context → target) and default PATH, whose first directory is the release candidate's binary directory. */
+function baseImage() {
+  const instructions = dockerInstructions(BASE_DOCKERFILE)
+  const args = Object.fromEntries(instructions.flatMap((i) => {
+    const m = /^ARG (\w+)=(\S+)$/.exec(i)
+    return m ? [[m[1]!, m[2]!]] : []
+  }))
+  const mounts = new Map([...instructions.join('\n').matchAll(/--mount=type=bind,from=([\w-]+),target=(\S+)/g)].map((m) => [m[1]!, m[2]!]))
+  const env = instructions.filter((i) => i.startsWith('ENV PATH='))
+  expect(env.length).toBe(1)
+  const path = env[0]!.slice('ENV PATH='.length).split(':')
+  return { instructions, args, mounts, path, rcBinDir: path[0]! }
+}
+
+/**
+ * The shell statements of `lines` (RUN instructions, or a script's joined
+ * lines), split at `;`, `&&`, `||` and `|`, with every `echo "…"` string
+ * emptied (an ERROR line naming a command does not run it) and redirections
+ * dropped.
+ */
+function shellStatements(lines: string[]): string[] {
+  return lines.flatMap((line) => line
+    .replace(/\becho\s+"(?:[^"\\]|\\.)*"/g, 'echo ""')
+    .split(/;|&&|\|\|?/)
+    .map((s) => s.replace(/\s\d*>&?\s*[^\s;]+/g, '').trim())
+    .filter((s) => s !== ''))
+}
+
+/** The statements of the `if` at `statements[at]` up to its own `fi`, each with its nesting depth (0: the if's own body). */
+function ifBody(statements: string[], at: number): { depth: number, text: string }[] {
+  const body: { depth: number, text: string }[] = []
+  let depth = 0
+  for (const statement of statements.slice(at + 1)) {
+    if (statement === 'fi') {
+      if (depth === 0) return body
+      depth--
+      continue
+    }
+    const text = statement.replace(/^(then|else)\s+/, '')
+    if (/^if\s/.test(text)) depth++
+    body.push({ depth, text })
+  }
+  throw new Error(`no fi closes ${statements[at]}`)
+}
+
+describe('the /ci images (source audit)', () => {
+  const baseRepo = BASE_IMAGE.slice(0, BASE_IMAGE.indexOf(':'))
+
+  test.each([
+    join('docker', 'Dockerfile.test'),
+    join('docker', 'Dockerfile.live'),
+    BASE_DOCKERFILE,
+    join('.claude', 'skills', 'ci', 'SKILL.md'),
+    join('.claude', 'skills', 'ci-live', 'SKILL.md'),
+  ])('every base-image tag %s names is BASE_IMAGE', (rel) => {
+    const tags = [...repoFile(rel).matchAll(new RegExp(`${baseRepo}:[\\w-]+(?:\\.[\\w-]+)*`, 'g'))].map((m) => m[0])
+    expect(tags.length).toBeGreaterThan(0)
+    expect(tags.filter((tag) => tag !== BASE_IMAGE)).toEqual([])
+  })
+
+  test.each([join('docker', 'Dockerfile.test'), join('docker', 'Dockerfile.live')])('%s is built FROM BASE_IMAGE and nothing else', (rel) => {
+    expect(dockerInstructions(rel).filter((i) => /^FROM\s/i.test(i))).toEqual([`FROM ${BASE_IMAGE}`])
+  })
+
+  test("the /ci skill's BASE_TAG is BASE_IMAGE, and it builds docker/Dockerfile.test.base under that tag", () => {
+    const skill = repoFile(join('.claude', 'skills', 'ci', 'SKILL.md'))
+    expect([...skill.matchAll(/^\s*BASE_TAG=(\S+)/gm)].map((m) => m[1])).toEqual([BASE_IMAGE])
+    expect(skill).toContain('-f docker/Dockerfile.test.base -t "${BASE_TAG}" .')
+  })
+
+  test("the base reads one file from the repo context, the client-under-test check (no other COPY or ADD, so no package.json), and its one install is the global client from the release candidate's tarball (none from the registry); the 0.10.0 legs are packed at exact versions", () => {
+    const { instructions, args } = baseImage()
+    expect(instructions.filter((i) => /^(COPY|ADD)\s/i.test(i))).toEqual([`COPY --chmod=0755 ${RC_CLIENT_CHECK_SOURCE} ${RC_CLIENT_CHECK}`])
+    expect(shellStatements(instructions).filter((s) => /\bnpm\s+(i|install|add)\b|\bbun\s+(add|install)\b|\s(-g|--global)\b/.test(s))).toEqual([
+      'bun add -g --ignore-scripts "${RC_CLIENT_TGZ}"',
+    ])
+    expect([args.AD_PREV_VERSION, args.CSCB_PREV_VERSION].map((v) => /^\d+\.\d+\.\d+$/.test(v ?? ''))).toEqual([true, true])
+    const pack = runWith(instructions, 'npm pack')
+    expect([pack.includes('"agent-director@${AD_PREV_VERSION}"'), pack.includes('"claude-slack-channel-bots@${CSCB_PREV_VERSION}"')]).toEqual([true, true])
+  })
+
+  test('the base binds only the agent-director-rc and agent-director-install contexts, each with a fallback stage of its name', () => {
+    const { instructions, mounts } = baseImage()
+    expect([...mounts.keys()]).toEqual(['agent-director-rc', 'agent-director-install'])
+    expect(instructions.filter((i) => /^FROM\s+\S+\s+AS\s+agent-director-(rc|install)$/i.test(i)).length).toBe(2)
+  })
+
+  test("the release candidate is read from its context and checked against SHA256SUMS and the pinned version and commit before its binary is installed, first on PATH in a directory of its own (not /usr/local/bin), which the build checks", () => {
+    const { instructions, args, mounts, path, rcBinDir } = baseImage()
+    const rc = runWith(instructions, 'from=agent-director-rc,')
+    const vars = shellVars(rc, args)
+    expect(vars.get('RC_CTX')).toBe(mounts.get('agent-director-rc')!)
+    expect(rc).toContain('"${RC_CTX}/SHA256SUMS"')
+    expect(args.AD_RC_VERSION).toMatch(/^\d+\.\d+\.\d+-rc\.\d+$/)
+    expect(args.AD_RC_COMMIT).toMatch(/^[0-9a-f]{40}$/)
+    const binary = installTarget(rc, 'agent-director-linux-amd64', vars)
+    const checks = [rc.indexOf('sha256sum -c'), rc.indexOf('!= "${AD_RC_VERSION}"'), rc.indexOf('!= "${AD_RC_COMMIT}"')]
+    expect(checks.map((at) => at >= 0 && at < binary.at)).toEqual([true, true, true])
+    expect([rcBinDir === '/usr/local/bin', path.includes('/usr/local/bin')]).toEqual([false, true])
+    expect(binary.target).toBe(join(rcBinDir, 'agent-director'))
+    expect(instructions.filter((i) => i.includes('/usr/local/bin/agent-director'))).toEqual([])
+    expect(rc.indexOf('command -v agent-director')).toBeGreaterThan(binary.at)
+  })
+
+  test('install.sh is read from its context and checked against the pinned SHA-256 before it is installed off PATH', () => {
+    const { instructions, args, mounts, path } = baseImage()
+    expect(args.AD_INSTALL_SH_SHA256).toMatch(/^[0-9a-f]{64}$/)
+    const run = runWith(instructions, 'from=agent-director-install,')
+    const vars = shellVars(run, args)
+    expect(vars.get('INSTALL_CTX')).toBe(mounts.get('agent-director-install')!)
+    expect(run).toContain('"${INSTALL_CTX}/install.sh"')
+    const script = installTarget(run, 'install.sh', vars)
+    const check = run.indexOf('!= "${AD_INSTALL_SH_SHA256}"')
+    expect(check >= 0 && check < script.at).toBe(true)
+    expect([script.target.startsWith('/'), path.includes(dirname(script.target))]).toEqual([true, false])
+  })
+
+  test("the /ci skill extracts install.sh at the commit it reads from the base's ARG AD_INSTALL_SH_COMMIT, and types no commit of its own", () => {
+    const skill = repoFile(join('.claude', 'skills', 'ci', 'SKILL.md'))
+    const { args } = baseImage()
+    expect(args.AD_INSTALL_SH_COMMIT).toMatch(/^[0-9a-f]{40}$/)
+    // What the skill's `sed -n 's/^ARG AD_INSTALL_SH_COMMIT=//p'` prints: that ARG's default, once.
+    const sedOutput = repoFile(BASE_DOCKERFILE).split('\n').flatMap((l) => l.startsWith('ARG AD_INSTALL_SH_COMMIT=') ? [l.slice('ARG AD_INSTALL_SH_COMMIT='.length)] : [])
+    expect(sedOutput).toEqual([args.AD_INSTALL_SH_COMMIT!])
+    expect([...skill.matchAll(/^\s*AD_INSTALL_SH_COMMIT=(.*)$/gm)].map((m) => m[1])).toEqual([
+      `"$(sed -n 's/^ARG AD_INSTALL_SH_COMMIT=//p' ${BASE_DOCKERFILE})"`,
+    ])
+    expect([...skill.matchAll(/\bgit -C "\$\{CSCB_AD_SRC_DIR\}" show "([^"]*)"/g)].map((m) => m[1])).toEqual([
+      '${AD_INSTALL_SH_COMMIT}:skills/install-agent-director/install.sh',
+    ])
+    expect(skill.match(/\b[0-9a-f]{40}\b/g) ?? []).toEqual([])
+  })
+
+  test('the 0.10.0 binary is fetched for its pinned release into a directory off PATH', () => {
+    const { instructions, args, path } = baseImage()
+    const run = runWith(instructions, 'id=gh_token')
+    const vars = shellVars(run, args)
+    expect(vars.get('AD_TAG')).toBe(`v${args.AD_PREV_VERSION}`)
+    expect(run).toContain('/releases/tags/${AD_TAG}"')
+    const target = expand(/\s-o\s+"?([^\s";]+)"?/.exec(run)![1]!, vars)
+    expect(target).toMatch(/^\/[^$]*\/agent-director$/)
+    expect(path).not.toContain(dirname(target))
+  })
+
+  test('the base installs sqlite3 and file with apt and writes the marker /etc/cscb-ci-image', () => {
+    const { instructions } = baseImage()
+    const packages = instructions.flatMap((i) => [...i.matchAll(/apt-get install -y((?:\s+[a-z0-9][\w.+-]*)+)/g)].flatMap((m) => m[1]!.trim().split(/\s+/)))
+    expect(['sqlite3', 'file'].filter((p) => !packages.includes(p))).toEqual([])
+    expect(instructions.filter((i) => /^RUN\s.*>\s*\/etc\/cscb-ci-image(\s|$)/.test(i)).length).toBe(1)
+  })
+
+  test("Dockerfile.live copies the staged binary over the base's release-candidate binary and checks that it is the first agent-director on PATH", () => {
+    const bin = join(baseImage().rcBinDir, 'agent-director')
+    const live = dockerInstructions(join('docker', 'Dockerfile.live'))
+    expect(live.filter((i) => i.startsWith('COPY --from=agent-director-bin '))).toEqual([`COPY --from=agent-director-bin agent-director ${bin}`])
+    expect(runWith(live, 'command -v agent-director')).toContain(`if [ "$(command -v agent-director)" != ${bin} ]`)
+    expect(live.filter((i) => i.includes('/usr/local/bin/agent-director'))).toEqual([])
+  })
+
+  test.each(['cscb-live-helpers.sh', 'cscb-live-preflight.sh', 'entrypoint.sh'])("docker/live/%s's PATH lines start with the base's release-candidate directory", (file) => {
+    const { rcBinDir } = baseImage()
+    const firsts = [...repoFile(join('docker', 'live', file)).matchAll(/^\s*export PATH="([^"]*)"/gm)].map((m) => m[1]!.split(':')[0])
+    expect(firsts.length).toBeGreaterThan(0)
+    expect(firsts.filter((dir) => dir !== rcBinDir)).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The client under test (source audit of the base, Dockerfile.live and test-1)
+// ---------------------------------------------------------------------------
+
+const LIVE_DOCKERFILE = join('docker', 'Dockerfile.live')
+const TEST_1 = join('tests', 'integration', 'test-1-install-startup.sh')
+
+const escapeRegExp = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+/** The base's RUN that installs and checks its global client: the RUN, its position, its plain assignments and its statements. */
+function baseGlobalClientRun() {
+  const { instructions, args } = baseImage()
+  const run = runWith(instructions, ' --client ')
+  return { instructions, args, run, at: instructions.indexOf(run), vars: shellVars(run, args), statements: shellStatements([run]) }
+}
+
+describe('the client under test (source audit)', () => {
+  test("the base copies the check from RC_CLIENT_CHECK_SOURCE to RC_CLIENT_CHECK, then installs its global client from the tarball path the release record holds and runs the check's --client on it", () => {
+    const { instructions, args, run, at, vars, statements } = baseGlobalClientRun()
+    const copy = instructions.indexOf(`COPY --chmod=0755 ${RC_CLIENT_CHECK_SOURCE} ${RC_CLIENT_CHECK}`)
+    expect([copy >= 0, copy < at]).toEqual([true, true])
+    expect(statSync(join(REPO, RC_CLIENT_CHECK_SOURCE)).isFile()).toBe(true)
+
+    // The release record the release candidate's RUN writes holds the client tarball's fixed path.
+    const rc = runWith(instructions, 'from=agent-director-rc,')
+    const rcVars = shellVars(rc, args)
+    const record = expand(/>\s*"?([^\s";]*\/release\.json)"?/.exec(rc)![1]!, rcVars)
+    expect(rc).toContain('--arg client_tarball "${RC_CLIENT_TGZ}"')
+    expect(rcVars.get('RC_CLIENT_TGZ')).toMatch(/^\/[^$]*\.tgz$/)
+    expect(instructions.indexOf(rc)).toBeLessThan(at)
+
+    // The global client: read from that record, installed from that path, then checked under set -e.
+    expect(run).toMatch(/^RUN set -[a-z]*e[a-z]*;/)
+    expect(/(?:^|;)\s*RC_CLIENT_TGZ=\$\(jq -er '\.client_tarball \| strings' (\S+)\)/.exec(run)?.[1]).toBe(record)
+    expect(vars.get('RC_CHECK')).toBe(RC_CLIENT_CHECK)
+    expect(vars.get('GLOBAL_CLIENT')).toBe('/root/.bun/install/global/node_modules/agent-director')
+    const install = statements.indexOf('bun add -g --ignore-scripts "${RC_CLIENT_TGZ}"')
+    const check = statements.indexOf('"${RC_CHECK}" --client "${GLOBAL_CLIENT}"')
+    expect([install >= 0, check > install]).toEqual([true, true])
+  })
+
+  test("Dockerfile.live copies no package.json, installs no agent-director (its one package install is Claude Code's), and after staging its binary runs RC_CLIENT_CHECK --client on the base's global client, stopping the build when it fails", () => {
+    const live = dockerInstructions(LIVE_DOCKERFILE)
+    expect(live.filter((i) => i.includes('package.json'))).toEqual([])
+    expect(shellStatements(live).filter((s) => /\b(npm|npx|bunx?|pnpm|yarn)\s/.test(s) || s.includes('agent-director@'))).toEqual([
+      'npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"',
+    ])
+
+    const run = runWith(live, 'command -v agent-director')
+    expect(live.indexOf(run)).toBeGreaterThan(live.findIndex((i) => i.startsWith('COPY --from=agent-director-bin ')))
+    const statements = shellStatements([run])
+    const checkRe = new RegExp(`^if ! "?${escapeRegExp(RC_CLIENT_CHECK)}"? --client "?([^\\s"]+)"?$`)
+    const checks = statements.flatMap((s, i) => checkRe.test(s) ? [i] : [])
+    expect(checks.length).toBe(1)
+    expect(checkRe.exec(statements[checks[0]!]!)![1]).toBe(baseGlobalClientRun().vars.get('GLOBAL_CLIENT')!)
+    expect(checks[0]!).toBeGreaterThan(statements.findIndex((s) => s.includes('command -v agent-director')))
+    expect(ifBody(statements, checks[0]!).filter((s) => s.depth === 0).at(-1)?.text).toBe('exit 1')
+  })
+
+  test("Dockerfile.live's failed-check line names --agent-director-binary only for the check's step 3 (binary), routing each ERROR line the check can print", () => {
+    const run = runWith(dockerInstructions(LIVE_DOCKERFILE), 'command -v agent-director')
+    const echoed = '"((?:[^"\\\\]|\\\\.)*)"'
+    const routes = [...run.matchAll(new RegExp(`\\b(?:if|elif)\\s+grep\\s+-qE\\s+'([^']*)'\\s+\\S+;\\s*then\\s+echo\\s+${echoed}`, 'g'))].map((m) => ({ re: new RegExp(m[1]!), text: m[2]! }))
+    const fallback = new RegExp(`\\belse\\s+echo\\s+${echoed}`).exec(run)?.[1]
+    expect(routes.length).toBeGreaterThan(0)
+    expect(fallback).toBeDefined()
+    const lineFor = (error: string) => routes.find((r) => r.re.test(error))?.text ?? fallback!
+
+    // Every step the check fails at, in the check's own ERROR shape, plus its usage and refusal lines.
+    const script = repoFile(RC_CLIENT_CHECK_SOURCE).split('\n').filter((l) => !l.trimStart().startsWith('#')).join('\n')
+    const steps = [...new Set([...script.matchAll(/\bfail (?:'([^']+)'|(\w+))\s/g)].map((m) => m[1] ?? m[2]!))]
+    expect(steps).toContain('3 (binary)')
+    expect(steps).toContain('4 (floor)')
+    const errors = [
+      ...steps.map((step) => `ERROR: rc-client check ${step}: what differs`),
+      'ERROR: rc-client-check.sh: /etc/cscb-ci-image is absent: this check runs only in a cscb-ci image (it runs agent-director); refusing to run',
+      'ERROR: rc-client-check.sh: unknown mode --x (usage: rc-client-check.sh --package <dir> | --client <dir>)',
+    ]
+    expect(errors.filter((e) => lineFor(e).includes('--agent-director-binary'))).toEqual(['ERROR: rc-client check 3 (binary): what differs'])
+  })
+
+  test("test-1 runs RC_CLIENT_CHECK --package on the package it installed into /test-repo, directly after the install, and fails the test when the check fails", () => {
+    const lines = dockerInstructions(TEST_1)
+    const install = lines.findIndex((l) => /^bun install \/tmp\/package\.tgz\s/.test(l))
+    expect(install).toBeGreaterThan(0)
+    const repoDir = lines.slice(0, install).flatMap((l) => /^cd (\/\S+)$/.exec(l)?.[1] ?? []).at(-1)
+    expect(repoDir).toBe('/test-repo')
+
+    // Directly after: plain assignments only, then the check.
+    const vars = new Map<string, string>()
+    let at = install + 1
+    for (let m; (m = /^([A-Z_][A-Z0-9_]*)=([^\s$"'`;()]+)$/.exec(lines[at] ?? '')); at++) vars.set(m[1]!, m[2]!)
+    const call = /^if ! (?:\w+=\$\()?"?([^\s"]+)"? --package "?([^\s")]+)"?[\s)]/.exec(lines[at]!)
+    expect(call).not.toBeNull()
+    expect(expand(call![1]!, vars)).toBe(RC_CLIENT_CHECK)
+    const pkgName = JSON.parse(repoFile('package.json')).name as string
+    expect(expand(call![2]!, vars)).toBe(join(repoDir!, 'node_modules', pkgName))
+    expect(lines[at]).toMatch(/; then$/)
+
+    // A failed check fails the test.
+    const fi = lines.indexOf('fi', at)
+    expect(lines.slice(at + 1, fi).filter((l) => /^fail\s/.test(l)).length).toBe(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The staged binary's failure texts: the live image build's message, and no host-upgrade advice
+// ---------------------------------------------------------------------------
+
+/** Dockerfile.live's RUN that stages and checks the binary. */
+const liveCheckRun = (): string => runWith(dockerInstructions(LIVE_DOCKERFILE), 'command -v agent-director')
+
+/** Every `echo "…"` text in `run`, as written. */
+const echoedTexts = (run: string): string[] => [...run.matchAll(/\becho\s+"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1]!)
+
+/** The ERROR lines Dockerfile.live's RUN prints, each as the shell prints it (`$(command -v agent-director)` filled in). */
+function liveErrorLines(): string[] {
+  return echoedTexts(liveCheckRun())
+    .filter((t) => t.startsWith('ERROR: '))
+    .map((t) => t.replace(/\$\(command -v agent-director\)/g, '/usr/local/bin/agent-director'))
+}
+
+/**
+ * A failed `docker build`'s stderr as BuildKit's plain progress prints it: the
+ * RUN step's own output lines (`#9 <time> …`), then docker's own lines, which
+ * quote the RUN's whole text (every routed ERROR text in it), the Dockerfile
+ * excerpt and the final `failed to solve` line (`final`: the older form, or
+ * DOCKER_29_FINAL, the form docker 29 prints).
+ */
+function failedBuildStderr(own: string[], final = 'ERROR: failed to solve: '): string {
+  const run = liveCheckRun()
+  const quoted = `/bin/sh -c ${run.slice('RUN '.length)}`.replace(/"/g, '\\"')
+  return [
+    `#9 [4/4] ${run}`,
+    '#9 0.051 + chmod 0755 /opt/agent-director-rc/bin/agent-director',
+    ...own.map((line, i) => `#9 0.${120 + i} ${line}`),
+    `#9 ERROR: process "${quoted}" did not complete successfully: exit code: 1`,
+    '------',
+    ...own.map((line) => ` > 0.120 ${line}`),
+    '------',
+    ...repoFile(LIVE_DOCKERFILE).split('\n').map((line, i) => `  ${i + 1} | >>> ${line}`),
+    `${final}process "${quoted}" did not complete successfully: exit code: 1`,
+  ].join('\n')
+}
+
+/** The start of docker 29's own final line for a failed build (docker 29.7.2's plain progress). */
+const DOCKER_29_FINAL = 'ERROR: failed to build: failed to solve: '
+
+/** Why `text` advises upgrading or installing the host's agent-director, or null. */
+function upgradeAdvice(text: string): string | null {
+  if (/upgrad/i.test(text)) return 'an upgrade'
+  if (/install-agent-director/i.test(text)) return 'the install-agent-director skill'
+  if (/agent-director/i.test(text) && /\binstall|\bnpm\b|\bupdat/i.test(text)) return 'an install or update of agent-director'
+  return null
+}
+
+describe("the staged binary's failure texts", () => {
+  const OPTION = AGENT_DIRECTOR_BINARY_OPTION
+  const NO_ADVICE = /\bnpm\b|host agent-director|install|upgrad/i
+
+  // Each row: a fragment of one ERROR line Dockerfile.live echoes, the rc-client check line printed before it (if any), and the runner's message.
+  const ROUTES: [string, string[], string][] = [
+    [
+      'is not the release candidate',
+      ['ERROR: rc-client check 3 (binary): the binary reports 0.10.0, not 0.11.0-rc.1'],
+      `the staged agent-director binary is not the release candidate this image's agent-director client is checked against: give the release candidate's binary with ${OPTION} <path>`,
+    ],
+    [
+      'do not pair',
+      ['ERROR: rc-client check 4 (floor): the binary is below the client floor'],
+      "the release candidate's agent-director binary and client do not pair: the release candidate pinned in docker/Dockerfile.test.base is not usable as is",
+    ],
+    [
+      'predates this tree',
+      ['ERROR: rc-client-check.sh: /etc/cscb-ci-image is absent: this check runs only in a cscb-ci image (it runs agent-director); refusing to run'],
+      `the base image ${BASE_IMAGE} predates this tree's docker/Dockerfile.test.base or docker/rc-client-check.sh: bump the base image version (docker/README.md)`,
+    ],
+    ['agent-director on PATH is', [], "the staged agent-director binary is not the first agent-director on the image's PATH"],
+  ]
+
+  test('every ERROR line Dockerfile.live echoes has exactly one route', () => {
+    const lines = liveErrorLines()
+    expect(lines.length).toBe(ROUTES.length)
+    expect(lines.map((line) => ROUTES.filter(([fragment]) => line.includes(fragment)).length)).toEqual(lines.map(() => 1))
+  })
+
+  test.each(ROUTES)("Dockerfile.live's line holding %p is the build's reason, read from its own ERROR lines only", (fragment, checkLines, message) => {
+    const routed = liveErrorLines().filter((line) => line.includes(fragment))
+    expect(routed.length).toBe(1)
+    const stderr = failedBuildStderr([...checkLines, routed[0]!])
+    expect(liveBuildErrorLines(stderr)).toEqual([...checkLines, routed[0]!])
+    expect(liveBuildFailureMessage(1, stderr)).toBe(`docker build of the live image failed (exit 1): ${message} (see run.log)`)
+    expect(message).not.toMatch(NO_ADVICE)
+  })
+
+  test("a build that fails elsewhere gets no reason, though docker's own lines and the Dockerfile excerpt quote every routed ERROR text", () => {
+    const stderr = failedBuildStderr([])
+    for (const [fragment] of ROUTES) expect([fragment, stderr.split(fragment).length - 1 >= 3]).toEqual([fragment, true])
+    expect(liveBuildErrorLines(stderr)).toEqual([])
+    expect(liveBuildFailureMessage(17, stderr)).toBe('docker build of the live image failed (exit 17)')
+    // An rc-client check line alone, with no Dockerfile.live line after it, names no reason either.
+    expect(liveBuildFailureMessage(1, failedBuildStderr(['ERROR: rc-client check 3 (binary): the binary reports 0.10.0']))).toBe('docker build of the live image failed (exit 1)')
+  })
+
+  test("docker 29's final `ERROR: failed to build: failed to solve:` line is docker's own, never one of the build's ERROR lines", () => {
+    const [fragment, checkLines, message] = ROUTES[0]!
+    const routed = liveErrorLines().filter((line) => line.includes(fragment))
+    const failed = failedBuildStderr([...checkLines, routed[0]!], DOCKER_29_FINAL)
+    expect(liveBuildErrorLines(failed)).toEqual([...checkLines, routed[0]!])
+    expect(liveBuildFailureMessage(1, failed)).toBe(`docker build of the live image failed (exit 1): ${message} (see run.log)`)
+    const elsewhere = failedBuildStderr([], DOCKER_29_FINAL)
+    expect(liveBuildErrorLines(elsewhere)).toEqual([])
+    expect(liveBuildFailureMessage(17, elsewhere)).toBe('docker build of the live image failed (exit 17)')
+  })
+
+  test("no failure text in the runner (container-run.ts, main.ts, ci-live/lib/) or Dockerfile.live's ERROR lines advises upgrading or installing the host's agent-director, or names the install-agent-director skill", () => {
+    const LITERAL = /'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|`(?:\\.|[^`\\])*`/g
+    const files = [join('runtime', 'container-run.ts'), 'main.ts', ...readdirSync(join(CI_LIVE, 'lib')).filter((f) => f.endsWith('.ts')).map((f) => join('lib', f))]
+    const findings: string[] = []
+    for (const rel of files) {
+      const text = code(rel)
+      // Each string or template literal, and each error's whole argument (a message built from several literals).
+      const units = [...text.matchAll(LITERAL)].map((m) => m[0]).concat(indicesOf(/\bnew \w*Error\(/g, text).map((at) => callArguments(text, at)))
+      for (const unit of units) {
+        const why = upgradeAdvice(unit)
+        if (why) findings.push(`${rel}: ${why}: ${unit.slice(0, 120)}`)
+      }
+    }
+    const errorLines = echoedTexts(liveCheckRun()).filter((t) => t.startsWith('ERROR: '))
+    expect(errorLines.length).toBe(ROUTES.length)
+    for (const line of errorLines) {
+      const why = upgradeAdvice(line)
+      if (why) findings.push(`${LIVE_DOCKERFILE}: ${why}: ${line.slice(0, 120)}`)
+    }
+    expect(findings).toEqual([])
   })
 })

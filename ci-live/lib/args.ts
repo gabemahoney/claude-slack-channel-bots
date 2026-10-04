@@ -3,6 +3,7 @@
  *
  *   bun ci-live/run.ts [--dry-run] [--provision-only] [--stage apps|install|tokens|channels]
  *                      [--only <check ids>] [--keep-container] [--clean] [--create-apps]
+ *                      [--agent-director-binary <path>]
  *   bun ci-live/run.ts login [--second]
  *   bun ci-live/run.ts config-token --rotate
  *   bun ci-live/run.ts apps --list|--delete-strays
@@ -11,7 +12,7 @@
  * Pure: parses an argv array into options or a usage error. A usage error
  * never echoes an argument it does not know (it could be a pasted secret):
  * it names the argument's position, or the argument itself only when it is a
- * plain `--flag-name`.
+ * plain `--flag-name`. The `--agent-director-binary` path is never echoed.
  */
 
 export const STAGES = ['apps', 'install', 'tokens', 'channels'] as const
@@ -34,6 +35,14 @@ export interface RunOptions {
    * when given.
    */
   createApps?: boolean
+  /**
+   * `--agent-director-binary <path>`: the agent-director binary the live
+   * image is built with, staged as given (lib/agent-director-binary.ts
+   * validates it by reading only; nothing runs it on the host). A run only,
+   * dry or real; never with `--provision-only` or `--stage`, which build no
+   * image. Set only when given: without it the runner searches the host.
+   */
+  agentDirectorBinary?: string
   /** `login --second`: sign the second workspace user in instead of the test human. Set only when given. */
   second?: boolean
   /**
@@ -55,7 +64,8 @@ export interface RunOptions {
 
 export const USAGE =
   'usage: bun ci-live/run.ts [--dry-run] [--provision-only] [--stage apps|install|tokens|channels] ' +
-  '[--only <check ids, comma-separated>] [--keep-container] [--clean] [--create-apps]\n' +
+  '[--only <check ids, comma-separated>] [--keep-container] [--clean] [--create-apps] ' +
+  '[--agent-director-binary <path>]\n' +
   '       bun ci-live/run.ts login [--second]\n' +
   '       bun ci-live/run.ts config-token --rotate\n' +
   '       bun ci-live/run.ts apps --list|--delete-strays\n' +
@@ -79,6 +89,20 @@ export class UsageError extends Error {
 /** A check id as the testplan names it: `S2`, `1`, `29a`, `HOST`, `preflight`, `install`. */
 const CHECK_ID_RE = /^[A-Za-z0-9-]{1,16}$/
 
+/** The option that names the agent-director binary a run stages in the live image. */
+export const AGENT_DIRECTOR_BINARY_OPTION = '--agent-director-binary'
+
+/**
+ * A maintenance command builds no image: it refuses `--agent-director-binary`
+ * by its position in the argv (never echoing the path after it).
+ */
+function refuseAgentDirectorBinary(command: string, argv: readonly string[]): void {
+  const at = argv.indexOf(AGENT_DIRECTOR_BINARY_OPTION)
+  if (at >= 0) {
+    throw new UsageError(`${command} builds no image: it does not take ${AGENT_DIRECTOR_BINARY_OPTION} (argument #${at + 1})`)
+  }
+}
+
 export function parseArgs(argv: readonly string[]): RunOptions {
   const options: RunOptions = {
     command: 'run',
@@ -88,6 +112,9 @@ export function parseArgs(argv: readonly string[]): RunOptions {
     only: [],
     keepContainer: false,
     clean: false,
+  }
+  if (argv[0] === 'login' || argv[0] === 'config-token' || argv[0] === 'apps' || argv[0] === 'mailbox') {
+    refuseAgentDirectorBinary(argv[0], argv)
   }
   if (argv[0] === 'login') {
     options.command = 'login'
@@ -140,6 +167,8 @@ export function parseArgs(argv: readonly string[]): RunOptions {
   }
   let index = 0
   const next = (): string | undefined => argv[index++]
+  /** Where `--agent-director-binary` was given (0-based), or -1. */
+  let binaryAt = -1
   while (index < argv.length) {
     const at = index
     const arg = next() as string
@@ -168,6 +197,19 @@ export function parseArgs(argv: readonly string[]): RunOptions {
         options.provisionOnly = true
         break
       }
+      case AGENT_DIRECTOR_BINARY_OPTION: {
+        if (binaryAt >= 0) {
+          throw new UsageError(`${AGENT_DIRECTOR_BINARY_OPTION} is given twice (arguments #${binaryAt + 1} and #${at + 1}): give it once`)
+        }
+        binaryAt = at
+        const value = next()
+        // A missing value, an empty one, or the next flag taken as the value.
+        if (value === undefined || value === '' || value.startsWith('-')) {
+          throw new UsageError(`${AGENT_DIRECTOR_BINARY_OPTION} (argument #${at + 1}) needs the path of the agent-director binary to stage in the live image`)
+        }
+        options.agentDirectorBinary = value
+        break
+      }
       case '--only': {
         const value = next()
         const ids = (value ?? '').split(',').map((s) => s.trim()).filter(Boolean)
@@ -183,6 +225,12 @@ export function parseArgs(argv: readonly string[]): RunOptions {
   }
   if (options.dryRun && options.stage !== null) {
     throw new UsageError('--stage runs one real provisioning stage; it does not combine with --dry-run')
+  }
+  if (binaryAt >= 0 && options.provisionOnly) {
+    throw new UsageError(
+      `${AGENT_DIRECTOR_BINARY_OPTION} (argument #${binaryAt + 1}) stages the binary the live image is built with; ` +
+        `${options.stage !== null ? '--stage' : '--provision-only'} builds no image, so they do not combine`,
+    )
   }
   return options
 }

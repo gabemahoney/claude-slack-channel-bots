@@ -6,7 +6,17 @@
 # runner edit. Short-circuits on first FAIL, writes a single-line verdict to
 # /test-results/verdict.txt: either "PASS" or "FAIL: <test>: <step>".
 # Exits 0 on PASS, 1 on FAIL.
+#
+# Runs only in a cscb-ci image: its first step checks for the image marker
+# /etc/cscb-ci-image (docker/Dockerfile.test.base) and, when it is absent,
+# prints one line to stderr and exits 2 before it creates a directory, writes
+# a verdict or runs a test.
 set -uo pipefail
+
+if [[ ! -e /etc/cscb-ci-image ]]; then
+    echo "runner.sh: /etc/cscb-ci-image is absent: this runner runs only in a cscb-ci image (/ci); refusing to run" >&2
+    exit 2
+fi
 
 TESTS_DIR="$(cd "$(dirname "$0")" && pwd)"
 RESULTS_DIR="/test-results"

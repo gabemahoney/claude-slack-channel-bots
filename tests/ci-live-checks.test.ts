@@ -3,8 +3,9 @@
  * and the checks a dry run runs for real (bug b.1cx): `ci-live/checks/
  * framework.ts` (skips, blocking, the verdict), `checks/list.ts` (the plan
  * order, the HOST and Teardown checks), `lib/host-state.ts` (the read-only
- * snapshot of the production side of the host), Checks S2, S3 and 29a
- * (`checks/setup-checks.ts`, `checks/lifecycle-checks.ts`) and Check 28's
+ * snapshot of the production side of the host), Part 1.4's install and
+ * Checks S2, S3 and 29a (`checks/setup-checks.ts`,
+ * `checks/lifecycle-checks.ts`) and Check 28's
  * failed revocation against a fake container, and the pure helpers the live
  * checks build on (`checks/helpers.ts`, `checks/channel-checks.ts`,
  * `checks/context.ts`).
@@ -16,6 +17,14 @@
  *   runner's reason when it gives one (a second account needing a code);
  * - a dry run (no workspace) runs exactly the pre-flight, install, setup,
  *   S2, S3, 29a, Teardown and HOST checks;
+ * - Part 1.4's install runs the image's client-under-test check
+ *   (`RC_CLIENT_CHECK --package "$PKG"`, behind the guard) once, after the
+ *   install and its trust step and before the state check, the package
+ *   checksums and the skill link, and records its summary line; a check that
+ *   exits non-zero, prints no summary or is refused by the guard is a
+ *   blocking FAIL whose reason is `RC_CLIENT_CHECK_FAILED` and the check's
+ *   own `ERROR:` line (or the exit or the refusal), and nothing after it runs;
+ *   a failed install never reaches the check;
  * - no live check passes against a silent workspace (nothing answers);
  * - HOST fails on any change to the host's service=cscb rows, CSCB tmux
  *   sessions, port-3100 listener or config.json hash, and on a probe that
@@ -138,7 +147,7 @@ import {
 } from '../ci-live/checks/helpers.ts'
 import { check28, CHECK27_PROMPT, check29a, parseCount, parseLeakcount, parsePersonaCounts, personaCountsProblem } from '../ci-live/checks/lifecycle-checks.ts'
 import { FINAL_CHECKS, hostCheck, PLAN_CHECKS, teardownCheck } from '../ci-live/checks/list.ts'
-import { s2Check, s3Check } from '../ci-live/checks/setup-checks.ts'
+import { installCheck, RC_CLIENT_CHECK_FAILED, s2Check, s3Check } from '../ci-live/checks/setup-checks.ts'
 import { FlowError, type BrowserDriver, type HumanApi } from '../ci-live/lib/browser-types.ts'
 import type { ContainerExec } from '../ci-live/lib/container.ts'
 import {
@@ -155,6 +164,7 @@ import {
 import { HumanSession } from '../ci-live/lib/human-session.ts'
 import { buildLiveConfig, renderConfig } from '../ci-live/lib/live-config.ts'
 import type { ProcResult } from '../ci-live/lib/proc.ts'
+import { RC_CLIENT_CHECK, RC_CLIENT_CHECK_PASSED } from '../ci-live/lib/rc-client.ts'
 import { RESULTS_COLUMNS } from '../ci-live/lib/results.ts'
 import type { PersonaLetter } from '../ci-live/lib/personas.ts'
 import { MINUTE, SECOND } from '../ci-live/lib/wait.ts'
@@ -678,8 +688,74 @@ describe('host-state', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Checks S2, S3 and 29a against a fake container
+// Part 1.4's install, Checks S2, S3 and 29a against a fake container
 // ---------------------------------------------------------------------------
+
+describe('Part 1.4 install', () => {
+  const SUMMARY = `${RC_CLIENT_CHECK_PASSED}client /home/testuser/.bun/install/global/node_modules/agent-director`
+  const PASSING: ReadonlyArray<readonly [string, Reply]> = [
+    ['env | cut', '0'],
+    ["echo 'test host'", 'test host'],
+    ['bun install -g', ''],
+    ['echo "PKG=$PKG"', 'PKG=/home/testuser/pkg\n/home/testuser/pkg\n1.2.3'],
+    [RC_CLIENT_CHECK, `unpacking the client tarball\n${SUMMARY}`],
+    ['ls -A "$S"', 'config.json'],
+    ['jq -c . "$S/config.json"', '{"personas":[]}'],
+    ['pkg-before.sha256', '42'],
+  ]
+  /** installCheck over the passing container, with `changes` answered first; the result and every script it ran. */
+  const run = async (changes: ReadonlyArray<readonly [string, Reply]> = []) => {
+    const { container, scripts } = fakeContainer([...changes, ...PASSING])
+    return { r: await installCheck.run(makeCtx({ container })), scripts }
+  }
+  const at = (scripts: readonly string[], key: string) => scripts.findIndex((s) => s.includes(key))
+
+  test("passes when the client-under-test check passes, its summary line recorded as a finding; the check is run once, behind the guard, on the package", async () => {
+    const { r, scripts } = await run()
+    expect([r.status, r.reason]).toEqual(['PASS', undefined])
+    expect(r.evidence).toContain(SUMMARY)
+    expect(scripts.filter((s) => s.includes(RC_CLIENT_CHECK))).toEqual([`guard || exit 90\n${RC_CLIENT_CHECK} --package "$PKG"`])
+  })
+
+  test('the client-under-test check runs after the install and its trust step, and before the state check, the checksums and the skill link', async () => {
+    const { scripts } = await run()
+    const rc = at(scripts, RC_CLIENT_CHECK)
+    const order = [at(scripts, 'bun pm -g trust'), at(scripts, '$PKG/README.md'), rc, at(scripts, 'ls -A "$S"'), at(scripts, 'pkg-before.sha256'), at(scripts, 'ln -s "$PKG/skills')]
+    expect(order.every((i) => i >= 0)).toBe(true)
+    expect(order).toEqual([...order].sort((a, b) => a - b))
+  })
+
+  // The ERROR lines in docker/rc-client-check.sh's own shapes, for the client the package resolves.
+  const CLIENT = '/home/testuser/.bun/install/global/node_modules/agent-director'
+  const TGZ = '/opt/agent-director-rc/client/agent-director-0.10.0.tgz'
+  const CONTENT = `ERROR: rc-client check 1 (content): the client at ${CLIENT} is not the release candidate's client: 1 difference(s) from ${TGZ}, first: Files <tarball>/dist/index.js and ${CLIENT}/dist/index.js differ`
+  const EXPORTS = `ERROR: rc-client check 2 (exports): the client at ${CLIENT} does not export ErrTmuxUnresponsive ErrTmuxSessionConflict as AgentDirectorError classes`
+  const BINARY = "ERROR: rc-client check 3 (binary): the first agent-director binary on PATH, /opt/agent-director-rc/bin/agent-director, reports version 0.10.0 (0123456789abcdef0123456789abcdef01234567), not the release candidate's 0.11.0-rc.1 (d787cb434043868543c3c98105e3394026d6ca5f)"
+  const REFUSAL = 'ERROR: rc-client-check.sh: /etc/cscb-ci-image is absent: this check runs only in a cscb-ci image (it runs agent-director); refusing to run'
+  const USAGE = 'ERROR: rc-client-check.sh: /home/testuser/pkg holds no package.json (usage: rc-client-check.sh --package <dir> | --client <dir>)'
+  const failures: ReadonlyArray<readonly [string, Partial<ProcResult>, string]> = [
+    ['a content mismatch', { code: 1, stderr: `cp: done\n${CONTENT}` }, CONTENT],
+    ['a missing Phase 1 export', { code: 1, stderr: EXPORTS }, EXPORTS],
+    ['the wrong binary on PATH', { code: 1, stderr: BINARY }, BINARY],
+    ["the check's refusal", { code: 3, stderr: REFUSAL }, REFUSAL],
+    ["the check's usage error", { code: 2, stderr: USAGE }, USAGE],
+    ['a non-zero exit with no ERROR line', { code: 139, stderr: 'Segmentation fault' }, 'exit 139'],
+    ['exit 0 with no summary line', { code: 0, stdout: 'unpacking the client tarball' }, 'exit 0'],
+    ['the guard refusing the shell', { code: 90 }, 'the guard refused the container shell'],
+  ]
+
+  test.each(failures)('a blocking FAIL on %s, with its own reason, and nothing after the check runs', async (_what, reply, detail) => {
+    const { r, scripts } = await run([[RC_CLIENT_CHECK, reply]])
+    expect([installCheck.blocking, r.status, r.reason]).toEqual([true, 'FAIL', `${RC_CLIENT_CHECK_FAILED}: ${detail}`])
+    expect(scripts.at(-1)).toContain(RC_CLIENT_CHECK)
+  })
+
+  test('a failed install stops before the client-under-test check', async () => {
+    const { r, scripts } = await run([['bun install -g', { code: 1 }]])
+    expect([r.status, r.reason]).toEqual(['FAIL', 'the install failed (exit 1; see ~/cscb-live/install.log in the container)'])
+    expect(at(scripts, RC_CLIENT_CHECK)).toBe(-1)
+  })
+})
 
 describe('Check S2', () => {
   const PASSING: Record<string, string> = {

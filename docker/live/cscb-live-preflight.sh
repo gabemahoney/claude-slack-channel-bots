@@ -10,7 +10,7 @@
 set -u
 TEST_HOST='@TEST_HOST@'   # the container's hostname
 PHASE="${1:?usage: bash ~/cscb-live-preflight.sh setup|check1}"
-export PATH="$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin"
+export PATH="/opt/agent-director-rc/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin"
 STATE="$HOME/.claude/channels/slack"
 fail() { echo "PRE-FLIGHT FAILED: $*" >&2; exit 1; }
 

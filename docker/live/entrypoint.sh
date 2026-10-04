@@ -98,7 +98,7 @@ fi
 if [[ -e "${BOOT_MARKER}" ]]; then
     log "start-at-boot marker present: starting claude-slack-channel-bots as testuser"
     gosu testuser bash -c '
-        export PATH="$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin"
+        export PATH="/opt/agent-director-rc/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin"
         cd "$HOME" && claude-slack-channel-bots start >> "$HOME/cscb-live/boot-start.log" 2>&1
     ' &
 fi
