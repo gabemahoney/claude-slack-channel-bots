@@ -1644,14 +1644,17 @@ tmux server and agent-director without changing either:
 agent-director version
 agent-director get --claude-instance-id cscb_<key>
 agent-director list --label service=cscb --label persona=<key>
-timeout 10 tmux list-sessions
+agent-director read-pane --claude-instance-id cscb_<key> --n-lines 1
 ```
 
-Run `tmux list-sessions` as the user the workers run as, with their tmux
-socket (the same `TMUX_TMPDIR` or `-S` path): under another user or socket it
-asks a different tmux server. It shows only whether tmux answers, never whose
-a session is: ownership comes from agent-director's row (the `get` and `list`
-above), never from this list, so never act on a session because of it.
+Run them as the user the workers run as, in the bot server's launcher
+environment. The `read-pane` reaches the persona's tmux session through
+agent-director: an answer in time shows that tmux answers, and
+`ErrTmuxUnresponsive` or `ErrCallTimeout` shows it still doesn't. It never
+shows whose a session is (see its caveats under
+[Listing instances](#listing-instances)): ownership comes from
+agent-director's row (the `get` and `list` above), so never act on a session
+because of it.
 
 A command that hangs or times out points at the host (its load, or the tmux
 server). Never run a command that ends a session or deletes a row to clear
@@ -1958,8 +1961,15 @@ rows record the session name. Run it on the command line; over MCP, `list`
 ignores this filter:
 
 ```sh
-agent-director list --tmux-session-name <name>
+agent-director list --tmux-session-name '<name>'
 ```
+
+The notice's line quotes the name for the shell (single quotes, each `'` in
+it written `'\''`; a plain name reads
+`agent-director list --tmux-session-name 'slack_bot_dev'`). When the name
+holds a control character, a line or paragraph separator, or a backtick, the
+notice leaves the line out and says "The session name could not be shown
+safely." instead.
 
 **After a launch's plain spawn met the conflict** (`refused=plain-spawn` in
 the `latched` line below), the persona's own row reads one of two ways, and
@@ -4315,10 +4325,46 @@ nothing was posted to Slack. Running agent-director instances are left as
 they were. For both classes, this CSCB release and agent-director Phase 1
 are installed together, through the README section "Switching over to
 agent-director Phase 1": its `state.db` backup and restarts come with the
-install. Tell the operator to follow that section; a bot or this skill never
-changes the agent-director install itself. A running server can stop on
-the same two classes; see
+install. The section opens with the block
+["Arrived here from a startup refusal?"](../../README.md#arrived-here-from-a-startup-refusal),
+which says what a refused operator does, in order; tell the operator to
+follow that block. A bot or this skill never changes the agent-director
+install itself, and never starts the server on its own after a refusal. A
+running server can stop on the same two classes; that stop is not a
+switch-over case and has its own remedy, under
 [Found while the server was running](#found-while-the-server-was-running).
+
+**What the block says.** It covers only a refusal before agent-director
+Phase 1 is installed on the host, by step 8 of the runbook or otherwise:
+
+- If `config.json` is in persona form and no pre-persona copy of it exists
+  (neither step 1's copy nor one the operator kept elsewhere), the operator
+  stops there and changes nothing until that file is rebuilt by hand, as
+  step 8 of "Rolling back the switch-over" says, then follows the block
+  again from its start.
+- Otherwise the operator rebuilds by hand the crontable targets and
+  `/interject` callers left in persona form where step 1's copy of them is
+  missing, then reinstalls and starts the previous CSCB (the version step 1
+  recorded, or else the one the host ran before) from step 1's files, a
+  pre-persona `config.json` copy the operator kept, or the files in place,
+  re-enabling its autostart if it was disabled.
+- A host not on agent-director 0.10.0 brings it to 0.10.0 outside the
+  runbook; the block gives no command for it.
+- Then the operator starts the runbook at step 1. The new server starts at
+  step 10 of the runbook, not before.
+
+A refusal at step 10, or at any later start of the new CSCB (an autostart,
+`clean_restart` or the restart in step 4 of "Rolling back the switch-over"
+included), on a host whose Phase 1 install was step 8's or agent-director's
+own install on a publishing host, means the server finds the wrong
+agent-director binary: the block's "A refusal after Phase 1 was installed"
+gives its binary check and next step, the same as
+[Found while the server was running](#found-while-the-server-was-running)
+below. A host where Phase 1 was installed in any other way outside the
+runbook is not a target of the runbook: the block sends it to "Rolling back
+the switch-over" and the item "agent-director was installed outside the
+caller's switch-over" in the "Operator actions" section of agent-director's
+README.
 
 ### `ad-below-phase1-floor`
 
@@ -4334,8 +4380,9 @@ install-skill block.
   same way. A build that reports the bare version `dev` does not reach this
   check: the version does not parse, so the client refuses it first as
   `ad-system-install-unreachable` (reason `unparseable-version`).
-- **Fix:** the operator follows the README section "Switching over to
-  agent-director Phase 1", then starts the server again.
+- **Fix:** the operator follows the block "Arrived here from a startup
+  refusal?" of the README section "Switching over to agent-director
+  Phase 1" (above); the runbook's step 10 starts the new server.
 
 ### `ad-system-install-too-old`
 
@@ -4351,8 +4398,9 @@ class.
 
 - **Cause:** the system-installed binary is older than the minimum that
   the npm `agent-director` client CSCB depends on accepts.
-- **Fix:** the operator follows the README section "Switching over to
-  agent-director Phase 1", then starts the server again.
+- **Fix:** the operator follows the block "Arrived here from a startup
+  refusal?" of the README section "Switching over to agent-director
+  Phase 1" (above); the runbook's step 10 starts the new server.
 
 ### Found while the server was running
 
@@ -4368,8 +4416,12 @@ found by a runtime re-check while the server was running, so the server stopped
 ```
 
 in place of the floor entry's "found by the startup check" (for the too-old
-entry, right after the binary path). It still names the versions and the
-binary path, and the too-old entry still ends with the install-skill block.
+entry, right after the binary path). It still names the version found, the
+version required and the binary path. In place of the README's switch-over
+runbook and the install skill, it points to this skill
+(`skills/debug-slack-channel-bots/SKILL.md`), whose remedy for this stop is
+the one below; it carries no install-skill block and no instruction to
+change the agent-director install. This stop is not a switch-over case.
 `server.log` then shows
 `[slack] Shutting down: the runtime version re-check refused the agent-director binary (see startup-errors.log)`
 and, last, `[slack] Shutdown complete` (or, if the shutdown hung,
@@ -4377,9 +4429,12 @@ and, last, `[slack] Shutdown complete` (or, if the shutdown hung,
 shutdown that hung with nothing left open ends with neither line, still with
 exit code 1).
 
-- **Cause:** the binary was swapped, while the server ran, for an older
-  build or one that fails the check (such as a `0.0.0-dev` development
-  build).
+- **Cause:** the agent-director binary the server finds is not the one the
+  running server started with: it was swapped, while the server ran, for an
+  older build or one that fails the check (such as a `0.0.0-dev`
+  development build). The server finds
+  `$HOME/.agent-director/bin/agent-director` first, then the first
+  `agent-director` on `PATH`.
 - **What the stop did not do:** the shutdown made no agent-director call. No
   bot was killed, paused or deleted, and every agent-director row is as it
   was: the bots keep running, but nothing serves them until the server is
@@ -4400,9 +4455,34 @@ exit code 1).
   `[slack] startupSessionManager: not launching "<name>" (key=<key>) — the server has begun shutting down; no agent-director call, counted in no summary count (b.jg5 SRJ-205)`
   and is counted in none of the start summary's counts, never as failed. A
   launch already under way is not interrupted.
-- **Fix:** the same as at start: the operator follows the README section
-  "Switching over to agent-director Phase 1", then starts the server again.
-  A bot or this skill never changes the agent-director install itself.
+- **Fix:** a human's. A bot or this skill never changes the agent-director
+  install itself, and never starts the server without the operator's
+  say-so.
+  1. **Check the binary.** The server finds
+     `$HOME/.agent-director/bin/agent-director` first, then the first
+     `agent-director` on `PATH`. Take the binary path the startup-errors
+     entry names and run `<path> version`, as the workers' user in the bot
+     server's launcher environment.
+  2. **Then either put agent-director Phase 1 back, or roll back.**
+     - To put agent-director Phase 1 back as the binary the server finds:
+       every agent on the host and every long-running agent-director
+       process (`agent-director serve` included) is stopped before that
+       binary change and started again after it. CSCB's own bots, which
+       the stop left running, are stopped by a human through the item
+       "Stopping a set of agents before a binary change" in the "Operator
+       actions" section of agent-director's README; this skill names no
+       command for it. Once the server finds Phase 1, start CSCB.
+     - If the host is being rolled back, follow
+       ["Rolling back the switch-over"](../../README.md#rolling-back-the-switch-over),
+       which starts the previous CSCB.
+
+  Installing agent-director Phase 1 migrated agent-director's store, so
+  never reinstall the old CSCB onto it.
+- **At the restart in step 4 of "Rolling back the switch-over":** an agent
+  that could not be stopped still runs, so put nothing back and don't follow
+  the rollback runbook again. The new CSCB stays stopped until
+  agent-director has dealt with that agent (as rollback step 4 says); then
+  this remedy applies.
 
 ### The two CLI commands on an old binary
 
@@ -4417,6 +4497,17 @@ stop anything. They treat the two classes differently:
 So an operator on an agent-director older than Phase 1 can stop the bots
 with `stop --stop-bots` before the switch-over; `clean_restart` needs the
 switch-over first.
+
+`bun run install-check` passes a binary below CSCB's Phase 1 floor that the
+client accepts only with a `note`: the version found and CSCB's floor (its
+release candidates included), that the server refuses to start on it until
+agent-director Phase 1 is installed, and the README section
+["Switching over to agent-director Phase 1"](../../README.md#switching-over-to-agent-director-phase-1)
+(see
+[Checking your agent-director install](../../README.md#checking-your-agent-director-install)).
+The note names no command. A binary that passes
+with it is still refused at start as `ad-below-phase1-floor`. The operator
+follows that README section; this skill runs nothing for the note.
 
 **`stop --stop-bots` on a binary the client refuses as too old.**
 
@@ -4469,6 +4560,11 @@ nine keys and their defaults.
 - **The default rule:** a missing file, a missing key or `0` means
   agent-director's default for that key. Other tables and keys are ignored,
   so a misspelt key leaves its default in force.
+- **The values in effect:** an accepted read writes one `server.log` line
+  with the nine `[tmux]` values in effect, at the first accepted read after
+  start and at each later accepted read that changes any of the nine. A
+  read that changes only `[pause] timeout_seconds`, or changes nothing,
+  writes none. The latest such line shows the values the server waits on.
 - **A refused read.** The server refuses the whole file when:
   - the server can't find its home directory;
   - the file exists but can't be read (it's a directory or not a regular

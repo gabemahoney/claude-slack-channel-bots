@@ -361,7 +361,10 @@ agent-director version
 If `agent-director` isn't on `PATH`, or is older than the version the server
 needs, point the operator to the `install-cscb` skill
 (`skills/install-cscb/SKILL.md` in the package), which checks the install with
-`bun run install-check` and walks through the fix. The server registers its
+`bun run install-check` and walks through the diagnosis. This release needs
+agent-director Phase 1, and the two are installed together through the
+README section "Switching over to agent-director Phase 1"; this wizard
+changes nothing in the agent-director install. The server registers its
 agent-director template at start; an `ad-template-install` line in
 `$STATE_DIR/startup-errors.log` means that failed.
 

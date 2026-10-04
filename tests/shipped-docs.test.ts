@@ -38,7 +38,9 @@
  *   entry per label inside its refusal section and README "Startup errors" a
  *   line per label, each naming the switch-over runbook section by its title;
  *   neither the refusal section nor a README line carries an upgrade form
- *   (tests/test-helpers/upgrade-forms.ts, self-checked here); exactly one
+ *   (tests/test-helpers/upgrade-forms.ts, self-checked here; the runtime-stop
+ *   remedy's `agent-director serve` span removed first, ruling C-1,
+ *   SRJ-1104); exactly one
  *   README heading, under `## Migration`, carries the title the refusals
  *   name (replacing E2's no-link case), and every link into that section
  *   from the README and the two skills resolves;
@@ -137,6 +139,41 @@
  *     (`SRJ_1105_TOPICS`), each found by the `src/` exports it names
  *     (imported, `exportName`). Each self-checked against the old wording or
  *     a synthetic text.
+ * - E36 T4's checks, read through `OPERATOR_TEXTS` (b.jg5 SRJ-1101, SRJ-1103,
+ *   SRJ-1104; SRJ-1105 and SRJ-1106 through the term checks; AC 78, AC 79):
+ *   - SRJ-1101 over all seven texts, each hit with file and line: none of
+ *     `SRJ_1101_TERMS` (`has-session`, `tmux-kill`, `agent-director delete`,
+ *     `find-missing --timeout`, `include-finished` and `include_finished`,
+ *     `kill-pane`, `kill-server`), wrapped or in any case; `tmux kill-session`
+ *     only in switch-over steps 5 and 6 of the two runbook carriers (the
+ *     steps' lines cross-checked against `runbookSteps`; `-t =` is checked
+ *     inside the section by the SRJ-1108 case); no `tmux attach -t` without
+ *     `=` outside `PREFIX_KEY_REASON_SPANS`; every tmux command on the
+ *     layering rule's allow-list (`TMUX_ALLOWED_FORMS`: the exact-target
+ *     attach, the runbooks' read-only `tmux ls`, `tmux list-windows -a` or
+ *     `-t =`, `tmux display-message -p`, and `tmux kill-session -t =`), found
+ *     by tmux's command names (`TMUX_COMMAND_NAMES`, citing tmux(1)); no
+ *     pane, `read-pane` answer or GONE taken as proof a worker is gone
+ *     (SRJ-613); every `agent-director kill --claude-instance-id` named with
+ *     its result checked, and in the README and the CHANGELOG with "on an
+ *     error, don't delete or respawn" (also a row per runbook step); the
+ *     debugging skill's one-line `read-pane` check, both caveats and the
+ *     pointer;
+ *   - SRJ-1103 over the README, a row per prerequisite and per section
+ *     (`README_SRJ_1103_ROWS`), the Troubleshooting entry of each notice by
+ *     its `src/`-rendered title, each SRJ-1013 class under "Startup errors",
+ *     the cron line (`AD_VOCABULARY`'s `findMissingCron`), the refusal items
+ *     and the runtime-stop paragraph, switch-over steps 1 and 7 linking
+ *     "Upgrading to personas" in both carriers;
+ *   - SRJ-1104 over the debugging skill, a row per section
+ *     (`DEBUG_SKILL_SRJ_1104_ROWS`), each SRJ-1013 class in its section, the
+ *     refusal entries, and the runtime-stop remedy's elements
+ *     (`RUNTIME_STOP_REMEDY_ROWS`), with no `command -v agent-director` and no
+ *     upgrade form once ruling C-1's one span (`RUNBOOK_COMMAND_SPANS`) is
+ *     removed. E34 T3's settings values line and runtime-entry pointer are
+ *     not pinned (that log line is not on this branch).
+ *   Each self-checked: every row's items cut one by one, and the rows
+ *   SRJ-1103's and SRJ-1104's Test lines name reverted to the old wording.
  * CHANGELOG.md and docs/ are not shipped descriptions: the forbidden-term
  * audit still reads only `SHIPPED_TEXTS`, which holds neither. Besides the
  * two docs read through `OPERATOR_TEXTS`, the one docs/ file read is
@@ -160,6 +197,8 @@ import {
   DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   DELIVERY_MODES,
   DM_DESTINATION,
+  MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+  MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   PERSONA_DM_KEYS,
   PERSONA_ENTRY_KEYS,
   PERSONA_TOP_LEVEL_KEYS,
@@ -191,7 +230,7 @@ import { DELETE_HELPERS, REMOVED_IDENTIFIERS, SOURCE_WORD_RULES, type SourceWord
 import { CRONTABLE_TEMPLATE_HEADER } from '../src/cron-bootstrap.ts'
 import type { Via } from '../src/delivery-decision.ts'
 import { MCP_INSTRUCTIONS } from '../src/registry.ts'
-import { installAdVersionRecheck, meetsPhase1Floor, PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_SECTION_TITLE } from '../src/ad-version-gate.ts'
+import { AD_VERSION_RECHECK_INTERVAL_MS, installAdVersionRecheck, meetsPhase1Floor, PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_SECTION_TITLE } from '../src/ad-version-gate.ts'
 import {
   AD_BELOW_PHASE1_FLOOR,
   AD_SHIM_CATALOG_INCOMPLETE,
@@ -206,15 +245,18 @@ import { AD_VERSION_CHECK_FAIL_EXIT_CODE, SR25_NOTE_PREFIX, SR25_PREFIX } from '
 import {
   AD_CALL_TIMEOUT_NEED_MARGIN_MS,
   AD_CEILING_VERBS,
+  AD_LAUNCH_BOUND_GRACE_ADDEND_SECONDS,
   AD_LAUNCH_CEILING_VERBS,
   AD_PAUSE_TABLE,
   AD_PAUSE_TIMEOUT_KEY,
   AD_SETTING_MINIMUMS,
+  AD_SETTINGS_LOG_PREFIX,
   AD_SETTINGS_RELATIVE_PATH,
   AD_TMUX_KEYS,
   AD_TMUX_TABLE,
   checkAdCallTimeoutAtStartup,
   DEFAULT_AD_SETTINGS,
+  DIALOG_READY_TIMEOUT_MS,
   installAdSettings,
   type AdTmuxKey,
 } from '../src/ad-settings.ts'
@@ -228,8 +270,23 @@ import {
   SERVICE_LABEL,
 } from '../src/persona-identity.ts'
 import { LAST_APPLIED_FILE_SUFFIX } from '../src/reload.ts'
-import { createOldLifeHoldSet, oldLifeKeyOf, RETIRED_KEYS_FILE_NAME, RETIRED_KEYS_FORMAT_VERSION, serializeRetiredKeys } from '../src/retired-keys.ts'
-import { CLEAR_LATCH_COMMAND, CLEAR_LATCH_ROUTE, dialClearLatch, handleClearLatch, SERVER_PORT_FILE_NAME, writeServerPortRecord } from '../src/clear-latch.ts'
+import {
+  createOldLifeHoldSet,
+  oldLifeKeyOf,
+  RETIRED_KEYS_FILE_NAME,
+  RETIRED_KEYS_FORMAT_VERSION,
+  RETIRED_KEYS_UNREADABLE_LABEL,
+  serializeRetiredKeys,
+} from '../src/retired-keys.ts'
+import {
+  CLEAR_LATCH_COMMAND,
+  CLEAR_LATCH_DIAL_HOST,
+  CLEAR_LATCH_ROUTE,
+  dialClearLatch,
+  handleClearLatch,
+  SERVER_PORT_FILE_NAME,
+  writeServerPortRecord,
+} from '../src/clear-latch.ts'
 import { CLEAN_RESTART_NOT_RESTARTED_LABEL, CLI_TEARDOWN_FAILED_LABEL, PRECHECK_TRIES, precheckVerdictOf } from '../src/cli-teardown.ts'
 import {
   KILL_FAILURE_CLOSING_CLI_TEARDOWN,
@@ -243,6 +300,7 @@ import {
   killFailureSurvivorPidList,
   PERSONA_KILL_FAILED_LABEL,
   PERSONA_KILL_SURVIVOR_LABEL,
+  PERSONA_TEARDOWN_NOTICE_LABEL,
   type KillFailureAlertContent,
   type KillFailureAlertVersion,
   type KillFailureClosing,
@@ -262,12 +320,41 @@ import {
   startupSummaryEnding,
   STUCK_LAUNCH_ABORT_SITE,
 } from '../src/session-manager.ts'
-import { createUnavailableRetryController, UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE } from '../src/unavailable-retry.ts'
-import { armPendingOnlyAfterLaunchFailure } from '../src/outage-state.ts'
-import { createTmuxUnresponsiveCondition, PERSONA_EPISODE_KIND_AD_CONFIG_MALFORMED, TMUX_UNRESPONSIVE_ONSET_FLOOR_MS } from '../src/persona-episodes.ts'
-import { createConflictLatch, createLatchRecheckController, decideLatchRecheck, LATCH_RECHECK_INTERVAL_MS, recogniseConflictCase } from '../src/conflict-latch.ts'
+import {
+  createUnavailableRetryController,
+  UNAVAILABLE_RETRY_BASE_S,
+  UNAVAILABLE_RETRY_CAUSE_COLLISION,
+  UNAVAILABLE_RETRY_CEILING_S,
+  UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE,
+} from '../src/unavailable-retry.ts'
+import { armPendingOnlyAfterLaunchFailure, ONSET_TEMPLATES, tmuxServerChangedOnset } from '../src/outage-state.ts'
+import {
+  createTmuxUnresponsiveCondition,
+  PERSONA_EPISODE_KIND_AD_CONFIG_MALFORMED,
+  PERSONA_UNCLASSIFIED_ERROR_LABEL,
+  TMUX_UNRESPONSIVE_ONSET_FLOOR_MS,
+  tmuxUnresponsiveAlertText,
+  tmuxUnresponsiveOnsetText,
+  tmuxUnresponsiveRecoveryText,
+  unclassifiedErrorAlertText,
+} from '../src/persona-episodes.ts'
+import {
+  CONFLICT_NOTICE_FIRST_LINE_HEAD,
+  CONFLICT_RECOVERY_HEAD,
+  createConflictLatch,
+  createLatchRecheckController,
+  decideLatchRecheck,
+  HOLD_RECOVERY_HEAD,
+  LATCH_RECHECK_INTERVAL_MS,
+  LAUNCH_START_NOTICE_HEAD,
+  recogniseConflictCase,
+  UNUSABLE_NAME_NOTICE_HEAD,
+} from '../src/conflict-latch.ts'
+import { LATCHING_LIVENESS_NOTE } from '../src/row-read-rules.ts'
 import { createLiveRowSequenceRegistry, LIVE_ROW_SEQUENCE_MAX_KILLS } from '../src/live-row-sequence.ts'
-import { createStuckLaunchAbort, PENDING_ROW_NO_LAUNCH_START } from '../src/pending-row.ts'
+import { createStuckLaunchAbort, PENDING_ROW_NO_LAUNCH_START, STUCK_LAUNCH_HELD_HEAD, STUCK_LAUNCH_RELAUNCHING_HEAD } from '../src/pending-row.ts'
+import { slowRecoveryText } from '../src/slow-recovery.ts'
+import { INVALID_FLAGS_HOLD_ALERT_TEXT } from '../src/invalid-flags-hold.ts'
 import { errTmuxKillFailed, KILL_FAILED_DESCRIPTIONS, STUB_SURVIVOR_PIDS } from './test-helpers/agent-director-stub.ts'
 import { CLIENT_MIN_VERSION, MIN_CLAUDE_CODE_VERSION, OLD_AD_VERSION } from './test-helpers/agent-director-versions.ts'
 import {
@@ -1109,11 +1196,17 @@ function formatHit(hit: TermHit): string {
 
 /** Every occurrence of `terms` in `text`, with the line each starts on. Pure. */
 function findTerms(file: string, text: string, terms: readonly Term[]): TermHit[] {
+  return findTermsAt(file, text, terms).map(({ hit }) => hit)
+}
+
+/** `findTerms`, with each hit's offset in `text`, for a check that leaves some spans of the text out. Pure. */
+function findTermsAt(file: string, text: string, terms: readonly Term[]): { hit: TermHit; index: number }[] {
   const lines = text.split('\n')
   return terms.flatMap(([term, pattern]) =>
     [...text.matchAll(pattern)].map((m) => {
-      const line = text.slice(0, m.index).split('\n').length
-      return { file, line, term, match: flat(m[0]), text: lines[line - 1].trim() }
+      const index = m.index ?? 0
+      const line = text.slice(0, index).split('\n').length
+      return { index, hit: { file, line, term, match: flat(m[0]), text: lines[line - 1].trim() } }
     }),
   )
 }
@@ -1641,6 +1734,44 @@ function labelItem(section: string, label: string, where: string): string {
   return flat(item.join('\n'))
 }
 
+/** The debugging skill's section for a stop by the runtime re-check (b.jg5 SRJ-205, SRJ-1104), under the refusal section. */
+const RUNTIME_STOP_HEADING = '### Found while the server was running'
+
+/** `RUNBOOK_COMMAND_SPANS`' key for the debugging skill's runtime-stop remedy. */
+const RUNTIME_STOP_REMEDY = "the debugging skill's runtime-stop remedy"
+
+/**
+ * Ruling C-1 (b.jg5 SRJ-1104, SRJ-1108): the backticked agent-director
+ * command lines an operator text may carry where `UPGRADE_FORMS` applies,
+ * each removed exactly (that span, as written) before the forms are applied;
+ * any other backticked agent-director command line there still fails. No
+ * pattern is narrowed. The runbook's refusal block and the debugging skill's
+ * runtime-stop remedy (under `RUNTIME_STOP_HEADING`, and only there) name the
+ * process `agent-director serve` among those stopped around the binary change
+ * (SRJ-1104, SRJ-1108; HO C15); step 1's version item runs
+ * `agent-director version` (SRJ-1108).
+ */
+const RUNBOOK_COMMAND_SPANS: Record<'refusal block' | "step 1's version item" | typeof RUNTIME_STOP_REMEDY, string> = {
+  'refusal block': code('agent-director serve'),
+  "step 1's version item": code('agent-director version'),
+  [RUNTIME_STOP_REMEDY]: code('agent-director serve'),
+}
+
+/**
+ * The debugging skill's refusal section, flattened, with ruling C-1's span
+ * removed from its `RUNTIME_STOP_HEADING` subsection only: the text
+ * `UPGRADE_FORMS` is applied to. Throws naming a missing section or
+ * subsection.
+ */
+function refusalSectionForUpgradeForms(skill: string): string {
+  const section = requiredSection(skill, `## ${REFUSAL_SECTION_TITLE}`, DEBUG_SKILL_FILE)
+  const range = sectionRange(section, RUNTIME_STOP_HEADING)
+  if (range === undefined) throw new Error(`${DEBUG_SKILL_FILE}, under "## ${REFUSAL_SECTION_TITLE}", has no heading "${RUNTIME_STOP_HEADING}"`)
+  const lines = section.split('\n')
+  const remedy = withoutAllowedSpan(flat(lines.slice(range.start, range.end).join('\n')), RUNTIME_STOP_REMEDY)
+  return flat([...lines.slice(0, range.start), remedy, ...lines.slice(range.end)].join('\n'))
+}
+
 /** The label of `UPGRADE_FORMS`' re-install row (E36 T2 ruling; SRJ-1101); throws when the helper has no such row. */
 const REINSTALL_FORM: string = (() => {
   const row = UPGRADE_FORMS.find(([label]) => /\bre-install\b/i.test(label))
@@ -1675,11 +1806,30 @@ describe('the agent-director refusal classes name the switch-over runbook (b.jg5
     })
 
     test.each(UPGRADE_FORMS.map(([form, pattern]) => [form, pattern] as const))(
-      'the refusal section carries no %s',
+      `the refusal section carries no %s, once the runtime-stop remedy's ${RUNBOOK_COMMAND_SPANS[RUNTIME_STOP_REMEDY]} span is removed (ruling C-1; SRJ-1104)`,
       (_form, pattern) => {
-        expect(flat(requiredSection(debugSkill, `## ${REFUSAL_SECTION_TITLE}`, DEBUG_SKILL_FILE))).not.toMatch(pattern)
+        expect(refusalSectionForUpgradeForms(debugSkill)).not.toMatch(pattern)
       },
     )
+
+    describe(`self-checks (ruling C-1): the ${RUNBOOK_COMMAND_SPANS[RUNTIME_STOP_REMEDY]} span is removed only inside "${RUNTIME_STOP_HEADING}"`, () => {
+      /** A synthetic debugging skill: the refusal section, a class entry, then the runtime-stop subsection. */
+      const skill = (entry: string, remedy: string) =>
+        [`## ${REFUSAL_SECTION_TITLE}`, 'Intro.', `### \`${AD_BELOW_PHASE1_FLOOR}\``, entry, RUNTIME_STOP_HEADING, remedy, '## Later', 'Out.'].join('\n')
+      const SPAN = RUNBOOK_COMMAND_SPANS[RUNTIME_STOP_REMEDY]
+      test.each([
+        ['the span in the remedy only', skill('Fix: follow the block.', `Stop every process (${SPAN} included).`), []],
+        ['the span in the class entry', skill(`Fix: restart ${SPAN}.`, 'Stop everything.'), ['backticked agent-director command line']],
+        ['another backticked agent-director command in the remedy', skill('Fix: follow the block.', `Stop every process (${SPAN} included), then run \`agent-director upgrade\`.`), ['backticked agent-director command line', 'upgrade wording']],
+        ['the span with arguments in the remedy', skill('Fix: follow the block.', `Restart ${code('agent-director serve --port 1')}.`), ['backticked agent-director command line']],
+      ] as const)('%s', (_label, text, forms) => {
+        expect(upgradeFormsIn(refusalSectionForUpgradeForms(text)).sort()).toEqual([...forms].sort())
+      })
+
+      test(`a skill with no "${RUNTIME_STOP_HEADING}" heading throws naming it`, () => {
+        expect(() => refusalSectionForUpgradeForms(`## ${REFUSAL_SECTION_TITLE}\nIntro.\n`)).toThrow(RUNTIME_STOP_HEADING)
+      })
+    })
 
     test('the triage points to the refusal section by an anchor that resolves', () => {
       const anchor = headingSlug(REFUSAL_SECTION_TITLE)
@@ -1729,7 +1879,7 @@ describe('the agent-director refusal classes name the switch-over runbook (b.jg5
   })
 
   test('self-check: no pattern matches the runbook pointer itself', () => {
-    const pointer = flat(`Follow the README section "${PHASE1_RUNBOOK_SECTION_TITLE}" to install agent-director, then start the server again.`)
+    const pointer = flat(`Follow the README section "${PHASE1_RUNBOOK_SECTION_TITLE}" from its block "${REFUSAL_BLOCK_HEADING}"; the new CSCB is started only as step 10 starts it.`)
     expect(UPGRADE_FORMS.filter(([, pattern]) => pattern.test(pointer)).map(([form]) => form)).toEqual([])
   })
 
@@ -1843,15 +1993,21 @@ function lazy<T>(build: () => T): () => T {
   return () => (built ??= { value: build() }).value
 }
 
+/** agent-director's home install path, which the client looks at first (SRJ-1301): the `homeBinary` and `findMissingCron` rows' common part. */
+const AD_HOME_BINARY = '$HOME/.agent-director/bin/agent-director'
+
 /**
- * agent-director vocabulary the runbook names and CSCB defines nowhere, each
- * row citing its source (HO: agent-director's handoff notes; ADSRD: its SRD).
- * Everything CSCB defines (versions, settings keys, defaults, minimums, the
- * margin, the verbs, the store path, titles, labels) is imported instead.
+ * agent-director vocabulary the operator texts name and CSCB defines nowhere,
+ * each row citing its source (HO: agent-director's handoff notes; ADSRD: its
+ * SRD). Everything CSCB defines (versions, settings keys, defaults, minimums,
+ * the margin, the verbs, the store path, titles, labels) is imported instead.
  * `ceiling <name>` rows are ADSRD SR-13.2's ceiling formulas as the runbook
  * lists them (b.jg5 SRJ-213), one per ceiling CSCB calls.
  */
 const AD_VOCABULARY: Record<string, { text: string; source: string }> = {
+  homeBinary: { text: AD_HOME_BINARY, source: "agent-director's client discovery: its home install, found before the first `agent-director` on PATH (b.jg5 SRJ-1301; SRJ-1104, SRJ-1108)" },
+  findMissingCron: { text: `* * * * * ${AD_HOME_BINARY} find-missing`, source: "HO C19; b.jg5 SRJ-1101: the README Migration section's cron line, with no flags, run as the workers' user on their tmux socket (C7)" },
+  stoppingSetItem: { text: '"Stopping a set of agents before a binary change"', source: 'HO rev 27: the "Operator actions" item a human follows to stop a set of agents, CSCB\'s bots included; SRJ-1104, SRJ-1108' },
   tmuxMinimum: { text: '3.2', source: 'HO rev 17: tmux 3.2 or later; b.jg5 SRJ-1108 step 1, SRJ-1103' },
   remainOnExit: { text: code('remain-on-exit'), source: 'HO rev 17: kept off; SRJ-1108 step 1' },
   baseIndex: { text: 'base-index', source: 'HO rev 17: agent-director depends on it not at all; SRJ-1108 step 1 names it not' },
@@ -2022,6 +2178,23 @@ function missingItems(carrier: RunbookCarrier, text: string, required: readonly 
 /** A link to step n's heading in the carrier, as Markdown writes its target. */
 const stepLink = (n: number) => (carrier: RunbookCarrier) => `(#${carrier.stepAnchors[n - 1]})`
 
+/** The README section that keeps the conversion steps the switch-over's steps 1 and 7 point to (b.jg5 SRJ-1103). */
+const UPGRADING_TITLE = 'Upgrading to personas'
+
+/**
+ * A link to `UPGRADING_TITLE`'s README heading as the carrier writes it: a
+ * same-file anchor in the README, `README.md#…` in the CHANGELOG copy (b.jg5
+ * SRJ-1107; the E35 T1 PM note).
+ */
+const upgradingLink = (carrier: RunbookCarrier) => `(${carrier.name.startsWith(`${CHANGELOG_FILE} `) ? 'README.md' : ''}#${headingSlug(UPGRADING_TITLE)})`
+
+/**
+ * SRJ-1101's words for a kill a runbook step tells a human to run: its result
+ * checked, and nothing deleted or respawned on an error (switch-over step 6,
+ * rollback steps 4 and 5; the README's advice to kill leftover workers).
+ */
+const KILL_CAVEAT = "check its result; on an error, don't delete or respawn"
+
 /** `(operator action)`, the marker of each operator-only action (Runbook Markdown contract). */
 const OPERATOR_ACTION = '(operator action)'
 
@@ -2164,6 +2337,7 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
   ['step 1 › Copies for rollback', "the old CSCB's exact version recorded in the switch-over log", [ci("record the old CSCB's exact version in the switch-over log")]],
   ['step 1 › The orchestrator prompt', 'the §6 "ship now" wording may go out any time before', [ci('"ship now" wording may go out any time before')]],
   ['step 1 › The orchestrator prompt', 'operator action: the §6 "ship now" wording', [OPERATOR_ACTION]],
+  ['step 1', `the conversion steps kept in "${UPGRADING_TITLE}" are linked (SRJ-1103; the E35 T1 PM note)`, [upgradingLink]],
 
   // Steps 2 to 11.
   ['step 2', "the host's autostart for CSCB disabled until step 10", [ci("disable the host's autostart for CSCB until step 10")]],
@@ -2220,6 +2394,9 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
     ci('if the session or one of its windows remains, end the session with the exact-name `tmux kill-session -t =<name>`, and make the gone check again'),
     ci(`\`agent-director find-missing\` until the row reads \`ended\` or \`missing\`, for at most ${vocab('waitMinutes')} minutes`),
   ]],
+  ['step 6', "the kill's result is checked, and on an error nothing is deleted or respawned (SRJ-1101)", [
+    ci(`${code('agent-director kill --claude-instance-id <id>')} and ${KILL_CAVEAT}`),
+  ]],
   ['step 6', 'a leftover that cannot be ended means no Phase 1 install: step 8\'s "no go", investigated by session name', [
     ci('a leftover that cannot be ended this way means no Phase 1 install'),
     ci('step 8\'s "no go" branch'),
@@ -2239,6 +2416,7 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
     ci(`passes on the still-installed ${OLD_AD_VERSION}, with its note`),
   ]],
   ['step 7', 'from this step the new CSCB is deployed but not started', [ci('from this step the new CSCB is deployed but not started')]],
+  ['step 7', `the conversion steps kept in "${UPGRADING_TITLE}" are linked (SRJ-1103; the E35 T1 PM note)`, [upgradingLink]],
   ['step 8', "the install-gate record's dated go line confirmed", [ci("confirm that the install-gate record has this host's dated go line")]],
   ['step 8', `"no go": no Phase 1 install; the previous CSCB back with step 1's files, started on ${OLD_AD_VERSION}, autostart re-enabled, the stopped agents started again; the runbook stops`, [
     ci('if it does not, there is no Phase 1 install'),
@@ -2340,17 +2518,6 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
 const overCarriers = <T extends readonly unknown[]>(rows: readonly T[]) =>
   SWITCH_OVER_CARRIERS.flatMap(([name, read]) => rows.map((row) => [name, ...row, read] as const))
 
-/**
- * Ruling C-1 (b.jg5 SRJ-1108): the backticked agent-director command lines a
- * runbook text may carry where `UPGRADE_FORMS` applies, each removed exactly
- * (that span, as written) before the forms are applied; any other backticked
- * agent-director command line there still fails. No pattern is narrowed.
- */
-const RUNBOOK_COMMAND_SPANS: Record<'refusal block' | "step 1's version item", string> = {
-  'refusal block': code('agent-director serve'),
-  "step 1's version item": code('agent-director version'),
-}
-
 /** `text` without the one command span ruling C-1 allows in `where`. */
 function withoutAllowedSpan(text: string, where: keyof typeof RUNBOOK_COMMAND_SPANS): string {
   return text.split(RUNBOOK_COMMAND_SPANS[where]).join('')
@@ -2440,7 +2607,7 @@ const REFUSAL_BRANCHES: [element: string, part: RegExp, required: readonly Item[
     ci('for that refusal, and only for it'),
   ]],
   ["the binary check: the lookup order, then `<path> version` on the startup-errors entry's path, as the workers' user in the launcher environment", ci('a refusal at step 10'), [
-    `${code('$HOME/.agent-director/bin/agent-director')} first, then the first ${code('agent-director')} on ${code('PATH')}`,
+    `${code(vocab('homeBinary'))} first, then the first ${code('agent-director')} on ${code('PATH')}`,
     ci('the binary path the startup-errors entry names'),
     code('<path> version'),
     ci("as the workers' user in the bot server's launcher environment"),
@@ -2449,7 +2616,7 @@ const REFUSAL_BRANCHES: [element: string, part: RegExp, required: readonly Item[
     ci('put agent-director Phase 1 back as the binary the server finds'),
     `follow "${ROLLBACK_RUNBOOK_SECTION_TITLE}", which starts the previous CSCB`,
     ci(`stop every agent on the host and every long-running agent-director process (${code('agent-director serve')} included) before that binary change, and start them again after it`),
-    '"Stopping a set of agents before a binary change"',
+    vocab('stoppingSetItem'),
     `${vocab('operatorActions')} section of agent-director's README`,
     ci('once the server finds Phase 1, start the new CSCB as'),
     stepLink(10),
@@ -2704,7 +2871,7 @@ describe(`the switch-over runbook, "${PHASE1_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-
       expect(markdownLinks(readRepoFile(file)).filter((link) => link.anchor === anchor).map((link) => link.target)).toEqual([])
     })
 
-    const UPGRADING_HEADING = '### Upgrading to personas'
+    const UPGRADING_HEADING = `### ${UPGRADING_TITLE}`
     const upgrading = () => flat(requiredSection(migration(), UPGRADING_HEADING, `README.md, under "${MIGRATION_HEADING}",`))
 
     test.each([
@@ -2839,6 +3006,9 @@ const ROLLBACK_ELEMENTS: [where: string, element: string, required: readonly Ite
     ci('a row still live after that (for example a retired key whose kill failed, which `stop --stop-bots` does not cover) is ended by a human'),
     ci('run `agent-director kill --claude-instance-id <id>`, and check its result'),
   ]],
+  ['step 4', "the kill's result is checked, and on an error nothing is deleted or respawned (SRJ-1101)", [
+    ci(`${code('agent-director kill --claude-instance-id <id>')}, and ${KILL_CAVEAT}`),
+  ]],
   ['step 4', `a kill refused with ${AD_ERROR_CLASS_CONFLICT} ("${vocab('notThisLaunch')}") meets a leftover of an earlier launch, handled as ${vocab('operatorActions')} describes`, [
     `refused with ${AD_ERROR_CLASS_CONFLICT} ("${vocab('notThisLaunch')}")`,
     ci('has met a leftover of an earlier launch'),
@@ -2877,6 +3047,9 @@ const ROLLBACK_ELEMENTS: [where: string, element: string, required: readonly Ite
     ci('a leftover whose row is live'),
     code(`agent-director kill --claude-instance-id ${PERSONA_INSTANCE_ID_PREFIX}<key>`),
     ci(`when that \`kill\` is refused with "${vocab('notThisLaunch')}", handle it as ${vocab('operatorActions')} describes`),
+  ]],
+  ['step 5', "the live row's kill: its result checked, and on an error nothing deleted or respawned (SRJ-1101)", [
+    ci(`${code(`agent-director kill --claude-instance-id ${PERSONA_INSTANCE_ID_PREFIX}<key>`)}, and ${KILL_CAVEAT}`),
   ]],
   ['step 5', `a finished row's own leftover session: as ${vocab('operatorActions')} describes`, [
     new RegExp(`a finished row's own leftover session\\W+handle it as ${escapeRegExp(vocab('operatorActions'))} describes`, 'i'),
@@ -3428,6 +3601,8 @@ const HATCH_NOTE_NAMES: [name: string, source: string][] = [
   [PERSONA_KILL_SURVIVOR_LABEL, 'E33: src/kill-failure-alert.ts PERSONA_KILL_SURVIVOR_LABEL (SRJ-1013)'],
   [CLEAN_RESTART_NOT_RESTARTED_LABEL, 'E33: src/cli-teardown.ts CLEAN_RESTART_NOT_RESTARTED_LABEL (SRJ-906, SRJ-1013)'],
   ...startSummaryCountLabels().map((label): [string, string] => [label, 'E26: src/session-manager.ts startupSummaryEnding (SRJ-1015)']),
+  [UNAVAILABLE_RETRY_CAUSE_COLLISION, "E36 T1: src/unavailable-retry.ts UNAVAILABLE_RETRY_CAUSE_COLLISION (the retry cause's rename, reconcile ruling)"],
+  [lostMessageStateLabel('auto-restart-disabled'), "E8, E36 T4: src/lost-message.ts STATE_WORDING['auto-restart-disabled'] (SRJ-1011)"],
 ]
 
 /**
@@ -4814,6 +4989,1190 @@ describe('E36 T3: the architecture doc and the engineering guide match the build
       expect(brokenRepoLinks(ARCHITECTURE_FILE, `See [the README](../README.md#${readmeAnchor}) and [gone](../README.md#no-such-heading).`).broken).toEqual([
         `${ARCHITECTURE_FILE} -> ../README.md#no-such-heading (no such heading in ../README.md)`,
       ])
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// E36 T4: SRJ-1101's term and placement checks over every operator text, the
+// layering rule's tmux allow-list, and SRJ-1103's README and SRJ-1104's
+// debugging-skill sections (b.jg5 SRJ-1101, SRJ-1103, SRJ-1104; SRJ-1105 and
+// SRJ-1106 through the term checks; AC 78, AC 79), read through OPERATOR_TEXTS
+// ---------------------------------------------------------------------------
+
+/**
+ * SRJ-1101's terms (file-local, citing SRJ-1101's Test line and the Task's
+ * hatch notes): `has-session`, `tmux-kill`, `agent-director delete`,
+ * `find-missing --timeout`, the finished-row option in both spellings
+ * (`include_finished` beside `include-finished`, the orchestrator's hatch
+ * note), and tmux's two other raw kills, `kill-pane` and `kill-server`
+ * (`tmux kill-session` is placed by its own case). Case-insensitive, a space
+ * matching any whitespace, so a term wrapped across lines is found.
+ */
+const SRJ_1101_TERMS: readonly Term[] = [
+  ['has-session', /\bhas-session\b/gi],
+  ['tmux-kill', /\btmux-kill\b/gi],
+  ['agent-director delete', /\bagent-director\s+delete\b/gi],
+  ['find-missing --timeout', /\bfind-missing\s+--timeout\b/gi],
+  ['include-finished', /\binclude-finished\b/gi],
+  ['include_finished', /\binclude_finished\b/gi],
+  ['kill-pane', /\bkill-pane\b/gi],
+  ['kill-server', /\bkill-server\b/gi],
+]
+
+/** `pattern` with each literal space in its source matching any whitespace, so a phrase wrapped across lines is found in a file's raw text. */
+function wrapped(pattern: RegExp): RegExp {
+  return new RegExp(pattern.source.replace(/ /g, '\\s+'), pattern.flags)
+}
+
+/** Each [start, end) offset of `span` in `text`, a space in it matching any whitespace. Pure. */
+function spanOffsets(text: string, span: string): [start: number, end: number][] {
+  return [...text.matchAll(new RegExp(escapeRegExp(span.trim()).replace(/ /g, '\\s+'), 'g'))].map((m) => [m.index ?? 0, (m.index ?? 0) + m[0].length])
+}
+
+/** `findTermsAt`'s hits of `terms` in `text` that start inside no occurrence of `spans`. Pure. */
+function hitsOutsideSpans(file: string, text: string, terms: readonly Term[], spans: readonly string[]): { hit: TermHit; index: number }[] {
+  const offsets = spans.flatMap((span) => spanOffsets(text, span))
+  return findTermsAt(file, text, terms).filter(({ index }) => !offsets.some(([start, end]) => index >= start && index < end))
+}
+
+/** The prefix-key reason's spans (`PREFIX_KEY_REASON_SPANS`), built: the one place an operator text may show an attach without `=` (SRJ-1102). */
+function prefixKeyReasonSpans(): string[] {
+  return PREFIX_KEY_REASON_SPANS.map(([, span]) => span())
+}
+
+/** A raw tmux session kill, wrapped or not; SRJ-1101 allows it only in switch-over steps 5 and 6, with `=`. */
+const KILL_SESSION: Term = ['tmux kill-session', /\btmux\s+kill-session\b/gi]
+
+/** The switch-over steps SRJ-1101 lets name `tmux kill-session -t =<name>` (SRJ-1108 steps 5 and 6). */
+const KILL_SESSION_STEPS: readonly number[] = [5, 6]
+
+/** The files that carry the switch-over runbook (`SWITCH_OVER_CARRIERS`' names). */
+const SWITCH_OVER_CARRIER_FILES: readonly string[] = SWITCH_OVER_CARRIERS.map(([name]) => name)
+
+/**
+ * The 0-based [start, end) line ranges, in `text` (a carrier's whole file),
+ * of switch-over `steps`: the step headings, at the runbook's step level,
+ * inside the file's first `SWITCH_OVER_HEADING` section (the README's, or the
+ * CHANGELOG release entry's copy, the file's first entry). Throws naming the
+ * file when the section or a step is missing.
+ */
+function switchOverStepRanges(file: string, text: string, steps: readonly number[]): { start: number; end: number }[] {
+  const section = sectionRange(text, SWITCH_OVER_HEADING)
+  if (section === undefined) throw new Error(`${file} has no heading "${SWITCH_OVER_HEADING}"`)
+  const level = SWITCH_OVER_HEADING.indexOf(' ') + 1
+  const hs = headings(text)
+  return steps.map((n) => {
+    const i = hs.findIndex((h) => h.line > section.start && h.line < section.end && h.level === level && stepNumberOf(h.title) === n)
+    if (i < 0) throw new Error(`${file}: switch-over step ${n} is missing`)
+    const next = hs.slice(i + 1).find((h) => h.level <= level)
+    return { start: hs[i].line, end: next === undefined ? text.split('\n').length : next.line }
+  })
+}
+
+/** Each `tmux kill-session` in `text` (the operator text `file`) outside switch-over steps 5 and 6, which only the runbook's carriers hold. Pure. */
+function killSessionsOutsideSteps(file: string, text: string): TermHit[] {
+  const ranges = SWITCH_OVER_CARRIER_FILES.includes(file) ? switchOverStepRanges(file, text, KILL_SESSION_STEPS) : []
+  return findTerms(file, text, [KILL_SESSION]).filter((hit) => !ranges.some((range) => hit.line > range.start && hit.line <= range.end))
+}
+
+/** E8's attach-without-`=` form (`RAW_COMMAND_FORMS`), wrapped, for the raw text of every operator text. */
+const UNEXACT_ATTACH: Term = (() => {
+  const row = RAW_COMMAND_FORMS.find(([label]) => label === 'a tmux attach target without =')
+  if (row === undefined) throw new Error('RAW_COMMAND_FORMS has no row "a tmux attach target without ="')
+  return [row[0], wrapped(row[1])]
+})()
+
+/** Each `tmux attach -t` (or `attach-session -t`) without `=` in `text`, outside `spans` (the prefix-key reason's, by default). Pure. */
+function unexactAttaches(file: string, text: string, spans: readonly string[] = prefixKeyReasonSpans()): string[] {
+  return hitsOutsideSpans(file, text, [UNEXACT_ATTACH], spans).map(({ hit }) => formatHit(hit))
+}
+
+/**
+ * tmux's commands (file-local; tmux(1), COMMANDS, tmux 3.2 and later): each
+ * command's name and its documented alias. A fact of tmux, which neither CSCB
+ * nor agent-director defines, so it sits here rather than in `AD_VOCABULARY`.
+ * A word after `tmux` that is none of these ("tmux session", "tmux server
+ * changed") is prose, not a command.
+ */
+const TMUX_COMMAND_NAMES: readonly string[] = [
+  'attach-session', 'attach', 'bind-key', 'bind', 'break-pane', 'breakp', 'capture-pane', 'capturep', 'choose-buffer', 'choose-client',
+  'choose-tree', 'clear-history', 'clearhist', 'clear-prompt-history', 'clearphist', 'clock-mode', 'command-prompt', 'confirm-before',
+  'confirm', 'copy-mode', 'customize-mode', 'delete-buffer', 'deleteb', 'detach-client', 'detach', 'display-menu', 'menu',
+  'display-message', 'display', 'display-panes', 'displayp', 'display-popup', 'popup', 'find-window', 'findw', 'has-session', 'has',
+  'if-shell', 'if', 'join-pane', 'joinp', 'kill-pane', 'killp', 'kill-server', 'kill-session', 'kill-window', 'killw', 'last-pane',
+  'lastp', 'last-window', 'last', 'link-window', 'linkw', 'list-buffers', 'lsb', 'list-clients', 'lsc', 'list-commands', 'lscm',
+  'list-keys', 'lsk', 'list-panes', 'lsp', 'list-sessions', 'ls', 'list-windows', 'lsw', 'load-buffer', 'loadb', 'lock-client',
+  'lockc', 'lock-server', 'lock', 'lock-session', 'locks', 'move-pane', 'movep', 'move-window', 'movew', 'new-session', 'new',
+  'new-window', 'neww', 'next-layout', 'nextl', 'next-window', 'next', 'paste-buffer', 'pasteb', 'pipe-pane', 'pipep',
+  'previous-layout', 'prevl', 'previous-window', 'prev', 'refresh-client', 'refresh', 'rename-session', 'rename', 'rename-window',
+  'renamew', 'resize-pane', 'resizep', 'resize-window', 'resizew', 'respawn-pane', 'respawnp', 'respawn-window', 'respawnw',
+  'rotate-window', 'rotatew', 'run-shell', 'run', 'save-buffer', 'saveb', 'select-layout', 'selectl', 'select-pane', 'selectp',
+  'select-window', 'selectw', 'send-keys', 'send', 'send-prefix', 'server-access', 'set-buffer', 'setb', 'set-environment', 'setenv',
+  'set-hook', 'set-option', 'set', 'set-window-option', 'setw', 'show-buffer', 'showb', 'show-environment', 'showenv', 'show-hooks',
+  'show-messages', 'showmsgs', 'show-options', 'show', 'show-prompt-history', 'showphist', 'show-window-options', 'showw',
+  'source-file', 'source', 'split-window', 'splitw', 'start-server', 'start', 'suspend-client', 'suspendc', 'swap-pane', 'swapp',
+  'swap-window', 'swapw', 'switch-client', 'switchc', 'unbind-key', 'unbind', 'unlink-window', 'unlinkw', 'wait-for', 'wait',
+]
+
+/** A tmux command in a text: `tmux`, any global flags (`-L <name>`, `-S <path>`), then one of `TMUX_COMMAND_NAMES` as a whole word, wrapped or not. */
+const TMUX_COMMAND: RegExp = new RegExp(
+  `\\btmux(?:\\s+-[A-Za-z0-9]+(?:\\s+(?!-)[^\\s\`]+)?)*?\\s+(?:${[...TMUX_COMMAND_NAMES].sort((a, b) => b.length - a.length).map(escapeRegExp).join('|')})(?![\\w-])`,
+  'gi',
+)
+
+/**
+ * The layering rule's allow-list (the Task's ruling, citing the engineering
+ * guide's "CSCB never touches tmux"; file-local): the tmux commands an
+ * operator text may name, each a human's read-only or exact-target command.
+ * The exact-target attach (SRJ-1101); the runbooks' read-only `tmux ls`,
+ * `tmux list-windows -a` or `-t =<name>` and `tmux display-message -p`
+ * (SRJ-1108 steps 1 and 5); and the exact-name `tmux kill-session -t =` of
+ * switch-over steps 5 and 6, whose placement its own case checks. Each form
+ * is matched against a command's text from `tmux` on, flattened; a command
+ * matching none, global flags included, is off the list.
+ */
+const TMUX_ALLOWED_FORMS: readonly [form: string, pattern: RegExp][] = [
+  ['`tmux attach -t =<name>` (SRJ-1101)', /^tmux\s+attach(?:-session)?\s+-t\s*=/i],
+  ['`tmux ls`, read-only (SRJ-1108 steps 1 and 5)', /^tmux\s+ls(?![\w-])/i],
+  ['`tmux list-windows -a` or `-t =<name>`, read-only (SRJ-1108 step 5)', /^tmux\s+list-windows\s+(?:-a(?![\w-])|-t\s*=)/i],
+  ['`tmux display-message -p …`, read-only (SRJ-1108 step 1)', /^tmux\s+display-message\s+-p(?![\w-])/i],
+  ['`tmux kill-session -t =<name>` (SRJ-1101: switch-over steps 5 and 6 only)', /^tmux\s+kill-session\s+-t\s*=/i],
+]
+
+/** Each tmux command in `text` that no `TMUX_ALLOWED_FORMS` form allows, outside `spans` (the prefix-key reason's, by default), with file and line. Pure. */
+function offListTmuxCommands(file: string, text: string, spans: readonly string[] = prefixKeyReasonSpans()): string[] {
+  return hitsOutsideSpans(file, text, [['a tmux command off the allow-list', TMUX_COMMAND]], spans)
+    .filter(({ index }) => {
+      const command = flat(text.slice(index, index + 200))
+      return !TMUX_ALLOWED_FORMS.some(([, form]) => form.test(command))
+    })
+    .map(({ hit }) => formatHit(hit))
+}
+
+/**
+ * SRJ-613's claim (file-local, citing SRJ-613 and SRJ-1101): that a pane, a
+ * `read-pane` answer or a GONE (`ErrTmuxCaptureFailed`) proves, shows or
+ * means a worker gone. A match whose clause, up to its end, holds a negation
+ * ("does not prove the worker gone") is the caveat, not the claim.
+ */
+const GONE_AS_PROOF: readonly [label: string, pattern: RegExp][] = [
+  [
+    'a pane, a read-pane answer or a GONE taken as proof the worker is gone',
+    /\b(?:GONE|ErrTmuxCaptureFailed|panes?|read-pane)\b[^.;:]{0,80}?\b(?:proves?|proof|confirms?|shows?|means?)\b[^.;:]{0,60}?\b(?:gone|dead|exited|not running)\b/g,
+  ],
+]
+
+/** Each affirmed `GONE_AS_PROOF` claim in `text`'s units, as `<label>: <matched text>`. Pure. */
+function goneAsProofClaims(text: string): string[] {
+  return textUnits(text).flatMap((unit) =>
+    GONE_AS_PROOF.flatMap(([label, pattern]) =>
+      [...unit.matchAll(pattern)]
+        .filter((m) => !NEGATION.test(`${clauseBefore(unit, m.index ?? 0)}${m[0]}`))
+        .map((m) => `${label}: ${m[0]}`),
+    ),
+  )
+}
+
+/** An instruction to kill a row's worker: the backticked `agent-director kill --claude-instance-id …` (a log line's `agent-director kill of …` is no instruction). */
+const KILL_INSTRUCTION = /`agent-director kill --claude-instance-id [^`]*`/g
+
+/** SRJ-1101: an `agent-director kill` named with its result checked. */
+const CHECKS_THE_RESULT = /\bcheck(?:s|ed|ing)? (?:the|its) result\b/i
+
+/** SRJ-1101: the README's advice to kill a leftover worker adds "check the result; on an error, don't delete or respawn". */
+const CHECKS_AND_DOES_NOT_DELETE = /\bchecks? (?:the|its) result; on an error, don't delete or respawn\b/i
+
+/** The rest of the sentence of flattened `text` from offset `at`: up to its next full stop followed by whitespace, or the end. */
+function sentenceAfter(text: string, at: number): string {
+  const rest = text.slice(at)
+  const end = rest.search(/\.(?:\s|$)/)
+  return end < 0 ? rest : rest.slice(0, end)
+}
+
+/** Each `KILL_INSTRUCTION` in `text` whose sentence does not match `rule`, with that sentence. Pure. */
+function killAdviceProblems(text: string, rule: RegExp): string[] {
+  const flatText = flat(text)
+  return [...flatText.matchAll(KILL_INSTRUCTION)]
+    .map((m) => `${m[0]}${sentenceAfter(flatText, (m.index ?? 0) + m[0].length)}`)
+    .filter((sentence) => !rule.test(sentence))
+}
+
+/** A notice's title: the words between its first pair of `*`. Throws on a text with none. */
+function noticeTitle(text: string): string {
+  const m = /\*([^*]+)\*/.exec(text)
+  if (m === null) throw new Error(`no *title* in: ${text.slice(0, 80)}`)
+  return m[1]
+}
+
+/**
+ * The Slack notices README "Troubleshooting" gives an entry each (SRJ-1103:
+ * the retry timer's, `tmux-unresponsive`'s, the kill-failure alert's two
+ * versions and the other new notices), each title rendered by the `src/`
+ * builder or head that posts it.
+ */
+const TROUBLESHOOTING_NOTICES: readonly [source: string, title: () => string][] = [
+  ['tmuxUnresponsiveOnsetText', () => noticeTitle(tmuxUnresponsiveOnsetText(ALERT_KEY))],
+  ['tmuxUnresponsiveAlertText', () => noticeTitle(tmuxUnresponsiveAlertText(ALERT_KEY, TMUX_UNRESPONSIVE_ONSET_FLOOR_MS))],
+  ['tmuxUnresponsiveRecoveryText', () => noticeTitle(tmuxUnresponsiveRecoveryText(ALERT_KEY))],
+  ['slowRecoveryText', () => noticeTitle(slowRecoveryText(ALERT_KEY))],
+  ['STUCK_LAUNCH_RELAUNCHING_HEAD', () => noticeTitle(STUCK_LAUNCH_RELAUNCHING_HEAD)],
+  ['STUCK_LAUNCH_HELD_HEAD', () => noticeTitle(STUCK_LAUNCH_HELD_HEAD)],
+  ["ONSET_TEMPLATES['tmux-unavailable']", () => noticeTitle(ONSET_TEMPLATES['tmux-unavailable']())],
+  ['tmuxServerChangedOnset', () => noticeTitle(tmuxServerChangedOnset())],
+  ['CONFLICT_NOTICE_FIRST_LINE_HEAD', () => noticeTitle(CONFLICT_NOTICE_FIRST_LINE_HEAD)],
+  ['UNUSABLE_NAME_NOTICE_HEAD', () => noticeTitle(UNUSABLE_NAME_NOTICE_HEAD)],
+  ['LAUNCH_START_NOTICE_HEAD', () => noticeTitle(LAUNCH_START_NOTICE_HEAD)],
+  ['INVALID_FLAGS_HOLD_ALERT_TEXT', () => noticeTitle(INVALID_FLAGS_HOLD_ALERT_TEXT)],
+  ...killFailureAlertRenderings()
+    .filter(({ content }, i, all) => all.findIndex((r) => r.content.version === content.version) === i)
+    .map(({ content }): [string, () => string] => [`killFailureAlertText (${content.version})`, () => noticeTitle(killFailureAlertText(content, KILL_FAILURE_CLOSING_DESTINATION, true))]),
+  ["ONSET_TEMPLATES['ad-config-malformed']", () => noticeTitle(ONSET_TEMPLATES['ad-config-malformed']())],
+  ['unclassifiedErrorAlertText', () => noticeTitle(unclassifiedErrorAlertText({ reportedName: undefined, message: '' }))],
+]
+
+/** The README Troubleshooting section's entries: each bold title line (`**…**` alone on its line) with its text up to the next, flattened. Pure. */
+function troubleshootingEntries(readme: string): { title: string; text: string }[] {
+  const entries: { title: string; lines: string[] }[] = []
+  for (const line of requiredSection(readme, TROUBLESHOOTING_HEADING, 'README.md').split('\n')) {
+    if (/^\*\*.+\*\*\s*$/.test(line)) entries.push({ title: line.trim(), lines: [] })
+    else entries.at(-1)?.lines.push(line)
+  }
+  return entries.map(({ title, lines }) => ({ title, text: flat(lines.join('\n')).trim() }))
+}
+
+/** The one Troubleshooting entry whose title holds `titlePart`, its title and text flattened; throws unless exactly one does. */
+function troubleshootingEntry(readme: string, titlePart: string): string {
+  const entries = troubleshootingEntries(readme).filter((entry) => entry.title.includes(titlePart))
+  if (entries.length !== 1) throw new Error(`README.md "${TROUBLESHOOTING_HEADING}": ${entries.length} entries' titles hold "${titlePart}", expected 1`)
+  return `${entries[0].title} ${entries[0].text}`
+}
+
+/** A section of `file`'s text under `heading`, flattened (a row's passage). */
+const sectionOf = (file: string, heading: HeadingMatch) => (text: string) => flat(requiredSection(text, heading, file))
+
+/** The one unit (`textUnits`) of `file`'s section under `heading` that opens with `lead`, link targets dropped (a row's passage). */
+const unitOf = (file: string, heading: HeadingMatch, lead: string) => (text: string) => {
+  const units = textUnits(requiredSection(text, heading, file)).filter((unit) => unit.startsWith(lead))
+  if (units.length !== 1) throw new Error(`${file} ${String(heading)}: ${units.length} units open with "${lead}", expected 1`)
+  return linkTexts(units[0])
+}
+
+/** The Troubleshooting entry whose title holds `*<title>*` (a row's passage). */
+const entryOf = (title: () => string) => (readme: string) => troubleshootingEntry(readme, `*${title()}*`)
+
+/** One row: an element, the passage of its text it sits in, and the items the passage must hold. */
+type DocRow = readonly [element: string, passage: (text: string) => string, required: readonly (string | RegExp)[]]
+
+/** A row's problems on `text`: its passage missing, or each item it lacks. */
+function docRowProblems(passage: (text: string) => string, required: readonly (string | RegExp)[], text: string): string[] {
+  let found: string
+  try {
+    found = passage(text)
+  } catch (err) {
+    return [err instanceof Error ? err.message : String(err)]
+  }
+  return lacking(found, required)
+}
+
+/** A notice title from `TROUBLESHOOTING_NOTICES` by its source. */
+function troubleshootingNoticeTitle(source: string): () => string {
+  const row = TROUBLESHOOTING_NOTICES.find(([name]) => name === source)
+  if (row === undefined) throw new Error(`TROUBLESHOOTING_NOTICES has no source "${source}"`)
+  return row[1]
+}
+
+/** A number written as the README writes a range bound: thousands joined by `_` (`3_600_000`). */
+function underscored(n: number): string {
+  return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, '_')
+}
+
+/** The README's clear-latch CLI entry heading. */
+const CLEAR_LATCH_CLI_HEADING = `### \`claude-slack-channel-bots ${CLEAR_LATCH_COMMAND}\``
+
+/** The all-interfaces `bind`, the other value through which `clear-latch` reaches the server (SRJ-510); the loopback one is `CLEAR_LATCH_DIAL_HOST`. */
+const ALL_INTERFACES_BIND = '0.0.0.0'
+
+/** The README section and subsection the call-timeout entry sits in (SRJ-1103: under "Configuration"). */
+const CONFIGURATION_HEADING = '## Configuration'
+const CALL_TIMEOUT_SIZING_HEADING = '#### Sizing the agent-director call timeout'
+
+/** The README's timing-settings section (SRJ-209, SRJ-1103). */
+const TIMING_SETTINGS_HEADING = "### agent-director's timing settings"
+
+/** The README's prerequisites section. */
+const PREREQUISITES_HEADING = '## Prerequisites'
+
+/** The re-check interval in the words the docs use: "every 2 minutes" (`LATCH_RECHECK_INTERVAL_MS`, SRJ-505). */
+const LATCH_RECHECK_WORDS = `every ${LATCH_RECHECK_INTERVAL_MS / 60_000} minutes`
+
+/**
+ * SRJ-1103's README rows (AC 78, AC 79): the prerequisites, one row per item;
+ * then one row per section SRJ-1103 names. Values CSCB defines are imported;
+ * agent-director's from `AD_VOCABULARY`. Each row is self-checked below: each
+ * item cut from its passage is reported, and the rows SRJ-1103's Test line
+ * names fail on the README with that item reverted.
+ */
+const README_SRJ_1103_ROWS: readonly DocRow[] = [
+  // The prerequisites.
+  [`prerequisites: Claude Code ${MIN_CLAUDE_CODE_VERSION} or later for the workers (MIN_CLAUDE_CODE_VERSION), the minimum agent-director states for its exec-form hooks and the fleet's version (RN-9; HO rev 31; SRJ-1304)`, unitOf('README.md', PREREQUISITES_HEADING, '- [Claude Code]'), [
+    `Claude Code ${MIN_CLAUDE_CODE_VERSION} or later for the workers`,
+    ci('installed and authenticated'),
+    ci('the minimum agent-director states for its exec-form hooks'),
+    ci('the version the fleet runs'),
+  ]],
+  ['prerequisites: agent-director Phase 1 or later, installed system-wide', unitOf('README.md', PREREQUISITES_HEADING, '- [`agent-director`]'), [
+    ci('`agent-director` Phase 1 or later'),
+    ci('installed system-wide'),
+  ]],
+  ['prerequisites: this release and agent-director Phase 1 are installed, and rolled back, together; CSCB changes no agent-director code (SRJ-1515)', unitOf('README.md', PREREQUISITES_HEADING, '- [`agent-director`]'), [
+    ci('installed on the host together with it, and the two are rolled back together'),
+    ci('CSCB changes no agent-director code'),
+  ]],
+  ['prerequisites: every agent and long-running agent-director process stopped before either binary change and started again after it (HO C15; ADA question 9)', unitOf('README.md', PREREQUISITES_HEADING, '- [`agent-director`]'), [
+    ci(`every agent on the host, with every long-running agent-director process (${code('agent-director serve')} included), is stopped before either binary change`),
+    ci("the Phase 1 install, and the rollback's restore of the previous binary"),
+    ci('and started again after it'),
+  ]],
+  [`prerequisites: tmux ${vocab('tmuxMinimum')} or later, with remain-on-exit off (HO rev 17)`, unitOf('README.md', PREREQUISITES_HEADING, '- [tmux]'), [
+    ci(`tmux ${vocab('tmuxMinimum')} or later, with ${vocab('remainOnExit')} off`),
+  ]],
+  ['prerequisites: agent-director depends on neither base-index nor pane-base-index (HO rev 17)', unitOf('README.md', PREREQUISITES_HEADING, '- [tmux]'), [
+    ci(`agent-director does not depend on tmux's ${code(vocab('baseIndex'))} or ${code(vocab('paneBaseIndex'))}`),
+  ]],
+
+  // Migration, beside the runbooks.
+  ["Migration: the find-missing job runs as the workers' user and resolves their tmux socket (C7, C19)", sectionOf('README.md', MIGRATION_HEADING), [
+    ci("the job must run as the workers' user and resolve their tmux socket"),
+    ci('the socket switch-over step 1 pins'),
+  ]],
+  ["Migration: a host's sweep runs in its sweep loop, the one the switch-over runbook names", sectionOf('README.md', MIGRATION_HEADING), [
+    code('~/startup/find-missing-loop.sh'),
+  ]],
+
+  // Destructive changes: the retired persona, no delete, checked kills.
+  ['Destructive changes: a removed, renamed or destructively modified persona is retired, never resumed, and a re-add starts fresh', sectionOf('README.md', '### Destructive changes'), [
+    ci("a retired persona's session is stopped and never resumed"),
+    ci('a persona removed and added again with the same key, or renamed and then renamed back, always starts a new conversation'),
+  ]],
+  ["Destructive changes: CSCB never deletes a row and checks every kill; a removed persona's row is kept until expire", sectionOf('README.md', '### Destructive changes'), [
+    ci('CSCB never deletes an agent-director row, and it checks the result of every kill it makes'),
+    ci("a removed persona's row stays until agent-director's `expire` removes it, and is never resumed"),
+  ]],
+
+  // The latch.
+  [`the *${troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')()}* entry: a CONFLICT and conflicting labels latch; the persona is ${lostMessageStateLabel('held-for-human')}`, entryOf(troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')), [
+    ci('a session conflict'),
+    ci("conflicting labels on the persona's own row"),
+    code(lostMessageStateLabel('held-for-human')),
+  ]],
+  [`the *${troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')()}* entry: the re-check ${LATCH_RECHECK_WORDS} (SRJ-505), how a hold ends, clear-latch, and "Operator actions" for a human only`, entryOf(troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')), [
+    ci(`**The server's own check.** ${LATCH_RECHECK_WORDS}`),
+    ci('**How a hold ends.**'),
+    `(#${headingSlug(CLEAR_LATCH_CLI_HEADING.slice('### '.length))})`,
+    vocab('operatorActions'),
+    ci('for a human only'),
+  ]],
+  [`the *${troubleshootingNoticeTitle('UNUSABLE_NAME_NOTICE_HEAD')()}* entry: an unusable recorded name latches`, entryOf(troubleshootingNoticeTitle('UNUSABLE_NAME_NOTICE_HEAD')), [
+    ci('recorded on it cannot be used'),
+    vocab('operatorActions'),
+  ]],
+  [`the *${troubleshootingNoticeTitle('LAUNCH_START_NOTICE_HEAD')()}* entry: a pending row with no launch start latches`, entryOf(troubleshootingNoticeTitle('LAUNCH_START_NOTICE_HEAD')), [
+    ci('reads pending but records no launch start'),
+    vocab('operatorActions'),
+  ]],
+
+  // A pending launch and the stuck-launch post (SRJ-410 to SRJ-412, SRJ-1017).
+  ["\"A persona's instance is still starting\": a pending launch is never launched over, its retries check it after agent-director's grace period", (readme) => troubleshootingEntry(readme, "**A persona's instance is still starting**"), [
+    code('pending_grace_seconds'),
+    ci('they never launch a second instance over it and never end it'),
+    ci('a launch that is still starting never counts as a failure'),
+  ]],
+  [`the *${troubleshootingNoticeTitle('STUCK_LAUNCH_RELAUNCHING_HEAD')()}* or *${troubleshootingNoticeTitle('STUCK_LAUNCH_HELD_HEAD')()}* entry: the later of 5 minutes and pending_grace_seconds plus 60 s`, entryOf(troubleshootingNoticeTitle('STUCK_LAUNCH_RELAUNCHING_HEAD')), [
+    `*${troubleshootingNoticeTitle('STUCK_LAUNCH_HELD_HEAD')()}*`,
+    ci(`the later of ${DIALOG_READY_TIMEOUT_MS / 60_000} minutes and agent-director's \`pending_grace_seconds\` plus ${AD_LAUNCH_BOUND_GRACE_ADDEND_SECONDS} s`),
+  ]],
+
+  // agent-director's timing settings (SRJ-209, SRJ-210).
+  [`timing settings: the nine [${AD_TMUX_TABLE}] keys of ~/${AD_SETTINGS_RELATIVE_PATH}, read at start and every ${AD_VERSION_RECHECK_INTERVAL_MS / 1000} s with agent-director's rule; agent-director's answers decide`, sectionOf('README.md', TIMING_SETTINGS_HEADING), [
+    code(`[${AD_TMUX_TABLE}]`),
+    code(`~/${AD_SETTINGS_RELATIVE_PATH}`),
+    ...AD_TMUX_KEYS.map(code),
+    ci(`when it starts and every ${AD_VERSION_RECHECK_INTERVAL_MS / 1000} s after that`),
+    ci("a missing file, a missing key or `0` means agent-director's default"),
+    ci("agent-director's own answers always decide"),
+  ]],
+  ['timing settings: each key\'s default as src/ad-settings.ts holds it', sectionOf('README.md', TIMING_SETTINGS_HEADING), AD_TMUX_KEYS.map((key) => `| ${code(key)} | ${code(String(DEFAULT_AD_SETTINGS.tmux[key]))} |`)],
+
+  // The ad-config-malformed outage (SRJ-316).
+  [`the *${troubleshootingNoticeTitle("ONSET_TEMPLATES['ad-config-malformed']")()}* entry (${PERSONA_EPISODE_KIND_AD_CONFIG_MALFORMED}): CSCB acts on nothing and retries`, entryOf(troubleshootingNoticeTitle("ONSET_TEMPLATES['ad-config-malformed']")), [
+    code(`~/${AD_SETTINGS_RELATIVE_PATH}`),
+    ci('kills, deletes and relaunches nothing'),
+    ci('it retries the persona on its own'),
+  ]],
+
+  // The call timeout, under "Configuration" (SRJ-213).
+  [`Server-wide settings: agent_director_call_timeout_ms, default ${DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS}, range [${MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS}, ${MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS}]`, (readme) => readme.split('\n').find((line) => line.startsWith(`| ${code('agent_director_call_timeout_ms')} |`)) ?? '', [
+    `| number | ${code(String(DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS))} |`,
+    `[${MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS}, ${underscored(MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS)}]`,
+    `(#${headingSlug(CALL_TIMEOUT_SIZING_HEADING.slice('#### '.length))})`,
+  ]],
+  [`call timeout: its default ${DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS}, its range, and the need: the largest ceiling CSCB calls plus the ${AD_CALL_TIMEOUT_NEED_MARGIN_MS / 1000n} s margin`, sectionOf('README.md', CALL_TIMEOUT_SIZING_HEADING), [
+    `${code('agent_director_call_timeout_ms')} (default ${code(String(DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS))}, an integer in ${code(`[${MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS}, ${underscored(MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS)}]`)}`,
+    ci('the largest ceiling among the agent-director verbs CSCB calls'),
+    ci(`plus a ${AD_CALL_TIMEOUT_NEED_MARGIN_MS / 1000n} s margin (${AD_CALL_TIMEOUT_NEED_MARGIN_MS} ms`),
+  ]],
+  ['call timeout: the ceilings\' formulas, one table row per ceiling CSCB calls (ADSRD SR-13.2; SRJ-213)', sectionOf('README.md', CALL_TIMEOUT_SIZING_HEADING),
+    CSCB_CEILINGS.map((name) => `| ${vocab(`ceiling ${name}`)} |`)],
+  ['call timeout: the startup warning, its line in server.log', sectionOf('README.md', CALL_TIMEOUT_SIZING_HEADING), [
+    ci('**The startup warning.**'),
+    `${AD_SETTINGS_LOG_PREFIX} agent_director_call_timeout_ms is <value>, at or below its need of <need> ms`,
+  ]],
+
+  // clear-latch under "CLI Reference" (SRJ-510).
+  [`clear-latch: it reaches the server at ${CLEAR_LATCH_DIAL_HOST}, so bind is ${CLEAR_LATCH_DIAL_HOST} or ${ALL_INTERFACES_BIND}`, sectionOf('README.md', CLEAR_LATCH_CLI_HEADING), [
+    `It reaches the server at ${code(CLEAR_LATCH_DIAL_HOST)}`,
+    `${code(CLEAR_LATCH_DIAL_HOST)} (the default) or ${code(ALL_INTERFACES_BIND)}`,
+  ]],
+  ['clear-latch: on any other bind, a hold ends only by the re-check, the teardown or a server restart, which drops every hold', sectionOf('README.md', CLEAR_LATCH_CLI_HEADING), [
+    ci(`a hold ends only by the server's own check ${LATCH_RECHECK_WORDS}`),
+    ci("by the persona's teardown"),
+    ci('or by a server restart, which drops every hold'),
+  ]],
+
+  // The retry timer (SRJ-301).
+  ['"A persona is retried after agent-director refuses it": the retry timer\'s schedule, whatever session_restart_delay and health_check_interval are, never toward the restart limit', (readme) => troubleshootingEntry(readme, '**A persona is retried after agent-director refuses it**'), [
+    ci(`${UNAVAILABLE_RETRY_BASE_S} seconds after the refusal`),
+    ci(`then every ${UNAVAILABLE_RETRY_CEILING_S} seconds`),
+    ci('whatever `session_restart_delay` and `health_check_interval` are, `0` included'),
+    ci('a refusal never counts toward the restart limit'),
+  ]],
+
+  // The files and the PID file (SRJ-510, SRJ-802).
+  [`Files beside the config file: ${RETIRED_KEYS_FILE_NAME}`, sectionOf('README.md', '### Files beside the config file'), [`| ${code(RETIRED_KEYS_FILE_NAME)} | The retired-key record`]],
+  [`PID file: ${SERVER_PORT_FILE_NAME}`, sectionOf('README.md', '### PID file'), [ci(`${code(`STATE_DIR/${SERVER_PORT_FILE_NAME}`)} records the server's process ID and the port it actually listens on`)]],
+
+  // The permission wedge (SRJ-1012, SRJ-1101).
+  ['the permission-wedge entry names agent-director read-pane and kill, the kill with its result checked and nothing deleted or respawned, for a human only', (readme) => troubleshootingEntry(readme, '**Bot appears dead / posts a "blocked on a native Claude Code permission prompt" warning**'), [
+    code('agent-director read-pane --claude-instance-id <id>'),
+    `${code('agent-director kill --claude-instance-id <id>')} and check the result; on an error, don't delete or respawn`,
+    vocab('operatorActions'),
+    ci('for a human only'),
+  ]],
+
+  // The *Still not answering* read-only check (E19; SRJ-1101).
+  [`the *${troubleshootingNoticeTitle('tmuxUnresponsiveAlertText')()}* check: the one-line read-pane through agent-director, its caveats in the debugging skill`, entryOf(troubleshootingNoticeTitle('tmuxUnresponsiveOnsetText')), [
+    code(`agent-director read-pane --claude-instance-id ${PERSONA_INSTANCE_ID_PREFIX}<key> --n-lines 1`),
+    `(${DEBUG_SKILL_FILE}#${headingSlug('Listing instances')})`,
+    ci("take ownership from agent-director's row, never from the pane"),
+  ]],
+]
+
+/** The element of the one `README_SRJ_1103_ROWS` row that starts with `prefix`; throws unless exactly one does. */
+function readmeRow(prefix: string): string {
+  const rows = README_SRJ_1103_ROWS.filter(([element]) => element.startsWith(prefix))
+  if (rows.length !== 1) throw new Error(`${rows.length} README_SRJ_1103_ROWS rows start with "${prefix}", expected 1`)
+  return rows[0][0]
+}
+
+/** The README rows SRJ-1103's Test line names, each with an edit reverting one of its items, and the row it must fail. */
+const README_REVERTS: readonly [row: string, how: string, edit: (readme: string) => string][] = [
+  [readmeRow('prerequisites: Claude Code'), `the Claude Code line without ${MIN_CLAUDE_CODE_VERSION} (b.ob2's line)`, (readme) =>
+    readme.replace(/^- \[Claude Code\]\(([^)]+)\) [^\n]*$/m, '- [Claude Code]($1) installed and authenticated')],
+  [readmeRow('prerequisites: Claude Code'), 'an older Claude Code version', (readme) =>
+    readme.replace(`) ${MIN_CLAUDE_CODE_VERSION} or later for the workers`, ') 2.1.139 or later for the workers')],
+  [readmeRow('prerequisites: every agent'), 'the C15 sentence dropped', (readme) => readme.replace(/ Every agent on the host, with every long-running agent-director process [^\n]*?started again after it\./, '')],
+  [readmeRow('prerequisites: tmux'), 'the tmux line dropped', (readme) => readme.replace(/^- \[tmux\][^\n]*\n/m, '')],
+  ...[
+    [CLEAR_LATCH_DIAL_HOST, code(ALL_INTERFACES_BIND)],
+    [ALL_INTERFACES_BIND, `${code(CLEAR_LATCH_DIAL_HOST)} (the default)`],
+  ].map(([bind, left]): [string, string, (readme: string) => string] => [
+    readmeRow('clear-latch: it reaches'),
+    `the bind value ${bind} dropped`,
+    (readme) => readme.replace(`must be ${code(CLEAR_LATCH_DIAL_HOST)} (the default) or ${code(ALL_INTERFACES_BIND)}`, `must be ${left}`),
+  ]),
+  [readmeRow('clear-latch: on any other bind'), 'the restart fallback dropped', (readme) =>
+    readme.replace(', or by a server restart, which drops every hold.', '.')],
+  [readmeRow('Server-wide settings: agent_director_call_timeout_ms'), 'another default', (readme) =>
+    readme.replace(`| ${code('agent_director_call_timeout_ms')} | number | ${code(String(DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS))} |`, `| ${code('agent_director_call_timeout_ms')} | number | ${code('30000')} |`)],
+  [readmeRow('call timeout: its default'), 'the margin dropped', (readme) =>
+    readme.replace(/, plus a \d+ s margin \([^)]*\)/, '')],
+  [readmeRow("call timeout: the ceilings' formulas"), `${CSCB_CEILINGS[0]}'s formula changed`, (readme) =>
+    readme.replace(`| ${vocab(`ceiling ${CSCB_CEILINGS[0]}`)} |`, '| 2Q + 2A |')],
+]
+
+/** The SRJ-1013 classes (`startup-errors.log`), each as `src/` exports it; README "Startup errors" lists each, and the debugging skill describes each. */
+const SRJ_1013_CLASSES: readonly string[] = [
+  AD_BELOW_PHASE1_FLOOR,
+  PERSONA_KILL_FAILED_LABEL,
+  PERSONA_KILL_SURVIVOR_LABEL,
+  PERSONA_TEARDOWN_NOTICE_LABEL,
+  PERSONA_UNCLASSIFIED_ERROR_LABEL,
+  CLI_TEARDOWN_FAILED_LABEL,
+  CLEAN_RESTART_NOT_RESTARTED_LABEL,
+  RETIRED_KEYS_UNREADABLE_LABEL,
+]
+
+/** Whether README "Startup errors" has a list item opening with `label` as a code span, alone or among other labels (`- \`a\` and \`b\` — …`). */
+function readmeListsClass(readme: string, label: string): boolean {
+  const section = requiredSection(readme, STARTUP_ERRORS_HEADING, 'README.md')
+  return new RegExp(`^\\s*- (?:\`[^\`]+\`(?:,| and| or)\\s+)*\`${escapeRegExp(label)}\``, 'm').test(section)
+}
+
+/** The debugging skill's section describing each SRJ-1013 class (file-local; SRJ-1104: an entry per class with its cause and fix). */
+const DEBUG_SKILL_CLASS_SECTIONS: Readonly<Record<string, HeadingMatch>> = {
+  [AD_BELOW_PHASE1_FLOOR]: classHeading(AD_BELOW_PHASE1_FLOOR),
+  [PERSONA_KILL_FAILED_LABEL]: '## A persona posts a Kill failed or Process outlived kill notice',
+  [PERSONA_KILL_SURVIVOR_LABEL]: '## A persona posts a Kill failed or Process outlived kill notice',
+  [PERSONA_TEARDOWN_NOTICE_LABEL]: '## A persona was added or removed by a confirmed change',
+  [PERSONA_UNCLASSIFIED_ERROR_LABEL]: '## agent-director refuses a persona: it is retried on its own',
+  [CLI_TEARDOWN_FAILED_LABEL]: '## `stop --stop-bots` or `clean_restart` could not stop a persona',
+  [CLEAN_RESTART_NOT_RESTARTED_LABEL]: '## `stop --stop-bots` or `clean_restart` could not stop a persona',
+  [RETIRED_KEYS_UNREADABLE_LABEL]: "### The retired-key record can't be read or is invalid",
+}
+
+/**
+ * Whether the debugging skill's section for `label` (`DEBUG_SKILL_CLASS_SECTIONS`),
+ * its heading included, names the class: as a code span, or as a
+ * `startup-errors.log` entry's `[label]`. False when the section is missing.
+ */
+function debugClassSectionNames(skill: string, label: string): boolean {
+  const heading = DEBUG_SKILL_CLASS_SECTIONS[label]
+  const range = heading === undefined ? undefined : sectionRange(skill, heading)
+  if (range === undefined) return false
+  const text = flat(skill.split('\n').slice(range.start, range.end).join('\n'))
+  return text.includes(code(label)) || text.includes(`[${label}]`)
+}
+
+/** The refusal entries' old ending, which the "Arrived here from a startup refusal?" block replaced (E2-gate note; SRJ-1108). */
+const START_AGAIN = ci('start the server again')
+
+/** A README refusal item's problems: it names the refusal block by a link that resolves and step 10 by its link, and says no "start the server again". */
+function readmeRefusalItemProblems(label: string, readme: string): string[] {
+  const item = readmeLabelItem(STARTUP_ERRORS_HEADING, label, readme)
+  const carrier = readRunbookCarrier('README.md', readme, SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT)
+  return [
+    ...lacking(item, [`["${REFUSAL_BLOCK_HEADING}"](#${headingSlug(REFUSAL_BLOCK_HEADING)})`, stepLink(10)(carrier)]),
+    ...(START_AGAIN.test(item) ? [`says "start the server again": ${item}`] : []),
+    ...(headingAt(readme, headingSlug(REFUSAL_BLOCK_HEADING))?.title === REFUSAL_BLOCK_HEADING ? [] : [`no heading "${REFUSAL_BLOCK_HEADING}" for the link`]),
+  ]
+}
+
+/** README "Startup errors"' paragraph on a stop by the runtime re-check (SRJ-205): its one unit opening "**Found while the server was running.**". */
+function readmeRuntimeParagraph(readme: string): string {
+  const units = textUnits(requiredSection(readme, STARTUP_ERRORS_HEADING, 'README.md')).filter((unit) => unit.startsWith(`**${RUNTIME_STOP_HEADING.slice('### '.length)}.**`))
+  if (units.length !== 1) throw new Error(`README.md "${STARTUP_ERRORS_HEADING}": ${units.length} units open with the runtime-stop lead, expected 1`)
+  return units[0]
+}
+
+/** The README runtime paragraph's problems: it links the debugging skill's runtime-stop section, which resolves inside the refusal section, says it is not a switch-over case, and no "start the server again". */
+function readmeRuntimeParagraphProblems(readme: string, skill: string = operatorText(DEBUG_SKILL_FILE)): string[] {
+  const paragraph = readmeRuntimeParagraph(readme)
+  const anchor = headingSlug(RUNTIME_STOP_HEADING.slice('### '.length))
+  const linked = markdownLinks(paragraph).filter((link) => link.path === DEBUG_SKILL_FILE && link.anchor === anchor)
+  const index = headingAnchors(skill).indexOf(anchor)
+  const parent = sectionRange(skill, `## ${REFUSAL_SECTION_TITLE}`)
+  const line = index < 0 ? -1 : headings(skill)[index].line
+  return [
+    ...(linked.length === 1 ? [] : [`${linked.length} links to ${DEBUG_SKILL_FILE}#${anchor}, expected 1`]),
+    ...(parent !== undefined && line > parent.start && line < parent.end ? [] : [`${DEBUG_SKILL_FILE}#${anchor} resolves to no heading inside "## ${REFUSAL_SECTION_TITLE}"`]),
+    ...lacking(paragraph, [ci('not a switch-over case')]),
+    ...(START_AGAIN.test(paragraph) ? ['says "start the server again"'] : []),
+  ]
+}
+
+/** The debugging skill's runtime-stop section, flattened (`RUNTIME_STOP_HEADING`, under the refusal section). */
+function runtimeStopSection(skill: string): string {
+  return flat(requiredSection(requiredSection(skill, `## ${REFUSAL_SECTION_TITLE}`, DEBUG_SKILL_FILE), RUNTIME_STOP_HEADING, `${DEBUG_SKILL_FILE}, under "## ${REFUSAL_SECTION_TITLE}",`))
+}
+
+/**
+ * SRJ-1104's runtime-stop remedy (its Test line; hatch A3), one row per
+ * element, each found in the debugging skill's `RUNTIME_STOP_HEADING` section.
+ */
+const RUNTIME_STOP_REMEDY_ROWS: readonly [element: string, required: readonly (string | RegExp)[]][] = [
+  ['the binary the server finds is not the one the running server started with', [ci('the agent-director binary the server finds is not the one the running server started with')]],
+  ['the lookup order: the home binary first, then the first agent-director on PATH (SRJ-1301)', [`${code(vocab('homeBinary'))} first, then the first ${code('agent-director')} on ${code('PATH')}`]],
+  ["`<path> version` on the binary path the startup-errors entry names, as the workers' user in the bot server's launcher environment", [
+    ci('take the binary path the startup-errors entry names'),
+    code('<path> version'),
+    ci("as the workers' user in the bot server's launcher environment"),
+  ]],
+  ['Phase 1 put back as the binary the server finds, with every agent and every long-running agent-director process stopped before and started after (HO C15; ADA question 9)', [
+    ci('put agent-director Phase 1 back as the binary the server finds'),
+    ci(`every agent on the host and every long-running agent-director process (${code('agent-director serve')} included) is stopped before that binary change and started again after it`),
+  ]],
+  [`CSCB's own bots stopped by a human through "Operator actions" item ${vocab('stoppingSetItem')}, no command named (HO rev 27; hatch A3)`, [
+    ci("CSCB's own bots, which the stop left running, are stopped by a human"),
+    vocab('stoppingSetItem'),
+    `${vocab('operatorActions')} section of agent-director's README`,
+    ci('names no command for it'),
+  ]],
+  ['once the server finds Phase 1, CSCB is started', [ci('once the server finds Phase 1, start CSCB')]],
+  [`or the rollback runbook, "${ROLLBACK_RUNBOOK_SECTION_TITLE}", which starts the previous CSCB`, [
+    `["${ROLLBACK_RUNBOOK_SECTION_TITLE}"](../../README.md#${headingSlug(ROLLBACK_RUNBOOK_SECTION_TITLE)})`,
+    ci('which starts the previous CSCB'),
+  ]],
+  ['the old CSCB is never reinstalled onto the migrated store', [ci("installing agent-director Phase 1 migrated agent-director's store, so never reinstall the old CSCB onto it")]],
+  ["at rollback step 4's restart, an agent that could not be stopped still runs: nothing put back, no rollback rerun, the new CSCB stopped until agent-director has dealt with it, then this remedy", [
+    ci(`the restart in step 4 of "${ROLLBACK_RUNBOOK_SECTION_TITLE}"`),
+    ci('an agent that could not be stopped still runs, so put nothing back'),
+    ci("don't follow the rollback runbook again"),
+    ci('the new CSCB stays stopped until agent-director has dealt with that agent'),
+    ci('then this remedy applies'),
+  ]],
+  ['a bot or this skill never changes the agent-director install, and never starts the server without the operator\'s say-so', [
+    ci('a bot or this skill never changes the agent-director install itself'),
+  ]],
+]
+
+/** The forms the runtime-stop remedy must not carry (SRJ-1104; hatch A3): a `command -v agent-director`; `UPGRADE_FORMS` apply through ruling C-1's span list. */
+const COMMAND_V = /\bcommand -v agent-director\b/
+
+/** The runtime-stop remedy's problems: its rows' missing items, a `command -v agent-director`, and the upgrade forms once ruling C-1's span is removed. */
+function runtimeStopProblems(skill: string): string[] {
+  const text = runtimeStopSection(skill)
+  return [
+    ...RUNTIME_STOP_REMEDY_ROWS.flatMap(([element, required]) => lacking(text, required).map((item) => `${element}: ${item}`)),
+    ...(COMMAND_V.test(text) ? ['names `command -v agent-director`'] : []),
+    ...upgradeFormsIn(withoutAllowedSpan(text, RUNTIME_STOP_REMEDY)),
+  ]
+}
+
+/** The debugging skill's refusal entries' Fix lines (SRJ-1104, SRJ-1108; the E2-gate note): the refusal block by title, step 10, no "start the server again". */
+function debugRefusalEntryProblems(label: string, skill: string): string[] {
+  const entry = flat(requiredSection(skill, classHeading(label), DEBUG_SKILL_FILE))
+  return [
+    ...lacking(entry, [`the block "${flat(REFUSAL_BLOCK_HEADING)}" of the README section "${PHASE1_RUNBOOK_SECTION_TITLE}"`, ci("the runbook's step 10 starts the new server")]),
+    ...(START_AGAIN.test(entry) ? [`says "start the server again": ${entry}`] : []),
+  ]
+}
+
+/** The one-line `read-pane` check SRJ-1101 gives the debugging skill, as its fenced block holds it. */
+const READ_PANE_CHECK = `agent-director read-pane --claude-instance-id ${PERSONA_INSTANCE_ID_PREFIX}<key> --n-lines 1`
+
+/**
+ * SRJ-1104's debugging-skill rows, one per section it names (AC 78): each
+ * passage and its items; titles rendered from `src/`, labels imported.
+ */
+const DEBUG_SKILL_SRJ_1104_ROWS: readonly DocRow[] = [
+  ['retired persona: a removed persona\'s row is kept until expire and never resumed', sectionOf(DEBUG_SKILL_FILE, '## A persona was added or removed by a confirmed change'), [
+    ci("its agent-director row is kept until agent-director's `expire` removes it"),
+    ci('which is never resumed'),
+  ]],
+  ['retired persona: a key added again or renamed back starts a new conversation, the old one never resumed', sectionOf(DEBUG_SKILL_FILE, '### Added again or renamed back'), [
+    code(RETIRED_KEYS_FILE_NAME),
+    ci('starts a new conversation on the same instance'),
+    ci('the old conversation is never resumed'),
+  ]],
+  ["no delete: a server start's clean-up never deletes a row; the teardown table keeps the row", sectionOf(DEBUG_SKILL_FILE, '## Listing instances'), [
+    ci("a server start's clean-up never deletes it"),
+    ci('the row is kept'),
+  ]],
+  [`latch: the hold's cases (case=…), the conflicting-labels note (${LATCHING_LIVENESS_NOTE}), the re-check ${LATCH_RECHECK_WORDS}, and "Operator actions" for a human only`, sectionOf(DEBUG_SKILL_FILE, '## A persona posts a Held: tmux session conflict notice'), [
+    code(LATCHING_LIVENESS_NOTE),
+    ci(LATCH_RECHECK_WORDS),
+    vocab('operatorActions'),
+    ci('for a human only'),
+  ]],
+  [`clear-latch: it reaches the server at ${CLEAR_LATCH_DIAL_HOST}, so bind is ${CLEAR_LATCH_DIAL_HOST} or ${ALL_INTERFACES_BIND}; otherwise the re-check, the teardown or a restart`, sectionOf(DEBUG_SKILL_FILE, '## Clearing a hold by hand: `clear-latch`'), [
+    `${code(CLEAR_LATCH_DIAL_HOST)} (the default) or ${code(ALL_INTERFACES_BIND)}`,
+    ci("a hold ends only by the server's own check"),
+    ci("by the persona's teardown"),
+    ci('or by a server restart, which drops every hold'),
+  ]],
+  ['Constraints: clear-latch runs only on the operator\'s say-so, never by a bot', sectionOf(DEBUG_SKILL_FILE, '## Constraints'), [
+    ci(`NEVER run ${code(CLEAR_LATCH_COMMAND)} without the operator's explicit say-so`),
+    ci('never tell a persona, or any bot, to run it'),
+  ]],
+  [`stuck launch: the *${troubleshootingNoticeTitle('STUCK_LAUNCH_RELAUNCHING_HEAD')()}* and *${troubleshootingNoticeTitle('STUCK_LAUNCH_HELD_HEAD')()}* post`, (skill) => {
+    const title = `## A persona posts a ${troubleshootingNoticeTitle('STUCK_LAUNCH_RELAUNCHING_HEAD')()} or ${troubleshootingNoticeTitle('STUCK_LAUNCH_HELD_HEAD')()} notice`
+    return `${title} ${sectionOf(DEBUG_SKILL_FILE, title)(skill)}`
+  }, [code('pending'), ci('launch')]],
+  [`timing settings: the [${AD_TMUX_TABLE}] table of ~/${AD_SETTINGS_RELATIVE_PATH}, read at start and every ${AD_VERSION_RECHECK_INTERVAL_MS / 1000} s`, sectionOf(DEBUG_SKILL_FILE, "## agent-director's timing settings"), [
+    code(`[${AD_TMUX_TABLE}]`),
+    code(`~/${AD_SETTINGS_RELATIVE_PATH}`),
+    ci(`every ${AD_VERSION_RECHECK_INTERVAL_MS / 1000} s`),
+  ]],
+  [`the ${PERSONA_EPISODE_KIND_AD_CONFIG_MALFORMED} outage: *${troubleshootingNoticeTitle("ONSET_TEMPLATES['ad-config-malformed']")()}*`, sectionOf(DEBUG_SKILL_FILE, '## agent-director refuses a persona: it is retried on its own'), [
+    `**${troubleshootingNoticeTitle("ONSET_TEMPLATES['ad-config-malformed']")()}**`,
+    code(PERSONA_EPISODE_KIND_AD_CONFIG_MALFORMED),
+  ]],
+  ['precheck: stop --stop-bots and clean_restart check agent-director first; a failed check stops nothing and exits 1', sectionOf(DEBUG_SKILL_FILE, '## A precheck failed: nothing was stopped'), [
+    ci('check agent-director before they stop anything'),
+    ci('when the check fails, the command stops nothing and exits 1'),
+    `<command>: precheck failed for persona "<name>" (key=<key>), session "${PERSONA_TMUX_SESSION_PREFIX}<key>": <CLASS>: <description>`,
+  ]],
+  ['old binary: the two CLI commands on a binary below the floor or the client\'s minimum', sectionOf(DEBUG_SKILL_FILE, '### The two CLI commands on an old binary'), [
+    code(AD_BELOW_PHASE1_FLOOR),
+    code(AD_SYSTEM_INSTALL_TOO_OLD),
+    PHASE1_RUNBOOK_SECTION_TITLE,
+  ]],
+  [`CLI teardown: ${CLI_TEARDOWN_FAILED_LABEL} and ${CLEAN_RESTART_NOT_RESTARTED_LABEL}`, sectionOf(DEBUG_SKILL_FILE, '## `stop --stop-bots` or `clean_restart` could not stop a persona'), [
+    code(CLI_TEARDOWN_FAILED_LABEL),
+    code(CLEAN_RESTART_NOT_RESTARTED_LABEL),
+  ]],
+  [`the refusal section points to the runbook's "${REFUSAL_BLOCK_HEADING}" block by a link`, sectionOf(DEBUG_SKILL_FILE, `## ${REFUSAL_SECTION_TITLE}`), [
+    `["${REFUSAL_BLOCK_HEADING}"](../../README.md#${headingSlug(REFUSAL_BLOCK_HEADING)})`,
+    ci('never starts the server on its own after a refusal'),
+  ]],
+  [`the install check's below-floor note points to the switch-over runbook (SRJ-1104, SRJ-1108; hatch A3)`, (skill) =>
+    textUnits(skill).filter((unit) => /\binstall[- ]check\b/i.test(unit) && /\bnote\b/i.test(unit)).join(' '), [
+    /\binstall[- ]check\b/i,
+    /\bnote\b/i,
+    PHASE1_RUNBOOK_SECTION_TITLE,
+  ]],
+  [`the ${troubleshootingNoticeTitle('tmuxUnresponsiveOnsetText')()} check: the one-line read-pane, with its caveats under "Listing instances"`, sectionOf(DEBUG_SKILL_FILE, '## A persona posts a Not answering notice'), [
+    READ_PANE_CHECK,
+    `(#${headingSlug('Listing instances')})`,
+  ]],
+]
+
+/** The debugging skill's "Listing instances" read-pane check's problems (SRJ-1101, SRJ-613; the E19 note): the fenced command, both caveats and the pointer. */
+function readPaneCheckProblems(skill: string): string[] {
+  const raw = requiredSection(skill, '## Listing instances', DEBUG_SKILL_FILE)
+  const text = flat(raw)
+  return [
+    ...(splitFences(raw).blocks.some((block) => block.body.trim() === READ_PANE_CHECK) ? [] : [`no fenced block holding only \`${READ_PANE_CHECK}\``]),
+    ...lacking(text, [
+      ci('**A pane:** a session of the persona is there'),
+      ci('it can be a single leftover of an earlier launch'),
+      `answers ${AD_ERROR_CLASS_CONFLICT}, "${vocab('notThisLaunch')}"`,
+      `**${code('ErrTmuxCaptureFailed')}:** no session of the row's current launch is there`,
+      ci('that does not prove the worker gone after a kill failure whose description says no session or pane of this launch was found'),
+      `the ${vocab('operatorActions')} section of agent-director's README`,
+    ]),
+  ]
+}
+
+describe('E36 T4: SRJ-1101 over every operator text (b.jg5 SRJ-1101; SRJ-1105, SRJ-1106 through it; AC 78)', () => {
+  test.each(OPERATOR_TEXTS.flatMap(([name, read]) => SRJ_1101_TERMS.map(([label, pattern]) => [name, label, pattern, read] as const)))(
+    '%s: no %s',
+    (name, label, pattern, read) => {
+      expect(findTerms(name, read(), [[label, pattern]]).map(formatHit)).toEqual([])
+    },
+  )
+
+  test.each(OPERATOR_TEXTS)('%s: `tmux kill-session` stands only in switch-over steps 5 and 6', (name, read) => {
+    expect(killSessionsOutsideSteps(name, read()).map(formatHit)).toEqual([])
+  })
+
+  test.each(SWITCH_OVER_CARRIERS)(`%s: every \`tmux kill-session\` in the file is one the step reader reads in steps 5 and 6`, (name, read) => {
+    const text = operatorText(name)
+    const inSteps = KILL_SESSION_STEPS.map((n) => [...read().steps[n - 1].matchAll(/tmux kill-session/g)].length).reduce((a, b) => a + b, 0)
+    expect(inSteps).toBeGreaterThan(0)
+    expect(findTerms(name, text, [KILL_SESSION])).toHaveLength(inSteps)
+  })
+
+  test.each(OPERATOR_TEXTS)('%s: every `tmux attach -t` is written with `=`, apart from the prefix-key reason sentence (SRJ-1102)', (name, read) => {
+    expect(unexactAttaches(name, read())).toEqual([])
+  })
+
+  test.each(OPERATOR_TEXTS)("%s: every tmux command it names is on the layering rule's allow-list", (name, read) => {
+    expect(offListTmuxCommands(name, read())).toEqual([])
+  })
+
+  test.each(OPERATOR_TEXTS)('%s: no pane, read-pane answer or GONE is taken as proof a worker is gone (SRJ-613)', (_name, read) => {
+    expect(goneAsProofClaims(read())).toEqual([])
+  })
+
+  test.each(OPERATOR_TEXTS)('%s: every `agent-director kill --claude-instance-id` it names is followed by checking its result', (_name, read) => {
+    expect(killAdviceProblems(read(), CHECKS_THE_RESULT)).toEqual([])
+  })
+
+  test.each(['README.md', CHANGELOG_FILE])("%s: every kill advice adds \"check the result; on an error, don't delete or respawn\"", (name) => {
+    const text = operatorText(name)
+    expect([...flat(text).matchAll(KILL_INSTRUCTION)].length).toBeGreaterThan(0)
+    expect(killAdviceProblems(text, CHECKS_AND_DOES_NOT_DELETE)).toEqual([])
+  })
+
+  test(`${DEBUG_SKILL_FILE}: "Listing instances" carries the one-line read-pane check, both caveats and the "Operator actions" pointer (SRJ-1101, SRJ-613)`, () => {
+    expect(readPaneCheckProblems(operatorText(DEBUG_SKILL_FILE))).toEqual([])
+  })
+
+  describe('self-checks (synthetic texts, or an operator text with the old wording put back)', () => {
+    test.each(SRJ_1101_TERMS.map(([label]) => [label] as const))('%s, wrapped and in other letter case, is reported with file and line', (label) => {
+      const sample = `Line one.\nThen ${label.toUpperCase().replace(' ', '\n  ')} here.`
+      expect(findTerms('sample.md', sample, SRJ_1101_TERMS).map((hit) => `${hit.file}:${hit.line}: ${hit.term}`)).toEqual([`sample.md:2: ${label}`])
+    })
+
+    test('each SRJ-1101 term of the old wording is reported: the has-session check, the cron flag, the finished-row option, a row delete', () => {
+      const old = [
+        'timeout 10 tmux has-session -t =slack_bot_<key>',
+        '* * * * * /usr/local/bin/agent-director find-missing --timeout 30s',
+        'Run `agent-director kill --include-finished` for a finished row.',
+        'Every kill passes `include_finished: true`.',
+        'then `agent-director delete --claude-instance-id <id>`',
+        'end it with tmux-kill and respawn it',
+      ].join('\n')
+      expect(findTerms('old.md', old, SRJ_1101_TERMS).map((hit) => `${hit.line}: ${hit.term}`).sort()).toEqual(
+        ['1: has-session', '2: find-missing --timeout', '3: include-finished', '4: include_finished', '5: agent-director delete', '6: tmux-kill'].sort(),
+      )
+    })
+
+    /** A synthetic runbook carrier: the switch-over section with steps 4 to 6 (the reader's other steps are not read here), then another section. */
+    const carrierText = (step4: string, step5: string, step6: string, after: string) =>
+      [
+        '# Doc', //                                            l.1
+        SWITCH_OVER_HEADING, //                                l.2
+        `#### ${stepHeadingPrefix(4)}Wait`, //                 l.3
+        step4, //                                              l.4
+        `#### ${stepHeadingPrefix(5)}Check`, //                l.5
+        step5, //                                              l.6
+        `#### ${stepHeadingPrefix(6)}End`, //                  l.7
+        step6, //                                              l.8
+        '## Troubleshooting', //                               l.9
+        after, //                                              l.10
+      ].join('\n')
+    const KILL = 'end it with `tmux kill-session -t =<name>`'
+
+    test.each([
+      ['in steps 5 and 6 of a carrier', 'README.md', carrierText('-', KILL, KILL, '-'), []],
+      ['in step 4 of a carrier', 'README.md', carrierText(KILL, KILL, '-', '-'), ['README.md:4: tmux kill-session']],
+      ['after the runbook in a carrier', CHANGELOG_FILE, carrierText('-', KILL, '-', `Or ${KILL.replace(' kill', '\nkill')}.`), [`${CHANGELOG_FILE}:10: tmux kill-session`]],
+      ['in a text that is no carrier, steps 5 and 6 included', DEBUG_SKILL_FILE, carrierText('-', KILL, KILL, '-'), [`${DEBUG_SKILL_FILE}:6: tmux kill-session`, `${DEBUG_SKILL_FILE}:8: tmux kill-session`]],
+    ] as const)('`tmux kill-session` %s', (_where, file, text, expected) => {
+      expect(killSessionsOutsideSteps(file, text).map((hit) => `${hit.file}:${hit.line}: ${hit.term}`)).toEqual([...expected])
+    })
+
+    test('a carrier with no switch-over section, or no step 6, throws naming the file', () => {
+      expect(() => killSessionsOutsideSteps('README.md', '# Doc\nNo runbook.')).toThrow(`README.md has no heading "${SWITCH_OVER_HEADING}"`)
+      expect(() => killSessionsOutsideSteps('README.md', carrierText('-', '-', '-', '-').replace(`${stepHeadingPrefix(6)}`, 'Then: '))).toThrow('README.md: switch-over step 6 is missing')
+    })
+
+    test('an attach without `=` is reported with file and line, wrapped or not; the exact target and the reason sentence are not', () => {
+      const session = personaTmuxSessionName(ALERT_KEY)
+      const text = [
+        `Attach with \`tmux attach -t =${session}\`.`, //            l.1
+        `Or with \`tmux attach -t ${session}\`.`, //                  l.2
+        `Or with \`tmux\nattach-session -t ${session}\`.`, //         l.3-4
+        DOCS_PREFIX_KEY_REASON, //                                   l.5
+      ].join('\n')
+      expect(unexactAttaches('sample.md', text).map((hit) => hit.split(' (')[0])).toEqual(['sample.md:2: a tmux attach target without =', 'sample.md:3: a tmux attach target without ='])
+      expect(unexactAttaches('sample.md', DOCS_PREFIX_KEY_REASON, [])).toHaveLength(1)
+    })
+
+    test.each([
+      ['the exact-target attach', `\`tmux attach -t =${personaTmuxSessionName(ALERT_KEY)}\``],
+      ['a read-only tmux ls', 'run a read-only `tmux ls`'],
+      ['the window list, all sessions', '`tmux list-windows -a`'],
+      ['the window list, one exact target', '`tmux list-windows -t =<name>`'],
+      ['the socket check', "`tmux display-message -p '#{socket_path}'`"],
+      ['the exact-name kill (placed by its own case)', '`tmux kill-session -t =<name>`'],
+      ['prose naming tmux', 'the tmux session conflict; a tmux server changed notice; tmux is not available; the tmux socket'],
+      ['flags and labels with tmux in them', '`--tmux-session-name <name>`, `tmux-unresponsive`, `TMUX_TMPDIR`'],
+    ])("the allow-list passes %s", (_label, text) => {
+      expect(offListTmuxCommands('sample.md', text, [])).toEqual([])
+    })
+
+    test.each([
+      ['the debugging skill\'s old liveness check', 'timeout 10 tmux list-sessions'],
+      ['a session probe', '`tmux has-session -t =slack_bot_alpha`'],
+      ['a server kill', 'run `tmux kill-server`'],
+      ['a kill behind a global flag', '`tmux -L other kill-session -t =slack_bot_alpha`'],
+      ['a session kill without =', '`tmux kill-session -t slack_bot_alpha`'],
+      ['a window list without =', '`tmux list-windows -t slack_bot_alpha`'],
+      ['a pane read', '`tmux capture-pane -p -t =slack_bot_alpha:`'],
+      ['typing into a session, wrapped', 'press Enter with `tmux\nsend-keys -t =slack_bot_alpha: Enter`'],
+      ['an attach without =', '`tmux attach -t slack_bot_alpha`'],
+      ['a new session', '`tmux new -s slack_bot_alpha`'],
+    ])('the allow-list reports %s', (_label, text) => {
+      expect(offListTmuxCommands('sample.md', text, [])).toHaveLength(1)
+    })
+
+    test('the finder reads every allowed form in the README, so the allow-list case is not vacuous', () => {
+      const readme = operatorText('README.md')
+      const commands = findTermsAt('README.md', readme, [['a tmux command', TMUX_COMMAND]]).map(({ index }) => flat(readme.slice(index, index + 200)))
+      expect(TMUX_ALLOWED_FORMS.filter(([, form]) => !commands.some((command) => form.test(command))).map(([label]) => label)).toEqual([])
+    })
+
+    test("the debugging skill fails the allow-list with its old liveness check put back", () => {
+      const skill = operatorText(DEBUG_SKILL_FILE)
+      const edited = skill.replace(READ_PANE_CHECK, 'timeout 10 tmux list-sessions')
+      expect(edited).not.toBe(skill)
+      expect(offListTmuxCommands(DEBUG_SKILL_FILE, edited).map((hit) => hit.split(': ')[1])).toEqual(['a tmux command off the allow-list ("tmux list-sessions") in'])
+    })
+
+    test.each([
+      'A GONE from `read-pane` proves the worker is gone.',
+      '`ErrTmuxCaptureFailed` means the worker is dead.',
+      'If the pane is missing, that shows the worker has gone: a read-pane answer of ErrTmuxCaptureFailed confirms it is gone.',
+    ])('SRJ-613: the claim %p is reported', (text) => {
+      expect(goneAsProofClaims(text)).not.toEqual([])
+    })
+
+    test("SRJ-613: the debugging skill's caveats and the alert's wording are not reported", () => {
+      const fine = [
+        '`ErrTmuxCaptureFailed`: no session of the row\'s current launch is there. That does not prove the worker gone after a kill failure whose description says no session or pane of this launch was found.',
+        'A pane read can show a leftover\'s pane, and a failed read does not prove the worker gone.',
+        'A GONE says that agent-director found no session or pane of the row\'s launch; it does not prove the worker\'s process gone.',
+        'A pane proves nothing.',
+      ].join('\n\n')
+      expect(goneAsProofClaims(fine)).toEqual([])
+    })
+
+    test.each([
+      ['an unchecked kill', 'Then run `agent-director kill --claude-instance-id <id>`. Respawn it after.', CHECKS_THE_RESULT],
+      ['a checked kill without the delete-or-respawn caveat', 'Run `agent-director kill --claude-instance-id <id>` and check the result.', CHECKS_AND_DOES_NOT_DELETE],
+    ] as const)('kill advice: %s is reported', (_label, text, rule) => {
+      expect(killAdviceProblems(text, rule)).toHaveLength(1)
+    })
+
+    test('kill advice: a log line naming a kill is no instruction', () => {
+      expect(killAdviceProblems('`agent-director kill of cscb_alpha refused at a try: outcome=not-killed class=CONFLICT …`', CHECKS_THE_RESULT)).toEqual([])
+    })
+
+    test("the README's runbook kills fail their rows with the delete-or-respawn caveat dropped, in each step (SRJ-1101)", () => {
+      const readme = operatorText('README.md')
+      const edited = readme.replaceAll(`; on an error, don't delete or respawn`, '')
+      expect(edited).not.toBe(readme)
+      const switchOver = readRunbookCarrier('README.md', edited, SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT)
+      const rollback = readRunbookCarrier('README.md', edited, ROLLBACK_HEADING, ROLLBACK_STEP_COUNT)
+      const caveatRows = <T extends readonly [string, string, readonly Item[]]>(rows: readonly T[]) => rows.filter(([, element]) => element.includes('deleted or respawned (SRJ-1101)'))
+      const failing = [
+        ...caveatRows(SWITCH_OVER_ELEMENTS).filter(([where, , required]) => missingItems(switchOver, textAt(switchOver, where), required).length > 0).map(([where]) => `switch-over ${where}`),
+        ...caveatRows(ROLLBACK_ELEMENTS).filter(([where, , required]) => missingItems(rollback, textAt(rollback, where), required).length > 0).map(([where]) => `rollback ${where}`),
+      ]
+      expect(failing).toEqual(['switch-over step 6', 'rollback step 4', 'rollback step 5'])
+      expect(killAdviceProblems(edited, CHECKS_AND_DOES_NOT_DELETE).length).toBeGreaterThanOrEqual(3)
+    })
+
+    test.each([1, 7])(`the README's switch-over step %d fails its "${UPGRADING_TITLE}" row with the link dropped`, (n) => {
+      const readme = operatorText('README.md')
+      const anchor = `#${headingSlug(UPGRADING_TITLE)}`
+      const step = sectionRange(readme, new RegExp(`^#### ${escapeRegExp(stepHeadingPrefix(n))}`))!
+      const lines = readme.split('\n')
+      const edited = [...lines.slice(0, step.start), ...lines.slice(step.start, step.end).map((line) => line.replaceAll(`](${anchor})`, '](#no-such-heading)')), ...lines.slice(step.end)].join('\n')
+      expect(edited).not.toBe(readme)
+      const carrier = readRunbookCarrier('README.md', edited, SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT)
+      expect(missingItems(carrier, carrier.steps[n - 1], [upgradingLink])).toEqual([`(${anchor})`])
+    })
+
+    test(`the "Listing instances" read-pane check fails without its fenced command, either caveat or the pointer`, () => {
+      const skill = operatorText(DEBUG_SKILL_FILE)
+      const edits: [string, string][] = [
+        [`\`\`\`sh\n${READ_PANE_CHECK}\n\`\`\``, `\`\`\`sh\nagent-director read-pane --claude-instance-id ${PERSONA_INSTANCE_ID_PREFIX}<key>\n\`\`\``],
+        ['- **A pane:** a session of the persona is there.', '- **A pane:** the worker runs.'],
+        ['description says no session or pane of this launch was found.', 'description says so.'],
+      ]
+      for (const [from, to] of edits) {
+        const edited = skill.replace(from, to)
+        expect({ from, changed: edited !== skill }).toEqual({ from, changed: true })
+        expect({ from, problems: readPaneCheckProblems(edited).length > 0 }).toEqual({ from, problems: true })
+      }
+    })
+  })
+})
+
+describe('E36 T4: the README describes the build (b.jg5 SRJ-1103; AC 78, AC 79)', () => {
+  const readme = () => operatorText('README.md')
+
+  test.each(README_SRJ_1103_ROWS)('%s', (element, passage, required) => {
+    expect({ element, problems: docRowProblems(passage, required, readme()) }).toEqual({ element, problems: [] })
+  })
+
+  test.each(TROUBLESHOOTING_NOTICES)('"Troubleshooting" has one entry titled by the *%s* notice\'s title, as src/ renders it', (_source, title) => {
+    const entries = troubleshootingEntries(readme()).filter((entry) => entry.title.includes(`*${title()}*`))
+    expect(entries.map((entry) => entry.title)).toHaveLength(1)
+  })
+
+  test.each(SRJ_1013_CLASSES.map((label) => [label] as const))(`"${STARTUP_ERRORS_HEADING}" lists the SRJ-1013 class %s`, (label) => {
+    expect(readmeListsClass(readme(), label)).toBe(true)
+  })
+
+  test('the prerequisites name base-index and pane-base-index only to say agent-director does not depend on them, and the version note is gone', () => {
+    const sentences = flat(requiredSection(readme(), PREREQUISITES_HEADING, 'README.md'))
+      .split(/(?<=\.)\s+/)
+      .filter((sentence) => sentence.includes(vocab('baseIndex')))
+    expect(sentences.length).toBeGreaterThan(0)
+    expect(sentences.filter((sentence) => !/\bdoes not depend\b/.test(sentence))).toEqual([])
+    expect(readme()).not.toMatch(ci('Note on agent-director versions'))
+  })
+
+  test(`Migration's cron line is SRJ-1101's, "${vocab('findMissingCron')}", and no other agent-director path or flag (C19)`, () => {
+    const migration = requiredSection(readme(), MIGRATION_HEADING, 'README.md')
+    const preamble = migration.split('\n').slice(0, headings(migration)[0]?.line).join('\n')
+    expect(splitFences(preamble).blocks.filter((block) => block.info === 'cron').map((block) => block.body.trim())).toEqual([vocab('findMissingCron')])
+    expect(readme()).not.toContain('/usr/local/bin/agent-director')
+  })
+
+  test.each(REFUSAL_LABELS)(`"${STARTUP_ERRORS_HEADING}": the \`%s\` item points to the "${REFUSAL_BLOCK_HEADING}" block and step 10, never "start the server again" (E2 gate; SRJ-1108)`, (label) => {
+    expect(readmeRefusalItemProblems(label, readme())).toEqual([])
+  })
+
+  test(`"${STARTUP_ERRORS_HEADING}": the runtime-stop paragraph links the debugging skill's "${RUNTIME_STOP_HEADING.slice('### '.length)}" (SRJ-1104; hatch A3)`, () => {
+    expect(readmeRuntimeParagraphProblems(readme())).toEqual([])
+  })
+
+  test(`"${CALL_TIMEOUT_SIZING_HEADING.slice('#### '.length)}" sits under "${CONFIGURATION_HEADING}" (SRJ-1103)`, () => {
+    const configuration = sectionRange(readme(), CONFIGURATION_HEADING)
+    const sizing = sectionRange(readme(), CALL_TIMEOUT_SIZING_HEADING)
+    expect(configuration !== undefined && sizing !== undefined && sizing.start > configuration.start && sizing.end <= configuration.end).toBe(true)
+  })
+
+  test('"Destructive changes" says neither that a teardown deletes a row nor that a bring-up may resume it', () => {
+    const section = requiredSection(readme(), '### Destructive changes', 'README.md')
+    expect(affirmedClaims(section, ROW_DELETE_CLAIMS)).toEqual([])
+    expect(affirmedClaims(section, [['a resume', /\bresum\w*/gi]])).toEqual([])
+  })
+
+  describe('self-checks', () => {
+    test.each(README_SRJ_1103_ROWS)('%s: each of its items, cut from its passage, is reported', (element, passage, required) => {
+      const text = passage(readme())
+      for (const item of required) {
+        const cut = typeof item === 'string' ? text.split(item).join(' ') : text.replace(new RegExp(item.source, `${item.flags.replace('g', '')}g`), ' ')
+        expect({ element, item: String(item), reported: lacking(cut, required).includes(`lacks ${String(item)}`) }).toEqual({ element, item: String(item), reported: true })
+      }
+    })
+
+    test.each(README_REVERTS)('"%s" fails with %s', (row, _how, edit) => {
+      const text = readme()
+      const edited = edit(text)
+      expect(edited).not.toBe(text)
+      const [, passage, required] = README_SRJ_1103_ROWS.find(([element]) => element === row)!
+      expect(docRowProblems(passage, required, edited)).not.toEqual([])
+    })
+
+    test("the version note put back is reported", () => {
+      const edited = readme().replace('### Checking your agent-director install', '> **Note on agent-director versions.** v0.4.1 is a zombie release.\n\n### Checking your agent-director install')
+      expect(edited).toMatch(ci('Note on agent-director versions'))
+    })
+
+    test('a base-index requirement in the prerequisites is reported', () => {
+      const edited = readme().replace(/(^- \[tmux\][^\n]*)$/m, '$1 Set `base-index` to 1.')
+      const sentences = flat(requiredSection(edited, PREREQUISITES_HEADING, 'README.md')).split(/(?<=\.)\s+/).filter((sentence) => sentence.includes(vocab('baseIndex')))
+      expect(sentences.filter((sentence) => !/\bdoes not depend\b/.test(sentence))).toEqual(['Set `base-index` to 1.'])
+    })
+
+    test("Migration's old cron line is reported, by the cron case and by SRJ-1101's term", () => {
+      const edited = readme().replace(vocab('findMissingCron'), '* * * * * /usr/local/bin/agent-director find-missing --timeout 30s')
+      expect(edited).not.toBe(readme())
+      const migration = requiredSection(edited, MIGRATION_HEADING, 'README.md')
+      const preamble = migration.split('\n').slice(0, headings(migration)[0]?.line).join('\n')
+      expect(splitFences(preamble).blocks.filter((block) => block.info === 'cron').map((block) => block.body.trim())).not.toEqual([vocab('findMissingCron')])
+      expect(findTerms('README.md', edited, SRJ_1101_TERMS).map((hit) => hit.term)).toEqual(['find-missing --timeout'])
+    })
+
+    test.each(REFUSAL_LABELS)('the `%s` item fails with "then start the server again" back', (label) => {
+      const text = readme()
+      const edited = text.replace(
+        new RegExp(`(^- \`${escapeRegExp(label)}\`[^\\n]*?)Follow (?:that|the README) section[^\\n]*?starts it\\.`, 'm'),
+        `$1Follow the README section "${PHASE1_RUNBOOK_SECTION_TITLE}", then start the server again.`,
+      )
+      expect(edited).not.toBe(text)
+      expect(readmeRefusalItemProblems(label, edited)).not.toEqual([])
+    })
+
+    test('the runtime-stop paragraph fails with its old ending back', () => {
+      const text = readme()
+      const edited = text.replace(/(\*\*Found while the server was running\.\*\*[^\n]*?)This stop is not a switch-over case:[^\n]*/, `$1Follow the README section "${PHASE1_RUNBOOK_SECTION_TITLE}", then start the server again.`)
+      expect(edited).not.toBe(text)
+      expect(readmeRuntimeParagraphProblems(edited)).toEqual(expect.arrayContaining([`0 links to ${DEBUG_SKILL_FILE}#${headingSlug(RUNTIME_STOP_HEADING.slice('### '.length))}, expected 1`, 'says "start the server again"']))
+    })
+
+    test('the runtime-stop paragraph fails when the debugging skill\'s section is renamed', () => {
+      const skill = operatorText(DEBUG_SKILL_FILE).replace(RUNTIME_STOP_HEADING, '### A stop while running')
+      expect(readmeRuntimeParagraphProblems(readme(), skill).join('\n')).toContain('resolves to no heading')
+    })
+
+    test('a notice title renamed in "Troubleshooting" is no longer found', () => {
+      const [, title] = TROUBLESHOOTING_NOTICES[0]
+      const edited = readme().replace(`**A persona posts a *${title()}*`, '**A persona posts a *Unreachable*')
+      expect(edited).not.toBe(readme())
+      expect(troubleshootingEntries(edited).filter((entry) => entry.title.includes(`*${title()}*`))).toHaveLength(0)
+    })
+
+    test('a resumed or deleted row in "Destructive changes" is reported', () => {
+      expect(affirmedClaims('A bring-up may resume the old conversation.', [['a resume', /\bresum\w*/gi]])).toHaveLength(1)
+      expect(affirmedClaims('The teardown kills the bot and deletes its row.', ROW_DELETE_CLAIMS)).not.toEqual([])
+    })
+  })
+})
+
+describe('E36 T4: the debugging skill describes the build (b.jg5 SRJ-1104; AC 78)', () => {
+  const skill = () => operatorText(DEBUG_SKILL_FILE)
+
+  test.each(DEBUG_SKILL_SRJ_1104_ROWS)('%s', (element, passage, required) => {
+    expect({ element, problems: docRowProblems(passage, required, skill()) }).toEqual({ element, problems: [] })
+  })
+
+  test.each(SRJ_1013_CLASSES.map((label) => [label, String(DEBUG_SKILL_CLASS_SECTIONS[label])] as const))('the SRJ-1013 class %s is described in its section, %s', (label) => {
+    expect(debugClassSectionNames(skill(), label)).toBe(true)
+  })
+
+  test('self-check: a class named nowhere in its section, heading included, is reported', () => {
+    expect(debugClassSectionNames(`### \`${AD_BELOW_PHASE1_FLOOR}\`\nThe binary is below the floor.\n`, AD_BELOW_PHASE1_FLOOR)).toBe(true)
+    const retired = String(DEBUG_SKILL_CLASS_SECTIONS[RETIRED_KEYS_UNREADABLE_LABEL])
+    expect(debugClassSectionNames(`${retired}\nThe record can't be read.\n`, RETIRED_KEYS_UNREADABLE_LABEL)).toBe(false)
+    expect(debugClassSectionNames(`${retired}\n\`[${RETIRED_KEYS_UNREADABLE_LABEL}] …\`\n`, RETIRED_KEYS_UNREADABLE_LABEL)).toBe(true)
+    expect(debugClassSectionNames(`## Other\n\`${RETIRED_KEYS_UNREADABLE_LABEL}\`\n`, RETIRED_KEYS_UNREADABLE_LABEL)).toBe(false)
+  })
+
+  test.each(REFUSAL_LABELS)(`the \`%s\` entry's fix follows the "${REFUSAL_BLOCK_HEADING}" block and the runbook's step 10, never "start the server again" (E2 gate; SRJ-1108)`, (label) => {
+    expect(debugRefusalEntryProblems(label, skill())).toEqual([])
+  })
+
+  test(`the refusal section names no "start the server again"`, () => {
+    expect(flat(requiredSection(skill(), `## ${REFUSAL_SECTION_TITLE}`, DEBUG_SKILL_FILE))).not.toMatch(START_AGAIN)
+  })
+
+  test.each(RUNTIME_STOP_REMEDY_ROWS)(`"${RUNTIME_STOP_HEADING.slice('### '.length)}": %s (SRJ-1104; hatch A3)`, (element, required) => {
+    expect({ element, missing: lacking(runtimeStopSection(skill()), required) }).toEqual({ element, missing: [] })
+  })
+
+  test(`"${RUNTIME_STOP_HEADING.slice('### '.length)}" names no \`command -v agent-director\` and, once ruling C-1's span is removed, no upgrade or install command`, () => {
+    expect(runtimeStopProblems(skill())).toEqual([])
+  })
+
+  test(`the rollback link of "${RUNTIME_STOP_HEADING.slice('### '.length)}" resolves to the README's "${ROLLBACK_HEADING}"`, () => {
+    const links = markdownLinks(runtimeStopSection(skill())).filter((link) => link.path === '../../README.md')
+    expect(links.length).toBeGreaterThan(0)
+    expect(links.map((link) => headingAt(operatorText('README.md'), link.anchor)?.text)).toEqual(links.map(() => ROLLBACK_HEADING))
+  })
+
+  describe('self-checks', () => {
+    test.each(DEBUG_SKILL_SRJ_1104_ROWS)('%s: each of its items, cut from its passage, is reported', (element, passage, required) => {
+      let text: string
+      try {
+        text = passage(skill())
+      } catch {
+        text = ''
+      }
+      for (const item of required) {
+        const cut = typeof item === 'string' ? text.split(item).join(' ') : text.replace(new RegExp(item.source, `${item.flags.replace('g', '')}g`), ' ')
+        expect({ element, item: String(item), reported: lacking(cut, required).includes(`lacks ${String(item)}`) }).toEqual({ element, item: String(item), reported: true })
+      }
+    })
+
+    test.each(RUNTIME_STOP_REMEDY_ROWS.flatMap(([element, required]) => required.map((item) => [element, String(item), item] as const)))(
+      'the remedy without "%s" item %s is reported',
+      (element, _label, item) => {
+        const section = runtimeStopSection(skill())
+        const cut = typeof item === 'string' ? section.split(item).join(' ') : section.replace(new RegExp(item.source, `${item.flags.replace('g', '')}g`), ' ')
+        const fakeSkill = `## ${REFUSAL_SECTION_TITLE}\n\n${RUNTIME_STOP_HEADING}\n\n${cut}\n`
+        expect(runtimeStopProblems(fakeSkill).filter((problem) => problem.startsWith(`${element}: `))).not.toEqual([])
+      },
+    )
+
+    test.each([
+      ['`command -v agent-director`', 'Find it with `command -v agent-director`.', 'names `command -v agent-director`'],
+      ['another backticked agent-director command line', 'Then run `agent-director stop-all`.', 'backticked agent-director command line'],
+      ['an upgrade command', 'Or upgrade it with `install.sh`.', 'upgrade wording'],
+    ])('the remedy with %s added is reported', (_label, sentence, problem) => {
+      const fakeSkill = `## ${REFUSAL_SECTION_TITLE}\n\n${RUNTIME_STOP_HEADING}\n\n${runtimeStopSection(skill())} ${sentence}\n`
+      expect(runtimeStopProblems(fakeSkill)).toContain(problem)
+    })
+
+    test.each(REFUSAL_LABELS)('the `%s` entry fails with its old fix back', (label) => {
+      const text = skill()
+      const entryStart = text.indexOf(`### \`${label}\``)
+      const fix = new RegExp(
+        escapeRegExp(`- **Fix:** the operator follows the block "${REFUSAL_BLOCK_HEADING}" of the README section "${PHASE1_RUNBOOK_SECTION_TITLE}" (above); the runbook's step 10 starts the new server.`).replace(/ /g, '\\s+'),
+      )
+      const rest = text.slice(entryStart).replace(fix, `- **Fix:** the operator follows the README section "${PHASE1_RUNBOOK_SECTION_TITLE}", then starts the server again.`)
+      const edited = text.slice(0, entryStart) + rest
+      expect(edited).not.toBe(text)
+      expect(debugRefusalEntryProblems(label, edited)).not.toEqual([])
     })
   })
 })

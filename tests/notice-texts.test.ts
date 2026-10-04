@@ -119,6 +119,7 @@ import {
   teardownFailureLine,
 } from '../src/cli-teardown.ts'
 import {
+  CONFLICT_NOTICE_LIST_LINE_UNSAFE_NAME,
   conflictNoticeText,
   LATCH_CASE_CONFLICTING_LABELS,
   LATCH_CASE_LEFTOVER,
@@ -269,6 +270,18 @@ function entry(srj: NoticeSrj, builder: string, variant: string, render: () => s
   return Object.freeze({ srj, builder, variant, render })
 }
 
+/**
+ * SRJ-1004's list-line renderings beyond a plain name (the Epic's hatch note
+ * "orchestrator ruling after E13"): a name the line shell-quotes with a `'\''`
+ * in it, and names the line leaves out for the unsafe-name sentence.
+ */
+const CONFLICT_LIST_NAME_VARIANTS: readonly (readonly [variant: string, sessionName: string])[] = [
+  ['list line: a name with a quote and a semicolon, shell-quoted', "it's; rm -rf x"],
+  ['list line left out: a name with a control character', 'bad\u001bname'],
+  ['list line left out: a name with a newline', 'bad\nname'],
+  ['list line left out: a name with a backtick', 'bad`name'],
+]
+
 /** SRJ-1004: the CONFLICT notice. */
 function conflictEntries(): NoticeEntry[] {
   const byRow = CONFLICT_CASE_ROWS.map((row) =>
@@ -294,6 +307,11 @@ function conflictEntries(): NoticeEntry[] {
         latchCase: LATCH_CASE_LEFTOVER as ConflictLatchCase,
         description: withToken(errTmuxSessionConflict('spawn', 'leftover', session).errDescription, 'conflict'),
       }),
+    ),
+    ...CONFLICT_LIST_NAME_VARIANTS.map(([variant, sessionName]) =>
+      entry('SRJ-1004', 'conflictNoticeText', variant, () =>
+        conflictNoticeText({ sessionName, latchCase: LATCH_CASE_LEFTOVER as ConflictLatchCase }),
+      ),
     ),
   ]
 }
@@ -1006,10 +1024,17 @@ describe('the notice catalogue is complete (SRJ-1001 to SRJ-1021, and every name
     expect(entries.filter(([, reason]) => reason.trim() === '').map(([id]) => id)).toEqual([])
   })
 
-  test('the CONFLICT entries cover every row of the conflict-case table, and the unusable-name entries every fault', () => {
+  test('the CONFLICT entries cover every row of the conflict-case table and each list-line rendering, and the unusable-name entries every fault', () => {
     expect(NOTICE_CATALOGUE.filter((e) => e.builder === 'conflictNoticeText').map((e) => e.variant)).toEqual(
-      expect.arrayContaining(CONFLICT_CASE_ROWS.map((row) => row.name)),
+      expect.arrayContaining([...CONFLICT_CASE_ROWS.map((row) => row.name), ...CONFLICT_LIST_NAME_VARIANTS.map(([variant]) => variant)]),
     )
+    // The renderings are what their variants say: the shell-quoted word, or the unsafe-name sentence in place of the list line.
+    const rendered = (variant: string) => NOTICE_CATALOGUE.find((e) => e.variant === variant)!.render()
+    const [[quotedVariant], ...unsafe] = CONFLICT_LIST_NAME_VARIANTS
+    expect(rendered(quotedVariant).includes("--tmux-session-name 'it'\\''s; rm -rf x'`")).toBe(true)
+    for (const [variant] of unsafe) {
+      expect([variant, rendered(variant).includes(CONFLICT_NOTICE_LIST_LINE_UNSAFE_NAME), rendered(variant).includes('--tmux-session-name')]).toEqual([variant, true, false])
+    }
     expect(NOTICE_CATALOGUE.filter((e) => e.builder === 'unusableNameNoticeText').map((e) => e.variant)).toEqual(
       expect.arrayContaining([...UNUSABLE_NAME_FAULTS]),
     )

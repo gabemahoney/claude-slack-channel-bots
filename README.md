@@ -49,8 +49,9 @@ See the sections below for manual configuration details if you prefer not to use
 ## Prerequisites
 
 - [Bun](https://bun.sh) `>= 1.0.21` (agent-director minimum)
-- [Claude Code](https://claude.ai/code) installed and authenticated
-- [`agent-director`](https://github.com/gabemahoney/agent-director) **installed system-wide** as a prerequisite — like `git` or `docker`. CSCB no longer vendors the AD binary. The npm `agent-director` package CSCB depends on is now a thin TypeScript shim that locates the system-installed binary at startup via `resolveSystemBinary()` / `Client.create()` and refuses to start when the binary is missing, too old, or unreachable. This release requires agent-director Phase 1, installed on the host together with it, and the two are rolled back together; CSCB changes no agent-director code (see "Switching over to agent-director Phase 1" under [Migration](#migration)). The startup gate enforces AD's required version (declared by AD in `dist/version-floor.json`), also refuses a binary older than agent-director Phase 1 (see [Startup errors](#startup-errors)), and reports the required version on mismatch. agent-director itself requires [tmux](https://github.com/tmux/tmux) on the operator's PATH; CSCB no longer probes for it directly.
+- [Claude Code](https://claude.ai/code) 2.1.280 or later for the workers, installed and authenticated: the minimum agent-director states for its exec-form hooks, and the version the fleet runs. A Claude Code too old for exec-form hooks (older than 2.1.139) has its hooks ignored, so every launch stays `pending`.
+- [`agent-director`](https://github.com/gabemahoney/agent-director) Phase 1 or later, **installed system-wide** as a prerequisite, like `git` or `docker`. The npm `agent-director` package CSCB depends on is the client only: it finds the system-installed binary at startup and refuses to start when the binary is missing, too old, or unreachable. This release requires agent-director Phase 1, installed on the host together with it, and the two are rolled back together; CSCB changes no agent-director code (see "Switching over to agent-director Phase 1" under [Migration](#migration)). Every agent on the host, with every long-running agent-director process (`agent-director serve` included), is stopped before either binary change (the Phase 1 install, and the rollback's restore of the previous binary) and started again after it. The startup gate refuses a binary below the client's own minimum (`min_binary_version` in the client's `dist/version-floor.json`) or below agent-director Phase 1, and names the required version (see [Startup errors](#startup-errors)).
+- [tmux](https://github.com/tmux/tmux) 3.2 or later, with `remain-on-exit` off. agent-director runs it; CSCB starts no tmux process. agent-director does not depend on tmux's `base-index` or `pane-base-index`, so their values don't matter.
 - Slack workspace admin access (to create and configure one Slack app per persona)
 - **cozempic** (optional) — Python 3.10+ and `pip install cozempic` — used by JSONL path resolution helpers retained for downstream callers.
 
@@ -65,8 +66,6 @@ See the sections below for manual configuration details if you prefer not to use
 | Windows | **Not supported** by agent-director |
 
 If the host is unsupported, the system-installed `agent-director` itself will refuse to install or run; CSCB's startup gate then exits non-zero with one of the `ad-system-install-*` class labels (see [Startup errors](#startup-errors)) and writes the failure to `~/.claude/channels/slack/startup-errors.log` and stderr. Consult [agent-director's documentation](https://github.com/gabemahoney/agent-director) for the canonical platform support list.
-
-> **Note on agent-director versions.** v0.4.1 is a zombie release (the published tarball is missing `dist/` and cannot be imported). v0.4.2 lacks the `MakeTemplateParams.overwrite` field CSCB needs for the boot-time template refresh. v0.5.4 and earlier lack `allow_pending` on `readPane`/`sendKeys`, causing `ErrSpawnNotInteractive` during dev-channels dialog approval on freshly-spawned bots. v0.6.0 shipped a stale TS shim whose `Client` dropped `getPermission`, whose `buildDecide()` dropped `--request-token`, and whose error catalog omitted `ErrInvalidFlags` / `ErrPermissionRequestNotFound` / `ErrAmbiguousRequest` — each silently breaks the disambiguation relay. v0.6.1–0.6.2 still lack the full `permission_requests` plural projection + composite-key disambiguation surface CSCB depends on for concurrent open requests. From v0.7.0 onward, AD ships as a thin npm shim around a system-installed binary, AD's library-side `Client.create()` enforces AD's own minimum from `dist/version-floor.json`, and CSCB also refuses a binary older than agent-director Phase 1 (see [Startup errors](#startup-errors)). CSCB's `package.json` caret-pin on `agent-director` governs npm resolution of AD's TypeScript shim only — not these runtime minimums.
 
 ### Checking your agent-director install
 
@@ -452,7 +451,7 @@ If you change `port` or `bind` in `config.json`, the confirmed change takes effe
 
 agent-director keeps its timing settings in the `[tmux]` table of `~/.agent-director/config.toml`. They are agent-director's settings, not CSCB configuration: CSCB only reads them, from the file under the HOME the server runs in.
 
-The server reads the table when it starts and every 120 s after that, whatever `health_check_interval` is (`0` included), so a change on the host is used within about 120 s (each read follows the binary re-check, which runs 120 s after the previous one ends and can take up to its 30 s time limit). It applies agent-director's own rule: a missing file, a missing key or `0` means agent-director's default.
+The server reads the table when it starts and every 120 s after that, whatever `health_check_interval` is (`0` included), so a change on the host is used within about 120 s (each read follows the binary re-check, which runs 120 s after the previous one ends and can take up to its 30 s time limit). It applies agent-director's own rule: a missing file, a missing key or `0` means agent-director's default. At the first read it accepts, and at each later accepted read that changes any of them, the server writes one line to `server.log` with the nine `[tmux]` values in effect; a read that changes only `[pause] timeout_seconds` (see [Sizing the agent-director call timeout](#sizing-the-agent-director-call-timeout)) writes none.
 
 | Key | Default |
 |---|---|
@@ -1761,7 +1760,7 @@ These notices mean agent-director or tmux is not answering for the persona's ses
 
 From the first refusal until the session answers again, a message sent to the persona is lost. While the server is retrying the persona, its lost-message notice reports `not answering`, with no restart started. At the restart limit it reports `restart limit reached` instead; if the persona's retries have stopped, it reports the next state that applies, which can be `starting now`.
 
-The usual order is *Not answering*, *Still not answering*, *Answering again*; when *Still not answering* comes first (for example with `health_check_interval` `0` and a 3-minute alert threshold), *Not answering* is skipped. Each is posted at most once per episode, from the first refusal until the session answers again; a later refusal starts a new episode. After *Still not answering*, a human should check the host's tmux server and agent-director, with read-only checks only, for example `agent-director version`, `agent-director get --claude-instance-id cscb_<key>` and `timeout 10 tmux list-sessions`. Run `tmux list-sessions` as the user the workers run as, with their tmux socket, since another user or socket asks a different tmux server; it shows only whether tmux answers, never whose a session is, so take ownership from agent-director's row, never from this list. Never run a command that ends a session or deletes an agent-director row to clear it: once agent-director and tmux answer, the next retry recovers the persona and *Answering again* follows. To follow one persona's episode:
+The usual order is *Not answering*, *Still not answering*, *Answering again*; when *Still not answering* comes first (for example with `health_check_interval` `0` and a 3-minute alert threshold), *Not answering* is skipped. Each is posted at most once per episode, from the first refusal until the session answers again; a later refusal starts a new episode. After *Still not answering*, a human should check the host's tmux server and agent-director, with read-only checks only, for example `agent-director version`, `agent-director get --claude-instance-id cscb_<key>` and `agent-director read-pane --claude-instance-id cscb_<key> --n-lines 1`. Run them as the user the workers run as, in the bot server's launcher environment. The `read-pane` reaches the persona's tmux session through agent-director: an answer in time shows that tmux answers, and `ErrTmuxUnresponsive` or `ErrCallTimeout` shows it still doesn't. It never shows whose a session is (see its caveats under [Listing instances](skills/debug-slack-channel-bots/SKILL.md#listing-instances) in the debugging skill), so take ownership from agent-director's row, never from the pane. Never run a command that ends a session or deletes an agent-director row to clear it: once agent-director and tmux answer, the next retry recovers the persona and *Answering again* follows. To follow one persona's episode:
 
 ```sh
 grep -E 'persona-episodes: persona=<key> tmux-unresponsive (started|onset|alert|ended|recovery)' ~/.claude/channels/slack/server.log
@@ -1941,8 +1940,10 @@ A description the server does not recognise gets a general first line with no ca
 What to do: for every case with a pointer, a human follows the "Operator actions" section of agent-director's README for the session the notice names. This is for a human only: no bot acts on it, including a persona that sees the post. The notice gives one read-only check, to see which agent-director rows record the session name (on the command line; over MCP, `list` ignores this filter):
 
 ```sh
-agent-director list --tmux-session-name <name>
+agent-director list --tmux-session-name '<name>'
 ```
+
+The notice quotes the name for the shell: it is wrapped in single quotes, with each `'` in it written `'\''`, so a plain name reads `agent-director list --tmux-session-name 'slack_bot_dev'`. When the name holds a control character, a line or paragraph separator, or a backtick, the notice leaves this line out and says "The session name could not be shown safely." in its place.
 
 To follow one persona's hold in `server.log`:
 
@@ -2133,8 +2134,8 @@ The classes in the first list are fatal: the process exits non-zero. Two of them
 Fatal classes you may see:
 
 - `ad-system-install-not-found` — `Client.create()` could not locate an `agent-director` binary on PATH or at the standard install path. The log line points to the block ["The publishing host"](#the-publishing-host) in the README section "Switching over to agent-director Phase 1", which covers a host with no agent-director, and appends a manual-skill-install instructions block pointing at `skills/install-cscb/SKILL.md` (URL, target path under `~/.claude/skills/`, and invocation command `/install-cscb`).
-- `ad-system-install-too-old` — the system-installed agent-director binary is below the agent-director client's own minimum (declared in `dist/version-floor.json`). The log line names the version found, the version the client requires, that this CSCB release needs CSCB's Phase 1 floor or later (release candidates included), and the binary path, says this CSCB release and agent-director Phase 1 are installed together, and names the README section "Switching over to agent-director Phase 1" as the way to install agent-director. It appends the manual-skill-install instructions block; for this class the skill names the same section and runs nothing.
-- `ad-below-phase1-floor` — the binary passed the client's own minimum but is below CSCB's Phase 1 floor: the Phase 1 agent-director release or later is required, its release candidates included (the development placeholder `0.0.0-dev` is below it). The log line names the version found, the version required, the binary path and that the startup check found it. Nothing is launched and nothing is posted to Slack. Follow the README section "Switching over to agent-director Phase 1", then start the server again. The line appends no skill block.
+- `ad-system-install-too-old` — the system-installed agent-director binary is below the agent-director client's own minimum (declared in `dist/version-floor.json`). The log line names the version found, the version the client requires, that this CSCB release needs CSCB's Phase 1 floor or later (release candidates included), and the binary path, says this CSCB release and agent-director Phase 1 are installed together, and names the README section "Switching over to agent-director Phase 1" as the way to install agent-director. It appends the manual-skill-install instructions block; for this class the skill names the same section and runs nothing. Follow that section from its block ["Arrived here from a startup refusal?"](#arrived-here-from-a-startup-refusal); the new CSCB is started only as [step 10](#step-10-start-the-new-cscb) starts it.
+- `ad-below-phase1-floor` — the binary passed the client's own minimum but is below CSCB's Phase 1 floor: the Phase 1 agent-director release or later is required, its release candidates included (the development placeholder `0.0.0-dev` is below it). The log line names the version found, the version required, the binary path and that the startup check found it. Nothing is launched and nothing is posted to Slack. Follow the README section "Switching over to agent-director Phase 1" from its block ["Arrived here from a startup refusal?"](#arrived-here-from-a-startup-refusal); the new CSCB is started only as [step 10](#step-10-start-the-new-cscb) starts it. The line appends no skill block.
 - `ad-system-install-unreachable` — agent-director was discovered but the probe could not execute it (e.g. permission bits, broken symlink, runtime crash). The log line surfaces AD's supplied `err.reason` value verbatim (one of `not-executable`, `not-a-regular-file`, `probe-timeout`, `probe-nonzero-exit`, `probe-killed-by-signal`, `unparseable-version`, `spawn-failed`, `other`), says to diagnose with the install-cscb skill, names the README section "Switching over to agent-director Phase 1" and appends the manual-skill-install instructions block.
 - `ad-bun-version-too-old` — agent-director needs Bun `>= 1.0.21`. Upgrade Bun.
 - `ad-client-construct` — `Client.create()` failed with an error other than the `ad-system-install-*` ones; the line gives its detail. Check the install with the `install-cscb` skill, then retry.
@@ -2152,7 +2153,7 @@ Fatal classes you may see:
   mv "$STATE/retired-keys.json" "$STATE/retired-keys.json.moved-aside"
   ```
 
-**Found while the server was running.** `ad-system-install-too-old` and `ad-below-phase1-floor` can also be written by the runtime re-check: while the server runs, it re-checks the agent-director binary every 120 s, whatever `health_check_interval` is (`0` included), and stops with a non-zero exit when the binary fails either check. The entry names the version found, the version required, the binary path and that it was found by a runtime re-check while the server was running, so the server stopped. The stop posts nothing to Slack and leaves every bot and its agent-director row as it was: the bots keep running, but nothing serves them. Follow the README section "Switching over to agent-director Phase 1", then start the server again.
+**Found while the server was running.** `ad-system-install-too-old` and `ad-below-phase1-floor` can also be written by the runtime re-check: while the server runs, it re-checks the agent-director binary every 120 s, whatever `health_check_interval` is (`0` included), and stops with a non-zero exit when the binary fails either check. The entry names the version found, the version required, the binary path and that it was found by a runtime re-check while the server was running, so the server stopped. The stop posts nothing to Slack and leaves every bot and its agent-director row as it was: the bots keep running, but nothing serves them. This stop is not a switch-over case: what to do is under [Found while the server was running](skills/debug-slack-channel-bots/SKILL.md#found-while-the-server-was-running) in the debugging skill.
 
 The following classes are **non-fatal**: the Slack Reply Guard's setup pass at server start (see [Slack Reply Guard (Stop hook)](#slack-reply-guard-stop-hook)). The guard stays fail-open, so an affected persona gets no reminder, and every other persona and the rest of the start are unaffected. Directory and file failures at a later launch are server-log lines only, never records here.
 
@@ -2184,7 +2185,7 @@ The following classes are **non-fatal** failures while preparing or launching pe
 
 - `cli-teardown-failed` — a persona the command could not stop, with no *Kill failed* text after its line. The entry is the persona's line: `[<time>] [cli-teardown-failed] <command>: could not stop persona "<name>" (key=<key>), session "slack_bot_<key>": <CLASS>: <description>`, naming the command, the persona, its session, the class and agent-director's description, redacted. What to do: see "`clean_restart` or `stop --stop-bots` exits non-zero with `could not stop`" in [Troubleshooting](#troubleshooting).
 - `persona-kill-failed` and `persona-kill-survivor` — the same classes as below, with the context `CLI teardown, <command>`: a persona whose line is followed by a *Kill failed* text gets one `persona-kill-failed` entry holding its line and then `persona "<name>" (key=<key>) (CLI teardown, <command>): <the notice's text>`, on one line; a persona stopped with a *Process outlived kill* text gets one `persona-kill-survivor` entry, `persona "<name>" (key=<key>) (CLI teardown, <command>): <the notice's text>`, and counts as stopped.
-- `clean-restart-not-restarted` — `clean_restart` could not stop at least one persona, and agent-director did not answer its check after the teardown, so the server was not started. One entry per run, the same text the command printed and appended to `server.log`: `[<time>] [clean-restart-not-restarted] clean_restart: could not stop persona "<name>" (key=<key>), session "slack_bot_<key>": <CLASS>; agent-director did not answer, so the server was not started: start it once agent-director answers`, naming each persona it could not stop with its session and class. The server and the bots it did stop stay down until a human starts the server: once `agent-director version` answers, run `claude-slack-channel-bots start` (see [When `clean_restart` can't stop a bot](#when-clean_restart-cant-stop-a-bot)).
+- `clean-restart-not-restarted` — `clean_restart` could not stop at least one persona, and agent-director did not answer its check after the teardown, so the server was not started. One entry per run, `[<time>] [clean-restart-not-restarted] ` followed by the alert the command printed and appended to `server.log`, which names each persona it could not stop with its session and class (the alert is quoted under [When `clean_restart` can't stop a bot](#when-clean_restart-cant-stop-a-bot)). The server and the bots it did stop stay down until a human starts the server: once `agent-director version` answers, run `claude-slack-channel-bots start` (see [When `clean_restart` can't stop a bot](#when-clean_restart-cant-stop-a-bot)).
 
 **Written while the server runs.** These non-fatal classes are written while the server runs; only `persona-kill-survivor` is also written at start, and `stop --stop-bots` and `clean_restart` also write `persona-kill-failed` and `persona-kill-survivor` (above):
 
@@ -2259,23 +2260,18 @@ This gracefully exits the managed Claude Code sessions, stops and restarts the s
 
 ## Migration
 
-For operators upgrading from a pre-`agent-director` install:
+This release and agent-director Phase 1 are installed together, and rolled back together, by the two runbooks below. Beside them:
 
-1. **Install the new CSCB together with agent-director Phase 1**: installing the npm package is not the whole install. This release needs agent-director Phase 1 on the host, installed with it by the runbook in [Switching over to agent-director Phase 1](#switching-over-to-agent-director-phase-1), which also says when to install the package. The npm `agent-director` package CSCB pulls in is only the client; the binary is installed system-wide (see [Prerequisites](#prerequisites)). Remove `claude-director` first if present: `bun remove claude-director`.
-2. **Delete any old relay hooks** — see [Upgrading from pre-Epic-2 (v0.5.x → v0.6.x)](#upgrading-from-pre-epic-2-v05x--v06x) for the cleanup commands.
-3. **(Optional) Configure an agent-director `find-missing` sweep**. CSCB itself runs `find-missing` once before a resume during dead-session recovery, so a bot that died on reboot comes back with its history intact. If agent-director doesn't answer that sweep (it times out or reports tmux not answering), CSCB stops the recovery there, with no resume and no fresh session, and retries it later. A standalone periodic sweep is no longer required for CSCB recovery, but remains useful if you want stuck rows from non-CSCB spawns reconciled on a cadence. To add one, use a cron entry (or systemd timer):
+1. **Install the new CSCB together with agent-director Phase 1**: installing the npm package is not the whole install. This release needs agent-director Phase 1 on the host, installed with it by the runbook in [Switching over to agent-director Phase 1](#switching-over-to-agent-director-phase-1), which also says when to install the package. The npm `agent-director` package CSCB pulls in is only the client; the binary is installed system-wide (see [Prerequisites](#prerequisites)).
+2. **(Optional) Run a periodic agent-director `find-missing` sweep**. CSCB itself runs `find-missing` once before a resume during dead-session recovery, so a bot that died on reboot comes back with its history intact. If agent-director doesn't answer that sweep (it times out or reports tmux not answering), CSCB stops the recovery there, with no resume and no fresh session, and retries it later. CSCB's own recovery needs no periodic sweep; one reconciles the rows of agent-director's other users on a cadence. A host that runs one keeps it in its sweep loop, `~/startup/find-missing-loop.sh`, the loop the switch-over runbook names, or in a cron entry:
    ```cron
-   * * * * * /usr/local/bin/agent-director find-missing --timeout 30s
+   * * * * * $HOME/.agent-director/bin/agent-director find-missing
    ```
-4. **Install the startup-errors logrotate snippet** so `~/.claude/channels/slack/startup-errors.log` doesn't grow unboundedly. Edit `USER` in the file to match the OS account running CSCB:
+   The job must run as the workers' user and resolve their tmux socket, the socket switch-over step 1 pins.
+3. **Install the startup-errors logrotate snippet** so `~/.claude/channels/slack/startup-errors.log` doesn't grow unboundedly. Edit `USER` in the file to match the OS account running CSCB:
    ```sh
    sudo cp docs/logrotate-startup-errors.conf /etc/logrotate.d/claude-slack-channel-bots
    ```
-5. **Rename your config field**. Pre-Epic-2 configs used `claude_director_poll_interval_ms`; CSCB now expects `agent_director_poll_interval_ms` and rejects the old name (no silent alias). Edit `~/.claude/channels/slack/config.json` accordingly. Unknown top-level fields are also rejected — clear any other deprecated keys.
-6. **Optional cleanup**: `~/.claude/channels/slack/sessions.json` and `sessions.json.last` are no longer read or written. CSCB ignores them; you can safely `rm` them after a successful boot.
-7. **`tmux` is no longer a CSCB-direct prereq** but is still required transitively via agent-director — keep it installed.
-
-After step 1, every CSCB bot is spawned through `client.spawn(...)` with `relay_mode='on'`. The green/red Slack button UX is byte-identical to the pre-migration behavior; the action_id shape changes from `perm_(allow|deny)_<uuid>` to `perm_(allow|deny)_cscb_<key>_<request_token>` (where `<key>` is the persona key and `<request_token>` is a UUIDv4 minted by agent-director) but this is invisible to end users.
 
 ### Switching over to agent-director Phase 1
 
@@ -2385,7 +2381,7 @@ Only if step 5 found a leftover with a row. End each such leftover now, with the
 For each one:
 
 1. Note the session's window ids, as in step 5.
-2. Run `agent-director kill --claude-instance-id <id>`, then make the gone check.
+2. Run `agent-director kill --claude-instance-id <id>` and check its result; on an error, don't delete or respawn. Then make the gone check.
 3. If the session or one of its windows remains, end the session with the exact-name `tmux kill-session -t =<name>`, and make the gone check again.
 4. Run `agent-director find-missing` until the row reads `ended` or `missing`, for at most 5 minutes.
 
@@ -2483,7 +2479,7 @@ agent-director list --label service=cscb
 
 A row still live after that (for example a retired key whose kill failed, which `stop --stop-bots` does not cover) is ended by a human:
 
-1. Run `agent-director kill --claude-instance-id <id>`, and check its result.
+1. Run `agent-director kill --claude-instance-id <id>`, and check its result; on an error, don't delete or respawn.
 2. A `kill` refused with CONFLICT ("not this launch's session") has met a leftover of an earlier launch: handle it as "Operator actions" describes.
 3. If these kills keep failing, follow "Operator actions" for that worker, and record it in the switch-over log.
 
@@ -2495,7 +2491,7 @@ Nothing goes on to step 6 while such a worker runs, because every agent must be 
 
 As the workers' user, on the socket switch-over step 1 pinned, run a read-only `tmux ls`, and confirm that no `slack_bot_<key>` session is left. Handle each leftover by whether it has a row and, if it has one, by that row's current state:
 
-- **A leftover whose row is live:** end it with `agent-director kill --claude-instance-id cscb_<key>`. When that `kill` is refused with "not this launch's session", handle it as "Operator actions" describes.
+- **A leftover whose row is live:** end it with `agent-director kill --claude-instance-id cscb_<key>`, and check its result; on an error, don't delete or respawn. When that `kill` is refused with "not this launch's session", handle it as "Operator actions" describes.
 - **A finished row's own leftover session:** handle it as "Operator actions" describes.
 - **An operator action refused inside the stopping window or the starting-session bound:** retry it once the longer of the two has passed. Read all nine timing settings again, as in switch-over step 1, for the two windows' values, and record them in the switch-over log. A plain `kill` never refuses for that reason.
 - **A leftover with no row:** handle it as in [switch-over step 5](#step-5-check-for-leftover-sessions), against the previous CSCB's session names (`slack_bot_<name>_<channel>` or `slack_bot_<channel ID>`) instead of the new personas'.
@@ -2551,7 +2547,7 @@ This major version accepts only the persona configuration format. These are the 
 
 ## Upgrading from pre-Epic-2 (v0.5.x → v0.6.x)
 
-If you installed CSCB before v0.6.0 you may have legacy artifacts on disk that are no longer needed. Clean them up manually — automatic postinstall migration is tracked under idea b.irf and not yet implemented.
+If you installed CSCB before v0.6.0 you may have legacy artifacts on disk that are no longer needed. Clean them up by hand; no install step removes them.
 
 ### 1. Remove old relay hook files
 
@@ -2578,8 +2574,4 @@ Any non-empty arrays in the output are orphan entries. Remove:
 - Any object inside `hooks.PreToolUse` with `"matcher": "AskUserQuestion"` whose `hooks[].command` ends in `ask-relay.sh`.
 
 The modern permission relay runs automatically via agent-director — no `PermissionRequest` or `PreToolUse` hook entries for `.sh` files are needed.
-
-### 3. Note on automated migration
-
-A postinstall step that performs this cleanup automatically is tracked under idea b.irf. Until that lands, the steps above are manual.
 

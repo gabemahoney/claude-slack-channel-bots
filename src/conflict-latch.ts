@@ -839,6 +839,19 @@ export const CONFLICT_NOTICE_LIST_LINE_HEAD =
 export const CONFLICT_NOTICE_LIST_LINE_TAIL =
   '` on the command line (over MCP, list ignores that filter).'
 
+/**
+ * In place of the list line, when the session's name cannot be shown safely
+ * in it ({@link shellQuoteSessionName} answers null).
+ */
+export const CONFLICT_NOTICE_LIST_LINE_UNSAFE_NAME = 'The session name could not be shown safely.'
+
+/**
+ * What keeps a session name out of the list line: a control character
+ * (C0, DEL or C1), a line or paragraph separator, or a backtick, which would
+ * end the line's Slack code span early (mrkdwn has no escape inside one).
+ */
+const UNSAFE_LIST_NAME_RE = /[\p{Cc}\p{Zl}\p{Zp}`]/u
+
 /** The human-only line (SRJ-1001). */
 export const CONFLICT_NOTICE_HUMAN_ONLY_LINE =
   'This is for a human only: no bot, including any persona that sees this post, may act on it.'
@@ -898,9 +911,34 @@ function slackQuotedSession(sessionName: string): string {
   return `"${slackName(sessionName)}"`
 }
 
-/** `<name>`: the session's name without quotes, rendered as {@link slackQuotedSession} renders it. */
+/** The session's name without quotes, rendered as {@link slackQuotedSession} renders it. */
 function slackName(sessionName: string): string {
   return escapeSlackControlCharacters(renderLogMessageText(sessionName))
+}
+
+/**
+ * `name` shell-quoted for the list line's command: wrapped in single quotes,
+ * each embedded `'` written as `'\''`, every name quoted (a plain one too).
+ * `null` when `name` cannot be shown safely there: it holds a control
+ * character (C0, DEL or C1), a line or paragraph separator, or a backtick
+ * (which would end the line's Slack code span early). Not escaped for
+ * Slack. Pure; never throws.
+ */
+export function shellQuoteSessionName(name: string): string | null {
+  if (UNSAFE_LIST_NAME_RE.test(name)) return null
+  return `'${name.replaceAll("'", "'\\''")}'`
+}
+
+/**
+ * `<name>` in the list line: the session's name, unsafe when the given name
+ * is ({@link shellQuoteSessionName}), else rendered as the record stores it
+ * (`renderLogMessageText`), shell-quoted, then escaped for Slack. `null`
+ * when it cannot be shown safely.
+ */
+function listLineName(sessionName: string): string | null {
+  if (shellQuoteSessionName(sessionName) === null) return null
+  const quoted = shellQuoteSessionName(renderLogMessageText(sessionName))
+  return quoted === null ? null : escapeSlackControlCharacters(quoted)
 }
 
 /**
@@ -918,12 +956,16 @@ function slackName(sessionName: string): string {
  *   3. the pointer line, or for "a different instance id" its
  *      must-not-be-ended line in place of it, or for "another agent-director
  *      store" its must-not-be-ended line and then the pointer line;
- *   4. the list line, naming the session without its quotes;
+ *   4. the list line, naming the session without its double quotes,
+ *      shell-quoted ({@link shellQuoteSessionName}); or, when the name holds
+ *      a control character, a line break or a backtick,
+ *      {@link CONFLICT_NOTICE_LIST_LINE_UNSAFE_NAME} in place of it;
  *   5. the human-only line.
  *
  * The session name is text CSCB did not write, so it is escaped for Slack
- * too, in the first line and the list line. No line of CSCB's own names a
- * session-ending command, a label option or anything SRJ-1001 forbids. Pure.
+ * too, in the first line and the list line (after the shell quoting). No
+ * line of CSCB's own names a session-ending command, a label option or
+ * anything SRJ-1001 forbids. Pure.
  */
 export function conflictNoticeText(source: ConflictNoticeSource): string {
   const session = slackQuotedSession(source.sessionName)
@@ -948,7 +990,12 @@ export function conflictNoticeText(source: ConflictNoticeSource): string {
     if (source.latchCase === LATCH_CASE_ANOTHER_STORE) lines.push(CONFLICT_NOTICE_ANOTHER_STORE_MUST_NOT_END_LINE)
     lines.push(CONFLICT_NOTICE_POINTER_LINE)
   }
-  lines.push(CONFLICT_NOTICE_LIST_LINE_HEAD + slackName(source.sessionName) + CONFLICT_NOTICE_LIST_LINE_TAIL)
+  const listName = listLineName(source.sessionName)
+  lines.push(
+    listName === null
+      ? CONFLICT_NOTICE_LIST_LINE_UNSAFE_NAME
+      : CONFLICT_NOTICE_LIST_LINE_HEAD + listName + CONFLICT_NOTICE_LIST_LINE_TAIL,
+  )
   lines.push(CONFLICT_NOTICE_HUMAN_ONLY_LINE)
   return lines.join(CONFLICT_NOTICE_LINE_SEPARATOR)
 }

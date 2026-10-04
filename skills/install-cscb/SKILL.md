@@ -47,7 +47,12 @@ Read the output carefully:
 
 - **Exit 0 + "OK"**: agent-director is satisfied. Print the resolved
   binary path, detected version, and floor from the success output, then
-  go to Step 5. No further remediation is required.
+  go to Step 5. This skill has nothing more to fix. If the output ends
+  with a `note:` line, the binary is below CSCB's Phase 1 floor: show the
+  note to the user. The server refuses to start on that binary until
+  agent-director Phase 1 is in place, which comes only through the README
+  section "Switching over to agent-director Phase 1"; offer no command and
+  run nothing for it.
 
 - **Exit non-zero**: identify the class label on stderr (one of
   `ad-system-install-not-found`, `ad-system-install-too-old`,

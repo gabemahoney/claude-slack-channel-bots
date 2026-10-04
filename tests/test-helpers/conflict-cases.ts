@@ -453,6 +453,7 @@ import {
   CONFLICT_NOTICE_LINE_SEPARATOR,
   CONFLICT_NOTICE_LIST_LINE_HEAD,
   CONFLICT_NOTICE_LIST_LINE_TAIL,
+  CONFLICT_NOTICE_LIST_LINE_UNSAFE_NAME,
   CONFLICT_NOTICE_POINTER_LINE,
   LATCH_CASE_ANOTHER_STORE,
   LATCH_CASE_CONFLICTING_LABELS,
@@ -513,6 +514,7 @@ import {
   launchStartNotRecordedNoticeText,
   launchStartNotRecordedSetInput,
   recogniseConflictCase,
+  shellQuoteSessionName,
   takesUnrecognisedHandling,
   unusableNameNoticeText,
   unusableNameSetInput,
@@ -858,7 +860,11 @@ export interface ConflictNoticeCarries {
   readonly pointer: boolean
   /** "a different instance id": `row`, in place of the pointer; "another agent-director store": `store`, before the pointer. */
   readonly mustNotEnd: MustNotEndLine
-  /** The `list` line: every case. */
+  /**
+   * The `list` line: every case whose session name can be shown safely
+   * (`shellQuoteSessionName` answers a string); otherwise the unsafe-name
+   * line stands in its place.
+   */
   readonly list: boolean
   /** The human-only line: every case. */
   readonly humanOnly: boolean
@@ -876,6 +882,8 @@ export interface ExpectedConflictNotice {
   readonly caseSentence: string | undefined
   /** Its description line; `undefined` when there is no description. */
   readonly descriptionLine: string | undefined
+  /** Its `list` line, or the unsafe-name line in its place when `carries.list` is false. */
+  readonly listLine: string
 }
 
 /** What an expected notice is built from: a CONFLICT latch's case, its quoted session (as the record holds it) and its description, if any. */
@@ -885,11 +893,25 @@ export interface ExpectedConflictNoticeSource {
   readonly description?: string
 }
 
-/** The flags SRJ-1004 sets for a case. */
-function carriesFor(latchCase: ConflictLatchCase): ConflictNoticeCarries {
+/** The flags SRJ-1004 sets for a case and a session name. */
+function carriesFor(latchCase: ConflictLatchCase, sessionName: string): ConflictNoticeCarries {
   const mustNotEnd: MustNotEndLine =
     latchCase === LATCH_CASE_DIFFERENT_ID ? 'row' : latchCase === LATCH_CASE_ANOTHER_STORE ? 'store' : 'none'
-  return Object.freeze({ pointer: latchCase !== LATCH_CASE_DIFFERENT_ID, mustNotEnd, list: true, humanOnly: true })
+  const list = shellQuoteSessionName(sessionName) !== null
+  return Object.freeze({ pointer: latchCase !== LATCH_CASE_DIFFERENT_ID, mustNotEnd, list, humanOnly: true })
+}
+
+/**
+ * The `list` line for `sessionName` (as given): the unsafe-name line when the
+ * given name cannot be shown safely, else the name rendered as the record
+ * stores it, shell-quoted by `shellQuoteSessionName` and then escaped once
+ * for Slack, between the line's head and tail.
+ */
+export function expectedConflictListLine(sessionName: string): string {
+  if (shellQuoteSessionName(sessionName) === null) return CONFLICT_NOTICE_LIST_LINE_UNSAFE_NAME
+  const quoted = shellQuoteSessionName(renderLogMessageText(sessionName))
+  if (quoted === null) throw new Error(`a safe session name rendered unsafe: ${JSON.stringify(sessionName)}`)
+  return CONFLICT_NOTICE_LIST_LINE_HEAD + escapeSlackControlCharacters(quoted) + CONFLICT_NOTICE_LIST_LINE_TAIL
 }
 
 /**
@@ -898,12 +920,13 @@ function carriesFor(latchCase: ConflictLatchCase): ConflictNoticeCarries {
  * the first line (`"<session>"`, with the case sentence unless the case takes
  * the unrecognised-text wording), the description line (left out when the
  * rendered description is empty), the must-not-be-ended line and the pointer
- * as `carries` says, the `list` line (`<name>` without quotes) and the
- * human-only line. The session name and the rendered description are escaped
- * once for Slack.
+ * as `carries` says, the `list` line ({@link expectedConflictListLine}: the
+ * name shell-quoted, or the unsafe-name line in its place) and the
+ * human-only line. The session name (rendered as the record stores it) and
+ * the rendered description are escaped once for Slack.
  */
 export function expectedConflictNotice(source: ExpectedConflictNoticeSource): ExpectedConflictNotice {
-  const name = escapeSlackControlCharacters(source.sessionName)
+  const name = escapeSlackControlCharacters(renderLogMessageText(source.sessionName))
   const caseSentence = takesUnrecognisedHandling(source.latchCase)
     ? undefined
     : CONFLICT_CASE_SENTENCES[source.latchCase as ConflictCaseWithSentence]
@@ -912,7 +935,8 @@ export function expectedConflictNotice(source: ExpectedConflictNoticeSource): Ex
     rendered === ''
       ? undefined
       : CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD + escapeSlackControlCharacters(rendered) + CONFLICT_NOTICE_DESCRIPTION_LINE_TAIL
-  const carries = carriesFor(source.latchCase)
+  const carries = carriesFor(source.latchCase, source.sessionName)
+  const listLine = expectedConflictListLine(source.sessionName)
   const lines = [
     CONFLICT_NOTICE_FIRST_LINE_HEAD +
       `"${name}"` +
@@ -922,7 +946,7 @@ export function expectedConflictNotice(source: ExpectedConflictNoticeSource): Ex
     ...(carries.mustNotEnd === 'row' ? [CONFLICT_NOTICE_DIFFERENT_ID_MUST_NOT_END_LINE] : []),
     ...(carries.mustNotEnd === 'store' ? [CONFLICT_NOTICE_ANOTHER_STORE_MUST_NOT_END_LINE] : []),
     ...(carries.pointer ? [CONFLICT_NOTICE_POINTER_LINE] : []),
-    CONFLICT_NOTICE_LIST_LINE_HEAD + name + CONFLICT_NOTICE_LIST_LINE_TAIL,
+    listLine,
     CONFLICT_NOTICE_HUMAN_ONLY_LINE,
   ]
   return Object.freeze({
@@ -931,6 +955,7 @@ export function expectedConflictNotice(source: ExpectedConflictNoticeSource): Ex
     carries,
     caseSentence,
     descriptionLine,
+    listLine,
   })
 }
 
