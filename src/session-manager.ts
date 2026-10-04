@@ -3474,51 +3474,6 @@ function remediationHint(error: AgentDirectorError): string {
 }
 
 // ---------------------------------------------------------------------------
-// Raw tmux calls — one runner, exact targets only (b.1ix)
-// ---------------------------------------------------------------------------
-
-/** One `tmux` run: its exit code (`null` when it could not run) and its stdout. */
-export interface TmuxRunResult {
-  code: number | null
-  stdout: string
-}
-
-/**
- * Runs `tmux <args>` and never rejects. No server path makes a raw tmux call
- * through it: CSCB reaches tmux only through agent-director. The runner and
- * its seams stay so a unit test can install a recording runner, see that no
- * argv reaches it, and never reach a real tmux server.
- */
-export type TmuxCommandRunner = (args: readonly string[]) => Promise<TmuxRunResult>
-
-const defaultRunTmux: TmuxCommandRunner = async (args) => {
-  const { spawn } = await import('child_process')
-  return new Promise<TmuxRunResult>((resolve) => {
-    try {
-      const child = spawn('tmux', [...args], { stdio: ['ignore', 'pipe', 'ignore'] })
-      let stdout = ''
-      child.stdout?.on('data', (d: Buffer) => { stdout += d.toString('utf8') })
-      child.on('error', () => resolve({ code: null, stdout: '' })) // tmux missing
-      child.on('close', (code) => resolve({ code, stdout }))
-    } catch {
-      resolve({ code: null, stdout: '' })
-    }
-  })
-}
-
-let _runTmux: TmuxCommandRunner = defaultRunTmux
-
-/** Test-only seam: override the tmux command runner. */
-export function _setTmuxCommandRunner(fn: TmuxCommandRunner): void {
-  _runTmux = fn
-}
-
-/** Test-only seam: restore the default tmux command runner. */
-export function _resetTmuxCommandRunner(): void {
-  _runTmux = defaultRunTmux
-}
-
-// ---------------------------------------------------------------------------
 // reconnectMcp — send `/mcp reconnect <server-name>` via library sendKeys
 // ---------------------------------------------------------------------------
 
@@ -8338,9 +8293,9 @@ async function waitForWorkingRow(
   // ended/missing branch and returns 'dead-session' directly in seconds (b.ecw:
   // process-keyed, no tmux probe); a genuinely-alive long-turn row is untouched
   // by the evidence-based sweep and keeps today's polling behavior (b.rmy
-  // long-turn guard preserved). Prefer
-  // AD's findMissing verb over a CSCB-side tmux reconcile per
-  // docs/engineering-guide.md ("Avoiding Duplicated Effort"), mirroring
+  // long-turn guard preserved). Agent-director's findMissing verb is the
+  // reconcile, and CSCB starts no tmux process (b.jg5 SRJ-601;
+  // docs/engineering-guide.md, "Avoiding Duplicated Effort"), mirroring
   // resumeOrFreshSpawn's reconcileMissingFirst branch. On a findMissing
   // error, log and fall through to the existing poll loop (today's
   // behavior), except a refused sweep (b.jg5 SRJ-105): nothing more is
@@ -10927,8 +10882,9 @@ async function resumeOrFreshSpawn(
   // ErrSpawnNotResumable. The ladder answers failed, which the launch
   // answers as `retrying` (`retryingWhenArmed`). On any other findMissing error, fall through to attempting
   // resume anyway (an ErrSpawnNotResumable then takes the not-resumable
-  // step). Prefer AD's findMissing verb over CSCB-side tmux probing per
-  // docs/engineering-guide.md ("Avoiding Duplicated Effort").
+  // step). Agent-director's findMissing verb is the reconcile, and CSCB
+  // starts no tmux process (b.jg5 SRJ-601; docs/engineering-guide.md,
+  // "Avoiding Duplicated Effort").
   if (opts.reconcileMissingFirst) {
     const postSweep: { ownRowRead?: LatchRowState } = {}
     const sweep = await reconcileMissingSweep(key, 'spawnForPersona: before resume', ref, {
