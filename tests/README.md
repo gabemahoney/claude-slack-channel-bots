@@ -202,11 +202,18 @@ tests/
                                    # a harness call logged with its argv and the scenario shell as parent; the client's version probe through the shim; a spawn on the
                                    # scenario's own tmux server; `ad_store_id` and `ad_store_edit` on the scenario's store; the shim a regular file carrying its marker
                                    # after every install, re-shim, swap and restore, with the log kept; a 0.10.0 start; every guarded helper refusing a HOME outside
-                                   # SCENARIO_ROOT; and the trap stopping the scenario's tmux server
+                                   # SCENARIO_ROOT; the tmux shim logging argv and parent, and each of its modes (fail-kill, fail-create, slow-create, wedge) behaving
+                                   # as its header says; `cscb_run` putting the shim first on a CSCB process's PATH and recording it, the scenario shell keeping the
+                                   # real tmux; a live one-persona start whose dialog the approver clears through agent-director, with no tmux line whose parent is
+                                   # the bot server and the three closing assertions passing, both positive controls met by that start's own lines; harness
+                                   # `kill --include-finished` calls passing; each assertion, positive control and count helper failing on a violating log; the
+                                   # closing enforcement; and the trap stopping the scenario's tmux server. It ends with the three closing assertions
     lib/
       scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards (see Scenario helper below)
     fixtures/
       agent-director-shim.sh       # the logging agent-director shim of fmk mode: logs each call's argv and parent, then execs the real binary beside it
+      tmux-shim.sh                 # the logging tmux shim of fmk mode, first on the PATH of every CSCB process: logs each call's argv and parent, then acts on its
+                                   # mode (log, fail-kill, fail-create, slow-create, wedge)
       fmk-driver.ts                # the driver of the calls an fmk scenario forces; refuses to run without the image marker /etc/cscb-ci-image and
                                    # imports the installed package and its agent-director client only after that check
       driver.ts                    # Test 4 driver: builds a one-persona config, calls spawnForPersona directly, then follows the persona's dialog approver through the package's seams
@@ -339,13 +346,15 @@ Sourcing it, in both modes:
 - sets `SCENARIO_TAG` (`t<N>` from the script name). In shared mode, build
   persona names from it (`${SCENARIO_TAG}_alpha`), so no two shared-mode
   scripts share a persona key in the container's one agent-director store;
-- installs an EXIT trap that stops every server the scenario started (with
-  `--stop-bots` after a live start), kills every process registered with
-  `track_pid`, in fmk mode stops the scenario's tmux server (a kill-server on
-  every tmux socket under `SCENARIO_ROOT`, then SIGKILL for any of its tmux
-  processes left; one still running fails the run), runs the `on_exit` hooks,
-  prints the tail of each `server.log` when the script failed, and removes the
-  scratch root.
+- installs an EXIT trap that, in fmk mode, first sets the tmux shim back to
+  `log`; stops every server the scenario started (with `--stop-bots` after a
+  live start), kills every process registered with `track_pid`, in fmk mode
+  stops every recorded bot server still running and the scenario's tmux server
+  (a kill-server on every tmux socket under `SCENARIO_ROOT`, then SIGKILL for
+  any of its tmux processes left; one still running fails the run) and runs
+  the closing enforcement (see Closing assertions); then runs the `on_exit`
+  hooks, prints the tail of each `server.log` when the script failed, and
+  removes the scratch root.
 
 fmk mode. Sourcing also:
 
@@ -375,12 +384,16 @@ fmk mode. Sourcing also:
   that sets it fails;
 - writes no agent-director `config.toml`, so agent-director runs on its
   default settings. Scenarios 10 and 24 are the exceptions: they write a
-  `[tmux]` table.
+  `[tmux]` table;
+- installs the tmux shim for the scenario's CSCB processes, in `log` mode, and
+  starts the CSCB process record (see The tmux shim and CSCB processes below).
 
 Keep HOME, `TMUX_TMPDIR` and PATH as sourcing set them. Sourcing also sets
-`SCENARIO_REAL_TMUX` (the real tmux, which the trap stops the server with),
-`SCENARIO_AD_BIN` (the standard path, which holds the shim) and
-`SCENARIO_AD_SHIM_LOG` (the shim's log).
+`SCENARIO_REAL_TMUX` (the real tmux, resolved before PATH changed, which the
+trap stops the server with), `SCENARIO_AD_BIN` (the standard path, which
+holds the shim), `SCENARIO_AD_SHIM_LOG` (the agent-director shim's log),
+`SCENARIO_TMUX_SHIM_LOG` (the tmux shim's log), `SCENARIO_CSCB_RECORD` (the
+record) and `SCENARIO_SHELL_CMDLINE` (the script's own command line).
 
 The agent-director shim (`fixtures/agent-director-shim.sh`):
 
@@ -441,6 +454,129 @@ Harness agent-director calls and store helpers:
   `require_ci_image` and then `require_scenario_home` as its first two steps
   (see Image marker).
 
+The tmux shim and CSCB processes (fmk mode). A CSCB process is the bot
+server, or a CLI command or driver the scenario runs: every `start` run
+(`run_start`, `start_server`), every `stop` run (`stop_server` and the
+trap's), every bot server they leave, and every command run through
+`cscb_run`. Each starts with the tmux shim's bin directory
+(`SCENARIO_TMUX_SHIM_BIN`, `$SCENARIO_ROOT/tmux-shim/bin`) first on its PATH.
+agent-director runs `tmux` from its caller's PATH, and the client passes its
+caller's whole environment on, so every tmux call agent-director makes for
+CSCB reaches the shim. The scenario's own shell keeps the real tmux and never
+has the shim on its PATH.
+
+- `cscb_run <command> [<arg>...]` runs a CLI command (of the package under
+  test or another) or a driver as a CSCB process: recorded with role `run`,
+  the shim first on its PATH, standard streams passed through, its status
+  returned. `<command>` is a program, run directly or through `env`, never
+  through `timeout`, `bash -c` or another process that would stay its parent.
+  It registers `SLACK_STATE_DIR` (when it is under `SCENARIO_ROOT`), so the
+  trap stops a server the command leaves there. In shared mode it runs the
+  command with no shim and no record.
+- `tmux_shim_mode <mode> [<delay-s>]` sets the shim's mode by an atomic write
+  of its mode file (`SCENARIO_TMUX_SHIM_MODE_FILE`); the shim's next call
+  reads it. Only `slow-create` and `wedge` take a delay, a whole or decimal
+  number of seconds. It fails on an unknown mode, a delay for any other mode
+  and in shared mode. The mode is `log` from setup on.
+
+The tmux shim (`fixtures/tmux-shim.sh`, installed as
+`$SCENARIO_ROOT/tmux-shim/bin/tmux`):
+
+- finds its files from its own path, never from an environment variable:
+  the real tmux (`tmux.real`, a link to the tmux `scenario.sh` resolved before
+  it changed PATH), the mode file and its log (`tmux-shim.log`,
+  `SCENARIO_TMUX_SHIM_LOG`), all in `$SCENARIO_ROOT/tmux-shim`
+  (`SCENARIO_TMUX_SHIM_DIR`). It refuses, running nothing and exiting 70, when
+  the real tmux is missing, is the shim's own file or carries the shim's
+  marker;
+- for every call, in every mode, first appends one `call` line to its log,
+  holding the parent's PID, the parent's command line and argv, in the
+  agent-director shim's six-field format. When it cannot append the line it
+  runs nothing and exits 70, so no call goes unlogged;
+- then reads its mode from the mode file: one line, `<mode>` or
+  `<mode> <delay-s>`. No file reads as `log`; an unreadable file, an unknown
+  mode or a delay that is not a number of seconds runs nothing and exits 70;
+- reads each command of a chained call after tmux's global options, and
+  matches a command name as tmux does (its full name, its alias or a prefix
+  no other command shares). A call with no command, and neither `-c` nor
+  `-V`, is tmux's default `new-session`.
+
+| Mode | Acts on a call whose commands include | What it does to that call | Every other call |
+|---|---|---|---|
+| `log` | (none) | | runs the real tmux |
+| `fail-kill` | `kill-session` or `kill-pane` | runs nothing, so kills nothing; one `tmux-shim:` line on standard error; exits 1 | runs the real tmux |
+| `fail-create` | `new-session` | runs nothing, so creates nothing; nothing on standard output and one `tmux-shim:` line (which tmux never gives) on standard error; exits 1. agent-director answers `ErrTmuxSessionCreate` and a plain spawn's row stays `pending` | runs the real tmux |
+| `slow-create` | `new-session` | runs the whole chained call through the real tmux (agent-director's `@ad_owner` and `@ad_pane` labels with it), then waits the delay (default 15 s, longer than agent-director's default `create_timeout_ms` of 5000) and exits with tmux's status: the launch times out with its session present | runs the real tmux |
+| `wedge` | any command | waits the delay (default 60 s, longer than every agent-director call timeout at its defaults), then prints one `tmux-shim:` line on standard error and exits 1, having run no tmux | (every call is waited) |
+
+A wait runs `sleep` with its standard streams on `/dev/null`, so a `sleep`
+left behind when agent-director's call timeout kills the shim holds none of
+agent-director's pipes.
+
+The CSCB process record (`SCENARIO_CSCB_RECORD`,
+`$SCENARIO_ROOT/cscb-processes`) never drops a process. Each entry holds the
+process's role (`start`, `stop`, `server` or `run`), its PID, its start time
+from `/proc` and the time it started, and a later `gone` time once the
+harness sees it ended. A run records itself, in the subshell that then execs
+the command, before the command starts. A bot server is recorded once the
+harness sees its PID in a state dir's `server.pid` (after every CSCB run, in
+`start_server`, before every read of the record and in the trap). A log
+line's parent is a CSCB process only when its PPID is an entry's PID and its
+time lies in that entry's window, so a PID the system gives to another
+process later never matches. A bot server that exits before it writes its PID
+file (a start the server refuses) is not recorded, so its agent-director
+calls (its version probe) are not counted as CSCB's.
+
+`SCENARIO_SHELL_CMDLINE` is the script's own command line, quoted as the
+shims quote a parent's: the parent field of every call the scenario's shell,
+or a subshell of it, makes.
+
+Closing assertions (fmk mode; b.jg5 SRJ-1401, SRJ-1418). Each reads the tmux
+shim's log, the agent-director shim's log and the record, takes only `call`
+lines (never a stub's `stop` line) and fails on a line not in the shims'
+format. It reads an agent-director call's verb as the first word after
+agent-director's global flags (`--store-path`, `--home`, `--tmux-command`).
+On failure it prints each offending line indented, then a FAIL line naming
+itself, how many lines and their numbers.
+
+| Assertion | Fails on | Positive control: fails unless |
+|---|---|---|
+| `assert_no_server_tmux` | any tmux shim line whose parent is a bot server the scenario started | some tmux line's parent is an agent-director process a CSCB process ran: its PID is that of the latest agent-director shim `call` line at or before it, that call's parent is a CSCB process, and the parent's argv[0] is `agent-director`. The harness's own spawns never meet it |
+| `assert_no_cscb_include_finished` | any agent-director `kill` call carrying `--include-finished` (`-` or `--`, with or without `=<value>`) whose parent is not the scenario's own shell or a subshell of it (a command substitution or pipeline element included): a parent whose command line is `SCENARIO_SHELL_CMDLINE` and that no CSCB process held | some agent-director call's parent is a bot server the scenario started (its version probe) |
+| `assert_no_cscb_delete` | any agent-director `delete` call whose parent is a CSCB process | (no positive control) |
+
+Every fmk script ends with all three, in its own shell, whatever the tmux
+shim's mode. The positive controls keep an empty or bypassed log from passing:
+both need the scenario's own CSCB lines, so every fmk script starts at least
+one bot server, and has agent-director run tmux for at least one of its CSCB
+processes. The trap enforces the ending, after it has set the shim back to
+`log` and stopped every server (its `stop` runs are CSCB processes, logged
+like any other), for every fmk script, nested harness runs included; there
+is no opt-out:
+
+- a script that exits 0 without all three having passed in its own shell,
+  over the scenario's own logs and record, fails, its FAIL line naming the
+  assertions not passed. An assertion run in a subshell, or pointed at other
+  files, does not count;
+- when all three passed, the trap runs them again over the whole logs, so a
+  violating line written after them (while the trap stopped a server, for
+  example) fails the run with a FAIL line starting
+  `after the closing assertions:`.
+
+Scenario 17 (b.jg5 SRJ-1418, AC 19) is `assert_no_server_tmux` across every
+fmk script: the bot server runs no tmux, and answers a startup dialog only
+through agent-director (SRJ-401, SRJ-601, SRJ-612). Its static half is
+SRJ-716's audit, `tests/fmk-source-audit.test.ts` (AC 18). AC 16's `/ci`
+half (SRJ-106) is `assert_no_cscb_include_finished` across every fmk script,
+with `tests/fmk-source-audit.test.ts` as its unit half.
+
+CSCB's agent-director calls. `cscb_ad_calls <verb> [<fragment>...]` prints
+the agent-director shim's `call` lines whose parent is a CSCB process, whose
+verb is `<verb>` (any verb when `<verb>` is empty) and whose arguments, joined
+by single spaces, hold every fixed-string fragment in order;
+`cscb_ad_count <verb> [<fragment>...]` prints how many. The harness's calls,
+the stub's calls and any `stop` line never count.
+
 Matchers (E14 director decision 14). A matcher is one or more fixed-string
 fragments that must appear on one line in the given order, with anything
 between them; there is no regex. A plain string is a one-fragment matcher, so
@@ -473,8 +609,9 @@ for `<hold-s>` seconds the last-applied record keeps its inode and bytes, no
 new `reload-applied` line appears and `<command>` stays true, and the pending
 file still exists afterwards.
 
-Processes. `stop_server` forgets its daemon's PID once the daemon is gone,
-and `stop_tracked_pid <pid> [<timeout-s>] [<step>]` stops a tracked process,
+Processes. `stop_server` forgets its daemon's PID once the daemon is gone
+(in fmk mode the CSCB process record keeps it, with its window), and
+`stop_tracked_pid <pid> [<timeout-s>] [<step>]` stops a tracked process,
 fails unless it is gone in time, and forgets it. Before the trap signals any
 PID it checks the process is still the scenario's (a child of the script's
 shell, or a process whose environment holds this `SCENARIO_ROOT`), so a PID
@@ -506,7 +643,52 @@ The contract for a scenario:
   every harness agent-director call with `ad` or `ad_capture`, every store
   read or edit with `ad_store_id` or `ad_store_edit`, and every change to the
   install with the helpers above, followed by `reshim_ad` after any
-  `install.sh` run.
+  `install.sh` run; run every other CSCB CLI command or driver through
+  `cscb_run`; and follow Rules for every fmk scenario below.
+
+### Rules for every fmk scenario
+
+These hold for every fmk script (b.jg5 SRJ-1401):
+
+- It runs on the release candidate (binary, client, and `install.sh` with its
+  migration) unless it sets `SCENARIO_AD_START=0.10.0`, and at
+  agent-director's default settings, with no `config.toml`, unless it is
+  scenario 10 or 24, which write a `[tmux]` table.
+- It runs with both shims: `tmux-shim.sh` first on the PATH of its CSCB
+  processes, in `log` mode unless the scenario sets `fail-kill`,
+  `fail-create`, `slow-create` or `wedge` with `tmux_shim_mode`; and
+  `agent-director-shim.sh` in front of the agent-director binary.
+- It ends with `assert_no_server_tmux`, `assert_no_cscb_include_finished` and
+  `assert_no_cscb_delete`, whatever the shim's mode, and the trap fails a
+  script that skips them (see Closing assertions).
+- Where a scenario has a human act, the harness plays the human from the
+  scenario's own shell, never from a CSCB process: `ad` or `ad_capture` as a
+  plain command, in `$( … )` or in a pipeline, never through `timeout` or
+  another wrapper process (its parent would not be the shell). The harness,
+  never CSCB, seeds an `@ad_owner` label, renames a session or sets
+  `remain-on-exit`, and every seeded label or pane follows SRJ-1306's seeding
+  rules: each `@ad_owner` label ends with the scenario store's own store id
+  (`ad_store_id`) unless the step seeds another store's session, and every
+  seeded leftover carries `@ad_pane` on its worker's pane.
+- A check that counts or rules out CSCB's agent-director calls reads only the
+  shim log lines whose parent is a CSCB process (`cscb_ad_calls`,
+  `cscb_ad_count`). The stub worker's own calls, any `stop` line (the kind
+  the line format reserves for `stub-claude.sh`) and the harness's calls are
+  not CSCB's.
+- A latched persona's row is marked `missing` by a `find-missing` loop the
+  harness runs, because CSCB makes no extra calls for a latched persona. For
+  an unlatched persona, CSCB's own pending-row runs mark it, and the harness
+  runs no `find-missing` for it.
+- A check that no row was deleted reads the row afterwards: it is present, in
+  any state.
+- CSCB's timings are shortened only through its configuration
+  (`health_check_interval`, `session_restart_delay`) and the package's
+  exported seams, never by editing `src/`. agent-director's are changed only
+  through the `[tmux]` table of scenarios 10 and 24; every other scenario
+  waits out agent-director's default windows.
+- Posts are read from the Slack stub's record (`slack-stub-server.ts
+  --record`).
+- Shim logs are read by parent process, as above, never by scraping a pane.
 
 ### Slack stub
 
@@ -575,7 +757,16 @@ stdout/stderr where `docker logs` can capture them — never into `verdict.txt`.
    `-fmk-`). Sourcing the helper then gives it its own HOME, agent-director
    install and store, tmux server and shim (see fmk mode under Scenario
    helper), on the release candidate. To start on agent-director 0.10.0, set
-   `SCENARIO_AD_START=0.10.0` on its own line before the source line.
+   `SCENARIO_AD_START=0.10.0` on its own line before the source line. It
+   follows Rules for every fmk scenario and ends with the three closing
+   assertions, in the script's own shell, before its PASS line:
+   ```bash
+   # ... start_server --live, cscb_run, ad / ad_capture as the human, assertions, stop_server ...
+   assert_no_server_tmux
+   assert_no_cscb_include_finished
+   assert_no_cscb_delete
+   echo "PASS: ${TEST_NAME}"
+   ```
 3. Make it executable. The runner picks it up by name and runs every
    `test-*.sh` through `bash`, so the mode bit is not what makes it run;
    don't edit `tests/runner.sh`.
@@ -586,7 +777,9 @@ stdout/stderr where `docker logs` can capture them — never into `verdict.txt`.
 ### What does NOT belong in a test script
 
 - Anything requiring LLM judgment ("did this response look reasonable").
-- Pane scraping, tmux capture, JSONL transcript parsing.
+- Pane scraping, tmux capture, JSONL transcript parsing. Whose call a shim
+  log line records is read from its parent process (the closing assertions,
+  `cscb_ad_calls`, `cscb_ad_count`), never from a pane.
 - Retries, fix-it-yourself logic, or self-healing. A test is a strict assertion.
 
 ### Escape hatch: tests that genuinely need LLM judgment

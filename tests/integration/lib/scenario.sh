@@ -47,10 +47,11 @@
 #   them from the tag (for example "${SCENARIO_TAG}_alpha");
 # - installs an EXIT trap that stops every server the scenario started, kills
 #   every process it registered with `track_pid`, in fmk mode stops the
-#   scenario's tmux server, runs the `on_exit` hooks, prints the tail of each
-#   state dir's server.log when the script failed, and removes SCENARIO_ROOT.
-#   The trap signals only a process that is still the scenario's own (see
-#   "PIDs" below).
+#   scenario's tmux server and runs the closing enforcement (see "Closing
+#   assertions"), runs the `on_exit` hooks, prints the tail of each state
+#   dir's server.log when the script failed, and removes SCENARIO_ROOT. The
+#   trap signals only a process that is still the scenario's own (see "PIDs"
+#   below).
 #
 # fmk mode. Sourcing also:
 # - exports HOME as SCENARIO_HOME, `$SCENARIO_ROOT/home`, so no step reads or
@@ -72,12 +73,55 @@
 #   before sourcing, agent-director 0.10.0's binary (`install_ad_010`), with
 #   no release-candidate install and no store yet (SCENARIO_AD_START is `rc`
 #   or `0.10.0`; a shared-mode script that sets it fails);
-# - writes no agent-director config.toml: agent-director's default settings.
+# - writes no agent-director config.toml: agent-director's default settings;
+# - installs the tmux shim (fixtures/tmux-shim.sh) for the scenario's CSCB
+#   processes, in `log` mode, and starts the CSCB process record (see "CSCB
+#   processes and the tmux shim").
 # Keep HOME, TMUX_TMPDIR and PATH as sourcing set them. Sourcing also sets
 # SCENARIO_REAL_TMUX (the real tmux, resolved before PATH changed; the trap
 # stops the scenario's tmux server with it), SCENARIO_AD_BIN (the standard
 # path, which holds the shim) and SCENARIO_AD_SHIM_LOG (the shim's log; its
 # one line format is stated in the shim's header, and nowhere else).
+#
+# CSCB processes and the tmux shim (fmk mode). A CSCB process is the bot
+# server, or a CLI command or driver the scenario runs (b.jg5 SRJ-1401):
+# every `start` run (`run_start`, `start_server`), every `stop` run
+# (`stop_server` and the trap's), every bot server they leave, and every
+# command run through `cscb_run`. Each starts with the tmux shim's bin
+# directory first on its PATH; agent-director inherits that PATH (the client
+# passes its caller's whole environment), so every tmux call agent-director
+# makes for CSCB reaches the shim. The scenario's own shell keeps the real
+# tmux and never has the shim on its PATH: the harness plays the human there,
+# so its agent-director calls and their tmux calls are never CSCB's.
+# - The shim lives at SCENARIO_TMUX_SHIM_BIN/tmux (SCENARIO_TMUX_SHIM_BIN is
+#   `$SCENARIO_ROOT/tmux-shim/bin`), with its real tmux, its mode file
+#   (SCENARIO_TMUX_SHIM_MODE_FILE) and its log (SCENARIO_TMUX_SHIM_LOG) in
+#   the directory above (SCENARIO_TMUX_SHIM_DIR). Its modes, mode file and
+#   line format (the agent-director shim's) are stated in its header.
+# - The record (SCENARIO_CSCB_RECORD, `$SCENARIO_ROOT/cscb-processes`) never
+#   drops a process. One line per entry, TAB-separated:
+#     proc TAB <role> TAB <pid> TAB <starttime> TAB <from> TAB <words>
+#     gone TAB <pid> TAB <starttime> TAB <time>
+#   <role> is `start`, `stop`, `server` or `run`; <starttime> the process's
+#   start time in clock ticks since boot (/proc/<pid>/stat field 22, which
+#   no later process given the same PID shares; `-` when unknown); <from>
+#   and <time> are in the logs' layout (seconds, six decimals); <words> the
+#   command, `printf %q`-quoted. A run records itself, in the subshell that
+#   then execs the command (so the PID is the command's own), before the
+#   command starts; <from> is then. A bot server is recorded once the harness
+#   sees its PID in a state dir's server.pid (after every CSCB run, in
+#   `start_server`, before every read of the record and in the trap); <from>
+#   is its start time from /proc (never later than the true one). A `gone`
+#   entry is added, with the time then, once the harness sees the process
+#   ended (after each run, after `stop_server`, before every read and in the
+#   trap). A log line's parent is a recorded process only when its PPID is
+#   the entry's PID and its time lies in the entry's window, from <from> to
+#   the earliest `gone` time (open while it runs), so a PID the system gives
+#   to another process later never matches. A bot server that exits before
+#   it writes its PID file (a start the server refuses) is not recorded.
+# - SCENARIO_SHELL_CMDLINE is the script's own command line (/proc/$$/cmdline),
+#   quoted as the shims quote a parent's: the parent field of every call the
+#   scenario's shell or a subshell of it makes.
 #
 # Guards. Every helper below that runs agent-director, installs, moves or
 # swaps an agent-director binary or the shim, or reads or edits the store
@@ -116,8 +160,9 @@
 #   Server
 #   run_start [--live]                 run `start`; set START_RC and START_OUT; never fails
 #   start_server [--live]              run `start`, fail unless it exits 0 and the daemon is running; set SERVER_PID
-#   stop_server [--stop-bots]          run `stop` (under `timeout 90`) for $SLACK_STATE_DIR (output in
-#                                      STOP_OUT); fail unless its daemon is gone, then forget its PID
+#   stop_server [--stop-bots]          run `stop` (bounded at 90 s; 124 when it is not done by then) for
+#                                      $SLACK_STATE_DIR (output in STOP_OUT); fail unless its daemon is
+#                                      gone, then forget its PID
 #   server_pid                         print the PID in $SLACK_STATE_DIR/server.pid (empty when none)
 #   pid_alive <pid>                    true when <pid> is a live process (a zombie counts as gone)
 #   port_listening <port>              true when an HTTP server answers on 127.0.0.1:<port>
@@ -224,6 +269,53 @@
 #                                      key store_id); fail, saying why, unless it is 16 lowercase hex
 #                                      characters (a 0.10.0 store has none)
 #
+#   CSCB processes and the tmux shim (see "CSCB processes and the tmux shim")
+#   cscb_run <command> [<arg>...]      run <command> as a CSCB process (a CLI command of the package
+#                                      under test or another, such as scenario 1's pre-persona CLI, or
+#                                      a driver): recorded (role `run`), the tmux shim first on its
+#                                      PATH; standard input, output and error pass through; return its
+#                                      status. <command> is a program (not a function) and is itself
+#                                      the CSCB process: run it directly or through `env`, never
+#                                      through `timeout`, `bash -c` or another process that would
+#                                      stay its parent. Registers SLACK_STATE_DIR (when under
+#                                      SCENARIO_ROOT), so the trap stops a server it leaves there.
+#                                      Works in shared mode too (no shim, no record)
+#   tmux_shim_mode <mode> [<delay-s>]  set the tmux shim's mode (log, fail-kill, fail-create,
+#                                      slow-create, wedge; `log` from setup on), and for slow-create
+#                                      or wedge its delay in seconds (the shim's defaults: 15, 60),
+#                                      by an atomic write of the mode file; the next call reads it
+#
+#   Closing assertions and CSCB's agent-director calls (fmk mode; see "Closing assertions").
+#   Each reads SCENARIO_TMUX_SHIM_LOG, SCENARIO_AD_SHIM_LOG and SCENARIO_CSCB_RECORD (a
+#   subshell may point them at other files), takes only `call` lines (never a stub's `stop`
+#   line), fails on a line not in the shims' format, and on failure prints each offending
+#   line indented, then fails naming itself, how many lines and their numbers.
+#   assert_no_server_tmux              fail on any tmux shim log line whose parent is a bot server
+#                                      the scenario started; positive control: fail unless some line's
+#                                      parent is an agent-director process that a CSCB process ran
+#                                      (its PID that of an agent-director shim `call` line whose own
+#                                      parent is a CSCB process, the latest such line at or before it,
+#                                      and its argv[0] agent-director)
+#   assert_no_cscb_include_finished    fail on any `kill` invocation carrying --include-finished
+#                                      (`-` or `--`, with or without `=<value>`) whose parent is not the
+#                                      scenario's own shell or a subshell of it (a command
+#                                      substitution or pipeline element included): a parent whose
+#                                      command line is the script's own (SCENARIO_SHELL_CMDLINE, quoted
+#                                      as the shims quote it) and that no CSCB process held; positive
+#                                      control: fail unless some invocation's parent is a bot server
+#                                      the scenario started (its version probe)
+#   assert_no_cscb_delete              fail on any `delete` invocation whose parent is a CSCB process
+#   cscb_ad_calls <verb> [<fragment>...]
+#                                      print the agent-director shim's `call` lines whose parent is a
+#                                      CSCB process, whose verb is <verb> (any verb when <verb> is
+#                                      empty) and whose arguments, joined by single spaces, hold every
+#                                      fixed-string <fragment> in order. The verb is the first word
+#                                      after agent-director's global flags (--store-path, --home,
+#                                      --tmux-command, taken from anywhere in the argv); the harness's
+#                                      calls, the stub's lines and its stop line never count
+#   cscb_ad_count <verb> [<fragment>...]
+#                                      print how many lines `cscb_ad_calls` would print
+#
 # Line builders (every fragment is quoted from src/; <ref> is `persona_ref`):
 #   persona_start_match   `[slack] persona-start: personas[<index>] <ref>`
 #                         (src/persona-bringup-controller.ts bringUp, format
@@ -255,10 +347,25 @@
 # `wait_for_count` for one more after it.
 #
 # PIDs: `stop_server` forgets its daemon's PID once the daemon is gone, and
-# `stop_tracked_pid` forgets a tracked PID once it is gone. Before the trap
-# stops or kills any PID it confirms the process is still the scenario's: a
-# child of this shell, or a process whose environment holds this scenario's
+# `stop_tracked_pid` forgets a tracked PID once it is gone (the CSCB process
+# record keeps every CSCB process, with its window). Before the trap stops or
+# kills any PID it confirms the process is still the scenario's: a child of
+# this shell, or a process whose environment holds this scenario's
 # SCENARIO_ROOT. A PID the system reused for another process is left alone.
+#
+# Closing assertions (fmk mode; b.jg5 SRJ-1401, SRJ-1418). Every fmk script
+# ends with `assert_no_server_tmux`, `assert_no_cscb_include_finished` and
+# `assert_no_cscb_delete`, in its own shell, whatever the tmux shim's mode.
+# The trap enforces it, after it has set the shim back to `log` and stopped
+# every server (its `stop` runs are CSCB processes, logged like any other):
+# - a script that exits 0 without all three having passed in its own shell
+#   over the scenario's own logs and record fails;
+# - when all three passed, the trap runs them again over the whole logs, so a
+#   violating line written after them (while the trap stopped a server, for
+#   example) fails the run, its FAIL line saying it came after the closing
+#   assertions.
+# Shared-mode scripts (test-5 to test-12) have no closing assertions, no tmux
+# shim and no record.
 #
 # Exit hooks: `on_exit <function>` registers extra cleanup (removing files
 # outside SCENARIO_ROOT, for example). The trap runs the hooks in registration
@@ -332,6 +439,15 @@ SCENARIO_AD_SHIM_MARKER='# CSCB_CI_AGENT_DIRECTOR_SHIM_MARKER'
 # processes exiting after it, in seconds.
 SCENARIO_TMUX_STOP_S=10
 
+# The tmux shim, the whole line that marks it, and its modes
+# (fixtures/tmux-shim.sh states what each does).
+SCENARIO_TMUX_SHIM_SRC="${SCENARIO_FIXTURES}/tmux-shim.sh"
+SCENARIO_TMUX_SHIM_MARKER='# CSCB_CI_TMUX_SHIM_MARKER'
+SCENARIO_TMUX_SHIM_MODES=(log fail-kill fail-create slow-create wedge)
+
+# The closing assertions every fmk script ends with.
+SCENARIO_CLOSING_ASSERTIONS=(assert_no_server_tmux assert_no_cscb_include_finished assert_no_cscb_delete)
+
 # fmk mode: 1 when TEST_NAME carries `-fmk-` (set on source).
 SCENARIO_FMK=0
 
@@ -344,6 +460,7 @@ _SCENARIO_STATE_COUNT=0
 _SCENARIO_START_COUNT=0
 _SCENARIO_INSTALL_COUNT=0 # install.sh runs
 _SCENARIO_AD_COUNT=0      # ad_capture calls
+_SCENARIO_CLOSED=()       # closing assertions that passed in the script's own shell
 
 fail() {
     echo "FAIL: ${TEST_NAME}: $1" >&2
@@ -459,7 +576,8 @@ on_exit() {
 
 # Stop the daemon of one state dir, if its PID file names a live process
 # that is still the scenario's: the CLI `stop` first (with --stop-bots once a
-# live start ran), bounded, then SIGKILL. Never fails.
+# live start ran), bounded, as a CSCB process (`_scenario_cscb_bounded`),
+# then SIGKILL. Never fails.
 _scenario_stop_dir() {
     local dir="$1" pid
     [[ -f "${dir}/server.pid" ]] || return 0
@@ -468,9 +586,71 @@ _scenario_stop_dir() {
     _scenario_pid_ours "${pid}" || return 0
     local args=(stop)
     [[ "${_SCENARIO_LIVE}" == 1 ]] && args+=(--stop-bots)
-    SLACK_STATE_DIR="${dir}" timeout "${SCENARIO_STOP_CLI_S}" "${SCENARIO_CLI}" "${args[@]}" > /dev/null 2>&1 || true
+    local -x SLACK_STATE_DIR="${dir}"
+    _scenario_cscb_bounded "${SCENARIO_STOP_CLI_S}" /dev/null stop "${SCENARIO_CLI}" "${args[@]}"
     _scenario_pid_ours "${pid}" && kill -KILL "${pid}" 2>/dev/null
     return 0
+}
+
+# The trap's stop of every recorded bot server still running and still the
+# scenario's (a daemon a `cscb_run` left in a state dir no start ran in, for
+# example): SIGTERM, then SIGKILL after 5 s. Never fails.
+_scenario_stop_recorded_servers() {
+    local lines=() line kind role pid st
+    [[ -f "${_SCENARIO_REAL_CSCB_RECORD:-}" ]] || return 0
+    mapfile -t lines < "${_SCENARIO_REAL_CSCB_RECORD}"
+    for line in ${lines[@]+"${lines[@]}"}; do
+        IFS=$'\t' read -r kind role pid st _ <<< "${line}"
+        [[ "${kind}" == proc && "${role}" == server ]] || continue
+        [[ "$(_scenario_proc_starttime "${pid}")" == "${st}" ]] || continue
+        _scenario_pid_ours "${pid}" || continue
+        kill -TERM "${pid}" 2> /dev/null
+        _scenario_poll_until 5 _scenario_pid_gone "${pid}" \
+            || { _scenario_pid_ours "${pid}" && kill -KILL "${pid}" 2> /dev/null; }
+    done
+    return 0
+}
+
+# The trap's closing enforcement (fmk mode). Prints the FAIL line (or, when
+# the run already failed, an indented note) and returns 1 when the script
+# exited 0 without every closing assertion having passed in its own shell, or
+# when a closing assertion, run again over the logs after the trap stopped
+# every server, now fails. <rc> is the run's status so far.
+_scenario_closing_check() {
+    local rc="$1" missing=() name out recheck_rc=0 line list all
+    for name in "${SCENARIO_CLOSING_ASSERTIONS[@]}"; do
+        _scenario_closing_passed "${name}" || missing+=("${name}")
+    done
+    if (( ${#missing[@]} > 0 )); then
+        (( rc == 0 )) || return 0
+        printf -v list '%s, ' "${missing[@]}"
+        printf -v all '%s, ' "${SCENARIO_CLOSING_ASSERTIONS[@]}"
+        echo "FAIL: ${TEST_NAME}: the script exited 0 without the closing assertions (${list%, }: not passed in its own shell); every fmk script ends with ${all%, }" >&2
+        return 1
+    fi
+    out="$( (set -e; _scenario_closing_recheck) 2>&1 )" || recheck_rc=$?
+    (( recheck_rc == 0 )) && return 0
+    line="$(grep -m1 '^FAIL:' <<< "${out}" || true)"
+    line="${line#"FAIL: ${TEST_NAME}: "}"
+    # Indented, so no line of it can pass for the runner's FAIL line.
+    grep -v '^FAIL:' <<< "${out}" | sed 's/^/  | /' >&2
+    if (( rc == 0 )); then
+        echo "FAIL: ${TEST_NAME}: after the closing assertions: ${line:-their re-check exited ${recheck_rc}}" >&2
+    else
+        echo "  | after the closing assertions, also: ${line:-their re-check exited ${recheck_rc}}" >&2
+    fi
+    return 1
+}
+
+# The closing assertions again, over the scenario's own logs and record.
+_scenario_closing_recheck() {
+    SCENARIO_TMUX_SHIM_LOG="${_SCENARIO_REAL_TMUX_SHIM_LOG}"
+    SCENARIO_AD_SHIM_LOG="${_SCENARIO_REAL_AD_SHIM_LOG}"
+    SCENARIO_CSCB_RECORD="${_SCENARIO_REAL_CSCB_RECORD}"
+    local name
+    for name in "${SCENARIO_CLOSING_ASSERTIONS[@]}"; do
+        "${name}"
+    done
 }
 
 # Print the PID of every live process of the real tmux binary that is still
@@ -511,6 +691,11 @@ _scenario_cleanup() {
     local rc=$? dir pid hook hook_rc
     set +e
     trap - EXIT
+    if [[ "${SCENARIO_FMK}" == 1 ]]; then
+        # The stops below run in `log` mode, whatever mode the script left.
+        _scenario_tmux_shim_reset
+        _scenario_cscb_after
+    fi
     for dir in ${_SCENARIO_STATE_DIRS[@]+"${_SCENARIO_STATE_DIRS[@]}"}; do
         _scenario_stop_dir "${dir}"
     done
@@ -522,6 +707,10 @@ _scenario_cleanup() {
                 || { _scenario_pid_ours "${pid}" && kill -KILL "${pid}" 2>/dev/null; }
         fi
     done
+    if [[ "${SCENARIO_FMK}" == 1 ]]; then
+        _scenario_stop_recorded_servers
+        _scenario_cscb_after
+    fi
     if [[ "${SCENARIO_FMK}" == 1 ]] && ! _scenario_stop_tmux; then
         if [[ "${rc}" -eq 0 ]]; then
             echo "FAIL: ${TEST_NAME}: the scenario's tmux server outlived the trap's kill-server and SIGKILL" >&2
@@ -529,6 +718,9 @@ _scenario_cleanup() {
         else
             echo "  | the scenario's tmux server also outlived the trap's kill-server and SIGKILL" >&2
         fi
+    fi
+    if [[ "${SCENARIO_FMK}" == 1 ]] && ! _scenario_closing_check "${rc}"; then
+        rc=1
     fi
     for hook in ${_SCENARIO_EXIT_HOOKS[@]+"${_SCENARIO_EXIT_HOOKS[@]}"}; do
         ( "${hook}" )
@@ -899,7 +1091,7 @@ run_start() {
         env_args+=(SLACK_DRY_RUN=1)
     fi
     set +e
-    (cd "${SCENARIO_REPO}" && env "${env_args[@]}" "${SCENARIO_CLI}" start) > "${START_OUT}" 2>&1
+    (cd "${SCENARIO_REPO}" && _scenario_cscb_exec start env "${env_args[@]}" "${SCENARIO_CLI}" start) > "${START_OUT}" 2>&1
     START_RC=$?
     set -e
     local pid
@@ -907,6 +1099,7 @@ run_start() {
     if [[ -n "${pid}" ]]; then
         _scenario_add _SCENARIO_SERVER_PIDS "${pid}"
     fi
+    _scenario_cscb_after || fail "run_start: could not update the CSCB process record"
     return 0
 }
 
@@ -928,6 +1121,7 @@ start_server() {
     # not recognise would outlive the script.
     _scenario_pid_ours "${SERVER_PID}" \
         || fail "daemon PID ${SERVER_PID} does not carry this scenario's SCENARIO_ROOT"
+    _scenario_cscb_after || fail "start_server: could not update the CSCB process record"
 }
 
 stop_server() {
@@ -943,10 +1137,9 @@ stop_server() {
     STOP_OUT="${SCENARIO_ROOT}/stop.out"
     pid="$(server_pid)"
     [[ -n "${pid}" ]] || fail "stop: no server.pid in ${SLACK_STATE_DIR}"
-    set +e
-    timeout "${SCENARIO_STOP_CLI_S}" "${SCENARIO_CLI}" "${args[@]}" > "${STOP_OUT}" 2>&1
-    rc=$?
-    set -e
+    _scenario_cscb_after || fail "stop_server: could not update the CSCB process record"
+    _scenario_cscb_bounded "${SCENARIO_STOP_CLI_S}" "${STOP_OUT}" stop "${SCENARIO_CLI}" "${args[@]}"
+    rc="${_SCENARIO_BOUNDED_RC}"
     if [[ "${rc}" -ne 0 ]]; then
         cat "${STOP_OUT}" >&2
         if [[ "${rc}" -eq 124 ]]; then
@@ -957,7 +1150,204 @@ stop_server() {
     _scenario_poll_until "${SCENARIO_STOP_WAIT_S}" _scenario_pid_gone "${pid}" \
         || fail "server PID ${pid} still running ${SCENARIO_STOP_WAIT_S}s after ${args[*]}"
     # Gone: the trap must never signal this PID, which the system may reuse.
+    # The CSCB process record keeps it, with the time it was seen gone.
     _scenario_drop _SCENARIO_SERVER_PIDS "${pid}"
+    _scenario_cscb_after || fail "stop_server: could not update the CSCB process record"
+}
+
+# ---------------------------------------------------------------------------
+# CSCB processes: the tmux shim on their PATH, and their record (fmk mode)
+# ---------------------------------------------------------------------------
+
+# Print the start time of <pid> (field 22 of /proc/<pid>/stat, clock ticks
+# since boot; it survives exec and differs for any later process given the
+# same PID); nothing when there is no such process.
+_scenario_proc_starttime() {
+    local stat rest fields=()
+    { read -r stat < "/proc/$1/stat"; } 2> /dev/null || return 0
+    # The fields after the parenthesised command name start at field 3.
+    rest="${stat##*) }"
+    read -r -a fields <<< "${rest}"
+    [[ "${fields[19]:-}" =~ ^[0-9]+$ ]] && printf '%s\n' "${fields[19]}"
+    return 0
+}
+
+# Print the wall-clock time a process with start time <ticks> started, in
+# the log lines' layout (seconds, six decimals), rounded down: /proc/stat's
+# btime is whole seconds, so this is never later than the true start.
+_scenario_start_epoch() {
+    local us=$(( _SCENARIO_BTIME * 1000000 + $1 * 1000000 / _SCENARIO_CLK_TCK ))
+    printf '%d.%06d\n' $(( us / 1000000 )) $(( us % 1000000 ))
+}
+
+# Append one line to the CSCB process record, under its lock.
+_scenario_record_append() {
+    { flock -x 9 && printf '%s\n' "$1" >&9; } 9>> "${_SCENARIO_REAL_CSCB_RECORD}"
+}
+
+# _scenario_record_proc <role> <pid> <starttime> <from> [<word>...]: record
+# one CSCB process.
+_scenario_record_proc() {
+    local role="$1" pid="$2" st="$3" from="$4" words="" line
+    shift 4
+    if (( $# > 0 )); then
+        printf -v words '%q ' "$@"
+        words="${words% }"
+    fi
+    printf -v line 'proc\t%s\t%s\t%s\t%s\t%s' "${role}" "${pid}" "${st}" "${from}" "${words}"
+    _scenario_record_append "${line}"
+}
+
+# True when the record holds a <role> entry for <pid> with <starttime>.
+_scenario_record_has() {
+    local needle
+    printf -v needle 'proc\t%s\t%s\t%s\t' "$1" "$2" "$3"
+    grep -qF -- "${needle}" "${_SCENARIO_REAL_CSCB_RECORD}" 2> /dev/null
+}
+
+# _scenario_cscb_exec <role> <command> [<arg>...]: become a CSCB process. Run
+# only in a subshell of its own, `( _scenario_cscb_exec … )`, which it
+# replaces: in fmk mode it records the subshell (its PID, start time, and the
+# time now) under <role>, puts the tmux shim's bin directory first on PATH
+# and execs <command>, which keeps that PID; in shared mode it only execs.
+# <command> must be a program (not a function), and is itself the CSCB
+# process: run it directly, or through `env`, which execs it in turn.
+_scenario_cscb_exec() {
+    local role="$1"
+    shift
+    if [[ "${SCENARIO_FMK}" == 1 ]]; then
+        local me="${BASHPID}" st
+        st="$(_scenario_proc_starttime "${me}")"
+        if ! _scenario_record_proc "${role}" "${me}" "${st:--}" "${EPOCHREALTIME/,/.}" "$@"; then
+            echo "FAIL: ${TEST_NAME}: could not record the ${role} run in ${_SCENARIO_REAL_CSCB_RECORD}; it did not run" >&2
+            exit 70
+        fi
+        PATH="${SCENARIO_TMUX_SHIM_BIN}:${PATH}"
+        export PATH
+    fi
+    exec "$@"
+}
+
+# Record every bot server a state dir's server.pid names (the registered
+# dirs and SLACK_STATE_DIR) that is live, still the scenario's and not yet
+# recorded, as role `server`, from its own start time. False when the record
+# cannot be written.
+_scenario_note_servers() {
+    [[ "${SCENARIO_FMK}" == 1 && -n "${_SCENARIO_REAL_CSCB_RECORD:-}" ]] || return 0
+    local dirs=(${_SCENARIO_STATE_DIRS[@]+"${_SCENARIO_STATE_DIRS[@]}"}) dir pid st argv=()
+    [[ -n "${SLACK_STATE_DIR:-}" ]] && dirs+=("${SLACK_STATE_DIR}")
+    for dir in ${dirs[@]+"${dirs[@]}"}; do
+        [[ -f "${dir}/server.pid" ]] || continue
+        pid="$(tr -d '[:space:]' < "${dir}/server.pid" 2> /dev/null || true)"
+        [[ "${pid}" =~ ^[0-9]+$ ]] || continue
+        _scenario_pid_ours "${pid}" || continue
+        st="$(_scenario_proc_starttime "${pid}")"
+        [[ -n "${st}" ]] || continue
+        _scenario_record_has server "${pid}" "${st}" && continue
+        argv=()
+        mapfile -d '' -t argv 2> /dev/null < "/proc/${pid}/cmdline" || true
+        _scenario_record_proc server "${pid}" "${st}" "$(_scenario_start_epoch "${st}")" \
+            ${argv[@]+"${argv[@]}"} || return 1
+    done
+    return 0
+}
+
+# For every recorded process with no `gone` entry that is no longer running
+# as the same process (gone, or its PID now another process's), append one
+# with the time now. False when the record cannot be written.
+_scenario_record_sweep() {
+    [[ "${SCENARIO_FMK}" == 1 && -f "${_SCENARIO_REAL_CSCB_RECORD:-}" ]] || return 0
+    local lines=() line kind a b c key pid st
+    local -A open=() gone=()
+    mapfile -t lines < "${_SCENARIO_REAL_CSCB_RECORD}"
+    for line in ${lines[@]+"${lines[@]}"}; do
+        IFS=$'\t' read -r kind a b c _ <<< "${line}"
+        case "${kind}" in
+            proc) open["${b}:${c}"]=1 ;;
+            gone) gone["${a}:${b}"]=1 ;;
+        esac
+    done
+    for key in "${!open[@]}"; do
+        [[ -z "${gone[${key}]:-}" ]] || continue
+        pid="${key%%:*}"
+        st="${key#*:}"
+        if [[ "${st}" == - || "$(_scenario_proc_starttime "${pid}")" != "${st}" ]]; then
+            printf -v line 'gone\t%s\t%s\t%s' "${pid}" "${st}" "${EPOCHREALTIME/,/.}"
+            _scenario_record_append "${line}" || return 1
+        fi
+    done
+    return 0
+}
+
+# After any CSCB run, and before any read of the record: note new bot
+# servers, then close the entries of processes that ended.
+_scenario_cscb_after() {
+    _scenario_note_servers && _scenario_record_sweep
+}
+
+# _scenario_cscb_bounded <timeout-s> <out-file> <role> <command> [<arg>...]:
+# run <command> as a CSCB process (`_scenario_cscb_exec`), standard input
+# from /dev/null and output to <out-file>; SIGTERM it after <timeout-s>, and
+# SIGKILL 5 s later. Sets _SCENARIO_BOUNDED_RC (124 when it timed out, as
+# `timeout` does). In shared mode it runs `timeout <timeout-s> <command>`, as
+# the helpers always did. Never fails.
+_scenario_cscb_bounded() {
+    local timeout_s="$1" out="$2" role="$3" pid
+    shift 3
+    _SCENARIO_BOUNDED_RC=0
+    if [[ "${SCENARIO_FMK}" != 1 ]]; then
+        timeout "${timeout_s}" "$@" > "${out}" 2>&1 || _SCENARIO_BOUNDED_RC=$?
+        return 0
+    fi
+    # `timeout` would itself be the process the record holds, not the CSCB
+    # command, so the bound is kept here.
+    ( _scenario_cscb_exec "${role}" "$@" ) < /dev/null > "${out}" 2>&1 &
+    pid=$!
+    if _scenario_poll_until "${timeout_s}" _scenario_pid_gone "${pid}"; then
+        wait "${pid}" || _SCENARIO_BOUNDED_RC=$?
+    else
+        kill -TERM "${pid}" 2> /dev/null || true
+        _scenario_poll_until 5 _scenario_pid_gone "${pid}" || kill -KILL "${pid}" 2> /dev/null || true
+        wait "${pid}" 2> /dev/null || true
+        _SCENARIO_BOUNDED_RC=124
+    fi
+    return 0
+}
+
+cscb_run() {
+    (( $# > 0 )) || fail "cscb_run: no command given"
+    local rc=0
+    # The trap stops a daemon the command leaves in this state dir.
+    if [[ -n "${SLACK_STATE_DIR:-}" && "${SLACK_STATE_DIR}" == "${SCENARIO_ROOT}"/* ]]; then
+        _scenario_register_state_dir "${SLACK_STATE_DIR}"
+    fi
+    ( _scenario_cscb_exec run "$@" ) || rc=$?
+    _scenario_cscb_after || fail "cscb_run: could not update the CSCB process record"
+    return "${rc}"
+}
+
+tmux_shim_mode() {
+    local mode="${1:-}" delay="${2:-}" m known=0
+    [[ "${SCENARIO_FMK}" == 1 ]] || fail "tmux_shim_mode: the tmux shim is for fmk scripts only"
+    for m in "${SCENARIO_TMUX_SHIM_MODES[@]}"; do
+        [[ "${m}" == "${mode}" ]] && known=1
+    done
+    (( known )) || fail "tmux_shim_mode: unknown mode '${mode}' (${SCENARIO_TMUX_SHIM_MODES[*]})"
+    if [[ -n "${delay}" ]]; then
+        [[ "${mode}" == slow-create || "${mode}" == wedge ]] \
+            || fail "tmux_shim_mode: mode ${mode} takes no delay"
+        [[ "${delay}" =~ ^[0-9]+(\.[0-9]+)?$ ]] \
+            || fail "tmux_shim_mode: delay '${delay}' is not a number of seconds"
+    fi
+    write_file "${SCENARIO_TMUX_SHIM_MODE_FILE}" <<< "${mode}${delay:+ ${delay}}"
+}
+
+# The trap's reset of the tmux shim to `log`. Never fails.
+_scenario_tmux_shim_reset() {
+    local file="${SCENARIO_TMUX_SHIM_MODE_FILE:-}"
+    [[ -n "${file}" && -d "${file%/*}" ]] || return 0
+    { printf 'log\n' > "${file}.trap" && mv -f -- "${file}.trap" "${file}"; } 2> /dev/null
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -1327,6 +1717,333 @@ ad_store_id() {
 }
 
 # ---------------------------------------------------------------------------
+# Reading the shim logs against the CSCB process record (fmk mode)
+# ---------------------------------------------------------------------------
+
+# _scenario_to_us <time>: set _SCENARIO_US to <time> (seconds with exactly six
+# decimals) in whole microseconds; false for any other text.
+_scenario_to_us() {
+    [[ "$1" =~ ^([0-9]+)\.([0-9]{6})$ ]] || return 1
+    _SCENARIO_US=$(( 10#${BASH_REMATCH[1]} * 1000000 + 10#${BASH_REMATCH[2]} ))
+}
+
+# _scenario_record_load <record>: load <record> into _SR_ROLE, _SR_FROM and
+# _SR_UNTIL (microseconds; _SR_UNTIL empty while the process runs), one
+# element per `proc` entry, and _SR_BY_PID (PID -> its entries' indices).
+# An entry's window runs from its `from` time to the earliest `gone` time of
+# the same PID and start time.
+_scenario_record_load() {
+    local file="$1" lines=() line kind a b c d key i=0
+    local -A gone=()
+    _SR_ROLE=()
+    _SR_FROM=()
+    _SR_UNTIL=()
+    declare -gA _SR_BY_PID=()
+    [[ -f "${file}" ]] || return 0
+    mapfile -t lines < "${file}"
+    for line in ${lines[@]+"${lines[@]}"}; do
+        IFS=$'\t' read -r kind a b c _ <<< "${line}"
+        [[ "${kind}" == gone ]] && _scenario_to_us "${c}" || continue
+        key="${a}:${b}"
+        if [[ -z "${gone[${key}]:-}" ]] || (( _SCENARIO_US < gone[${key}] )); then
+            gone["${key}"]="${_SCENARIO_US}"
+        fi
+    done
+    for line in ${lines[@]+"${lines[@]}"}; do
+        IFS=$'\t' read -r kind a b c d _ <<< "${line}"
+        [[ "${kind}" == proc && "${b}" =~ ^[0-9]+$ ]] && _scenario_to_us "${d}" || continue
+        _SR_ROLE[i]="${a}"
+        _SR_FROM[i]="${_SCENARIO_US}"
+        _SR_UNTIL[i]="${gone[${b}:${c}]:-}"
+        _SR_BY_PID["${b}"]+=" ${i}"
+        i=$(( i + 1 ))
+    done
+}
+
+# _scenario_role_at <pid> <us>: set _SCENARIO_ROLE to the role of the
+# recorded CSCB process that held <pid> at <us> (`server` first); false, and
+# empty, when none did. A PID matches only inside its entry's window, so a
+# later process given the same PID never matches.
+_scenario_role_at() {
+    local pid="$1" us="$2" i
+    _SCENARIO_ROLE=""
+    for i in ${_SR_BY_PID[${pid}]:-}; do
+        (( us >= _SR_FROM[i] )) || continue
+        [[ -z "${_SR_UNTIL[i]}" ]] || (( us <= _SR_UNTIL[i] )) || continue
+        _SCENARIO_ROLE="${_SR_ROLE[i]}"
+        [[ "${_SCENARIO_ROLE}" == server ]] && return 0
+    done
+    [[ -n "${_SCENARIO_ROLE}" ]]
+}
+
+# _scenario_split_line <line>: split a shim log line into _L_KIND, _L_US
+# (its time in microseconds), _L_PID, _L_PPID, _L_PARENT and _L_RAW_WORDS
+# (the quoted fields); false unless it has the format's six fields with a
+# time, PID and PPID of the format's shape.
+_scenario_split_line() {
+    local rest="$1" f=()
+    while [[ "${rest}" == *$'\t'* ]]; do
+        f+=("${rest%%$'\t'*}")
+        rest="${rest#*$'\t'}"
+    done
+    f+=("${rest}")
+    (( ${#f[@]} == 6 )) || return 1
+    [[ "${f[2]}" =~ ^[0-9]+$ && "${f[3]}" =~ ^[0-9]+$ ]] || return 1
+    _scenario_to_us "${f[1]}" || return 1
+    _L_KIND="${f[0]}"
+    _L_US="${_SCENARIO_US}"
+    _L_PID="${f[2]}"
+    _L_PPID="${f[3]}"
+    _L_PARENT="${f[4]}"
+    _L_RAW_WORDS="${f[5]}"
+}
+
+# _scenario_eval_words <array-name> <field>: set the array to the words a
+# quoted field gives back, as the shims' headers say (`eval`); false, the
+# array empty, when the field does not parse. The field is parsed first in a
+# subshell of its own: a parse error in `eval` ends the subshell it runs in,
+# so in the caller's own subshell (a command substitution, or the trap's
+# re-check) it would end that one with no FAIL line.
+_scenario_eval_words() {
+    local -n _scenario_eval_words_out="$1"
+    _scenario_eval_words_out=()
+    ( eval "_scenario_eval_words_probe=($2)" ) > /dev/null 2>&1 || return 1
+    eval "_scenario_eval_words_out=($2)" 2> /dev/null
+}
+
+# Decode _L_RAW_WORDS into _L_WORDS; false when the field does not decode.
+_scenario_decode_words() {
+    _scenario_eval_words _L_WORDS "${_L_RAW_WORDS}"
+}
+
+# Set _L_VERB and _L_ARGS from _L_WORDS: agent-director's global flags
+# (--store-path, --home, --tmux-command, each `--flag value` or
+# `--flag=value`, which agent-director takes from anywhere in its argv) are
+# dropped; the first word left is the verb, the rest its arguments.
+_scenario_ad_verb() {
+    local w skip=0 rest=()
+    for w in ${_L_WORDS[@]+"${_L_WORDS[@]}"}; do
+        if (( skip )); then
+            skip=0
+            continue
+        fi
+        case "${w}" in
+            --store-path | --home | --tmux-command) skip=1; continue ;;
+            --store-path=* | --home=* | --tmux-command=*) continue ;;
+        esac
+        rest+=("${w}")
+    done
+    _L_VERB="${rest[0]:-}"
+    _L_ARGS=("${rest[@]:1}")
+}
+
+# _scenario_read_log <step> <log> <array-name>: read <log>'s lines into the
+# array (none when the log is missing); fail, naming <step> and the line,
+# when a line is not in the shims' format.
+_scenario_read_log() {
+    local step="$1" log="$2" i
+    local -n _scenario_read_log_lines="$3"
+    _scenario_read_log_lines=()
+    [[ -f "${log}" ]] || return 0
+    mapfile -t _scenario_read_log_lines < "${log}"
+    for i in "${!_scenario_read_log_lines[@]}"; do
+        if ! _scenario_split_line "${_scenario_read_log_lines[i]}" \
+            || { [[ "${_L_KIND}" == call ]] && ! _scenario_decode_words; }; then
+            echo "  | ${log##*/}:$(( i + 1 )): ${_scenario_read_log_lines[i]}" >&2
+            fail "${step}: ${log} line $(( i + 1 )) is not in the shims' line format"
+        fi
+    done
+}
+
+# _scenario_query_prep <step>: refuse outside fmk mode; on the scenario's own
+# record, note new bot servers and close ended entries first; then load the
+# record in SCENARIO_CSCB_RECORD.
+_scenario_query_prep() {
+    [[ "${SCENARIO_FMK}" == 1 ]] || fail "$1: the shim logs and the CSCB process record are for fmk scripts only"
+    if [[ "${SCENARIO_CSCB_RECORD}" == "${_SCENARIO_REAL_CSCB_RECORD}" ]]; then
+        _scenario_cscb_after || fail "$1: could not update the CSCB process record"
+    fi
+    _scenario_record_load "${SCENARIO_CSCB_RECORD}"
+}
+
+# _scenario_offending <step> <log> <what> <line-number>...: print each
+# offending line of <log>, indented, then fail naming <step>, how many and
+# their line numbers.
+_scenario_offending() {
+    local step="$1" log="$2" what="$3" nr list=""
+    shift 3
+    for nr in "$@"; do
+        echo "  | ${log##*/}:${nr}: $(sed -n "${nr}p" "${log}")" >&2
+        list+="${list:+, }${nr}"
+    done
+    fail "${step}: $# ${log##*/} line(s) ${what} (line ${list})"
+}
+
+# Mark <name> as a closing assertion that passed, when it ran in the
+# script's own shell over the scenario's own logs and record.
+_scenario_closing_ran() {
+    [[ "${BASHPID}" == "$$" ]] || return 0
+    [[ "${SCENARIO_TMUX_SHIM_LOG}" == "${_SCENARIO_REAL_TMUX_SHIM_LOG}" \
+        && "${SCENARIO_AD_SHIM_LOG}" == "${_SCENARIO_REAL_AD_SHIM_LOG}" \
+        && "${SCENARIO_CSCB_RECORD}" == "${_SCENARIO_REAL_CSCB_RECORD}" ]] || return 0
+    _scenario_add _SCENARIO_CLOSED "$1"
+}
+
+_scenario_closing_passed() {
+    local name
+    for name in ${_SCENARIO_CLOSED[@]+"${_SCENARIO_CLOSED[@]}"}; do
+        [[ "${name}" == "$1" ]] && return 0
+    done
+    return 1
+}
+
+assert_no_server_tmux() {
+    local step=assert_no_server_tmux ad_lines=() tmux_lines=() bad=() i j best entry control=0 parent=()
+    # Each agent-director call line by its PID: "<us>:<1 when a CSCB process ran it, else 0>".
+    local -A ad_calls=()
+    _scenario_query_prep "${step}"
+    _scenario_read_log "${step}" "${SCENARIO_AD_SHIM_LOG}" ad_lines
+    _scenario_read_log "${step}" "${SCENARIO_TMUX_SHIM_LOG}" tmux_lines
+    for i in "${!ad_lines[@]}"; do
+        _scenario_split_line "${ad_lines[i]}"
+        [[ "${_L_KIND}" == call ]] || continue
+        if _scenario_role_at "${_L_PPID}" "${_L_US}"; then
+            ad_calls["${_L_PID}"]+=" ${_L_US}:1"
+        else
+            ad_calls["${_L_PID}"]+=" ${_L_US}:0"
+        fi
+    done
+    for i in "${!tmux_lines[@]}"; do
+        _scenario_split_line "${tmux_lines[i]}"
+        [[ "${_L_KIND}" == call ]] || continue
+        if _scenario_role_at "${_L_PPID}" "${_L_US}" && [[ "${_SCENARIO_ROLE}" == server ]]; then
+            bad+=("$(( i + 1 ))")
+            continue
+        fi
+        (( control )) && continue
+        # The positive control: the parent is the agent-director process of
+        # the latest call line with its PID at or before this line, that call
+        # was a CSCB process's, and the parent's argv[0] is agent-director.
+        best=""
+        for entry in ${ad_calls[${_L_PPID}]:-}; do
+            (( ${entry%:*} <= _L_US )) || continue
+            if [[ -z "${best}" ]] || (( ${entry%:*} >= ${best%:*} )); then
+                best="${entry}"
+            fi
+        done
+        [[ "${best}" == *:1 && "${_L_PARENT}" != '?' ]] || continue
+        _scenario_eval_words parent "${_L_PARENT}" || continue
+        j="${parent[0]:-}"
+        if [[ "${j##*/}" == agent-director || "${j##*/}" == agent-director.real ]]; then
+            control=1
+        fi
+    done
+    (( ${#bad[@]} == 0 )) \
+        || _scenario_offending "${step}" "${SCENARIO_TMUX_SHIM_LOG}" "have a bot server the scenario started as their parent" "${bad[@]}"
+    (( control )) \
+        || fail "${step}: positive control: no line of ${SCENARIO_TMUX_SHIM_LOG} (${#tmux_lines[@]} line(s)) has as its parent an agent-director process that a CSCB process ran, so the tmux shim's log shows no tmux call agent-director made for CSCB"
+    _scenario_closing_ran "${step}"
+}
+
+assert_no_cscb_include_finished() {
+    local step=assert_no_cscb_include_finished lines=() bad=() i a control=0 finished
+    _scenario_query_prep "${step}"
+    _scenario_read_log "${step}" "${SCENARIO_AD_SHIM_LOG}" lines
+    for i in "${!lines[@]}"; do
+        _scenario_split_line "${lines[i]}"
+        [[ "${_L_KIND}" == call ]] || continue
+        if _scenario_role_at "${_L_PPID}" "${_L_US}" && [[ "${_SCENARIO_ROLE}" == server ]]; then
+            control=1
+        fi
+        _scenario_decode_words
+        _scenario_ad_verb
+        [[ "${_L_VERB}" == kill ]] || continue
+        finished=0
+        for a in ${_L_ARGS[@]+"${_L_ARGS[@]}"}; do
+            [[ "${a}" =~ ^--?include-finished(=.*)?$ ]] && finished=1
+        done
+        (( finished )) || continue
+        # The scenario's own shell, or a subshell of it (a command
+        # substitution or a pipeline element included): a parent with the
+        # script's own command line that no CSCB process held.
+        if [[ "${_L_PARENT}" == "${SCENARIO_SHELL_CMDLINE}" ]] \
+            && ! _scenario_role_at "${_L_PPID}" "${_L_US}"; then
+            continue
+        fi
+        bad+=("$(( i + 1 ))")
+    done
+    (( ${#bad[@]} == 0 )) \
+        || _scenario_offending "${step}" "${SCENARIO_AD_SHIM_LOG}" "run kill with --include-finished from a parent other than the scenario's own shell or a subshell of it" "${bad[@]}"
+    (( control )) \
+        || fail "${step}: positive control: no invocation in ${SCENARIO_AD_SHIM_LOG} (${#lines[@]} line(s)) has a bot server the scenario started as its parent (its version probe), so the shim's log shows no call CSCB made"
+    _scenario_closing_ran "${step}"
+}
+
+assert_no_cscb_delete() {
+    local step=assert_no_cscb_delete lines=() bad=() i
+    _scenario_query_prep "${step}"
+    _scenario_read_log "${step}" "${SCENARIO_AD_SHIM_LOG}" lines
+    for i in "${!lines[@]}"; do
+        _scenario_split_line "${lines[i]}"
+        [[ "${_L_KIND}" == call ]] || continue
+        _scenario_role_at "${_L_PPID}" "${_L_US}" || continue
+        _scenario_decode_words
+        _scenario_ad_verb
+        if [[ "${_L_VERB}" == delete ]]; then
+            bad+=("$(( i + 1 ))")
+        fi
+    done
+    (( ${#bad[@]} == 0 )) \
+        || _scenario_offending "${step}" "${SCENARIO_AD_SHIM_LOG}" "run delete from a CSCB process" "${bad[@]}"
+    _scenario_closing_ran "${step}"
+}
+
+# _scenario_cscb_ad_scan <step> <print|count> <verb> [<fragment>...]: over the
+# agent-director shim's `call` lines whose parent is a CSCB process, the ones
+# whose verb is <verb> (any verb when empty) and whose arguments, joined by
+# single spaces, hold every fragment in order: print them, or how many.
+_scenario_cscb_ad_scan() {
+    local step="$1" mode="$2" verb="$3" lines=() i n=0 rest frag ok
+    shift 3
+    _scenario_query_prep "${step}"
+    _scenario_read_log "${step}" "${SCENARIO_AD_SHIM_LOG}" lines
+    for i in "${!lines[@]}"; do
+        _scenario_split_line "${lines[i]}"
+        [[ "${_L_KIND}" == call ]] || continue
+        _scenario_role_at "${_L_PPID}" "${_L_US}" || continue
+        _scenario_decode_words
+        _scenario_ad_verb
+        [[ -z "${verb}" || "${_L_VERB}" == "${verb}" ]] || continue
+        printf -v rest '%s ' ${_L_ARGS[@]+"${_L_ARGS[@]}"}
+        rest="${rest% }"
+        ok=1
+        for frag in "$@"; do
+            if [[ "${rest}" != *"${frag}"* ]]; then
+                ok=0
+                break
+            fi
+            rest="${rest#*"${frag}"}"
+        done
+        (( ok )) || continue
+        n=$(( n + 1 ))
+        if [[ "${mode}" == print ]]; then
+            printf '%s\n' "${lines[i]}"
+        fi
+    done
+    if [[ "${mode}" == count ]]; then
+        echo "${n}"
+    fi
+}
+
+cscb_ad_calls() {
+    _scenario_cscb_ad_scan "cscb_ad_calls" print "${1-}" "${@:2}"
+}
+
+cscb_ad_count() {
+    _scenario_cscb_ad_scan "cscb_ad_count" count "${1-}" "${@:2}"
+}
+
+# ---------------------------------------------------------------------------
 # fmk mode setup
 # ---------------------------------------------------------------------------
 
@@ -1362,6 +2079,34 @@ _scenario_fmk_setup() {
     chmod 00700 "${SCENARIO_ROOT}/tmux" || fail "could not set the mode of ${SCENARIO_ROOT}/tmux"
     _scenario_place "${SCENARIO_FIXTURES}/stub-claude.sh" "${SCENARIO_BIN}/claude" "the stub claude"
 
+    # The tmux shim, its real tmux, its mode (`log`) and its log, for the
+    # CSCB processes' PATH only; the scenario's own shell keeps the real tmux.
+    SCENARIO_TMUX_SHIM_DIR="${SCENARIO_ROOT}/tmux-shim"
+    SCENARIO_TMUX_SHIM_BIN="${SCENARIO_TMUX_SHIM_DIR}/bin"
+    SCENARIO_TMUX_SHIM_MODE_FILE="${SCENARIO_TMUX_SHIM_DIR}/mode"
+    SCENARIO_TMUX_SHIM_LOG="${SCENARIO_TMUX_SHIM_DIR}/tmux-shim.log"
+    [[ -f "${SCENARIO_TMUX_SHIM_SRC}" ]] && grep -qxF -- "${SCENARIO_TMUX_SHIM_MARKER}" "${SCENARIO_TMUX_SHIM_SRC}" \
+        || fail "fmk setup: the tmux shim ${SCENARIO_TMUX_SHIM_SRC} is missing or carries no marker"
+    mkdir -p "${SCENARIO_TMUX_SHIM_BIN}" || fail "fmk setup: could not create ${SCENARIO_TMUX_SHIM_BIN}"
+    _scenario_place "${SCENARIO_TMUX_SHIM_SRC}" "${SCENARIO_TMUX_SHIM_BIN}/tmux" "fmk setup: the tmux shim"
+    ln -s -- "${SCENARIO_REAL_TMUX}" "${SCENARIO_TMUX_SHIM_DIR}/tmux.real" \
+        || fail "fmk setup: could not link the real tmux beside the tmux shim"
+    tmux_shim_mode log
+
+    # The CSCB process record, and what reading it needs: the script's own
+    # command line (as the shims quote a parent's) and the clock of /proc.
+    SCENARIO_CSCB_RECORD="${SCENARIO_ROOT}/cscb-processes"
+    : > "${SCENARIO_CSCB_RECORD}" || fail "fmk setup: could not create ${SCENARIO_CSCB_RECORD}"
+    local shell_argv=()
+    mapfile -d '' -t shell_argv < "/proc/$$/cmdline" && (( ${#shell_argv[@]} > 0 )) \
+        || fail "fmk setup: could not read the script's own command line"
+    printf -v SCENARIO_SHELL_CMDLINE '%q ' "${shell_argv[@]}"
+    SCENARIO_SHELL_CMDLINE="${SCENARIO_SHELL_CMDLINE% }"
+    _SCENARIO_BTIME="$(sed -n 's/^btime //p' /proc/stat)"
+    _SCENARIO_CLK_TCK="$(getconf CLK_TCK)"
+    [[ "${_SCENARIO_BTIME}" =~ ^[0-9]+$ && "${_SCENARIO_CLK_TCK}" =~ ^[1-9][0-9]*$ ]] \
+        || fail "fmk setup: could not read the boot time and clock tick from /proc/stat and getconf"
+
     export HOME="${SCENARIO_HOME}"
     export TMUX_TMPDIR="${SCENARIO_ROOT}/tmux"
     unset TMUX TMUX_PANE
@@ -1377,6 +2122,11 @@ _scenario_fmk_setup() {
 
     SCENARIO_AD_BIN="${HOME}/.agent-director/bin/agent-director"
     SCENARIO_AD_SHIM_LOG="${HOME}/.agent-director/bin/agent-director-shim.log"
+    # The files the closing enforcement reads, whatever a script later sets
+    # SCENARIO_TMUX_SHIM_LOG, SCENARIO_AD_SHIM_LOG or SCENARIO_CSCB_RECORD to.
+    _SCENARIO_REAL_TMUX_SHIM_LOG="${SCENARIO_TMUX_SHIM_LOG}"
+    _SCENARIO_REAL_AD_SHIM_LOG="${SCENARIO_AD_SHIM_LOG}"
+    _SCENARIO_REAL_CSCB_RECORD="${SCENARIO_CSCB_RECORD}"
     if [[ "${SCENARIO_AD_START}" == 0.10.0 ]]; then
         install_ad_010 "fmk setup: install agent-director 0.10.0"
     else

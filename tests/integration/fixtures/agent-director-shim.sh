@@ -8,11 +8,12 @@
 # `install_ad_shim` (scenario.sh) puts this file at the path a scenario
 # HOME's agent-director client resolves first, the standard path
 # $HOME/.agent-director/bin/agent-director, as a regular file (the client
-# follows symlinks, so a symlink there would bypass the shim), and moves the
+# follows symlinks, so a symlink there would bypass the shim): it copies the
 # binary that was installed there beside it, as
-# $HOME/.agent-director/bin/agent-director.real. The line above is the shim's
-# marker; scenario.sh's `check_ad_shim` checks for it after every install,
-# re-shim, swap and restore.
+# $HOME/.agent-director/bin/agent-director.real, then renames the shim over
+# the standard path, so that path always holds the binary or the shim. The
+# line above is the shim's marker; scenario.sh's `check_ad_shim` checks for
+# it after every install, re-shim, swap and restore.
 #
 # For each invocation the shim appends one `call` line to its log, then
 # replaces itself with the real binary beside it (`exec`): the same process
