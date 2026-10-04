@@ -3962,9 +3962,12 @@ describe('main() builds the latch re-check once, through the session manager\'s 
   const BIND_NOTICE: keyof typeof ConflictLatchModule = 'bindConflictNotice'
   const EPISODES_FACTORY: keyof typeof PersonaEpisodesModule = 'createPersonaEpisodes'
   const CONTROLLER_FACTORY: keyof typeof ConflictLatchModule = 'createLatchRecheckController'
-  const SILENT_CLEAR: keyof typeof ConflictLatchModule = 'createSilentLatchRecheckClear'
+  const CLEAR: keyof typeof ConflictLatchModule = 'createLatchClear'
   const ROUND: keyof typeof SessionManagerModule = 'runLatchRecheckRound'
+  const CLEAR_SEQUENCE: keyof typeof SessionManagerModule = 'runLatchClearSequence'
   const IN_TURN: keyof typeof RestartModule = 'runRestartWorkInTurn'
+  const RETRY_IN_TURN: keyof typeof RestartModule = 'runRestartRetryInTurn'
+  const HOLD_ACTIVE: keyof typeof RestartModule = 'holdRestartActive'
   const ADD_SET: keyof ConflictLatch = 'addSetObserver'
   const ADD_FORGET: keyof ConflictLatch = 'addForgetObserver'
   const STOP_ALL: keyof LatchRecheckController = 'stopAll'
@@ -3985,13 +3988,13 @@ describe('main() builds the latch re-check once, through the session manager\'s 
     return decls[0]![1]!
   }
 
-  test('the re-check is built exactly once, by the session manager\'s builder, bound to a const in main()\'s own statement list (not at module scope, behind no branch), after the latch, the notice episodes and both the holds\' and the notice\'s bindings, and before the start pass; server.ts declares neither name and builds no re-check controller, round, clear or in-turn run of its own', () => {
+  test('the re-check is built exactly once, by the session manager\'s builder, bound to a const in main()\'s own statement list (not at module scope, behind no branch), after the latch, the notice episodes and both the holds\' and the notice\'s bindings, and before the start pass; server.ts declares neither name and builds no re-check controller, round, clear entry, after-clear sequence, in-turn run or in-turn retry, nor holds a persona active, of its own (b.jg5 SRJ-506: the clear is the builder\'s)', () => {
     expect(importSource(SERVER_CODE, RECHECK_BUILDER)).toBe('./session-manager.ts')
     for (const name of [RECHECK_BUILDER, RECHECK_BIND]) {
       expect([name, indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${name}\\b`, 'g'), SERVER_CODE)]).toEqual([name, []])
     }
     // The composition lives in the builder only, so main() and the recovery harness run the same re-check.
-    for (const name of [CONTROLLER_FACTORY, SILENT_CLEAR, ROUND, IN_TURN]) {
+    for (const name of [CONTROLLER_FACTORY, CLEAR, ROUND, CLEAR_SEQUENCE, IN_TURN, RETRY_IN_TURN, HOLD_ACTIVE]) {
       expect([name, indicesOf(new RegExp(`\\b${name}\\b`, 'g'), SERVER_CODE)]).toEqual([name, []])
     }
     // Named only at its import and the one call.

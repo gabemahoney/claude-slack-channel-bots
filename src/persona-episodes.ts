@@ -369,7 +369,8 @@ export const MUTED_BY_TEARDOWN = 'muted, its persona teardown was submitted'
  * `bindConflictNotice`, `src/conflict-latch.ts`): a latch or a relatch with a
  * new case begins the episode with its case and posts the CONFLICT notice
  * once; the same case keeps it and posts nothing; a latch of a hold case ends
- * it silently. Its end, at the latch's clear, is E30's.
+ * it silently. The latch's clear (`createLatchClear`) posts the recovery
+ * notice in it once and ends it.
  */
 export const PERSONA_EPISODE_KIND_CONFLICT = 'conflict'
 
@@ -379,7 +380,8 @@ export const PERSONA_EPISODE_KIND_CONFLICT = 'conflict'
  * (`createConflictNoticeObserver`, bound in `main()` by `bindConflictNotice`,
  * `src/conflict-latch.ts`): a latch, or a relatch from another case, begins
  * the episode and posts SRJ-1019 once; a latch of another kind ends it
- * silently. Its end, at the latch's clear, is E30's.
+ * silently. The latch's clear (`createLatchClear`) posts the recovery notice
+ * in it once and ends it.
  */
 export const PERSONA_EPISODE_KIND_UNUSABLE_RECORDED_NAME = 'unusable-recorded-name'
 
@@ -388,8 +390,8 @@ export const PERSONA_EPISODE_KIND_UNUSABLE_RECORDED_NAME = 'unusable-recorded-na
  * until it clears. Posted by the conflict latch's notice reaction
  * (`createConflictNoticeObserver`, `src/conflict-latch.ts`): a latch, or a
  * relatch from another case, begins the episode and posts SRJ-1020 once; a
- * latch of another kind ends it silently. Its end, at the latch's clear, is
- * E30's.
+ * latch of another kind ends it silently. The latch's clear
+ * (`createLatchClear`) posts the recovery notice in it once and ends it.
  */
 export const PERSONA_EPISODE_KIND_LAUNCH_START_NOT_RECORDED = 'launch-start-not-recorded'
 

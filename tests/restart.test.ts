@@ -16,7 +16,10 @@ import {
   _resetRestartState,
   isRestartPendingOrActive,
   runRestartRetry,
+  runRestartRetryInTurn,
   runRestartWorkInTurn,
+  holdRestartActive,
+  restartRetrySkippedLine,
   RESTART_FAILURE_CAP,
   RESTART_OUTCOME_ALREADY_CONNECTED,
   RESTART_OUTCOME_CAPPED,
@@ -242,6 +245,8 @@ import {
   UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
   UNAVAILABLE_RETRY_MODE_FULL,
   UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
+  RETRY_BLOCK_LIVE_ROW_SEQUENCE,
+  type RetryBlockCause,
   holdsLatchRecheckPermit,
   latchRecheckScopeOf,
   runInLatchRecheck,
@@ -9239,5 +9244,195 @@ describe('b.jg5 SRJ-505, SRJ-502: the latch re-check\'s own run of the restart p
       expect(getFailureCount(P)).toBe(refuseAtRead ? 1 : 0)
       expect(deps.armRetryTimerCalls).toEqual([])
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-506 — the retry entry from inside P's serializer turn
+// (`runRestartRetryInTurn`) and P's active hold (`holdRestartActive`)
+//
+// The after-clear sequence retries P at once from inside the job that holds
+// P's lifecycle serializer turn: `runRestartRetryInTurn` makes the retry
+// entry's gates (latched, held, "blocks a retry" with its skip line, the
+// restart cap) in that order and its restart work with the same accounting,
+// with no submission of its own, so awaiting it inside the turn settles; P is
+// active while it runs. Each gate is compared with `runRestartRetry` over the
+// same deps, so the two stay one entry. `holdRestartActive` holds P active
+// from the clear to the job's end: the health tick and the lost-message
+// path read a restart under way until the release, which is idempotent and
+// never hides another work still active. Which clear calls them, and the
+// health tick's skip, are tests/conflict-latch.test.ts's.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-506: runRestartRetryInTurn is the retry entry\'s gates and work inside the caller\'s serializer turn, and holdRestartActive holds P active until released', () => {
+  const P = 'persona_p'
+  const CWD = '/cwd/p'
+  let errLines: string[]
+  let origConsoleError: typeof console.error
+
+  beforeEach(() => {
+    errLines = []
+    origConsoleError = console.error
+    console.error = (...args: unknown[]) => { errLines.push(args.map(String).join(' ')) }
+  })
+
+  afterEach(() => {
+    console.error = origConsoleError
+    cancelAllRestartTimers()
+    assertNoLeak({ errLines })
+  })
+
+  /** The file's deps with a recording `serialize`: the in-turn entry must never submit. */
+  function inTurnDeps(opts: DepsOpts = {}): ReturnType<typeof makeDeps> & { submitted: string[] } {
+    const submitted: string[] = []
+    const deps = Object.assign(makeDeps(opts), { submitted })
+    deps.serialize = async <T>(key: string, operation: () => T | Promise<T>): Promise<T> => {
+      submitted.push(key)
+      return operation()
+    }
+    return deps
+  }
+
+  test('before initRestart it answers not-initialised with one line, asks nothing and marks nothing active', async () => {
+    const asked: string[] = []
+    expect(await runRestartRetryInTurn(P, CWD, (key) => { asked.push(key); return false })).toBe(RESTART_OUTCOME_NOT_INITIALISED)
+    expect(asked).toEqual([])
+    expect(isRestartPendingOrActive(P)).toBe(false)
+    expect(errLines).toEqual([`[slack] runRestartRetryInTurn: deps not initialized — skipping the retry for persona=${P}`])
+  })
+
+  /** One gate: how the deps and the in-flight query are set, the outcome, and the one skip line. */
+  type Gate = readonly [string, (deps: ReturnType<typeof makeDeps>) => void, boolean, RestartRetryOutcome, string]
+  const latchedLine = `[slack] Skipping restart for persona=${P} — the persona is latched; no agent-director call, nothing recorded (b.jg5 SRJ-502)`
+  const heldLine = `[slack] Skipping restart for persona=${P} — the persona is held on ErrInvalidFlags; no agent-director call, nothing recorded (b.jg5 SRJ-207)`
+  const capLine = `[slack] Restart retry skipped for persona=${P} — the persona is at the restart cap; nothing killed or launched`
+  const GATES: Gate[] = [
+    // Each gate is checked first among the later ones: every later one also holds.
+    ['latched (held, in flight and capped too)', (deps) => { deps.isLatched = () => true; deps.isHeld = () => true }, true, RESTART_OUTCOME_LATCHED, latchedLine],
+    ['held on ErrInvalidFlags (in flight and capped too)', (deps) => { deps.isHeld = () => true }, true, RESTART_OUTCOME_HELD, heldLine],
+    ['blocked by its live-row sequence (capped too)', () => {}, true, RESTART_OUTCOME_IN_FLIGHT, restartRetrySkippedLine(P, RETRY_BLOCK_LIVE_ROW_SEQUENCE)],
+    ['at the restart cap', () => {}, false, RESTART_OUTCOME_CAPPED, capLine],
+  ]
+
+  test.each(GATES)('%s: the same outcome and skip line as runRestartRetry, no probe, kill or launch, nothing counted, no submission, and P inactive after', async (_label, setUp, inFlight, outcome, line) => {
+    const answers: unknown[] = []
+    for (const entry of ['in-turn', 'retry entry'] as const) {
+      _resetBackoffState()
+      for (let i = 0; i < RESTART_FAILURE_CAP; i++) recordFailure(P)
+      errLines.length = 0
+      const deps = inTurnDeps()
+      setUp(deps)
+      initRestart(deps)
+      const blockCause = (): RetryBlockCause => RETRY_BLOCK_LIVE_ROW_SEQUENCE
+      const answer = entry === 'in-turn'
+        ? await runRestartRetryInTurn(P, CWD, () => inFlight, blockCause)
+        : await runRestartRetry(P, CWD, () => inFlight, blockCause)
+      answers.push([entry, answer, errLines.slice(), deps.isSessionAliveCalls, deps.killSessionCalls, deps.launchSessionCalls, getFailureCount(P), isRestartPendingOrActive(P)])
+      expect([entry, deps.submitted]).toEqual([entry, entry === 'in-turn' ? [] : [P]])
+    }
+    const expected = (entry: string) => [entry, outcome, [line], [], [], [], RESTART_FAILURE_CAP, false]
+    expect(answers).toEqual([expected('in-turn'), expected('retry entry')])
+  })
+
+  test.each<[string, DepsOpts, RestartRetryOutcome, number]>([
+    ['dead: one launch, the earlier failure reset', {}, RESTART_OUTCOME_LAUNCHED, 0],
+    ['dead, the launch failing: one failure counted', { launchSessionResult: false }, RESTART_OUTCOME_COUNTED_FAILURE, 2],
+    ['pending: the deferral, nothing counted', { isSessionAliveResult: LIVENESS_READING_PENDING }, RESTART_OUTCOME_PENDING_DEFERRED, 1],
+  ])('no gate holding, the probe reading %s, as the retry entry does; P is active during the work only and nothing is submitted', async (_label, opts, outcome, failures) => {
+    const results: unknown[] = []
+    for (const entry of ['in-turn', 'retry entry'] as const) {
+      _resetBackoffState()
+      recordFailure(P)
+      const activeAtProbe: boolean[] = []
+      const deps = inTurnDeps(opts)
+      const probe = deps.isSessionAlive.bind(deps)
+      deps.isSessionAlive = async (key) => {
+        activeAtProbe.push(isRestartPendingOrActive(key))
+        return probe(key)
+      }
+      initRestart(deps)
+      const answer = entry === 'in-turn' ? await runRestartRetryInTurn(P, CWD, () => false) : await runRestartRetry(P, CWD, () => false)
+      results.push([entry, answer, deps.isSessionAliveCalls, deps.launchSessionCalls.map((c) => c.key), getFailureCount(P), activeAtProbe, isRestartPendingOrActive(P), deps.submitted.length])
+    }
+    const launches = outcome === RESTART_OUTCOME_PENDING_DEFERRED ? [] : [P]
+    expect(results).toEqual([
+      ['in-turn', outcome, [P], launches, failures, [true], false, 0],
+      ['retry entry', outcome, [P], launches, failures, [true], false, 1],
+    ])
+  })
+
+  test('awaited inside P\'s turn on a real persona serializer it settles there with no submission of its own; a retry for P submitted meanwhile waits for the turn', async () => {
+    const serializer = createPersonaSerializer()
+    const deps = inTurnDeps()
+    deps.serialize = <T>(key: string, operation: () => T | Promise<T>): Promise<T> => {
+      deps.submitted.push(key)
+      return serializer.run(key, operation)
+    }
+    const launchReached = Promise.withResolvers<void>()
+    const launchRelease = Promise.withResolvers<void>()
+    const order: string[] = []
+    deps.launchSession = async (key) => {
+      order.push(`launch ${key}`)
+      launchReached.resolve()
+      await launchRelease.promise
+      return true
+    }
+    initRestart(deps)
+
+    const turn = serializer.run(P, async () => {
+      const outcome = await runRestartRetryInTurn(P, CWD, () => false)
+      order.push(`in-turn ${outcome}`)
+      return outcome
+    })
+    await launchReached.promise
+    const retry = runRestartRetry(P, CWD, () => false)
+    for (let i = 0; i < 20; i++) await Promise.resolve()
+    expect(order).toEqual([`launch ${P}`])
+    expect(deps.submitted).toEqual([P])
+
+    launchRelease.resolve()
+    expect(await turn).toBe(RESTART_OUTCOME_LAUNCHED)
+    expect(await retry).toBe(RESTART_OUTCOME_LAUNCHED)
+    expect(order).toEqual([`launch ${P}`, `in-turn ${RESTART_OUTCOME_LAUNCHED}`, `launch ${P}`])
+    expect(deps.submitted).toEqual([P])
+    expect(isRestartPendingOrActive(P)).toBe(false)
+  })
+
+  test('holdRestartActive: P reads active until the release, a second release changes nothing, and another persona is untouched', () => {
+    const release = holdRestartActive(P)
+    expect([isRestartPendingOrActive(P), isRestartPendingOrActive('persona_q')]).toEqual([true, false])
+    release()
+    expect(isRestartPendingOrActive(P)).toBe(false)
+    release()
+    expect(isRestartPendingOrActive(P)).toBe(false)
+  })
+
+  test('holdRestartActive never hides another work still active: a hold released, or released twice, while P\'s retry runs leaves P active until that retry ends; two holds keep P active until both are released', async () => {
+    const deps = inTurnDeps()
+    const launchReached = Promise.withResolvers<void>()
+    const launchRelease = Promise.withResolvers<void>()
+    deps.launchSession = async () => {
+      launchReached.resolve()
+      await launchRelease.promise
+      return true
+    }
+    initRestart(deps)
+    const release = holdRestartActive(P)
+    const retry = runRestartRetry(P, CWD, () => false)
+    await launchReached.promise
+    release()
+    release()
+    expect(isRestartPendingOrActive(P)).toBe(true)
+    launchRelease.resolve()
+    expect(await retry).toBe(RESTART_OUTCOME_LAUNCHED)
+    expect(isRestartPendingOrActive(P)).toBe(false)
+
+    const first = holdRestartActive(P)
+    const second = holdRestartActive(P)
+    first()
+    first()
+    expect(isRestartPendingOrActive(P)).toBe(true)
+    second()
+    expect(isRestartPendingOrActive(P)).toBe(false)
   })
 })

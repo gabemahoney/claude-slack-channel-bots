@@ -119,14 +119,21 @@
  * The recovery notice (SRJ-1005): {@link conflictRecoveryText},
  * {@link holdRecoveryText} and {@link latchRecoveryText} build it for either
  * latch kind ({@link LatchKind}) and one of five reasons
- * ({@link LatchRecoveryReason}); nothing here posts it (see its section).
+ * ({@link LatchRecoveryReason}); the clear entry posts it.
+ *
+ * The clear (SRJ-506): {@link createLatchClear} builds the one clear entry,
+ * which takes a persona and a reason: it removes the record, stops the
+ * persona's re-check timer, posts the recovery notice once in the episode of
+ * the latch's kind, ends that episode (and any other latch kind's) and logs
+ * one line with the reason. Every clear goes through it: the re-check's
+ * (through the session manager's builder) and a clear by hand.
  *
  * Every latching site latches through `set`, `setFromConflict`,
  * `setFromUnusableName` or `setLaunchStartNotRecorded`. A latch is dropped
- * by the persona's teardown (`forget`, silently) and by the re-check's clear
- * hand-off (below). `setProbeDropped` marks the record's episode as having
- * its "this row's own id" probe dropped (`probeDropped`); a new case's
- * record starts without the mark.
+ * by the persona's teardown (`forget`, silently) and by the clear entry.
+ * `setProbeDropped` marks the record's episode as having its "this row's own
+ * id" probe dropped (`probeDropped`); a new case's record starts without the
+ * mark.
  *
  * The re-check (SRJ-505): {@link LATCH_RECHECK_INTERVAL_MS}, step 1's reading
  * ({@link LatchRecheckReading}), the step, action and call identifiers
@@ -134,19 +141,21 @@
  * ({@link decideLatchRecheck}) and the finished-row retry's launch
  * ({@link decideFinishedRowLaunch}), the verdicts on a `read-pane` answer
  * ({@link decideLatchRecheckProbe}, {@link decideLatchRecheckPendingReadPane}),
- * the clear hand-off's type with its silent form
- * ({@link createSilentLatchRecheckClear}), the per-persona timer
- * ({@link createLatchRecheckController}, bound by {@link bindLatchRecheck})
- * and the round's line ({@link latchRecheckRoundLine}). The round itself,
- * which makes the calls, is the session manager's (`src/session-manager.ts`),
- * built with its production dependencies by `buildLatchRecheck` there. The
- * silent clear forgets the latch and stops the timer, with no recovery post;
- * SRJ-506's clear takes its place through that builder.
+ * the single retry after a cleared probe ({@link decideClearedProbeRetry}),
+ * the clear hand-off's type ({@link LatchRecheckClearHandOff}), the
+ * per-persona timer ({@link createLatchRecheckController}, bound by
+ * {@link bindLatchRecheck}) and the round's line
+ * ({@link latchRecheckRoundLine}). The round itself, which makes the calls,
+ * is the session manager's (`src/session-manager.ts`), built with its
+ * production dependencies by `buildLatchRecheck` there, whose hand-off clears
+ * through the clear entry.
  *
  * Log lines, to the injected log (a throwing log is swallowed):
  *
  *   [slack] conflict-latch: persona=<key> latched — case=<case> session="<name>" refused=<operation> state=<state>[ message="<description>"]
  *   [slack] conflict-latch: persona=<key> relatched — case=<case> (was <case>) session="<name>" refused=<operation> state=<state>[ message="<description>"]
+ *   [slack] conflict-latch: persona=<key> cleared — case=<case> session="<name>" reason="<reason>"; recovery notice <posted|not posted (the notice episodes are closed)>
+ *   [slack] conflict-latch: persona=<key> clear step failed (<step>): <error>
  *   [slack] conflict-latch: persona=<key> set observer failed: <error>
  *   [slack] conflict-latch: persona=<key> hold failed (<hold>): <error>
  *   [slack] conflict-latch: persona=<key> forget observer failed: <error>
@@ -547,8 +556,8 @@ export interface ConflictLatch {
   /** `key`'s record, or `undefined` when it is not latched. */
   record(key: string): ConflictLatchRecord | undefined
   /**
-   * Drop `key`'s latch silently (its teardown, the re-check's silent clear):
-   * no post, no set observer call, no line. Each forget observer is then told
+   * Drop `key`'s latch silently (its teardown; the clear entry, which posts
+   * and ends the episode itself): no post, no set observer call, no line. Each forget observer is then told
    * the key (the re-check timer's stop), when a latch was dropped. Answers
    * whether it was latched.
    */
@@ -1039,10 +1048,9 @@ export function launchStartNotRecordedNoticeText(key: string): string {
 // ---------------------------------------------------------------------------
 // The recovery notice (b.jg5 SRJ-1005)
 //
-// Built here; nothing in this module posts it. The re-check's clear
-// hand-off is where a re-check's clear is handed (every reason but "cleared
-// by hand"; the silent clear posts nothing yet), and a `clear-latch` posts
-// it with "cleared by hand". The re-check posts nothing before a clear: a
+// Built here and posted by the clear entry (`createLatchClear`), once per
+// clear: the re-check's clears with every reason but "cleared by hand", and a
+// `clear-latch` with "cleared by hand". The re-check posts nothing before a clear: a
 // "not this launch's session" latch posts none when its finished-row retry
 // is made or relatches P, only when that retry clears it
 // (`LATCH_RECOVERY_REASON_RELAUNCH_NOT_REFUSED`); a latch whose refused
@@ -1072,7 +1080,7 @@ export const LATCH_RECOVERY_REASON_KIND_ROW_GONE = 'row-gone'
 export const LATCH_RECOVERY_REASON_KIND_RETRY_NOT_REFUSED = 'retry-not-refused'
 /** Reason `its row finished and a relaunch was not refused`. */
 export const LATCH_RECOVERY_REASON_KIND_RELAUNCH_NOT_REFUSED = 'relaunch-not-refused'
-/** Reason `cleared by hand` (E31's `clear-latch`). */
+/** Reason `cleared by hand` (`clear-latch`). */
 export const LATCH_RECOVERY_REASON_KIND_CLEARED_BY_HAND = 'cleared-by-hand'
 
 /** Why a latch cleared: one of SRJ-1005's five reasons, the state-bearing one with its state. */
@@ -1236,7 +1244,8 @@ export function latchNoticeEpisodeKindOf(latchCase: LatchCase): PersonaEpisodeKi
  * straight to Slack, and reads no other notice's latch, b.f2b's
  * `unproven-idle` and `blocked-on-prompt` included, so none holds it back.
  * After the episodes' `close` (shutdown) it opens and posts nothing. A
- * teardown's `forget` ends them; the re-check's silent clear ends none.
+ * teardown's `forget` ends them silently; the clear entry
+ * ({@link createLatchClear}) ends them after its one recovery post.
  */
 export function createConflictNoticeObserver(episodes: ConflictNoticeEpisodes): ConflictLatchSetObserver {
   return ({ key, outcome, record }) => {
@@ -1262,6 +1271,121 @@ export function createConflictNoticeObserver(episodes: ConflictNoticeEpisodes): 
  */
 export function bindConflictNotice(latch: Pick<ConflictLatch, 'addSetObserver'>, episodes: ConflictNoticeEpisodes): () => void {
   return latch.addSetObserver(createConflictNoticeObserver(episodes))
+}
+
+// ---------------------------------------------------------------------------
+// The clear (b.jg5 SRJ-506, SRJ-1005, SRJ-1016)
+// ---------------------------------------------------------------------------
+
+/** The mark the recovery notice is posted under in the episode of the latch's kind. */
+export const LATCH_RECOVERY_MARK = 'recovery'
+
+/**
+ * Clear persona `key`'s latch for `reason` (one of SRJ-1005's five), with
+ * its one recovery notice. Answers whether `key` was latched; an unlatched
+ * persona gets nothing (no post, no line). Never throws.
+ */
+export type LatchClear = (key: string, reason: LatchRecoveryReason) => boolean
+
+/** What the clear entry needs. */
+export interface LatchClearDeps {
+  /** The server's latch: the record to clear and its silent forget. */
+  readonly latch: Pick<ConflictLatch, 'record' | 'forget'>
+  /** The server's notice episodes (the latch notices'): the recovery post and the episode end. */
+  readonly episodes: ConflictNoticeEpisodes
+  /** Stop persona `key`'s re-check timer (`LatchRecheckController.stop`). */
+  readonly stopTimer: (key: string) => void
+  /** Receives the clear's one line (the server log). A throwing log is swallowed. */
+  readonly log: (line: string) => void
+}
+
+/**
+ * The reason as a log line carries it: the reason's text, unescaped, its
+ * state rendered as a description is (redacted, on one line, capped). Pure.
+ */
+function latchRecoveryReasonLogText(reason: LatchRecoveryReason): string {
+  return reason.kind === LATCH_RECOVERY_REASON_KIND_ROW_READS
+    ? LATCH_RECOVERY_REASON_ROW_READS_HEAD + renderLogMessageText(reason.state)
+    : LATCH_RECOVERY_REASON_TEXTS[reason.kind]
+}
+
+/**
+ * The clear's one line (b.jg5 SRJ-506, SRJ-1014): the persona, the cleared
+ * record's case and session, the reason, and whether the recovery notice was
+ * posted (it is not once the notice episodes are closed, at shutdown):
+ *
+ *   [slack] conflict-latch: persona=<key> cleared — case=<case> session="<name>" reason="<reason>"; recovery notice <posted|not posted (the notice episodes are closed)>
+ *
+ * Pure.
+ */
+export function latchClearedLine(key: string, record: ConflictLatchRecord, reason: LatchRecoveryReason, posted: boolean): string {
+  return (
+    `[slack] conflict-latch: persona=${key} cleared — case=${record.latchCase} session=${JSON.stringify(record.sessionName)} ` +
+    `reason=${JSON.stringify(latchRecoveryReasonLogText(reason))}; recovery notice ` +
+    (posted ? 'posted' : 'not posted (the notice episodes are closed)')
+  )
+}
+
+/**
+ * The one clear entry (b.jg5 SRJ-506, SRJ-1005, SRJ-1016). For a latched
+ * persona, in this order:
+ *
+ *   1. the record is removed (`forget`; its forget observers, the re-check
+ *      timer's stop among them, are told);
+ *   2. the persona's re-check timer is stopped (`stopTimer`; a stop of no
+ *      timer is a no-op);
+ *   3. the recovery notice ({@link latchRecoveryText} for the record's latch
+ *      kind, `reason` and its quoted session) is posted once, under
+ *      {@link LATCH_RECOVERY_MARK}, in the persona's episode of the record's
+ *      kind ({@link latchNoticeEpisodeKindOf}), which is begun first if none
+ *      is open, so every clear posts exactly once; after the episodes'
+ *      `close` (shutdown) nothing is posted;
+ *   4. the persona's episodes of every latch kind are ended silently, so a
+ *      later latch of any kind, its case the same or not, begins a new
+ *      episode and posts again;
+ *   5. one line ({@link latchClearedLine}).
+ *
+ * The post goes through the episodes' sink, the persona notifier, which adds
+ * the persona prefix. Removing the record first makes a second clear of the
+ * same latch, or a clear of an unlatched persona, answer false with no post
+ * and no line. Each step is isolated: one that throws is logged and the next
+ * still runs. Never throws.
+ */
+export function createLatchClear(deps: LatchClearDeps): LatchClear {
+  const step = (key: string, name: string, fn: () => void): void => {
+    try {
+      fn()
+    } catch (thrown) {
+      safeLog(deps.log, `[slack] conflict-latch: persona=${key} clear step failed (${name}): ${describeThrownValue(thrown)}`)
+    }
+  }
+  return (key, reason) => {
+    let record: ConflictLatchRecord | undefined
+    let forgotten = false
+    try {
+      record = deps.latch.record(key)
+      forgotten = record !== undefined && deps.latch.forget(key)
+    } catch (thrown) {
+      safeLog(deps.log, `[slack] conflict-latch: persona=${key} clear step failed (forget): ${describeThrownValue(thrown)}`)
+    }
+    if (record === undefined || !forgotten) return false
+    const cleared = record
+    step(key, 'timer stop', () => deps.stopTimer(key))
+    let posted = false
+    step(key, 'recovery post', () => {
+      const kind = latchNoticeEpisodeKindOf(cleared.latchCase)
+      if (deps.episodes.begin(key, kind, cleared.latchCase) === 'closed') return
+      posted = deps.episodes.post(
+        key,
+        kind,
+        latchRecoveryText(latchKindOf(cleared.latchCase), reason, cleared.sessionName),
+        LATCH_RECOVERY_MARK,
+      )
+    })
+    for (const kind of LATCH_NOTICE_EPISODE_KINDS) step(key, 'episode end', () => deps.episodes.end(key, kind))
+    safeLog(deps.log, latchClearedLine(key, cleared, reason, posted))
+    return true
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1801,10 +1925,8 @@ export const RECHECK_CLEARED_BY_FINISHED_ROW_RETRY = 'finished-row-retry'
 export const RECHECK_CLEARED_BY_PENDING_READ_PANE = 'pending-read-pane'
 /** Cleared by a run of the restart path's decision that completed with no refusal. */
 export const RECHECK_CLEARED_BY_RESTART_DECISION = 'restart-decision'
-/** A probe that found the condition cleared: the latch is not cleared by it (SRJ-506's `find-missing` and single retry follow). */
-export const RECHECK_CLEARED_BY_PROBE = 'probe'
 
-/** What cleared, or (for a probe) found the condition cleared. */
+/** What cleared. */
 export type LatchRecheckClearedBy =
   | typeof RECHECK_CLEARED_BY_STEP_1
   | typeof RECHECK_CLEARED_BY_LAUNCH_START_FINISHED
@@ -1812,26 +1934,33 @@ export type LatchRecheckClearedBy =
   | typeof RECHECK_CLEARED_BY_FINISHED_ROW_RETRY
   | typeof RECHECK_CLEARED_BY_PENDING_READ_PANE
   | typeof RECHECK_CLEARED_BY_RESTART_DECISION
-  | typeof RECHECK_CLEARED_BY_PROBE
 
 /**
- * What the re-check hands off for persona P: a cleared outcome, or a probe
- * that found the condition cleared. `record` is P's latch record when the
- * round decided (the probe's or retry's latched operation). `reason` is
- * SRJ-1005's for the recovery notice (a probe has none: its single retry's
- * answer gives it). `by` says what cleared: step 1, a "launch start not
- * recorded" row read finished and a "conflicting labels" latch's `pending`
- * `read-pane` launched nothing, so the bring-up the latch held back is still
- * owed; a retry, a finished-row retry and a run of the restart path's
- * decision keep their own outcome (SRJ-506).
+ * The clears that launched nothing (b.jg5 SRJ-506): step 1's, a "launch
+ * start not recorded" row read finished, and a "conflicting labels" latch's
+ * `pending` `read-pane`. The bring-up the latch held back is still owed, so
+ * the persona is retried at once after them; a retry, a finished-row retry
+ * and a run of the restart path's decision keep their own outcome.
  */
-export type LatchRecheckCleared =
-  | {
-      readonly by: Exclude<LatchRecheckClearedBy, typeof RECHECK_CLEARED_BY_PROBE>
-      readonly record: ConflictLatchRecord
-      readonly reason: LatchRecoveryReason
-    }
-  | { readonly by: typeof RECHECK_CLEARED_BY_PROBE; readonly record: ConflictLatchRecord }
+export const RECHECK_CLEARS_THAT_LAUNCHED_NOTHING: ReadonlySet<LatchRecheckClearedBy> = new Set<LatchRecheckClearedBy>([
+  RECHECK_CLEARED_BY_STEP_1,
+  RECHECK_CLEARED_BY_LAUNCH_START_FINISHED,
+  RECHECK_CLEARED_BY_PENDING_READ_PANE,
+])
+
+/**
+ * What the re-check hands off for persona P: a cleared outcome. `record` is
+ * P's latch record when the round decided (the retry's latched operation).
+ * `reason` is SRJ-1005's for the recovery notice. `by` says what cleared
+ * (see {@link RECHECK_CLEARS_THAT_LAUNCHED_NOTHING}). A probe that finds the
+ * condition cleared is no clear: the round itself runs SRJ-506's
+ * `find-missing` and single retry, whose answer may clear.
+ */
+export interface LatchRecheckCleared {
+  readonly by: LatchRecheckClearedBy
+  readonly record: ConflictLatchRecord
+  readonly reason: LatchRecoveryReason
+}
 
 /**
  * The one clear hand-off (b.jg5 SRJ-505, SRJ-506): called synchronously, once
@@ -1840,33 +1969,47 @@ export type LatchRecheckCleared =
  * definite failure's class handling. Must not throw (a throw is logged and
  * swallowed by the caller). Anything asynchronous it starts must not await
  * the persona's lifecycle serializer from inside the round (the round holds
- * that turn).
+ * that turn), and runs outside the round's scope. The production hand-off is
+ * the session manager's (`buildLatchRecheck`): the clear entry
+ * ({@link createLatchClear}), then, after a clear that launched nothing, the
+ * after-clear sequence's run (its `find-missing` first after step 1's clear,
+ * then the persona's retry at once), which the round's operation runs right
+ * after the round, in the same serializer turn.
  */
 export type LatchRecheckClearHandOff = (key: string, cleared: LatchRecheckCleared) => void
 
-/** What the silent clear needs: the latch's silent forget and the re-check timer's stop. */
-export interface SilentLatchRecheckClearDeps {
-  readonly latch: Pick<ConflictLatch, 'forget'>
-  /** Stop persona `key`'s re-check timer (`LatchRecheckController.stop`). */
-  readonly stopTimer: (key: string) => void
-}
-
 /**
- * The silent clear hand-off: for a cleared outcome, the latch's silent
- * forget (no post, no observer call, no line) and the persona's re-check
- * timer stop; for a probe that found the condition cleared, nothing (the
- * persona stays latched; the round's line names it). No recovery post, no
- * episode end and no bring-up: SRJ-506's clear replaces this hand-off
- * whole, through the re-check's dependency builder. Never throws.
+ * The single retry after a probe that found the condition cleared (b.jg5
+ * SRJ-506; hatch A3), for the latch `record` whose step-1 reading in the same
+ * re-check was `reading`: the latched operation itself. A `resume` or reuse
+ * is retried as itself, only on a row read `ended` or `missing` (HO rev 28;
+ * the probe is gated the same way); a plain spawn as the plain-spawn row
+ * keys on step 1's row (no row: the plain spawn; `ended` or `missing`: a
+ * spawn with `reuse_finished`; a live row, `pending` included: none); a
+ * latch from a pane verb, a kill or a note (P's next check or recovery, P's
+ * bring-up) gets one run of the restart path's decision. A key recorded in
+ * `retired-keys.json` gets the reuse in place of a `resume` or a plain spawn
+ * (b.jg5 SRJ-805). The hold cases are never probed: none. Pure.
  */
-export function createSilentLatchRecheckClear(deps: SilentLatchRecheckClearDeps): LatchRecheckClearHandOff {
-  return (key, cleared) => {
-    if (cleared.by === RECHECK_CLEARED_BY_PROBE) return
-    try {
-      deps.latch.forget(key)
-    } finally {
-      deps.stopTimer(key)
-    }
+export function decideClearedProbeRetry(
+  record: Pick<ConflictLatchRecord, 'refusedOperation'>,
+  reading: LatchRecheckReading,
+  retiredKeyRecorded: boolean,
+): LatchRecheckCall {
+  const finished = reading.kind === RECHECK_READING_STATE && AGENT_DIRECTOR_DEAD_STATES.has(reading.state)
+  switch (record.refusedOperation) {
+    case REFUSED_OPERATION_RESUME:
+      return finished ? retiredAware(RECHECK_CALL_RESUME, retiredKeyRecorded) : RECHECK_CALL_NONE
+    case REFUSED_OPERATION_REUSE_SPAWN:
+      return finished ? RECHECK_CALL_REUSE_SPAWN : RECHECK_CALL_NONE
+    case REFUSED_OPERATION_PLAIN_SPAWN:
+      if (reading.kind === RECHECK_READING_NO_ROW) return retiredAware(RECHECK_CALL_PLAIN_SPAWN, retiredKeyRecorded)
+      return finished ? RECHECK_CALL_REUSE_SPAWN : RECHECK_CALL_NONE
+    case REFUSED_OPERATION_BRING_UP:
+    case REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY:
+      return RECHECK_CALL_RESTART_DECISION
+    case REFUSED_OPERATION_NONE:
+      return RECHECK_CALL_NONE
   }
 }
 
@@ -2030,7 +2173,7 @@ export function createLatchRecheckController(deps: LatchRecheckControllerDeps): 
  * Bind the re-check timers to `latch`: the controller's set observer (a new
  * latch arms its timer) and a forget observer that stops the persona's timer
  * at every forget of its latch (its teardown's, through `main()`'s
- * `forgetConflictLatch` binding; the silent clear's). Answers the removal of
+ * `forgetConflictLatch` binding; the clear entry's). Answers the removal of
  * both. `main()` binds it after the holds and the notice, so a set runs the
  * read, the set, the holds, the notice, then the timer's arm.
  */

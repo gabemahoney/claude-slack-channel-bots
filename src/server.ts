@@ -3446,10 +3446,13 @@ export async function main(): Promise<void> {
   // bound after the holds and the notice, so a set runs the read, the set,
   // the holds, the notice, then the timer's arm: a persona that latches gets
   // one timer, its first round 120 s later whatever health_check_interval
-  // is, and a relatch adds none. Its clear hand-off forgets the latch and
-  // stops the timer; the binding also stops a persona's timer at every
-  // forget of its latch (the persona teardown's, bound below), and
-  // shutdown() stops every timer. The health tick is not handed it.
+  // is, and a relatch adds none. Its clear hand-off clears through the one
+  // clear entry (one recovery post through the notice episodes, the episode
+  // ended, the timer stopped) and, after a clear that launched nothing,
+  // retries the persona at once (b.jg5 SRJ-506); the binding also stops a
+  // persona's timer at every forget of its latch (the persona teardown's,
+  // bound below), and shutdown() stops every timer. The health tick is not
+  // handed it.
   const latchRecheck = buildLatchRecheck({
     latch: conflictLatch,
     clock: SYSTEM_PERSONA_CONNECTION_CLOCK,

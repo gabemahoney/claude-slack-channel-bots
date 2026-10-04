@@ -413,7 +413,26 @@
  * (`afterLaunchUnavailable`); and a CONFLICT or UNUSABLE NAME relatches with
  * the state the re-check read, never a latch-time read. Outside it, a launch
  * whose persona was latched elsewhere during its awaited call sets nothing
- * on its own CONFLICT or UNUSABLE NAME (`latchedElsewhereDuringCall`).
+ * on its own CONFLICT or UNUSABLE NAME (`latchedElsewhereDuringCall`). A
+ * probe that finds the condition cleared is followed, in the round, by one
+ * bypassing `find-missing` and exactly one retry
+ * (`latchRecheckClearedProbeRetry`); a "this row's own id" single retry
+ * refused again drops the probe for the episode.
+ *
+ * The clear (b.jg5 SRJ-506, SRJ-1005): the clear hand-off clears through the
+ * one clear entry (`createLatchClear`, `src/conflict-latch.ts`: one recovery
+ * post, the episode ended, the timer stopped). After a clear that launched
+ * nothing (step 1's, a "launch start not recorded" row read finished, a
+ * "conflicting labels" `pending` `read-pane`), and after a clear by hand, the
+ * after-clear sequence's run follows as one job in the persona's lifecycle
+ * serializer turn (right after the round, in the round's turn; submitted
+ * through the serializer for a clear by hand, `runLatchClearSequence`),
+ * outside the round's scope: one bypassing `find-missing` after step 1's
+ * clear and a clear by hand, then the persona retried at once through the
+ * in-turn retry entry (`runRestartRetryInTurn`). From the clear to the run's
+ * end the persona is held active (`holdRestartActive`), so the health tick
+ * reads nothing of it meanwhile. A clear by a retry that was not refused
+ * keeps that retry's outcome.
  *
  * No tmux process-tree walks, no JSONL existence checks for resume eligibility:
  * the library encapsulates both.
@@ -631,10 +650,10 @@ import {
   RECHECK_CLEARED_BY_FINISHED_ROW_RETRY,
   RECHECK_CLEARED_BY_LAUNCH_START_FINISHED,
   RECHECK_CLEARED_BY_PENDING_READ_PANE,
-  RECHECK_CLEARED_BY_PROBE,
   RECHECK_CLEARED_BY_RESTART_DECISION,
   RECHECK_CLEARED_BY_RETRY,
   RECHECK_CLEARED_BY_STEP_1,
+  RECHECK_CLEARS_THAT_LAUNCHED_NOTHING,
   RECHECK_READING_FAILED,
   RECHECK_READING_FAILED_VALUE,
   RECHECK_READING_NO_ROW,
@@ -644,8 +663,9 @@ import {
   RECHECK_VERDICT_CLEARED,
   RECHECK_VERDICT_RELATCH,
   RECHECK_VERDICT_UNUSABLE_NAME,
+  createLatchClear,
   createLatchRecheckController,
-  createSilentLatchRecheckClear,
+  decideClearedProbeRetry,
   decideFinishedRowLaunch,
   decideLatchRecheck,
   decideLatchRecheckPendingReadPane,
@@ -653,6 +673,7 @@ import {
   latchRecheckRoundLine,
   type ConflictNoticeEpisodes,
   type LatchCase,
+  type LatchClear,
   type LatchRecheckCall,
   type LatchRecheckClearHandOff,
   type LatchRecheckClearedBy,
@@ -662,6 +683,7 @@ import {
   type LatchRecheckReading,
   type LatchRecoveryReason,
   LATCH_CASE_NOT_THIS_LAUNCH,
+  LATCH_CASE_OWN_ID,
   LATCH_ROW_STATE_KIND_NO_ROW,
   LATCH_ROW_STATE_KIND_READ,
   LATCH_ROW_STATE_KIND_UNREADABLE,
@@ -861,7 +883,9 @@ import {
   RESTART_OUTCOME_COUNTED_FAILURE,
   RESTART_OUTCOME_LAUNCHED,
   RESTART_OUTCOME_RECONNECTED,
+  holdRestartActive,
   recordLaunchResultOutsideRestartWork,
+  runRestartRetryInTurn,
   runRestartWorkInTurn,
   type RestartRetryOutcome,
 } from './restart.ts'
@@ -19611,11 +19635,15 @@ const RESTART_DECISION_CLEARING_OUTCOMES: ReadonlySet<RestartRetryOutcome> = new
 
 /** What the re-check round needs (b.jg5 SRJ-505), built by `buildLatchRecheck`. */
 export interface LatchRecheckRoundDeps {
-  /** The server's latch: its own query and record, and, for the run's permit, its set observers. */
-  readonly latch: Pick<ConflictLatch, 'isLatched' | 'record'> & Partial<Pick<ConflictLatch, 'addSetObserver'>>
+  /**
+   * The server's latch: its own query and record; for the run's permit and
+   * the single retry after a cleared probe, its set observers; and, for a
+   * "this row's own id" single retry refused again, its probe-dropped mark.
+   */
+  readonly latch: Pick<ConflictLatch, 'isLatched' | 'record'> & Partial<Pick<ConflictLatch, 'addSetObserver' | 'setProbeDropped'>>
   /** The applied configuration now, read at each round. */
   readonly appliedConfig: () => PersonaConfig | null | undefined
-  /** The one clear hand-off: every cleared outcome, and a probe that found the condition cleared. */
+  /** The one clear hand-off: every cleared outcome. */
   readonly clearHandOff: LatchRecheckClearHandOff
   /**
    * The run of the restart path's decision from inside the round's
@@ -19776,8 +19804,10 @@ function paneReadErrorOf(failure: PaneReadFailure | undefined): unknown {
  *      - a clear by the read goes to the clear hand-off, with no call;
  *      - the probe and the lap `read-pane` (`latchRecheckReadPane`), judged by
  *        `decideLatchRecheckProbe` and `decideLatchRecheckPendingReadPane`: a
- *        probe that finds the condition cleared is handed off as such (the
- *        persona stays latched); the lap read's pane or GONE clears; a new
+ *        probe that finds the condition cleared is followed, in this round
+ *        and with the persona still latched, by one bypassing `find-missing`
+ *        and the single retry (`latchRecheckClearedProbeRetry`); the lap
+ *        read's pane or GONE clears; a new
  *        CONFLICT case there relatches through the CONFLICT entry, and an
  *        UNUSABLE NAME relatches through the unusable-name entry, each with
  *        the state step 1 read;
@@ -19800,7 +19830,7 @@ export async function runLatchRecheckRound(key: string, deps: LatchRecheckRoundD
   const found = appliedPersonaOf(deps.appliedConfig, key)
   const ref = found === undefined ? keyRef(key) : personaRef(found.persona)
   let decidedRecord = record
-  let clearedBy: Exclude<LatchRecheckClearedBy, typeof RECHECK_CLEARED_BY_PROBE> = RECHECK_CLEARED_BY_RETRY
+  let clearedBy: LatchRecheckClearedBy = RECHECK_CLEARED_BY_RETRY
   let handedOff = false
   const log = (line: string): void => {
     try {
@@ -19811,7 +19841,7 @@ export async function runLatchRecheckRound(key: string, deps: LatchRecheckRoundD
   }
   const handOff = (cleared: Parameters<LatchRecheckClearHandOff>[1]): void => {
     if (handedOff) return
-    if (cleared.by !== RECHECK_CLEARED_BY_PROBE) handedOff = true
+    handedOff = true
     try {
       deps.clearHandOff(key, cleared)
     } catch (thrown) {
@@ -19885,13 +19915,19 @@ export async function runLatchRecheckRound(key: string, deps: LatchRecheckRoundD
           : decideLatchRecheckProbe(after.latchCase, read.answer)
         let answer: string = verdict
         if (verdict === RECHECK_VERDICT_CLEARED) {
-          if (pending) {
-            clearedBy = RECHECK_CLEARED_BY_PENDING_READ_PANE
-            handOff({ by: clearedBy, record: after, reason: LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED })
-          } else {
-            handOff({ by: RECHECK_CLEARED_BY_PROBE, record: after })
-            answer = 'probe-cleared'
+          if (!pending) {
+            const retry = await latchRecheckClearedProbeRetry(key, after, reading, found, ref, deps, scope, (by) => {
+              clearedBy = by
+            })
+            line(
+              after.latchCase,
+              `${decision.call}+${retry.call}`,
+              `probe-cleared (${read.answer.kind}); ${'action' in retry ? answerAfter(retry.action) : retry.said}`,
+            )
+            return
           }
+          clearedBy = RECHECK_CLEARED_BY_PENDING_READ_PANE
+          handOff({ by: clearedBy, record: after, reason: LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED })
         } else if (verdict === RECHECK_VERDICT_RELATCH) {
           answer = `relatch: ${latchOnConflict(key, paneReadErrorOf(read.failure), REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, scope.lastRead)}`
         } else if (verdict === RECHECK_VERDICT_UNUSABLE_NAME) {
@@ -19940,6 +19976,103 @@ export async function runLatchRecheckRound(key: string, deps: LatchRecheckRoundD
       }
     }
   })
+}
+
+/** What the single retry after a cleared probe made: its call label and the retry's action, or why none was made. */
+type ClearedProbeRetry =
+  | { readonly call: string; readonly action: string }
+  | { readonly call: string; readonly said: string }
+
+/**
+ * After a re-check's probe found the condition cleared (b.jg5 SRJ-506; hatch
+ * A3), inside the round, its scope and P's serializer turn, with P still
+ * latched until the retry's answer clears it:
+ *
+ *   1. the single retry's call (`decideClearedProbeRetry` on the record,
+ *      step 1's reading and the retired-key reading): none, for a plain
+ *      spawn whose step-1 row reads live, ends here with no further call;
+ *   2. one bypassing `find-missing` (`bypassingFindMissingSweep`, no
+ *      next-step `get`). A refusal (UNAVAILABLE, ENVIRONMENT, CONFIG,
+ *      UNCLASSIFIED) means no retry in this round and no post: P stays
+ *      latched, and the next round probes again; inside the scope it arms
+ *      nothing, a CONFIG answer raises `ad-config-malformed` and an
+ *      ENVIRONMENT answer `tmux-unavailable`. Its post-run `get` skips the
+ *      latched P, so it never relatches P; its latched answer
+ *      (`FIND_MISSING_LATCHED`, for a P latched before the run), a result
+ *      and any other failure all go on to the retry;
+ *   3. exactly one retry, through the same handlers and permit as the
+ *      round's own: a launch (`latchRecheckLaunch`, cleared as a retry) or
+ *      one run of the restart path's decision (`latchRecheckRestartDecision`).
+ *      Its answer is judged as any retry's: an `ErrInstanceIdCollision`
+ *      gives no information (no post, no get-then-act).
+ *
+ * A "this row's own id" `resume` or reuse whose single retry is refused
+ * again with that case (a same-case set seen during the retry, the latch
+ * still on that case after it) has its probe dropped for the rest of the
+ * episode (`setProbeDropped`, b.jg5 SRJ-505's first table row), with one
+ * line. `setClearedBy` tells the round what a clear during the retry is.
+ * Never throws.
+ *
+ *   [slack] latch-recheck: <ref>'s "this row's own id" single retry was refused again with that case — its probe is dropped for the rest of this episode (b.jg5 SRJ-505)
+ */
+async function latchRecheckClearedProbeRetry(
+  key: string,
+  record: ConflictLatchRecord,
+  reading: LatchRecheckReading,
+  found: { readonly persona: Persona; readonly config: PersonaConfig },
+  ref: string,
+  deps: LatchRecheckRoundDeps,
+  scope: LatchRecheckRoundScope,
+  setClearedBy: (by: LatchRecheckClearedBy) => void,
+): Promise<ClearedProbeRetry> {
+  const call = decideClearedProbeRetry(record, reading, retiredKeyReadingOf(key).recorded)
+  if (call === RECHECK_CALL_NONE) {
+    return { call: RECHECK_CALL_NONE, said: `no retry (row ${describeLatchRowState(scope.lastRead)})` }
+  }
+  const sweep = await bypassingFindMissingSweep(key, LATCH_RECHECK_SITE)
+  if (sweep === FIND_MISSING_REFUSED) return { call: 'find-missing', said: 'find-missing refused; no retry' }
+  const now = latchRecordOf(deps.latch, key)
+  if (now === undefined) return { call: 'find-missing', said: 'not-latched' }
+  if (now.latchCase !== record.latchCase) return { call: 'find-missing', said: `relatched (case=${now.latchCase})` }
+  let sameCaseSet = false
+  let removeObserver: (() => void) | undefined
+  try {
+    removeObserver = deps.latch.addSetObserver?.((event) => {
+      if (event.key === key && event.outcome === CONFLICT_LATCH_SET_SAME_CASE) sameCaseSet = true
+    })
+  } catch {
+    removeObserver = undefined
+  }
+  let action: string
+  try {
+    if (call === RECHECK_CALL_RESTART_DECISION) {
+      setClearedBy(RECHECK_CLEARED_BY_RESTART_DECISION)
+      action = await latchRecheckRestartDecision(key, found.persona, deps, scope)
+    } else {
+      setClearedBy(RECHECK_CLEARED_BY_RETRY)
+      action = await latchRecheckLaunch(call, found, ref, scope.lastRead)
+    }
+  } finally {
+    try {
+      removeObserver?.()
+    } catch {
+      /* the observer only marks a same-case answer this retry has had */
+    }
+  }
+  if (record.latchCase === LATCH_CASE_OWN_ID && sameCaseSet && latchRecordOf(deps.latch, key)?.latchCase === LATCH_CASE_OWN_ID) {
+    let dropped = false
+    try {
+      dropped = deps.latch.setProbeDropped?.(key) === true
+    } catch {
+      dropped = false
+    }
+    if (dropped) {
+      console.error(
+        `[slack] ${LATCH_RECHECK_SITE}: ${ref}'s "this row's own id" single retry was refused again with that case — its probe is dropped for the rest of this episode (b.jg5 SRJ-505)`,
+      )
+    }
+  }
+  return { call: `find-missing+${call}`, action }
 }
 
 /**
@@ -20173,13 +20306,296 @@ function revokeLatchRecheckRunPermit(key: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// The re-check's production dependencies (b.jg5 SRJ-505)
+// After a latch clears (b.jg5 SRJ-506)
+// ---------------------------------------------------------------------------
+
+/** The head of the after-clear sequence's lines. */
+const LATCH_CLEAR_SITE = 'latch-clear'
+
+/** The persona was not latched: the clear entry did nothing, and nothing followed. */
+export const LATCH_CLEAR_SEQUENCE_NOT_LATCHED = 'not-latched'
+/** The persona is not in the applied configuration when the run's turn came: cleared, with no `find-missing` and no retry. */
+export const LATCH_CLEAR_SEQUENCE_NOT_APPLIED = 'not-applied'
+/** The bypassing `find-missing` was refused: no launch in that attempt; the persona is left to its retry timer. */
+export const LATCH_CLEAR_SEQUENCE_FIND_MISSING_REFUSED = 'find-missing-refused'
+/**
+ * The persona was latched again when the run's turn came (no call), or by
+ * the time the bypassing `find-missing` was done (a note still present): no
+ * retry.
+ */
+export const LATCH_CLEAR_SEQUENCE_RELATCHED = 'relatched'
+/** The persona was retried at once; `outcome` is the in-turn retry entry's answer. */
+export const LATCH_CLEAR_SEQUENCE_RETRIED = 'retried'
+/** The retry rejected (an unguarded dependency threw), or the run could not be submitted or rejected in the serializer. */
+export const LATCH_CLEAR_SEQUENCE_RETRY_FAILED = 'retry-failed'
+
+/** What one after-clear sequence did. */
+export type LatchClearSequenceOutcome =
+  | {
+      readonly kind:
+        | typeof LATCH_CLEAR_SEQUENCE_NOT_LATCHED
+        | typeof LATCH_CLEAR_SEQUENCE_NOT_APPLIED
+        | typeof LATCH_CLEAR_SEQUENCE_FIND_MISSING_REFUSED
+        | typeof LATCH_CLEAR_SEQUENCE_RELATCHED
+        | typeof LATCH_CLEAR_SEQUENCE_RETRY_FAILED
+    }
+  | { readonly kind: typeof LATCH_CLEAR_SEQUENCE_RETRIED; readonly outcome: RestartRetryOutcome }
+
+/** What the after-clear sequence needs. */
+export interface LatchClearSequenceDeps {
+  /** The one clear entry (`createLatchClear`, `src/conflict-latch.ts`). */
+  readonly clear: LatchClear
+  /** The applied configuration now. */
+  readonly appliedConfig: () => PersonaConfig | null | undefined
+  /**
+   * The one persona lifecycle serializer's submit (`PersonaSerializer.run`):
+   * a clear made outside the persona's turn (`runLatchClearSequence`)
+   * submits the sequence's run through it, never awaiting it from inside a
+   * turn.
+   */
+  readonly serialize: <T>(key: string, operation: () => T | Promise<T>) => Promise<T>
+  /**
+   * The persona's retry at once, called inside the run's serializer turn, so
+   * it must not submit through the serializer: one run of the restart path's
+   * decision through the in-turn retry entry (default:
+   * `runRestartRetryInTurn`, `src/restart.ts`, with the server's "blocks a
+   * retry" query, `personaRetryBlockCause`).
+   */
+  readonly retryAtOnce?: (key: string, cwd: string) => Promise<RestartRetryOutcome>
+  /** Where the sequence's lines go. A throwing log is swallowed. */
+  readonly log: (line: string) => void
+}
+
+/** How the after-clear sequence runs. */
+export interface LatchClearSequenceOptions {
+  /**
+   * Whether one bypassing `find-missing` runs before the retry: true (the
+   * default) after a clear by the re-check's step 1 or by hand; false after a
+   * "launch start not recorded" latch's clear on `ended` or `missing` and a
+   * "conflicting labels" latch's clear by its `read-pane` of a `pending` row
+   * (b.jg5 SRJ-506; hatch A3).
+   */
+  readonly findMissingFirst?: boolean
+}
+
+/**
+ * The default retry at once: the in-turn retry entry with the server's
+ * "blocks a retry" query (b.jg5 SRJ-303), its gates and accounting those of
+ * the retry entry.
+ */
+function retryPersonaInTurn(key: string, cwd: string): Promise<RestartRetryOutcome> {
+  return runRestartRetryInTurn(key, cwd, (k) => personaRetryBlockCause(k) !== undefined, personaRetryBlockCause)
+}
+
+/**
+ * A clear the after-clear sequence's run follows: `run`, the one job to run
+ * inside the persona's lifecycle serializer turn (never rejects), and
+ * `release`, which ends the persona's active hold when the run will never
+ * run (the run releases it itself when it ends). Both are idempotent.
+ */
+interface LatchClearRun {
+  readonly run: () => Promise<LatchClearSequenceOutcome>
+  readonly release: () => void
+}
+
+/**
+ * The clear of persona `key` with `reason` and what follows it at once
+ * (b.jg5 SRJ-506): the clear entry (`deps.clear`: one recovery post, the
+ * episode ended, the re-check timer stopped, one line); for an unlatched
+ * persona nothing more (undefined). Otherwise the persona's working-row
+ * evidence is forgotten (`forgetWorkingRowEvidence`: a released persona
+ * starts with none) and the persona is held active (`holdRestartActive`)
+ * until the run ends, so the health tick, which skips an active persona
+ * before any read, reads nothing of its row before the run's `find-missing`;
+ * and the run is answered, unstarted. Synchronous; never throws.
+ */
+function clearForSequence(key: string, reason: LatchRecoveryReason, deps: LatchClearSequenceDeps, findMissingFirst: boolean): LatchClearRun | undefined {
+  if (!deps.clear(key, reason)) return undefined
+  forgetWorkingRowEvidence(key)
+  const release = holdRestartActive(key)
+  let ran: Promise<LatchClearSequenceOutcome> | undefined
+  return {
+    run: () => {
+      ran ??= runOutsideAttempts(() => afterLatchCleared(key, deps, findMissingFirst)).finally(release)
+      return ran
+    },
+    release,
+  }
+}
+
+/** `deps.log(line)`, a throw swallowed. */
+function logLatchClear(deps: LatchClearSequenceDeps, line: string): void {
+  try {
+    deps.log(line)
+  } catch {
+    /* a failing log changes nothing the sequence does */
+  }
+}
+
+/**
+ * The after-clear sequence for a clear made outside persona `key`'s
+ * lifecycle serializer turn (b.jg5 SRJ-506, SRJ-120): a clear by hand,
+ * through `clearAndRecover` (`buildLatchRecheck`). The clear is made
+ * synchronously, before this function returns (`clearForSequence`): one
+ * recovery post, the episode ended, the re-check timer stopped, one line;
+ * an unlatched persona gets nothing more (`not-latched`). Then the
+ * sequence's run is submitted through the persona's serializer
+ * (`deps.serialize`), as one job, outside every launch or recovery attempt
+ * and every latch re-check (`runOutsideAttempts`), so no re-check scope or
+ * permit carries into it. Answers once the run has ended. Never awaited
+ * from inside the persona's serializer turn: the run waits for that turn.
+ *
+ * The run, in its turn, in order:
+ *   1. a persona not in the applied configuration gets no call
+ *      (`not-applied`); a persona latched again meanwhile gets none either
+ *      (`relatched`);
+ *   2. unless `options.findMissingFirst` is false, one bypassing
+ *      `find-missing` (`bypassingFindMissingSweep`, no next-step `get`), as a
+ *      recovery attempt of the persona (`runInAttempt`), before anything
+ *      next reads its row. Its post-run `get` of the persona's row, when the
+ *      run lists it in `unverified_ids`, latches it again on a
+ *      `provenance_conflict` note still present, with a new post
+ *      (`relatched`: no retry). A refusal (UNAVAILABLE, ENVIRONMENT, CONFIG,
+ *      UNCLASSIFIED) stops that attempt with no launch: being inside the
+ *      attempt, its answer arms the persona's retry timer and raises its
+ *      outage as its class says (`find-missing-refused`). A result or any
+ *      other failure goes on;
+ *   3. the persona retried at once, in the same turn: one run of the restart
+ *      path's decision through the in-turn retry entry (`deps.retryAtOnce`),
+ *      with the retry entry's gates (latched, held, "blocks a retry", the
+ *      restart cap) and accounting, which arms the retry timer for a
+ *      `pending` row (b.jg5 SRJ-409) or starts the live-row sequence for a
+ *      retired key's row (SRJ-411) as its decision says (`retried`).
+ * From the clear to the run's end the persona is held active
+ * (`holdRestartActive`). A run that cannot be submitted, or that the
+ * serializer rejects, answers `retry-failed` with one line and releases the
+ * hold. One line per step after the clear. Never rejects.
+ *
+ *   [slack] latch-clear: <ref> is not in the applied configuration — no find-missing and no retry after its latch cleared (b.jg5 SRJ-506)
+ *   [slack] latch-clear: <ref> is latched again before the run that follows its clear — nothing is called for it (b.jg5 SRJ-506, SRJ-502)
+ *   [slack] latch-clear: the bypassing find-missing after <ref>'s latch cleared was refused — no launch in this attempt; the persona is left to its retry timer (b.jg5 SRJ-506, SRJ-120)
+ *   [slack] latch-clear: <ref> is latched again after the bypassing find-missing that followed its clear — no retry (b.jg5 SRJ-506, SRJ-114)
+ *   [slack] latch-clear: <ref>'s retry at once after its latch cleared answered <outcome> (b.jg5 SRJ-506)
+ *   [slack] latch-clear: <ref>'s retry at once after its latch cleared failed: <error> (b.jg5 SRJ-506)
+ *   [slack] latch-clear: the run after <ref>'s latch cleared could not be run in its serializer turn: <error> (b.jg5 SRJ-506)
+ */
+export function runLatchClearSequence(
+  key: string,
+  reason: LatchRecoveryReason,
+  deps: LatchClearSequenceDeps,
+  options: LatchClearSequenceOptions = {},
+): Promise<LatchClearSequenceOutcome> {
+  return runOutsideAttempts(() => {
+    const cleared = clearForSequence(key, reason, deps, options.findMissingFirst !== false)
+    if (cleared === undefined) return Promise.resolve({ kind: LATCH_CLEAR_SEQUENCE_NOT_LATCHED })
+    const notRun = (thrown: unknown): LatchClearSequenceOutcome => {
+      cleared.release()
+      logLatchClear(deps, `[slack] ${LATCH_CLEAR_SITE}: the run after ${keyRef(key)}'s latch cleared could not be run in its serializer turn: ${describeThrownValue(thrown)} (b.jg5 SRJ-506)`)
+      return { kind: LATCH_CLEAR_SEQUENCE_RETRY_FAILED }
+    }
+    try {
+      return deps.serialize(key, cleared.run).catch(notRun)
+    } catch (thrown) {
+      return Promise.resolve(notRun(thrown))
+    }
+  })
+}
+
+/** The after-clear sequence's run (`runLatchClearSequence`'s steps 1 to 3), in the persona's serializer turn. Never rejects. */
+async function afterLatchCleared(key: string, deps: LatchClearSequenceDeps, findMissingFirst: boolean): Promise<LatchClearSequenceOutcome> {
+  const found = appliedPersonaOf(deps.appliedConfig, key)
+  if (found === undefined) {
+    logLatchClear(deps, `[slack] ${LATCH_CLEAR_SITE}: ${keyRef(key)} is not in the applied configuration — no find-missing and no retry after its latch cleared (b.jg5 SRJ-506)`)
+    return { kind: LATCH_CLEAR_SEQUENCE_NOT_APPLIED }
+  }
+  const ref = personaRef(found.persona)
+  if (personaLatchedNow(key)) {
+    logLatchClear(deps, `[slack] ${LATCH_CLEAR_SITE}: ${ref} is latched again before the run that follows its clear — nothing is called for it (b.jg5 SRJ-506, SRJ-502)`)
+    return { kind: LATCH_CLEAR_SEQUENCE_RELATCHED }
+  }
+  if (findMissingFirst) {
+    const sweep = await runInAttempt(key, 'recovery', () => bypassingFindMissingSweep(key, LATCH_CLEAR_SITE))
+    if (sweep === FIND_MISSING_REFUSED) {
+      logLatchClear(
+        deps,
+        `[slack] ${LATCH_CLEAR_SITE}: the bypassing find-missing after ${ref}'s latch cleared was refused — no launch in this attempt; the persona is left to its retry timer (b.jg5 SRJ-506, SRJ-120)`,
+      )
+      return { kind: LATCH_CLEAR_SEQUENCE_FIND_MISSING_REFUSED }
+    }
+    if (sweep === FIND_MISSING_LATCHED) {
+      logLatchClear(deps, `[slack] ${LATCH_CLEAR_SITE}: ${ref} is latched again after the bypassing find-missing that followed its clear — no retry (b.jg5 SRJ-506, SRJ-114)`)
+      return { kind: LATCH_CLEAR_SEQUENCE_RELATCHED }
+    }
+  }
+  try {
+    const outcome = await (deps.retryAtOnce ?? retryPersonaInTurn)(key, found.persona.working_directory)
+    logLatchClear(deps, `[slack] ${LATCH_CLEAR_SITE}: ${ref}'s retry at once after its latch cleared answered ${outcome} (b.jg5 SRJ-506)`)
+    return { kind: LATCH_CLEAR_SEQUENCE_RETRIED, outcome }
+  } catch (thrown) {
+    logLatchClear(deps, `[slack] ${LATCH_CLEAR_SITE}: ${ref}'s retry at once after its latch cleared failed: ${describeThrownValue(thrown)} (b.jg5 SRJ-506)`)
+    return { kind: LATCH_CLEAR_SEQUENCE_RETRY_FAILED }
+  }
+}
+
+/**
+ * The re-check's clear hand-off for one round (b.jg5 SRJ-506), over the
+ * after-clear sequence's dependencies, called synchronously inside the
+ * round:
+ *   - a clear that launched nothing (`RECHECK_CLEARS_THAT_LAUNCHED_NOTHING`)
+ *     is made at once (`clearForSequence`: the clear, the persona held
+ *     active), and its run is handed to `owe`, unstarted: the round's
+ *     operation runs it right after the round, in the same serializer turn
+ *     and outside the round's scope (`buildLatchRecheck`), so nothing else in
+ *     that turn's queue runs between the clear and the run. Step 1's clear
+ *     runs one bypassing `find-missing` first; a "launch start not recorded"
+ *     latch's clear on `ended` or `missing` (its one bring-up retry) and a
+ *     "conflicting labels" latch's clear by its `pending` `read-pane` run
+ *     none;
+ *   - a clear by a retry that was not refused (a retry at the cadence, a
+ *     finished-row retry, a run of the restart path's decision, the single
+ *     retry after a cleared probe) is the clear entry only: the retry's own
+ *     outcome stands, with no second launch.
+ * Never throws.
+ */
+function createLatchRecheckClearHandOff(deps: LatchClearSequenceDeps, owe: (run: LatchClearRun) => void): LatchRecheckClearHandOff {
+  return (key, cleared) => {
+    if (!RECHECK_CLEARS_THAT_LAUNCHED_NOTHING.has(cleared.by)) {
+      deps.clear(key, cleared.reason)
+      return
+    }
+    const run = clearForSequence(key, cleared.reason, deps, cleared.by === RECHECK_CLEARED_BY_STEP_1)
+    if (run !== undefined) owe(run)
+  }
+}
+
+/**
+ * One re-check round for persona `key` as the re-check's timer runs it,
+ * inside the persona's serializer turn (b.jg5 SRJ-505, SRJ-506): the round
+ * (`runLatchRecheckRound`), then, when its hand-off made a clear that
+ * launched nothing, the after-clear sequence's run, awaited in the same
+ * turn. Never rejects.
+ */
+async function runLatchRecheckRoundThenOwed(key: string, input: LatchRecheckInput, sequenceDeps: LatchClearSequenceDeps): Promise<void> {
+  const owed: { run?: LatchClearRun } = {}
+  const clearHandOff = createLatchRecheckClearHandOff(sequenceDeps, (run) => {
+    owed.run?.release()
+    owed.run = run
+  })
+  try {
+    await runLatchRecheckRound(key, { latch: input.latch, appliedConfig: input.appliedConfig, clearHandOff, log: input.log })
+  } finally {
+    if (owed.run !== undefined) await owed.run.run()
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The re-check's production dependencies (b.jg5 SRJ-505, SRJ-506)
 // ---------------------------------------------------------------------------
 
 /** What `buildLatchRecheck` composes the re-check from. */
 export interface LatchRecheckInput {
   /** The server's one latch. */
-  readonly latch: Pick<ConflictLatch, 'isLatched' | 'record' | 'forget' | 'addSetObserver'>
+  readonly latch: Pick<ConflictLatch, 'isLatched' | 'record' | 'forget' | 'addSetObserver' | 'setProbeDropped'>
   /** The re-check timers' clock (the system clock in production). */
   readonly clock: LatchRecheckClock
   /** The one persona lifecycle serializer's submit (`PersonaSerializer.run`). */
@@ -20188,17 +20604,31 @@ export interface LatchRecheckInput {
   readonly appliedConfig: () => PersonaConfig | null | undefined
   /** Where the re-check's lines go. */
   readonly log: (line: string) => void
-  /**
-   * The server's notice episodes (the latch notices'), for the clear's
-   * recovery post and episode end (SRJ-506's clear). The silent clear reads
-   * nothing of them.
-   */
+  /** The server's notice episodes (the latch notices'), for the clear's recovery post and episode end (SRJ-506's clear). */
   readonly episodes: ConflictNoticeEpisodes
 }
 
+/** The re-check as built: its timers, the one clear entry and the after-clear sequence over it. */
+export interface LatchRecheck extends LatchRecheckController {
+  /**
+   * The one clear entry (`createLatchClear` over the latch, the notice
+   * episodes and these timers' stop): every clear goes through it.
+   */
+  readonly clear: LatchClear
+  /**
+   * The after-clear sequence (`runLatchClearSequence`) over `clear`, with
+   * its bypassing `find-missing` first: for a clear by hand, with
+   * `LATCH_RECOVERY_REASON_CLEARED_BY_HAND`. The clear is made before it
+   * returns; its run is submitted through the persona's serializer, and the
+   * answer settles once that run has ended. Never awaited from inside the
+   * persona's serializer turn.
+   */
+  readonly clearAndRecover: (key: string, reason: LatchRecoveryReason) => Promise<LatchClearSequenceOutcome>
+}
+
 /**
- * The re-check's production composition (b.jg5 SRJ-505), built once per
- * server: `main()` and the recovery harness both call it, so the re-check
+ * The re-check's production composition (b.jg5 SRJ-505, SRJ-506), built once
+ * per server: `main()` and the recovery harness both call it, so the re-check
  * runs identically in both. It builds the re-check timers
  * (`createLatchRecheckController`) over `input.clock`, the latch's own
  * query and the one persona serializer, each round being
@@ -20206,37 +20636,49 @@ export interface LatchRecheckInput {
  *   - step 1's reads through the shared own-row reads (`readPersonaOwnRow`,
  *     `readPersonaOwnRowStatus`), with their latch rules;
  *   - the probe and the lap `read-pane` through the outage wrapper with the
- *     one-line count;
+ *     one-line count, a cleared probe's bypassing `find-missing` through
+ *     `bypassingFindMissingSweep`;
  *   - the retries through the one handler each (`plainSpawnOutcomeAt`,
  *     `reuseSpawnForPersona`, `resumeAtSite`) and the run of the restart
  *     path's decision through `runRestartWorkInTurn` with the re-check's
  *     permit;
  *   - the no-information scope (`runInLatchRecheck`), the latch's CONFLICT
- *     and unusable-name entries for a relatch, and the CONFIG outage raised
- *     by the wrapper;
- *   - the clear hand-off: the silent clear (`createSilentLatchRecheckClear`:
- *     the latch's silent forget and this controller's stop of the persona's
- *     timer).
- * Answers the controller; the caller binds its observer to the latch
+ *     and unusable-name entries for a relatch, its probe-dropped mark, and
+ *     the CONFIG outage raised by the wrapper;
+ *   - the clear hand-off (`createLatchRecheckClearHandOff`): the one clear
+ *     entry (`createLatchClear` over the latch, `input.episodes` and this
+ *     controller's stop of the persona's timer) and, after a clear that
+ *     launched nothing, the after-clear sequence's run
+ *     (`runLatchRecheckRoundThenOwed`), right after the round in the same
+ *     serializer turn, its retry through `runRestartRetryInTurn`.
+ * Answers the controller with the clear entry and the after-clear sequence
+ * (`LatchRecheck`); the caller binds its observer to the latch
  * (`bindLatchRecheck`) after the holds and the notice, stops a persona's
  * timer wherever it forgets the persona's latch at a teardown, and calls
  * `stopAll` at shutdown. The builder reads nothing and starts nothing when
  * called.
  */
-export function buildLatchRecheck(input: LatchRecheckInput): LatchRecheckController {
+export function buildLatchRecheck(input: LatchRecheckInput): LatchRecheck {
   let controller: LatchRecheckController | undefined
-  const clearHandOff = createSilentLatchRecheckClear({
+  const clear = createLatchClear({
     latch: input.latch,
+    episodes: input.episodes,
     stopTimer: (key) => {
       controller?.stop(key)
     },
+    log: input.log,
   })
+  const sequenceDeps: LatchClearSequenceDeps = { clear, appliedConfig: input.appliedConfig, serialize: input.serialize, log: input.log }
   controller = createLatchRecheckController({
     clock: input.clock,
     isLatched: (key) => input.latch.isLatched(key),
     serialize: input.serialize,
-    round: (key) => runLatchRecheckRound(key, { latch: input.latch, appliedConfig: input.appliedConfig, clearHandOff, log: input.log }),
+    round: (key) => runLatchRecheckRoundThenOwed(key, input, sequenceDeps),
     log: input.log,
   })
-  return controller
+  return {
+    ...controller,
+    clear,
+    clearAndRecover: (key, reason) => runLatchClearSequence(key, reason, sequenceDeps),
+  }
 }

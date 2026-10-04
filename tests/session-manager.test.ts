@@ -1243,6 +1243,8 @@ import {
   LATCH_RECHECK_INTERVAL_MS,
   LATCH_RECOVERY_REASON_RELAUNCH_NOT_REFUSED,
   LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED,
+  LATCH_KIND_CONFLICT,
+  latchRecoveryText,
   RECHECK_CALL_FINISHED_ROW,
   RECHECK_CALL_NONE,
   RECHECK_CALL_PLAIN_SPAWN,
@@ -1250,7 +1252,6 @@ import {
   RECHECK_CALL_RESUME,
   RECHECK_CALL_REUSE_SPAWN,
   RECHECK_CLEARED_BY_FINISHED_ROW_RETRY,
-  RECHECK_CLEARED_BY_PROBE,
   RECHECK_CLEARED_BY_RESTART_DECISION,
   RECHECK_CLEARED_BY_RETRY,
   latchRecheckRoundLine,
@@ -31251,7 +31252,7 @@ describe('b.jg5 SRJ-412, SRJ-705: the abort\'s live-row sequence start (startStu
 // `advanceToRecheck`), or, where a case must see the clear hand-off itself,
 // one round driven directly (`runLatchRecheckRound` inside P's serializer
 // turn, with a hand-off that records what had happened when it was called
-// and then forgets the latch, as T1's silent clear does). P is latched
+// and then forgets the latch, a stand-in for the clear entry). P is latched
 // through the latch's own set entry (`latchSet`), as a latching site
 // latches it, with the stub's CONFLICT description for the case.
 //
@@ -31276,9 +31277,10 @@ describe('b.jg5 SRJ-412, SRJ-705: the abort\'s live-row sequence start (startStu
 // post are tests/conflict-latch.test.ts's; the no-information scope at the
 // wrappers and the timer, tests/outage-state.test.ts's and
 // tests/unavailable-retry.test.ts's; the permit inside
-// `runRestartWorkInTurn`, tests/restart.test.ts's. T1's clear is the silent
-// hand-off (T2 adds the recovery post): a cleared case asserts the latch and
-// its timer gone, never that nothing was posted.
+// `runRestartWorkInTurn`, tests/restart.test.ts's. The clear's one recovery
+// post, its reason, the episode's end and the after-clear sequence (SRJ-506)
+// are tests/conflict-latch.test.ts's: a cleared case here asserts the latch
+// and its timer gone.
 // ---------------------------------------------------------------------------
 
 /** A CONFLICT refusing `verb` with the stub's case `stubCase`, quoting P's session name. */
@@ -31369,7 +31371,7 @@ function recheckRoundLineHead(key: string, latchCase: LatchCase, call: string): 
   return latchRecheckRoundLine(renderPersonaRef(key, key), latchCase, call, '')
 }
 
-/** P's latch and its re-check timer are gone: the silent clear (T1). */
+/** P's latch and its re-check timer are gone: the clear entry ran (its post is tests/conflict-latch.test.ts's). */
 function expectRecheckCleared(h: RecoveryHarness, p: string): void {
   expect([h.latch.isLatched(p), h.latch.record(p), h.latchRecheck.isArmed(p)]).toEqual([false, undefined, false])
 }
@@ -31596,7 +31598,7 @@ describe('b.jg5 SRJ-505, HO rev 28: each refused operation and step-1 reading ge
     expect(lines).toHaveLength(1)
     expect(lines[0]).toStartWith(recheckRoundLineHead(p, c.latch.latchCase, c.call))
     if (launched) {
-      // A launch that was not refused clears the latch (the silent hand-off) and stops its timer.
+      // A launch that was not refused clears the latch (through the clear entry) and stops its timer.
       expectRecheckCleared(h, p)
       if (h.approverRunning(p)) await h.runApproverToStop(p)
     } else {
@@ -31885,8 +31887,10 @@ describe('b.jg5 SRJ-506, SRJ-111, SRJ-112, SRJ-113: every row of the launch\'s o
 
   // b.jg5 SRJ-113, SRJ-111, SRJ-501: the plain spawn after the re-check resume's
   // ErrSpawnNotFound runs once the latch has cleared, so its scan CONFLICT
-  // latches P anew, with "plain spawn" and the state the re-check read.
-  test('a resume latch\'s retry answering ErrSpawnNotFound, then the plain spawn\'s scan CONFLICT: the latch cleared, then P latched anew with "plain spawn" and the state step 1 read; no latch-time read', async () => {
+  // latches P anew, with "plain spawn" and the state the re-check read. The
+  // clear posts its one recovery notice first (SRJ-506, SRJ-1005: "a retry of
+  // the refused operation was not refused"), then the new latch posts anew.
+  test('a resume latch\'s retry answering ErrSpawnNotFound, then the plain spawn\'s scan CONFLICT: the latch cleared with one recovery notice, then P latched anew with "plain spawn" and the state step 1 read, with one new post; no latch-time read', async () => {
     const { h, p } = srj105Build({ latchRecheck: true })
     latchForRecheck(h, p, RESUME_RECHECK_LATCH, ROW_ENDED)
     const scan = recheckConflict('spawn', 'scan-leftover')
@@ -31900,7 +31904,14 @@ describe('b.jg5 SRJ-506, SRJ-111, SRJ-112, SRJ-113: every row of the launch\'s o
     expect(h.latch.record(p)).toStrictEqual(
       expectedLatchRecord(p, { latchCase: LATCH_CASE_LEFTOVER, refusedOperation: REFUSED_OPERATION_PLAIN_SPAWN, rowState: ROW_ENDED, sessionName: STUB_TMUX_SESSION_NAME, description: scan.errDescription }),
     )
-    expect(h.latchEvents.slice(eventsBefore)).toMatchObject([{ step: 'set', key: p, outcome: CONFLICT_LATCH_SET_LATCHED }, { step: 'hold' }, { step: 'hold' }, { step: 'hold' }, { step: 'notice', key: p }])
+    expect(h.latchEvents.slice(eventsBefore)).toMatchObject([
+      { step: 'notice', key: p, text: latchRecoveryText(LATCH_KIND_CONFLICT, LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED, STUB_TMUX_SESSION_NAME) },
+      { step: 'set', key: p, outcome: CONFLICT_LATCH_SET_LATCHED },
+      { step: 'hold' },
+      { step: 'hold' },
+      { step: 'hold' },
+      { step: 'notice', key: p },
+    ])
     expect(h.latchRecheck.isArmed(p)).toBe(true)
   })
 })
@@ -31977,7 +31988,9 @@ interface RecordedHandOff {
 /**
  * Run one re-check round of P directly, inside P's serializer turn, as the
  * timer runs it, with a hand-off that records what had happened when it was
- * called, then forgets P's latch (T1's silent clear). Answers the hand-offs.
+ * called, then forgets P's latch (a stand-in for the clear entry, whose post
+ * and after-clear sequence tests/conflict-latch.test.ts covers). Answers the
+ * hand-offs.
  */
 async function roundRecordingHandOff(h: RecoveryHarness, p: string, order: readonly string[], deps: Partial<LatchRecheckRoundDeps> = {}): Promise<RecordedHandOff[]> {
   const handOffs: RecordedHandOff[] = []
@@ -31995,7 +32008,7 @@ async function roundRecordingHandOff(h: RecoveryHarness, p: string, order: reado
           notices: h.notices.filter((notice) => notice.key === key).length,
           approverRunning: h.approverRunning(key),
         })
-        if (cleared.by !== RECHECK_CLEARED_BY_PROBE) h.teardownDeps().forgetConflictLatch(key)
+        h.teardownDeps().forgetConflictLatch(key)
       },
       ...deps,
     }),

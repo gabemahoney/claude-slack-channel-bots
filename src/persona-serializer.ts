@@ -19,6 +19,11 @@
  *   retries rerun the same work through the same `serialize`
  *   (`runRestartRetry`), their in-flight check and then the restart cap
  *   first;
+ * - each latch re-check round (`src/conflict-latch.ts`'s timer) and, in the
+ *   same turn after a round whose clear launched nothing, the after-clear
+ *   sequence's run (its `find-missing`, then the retry entry's work in that
+ *   turn, `runRestartRetryInTurn`); a clear by hand submits that run itself
+ *   (`runLatchClearSequence`, `src/session-manager.ts`);
  * - each bring-up retry attempt, through to the launch it triggers
  *   (`persona-bringup-controller.ts`, through its `serialize` dependency): a
  *   directory re-check with its Slack step and launch, and the launch after a

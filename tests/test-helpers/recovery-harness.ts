@@ -446,8 +446,10 @@
  *   harness's serializer `serializer.run` as `main()`'s
  *   `personaLifecycle.run`, the live applied configuration, `console.error`
  *   as its log, so its lines and its round's lines go to `errors`, and the
- *   latch notice's episodes; its silent clear forgets the latch and stops
- *   the timer). With `options.latchRecheck` (false when unset, so the
+ *   latch notice's episodes; its clear goes through the one clear entry:
+ *   one recovery post, the episode ended, the timer stopped, then, after a
+ *   clear that launched nothing, the after-clear sequence's run in the same
+ *   serializer turn, b.jg5 SRJ-506). With `options.latchRecheck` (false when unset, so the
  *   suites that assert no call and no timer for a latched persona on the
  *   other automated paths keep their meaning) its observer is bound after
  *   the holds and the notice (`bindLatchRecheck`), so a set runs the holds,
@@ -458,12 +460,14 @@
  *   round settled. Its timers are tracked: `latchRecheck.nextDueAt()` (the
  *   earliest pending re-check's due time, or undefined) and
  *   `pendingTimers()`, beside the controller's `isArmed(key)`,
- *   `armedKeys()` and `whenRoundSettled(key)`. `advanceToRecheck()` moves
+ *   `armedKeys()` and `whenRoundSettled(key)` (a round's settling includes
+ *   the after-clear sequence's run it owes), and the builder's `clear` and
+ *   `clearAndRecover`. `advanceToRecheck()` moves
  *   the clock to the earliest pending re-check, settles its round
  *   (`settle()`) and answers the time it fired at; it throws when none is
  *   pending. `advance` awaits the rounds a firing starts (flush-bounded) and
- *   `settle()` awaits them in real time. Its stops: a clear (the silent
- *   clear's `stop`), every forget of the persona's latch (the binding's
+ *   `settle()` awaits them in real time. Its stops: a clear (the clear
+ *   entry's `stop`), every forget of the persona's latch (the binding's
  *   forget observer: `teardown(key)`, `teardownDeps().forgetConflictLatch`,
  *   `restartServer(key)`), `shutdown()`'s `stopAll` and `cleanup()`'s.
  * - `invalidFlagsHold` (b.jg5 SRJ-207, SRJ-1008, SRJ-1016, SRJ-305): one
@@ -1241,6 +1245,7 @@ import {
   _setDialogReadyTimeoutMs,
   _whenDialogApproverStopped,
   buildLatchRecheck,
+  type LatchRecheck,
   buildLiveRowSequenceDeps,
   cancelWorkingRowWait,
   createOldLifeHoldEndRetry,
@@ -1668,9 +1673,13 @@ export type RecoveryLatchSetEntries = Pick<ConflictLatch, 'set' | 'setFromConfli
 
 /**
  * The harness's latch re-check timers, read-only (b.jg5 SRJ-505): the
- * controller's queries, and the tracked re-check timers on the harness clock.
+ * controller's queries, and the tracked re-check timers on the harness clock;
+ * and the builder's one clear entry and after-clear sequence (`clear`,
+ * `clearAndRecover`; b.jg5 SRJ-506), as `buildLatchRecheck` answers them.
  */
-export interface RecoveryLatchRecheckView extends Pick<LatchRecheckController, 'isArmed' | 'armedKeys' | 'whenRoundSettled'> {
+export interface RecoveryLatchRecheckView
+  extends Pick<LatchRecheckController, 'isArmed' | 'armedKeys' | 'whenRoundSettled'>,
+    Pick<LatchRecheck, 'clear' | 'clearAndRecover'> {
   /** The earliest due time of a pending re-check timer, or undefined when none is pending. */
   nextDueAt(): number | undefined
   /** How many of the harness clock's pending timers are re-check timers. */
@@ -3302,6 +3311,8 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       isArmed: (key: string) => latchRecheck.isArmed(key),
       armedKeys: () => latchRecheck.armedKeys(),
       whenRoundSettled: (key: string) => latchRecheck.whenRoundSettled(key),
+      clear: latchRecheck.clear,
+      clearAndRecover: latchRecheck.clearAndRecover,
       nextDueAt: () => nextDueOf(latchRecheckTimers),
       pendingTimers: () => latchRecheckTimers.size,
     }),

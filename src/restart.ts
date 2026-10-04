@@ -1155,25 +1155,91 @@ export async function runRestartRetry(
   }
   markActive(key)
   try {
-    return await (d.serialize ?? runNow)(key, async (): Promise<RestartRetryOutcome> => {
-      // b.jg5 SRJ-502: a latched persona gets no attempt, whatever else holds.
-      if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
-      // b.jg5 SRJ-207, SRJ-303: nor does a persona held on ErrInvalidFlags.
-      if (skipIfHeld(d, key)) return RESTART_OUTCOME_HELD
-      if (launchInFlight(key, isInFlight)) {
-        // b.jg5 SRJ-303: the skip line names what blocks the retry.
-        console.error(restartRetrySkippedLine(key, readRetryBlockCause(key, blockCause)))
-        return RESTART_OUTCOME_IN_FLIGHT
-      }
-      if (isAtCap(key, RESTART_FAILURE_CAP)) {
-        console.error(`[slack] Restart retry skipped for persona=${key} — the persona is at the restart cap; nothing killed or launched`)
-        return RESTART_OUTCOME_CAPPED
-      }
-      return runRestartWork(d, key, cwd, undefined)
-    })
+    return await (d.serialize ?? runNow)(key, () => restartRetryWork(d, key, cwd, isInFlight, blockCause))
   } finally {
     unmarkActive(key)
   }
+}
+
+/**
+ * The retry entry (`runRestartRetry`) from inside the operation that already
+ * holds persona `key`'s lifecycle serializer turn (b.jg5 SRJ-506): the same
+ * gates in the same order (the latched gate, the held gate, `isInFlight` with
+ * its skip line naming `blockCause`, the restart cap) and the same restart
+ * work and accounting, with no serializer of its own, since awaiting the
+ * retry entry from inside that turn would never settle
+ * (`src/persona-serializer.ts` re-entrancy rule). The key is active
+ * (`isRestartPendingOrActive`) while it runs. Unlike the latch re-check's
+ * run (`runRestartWorkInTurn`) it carries no permit: a latched persona meets
+ * the latched gate. Used by the after-clear sequence's retry at once only.
+ * Before `initRestart` it answers `RESTART_OUTCOME_NOT_INITIALISED` and logs.
+ * Rejects only when an unguarded dependency throws, as the retry entry does.
+ */
+export async function runRestartRetryInTurn(
+  key: string,
+  cwd: string,
+  isInFlight: (key: string) => boolean,
+  blockCause?: (key: string) => RetryBlockCause | undefined,
+): Promise<RestartRetryOutcome> {
+  const d = deps
+  if (!d) {
+    console.error(`[slack] runRestartRetryInTurn: deps not initialized — skipping the retry for persona=${key}`)
+    return RESTART_OUTCOME_NOT_INITIALISED
+  }
+  markActive(key)
+  try {
+    return await restartRetryWork(d, key, cwd, isInFlight, blockCause)
+  } finally {
+    unmarkActive(key)
+  }
+}
+
+/**
+ * Hold persona `key` active (`isRestartPendingOrActive`) until the answered
+ * release is called, as a retry entry waiting for its turn holds it: the
+ * health tick skips the persona before any read, and the lost-message path
+ * sees a restart under way. For the after-clear sequence (b.jg5 SRJ-506),
+ * from its clear to its end, so nothing outside the persona's serializer
+ * reads its row before the sequence's `find-missing` has run. The release is
+ * idempotent; a hold never hides another work still active. Never throws.
+ */
+export function holdRestartActive(key: string): () => void {
+  markActive(key)
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    unmarkActive(key)
+  }
+}
+
+/**
+ * The retry entry's work, in the turn its caller holds or was given: the
+ * latched gate, the held gate, the in-flight check, the restart cap, then the
+ * restart work (`runRestartWork`). Shared by `runRestartRetry` and
+ * `runRestartRetryInTurn`.
+ */
+async function restartRetryWork(
+  d: RestartDeps,
+  key: string,
+  cwd: string,
+  isInFlight: (key: string) => boolean,
+  blockCause: ((key: string) => RetryBlockCause | undefined) | undefined,
+): Promise<RestartRetryOutcome> {
+  // b.jg5 SRJ-502: a latched persona gets no attempt, whatever else holds.
+  if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
+  // b.jg5 SRJ-207, SRJ-303: nor does a persona held on ErrInvalidFlags.
+  if (skipIfHeld(d, key)) return RESTART_OUTCOME_HELD
+  if (launchInFlight(key, isInFlight)) {
+    // b.jg5 SRJ-303: the skip line names what blocks the retry.
+    console.error(restartRetrySkippedLine(key, readRetryBlockCause(key, blockCause)))
+    return RESTART_OUTCOME_IN_FLIGHT
+  }
+  if (isAtCap(key, RESTART_FAILURE_CAP)) {
+    console.error(`[slack] Restart retry skipped for persona=${key} — the persona is at the restart cap; nothing killed or launched`)
+    return RESTART_OUTCOME_CAPPED
+  }
+  return runRestartWork(d, key, cwd, undefined)
 }
 
 /**
