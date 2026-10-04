@@ -3556,6 +3556,10 @@ export async function main(): Promise<void> {
     // and a round that asks before it is built finds it throwing, which the
     // round reads as not up (no launch).
     canRelaunch: (key) => canRelaunch(key),
+    // b.av2 SR-6.3: the cap wins over the re-check. A persona at the restart
+    // cap gets its reads, so its latch can still clear, but no launch and no
+    // run of the restart path's decision from a round.
+    isAtCap: (key) => backoffIsAtCap(key, RESTART_FAILURE_CAP),
   })
   latchRecheckTimers = latchRecheck
   bindLatchRecheck(conflictLatch, latchRecheck)

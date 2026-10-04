@@ -654,16 +654,18 @@ import {
 } from '../src/persona-episodes.ts'
 import { personaInstanceId, personaTmuxSessionName, renderPersonaRef } from '../src/persona-identity.ts'
 import type { PersonaSerialize, PersonaSerializer } from '../src/persona-serializer.ts'
-import { getFailureCount, isAtCap } from '../src/backoff.ts'
+import { forgetFailures, getFailureCount, isAtCap } from '../src/backoff.ts'
 import { _resetHealthCheckState, initHealthCheck, startHealthCheck, stopHealthCheck } from '../src/health-check.ts'
 import {
   holdRestartActive,
   isRestartPendingOrActive,
   RESTART_FAILURE_CAP,
+  RESTART_OUTCOME_CAPPED,
   RESTART_OUTCOME_LATCHED,
   RESTART_OUTCOME_LAUNCHED,
   RESTART_OUTCOME_PENDING_DEFERRED,
   RESTART_OUTCOME_RECONNECT_DEFERRED,
+  restartRetryCapSkippedLine,
   runRestartRetry,
   scheduleRestart,
 } from '../src/restart.ts'
@@ -708,6 +710,8 @@ import {
   latchClearRetryAtOnceLineHead,
   latchClearRetryFailedLine,
   latchClearRunFailedLine,
+  LATCH_RECHECK_AT_CAP,
+  latchRecheckAtCapLine,
   latchRecheckCollisionNoInformationLine,
   latchRecheckConfigDirLine,
   latchRecheckLaunchInFlightLine,
@@ -879,6 +883,8 @@ import {
   personaCallCounts,
   personaOf,
   personaRow,
+  putAtRestartCap,
+  recheckAtCapLinesOf,
   recordCallOrder,
   reuseSpawnOf,
   retryNow,
@@ -7157,6 +7163,79 @@ describe('the cleared probe\'s find-missing and single retry: a refused run hold
   })
 })
 
+// Bug b.xkd (b.av2 SR-6.3; SRJ-505, SRJ-506): the restart cap wins over the
+// re-check. At the cap a round still reads (step 1, the probe), so a reading
+// can still clear the latch, but a probe that finds the condition cleared
+// leads to no bypassing find-missing (which serves only the retry) and no
+// single retry. The retry sites' launches and the run of the restart path's
+// decision at the cap are tests/session-manager.test.ts's.
+describe('bug b.xkd: at the restart cap a round still reads, so the latch can still clear, but a cleared probe gets no find-missing and no single retry until the cap resets (recovery harness, the re-check bound with the restart cap as main() binds it; b.av2 SR-6.3, SRJ-505, SRJ-506)', () => {
+  /** The single retry a cleared probe of `row` on step 1's `entry` makes. */
+  const retryOf = (row: RecheckTableRow, entry: RecheckEntry): LatchRecheckCall => expectedClearedProbeRetry(row.record(KEY).refusedOperation, entry.reading, false)
+  // The cap is one gate whatever the row: one cleared probe per retry it
+  // would make (the first of CLEARED_PROBES for each), each named in its line.
+  const PER_RETRY = CLEARED_PROBES.filter(([, row, entry], index) => CLEARED_PROBES.findIndex(([, other, otherEntry]) => retryOf(other, otherEntry) === retryOf(row, entry)) === index).map(
+    ([name, row, entry, answer]) => [retryOf(row, entry), name, row, entry, answer] as const,
+  )
+
+  test('the cleared probes below cover every single retry the case table\'s probes make: a resume, a reuse and a run of the restart path\'s decision', () => {
+    expect(PER_RETRY.map(([retry]): string => retry).sort()).toEqual([RECHECK_CALL_RESUME, RECHECK_CALL_REUSE_SPAWN, RECHECK_CALL_RESTART_DECISION].sort())
+  })
+
+  test.each(PER_RETRY)('a cleared probe whose retry is %s (%s), P at the cap: step 1\'s read and the probe only, one cap line naming the retry, the round line no retry (at-cap), P latched with its one post', async (retry, _name, row, entry, answer) => {
+    const run = latchForRecheck(row)
+    const { h, p, model, record } = run
+    putAtRestartCap(p)
+    scriptRecheckReading(model, row.recheck.readVerb, entry)
+    model.scriptReadPane(answer.answer())
+
+    const round = await recheckRound(h, p)
+
+    expect(round.verbs).toEqual([row.recheck.readVerb, 'readPane'])
+    expect(recheckAtCapLinesOf(h, p)).toEqual([latchRecheckAtCapLine(personaRefOf(h, p), retry)])
+    const lines = roundLinesOf(h, p)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toStartWith(roundLineHead(h, p, record.latchCase, entry.decision.step, `${RECHECK_CALL_PROBE}+${RECHECK_CALL_NONE}`))
+    expect(lines[0]).toEndWith(`; no retry (${LATCH_RECHECK_AT_CAP})`)
+    expectStillLatched(run, round.at)
+    expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls, getFailureCount(p)]).toEqual([[], [], RESTART_FAILURE_CAP])
+  })
+
+  test('the cap resets: the next cleared probe gets its find-missing and its single retry, which clears with one post', async () => {
+    const run = latchForRecheck(ownIdResumeRow(), { state: LIVENESS_DEAD_ROW_ENDED, readPane: [RECHECK_GONE_ANSWER.answer(), RECHECK_GONE_ANSWER.answer()] })
+    const { h, p, record } = run
+    putAtRestartCap(p)
+    let round = await recheckRound(h, p)
+    expect(round.verbs).toEqual(['status', 'readPane'])
+    expectStillLatched(run, round.at)
+
+    forgetFailures(p)
+    round = await recheckRound(h, p)
+
+    expect(round.verbs.slice(0, 4)).toEqual(['status', 'readPane', 'findMissing', 'resume'])
+    expect(recheckAtCapLinesOf(h, p)).toHaveLength(1)
+    expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED)])
+    expectClearedState(h, p)
+    await stopApprover(h, p)
+  })
+
+  test('a step-1 read that clears (its row reported in), P at the cap: the latch clears with its one recovery post and no cap line; the retry at once after the bypassing find-missing meets the restart path\'s own cap, answering capped with nothing launched', async () => {
+    const { h, p, model, record } = latchForRecheck(anotherStoreResumeRow(), { state: LIVENESS_DEAD_ROW_ENDED })
+    putAtRestartCap(p)
+    model.setState('waiting')
+
+    const round = await recheckRound(h, p)
+
+    expect(round.verbs).toEqual(['status', 'findMissing'])
+    expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, latchRecoveryReasonRowReads('waiting'))])
+    expectClearedState(h, p)
+    expect(recheckAtCapLinesOf(h, p)).toEqual([])
+    expect(retryAtOnceLinesOf(h, p)).toEqual([latchClearRetryAnsweredLine(personaRefOf(h, p), RESTART_OUTCOME_CAPPED)])
+    expect(h.errors.filter((line) => line === restartRetryCapSkippedLine(p))).toHaveLength(1)
+    expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls, getFailureCount(p)]).toEqual([[], [], RESTART_FAILURE_CAP])
+  })
+})
+
 /**
  * P latched on "another agent-director store" at a `resume` of its row read
  * `ended`, which now reads `waiting` and carries the note (a `status` read
@@ -7962,6 +8041,31 @@ describe('the clear by hand (clear-latch): in P\'s serializer turn, one "cleared
     expect([h.controller.isArmed(p), [...getOutageFlags(p)]]).toEqual([true, [...outages]])
     expect(h.errors.filter((line) => line === latchClearFindMissingRefusedLine(personaRefOf(h, p)))).toHaveLength(1)
     expect(retryAtOnceLinesOf(h, p)).toEqual([])
+  })
+
+  // Bug b.xkd: the cap wins over the re-check, which no longer relaunches a
+  // capped P, but not over a human: the clear by hand still releases it. It
+  // leaves the cap's count alone, so the retry at once meets the restart
+  // path's own cap.
+  test('bug b.xkd: a P at the restart cap, after a round that made no launch, is still released by hand: 200 with cleared true, one "cleared by hand" post, no re-check timer left; its count is kept, so the retry at once after the bypassing find-missing answers capped, with the restart path\'s cap line and nothing launched', async () => {
+    const run = latchForRecheck(anotherStoreResumeRow(), { state: LIVENESS_DEAD_ROW_ENDED })
+    const { h, p, record } = run
+    putAtRestartCap(p)
+    const round = await recheckRound(h, p)
+    expect(round.verbs).toEqual(['status'])
+    expectStillLatched(run, round.at)
+    const from = h.timedCalls.length
+
+    const response = await requestClearLatch(h, p).response
+    await settleClearJob(h, p)
+
+    expect([response.status, await response.json()]).toEqual([200, clearLatchBody(h, p, true)])
+    expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_CLEARED_BY_HAND)])
+    expectClearedState(h, p)
+    expect(personaCallsFrom(h, p, from).map((call) => call.verb)).toEqual(['findMissing'])
+    expect(retryAtOnceLinesOf(h, p)).toEqual([latchClearRetryAnsweredLine(personaRefOf(h, p), RESTART_OUTCOME_CAPPED)])
+    expect(h.errors.filter((line) => line === restartRetryCapSkippedLine(p))).toHaveLength(1)
+    expect([getFailureCount(p), h.capReached, h.stub.calls.spawnCalls, h.stub.calls.resumeCalls]).toEqual([RESTART_FAILURE_CAP, [], [], []])
   })
 })
 

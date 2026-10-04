@@ -3983,6 +3983,7 @@ describe('main() builds the latch re-check once, through the session manager\'s 
   const LOG: keyof LatchRecheckInput = 'log'
   const EPISODES: keyof LatchRecheckInput = 'episodes'
   const CAN_RELAUNCH: keyof LatchRecheckInput = 'canRelaunch'
+  const IS_AT_CAP: keyof LatchRecheckInput = 'isAtCap'
 
   /** The module-scope holder shutdown() stops: the one `let <name>: LatchRecheckController | undefined`, outside main(). */
   function holder(): string {
@@ -4017,9 +4018,9 @@ describe('main() builds the latch re-check once, through the session manager\'s 
     for (const later of latchStartPass()) expect(at).toBeLessThan(later)
   })
 
-  test('its input is exactly the one latch, the system clock, the one persona lifecycle serializer\'s run (the restart module\'s too, so a round never overlaps a teardown, a bring-up or a restart for the persona), the applied configuration read at each round, the server log, the one notice episodes instance and the relaunch gate the restart path asks, read at call time (b.av2 SR-6.4)', () => {
+  test('its input is exactly the one latch, the system clock, the one persona lifecycle serializer\'s run (the restart module\'s too, so a round never overlaps a teardown, a bring-up or a restart for the persona), the applied configuration read at each round, the server log, the one notice episodes instance, the relaunch gate the restart path asks, read at call time (b.av2 SR-6.4), and the restart cap over the one failure counter (b.av2 SR-6.3; bug b.xkd: the cap wins over the re-check)', () => {
     const props = onlyCallProps(RECHECK_BUILDER)
-    expect([...props.keys()].sort()).toEqual([APPLIED_CONFIG, CAN_RELAUNCH, CLOCK, EPISODES, RECHECK_LATCH, LOG, SERIALIZE].sort())
+    expect([...props.keys()].sort()).toEqual([APPLIED_CONFIG, CAN_RELAUNCH, CLOCK, EPISODES, IS_AT_CAP, RECHECK_LATCH, LOG, SERIALIZE].sort())
     expect(props.get(RECHECK_LATCH)).toBe(constOf(LATCH_FACTORY))
     expect(props.get(CLOCK)).toBe('SYSTEM_PERSONA_CONNECTION_CLOCK')
     expect(importSource(SERVER_CODE, 'SYSTEM_PERSONA_CONNECTION_CLOCK')).toBe('./persona-connections.ts')
@@ -4034,6 +4035,11 @@ describe('main() builds the latch re-check once, through the session manager\'s 
     const gate = constOf('createPersonaRelaunchGate')
     expect(onlyCallProps('initRestart').get('canRestart')).toBe(gate)
     expect(props.get(CAN_RELAUNCH)).toMatch(new RegExp(`^\\(?(\\w+)\\)? => ${gate}\\(\\1\\)$`))
+    // The same cap query the retry action's isAtCap is (the restart path's
+    // RESTART_FAILURE_CAP over the backoff module's counter).
+    expect(props.get(IS_AT_CAP)).toMatch(/^\(?(\w+)\)? => backoffIsAtCap\(\1, RESTART_FAILURE_CAP\)$/)
+    expect(importSource(SERVER_CODE, 'backoffIsAtCap')).toBe('./backoff.ts')
+    expect(importSource(SERVER_CODE, 'RESTART_FAILURE_CAP')).toBe('./restart.ts')
   })
 
   test('it is bound exactly once, in main()\'s own statement list, to the one latch, after its build with no await between, after the holds\' and the notice\'s bindings (so a set runs the holds, the notice, then the timer\'s arm) and before the start pass; server.ts adds no set or forget observer by hand', () => {

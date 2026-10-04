@@ -317,7 +317,9 @@ function arranged(ok: boolean, what: string): void {
  * Put persona `key` at the restart cap (SRJ-305) through the real backoff
  * state: `RESTART_FAILURE_CAP` failures recorded with `recordFailure`, as
  * counted launch failures record them. Throws unless `isAtCap` then answers
- * true. `resetRoutingState()` undoes it.
+ * true. `resetRoutingState()` undoes it, as the recovery harness's
+ * `cleanup()` does. The one copy: tests/test-helpers/recovery-harness.ts
+ * exports it beside that harness, so no file keeps its own.
  */
 export function putAtRestartCap(key: string): void {
   for (let i = 0; i < RESTART_FAILURE_CAP; i++) recordFailure(key)

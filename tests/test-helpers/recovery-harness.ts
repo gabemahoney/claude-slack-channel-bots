@@ -446,9 +446,13 @@
  *   harness's serializer `serializer.run` as `main()`'s
  *   `personaLifecycle.run`, the live applied configuration, `console.error`
  *   as its log, so its lines and its round's lines go to `errors`, the
- *   latch notice's episodes, and the harness's relaunch gate as its
+ *   latch notice's episodes, the harness's relaunch gate as its
  *   `canRelaunch`, so a persona `setUp(key, false)` set down gets no launch
- *   in a round, b.av2 SR-6.4; every operation it submits through the
+ *   in a round, b.av2 SR-6.4, and the restart cap (`isAtCap` at
+ *   `RESTART_FAILURE_CAP`, over the real failure counter) as its `isAtCap`,
+ *   so a persona at the cap gets its reads in a round but no launch and no
+ *   run of the restart path's decision, b.av2 SR-6.3, bug b.xkd; every
+ *   operation it submits through the
  *   serializer is tracked until it settles); its clear goes through the one clear entry:
  *   one recovery post, the episode ended, the timer stopped, then, after a
  *   clear that launched nothing, the after-clear sequence's run in the same
@@ -989,7 +993,11 @@
  *
  * Shared case helpers, each over a harness: `personaOf` (a configured
  * persona), `personaRow` (a persona's own row as a `get` reads it, with
- * overrides), the retired-key store's clear lines (b.jg5 SRJ-807; src
+ * overrides), the restart cap's (b.av2 SR-6.3; bug b.xkd):
+ * `putAtRestartCap` (a persona at the cap over the real backoff count, the
+ * one copy in tests/test-helpers/persona-routing-harness.ts, exported here
+ * too) and `recheckAtCapLinesOf` (the latch re-check's at-the-cap lines for
+ * a persona, whatever call they name), the retired-key store's clear lines (b.jg5 SRJ-807; src
  * exports no builder for them): `retiredEntryClearedLine` and
  * `retiredEntryClearFailedLine` (a write `failRetiredKeyWrites` refused), each
  * for the record's path, the key, the state read and the read's site, and
@@ -1217,7 +1225,7 @@ import {
   type TmuxUnresponsiveEndResult,
   type UnclassifiedErrorEndReason,
 } from '../../src/persona-episodes.ts'
-import { personaInstanceId, personaSpawnEnv, personaTmuxSessionName } from '../../src/persona-identity.ts'
+import { personaInstanceId, personaSpawnEnv, personaTmuxSessionName, renderPersonaRef } from '../../src/persona-identity.ts'
 import { createPersonaRouting, type PersonaRouting } from '../../src/persona-routing.ts'
 import { createPersonaSerializer, type PersonaSerialize, type PersonaSerializer } from '../../src/persona-serializer.ts'
 import { createPersonaRelaunchGate, createPersonaUpPredicate, type PersonaUpQuery } from '../../src/persona-start.ts'
@@ -1294,6 +1302,7 @@ import {
   isLiveRowSequenceRunning,
   isSequenceOrOldLifeWaitRunning,
   killPersonaInstanceForTeardown,
+  latchRecheckAtCapLine,
   launchSession,
   liveRowSequenceGate,
   notifyRestartCapReached,
@@ -1428,6 +1437,7 @@ import {
 } from './agent-director-stub.ts'
 import { LEAK_SENTINEL, writtenFile } from './credentials.ts'
 import { createFakeClock, type FakeClock } from './fake-clock.ts'
+import { builtAround } from './line-parts.ts'
 import { makeMultiPersonaConfig, type PersonaSpec } from './persona-config.ts'
 import { makeNotifierStack } from './persona-notifier.ts'
 import { launchStartText, type PendingRowModel } from './pending-row-model.ts'
@@ -2474,6 +2484,11 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     // As main() passes it (b.av2 SR-6.4): each round's launch asks the
     // harness's relaunch gate, so `setUp(key, false)` refuses it.
     canRelaunch: (key) => canRelaunch(key),
+    // As main() passes it (b.av2 SR-6.3; bug b.xkd): the restart cap over the
+    // real failure counter, so a persona `recordFailure`d to
+    // `RESTART_FAILURE_CAP` gets its reads in a round but no launch and no run
+    // of the restart path's decision.
+    isAtCap: (key) => isAtCap(key, RESTART_FAILURE_CAP),
   })
   if (options.latchRecheck === true) unbindLatch.push(bindLatchRecheck(latch, latchRecheck))
   /** Every key a latch re-check round may run for: the configured and the armed. */
@@ -3823,6 +3838,24 @@ function recordingNoticeEpisodes(
 /** Persona `key` of the harness's configuration. */
 export function personaOf(h: RecoveryHarness, key: string): Persona {
   return h.config.personas.find((p) => p.key === key)!
+}
+
+/**
+ * Put persona `key` at the restart cap through the real backoff state (its
+ * one copy, tests/test-helpers/persona-routing-harness.ts's): the count the
+ * harness's re-check asks through its `isAtCap`, as `main()` binds it (b.av2
+ * SR-6.3; bug b.xkd). The harness's `cleanup()` undoes it.
+ */
+export { putAtRestartCap } from './persona-routing-harness.ts'
+
+/**
+ * The latch re-check's at-the-cap lines (`latchRecheckAtCapLine`, b.av2
+ * SR-6.3; bug b.xkd) logged to `errors` for persona `key`, whatever call they
+ * name.
+ */
+export function recheckAtCapLinesOf(h: RecoveryHarness, key: string): string[] {
+  const pattern = builtAround((call) => latchRecheckAtCapLine(renderPersonaRef(personaOf(h, key).name, key), call))
+  return h.errors.filter((line) => pattern.test(line))
 }
 
 /**

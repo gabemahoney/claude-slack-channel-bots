@@ -20062,6 +20062,14 @@ export function latchRecheckNotUpLine(ref: string, call: string): string {
   return `[slack] ${LATCH_RECHECK_SITE}: ${ref} is not up — no ${call} in this re-check; the persona stays latched (b.av2 SR-6.4; b.jg5 SRJ-505)`
 }
 
+/** The re-check's answer for a persona at the restart cap: no launch and no run of the restart path's decision (`latchRecheckAtCapLine`). */
+export const LATCH_RECHECK_AT_CAP = 'at-cap'
+
+/** `[slack] latch-recheck: <ref> is at the restart cap — no <call> in this re-check; the persona stays latched (b.av2 SR-6.3; b.jg5 SRJ-505, SRJ-506)` (b.jg5 SRJ-1014). Pure. */
+export function latchRecheckAtCapLine(ref: string, call: string): string {
+  return `[slack] ${LATCH_RECHECK_SITE}: ${ref} is at the restart cap — no ${call} in this re-check; the persona stays latched (b.av2 SR-6.3; b.jg5 SRJ-505, SRJ-506)`
+}
+
 /** `[slack] latch-recheck: a launch is in flight for <ref> — no <call> in this re-check (b.jg5 SRJ-505)` (b.jg5 SRJ-1014). Pure. */
 export function latchRecheckLaunchInFlightLine(ref: string, call: string): string {
   return `[slack] ${LATCH_RECHECK_SITE}: a launch is in flight for ${ref} — no ${call} in this re-check (b.jg5 SRJ-505)`
@@ -20100,6 +20108,15 @@ export interface LatchRecheckRoundDeps {
    * refused by it; a gate that throws counts as not up.
    */
   readonly canRelaunch?: (key: string) => boolean
+  /**
+   * The restart cap query (production: `isAtCap(key, RESTART_FAILURE_CAP)`,
+   * `src/backoff.ts`; b.av2 SR-6.3), asked first before each of the round's
+   * launches, before a cleared probe's bypassing `find-missing`, and before
+   * its run of the restart path's decision: a persona at the cap gets none of
+   * them, its reads only (the cap wins over the re-check). Absent, no persona
+   * is at the cap; a query that throws counts as at the cap.
+   */
+  readonly isAtCap?: (key: string) => boolean
   /**
    * The run of the restart path's decision from inside the round's
    * serializer turn, with the re-check's permit (default
@@ -20279,7 +20296,12 @@ function paneReadErrorOf(failure: PaneReadFailure | undefined): unknown {
  * never nothing, so its CONFLICT relatches with no latch-time read. An
  * answer that leaves the persona latched leads to no further call. A
  * persona not in the applied configuration, or with no latch, gets nothing
- * after its read. Never throws.
+ * after its read. A persona at the restart cap (`deps.isAtCap`) still gets
+ * its reads (step 1, the probe or lap `read-pane`, the finished-row retry's
+ * `get`), so a read can still clear its latch, but no launch, no bypassing
+ * `find-missing` and no run of the restart path's decision: one line
+ * (`latchRecheckAtCapLine`) where that call would have been made. Never
+ * throws.
  */
 export async function runLatchRecheckRound(key: string, deps: LatchRecheckRoundDeps): Promise<void> {
   const record = latchRecordOf(deps.latch, key)
@@ -20450,6 +20472,9 @@ type ClearedProbeRetry =
  *   1. the single retry's call (`decideClearedProbeRetry` on the record,
  *      step 1's reading and the retired-key reading): none, for a plain
  *      spawn whose step-1 row reads live, ends here with no further call;
+ *      so does a persona at the restart cap (`deps.isAtCap`), with one line
+ *      (`latchRecheckAtCapLine`) and no `find-missing`, which only serves
+ *      the retry;
  *   2. one bypassing `find-missing` (`bypassingFindMissingSweep`, no
  *      next-step `get`). A refusal (UNAVAILABLE, ENVIRONMENT, CONFIG,
  *      UNCLASSIFIED) means no retry in this round and no post: P stays
@@ -20487,6 +20512,10 @@ async function latchRecheckClearedProbeRetry(
   const call = decideClearedProbeRetry(record, reading, retiredKeyReadingOf(key).recorded)
   if (call === RECHECK_CALL_NONE) {
     return { call: RECHECK_CALL_NONE, said: `no retry (row ${describeLatchRowState(scope.lastRead)})` }
+  }
+  if (latchRecheckAtCap(deps, key)) {
+    console.error(latchRecheckAtCapLine(ref, call))
+    return { call: RECHECK_CALL_NONE, said: `no retry (${LATCH_RECHECK_AT_CAP})` }
   }
   const sweep = await bypassingFindMissingSweep(key, LATCH_RECHECK_SITE)
   if (sweep === FIND_MISSING_REFUSED) return { call: 'find-missing', said: 'find-missing refused; no retry' }
@@ -20557,7 +20586,9 @@ async function latchRecheckClearedProbeRetry(
  * count, and a LAUNCH FAILURE or DIRECTORY answer (marked `countedClass`) is
  * one counted launch failure; nothing else is counted.
  *
- * Before any call it asks the gates every other launch path asks, in
+ * Before any call it asks the restart cap first (`deps.isAtCap`, b.av2
+ * SR-6.3: `LATCH_RECHECK_AT_CAP`), so a persona at the cap is not relaunched
+ * by the re-check; then the gates every other launch path asks, in
  * `launchSession`'s and `spawnForPersona`'s order, through their own
  * functions, and makes no call when one stops it: the relaunch gate
  * (`deps.canRelaunch`, b.av2 SR-6.4: `not-up`); the `ErrInvalidFlags` held
@@ -20576,6 +20607,7 @@ async function latchRecheckClearedProbeRetry(
  * plain spawn or a `resume` (the reuse runs its own). Answers the launch's
  * action, or why none was made. Never throws.
  *
+ *   [slack] latch-recheck: <ref> is at the restart cap — no <call> in this re-check; the persona stays latched (b.av2 SR-6.3; b.jg5 SRJ-505, SRJ-506)
  *   [slack] latch-recheck: <ref> is not up — no <call> in this re-check; the persona stays latched (b.av2 SR-6.4; b.jg5 SRJ-505)
  */
 async function latchRecheckLaunch(
@@ -20583,10 +20615,14 @@ async function latchRecheckLaunch(
   found: { readonly persona: Persona; readonly config: PersonaConfig },
   ref: string,
   lastRead: LatchRowState,
-  deps: Pick<LatchRecheckRoundDeps, 'canRelaunch'>,
+  deps: Pick<LatchRecheckRoundDeps, 'canRelaunch' | 'isAtCap'>,
 ): Promise<string> {
   const { persona, config } = found
   const { key } = persona
+  if (latchRecheckAtCap(deps, key)) {
+    console.error(latchRecheckAtCapLine(ref, call))
+    return LATCH_RECHECK_AT_CAP
+  }
   if (!latchRecheckMayRelaunch(deps, key)) {
     console.error(latchRecheckNotUpLine(ref, call))
     return 'not-up'
@@ -20637,6 +20673,16 @@ function latchRecheckMayRelaunch(deps: Pick<LatchRecheckRoundDeps, 'canRelaunch'
     return deps.canRelaunch(key) === true
   } catch {
     return false
+  }
+}
+
+/** The re-check's restart cap gate for persona `key`: false with no query given; a query that throws counts as at the cap. Never throws. */
+function latchRecheckAtCap(deps: Pick<LatchRecheckRoundDeps, 'isAtCap'>, key: string): boolean {
+  if (deps.isAtCap === undefined) return false
+  try {
+    return deps.isAtCap(key) === true
+  } catch {
+    return true
   }
 }
 
@@ -20731,7 +20777,10 @@ export function latchRecheckObserverFailedLine(ref: string, failure: string): st
  * a latched persona: a launch's through the handlers' clear hook, a
  * sequence's through the start entry's; and a run that completes with no
  * refusal (connected, reconnected, launched, or a counted failure) clears it
- * after the run when nothing has. When the set observer cannot be added,
+ * after the run when nothing has. The restart cap is asked first
+ * (`deps.isAtCap`; the restart work itself does not ask it): at the cap no
+ * run is made, with one line (`latchRecheckAtCapLine`), no information, and
+ * the answer `LATCH_RECHECK_AT_CAP`. When the set observer cannot be added,
  * the permit could not be revoked, so no run is made: one line
  * (`latchRecheckObserverFailedLine`), no information, and the answer
  * `LATCH_RECHECK_OBSERVER_FAILED`. Answers the run's outcome. Never throws.
@@ -20742,6 +20791,10 @@ async function latchRecheckRestartDecision(
   deps: LatchRecheckRoundDeps,
   scope: LatchRecheckRoundScope,
 ): Promise<string> {
+  if (latchRecheckAtCap(deps, key)) {
+    console.error(latchRecheckAtCapLine(personaRef(persona), RECHECK_CALL_RESTART_DECISION))
+    return LATCH_RECHECK_AT_CAP
+  }
   let refused = false
   let noInformation = false
   let ended = false
@@ -21245,6 +21298,7 @@ async function runLatchRecheckRoundThenOwed(key: string, input: LatchRecheckInpu
       clearHandOff,
       log: input.log,
       ...(input.canRelaunch === undefined ? {} : { canRelaunch: input.canRelaunch }),
+      ...(input.isAtCap === undefined ? {} : { isAtCap: input.isAtCap }),
     })
   } finally {
     if (owed.run !== undefined) await owed.run.run()
@@ -21276,6 +21330,13 @@ export interface LatchRecheckInput {
    * refused by it.
    */
   readonly canRelaunch?: (key: string) => boolean
+  /**
+   * The restart cap query (`isAtCap(key, RESTART_FAILURE_CAP)`,
+   * `src/backoff.ts`; b.av2 SR-6.3), asked first before each of a round's
+   * launches and its run of the restart path's decision
+   * (`LatchRecheckRoundDeps.isAtCap`). Absent, no persona is at the cap.
+   */
+  readonly isAtCap?: (key: string) => boolean
 }
 
 /** The re-check as built: its timers, the one clear entry and the after-clear sequence over it. */
@@ -21310,10 +21371,11 @@ export interface LatchRecheck extends LatchRecheckController {
  *     one-line count, a cleared probe's bypassing `find-missing` through
  *     `bypassingFindMissingSweep`;
  *   - the retries through the one handler each (`plainSpawnOutcomeAt`,
- *     `reuseSpawnForPersona`, `resumeAtSite`), each behind the relaunch
- *     gate (`input.canRelaunch`), the held gate and the old-life hold step,
- *     and the run of the restart path's decision through
- *     `runRestartWorkInTurn` with the re-check's permit;
+ *     `reuseSpawnForPersona`, `resumeAtSite`), each behind the restart cap
+ *     (`input.isAtCap`), the relaunch gate (`input.canRelaunch`), the held
+ *     gate and the old-life hold step, and the run of the restart path's
+ *     decision through `runRestartWorkInTurn` with the re-check's permit,
+ *     behind the restart cap;
  *   - the no-information scope (`runInLatchRecheck`), the latch's CONFLICT
  *     and unusable-name entries for a relatch, its probe-dropped mark, and
  *     the CONFIG outage raised by the wrapper;
