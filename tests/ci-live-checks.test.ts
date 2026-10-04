@@ -1115,6 +1115,9 @@ describe('Checks 16 and 20 against a scripted A', () => {
     call?: string
   }
 
+  /** The second user's DM with A before the check: none listed, listed but empty (as Slack lists one from the day an account joins), or holding a message. */
+  type DmBefore = 'none' | 'empty' | 'used'
+
   /**
    * A-home, `replies a` and the second user's DMs, scripted per ask: each
    * human post in A-home is one ask and plays the next step (A's call lands
@@ -1123,14 +1126,15 @@ describe('Checks 16 and 20 against a scripted A', () => {
    * `replies a` printed before the check (an earlier check's call). Every
    * message gets the next ts, so A's done belongs to the ask it follows.
    */
-  function scriptedA(steps: AskStep[], earlier: string[] = []) {
+  function scriptedA(steps: AskStep[], earlier: string[] = [], dmBefore: DmBefore = 'none') {
     const clock = virtualClock()
     let seq = 0
     const nextTs = () => `1700000100.${String(++seq).padStart(6, '0')}`
     const messages: (CannedMessage & { channel: string })[] = []
     const replyLines = [...earlier]
     const asks: { text: string; ts: string; done: string | null }[] = []
-    let dmOpen = false
+    let dmOpen = dmBefore !== 'none'
+    if (dmBefore === 'used') messages.push({ channel: NEW_DM, ts: nextTs(), text: 'hello from an earlier run', user: SECOND_ID })
     const api: HumanApi = {
       call: async (method, params = {}) => {
         const channel = String(params.channel ?? '')
@@ -1165,8 +1169,8 @@ describe('Checks 16 and 20 against a scripted A', () => {
     return { ctx, asks, askEvidence }
   }
 
-  async function runWith(check: CheckDef<CheckContext>, steps: AskStep[], earlier: string[] = []) {
-    const a = scriptedA(steps, earlier)
+  async function runWith(check: CheckDef<CheckContext>, steps: AskStep[], earlier: string[] = [], dmBefore: DmBefore = 'none') {
+    const a = scriptedA(steps, earlier, dmBefore)
     const r = await check.run(a.ctx)
     assertNoLeak(r)
     return { r, ...a }
@@ -1231,6 +1235,18 @@ describe('Checks 16 and 20 against a scripted A', () => {
     const fresh = await runWith(check20, [{ done: true, call: SENT }], [REFUSED])
     expect([fresh.r.status, fresh.r.reason]).toEqual(['PASS', undefined])
     expect(fresh.asks.length).toBe(1)
+  })
+
+  test.each(BOTH)('Check %s: an empty DM with A listed before the check is no rerun: the check runs and passes', async (_id, check, call) => {
+    const { r, asks } = await runWith(check, [{ done: true, call }], [], 'empty')
+    expect([r.status, r.reason]).toEqual(['PASS', undefined])
+    expect(asks.length).toBe(1)
+  })
+
+  test.each(BOTH)('Check %s: a DM with A that holds a message before the check is a rerun: SKIPPED, nothing asked', async (_id, check, call) => {
+    const { r, asks } = await runWith(check, [{ done: true, call }], [], 'used')
+    expect([r.status, r.reason]).toEqual(['SKIPPED', 'not verified: the second account already has a DM with A (a rerun)'])
+    expect(asks.length).toBe(0)
   })
 
   test("the call evaluated must be the check's own: Check 16 fails a sent message, Check 20 fails a refusal", async () => {
