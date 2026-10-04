@@ -20,9 +20,13 @@
  *   first-@mention claim (SR-12), and no term of `FORBIDDEN_TERMS` (the
  *   pre-persona shape, the token environment variables and command-line
  *   tokens, the access-control file, the retired name-rule wording). The
- *   exemptions (`AUDIT_EXCEPTIONS`) are the debugging skill's SR-1.7 entry
- *   and `access.json` inside the README's switch-over runbook section, which
- *   saves the previous CSCB's file (b.jg5 SRJ-1108, SRJ-1516);
+ *   exemptions (`AUDIT_EXCEPTIONS`) are exactly three: the debugging skill's
+ *   SR-1.7 entry, and one entry per README runbook section, each exempting
+ *   `access.json` only, and only inside "Switching over to agent-director
+ *   Phase 1" (which saves the previous CSCB's file) or "Rolling back the
+ *   switch-over" (which restores it) (b.jg5 SRJ-1108, SRJ-1109, SRJ-1516).
+ *   Every other term stays banned inside those sections, the token
+ *   variables' names included; a missing heading fails the audit;
  * - the README's receiving section (SR-12, SR-4.4): its table's row for each
  *   `via` value shows that value, and both injected kinds' rows show none;
  * - the MCP instructions carry no reload wording (AC 74, SR-8.8);
@@ -46,8 +50,19 @@
  *   block's ordered elements and branches, the publishing-host block, the
  *   sections the runbook replaced or kept, and the reader's self-checks.
  *   Values CSCB defines are imported; agent-director vocabulary CSCB defines
- *   nowhere sits in `AD_VOCABULARY`, each row citing its source.
- * CHANGELOG.md and docs/ are not shipped descriptions and are not read.
+ *   nowhere sits in `AD_VOCABULARY`, each row citing its source;
+ * - the rollback runbook, README "Rolling back the switch-over" (b.jg5
+ *   SRJ-1109; hatch A3): exactly one `###` heading under `## Migration`,
+ *   after the switch-over section; its steps 1–9 read in order by the same
+ *   step reader, one named case per SRJ-1109 element over each carrier
+ *   (`ROLLBACK_CARRIERS`), the order rows (steps 6, 8 and 9), the cross-step
+ *   rows (no `tmux kill-session`, no `include-finished`, "Operator actions"
+ *   named by title), step 8's no-conversion-tool check, and ruling C-2: the
+ *   switch-over refusal block's pointers to the rollback runbook and its
+ *   step 8 are links that resolve, as are the runbooks' other links and the
+ *   registry-install runbook's scope note links to both sections.
+ * CHANGELOG.md and docs/ are not shipped descriptions and are not audited;
+ * the one docs/ file read is docs/registry-install-runbook.md, for its links.
  *
  * Reads repo files resolved from this file's location, so the working
  * directory doesn't matter. The one writer is the complete-example load: it
@@ -62,6 +77,7 @@ import { join, resolve } from 'path'
 
 import {
   CHANNEL_ENTRY_KEYS,
+  CONFIG_FILE_NAME,
   DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   DELIVERY_MODES,
   DM_DESTINATION,
@@ -81,6 +97,7 @@ import {
   headings,
   headingSlug,
   requiredSection,
+  type Heading,
   sectionRange,
   splitFences,
 } from './test-helpers/markdown.ts'
@@ -106,6 +123,10 @@ import {
   type AdTmuxKey,
 } from '../src/ad-settings.ts'
 import { DEFAULT_STORE_PATH } from '../src/agent-director-client.ts'
+import { AD_ERROR_CLASS_CONFLICT, AD_ERROR_CLASS_UNAVAILABLE } from '../src/ad-error-class.ts'
+import { PERSONA_INSTANCE_ID_PREFIX, PERSONA_TMUX_SESSION_PREFIX, SERVICE_LABEL } from '../src/persona-identity.ts'
+import { LAST_APPLIED_FILE_SUFFIX } from '../src/reload.ts'
+import { RETIRED_KEYS_FILE_NAME } from '../src/retired-keys.ts'
 import { CLIENT_MIN_VERSION, MIN_CLAUDE_CODE_VERSION, OLD_AD_VERSION } from './test-helpers/agent-director-versions.ts'
 import {
   PUBLISHING_HOST_BLOCK_HEADING,
@@ -869,8 +890,8 @@ const SR_1_7_EXCEPTION: AuditException = {
  * section may name `access.json` among the previous CSCB's files it saves and
  * restores. Every other term stays banned there, the token variables' names
  * included, and `access.json` stays banned everywhere else. A missing heading
- * throws, as for the SR-1.7 entry. The rollback section's entry is SRJ-1516's
- * own (b.jg5 E35 T2).
+ * throws, as for the SR-1.7 entry. The rollback section has its own entry,
+ * below.
  */
 const SWITCH_OVER_EXCEPTION: AuditException = {
   file: 'README.md',
@@ -879,7 +900,27 @@ const SWITCH_OVER_EXCEPTION: AuditException = {
   reason: "b.jg5 SRJ-1108, SRJ-1516: the switch-over runbook saves and restores the previous CSCB's access.json",
 }
 
-const AUDIT_EXCEPTIONS: readonly AuditException[] = [SR_1_7_EXCEPTION, SWITCH_OVER_EXCEPTION]
+/** The rollback section's heading as the README writes it: a `###` under `## Migration`, after the switch-over section. */
+const ROLLBACK_HEADING = `### ${ROLLBACK_RUNBOOK_SECTION_TITLE}`
+
+/**
+ * The rollback runbook's exemption (b.jg5 SRJ-1109, SRJ-1516): the README
+ * section may name `access.json` among the files its step 8 restores. As for
+ * the switch-over entry: every other term stays banned there, the token
+ * variables' names included, `access.json` stays banned everywhere else, and
+ * a missing heading throws.
+ */
+const ROLLBACK_EXCEPTION: AuditException = {
+  file: 'README.md',
+  heading: ROLLBACK_HEADING,
+  terms: ['access.json'],
+  reason: "b.jg5 SRJ-1109, SRJ-1516: the rollback runbook's step 8 restores the previous CSCB's access.json",
+}
+
+/** The two runbook entries (SRJ-1516): one per README runbook section, each exempting only `access.json`. */
+const RUNBOOK_EXCEPTIONS: readonly AuditException[] = [SWITCH_OVER_EXCEPTION, ROLLBACK_EXCEPTION]
+
+const AUDIT_EXCEPTIONS: readonly AuditException[] = [SR_1_7_EXCEPTION, ...RUNBOOK_EXCEPTIONS]
 
 /** A forbidden term found in a text: its file, 1-based line, term label, matched text and whole line. */
 interface TermHit {
@@ -969,18 +1010,31 @@ describe('AC 46: forbidden-term audit (README, skills, manifest, MCP instruction
     expect([...new Set(hits.map((hit) => hit.term))].sort()).toEqual([...SR_1_7_EXCEPTION.terms].sort())
   })
 
-  test(`the only allowed hit: ${SWITCH_OVER_EXCEPTION.terms.join(', ')} in ${SWITCH_OVER_EXCEPTION.file} under "${SWITCH_OVER_EXCEPTION.heading}" (SRJ-1108, SRJ-1516); with the exemption off, it appears nowhere else in shipped text, and the exemption is used`, () => {
-    const terms = ALL_FORBIDDEN_TERMS.filter(([label]) => SWITCH_OVER_EXCEPTION.terms.includes(label))
-    expect(terms.map(([label]) => label)).toEqual([...SWITCH_OVER_EXCEPTION.terms])
+  test('the exemptions are exactly the SR-1.7 entry and the two runbook entries, each runbook entry exempting only access.json in README.md (SRJ-1516)', () => {
+    expect(AUDIT_EXCEPTIONS.map((e) => [e.file, e.heading, [...e.terms]])).toEqual([
+      [SR_1_7_EXCEPTION.file, SR_1_7_EXCEPTION.heading, [...SR_1_7_EXCEPTION.terms]],
+      ['README.md', `### ${PHASE1_RUNBOOK_SECTION_TITLE}`, ['access.json']],
+      ['README.md', `### ${ROLLBACK_RUNBOOK_SECTION_TITLE}`, ['access.json']],
+    ])
+  })
+
+  test(`the only allowed hits: access.json in README.md under "${SWITCH_OVER_EXCEPTION.heading}" and under "${ROLLBACK_EXCEPTION.heading}" (SRJ-1108, SRJ-1109, SRJ-1516); with the exemptions off, it appears nowhere else in shipped text, and both exemptions are used`, () => {
+    const terms = ALL_FORBIDDEN_TERMS.filter(([label]) => label === 'access.json')
+    expect(terms.map(([label]) => label)).toEqual(['access.json'])
+    const readme = readRepoFile('README.md')
+    const ranges = RUNBOOK_EXCEPTIONS.map((exception) => {
+      const range = sectionRange(readme, exception.heading)
+      if (range === undefined) throw new Error(`README.md has no heading "${exception.heading}"`)
+      return range
+    })
+    const inside = (hit: TermHit) => hit.file === 'README.md' && ranges.some((range) => hit.line > range.start && hit.line <= range.end)
     const hits = SHIPPED_TEXTS.flatMap(([name, read]) => auditText(name, read(), terms, []).hits)
-    const readme = readRepoFile(SWITCH_OVER_EXCEPTION.file)
-    const range = sectionRange(readme, SWITCH_OVER_EXCEPTION.heading)
-    if (range === undefined) throw new Error(`${SWITCH_OVER_EXCEPTION.file} has no heading "${SWITCH_OVER_EXCEPTION.heading}"`)
-    const inside = (hit: TermHit) => hit.file === SWITCH_OVER_EXCEPTION.file && hit.line > range.start && hit.line <= range.end
     expect(hits.filter((hit) => !inside(hit)).map(formatHit)).toEqual([])
-    const { hits: left, allowed } = auditText(SWITCH_OVER_EXCEPTION.file, readme, terms)
-    expect(left).toEqual([])
-    expect(allowed.length).toBeGreaterThan(0)
+    expect(auditText('README.md', readme, terms).hits.map(formatHit)).toEqual([])
+    // Each runbook entry, alone, allows at least one hit: neither exemption is idle.
+    expect(RUNBOOK_EXCEPTIONS.map((exception) => [exception.heading, auditText('README.md', readme, terms, [exception]).allowed.length > 0])).toEqual(
+      RUNBOOK_EXCEPTIONS.map((exception) => [exception.heading, true]),
+    )
   })
 
   test(`the SR-1.7 entry names the three keys, says they are rejected and that the configuration must be rewritten as personas`, () => {
@@ -1163,66 +1217,98 @@ describe('AC 46: forbidden-term scanner self-checks', () => {
     )
   })
 
-  /** The switch-over runbook's exemption (b.jg5 SRJ-1108, SRJ-1516), on a synthetic README. */
-  describe('the switch-over runbook exemption', () => {
-    const README = SWITCH_OVER_EXCEPTION.file
+  /** The two runbook exemptions (b.jg5 SRJ-1108, SRJ-1109, SRJ-1516), on a synthetic README. */
+  describe('the two runbook exemptions', () => {
+    const README = 'README.md'
     const SAVE = 'Keep a copy of `access.json`.'
-    /** A synthetic README: the switch-over section (with a step subsection) between two sections, then another `##` section. */
-    const readme = (earlier: string, inside: string, later: string, other: string) =>
-      [
+    const RESTORE = 'Put back `access.json`.'
+    type Parts = { earlier: string; inSwitchOver: string; between: string; inRollback: string; later: string; other: string }
+    const EMPTY: Parts = { earlier: '-', inSwitchOver: '-', between: '-', inRollback: '-', later: '-', other: '-' }
+    /**
+     * A synthetic README: the switch-over section and the rollback section,
+     * each with a step subsection, a section between them, one after them,
+     * then another `##` section. Line numbers hold while each part is one line.
+     */
+    const readme = (parts: Partial<Parts>) => {
+      const p = { ...EMPTY, ...parts }
+      return [
         '# CSCB', //                                                  l.1
         '## Migration', //                                            l.2
-        earlier, //                                                   l.3
+        p.earlier, //                                                 l.3
         SWITCH_OVER_EXCEPTION.heading, //                             l.4
-        inside, //                                                    l.5
-        `#### ${stepHeadingPrefix(1)}Stage the release`, //           l.6
+        p.inSwitchOver, //                                            l.5
+        `#### ${stepHeadingPrefix(1)}Check the host`, //              l.6
         SAVE, //                                                      l.7
-        '### Upgrading to personas', //                               l.8
-        later, //                                                     l.9
-        '## Troubleshooting', //                                      l.10
-        other, //                                                     l.11
+        '### Between the runbooks', //                                l.8
+        p.between, //                                                 l.9
+        ROLLBACK_EXCEPTION.heading, //                                l.10
+        p.inRollback, //                                              l.11
+        `#### ${stepHeadingPrefix(8)}Reinstall the previous CSCB`, // l.12
+        RESTORE, //                                                   l.13
+        '### Upgrading to personas', //                               l.14
+        p.later, //                                                   l.15
+        '## Troubleshooting', //                                      l.16
+        p.other, //                                                   l.17
       ].join('\n')
+    }
 
-    test('inside the section, including its subsections, access.json is allowed, not a hit', () => {
-      const { hits, allowed } = auditText(README, readme('-', SAVE, '-', '-'), ALL_FORBIDDEN_TERMS)
+    test('inside either section, including its subsections, access.json is allowed, not a hit', () => {
+      const { hits, allowed } = auditText(README, readme({ inSwitchOver: SAVE, inRollback: RESTORE }), ALL_FORBIDDEN_TERMS)
       expect(hits).toEqual([])
-      expect(allowed.map((hit) => `${hit.line}: ${hit.term}`)).toEqual(['5: access.json', '7: access.json'])
+      expect(allowed.map((hit) => `${hit.line}: ${hit.term}`)).toEqual(['5: access.json', '7: access.json', '11: access.json', '13: access.json'])
     })
 
     test.each([
-      ['just before the section', readme(SAVE, '-', '-', '-'), `${README}:3: access.json`],
-      ['just after the section', readme('-', '-', SAVE, '-'), `${README}:9: access.json`],
-      ['in another section', readme('-', '-', '-', SAVE), `${README}:11: access.json`],
-    ])('access.json %s is a hit, with file and line', (_where, text, expected) => {
-      const hits = auditText(README, text, ALL_FORBIDDEN_TERMS).hits.map(formatHit)
+      ['just before the switch-over section', { earlier: SAVE }, `${README}:3: access.json`],
+      ['between the two sections', { between: SAVE }, `${README}:9: access.json`],
+      ['just after the rollback section', { later: RESTORE }, `${README}:15: access.json`],
+      ['in another section', { other: RESTORE }, `${README}:17: access.json`],
+    ] as const)('access.json %s is a hit, with file and line', (_where, parts, expected) => {
+      const hits = auditText(README, readme(parts), ALL_FORBIDDEN_TERMS).hits.map(formatHit)
       expect(hits).toHaveLength(1)
       expect(hits[0].startsWith(expected)).toBe(true)
     })
 
-    test.each([
+    const OTHER_TERMS = [
       ['a token variable', 'Unset SLACK_APP_TOKEN too.', 'SLACK_APP_TOKEN'],
+      ['the other token variable', 'Set SLACK_BOT_TOKEN again.', 'SLACK_BOT_TOKEN'],
       ['an export of a token variable', 'export MY_TOKEN="<bot token>"', 'an export of a token variable'],
       ['access-control wording', 'It holds the access control list.', 'access-control wording'],
-    ])('%s inside the section is a hit', (_label, line, term) => {
-      const { hits } = auditText(README, readme('-', `${SAVE}\n${line}`, '-', '-'), ALL_FORBIDDEN_TERMS)
-      expect(hits.map((hit) => `${hit.line}: ${hit.term}`)).toEqual([`6: ${term}`])
-    })
+      ['a pre-persona key', 'Put `default_route` back.', 'default_route'],
+    ] as const
 
-    test('the same heading in a skill exempts nothing', () => {
+    /** Each section with the synthetic README carrying `line` just inside it, and the line number `line` lands on. */
+    const WITH_LINE_INSIDE: [section: string, build: (line: string) => string, lineNumber: number][] = [
+      ['switch-over', (line) => readme({ inSwitchOver: `${SAVE}\n${line}`, inRollback: RESTORE }), 6],
+      ['rollback', (line) => readme({ inSwitchOver: SAVE, inRollback: `${RESTORE}\n${line}` }), 12],
+    ]
+
+    test.each(WITH_LINE_INSIDE.flatMap(([section, build, lineNumber]) => OTHER_TERMS.map(([label, line, term]) => [label, section, build(line), `${lineNumber}: ${term}`] as const)))(
+      '%s inside the %s section is a hit',
+      (_label, _section, text, expected) => {
+        expect(auditText(README, text, ALL_FORBIDDEN_TERMS).hits.map((hit) => `${hit.line}: ${hit.term}`)).toEqual([expected])
+      },
+    )
+
+    test('the same headings in a skill exempt nothing', () => {
       const other = 'skills/other-skill/SKILL.md'
-      const { hits, allowed } = auditText(other, readme('-', SAVE, '-', '-'), ALL_FORBIDDEN_TERMS)
+      const { hits, allowed } = auditText(other, readme({ inSwitchOver: SAVE, inRollback: RESTORE }), ALL_FORBIDDEN_TERMS)
       expect(allowed).toEqual([])
-      expect(hits.map((hit) => `${hit.file}:${hit.line}: ${hit.term}`)).toEqual([`${other}:5: access.json`, `${other}:7: access.json`])
+      expect(hits.map((hit) => `${hit.file}:${hit.line}: ${hit.term}`)).toEqual(
+        [5, 7, 11, 13].map((line) => `${other}:${line}: access.json`),
+      )
     })
 
-    test.each([
-      ['removed', (text: string) => text.replace(`${SWITCH_OVER_EXCEPTION.heading}\n`, '')],
-      ['renamed', (text: string) => text.replace(SWITCH_OVER_EXCEPTION.heading, '### Switching over')],
-      ['moved to another level', (text: string) => text.replace(SWITCH_OVER_EXCEPTION.heading, `#${SWITCH_OVER_EXCEPTION.heading}`)],
-    ])('with the switch-over heading %s, the audit fails naming it and exempts nothing', (_how, edit) => {
-      expect(() => auditText(README, edit(readme('-', SAVE, '-', '-')), ALL_FORBIDDEN_TERMS)).toThrow(
-        `${README} has no heading "${SWITCH_OVER_EXCEPTION.heading}"`,
-      )
+    test.each(
+      RUNBOOK_EXCEPTIONS.flatMap(({ heading }) => [
+        ['removed', heading, (text: string) => text.replace(`${heading}\n`, '')],
+        ['renamed', heading, (text: string) => text.replace(heading, '### A runbook')],
+        ['moved to another level', heading, (text: string) => text.replace(heading, `#${heading}`)],
+      ] as const),
+    )('with the heading %s (%s), the audit fails naming it and exempts nothing', (_how, heading, edit) => {
+      const edited = edit(readme({ inSwitchOver: SAVE, inRollback: RESTORE }))
+      expect(edited).not.toBe(readme({ inSwitchOver: SAVE, inRollback: RESTORE }))
+      expect(() => auditText(README, edited, ALL_FORBIDDEN_TERMS)).toThrow(`${README} has no heading "${heading}"`)
     })
   })
 })
@@ -1572,10 +1658,14 @@ const AD_VOCABULARY: Record<string, { text: string; source: string }> = {
   hookIgnored: { text: code('ad.hook.ignored'), source: 'HO rev 24, rev 31: the event of a hook on a Claude Code too old for exec-form hooks' },
   noExecForm: { text: code('no_exec_form'), source: "HO rev 24, rev 31: that event's reason" },
   sessionStartCapSeconds: { text: '540', source: "HO rev 25; A-33: the cap on agent-director's SessionStart wait, in seconds" },
-  waitMinutes: { text: '5', source: 'SRJ-1108 steps 4 and 6: the waits for a row to read `ended` or `missing`, in minutes' },
+  waitMinutes: { text: '5', source: 'SRJ-1108 steps 4 and 6, SRJ-1109 step 4: the waits for a row to read `ended` or `missing`, in minutes' },
+  operatorActions: { text: '"Operator actions"', source: "HO rev 27; A-2, A-26: the section of agent-director's README a human follows; SRJ-1109 steps 3 to 5" },
+  notThisLaunch: { text: "not this launch's session", source: "HO §2; SRJ-1109 steps 4 and 5: a `kill`'s CONFLICT on a leftover of an earlier launch" },
+  downgradeRecipe: { text: 'emergency downgrade recipe', source: "HO C15; ADA question 8; SRJ-1109 step 6: the only way the previous agent-director is restored" },
+  downgradeSchemaVersion: { text: '4', source: 'HO C15; ADA question 8; SRJ-1109 step 6: the schema version the recipe stamps' },
   sqliteBackup: { text: code('.backup'), source: "HO C15; SRJ-1108 step 8: sqlite3's online-consistent copy of the WAL-mode store" },
-  migrationColumns: { text: 'thirteen', source: "HO rev 15: the columns Phase 1's schema migration adds" },
-  storeMeta: { text: code('store_meta'), source: "HO rev 15: the one-row table holding the store's id" },
+  migrationColumns: { text: 'thirteen', source: "HO rev 15: the columns Phase 1's schema migration adds (and the downgrade recipe drops, SRJ-1109 step 6)" },
+  storeMeta: { text: code('store_meta'), source: "HO rev 15, rev 19: the one-row table holding the store's id" },
   configMalformed: { text: code('ErrConfigMalformed'), source: "HO §1; ADSRD SR-4.1: agent-director's answer to a malformed settings file" },
   expireAll: { text: code('--older-than 0d'), source: 'HO C6; SRJ-1108 step 11: never used' },
   'ceiling kill': { text: 'the larger of 2Q + 2A + E + 4W and 3Q + 2A + 5W', source: 'ADSRD SR-13.2; SRJ-213' },
@@ -2151,7 +2241,7 @@ const REFUSAL_BRANCHES: [element: string, part: RegExp, required: readonly Item[
     `follow "${ROLLBACK_RUNBOOK_SECTION_TITLE}", which starts the previous CSCB`,
     ci(`stop every agent on the host and every long-running agent-director process (${code('agent-director serve')} included) before that binary change, and start them again after it`),
     '"Stopping a set of agents before a binary change"',
-    `"Operator actions" section of agent-director's README`,
+    `${vocab('operatorActions')} section of agent-director's README`,
     ci('once the server finds Phase 1, start the new CSCB as'),
     stepLink(10),
   ]],
@@ -2167,7 +2257,7 @@ const REFUSAL_BRANCHES: [element: string, part: RegExp, required: readonly Item[
     ci('installed in any other way outside this runbook is not a target of this runbook'),
     ci(`follow "${ROLLBACK_RUNBOOK_SECTION_TITLE}"`),
     '"agent-director was installed outside the caller\'s switch-over"',
-    '"Operator actions"',
+    vocab('operatorActions'),
   ]],
   ['a stop by the runtime re-check: not a switch-over case; the debugging skill instead', ci('runtime re-check'), [
     ci('not a switch-over case'),
@@ -2434,6 +2524,511 @@ describe(`the switch-over runbook, "${PHASE1_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-
 
     test.each(['stop --stop-bots', 'claude-slack-channel-bots start'])(`"${UPGRADING_HEADING}" no longer holds %s`, (command) => {
       expect(upgrading()).not.toContain(command)
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The rollback runbook (b.jg5 SRJ-1109; hatch A3; ruling C-2)
+// ---------------------------------------------------------------------------
+
+/** The rollback runbook's step count (SRJ-1109: steps 1 to 9). */
+const ROLLBACK_STEP_COUNT = 9
+
+/** Every carrier of the rollback runbook: its name and its reader. The CHANGELOG copy joins in b.jg5 E35 T3. */
+const ROLLBACK_CARRIERS: [name: string, read: () => RunbookCarrier][] = [
+  ['README.md', lazy(() => readRunbookCarrier('README.md', readRepoFile('README.md'), ROLLBACK_HEADING, ROLLBACK_STEP_COUNT))],
+]
+
+/** One rollback carrier's place, for the cases that run over every carrier. */
+const overRollbackCarriers = <T extends readonly unknown[]>(rows: readonly T[]) =>
+  ROLLBACK_CARRIERS.flatMap(([name, read]) => rows.map((row) => [name, ...row, read] as const))
+
+/** A count as the runbooks write it, in words; throws for a count it lacks, so a changed count fails naming it. */
+function countWord(n: number): string {
+  const words: Record<number, string> = { 9: 'nine' }
+  const word = words[n]
+  if (word === undefined) throw new Error(`countWord has no word for ${n}`)
+  return word
+}
+
+/** The old CSCB's tmux session names, which the previous CSCB uses again after the rollback (SRJ-1109 step 5). */
+const OLD_SESSION_NAMES = [`${PERSONA_TMUX_SESSION_PREFIX}<name>_<channel>`, `${PERSONA_TMUX_SESSION_PREFIX}<channel ID>`]
+
+/**
+ * One row per SRJ-1109 element: where it sits (`frame`, `step <n>` or
+ * `step <n> › <item lead>`), the element, and the items its text must hold.
+ * The `operator action` rows mark each operator-only action at its step.
+ * Links are checked only in the README (ruling C-2, below), so the rows hold
+ * for a copy whose links differ.
+ */
+const ROLLBACK_ELEMENTS: [where: string, element: string, required: readonly Item[]][] = [
+  // The section-level statements.
+  ['frame', `back to the previous CSCB on agent-director ${OLD_AD_VERSION}; both binaries rolled back together`, [
+    ci(`back to the previous CSCB on agent-director ${OLD_AD_VERSION}`),
+    ci('both binaries are rolled back together'),
+  ]],
+  ['frame', `the previous agent-director is restored only with agent-director's ${vocab('downgradeRecipe')}, never state.db from the switch-over backup`, [
+    ci(`the previous agent-director is restored only with agent-director's ${vocab('downgradeRecipe')}, in step 6`),
+    ci("never restore `state.db` from the switch-over's backup"),
+  ]],
+  ['frame', "the reason: the store is shared, and a restore drops other services' rows, leaving their workers running with no row", [
+    ci('the store is shared by every agent-director user on the host'),
+    ci("a restore would drop the rows of other services' workers spawned since the switch-over, leaving them running with no row"),
+  ]],
+  ['frame', 'every agent and long-running agent-director process stopped before the previous binary is restored and started again after it (C15)', [
+    ci(`every agent on the host, with every long-running agent-director process (${code('agent-director serve')} included), is stopped before the previous binary is restored and started again after it`),
+  ]],
+  ['frame', 'the switch-over log kept in use; each step says what to record', [ci('keep using the switch-over log'), ci('each step says what to record in it')]],
+  ['frame', "commands run as the workers' user in the tmux environment switch-over step 1 pinned", [
+    ci("run every command as the workers' user, in the tmux environment switch-over step 1 pinned"),
+  ]],
+  ['frame', 'operator-only actions are marked "operator action"', [ci('steps marked "operator action" are done by a human on the host')]],
+  ['frame', `${vocab('operatorActions')} is that section of agent-director's README`, [ci(`${vocab('operatorActions')} is that section of agent-director's README`)]],
+
+  // Steps 1 and 2.
+  ['step 1', "the host's autostart for CSCB disabled until step 9, recorded", [
+    ci("disable the host's autostart for CSCB until step 9"),
+    ci('record it in the switch-over log'),
+  ]],
+  ['step 1', "operator action: disabling the host's autostart for CSCB", [ci(`until step 9 ${OPERATOR_ACTION}`)]],
+  ['step 2', "the daily agent-director expire switch-over step 11 added removed from the host's sweep loop, recorded", [
+    ci("remove the daily `agent-director expire` run that switch-over step 11 added to the host's sweep loop"),
+    code('~/startup/find-missing-loop.sh'),
+    ci('record it in the switch-over log'),
+  ]],
+  ['step 2', 'before the previous binary is restored, because the older expire does not check tmux', [
+    ci('before the previous binary is restored, because the older `expire` does not check tmux'),
+  ]],
+  ['step 2', 'operator action: removing the daily expire', [ci(`${code('~/startup/find-missing-loop.sh')} ${OPERATOR_ACTION}`)]],
+
+  // Step 3.
+  ['step 3', 'the new CSCB stopped with stop --stop-bots, whose failure lines the README describes (E32, E33)', [
+    'claude-slack-channel-bots stop --stop-bots',
+    ci("the command's failure lines are described in"),
+    'Precheck before stopping bots',
+    "What the command prints when a bot can't be stopped",
+  ]],
+  ['step 3', `a persona in ${AD_ERROR_CLASS_CONFLICT}: a human follows ${vocab('operatorActions')} for its session, checks the result and runs stop --stop-bots again`, [
+    `naming a persona in ${AD_ERROR_CLASS_CONFLICT}`,
+    ci(`a human follows ${vocab('operatorActions')} for that persona's session, checks the result, and runs \`stop --stop-bots\` again`),
+  ]],
+  ['step 3', `that session not ended, agent-director not answering or a call ${AD_ERROR_CLASS_UNAVAILABLE} after its retries: plain stop, each persona and session recorded`, [
+    ci('if that session cannot be ended that way'),
+    ci('the command exits non-zero because agent-director does not answer'),
+    `a call stays ${AD_ERROR_CLASS_UNAVAILABLE} after its retries`,
+    ci('stop the server with plain `stop`'),
+    'claude-slack-channel-bots stop ```',
+    ci('record in the switch-over log each persona and session the failed command named'),
+  ]],
+
+  // Step 4.
+  ['step 4', `agent-director find-missing, then at most ${vocab('waitMinutes')} minutes for every ${SERVICE_LABEL} row, retired keys' rows included, to read ended or missing`, [
+    code('agent-director find-missing'),
+    ci(`wait at most ${vocab('waitMinutes')} minutes for every \`${SERVICE_LABEL}\` row, the rows of retired persona keys included, to read \`ended\` or \`missing\``),
+  ]],
+  ['step 4', 'a row still live (a retired key whose kill failed, which stop --stop-bots does not cover) is ended by a human with agent-director kill, its result checked', [
+    ci('a row still live after that (for example a retired key whose kill failed, which `stop --stop-bots` does not cover) is ended by a human'),
+    ci('run `agent-director kill --claude-instance-id <id>`, and check its result'),
+  ]],
+  ['step 4', `a kill refused with ${AD_ERROR_CLASS_CONFLICT} ("${vocab('notThisLaunch')}") meets a leftover of an earlier launch, handled as ${vocab('operatorActions')} describes`, [
+    `refused with ${AD_ERROR_CLASS_CONFLICT} ("${vocab('notThisLaunch')}")`,
+    ci('has met a leftover of an earlier launch'),
+    ci(`handle it as ${vocab('operatorActions')} describes`),
+  ]],
+  ['step 4', `kills that keep failing: ${vocab('operatorActions')} for that worker, recorded`, [
+    ci(`if these kills keep failing, follow ${vocab('operatorActions')} for that worker, and record it in the switch-over log`),
+  ]],
+  ['step 4', 'nothing goes on to step 6 while such a worker runs, because every agent must be stopped before the restore (ADA question 9)', [
+    ci('nothing goes on to step 6 while such a worker runs, because every agent must be stopped before the previous binary is restored'),
+  ]],
+  ['step 4', `a worker ${vocab('operatorActions')} cannot end: the rollback stops with Phase 1 installed and the worker goes to agent-director`, [
+    ci(`when ${vocab('operatorActions')} cannot end it either`),
+    ci('the rollback stops here, with Phase 1 still installed, and the worker is taken to agent-director'),
+  ]],
+  ['step 4', "then the new CSCB started again, step 2's expire restored and the autostart re-enabled, so the fleet does not stay down", [
+    ci('so that the fleet does not stay down while agent-director investigates'),
+    ci('start the new CSCB again'),
+    ci("restore step 2's daily `expire` in `~/startup/find-missing-loop.sh`"),
+    ci("re-enable the host's autostart for CSCB"),
+  ]],
+  ['step 4', "operator action: the new CSCB's restart, the expire and the autostart", [ci(`autostart for CSCB ${OPERATOR_ACTION}`)]],
+  ['step 4', `a refused restart: the new CSCB stays stopped until agent-director has dealt with the worker, then the refusal block's after-install branch (SRJ-1108)`, [
+    ci('if that start is refused, the new CSCB stays stopped until agent-director has dealt with that worker'),
+    ci('then follow "A refusal after Phase 1 was installed"'),
+    REFUSAL_BLOCK_HEADING,
+  ]],
+
+  // Step 5.
+  ['step 5', `a read-only tmux ls, as the workers' user on the pinned socket, confirms no ${PERSONA_TMUX_SESSION_PREFIX}<key> session is left`, [
+    ci("as the workers' user, on the socket switch-over step 1 pinned, run a read-only `tmux ls`"),
+    ci(`confirm that no ${code(`${PERSONA_TMUX_SESSION_PREFIX}<key>`)} session is left`),
+    ci("handle each leftover by its row's current state"),
+  ]],
+  ['step 5', `a live row's leftover: agent-director kill of ${PERSONA_INSTANCE_ID_PREFIX}<key>; refused with "${vocab('notThisLaunch')}", ${vocab('operatorActions')}`, [
+    ci('a leftover whose row is live'),
+    code(`agent-director kill --claude-instance-id ${PERSONA_INSTANCE_ID_PREFIX}<key>`),
+    ci(`when that \`kill\` is refused with "${vocab('notThisLaunch')}", handle it as ${vocab('operatorActions')} describes`),
+  ]],
+  ['step 5', `a finished row's own leftover session: as ${vocab('operatorActions')} describes`, [
+    new RegExp(`a finished row's own leftover session\\W+handle it as ${escapeRegExp(vocab('operatorActions'))} describes`, 'i'),
+  ]],
+  ['step 5', 'an operator action refused inside the stopping window or starting-session bound: retried once the longer has passed, the nine settings read again and recorded; a plain kill never refuses so', [
+    ci('an operator action refused inside the stopping window or the starting-session bound'),
+    ci('retry it once the longer of the two has passed'),
+    () => `all ${countWord(AD_TMUX_KEYS.length)} timing settings again, as in switch-over step 1`,
+    ci('record them in the switch-over log'),
+    ci('a plain `kill` never refuses for that reason'),
+  ]],
+  ['step 5', "a leftover with no row: as in switch-over step 5, against the previous CSCB's session names", [
+    ci('a leftover with no row'),
+    ci('switch-over step 5'),
+    ci("against the previous CSCB's session names"),
+    ...OLD_SESSION_NAMES.map(code),
+  ]],
+  ['step 5', "each result checked, then find-missing and switch-over step 5's gone check again", [
+    ci("check each result, then run `agent-director find-missing` and switch-over step 5's gone check again"),
+  ]],
+  ['step 5', "no going on while a leftover remains: the previous CSCB's first start deletes every row without a channel label", [
+    ci("don't go on while a leftover remains"),
+    ci("the previous CSCB's first start deletes every row without a `channel` label"),
+  ]],
+
+  // Step 6.
+  ['step 6 › Stop every other agent', "every other agent and long-running agent-director process stopped before the restore: workers, hand-started sessions, serve sessions, whose Claude session is stopped too (HO C15; ADA question 9)", [
+    ci('before the previous binary is restored, stop every other agent on the host and every long-running agent-director process'),
+    ci("orchestrators' workers, hand-started sessions and sessions with an `agent-director serve`"),
+    ci('a `serve` runs inside its Claude session, so that session is stopped too'),
+  ]],
+  ['step 6 › Stop every other agent', 'operator action: stopping every other agent (C15)', [OPERATOR_ACTION]],
+  ['step 6 › Stop every other agent', 'confirmed as in switch-over step 8: agent-director list, a read-only tmux ls, recorded', [
+    ci('confirm as in'),
+    ci('switch-over step 8'),
+    ci("`agent-director list` shows each stopped agent's row `ended` or `missing`"),
+    ci('a read-only `tmux ls` shows no agent session left'),
+    ci('record it in the switch-over log'),
+  ]],
+  ['step 6 › Stop every other agent', 'no restore while any agent runs; one that cannot be stopped stops the rollback as step 4 says, and the stopped agents start again on Phase 1', [
+    ci('the restore does not begin while any agent runs'),
+    ci('if one cannot be stopped, the rollback stops as step 4 says'),
+    ci('every agent this step stopped is started again on Phase 1 by its owner'),
+  ]],
+  ['step 6 › Stop every other agent', 'operator action: the stopped agents started again on Phase 1 by their owners', [ci(`started again on Phase 1 by its owner ${OPERATOR_ACTION}`)]],
+  ['step 6 › Restore the previous agent-director', `restored with agent-director's ${vocab('downgradeRecipe')}, never from the switch-over's state.db backup`, [
+    ci(`with agent-director's ${vocab('downgradeRecipe')}, never from the switch-over's \`state.db\` backup`),
+  ]],
+  ['step 6 › Restore the previous agent-director', `the recipe drops the ${vocab('migrationColumns')} columns and the ${vocab('storeMeta')} table holding the store's id (HO rev 15, rev 19)`, [
+    ci(`drops the ${vocab('migrationColumns')} columns the Phase 1 migration added and its ${vocab('storeMeta')} table, which holds the store's id`),
+  ]],
+  ['step 6 › Restore the previous agent-director', `the recipe stamps schema version ${vocab('downgradeSchemaVersion')} and deletes no row or history entry; the older binary shows every life's history again`, [
+    ci(`stamps schema version ${vocab('downgradeSchemaVersion')}`),
+    ci("it deletes no row or history entry, so the older binary shows every life's history again"),
+  ]],
+  ['step 6 › Restore the previous agent-director', "a later Phase 1 install creates a new store id: an earlier-labelled session reads as another store's, one more reason no agent runs across the restore (HO rev 15)", [
+    ci('a later Phase 1 install creates a new store id'),
+    ci("a session labelled before the rollback would then read as another agent-director store's session, which agent-director never acts on"),
+    ci('one more reason no agent may run across the restore'),
+  ]],
+  ['step 6 › Start the other agents again', 'every other agent started again by its owner on the previous binary, its serve processes on it', [
+    ci('every other agent on the host is started again by its owner on the previous binary, which also starts its `serve` processes on it'),
+  ]],
+  ['step 6 › Start the other agents again', 'operator action: the other agents started again (C15)', [OPERATOR_ACTION]],
+
+  // Steps 7 to 9.
+  ['step 7', 'the §6 "hold until after" wording reverted', [ci('revert the orchestrator system prompt\'s "hold until after" wording that switch-over step 11 put out')]],
+  ['step 7', 'operator action: reverting the "hold until after" wording', [ci(`put out ${OPERATOR_ACTION}`)]],
+  ['step 7', `the "kill, then leave the row" cleanup stays: it works on ${OLD_AD_VERSION} too (reconcile note)`, [
+    ci('the worker cleanup switch-over step 10 changed to "kill, then leave the row" stays'),
+    ci(`it works on ${OLD_AD_VERSION} too`),
+  ]],
+  ['step 8', `${CONFIG_FILE_NAME}${LAST_APPLIED_FILE_SUFFIX} and ${RETIRED_KEYS_FILE_NAME} moved aside`, [
+    ci(`move aside ${code(`${CONFIG_FILE_NAME}${LAST_APPLIED_FILE_SUFFIX}`)} and ${code(RETIRED_KEYS_FILE_NAME)}`),
+  ]],
+  ['step 8', 'the previous CSCB reinstalled: the version switch-over step 1 recorded, or else the version the host ran before (hatch A3)', [
+    ci('reinstall the previous CSCB, the version switch-over step 1 recorded, or else the version the host ran before'),
+    'bun install -g claude-slack-channel-bots@<the version switch-over step 1 recorded>',
+  ]],
+  ['step 8', "switch-over step 1's files put back: the pre-persona config.json, crontable, /interject callers, access.json and the Slack token environment variables (SRJ-1516)", [
+    ci('put back what switch-over step 1 saved'),
+    ci(`the pre-persona ${code(CONFIG_FILE_NAME)}, the crontable, the \`/interject\` callers`),
+    ci("the host crontab's `curl` lines included"),
+    code('access.json'),
+    ci('the Slack token environment variables'),
+  ]],
+  ['step 8', "a file whose switch-over step 1 copy is missing is rebuilt by hand from the persona configuration, reversing the manual conversion (hatch A3)", [
+    ci("where switch-over step 1's copy of a file is missing, the operator rebuilds the pre-persona file by hand from the persona configuration"),
+    ci('reversing the manual conversion'),
+  ]],
+  ['step 8', 'no tooling for the rebuild: none ships in either direction (hatch A3)', [
+    ci('no tooling does this'),
+    ci('ships no conversion tooling in either direction'),
+  ]],
+  ['step 9', "the previous CSCB started, then the host's autostart for CSCB re-enabled, recorded", [
+    ci("start the previous CSCB, then re-enable the host's autostart for CSCB"),
+    'claude-slack-channel-bots start',
+    ci('record it in the switch-over log'),
+  ]],
+  ['step 9', "operator action: re-enabling the host's autostart for CSCB", [ci(`autostart for CSCB ${OPERATOR_ACTION}`)]],
+]
+
+/** The steps that send a human beyond `agent-director kill`, each naming agent-director's "Operator actions" by title (SRJ-1109). */
+const OPERATOR_ACTIONS_STEPS: readonly number[] = [3, 4, 5]
+
+/**
+ * What in a rollback step-8 text names a tool or command for the rebuild by
+ * hand (hatch A3): a fenced block other than the previous CSCB's reinstall, a
+ * code span naming a script or a CSCB subcommand, a link to a file, or
+ * conversion wording tied to a tool, script or command. Takes the flattened
+ * step text. Pure; `[]` when none.
+ */
+function conversionToolsIn(stepText: string): string[] {
+  const REINSTALL = /^bun install -g claude-slack-channel-bots@<[^>]+>$/
+  const blocks = [...stepText.matchAll(/```\w*\s(.*?)\s?```/g)].map((m) => m[1].trim())
+  const prose = stepText.replace(/```\w*\s.*?\s?```/g, ' ')
+  return [
+    ...blocks.filter((body) => !REINSTALL.test(body)).map((body) => `fenced block: ${body}`),
+    ...[...prose.matchAll(/`[^`]*(?:\.(?:sh|ts|js|py)\b|claude-slack-channel-bots\s+\w)[^`]*`/g)].map((m) => `code span: ${m[0]}`),
+    ...markdownLinks(prose).filter((link) => link.path !== '').map((link) => `link to a file: ${link.target}`),
+    ...[...prose.matchAll(/\b(?:conver\w*|migrat\w*)\b[^.]*\b(?:tool|script|command|subcommand)s?\b|\b(?:tool|script|command|subcommand)s?\b[^.]*\bconver\w*/gi)].map((m) => `wording: ${m[0]}`),
+  ]
+}
+
+/** The README heading `anchor` resolves to, as GitHub assigns anchors; undefined when none does. */
+function headingAt(readme: string, anchor: string): Heading | undefined {
+  const index = headingAnchors(readme).indexOf(anchor)
+  return index < 0 ? undefined : headings(readme)[index]
+}
+
+/** The inline links in `text`, each with its link text and its target split as `markdownLinks` splits it. */
+function linksWithText(text: string): { text: string; path: string; anchor: string; target: string }[] {
+  return [...text.matchAll(/\[([^\]]*)\]\(([^)\s]+)\)/g)].map(([, linkText, target]) => ({ text: linkText, ...markdownLinks(`](${target})`)[0] }))
+}
+
+/**
+ * What is wrong with the rollback section's heading (b.jg5 SRJ-1109): exactly
+ * one heading carries `ROLLBACK_RUNBOOK_SECTION_TITLE`, at `###`, inside
+ * `## Migration`, after the switch-over section ends. Pure; `[]` when all holds.
+ */
+function rollbackTitleProblems(readme: string): string[] {
+  const titled = headings(readme).filter((h) => h.title === ROLLBACK_RUNBOOK_SECTION_TITLE)
+  if (titled.length !== 1) return [`${titled.length} README headings are titled "${ROLLBACK_RUNBOOK_SECTION_TITLE}", expected 1`]
+  const [heading] = titled
+  const problems: string[] = []
+  if (heading.text !== ROLLBACK_HEADING) problems.push(`"${heading.text}" is not "${ROLLBACK_HEADING}"`)
+  const migration = sectionRange(readme, MIGRATION_HEADING)
+  if (migration === undefined || heading.line <= migration.start || heading.line >= migration.end) {
+    problems.push(`"${heading.text}" is not under "${MIGRATION_HEADING}"`)
+  }
+  const switchOver = sectionRange(readme, SWITCH_OVER_HEADING)
+  if (switchOver === undefined || heading.line < switchOver.end) problems.push(`"${heading.text}" is not after "${SWITCH_OVER_HEADING}"`)
+  return problems
+}
+
+/**
+ * Ruling C-2 (hatch A3): the switch-over runbook's pointers to the rollback
+ * runbook are links that resolve. Each pointer phrase, wherever it is
+ * written, must be the text of a link resolving to its target: the frame's
+ * "rolled back together, by "<title>"" and the refusal block's
+ * "follow "<title>"" to the rollback heading, and the refusal block's
+ * "step 8 of "<title>"" to rollback step 8; each must be written at least
+ * once. The refusal block also links rollback step 4, whose restart it names.
+ * Pure; `[]` when all holds.
+ */
+function rollbackPointerProblems(readme: string): string[] {
+  const rollback = sectionRange(readme, ROLLBACK_HEADING)
+  if (rollback === undefined) return [`README.md has no heading "${ROLLBACK_HEADING}"`]
+  const switchOver = requiredSection(readme, SWITCH_OVER_HEADING, 'README.md')
+  const lines = switchOver.split('\n')
+  const first = headings(switchOver)[0]
+  const frame = flat(lines.slice(0, first === undefined ? lines.length : first.line).join('\n'))
+  const block = flat(requiredSection(switchOver, `#### ${REFUSAL_BLOCK_HEADING}`, `README.md, under "${SWITCH_OVER_HEADING}",`))
+  const isSection = (h: Heading) => h.text === ROLLBACK_HEADING
+  const isStep = (n: number) => (h: Heading) => h.line > rollback.start && h.line < rollback.end && h.level === 4 && stepNumberOf(h.title) === n
+  const title = escapeRegExp(`"${ROLLBACK_RUNBOOK_SECTION_TITLE}"`)
+  const pointers: [where: string, text: string, phrase: RegExp, target: string, resolves: (h: Heading) => boolean][] = [
+    ['the switch-over frame', frame, new RegExp(`rolled back together, by ${title}`, 'gi'), 'the rollback section', isSection],
+    [`"${REFUSAL_BLOCK_HEADING}"`, block, new RegExp(`follow ${title}`, 'gi'), 'the rollback section', isSection],
+    [`"${REFUSAL_BLOCK_HEADING}"`, block, new RegExp(`step 8 of ${title}`, 'gi'), 'rollback step 8', isStep(8)],
+  ]
+  const problems: string[] = []
+  for (const [where, text, phrase, target, resolves] of pointers) {
+    const written = [...text.matchAll(phrase)].length
+    const linked = linksWithText(text)
+      .filter((link) => link.path === '')
+      .filter((link) => {
+        const h = headingAt(readme, link.anchor)
+        return h !== undefined && resolves(h)
+      })
+      .reduce((n, link) => n + [...link.text.matchAll(phrase)].length, 0)
+    if (written === 0) problems.push(`${where} never writes ${String(phrase)}`)
+    else if (linked !== written) problems.push(`${where}: ${written - linked} of ${written} pointers ${String(phrase)} are not links resolving to ${target}`)
+  }
+  const step4 = linksWithText(block).filter((link) => {
+    const h = link.path === '' ? headingAt(readme, link.anchor) : undefined
+    return h !== undefined && isStep(4)(h)
+  })
+  if (step4.length === 0) problems.push(`"${REFUSAL_BLOCK_HEADING}" has no link resolving to rollback step 4`)
+  return problems
+}
+
+describe(`the rollback runbook, "${ROLLBACK_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-1109)`, () => {
+  const readme = readRepoFile('README.md')
+
+  test('exactly one README heading carries the rollback title, a `###` under `## Migration`, after the switch-over section', () => {
+    expect(rollbackTitleProblems(readme)).toEqual([])
+  })
+
+  test.each([
+    ['re-levelled', (text: string) => text.replace(`${ROLLBACK_HEADING}\n`, `#${ROLLBACK_HEADING}\n`), 'is not "'],
+    ['duplicated', (text: string) => `${text}\n${ROLLBACK_HEADING}\n`, '2 README headings'],
+    ['placed before the switch-over section', (text: string) => text.replace(`${ROLLBACK_HEADING}\n`, '').replace(`${SWITCH_OVER_HEADING}\n`, `${ROLLBACK_HEADING}\n\n${SWITCH_OVER_HEADING}\n`), 'is not after'],
+  ])('self-check: with the rollback heading %s, the title case fails', (_how, edit, problem) => {
+    const edited = edit(readme)
+    expect(edited).not.toBe(readme)
+    expect(rollbackTitleProblems(edited).join('\n')).toContain(problem)
+  })
+
+  test.each(ROLLBACK_CARRIERS)(`%s: the section reads as steps 1 to ${ROLLBACK_STEP_COUNT}, in order, one heading level below it`, (_name, read) => {
+    expect(read().steps).toHaveLength(ROLLBACK_STEP_COUNT)
+  })
+
+  describe('the step reader on the rollback section (self-checks, on edited README text)', () => {
+    const start = readme.indexOf(`${ROLLBACK_HEADING}\n`)
+    /** The README with `edit` applied to the rollback section and what follows it only. */
+    const inRollback = (edit: (rest: string) => string) => readme.slice(0, start) + edit(readme.slice(start))
+    const step = (n: number) => `#### ${stepHeadingPrefix(n)}`
+    test.each([
+      ['missing', inRollback((rest) => rest.replace(step(7), '#### Then: ')), 'step 7 is missing'],
+      ['duplicated', inRollback((rest) => rest.replace(step(8), step(7))), 'step 7 appears 2 times'],
+      ['out of order', inRollback((rest) => rest.replace(step(7), '#### SWAP: ').replace(step(8), step(7)).replace('#### SWAP: ', step(8))), 'step 8 is out of order'],
+      ['beyond the count', inRollback((rest) => rest.replace(step(9), `${step(10)}Extra\n\n${step(9)}`)), 'step 10 is beyond the expected 9 steps'],
+    ])('a rollback step %s fails naming the rollback section and the step', (_how, text, message) => {
+      expect(start).toBeGreaterThan(0)
+      expect(() => readRunbookCarrier('README.md', text, ROLLBACK_HEADING, ROLLBACK_STEP_COUNT)).toThrow(`README.md "${ROLLBACK_HEADING}": ${message}`)
+    })
+  })
+
+  test.each(overRollbackCarriers(ROLLBACK_ELEMENTS))('%s, rollback %s: %s', (carrierName, where, element, required, read) => {
+    const carrier = read()
+    expect({ carrier: carrierName, runbook: 'rollback', where, element, missing: missingItems(carrier, textAt(carrier, where), required) }).toEqual({
+      carrier: carrierName,
+      runbook: 'rollback',
+      where,
+      element,
+      missing: [],
+    })
+  })
+
+  describe('order rows', () => {
+    const ORDERS: [step: number, label: string, order: RegExp[]][] = [
+      [6, "step 6 stops every other agent and confirms it, then restores with the recipe, then starts the agents again on the previous binary", [
+        ci('stop every other agent on the host'),
+        ci("shows each stopped agent's row"),
+        ci('restore the previous agent-director'),
+        ci(vocab('downgradeRecipe')),
+        ci('started again by its owner on the previous binary'),
+      ]],
+      [8, 'step 8 moves the last-applied record and the retired keys aside, then reinstalls the previous CSCB, then puts back the saved files', [
+        ci('move aside'),
+        ci('reinstall the previous CSCB'),
+        ci('bun install -g claude-slack-channel-bots@'),
+        ci('put back what switch-over step 1 saved'),
+      ]],
+      [9, "step 9 starts the previous CSCB, then re-enables the host's autostart for CSCB", [ci('start the previous CSCB'), ci("re-enable the host's autostart for CSCB")]],
+    ]
+
+    test.each(overRollbackCarriers(ORDERS))('%s, step %d: %s, in that order', (_name, n, _label, order, read) => {
+      const text = read().steps[n - 1]
+      const at = order.map((pattern) => text.search(pattern))
+      expect(order.filter((_, i) => at[i] < 0).map(String)).toEqual([])
+      expect(at).toEqual([...at].sort((a, b) => a - b))
+    })
+  })
+
+  describe('cross-step rows', () => {
+    test.each(ROLLBACK_CARRIERS)('%s: the section never names `tmux kill-session` (SRJ-1101 allows it only in switch-over steps 5 and 6)', (_name, read) => {
+      expect(flat(read().section)).not.toMatch(/tmux kill-session/)
+    })
+
+    test.each(ROLLBACK_CARRIERS)('%s: the section never names include-finished, nor agent-director delete (SRJ-1101)', (_name, read) => {
+      const section = flat(read().section)
+      expect(section).not.toMatch(/include[-_]finished/)
+      expect(section).not.toMatch(/agent-director delete\b/)
+    })
+
+    test.each(overRollbackCarriers(OPERATOR_ACTIONS_STEPS.map((n) => [n] as const)))(
+      `%s: step %d, which sends a human beyond \`agent-director kill\`, names ${vocab('operatorActions')} by title`,
+      (_name, n, read) => {
+        expect(read().steps[n - 1]).toContain(vocab('operatorActions'))
+      },
+    )
+
+    test.each(overRollbackCarriers(UPGRADE_FORMS.map(([label, pattern]) => [label, pattern] as const)))(
+      "%s: step 6's restore item carries no %s: the recipe is agent-director's, named, never spelled out",
+      (_name, _label, pattern, read) => {
+        expect(textAt(read(), 'step 6 › Restore the previous agent-director')).not.toMatch(pattern)
+      },
+    )
+
+    test.each(ROLLBACK_CARRIERS)('%s: step 8 names no conversion tool or command for the rebuild by hand (hatch A3)', (_name, read) => {
+      expect(conversionToolsIn(read().steps[7])).toEqual([])
+    })
+
+    test.each([
+      ['a CSCB subcommand', 'Rebuild it with `claude-slack-channel-bots unpersona`.', 'code span'],
+      ['a script', 'Run `scripts/unpersona.sh` on the file.', 'code span'],
+      ['a fenced command', 'Rebuild it: ```sh cscb-convert config.json ```', 'fenced block'],
+      ['a link to a file', 'See [the helper](tools/rebuild.ts).', 'link to a file'],
+      ['conversion wording tied to a tool', 'Run the conversion tool on the persona configuration.', 'wording'],
+    ])('self-check (hatch A3): a step 8 naming %s is flagged', (_label, text, kind) => {
+      expect(conversionToolsIn(flat(`Reinstall: \`\`\`sh bun install -g claude-slack-channel-bots@<v> \`\`\` ${text}`)).map((found) => found.split(':')[0])).toEqual([kind])
+    })
+  })
+
+  describe('README.md: ruling C-2 and the runbooks\' links', () => {
+    test("the switch-over runbook's pointers to the rollback runbook and its step 8 are links that resolve (ruling C-2; hatch A3)", () => {
+      expect(rollbackPointerProblems(readme)).toEqual([])
+    })
+
+    test.each([
+      ['rollback step 8 renamed', (text: string) => text.replace(`#### ${stepHeadingPrefix(8)}Reinstall`, `#### ${stepHeadingPrefix(8)}Put back`), 'rollback step 8'],
+      ['a step 8 pointer unlinked', (text: string) => text.replace(/\[(step 8 of "[^"]+")\]\(#[^)]+\)/, '$1'), '1 of 2 pointers'],
+      ['the frame pointer unlinked', (text: string) => text.replace(/\[(rolled back together, by "[^"]+")\]\(#[^)]+\)/, '$1'), 'the switch-over frame'],
+    ])('self-check (ruling C-2): with %s, the pointer case fails', (_how, edit, problem) => {
+      const edited = edit(readme)
+      expect(edited).not.toBe(readme)
+      expect(rollbackPointerProblems(edited).join('\n')).toContain(problem)
+    })
+
+    test.each([SWITCH_OVER_HEADING, ROLLBACK_HEADING])('every same-file link in "%s" resolves to a README heading', (heading) => {
+      const section = requiredSection(readme, heading, 'README.md')
+      const anchors = headingAnchors(readme)
+      const links = linksWithText(section).filter((link) => link.path === '')
+      expect(links.length).toBeGreaterThan(0)
+      expect(links.filter((link) => !anchors.includes(link.anchor)).map((link) => link.target)).toEqual([])
+    })
+
+    test('each "switch-over step <n>" link in the rollback section resolves to that step of the switch-over section', () => {
+      const switchOver = sectionRange(readme, SWITCH_OVER_HEADING)
+      if (switchOver === undefined) throw new Error(`README.md has no heading "${SWITCH_OVER_HEADING}"`)
+      const links = linksWithText(requiredSection(readme, ROLLBACK_HEADING, 'README.md')).filter((link) => link.path === '' && /^switch-over step \d+$/i.test(link.text))
+      expect(links.length).toBeGreaterThan(0)
+      const wrong = links.filter((link) => {
+        const h = headingAt(readme, link.anchor)
+        return h === undefined || h.line <= switchOver.start || h.line >= switchOver.end || stepNumberOf(h.title) !== Number(/\d+$/.exec(link.text)![0])
+      })
+      expect(wrong.map((link) => `[${link.text}](${link.target})`)).toEqual([])
+    })
+
+    test('docs/registry-install-runbook.md links both runbook sections, and the links resolve', () => {
+      const anchors = markdownLinks(readRepoFile('docs/registry-install-runbook.md'))
+        .filter((link) => link.path === '../README.md')
+        .map((link) => link.anchor)
+      for (const heading of [SWITCH_OVER_HEADING, ROLLBACK_HEADING]) {
+        const anchor = headingSlug(heading.slice('### '.length))
+        expect(anchors).toContain(anchor)
+        expect(headingAt(readme, anchor)?.text).toBe(heading)
+      }
     })
   })
 })

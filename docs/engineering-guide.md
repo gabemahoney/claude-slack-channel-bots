@@ -1334,7 +1334,7 @@ Not all issues are equal. When writing or reviewing code, focus in this order:
 
 ## Definition of Done — closing a bee
 
-Before any bee closes, a change to shipped text (README, any file under `skills/`, `slack-app-manifest.yml`, `MCP_INSTRUCTIONS` in `src/registry.ts`) keeps `tests/shipped-docs.test.ts` and `tests/access-file-retired.test.ts` green. Shipped text describes personas only: no pre-persona configuration shape, token environment variable or access-control file, except the debugging skill's pre-persona rejection entry (b.av2 SR-12, SR-13.5). Don't widen the audit's exceptions to make a change pass.
+Before any bee closes, a change to shipped text (README, any file under `skills/`, `slack-app-manifest.yml`, `MCP_INSTRUCTIONS` in `src/registry.ts`) keeps `tests/shipped-docs.test.ts` and `tests/access-file-retired.test.ts` green. Shipped text describes personas only: no pre-persona configuration shape, token environment variable or access-control file, except the debugging skill's pre-persona rejection entry (b.av2 SR-12, SR-13.5) and the README's two runbook sections, the switch-over and the rollback, which may name the previous CSCB's retired access-control file, and nothing else, as a file to save or restore (b.jg5 SRJ-1516). Those three are the audit's only exceptions; don't widen them or add another to make a change pass.
 
 A bee may be set `finished` only when one of the following holds, and the chosen justification is stated plainly in its closure note:
 

@@ -2276,7 +2276,7 @@ After step 1, every CSCB bot is spawned through `client.spawn(...)` with `relay_
 
 ### Switching over to agent-director Phase 1
 
-This release requires agent-director Phase 1, installed on the host together with it; CSCB changes no agent-director code. The two are installed together, by this runbook, and rolled back together, by "Rolling back the switch-over".
+This release requires agent-director Phase 1, installed on the host together with it; CSCB changes no agent-director code. The two are installed together, by this runbook, and [rolled back together, by "Rolling back the switch-over"](#rolling-back-the-switch-over).
 
 - Every agent on the host, with every long-running agent-director process (`agent-director serve` included), is stopped before either binary change and started again after it.
 - The old CSCB never runs against Phase 1, and the new one never against 0.10.0: no bot server runs between step 3 and step 10, and no side-by-side install under another path is used.
@@ -2290,19 +2290,19 @@ Your new CSCB is installed and its server refused to start with `ad-below-phase1
 
 This block covers only a refusal before agent-director Phase 1 is installed on the host, by step 8 or otherwise. Act in this order:
 
-1. If `config.json` is in persona form and no pre-persona copy of it exists, neither step 1's copy nor one you kept elsewhere, stop here and change nothing: no reinstall, no start and no step 1. Rebuild the pre-persona `config.json` by hand, as step 8 of "Rolling back the switch-over" says. Once you have rebuilt it, follow this block again from its start.
-2. Otherwise, first rebuild by hand to their pre-persona form, as step 8 of "Rolling back the switch-over" says, the crontable targets and `/interject` callers that the conversion to personas left in persona form where step 1's copy of them is missing. Then reinstall the previous CSCB, the version step 1 recorded or else the version the host ran before, with the pre-persona `config.json`, crontable, `/interject` callers, `access.json` and Slack token environment variables: from step 1's files, or a pre-persona copy of `config.json` you kept, where they exist, and otherwise from those still in place. Start it, re-enabling the host's autostart for CSCB if it was disabled, as step 8's "no go" branch does.
+1. If `config.json` is in persona form and no pre-persona copy of it exists, neither step 1's copy nor one you kept elsewhere, stop here and change nothing: no reinstall, no start and no step 1. Rebuild the pre-persona `config.json` by hand, as [step 8 of "Rolling back the switch-over"](#step-8-reinstall-the-previous-cscb) says. Once you have rebuilt it, follow this block again from its start.
+2. Otherwise, first rebuild by hand to their pre-persona form, as [step 8 of "Rolling back the switch-over"](#step-8-reinstall-the-previous-cscb) says, the crontable targets and `/interject` callers that the conversion to personas left in persona form where step 1's copy of them is missing. Then reinstall the previous CSCB, the version step 1 recorded or else the version the host ran before, with the pre-persona `config.json`, crontable, `/interject` callers, `access.json` and Slack token environment variables: from step 1's files, or a pre-persona copy of `config.json` you kept, where they exist, and otherwise from those still in place. Start it, re-enabling the host's autostart for CSCB if it was disabled, as step 8's "no go" branch does.
 3. Then, if agent-director is not 0.10.0 (below 0.7.0 under `ad-system-install-too-old`; 0.7.0 to 0.9.x under `ad-below-phase1-floor`), bring it to 0.10.0 outside this runbook. This block gives no command for it.
 4. Then start the runbook at [step 1](#step-1-check-the-host-and-stage-the-release). Step 3 is then the old CSCB's own stop.
 
 **A refusal after Phase 1 was installed.** Installing agent-director Phase 1 migrates agent-director's store. A refusal at step 10, or at any later start of the new CSCB (an autostart, `clean_restart` or the restart in step 4 of "Rolling back the switch-over" included), on a host whose Phase 1 install was step 8's or agent-director's own install on a publishing host, means the server finds the wrong agent-director binary. For that refusal, and only for it:
 
 1. Check the binary. The server finds `$HOME/.agent-director/bin/agent-director` first, then the first `agent-director` on `PATH`. Take the binary path the startup-errors entry names and run `<path> version`, as the workers' user in the bot server's launcher environment.
-2. Then either put agent-director Phase 1 back as the binary the server finds, or follow "Rolling back the switch-over", which starts the previous CSCB. To put it back, stop every agent on the host and every long-running agent-director process (`agent-director serve` included) before that binary change, and start them again after it. A human stops any CSCB bot still running through the item "Stopping a set of agents before a binary change" in the "Operator actions" section of agent-director's README. Once the server finds Phase 1, start the new CSCB as [step 10](#step-10-start-the-new-cscb) does.
+2. Then either put agent-director Phase 1 back as the binary the server finds, or [follow "Rolling back the switch-over", which starts the previous CSCB](#rolling-back-the-switch-over). To put it back, stop every agent on the host and every long-running agent-director process (`agent-director serve` included) before that binary change, and start them again after it. A human stops any CSCB bot still running through the item "Stopping a set of agents before a binary change" in the "Operator actions" section of agent-director's README. Once the server finds Phase 1, start the new CSCB as [step 10](#step-10-start-the-new-cscb) does.
 
-Never reinstall the old CSCB onto the migrated store. At the restart in step 4 of "Rolling back the switch-over", an agent that could not be stopped still runs: put nothing back and don't follow the rollback again. The new CSCB stays stopped until agent-director has dealt with that agent (as that step says), and then this branch applies.
+Never reinstall the old CSCB onto the migrated store. At the restart in step 4 of "Rolling back the switch-over", an agent that could not be stopped still runs: put nothing back and don't follow the rollback again. The new CSCB stays stopped until agent-director has dealt with that agent (as [that step](#step-4-wait-for-the-new-rows-to-end) says), and then this branch applies.
 
-**Phase 1 installed some other way.** A host where agent-director Phase 1 was installed in any other way outside this runbook is not a target of this runbook, the same way step 1 sends a host on any version but 0.10.0 outside it. Follow "Rolling back the switch-over" and the item "agent-director was installed outside the caller's switch-over" in the "Operator actions" section of agent-director's README. Don't put Phase 1 back and start the new CSCB.
+**Phase 1 installed some other way.** A host where agent-director Phase 1 was installed in any other way outside this runbook is not a target of this runbook, the same way step 1 sends a host on any version but 0.10.0 outside it. [Follow "Rolling back the switch-over"](#rolling-back-the-switch-over) and the item "agent-director was installed outside the caller's switch-over" in the "Operator actions" section of agent-director's README. Don't put Phase 1 back and start the new CSCB.
 
 **A stop by the runtime re-check** is not a switch-over case. See [Found while the server was running](skills/debug-slack-channel-bots/SKILL.md#found-while-the-server-was-running) in the debugging skill.
 
@@ -2436,6 +2436,100 @@ Every other agent on the host is started again by its owner (operator action), w
 Schedule a daily `agent-director expire` at the default retention, never `--older-than 0d`, as the workers' user in the tmux environment step 1 pinned (operator action). Add it to the host's sweep loop, `~/startup/find-missing-loop.sh`, the script step 1's socket check names: nothing on the host runs `expire` before this step.
 
 The orchestrator system prompt's "hold until after" wording goes out now (operator action).
+
+### Rolling back the switch-over
+
+This runbook takes a host that ran [Switching over to agent-director Phase 1](#switching-over-to-agent-director-phase-1) back to the previous CSCB on agent-director 0.10.0. Both binaries are rolled back together, the same way they were installed together.
+
+- The previous agent-director is restored only with agent-director's emergency downgrade recipe, in step 6. Never restore `state.db` from the switch-over's backup: the store is shared by every agent-director user on the host, and a restore would drop the rows of other services' workers spawned since the switch-over, leaving them running with no row.
+- Every agent on the host, with every long-running agent-director process (`agent-director serve` included), is stopped before the previous binary is restored and started again after it.
+- Keep using the switch-over log. Each step says what to record in it.
+- Run every command as the workers' user, in the tmux environment switch-over step 1 pinned.
+- Steps marked "operator action" are done by a human on the host; nothing in CSCB does them. "Operator actions" is that section of agent-director's README.
+
+#### Step 1: Disable CSCB's autostart for the rollback
+
+Disable the host's autostart for CSCB until step 9 (operator action), and record it in the switch-over log.
+
+#### Step 2: Remove the daily expire from the sweep loop
+
+Remove the daily `agent-director expire` run that switch-over step 11 added to the host's sweep loop, `~/startup/find-missing-loop.sh` (operator action), and record it in the switch-over log. This comes before the previous binary is restored, because the older `expire` does not check tmux.
+
+#### Step 3: Stop the new CSCB with its bots
+
+```sh
+claude-slack-channel-bots stop --stop-bots
+```
+
+The command's failure lines are described in [Precheck before stopping bots](#precheck-before-stopping-bots) and [What the command prints when a bot can't be stopped](#what-the-command-prints-when-a-bot-cant-be-stopped).
+
+- **A persona in CONFLICT.** If the command exits non-zero naming a persona in CONFLICT, a human follows "Operator actions" for that persona's session, checks the result, and runs `stop --stop-bots` again.
+- **When the bots can't be stopped.** If that session cannot be ended that way, or the command exits non-zero because agent-director does not answer or a call stays UNAVAILABLE after its retries, stop the server with plain `stop`, and record in the switch-over log each persona and session the failed command named:
+  ```sh
+  claude-slack-channel-bots stop
+  ```
+
+#### Step 4: Wait for the new rows to end
+
+Run `agent-director find-missing`, then wait at most 5 minutes for every `service=cscb` row, the rows of retired persona keys included, to read `ended` or `missing`:
+
+```sh
+agent-director find-missing
+agent-director list --label service=cscb
+```
+
+A row still live after that (for example a retired key whose kill failed, which `stop --stop-bots` does not cover) is ended by a human:
+
+1. Run `agent-director kill --claude-instance-id <id>`, and check its result.
+2. A `kill` refused with CONFLICT ("not this launch's session") has met a leftover of an earlier launch: handle it as "Operator actions" describes.
+3. If these kills keep failing, follow "Operator actions" for that worker, and record it in the switch-over log.
+
+Nothing goes on to step 6 while such a worker runs, because every agent must be stopped before the previous binary is restored.
+
+**When "Operator actions" cannot end it either**, the rollback stops here, with Phase 1 still installed, and the worker is taken to agent-director. So that the fleet does not stay down while agent-director investigates, start the new CSCB again, restore step 2's daily `expire` in `~/startup/find-missing-loop.sh`, and re-enable the host's autostart for CSCB (operator action). If that start is refused, the new CSCB stays stopped until agent-director has dealt with that worker; then follow "A refusal after Phase 1 was installed" in [Arrived here from a startup refusal?](#arrived-here-from-a-startup-refusal).
+
+#### Step 5: Check for leftover persona sessions
+
+As the workers' user, on the socket switch-over step 1 pinned, run a read-only `tmux ls`, and confirm that no `slack_bot_<key>` session is left. Handle each leftover by its row's current state:
+
+- **A leftover whose row is live:** end it with `agent-director kill --claude-instance-id cscb_<key>`. When that `kill` is refused with "not this launch's session", handle it as "Operator actions" describes.
+- **A finished row's own leftover session:** handle it as "Operator actions" describes.
+- **An operator action refused inside the stopping window or the starting-session bound:** retry it once the longer of the two has passed. Read all nine timing settings again, as in switch-over step 1, for the two windows' values, and record them in the switch-over log. A plain `kill` never refuses for that reason.
+- **A leftover with no row:** handle it as in [switch-over step 5](#step-5-check-for-leftover-sessions), against the previous CSCB's session names (`slack_bot_<name>_<channel>` or `slack_bot_<channel ID>`) instead of the new personas'.
+
+Check each result, then run `agent-director find-missing` and switch-over step 5's gone check again. Don't go on while a leftover remains: the previous CSCB's first start deletes every row without a `channel` label.
+
+#### Step 6: Stop every agent and restore the previous agent-director
+
+1. **Stop every other agent (operator action).** Before the previous binary is restored, stop every other agent on the host and every long-running agent-director process: orchestrators' workers, hand-started sessions and sessions with an `agent-director serve`. A `serve` runs inside its Claude session, so that session is stopped too. Confirm as in [switch-over step 8](#step-8-install-agent-director-phase-1): `agent-director list` shows each stopped agent's row `ended` or `missing`, and a read-only `tmux ls` shows no agent session left. Record it in the switch-over log.
+
+   The restore does not begin while any agent runs. If one cannot be stopped, the rollback stops as step 4 says, and every agent this step stopped is started again on Phase 1 by its owner (operator action).
+2. **Restore the previous agent-director** with agent-director's emergency downgrade recipe, never from the switch-over's `state.db` backup. The recipe drops the thirteen columns the Phase 1 migration added and its `store_meta` table, which holds the store's id, and stamps schema version 4. It deletes no row or history entry, so the older binary shows every life's history again.
+
+   A later Phase 1 install creates a new store id. A session labelled before the rollback would then read as another agent-director store's session, which agent-director never acts on: one more reason no agent may run across the restore.
+3. **Start the other agents again (operator action).** Every other agent on the host is started again by its owner on the previous binary, which also starts its `serve` processes on it.
+
+#### Step 7: Revert the orchestrator prompt's hold wording
+
+Revert the orchestrator system prompt's "hold until after" wording that switch-over step 11 put out (operator action). The worker cleanup switch-over step 10 changed to "kill, then leave the row" stays: it works on 0.10.0 too.
+
+#### Step 8: Reinstall the previous CSCB
+
+1. Move aside `config.json.last-applied` and `retired-keys.json` (see [Files beside the config file](#files-beside-the-config-file)).
+2. Reinstall the previous CSCB, the version switch-over step 1 recorded, or else the version the host ran before, without starting it:
+   ```sh
+   bun install -g claude-slack-channel-bots@<the version switch-over step 1 recorded>
+   ```
+3. Put back what switch-over step 1 saved: the pre-persona `config.json`, the crontable, the `/interject` callers (the host crontab's `curl` lines included), `access.json` and the Slack token environment variables.
+4. Where switch-over step 1's copy of a file is missing, the operator rebuilds the pre-persona file by hand from the persona configuration, reversing the manual conversion in [Upgrading to personas](#upgrading-to-personas). No tooling does this: CSCB ships no conversion tooling in either direction.
+
+#### Step 9: Start the previous CSCB
+
+Start the previous CSCB, then re-enable the host's autostart for CSCB (operator action), and record it in the switch-over log:
+
+```sh
+claude-slack-channel-bots start
+```
 
 ### Upgrading to personas
 

@@ -16,9 +16,11 @@
 - Shipped descriptions are the README, every file under `skills/` (`skills/EXAMPLE_CLAUDE.md` included), `slack-app-manifest.yml` and the MCP instruction text (`MCP_INSTRUCTIONS` in `src/registry.ts`); they describe personas and nothing else (AC 46)
 - Use persona terms: personas, their `channels` and `delivery`, `dm`, `permission_prompts`, credentials files, the confirmed reload. Never describe the pre-persona shape (`routes`, `default_route`, `default_dm_session`, per-route or routing-config wording), the token environment variables (`SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `export` lines), a token on a command line, or the access-control file and its model (`access.json`, `allowFrom`, `dmPolicy`, allowlist or pairing wording)
 - The one place a pre-persona key may appear is the debugging skill's `## Pre-persona configuration` entry, which names `routes`, `default_route` and `default_dm_session` only to say they are rejected; keep that heading as written
+- The README's two runbook sections, the switch-over runbook and the rollback runbook under `## Migration`, may name `access.json`, and only as the previous CSCB's file to save (switch-over) or restore (rollback); it stays banned in every other section and file. Nothing else is allowed in them: the runbooks say "the Slack token environment variables" and never name one, and carry no `export` line, access-control model wording or pre-persona key. Keep both headings as written; a renamed or moved heading fails the audit
+- The skills point to the runbooks by section title and link, and do not repeat their steps
 - Describe no persona-name format rule; a persona name is used as written
 - The MCP instruction text carries no reload wording; the README and skills may describe the rename gesture
-- `tests/shipped-docs.test.ts` enforces these rules: its `FORBIDDEN_TERMS` list is the full set. If it flags your text, rewrite the text; never add an exemption (see the testing guide's Shipped-Description Audit)
+- `tests/shipped-docs.test.ts` enforces these rules: its `FORBIDDEN_TERMS` list is the full set. Its three exemptions (the SR-1.7 entry and the two runbook sections above) are the only ones. If it flags your text anywhere else, rewrite the text; never add an exemption (see the testing guide's Shipped-Description Audit)
 - Upgrade notes about retired files or settings go in CHANGELOG.md, which the audit does not scan
 
 ### Release notes (CHANGELOG.md)
