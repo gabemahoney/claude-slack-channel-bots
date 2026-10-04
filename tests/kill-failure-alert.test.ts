@@ -112,7 +112,7 @@ import {
 import { LIVE_ROW_STOP_TEARDOWN, liveRowStopCauseText } from '../src/live-row-sequence.ts'
 import { oldLifeWaitRef } from '../src/old-life-wait.ts'
 import { MAX_LOGGED_MESSAGE_LENGTH, renderLogMessageText } from '../src/persona-connection-errors.ts'
-import { createKillFailureAlerts, createPersonaEpisodes, killFailureStoppedRetryText, type KillFailureAlerts } from '../src/persona-episodes.ts'
+import { killFailureStoppedRetryText, type KillFailureAlerts } from '../src/persona-episodes.ts'
 import { personaInstanceId, personaTmuxSessionName } from '../src/persona-identity.ts'
 import { PERSONA_TEARDOWN_NOTICE_LABEL, formatPersonaNotice, personaTeardownNoticeEntryText } from '../src/persona-notifier.ts'
 import {
@@ -127,7 +127,6 @@ import {
   type PersonaKillKeepGoingQuery,
 } from '../src/session-manager.ts'
 import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
-import { recordStartupError } from '../src/startup-errors.ts'
 import {
   KILL_FAILED_DESCRIPTIONS,
   STUB_SURVIVOR_PIDS,
@@ -141,7 +140,7 @@ import { LAUNCH_START_PRE_PERSONA_KEY } from './test-helpers/conflict-cases.ts'
 import { LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
-import { makeNotifierHarness, readStartupEntries, type NotifierHarness, type StartupEntry } from './test-helpers/persona-notifier.ts'
+import { makeNoticeAlertsRig, makeNotifierHarness, readStartupEntries, type NotifierHarness, type StartupEntry } from './test-helpers/persona-notifier.ts'
 import { forbiddenServerLoads } from './test-helpers/source-audit.ts'
 
 // ---------------------------------------------------------------------------
@@ -726,21 +725,9 @@ describe('kill-failure alert: the alerts layer over every SRJ-1002 context, and 
     ;[kept, removed] = config.personas as [Persona, Persona]
     h = makeNotifierHarness(config, { leakMarker: LEAK_SENTINEL })
     h.personas.splice(h.personas.findIndex((p) => p.key === removed.key), 1) // an apply removed it
-    lines = []
-    const episodes = createPersonaEpisodes({
-      sink: (key, text, options) => h.notifier.notify(key, text, options),
-      log: (line) => lines.push(line),
-      clock: h.clock,
-      teardownWindow: (key) => h.notifier.teardownWindowState(key),
-    })
     // As main() builds them: configured is "in the applied persona set now",
     // and the log-only route is recordStartupError (here into logDir).
-    alerts = createKillFailureAlerts({
-      episodes,
-      log: (line) => lines.push(line),
-      isConfigured: (key) => h.personas.some((p) => p.key === key),
-      logOnly: (classLabel, entry) => recordStartupError(classLabel, entry, undefined, { logDir, omitStderr: true }),
-    })
+    ;({ lines, alerts } = makeNoticeAlertsRig(h, { logDir, omitStderr: true }))
   })
 
   afterEach(() => {
@@ -832,13 +819,16 @@ describe('kill-failure alert: the alerts layer over every SRJ-1002 context, and 
     ['a cause the server cannot tell (no keep-going query)', undefined, undefined, PERSONA_KILL_STOP_CAUSE_GENERIC],
   ]
 
-  test.each(
-    ([KILL_FAILURE_CONTEXT_RECOVERY, KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT] as const).flatMap((context) =>
-      STOP_CAUSES.flatMap(([causeLabel, query, given, cause]) =>
-        STOPPED_RETRIES.map(([retryLabel, retry, kind, survivor]) => [context, causeLabel, retryLabel, query, given, cause, retry, kind, survivor] as const),
-      ),
-    ),
-  )('a %s kill stopped by %s, after %s: the applied persona gets the one line only, the removed one that line and one persona-kill-failed entry with no alert text; nothing posted, no episode', async (context, _causeLabel, _retryLabel, query, given, cause, retry, kind, survivor) => {
+  // Every stop cause and decision in the recovery context; the stuck-launch
+  // abort's context changes only the word the line and entry name, so it
+  // takes one row.
+  const STOP_ROWS = STOP_CAUSES.flatMap(([causeLabel, query, given, cause]) =>
+    STOPPED_RETRIES.map(([retryLabel, retry, kind, survivor]) => [causeLabel, retryLabel, query, given, cause, retry, kind, survivor] as const),
+  )
+  test.each([
+    ...STOP_ROWS.map((row) => [KILL_FAILURE_CONTEXT_RECOVERY, ...row] as const),
+    [KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT, ...STOP_ROWS[0]!] as const,
+  ])('a %s kill stopped by %s, after %s: the applied persona gets the one line only, the removed one that line and one persona-kill-failed entry with no alert text; nothing posted, no episode', async (context, _causeLabel, _retryLabel, query, given, cause, retry, kind, survivor) => {
     setPersonaKillKeepGoingQuery(query)
     const stoppedTexts: string[] = []
     for (const persona of [kept, removed]) {

@@ -150,7 +150,12 @@ import {
   type PersonaTeardownNoticeOccasion,
 } from '../src/persona-notifier.ts'
 import { retiredKeysUnreadableMessage } from '../src/retired-keys.ts'
-import { spawnFailureNoticeText } from '../src/session-manager.ts'
+import {
+  jsonlCandidatesText,
+  jsonlDiagnosisInconclusiveNoticeText,
+  jsonlTranscriptLostNoticeText,
+  spawnFailureNoticeText,
+} from '../src/session-manager.ts'
 import { REDACTED_TOKEN_PLACEHOLDER } from '../src/slack-log-redaction.ts'
 import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import { slowRecoveryText } from '../src/slow-recovery.ts'
@@ -623,6 +628,11 @@ const SLACK_QUOTING_NOTICES: readonly (readonly [title: string, render: (descrip
   ['SRJ-1018 adConfigMalformedOnset', (description) => adConfigMalformedOnset(errUnknownErrorName('ErrConfigMalformed', description))],
   ['SRJ-1019 unusableNameNoticeText', (description) => unusableNameNoticeText(KEY, description)],
   ['SRJ-1001 spawnFailureNoticeText', (description) => spawnFailureNoticeText(errGeneric('spawn', 'ErrTmuxSessionCreate', description))],
+  ['SRJ-712 jsonlTranscriptLostNoticeText (a candidate\'s path)', (description) =>
+    jsonlTranscriptLostNoticeText(2, jsonlCandidatesText([{ source: 'persisted', path: description, note: 'ENOENT' }]))],
+  ['SRJ-712 jsonlDiagnosisInconclusiveNoticeText (a candidate\'s note)', (description) =>
+    jsonlDiagnosisInconclusiveNoticeText(jsonlCandidatesText([{ source: 'persisted', path: '/data/proj/sess.jsonl', note: description }]))],
+  ['SRJ-712 jsonlDiagnosisInconclusiveNoticeText (the reason)', (description) => jsonlDiagnosisInconclusiveNoticeText(description)],
 ]
 
 /** `<SRJ id> <builder>: <variant>`, for case titles. */

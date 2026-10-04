@@ -47,7 +47,6 @@ import {
   AD_VERSION_RECHECK_INTERVAL_MS,
   AD_VERSION_RECHECK_STOP_EXIT_CODE,
   DEBUG_SKILL_PATH,
-  DEBUG_SKILL_RUNTIME_STOP_POINTER,
   PHASE1_FLOOR_VERSION,
   PHASE1_REQUIRED_PHRASE,
   PHASE1_RUNBOOK_SECTION_TITLE,
@@ -119,9 +118,8 @@ import { parseLaunchStart } from '../src/pending-row.ts'
 import {
   PERSONA_UNCLASSIFIED_ERROR_LABEL,
   personaUnclassifiedErrorEntryText,
-  createKillFailureAlerts,
-  createPersonaEpisodes,
-  createUnclassifiedErrorEpisodes,
+  type KillFailureAlerts,
+  type UnclassifiedErrorEpisodes,
   unclassifiedErrorAlertText,
 } from '../src/persona-episodes.ts'
 import { personaInstanceId, personaTmuxSessionName, renderPersonaRef } from '../src/persona-identity.ts'
@@ -165,9 +163,11 @@ import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
 import { STALE_VERSION } from './test-helpers/install-check-fixtures.ts'
 import { flat } from './test-helpers/markdown.ts'
+import { expectRuntimeEntryPointsToDebugSkill } from './test-helpers/ad-version-entries.ts'
 import { listed, sweepOver } from './test-helpers/old-life.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import {
+  makeNoticeAlertsRig,
   makeNotifierHarness,
   readStartupEntries,
   teardownNoticeEntry,
@@ -382,18 +382,6 @@ describe('b.jg5 SRJ-1013, SRJ-208 (hatch A3): ad-below-phase1-floor and ad-syste
     expect(logs).toEqual([])
   }
 
-  /**
-   * What a runtime re-check's entry never names (b.jg5 SRJ-208, SRJ-1013;
-   * hatch A3): the switch-over runbook (its section, the startup gate's
-   * instruction), the install skill's block, and an instruction to install
-   * agent-director.
-   */
-  function expectNoRunbookOrInstall(text: string): void {
-    expectNames(text, [], [PHASE1_RUNBOOK_SECTION_TITLE, PHASE1_SWITCH_OVER_INSTRUCTION, oneLine(renderInstallSkillInstructions()).trim()])
-    expect(text).not.toMatch(/switch-over runbook/i)
-    expect(text).not.toMatch(/\binstall agent-director\b/i)
-  }
-
   test('below the floor, at the startup gate: one entry naming the version found, the floor, the binary path, that the startup check found it, and the switch-over runbook sentence with its section', async () => {
     const path = binaryPath()
 
@@ -411,9 +399,8 @@ describe('b.jg5 SRJ-1013, SRJ-208 (hatch A3): ad-below-phase1-floor and ad-syste
     await runtimeRecheck({ version: OLD_AD_VERSION, path })
 
     const text = onlyEntry(logDir, AD_BELOW_PHASE1_FLOOR)
-    expectNames(text, [OLD_AD_VERSION, PHASE1_FLOOR_VERSION, path, RUNTIME_RECHECK_PHRASE, PHASE1_REQUIRED_PHRASE, DEBUG_SKILL_RUNTIME_STOP_POINTER, DEBUG_SKILL_PATH])
-    expectNoRunbookOrInstall(text)
-    expectNoUpgradeForm(text)
+    expectNames(text, [OLD_AD_VERSION, PHASE1_FLOOR_VERSION, path, PHASE1_REQUIRED_PHRASE])
+    expectRuntimeEntryPointsToDebugSkill(text)
     assertNoLeak(writtenFile(join(logDir, LOG_NAME)))
   })
 
@@ -435,9 +422,8 @@ describe('b.jg5 SRJ-1013, SRJ-208 (hatch A3): ad-below-phase1-floor and ad-syste
     await runtimeRecheck({ throws: errSystemInstallTooOld(STALE_VERSION, CLIENT_MIN_VERSION, path) })
 
     const text = onlyEntry(logDir, AD_SYSTEM_INSTALL_TOO_OLD)
-    expectNames(text, [STALE_VERSION, CLIENT_MIN_VERSION, PHASE1_FLOOR_VERSION, path, RUNTIME_RECHECK_PHRASE, DEBUG_SKILL_RUNTIME_STOP_POINTER, DEBUG_SKILL_PATH])
-    expectNoRunbookOrInstall(text)
-    expectNoUpgradeForm(text)
+    expectNames(text, [STALE_VERSION, CLIENT_MIN_VERSION, PHASE1_FLOOR_VERSION, path])
+    expectRuntimeEntryPointsToDebugSkill(text)
     assertNoLeak(writtenFile(join(logDir, LOG_NAME)))
   })
 })
@@ -451,18 +437,17 @@ describe('b.jg5 SRJ-1013, SRJ-208 (hatch A3): ad-below-phase1-floor and ad-syste
 /**
  * The server's notice composition, as `main()` builds it: the real persona
  * notifier over one Slack stub per persona (its teardown window's recorder
- * the real `recordStartupError` into `logDir`), the notice episodes handing
- * their posts to it and reading its teardown window, and the kill-failure
- * alerts and unclassified-error episodes over those episodes, each persona
- * configured while it is in `h.personas`, their log-only routes the real
- * recorder into `logDir`. Every timer runs on one fake clock.
+ * the real `recordStartupError` into `logDir`), and the shared notice rig
+ * over it (`makeNoticeAlertsRig`: the notice episodes, the kill-failure
+ * alerts and the unclassified-error episodes, their log-only routes the real
+ * recorder into `logDir`, at the alert threshold in effect). Every timer
+ * runs on the harness's one fake clock (`h.clock`).
  */
 interface NoticeRig {
   readonly h: NotifierHarness
-  readonly clock: ReturnType<typeof createFakeClock>
   readonly lines: string[]
-  readonly alerts: ReturnType<typeof createKillFailureAlerts>
-  readonly unclassified: ReturnType<typeof createUnclassifiedErrorEpisodes>
+  readonly alerts: KillFailureAlerts
+  readonly unclassified: UnclassifiedErrorEpisodes
   /** The first persona, the one each case raises for. */
   readonly persona: Persona
   /** Drop the first persona from the applied configuration (a reload that removed it). */
@@ -472,14 +457,15 @@ interface NoticeRig {
 describe('b.jg5 SRJ-1013, SRJ-704, SRJ-1003: persona-kill-failed, persona-kill-survivor, persona-teardown-notice and persona-unclassified-error on their log-only routes', () => {
   let rig: NoticeRig | undefined
 
-  afterEach(() => {
+  afterEach(async () => {
     const done = rig
     rig = undefined
     if (done === undefined) return
     try {
-      // Nothing reached Slack: no post through any persona's stub.
+      // Nothing reached Slack: no post through any persona's stub, once every pending hand-off ran.
+      await done.h.clock.flush()
       expect(done.h.allPosts()).toEqual(Object.fromEntries([...done.h.stubs.keys()].map((key) => [key, []])))
-      expect(done.clock.pendingCount()).toBe(0)
+      expect(done.h.clock.pendingCount()).toBe(0)
       assertNoLeak({ lines: done.lines, logs: done.h.logs, entries: readStartupEntries(logDir), file: writtenFile(join(logDir, LOG_NAME)) })
     } finally {
       done.h.cleanup()
@@ -489,33 +475,10 @@ describe('b.jg5 SRJ-1013, SRJ-704, SRJ-1003: persona-kill-failed, persona-kill-s
   function buildRig(): NoticeRig {
     const config = makeMultiPersonaConfig([{ name: 'Ops Bot' }, { name: 'dev' }], root)
     const h = makeNotifierHarness(config, { leakMarker: LEAK_SENTINEL, recordStartupError: recorderInto(logDir) })
-    const clock = createFakeClock()
-    const lines: string[] = []
-    const log = (line: string): void => {
-      lines.push(line)
-    }
-    const episodes = createPersonaEpisodes({
-      sink: (key, text, options) => {
-        void h.notifier.notify(key, text, options)
-      },
-      log,
-      clock,
-      teardownWindow: (key) => h.notifier.teardownWindowState(key),
-    })
-    const isConfigured = (key: string): boolean => h.personas.some((p) => p.key === key)
-    const alerts = createKillFailureAlerts({ episodes, log, isConfigured, logOnly: recorderInto(logDir) })
-    const unclassified = createUnclassifiedErrorEpisodes({
-      episodes,
-      log,
-      alertThresholdMs: adAlertThresholdMsInEffect,
-      isConfigured,
-      // As `main()` binds it (`src/server.ts`).
-      logOnly: (key, text) => recordStartupError(PERSONA_UNCLASSIFIED_ERROR_LABEL, personaUnclassifiedErrorEntryText(key, text), undefined, { logDir }),
-    })
+    const { lines, alerts, unclassified } = makeNoticeAlertsRig(h, { logDir, alertThresholdMs: adAlertThresholdMsInEffect })
     const persona = h.personas[0]!
     rig = {
       h,
-      clock,
       lines,
       alerts,
       unclassified,
@@ -588,7 +551,7 @@ describe('b.jg5 SRJ-1013, SRJ-704, SRJ-1003: persona-kill-failed, persona-kill-s
     const err = errInternal(sentinelInMessage('unclassified-alert'))
 
     expect(r.unclassified.report(r.persona.key, first)).toBe('begun')
-    await r.clock.advance(adAlertThresholdMsInEffect() + 1)
+    await r.h.clock.advance(adAlertThresholdMsInEffect() + 1)
     r.remove()
     expect(r.unclassified.report(r.persona.key, err)).toBe('alerted')
 

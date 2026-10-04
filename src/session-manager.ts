@@ -1694,7 +1694,8 @@ const LATCH_TIME_READ_LATCHED_ELSEWHERE =
  * caller kills, deletes and launches nothing more. With no latch installed
  * it makes no read, sets nothing, logs the one line saying so, and still
  * answers `latched`. For a persona no longer in the applied configuration
- * (`latchEntryConfigured`) it makes no read, sets and posts nothing, logs
+ * and outside its open teardown window (`latchEntryConfigured`; inside the
+ * window it latches as above) it makes no read, sets and posts nothing, logs
  * the one line with `notConfiguredLatchOutcome`'s outcome and writes no
  * startup-errors entry (b.jg5 SRJ-1002), and still answers `latched`.
  * `site` is the line's prefix (default `spawnForPersona`). Never throws.
@@ -1758,14 +1759,25 @@ const LATCH_OUTCOME_NO_LATCH = 'no latch is installed, so nothing is latched'
  * episode. Answers the latch line's outcome text: the set's outcome
  * (`LATCH_SET_OUTCOME_TEXT`), `LATCH_OUTCOME_NO_LATCH` with no latch
  * installed, `notConfiguredLatchOutcome`'s with nothing set for a persona no
- * longer in the applied configuration (`latchEntryConfigured`, b.jg5
- * SRJ-1002), or that latching failed and what it threw. Logs nothing; never
- * throws.
+ * longer in the applied configuration and outside its open teardown window
+ * (`latchEntryConfigured`, b.jg5 SRJ-1002), or that latching failed and what
+ * it threw. Logs nothing; never throws.
  */
 function latchOnUnusableName(key: string, err: unknown, rowState: LatchRowState): string {
+  if (conflictLatch === undefined) return LATCH_OUTCOME_NO_LATCH
+  if (!latchEntryConfigured(key)) return notConfiguredLatchOutcome(LATCH_CASE_UNUSABLE_RECORDED_NAME, REFUSED_OPERATION_NONE)
+  return setUnusableNameLatch(key, err, rowState)
+}
+
+/**
+ * `latchOnUnusableName`'s set, for a caller that has already asked
+ * `latchEntryConfigured` (so the query is asked once per entry): the
+ * installed latch's `set`, answering the latch line's outcome text. Logs
+ * nothing; never throws.
+ */
+function setUnusableNameLatch(key: string, err: unknown, rowState: LatchRowState): string {
   const latch = conflictLatch
   if (latch === undefined) return LATCH_OUTCOME_NO_LATCH
-  if (!latchEntryConfigured(key)) return notConfiguredLatchOutcome(LATCH_CASE_UNUSABLE_RECORDED_NAME, REFUSED_OPERATION_NONE)
   try {
     const input = unusableNameSetInput(key, err, rowState)
     // Not reached: every caller has checked `isUnusableNameError`.
@@ -1798,7 +1810,7 @@ function logUnusableName(site: string, what: string, ref: string, err: unknown, 
  * other value it answers `undefined` and the site goes on as before (every
  * other `ErrInternal` is UNCLASSIFIED, SRJ-313).
  *
- * For an UNUSABLE NAME it latches the persona (`latchOnUnusableName`) with
+ * For an UNUSABLE NAME it latches the persona (`setUnusableNameLatch`) with
  * the row state `lastRead`, the state the path last read before the call,
  * or, when it read nothing (`NOTHING_READ`), exactly one latch-time `status`
  * read (`latchTimeRowState`; when that read latched the persona itself, its
@@ -1809,8 +1821,9 @@ function logUnusableName(site: string, what: string, ref: string, err: unknown, 
  * tmux-touching call follows (SRJ-502). With no latch installed it makes no
  * read, sets nothing, logs the one line saying so, and still answers
  * `latched`; so it does, with `notConfiguredLatchOutcome`'s outcome, for a
- * persona no longer in the applied configuration (`latchEntryConfigured`,
- * b.jg5 SRJ-1002). Never throws.
+ * persona no longer in the applied configuration and outside its open
+ * teardown window (`latchEntryConfigured`, asked once, b.jg5 SRJ-1002).
+ * Never throws.
  */
 async function unusableNameAt(
   key: string,
@@ -1835,7 +1848,7 @@ async function unusableNameAt(
     what,
     ref,
     err,
-    'latched' in recorded ? recorded.outcome : latchOnUnusableName(key, err, recorded.rowState),
+    'latched' in recorded ? recorded.outcome : setUnusableNameLatch(key, err, recorded.rowState),
   )
   return { key, action: 'latched' }
 }
@@ -1880,10 +1893,15 @@ export type ConfiguredPersonaQuery = (key: string) => boolean
 /**
  * The installed configured-persona query. Production installs one in
  * `main()` that reads the applied configuration at each call, so a persona an
- * apply adds or removes counts, or stops counting, at once. With none
- * installed (unit tests, the integration driver) no key counts as
- * configured, so no row read latches anyone by the row-read rule
- * (`readPersonaOwnRow`, `applyOwnRowStatusStep`).
+ * apply adds or removes counts, or stops counting, at once. Its two readers
+ * take opposite defaults when none is installed (unit tests, the integration
+ * driver) or when it throws:
+ *   - the row-read rule (`configuredReadingOf`: `readPersonaOwnRow`,
+ *     `applyOwnRowStatusStep`) counts no key as configured, so no row read
+ *     latches anyone by the note or launch-start rule;
+ *   - the CONFLICT and UNUSABLE NAME latch entries (`latchEntryConfigured`)
+ *     latch as for a configured persona, so the latch's own behaviour is
+ *     unchanged where no configuration is applied.
  */
 let configuredPersonaQuery: ConfiguredPersonaQuery | undefined
 
@@ -1903,18 +1921,54 @@ export function _resetConfiguredPersonaQuery(): void {
  * `key` (b.jg5 SRJ-501, SRJ-512, SRJ-1002): false only when the installed
  * configured-persona query answers that `key` is not a persona of the
  * applied configuration (a launch or recovery that began before an apply
- * removed it). With no query installed, or one that throws, the entry
- * latches as it would for a configured persona. The note, launch-start,
- * CONFLICT and UNUSABLE NAME latches all ask the one installed query. Never
- * throws.
+ * removed it) and the key's persona teardown window is not open
+ * (`teardownWindowOpen`). Inside an open window the entry latches as for a
+ * configured persona (b.jg5 SRJ-1002, SRJ-1003): an apply removes the persona
+ * from the configuration before its teardown runs, the latch's notice goes
+ * through the notice episodes to the persona notifier, whose open window
+ * writes it as one `persona-teardown-notice` entry and posts nothing, and the
+ * teardown forgets the latch silently once the launch in flight has settled.
+ * With no query installed the entry latches as for a configured persona; a
+ * query that throws does too, with one line:
+ *
+ *   [slack] configured-persona query for <ref> failed: <thrown value> — the latch entry latches as for a configured persona (b.jg5 SRJ-1002)
+ *
+ * The note, launch-start, CONFLICT and UNUSABLE NAME latches all ask the one
+ * installed query. Never throws.
  */
 function latchEntryConfigured(key: string): boolean {
   const query = configuredPersonaQuery
   if (query === undefined) return true
+  let configured: boolean
   try {
-    return query(key) === true
-  } catch {
+    configured = query(key) === true
+  } catch (err) {
+    console.error(latchEntryQueryFailedLine(key, describeThrownValue(err)))
     return true
+  }
+  return configured || teardownWindowOpen(key)
+}
+
+/** `latchEntryConfigured`'s one line when the configured-persona query throws for persona `key`; `failure` is the thrown value as `describeThrownValue` renders it (redacted). Pure. */
+export function latchEntryQueryFailedLine(key: string, failure: string): string {
+  return (
+    `[slack] configured-persona query for ${keyRef(key)} failed: ${failure} — ` +
+    `the latch entry latches as for a configured persona (b.jg5 SRJ-1002)`
+  )
+}
+
+/**
+ * Whether persona `key`'s teardown window is open (b.jg5 SRJ-1003), read
+ * through the installed notice episodes (`setStuckLaunchEpisodes`; production:
+ * `main()`'s, whose teardown query is the persona notifier's
+ * `teardownWindowState`), the episodes the latch's notice goes through. With
+ * none installed it is not open. Never throws.
+ */
+function teardownWindowOpen(key: string): boolean {
+  try {
+    return stuckLaunchEpisodes?.teardownWindowState(key) === 'open'
+  } catch {
+    return false
   }
 }
 
@@ -2608,8 +2662,10 @@ function endKillFailureEpisodeOnRead(key: string, answer: { readonly state: unkn
  * `src/persona-episodes.ts`). Production installs `main()`'s notice episodes
  * (`setStuckLaunchEpisodes`), before the start pass. Every own-row read that
  * reads the row live out of `pending` ends the persona's stuck-launch
- * episode through it (`endStuckLaunchEpisodeOnRead`). With none installed
- * (unit tests, the integration driver) no episode is ended.
+ * episode through it (`endStuckLaunchEpisodeOnRead`), and the CONFLICT and
+ * UNUSABLE NAME latch entries read a persona's teardown window through it
+ * (`teardownWindowOpen`, b.jg5 SRJ-1003). With none installed (unit tests,
+ * the integration driver) no episode is ended and no window is open.
  */
 let stuckLaunchEpisodes: PersonaEpisodes | undefined
 
@@ -3511,9 +3567,9 @@ function logLapEnterLatch(ref: string, cause: PendingRowLapEnterLatching, outcom
  * latch's CONFLICT entry (`setFromConflict`, b.jg5 SRJ-501) with `operation`
  * and `rowState`. Answers the latch line's outcome text: the set's outcome,
  * that no latch is installed, `notConfiguredLatchOutcome`'s with nothing set
- * for a persona no longer in the applied configuration
- * (`latchEntryConfigured`, b.jg5 SRJ-1002), or that latching failed and what
- * it threw. Logs nothing; never throws.
+ * for a persona no longer in the applied configuration and outside its open
+ * teardown window (`latchEntryConfigured`, b.jg5 SRJ-1002), or that latching
+ * failed and what it threw. Logs nothing; never throws.
  */
 function latchOnConflict(key: string, err: unknown, operation: RefusedOperation, rowState: LatchRowState): string {
   const latch = conflictLatch
@@ -3921,7 +3977,7 @@ export async function reconnectMcp(
  *     (`isOwnRowOldLifeHeld`, b.jg5 SRJ-810: CSCB types no `/mcp reconnect`
  *     into the old life's session): no `send-keys`; the persona recorded as
  *     waiting on that hold (`recordOwnRowWaiting`), its retry timer armed
- *     with the held-for-an-old-life cause (`armOldLifeWaiter`), one line
+ *     with the held-for-an-old-life cause (`armOldLifeHoldTimer`), one line
  *     (`reconnectHeldLine`) naming the persona and the held instance id;
  *     `transient`. This guards every caller: the ladder's `waiting` branch,
  *     the launch's working-row wait and the restart path's reconnect
@@ -3996,7 +4052,7 @@ export async function reconnectMcpWithCause(
   // persona waits on that hold, so the hold's end retries it at once.
   if (isOwnRowOldLifeHeld(key)) {
     recordOwnRowWaiting(key)
-    console.error(reconnectHeldLine(ref, personaInstanceId(key), armOldLifeWaiter(key)))
+    console.error(reconnectHeldLine(ref, personaInstanceId(key), armOldLifeHoldTimer(key)))
     return { outcome: 'transient' }
   }
   console.error(reconnectStartLine(ref))
@@ -4099,15 +4155,25 @@ export function reconnectLatchedLine(ref: string): string {
 /**
  * The reconnect's line for a persona whose own row is held for an old life
  * (b.jg5 SRJ-810): no `send-keys` is made; `armed` says whether its retry
- * timer was armed with the held-for-an-old-life cause:
+ * timer was armed with the held-for-an-old-life cause, as the old-life hold
+ * step's line does (`oldLifeHoldLaunchLine`): true, false (an arm was asked
+ * for and failed) or `OLD_LIFE_HOLD_ARM_SKIPPED` (the arm was skipped on
+ * purpose for a persona not applied, latched, held on `ErrInvalidFlags` or
+ * not up, whose own line comes first; `OLD_LIFE_HOLD_SKIPPED_TIMER_PHRASE`):
  *
  *   [slack] reconnectMcp: <ref> — its own row instanceId="<id>" is held for an old life that may still be running: no send-keys; transient, nothing typed; its retry timer is armed (held-for-old-life) (b.jg5 SRJ-810)
  *   [slack] reconnectMcp: <ref> — its own row instanceId="<id>" is held for an old life that may still be running: no send-keys; transient, nothing typed; its retry timer could not be armed (b.jg5 SRJ-810)
+ *   [slack] reconnectMcp: <ref> — its own row instanceId="<id>" is held for an old life that may still be running: no send-keys; transient, nothing typed; its retry timer is not armed: the step skips this persona, as the line before says (b.jg5 SRJ-810)
  *
  * Pure.
  */
-export function reconnectHeldLine(ref: string, instanceId: string, armed: boolean): string {
-  const timer = armed ? `its retry timer is armed (${UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD})` : 'its retry timer could not be armed'
+export function reconnectHeldLine(ref: string, instanceId: string, armed: boolean | typeof OLD_LIFE_HOLD_ARM_SKIPPED): string {
+  const timer =
+    armed === OLD_LIFE_HOLD_ARM_SKIPPED
+      ? OLD_LIFE_HOLD_SKIPPED_TIMER_PHRASE
+      : armed
+        ? `its retry timer is armed (${UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD})`
+        : 'its retry timer could not be armed'
   return (
     `[slack] reconnectMcp: ${ref} — its own row instanceId=${JSON.stringify(renderLogMessageText(instanceId))} is held for an old life ` +
     `that may still be running: no send-keys; transient, nothing typed; ${timer} (b.jg5 SRJ-810)`
@@ -7980,7 +8046,7 @@ async function reconcileAndReadRowState(
       console.error(`[slack] ${logPrefix}: reading the row of ${ref} after the findMissing sweep failed: ${ERR_SPAWN_NOT_FOUND_NAME}`)
       return undefined
     case OWN_ROW_STATUS_REFUSED:
-      console.error(`[slack] ${logPrefix}: reading the row of ${ref} after the findMissing sweep failed: ${describeAgentDirectorFailure(read.error)}`)
+      console.error(`[slack] ${logPrefix}: reading the row of ${ref} after the findMissing sweep failed: ${describeAdFailureForLog(read.error)}`)
       return undefined
   }
 }
@@ -8568,7 +8634,7 @@ async function waitForWorkingRow(
       const errorClass = classifyAdError(read.error).errorClass
       if (errorClass !== loggedStatusErrorClass) {
         loggedStatusErrorClass = errorClass
-        console.error(waitPollStatusErrorLine(ref, describeAgentDirectorFailure(read.error), errorClass))
+        console.error(waitPollStatusErrorLine(ref, describeAdFailureForLog(read.error), errorClass))
       }
       await sleepUnlessCancelled(wait, pollIntervalMs)
       continue
@@ -9412,8 +9478,10 @@ function callerKeepsGoing(options: PersonaKillRetryOptions): boolean {
  * tries ran) they also write that line's content as one
  * `persona-kill-failed` entry, with no alert text, and for a configured
  * persona the line only. With no
- * alerts installed, one line carries the decision instead. A `none`
- * decision whose tries were not stopped does nothing. Never throws.
+ * alerts installed, one line carries the decision instead, or, for a stopped
+ * retry (its decision `none` included), the stop
+ * (`personaKillStoppedNoAlertsLine`). A `none` decision whose tries were not
+ * stopped does nothing. Never throws.
  *
  *   [slack] <site>: kill for <ref>: the kill-failure alert's <version> version is not raised — no kill-failure alerts are installed; <descriptions> (b.jg5 SRJ-704)
  *
@@ -9437,14 +9505,6 @@ export function raisePersonaKillFailureAlert(
     // `none` decision included (an `ErrTmuxUnresponsive` stop with no
     // survivor-naming failure); any other `none` decision does nothing.
     if (decision.kind === KILL_RETRY_ALERT_NONE && !stopped) return
-    if (alerts === undefined) {
-      // With no alerts installed a stopped `none` decision has no version to name: nothing is logged.
-      if (decision.kind === KILL_RETRY_ALERT_NONE) return
-      console.error(
-        `[slack] ${site}: kill for ${ref}: the kill-failure alert's ${decision.kind} version is not raised — no kill-failure alerts are installed; ${describeKillFailureDescriptions(decision)} (b.jg5 SRJ-704)`,
-      )
-      return
-    }
     const { outcome } = retried
     // b.jg5 SRJ-702: a stopped retry's one line names the last outcome's class and the stop's cause.
     const stop = stopped
@@ -9452,11 +9512,43 @@ export function raisePersonaKillFailureAlert(
           lastOutcomeClass: outcome.kind === KILL_OUTCOME_NOT_KILLED ? outcome.errorClass : outcome.kind,
           stopCause: stopsServer ? PERSONA_KILL_STOP_CAUSE_RECHECK : (stopCause ?? personaKillStopCause(key)),
         }
-      : {}
-    alerts.raise({ key, decision, latched, stopped, context, ...stop })
+      : undefined
+    if (alerts === undefined) {
+      // A stopped retry, its decision `none` included, is recorded by its stop line.
+      console.error(
+        stop === undefined
+          ? `[slack] ${site}: kill for ${ref}: the kill-failure alert's ${decision.kind} version is not raised — no kill-failure alerts are installed; ${describeKillFailureDescriptions(decision)} (b.jg5 SRJ-704)`
+          : personaKillStoppedNoAlertsLine(site, ref, decision, stop.lastOutcomeClass, stop.stopCause),
+      )
+      return
+    }
+    alerts.raise({ key, decision, latched, stopped, context, ...(stop ?? {}) })
   } catch (err) {
     console.error(`[slack] ${site}: kill for ${ref}: raising the kill-failure alert failed: ${describeThrownValue(err)}`)
   }
+}
+
+/**
+ * `raisePersonaKillFailureAlert`'s one line for a kill retry whose tries were
+ * stopped when no kill-failure alerts are installed (b.jg5 SRJ-702,
+ * SRJ-704): no version is raised; it names the stop's cause, the last
+ * outcome's class and `decision`'s redacted descriptions (`no description`
+ * for a `none` decision). Pure.
+ *
+ *   [slack] <site>: kill for <ref>: the kill-failure alert is not raised — its tries were stopped (<cause>); its last outcome's class: <class>; no kill-failure alerts are installed; <descriptions> (b.jg5 SRJ-702, SRJ-704)
+ */
+export function personaKillStoppedNoAlertsLine(
+  site: string,
+  ref: string,
+  decision: KillRetryAlert,
+  lastOutcomeClass: string,
+  stopCause: string,
+): string {
+  return (
+    `[slack] ${site}: kill for ${ref}: the kill-failure alert is not raised — its tries were stopped (${stopCause}); ` +
+    `its last outcome's class: ${lastOutcomeClass}; no kill-failure alerts are installed; ` +
+    `${describeKillFailureDescriptions(decision)} (b.jg5 SRJ-702, SRJ-704)`
+  )
 }
 
 /** One between-try `status` read of persona `key`'s own row, as the kill retry takes it. Never throws. */
@@ -10059,7 +10151,7 @@ const AD_JSONL_CANDIDATE_SOURCES: readonly AdJsonlCandidateSource[] = [
 ]
 
 /** One transcript candidate resume tried (or that we recomputed locally). */
-interface JsonlCandidate {
+export interface JsonlCandidate {
   /** Provenance as reported by AD (see AdJsonlCandidateSource), or a
    *  'locally-computed(…)' label when we reconstructed it ourselves because
    *  AD's message lacked detail. */
@@ -10096,6 +10188,59 @@ function parseJsonlMissingCandidates(description: string): JsonlCandidate[] {
     out.push({ source: m[1], path: m[2], note: m[3] })
   }
   return out
+}
+
+/** The candidate list's text when no transcript path could be determined. */
+export const JSONL_NO_CANDIDATES_TEXT = '(no transcript path could be determined)'
+
+/**
+ * The candidate list as every text of the lost-transcript diagnosis quotes it
+ * (b.jg5 SRJ-712, SRJ-1001): each candidate as `<source> <path> (<note>)`,
+ * joined by "; ", or `JSONL_NO_CANDIDATES_TEXT` when there is none. Every
+ * field can carry agent-director's text (its description's enumeration, or a
+ * path read from its row), so each is rendered by `renderLogMessageText`
+ * (redacted, on one line, capped) before it is joined. Not escaped for Slack:
+ * a notice escapes the joined text once. Pure; never throws.
+ */
+export function jsonlCandidatesText(candidates: readonly JsonlCandidate[]): string {
+  if (candidates.length === 0) return JSONL_NO_CANDIDATES_TEXT
+  return candidates
+    .map((c) => `${renderLogMessageText(c.source)} ${renderLogMessageText(c.path)} (${renderLogMessageText(c.note)})`)
+    .join('; ')
+}
+
+/** A row's `started_at` as the diagnosis's texts quote it: rendered by `renderLogMessageText`, or `(none)` when absent or empty. Pure. */
+function jsonlStartedAtText(startedAt: unknown): string {
+  return renderLogMessageText(startedAt) || '(none)'
+}
+
+/**
+ * The persona notice of a `lost` lost-transcript diagnosis (b.jg5 SRJ-712,
+ * SRJ-1001): `archived` messages since spawn and `candidates`, the candidate
+ * list already rendered (`jsonlCandidatesText`), escaped once for Slack here.
+ * Pure; never throws.
+ */
+export function jsonlTranscriptLostNoticeText(archived: number, candidates: string): string {
+  return (
+    `⚠️ CSCB: on restart my conversation transcript could not be found, but the message archive shows ` +
+    `${archived} message(s) since I started — my conversation memory has been lost and I ` +
+    `was ${JSONL_DIAGNOSIS_REUSE_WORDING}. An operator should investigate transcript storage. Paths tried: ` +
+    escapeSlackControlCharacters(candidates)
+  )
+}
+
+/**
+ * The persona notice of an `inconclusive` lost-transcript diagnosis (b.jg5
+ * SRJ-712, SRJ-1001): `reason`, whose agent-director-derived parts are already
+ * rendered (`jsonlCandidatesText`, `renderLogMessageText`), escaped once for
+ * Slack here. Worded as uncertainty, not loss. Pure; never throws.
+ */
+export function jsonlDiagnosisInconclusiveNoticeText(reason: string): string {
+  return (
+    `⚠️ CSCB: on restart I was ${JSONL_DIAGNOSIS_REUSE_WORDING}; I could not determine whether my prior ` +
+    `conversation history was preserved (diagnosis inconclusive: ${escapeSlackControlCharacters(reason)}). An operator should ` +
+    `investigate.`
+  )
 }
 
 /** Local stat label: what WE see at a path right now (never claims AD tried it). */
@@ -10199,7 +10344,7 @@ async function diagnoseJsonlMissing(
     // Not reached: every `get` error but ErrSpawnNotFound and UNUSABLE NAME
     // is a refusal. Any other ends the ladder 'failed' as a refusal does: no
     // diagnosis, no launch, no spawn-failure notice (b.jg5 SRJ-105).
-    console.error(`[slack] spawnForPersona: ${what} failed for ${ref}: ${describeAgentDirectorFailure(ownRead.error)} — nothing more is called`)
+    console.error(`[slack] spawnForPersona: ${what} failed for ${ref}: ${describeAdFailureForLog(ownRead.error)} — nothing more is called`)
     return { key, action: 'failed' }
   }
   if (ownRead.kind === OWN_ROW_READ_ABSENT) {
@@ -10208,7 +10353,7 @@ async function diagnoseJsonlMissing(
     // Inconclusive: the row could not be consulted at all, so whether history
     // was lost is unknown. Report it as uncertainty, not reassurance.
     const adDetail = adCandidates.length
-      ? adCandidates.map((c) => `${c.source} ${c.path} (${c.note})`).join('; ')
+      ? jsonlCandidatesText(adCandidates)
       : renderLogMessageText(err.errDescription) || '(no path detail from agent-director)'
     const notice = reportInconclusiveDiagnosis(
       ref,
@@ -10254,10 +10399,9 @@ async function diagnoseJsonlMissing(
     }
   }
 
-  const candidateStr =
-    candidates.length > 0
-      ? candidates.map((c) => `${c.source} ${c.path} (${c.note})`).join('; ')
-      : '(no transcript path could be determined)'
+  // b.jg5 SRJ-1001: every field rendered (redacted, capped) for the log line,
+  // the startup-errors entry and, escaped once more, the notice.
+  const candidateStr = jsonlCandidatesText(candidates)
   const detailProvenance =
     adCandidates.length > 0
       ? 'paths+sources reported by agent-director'
@@ -10281,17 +10425,14 @@ async function diagnoseJsonlMissing(
     const detail =
       `${ref} instance=${claudeInstanceId}: resume threw ErrJsonlMissing and the persona is ` +
       `${JSONL_DIAGNOSIS_REUSE_WORDING}, but the message archive holds ${archivedSinceSpawn} message(s) since spawn ` +
-      `(started_at=${row.started_at}). Conversation history was LOST. Transcript candidates tried ` +
+      `(started_at=${jsonlStartedAtText(row.started_at)}). Conversation history was LOST. Transcript candidates tried ` +
       `(${detailProvenance}): ${candidateStr}.`
     console.error(`[slack] ErrJsonlMissing diagnostic: ${detail}`)
     // Operator-visible signal — reuse the existing startup-errors mechanism.
     if (isStartup) recordStartupError(JSONL_TRANSCRIPT_LOST_ENTRY_CLASS, detail, describeAgentDirectorFailure(err))
     // And a persona notice so it is not buried in logs, posted once the
     // reuse spawn has brought the persona up.
-    const notice =
-      `⚠️ CSCB: on restart my conversation transcript could not be found, but the message archive shows ` +
-      `${archivedSinceSpawn} message(s) since I started — my conversation memory has been lost and I ` +
-      `was ${JSONL_DIAGNOSIS_REUSE_WORDING}. An operator should investigate transcript storage. Paths tried: ${escapeSlackControlCharacters(candidateStr)}`
+    const notice = jsonlTranscriptLostNoticeText(archivedSinceSpawn, candidateStr)
     return { verdict: 'lost', notice }
   }
 
@@ -10324,7 +10465,7 @@ async function diagnoseJsonlMissing(
   let reason: string
   if (startedAtEpoch === null) {
     reason =
-      `the row's started_at is absent or unparseable (started_at=${row.started_at ?? '(none)'}), ` +
+      `the row's started_at is absent or unparseable (started_at=${jsonlStartedAtText(row.started_at)}), ` +
       `so "since spawn" could not be bounded and the archive was not consulted`
   } else if (archivedSinceSpawn === 0) {
     reason = UNATTRIBUTABLE_ZERO_REASON
@@ -10372,13 +10513,9 @@ function reportInconclusiveDiagnosis(
     `history was lost because ${reason}.`
   console.error(`[slack] ErrJsonlMissing diagnostic: ${detail}`)
   if (isStartup) recordStartupError(JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS, detail, describeAgentDirectorFailure(err))
-  // The reason can quote agent-director's description (rendered by
-  // `renderLogMessageText`): escaped once for Slack, as SRJ-1018 quotes one.
-  return (
-    `⚠️ CSCB: on restart I was ${JSONL_DIAGNOSIS_REUSE_WORDING}; I could not determine whether my prior ` +
-    `conversation history was preserved (diagnosis inconclusive: ${escapeSlackControlCharacters(reason)}). An operator should ` +
-    `investigate.`
-  )
+  // The reason's agent-director-derived parts are already rendered
+  // (`renderLogMessageText`); the notice escapes it once for Slack.
+  return jsonlDiagnosisInconclusiveNoticeText(reason)
 }
 
 // ---------------------------------------------------------------------------
@@ -11523,7 +11660,7 @@ async function rereadPersonaRow(key: string, ref: string, site: string, what: st
   if (read.kind === OWN_ROW_READ_REFUSED) {
     if (refusalAt(key, read.error, 'get', site, what, ref) === undefined) {
       // Not reached: every `get` error but ErrSpawnNotFound and UNUSABLE NAME is a refusal.
-      console.error(`[slack] ${site}: ${what} failed for ${ref}: ${describeAgentDirectorFailure(read.error)} — nothing more is called`)
+      console.error(`[slack] ${site}: ${what} failed for ${ref}: ${describeAdFailureForLog(read.error)} — nothing more is called`)
     }
     return { kind: ROW_REREAD_REFUSED }
   }
@@ -13138,7 +13275,7 @@ async function afterLaunchUnavailable(
   if (read.kind === OWN_ROW_READ_REFUSED) {
     if (refusalAt(key, read.error, 'get', at.site, at.what, ref) === undefined) {
       // Not reached: every `get` error but ErrSpawnNotFound and UNUSABLE NAME is a refusal.
-      console.error(`[slack] ${at.site}: ${at.what} failed for ${ref}: ${describeAgentDirectorFailure(read.error)} — nothing more is called`)
+      console.error(`[slack] ${at.site}: ${at.what} failed for ${ref}: ${describeAdFailureForLog(read.error)} — nothing more is called`)
     }
     log('nothing (a refused read)', undefined, LAUNCH_UNAVAILABLE_OUTCOME_REFUSED)
     return notLaunched()
@@ -15521,7 +15658,7 @@ function launchHoldsOn(persona: OldLifeHoldPersona): OldLifeHold[] {
  *     (`ensureOldLifeWait`); a wait already running on the id is left as it
  *     is, so a second launch starts none;
  *   - the persona's retry timer is armed with the held-for-an-old-life
- *     cause, uncounted (`armOldLifeWaiter`);
+ *     cause, uncounted (`armOldLifeHoldTimer`);
  *   - one line names the persona, the held directory, every held instance id
  *     with what was done for its wait, and the timer
  *     (`oldLifeHoldLaunchLine`);
@@ -15560,10 +15697,20 @@ export function oldLifeHoldStep(
     console.error(oldLifeHoldLaunchLine(site, ref, held[0]!.realDirectory, waits, false, true))
     return true
   }
-  const answer = armOldLifeWaiterAnswer(persona.key)
-  const armed = answer === OLD_LIFE_WAITER_ARMED ? true : answer === OLD_LIFE_WAITER_SKIPPED ? OLD_LIFE_HOLD_ARM_SKIPPED : false
-  console.error(oldLifeHoldLaunchLine(site, ref, held[0]!.realDirectory, waits, armed))
+  console.error(oldLifeHoldLaunchLine(site, ref, held[0]!.realDirectory, waits, armOldLifeHoldTimer(persona.key)))
   return true
+}
+
+/**
+ * Arm persona `key`'s retry timer with the held-for-an-old-life cause
+ * (`armOldLifeWaiterAnswer`), answering the old-life hold lines' `armed`:
+ * true when armed, `OLD_LIFE_HOLD_ARM_SKIPPED` when the arm was skipped on
+ * purpose (with its own line first), false when an arm was asked for and not
+ * made. Never throws.
+ */
+function armOldLifeHoldTimer(key: string): boolean | typeof OLD_LIFE_HOLD_ARM_SKIPPED {
+  const answer = armOldLifeWaiterAnswer(key)
+  return answer === OLD_LIFE_WAITER_ARMED ? true : answer === OLD_LIFE_WAITER_SKIPPED ? OLD_LIFE_HOLD_ARM_SKIPPED : false
 }
 
 /**
@@ -17656,7 +17803,7 @@ export function liveRowSequenceGate(key: string, site: string): boolean {
  * SRJ-811 bullet 2, SRJ-810): record the persona as waiting on that hold
  * (`recordOwnRowWaiting`), so the hold's end retries it at once and its
  * teardown forgets it there; arm its retry timer with the
- * held-for-an-old-life cause (`armOldLifeWaiter`), log one line and answer
+ * held-for-an-old-life cause (`armOldLifeHoldTimer`), log one line and answer
  * true; otherwise false, with nothing done. Never throws.
  *
  *   [slack] <site>: <ref> waits on the old-life wait running on its own row — its retry timer is armed (held-for-old-life) (sequence-waiting; b.jg5 SRJ-811)
@@ -17664,7 +17811,7 @@ export function liveRowSequenceGate(key: string, site: string): boolean {
 function oldLifeWaitRefusal(key: string, ref: string, site: string): boolean {
   if (liveRowSequenceRegistry?.isNoLaunchRunning(personaInstanceId(key)) !== true) return false
   recordOwnRowWaiting(key)
-  console.error(oldLifeWaitRefusalLine(site, ref, armOldLifeWaiter(key)))
+  console.error(oldLifeWaitRefusalLine(site, ref, armOldLifeHoldTimer(key)))
   return true
 }
 
@@ -17691,15 +17838,22 @@ function recordOwnRowWaiting(key: string): void {
 /**
  * The line of a launch refused because an old-life wait runs on the
  * persona's own row (b.jg5 SRJ-811; `armed`: whether its retry timer was
- * armed):
+ * armed, as `oldLifeHoldLaunchLine` takes it, `OLD_LIFE_HOLD_ARM_SKIPPED` for
+ * an arm skipped on purpose):
  *
  *   [slack] <site>: <ref> waits on the old-life wait running on its own row — its retry timer is armed (held-for-old-life) (sequence-waiting; b.jg5 SRJ-811)
  *   [slack] <site>: <ref> waits on the old-life wait running on its own row — its retry timer could not be armed (sequence-waiting; b.jg5 SRJ-811)
+ *   [slack] <site>: <ref> waits on the old-life wait running on its own row — its retry timer is not armed: the step skips this persona, as the line before says (sequence-waiting; b.jg5 SRJ-811)
  *
  * Pure.
  */
-export function oldLifeWaitRefusalLine(site: string, ref: string, armed: boolean): string {
-  const timer = armed ? `its retry timer is armed (${UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD})` : 'its retry timer could not be armed'
+export function oldLifeWaitRefusalLine(site: string, ref: string, armed: boolean | typeof OLD_LIFE_HOLD_ARM_SKIPPED): string {
+  const timer =
+    armed === OLD_LIFE_HOLD_ARM_SKIPPED
+      ? OLD_LIFE_HOLD_SKIPPED_TIMER_PHRASE
+      : armed
+        ? `its retry timer is armed (${UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD})`
+        : 'its retry timer could not be armed'
   return `[slack] ${site}: ${ref} waits on the old-life wait running on its own row — ${timer} (sequence-waiting; b.jg5 SRJ-811)`
 }
 
@@ -19763,13 +19917,14 @@ function latchedElsewhereDuringCall(key: string, err: unknown, site: string, wha
   const { errorClass } = classifyAdError(err)
   if (errorClass !== AD_ERROR_CLASS_CONFLICT && errorClass !== AD_ERROR_CLASS_UNUSABLE_NAME) return false
   if (latchRecheckScopeOf(key) !== undefined || !personaLatchedNow(key)) return false
-  console.error(latchedElsewhereDuringCallLine(site, what, ref, describeAgentDirectorFailure(err)))
+  console.error(latchedElsewhereDuringCallLine(site, what, ref, describeAdFailureForLog(err)))
   return true
 }
 
 /**
  * `latchedElsewhereDuringCall`'s line, `failure` the refused call's
- * description (`describeAgentDirectorFailure`):
+ * description (`describeAdFailureForLog`: agent-director's reported name for
+ * an UNUSABLE NAME answer):
  *
  *   [slack] <site>: <what> refused for <ref>: <failure> — the persona was latched elsewhere during the call, so that latch stands: nothing is set and nothing more is called for it (b.jg5 SRJ-502)
  *

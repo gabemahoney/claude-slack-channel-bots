@@ -57,7 +57,6 @@ import {
   KILL_ROW_FINISHED_MISSING,
   KILL_ROW_FINISHED_NO_ROW,
   checkedKill,
-  killLetsNextStepRun,
   killOutcomeOf,
   type AnyKillOutcome,
   type CheckedKillOptions,
@@ -1157,27 +1156,25 @@ describe('runKillRetry: each try and each read is logged, redacted (b.jg5 SRJ-70
   // builder's: the try number, the outcome (`describeKillOutcome`, its
   // kill_sent and its redacted description) and what follows. A fake token
   // rides in every description that has a slot for one.
-  test.each<[string, CannedResponse<Phase1KillResult>, KillRetrySeed, string | undefined]>([
-    ['a success with kill_sent true', cannedOk(cannedKillResult(true)), SEED_WAITING, undefined],
-    ['a success with kill_sent false', cannedOk(cannedKillResult(false)), SEED_WAITING, undefined],
-    ['a success with no kill_sent', cannedOk(cannedKillResult()), SEED_WAITING, undefined],
-    ['ErrSpawnNotFound (the row-gone success)', cannedErr(errSpawnNotFound()), SEED_WAITING, undefined],
-    ['GONE (the session-gone success), a fake token in its session', cannedErr(errTmuxCaptureFailed(sentinelInMessage('try-gone'), 'kill')), SEED_WAITING, undefined],
-    ['CONFLICT, a fake token in its quoted session', cannedErr(errTmuxSessionConflict('kill', 'not-this-launch', sentinelInMessage('try-conflict'))), SEED_WAITING, REDACTED_SENTINEL_TAIL],
-    ['UNUSABLE NAME', cannedErr(errUnusableName()), SEED_WAITING, undefined],
-    ['CONFIG, a fake token in its value', cannedErr(errConfigMalformed('starting_session_seconds', sentinelInMessage('try-config'))), SEED_WAITING, REDACTED_SENTINEL_TAIL],
-    ['ENVIRONMENT (ErrTmuxNotAvailable)', cannedErr(errTmuxNotAvailable(undefined, 'kill')), SEED_WAITING, undefined],
-    ['UNCLASSIFIED (ErrInternal), a fake token in its description', cannedErr(errInternal(`the store could not be read (${sentinelInMessage('try-internal')})`)), SEED_WAITING, REDACTED_SENTINEL_TAIL],
-    ['an ErrTmuxKillFailed naming no survivor, a fake token in its session (a row not last read live: one try)', cannedErr(errTmuxKillFailed(sentinelInMessage('try-killfailed'), 'outlived-exit-wait')), KILL_RETRY_SEED_NOT_LIVE_VALUE, REDACTED_SENTINEL_TAIL],
-    ['the survivor-naming ErrTmuxKillFailed, a fake token in its session (a row not last read live: one try)', cannedErr(errTmuxKillFailed(sentinelInMessage('try-survivor'), 'pane-process-survived')), KILL_RETRY_SEED_NOT_LIVE_VALUE, REDACTED_SENTINEL_TAIL],
-    ['an ErrTmuxUnresponsive, a fake token in its description (a row not last read live: one try)', cannedErr(errTmuxUnresponsive('kill', `no answer (${sentinelInMessage('try-unresponsive')})`)), KILL_RETRY_SEED_NOT_LIVE_VALUE, REDACTED_SENTINEL_TAIL],
-  ])('a try answering %s: its one line is the builder\'s for that outcome and what follows it', async (_label, kill, lastRead, redacted) => {
+  test.each<[string, CannedResponse<Phase1KillResult>, KillRetrySeed, string | undefined, number, KillRetryTryNext]>([
+    ['a success with kill_sent true', cannedOk(cannedKillResult(true)), SEED_WAITING, undefined, KILL_RETRY_TRIES, KILL_RETRY_NEXT_SUCCESS],
+    ['a success with kill_sent false', cannedOk(cannedKillResult(false)), SEED_WAITING, undefined, KILL_RETRY_TRIES, KILL_RETRY_NEXT_SUCCESS],
+    ['a success with no kill_sent', cannedOk(cannedKillResult()), SEED_WAITING, undefined, KILL_RETRY_TRIES, KILL_RETRY_NEXT_SUCCESS],
+    ['ErrSpawnNotFound (the row-gone success)', cannedErr(errSpawnNotFound()), SEED_WAITING, undefined, KILL_RETRY_TRIES, KILL_RETRY_NEXT_SUCCESS],
+    ['GONE (the session-gone success), a fake token in its session', cannedErr(errTmuxCaptureFailed(sentinelInMessage('try-gone'), 'kill')), SEED_WAITING, undefined, KILL_RETRY_TRIES, KILL_RETRY_NEXT_SUCCESS],
+    ['CONFLICT, a fake token in its quoted session', cannedErr(errTmuxSessionConflict('kill', 'not-this-launch', sentinelInMessage('try-conflict'))), SEED_WAITING, REDACTED_SENTINEL_TAIL, KILL_RETRY_TRIES, KILL_RETRY_NEXT_NOT_RETRIED],
+    ['UNUSABLE NAME', cannedErr(errUnusableName()), SEED_WAITING, undefined, KILL_RETRY_TRIES, KILL_RETRY_NEXT_NOT_RETRIED],
+    ['CONFIG, a fake token in its value', cannedErr(errConfigMalformed('starting_session_seconds', sentinelInMessage('try-config'))), SEED_WAITING, REDACTED_SENTINEL_TAIL, KILL_RETRY_TRIES, KILL_RETRY_NEXT_NOT_RETRIED],
+    ['ENVIRONMENT (ErrTmuxNotAvailable)', cannedErr(errTmuxNotAvailable(undefined, 'kill')), SEED_WAITING, undefined, KILL_RETRY_TRIES, KILL_RETRY_NEXT_NOT_RETRIED],
+    ['UNCLASSIFIED (ErrInternal), a fake token in its description', cannedErr(errInternal(`the store could not be read (${sentinelInMessage('try-internal')})`)), SEED_WAITING, REDACTED_SENTINEL_TAIL, KILL_RETRY_TRIES, KILL_RETRY_NEXT_NOT_RETRIED],
+    ['an ErrTmuxKillFailed naming no survivor, a fake token in its session (a row not last read live: one try)', cannedErr(errTmuxKillFailed(sentinelInMessage('try-killfailed'), 'outlived-exit-wait')), KILL_RETRY_SEED_NOT_LIVE_VALUE, REDACTED_SENTINEL_TAIL, 1, KILL_RETRY_NEXT_NOT_LIVE],
+    ['the survivor-naming ErrTmuxKillFailed, a fake token in its session (a row not last read live: one try)', cannedErr(errTmuxKillFailed(sentinelInMessage('try-survivor'), 'pane-process-survived')), KILL_RETRY_SEED_NOT_LIVE_VALUE, REDACTED_SENTINEL_TAIL, 1, KILL_RETRY_NEXT_NOT_LIVE],
+    ['an ErrTmuxUnresponsive, a fake token in its description (a row not last read live: one try)', cannedErr(errTmuxUnresponsive('kill', `no answer (${sentinelInMessage('try-unresponsive')})`)), KILL_RETRY_SEED_NOT_LIVE_VALUE, REDACTED_SENTINEL_TAIL, 1, KILL_RETRY_NEXT_NOT_LIVE],
+  ])('a try answering %s: its one line is the builder\'s for that outcome and what follows it', async (_label, kill, lastRead, redacted, maxTries, next) => {
     const r = await run({ kills: [kill], lastRead })
-    const live = killRetrySeedIsLive(lastRead)
-    const next = killLetsNextStepRun(r.result.outcome) ? KILL_RETRY_NEXT_SUCCESS : live ? KILL_RETRY_NEXT_NOT_RETRIED : KILL_RETRY_NEXT_NOT_LIVE
 
     expect([r.result.tries, r.result.reads]).toEqual([1, 0])
-    expect(r.lines[0]).toBe(killRetryTryLine(PREFIX, STUB_INSTANCE_ID, 1, live ? KILL_RETRY_TRIES : 1, r.result.outcome, next))
+    expect(r.lines[0]).toBe(killRetryTryLine(PREFIX, STUB_INSTANCE_ID, 1, maxTries, r.result.outcome, next))
     if (redacted !== undefined) expect(r.lines[0]).toContain(redacted)
   })
 

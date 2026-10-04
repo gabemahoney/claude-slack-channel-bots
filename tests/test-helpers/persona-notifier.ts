@@ -51,6 +51,15 @@
  * under test (`setSessionNotifier`, `initOutageState({ notify })`, the
  * safeguard's `notify` argument).
  *
+ * `makeNoticeAlertsRig(h, opts)` composes the notice episodes, the
+ * kill-failure alerts and the unclassified-error episodes over harness `h`
+ * as `main()` composes them (b.jg5 SRJ-704, SRJ-1003, SRJ-1013): the
+ * episodes hand their posts to `h.notifier` and read its teardown window, on
+ * `h.clock` (the one fake clock the harness's hold runs on too); a persona
+ * counts as configured while it is in `h.personas`; each log-only route is
+ * the real `recordStartupError` into `opts.logDir`; every `[slack]` line goes
+ * to the rig's `lines`.
+ *
  * `makeNotifierStack(deps)` is the wiring on its own: a destination resolver,
  * the destination hold over it on a fake clock, and the notifier handing
  * notices to that hold, all over the caller's persona and client lookups and
@@ -86,6 +95,16 @@ import {
   type PersonaStartupErrorRecorder,
   type PersonaTeardownNoticeOccasion,
 } from '../../src/persona-notifier.ts'
+import {
+  PERSONA_UNCLASSIFIED_ERROR_LABEL,
+  createKillFailureAlerts,
+  createPersonaEpisodes,
+  createUnclassifiedErrorEpisodes,
+  personaUnclassifiedErrorEntryText,
+  type KillFailureAlerts,
+  type PersonaEpisodes,
+  type UnclassifiedErrorEpisodes,
+} from '../../src/persona-episodes.ts'
 import { recordStartupError } from '../../src/startup-errors.ts'
 import { createFakeClock, type FakeClock } from './fake-clock.ts'
 import { makeStubSlack, type StubSlack, type WebApiOutcome } from './slack-stub.ts'
@@ -404,4 +423,58 @@ export function makeNotifierHarness(
       logDir = undefined
     },
   }
+}
+
+/** The notice episodes, kill-failure alerts and unclassified-error episodes `makeNoticeAlertsRig` composes over a notifier harness. */
+export interface NoticeAlertsRig {
+  readonly episodes: PersonaEpisodes
+  readonly alerts: KillFailureAlerts
+  readonly unclassified: UnclassifiedErrorEpisodes
+  /** Every `[slack]` line the episodes, the alerts and the unclassified-error episodes wrote, in order. */
+  readonly lines: string[]
+}
+
+export interface NoticeAlertsRigOptions {
+  /** The directory each log-only route's real `recordStartupError` writes `startup-errors.log` in. */
+  readonly logDir: string
+  /** Write no fd-2 copy of each entry (the CLI's recorder form). Default false. */
+  readonly omitStderr?: boolean
+  /** The unclassified-error alert threshold in effect. Default 0 (the alert at the first report). */
+  readonly alertThresholdMs?: () => number
+}
+
+/**
+ * The server's notice composition over notifier harness `h`, as `main()`
+ * builds it (b.jg5 SRJ-704, SRJ-1003, SRJ-1013): the notice episodes hand
+ * their posts to `h.notifier` and read its teardown window, on `h.clock`;
+ * the kill-failure alerts and the unclassified-error episodes run over those
+ * episodes, a persona configured while it is in `h.personas`; each log-only
+ * route is the real `recordStartupError` into `opts.logDir` (the
+ * unclassified one through `personaUnclassifiedErrorEntryText`, as
+ * `src/server.ts` binds it).
+ */
+export function makeNoticeAlertsRig(h: NotifierHarness, opts: NoticeAlertsRigOptions): NoticeAlertsRig {
+  const lines: string[] = []
+  const log = (line: string): void => {
+    lines.push(line)
+  }
+  const record = (classLabel: string, entry: string): void => {
+    recordStartupError(classLabel, entry, undefined, { logDir: opts.logDir, ...(opts.omitStderr === true ? { omitStderr: true } : {}) })
+  }
+  const episodes = createPersonaEpisodes({
+    sink: (key, text, options) => h.notifier.notify(key, text, options),
+    log,
+    clock: h.clock,
+    teardownWindow: (key) => h.notifier.teardownWindowState(key),
+  })
+  const isConfigured = (key: string): boolean => h.personas.some((p) => p.key === key)
+  const alerts = createKillFailureAlerts({ episodes, log, isConfigured, logOnly: record })
+  const unclassified = createUnclassifiedErrorEpisodes({
+    episodes,
+    log,
+    alertThresholdMs: opts.alertThresholdMs ?? (() => 0),
+    isConfigured,
+    logOnly: (key, text) => record(PERSONA_UNCLASSIFIED_ERROR_LABEL, personaUnclassifiedErrorEntryText(key, text)),
+  })
+  return { episodes, alerts, unclassified, lines }
 }

@@ -64,6 +64,7 @@ import {
   reportUnclassifiedAtSite,
   ALL_CLEAR_TEMPLATE,
   ONSET_TEMPLATES,
+  outageNoticeFailedLine,
   OUTAGE_CLASS_ORDER,
   adConfigMalformedClearedLine,
   adConfigMalformedOnset,
@@ -150,6 +151,7 @@ import { MAX_LOGGED_MESSAGE_LENGTH, describeThrownValue } from '../src/persona-c
 import { RECHECK_OUTCOME_NOT_RUNNING, RECHECK_OUTCOME_PASS, createAdVersionRecheck } from '../src/ad-version-gate.ts'
 import { PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
+import { lineParts } from './test-helpers/line-parts.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { formatPersonaNotice } from '../src/persona-notifier.ts'
 import { stubOpenedDmId, type StubSlack } from './test-helpers/slack-stub.ts'
@@ -2369,11 +2371,16 @@ describe('the cleared-flag observer (b.jg5 SRJ-305, SRJ-311)', () => {
 // ---------------------------------------------------------------------------
 
 /** The one server-log line a failed onset post for persona `key` writes. */
-const onsetFailureLine = (key: string, failure: unknown): string =>
-  `[slack] outage-state: onset notice for persona=${key} failed: ${describeThrownValue(failure)} — the flag stays raised; the notice counts as posted`
+const onsetFailureLine = (key: string, failure: unknown): string => outageNoticeFailedLine(key, false, describeThrownValue(failure))
 
-/** The lines among `lines` that report a failed onset post (any persona). */
-const onsetFailureLinesIn = (lines: readonly string[]): string[] => lines.filter((line) => line.includes('outage-state: onset notice for persona='))
+/** The one server-log line a failed all-clear post for persona `key` writes. */
+const allClearFailureLine = (key: string, failure: unknown): string => outageNoticeFailedLine(key, true, describeThrownValue(failure))
+
+/** The lines among `lines` that report a failed onset post (any persona): the builder's own words before the persona. */
+const onsetFailureLinesIn = (lines: readonly string[]): string[] => {
+  const [head] = lineParts((hole) => outageNoticeFailedLine(hole, false, hole))
+  return lines.filter((line) => line.startsWith(head!))
+}
 
 /** How a notify can fail: it throws the failure, or answers a promise that rejects with it. */
 const NOTIFY_FAILURES: ReadonlyArray<readonly [form: string, fail: (failure: Error) => unknown]> = [
@@ -2452,6 +2459,46 @@ describe('the wrappers\' other onsets with a notify that fails: the call\'s own 
     await settle()
     expect([calls.length, onsetFailureLinesIn(lines).length]).toEqual([1, 1])
     expect(getOutageFlags(P2).size).toBe(0)
+    assertNoLeak({ calls, lines })
+  })
+})
+
+describe('a GONE answer\'s all-clear with a notify that fails: the GONE error is rethrown (b.jg5 SRJ-312, SRJ-1014)', () => {
+  /** Every server-log line (`console.error`) the running case wrote. */
+  let lines: string[]
+  let errorSpy: ReturnType<typeof spyOn>
+
+  beforeEach(() => {
+    lines = []
+    errorSpy = spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+      lines.push(args.map(String).join(' '))
+    })
+  })
+
+  afterEach(() => {
+    errorSpy.mockRestore()
+  })
+
+  // P1's tmux-unavailable flag is raised by an ENVIRONMENT answer (its onset
+  // post fails too, and counts as posted); a GONE answer from a tmux-touching
+  // call then clears it, and the all-clear it emits goes out through the same
+  // isolation: logged once, never replacing the GONE value the wrapper rethrows.
+  test.each(NOTIFY_FAILURES.flatMap(([form, fail]) => WRAPPERS.map(([w, wrap]) => [form, w, fail, wrap] as const)))('%s, through %s: the GONE value is rethrown, the flag cleared, notify called once with the all-clear and one all-clear-failed line logged', async (_form, _w, fail, wrap) => {
+    const failure = notifyFailure()
+    const { calls } = makeFailingNotifyHarness(fail, failure)
+    const raising = errTmuxNotAvailable(undefined, 'send-keys')
+    expect(await rejectionFrom(wrap, P1, 'send-keys', raising)).toBe(raising)
+    await settle()
+    expect([...getOutageFlags(P1)]).toEqual(['tmux-unavailable'])
+    const gone = errTmuxSendKeys()
+
+    expect(await rejectionFrom(wrap, P1, 'send-keys', gone)).toBe(gone)
+    await settle()
+
+    expect(getOutageFlags(P1).size).toBe(0)
+    expect(calls.slice(1)).toEqual([{ key: P1, text: allClearOf([['tmux-unavailable', undefined]]) }])
+    expect(lines.filter((line) => line === allClearFailureLine(P1, failure))).toHaveLength(1)
+    expect(onsetFailureLinesIn(lines)).toEqual([onsetFailureLine(P1, failure)])
     assertNoLeak({ calls, lines })
   })
 })

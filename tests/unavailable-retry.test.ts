@@ -529,6 +529,7 @@ import {
   launchStartRecord,
 } from './test-helpers/conflict-cases.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import { builtAround } from './test-helpers/line-parts.ts'
 import { startManualPoller } from './test-helpers/permission-relay-harness.ts'
 import {
   callCounts,
@@ -639,19 +640,6 @@ function refusalsToCeiling(): number {
   let n = 0
   while (waitMs(n) < UNAVAILABLE_RETRY_CEILING_S * 1000) n++
   return n
-}
-
-/**
- * The lines `build` makes whatever it is given as its one open part (a
- * thrown value's description, which carries its stack frames, or a cause's
- * error a case cannot rebuild): a pattern of the builder's own text before
- * and after that part, with anything in it.
- */
-function builtAround(build: (hole: string) => string): RegExp {
-  const hole = '\u0000'
-  const [head, tail] = build(hole).split(hole) as [string, string]
-  const quote = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  return new RegExp(`^${quote(head)}.*${quote(tail)}$`)
 }
 
 /** A cause's description in the timer's lines (`<kind>: <one-line error>`), its error described with no stack frame. */

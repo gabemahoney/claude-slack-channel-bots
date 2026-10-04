@@ -79,8 +79,10 @@ import {
   createConflictLatch,
   LATCH_CASE_LEFTOVER,
   LATCH_CASE_OWN_ID,
+  LATCH_CASE_UNUSABLE_RECORDED_NAME,
   LATCH_ROW_STATE_NO_ROW,
   latchRowStateRead,
+  notConfiguredLatchOutcome,
   REFUSED_OPERATION_PLAIN_SPAWN,
   REFUSED_OPERATION_RESUME,
   unusableNameNoticeText,
@@ -168,7 +170,7 @@ import {
   runRestartRetry,
   scheduleRestart,
 } from '../src/restart.ts'
-import { LIVENESS_READING_DEAD } from '../src/liveness-reading.ts'
+import { LIVENESS_READING_DEAD, LIVENESS_READING_DEAD_ENDED } from '../src/liveness-reading.ts'
 import {
   APPROVER_LOG_PREFIX,
   APPROVER_STOP_TEARDOWN,
@@ -177,9 +179,11 @@ import {
   approverLogLine,
   approverNotStartedMessage,
   killPersonaInstanceForTeardown,
+  latchOnRestartKillOutcome,
   oldLifeWaitTeardownLine,
   setConfiguredPersonaQuery,
   setConflictLatch,
+  setStuckLaunchEpisodes,
   stopLiveRowSequence,
   whenLaunchSettled,
   type PersonaTeardownKillRefusal,
@@ -200,7 +204,11 @@ import {
   type RecoveryHarness,
 } from './test-helpers/recovery-harness.ts'
 import { PRE_PERSONA_ID, holdOldAt } from './test-helpers/old-life.ts'
-import { conflictForPersona } from './test-helpers/conflict-cases.ts'
+import {
+  conflictForPersona,
+  RESTART_KILL_CONFLICT_CASE_ROWS,
+  RESTART_KILL_UNUSABLE_NAME_CASE_ROWS,
+} from './test-helpers/conflict-cases.ts'
 import {
   KILL_RETRY_ALERT_NONE,
   KILL_RETRY_ALERT_ORDINARY,
@@ -2492,6 +2500,114 @@ describe('persona teardown over the real latch (b.jg5 SRJ-504, SRJ-1002): the ke
     expect(h.stub(b).callLog).toEqual([])
     expect(h.totalPosts()).toBe(0)
     expect(r.f.lines.at(-1)).toBe(`${teardownPrefix(r.f.b)}: complete`)
+  })
+
+  // b.jg5 SRJ-1002, SRJ-1003 (E34 final review): the session manager's
+  // CONFLICT and UNUSABLE NAME latch entries ask the not-configured guard
+  // (`latchEntryConfigured`), which reads the key's teardown window through
+  // the installed notice episodes. Apply step 1 removes B before its teardown
+  // runs, so B's launch in flight meeting either answer inside B's open window
+  // latches as for a configured persona: its notice reaches the notifier's
+  // open window (one persona-teardown-notice entry, no Slack call) and the
+  // teardown forgets the latch. Outside the window (`none`, or a teardown
+  // only `submitted`) the same answer is routed log-only: nothing latched,
+  // posted or written, one line with the not-configured outcome. The entry is
+  // the restart path's kill (`latchOnRestartKillOutcome`, its run having read
+  // the row `ended`, so no latch-time read). Installed as main() installs
+  // them: the latch, the notice episodes and the configured-persona query over
+  // the notifier's applied set.
+  const GUARD_SITE = 'teardownWindowGuard'
+  const GUARD_ANSWERS = [
+    ['a CONFLICT', RESTART_KILL_CONFLICT_CASE_ROWS[0]!, PERSONA_EPISODE_KIND_CONFLICT],
+    ['an UNUSABLE NAME', RESTART_KILL_UNUSABLE_NAME_CASE_ROWS[0]!, PERSONA_EPISODE_KIND_UNUSABLE_RECORDED_NAME],
+  ] as const
+  type GuardRow = (typeof GUARD_ANSWERS)[number][1]
+
+  /** Install `r`'s latch and episodes in the session manager with the configured-persona query over `r.h`'s applied set, as main() does; put back in `cleanups`. */
+  function installGuard(r: LatchFixture): void {
+    const h = r.h!
+    setConflictLatch(r.latch)
+    setStuckLaunchEpisodes(r.episodes)
+    setConfiguredPersonaQuery((key) => h.personas.some((p) => p.key === key))
+    cleanups.push(() => {
+      setConflictLatch(undefined)
+      setStuckLaunchEpisodes(undefined)
+      _resetConfiguredPersonaQuery()
+    })
+  }
+
+  /** The restart path's kill of `key` meeting `row`'s answer, its run having read the row `ended`, through the session manager's latch entry. */
+  const meetAtKill = (key: string, row: GuardRow): Promise<boolean> =>
+    latchOnRestartKillOutcome(key, killOutcomeOf({ thrown: row.build() }), GUARD_SITE, LIVENESS_READING_DEAD_ENDED)
+
+  /** The notice `latch`'s record of `key` posts for `row`'s answer. */
+  function guardNotice(latch: ConflictLatch, key: string, row: GuardRow): string {
+    const record = latch.record(key)!
+    return row.latchCase === LATCH_CASE_UNUSABLE_RECORDED_NAME
+      ? unusableNameNoticeText(key, record.description)
+      : conflictNoticeText({ sessionName: record.sessionName, latchCase: row.latchCase, description: record.description })
+  }
+
+  /** Every console line carrying the not-configured outcome of `row`'s answer. */
+  const notConfiguredLines = (row: GuardRow): string[] =>
+    consoleLines().filter((line) => line.includes(notConfiguredLatchOutcome(row.latchCase, row.refusedOperation)))
+
+  test.each(GUARD_ANSWERS)('SRJ-1002, SRJ-1003: B removed, its launch in flight meeting %s through the not-configured guard as it settles inside B\'s open teardown window: latched as for a configured persona, no not-configured line; its notice written by the window as one persona-teardown-notice entry with no Slack call; once the teardown completes no latch and no episode are left', async (_label, row, episodeKind) => {
+    const release = Promise.withResolvers<void>()
+    let atSettle: { latched: boolean; answer: boolean; notice: string } | undefined
+    const r = makeLatched({
+      notifier: true,
+      launchInFlight: (latch) =>
+        release.promise.then(async () => {
+          const b = r.f.b.key
+          const answer = await meetAtKill(b, row)
+          atSettle = { latched: latch.isLatched(b), answer, notice: guardNotice(latch, b, row) }
+        }),
+    })
+    installGuard(r)
+    const h = r.h!
+    const b = r.f.b.key
+    h.personas.splice(h.personas.findIndex((p) => p.key === b), 1) // apply step 1: B removed
+
+    const done = r.f.lifecycle.teardown(r.f.b)
+    await flush()
+    expect([r.latch.isLatched(b), h.notifier.teardownWindowState(b)]).toEqual([false, 'open'])
+    release.resolve()
+    await done
+    await flush()
+
+    expect(atSettle).toMatchObject({ latched: true, answer: true })
+    expect(notConfiguredLines(row)).toEqual([])
+    expect(r.latch.isLatched(b)).toBe(false)
+    expect(r.latch.record(b)).toBeUndefined()
+    expect(r.episodes.isOpen(b, episodeKind)).toBe(false)
+    expect(r.posts).toEqual([{ key: b, text: atSettle!.notice }])
+    expect(h.startupEntries()).toEqual([teardownNoticeEntry(r.f.b, unescapeSlackControlCharacters(atSettle!.notice))])
+    expect(h.logs).toEqual([teardownNoticeLine(r.f.b, atSettle!.notice)])
+    expect(h.stub(b).callLog).toEqual([])
+    expect(h.totalPosts()).toBe(0)
+    expect(h.notifier.teardownWindowState(b)).toBe('none')
+    assertNoLeak({ lines: consoleLines() })
+  })
+
+  test.each(GUARD_ANSWERS.flatMap(([label, row]) => (['none', 'submitted'] as const).map((window) => [label, window, row] as const)))('SRJ-1002, SRJ-1003: B removed, its launch meeting %s with its teardown window %s: routed log-only by the not-configured guard: nothing latched, posted or written, and one line carrying the not-configured outcome', async (_label, window, row) => {
+    const r = makeLatched({ notifier: true })
+    installGuard(r)
+    const h = r.h!
+    const b = r.f.b.key
+    h.personas.splice(h.personas.findIndex((p) => p.key === b), 1) // apply step 1: B removed
+    if (window === 'submitted') h.notifier.submitTeardown(b)
+    expect(h.notifier.teardownWindowState(b)).toBe(window)
+
+    expect(await meetAtKill(b, row)).toBe(true)
+    await flush()
+    h.notifier.settleTeardown(b)
+
+    expect([r.latch.isLatched(b), r.latch.record(b)]).toEqual([false, undefined])
+    expect(notConfiguredLines(row)).toHaveLength(1)
+    expect([r.posts, r.latchLines, h.logs, h.startupEntries()]).toEqual([[], [], [], []])
+    expect(h.totalPosts()).toBe(0)
+    assertNoLeak({ lines: consoleLines() })
   })
 
   test('the old half of a destructive modify (B still applied) forgets B\'s latch too: the new half starts unlatched and, meeting the same CONFLICT itself, latches with exactly one post for B', async () => {

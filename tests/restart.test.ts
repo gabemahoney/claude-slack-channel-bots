@@ -259,6 +259,7 @@ import {
 } from '../src/unavailable-retry.ts'
 import { RECHECK_OUTCOME_PASS, RECHECK_OUTCOME_STOP, installAdVersionRecheck, resetAdVersionRecheckForTests } from '../src/ad-version-gate.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import { lineParts } from './test-helpers/line-parts.ts'
 import {
   callCounts,
   callCountsSince,
@@ -5975,7 +5976,7 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
   const P = 'persona_p'
   const CWD = '/cwd/p'
   /** The pending-deferral failure line's head for P, ahead of its failure. */
-  const DEFER_FAILED = pendingDeferralFailedLine(P, '\u0000').split('\u0000')[0]!
+  const [DEFER_FAILED] = lineParts((hole) => pendingDeferralFailedLine(P, hole)) as [string]
   let errLines: string[]
   let errArgs: unknown[][]
   let origConsoleError: typeof console.error

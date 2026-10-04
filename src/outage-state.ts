@@ -551,14 +551,14 @@ export function raiseAdConfigMalformed(key: string, err: unknown): void {
 /**
  * Post `text` to persona `key` through `deps.notify` without letting it throw
  * or reject: a synchronous throw, or a returned promise that rejects, is
- * logged once (`describeThrownValue`) and otherwise ignored, so the notice
- * counts as posted (the precedent of `src/persona-episodes.ts`). Never throws.
+ * logged once (`describeThrownValue`, `outageNoticeFailedLine`) and otherwise
+ * ignored, so the notice counts as posted (the precedent of
+ * `src/persona-episodes.ts`). Never throws.
  */
 function notifyIsolated(key: string, text: string, options?: OutageNoticeOptions): void {
+  const allClear = options?.outage?.phase === 'all-clear'
   const logFailure = (failure: unknown): void => {
-    console.error(
-      `[slack] outage-state: onset notice for persona=${key} failed: ${describeThrownValue(failure)} — the flag stays raised; the notice counts as posted`,
-    )
+    console.error(outageNoticeFailedLine(key, allClear, describeThrownValue(failure)))
   }
   try {
     const pending: unknown = deps?.notify(key, text, options)
@@ -566,6 +566,20 @@ function notifyIsolated(key: string, text: string, options?: OutageNoticeOptions
   } catch (failure) {
     logFailure(failure)
   }
+}
+
+/**
+ * `notifyIsolated`'s one line when the notice for persona `key` fails
+ * (`allClear`: the notice is an all-clear, else an onset); `failure` is the
+ * thrown value as `describeThrownValue` renders it (redacted). Pure.
+ *
+ *   [slack] outage-state: onset notice for persona=<key> failed: <thrown value> — the flag stays raised; the notice counts as posted
+ *   [slack] outage-state: all-clear notice for persona=<key> failed: <thrown value> — the flags stay cleared; the notice counts as posted
+ */
+export function outageNoticeFailedLine(key: string, allClear: boolean, failure: string): string {
+  return allClear
+    ? `[slack] outage-state: all-clear notice for persona=${key} failed: ${failure} — the flags stay cleared; the notice counts as posted`
+    : `[slack] outage-state: onset notice for persona=${key} failed: ${failure} — the flag stays raised; the notice counts as posted`
 }
 
 /**
@@ -640,6 +654,21 @@ function raiseFlag(
  * success or `ErrSpawnNotFound` (b.jg5 SRJ-312).
  */
 export function clearOutageFlag(key: string, cls: OutageClass, reading?: string): void {
+  clearFlag(key, cls, reading)
+}
+
+/**
+ * {@link clearOutageFlag}'s body. The all-clear is emitted through `post`
+ * when given (the wrappers' catch block passes {@link notifyIsolated}, so a
+ * `notify` that throws or rejects is logged once and never replaces the error
+ * the wrapper rethrows), else `deps.notify` directly.
+ */
+function clearFlag(
+  key: string,
+  cls: OutageClass,
+  reading: string | undefined,
+  post?: (key: string, text: string, options?: OutageNoticeOptions) => void,
+): void {
   if (!deps) return
   const entry = entries.get(key)
   if (!entry) return
@@ -655,7 +684,9 @@ export function clearOutageFlag(key: string, cls: OutageClass, reading?: string)
     entry.badStretchClasses = new Map()
     const allClearOf = (classes: readonly string[]): string =>
       ALL_CLEAR_TEMPLATE(new Map([...snapshot].filter(([cls]) => classes.includes(cls))))
-    deps.notify(key, ALL_CLEAR_TEMPLATE(snapshot), { outage: { phase: 'all-clear', classes: [...snapshot.keys()], allClearOf } })
+    const options: OutageNoticeOptions = { outage: { phase: 'all-clear', classes: [...snapshot.keys()], allClearOf } }
+    if (post !== undefined) post(key, ALL_CLEAR_TEMPLATE(snapshot), options)
+    else deps.notify(key, ALL_CLEAR_TEMPLATE(snapshot), options)
   }
   flagCleared(key, cls, reading)
 }
@@ -750,7 +781,8 @@ export function resetAllToHealthy(keys: string[]): void {
  *
  * The original error is always rethrown so callers can handle it normally:
  * every onset raised here (`ad-unreachable`, `tmux-unavailable`,
- * `cwd-unreachable`, `ad-config-malformed`) goes out through
+ * `cwd-unreachable`, `ad-config-malformed`), and the all-clear a GONE
+ * answer's clear of `tmux-unavailable` can emit, goes out through
  * `notifyIsolated`, so a notify that throws or rejects is logged once and
  * never replaces the error.
  */
@@ -805,8 +837,9 @@ export async function withOutageDetection<T>(
     const deferred = options?.deferUnavailableReport === true && errorClass === AD_ERROR_CLASS_UNAVAILABLE
     if (armsNothing === undefined && !deferred) reportAgentDirectorError(key, err, call)
     if (isTmuxTouchingCall(call) && errorClass === AD_ERROR_CLASS_GONE) {
-      // b.jg5 SRJ-312: GONE from a tmux-touching call is tmux answering.
-      clearOutageFlag(key, 'tmux-unavailable')
+      // b.jg5 SRJ-312: GONE from a tmux-touching call is tmux answering. Its
+      // all-clear goes out through `notifyIsolated`, so it never replaces `err`.
+      clearFlag(key, 'tmux-unavailable', undefined, notifyIsolated)
       endTmuxUnresponsive(key)
     }
     throw err

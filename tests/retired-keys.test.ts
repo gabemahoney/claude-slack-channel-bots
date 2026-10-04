@@ -186,6 +186,7 @@ import {
 } from './test-helpers/conflict-cases.ts'
 import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, writtenFile } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import { lineParts } from './test-helpers/line-parts.ts'
 import { makeFifo, mkfifoAvailable } from './test-helpers/fifo.ts'
 import { readStartupEntries, type StartupEntry } from './test-helpers/persona-notifier.ts'
 import { hostSafeChildEnv, osTempDir } from './test-helpers/host-safe-env.ts'
@@ -273,7 +274,7 @@ function fileOf(rig: Rig): string {
  * the detail starts), and the tail after it.
  */
 function expectWithWriteDetail(line: string, build: (detail: string) => string, failure: Error): void {
-  const [head, tail] = build('\u0000').split('\u0000') as [string, string]
+  const [head, tail] = lineParts(build) as [string, string]
   expect(line.startsWith(`${head}${errnoSuffix(failure)}`)).toBe(true)
   expect(line.endsWith(tail)).toBe(true)
 }

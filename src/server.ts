@@ -259,6 +259,7 @@ import {
   AD_ERROR_CLASS_CONFIG,
   AD_ERROR_CLASS_ENVIRONMENT,
   classifyAdError,
+  describeAdFailureForLog,
   hasAdErrorName,
 } from './ad-error-class.ts'
 import {
@@ -2232,7 +2233,7 @@ export function _buildReconnectSessionAdapter(
       if (applyOwnRowStatusStep(key, { thrown: err }, RECONNECT_STATUS_SITE)) return reconnectLatchedByRead(key)
       // b.f2b: nothing is known about the session, so nothing is typed.
       forgetWorkingRowEvidence(key)
-      console.error(reconnectStatusCheckFailedLine(key, describeThrownValue(err)))
+      console.error(reconnectStatusCheckFailedLine(key, describeAdFailureForLog(err)))
       return 'transient'
     }
     // b.jg5 SRJ-502: the state read is awaited, and the persona may have
@@ -2447,8 +2448,8 @@ function replaceOwnRowOldLife(key: string, state: string, why: OwnRowOldLife): '
 /**
  * The reconnect adapter's line for a `status` read that failed (b.f2b,
  * b.rmy): nothing is typed and the persona is deferred to a later tick;
- * `failure` is the thrown value as `describeThrownValue` renders it
- * (redacted). Pure.
+ * `failure` is the thrown value as `describeAdFailureForLog` renders it
+ * (redacted; an agent-director error as its reported name and message). Pure.
  *
  *   [slack] reconnectSession: persona=<key> status check failed: <failure> — not typing /mcp reconnect blind; deferring to a later tick (b.f2b/b.rmy)
  */
@@ -2924,7 +2925,7 @@ export async function deferPendingRow(
         break
       }
       case PENDING_ROW_STEP_REFUSED:
-        console.error(deferralRefusedLine(key, describeThrownValue(step.error)))
+        console.error(deferralRefusedLine(key, describeAdFailureForLog(step.error)))
         break
       case PENDING_ROW_STEP_LATCHED:
         // The shared read logged the latch; the latch's gates stop later work.
@@ -2963,8 +2964,8 @@ export function deferralNoRowLine(key: string): string {
 
 /**
  * `deferPendingRow`'s line when the step's read was refused (b.jg5 SRJ-409);
- * `failure` is the refusal as `describeThrownValue` renders it (redacted).
- * Pure.
+ * `failure` is the refusal as `describeAdFailureForLog` renders it
+ * (redacted; an agent-director error as its reported name and message). Pure.
  *
  *   [slack] Deferring persona=<key>: its row could not be read again (<failure>) — nothing more in this run; the next run decides (b.jg5 SRJ-409)
  */

@@ -529,7 +529,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, existsSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs'
 import { homedir, tmpdir } from 'os'
 import { join } from 'path'
@@ -830,6 +830,7 @@ import {
 } from '../src/live-row-sequence.ts'
 import type { TranscriptReading, TranscriptSnapshot } from '../src/session-transcript.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import { lineParts } from './test-helpers/line-parts.ts'
 import { balancedAfter, srcModules, stripComments } from './test-helpers/source-audit.ts'
 import {
   _resetLaunchedWithDirs,
@@ -1409,6 +1410,15 @@ import {
   oldLifeWaitNotAppliedLine,
   oldLifeWaitNotStartedLine,
   oldLifeWaitRefusalLine,
+  latchEntryQueryFailedLine,
+  personaKillStoppedNoAlertsLine,
+  JSONL_NO_CANDIDATES_TEXT,
+  jsonlCandidatesText,
+  jsonlDiagnosisInconclusiveNoticeText,
+  jsonlTranscriptLostNoticeText,
+  type JsonlCandidate,
+  OLD_LIFE_HOLD_ARM_SKIPPED,
+  OLD_LIFE_HOLD_SKIPPED_TIMER_PHRASE,
   personaRetryBlockCause,
   buildPendingRowRuleDeps,
 } from '../src/session-manager.ts'
@@ -1434,6 +1444,7 @@ import {
   RETRY_BLOCK_OLD_LIFE_WAIT,
   UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD,
   UNAVAILABLE_RETRY_RUN_NOW_RAN,
+  UNAVAILABLE_RETRY_RUN_NOW_ARMED,
   type RetryBlockCause,
 } from '../src/unavailable-retry.ts'
 import {
@@ -8462,7 +8473,7 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     expect(row.sendKeysCalls.map((c) => c.text)).toEqual([RECONNECT_TEXT])
     expect(notices).toEqual([])
     expect(linesWith(errLog, 'waitForWaitingAndReconnect: status read failed for ')).toEqual([
-      waitPollStatusErrorLine(WAIT_REF_C, describeAgentDirectorFailure(err), errorClass),
+      waitPollStatusErrorLine(WAIT_REF_C, describeAdFailureForLog(err), errorClass),
     ])
     expect(linesWith(errLog, 'dead session')).toEqual([])
     expect(linesWith(errLog, 'refused for persona=C')).toEqual([])
@@ -8491,9 +8502,9 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     expect(result).toBe('ok')
     expect(row.statusCalls).toHaveLength(readings.length + 1)
     expect(linesWith(errLog, 'waitForWaitingAndReconnect: status read failed for ')).toEqual([
-      waitPollStatusErrorLine(ref, describeAgentDirectorFailure(unavailable), AD_ERROR_CLASS_UNAVAILABLE),
-      waitPollStatusErrorLine(ref, describeAgentDirectorFailure(config), AD_ERROR_CLASS_CONFIG),
-      waitPollStatusErrorLine(ref, describeAgentDirectorFailure(unavailable), AD_ERROR_CLASS_UNAVAILABLE),
+      waitPollStatusErrorLine(ref, describeAdFailureForLog(unavailable), AD_ERROR_CLASS_UNAVAILABLE),
+      waitPollStatusErrorLine(ref, describeAdFailureForLog(config), AD_ERROR_CLASS_CONFIG),
+      waitPollStatusErrorLine(ref, describeAdFailureForLog(unavailable), AD_ERROR_CLASS_UNAVAILABLE),
     ])
     expect(notices).toEqual([])
   })
@@ -10927,6 +10938,30 @@ describe('b.jdc: checkPromptRowDeferral', () => {
     expect(linesWith(errLog, 'after the findMissing sweep failed')).toEqual([
       `[slack] reconnectSession: prompt row: reading the row of persona=C after the findMissing sweep failed: ErrStatusBroken message="${REDACTED_AD_DESCRIPTION}"`,
     ])
+    expect(errLog).not.toContain(LEAK_SENTINEL)
+  })
+
+  // b.jg5 SRJ-1014 (E34 final review): the read's failure is named by
+  // `describeAdFailureForLog`: agent-director's reported error name, never
+  // the client's placeholder, for an UNCLASSIFIED and a CONFIG answer.
+  test.each([
+    ['UNCLASSIFIED (ErrInternal)', () => errInternal()],
+    ['CONFIG (ErrConfigMalformed)', () => errConfigMalformed()],
+  ] as const)('a read after the sweep failing with %s defers with one line naming agent-director\'s reported error name', async (_label, make) => {
+    const err = make()
+    installStub({ findMissingCalls: [], statusError: err })
+
+    const errLog = await withCapturedErr(async () => {
+      await checkPromptRowDeferral('C', 'ask_user')
+      await clock.advance(min(10))
+      await checkPromptRowDeferral('C', 'ask_user')
+    })
+
+    const described = describeAdFailureForLog(err)
+    expect(described.startsWith(`${classifyAdError(err).reportedName!} `)).toBe(true)
+    const lines = linesWith(errLog, 'after the findMissing sweep failed')
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toEndWith(`: ${described}`)
     expect(errLog).not.toContain(LEAK_SENTINEL)
   })
 
@@ -13970,6 +14005,103 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
   })
 
+  // b.jg5 SRJ-712, SRJ-1001 (E34 final review): every field of a transcript
+  // candidate (source, path, note) and the row's started_at can carry
+  // agent-director's text. Each is rendered on its own (`renderLogMessageText`:
+  // redacted, on one line, capped) before the candidates are joined
+  // (`jsonlCandidatesText`), for the log line and the startup-errors entry
+  // alike; the lost and inconclusive notices escape that text once for Slack.
+  const JSONL_MARKUP = '<!channel>&'
+  /** A field holding a fake token and Slack markup. */
+  const leakyJsonlField = (label: string): string => `${label} ${fakeToken(BOT_TOKEN_PREFIX, `jsonl-${label}`)} ${JSONL_MARKUP}`
+
+  test('b.jg5 SRJ-712, SRJ-1001: jsonlCandidatesText renders each field redacted, on one line and capped, unescaped (log text); none gives the no-candidates text; both notice builders escape the rendered text exactly once', () => {
+    const longNote = `${leakyJsonlField('note')}\n${'x'.repeat(MAX_LOGGED_MESSAGE_LENGTH)}`
+    const candidates: JsonlCandidate[] = [
+      { source: leakyJsonlField('source'), path: leakyJsonlField('path'), note: longNote },
+      { source: 'persisted', path: '/data/proj/sess.jsonl', note: 'ENOENT' },
+    ]
+
+    const text = jsonlCandidatesText(candidates)
+
+    expect(jsonlCandidatesText([])).toBe(JSONL_NO_CANDIDATES_TEXT)
+    for (const field of [candidates[0]!.source, candidates[0]!.path, longNote]) {
+      const rendered = renderLogMessageText(field)
+      expect(rendered).toContain(REDACTED_TOKEN_PLACEHOLDER)
+      expect(text).toContain(rendered)
+      expect(text).not.toContain(field)
+    }
+    expect(renderLogMessageText(longNote)).toHaveLength(MAX_LOGGED_MESSAGE_LENGTH)
+    expect(text).toContain('/data/proj/sess.jsonl')
+    expect(text).toContain(JSONL_MARKUP)
+    expect(text).not.toContain('\n')
+    const notices = [jsonlTranscriptLostNoticeText(2, text), jsonlDiagnosisInconclusiveNoticeText(text)]
+    for (const notice of notices) {
+      expect(notice.split(escapeSlackControlCharacters(text))).toHaveLength(2)
+      expect(notice).not.toContain('<!channel>')
+      expect(notice).not.toContain(escapeSlackControlCharacters(escapeSlackControlCharacters(text)))
+    }
+    assertNoLeak({ text, notices })
+  })
+
+  test('b.jg5 SRJ-712, SRJ-1001: lost, with agent-director\'s enumerated candidate holding a fake token and Slack markup in its path and note → the log line and the record quote the rendered candidates, the notice quotes them escaped once; nothing leaks', async () => {
+    const readLog = captureStartupErrors()
+    const startedAt = '2026-09-20T05:00:00Z'
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, {
+      message_archive_db: makeArchiveWithMessagesSince(startedAt, 2),
+    })
+    const candidate: JsonlCandidate = {
+      source: 'persisted',
+      path: `/data/${fakeToken(BOT_TOKEN_PREFIX, 'jsonl-path')}/a${JSONL_MARKUP}.jsonl`,
+      note: `stat ${fakeToken(BOT_TOKEN_PREFIX, 'jsonl-note')} ${JSONL_MARKUP} failed`,
+    }
+    installAmnesia({
+      cfg,
+      spawnCalls: [],
+      jsonlDescription: `no transcript found: ${candidate.source} ${candidate.path} (${candidate.note})`,
+      getResult: { jsonl_path: '/data/proj/sess-7.jsonl', claude_session_id: 'sess-7', cwd: CWD, started_at: startedAt },
+    })
+    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
+    })
+
+    expect(result?.action).toBe('fresh-after-amnesia')
+    const rendered = jsonlCandidatesText([candidate])
+    expect(errLog.split('\n').filter((line) => line.startsWith('[slack] ErrJsonlMissing diagnostic: ') && line.includes(rendered))).toHaveLength(1)
+    expect(onlyStartupEntry(readLog(), JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)).toContain(rendered)
+    expect(notices.map((n) => n.text)).toEqual([jsonlTranscriptLostNoticeText(2, rendered)])
+    expect(notices[0]!.text).not.toContain('<!channel>')
+    assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
+  })
+
+  test('b.jg5 SRJ-712, SRJ-1001: inconclusive, with a row started_at holding a fake token and Slack markup → the log line and the record quote it rendered, the notice escaped once; nothing leaks', async () => {
+    const readLog = captureStartupErrors()
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, {
+      message_archive_db: makeArchiveWithMessagesSince('2026-09-20T05:00:00Z', 2),
+    })
+    const startedAt = leakyJsonlField('started')
+    installAmnesia({
+      cfg,
+      spawnCalls: [],
+      getResult: { jsonl_path: '/data/proj/sess-8.jsonl', claude_session_id: 'sess-8', cwd: CWD, started_at: startedAt },
+    })
+    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
+    })
+
+    expect(result?.action).toBe('fresh-after-inconclusive-amnesia')
+    const quoted = `started_at=${renderLogMessageText(startedAt)}`
+    expect(quoted).toContain(REDACTED_TOKEN_PLACEHOLDER)
+    expect(errLog.split('\n').filter((line) => line.startsWith('[slack] ErrJsonlMissing diagnostic: ') && line.includes(quoted))).toHaveLength(1)
+    expect(onlyStartupEntry(readLog(), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toContain(quoted)
+    expect(notices).toHaveLength(1)
+    expect(notices[0]!.text.split(escapeSlackControlCharacters(quoted))).toHaveLength(2)
+    expect(notices[0]!.text).not.toContain('<!channel>')
+    assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
+  })
+
   // AC 20 with b.jg5 SRJ-712, SRJ-113: `resume`'s answers are classified by
   // name, so an ErrJsonlMissing value whose errName is token-shaped is not a
   // no-transcript answer: no diagnosis and no reuse; the resume's failure
@@ -16475,6 +16607,8 @@ interface WaitStatusSite extends LadderSite {
   readonly action: SpawnPersonaResult['action']
   /** The `status` reads one such launch makes. */
   readonly statusReads: number
+  /** How the site's line and notice describe the failed read's error (the poll: `describeAdFailureForLog`, b.jg5 SRJ-1014). */
+  describe(err: unknown): string
   /** The wait's one line for the failed read of persona `ref`'s row, the error `described` and of class `errorClass`. */
   line(ref: string, described: string, errorClass: AdErrorClass): string
   /** The cause the not-connected notice names at the harness's session_restart_delay 0, when the read raises one. */
@@ -16498,6 +16632,7 @@ const WAIT_STATUS_SITES: readonly WaitStatusSite[] = [
     calls: ladderCallsOf({ spawn: 1, sendKeys: 1 }),
     action: 'reconnected',
     statusReads: 2,
+    describe: describeAdFailureForLog,
     line: waitPollStatusErrorLine,
   },
   {
@@ -16508,6 +16643,7 @@ const WAIT_STATUS_SITES: readonly WaitStatusSite[] = [
     calls: ladderCallsOf({ spawn: 1 }),
     action: 'not-reconnected',
     statusReads: 1,
+    describe: describeAgentDirectorFailure,
     line: (ref, described, errorClass) => waitEndedDisconnectedLine(waitTimedOutUnreadReport(ref, 0, described, errorClass), 0),
     noticeCause: (ref, described, errorClass) => noticeCause(waitTimedOutUnreadReport(ref, 0, described, errorClass).notice),
   },
@@ -16629,7 +16765,7 @@ function expectHeldOnce(h: RecoveryHarness, p: string, err: Error, kind: string,
   expect([h.invalidFlagsHold.heldKeys(), h.invalidFlagsHold.beganUnder(p)]).toEqual([[p], version])
   expect(h.episodeNotices).toEqual([holdAlert(p)])
   expect(h.lines.filter((line) => line === invalidFlagsHoldSetLine(p, version))).toHaveLength(1)
-  const [head, tail] = reuseInvalidFlagsHeldLine(renderPersonaRef(p, p), describeAgentDirectorFailure(err), kind, '\u0000').split('\u0000') as [string, string]
+  const [head, tail] = lineParts((hole) => reuseInvalidFlagsHeldLine(renderPersonaRef(p, p), describeAgentDirectorFailure(err), kind, hole)) as [string, string]
   expect(h.errors.filter((line) => line.startsWith(head) && line.endsWith(tail) && line.includes(describeHoldVersion(version)))).toHaveLength(1)
   expect([getFailureCount(p), h.notices, h.triggers, h.controller.isArmed(p)]).toEqual([0, [], [], false])
   expect([h.unclassifiedErrorOpen(p), unclassifiedStartedLines(h, p)]).toEqual([false, []])
@@ -16785,7 +16921,7 @@ async function expectWaitGoesOnAt(
   expect(await h.launch(p)).toStrictEqual({ key: p, action: site.action })
 
   const ref = renderPersonaRef(p, p)
-  const described = describeAgentDirectorFailure(err)
+  const described = site.describe(err)
   expect(ladderCallsMade(h)).toEqual(site.calls)
   expect(h.stub.calls.statusCalls).toHaveLength(site.statusReads)
   expect(order.filter((call) => call.startsWith('tmux '))).toEqual([])
@@ -17617,6 +17753,35 @@ describe('b.jg5 SRJ-702: the stop\'s cause raisePersonaKillFailureAlert hands th
     raisePersonaKillFailureAlert(KEY, retryEndedBy(KILL_RETRY_END_STOPPED), 'test-site', `persona=${KEY}`, KILL_FAILURE_CONTEXT_RECOVERY, alerts, liveRowStopCauseText(reason))
 
     expect(inputs).toEqual([expect.objectContaining({ stopped: true, stopCause: liveRowStopCauseText(reason) })])
+  })
+
+  // b.jg5 SRJ-702, SRJ-704 (E34 final review): with no kill-failure alerts
+  // installed, a stopped retry is recorded by its one stop line
+  // (`personaKillStoppedNoAlertsLine`), its decision `none` included, naming
+  // the stop's cause and the last outcome's class; a `none` decision whose
+  // tries were not stopped logs nothing.
+  test.each<[string, KillRetryResult, string | undefined]>([
+    ['an ordinary decision, stopped', retryEndedBy(KILL_RETRY_END_STOPPED), PERSONA_KILL_STOP_CAUSE_GENERIC],
+    [
+      'a none decision (ErrTmuxUnresponsive), stopped',
+      { outcome: killOutcomeOf({ thrown: errTmuxUnresponsive('kill') }), end: KILL_RETRY_END_STOPPED, tries: 1, reads: 0, alert: { kind: KILL_RETRY_ALERT_NONE } },
+      PERSONA_KILL_STOP_CAUSE_GENERIC,
+    ],
+    [
+      'a none decision, not stopped',
+      { outcome: killOutcomeOf({ thrown: errTmuxUnresponsive('kill') }), end: KILL_RETRY_END_EXHAUSTED, tries: 1, reads: 0, alert: { kind: KILL_RETRY_ALERT_NONE } },
+      undefined,
+    ],
+  ])('no kill-failure alerts installed, %s: the stop line naming its cause and the last outcome\'s class, or nothing', async (_label, retried, cause) => {
+    setKillFailureAlerts(undefined)
+
+    const errLog = await withCapturedErr(() => {
+      raisePersonaKillFailureAlert(KEY, retried, 'test-site', `persona=${KEY}`, KILL_FAILURE_CONTEXT_RECOVERY)
+    })
+
+    const lines = errLog.split('\n').filter((line) => line !== '')
+    expect(lines).toEqual(cause === undefined ? [] : [personaKillStoppedNoAlertsLine('test-site', `persona=${KEY}`, retried.alert, AD_ERROR_CLASS_UNAVAILABLE, cause)])
+    assertNoLeak({ lines })
   })
 
   test('a retry that was not stopped carries no stop\'s cause and no last outcome\'s class, even with a caller\'s cause given', () => {
@@ -21109,12 +21274,17 @@ describe('b.jg5 SRJ-1002, SRJ-501, SRJ-512: a launch-site CONFLICT or UNUSABLE N
   })
 
   // With no configured-persona query installed, or one that throws, the guard
-  // is not met: P latches exactly as a configured persona does.
-  const queries: ReadonlyArray<readonly [string, () => void]> = [
-    ['no configured-persona query is installed', () => setConfiguredPersonaQuery(undefined)],
-    ['the configured-persona query throws', () => setConfiguredPersonaQuery(() => { throw new Error('configured query broken') })],
+  // is not met: P latches exactly as a configured persona does; a throwing
+  // query logs one line naming P and the thrown value (b.jg5 SRJ-1002).
+  const QUERY_BROKEN = new Error('configured query broken')
+  const queries: ReadonlyArray<readonly [string, () => void, number]> = [
+    ['no configured-persona query is installed', () => setConfiguredPersonaQuery(undefined), 0],
+    ['the configured-persona query throws', () => setConfiguredPersonaQuery(() => { throw QUERY_BROKEN }), 1],
   ]
-  test.each(queries)('control, %s: a CONFLICT at the first spawn latches P as before, with its latch-time read and one post', async (_label, install) => {
+  /** P's query-failed lines: the UNUSABLE NAME entry asks the query once (`unusableNameAt`), as the CONFLICT entry does. */
+  const queryFailedLinesOf = (h: RecoveryHarness, p: string): string[] =>
+    h.errors.filter((line) => line === latchEntryQueryFailedLine(p, describeThrownValue(QUERY_BROKEN)))
+  test.each(queries)('control, %s: a CONFLICT at the first spawn latches P as before, with its latch-time read and one post', async (_label, install, queryFailed) => {
     const { h, p } = srj105Build()
     install()
     const site = LATCH_SPAWN_SITES[0]!
@@ -21126,9 +21296,10 @@ describe('b.jg5 SRJ-1002, SRJ-501, SRJ-512: a launch-site CONFLICT or UNUSABLE N
     expect(h.stub.calls.statusCalls).toHaveLength(1)
     expectLatchedOnce(h, p, conflictLatch(p, row, refusedOperationAt(site), row.rowAfter === undefined ? row.rowState : rowAfterState(row.rowAfter)))
     expect(conflictLinesIn(h.errors, p)[0]).not.toContain(notConfiguredLatchOutcome(row.latchCase, refusedOperationAt(site)))
+    expect(queryFailedLinesOf(h, p)).toHaveLength(queryFailed)
   })
 
-  test.each(queries)('control, %s: an UNUSABLE NAME at the first spawn latches P as before, with its latch-time read and one post', async (_label, install) => {
+  test.each(queries)('control, %s: an UNUSABLE NAME at the first spawn latches P as before, with its latch-time read and one post', async (_label, install, queryFailed) => {
     const { h, p } = srj105Build()
     install()
     const site = NOT_CONFIGURED_UNUSABLE_SITES[0]!
@@ -21140,6 +21311,7 @@ describe('b.jg5 SRJ-1002, SRJ-501, SRJ-512: a launch-site CONFLICT or UNUSABLE N
     expect(h.stub.calls.statusCalls).toHaveLength(1)
     expectLatchedOnce(h, p, unusableNameLatch(p, row))
     expect(unusableNameLinesOf(h, p)[0]).not.toContain(notConfiguredLatchOutcome(LATCH_CASE_UNUSABLE_RECORDED_NAME, REFUSED_OPERATION_NONE))
+    expect(queryFailedLinesOf(h, p)).toHaveLength(queryFailed)
   })
 })
 
@@ -27604,7 +27776,7 @@ describe('b.jg5 SRJ-207, SRJ-1015: every launch path for a held persona answers 
 
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'held' })
 
-    const [head, tail] = reuseInvalidFlagsHeldLine(renderPersonaRef(p, p), describeAgentDirectorFailure(err), RECHECK_OUTCOME_NOT_RUNNING, '\u0000').split('\u0000') as [string, string]
+    const [head, tail] = lineParts((hole) => reuseInvalidFlagsHeldLine(renderPersonaRef(p, p), describeAgentDirectorFailure(err), RECHECK_OUTCOME_NOT_RUNNING, hole)) as [string, string]
     const held = h.errors.filter((line) => line.startsWith(head))
     expect(held).toHaveLength(1)
     expect(held[0]).toStartWith(`${head}holding the persona failed: Error message="hold set broke (${REDACTED_SENTINEL_TAIL})" at `)
@@ -29123,15 +29295,21 @@ describe('b.jg5 SRJ-811, SRJ-810, SRJ-1015 (E27 T2): a launch of P refused becau
    * run that lists the row in its ids (`release`) ends the hold while the wait
    * still runs there, so the end-retry observer retries P only once the
    * stopped wait has settled, at the end's clock time, with one end line
-   * naming P as deferred and one settled line.
+   * naming P as deferred and one settled line. `result` is the run-now's
+   * answer: `ran` for P armed, `armed` for P whose arm was not made.
    */
-  async function expectRetriedOnceSettled(h: RecoveryHarness, p: string, release: () => Promise<void>): Promise<void> {
+  async function expectRetriedOnceSettled(
+    h: RecoveryHarness,
+    p: string,
+    release: () => Promise<void>,
+    result: typeof UNAVAILABLE_RETRY_RUN_NOW_RAN | typeof UNAVAILABLE_RETRY_RUN_NOW_ARMED = UNAVAILABLE_RETRY_RUN_NOW_RAN,
+  ): Promise<void> {
     const id = personaInstanceId(p)
     expect(h.oldLifeHolds.holdOf(id)?.waiting).toEqual([p])
     const endedAt = h.clock.now()
     await release()
     await h.settle()
-    expect(h.holdEndRetries).toEqual([{ key: p, at: endedAt, result: UNAVAILABLE_RETRY_RUN_NOW_RAN }])
+    expect(h.holdEndRetries).toEqual([{ key: p, at: endedAt, result }])
     expect(h.errors.filter((line) => line === oldLifeHoldEndRetryLine(id, [], [], [p]))).toHaveLength(1)
     expect(h.errors.filter((line) => line === oldLifeHoldEndSettledRetryLine(id, p, undefined))).toHaveLength(1)
     if (h.approverRunning(p)) await h.runApproverToStop(p)
@@ -29176,13 +29354,13 @@ describe('b.jg5 SRJ-811, SRJ-810, SRJ-1015 (E27 T2): a launch of P refused becau
 
     expect(h.stub.callCount()).toBe(calls)
     expect([h.triggers, h.controller.isArmed(p), h.oldLifeHolds.holdOf(personaInstanceId(p))?.waiting]).toEqual([[], false, []])
-    const refusals = [true, false].map((armed) => oldLifeWaitRefusalLine('runRestartWork', `persona=${p}`, armed))
+    const refusals = ([true, false, OLD_LIFE_HOLD_ARM_SKIPPED] as const).map((armed) => oldLifeWaitRefusalLine('runRestartWork', `persona=${p}`, armed))
     expect(h.errors.filter((line) => refusals.includes(line) || line === oldLifeWaitNotAppliedLine(p))).toEqual([])
     expect(getFailureCount(p)).toBe(0)
     await release()
   })
 
-  test('P removed while a wait runs on its own row: the start entry for P\'s launching sequence answers already-running, refuses to arm P\'s timer with one not-in-the-applied-configuration line, and its refusal line says the timer could not be armed', async () => {
+  test('P removed while a wait runs on its own row: the start entry for P\'s launching sequence answers already-running, refuses to arm P\'s timer with one not-in-the-applied-configuration line, and its refusal line, after it, names the skip, never an arm failure', async () => {
     const { h, p, release } = await waitOnOwnRow()
     h.remove(p)
     const calls = h.stub.callCount()
@@ -29191,11 +29369,38 @@ describe('b.jg5 SRJ-811, SRJ-810, SRJ-1015 (E27 T2): a launch of P refused becau
 
     expect(h.stub.callCount()).toBe(calls)
     expect([h.triggers, h.controller.isArmed(p), h.oldLifeHolds.holdOf(personaInstanceId(p))?.waiting]).toEqual([[], false, []])
+    const skipped = oldLifeWaitRefusalLine(startLiveRowSequence.name, `persona=${p}`, OLD_LIFE_HOLD_ARM_SKIPPED)
+    expect(skipped).toContain(OLD_LIFE_HOLD_SKIPPED_TIMER_PHRASE)
     expect(h.errors.filter((line) => line === oldLifeWaitNotAppliedLine(p))).toHaveLength(1)
-    expect(h.errors.filter((line) => line === oldLifeWaitRefusalLine(startLiveRowSequence.name, `persona=${p}`, false))).toHaveLength(1)
-    expect(h.errors.filter((line) => line === oldLifeWaitRefusalLine(startLiveRowSequence.name, `persona=${p}`, true))).toEqual([])
+    expect(h.errors.filter((line) => line === skipped)).toHaveLength(1)
+    expect(h.errors.indexOf(oldLifeWaitNotAppliedLine(p))).toBeLessThan(h.errors.indexOf(skipped))
+    const others = [true, false].map((armed) => oldLifeWaitRefusalLine(startLiveRowSequence.name, `persona=${p}`, armed))
+    expect(h.errors.filter((line) => others.includes(line))).toEqual([])
     expect(getFailureCount(p)).toBe(0)
     await release()
+  })
+
+  // b.jg5 SRJ-811, SRJ-1014: an arm asked for and not made (the controller
+  // answers false) reads as a failure, never as the skip.
+  test('P applied while a wait runs on its own row, its arm asked for and not made: the start entry answers already-running and its refusal line says the timer could not be armed, never the skip phrase', async () => {
+    const { h, p, release } = await waitOnOwnRow()
+    const arm = spyOn(h.controller, 'arm').mockReturnValue(false)
+    try {
+      expect(startLiveRowSequence(h.sequenceRequest(p, { lastReadState: 'waiting' }))).toBe(LIVE_ROW_START_ALREADY_RUNNING)
+    } finally {
+      arm.mockRestore()
+    }
+
+    const failed = oldLifeWaitRefusalLine(startLiveRowSequence.name, `persona=${p}`, false)
+    expect(failed).not.toContain(OLD_LIFE_HOLD_SKIPPED_TIMER_PHRASE)
+    expect(h.errors.filter((line) => line === failed)).toHaveLength(1)
+    const others = ([true, OLD_LIFE_HOLD_ARM_SKIPPED] as const).map((armed) => oldLifeWaitRefusalLine(startLiveRowSequence.name, `persona=${p}`, armed))
+    expect(h.errors.filter((line) => others.includes(line))).toEqual([])
+    expect([h.triggers, h.controller.isArmed(p), getFailureCount(p)]).toEqual([[{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD }], false, 0])
+    // No skip line: the step skipped nothing.
+    expect(h.errors.filter((line) => line === oldLifeWaitNotAppliedLine(p))).toEqual([])
+    // Not armed, P is armed with the old-life cause and run at once by the hold's end.
+    await expectRetriedOnceSettled(h, p, release, UNAVAILABLE_RETRY_RUN_NOW_ARMED)
   })
 
   test.each<[string, boolean]>([
@@ -29391,7 +29596,7 @@ describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the l
 
   test.each<[string, boolean]>([
     ['P applied: its timer armed with the old-life cause', true],
-    ['P no longer applied: its timer not armed, P not recorded', false],
+    ['P no longer applied: its timer not armed, P not recorded, the line naming the skip after the not-applied line', false],
   ])('reconnectMcpWithCause for P whose own row is held (%s): no send-keys, transient, one line naming the held id; P recorded as waiting on the hold only while applied; B, not held, gets its one send-keys', async (_label, applied) => {
     const { h, p, b } = srj105Build()
     holdOldAt(h, personaInstanceId(p), p, p)
@@ -29401,13 +29606,40 @@ describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the l
     expect(await reconnectMcpWithCause(p, latchRowStateRead('waiting'))).toEqual({ outcome: 'transient' })
 
     expect(h.stub.calls.sendKeysCalls).toEqual([])
-    expect(h.errors.filter((line) => line === reconnectHeldLine(`persona=${p}`, personaInstanceId(p), applied))).toHaveLength(1)
+    // b.jg5 SRJ-810, SRJ-1014: a removed P's arm is skipped on purpose, its own line first; never an arm failure.
+    const armed = applied ? true : OLD_LIFE_HOLD_ARM_SKIPPED
+    const held = (answer: boolean | typeof OLD_LIFE_HOLD_ARM_SKIPPED): string => reconnectHeldLine(`persona=${p}`, personaInstanceId(p), answer)
+    expect(h.errors.filter((line) => line === held(armed))).toHaveLength(1)
+    expect(h.errors.filter((line) => line !== held(armed) && ([true, false, OLD_LIFE_HOLD_ARM_SKIPPED] as const).some((other) => line === held(other)))).toEqual([])
+    expect(h.errors.filter((line) => line === oldLifeWaitNotAppliedLine(p))).toHaveLength(applied ? 0 : 1)
+    if (!applied) expect(h.errors.indexOf(oldLifeWaitNotAppliedLine(p))).toBeLessThan(h.errors.indexOf(held(armed)))
     expect([h.controller.isArmed(p), getFailureCount(p)]).toEqual([applied, 0])
     // b.jg5 SRJ-810, SRJ-1512: the hold's end retries an applied P; a key outside the applied set is never recorded.
     expect(h.oldLifeHolds.holdOf(personaInstanceId(p))?.waiting).toEqual(applied ? [p] : [])
 
     expect(await reconnectMcpWithCause(b, latchRowStateRead('waiting'))).toEqual({ outcome: 'ok' })
     expect(h.stub.calls.sendKeysCalls.map((params) => params.claude_instance_id)).toEqual([personaInstanceId(b)])
+  })
+
+  // b.jg5 SRJ-810, SRJ-1014: an arm asked for and not made (the controller
+  // answers false) reads as a failure, never as the skip.
+  test('reconnectMcpWithCause for P applied whose own row is held, its arm asked for and not made: no send-keys, transient; its one line says the timer could not be armed, never the skip phrase', async () => {
+    const { h, p } = srj105Build()
+    holdOldAt(h, personaInstanceId(p), p, p)
+    const arm = spyOn(h.controller, 'arm').mockReturnValue(false)
+    try {
+      expect(await reconnectMcpWithCause(p, latchRowStateRead('waiting'))).toEqual({ outcome: 'transient' })
+    } finally {
+      arm.mockRestore()
+    }
+
+    expect(h.stub.calls.sendKeysCalls).toEqual([])
+    const failed = reconnectHeldLine(`persona=${p}`, personaInstanceId(p), false)
+    expect(failed).not.toContain(OLD_LIFE_HOLD_SKIPPED_TIMER_PHRASE)
+    expect(h.errors.filter((line) => line === failed)).toHaveLength(1)
+    const others = ([true, OLD_LIFE_HOLD_ARM_SKIPPED] as const).map((armed) => reconnectHeldLine(`persona=${p}`, personaInstanceId(p), armed))
+    expect(h.errors.filter((line) => others.includes(line))).toEqual([])
+    expect([h.controller.isArmed(p), getFailureCount(p), h.oldLifeHolds.holdOf(personaInstanceId(p))?.waiting]).toEqual([false, 0, [p]])
   })
 
   test('the held-directory query: every hold on a directory by real path, in begin order, with the first hold\'s real path; undefined for a directory not held', () => {
@@ -30218,7 +30450,7 @@ const PLAIN_SPAWN_ROWS: readonly PlainSpawnRow[] = [
 
 /** The lines `plainSpawnCollisionLine` writes for persona `key` (any spawn), re-running get-then-act (`rerun`) or answering `retrying` with the timer armed. */
 function plainSpawnCollisionLinesOf(h: RecoveryHarness, key: string, rerun: boolean): string[] {
-  const [head, tail] = plainSpawnCollisionLine('\u0000', renderPersonaRef(key, key), rerun, true).split('\u0000') as [string, string]
+  const [head, tail] = lineParts((hole) => plainSpawnCollisionLine(hole, renderPersonaRef(key, key), rerun, true)) as [string, string]
   return h.errors.filter((line) => line.startsWith(head) && line.endsWith(tail))
 }
 
@@ -31657,7 +31889,7 @@ function recheckRoundCalls(order: readonly string[]): string[] {
 
 /** The re-check round lines logged for persona `key` (`latchRecheckRoundLine`: one per round). */
 function recheckRoundLinesOf(h: RecoveryHarness, key: string): string[] {
-  const head = latchRecheckRoundLine(renderPersonaRef(key, key), '\u0000' as LatchCase, RECHECK_STEP_TABLE, '', '').split('\u0000')[0]!
+  const [head] = lineParts((hole) => latchRecheckRoundLine(renderPersonaRef(key, key), hole as LatchCase, RECHECK_STEP_TABLE, '', '')) as [string]
   return h.errors.filter((line) => line.startsWith(head))
 }
 
@@ -32499,14 +32731,14 @@ describe('b.jg5 SRJ-502 (E16): a launch whose persona was latched elsewhere duri
     return h.latch.record(p)!
   }
 
-  /** `latchedElsewhereDuringCall`'s line for persona `key` at `site`'s call `what`, refused with `err`. */
+  /** `latchedElsewhereDuringCall`'s line for persona `key` at `site`'s call `what`, refused with `err` (described with agent-director's reported name, b.jg5 SRJ-1014). */
   const elsewhereLine = (site: string, what: string, key: string, err: Error): string =>
-    latchedElsewhereDuringCallLine(site, what, renderPersonaRef(key, key), describeAgentDirectorFailure(err))
+    latchedElsewhereDuringCallLine(site, what, renderPersonaRef(key, key), describeAdFailureForLog(err))
 
   /** Every `latchedElsewhereDuringCall` line logged for persona `key`, whatever its site, call or failure. */
   const elsewhereLines = (h: RecoveryHarness, key: string): string[] => {
     // The builder's own words around marker arguments: "<site>: <what> refused for <ref>: <failure> — …".
-    const [, , refused, tail] = latchedElsewhereDuringCallLine('\u0000', '\u0000', renderPersonaRef(key, key), '\u0000').split('\u0000')
+    const [, , refused, tail] = lineParts((hole) => latchedElsewhereDuringCallLine(hole, hole, renderPersonaRef(key, key), hole))
     return h.errors.filter((line) => line.includes(refused!) && line.endsWith(tail!))
   }
 

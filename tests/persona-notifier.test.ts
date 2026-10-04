@@ -1124,23 +1124,28 @@ describe('the persona teardown window: every notice for the key is a log line an
   // b.jg5 SRJ-1002, SRJ-1003, SRJ-1013: each kind of notice the notifier
   // carries, raised once in A's window, while B beside it (no window) gets the
   // same notice: A's is one line and one entry of its class, never posted and
-  // its failure callback never called; B's is posted to its destination.
-  test.each<[string, () => PersonaNoticeOptions | undefined, string]>([
-    ['a plain notice', () => undefined, PERSONA_TEARDOWN_NOTICE_LABEL],
-    ['a notice with a failure callback', () => ({ onPostFailure: () => { throw new Error('the failure callback ran') } }), PERSONA_TEARDOWN_NOTICE_LABEL],
-    ['the kill-failure alert\'s survivor version', () => ({ teardownEntryClass: PERSONA_KILL_SURVIVOR_LABEL }), PERSONA_KILL_SURVIVOR_LABEL],
-    ['an outage onset', () => onset('ad-unreachable'), PERSONA_TEARDOWN_NOTICE_LABEL],
-    ['the onset of an outage a submitted teardown mutes (ad-config-malformed)', () => onset(...(PERSONA_NOTICE_SUBMIT_MUTED_OUTAGE_CLASSES as OutageClass[])), PERSONA_TEARDOWN_NOTICE_LABEL],
-    ['an outage all-clear', () => allClear('tmux-unavailable'), PERSONA_TEARDOWN_NOTICE_LABEL],
-  ])('%s raised in A\'s window: one line and one entry of its class for A, no Slack call or hold for A; B beside it, with no window, gets it posted', async (_kind, options, classLabel) => {
+  // its failure callback never called; B's is posted to its destination. In
+  // the failure-callback row A's every post fails, so a post made inside the
+  // window would run the callback (recorded in `called`).
+  test.each<[string, (called: string[]) => PersonaNoticeOptions | undefined, string, boolean]>([
+    ['a plain notice', () => undefined, PERSONA_TEARDOWN_NOTICE_LABEL, false],
+    ['a notice with a failure callback, A\'s posts failing', (called) => ({ onPostFailure: () => { called.push('the failure callback ran') } }), PERSONA_TEARDOWN_NOTICE_LABEL, true],
+    ['the kill-failure alert\'s survivor version', () => ({ teardownEntryClass: PERSONA_KILL_SURVIVOR_LABEL }), PERSONA_KILL_SURVIVOR_LABEL, false],
+    ['an outage onset', () => onset('ad-unreachable'), PERSONA_TEARDOWN_NOTICE_LABEL, false],
+    ['the onset of an outage a submitted teardown mutes (ad-config-malformed)', () => onset(...(PERSONA_NOTICE_SUBMIT_MUTED_OUTAGE_CLASSES as OutageClass[])), PERSONA_TEARDOWN_NOTICE_LABEL, false],
+    ['an outage all-clear', () => allClear('tmux-unavailable'), PERSONA_TEARDOWN_NOTICE_LABEL, false],
+  ])('%s raised in A\'s window: one line and one entry of its class for A, no Slack call or hold for A; B beside it, with no window, gets it posted', async (_kind, options, classLabel, failA) => {
     for (const p of [f.A, f.B]) h.validate(p.key)
+    if (failA) failAlways(h.stub(f.A.key).script.post, { kind: 'platform', error: 'invalid_blocks' })
     const text = 'a notice of this kind\n  detail'
+    const called: string[] = []
 
     await h.duringTeardown(f.A, async () => {
-      await h.notifier.notify(f.A.key, text, options())
-      await h.notifier.notify(f.B.key, text, options())
+      await h.notifier.notify(f.A.key, text, options(called))
+      await h.notifier.notify(f.B.key, text, options(called))
     })
 
+    expect(called).toEqual([])
     expect(h.startupEntries()).toEqual([teardownNoticeEntry(f.A, text, PERSONA_TEARDOWN_NOTICE_RAISED, classLabel)])
     expect(h.logs).toEqual([windowLine(f.A, text, classLabel)])
     expect(h.stub(f.A.key).callLog).toEqual([])

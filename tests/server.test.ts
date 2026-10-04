@@ -237,6 +237,8 @@ import {
   promptRowSweepFinishedLine,
   pendingRowRuleAlreadyRanLine,
   pendingRowRuleNotInstalledLine,
+  PERSONA_KILL_STOP_CAUSE_RECHECK,
+  personaKillStoppedNoAlertsLine,
   type DeadEvidenceSource,
   type EscalateDeadVerdict,
 } from '../src/session-manager.ts'
@@ -322,6 +324,7 @@ import {
   type KillOutcome,
 } from '../src/checked-kill.ts'
 import {
+  KILL_RETRY_ALERT_NONE,
   KILL_RETRY_ALERT_ORDINARY,
   KILL_RETRY_END_SETTLED,
   KILL_RETRY_NEXT_NOT_LIVE,
@@ -381,6 +384,7 @@ import {
   writeCredentialsFile,
 } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import { lineParts } from './test-helpers/line-parts.ts'
 import {
   IDLE_PANE,
   PERMISSION_PANE,
@@ -1909,7 +1913,7 @@ describe('_buildReconnectSessionAdapter', () => {
     expect(sendKeysCalls).toEqual([])
     expect(readPaneCalls).toEqual([])
     expect(findMissingCalls).toHaveLength(0)
-    expect(lines).toEqual([reconnectStatusCheckFailedLine('C1', describeThrownValue(statusError))])
+    expect(lines).toEqual([reconnectStatusCheckFailedLine('C1', describeAdFailureForLog(statusError))])
   })
 
   // b.jg5 SRJ-115, SRJ-316: a CONFIG answer at the state read is the same
@@ -1925,7 +1929,7 @@ describe('_buildReconnectSessionAdapter', () => {
     expect(findMissingCalls).toHaveLength(0)
     expect([...getOutageFlags('C1')]).toEqual(['ad-config-malformed'])
     const lines = stringLines(errArgs)
-    expect(lines.filter((l) => l === reconnectStatusCheckFailedLine('C1', describeThrownValue(statusError)))).toHaveLength(1)
+    expect(lines.filter((l) => l === reconnectStatusCheckFailedLine('C1', describeAdFailureForLog(statusError)))).toHaveLength(1)
     expect(lines.filter((l) => l.includes('ad-config-malformed raised for persona=C1'))).toHaveLength(1)
     expect(lines).toHaveLength(2)
     assertNoLeak({ errArgs })
@@ -2881,7 +2885,7 @@ describe('_buildReconnectSessionAdapter', () => {
 
     /** The reconnect's latch line for C1 (`build` given the latch's outcome text), matched whole around that text. */
     const reconnectLatchLines = (lines: readonly string[], build: (outcome: string) => string): string[] => {
-      const [head, tail] = build('\u0000').split('\u0000') as [string, string]
+      const [head, tail] = lineParts(build) as [string, string]
       return lines.filter((l) => l.startsWith(head) && l.endsWith(tail))
     }
 
@@ -5241,7 +5245,7 @@ describe('b.jg5 SRJ-409, SRJ-411: the reconnect adapter\'s pending branch and de
   test.each<[string, (h: RecoveryHarness, key: string) => RecoveryStubScript, (key: string, scripted: RecoveryStubScript) => string]>([
     ['reads the row waiting', (h, key) => ({ getResult: personaRow(h, key) }), (key, scripted) => deferralNotPendingLine(key, scripted.getResult!.state)],
     ['answers ErrSpawnNotFound', () => ({ getError: errSpawnNotFound() }), (key) => deferralNoRowLine(key)],
-    ['is refused (UNAVAILABLE)', () => ({ getError: unavailableAt('get') }), (key, scripted) => deferralRefusedLine(key, describeThrownValue(scripted.getError))],
+    ['is refused (UNAVAILABLE)', () => ({ getError: unavailableAt('get') }), (key, scripted) => deferralRefusedLine(key, describeAdFailureForLog(scripted.getError))],
   ])('deferPendingRow, P\'s get %s: pending; one line saying so after the deferral line; nothing armed, started or typed', async (_label, script, said) => {
     const { h, p } = pendingP(SAMPLE_LAUNCH_START_WHOLE)
     const scripted = script(h, p)
@@ -6017,7 +6021,7 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
       expect(statusCalls).toEqual([])
     })
 
-    test('the re-check decides that the server stops → exactly one re-check and one stop; the outcome carries the stop; nothing armed, reported or latched; one kill, one outcome line, no status read', async () => {
+    test('the re-check decides that the server stops → exactly one re-check and one stop; the outcome carries the stop; nothing armed, reported or latched; one kill, one outcome line, then the stopped retry\'s no-alerts line; no status read', async () => {
       installRecheck({ version: OLD_AD_VERSION })
       const err = errInvalidFlags('kill')
       install(err)
@@ -6029,7 +6033,19 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
       expect(killOutcomeStopsServer(result)).toBe(true)
       expect(notKilled(result)).toMatchObject({ errorClass: AD_ERROR_CLASS_UNCLASSIFIED, error: err, recheck: RECHECK_OUTCOME_STOP })
       expect(killCalls).toHaveLength(1)
-      expect(stringLines(errArgs).filter((l) => l.includes('killSession (restart adapter)'))).toEqual(killLines(result as KillOutcome))
+      // b.jg5 SRJ-702, SRJ-704: no alerts are installed, so the stopped retry's
+      // `none` decision is recorded by its one stop line.
+      expect(stringLines(errArgs).filter((l) => l.includes('killSession (restart adapter)'))).toEqual([
+        ...killLines(result as KillOutcome),
+        personaKillStoppedNoAlertsLine(
+          'killSession (restart adapter)',
+          'persona=C1',
+          { kind: KILL_RETRY_ALERT_NONE },
+          AD_ERROR_CLASS_UNCLASSIFIED,
+          PERSONA_KILL_STOP_CAUSE_RECHECK,
+        ),
+      ])
+      assertNoLeak({ errArgs })
       expect(triggers).toEqual([])
       expect(reports).toEqual([])
       expect(latch.isLatched('C1')).toBe(false)

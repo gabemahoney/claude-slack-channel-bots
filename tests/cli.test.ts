@@ -246,8 +246,7 @@ import {
   KILL_RETRY_SPACING_MS,
   KILL_RETRY_TRIES,
   KILL_RETRY_END_ROW_FINISHED,
-  KILL_RETRY_NEXT_NOT_LIVE,
-  KILL_RETRY_NEXT_SUCCESS,
+  KILL_RETRY_NEXT_AGAIN,
   KILL_RETRY_VERDICT_FINISHED,
   KILL_RETRY_VERDICT_GO,
   killRetryEndLine,
@@ -3640,12 +3639,26 @@ const KILL_SURVIVOR_ROWS: ReadonlyArray<readonly [string, () => KillCase]> = [
  * (the failure line, followed by the ordinary alert when `kc.alert` is set;
  * or, when stopped, the survivor version when `kc.survivor` is set, else
  * nothing), the exit, a state directory unchanged but for the report's two
- * log files, and no leak.
+ * log files, and no leak. The CLI builds no Slack client and makes no Slack
+ * call while the teardown runs (b.jg5 SRJ-1002, SRJ-909; AC 64): a Web API
+ * call or a Socket Mode start throws, and neither is made.
  */
 async function runKillCase(command: CliTeardownCommand, [, mk, run]: Command, overrides: () => Overrides, kc: KillCase): Promise<Bundle> {
   const b = mk(killCaseOverrides(overrides(), kc))
   const before = snapshotTreeExceptTeardownLogs() // after make, so the PID file is in it
-  await run(b)
+  const apiCall = spyOn(WebClient.prototype, 'apiCall').mockImplementation(() => {
+    throw new Error('the CLI teardown made a Slack Web API call')
+  })
+  const socketStart = spyOn(SocketModeClient.prototype, 'start').mockImplementation(() => {
+    throw new Error('the CLI teardown started Socket Mode')
+  })
+  try {
+    await run(b)
+    expect([apiCall.mock.calls.length, socketStart.mock.calls.length]).toEqual([0, 0])
+  } finally {
+    apiCall.mockRestore()
+    socketStart.mockRestore()
+  }
   expectKillTries(b, kc.calls)
   if (kc.fails === null) {
     expectTeardownStopped(b, command, kc.survivor === undefined ? [] : [survivorReport(command, OPS_PERSONA, kc.survivor)])
@@ -3797,39 +3810,11 @@ describe('the teardown\'s kill by class (b.jg5 SRJ-904, SRJ-702, SRJ-110; AC 64,
 
     const firstOutcome = killOutcomeOf({ thrown: first }, TEARDOWN_KILL_OPTIONS)
     const lines = opsKillRetryLines()
-    // The first try is tried again: what follows it has no exported value,
-    // so its line is the builder's head for that outcome (shared by every
-    // exported form) and none of those forms.
-    const forms = ([KILL_RETRY_NEXT_SUCCESS, KILL_RETRY_NEXT_NOT_RETRIED, KILL_RETRY_NEXT_NOT_LIVE] as const).map((next) => killRetryTryLine(opsKillLogPrefix(), opsId(), 1, KILL_RETRY_TRIES, firstOutcome, next))
-    let shared = 0
-    while (shared < forms[0]!.length && forms.every((form) => form[shared] === forms[0]![shared])) shared++
-    expect([lines[0]!.startsWith(forms[0]!.slice(0, shared)), forms.includes(lines[0]!)]).toEqual([true, false])
-    expect(lines.slice(1)).toEqual(expected)
+    // The first try is tried again (KILL_RETRY_NEXT_AGAIN).
+    expect(lines).toEqual([killRetryTryLine(opsKillLogPrefix(), opsId(), 1, KILL_RETRY_TRIES, firstOutcome, KILL_RETRY_NEXT_AGAIN), ...expected])
     expect(lines.filter((line) => line.includes(REDACTED_SENTINEL_TAIL))).toHaveLength(redacted)
     expect(lines[0]).toContain(REDACTED_SENTINEL_TAIL)
     assertNoLeak({ lines })
-  })
-
-  // b.jg5 SRJ-1002, SRJ-909 (AC 64): a CONFLICT or an UNUSABLE NAME at the
-  // CLI's kill is printed, logged and recorded (runKillCase checks the
-  // three and the unchanged state directory: no latch, no record), and the
-  // CLI builds no Slack client and makes no Slack call: no Web API call and
-  // no Socket Mode start while the teardown runs.
-  test.each(forEachKillPath<{ error: unknown; errorClass: AdErrorClass }>([
-    ['CONFLICT (not this launch\'s session)', () => ({ error: errTmuxSessionConflict(KILL_VERB, 'not-this-launch', opsSession()), errorClass: AD_ERROR_CLASS_CONFLICT })],
-    ['UNUSABLE NAME', () => ({ error: errUnusableName(), errorClass: AD_ERROR_CLASS_UNUSABLE_NAME })],
-  ], 'a kill answering '))('%s: %s: printed, logged and recorded as cli-teardown-failed; no Slack call of any kind', async (command, _label, { overrides, make }, cmd) => {
-    const { error, errorClass } = make()
-    const apiCall = spyOn(WebClient.prototype, 'apiCall')
-    const socketStart = spyOn(SocketModeClient.prototype, 'start')
-    try {
-      await runKillCase(command, cmd, overrides, { kills: [thrown(error)], calls: [1, 0], fails: [error, errorClass] })
-      expect(startupErrorEntries().map((entry) => entry.classLabel)).toEqual([CLI_TEARDOWN_FAILED_LABEL])
-      expect([apiCall.mock.calls.length, socketStart.mock.calls.length]).toEqual([0, 0])
-    } finally {
-      apiCall.mockRestore()
-      socketStart.mockRestore()
-    }
   })
 
   // Hatch note E24: the reads between tries are SRJ-115 sites; the CLI never writes retired-keys.json (SRJ-801).

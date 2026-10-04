@@ -714,7 +714,9 @@ import {
   latchRecheckUnmatchedLine,
   latchedLaunchSkipLine,
   latchOnRestartKillOutcome,
+  latchEntryQueryFailedLine,
   readPersonaOwnPane,
+  setStuckLaunchEpisodes,
   COLLISION_GET_SITE,
   _resetConfigDirFs,
   _resetConfiguredPersonaQuery,
@@ -856,6 +858,7 @@ import {
   sentinelInMessage,
 } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import { builtAround, lineParts } from './test-helpers/line-parts.ts'
 import { PRE_PERSONA_ID, PRE_PERSONA_LABELS, holdOldAt } from './test-helpers/old-life.ts'
 import { posts } from './test-helpers/permission-relay-harness.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
@@ -2723,21 +2726,56 @@ describe('SRJ-1002: a CONFLICT or an UNUSABLE NAME met for a persona no longer i
     expect([h.notices, h.startupErrors()]).toEqual([[], []])
   })
 
-  test.each(NOT_CONFIGURED_ENTRIES.flatMap(([entry, run, conflictRow]) => [
-    [entry, 'no configured-persona query installed', run, conflictRow, () => _resetConfiguredPersonaQuery()],
-    [entry, 'a configured-persona query that throws', run, conflictRow, () => setConfiguredPersonaQuery(() => { throw new Error('the query broke') })],
-  ] as const))('%s with %s: a removed P latches as a configured persona would, with one post and no not-configured line', async (_entry, _query, run, conflictRow, install) => {
+  // b.jg5 SRJ-1002: a throwing query latches as a configured persona, with
+  // one line naming the persona and the thrown value (`latchEntryQueryFailedLine`).
+  const QUERY_BROKE = new Error('the query broke')
+  test.each(NOT_CONFIGURED_ENTRIES.flatMap(([entry, run, conflictRow, unusableRow]) => [
+    [entry, 'a CONFLICT', 'no configured-persona query installed', run, conflictRow, () => _resetConfiguredPersonaQuery(), 0],
+    [entry, 'a CONFLICT', 'a configured-persona query that throws', run, conflictRow, () => setConfiguredPersonaQuery(() => { throw QUERY_BROKE }), 1],
+    [entry, 'an UNUSABLE NAME', 'a configured-persona query that throws', run, unusableRow, () => setConfiguredPersonaQuery(() => { throw QUERY_BROKE }), 1],
+  ] as const))('%s meeting %s with %s: a removed P latches as a configured persona would, with one post and no not-configured line; a throwing query logs its one query-failed line', async (_entry, _answer, _query, run, row, install, queryFailedLines) => {
     const h = makeRecoveryHarness()
     harnesses.push(h)
     const [p] = h.keys as [string]
     h.remove(p)
     install()
 
-    await run(h, p, conflictRow().build())
+    await run(h, p, row().build())
 
-    expect(h.latch.record(p)?.latchCase).toBe(conflictRow().latchCase)
+    expect(h.latch.record(p)?.latchCase).toBe(row().latchCase)
     expect(h.episodeNotices.map((notice) => notice.key)).toEqual([p])
-    expect(h.errors.filter((line) => line.includes(notConfiguredLatchOutcome(conflictRow().latchCase, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY)))).toEqual([])
+    expect(h.errors.filter((line) => line.includes(notConfiguredLatchOutcome(row().latchCase, row().refusedOperation)))).toEqual([])
+    expect(h.errors.filter((line) => line === latchEntryQueryFailedLine(p, describeThrownValue(QUERY_BROKE)))).toHaveLength(queryFailedLines)
+  })
+
+  // b.jg5 SRJ-1002, SRJ-1003: the guard reads P's teardown window through the
+  // installed notice episodes (`setStuckLaunchEpisodes`; here real episodes
+  // whose teardown query answers `window`). Inside an open window a removed P
+  // latches as a configured persona (its notice goes through the latch's
+  // episodes; the persona notifier's window routing is
+  // tests/persona-lifecycle.test.ts's); a window only `submitted` is not
+  // open, so P is routed log-only as with none.
+  test.each(NOT_CONFIGURED_ENTRIES.flatMap(([entry, run, conflictRow, unusableRow]) =>
+    (['open', 'submitted'] as const).flatMap((window) => [
+      [entry, 'a CONFLICT', window, run, conflictRow],
+      [entry, 'an UNUSABLE NAME', window, run, unusableRow],
+    ] as const),
+  ))('%s meeting %s for a removed P whose teardown window is %s: latched with one post only while the window is open, else the one not-configured line', async (_entry, _answer, window, run, row) => {
+    const h = makeRecoveryHarness()
+    harnesses.push(h)
+    const [p] = h.keys as [string]
+    h.remove(p)
+    const windowSinkPosts: string[] = []
+    const windowClock = createFakeClock()
+    setStuckLaunchEpisodes(createPersonaEpisodes({ sink: (key) => void windowSinkPosts.push(key), log: () => {}, clock: windowClock, teardownWindow: () => window }))
+
+    await run(h, p, row().build())
+
+    const open = window === 'open'
+    expect(h.latch.record(p)?.latchCase).toBe(open ? row().latchCase : undefined)
+    expect(h.episodeNotices.map((notice) => notice.key)).toEqual(open ? [p] : [])
+    expect(h.errors.filter((line) => line.includes(notConfiguredLatchOutcome(row().latchCase, row().refusedOperation)))).toHaveLength(open ? 0 : 1)
+    expect([windowSinkPosts, windowClock.pendingCount(), h.startupErrors()]).toEqual([[], 0, []])
   })
 })
 
@@ -5927,21 +5965,9 @@ function recheckSite(): string {
   return probe.slice(probe.indexOf(' ') + 1, probe.indexOf(': REF'))
 }
 
-/**
- * The lines `build` makes whatever it is given as its one open part (a label
- * the session manager does not export, such as the launch a line names): a
- * pattern of the builder's own text before and after that part.
- */
-function builtAround(build: (hole: string) => string): RegExp {
-  const hole = '\u0000'
-  const [head, tail] = build(hole).split(hole) as [string, string]
-  const quote = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  return new RegExp(`^${quote(head)}.*${quote(tail)}$`)
-}
-
 /** Persona `key`'s re-check round lines in `h` (`latchRecheckRoundLine`, one per round), in order. */
 function roundLinesOf(h: RecoveryHarness, key: string): string[] {
-  const head = latchRecheckRoundLine(personaRefOf(h, key), '\u0000' as LatchCase, RECHECK_STEP_TABLE, RECHECK_CALL_NONE, '').split('\u0000')[0]!
+  const [head] = lineParts((hole) => latchRecheckRoundLine(personaRefOf(h, key), hole as LatchCase, RECHECK_STEP_TABLE, RECHECK_CALL_NONE, ''))
   return h.errors.filter((line) => line.startsWith(head))
 }
 
@@ -7161,7 +7187,7 @@ describe('the exported after-clear sequence (runLatchClearSequence) and the buil
   // The sequence's three failure lines, from their builders; `persona=<key>`
   // is the session manager's key-only reference (not exported).
   /** The after-clear sequence's lines: their head is its builders' (`latchClearNotAppliedLine`'s, up to the persona reference). */
-  const latchClearHead = latchClearNotAppliedLine('\u0000').split('\u0000')[0]!
+  const [latchClearHead] = lineParts((hole) => latchClearNotAppliedLine(hole))
   const latchClearLinesIn = (h: RecoveryHarness): string[] => h.errors.filter((line) => line.startsWith(latchClearHead))
   const notRunInTurnLine = (key: string, thrown: unknown): string => latchClearNotRunInTurnLine(`persona=${key}`, describeThrownValue(thrown))
   const clearFailedLine = (key: string, thrown: unknown): string => latchClearClearFailedLine(`persona=${key}`, describeThrownValue(thrown))
