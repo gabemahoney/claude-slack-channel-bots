@@ -45,8 +45,20 @@
  *     `LAUNCH_TIMEOUT_PHRASE`, in the `ErrTmuxUnresponsive` form;
  *   - `isDifferentTmuxServerError` holds for a client-built
  *     `ErrTmuxNotAvailable` carrying `DIFFERENT_TMUX_SERVER_PHRASE`.
- * Every description, phrase, class label and Phase-1-only name is taken from
- * the package's own modules, never written here.
+ * Every description, phrase, class label, verb and Phase-1-only name is taken
+ * from the package's own modules, never written here; each Phase-1-only name
+ * is also the name of its export (by design), so the checker reads the
+ * package's export by that name.
+ *
+ * What it does not check: the client decodes a binary's error envelope with
+ * its internal `throwFromEnvelope`, over a map built from the client's
+ * bundled error-name catalog (`catalog.json`) intersected with its exports.
+ * That map is a separate table from `errorFromEnvelope`'s own, and neither
+ * the map nor the catalog is exported (the catalog is inlined in the
+ * client's bundle). So a client whose catalog lacked one of the three
+ * Phase-1-only names would deliver that error from a real binary as
+ * `ErrUnknownErrorName`, and this check would still pass. Proving the binary
+ * path takes a real binary run, which this check never makes.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -130,9 +142,6 @@ const SRJ103_CLIENT_EXPORTS = ['ErrTmuxSendKeys', 'ErrTmuxCaptureFailed', 'ErrTm
 /** The client's re-bound-socket error class, by export name. */
 const TMUX_NOT_AVAILABLE_EXPORT = 'ErrTmuxNotAvailable'
 
-/** The verb the client-built CONFLICT, launch timeout and re-bound-socket error carry. */
-const LAUNCH_VERB = 'spawn'
-
 type AnyFunction = (...args: never[]) => unknown
 
 /** `value` as a function, or undefined. */
@@ -143,6 +152,17 @@ function asFunction(value: unknown): AnyFunction | undefined {
 /** `value` as a string, or undefined. */
 function asString(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined
+}
+
+/** The first string in `value` when it is a non-empty set of strings (the package's `AD_LAUNCH_VERBS`), or undefined. */
+function firstOfStringSet(value: unknown): string | undefined {
+  try {
+    if (!(value instanceof Set) || value.size === 0) return undefined
+    const members = [...value]
+    return members.every((m) => typeof m === 'string') ? (members[0] as string) : undefined
+  } catch {
+    return undefined
+  }
 }
 
 /** `ns[name]`, or undefined when the read throws. */
@@ -205,6 +225,8 @@ export function checkPhase1Client(modules: Phase1ClientCheckModules): Phase1Clie
   const launchTimeoutFormOf = need(errorClass, 'ad-error-class', 'launchTimeoutFormOf', asFunction, 'function')
   const isDifferentTmuxServerError = need(errorClass, 'ad-error-class', 'isDifferentTmuxServerError', asFunction, 'function')
   const killVerb = need(errorClass, 'ad-error-class', 'AD_VERB_KILL', asString, 'string')
+  // The verb the client-built CONFLICT, launch timeout and re-bound-socket error carry: one of the package's launch verbs.
+  const launchVerb = need(errorClass, 'ad-error-class', 'AD_LAUNCH_VERBS', firstOfStringSet, 'non-empty string set')
   const conflictPhrase = need(phrases, 'ad-description-phrases', 'CONFLICT_NOT_THIS_LAUNCH_PHRASE', asString, 'string')
   const retryKillLaterPhrase = need(phrases, 'ad-description-phrases', 'RETRY_KILL_LATER_PHRASE', asString, 'string')
   const launchTimeoutPhrase = need(phrases, 'ad-description-phrases', 'LAUNCH_TIMEOUT_PHRASE', asString, 'string')
@@ -270,8 +292,8 @@ export function checkPhase1Client(modules: Phase1ClientCheckModules): Phase1Clie
   }
 
   // ErrTmuxSessionConflict: CONFLICT, its description read by conflictDescriptionOf.
-  if (conflictName !== undefined && conflictPhrase !== undefined) {
-    const built = build(LAUNCH_VERB, conflictName, 'ErrTmuxSessionConflict', conflictPhrase)
+  if (conflictName !== undefined && conflictPhrase !== undefined && launchVerb !== undefined) {
+    const built = build(launchVerb, conflictName, conflictName, conflictPhrase)
     if (built !== undefined) {
       classifies(built, conflictName, conflictLabel)
       if (conflictDescriptionOf !== undefined) {
@@ -285,7 +307,7 @@ export function checkPhase1Client(modules: Phase1ClientCheckModules): Phase1Clie
 
   // ErrTmuxKillFailed: UNAVAILABLE, its description read by killFailedDescriptionOf.
   if (killFailedName !== undefined && retryKillLaterPhrase !== undefined && killVerb !== undefined) {
-    const built = build(killVerb, killFailedName, 'ErrTmuxKillFailed', retryKillLaterPhrase)
+    const built = build(killVerb, killFailedName, killFailedName, retryKillLaterPhrase)
     if (built !== undefined) {
       classifies(built, killFailedName, unavailableLabel)
       if (killFailedDescriptionOf !== undefined) {
@@ -298,22 +320,22 @@ export function checkPhase1Client(modules: Phase1ClientCheckModules): Phase1Clie
   }
 
   // ErrTmuxUnresponsive: UNAVAILABLE, and a launch timeout in its own form when it carries the phrase.
-  if (unresponsiveName !== undefined && launchTimeoutPhrase !== undefined) {
-    const built = build(LAUNCH_VERB, unresponsiveName, 'ErrTmuxUnresponsive', launchTimeoutPhrase)
+  if (unresponsiveName !== undefined && launchTimeoutPhrase !== undefined && launchVerb !== undefined) {
+    const built = build(launchVerb, unresponsiveName, unresponsiveName, launchTimeoutPhrase)
     if (built !== undefined) {
       classifies(built, unresponsiveName, unavailableLabel)
       if (launchTimeoutFormOf !== undefined && unresponsiveForm !== undefined) {
-        const form = call(launchTimeoutFormOf, [built, LAUNCH_VERB])
+        const form = call(launchTimeoutFormOf, [built, launchVerb])
         if (form.threw !== undefined || form.value !== unresponsiveForm) {
-          problem(PROBLEM_LAUNCH_TIMEOUT, `launchTimeoutFormOf(${unresponsiveName} carrying LAUNCH_TIMEOUT_PHRASE, ${LAUNCH_VERB}) answered ${form.threw ?? show(form.value)}, not ${unresponsiveForm}`)
+          problem(PROBLEM_LAUNCH_TIMEOUT, `launchTimeoutFormOf(${unresponsiveName} carrying LAUNCH_TIMEOUT_PHRASE, ${launchVerb}) answered ${form.threw ?? show(form.value)}, not ${unresponsiveForm}`)
         }
       }
     }
   }
 
   // ErrTmuxNotAvailable carrying the re-bound-socket phrase.
-  if (differentServerPhrase !== undefined && errorFromEnvelope !== undefined && isDifferentTmuxServerError !== undefined) {
-    const built = build(LAUNCH_VERB, TMUX_NOT_AVAILABLE_EXPORT, TMUX_NOT_AVAILABLE_EXPORT, differentServerPhrase)
+  if (differentServerPhrase !== undefined && errorFromEnvelope !== undefined && isDifferentTmuxServerError !== undefined && launchVerb !== undefined) {
+    const built = build(launchVerb, TMUX_NOT_AVAILABLE_EXPORT, TMUX_NOT_AVAILABLE_EXPORT, differentServerPhrase)
     if (built !== undefined) {
       const answer = call(isDifferentTmuxServerError, [built])
       if (answer.threw !== undefined || answer.value !== true) {

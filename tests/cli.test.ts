@@ -3510,6 +3510,7 @@ const FAIL_AT_ONCE_ANSWERS: ReadonlyArray<readonly [string, () => unknown, AdErr
   ['ENVIRONMENT (ErrTmuxNotAvailable, a different tmux server)', () => errTmuxNotAvailableDifferentServer(STUB_TMUX_SOCKET_PATH, KILL_VERB), AD_ERROR_CLASS_ENVIRONMENT, []],
   ...UNUSABLE_NAME_FAULTS.map((f) => [`UNUSABLE NAME (the unusable-name ErrInternal, ${f})`, () => errUnusableName(f), AD_ERROR_CLASS_UNUSABLE_NAME, []] as const),
   ['UNCLASSIFIED (a plain ErrInternal)', () => errInternal(), AD_ERROR_CLASS_UNCLASSIFIED, []],
+  ['UNCLASSIFIED (a base AgentDirectorError merely named ErrSpawnNotFound: not that class, so no success)', () => errGeneric(KILL_VERB, ERR_SPAWN_NOT_FOUND_NAME, 'row gone'), AD_ERROR_CLASS_UNCLASSIFIED, [ERR_SPAWN_NOT_FOUND_NAME]],
   [`UNCLASSIFIED (${ERR_SCHEMA_MISMATCH_NAME}, a store name)`, () => errSchemaMismatch(), AD_ERROR_CLASS_UNCLASSIFIED, [ERR_SCHEMA_MISMATCH_NAME]],
   ...STORE_OPEN_ERR_NAMES.filter((name) => name !== ERR_SCHEMA_MISMATCH_NAME)
     .map((name) => [`UNCLASSIFIED (${name}, a store name)`, () => errUnknownErrorName(name), AD_ERROR_CLASS_UNCLASSIFIED, [name]] as const),
@@ -3581,6 +3582,7 @@ const KILL_READ_ROWS: ReadonlyArray<readonly [string, () => KillCase]> = [
   ...([
     ['a read answering UNAVAILABLE (ErrCallTimeout)', () => thrown(errCallTimeout(STATUS_VERB))],
     ['a read answering UNAVAILABLE (a plain Error)', () => thrown(new Error('AD connection refused'))],
+    ['a read answering a base AgentDirectorError merely named ErrSpawnNotFound (not that class: no missing row)', () => thrown(errGeneric(STATUS_VERB, ERR_SPAWN_NOT_FOUND_NAME, 'spawn not found'))],
     ...UNUSABLE_NAME_FAULTS.map((f) => [`a read answering UNUSABLE NAME (${f})`, () => thrown(errUnusableName(f))] as const),
     ['a read answering CONFLICT', () => thrown(errTmuxSessionConflict(STATUS_VERB, 'unrecognised', opsSession()))],
     ['a read of a pending row with no launch start', () => cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE })],

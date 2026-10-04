@@ -33,10 +33,15 @@
  * interval, time limit, runbook title and the runtime phrase is imported from
  * `src/`; one case pins the interval constant to SRJ-204's 120 s.
  *
- * The floor is confirmed from the Phase 1 release candidate:
- * `PHASE1_RC_VERSION` parses as the floor with pre-release `rc.1` (SRJ-201,
- * SRJ-1304), and any `<floor>-rc.N` passes it (SRJ-202). Its confirmation
- * from the Phase 1 release itself is the Plan's Epic E51's.
+ * The floor's confirmation from the Phase 1 release candidate is external to
+ * this file: `tests/ci-live-docker.test.ts` checks that the release candidate
+ * pinned in `docker/Dockerfile.test.base` (`AD_RC_VERSION`) has
+ * `PHASE1_FLOOR_VERSION` as its major.minor.patch and passes the floor
+ * (SRJ-201, SRJ-202). Here, the `PHASE1_RC_VERSION` case (it parses as the
+ * floor with pre-release `rc.1`, SRJ-1304) guards the versions helper's
+ * shape only, since the helper builds it from the floor; and any
+ * `<floor>-rc.N` passes the floor (SRJ-202). The floor's confirmation from
+ * the Phase 1 release itself is the Plan's Epic E51's.
  *
  * The runtime re-check runs on `createFakeClock` with
  * `makeStubResolveSystemBinary` and no health check (the

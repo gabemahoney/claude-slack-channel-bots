@@ -45,8 +45,8 @@
  *   it on the host;
  * - a failed live image build is told apart by `Dockerfile.live`'s own ERROR
  *   lines (`liveBuildErrorLines`, `liveBuildFailureMessage`), never by docker's
- *   lines that quote the RUN text; no failure text, the runner's or
- *   `Dockerfile.live`'s, advises upgrading or installing the host's
+ *   lines that quote the RUN text; no failure text, in any of the runner's
+ *   `ci-live/` sources or `Dockerfile.live`, advises upgrading or installing the host's
  *   agent-director or names the install-agent-director skill;
  * - the runner waits for the boot it caused and accepts only that boot
  *   number with status `ok` (`lib/container-boot.ts`);
@@ -100,8 +100,8 @@
  * - `Dockerfile.live` pins Claude Code: one `ARG CLAUDE_CODE_VERSION=`
  *   declaration, assigned nowhere else, a plain major.minor.patch release at
  *   or above `MIN_CLAUDE_CODE_VERSION` (imported from
- *   `test-helpers/agent-director-versions.ts`) by numeric order, part by
- *   part, never string order, and its one Claude Code install is
+ *   `test-helpers/agent-director-versions.ts`) by `semver.gte`, and its one
+ *   Claude Code install is
  *   `npm install -g` at that build-arg (no unpinned or "latest" install); a
  *   pin one patch below the minimum, a missing, repeated or unparseable
  *   declaration and an unpinned install are each refused, never skipped.
@@ -2262,19 +2262,8 @@ const CLAUDE_CODE_ARG = 'CLAUDE_CODE_VERSION'
 /** The one Claude Code install Dockerfile.live may run: the pinned build-arg's version. */
 const PINNED_CLAUDE_CODE_INSTALL = `npm install -g "@anthropic-ai/claude-code@\${${CLAUDE_CODE_ARG}}"`
 
-/** A plain major.minor.patch release's parts as numbers, or null. */
-function releaseParts(version: string): [number, number, number] | null {
-  const m = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(version)
-  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null
-}
-
-/** Whether plain release `version` is at or above plain release `min`, part by part as numbers (never as strings). */
-function releaseAtLeast(version: string, min: string): boolean {
-  const [v, floor] = [releaseParts(version), releaseParts(min)]
-  if (v === null || floor === null) throw new Error(`not a plain major.minor.patch release: ${JSON.stringify(v === null ? version : min)}`)
-  for (let i = 0; i < 3; i++) if (v[i] !== floor[i]) return v[i]! > floor[i]!
-  return true
-}
+/** A plain major.minor.patch release: no pre-release, no build metadata, no range. */
+const PLAIN_RELEASE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/
 
 /**
  * What is wrong with a Dockerfile text's Claude Code pin against `min`: empty
@@ -2292,8 +2281,8 @@ function claudeCodePinProblems(text: string, min: string): string[] {
   else if (overrides.length > 0) problems.push(`${CLAUDE_CODE_ARG} is assigned outside its ARG: ${JSON.stringify(overrides.map((i) => i.slice(0, 80)))}`)
   else {
     const value = new RegExp(`^ARG\\s+${CLAUDE_CODE_ARG}=(\\S+)$`).exec(declarations[0]!)?.[1]
-    if (value === undefined || releaseParts(value) === null) problems.push(`${declarations[0]} declares no plain major.minor.patch release`)
-    else if (!releaseAtLeast(value, min)) problems.push(`${CLAUDE_CODE_ARG} ${value} is below ${min}`)
+    if (value === undefined || !PLAIN_RELEASE.test(value)) problems.push(`${declarations[0]} declares no plain major.minor.patch release`)
+    else if (!semver.gte(value, min)) problems.push(`${CLAUDE_CODE_ARG} ${value} is below ${min}`)
   }
   const installs = shellStatements(instructions.filter((i) => i.startsWith('RUN ')))
     .filter((s) => /claude-code|claude\.ai\/install|\bclaude\s+(?:install|update)\b/.test(s))
@@ -2303,9 +2292,9 @@ function claudeCodePinProblems(text: string, min: string): string[] {
 
 /** `version` one patch below, derived from it. */
 function onePatchBelow(version: string): string {
-  const parts = releaseParts(version)
-  if (parts === null || parts[2] === 0) throw new Error(`${JSON.stringify(version)} has no release one patch below it`)
-  return `${parts[0]}.${parts[1]}.${parts[2] - 1}`
+  const parsed = PLAIN_RELEASE.test(version) ? semver.parse(version) : null
+  if (parsed === null || parsed.patch === 0) throw new Error(`${JSON.stringify(version)} has no release one patch below it`)
+  return `${parsed.major}.${parsed.minor}.${parsed.patch - 1}`
 }
 
 describe("Dockerfile.live's Claude Code pin", () => {
@@ -2321,27 +2310,12 @@ describe("Dockerfile.live's Claude Code pin", () => {
   const withPin = (value: string): string => live().replace(`ARG ${CLAUDE_CODE_ARG}=${pinnedValue()}`, `ARG ${CLAUDE_CODE_ARG}=${value}`)
 
   test('Dockerfile.live declares CLAUDE_CODE_VERSION once, a plain release at or above MIN_CLAUDE_CODE_VERSION, and installs Claude Code only at it; a pin one patch below MIN_CLAUDE_CODE_VERSION is refused', () => {
-    expect(releaseParts(MIN)).not.toBeNull()
+    expect(MIN).toMatch(PLAIN_RELEASE)
     expect(claudeCodePinProblems(live(), MIN)).toEqual([])
 
-    // Negative control: one patch below the constant, derived from it, is refused, by the comparison and as Dockerfile.live's pin.
+    // Negative control: one patch below the constant, derived from it, is refused as Dockerfile.live's pin.
     const below = onePatchBelow(MIN)
-    expect(releaseAtLeast(below, MIN)).toBe(false)
     expect(claudeCodePinProblems(withPin(below), MIN)).toEqual([`${CLAUDE_CODE_ARG} ${below} is below ${MIN}`])
-  })
-
-  test('the comparison is numeric, part by part, never string order', () => {
-    const [major, minor, patch] = releaseParts(MIN)!
-    // A patch with more digits: above MIN as numbers, below it as strings.
-    const longerPatch = `${major}.${minor}.${10 ** String(patch).length}`
-    expect(longerPatch < MIN).toBe(true)
-    expect(releaseAtLeast(longerPatch, MIN)).toBe(true)
-    expect(claudeCodePinProblems(withPin(longerPatch), MIN)).toEqual([])
-    expect(releaseAtLeast(MIN, longerPatch)).toBe(false)
-    expect(releaseAtLeast(MIN, MIN)).toBe(true)
-    expect(releaseAtLeast(`${major}.${minor + 1}.0`, MIN)).toBe(true)
-    expect(releaseAtLeast(`${major + 1}.0.0`, MIN)).toBe(true)
-    expect(releaseAtLeast(`${major - 1}.${minor + 1}.${patch + 1}`, MIN)).toBe(false)
   })
 
   test.each([
@@ -2474,9 +2448,23 @@ describe("the staged binary's failure texts", () => {
     expect(liveBuildFailureMessage(17, elsewhere)).toBe('docker build of the live image failed (exit 17)')
   })
 
-  test("no failure text in the runner (container-run.ts, main.ts, ci-live/lib/) or Dockerfile.live's ERROR lines advises upgrading or installing the host's agent-director, or names the install-agent-director skill", () => {
+  test.each([
+    ['install agent-director, then rerun', 'an install or update of agent-director'],
+    ['run npm install -g agent-director on the host', 'an install or update of agent-director'],
+    ['update agent-director and rerun', 'an install or update of agent-director'],
+    ['upgrade the host binary', 'an upgrade'],
+    ['run the install-agent-director skill', 'the install-agent-director skill'],
+    ['npm pack failed: run npm install in the repo and rerun', null],
+    ['the staged agent-director binary is not the first agent-director on the image\'s PATH', null],
+  ])('upgradeAdvice(%p) is %p', (text, why) => {
+    expect(upgradeAdvice(text)).toBe(why)
+  })
+
+  test("no failure text in the runner (every ci-live source) or Dockerfile.live's ERROR lines advises upgrading or installing the host's agent-director, or names the install-agent-director skill", () => {
     const LITERAL = /'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|`(?:\\.|[^`\\])*`/g
-    const files = [join('runtime', 'container-run.ts'), 'main.ts', ...readdirSync(join(CI_LIVE, 'lib')).filter((f) => f.endsWith('.ts')).map((f) => join('lib', f))]
+    const files = runnerSources().map((p) => relative(CI_LIVE, p))
+    expect(files).toContain(join('runtime', 'container-run.ts'))
+    expect(files).toContain(join('checks', 'framework.ts'))
     const findings: string[] = []
     for (const rel of files) {
       const text = code(rel)

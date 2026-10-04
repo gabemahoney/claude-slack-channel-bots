@@ -44,8 +44,10 @@ import {
   AD_ERROR_CLASS_ENVIRONMENT,
   AD_ERROR_CLASS_GONE,
   AD_ERROR_CLASS_UNAVAILABLE,
+  AD_ERROR_CLASS_UNCLASSIFIED,
 } from '../src/ad-error-class.ts'
 import type { Phase1KillResult, Phase1StatusResult } from '../src/ad-phase1-types.ts'
+import { ERR_SPAWN_NOT_FOUND_NAME } from '../src/agent-director-errors.ts'
 import {
   KILL_OUTCOME_KILLED,
   KILL_OUTCOME_NOT_KILLED,
@@ -57,6 +59,7 @@ import {
   KILL_ROW_FINISHED_MISSING,
   KILL_ROW_FINISHED_NO_ROW,
   checkedKill,
+  describeKillOutcome,
   killOutcomeOf,
   type AnyKillOutcome,
   type CheckedKillOptions,
@@ -125,6 +128,7 @@ import {
   cannedStatusResult,
   errCallTimeout,
   errConfigMalformed,
+  errGeneric,
   errInternal,
   errSpawnNotFound,
   errTmuxCaptureFailed,
@@ -428,6 +432,7 @@ describe('runKillRetry: only UNAVAILABLE of a row last read live is tried again 
     ['ErrTmuxNotAvailable (ENVIRONMENT)', () => errTmuxNotAvailable(undefined, 'kill'), KILL_OUTCOME_NOT_KILLED, AD_ERROR_CLASS_ENVIRONMENT],
     ['ErrInternal (UNCLASSIFIED)', () => errInternal(), KILL_OUTCOME_NOT_KILLED, undefined],
     ['ErrSpawnNotFound (the row-gone success)', () => errSpawnNotFound(), KILL_OUTCOME_ROW_GONE, undefined],
+    ['a base AgentDirectorError merely named ErrSpawnNotFound (not that class: no success, UNCLASSIFIED)', () => errGeneric('kill', ERR_SPAWN_NOT_FOUND_NAME, 'row gone'), KILL_OUTCOME_NOT_KILLED, AD_ERROR_CLASS_UNCLASSIFIED],
     ['GONE (the session-gone success)', () => errTmuxCaptureFailed(undefined, 'kill'), KILL_OUTCOME_SESSION_GONE, undefined],
   ])('%s at the first try: one kill, no read, no wait; its outcome stands', async (_label, make, kind, errorClass) => {
     const err = make()
@@ -503,6 +508,7 @@ describe('runKillRetry: one status read before each further try (b.jg5 SRJ-702, 
     ['UNAVAILABLE (ErrCallTimeout)', errCallTimeout('status')],
     ['UNCLASSIFIED (ErrInternal), a fake token in its description', errInternal(`the store could not be read (${sentinelInMessage('read-unclassified')})`)],
     ['UNUSABLE NAME that latched nothing', errUnusableName()],
+    ['UNCLASSIFIED (a base AgentDirectorError merely named ErrSpawnNotFound: not that class, no missing row)', errGeneric('status', ERR_SPAWN_NOT_FOUND_NAME, 'spawn not found')],
     ['CONFLICT, a fake token in its quoted session', errTmuxSessionConflict('status', 'unrecognised', sentinelInMessage('read-conflict'))],
   ])('a failed read (%s) lets the next try go ahead; each read line names it and that the try goes ahead', async (_label, readErr) => {
     const r = await run({ kills: failing(KILL_RETRY_TRIES, () => errTmuxUnresponsive('kill')), reads: [cannedErr(readErr), cannedErr(readErr)] })
@@ -741,7 +747,7 @@ describe('runKillRetry: the survivor rule and the alert decision (b.jg5 SRJ-702,
     ...LATER_SUCCESSES.flatMap(([what, kill, outcome]) => READS_BEFORE.map(([before, read]) => [`${what}, after ${before}`, kill, read, outcome] as const)),
     ['answering ErrSpawnNotFound, after a read that found the row live', cannedErr<Phase1KillResult>(errSpawnNotFound()), readState('waiting'), { kind: KILL_OUTCOME_ROW_GONE } as KillOutcome] as const,
   ])('a survivor-naming first try, then a second try %s: that success stands, the decision is the survivor version quoting the survivor-naming description, and both tries are logged', async (_label, second, read, outcome) => {
-    const { err, description, survivor } = survivorFirst()
+    const { err, survivor } = survivorFirst()
 
     const r = await run({ kills: [cannedErr(err), second, ...failing(KILL_RETRY_TRIES, () => errTmuxUnresponsive('kill'))], reads: [read] })
 
@@ -749,8 +755,12 @@ describe('runKillRetry: the survivor rule and the alert decision (b.jg5 SRJ-702,
     expect(r.result).toEqual({ outcome, end: KILL_RETRY_END_SETTLED, tries: 2, reads: 1, alert: survivor })
     const tryLines = r.lines.filter((l) => /kill try \d+ of \d+/.test(l))
     expect(tryLines).toHaveLength(2)
-    expect(tryLines[0]).toContain(JSON.stringify(description))
-    expect(tryLines[1]).not.toContain(JSON.stringify(description))
+    // The first try's line carries its outcome as the module renders it (the description redacted and capped).
+    const survivorTry = describeKillOutcome(notKilled(err))
+    expect(survivorTry).toContain(KILL_OUTCOME_NOT_KILLED)
+    expect(tryLines[0]).toContain(survivorTry)
+    expect(tryLines[1]).not.toContain(survivorTry)
+    expect(tryLines[1]).toContain(describeKillOutcome(outcome))
   })
 
   test('a survivor-naming first try, then ErrTmuxUnresponsive twice: the ordinary decision quoting the survivor-naming description only; never the survivor version', async () => {

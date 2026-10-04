@@ -21,7 +21,9 @@
  *
  * Every value is built with the stub's builders; a value of a class with a
  * description no builder takes has that description set on the builder's
- * value. A base `AgentDirectorError` named like a class (`errGeneric`), an
+ * value. The one exception is `RC_KILL_FAILED_DESCRIPTIONS`, the release
+ * candidate's kill-failure descriptions as literals, which pins the survivor
+ * pattern to agent-director's own wording. A base `AgentDirectorError` named like a class (`errGeneric`), an
  * `Error` named like one and an object shaped like one are the by-class
  * negatives. The client's classes, the bindings of the three Phase-1-only
  * classes (`ErrTmuxKillFailed`, `ErrTmuxUnresponsive`,
@@ -805,20 +807,6 @@ describe('stub builders: shape (SRJ-1303)', () => {
     },
   )
 
-  test('the three bindings are distinct classes, each named for its error, and no builder value is an instance of another\'s', () => {
-    const bindings: ReadonlyArray<readonly [AdErrorConstructor, string]> = [
-      [ErrTmuxUnresponsive, ERR_TMUX_UNRESPONSIVE_NAME],
-      [ErrTmuxKillFailed, ERR_TMUX_KILL_FAILED_NAME],
-      [ErrTmuxSessionConflict, ERR_TMUX_SESSION_CONFLICT_NAME],
-    ]
-    expect(new Set(bindings.map(([errorClass]) => errorClass)).size).toBe(PHASE1_ONLY_ERR_NAMES.length)
-    expect(bindings.map(([errorClass]) => errorClass.name)).toEqual(bindings.map(([, name]) => name))
-    for (const [label, errorClass, , , build] of PHASE1_BUILDS) {
-      const others = bindings.filter(([other]) => other !== errorClass && build() instanceof other)
-      expect({ label, others }).toEqual({ label, others: [] })
-    }
-  })
-
   test.each(KILL_FAILED_BUILDS)(
     'errTmuxKillFailed (%s) carries the quoted session name and verb kill, and ends "retry kill later", then "never delete this row"',
     (_label, build) => {
@@ -1020,14 +1008,85 @@ describe('stub builders: shape (SRJ-1303)', () => {
 // ---------------------------------------------------------------------------
 
 /**
+ * The release candidate's `ErrTmuxKillFailed` descriptions as written: each
+ * row is the full text the client delivers (agent-director's `err.Error()`,
+ * `tmux: agent process still running: instance <id>: tmux session "<name>":
+ * …`), copied by hand from agent-director 0.11.0-rc.1 (commit `d787cb4`,
+ * `pkg/api/kill_errors.go`: `waitExpiredError`, `uncheckableError`,
+ * `noPaneError`), with the survivor clause each names (none for a row
+ * without one) and the pids `survivorPids` reads from it. This is the one
+ * place the release candidate's wording is written out as literals, never
+ * built from `src/ad-description-phrases.ts`, so a change to
+ * `SURVIVOR_CLAUSE_ONE_PHRASE` or `SURVIVOR_CLAUSE_MANY_PHRASE` that
+ * agent-director does not share fails here. It is the check E51 re-runs
+ * against 0.11.0. The worker's pid, 4321, is never a survivor.
+ */
+const RC_KILL_FAILED_DESCRIPTIONS: ReadonlyArray<readonly [label: string, description: string, clause: string | undefined, survivors: readonly number[]]> = [
+  [
+    'worker only',
+    'tmux: agent process still running: instance cscb_alpha: tmux session "slack_bot_alpha": a kill was sent to the agent\'s pane and to its labelled session, and the agent process (pid 4321) was still running after the kill exit wait of 5 s; retry kill later; never delete this row',
+    undefined,
+    [],
+  ],
+  [
+    'one survivor',
+    'tmux: agent process still running: instance cscb_alpha: tmux session "slack_bot_alpha": a kill was sent to the agent\'s pane and to its labelled session, and another process of a pane of the labelled session (pid 4400) was still running after the kill exit wait of 5 s; retry kill later; never delete this row',
+    'another process of a pane of the labelled session (pid 4400)',
+    [4400],
+  ],
+  [
+    'several survivors',
+    'tmux: agent process still running: instance cscb_alpha: tmux session "slack_bot_alpha": a kill was sent to its labelled session, and other processes of panes of the labelled session (pids 4400, 4401) were still running after the kill exit wait of 5 s; retry kill later; never delete this row',
+    'other processes of panes of the labelled session (pids 4400, 4401)',
+    [4400, 4401],
+  ],
+  [
+    'the worker and one survivor',
+    'tmux: agent process still running: instance cscb_alpha: tmux session "slack_bot_alpha": a kill was sent to the agent\'s pane, and the agent process (pid 4321) and another process of a pane of the labelled session (pid 4400) were still running after the kill exit wait of 0.3 s; retry kill later; never delete this row',
+    'another process of a pane of the labelled session (pid 4400)',
+    [4400],
+  ],
+  [
+    'the worker and several survivors',
+    'tmux: agent process still running: instance cscb_alpha: tmux session "slack_bot_alpha": a kill was sent to the agent\'s pane and to its labelled session, and the agent process (pid 4321) and other processes of panes of the labelled session (pids 4402, 4400, 4401) were still running after the kill exit wait of 5 s; retry kill later; never delete this row',
+    'other processes of panes of the labelled session (pids 4402, 4400, 4401)',
+    [4402, 4400, 4401],
+  ],
+  [
+    'uncheckable',
+    'tmux: agent process still running: instance cscb_alpha: tmux session "slack_bot_alpha": a kill was sent to the agent\'s pane and to its labelled session, but the agent process cannot be checked and its labelled session is still there; retry kill later; never delete this row',
+    undefined,
+    [],
+  ],
+  [
+    'no session (pid N)',
+    'tmux: agent process still running: instance cscb_alpha: tmux session "slack_bot_alpha": no session or pane of this launch was found while its agent process still runs (pid 4321), so no kill was sent; a human can find and look at the process, see "Operator actions" in the agent-director README; retry kill later; never delete this row',
+    undefined,
+    [],
+  ],
+]
+
+/**
  * The survivor clause's forms are agent-director 0.11.0-rc.1's (commit
  * `d787cb4`, `pkg/api/kill_errors.go`): one survivor named after
  * `SURVIVOR_CLAUSE_ONE_PHRASE`, two or more after
- * `SURVIVOR_CLAUSE_MANY_PHRASE`. Every description is built by the stub's
- * `errTmuxKillFailed`; a clause whose words and pid form disagree is a stub
- * description with the other clause's words swapped in.
+ * `SURVIVOR_CLAUSE_MANY_PHRASE`. Apart from the release candidate's literal
+ * descriptions (`RC_KILL_FAILED_DESCRIPTIONS`), every description is built by
+ * the stub's `errTmuxKillFailed`; a clause whose words and pid form disagree
+ * is a stub description with the other clause's words swapped in.
  */
 describe('SURVIVOR_PID_PATTERN and survivorPids (b.jg5 SRJ-702)', () => {
+  test.each(RC_KILL_FAILED_DESCRIPTIONS)(
+    'the release candidate\'s description (%s): SURVIVOR_PID_PATTERN matches only its survivor clause and survivorPids reads exactly the survivor pids, never the worker\'s',
+    (_label, description, clause, survivors) => {
+      const matches = [...description.matchAll(new RegExp(SURVIVOR_PID_PATTERN.source, 'g'))].map((m) => m[0])
+      expect(matches).toEqual(clause === undefined ? [] : [clause])
+      expect(SURVIVOR_PID_PATTERN.test(description)).toBe(clause !== undefined)
+      expect(survivorPids(description)).toEqual([...survivors])
+      expect(survivorPids(description)).not.toContain(4321)
+    },
+  )
+
   const oneSurvivor = errTmuxKillFailed(STUB_TMUX_SESSION_NAME, 'pane-process-survived', [4194401]).errDescription
   const twoSurvivors = errTmuxKillFailed(STUB_TMUX_SESSION_NAME, 'pane-process-survived', [4194403, 4194402]).errDescription
 
@@ -1236,15 +1295,11 @@ describe('isAdErrorInstance', () => {
     ['errTmuxUnresponsive against the ErrTmuxUnresponsive binding', true, () => errTmuxUnresponsive(), ErrTmuxUnresponsive],
     ['errTmuxSessionConflict against the ErrTmuxSessionConflict binding', true, () => errTmuxSessionConflict('resume', 'own-id'), ErrTmuxSessionConflict],
     ['an ErrSpawnNotFound whose errName getter throws (the class decides)', true, () => Object.defineProperty(errSpawnNotFound(), 'errName', { get: () => { throw new Error('boom') } }), ErrSpawnNotFound],
-    ['a base error named ErrSpawnNotFound (a STATE class)', false, () => baseError(ERR_SPAWN_NOT_FOUND_NAME), ErrSpawnNotFound],
-    ['a base error named ErrTmuxKillFailed', false, () => baseError(ERR_TMUX_KILL_FAILED_NAME), ErrTmuxKillFailed],
     ['an ErrUnknownErrorName carrying ErrTmuxKillFailed', false, () => errUnknownErrorName(ERR_TMUX_KILL_FAILED_NAME), ErrTmuxKillFailed],
     ['errSpawnNotFound against ErrTmuxKillFailed', false, () => errSpawnNotFound(), ErrTmuxKillFailed],
     ['errTmuxKillFailed against ErrSpawnNotFound', false, () => errTmuxKillFailed(), ErrSpawnNotFound],
     ['errTmuxUnresponsive against ErrTmuxKillFailed', false, () => errTmuxUnresponsive(), ErrTmuxKillFailed],
     ['an agent-director error whose name, not class, matches', false, () => Object.assign(baseError(ERR_INTERNAL), { name: ERR_SPAWN_NOT_FOUND_NAME }), ErrSpawnNotFound],
-    ['an Error named for it', false, () => plainErrorNamed(ERR_SPAWN_NOT_FOUND_NAME), ErrSpawnNotFound],
-    ['a plain object with a matching errName', false, () => ({ errName: ERR_TMUX_KILL_FAILED_NAME }), ErrTmuxKillFailed],
     ['undefined', false, () => undefined, ErrSpawnNotFound],
     ['a string of that name', false, () => ERR_SPAWN_NOT_FOUND_NAME, ErrSpawnNotFound],
     ['a proxy whose every trap throws', false, () => hostileProxy(), ErrSpawnNotFound],

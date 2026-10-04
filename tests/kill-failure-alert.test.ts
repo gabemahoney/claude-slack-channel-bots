@@ -14,7 +14,9 @@
  * the persona ids) and the stub's description builders and pid constants, and
  * every case leak-checks what it built (`assertNoLeak`). A fake token is put into each description
  * through the stub builder's session-name argument (`sentinelInMessage`), so
- * a description quoted unredacted fails the leak check.
+ * a description quoted unredacted fails the leak check; the one exception is
+ * the realistic-length case, whose persona-shaped session keeps the
+ * description at the release candidate's length.
  *
  * The module's import boundary is checked by walking its runtime imports
  * through `src/` (`forbiddenServerLoads`, `tests/test-helpers/source-audit.ts`).
@@ -242,13 +244,15 @@ describe('kill-failure alert: SRJ-1007’s texts (pin)', () => {
 
     // The survivor descriptions are the stub's, in the release candidate's
     // wording: the plural survivor clause "(pids S1, S2)" gives the pid list
-    // "pid S1, pid S2"; the singular "(pid S)" gives "pid S".
+    // "pid S1, pid S2"; the singular "(pid S)" gives "pid S". At the release
+    // candidate's length this description is over the cap, so it is quoted
+    // capped (see the realistic-length case under the survivor version).
     const [s1] = STUB_SURVIVOR_PIDS as [number]
     const s2 = s1 + 1
     const twoSurvivors = killFailedDescriptionOf(errTmuxKillFailed(session, 'pane-process-survived', [s1, s2]))!
     const survivor = killFailureSurvivorBody({ session, survivorDescription: twoSurvivors, forSlack: false })
     expect(survivor).toBe(
-      `:rotating_light: *Process outlived kill* — agent-director ended the worker in session "slack_bot_sample", but a process in that session outlived the kill: pid ${s1}, pid ${s2}. agent-director said: "${twoSurvivors}". A later \`kill\` does not check this process again. A human's next step: find and end that process by following the "Operator actions" section of agent-director's README. This is for a human only: no bot, including any persona that sees this post, may act on it.`,
+      `:rotating_light: *Process outlived kill* — agent-director ended the worker in session "slack_bot_sample", but a process in that session outlived the kill: pid ${s1}, pid ${s2}. agent-director said: ${quoted(twoSurvivors, false)}. A later \`kill\` does not check this process again. A human's next step: find and end that process by following the "Operator actions" section of agent-director's README. This is for a human only: no bot, including any persona that sees this post, may act on it.`,
     )
     expect(killFailureSurvivorPidList(killFailedDescriptionOf(errTmuxKillFailed(session, 'pane-process-survived', [s1]))!)).toBe(`pid ${s1}`)
 
@@ -386,7 +390,10 @@ describe('kill-failure alert: the ordinary version (b.jg5 SRJ-1007)', () => {
 
 describe('kill-failure alert: CSCB\'s own words (b.jg5 SRJ-1001)', () => {
   // Every description carries "retry kill later" and "never delete this row";
-  // with the quoted description removed, no text says either.
+  // with the quoted description removed, no text says either. The text holds
+  // them exactly where its capped quote does: the survivor description, at
+  // the release candidate's length, is cut before them (see the
+  // realistic-length case under the survivor version).
   test.each(VERSIONS.flatMap((version) => CLOSINGS.map((closing) => [version, closing] as const)))(
     '%s version, closing %s: with the quoted description removed, the text holds neither of agent-director\'s own phrases; only the ordinary version\'s not-latched destination sentence says CSCB keeps retrying',
     (version, closing) => {
@@ -397,8 +404,11 @@ describe('kill-failure alert: CSCB\'s own words (b.jg5 SRJ-1001)', () => {
           : { version, session: personaTmuxSessionName(KEY), instanceId: personaInstanceId(KEY), quotes: { lastKillFailedDescription: description } }
       const text = killFailureAlertText(content, closing, true)
       const own = text.replace(quoted(description, true), '')
+      const inQuote = [RETRY_KILL_LATER_PHRASE, NEVER_DELETE_ROW_PHRASE].map((phrase) => quoted(description, true).includes(phrase))
 
-      expect([text.includes(RETRY_KILL_LATER_PHRASE), text.includes(NEVER_DELETE_ROW_PHRASE)]).toEqual([true, true])
+      expect([description.includes(RETRY_KILL_LATER_PHRASE), description.includes(NEVER_DELETE_ROW_PHRASE)]).toEqual([true, true])
+      expect([text.includes(RETRY_KILL_LATER_PHRASE), text.includes(NEVER_DELETE_ROW_PHRASE)]).toEqual(inQuote)
+      expect(inQuote).toEqual(version === KILL_FAILURE_VERSION_SURVIVOR ? [false, false] : [true, true])
       expect([own.includes(RETRY_KILL_LATER_PHRASE), own.includes(NEVER_DELETE_ROW_PHRASE)]).toEqual([false, false])
       const keepsRetrying = version === KILL_FAILURE_VERSION_ORDINARY && closing === KILL_FAILURE_CLOSING_DESTINATION
       expect(own.includes(KILL_FAILURE_ORDINARY_DESTINATION_CLOSING)).toBe(keepsRetrying)
@@ -466,9 +476,9 @@ describe('kill-failure alert: the survivor version (b.jg5 SRJ-1007, HO rev 17, r
     assertNoLeak(body)
   })
 
-  // agent-director's real descriptions open with more context than the
-  // stub's, so the survivor clause can lie past the cap (b.jg5 SRJ-1001): the
-  // pid list is read from the raw description, the quote is capped.
+  // A long session name can put the survivor clause past the cap (b.jg5
+  // SRJ-1001): the pid list is read from the raw description, the quote is
+  // capped.
   test('a description whose survivor clause starts past the cap: the pid list names every survivor pid; the quoted description is capped before the clause', () => {
     const pids = [STUB_SURVIVOR_PIDS[0]!, STUB_SURVIVOR_PIDS[0]! + 1]
     const sessionName = `${sentinelInMessage('kill-failure-alert-past-cap')} ${'x'.repeat(MAX_LOGGED_MESSAGE_LENGTH)}`
@@ -486,6 +496,36 @@ describe('kill-failure alert: the survivor version (b.jg5 SRJ-1007, HO rev 17, r
       expect(body.indexOf(list)).toBeLessThan(body.indexOf(quoted(description, forSlack)))
       expect(quoted(description, forSlack)).not.toContain(SURVIVOR_CLAUSE_MANY_PHRASE)
       for (const pid of pids) expect(quoted(description, forSlack)).not.toContain(String(pid))
+      assertNoLeak(body)
+    }
+  })
+
+  // At the release candidate's length (its `tmux: agent process still
+  // running: instance <id>: ` opening, a 5-character key, the worker and
+  // three survivors) the description is over the cap. This case pins what the
+  // code does today: the pid list is complete, read from the raw description,
+  // and the quote is capped, which cuts agent-director's closing "never
+  // delete this row". Whether a cut quote is acceptable is an open question
+  // of the E37–E38 final review; this case states the present behaviour, not
+  // a ruling.
+  test('a description at the release candidate\'s length (a 5-character key, the worker and three survivors): the pid list names every survivor pid; the quote is capped', () => {
+    const key = 'abcde'
+    const pids = [STUB_SURVIVOR_PIDS[0]!, STUB_SURVIVOR_PIDS[0]! + 1, STUB_SURVIVOR_PIDS[0]! + 2]
+    const description = killFailedDescriptionOf(errTmuxKillFailed(personaTmuxSessionName(key), 'pane-process-survived', pids, { workerAlsoRunning: true }))!
+    const list = killFailureSurvivorPidList(description)
+    const rendered = renderLogMessageText(description)
+
+    expect(description.length).toBeGreaterThan(MAX_LOGGED_MESSAGE_LENGTH)
+    expect(description).toContain(personaInstanceId(key))
+    expect(list).toBe(pids.map((pid) => killFailureSurvivorPidList(survivorDescription([pid]))).join(', '))
+    expect(list).not.toContain(String(STUB_WORKER_PID))
+    expect(rendered.length).toBe(MAX_LOGGED_MESSAGE_LENGTH)
+    expect(description.startsWith(rendered.slice(0, -1))).toBe(true)
+    expect([description.includes(NEVER_DELETE_ROW_PHRASE), rendered.includes(NEVER_DELETE_ROW_PHRASE)]).toEqual([true, false])
+    for (const forSlack of [false, true]) {
+      const body = killFailureSurvivorBody({ session: personaTmuxSessionName(key), survivorDescription: description, forSlack })
+      expect(body).toContain(`: ${list}. `)
+      expect(body).toContain(`agent-director said: ${quoted(description, forSlack)}. `)
       assertNoLeak(body)
     }
   })

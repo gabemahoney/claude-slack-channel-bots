@@ -42,27 +42,38 @@
  * A second audit, `byNameFindings`, reads every `src/` file and the
  * agent-director stub (`tests/test-helpers/agent-director-stub.ts`) with the
  * TypeScript parser, so text in strings and comments never counts, and finds
- * any recognition of the three Phase-1-only classes (`ErrTmuxKillFailed`,
- * `ErrTmuxUnresponsive`, `ErrTmuxSessionConflict`) by name rather than by
- * class (b.jg5 SRJ-101, SRJ-104). A name is the literal, a constant holding
- * it, or an element of a collection of them; its rules are listed at
- * `byNameFindings`. The same rows pin each rule with a planted violation and
- * the allowed uses (the name constants and `PHASE1_ONLY_ERR_NAMES`,
- * `REQUIRED_ERR_NAMES` and the catalogue check, log labels, the stub's
- * builders on the class bindings, and the stand-in declarations in
- * `src/agent-director-errors.ts`).
+ * any recognition of a class the client declares by name rather than by class
+ * (b.jg5 SRJ-101, SRJ-104). The class names are read from the installed
+ * client's namespace (every subclass of its `AgentDirectorError`), with the
+ * three Phase-1-only classes (`PHASE1_ONLY_ERR_NAMES`), never listed here. A
+ * name is the literal, a constant holding it, or an element of a collection
+ * of them; its rules are listed at `byNameFindings`. The only by-name uses
+ * kept are `SANCTIONED_BY_NAME`'s (`ErrAmbiguousRequest` in the click handler,
+ * `ErrPermissionRequestNotFound` in the client module, the system-install
+ * classes in the version gate, the GONE names in the checked kill's log label,
+ * and the stub's two base-error builders), each checked to be a client class
+ * still used there by its rule. The same rows pin each
+ * rule with a planted violation, at a synthetic path or at a real kill or
+ * sanctioned site's path, and the allowed uses (the name constants and
+ * `PHASE1_ONLY_ERR_NAMES`, `REQUIRED_ERR_NAMES` and the catalogue check, log
+ * labels, the stub's builders on the class bindings, the A-13 and
+ * `UnknownError` rows, the sanctioned comparisons, and the stand-in
+ * declarations in `src/agent-director-errors.ts`).
  *
- * The file starts no process and reads nothing outside the repository.
+ * The file starts no process and reads nothing outside the repository and
+ * its installed client.
  *
  * SPDX-License-Identifier: MIT
  */
 
 import { describe, expect, test } from 'bun:test'
+import * as agentDirectorClient from 'agent-director'
 import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import ts from 'typescript'
 
 import { AD_TMUX_TABLE } from '../src/ad-settings.ts'
+import { PHASE1_ONLY_ERR_NAMES } from '../src/agent-director-errors.ts'
 import {
   callArguments,
   DELETE_HELPERS,
@@ -539,21 +550,76 @@ describe('the closed list of non-literal process starts is keyed by file, callee
 })
 
 // ---------------------------------------------------------------------------
-// By-name recognition of the Phase-1-only classes (b.jg5 SRJ-101, SRJ-104)
+// By-name recognition of a class the client declares (b.jg5 SRJ-101, SRJ-104)
 // ---------------------------------------------------------------------------
 
-type ByNameRule = 'phase1-name-comparison' | 'phase1-name-lookup' | 'phase1-by-name-call' | 'base-error-named'
+type ByNameRule = 'class-name-comparison' | 'class-name-lookup' | 'class-by-name-call' | 'base-error-named'
 
 interface ByNameFinding {
   /** The file, relative to the repository root. */
   readonly file: string
   readonly rule: ByNameRule
+  /** The class names the finding reads, sorted; empty for a base error named through a variable. */
+  readonly names: readonly string[]
   /** `line: code` of the finding, for the failure message only. */
   readonly at: string
 }
 
-/** The classes only the Phase 1 agent-director client declares. */
-const PHASE1_NAMES: readonly string[] = ['ErrTmuxKillFailed', 'ErrTmuxUnresponsive', 'ErrTmuxSessionConflict']
+/**
+ * The classes the installed client declares: each export of its namespace
+ * that is a subclass of its `AgentDirectorError`, [export name, class]. Read
+ * from the client, never listed here, so a class a later client adds is
+ * audited with no change to this file.
+ */
+const CLIENT_CLASS_EXPORTS: ReadonlyArray<readonly [string, { readonly name: string }]> = Object.entries(agentDirectorClient as Record<string, unknown>)
+  .filter((entry): entry is [string, { readonly name: string }] => typeof entry[1] === 'function' && entry[1].prototype instanceof agentDirectorClient.AgentDirectorError)
+
+/**
+ * Every class name the audit guards: the installed client's classes, and the
+ * three Phase-1-only classes (`PHASE1_ONLY_ERR_NAMES`), which
+ * `src/agent-director-errors.ts` resolves from a Phase 1 client and the 0.10.0
+ * client lacks.
+ */
+const CLASS_NAMES: ReadonlySet<string> = new Set([...CLIENT_CLASS_EXPORTS.map(([name]) => name), ...PHASE1_ONLY_ERR_NAMES])
+
+/**
+ * The only by-name uses of a class the client declares that the tree keeps,
+ * each a finding of `rule` reading `name` in `file`, and nothing else:
+ * `ErrAmbiguousRequest` and `ErrPermissionRequestNotFound`, which SRJ-104's
+ * table does not list and E37's ruling keeps as they are (b.jg5 SRJ-101); the
+ * version gate's three system-install comparisons; and the checked kill's
+ * GONE-name log label. Every other class, at these files included, is decided
+ * by `instanceof`. The A-13 rows
+ * (`ErrInternal`, `ErrConfigMalformed`, the three store-open names) and CSCB's
+ * `UnknownError` row in `src/ad-error-class.ts` need no entry: those names are
+ * no class the client declares.
+ */
+interface SanctionedByName {
+  readonly file: string
+  readonly name: string
+  readonly rule: ByNameRule
+  readonly reason: string
+}
+
+const SANCTIONED_BY_NAME: readonly SanctionedByName[] = [
+  { file: 'src/permission-click-handler.ts', name: 'ErrAmbiguousRequest', rule: 'class-name-comparison', reason: "decide's defense-in-depth backstop and its trail class (SR-4.4, SR-V-2.7)" },
+  { file: 'src/agent-director-client.ts', name: 'ErrPermissionRequestNotFound', rule: 'class-name-comparison', reason: "the permission poller's sentinel matcher (isErrPermissionRequestNotFound)" },
+  { file: 'tests/test-helpers/agent-director-stub.ts', name: 'ErrAmbiguousRequest', rule: 'base-error-named', reason: "the stub's base-error builder, which the click handler's comparison matches" },
+  { file: 'tests/test-helpers/agent-director-stub.ts', name: 'ErrPermissionRequestNotFound', rule: 'base-error-named', reason: "the stub's base-error builder, which the sentinel matcher matches" },
+  // The version gate classifies `resolveSystemBinary()`'s system-install errors
+  // by name and reads their fields structurally by design, with no `instanceof`
+  // and no value import from `agent-director` (its module header). Whether it
+  // moves to `instanceof` is an open question; until then its three names are
+  // sanctioned here, and the staleness test fails on any entry whose
+  // comparison is gone.
+  { file: 'src/ad-version-gate.ts', name: 'ErrSystemInstallUnreachable', rule: 'class-name-comparison', reason: "the gate's failure rendering and its thrown-failure classifier, by name by design (module header)" },
+  { file: 'src/ad-version-gate.ts', name: 'ErrSystemInstallNotFound', rule: 'class-name-comparison', reason: "the gate's thrown-failure classifier, by name by design (module header)" },
+  { file: 'src/ad-version-gate.ts', name: 'ErrSystemInstallTooOld', rule: 'class-name-comparison', reason: "the gate's thrown-failure classifier, by name by design (module header)" },
+  // `renderSessionGone` renders a log label from a GONE name the kill outcome
+  // already holds; it decides no class.
+  { file: 'src/checked-kill.ts', name: 'ErrTmuxSendKeys', rule: 'class-name-lookup', reason: "renderSessionGone's log label from a name already decided; it decides no class" },
+  { file: 'src/checked-kill.ts', name: 'ErrTmuxCaptureFailed', rule: 'class-name-lookup', reason: "renderSessionGone's log label from a name already decided; it decides no class" },
+]
 
 /** What an error's name is read as: these properties (`x.errName`, `x['name']`) or bare identifiers. */
 const NAME_KEYS: readonly string[] = ['errName', 'unknownName', 'name']
@@ -568,9 +634,9 @@ const LOOKUP_METHODS: readonly string[] = ['get', 'has', 'includes', 'indexOf', 
 const LOG_CALLEES: readonly string[] = ['log', 'warn', 'error', 'info', 'debug']
 
 /**
- * The module that resolves the three classes from the client, and its
- * declarations that make the stand-ins and pick each class by name (b.jg5
- * SRJ-101): the audit allows anything inside them, in that file only.
+ * The module that resolves the three Phase-1-only classes from the client,
+ * and its declarations that make the stand-ins and pick each class by name
+ * (b.jg5 SRJ-101): the audit allows anything inside them, in that file only.
  */
 const STAND_IN_FILE = 'src/agent-director-errors.ts'
 const STAND_IN_DECLARATIONS: readonly string[] = ['phase1StandIn', 'PHASE1_STAND_INS', 'resolvePhase1ErrorClasses']
@@ -578,10 +644,10 @@ const STAND_IN_DECLARATIONS: readonly string[] = ['phase1StandIn', 'PHASE1_STAND
 /** The agent-director stub, audited beside `src/`. */
 const STUB_FILE = 'tests/test-helpers/agent-director-stub.ts'
 
-/** Identifiers found to hold a Phase-1-only name (`constants`) or a collection holding one (`collections`). */
-interface Phase1NameBindings {
-  readonly constants: Set<string>
-  readonly collections: Set<string>
+/** Identifiers found to hold a class name (`constants`) or a collection holding one (`collections`), each with the names it holds. */
+interface ClassNameBindings {
+  readonly constants: Map<string, ReadonlySet<string>>
+  readonly collections: Map<string, ReadonlySet<string>>
 }
 
 const parseSource = (file: string, text: string): ts.SourceFile => ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
@@ -619,14 +685,14 @@ function memberName(expr: ts.Expression): string | undefined {
 /** The text of a string literal or a template with no substitution, else undefined. */
 const literalOf = (node: ts.Node): string | undefined => (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) ? node.text : undefined)
 
-/** Whether `expr` is a Phase-1-only name: the literal, a constant holding it, or an element (by index) of a collection of them. */
-function isPhase1Name(expr: ts.Expression, b: Phase1NameBindings): boolean {
+/** The class names `expr` is: the literal, a constant holding one, or an element (by index) of a collection of them; empty for anything else. */
+function namesOf(expr: ts.Expression, b: ClassNameBindings): string[] {
   const inner = unwrap(expr)
   const literal = literalOf(inner)
-  if (literal !== undefined) return PHASE1_NAMES.includes(literal)
+  if (literal !== undefined) return CLASS_NAMES.has(literal) ? [literal] : []
   const name = memberName(inner)
-  if (name !== undefined) return b.constants.has(name)
-  return ts.isElementAccessExpression(inner) && ts.isNumericLiteral(inner.argumentExpression) && isCollection(inner.expression, b)
+  if (name !== undefined) return [...(b.constants.get(name) ?? [])]
+  return ts.isElementAccessExpression(inner) && ts.isNumericLiteral(inner.argumentExpression) ? collectionNames(inner.expression, b) : []
 }
 
 /** Whether `expr` reads an error's name (`NAME_KEYS`). */
@@ -637,50 +703,60 @@ function isNameRead(expr: ts.Expression): boolean {
 }
 
 /**
- * Whether `expr` is a collection holding a Phase-1-only name: an identifier
- * found to hold one, an array literal with one (nested arrays and spreads
- * included), an object literal keyed by one (a computed key, or a plain key
- * spelled as one), or a `new Set(…)` / `new Map(…)` over one.
+ * The class names the collection `expr` holds: an identifier found to hold
+ * them, an array literal with them (nested arrays and spreads included), an
+ * object literal keyed by them (a computed key, or a plain key spelled as
+ * one), or a `new Set(…)` / `new Map(…)` over them; empty for anything else.
  */
-function isCollection(expr: ts.Expression, b: Phase1NameBindings): boolean {
+function collectionNames(expr: ts.Expression, b: ClassNameBindings): string[] {
   const inner = unwrap(expr)
   const name = memberName(inner)
-  if (name !== undefined) return b.collections.has(name)
+  if (name !== undefined) return [...(b.collections.get(name) ?? [])]
   if (ts.isArrayLiteralExpression(inner)) {
-    return inner.elements.some((el) => {
+    return inner.elements.flatMap((el) => {
       const item = ts.isSpreadElement(el) ? el.expression : el
-      return isPhase1Name(item, b) || isCollection(item, b)
+      return [...namesOf(item, b), ...collectionNames(item, b)]
     })
   }
   if (ts.isObjectLiteralExpression(inner)) {
-    return inner.properties.some((p) => {
-      if (ts.isSpreadAssignment(p)) return isCollection(p.expression, b)
-      if (p.name === undefined) return false
-      if (ts.isComputedPropertyName(p.name)) return isPhase1Name(p.name.expression, b)
-      return PHASE1_NAMES.includes(ts.isIdentifier(p.name) ? p.name.text : literalOf(p.name) ?? '')
+    return inner.properties.flatMap((p) => {
+      if (ts.isSpreadAssignment(p)) return collectionNames(p.expression, b)
+      if (p.name === undefined) return []
+      if (ts.isComputedPropertyName(p.name)) return namesOf(p.name.expression, b)
+      const key = ts.isIdentifier(p.name) ? p.name.text : literalOf(p.name) ?? ''
+      return CLASS_NAMES.has(key) ? [key] : []
     })
   }
-  if (ts.isNewExpression(inner) && ['Set', 'Map'].includes(memberName(inner.expression) ?? '')) return (inner.arguments ?? []).some((a) => isCollection(a, b))
-  return false
+  if (ts.isNewExpression(inner) && ['Set', 'Map'].includes(memberName(inner.expression) ?? '')) return (inner.arguments ?? []).flatMap((a) => collectionNames(a, b))
+  return []
 }
 
 /**
- * The identifiers in `sources` declared with a Phase-1-only name (constants)
- * or a collection of them, followed through other declarations (`const X = Y`)
+ * The identifiers in `sources` declared with a class name (constants) or a
+ * collection of them, followed through other declarations (`const X = Y`)
  * to a fixed point, starting from `base`.
  */
-function phase1NameBindings(sources: readonly ts.SourceFile[], base?: Phase1NameBindings): Phase1NameBindings {
-  const b: Phase1NameBindings = { constants: new Set(base?.constants), collections: new Set(base?.collections) }
+function classNameBindings(sources: readonly ts.SourceFile[], base?: ClassNameBindings): ClassNameBindings {
+  const b: ClassNameBindings = { constants: new Map(base?.constants), collections: new Map(base?.collections) }
+  const grow = (into: Map<string, ReadonlySet<string>>, id: string, names: readonly string[]): boolean => {
+    const had = into.get(id)
+    const merged = new Set([...(had ?? []), ...names])
+    if (had !== undefined && merged.size === had.size) return false
+    into.set(id, merged)
+    return true
+  }
   for (let grew = true; grew;) {
     grew = false
     for (const sf of sources) {
       forEachNode(sf, (node) => {
         if (!ts.isVariableDeclaration(node) || !ts.isIdentifier(node.name) || node.initializer === undefined) return
-        const into = isPhase1Name(node.initializer, b) ? b.constants : isCollection(node.initializer, b) ? b.collections : undefined
-        if (into !== undefined && !into.has(node.name.text)) {
-          into.add(node.name.text)
-          grew = true
+        const held = namesOf(node.initializer, b)
+        if (held.length > 0) {
+          if (grow(b.constants, node.name.text, held)) grew = true
+          return
         }
+        const collected = collectionNames(node.initializer, b)
+        if (collected.length > 0 && grow(b.collections, node.name.text, collected)) grew = true
       })
     }
   }
@@ -704,41 +780,43 @@ function inStandInDeclaration(node: ts.Node): boolean {
 const EQUALITY_OPERATORS = new Set([ts.SyntaxKind.EqualsEqualsEqualsToken, ts.SyntaxKind.ExclamationEqualsEqualsToken, ts.SyntaxKind.EqualsEqualsToken, ts.SyntaxKind.ExclamationEqualsToken])
 
 /**
- * Every place `files` ([repository path, text]) recognises a Phase-1-only
- * class by name, the names and collections found in `files` added to `base`
- * (the tree's, so a planted source can use the real constants):
+ * Every place `files` ([repository path, text]) recognises a class the
+ * client declares (`CLASS_NAMES`) by name rather than by class, the names and
+ * collections found in `files` added to `base` (the tree's, so a planted
+ * source can use the real constants):
  *
- * - `phase1-name-comparison`: `===`, `!==`, `==` or `!=` between a name read
- *   (`errName`, `unknownName`, `name`) and a Phase-1-only name, or a
- *   `switch` on a name read with a `case` of one.
- * - `phase1-name-lookup`: `get`, `has`, `includes`, `indexOf` or
- *   `lastIndexOf` with a Phase-1-only name, or on a collection of them with a
- *   name read; an element read at a Phase-1-only name, or of a collection of
- *   them at a name read; `in` with either.
- * - `phase1-by-name-call`: any other call with a Phase-1-only name as an
- *   argument (a by-name helper such as `hasAdErrorName(err, NAME)`, or a
- *   by-name builder such as `errGeneric(verb, NAME, description)`), except a
- *   log call (`LOG_CALLEES`).
- * - `base-error-named`: a base `AgentDirectorError` built with a
- *   Phase-1-only name, or a base error whose `name` or `errName` is then set
- *   (an assignment, `Object.defineProperty` or `Object.assign` on it).
+ * - `class-name-comparison`: `===`, `!==`, `==` or `!=` between a name read
+ *   (`errName`, `unknownName`, `name`) and a class name, or a `switch` on a
+ *   name read with a `case` of one.
+ * - `class-name-lookup`: `get`, `has`, `includes`, `indexOf` or
+ *   `lastIndexOf` with a class name, or on a collection of them with a name
+ *   read; an element read at a class name, or of a collection of them at a
+ *   name read; `in` with either.
+ * - `class-by-name-call`: any other call with a class name as an argument (a
+ *   by-name helper such as `hasAdErrorName(err, NAME)`, or a by-name builder
+ *   such as `errGeneric(verb, NAME, description)`), except a log call
+ *   (`LOG_CALLEES`).
+ * - `base-error-named`: a base `AgentDirectorError` built with a class name,
+ *   or a base error whose `name` or `errName` is then set (an assignment,
+ *   `Object.defineProperty` or `Object.assign` on it).
  *
  * Allowed: anything inside `STAND_IN_DECLARATIONS` in `STAND_IN_FILE`; a
  * `new` of any other class with a name (the stub's builders on the class
  * bindings); names in templates and string concatenation (log labels);
  * declaring and iterating the constants and collections
  * (`PHASE1_ONLY_ERR_NAMES`, `REQUIRED_ERR_NAMES` and the catalogue check).
+ * `SANCTIONED_BY_NAME`'s uses are findings here, which `unsanctioned` drops.
  */
-function byNameFindings(files: ReadonlyArray<readonly [string, string]>, base?: Phase1NameBindings): ByNameFinding[] {
+function byNameFindings(files: ReadonlyArray<readonly [string, string]>, base?: ClassNameBindings): ByNameFinding[] {
   const sources = files.map(([file, text]) => parseSource(file, text))
-  const b = phase1NameBindings(sources, base)
+  const b = classNameBindings(sources, base)
   const findings: ByNameFinding[] = []
   for (const sf of sources) {
     const file = sf.fileName
-    const add = (rule: ByNameRule, node: ts.Node): void => {
+    const add = (rule: ByNameRule, node: ts.Node, names: readonly string[]): void => {
       if (file === STAND_IN_FILE && inStandInDeclaration(node)) return
       const line = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1
-      findings.push({ file, rule, at: `${line}: ${node.getText(sf).replace(/\s+/g, ' ').slice(0, 120)}` })
+      findings.push({ file, rule, names: [...new Set(names)].sort(), at: `${line}: ${node.getText(sf).replace(/\s+/g, ' ').slice(0, 120)}` })
     }
     const baseErrors = new Set<string>()
     forEachNode(sf, (node) => {
@@ -760,34 +838,51 @@ function byNameFindings(files: ReadonlyArray<readonly [string, string]>, base?: 
       if (ts.isBinaryExpression(node)) {
         const { left, right } = node
         const op = node.operatorToken.kind
-        if (EQUALITY_OPERATORS.has(op) && ((isNameRead(left) && isPhase1Name(right, b)) || (isPhase1Name(left, b) && isNameRead(right)))) add('phase1-name-comparison', node)
-        else if (op === ts.SyntaxKind.InKeyword && (isPhase1Name(left, b) || (isNameRead(left) && isCollection(right, b)))) add('phase1-name-lookup', node)
-        else if (op === ts.SyntaxKind.EqualsToken && setsBaseErrorName(left)) add('base-error-named', node)
+        const compared = EQUALITY_OPERATORS.has(op) ? [...(isNameRead(left) ? namesOf(right, b) : []), ...(isNameRead(right) ? namesOf(left, b) : [])] : []
+        const contained = op === ts.SyntaxKind.InKeyword ? [...namesOf(left, b), ...(isNameRead(left) ? collectionNames(right, b) : [])] : []
+        if (compared.length > 0) add('class-name-comparison', node, compared)
+        else if (contained.length > 0) add('class-name-lookup', node, contained)
+        else if (op === ts.SyntaxKind.EqualsToken && setsBaseErrorName(left)) add('base-error-named', node, [])
       } else if (ts.isSwitchStatement(node) && isNameRead(node.expression)) {
-        for (const clause of node.caseBlock.clauses) if (ts.isCaseClause(clause) && isPhase1Name(clause.expression, b)) add('phase1-name-comparison', clause)
+        for (const clause of node.caseBlock.clauses) {
+          const names = ts.isCaseClause(clause) ? namesOf(clause.expression, b) : []
+          if (names.length > 0) add('class-name-comparison', clause, names)
+        }
       } else if (ts.isElementAccessExpression(node)) {
-        if (isPhase1Name(node.argumentExpression, b) || (isCollection(node.expression, b) && isNameRead(node.argumentExpression))) add('phase1-name-lookup', node)
+        const names = [...namesOf(node.argumentExpression, b), ...(isNameRead(node.argumentExpression) ? collectionNames(node.expression, b) : [])]
+        if (names.length > 0) add('class-name-lookup', node, names)
       } else if (ts.isNewExpression(node)) {
-        if (isBaseErrorNew(node) && (node.arguments ?? []).some((a) => isPhase1Name(a, b))) add('base-error-named', node)
+        const names = isBaseErrorNew(node) ? (node.arguments ?? []).flatMap((a) => namesOf(a, b)) : []
+        if (names.length > 0) add('base-error-named', node, names)
       } else if (ts.isCallExpression(node)) {
         const callee = node.expression
         const args = node.arguments
         const calleeText = callee.getText(sf).replace(/\s+/g, '')
+        const argNames = args.flatMap((a) => namesOf(a, b))
+        const lookedUp = ts.isPropertyAccessExpression(callee) && LOOKUP_METHODS.includes(callee.name.text)
+          ? [...argNames, ...(args.some((a) => isNameRead(a)) ? collectionNames(callee.expression, b) : [])]
+          : []
         if (calleeText === 'Object.defineProperty' && args.length >= 2 && isBaseError(args[0]!) && NAME_SET_KEYS.includes(literalOf(args[1]!) ?? '')) {
-          add('base-error-named', node)
+          add('base-error-named', node, [])
         } else if (calleeText === 'Object.assign' && args.length >= 2 && isBaseError(args[0]!) && args.slice(1).some(namesAProperty)) {
-          add('base-error-named', node)
-        } else if (ts.isPropertyAccessExpression(callee) && LOOKUP_METHODS.includes(callee.name.text)
-          && (args.some((a) => isPhase1Name(a, b)) || (isCollection(callee.expression, b) && args.some((a) => isNameRead(a))))) {
-          add('phase1-name-lookup', node)
-        } else if (!LOG_CALLEES.includes(memberName(callee) ?? '') && args.some((a) => isPhase1Name(a, b))) {
-          add('phase1-by-name-call', node)
+          add('base-error-named', node, [])
+        } else if (lookedUp.length > 0) {
+          add('class-name-lookup', node, lookedUp)
+        } else if (!LOG_CALLEES.includes(memberName(callee) ?? '') && argNames.length > 0) {
+          add('class-by-name-call', node, argNames)
         }
       }
     })
   }
   return findings
 }
+
+/** Whether `finding` is sanctioned: every name it reads is sanctioned in its file for its rule. */
+const isSanctioned = (finding: ByNameFinding): boolean => finding.names.length > 0
+  && finding.names.every((name) => SANCTIONED_BY_NAME.some((s) => s.file === finding.file && s.rule === finding.rule && s.name === name))
+
+/** `findings` without the sanctioned ones. */
+const unsanctioned = (findings: readonly ByNameFinding[]): ByNameFinding[] => findings.filter((f) => !isSanctioned(f))
 
 /** Every `src/` file (`src/<name>`) and the stub: [repository path, text]. */
 const BY_NAME_TREE: ReadonlyArray<readonly [string, string]> = [
@@ -796,43 +891,55 @@ const BY_NAME_TREE: ReadonlyArray<readonly [string, string]> = [
 ]
 
 /** The tree's name constants and collections, which planted sources may use. */
-const TREE_BINDINGS = phase1NameBindings(BY_NAME_TREE.map(([file, text]) => parseSource(file, text)))
+const TREE_BINDINGS = classNameBindings(BY_NAME_TREE.map(([file, text]) => parseSource(file, text)))
 
-const ERRORS_IMPORT = "import { ERR_TMUX_KILL_FAILED_NAME, ERR_TMUX_SESSION_CONFLICT_NAME, ERR_TMUX_UNRESPONSIVE_NAME, PHASE1_ONLY_ERR_NAMES } from './agent-director-errors.ts'"
+/** The tree's findings, sanctioned ones included. */
+const TREE_FINDINGS = byNameFindings(BY_NAME_TREE)
+
+const ERRORS_IMPORT = "import { ERR_SPAWN_NOT_FOUND_NAME, ERR_TMUX_KILL_FAILED_NAME, ERR_TMUX_SESSION_CONFLICT_NAME, ERR_TMUX_UNRESPONSIVE_NAME, PHASE1_ONLY_ERR_NAMES } from './agent-director-errors.ts'"
 
 /** [what is planted, the synthetic source, the one rule it breaks]. */
 const BY_NAME_PLANTED: ReadonlyArray<readonly [string, string, ByNameRule]> = [
   // Comparisons of errName, unknownName or name with a name.
-  ["errName === a literal", "if (err.errName === 'ErrTmuxKillFailed') retry()", 'phase1-name-comparison'],
-  ['a constant === errName', `${ERRORS_IMPORT}\nif (ERR_TMUX_SESSION_CONFLICT_NAME === err.errName) latch()`, 'phase1-name-comparison'],
-  ['unknownName !== a constant', `${ERRORS_IMPORT}\nif (err.unknownName !== ERR_TMUX_UNRESPONSIVE_NAME) return`, 'phase1-name-comparison'],
-  ['name == a literal', "if (err.name == 'ErrTmuxSessionConflict') latch()", 'phase1-name-comparison'],
-  ['errName != a template literal', 'if (err.errName != `ErrTmuxUnresponsive`) return', 'phase1-name-comparison'],
-  ['errName through a cast, optional chaining and a namespace constant', "import * as errors from './agent-director-errors.ts'\nif ((err as AgentDirectorError)?.errName === errors.ERR_TMUX_KILL_FAILED_NAME) retry()", 'phase1-name-comparison'],
-  ["err['errName'] === a constant", `${ERRORS_IMPORT}\nif (err['errName'] === ERR_TMUX_KILL_FAILED_NAME) retry()`, 'phase1-name-comparison'],
-  ['the constructor name === a literal', "if (err.constructor.name === 'ErrTmuxKillFailed') retry()", 'phase1-name-comparison'],
-  ['a destructured errName === a constant', `${ERRORS_IMPORT}\nconst { errName } = err\nif (errName === ERR_TMUX_UNRESPONSIVE_NAME) retry()`, 'phase1-name-comparison'],
-  ['errName === a local alias of a constant', `${ERRORS_IMPORT}\nconst KILL = ERR_TMUX_KILL_FAILED_NAME\nif (err.errName === KILL) retry()`, 'phase1-name-comparison'],
-  ['errName === a src alias of a constant', "import { LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE } from './ad-error-class.ts'\nif (err.errName === LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE) wait()", 'phase1-name-comparison'],
-  ['errName === an element of PHASE1_ONLY_ERR_NAMES', `${ERRORS_IMPORT}\nif (err.errName === PHASE1_ONLY_ERR_NAMES[0]) retry()`, 'phase1-name-comparison'],
-  ['a switch on errName with a case of a constant', `${ERRORS_IMPORT}\nswitch (err.errName) {\n  case ERR_TMUX_SESSION_CONFLICT_NAME: return 'conflict'\n  default: return 'other'\n}`, 'phase1-name-comparison'],
+  ["errName === a literal", "if (err.errName === 'ErrTmuxKillFailed') retry()", 'class-name-comparison'],
+  ['a constant === errName', `${ERRORS_IMPORT}\nif (ERR_TMUX_SESSION_CONFLICT_NAME === err.errName) latch()`, 'class-name-comparison'],
+  ['unknownName !== a constant', `${ERRORS_IMPORT}\nif (err.unknownName !== ERR_TMUX_UNRESPONSIVE_NAME) return`, 'class-name-comparison'],
+  ['name == a literal', "if (err.name == 'ErrTmuxSessionConflict') latch()", 'class-name-comparison'],
+  ['errName != a template literal', 'if (err.errName != `ErrTmuxUnresponsive`) return', 'class-name-comparison'],
+  ['errName through a cast, optional chaining and a namespace constant', "import * as errors from './agent-director-errors.ts'\nif ((err as AgentDirectorError)?.errName === errors.ERR_TMUX_KILL_FAILED_NAME) retry()", 'class-name-comparison'],
+  ["err['errName'] === a constant", `${ERRORS_IMPORT}\nif (err['errName'] === ERR_TMUX_KILL_FAILED_NAME) retry()`, 'class-name-comparison'],
+  ['the constructor name === a literal', "if (err.constructor.name === 'ErrTmuxKillFailed') retry()", 'class-name-comparison'],
+  ['a destructured errName === a constant', `${ERRORS_IMPORT}\nconst { errName } = err\nif (errName === ERR_TMUX_UNRESPONSIVE_NAME) retry()`, 'class-name-comparison'],
+  ['errName === a local alias of a constant', `${ERRORS_IMPORT}\nconst KILL = ERR_TMUX_KILL_FAILED_NAME\nif (err.errName === KILL) retry()`, 'class-name-comparison'],
+  ['errName === a src alias of a constant', "import { LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE } from './ad-error-class.ts'\nif (err.errName === LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE) wait()", 'class-name-comparison'],
+  ['errName === an element of PHASE1_ONLY_ERR_NAMES', `${ERRORS_IMPORT}\nif (err.errName === PHASE1_ONLY_ERR_NAMES[0]) retry()`, 'class-name-comparison'],
+  ['a switch on errName with a case of a constant', `${ERRORS_IMPORT}\nswitch (err.errName) {\n  case ERR_TMUX_SESSION_CONFLICT_NAME: return 'conflict'\n  default: return 'other'\n}`, 'class-name-comparison'],
+  // Classes every client declares, read from the installed client's namespace.
+  ["errName === ErrSpawnNotFound's literal (the kill site's look-alike)", "if (isAdErrorInstance(error, ErrSpawnNotFound) || error?.errName === 'ErrSpawnNotFound') return { kind: KILL_OUTCOME_ROW_GONE }", 'class-name-comparison'],
+  ['errName === ERR_SPAWN_NOT_FOUND_NAME', `${ERRORS_IMPORT}\nif (err.errName === ERR_SPAWN_NOT_FOUND_NAME) skip()`, 'class-name-comparison'],
+  ['errName === a CSCB alias of the client timeout name', "import { LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT } from './ad-error-class.ts'\nif (err.errName === LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT) wait()", 'class-name-comparison'],
+  ["name === ErrInstanceIdCollision's literal", "if (err.name === 'ErrInstanceIdCollision') retryCollision()", 'class-name-comparison'],
+  ["a switch on errName with a case of ErrNoSessionId", "switch (err.errName) {\n  case 'ErrNoSessionId': return reuse()\n  default: return fail()\n}", 'class-name-comparison'],
   // By-name helper calls.
-  ['hasAdErrorName with a constant', `${ERRORS_IMPORT}\nif (hasAdErrorName(err, ERR_TMUX_KILL_FAILED_NAME)) retry()`, 'phase1-by-name-call'],
-  ['a by-name helper with a literal', "if (isNamed(err, 'ErrTmuxUnresponsive')) wait()", 'phase1-by-name-call'],
-  ['an optional by-name helper on a receiver', `${ERRORS_IMPORT}\ndeps.matchesName?.(err, ERR_TMUX_UNRESPONSIVE_NAME)`, 'phase1-by-name-call'],
-  ['a by-name builder (errGeneric)', `${ERRORS_IMPORT}\nthrow errGeneric('spawn', ERR_TMUX_SESSION_CONFLICT_NAME, 'not this launch')`, 'phase1-by-name-call'],
-  ['a call inside a function named like a stand-in declaration, outside src/agent-director-errors.ts', `${ERRORS_IMPORT}\nfunction resolvePhase1ErrorClasses(err: unknown) { return hasAdErrorName(err, ERR_TMUX_KILL_FAILED_NAME) }`, 'phase1-by-name-call'],
+  ['hasAdErrorName with a constant', `${ERRORS_IMPORT}\nif (hasAdErrorName(err, ERR_TMUX_KILL_FAILED_NAME)) retry()`, 'class-by-name-call'],
+  ['a by-name helper with a literal', "if (isNamed(err, 'ErrTmuxUnresponsive')) wait()", 'class-by-name-call'],
+  ['an optional by-name helper on a receiver', `${ERRORS_IMPORT}\ndeps.matchesName?.(err, ERR_TMUX_UNRESPONSIVE_NAME)`, 'class-by-name-call'],
+  ['a by-name builder (errGeneric)', `${ERRORS_IMPORT}\nthrow errGeneric('spawn', ERR_TMUX_SESSION_CONFLICT_NAME, 'not this launch')`, 'class-by-name-call'],
+  ['a by-name builder of ErrSpawnNotFound', `${ERRORS_IMPORT}\nthrow errGeneric('kill', ERR_SPAWN_NOT_FOUND_NAME, 'row gone')`, 'class-by-name-call'],
+  ['a call inside a function named like a stand-in declaration, outside src/agent-director-errors.ts', `${ERRORS_IMPORT}\nfunction resolvePhase1ErrorClasses(err: unknown) { return hasAdErrorName(err, ERR_TMUX_KILL_FAILED_NAME) }`, 'class-by-name-call'],
   // Map or set lookups keyed by a name.
-  ['a map get at a constant', `${ERRORS_IMPORT}\nconst cls = CLASS_BY_NAME.get(ERR_TMUX_KILL_FAILED_NAME)`, 'phase1-name-lookup'],
-  ['PHASE1_ONLY_ERR_NAMES.includes(errName)', `${ERRORS_IMPORT}\nif (PHASE1_ONLY_ERR_NAMES.includes(err.errName)) retry()`, 'phase1-name-lookup'],
-  ['a Set over PHASE1_ONLY_ERR_NAMES has unknownName', `${ERRORS_IMPORT}\nif (new Set(PHASE1_ONLY_ERR_NAMES).has(err.unknownName)) retry()`, 'phase1-name-lookup'],
-  ['an inline array of literals includes name', "if (['ErrTmuxKillFailed', 'ErrTmuxUnresponsive'].includes(err.name)) retry()", 'phase1-name-lookup'],
-  ['a declared Set of constants has errName', `${ERRORS_IMPORT}\nconst RETRYABLE = new Set([ERR_TMUX_UNRESPONSIVE_NAME, ERR_TMUX_KILL_FAILED_NAME])\nif (RETRYABLE.has(err.errName)) retry()`, 'phase1-name-lookup'],
-  ['a frozen Map of constants get errName', `${ERRORS_IMPORT}\nconst KIND = Object.freeze(new Map([[ERR_TMUX_KILL_FAILED_NAME, 'kill']]))\nconst kind = KIND.get(err.errName)`, 'phase1-name-lookup'],
-  ['a table keyed by a computed constant, read at errName', `${ERRORS_IMPORT}\nconst CLASS_OF = { [ERR_TMUX_SESSION_CONFLICT_NAME]: 'CONFLICT' } as const\nconst cls = CLASS_OF[err.errName]`, 'phase1-name-lookup'],
-  ['a table keyed by a plain name, read at errName', "const CLASS_OF = { ErrTmuxKillFailed: 'UNAVAILABLE' }\nconst cls = CLASS_OF[err.errName]", 'phase1-name-lookup'],
-  ['a table read at a constant', `${ERRORS_IMPORT}\nconst handle = HANDLERS[ERR_TMUX_KILL_FAILED_NAME]`, 'phase1-name-lookup'],
-  ['errName in a table keyed by a constant', `${ERRORS_IMPORT}\nconst CLASS_OF = { [ERR_TMUX_UNRESPONSIVE_NAME]: 'UNAVAILABLE' }\nif (err.errName in CLASS_OF) retry()`, 'phase1-name-lookup'],
+  ['a map get at a constant', `${ERRORS_IMPORT}\nconst cls = CLASS_BY_NAME.get(ERR_TMUX_KILL_FAILED_NAME)`, 'class-name-lookup'],
+  ['PHASE1_ONLY_ERR_NAMES.includes(errName)', `${ERRORS_IMPORT}\nif (PHASE1_ONLY_ERR_NAMES.includes(err.errName)) retry()`, 'class-name-lookup'],
+  ['a Set over PHASE1_ONLY_ERR_NAMES has unknownName', `${ERRORS_IMPORT}\nif (new Set(PHASE1_ONLY_ERR_NAMES).has(err.unknownName)) retry()`, 'class-name-lookup'],
+  ['an inline array of literals includes name', "if (['ErrTmuxKillFailed', 'ErrTmuxUnresponsive'].includes(err.name)) retry()", 'class-name-lookup'],
+  ['a declared Set of constants has errName', `${ERRORS_IMPORT}\nconst RETRYABLE = new Set([ERR_TMUX_UNRESPONSIVE_NAME, ERR_TMUX_KILL_FAILED_NAME])\nif (RETRYABLE.has(err.errName)) retry()`, 'class-name-lookup'],
+  ['a declared Set of no-transcript names has errName', "const NO_TRANSCRIPT = new Set(['ErrNoSessionId', 'ErrJsonlMissing', 'ErrJsonlNeverWritten'])\nif (NO_TRANSCRIPT.has(err.errName)) reuse()", 'class-name-lookup'],
+  ['a frozen Map of constants get errName', `${ERRORS_IMPORT}\nconst KIND = Object.freeze(new Map([[ERR_TMUX_KILL_FAILED_NAME, 'kill']]))\nconst kind = KIND.get(err.errName)`, 'class-name-lookup'],
+  ['a table keyed by a computed constant, read at errName', `${ERRORS_IMPORT}\nconst CLASS_OF = { [ERR_TMUX_SESSION_CONFLICT_NAME]: 'CONFLICT' } as const\nconst cls = CLASS_OF[err.errName]`, 'class-name-lookup'],
+  ['a table keyed by a plain name, read at errName', "const CLASS_OF = { ErrTmuxKillFailed: 'UNAVAILABLE' }\nconst cls = CLASS_OF[err.errName]", 'class-name-lookup'],
+  ['a table keyed by a plain 0.10.0 class name, read at errName', "const CLASS_OF = { ErrSystemInstallDisappeared: 'UNCLASSIFIED' }\nconst cls = CLASS_OF[err.errName]", 'class-name-lookup'],
+  ['a table read at a constant', `${ERRORS_IMPORT}\nconst handle = HANDLERS[ERR_TMUX_KILL_FAILED_NAME]`, 'class-name-lookup'],
+  ['errName in a table keyed by a constant', `${ERRORS_IMPORT}\nconst CLASS_OF = { [ERR_TMUX_UNRESPONSIVE_NAME]: 'UNAVAILABLE' }\nif (err.errName in CLASS_OF) retry()`, 'class-name-lookup'],
   // A base error named like a class.
   ['a builder that makes a base error and then sets its name', 'function byName(name: string, verb: string, description: string) {\n  const err = new AgentDirectorError(verb, name, description)\n  err.name = name\n  return err\n}', 'base-error-named'],
   ["a base error's name set in the bracket form", "const err = new AgentDirectorError(verb, errName, description)\nerr['name'] = errName", 'base-error-named'],
@@ -840,6 +947,35 @@ const BY_NAME_PLANTED: ReadonlyArray<readonly [string, string, ByNameRule]> = [
   ['a base error named by Object.assign', 'return Object.assign(new AgentDirectorError(verb, errName, description), { name: errName })', 'base-error-named'],
   ['a base error built with a constant', `${ERRORS_IMPORT}\nthrow new AgentDirectorError('kill', ERR_TMUX_KILL_FAILED_NAME, 'retry kill later')`, 'base-error-named'],
   ['a base error built through a namespace with a literal', "import * as ad from 'agent-director'\nthrow new ad.AgentDirectorError('spawn', 'ErrTmuxUnresponsive', 'did not answer')", 'base-error-named'],
+  ['a base error built with a 0.10.0 class name', "throw new AgentDirectorError('get', 'ErrSpawnNotFound', 'spawn not found')", 'base-error-named'],
+]
+
+/**
+ * [what is planted, the real path it is planted at, the synthetic source, the
+ * one rule it breaks]: by-name recognitions at the sanctioned sites' files and
+ * at the kill sites that `SANCTIONED_BY_NAME` does not cover.
+ */
+const BY_NAME_PLANTED_AT: ReadonlyArray<readonly [string, string, string, ByNameRule]> = [
+  ["ErrSpawnNotFound by name beside its class at the checked kill", 'src/checked-kill.ts',
+    "if (isAdErrorInstance(error, ErrSpawnNotFound) || error?.errName === 'ErrSpawnNotFound') return { kind: KILL_OUTCOME_ROW_GONE }", 'class-name-comparison'],
+  ["ErrSpawnNotFound by name beside its class at the kill retry's read", 'src/kill-retry.ts',
+    "if (isAdErrorInstance(error, ErrSpawnNotFound) || error?.errName === 'ErrSpawnNotFound') return { kind: KILL_RETRY_VERDICT_FINISHED, read: KILL_ROW_FINISHED_NO_ROW }", 'class-name-comparison'],
+  ['ErrAmbiguousRequest by name outside the click handler', 'src/permission-poller.ts',
+    "if (err instanceof AgentDirectorError && err.errName === 'ErrAmbiguousRequest') return true", 'class-name-comparison'],
+  ['ErrPermissionRequestNotFound by name outside the client module', 'src/permission-click-handler.ts',
+    "if (err instanceof AgentDirectorError && err.errName === 'ErrPermissionRequestNotFound') return true", 'class-name-comparison'],
+  ['another class by name in the click handler', 'src/permission-click-handler.ts',
+    "if (err instanceof AgentDirectorError && err.errName === 'ErrAlreadyDecided') return 'ErrAlreadyDecided'", 'class-name-comparison'],
+  ['a sanctioned name and another in one switch case list', 'src/permission-click-handler.ts',
+    "switch (err.errName) {\n  case 'ErrAmbiguousRequest': return 'ambiguous'\n  case 'ErrSpawnNotFound': return 'gone'\n}", 'class-name-comparison'],
+  ['a sanctioned name in a lookup, not a comparison', 'src/permission-click-handler.ts',
+    "if (['ErrAmbiguousRequest'].includes(err.errName)) return true", 'class-name-lookup'],
+  ['a sanctioned name in a by-name helper call', 'src/agent-director-client.ts',
+    "return hasAdErrorName(err, 'ErrPermissionRequestNotFound')", 'class-by-name-call'],
+  ['a base error named like a class the stub has no sanction for', STUB_FILE,
+    "return new AgentDirectorError('kill', 'ErrSpawnNotFound', 'row gone')", 'base-error-named'],
+  ['a sanctioned name compared in the stub, where only its base-error builder is sanctioned', STUB_FILE,
+    "if (err.errName === 'ErrAmbiguousRequest') return true", 'class-name-comparison'],
 ]
 
 /** [what the source holds, its repository path, the synthetic source]: none is a finding. */
@@ -847,6 +983,7 @@ const BY_NAME_ALLOWED: ReadonlyArray<readonly [string, string, string]> = [
   ['the name constants and PHASE1_ONLY_ERR_NAMES declared', 'planted/declarations.ts', [
     "export const ERR_TMUX_KILL_FAILED_NAME = 'ErrTmuxKillFailed'",
     "export const ERR_TMUX_UNRESPONSIVE_NAME = 'ErrTmuxUnresponsive'",
+    "export const ERR_SPAWN_NOT_FOUND_NAME = 'ErrSpawnNotFound'",
     'export const PHASE1_ONLY_ERR_NAMES = [ERR_TMUX_KILL_FAILED_NAME, ERR_TMUX_UNRESPONSIVE_NAME] as const',
     'export type Phase1OnlyErrName = (typeof PHASE1_ONLY_ERR_NAMES)[number]',
   ].join('\n')],
@@ -862,21 +999,46 @@ const BY_NAME_ALLOWED: ReadonlyArray<readonly [string, string, string]> = [
     'log(`[slack] kill failed: ${ERR_TMUX_KILL_FAILED_NAME} ${message}`)',
     "console.error('[slack] unavailable:', ERR_TMUX_UNRESPONSIVE_NAME)",
     "const line = 'conflict ' + ERR_TMUX_SESSION_CONFLICT_NAME",
+    'console.error(`[slack] reading the row failed: ${ERR_SPAWN_NOT_FOUND_NAME}`)',
   ].join('\n')],
   ['deciding by class', 'planted/by-class.ts', [
     "import { ErrTmuxKillFailed, ErrTmuxSessionConflict } from './agent-director-errors.ts'",
     'if (isAdErrorInstance(err, ErrTmuxKillFailed)) retry()',
     'if (err instanceof ErrTmuxSessionConflict) latch()',
+    'if (isAdErrorInstance(error, ErrSpawnNotFound)) return { kind: KILL_OUTCOME_ROW_GONE }',
   ].join('\n')],
   ["the stub's builders on the class bindings", 'planted/stub-builders.ts', [
     ERRORS_IMPORT,
     "return new ErrTmuxKillFailed('kill', ERR_TMUX_KILL_FAILED_NAME, text[description])",
     'return new ErrTmuxUnresponsive(verb, ERR_TMUX_UNRESPONSIVE_NAME, description)',
+    "return new ErrSpawnNotFound('get', 'ErrSpawnNotFound', 'spawn not found')",
   ].join('\n')],
-  ['comparisons and base errors for other names', 'planted/other-names.ts', [
-    "if (err.errName === 'ErrAmbiguousRequest') return",
+  ['comparisons and base errors for names that are no client class', 'planted/other-names.ts', [
+    "if (err.errName === 'ErrConfigMalformed') return",
     'if (err.unknownName === ERR_INTERNAL_NAME) return',
+    'if (err.errName === ERR_SPAWN_CAP_REACHED_NAME) return capHint()',
+    "return new AgentDirectorError('decide', 'ErrInternal', 'internal error')",
+  ].join('\n')],
+  ["the A-13 and UnknownError rows in src/ad-error-class.ts", 'src/ad-error-class.ts', [
+    "import { ERR_INTERNAL_NAME, ERR_CONFIG_MALFORMED_NAME, STORE_OPEN_ERR_NAMES } from './agent-director-errors.ts'",
+    "const CSCB_UNKNOWN_ERROR_NAME = 'UnknownError'",
+    'const STORE_OPEN_NAMES: ReadonlySet<unknown> = new Set(STORE_OPEN_ERR_NAMES)',
+    "const errName = readProp(value, 'errName')",
+    'if (errName === ERR_INTERNAL_NAME || errName === ERR_CONFIG_MALFORMED_NAME || STORE_OPEN_NAMES.has(errName)) return classifyUnknownName(errName, description)',
+    'if (errName === CSCB_UNKNOWN_ERROR_NAME) return { errorClass: AD_ERROR_CLASS_UNAVAILABLE }',
+    'if (unknownName === ERR_INTERNAL_NAME) return internal()',
+  ].join('\n')],
+  ['the sanctioned ErrAmbiguousRequest comparisons in the click handler', 'src/permission-click-handler.ts', [
+    "if (err instanceof AgentDirectorError && err.errName === 'ErrAmbiguousRequest') return 'ErrAmbiguousRequest'",
+    "if (err instanceof AgentDirectorError && err.errName === 'ErrAmbiguousRequest') {",
+    '  return true',
+    '}',
+  ].join('\n')],
+  ['the sanctioned ErrPermissionRequestNotFound comparison in the client module', 'src/agent-director-client.ts',
+    "return err instanceof AgentDirectorError && err.errName === 'ErrPermissionRequestNotFound'"],
+  ["the stub's sanctioned base-error builders", STUB_FILE, [
     "return new AgentDirectorError('decide', 'ErrAmbiguousRequest', 'ambiguous request')",
+    "return new AgentDirectorError('get-permission', 'ErrPermissionRequestNotFound', 'permission request not found')",
   ].join('\n')],
   ['an error rebuilt from its own class with its own name', 'planted/rebuild.ts', [
     'const Made = err.constructor as new (verb: string, errName: string, description: string) => E',
@@ -891,6 +1053,7 @@ const BY_NAME_ALLOWED: ReadonlyArray<readonly [string, string, string]> = [
     "// if (err.errName === 'ErrTmuxKillFailed') retry()",
     '/* hasAdErrorName(err, ERR_TMUX_KILL_FAILED_NAME) */',
     "const doc = \"err.errName === 'ErrTmuxSessionConflict'\"",
+    "// if (error?.errName === 'ErrSpawnNotFound') return { kind: KILL_OUTCOME_ROW_GONE }",
   ].join('\n')],
   ['the stand-in declarations in src/agent-director-errors.ts', STAND_IN_FILE, [
     "export const ERR_TMUX_KILL_FAILED_NAME = 'ErrTmuxKillFailed'",
@@ -907,15 +1070,33 @@ const BY_NAME_ALLOWED: ReadonlyArray<readonly [string, string, string]> = [
   ].join('\n')],
 ]
 
-describe('b.jg5 SRJ-101, SRJ-104: no by-name recognition of a Phase-1-only class in src/ or the stub', () => {
-  test('the real src/ and the stub have no finding', () => {
-    expect(BY_NAME_TREE.map(([file]) => file)).toEqual(expect.arrayContaining([STAND_IN_FILE, 'src/ad-error-class.ts', STUB_FILE]))
-    expect(byNameFindings(BY_NAME_TREE)).toEqual([])
+/** The client's declared subclasses of `AgentDirectorError`, read from its shipped declarations, which the namespace read must match. */
+const DECLARED_CLASS_NAMES: readonly string[] = [
+  ...readFileSync(join(import.meta.dir, '..', 'node_modules', 'agent-director', 'dist', 'errors.d.ts'), 'utf-8')
+    .matchAll(/^export declare class (\w+) extends \w+/gm),
+].map((m) => m[1]!).filter((name) => name !== 'AgentDirectorError')
+
+describe('b.jg5 SRJ-101, SRJ-104: every class the client declares is decided by class in src/ and the stub, never by name', () => {
+  test('the class names are read from the installed client: each of its declared error classes, by its own name, and the three Phase-1-only classes', () => {
+    expect(CLIENT_CLASS_EXPORTS.map(([name]) => name).sort()).toEqual([...DECLARED_CLASS_NAMES].sort())
+    for (const [name, cls] of CLIENT_CLASS_EXPORTS) expect(cls.name).toBe(name)
+    expect(CLASS_NAMES.has('AgentDirectorError')).toBe(false)
+    expect([...CLASS_NAMES]).toEqual(expect.arrayContaining([...PHASE1_ONLY_ERR_NAMES]))
+  })
+
+  test('the real src/ and the stub have no finding but the sanctioned uses', () => {
+    expect(BY_NAME_TREE.map(([file]) => file)).toEqual(expect.arrayContaining([STAND_IN_FILE, 'src/ad-error-class.ts', 'src/checked-kill.ts', 'src/kill-retry.ts', STUB_FILE]))
+    expect(unsanctioned(TREE_FINDINGS)).toEqual([])
+  })
+
+  test.each(SANCTIONED_BY_NAME.map((s) => [`${s.rule} of ${s.name} in ${s.file}`, s] as const))('the sanctioned %s names a class the installed client declares and still matches a site there', (_label, s) => {
+    expect(CLIENT_CLASS_EXPORTS.map(([name]) => name)).toContain(s.name)
+    expect(TREE_FINDINGS.some((f) => f.file === s.file && f.rule === s.rule && f.names.includes(s.name))).toBe(true)
   })
 
   test('the audit finds the real name constants and collections', () => {
-    expect([...TREE_BINDINGS.constants]).toEqual(expect.arrayContaining(['ERR_TMUX_KILL_FAILED_NAME', 'ERR_TMUX_UNRESPONSIVE_NAME', 'ERR_TMUX_SESSION_CONFLICT_NAME']))
-    expect([...TREE_BINDINGS.collections]).toEqual(expect.arrayContaining(['PHASE1_ONLY_ERR_NAMES', 'REQUIRED_ERR_NAMES']))
+    expect([...TREE_BINDINGS.constants.keys()]).toEqual(expect.arrayContaining(['ERR_TMUX_KILL_FAILED_NAME', 'ERR_TMUX_UNRESPONSIVE_NAME', 'ERR_TMUX_SESSION_CONFLICT_NAME', 'ERR_SPAWN_NOT_FOUND_NAME']))
+    expect([...TREE_BINDINGS.collections.keys()]).toEqual(expect.arrayContaining(['PHASE1_ONLY_ERR_NAMES', 'REQUIRED_ERR_NAMES']))
   })
 
   test('every allowed stand-in declaration is declared in src/agent-director-errors.ts', () => {
@@ -929,10 +1110,14 @@ describe('b.jg5 SRJ-101, SRJ-104: no by-name recognition of a Phase-1-only class
 
   test.each(BY_NAME_PLANTED)('%s: one finding of its rule, naming the synthetic file', (what, source, rule) => {
     const file = plantedFile(what)
-    expect(byNameFindings([[file, source]], TREE_BINDINGS).map(({ file: f, rule: r }) => ({ file: f, rule: r }))).toEqual([{ file, rule }])
+    expect(unsanctioned(byNameFindings([[file, source]], TREE_BINDINGS)).map(({ file: f, rule: r }) => ({ file: f, rule: r }))).toEqual([{ file, rule }])
+  })
+
+  test.each(BY_NAME_PLANTED_AT)('%s (planted at %s): one finding of its rule, which no sanction drops', (_what, file, source, rule) => {
+    expect(unsanctioned(byNameFindings([[file, source]], TREE_BINDINGS)).map(({ file: f, rule: r }) => ({ file: f, rule: r }))).toEqual([{ file, rule }])
   })
 
   test.each(BY_NAME_ALLOWED)('%s: no finding', (_what, file, source) => {
-    expect(byNameFindings([[file, source]], TREE_BINDINGS)).toEqual([])
+    expect(unsanctioned(byNameFindings([[file, source]], TREE_BINDINGS))).toEqual([])
   })
 })

@@ -53,7 +53,7 @@ and the two build contexts below.
 
 ## What the base holds
 
-Every path is readable by every user, `testuser` included.
+Every path is readable by every user, `testuser` included, except the global client under `/root`, which is root-only.
 
 | Path | What it is |
 |---|---|
@@ -63,7 +63,7 @@ Every path is readable by every user, `testuser` included.
 | `/opt/agent-director-rc/client/release.json` | The release record: `version`, `commit`, `client_tarball` (the tarball's path above) and `client_tarball_sha256` |
 | `/opt/agent-director-rc/install/install.sh` | The release candidate's install script (mode 0755), from agent-director's source tree at the pinned commit. Off `PATH`; its directory holds nothing else |
 | `/opt/agent-director-rc/check/rc-client-check.sh` | The client-under-test check (`docker/rc-client-check.sh`, mode 0755; `ci-live/lib/rc-client.ts` exports the path as `RC_CLIENT_CHECK`). Off `PATH`, outside the release candidate's binary directory. See [The client under test](#the-client-under-test) |
-| `/root/.bun/install/global/node_modules/agent-director` | The global agent-director client: the release candidate's, installed with `bun add -g --ignore-scripts` from the tarball `release.json` names (it has no dependencies, so nothing comes from the registry), then checked by the build with `rc-client-check.sh --client` |
+| `/root/.bun/install/global/node_modules/agent-director` | The global agent-director client: the release candidate's, installed with `bun add -g --ignore-scripts` from the tarball `release.json` names (it has no dependencies, so nothing comes from the registry), then checked by the build with `rc-client-check.sh --client`. Root-only (`/root` is 0700): this base build and `docker/Dockerfile.live` read it, both as root; `testuser` cannot |
 | `/opt/agent-director-0.10.0/bin/agent-director` | agent-director 0.10.0's binary, off `PATH` |
 | `/opt/agent-director-0.10.0/agent-director-0.10.0.tgz` | The published agent-director 0.10.0 client, from npm |
 | `/opt/claude-slack-channel-bots-0.10.0/claude-slack-channel-bots-0.10.0.tgz` | The published pre-persona claude-slack-channel-bots 0.10.0 package, from npm |

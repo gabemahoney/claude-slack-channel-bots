@@ -10,7 +10,8 @@
 #     --build-context agent-director-install=<directory holding install.sh> \
 #     -f docker/Dockerfile.test.base -t cscb-ci-base:v5 .
 #
-# Fixed paths (all readable by every user, testuser included):
+# Fixed paths (all readable by every user, testuser included, except the
+# global client under /root, which is root-only):
 #   /opt/agent-director-rc/bin/agent-director
 #       the release candidate's binary, the image's default agent-director.
 #       Its directory holds nothing else and is first on the default PATH,
@@ -34,7 +35,9 @@
 #       ci-live/checks/setup-checks.ts and docker/Dockerfile.live run it.
 #   /root/.bun/install/global/node_modules/agent-director
 #       the global agent-director client: the release candidate's, installed
-#       from its tarball above and checked by the build.
+#       from its tarball above and checked by the build. Root-only (/root is
+#       0700): read by this base build and by docker/Dockerfile.live, which
+#       both run as root; testuser cannot read it.
 #   /opt/agent-director-0.10.0/bin/agent-director
 #       agent-director 0.10.0's binary, off PATH.
 #   /opt/agent-director-0.10.0/agent-director-0.10.0.tgz

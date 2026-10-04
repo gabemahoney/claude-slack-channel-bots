@@ -715,6 +715,7 @@ const NOT_KILLED_ROWS: readonly FailureRow[] = [
   ['ErrTmuxNotAvailable, a different tmux server (ENVIRONMENT)', () => errTmuxNotAvailableDifferentServer(STUB_TMUX_SOCKET_PATH, KILL_VERB), AD_ERROR_CLASS_ENVIRONMENT],
   ...UNUSABLE_NAME_FAULTS.map((f): FailureRow => [`the unusable-name ErrInternal, ${f} (UNUSABLE NAME)`, () => errUnusableName(f), AD_ERROR_CLASS_UNUSABLE_NAME]),
   ['a plain ErrInternal (UNCLASSIFIED)', () => errInternal(), AD_ERROR_CLASS_UNCLASSIFIED],
+  ['a base AgentDirectorError merely named ErrSpawnNotFound at a try (not that class: no success, UNCLASSIFIED)', () => errGeneric(KILL_VERB, ERR_SPAWN_NOT_FOUND_NAME, 'row gone'), AD_ERROR_CLASS_UNCLASSIFIED],
   ['a plain ErrInternal whose description carries fake tokens (UNCLASSIFIED)', () => errInternal(`the store could not be read (${sentinelInMessage('kill-internal')})`), AD_ERROR_CLASS_UNCLASSIFIED],
   ['a CONFLICT whose description carries fake tokens', () => errTmuxSessionConflict(KILL_VERB, 'unrecognised', sentinelInMessage('kill-conflict')), AD_ERROR_CLASS_CONFLICT],
   [`${ERR_SCHEMA_MISMATCH_NAME} (a store name, UNCLASSIFIED)`, () => errSchemaMismatch(), AD_ERROR_CLASS_UNCLASSIFIED],
@@ -1177,7 +1178,8 @@ describe('personaTeardownReportOf: each persona\'s report plan (b.jg5 SRJ-907, S
 
   test.each(REPORT_COMMANDS)('%s: descriptions carrying fake tokens, in the failure line and in both versions\' quotes, come out redacted in every printed line, logged line and entry', (command) => {
     const killValue = errTmuxKillFailed(sentinelInMessage('report-last'), 'outlived-exit-wait')
-    const survivorWithToken = `${survivorDescription()} (${sentinelInMessage('report-survivor')})`
+    // The fake token leads the quoted description, so the log cap never cuts it off.
+    const survivorWithToken = `(${sentinelInMessage('report-survivor')}) ${survivorDescription()}`
     const failed = personaTeardownReportOf(command, REPORT_PERSONA, failedKillOutcome(killValue, AD_ERROR_CLASS_UNAVAILABLE, {
       kind: KILL_RETRY_ALERT_ORDINARY, lastKillFailedDescription: teardownKillFailedDescription(killValue), earlierSurvivorDescription: survivorWithToken,
     }, KILL_RETRY_TRIES))

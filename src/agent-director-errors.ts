@@ -302,46 +302,6 @@ export const ERR_INTERNAL_NAME = 'ErrInternal'
  */
 export const ERR_SPAWN_NOT_FOUND_NAME = 'ErrSpawnNotFound'
 
-/**
- * `errName` of the error agent-director answers when a row is not interactive
- * for the verb: a `send-keys` that reaches no session carrying this launch's
- * label, or a `pending` row with no launch start (C5, C21). Every client
- * declares its class (`ErrSpawnNotInteractive`), by which every site, the
- * dialog approver included (b.jg5 SRJ-118, SRJ-404), recognises it; the name
- * is kept here for log labels.
- */
-export const ERR_SPAWN_NOT_INTERACTIVE_NAME = 'ErrSpawnNotInteractive'
-
-/**
- * `errName` of the error the client raises when its agent-director binary is
- * gone after the client was built (any verb; b.xht). Every client declares
- * its class (`ErrSystemInstallDisappeared`), by which every site, the
- * liveness adapter included (where it reads dead, b.jg5 SRJ-314), recognises
- * it; the name is kept here for log labels.
- */
-export const ERR_SYSTEM_INSTALL_DISAPPEARED_NAME = 'ErrSystemInstallDisappeared'
-
-/**
- * `errName`s of `resume`'s answers that the live-row sequence's final
- * launch tells apart (b.jg5 SRJ-705, SRJ-710): the three no-transcript
- * answers, which go on to the reuse spawn, and `ErrSpawnNotResumable`. Every
- * client declares their classes, by which the sites recognise them; the
- * names are kept here for log labels.
- */
-export const ERR_NO_SESSION_ID_NAME = 'ErrNoSessionId'
-export const ERR_JSONL_MISSING_NAME = 'ErrJsonlMissing'
-export const ERR_JSONL_NEVER_WRITTEN_NAME = 'ErrJsonlNeverWritten'
-export const ERR_SPAWN_NOT_RESUMABLE_NAME = 'ErrSpawnNotResumable'
-
-/**
- * `errName` of the error agent-director answers when a spawn names an id
- * whose row is live (a plain spawn's or a reuse spawn's collision, b.jg5
- * SRJ-111, SRJ-112). Every client declares its class
- * (`ErrInstanceIdCollision`), by which the launch sites recognise it; the
- * name is kept here for log labels.
- */
-export const ERR_INSTANCE_ID_COLLISION_NAME = 'ErrInstanceIdCollision'
-
 /** The three store-open error names, in one list. */
 export const STORE_OPEN_ERR_NAMES = [
   ERR_SCHEMA_MISMATCH_NAME,

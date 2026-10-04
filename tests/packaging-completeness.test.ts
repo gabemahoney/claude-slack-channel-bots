@@ -741,6 +741,34 @@ function rangePreReleases(spec: string): string[] {
     .map((comparator) => comparator.semver.version)
 }
 
+describe('rangePreReleases', () => {
+  const floorXRange = `${semver.major(PHASE1_FLOOR_VERSION)}.${semver.minor(PHASE1_FLOOR_VERSION)}.x`
+
+  test.each([
+    ['the old release\'s caret', `^${OLD_AD_VERSION}`, []],
+    ['the floor\'s caret', `^${PHASE1_FLOOR_VERSION}`, []],
+    ['the floor\'s tilde', `~${PHASE1_FLOOR_VERSION}`, []],
+    ['an x-range over the floor', floorXRange, []],
+    ['*', '*', []],
+    ['the release candidate', PHASE1_RC_VERSION, [PHASE1_RC_VERSION]],
+    ['the release candidate\'s caret', `^${PHASE1_RC_VERSION}`, [PHASE1_RC_VERSION]],
+    ['at or above the release candidate', `>=${PHASE1_RC_VERSION}`, [PHASE1_RC_VERSION]],
+    ['a range from the old release up to the release candidate', `>=${OLD_AD_VERSION} <${PHASE1_RC_VERSION}`, [PHASE1_RC_VERSION]],
+  ])('%s (%p) names %p', (_label, spec, expected) => {
+    expect(semver.validRange(spec)).not.toBeNull()
+    expect(rangePreReleases(spec)).toEqual(expected)
+  })
+
+  // A dist-tag or a non-registry source is no version range: the spec test's validRange check refuses it before rangePreReleases runs, and rangePreReleases itself throws on it.
+  test.each([
+    ['a dist-tag', 'latest'],
+    ['a file source', `file:../${AD_PACKAGE}-${PHASE1_FLOOR_VERSION}.tgz`],
+  ])('%s is no version range', (_label, spec) => {
+    expect(semver.validRange(spec)).toBeNull()
+    expect(() => rangePreReleases(spec)).toThrow()
+  })
+})
+
 describe(`b.jg5 SRJ-101: the real package.json and bun.lock never take ${AD_PACKAGE} from a release candidate, a tag or a non-registry source (hermetic)`, () => {
   test(`package.json names ${AD_PACKAGE} in dependencies and in no other section`, () => {
     const pkg = readPkg()

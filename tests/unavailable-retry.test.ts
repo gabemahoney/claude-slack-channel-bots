@@ -840,8 +840,11 @@ describe('unavailable retry: the schedule', () => {
     expect(controller.view(KEY)?.refusals).toBe(1)
     const described = lines.filter((line) => line.includes('ErrTmuxNotAvailable message="'))
     expect(described).toHaveLength(2)
+    // The same builder with the redacted socket path: the description as it should be logged.
+    const redacted = errTmuxNotAvailable(`(${REDACTED_SENTINEL_TAIL})`, 'spawn').errDescription
+    expect(redacted).not.toBe(err.errDescription)
     for (const line of described) {
-      expect(line).toContain(`tmux socket (${REDACTED_SENTINEL_TAIL}) is not accessible to this user"`)
+      expect(line).toContain(`${redacted}"`)
     }
     assertNoLeak(lines)
   })

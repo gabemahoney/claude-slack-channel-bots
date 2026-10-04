@@ -27,7 +27,7 @@
  *   3. A module whose every read throws: problems, never a throw.
  *   4. The `FAIL:` line for a problem.
  *
- * Phrases, names and class labels come from `src/`, never literals.
+ * Phrases, names, verbs and class labels come from `src/`, never literals.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -168,6 +168,8 @@ const MISMATCHES: readonly MismatchCase[] = [
   { label: 'ad-error-class has a non-function classifyAdError', patch: { errorClass: { classifyAdError: AD_ERROR_CLASS_GONE } }, kinds: [PROBLEM_MISSING_EXPORT], names: 'classifyAdError' },
   { label: 'ad-description-phrases lacks LAUNCH_TIMEOUT_PHRASE', patch: { phrases: { LAUNCH_TIMEOUT_PHRASE: undefined } }, kinds: [PROBLEM_MISSING_EXPORT], names: 'LAUNCH_TIMEOUT_PHRASE' },
   { label: 'the client lacks errorFromEnvelope', patch: { client: { errorFromEnvelope: undefined } }, kinds: [PROBLEM_MISSING_EXPORT], names: 'errorFromEnvelope' },
+  { label: 'ad-error-class lacks AD_LAUNCH_VERBS', patch: { errorClass: { AD_LAUNCH_VERBS: undefined } }, kinds: [PROBLEM_MISSING_EXPORT], names: 'AD_LAUNCH_VERBS' },
+  { label: 'ad-error-class has an empty AD_LAUNCH_VERBS', patch: { errorClass: { AD_LAUNCH_VERBS: new Set<string>() } }, kinds: [PROBLEM_MISSING_EXPORT], names: 'AD_LAUNCH_VERBS' },
 
   // The presence flag.
   { label: 'the presence flag is false', patch: { errors: { PHASE1_ERROR_CLASSES_FROM_CLIENT: false } }, kinds: [PROBLEM_PRESENCE_FLAG], names: 'PHASE1_ERROR_CLASSES_FROM_CLIENT' },

@@ -202,6 +202,7 @@ import type {
 import type { Persona } from '../../src/config.ts'
 import {
   PERSONA_INSTANCE_ID_PREFIX,
+  PERSONA_TMUX_SESSION_PREFIX,
   personaInstanceId,
   personaTmuxSessionName,
 } from '../../src/persona-identity.ts'
@@ -953,10 +954,24 @@ export interface KillFailedOptions {
 }
 
 /**
+ * The instance id `errTmuxKillFailed`'s descriptions name for `sessionName`:
+ * `cscb_<key>` for a persona's own session `slack_bot_<key>`, otherwise
+ * {@link STUB_INSTANCE_ID}.
+ */
+function killFailedInstanceId(sessionName: string): string {
+  return sessionName.startsWith(PERSONA_TMUX_SESSION_PREFIX)
+    ? personaInstanceId(sessionName.slice(PERSONA_TMUX_SESSION_PREFIX.length))
+    : STUB_INSTANCE_ID
+}
+
+/**
  * Build an `ErrTmuxKillFailed` (the class binding of
  * `src/agent-director-errors.ts`; verb `kill`) with one of its four
- * descriptions ({@link KillFailedDescription}), each starting at the quoted
- * session name and ending "retry kill later; never delete this row". Only
+ * descriptions ({@link KillFailedDescription}), each the full text the client
+ * delivers: agent-director's error text, `tmux: agent process still running:
+ * instance <id>: ` (the id `cscb_<key>` for a session `slack_bot_<key>`,
+ * else {@link STUB_INSTANCE_ID}), then the quoted session name, and ending
+ * "retry kill later; never delete this row". Only
  * `'pane-process-survived'` carries the survivor clause, built from
  * `SURVIVOR_CLAUSE_ONE_PHRASE` for one of `pids` and
  * `SURVIVOR_CLAUSE_MANY_PHRASE` for several; the other three ignore `pids`.
@@ -978,7 +993,7 @@ export function errTmuxKillFailed(
   if (options.workerAlsoRunning === true && description !== 'pane-process-survived') {
     throw new Error(`errTmuxKillFailed (${description}): workerAlsoRunning applies to 'pane-process-survived' only`)
   }
-  const context = `tmux session ${JSON.stringify(sessionName)}`
+  const context = `tmux: agent process still running: instance ${killFailedInstanceId(sessionName)}: tmux session ${JSON.stringify(sessionName)}`
   const sent = "a kill was sent to the agent's pane and to its labelled session"
   const exitWait = 'still running after the kill exit wait of 5 s'
   const tail = `${RETRY_KILL_LATER_PHRASE}; ${NEVER_DELETE_ROW_PHRASE}`

@@ -1152,12 +1152,18 @@ function phase1ImportFindings(sf: ts.SourceFile): string[] {
 /**
  * The only files (by repository path) that may read a Phase-1-only error
  * class from agent-director (b.jg5 SRJ-101, SRJ-103): the module that
- * resolves the three for the rest of CSCB, the test of their identities, and
- * the image-side fixture that checks them on the release-candidate client.
- * Every other file takes the classes from `src/agent-director-errors.ts`.
+ * resolves the three for the rest of CSCB, the test of their identities, the
+ * image-side fixture that checks them on the release-candidate client, and
+ * the source audit, which passes the namespace to `Object.entries` to collect
+ * the name of every error class the installed client declares for its
+ * by-name audit. That read names no Phase-1-only export, so the source audit
+ * loads on the 0.10.0 client and on the Phase 1 client alike (SRJ-101 bans
+ * named imports and re-exports, which it does not use). Every other file
+ * takes the classes from `src/agent-director-errors.ts`.
  */
 const PHASE1_READ_FILES: readonly string[] = [
   'src/agent-director-errors.ts',
+  'tests/fmk-source-audit.test.ts',
   'tests/integration/fixtures/phase1-client-check.ts',
   'tests/phase1-client-classes.test.ts',
 ]
