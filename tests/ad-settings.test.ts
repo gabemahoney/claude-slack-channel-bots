@@ -12,7 +12,11 @@
  * agent-director's verb ceilings, the call timeout's need and the startup
  * check that warns when `agent_director_call_timeout_ms` does not exceed it
  * (b.jg5 SRJ-213, AC 80): each ceiling against its formula written out here,
- * the need, and the check's one line through a capturing log sink.
+ * the need, and the check's one line through a capturing log sink. The
+ * settings helper's own self-test (b.jg5 SRJ-1304) is here too: where
+ * `writeAgentDirectorConfig` writes, the HOME it refuses, a `BigInt` read
+ * back as an integer and a plain number, its zero fraction kept, as a float,
+ * the zero-fraction row of `REFUSED_AD_CONFIG_FORMS`, and the re-exports.
  *
  * Every config file is written by `writeAgentDirectorConfig`
  * (`tests/test-helpers/ad-settings.ts`, b.jg5 SRJ-1304) under a
@@ -33,8 +37,8 @@
  */
 
 import { afterEach, describe, expect, spyOn, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { mkdirSync, mkdtempSync, rmSync, statSync } from 'node:fs'
+import { devNull, homedir } from 'node:os'
 import { join } from 'node:path'
 
 import {
@@ -46,6 +50,7 @@ import {
   AD_PAUSE_TABLE,
   AD_PAUSE_TIMEOUT_KEY,
   AD_SETTING_INTEGER_MAX,
+  AD_SETTING_MINIMUMS as SRC_AD_SETTING_MINIMUMS,
   AD_SETTINGS_LOG_PREFIX,
   AD_SETTINGS_RELATIVE_PATH,
   AD_TMUX_KEYS,
@@ -64,6 +69,7 @@ import {
   buildAdSettingsRefusedReadLine,
   checkAdCallTimeoutAtStartup,
   createAdSettingsReader,
+  DEFAULT_AD_SETTINGS as SRC_DEFAULT_AD_SETTINGS,
   DEFAULT_AD_SETTINGS_IN_EFFECT,
   DIALOG_READY_TIMEOUT_MS,
   installAdSettings,
@@ -105,6 +111,7 @@ import {
   writeAgentDirectorConfig,
   type AdConfigInput,
   type AdConfigValue,
+  type RefusedAdConfigForm,
 } from './test-helpers/ad-settings.ts'
 import {
   errSystemInstallNotFound,
@@ -114,7 +121,7 @@ import {
 import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
-import { osTempDir } from './test-helpers/host-safe-env.ts'
+import { isUnder, osTempDir } from './test-helpers/host-safe-env.ts'
 import {
   importSource,
   importedSpecifiers,
@@ -787,6 +794,87 @@ describe('ad settings: no file text reaches a line or an outcome', () => {
       expect(rig.reader.valuesInEffect().pauseTimeout.kind).toBe('not-used')
     }
     assertNoLeak({ lines: rig.lines, outcome, values: rig.reader.valuesInEffect() })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The settings helper's self-test (b.jg5 SRJ-1304): where it writes, the HOME it refuses, how it writes numbers, its zero-fraction row, its re-exports
+// ---------------------------------------------------------------------------
+
+/** Added to an integral number, a float with a fraction. */
+const HALF = 0.5
+
+/** A refused form's `[tmux]` value under its key, when it holds one. */
+function formTmuxValue(form: RefusedAdConfigForm): AdConfigValue | undefined {
+  return form.key !== undefined && 'tmux' in form.input ? form.input.tmux?.[form.key] : undefined
+}
+
+/** The helper's refused forms whose value is a plain integral number: written as a float with a zero fraction. */
+const ZERO_FRACTION_FORM_ROWS = REFUSED_AD_CONFIG_FORMS.filter((form) => {
+  const value = formTmuxValue(form)
+  return typeof value === 'number' && Number.isInteger(value)
+}).map((form) => [form.name, form] as const)
+
+describe('ad settings: the writeAgentDirectorConfig helper (b.jg5 SRJ-1304)', () => {
+  test('it writes AD_SETTINGS_RELATIVE_PATH under the HOME it is given, creating the directory, and answers that path', () => {
+    const home = makeHome()
+    const path = writeAgentDirectorConfig(home, CHANGED_FILE)
+    expect(path).toBe(join(home, AD_SETTINGS_RELATIVE_PATH))
+    expect(statSync(path).isFile()).toBe(true)
+  })
+
+  test('it refuses a HOME not under the OS temp directory, throwing its own error before any write', () => {
+    // Under the null device no directory can be made: a write that got past the check would fail with an fs error, not the helper's.
+    const notTemp = join(devNull, 'home')
+    expect(isUnder(notTemp, osTempDir())).toBe(false)
+    expect(() => writeAgentDirectorConfig(notTemp, CHANGED_FILE)).toThrow(writeAgentDirectorConfig.name)
+  })
+
+  test.each(TMUX_KEY_ROWS)('%s: its default as a BigInt is read as an integer and used; as a plain number it is read as a float, its zero fraction kept', (key) => {
+    const rig = makeReaderRig()
+    rig.write({ tmux: { [key]: DEFAULT_TMUX[key] } })
+    expect(rig.read()).toEqual({ kind: 'accepted', values: inEffect(DEFAULT_TMUX) })
+    rig.write({ tmux: { [key]: Number(DEFAULT_TMUX[key]) + HALF } })
+    const floatReason = refusedReason(rig.read())
+    rig.write({ tmux: { [key]: String(DEFAULT_TMUX[key]) } })
+    expect(refusedReason(rig.read())).not.toBe(floatReason)
+    rig.write({ tmux: { [key]: Number(DEFAULT_TMUX[key]) } })
+    expect(refusedReason(rig.read())).toBe(floatReason)
+  })
+
+  test('[pause] timeout_seconds: a BigInt is read as an integer and used; a plain number is read as a float, its zero fraction kept', () => {
+    const rig = makeReaderRig()
+    rig.write({ pauseTimeout: CHANGED_PAUSE_SECONDS })
+    rig.read()
+    expect(rig.reader.valuesInEffect().pauseTimeout).toEqual({ kind: 'used', seconds: CHANGED_PAUSE_SECONDS })
+    rig.write({ pauseTimeout: Number(CHANGED_PAUSE_SECONDS) + HALF })
+    rig.read()
+    const floatPause = rig.reader.valuesInEffect().pauseTimeout
+    expect(floatPause.kind).toBe('not-used')
+    rig.write({ pauseTimeout: String(CHANGED_PAUSE_SECONDS) })
+    rig.read()
+    expect(rig.reader.valuesInEffect().pauseTimeout).not.toEqual(floatPause)
+    rig.write({ pauseTimeout: Number(CHANGED_PAUSE_SECONDS) })
+    rig.read()
+    expect(rig.reader.valuesInEffect().pauseTimeout).toEqual(floatPause)
+  })
+
+  test('REFUSED_AD_CONFIG_FORMS holds a float with a zero fraction', () => {
+    expect(ZERO_FRACTION_FORM_ROWS.length).toBeGreaterThan(0)
+  })
+
+  test.each(ZERO_FRACTION_FORM_ROWS)('%s is read as a float: refused with the reason its key gets with a fraction', (_name, form) => {
+    const rig = makeReaderRig()
+    const tmux = 'tmux' in form.input ? form.input.tmux : undefined
+    rig.write({ tmux: { ...tmux, [form.key!]: (formTmuxValue(form) as number) + HALF } })
+    const floatReason = refusedReason(rig.read())
+    rig.write(form.input)
+    expect(refusedReason(rig.read())).toBe(floatReason)
+  })
+
+  test("DEFAULT_AD_SETTINGS and AD_SETTING_MINIMUMS are src/ad-settings.ts's own objects, re-exported, not copies", () => {
+    expect(DEFAULT_AD_SETTINGS).toBe(SRC_DEFAULT_AD_SETTINGS)
+    expect(AD_SETTING_MINIMUMS).toBe(SRC_AD_SETTING_MINIMUMS)
   })
 })
 

@@ -470,6 +470,15 @@
  *   entry's `stop`), every forget of the persona's latch (the binding's
  *   forget observer: `teardown(key)`, `teardownDeps().forgetConflictLatch`,
  *   `restartServer(key)`), `shutdown()`'s `stopAll` and `cleanup()`'s.
+ *   Decision (E30 T1's PM finding, recorded in E30 T3): the binding is
+ *   opt-in, and stays so, although `main()` always binds it. Binding it by
+ *   default broke 84 tests in 8 files, each asserting that a latched persona
+ *   gets no call and no timer on some other automated path (AC 46's half and
+ *   its kin), which a bound re-check's 120 s rounds and its armed timer would
+ *   contradict. So a case about the re-check, or about a latched persona's
+ *   life with it, passes `latchRecheck: true` (as `tests/conflict-latch.test.ts`'s
+ *   `makeRecheckHarness` does); every other case leaves it unbound, and the
+ *   default changes only together with those suites.
  * - `invalidFlagsHold` (b.jg5 SRJ-207, SRJ-1008, SRJ-1016, SRJ-305): one
  *   `ErrInvalidFlags` hold per harness (`createInvalidFlagsHold`, its lines
  *   to `lines`), composed as `main()` composes it: installed in the session
@@ -865,6 +874,19 @@
  * - `stateDir` and `startupErrors()`: `SLACK_STATE_DIR` points at a
  *   temporary directory while the harness is live; `startupErrors()` answers
  *   the entries written to its `startup-errors.log`, one per line.
+ * - Overlapping harnesses (a case that builds a second harness before it
+ *   cleans the first up): `SLACK_STATE_DIR` and `console.error` are the
+ *   newest live harness's, and each `cleanup()` gives them up last in, first
+ *   out by effect, whatever order the case cleans up in: cleaning up the
+ *   newest live harness puts back what was in effect at its build, while
+ *   cleaning up an older one changes nothing now and passes what it saved to
+ *   the next newer one, so the values from before the first build are back
+ *   once all are cleaned up, never an earlier harness's removed directory or
+ *   capture. Only these two process-wide values are restored this way: the
+ *   session manager's installs (the stub client, the latch, the hold, the
+ *   rule and the rest) are module singletons that the newest build installs
+ *   and every `cleanup()` resets, so a case drives only its newest harness
+ *   while two are live.
  * - `home` and `settings()`: agent-director's settings in effect, through
  *   the settings install (`installAdSettings`) over the temporary HOME.
  *   `options.adSettings`, when given, is written there first
@@ -886,8 +908,9 @@
  *   not stall the step. Resolves with the number of timers fired.
  * - `errors`: every `console.error` call while the harness is live (the
  *   session manager's and the restart module's lines), its arguments joined
- *   with spaces, in order. `console.error` is replaced at build and put back
- *   by `cleanup()`.
+ *   with spaces, in order, while the harness is the newest live one.
+ *   `console.error` is replaced at build and given up by `cleanup()` (see
+ *   overlapping harnesses, above).
  * - `captured()`: everything captured, for `assertNoLeak`: the lines, the
  *   `console.error` lines, the four notice lists, the startup-errors
  *   entries, the attempts, the triggers, the condition ends, the outage
@@ -933,7 +956,8 @@
  *   re-check's install when `recheckAnswers` or `versionRecheck` made one
  *   (disposed first, before the pending timers are counted), the sequence
  *   registry's install (`_resetLiveRowSequenceRegistry`), the old-life wait
- *   bindings (`_resetOldLifeWaitBindings`), `SLACK_STATE_DIR`) and
+ *   bindings (`_resetOldLifeWaitBindings`), `SLACK_STATE_DIR` and
+ *   `console.error`, given up as overlapping harnesses need, above) and
  *   removes the temporary directory. The registry is closed (every live-row
  *   sequence and old-life wait still running stopped with the shutdown
  *   reason) after the pending timers, the running sequences and the running
@@ -1405,8 +1429,60 @@ const DEFAULT_APPROVER_STEPS = 1000
 /** What the scripted action answers once a persona's queued outcomes run out: a bare refusal. */
 const SCRIPTED_REFUSAL: UnavailableRetryOutcome = Object.freeze({ kind: 'again' })
 
+/** The process-wide values a live harness replaces while it is live. */
+interface RecoveryAmbient {
+  /** `process.env.SLACK_STATE_DIR` (undefined: unset). */
+  readonly stateDir: string | undefined
+  readonly consoleError: typeof console.error
+}
+
+/** One live harness's hold on the process-wide values: what it put back at its cleanup if it were the newest live harness. */
+interface RecoveryAmbientFrame {
+  saved: RecoveryAmbient
+}
+
+/**
+ * Every live harness's frame, oldest first. Overlapping harnesses (a case
+ * that builds a second before it cleans the first up) are cleaned up in any
+ * order: see {@link releaseRecoveryAmbient}.
+ */
+const liveAmbientFrames: RecoveryAmbientFrame[] = []
+
+function putAmbient(values: RecoveryAmbient): void {
+  if (values.stateDir === undefined) delete process.env['SLACK_STATE_DIR']
+  else process.env['SLACK_STATE_DIR'] = values.stateDir
+  console.error = values.consoleError
+}
+
+/** Point `SLACK_STATE_DIR` and `console.error` at a new harness's, saving what was in effect: the newest live harness's values win. */
+function takeRecoveryAmbient(values: RecoveryAmbient): RecoveryAmbientFrame {
+  const frame: RecoveryAmbientFrame = { saved: { stateDir: process.env['SLACK_STATE_DIR'], consoleError: console.error } }
+  liveAmbientFrames.push(frame)
+  putAmbient(values)
+  return frame
+}
+
+/**
+ * Give a harness's frame up at its cleanup, correct for overlapping
+ * harnesses in any cleanup order (last in, first out by effect): the newest
+ * live harness puts back what it saved at its build; an older one changes
+ * nothing now (a newer one's values stay in effect) and hands what it saved
+ * to the next newer frame, which then puts that back at its own cleanup. So
+ * once every harness is cleaned up, the values in effect before the first
+ * build are back, and while any is live, the newest live one's are in
+ * effect. A frame given up twice changes nothing.
+ */
+function releaseRecoveryAmbient(frame: RecoveryAmbientFrame): void {
+  const index = liveAmbientFrames.indexOf(frame)
+  if (index === -1) return
+  liveAmbientFrames.splice(index, 1)
+  const newer = liveAmbientFrames[index]
+  if (newer === undefined) putAmbient(frame.saved)
+  else newer.saved = frame.saved
+}
+
 /** The connection status the relaunch gate reads for every persona: serving. */
-const SERVING: PersonaConnectionStatus = Object.freeze({ state: 'up', identity: Object.freeze({ botUserId: 'U0RECOVERY', botId: 'B0RECOVERY' }) })
+const SERVING: PersonaConnectionStatus =Object.freeze({ state: 'up', identity: Object.freeze({ botUserId: 'U0RECOVERY', botId: 'B0RECOVERY' }) })
 
 /** Options of `makeRecoveryHarness`; every one is optional. */
 export interface RecoveryHarnessOptions {
@@ -1481,7 +1557,9 @@ export interface RecoveryHarnessOptions {
    * timer and its rounds; false when unset: the re-check is built through
    * the same builder but its observer is not bound, so no latch arms a timer
    * and the suites that assert no call or timer for a latched persona on
-   * the other automated paths keep their meaning.
+   * the other automated paths keep their meaning. Opt-in by decision (E30
+   * T1's PM finding; see the module comment's `latchRecheck`): binding it by
+   * default broke 84 tests in 8 files.
    */
   latchRecheck?: boolean
 }
@@ -2372,12 +2450,15 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     log,
   })
 
-  const savedStateDir = process.env['SLACK_STATE_DIR']
-  process.env['SLACK_STATE_DIR'] = stateDir
-  const savedConsoleError = console.error
-  console.error = (...args: unknown[]) => {
-    errors.push(args.map(String).join(' '))
-  }
+  // `SLACK_STATE_DIR` and `console.error` are this harness's while it is the
+  // newest live one; its cleanup gives them up LIFO-correctly, whatever order
+  // overlapping harnesses are cleaned up in (`releaseRecoveryAmbient`).
+  const ambient = takeRecoveryAmbient({
+    stateDir,
+    consoleError: (...args: unknown[]) => {
+      errors.push(args.map(String).join(' '))
+    },
+  })
 
   // As main() reads its one retired-key store at start (b.jg5 SRJ-802), over
   // the harness's state directory, its lines to `console.error` (so to
@@ -2399,9 +2480,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   if (options.retiredKeys !== undefined) writeRetiredKeysRecord(stateDir, options.retiredKeys(keys))
   const retiredKeysStart = readRetiredKeysAtStart(stateDir, { log: (line) => console.error(line), write: writeRetiredKeys })
   if (retiredKeysStart.kind !== 'loaded') {
-    console.error = savedConsoleError
-    if (savedStateDir === undefined) delete process.env['SLACK_STATE_DIR']
-    else process.env['SLACK_STATE_DIR'] = savedStateDir
+    releaseRecoveryAmbient(ambient)
     rmSync(root, { recursive: true, force: true })
     throw new Error('recovery harness: the retired-key record the case seeded cannot be read')
   }
@@ -3656,9 +3735,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       _resetFindMissingMemo()
       if (harnessNow) _resetNow()
       resetAdSettingsForTests()
-      console.error = savedConsoleError
-      if (savedStateDir === undefined) delete process.env['SLACK_STATE_DIR']
-      else process.env['SLACK_STATE_DIR'] = savedStateDir
+      releaseRecoveryAmbient(ambient)
       rmSync(root, { recursive: true, force: true })
       if (pendingTimers !== 0 || armed.length !== 0 || sequencesRunning.length !== 0 || oldLifeWaitsRunning.length !== 0) {
         throw new Error(

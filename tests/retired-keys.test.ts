@@ -10,6 +10,14 @@
  * - Format (SRJ-802): a round trip through the serialiser and the parser and
  *   through the store; `version` 1; RFC 3339 UTC timestamps equal to the
  *   injected clock's time; a key that is no persona key is accepted.
+ * - The record helpers (SRJ-1304): `writeRetiredKeysRecord` writes exactly
+ *   the serialiser's bytes for its seeds (a given time kept, an unset one the
+ *   sample) and refuses the real home (shown with the launch-time home
+ *   `os.homedir()`, which `isRealHome` matches; only the guard's own files
+ *   name `realHome`), the OS temp directory itself and a directory outside
+ *   it, writing nothing; `readRetiredKeysRecord` reads
+ *   `null` for no file, throws naming the file and the parser's problem for a
+ *   refused record, and rethrows any other read failure.
  * - The primitives: a batch record is one write; re-recording a marked key
  *   clears its mark, an unmarked one writes nothing; mark; clear; restore of
  *   the record held before a batch (SRJ-804: the file removed only when that
@@ -102,7 +110,7 @@ import {
   writeFileSync,
   writeSync,
 } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { durableUnlinkSync, durableWriteFileSync, type DurableWriteFs } from '../src/atomic-write.ts'
@@ -163,7 +171,7 @@ import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, writtenFile } from './test-h
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { makeFifo, mkfifoAvailable } from './test-helpers/fifo.ts'
 import { readStartupEntries, type StartupEntry } from './test-helpers/persona-notifier.ts'
-import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
+import { hostSafeChildEnv, osTempDir } from './test-helpers/host-safe-env.ts'
 import {
   readRetiredKeysRecord,
   retiredKeysRecordOf,
@@ -235,6 +243,16 @@ afterEach(() => {
 /** An errno-style error, as `node:fs` throws. */
 function errnoError(code: string): NodeJS.ErrnoException {
   return Object.assign(new Error(`${code}: injected failure`), { code })
+}
+
+/** What `act` throws; fails when it returns. */
+function thrownBy(act: () => unknown): NodeJS.ErrnoException {
+  try {
+    act()
+  } catch (err) {
+    return err as NodeJS.ErrnoException
+  }
+  throw new Error('expected a throw; none came')
 }
 
 /** The record file's bytes, or null when there is none. */
@@ -407,6 +425,59 @@ describe('the record\'s format and round trip (b.jg5 SRJ-802, SRJ-1304)', () => 
 
     for (const key of rig.store.keys()) rig.store.clear(key)
     expect(readRetiredKeysRecord(dir)).toEqual(new Map())
+  })
+
+  test('writeRetiredKeysRecord writes exactly the serialiser\'s bytes for its seeds: a given retired_at and mark time kept, true the sample mark, false, null or unset no mark', () => {
+    const givenRetiredAt = new Date(START_MS).toISOString()
+    const givenMark = new Date(START_MS + 1_000).toISOString()
+    const seeds: Readonly<Record<string, RetiredKeySeed>> = {
+      given: { cause: RETIRED_KEY_CAUSE_REMOVED, retiredAt: givenRetiredAt, mark: givenMark },
+      sample: { cause: RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY, mark: true },
+      off: { cause: RETIRED_KEY_CAUSE_ABSENT_AT_START, mark: false },
+      none: { cause: RETIRED_KEY_CAUSE_REMOVED, mark: null },
+      unset: { cause: RETIRED_KEY_CAUSE_REMOVED },
+    }
+    const expected: RetiredKeyRecord = new Map([
+      ['given', { retiredAt: givenRetiredAt, cause: RETIRED_KEY_CAUSE_REMOVED, newLifeBegunAt: givenMark }],
+      ['sample', { retiredAt: SAMPLE_RETIRED_AT, cause: RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY, newLifeBegunAt: SAMPLE_NEW_LIFE_BEGUN_AT }],
+      ['off', { retiredAt: SAMPLE_RETIRED_AT, cause: RETIRED_KEY_CAUSE_ABSENT_AT_START, newLifeBegunAt: null }],
+      ['none', { retiredAt: SAMPLE_RETIRED_AT, cause: RETIRED_KEY_CAUSE_REMOVED, newLifeBegunAt: null }],
+      ['unset', { retiredAt: SAMPLE_RETIRED_AT, cause: RETIRED_KEY_CAUSE_REMOVED, newLifeBegunAt: null }],
+    ])
+    expect(retiredKeysRecordOf(seeds)).toEqual(expected)
+
+    expect(writeRetiredKeysRecord(dir, seeds)).toBe(retiredKeysPath(dir))
+
+    expect(fileBytes()).toEqual(new Uint8Array(serializeRetiredKeys(expected)))
+    expect(readdirSync(dir)).toEqual([RETIRED_KEYS_FILE_NAME])
+    expect(readRetiredKeysRecord(dir)).toEqual(expected)
+  })
+
+  test('writeRetiredKeysRecord refuses the real home (the launch-time home), the OS temp directory itself and a directory outside it, writing nothing', () => {
+    // When the launch-time home is a scratch HOME under the OS temp directory
+    // (`HOME=$(mktemp -d)`), only the real-home rule refuses it.
+    for (const refused of [homedir(), osTempDir(), '/']) {
+      const path = retiredKeysPath(refused)
+      const existed = existsSync(path)
+      expect(() => writeRetiredKeysRecord(refused, SEED)).toThrow(writeRetiredKeysRecord.name)
+      expect(existsSync(path)).toBe(existed)
+    }
+  })
+
+  test('readRetiredKeysRecord throws, naming the file and the parser\'s problem, on a record the parser refuses, and rethrows a read failure other than a missing file', () => {
+    const path = writeRetiredKeysRecord(dir, SEED)
+    const truncated = readFileSync(path).subarray(0, 40)
+    writeFileSync(path, truncated)
+    const parsed = parseRetiredKeys(truncated)
+    if (parsed.ok) throw new Error('the truncated record parsed')
+    const refused = thrownBy(() => readRetiredKeysRecord(dir))
+    expect(refused.message).toContain(readRetiredKeysRecord.name)
+    expect(refused.message).toContain(path)
+    expect(refused.message).toContain(parsed.problem)
+
+    rmSync(path)
+    mkdirSync(path)
+    expect(thrownBy(() => readRetiredKeysRecord(dir)).code).toBe('EISDIR')
   })
 })
 

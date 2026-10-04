@@ -1,7 +1,9 @@
 /**
  * ad-version-gate.test.ts — CSCB's Phase 1 floor (b.jg5 SRJ-201), its
- * comparison (b.jg5 SRJ-202), the shared test versions (b.jg5 SRJ-1304) and
- * the runtime re-check of the host binary (b.jg5 SRJ-204, SRJ-205): its one
+ * comparison (b.jg5 SRJ-202), the shared test versions (b.jg5 SRJ-1304; the
+ * Claude Code minimum `MIN_CLAUDE_CODE_VERSION` by its form, and by a scan
+ * that finds its value in the code, comments stripped, of no `tests/`
+ * TypeScript file but the helper's) and the runtime re-check of the host binary (b.jg5 SRJ-204, SRJ-205): its one
  * log line per run of could-not-run results (b.jg5 SRJ-206, AC 22), the
  * immediate trigger (AC 23's first half) and the version-changed signal;
  * the host-version decision shared by `/publish`'s SR-2.5 check and the
@@ -41,9 +43,9 @@
  */
 
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, sep } from 'node:path'
 import semver from 'semver'
 
 import { DEV_SENTINEL_VERSION } from 'agent-director'
@@ -140,6 +142,7 @@ import {
   CLIENT_MIN_VERSION,
   DEV_PLACEHOLDER_VERSION,
   DEV_UNPARSEABLE_VERSION,
+  MIN_CLAUDE_CODE_VERSION,
   OLD_AD_VERSION,
   PHASE1_RC_VERSION,
 } from './test-helpers/agent-director-versions.ts'
@@ -277,6 +280,22 @@ describe('agent-director-versions helper', () => {
     const floorPath = Bun.resolveSync('agent-director/dist/version-floor.json', import.meta.dir)
     const floorJson = (await Bun.file(floorPath).json()) as { min_binary_version: unknown }
     expect(CLIENT_MIN_VERSION).toBe(floorJson.min_binary_version as string)
+  })
+
+  test('MIN_CLAUDE_CODE_VERSION is a strict SemVer release, with no pre-release or build part', () => {
+    expect(MIN_CLAUDE_CODE_VERSION).toMatch(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/)
+  })
+
+  test('no tests/ TypeScript file but the helper writes MIN_CLAUDE_CODE_VERSION in code (comments stripped)', () => {
+    const testsDir = import.meta.dir
+    const helper = join('test-helpers', 'agent-director-versions.ts')
+    const codeOf = (rel: string): string => stripComments(readFileSync(join(testsDir, rel), 'utf-8'))
+    const files = readdirSync(testsDir, { recursive: true, encoding: 'utf-8' })
+      .filter((rel) => /\.[cm]?tsx?$/.test(rel) && !rel.split(sep).includes('node_modules'))
+    // Not vacuous: the scan reads the helper, and the needle is found in its code.
+    expect(files).toContain(helper)
+    expect(codeOf(helper)).toContain(MIN_CLAUDE_CODE_VERSION)
+    expect(files.filter((rel) => rel !== helper && codeOf(rel).includes(MIN_CLAUDE_CODE_VERSION)).sort()).toEqual([])
   })
 })
 

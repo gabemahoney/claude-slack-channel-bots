@@ -178,8 +178,9 @@
  *
  * The re-check columns (E30; b.jg5 SRJ-505, SRJ-506, SRJ-1005, SRJ-1304):
  * every row of every site kind (the CONFLICT rows, the sequence `resume`
- * rows, the UNUSABLE NAME rows, the launch-start rows and the note rows
- * below) carries `recheck`, its {@link RecheckColumns}:
+ * rows, the plain spawn's rows recorded unreadable or live, the UNUSABLE
+ * NAME rows, the launch-start rows and the note rows below) carries
+ * `recheck`, its {@link RecheckColumns}:
  *   - `readVerb`: the read step 1 makes, `get` for "conflicting labels",
  *     `status` otherwise;
  *   - `action`: SRJ-505's table action for the row's refused operation and
@@ -200,7 +201,12 @@
  * `decideLatchRecheck`, so a test compares the two. Thus a plain-spawn row
  * reads: no row, the plain spawn; `pending`, no retry; `ended` or
  * `missing`, a spawn with `--reuse-finished` (on E28 T4's `rowAfter`, which
- * gives the recorded state); a `resume` or reuse row (HO rev 28): a live
+ * gives the recorded state); a live state other than `pending` clears a
+ * latch recorded with no row or `ended` (the row reported in), and gives no
+ * retry to one recorded unreadable or live
+ * ({@link PLAIN_SPAWN_RECORDED_LIVE_CASE_ROWS}, E30 T3: each plain spawn row
+ * again, its latch-time `status` read failed or read the row `waiting`; not
+ * in {@link CONFLICT_CASE_ROWS}); a `resume` or reuse row (HO rev 28): a live
  * row, `pending` included, no call and no post; `ended` or `missing`, the
  * case's probe or retry; no row, a `resume` latch cleared and a reuse latch's
  * reuse retried as a fresh spawn, whatever the case ("another agent-director
@@ -811,6 +817,13 @@ export interface ConflictCaseRow {
    * row, so the row's `rowState` is its reading (no row, or `ended`).
    */
   readonly rowAfter?: PlainSpawnRowAfter
+  /**
+   * Set on {@link PLAIN_SPAWN_RECORDED_LIVE_CASE_ROWS} only (E30 T3; b.jg5
+   * SRJ-505, hatch A3): the plain first spawn's latch-time `status` read
+   * failed (`unreadable`) or read the row live other than `pending`
+   * (`waiting`), so the record shows no row that had not reported in.
+   */
+  readonly latchTimeReading?: PlainSpawnLatchTimeReading
   /** The whole latch record a latch of persona `key` from this row holds ({@link expectedLatchRecord} of the set `setFromConflict` makes). */
   readonly record: (key: string) => ConflictLatchRecord
   /**
@@ -1820,6 +1833,56 @@ export const PLAIN_SPAWN_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object
   plainSpawn('another-store', LATCH_CASE_ANOTHER_STORE, LIVENESS_DEAD_ROW_ENDED, { plainSpawn: true }),
   plainSpawn('conflicting-labels', LATCH_CASE_CONFLICTING_LABELS, LIVENESS_DEAD_ROW_ENDED),
 ])
+
+/**
+ * What a plain first spawn's latch-time `status` read gave, for the latches
+ * whose record shows no row that had not reported in (b.jg5 SRJ-501,
+ * SRJ-505, hatch A3): the read failed, or it read the row live other than
+ * `pending` (agent-director's end write after "duplicate session" was not
+ * applied, or another agent-director write changed the row).
+ */
+export type PlainSpawnLatchTimeReading = 'unreadable' | 'waiting'
+
+/** The latch row state each {@link PlainSpawnLatchTimeReading} records, in row order. */
+export const PLAIN_SPAWN_LATCH_TIME_ROW_STATES: Readonly<Record<PlainSpawnLatchTimeReading, LatchRowState>> = Object.freeze({
+  unreadable: LATCH_ROW_STATE_UNREADABLE,
+  waiting: WAITING,
+})
+
+/**
+ * The plain spawn's latches recorded unreadable or live (E30 T3; b.jg5
+ * SRJ-505's "a plain-spawn latch recorded live or unreadable", hatch A3):
+ * for each {@link PlainSpawnLatchTimeReading}, one row per
+ * {@link PLAIN_SPAWN_CONFLICT_CASE_ROWS} row (the same case, option set and
+ * `rowAfter`), recording that reading's state, named `plain spawn (recorded
+ * <reading>): <stub case>`. Step 1 clears none of them on a live reading, so
+ * their re-check columns show the plain-spawn row of SRJ-505's table on every
+ * state step 1 can read: no row, the plain spawn; `ended` or `missing`, a
+ * spawn with `--reuse-finished`; `pending` and another live state
+ * (`waiting`), no retry. They are not in {@link CONFLICT_CASE_ROWS} (the
+ * errors are the plain spawn rows', and only the recorded state differs).
+ */
+export const PLAIN_SPAWN_RECORDED_LIVE_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze(
+  (Object.keys(PLAIN_SPAWN_LATCH_TIME_ROW_STATES) as PlainSpawnLatchTimeReading[]).flatMap((reading) =>
+    PLAIN_SPAWN_CONFLICT_CASE_ROWS.map((plainRow) => {
+      const caseRow = row(
+        'plain spawn',
+        REFUSED_OPERATION_PLAIN_SPAWN,
+        SPAWN_VERB,
+        plainRow.stubCase,
+        plainRow.latchCase,
+        PLAIN_SPAWN_LATCH_TIME_ROW_STATES[reading],
+        plainRow.options,
+      )
+      return Object.freeze({
+        ...caseRow,
+        name: caseRow.name.replace('plain spawn', `plain spawn (recorded ${reading})`),
+        ...(plainRow.rowAfter === undefined ? {} : { rowAfter: plainRow.rowAfter }),
+        latchTimeReading: reading,
+      })
+    }),
+  ),
+)
 
 /**
  * The reuse spawn's CONFLICT rows (E22; b.jg5 SRJ-112, SRJ-501, SRJ-507; HO

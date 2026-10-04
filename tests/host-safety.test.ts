@@ -258,6 +258,11 @@ describe('hostSafeChildEnv', () => {
       return { home: link }
     }],
     ['HOME is the home the run started with', HOST_SAFETY_REFUSAL.realHome, () => ({ home: homedir() })],
+    ['HOME holds an agent-director install directory with no binary in it', HOST_SAFETY_REFUSAL.homeHoldsInstall, () => {
+      const home = dirUnder('home')
+      mkdirSync(join(home, AGENT_DIRECTOR_INSTALL_DIR))
+      return { home }
+    }],
     ['HOME holds the standard install path (a plain file)', HOST_SAFETY_REFUSAL.homeHoldsInstall, () => {
       const home = dirUnder('home')
       plainFile(join(home, AGENT_DIRECTOR_INSTALL_PATH))

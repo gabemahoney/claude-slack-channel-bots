@@ -1,6 +1,7 @@
 /**
  * agent-director-versions.ts — the shared agent-director versions tests check
- * against CSCB's Phase 1 floor (b.jg5 SRJ-1304).
+ * against CSCB's Phase 1 floor, and the minimum Claude Code version
+ * agent-director states (b.jg5 SRJ-1304).
  *
  * Tests import every agent-director version they check from here or from
  * `src/`, never as a literal, so a change to the floor constant
@@ -22,6 +23,14 @@
  * `BELOW_CLIENT_MIN_VERSION` is the plain release one step below it, which the
  * client refuses as too old; it is checked against the minimum when this
  * module loads.
+ *
+ * `MIN_CLAUDE_CODE_VERSION` is the minimum Claude Code version agent-director
+ * states for its exec-form hooks, and the version the fleet runs (RN-9; HO
+ * rev 31). This helper is its one definition: no `src/` module defines or
+ * reads a Claude Code version, and every test that needs it (a fixture's
+ * recorded version, the runbook, docs and `Dockerfile.live` pin checks)
+ * imports it from here. `tests/ad-version-gate.test.ts` checks that no other
+ * `tests/` TypeScript file writes its value in code.
  *
  * Starts no process and holds no value import of `Client` or
  * `resolveSystemBinary` (host-safety audit, b.jg5 SRJ-1301). It imports only
@@ -49,6 +58,14 @@ export const DEV_PLACEHOLDER_VERSION: string = DEV_SENTINEL_VERSION
 
 /** A development version that is not strict SemVer; CSCB's floor refuses it. */
 export const DEV_UNPARSEABLE_VERSION = 'dev'
+
+/**
+ * The minimum Claude Code version agent-director states for its exec-form
+ * hooks, having checked its hooks on it, and the version the fleet runs
+ * (RN-9; HO rev 31). Exec-form hooks (`command` with `args`) need Claude Code
+ * 2.1.139 or later. The one place this value is written in `tests/`.
+ */
+export const MIN_CLAUDE_CODE_VERSION = '2.1.280'
 
 /** The installed client's floor file, as its package exports it. */
 export const FLOOR_SUBPATH = 'agent-director/dist/version-floor.json'

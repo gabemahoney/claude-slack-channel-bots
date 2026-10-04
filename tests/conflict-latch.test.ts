@@ -305,12 +305,22 @@
  *
  * The latch re-check (SRJ-505; E30 T1; AC 2, 5, 7, 8, 44, 46, 71). Pure:
  * for every row of the case table (`RECHECK_TABLE`: every site kind's
- * CONFLICT rows, the resume and reuse "this row's own id" rows once their
- * probe is dropped, the UNUSABLE NAME, launch-start and note rows),
+ * CONFLICT rows, the live-row sequence's step-6 `resume` rows and the plain
+ * spawn's rows recorded unreadable or live included, the resume and reuse
+ * "this row's own id" rows once their probe is dropped, the UNUSABLE NAME,
+ * launch-start and note rows),
  * `decideLatchRecheck` gives each step-1 reading's whole decision as the
  * row's `recheck` columns say, and a retired key's call; each finished-row
  * retry entry's launch is `decideFinishedRowLaunch`'s; the table holds every
- * row once and no description names "no pane 0.0". On `makeRecoveryHarness`
+ * row once and no description names "no pane 0.0". SRJ-1304's audit (E30
+ * T3): every site kind has its rows and every row every re-check column;
+ * every `resume` and reuse row has its `pending` (no probe, no retry, no
+ * post; "conflicting labels": the one-line `read-pane`, no launch), `ended`
+ * (its probe or retry) and absent (a `resume` cleared, a reuse retried)
+ * entries; the plain spawn's rows, from the scan and from "duplicate
+ * session", give no row the plain spawn, a finished row the reuse,
+ * `pending` no retry, and another live state no retry when recorded
+ * unreadable or live. On `makeRecoveryHarness`
  * with the re-check bound (`latchRecheck`), `health_check_interval` 0 and P's
  * row on the row model, one case per row: P latched by the row's `latchOn`,
  * then one round per still-latched reading and answer, each one interval
@@ -325,8 +335,9 @@
  * at a teardown, the teardown dependencies' forget and shutdown); HO rev 28
  * (a resume or reuse latch's row left `pending` by a stays-pending refusal
  * gets status only, round after round, and its probe or retry once it reads
- * `ended`; a gone row clears a resume latch, P's next launch being the plain
- * spawn, and retries a reuse as a fresh spawn; a finished-row get reading
+ * `ended`; for every resume and reuse row, a gone row clears a resume latch,
+ * P's next launch being the plain spawn, and retries a reuse as a fresh
+ * spawn; a finished-row get reading
  * `pending` launches nothing); a retired key's retry is the reuse, and a
  * round's read of a marked key's live row drops its entry (E24-E25); "not
  * this launch's session" from a kill, a reconnect send-keys and a read-pane
@@ -378,6 +389,12 @@
  * after it, a health tick at its find-missing reads nothing of P); and
  * `runLatchClearSequence` and the builder's `clear` and `clearAndRecover`
  * (not latched, the clear before it returns, its outcomes and lines).
+ *
+ * The recovery harness's own overlap rule (SRJ-1304; E30 T3): two or three
+ * harnesses built before any is cleaned up, cleaned up in creation order,
+ * newest first or in a mixed order, leave `SLACK_STATE_DIR` and
+ * `console.error` the newest live harness's after each cleanup, and what
+ * was in effect before the first build once all are cleaned up.
  *
  * Pure module under test, except the recovery-harness cases: one
  * `createConflictLatch` per test over a line capture and a recording
@@ -496,6 +513,8 @@ import {
   RECHECK_CLEARS_THAT_LAUNCHED_NOTHING,
   RECHECK_READING_NO_ROW_VALUE,
   RECHECK_READING_STATE,
+  RECHECK_STEP_CLEAR_GONE,
+  RECHECK_STEP_SPAWN_RETRY,
   RECHECK_STEP_TABLE,
   createLatchClear,
   decideClearedProbeRetry,
@@ -690,6 +709,19 @@ import {
   CONFLICT_CASE_ROWS,
   FINISHED_ROW_RETRY_ENTRIES,
   NOTE_LATCH_CASE_ROWS,
+  PLAIN_SPAWN_CONFLICT_CASE_ROWS,
+  PLAIN_SPAWN_LATCH_TIME_ROW_STATES,
+  PLAIN_SPAWN_RECORDED_LIVE_CASE_ROWS,
+  SEQUENCE_RESUME_CONFLICT_CASE_ROWS,
+  SEQUENCE_RESUME_SITE,
+  LIVENESS_PANE_SITES,
+  PROMPT_ROW_PANE_SITES,
+  RECONNECT_SITE,
+  RESTART_KILL_SITE,
+  REUSE_SPAWN_SITE,
+  SEQUENCE_KILL_SITES,
+  STUCK_LAUNCH_ABORT_SITE,
+  UNUSABLE_NAME_SITES,
   recheckEntryAt,
   recheckNoInformationAnswers,
   RECHECK_CONFIG_ANSWER,
@@ -4852,9 +4884,17 @@ interface RecheckTableRow {
   readonly noLaunchStart: boolean
 }
 
+/**
+ * Every CONFLICT row of the case table: {@link CONFLICT_CASE_ROWS}, then the
+ * rows kept out of it because only their recorded state differs (the
+ * live-row sequence's step-6 `resume`, E21/E23; the plain spawn recorded
+ * unreadable or live, hatch A3).
+ */
+const EVERY_CONFLICT_ROW: readonly ConflictCaseRow[] = [...CONFLICT_CASE_ROWS, ...SEQUENCE_RESUME_CONFLICT_CASE_ROWS, ...PLAIN_SPAWN_RECORDED_LIVE_CASE_ROWS]
+
 /** Every row of the case table with its re-check columns, by site kind. */
 const RECHECK_TABLE: readonly RecheckTableRow[] = [
-  ...CONFLICT_CASE_ROWS.flatMap((row): RecheckTableRow[] => [
+  ...EVERY_CONFLICT_ROW.flatMap((row): RecheckTableRow[] => [
     { name: `CONFLICT ${row.name}`, latchOn: row.latchOn, record: row.record, recheck: row.recheck, probeDropped: false, noLaunchStart: false },
     ...(row.probeDroppedRecheck === undefined
       ? []
@@ -4877,7 +4917,7 @@ const RECHECK_TABLE: readonly RecheckTableRow[] = [
     probeDropped: false,
     noLaunchStart: false,
   })),
-  ...LAUNCH_START_CASE_ROWS.map((row): RecheckTableRow => ({
+  ...[...LAUNCH_START_CASE_ROWS, LAUNCH_START_AND_NOTE_ROW].map((row): RecheckTableRow => ({
     name: `launch start not recorded ${row.name}`,
     latchOn: row.latchOn,
     record: row.record,
@@ -4900,12 +4940,12 @@ const RECHECK_ROWS = RECHECK_TABLE.map((row) => [row.name, row] as const)
 
 describe('the latch re-check\'s decision for every row of the case table (SRJ-505, SRJ-1304; pure)', () => {
   test('the re-check table holds every row of every site kind once, the probe-dropped columns only on the resume and reuse "this row\'s own id" rows, and no description names "no pane 0.0"', () => {
-    const ownIdLaunchRows = CONFLICT_CASE_ROWS.filter(
+    const ownIdLaunchRows = EVERY_CONFLICT_ROW.filter(
       (row) => row.latchCase === LATCH_CASE_OWN_ID && (row.refusedOperation === REFUSED_OPERATION_RESUME || row.refusedOperation === REFUSED_OPERATION_REUSE_SPAWN),
     )
-    expect(CONFLICT_CASE_ROWS.filter((row) => row.probeDroppedRecheck !== undefined)).toEqual(ownIdLaunchRows)
+    expect(EVERY_CONFLICT_ROW.filter((row) => row.probeDroppedRecheck !== undefined)).toEqual(ownIdLaunchRows)
     expect(RECHECK_TABLE).toHaveLength(
-      CONFLICT_CASE_ROWS.length + ownIdLaunchRows.length + UNUSABLE_NAME_CASE_ROWS.length + LAUNCH_START_CASE_ROWS.length + NOTE_LATCH_CASE_ROWS.length,
+      EVERY_CONFLICT_ROW.length + ownIdLaunchRows.length + UNUSABLE_NAME_CASE_ROWS.length + LAUNCH_START_CASE_ROWS.length + 1 + NOTE_LATCH_CASE_ROWS.length,
     )
     expect(new Set(RECHECK_TABLE.map((row) => row.name)).size).toBe(RECHECK_TABLE.length)
     // b.jg5 SRJ-507 (rev 17): "no pane 0.0" is withdrawn; no row's description, nor any answer a column scripts, names it.
@@ -4925,6 +4965,98 @@ describe('the latch re-check\'s decision for every row of the case table (SRJ-50
   test.each(FINISHED_ROW_RETRY_ENTRIES.map((entry) => [entry.name, entry] as const))('a "not this launch\'s session" latch\'s finished-row retry whose get reads %s launches as SRJ-505 says (never a kill, never a plain spawn over a row), and the reuse for a retired key', (_name, entry) => {
     expect(decideFinishedRowLaunch(entry.reading, entry.hasSessionId, false)).toBe(entry.call)
     expect(decideFinishedRowLaunch(entry.reading, entry.hasSessionId, true)).toBe(entry.retiredKeyCall)
+  })
+
+  test('every site kind has its rows, and every row carries every re-check column: its read, its table action, and one entry per state step 1 can read, each with its decision, its retired-key call and, for a call one verb answers, its answers (SRJ-1304)', () => {
+    // E13's ladder and E28's plain spawn, E22's reuse, E23's resume, E17's approver, E18's three read-pane sites,
+    // E19's reconnect and prompt rows, E20's restart kill, E21's sequence kills and step-6 resume, E29's abort kill.
+    const siteKinds = [
+      'plain spawn',
+      REUSE_SPAWN_SITE,
+      'resume',
+      SEQUENCE_RESUME_SITE,
+      ...APPROVER_SITES,
+      ...LIVENESS_PANE_SITES,
+      RECONNECT_SITE,
+      ...PROMPT_ROW_PANE_SITES,
+      RESTART_KILL_SITE,
+      ...SEQUENCE_KILL_SITES,
+      STUCK_LAUNCH_ABORT_SITE,
+    ]
+    // The approver's status answers no CONFLICT, so its rows are UNUSABLE NAME rows only.
+    const sitesWithRows = new Set<string>([...EVERY_CONFLICT_ROW, ...UNUSABLE_NAME_CASE_ROWS].map((row) => row.site))
+    expect(siteKinds.filter((site) => !sitesWithRows.has(site))).toEqual([])
+    // E16's holds: an unusable-name row at every site kind that can answer UNUSABLE NAME, and the launch-start rows.
+    expect(UNUSABLE_NAME_SITES.filter((site) => !UNUSABLE_NAME_CASE_ROWS.some((row) => row.site === site))).toEqual([])
+    expect(LAUNCH_START_CASE_ROWS.length).toBeGreaterThan(0)
+    const statusReadings: RecheckReadingName[] = ['read fails', 'no row', 'pending', 'waiting', 'ended', 'missing']
+    const getReadings: RecheckReadingName[] = [...statusReadings, 'pending, with the note', 'waiting, with the note', 'ended, with the note']
+    const answered = new Set<string>([RECHECK_CALL_PROBE, RECHECK_CALL_PENDING_READ_PANE, RECHECK_CALL_PLAIN_SPAWN, RECHECK_CALL_REUSE_SPAWN, RECHECK_CALL_RESUME])
+    const incomplete = RECHECK_TABLE.flatMap((row) => {
+      const { readVerb, action, entries } = row.recheck
+      const readings = readVerb === 'get' ? getReadings : statusReadings
+      const problems: string[] = []
+      if (readVerb !== (row.record(KEY).latchCase === LATCH_CASE_CONFLICTING_LABELS ? 'get' : 'status')) problems.push(`read ${readVerb}`)
+      if (typeof action !== 'string') problems.push('no action')
+      if (JSON.stringify(entries.map((entry) => entry.name)) !== JSON.stringify(readings)) problems.push(`entries ${entries.map((entry) => entry.name).join('|')}`)
+      for (const entry of entries) {
+        if (entry.decision === undefined || entry.retiredKeyCall === undefined) problems.push(`${entry.name}: no decision or retired-key call`)
+        if ((entry.answers !== undefined) !== answered.has(entry.decision.call)) problems.push(`${entry.name}: answers for ${entry.decision.call}`)
+      }
+      return problems.map((problem) => `${row.name}: ${problem}`)
+    })
+    expect(incomplete).toEqual([])
+  })
+
+  test('HO rev 28: every resume and reuse row has its pending, ended and absent entries: pending, no probe, no retry and no post (for "conflicting labels" with no note, the one-line read-pane and no launch); ended, the case\'s probe or retry; absent, a resume latch cleared by its gone row and a reuse latch\'s reuse retried', () => {
+    const launchRows = RECHECK_TABLE.filter((row) => [REFUSED_OPERATION_RESUME, REFUSED_OPERATION_REUSE_SPAWN].includes(row.record(KEY).refusedOperation))
+    expect(launchRows.length).toBe(EVERY_CONFLICT_ROW.filter((row) => [REFUSED_OPERATION_RESUME, REFUSED_OPERATION_REUSE_SPAWN].includes(row.refusedOperation)).length + EVERY_CONFLICT_ROW.filter((row) => row.probeDroppedRecheck !== undefined).length)
+    const wrong = launchRows.flatMap((row) => {
+      const { latchCase, refusedOperation } = row.record(KEY)
+      const launch = refusedOperation === REFUSED_OPERATION_RESUME ? RECHECK_CALL_RESUME : RECHECK_CALL_REUSE_SPAWN
+      const pending = recheckEntryAt(row.recheck, 'pending').decision
+      const ended = recheckEntryAt(row.recheck, 'ended').decision
+      const absent = recheckEntryAt(row.recheck, 'no row').decision
+      const problems: string[] = []
+      // pending: no probe, no retry, no clear (so no post); "conflicting labels" with no note: the one-line read-pane only.
+      const pendingCall = latchCase === LATCH_CASE_CONFLICTING_LABELS ? RECHECK_CALL_PENDING_READ_PANE : RECHECK_CALL_NONE
+      if (pending.call !== pendingCall || pending.clear !== undefined) problems.push(`pending: ${pending.call}`)
+      // ended: the case's probe or retry (unrecognised text: none, as its table row says), no clear.
+      const endedCalls = latchCase === LATCH_CASE_UNRECOGNISED ? [RECHECK_CALL_NONE] : [RECHECK_CALL_PROBE, launch]
+      if (!endedCalls.includes(ended.call) || ended.clear !== undefined) problems.push(`ended: ${ended.call}`)
+      // absent: a resume latch cleared ("its agent-director row is gone"; P then comes up by the plain spawn); a reuse retried, with no probe.
+      if (refusedOperation === REFUSED_OPERATION_RESUME) {
+        if (absent.step !== RECHECK_STEP_CLEAR_GONE || absent.call !== RECHECK_CALL_NONE || absent.clear?.reason !== LATCH_RECOVERY_REASON_ROW_GONE) problems.push(`absent: ${absent.step} ${absent.call}`)
+      } else if (absent.step !== RECHECK_STEP_SPAWN_RETRY || absent.call !== RECHECK_CALL_REUSE_SPAWN || absent.clear !== undefined) {
+        problems.push(`absent: ${absent.step} ${absent.call}`)
+      }
+      return problems.map((problem) => `${row.name}: ${problem}`)
+    })
+    expect(wrong).toEqual([])
+  })
+
+  test('the plain spawn\'s rows, from the scan\'s refusal and from "duplicate session" ("another agent-director store" among the latter), and again recorded unreadable and live: no row, the plain spawn; ended or missing, a spawn with --reuse-finished; pending, no retry; another live state, no retry for a latch recorded unreadable or live (hatch A3)', () => {
+    expect(PLAIN_SPAWN_CONFLICT_CASE_ROWS.map((row) => row.rowAfter)).toEqual(expect.arrayContaining(['none', LIVENESS_DEAD_ROW_ENDED]))
+    expect(PLAIN_SPAWN_CONFLICT_CASE_ROWS.some((row) => row.latchCase === LATCH_CASE_ANOTHER_STORE && row.rowAfter === LIVENESS_DEAD_ROW_ENDED)).toBe(true)
+    // Each plain spawn row again, once per latch-time reading that shows no row that had not reported in.
+    const recordedLive: unknown[] = Object.entries(PLAIN_SPAWN_LATCH_TIME_ROW_STATES).flatMap(([reading, rowState]) =>
+      PLAIN_SPAWN_CONFLICT_CASE_ROWS.map((plain) => [reading, plain.stubCase, plain.options, rowState]),
+    )
+    expect(PLAIN_SPAWN_RECORDED_LIVE_CASE_ROWS.map((row): unknown => [row.latchTimeReading, row.stubCase, row.options, row.rowState])).toEqual(recordedLive)
+    const plainRows = [...PLAIN_SPAWN_CONFLICT_CASE_ROWS, ...PLAIN_SPAWN_RECORDED_LIVE_CASE_ROWS]
+    const wrong = plainRows.flatMap((row) => {
+      const call = (name: RecheckReadingName): string => {
+        const { decision } = recheckEntryAt(row.recheck, name)
+        return decision.clear === undefined ? decision.call : `cleared (${decision.call})`
+      }
+      // A live state other than pending clears a latch recorded with no row or ended (the row reported in); one recorded unreadable or live gets no retry.
+      const another = row.latchTimeReading === undefined ? `cleared (${RECHECK_CALL_NONE})` : RECHECK_CALL_NONE
+      const expected = [RECHECK_CALL_PLAIN_SPAWN, RECHECK_CALL_REUSE_SPAWN, RECHECK_CALL_REUSE_SPAWN, RECHECK_CALL_NONE, another]
+      const got = [call('no row'), call('ended'), call('missing'), call('pending'), call('waiting')]
+      return JSON.stringify(got) === JSON.stringify(expected) ? [] : [`${row.name}: ${got.join(', ')}`]
+    })
+    expect(wrong).toEqual([])
+    expect(RECHECK_TABLE.filter((row) => plainRows.some((plain) => `CONFLICT ${plain.name}` === row.name))).toHaveLength(plainRows.length)
   })
 })
 
@@ -5245,12 +5377,11 @@ describe('HO rev 28: a latched resume or reuse is probed or retried only when st
     expect(round.verbs.slice(0, 1 + callMethods.length)).toEqual(['status', ...callMethods])
   })
 
-  test.each(
-    ([LATCH_CASE_OWN_ID, LATCH_CASE_ANOTHER_STORE, LATCH_CASE_CONFLICTING_LABELS] as LatchCase[]).map((latchCase) => {
-      const row = launchRowOf(REFUSED_OPERATION_RESUME, latchCase)
-      return [row.name, row] as const
-    }),
-  )('%s, its row gone: step 1\'s ErrSpawnNotFound clears the latch, and the retry at once after its find-missing is the plain spawn, never a resume or a reuse (SRJ-506)', async (_name, row) => {
+  // Every resume and reuse case (HO rev 28; SRJ-1304): the resume rows of every site kind, and the reuse rows.
+  const launchRowsRefusing = (refusedOperation: string) =>
+    EVERY_CONFLICT_ROW.filter((row) => row.refusedOperation === refusedOperation).map((row) => [row.name, row] as const)
+
+  test.each(launchRowsRefusing(REFUSED_OPERATION_RESUME))('%s, its row gone: step 1\'s ErrSpawnNotFound clears the latch, and the retry at once after its find-missing is the plain spawn, never a resume or a reuse (SRJ-506)', async (_name, row) => {
     const { h, p } = latchForRecheck(row, { state: PENDING_ROW_MODEL_NO_ROW })
     const spawnsBefore = h.stub.calls.spawnCalls.length
     const round = await recheckRound(h, p)
@@ -5262,15 +5393,10 @@ describe('HO rev 28: a latched resume or reuse is probed or retried only when st
     if (h.approverRunning(p)) await h.runApproverToStop(p)
   })
 
-  test.each(
-    ([LATCH_CASE_OWN_ID, LATCH_CASE_ANOTHER_STORE, LATCH_CASE_LEFTOVER] as LatchCase[]).map((latchCase) => {
-      const row = launchRowOf(REFUSED_OPERATION_REUSE_SPAWN, latchCase)
-      return [row.name, row] as const
-    }),
-  )('%s, its row gone: the reuse is retried as an ordinary fresh spawn, with no probe; not refused, it clears the latch', async (_name, row) => {
+  test.each(launchRowsRefusing(REFUSED_OPERATION_REUSE_SPAWN))('%s, its row gone: the reuse is retried as an ordinary fresh spawn, with no probe; not refused, it clears the latch', async (_name, row) => {
     const { h, p } = latchForRecheck(row, { state: PENDING_ROW_MODEL_NO_ROW })
     const round = await recheckRound(h, p)
-    expect(round.verbs.slice(0, 2)).toEqual(['status', 'spawn'])
+    expect(round.verbs.slice(0, 2)).toEqual([row.recheck.readVerb, 'spawn'])
     expect(h.stub.calls.spawnCalls[0]).toEqual(reuseSpawnOf(h, p))
     expect([h.latch.isLatched(p), h.latchRecheck.isArmed(p)]).toEqual([false, false])
   })
@@ -5844,7 +5970,8 @@ describe('a clear by step 1 or by a "launch start not recorded" row read finishe
   test('the table has a step-1 clear for every kind of latch that clears at step 1, and a finished-row clear for every launch-start row', () => {
     expect(RECHECK_CLEARS.length).toBeGreaterThan(RECHECK_TABLE.length / 2)
     const launchStartClears = RECHECK_CLEARS.filter(([, row, entry]) => row.noLaunchStart && entry.decision.step === RECHECK_STEP_TABLE)
-    expect(launchStartClears).toHaveLength(2 * LAUNCH_START_CASE_ROWS.length)
+    // Every launch-start row, LAUNCH_START_AND_NOTE_ROW included.
+    expect(launchStartClears).toHaveLength(2 * (LAUNCH_START_CASE_ROWS.length + 1))
   })
 
   test.each(RECHECK_CLEARS)('%s', async (_name, row, entry) => {
@@ -6539,5 +6666,59 @@ describe('the exported after-clear sequence (runLatchClearSequence) and the buil
     failFindMissing(h, errTmuxUnresponsive('find-missing'))
     expect(await runLatchClearSequence(p, LATCH_RECOVERY_REASON_CLEARED_BY_HAND, sequenceDeps(h))).toEqual({ kind: LATCH_CLEAR_SEQUENCE_FIND_MISSING_REFUSED })
     expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls, h.controller.isArmed(p)]).toEqual([[], [], true])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The recovery harness with overlapping lifetimes (E30 T3; SRJ-1304): a case
+// that builds a second harness before it cleans the first up, cleaned up in
+// any order, leaves SLACK_STATE_DIR and console.error pointing at the newest
+// harness still live, and at what was in effect before the first build once
+// all are cleaned up, never at an earlier harness's removed directory or
+// capture.
+// ---------------------------------------------------------------------------
+
+describe('the recovery harness: overlapping harnesses give SLACK_STATE_DIR and console.error up last in, first out, whatever order they are cleaned up in (SRJ-1304)', () => {
+  test.each([
+    ['two, cleaned up in creation order', 2, [0, 1]],
+    ['two, cleaned up newest first', 2, [1, 0]],
+    ['three, the middle one first', 3, [1, 0, 2]],
+    ['three, the oldest, the newest, then the middle one', 3, [0, 2, 1]],
+    ['three, newest first', 3, [2, 1, 0]],
+  ] as const)('%s', (_label, count, order) => {
+    const before = { stateDir: process.env['SLACK_STATE_DIR'], consoleError: console.error }
+    const built: RecoveryHarness[] = []
+    const live = new Set<number>()
+    /** Where SLACK_STATE_DIR and console.error point now: the index of the harness whose they are, or 'before'. */
+    const inEffect = (probe: string): { stateDir: number | 'before' | 'other'; consoleError: number | 'before' | 'other' } => {
+      const dir = process.env['SLACK_STATE_DIR']
+      const stateDir = dir === before.stateDir ? 'before' : built.findIndex((h) => h.stateDir === dir)
+      let consoleError: number | 'before' | 'other' = 'other'
+      if (console.error === before.consoleError) consoleError = 'before'
+      else {
+        console.error(probe)
+        consoleError = built.findIndex((h) => h.errors.includes(probe))
+      }
+      return { stateDir: stateDir === -1 ? 'other' : stateDir, consoleError: consoleError === -1 ? 'other' : consoleError }
+    }
+    /** The newest harness still live, or 'before' when none is. */
+    const newestLive = (): number | 'before' => (live.size === 0 ? 'before' : Math.max(...live))
+    try {
+      for (let n = 0; n < count; n++) {
+        built.push(makeRecoveryHarness())
+        live.add(n)
+        expect([n, inEffect(`after build ${n}`)]).toEqual([n, { stateDir: n, consoleError: n }])
+      }
+      for (const index of order) {
+        live.delete(index)
+        built[index]!.cleanup()
+        const expected = newestLive()
+        expect([`after cleaning up ${index}`, inEffect(`after cleanup ${index}`)]).toEqual([`after cleaning up ${index}`, { stateDir: expected, consoleError: expected }])
+      }
+      expect([process.env['SLACK_STATE_DIR'], console.error === before.consoleError]).toEqual([before.stateDir, true])
+    } finally {
+      // A failed expectation leaves some live: clean them up newest first, which always restores.
+      for (const index of [...live].sort((a, b) => b - a)) built[index]!.cleanup()
+    }
   })
 })

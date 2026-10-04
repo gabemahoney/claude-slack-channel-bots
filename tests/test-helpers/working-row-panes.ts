@@ -8,9 +8,11 @@
  * reconnect a `working` row only on the positive-idle rule: the same idle
  * screen AND the same transcript, ending with a completed turn, across
  * `STALE_WORKING_WINDOW_MS`. The screens below are drawn as Claude Code
- * 2.1.280 draws them; the transcript entries are the JSONL lines it writes.
- * A suite builds its screens and transcripts from these rather than writing
- * its own.
+ * 2.1.280 draws them; the transcript entries are the JSONL lines it writes,
+ * their `version` field `MIN_CLAUDE_CODE_VERSION` from
+ * `agent-director-versions.ts` (the comments that name 2.1.280 record what
+ * the screens were drawn from). A suite builds its screens and transcripts
+ * from these rather than writing its own.
  *
  * Time: the wait and the evidence take the session manager's clock seam, so
  * a suite passes `createFakeClock().now` to `_setNow` (reset with `_resetNow`
@@ -20,6 +22,8 @@
  */
 
 import { appendFileSync, writeFileSync } from 'node:fs'
+
+import { MIN_CLAUDE_CODE_VERSION } from './agent-director-versions.ts'
 
 // ---------------------------------------------------------------------------
 // Screens
@@ -315,7 +319,7 @@ function conversation(type: 'user' | 'assistant', message: Record<string, unknow
     userType: 'external',
     cwd: '/x',
     sessionId: TRANSCRIPT_SESSION_ID,
-    version: '2.1.280',
+    version: MIN_CLAUDE_CODE_VERSION,
     type,
     message,
     uuid: crypto.randomUUID(),
@@ -399,7 +403,7 @@ export function hookAttachmentEntry(type: string, hookEvent = 'Stop'): Transcrip
     userType: 'external',
     cwd: '/x',
     sessionId: TRANSCRIPT_SESSION_ID,
-    version: '2.1.280',
+    version: MIN_CLAUDE_CODE_VERSION,
     type: 'attachment',
     attachment: { type, content: ['Check the job list before you finish.'], hookName: hookEvent, toolUseID: `hook-${hookEvent}`, hookEvent },
     uuid: crypto.randomUUID(),
