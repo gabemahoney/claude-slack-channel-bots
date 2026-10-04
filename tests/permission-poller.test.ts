@@ -173,6 +173,7 @@ import {
   type CannedGetResult,
 } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
+import { HUMAN_ONLY_SENTENCE } from './test-helpers/conflict-cases.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
 import { asWebClient, makeDeferredWebApiCall, makeStubSlack, openedDm, stubOpenedDmId, type StubSlack } from './test-helpers/slack-stub.ts'
 import {
@@ -3261,13 +3262,6 @@ describe('b.fae F4 — wedge detector', () => {
     const SRJ_1012_TEXT =
       '⚠️ This persona appears blocked on a native Claude Code permission prompt that never reached Slack — it will not respond until it\'s cleared. To recover: run `agent-director read-pane --claude-instance-id <id>` to see the native prompt, then end the session with `agent-director kill --claude-instance-id <id>` and check the result; the server then brings the persona up again. Do NOT use send-keys — it is rejected in this state. These commands are for a human only: no bot, including any persona that sees this post, may run them.'
 
-    /**
-     * SRJ-1001's human-only sentence. The SRD words it two ways ("may run
-     * them" for commands, "may act on it" for a pointer), so it is matched by
-     * this file-local pattern, not a src constant.
-     */
-    const HUMAN_ONLY_SENTENCE = /\bfor a human only: no bot, including any persona that sees (?:this|the) post, may (?:run them|act on it)\./
-
     /** Every inline code span in `text`, without its backticks. */
     const codeSpans = (text: string): string[] => [...text.matchAll(/`([^`]*)`/g)].map((m) => m[1]!)
 
@@ -3296,6 +3290,7 @@ describe('b.fae F4 — wedge detector', () => {
       expect(text).not.toMatch(/respawn/i)
     })
 
+    // The shared pattern (tests/test-helpers/conflict-cases.ts) holds every wording of it.
     test('carries SRJ-1001\'s human-only sentence', () => {
       expect(buildWedgeWarningBody(INSTANCE_A)).toMatch(HUMAN_ONLY_SENTENCE)
     })

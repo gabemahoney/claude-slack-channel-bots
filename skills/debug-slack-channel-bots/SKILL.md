@@ -1967,9 +1967,12 @@ agent-director list --tmux-session-name '<name>'
 The notice's line quotes the name for the shell (single quotes, each `'` in
 it written `'\''`; a plain name reads
 `agent-director list --tmux-session-name 'slack_bot_dev'`). When the name
-holds a control character, a line or paragraph separator, or a backtick, the
+holds a control character, a line or paragraph separator, or a backtick, or
+when rendering it as the notice renders agent-director's text would change
+it (a token-like part redacted, leading or trailing whitespace trimmed, a
+name of whitespace alone included, or the name cut at the length cap), the
 notice leaves the line out and says "The session name could not be shown
-safely." instead.
+safely." instead: a command filtering on a changed name would list nothing.
 
 **After a launch's plain spawn met the conflict** (`refused=plain-spawn` in
 the `latched` line below), the persona's own row reads one of two ways, and

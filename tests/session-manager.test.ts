@@ -1047,6 +1047,7 @@ import {
   ERR_STORE_OPEN_NAME,
 } from '../src/agent-director-errors.ts'
 import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER } from '../src/slack-log-redaction.ts'
+import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import { UNUSABLE_RECORDED_NAME_PHRASE } from '../src/ad-description-phrases.ts'
 import { RESTART_FAILURE_CAP, RESTART_OUTCOME_LAUNCHED, RESTART_OUTCOME_REFUSED, runRestartRetry, type LaunchSessionResult } from '../src/restart.ts'
 import {
@@ -1171,6 +1172,8 @@ import {
   UNUSABLE_NAME_CASE_ROWS,
   expectedConflictNotice,
   expectedLatchRecord,
+  HUMAN_ONLY_SENTENCE,
+  humanOnlySentencesIn,
   livenessPaneConflictRowsAt,
   promptRowPaneConflictRowsAt,
   reconnectConflictRowsAt,
@@ -9427,18 +9430,6 @@ const PROMPT_NOTICE_AUTO_RESTART_ON = 'Once it is answered, CSCB reconnects it w
 /** What the unproven-idle notice says is wrong (b.f2b). */
 const UNPROVEN_IDLE_CLAIM = 'its session reads working but CSCB can\'t prove it\'s idle, so it won\'t type into it'
 
-/**
- * b.jg5 SRJ-1001: the human-only sentence a notice that names a command
- * carries. A file-local pattern, not a src constant, because the SRD words it
- * two ways ("may act on it" / "may run them").
- */
-const HUMAN_ONLY_SENTENCE = /(?:This is|These commands are) for a human only: no bot, including any persona that sees this post, may (?:act on it|run them)\./g
-
-/** How many times `text` carries SRJ-1001's human-only sentence. */
-function humanOnlySentenceCount(text: string): number {
-  return text.match(HUMAN_ONLY_SENTENCE)?.length ?? 0
-}
-
 /** A transcript's identity for the pure fold cases (no file behind it). */
 const SNAPSHOT: TranscriptSnapshot = { path: `/t/${TRANSCRIPT_SESSION_ID}.jsonl`, dev: 1, ino: 7, size: 4_096, mtimeMs: 1_000 }
 
@@ -9937,7 +9928,7 @@ describe('b.f2b: the not-connected notice, once per episode', () => {
     expect(second).toContain(`\`${RECONNECT_TEXT}\``)
     // b.jg5 SRJ-1001: the notice names commands, so it carries the
     // human-only sentence exactly once, at the end of its second line.
-    expect(humanOnlySentenceCount(notices[0]!.text)).toBe(1)
+    expect(humanOnlySentencesIn(notices[0]!.text)).toHaveLength(1)
     expect(second).toMatch(new RegExp(` (?:${HUMAN_ONLY_SENTENCE.source})$`))
     expect(linesWith(errLog, `persona=C is not connected (${notice.reason})`)).toHaveLength(1)
   })
@@ -9954,7 +9945,7 @@ describe('b.f2b: the not-connected notice, once per episode', () => {
   ])('%s: the first line is unchanged and carries no human-only sentence', (_label, notice, firstLine) => {
     const [first] = buildNotConnectedNotice('C', notice).split('\n')
     expect(first).toBe(firstLine)
-    expect(humanOnlySentenceCount(first!)).toBe(0)
+    expect(humanOnlySentencesIn(first!)).toEqual([])
   })
 
   test.each<[UndeliverableCause | undefined, string, string]>([
@@ -13899,10 +13890,11 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   // inconclusive path's one answer, ErrSpawnNotFound) and ErrJsonlMissing
   // gave no enumerated paths, its description is echoed as "AD reported: …"
   // only after redactSlackLogText, in the log line, the
-  // jsonl-diagnosis-inconclusive record and the persona notice; the record's
-  // cause is describeAgentDirectorFailure: the error's name and the same
-  // redacted description as `message="…"`.
-  test('AC 20: the row fetch finds no row and ErrJsonlMissing\'s description holds a URL and a fake token → "AD reported:" carries it redacted in the line, the record and the notice; nothing leaks', async () => {
+  // jsonl-diagnosis-inconclusive record and the persona notice (there also
+  // escaped for Slack, so the placeholders read `&lt;redacted-url&gt;`); the
+  // record's cause is describeAgentDirectorFailure: the error's name and the
+  // same redacted description as `message="…"`.
+  test('AC 20: the row fetch finds no row and ErrJsonlMissing\'s description holds a URL and a fake token → "AD reported:" carries it redacted in the line, the record and the notice (escaped for Slack there); nothing leaks', async () => {
     const readLog = captureStartupErrors()
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
     installDiagnosisGetFailure(cfg, () => errSpawnNotFound(), { spawnCalls: [], deleteCalls: [] }, adDescription())
@@ -13917,7 +13909,8 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     const entry = onlyStartupEntry(readLog(), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)
     expect(entry).toContain(reported)
     expect(entry.endsWith(` — ErrJsonlMissing message=${JSON.stringify(REDACTED_AD_DESCRIPTION)}`)).toBe(true)
-    expect(notices.map((n) => n.text).filter((t) => t.includes(reported))).toHaveLength(1)
+    expect(notices.map((n) => n.text).filter((t) => t.includes(escapeSlackControlCharacters(reported)))).toHaveLength(1)
+    expect(notices.map((n) => n.text).filter((t) => t.includes(REDACTED_URL_PLACEHOLDER))).toEqual([])
     assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
   })
 
@@ -13957,9 +13950,10 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   // text: its description ("AD reported:") or the paths taken from it or from
   // the row ("Transcript candidates tried", "Paths tried"). In the Slack
   // notice that quoted part is redacted, on one line and cut to
-  // MAX_LOGGED_MESSAGE_LENGTH (`renderLogMessageText`); the log line and the
-  // startup-errors entry carry it in full, as before. A plain short quote
-  // reads in the notice exactly as given.
+  // MAX_LOGGED_MESSAGE_LENGTH (`renderLogMessageText`), then escaped for
+  // Slack (`escapeSlackControlCharacters`, final-review fix #1); the log line
+  // and the startup-errors entry carry it in full and unescaped, as before. A
+  // plain short quote reads in the notice exactly as given.
 
   /** A URL-like transcript path, which redaction replaces. */
   const URL_PATH = 'https://transcripts.example.test/v1/sess-u.jsonl'
@@ -14055,20 +14049,22 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     return { notice, quotedPart, logLine: logLines[0]!, entry: onlyStartupEntry(readLog(), c.entryClass) }
   }
 
-  test.each(QUOTED_DIAGNOSIS_CASES)('SRJ-1001, %s: over the cap, on two lines and with a URL, the notice carries it redacted, on one line and cut to MAX_LOGGED_MESSAGE_LENGTH; the log line and the entry carry it in full', async (_label, c) => {
+  test.each(QUOTED_DIAGNOSIS_CASES)('SRJ-1001, %s: over the cap, on two lines and with a URL, the notice carries it redacted, on one line, cut to MAX_LOGGED_MESSAGE_LENGTH and then escaped for Slack; the log line and the entry carry it in full, unescaped', async (_label, c) => {
     // The premise: the quote is over the cap and spans two lines.
     expect(c.long.quoted.length).toBeGreaterThan(MAX_LOGGED_MESSAGE_LENGTH)
     expect(c.long.quoted).toContain('\n')
 
     const { notice, quotedPart, logLine, entry } = await quotedDiagnosisRun(c, c.long.description)
 
-    expect(quotedPart).toBe(renderLogMessageText(c.long.quoted))
-    expect(quotedPart).toHaveLength(MAX_LOGGED_MESSAGE_LENGTH)
-    expect(quotedPart).toContain(REDACTED_URL_PLACEHOLDER)
+    // Cut before it is escaped: the rendered quote is the cap's length, and the escape lengthens only the placeholder.
+    expect(renderLogMessageText(c.long.quoted)).toHaveLength(MAX_LOGGED_MESSAGE_LENGTH)
+    expect(quotedPart).toBe(escapeSlackControlCharacters(renderLogMessageText(c.long.quoted)))
+    expect(quotedPart).toContain(escapeSlackControlCharacters(REDACTED_URL_PLACEHOLDER))
+    expect(notice).not.toContain(REDACTED_URL_PLACEHOLDER)
     expect(notice).not.toContain('\n')
     expect(notice).not.toContain(URL_PATH)
     // The log line and the entry are as before the fix: the quote in full
-    // (the entry's own flattening puts it on one line).
+    // (the entry's own flattening puts it on one line), never escaped.
     expect(logLine).toContain(`${c.logLead}${c.long.quoted}`)
     expect(entry).toContain(`${c.logLead}${c.long.quoted.replace(/\n/g, ' ')}`)
   })
@@ -14144,6 +14140,44 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     // is unparseable, the archive must NOT have been consulted (no lost record).
     expect(log).toContain("started_at is absent or unparseable")
     expect(log).not.toContain(JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)
+  })
+
+  // (b) with the row's started_at quoted (final-review fix #2): it is
+  // agent-director's text, so the reason renders it through
+  // renderLogMessageText (redacted, on one line, capped; blank reads
+  // `(none)`) in the log line, the entry and the notice alike, and the notice
+  // alone escapes it for Slack.
+  test.each([
+    ['holding "<", "&" and a URL', 'not<a&time https://clock.example.test/t1'],
+    ['empty', ''],
+    ['whitespace only', '   '],
+  ])('inconclusive (b): a started_at %s is quoted rendered in the line, the entry and the notice, and escaped in the notice only', async (_label, startedAt) => {
+    const readLog = captureStartupErrors()
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
+    installAmnesia({ cfg, getResult: { jsonl_path: '/data/proj/sess-b2.jsonl', claude_session_id: 'sess-b2', cwd: CWD, started_at: startedAt } })
+    const errLog = await withCapturedErr(async () => {
+      expect((await spawnForPersona(personaOf(cfg, CH), cfg, true)).action).toBe('fresh-after-inconclusive-amnesia')
+    })
+
+    const rendered = renderLogMessageText(startedAt) || '(none)'
+    const quoted = `(started_at=${rendered})`
+    if (startedAt.includes('https://')) {
+      // The premise: rendering redacted the URL and kept "<" and "&", which the notice must escape.
+      expect(rendered).toContain(REDACTED_URL_PLACEHOLDER)
+      expect(/[<&]/.test(rendered.split(REDACTED_URL_PLACEHOLDER).join(''))).toBe(true)
+    } else {
+      expect(rendered).toBe('(none)')
+    }
+    const lines = errLog.split('\n').filter((l) => l.startsWith('[slack] ErrJsonlMissing diagnostic: '))
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toContain(quoted)
+    expect(onlyStartupEntry(readLog(), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toContain(quoted)
+    expect(notices.map((n) => n.key)).toEqual([CH])
+    const notice = notices[0]!.text
+    expect(notice).toContain(escapeSlackControlCharacters(quoted))
+    expect(/[<>]/.test(notice)).toBe(false)
+    expect(notice).not.toContain('https://')
+    assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
   })
 
   // (c-config) archive unavailable because none is configured. Distinguished

@@ -1749,17 +1749,22 @@ describe('the quoted description and session in the notice', () => {
     expect(run.lines.filter((line) => line.includes(controls) && line.includes(JSON.stringify(sessionName))).length).toBe(1)
   })
 
-  test('a token-shaped quoted session is redacted in the first line and the list line', () => {
+  test('a token-shaped quoted session is redacted in the first line, and the unsafe-name sentence stands in place of the list line (final-review fix #3)', () => {
     const run = makeNoticeRun()
     const ownId = rowWhere((row) => row.latchCase === LATCH_CASE_OWN_ID)
     run.latch.setFromConflict(KEY, errTmuxSessionConflict(ownId.verb, ownId.stubCase, fakeToken(BOT_TOKEN_PREFIX, 'q'), ownId.options), {
       refusedOperation: REFUSED_OPERATION_RESUME,
       rowState: ENDED,
     })
-    const lines = run.posts[0][1].split(CONFLICT_NOTICE_LINE_SEPARATOR)
+    const notice = run.posts[0][1]
+    const lines = notice.split(CONFLICT_NOTICE_LINE_SEPARATOR)
     const placeholder = escapeSlackControlCharacters(REDACTED_TOKEN_PLACEHOLDER)
     expect(lines[0].includes(JSON.stringify(placeholder))).toBe(true)
-    expect(lines.at(-2)).toBe(CONFLICT_NOTICE_LIST_LINE_HEAD + `'${placeholder}'` + CONFLICT_NOTICE_LIST_LINE_TAIL)
+    // The record holds the placeholder, which reads safe; the flag set from the name as given keeps it out of the list line.
+    expect(run.latch.record(KEY)?.listLineUnsafe).toBe(true)
+    expect(lines.slice(-2)).toEqual([CONFLICT_NOTICE_LIST_LINE_UNSAFE_NAME, CONFLICT_NOTICE_HUMAN_ONLY_LINE])
+    // Only agent-director's quoted description may carry its own list command.
+    expect(cscbOwnText(notice).includes('--tmux-session-name')).toBe(false)
   })
 })
 
@@ -1890,6 +1895,34 @@ describe('the list line\'s session name is shell-quoted', () => {
     expect(lines.filter((line) => line.includes('bad'))).toEqual([lines[0]])
   })
 
+  /**
+   * Names `shellQuoteSessionName` quotes but `renderLogMessageText` changes
+   * (redacts, trims, caps or empties): a list command filtering on the
+   * changed name would list nothing, so the list line is left out
+   * (final-review fix #3).
+   */
+  const RENDER_CHANGED_NAMES: ReadonlyArray<readonly [label: string, name: string]> = [
+    ['a token-like substring', `bot-${fakeToken(BOT_TOKEN_PREFIX, 'listname')}`],
+    ['a URL', 'see https://sessions.example.test/s1'],
+    ['a leading space', ' slack_bot_dev'],
+    ['a trailing space', 'slack_bot_dev '],
+    ['more than MAX_LOGGED_MESSAGE_LENGTH characters', 's'.repeat(MAX_LOGGED_MESSAGE_LENGTH + 1)],
+    ['whitespace only', '   '],
+  ]
+
+  test.each(RENDER_CHANGED_NAMES)('a name with %s: quotable, but rendering changes it, so the unsafe-name sentence stands in place of the list line', (_label, name) => {
+    // The premise: shellQuoteSessionName's contract is unchanged (it quotes the name), and rendering changes it.
+    expect(shellQuoteSessionName(name)).not.toBeNull()
+    expect(renderLogMessageText(name)).not.toBe(name)
+    const notice = conflictNoticeText({ sessionName: name, latchCase: LATCH_CASE_NO_VALID_ID })
+    expect(notice).toBe(expectedConflictNotice({ latchCase: LATCH_CASE_NO_VALID_ID, sessionName: name }).text)
+    const lines = notice.split(CONFLICT_NOTICE_LINE_SEPARATOR)
+    expect(lines.slice(-2)).toEqual([CONFLICT_NOTICE_LIST_LINE_UNSAFE_NAME, CONFLICT_NOTICE_HUMAN_ONLY_LINE])
+    expect(lines.filter((line) => line.startsWith(CONFLICT_NOTICE_LIST_LINE_HEAD))).toEqual([])
+    expect(notice.includes('--tmux-session-name')).toBe(false)
+    assertNoLeak(notice, 'render-changed session name')
+  })
+
   test.each([
     ['a tab', 'bad\tname'],
     ['a backtick', 'bad`name'],
@@ -1899,6 +1932,124 @@ describe('the list line\'s session name is shell-quoted', () => {
     expect(expectedConflictNotice({ latchCase: LATCH_CASE_NO_VALID_ID, sessionName: name }).carries.list).toBe(false)
     expect(notice.split(CONFLICT_NOTICE_LINE_SEPARATOR).slice(-2)).toEqual([CONFLICT_NOTICE_LIST_LINE_UNSAFE_NAME, CONFLICT_NOTICE_HUMAN_ONLY_LINE])
     expect(notice.includes('--tmux-session-name')).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The record's listLineUnsafe through the latch (final-review fix #3, SRJ-501, SRJ-1004)
+// ---------------------------------------------------------------------------
+
+describe('the record\'s listLineUnsafe: decided by set from the quoted name as given, and followed by the posted notice', () => {
+  const noValidId = lazyRow((row) => row.latchCase === LATCH_CASE_NO_VALID_ID)
+  const leftover = lazyRow((row) => row.latchCase === LATCH_CASE_LEFTOVER)
+
+  /** The CONFLICT error `row`'s verb and stub case give, quoting `sessionName`. */
+  const conflictQuoting = (row: ConflictCaseRow, sessionName: string) => errTmuxSessionConflict(row.verb, row.stubCase, sessionName, row.options)
+
+  /** Latch `key` through `setFromConflict` on `row`'s error quoting `sessionName`; answers the error's description. */
+  function latchQuoting(run: NoticeRun, key: string, row: ConflictCaseRow, sessionName: string) {
+    const err = conflictQuoting(row, sessionName)
+    const outcome = run.latch.setFromConflict(key, err, { refusedOperation: row.refusedOperation, rowState: row.rowState })
+    return { outcome, description: err.errDescription }
+  }
+
+  /** The notice the record of `key` should post: built from the record's name, with its flag. */
+  function noticeForRecord(run: NoticeRun, key: string, description: string): string {
+    const record = run.latch.record(key)!
+    return expectedConflictNotice({
+      latchCase: record.latchCase as ConflictLatchCase,
+      sessionName: record.sessionName,
+      description,
+      listLineUnsafe: record.listLineUnsafe === true,
+    }).text
+  }
+
+  /**
+   * Quoted names `set` cannot keep as given: one holding a token (redacted;
+   * a name that is a whole token is the case above), a URL (redacted),
+   * leading or trailing spaces (trimmed), a name over
+   * MAX_LOGGED_MESSAGE_LENGTH (capped) and whitespace only (blank, so the
+   * record holds `slack_bot_<key>`). Each record's name reads safe, so only
+   * the flag keeps it out of the list line.
+   */
+  const CHANGED_ON_SET: ReadonlyArray<readonly [label: string, name: string]> = [
+    ['a token', `bot-${fakeToken(BOT_TOKEN_PREFIX, 'flagged')}`],
+    ['a URL', 'https://sessions.example.test/s1'],
+    ['a leading space', ' slack_bot_dev'],
+    ['a trailing space', 'slack_bot_dev '],
+    ['more than MAX_LOGGED_MESSAGE_LENGTH characters', 's'.repeat(MAX_LOGGED_MESSAGE_LENGTH + 1)],
+    ['whitespace only', '   '],
+  ]
+
+  test.each(CHANGED_ON_SET)('a quoted name with %s: the record carries listLineUnsafe, and the post has the unsafe-name sentence in place of the list line', (label, name) => {
+    const run = makeNoticeRun()
+    const { outcome, description } = latchQuoting(run, KEY, noValidId(), name)
+    expect(outcome).toBe(CONFLICT_LATCH_SET_LATCHED)
+    const record = run.latch.record(KEY)!
+    expect(record).toEqual(
+      expectedLatchRecord(KEY, { latchCase: LATCH_CASE_NO_VALID_ID, refusedOperation: noValidId().refusedOperation, rowState: noValidId().rowState, sessionName: name, description }),
+    )
+    expect(record.listLineUnsafe).toBe(true)
+    // The premise: the name the record holds would read safe without the flag.
+    expect(expectedConflictNotice({ latchCase: LATCH_CASE_NO_VALID_ID, sessionName: record.sessionName }).carries.list).toBe(true)
+    if (label === 'whitespace only') expect(record.sessionName).toBe(personaTmuxSessionName(KEY))
+    expect(run.posts).toEqual([[KEY, noticeForRecord(run, KEY, description)]])
+    const notice = run.posts[0]![1]
+    expect(notice.split(CONFLICT_NOTICE_LINE_SEPARATOR).slice(-2)).toEqual([CONFLICT_NOTICE_LIST_LINE_UNSAFE_NAME, CONFLICT_NOTICE_HUMAN_ONLY_LINE])
+    expect(cscbOwnLines(notice).filter((line) => line.startsWith(CONFLICT_NOTICE_LIST_LINE_HEAD) || line.includes('--tmux-session-name'))).toEqual([])
+  })
+
+  test.each([
+    ['another persona\'s plain session name', () => personaTmuxSessionName(OTHER), () => personaTmuxSessionName(OTHER)],
+    ['no quoted name (the persona\'s own slack_bot_<key>)', undefined, () => personaTmuxSessionName(KEY)],
+  ] as const)('%s: no listLineUnsafe, and the list line names the session shell-quoted', (_label, quoted, stored) => {
+    const run = makeNoticeRun()
+    const err = quoted === undefined ? conflictError(CONFLICT_OWN_ID_PHRASE) : conflictQuoting(noValidId(), quoted())
+    run.latch.setFromConflict(KEY, err, { refusedOperation: REFUSED_OPERATION_RESUME, rowState: ENDED })
+    const record = run.latch.record(KEY)!
+    expect(record.sessionName).toBe(stored())
+    expect('listLineUnsafe' in record).toBe(false)
+    expect(run.posts).toEqual([[KEY, noticeForRecord(run, KEY, err.errDescription)]])
+    expect(run.posts[0]![1].split(CONFLICT_NOTICE_LINE_SEPARATOR).at(-2)).toBe(
+      CONFLICT_NOTICE_LIST_LINE_HEAD + `'${stored()}'` + CONFLICT_NOTICE_LIST_LINE_TAIL,
+    )
+  })
+
+  test('a relatch builds the flag afresh from its own name: an unsafe name then a plain one clears it, and back sets it; each post follows its record', () => {
+    const run = makeNoticeRun()
+    const plain = personaTmuxSessionName(OTHER)
+    const plainListLine = CONFLICT_NOTICE_LIST_LINE_HEAD + `'${plain}'` + CONFLICT_NOTICE_LIST_LINE_TAIL
+    const listLines = () => run.posts.map(([, text]) => text.split(CONFLICT_NOTICE_LINE_SEPARATOR).at(-2))
+
+    expect(latchQuoting(run, KEY, noValidId(), ' slack_bot_dev').outcome).toBe(CONFLICT_LATCH_SET_LATCHED)
+    expect(run.latch.record(KEY)?.listLineUnsafe).toBe(true)
+
+    const second = latchQuoting(run, KEY, leftover(), plain)
+    expect(second.outcome).toBe(CONFLICT_LATCH_SET_RELATCHED)
+    expect('listLineUnsafe' in run.latch.record(KEY)!).toBe(false)
+    expect(run.posts.at(-1)).toEqual([KEY, noticeForRecord(run, KEY, second.description)])
+
+    const third = latchQuoting(run, KEY, noValidId(), `${plain} `)
+    expect(third.outcome).toBe(CONFLICT_LATCH_SET_RELATCHED)
+    // Trimmed, the record holds the plain name again; only the flag differs.
+    expect(run.latch.record(KEY)).toMatchObject({ sessionName: plain, listLineUnsafe: true })
+    expect(run.posts.at(-1)).toEqual([KEY, noticeForRecord(run, KEY, third.description)])
+
+    expect(listLines()).toEqual([CONFLICT_NOTICE_LIST_LINE_UNSAFE_NAME, plainListLine, CONFLICT_NOTICE_LIST_LINE_UNSAFE_NAME])
+  })
+
+  test('setProbeDropped keeps the flag, and a same-case set with a plain name keeps the flagged record', () => {
+    const run = makeNoticeRun()
+    latchQuoting(run, KEY, noValidId(), 'slack_bot_dev ')
+    const flagged = run.latch.record(KEY)!
+    expect(run.latch.setProbeDropped(KEY)).toBe(true)
+    expect(run.latch.record(KEY)).toEqual({ ...flagged, probeDropped: true })
+    expect(run.latch.record(KEY)?.listLineUnsafe).toBe(true)
+
+    const dropped = run.latch.record(KEY)
+    expect(latchQuoting(run, KEY, noValidId(), personaTmuxSessionName(OTHER)).outcome).toBe(CONFLICT_LATCH_SET_SAME_CASE)
+    expect(run.latch.record(KEY)).toBe(dropped)
+    expect(run.posts.length).toBe(1)
   })
 })
 

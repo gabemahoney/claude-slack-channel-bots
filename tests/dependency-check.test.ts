@@ -20,8 +20,10 @@
  *      hatch notes): the three API-surface probes carry the client-package
  *      remedy (`CLIENT_PACKAGE_REMEDY`) naming the runbook section; the
  *      catalog clause names `ErrUnknownErrorName` and misclassification, not
- *      the base `AgentDirectorError`; not found names the publishing-host
- *      block; unreachable the runbook section and the install-cscb skill;
+ *      the base `AgentDirectorError`; not found names the runbook section
+ *      (whose step 1 checks the workers' agent-director version), never the
+ *      publishing-host block; unreachable the runbook section and the
+ *      install-cscb skill;
  *      `ad-same-user` the runbook section, the file's owner and the ruling's
  *      "never remove or recreate the file". One sweep over every message the
  *      gate builds: no `UPGRADE_FORMS` row (its re-install row included) and
@@ -821,10 +823,17 @@ describe('SR-4.2: system-install typed-error branches', () => {
       expect(outcome.phase).toBe('construct')
       expect(outcome.classLabel).toBe(AD_SYSTEM_INSTALL_NOT_FOUND)
       expect(outcome.message).toContain('agent-director')
-      // The publishing-host block, which covers a host with no agent-director (E35 note).
-      expect(outcome.message).toContain(PUBLISHING_HOST_BLOCK_POINTER)
-      expect(outcome.message).toContain(`"${PUBLISHING_HOST_BLOCK_HEADING}"`)
+      // The runbook section, whose step 1 checks agent-director's version as
+      // the workers' user in the bot server's launcher environment; not the
+      // publishing-host block, and no install advice (final-review fix #4).
+      expect(outcome.message).toContain(RUNBOOK_SECTION_POINTER)
       expect(outcome.message).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
+      expect(outcome.message).toContain('step 1')
+      expect(outcome.message).toContain("workers' user")
+      expect(outcome.message).not.toContain(PUBLISHING_HOST_BLOCK_POINTER)
+      expect(outcome.message).not.toContain(PUBLISHING_HOST_BLOCK_HEADING)
+      const rest = withoutAllowedSpans(outcome.message)
+      expect([...UPGRADE_FORMS, ...INSTALL_OR_REMOVAL_FORMS].filter(([, pattern]) => pattern.test(rest)).map(([label]) => label)).toEqual([])
       // SR-4.5: appends the manual-skill-install instructions block.
       expect(outcome.message).toContain('skills/install-cscb/SKILL.md')
     }

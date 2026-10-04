@@ -109,9 +109,10 @@ export const RUNBOOK_SECTION_POINTER = `the README's switch-over runbook section
 
 /**
  * The publishing-host block (`PUBLISHING_HOST_BLOCK_HEADING`) inside the
- * switch-over runbook section: where the not-found texts of the install
- * check and the startup gate point, since that block covers a host with no
- * agent-director (b.jg5 SRJ-1108, SRJ-212).
+ * switch-over runbook section: where the install check's not-found text
+ * points, since that block covers a host with no agent-director (b.jg5
+ * SRJ-1108, SRJ-212). The startup gate's not-found text points at
+ * `RUNBOOK_SECTION_POINTER` instead (it runs on a bot host).
  */
 export const PUBLISHING_HOST_BLOCK_POINTER = `the block "${PUBLISHING_HOST_BLOCK_HEADING}" in ${RUNBOOK_SECTION_POINTER}`
 

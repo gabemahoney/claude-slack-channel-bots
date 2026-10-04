@@ -52,8 +52,9 @@
  *     (`sessionEndingCommandsIn`);
  *   - every Slack notice whose own text names a command (a code span opening
  *     with `agent-director` or `tmux` and a space) or "Operator actions"
- *     carries the human-only sentence, matched by one file-local pattern
- *     (`HUMAN_ONLY_SENTENCE`) since the SRD's wordings differ; "Operator
+ *     carries the human-only sentence, matched by the one shared pattern
+ *     (`HUMAN_ONLY_SENTENCE` from tests/test-helpers/conflict-cases.ts) since
+ *     its wordings differ; "Operator
  *     actions" appears only as its quoted title; the log-only texts
  *     (`LOG_ONLY_SRJS`: SRJ-1003, SRJ-1013) quote agent-director's own
  *     pointer and are held to the other rules only;
@@ -234,6 +235,8 @@ import {
   cscbOwnLineForbiddenIn,
   cscbOwnLines,
   cscbOwnText,
+  HUMAN_ONLY_SENTENCE,
+  humanOnlySentencesIn,
   sessionEndingCommandsIn,
 } from './test-helpers/conflict-cases.ts'
 import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
@@ -280,6 +283,7 @@ const CONFLICT_LIST_NAME_VARIANTS: readonly (readonly [variant: string, sessionN
   ['list line left out: a name with a control character', 'bad\u001bname'],
   ['list line left out: a name with a newline', 'bad\nname'],
   ['list line left out: a name with a backtick', 'bad`name'],
+  ['list line left out: a token-bearing name, which rendering redacts', `bot ${sentinelInMessage('list-name')}`],
 ]
 
 /** SRJ-1004: the CONFLICT notice. */
@@ -757,11 +761,18 @@ function jsonlSafeguardEntries(): NoticeEntry[] {
 }
 
 /**
+ * Slack's control characters, which a path or description agent-director
+ * quotes may hold: each diagnosis notice escapes them (final-review fix #1).
+ */
+const JSONL_SLACK_CONTROLS = '<a>&b'
+
+/**
  * A transcript path list as agent-director's `ErrJsonlMissing` description
- * enumerates it (`<source> <path> (<stat error>)`), a fake token riding in it.
+ * enumerates it (`<source> <path> (<stat error>)`), the path holding
+ * {@link JSONL_SLACK_CONTROLS} and a fake token riding in it.
  */
 function jsonlPathsTried(label: string): string {
-  return withToken(`jsonl_path ${JSONL_BASE_DIR}/claude/projects/sess-notice.jsonl (stat: no such file or directory)`, label)
+  return withToken(`jsonl_path ${JSONL_BASE_DIR}/claude/projects/sess-${JSONL_SLACK_CONTROLS}.jsonl (stat: no such file or directory)`, label)
 }
 
 /**
@@ -774,7 +785,8 @@ const JSONL_SAMPLE_PROVENANCE = 'sample provenance of the paths below'
 /**
  * SRJ-1001 (SRJ-712): the `ErrJsonlMissing` diagnosis's persona notices, LOST
  * and both INCONCLUSIVE shapes, each quoting agent-director's paths or
- * description; they name no command.
+ * description, which hold a fake token and {@link JSONL_SLACK_CONTROLS};
+ * they name no command.
  */
 function jsonlDiagnosisEntries(): NoticeEntry[] {
   return [
@@ -782,7 +794,7 @@ function jsonlDiagnosisEntries(): NoticeEntry[] {
       jsonlTranscriptLostNoticeText(3, jsonlPathsTried('jsonl-lost')),
     ),
     entry('SRJ-1001', 'jsonlRowAbsentInconclusiveNoticeText', 'inconclusive, row absent, token-bearing description', () =>
-      jsonlRowAbsentInconclusiveNoticeText(withToken(errJsonlMissing().errDescription, 'jsonl-row-absent')),
+      jsonlRowAbsentInconclusiveNoticeText(withToken(`${errJsonlMissing().errDescription} ${JSONL_SLACK_CONTROLS}`, 'jsonl-row-absent')),
     ),
     entry('SRJ-1001', 'jsonlCandidatesInconclusiveNoticeText', 'inconclusive, unattributable zero, token-bearing candidates', () =>
       jsonlCandidatesInconclusiveNoticeText(UNATTRIBUTABLE_ZERO_REASON, JSONL_SAMPLE_PROVENANCE, jsonlPathsTried('jsonl-candidates')),
@@ -1065,6 +1077,20 @@ describe('the notice catalogue is complete (SRJ-1001 to SRJ-1021, and every name
       })
     }
   })
+
+  test('each ErrJsonlMissing diagnosis notice\'s quoting row escapes the "<", ">" and "&" in its quoted text for Slack, once', () => {
+    const quoting = NOTICE_CATALOGUE.filter((e) => JSONL_DIAGNOSIS_BUILDERS.includes(e.builder) && e.variant !== CAP_VARIANT)
+    expect(quoting.map((e) => e.builder)).toEqual([...JSONL_DIAGNOSIS_BUILDERS])
+    for (const e of quoting) {
+      const text = e.render()
+      expect({ title: titleOf(e), escaped: text.includes(escapeSlackControlCharacters(JSONL_SLACK_CONTROLS)), raw: /[<>]/.test(text), twice: text.includes(escapeSlackControlCharacters(escapeSlackControlCharacters(JSONL_SLACK_CONTROLS))) }).toEqual({
+        title: titleOf(e),
+        escaped: true,
+        raw: false,
+        twice: false,
+      })
+    }
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -1078,20 +1104,39 @@ describe('the notice catalogue is complete (SRJ-1001 to SRJ-1021, and every name
  */
 const COMMAND_SPAN = /`(?:agent-director|tmux)\s/
 
-/**
- * SRJ-1001's human-only sentence. One file-local pattern, not a src constant:
- * the SRD's wordings differ ("may act on it", "may act on them", "may run
- * them").
- */
-const HUMAN_ONLY_SENTENCE = /for a human only: no bot, including any persona that sees this post, may (?:act on|run) (?:it|them)\./
-
 /** The title of agent-director's README section a notice points to; a notice names it only as that quoted title (SRJ-1001). */
 const OPERATOR_ACTIONS = 'Operator actions'
 const OPERATOR_ACTIONS_TITLE = `"${OPERATOR_ACTIONS}"`
 
+/** Whether `ownText` names "Operator actions" other than as its quoted title, in any letter case (SRJ-1001). */
+function namesOperatorActionsUnquoted(ownText: string): boolean {
+  return new RegExp(OPERATOR_ACTIONS, 'i').test(ownText.split(OPERATOR_ACTIONS_TITLE).join(''))
+}
+
 /** `agent-director kill` named as a command, which only a human's step with its result checked may name (SRJ-1001, SRJ-1007, SRJ-1012). */
 const AD_KILL_COMMAND = /`agent-director kill\b/
 const CHECKS_THE_RESULT = /check (?:the|its) result/
+
+/** Whether `text` names `agent-director kill` and does not say to check its result (SRJ-1001). */
+function namesKillWithoutResultCheck(text: string): boolean {
+  return AD_KILL_COMMAND.test(text) && !CHECKS_THE_RESULT.test(text)
+}
+
+/**
+ * The row-delete form: in one clause (cut at punctuation, a bracket, a dash
+ * or a line break), a `delete` in any inflection and a row, in either order,
+ * unless the clause is negated ("deletes no row", "the row is not deleted",
+ * "don't delete the row", "kills, deletes and respawns nothing").
+ */
+const CLAUSE_END = String.raw`,.;:!?()\[\]—\n`
+const DELETE_VERB = String.raw`\bdelet(?:e|es|ed|ing)\b`
+const ROW_NOUN = String.raw`\brows?\b`
+const CLAUSE_NEGATION = String.raw`\b(?:no|not|nothing|never|none|nor|without|cannot)\b|n['’]t\b`
+const ROW_DELETE = new RegExp(
+  `(?:^|[${CLAUSE_END}])(?![^${CLAUSE_END}]*(?:${CLAUSE_NEGATION}))[^${CLAUSE_END}]*` +
+    `(?:${DELETE_VERB}[^${CLAUSE_END}]*${ROW_NOUN}|${ROW_NOUN}[^${CLAUSE_END}]*${DELETE_VERB})`,
+  'i',
+)
 
 /**
  * What no notice names (SRJ-1001), beside `CSCB_OWN_LINE_FORBIDDEN` (a pane
@@ -1105,7 +1150,7 @@ const NOTICE_FORBIDDEN: readonly (readonly [name: string, pattern: RegExp])[] = 
   ['tmux kill-server', /\bkill-server\b/i],
   ['a raw tmux kill', /\btmux\s+kill/i],
   ['a process kill', /\b(?:pkill|killall)\b|\bkill\s+-(?:\d+|[A-Z]+)\b|\bkill\s+\d/],
-  ['a row delete', /\bdelete\b[^.\n]*\brows?\b/i],
+  ['a row delete', ROW_DELETE],
   ['a tmux target without =', /\btmux\b[^`\n]*\s-t\s*(?!=)\S/],
 ])
 
@@ -1209,13 +1254,13 @@ describe('SRJ-1001: a Slack notice that names a command or "Operator actions" ca
 
 describe('SRJ-1001: a Slack notice names "Operator actions" only by its quoted title', () => {
   test.each(SLACK_CASES)('%s', (_title, e) => {
-    expect(ownTextOf(e.render()).split(OPERATOR_ACTIONS_TITLE).join('')).not.toMatch(new RegExp(OPERATOR_ACTIONS, 'i'))
+    expect(namesOperatorActionsUnquoted(ownTextOf(e.render()))).toBe(false)
   })
 })
 
 describe('SRJ-1001: only the ordinary kill-failure alert and the wedge warning name `agent-director kill`, each checking its result', () => {
   test.each(CASES.filter(([, e]) => AD_KILL_COMMAND.test(e.render())))('%s', (_title, e) => {
-    expect(e.render()).toMatch(CHECKS_THE_RESULT)
+    expect(namesKillWithoutResultCheck(e.render())).toBe(false)
   })
 
   test("the builders that name it are those two, and the startup-errors entry that carries the ordinary alert's text", () => {
@@ -1249,8 +1294,9 @@ describe("SRJ-1001: agent-director's quoted words are never CSCB's own", () => {
     expect(forbiddenTermsIn(ownTextOf(text))).toEqual([])
   })
 
-  test("each phrase is agent-director's, and the row-delete form would flag \"never delete this row\" as CSCB's own words", () => {
-    expect(forbiddenTermsIn(NEVER_DELETE_ROW_PHRASE)).toEqual(['a row delete'])
+  test("each phrase is agent-director's; \"never delete this row\" is a negated clause the row-delete form passes, and without its \"never\" the form flags it", () => {
+    expect(forbiddenTermsIn(NEVER_DELETE_ROW_PHRASE)).toEqual([])
+    expect(forbiddenTermsIn(NEVER_DELETE_ROW_PHRASE.replace(/\bnever\s+/i, ''))).toEqual(['a row delete'])
     expect(forbiddenTermsIn(withoutAdOwnWords(NEVER_DELETE_ROW_PHRASE))).toEqual([])
     // The session-ending forms take "kill" only as a command to run, so these two are no hit even unquoted (ADSRD SR-1.4).
     expect([NO_KILL_SENT_PHRASE, RETRY_KILL_LATER_PHRASE].flatMap(sessionEndingCommandsIn)).toEqual([])
@@ -1268,11 +1314,43 @@ describe('SRJ-1001: the rule patterns find what they look for (the checks are no
     ['tmux kill it', 'a raw tmux kill'],
     [`run \`kill -9 ${STUB_SURVIVOR_PIDS[0]}\``, 'a process kill'],
     ['delete its agent-director row', 'a row delete'],
+    ['CSCB deletes its row', 'a row delete'],
+    ['CSCB deleted the row', 'a row delete'],
+    ['deleting the rows by hand', 'a row delete'],
+    ['The row is deleted', 'a row delete'],
+    ['the rows were deleted', 'a row delete'],
+    ['If it does not answer, delete the row', 'a row delete'],
     [`attach with \`tmux attach -t ${session}\``, 'a tmux target without ='],
   ]
 
   test.each(samples)('finds it in %s: %s', (text, form) => {
     expect(forbiddenTermsIn(text)).toContain(form)
+  })
+
+  test.each([
+    ['CSCB kills, deletes and respawns nothing'],
+    ['CSCB kills, deletes and respawns no row'],
+    ['it deletes no row'],
+    ['The row is not deleted'],
+    ["don't delete the row"],
+    ['on an error, don’t delete or respawn the row'],
+    ['the row is kept; nothing is deleted'],
+  ])('the row-delete form passes a negated clause: %s', (text) => {
+    expect(forbiddenTermsIn(text)).toEqual([])
+  })
+
+  test('"Operator actions" is flagged outside its quoted title, in any letter case, and passes as the title', () => {
+    expect(namesOperatorActionsUnquoted(`follow ${OPERATOR_ACTIONS}`)).toBe(true)
+    expect(namesOperatorActionsUnquoted(`see ${OPERATOR_ACTIONS_TITLE}, then the ${OPERATOR_ACTIONS.toLowerCase()}`)).toBe(true)
+    expect(namesOperatorActionsUnquoted(`follow ${OPERATOR_ACTIONS_TITLE}`)).toBe(false)
+  })
+
+  test('`agent-director kill` is flagged without "check the result" and passes with it', () => {
+    const kill = `\`agent-director kill --claude-instance-id ${personaInstanceId(KEY)}\``
+    expect(namesKillWithoutResultCheck(`run ${kill}`)).toBe(true)
+    expect(namesKillWithoutResultCheck(`run ${kill}, then check its result`)).toBe(false)
+    expect(namesKillWithoutResultCheck(`run ${kill} and check the result`)).toBe(false)
+    expect(namesKillWithoutResultCheck(NO_KILL_SENT_PHRASE)).toBe(false)
   })
 
   test('every form has a sample', () => {
@@ -1289,11 +1367,39 @@ describe('SRJ-1001: the rule patterns find what they look for (the checks are no
     expect(COMMAND_SPAN.test('the `tmux-unavailable` outage')).toBe(false)
   })
 
-  test('the human-only sentence matches each of its wordings, and the catalogue holds each', () => {
+  test('the human-only sentence matches each of the notices\' wordings, and the catalogue holds each', () => {
     const texts = NOTICE_CATALOGUE.map((e) => e.render())
     for (const ending of ['may act on it.', 'may act on them.', 'may run them.']) {
-      expect(texts.some((text) => HUMAN_ONLY_SENTENCE.test(text) && text.includes(`sees this post, ${ending}`))).toBe(true)
+      expect({ ending, held: texts.some((text) => humanOnlySentencesIn(text).some((sentence) => sentence.endsWith(`sees this post, ${ending}`))) }).toEqual({
+        ending,
+        held: true,
+      })
     }
+  })
+
+  test.each([
+    ['', 'These commands are for a human only: no bot, including any persona that sees this post, may run them.'],
+    ['', 'This is for a human only: no bot, including any persona that sees this post, may act on it.'],
+    ['', 'These remedies are for a human only: no bot, including any persona that sees this post, may act on them.'],
+    // The SRD's (SRJ-1001) and the docs' wordings.
+    ['It says ', 'it is for a human only: no bot, including any persona that sees the post, may act on it.'],
+    ['It says ', 'its commands are for a human only: no bot, including a persona that sees the post, may run them.'],
+    ['', 'These commands are for a human only: no bot runs them, including a persona that sees the post.'],
+    ['', 'This is for a human only: no bot acts on it, including a persona that sees the post.'],
+    ['', 'Both notices are for a human only: no bot acts on them, including a persona that sees the post.'],
+  ])('the human-only sentence pattern finds the wording %p%p, once', (lead, sentence) => {
+    expect(HUMAN_ONLY_SENTENCE.test(sentence)).toBe(true)
+    expect(humanOnlySentencesIn(`Run \`tmux attach -t =slack_bot_x\`. ${lead}${sentence} Then more.`)).toEqual([sentence])
+  })
+
+  test.each([
+    ['no persona clause', 'This is for a human only: no bot may act on it.'],
+    ['"may run it"', 'These commands are for a human only: no bot, including any persona that sees this post, may run it.'],
+    ['"for humans only"', 'This is for humans only: no bot, including any persona that sees this post, may act on it.'],
+    ['no lead-in', 'For a human only: no bot, including any persona that sees this post, may act on it.'],
+    ['an unrelated "for a human only" sentence', 'It is for a human only: no bot is offered it.'],
+  ])('the human-only sentence pattern finds nothing with %s', (_label, text) => {
+    expect(humanOnlySentencesIn(text)).toEqual([])
   })
 })
 

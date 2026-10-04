@@ -82,6 +82,17 @@ the user:
 > "Switching over to agent-director Phase 1", which covers a host with no
 > agent-director.
 
+If the user came here from the server's startup refusal on a bot host,
+the binary may only be missing from the bot server's launcher HOME or
+PATH while agent-director's store and workers are live; that block is
+not for this host. Tell the user instead:
+
+> The startup gate did not find agent-director. See step 1 of the README
+> section "Switching over to agent-director Phase 1": its check of
+> agent-director's version, as the workers' user in the bot server's
+> launcher environment, shows whether the launcher's HOME or PATH differs
+> from the workers'.
+
 Offer no command and run nothing for this class: agent-director comes onto
 the host only as that README section says. Exit without returning to
 Step 1; the user re-invokes the skill after following the section.

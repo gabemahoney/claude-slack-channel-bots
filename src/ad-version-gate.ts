@@ -116,10 +116,13 @@ export const PHASE1_RUNBOOK_SECTION_TITLE = 'Switching over to agent-director Ph
  * {@link PHASE1_RUNBOOK_SECTION_TITLE} section (b.jg5 SRJ-1108, SRJ-211,
  * SRJ-212): the host that publishes the release, or one with no
  * agent-director. The README's block heading must equal this constant. The
- * install check's not-found message (`src/install-check.ts`), the startup
- * gate's not-found message (`src/agent-director-startup.ts`) and `/publish`'s
+ * install check's not-found message (`src/install-check.ts`) and `/publish`'s
  * not-found and below-client-minimum diagnostics
- * (`scripts/ad-version-check.ts`) name it.
+ * (`scripts/ad-version-check.ts`) name it, as publishing-host contexts. The
+ * startup gate's not-found message (`src/agent-director-startup.ts`) does
+ * not: the gate runs on a bot host, where the binary may only be missing
+ * from the launcher's HOME or PATH beside a live store and workers, so it
+ * points at the runbook section's step 1 (`RUNBOOK_SECTION_POINTER`) instead.
  */
 export const PUBLISHING_HOST_BLOCK_HEADING = 'The publishing host'
 

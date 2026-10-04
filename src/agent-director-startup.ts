@@ -82,7 +82,6 @@ import {
   AD_SYSTEM_INSTALL_TOO_OLD,
   AD_SYSTEM_INSTALL_UNREACHABLE,
   CLIENT_PACKAGE_REMEDY,
-  PUBLISHING_HOST_BLOCK_POINTER,
   RUNBOOK_SECTION_POINTER,
 } from './install-check.ts'
 import { PHASE1_ONLY_ERR_NAMES } from './agent-director-errors.ts'
@@ -407,7 +406,9 @@ function constructFailure(err: unknown): StartupGateFailure {
       message:
         `agent-director system install not found. The startup gate searched ` +
         `the standard install path and PATH but did not locate the agent-director ` +
-        `binary. See ${PUBLISHING_HOST_BLOCK_POINTER}, which covers a host with no agent-director.` +
+        `binary. See ${RUNBOOK_SECTION_POINTER}: its step 1 checks agent-director's version as the ` +
+        `workers' user in the bot server's launcher environment, which shows whether this launcher's ` +
+        `HOME or PATH differs from the workers'.` +
         renderInstallSkillInstructions(),
     }
   }

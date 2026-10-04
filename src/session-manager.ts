@@ -879,6 +879,7 @@ import {
 } from './persona-connection-errors.ts'
 import { describeDestinationFailureCause } from './persona-destination.ts'
 import { redactSlackLogText } from './slack-log-redaction.ts'
+import { escapeSlackControlCharacters } from './slack-text-escape.ts'
 import {
   RESTART_FAILURE_CAP,
   RESTART_OUTCOME_ALREADY_CONNECTED,
@@ -10240,7 +10241,10 @@ async function diagnoseJsonlMissing(
 
   // INCONCLUSIVE: we could not gather enough evidence to decide loss vs
   // never-created. Determine WHY — the operator needs the actionable cause.
-  //   (b) started_at absent/unparseable → could not bound "since spawn".
+  //   (b) started_at absent/unparseable → could not bound "since spawn". The
+  //       row's started_at is agent-director's text, so it is quoted
+  //       through renderLogMessageText (redacted, on one line, capped); the
+  //       notice escapes the whole reason for Slack (`jsonlInconclusiveNoticeText`).
   //   (c-config) no message_archive_db configured → diagnosis is structurally
   //              impossible; actionable "turn on the archive" hint.
   //   (c-other) archive configured but file-missing / unreadable / query threw.
@@ -10248,7 +10252,7 @@ async function diagnoseJsonlMissing(
   let reason: string
   if (startedAtEpoch === null) {
     reason =
-      `the row's started_at is absent or unparseable (started_at=${row.started_at ?? '(none)'}), ` +
+      `the row's started_at is absent or unparseable (started_at=${renderLogMessageText(row.started_at) || '(none)'}), ` +
       `so "since spawn" could not be bounded and the archive was not consulted`
   } else if (archivedSinceSpawn === 0) {
     reason = UNATTRIBUTABLE_ZERO_REASON
@@ -10300,19 +10304,23 @@ function jsonlCandidatesReasonLead(reason: string, detailProvenance: string): st
 }
 
 /**
- * The INCONCLUSIVE diagnosis notice text: `reasonLead` (CSCB's own words)
- * followed by `quoted` (text taken from agent-director's description or
- * row) through `renderLogMessageText` (redacted, on one line, capped at
- * `MAX_LOGGED_MESSAGE_LENGTH`; b.jg5 SRJ-1001). It says the persona is
- * brought up fresh by a reuse spawn and its row is kept
- * (`JSONL_DIAGNOSIS_REUSE_WORDING`), and is worded as uncertainty, not loss:
- * a false "your history was destroyed" is its own harm.
+ * The INCONCLUSIVE diagnosis notice text: `reasonLead` (CSCB's own words,
+ * which may hold a value from agent-director's row already rendered through
+ * `renderLogMessageText`, or the configured archive path) followed by
+ * `quoted` (text taken from agent-director's description or row) through
+ * `renderLogMessageText` (redacted, on one line, capped at
+ * `MAX_LOGGED_MESSAGE_LENGTH`; b.jg5 SRJ-1001). Each is then escaped once
+ * for Slack (`escapeSlackControlCharacters`); the log line and the
+ * startup-errors entry stay unescaped. It says the persona is brought up
+ * fresh by a reuse spawn and its row is kept (`JSONL_DIAGNOSIS_REUSE_WORDING`),
+ * and is worded as uncertainty, not loss: a false "your history was
+ * destroyed" is its own harm.
  */
 function jsonlInconclusiveNoticeText(reasonLead: string, quoted: string): string {
   return (
     `⚠️ CSCB: on restart I was ${JSONL_DIAGNOSIS_REUSE_WORDING}; I could not determine whether my prior ` +
-    `conversation history was preserved (diagnosis inconclusive: ${reasonLead}${renderLogMessageText(quoted)}). An operator should ` +
-    `investigate.`
+    `conversation history was preserved (diagnosis inconclusive: ${escapeSlackControlCharacters(reasonLead)}` +
+    `${escapeSlackControlCharacters(renderLogMessageText(quoted))}). An operator should investigate.`
   )
 }
 
@@ -10321,7 +10329,8 @@ function jsonlInconclusiveNoticeText(reasonLead: string, quoted: string): string
  * diagnosis that is INCONCLUSIVE because the persona's agent-director row is
  * absent (`ErrSpawnNotFound`): the "AD reported:" shape, quoting
  * `adReported` (the paths agent-director's description enumerates, or its
- * redacted description) through `renderLogMessageText` (b.jg5 SRJ-1001).
+ * redacted description) through `renderLogMessageText` (b.jg5 SRJ-1001),
+ * escaped for Slack.
  * Pure; exported for the notice catalogue.
  */
 export function jsonlRowAbsentInconclusiveNoticeText(adReported: string): string {
@@ -10334,7 +10343,8 @@ export function jsonlRowAbsentInconclusiveNoticeText(adReported: string): string
  * attributable archive count): the "Transcript candidates tried" shape, with
  * CSCB's `reason`, the candidates' `detailProvenance`, and `candidates` (the
  * paths tried, from agent-director's description or row) through
- * `renderLogMessageText` (b.jg5 SRJ-1001). Pure; exported for the notice
+ * `renderLogMessageText` (b.jg5 SRJ-1001), the reason and the quoted text
+ * escaped for Slack. Pure; exported for the notice
  * catalogue.
  */
 export function jsonlCandidatesInconclusiveNoticeText(reason: string, detailProvenance: string, candidates: string): string {
@@ -10346,14 +10356,15 @@ export function jsonlCandidatesInconclusiveNoticeText(reason: string, detailProv
  * diagnosis (the archive holds `archivedSinceSpawn` messages since spawn,
  * yet no transcript survives): the "Paths tried" shape, with `pathsTried`
  * (taken from agent-director's description or row) redacted and capped
- * through `renderLogMessageText` (b.jg5 SRJ-1001). Pure; exported for the
- * notice catalogue.
+ * through `renderLogMessageText` (b.jg5 SRJ-1001), then escaped for Slack
+ * (`escapeSlackControlCharacters`). Pure; exported for the notice catalogue.
  */
 export function jsonlTranscriptLostNoticeText(archivedSinceSpawn: number, pathsTried: string): string {
   return (
     `⚠️ CSCB: on restart my conversation transcript could not be found, but the message archive shows ` +
     `${archivedSinceSpawn} message(s) since I started — my conversation memory has been lost and I ` +
-    `was ${JSONL_DIAGNOSIS_REUSE_WORDING}. An operator should investigate transcript storage. Paths tried: ${renderLogMessageText(pathsTried)}`
+    `was ${JSONL_DIAGNOSIS_REUSE_WORDING}. An operator should investigate transcript storage. Paths tried: ` +
+    escapeSlackControlCharacters(renderLogMessageText(pathsTried))
   )
 }
 

@@ -93,7 +93,9 @@ If `bun run install-check` (or the startup gate) reports one of the
 `ad-system-install-*` failure classes, you can install the `install-cscb`
 Claude skill for an interactive walkthrough. The skill drives the same
 shared check module but walks you through each failure class: the block
-["The publishing host"](#the-publishing-host) for a missing binary, the
+["The publishing host"](#the-publishing-host) for a missing binary (and,
+after the startup gate's refusal on a bot host, the section's
+[step 1](#step-1-check-the-host-and-stage-the-release) version check), the
 README section "Switching over to agent-director Phase 1" for a too-old
 one, and a per-reason diagnosis for each of the eight
 `ErrSystemInstallUnreachable.reason` values.
@@ -127,7 +129,10 @@ The skill calls `bun run install-check` on each iteration and runs no
 agent-director install of its own. Three classes end the skill instead of
 looping, and it runs nothing for them: for `ad-system-install-not-found` it
 names the block "The publishing host" of the README section "Switching
-over to agent-director Phase 1", for `ad-system-install-too-old` it names
+over to agent-director Phase 1" (after the startup gate's refusal on a bot
+host, that section's step 1 instead, whose version check as the workers'
+user in the bot server's launcher environment shows whether the launcher's
+HOME or PATH differs from the workers'), for `ad-system-install-too-old` it names
 that section, and for `ad-version-floor-unreadable` it says to check the
 `agent-director` npm package installed with CSCB (the skill cannot fix that
 package). For `ad-system-install-unreachable` it gives each reason's
@@ -1943,7 +1948,7 @@ What to do: for every case with a pointer, a human follows the "Operator actions
 agent-director list --tmux-session-name '<name>'
 ```
 
-The notice quotes the name for the shell: it is wrapped in single quotes, with each `'` in it written `'\''`, so a plain name reads `agent-director list --tmux-session-name 'slack_bot_dev'`. When the name holds a control character, a line or paragraph separator, or a backtick, the notice leaves this line out and says "The session name could not be shown safely." in its place.
+The notice quotes the name for the shell: it is wrapped in single quotes, with each `'` in it written `'\''`, so a plain name reads `agent-director list --tmux-session-name 'slack_bot_dev'`. When the name holds a control character, a line or paragraph separator, or a backtick, or when rendering it as the notice renders agent-director's text would change it (a token-like part redacted, leading or trailing whitespace trimmed, a name of whitespace alone included, or the name cut at the length cap), the notice leaves this line out and says "The session name could not be shown safely." in its place: a command filtering on a changed name would list nothing.
 
 To follow one persona's hold in `server.log`:
 
@@ -2133,7 +2138,7 @@ The classes in the first list are fatal: the process exits non-zero. Two of them
 
 Fatal classes you may see:
 
-- `ad-system-install-not-found` — `Client.create()` could not locate an `agent-director` binary on PATH or at the standard install path. The log line points to the block ["The publishing host"](#the-publishing-host) in the README section "Switching over to agent-director Phase 1", which covers a host with no agent-director, and appends a manual-skill-install instructions block pointing at `skills/install-cscb/SKILL.md` (URL, target path under `~/.claude/skills/`, and invocation command `/install-cscb`).
+- `ad-system-install-not-found` — `Client.create()` could not locate an `agent-director` binary on PATH or at the standard install path. The startup gate runs on a bot host, where the binary may only be missing from the bot server's launcher HOME or PATH while agent-director's store and workers are live, so the log line does not point to the publishing-host block. It points to the README section "Switching over to agent-director Phase 1": its [step 1](#step-1-check-the-host-and-stage-the-release) checks agent-director's version as the workers' user in the bot server's launcher environment, which shows whether this launcher's HOME or PATH differs from the workers'. The log line appends a manual-skill-install instructions block pointing at `skills/install-cscb/SKILL.md` (URL, target path under `~/.claude/skills/`, and invocation command `/install-cscb`).
 - `ad-system-install-too-old` — the system-installed agent-director binary is below the agent-director client's own minimum (declared in `dist/version-floor.json`). The log line names the version found, the version the client requires, that this CSCB release needs CSCB's Phase 1 floor or later (release candidates included), and the binary path, says this CSCB release and agent-director Phase 1 are installed together, and names the README section "Switching over to agent-director Phase 1" as the way to install agent-director. It appends the manual-skill-install instructions block; for this class the skill names the same section and runs nothing. Follow that section from its block ["Arrived here from a startup refusal?"](#arrived-here-from-a-startup-refusal); the new CSCB is started only as [step 10](#step-10-start-the-new-cscb) starts it.
 - `ad-below-phase1-floor` — the binary passed the client's own minimum but is below CSCB's Phase 1 floor: the Phase 1 agent-director release or later is required, its release candidates included (the development placeholder `0.0.0-dev` is below it). The log line names the version found, the version required, the binary path and that the startup check found it. Nothing is launched and nothing is posted to Slack. Follow the README section "Switching over to agent-director Phase 1" from its block ["Arrived here from a startup refusal?"](#arrived-here-from-a-startup-refusal); the new CSCB is started only as [step 10](#step-10-start-the-new-cscb) starts it. The line appends no skill block.
 - `ad-system-install-unreachable` — agent-director was discovered but the probe could not execute it (e.g. permission bits, broken symlink, runtime crash). The log line surfaces AD's supplied `err.reason` value verbatim (one of `not-executable`, `not-a-regular-file`, `probe-timeout`, `probe-nonzero-exit`, `probe-killed-by-signal`, `unparseable-version`, `spawn-failed`, `other`), says to diagnose with the install-cscb skill, names the README section "Switching over to agent-director Phase 1" and appends the manual-skill-install instructions block.
