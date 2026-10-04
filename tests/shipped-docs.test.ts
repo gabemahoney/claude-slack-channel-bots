@@ -114,6 +114,29 @@
  *     agent-director (`UPGRADE_FORMS`' re-install row, whose self-checks sit
  *     with the other rows' under SRJ-208). Each self-checked against the
  *     wording the Task replaced.
+ * - E36 T3's checks over docs/architecture.md and docs/engineering-guide.md,
+ *   read through `OPERATOR_TEXTS` (b.jg5 SRJ-1105, SRJ-1106, SRJ-612; AC 78;
+ *   the passage and presence checks SRJ-1101's term checks cannot express):
+ *   - both docs: no tmux call made by the server (a raw session, pane or
+ *     server sub-command, `tmux send-keys`, an affirmed raw or direct tmux
+ *     call; `SERVER_TMUX_CALLS`, `AFFIRMED_TMUX_CALLS`), none of E8's
+ *     `RAW_COMMAND_FORMS`, no row delete described as live
+ *     (`ROW_DELETE_CLAIMS`, negated clauses passing), no dead-state streak, no
+ *     incident write-up, and no word of the source audit's
+ *     `delete-helper`, `finished-row-option` or `removed-identifier` rules
+ *     (`SOURCE_WORD_RULES`, tests/test-helpers/source-audit.ts), the two
+ *     delete-helper lists (`DELETE_HELPER_LISTS`, SRJ-716) excepted; none of
+ *     the old raw-tmux guidance (its heading, a link to it, the known gap);
+ *     every link resolves;
+ *   - the engineering guide: SRJ-1106's section states the rule, links
+ *     Source Invariants and names the source audit; agent-director's labels
+ *     (`AD_VOCABULARY`) only inside it; the Layering section's two rules and
+ *     its link to it; the Start Sweep's pre-persona-row rule says the kill is
+ *     checked and the row kept;
+ *   - the architecture doc: one passage per SRJ-1105 topic
+ *     (`SRJ_1105_TOPICS`), each found by the `src/` exports it names
+ *     (imported, `exportName`). Each self-checked against the old wording or
+ *     a synthetic text.
  * CHANGELOG.md and docs/ are not shipped descriptions: the forbidden-term
  * audit still reads only `SHIPPED_TEXTS`, which holds neither. Besides the
  * two docs read through `OPERATOR_TEXTS`, the one docs/ file read is
@@ -128,11 +151,12 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
-import { join, resolve } from 'path'
+import { dirname, join, resolve } from 'path'
 
 import {
   CHANNEL_ENTRY_KEYS,
   CONFIG_FILE_NAME,
+  agentDirectorCallTimeoutMsOf,
   DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   DELIVERY_MODES,
   DM_DESTINATION,
@@ -163,10 +187,11 @@ import {
 import { RELOAD_TERMS } from './test-helpers/reload-terms.ts'
 import { CLEAR_LATCH_TERMS, clearLatchTermsIn } from './test-helpers/clear-latch-terms.ts'
 import { UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
+import { DELETE_HELPERS, REMOVED_IDENTIFIERS, SOURCE_WORD_RULES, type SourceWordRule } from './test-helpers/source-audit.ts'
 import { CRONTABLE_TEMPLATE_HEADER } from '../src/cron-bootstrap.ts'
 import type { Via } from '../src/delivery-decision.ts'
 import { MCP_INSTRUCTIONS } from '../src/registry.ts'
-import { PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_SECTION_TITLE } from '../src/ad-version-gate.ts'
+import { installAdVersionRecheck, meetsPhase1Floor, PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_SECTION_TITLE } from '../src/ad-version-gate.ts'
 import {
   AD_BELOW_PHASE1_FLOOR,
   AD_SHIM_CATALOG_INCOMPLETE,
@@ -188,11 +213,13 @@ import {
   AD_SETTINGS_RELATIVE_PATH,
   AD_TMUX_KEYS,
   AD_TMUX_TABLE,
+  checkAdCallTimeoutAtStartup,
   DEFAULT_AD_SETTINGS,
+  installAdSettings,
   type AdTmuxKey,
 } from '../src/ad-settings.ts'
 import { DEFAULT_STORE_PATH } from '../src/agent-director-client.ts'
-import { AD_ERROR_CLASS_CONFLICT, AD_ERROR_CLASS_UNAVAILABLE } from '../src/ad-error-class.ts'
+import { AD_ERROR_CLASS_CONFLICT, AD_ERROR_CLASS_UNAVAILABLE, AD_ERROR_CLASSES, classifyAdError } from '../src/ad-error-class.ts'
 import {
   PERSONA_INSTANCE_ID_PREFIX,
   PERSONA_TMUX_SESSION_PREFIX,
@@ -201,9 +228,9 @@ import {
   SERVICE_LABEL,
 } from '../src/persona-identity.ts'
 import { LAST_APPLIED_FILE_SUFFIX } from '../src/reload.ts'
-import { RETIRED_KEYS_FILE_NAME } from '../src/retired-keys.ts'
-import { CLEAR_LATCH_COMMAND, SERVER_PORT_FILE_NAME } from '../src/clear-latch.ts'
-import { CLEAN_RESTART_NOT_RESTARTED_LABEL, CLI_TEARDOWN_FAILED_LABEL } from '../src/cli-teardown.ts'
+import { createOldLifeHoldSet, oldLifeKeyOf, RETIRED_KEYS_FILE_NAME, RETIRED_KEYS_FORMAT_VERSION, serializeRetiredKeys } from '../src/retired-keys.ts'
+import { CLEAR_LATCH_COMMAND, CLEAR_LATCH_ROUTE, dialClearLatch, handleClearLatch, SERVER_PORT_FILE_NAME, writeServerPortRecord } from '../src/clear-latch.ts'
+import { CLEAN_RESTART_NOT_RESTARTED_LABEL, CLI_TEARDOWN_FAILED_LABEL, PRECHECK_TRIES, precheckVerdictOf } from '../src/cli-teardown.ts'
 import {
   KILL_FAILURE_CLOSING_CLI_TEARDOWN,
   KILL_FAILURE_CLOSING_DESTINATION,
@@ -222,7 +249,25 @@ import {
 } from '../src/kill-failure-alert.ts'
 import { STATE_WORDING } from '../src/lost-message.ts'
 import { renderLogMessageText } from '../src/persona-connection-errors.ts'
-import { startupSummaryEnding } from '../src/session-manager.ts'
+import {
+  abortKillOwnStuckLaunch,
+  buildPendingRowRuleDeps,
+  clearByHandOf,
+  DIALOG_POLL_INTERVAL_MS,
+  LAUNCH_CALL_END_LAUNCH_TIMEOUT,
+  LAUNCH_VERB_REUSE_SPAWN,
+  PENDING_ROW_RULE_GET_SITE,
+  runLatchClearSequence,
+  startDialogApprover,
+  startupSummaryEnding,
+  STUCK_LAUNCH_ABORT_SITE,
+} from '../src/session-manager.ts'
+import { createUnavailableRetryController, UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE } from '../src/unavailable-retry.ts'
+import { armPendingOnlyAfterLaunchFailure } from '../src/outage-state.ts'
+import { createTmuxUnresponsiveCondition, PERSONA_EPISODE_KIND_AD_CONFIG_MALFORMED, TMUX_UNRESPONSIVE_ONSET_FLOOR_MS } from '../src/persona-episodes.ts'
+import { createConflictLatch, createLatchRecheckController, decideLatchRecheck, LATCH_RECHECK_INTERVAL_MS, recogniseConflictCase } from '../src/conflict-latch.ts'
+import { createLiveRowSequenceRegistry, LIVE_ROW_SEQUENCE_MAX_KILLS } from '../src/live-row-sequence.ts'
+import { createStuckLaunchAbort, PENDING_ROW_NO_LAUNCH_START } from '../src/pending-row.ts'
 import { errTmuxKillFailed, KILL_FAILED_DESCRIPTIONS, STUB_SURVIVOR_PIDS } from './test-helpers/agent-director-stub.ts'
 import { CLIENT_MIN_VERSION, MIN_CLAUDE_CODE_VERSION, OLD_AD_VERSION } from './test-helpers/agent-director-versions.ts'
 import {
@@ -1823,6 +1868,8 @@ const AD_VOCABULARY: Record<string, { text: string; source: string }> = {
   migrationColumns: { text: 'thirteen', source: "HO rev 15: the columns Phase 1's schema migration adds (and the downgrade recipe drops, SRJ-1109 step 6)" },
   storeMeta: { text: code('store_meta'), source: "HO rev 15, rev 19: the one-row table holding the store's id" },
   configMalformed: { text: code('ErrConfigMalformed'), source: "HO §1; ADSRD SR-4.1: agent-director's answer to a malformed settings file" },
+  ownerLabel: { text: code('@ad_owner'), source: "HO rev 15; b.jg5 SRJ-612: the session label by which agent-director proves a session is a row's" },
+  paneLabel: { text: code('@ad_pane'), source: 'HO rev 17; b.jg5 SRJ-612, SRJ-613: the per-pane label' },
   unknownErrorName: { text: code('ErrUnknownErrorName'), source: "agent-director's client: the error a name outside its catalog arrives as; the E4 hatch note (`ad-shim-catalog-incomplete`)" },
   expireAll: { text: code('--older-than 0d'), source: 'HO C6; SRJ-1108 step 11: never used' },
   'ceiling kill': { text: 'the larger of 2Q + 2A + E + 4W and 3Q + 2A + 5W', source: 'ADSRD SR-13.2; SRJ-213' },
@@ -3398,13 +3445,13 @@ function startSummaryCountLabels(): string[] {
   })
 }
 
-/** Every link from `text` (the repository-root `file`) that resolves nowhere: a same-file anchor `text` lacks, or a repository file or its heading that does not exist. */
+/** Every link from `text` (the repository file `file`) that resolves nowhere: a same-file anchor `text` lacks, or a file (relative to `file`'s directory) or its heading that does not exist. */
 function brokenRepoLinks(file: string, text: string): { checked: number; broken: string[] } {
   const own = headingAnchors(text)
   const links = markdownLinks(text).filter((link) => !/^[a-z][a-z0-9+.-]*:/i.test(link.path))
   const broken = links.flatMap((link) => {
     if (link.path === '') return own.includes(link.anchor) ? [] : [`${file} -> ${link.target} (no such heading in ${file})`]
-    const target = resolve(REPO_ROOT, link.path)
+    const target = resolve(REPO_ROOT, dirname(file), link.path)
     if (!existsSync(target)) return [`${file} -> ${link.target} (no such file)`]
     if (link.anchor === '') return []
     return headingAnchors(readFileSync(target, 'utf-8')).includes(link.anchor) ? [] : [`${file} -> ${link.target} (no such heading in ${link.path})`]
@@ -4269,5 +4316,504 @@ describe("E8: the README's and debugging skill's `auto-restart disabled` text ke
     expect(termsIn('`session_restart_delay` is `0`, so the instance will not restart on its own.', STALE_AUTO_RESTART_CLAIM)).not.toEqual([])
     expect(termsIn("the persona won't come back on its own", STALE_AUTO_RESTART_CLAIM)).not.toEqual([])
     expect(termsIn(STATE_WORDING['auto-restart-disabled'], STALE_AUTO_RESTART_CLAIM)).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// E36 T3: the architecture doc and the engineering guide match the build
+// (b.jg5 SRJ-1105, SRJ-1106, SRJ-612; AC 78), read through OPERATOR_TEXTS.
+// SRJ-1101's term checks over every operator text are not here; these are the
+// passage and presence checks the terms cannot express.
+// ---------------------------------------------------------------------------
+
+const ARCHITECTURE_FILE = 'docs/architecture.md'
+const ENGINEERING_GUIDE_FILE = 'docs/engineering-guide.md'
+
+/** The two texts SRJ-1105 and SRJ-1106 describe. */
+const DESIGN_DOCS: readonly string[] = [ARCHITECTURE_FILE, ENGINEERING_GUIDE_FILE]
+
+/** The one source audit both docs point to for the rules they state (b.jg5 SRJ-716, SRJ-612, SRJ-601). */
+const SOURCE_AUDIT_FILE = 'tests/fmk-source-audit.test.ts'
+
+/**
+ * An imported binding's name as a code span, bare or called (`` `name` ``,
+ * `` `name()` ``, `` `name(key, …)` ``), read from the binding (`{ name }`),
+ * so a rename in `src/` fails the typecheck and no name is typed.
+ */
+function exportName(binding: Record<string, unknown>): RegExp {
+  const names = Object.keys(binding)
+  if (names.length !== 1) throw new Error(`exportName takes one binding, got ${names.length}`)
+  return new RegExp(`\`${escapeRegExp(names[0])}(?:\\([^\`]*\\))?\``)
+}
+
+/** `text` without the section under `heading` (heading line included); throws naming `file` when there is no such heading. */
+function outsideSection(text: string, heading: HeadingMatch, file: string): string {
+  const range = sectionRange(text, heading)
+  if (range === undefined) throw new Error(`${file} has no heading ${typeof heading === 'string' ? `"${heading}"` : `matching ${String(heading)}`}`)
+  return text
+    .split('\n')
+    .filter((_, i) => i < range.start || i >= range.end)
+    .join('\n')
+}
+
+/** A word that turns a clause negative ("no path calls tmux", "never deletes a row"). */
+const NEGATION = /\b(?:no|not|never|nothing|none|nor|neither|without)\b|n't\b/i
+
+/** The clause of `unit` before offset `at`: from the last `. `, `; ` or `: ` before it. */
+function clauseBefore(unit: string, at: number): string {
+  const before = unit.slice(0, at)
+  return before.slice(Math.max(...['. ', '; ', ': '].map((stop) => before.lastIndexOf(stop))) + 1)
+}
+
+/**
+ * Each match of `claims` in `text`'s units (`textUnits`) whose clause before
+ * the match holds no negation, as `<label>: <matched text>`: "No path in
+ * `src/` calls tmux directly" and "No persona teardown deletes a row" pass,
+ * "Four paths still call tmux directly" does not.
+ */
+function affirmedClaims(text: string, claims: readonly [label: string, pattern: RegExp][]): string[] {
+  return textUnits(text).flatMap((unit) =>
+    claims.flatMap(([label, pattern]) =>
+      [...unit.matchAll(pattern)].filter((m) => !NEGATION.test(clauseBefore(unit, m.index ?? 0))).map((m) => `${label}: ${m[0]}`),
+    ),
+  )
+}
+
+/**
+ * A tmux call made by the server (SRJ-1105, SRJ-1106: neither doc describes
+ * one), file-local: a raw tmux sub-command that ends, probes, starts, reads
+ * or types into a session, pane or server, named with or without `tmux`
+ * (agent-director's own verb `send-keys` counts only after `tmux`), and an
+ * affirmed raw or direct tmux call. A human's `tmux attach -t =…` and a
+ * read-only `tmux ls` are no such call.
+ */
+const SERVER_TMUX_CALLS: readonly [label: string, pattern: RegExp][] = [
+  [
+    'a tmux sub-command that ends, probes, starts, reads or types into a session',
+    /\b(?:capture-pane|kill-session|kill-server|kill-pane|kill-window|has-session|new-session|start-server|respawn-pane|respawn-window|rename-session|set-option|show-options|set-environment|show-environment)\b/gi,
+  ],
+  ['tmux send-keys', /\btmux\s+send-keys\b/gi],
+]
+
+/** The affirmed forms of a server tmux call (`affirmedClaims`): "raw tmux calls", "calls tmux directly". */
+const AFFIRMED_TMUX_CALLS: readonly [label: string, pattern: RegExp][] = [
+  ['a raw tmux call', /\braw\s+`?tmux\b/gi],
+  ['a direct tmux call', /\bcalls?\s+`?tmux`?\s+directly\b/gi],
+]
+
+/**
+ * A row delete described as live (SRJ-1105: the delete-then-spawn, start
+ * sweep and persona teardown deletes are gone; b.jg5 SRJ-716), file-local,
+ * read through `affirmedClaims`.
+ */
+const ROW_DELETE_CLAIMS: readonly [label: string, pattern: RegExp][] = [
+  ['a delete-then-spawn', /\bdelete-then-spawn\b/gi],
+  ['a kill or pause, then a delete', /\b(?:kill|kills|killed|killing|pause|pauses|paused)\b[^.;]{0,80}?\band\s+(?:then\s+)?delet\w*/gi],
+  ['a row deleted', /\bdelet(?:e|es|ed|ing)\s+(?:the|its|a|each|every|that|this|one)\s+(?:[\w`<>-]+\s+){0,3}?rows?\b/gi],
+  ['a delete attempted', /\b(?:attempts?|tries|makes?|calls?|runs?|issues?)\s+(?:the\s+|a\s+|its\s+|one\s+)?`?delete\b/gi],
+]
+
+/** The approver's dead-state streak (SRJ-1105, SRJ-402), file-local, named at all; its constant is a `REMOVED_IDENTIFIERS` entry. */
+const DEAD_STATE_STREAK_CLAIMS: readonly [label: string, pattern: RegExp][] = [
+  ["the approver's dead-state streak", /\bdead-state streak\b|\b(?:polls|laps|reads) in a row\b[^.]{0,60}?\bdead\b/gi],
+]
+
+/** A pointer to an incident write-up: history, not the current rule (the docs describe only the current design). */
+const HISTORY_POINTERS: readonly [label: string, pattern: RegExp][] = [['an incident write-up', /\bincident-[\w.-]+/gi]]
+
+/** The source audit's word rules both docs keep too (SRJ-1105, SRJ-1106): the row-delete helpers, the finished-row option and the removed identifiers. */
+const DOC_WORD_RULES: readonly SourceWordRule[] = ['delete-helper', 'finished-row-option', 'removed-identifier']
+
+/** One source audit word rule's pattern; throws naming a rule `SOURCE_WORD_RULES` lacks. */
+function sourceWordRule(rule: SourceWordRule): RegExp {
+  const row = SOURCE_WORD_RULES.find(([name]) => name === rule)
+  if (row === undefined) throw new Error(`SOURCE_WORD_RULES has no rule "${rule}"`)
+  return row[1]
+}
+
+const SECURITY_MODEL_HEADING = '## Security Model'
+const SOURCE_INVARIANTS_HEADING = '## Source Invariants'
+
+/**
+ * The two passages that list the row-delete helpers on purpose, so a reader
+ * knows which names must never come back (b.jg5 SRJ-716; the engineering
+ * guide's Source Invariants): each [file, section heading, the list item's
+ * lead]. Each item, and only it, is left out before `DOC_WORD_RULES`' row
+ * `delete-helper` reads its doc.
+ */
+const DELETE_HELPER_LISTS: readonly [file: string, heading: string, lead: string][] = [
+  [ARCHITECTURE_FILE, SECURITY_MODEL_HEADING, '- no agent-director row is ever deleted:'],
+  [ENGINEERING_GUIDE_FILE, SOURCE_INVARIANTS_HEADING, '- **Write no row-delete helper**'],
+]
+
+/** `text` (the doc `file`) without the one item of each `DELETE_HELPER_LISTS` entry for it; throws unless each entry finds exactly one item. */
+function withoutDeleteHelperLists(file: string, text: string): string {
+  return DELETE_HELPER_LISTS.filter(([listFile]) => listFile === file).reduce((rest, [, heading, lead]) => {
+    const items = textUnits(requiredSection(rest, heading, file)).filter((unit) => unit.startsWith(lead))
+    if (items.length !== 1) throw new Error(`${file} "${heading}": ${items.length} items open with "${lead}", expected 1`)
+    const lines = rest.split('\n')
+    const at = lines.findIndex((line) => line.trimStart().startsWith(lead))
+    return [...lines.slice(0, at), ...lines.slice(at + 1)].join('\n')
+  }, text)
+}
+
+/** Each source-audit word in `text` (the doc `file`), the `DELETE_HELPER_LISTS` items left out, as `<rule>: <word>`. */
+function sourceWordsIn(file: string, text: string): string[] {
+  const rest = withoutDeleteHelperLists(file, text)
+  return DOC_WORD_RULES.flatMap((rule) => [...rest.matchAll(sourceWordRule(rule))].map((m) => `${rule}: ${m[0]}`))
+}
+
+/** Everything both docs must not describe as live or name: each problem as `<label>: <matched text>`. */
+function staleDesignProblems(file: string, text: string): string[] {
+  const flatText = withoutPrefixKeyReason(text)
+  return [
+    ...termsIn(flatText, SERVER_TMUX_CALLS),
+    ...termsIn(flatText, RAW_COMMAND_FORMS),
+    ...affirmedClaims(text, AFFIRMED_TMUX_CALLS),
+    ...affirmedClaims(text, ROW_DELETE_CLAIMS),
+    ...termsIn(flatText, DEAD_STATE_STREAK_CLAIMS),
+    ...termsIn(flatText, HISTORY_POINTERS),
+    ...sourceWordsIn(file, text),
+  ]
+}
+
+// SRJ-1106: the engineering guide's rule
+
+/** SRJ-1106's section of the engineering guide (file-local, citing SRJ-1106): its heading and its rule sentence. */
+const SRJ_1106_HEADING = '## The Server Reaches a Session Only Through agent-director'
+const SRJ_1106_RULE = `The server starts no tmux process and reaches a session only through agent-director, and never touches agent-director's ${vocab('ownerLabel')} label or its per-pane ${vocab('paneLabel')} label`
+
+/** The section the old raw-tmux guidance stood under, replaced by SRJ-1106's rule. */
+const OLD_RAW_TMUX_TITLE = 'Raw tmux Calls'
+
+/** The old raw-tmux guidance's passages, file-local: its known-gap bullet and its bullet's reason that persona keys can prefix one another. */
+const OLD_RAW_TMUX_GUIDANCE: readonly [label: string, pattern: RegExp][] = [
+  ['the known-gap passage', /\bknown gap\b/gi],
+  ['the old raw-tmux reason', /\bcan prefix one another\b/gi],
+]
+
+/** The old raw-tmux guidance in `text`: a heading titled `OLD_RAW_TMUX_TITLE`, a link to its anchor, or one of its passages. */
+function oldRawTmuxGuidance(text: string): string[] {
+  return [
+    ...headings(text).filter((h) => h.title.toLowerCase() === OLD_RAW_TMUX_TITLE.toLowerCase()).map((h) => `heading "${h.text}"`),
+    ...markdownLinks(text).filter((link) => link.anchor === headingSlug(OLD_RAW_TMUX_TITLE)).map((link) => `link (${link.target})`),
+    ...termsIn(flat(text), OLD_RAW_TMUX_GUIDANCE),
+  ]
+}
+
+/** What SRJ-1106's section lacks: the rule sentence, a link to Source Invariants that resolves, and the source audit by its path. */
+function srj1106SectionProblems(guide: string): string[] {
+  const section = flat(requiredSection(guide, SRJ_1106_HEADING, ENGINEERING_GUIDE_FILE))
+  const invariants = headingSlug(SOURCE_INVARIANTS_HEADING.slice('## '.length))
+  return [
+    ...lacking(section, [SRJ_1106_RULE, code(SOURCE_AUDIT_FILE), `](#${invariants})`]),
+    ...(headingAnchors(guide).includes(invariants) ? [] : [`no heading "${SOURCE_INVARIANTS_HEADING}" for the link`]),
+  ]
+}
+
+/** Each mention of agent-director's labels (the source audit's `ad-label` rule) in the engineering guide outside SRJ-1106's section. */
+function labelsOutsideRule(guide: string): string[] {
+  return [...outsideSection(guide, SRJ_1106_HEADING, ENGINEERING_GUIDE_FILE).matchAll(sourceWordRule('ad-label'))].map((m) => m[0])
+}
+
+/** The engineering guide's Layering section and its two rules (the Task's hatch note: CSCB never touches tmux and never replicates agent-director). */
+const LAYERING_HEADING = '## Layering: agent-director Owns tmux'
+const LAYERING_RULES: readonly string[] = ['- **CSCB never touches tmux.**', '- **CSCB never replicates agent-director functionality.**']
+
+/** What the Layering section lacks: each rule as a list item, and a link to SRJ-1106's section. */
+function layeringProblems(guide: string): string[] {
+  const units = textUnits(requiredSection(guide, LAYERING_HEADING, ENGINEERING_GUIDE_FILE))
+  return [
+    ...LAYERING_RULES.filter((rule) => !units.some((unit) => unit.startsWith(rule))).map((rule) => `no item "${rule}"`),
+    ...(units.some((unit) => unit.includes(`](#${headingSlug(SRJ_1106_HEADING.slice('## '.length))})`)) ? [] : [`no link to "${SRJ_1106_HEADING}"`]),
+  ]
+}
+
+const START_SWEEP_HEADING = '## The Start Sweep'
+
+/** The Start Sweep's pre-persona-row rule (SRJ-1106, SRJ-714): the one sentence that says what a pre-persona row's kill is; it says the kill is checked and the row kept, and names no delete. */
+function prePersonaRuleProblems(guide: string): string[] {
+  const sentences = flat(requiredSection(guide, START_SWEEP_HEADING, ENGINEERING_GUIDE_FILE))
+    .split(/(?<=\.)\s+/)
+    .filter((sentence) => /\bA pre-persona row\b.*?\bkilled\b/.test(sentence))
+  if (sentences.length !== 1) return [`${sentences.length} Start Sweep sentences say what a pre-persona row's kill is, expected 1`]
+  return [...lacking(sentences[0], [/\bchecked\b/, /\bkept\b/]), ...(/\bdelet\w*/i.test(sentences[0]) ? [`a delete: ${sentences[0]}`] : [])]
+}
+
+// SRJ-1105: one passage per topic of the architecture doc
+
+/** Where a topic's passage stands in the architecture doc, and how it is read (flattened). */
+interface Passage {
+  where: string
+  read: (doc: string) => string
+}
+
+/** The section under `heading`. */
+function sectionPassage(heading: HeadingMatch): Passage {
+  return { where: `under ${typeof heading === 'string' ? `"${heading}"` : String(heading)}`, read: (doc) => flat(requiredSection(doc, heading, ARCHITECTURE_FILE)) }
+}
+
+/** The one unit (`textUnits`) under `heading` that opens with `lead`. */
+function itemPassage(heading: HeadingMatch, lead: string): Passage {
+  return {
+    where: `the unit "${lead}" under ${typeof heading === 'string' ? `"${heading}"` : String(heading)}`,
+    read: (doc) => {
+      const units = textUnits(requiredSection(doc, heading, ARCHITECTURE_FILE)).filter((unit) => unit.startsWith(lead))
+      if (units.length !== 1) throw new Error(`${ARCHITECTURE_FILE} ${String(heading)}: ${units.length} units open with "${lead}", expected 1`)
+      return units[0]
+    },
+  }
+}
+
+const SERVER_MANAGED_STARTUP = sectionPassage(/^### Server-Managed Startup\b/)
+const UNAVAILABLE_RETRY_HEADING = /^#### UNAVAILABLE retry\b/
+const UNAVAILABLE_RETRY = sectionPassage(UNAVAILABLE_RETRY_HEADING)
+
+/**
+ * SRJ-1105's topics (file-local, citing SRJ-1105; the titles are the
+ * architecture doc's, built from a `src/` constant where one names them):
+ * each topic's passage and what it must name, every name an imported `src/`
+ * export or value (`exportName`), or agent-director's vocabulary
+ * (`AD_VOCABULARY`).
+ */
+const SRJ_1105_TOPICS: readonly [topic: string, passage: Passage, names: readonly (string | RegExp)[]][] = [
+  ['the classifier', sectionPassage(/^### Agent-director error classes\b/), [exportName({ classifyAdError }), exportName({ AD_ERROR_CLASSES })]],
+  ['the retry timer', UNAVAILABLE_RETRY, [exportName({ createUnavailableRetryController })]],
+  ["the retry timer's pending-only mode", sectionPassage(/^#### Pending-only mode\b/), [exportName({ armPendingOnlyAfterLaunchFailure }), exportName({ UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE })]],
+  ['the tmux-unresponsive condition', sectionPassage(/^#### The tmux-unresponsive condition\b/), [exportName({ createTmuxUnresponsiveCondition }), exportName({ TMUX_UNRESPONSIVE_ONSET_FLOOR_MS })]],
+  [`the ${PERSONA_EPISODE_KIND_AD_CONFIG_MALFORMED} outage`, itemPassage(UNAVAILABLE_RETRY_HEADING, '**CONFIG (b.jg5 SRJ-316).**'), [code(PERSONA_EPISODE_KIND_AD_CONFIG_MALFORMED), vocab('configMalformed')]],
+  ['the latch and its cases', sectionPassage(/^#### Session conflict latch\b/), [exportName({ createConflictLatch }), exportName({ recogniseConflictCase })]],
+  ["the latch's re-check", sectionPassage(/^##### The re-check\b/), [exportName({ createLatchRecheckController }), exportName({ decideLatchRecheck }), exportName({ LATCH_RECHECK_INTERVAL_MS })]],
+  ['how a latch clears, by hand included', sectionPassage(/^##### How a latch clears\b/), [exportName({ clearByHandOf })]],
+  [`the ${CLEAR_LATCH_COMMAND} command`, sectionPassage(new RegExp(`^### ${escapeRegExp(CLEAR_LATCH_COMMAND)} command\\b`)), [code(CLEAR_LATCH_COMMAND), exportName({ dialClearLatch })]],
+  [`the ${CLEAR_LATCH_ROUTE} route`, sectionPassage(new RegExp(`^### POST ${escapeRegExp(CLEAR_LATCH_ROUTE)}$`)), [exportName({ handleClearLatch }), exportName({ runLatchClearSequence })]],
+  [`the ${SERVER_PORT_FILE_NAME} record`, sectionPassage(new RegExp(`^### ${escapeRegExp(SERVER_PORT_FILE_NAME)} \\(`)), [exportName({ writeServerPortRecord })]],
+  [`${CLEAR_LATCH_COMMAND} is not offered to the bots`, itemPassage(SECURITY_MODEL_HEADING, `- **${code(CLEAR_LATCH_COMMAND)} is not offered to the bots**`), [/\bSRJ-511\b/]],
+  ['the live-row sequence', sectionPassage(/^#### The live-row sequence\b/), [exportName({ createLiveRowSequenceRegistry }), exportName({ LIVE_ROW_SEQUENCE_MAX_KILLS })]],
+  ['reuse', sectionPassage(/^#### Reuse spawn\b/), [exportName({ LAUNCH_VERB_REUSE_SPAWN })]],
+  ['the retired-key record', sectionPassage(new RegExp(`^### ${escapeRegExp(RETIRED_KEYS_FILE_NAME)} \\(`)), [exportName({ RETIRED_KEYS_FORMAT_VERSION }), exportName({ serializeRetiredKeys })]],
+  ['the old-life hold', sectionPassage(/^#### The old-life hold\b/), [exportName({ createOldLifeHoldSet }), exportName({ oldLifeKeyOf })]],
+  ['launch pending', sectionPassage(/^### Launch pending\b/), [exportName({ PENDING_ROW_NO_LAUNCH_START }), exportName({ LAUNCH_CALL_END_LAUNCH_TIMEOUT })]],
+  ['the approver through agent-director', SERVER_MANAGED_STARTUP, [exportName({ startDialogApprover }), exportName({ DIALOG_POLL_INTERVAL_MS }), /\bThe dialog approver calls no tmux: it reads and types only through agent-director\b/]],
+  ['the pending-row rule', sectionPassage(/^#### The pending-row rule\b/), [exportName({ buildPendingRowRuleDeps }), exportName({ PENDING_ROW_RULE_GET_SITE })]],
+  ['the stuck-launch abort', sectionPassage(/^#### CSCB's own stuck launch and its one abort\b/), [exportName({ createStuckLaunchAbort }), exportName({ abortKillOwnStuckLaunch }), exportName({ STUCK_LAUNCH_ABORT_SITE })]],
+  ['the timing settings CSCB reads', SERVER_MANAGED_STARTUP, [exportName({ installAdSettings })]],
+  ['the call timeout', SERVER_MANAGED_STARTUP, [exportName({ agentDirectorCallTimeoutMsOf }), exportName({ checkAdCallTimeoutAtStartup })]],
+  ["the server never touches agent-director's session label or a persona's session", itemPassage(SECURITY_MODEL_HEADING, "- **agent-director's rows, labels, socket and sessions are its own**"), [vocab('ownerLabel'), /\bSRJ-612\b/]],
+  ['the source audit that pins it', sectionPassage(SECURITY_MODEL_HEADING), [code(SOURCE_AUDIT_FILE), vocab('paneLabel')]],
+  ['the version gate', SERVER_MANAGED_STARTUP, [exportName({ meetsPhase1Floor }), exportName({ installAdVersionRecheck })]],
+  ['the CLI precheck', sectionPassage(/^### The CLI precheck\b/), [exportName({ precheckVerdictOf }), exportName({ PRECHECK_TRIES })]],
+]
+
+/** One topic's problems on `doc`: its passage missing, or each name it lacks. */
+function topicProblems(passage: Passage, names: readonly (string | RegExp)[], doc: string): string[] {
+  let text: string
+  try {
+    text = passage.read(doc)
+  } catch (err) {
+    return [err instanceof Error ? err.message : String(err)]
+  }
+  return lacking(text, names)
+}
+
+/** Each problem's label: the text before its first `: `. */
+function problemLabels(problems: readonly string[]): string[] {
+  return problems.map((problem) => problem.split(': ')[0])
+}
+
+/** `text` with `paragraph` appended as a paragraph of its own. */
+function withParagraph(text: string, paragraph: string): string {
+  return `${text}\n\n${paragraph}\n`
+}
+
+describe('E36 T3: the architecture doc and the engineering guide match the build (b.jg5 SRJ-1105, SRJ-1106, SRJ-612; AC 78)', () => {
+  describe('both docs, read through OPERATOR_TEXTS', () => {
+    test.each(DESIGN_DOCS.map((file) => [file] as const))(
+      '%s describes no tmux call made by the server, no live row delete, no dead-state streak and no incident write-up, and names no row-delete helper, finished-row option or removed identifier',
+      (file) => {
+        expect(staleDesignProblems(file, operatorText(file))).toEqual([])
+      },
+    )
+
+    test.each(DESIGN_DOCS.map((file) => [file] as const))(`%s carries none of the old raw-tmux guidance (a "${OLD_RAW_TMUX_TITLE}" heading or link, the known gap)`, (file) => {
+      expect(oldRawTmuxGuidance(operatorText(file))).toEqual([])
+    })
+
+    test.each(DESIGN_DOCS.map((file) => [file] as const))('%s: every link resolves (a same-file anchor to a heading in it, a relative link to a file and its heading)', (file) => {
+      const { checked, broken } = brokenRepoLinks(file, operatorText(file))
+      expect(broken).toEqual([])
+      expect(checked).toBeGreaterThan(0)
+    })
+  })
+
+  describe(`${ENGINEERING_GUIDE_FILE} (SRJ-1106)`, () => {
+    const guide = () => operatorText(ENGINEERING_GUIDE_FILE)
+
+    test(`"${SRJ_1106_HEADING}" states SRJ-1106's rule, links Source Invariants and names ${SOURCE_AUDIT_FILE}`, () => {
+      expect(srj1106SectionProblems(guide())).toEqual([])
+      expect(existsSync(resolve(REPO_ROOT, SOURCE_AUDIT_FILE))).toBe(true)
+    })
+
+    test(`agent-director's labels (${vocab('ownerLabel')}, ${vocab('paneLabel')}) are named only inside "${SRJ_1106_HEADING}"`, () => {
+      expect(labelsOutsideRule(guide())).toEqual([])
+      expect(lacking(flat(requiredSection(guide(), SRJ_1106_HEADING, ENGINEERING_GUIDE_FILE)), [vocab('ownerLabel'), vocab('paneLabel')])).toEqual([])
+    })
+
+    test(`"${LAYERING_HEADING}" keeps both rules (CSCB never touches tmux; CSCB never replicates agent-director) and links "${SRJ_1106_HEADING}"`, () => {
+      expect(layeringProblems(guide())).toEqual([])
+    })
+
+    test(`"${START_SWEEP_HEADING}": the pre-persona-row rule says the kill is checked and the row kept (SRJ-714)`, () => {
+      expect(prePersonaRuleProblems(guide())).toEqual([])
+    })
+  })
+
+  describe(`${ARCHITECTURE_FILE} (SRJ-1105): a passage per topic, found by the src/ export it describes`, () => {
+    test.each(SRJ_1105_TOPICS)('%s', (topic, passage, names) => {
+      expect({ topic, where: passage.where, problems: topicProblems(passage, names, operatorText(ARCHITECTURE_FILE)) }).toEqual({ topic, where: passage.where, problems: [] })
+    })
+  })
+
+  describe('self-checks (each puts old wording back into an in-memory doc, or uses a synthetic text)', () => {
+    const arch = () => operatorText(ARCHITECTURE_FILE)
+    const guide = () => operatorText(ENGINEERING_GUIDE_FILE)
+
+    test.each([
+      [
+        'the raw-tmux passage (b.1ix)',
+        "- **Raw tmux calls address one session exactly (b.1ix).** Four paths still call tmux directly: the self-heal kill (`kill-session`), the approver's pane read and Enter for an `ended`/`missing` row (`capture-pane`, `send-keys`), the liveness probe (`has-session`) and the reconnect's `start-server`.",
+        ['a tmux sub-command that ends, probes, starts, reads or types into a session', 'a raw tmux call', 'a direct tmux call', 'a has-session probe'],
+      ],
+      ['the b.m4r raw kill example', 'A bot killed mid-turn (e.g. `tmux kill-session` on its session) leaves its AD row at `working`.', ['a tmux sub-command that ends, probes, starts, reads or types into a session', 'a raw tmux session or server kill']],
+      [
+        "the approver's raw pane read and Enter",
+        'For those states the loop reads the pane with raw `tmux capture-pane -p -t =slack_bot_<key>:` and sends Enter with raw `tmux send-keys -t =slack_bot_<key>: Enter`.',
+        ['a tmux sub-command that ends, probes, starts, reads or types into a session', 'tmux send-keys', 'a raw tmux call'],
+      ],
+      ["the approver's dead-state streak", 'An `ended`/`missing` row with no needle for 20 polls in a row counts as a dead spawn.', ["the approver's dead-state streak"]],
+      ['the delete-then-spawn chain', "- the kill and delete of the collision ladder's delete-then-spawn chains, all through `unusableNameAt`.", ['a delete-then-spawn']],
+      ["the persona teardown's delete", 'Persona teardown acts on one removed or destructively modified persona while the server keeps running, kills its bot without waiting and deletes its row.', ['a kill or pause, then a delete']],
+      ["the destructive modify's delete", '**Fresh.** The teardown kills `cscb_<key>` and deletes its agent-director row, so the launch in step 6 finds no row and spawns a new instance.', ['a kill or pause, then a delete', 'a row deleted']],
+      ["the start sweep's delete", 'A failed kill of a swept row still attempts the delete.', ['a delete attempted']],
+      ["the ladder's config_dir delete", "A changed directory has a different `config_dir` label, so the ladder's `config_dir` guard deletes the row and spawns fresh.", ['a row deleted']],
+      ['an incident write-up', 'The rule follows the b.qps outage (see `incident-2026-09-18-clean_restart.md`).', ['an incident write-up']],
+      ['the finished-row request field', 'Every kill passes `include_finished: true`.', ['finished-row-option']],
+      ['the finished-row CLI flag', 'Run `agent-director kill --include-finished`.', ['finished-row-option']],
+    ] as const)('%s, put back into each doc, is reported', (_label, paragraph, expected) => {
+      for (const file of DESIGN_DOCS) {
+        expect({ file, labels: problemLabels(staleDesignProblems(file, withParagraph(operatorText(file), paragraph))) }).toEqual({ file, labels: expect.arrayContaining([...expected]) })
+      }
+    })
+
+    test('the current wording is not reported: a negated tmux call or delete, a deleted row as the reason, the exact attach, a read-only listing', () => {
+      const fine = [
+        'No path in `src/` calls tmux directly and no `src/` file starts a process whose command is `tmux`.',
+        'The server makes no raw tmux call: no raw tmux path is left in `src/`.',
+        'No persona teardown deletes a row, and no delete-then-spawn site is left.',
+        'Why: a deleted row whose kill may have failed leaves a live session with nothing to find it by.',
+        'The sweep kills only rows listed live, keeps every row it lists and makes no `delete` call on any path.',
+        `Attach with \`tmux attach -t =${personaTmuxSessionName(ALERT_KEY)}\`; list sessions with \`tmux ls\`.`,
+      ].join('\n\n')
+      expect(staleDesignProblems('(synthetic)', fine)).toEqual([])
+    })
+
+    test.each([
+      ...DELETE_HELPERS.map((name) => ['delete-helper', name] as const),
+      ...REMOVED_IDENTIFIERS.map((name) => ['removed-identifier', name] as const),
+    ])('the source audit word %s %s, named outside the two delete-helper lists, is reported in each doc', (rule, name) => {
+      for (const file of DESIGN_DOCS) {
+        expect({ file, problems: sourceWordsIn(file, withParagraph(operatorText(file), `It calls \`${name}\`.`)) }).toEqual({ file, problems: [`${rule}: ${name}`] })
+      }
+    })
+
+    test.each(DELETE_HELPER_LISTS)('%s: the delete-helper list under "%s" (%s) is one item that names a helper, and is the part left out', (file, heading, lead) => {
+      const text = operatorText(file)
+      const item = textUnits(requiredSection(text, heading, file)).find((unit) => unit.startsWith(lead))
+      expect(item === undefined ? [] : DELETE_HELPERS.filter((name) => new RegExp(`\\b${name}\\b`).test(item)).length).toBeGreaterThan(0)
+      expect([...text.matchAll(sourceWordRule('delete-helper'))].length).toBeGreaterThan(0)
+      expect(sourceWordsIn(file, text)).toEqual([])
+    })
+
+    test(`the old "${OLD_RAW_TMUX_TITLE}" section put back in place of SRJ-1106's fails each engineering-guide case`, () => {
+      const text = guide()
+      const range = sectionRange(text, SRJ_1106_HEADING)!
+      const lines = text.split('\n')
+      const old = [
+        `## ${OLD_RAW_TMUX_TITLE}`,
+        '',
+        'The server makes no raw tmux call: no raw tmux path is left in `src/`.',
+        '',
+        '- **Address a session exactly in an operator command.** Build the target with `tmuxExactSessionTarget`; never pass a bare name. Why: tmux resolves a bare name by prefix, and persona keys can prefix one another.',
+        "- **Known gap: agent-director's own tmux calls still prefix-match.** Until the b.fmk version, claim exactness only for the operator's `attach` target.",
+        '',
+      ]
+      const edited = [...lines.slice(0, range.start), ...old, ...lines.slice(range.end)]
+        .join('\n')
+        .replace(`](#${headingSlug(SRJ_1106_HEADING.slice('## '.length))})`, `](#${headingSlug(OLD_RAW_TMUX_TITLE)})`)
+      expect(edited).not.toBe(text)
+      expect(oldRawTmuxGuidance(edited)).toEqual([
+        `heading "## ${OLD_RAW_TMUX_TITLE}"`,
+        `link (#${headingSlug(OLD_RAW_TMUX_TITLE)})`,
+        'the known-gap passage: Known gap',
+        'the old raw-tmux reason: can prefix one another',
+      ])
+      expect(() => srj1106SectionProblems(edited)).toThrow(SRJ_1106_HEADING)
+      expect(layeringProblems(edited)).toEqual([`no link to "${SRJ_1106_HEADING}"`])
+    })
+
+    test("SRJ-1106's rule sentence reverted to the old raw-tmux intro is reported", () => {
+      const text = guide()
+      const edited = text.replace(SRJ_1106_RULE, 'The server makes no raw tmux call')
+      expect(edited).not.toBe(text)
+      expect(srj1106SectionProblems(edited)).toEqual([`lacks ${SRJ_1106_RULE}`])
+    })
+
+    test(`a label named in "${SOURCE_INVARIANTS_HEADING}", as the ad-label bullet once did, is reported`, () => {
+      const text = guide()
+      const edited = text.replace(/^(- \*\*Never name agent-director's labels\*\*[^\n]*)/m, `$1 Never write ${vocab('ownerLabel')} or ${vocab('paneLabel')}.`)
+      expect(edited).not.toBe(text)
+      expect(labelsOutsideRule(edited)).toHaveLength(2)
+    })
+
+    test.each(LAYERING_RULES.map((rule) => [rule] as const))(`"${LAYERING_HEADING}" without the rule %s is reported`, (rule) => {
+      const text = guide()
+      const edited = text.replace(new RegExp(`^${escapeRegExp(rule)}[^\\n]*\\n`, 'm'), '')
+      expect(edited).not.toBe(text)
+      expect(layeringProblems(edited)).toEqual([`no item "${rule}"`])
+    })
+
+    test.each([
+      ['the kill unchecked and the row deleted', 'A pre-persona row (b.1ix) is killed when live, then deleted.', ['lacks /\\bchecked\\b/', 'lacks /\\bkept\\b/', 'a delete']],
+      ['the kill unchecked', 'A pre-persona row (b.1ix) is killed when live, and kept.', ['lacks /\\bchecked\\b/']],
+    ] as const)("the Start Sweep's pre-persona-row rule with %s is reported", (_label, sentence, expected) => {
+      const text = guide()
+      const edited = text.replace(/A pre-persona row \(b\.1ix\) is killed when live[^.]*\./, sentence)
+      expect(edited).not.toBe(text)
+      expect(prePersonaRuleProblems(edited).map((problem) => problem.split(': ')[0])).toEqual([...expected])
+    })
+
+    test.each(SRJ_1105_TOPICS)('SRJ-1105 topic "%s" fails once each name it pins is gone from the doc', (_topic, passage, names) => {
+      const edited = names.reduce<string>(
+        (text, name) => (typeof name === 'string' ? text.split(name).join(name.replace(/`$/, '_GONE`')) : text.replace(new RegExp(name.source, 'g'), '')),
+        arch(),
+      )
+      expect(topicProblems(passage, names, edited)).toHaveLength(names.length)
+    })
+
+    test('a topic whose heading or item is gone is one problem, not a throw', () => {
+      expect(topicProblems(sectionPassage('### No such section'), [], arch())).toEqual([`${ARCHITECTURE_FILE} has no heading "### No such section"`])
+      expect(topicProblems(itemPassage(SECURITY_MODEL_HEADING, '- **No such item**'), [], arch())).toHaveLength(1)
+    })
+
+    test("AD_VOCABULARY's label rows are what the source audit's ad-label rule finds", () => {
+      expect([...`${vocab('ownerLabel')} ${vocab('paneLabel')}`.matchAll(sourceWordRule('ad-label'))]).toHaveLength(2)
+    })
+
+    test('a broken relative link from docs/ is reported, a resolving one is not', () => {
+      const readmeAnchor = headingSlug(PERSONAS_HEADING.slice('### '.length))
+      expect(brokenRepoLinks(ARCHITECTURE_FILE, `See [the README](../README.md#${readmeAnchor}) and [gone](../README.md#no-such-heading).`).broken).toEqual([
+        `${ARCHITECTURE_FILE} -> ../README.md#no-such-heading (no such heading in ../README.md)`,
+      ])
+    })
   })
 })

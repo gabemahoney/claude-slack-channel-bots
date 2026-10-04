@@ -560,3 +560,53 @@ export function forbiddenServerLoads(entry: string): { loads: RuntimeLoads; forb
   ]
   return { loads, forbidden }
 }
+
+// ---------------------------------------------------------------------------
+// The word rules of the one source audit (tests/fmk-source-audit.test.ts)
+// ---------------------------------------------------------------------------
+
+/** The row-delete helpers (b.jg5 SRJ-716) and the `src/cli.ts` audit's delete verbs (`directorDelete`, `deleteSpawn`). */
+export const DELETE_HELPERS: readonly string[] = ['deleteInstance', 'deleteInstanceRow', 'deletePersonaInstance', 'tryDelete', 'killAndDeleteSweptRow', 'directorDelete', 'deleteSpawn']
+
+/** b.jg5 SRJ-601's removed identifiers, E17 T1's focused approver-seam names and E22 T4's ladder kill clock seam. */
+export const REMOVED_IDENTIFIERS: readonly string[] = [
+  // The raw runner.
+  'defaultRunTmux', '_runTmux', '_setTmuxCommandRunner', '_resetTmuxCommandRunner', 'TmuxCommandRunner', 'TmuxRunResult',
+  // The tmux server start.
+  'defaultEnsureTmuxServer', '_ensureTmuxServer', '_setTmuxServerEnsurer', '_resetTmuxServerEnsurer',
+  // The liveness probe.
+  'defaultHasTmuxSession', '_hasTmuxSession', '_setTmuxSessionProber', '_resetTmuxSessionProber', 'hasPersonaTmuxSession', 'tmuxFallbackVerdict',
+  // The approver's raw path.
+  'defaultTmuxCapturePane', 'defaultTmuxSendEnter', '_setTmuxCapturePane', '_setTmuxSendEnter', '_resetTmuxDialogHelpers', 'tmuxExactPaneTarget',
+  // E17 T1: the pane reader and Enter sender types, the dead-state streak and its seams, the poll-interval seams and the state sets.
+  'TmuxPaneReader', 'TmuxEnterSender', 'DIALOG_DEAD_GRACE_POLLS', '_setDialogDeadGracePolls', '_resetDialogDeadGracePolls',
+  '_setDialogPollIntervalMs', '_resetDialogPollIntervalMs', 'DIALOG_READY_STATES', 'DIALOG_DEAD_STATES',
+  // The b.vub self-heal.
+  'defaultKillTmuxSession', '_setTmuxSessionKiller', '_resetTmuxSessionKiller', 'selfHealTmuxCollisionAndRespawn',
+  // E22 T4: the ladder's kill clock seam.
+  '_ladderKillClock', '_setLadderKillClock', '_resetLadderKillClock',
+]
+
+/** A whole identifier from `names`, as a global RegExp. */
+export function wholeWord(names: readonly string[]): RegExp {
+  return new RegExp(`(?<![\\w$])(?:${names.join('|')})(?![\\w$])`, 'g')
+}
+
+/** The source audit's rules that match a word in code or in a string. */
+export type SourceWordRule = 'delete-helper' | 'finished-row-option' | 'ad-label' | 'raw-tmux-subcommand' | 'removed-identifier'
+
+/**
+ * The source audit's word rules, each a global RegExp: the row-delete helpers,
+ * agent-director's finished-row option in both spellings (b.jg5 SRJ-106), its
+ * labels (SRJ-612), the raw tmux kill, probe and server start (SRJ-1101) and
+ * the removed identifiers (SRJ-601). tests/fmk-source-audit.test.ts runs them
+ * over every `src/` file; tests/shipped-docs.test.ts reads some of them over
+ * the architecture doc and the engineering guide (SRJ-1105, SRJ-1106).
+ */
+export const SOURCE_WORD_RULES: ReadonlyArray<readonly [SourceWordRule, RegExp]> = [
+  ['delete-helper', wholeWord(DELETE_HELPERS)],
+  ['finished-row-option', /include_finished|include-finished/g],
+  ['ad-label', /ad_owner|ad_pane/g],
+  ['raw-tmux-subcommand', /kill-session|has-session|start-server/g],
+  ['removed-identifier', wholeWord(REMOVED_IDENTIFIERS)],
+]
