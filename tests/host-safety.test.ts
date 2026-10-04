@@ -40,6 +40,20 @@
  *   server, the install check and `/publish`'s check. Each pinned file must
  *   still hold its site. (That `src/ad-version-gate.ts` never imports
  *   `./install-check.ts` is pinned in tests/ad-version-gate.test.ts.)
+ * - The `/ci` image refusals (b.jg5 SRJ-1306), read and never run:
+ *   `tests/runner.sh`, `tests/integration/lib/scenario.sh` and each
+ *   `tests/integration/test-*.sh` that does not source it (found from the
+ *   directory) check `/etc/cscb-ci-image` before their first other step; each
+ *   script that sources scenario.sh runs nothing before its source line;
+ *   `fmk-driver.ts` checks the marker first and statically imports only
+ *   `node:` built-ins; and scenario.sh's `install_ad_shim`, `ad_store_edit`
+ *   and `ad_store_id` call `require_scenario_home` before their first
+ *   sqlite3, copy, move or install step, a call of a scenario.sh function
+ *   that makes one (such as `_scenario_place`) counting as one. Shell is read
+ *   with comments, heredoc bodies and quoted text blanked; the shebang,
+ *   comments, blank lines, `set` options and literal assignments are not
+ *   steps. Each rule is pinned with synthetic violations (each finding names
+ *   its file and rule) and allowed sources, then run over the tree.
  * - Preload check: the shared `preloadCheckFailures` (the one the preload
  *   guard runs), each failure label (`PRELOAD_CHECK`) pinned with a row.
  * - Preload redirect: the shared, side-effect-free `preloadRedirectedEnv`
@@ -2042,6 +2056,724 @@ describe('static audit: where Client.create, the startup gate and resolveSystemB
     const findings = clientCreateFindings(parseFile(join(SRC_DIR, 'agent-director-startup.ts')))
 
     expect(findings).toEqual([expect.stringMatching(/: read of Client\.create$/)])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: the /ci image marker and SCENARIO_ROOT checks come first (b.jg5 SRJ-1306)
+// ---------------------------------------------------------------------------
+
+const INTEGRATION_DIR = join(TESTS_DIR, 'integration')
+const RUNNER_PATH = join(TESTS_DIR, 'runner.sh')
+const SCENARIO_PATH = join(INTEGRATION_DIR, 'lib', 'scenario.sh')
+const FMK_DRIVER_PATH = join(INTEGRATION_DIR, 'fixtures', 'fmk-driver.ts')
+
+/** The file only the cscb-ci images carry (docker/Dockerfile.test.base). */
+const CI_IMAGE_MARKER = '/etc/cscb-ci-image'
+
+/** The rule each finding names. */
+const IMAGE_GUARD_RULE = {
+  /** The marker check is the file's first step. */
+  markerFirst: 'marker-check-first',
+  /** A script that sources scenario.sh runs nothing before its source line. */
+  sourceFirst: 'source-line-first',
+  /** The HOME-under-SCENARIO_ROOT check comes before the helper's first sqlite3, copy, move or install step. */
+  homeCheckFirst: 'home-check-before-step',
+  /** fmk-driver.ts statically imports only `node:` built-ins. */
+  driverStaticImport: 'driver-static-import',
+} as const
+
+/** The scenario.sh helpers whose HOME check must come before their first sqlite3, copy, move or install step. */
+const HOME_GUARDED_HELPERS: readonly string[] = ['install_ad_shim', 'ad_store_edit', 'ad_store_id']
+
+/** scenario.sh's guard that refuses unless HOME is under SCENARIO_ROOT. */
+const HOME_GUARD = 'require_scenario_home'
+
+/** Commands that are a sqlite3, copy, move or install step. */
+const STORE_OR_FILE_STEPS: readonly string[] = ['sqlite3', 'cp', 'mv', 'install', 'rsync']
+
+/** A command word that runs an install script (by its path or the variable holding it). */
+const INSTALL_SCRIPT_WORD = /install\.sh$|_INSTALL_SH\}?$/
+
+/** Reserved words that may stand before a command name; they open or close no step themselves. */
+const SHELL_RESERVED: ReadonlySet<string> = new Set(['if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'while', 'until', 'esac', '!', '{', '}', 'time'])
+
+/** Words that run the command after them (`command cp …`). */
+const SHELL_PREFIXES: ReadonlySet<string> = new Set(['command', 'exec', 'nohup', 'builtin'])
+
+/** `NAME=…` (or `NAME[i]=…`, `NAME+=…`) at the start of a word. */
+const SHELL_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=/
+
+/**
+ * What is not a step in a shell file, besides the shebang, comments and blank
+ * lines (which the mask blanks): a line of `set` options, and an assignment of
+ * a literal (no expansion, command substitution or second command).
+ */
+const SHELL_SET_OPTIONS = /^set(?:\s+[-+][A-Za-z]*o\s+[a-z]+|\s+[-+][A-Za-z]+)+$/
+const SHELL_LITERAL_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=(?:"[^"$`\\]*"|'[^']*'|[A-Za-z0-9_./:@%+,=-]*)$/
+
+/** One simple command of a shell file, as the audit reads it. */
+interface ShellCommand {
+  /** The command word with its quotes removed (`cp`, `require_scenario_home`, `${SCENARIO_RC_INSTALL_SH}`); empty for a line of reserved words only (`fi`). */
+  name: string
+  /** The words after it, quotes removed. */
+  args: string[]
+  /** The reserved words before it (`if`, `then`, `{` …). */
+  keywords: string[]
+  /** What comes before it: '' (start of a logical line), `;`, `&&`, `||`, `|`, `&`, `(`, `)` or `$(` (inside a substitution). */
+  after: string
+  /** Its 1-based line. */
+  line: number
+}
+
+/** One logical line: up to a newline outside quotes, substitutions and line continuations. */
+interface ShellLogicalLine {
+  line: number
+  /** The text with comments and heredoc bodies blanked. */
+  text: string
+  /** The text with quoted characters also blanked (to `_`, so a quoted word stays one word). */
+  code: string
+  /** Its commands, a substitution's before the command it is in (the order bash runs them). */
+  commands: ShellCommand[]
+}
+
+/**
+ * `source` with what is not code blanked, both outputs as long as `source`:
+ * `text` blanks comments and heredoc bodies; `code` also blanks the
+ * characters inside quotes to `_`, apart from a `$( … )` inside double quotes,
+ * which is code. `breaks` are the offsets of the newlines that end a logical
+ * line.
+ */
+function shellMask(source: string): { text: string; code: string; breaks: number[] } {
+  const text: string[] = []
+  const code: string[] = []
+  const breaks: number[] = []
+  const heredocs: { tag: string; strip: boolean }[] = []
+  /** The open quotes and substitutions; a code frame counts its open parentheses. */
+  const stack: ({ kind: 'code'; depth: number } | { kind: 'dquote' | 'squote' | 'ansi' })[] = [{ kind: 'code', depth: 0 }]
+  const push = (raw: string, masked: string = raw): void => {
+    text.push(raw)
+    code.push(masked)
+  }
+  const blankUntilLineEnd = (from: number): number => {
+    const end = source.indexOf('\n', from)
+    const stop = end === -1 ? source.length : end
+    for (let k = from; k < stop; k++) {
+      text.push(' ')
+      code.push(' ')
+    }
+    return stop
+  }
+  let i = 0
+  while (i < source.length) {
+    const c = source[i]
+    const frame = stack[stack.length - 1]
+    if (frame.kind === 'code') {
+      if (c === '\n') {
+        push(c)
+        if (stack.length === 1) breaks.push(i)
+        i++
+        while (stack.length === 1 && heredocs.length > 0) {
+          const { tag, strip } = heredocs.shift()!
+          while (i < source.length) {
+            const lineStart = i
+            i = blankUntilLineEnd(i)
+            const bodyLine = source.slice(lineStart, i)
+            if (i < source.length) {
+              push('\n')
+              breaks.push(i)
+              i++
+            }
+            if ((strip ? bodyLine.replace(/^\t+/, '') : bodyLine) === tag) break
+          }
+        }
+        continue
+      }
+      if (c === '\\' && i + 1 < source.length) {
+        push(c + source[i + 1])
+        i += 2
+        continue
+      }
+      if (c === '#' && (i === 0 || /[\s;&|(]/.test(source[i - 1]))) {
+        i = blankUntilLineEnd(i)
+        continue
+      }
+      if (c === "'") stack.push({ kind: 'squote' })
+      else if (c === '$' && source[i + 1] === "'") {
+        stack.push({ kind: 'ansi' })
+        push("$'")
+        i += 2
+        continue
+      } else if (c === '"') stack.push({ kind: 'dquote' })
+      else if (c === '<' && source[i + 1] === '<' && source[i + 2] !== '<') {
+        const m = /^<<(-?)[ \t]*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/.exec(source.slice(i))
+        if (m !== null) {
+          heredocs.push({ tag: m[3], strip: m[1] === '-' })
+          push(m[0])
+          i += m[0].length
+          continue
+        }
+      } else if (c === '(') frame.depth++
+      else if (c === ')' && stack.length > 1) {
+        if (frame.depth === 0) stack.pop()
+        else frame.depth--
+      }
+      push(c)
+      i++
+      continue
+    }
+    if (frame.kind === 'squote') {
+      if (c === "'") {
+        stack.pop()
+        push(c)
+      } else push(c, '_')
+      i++
+    } else if (frame.kind === 'ansi') {
+      if (c === '\\' && i + 1 < source.length) {
+        push(c + source[i + 1], '__')
+        i += 2
+        continue
+      }
+      if (c === "'") {
+        stack.pop()
+        push(c)
+      } else push(c, '_')
+      i++
+    } else {
+      if (c === '\\' && i + 1 < source.length) {
+        push(c + source[i + 1], '__')
+        i += 2
+      } else if (c === '"') {
+        stack.pop()
+        push(c)
+        i++
+      } else if (c === '$' && source[i + 1] === '(') {
+        stack.push({ kind: 'code', depth: 0 })
+        push('$(')
+        i += 2
+      } else {
+        push(c, '_')
+        i++
+      }
+    }
+  }
+  return { text: text.join(''), code: code.join(''), breaks }
+}
+
+/** The index of the `)` that closes the `(` at `open` in `code`, or `end` when none does. */
+function closingParen(code: string, open: number, end: number): number {
+  let depth = 0
+  for (let k = open; k < end; k++) {
+    if (code[k] === '(') depth++
+    else if (code[k] === ')' && --depth === 0) return k
+  }
+  return end
+}
+
+/**
+ * The simple commands in `code[start, end)` (`raw` is the file, `code` its
+ * mask), appended to `out`. A `$( … )`, `<( … )` or `>( … )` stays part of
+ * its word and its own commands are read first; a `(` that starts a word
+ * opens a subshell.
+ */
+function shellCommandsIn(code: string, raw: string, start: number, end: number, lineAt: (offset: number) => number, out: ShellCommand[], firstAfter: string): void {
+  let words: { raw: string; start: number }[] = []
+  let after = firstAfter
+  const flush = (separator: string): void => {
+    if (words.length > 0) out.push(shellCommand(words, after, lineAt))
+    words = []
+    after = separator
+  }
+  let i = start
+  while (i < end) {
+    const c = code[i]
+    if (c === '\\' && code[i + 1] === '\n') i += 2
+    else if (/\s/.test(c)) i++
+    else if (c === ';') {
+      flush(';')
+      i += code[i + 1] === ';' ? 2 : 1
+    } else if (c === '&' || c === '|') {
+      const double = code[i + 1] === c
+      flush(double ? c + c : c)
+      i += double ? 2 : 1
+    } else if (c === ')') {
+      flush(')')
+      i++
+    } else if (c === '(' && code[i + 1] !== '(') {
+      flush('(')
+      i++
+    } else {
+      const wordStart = i
+      while (i < end) {
+        const d = code[i]
+        if (d === '\\') {
+          i += 2
+          continue
+        }
+        if (/\s/.test(d) || d === ';' || d === '|' || d === ')') break
+        if (d === '&' && code[i - 1] !== '>' && code[i + 1] !== '>') break
+        if (d === '(') {
+          const close = closingParen(code, i, end)
+          if (i > wordStart && '$<>'.includes(code[i - 1])) shellCommandsIn(code, raw, i + 1, close, lineAt, out, '$(')
+          i = close + 1
+          continue
+        }
+        i++
+      }
+      words.push({ raw: raw.slice(wordStart, i), start: wordStart })
+    }
+  }
+  flush('')
+}
+
+/** A simple command from its words: reserved words, assignments and `command` / `env` / `timeout` prefixes set aside. */
+function shellCommand(words: readonly { raw: string; start: number }[], after: string, lineAt: (offset: number) => number): ShellCommand {
+  const unquoted = words.map((w) => w.raw.replace(/["']/g, ''))
+  const keywords: string[] = []
+  let k = 0
+  while (k < unquoted.length) {
+    const w = unquoted[k]
+    if (SHELL_RESERVED.has(w)) keywords.push(w)
+    else if (!SHELL_ASSIGNMENT.test(words[k].raw) && !SHELL_PREFIXES.has(w)) {
+      if (w === 'env') {
+        k++
+        while (k < unquoted.length && (unquoted[k].startsWith('-') || SHELL_ASSIGNMENT.test(unquoted[k]))) k += unquoted[k] === '-u' ? 2 : 1
+        continue
+      }
+      if (w === 'timeout') {
+        k++
+        while (k < unquoted.length && unquoted[k].startsWith('-')) k++
+        k++
+        continue
+      }
+      break
+    }
+    k++
+  }
+  return { name: unquoted[k] ?? '', args: unquoted.slice(k + 1), keywords, after, line: lineAt(words[0].start) }
+}
+
+/** `source` read as logical lines, each with its commands. */
+function shellLogicalLines(source: string): ShellLogicalLine[] {
+  const { text, code, breaks } = shellMask(source)
+  const lineStarts = [0]
+  for (let k = 0; k < source.length; k++) if (source[k] === '\n') lineStarts.push(k + 1)
+  const lineAt = (offset: number): number => {
+    let lo = 0
+    let hi = lineStarts.length - 1
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1
+      if (lineStarts[mid] <= offset) lo = mid
+      else hi = mid - 1
+    }
+    return lo + 1
+  }
+  const out: ShellLogicalLine[] = []
+  let start = 0
+  for (const end of [...breaks, source.length]) {
+    const commands: ShellCommand[] = []
+    shellCommandsIn(code, source, start, end, lineAt, commands, '')
+    out.push({ line: lineAt(start), text: text.slice(start, end), code: code.slice(start, end), commands })
+    start = end + 1
+  }
+  return out
+}
+
+/** Whether `line` is not a step: blank or comment only, `set` options, or a literal assignment. */
+function isShellNonStep(line: ShellLogicalLine): boolean {
+  const text = line.text.trim()
+  return line.code.trim() === '' || SHELL_SET_OPTIONS.test(text) || SHELL_LITERAL_ASSIGNMENT.test(text)
+}
+
+/** How much `command` opens (+) or closes (−) a compound command. */
+function shellDepthChange(command: ShellCommand): number {
+  let change = ['case', 'for', 'select'].includes(command.name) ? 1 : 0
+  for (const word of command.keywords) {
+    if (['if', 'while', 'until', '{'].includes(word)) change++
+    else if (['fi', 'done', 'esac', '}'].includes(word)) change--
+  }
+  return change
+}
+
+/** The first command of `line` that is not inside a substitution: the one the line starts with. */
+function lineCommand(line: ShellLogicalLine): ShellCommand | undefined {
+  return line.commands.find((command) => command.after === '')
+}
+
+/** Whether `line` starts by sourcing scenario.sh (`source` or `.`, naming `lib/scenario.sh`). */
+function sourcesScenario(line: ShellLogicalLine): boolean {
+  const command = lineCommand(line)
+  return command !== undefined && (command.name === 'source' || command.name === '.') && /\/lib\/scenario\.sh\b/.test(line.text)
+}
+
+/**
+ * Whether the commands from `at` on open with the marker check: `if` with
+ * `[[ ! -e /etc/cscb-ci-image ]]` (or `[ … ]`, `test`, `-f`), whose `then`
+ * branch exits with a non-zero status.
+ */
+function isShellMarkerCheck(commands: readonly ShellCommand[], at: number): boolean {
+  const check = commands[at]
+  if (check === undefined || check.after !== '' || check.keywords.join(' ') !== 'if') return false
+  const test = [check.name, ...check.args]
+  const shapes = [['[[', '!', '-e', CI_IMAGE_MARKER, ']]'], ['[', '!', '-e', CI_IMAGE_MARKER, ']'], ['test', '!', '-e', CI_IMAGE_MARKER]]
+  if (!shapes.some((shape) => shape.length === test.length && shape.every((w, k) => w === test[k] || (w === '-e' && test[k] === '-f')))) return false
+  let depth = 1
+  for (const command of commands.slice(at + 1)) {
+    if (depth === 1 && command.keywords.some((w) => w === 'else' || w === 'elif')) return false
+    depth += shellDepthChange(command)
+    if (depth <= 0) return false
+    if (depth === 1 && command.name === 'exit' && /^[1-9][0-9]*$/.test(command.args[0] ?? '')) return true
+  }
+  return false
+}
+
+/**
+ * The image-marker findings for the shell file `file`: when it sources
+ * scenario.sh, its first step must be the source line (so the refusal is
+ * scenario.sh's); otherwise its first step must be its own marker check.
+ */
+function shellEntryFindings(file: string, source: string): string[] {
+  const lines = shellLogicalLines(source)
+  const sourcing = lines.some(sourcesScenario)
+  const first = lines.find((line) => !isShellNonStep(line))
+  const shown = (line: ShellLogicalLine): string => line.text.trim().split('\n')[0]
+  if (sourcing) {
+    if (first !== undefined && sourcesScenario(first)) return []
+    return [`${file}:${first?.line ?? 1}: ${IMAGE_GUARD_RULE.sourceFirst}: a step runs before the scenario.sh source line: ${first === undefined ? '' : shown(first)}`]
+  }
+  if (first === undefined) return [`${file}:1: ${IMAGE_GUARD_RULE.markerFirst}: no ${CI_IMAGE_MARKER} check`]
+  const all = lines.flatMap((line) => line.commands)
+  const opening = lineCommand(first)
+  if (opening !== undefined && isShellMarkerCheck(all, all.indexOf(opening))) return []
+  return [`${file}:${first.line}: ${IMAGE_GUARD_RULE.markerFirst}: the first step is not the ${CI_IMAGE_MARKER} check that exits non-zero: ${shown(first)}`]
+}
+
+/** The commands of each `name() {` … `}` function of `source` (braces in column 0), by name. */
+function shellFunctions(source: string): Map<string, ShellCommand[]> {
+  const functions = new Map<string, ShellCommand[]>()
+  let current: ShellCommand[] | undefined
+  for (const line of shellLogicalLines(source)) {
+    const opening = /^([A-Za-z_][A-Za-z0-9_]*)\s*\(\)\s*\{$/.exec(line.text.trim())
+    if (current === undefined && opening !== null && line.text.startsWith(opening[1])) {
+      current = []
+      functions.set(opening[1], current)
+    } else if (current !== undefined && /^\}\s*$/.test(line.text)) current = undefined
+    else if (current !== undefined) current.push(...line.commands)
+  }
+  return functions
+}
+
+/** Whether `name` is itself a sqlite3, copy, move or install step. */
+function isStoreOrFileStep(name: string): boolean {
+  return STORE_OR_FILE_STEPS.includes(basename(name)) || INSTALL_SCRIPT_WORD.test(name)
+}
+
+/**
+ * The HOME-check findings for `helpers` in the shell file `file`: each must
+ * call `require_scenario_home` unconditionally (at the top of its body, not
+ * after `&&`, `||` or `|`, nor in a subshell or substitution) before its first
+ * sqlite3, copy, move or install step. A call of a function of the same file
+ * that makes such a step, directly or through another, counts as one (so a
+ * copy delegated to `_scenario_place` is still a step). A helper with no step
+ * the audit can see is a finding too.
+ */
+function helperHomeCheckFindings(file: string, source: string, helpers: readonly string[] = HOME_GUARDED_HELPERS): string[] {
+  const functions = shellFunctions(source)
+  const stepFunctions = new Set<string>()
+  for (let grew = true; grew;) {
+    grew = false
+    for (const [name, body] of functions) {
+      if (!stepFunctions.has(name) && body.some((c) => isStoreOrFileStep(c.name) || stepFunctions.has(c.name))) {
+        stepFunctions.add(name)
+        grew = true
+      }
+    }
+  }
+  const findings: string[] = []
+  const rule = IMAGE_GUARD_RULE.homeCheckFirst
+  for (const helper of helpers) {
+    const body = functions.get(helper)
+    if (body === undefined) {
+      findings.push(`${file}:1: ${rule}: ${helper} is not defined`)
+      continue
+    }
+    const firstStep = body.findIndex((c) => isStoreOrFileStep(c.name) || stepFunctions.has(c.name))
+    if (firstStep < 0) {
+      findings.push(`${file}:1: ${rule}: ${helper} has no sqlite3, copy, move or install step the audit can see`)
+      continue
+    }
+    let depth = 0
+    let guard = -1
+    body.forEach((c, k) => {
+      if (guard < 0 && depth === 0 && c.name === HOME_GUARD && c.keywords.length === 0 && (c.after === '' || c.after === ';')) guard = k
+      depth += shellDepthChange(c)
+    })
+    if (guard < 0 || guard > firstStep) {
+      const step = body[firstStep]
+      findings.push(`${file}:${step.line}: ${rule}: ${helper}: \`${step.name}\` runs before ${guard < 0 ? `any unconditional ${HOME_GUARD}` : HOME_GUARD}`)
+    }
+  }
+  return findings
+}
+
+/** Whether `statement` is the driver's marker check: `if (!existsSync('/etc/cscb-ci-image'))` (existsSync from `node:fs`) whose branch calls `process.exit` with a non-zero literal. */
+function isDriverMarkerCheck(statement: ts.Statement, sf: ts.SourceFile): boolean {
+  if (!ts.isIfStatement(statement)) return false
+  const condition = unwrap(statement.expression)
+  if (!ts.isPrefixUnaryExpression(condition) || condition.operator !== ts.SyntaxKind.ExclamationToken) return false
+  const call = unwrap(condition.operand)
+  if (!ts.isCallExpression(call) || !ts.isIdentifier(call.expression) || call.arguments.length !== 1 || stringText(call.arguments[0]) !== CI_IMAGE_MARKER) return false
+  const local = call.expression.text
+  const fromNodeFs = sf.statements.some((s) => {
+    if (!ts.isImportDeclaration(s) || stringText(s.moduleSpecifier) !== 'node:fs' || s.importClause === undefined || s.importClause.isTypeOnly) return false
+    const bindings = s.importClause.namedBindings
+    return bindings !== undefined && ts.isNamedImports(bindings) && bindings.elements.some((e) => !e.isTypeOnly && e.name.text === local && (e.propertyName ?? e.name).text === 'existsSync')
+  })
+  if (!fromNodeFs) return false
+  let exits = false
+  forEachNode(statement.thenStatement, (node) => {
+    if (!ts.isCallExpression(node) || !ts.isPropertyAccessExpression(node.expression) || node.arguments.length !== 1) return
+    const target = node.expression
+    const code = node.arguments[0]
+    if (ts.isIdentifier(target.expression) && target.expression.text === 'process' && target.name.text === 'exit' && ts.isNumericLiteral(code) && Number(code.text) !== 0) exits = true
+  })
+  return exits
+}
+
+/**
+ * The findings for the driver `file`: every static import or `export … from`
+ * of anything but a `node:` built-in (it is evaluated before the file's first
+ * statement, wherever it stands, type-only included), and a first statement
+ * (after the static imports) that is not the marker check.
+ */
+function driverGuardFindings(file: string, source: string): string[] {
+  const sf = parse(source, file)
+  const at = (node: ts.Node, rule: string, what: string): string => `${file}:${finding(sf, node, `${rule}: ${what}`)}`
+  const loadOf = (s: ts.Statement): ts.Expression | undefined => (ts.isImportDeclaration(s) || ts.isExportDeclaration(s) ? s.moduleSpecifier : undefined)
+  const findings: string[] = []
+  for (const s of sf.statements) {
+    const specifier = loadOf(s)
+    if (specifier === undefined) continue
+    const text = stringText(specifier)
+    if (text === undefined || !text.startsWith('node:')) findings.push(at(s, IMAGE_GUARD_RULE.driverStaticImport, `static import of '${text ?? specifier.getText(sf)}' is evaluated before the ${CI_IMAGE_MARKER} check`))
+  }
+  const first = sf.statements.find((s) => loadOf(s) === undefined)
+  if (first === undefined) findings.push(`${file}:1: ${IMAGE_GUARD_RULE.markerFirst}: no ${CI_IMAGE_MARKER} check`)
+  else if (!isDriverMarkerCheck(first, sf)) findings.push(at(first, IMAGE_GUARD_RULE.markerFirst, `the first step is not the ${CI_IMAGE_MARKER} check that exits non-zero: ${first.getText(sf).split('\n')[0]}`))
+  return findings
+}
+
+/** Every `tests/integration/test-*.sh`, read from the directory. */
+function integrationScripts(): string[] {
+  return readdirSync(INTEGRATION_DIR, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && /^test-.*\.sh$/.test(entry.name))
+    .map((entry) => join(INTEGRATION_DIR, entry.name))
+    .sort()
+}
+
+/** Asserts `findings` is not empty, each names `file`, and one names `rule`. */
+function expectNamedFindings(findings: readonly string[], file: string, rule: string): void {
+  expect(findings.length).toBeGreaterThan(0)
+  expect(findings.filter((f) => !f.startsWith(`${file}:`))).toEqual([])
+  expect(findings).toContainEqual(expect.stringMatching(new RegExp(`^${file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:\\d+: ${rule}: `)))
+}
+
+describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first (b.jg5 SRJ-1306)', () => {
+  // What is not a step. Shell: the shebang, comments, blank lines, `set`
+  // options and literal assignments. fmk-driver.ts: static imports of
+  // `node:` built-ins; a static import of any other module is a step, since
+  // it is evaluated before the check. These files are read, never run.
+
+  const MARKER_CHECK = lines(
+    `if [[ ! -e ${CI_IMAGE_MARKER} ]]; then`,
+    `    echo "FAIL: x: refused: ${CI_IMAGE_MARKER} is absent" >&2`,
+    '    exit 1',
+    'fi',
+  )
+  const SOURCE_LINE = 'source "$(dirname "$0")/lib/scenario.sh"'
+  const RULE = IMAGE_GUARD_RULE
+
+  describe('the marker check, or the source line, is the first step', () => {
+    const flagged: [label: string, file: string, rule: string, source: string][] = [
+      ['a mkdir before the check', 'tests/runner.sh', RULE.markerFirst, lines('#!/usr/bin/env bash', 'set -uo pipefail', 'mkdir -p /test-results', MARKER_CHECK)],
+      ['an assignment from a command substitution before the check', 'tests/runner.sh', RULE.markerFirst, lines('TESTS_DIR="$(cd "$(dirname "$0")" && pwd)"', MARKER_CHECK)],
+      ['an assignment that expands a variable before the check', 'scenario.sh', RULE.markerFirst, lines('SCENARIO_ROOT="${TMPDIR}/x"', MARKER_CHECK)],
+      ['an export before the check', 'scenario.sh', RULE.markerFirst, lines('export HOME=/tmp/x', MARKER_CHECK)],
+      ['a command after the set options on the same line', 'test-1-x.sh', RULE.markerFirst, lines('set -e; cd /test-repo', MARKER_CHECK)],
+      ['a trap before the check', 'scenario.sh', RULE.markerFirst, lines("trap 'rm -rf /tmp/x' EXIT", MARKER_CHECK)],
+      ['the check inside a function (the definition comes first)', 'test-1-x.sh', RULE.markerFirst, lines('refuse() {', MARKER_CHECK, '}', 'refuse')],
+      ['a check that exits 0', 'test-1-x.sh', RULE.markerFirst, MARKER_CHECK.replace('exit 1', 'exit 0')],
+      ['a check that only prints', 'test-1-x.sh', RULE.markerFirst, MARKER_CHECK.replace('    exit 1\n', '')],
+      ['a check that exits only in its else branch', 'test-1-x.sh', RULE.markerFirst, MARKER_CHECK.replace('    exit 1', '    :\nelse\n    exit 1')],
+      ['a check of another file', 'test-1-x.sh', RULE.markerFirst, MARKER_CHECK.replace(`! -e ${CI_IMAGE_MARKER} ]]`, '! -e /etc/hostname ]]')],
+      ['a test script that neither sources scenario.sh nor checks the marker', 'test-14-x.sh', RULE.markerFirst, lines('#!/usr/bin/env bash', 'set -euo pipefail', 'TEST_NAME="test-14-x"', 'cd /test-repo')],
+      ['a script whose marker check and source line are only in comments and strings', 'test-14-x.sh', RULE.markerFirst, lines(`# ${MARKER_CHECK.split('\n')[0]}`, `# ${SOURCE_LINE}`, 'echo "source lib/scenario.sh"')],
+      ['a cd before the source line', 'test-13-fmk-x.sh', RULE.sourceFirst, lines('#!/usr/bin/env bash', 'set -euo pipefail', 'TEST_NAME="test-13-fmk-x"', 'cd /test-repo', SOURCE_LINE)],
+      ['an assignment from a command substitution before the source line', 'test-13-fmk-x.sh', RULE.sourceFirst, lines('set -euo pipefail', 'STAMP="$(date +%s)"', SOURCE_LINE)],
+      ['a second command on the TEST_NAME line', 'test-13-fmk-x.sh', RULE.sourceFirst, lines('TEST_NAME="test-13-fmk-x"; rm -rf /tmp/x', SOURCE_LINE)],
+    ]
+
+    test.each(flagged)('flags %s, naming the file and the rule', (_label, file, rule, source) => {
+      expectNamedFindings(shellEntryFindings(file, source), file, rule)
+    })
+
+    const allowed: [label: string, source: string][] = [
+      ['the shebang, comments, blank lines and set options before the check', lines('#!/usr/bin/env bash', '# Runs only in a cscb-ci image.', '', 'set -uo pipefail', 'set -e -o pipefail', '', MARKER_CHECK, 'mkdir -p /test-results')],
+      ['literal assignments (double-quoted, single-quoted and bare) before the check', lines('A="literal text"', "B='single $x'", 'C=0.10.0', MARKER_CHECK)],
+      ['the check with [ ], -f and the marker quoted', lines(`if [ ! -f "${CI_IMAGE_MARKER}" ]; then`, '    exit 2', 'fi')],
+      ['the check, then set options and steps', lines(MARKER_CHECK, '', 'set -euo pipefail', 'cd /test-repo')],
+      ['a sourcing script with set options and literal assignments before its source line', lines('#!/usr/bin/env bash', '# Test 13.', 'set -euo pipefail', '', 'TEST_NAME="test-13-fmk-x"', 'SCENARIO_AD_START=0.10.0', '# shellcheck source=lib/scenario.sh', SOURCE_LINE, 'cd /test-repo')],
+      ['a sourcing script using `.`', lines('set -euo pipefail', '. "$(dirname "$0")/lib/scenario.sh"', 'cd /test-repo')],
+    ]
+
+    test.each(allowed)('allows %s', (_label, source) => {
+      expect(shellEntryFindings('x.sh', source)).toEqual([])
+    })
+
+    test('the current tree: runner.sh and scenario.sh check the marker before their first other step', () => {
+      const findings = [RUNNER_PATH, SCENARIO_PATH].flatMap((path) => shellEntryFindings(relative(REPO_ROOT, path), readFileSync(path, 'utf-8')))
+
+      expect(findings).toEqual([])
+    })
+
+    test('the current tree: each test-*.sh that does not source scenario.sh checks the marker first, and each that does runs nothing before its source line', () => {
+      const scripts = integrationScripts().map((path) => ({ file: relative(REPO_ROOT, path), source: readFileSync(path, 'utf-8') }))
+      const sourcing = scripts.filter(({ source }) => shellLogicalLines(source).some(sourcesScenario))
+
+      expect(sourcing.length).toBeGreaterThan(0)
+      expect(scripts.length - sourcing.length).toBeGreaterThan(0)
+      expect(scripts.flatMap(({ file, source }) => shellEntryFindings(file, source))).toEqual([])
+    })
+  })
+
+  describe('the HOME-under-SCENARIO_ROOT check comes before the first sqlite3, copy, move or install step', () => {
+    const PRELUDE = lines(
+      'fail() {',
+      '    echo "FAIL: $1" >&2',
+      '    exit 1',
+      '}',
+      'require_ci_image() {',
+      `    [[ -e ${CI_IMAGE_MARKER} ]] || fail "refused"`,
+      '}',
+      `${HOME_GUARD}() {`,
+      '    [[ "${HOME}" == "${SCENARIO_ROOT}"/* ]] || fail "refused"',
+      '}',
+      '_scenario_place() {',
+      '    require_ci_image "$3"',
+      '    cp -- "$1" "$2.tmp" || fail "$3: could not copy"',
+      '    mv -f -- "$2.tmp" "$2" || fail "$3: could not rename"',
+      '}',
+    )
+    const GUARDS = lines('    require_ci_image "${step}"', `    ${HOME_GUARD} "\${step}"`)
+    const BODIES: Readonly<Record<string, string>> = {
+      install_ad_shim: lines(
+        '    local step="${1:-install the agent-director shim}"',
+        GUARDS,
+        '    local path="${HOME}/.agent-director/bin/agent-director"',
+        '    mv -f -- "${path}" "${path}.real" || fail "${step}: could not move ${path}"',
+        '    _scenario_place "${SCENARIO_AD_SHIM_SRC}" "${path}" "${step}"',
+      ),
+      ad_store_edit: lines(
+        '    local step=ad_store_edit out',
+        GUARDS,
+        '    out="$(sqlite3 -batch -bail "${HOME}/.agent-director/state.db" "$1;" 2>&1)" \\',
+        '        || fail "ad_store_edit: sqlite3 failed: ${out}"',
+      ),
+      ad_store_id: lines(
+        '    local step=ad_store_id out',
+        GUARDS,
+        '    out="$(sqlite3 -batch -readonly "${HOME}/.agent-director/state.db" \\',
+        `        "SELECT value FROM store_meta WHERE key = 'store_id';" 2>&1)" || fail "ad_store_id: \${out}"`,
+      ),
+    }
+    /** A scenario.sh-shaped source: the guards and `_scenario_place`, then the three helpers with `bodies` replacing theirs (undefined leaves one out). */
+    function helperSource(bodies: Readonly<Record<string, string | undefined>> = {}): string {
+      const helpers = HOME_GUARDED_HELPERS.flatMap((name) => {
+        const body = name in bodies ? bodies[name] : BODIES[name]
+        return body === undefined ? [] : [`${name}() {`, body, '}']
+      })
+      return lines(PRELUDE, ...helpers)
+    }
+
+    const flagged: [label: string, bodies: Record<string, string | undefined>][] = [
+      ['install_ad_shim: a copy before its HOME check', { install_ad_shim: lines('    cp -- "${HOME}/.agent-director/bin/agent-director" /tmp/ad.bak', GUARDS, BODIES.install_ad_shim) }],
+      ['install_ad_shim: a move before its HOME check', { install_ad_shim: lines('    require_ci_image x', '    mv -f -- "${HOME}/.agent-director/bin/agent-director" /tmp/ad', `    ${HOME_GUARD} x`) }],
+      ['install_ad_shim: the copy delegated to _scenario_place before its HOME check', { install_ad_shim: lines('    require_ci_image x', '    _scenario_place "${SCENARIO_AD_SHIM_SRC}" "${HOME}/.agent-director/bin/agent-director" x', `    ${HOME_GUARD} x`) }],
+      ['install_ad_shim: an install.sh run before its HOME check', { install_ad_shim: lines('    (cd "${HOME}" && "${SCENARIO_RC_INSTALL_SH}" --binary /opt/ad --no-hooks) < /dev/null', GUARDS) }],
+      ['install_ad_shim: left out', { install_ad_shim: undefined }],
+      ['ad_store_edit: sqlite3 in a command substitution before its HOME check', { ad_store_edit: lines('    require_ci_image x', '    local out="$(sqlite3 "${HOME}/.agent-director/state.db" "$1;")"', `    ${HOME_GUARD} x`) }],
+      ['ad_store_edit: the HOME check only after an ||', { ad_store_edit: lines('    [[ -f "${HOME}/.agent-director/state.db" ]] || ' + `${HOME_GUARD} x`, '    sqlite3 "${HOME}/.agent-director/state.db" "$1;"') }],
+      ['ad_store_edit: the HOME check only in a subshell', { ad_store_edit: lines(`    ( ${HOME_GUARD} x )`, '    sqlite3 "${HOME}/.agent-director/state.db" "$1;"') }],
+      ['ad_store_id: the HOME check only inside an if', { ad_store_id: lines('    if [[ -n "${STRICT:-}" ]]; then', `        ${HOME_GUARD} x`, '    fi', '    sqlite3 -readonly "${HOME}/.agent-director/state.db" "SELECT 1;"') }],
+      ['ad_store_id: no HOME check at all', { ad_store_id: lines('    require_ci_image x', '    sqlite3 -readonly "${HOME}/.agent-director/state.db" "SELECT 1;"') }],
+      ['ad_store_id: no step the audit can see', { ad_store_id: lines(GUARDS, '    read_store_id_somehow') }],
+    ]
+
+    test.each(flagged)('flags %s, naming the file and the rule', (_label, bodies) => {
+      expectNamedFindings(helperHomeCheckFindings('scenario.sh', helperSource(bodies)), 'scenario.sh', RULE.homeCheckFirst)
+    })
+
+    const allowed: [label: string, bodies: Record<string, string>][] = [
+      ['the guards first, then the steps', {}],
+      ['step words in comments, strings and a heredoc before the HOME check', {
+        install_ad_shim: lines(
+          '    # cp the shim aside, then mv it into place',
+          '    local step="${1:-cp and mv the shim}" note=\'sqlite3 install\'',
+          '    cat <<EOF >&2',
+          'cp a b',
+          'EOF',
+          '    echo "mv ${note}" >&2',
+          GUARDS,
+          '    mv -f -- "${HOME}/a" "${HOME}/b"',
+        ),
+      }],
+      ['a read-only grep of the shim before the HOME check', { install_ad_shim: lines('    grep -qxF -- "# marker" "${SCENARIO_AD_SHIM_SRC}" || fail x', GUARDS, '    _scenario_place a "${HOME}/b" x') }],
+    ]
+
+    test.each(allowed)('allows %s', (_label, bodies) => {
+      expect(helperHomeCheckFindings('scenario.sh', helperSource(bodies))).toEqual([])
+    })
+
+    test('the current tree: install_ad_shim, ad_store_edit and ad_store_id run require_scenario_home before their first sqlite3, copy, move or install step', () => {
+      expect(helperHomeCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), readFileSync(SCENARIO_PATH, 'utf-8'))).toEqual([])
+    })
+  })
+
+  describe('fmk-driver.ts checks the marker before its first step', () => {
+    const NODE_IMPORTS = lines("import { existsSync } from 'node:fs'", "import { join } from 'node:path'")
+    const CHECK = lines(`if (!existsSync('${CI_IMAGE_MARKER}')) {`, "  console.error('FAIL: fmk-driver: refused')", '  process.exit(2)', '}')
+    const AFTER = "const mod = await import(join(process.env['CSCB_PKG_DIR'] ?? '/test-repo', 'src', 'x.ts'))"
+
+    const flagged: [label: string, rule: string, source: string][] = [
+      ['a static package import', RULE.driverStaticImport, lines(NODE_IMPORTS, "import { spawnForPersona } from 'claude-slack-channel-bots/src/session-manager.ts'", CHECK)],
+      ['a static package import after the check (evaluated first all the same)', RULE.driverStaticImport, lines(NODE_IMPORTS, CHECK, "import { Client } from 'agent-director'")],
+      ['a type-only import of a package', RULE.driverStaticImport, lines("import type { Client } from 'agent-director'", NODE_IMPORTS, CHECK)],
+      ['a side-effect import of a relative module', RULE.driverStaticImport, lines("import './setup.ts'", NODE_IMPORTS, CHECK)],
+      ['a re-export from a package', RULE.driverStaticImport, lines(NODE_IMPORTS, CHECK, "export { Client } from 'agent-director'")],
+      ['a statement before the check', RULE.markerFirst, lines(NODE_IMPORTS, "const PKG_DIR = process.env['CSCB_PKG_DIR'] ?? '/test-repo'", CHECK)],
+      ['a check that exits 0', RULE.markerFirst, lines(NODE_IMPORTS, CHECK.replace('exit(2)', 'exit(0)'))],
+      ['a check that does not exit', RULE.markerFirst, lines(NODE_IMPORTS, CHECK.replace('  process.exit(2)\n', ''))],
+      ['a check of another path', RULE.markerFirst, lines(NODE_IMPORTS, CHECK.replace(CI_IMAGE_MARKER, '/etc/hostname'))],
+      ['existsSync from a module other than node:fs', RULE.markerFirst, lines("import { existsSync } from './fs-shim.ts'", "import { join } from 'node:path'", CHECK)],
+      ['no check at all', RULE.markerFirst, lines(NODE_IMPORTS, AFTER)],
+    ]
+
+    test.each(flagged)('flags %s, naming the file and the rule', (_label, rule, source) => {
+      expectNamedFindings(driverGuardFindings('fmk-driver.ts', source), 'fmk-driver.ts', rule)
+    })
+
+    const allowed: [label: string, source: string][] = [
+      ['node: imports and comments, the check, then dynamic imports', lines('/** The driver. */', NODE_IMPORTS, '// The marker first.', CHECK, AFTER)],
+      ['existsSync imported under another name', lines("import { existsSync as exists } from 'node:fs'", CHECK.replace('existsSync(', 'exists('))],
+    ]
+
+    test.each(allowed)('allows %s', (_label, source) => {
+      expect(driverGuardFindings('fmk-driver.ts', source)).toEqual([])
+    })
+
+    test('the current tree: fmk-driver.ts imports only node: built-ins statically and checks the marker first', () => {
+      expect(driverGuardFindings(relative(REPO_ROOT, FMK_DRIVER_PATH), readFileSync(FMK_DRIVER_PATH, 'utf-8'))).toEqual([])
+    })
   })
 })
 

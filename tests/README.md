@@ -140,6 +140,41 @@ unit suite, which spawns no real Claude process: Test 12 checks the hook
 paths a launched persona runs (b.cnu SR-8.2), which the unit suite could
 only skip.
 
+### Image marker
+
+`/etc/cscb-ci-image` exists only in the `cscb-ci` images
+(`docker/Dockerfile.test.base`, see `docker/README.md`). The following check
+for it before their first other step and, when it is absent, refuse and say
+why:
+
+- `tests/runner.sh`: its first step. It prints one line to stderr and exits 2
+  before it creates a directory, writes a verdict or runs a test.
+- Every `test-*.sh`: a script that sources `lib/scenario.sh` gets the
+  helper's check, its first step, which prints
+  `FAIL: <test>: refused: /etc/cscb-ci-image is absent …` and exits 1 before
+  it makes a scratch root, picks a port or sets a trap. Tests 1 to 4, which do
+  not source the helper, carry the same check as their own first step.
+- `fixtures/fmk-driver.ts`: its first statement checks the marker and exits
+  2 before it reads an argument or loads a module; it statically imports only
+  `node:` built-ins. (`fixtures/phase1-client-check.ts` also refuses to run
+  without the marker.)
+- Every `scenario.sh` step that installs, moves or swaps an agent-director
+  binary or the shim, every harness agent-director call (`ad`, `ad_capture`)
+  and every harness `sqlite3` read or edit (`ad_store_edit`, `ad_store_id`)
+  calls `require_ci_image` as its first step, which fails with
+  `FAIL: <test>: <step>: refused: /etc/cscb-ci-image is absent …`.
+
+The same helpers then call `require_scenario_home`, which refuses unless
+`SCENARIO_ROOT` is a directory and HOME is under it, both as written and by
+real path (a HOME that is a symlink out of `SCENARIO_ROOT` is refused). The
+copy-and-rename every install and swap goes through also refuses a
+destination outside `SCENARIO_ROOT`. No harness step touches the invoking
+user's own `~/.agent-director`.
+
+`tests/host-safety.test.ts` reads these files, and never runs them, to check
+that each check comes before the first step it guards (see the
+`host-safety.test.ts` row in `docs/testing-guide.md`).
+
 ### Layout
 
 ```
@@ -161,9 +196,19 @@ tests/
                                    # b.cnu SR-8.2, b.2qu, live against the Slack stub: every hook `command` path of an agent-director-launched persona is an absolute path to an existing executable
                                    # (agent-director's exec-form `command` read verbatim, CSCB's shell-form Stop hook by its first word); agent-director's run the user's agent-director install,
                                    # the reply guard runs the installed package's script
+    test-0-fmk-harness-self-check.sh
+                                   # SRJ-1306, fmk mode: the harness's self-check, run after Test 4 and before every fmk scenario. Its legs show the scenario's own HOME,
+                                   # TMUX_TMPDIR and PATH (no agent-director on it, the stub as `claude`, bun kept); the release candidate behind the shim at the standard path;
+                                   # a harness call logged with its argv and the scenario shell as parent; the client's version probe through the shim; a spawn on the
+                                   # scenario's own tmux server; `ad_store_id` and `ad_store_edit` on the scenario's store; the shim a regular file carrying its marker
+                                   # after every install, re-shim, swap and restore, with the log kept; a 0.10.0 start; every guarded helper refusing a HOME outside
+                                   # SCENARIO_ROOT; and the trap stopping the scenario's tmux server
     lib/
-      scenario.sh                  # shared helper sourced by Tests 5 onwards (see Scenario helper below)
+      scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards (see Scenario helper below)
     fixtures/
+      agent-director-shim.sh       # the logging agent-director shim of fmk mode: logs each call's argv and parent, then execs the real binary beside it
+      fmk-driver.ts                # the driver of the calls an fmk scenario forces; refuses to run without the image marker /etc/cscb-ci-image and
+                                   # imports the installed package and its agent-director client only after that check
       driver.ts                    # Test 4 driver: builds a one-persona config, calls spawnForPersona directly, then follows the persona's dialog approver through the package's seams
                                    # (running when the launch returns, stops because the row went live, keeps the launch start); deletes no row
       stub-claude.sh               # fake `claude` (Tests 4, 10 and 12): prints the dev-channels dialog; on Enter, and on its exit sentinel, fires every SessionStart, and SessionEnd,
@@ -186,7 +231,8 @@ docker/
 
 `tests/runner.sh` runs Tests 1 to 4 first, in that order, then every other
 `tests/integration/test-*.sh` it finds, in version order (`sort -V`, so
-`test-5` runs before `test-10`). A new scenario script needs no runner edit;
+`test-5` runs before `test-10`, and `test-0-fmk-harness-self-check.sh` runs
+right after Test 4 and before every fmk scenario). A new scenario script needs no runner edit;
 this layout shows the suite's shape, not a fixed list.
 
 ### Testplan tickets
@@ -199,8 +245,9 @@ you change the script, update the testplan. Today that is Tests 1 to 3
 (`testplans/b.j9i`, `b.3hy`, `b.set`).
 
 A script with no ticket is specified by its header comment, and by its
-driver's where it has one (Test 4 and `fixtures/driver.ts`). Tests 5 to 12
-have no testplan ticket: each header comment lists what it checks, and the
+driver's where it has one (Test 4 and `fixtures/driver.ts`). Test 0 has no
+testplan ticket: its header comment lists each leg and what it shows. Tests
+5 to 12 have none either: each header comment lists what it checks, and the
 log fragments it expects are taken from `src/` (the function that writes
 each is named in the header or in a constants block near the top), so the
 transcription rule does not apply to them.
@@ -245,11 +292,15 @@ the agent-director client it resolves (`rc-client-check.sh --package`, then
 `fixtures/phase1-client-check.ts`) and starts the daemon, Tests 2 and 3 use that daemon, Test 4 uses the installed package. The
 runner stops at the first failure and runs nothing after it.
 
-Tests 5 onwards depend only on Test 1's install. Each runs its own server in
-its own state dir on its own port, and stops it before it exits, so their
-order among themselves does not matter. They still share the container's one
-HOME and one agent-director store, which is why their persona names are
-unique per script.
+Test 0 and Tests 5 onwards depend only on Test 1's install. Each runs any
+server it starts in its own state dir on its own port, and stops it before it
+exits, so their order among themselves does not matter. Tests 5 to 12 run in the
+helper's shared mode: they share the container's one HOME, one agent-director
+store and one tmux server, with no shim, which is why their persona names are
+unique per script. Every fmk script (Test 0 and each script whose name
+carries `-fmk-`) runs with its own HOME, agent-director install and store,
+and tmux server, all under its `SCENARIO_ROOT` (see Scenario helper), and
+shares none of them with another script.
 
 Test 10's live start runs the server's start sweep (`reconcileOrphans`,
 `src/session-manager.ts`), which kills and deletes every `service=cscb`
@@ -258,12 +309,26 @@ with a foreign instance ID or another working directory; a row with no
 persona label is killed when live and kept). Every persona row an earlier
 script left behind is gone after Test 10's start, and Test 12's live start
 does the same to Test 10's rows; that is acceptable only because the
-container is ephemeral and the scripts run one at a time.
+container is ephemeral and the scripts run one at a time. The sweep reaches
+only the shared store: an fmk script's rows are in its own store, which no
+other script's start sees.
 
 ### Scenario helper
 
-`tests/integration/lib/scenario.sh` is sourced by Tests 5 onwards; its header
-comment is the full function list. Sourcing it:
+`tests/integration/lib/scenario.sh` is sourced by Test 0 and Tests 5
+onwards; its header comment is the full function list. Its first step is the
+image-marker check (see Image marker). It has two modes, chosen by the
+script's name:
+
+- fmk mode, for every script whose `TEST_NAME` carries `-fmk-` (Test 0 and
+  the fmk scenarios): the script gets its own HOME, agent-director install and
+  store, and tmux server, all under `SCENARIO_ROOT`, with the agent-director
+  shim in front of the binary (see fmk mode below);
+- shared mode, for every other script (Tests 5 to 12): HOME, PATH, the
+  agent-director store and the tmux server stay the container's, as the
+  scripts found them, and no shim is installed.
+
+Sourcing it, in both modes:
 
 - makes a scratch root (`SCENARIO_ROOT`, `mktemp -d` under `/tmp`) and a
   first state dir under it, exported as `SLACK_STATE_DIR`, so a scenario never
@@ -271,13 +336,110 @@ comment is the full function list. Sourcing it:
   `start` finds no `config.json.last-applied`;
 - picks a free loopback port (`SCENARIO_PORT`, 20000 to 29999, never 3100,
   which Tests 1 to 3's server keeps) for the scenario's config to name;
-- sets `SCENARIO_TAG` (`t<N>` from the script name). Build persona names from
-  it (`${SCENARIO_TAG}_alpha`), so no two scripts share a persona key in the
-  one agent-director store;
+- sets `SCENARIO_TAG` (`t<N>` from the script name). In shared mode, build
+  persona names from it (`${SCENARIO_TAG}_alpha`), so no two shared-mode
+  scripts share a persona key in the container's one agent-director store;
 - installs an EXIT trap that stops every server the scenario started (with
   `--stop-bots` after a live start), kills every process registered with
-  `track_pid`, runs the `on_exit` hooks, prints the tail of each `server.log`
-  when the script failed, and removes the scratch root.
+  `track_pid`, in fmk mode stops the scenario's tmux server (a kill-server on
+  every tmux socket under `SCENARIO_ROOT`, then SIGKILL for any of its tmux
+  processes left; one still running fails the run), runs the `on_exit` hooks,
+  prints the tail of each `server.log` when the script failed, and removes the
+  scratch root.
+
+fmk mode. Sourcing also:
+
+- exports HOME as `SCENARIO_HOME` (`$SCENARIO_ROOT/home`), so no step reads
+  or writes the container user's own `~/.agent-director`;
+- exports `TMUX_TMPDIR` as `$SCENARIO_ROOT/tmux` and unsets `TMUX` and
+  `TMUX_PANE`, so every tmux client the scenario's processes start talks to
+  the scenario's own tmux server;
+- exports a PATH that starts with the scenario's bin directory
+  (`SCENARIO_BIN`), where `claude` is a copy of `fixtures/stub-claude.sh`,
+  followed by the container's PATH without every directory that holds an
+  `agent-director` (the image's default agent-director directory among them)
+  and without relative or empty entries. bun's directory stays. No process of
+  the scenario finds an agent-director on PATH: the client finds the scenario
+  HOME's at its standard path, `$HOME/.agent-director/bin/agent-director`;
+- installs agent-director into the scenario HOME behind the shim. By default
+  that is the release candidate: `install_ad_rc` runs the release
+  candidate's `install.sh` (from agent-director's tree at the release
+  candidate's commit, in the image) in the scenario HOME with
+  `--binary <the image's release-candidate binary> --no-symlink --no-hooks`,
+  stdin from `/dev/null`, which puts the binary at the standard path and makes
+  the HOME's store with its store id, then re-shims. A script that sets
+  `SCENARIO_AD_START=0.10.0` before its source line starts on agent-director
+  0.10.0 instead: `install_ad_010` copies 0.10.0's binary to the standard path
+  behind the shim, with no `install.sh` run and no store yet.
+  `SCENARIO_AD_START` is `rc` (the default) or `0.10.0`; a shared-mode script
+  that sets it fails;
+- writes no agent-director `config.toml`, so agent-director runs on its
+  default settings. Scenarios 10 and 24 are the exceptions: they write a
+  `[tmux]` table.
+
+Keep HOME, `TMUX_TMPDIR` and PATH as sourcing set them. Sourcing also sets
+`SCENARIO_REAL_TMUX` (the real tmux, which the trap stops the server with),
+`SCENARIO_AD_BIN` (the standard path, which holds the shim) and
+`SCENARIO_AD_SHIM_LOG` (the shim's log).
+
+The agent-director shim (`fixtures/agent-director-shim.sh`):
+
+- sits at the standard path as a regular file (the client takes the standard
+  path first and follows symlinks, so a symlink there would bypass it), with
+  the real binary beside it as `agent-director.real`;
+- for each invocation appends one `call` line to its log, holding argv, the
+  parent's PID and the parent's command line, then execs the real binary
+  beside it, keeping the PID, argv, standard streams and exit status. When it
+  cannot append the line it runs nothing and exits 70, so no call goes
+  unlogged;
+- reads no environment variable (the client's version probe runs it with cwd
+  `/` and a scrubbed environment): it finds the real binary and its log from
+  its own path;
+- logs to `agent-director-shim.log` beside the real binary
+  (`SCENARIO_AD_SHIM_LOG`), in one line format of six TAB-separated fields,
+  stated in the shim's header and nowhere else. A reader of invocations takes
+  only the lines whose first field is `call`; the format's other kind, `stop`,
+  is reserved for `stub-claude.sh`. Every install, re-shim, swap, hide and
+  restore moves only the shim and the binary, so the log keeps every line;
+- carries a marker line. `check_ad_shim` fails unless the standard path holds
+  a regular, executable file (not a symlink) carrying it, with an executable
+  binary beside it that is not the shim; every install, re-shim, swap and
+  restore runs it after its change.
+
+Each change to the install goes through one helper:
+
+- `install_ad_shim` puts the binary installed at the standard path behind the
+  shim: it copies the binary to `agent-director.real`, then renames the shim
+  over the standard path, so the standard path always holds the binary or the
+  shim. It fails when the standard path is missing, a symlink or already the
+  shim.
+- `install.sh` replaces whatever is at the standard path with its binary, so
+  every `install.sh` run is followed by `reshim_ad`, which puts the shim back
+  and re-checks it. `install_ad_rc` does this itself; a runbook step that runs
+  its own install command calls `reshim_ad` after it.
+- `swap_ad_binary <rc|0.10.0|<abs-path>>` replaces only the binary behind
+  the shim (the release candidate, 0.10.0, or a stand-in file), checking the
+  shim before and after.
+- `hide_ad_install` and `restore_ad_install` are the one exception, for
+  scenario 8's not-found step: hide moves the shim and the binary aside
+  together (to `$SCENARIO_ROOT/ad-aside`), leaving no file at the standard
+  path; restore moves both back, the binary first, then runs `check_ad_shim`.
+  A move that fails halfway is rolled back and the step fails saying so.
+
+Harness agent-director calls and store helpers:
+
+- `ad <arg>...` and `ad_capture <arg>...` run the scenario HOME's standard
+  path, so every harness call goes through the shim to the scenario's binary,
+  from the scenario's own shell: run as a plain command, the shim logs the
+  script's shell (`$$`) as the call's parent. `ad_capture` sets `AD_RC`,
+  `AD_OUT` and `AD_ERR` and never fails on the call's status.
+- `ad_store_edit <statement>` runs exactly one `sqlite3` statement on the
+  scenario HOME's `.agent-director/state.db` and fails with sqlite3's error;
+  `ad_store_id` opens the store read-only and prints its store id, failing,
+  saying why, unless it is 16 lowercase hex characters.
+- Each of these, `install_ad_shim` and every other install helper above calls
+  `require_ci_image` and then `require_scenario_home` as its first two steps
+  (see Image marker).
 
 Matchers (E14 director decision 14). A matcher is one or more fixed-string
 fragments that must appear on one line in the given order, with anything
@@ -340,6 +502,11 @@ The contract for a scenario:
   sentence copied from `src/`.
 - Never replace the EXIT trap. Register a background process with
   `track_pid` and extra cleanup with `on_exit` instead.
+- In fmk mode, keep HOME, `TMUX_TMPDIR` and PATH as sourcing set them; make
+  every harness agent-director call with `ad` or `ad_capture`, every store
+  read or edit with `ad_store_id` or `ad_store_edit`, and every change to the
+  install with the helpers above, followed by `reshim_ad` after any
+  `install.sh` run.
 
 ### Slack stub
 
@@ -381,7 +548,7 @@ stdout/stderr where `docker logs` can capture them — never into `verdict.txt`.
 
 1. Write the testplan ticket in `testplans/` (the source of truth — describes
    what is being tested and why, in human prose).
-   A self-describing scenario with no ticket (as Tests 5 to 12) skips this
+   A self-describing scenario with no ticket (as Test 0 and Tests 5 to 12) skips this
    step: its header comment lists what it checks, and its expected log
    fragments are taken from `src/` in the header or a constants block.
 2. Add `tests/integration/test-N-<short-name>.sh`, with `N` the next unused
@@ -397,7 +564,18 @@ stdout/stderr where `docker logs` can capture them — never into `verdict.txt`.
    ```
    Every pass criterion must be an explicit bash assertion that calls
    `fail <step>`, which prints `FAIL: <test-name>: <step>` to stderr and exits
-   non-zero. Follow the helper's contract (see Scenario helper).
+   non-zero. Follow the helper's contract (see Scenario helper). Nothing but
+   the shebang, comments, `set` options and literal assignments may come
+   before the source line: the helper's image-marker check must be the
+   script's first step (`tests/host-safety.test.ts` checks this). A script
+   that does not source the helper starts with its own marker check instead,
+   as Tests 1 to 4 do.
+
+   An fmk scenario is named `test-N-fmk-<short-name>` (`TEST_NAME` carrying
+   `-fmk-`). Sourcing the helper then gives it its own HOME, agent-director
+   install and store, tmux server and shim (see fmk mode under Scenario
+   helper), on the release candidate. To start on agent-director 0.10.0, set
+   `SCENARIO_AD_START=0.10.0` on its own line before the source line.
 3. Make it executable. The runner picks it up by name and runs every
    `test-*.sh` through `bash`, so the mode bit is not what makes it run;
    don't edit `tests/runner.sh`.

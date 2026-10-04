@@ -6,6 +6,12 @@
 # and tears down each persona's instance cscb_<key> (b.av2 SR-8.7). Dry run
 # never spawned one, so it reports no spawn row for each persona. The restart
 # runs with SLACK_BOT_TOKEN and SLACK_APP_TOKEN unset (AC 47).
+# Runs only in a cscb-ci image: without its marker, refuse before any other step.
+if [[ ! -e /etc/cscb-ci-image ]]; then
+    echo "FAIL: test-3-cozempic-restart: refused: /etc/cscb-ci-image is absent; this test runs only in a cscb-ci image (/ci)" >&2
+    exit 1
+fi
+
 set -euo pipefail
 
 TEST_NAME="test-3-cozempic-restart"

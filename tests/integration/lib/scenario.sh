@@ -1,6 +1,7 @@
 # shellcheck shell=bash
 # tests/integration/lib/scenario.sh — shared helper for the docker integration
-# scenario scripts (test-5 onwards). Sourced, never run:
+# scenario scripts (test-5 onwards, and test-0-fmk-harness-self-check).
+# Sourced, never run:
 #
 #   #!/usr/bin/env bash
 #   set -euo pipefail
@@ -12,25 +13,76 @@
 # without -x, so the helper's globals count as used.)
 #
 # Runs only inside the cscb-ci container (tests/runner.sh, via /ci), after
-# Test 1 installed the package into /test-repo. Never source it on a dev box.
+# Test 1 installed the package into /test-repo. Never source it on a dev box:
+# its first step checks for the image marker /etc/cscb-ci-image and, when it
+# is absent, prints `FAIL: <test>: refused: /etc/cscb-ci-image is absent …`
+# and exits 1, before it makes a scratch root, picks a port or sets a trap.
 #
-# What sourcing does:
+# Two modes, chosen by the script's name:
+# - fmk mode, for every script whose TEST_NAME carries `-fmk-` (test-13 to
+#   test-28, and test-0-fmk-harness-self-check): the scenario gets its own
+#   HOME, agent-director install and store, and tmux server, all under
+#   SCENARIO_ROOT, with the agent-director shim in front of the binary (see
+#   "fmk mode" below);
+# - shared mode, for every other script (test-5 to test-12): HOME, PATH, the
+#   agent-director store and the tmux server stay the container's, as the
+#   scripts found them, and no shim is installed (test-12 checks where the
+#   hook commands resolve).
+#
+# What sourcing does, in both modes:
+# - refuses outside a cscb-ci image (above);
 # - sets TEST_NAME from the script's file name when the script did not;
 # - makes the scenario's scratch root (SCENARIO_ROOT, `mktemp -d` under /tmp,
 #   exported, so every process the scenario starts carries it in its
 #   environment) and a first state dir under it, exported as SLACK_STATE_DIR,
 #   so the scenario never touches ~/.claude/channels/slack or another
 #   script's state (a fresh state dir has no config.json.last-applied);
+# - in fmk mode, sets up the scenario's HOME, tmux, PATH and agent-director
+#   install (see "fmk mode");
 # - picks a free port (SCENARIO_PORT; never 3100, which Tests 1-3's server
 #   keeps) for the scenario's config to name;
-# - sets SCENARIO_TAG ("t<N>" from TEST_NAME). Persona names must be unique
-#   across scripts, since every script shares one HOME and one agent-director
-#   store: build them from the tag (for example "${SCENARIO_TAG}_alpha");
+# - sets SCENARIO_TAG ("t<N>" from TEST_NAME). Persona names in the
+#   shared-mode scripts must be unique across those scripts, since every
+#   shared-mode script shares one HOME and one agent-director store: build
+#   them from the tag (for example "${SCENARIO_TAG}_alpha");
 # - installs an EXIT trap that stops every server the scenario started, kills
-#   every process it registered with `track_pid`, runs the `on_exit` hooks,
-#   prints the tail of each state dir's server.log when the script failed,
-#   and removes SCENARIO_ROOT. The trap signals only a process that is still
-#   the scenario's own (see "PIDs" below).
+#   every process it registered with `track_pid`, in fmk mode stops the
+#   scenario's tmux server, runs the `on_exit` hooks, prints the tail of each
+#   state dir's server.log when the script failed, and removes SCENARIO_ROOT.
+#   The trap signals only a process that is still the scenario's own (see
+#   "PIDs" below).
+#
+# fmk mode. Sourcing also:
+# - exports HOME as SCENARIO_HOME, `$SCENARIO_ROOT/home`, so no step reads or
+#   writes the container user's own ~/.agent-director;
+# - exports TMUX_TMPDIR as `$SCENARIO_ROOT/tmux` and unsets TMUX and
+#   TMUX_PANE, so every tmux client the scenario's processes start talks to
+#   the scenario's own tmux server;
+# - exports a PATH that starts with the scenario's bin directory
+#   (SCENARIO_BIN, `$SCENARIO_ROOT/bin`), in which `claude` is a copy of
+#   fixtures/stub-claude.sh, followed by the container's PATH without every
+#   directory that holds an `agent-director` (the image's default binary's
+#   own directory among them) and without relative or empty entries. bun's
+#   directory stays. No process of the scenario finds an agent-director on
+#   PATH: the client finds the scenario HOME's at its standard path;
+# - installs agent-director into the scenario HOME behind the shim
+#   (fixtures/agent-director-shim.sh): by default the release candidate,
+#   through its install.sh (`install_ad_rc`), which creates the HOME's store
+#   with its store id; or, for a script that sets SCENARIO_AD_START=0.10.0
+#   before sourcing, agent-director 0.10.0's binary (`install_ad_010`), with
+#   no release-candidate install and no store yet (SCENARIO_AD_START is `rc`
+#   or `0.10.0`; a shared-mode script that sets it fails);
+# - writes no agent-director config.toml: agent-director's default settings.
+# Keep HOME, TMUX_TMPDIR and PATH as sourcing set them. Sourcing also sets
+# SCENARIO_REAL_TMUX (the real tmux, resolved before PATH changed; the trap
+# stops the scenario's tmux server with it), SCENARIO_AD_BIN (the standard
+# path, which holds the shim) and SCENARIO_AD_SHIM_LOG (the shim's log; its
+# one line format is stated in the shim's header, and nowhere else).
+#
+# Guards. Every helper below that runs agent-director, installs, moves or
+# swaps an agent-director binary or the shim, or reads or edits the store
+# with sqlite3 calls `require_ci_image` and then `require_scenario_home` as
+# its first two steps, before any copy, move, install or sqlite3 step.
 #
 # Matchers (E14 decision 14). Scenario scripts assert a line's class prefix,
 # persona ref and distinguishing fragments, never a whole sentence the unit
@@ -121,6 +173,57 @@
 #   fake_token <bot|app> <label>       print a fake token, built at runtime
 #   count_token_like <file>...         print the number of token-like matches (never the text)
 #
+#   Guards (each fails with its reason, the FAIL line naming <step>)
+#   require_ci_image <step>            fail unless the image marker /etc/cscb-ci-image exists
+#   require_scenario_home <step>       fail unless SCENARIO_ROOT is a directory and HOME is under it,
+#                                      both as written and by real path
+#
+#   agent-director install (fmk mode; standard path = $HOME/.agent-director/bin/agent-director,
+#   the real binary beside it = <standard path>.real; each runs both guards first, and
+#   each that changes the install runs `check_ad_shim` after its change, apart from
+#   `hide_ad_install`, which leaves no file at the standard path to check)
+#   install_ad_shim [<step>]           put the binary installed at the standard path behind the shim:
+#                                      it is copied to <standard path>.real, then the shim is renamed
+#                                      over the standard path (which so always holds the binary or
+#                                      the shim); fails when the standard path is missing, a symlink
+#                                      or already the shim
+#   reshim_ad [<step>]                 the re-shim after any install.sh run (the harness's or a
+#                                      runbook's own install command): `install_ad_shim`
+#   install_ad_rc [<step>]             run the release candidate's install.sh in the scenario HOME
+#                                      (`--binary <RC binary> --no-symlink --no-hooks`, stdin from
+#                                      /dev/null, cwd HOME; output in AD_INSTALL_OUT), then `reshim_ad`;
+#                                      a failed run fails the step with install.sh's output
+#   install_ad_010 [<step>]            copy agent-director 0.10.0's binary to the standard path, then
+#                                      `install_ad_shim` (no install.sh run, no store made)
+#   swap_ad_binary <rc|0.10.0|<abs-path>> [<step>]
+#                                      replace only the binary behind the shim (the release
+#                                      candidate, 0.10.0, or a stand-in or wrapper file)
+#   hide_ad_install [<step>]           scenario 8's not-found step: move the shim and the binary
+#                                      aside together (to $SCENARIO_ROOT/ad-aside), leaving no file
+#                                      at the standard path; when the binary cannot move, the shim
+#                                      goes back before the step fails
+#   restore_ad_install [<step>]        move both back, the binary first, then `check_ad_shim`; when
+#                                      the shim cannot move, the binary goes aside again before the
+#                                      step fails
+#   check_ad_shim [<step>]             fail unless the standard path holds a regular file, not a
+#                                      symlink, executable and carrying the shim's marker, with an
+#                                      executable binary beside it that is not the shim
+#
+#   Harness agent-director calls (fmk mode; both guards first; run the standard path, the shim)
+#   ad <arg>...                        run agent-director with <arg>...; status and output pass
+#                                      through. As a plain command (not in `$( … )` or a pipeline)
+#                                      its parent is the scenario's own shell ($$), as the shim logs
+#   ad_capture <arg>...                the same, as a direct child of the shell; set AD_RC, AD_OUT
+#                                      (stdout file) and AD_ERR (stderr file); never fails on the
+#                                      call's status
+#
+#   The scenario store ($HOME/.agent-director/state.db; both guards first; no other store)
+#   ad_store_edit <statement>          run exactly one sqlite3 statement (no `;` but one at its end);
+#                                      print its output; fail with sqlite3's error
+#   ad_store_id                        open the store read-only and print its store id (store_meta
+#                                      key store_id); fail, saying why, unless it is 16 lowercase hex
+#                                      characters (a 0.10.0 store has none)
+#
 # Line builders (every fragment is quoted from src/; <ref> is `persona_ref`):
 #   persona_start_match   `[slack] persona-start: personas[<index>] <ref>`
 #                         (src/persona-bringup-controller.ts bringUp, format
@@ -160,8 +263,10 @@
 # Exit hooks: `on_exit <function>` registers extra cleanup (removing files
 # outside SCENARIO_ROOT, for example). The trap runs the hooks in registration
 # order, each in a subshell, after every server and tracked process is
-# stopped and before SCENARIO_ROOT is removed; on success and on failure
-# alike. A hook that exits non-zero (or calls `fail`) turns a passing run
+# stopped (and, in fmk mode, the scenario's tmux server: a kill-server on
+# every tmux socket under SCENARIO_ROOT, then SIGKILL for any of its tmux
+# processes left; one still running fails the run) and before SCENARIO_ROOT
+# is removed; on success and on failure alike. A hook that exits non-zero (or calls `fail`) turns a passing run
 # into a failed one; a hook's failure never stops the rest of the cleanup.
 #
 # Don't call a function that can fail inside `$( … )` unless the assignment
@@ -173,6 +278,13 @@
 #
 # Don't replace the EXIT trap; register a background process with
 # `track_pid` and extra cleanup with `on_exit` instead.
+
+# The image marker, before any other step: no scratch root, port or trap
+# outside a cscb-ci image.
+if [[ ! -e /etc/cscb-ci-image ]]; then
+    echo "FAIL: ${TEST_NAME:-$(basename "$0" .sh)}: refused: /etc/cscb-ci-image is absent; scenario.sh runs only in a cscb-ci image (/ci)" >&2
+    exit 1
+fi
 
 set -euo pipefail
 
@@ -202,6 +314,27 @@ SCENARIO_SEP=$'\x1f'
 # src/reload-fingerprint.ts PENDING_FILE_HEADER.
 PENDING_HEADER='claude-slack-channel-bots: pending configuration change (written by the server)'
 
+# The integration fixtures (stub-claude.sh, agent-director-shim.sh, drivers).
+SCENARIO_FIXTURES="$(cd "$(dirname "${BASH_SOURCE[0]}")/../fixtures" && pwd)"
+
+# The image's agent-director files (docker/Dockerfile.test.base): the release
+# candidate's binary and its install.sh (from agent-director's tree at the
+# release candidate's commit), and agent-director 0.10.0's binary.
+SCENARIO_RC_BIN=/opt/agent-director-rc/bin/agent-director
+SCENARIO_RC_INSTALL_SH=/opt/agent-director-rc/install/install.sh
+SCENARIO_AD_010_BIN=/opt/agent-director-0.10.0/bin/agent-director
+
+# The agent-director shim and the whole line that marks it.
+SCENARIO_AD_SHIM_SRC="${SCENARIO_FIXTURES}/agent-director-shim.sh"
+SCENARIO_AD_SHIM_MARKER='# CSCB_CI_AGENT_DIRECTOR_SHIM_MARKER'
+
+# Bound on each tmux kill-server the trap sends, and on the scenario's tmux
+# processes exiting after it, in seconds.
+SCENARIO_TMUX_STOP_S=10
+
+# fmk mode: 1 when TEST_NAME carries `-fmk-` (set on source).
+SCENARIO_FMK=0
+
 _SCENARIO_STATE_DIRS=()   # every state dir a `start` ran in
 _SCENARIO_SERVER_PIDS=()  # daemon PIDs a start reported and no stop_server saw gone
 _SCENARIO_TRACKED_PIDS=() # background processes registered with track_pid
@@ -209,10 +342,35 @@ _SCENARIO_EXIT_HOOKS=()   # functions registered with on_exit
 _SCENARIO_LIVE=0          # 1 once a start ran with --live
 _SCENARIO_STATE_COUNT=0
 _SCENARIO_START_COUNT=0
+_SCENARIO_INSTALL_COUNT=0 # install.sh runs
+_SCENARIO_AD_COUNT=0      # ad_capture calls
 
 fail() {
     echo "FAIL: ${TEST_NAME}: $1" >&2
     exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Guards
+# ---------------------------------------------------------------------------
+
+require_ci_image() {
+    [[ -e /etc/cscb-ci-image ]] \
+        || fail "${1:-require_ci_image}: refused: /etc/cscb-ci-image is absent; this step runs only in a cscb-ci image"
+}
+
+require_scenario_home() {
+    local step="${1:-require_scenario_home}" real_root real_home
+    [[ -n "${SCENARIO_ROOT:-}" && -d "${SCENARIO_ROOT}" ]] \
+        || fail "${step}: refused: SCENARIO_ROOT '${SCENARIO_ROOT:-}' is not a directory"
+    [[ "${HOME:-}" == "${SCENARIO_ROOT}"/* ]] \
+        || fail "${step}: refused: HOME '${HOME:-}' is not under SCENARIO_ROOT ${SCENARIO_ROOT}"
+    real_root="$(realpath -e -- "${SCENARIO_ROOT}" 2> /dev/null)" \
+        || fail "${step}: refused: cannot resolve SCENARIO_ROOT ${SCENARIO_ROOT}"
+    real_home="$(realpath -e -- "${HOME}" 2> /dev/null)" \
+        || fail "${step}: refused: HOME ${HOME} does not exist"
+    [[ "${real_home}" == "${real_root}"/* ]] \
+        || fail "${step}: refused: HOME ${HOME} resolves to ${real_home}, which is not under SCENARIO_ROOT ${real_root}"
 }
 
 # ---------------------------------------------------------------------------
@@ -315,6 +473,40 @@ _scenario_stop_dir() {
     return 0
 }
 
+# Print the PID of every live process of the real tmux binary that is still
+# the scenario's own (fmk mode): its tmux server and any client left running.
+_scenario_tmux_pids() {
+    local proc
+    for proc in /proc/[0-9]*; do
+        [[ "${proc}/exe" -ef "${SCENARIO_REAL_TMUX}" ]] || continue
+        _scenario_pid_ours "${proc#/proc/}" && printf '%s\n' "${proc#/proc/}"
+    done
+    return 0
+}
+
+_scenario_tmux_gone() {
+    [[ -z "$(_scenario_tmux_pids)" ]]
+}
+
+# Stop the scenario's tmux server (fmk mode), with the real tmux: a bounded
+# kill-server on every tmux socket under SCENARIO_ROOT, then SIGKILL for any
+# of the scenario's tmux processes still running (a server whose socket was
+# moved or re-bound, say). True once none is left.
+_scenario_stop_tmux() {
+    local sock pid
+    [[ -n "${SCENARIO_REAL_TMUX:-}" ]] || return 0
+    if [[ -n "${SCENARIO_ROOT:-}" && -d "${SCENARIO_ROOT}" ]]; then
+        while IFS= read -r -d '' sock; do
+            timeout "${SCENARIO_TMUX_STOP_S}" "${SCENARIO_REAL_TMUX}" -S "${sock}" kill-server > /dev/null 2>&1
+        done < <(find "${SCENARIO_ROOT}" -type s -path '*/tmux-[0-9]*/*' -print0 2> /dev/null)
+    fi
+    _scenario_poll_until "${SCENARIO_TMUX_STOP_S}" _scenario_tmux_gone && return 0
+    for pid in $(_scenario_tmux_pids); do
+        kill -KILL "${pid}" 2> /dev/null
+    done
+    _scenario_poll_until 5 _scenario_tmux_gone
+}
+
 _scenario_cleanup() {
     local rc=$? dir pid hook hook_rc
     set +e
@@ -330,6 +522,14 @@ _scenario_cleanup() {
                 || { _scenario_pid_ours "${pid}" && kill -KILL "${pid}" 2>/dev/null; }
         fi
     done
+    if [[ "${SCENARIO_FMK}" == 1 ]] && ! _scenario_stop_tmux; then
+        if [[ "${rc}" -eq 0 ]]; then
+            echo "FAIL: ${TEST_NAME}: the scenario's tmux server outlived the trap's kill-server and SIGKILL" >&2
+            rc=1
+        else
+            echo "  | the scenario's tmux server also outlived the trap's kill-server and SIGKILL" >&2
+        fi
+    fi
     for hook in ${_SCENARIO_EXIT_HOOKS[@]+"${_SCENARIO_EXIT_HOOKS[@]}"}; do
         ( "${hook}" )
         hook_rc=$?
@@ -905,6 +1105,288 @@ count_token_like() {
 }
 
 # ---------------------------------------------------------------------------
+# agent-director install, shim and harness calls (fmk mode)
+# ---------------------------------------------------------------------------
+
+# True when <file> carries the shim's marker line.
+_scenario_is_shim() {
+    grep -qxF -- "${SCENARIO_AD_SHIM_MARKER}" "$1" 2> /dev/null
+}
+
+# _scenario_place <src> <dest> <step>: copy <src> beside <dest>, make it
+# 0755 and rename it over <dest>, so <dest> is never half written. Refuses
+# outside the image and for a <dest> outside SCENARIO_ROOT.
+_scenario_place() {
+    local src="$1" dest="$2" step="$3" tmp
+    require_ci_image "${step}"
+    [[ -n "${SCENARIO_ROOT:-}" && "${dest}" == "${SCENARIO_ROOT}"/* ]] \
+        || fail "${step}: refused: ${dest} is not under SCENARIO_ROOT ${SCENARIO_ROOT:-}"
+    tmp="$(mktemp "$(dirname "${dest}")/.scenario-place.XXXXXX")" \
+        || fail "${step}: could not create a temp file beside ${dest}"
+    cp -- "${src}" "${tmp}" || fail "${step}: could not copy ${src} beside ${dest}"
+    chmod 0755 "${tmp}" || fail "${step}: chmod 0755 failed beside ${dest}"
+    mv -f -- "${tmp}" "${dest}" || fail "${step}: could not rename into ${dest}"
+}
+
+check_ad_shim() {
+    local step="${1:-the agent-director shim check}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    local path="${HOME}/.agent-director/bin/agent-director"
+    local real="${path}.real"
+    [[ -e "${path}" || -L "${path}" ]] || fail "${step}: no file at ${path}"
+    [[ ! -L "${path}" ]] || fail "${step}: ${path} is a symlink, not the shim"
+    [[ -f "${path}" ]] || fail "${step}: ${path} is not a regular file"
+    _scenario_is_shim "${path}" || fail "${step}: ${path} does not carry the shim's marker"
+    [[ -x "${path}" ]] || fail "${step}: the shim at ${path} is not executable"
+    [[ -f "${real}" && ! -L "${real}" && -x "${real}" ]] \
+        || fail "${step}: no executable regular file behind the shim at ${real}"
+    ! _scenario_is_shim "${real}" || fail "${step}: the file behind the shim at ${real} is the shim itself"
+}
+
+install_ad_shim() {
+    local step="${1:-install the agent-director shim}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    local path="${HOME}/.agent-director/bin/agent-director"
+    [[ -f "${SCENARIO_AD_SHIM_SRC}" ]] && _scenario_is_shim "${SCENARIO_AD_SHIM_SRC}" \
+        || fail "${step}: the shim ${SCENARIO_AD_SHIM_SRC} is missing or carries no marker"
+    [[ -e "${path}" || -L "${path}" ]] || fail "${step}: no binary installed at ${path}"
+    [[ ! -L "${path}" ]] || fail "${step}: ${path} is a symlink, not an installed binary"
+    [[ -f "${path}" ]] || fail "${step}: ${path} is not a regular file"
+    ! _scenario_is_shim "${path}" || fail "${step}: ${path} is already the shim; no binary to put behind it"
+    # Copy the binary to .real, then rename the shim over the standard path:
+    # each is a copy-and-rename, so the standard path always holds the binary
+    # or the shim, and a failure at either leaves the binary in place.
+    _scenario_place "${path}" "${path}.real" "${step}"
+    _scenario_place "${SCENARIO_AD_SHIM_SRC}" "${path}" "${step}"
+    check_ad_shim "${step}"
+}
+
+reshim_ad() {
+    local step="${1:-re-shim after install.sh}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    install_ad_shim "${step}"
+}
+
+install_ad_rc() {
+    local step="${1:-install the release candidate with its install.sh}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    local rc=0 last
+    [[ -f "${SCENARIO_RC_INSTALL_SH}" && -x "${SCENARIO_RC_INSTALL_SH}" ]] \
+        || fail "${step}: the release candidate's install.sh is missing from the image (${SCENARIO_RC_INSTALL_SH})"
+    [[ -f "${SCENARIO_RC_BIN}" && -x "${SCENARIO_RC_BIN}" ]] \
+        || fail "${step}: the release candidate's binary is missing from the image (${SCENARIO_RC_BIN})"
+    _SCENARIO_INSTALL_COUNT=$(( _SCENARIO_INSTALL_COUNT + 1 ))
+    AD_INSTALL_OUT="${SCENARIO_ROOT}/install-sh.${_SCENARIO_INSTALL_COUNT}.out"
+    (cd "${HOME}" && "${SCENARIO_RC_INSTALL_SH}" --binary "${SCENARIO_RC_BIN}" --no-symlink --no-hooks) \
+        < /dev/null > "${AD_INSTALL_OUT}" 2>&1 || rc=$?
+    if [[ "${rc}" -ne 0 ]]; then
+        # Indented, so no line of it can pass for the runner's FAIL line.
+        sed 's/^/  | /' "${AD_INSTALL_OUT}" >&2
+        # install.sh starts its own error lines with `install.sh:`.
+        last="$(grep '^install\.sh:' "${AD_INSTALL_OUT}" | tail -n 1 || true)"
+        [[ -n "${last}" ]] || last="$(grep -v '^[[:space:]]*$' "${AD_INSTALL_OUT}" | tail -n 1 || true)"
+        fail "${step}: install.sh exited ${rc}: ${last:-no output}"
+    fi
+    reshim_ad "${step}: re-shim"
+}
+
+install_ad_010() {
+    local step="${1:-install agent-director 0.10.0}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    local root="${HOME}/.agent-director"
+    [[ -f "${SCENARIO_AD_010_BIN}" && -x "${SCENARIO_AD_010_BIN}" ]] \
+        || fail "${step}: agent-director 0.10.0's binary is missing from the image (${SCENARIO_AD_010_BIN})"
+    mkdir -p "${root}/bin" || fail "${step}: could not create ${root}/bin"
+    # Five-digit modes, as install.sh sets them: they also clear a setgid bit
+    # inherited from /tmp.
+    chmod 00700 "${root}" && chmod 00755 "${root}/bin" || fail "${step}: could not set the modes of ${root}"
+    _scenario_place "${SCENARIO_AD_010_BIN}" "${root}/bin/agent-director" "${step}"
+    install_ad_shim "${step}"
+}
+
+swap_ad_binary() {
+    local what="${1:-}"
+    local step="${2:-swap the binary behind the agent-director shim to ${1:-}}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    local src
+    case "${what}" in
+        rc) src="${SCENARIO_RC_BIN}" ;;
+        0.10.0) src="${SCENARIO_AD_010_BIN}" ;;
+        /*) src="${what}" ;;
+        *) fail "${step}: '${what}' is not rc, 0.10.0 or an absolute path" ;;
+    esac
+    [[ -f "${src}" && -x "${src}" ]] || fail "${step}: ${src} is not an executable file"
+    ! _scenario_is_shim "${src}" || fail "${step}: ${src} is the shim, not a binary"
+    check_ad_shim "${step}: the shim before the swap"
+    _scenario_place "${src}" "${HOME}/.agent-director/bin/agent-director.real" "${step}"
+    check_ad_shim "${step}"
+}
+
+hide_ad_install() {
+    local step="${1:-move the agent-director shim and binary aside}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    local path="${HOME}/.agent-director/bin/agent-director"
+    local aside="${SCENARIO_ROOT}/ad-aside"
+    [[ ! -e "${aside}" ]] || fail "${step}: ${aside} already exists (hidden twice?)"
+    check_ad_shim "${step}: the shim before hiding"
+    mkdir -p "${aside}" || fail "${step}: could not create ${aside}"
+    # The shim first, so the client never finds the standard path without it.
+    mv -- "${path}" "${aside}/agent-director" || fail "${step}: could not move ${path} aside"
+    if ! mv -- "${path}.real" "${aside}/agent-director.real"; then
+        # Put the shim back, so a failed hide leaves the install as it was.
+        mv -- "${aside}/agent-director" "${path}" && rmdir -- "${aside}" \
+            || fail "${step}: could not move ${path}.real aside, nor put the shim back from ${aside}: the install is half hidden"
+        fail "${step}: could not move ${path}.real aside (the shim is back at ${path})"
+    fi
+    [[ ! -e "${path}" && ! -L "${path}" ]] || fail "${step}: a file is still at ${path}"
+}
+
+restore_ad_install() {
+    local step="${1:-restore the agent-director shim and binary}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    local path="${HOME}/.agent-director/bin/agent-director"
+    local aside="${SCENARIO_ROOT}/ad-aside"
+    [[ -f "${aside}/agent-director" && -f "${aside}/agent-director.real" ]] \
+        || fail "${step}: nothing hidden in ${aside}"
+    [[ ! -e "${path}" && ! -L "${path}" ]] || fail "${step}: a file is already at ${path}"
+    # The binary first, so the shim never runs without one behind it.
+    mv -- "${aside}/agent-director.real" "${path}.real" || fail "${step}: could not restore ${path}.real"
+    if ! mv -- "${aside}/agent-director" "${path}"; then
+        # Move the binary aside again, so a failed restore leaves the install hidden.
+        mv -- "${path}.real" "${aside}/agent-director.real" \
+            || fail "${step}: could not restore ${path}, nor move ${path}.real back to ${aside}: the install is half restored"
+        fail "${step}: could not restore ${path} (the install is still hidden in ${aside})"
+    fi
+    rmdir -- "${aside}" || fail "${step}: could not remove ${aside}"
+    check_ad_shim "${step}"
+}
+
+ad() {
+    require_ci_image "ad $*"
+    require_scenario_home "ad $*"
+    "${HOME}/.agent-director/bin/agent-director" "$@"
+}
+
+ad_capture() {
+    require_ci_image "ad_capture $*"
+    require_scenario_home "ad_capture $*"
+    _SCENARIO_AD_COUNT=$(( _SCENARIO_AD_COUNT + 1 ))
+    AD_OUT="${SCENARIO_ROOT}/ad.${_SCENARIO_AD_COUNT}.out"
+    AD_ERR="${SCENARIO_ROOT}/ad.${_SCENARIO_AD_COUNT}.err"
+    AD_RC=0
+    "${HOME}/.agent-director/bin/agent-director" "$@" > "${AD_OUT}" 2> "${AD_ERR}" || AD_RC=$?
+}
+
+# ---------------------------------------------------------------------------
+# The scenario store
+# ---------------------------------------------------------------------------
+
+# Bound on waiting for agent-director's lock on the store, in milliseconds.
+SCENARIO_STORE_BUSY_MS=5000
+
+ad_store_edit() {
+    require_ci_image "ad_store_edit"
+    require_scenario_home "ad_store_edit"
+    local db="${HOME}/.agent-director/state.db" statement out
+    (( $# == 1 )) || fail "ad_store_edit: takes one statement, not $# arguments"
+    statement="$1"
+    # One statement: no `;` but an optional one at its end.
+    statement="${statement%"${statement##*[![:space:]]}"}"
+    statement="${statement%;}"
+    [[ "${statement}" =~ [^[:space:]] ]] || fail "ad_store_edit: the statement is empty"
+    [[ "${statement}" != *';'* ]] \
+        || fail "ad_store_edit: '$1' is more than one statement (a ';' before its end)"
+    [[ -f "${db}" ]] || fail "ad_store_edit: no store at ${db}"
+    out="$(sqlite3 -batch -bail -cmd ".timeout ${SCENARIO_STORE_BUSY_MS}" "${db}" "${statement};" 2>&1)" \
+        || fail "ad_store_edit: sqlite3 failed on '${statement}': ${out//$'\n'/ }"
+    if [[ -n "${out}" ]]; then
+        printf '%s\n' "${out}"
+    fi
+}
+
+ad_store_id() {
+    require_ci_image "ad_store_id"
+    require_scenario_home "ad_store_id"
+    local db="${HOME}/.agent-director/state.db" out
+    [[ -f "${db}" ]] || fail "ad_store_id: no store at ${db}"
+    out="$(sqlite3 -batch -bail -readonly -cmd ".timeout ${SCENARIO_STORE_BUSY_MS}" "${db}" \
+        "SELECT value FROM store_meta WHERE key = 'store_id';" 2>&1)" \
+        || fail "ad_store_id: ${db} has no readable store id (a store from before store ids, such as 0.10.0's, has no store_meta table): ${out//$'\n'/ }"
+    [[ -n "${out}" ]] || fail "ad_store_id: ${db}'s store_meta has no store_id row"
+    [[ "${out}" =~ ^[0-9a-f]{16}$ ]] \
+        || fail "ad_store_id: ${db}'s store id '${out//$'\n'/ }' is not 16 lowercase hex characters"
+    printf '%s\n' "${out}"
+}
+
+# ---------------------------------------------------------------------------
+# fmk mode setup
+# ---------------------------------------------------------------------------
+
+# Print PATH without relative or empty entries and without every directory
+# that holds an `agent-director`.
+_scenario_path_without_ad() {
+    local dirs=() keep=() dir
+    IFS=: read -r -a dirs <<< "${PATH}"
+    for dir in ${dirs[@]+"${dirs[@]}"}; do
+        [[ "${dir}" == /* ]] || continue
+        [[ -e "${dir}/agent-director" || -L "${dir}/agent-director" ]] && continue
+        keep+=("${dir}")
+    done
+    local IFS=:
+    printf '%s\n' "${keep[*]}"
+}
+
+_scenario_fmk_setup() {
+    case "${SCENARIO_AD_START:=rc}" in
+        rc | 0.10.0) ;;
+        *) fail "SCENARIO_AD_START '${SCENARIO_AD_START}' is neither rc nor 0.10.0" ;;
+    esac
+    SCENARIO_REAL_TMUX="$(command -v tmux || true)"
+    [[ "${SCENARIO_REAL_TMUX}" == /* ]] || fail "tmux not on PATH (base image prerequisite)"
+    command -v bun > /dev/null 2>&1 || fail "bun not on PATH (base image prerequisite)"
+    [[ -f "${SCENARIO_FIXTURES}/stub-claude.sh" ]] \
+        || fail "stub-claude fixture missing at ${SCENARIO_FIXTURES}/stub-claude.sh"
+
+    SCENARIO_HOME="${SCENARIO_ROOT}/home"
+    SCENARIO_BIN="${SCENARIO_ROOT}/bin"
+    mkdir -p "${SCENARIO_HOME}" "${SCENARIO_BIN}" "${SCENARIO_ROOT}/tmux" \
+        || fail "could not create the scenario's HOME, bin and tmux directories"
+    chmod 00700 "${SCENARIO_ROOT}/tmux" || fail "could not set the mode of ${SCENARIO_ROOT}/tmux"
+    _scenario_place "${SCENARIO_FIXTURES}/stub-claude.sh" "${SCENARIO_BIN}/claude" "the stub claude"
+
+    export HOME="${SCENARIO_HOME}"
+    export TMUX_TMPDIR="${SCENARIO_ROOT}/tmux"
+    unset TMUX TMUX_PANE
+    PATH="${SCENARIO_BIN}:$(_scenario_path_without_ad)"
+    export PATH
+    hash -r
+
+    ! command -v agent-director > /dev/null 2>&1 \
+        || fail "an agent-director is still on the scenario's PATH: $(command -v agent-director)"
+    command -v bun > /dev/null 2>&1 || fail "bun dropped from the scenario's PATH"
+    [[ "$(command -v claude || true)" == "${SCENARIO_BIN}/claude" ]] \
+        || fail "claude resolves to '$(command -v claude || true)', not the stub ${SCENARIO_BIN}/claude"
+
+    SCENARIO_AD_BIN="${HOME}/.agent-director/bin/agent-director"
+    SCENARIO_AD_SHIM_LOG="${HOME}/.agent-director/bin/agent-director-shim.log"
+    if [[ "${SCENARIO_AD_START}" == 0.10.0 ]]; then
+        install_ad_010 "fmk setup: install agent-director 0.10.0"
+    else
+        install_ad_rc "fmk setup: install the release candidate"
+        [[ -f "${HOME}/.agent-director/state.db" ]] \
+            || fail "fmk setup: the release candidate's install.sh made no store at ${HOME}/.agent-director/state.db"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Setup (runs on source)
 # ---------------------------------------------------------------------------
 
@@ -924,6 +1406,13 @@ export SCENARIO_ROOT
 trap _scenario_cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+if [[ "${TEST_NAME}" == *-fmk-* ]]; then
+    SCENARIO_FMK=1
+    _scenario_fmk_setup
+elif [[ -n "${SCENARIO_AD_START:-}" ]]; then
+    fail "SCENARIO_AD_START is for fmk scripts only (a TEST_NAME carrying -fmk-)"
+fi
 
 new_state_dir main
 SCENARIO_PORT="$(free_port)"

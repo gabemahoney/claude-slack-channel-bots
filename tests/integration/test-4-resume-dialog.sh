@@ -27,6 +27,12 @@
 # Requires tmux in the image (docker/Dockerfile.test.base).
 #
 # Depends on Test 1 having installed the package tarball into /test-repo.
+# Runs only in a cscb-ci image: without its marker, refuse before any other step.
+if [[ ! -e /etc/cscb-ci-image ]]; then
+    echo "FAIL: test-4-resume-dialog: refused: /etc/cscb-ci-image is absent; this test runs only in a cscb-ci image (/ci)" >&2
+    exit 1
+fi
+
 set -euo pipefail
 
 TEST_NAME="test-4-resume-dialog"
