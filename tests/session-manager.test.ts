@@ -1141,6 +1141,8 @@ import {
   personaOf as harnessPersona,
   holdSequenceReuse,
   launchThroughSequence,
+  putAtRestartCap,
+  recheckAtCapLinesOf,
   recordCallOrder,
   retryNow,
   reuseSpawnOf,
@@ -1269,8 +1271,10 @@ import {
   type LatchRecheckLineStep,
 } from '../src/conflict-latch.ts'
 import {
+  LATCH_RECHECK_AT_CAP,
   LATCH_RECHECK_OBSERVER_FAILED,
   LATCH_RECHECK_STATUS_READ_SITE,
+  latchRecheckAtCapLine,
   latchedElsewhereDuringCallLine,
   latchRecheckCollidedAfterClearLine,
   latchRecheckCollisionNoInformationLine,
@@ -31909,13 +31913,15 @@ function expectRecheckCleared(h: RecoveryHarness, p: string): void {
 /**
  * P stays latched with `record` unchanged and no new latch event, its timer
  * armed for the next round; nothing armed, started, raised (CONFIG's outage
- * aside) or fed for it, and nothing counted (b.jg5 SRJ-505, AC 71).
+ * aside) or fed for it, and nothing counted: its restart failure count is
+ * still `failures`, 0 unless the case put P at the cap (b.jg5 SRJ-505,
+ * AC 71).
  */
-function expectRecheckStillLatched(h: RecoveryHarness, p: string, record: ConflictLatchRecord, eventsBefore: number): void {
+function expectRecheckStillLatched(h: RecoveryHarness, p: string, record: ConflictLatchRecord, eventsBefore: number, failures = 0): void {
   expect(h.latch.record(p)).toStrictEqual(record)
   expect(h.latchEvents.slice(eventsBefore).filter((event) => event.step !== 'set' && event.step !== 'hold')).toEqual([])
   expect(h.latchRecheck.isArmed(p)).toBe(true)
-  expect([h.controller.isArmed(p), h.triggers.filter((t) => t.key === p), getFailureCount(p)]).toEqual([false, [], 0])
+  expect([h.controller.isArmed(p), h.triggers.filter((t) => t.key === p), getFailureCount(p)]).toEqual([false, [], failures])
   expect([h.tmuxUnresponsive.holds(p), conditionStartedLines(h, p), h.unclassifiedErrorOpen(p), unclassifiedStartedLines(h, p)]).toEqual([false, [], false, []])
   expect(h.notices.filter((notice) => notice.key === p)).toEqual([])
 }
@@ -32706,6 +32712,169 @@ describe('b.jg5 SRJ-505, SRJ-207, SRJ-810, b.av2 SR-6.4: a re-check retry stoppe
     expect([h.latchEvents.length, h.episodeNotices.length]).toEqual([eventsBefore, postsBefore])
     expect([h.controller.isArmed(p), h.triggers.slice(triggersBefore)]).toEqual([false, []])
     await gate.release?.()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Bug b.xkd (b.av2 SR-6.3; b.jg5 SRJ-505, SRJ-506): the restart cap wins over
+// the re-check. A latched persona at the restart cap still gets its reads
+// (step 1's, and the finished-row retry's `get`), so a read can still clear
+// its latch, but no launch from any retry site and no run of the restart
+// path's decision: one line where that call would have been made, and the
+// round's answer `no-information (at-cap)`, so P stays latched with no post
+// until a human releases it or the cap resets. The cap is asked first, before
+// the relaunch gate; a query that throws counts as at the cap, and none given
+// as no persona at it. The bound timer's rounds run on the harness's binding,
+// as main() passes it (`isAtCap` at RESTART_FAILURE_CAP over the real
+// counter); the query's own answers are driven at the handler level. Below
+// the cap each site launches as before: each site's one launch above, the
+// counted-failure cases above (at one failure below it), the cap query
+// answering false here, and the cap's reset in tests/conflict-latch.test.ts.
+// The cleared probe's single retry at the cap, a step-1 clear at the cap and
+// the clear by hand of a capped P are tests/conflict-latch.test.ts's.
+// ---------------------------------------------------------------------------
+
+/** The one round line for persona `key` answering `no-information (at-cap)`. */
+function atCapRoundLine(key: string, latchCase: LatchCase, step: LatchRecheckLineStep, call: string): string {
+  return latchRecheckRoundLine(renderPersonaRef(key, key), latchCase, step, call, `no-information (${LATCH_RECHECK_AT_CAP})`)
+}
+
+describe('bug b.xkd (b.av2 SR-6.3; b.jg5 SRJ-505, SRJ-506): the restart cap wins over the re-check — a latched P at the cap gets its reads but no launch and no run of the restart path\'s decision, and stays latched with no post', () => {
+  afterEach(() => {
+    expectNoKillOrDelete(srj105Harness!)
+    srj105AfterEach()
+  })
+
+  test.each(RECHECK_RETRY_SITES.map((site) => [site.name, site] as const))('at %s: at the cap, its reads only, one cap line and the round line no-information (at-cap), P latched with no post and B untouched', async (_name, site) => {
+    const { h, p, b } = srj105Build({ latchRecheck: true })
+    putAtRestartCap(p)
+    const record = latchForRecheck(h, p, site.latch, site.recorded)
+    h.script(site.script(h, p))
+    const eventsBefore = h.latchEvents.length
+    const postsBefore = h.episodeNotices.length
+    const order = recordCallOrder(h)
+
+    await h.advanceToRecheck()
+
+    expect(order).toEqual([...site.before])
+    expect(recheckAtCapLinesOf(h, p)).toEqual([latchRecheckAtCapLine(renderPersonaRef(p, p), site.launch)])
+    expect(recheckRoundLinesOf(h, p)).toEqual([atCapRoundLine(p, site.latch.latchCase, site.step, site.call)])
+    expectRecheckStillLatched(h, p, record, eventsBefore, RESTART_FAILURE_CAP)
+    expect([h.latchEvents.length, h.episodeNotices.length, h.capReached, personaCallCounts(h, b)]).toEqual([eventsBefore, postsBefore, [], {}])
+  })
+
+  test('a bring-up latch (its call the run of the restart path\'s decision): at the cap, step 1\'s read only (no run, so no liveness read and no launch), one cap line naming the run and the round line no-information (at-cap), P latched with no post and B untouched', async () => {
+    const { h, p, b } = srj105Build({ latchRecheck: true })
+    putAtRestartCap(p)
+    const record = latchForRecheck(h, p, BRING_UP_RECHECK_LATCH, ROW_WAITING)
+    h.script(step1Status(LIVENESS_DEAD_ROW_ENDED))
+    const eventsBefore = h.latchEvents.length
+    const postsBefore = h.episodeNotices.length
+    const order = recordCallOrder(h)
+
+    await h.advanceToRecheck()
+
+    expect(order).toEqual(['status'])
+    expect(recheckAtCapLinesOf(h, p)).toEqual([latchRecheckAtCapLine(renderPersonaRef(p, p), RECHECK_CALL_RESTART_DECISION)])
+    expect(recheckRoundLinesOf(h, p)).toEqual([atCapRoundLine(p, LATCH_CASE_NO_VALID_ID, RECHECK_STEP_TABLE, RECHECK_CALL_RESTART_DECISION)])
+    expectRecheckStillLatched(h, p, record, eventsBefore, RESTART_FAILURE_CAP)
+    expect([h.latchEvents.length, h.episodeNotices.length, h.capReached, personaCallCounts(h, b)]).toEqual([eventsBefore, postsBefore, [], {}])
+  })
+
+  /**
+   * The cap query a case injects (none: no query given), whether it puts P at
+   * the cap, and whether P's real failure count is put at the cap first. With
+   * no query given the round asks nothing about the cap, so even a real count
+   * at it means not at the cap.
+   */
+  const CAP_QUERIES: ReadonlyArray<readonly [string, ((key: string) => boolean) | undefined, boolean, boolean]> = [
+    ['none given, P\'s real count at the cap (no persona is at the cap)', undefined, false, true],
+    ['answering false', () => false, false, false],
+    ['answering true', () => true, true, false],
+    [
+      'throwing (counted as at the cap)',
+      () => {
+        throw new Error('the restart cap could not be read')
+      },
+      true,
+      false,
+    ],
+  ]
+
+  test.each(CAP_QUERIES)('a reuse retry, the cap query %s: asked once for P, before the relaunch gate; at the cap no launch, the relaunch gate never asked, one cap line, no-information (at-cap) and no hand-off; otherwise the reuse, which clears', async (_label, query, capped, countAtCap) => {
+    const { h, p } = srj105Build()
+    if (countAtCap) putAtRestartCap(p)
+    const record = latchForRecheckUnbound(h, p, REUSE_RECHECK_LATCH, ROW_ENDED)
+    h.script(step1Status(LIVENESS_DEAD_ROW_ENDED))
+    const postsBefore = h.episodeNotices.length
+    const order = recordCallOrder(h)
+    const asked: string[] = []
+
+    const handOffs = await roundRecordingHandOff(h, p, order, {
+      canRelaunch: (key) => {
+        asked.push(`up ${key}`)
+        return true
+      },
+      ...(query === undefined
+        ? {}
+        : {
+            isAtCap: (key: string) => {
+              asked.push(`cap ${key}`)
+              return query(key)
+            },
+          }),
+    })
+
+    if (capped) {
+      expect([asked, order, handOffs]).toEqual([[`cap ${p}`], ['status'], []])
+      expect(recheckAtCapLinesOf(h, p)).toEqual([latchRecheckAtCapLine(renderPersonaRef(p, p), RECHECK_CALL_REUSE_SPAWN)])
+      expect(recheckRoundLinesOf(h, p)).toEqual([atCapRoundLine(p, LATCH_CASE_NO_VALID_ID, RECHECK_STEP_TABLE, RECHECK_CALL_REUSE_SPAWN)])
+      expect([h.latch.record(p), h.episodeNotices.length, h.stub.calls.spawnCalls]).toEqual([record, postsBefore, []])
+    } else {
+      expect(asked).toEqual(query === undefined ? [`up ${p}`] : [`cap ${p}`, `up ${p}`])
+      expect(recheckRoundCalls(order)).toEqual(['status', 'spawn'])
+      expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, p)])
+      expect(handOffs.map((handOff) => handOff.cleared.by)).toEqual([RECHECK_CLEARED_BY_RETRY])
+      expect(recheckAtCapLinesOf(h, p)).toEqual([])
+      if (h.approverRunning(p)) await h.runApproverToStop(p)
+    }
+  })
+
+  test.each(CAP_QUERIES.filter(([, query]) => query !== undefined))('a bring-up latch\'s run of the restart path\'s decision, the cap query %s: at the cap no run and no set observer added, one cap line naming the run, no-information (at-cap) and no hand-off; otherwise the one run, which clears', async (_label, query, capped) => {
+    const { h, p } = srj105Build()
+    const record = latchForRecheckUnbound(h, p, BRING_UP_RECHECK_LATCH, ROW_WAITING)
+    h.script(step1Status(cannedStatusResult().state))
+    const order = recordCallOrder(h)
+    const { latch } = observedLatch(h)
+    let added = 0
+    const runs: string[] = []
+
+    const handOffs = await roundRecordingHandOff(h, p, order, {
+      latch: {
+        ...latch,
+        addSetObserver: (observer) => {
+          added++
+          return latch.addSetObserver(observer)
+        },
+      },
+      isAtCap: query,
+      runRestartDecision: async (key) => {
+        runs.push(key)
+        return RESTART_OUTCOME_LAUNCHED
+      },
+    })
+
+    expect(order).toEqual(['status'])
+    if (capped) {
+      expect([runs, added, handOffs]).toEqual([[], 0, []])
+      expect(recheckAtCapLinesOf(h, p)).toEqual([latchRecheckAtCapLine(renderPersonaRef(p, p), RECHECK_CALL_RESTART_DECISION)])
+      expect(recheckRoundLinesOf(h, p)).toEqual([atCapRoundLine(p, LATCH_CASE_NO_VALID_ID, RECHECK_STEP_TABLE, RECHECK_CALL_RESTART_DECISION)])
+      expect(h.latch.record(p)).toStrictEqual(record)
+    } else {
+      expect([runs, added]).toEqual([[p], 1])
+      expect(handOffs.map((handOff) => handOff.cleared.by)).toEqual([RECHECK_CLEARED_BY_RESTART_DECISION])
+      expect(recheckAtCapLinesOf(h, p)).toEqual([])
+    }
   })
 })
 
