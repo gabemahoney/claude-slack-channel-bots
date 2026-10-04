@@ -95,7 +95,7 @@
  * and no episode begun while the injected `tmux-unavailable` query answers
  * raised or throws; `closed` after `close()`; a submitted teardown mutes the
  * post, which still counts; an episodes call that throws answers
- * suppressed; two personas are independent; one line per call, from the
+ * failed, never the gate's suppressed; two personas are independent; one line per call, from the
  * exported line builders. The episode-end predicate's table. `assertNoLeak`
  * over every text and line, with a key carrying a fake token (masked by
  * `withoutName`), a raw launch start carrying one, and thrown values
@@ -141,6 +141,47 @@
  * tests/unavailable-retry.test.ts's, tests/server.test.ts's,
  * tests/restart.test.ts's and tests/session-manager.test.ts's.
  *
+ * CSCB's own stuck launch, one abort per stuck-launch episode (b.jg5
+ * SRJ-412; AC 9, AC 31, AC 48, AC 67, AC 84). `createStuckLaunchAbort` over
+ * fake dependencies (the relaunching text's real poster over a real
+ * episodes instance): the post, the approver's stop, the kill and the
+ * sequence's start in order, one line each; each kill answer, whether it
+ * uses the abort (`stuckLaunchAbortKillUsesAbort`) and what the round
+ * answers; Q-12's same abort with no second post after a kill that did
+ * nothing or was stopped; no abort once used, until the episode's end (a
+ * live read, P's teardown) disposes of the state; no abort without the post
+ * (suppressed, closed, failed, no episode open); one abort in progress at a
+ * time; the latch and both outages asked again after the approver's stop,
+ * a throwing query taken as raised; a rejecting stop or kill kept with its
+ * redacted line and the next call aborting. Then on `makeRecoveryHarness`
+ * with `harnessNow` and the own-launch drivers (`launchOwnPending`,
+ * `scriptModelLaunch`, `launchByAnotherProcess`, `driveToB`): a resumed own
+ * launch at an unrecognised prompt, judged at B or in neither list, gets one
+ * relaunching post, one kill (`kill_sent` true), the sequence from step 2 and
+ * the `resume` of the same row with nothing counted; a timed-out launch
+ * inside its window is aborted, its `kill_sent` false going on to the
+ * sequence; a launch whose approver's or lap's `send-keys` met
+ * `ErrSpawnNotInteractive`, another process's launch and a launch start
+ * before or after its window get the held post and no kill; the relaunch
+ * still `pending` at its B gets the held text once and no kill; the abort
+ * kill's `ErrTmuxKillFailed` (3 tries, 2 s apart, one alert with the
+ * 'stuck-launch abort' context, the held text once at the next retry), each
+ * CONFLICT and UNUSABLE NAME row of `conflict-cases.ts` (a latch with one
+ * post, never retried, the kill backstop included), UNAVAILABLE from the
+ * approver's stop and from a retry (`tmux-unresponsive` or the arm, hatch
+ * A2, then the same abort with no second post), `ErrTmuxNotAvailable` (the
+ * same abort only once a lap clears the outage), CONFIG (the abort waits for
+ * the clear), a survivor-naming failure then a non-success (one alert), and
+ * tries stopped because P stopped being up (no alert, the abort unused);
+ * no launch or delete after any non-success; neither text and no kill while
+ * a lap's `tmux-unavailable` is raised at B, nor for P latched; a server
+ * restart forgets the record; the sequence's SRJ-717 stop (no alert, the
+ * held text once after) and its step-5 alert with the abort's context; a
+ * running approver stopped with `stuck-launch-abort` and no rule run after
+ * that stop. The own-launch record's set and forget points and the abort
+ * kill's typed answers are tests/session-manager.test.ts's; the approver's
+ * stop reason is tests/approve-trust-folder-dialog.test.ts's.
+ *
  * SPDX-License-Identifier: MIT
  */
 
@@ -180,9 +221,36 @@ import {
   STUCK_LAUNCH_MARK_RELAUNCHING,
   STUCK_LAUNCH_NOT_POSTED_CLOSED,
   STUCK_LAUNCH_NOT_STARTED_BY_CSCB_CLAUSE,
+  STUCK_LAUNCH_POST_FAILED,
   STUCK_LAUNCH_POSTED,
   STUCK_LAUNCH_RELAUNCHING_HEAD,
   STUCK_LAUNCH_SUPPRESSED,
+  STUCK_LAUNCH_ABORT_KEPT_KILL_FAILED,
+  STUCK_LAUNCH_ABORT_KEPT_STOPPED,
+  STUCK_LAUNCH_ABORT_KEPT_TRY_LATER,
+  STUCK_LAUNCH_ABORT_KILL_FAILED,
+  STUCK_LAUNCH_ABORT_KILL_LATCHED,
+  STUCK_LAUNCH_ABORT_KILL_STOPPED,
+  STUCK_LAUNCH_ABORT_KILL_SUCCEEDED,
+  STUCK_LAUNCH_ABORT_KILL_TRY_LATER,
+  STUCK_LAUNCH_ABORT_SEQUENCE_NOT_STARTED,
+  STUCK_LAUNCH_ABORT_SEQUENCE_STARTED,
+  STUCK_LAUNCH_ABORT_SKIP_CONFIG_MALFORMED,
+  STUCK_LAUNCH_ABORT_SKIP_EARLIER_ABORT,
+  STUCK_LAUNCH_ABORT_SKIP_IN_PROGRESS,
+  STUCK_LAUNCH_ABORT_SKIP_NO_EPISODE,
+  STUCK_LAUNCH_ABORT_SKIP_POST_FAILED,
+  STUCK_LAUNCH_ABORT_SKIP_SHUTDOWN,
+  STUCK_LAUNCH_ABORT_SKIP_TMUX_UNAVAILABLE,
+  createStuckLaunchAbort,
+  stuckLaunchAbortKillLine,
+  stuckLaunchAbortKillUsesAbort,
+  stuckLaunchAbortSequenceLine,
+  stuckLaunchAbortSkippedLine,
+  stuckLaunchAbortStartedLine,
+  type StuckLaunchAbortDeps,
+  type StuckLaunchAbortKillAnswer,
+  type StuckLaunchAbortSequenceStart,
   stuckLaunchAttachRemedyLine,
   stuckLaunchEndRowLiveReason,
   stuckLaunchEpisodeEndedLine,
@@ -258,6 +326,8 @@ import {
   PENDING_ROW_READING_RUN_REFUSED,
   PENDING_ROW_READING_UNKNOWN_STATE,
   PENDING_ROW_RELAUNCH_KEPT,
+  PENDING_ROW_RELAUNCH_LATCHED,
+  PENDING_ROW_RELAUNCH_SEQUENCE_STARTED,
   PENDING_ROW_RULE_GONE,
   PENDING_ROW_RULE_HELD,
   PENDING_ROW_RULE_LATCHED,
@@ -285,6 +355,7 @@ import {
   type PendingRowLapEnterOutcome,
   type PendingRowLapNext,
   type PendingRowOwnLaunchHooks,
+  type PendingRowRelaunchAnswer,
   type PendingRowRuleAnswer,
   type PendingRowRuleDeps,
   type PendingRowRuleGet,
@@ -312,8 +383,13 @@ import {
   type PaneReadOutcome,
 } from '../src/pane-read.ts'
 import { getOutageFlags } from '../src/outage-state.ts'
+import type { ConflictLatchRecord } from '../src/conflict-latch.ts'
 import { OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL } from '../src/retired-keys.ts'
-import { KILL_FAILURE_CONTEXT_RECOVERY } from '../src/kill-failure-alert.ts'
+import { KILL_FAILURE_CLOSING_DESTINATION, KILL_FAILURE_CONTEXT_RECOVERY, KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT } from '../src/kill-failure-alert.ts'
+import { KILL_RETRY_SPACING_MS, KILL_RETRY_TRIES } from '../src/kill-retry.ts'
+import { describeKillOutcome, KILL_OUTCOME_KILLED } from '../src/checked-kill.ts'
+import { LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT } from '../src/ad-error-class.ts'
+import { getFailureCount } from '../src/backoff.ts'
 import { LIVE_ROW_SEQUENCE_ENTRY_KILL, LIVE_ROW_START_STARTED, type LiveRowSequenceRequest } from '../src/live-row-sequence.ts'
 import {
   CONFIG_DIR_LABEL_PREFIX,
@@ -331,6 +407,10 @@ import {
   _resetFindMissingMemo,
   _setConfigDirFs,
   _setFindMissingMemoTtlMs,
+  APPROVER_STOP_STUCK_LAUNCH_ABORT,
+  isCscbOwnLaunch,
+  LAUNCH_CALL_END_LAUNCH_TIMEOUT,
+  ownLaunchRecordOf,
   paneShowsStartupDialog,
   PENDING_ROW_STEP_LATCHED,
   pendingRowComparisonFor,
@@ -365,7 +445,9 @@ import {
   errSpawnNotFound,
   errSpawnNotInteractive,
   errSpawnNotInteractiveNoLaunchStart,
+  cannedKillResult,
   errTmuxCaptureFailed,
+  errTmuxKillFailed,
   errTmuxNotAvailable,
   errTmuxSendKeys,
   errTmuxSessionConflict,
@@ -402,6 +484,9 @@ import { writeAgentDirectorConfig, type AdConfigTables } from './test-helpers/ad
 import {
   CSCB_OWN_LINE_FORBIDDEN,
   cscbOwnLineForbiddenIn,
+  expectedLatchRecord,
+  STUCK_LAUNCH_ABORT_CONFLICT_CASE_ROWS,
+  STUCK_LAUNCH_ABORT_UNUSABLE_NAME_CASE_ROWS,
   LAUNCH_START_CASE_ROWS,
   SESSION_ENDING_COMMAND_FORMS,
   sessionEndingCommandsIn,
@@ -409,12 +494,21 @@ import {
 import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, sentinelInMessage, withoutName } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import {
+  adConfigMalformedRaiseLines,
+  driveToB,
   expectPendingOnlyWatch,
+  killFailureLines,
+  killFailureNotice,
+  killFailurePostedLine,
+  launchByAnotherProcess,
+  launchOwnPending,
   makeRecoveryHarness,
+  ordinaryAlertContent,
   personaOf,
   personaRow,
   recordSequenceStarts,
   retryNow,
+  scriptModelLaunch,
   type RecoveryHarness,
   type RecoveryHarnessOptions,
 } from './test-helpers/recovery-harness.ts'
@@ -1757,7 +1851,7 @@ describe('the stuck-launch posters: closed episodes, a submitted teardown, and f
     expect(rig.episodeLines).toHaveLength(1)
   })
 
-  test('an episodes call that throws: suppressed, with its one line, and nothing posted', () => {
+  test('an episodes call that throws: failed (never suppressed, the tmux-unavailable gate\'s answer), with its one line, and nothing posted', () => {
     const err = new Error(`episodes refused (${sentinelInMessage('episodes')})`)
     const posts: string[] = []
     const episodes: StuckLaunchPostEpisodes = {
@@ -1773,7 +1867,8 @@ describe('the stuck-launch posters: closed episodes, a submitted teardown, and f
     const lines: string[] = []
     const deps: StuckLaunchPosterDeps = { episodes, tmuxUnavailableRaised: () => false, log: (line) => void lines.push(line) }
 
-    for (const text of TEXT_CASES) expect(text.post(deps, P)).toBe(STUCK_LAUNCH_SUPPRESSED)
+    for (const text of TEXT_CASES) expect(text.post(deps, P)).toBe(STUCK_LAUNCH_POST_FAILED)
+    expect(STUCK_LAUNCH_POST_FAILED).not.toBe(STUCK_LAUNCH_SUPPRESSED)
 
     expect(posts).toEqual([])
     expect(lines).toEqual(TEXT_CASES.map(() => stuckLaunchPostFailedLine(P, describeThrownValue(err))))
@@ -1817,7 +1912,7 @@ describe('assertNoLeak over the stuck-launch texts and lines (b.jg5 SRJ-1017)', 
       stuckLaunchRelaunchingText(key, adLaunchBoundMsInEffect()),
       ...HELD_FORMS.map(([, flagged]) => stuckLaunchHeldText(key, POSTED_LAUNCH_START, flagged)),
     ]
-    const answers: StuckLaunchPostAnswer[] = [STUCK_LAUNCH_POSTED, STUCK_LAUNCH_ALREADY_POSTED, STUCK_LAUNCH_SUPPRESSED, STUCK_LAUNCH_NOT_POSTED_CLOSED]
+    const answers: StuckLaunchPostAnswer[] = [STUCK_LAUNCH_POSTED, STUCK_LAUNCH_ALREADY_POSTED, STUCK_LAUNCH_SUPPRESSED, STUCK_LAUNCH_NOT_POSTED_CLOSED, STUCK_LAUNCH_POST_FAILED]
     const lines = [
       ...TEXT_CASES.flatMap((text) => answers.map((answer) => posterLine(key, text, answer))),
       posterLine(key, RELAUNCHING, STUCK_LAUNCH_POSTED, true),
@@ -2517,6 +2612,28 @@ describe('the pending-row rule\'s step 3 at B: the held post, never a kill; noth
         expect([relaunched, rig.posts]).toEqual([[], []])
     }
   })
+
+  // AC 84; SRJ-316, SRJ-410 step 3, SRJ-412: on the harness every successful
+  // call clears ad-config-malformed before step 3, so the gate is pinned here
+  // over the real abort with its outage held raised across rounds.
+  test('CSCB\'s own launch at B over the real abort while ad-config-malformed stays raised: no relaunching or held post, no stop or kill, the abort not used, at every round; once it clears, the relaunching post and the one abort', async () => {
+    const abort = abortRig()
+    abort.flags.configMalformed = true
+    const rig = ruleRig({ ownLaunch: abort.abort, isConfigMalformedRaised: () => abort.flags.configMalformed }, atB)
+
+    for (const origin of [PENDING_ROW_RULE_ORIGIN_APPROVER_STOP, PENDING_ROW_RULE_ORIGIN_RETRY, PENDING_ROW_RULE_ORIGIN_RETRY] as const) {
+      expect(await rig.rule.run(ruleInput({ origin }))).toEqual(refusalOf(PENDING_ROW_STEP3_CONFIG_MALFORMED))
+    }
+    expect([abort.calls, abort.posters.posts, rig.posts, abort.abort.isAbortUsed(P)]).toEqual([[], [], [], false])
+    expect(abort.posters.episodes.isOpen(P, PERSONA_EPISODE_KIND_STUCK_LAUNCH)).toBe(false)
+
+    abort.flags.configMalformed = false
+    expect(await rig.rule.run(ruleInput())).toEqual({ kind: PENDING_ROW_RULE_RELAUNCH, answer: { kind: PENDING_ROW_RELAUNCH_SEQUENCE_STARTED } })
+    expect(abort.calls).toEqual(['stop', 'kill', 'sequence'])
+    expect(abort.posters.posts).toEqual([{ key: P, text: RELAUNCHING.text(P) }])
+    expect(rig.posts).toEqual([])
+    expect(abort.abort.isAbortUsed(P)).toBe(true)
+  })
 })
 
 describe('the pending-row rule never rejects: a dependency that throws ends the round with one line (b.jg5 SRJ-410)', () => {
@@ -2539,6 +2656,268 @@ describe('the pending-row rule never rejects: a dependency that throws ends the 
 })
 
 // ---------------------------------------------------------------------------
+// The abort of CSCB's own stuck launch over injected dependencies (b.jg5 SRJ-412)
+// ---------------------------------------------------------------------------
+
+/** A step of the abort that reaches its dependencies: the approver's stop, the kill, the sequence's start. */
+type AbortCall = 'stop' | 'kill' | 'sequence'
+
+/** A rig over the abort's injected dependencies: a real episodes instance (the posters' rig), the outages and the latch the case sets, scripted kill answers. */
+interface AbortRig {
+  readonly abort: ReturnType<typeof createStuckLaunchAbort>
+  /** The posters' rig: its episodes, its posts and its lines (the abort logs to the same lines). */
+  readonly posters: PosterRig
+  readonly calls: AbortCall[]
+  /** P latched, and P's `ad-config-malformed` outage raised (the posters' rig holds `tmux-unavailable`). */
+  readonly flags: { latched: boolean; configMalformed: boolean }
+}
+
+/** A kill answer of `kind` (`try-later` as UNAVAILABLE), with a fixed description. */
+function abortKillAnswer(kind: StuckLaunchAbortKillAnswer['kind'], killSent?: boolean): StuckLaunchAbortKillAnswer {
+  const description = `the case's ${kind} outcome`
+  if (kind === STUCK_LAUNCH_ABORT_KILL_TRY_LATER) return { kind, errorClass: 'UNAVAILABLE', description }
+  if (kind === STUCK_LAUNCH_ABORT_KILL_SUCCEEDED && killSent !== undefined) return { kind, killSent, description }
+  return { kind, description } as StuckLaunchAbortKillAnswer
+}
+
+/**
+ * The abort for {@link P} over fake dependencies: P's launch own, not
+ * latched, no outage; the relaunching text's real poster over the posters'
+ * rig (B in effect); the approver's stop recorded; each kill answering the
+ * next of `kills` (then success with `kill_sent` true); the sequence started.
+ * `overrides` replace any of them.
+ */
+function abortRig(kills: StuckLaunchAbortKillAnswer[] = [], overrides: Partial<StuckLaunchAbortDeps> = {}): AbortRig {
+  const posters = posterRig()
+  const calls: AbortCall[] = []
+  const flags = { latched: false, configMalformed: false }
+  const deps: StuckLaunchAbortDeps = {
+    log: posters.deps.log,
+    isOwnLaunch: () => true,
+    isLatched: () => flags.latched,
+    isTmuxUnavailableRaised: (key) => posters.raised.has(key),
+    isConfigMalformedRaised: () => flags.configMalformed,
+    postRelaunching: (key) => postStuckLaunchRelaunching(posters.deps, key, adLaunchBoundMsInEffect()),
+    episodes: posters.episodes,
+    stopApprover: async () => {
+      calls.push('stop')
+    },
+    abortKill: async () => {
+      calls.push('kill')
+      return kills.shift() ?? abortKillAnswer(STUCK_LAUNCH_ABORT_KILL_SUCCEEDED, true)
+    },
+    startSequence: (): StuckLaunchAbortSequenceStart => {
+      calls.push('sequence')
+      return { kind: STUCK_LAUNCH_ABORT_SEQUENCE_STARTED }
+    },
+    ...overrides,
+  }
+  return { abort: createStuckLaunchAbort(deps), posters, calls, flags }
+}
+
+/** The abort's relaunch of P on {@link RULE_START}. */
+const relaunchOf = (rig: AbortRig) => rig.abort.relaunch(P, RULE_REF, RULE_START)
+
+/** A kept answer with `why`. */
+const keptFor = (why: string): PendingRowRelaunchAnswer => ({ kind: PENDING_ROW_RELAUNCH_KEPT, why })
+
+/** The fixed start of the abort's kill line for `answer` (everything before what follows). */
+const abortKillLineStart = (answer: StuckLaunchAbortKillAnswer, key = P): string => stuckLaunchAbortKillLine(key, answer, '').split(' — ')[0]!
+
+describe('createStuckLaunchAbort: the relaunching post, the approver stopped, one checked kill, then the sequence from step 2; one abort per stuck-launch episode (b.jg5 SRJ-412, SRJ-1017; AC 9, AC 67)', () => {
+  test('a success with kill_sent true: the relaunching post, then the approver\'s stop, the kill and the sequence\'s start, in order; "sequence started"; the abort used; one line per step', async () => {
+    const rig = abortRig()
+    const killed = abortKillAnswer(STUCK_LAUNCH_ABORT_KILL_SUCCEEDED, true)
+
+    expect(await relaunchOf(rig)).toEqual({ kind: PENDING_ROW_RELAUNCH_SEQUENCE_STARTED })
+
+    expect(rig.calls).toEqual(['stop', 'kill', 'sequence'])
+    expect(rig.posters.posts).toEqual([{ key: P, text: RELAUNCHING.text(P) }])
+    expect(rig.abort.isAbortUsed(P)).toBe(true)
+    const [post, started, kill, sequence, ...rest] = rig.posters.lines
+    expect([post, started, sequence, rest]).toEqual([
+      posterLine(P, RELAUNCHING, STUCK_LAUNCH_POSTED),
+      stuckLaunchAbortStartedLine(P, RULE_REF, RULE_START),
+      stuckLaunchAbortSequenceLine(P, { kind: STUCK_LAUNCH_ABORT_SEQUENCE_STARTED }),
+      [],
+    ])
+    expect(started).toContain(describeLaunchStartForLog(RULE_START))
+    expect(kill!.startsWith(abortKillLineStart(killed))).toBe(true)
+  })
+
+  test.each<[string, StuckLaunchAbortKillAnswer, StuckLaunchAbortSequenceStart | undefined, unknown, boolean]>([
+    ['a success with kill_sent false: the sequence', abortKillAnswer(STUCK_LAUNCH_ABORT_KILL_SUCCEEDED, false), undefined, { kind: PENDING_ROW_RELAUNCH_SEQUENCE_STARTED }, true],
+    ['a success whose sequence did not start: kept, the abort used', abortKillAnswer(STUCK_LAUNCH_ABORT_KILL_SUCCEEDED, true), { kind: STUCK_LAUNCH_ABORT_SEQUENCE_NOT_STARTED, why: 'held' }, { kind: PENDING_ROW_RELAUNCH_KEPT, why: expect.stringContaining('(held)') }, true],
+    ['ErrTmuxKillFailed after its tries: kept, the abort used, no sequence', abortKillAnswer(STUCK_LAUNCH_ABORT_KILL_FAILED), undefined, keptFor(STUCK_LAUNCH_ABORT_KEPT_KILL_FAILED), true],
+    ['a latch (CONFLICT, UNUSABLE NAME): latched, the abort used, no sequence', abortKillAnswer(STUCK_LAUNCH_ABORT_KILL_LATCHED), undefined, { kind: PENDING_ROW_RELAUNCH_LATCHED }, true],
+    ['a kill that did nothing (Q-12): kept, the abort not used, no sequence', abortKillAnswer(STUCK_LAUNCH_ABORT_KILL_TRY_LATER), undefined, keptFor(STUCK_LAUNCH_ABORT_KEPT_TRY_LATER), false],
+    ['tries SRJ-702\'s stop rule stopped: kept, the abort not used, no sequence', abortKillAnswer(STUCK_LAUNCH_ABORT_KILL_STOPPED), undefined, keptFor(STUCK_LAUNCH_ABORT_KEPT_STOPPED), false],
+  ])('the kill answering %s', async (_label, killed, sequence, answer, used) => {
+    const rig = abortRig([killed], sequence === undefined ? {} : { startSequence: () => (rig.calls.push('sequence'), sequence) })
+
+    expect(await relaunchOf(rig)).toEqual(answer as Awaited<ReturnType<typeof relaunchOf>>)
+
+    expect(stuckLaunchAbortKillUsesAbort(killed)).toBe(used)
+    expect(rig.abort.isAbortUsed(P)).toBe(used)
+    expect(rig.calls).toEqual(killed.kind === STUCK_LAUNCH_ABORT_KILL_SUCCEEDED ? ['stop', 'kill', 'sequence'] : ['stop', 'kill'])
+    expect(rig.posters.lines.filter((line) => line.startsWith(abortKillLineStart(killed)))).toHaveLength(1)
+  })
+
+  test('a kill that did nothing, then the next call: the same abort, with no second relaunching post (Q-12); a success then uses it', async () => {
+    const rig = abortRig([abortKillAnswer(STUCK_LAUNCH_ABORT_KILL_TRY_LATER), abortKillAnswer(STUCK_LAUNCH_ABORT_KILL_STOPPED)])
+
+    expect(await relaunchOf(rig)).toEqual(keptFor(STUCK_LAUNCH_ABORT_KEPT_TRY_LATER))
+    expect(await relaunchOf(rig)).toEqual(keptFor(STUCK_LAUNCH_ABORT_KEPT_STOPPED))
+    expect(rig.abort.isAbortAvailable(P)).toBe(true)
+    expect(await relaunchOf(rig)).toEqual({ kind: PENDING_ROW_RELAUNCH_SEQUENCE_STARTED })
+
+    expect(rig.calls).toEqual(['stop', 'kill', 'stop', 'kill', 'stop', 'kill', 'sequence'])
+    expect(rig.posters.posts).toEqual([{ key: P, text: RELAUNCHING.text(P) }])
+    expect(rig.posters.lines.filter((line) => line === posterLine(P, RELAUNCHING, STUCK_LAUNCH_ALREADY_POSTED))).toHaveLength(2)
+  })
+
+  test('once the abort is used: the abort is not available (one line per ask), and a further relaunch makes no kill; Q\'s abort is its own', async () => {
+    const rig = abortRig()
+    expect(rig.abort.isAbortAvailable(P)).toBe(true)
+    expect(rig.posters.lines).toEqual([])
+    await relaunchOf(rig)
+    const lines = rig.posters.lines.length
+
+    expect(rig.abort.isAbortAvailable(P)).toBe(false)
+    expect(rig.posters.lines.slice(lines)).toEqual([stuckLaunchAbortSkippedLine(P, STUCK_LAUNCH_ABORT_SKIP_EARLIER_ABORT)])
+    expect(await relaunchOf(rig)).toEqual(keptFor(STUCK_LAUNCH_ABORT_SKIP_EARLIER_ABORT))
+    expect([rig.abort.isAbortAvailable(Q), rig.abort.isAbortUsed(Q)]).toEqual([true, false])
+
+    expect(rig.calls).toEqual(['stop', 'kill', 'sequence'])
+    expect(rig.posters.posts).toEqual([{ key: P, text: RELAUNCHING.text(P) }])
+  })
+
+  test.each<[string, (rig: AbortRig) => void]>([
+    ['a read of the row live out of pending', (rig) => void endStuckLaunchEpisode(rig.posters.episodes, P, stuckLaunchEndRowLiveReason(LIVE_OUT_OF_PENDING), rig.posters.deps.log)],
+    ['P\'s teardown (the episodes forget P)', (rig) => rig.posters.episodes.forget(P)],
+  ])('the episode\'s end at %s disposes of its abort state: a new episode posts the relaunching text and aborts again', async (_label, end) => {
+    const rig = abortRig()
+    await relaunchOf(rig)
+    end(rig)
+
+    expect([rig.abort.isAbortUsed(P), rig.abort.isAbortAvailable(P)]).toEqual([false, true])
+    expect(await relaunchOf(rig)).toEqual({ kind: PENDING_ROW_RELAUNCH_SEQUENCE_STARTED })
+    expect(rig.calls).toEqual(['stop', 'kill', 'sequence', 'stop', 'kill', 'sequence'])
+    expect(rig.posters.posts).toEqual([
+      { key: P, text: RELAUNCHING.text(P) },
+      { key: P, text: RELAUNCHING.text(P) },
+    ])
+  })
+
+  test.each<[string, (rig: AbortRig) => void, Partial<StuckLaunchAbortDeps>, string]>([
+    ['P\'s tmux-unavailable outage raised (suppressed)', (rig) => void rig.posters.raised.add(P), {}, STUCK_LAUNCH_ABORT_SKIP_TMUX_UNAVAILABLE],
+    ['the episodes closed (shutdown)', (rig) => rig.posters.episodes.close(), {}, STUCK_LAUNCH_ABORT_SKIP_SHUTDOWN],
+    ['an episodes call that threw (failed)', () => {}, { postRelaunching: () => STUCK_LAUNCH_POST_FAILED }, STUCK_LAUNCH_ABORT_SKIP_POST_FAILED],
+    ['a post with no stuck-launch episode open to hold the abort', () => {}, { postRelaunching: () => STUCK_LAUNCH_POSTED }, STUCK_LAUNCH_ABORT_SKIP_NO_EPISODE],
+  ])('no abort without the relaunching post: %s: kept with its one line; no stop, kill or sequence; the abort not used', async (_label, arrange, overrides, why) => {
+    const rig = abortRig([], overrides)
+    arrange(rig)
+
+    expect(await relaunchOf(rig)).toEqual(keptFor(why))
+
+    expect(rig.calls).toEqual([])
+    expect(rig.posters.posts).toEqual([])
+    expect(rig.posters.lines.at(-1)).toBe(stuckLaunchAbortSkippedLine(P, why))
+    expect(rig.abort.isAbortUsed(P)).toBe(false)
+  })
+
+  test('an abort of P in progress: a second call makes no post, stop or kill, with its line; the first then ends as before', async () => {
+    let release!: (answer: StuckLaunchAbortKillAnswer) => void
+    const rig = abortRig([], {
+      abortKill: () => {
+        rig.calls.push('kill')
+        return new Promise((resolve) => (release = resolve))
+      },
+    })
+    const first = relaunchOf(rig)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(rig.calls).toEqual(['stop', 'kill'])
+
+    expect(await relaunchOf(rig)).toEqual(keptFor(STUCK_LAUNCH_ABORT_SKIP_IN_PROGRESS))
+    expect(rig.posters.lines.at(-1)).toBe(stuckLaunchAbortSkippedLine(P, STUCK_LAUNCH_ABORT_SKIP_IN_PROGRESS))
+    release(abortKillAnswer(STUCK_LAUNCH_ABORT_KILL_SUCCEEDED, true))
+
+    expect(await first).toEqual({ kind: PENDING_ROW_RELAUNCH_SEQUENCE_STARTED })
+    expect(rig.calls).toEqual(['stop', 'kill', 'sequence'])
+    expect(rig.posters.posts).toHaveLength(1)
+  })
+
+  const throwing = (): never => {
+    throw new Error('query failed')
+  }
+
+  test.each<[string, (rig: AbortRig) => void, Partial<StuckLaunchAbortDeps>, unknown]>([
+    ['P latched while its approver stopped (SRJ-502)', (rig) => void (rig.flags.latched = true), {}, { kind: PENDING_ROW_RELAUNCH_LATCHED }],
+    ['a latched query that throws: taken as latched', () => {}, { isLatched: throwing }, { kind: PENDING_ROW_RELAUNCH_LATCHED }],
+    ['tmux-unavailable raised while its approver stopped', (rig) => void rig.posters.raised.add(P), {}, keptFor(STUCK_LAUNCH_ABORT_SKIP_TMUX_UNAVAILABLE)],
+    ['a tmux-unavailable query that throws: taken as raised', () => {}, { isTmuxUnavailableRaised: throwing }, keptFor(STUCK_LAUNCH_ABORT_SKIP_TMUX_UNAVAILABLE)],
+    ['ad-config-malformed raised while its approver stopped (SRJ-316: no kill of a row read pending)', (rig) => void (rig.flags.configMalformed = true), {}, keptFor(STUCK_LAUNCH_ABORT_SKIP_CONFIG_MALFORMED)],
+    ['an ad-config-malformed query that throws: taken as raised', () => {}, { isConfigMalformedRaised: throwing }, keptFor(STUCK_LAUNCH_ABORT_SKIP_CONFIG_MALFORMED)],
+  ])('asked again after the approver\'s stop: %s: no kill, the abort not used', async (_label, onStop, overrides, answer) => {
+    const rig = abortRig([], {
+      stopApprover: async () => {
+        rig.calls.push('stop')
+        onStop(rig)
+      },
+      ...overrides,
+    })
+
+    expect(await relaunchOf(rig)).toEqual(answer as Awaited<ReturnType<typeof relaunchOf>>)
+
+    expect(rig.calls).toEqual(['stop'])
+    expect(rig.posters.posts).toEqual([{ key: P, text: RELAUNCHING.text(P) }])
+    expect(rig.abort.isAbortUsed(P)).toBe(false)
+  })
+
+  test.each<[string, AbortCall]>([
+    ['the approver\'s stop', 'stop'],
+    ['the kill', 'kill'],
+  ])('%s rejecting: never rejects; kept with its redacted line; the abort not used, and the next call aborts', async (_label, failing) => {
+    let failed = false
+    const failOnce = (): void => {
+      if (failed) return
+      failed = true
+      throw new Error(`${failing} failed (${sentinelInMessage(`abort ${failing}`)})`)
+    }
+    const rig = abortRig([], {
+      stopApprover: async () => {
+        rig.calls.push('stop')
+        if (failing === 'stop') failOnce()
+      },
+      abortKill: async () => {
+        rig.calls.push('kill')
+        if (failing === 'kill') failOnce()
+        return abortKillAnswer(STUCK_LAUNCH_ABORT_KILL_SUCCEEDED, true)
+      },
+    })
+
+    const answer = await relaunchOf(rig)
+    expect(answer).toEqual({ kind: PENDING_ROW_RELAUNCH_KEPT, why: expect.stringContaining('the abort failed: ') })
+    expect(rig.posters.lines.at(-1)).toBe(stuckLaunchAbortSkippedLine(P, (answer as { why: string }).why))
+    expect(rig.abort.isAbortUsed(P)).toBe(false)
+    assertNoLeak(rig.posters.lines)
+
+    expect(await relaunchOf(rig)).toEqual({ kind: PENDING_ROW_RELAUNCH_SEQUENCE_STARTED })
+    expect(rig.calls.slice(-3)).toEqual(['stop', 'kill', 'sequence'])
+    expect(rig.posters.posts).toHaveLength(1)
+  })
+
+  test('the own-launch query: passed P\'s key and the launch start as read now; a throw is not own', () => {
+    const asked: unknown[] = []
+    const own = abortRig([], { isOwnLaunch: (key, start) => (asked.push([key, start]), true) }).abort
+    expect(own.isOwnLaunch(P, RULE_START)).toBe(true)
+    expect(asked).toEqual([[P, RULE_START]])
+    expect(abortRig([], { isOwnLaunch: throwing }).abort.isOwnLaunch(P, RULE_START)).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // The pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC 32, AC 33, AC 84)
 // ---------------------------------------------------------------------------
 
@@ -2555,7 +2934,7 @@ function ruleHarnessOf(options: RecoveryHarnessOptions = {}): { h: RecoveryHarne
 }
 
 /** Replace the model's knob `name` with `wrap` over it (the model's own answer stays reachable). */
-function wrapModelKnob<K extends 'spawnFn' | 'getFn' | 'readPaneFn' | 'findMissingFn'>(
+function wrapModelKnob<K extends 'spawnFn' | 'getFn' | 'readPaneFn' | 'findMissingFn' | 'killFn'>(
   h: RecoveryHarness,
   name: K,
   wrap: (model: NonNullable<StubClientOptions[K]>) => NonNullable<StubClientOptions[K]>,
@@ -2681,22 +3060,35 @@ function ruleLinesOf(h: RecoveryHarness, p: string, origin: PendingRowInputOrigi
 /** A rule input's origin. */
 type PendingRowInputOrigin = PendingRowRuleInput['origin']
 
+/** The rule's next lap read-pane (P's approver not running) answers `make()`; every other read-pane is the model's. */
+function failNextLapRead(h: RecoveryHarness, p: string, make: () => Error): void {
+  let armed = true
+  wrapModelKnob(h, 'readPaneFn', (modelReadPane) => (params) => {
+    if (!armed || !isLapRead(params) || h.approverRunning(p)) return modelReadPane(params)
+    armed = false
+    return make()
+  })
+}
+
 /** The launch-path verbs that must never reach a `pending` row: no kill and no launch over it. */
 const KILL_OR_LAUNCH: readonly PendingRowModelVerb[] = ['kill', 'spawn', 'resume']
 
+/** `afterEach` of the rule's harness cases: the seams reset, the case's harness leak-checked and cleaned up. */
+function cleanUpRuleHarness(): void {
+  const h = ruleHarness
+  ruleHarness = undefined
+  _resetConfigDirFs()
+  _resetFindMissingMemo()
+  if (h === undefined) return
+  try {
+    assertNoLeak(h.captured())
+  } finally {
+    h.cleanup()
+  }
+}
+
 describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC 32, AC 33, AC 84)', () => {
-  afterEach(() => {
-    const h = ruleHarness
-    ruleHarness = undefined
-    _resetConfigDirFs()
-    _resetFindMissingMemo()
-    if (h === undefined) return
-    try {
-      assertNoLeak(h.captured())
-    } finally {
-      h.cleanup()
-    }
-  })
+  afterEach(cleanUpRuleHarness)
 
   // AC 30, SRJ-410, SRJ-405, SRJ-1010.
   test.each(RULE_ORIGINS)('AC 30, %s: nothing before G; from G a lap and a bypassing run, then the get, on the timer; nothing more before B; waits doubling to the ceiling; one held post at B naming the session; no kill or launch while pending; the post is the persona\'s only notice; brought up once marked missing', async (_name, origin) => {
@@ -3095,16 +3487,6 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     ['UNCLASSIFIED opens P\'s unclassified-error episode', () => unclassifiedAt('read-pane'), (h, p) => h.unclassifiedErrorOpen(p)],
   ]
 
-  /** The rule's next lap read-pane (P's approver not running) answers `make()`; every other read-pane is the model's. */
-  function failNextLapRead(h: RecoveryHarness, p: string, make: () => Error): void {
-    let armed = true
-    wrapModelKnob(h, 'readPaneFn', (modelReadPane) => (params) => {
-      if (!armed || !isLapRead(params) || h.approverRunning(p)) return modelReadPane(params)
-      armed = false
-      return make()
-    })
-  }
-
   test.each(ATTEMPT_ANSWERS)('at a retry, the lap\'s read-pane answering %s; the run still follows', async (_label, make, holds) => {
     const { h, p } = ruleHarnessOf()
     const row = await ORIGIN_START_PASS.begin(h, p, { dialog: PENDING_ROW_DIALOG_UNRECOGNISED })
@@ -3194,5 +3576,528 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     await h.settle()
     expect(h.stub.calls.readPaneCalls!.filter(isLapRead)).toHaveLength(1)
     expect(ruleLinesOf(h, p)).toHaveLength(1)
+  })
+})
+
+
+// ---------------------------------------------------------------------------
+// CSCB's own stuck launch at B on the recovery harness (b.jg5 SRJ-412; AC 9, AC 31, AC 48, AC 67, AC 84)
+// ---------------------------------------------------------------------------
+
+/** The session id of the row CSCB's own launch resumed, so the abort's sequence ends in a `resume` that keeps it. */
+const OWN_SESSION_ID = 'a-resumed-session'
+
+/** P's relaunching text with B in effect. */
+const relaunchingTextOf = (p: string): string => stuckLaunchRelaunchingText(p, adLaunchBoundMsInEffect())
+
+/** P's stuck-launch relaunching posts in `h`. */
+const relaunchingPostsOf = (h: RecoveryHarness, p: string): string[] =>
+  h.episodeNotices.filter((notice) => notice.key === p && notice.text === relaunchingTextOf(p)).map((notice) => notice.text)
+
+/** Where the abort's round runs from: P's approver stopping at B, or a retry of P's timer (its approver stopped at the stub's cap). */
+const ABORT_ORIGIN_APPROVER_STOP = 'the approver\'s stop at B'
+const ABORT_ORIGIN_RETRY = 'a retry of P\'s timer'
+type AbortOrigin = typeof ABORT_ORIGIN_APPROVER_STOP | typeof ABORT_ORIGIN_RETRY
+const ABORT_ORIGINS: readonly AbortOrigin[] = [ABORT_ORIGIN_APPROVER_STOP, ABORT_ORIGIN_RETRY]
+
+/**
+ * An own-launch harness (`harnessNow`, both settings 0) and P's model: a
+ * finished row with a session id whose pane shows a prompt no approver
+ * clears, the start pass's spawn colliding with it, so P's launch is a
+ * `resume` of that row (`options` merged in). From
+ * {@link ABORT_ORIGIN_APPROVER_STOP} the approver runs to B (no test cap);
+ * from {@link ABORT_ORIGIN_RETRY} it stops at the stub's cap and P's timer
+ * runs the rule.
+ */
+function ownStuckLaunchOf(
+  options: PendingRowModelOptions = {},
+  origin: AbortOrigin = ABORT_ORIGIN_APPROVER_STOP,
+  harness: RecoveryHarnessOptions = {},
+): { h: RecoveryHarness; p: string; row: PendingRowModel } {
+  const { h, p } = ruleHarnessOf({ harnessNow: true, ...harness })
+  if (origin === ABORT_ORIGIN_APPROVER_STOP) h.setApproverCap(undefined)
+  const row = makePendingRowModel(h, p, {
+    state: LIVENESS_DEAD_ROW_ENDED,
+    sessionId: OWN_SESSION_ID,
+    dialog: PENDING_ROW_DIALOG_UNRECOGNISED,
+    launches: [errInstanceIdCollision()],
+    ...options,
+  })
+  return { h, p, row }
+}
+
+/** One retry of P's timer, its abort kill's waits between tries and any sequence it started driven on the harness clock; answers the retry's time. */
+async function retryDriven(h: RecoveryHarness, p: string): Promise<number> {
+  const at = await h.drive(retryNow(h, p, { settle: false }))
+  await h.drive(h.settle())
+  await h.driveSequence(h.sequenceSettled(p))
+  return at
+}
+
+/** Retry P's timer until its next retry is the first at or past B from the row's launch start now; answers that B. */
+async function retryUntilB(h: RecoveryHarness, p: string, row: PendingRowModel): Promise<number> {
+  const atB = row.launchStartMs()! + adLaunchBoundMsInEffect()
+  while (h.controller.view(p)!.dueAt! < atB) await retryDriven(h, p)
+  return atB
+}
+
+/** Drive P's row to B from `origin`: the approver's stop at B, or the first retry at or past B. Answers the clock time of the round at B. */
+async function abortRoundAtB(h: RecoveryHarness, p: string, row: PendingRowModel, origin: AbortOrigin): Promise<number> {
+  if (origin === ABORT_ORIGIN_RETRY) {
+    await retryUntilB(h, p, row)
+    return retryDriven(h, p)
+  }
+  const atB = row.launchStartMs()! + adLaunchBoundMsInEffect()
+  await driveToB(h, row)
+  await h.driveSequence(h.sequenceSettled(p))
+  return atB
+}
+
+/** P's model with no row, so P's launch is a plain spawn the case may time (`scriptModelLaunch`). */
+const PLAIN_SPAWN_LAUNCH: PendingRowModelOptions = { state: PENDING_ROW_MODEL_NO_ROW, launches: [] }
+
+/** The model's verbs at or after `fromMs`, without the dialog approver's laps (each a `status` and a `read-pane` while one runs). */
+const roundVerbsFrom = (h: RecoveryHarness, row: PendingRowModel, fromMs: number): PendingRowModelVerb[] =>
+  row.calls.filter((call) => call.at >= fromMs).map((call) => call.verb)
+
+/** The abort's sequence from step 2 after its one kill: a get, a run, a get, then the `resume` keeping the conversation. */
+const ABORT_ROUND_TO_RESUME: PendingRowModelVerb[] = ['read-pane', 'find-missing', 'get', 'kill', 'get', 'find-missing', 'get', 'resume']
+
+/** P's model calls of a launch or a delete (no `delete` is modelled: the stub's own record is read too). */
+const launchesOf = (row: PendingRowModel): PendingRowModelVerb[] => row.calls.filter((call) => call.verb === 'spawn' || call.verb === 'resume').map((call) => call.verb)
+
+/** P's abort kill lines in `h`, each up to what follows (its kind and the kill's described outcome). */
+function abortKillLinesOf(h: RecoveryHarness, p: string): string[] {
+  const head = stuckLaunchAbortKillLine(p, abortKillAnswer(STUCK_LAUNCH_ABORT_KILL_FAILED), '').split(STUCK_LAUNCH_ABORT_KILL_FAILED)[0]!
+  return h.errors.filter((line) => line.startsWith(head)).map((line) => line.split(' — ')[0]!)
+}
+
+/** The start of P's abort kill line for a success with `kill_sent` as given, its outcome described by `src/checked-kill.ts`. */
+const killedLineStart = (p: string, killSent: boolean): string =>
+  abortKillLineStart({ kind: STUCK_LAUNCH_ABORT_KILL_SUCCEEDED, killSent, description: describeKillOutcome({ kind: KILL_OUTCOME_KILLED, killSent }) }, p)
+
+/** P's kill-failure alerts with the abort's context as the alerts' own lines record them. */
+const abortAlertLinesOf = (h: RecoveryHarness, p: string): string[] =>
+  killFailureLines(h, p).filter((line) => line.includes(`(${KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT}`))
+
+/** Everything P's destination got that is not a stuck-launch text: the alerts, the latch notices and any other notice. */
+const otherNoticesOf = (h: RecoveryHarness, p: string): string[] =>
+  noticesOf(h, p).filter((text) => text !== relaunchingTextOf(p) && !text.startsWith(STUCK_LAUNCH_HELD_HEAD))
+
+describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill, the live-row sequence from step 2 (recovery harness; b.jg5 SRJ-412; AC 9, AC 31, AC 48, AC 67, AC 84)', () => {
+  afterEach(cleanUpRuleHarness)
+
+  // AC 9; AC 84 and SRJ-410 step 2 / SRJ-1426: at B, judged or not, the own launch is aborted.
+  test.each<[string, PendingRowModelOptions['judgment']]>([
+    ['its runs leaving the row in neither ids nor unverified_ids', judgeNotJudged],
+    ['its runs judging it and leaving it live (unverified_ids)', judgeUnverified],
+  ])('AC 9, a resumed launch CSCB started, held at an unrecognised prompt, %s: at B one relaunching post, one kill with kill_sent true, the sequence from step 2 (no step-1 kill) and a resume of the same row; nothing counted', async (_label, judgment) => {
+    const { h, p, row } = ownStuckLaunchOf({ judgment })
+    const launchStart = await launchOwnPending(h, row)
+    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: row.instanceId }])
+
+    const atB = await abortRoundAtB(h, p, row, ABORT_ORIGIN_APPROVER_STOP)
+
+    expect(atB).toBe(parseLaunchStart(launchStart)! + adLaunchBoundMsInEffect())
+    expect(roundVerbsFrom(h, row, atB).slice(0, ABORT_ROUND_TO_RESUME.length)).toEqual(ABORT_ROUND_TO_RESUME)
+    expect(row.callTimes('kill')).toEqual([atB])
+    expect(abortKillLinesOf(h, p)).toEqual([killedLineStart(p, true)])
+    // The resume of the same row (its session id kept), and no reuse spawn or delete.
+    expect(row.getRow().claude_session_id).toBe(OWN_SESSION_ID)
+    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: row.instanceId }, { claude_instance_id: row.instanceId }])
+    expect([h.reuseSpawns(), h.stub.calls.deleteCalls]).toEqual([[], []])
+    expect(relaunchingPostsOf(h, p)).toEqual([relaunchingTextOf(p)])
+    expect([heldPostsOf(h, p), otherNoticesOf(h, p), getFailureCount(p)]).toEqual([[], [], 0])
+    expect(h.stuckLaunchAbortUsed(p)).toBe(true)
+    // The relaunch is pending, CSCB's own, its approver at its first lap.
+    expect([row.state(), row.launchStartMs(), isCscbOwnLaunch(p, row.launchStartedAt())]).toEqual([AGENT_DIRECTOR_PENDING_STATE, atB, true])
+  })
+
+  // AC 84 (SRJ-410; HO C21 steps 2 and 3), the own-launch half at non-default
+  // G (the held half is in the rule's harness describe above).
+  test.each<[string, bigint, PendingRowModelOptions['judgment']]>([
+    ['pending_grace_seconds at its minimum, the runs leaving the row in neither list', pendingGraceMinimumSeconds(DEFAULT_AD_SETTINGS.tmux.create_timeout_ms, DEFAULT_AD_SETTINGS.tmux.pipe_close_wait_ms), judgeNotJudged],
+    ['pending_grace_seconds 400 (B 460 s), the runs leaving the row in neither list', 400n, judgeNotJudged],
+    ['pending_grace_seconds 400 (B 460 s), the runs judging the row (unverified_ids) while it stays pending', 400n, judgeUnverified],
+  ])('AC 84, CSCB\'s own stuck launch with %s: no post, kill or alert before B while the retries run; at B, judged or not, one relaunching post and one abort, no held post', async (_label, graceSeconds, judgment) => {
+    expect(graceSeconds).not.toBe(DEFAULT_AD_SETTINGS.tmux.pending_grace_seconds)
+    const { h, p, row } = ownStuckLaunchOf({ judgment }, ABORT_ORIGIN_RETRY, { adSettings: { tmux: { pending_grace_seconds: graceSeconds } } })
+    expect(adGraceMsInEffect()).toBe(Number(graceSeconds) * MS_PER_SECOND)
+    await launchOwnPending(h, row)
+    const launchStartMs = row.launchStartMs()!
+
+    const atB = await retryUntilB(h, p, row)
+
+    expect(h.callTimes('findMissing').some((at) => at >= launchStartMs + adGraceMsInEffect() && at < atB)).toBe(true)
+    expect([relaunchingPostsOf(h, p), heldPostsOf(h, p), otherNoticesOf(h, p), row.callTimes('kill')]).toEqual([[], [], [], []])
+    expect(h.stuckLaunchAbortUsed(p)).toBe(false)
+
+    const roundAt = await retryDriven(h, p)
+
+    expect(roundAt).toBeGreaterThanOrEqual(atB)
+    expect(row.callTimes('kill')).toEqual([roundAt])
+    expect(relaunchingPostsOf(h, p)).toEqual([relaunchingTextOf(p)])
+    expect([heldPostsOf(h, p), otherNoticesOf(h, p), getFailureCount(p)]).toEqual([[], [], 0])
+    expect(h.stuckLaunchAbortUsed(p)).toBe(true)
+  })
+
+  // AC 31: a timed-out launch inside its window is CSCB's own; a kill_sent false success goes on to the sequence.
+  test('AC 31, a launch that timed out with its launch start inside its window: aborted at B; its kill answering kill_sent false goes on to the sequence and its resume', async () => {
+    const { h, p, row } = ownStuckLaunchOf({ ...PLAIN_SPAWN_LAUNCH, kill: [cannedKillResult(false)] })
+    scriptModelLaunch(h, row, { takesMs: MINUTE_MS, end: LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT })
+    await launchOwnPending(h, row)
+    expect(ownLaunchRecordOf(p)?.window.end).toBe(LAUNCH_CALL_END_LAUNCH_TIMEOUT)
+
+    const atB = await abortRoundAtB(h, p, row, ABORT_ORIGIN_APPROVER_STOP)
+
+    expect(row.callTimes('kill')).toEqual([atB])
+    expect(abortKillLinesOf(h, p)).toEqual([killedLineStart(p, false)])
+    expect(roundVerbsFrom(h, row, atB).slice(0, ABORT_ROUND_TO_RESUME.length)).toEqual(ABORT_ROUND_TO_RESUME)
+    expect(relaunchingPostsOf(h, p)).toEqual([relaunchingTextOf(p)])
+    expect(heldPostsOf(h, p)).toEqual([])
+  })
+
+  // AC 9, AC 31, AC 48: every other pending row at B gets the held post and is never killed.
+  type NotOwnArrange = (h: RecoveryHarness, p: string, row: PendingRowModel) => Promise<void>
+  test.each<[string, PendingRowModelOptions, NotOwnArrange, boolean]>([
+    [
+      'the approver\'s send-keys answered ErrSpawnNotInteractive (R13)',
+      { dialogOnLaunch: PENDING_ROW_DIALOG_TRUST, sendKeys: [errSpawnNotInteractive('send-keys')] },
+      async (h, p) => {
+        await h.launch(p)
+        await h.settle()
+        expect(ownLaunchRecordOf(p)).toBeDefined()
+      },
+      true,
+    ],
+    [
+      'a lap\'s send-keys answered ErrSpawnNotInteractive (R13)',
+      {},
+      async (h, _p, row) => {
+        await launchOwnPending(h, row)
+        row.setDialog(PENDING_ROW_DIALOG_TRUST)
+        row.scriptSendKeys(errSpawnNotInteractive('send-keys'))
+      },
+      true,
+    ],
+    [
+      'another process\'s launch over CSCB\'s own (AC 48)',
+      {},
+      async (h, _p, row) => {
+        await launchOwnPending(h, row)
+        await h.advance(MS_PER_SECOND)
+        launchByAnotherProcess(h, row)
+      },
+      false,
+    ],
+    ...(['before', 'after'] as const).map((placement): [string, PendingRowModelOptions, NotOwnArrange, boolean] => [
+      `a launch whose launch start lies ${placement} its call's window (AC 31)`,
+      PLAIN_SPAWN_LAUNCH,
+      async (h, p, row) => {
+        scriptModelLaunch(h, row, { takesMs: MINUTE_MS, launchStart: placement })
+        await h.launch(p)
+        await h.settle()
+        expect(ownLaunchRecordOf(p)).toBeUndefined()
+      },
+      false,
+    ]),
+  ])('%s: at B the held post, with no relaunching post and no kill', async (_label, model, arrange, flagged) => {
+    const { h, p, row } = ownStuckLaunchOf(model, ABORT_ORIGIN_RETRY)
+    await arrange(h, p, row)
+    const launches = launchesOf(row)
+
+    await abortRoundAtB(h, p, row, ABORT_ORIGIN_RETRY)
+    await retryDriven(h, p)
+
+    expect([row.state(), isCscbOwnLaunch(p, row.launchStartedAt())]).toEqual([AGENT_DIRECTOR_PENDING_STATE, false])
+    expect(heldPostsOf(h, p)).toEqual([stuckLaunchHeldText(p, row.launchStartedAt(), flagged)])
+    expect([relaunchingPostsOf(h, p), row.callTimes('kill'), launchesOf(row)]).toEqual([[], [], launches])
+  })
+
+  // SRJ-1017's Test clause; SRJ-412: at most one abort per stuck-launch episode.
+  test('a relaunch still pending at B in the same episode: the held text once and no kill, and no second relaunching post', async () => {
+    const { h, p, row } = ownStuckLaunchOf()
+    await launchOwnPending(h, row)
+    await abortRoundAtB(h, p, row, ABORT_ORIGIN_APPROVER_STOP)
+    const relaunchStart = row.launchStartedAt()
+    expect(isCscbOwnLaunch(p, relaunchStart)).toBe(true)
+
+    await abortRoundAtB(h, p, row, ABORT_ORIGIN_APPROVER_STOP)
+    await retryDriven(h, p)
+
+    expect(row.launchStartedAt()).toBe(relaunchStart)
+    expect(heldPostsOf(h, p)).toEqual([stuckLaunchHeldText(p, relaunchStart, false)])
+    expect(relaunchingPostsOf(h, p)).toEqual([relaunchingTextOf(p)])
+    expect(row.callTimes('kill')).toHaveLength(1)
+    expect(h.stuckLaunchAbortUsed(p)).toBe(true)
+  })
+
+  // AC 67, SRJ-702, SRJ-704: ErrTmuxKillFailed after its tries uses the abort; one alert; then the held text once.
+  test('the abort kill answering ErrTmuxKillFailed at each of its 3 tries, 2 s apart: one ordinary alert with the stuck-launch abort context; not retried; no launch or delete; the held text once at the next retry, never in the same round', async () => {
+    const { h, p, row } = ownStuckLaunchOf()
+    const failed = errTmuxKillFailed(personaTmuxSessionName(p))
+    row.scriptKill(...Array.from({ length: KILL_RETRY_TRIES }, () => failed))
+    await launchOwnPending(h, row)
+    const launches = launchesOf(row)
+
+    const atB = await abortRoundAtB(h, p, row, ABORT_ORIGIN_APPROVER_STOP)
+
+    expect(row.callTimes('kill')).toEqual(Array.from({ length: KILL_RETRY_TRIES }, (_, i) => atB + i * KILL_RETRY_SPACING_MS))
+    const alert = ordinaryAlertContent(p, { last: failed })
+    expect(otherNoticesOf(h, p)).toEqual([killFailureNotice(p, alert).text])
+    expect(abortAlertLinesOf(h, p)).toEqual([killFailurePostedLine(p, alert, KILL_FAILURE_CLOSING_DESTINATION, KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT)])
+    expect([launchesOf(row), h.stub.calls.deleteCalls, heldPostsOf(h, p)]).toEqual([launches, [], []])
+    expect(h.stuckLaunchAbortUsed(p)).toBe(true)
+
+    await retryDriven(h, p)
+    await retryDriven(h, p)
+    expect(heldPostsOf(h, p)).toEqual([stuckLaunchHeldText(p, row.launchStartedAt(), false)])
+    expect([row.callTimes('kill').length, otherNoticesOf(h, p).length, relaunchingPostsOf(h, p).length, launchesOf(row)]).toEqual([KILL_RETRY_TRIES, 1, 1, launches])
+  })
+
+  // SRJ-501, SRJ-505, SRJ-512, SRJ-613 (AC 9): the abort kill's CONFLICT and UNUSABLE NAME latch P, never retried.
+  const ABORT_KILL_LATCHES: ReadonlyArray<readonly [string, () => Error, (key: string) => ConflictLatchRecord, (key: string) => string]> = [
+    ...STUCK_LAUNCH_ABORT_CONFLICT_CASE_ROWS.map((caseRow) => [
+      `CONFLICT (${caseRow.name}${caseRow.killBackstop === true ? ", SRJ-613's kill backstop" : ''})`,
+      caseRow.build,
+      (key: string) =>
+        expectedLatchRecord(key, {
+          latchCase: caseRow.latchCase,
+          refusedOperation: caseRow.refusedOperation,
+          rowState: caseRow.rowState,
+          sessionName: caseRow.sessionName,
+          description: caseRow.build().errDescription,
+        }),
+      () => caseRow.notice.text,
+    ] as const),
+    ...STUCK_LAUNCH_ABORT_UNUSABLE_NAME_CASE_ROWS.map((caseRow) => [`UNUSABLE NAME (${caseRow.name})`, caseRow.build, caseRow.record, caseRow.notice] as const),
+  ]
+
+  test.each(ABORT_KILL_LATCHES)('the abort kill answering %s: P latches with the row\'s record and one post; nothing is sent after the kill (no launch, delete or further call), and it is never tried again', async (_label, error, record, notice) => {
+    const { h, p, row } = ownStuckLaunchOf()
+    row.scriptKill(error())
+    await launchOwnPending(h, row)
+    const launches = launchesOf(row)
+
+    const atB = await abortRoundAtB(h, p, row, ABORT_ORIGIN_APPROVER_STOP)
+
+    expect(roundVerbsFrom(h, row, atB)).toEqual(['read-pane', 'find-missing', 'get', 'kill'])
+    expect(h.latch.record(p)).toEqual(record(p))
+    expect(otherNoticesOf(h, p)).toEqual([notice(p)])
+    expect(relaunchingPostsOf(h, p)).toEqual([relaunchingTextOf(p)])
+    expect(h.stops).toContainEqual({ key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED })
+
+    await h.advance(2 * adLaunchBoundMsInEffect())
+    await h.drive(h.settle())
+    expect([row.callTimes('kill'), launchesOf(row), h.stub.calls.deleteCalls, heldPostsOf(h, p), otherNoticesOf(h, p).length]).toEqual([[atB], launches, [], [], 1])
+  })
+
+  // SRD hatch A2 and Q-12: the abort's kill is part of the round's attempt; a kill that did nothing is made again at the next retry reaching step 3.
+  const ABORT_KILL_ATTEMPTS: ReadonlyArray<readonly [string, () => Error, (h: RecoveryHarness, p: string) => boolean]> = [
+    ['ErrTmuxUnresponsive, a tmux-touching UNAVAILABLE: starts tmux-unresponsive', () => errTmuxUnresponsive('kill'), (h, p) => h.tmuxUnresponsive.holds(p)],
+    ['ErrCallTimeout, UNAVAILABLE: arms its cause (SRJ-105)', () => errCallTimeout('kill'), (h, p) => h.triggers.some((t) => t.key === p && t.kind === UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)],
+  ]
+
+  test.each(ABORT_ORIGINS.flatMap((origin) => ABORT_KILL_ATTEMPTS.map(([label, make, holds]) => [origin, label, make, holds] as const)))('from %s, the abort kill answering %s at each try: no alert, the abort not used, no launch; the next retry reaching step 3 makes the same abort with no second relaunching post', async (origin, _label, make, holds) => {
+    const { h, p, row } = ownStuckLaunchOf({}, origin)
+    row.scriptKill(...Array.from({ length: KILL_RETRY_TRIES }, make))
+    await launchOwnPending(h, row)
+    const launches = launchesOf(row)
+
+    const atB = await abortRoundAtB(h, p, row, origin)
+
+    expect(row.callTimes('kill')).toEqual(Array.from({ length: KILL_RETRY_TRIES }, (_, i) => atB + i * KILL_RETRY_SPACING_MS))
+    expect(holds(h, p)).toBe(true)
+    expect([h.stuckLaunchAbortUsed(p), launchesOf(row), h.stub.calls.deleteCalls, abortAlertLinesOf(h, p), heldPostsOf(h, p)]).toEqual([false, launches, [], [], []])
+
+    await retryDriven(h, p)
+    expect(row.callTimes('kill')).toHaveLength(KILL_RETRY_TRIES + 1)
+    expect(launchesOf(row)).toEqual([...launches, 'resume'])
+    expect([relaunchingPostsOf(h, p), heldPostsOf(h, p), h.stuckLaunchAbortUsed(p)]).toEqual([[relaunchingTextOf(p)], [], true])
+  })
+
+  // AC 67, SRJ-111's ErrTmuxNotAvailable row: no abort while tmux-unavailable is raised; the same abort once it clears.
+  test('the abort kill answering ErrTmuxNotAvailable: tmux-unavailable raised, one try, the abort not used; a retry whose lap keeps it raised makes no kill and no post; once a lap clears it, the same abort with no second relaunching post', async () => {
+    const { h, p, row } = ownStuckLaunchOf()
+    row.scriptKill(errTmuxNotAvailable(undefined, 'kill'))
+    await launchOwnPending(h, row)
+    const launches = launchesOf(row)
+
+    const atB = await abortRoundAtB(h, p, row, ABORT_ORIGIN_APPROVER_STOP)
+    expect([row.callTimes('kill'), getOutageFlags(p).has('tmux-unavailable'), h.stuckLaunchAbortUsed(p)]).toEqual([[atB], true, false])
+
+    failNextLapRead(h, p, () => errTmuxNotAvailable(undefined, 'read-pane'))
+    await retryDriven(h, p)
+    expect([row.callTimes('kill').length, getOutageFlags(p).has('tmux-unavailable'), heldPostsOf(h, p)]).toEqual([1, true, []])
+
+    const clearedAt = await retryDriven(h, p)
+    expect(getOutageFlags(p).has('tmux-unavailable')).toBe(false)
+    expect(row.callTimes('kill')).toEqual([atB, clearedAt])
+    expect(launchesOf(row)).toEqual([...launches, 'resume'])
+    expect([relaunchingPostsOf(h, p), heldPostsOf(h, p)]).toEqual([[relaunchingTextOf(p)], []])
+  })
+
+  // SRJ-316 (E12): a CONFIG answer raises ad-config-malformed, and the abort waits for it to clear.
+  test('the abort kill answering CONFIG: ad-config-malformed raised, no further try, the abort not used and no launch; the next retry\'s reads clear it, and the same abort follows with no second relaunching post', async () => {
+    const { h, p, row } = ownStuckLaunchOf()
+    row.scriptKill(errConfigMalformed())
+    await launchOwnPending(h, row)
+    const launches = launchesOf(row)
+
+    const atB = await abortRoundAtB(h, p, row, ABORT_ORIGIN_APPROVER_STOP)
+    expect([row.callTimes('kill'), adConfigMalformedRaiseLines(h, p).length, h.stuckLaunchAbortUsed(p), launchesOf(row)]).toEqual([[atB], 1, false, launches])
+
+    const retryAt = await retryDriven(h, p)
+    expect(getOutageFlags(p).has('ad-config-malformed')).toBe(false)
+    expect(row.callTimes('kill')).toEqual([atB, retryAt])
+    expect([relaunchingPostsOf(h, p), heldPostsOf(h, p), h.stuckLaunchAbortUsed(p)]).toEqual([[relaunchingTextOf(p)], [], true])
+  })
+
+  // SRJ-702, SRJ-412: an abort kill SRJ-702's stop rule stopped uses up no abort and raises no alert.
+  test('the abort kill\'s tries stopped because P stopped being up: no alert of either version, the abort not used; once P is up, the next retry reaching step 3 makes the same abort with no second relaunching post', async () => {
+    const { h, p, row } = ownStuckLaunchOf()
+    row.scriptKill(errTmuxUnresponsive('kill'))
+    await launchOwnPending(h, row)
+    const launches = launchesOf(row)
+    let stopsUp = true
+    wrapModelKnob(h, 'killFn', (modelKill) => (params) => {
+      if (stopsUp) h.setUp(p, false)
+      return modelKill(params)
+    })
+
+    const atB = await abortRoundAtB(h, p, row, ABORT_ORIGIN_APPROVER_STOP)
+    expect(row.callTimes('kill')).toEqual([atB])
+    expect([abortAlertLinesOf(h, p), otherNoticesOf(h, p), h.killFailureOpen(p), h.stuckLaunchAbortUsed(p)]).toEqual([[], [], false, false])
+
+    h.setUp(p, true)
+    stopsUp = false
+    const retryAt = await retryDriven(h, p)
+    expect(row.callTimes('kill')).toEqual([atB, retryAt])
+    expect([relaunchingPostsOf(h, p), h.stuckLaunchAbortUsed(p), launchesOf(row)]).toEqual([[relaunchingTextOf(p)], true, [...launches, 'resume']])
+  })
+
+  // SRJ-702, SRJ-704: a survivor-naming failure, then a non-success: the ordinary alert, once.
+  test('the abort kill naming a survivor at its first try, then ErrTmuxUnresponsive: one ordinary alert with the stuck-launch abort context, quoting the survivor-naming description; the abort not used', async () => {
+    const { h, p, row } = ownStuckLaunchOf()
+    const survivor = errTmuxKillFailed(personaTmuxSessionName(p), 'pane-process-survived')
+    row.scriptKill(survivor, errTmuxUnresponsive('kill'), errTmuxUnresponsive('kill'))
+    await launchOwnPending(h, row)
+
+    await abortRoundAtB(h, p, row, ABORT_ORIGIN_APPROVER_STOP)
+
+    const alert = ordinaryAlertContent(p, { earlierSurvivor: survivor })
+    expect(row.callTimes('kill')).toHaveLength(KILL_RETRY_TRIES)
+    expect(otherNoticesOf(h, p)).toEqual([killFailureNotice(p, alert).text])
+    expect(abortAlertLinesOf(h, p)).toEqual([killFailurePostedLine(p, alert, KILL_FAILURE_CLOSING_DESTINATION, KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT)])
+    expect(h.stuckLaunchAbortUsed(p)).toBe(false)
+  })
+
+  // AC 67: an own stuck launch at B while a lap's read-pane raised tmux-unavailable: neither text and no kill until it clears.
+  test('an own stuck launch whose lap at the round reaching B raises tmux-unavailable: neither text and no kill; the next retry\'s lap clears it, and that round makes the relaunching post and the abort', async () => {
+    const { h, p, row } = ownStuckLaunchOf({}, ABORT_ORIGIN_RETRY)
+    await launchOwnPending(h, row)
+    await retryUntilB(h, p, row)
+    failNextLapRead(h, p, () => errTmuxNotAvailable(undefined, 'read-pane'))
+
+    await retryDriven(h, p)
+    expect(getOutageFlags(p).has('tmux-unavailable')).toBe(true)
+    expect([relaunchingPostsOf(h, p), heldPostsOf(h, p), row.callTimes('kill')]).toEqual([[], [], []])
+
+    const clearedAt = await retryDriven(h, p)
+    expect(getOutageFlags(p).has('tmux-unavailable')).toBe(false)
+    expect([relaunchingPostsOf(h, p), heldPostsOf(h, p), row.callTimes('kill')]).toEqual([[relaunchingTextOf(p)], [], [clearedAt]])
+  })
+
+  // SRJ-502: no abort for a latched P.
+  test('an own stuck launch latched by its lap\'s read-pane CONFLICT at the round reaching B: no relaunching post and no kill, then or later', async () => {
+    const { h, p, row } = ownStuckLaunchOf({}, ABORT_ORIGIN_RETRY)
+    await launchOwnPending(h, row)
+    await retryUntilB(h, p, row)
+    failNextLapRead(h, p, () => errTmuxSessionConflict('read-pane', 'leftover', personaTmuxSessionName(p)))
+
+    await retryDriven(h, p)
+    h.controller.armPendingOnly(p)
+    await h.advance(adLaunchBoundMsInEffect())
+    await h.drive(h.settle())
+
+    expect(h.latch.isLatched(p)).toBe(true)
+    expect([relaunchingPostsOf(h, p), heldPostsOf(h, p), row.callTimes('kill')]).toEqual([[], [], []])
+  })
+
+  // SRJ-412: the record is in memory only; a server restart forgets it.
+  test('after a server restart the same pending row is no longer CSCB\'s own: at B the held post, no relaunching post and no kill', async () => {
+    const { h, p, row } = ownStuckLaunchOf({}, ABORT_ORIGIN_RETRY)
+    const launchStart = await launchOwnPending(h, row)
+    await h.restartServer(p)
+    row.scriptLaunches(errInstanceIdCollision())
+    await h.launch(p)
+    await h.settle()
+    expect([row.launchStartedAt(), ownLaunchRecordOf(p)]).toEqual([launchStart, undefined])
+
+    await abortRoundAtB(h, p, row, ABORT_ORIGIN_RETRY)
+    await retryDriven(h, p)
+
+    expect(heldPostsOf(h, p)).toEqual([stuckLaunchHeldText(p, launchStart, false)])
+    expect([relaunchingPostsOf(h, p), row.callTimes('kill')]).toEqual([[], []])
+  })
+
+  /** The model's row stays `pending` (its launch start kept) after each of its kills succeeds. */
+  function keepPendingAfterKill(h: RecoveryHarness, row: PendingRowModel): void {
+    wrapModelKnob(h, 'killFn', (modelKill) => (params) => {
+      const answer = modelKill(params)
+      if (params.claude_instance_id === row.instanceId) row.setState(AGENT_DIRECTOR_PENDING_STATE)
+      return answer
+    })
+  }
+
+  // SRJ-717 after the abort's kill: the sequence stops on an unjudged run; the abort is used; the held text once.
+  test('the abort\'s sequence stopping at its first run that leaves the row pending in neither list (SRJ-717): no alert and no launch; the held text once at the next retry, and no further kill', async () => {
+    const { h, p, row } = ownStuckLaunchOf()
+    await launchOwnPending(h, row)
+    keepPendingAfterKill(h, row)
+    const launches = launchesOf(row)
+    const launchStart = row.launchStartedAt()
+
+    const atB = await abortRoundAtB(h, p, row, ABORT_ORIGIN_APPROVER_STOP)
+    expect(roundVerbsFrom(h, row, atB)).toEqual(['read-pane', 'find-missing', 'get', 'kill', 'get', 'find-missing'])
+    expect([launchesOf(row), abortAlertLinesOf(h, p), otherNoticesOf(h, p), heldPostsOf(h, p), h.stuckLaunchAbortUsed(p)]).toEqual([launches, [], [], [], true])
+
+    await retryDriven(h, p)
+    await retryDriven(h, p)
+    expect(heldPostsOf(h, p)).toEqual([stuckLaunchHeldText(p, launchStart, false)])
+    expect([row.callTimes('kill'), relaunchingPostsOf(h, p).length]).toEqual([[atB], 1])
+  })
+
+  // SRJ-705 step 5 with the abort's context.
+  test('the abort\'s sequence reaching step 5 (the row still pending after runs that judged it and its step-4 kill): the ordinary alert with no description and the stuck-launch abort context; no launch', async () => {
+    const { h, p, row } = ownStuckLaunchOf({ judgment: judgeUnverified })
+    await launchOwnPending(h, row)
+    keepPendingAfterKill(h, row)
+    const launches = launchesOf(row)
+
+    await abortRoundAtB(h, p, row, ABORT_ORIGIN_APPROVER_STOP)
+
+    const alert = ordinaryAlertContent(p)
+    expect(row.callTimes('kill')).toHaveLength(2)
+    expect(otherNoticesOf(h, p)).toEqual([killFailureNotice(p, alert).text])
+    expect(abortAlertLinesOf(h, p)).toEqual([killFailurePostedLine(p, alert, KILL_FAILURE_CLOSING_DESTINATION, KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT)])
+    expect(launchesOf(row)).toEqual(launches)
+  })
+
+  // SRJ-404, hatch A3: the abort stops P's running approver first, with its own stop reason, and no rule run follows that stop.
+  test('a retry reaching B while P\'s approver still runs (a test cap past B): the abort stops it with the stuck-launch-abort reason, no pending-row run follows that stop, and the kill and the resume follow', async () => {
+    const { h, p, row } = ownStuckLaunchOf({}, ABORT_ORIGIN_RETRY, { approverCapMs: 2 * adLaunchBoundMsInEffect() })
+    await launchOwnPending(h, row)
+    await retryUntilB(h, p, row)
+    expect(h.approverRunning(p)).toBe(true)
+
+    const atB = await retryDriven(h, p)
+
+    expect(h.errors.filter((line) => line.includes(`(${APPROVER_STOP_STUCK_LAUNCH_ABORT})`))).toHaveLength(1)
+    expect(ruleLinesOf(h, p, PENDING_ROW_RULE_ORIGIN_APPROVER_STOP)).toEqual([])
+    expect(row.callTimes('kill')).toEqual([atB])
+    // The retry's own reads, then the rule's run and get with no lap (the approver ran), the kill and the sequence.
+    expect(roundVerbsFrom(h, row, atB).slice(0, 9)).toEqual(['status', 'get', 'find-missing', 'get', 'kill', 'get', 'find-missing', 'get', 'resume'])
+    expect(relaunchingPostsOf(h, p)).toEqual([relaunchingTextOf(p)])
   })
 })

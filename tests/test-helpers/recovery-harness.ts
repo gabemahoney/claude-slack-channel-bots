@@ -288,7 +288,9 @@
  *   `cleanup()`) as `main()` builds and installs them, before any launch:
  *   the restart path's kill adapter and the live-row sequence's kills raise
  *   the bounded retry's decision through them (context `recovery`; the
- *   collision ladder makes no kill), and every own-row read of the session manager that reads
+ *   collision ladder makes no kill), the stuck-launch abort's kill too
+ *   (context 'stuck-launch abort', given to the pending-row rule's builder),
+ *   and every own-row read of the session manager that reads
  *   the row `ended` or `missing`, or finds it gone (`ErrSpawnNotFound`), ends
  *   the persona's episode silently. The destination route posts through the
  *   episodes' sink, so the alert lands in `episodeNotices`; the
@@ -336,8 +338,21 @@
  *   approver-stop run is tracked and `settle()` awaits it. With
  *   `options.pendingRowRule: false` none is installed, and each retry or
  *   stop that would run it logs its "no pending-row rule is installed" line.
- *   Step 3's own-launch slot (`PendingRowRuleDeps.ownLaunch`) is whatever
- *   the builder sets: none yet, so every row at B takes the held branch.
+ *   Step 3's own-launch slot (`PendingRowRuleDeps.ownLaunch`) is the one
+ *   the builder sets (b.jg5 SRJ-412): the stuck-launch abort
+ *   (`createStuckLaunchAbort`) over the own-launch query
+ *   (`isCscbOwnLaunch`), so CSCB's own stuck launch at B gets the
+ *   relaunching post, the abort's checked kill and the live-row sequence
+ *   from step 2, and every other row at B the held post. The builder is
+ *   given the kill-retry clock (`killRetryWait: killRetryClock`, so the
+ *   abort kill's waits between tries are on the harness clock and `drive`
+ *   moves it to them) and the harness's kill-failure alerts
+ *   (`killFailureAlerts`, so its alert, context 'stuck-launch abort', lands
+ *   in `episodeNotices`). `stuckLaunchAbortUsed(key)` reads the abort's
+ *   per-episode state (`isAbortUsed`). A launch the harness makes is CSCB's
+ *   own only with `options.harnessNow` (the launch window and the stub's
+ *   launch start then share the clock); without it the window is on the
+ *   real clock and no harness launch is own.
  *   A case scripts the row with `makePendingRowModel`
  *   (`tests/test-helpers/pending-row-model.ts`), which takes a harness as
  *   its host.
@@ -361,9 +376,12 @@
  *   `UNAVAILABLE_RETRY_STOP_SHUTDOWN` (a real stop, in `stops`), its dialog
  *   approver stopped with `APPROVER_STOP_SHUTDOWN` (no pending-row run
  *   follows) and awaited, its launch records forgotten (`forgetLaunchCalls`:
- *   the launch-call window and "this launch's row" record, SRJ-407, and the
- *   not-interactive record, SRJ-412), and its episodes and counts forgotten,
- *   every kind (`episodes.forget(key)`, the stuck-launch episode included).
+ *   the launch-call window and "this launch's row" record, SRJ-407, the
+ *   not-interactive record and the record of CSCB's own launch, SRJ-412),
+ *   and its episodes and counts forgotten, every kind (`episodes.forget(key)`,
+ *   the stuck-launch episode included, whose close disposes the abort's
+ *   per-episode state, SRJ-412). It throws if the own-launch record or a
+ *   used abort outlives that.
  *   The stub's row is untouched; the latch, the outage flags, the holds, the
  *   retired-key store, the restart module's counts and the findMissing memo
  *   are kept (a case that needs them gone builds a new harness). It throws
@@ -609,7 +627,9 @@
  *   adapter gets the kill-retry clock (its kill is one try, seeded with the
  *   run's `dead` reading), the live-row sequence's kills take the sequence
  *   clock through the session manager's dependency builder (the collision
- *   ladder makes no kill; a live row's kills are the sequence's), and the
+ *   ladder makes no kill; a live row's kills are the sequence's), the
+ *   stuck-launch abort's kill (3 tries on its `pending` row) takes the
+ *   kill-retry clock through the pending-row rule's builder, and the
  *   kill retry's
  *   keep-going query (`setPersonaKillKeepGoingQuery`, removed by
  *   `cleanup()`) is the up predicate over the same serving connection,
@@ -857,7 +877,9 @@
  *   first, so no hold a later step ends retries anyone) and the old-life
  *   hold set's install (`_resetOldLifeHolds`), so no hold outlives the
  *   harness,
- *   the stub spawn path and client with every launch still in flight and the
+ *   the stub spawn path and client with every launch still in flight
+ *   (`_resetInFlightLaunches`, which also forgets every launch-call window
+ *   and every record of CSCB's own launch, b.jg5 SRJ-412) and the
  *   approver's clock and cap, the session manager's clock when
  *   `options.harnessNow` set it (`_resetNow`), the
  *   findMissing memo, the tmux seams, the settings install, the version
@@ -934,7 +956,20 @@
  * placed against the call's window, `TimedLaunchStart`: on either bound,
  * inside, before, after or none; its handle gives the error, the window, the
  * launch start, the row, and a `status` answer with the same launch start
- * for the case's own `statusFn`), and the condition's log
+ * for the case's own `statusFn`), the own-launch drivers over a
+ * `makePendingRowModel` row (b.jg5 SRJ-412, SRJ-407; AC 9, AC 31, AC 48; a
+ * harness built with `harnessNow`): `launchOwnPending` (launch the persona
+ * and settle, so the approver's first lap records the model's new `pending`
+ * launch as CSCB's own; throws unless `isCscbOwnLaunch` then answers yes;
+ * resolves with its launch start), `scriptModelLaunch` (the model's next
+ * launch call takes `takesMs`, ends in success or either launch-timeout
+ * form, and its launch start lies inside the call's window, before it or
+ * after its end: `scriptTimedLaunch` for a row the model answers),
+ * `launchByAnotherProcess` (the model's row reads `pending` with a launch
+ * start the server never recorded; answers it) and `driveToB` (move the
+ * clock to B past the row's launch start, firing the approver's stop at B
+ * and its one rule run, then settle while moving the clock to each wait
+ * between the abort kill's tries), and the condition's log
  * lines: `conditionLinePrefix`, `conditionLines`, `conditionStartedLines`,
  * `conditionEndedLines` and the line builders `conditionOnsetLine`,
  * `conditionAlertLine`, `conditionEndedLine`, `conditionRecoveryLine` and
@@ -1006,6 +1041,7 @@ import type { Phase1SpawnParams, Phase1StatusResult } from '../../src/ad-phase1-
 import {
   adAlertThresholdMsInEffect,
   adGraceMsInEffect,
+  adLaunchBoundMsInEffect,
   adSettingsInEffect,
   installAdSettings,
   resetAdSettingsForTests,
@@ -1024,6 +1060,7 @@ import {
   type ConflictNoticeEpisodes,
 } from '../../src/conflict-latch.ts'
 import {
+  AGENT_DIRECTOR_PENDING_STATE,
   LIVENESS_DEAD_ROW_ENDED,
   LIVENESS_DEAD_ROW_MISSING,
   LIVENESS_LIVE,
@@ -1053,7 +1090,14 @@ import {
   type KillFailureClosing,
 } from '../../src/kill-failure-alert.ts'
 import { LOST_MESSAGE_STATES, STATE_WORDING, type LostMessageState } from '../../src/lost-message.ts'
-import { createPendingRowRule, endStuckLaunchEpisodeForLatch, parseLaunchStart, type LaunchCallWindow } from '../../src/pending-row.ts'
+import {
+  createPendingRowRule,
+  endStuckLaunchEpisodeForLatch,
+  parseLaunchStart,
+  type LaunchCallWindow,
+  type PendingRowOwnLaunchHooks,
+  type StuckLaunchAbort,
+} from '../../src/pending-row.ts'
 import { _resetOutageState, clearOutageFlag, getOutageFlags, initOutageState, resetAllToHealthy, type OutageClass } from '../../src/outage-state.ts'
 import type { PersonaLifecycleDeps } from '../../src/persona-lifecycle.ts'
 import type { PersonaConnectionStatus } from '../../src/persona-connections.ts'
@@ -1148,6 +1192,7 @@ import {
   createOldLifeHoldEndRetry,
   ensureOldLifeWait,
   forgetOldLifeWaits,
+  isCscbOwnLaunch,
   isDialogApproverRunning,
   isLaunchInFlight,
   isLiveRowSequenceRunning,
@@ -1158,6 +1203,7 @@ import {
   notifyRestartCapReached,
   oldLifeHeldDirectory,
   oldLifeHoldStep,
+  ownLaunchRecordOf,
   personaRetryBlockCause,
   readPersonaRowState,
   reconcileOrphans,
@@ -1270,6 +1316,7 @@ import {
   type CannedGetResult,
   type FindMissingHold,
   type PersonaGetResultOverrides,
+  type StubCallAnswer,
   type StubCallLog,
   type StubClientOptions,
   type StubResolveSystemBinaryOutcome,
@@ -1279,6 +1326,7 @@ import { LEAK_SENTINEL, writtenFile } from './credentials.ts'
 import { createFakeClock, type FakeClock } from './fake-clock.ts'
 import { makeMultiPersonaConfig, type PersonaSpec } from './persona-config.ts'
 import { makeNotifierStack } from './persona-notifier.ts'
+import { launchStartText, type PendingRowModel } from './pending-row-model.ts'
 import { stateOf } from './persona-routing-harness.ts'
 import { makeChannelMessage, makeStubSlack, type StubSlack } from './slack-stub.ts'
 import { writeRetiredKeysRecord, type RetiredKeySeed } from './retired-keys.ts'
@@ -1843,6 +1891,15 @@ export interface RecoveryHarness {
    * stopped. See the module comment.
    */
   restartServer(key: string): Promise<void>
+  /**
+   * Whether persona `key`'s open stuck-launch episode has used its one abort
+   * (b.jg5 SRJ-412): the installed pending-row rule's abort state
+   * (`StuckLaunchAbort.isAbortUsed`), read-only. False once the episode
+   * closes (a read of the row live out of `pending`, a latch, a teardown's or
+   * `restartServer`'s `episodes.forget(key)`, `shutdown()`). Throws when no
+   * rule is installed (`options.pendingRowRule: false`).
+   */
+  stuckLaunchAbortUsed(key: string): boolean
   /** Whether persona `key`'s dialog approver is running (read-only; the session manager's `isDialogApproverRunning`). */
   approverRunning(key: string): boolean
   /**
@@ -1906,6 +1963,17 @@ export interface RecoveryHarness {
  */
 function lostMessageArmLine(key: string): string {
   return `[slack] Lost message: persona=${key} has its tmux-unavailable outage raised with no retry timer — no restart scheduled; arming one (b.jg5 SRJ-311)`
+}
+
+/**
+ * The pending-row rule's own-launch slot as the abort it is (b.jg5 SRJ-412):
+ * `buildPendingRowRuleDeps` fills it with `createStuckLaunchAbort`'s
+ * instance, typed as the slot (`PendingRowOwnLaunchHooks`); `undefined` when
+ * the slot is empty or carries no abort-state read.
+ */
+function stuckLaunchAbortOf(hooks: PendingRowOwnLaunchHooks | undefined): StuckLaunchAbort | undefined {
+  if (hooks === undefined || typeof (hooks as Partial<StuckLaunchAbort>).isAbortUsed !== 'function') return undefined
+  return hooks as StuckLaunchAbort
 }
 
 /** Build a recovery harness; see the module comment. Call `cleanup()` in `afterEach`. */
@@ -2382,8 +2450,21 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     void run.then(done, done)
     return run
   }
+  // The abort's per-episode state, read through `stuckLaunchAbortUsed`; unset
+  // with `options.pendingRowRule: false`.
+  let stuckLaunchAbort: StuckLaunchAbort | undefined
   if (options.pendingRowRule !== false) {
-    const ruleDeps = buildPendingRowRuleDeps({ appliedPersona, episodes, log: (line) => console.error(line) })
+    // As main() gives them (b.jg5 SRJ-412, SRJ-702, SRJ-704): the abort kill's
+    // waits between tries on `killRetryClock` (tracked, so `drive` moves the
+    // clock to them) and its alerts through the harness's kill-failure alerts.
+    const ruleDeps = buildPendingRowRuleDeps({
+      appliedPersona,
+      episodes,
+      log: (line) => console.error(line),
+      killRetryWait: killRetryClock,
+      killFailureAlerts,
+    })
+    stuckLaunchAbort = stuckLaunchAbortOf(ruleDeps.ownLaunch)
     setPendingRowRule({
       rule: createPendingRowRule(harnessNow ? ruleDeps : { ...ruleDeps, now: () => clock.now() }),
       serialize: serializeRuleRun,
@@ -3183,11 +3264,22 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       // pending-row run follows), awaited.
       await stopDialogApprover(key, APPROVER_STOP_SHUTDOWN)
       // Its launch records: the launch-call window and "this launch's row"
-      // record (b.jg5 SRJ-407) and the not-interactive record (SRJ-412).
+      // record (b.jg5 SRJ-407), the not-interactive record and the record of
+      // CSCB's own launch (SRJ-412).
       forgetLaunchCalls(key)
       // Its episodes and counts, every kind (the stuck-launch episode
-      // included, b.jg5 SRJ-1016, SRJ-1017).
+      // included, b.jg5 SRJ-1016, SRJ-1017); that episode's close disposes
+      // the abort's per-episode state (SRJ-412), as a new process starts
+      // with none.
       episodes.forget(key)
+      if (ownLaunchRecordOf(key) !== undefined || stuckLaunchAbort?.isAbortUsed(key) === true) {
+        throw new Error(`recovery harness: persona ${key}'s own-launch record or stuck-launch abort state outlived restartServer`)
+      }
+    },
+
+    stuckLaunchAbortUsed(key) {
+      if (stuckLaunchAbort === undefined) throw new Error('recovery harness: no pending-row rule with a stuck-launch abort is installed')
+      return stuckLaunchAbort.isAbortUsed(key)
     },
 
     approverRunning: (key) => isDialogApproverRunning(key),
@@ -4060,6 +4152,136 @@ export function scriptTimedLaunch(h: RecoveryHarness, key: string, options: Time
       return cannedStatusResult({ state: 'pending', launch_started_at: launchStartedAt() ?? SAMPLE_LAUNCH_START_NONE, ...overrides })
     },
   }
+}
+
+/** Where `scriptModelLaunch` places the new launch's launch start against the call's window: at its start (inside), before it, or after its end. */
+export type ModelLaunchStart = 'inside' | 'before' | 'after'
+
+/** Options of `scriptModelLaunch`; every one is optional. */
+export interface ModelLaunchOptions {
+  /** How long the call takes on the harness clock, in ms (0 by default). */
+  readonly takesMs?: number
+  /** How the call ends: `TIMED_LAUNCH_SUCCESS` (the model's own answer) by default, or either launch-timeout form. */
+  readonly end?: TimedLaunchEnd
+  /** Where the new launch's launch start lies against the call's window: `inside` (at its start) by default. */
+  readonly launchStart?: ModelLaunchStart
+  /** How far `before` and `after` lie outside the window, in ms (1 by default). */
+  readonly offMs?: number
+}
+
+/**
+ * Script the next launch call (`spawn`, plain or reuse, or `resume`) of
+ * persona `row.key`'s pending-row model `row` (b.jg5 SRJ-407, SRJ-412; AC
+ * 31): the model's own launch (state `pending`, its launch start the clock's
+ * now, its pane `dialogOnLaunch`), made at the call's start, then the call
+ * takes `takesMs` on the harness clock (timers due by then fire), the launch
+ * start is placed against the call's window `[start, end]` (`inside`: at its
+ * start; `before`: `start - offMs`; `after`: `end + offMs`), and the call
+ * ends with `end`: the model's answer, `errCallTimeout(verb)` or
+ * `errTmuxUnresponsiveLaunchTimeout(verb, id)`. A scripted launch error of
+ * the model (`launches`) is answered as it is, placing nothing. One call
+ * only; every later call goes to the model. The counterpart of
+ * `scriptTimedLaunch` for a row the model answers (`status`, `get`, `kill`
+ * and the rest stay the model's). Needs a harness built with `harnessNow`
+ * (it throws otherwise), so the window the session manager records is on
+ * the harness clock. Script it after `makePendingRowModel`, then drive the
+ * launch.
+ */
+export function scriptModelLaunch(h: RecoveryHarness, row: PendingRowModel, options: ModelLaunchOptions = {}): void {
+  if (!h.harnessNow) throw new Error('scriptModelLaunch: build the harness with { harnessNow: true }, so the session manager reads the launch window on the harness clock')
+  const takesMs = options.takesMs ?? 0
+  const end = options.end ?? TIMED_LAUNCH_SUCCESS
+  const placement = options.launchStart ?? 'inside'
+  const offMs = options.offMs ?? 1
+  const knobs = h.stub.calls as StubClientOptions
+  const modelSpawn = knobs.spawnFn
+  const modelResume = knobs.resumeFn
+  if (modelSpawn === undefined || modelResume === undefined) throw new Error('scriptModelLaunch: install the pending-row model first')
+  let used = false
+  const timed = async <T>(verb: 'spawn' | 'resume', answer: () => StubCallAnswer<T>): Promise<T | Error | undefined> => {
+    used = true
+    const startMs = h.clock.now()
+    const answered = await answer()
+    if (answered instanceof Error) return answered
+    if (takesMs > 0) await h.clock.advance(takesMs)
+    const endMs = h.clock.now()
+    if (placement !== 'inside') row.setLaunchStartedAt(launchStartText(placement === 'before' ? startMs - offMs : endMs + offMs))
+    if (end === TIMED_LAUNCH_SUCCESS) return answered
+    return end === LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT ? errCallTimeout(verb) : errTmuxUnresponsiveLaunchTimeout(verb, row.instanceId)
+  }
+  h.script({
+    spawnFn: (params) => (!used && params.claude_instance_id === row.instanceId ? timed('spawn', () => modelSpawn(params)) : modelSpawn(params)),
+    resumeFn: (params) => (!used && params.claude_instance_id === row.instanceId ? timed('resume', () => modelResume(params)) : modelResume(params)),
+  })
+}
+
+/**
+ * CSCB's own launch of persona `row.key`, held `pending` (b.jg5 SRJ-412,
+ * SRJ-407): launch the persona (`h.launch`) over its pending-row model `row`
+ * and settle, so the model answers the launch call (a `resume` of a finished
+ * row with a session id, a plain spawn of no row) with a new `pending`
+ * launch whose launch start lies inside the call's window, and the dialog
+ * approver's first lap reads it (`keepApproverLaunchStart`), recording it as
+ * CSCB's own. Throws unless the row then reads `pending` and the own-launch
+ * query answers yes for its launch start (`isCscbOwnLaunch`), so a harness
+ * built without `harnessNow` (the window then on the real clock) fails here.
+ * Use a model whose `dialogOnLaunch` the approver cannot clear
+ * (`PENDING_ROW_DIALOG_UNRECOGNISED` or `PENDING_ROW_DIALOG_NONE`) for a
+ * launch that stays `pending`. Resolves with the row's raw launch start.
+ */
+export async function launchOwnPending(h: RecoveryHarness, row: PendingRowModel): Promise<string> {
+  await h.launch(row.key)
+  await h.settle()
+  const launchStart = row.launchStartedAt()
+  if (row.state() !== AGENT_DIRECTOR_PENDING_STATE || typeof launchStart !== 'string' || !isCscbOwnLaunch(row.key, launchStart)) {
+    throw new Error(
+      `launchOwnPending: persona ${row.key}'s launch is not CSCB's own and pending (state ${String(row.state())}, launch start ${String(launchStart)}, own record ${JSON.stringify(ownLaunchRecordOf(row.key))}${h.harnessNow ? '' : '; build the harness with { harnessNow: true }'})`,
+    )
+  }
+  return launchStart
+}
+
+/**
+ * Another process's launch of persona `row.key`'s row (b.jg5 SRJ-412; AC
+ * 48): its pending-row model `row` reads `pending` with a launch start the
+ * server never recorded, `launchStartText(atMs)` (the harness clock's now by
+ * default), so the own-launch query answers no for it. Throws when that
+ * instant is the one the persona's own-launch record holds (move the clock,
+ * or give another `atMs`). Nothing else changes: no launch call is made and
+ * no window recorded. Answers the new raw launch start.
+ */
+export function launchByAnotherProcess(h: RecoveryHarness, row: PendingRowModel, atMs: number = h.clock.now()): string {
+  const launchStart = launchStartText(atMs)
+  if (ownLaunchRecordOf(row.key)?.launchStartMs === parseLaunchStart(launchStart)) {
+    throw new Error(`launchByAnotherProcess: ${launchStart} is persona ${row.key}'s own recorded launch start; move the clock or give another instant`)
+  }
+  row.setState(AGENT_DIRECTOR_PENDING_STATE)
+  row.setLaunchStartedAt(launchStart)
+  return launchStart
+}
+
+/**
+ * Age persona `row.key`'s `pending` row to B past its launch start (b.jg5
+ * SRJ-410, SRJ-412): move the harness clock to the row's launch start plus B
+ * in effect (`adLaunchBoundMsInEffect`), firing every timer due by then as
+ * `advance` does (the approver's laps and its stop at B, which runs the
+ * pending-row rule once; P's retries), then settle while moving the clock to
+ * each wait between the abort kill's tries as it is set (`drive(settle())`),
+ * so an abort whose kill answers UNAVAILABLE runs its tries on the harness
+ * clock. It stops at B: a relaunch the abort's live-row sequence made is
+ * left at its approver's first lap (`runApproverToStop` would drive that
+ * approver to its own B as well). Throws when the row has no launch start,
+ * or the clock is already past B. A case running the approver under a test
+ * cap unsets it first (`setApproverCap(undefined)`), so the approver stops
+ * at B and not at the cap.
+ */
+export async function driveToB(h: RecoveryHarness, row: PendingRowModel): Promise<void> {
+  const launchStartMs = row.launchStartMs()
+  if (launchStartMs === undefined) throw new Error(`driveToB: persona ${row.key}'s row has no launch start`)
+  const waitMs = launchStartMs + adLaunchBoundMsInEffect() - h.clock.now()
+  if (waitMs < 0) throw new Error(`driveToB: the clock is already ${-waitMs} ms past B for persona ${row.key}`)
+  await h.advance(waitMs)
+  await h.drive(h.settle())
 }
 
 // The `tmux-unresponsive` condition's log lines (SRJ-307 to SRJ-310). The

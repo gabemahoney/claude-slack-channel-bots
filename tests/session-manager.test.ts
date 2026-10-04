@@ -1460,6 +1460,30 @@ import {
 import { runInTimerRetry } from '../src/unavailable-retry.ts'
 import { LIVENESS_DEAD_ROW_NO_ROW, type DeadRowRead } from '../src/liveness-reading.ts'
 import { pastSampleGrace } from './test-helpers/recovery-harness.ts'
+import {
+  APPROVER_STOP_STUCK_LAUNCH_ABORT,
+  abortKillOwnStuckLaunch,
+  approverStopRequestedMessage,
+  dialogApproverLaunchStart,
+  isCscbOwnLaunch,
+  ownLaunchRecordOf,
+  startStuckLaunchAbortSequence,
+  stopApproverForStuckLaunchAbort,
+} from '../src/session-manager.ts'
+import {
+  STUCK_LAUNCH_ABORT_KILL_FAILED,
+  STUCK_LAUNCH_ABORT_KILL_LATCHED,
+  STUCK_LAUNCH_ABORT_KILL_STOPPED,
+  STUCK_LAUNCH_ABORT_KILL_SUCCEEDED,
+  STUCK_LAUNCH_ABORT_KILL_TRY_LATER,
+  STUCK_LAUNCH_ABORT_SEQUENCE_NOT_STARTED,
+  STUCK_LAUNCH_ABORT_SEQUENCE_STARTED,
+  stuckLaunchAbortKillUsesAbort,
+  type StuckLaunchAbortKillAnswer,
+} from '../src/pending-row.ts'
+import { KILL_FAILURE_CLOSING_DESTINATION, KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT } from '../src/kill-failure-alert.ts'
+import { LIVE_ROW_SEQUENCE_ENTRY_GET, type LiveRowSequenceRegistry } from '../src/live-row-sequence.ts'
+import { STUCK_LAUNCH_ABORT_CONFLICT_CASE_ROWS, STUCK_LAUNCH_ABORT_UNUSABLE_NAME_CASE_ROWS } from './test-helpers/conflict-cases.ts'
 
 // ---------------------------------------------------------------------------
 // Test fixture helpers
@@ -30525,5 +30549,577 @@ describe('b.jg5 SRJ-410, SRJ-409, SRJ-710: the ladder\'s pending step on P\'s co
     expect(ruleLines(h, p)).toHaveLength(1)
     expectStepArmOnly(h, p)
     expect([h.sequenceRunning(p), getFailureCount(p), h.notices, h.episodeNotices, h.stub.calls.killCalls, h.startupErrors()]).toEqual([false, 0, [], [], [], []])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-412, SRJ-407 (E29 T3): the record of CSCB's own launch
+//
+// On `makeRecoveryHarness` with the session manager's clock on the harness
+// clock (`timedLaunchBuild`), each launch call timed through
+// `scriptTimedLaunch` (`TIMED_CALL_MS` long). The record
+// (`ownLaunchRecordOf`) is set by the dialog approver's first lap that reads
+// the row `pending` with a launch start, after a launch call that returned
+// success, and by the one `get` after a launch timeout (beside E28's "this
+// launch's row"); each only for a launch start inside the window (both ends
+// included) of the persona's latest launch call. A failed read sets nothing
+// (the approver's failed first lap is in tests/approve-trust-folder-dialog.test.ts).
+// It outlives the approver and no read forgets it; a new launch call, the
+// teardown's kill and the reset do. The own-launch query (`isCscbOwnLaunch`)
+// compares the launch start read now with it by instant, and answers no once
+// a `send-keys` on that launch answered `ErrSpawnNotInteractive` (R13; the
+// not-interactive record's own cases are SRJ-118's describe above). The
+// rule's use of the query at B is tests/pending-row.test.ts's; the
+// approver's first-lap input is tests/approve-trust-folder-dialog.test.ts's.
+// ---------------------------------------------------------------------------
+
+/** Where a timed launch's launch start lies against its call's window, and whether the launch is then CSCB's own. */
+const OWN_LAUNCH_PLACEMENTS: ReadonlyArray<readonly [TimedLaunchStart, boolean]> = [
+  ['at-start', true],
+  ['inside', true],
+  ['at-end', true],
+  ['before', false],
+  ['after', false],
+]
+
+/** CSCB's own launch of P: the ladder's first spawn returns success, its launch start inside the window, and P's approver makes its first lap. Resolves with the timed launch. */
+async function ownTimedLaunch(h: RecoveryHarness, p: string): Promise<TimedLaunch> {
+  const t = scriptTimedLaunch(h, p, { verb: 'spawn', reuse: false, takesMs: TIMED_CALL_MS, end: TIMED_LAUNCH_SUCCESS })
+  statusOnTimedRow(h, t)
+  await h.launch(p)
+  await h.settle()
+  expect(ownLaunchRecordOf(p)).toEqual({ launchStartMs: Date.parse(t.launchStartedAt()!), window: launchCallWindowOf(p)! })
+  return t
+}
+
+describe('b.jg5 SRJ-412, SRJ-407: the record of CSCB\'s own launch, its set and forget points, and the own-launch query', () => {
+  afterEach(srj105AfterEach)
+
+  test.each(TIMED_VERBS.flatMap(([name, verb]) => OWN_LAUNCH_PLACEMENTS.map(([placement, own]) => [name, placement, own, verb] as const)))(
+    '%s that returns success, its launch start %s the window: the approver\'s first lap records CSCB\'s own launch: %s; the record outlives the approver',
+    async (_name, placement, own, verb) => {
+      const { h, p } = await timedLaunchBuild()
+      verb.arrange(h, p)
+      const t = scriptTimedLaunch(h, p, { verb: verb.verb, reuse: verb.reuse, takesMs: TIMED_CALL_MS, end: TIMED_LAUNCH_SUCCESS, launchStart: placement })
+      statusOnTimedRow(h, t)
+
+      await h.launch(p)
+      await h.settle()
+
+      const launchStartMs = Date.parse(t.launchStartedAt()!)
+      const window = launchCallWindowOf(p)!
+      expect(window.end).toBe(LAUNCH_CALL_END_RETURNED)
+      // The first lap kept the launch start, own or not.
+      expect(dialogApproverLaunchStart(p)).toBe(launchStartMs)
+      const expected = own ? { launchStartMs, window } : undefined
+      expect(ownLaunchRecordOf(p)).toEqual(expected)
+      expect(isCscbOwnLaunch(p, t.launchStartedAt())).toBe(own)
+
+      await h.runApproverToStop(p)
+      expect(h.approverRunning(p)).toBe(false)
+      expect(ownLaunchRecordOf(p)).toEqual(expected)
+    },
+  )
+
+  test.each([
+    ...TIMED_VERBS.flatMap(([name, verb]) => LAUNCH_TIMEOUT_FORMS.map((form) => [name, form, 'inside', true, verb] as const)),
+    ...LAUNCH_TIMEOUT_FORMS.flatMap((form) => (['before', 'after'] as const).map((placement) => [TIMED_VERBS[0]![0], form, placement, false, TIMED_VERBS[0]![1]] as const)),
+  ])(
+    '%s ending in a launch timeout (%s), its one get reading P\'s pending row with its launch start %s the window: CSCB\'s own launch: %s, exactly when it is this launch\'s row; the approver\'s first lap of that window records nothing more',
+    async (_name, form, placement, own, verb) => {
+      const { h, p } = await timedLaunchBuild()
+      verb.arrange(h, p)
+      const t = scriptTimedLaunch(h, p, { verb: verb.verb, reuse: verb.reuse, takesMs: TIMED_CALL_MS, end: form, launchStart: placement })
+      statusOnTimedRow(h, t)
+
+      expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_RETRYING })
+
+      const launchStartMs = Date.parse(t.launchStartedAt()!)
+      expect(launchCallWindowOf(p)?.end).toBe(LAUNCH_CALL_END_LAUNCH_TIMEOUT)
+      const expected = own ? { launchStartMs, window: launchCallWindowOf(p)! } : undefined
+      expect(ownLaunchRecordOf(p)).toEqual(expected)
+      expect(thisLaunchRowOf(p)).toEqual(expected)
+
+      await h.settle()
+      expect(dialogApproverLaunchStart(p)).toBe(launchStartMs)
+      expect(ownLaunchRecordOf(p)).toEqual(expected)
+      expect(isCscbOwnLaunch(p, t.launchStartedAt())).toBe(own)
+      await h.runApproverToStop(p)
+    },
+  )
+
+  // A later launch call begins while the approver's first status read is in
+  // progress, and fails with no window end: the approver's window is no
+  // longer the persona's latest, so its lap keeps the launch start (inside
+  // its own window) and records nothing.
+  test('an approver whose launch call is no longer the persona\'s latest when its first lap reads the row records nothing, though the launch start lies inside its own window', async () => {
+    const { h, p } = await timedLaunchBuild()
+    const t = scriptTimedLaunch(h, p, { verb: 'spawn', reuse: false, takesMs: TIMED_CALL_MS, end: TIMED_LAUNCH_SUCCESS })
+    statusOnTimedRow(h, t)
+    h.script({ resumeError: errTmuxUnresponsive('resume') })
+    const windows: Array<LaunchCallWindowRecord | undefined> = []
+    const status = h.stub.client.status.bind(h.stub.client)
+    h.stub.client.status = async (params) => {
+      if (windows.length === 0 && t.window()?.endMs !== undefined && params.claude_instance_id === personaInstanceId(p)) {
+        windows.push(launchCallWindowOf(p))
+        await launchForLiveRowSequence(harnessPersona(h, p), h.config, { kind: LIVE_ROW_LAUNCH_RESUME, lastRead: ENDED_READ })
+        windows.push(launchCallWindowOf(p))
+      }
+      return status(params)
+    }
+
+    await h.launch(p)
+    await h.settle()
+
+    expect(windows.map((w) => [w?.verb, w?.end])).toEqual([
+      ['spawn', LAUNCH_CALL_END_RETURNED],
+      ['resume', undefined],
+    ])
+    expect(dialogApproverLaunchStart(p)).toBe(Date.parse(t.launchStartedAt()!))
+    expect(ownLaunchRecordOf(p)).toBeUndefined()
+    expect(isCscbOwnLaunch(p, t.launchStartedAt())).toBe(false)
+  })
+
+  test.each([
+    ['fails with no window end (ErrTmuxUnresponsive): no record', false],
+    ['returns success and its approver\'s first lap reads the new launch start inside the new window: the new launch\'s record in its place', true],
+  ] as const)('a later launch call of P (the live-row sequence\'s resume) forgets P\'s record as it begins; one that %s', async (_label, succeeds) => {
+    const { h, p } = await timedLaunchBuild()
+    const first = await ownTimedLaunch(h, p)
+    await stopDialogApprover(p, APPROVER_STOP_TEARDOWN)
+    const second = succeeds ? scriptTimedLaunch(h, p, { verb: 'resume', takesMs: TIMED_CALL_MS, end: TIMED_LAUNCH_SUCCESS }) : undefined
+    if (second === undefined) h.script({ resumeError: errTmuxUnresponsive('resume') })
+    else statusOnTimedRow(h, second)
+    const atCall: unknown[] = []
+    const resume = h.stub.client.resume.bind(h.stub.client)
+    h.stub.client.resume = async (params) => {
+      atCall.push(ownLaunchRecordOf(p))
+      return resume(params)
+    }
+
+    await launchForLiveRowSequence(harnessPersona(h, p), h.config, { kind: LIVE_ROW_LAUNCH_RESUME, lastRead: ENDED_READ })
+    await h.settle()
+
+    expect(atCall).toEqual([undefined])
+    expect([launchCallWindowOf(p)?.verb, launchCallWindowOf(p)?.end]).toEqual(['resume', succeeds ? LAUNCH_CALL_END_RETURNED : undefined])
+    expect(ownLaunchRecordOf(p)).toEqual(second === undefined ? undefined : { launchStartMs: Date.parse(second.launchStartedAt()!), window: launchCallWindowOf(p)! })
+    expect(isCscbOwnLaunch(p, first.launchStartedAt())).toBe(false)
+  })
+
+  test('the teardown\'s kill forgets the torn-down persona\'s record before its first try, and only that one; the reset forgets every record', async () => {
+    const { h, p, b } = await timedLaunchBuild()
+    const timed = new Map([p, b].map((key) => [personaInstanceId(key), scriptTimedLaunch(h, key, { verb: 'spawn', reuse: false, takesMs: TIMED_CALL_MS, end: TIMED_LAUNCH_SUCCESS })] as const))
+    h.script({
+      statusFn: (params) => {
+        const t = timed.get(String(params.claude_instance_id))
+        return t?.window()?.endMs !== undefined ? t.statusRow() : cannedStatusResult()
+      },
+    })
+    await h.launch(p)
+    await h.launch(b)
+    await h.settle()
+    const records = [p, b].map((key) => ownLaunchRecordOf(key))
+    expect(records.map((record) => record?.launchStartMs)).toEqual([p, b].map((key) => Date.parse(timed.get(personaInstanceId(key))!.launchStartedAt()!)))
+    const atKill: unknown[] = []
+    const kill = h.stub.client.kill.bind(h.stub.client)
+    h.stub.client.kill = async (params) => {
+      atKill.push(ownLaunchRecordOf(p))
+      return kill(params)
+    }
+
+    await h.drive(killPersonaInstanceForTeardown(p, { clock: h.killRetryClock }))
+
+    expect(atKill).toEqual([undefined])
+    expect([ownLaunchRecordOf(p), ownLaunchRecordOf(b)]).toEqual([undefined, records[1]])
+
+    _resetInFlightLaunches()
+    expect(ownLaunchRecordOf(b)).toBeUndefined()
+  })
+
+  test('no read forgets it: P\'s row read waiting through the shared own-row get forgets "this launch\'s row" and keeps CSCB\'s own launch', async () => {
+    const { h, p } = await timedLaunchBuild()
+    const t = scriptTimedLaunch(h, p, { verb: 'spawn', reuse: false, takesMs: TIMED_CALL_MS, end: LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT })
+    statusOnTimedRow(h, t)
+    await h.launch(p)
+    const record = ownLaunchRecordOf(p)
+    expect(record).toBeDefined()
+    expect(thisLaunchRowOf(p)).toEqual(record)
+    await stopDialogApprover(p, APPROVER_STOP_TEARDOWN)
+
+    t.setRow({ state: 'waiting' })
+    await readPersonaOwnRow(p, STATUS_READ_SITE)
+
+    expect([thisLaunchRowOf(p), ownLaunchRecordOf(p)]).toEqual([undefined, record])
+  })
+
+  test('the own-launch query: both forms of the recorded instant are own; another instant, another persona and a launch start naming no instant are not; a query forgets nothing', async () => {
+    const { h, p, b } = await timedLaunchBuild()
+    const raw = (await ownTimedLaunch(h, p)).launchStartedAt()!
+    const ms = Date.parse(raw)
+    const record = ownLaunchRecordOf(p)
+    const notOwn: unknown[] = [ms - 1, ms + 1, new Date(ms + 1).toISOString(), undefined, null, 'not a time', Number.NaN]
+
+    expect([raw, ms].map((form) => isCscbOwnLaunch(p, form))).toEqual([true, true])
+    expect(notOwn.map((form) => isCscbOwnLaunch(p, form))).toEqual(notOwn.map(() => false))
+    expect([isCscbOwnLaunch(b, raw), ownLaunchRecordOf(b)]).toEqual([false, undefined])
+    expect(ownLaunchRecordOf(p)).toEqual(record)
+    expect(isCscbOwnLaunch(p, raw)).toBe(true)
+  })
+
+  test('R13: once a send-keys on the launch answered ErrSpawnNotInteractive (the not-interactive record of its launch start) it is not own, in either form, and its record is kept; that record for another launch start changes nothing', async () => {
+    const { h, p } = await timedLaunchBuild()
+    const raw = (await ownTimedLaunch(h, p)).launchStartedAt()!
+    const record = ownLaunchRecordOf(p)
+
+    recordSendKeysNotInteractive(p, Date.parse(raw) + 1)
+    expect(isCscbOwnLaunch(p, raw)).toBe(true)
+
+    recordSendKeysNotInteractive(p, raw)
+    expect([isCscbOwnLaunch(p, raw), isCscbOwnLaunch(p, Date.parse(raw))]).toEqual([false, false])
+    expect(ownLaunchRecordOf(p)).toEqual(record)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-412, SRJ-110, SRJ-702, SRJ-704, SRJ-501, SRJ-512, SRJ-316 (E29
+// T3): the abort's one checked kill of P's own `pending` row
+// (`abortKillOwnStuckLaunch`), called directly on the recovery harness's
+// kill-retry clock with its kill-failure alerts installed as main() installs
+// them. The bounded retry is seeded `pending`: up to `KILL_RETRY_TRIES` tries
+// `KILL_RETRY_SPACING_MS` apart on UNAVAILABLE (never the restart path's one
+// try), one shared own-row `status` read before each further try, a CONFIG
+// answer at that read ending the tries, and the stop rule (P not up). One
+// case per answer class; no answer makes a delete, a `get` or a launch. The
+// rule's use of each answer (the per-episode abort, the held text after a
+// used abort, the same abort at the next step 3 after try-later or stopped)
+// is tests/pending-row.test.ts's.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-412: the abort kill of CSCB\'s own stuck launch (abortKillOwnStuckLaunch) answers one typed outcome per class', () => {
+  afterEach(srj105AfterEach)
+
+  /** The stub's survivor-naming `ErrTmuxKillFailed`. */
+  const survivorErr = (): Error => errTmuxKillFailed(undefined, 'pane-process-survived')
+
+  /** The answer's description of a kill that threw `err`. */
+  const thrownDescription = (err: Error): string => describeKillOutcome(killOutcomeOf({ thrown: err }))
+
+  /** The state the abort's latch records: `pending`, the state the rule's `get` last read. */
+  const PENDING_READ = latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE)
+
+  /**
+   * Run the abort kill of `p` on the harness's kill-retry clock to its end;
+   * assert it made `kills` kills and `reads` status reads of P's own instance
+   * and no other call, waited `waits` spacings and left no timer but P's
+   * retry timer armed with `armed` (an outage raised as from any verb).
+   * Resolves with its answer.
+   */
+  async function abortKill(
+    h: RecoveryHarness,
+    p: string,
+    kills: number,
+    reads: number,
+    { waits = reads, armed = [] }: { readonly waits?: number; readonly armed?: readonly string[] } = {},
+  ): Promise<StuckLaunchAbortKillAnswer> {
+    const startedAt = h.clock.now()
+    const answer = await h.drive(abortKillOwnStuckLaunch(p, renderPersonaRef(p, p), { clock: h.killRetryClock }))
+    const id = personaInstanceId(p)
+    expect(h.clock.now() - startedAt).toBe(waits * KILL_RETRY_SPACING_MS)
+    expect(h.controller.view(p)?.causes ?? []).toEqual([...armed])
+    expect(h.clock.pending()).toHaveLength(armed.length === 0 ? 0 : 1)
+    expect(h.stub.calls.killCalls).toEqual(Array.from({ length: kills }, () => ({ claude_instance_id: id })))
+    expect(h.stub.calls.statusCalls.map((c) => c.claude_instance_id)).toEqual(Array.from({ length: reads }, () => id))
+    expect(h.stub.callCount()).toBe(kills + reads)
+    return answer
+  }
+
+  test.each([true, false])('a first try succeeding with kill_sent %s: succeeded, carrying it; no alert, nothing latched', async (killSent) => {
+    const { h, p } = srj105Build()
+    h.script({ killResult: cannedKillResult(killSent) })
+
+    expect(await abortKill(h, p, 1, 0)).toEqual({ kind: STUCK_LAUNCH_ABORT_KILL_SUCCEEDED, killSent, description: describeKillOutcome({ kind: KILL_OUTCOME_KILLED, killSent }) })
+
+    expect([h.episodeNotices, killFailureLines(h, p), h.latch.isLatched(p)]).toEqual([[], [], false])
+  })
+
+  test.each<[string, RecoveryStubScript, number, Parameters<typeof describeKillOutcome>[0]]>([
+    ['the row already gone (ErrSpawnNotFound)', { killError: errSpawnNotFound() }, 0, { kind: KILL_OUTCOME_ROW_GONE }],
+    ['ErrTmuxUnresponsive, then a read of ended', { killError: errTmuxUnresponsive('kill'), statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))] }, 1, { kind: KILL_OUTCOME_ROW_FINISHED, read: KILL_ROW_FINISHED_ENDED }],
+  ])('%s: succeeded with no kill_sent; no alert, nothing latched', async (_label, script, reads, outcome) => {
+    const { h, p } = srj105Build()
+    h.script(script)
+
+    expect(await abortKill(h, p, 1, reads)).toEqual({ kind: STUCK_LAUNCH_ABORT_KILL_SUCCEEDED, description: describeKillOutcome(outcome) })
+
+    expect([h.episodeNotices, h.latch.isLatched(p)]).toEqual([[], false])
+  })
+
+  test('a survivor-naming ErrTmuxKillFailed, then a success with kill_sent true: succeeded after two tries and one read; the survivor version, with the stuck-launch abort context; no episode opens', async () => {
+    const { h, p } = srj105Build()
+    const survivor = survivorErr()
+    h.script({ killQueue: [cannedErr(survivor), cannedOk(cannedKillResult(true))] })
+
+    expect(await abortKill(h, p, 2, 1)).toEqual({ kind: STUCK_LAUNCH_ABORT_KILL_SUCCEEDED, killSent: true, description: describeKillOutcome({ kind: KILL_OUTCOME_KILLED, killSent: true }) })
+
+    const content = survivorAlertContent(p, survivor)
+    expect(h.episodeNotices).toEqual([killFailureNotice(p, content)])
+    expect(killFailureLines(h, p)).toEqual([killFailurePostedLine(p, content, KILL_FAILURE_CLOSING_DESTINATION, KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT)])
+    expect(h.killFailureOpen(p)).toBe(false)
+  })
+
+  test('ErrTmuxKillFailed at every try: kill-failed after 3 tries 2 s apart, the row read before each further try (the pending seed, never the restart path\'s one try); one ordinary alert with the stuck-launch abort context; nothing latched', async () => {
+    const { h, p } = srj105Build()
+    const err = errTmuxKillFailed()
+    h.script({ killError: err })
+
+    expect(await abortKill(h, p, KILL_RETRY_TRIES, KILL_RETRY_TRIES - 1)).toEqual({ kind: STUCK_LAUNCH_ABORT_KILL_FAILED, description: thrownDescription(err) })
+
+    const content = ordinaryAlertContent(p, { last: err })
+    expect(h.episodeNotices).toEqual([killFailureNotice(p, content)])
+    expect(killFailureLines(h, p)).toEqual([killFailurePostedLine(p, content, KILL_FAILURE_CLOSING_DESTINATION, KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT)])
+    expect([h.killFailureOpen(p), h.latch.isLatched(p)]).toEqual([true, false])
+  })
+
+  // SRJ-316, SRJ-702: the seed is `pending`, so a CONFIG answer at the first
+  // read between tries ends them (no `configReadEndsTries` is set). The
+  // build lead's ruling: an ErrTmuxKillFailed standing then is kill-failed
+  // (its alert raised), any other UNAVAILABLE try-later.
+  test.each<[string, () => Error, (err: Error) => StuckLaunchAbortKillAnswer, boolean]>([
+    ['ErrTmuxKillFailed', () => errTmuxKillFailed(), (err) => ({ kind: STUCK_LAUNCH_ABORT_KILL_FAILED, description: thrownDescription(err) }), true],
+    ['ErrTmuxUnresponsive', () => errTmuxUnresponsive('kill'), (err) => ({ kind: STUCK_LAUNCH_ABORT_KILL_TRY_LATER, errorClass: AD_ERROR_CLASS_UNAVAILABLE, description: thrownDescription(err) }), false],
+  ])('%s at the first try, then a CONFIG answer at the read between tries: the tries end with no further kill; ad-config-malformed raised once; the answer by what stands', async (_label, make, answer, alerted) => {
+    const { h, p } = srj105Build()
+    const err = make()
+    const configErr = errConfigMalformed()
+    h.script({ killError: err, statusQueue: [cannedErr(configErr)] })
+
+    expect(await abortKill(h, p, 1, 1, { armed: [UNAVAILABLE_RETRY_CAUSE_CONFIG] })).toEqual(answer(err))
+
+    expect([...getOutageFlags(p)]).toEqual([AD_CONFIG_MALFORMED_CLASS])
+    expect(h.outageNotices).toEqual([{ key: p, text: adConfigMalformedOnset(configErr) }])
+    expect(h.episodeNotices).toEqual(alerted ? [killFailureNotice(p, ordinaryAlertContent(p, { last: err }))] : [])
+    expect(h.latch.isLatched(p)).toBe(false)
+  })
+
+  test.each(STUCK_LAUNCH_ABORT_CONFLICT_CASE_ROWS.map((row) => [row.name, row] as const))('CONFLICT at the first try (%s): latched, never tried again; P latched once through the CONFLICT entry with "P\'s next check or recovery" and the state pending; no alert', async (_name, row) => {
+    const { h, p } = srj105Build()
+    const err = row.build()
+    h.script({ killQueue: [cannedErr(err), cannedOk(cannedKillResult(true))] })
+
+    expect(await abortKill(h, p, 1, 0)).toEqual({ kind: STUCK_LAUNCH_ABORT_KILL_LATCHED, description: thrownDescription(err) })
+
+    expectLatchedOnce(h, p, conflictLatch(p, row, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, PENDING_READ))
+    expect(killFailureLines(h, p)).toEqual([])
+  })
+
+  test.each(STUCK_LAUNCH_ABORT_UNUSABLE_NAME_CASE_ROWS.map((row) => [row.name, row] as const))('UNUSABLE NAME at the first try (%s): latched, never tried again; P latched once through the unusable-name entry with the state pending; no alert', async (_name, row) => {
+    const { h, p } = srj105Build()
+    const err = row.build()
+    h.script({ killQueue: [cannedErr(err), cannedOk(cannedKillResult(true))] })
+
+    expect(await abortKill(h, p, 1, 0)).toEqual({ kind: STUCK_LAUNCH_ABORT_KILL_LATCHED, description: thrownDescription(err) })
+
+    expectLatchedOnce(h, p, unusableNameLatch(p, row, PENDING_READ))
+    expect(killFailureLines(h, p)).toEqual([])
+  })
+
+  // An outage raised arms P's retry timer with its cause, as from any verb (SRJ-311, SRJ-316).
+  test.each<[string, () => Error, string, number, readonly OutageClass[], readonly string[]]>([
+    ['ErrTmuxUnresponsive at every try (UNAVAILABLE)', () => errTmuxUnresponsive('kill'), AD_ERROR_CLASS_UNAVAILABLE, KILL_RETRY_TRIES, [], []],
+    ['ErrCallTimeout at every try (UNAVAILABLE)', () => errCallTimeout('kill'), AD_ERROR_CLASS_UNAVAILABLE, KILL_RETRY_TRIES, [], []],
+    ['ENVIRONMENT (ErrTmuxNotAvailable)', () => errTmuxNotAvailable(undefined, 'kill'), AD_ERROR_CLASS_ENVIRONMENT, 1, [TMUX_UNAVAILABLE_CLASS], [UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT]],
+    ['CONFIG (ErrConfigMalformed)', () => errConfigMalformed(), AD_ERROR_CLASS_CONFIG, 1, [AD_CONFIG_MALFORMED_CLASS], [UNAVAILABLE_RETRY_CAUSE_CONFIG]],
+    ['UNCLASSIFIED (ErrInternal)', () => errInternal(), AD_ERROR_CLASS_UNCLASSIFIED, 1, [], []],
+  ])('%s: try-later with its class, the outcome\'s outage raised; no alert, nothing latched', async (_label, make, errorClass, kills, flags, armed) => {
+    const { h, p } = srj105Build()
+    const err = make()
+    h.script({ killError: err })
+
+    expect(await abortKill(h, p, kills, kills - 1, { armed })).toEqual({ kind: STUCK_LAUNCH_ABORT_KILL_TRY_LATER, errorClass, description: thrownDescription(err) })
+
+    expect([...getOutageFlags(p)]).toEqual([...flags])
+    expect([h.episodeNotices, killFailureLines(h, p), h.latch.isLatched(p)]).toEqual([[], [], false])
+  })
+
+  // SRJ-104, SRJ-204: ErrInvalidFlags gets one immediate version re-check.
+  // One that passes leaves UNCLASSIFIED (try-later, the abort not used); one
+  // that decides the server stops answers stopped (the abort not used).
+  test('ErrInvalidFlags whose one re-check passes: try-later as UNCLASSIFIED after one try; no alert, nothing latched, no stop asked', async () => {
+    const { h, p } = srj105Build()
+    const { resolves, stops } = h.recheckAnswers(PHASE1_RC_VERSION)
+    const err = errInvalidFlags('kill')
+    h.script({ killError: err })
+
+    const answer = await abortKill(h, p, 1, 0)
+
+    expect(answer).toMatchObject({ kind: STUCK_LAUNCH_ABORT_KILL_TRY_LATER, errorClass: AD_ERROR_CLASS_UNCLASSIFIED })
+    expect(stuckLaunchAbortKillUsesAbort(answer)).toBe(false)
+    expect([resolves.length, stops]).toEqual([1, []])
+    expect([h.episodeNotices, killFailureLines(h, p), h.latch.isLatched(p)]).toEqual([[], [], false])
+  })
+
+  test('ErrInvalidFlags whose one re-check decides that the server stops: stopped after one try, with no further kill or read; no alert, nothing latched', async () => {
+    const { h, p } = srj105Build()
+    const { resolves, stops } = h.recheckAnswers(OLD_AD_VERSION)
+    h.script({ killError: errInvalidFlags('kill') })
+
+    const answer = await abortKill(h, p, 1, 0)
+
+    expect(answer.kind).toBe(STUCK_LAUNCH_ABORT_KILL_STOPPED)
+    expect(stuckLaunchAbortKillUsesAbort(answer)).toBe(false)
+    expect([resolves.length, stops.length]).toEqual([1, 1])
+    expect([h.episodeNotices, killFailureLines(h, p), h.latch.isLatched(p)]).toEqual([[], [], false])
+  })
+
+  // SRJ-702's stop rule: P not up when a try returns stops the tries; neither
+  // version is raised, for a configured persona one line only.
+  test.each<[string, () => Error[], (errs: Error[]) => KillRetryAlert]>([
+    ['an ErrTmuxKillFailed naming no survivor', () => [errTmuxKillFailed()], (errs) => ({ kind: KILL_RETRY_ALERT_ORDINARY, lastKillFailedDescription: killFailedDescriptionOf(errs[0]!)! })],
+    ['a survivor-naming ErrTmuxKillFailed, then ErrTmuxUnresponsive', () => [survivorErr(), errTmuxUnresponsive('kill')], (errs) => ({ kind: KILL_RETRY_ALERT_ORDINARY, earlierSurvivorDescription: killFailedDescriptionOf(errs[0]!)! })],
+  ])('%s, P no longer up when the last try returns: stopped, with no further kill or read; no alert of either version, no entry, one stop line; nothing latched', async (_label, make, decision) => {
+    const { h, p } = srj105Build()
+    const errs = make()
+    h.script({ killQueue: errs.map((err) => cannedErr(err)) })
+    const kill = h.stub.client.kill.bind(h.stub.client)
+    h.stub.client.kill = async (params) => {
+      try {
+        return await kill(params)
+      } finally {
+        if (h.stub.calls.killCalls.length === errs.length) h.setUp(p, false)
+      }
+    }
+
+    expect(await abortKill(h, p, errs.length, errs.length - 1, { waits: errs.length })).toEqual({ kind: STUCK_LAUNCH_ABORT_KILL_STOPPED, description: thrownDescription(errs.at(-1)!) })
+
+    const stopped = killFailureStoppedRetryText({
+      key: p,
+      decision: decision(errs),
+      context: KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT,
+      lastOutcomeClass: AD_ERROR_CLASS_UNAVAILABLE,
+      stopCause: PERSONA_KILL_STOP_CAUSE_NOT_UP,
+    })
+    expect(killFailureLines(h, p)).toEqual([stopped.line])
+    expect([h.episodeNotices, h.startupErrors(), h.killFailureOpen(p), h.latch.isLatched(p)]).toEqual([[], [], false, false])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-412, SRJ-404, SRJ-705 (E29 T3): the abort's approver stop and
+// its live-row sequence start. The stop's effects on the approver (no rule
+// run, nothing armed) are tests/approve-trust-folder-dialog.test.ts's; the
+// sequence's run from step 2 is tests/live-row-sequence.test.ts's.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-412, SRJ-404: the abort\'s approver stop (stopApproverForStuckLaunchAbort) stops only a running approver', () => {
+  afterEach(srj105AfterEach)
+
+  test('a running approver: stopped with the stuck-launch-abort reason and its one line; resolves true once it has stopped', async () => {
+    const { h, p } = srj105Build()
+    h.script({ statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }) })
+    await h.launch(p)
+    await h.settle()
+    expect(h.approverRunning(p)).toBe(true)
+
+    expect(await stopApproverForStuckLaunchAbort(p)).toBe(true)
+
+    expect(h.approverRunning(p)).toBe(false)
+    expect(await _whenDialogApproverStopped(p)).toMatchObject({ reason: APPROVER_STOP_STUCK_LAUNCH_ABORT })
+    const line = approverLogLine(approverStopRequestedMessage(renderPersonaRef(p, p), APPROVER_STOP_STUCK_LAUNCH_ABORT))
+    expect(h.errors.filter((l) => l === line)).toHaveLength(1)
+  })
+
+  test('no approver running while P\'s launch is in flight: resolves false with no line, and the approver that launch starts is not cancelled', async () => {
+    const { h, p } = srj105Build()
+    h.script({ statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }) })
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let reached!: () => void
+    const atSpawn = new Promise<void>((resolve) => {
+      reached = resolve
+    })
+    const spawn = h.stub.client.spawn.bind(h.stub.client)
+    h.stub.client.spawn = async (params) => {
+      reached()
+      await gate
+      return spawn(params)
+    }
+    const launched = h.launch(p)
+    await atSpawn
+    expect([isLaunchInFlight(p), h.approverRunning(p)]).toEqual([true, false])
+
+    expect(await stopApproverForStuckLaunchAbort(p)).toBe(false)
+
+    release()
+    await launched
+    await h.settle()
+    expect(h.approverRunning(p)).toBe(true)
+    expect(h.errors.filter((l) => l.includes(APPROVER_STOP_STUCK_LAUNCH_ABORT))).toEqual([])
+  })
+})
+
+describe('b.jg5 SRJ-412, SRJ-705: the abort\'s live-row sequence start (startStuckLaunchAbortSequence)', () => {
+  afterEach(srj105AfterEach)
+
+  /** Install a sequence registry whose start answers `answer`, or throws it, starting nothing. */
+  function registryAnswering(answer: ReturnType<LiveRowSequenceRegistry['start']> | Error): void {
+    setLiveRowSequenceRegistry({
+      start: () => {
+        if (answer instanceof Error) throw answer
+        return answer
+      },
+      stop: async () => false,
+      stopNoLaunch: async () => false,
+      stopAll: async () => {},
+      close: async () => {},
+      isRunning: () => false,
+      isNoLaunchRunning: () => false,
+      _whenSettled: async () => undefined,
+      _whenSettledOn: async () => undefined,
+    })
+  }
+
+  test('one request through the start entry: entry at step 2, the row last read pending, the conversation kept, ending in a launch, no retired-key flag, context stuck-launch abort; answers started', () => {
+    const { p } = srj105Build()
+    const starts = recordSequenceStarts()
+    const ref = renderPersonaRef(p, p)
+
+    expect(startStuckLaunchAbortSequence(p, ref)).toEqual({ kind: STUCK_LAUNCH_ABORT_SEQUENCE_STARTED })
+
+    expect(starts).toEqual([
+      {
+        key: p,
+        ref,
+        instanceId: personaInstanceId(p),
+        lastReadState: AGENT_DIRECTOR_PENDING_STATE,
+        entryStep: LIVE_ROW_SEQUENCE_ENTRY_GET,
+        keepsConversation: true,
+        retiredKey: false,
+        launches: true,
+        alertContext: KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT,
+        // The start entry's own addition: the store's reading of the key at the attempt's start.
+        retiredAtStart: expect.anything(),
+      },
+    ])
+  })
+
+  test.each<[string, () => void, string]>([
+    ['the registry answering already-running', () => registryAnswering(LIVE_ROW_START_ALREADY_RUNNING), LIVE_ROW_START_ALREADY_RUNNING],
+    ['the registry answering closed', () => registryAnswering(LIVE_ROW_START_CLOSED), LIVE_ROW_START_CLOSED],
+    ['no registry installed', () => _resetLiveRowSequenceRegistry(), LIVE_ROW_START_NOT_INSTALLED],
+  ])('%s: not started, with the start entry\'s answer as why', (_label, arrange, why) => {
+    const { p } = srj105Build()
+    arrange()
+
+    expect(startStuckLaunchAbortSequence(p, renderPersonaRef(p, p))).toEqual({ kind: STUCK_LAUNCH_ABORT_SEQUENCE_NOT_STARTED, why })
+  })
+
+  test('a start that throws: not started, why naming the thrown value; it does not throw', () => {
+    const { p } = srj105Build()
+    const failure = new Error('registry broke')
+    registryAnswering(failure)
+
+    expect(startStuckLaunchAbortSequence(p, renderPersonaRef(p, p))).toEqual({ kind: STUCK_LAUNCH_ABORT_SEQUENCE_NOT_STARTED, why: `its start failed: ${describeThrownValue(failure)}` })
   })
 })

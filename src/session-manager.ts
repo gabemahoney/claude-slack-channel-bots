@@ -502,6 +502,7 @@ import {
   type InvalidFlagsHold,
 } from './invalid-flags-hold.ts'
 import {
+  KILL_OUTCOME_KILLED,
   KILL_OUTCOME_NOT_KILLED,
   KILL_REFUSAL_AT_KILL,
   KILL_REFUSAL_AT_READ,
@@ -516,6 +517,7 @@ import {
   KILL_FAILURE_CONTEXT_OLD_LIFE_WAIT,
   KILL_FAILURE_CONTEXT_RECOVERY,
   KILL_FAILURE_CONTEXT_START_SWEEP,
+  KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT,
   KILL_FAILURE_VERSION_ORDINARY,
   KILL_FAILURE_VERSION_SURVIVOR,
   ORPHAN_CLEANUP_LABEL,
@@ -699,6 +701,7 @@ import {
   LIVE_ROW_RUN_MARKED_MISSING,
   LIVE_ROW_RUN_NOT_JUDGED,
   LIVE_ROW_RUN_REFUSED,
+  LIVE_ROW_SEQUENCE_ENTRY_GET,
   LIVE_ROW_SEQUENCE_ENTRY_KILL,
   LIVE_ROW_SEQUENCE_LOG_PREFIX,
   LIVE_ROW_START_ALREADY_RUNNING,
@@ -815,11 +818,24 @@ import {
   PENDING_ROW_RUN_MARKED_MISSING,
   PENDING_ROW_RUN_NOT_JUDGED,
   PENDING_ROW_RUN_REFUSED,
+  STUCK_LAUNCH_ABORT_KILL_FAILED,
+  STUCK_LAUNCH_ABORT_KILL_LATCHED,
+  STUCK_LAUNCH_ABORT_KILL_STOPPED,
+  STUCK_LAUNCH_ABORT_KILL_SUCCEEDED,
+  STUCK_LAUNCH_ABORT_KILL_TRY_LATER,
+  STUCK_LAUNCH_ABORT_SEQUENCE_NOT_STARTED,
+  STUCK_LAUNCH_ABORT_SEQUENCE_STARTED,
+  STUCK_LAUNCH_POST_FAILED,
   STUCK_LAUNCH_SUPPRESSED,
+  createStuckLaunchAbort,
   describePendingRowRuleAnswer,
   pendingRowLapEnterFailureOf,
   pendingRowRuleFailedLine,
   postStuckLaunchHeld,
+  postStuckLaunchRelaunching,
+  type StuckLaunchAbortEpisodes,
+  type StuckLaunchAbortKillAnswer,
+  type StuckLaunchAbortSequenceStart,
   type PendingRowLapEnterFailure,
   type PendingRowLapEnterLatching,
   type PendingRowLapEnterOutcome,
@@ -4149,6 +4165,13 @@ export const APPROVER_STOP_TEARDOWN = 'teardown'
 export const APPROVER_STOP_RETIRED_KEY = 'retired-key'
 /** Shutdown stopped the approver (b.jg5 SRJ-404). */
 export const APPROVER_STOP_SHUTDOWN = 'shutdown'
+/**
+ * The abort of the persona's own stuck launch began (b.jg5 SRJ-412, SRJ-404;
+ * hatch A3): the pending-row rule stopped the approver before the abort's
+ * kill (`stopApproverForStuckLaunchAbort`). No pending-row rule run follows
+ * this stop, and it arms nothing (`APPROVER_STOPS_THAT_ARM`).
+ */
+export const APPROVER_STOP_STUCK_LAUNCH_ABORT = 'stuck-launch-abort'
 /** The approver's loop threw (not reached: every step is guarded); the throw was logged and nothing more was called. */
 export const APPROVER_STOP_FAILED = 'failed'
 
@@ -4158,7 +4181,7 @@ export const APPROVER_STOP_FAILED = 'failed'
  * member, so a reader of the outcome tells which stops leave a `pending` row
  * to the pending-row rule (b.jg5 SRJ-404: B or the cap, GONE, not
  * interactive, tmux unavailable, superseded) from those that do not
- * (shutdown, latched, teardown, retired key).
+ * (shutdown, latched, teardown, retired key, the stuck-launch abort).
  */
 export type ApproverStopReason =
   | typeof APPROVER_STOP_LIVE
@@ -4175,13 +4198,14 @@ export type ApproverStopReason =
   | typeof APPROVER_STOP_TEARDOWN
   | typeof APPROVER_STOP_RETIRED_KEY
   | typeof APPROVER_STOP_SHUTDOWN
+  | typeof APPROVER_STOP_STUCK_LAUNCH_ABORT
   | typeof APPROVER_STOP_FAILED
 
 /**
  * The reasons a caller stops a persona's approver with (`stopDialogApprover`):
  * each is also the stopped approver's {@link ApproverStopReason}. One member
- * per kind of stop (a later stop, such as the abort of the persona's own
- * stuck launch, is one more member here), so a reader of the outcome tells
+ * per kind of stop (the abort of the persona's own stuck launch included,
+ * `APPROVER_STOP_STUCK_LAUNCH_ABORT`), so a reader of the outcome tells
  * which stops leave the row to the pending-row rule: none of these but
  * `superseded` does (b.jg5 SRJ-404).
  */
@@ -4191,6 +4215,7 @@ export type ApproverStopRequestReason =
   | typeof APPROVER_STOP_RETIRED_KEY
   | typeof APPROVER_STOP_SHUTDOWN
   | typeof APPROVER_STOP_LATCHED
+  | typeof APPROVER_STOP_STUCK_LAUNCH_ABORT
 
 /** The approver's two time limits: B, or the test cap set in place of it. */
 type ApproverLimitReason = typeof APPROVER_STOP_BOUND | typeof APPROVER_STOP_CAP
@@ -4351,6 +4376,7 @@ const APPROVER_STOP_REQUEST_WHY: Readonly<Record<ApproverStopRequestReason, stri
   [APPROVER_STOP_RETIRED_KEY]: 'its key was recorded as retired',
   [APPROVER_STOP_SHUTDOWN]: 'the server is shutting down',
   [APPROVER_STOP_LATCHED]: 'the persona latched',
+  [APPROVER_STOP_STUCK_LAUNCH_ABORT]: "CSCB is aborting the persona's own stuck launch, and its kill follows; no pending-row run follows this stop",
 }
 
 /** The message for a stop of a running approver (`stopDialogApprover`, `startDialogApprover` superseding one, the latch's set observer). */
@@ -4487,10 +4513,19 @@ interface ApproverRun {
    * run at the approver's stop runs on (b.jg5 SRJ-404, SRJ-410).
    */
   lastLaunchStartedAt: unknown
+  /**
+   * The window of the launch call that started this approver
+   * (`launchCallWindowOf` when the registry started it; b.jg5 SRJ-407,
+   * SRJ-412), or `undefined` for an approver run directly
+   * (`approvePreSessionDialogs`), which takes the persona's latest window at
+   * its first lap. The first lap that keeps a launch start records CSCB's own
+   * launch only while this is still the persona's latest window.
+   */
+  readonly launchWindow: LaunchCallWindowRecord | undefined
 }
 
-/** A fresh approver state: no stop asked, no limit armed, no launch start kept. */
-function newApproverRun(): ApproverRun {
+/** A fresh approver state: no stop asked, no limit armed, no launch start kept; `launchWindow` the window of the launch call that started it, if known. */
+function newApproverRun(launchWindow?: LaunchCallWindowRecord): ApproverRun {
   return {
     stopRequested: undefined,
     limitReached: undefined,
@@ -4499,6 +4534,7 @@ function newApproverRun(): ApproverRun {
     launchStartMs: undefined,
     lastStateRead: undefined,
     lastLaunchStartedAt: undefined,
+    launchWindow,
   }
 }
 
@@ -4803,10 +4839,20 @@ function approverLimitReached(ctx: ApproverContext, reason: ApproverLimitReason,
  * (`parseLaunchStart`); B is re-armed from the raw value through
  * `armApproverBoundFromLaunchStart`, which arms nothing for one that does
  * not parse.
+ *
+ * b.jg5 SRJ-412, SRJ-407: when the launch call that started the approver
+ * (`run.launchWindow`, or, for an approver run directly, the persona's
+ * latest window) is still the persona's latest, returned success
+ * (`LAUNCH_CALL_END_RETURNED`) and the kept launch start lies inside its
+ * window, the launch is recorded as CSCB's own (`recordOwnLaunch`); the
+ * record outlives the approver, for the pending-row rule's step 3. A launch
+ * start outside the window, a window with no end or a launch-timeout window
+ * (recorded by `afterLaunchUnavailable` instead) records nothing here.
  */
 function keepApproverLaunchStart(ctx: ApproverContext, launchStartedAt: unknown, launchStartMs: number): void {
   const { run } = ctx
   run.launchStartMs = launchStartMs
+  recordOwnLaunch(ctx.key, run.launchWindow ?? launchCallWindowOf(ctx.key), LAUNCH_CALL_END_RETURNED, launchStartedAt)
   if (run.limit === undefined || run.limit.reason !== APPROVER_STOP_BOUND) return
   armApproverBoundFromLaunchStart(ctx.clock, run, launchStartedAt)
 }
@@ -11853,13 +11899,18 @@ export interface PendingRowRuleDepsInput {
   /** The applied persona with this key, read at each call (production: `getAppliedPersona`); the old-life hold gate reads it. */
   readonly appliedPersona: (key: string) => Persona | undefined
   /**
-   * The server's one notice episodes instance, the held text's poster's
-   * (production: `main()`'s notice episodes). Absent: the stuck-launch
-   * episodes installed with `setStuckLaunchEpisodes`, read at each post.
+   * The server's one notice episodes instance, the stuck-launch posters' and
+   * the abort's per-episode state's (production: `main()`'s notice
+   * episodes). Absent: the stuck-launch episodes installed with
+   * `setStuckLaunchEpisodes`, read at each post.
    */
-  readonly episodes?: StuckLaunchPostEpisodes
+  readonly episodes?: StuckLaunchPostEpisodes & StuckLaunchAbortEpisodes
   /** Receives the rule's lines and its poster's (default: the server log). */
   readonly log?: (line: string) => void
+  /** The wait between the abort kill's tries (default: `KILL_RETRY_SYSTEM_CLOCK`; b.jg5 SRJ-702, SRJ-412). */
+  readonly killRetryWait?: KillRetryWait
+  /** The kill-failure alerts the abort kill raises through (default: the installed ones, `setKillFailureAlerts`). */
+  readonly killFailureAlerts?: KillFailureAlerts
 }
 
 /**
@@ -11932,6 +11983,160 @@ export function pendingRowRuleNoEpisodesLine(key: string): string {
   return `[slack] pending-row: persona=${key} stuck-launch held text not posted — no notice episodes are installed (b.jg5 SRJ-1017)`
 }
 
+/** The line for a relaunching post with no episodes instance to post through: nothing posted, and so no abort. */
+export function pendingRowRuleNoEpisodesRelaunchingLine(key: string): string {
+  return `[slack] pending-row: persona=${key} stuck-launch relaunching text not posted — no notice episodes are installed, so no abort is made (b.jg5 SRJ-1017, SRJ-412)`
+}
+
+// ---------------------------------------------------------------------------
+// The abort of CSCB's own stuck launch: its kill, its approver stop and its
+// sequence (b.jg5 SRJ-412)
+// ---------------------------------------------------------------------------
+
+/** The abort kill's site: the head of its tries', reads' and latch lines (`[slack] <site>: …`). */
+export const STUCK_LAUNCH_ABORT_SITE = 'pendingRowRule stuck-launch abort'
+
+/** What `abortKillOwnStuckLaunch` is given. */
+export interface StuckLaunchAbortKillOptions {
+  /** The wait between tries (production: `KILL_RETRY_SYSTEM_CLOCK`; a test passes its fake clock). */
+  readonly clock: KillRetryWait
+  /** The kill-failure alerts (default: the installed ones, `setKillFailureAlerts`). */
+  readonly alerts?: KillFailureAlerts
+}
+
+/**
+ * The abort's one checked kill of persona `key`'s own row (b.jg5 SRJ-412,
+ * SRJ-110, SRJ-702, SRJ-704, SRJ-316), inside the launch or recovery attempt
+ * the pending-row rule runs in:
+ *   - the bounded retry over the checked kill (`retryPersonaKill`): the row
+ *     read `pending` (`killRetrySeedOfState`), so up to 3 tries 2 s apart on
+ *     UNAVAILABLE (SRJ-702), each a tmux-touching kill (`rowReadLive`), the
+ *     shared own-row `status` read between tries (a CONFIG answer there
+ *     raises `ad-config-malformed` and, the row last read `pending`, ends the
+ *     tries with no further kill, SRJ-316), the server's keep-going check
+ *     (P latched, not up or torn down, or a shutdown, stop the tries), on
+ *     `options.clock`. None of the old-life wait's or the CLI's options
+ *     (`holdEnded`, `configReadEndsTries`, `goneIsFailure`) applies, and the
+ *     restart path's one-try seed is never used;
+ *   - a CONFLICT ("not this launch's session") latches P through the latch's
+ *     CONFLICT entry with the refused operation "P's next check or recovery"
+ *     and the recorded state `pending`, and an UNUSABLE NAME through the
+ *     unusable-name entry (`latchOnKillOutcomeAt`): never tried again;
+ *   - then the kill-failure alert the tries decided
+ *     (`raisePersonaKillFailureAlert`, context 'stuck-launch abort'): the
+ *     ordinary version for `ErrTmuxKillFailed` after its tries, the survivor
+ *     version after a survivor-naming failure that a success followed, and,
+ *     after a survivor-naming failure, the ordinary version on any
+ *     non-success; for tries SRJ-702's stop rule stopped, neither version,
+ *     only its one line (and, for P removed during the tries, its
+ *     `persona-kill-failed` entry with no alert text).
+ * Answers, by class and name (`src/ad-error-class.ts`):
+ *   - succeeded, with `kill_sent` from agent-director's result (any success
+ *     form: `kill_sent` true or false, the row or the session gone, the row
+ *     read finished between tries);
+ *   - kill-failed: `ErrTmuxKillFailed` stands, its tries not stopped;
+ *   - latched: CONFLICT or UNUSABLE NAME latched P, a read between tries
+ *     latched it, or it was latched when its tries stopped;
+ *   - try-later: any other UNAVAILABLE, ENVIRONMENT (which raised
+ *     `tmux-unavailable`), CONFIG (which raised `ad-config-malformed`) or
+ *     UNCLASSIFIED (reported by the kill as any in an attempt);
+ *   - stopped: tries SRJ-702's stop rule stopped (P not latched), or an
+ *     `ErrInvalidFlags` whose version re-check stops the server.
+ * No delete and no launch follows any answer here. No new `getClient()`
+ * site: every call goes through `withOutageDetection` inside the shared
+ * entries. Never throws or rejects.
+ */
+export async function abortKillOwnStuckLaunch(
+  key: string,
+  ref: string,
+  options: StuckLaunchAbortKillOptions,
+): Promise<StuckLaunchAbortKillAnswer> {
+  const site = STUCK_LAUNCH_ABORT_SITE
+  const retried = await retryPersonaKill(key, {
+    rowReadLive: true,
+    lastRead: killRetrySeedOfState(AGENT_DIRECTOR_PENDING_STATE),
+    site,
+    ref,
+    clock: options.clock,
+  })
+  const { outcome } = retried
+  const description = describeKillOutcome(outcome)
+  const raise = (): void =>
+    raisePersonaKillFailureAlert(key, retried, site, ref, KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT, options.alerts)
+  if (killRetryStopped(retried)) {
+    raise()
+    const latched = retried.end === KILL_RETRY_END_READ_LATCHED || personaLatchedNow(key)
+    return latched
+      ? { kind: STUCK_LAUNCH_ABORT_KILL_LATCHED, description }
+      : { kind: STUCK_LAUNCH_ABORT_KILL_STOPPED, description }
+  }
+  if (killOutcomeStopsServer(outcome)) {
+    raise()
+    return { kind: STUCK_LAUNCH_ABORT_KILL_STOPPED, description }
+  }
+  if (outcome.kind !== KILL_OUTCOME_NOT_KILLED) {
+    // SRJ-702, SRJ-704: a survivor version is raised before the sequence.
+    raise()
+    return outcome.kind === KILL_OUTCOME_KILLED && outcome.killSent !== undefined
+      ? { kind: STUCK_LAUNCH_ABORT_KILL_SUCCEEDED, killSent: outcome.killSent, description }
+      : { kind: STUCK_LAUNCH_ABORT_KILL_SUCCEEDED, description }
+  }
+  // SRJ-501, SRJ-512: the outcome's own handling first, then the alert (SRJ-704).
+  const latched = await latchOnKillOutcomeAt(key, outcome, site, ref, latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE))
+  raise()
+  if (latched) return { kind: STUCK_LAUNCH_ABORT_KILL_LATCHED, description }
+  if (outcome.errorClass === AD_ERROR_CLASS_UNAVAILABLE && outcome.killFailed) return { kind: STUCK_LAUNCH_ABORT_KILL_FAILED, description }
+  return { kind: STUCK_LAUNCH_ABORT_KILL_TRY_LATER, errorClass: outcome.errorClass, description }
+}
+
+/**
+ * Stop persona `key`'s running dialog approver for the abort of its own
+ * stuck launch (b.jg5 SRJ-404, SRJ-412; hatch A3), before the abort's kill:
+ * with `APPROVER_STOP_STUCK_LAUNCH_ABORT`, a stop outside the stops the
+ * pending-row rule runs after and that arm the retry timer
+ * (`APPROVER_STOPS_THAT_ARM`), so no rule run follows it. Only a running
+ * approver is stopped (`isDialogApproverRunning`): no coming approver of a
+ * launch in flight is cancelled. Resolves once it has stopped, true when one
+ * ran. Never rejects.
+ */
+export async function stopApproverForStuckLaunchAbort(key: string): Promise<boolean> {
+  if (!isDialogApproverRunning(key)) return false
+  return stopDialogApprover(key, APPROVER_STOP_STUCK_LAUNCH_ABORT)
+}
+
+/**
+ * Start persona `key`'s live-row sequence after the abort's own kill (b.jg5
+ * SRJ-412, SRJ-705, SRJ-706) through the start entry
+ * (`startLiveRowSequence`): entry at step 2 (`LIVE_ROW_SEQUENCE_ENTRY_GET`),
+ * the state last read `pending`, the conversation kept (a row with a session
+ * id ends in `resume`, any other in a reuse spawn), ending in a launch, alert
+ * context 'stuck-launch abort'. The start entry sets the retired-key flag
+ * for a recorded key and answers held for a persona held on
+ * `ErrInvalidFlags`. The sequence's launch passes `isStartup: false`, as
+ * every sequence launch does (`launchForLiveRowSequence`). Answers whether
+ * it started, with the start entry's answer otherwise. Never throws.
+ */
+export function startStuckLaunchAbortSequence(key: string, ref: string): StuckLaunchAbortSequenceStart {
+  try {
+    const answer = startLiveRowSequence({
+      key,
+      ref,
+      instanceId: personaInstanceId(key),
+      lastReadState: AGENT_DIRECTOR_PENDING_STATE,
+      entryStep: LIVE_ROW_SEQUENCE_ENTRY_GET,
+      keepsConversation: true,
+      retiredKey: false,
+      launches: true,
+      alertContext: KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT,
+    })
+    return answer === LIVE_ROW_START_STARTED
+      ? { kind: STUCK_LAUNCH_ABORT_SEQUENCE_STARTED }
+      : { kind: STUCK_LAUNCH_ABORT_SEQUENCE_NOT_STARTED, why: answer }
+  } catch (err) {
+    return { kind: STUCK_LAUNCH_ABORT_SEQUENCE_NOT_STARTED, why: `its start failed: ${describeThrownValue(err)}` }
+  }
+}
+
 /**
  * The pending-row rule's production dependencies (b.jg5 SRJ-410), bound to
  * the shared entries, so `main()` and the recovery harness compose the rule
@@ -11953,7 +12158,17 @@ export function pendingRowRuleNoEpisodesLine(key: string): string {
  *   - the outage flags (`getOutageFlags`: `tmux-unavailable`,
  *     `ad-config-malformed`);
  *   - the held text's poster (`postStuckLaunchHeld`) over the one episodes
- *     instance.
+ *     instance;
+ *   - step 3's own-launch slot (b.jg5 SRJ-412): one abort instance
+ *     (`createStuckLaunchAbort`, holding the per-episode abort state) over
+ *     the own-launch query (`isCscbOwnLaunch`), the latched query and the
+ *     outage flags, the relaunching text's poster
+ *     (`postStuckLaunchRelaunching`, B in effect at the post) and the
+ *     stuck-launch episode's close hook over the same episodes instance, the
+ *     approver's stop (`stopApproverForStuckLaunchAbort`), the abort kill
+ *     (`abortKillOwnStuckLaunch`, on `input.killRetryWait` with
+ *     `input.killFailureAlerts`) and the sequence's start at step 2
+ *     (`startStuckLaunchAbortSequence`).
  * Every agent-director call goes through `withOutageDetection` inside those
  * entries; there is no new `getClient()` site. The builder reads nothing and
  * starts nothing when called.
@@ -11961,6 +12176,33 @@ export function pendingRowRuleNoEpisodesLine(key: string): string {
 export function buildPendingRowRuleDeps(input: PendingRowRuleDepsInput): PendingRowRuleDeps {
   const log = input.log ?? ((line: string): void => console.error(line))
   const tmuxUnavailableRaised = (key: string): boolean => getOutageFlags(key).has('tmux-unavailable')
+  const configMalformedRaised = (key: string): boolean => getOutageFlags(key).has('ad-config-malformed')
+  const episodesNow = (): (StuckLaunchPostEpisodes & StuckLaunchAbortEpisodes) | undefined => input.episodes ?? stuckLaunchEpisodes
+  const ownLaunch = createStuckLaunchAbort({
+    log,
+    isOwnLaunch: (key, launchStart) => isCscbOwnLaunch(key, launchStart),
+    isLatched: (key) => personaLatchedNow(key),
+    isTmuxUnavailableRaised: tmuxUnavailableRaised,
+    isConfigMalformedRaised: configMalformedRaised,
+    postRelaunching: (key) => {
+      const episodes = episodesNow()
+      if (episodes === undefined) {
+        log(pendingRowRuleNoEpisodesRelaunchingLine(key))
+        return STUCK_LAUNCH_POST_FAILED
+      }
+      return postStuckLaunchRelaunching({ episodes, tmuxUnavailableRaised, log }, key, adLaunchBoundMsInEffect())
+    },
+    episodes: {
+      whenClosed: (key, kind, dispose) => episodesNow()?.whenClosed(key, kind, dispose) === true,
+    },
+    stopApprover: (key) => stopApproverForStuckLaunchAbort(key),
+    abortKill: (key, ref) =>
+      abortKillOwnStuckLaunch(key, ref, {
+        clock: input.killRetryWait ?? KILL_RETRY_SYSTEM_CLOCK,
+        ...(input.killFailureAlerts === undefined ? {} : { alerts: input.killFailureAlerts }),
+      }),
+    startSequence: (key, ref) => startStuckLaunchAbortSequence(key, ref),
+  })
   return {
     now: () => _now(),
     log,
@@ -11976,15 +12218,16 @@ export function buildPendingRowRuleDeps(input: PendingRowRuleDepsInput): Pending
     runFindMissing: (key) => runPendingRowRuleFindMissing(key),
     readRow: (key, ref) => readPendingRowRuleRow(key, ref),
     isTmuxUnavailableRaised: tmuxUnavailableRaised,
-    isConfigMalformedRaised: (key) => getOutageFlags(key).has('ad-config-malformed'),
+    isConfigMalformedRaised: configMalformedRaised,
     postHeld: (key, launchStart, metNotInteractive) => {
-      const episodes = input.episodes ?? stuckLaunchEpisodes
+      const episodes = episodesNow()
       if (episodes === undefined) {
         log(pendingRowRuleNoEpisodesLine(key))
         return STUCK_LAUNCH_SUPPRESSED
       }
       return postStuckLaunchHeld({ episodes, tmuxUnavailableRaised, log }, key, launchStart, metNotInteractive)
     },
+    ownLaunch,
   }
 }
 
@@ -12139,7 +12382,8 @@ export function pendingRowRuleApproverStopNotInstalledLine(ref: string, reason: 
  * `failed`, is in the set too): when the reason is one after which the rule runs
  * (`approverStopArmsPendingRow`, `APPROVER_STOPS_THAT_ARM`: B or the test
  * cap, GONE, not interactive, tmux unavailable, superseded, failed; never
- * shutdown, a latch, the key's retired-key recording or a teardown) and the
+ * shutdown, a latch, the key's retired-key recording, a teardown or the
+ * stuck-launch abort) and the
  * approver's last `status` read gave the row `pending` with a launch start,
  * one rule run for P is queued in P's lifecycle serializer turn
  * (`PendingRowRuleInstall.serialize`), not awaited by the approver. It runs
@@ -12484,7 +12728,8 @@ function launchUnavailableReadText(state: unknown): string {
  *     (`isLaunchStartInWindow` over `launchCallWindowOf`, both ends
  *     included), the row is this launch's: the persona's "this launch's row"
  *     record is set (`thisLaunchRows`: its launch start and the window, for
- *     SRJ-310's rule 3, `checkThisLaunchRowOnRead`), and for a reuse spawn
+ *     SRJ-310's rule 3, `checkThisLaunchRowOnRead`), so is the record of
+ *     CSCB's own launch (`ownLaunches`, b.jg5 SRJ-412), and for a reuse spawn
  *     of a recorded key the "new life has begun" mark is set and the key's
  *     old-life hold ended (`markNewLifeAfterTimedOutReuse`, SRJ-806,
  *     SRJ-809), before the cover decision, so the reuse's own row is covered
@@ -12570,6 +12815,10 @@ async function afterLaunchUnavailable(
     if (window !== undefined && launchStartMs !== undefined && isLaunchStartInWindow(row.launch_started_at, window)) {
       thisLaunchRow = { launchStartMs, window }
       thisLaunchRows.set(key, thisLaunchRow)
+      // b.jg5 SRJ-412: a timed-out launch's own row is CSCB's own launch. An
+      // uncovered row may be recorded too; only the pending-row rule's step 3,
+      // which runs on a covered row, reads the record.
+      recordOwnLaunch(key, window, LAUNCH_CALL_END_LAUNCH_TIMEOUT, row.launch_started_at)
       if (site.reuseRetiredAtStart !== undefined) markNewLifeAfterTimedOutReuse(key, ref, site.reuseRetiredAtStart)
     }
   }
@@ -12765,9 +13014,9 @@ export function launchCallWindowOf(key: string): LaunchCallWindowRecord | undefi
 
 /**
  * Forget persona `key`'s launch-call window, its "this launch's row"
- * record (b.jg5 SRJ-407, SRJ-310) and its record of a launch whose
- * `send-keys` answered `ErrSpawnNotInteractive` (b.jg5 SRJ-412), as its
- * teardown does
+ * record (b.jg5 SRJ-407, SRJ-310), its record of a launch whose
+ * `send-keys` answered `ErrSpawnNotInteractive` and its record of CSCB's own
+ * launch (b.jg5 SRJ-412), as its teardown does
  * (`killPersonaInstanceForTeardown`, which runs once the persona's launch in
  * flight has settled). Silent; never throws.
  */
@@ -12775,6 +13024,7 @@ export function forgetLaunchCalls(key: string): void {
   launchCallWindows.delete(key)
   thisLaunchRows.delete(key)
   notInteractiveLaunches.delete(key)
+  ownLaunches.delete(key)
 }
 
 /**
@@ -12822,13 +13072,103 @@ export function launchMetSendKeysNotInteractive(key: string, launchStart: unknow
   return launchStartInstantOf(launchStart) === recorded
 }
 
+// ---------------------------------------------------------------------------
+// CSCB's own launch (b.jg5 SRJ-412)
+// ---------------------------------------------------------------------------
+
+/**
+ * Persona P's record of CSCB's own launch (b.jg5 SRJ-412, SRJ-407): the
+ * launch start (epoch ms, as `parseLaunchStart` reads it) of the row a launch
+ * call this server made left, and that call's window. Set only when the
+ * launch start lies inside the window (`isLaunchStartInWindow`, both ends
+ * included): after a call that returned success, as the dialog approver's
+ * first lap read it (`keepApproverLaunchStart`); after a call that ended in a
+ * launch timeout, as the one `get` that followed read it
+ * (`afterLaunchUnavailable`).
+ */
+export interface OwnLaunchRecord {
+  readonly launchStartMs: number
+  readonly window: LaunchCallWindowRecord
+}
+
+/**
+ * Each persona's record of CSCB's own launch (`OwnLaunchRecord`; b.jg5
+ * SRJ-412), kept beside the launch-in-flight state and the launch-call
+ * windows, in memory only (a server restart forgets it). It outlives the
+ * dialog approver that set it, so the pending-row rule's step 3 reads it
+ * after the approver has stopped. Unlike "this launch's row"
+ * (`thisLaunchRows`), no read forgets it: a read only compares the launch
+ * start it carries (`isCscbOwnLaunch`). Forgotten at a new launch call for
+ * the persona (`launchCallWithWindow`), at its teardown's kill
+ * (`forgetLaunchCalls`) and by `_resetInFlightLaunches`. A launch call that
+ * failed in any other way (no window end), another process's or a human's
+ * launch, a row with no launch start and a launch start outside the window
+ * are never recorded.
+ */
+const ownLaunches = new Map<string, OwnLaunchRecord>()
+
+/** Persona `key`'s record of CSCB's own launch, or `undefined` when none is kept (b.jg5 SRJ-412). Read-only. */
+export function ownLaunchRecordOf(key: string): OwnLaunchRecord | undefined {
+  return ownLaunches.get(key)
+}
+
+/**
+ * Record persona `key`'s own launch (b.jg5 SRJ-412) when `launchStartedAt`,
+ * the raw launch start a read gave, lies inside `window`, which must still be
+ * the persona's latest launch call's window and have ended `end`
+ * (`LAUNCH_CALL_END_RETURNED` for the approver's first lap,
+ * `LAUNCH_CALL_END_LAUNCH_TIMEOUT` for the get after a launch timeout).
+ * Answers whether it recorded. Silent; never throws.
+ */
+function recordOwnLaunch(
+  key: string,
+  window: LaunchCallWindowRecord | undefined,
+  end: LaunchCallEnd,
+  launchStartedAt: unknown,
+): boolean {
+  try {
+    if (window === undefined || window.end !== end || launchCallWindows.get(key) !== window) return false
+    const launchStartMs = parseLaunchStart(launchStartedAt)
+    if (launchStartMs === undefined || !isLaunchStartInWindow(launchStartedAt, window)) return false
+    ownLaunches.set(key, { launchStartMs, window })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Whether persona `key`'s row's current launch, whose raw launch start as
+ * read now is `launchStart` (raw or parsed), is CSCB's own (b.jg5 SRJ-412):
+ * true only when the persona's own-launch record is kept, that launch start
+ * equals the recorded one (`launchStartInstantOf`, so both launch-start forms
+ * of one instant match), and no `send-keys` on the row answered
+ * `ErrSpawnNotInteractive` during that launch
+ * (`launchMetSendKeysNotInteractive`). False for a launch start that is
+ * absent or does not parse. Whether it is a relaunch an abort made earlier in
+ * the same stuck-launch episode is the pending-row rule's per-episode abort
+ * state, not this query's. Read only from the rule's step 3, on a row decided
+ * covered (SRJ-410). Read-only; never throws.
+ */
+export function isCscbOwnLaunch(key: string, launchStart: unknown): boolean {
+  try {
+    const record = ownLaunches.get(key)
+    if (record === undefined) return false
+    if (launchStartInstantOf(launchStart) !== record.launchStartMs) return false
+    return !launchMetSendKeysNotInteractive(key, launchStart)
+  } catch {
+    return false
+  }
+}
+
 /**
  * One launch call of persona `key` (`client.spawn`, plain or reuse, or
  * `client.resume`, declared as `verb`) through spawn detection
  * (`withSpawnDetection`), recording its window (b.jg5 SRJ-407): a new window
  * starts just before the call, on the session manager's clock (`_now`),
  * replacing the persona's earlier one, and the call forgets the persona's
- * "this launch's row" record (`thisLaunchRows`); the window's end is taken
+ * "this launch's row" record (`thisLaunchRows`) and its record of CSCB's own
+ * launch (`ownLaunches`, b.jg5 SRJ-412); the window's end is taken
  * when the call returns success or, for a launch timeout
  * (`isLaunchTimeoutError`: `ErrCallTimeout`, or `ErrTmuxUnresponsive` whose
  * description carries "the session may have been created"), when the call's
@@ -12844,6 +13184,7 @@ async function launchCallWithWindow<T>(
   call: (client: Client) => Promise<T>,
 ): Promise<T> {
   thisLaunchRows.delete(key)
+  ownLaunches.delete(key)
   const started: LaunchCallWindowRecord = { verb, startMs: _now() }
   launchCallWindows.set(key, started)
   let result: T
@@ -12975,8 +13316,9 @@ const inFlightLaunches = new Map<string, Promise<SpawnPersonaResult>>()
 /**
  * Test-only seam: forget every in-flight launch (and, b.f2b, every cancel of
  * a wait one had not started), every launch call's window, every "this
- * launch's row" record (b.jg5 SRJ-407) and every record of a launch whose
- * `send-keys` answered `ErrSpawnNotInteractive` (b.jg5 SRJ-412); cancel, wake and forget every running wait for
+ * launch's row" record (b.jg5 SRJ-407), every record of a launch whose
+ * `send-keys` answered `ErrSpawnNotInteractive` and every record of CSCB's
+ * own launch (b.jg5 SRJ-412); cancel, wake and forget every running wait for
  * a `working` row, as `cancelWorkingRowWait` does but without its log line, so
  * the wait types nothing more and returns `cancelled` instead of polling on
  * to its deadline; and stop and forget every dialog approver
@@ -12988,6 +13330,7 @@ export function _resetInFlightLaunches(): void {
   launchCallWindows.clear()
   thisLaunchRows.clear()
   notInteractiveLaunches.clear()
+  ownLaunches.clear()
   for (const wait of workingRowWaits.values()) {
     wait.cancelled = true
     wait.wake()
@@ -13118,7 +13461,8 @@ export function startDialogApprover(
   if (start.origin === APPROVER_ORIGIN_LAUNCH_TIMEOUT) console.error(approverLogLine(approverStartedAfterLaunchTimeoutMessage(ref)))
   const previous = runningApprovers.get(key)
   if (previous !== undefined) requestApproverStop(previous, APPROVER_STOP_SUPERSEDED, true)
-  const run = newApproverRun()
+  // b.jg5 SRJ-412: the window of the launch call that starts this approver, for its first lap's own-launch record.
+  const run = newApproverRun(launchCallWindowOf(key))
   let resolveStopped!: (outcome: ApproverOutcome) => void
   const stopped = new Promise<ApproverOutcome>((resolve) => {
     resolveStopped = resolve
@@ -13175,7 +13519,9 @@ async function runRegisteredApprover(
  * the test cap, GONE, not interactive, tmux unavailable, the one-approver
  * rule (`superseded`), and a loop that threw (`failed`, so a `pending` row
  * is never left unwatched). Never after shutdown, a latch, the key's
- * retired-key recording or a teardown; `live`, `finished`, `absent` and
+ * retired-key recording, a teardown or the abort of the persona's own stuck
+ * launch (`stuck-launch-abort`: its kill and sequence follow, b.jg5
+ * SRJ-412); `live`, `finished`, `absent` and
  * `no-launch-start` leave no covered `pending` row. The same set is the one
  * after which the pending-row rule runs once for P (b.jg5 SRJ-404, SRJ-410;
  * `queueApproverStopRuleRun`), for a last read of `pending` with a launch
@@ -13262,8 +13608,10 @@ export function isDialogApproverRunning(key: string): boolean {
  * The launch start (epoch ms) that persona `key`'s running approver kept:
  * the one its first lap whose `status` read the row `pending` with a launch
  * start read (b.jg5 SRJ-401, SRJ-412). Undefined when no approver runs or
- * none has kept one yet. Read-only. That kept launch start is what decides
- * whether a launch that returned success is CSCB's own (b.jg5 SRJ-412).
+ * none has kept one yet. Read-only. The first lap that keeps it also sets
+ * the record of CSCB's own launch for a launch that returned success
+ * (`keepApproverLaunchStart`, `ownLaunchRecordOf`; b.jg5 SRJ-412), which
+ * outlives the approver.
  */
 export function dialogApproverLaunchStart(key: string): number | undefined {
   return runningApprovers.get(key)?.run.launchStartMs
@@ -15205,10 +15553,14 @@ export type LiveRowSequenceLaunchEntryResult = SpawnPersonaResult | LiveRowSeque
  * record nothing.
  * The launch is never part of the start pass, whichever path started the
  * sequence (a start-pass collision ladder's replacement site or
- * not-resumable step included): the sequence runs detached, after its
- * starter has answered `sequence-waiting` and the start pass has counted
- * that (b.jg5 SRJ-706, SRJ-1015), so every call here passes the start flag
- * false, the `resume` a recovery holding dead evidence ends in included.
+ * not-resumable step included, and the abort of the persona's own stuck
+ * launch, made only at a retry of its timer or at its dialog approver's
+ * stop, after the stuck launch's call returned; b.jg5 SRJ-412): the
+ * sequence runs detached, after its starter has answered (`sequence-waiting`
+ * or "sequence started") and the start pass has counted that (b.jg5
+ * SRJ-706, SRJ-1015), so every call here passes the start flag false, the
+ * `resume` a recovery holding dead evidence ends in and the `resume` that
+ * keeps an aborted resumed launch's conversation included.
  * No `spawn-failed`, `jsonl-transcript-lost-on-resume` or
  * `jsonl-diagnosis-inconclusive` startup-errors entry is written for it, as
  * for every launch outside the start pass (the restart path's `resume`

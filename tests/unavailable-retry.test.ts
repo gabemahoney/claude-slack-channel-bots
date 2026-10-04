@@ -153,6 +153,13 @@
  * that latches P. What every other end without the launch arms, and every
  * step-6 reuse outcome (its triggers in order, the count and the notice by
  * class), are tests/live-row-sequence.test.ts's.
+ * SRJ-316's C21 half (b.jg5 SRJ-316, SRJ-412, AC 84) runs on the harness
+ * with both settings 0 and the launch window on its clock: CSCB's own launch
+ * held `pending` past B while every call answers CONFIG gets one onset and no
+ * relaunching post, kill, delete or launch across several retries, nothing
+ * counted; once calls succeed, one all-clear, the next retry reaching step 3
+ * makes the relaunching post and the abort's one kill, its sequence launches
+ * P again, and P comes up.
  * A key recorded as retired (b.jg5 SRJ-805, SRJ-806; AC 51's retry-timer
  * half) runs on the harness too: a start-pass or non-start launch refused
  * UNAVAILABLE arms its timer, each retry relaunches it by the reuse and never
@@ -178,8 +185,9 @@
  * the rule's answer in both modes: nothing but the read before G, a refusal
  * from G at the timer's pace, the hand-off once a run marks the row missing
  * (in full mode, the same restart run's launch with no kill), the stop on a
- * row the lap brought to `waiting`, the held post at B, and a retry that
- * finds only P's approver running making the run and no lap.
+ * row the lap brought to `waiting`, the held post at B, the abort of CSCB's
+ * own launch past B (a refusal naming the live-row sequence it started), and
+ * a retry that finds only P's approver running making the run and no lap.
  * Only the pin case holds the SRD's numbers; every other case derives its
  * waits from the exported base and ceiling through `doublingBackoffDelay`. No
  * retry timer is real; the only real-time waits are the spawn path's 1 ms
@@ -256,6 +264,7 @@ import {
   PENDING_ROW_RULE_LOG_HEAD,
   PENDING_ROW_RULE_ORIGIN_RETRY,
   stuckLaunchHeldText,
+  stuckLaunchRelaunchingText,
 } from '../src/pending-row.ts'
 import {
   AGENT_DIRECTOR_PENDING_STATE,
@@ -475,6 +484,7 @@ import {
   SAMPLE_LAUNCH_STARTS,
   unavailableForms,
   type CannedResponse,
+  type StubClientOptions,
 } from './test-helpers/agent-director-stub.ts'
 import {
   assertNoLeak,
@@ -507,6 +517,7 @@ import {
   expectUntouched,
   killFailureNotice,
   LATE_KILL_ANSWERS,
+  launchOwnPending,
   makeRecoveryHarness,
   ordinaryAlertContent,
   callCountsSince,
@@ -567,6 +578,7 @@ import {
   judgeMissingFromG,
   makePendingRowModel,
   PENDING_ROW_DIALOG_TRUST,
+  PENDING_ROW_DIALOG_UNRECOGNISED,
   PENDING_ROW_MODEL_NO_ROW,
   type PendingRowModel,
   type PendingRowModelOptions,
@@ -3884,6 +3896,28 @@ describe('unavailable retry: the pending-row rule at each retry of P\'s timer (S
     expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
   })
 
+  // b.jg5 SRJ-412: the abort's own cases are tests/pending-row.test.ts's; this
+  // is what the pending-only retry answers when its rule made the abort.
+  test('pending-only, past B, CSCB\'s own launch: the retry\'s rule makes the relaunching post and the abort\'s one kill, and the retry is a refusal naming the live-row sequence it started, the last row read kept pending', async () => {
+    const h = (harness = makeRecoveryHarness({ harnessNow: true }))
+    const [key] = h.keys as [string]
+    const row = makePendingRowModel(h, key, { state: PENDING_ROW_MODEL_NO_ROW, dialog: PENDING_ROW_DIALOG_UNRECOGNISED })
+    // The approver stops at the harness's test cap, well before G: no rule run then reaches step 3.
+    await launchOwnPending(h, row)
+    expectPendingOnlyWatch(h, key)
+
+    while (h.controller.view(key)!.dueAt! - row.launchStartMs()! < adLaunchBoundMsInEffect()) await retryNow(h, key)
+    expect([h.episodeNotices, h.stub.calls.killCalls]).toEqual([[], []])
+    const retry = h.attempts.filter((attempt) => attempt.key === key).length + 1
+    await retryNow(h, key)
+
+    expect(h.episodeNotices).toEqual([{ key, text: stuckLaunchRelaunchingText(key, adLaunchBoundMsInEffect()) }])
+    expect(h.stub.calls.killCalls).toEqual([{ claude_instance_id: personaInstanceId(key) }])
+    expect(retryLinesOf(h, key)).toContain(reArmedLine(key, retry, UNAVAILABLE_RETRY_AGAIN_SEQUENCE_STARTED, retry, { ranPendingOnly: true }))
+    expect(h.controller.view(key)).toMatchObject({ mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
+    expect(getFailureCount(key)).toBe(0)
+  })
+
   // SRJ-303's Test line: "one that finds only the approver running makes the
   // rule's find-missing run and no lap". The timer is armed half a lap before
   // the launch, so no retry falls due at one of the approver's lap times and
@@ -6608,8 +6642,9 @@ describe('unavailable retry: a live row’s kill makes its tries before its outc
 // what arms the timer in a start-pass launch and outside every attempt, a
 // trigger while armed, AC 84 end to end (a persona up and connected, and a
 // launch that met CONFIG), and a clear of the outage that is not a timer
-// stop. The `pending`-row and C21 halves of SRJ-316's Test line are later
-// work; these cases assert no kill of any kind while calls answer CONFIG.
+// stop. These cases assert no kill of any kind while calls answer CONFIG;
+// the `pending`-row half of SRJ-316's Test line is the live-row sequence's
+// describe below, and its C21 half the describe after it.
 // ---------------------------------------------------------------------------
 
 /** The `ad-config-malformed` class, typed against `OutageClass`. */
@@ -8782,6 +8817,97 @@ describe('unavailable retry: the live-row sequence — SRJ-316\'s pending-row le
     expect(order).toEqual(['kill', 'get', 'findMissing', 'get', 'resume'])
     expect(h.notices).toEqual([])
     expectNothingArmed(h)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SRJ-316's C21 half (b.jg5 SRJ-316, SRJ-412, SRJ-410 step 3; AC 84): CSCB's
+// own stuck launch is never aborted while P's `ad-config-malformed` outage is
+// raised. On the recovery harness with both settings 0 (`harnessNow`, so the
+// launch call's window is on the harness clock), P's own launch held
+// `pending` at a prompt the approver does not know, past B, while every call
+// answers CONFIG; once calls succeed, the next retry reaching step 3 makes the
+// relaunching post and the abort. While every call answers CONFIG, the rule's
+// run at the approver's stop is refused at its `find-missing` and each
+// retry's liveness read reads unknown, so no round reaches step 3; step 3's
+// own `ad-config-malformed` gate, and the abort's other cases, are
+// tests/pending-row.test.ts's.
+// ---------------------------------------------------------------------------
+
+/**
+ * Each of the pending-row model's verbs answers `refusal()` while it gives an
+ * error, through its knob before the model's answer; the model answers once
+ * it gives none. Every other verb is the case's (`everyVerbButStatusAnswers`).
+ */
+function refuseOverModel(h: RecoveryHarness, refusal: () => Error | undefined): void {
+  const knobs = h.stub.calls as StubClientOptions
+  const refused = <P, R>(model: ((params: P) => R) | undefined) => (params: P): R | Error => refusal() ?? model!(params)
+  h.script({
+    statusFn: refused(knobs.statusFn),
+    getFn: refused(knobs.getFn),
+    readPaneFn: refused(knobs.readPaneFn),
+    sendKeysFn: refused(knobs.sendKeysFn),
+    findMissingFn: refused(knobs.findMissingFn),
+    killFn: refused(knobs.killFn),
+    spawnFn: refused(knobs.spawnFn),
+    resumeFn: refused(knobs.resumeFn),
+  })
+}
+
+describe('unavailable retry: SRJ-316\'s C21 half — no abort of CSCB\'s own stuck launch while ad-config-malformed is raised (SRJ-316, SRJ-412, AC 84)', () => {
+  test('CONFIG on every call while CSCB\'s own launch stays pending past B: one onset, and no relaunching post, kill, delete or launch and nothing counted across several retries; once calls succeed, one all-clear, the next retry reaching step 3 makes the relaunching post and the abort\'s one kill, its sequence launches P again, and P comes up', async () => {
+    const h = (harness = makeRecoveryHarness({ harnessNow: true }))
+    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
+    const [key, other] = h.keys as [string, string]
+    h.setApproverCap(undefined)
+    const row = makePendingRowModel(h, key, { state: PENDING_ROW_MODEL_NO_ROW, dialog: PENDING_ROW_DIALOG_UNRECOGNISED })
+    await launchOwnPending(h, row)
+    const launches = (): number => h.stub.calls.spawnCalls.length + h.stub.calls.resumeCalls.length
+    expect(launches()).toBe(1)
+
+    const err = errConfigMalformed()
+    let refusing = true
+    refuseOverModel(h, () => (refusing ? err : undefined))
+    h.script(everyVerbButStatusAnswers(err))
+
+    // Past B on the clock: the approver's laps meet CONFIG and it stops at B
+    // (its one rule run at the stop with them); then several more retries.
+    await h.advance(row.launchStartMs()! + adLaunchBoundMsInEffect() - h.clock.now())
+    await h.settle()
+    expect(h.approverRunning(key)).toBe(false)
+    for (let retry = 0; retry < 3; retry++) await retryNow(h, key)
+
+    expect(row.state()).toBe(AGENT_DIRECTOR_PENDING_STATE)
+    expect(h.outageNotices).toEqual([configOnset(key, err)])
+    expect(adConfigMalformedRaiseLines(h, key)).toHaveLength(1)
+    expect(h.episodeNotices).toEqual([])
+    expect(h.stuckLaunchAbortUsed(key)).toBe(false)
+    expect([h.stub.calls.killCalls, h.stub.calls.deleteCalls, launches(), getFailureCount(key), h.notices]).toEqual([[], [], 1, 0, []])
+
+    // Calls succeed: the next retry's status clears the outage, and its rule
+    // reaches step 3 on the row still pending past B.
+    refusing = false
+    h.script(everyVerbButStatusAnswers(undefined))
+    await retryNow(h, key)
+
+    const retries = h.attempts.filter((attempt) => attempt.key === key).length
+    expect(h.outageNotices).toEqual([configOnset(key, err), configAllClear(key)])
+    expect(getOutageFlags(key).size).toBe(0)
+    expect(h.episodeNotices).toEqual([{ key, text: stuckLaunchRelaunchingText(key, adLaunchBoundMsInEffect()) }])
+    expect(h.stub.calls.killCalls).toEqual([{ claude_instance_id: personaInstanceId(key) }])
+    expect(h.stuckLaunchAbortUsed(key)).toBe(true)
+    // The abort's sequence launched P again (a reuse: the row has no session id), with no delete and nothing counted.
+    expect([launches(), h.reuseSpawns().length, h.stub.calls.deleteCalls, getFailureCount(key)]).toEqual([2, 1, [], 0])
+    expect(retryLinesOf(h, key)).toContain(reArmedLine(key, retries, UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, retries))
+
+    // P comes up: the relaunch's approver clears its dialog, and the next retry finds nothing left to recover.
+    row.setDialog(PENDING_ROW_DIALOG_TRUST)
+    expect(await h.runApproverToStop(key)).toMatchObject({ reason: APPROVER_STOP_LIVE })
+    await retryNow(h, key)
+    expect(retryLinesOf(h, key).at(-1)).toBe(stoppedLine(key, UNAVAILABLE_RETRY_STOP_RECOVERED))
+    expectStopped(h, key)
+    expect(h.episodeNotices).toHaveLength(1)
+    expectUntouched(h, other)
   })
 })
 

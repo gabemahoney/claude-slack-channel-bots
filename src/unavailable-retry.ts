@@ -655,12 +655,14 @@ export const UNAVAILABLE_RETRY_AGAIN_SEQUENCE_WAITING = 'live-row-sequence-waiti
 
 /**
  * A pending-only retry whose row read `pending` and whose pending-row step
- * found the row not covered (b.jg5 SRJ-411: a retired key's old life before
- * its new life, or a `cwd` or `config_dir` mismatch) and started the
- * live-row sequence for it: no launch or approver of the retry's own; the
- * last row read stays `pending`, and the timer re-arms at the doubled wait
- * (SRJ-302: a refusal). Kept apart from `live-row-sequence-waiting`, a
- * full-mode run that found a sequence already running.
+ * started the live-row sequence for it: the row was not covered (b.jg5
+ * SRJ-411: a retired key's old life before its new life, or a `cwd` or
+ * `config_dir` mismatch), or the pending-row rule aborted CSCB's own stuck
+ * launch, whose sequence enters at its second step (b.jg5 SRJ-412). No
+ * launch or approver of the retry's own; the last row read stays `pending`,
+ * and the timer re-arms at the doubled wait (SRJ-302: a refusal). Kept apart
+ * from `live-row-sequence-waiting`, a full-mode run that found a sequence
+ * already running.
  */
 export const UNAVAILABLE_RETRY_AGAIN_SEQUENCE_STARTED = 'live-row-sequence-started'
 
@@ -670,7 +672,7 @@ export const UNAVAILABLE_RETRY_AGAIN_SEQUENCE_STARTED = 'live-row-sequence-start
 
 /** The step kept the row: covered or undecided (P armed pending-only), or its read was refused. */
 export const UNAVAILABLE_RETRY_PENDING_STEP_KEPT = 'kept'
-/** The step found the row not covered and started the live-row sequence for it (SRJ-411). */
+/** The step started the live-row sequence: the row was not covered (SRJ-411), or the pending-row rule aborted CSCB's own stuck launch (SRJ-412). */
 export const UNAVAILABLE_RETRY_PENDING_STEP_SEQUENCE_STARTED = 'sequence-started'
 /** The step's read latched the persona (SRJ-114, SRJ-513), or found it latched. */
 export const UNAVAILABLE_RETRY_PENDING_STEP_LATCHED = 'latched'
@@ -1854,9 +1856,10 @@ function pendingOnlyAnswer(row: string, restart: () => Promise<unknown>): Unavai
 /**
  * What a pending-only retry answers for its pending-row step's `step`
  * (b.jg5 SRJ-409, SRJ-411, SRJ-305): `kept` is today's refusal
- * (`row-pending`, the row kept `pending`); `sequence-started` is a refusal
- * naming the sequence it started (`live-row-sequence-started`), the row kept
- * `pending`, with no launch or approver of its own; `latched`, or a persona
+ * (`row-pending`, the row kept `pending`); `sequence-started` (an uncovered
+ * row's sequence, or the abort of CSCB's own stuck launch, b.jg5 SRJ-412) is
+ * a refusal naming the sequence it started (`live-row-sequence-started`),
+ * the row kept `pending`, with no launch or approver of its own; `latched`, or a persona
  * the latched query now answers latched, stops with the latch's reason and
  * hands nothing on; `row` answers as the `status` read would have for that
  * state (`pendingOnlyAnswer`): `ended`, `missing` or no row stops and hands

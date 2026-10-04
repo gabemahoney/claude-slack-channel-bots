@@ -178,7 +178,7 @@ import {
   type KillRetryWait,
 } from './kill-retry.ts'
 import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_PENDING_STATE } from './liveness-reading.ts'
-import { describeThrownValue, isSafeIdentifier, renderLogMessageText } from './persona-connection-errors.ts'
+import { describeLogMessage, describeThrownValue, isSafeIdentifier, renderLogMessageText } from './persona-connection-errors.ts'
 import { PENDING_ROW_WAIT_NOT_ARMED, armPendingRowWait, parseLaunchStart, type PendingRowWaitArm } from './pending-row.ts'
 
 // ---------------------------------------------------------------------------
@@ -190,6 +190,13 @@ export const LIVE_ROW_SEQUENCE_RUN_SPACING_MS = 5_000
 
 /** Step 4's pause between its kill and its run, in ms (SRJ-705). */
 export const LIVE_ROW_SEQUENCE_STEP4_PAUSE_MS = 5_000
+
+/**
+ * The wait before step 2's G wait is armed again after the G accessor threw
+ * or answered NaN while arming, in ms (SRJ-210, SRJ-705): the wait is never
+ * ended early for it.
+ */
+export const LIVE_ROW_SEQUENCE_GRACE_REARM_MS = 5_000
 
 /** The number of runs step 3 makes at most (SRJ-705). */
 export const LIVE_ROW_SEQUENCE_STEP3_RUNS = 3
@@ -951,15 +958,43 @@ function describeReadFailure(error: unknown): string {
   return describeAgentDirectorFailure(error)
 }
 
+/** The armed line's G when it is `AD_WAIT_NEVER_ENDS`, a G too long for any wait. */
+export const LIVE_ROW_SEQUENCE_GRACE_NEVER_ENDS_TEXT = 'beyond any wait (it never ends while so set)'
+/** The armed line's G when it is not a number of milliseconds (the accessor threw or answered NaN). */
+export const LIVE_ROW_SEQUENCE_GRACE_UNREADABLE_TEXT = 'could not be read (the wait is armed again until it reads)'
+
 /**
- * The step-2 wait's armed line (no deadline is rendered from a value that is not finite):
- *   `[slack] live-row-sequence: <ref>: step 2: waiting on the pending row until G past its launch start (launch start=<iso>; G=<n> ms[; deadline=<iso>]) (b.jg5 SRJ-705, SRJ-406)`
+ * The step-2 wait's armed line. G renders as `<n> ms` with a deadline when
+ * finite; as {@link LIVE_ROW_SEQUENCE_GRACE_NEVER_ENDS_TEXT} for
+ * `AD_WAIT_NEVER_ENDS`; as {@link LIVE_ROW_SEQUENCE_GRACE_UNREADABLE_TEXT}
+ * for any other value (NaN: G could not be read). No deadline is rendered
+ * from a value that is not finite:
+ *   `[slack] live-row-sequence: <ref>: step 2: waiting on the pending row until G past its launch start (launch start=<iso>; G=<G>[; deadline=<iso>]) (b.jg5 SRJ-705, SRJ-406)`
  */
 export function liveRowSequenceWaitArmedLine(ref: string, launchStartMs: number, graceMs: number): string {
   const start = renderInstant(launchStartMs) ?? 'unknown'
-  const grace = Number.isFinite(graceMs) ? `${graceMs} ms` : 'beyond any wait (it never ends while so set)'
+  const grace = Number.isFinite(graceMs)
+    ? `${graceMs} ms`
+    : graceMs === AD_WAIT_NEVER_ENDS
+      ? LIVE_ROW_SEQUENCE_GRACE_NEVER_ENDS_TEXT
+      : LIVE_ROW_SEQUENCE_GRACE_UNREADABLE_TEXT
   const deadline = Number.isFinite(graceMs) ? renderInstant(launchStartMs + graceMs) : undefined
   return `${head(ref)}: step 2: waiting on the pending row until G past its launch start (launch start=${start}; G=${grace}${deadline === undefined ? '' : `; deadline=${deadline}`}) (b.jg5 SRJ-705, SRJ-406)`
+}
+
+/**
+ * The step-2 wait's line when G could not be read while arming (the accessor
+ * threw or answered NaN). `described` is one line with no stack (a stack
+ * carries absolute file paths): for an `Error`, `describeThrownValue`'s form
+ * without frames, `<name>[ message="<message>"]` (the name when
+ * `isSafeIdentifier` passes it, else `Error`; the message through
+ * `describeLogMessage`: redacted, one line, capped, JSON-quoted); for any
+ * other value, `describeThrownValue`, which reads no stack for it; `unknown`
+ * when the error cannot be read. Never the error:
+ *   `[slack] live-row-sequence: <ref>: step 2: G could not be read while arming the wait (<described>) — the wait is not ended; armed again in <n> ms (b.jg5 SRJ-705, SRJ-210)`
+ */
+export function liveRowSequenceWaitArmFailedLine(ref: string, described: string): string {
+  return `${head(ref)}: step 2: G could not be read while arming the wait (${described}) — the wait is not ended; armed again in ${LIVE_ROW_SEQUENCE_GRACE_REARM_MS} ms (b.jg5 SRJ-705, SRJ-210)`
 }
 
 /**
@@ -1202,7 +1237,12 @@ export async function runLiveRowSequence(
    * Wait until G past the launch start `launchStartedAt` names (raw), through
    * `armPendingRowWait` (`src/pending-row.ts`: never early, with the G
    * accessor read at every fire; SRJ-406, never from `started_at`); ends
-   * early (false) once stopped.
+   * early (false) once stopped. Never ends early (SRJ-210: waiting too short
+   * never leads to a destructive step): a G accessor that throws or answers
+   * NaN while arming arms nothing, with one line
+   * (`liveRowSequenceWaitArmFailedLine`), and the arm is tried again after
+   * `LIVE_ROW_SEQUENCE_GRACE_REARM_MS` on the clock, until it arms or the
+   * sequence is stopped; only the armed wait's own fire ends the wait.
    */
   const waitForGrace = (launchStartedAt: unknown): Promise<boolean> => {
     if (stop.reason !== undefined) return Promise.resolve(false)
@@ -1217,21 +1257,37 @@ export async function runLiveRowSequence(
         cancel()
         resolve(elapsed)
       }
-      let armed: PendingRowWaitArm
-      try {
-        armed = armPendingRowWait(deps.clock, launchStartedAt, deps.graceMs, () => settle(true))
-      } catch {
-        // Not reached: G is a number while arming; no wait then.
-        settle(true)
-        return
+      const arm = (): void => {
+        if (done) return
+        let armed: PendingRowWaitArm
+        try {
+          armed = armPendingRowWait(deps.clock, launchStartedAt, deps.graceMs, () => settle(true))
+        } catch (err) {
+          // SRJ-210: G could not be read while arming; the wait is not ended, the arm is tried again.
+          // Name and message only: a stack would put absolute file paths on the line.
+          let described = 'unknown'
+          try {
+            described =
+              err instanceof Error
+                ? [isSafeIdentifier(err.name) ? err.name : 'Error', describeLogMessage(err.message)].filter(Boolean).join(' ')
+                : describeThrownValue(err)
+          } catch {
+            /* an error whose name or message cannot be read stays `unknown` */
+          }
+          log(liveRowSequenceWaitArmFailedLine(ref, described))
+          const handle = deps.clock.setTimeout(arm, LIVE_ROW_SEQUENCE_GRACE_REARM_MS)
+          cancel = () => deps.clock.clearTimeout(handle)
+          return
+        }
+        if (armed === PENDING_ROW_WAIT_NOT_ARMED) {
+          // Not reached: step 2 read a launch start; a row with none has no wait (SRJ-408).
+          settle(true)
+          return
+        }
+        cancel = armed.cancel
       }
-      if (armed === PENDING_ROW_WAIT_NOT_ARMED) {
-        // Not reached: step 2 read a launch start; a row with none has no wait (SRJ-408).
-        settle(true)
-        return
-      }
-      cancel = armed.cancel
       unsubscribe = stop.onStop(() => settle(false))
+      arm()
     })
   }
 
@@ -1451,11 +1507,12 @@ export async function runLiveRowSequence(
     return undefined
   }
 
+  /** G for the armed line; NaN (rendered as not read) when the accessor throws, as the arm then re-arms. */
   const graceInEffect = (): number => {
     try {
       return deps.graceMs()
     } catch {
-      return AD_WAIT_NEVER_ENDS
+      return Number.NaN
     }
   }
 

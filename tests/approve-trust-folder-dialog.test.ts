@@ -77,15 +77,26 @@
  * on) record nothing. `afterEach` forgets both personas' records
  * (`forgetLaunchCalls`).
  *
+ * The record of CSCB's own launch (b.jg5 SRJ-412, SRJ-401): the approver's
+ * first lap that keeps a launch start is its input. Its record needs a launch
+ * call's window, so these cases run on the recovery harness (`harnessNow`,
+ * the approver stopping at B) over P's pending-row model, launched through
+ * the real launch path: a first lap whose `status` fails records nothing and
+ * the next lap that reads the row `pending` records it; a later lap reading
+ * another launch start stops the approver superseded and leaves the record
+ * as it was, past the stop. Where the record is set, replaced and forgotten
+ * is tests/session-manager.test.ts's.
+ *
  * The registry (b.jg5 SRJ-401, SRJ-404; hatch A2) is driven through its
  * entries (`startDialogApprover`, `stopDialogApprover`,
  * `stopAllDialogApprovers`, `isDialogApproverRunning`,
  * `dialogApproverLaunchStart`) and its await seam
  * (`_whenDialogApproverStopped`): at most one approver per persona, a stop
  * that completes after the call in progress returns and types nothing after
- * it (asked with the teardown's reason, and with the retired-key reason apply
+ * it (asked with the teardown's reason, with the retired-key reason apply
  * step 1 stops a recorded key's approver with, b.jg5 SRJ-808, whose recorded
- * calls end at that stop), the launch start a running approver keeps, stop-all, and calls made
+ * calls end at that stop, and with the stuck-launch abort's reason, b.jg5
+ * SRJ-412, whose kill follows the stop), the launch start a running approver keeps, stop-all, and calls made
  * outside every launch attempt, and the latch (b.jg5 SRJ-502): a latch of P
  * set by another site through the installed latch stops P's approver (its
  * calls end at the latch) and a latch of another persona does not; with a
@@ -114,8 +125,9 @@
  * `ErrSpawnNotInteractive`), one bypassing `find-missing` and one `get` on
  * the approver's last read, with one answer line, the held post at B, and no
  * kill or launch; live, finished, absent, no launch start, latched,
- * teardown, the retired-key recording (E25: its calls end at the stop) and
- * shutdown ask none and make no call. A stop in the run set whose last read
+ * teardown, the retired-key recording (E25: its calls end at the stop),
+ * shutdown and the stuck-launch abort's stop (asked through the abort's own
+ * stop entry, `stopApproverForStuckLaunchAbort`) ask none and make no call. A stop in the run set whose last read
  * was not `pending` runs nothing; a run before G makes no call; a later stop
  * asks no second run; a run still queued at shutdown is dropped with one
  * line.
@@ -183,6 +195,7 @@ import {
   APPROVER_STOP_NOT_INTERACTIVE,
   APPROVER_STOP_RETIRED_KEY,
   APPROVER_STOP_SHUTDOWN,
+  APPROVER_STOP_STUCK_LAUNCH_ABORT,
   APPROVER_STOP_SUPERSEDED,
   APPROVER_STOP_TEARDOWN,
   APPROVER_STOP_TMUX_UNAVAILABLE,
@@ -192,8 +205,11 @@ import {
   DIALOG_SLOW_POLL_INTERVAL_MS,
   dialogApproverLaunchStart,
   forgetLaunchCalls,
+  isCscbOwnLaunch,
   isDialogApproverRunning,
+  launchCallWindowOf,
   launchMetSendKeysNotInteractive,
+  ownLaunchRecordOf,
   setSessionNotifier,
   startDialogApprover,
   STARTUP_ERROR_APPROVE_NOT_READY,
@@ -222,6 +238,7 @@ import {
   setPendingRowRule,
   setConfiguredPersonaQuery,
   setConflictLatch,
+  stopApproverForStuckLaunchAbort,
   type ApproverOutcome,
   type ApproverStart,
   type ApproverStopReason,
@@ -338,6 +355,13 @@ import { assertNoLeak, LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, sentinelInMessage,
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeNotifierHarness } from './test-helpers/persona-notifier.ts'
+import {
+  makePendingRowModel,
+  PENDING_ROW_DIALOG_UNRECOGNISED,
+  PENDING_ROW_MODEL_NO_ROW,
+  type PendingRowModel,
+} from './test-helpers/pending-row-model.ts'
+import { launchByAnotherProcess, makeRecoveryHarness, type RecoveryHarness } from './test-helpers/recovery-harness.ts'
 import { stripComments } from './test-helpers/source-audit.ts'
 
 // ---------------------------------------------------------------------------
@@ -1762,6 +1786,81 @@ describe('the approver\'s send-keys answering ErrSpawnNotInteractive records its
 })
 
 // ---------------------------------------------------------------------------
+// The approver's first lap as the input to the record of CSCB's own launch
+// (b.jg5 SRJ-412, SRJ-401; E17's kept first-lap launch start)
+// ---------------------------------------------------------------------------
+
+/**
+ * Run `body` on a recovery harness built with `harnessNow` (so the launch
+ * call's window is on the harness clock) and the approver stopping at B, not
+ * the test cap, over persona P's pending-row model: no row, so `h.launch(p)`
+ * is a plain spawn that leaves a new `pending` launch whose launch start lies
+ * inside the call's window, held at a prompt the approver does not know. The
+ * harness's lines are leak-checked and it is cleaned up whatever happens.
+ */
+async function onOwnLaunchHarness(body: (h: RecoveryHarness, p: string, row: PendingRowModel) => Promise<void>): Promise<void> {
+  const h = makeRecoveryHarness({ harnessNow: true })
+  try {
+    h.setApproverCap(undefined)
+    const p = h.keys[0]!
+    await body(h, p, makePendingRowModel(h, p, { state: PENDING_ROW_MODEL_NO_ROW, dialog: PENDING_ROW_DIALOG_UNRECOGNISED }))
+    assertNoLeak(h.captured())
+  } finally {
+    h.cleanup()
+  }
+}
+
+describe('the approver\'s first lap that keeps a launch start is the input to the record of CSCB\'s own launch (b.jg5 SRJ-412, SRJ-401)', () => {
+  test('a first lap whose status read fails keeps no launch start and records nothing; the next lap that reads the row pending records its launch start as CSCB\'s own, in the launch call\'s window', async () => {
+    await onOwnLaunchHarness(async (h, p, row) => {
+      // The approver's first status read (no other status is made while it runs) answers UNAVAILABLE.
+      const modelStatus = (h.stub.calls as StubClientOptions).statusFn!
+      let failed = false
+      h.script({
+        statusFn: (params) => {
+          if (failed || !isDialogApproverRunning(p)) return modelStatus(params)
+          failed = true
+          return errTmuxUnresponsive('status')
+        },
+      })
+
+      await h.launch(p)
+      await h.settle()
+
+      expect(failed).toBe(true)
+      expect([h.approverRunning(p), dialogApproverLaunchStart(p), ownLaunchRecordOf(p)]).toEqual([true, undefined, undefined])
+      expect(isCscbOwnLaunch(p, row.launchStartedAt())).toBe(false)
+
+      // UNAVAILABLE backs off: the next lap comes at the slow pace.
+      await h.advance(DIALOG_SLOW_POLL_INTERVAL_MS)
+
+      expect(dialogApproverLaunchStart(p)).toBe(row.launchStartMs())
+      expect(ownLaunchRecordOf(p)).toEqual({ launchStartMs: row.launchStartMs()!, window: launchCallWindowOf(p)! })
+      expect(isCscbOwnLaunch(p, row.launchStartedAt())).toBe(true)
+    })
+  })
+
+  test('a later lap that reads another launch start stops the approver as superseded and leaves the record as the first lap set it, past the approver\'s stop', async () => {
+    await onOwnLaunchHarness(async (h, p, row) => {
+      await h.launch(p)
+      await h.settle()
+      const own = row.launchStartedAt()
+      const ownMs = row.launchStartMs()!
+      const recorded = ownLaunchRecordOf(p)
+      expect(recorded).toEqual({ launchStartMs: ownMs, window: launchCallWindowOf(p)! })
+
+      const other = launchByAnotherProcess(h, row, ownMs + DIALOG_POLL_INTERVAL_MS)
+
+      expect(await h.runApproverToStop(p)).toEqual({ reason: APPROVER_STOP_SUPERSEDED, launchStartMs: ownMs })
+      // The kept launch start ends with the approver; the record does not.
+      expect(dialogApproverLaunchStart(p)).toBeUndefined()
+      expect(ownLaunchRecordOf(p)).toBe(recorded)
+      expect([isCscbOwnLaunch(p, own), isCscbOwnLaunch(p, other)]).toEqual([true, false])
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
 // The approver registry (b.jg5 SRJ-401, SRJ-404; hatch A2)
 // ---------------------------------------------------------------------------
 
@@ -1952,10 +2051,16 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
 
   /**
    * The reasons the stop entry is asked for one key with: the teardown's
-   * (b.jg5 SRJ-404, SRJ-715) and apply step 1's once the key is recorded as
-   * retired (b.jg5 SRJ-808), whose recorded calls end at that stop.
+   * (b.jg5 SRJ-404, SRJ-715), apply step 1's once the key is recorded as
+   * retired (b.jg5 SRJ-808), whose recorded calls end at that stop, and the
+   * stuck-launch abort's (b.jg5 SRJ-412), whose kill follows only once the
+   * stop has resolved.
    */
-  const STOP_ENTRY_REASONS: ReadonlyArray<typeof APPROVER_STOP_TEARDOWN | typeof APPROVER_STOP_RETIRED_KEY> = [APPROVER_STOP_TEARDOWN, APPROVER_STOP_RETIRED_KEY]
+  const STOP_ENTRY_REASONS: ReadonlyArray<typeof APPROVER_STOP_TEARDOWN | typeof APPROVER_STOP_RETIRED_KEY | typeof APPROVER_STOP_STUCK_LAUNCH_ABORT> = [
+    APPROVER_STOP_TEARDOWN,
+    APPROVER_STOP_RETIRED_KEY,
+    APPROVER_STOP_STUCK_LAUNCH_ABORT,
+  ]
 
   test.each(STOP_ENTRY_REASONS.map((reason) => [reason] as const))('a stop (%s) between laps ends P\'s approver at once with no further call and one line naming the reason; Q\'s goes on; a second stop and a stop of a key with no approver answer false and log nothing; no timer is left', async (reason) => {
     rows.set(PLAIN.id, [PENDING_ROW])
@@ -2992,6 +3097,14 @@ describe('the pending-row rule runs once at the approver\'s stop, for the stops 
     // E25: the retired-key recording's stop; the recorded calls end at it.
     [APPROVER_STOP_RETIRED_KEY]: { arrange: () => pendingNoDialog(), stop: () => stopDialogApprover(who.key, APPROVER_STOP_RETIRED_KEY), pendingRead: true, runs: false },
     [APPROVER_STOP_SHUTDOWN]: { arrange: () => pendingNoDialog(), stop: () => stopAllDialogApprovers(), pendingRead: true, runs: false },
+    // b.jg5 SRJ-404, SRJ-412: the stuck-launch abort's own stop, through the
+    // abort's stop entry, its kill to follow; no run after it.
+    [APPROVER_STOP_STUCK_LAUNCH_ABORT]: {
+      arrange: () => pendingNoDialog(),
+      stop: () => stopApproverForStuckLaunchAbort(who.key),
+      pendingRead: true,
+      runs: false,
+    },
   }
 
   test.each(Object.entries(STOP_CASES) as Array<[ApproverStopReason, StopCase]>)(

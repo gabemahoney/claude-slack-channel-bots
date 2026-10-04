@@ -2803,7 +2803,10 @@ export function deferringPendingRowLine(key: string, launchStartedAt?: string): 
  * `options.mayRunRule` is false:
  *   - covered: the pending-row rule's one run of that retry on the row the
  *     `get` read (`runPendingRowRuleAtRetry`); a row it reads `ended`,
- *     `missing` or gone answers gone, anything else 'pending';
+ *     `missing` or gone answers gone, anything else 'pending', the abort of
+ *     CSCB's own stuck launch included (b.jg5 SRJ-412: its live-row
+ *     sequence started, or the abort kept the row), which the restart work
+ *     answers as its `pending` deferral;
  *   - `ended`, `missing` or no row from the step's own `get`: gone.
  * A gone answer (the `DeadRowRead`) lets the restart work go
  * on to its dead branch in the same run, with no kill for a row read

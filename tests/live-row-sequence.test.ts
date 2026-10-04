@@ -11,7 +11,11 @@
  * a `get` after any run reading `ended`, `missing` or no row goes to step 6;
  * a step-2 `get` reading a finished row still leads to one run. The `pending`
  * wait: measured from the launch start with G in effect (SRJ-406, SRJ-210),
- * never early, at a G beyond the timer maximum too; no wait without a launch
+ * never early, at a G beyond the timer maximum too, and when G cannot be read
+ * while arming (the accessor throws or answers NaN: logged by the error's
+ * name and message with no stack, G named unreadable on the armed line,
+ * armed again on the clock, never ended; a stop then ends it false); G at
+ * `AD_WAIT_NEVER_ENDS` named beyond any wait; no wait without a launch
  * start (SRJ-408). The not-judged stop (SRJ-717), the failed runs (SRJ-120's
  * refusal split, E14 build), the kills (SRJ-110, SRJ-702, SRJ-703, SRJ-1007;
  * `ErrInvalidFlags`'s one version re-check, SRJ-104), the
@@ -103,14 +107,18 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { resolve } from 'node:path'
+
 import { afterEach, describe, expect, test } from 'bun:test'
 
 import type { FindMissingResult } from 'agent-director'
 
 import {
   AD_SETTING_MINIMUMS,
+  AD_WAIT_NEVER_ENDS,
   DEFAULT_AD_SETTINGS,
   adGraceMsInEffect,
+  armNeverEarlyWait,
   pendingGraceMinimumSeconds,
 } from '../src/ad-settings.ts'
 import {
@@ -180,6 +188,9 @@ import {
   LIVE_ROW_RUN_REFUSED,
   LIVE_ROW_SEQUENCE_ENTRY_GET,
   LIVE_ROW_SEQUENCE_ENTRY_KILL,
+  LIVE_ROW_SEQUENCE_GRACE_NEVER_ENDS_TEXT,
+  LIVE_ROW_SEQUENCE_GRACE_REARM_MS,
+  LIVE_ROW_SEQUENCE_GRACE_UNREADABLE_TEXT,
   LIVE_ROW_SEQUENCE_LOG_PREFIX,
   LIVE_ROW_SEQUENCE_MAX_KILLS,
   LIVE_ROW_SEQUENCE_MAX_RUNS,
@@ -207,6 +218,8 @@ import {
   liveRowSequenceRunLine,
   liveRowSequenceStartLine,
   liveRowSequenceStopAskedLine,
+  liveRowSequenceWaitArmedLine,
+  liveRowSequenceWaitArmFailedLine,
   liveRowStopCauseText,
   runLiveRowSequence,
   type LiveRowLaunchKindInput,
@@ -224,7 +237,7 @@ import {
 import { AGENT_DIRECTOR_PENDING_STATE, LIVENESS_DEAD_ROW_ENDED, LIVENESS_DEAD_ROW_MISSING } from '../src/liveness-reading.ts'
 import { oldLifeWaitRef } from '../src/old-life-wait.ts'
 import { parseLaunchStart, PENDING_ROW_REASON_CWD_MISMATCH, PENDING_ROW_REASON_RETIRED_OLD_LIFE } from '../src/pending-row.ts'
-import { describeThrownValue } from '../src/persona-connection-errors.ts'
+import { describeLogMessage, describeThrownValue } from '../src/persona-connection-errors.ts'
 import { CONFIG_DIR_LABEL_PREFIX, personaInstanceId, personaTmuxSessionName, renderPersonaRef } from '../src/persona-identity.ts'
 import { OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL } from '../src/retired-keys.ts'
 import { KILL_FAILURE_END_ROW_FINISHED } from '../src/persona-episodes.ts'
@@ -499,6 +512,17 @@ function runWithDeps(
   replaced: Partial<LiveRowSequenceDeps>,
   requested: Partial<LiveRowSequenceRequest> = {},
 ): Promise<LiveRowSequenceOutcome> {
+  return h.driveSequence(startWithDeps(h, key, stop, replaced, requested))
+}
+
+/** As `runWithDeps`, but not driven: the case moves the clock itself. */
+function startWithDeps(
+  h: RecoveryHarness,
+  key: string,
+  stop: LiveRowSequenceStopHandle,
+  replaced: Partial<LiveRowSequenceDeps>,
+  requested: Partial<LiveRowSequenceRequest> = {},
+): Promise<LiveRowSequenceOutcome> {
   const request: LiveRowSequenceRequest = {
     key,
     instanceId: personaInstanceId(key),
@@ -510,7 +534,7 @@ function runWithDeps(
     alertContext: KILL_FAILURE_CONTEXT_RECOVERY,
     ...requested,
   }
-  return h.driveSequence(runInAttempt(key, 'recovery', () => runLiveRowSequence(request, { ...h.sequenceDeps, ...replaced }, stop)))
+  return runInAttempt(key, 'recovery', () => runLiveRowSequence(request, { ...h.sequenceDeps, ...replaced }, stop))
 }
 
 // ---------------------------------------------------------------------------
@@ -746,6 +770,154 @@ describe('the pending wait: until G past the launch start, never early (SRJ-705 
     expect(fires).toBe(Math.ceil(grace / MAX_TIMER_DELAY_MS))
     expect(times).toEqual([LAUNCH_START_MS + grace])
     expect(await h.driveSequence(run.outcome)).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, runs: 1 })
+  })
+
+  // SRJ-210: G that cannot be read while arming never ends the wait early.
+  // (An accessor that goes bad after arming is `armNeverEarlyWait`'s, in
+  // tests/ad-settings.test.ts.)
+
+  /** The repository root: no log line may carry it (a stack frame's file path). */
+  const REPO_ROOT = resolve(import.meta.dir, '..')
+
+  /** A G accessor that cannot be read while arming. */
+  const UNREADABLE_G: ReadonlyArray<readonly [string, () => number]> = [
+    ['throws', () => {
+      throw new Error('G could not be read')
+    }],
+    ['answers NaN', () => Number.NaN],
+  ]
+
+  /**
+   * Persona `key`'s arm-failed lines in `h`: lines equal to the builder's
+   * line over what arming over `unreadable` throws, described by its name and
+   * its message only (no stack frame, so no absolute file path).
+   */
+  function armFailedLines(h: RecoveryHarness, key: string, unreadable: () => number): string[] {
+    let thrown: Error | undefined
+    try {
+      armNeverEarlyWait(h.clock, LAUNCH_START_MS, unreadable, () => {})
+    } catch (err) {
+      thrown = err as Error
+    }
+    if (thrown === undefined) throw new Error('the accessor armed a wait')
+    const expected = liveRowSequenceWaitArmFailedLine(`persona=${key}`, `${thrown.name} ${describeLogMessage(thrown.message)}`)
+    return h.lines.filter((line) => line === expected)
+  }
+
+  /** Persona `key`'s step-2 armed lines in `h` for a launch start of `LAUNCH_START_MS` (any G). */
+  function armedLines(h: RecoveryHarness, key: string): string[] {
+    const head = liveRowSequenceWaitArmedLine(`persona=${key}`, LAUNCH_START_MS, Number.NaN).split('G=')[0]!
+    return h.lines.filter((line) => line.startsWith(`${head}G=`))
+  }
+
+  /** Every `step 2: ` line of persona `key` in `h` (the wait's armed, arm-failed and ended lines). */
+  function step2Lines(h: RecoveryHarness, key: string): string[] {
+    const head = liveRowSequenceWaitArmFailedLine(`persona=${key}`, '').split(': step 2: ')[0]!
+    return h.lines.filter((line) => line.startsWith(`${head}: step 2: `))
+  }
+
+  /** Persona `key`'s sequence entered at step 2 on its `pending` row, over the G accessor `graceMs`; not driven. */
+  function startOnPendingRow(h: RecoveryHarness, key: string, stop: LiveRowSequenceStopHandle, graceMs: () => number): Promise<LiveRowSequenceOutcome> {
+    return startWithDeps(h, key, stop, { graceMs }, { lastReadState: PENDING, entryStep: LIVE_ROW_SEQUENCE_ENTRY_GET })
+  }
+
+  test.each(UNREADABLE_G)('a G accessor that %s while arming: one line and no run, the arm tried again every re-arm wait; once G reads, the first run comes exactly at G past the launch start', async (_label, unreadable) => {
+    const { h, p } = build()
+    const REARMS = 2
+    expect((REARMS + 1) * LIVE_ROW_SEQUENCE_GRACE_REARM_MS).toBeLessThan(adGraceMsInEffect())
+    await clockAt(h, LAUNCH_START_MS)
+    pendingThenMarkedMissing(h, p, {})
+    const times = runTimes(h)
+    let readable = false
+    const outcome = startOnPendingRow(h, p, createLiveRowSequenceStop(), () => (readable ? adGraceMsInEffect() : unreadable()))
+    await h.clock.flush()
+
+    for (let rearm = 0; rearm < REARMS; rearm++) {
+      expect(h.clock.pending().map((timer) => timer.delayMs)).toEqual([LIVE_ROW_SEQUENCE_GRACE_REARM_MS])
+      await h.clock.runNext()
+    }
+    expect(armFailedLines(h, p, unreadable)).toHaveLength(REARMS + 1)
+    expect(times).toEqual([])
+
+    readable = true
+    expect(await h.driveSequence(outcome)).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, runs: 1 })
+    expect(times).toEqual([LAUNCH_START_MS + adGraceMsInEffect()])
+    expect(armFailedLines(h, p, unreadable)).toHaveLength(REARMS + 1)
+  })
+
+  test.each(UNREADABLE_G)('a G accessor that %s while arming: the armed line names G as unreadable with no deadline, and no G line carries a stack frame or a file path', async (_label, unreadable) => {
+    const { h, p } = build()
+    await clockAt(h, LAUNCH_START_MS)
+    pendingThenMarkedMissing(h, p, {})
+    const stop = createLiveRowSequenceStop()
+    const outcome = startOnPendingRow(h, p, stop, unreadable)
+    await h.clock.flush()
+    await h.clock.runNext()
+
+    expect(armedLines(h, p)).toEqual([liveRowSequenceWaitArmedLine(`persona=${p}`, LAUNCH_START_MS, Number.NaN)])
+    expect(armedLines(h, p)[0]).toContain(`G=${LIVE_ROW_SEQUENCE_GRACE_UNREADABLE_TEXT})`)
+    expect(armedLines(h, p)[0]).not.toContain(LIVE_ROW_SEQUENCE_GRACE_NEVER_ENDS_TEXT)
+    expect(armedLines(h, p)[0]).not.toContain('deadline=')
+    expect(armFailedLines(h, p, unreadable)).toHaveLength(2)
+    const lines = step2Lines(h, p)
+    expect(lines).toHaveLength(3)
+    for (const line of lines) {
+      expect(line).not.toContain(' at ')
+      expect(line).not.toContain(' <- ')
+      expect(line).not.toMatch(/\.[cm]?[jt]s:\d+/)
+      expect(line).not.toContain(REPO_ROOT)
+    }
+
+    stop.stop(LIVE_ROW_STOP_TEARDOWN)
+    expect(await h.driveSequence(outcome)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_TEARDOWN, runs: 0 })
+  })
+
+  test('a G accessor at AD_WAIT_NEVER_ENDS: the armed line names G as beyond any wait with no deadline; the wait arms (no arm-failed line, no re-arm) and never runs', async () => {
+    const { h, p } = build()
+    await clockAt(h, LAUNCH_START_MS)
+    pendingThenMarkedMissing(h, p, {})
+    const times = runTimes(h)
+    const stop = createLiveRowSequenceStop()
+    const outcome = startOnPendingRow(h, p, stop, () => AD_WAIT_NEVER_ENDS)
+    await h.clock.flush()
+    await h.clock.runNext()
+
+    expect(armedLines(h, p)).toEqual([liveRowSequenceWaitArmedLine(`persona=${p}`, LAUNCH_START_MS, AD_WAIT_NEVER_ENDS)])
+    expect(armedLines(h, p)[0]).toContain(`G=${LIVE_ROW_SEQUENCE_GRACE_NEVER_ENDS_TEXT})`)
+    expect(armedLines(h, p)[0]).not.toContain(LIVE_ROW_SEQUENCE_GRACE_UNREADABLE_TEXT)
+    expect(armedLines(h, p)[0]).not.toContain('deadline=')
+    expect(step2Lines(h, p)).toEqual(armedLines(h, p))
+    expect(h.clock.pending().map((timer) => timer.delayMs)).toEqual([MAX_TIMER_DELAY_MS])
+    expect(times).toEqual([])
+
+    stop.stop(LIVE_ROW_STOP_TEARDOWN)
+    expect(await h.driveSequence(outcome)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_TEARDOWN, runs: 0 })
+    expect(h.clock.pendingCount()).toBe(0)
+  })
+
+  test.each(UNREADABLE_G)('a G accessor that %s while arming, long past G: no run or other call, one timer at a time; a stop ends the wait as stopped and leaves no timer', async (_label, unreadable) => {
+    const { h, p } = build()
+    await clockAt(h, LAUNCH_START_MS)
+    pendingThenMarkedMissing(h, p, {})
+    const calls = recordCallTimes(h)
+    const stop = createLiveRowSequenceStop()
+    const outcome = startOnPendingRow(h, p, stop, unreadable)
+    await h.clock.flush()
+
+    let tries = 1
+    while (h.clock.now() < LAUNCH_START_MS + 2 * adGraceMsInEffect()) {
+      expect(h.clock.pending().map((timer) => timer.delayMs)).toEqual([LIVE_ROW_SEQUENCE_GRACE_REARM_MS])
+      await h.clock.runNext()
+      tries++
+    }
+    expect(calls).toEqual([['get', LAUNCH_START_MS]])
+    expect(armFailedLines(h, p, unreadable)).toHaveLength(tries)
+
+    stop.stop(LIVE_ROW_STOP_TEARDOWN)
+
+    expect(await h.driveSequence(outcome)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_TEARDOWN, runs: 0, kills: 0 })
+    expect(h.clock.pendingCount()).toBe(0)
+    expect(calls).toEqual([['get', LAUNCH_START_MS]])
   })
 
   test.each([

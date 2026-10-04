@@ -159,8 +159,23 @@
  * `leftover`, `duplicate-session-leftover`, `conflicting-labels` in its
  * "duplicate session" form and `unrecognised`. The UNUSABLE NAME rows: one
  * per fault at the reuse spawn, refused operation none, recording `ended`
- * ({@link REUSE_SPAWN_UNUSABLE_NAME_CASE_ROWS}). The stuck-launch abort's
- * kill rows (E29) are still to come, with the re-check columns (E30).
+ * ({@link REUSE_SPAWN_UNUSABLE_NAME_CASE_ROWS}).
+ *
+ * The stuck-launch abort's kill rows (E29; b.jg5 SRJ-412, SRJ-110, SRJ-501,
+ * SRJ-512, SRJ-613): the site kind {@link STUCK_LAUNCH_ABORT_SITE}, the
+ * abort kill's own site (`abortKillOwnStuckLaunch`, re-exported from
+ * `src/session-manager.ts`, so the kind is the head of its log lines; select
+ * its rows with {@link isStuckLaunchAbortSite}). The abort kills only a
+ * covered row read `pending` at B, so every row records `pending`, the state
+ * the rule's `get` last read, with no latch-time `status` read
+ * (`latchTimeRead` false). One CONFLICT row per stub case `kill` answers,
+ * each refusing P's next check or recovery
+ * ({@link STUCK_LAUNCH_ABORT_CONFLICT_CASE_ROWS}); its "not this launch's
+ * session" row is SRJ-613's kill backstop (`killBackstop`: the abort's kill
+ * on a `pending` row answering it latches the persona with nothing sent).
+ * Its UNUSABLE NAME rows: one per fault, refused operation none, recording
+ * `pending` ({@link STUCK_LAUNCH_ABORT_UNUSABLE_NAME_CASE_ROWS}). The latch
+ * re-check's columns are E30's.
  *
  * The `resume` rows (b.jg5 SRJ-113, SRJ-501, SRJ-507; HO rev 15, rev 20):
  * the site kind `resume`, each refusing the `resume`
@@ -254,7 +269,10 @@
  * {@link SEQUENCE_KILL_UNUSABLE_NAME_CASE_ROWS}) have one row per fault for
  * each state in {@link SEQUENCE_KILL_ROW_STATES} (`pending`, `waiting`), each
  * recording the state the sequence last read, named
- * `sequence step-1 kill (pending): <fault>`.
+ * `sequence step-1 kill (pending): <fault>`. The stuck-launch abort's kill
+ * (E29, {@link STUCK_LAUNCH_ABORT_SITE};
+ * {@link STUCK_LAUNCH_ABORT_UNUSABLE_NAME_CASE_ROWS}) has one row per fault,
+ * each recording `pending`.
  *
  * The expected latch records (SRJ-501), for any test that checks what a
  * hold-case latch holds (the server, restart, health-check, unavailable-retry
@@ -419,7 +437,7 @@ import {
 import { classifyAdError } from '../../src/ad-error-class.ts'
 import { renderLogMessageText } from '../../src/persona-connection-errors.ts'
 import { personaInstanceId, personaTmuxSessionName } from '../../src/persona-identity.ts'
-import { PROMPT_ROW_STATES, type ApproverVerb } from '../../src/session-manager.ts'
+import { PROMPT_ROW_STATES, STUCK_LAUNCH_ABORT_SITE, type ApproverVerb } from '../../src/session-manager.ts'
 import { escapeSlackControlCharacters } from '../../src/slack-text-escape.ts'
 import {
   SAMPLE_LAUNCH_START_NONE,
@@ -581,11 +599,27 @@ export function isSequenceKillSite(site: string): site is SequenceKillSite {
 }
 
 /**
- * One of the checked kill's site kinds: the restart path's kill (E20) or one
- * of the live-row sequence's two kills (E21). The collision ladder makes no
- * kill (E22).
+ * The stuck-launch abort's kill as a site kind (b.jg5 SRJ-412, SRJ-110; E29):
+ * `src/session-manager.ts`'s `STUCK_LAUNCH_ABORT_SITE`, the abort kill's own
+ * site (`abortKillOwnStuckLaunch`) and the head of its tries', reads' and
+ * latch lines, re-exported here.
  */
-export type KillSite = typeof RESTART_KILL_SITE | SequenceKillSite
+export { STUCK_LAUNCH_ABORT_SITE }
+
+/** The stuck-launch abort's kill site kind ({@link STUCK_LAUNCH_ABORT_SITE}). */
+export type StuckLaunchAbortSite = typeof STUCK_LAUNCH_ABORT_SITE
+
+/** Whether `site` is the stuck-launch abort's kill site kind. */
+export function isStuckLaunchAbortSite(site: string): site is StuckLaunchAbortSite {
+  return site === STUCK_LAUNCH_ABORT_SITE
+}
+
+/**
+ * One of the checked kill's site kinds: the restart path's kill (E20), one
+ * of the live-row sequence's two kills (E21), or the stuck-launch abort's
+ * kill (E29). The collision ladder makes no kill (E22).
+ */
+export type KillSite = typeof RESTART_KILL_SITE | SequenceKillSite | StuckLaunchAbortSite
 
 /**
  * The site kind that meets a CONFLICT row's refusal: a plain spawn, a reuse
@@ -593,7 +627,7 @@ export type KillSite = typeof RESTART_KILL_SITE | SequenceKillSite
  * approver's pane verbs, one of the liveness checks' `read-pane` sites, the
  * reconnect's `send-keys`, one of b.jdc's prompt-row `read-pane` sites, or
  * one of the checked kill's sites (the restart path's kill, the live-row
- * sequence's two kills).
+ * sequence's two kills, the stuck-launch abort's kill).
  */
 export type ConflictCaseSite =
   | 'plain spawn'
@@ -638,20 +672,22 @@ export interface ConflictCaseRow {
    */
   readonly leftoverOfEarlierLaunch?: true
   /**
-   * Set on the restart kill's and the live-row sequence's kill rows only,
-   * false: the recorded state is the one the path hands the kill, so no
-   * latch-time `status` read is made. At the restart kill it is the state the
-   * run's `dead` reading carries (`ended`, `missing` or no row; b.jg5
-   * SRJ-501), and `rowState` is that of the `dead` reading a case hands the
-   * kill (`ended`, `LIVENESS_READING_DEAD_ENDED`); at a sequence kill it is
-   * the state the sequence last read.
+   * Set on the restart kill's, the live-row sequence's and the stuck-launch
+   * abort's kill rows only, false: the recorded state is the one the path
+   * hands the kill, so no latch-time `status` read is made. At the restart
+   * kill it is the state the run's `dead` reading carries (`ended`, `missing`
+   * or no row; b.jg5 SRJ-501), and `rowState` is that of the `dead` reading a
+   * case hands the kill (`ended`, `LIVENESS_READING_DEAD_ENDED`); at a
+   * sequence kill it is the state the sequence last read; at the abort's kill
+   * it is `pending`, the state the pending-row rule's `get` last read.
    */
   readonly latchTimeRead?: false
   /**
-   * Set on the sequence step-1 kill's "not this launch's session" row on a
-   * `pending` seed only: SRJ-613's kill backstop (a kill on a live row, `pending`
-   * included, answering "not this launch's session" latches the persona
-   * with nothing sent; E19 hatch note).
+   * Set on the "not this launch's session" row of the sequence step-1 kill on
+   * a `pending` seed and of the stuck-launch abort's kill only: SRJ-613's
+   * kill backstop (a kill on a live row, `pending` included, answering "not
+   * this launch's session" latches the persona with nothing sent; E19 and
+   * E20 hatch notes).
    */
   readonly killBackstop?: true
   /**
@@ -1130,6 +1166,21 @@ const SEQUENCE_KILL_ROWS: readonly ConflictCaseRow[] = SEQUENCE_KILL_SITES.flatM
 )
 
 /**
+ * The stuck-launch abort's kill CONFLICT rows (E29; b.jg5 SRJ-412, SRJ-110,
+ * SRJ-501, SRJ-613): one row per case `kill` answers, each refusing P's next
+ * check or recovery and recording `pending` (the abort kills only a row the
+ * rule's `get` read `pending`) with no latch-time `status` read. The "not
+ * this launch's session" row is SRJ-613's kill backstop (`killBackstop`).
+ */
+const STUCK_LAUNCH_ABORT_ROWS: readonly ConflictCaseRow[] = KILL_CASES.map(([stubCase, latchCase]) =>
+  Object.freeze({
+    ...row(STUCK_LAUNCH_ABORT_SITE, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, 'kill', stubCase, latchCase, PENDING),
+    latchTimeRead: false as const,
+    ...(latchCase === LATCH_CASE_NOT_THIS_LAUNCH ? { killBackstop: true as const } : {}),
+  }),
+)
+
+/**
  * The plain spawn's CONFLICT rows (b.jg5 SRJ-111, SRJ-501, SRJ-507; HO rev
  * 15, rev 20), each refusing the plain spawn and carrying the row
  * agent-director leaves (`rowAfter`): none after the pre-spawn scan's
@@ -1272,6 +1323,8 @@ export const CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze([
   ...RESTART_KILL_ROWS,
   // The live-row sequence's two kills (E21).
   ...SEQUENCE_KILL_ROWS,
+  // The stuck-launch abort's kill (E29).
+  ...STUCK_LAUNCH_ABORT_ROWS,
 ])
 
 /** The dialog approver's CONFLICT rows of {@link CONFLICT_CASE_ROWS} (its `read-pane` and `send-keys`), for `test.each`. */
@@ -1339,6 +1392,15 @@ export function sequenceKillConflictRowsAt(site: SequenceKillSite, lastRead: Seq
   return SEQUENCE_KILL_CONFLICT_CASE_ROWS.filter((caseRow) => caseRow.site === site && caseRow.rowState === SEQUENCE_KILL_ROW_STATES[lastRead])
 }
 
+/**
+ * The stuck-launch abort's kill CONFLICT rows of {@link CONFLICT_CASE_ROWS}
+ * (E29; one per case `kill` answers, each recording `pending`; the "not this
+ * launch's session" row carries `killBackstop`), for `test.each`.
+ */
+export const STUCK_LAUNCH_ABORT_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze(
+  CONFLICT_CASE_ROWS.filter((caseRow) => isStuckLaunchAbortSite(caseRow.site)),
+)
+
 // ---------------------------------------------------------------------------
 // The expected latch record of a hold case (b.jg5 SRJ-501)
 // ---------------------------------------------------------------------------
@@ -1380,6 +1442,7 @@ export type UnusableNameSite =
   | typeof RESTART_KILL_SITE
   | SequenceKillSite
   | typeof REUSE_SPAWN_SITE
+  | StuckLaunchAbortSite
 
 /** The agent-director verb each site kind calls. */
 const UNUSABLE_NAME_SITE_VERB: Readonly<Record<UnusableNameSite, string>> = Object.freeze({
@@ -1394,6 +1457,7 @@ const UNUSABLE_NAME_SITE_VERB: Readonly<Record<UnusableNameSite, string>> = Obje
   [SEQUENCE_STEP1_KILL_SITE]: 'kill',
   [SEQUENCE_STEP4_KILL_SITE]: 'kill',
   [REUSE_SPAWN_SITE]: SPAWN_VERB,
+  [STUCK_LAUNCH_ABORT_SITE]: 'kill',
 })
 
 /** Every site kind of {@link UnusableNameSite}, in row order. */
@@ -1453,6 +1517,10 @@ const UNUSABLE_NAME_LAST_READ: Readonly<Record<Exclude<UnusableNameSite, Reconne
   // The reuse spawn records the state its path last read (b.jg5 SRJ-501),
   // with no latch-time `status` read: `ended` here, a finished row.
   [REUSE_SPAWN_SITE]: ENDED,
+  // The stuck-launch abort's kill records `pending`, the state the
+  // pending-row rule's `get` last read (b.jg5 SRJ-412, SRJ-501), with no
+  // latch-time `status` read.
+  [STUCK_LAUNCH_ABORT_SITE]: PENDING,
 })
 
 function unusableNameRow(
@@ -1529,6 +1597,11 @@ export const SEQUENCE_KILL_UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow
 /** The reuse spawn's UNUSABLE NAME rows of {@link UNUSABLE_NAME_CASE_ROWS} (E22), for `test.each`. */
 export const REUSE_SPAWN_UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[] = Object.freeze(
   UNUSABLE_NAME_CASE_ROWS.filter((caseRow) => caseRow.site === REUSE_SPAWN_SITE),
+)
+
+/** The stuck-launch abort's kill UNUSABLE NAME rows of {@link UNUSABLE_NAME_CASE_ROWS} (E29; one per fault, each recording `pending`), for `test.each`. */
+export const STUCK_LAUNCH_ABORT_UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[] = Object.freeze(
+  UNUSABLE_NAME_CASE_ROWS.filter((caseRow) => isStuckLaunchAbortSite(caseRow.site)),
 )
 
 /** The sequence kill UNUSABLE NAME rows of one site kind whose sequence last read `lastRead`, for `test.each`. */

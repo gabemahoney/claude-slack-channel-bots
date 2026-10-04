@@ -112,7 +112,16 @@
  * row the held text, never a kill. The driver
  * ({@link createPendingRowRule}) is a factory over injected dependencies
  * (the session manager builds the production ones), runs one round per
- * call, and never kills, launches or reuses the row. The lap's pane is no
+ * call, and never kills, launches or reuses the row itself.
+ *
+ * CSCB's own stuck launch (b.jg5 SRJ-412): the own-launch slot is filled by
+ * {@link createStuckLaunchAbort}, a factory over injected dependencies that
+ * holds the per-episode abort state (one abort per stuck-launch episode,
+ * disposed when the episode closes) and makes the relaunching post, the stop
+ * of P's dialog approver, one checked kill (the session manager's, with the
+ * bounded retry and the kill-failure alert, context 'stuck-launch abort')
+ * and the live-row sequence's start at its second step, by the kill's typed
+ * answer ({@link StuckLaunchAbortKillAnswer}). The lap's pane is no
  * proof that this launch's session shows a dialog (b.jg5 SRJ-613): it leads
  * at most to Enter through `send-keys`, which is the backstop, answering
  * `ErrSpawnNotInteractive` with nothing typed on a `pending` row whose
@@ -120,8 +129,9 @@
  *
  * No module-scope state, no I/O, no agent-director call and nothing run at
  * import; the clock is always passed in. Every function but the posters, the
- * episode's end and the rule's driver is pure; those act only through the
- * dependencies they are given. Errors are classified by class and name
+ * episode's end, the rule's driver and the abort is pure; those act only
+ * through the dependencies they are given (the abort's per-episode state
+ * lives in its instance). Errors are classified by class and name
  * through `src/ad-error-class.ts`. Nothing names an export only the Phase 1
  * client has; the result field is typed through CSCB's own Phase 1
  * declarations (`src/ad-phase1-types.ts`, a type-only import).
@@ -654,6 +664,15 @@ export const STUCK_LAUNCH_ALREADY_POSTED = 'already-posted'
 export const STUCK_LAUNCH_SUPPRESSED = 'suppressed'
 /** A poster's answer: the episodes are closed (shutdown), so nothing was posted. */
 export const STUCK_LAUNCH_NOT_POSTED_CLOSED = 'closed'
+/**
+ * A poster's answer: an episodes call threw, so nothing was posted (its one
+ * line, {@link stuckLaunchPostFailedLine}). Kept apart from
+ * {@link STUCK_LAUNCH_SUPPRESSED}, so a caller never takes a failed post for
+ * the `tmux-unavailable` gate, nor the gate for a failed post (the abort of
+ * CSCB's own stuck launch follows only a relaunching text posted, b.jg5
+ * SRJ-412).
+ */
+export const STUCK_LAUNCH_POST_FAILED = 'failed'
 
 /** What a stuck-launch poster answers. */
 export type StuckLaunchPostAnswer =
@@ -661,6 +680,7 @@ export type StuckLaunchPostAnswer =
   | typeof STUCK_LAUNCH_ALREADY_POSTED
   | typeof STUCK_LAUNCH_SUPPRESSED
   | typeof STUCK_LAUNCH_NOT_POSTED_CLOSED
+  | typeof STUCK_LAUNCH_POST_FAILED
 
 /** What the posters use of the server's one episodes instance (`createPersonaEpisodes`, `src/persona-episodes.ts`). */
 export type StuckLaunchPostEpisodes = Pick<PersonaEpisodes, 'begin' | 'post' | 'teardownWindowState'>
@@ -699,8 +719,10 @@ function stuckLaunchTextName(mark: StuckLaunchTextMark, metNotInteractive: boole
  *   [slack] pending-row: persona=<key> stuck-launch <text> not posted — already posted in this stuck-launch episode
  *   [slack] pending-row: persona=<key> stuck-launch <text> not posted — its tmux-unavailable outage is raised, whose onset is its notice; no episode begun
  *   [slack] pending-row: persona=<key> stuck-launch <text> not posted — the server is shutting down
+ *   [slack] pending-row: persona=<key> stuck-launch <text> not posted — an episodes call failed
  *
- * where `<text>` is `relaunching text`, `held text`, or `held text (no attach
+ * (a poster whose episodes call threw logs {@link stuckLaunchPostFailedLine}
+ * instead, with what it threw), where `<text>` is `relaunching text`, `held text`, or `held text (no attach
  * line: the session holding its name was not started by CSCB's launch)`.
  * `muted` is true for a post its submitted persona teardown muted. Pure.
  */
@@ -720,6 +742,8 @@ export function stuckLaunchPostLine(
       return `${head} not posted — its tmux-unavailable outage is raised, whose onset is its notice; no episode begun`
     case STUCK_LAUNCH_NOT_POSTED_CLOSED:
       return `${head} not posted — the server is shutting down`
+    case STUCK_LAUNCH_POST_FAILED:
+      return `${head} not posted — an episodes call failed`
   }
 }
 
@@ -763,7 +787,7 @@ function tmuxUnavailableRaisedFor(deps: StuckLaunchPosterDeps, key: string): boo
  * is raised; otherwise begin or keep the episode and post at most once per
  * mark in it. One line per call ({@link stuckLaunchPostLine}). Never throws:
  * an episodes call that throws logs {@link stuckLaunchPostFailedLine} and
- * answers suppressed.
+ * answers {@link STUCK_LAUNCH_POST_FAILED}.
  */
 function postStuckLaunchText(
   deps: StuckLaunchPosterDeps,
@@ -787,7 +811,7 @@ function postStuckLaunchText(
     return line(STUCK_LAUNCH_POSTED, muted)
   } catch (err) {
     safePendingRowLog(deps.log, stuckLaunchPostFailedLine(key, describeThrownValue(err)))
-    return STUCK_LAUNCH_SUPPRESSED
+    return STUCK_LAUNCH_POST_FAILED
   }
 }
 
@@ -1344,7 +1368,7 @@ export interface PendingRowStepThreeInput {
   readonly tmuxUnavailableRaised: boolean
   /** P is latched. */
   readonly latched: boolean
-  /** The row's current launch is CSCB's own (SRJ-412); always false until the own-launch record is consulted. */
+  /** The row's current launch is CSCB's own (SRJ-412): the own-launch slot's answer; false with no slot filled. */
   readonly ownLaunch: boolean
   /** P's `ad-config-malformed` outage is raised. */
   readonly configMalformedRaised: boolean
@@ -1435,8 +1459,9 @@ export type PendingRowRelaunchAnswer =
  * The slot for step 3's own-launch branch (b.jg5 SRJ-412): whether the row's
  * current launch is CSCB's own, whether the stuck-launch episode's one abort
  * is still available, and the branch itself (the relaunching post and the
- * abort). Absent: no row is CSCB's own, and every row at B takes the held
- * branch.
+ * abort). Production fills it with {@link createStuckLaunchAbort} (the
+ * session manager's `buildPendingRowRuleDeps`). Absent: no row is CSCB's
+ * own, and every row at B takes the held branch.
  */
 export interface PendingRowOwnLaunchHooks {
   readonly isOwnLaunch: (key: string, launchStart: unknown) => boolean
@@ -1819,6 +1844,339 @@ export function createPendingRowRule(deps: PendingRowRuleDeps): PendingRowRule {
       } catch (err) {
         log(pendingRowRuleFailedLine(input.ref, input.origin, describeThrownValue(err)))
         return refusal('failed')
+      }
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// CSCB's own stuck launch: its one abort per stuck-launch episode (b.jg5 SRJ-412)
+// ---------------------------------------------------------------------------
+
+/** The abort kill succeeded (`kill_sent` true or false, the row already gone, the session gone, or a read between tries found the row finished): the sequence follows. */
+export const STUCK_LAUNCH_ABORT_KILL_SUCCEEDED = 'succeeded'
+/** The abort kill's `ErrTmuxKillFailed` stands after its tries: the kill-failure alert was raised; the episode's one abort is used. */
+export const STUCK_LAUNCH_ABORT_KILL_FAILED = 'kill-failed'
+/** The abort kill's CONFLICT or UNUSABLE NAME latched P, or a read between its tries did: the episode's one abort is used. */
+export const STUCK_LAUNCH_ABORT_KILL_LATCHED = 'latched'
+/**
+ * The abort kill did nothing (another UNAVAILABLE outcome, ENVIRONMENT,
+ * CONFIG or UNCLASSIFIED): the abort is not used, and the same abort is made
+ * again at the next retry that reaches step 3 (Q-12).
+ */
+export const STUCK_LAUNCH_ABORT_KILL_TRY_LATER = 'try-later'
+/**
+ * The abort kill's tries were stopped by SRJ-702's stop rule (P's teardown, P
+ * no longer up, a server shutdown, or a version re-check that stops the
+ * server): no alert of either version was raised, and the abort is not used.
+ */
+export const STUCK_LAUNCH_ABORT_KILL_STOPPED = 'stopped'
+
+/**
+ * What the abort's one checked kill answers (the session manager's
+ * `abortKillOwnStuckLaunch`), decided by class and name through
+ * `src/ad-error-class.ts`. `description` is the standing outcome as one log
+ * line renders it (`describeKillOutcome`: redacted, `kill_sent` included).
+ */
+export type StuckLaunchAbortKillAnswer =
+  | { readonly kind: typeof STUCK_LAUNCH_ABORT_KILL_SUCCEEDED; readonly killSent?: boolean; readonly description: string }
+  | { readonly kind: typeof STUCK_LAUNCH_ABORT_KILL_FAILED; readonly description: string }
+  | { readonly kind: typeof STUCK_LAUNCH_ABORT_KILL_LATCHED; readonly description: string }
+  | { readonly kind: typeof STUCK_LAUNCH_ABORT_KILL_TRY_LATER; readonly errorClass: string; readonly description: string }
+  | { readonly kind: typeof STUCK_LAUNCH_ABORT_KILL_STOPPED; readonly description: string }
+
+/**
+ * Whether the abort kill's answer uses up the stuck-launch episode's one
+ * abort (b.jg5 SRJ-412, Q-12): a success, `ErrTmuxKillFailed` after tries no
+ * stop ended, and a latch do; "try again later" and a stopped kill do not.
+ * Pure.
+ */
+export function stuckLaunchAbortKillUsesAbort(answer: StuckLaunchAbortKillAnswer): boolean {
+  return (
+    answer.kind === STUCK_LAUNCH_ABORT_KILL_SUCCEEDED ||
+    answer.kind === STUCK_LAUNCH_ABORT_KILL_FAILED ||
+    answer.kind === STUCK_LAUNCH_ABORT_KILL_LATCHED
+  )
+}
+
+/** The abort's live-row sequence started (entry at step 2). */
+export const STUCK_LAUNCH_ABORT_SEQUENCE_STARTED = 'started'
+/** The abort's live-row sequence did not start; `why` is the start entry's answer. */
+export const STUCK_LAUNCH_ABORT_SEQUENCE_NOT_STARTED = 'not-started'
+
+/** What the start of the abort's live-row sequence answers. */
+export type StuckLaunchAbortSequenceStart =
+  | { readonly kind: typeof STUCK_LAUNCH_ABORT_SEQUENCE_STARTED }
+  | { readonly kind: typeof STUCK_LAUNCH_ABORT_SEQUENCE_NOT_STARTED; readonly why: string }
+
+/** The abort was not made: the stuck-launch episode's one abort was used, so the row is any other `pending` row. */
+export const STUCK_LAUNCH_ABORT_SKIP_EARLIER_ABORT = "the stuck-launch episode's one abort was used, so the row is any other pending row and gets the held text"
+/** The abort was not made: P's `tmux-unavailable` outage is raised. */
+export const STUCK_LAUNCH_ABORT_SKIP_TMUX_UNAVAILABLE = 'its tmux-unavailable outage is raised; the abort waits until it clears'
+/** The abort was not made: P's `ad-config-malformed` outage is raised (SRJ-316: no kill of a row read `pending`). */
+export const STUCK_LAUNCH_ABORT_SKIP_CONFIG_MALFORMED = 'its ad-config-malformed outage is raised, and no row read pending is killed while it is; the abort waits until it clears'
+/** The abort was not made: an abort of this persona's launch is already in progress. */
+export const STUCK_LAUNCH_ABORT_SKIP_IN_PROGRESS = 'an abort of its launch is already in progress'
+/** The abort was not made: the server is shutting down (the relaunching post answered closed). */
+export const STUCK_LAUNCH_ABORT_SKIP_SHUTDOWN = 'the server is shutting down'
+/** The abort was not made: the relaunching post failed (an episodes call threw); the abort waits for a post. */
+export const STUCK_LAUNCH_ABORT_SKIP_POST_FAILED = 'the relaunching post failed, and no abort is made without it; tried again at the next retry that reaches step 3'
+/** The abort was not made: no stuck-launch episode was open to hold its one abort. */
+export const STUCK_LAUNCH_ABORT_SKIP_NO_EPISODE = 'no stuck-launch episode is open to hold its one abort; tried again at the next retry that reaches step 3'
+
+/** Why the abort, once its kill answered, makes no relaunch this round: `ErrTmuxKillFailed` after its tries. */
+export const STUCK_LAUNCH_ABORT_KEPT_KILL_FAILED =
+  "the abort kill failed after its tries: the kill-failure alert was raised, the episode's one abort is used, and the held text follows at the next retry that reaches step 3"
+/** Why: the abort kill did nothing; Q-12. */
+export const STUCK_LAUNCH_ABORT_KEPT_TRY_LATER =
+  'the abort kill did nothing: the abort is not used, and the same abort is made at the next retry that reaches step 3, with no second relaunching post'
+/** Why: the abort kill's tries were stopped by SRJ-702's stop rule. */
+export const STUCK_LAUNCH_ABORT_KEPT_STOPPED =
+  "the abort kill's tries were stopped: no alert, the abort is not used, and the same abort is made at the next retry that reaches step 3, with no second relaunching post"
+
+/** The head of every abort line for persona `key`. */
+function stuckLaunchAbortLineHead(key: string): string {
+  return `${stuckLaunchLineHead(key)} abort`
+}
+
+/**
+ * The abort's start line (b.jg5 SRJ-412), after the relaunching post:
+ *
+ *   [slack] pending-row: persona=<key> stuck-launch abort started for <ref> (launch started <ISO>) — its dialog approver is stopped if one runs, then one checked kill of its row (b.jg5 SRJ-412)
+ *
+ * Pure.
+ */
+export function stuckLaunchAbortStartedLine(key: string, ref: string, launchStart: unknown): string {
+  return `${stuckLaunchAbortLineHead(key)} started for ${ref} (launch started ${describeLaunchStartForLog(launchStart)}) — its dialog approver is stopped if one runs, then one checked kill of its row (b.jg5 SRJ-412)`
+}
+
+/**
+ * The line of an abort not made for persona `key` (b.jg5 SRJ-412), with why
+ * (one of the `STUCK_LAUNCH_ABORT_SKIP_*` texts):
+ *
+ *   [slack] pending-row: persona=<key> stuck-launch abort not made — <why> (b.jg5 SRJ-412)
+ *
+ * Pure.
+ */
+export function stuckLaunchAbortSkippedLine(key: string, why: string): string {
+  return `${stuckLaunchAbortLineHead(key)} not made — ${why} (b.jg5 SRJ-412)`
+}
+
+/**
+ * The line of the abort kill's answer for persona `key` (b.jg5 SRJ-412,
+ * SRJ-702, SRJ-704), with what follows:
+ *
+ *   [slack] pending-row: persona=<key> stuck-launch abort kill: <kind> (<description>) — <follows> (b.jg5 SRJ-412)
+ *
+ * `<description>` is the answer's own, already redacted. Pure.
+ */
+export function stuckLaunchAbortKillLine(key: string, answer: StuckLaunchAbortKillAnswer, follows: string): string {
+  return `${stuckLaunchAbortLineHead(key)} kill: ${answer.kind} (${answer.description}) — ${follows} (b.jg5 SRJ-412)`
+}
+
+/**
+ * The line of the abort's live-row sequence start for persona `key` (b.jg5
+ * SRJ-412, SRJ-705):
+ *
+ *   [slack] pending-row: persona=<key> stuck-launch abort: the live-row sequence started at its second step, keeping a resumed launch's conversation (b.jg5 SRJ-412, SRJ-705)
+ *   [slack] pending-row: persona=<key> stuck-launch abort: the live-row sequence did not start (<why>) — nothing more this round (b.jg5 SRJ-412, SRJ-705)
+ *
+ * Pure.
+ */
+export function stuckLaunchAbortSequenceLine(key: string, start: StuckLaunchAbortSequenceStart): string {
+  return start.kind === STUCK_LAUNCH_ABORT_SEQUENCE_STARTED
+    ? `${stuckLaunchAbortLineHead(key)}: the live-row sequence started at its second step, keeping a resumed launch's conversation (b.jg5 SRJ-412, SRJ-705)`
+    : `${stuckLaunchAbortLineHead(key)}: the live-row sequence did not start (${start.why}) — nothing more this round (b.jg5 SRJ-412, SRJ-705)`
+}
+
+/** What the abort uses of the server's one episodes instance: the close hook of the stuck-launch episode. */
+export type StuckLaunchAbortEpisodes = Pick<PersonaEpisodes, 'whenClosed'>
+
+/**
+ * The abort's injected dependencies (production: the session manager's
+ * builder, `buildPendingRowRuleDeps`). Every agent-director call is made
+ * through them; the abort itself makes none.
+ */
+export interface StuckLaunchAbortDeps {
+  /** Receives the abort's lines (the server log). A throwing log is swallowed. */
+  readonly log: (line: string) => void
+  /**
+   * Whether P's row's current launch, with this launch start as read now, is
+   * CSCB's own (production: `isCscbOwnLaunch`: the own-launch record, the
+   * unchanged launch start, no `send-keys` `ErrSpawnNotInteractive`). A throw
+   * counts as not own.
+   */
+  readonly isOwnLaunch: (key: string, launchStart: unknown) => boolean
+  /** The latch's latched query (SRJ-502). A throw counts as latched. */
+  readonly isLatched: (key: string) => boolean
+  /** Whether P's `tmux-unavailable` outage is raised. A throw counts as raised. */
+  readonly isTmuxUnavailableRaised: (key: string) => boolean
+  /** Whether P's `ad-config-malformed` outage is raised. A throw counts as raised. */
+  readonly isConfigMalformedRaised: (key: string) => boolean
+  /** The relaunching text's poster ({@link postStuckLaunchRelaunching} over the server's one episodes instance, B in effect). */
+  readonly postRelaunching: (key: string) => StuckLaunchPostAnswer
+  /** The server's one episodes instance: the stuck-launch episode's close hook holds the abort's per-episode state. */
+  readonly episodes: StuckLaunchAbortEpisodes
+  /** Stop P's running dialog approver with the abort's stop reason, if one runs; resolves once it has stopped. */
+  readonly stopApprover: (key: string) => Promise<unknown>
+  /** The abort's one checked kill of P's row with the bounded retry and its alert. */
+  readonly abortKill: (key: string, ref: string) => Promise<StuckLaunchAbortKillAnswer>
+  /** Start the live-row sequence at its second step, the conversation kept, after the abort's own kill. */
+  readonly startSequence: (key: string, ref: string) => StuckLaunchAbortSequenceStart
+}
+
+/** One persona's abort state in its open stuck-launch episode. */
+interface StuckLaunchAbortState {
+  /** The episode's one abort is used (SRJ-412). */
+  used: boolean
+  /** An abort is running now (its approver stop, kill or sequence start). */
+  inProgress: boolean
+}
+
+/** What {@link createStuckLaunchAbort} answers: the pending-row rule's own-launch slot, and a read of the abort state. */
+export interface StuckLaunchAbort extends PendingRowOwnLaunchHooks {
+  /** Whether persona `key`'s open stuck-launch episode has used its one abort. Read-only. */
+  readonly isAbortUsed: (key: string) => boolean
+}
+
+/** A kept answer. */
+function relaunchKept(why: string): PendingRowRelaunchAnswer {
+  return { kind: PENDING_ROW_RELAUNCH_KEPT, why }
+}
+
+/** The latched answer of the abort. */
+const RELAUNCH_LATCHED: PendingRowRelaunchAnswer = Object.freeze({ kind: PENDING_ROW_RELAUNCH_LATCHED })
+
+/**
+ * Build the abort of CSCB's own stuck launch (b.jg5 SRJ-412, SRJ-410 step 3)
+ * over `deps`: the pending-row rule's own-launch slot
+ * ({@link PendingRowOwnLaunchHooks}), with the per-episode abort state.
+ *
+ *   - `isOwnLaunch`: `deps.isOwnLaunch` (a throw is not own).
+ *   - `isAbortAvailable`: false once P's open stuck-launch episode has used
+ *     its one abort, with one line ({@link STUCK_LAUNCH_ABORT_SKIP_EARLIER_ABORT}):
+ *     the rule then takes the held branch, so a relaunch still `pending` at B
+ *     in the same episode gets the held text once and is never killed. The
+ *     state lives in this instance, per persona, and is disposed when the
+ *     episode closes (`whenClosed` of the stuck-launch kind: a read of the
+ *     row live out of `pending`, a latch, P's teardown, shutdown), so a new
+ *     episode has its abort again.
+ *   - `relaunch`, in order: the relaunching post (once per episode; a second
+ *     call in the episode posts nothing); no abort unless the post was made
+ *     or already made in this episode (an outage that suppressed it, a
+ *     shutdown and a failed post each make none, with one line); the state
+ *     is kept for the open episode; P's running dialog approver is stopped
+ *     (`deps.stopApprover`, its stop reason outside the stops the rule runs
+ *     after); the latch and both outages are asked again (no kill while P is
+ *     latched, while `tmux-unavailable` is raised, or of a row read `pending`
+ *     while `ad-config-malformed` is raised; SRJ-316); the one checked kill
+ *     (`deps.abortKill`). Then by the kill's answer:
+ *       - success: the abort is used, and the live-row sequence starts at
+ *         step 2 (`deps.startSequence`), answering "sequence started";
+ *       - `ErrTmuxKillFailed`: the abort is used; nothing more this round
+ *         (the held text comes at the next retry that reaches step 3);
+ *       - latched: the abort is used; answers latched;
+ *       - try again later, or stopped by SRJ-702's stop rule: the abort is
+ *         not used; nothing more this round; the next retry that reaches
+ *         step 3 makes the same abort with no second relaunching post (Q-12).
+ * At most one abort of a persona runs at a time: a call while one runs
+ * makes nothing. One line per decision and outcome. Every answer but
+ * "sequence started" and latched is kept (no held post that round). Never
+ * rejects: a dependency that throws ends the round as kept, with its line.
+ */
+export function createStuckLaunchAbort(deps: StuckLaunchAbortDeps): StuckLaunchAbort {
+  const log = (line: string): void => safePendingRowLog(deps.log, line)
+  const states = new Map<string, StuckLaunchAbortState>()
+
+  const skip = (key: string, why: string): PendingRowRelaunchAnswer => {
+    log(stuckLaunchAbortSkippedLine(key, why))
+    return relaunchKept(why)
+  }
+
+  /** P's state for its open stuck-launch episode, made and tied to the episode's close when absent; `undefined` when no episode is open. */
+  const stateFor = (key: string): StuckLaunchAbortState | undefined => {
+    const current = states.get(key)
+    if (current !== undefined) return current
+    const state: StuckLaunchAbortState = { used: false, inProgress: false }
+    const kept = deps.episodes.whenClosed(key, STUCK_LAUNCH_KIND, () => {
+      if (states.get(key) === state) states.delete(key)
+    })
+    if (!kept) return undefined
+    states.set(key, state)
+    return state
+  }
+
+  const abort = async (key: string, ref: string, launchStart: unknown): Promise<PendingRowRelaunchAnswer> => {
+    if (states.get(key)?.inProgress === true) return skip(key, STUCK_LAUNCH_ABORT_SKIP_IN_PROGRESS)
+    const post = deps.postRelaunching(key)
+    switch (post) {
+      case STUCK_LAUNCH_POSTED:
+      case STUCK_LAUNCH_ALREADY_POSTED:
+        break
+      case STUCK_LAUNCH_SUPPRESSED:
+        return skip(key, STUCK_LAUNCH_ABORT_SKIP_TMUX_UNAVAILABLE)
+      case STUCK_LAUNCH_NOT_POSTED_CLOSED:
+        return skip(key, STUCK_LAUNCH_ABORT_SKIP_SHUTDOWN)
+      case STUCK_LAUNCH_POST_FAILED:
+        return skip(key, STUCK_LAUNCH_ABORT_SKIP_POST_FAILED)
+    }
+    const state = stateFor(key)
+    if (state === undefined) return skip(key, STUCK_LAUNCH_ABORT_SKIP_NO_EPISODE)
+    if (state.used) return skip(key, STUCK_LAUNCH_ABORT_SKIP_EARLIER_ABORT)
+    if (state.inProgress) return skip(key, STUCK_LAUNCH_ABORT_SKIP_IN_PROGRESS)
+    state.inProgress = true
+    try {
+      log(stuckLaunchAbortStartedLine(key, ref, launchStart))
+      await deps.stopApprover(key)
+      // b.jg5 SRJ-502, SRJ-316, SRJ-412: asked again after the stop, which waited on the approver's call in progress.
+      if (askQuery(() => deps.isLatched(key), true)) {
+        log(stuckLaunchAbortSkippedLine(key, 'the persona is latched'))
+        return RELAUNCH_LATCHED
+      }
+      if (askQuery(() => deps.isTmuxUnavailableRaised(key), true)) return skip(key, STUCK_LAUNCH_ABORT_SKIP_TMUX_UNAVAILABLE)
+      if (askQuery(() => deps.isConfigMalformedRaised(key), true)) return skip(key, STUCK_LAUNCH_ABORT_SKIP_CONFIG_MALFORMED)
+      const killed = await deps.abortKill(key, ref)
+      if (stuckLaunchAbortKillUsesAbort(killed)) state.used = true
+      switch (killed.kind) {
+        case STUCK_LAUNCH_ABORT_KILL_SUCCEEDED: {
+          log(stuckLaunchAbortKillLine(key, killed, "the episode's one abort is used; the live-row sequence follows from its second step"))
+          const started = deps.startSequence(key, ref)
+          log(stuckLaunchAbortSequenceLine(key, started))
+          return started.kind === STUCK_LAUNCH_ABORT_SEQUENCE_STARTED
+            ? { kind: PENDING_ROW_RELAUNCH_SEQUENCE_STARTED }
+            : relaunchKept(`the abort kill succeeded, but the live-row sequence did not start (${started.why})`)
+        }
+        case STUCK_LAUNCH_ABORT_KILL_FAILED:
+          log(stuckLaunchAbortKillLine(key, killed, STUCK_LAUNCH_ABORT_KEPT_KILL_FAILED))
+          return relaunchKept(STUCK_LAUNCH_ABORT_KEPT_KILL_FAILED)
+        case STUCK_LAUNCH_ABORT_KILL_LATCHED:
+          log(stuckLaunchAbortKillLine(key, killed, "the persona latched: the episode's one abort is used, and the kill is never tried again"))
+          return RELAUNCH_LATCHED
+        case STUCK_LAUNCH_ABORT_KILL_TRY_LATER:
+          log(stuckLaunchAbortKillLine(key, killed, STUCK_LAUNCH_ABORT_KEPT_TRY_LATER))
+          return relaunchKept(STUCK_LAUNCH_ABORT_KEPT_TRY_LATER)
+        case STUCK_LAUNCH_ABORT_KILL_STOPPED:
+          log(stuckLaunchAbortKillLine(key, killed, STUCK_LAUNCH_ABORT_KEPT_STOPPED))
+          return relaunchKept(STUCK_LAUNCH_ABORT_KEPT_STOPPED)
+      }
+    } finally {
+      state.inProgress = false
+    }
+  }
+
+  return {
+    isOwnLaunch: (key, launchStart) => askQuery(() => deps.isOwnLaunch(key, launchStart), false),
+    isAbortAvailable: (key) => {
+      if (states.get(key)?.used !== true) return true
+      log(stuckLaunchAbortSkippedLine(key, STUCK_LAUNCH_ABORT_SKIP_EARLIER_ABORT))
+      return false
+    },
+    isAbortUsed: (key) => states.get(key)?.used === true,
+    relaunch: async (key, ref, launchStart) => {
+      try {
+        return await abort(key, ref, launchStart)
+      } catch (err) {
+        return skip(key, `the abort failed: ${describeThrownValue(err)}; nothing more this round`)
       }
     },
   }
