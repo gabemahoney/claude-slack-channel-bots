@@ -36,9 +36,15 @@
  * (SRJ-302): a persona is never given up on for UNAVAILABLE, ENVIRONMENT,
  * CONFIG or UNCLASSIFIED alone.
  * The liveness probe answers one of four readings (b.jg5 SRJ-314,
- * `src/liveness-reading.ts`), and only `dead` leads to the kill and the
- * launch; after an escalate-dead verdict that is not dead evidence (b.jg5
- * SRJ-611), to the launch alone. `live` takes the reconnect path; for a key
+ * `src/liveness-reading.ts`), and only `dead` leads to the launch. The
+ * checked kill comes before it only after a `dead` reading of
+ * `ErrSystemInstallDisappeared`, which reads no row: at the first probe, or
+ * at the re-probe after a GONE-based escalate-dead verdict. A `dead` reading
+ * that read the row (`ended`, `missing` or `ErrSpawnNotFound`) launches with
+ * no kill, and at the re-probe voids a GONE-based verdict, so the relaunch
+ * carries none; a verdict that is not dead evidence never leads to a kill
+ * (b.jg5 SRJ-110, SRJ-611; `killBeforeRelaunch` decides it all). `live`
+ * takes the reconnect path; for a key
  * recorded as retired with no "new life has begun" mark the server's
  * reconnect adapter types nothing into that old life, starts the live-row
  * sequence (with the retired-key flag) and answers 'transient' (b.jg5
@@ -144,6 +150,11 @@ import { readRetryBlockCause, retryBlockSkipText, runInAttempt, type RetryBlockC
 import { AD_ERROR_CLASS_CONFLICT, AD_ERROR_CLASS_UNUSABLE_NAME } from './ad-error-class.ts'
 import {
   KILL_OUTCOME_NOT_KILLED,
+  KILL_OUTCOME_ROW_FINISHED,
+  KILL_OUTCOME_ROW_GONE,
+  KILL_ROW_FINISHED_ENDED,
+  KILL_ROW_FINISHED_MISSING,
+  KILL_ROW_FINISHED_NO_ROW,
   describeKillOutcome,
   isKillOutcome,
   killLetsNextStepRun,
@@ -153,6 +164,9 @@ import {
 } from './checked-kill.ts'
 import {
   LIVENESS_DEAD,
+  LIVENESS_DEAD_ROW_ENDED,
+  LIVENESS_DEAD_ROW_MISSING,
+  LIVENESS_DEAD_ROW_NO_ROW,
   LIVENESS_LIVE,
   LIVENESS_PENDING,
   LIVENESS_READING_DEAD_INSTALL_GONE,
@@ -232,9 +246,9 @@ export const RESTART_OUTCOME_RECONNECT_DEFERRED = 'reconnect-deferred'
  */
 export const RESTART_OUTCOME_PENDING_DEFERRED = 'pending-deferred'
 /**
- * The launch ran and succeeded (a success was recorded), after the kill, or
- * with no kill after an escalate-dead verdict that is not dead evidence
- * (b.jg5 SRJ-611).
+ * The launch ran and succeeded (a success was recorded), after the checked
+ * kill or with no kill, as `killBeforeRelaunch` decided (b.jg5 SRJ-110,
+ * SRJ-314, SRJ-611).
  */
 export const RESTART_OUTCOME_LAUNCHED = 'launched'
 /**
@@ -358,8 +372,9 @@ export interface RestartDeps {
   /**
    * The persona's liveness reading (b.jg5 SRJ-314, `src/liveness-reading.ts`):
    * `live`, `pending` (with the row's launch start when the `status` result
-   * showed one), `dead` or `unknown`. Only `dead` leads to the kill and the
-   * launch. `live` takes the reconnect path; `pending` on the work's first
+   * showed one), `dead` or `unknown`. Only `dead` leads to the launch, and
+   * only its `ErrSystemInstallDisappeared` form to the checked kill before
+   * it (`killBeforeRelaunch`). `live` takes the reconnect path; `pending` on the work's first
    * liveness probe goes to `deferPendingRow` and the work returns
    * `RESTART_OUTCOME_PENDING_DEFERRED` with no reconnect, kill, launch or
    * accounting (`pending` on the b.d61 re-probe after an 'escalate-dead'
@@ -390,8 +405,9 @@ export interface RestartDeps {
    * The escalate-dead answer carries the verdict the adapter swept with
    * (`ReconnectEscalateDead`, b.jg5 SRJ-611); a bare 'escalate-dead'
    * carries none. After a `dead` re-probe only a verdict that is dead
-   * evidence leads to the kill; any other relaunches with no kill (b.jg5
-   * SRJ-609, SRJ-611, `ReconnectSessionResult`).
+   * evidence, with a re-probe of `ErrSystemInstallDisappeared`, leads to the
+   * kill; any other relaunches with no kill (b.jg5 SRJ-609, SRJ-611,
+   * `ReconnectSessionResult`, `killBeforeRelaunch`).
    *
    * The return type is widened from void: the server.ts adapter already
    * computes reconnectMcp's ReconnectMcpResult union internally and now
@@ -406,12 +422,15 @@ export interface RestartDeps {
    * Kill the persona's instance before its launch, with one checked kill
    * (b.jg5 SRJ-110, SRJ-701), and answer its outcome (`KillOutcome`,
    * `kill_sent` included), or `KILL_SESSION_NOT_KILLED_GUARD` when a guard
-   * made no call. Required: every kill reports its outcome. `lastRead` is
-   * the run's last liveness reading, the `dead` one that led to the kill:
-   * it carries the row state the run read (`ended`, `missing` or no row,
-   * `deadRowReadOf`), or none (`ErrSystemInstallDisappeared`), and is the
-   * state a latch the kill sets records (b.jg5 SRJ-501), with no further
-   * `status` read when it carries one. The work launches only after a
+   * made no call. Required: every kill reports its outcome. Called only
+   * after a `dead` reading of `ErrSystemInstallDisappeared`
+   * (`killBeforeRelaunch`, b.jg5 SRJ-314, SRJ-611): a reading that read the
+   * row gets no kill. `lastRead` is the run's last liveness reading, the
+   * `dead` one that led to the kill: it carries the row state the run read
+   * (`ended`, `missing` or no row, `deadRowReadOf`), or none
+   * (`ErrSystemInstallDisappeared`), and is the state a latch the kill sets
+   * records (b.jg5 SRJ-501), with no further `status` read when it carries
+   * one. The work launches only after a
    * success form (`killed`, any `kill_sent`; `row-gone`, `ErrSpawnNotFound`;
    * `session-gone`, GONE; `row-finished`) or the guard answer. A CONFLICT or
    * an UNUSABLE NAME (which the adapter latched), and any other non-success
@@ -435,7 +454,11 @@ export interface RestartDeps {
    * persona) or `sequence-waiting`; it counts as neither either (SRJ-302). `deadEvidence`: the verdict an
    * escalate-dead answer carried (`ReconnectEscalateDead`, b.jg5 SRJ-611),
    * passed on unchanged to the relaunch after it, which carries it into the
-   * ladder; absent for any other launch, and for a bare 'escalate-dead'.
+   * ladder, unless a read voided it (a re-probe that read the row `ended`,
+   * `missing` or gone, or a kill that read the row finished — its
+   * `ErrSpawnNotFound`, or a `status` read between its tries that found the
+   * row `ended`, `missing` or no row: dead evidence covers one life, `killBeforeRelaunch`); absent for any other launch, for
+   * a voided verdict, and for a bare 'escalate-dead'.
    */
   launchSession(key: string, cwd: string, sessionId?: string, deadEvidence?: CarriedDeadEvidence): Promise<LaunchSessionResult>
   getRestartDelay(): number
@@ -589,7 +612,8 @@ export interface RestartDeps {
    *   (`ended`, `missing`, `ErrSpawnNotFound`) → `noteDead`, and `dead` from
    *   `ErrSystemInstallDisappeared` (`isInstallGoneDeadReading`) →
    *   `noteInstallGone`, each before the same run's kill (made only after a
-   *   verdict that is dead evidence, b.jg5 SRJ-611) and relaunch;
+   *   verdict that is dead evidence and the `ErrSystemInstallDisappeared`
+   *   reading, b.jg5 SRJ-611) and relaunch;
    *   `unknown` or a thrown probe → nothing; a persona latched by that read
    *   → nothing (the latch's own end applies);
    * - at the run's first liveness probe, `dead` from a row read →
@@ -650,8 +674,13 @@ export interface RestartSlowRecoveryObserver {
  * (`evidence === true`). The work handles every escalate-dead answer alike
  * (the latch check, the re-probe and its slow-recovery note); when the
  * re-probe reads `dead`:
- *   - a GONE-based verdict (dead evidence) leads to the checked kill, then
- *     the relaunch, which carries the verdict;
+ *   - a GONE-based verdict (dead evidence) with a re-probe of
+ *     `ErrSystemInstallDisappeared`, which reads no row, leads to the checked
+ *     kill, then the relaunch, which carries the verdict unless the kill
+ *     answered `ErrSpawnNotFound`;
+ *   - a GONE-based verdict with a re-probe that read the row `ended`,
+ *     `missing` or gone is void (dead evidence covers one life): the
+ *     relaunch alone, carrying no verdict, with no kill;
  *   - any other verdict (`row-not-interactive`, a row read such as
  *     `row-absent-at-pane-read`) leads to the relaunch alone, carrying the
  *     verdict, with no kill: it never by itself leads to a kill (b.jg5
@@ -678,26 +707,160 @@ export type ReconnectSessionResult =
   | 'pending'
   | void
 
+/** An escalate-dead answer as the restart work reads it: the verdict it carried, absent for a bare 'escalate-dead'. */
+interface EscalateDeadAnswer {
+  readonly deadEvidence?: CarriedDeadEvidence
+}
+
 /**
  * The escalate-dead answer in `result`: `{}` for a bare 'escalate-dead'
  * (no verdict carried), `{ deadEvidence }` for `ReconnectEscalateDead`, and
  * `undefined` for every other answer.
  */
-function escalateDeadOf(result: ReconnectSessionResult): { deadEvidence?: CarriedDeadEvidence } | undefined {
+function escalateDeadOf(result: ReconnectSessionResult): EscalateDeadAnswer | undefined {
   if (result === 'escalate-dead') return {}
   if (typeof result === 'object' && result !== null && result.outcome === 'escalate-dead') return { deadEvidence: result.deadEvidence }
   return undefined
 }
 
 /**
- * The restart work's line when a `dead` re-probe after an escalate-dead
- * verdict that is not dead evidence relaunches persona `key` with no kill
- * (b.jg5 SRJ-609, SRJ-611): `deadEvidence` is the verdict carried, absent
- * when none was (a bare 'escalate-dead').
+ * `relaunchWithoutKillLine`'s reason: after an escalate-dead verdict that is
+ * not dead evidence, or a bare 'escalate-dead' that carries none (b.jg5
+ * SRJ-609, SRJ-611); the relaunch carries the verdict.
  */
-export function relaunchWithoutKillLine(key: string, deadEvidence?: CarriedDeadEvidence): string {
+export const RELAUNCH_NO_KILL_NOT_DEAD_EVIDENCE = 'not-dead-evidence'
+/**
+ * `relaunchWithoutKillLine`'s reason: the run's first liveness read found the
+ * row `ended`, `missing` or gone (`ErrSpawnNotFound`), with no escalate-dead
+ * verdict (b.jg5 SRJ-110, SRJ-314); the launch carries none.
+ */
+export const RELAUNCH_NO_KILL_ROW_READ = 'row-read'
+/**
+ * `relaunchWithoutKillLine`'s reason: after a GONE-based escalate-dead
+ * verdict, the re-probe read the row `ended`, `missing` or gone, which voids
+ * the verdict (b.jg5 SRJ-611, dead evidence covers one life); the relaunch
+ * carries none.
+ */
+export const RELAUNCH_NO_KILL_VERDICT_VOIDED = 'verdict-voided'
+
+/** Why the restart work relaunches with no kill (`relaunchWithoutKillLine`). */
+export type RelaunchNoKillReason =
+  | typeof RELAUNCH_NO_KILL_NOT_DEAD_EVIDENCE
+  | typeof RELAUNCH_NO_KILL_ROW_READ
+  | typeof RELAUNCH_NO_KILL_VERDICT_VOIDED
+
+/**
+ * The words naming what a `dead` reading read (b.jg5 SRJ-314): `the row
+ * ended`, `the row missing`, `no row (ErrSpawnNotFound)`, or, for a `dead`
+ * reading that carries no row state, `no row state`. Pure.
+ */
+function describeDeadRowRead(deadRead: DeadLivenessReading | undefined): string {
+  switch (deadRowReadOf(deadRead)) {
+    case LIVENESS_DEAD_ROW_ENDED:
+      return 'the row ended'
+    case LIVENESS_DEAD_ROW_MISSING:
+      return 'the row missing'
+    case LIVENESS_DEAD_ROW_NO_ROW:
+      return 'no row (ErrSpawnNotFound)'
+    default:
+      return 'no row state'
+  }
+}
+
+/**
+ * The restart work's line when it launches persona `key` with no kill
+ * (`killBeforeRelaunch`, the one place that decides it; b.jg5 SRJ-110,
+ * SRJ-314, SRJ-609, SRJ-611). `deadEvidence` is the escalate-dead verdict,
+ * absent when none was carried (a bare 'escalate-dead', or no escalate-dead
+ * answer at all); `deadRead` is the `dead` reading the decision read (the
+ * first probe's, or the re-probe's). By `reason`:
+ *   - `RELAUNCH_NO_KILL_NOT_DEAD_EVIDENCE` (the default):
+ *     `[slack] No kill before the relaunch for persona=<key> — its escalate-dead verdict (<verdict=… | none carried>) is not dead evidence, which never by itself leads to a kill; the relaunch's own row read decides (b.jg5 SRJ-609, SRJ-611)`
+ *   - `RELAUNCH_NO_KILL_ROW_READ`:
+ *     `[slack] No kill before the launch for persona=<key> — its liveness read found <what>: no kill is sent for a row just read finished or gone, which proves nothing about a worker, and a launch that started since that read is not the one it saw; the launch carries no verdict (b.jg5 SRJ-110, SRJ-314)`
+ *   - `RELAUNCH_NO_KILL_VERDICT_VOIDED`:
+ *     `[slack] No kill before the relaunch for persona=<key> — its escalate-dead verdict (verdict=…) is dead evidence, but the re-probe found <what>, which voids it (dead evidence covers one life): the relaunch carries no verdict (b.jg5 SRJ-110, SRJ-314, SRJ-611)`
+ */
+export function relaunchWithoutKillLine(
+  key: string,
+  deadEvidence?: CarriedDeadEvidence,
+  reason: RelaunchNoKillReason = RELAUNCH_NO_KILL_NOT_DEAD_EVIDENCE,
+  deadRead?: DeadLivenessReading,
+): string {
   const verdict = deadEvidence === undefined ? 'none carried' : `verdict=${String(deadEvidence.source)}`
-  return `[slack] No kill before the relaunch for persona=${key} — its escalate-dead verdict (${verdict}) is not dead evidence, which never by itself leads to a kill; the relaunch's own row read decides (b.jg5 SRJ-609, SRJ-611)`
+  switch (reason) {
+    case RELAUNCH_NO_KILL_ROW_READ:
+      return `[slack] No kill before the launch for persona=${key} — its liveness read found ${describeDeadRowRead(deadRead)}: no kill is sent for a row just read finished or gone, which proves nothing about a worker, and a launch that started since that read is not the one it saw; the launch carries no verdict (b.jg5 SRJ-110, SRJ-314)`
+    case RELAUNCH_NO_KILL_VERDICT_VOIDED:
+      return `[slack] No kill before the relaunch for persona=${key} — its escalate-dead verdict (${verdict}) is dead evidence, but the re-probe found ${describeDeadRowRead(deadRead)}, which voids it (dead evidence covers one life): the relaunch carries no verdict (b.jg5 SRJ-110, SRJ-314, SRJ-611)`
+    case RELAUNCH_NO_KILL_NOT_DEAD_EVIDENCE:
+      return `[slack] No kill before the relaunch for persona=${key} — its escalate-dead verdict (${verdict}) is not dead evidence, which never by itself leads to a kill; the relaunch's own row read decides (b.jg5 SRJ-609, SRJ-611)`
+  }
+}
+
+/**
+ * The restart work's line when the checked kill after an
+ * `ErrSystemInstallDisappeared` re-probe read the row finished or gone,
+ * which voids the GONE-based verdict `deadEvidence` (b.jg5 SRJ-611, dead
+ * evidence covers one life), so the relaunch carries none. `finishedRead`
+ * is absent when the kill answered `ErrSpawnNotFound`
+ * (`KILL_OUTCOME_ROW_GONE`):
+ *   `[slack] The kill before the relaunch for persona=<key> answered ErrSpawnNotFound (the row is gone), which voids its escalate-dead verdict (verdict=<source>; dead evidence covers one life): the relaunch carries no verdict (b.jg5 SRJ-611)`
+ * and is what a `status` read between the kill's tries found when it ended
+ * them (`KILL_OUTCOME_ROW_FINISHED`, read `ended`, `missing` or `no-row`):
+ *   `[slack] The kill before the relaunch for persona=<key> ended its tries at a status read that found <the row ended | the row missing | no row (ErrSpawnNotFound)>, which voids its escalate-dead verdict (verdict=<source>; dead evidence covers one life): the relaunch carries no verdict (b.jg5 SRJ-611, SRJ-702)`
+ */
+export function killVoidsVerdictLine(
+  key: string,
+  deadEvidence: CarriedDeadEvidence,
+  finishedRead?: KillVoidingFinishedRead,
+): string {
+  const verdict = `verdict=${String(deadEvidence.source)}`
+  if (finishedRead === undefined) {
+    return `[slack] The kill before the relaunch for persona=${key} answered ErrSpawnNotFound (the row is gone), which voids its escalate-dead verdict (${verdict}; dead evidence covers one life): the relaunch carries no verdict (b.jg5 SRJ-611)`
+  }
+  return `[slack] The kill before the relaunch for persona=${key} ended its tries at a status read that found ${describeKillFinishedRead(finishedRead)}, which voids its escalate-dead verdict (${verdict}; dead evidence covers one life): the relaunch carries no verdict (b.jg5 SRJ-611, SRJ-702)`
+}
+
+/**
+ * What a `status` read between the restart kill's tries found when it ended
+ * them and voided the verdict (`killVoidsVerdictLine`): the row `ended`,
+ * `missing`, or no row.
+ */
+export type KillVoidingFinishedRead =
+  | typeof KILL_ROW_FINISHED_ENDED
+  | typeof KILL_ROW_FINISHED_MISSING
+  | typeof KILL_ROW_FINISHED_NO_ROW
+
+/** `killVoidsVerdictLine`'s words for the finished read that ended the kill's tries. */
+function describeKillFinishedRead(read: KillVoidingFinishedRead): string {
+  switch (read) {
+    case KILL_ROW_FINISHED_ENDED:
+      return 'the row ended'
+    case KILL_ROW_FINISHED_MISSING:
+      return 'the row missing'
+    case KILL_ROW_FINISHED_NO_ROW:
+      return 'no row (ErrSpawnNotFound)'
+  }
+}
+
+/**
+ * The finished read a kill outcome made of P's row, when it voids a
+ * GONE-based verdict (b.jg5 SRJ-611): `null` for the kill's own
+ * `ErrSpawnNotFound` (`row-gone`), the read for a `status` read between tries
+ * that found the row `ended`, `missing` or no row (`row-finished`), and
+ * `undefined` for every other outcome, which voids nothing (an old-life
+ * wait's hold end is no read of the row by this path).
+ */
+function killVoidingRead(killed: KillSessionResult): KillVoidingFinishedRead | null | undefined {
+  if (killed === KILL_SESSION_NOT_KILLED_GUARD) return undefined
+  if (killed.kind === KILL_OUTCOME_ROW_GONE) return null
+  if (killed.kind !== KILL_OUTCOME_ROW_FINISHED) return undefined
+  return killed.read === KILL_ROW_FINISHED_ENDED ||
+    killed.read === KILL_ROW_FINISHED_MISSING ||
+    killed.read === KILL_ROW_FINISHED_NO_ROW
+    ? killed.read
+    : undefined
 }
 
 /**
@@ -717,8 +880,11 @@ export const KILL_SESSION_NOT_KILLED_GUARD = 'not-killed-guard'
 export type KillSessionResult = KillOutcome | typeof KILL_SESSION_NOT_KILLED_GUARD
 
 /**
- * `relaunchAfterKillLine`'s form for a relaunch with no kill made: after an
- * escalate-dead verdict that is not dead evidence (b.jg5 SRJ-609, SRJ-611).
+ * `relaunchAfterKillLine`'s form for a launch with no kill made: after a
+ * `dead` reading that read the row, at the first probe or at the re-probe,
+ * and after an escalate-dead verdict that is not dead evidence
+ * (`killBeforeRelaunch`, `relaunchWithoutKillLine`; b.jg5 SRJ-110, SRJ-314,
+ * SRJ-609, SRJ-611).
  */
 export const RELAUNCH_KILL_NONE = 'kill-none'
 
@@ -1007,19 +1173,27 @@ function launchInFlight(key: string, isInFlight: (key: string) => boolean): bool
  * the not-up check again, then, by the reading (b.jg5 SRJ-314), a return with
  * nothing done (`unknown`, a thrown probe included: the arm hook is called;
  * `pending`, whatever the session's connection shows: the `pending` deferral
- * is called), a reconnect (`live`), or a kill and a launch (`dead`), and the
+ * is called), a reconnect (`live`), or a launch (`dead`), and the
  * success or failure accounting. A reconnect whose verdict
  * is escalate-dead is followed by a second liveness probe; only when the
  * row now reads `dead` does the same run go on to the launch (b.d61), which
  * carries the verdict the answer carried (`ReconnectEscalateDead`; b.jg5
- * SRJ-611). Only a GONE-based verdict, dead evidence, is preceded by the
- * checked kill; after any other verdict (`row-not-interactive`, a row read,
- * or a bare 'escalate-dead' that carries none) a `dead` re-probe leads to
- * the launch alone, with no kill (`relaunchWithoutKillLine`, b.jg5 SRJ-609,
- * SRJ-611). A run whose first liveness read is `dead` makes its checked kill
- * and then its launch, carrying nothing. When a
- * kill is made, the launch follows only its success, or a guard of the
- * adapter's that made no call (`killBeforeRelaunch`, b.jg5 SRJ-110, SRJ-701);
+ * SRJ-611) unless a read voided it. One decision, `killBeforeRelaunch`,
+ * says whether a checked kill comes before the launch and what the launch
+ * carries (b.jg5 SRJ-110, SRJ-314, SRJ-611): no kill is ever sent for a row
+ * the run has just read `ended`, `missing` or gone; only a `dead` reading of
+ * `ErrSystemInstallDisappeared`, which reads no row, gets the checked kill,
+ * at the first probe (the launch then carrying nothing) or at the re-probe
+ * after a GONE-based verdict (the relaunch then carrying the verdict, unless
+ * the kill read the row finished: its `ErrSpawnNotFound`, or a `status` read
+ * between its tries that found the row `ended`, `missing` or no row). A re-probe that read the row after
+ * a GONE-based verdict voids it (dead evidence covers one life): no kill,
+ * and a relaunch carrying none. After a verdict that is not dead evidence
+ * (`row-not-interactive`, a row read, or a bare 'escalate-dead' that carries
+ * none) the launch comes alone, with no kill, whatever the re-probe read,
+ * carrying the verdict (`relaunchWithoutKillLine`, b.jg5 SRJ-609, SRJ-611).
+ * When a kill is made, the launch follows only its success, or a guard of
+ * the adapter's that made no call (b.jg5 SRJ-110, SRJ-701);
  * any other answer ends the work with `RESTART_OUTCOME_LATCHED` (a CONFLICT or
  * an UNUSABLE NAME) or `RESTART_OUTCOME_REFUSED`: no launch, nothing counted. The restart cap is not
  * asked here (the retry entry asks it before this work). The whole work is
@@ -1116,15 +1290,14 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   // row read of `ended`, `missing` or no row also ends its episode.
   if (probe.kind === LIVENESS_DEAD) noteDeadReading(d, key, probe)
 
-  // `live` takes the reconnect path; only `dead` falls through to the kill
-  // and the launch (the kill left out after an escalate-dead verdict that is
-  // not dead evidence, b.jg5 SRJ-609, SRJ-611). `deadRead` is the run's last
-  // `dead` reading, handed to the kill (b.jg5 SRJ-501: the state the path
-  // last read). `deadEvidence` is the verdict an escalate-dead answer
-  // carried, handed to the relaunch (b.jg5 SRJ-611); a first `dead` reading
-  // carries none.
-  let killBeforeLaunch = true
-  let deadEvidence: CarriedDeadEvidence | undefined
+  // `live` takes the reconnect path; only `dead` falls through to the launch,
+  // with the checked kill before it only when `killBeforeRelaunch` decides
+  // so (b.jg5 SRJ-110, SRJ-314, SRJ-611). `deadRead` is the run's last
+  // `dead` reading, which that decision reads and the kill is handed (b.jg5
+  // SRJ-501: the state the path last read). `escalation` is the
+  // escalate-dead answer and the verdict it carried (b.jg5 SRJ-611); a first
+  // `dead` reading has none.
+  let escalation: EscalateDeadAnswer | undefined
   let deadRead = deadReadingOf(probe)
   if (probe.kind !== LIVENESS_DEAD) {
     // If the session already re-established its MCP connection (e.g. Claude
@@ -1196,7 +1369,8 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     // call in this run (b.jg5 SRJ-502); it is asked again right before the
     // kill below. b.d61: this run probes liveness again and, when the row
     // now reads `dead`, falls through to the relaunch branch below at once
-    // (its kill only after a verdict that is dead evidence), with the same
+    // (its kill only after a verdict that is dead evidence and an
+    // `ErrSystemInstallDisappeared` re-probe), with the same
     // accounting as any dead-session relaunch. When the
     // row still reads `live` (the sweep failed, left the row live, or a
     // memoized result predates the kill), the run ends with no kill, launch
@@ -1208,18 +1382,24 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     // returns with no relaunch, calls the arm hook and leaves the count as it
     // is. The external ~/startup/find-missing-loop.sh is belt-and-braces only
     // — recovery no longer depends on it, and removing it is a separate
-    // operator decision. b.jg5 SRJ-609, SRJ-611: only a GONE-based verdict
-    // (dead evidence) lets the kill precede the relaunch. A verdict that is
-    // not dead evidence (`row-not-interactive`, a row read) or a bare
-    // 'escalate-dead' that carries none never by itself leads to a kill, even
-    // when the re-probe reads `dead` (a `dead` reading of
-    // `ErrSystemInstallDisappeared` reads no row at all): its relaunch makes
-    // no kill, the ladder's collision `get` reading the row itself. Either
-    // way the relaunch carries the verdict into the ladder.
+    // operator decision. b.jg5 SRJ-110, SRJ-314, SRJ-609, SRJ-611: what
+    // follows a `dead` re-probe is decided in one place, `killBeforeRelaunch`.
+    // A verdict that is not dead evidence (`row-not-interactive`, a row read)
+    // or a bare 'escalate-dead' that carries none never leads to a kill,
+    // whatever the re-probe read: the relaunch carries the verdict and the
+    // ladder's collision `get` reads the row itself. A GONE-based verdict
+    // (dead evidence) covers one life: a re-probe that read the row `ended`,
+    // `missing` or gone voids it, so no kill is sent (on a finished row a
+    // kill proves nothing, and a launch that started since is not the one
+    // the verdict saw) and the relaunch carries none. Only a re-probe of
+    // `ErrSystemInstallDisappeared`, which reads no row, keeps the checked
+    // kill, then the relaunch carrying the verdict, unless that kill reads
+    // the row finished (its `ErrSpawnNotFound`, or a `status` read between
+    // its tries finding the row `ended`, `missing` or no row), which voids it
+    // too.
     if (reconnectResult === 'pending') return RESTART_OUTCOME_PENDING_DEFERRED
     if (escalated === undefined) return RESTART_OUTCOME_RECONNECT_DEFERRED
-    deadEvidence = escalated.deadEvidence
-    killBeforeLaunch = deadEvidence?.evidence === true
+    escalation = escalated
     // b.jg5 SRJ-502: the adapter's sweep may have latched the persona (a
     // post-run `get` of its own row); then no re-probe follows.
     if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
@@ -1231,14 +1411,18 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     deadRead = reprobed
   }
 
-  // Kill the zombie session, if any, with one checked kill (b.jg5 SRJ-110,
-  // SRJ-701): only a success (any `kill_sent`, or `ErrSpawnNotFound`), or a
-  // guard of the adapter's that made no call, lets the launch follow.
-  // b.jg5 SRJ-502: the latch is asked once more right before the kill, so a
-  // persona that latched during the 'escalate-dead' re-probe (or, with the
-  // check after the reconnect, during the reconnect) is never killed.
-  // b.jg5 SRJ-609, SRJ-611: after an escalate-dead verdict that is not dead
-  // evidence no kill is made; the latch is still asked before the relaunch.
+  // The kill before the launch, if any, is decided in one place
+  // (`killBeforeRelaunch`, b.jg5 SRJ-110, SRJ-314, SRJ-611): CSCB never sends
+  // `kill` for a row it has just read `ended`, `missing` or gone. Only a
+  // `dead` reading of `ErrSystemInstallDisappeared`, which reads no row,
+  // gets one checked kill (SRJ-701), at the first probe, or at the re-probe
+  // after a GONE-based verdict; only its success (any `kill_sent`, or
+  // `ErrSpawnNotFound`), or a guard of the adapter's that made no call, lets
+  // the launch follow. Every other `dead` reading launches with no kill.
+  // b.jg5 SRJ-502: the latch is asked once more right before the kill
+  // decision, so a persona that latched during the 'escalate-dead' re-probe
+  // (or, with the check after the reconnect, during the reconnect) is never
+  // killed, and a launch with no kill is still asked about.
   // b.jg5 SRJ-706: so is the sequence gate, before the kill and again before
   // the launch: while P's live-row sequence runs, nothing more is called.
   if (skipIfLatched(d, key)) return RESTART_OUTCOME_LATCHED
@@ -1246,20 +1430,17 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   if (skipIfSequenceRunning(d, key, 'before its kill')) return RESTART_OUTCOME_SEQUENCE_WAITING
   // b.jg5 SRJ-810: a held persona's worker is not killed.
   if (skipIfHeldForOldLife(d, key, 'before its kill')) return RESTART_OUTCOME_SEQUENCE_WAITING
-  if (killBeforeLaunch) {
-    const stopped = await killBeforeRelaunch(d, key, cwd, deadRead)
-    if (stopped !== undefined) return stopped
-  } else {
-    console.error(relaunchWithoutKillLine(key, deadEvidence))
-    console.error(relaunchAfterKillLine(key, cwd, RELAUNCH_KILL_NONE))
-  }
+  const decided = await killBeforeRelaunch(d, key, cwd, deadRead, escalation)
+  if (decided.kind === KILL_DECISION_STOP) return decided.outcome
   if (skipIfSequenceRunning(d, key, 'before its launch')) return RESTART_OUTCOME_SEQUENCE_WAITING
   if (skipIfHeldForOldLife(d, key, 'before its launch')) return RESTART_OUTCOME_SEQUENCE_WAITING
 
+  const { deadEvidence } = decided
   let ok: LaunchSessionResult
   try {
     // b.jg5 SRJ-611: the relaunch after an escalate-dead verdict carries it
-    // into the ladder; any other launch is called as it always was.
+    // into the ladder unless the decision voided it; any other launch is
+    // called as it always was.
     ok = deadEvidence === undefined
       ? await d.launchSession(key, cwd, sessionId)
       : await d.launchSession(key, cwd, sessionId, deadEvidence)
@@ -1288,10 +1469,10 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     // Declined: the persona stopped being up between the last `canRestart`
     // check above and the launch, and the launch's own gate (the same
     // relaunch gate) logged why; or the launch's version re-check decided
-    // the stop, and the server is stopping. The instance was already killed
-    // by then, unless the escalate-dead verdict was not dead evidence, which
-    // relaunches with no kill (b.jg5 SRJ-611); the failure counter, backoff and cap
-    // latch are left exactly as they were.
+    // the stop, and the server is stopping. Any kill the decision made
+    // (`killBeforeRelaunch`: only after an `ErrSystemInstallDisappeared`
+    // reading, b.jg5 SRJ-314, SRJ-611) was made by then; the failure counter,
+    // backoff and cap latch are left exactly as they were.
     return RESTART_OUTCOME_LAUNCH_SKIPPED
   }
 
@@ -1373,53 +1554,118 @@ export function recordLaunchResultOutsideRestartWork(
   return countLaunchFailure(deps, key, `[slack] Launch failed for persona=${key} — counted (b.jg5 SRJ-112, SRJ-113, SRJ-602)`)
 }
 
+/** `KillDecision`'s kind when the launch must not follow: the work answers `outcome`. */
+const KILL_DECISION_STOP = 'stop'
+/** `KillDecision`'s kind when the launch follows, carrying `deadEvidence` (none when absent). */
+const KILL_DECISION_LAUNCH = 'launch'
+
 /**
- * The restart work's kill before its relaunch (b.jg5 SRJ-110, SRJ-701):
- * one `RestartDeps.killSession` call with `lastRead`, the run's last `dead`
- * reading. Answers `undefined` when the launch may
- * follow: after a success form (`killed` with any `kill_sent`, `row-gone`,
- * `session-gone`, `row-finished`) or `KILL_SESSION_NOT_KILLED_GUARD`, after logging the
- * relaunch line that names the outcome (`relaunchAfterKillLine`). Otherwise
- * the work's outcome, with no launch and nothing recorded (no success, no
- * failure, no cap): `RESTART_OUTCOME_SHUTTING_DOWN` for an `ErrInvalidFlags`
- * whose re-check decided that the server stops (b.jg5 SRJ-205: nothing more
- * is called), `RESTART_OUTCOME_LATCHED` for a CONFLICT or an UNUSABLE
- * NAME, which the adapter has latched (b.jg5 SRJ-501, SRJ-512; never sent
- * again), and for any other non-success after which the persona is latched
- * (a `status` read between the kill's tries latched it, b.jg5 SRJ-702, or a
- * latch set elsewhere; the latched query, a throw counting as latched), and
- * `RESTART_OUTCOME_REFUSED` for every other non-success
- * (UNAVAILABLE, `ErrTmuxKillFailed` included, ENVIRONMENT, CONFIG,
- * UNCLASSIFIED, `ErrSystemInstallDisappeared` and a class the kill has no
- * row for included, each having armed the retry timer inside the attempt),
- * for an answer that is not a kill outcome, and for a `killSession` that
- * throws: none of them shows the kill succeeded.
+ * What the restart work's kill decision answers (`killBeforeRelaunch`):
+ * the work's outcome when the launch must not follow, or the launch, with
+ * the escalate-dead verdict it carries into the ladder (absent: none).
+ */
+type KillDecision =
+  | { readonly kind: typeof KILL_DECISION_STOP; readonly outcome: RestartWorkOutcome }
+  | { readonly kind: typeof KILL_DECISION_LAUNCH; readonly deadEvidence?: CarriedDeadEvidence }
+
+/**
+ * The restart work's one kill decision before its launch (b.jg5 SRJ-110,
+ * SRJ-314, SRJ-611, SRJ-701): the only place `runRestartWork` sends its
+ * kill. It reads `deadRead`, the run's last `dead` reading (the first
+ * probe's, or the re-probe's after an escalate-dead answer), and
+ * `escalation`, the escalate-dead answer with the verdict it carried (absent
+ * at the first probe). CSCB never sends `kill` for a row it has just read
+ * `ended`, `missing` or gone: on a finished row the kill is a no-op success
+ * that proves nothing about a worker, and a launch that started since that
+ * read is not the one it saw. So:
+ *
+ *   | escalate-dead answer        | `dead` reading                         | kill         | the launch carries
+ *   |-----------------------------|----------------------------------------|--------------|-------------------
+ *   | none (first probe)          | `ended`, `missing`, `ErrSpawnNotFound` | none         | nothing
+ *   | none (first probe)          | `ErrSystemInstallDisappeared`          | checked kill | nothing
+ *   | not dead evidence, or bare  | any                                    | none         | the verdict (none if bare)
+ *   | GONE-based (dead evidence)  | `ended`, `missing`, `ErrSpawnNotFound` | none         | nothing: the read voids it
+ *   | GONE-based (dead evidence)  | `ErrSystemInstallDisappeared`          | checked kill | the verdict; nothing if the kill read the row finished
+ *
+ * A `dead` reading that carries no row state and is not the install-gone
+ * one (a reading made with no `status` call) is no proof either: no kill.
+ * Each launch with no kill logs `relaunchWithoutKillLine` with its reason
+ * (`RELAUNCH_NO_KILL_ROW_READ`, `RELAUNCH_NO_KILL_NOT_DEAD_EVIDENCE`,
+ * `RELAUNCH_NO_KILL_VERDICT_VOIDED`), then `relaunchAfterKillLine`'s
+ * no-kill form. The checked kill is one `RestartDeps.killSession` call with
+ * `deadRead`; the launch follows after a success form (`killed` with any
+ * `kill_sent`, `row-gone`, `session-gone`, `row-finished`) or
+ * `KILL_SESSION_NOT_KILLED_GUARD`, after the relaunch line that names the
+ * outcome (`relaunchAfterKillLine`); after a GONE-based verdict, a kill that
+ * read the row finished (`row-gone`, or `row-finished` with a read of
+ * `ended`, `missing` or no row) also logs `killVoidsVerdictLine` and the
+ * relaunch carries none. Otherwise the work's outcome,
+ * with no launch and nothing recorded (no success, no failure, no cap):
+ * `RESTART_OUTCOME_SHUTTING_DOWN` for an `ErrInvalidFlags` whose re-check
+ * decided that the server stops (b.jg5 SRJ-205: nothing more is called),
+ * `RESTART_OUTCOME_LATCHED` for a CONFLICT or an UNUSABLE NAME, which the
+ * adapter has latched (b.jg5 SRJ-501, SRJ-512; never sent again), and for
+ * any other non-success after which the persona is latched (a `status` read
+ * between the kill's tries latched it, b.jg5 SRJ-702, or a latch set
+ * elsewhere; the latched query, a throw counting as latched), and
+ * `RESTART_OUTCOME_REFUSED` for every other non-success (UNAVAILABLE,
+ * `ErrTmuxKillFailed` included, ENVIRONMENT, CONFIG, UNCLASSIFIED,
+ * `ErrSystemInstallDisappeared` and a class the kill has no row for
+ * included, each having armed the retry timer inside the attempt), for an
+ * answer that is not a kill outcome, and for a `killSession` that throws:
+ * none of them shows the kill succeeded.
  */
 async function killBeforeRelaunch(
   d: RestartDeps,
   key: string,
   cwd: string,
-  lastRead: DeadLivenessReading,
-): Promise<RestartWorkOutcome | undefined> {
+  deadRead: DeadLivenessReading,
+  escalation: EscalateDeadAnswer | undefined,
+): Promise<KillDecision> {
+  const verdict = escalation?.deadEvidence
+  const launchWithoutKill = (reason: RelaunchNoKillReason, carries: CarriedDeadEvidence | undefined): KillDecision => {
+    console.error(relaunchWithoutKillLine(key, verdict, reason, deadRead))
+    console.error(relaunchAfterKillLine(key, cwd, RELAUNCH_KILL_NONE))
+    return carries === undefined ? { kind: KILL_DECISION_LAUNCH } : { kind: KILL_DECISION_LAUNCH, deadEvidence: carries }
+  }
+  // b.jg5 SRJ-609, SRJ-611: a verdict that is not dead evidence, or none,
+  // never leads to a kill, whatever the re-probe read.
+  if (escalation !== undefined && verdict?.evidence !== true) return launchWithoutKill(RELAUNCH_NO_KILL_NOT_DEAD_EVIDENCE, verdict)
+  // b.jg5 SRJ-110, SRJ-314, SRJ-611: a reading that read the row (or no row
+  // state at all) gets no kill; after a GONE-based verdict it voids it.
+  if (!isInstallGoneDeadReading(deadRead)) {
+    return escalation === undefined
+      ? launchWithoutKill(RELAUNCH_NO_KILL_ROW_READ, undefined)
+      : launchWithoutKill(RELAUNCH_NO_KILL_VERDICT_VOIDED, undefined)
+  }
   let killed: unknown
   try {
-    killed = await d.killSession(key, lastRead)
+    killed = await d.killSession(key, deadRead)
   } catch (err) {
     console.error(killNotSucceededLine(key, `killSession threw: ${describeThrownValue(err)}`, false))
-    return RESTART_OUTCOME_REFUSED
+    return { kind: KILL_DECISION_STOP, outcome: RESTART_OUTCOME_REFUSED }
   }
   if (killed === KILL_SESSION_NOT_KILLED_GUARD || killLetsNextStepRun(killed)) {
     console.error(relaunchAfterKillLine(key, cwd, killed))
-    return undefined
+    if (verdict === undefined) return { kind: KILL_DECISION_LAUNCH }
+    // b.jg5 SRJ-611: the kill's `ErrSpawnNotFound`, or a `status` read
+    // between its tries that found the row `ended`, `missing` or no row, read
+    // the row finished, which voids the verdict: the relaunch carries none.
+    const voidingRead = killVoidingRead(killed)
+    if (voidingRead !== undefined) {
+      console.error(killVoidsVerdictLine(key, verdict, voidingRead ?? undefined))
+      return { kind: KILL_DECISION_LAUNCH }
+    }
+    return { kind: KILL_DECISION_LAUNCH, deadEvidence: verdict }
   }
   if (!isKillOutcome(killed)) {
     console.error(killNotSucceededLine(key, 'killSession answered no kill outcome', false))
-    return RESTART_OUTCOME_REFUSED
+    return { kind: KILL_DECISION_STOP, outcome: RESTART_OUTCOME_REFUSED }
   }
   // A non-success: no launch follows, and nothing is counted (SRJ-302).
   if (killOutcomeStopsServer(killed)) {
     console.error(killStopsServerLine(key, describeKillOutcome(killed)))
-    return RESTART_OUTCOME_SHUTTING_DOWN
+    return { kind: KILL_DECISION_STOP, outcome: RESTART_OUTCOME_SHUTTING_DOWN }
   }
   // b.jg5 SRJ-702, SRJ-502: a CONFLICT or an UNUSABLE NAME latched the
   // persona at the adapter; so may a `status` read between the kill's tries,
@@ -1429,7 +1675,7 @@ async function killBeforeRelaunch(
       (killed.errorClass === AD_ERROR_CLASS_CONFLICT || killed.errorClass === AD_ERROR_CLASS_UNUSABLE_NAME)) ||
     readLatched(d, key).latched
   console.error(killNotSucceededLine(key, describeKillOutcome(killed), latched))
-  return latched ? RESTART_OUTCOME_LATCHED : RESTART_OUTCOME_REFUSED
+  return { kind: KILL_DECISION_STOP, outcome: latched ? RESTART_OUTCOME_LATCHED : RESTART_OUTCOME_REFUSED }
 }
 
 /**
@@ -1461,11 +1707,13 @@ function deadReadingOf(probe: LivenessProbe): DeadLivenessReading {
  * or a later one reads it dead. Returns
  * the `dead` reading (`deadReadingOf`: the row state it read, for the kill's
  * `lastRead`) only when the row now reads `dead` and this restart run should go
- * on to the relaunch branch; that branch makes the checked kill first only
- * when the verdict is dead evidence, and never after a verdict derived from
- * `ErrSpawnNotInteractive` or a row read, or a bare 'escalate-dead' (b.jg5
- * SRJ-609, SRJ-611): a `dead` reading here may come from
- * `ErrSystemInstallDisappeared`, which reads no row. Otherwise the outcome the run returns with,
+ * on to the relaunch branch; that branch (`killBeforeRelaunch`) makes the
+ * checked kill first only when the verdict is dead evidence and the reading
+ * is `ErrSystemInstallDisappeared`, which reads no row, and never after a
+ * verdict derived from `ErrSpawnNotInteractive` or a row read, or a bare
+ * 'escalate-dead' (b.jg5 SRJ-609, SRJ-611); a reading that read the row
+ * `ended`, `missing` or gone voids a GONE-based verdict (dead evidence
+ * covers one life). Otherwise the outcome the run returns with,
  * with no relaunch (b.jg5 SRJ-314): `RESTART_OUTCOME_RECONNECT_DEFERRED` (the
  * row still reads `live`: no kill, launch or accounting; each later
  * escalate-dead tick sweeps again, and the slow-recovery observer counts the

@@ -339,7 +339,8 @@
  * SRJ-707): a live row there (`pending` included) starts a sequence with the
  * conversation not kept and alert context `recovery`; and the ladder's
  * `resume` answering `ErrSpawnNotResumable` on a path that holds dead
- * evidence, whose re-read finds the row live other than `pending`
+ * evidence no read of the row as finished or gone has voided (dead evidence
+ * covers one life), whose re-read finds the row live other than `pending`
  * (`spawnNotResumableAtLadder`, b.jg5 SRJ-710, SRJ-611): a sequence with the
  * conversation kept, which ends in `resume`. Either way the launch answers
  * `sequence-waiting`. The sequence's launch is never part of the start pass:
@@ -6186,6 +6187,16 @@ interface FindMissingSweepOptions {
    * (`readListedPersonaRows`). Absent: the `get`s are made and acted on.
    */
   readonly postRunGetsGo?: () => boolean
+  /**
+   * Told what the post-run `get` of the caller's own row read (its state, or
+   * no row for `ErrSpawnNotFound`), once the run this caller started or
+   * joined has resolved, when that `get` was made and acted on and did not
+   * latch the persona (b.jg5 SRJ-120, SRJ-611: a read of the row after the
+   * path's own find-missing run). Never told on a memo hit, a failed run, a
+   * refused `get` or a row not listed in `unverified_ids`. A sink that throws
+   * is ignored. Absent: nothing is told.
+   */
+  readonly onOwnRowRead?: (read: LatchRowState) => void
 }
 
 /** The context an UNUSABLE NAME answer to the start sweep's post-run `get`s is routed in (b.jg5 SRJ-1002). */
@@ -6210,6 +6221,13 @@ interface PostRunReads {
    * SRJ-105, SRJ-114), and an UNUSABLE NAME answer is no refusal there.
    */
   readonly refusedReads: ReadonlyMap<string, unknown>
+  /**
+   * The configured personas whose own row's post-run `get` was acted on and
+   * did not latch, each with what it read: the row's state
+   * (`latchRowStateRead`) or no row for `ErrSpawnNotFound`. Only the
+   * persona's own caller is told it (`FindMissingSweepOptions.onOwnRowRead`).
+   */
+  readonly readStates: ReadonlyMap<string, LatchRowState>
 }
 
 /** What a run that resolved hands every caller awaiting it: its result and its post-run reads. */
@@ -6511,7 +6529,22 @@ async function sharedFindMissingSweep(
   if (key !== undefined && postRunGetRefusal(key, outcome.refusedReads, joined !== null, logPrefix, ref)) {
     return FIND_MISSING_REFUSED
   }
+  if (key !== undefined) tellOwnRowRead(opts, outcome.readStates.get(key))
   return latchedOr(key, outcome.result, outcome.latchedKeys)
+}
+
+/**
+ * Tell the caller's `opts.onOwnRowRead` what the post-run `get` of its own
+ * row read, when one was made (`read` defined). A sink that throws is
+ * ignored. Never throws.
+ */
+function tellOwnRowRead(opts: FindMissingSweepOptions, read: LatchRowState | undefined): void {
+  if (read === undefined || opts.onOwnRowRead === undefined) return
+  try {
+    opts.onOwnRowRead(read)
+  } catch {
+    /* the sink's own failure changes nothing about the run */
+  }
 }
 
 /** No persona latched by a run's post-run `get`s. */
@@ -6629,7 +6662,7 @@ function startFindMissingRun(
       : noPostRunReads(logPrefix, `${words} for ${ref}`)
     if (_findMissingLast === null || _findMissingLast.seq < seq) _findMissingLast = { result, at, seq }
     if (_findMissingInFlight === run) _findMissingInFlight = null
-    return { result, latchedKeys: reads.latchedKeys, refusedReads: reads.refusedReads }
+    return { result, latchedKeys: reads.latchedKeys, refusedReads: reads.refusedReads, readStates: reads.readStates }
   })()
   run = { seq, kind, promise }
   return run
@@ -6655,7 +6688,7 @@ function postRunGetsGo(opts: FindMissingSweepOptions): boolean {
  */
 function noPostRunReads(logPrefix: string, run: string): PostRunReads {
   console.error(`[slack] ${logPrefix}: after the ${run} — no post-sweep get is made: its caller stopped (b.jg5 SRJ-120, SRJ-714)`)
-  return { latchedKeys: NO_LATCHED_KEYS, refusedReads: new Map<string, unknown>() }
+  return { latchedKeys: NO_LATCHED_KEYS, refusedReads: new Map<string, unknown>(), readStates: new Map<string, LatchRowState>() }
 }
 
 /**
@@ -6724,7 +6757,10 @@ function ownRowKeyOfRowId(id: unknown): string | undefined {
  * where `<run>` is `findMissing sweep for <ref>` or `bypassing findMissing
  * sweep for <ref>`. No line is logged when no configured persona is listed.
  * Answers the personas whose read latched (`OwnRowRead.latched`, or the
- * `latched` answer) and the personas whose read failed, each with its error.
+ * `latched` answer), the personas whose read failed, each with its error,
+ * and the personas whose read found the row (its state) or no row, each with
+ * what it found (`PostRunReads.readStates`; b.jg5 SRJ-611: a finished read
+ * there voids the dead evidence of that persona's caller).
  * Never throws.
  */
 async function readListedPersonaRows(
@@ -6737,6 +6773,7 @@ async function readListedPersonaRows(
 ): Promise<PostRunReads> {
   const latchedKeys = new Set<string>()
   const refusedReads = new Map<string, unknown>()
+  const readStates = new Map<string, LatchRowState>()
   // The personas whose `get` settled after the starter stopped: not acted on.
   const notActed = new Set<string>()
   const siteFor = (key: string): OwnRowReadSite => {
@@ -6783,12 +6820,14 @@ async function readListedPersonaRows(
       const ownRead = outcome.value
       if (ownRead.kind === OWN_ROW_READ_ROW) {
         if (ownRead.latched) latchedKeys.add(key)
+        else readStates.set(key, latchRowStateRead(ownRead.row.state))
         entryOf.set(key, `${keyRef(key)} ${ownRead.latched ? 'latched' : 'read'}`)
       } else if (ownRead.kind === OWN_ROW_READ_LATCHED) {
         // b.jg5 SRJ-512: an UNUSABLE NAME answer latched the persona, so its caller stops.
         latchedKeys.add(key)
         entryOf.set(key, `${keyRef(key)} latched`)
       } else if (ownRead.kind === OWN_ROW_READ_ABSENT) {
+        readStates.set(key, LATCH_ROW_STATE_NO_ROW)
         entryOf.set(key, `${keyRef(key)} absent`)
       } else {
         refusedReads.set(key, ownRead.error)
@@ -6808,7 +6847,7 @@ async function readListedPersonaRows(
       `[slack] ${logPrefix}: after the ${run} — one get of each configured persona's own row in unverified_ids: ${entries.join(', ')} (b.jg5 SRJ-120)`,
     )
   }
-  return { latchedKeys, refusedReads }
+  return { latchedKeys, refusedReads, readStates }
 }
 
 /**
@@ -6931,7 +6970,9 @@ export function readFindMissingRow(
  * sweep may reconcile the frozen `working` row to `missing`; when the restart
  * run's second liveness probe (b.d61) then reads `dead`, it relaunches at
  * once, making its checked kill first only after a verdict that is dead
- * evidence (b.jg5 SRJ-611). It may also leave the row live (in
+ * evidence and a re-probe of `ErrSystemInstallDisappeared`, which reads no
+ * row; a re-probe that read the row voids the verdict, so the relaunch has
+ * no kill and carries none (b.jg5 SRJ-611). It may also leave the row live (in
  * `unverified_ids`, or, when `pending`, not judged), and the row may stay
  * live for further ticks: nothing promises that the re-probe or a later tick
  * reads it dead (b.jg5 SRJ-610). A re-probe reading `pending` or `unknown`
@@ -7160,6 +7201,11 @@ export function isDeadEvidence(source: string | undefined): boolean {
  * `CARRIED_DEAD_EVIDENCE_NONE` supply, so an object literal built by hand
  * fails the typecheck. The restart path carries it across its dependencies
  * as an opaque value (`src/restart.ts` imports the type only).
+ * Dead evidence covers one life: once the path that holds it reads P's row
+ * `ended`, `missing` or gone, or, for a verdict carried in, a reconnect
+ * answers `row-not-interactive`, it is void for the rest of that attempt
+ * (`voidDeadEvidence` in the collision ladder; the restart path's own kill
+ * decision, `killBeforeRelaunch` in `src/restart.ts`).
  */
 export interface CarriedDeadEvidence {
   readonly source: DeadEvidenceSource | typeof DEAD_EVIDENCE_NONE
@@ -7215,18 +7261,100 @@ export function describeDeadEvidence(carried: CarriedDeadEvidence): string {
  * (`resumeOrFreshSpawn`); `own` is the route's own cause and `carriedIn` the
  * escalate-dead verdict the restart path carried into the launch
  * (`CARRIED_DEAD_EVIDENCE_NONE` when none), and the line says whether the
- * path holds dead evidence (either does).
+ * path holds dead evidence (either does), unless `voidedBy` names the read
+ * or the answer that voids it (dead evidence covers one life): then the path
+ * holds none, as `resumeOrFreshSpawn` takes it (`voidDeadEvidence`).
  */
 export function deadSessionRouteLine(
   ref: string,
   state: string,
   own: CarriedDeadEvidence,
   carriedIn: CarriedDeadEvidence,
+  voidedBy?: string,
 ): string {
   const carried = carriedIn.source === DEAD_EVIDENCE_NONE ? '' : `; the restart path carried in ${describeDeadEvidence(carriedIn)}`
-  const holds = isDeadEvidence(own.source) || isDeadEvidence(carriedIn.source) ? 'holds dead evidence' : 'holds no dead evidence'
+  const anyEvidence = isDeadEvidence(own.source) || isDeadEvidence(carriedIn.source)
+  const holds = !anyEvidence
+    ? 'holds no dead evidence'
+    : voidedBy === undefined
+      ? 'holds dead evidence'
+      : `holds no dead evidence: ${voidedBy}, which voids it`
   return `[slack] spawnForPersona: dead session for ${ref} (state=${state}) — ${describeDeadEvidence(own)}${carried}; the path ${holds}; recovering via resume/fresh-spawn (b.jg5 SRJ-611)`
 }
+
+/**
+ * The line logged once for each piece of dead evidence a recovery path voids
+ * (b.jg5 SRJ-611, SRJ-1014; dead evidence covers one life): persona `ref`'s
+ * cause or verdict `voided` is void for the rest of the attempt because of
+ * `voidedBy`, the read (`deadEvidenceVoidingRead`) or the answer
+ * (`DEAD_EVIDENCE_VOIDED_BY_RESUME_NOT_FOUND`,
+ * `DEAD_EVIDENCE_VOIDED_BY_ROW_NOT_INTERACTIVE`,
+ * `DEAD_EVIDENCE_VOIDED_BY_REUSE_COLLISION_RERUN`,
+ * `DEAD_EVIDENCE_VOIDED_BY_RETIRED_KEY_FIRST_LAUNCH`) that voided it:
+ *   `[slack] spawnForPersona: <ref>'s dead evidence (<describeDeadEvidence>) is void for the rest of this attempt — <voidedBy>; a later live reading of the row is a launch that evidence never saw, handled as on a path with no dead evidence (b.jg5 SRJ-611)`
+ */
+export function deadEvidenceVoidedLine(ref: string, voided: CarriedDeadEvidence, voidedBy: string): string {
+  return `[slack] spawnForPersona: ${ref}'s dead evidence (${describeDeadEvidence(voided)}) is void for the rest of this attempt — ${voidedBy}; a later live reading of the row is a launch that evidence never saw, handled as on a path with no dead evidence (b.jg5 SRJ-611)`
+}
+
+/**
+ * The words naming a read of persona P's row that voids the path's dead
+ * evidence (b.jg5 SRJ-611): `<by> read the row <state>`, or `<by> found no
+ * row (ErrSpawnNotFound)`. `by` names the read (`DEAD_EVIDENCE_READ_BY_*`,
+ * `deadEvidenceReadByCause`); `read` is what it found. Pure.
+ */
+export function deadEvidenceVoidingRead(by: string, read: LatchRowState): string {
+  return read.kind === LATCH_ROW_STATE_KIND_NO_ROW
+    ? `${by} found no row (ErrSpawnNotFound)`
+    : `${by} read the row ${describeLatchRowState(read)}`
+}
+
+/** The read that gave `resumeOrFreshSpawn` its finished state last read, when its caller names none. */
+export const DEAD_EVIDENCE_READ_BY_PATH = "the path's last read"
+/** The collision ladder's collision `get` (b.jg5 SRJ-114). */
+export const DEAD_EVIDENCE_READ_BY_COLLISION_GET = 'the collision get'
+/** b.jdc's ladder action's re-read after its find-missing run (`launchOnPromptRow`, b.jg5 SRJ-607). */
+export const DEAD_EVIDENCE_READ_BY_PROMPT_ROW_REREAD = "the prompt-row ladder action's re-read after its find-missing run"
+/** The `get` SRJ-120 makes of P's own row after the path's own find-missing run, before its `resume`. */
+export const DEAD_EVIDENCE_READ_BY_POST_SWEEP_GET = "the get of its own row after the path's find-missing run"
+
+/**
+ * The read behind a dead-session route whose cause is a row read (b.jg5
+ * SRJ-605, SRJ-118): `row-absent` (the reconnect's `send-keys` or the
+ * working-row wait found no row) or `row-read-finished` (the working-row
+ * wait read the row finished). Pure.
+ */
+export function deadEvidenceReadByCause(cause: DeadSessionCause): string {
+  return `the read behind its dead-session cause (cause=${cause})`
+}
+
+/**
+ * The one re-run of get-then-act a reuse collision gives (b.jg5 SRJ-112)
+ * carries no dead evidence (SRJ-611): the reuse was made on a row the path
+ * took as finished, and the re-run's collision `get` reads whatever life
+ * holds the row now.
+ */
+export const DEAD_EVIDENCE_VOIDED_BY_REUSE_COLLISION_RERUN =
+  'the reuse spawn collided, and the re-run of get-then-act it gives carries no dead evidence'
+
+/**
+ * A retired key's first launch (b.jg5 SRJ-805) is a reuse spawn that starts
+ * a new life, so the get-then-act its collision enters carries no dead
+ * evidence (SRJ-611): a live row there is judged afresh.
+ */
+export const DEAD_EVIDENCE_VOIDED_BY_RETIRED_KEY_FIRST_LAUNCH =
+  "the retired key's first launch is a reuse spawn that starts a new life, which the evidence never saw, so the get-then-act its collision enters carries no dead evidence"
+
+/** `resume` answered `ErrSpawnNotFound` (b.jg5 SRJ-113): the row is gone, a voiding read (SRJ-611). */
+export const DEAD_EVIDENCE_VOIDED_BY_RESUME_NOT_FOUND = 'resume answered ErrSpawnNotFound: the row is gone'
+
+/**
+ * A reconnect's `send-keys` answered `ErrSpawnNotInteractive`
+ * (`row-not-interactive`, b.jg5 SRJ-118, SRJ-609), which voids a verdict the
+ * path carries in (SRJ-611; HO §2 mapping row 20).
+ */
+export const DEAD_EVIDENCE_VOIDED_BY_ROW_NOT_INTERACTIVE =
+  "the reconnect's send-keys answered ErrSpawnNotInteractive (row-not-interactive): the row is finished, or pending under a launch the verdict never saw"
 
 // ---------------------------------------------------------------------------
 // Rows waiting on a prompt whose session may be gone (b.jdc)
@@ -7473,8 +7601,12 @@ export function promptRowSweepFinishedLine(ref: string, state: string, heldMs: n
  *   and sets the mark (SRJ-806). The route's line (`deadSessionRouteLine`) names its
  *   cause: after a GONE `prompt-row-ladder-gone`, dead evidence; after an
  *   absent row `row-absent`, a row read and not dead evidence (b.jg5
- *   SRJ-611); either is handed on with any verdict the restart path carried
- *   in. Anything else (or a failed read) is left as it is
+ *   SRJ-611). Dead evidence covers one life: the re-read found the row
+ *   finished, so the GONE and any verdict the restart path carried in are
+ *   void for the rest of the attempt (`resumeOrFreshSpawn` takes the path as
+ *   holding none, one line per voided piece), and a live row a later read
+ *   finds is a launch that evidence never saw (b.jg5 SRJ-607, SRJ-611).
+ *   Anything else (or a failed read) is left as it is
  *   (`no-op`), for the restart path to retry. A refused sweep (b.jg5
  *   SRJ-105) reads nothing and answers `failed`: no resume or launch. A
  *   persona latched before the sweep (b.jg5 SRJ-502, `personaLatchedNow`),
@@ -7550,10 +7682,15 @@ async function launchOnPromptRow(
     // (`prompt-row-ladder-gone`); an absent row is a row read (`row-absent`)
     // and is not.
     const own = carriedDeadEvidenceOf(read.kind === PANE_READ_GONE ? DEAD_SESSION_CAUSE_PROMPT_ROW_LADDER_GONE : DEAD_SESSION_CAUSE_ROW_ABSENT)
-    console.error(deadSessionRouteLine(ref, state, own, run.carriedDeadEvidence))
     // b.jg5 SRJ-501: the re-read after the sweep is the path's last read.
+    const lastRead = latchRowStateRead(after)
+    // b.jg5 SRJ-611: that re-read found the row finished, which voids the
+    // path's dead evidence, its own GONE and any carried verdict alike
+    // (`resumeOrFreshSpawn`'s gate); the route's line says so.
+    console.error(deadSessionRouteLine(ref, state, own, run.carriedDeadEvidence, deadEvidenceVoidingRead(DEAD_EVIDENCE_READ_BY_PROMPT_ROW_REREAD, lastRead)))
     return resumeOrFreshSpawn(run, row, {
-      lastRead: latchRowStateRead(after),
+      lastRead,
+      lastReadBy: DEAD_EVIDENCE_READ_BY_PROMPT_ROW_REREAD,
       deadEvidence: heldDeadEvidence(own, run.carriedDeadEvidence),
     })
   }
@@ -9814,6 +9951,9 @@ interface LadderRun {
    * (b.jg5 SRJ-112): a reuse collision there is the second one, which
    * re-runs nothing. A retired key's first launch is a reuse, so the
    * get-then-act its collision enters is that re-run (`retiredKeyFirstLaunch`).
+   * Neither the re-run after `reuseFinishedRow`'s collision nor the retired
+   * key's first launch's get-then-act carries dead evidence (b.jg5 SRJ-611):
+   * a retired key's first launch starts a new life, which no verdict saw.
    */
   readonly reuseCollisionRerun: boolean
   /**
@@ -9829,8 +9969,14 @@ interface LadderRun {
   readonly plainSpawnCollisionRerun: boolean
   /**
    * The escalate-dead verdict the restart path carried into this launch
-   * (`spawnForPersona`'s `deadEvidence`, b.jg5 SRJ-611), kept for the run:
-   * `CARRIED_DEAD_EVIDENCE_NONE` when none was carried.
+   * (`spawnForPersona`'s `deadEvidence`, b.jg5 SRJ-611), kept for the run
+   * until a read or an answer voids it (dead evidence covers one life,
+   * `voidDeadEvidence`): from then on the run carries
+   * `CARRIED_DEAD_EVIDENCE_NONE`, as it does when none was carried. The
+   * re-runs of get-then-act after a reuse collision (a retired key's first
+   * launch's included), after a plain spawn's collision following the
+   * collision `get`'s `ErrSpawnNotFound`, and after `resume`'s
+   * `ErrSpawnNotFound` carry none.
    */
   readonly carriedDeadEvidence: CarriedDeadEvidence
   /**
@@ -9850,12 +9996,50 @@ interface LadderRun {
  * evidence or the verdict the restart path carried in (`carriedIn`) is,
  * within the same recovery attempt. Answers the one that is dead evidence,
  * the path's own first; with neither, the path's own cause, or the carried
- * verdict when the path has none. Pure.
+ * verdict when the path has none. Evidence covers one life: when the state
+ * the path hands on is finished (`ended`, `missing` or no row),
+ * `resumeOrFreshSpawn` voids what this answers (`voidDeadEvidence`), and a
+ * carried verdict a reconnect's `row-not-interactive` voided is no longer
+ * on the run. Pure.
  */
 function heldDeadEvidence(own: CarriedDeadEvidence, carriedIn: CarriedDeadEvidence): CarriedDeadEvidence {
   if (isDeadEvidence(own.source)) return own
   if (isDeadEvidence(carriedIn.source)) return carriedIn
   return own.source === DEAD_EVIDENCE_NONE ? carriedIn : own
+}
+
+/** A ladder run and the dead evidence its path holds, as `voidDeadEvidence` answers them. */
+interface HeldDeadEvidence {
+  readonly run: LadderRun
+  readonly deadEvidence: CarriedDeadEvidence
+}
+
+/**
+ * Void the dead evidence a collision ladder path holds (b.jg5 SRJ-611, dead
+ * evidence covers one life): `held` is the evidence the path hands on (its
+ * own cause or the carried verdict, `heldDeadEvidence`), and
+ * `run.carriedDeadEvidence` the verdict the restart path carried in. Each of
+ * them that is dead evidence is void for the rest of the attempt: one line
+ * for each (`deadEvidenceVoidedLine`, naming `voidedBy`, the read or the
+ * answer that voided it), and the answer holds none of it: `deadEvidence`
+ * `CARRIED_DEAD_EVIDENCE_NONE`, and the run with `carriedDeadEvidence`
+ * `CARRIED_DEAD_EVIDENCE_NONE`, so every later step of the attempt, a re-run
+ * of get-then-act included, holds none. Evidence that is not dead evidence
+ * is answered as it is, with no line. Never throws.
+ */
+function voidDeadEvidence(run: LadderRun, held: CarriedDeadEvidence, voidedBy: string): HeldDeadEvidence {
+  const carried = run.carriedDeadEvidence
+  const heldVoided = isDeadEvidence(held.source)
+  const carriedVoided = isDeadEvidence(carried.source)
+  if (!heldVoided && !carriedVoided) return { run, deadEvidence: held }
+  if (heldVoided) console.error(deadEvidenceVoidedLine(run.ref, held, voidedBy))
+  if (carriedVoided && !(heldVoided && carried.source === held.source)) {
+    console.error(deadEvidenceVoidedLine(run.ref, carried, voidedBy))
+  }
+  return {
+    run: carriedVoided ? { ...run, carriedDeadEvidence: CARRIED_DEAD_EVIDENCE_NONE } : run,
+    deadEvidence: heldVoided ? CARRIED_DEAD_EVIDENCE_NONE : held,
+  }
 }
 
 /**
@@ -9880,7 +10064,14 @@ function deadSessionLastRead(cause: DeadSessionCause, finishedState: string | un
  * every such route and for every cause, dead evidence or not. It hands on
  * the state its cause last read (`deadSessionLastRead`; `liveRead` for a
  * cause that is no row read) and the dead evidence the path holds
- * (`heldDeadEvidence`). Adds no kill, delete or launch of its own.
+ * (`heldDeadEvidence`). Dead evidence covers one life (b.jg5 SRJ-611): a
+ * cause that read the row finished or gone (`row-read-finished`,
+ * `row-absent`) hands on a finished state, so `resumeOrFreshSpawn` voids the
+ * evidence the path holds; and a reconnect that answered
+ * `row-not-interactive` voids the verdict the restart path carried in here,
+ * before the call, whatever route carried it (`voidDeadEvidence`; HO §2
+ * mapping row 20). The route's line says what the path then holds. Adds no
+ * kill, delete or launch of its own.
  */
 function deadSessionRoute(
   run: LadderRun,
@@ -9891,11 +10082,25 @@ function deadSessionRoute(
   liveRead: LatchRowState,
 ): Promise<SpawnPersonaResult> {
   const own = carriedDeadEvidenceOf(cause)
-  console.error(deadSessionRouteLine(run.ref, state, own, run.carriedDeadEvidence))
-  return resumeOrFreshSpawn(run, row, {
+  const lastRead = deadSessionLastRead(cause, finishedState, liveRead)
+  const lastReadBy = cause === DEAD_SESSION_CAUSE_ROW_ABSENT || cause === DEAD_SESSION_CAUSE_ROW_READ_FINISHED
+    ? deadEvidenceReadByCause(cause)
+    : DEAD_EVIDENCE_READ_BY_PATH
+  const notInteractive = cause === DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE && isDeadEvidence(run.carriedDeadEvidence.source)
+  const voidedBy = notInteractive
+    ? DEAD_EVIDENCE_VOIDED_BY_ROW_NOT_INTERACTIVE
+    : lastReadIsFinished(lastRead)
+      ? deadEvidenceVoidingRead(lastReadBy, lastRead)
+      : undefined
+  console.error(deadSessionRouteLine(run.ref, state, own, run.carriedDeadEvidence, voidedBy))
+  // b.jg5 SRJ-611: `row-not-interactive` voids the carried verdict for the
+  // rest of the attempt; the route's own cause is no dead evidence either.
+  const routed = notInteractive ? voidDeadEvidence(run, CARRIED_DEAD_EVIDENCE_NONE, DEAD_EVIDENCE_VOIDED_BY_ROW_NOT_INTERACTIVE).run : run
+  return resumeOrFreshSpawn(routed, row, {
     reconcileMissingFirst: true,
-    lastRead: deadSessionLastRead(cause, finishedState, liveRead),
-    deadEvidence: heldDeadEvidence(own, run.carriedDeadEvidence),
+    lastRead,
+    lastReadBy,
+    deadEvidence: heldDeadEvidence(own, routed.carriedDeadEvidence),
   })
 }
 
@@ -10040,7 +10245,11 @@ async function replacePersonaRow(
  * nothing:
  *   - the first collision re-runs get-then-act once (`ladderGetThenAct`,
  *     marked as the re-run): its collision `get` reads the row and its
- *     branches decide again;
+ *     branches decide again. The re-run carries no dead evidence, whichever
+ *     caller made the reuse (b.jg5 SRJ-611, dead evidence covers one life):
+ *     a verdict the restart path carried in is void, with its line
+ *     (`voidDeadEvidence`), and only a GONE the re-run meets on the life it
+ *     reads is evidence there;
  *   - a collision in that re-run (any second collision) makes no further
  *     call, arms the persona's retry timer with the reuse-collision cause
  *     (`reportReuseCollisionAtSite`, so the attempt records it) and answers
@@ -10061,7 +10270,10 @@ async function reuseFinishedRow(
     console.error(
       `[slack] spawnForPersona: the ${what} of ${ref} collided with a live row — nothing launched; re-running get-then-act once (b.jg5 SRJ-112)`,
     )
-    return ladderGetThenAct({ ...run, reuseCollisionRerun: true })
+    // b.jg5 SRJ-611: the re-run carries no dead evidence; a GONE it meets on
+    // the life its collision `get` reads is its own.
+    const voided = voidDeadEvidence(run, CARRIED_DEAD_EVIDENCE_NONE, DEAD_EVIDENCE_VOIDED_BY_REUSE_COLLISION_RERUN)
+    return ladderGetThenAct({ ...voided.run, reuseCollisionRerun: true })
   }
   // b.jg5 SRJ-112, SRJ-301: a second collision; P is re-evaluated at its
   // next tick or retry, so its retry timer is armed with the reuse-collision cause.
@@ -10101,7 +10313,10 @@ export function plainSpawnCollisionLine(what: string, ref: string, rerun: boolea
  *     second collision does (`reportReuseCollisionAtSite`, so the attempt
  *     records it), and answers `retrying` (b.jg5 SRJ-1015).
  * One line either way (`plainSpawnCollisionLine`). Never the spawn-failure
- * notice and never counted. Never throws.
+ * notice and never counted. Both callers read the row gone before the spawn
+ * (the collision `get`'s or `resume`'s `ErrSpawnNotFound`), which voided the
+ * path's dead evidence, so `run` and the re-run carry none (b.jg5 SRJ-611).
+ * Never throws.
  */
 function plainSpawnCollisionAtLadder(run: LadderRun, what: string): Promise<SpawnPersonaResult> {
   const { key } = run.persona
@@ -10168,6 +10383,29 @@ function plainSpawnCollisionAtLadder(run: LadderRun, what: string): Promise<Spaw
  * verdict is dead evidence; `row-not-interactive` and the row reads never
  * are. The not-resumable step and the replacements decide on it, and their
  * lines name it.
+ *
+ * Dead evidence covers one life (b.jg5 SRJ-611): once the path has read
+ * the row `ended`, `missing` or gone, the evidence it holds, its own or
+ * carried in, is void for the rest of the attempt (`voidDeadEvidence`: one
+ * line per voided piece, `deadEvidenceVoidedLine`, and the run carries none
+ * into any re-run of get-then-act). This gate voids it when:
+ *   - `opts.lastRead` is finished (`ended`, `missing` or no row; the read is
+ *     named by `opts.lastReadBy`): the collision `get`'s `ended`/`missing`
+ *     branch, a dead-session route whose cause is a row read (`row-absent`,
+ *     `row-read-finished`), the prompt-row action's re-read;
+ *   - with `reconcileMissingFirst`, the `get` SRJ-120 makes of P's own row
+ *     after the path's own find-missing run reads it `ended`, `missing` or
+ *     gone, before the `resume` (the run's listing itself voids nothing);
+ *     that read also becomes the path's state last read, which the latch
+ *     state and the replacement steps below use;
+ *   - `resume` answers `ErrSpawnNotFound` (SRJ-113): the plain spawn after
+ *     it, and any get-then-act its collision runs, hold none.
+ * Evidence that is not dead evidence passes through as it is. With the
+ * evidence voided, `ErrSpawnNotResumable` followed by a re-read in a live
+ * state other than `pending` is the lost race, and a replacement decides on
+ * the state last read as for a path with no evidence. A GONE the path meets
+ * after the read, on the life it then reads live, is new evidence of that
+ * life, and is kept.
  *
  * The no-transcript step's reuse spawn has SRJ-112's outcomes
  * (`reuseSpawnFailedAt`); its collision (`ErrInstanceIdCollision`: the row
@@ -10275,7 +10513,8 @@ function plainSpawnCollisionAtLadder(run: LadderRun, what: string): Promise<Spaw
  * too), "plain spawn" or, at a reuse spawn, "reuse spawn", and the row state
  * the path last read before that call: `opts.lastRead` (the caller's last
  * read: the collision `get`'s state, the working-row wait's last `status`,
- * or the prompt row's re-read), or, for the reuse after `ErrJsonlMissing`,
+ * or the prompt row's re-read) unless SRJ-120's post-run `get` read the row
+ * finished, which then replaces it, or, for the reuse after `ErrJsonlMissing`,
  * what its diagnosis `get` read. It answers `latched`: nothing is killed,
  * deleted or launched after it. An UNUSABLE NAME answer at the resume or at
  * any spawn after it latches the persona the same way, with the refused
@@ -10289,14 +10528,20 @@ function plainSpawnCollisionAtLadder(run: LadderRun, what: string): Promise<Spaw
  * @param row  The row returned by the collision `get` (its `labels`).
  */
 async function resumeOrFreshSpawn(
-  run: LadderRun,
+  runIn: LadderRun,
   row: Pick<GetResult, 'cwd' | 'labels'>,
-  opts: { reconcileMissingFirst?: boolean; lastRead: LatchRowState; deadEvidence?: CarriedDeadEvidence },
+  opts: { reconcileMissingFirst?: boolean; lastRead: LatchRowState; lastReadBy?: string; deadEvidence?: CarriedDeadEvidence },
 ): Promise<SpawnPersonaResult> {
-  const { persona, params, config, isStartup, ref } = run
+  const { persona, params, config, isStartup, ref } = runIn
   const { key } = persona
-  const { lastRead } = opts
-  const deadEvidence = opts.deadEvidence ?? CARRIED_DEAD_EVIDENCE_NONE
+  let { lastRead } = opts
+  // b.jg5 SRJ-611: dead evidence covers one life. A path whose state last
+  // read is finished (`ended`, `missing` or no row) holds none from here on,
+  // its own or carried in: one line per voided piece, and the run carries
+  // none into any re-run of get-then-act.
+  let { run, deadEvidence } = lastReadIsFinished(lastRead)
+    ? voidDeadEvidence(runIn, opts.deadEvidence ?? CARRIED_DEAD_EVIDENCE_NONE, deadEvidenceVoidingRead(opts.lastReadBy ?? DEAD_EVIDENCE_READ_BY_PATH, lastRead))
+    : { run: runIn, deadEvidence: opts.deadEvidence ?? CARRIED_DEAD_EVIDENCE_NONE }
   // b.jg5 SRJ-805: a retired key is never resumed; its rule runs below,
   // after the sweep and the unresolvable-directory deferral, on a reading
   // taken there. This reading decides only the `resume_enabled` false step.
@@ -10324,7 +10569,12 @@ async function resumeOrFreshSpawn(
   // step). Prefer AD's findMissing verb over CSCB-side tmux probing per
   // docs/engineering-guide.md ("Avoiding Duplicated Effort").
   if (opts.reconcileMissingFirst) {
-    const sweep = await reconcileMissingSweep(key, 'spawnForPersona: before resume', ref)
+    const postSweep: { ownRowRead?: LatchRowState } = {}
+    const sweep = await reconcileMissingSweep(key, 'spawnForPersona: before resume', ref, {
+      onOwnRowRead: (read) => {
+        postSweep.ownRowRead = read
+      },
+    })
     if (sweep === FIND_MISSING_REFUSED) return { key, action: 'failed' }
     if (sweep === FIND_MISSING_LATCHED) {
       // b.jg5 SRJ-120, SRJ-502: the persona latched during the sweep (a
@@ -10334,6 +10584,19 @@ async function resumeOrFreshSpawn(
         `[slack] spawnForPersona: ${ref} is latched after the findMissing sweep before resume — not resuming; nothing more is called for it (b.jg5 SRJ-502)`,
       )
       return { key, action: 'latched' }
+    }
+    // b.jg5 SRJ-120, SRJ-611: the post-run `get` of P's own row (made only
+    // for a row the run left in `unverified_ids`, never on a memo hit) is a
+    // read of the row: finished or gone, it voids the path's dead evidence
+    // before the `resume`, and it becomes the path's last read, so the latch
+    // state and the replacement step below act on it, not on the earlier
+    // live read. The run's own listing voids nothing.
+    const { ownRowRead } = postSweep
+    if (ownRowRead !== undefined && lastReadIsFinished(ownRowRead)) {
+      const voided = voidDeadEvidence(run, deadEvidence, deadEvidenceVoidingRead(DEAD_EVIDENCE_READ_BY_POST_SWEEP_GET, ownRowRead))
+      run = voided.run
+      deadEvidence = voided.deadEvidence
+      lastRead = ownRowRead
     }
   }
 
@@ -10383,6 +10646,14 @@ async function resumeOrFreshSpawn(
       )
     },
     notResumable: (err) => spawnNotResumableAtLadder(run, err, deadEvidence),
+    // b.jg5 SRJ-113, SRJ-611: `resume`'s ErrSpawnNotFound read the row gone,
+    // which voids the path's dead evidence: the plain spawn after it, and any
+    // get-then-act its collision runs, carry none.
+    resumeNotFound: () => {
+      const voided = voidDeadEvidence(run, deadEvidence, DEAD_EVIDENCE_VOIDED_BY_RESUME_NOT_FOUND)
+      run = voided.run
+      deadEvidence = voided.deadEvidence
+    },
     // b.jg5 SRJ-111, SRJ-114: the plain spawn after `resume`'s
     // ErrSpawnNotFound collided: get-then-act, re-run once.
     plainSpawnCollided: () => plainSpawnCollisionAtLadder(run, RESUME_NOT_FOUND_SPAWN_WHAT),
@@ -10494,6 +10765,12 @@ interface ResumeSite<R> {
   /** The `ErrSpawnNotResumable` row (b.jg5 SRJ-710): the site's not-resumable step. */
   readonly notResumable: (err: unknown) => Promise<R>
   /**
+   * Told once when the `resume` answered `ErrSpawnNotFound`, before the plain
+   * spawn after it (b.jg5 SRJ-113, SRJ-611: a read of the row as gone, which
+   * voids the collision ladder path's dead evidence). Absent: nothing is told.
+   */
+  readonly resumeNotFound?: () => void
+  /**
    * The collision row of the plain spawn after `ErrSpawnNotFound` (b.jg5
    * SRJ-111, SRJ-713; `plainSpawnOutcomeAt`'s `collided`): the collision
    * ladder's get-then-act re-run once (`plainSpawnCollisionAtLadder`), or the
@@ -10516,7 +10793,8 @@ interface ResumeSite<R> {
  *     site's no-transcript row (`site.noTranscript`, SRJ-707, SRJ-712);
  *   - `ErrSpawnNotResumable`: the site's not-resumable step
  *     (`site.notResumable`, SRJ-710);
- *   - `ErrSpawnNotFound`: one plain spawn of the same id
+ *   - `ErrSpawnNotFound`: the site told (`site.resumeNotFound`), then one
+ *     plain spawn of the same id
  *     (`plainSpawnAfterResumeNotFound`, SRJ-111) through the one plain-spawn
  *     outcome handler, with no spawn-failure notice for the
  *     `ErrSpawnNotFound` itself; its collision takes the site's row
@@ -10550,7 +10828,10 @@ async function resumeAtSite<R>(site: ResumeSite<R>): Promise<SpawnPersonaResult 
   } catch (err) {
     if (isNoTranscriptResumeError(err)) return site.noTranscript(err)
     if (hasAdErrorName(err, ERR_SPAWN_NOT_RESUMABLE_NAME)) return site.notResumable(err)
-    if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) return plainSpawnAfterResumeNotFound(site)
+    if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) {
+      site.resumeNotFound?.()
+      return plainSpawnAfterResumeNotFound(site)
+    }
     const notResumed = await resumeFailedAt(persona, err, isStartup, ref, lastRead)
     return site.marksDirectoryCounted ? withDirectoryCounted(notResumed, err) : notResumed
   }
@@ -12521,8 +12802,9 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *      `retrying`; on ErrSpawnNotFound → one plain spawn through the one
  *      plain-spawn outcome handler, whose collision re-runs this step once
  *      (SRJ-113, SRJ-111). An escalate-dead verdict the restart path carried
- *      in (`deadEvidence`) goes with this path, named in one line (b.jg5
- *      SRJ-611).
+ *      in (`deadEvidence`) is named in one line, and is void: the collision
+ *      `get`'s finished read voids it for the rest of the attempt (b.jg5
+ *      SRJ-611, dead evidence covers one life).
  *    - ended/missing + !resume_enabled → the replace step: a reuse spawn of
  *      the same id.
  *    - waiting → the reconnect (`reconnectMcpWithCause`, one `send-keys`,
@@ -12532,7 +12814,9 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *      and hands it on (`deadSessionRoute`, b.jg5 SRJ-611): only a
  *      GONE-based cause (`tmux-gone`) is dead evidence, never
  *      `row-not-interactive` or `row-absent`, and the find-missing run is
- *      made for every cause; 'transient' → `latched` for a latched
+ *      made for every cause; `row-not-interactive` voids a verdict the
+ *      restart path carried in, and `row-absent` voids all the path holds
+ *      (dead evidence covers one life); 'transient' → `latched` for a latched
  *      persona, otherwise `retrying` (b.jg5 SRJ-1015): no spawn-failure
  *      notice, no `spawn-failed` entry, nothing counted.
  *    - working → waitForWaitingAndReconnect; its outcome is mapped as the
@@ -12549,8 +12833,9 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *      pane, UNAVAILABLE, CONFIG, UNCLASSIFIED or ENVIRONMENT → no-op; GONE
  *      or the row absent (`ErrSpawnNotFound`) → findMissing sweep and a
  *      re-read, and a row now `ended` or `missing` → resume/fresh-spawn,
- *      carrying `prompt-row-ladder-gone` (dead evidence) after a GONE and
- *      `row-absent` (not dead evidence) after an absent row (b.jg5 SRJ-611)
+ *      naming `prompt-row-ladder-gone` (dead evidence) after a GONE and
+ *      `row-absent` (not dead evidence) after an absent row, both void once
+ *      the re-read found the row finished (b.jg5 SRJ-611)
  *      (otherwise no-op); CONFLICT or UNUSABLE NAME (the reader latched the
  *      persona) → `latched`.
  *    - pending → the ladder's `pending` step (`ladderPendingRowStep`):
@@ -12620,7 +12905,10 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  * its relaunch (b.jg5 SRJ-611; absent, none): the ladder keeps it for the
  * run (decided again from its cause or verdict, `carriedDeadEvidenceOf`),
  * and every `resumeOrFreshSpawn` call it makes holds dead evidence when that
- * verdict is dead evidence or the path's own cause is. A call that joins a
+ * verdict is dead evidence or the path's own cause is, until a read of the
+ * row as `ended`, `missing` or gone, or a reconnect's `row-not-interactive`
+ * answer, voids it for the rest of the attempt (dead evidence covers one
+ * life, `voidDeadEvidence`). A call that joins a
  * launch already in flight gets that launch's result, and its verdict is
  * dropped with one line. The held, `sequence-waiting` and old-life gates run
  * before the join check, so they answer either way; the latched gate runs after it, so
@@ -12906,7 +13194,11 @@ function describeRetiredMark(retired: RetiredKeyReading): string {
  * collision is the attempt's one reuse collision (SRJ-112), so this
  * get-then-act is marked as its one re-run (`run.reuseCollisionRerun`): a
  * reuse there that collides too re-runs nothing, arms the retry timer and
- * answers `retrying` (`reuseFinishedRow`). Never throws.
+ * answers `retrying` (`reuseFinishedRow`). That get-then-act carries no
+ * escalate-dead verdict (SRJ-611): a verdict handed in is void
+ * (`voidDeadEvidence`, `DEAD_EVIDENCE_VOIDED_BY_RETIRED_KEY_FIRST_LAUNCH`),
+ * since the launch starts a new life the verdict never saw, and a live row is
+ * judged afresh at the next attempt. Never throws.
  */
 async function retiredKeyFirstLaunch(run: LadderRun, retired: RetiredKeyReading): Promise<SpawnPersonaResult> {
   const { persona, config, isStartup, ref } = run
@@ -12927,7 +13219,10 @@ async function retiredKeyFirstLaunch(run: LadderRun, retired: RetiredKeyReading)
   console.error(
     `[slack] spawnForPersona: the ${RETIRED_KEY_REUSE_WHAT} of ${ref} collided — fetching current state; this is the one get-then-act a reuse collision gives (b.jg5 SRJ-805, SRJ-112)`,
   )
-  return ladderGetThenAct({ ...run, reuseCollisionRerun: true })
+  // b.jg5 SRJ-611: the get-then-act carries no verdict; the new life this
+  // launch starts is not the one the verdict saw.
+  const voided = voidDeadEvidence(run, CARRIED_DEAD_EVIDENCE_NONE, DEAD_EVIDENCE_VOIDED_BY_RETIRED_KEY_FIRST_LAUNCH)
+  return ladderGetThenAct({ ...voided.run, reuseCollisionRerun: true })
 }
 
 /**
@@ -12990,6 +13285,10 @@ async function ladderGetThenAct(run: LadderRun): Promise<SpawnPersonaResult> {
   if (latchedAfterOwnRowRead(key, 'spawnForPersona', 'collision get', ref)) return { key, action: 'latched' }
   if (collisionRead.kind !== OWN_ROW_READ_ROW) {
     if (collisionRead.kind === OWN_ROW_READ_ABSENT) {
+      // b.jg5 SRJ-611: the collision `get` read the row gone, which voids any
+      // verdict the restart path carried in for the rest of the attempt: the
+      // retry spawn's collision re-run, and the retired key's reuse, carry none.
+      run = voidDeadEvidence(run, CARRIED_DEAD_EVIDENCE_NONE, deadEvidenceVoidingRead(DEAD_EVIDENCE_READ_BY_COLLISION_GET, LATCH_ROW_STATE_NO_ROW)).run
       // b.jg5 SRJ-805: a retired key gets no plain spawn: the row is gone,
       // so its reuse spawn is an ordinary fresh spawn (SRJ-112).
       const retired = retiredKeyReadingOf(key)
@@ -13031,6 +13330,12 @@ async function ladderGetThenAct(run: LadderRun): Promise<SpawnPersonaResult> {
   // b.jg5 SRJ-501: the collision `get` is the path's last read until a later
   // read replaces it (the working-row wait's, the prompt row's re-read).
   const lastRead = latchRowStateRead(state)
+  // b.jg5 SRJ-611: dead evidence covers one life. A collision `get` that
+  // reads the row `ended` or `missing` voids the verdict the restart path
+  // carried in, for every branch below and any re-run of get-then-act.
+  const carriedIn = run.carriedDeadEvidence
+  const collisionVoidedBy = lastReadIsFinished(lastRead) ? deadEvidenceVoidingRead(DEAD_EVIDENCE_READ_BY_COLLISION_GET, lastRead) : undefined
+  if (collisionVoidedBy !== undefined) run = voidDeadEvidence(run, CARRIED_DEAD_EVIDENCE_NONE, collisionVoidedBy).run
 
   // b.av2 SR-6.2 as amended (b.jg5 SRJ-1503): a row in another directory (by
   // real path) is never resumed, reconnected or waited on, whatever its state
@@ -13069,14 +13374,18 @@ async function ladderGetThenAct(run: LadderRun): Promise<SpawnPersonaResult> {
   if (retiredStep !== undefined) return retiredStep
 
   if (state === 'ended' || state === 'missing') {
-    // b.jg5 SRJ-611: an escalate-dead verdict the restart path carried in
-    // goes with this path, named in one line; with none carried the path
-    // holds none.
-    const { carriedDeadEvidence } = run
-    if (carriedDeadEvidence.source !== DEAD_EVIDENCE_NONE) {
-      console.error(deadSessionRouteLine(ref, state, CARRIED_DEAD_EVIDENCE_NONE, carriedDeadEvidence))
+    // b.jg5 SRJ-611: an escalate-dead verdict the restart path carried in is
+    // named in one line, which says that this read voided it (above); with
+    // none carried the path holds none. Either way the path holds no dead
+    // evidence from here on.
+    if (carriedIn.source !== DEAD_EVIDENCE_NONE) {
+      console.error(deadSessionRouteLine(ref, state, CARRIED_DEAD_EVIDENCE_NONE, carriedIn, collisionVoidedBy))
     }
-    return resumeOrFreshSpawn(run, row, { lastRead, deadEvidence: carriedDeadEvidence })
+    return resumeOrFreshSpawn(run, row, {
+      lastRead,
+      lastReadBy: DEAD_EVIDENCE_READ_BY_COLLISION_GET,
+      deadEvidence: run.carriedDeadEvidence,
+    })
   }
 
   if (state === 'waiting') {

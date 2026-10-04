@@ -2424,7 +2424,7 @@ describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the 
     expect(startupEntriesOf(h, PERSONA_KILL_FAILED_LABEL)).toEqual([killFailureRecoveryEntry(p, ordinaryAlertContent(p), KILL_FAILURE_CONTEXT_RECOVERY)])
   })
 
-  test('a not-judged stop arms P\'s timer; its next retry, through the restart path\'s escalate-dead relaunch, reaches the not-resumable site again and begins a new sequence episode, which ends in resume', async () => {
+  test('a not-judged stop arms P\'s timer; its next retry, through the restart path\'s escalate-dead relaunch (no kill: its re-probe read the row ended, voiding the verdict), meets a fresh GONE on the row its relaunch reads live, reaches the not-resumable site again and begins a new sequence episode, which ends in resume', async () => {
     const { h, p } = build()
     await pastSampleGrace(h)
     const calls = h.stub.calls
@@ -2435,21 +2435,29 @@ describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the 
     expect(h.controller.view(p)?.causes).toEqual([UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED])
 
     // Episode 2: the retry's run reads the row waiting until its escalate-dead
-    // sweep (the reconnect's GONE: verdict dead-session) and ended after it;
-    // its checked kill, then its relaunch: the collision get reads ended, the
-    // resume answers ErrSpawnNotResumable, the re-read finds the row waiting.
+    // sweep (the reconnect's GONE: verdict dead-session) and ended after it.
+    // That re-probe read the row, which voids the verdict (dead evidence
+    // covers one life): no kill, and the relaunch carries none (b.jg5
+    // SRJ-110, SRJ-314, SRJ-611). The relaunch's collision get reads the row
+    // waiting (a launch the verdict never saw), whose reconnect answers GONE:
+    // new evidence of that life; the resume answers ErrSpawnNotResumable and
+    // the re-read finds the row waiting.
     const sweptAfter = calls.findMissingCalls.length
     h.script({
       statusFn: () => cannedStatusResult({ state: calls.findMissingCalls.length > sweptAfter ? ENDED : LIVE }),
       spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getQueue: [cannedOk(personaRow(h, p, { state: ENDED })), cannedOk(personaRow(h, p))],
+      getQueue: [cannedOk(personaRow(h, p)), cannedOk(personaRow(h, p))],
       getResult: personaRow(h, p, { state: ENDED, claude_session_id: SESSION_ID }),
+      sendKeysError: errTmuxSendKeys(),
       resumeQueue: [cannedErr(errSpawnNotResumable())],
     })
     // The escalate-dead sweep is a new run, not the memo's answer from episode 1.
     _resetFindMissingMemo()
+    const killsBefore = calls.killCalls.length
     await retryNow(h, p)
-    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_RESUME, result: { key: p, action: 'resumed' } })
+    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_RESUME, result: { key: p, action: 'resumed' }, kills: 1 })
+    // The sequence's own step-1 kill only: none before the relaunch.
+    expect(calls.killCalls.length - killsBefore).toBe(1)
 
     const startLine = liveRowSequenceStartLine(renderPersonaRef(p, p), h.sequenceRequest(p, { lastReadState: LIVE, keepsConversation: true }))
     expect(h.lines.filter((line) => line.startsWith(`${LIVE_ROW_SEQUENCE_LOG_PREFIX} ${renderPersonaRef(p, p)}: started at step `))).toEqual([startLine, startLine])

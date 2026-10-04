@@ -21,7 +21,9 @@
  *   unknown  any other `status` error, and any state string that is none of
  *            the above: agent-director could not report on the persona
  *
- * Only `dead` leads to a kill and a launch. A reading is an object whose
+ * Only `dead` leads to a launch, and only its `ErrSystemInstallDisappeared`
+ * form, which reads no row, to a kill before it (b.jg5 SRJ-110, SRJ-314):
+ * no kill is sent for a row just read `ended`, `missing` or gone. A reading is an object whose
  * `kind` names it; consumers decide on `livenessKindOf(reading)`. A `pending`
  * reading also carries the row's launch start (`launchStartedAt`) when the
  * `status` result showed one (b.jg5 SRJ-115, SRJ-406): read raw, as
@@ -74,7 +76,7 @@ export const AGENT_DIRECTOR_DEAD_STATES: ReadonlySet<string> = new Set(['ended',
 export const LIVENESS_LIVE = 'live'
 /** `pending`: the row reads `pending`; its session has not started. */
 export const LIVENESS_PENDING = 'pending'
-/** `dead`: `ended`, `missing`, `ErrSpawnNotFound` or `ErrSystemInstallDisappeared`. The only reading that leads to a kill and a launch. */
+/** `dead`: `ended`, `missing`, `ErrSpawnNotFound` or `ErrSystemInstallDisappeared`. The only reading that leads to a launch; only its `ErrSystemInstallDisappeared` form leads to a kill before it (b.jg5 SRJ-314). */
 export const LIVENESS_DEAD = 'dead'
 /** `unknown`: agent-director could not report on the persona. Never read as dead. */
 export const LIVENESS_UNKNOWN = 'unknown'

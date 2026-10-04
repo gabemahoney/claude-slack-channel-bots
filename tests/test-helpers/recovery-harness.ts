@@ -931,7 +931,12 @@ import {
   type ConflictLatchSetOutcome,
   type ConflictNoticeEpisodes,
 } from '../../src/conflict-latch.ts'
-import { LIVENESS_DEAD_ROW_ENDED, LIVENESS_DEAD_ROW_MISSING, LIVENESS_LIVE } from '../../src/liveness-reading.ts'
+import {
+  LIVENESS_DEAD_ROW_ENDED,
+  LIVENESS_DEAD_ROW_MISSING,
+  LIVENESS_LIVE,
+  LIVENESS_READING_DEAD_INSTALL_GONE,
+} from '../../src/liveness-reading.ts'
 import {
   AD_ERROR_CLASS_UNAVAILABLE,
   LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT,
@@ -3601,6 +3606,36 @@ export function rowReadsUntilSpawn(
   }
   h.script({ statusFn })
   return statusFn
+}
+
+/**
+ * A restart liveness read (`restartDeps.isSessionAlive`) for the cases whose
+ * subject is the restart path's kill: it answers `ErrSystemInstallDisappeared`'s
+ * `dead` reading, the one `dead` reading (read from no row) the checked kill
+ * follows (b.jg5 SRJ-110, SRJ-314), with no `status` call, until `readRow()`;
+ * from then on it is the real liveness adapter over `config`. Hand
+ * `isSessionAlive` to `makeRecoveryHarness`'s `restartDeps`; the stub's
+ * `status` (the launch's own reads, and the lost-message read) answers as each
+ * case scripts it.
+ *
+ * Two ways a case reaches the restart kill, chosen by what the case is about:
+ * - This injection, when the kill's outcome is the subject. A real
+ *   `ErrSystemInstallDisappeared` `status` read also raises the outage
+ *   state's `ad-unreachable` flag and arms the read-error cause (the liveness
+ *   adapter's own cases, tests/server.test.ts), which would cross every kill
+ *   assertion; the injection leaves both out, and makes no `status` call.
+ * - A real `ErrSystemInstallDisappeared` `status` read through the stub (as
+ *   tests/unavailable-retry.test.ts and tests/conflict-latch.test.ts do), when
+ *   the case means the production path with its outage side effects: the
+ *   case then asserts the read-error cause and the `ad-unreachable` onset.
+ */
+export function installGoneRestartProbe(config: () => PersonaConfig): { readonly isSessionAlive: RestartDeps['isSessionAlive']; readRow(): void } {
+  const real = _buildIsSessionAliveAdapter(config)
+  let installGone = true
+  return {
+    isSessionAlive: async (key) => (installGone ? LIVENESS_READING_DEAD_INSTALL_GONE : real(key)),
+    readRow: () => { installGone = false },
+  }
 }
 
 /** `scriptTimedLaunch`'s end for a call that succeeds (answered by the verb's other knobs). */

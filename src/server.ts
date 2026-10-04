@@ -1744,9 +1744,11 @@ const KILL_SESSION_ADAPTER_SITE = 'killSession (restart adapter)'
  * refuses it). Otherwise the adapter's kill runs through the bounded retry
  * (`retryPersonaKill`, inside the restart work's recovery attempt, on
  * `clock`), seeded with the run's `dead` reading: the restart path kills
- * only after one, so its kill is not of a row read live (not tmux-touching)
- * and is one try, its outcome standing at once (on a finished row `kill` is
- * a no-op success, SRJ-110). The adapter logs the outcome that stands with
+ * only after one, and only after its `ErrSystemInstallDisappeared` form,
+ * which reads no row (`killBeforeRelaunch` in `src/restart.ts`; b.jg5
+ * SRJ-314, SRJ-611: no kill is sent for a row just read `ended`, `missing`
+ * or gone), so its kill is not of a row read live (not tmux-touching) and is
+ * one try, its outcome standing at once. The adapter logs the outcome that stands with
  * `kill_sent` (`describeKillOutcome`), does its class's handling below,
  * raises the retry's kill-failure alert decision
  * (`raisePersonaKillFailureAlert`, context `recovery`; b.jg5 SRJ-704) and
@@ -1997,7 +1999,9 @@ export function _buildKillSessionAdapter(
  *   After an escalate-dead answer restart.ts probes liveness again in the
  *   same restart run and, when the reconciled row reads dead, relaunches at
  *   once, with its checked kill first only for a verdict that is dead
- *   evidence (b.jg5 SRJ-611). The sweep may leave the row live (in
+ *   evidence and a re-probe of `ErrSystemInstallDisappeared`, which reads
+ *   no row; a re-probe that read the row voids the verdict, so the relaunch
+ *   has no kill and carries none (b.jg5 SRJ-611). The sweep may leave the row live (in
  *   `unverified_ids`, or, when `pending`, not judged, b.jg5 SRJ-120), and it
  *   may then stay live for further ticks: nothing promises that the re-probe
  *   or a later tick reads it dead. Each escalate-dead tick sweeps again, with
@@ -2240,9 +2244,11 @@ export function _buildReconnectSessionAdapter(
     // sweep wrapper here, which may reconcile the frozen `working` row to
     // `missing`, and restart.ts probes liveness again in the same restart run
     // (b.d61): a re-probe that reads `dead` relaunches at once, with its
-    // checked kill first only after a verdict that is dead evidence (the
-    // relaunch alone after `row-not-interactive` or `row-absent-at-pane-read`,
-    // b.jg5 SRJ-609, SRJ-611). `pending` or
+    // checked kill first only after a verdict that is dead evidence and a
+    // re-probe of `ErrSystemInstallDisappeared` (the relaunch alone after
+    // `row-not-interactive` or `row-absent-at-pane-read`, and after a
+    // re-probe that read the row, which voids the verdict, b.jg5 SRJ-609,
+    // SRJ-611). `pending` or
     // `unknown` leaves the relaunch undone
     // (`unknown` arms the retry timer). The sweep may leave the row live (in
     // `unverified_ids`, or, when `pending`, not judged at all, b.jg5
@@ -4013,7 +4019,8 @@ export async function main(): Promise<void> {
   // with the row's raw launch start when shown (SRJ-115); `live` for another
   // live state; `dead` for a terminal state (ended, missing), ErrSpawnNotFound
   // or ErrSystemInstallDisappeared; `unknown` for every other status error and
-  // any state CSCB does not know. Only `dead` leads to a kill and a launch;
+  // any state CSCB does not know. Only `dead` leads to a launch, with a kill
+  // before it only for ErrSystemInstallDisappeared (b.jg5 SRJ-314);
   // the restart path hands `pending` to `deferPendingRow` and arms the
   // persona's retry timer on `unknown`; the health tick never counts
   // `pending` healthy and skips an `unknown` persona that tick. A configured

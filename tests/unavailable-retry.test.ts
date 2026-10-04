@@ -247,7 +247,11 @@ import {
   LIVENESS_DEAD_ROW_MISSING,
   LIVENESS_LIVE,
   LIVENESS_PENDING,
+  LIVENESS_READING_DEAD_ENDED,
+  LIVENESS_READING_DEAD_MISSING,
+  LIVENESS_READING_DEAD_NO_ROW,
   LIVENESS_READING_UNKNOWN,
+  type DeadLivenessReading,
   type PendingLivenessReading,
 } from '../src/liveness-reading.ts'
 import {
@@ -304,6 +308,10 @@ import {
   RESTART_OUTCOME_RECONNECTED,
   RESTART_OUTCOME_REFUSED,
   RESTART_OUTCOME_SHUTTING_DOWN,
+  RELAUNCH_KILL_NONE,
+  RELAUNCH_NO_KILL_ROW_READ,
+  relaunchAfterKillLine,
+  relaunchWithoutKillLine,
   runRestartRetry,
   scheduleRestart,
   type RestartRetryOutcome,
@@ -1634,6 +1642,19 @@ function adUnreachableOnsets(h: RecoveryHarness): RecoveryNotice[] {
   return h.outageNotices.filter((notice) => notice.text === ONSET_TEMPLATES['ad-unreachable'](h.stub.client.binaryPath))
 }
 
+/**
+ * The `ad-unreachable` outage's two posts for persona `key`: the onset an
+ * ErrSystemInstallDisappeared liveness read raises, and the all-clear of the
+ * next call that answers (the restart run's kill, say), for the stub's binary.
+ */
+function adUnreachableEpisode(h: RecoveryHarness, key: string): RecoveryNotice[] {
+  const binaryPath = h.stub.client.binaryPath
+  return [
+    { key, text: ONSET_TEMPLATES['ad-unreachable'](binaryPath) },
+    { key, text: ALL_CLEAR_TEMPLATE(new Map([['ad-unreachable', { detail: binaryPath }]])) },
+  ]
+}
+
 describe('unavailable retry: a status error at the launch’s working-row wait arms P’s timer while the wait goes on, and never fails or counts the launch (SRJ-605, SRJ-301)', () => {
   beforeEach(() => {
     _resetNotConnectedEpisodes()
@@ -2401,6 +2422,42 @@ function modelRow(h: RecoveryHarness, initial: RowState | typeof UNAVAILABLE_RET
   }
 }
 
+/** The `dead` reading of each finished or gone row read the restart decision launches on. */
+const DEAD_READING_OF_ROW: Readonly<Record<'ended' | 'missing' | typeof UNAVAILABLE_RETRY_ROW_ABSENT, DeadLivenessReading>> = {
+  ended: LIVENESS_READING_DEAD_ENDED,
+  missing: LIVENESS_READING_DEAD_MISSING,
+  [UNAVAILABLE_RETRY_ROW_ABSENT]: LIVENESS_READING_DEAD_NO_ROW,
+}
+
+/**
+ * The restart decision's liveness read found `key`'s row `state` (`ended`,
+ * `missing`, or no row) and it launched `times` times with no kill (b.jg5
+ * SRJ-110, SRJ-314): each launch logged its no-kill line and its `kill: none`
+ * relaunch line once.
+ */
+function expectLaunchedWithNoKill(h: RecoveryHarness, key: string, state: keyof typeof DEAD_READING_OF_ROW, times = 1): void {
+  const lines = [
+    relaunchWithoutKillLine(key, undefined, RELAUNCH_NO_KILL_ROW_READ, DEAD_READING_OF_ROW[state]),
+    relaunchAfterKillLine(key, personaOf(h, key).working_directory, RELAUNCH_KILL_NONE),
+  ]
+  expect(lines.map((line) => h.errors.filter((error) => error === line).length)).toEqual([times, times])
+}
+
+/**
+ * A `refuse` for `modelRow`: the first `status` answers
+ * ErrSystemInstallDisappeared, the one `dead` reading the restart decision
+ * makes its checked kill after (it reads no row); every later one reads the
+ * model.
+ */
+function installGoneOnce(): () => Error | undefined {
+  let answered = false
+  return () => {
+    if (answered) return undefined
+    answered = true
+    return errSystemInstallDisappeared('status')
+  }
+}
+
 /** The stub's calls made since `before` (a `callCounts` snapshot), by verb, leaving out verbs not called since. */
 function callsSince(h: RecoveryHarness, before: Record<string, number>): Record<string, number> {
   return Object.fromEntries(
@@ -2635,8 +2692,10 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
     ['pending and not connected: the liveness read defers it, no reconnect and never a spawn, and the timer runs on in full mode, its last row read pending', 'pending', false, { statusCalls: 1, getCalls: 1 }, { reason: UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, mode: UNAVAILABLE_RETRY_MODE_FULL, lastRow: UNAVAILABLE_RETRY_ROW_PENDING }],
     ['pending and connected with its stream: never nothing left to recover; the liveness read defers it, and the timer runs on in full mode, its last row read pending', 'pending', true, { statusCalls: 1, getCalls: 1 }, { reason: UNAVAILABLE_RETRY_AGAIN_PENDING_DEFERRED, mode: UNAVAILABLE_RETRY_MODE_FULL, lastRow: UNAVAILABLE_RETRY_ROW_PENDING }],
     // The launch arms its pending-only watch, adding the pending-row cause.
-    ['ended: a kill and a launch, and the timer runs on in pending-only mode, its last row read the launch’s pending', 'ended', false, { statusCalls: 2, killCalls: 1, spawnCalls: 1 }, { reason: UNAVAILABLE_RETRY_AGAIN_LAUNCHED, mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING }],
-    ['missing: a kill and a launch, and the timer runs on in pending-only mode, its last row read the launch’s pending', 'missing', false, { statusCalls: 2, killCalls: 1, spawnCalls: 1 }, { reason: UNAVAILABLE_RETRY_AGAIN_LAUNCHED, mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING }],
+    // No kill before it: the liveness read read the row finished (b.jg5
+    // SRJ-110, SRJ-314).
+    ['ended: a launch with no kill, and the timer runs on in pending-only mode, its last row read the launch’s pending', 'ended', false, { statusCalls: 2, spawnCalls: 1 }, { reason: UNAVAILABLE_RETRY_AGAIN_LAUNCHED, mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING }],
+    ['missing: a launch with no kill, and the timer runs on in pending-only mode, its last row read the launch’s pending', 'missing', false, { statusCalls: 2, spawnCalls: 1 }, { reason: UNAVAILABLE_RETRY_AGAIN_LAUNCHED, mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING }],
   ])('a retry that finds the row %s', async (_what, state, connected, calls, outcome) => {
     const h = (harness = makeRecoveryHarness())
     const [key, other] = h.keys as [string, string]
@@ -2647,6 +2706,7 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
     await retryNow(h, key)
 
     expect(callCounts(h)).toEqual(calls)
+    if (state === 'ended' || state === 'missing') expectLaunchedWithNoKill(h, key, state)
     expect(h.controller.isArmed(other)).toBe(true)
     if (typeof outcome === 'string') {
       expect(h.lines).toContain(stoppedLine(key, outcome))
@@ -2786,7 +2846,7 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
     ['a plain Error', () => new Error('boom')],
     ['ErrCallTimeout', () => errCallTimeout('status')],
     ['a CONFIG answer', () => errConfigMalformed()],
-  ])('a retry whose liveness status answers %s reads unknown: its status call and nothing else, re-armed at the next wait with the last row read kept, never stopped and nothing counted past the cap; once status answers ended the next retry kills and launches once', async (_what, make) => {
+  ])('a retry whose liveness status answers %s reads unknown: its status call and nothing else, re-armed at the next wait with the last row read kept, never stopped and nothing counted past the cap; once status answers ended the next retry launches once, with no kill', async (_what, make) => {
     // The arm hook wired as main() wires it: the read-error cause on the controller.
     const hooked: string[] = []
     const h = (harness = makeRecoveryHarness({
@@ -2835,7 +2895,8 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
     answer = 'ended'
     const before = callCounts(h)
     await retryNow(h, key)
-    expect(callsSince(h, before)).toEqual({ statusCalls: 2, killCalls: 1, spawnCalls: 1 })
+    expect(callsSince(h, before)).toEqual({ statusCalls: 2, spawnCalls: 1 })
+    expectLaunchedWithNoKill(h, key, 'ended')
     expect(h.lines).toContain(reArmedLine(key, last + 1, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, last + 1, { switchedTo: UNAVAILABLE_RETRY_MODE_PENDING_ONLY }))
     expect(getFailureCount(key)).toBe(0)
   })
@@ -2898,8 +2959,10 @@ describe('unavailable retry: the stop rules that exist now on the recovery harne
 
     expect(h.errors.filter((line) => line.startsWith(`[slack] Relaunching session for persona=${key} `))).toHaveLength(1)
     // The one held spawn is the only spawn; it is not in the stub's own log.
+    // No kill before it: the liveness read read the row missing.
     expect(hold.calls).toHaveLength(1)
-    expect(callCounts(h)).toEqual({ statusCalls: 1, killCalls: 1 })
+    expect(callCounts(h)).toEqual({ statusCalls: 1 })
+    expectLaunchedWithNoKill(h, key, 'missing')
     expect(getFailureCount(key)).toBe(RESTART_FAILURE_CAP)
     expect(h.capReached).toEqual([key])
     expect(h.notices.filter((n) => n.text.includes('automatic restarts suspended'))).toEqual([expect.objectContaining({ key })])
@@ -3092,7 +3155,7 @@ describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301,
   // Hatch note E8: the hand-off run's successful launch leaves a fresh
   // pending-only timer watching the new `pending` row (b.jg5 SRJ-301,
   // SRJ-409), armed through the trigger sink after the stop.
-  test.each(['ended', 'missing', UNAVAILABLE_RETRY_ROW_ABSENT] as const)('a row read %s: the timer stops, then one run of the restart decision (one kill, one launch), whose launch arms a fresh pending-only timer on its row', async (state) => {
+  test.each(['ended', 'missing', UNAVAILABLE_RETRY_ROW_ABSENT] as const)('a row read %s: the timer stops, then one run of the restart decision (one launch, no kill), whose launch arms a fresh pending-only timer on its row', async (state) => {
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
     const row = modelRow(h, state)
@@ -3101,9 +3164,11 @@ describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301,
 
     await retryNow(h, key)
 
-    // The row read, then the restart decision's liveness read, kill, spawn
-    // and readiness read.
-    expect(callCounts(h)).toEqual({ statusCalls: 3, killCalls: 1, spawnCalls: 1 })
+    // The row read, then the restart decision's liveness read, spawn and
+    // readiness read; no kill, since that liveness read read the row
+    // finished or gone (b.jg5 SRJ-110, SRJ-314).
+    expect(callCounts(h)).toEqual({ statusCalls: 3, spawnCalls: 1 })
+    expectLaunchedWithNoKill(h, key, state)
     expect(row.spawnedAt).toEqual([dueAt])
     expect(retryLinesOf(h, key)).toEqual([
       pendingOnlyArmedLine(key),
@@ -3673,7 +3738,10 @@ describe('unavailable retry: the pending and kill-failure exceptions (SRJ-306)',
   ])('a timer armed by ErrTmuxKillFailed inside a recovery attempt (refused: no launch follows, nothing counted) is kept by the condition-end entry, and stopped by %s', async (_rule, stop, reason) => {
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
-    const row = modelRow(h, 'ended')
+    // The liveness read answers ErrSystemInstallDisappeared, the one `dead`
+    // reading the restart run kills after (b.jg5 SRJ-110, SRJ-314); its
+    // UNCLASSIFIED answer arms the read-error cause first.
+    const row = modelRow(h, 'ended', installGoneOnce())
     h.script({ killError: errTmuxKillFailed() })
 
     // b.jg5 SRJ-105: the refused kill stops the restart work before its launch.
@@ -3682,13 +3750,13 @@ describe('unavailable retry: the pending and kill-failure exceptions (SRJ-306)',
     expect(callCounts(h)).toEqual({ statusCalls: 1, killCalls: 1 })
     expect(row.spawnedAt).toEqual([])
     expect(getFailureCount(key)).toBe(0)
-    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }])
+    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR }, { key, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }])
     expect(h.controller.view(key)).toEqual({
       phase: 'waiting',
       dueAt: h.clock.now() + waitMs(0),
       waitMs: waitMs(0),
       refusals: 0,
-      causes: [UNAVAILABLE_RETRY_CAUSE_KILL_FAILED],
+      causes: [UNAVAILABLE_RETRY_CAUSE_READ_ERROR, UNAVAILABLE_RETRY_CAUSE_KILL_FAILED],
       mode: UNAVAILABLE_RETRY_MODE_FULL,
     })
     expectKeptThroughEveryConditionEnd(h, key, UNAVAILABLE_RETRY_KEPT_KILL_FAILED)
@@ -3699,10 +3767,13 @@ describe('unavailable retry: the pending and kill-failure exceptions (SRJ-306)',
     expectStopped(h, key)
   })
 
-  test('a full-mode retry whose kill fails with ErrTmuxKillFailed launches nothing and stays in full mode; a later retry whose launch succeeds stays in full mode too, its last row read pending, and the next retry runs the full decision', async () => {
+  test('a full-mode retry whose kill (after an ErrSystemInstallDisappeared liveness read) fails with ErrTmuxKillFailed launches nothing and stays in full mode; a later retry whose launch succeeds stays in full mode too, its last row read pending, and the next retry runs the full decision', async () => {
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
-    const row = modelRow(h, 'ended')
+    // The liveness read answers ErrSystemInstallDisappeared, the one `dead`
+    // reading the restart decision kills after (b.jg5 SRJ-110, SRJ-314); its
+    // UNCLASSIFIED answer arms the read-error cause first.
+    const row = modelRow(h, 'ended', installGoneOnce())
     h.script({ killError: errTmuxKillFailed() })
     h.controller.arm(key, UNAVAILABLE)
 
@@ -3713,7 +3784,7 @@ describe('unavailable retry: the pending and kill-failure exceptions (SRJ-306)',
     expect(callCounts(h)).toEqual({ statusCalls: 1, killCalls: 1 })
     expect(row.spawnedAt).toEqual([])
     expect(getFailureCount(key)).toBe(0)
-    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }])
+    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR }, { key, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }])
     // A refusal gives no again-reason: the re-armed line names the cause.
     expect(retryLinesOf(h, key).at(-1)).toStartWith(`[slack] unavailable-retry: persona=${key} retry 1: ${UNAVAILABLE_RETRY_CAUSE_KILL_FAILED}`)
     expect(retryLinesOf(h, key).at(-1)).toEndWith(` — re-armed, next retry in ${waitMs(1) / 1000} s`)
@@ -3722,20 +3793,26 @@ describe('unavailable retry: the pending and kill-failure exceptions (SRJ-306)',
       dueAt: h.clock.now() + waitMs(1),
       waitMs: waitMs(1),
       refusals: 1,
-      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, UNAVAILABLE_RETRY_CAUSE_KILL_FAILED],
+      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, UNAVAILABLE_RETRY_CAUSE_READ_ERROR, UNAVAILABLE_RETRY_CAUSE_KILL_FAILED],
       mode: UNAVAILABLE_RETRY_MODE_FULL,
     })
 
-    // The next retry's kill answers and its launch succeeds: the kill-failure
-    // cause recorded before keeps the timer out of pending-only mode, the
-    // launch's own pending-only arm (b.jg5 SRJ-301, SRJ-409) included, which
-    // adds only its cause.
+    // The next retry's liveness read finds the row ended, so it launches
+    // with no kill (b.jg5 SRJ-110, SRJ-314), and the launch succeeds: the
+    // kill-failure cause recorded before keeps the timer out of pending-only
+    // mode, the launch's own pending-only arm (b.jg5 SRJ-301, SRJ-409)
+    // included, which adds only its cause.
     h.script({ killError: undefined })
     await retryNow(h, key)
 
-    expect(callCounts(h)).toEqual({ statusCalls: 3, killCalls: 2, spawnCalls: 1 })
+    expect(callCounts(h)).toEqual({ statusCalls: 3, killCalls: 1, spawnCalls: 1 })
+    expectLaunchedWithNoKill(h, key, 'ended')
     expect(row.spawnedAt).toHaveLength(1)
-    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }, { key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
+    expect(h.triggers).toEqual([
+      { key, kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR },
+      { key, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED },
+      { key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW },
+    ])
     expect(retryLinesOf(h, key).at(-1)).toBe(reArmedLine(key, 2, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, 2))
     expect(h.lines.filter((line) => line.includes(' in pending-only mode'))).toEqual([])
     expect(h.controller.view(key)).toEqual({
@@ -3743,7 +3820,7 @@ describe('unavailable retry: the pending and kill-failure exceptions (SRJ-306)',
       dueAt: h.clock.now() + waitMs(2),
       waitMs: waitMs(2),
       refusals: 2,
-      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, UNAVAILABLE_RETRY_CAUSE_KILL_FAILED, UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
+      causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, UNAVAILABLE_RETRY_CAUSE_READ_ERROR, UNAVAILABLE_RETRY_CAUSE_KILL_FAILED, UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
       mode: UNAVAILABLE_RETRY_MODE_FULL,
       lastRow: UNAVAILABLE_RETRY_ROW_PENDING,
     })
@@ -4122,11 +4199,14 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
   ])('a condition that ends after a kill-failure cause, through %s, leaves the timer armed with its due time', async (_what, end, reason, reading) => {
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
-    const row = modelRow(h, 'ended')
-    // A recovery attempt whose kill fails with ErrTmuxKillFailed: the
-    // kill-failure cause, with no launch after it (b.jg5 SRJ-105), and its
-    // ordinary kill-failure alert, the case's one post (b.jg5 SRJ-704): the
-    // condition's end posts nothing beside it.
+    const row = modelRow(h, 'ended', installGoneOnce())
+    // A recovery attempt whose liveness read answers
+    // ErrSystemInstallDisappeared (the read-error cause; the one `dead`
+    // reading the restart run kills after, b.jg5 SRJ-110, SRJ-314) and whose
+    // kill fails with ErrTmuxKillFailed: the kill-failure cause, with no
+    // launch after it (b.jg5 SRJ-105), and its ordinary kill-failure alert,
+    // the case's one post (b.jg5 SRJ-704): the condition's end posts nothing
+    // beside it.
     const killErr = errTmuxKillFailed()
     h.script({ killError: killErr })
     expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
@@ -4136,13 +4216,19 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
     const killAlert = killFailureNotice(key, ordinaryAlertContent(key, { last: killErr }))
     expect(h.episodeNotices).toEqual([killAlert])
     harnessEndCheck = (done) => expect(done.episodeNotices).toEqual([killAlert])
-    // Its retry's kill answers and its launch is refused UNAVAILABLE: the
-    // condition's start, with the kill-failure cause still recorded.
+    // Its retry reads the row ended, so it launches with no kill, and the
+    // launch is refused UNAVAILABLE: the condition's start, with the
+    // kill-failure cause still recorded.
     h.script({ killError: undefined, spawnError: errTmuxUnresponsive('spawn') })
     await retryNow(h, key)
     h.script({ spawnError: undefined })
     expect(row.spawnedAt).toHaveLength(1)
-    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }, { key, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
+    expect(h.stub.calls.killCalls).toHaveLength(1)
+    expect(h.triggers).toEqual([
+      { key, kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR },
+      { key, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED },
+      { key, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE },
+    ])
     expect(h.tmuxUnresponsive.holds(key)).toBe(true)
     const before = h.controller.view(key)!
     expect(before).toEqual({
@@ -4150,7 +4236,7 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
       dueAt: h.clock.now() + waitMs(1),
       waitMs: waitMs(1),
       refusals: 1,
-      causes: [UNAVAILABLE_RETRY_CAUSE_KILL_FAILED, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+      causes: [UNAVAILABLE_RETRY_CAUSE_READ_ERROR, UNAVAILABLE_RETRY_CAUSE_KILL_FAILED, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
       mode: UNAVAILABLE_RETRY_MODE_FULL,
     })
 
@@ -5499,11 +5585,11 @@ describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, i
     for (let n = 0; n < retries; n++) {
       dueAt += waitMs(n)
       await h.advance(dueAt - 1 - h.clock.now())
-      expect([n, row.spawnedAt.length, kills.length]).toEqual([n, n + 1, n])
+      expect([n, row.spawnedAt.length]).toEqual([n, n + 1])
       await h.advance(1)
       await h.settle()
       retryTimes.push(dueAt)
-      expect([n, row.spawnedAt.at(-1), kills.at(-1)]).toEqual([n, dueAt, dueAt])
+      expect([n, row.spawnedAt.at(-1)]).toEqual([n, dueAt])
       expect([n, environmentReArmed(h, key, n + 1, n + 1)]).toEqual([n, [expect.any(String)]])
       expect(h.controller.view(key)).toEqual({
         phase: 'waiting',
@@ -5515,9 +5601,13 @@ describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, i
       })
     }
 
-    // Every spawn and kill came at the arm or a retry's due time.
+    // Every spawn came at the arm or a retry's due time. No retry killed:
+    // each one's liveness read read the row missing, and the restart
+    // decision launches on a row it read finished with no kill (b.jg5
+    // SRJ-110, SRJ-314).
     expect(row.spawnedAt).toEqual([armedAt, ...retryTimes])
-    expect(kills).toEqual(retryTimes)
+    expect(kills).toEqual([])
+    expectLaunchedWithNoKill(h, key, 'missing', retries)
     expect(h.attempts.map((a) => a.at)).toEqual(retryTimes)
     expect(h.stub.calls.deleteCalls).toEqual([])
     expect(getFailureCount(key)).toBe(0)
@@ -5533,10 +5623,12 @@ describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, i
     expectUntouched(h, other)
   })
 
-  test.each<[string, RowState | typeof UNAVAILABLE_RETRY_ROW_ABSENT, Record<string, number>]>([
-    ['reads the row ended (a status success); its kill answers and its spawn answers ErrTmuxNotAvailable', 'ended', { statusCalls: 1, killCalls: 1, spawnCalls: 1 }],
-    ['reads the row missing (a status success); its kill answers and its spawn answers ErrTmuxNotAvailable', 'missing', { statusCalls: 1, killCalls: 1, spawnCalls: 1 }],
-    ['reads no row (status answers ErrSpawnNotFound); its kill answers and its spawn answers ErrTmuxNotAvailable', UNAVAILABLE_RETRY_ROW_ABSENT, { statusCalls: 1, killCalls: 1, spawnCalls: 1 }],
+  test.each<[string, keyof typeof DEAD_READING_OF_ROW, Record<string, number>]>([
+    // No kill: the restart decision launches on a row it read finished or
+    // gone with no kill (b.jg5 SRJ-110, SRJ-314).
+    ['reads the row ended (a status success); it launches with no kill, and its spawn answers ErrTmuxNotAvailable', 'ended', { statusCalls: 1, spawnCalls: 1 }],
+    ['reads the row missing (a status success); it launches with no kill, and its spawn answers ErrTmuxNotAvailable', 'missing', { statusCalls: 1, spawnCalls: 1 }],
+    ['reads no row (status answers ErrSpawnNotFound); it launches with no kill, and its spawn answers ErrTmuxNotAvailable', UNAVAILABLE_RETRY_ROW_ABSENT, { statusCalls: 1, spawnCalls: 1 }],
   ])('AC 27, AC 36: a retry that %s leaves the outage raised with no all-clear and the timer armed at the doubled wait', async (_what, state, calls) => {
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
@@ -5547,6 +5639,7 @@ describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, i
     await retryNow(h, key)
 
     expect(callsSince(h, before)).toEqual(calls)
+    expectLaunchedWithNoKill(h, key, state)
     expect([...getOutageFlags(key)]).toEqual(['tmux-unavailable'])
     expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key)])
     expect(h.outageClears).toEqual([])
@@ -5688,21 +5781,37 @@ describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, i
   ])('with a kill-failure cause recorded, %s clears the outage with one all-clear and leaves the timer armed with its due time', async (_what, clear, reading) => {
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
-    modelRow(h, 'ended')
+    // The restart run's liveness read answers ErrSystemInstallDisappeared
+    // (the read-error cause; the one `dead` reading it kills after, b.jg5
+    // SRJ-110, SRJ-314), and its kill fails with ErrTmuxKillFailed.
+    modelRow(h, 'ended', installGoneOnce())
     h.script({ killError: errTmuxKillFailed() })
     expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
     await h.settle()
+    // The install-gone read raised `ad-unreachable` once; a later read's
+    // success clears it, as here, so only the `tmux-unavailable` outage's
+    // posts are read below.
+    expect(adUnreachableOnsets(h)).toHaveLength(1)
+    clearOutageFlag(key, 'ad-unreachable')
+    const noticesBefore = h.outageNotices.length
     // The outage is raised by a read-pane outside every attempt.
     h.script({ killError: undefined, readPaneError: errTmuxNotAvailable(undefined, 'read-pane') })
     await expect(readPaneSucceeds(h, key)).rejects.toThrow()
     h.script({ readPaneError: undefined })
-    expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }, { key, kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT }])
+    expect(h.triggers).toEqual([
+      { key, kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR },
+      { key, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED },
+      { key, kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT },
+    ])
     const before = h.controller.view(key)!
-    expect(before).toMatchObject({ phase: 'waiting', causes: [UNAVAILABLE_RETRY_CAUSE_KILL_FAILED, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT] })
+    expect(before).toMatchObject({
+      phase: 'waiting',
+      causes: [UNAVAILABLE_RETRY_CAUSE_READ_ERROR, UNAVAILABLE_RETRY_CAUSE_KILL_FAILED, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
+    })
 
     await clear(h, key)
 
-    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key), tmuxUnavailableAllClear(key)])
+    expect(h.outageNotices.slice(noticesBefore)).toEqual([tmuxUnavailableOnset(key), tmuxUnavailableAllClear(key)])
     expect(h.outageClears).toEqual([{ key, reading, result: 'kept' }])
     expect(retryLinesOf(h, key).at(-1)).toBe(keptLine(key, UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED, UNAVAILABLE_RETRY_KEPT_KILL_FAILED))
     expect(h.controller.view(key)).toEqual({ ...before, ...(reading !== undefined ? { lastRow: reading } : {}) })
@@ -5846,54 +5955,66 @@ describe('unavailable retry: a re-bound tmux socket gives SRJ-1021’s onset and
 // ---------------------------------------------------------------------------
 
 describe('unavailable retry: a kill of the last session on a socket, then answers from a tmux server that is exiting (AD handoff rev 23)', () => {
-  test('ErrTmuxNotAvailable after the kill: one onset for the episode however many calls answer it, the retries on the backoff with nothing counted, deleted or launched while it lasts, one all-clear when tmux answers, the timer stopped once the persona is up; a later episode posts its own onset', async () => {
+  test('ErrTmuxNotAvailable after the kill (made after an ErrSystemInstallDisappeared liveness read): one onset for the episode however many calls answer it, the retries on the backoff, each launching with no kill, with nothing counted, deleted or brought up while it lasts, one all-clear when tmux answers, the timer stopped once the persona is up; a later episode posts its own onset', async () => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
     const [key, other] = h.keys as [string, string]
-    const row = modelRow(h, 'ended')
+    const row = modelRow(h, 'ended', installGoneOnce())
     const kills = recordKills(h)
 
-    // The restart kills the persona's session, the last on its socket (the
-    // kill answers); the tmux server exits and the launch's spawn answers
-    // ErrTmuxNotAvailable.
+    // The restart run's liveness read answers ErrSystemInstallDisappeared,
+    // the one `dead` reading it kills after (b.jg5 SRJ-110, SRJ-314; it arms
+    // the read-error cause and raises `ad-unreachable`). It kills the
+    // persona's session, the last on its socket (the kill answers); the tmux
+    // server exits and the launch's spawn answers ErrTmuxNotAvailable.
     h.script({ spawnError: errTmuxNotAvailable() })
     const killedAt = h.clock.now()
     expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
     await h.settle()
     expect(kills).toEqual([killedAt])
     expect(row.spawnedAt).toEqual([killedAt])
-    expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT)
-    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key)])
+    const causes = [UNAVAILABLE_RETRY_CAUSE_READ_ERROR, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT]
+    expect(h.triggers).toEqual(causes.map((kind) => ({ key, kind })))
+    expect(h.controller.view(key)).toMatchObject({ dueAt: killedAt + waitMs(0), refusals: 0, causes })
+    // The kill's answer cleared `ad-unreachable` before the spawn raised
+    // `tmux-unavailable`: two bad stretches, each with its own posts.
+    const adEpisode = adUnreachableEpisode(h, key)
+    expect(h.outageNotices).toEqual([...adEpisode, tmuxUnavailableOnset(key)])
 
     // More calls on the socket answer it while the server exits: a read-pane
-    // outside every attempt, and each retry's kill. None posts again; the
-    // trigger keeps the due time.
-    h.script({ killError: errTmuxNotAvailable(undefined, 'kill'), readPaneError: errTmuxNotAvailable(undefined, 'read-pane') })
+    // outside every attempt, and each retry's spawn (each retry reads the
+    // row ended, so it launches with no kill). None posts again; the trigger
+    // keeps the due time.
+    h.script({ readPaneError: errTmuxNotAvailable(undefined, 'read-pane') })
     await expect(readPaneSucceeds(h, key)).rejects.toThrow()
     expect(h.controller.view(key)).toMatchObject({ dueAt: killedAt + waitMs(0), refusals: 0 })
     let dueAt = killedAt
+    const retryTimes: number[] = []
     for (let n = 0; n < 2; n++) {
       dueAt += waitMs(n)
       await h.advance(dueAt - 1 - h.clock.now())
       expect(h.attempts).toHaveLength(n)
       await retryNow(h, key)
-      expect(h.attempts.at(-1)).toEqual({ key, retry: n + 1, causes: [UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT], mode: UNAVAILABLE_RETRY_MODE_FULL, at: dueAt })
+      retryTimes.push(dueAt)
+      expect(h.attempts.at(-1)).toEqual({ key, retry: n + 1, causes, mode: UNAVAILABLE_RETRY_MODE_FULL, at: dueAt })
       expect(environmentReArmed(h, key, n + 1, n + 1)).toHaveLength(1)
     }
-    // Each refused kill stopped its retry: no spawn followed it.
-    expect(kills).toEqual([killedAt, killedAt + waitMs(0), killedAt + waitMs(0) + waitMs(1)])
-    expect(row.spawnedAt).toEqual([killedAt])
-    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key)])
+    // Each refused spawn stopped its retry; no retry killed.
+    expect(kills).toEqual([killedAt])
+    expectLaunchedWithNoKill(h, key, 'ended', 2)
+    expect(row.spawnedAt).toEqual([killedAt, ...retryTimes])
+    expect(h.outageNotices).toEqual([...adEpisode, tmuxUnavailableOnset(key)])
     expect(h.outageClears).toEqual([])
 
-    // tmux answers again: the next retry's kill and spawn succeed. The
-    // spawn's success clears the outage with one all-clear; its pending row
-    // keeps the timer, now pending-only.
-    h.script({ killError: undefined, readPaneError: undefined, spawnError: undefined })
+    // tmux answers again: the next retry's spawn succeeds. The spawn's
+    // success clears the outage with one all-clear; its pending row keeps
+    // the timer, now pending-only.
+    h.script({ readPaneError: undefined, spawnError: undefined })
     dueAt += waitMs(2)
     expect(await retryNow(h, key)).toBe(dueAt)
-    expect(row.spawnedAt).toEqual([killedAt, dueAt])
-    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key), tmuxUnavailableAllClear(key)])
+    expect(kills).toEqual([killedAt])
+    expect(row.spawnedAt).toEqual([killedAt, ...retryTimes, dueAt])
+    expect(h.outageNotices).toEqual([...adEpisode, tmuxUnavailableOnset(key), tmuxUnavailableAllClear(key)])
     expect(h.outageClears).toEqual([{ key, reading: UNAVAILABLE_RETRY_ROW_PENDING, result: 'deferred' }])
     expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', dueAt: dueAt + waitMs(3), refusals: 3, mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
 
@@ -5916,37 +6037,44 @@ describe('unavailable retry: a kill of the last session on a socket, then answer
     // own onset and arm, and its own all-clear.
     h.script({ readPaneError: errTmuxNotAvailable(undefined, 'read-pane') })
     await expect(readPaneSucceeds(h, key)).rejects.toThrow()
-    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key), tmuxUnavailableAllClear(key), tmuxUnavailableOnset(key)])
+    expect(h.outageNotices).toEqual([...adEpisode, tmuxUnavailableOnset(key), tmuxUnavailableAllClear(key), tmuxUnavailableOnset(key)])
     expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', dueAt: h.clock.now() + waitMs(0), refusals: 0, causes: [UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT] })
     tickClear(key)
-    expect(h.outageNotices).toEqual([tmuxUnavailableOnset(key), tmuxUnavailableAllClear(key), tmuxUnavailableOnset(key), tmuxUnavailableAllClear(key)])
+    expect(h.outageNotices).toEqual([...adEpisode, tmuxUnavailableOnset(key), tmuxUnavailableAllClear(key), tmuxUnavailableOnset(key), tmuxUnavailableAllClear(key)])
     expectStopped(h, key)
     expectUntouched(h, other)
-    // b.jg5 SRJ-702: the restart path's kill (one try, its dead seed) and
-    // every ENVIRONMENT answer call for no kill-failure alert; nothing latched.
+    // b.jg5 SRJ-702: the restart path's one kill, which answered, and every
+    // ENVIRONMENT answer call for no kill-failure alert; nothing latched.
     expect(killFailureDecisionLines(h)).toEqual([])
     expect(h.latch.isLatched(key)).toBe(false)
   })
 
-  test('ErrTmuxUnresponsive after the kill: the tmux-unresponsive condition, not the outage, with the retries on the backoff and nothing counted, deleted or launched while it lasts; each post at most once, and the timer stopped once the persona is up', async () => {
+  test('ErrTmuxUnresponsive after the kill (made after an ErrSystemInstallDisappeared liveness read): the tmux-unresponsive condition, not the tmux-unavailable outage, with the retries on the backoff, each launching with no kill, and nothing counted, deleted or brought up while it lasts; each post at most once, and the timer stopped once the persona is up', async () => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     const [key, other] = h.keys as [string, string]
-    const row = modelRow(h, 'ended')
+    const row = modelRow(h, 'ended', installGoneOnce())
     const kills = recordKills(h)
 
+    // The restart run's liveness read answers ErrSystemInstallDisappeared,
+    // the one `dead` reading it kills after (b.jg5 SRJ-110, SRJ-314; it arms
+    // the read-error cause, and raises `ad-unreachable` until the kill
+    // answers); the kill answers, and the launch's spawn answers
+    // ErrTmuxUnresponsive.
     h.script({ spawnError: errTmuxUnresponsive('spawn') })
     const killedAt = h.clock.now()
     expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
     await h.settle()
     expect(kills).toEqual([killedAt])
     expect(row.spawnedAt).toEqual([killedAt])
-    expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)
+    const causes = [UNAVAILABLE_RETRY_CAUSE_READ_ERROR, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE]
+    expect(h.triggers).toEqual(causes.map((kind) => ({ key, kind })))
+    expect(h.controller.view(key)).toMatchObject({ dueAt: killedAt + waitMs(0), refusals: 0, causes })
     expect(h.tmuxUnresponsive.firstRefusalAt(key)).toBe(killedAt)
 
-    // Each retry's kill answers ErrTmuxUnresponsive while the server exits:
-    // refused, no spawn. The retries run past the onset floor and one more,
-    // so the onset is posted at the first retry at or past it, and only then.
-    h.script({ killError: errTmuxUnresponsive('kill') })
+    // Each retry reads the row ended and launches with no kill, and its spawn
+    // answers ErrTmuxUnresponsive while the server exits: refused. The
+    // retries run past the onset floor and one more, so the onset is posted
+    // at the first retry at or past it, and only then.
     const onset = { key, text: tmuxUnresponsiveOnsetText(key) }
     let dueAt = killedAt
     let onsetAt: number | undefined
@@ -5960,16 +6088,19 @@ describe('unavailable retry: a kill of the last session on a socket, then answer
       expect([n, h.episodeNotices]).toEqual([n, onsetAt === undefined ? [] : [onset]])
     }
     const refused = h.attempts.length
-    expect(row.spawnedAt).toEqual([killedAt])
+    expect(row.spawnedAt).toEqual([killedAt, ...h.attempts.map((attempt) => attempt.at)])
+    expect(kills).toEqual([killedAt])
+    expectLaunchedWithNoKill(h, key, 'ended', refused)
     expect(h.tmuxUnresponsive.holds(key)).toBe(true)
     expect(h.tmuxUnresponsive.firstRefusalAt(key)).toBe(killedAt)
 
-    // tmux answers again: the retry's kill and spawn succeed; the spawn ends
-    // the condition with its pending row (one recovery), keeping the timer.
-    h.script({ killError: undefined, spawnError: undefined })
+    // tmux answers again: the retry's spawn succeeds; it ends the condition
+    // with its pending row (one recovery), keeping the timer.
+    h.script({ spawnError: undefined })
     dueAt += waitMs(refused)
     expect(await retryNow(h, key)).toBe(dueAt)
-    expect(row.spawnedAt).toEqual([killedAt, dueAt])
+    expect(row.spawnedAt).toEqual([killedAt, ...h.attempts.slice(0, refused).map((attempt) => attempt.at), dueAt])
+    expect(kills).toEqual([killedAt])
     expect(h.tmuxUnresponsive.holds(key)).toBe(false)
     expect(h.conditionEnds).toEqual([{ key, reading: UNAVAILABLE_RETRY_ROW_PENDING, result: 'deferred' }])
     expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
@@ -5978,9 +6109,10 @@ describe('unavailable retry: a kill of the last session on a socket, then answer
     await retryNow(h, key)
     expectStopped(h, key)
 
-    // One onset and one recovery, and never the outage's posts.
+    // One onset and one recovery, and never the `tmux-unavailable` outage's
+    // posts: only the install-gone read's `ad-unreachable` pair.
     expect(h.episodeNotices).toEqual([onset, { key, text: tmuxUnresponsiveRecoveryText(key) }])
-    expect(h.outageNotices).toEqual([])
+    expect(h.outageNotices).toEqual(adUnreachableEpisode(h, key))
     expect(h.outageClears).toEqual([])
     expect(getFailureCount(key)).toBe(0)
     expect(h.capReached).toEqual([])
@@ -6446,13 +6578,15 @@ describe('unavailable retry: CONFIG arms from any verb in any context, takes no 
     expectUntouched(h, other)
 
     // The file is fixed: the next retry reads the row missing (the status
-    // success clears the outage), and the restart path kills and launches.
+    // success clears the outage), and the restart path launches with no kill
+    // (b.jg5 SRJ-110, SRJ-314).
     config.fix()
     dueAt += waitMs(retries)
     const before = callCounts(h)
     expect(await retryNow(h, key)).toBe(dueAt)
 
-    expect(callsSince(h, before)).toEqual({ statusCalls: 2, killCalls: 1, spawnCalls: 1 })
+    expect(callsSince(h, before)).toEqual({ statusCalls: 2, spawnCalls: 1 })
+    expectLaunchedWithNoKill(h, key, 'missing')
     expect(config.row.spawnedAt).toEqual([armedAt, dueAt])
     expect(h.outageNotices).toEqual([configOnset(key, config.err), configAllClear(key)])
     expect(getOutageFlags(key).size).toBe(0)
@@ -6581,17 +6715,19 @@ async function unclassifiedLaunch(h: RecoveryHarness, key: string, err: Error): 
 /**
  * Nothing destructive or counted for persona `key`: no delete, no failure
  * counted and no cap reached, no spawn-failure notice or startup entry, and
- * no outage or `tmux-unresponsive` condition or post.
+ * no outage or `tmux-unresponsive` condition or post. With `adUnreachable`,
+ * the one outage is the `ad-unreachable` an ErrSystemInstallDisappeared
+ * liveness read raised: its one onset, its flag still raised.
  */
-function expectNeverDestructive(h: RecoveryHarness, key: string): void {
+function expectNeverDestructive(h: RecoveryHarness, key: string, adUnreachable = false): void {
   expect(h.stub.calls.deleteCalls).toEqual([])
   expect(getFailureCount(key)).toBe(0)
   expect(isAtCap(key, RESTART_FAILURE_CAP)).toBe(false)
   expect(h.capReached).toEqual([])
   expect(h.notices).toEqual([])
   expect(h.startupErrors()).toEqual([])
-  expect(h.outageNotices).toEqual([])
-  expect(getOutageFlags(key).size).toBe(0)
+  expect(h.outageNotices).toEqual(adUnreachable ? adUnreachableEpisode(h, key).slice(0, 1) : [])
+  expect([...getOutageFlags(key)]).toEqual(adUnreachable ? ['ad-unreachable'] : [])
   expect(h.tmuxUnresponsive.holds(key)).toBe(false)
   expect(conditionLines(h, key)).toEqual([])
 }
@@ -6611,6 +6747,13 @@ interface UnclassifiedAttempt {
   readonly verb: string
   /** The persona's row before any spawn. */
   readonly row: RowState | typeof UNAVAILABLE_RETRY_ROW_ABSENT
+  /**
+   * True when every `status` answers ErrSystemInstallDisappeared, the one
+   * `dead` reading the restart run kills after (b.jg5 SRJ-110, SRJ-314): it
+   * arms the read-error cause before the outcome's, and raises
+   * `ad-unreachable`, which the refused call never clears.
+   */
+  readonly installGone?: true
   /** The stub's answer of that verb. */
   readonly script: (err: Error) => RecoveryStubScript
   /** Run the first attempt for persona `key`; it meets the outcome and is refused. */
@@ -6630,12 +6773,14 @@ const UNCLASSIFIED_ATTEMPTS: ReadonlyArray<readonly [string, UnclassifiedAttempt
       expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
     },
     firstCalls: { spawnCalls: 1 },
-    // The dead reading's kill comes before the relaunch; the refused spawn is the retry's last call.
-    retryCalls: { statusCalls: 1, killCalls: 1, spawnCalls: 1 },
+    // The dead reading (no row) launches with no kill (b.jg5 SRJ-110,
+    // SRJ-314); the refused spawn is the retry's last call.
+    retryCalls: { statusCalls: 1, spawnCalls: 1 },
   }],
-  ['a restart-run recovery (its kill of an ended row)', {
+  ['a restart-run recovery (its kill after an ErrSystemInstallDisappeared liveness read)', {
     verb: 'kill',
     row: 'ended',
+    installGone: true,
     script: (err) => ({ killError: err }),
     run: async (h, key) => {
       expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
@@ -6666,14 +6811,18 @@ describe('unavailable retry: UNCLASSIFIED outcomes are never destructive or coun
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
     const [key, other] = h.keys as [string, string]
     const err = make(attempt.verb)
-    modelRow(h, attempt.row)
+    modelRow(h, attempt.row, attempt.installGone === true ? () => errSystemInstallDisappeared('status') : undefined)
     h.script(attempt.script(err))
     const armedAt = h.clock.now()
+    const causes = attempt.installGone === true ? [UNAVAILABLE_RETRY_CAUSE_READ_ERROR, UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED] : [UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED]
 
     await attempt.run(h, key)
 
     expect(callCounts(h)).toEqual(attempt.firstCalls)
-    expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED)
+    expect(h.triggers).toEqual(causes.map((kind) => ({ key, kind })))
+    expect(h.controller.armedKeys()).toEqual([key])
+    expect(h.controller.view(key)).toEqual({ phase: 'waiting', dueAt: armedAt + waitMs(0), waitMs: waitMs(0), refusals: 0, causes, mode: UNAVAILABLE_RETRY_MODE_FULL })
+    expect(delays(h.clock)).toEqual([waitMs(0)])
     expect(h.unclassifiedErrorOpen(key)).toBe(true)
     expect(unclassifiedLines(h, key)).toEqual([unclassifiedStartedLine(key, err)])
 
@@ -6693,13 +6842,13 @@ describe('unavailable retry: UNCLASSIFIED outcomes are never destructive or coun
         dueAt: dueAt + waitMs(n + 1),
         waitMs: waitMs(n + 1),
         refusals: n + 1,
-        causes: [UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED],
+        causes,
         mode: UNAVAILABLE_RETRY_MODE_FULL,
       }])
     }
 
-    expect(h.triggers).toEqual(Array.from({ length: retries + 1 }, () => ({ key, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED })))
-    expectNeverDestructive(h, key)
+    expect(h.triggers).toEqual(Array.from({ length: retries + 1 }, () => causes.map((kind) => ({ key, kind }))).flat())
+    expectNeverDestructive(h, key, attempt.installGone)
     // The episode lasts through every retry and posts its one alert.
     expect(h.unclassifiedErrorOpen(key)).toBe(true)
     expect(h.episodeNotices).toEqual([unclassifiedAlert(key, err)])
@@ -6855,8 +7004,9 @@ describe('unavailable retry: UNCLASSIFIED outcomes are never destructive or coun
 // reads P's row `ended` with no session id, `resume` answers
 // `ErrNoSessionId`, and the reuse spawn of the same id answers as the case
 // sets it, on every launch (`noSessionIdReuse`). Each retry runs the restart
-// path's decision on the `ended` row: its liveness read, the kill of the
-// dead row and the launch, which ends at that reuse. Nothing is deleted.
+// path's decision on the `ended` row: its liveness read and the launch,
+// which ends at that reuse, with no kill (a row read `ended` is never
+// killed, b.jg5 SRJ-110, SRJ-314). Nothing is deleted.
 // ---------------------------------------------------------------------------
 
 /** The reuse spawn's answer at `noSessionIdReuse`'s site: an error, or success when it gives none. */
@@ -6917,8 +7067,11 @@ function noSessionIdReuse(h: RecoveryHarness, key: string, make: () => Error): N
 /** The calls of the bring-up's launch to the refused reuse: the colliding spawn, the collision get, the resume and the reuse spawn. */
 const NO_SESSION_ID_REUSE_LAUNCH = { spawnCalls: 2, getCalls: 1, resumeCalls: 1 } as const
 
-/** The calls of each retry: its liveness read, the kill of the dead row, then the launch to the reuse. */
-const NO_SESSION_ID_REUSE_RETRY = { statusCalls: 1, killCalls: 1, ...NO_SESSION_ID_REUSE_LAUNCH } as const
+/**
+ * The calls of each retry: its liveness read, then the launch to the reuse.
+ * No kill: the read found the row finished (b.jg5 SRJ-110, SRJ-314).
+ */
+const NO_SESSION_ID_REUSE_RETRY = { statusCalls: 1, ...NO_SESSION_ID_REUSE_LAUNCH } as const
 
 /**
  * The bring-up's launch to a reuse refused UNAVAILABLE: the refused reuse is
@@ -6927,8 +7080,8 @@ const NO_SESSION_ID_REUSE_RETRY = { statusCalls: 1, killCalls: 1, ...NO_SESSION_
  */
 const NO_SESSION_ID_REUSE_UNAVAILABLE_LAUNCH = { ...NO_SESSION_ID_REUSE_LAUNCH, getCalls: NO_SESSION_ID_REUSE_LAUNCH.getCalls + 1 } as const
 
-/** Each retry whose launch reaches a reuse refused UNAVAILABLE: its liveness read, the kill of the dead row, then that launch. */
-const NO_SESSION_ID_REUSE_UNAVAILABLE_RETRY = { statusCalls: 1, killCalls: 1, ...NO_SESSION_ID_REUSE_UNAVAILABLE_LAUNCH } as const
+/** Each retry whose launch reaches a reuse refused UNAVAILABLE: its liveness read, then that launch (no kill, as above). */
+const NO_SESSION_ID_REUSE_UNAVAILABLE_RETRY = { statusCalls: 1, ...NO_SESSION_ID_REUSE_UNAVAILABLE_LAUNCH } as const
 
 describe('unavailable retry: the no-transcript reuse spawn after resume’s ErrNoSessionId, refused UNCLASSIFIED or UNAVAILABLE, is retried at each due time and never counted (SRJ-313, SRJ-112, SRJ-707, AC 69)', () => {
   test('AC 69: an ErrInternal from the reuse at every retry, with both settings 0: no delete, no condition post and no spawn-failure notice; never counted past the restart cap; a retry at each due time; exactly one alert, at the first retry strictly past the alert threshold in effect; once the reuse succeeds P is up and its timer stops', async () => {
@@ -7303,11 +7456,13 @@ describe('unavailable retry: a latch stops the timer and ends the unclassified-e
     expect(await retryNow(h, key)).toBe(armedAt + waitMs(0))
     h.script({ spawnError: refusal })
 
-    // The liveness read, the kill of the dead reading and the spawn; after the
-    // CONFLICT no kill, delete, resume or second spawn (at most a status read).
+    // The liveness read and the spawn, with no kill before it (the read found
+    // no row, b.jg5 SRJ-110, SRJ-314); after the CONFLICT no kill, delete,
+    // resume or second spawn (at most a status read).
     const since = callsSince(h, before)
-    expect(since).toMatchObject({ killCalls: 1, spawnCalls: 1 })
-    expect(Object.keys(since).sort()).toEqual(['killCalls', 'spawnCalls', 'statusCalls'])
+    expect(since).toMatchObject({ spawnCalls: 1 })
+    expect(Object.keys(since).sort()).toEqual(['spawnCalls', 'statusCalls'])
+    expectLaunchedWithNoKill(h, key, UNAVAILABLE_RETRY_ROW_ABSENT)
     expectLatchedOnce(h, key, err, LATCH_ROW_STATE_NO_ROW)
     expect(h.stops).toEqual([{ key, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
     expect(retryLinesOf(h, key).at(-1)).toBe(stoppedLine(key, UNAVAILABLE_RETRY_STOP_LATCHED))
@@ -8132,7 +8287,10 @@ describe('unavailable retry: the live-row sequence — SRJ-316\'s pending-row le
     const fixed = callCounts(h)
     await retryNow(h, key)
 
-    expect(callsSince(h, fixed)).toEqual({ statusCalls: 2, killCalls: 1, spawnCalls: 1 })
+    // The row reads missing: the restart path launches with no kill (b.jg5
+    // SRJ-110, SRJ-314).
+    expect(callsSince(h, fixed)).toEqual({ statusCalls: 2, spawnCalls: 1 })
+    expectLaunchedWithNoKill(h, key, 'missing')
     expect(h.outageNotices).toEqual([configOnset(key, config.err), configAllClear(key)])
     expect(getOutageFlags(key).size).toBe(0)
     expect(getFailureCount(key)).toBe(0)
@@ -8734,12 +8892,13 @@ describe('unavailable retry: the ErrInvalidFlags hold stops the timer, no retry 
   // stop goes through the stop entry, which no exception keeps.
   test.each<[string, (h: RecoveryHarness, key: string) => Promise<void>]>([
     ['armed with the kill-failure cause (a refused ErrTmuxKillFailed)', async (h, key) => {
-      modelRow(h, 'ended')
+      modelRow(h, 'ended', installGoneOnce())
       h.script({ killError: errTmuxKillFailed() })
       expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
       await h.settle()
       h.script({ killError: undefined })
-      expect(h.controller.view(key)?.causes).toEqual([UNAVAILABLE_RETRY_CAUSE_KILL_FAILED])
+      // The install-gone liveness read the kill follows armed the read-error cause first.
+      expect(h.controller.view(key)?.causes).toEqual([UNAVAILABLE_RETRY_CAUSE_READ_ERROR, UNAVAILABLE_RETRY_CAUSE_KILL_FAILED])
     }],
     // No row model: a `pending` model would answer the hold's collision `get`
     // with a covered `pending` row instead of its finished one.

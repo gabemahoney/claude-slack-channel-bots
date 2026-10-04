@@ -89,7 +89,9 @@
  * call or delete for P and count nothing, the retry timer stopping latched;
  * Q launches and reconnects as before.
  * The kill as a latch site (SRJ-110, SRJ-505, AC 9; E20): P's restart run's
- * kill of its dead row, or the step-1 kill of the live-row sequence P's
+ * kill after a liveness read of ErrSystemInstallDisappeared (a row read
+ * `ended` launches with no kill, SRJ-314), or the step-1 kill of the
+ * live-row sequence P's
  * launch starts at a collision ladder replacement site over a row read
  * `waiting` in another directory (the ladder makes
  * no kill of its own, b.jg5 SRJ-707), answers CONFLICT "not this launch's
@@ -520,6 +522,7 @@ import {
   errNoSessionId,
   errSpawnNotFound,
   errSpawnNotResumable,
+  errSystemInstallDisappeared,
   errTmuxCaptureFailed,
   errTmuxSendKeys,
   errTmuxSessionConflict,
@@ -1961,6 +1964,8 @@ interface AutomatedPathsRun {
   readonly readPending: (key: string, pending?: boolean) => void
   /** Persona `key`'s `status` answers `err` from now on. */
   readonly failStatus: (key: string, err: Error) => void
+  /** Persona `key`'s next `status` answers `err`; the reads above follow it. */
+  readonly failStatusOnce: (key: string, err: Error) => void
 }
 
 /**
@@ -1988,6 +1993,7 @@ function makeAutomatedPathsRun(options: Omit<RecoveryHarnessOptions, 'restartDep
   const noLaunchStart = new Set<string>()
   const pending = new Set<string>()
   const statusErrors = new Map<string, Error>()
+  const statusErrorsOnce = new Map<string, Error>()
   const spawn = h.stub.client.spawn.bind(h.stub.client)
   h.stub.client.spawn = async (params) => {
     const result = await spawn(params)
@@ -1997,6 +2003,11 @@ function makeAutomatedPathsRun(options: Omit<RecoveryHarnessOptions, 'restartDep
   h.script({
     statusFn: (params) => {
       const id = String(params.claude_instance_id)
+      const once = statusErrorsOnce.get(id)
+      if (once !== undefined) {
+        statusErrorsOnce.delete(id)
+        return once
+      }
       const err = statusErrors.get(id)
       if (err !== undefined) return err
       if (noLaunchStart.has(id)) return cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE })
@@ -2015,6 +2026,7 @@ function makeAutomatedPathsRun(options: Omit<RecoveryHarnessOptions, 'restartDep
       else pending.delete(personaInstanceId(key))
     },
     failStatus: (key, err) => statusErrors.set(personaInstanceId(key), err),
+    failStatusOnce: (key, err) => statusErrorsOnce.set(personaInstanceId(key), err),
   }
 }
 
@@ -2051,8 +2063,13 @@ function captureTimer(kind: 'setTimeout' | 'setInterval', arm: () => void): () =
 /** The stub's launch answers back to their defaults (the row reads stay). */
 const CLEARED: RecoveryStubScript = { spawnError: undefined, spawnQueue: undefined, getResult: undefined, resumeError: undefined, readPaneError: undefined }
 
-/** One relaunch of a dead row: its liveness read, the kill, the spawn and the launch's own read. */
-const RELAUNCH = { statusCalls: 2, killCalls: 1, spawnCalls: 1 }
+/**
+ * One relaunch of a row read `ended`: its liveness read, the spawn and the
+ * launch's own read. No kill: the liveness read read the row finished, and
+ * no automated path kills a row it has just read `ended` (b.jg5 SRJ-110,
+ * SRJ-314, option A).
+ */
+const RELAUNCH = { statusCalls: 2, spawnCalls: 1 }
 
 /** The latch's reaction to one set of P, as `latchSteps` reads it: the set, the three holds in order, then the notice. */
 const oneLatch = (key: string) => [
@@ -2687,7 +2704,9 @@ describe('SRJ-118, SRJ-505: a CONFLICT or UNUSABLE NAME at the reconnect\'s send
 // ---------------------------------------------------------------------------
 // b.jg5 SRJ-110, SRJ-505 (AC 9), SRJ-501, SRJ-502, SRJ-512, SRJ-613: a kill is
 // a latch site (E20; the E13, E16 and E19 hatch notes). P's restart run kills
-// its dead row, or the live-row sequence P's launch starts at a collision
+// after its liveness read answers ErrSystemInstallDisappeared (the one `dead`
+// reading that reads no row, and so the only one its kill follows: SRJ-110,
+// SRJ-314), or the live-row sequence P's launch starts at a collision
 // ladder replacement site (a row of P's read `waiting` in another directory;
 // b.jg5 SRJ-707) kills it at its step 1, and the
 // kill answers CONFLICT
@@ -2700,9 +2719,20 @@ describe('SRJ-118, SRJ-505: a CONFLICT or UNUSABLE NAME at the reconnect\'s send
 // paths go on.
 // ---------------------------------------------------------------------------
 
+/**
+ * The restart run's checked kill for P: P's next liveness read answers
+ * ErrSystemInstallDisappeared, the only `dead` reading the restart path kills
+ * after (a row read `ended` launches with no kill), and the kill answers `err`.
+ */
+async function restartRunKillAnswering({ h, failStatusOnce }: AutomatedPathsRun, key: string, err: Error): Promise<void> {
+  failStatusOnce(key, errSystemInstallDisappeared('status'))
+  h.script({ killError: err })
+  expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_LATCHED)
+}
+
 /** How P's kill latches: [label, P's expected record, P's one post, the latching call (P's retry timer armed before it)]. */
 const KILL_LATCH_WAYS: ReadonlyArray<
-  readonly [string, (key: string) => ConflictLatchRecord, (key: string) => string, (h: RecoveryHarness, key: string) => Promise<void>]
+  readonly [string, (key: string) => ConflictLatchRecord, (key: string) => string, (run: AutomatedPathsRun, key: string) => Promise<void>]
 > = [
   ...RESTART_KILL_CONFLICT_CASE_ROWS.filter((row) => row.latchCase === LATCH_CASE_NOT_THIS_LAUNCH).map((row) => [
     `the restart run's kill: CONFLICT (${row.name})`,
@@ -2715,10 +2745,7 @@ const KILL_LATCH_WAYS: ReadonlyArray<
         description: row.build().errDescription,
       }),
     () => row.notice.text,
-    async (h: RecoveryHarness, key: string) => {
-      h.script({ killError: row.build() })
-      expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_LATCHED)
-    },
+    (run: AutomatedPathsRun, key: string) => restartRunKillAnswering(run, key, row.build()),
   ] as const),
   ...sequenceKillConflictRowsAt(SEQUENCE_STEP1_KILL_SITE, 'waiting').filter((row) => row.latchCase === LATCH_CASE_NOT_THIS_LAUNCH).map((row) => [
     `the step-1 kill of the live-row sequence P's launch starts over a row read waiting in another directory: CONFLICT (${row.name})`,
@@ -2731,7 +2758,7 @@ const KILL_LATCH_WAYS: ReadonlyArray<
         description: row.build().errDescription,
       }),
     () => row.notice.text,
-    async (h: RecoveryHarness, key: string) => {
+    async ({ h }: AutomatedPathsRun, key: string) => {
       h.script({ ...collided(h, personaOf(h, key), { cwd: h.home, state: 'waiting' }), killError: row.build() })
       expect(await h.launch(key)).toEqual({ key, action: 'sequence-waiting' })
       expect(await h.driveSequence(h.sequenceSettled(key))).toMatchObject({ kind: LIVE_ROW_OUTCOME_ABORTED, latched: true })
@@ -2743,10 +2770,7 @@ const KILL_LATCH_WAYS: ReadonlyArray<
     `the restart run's kill: UNUSABLE NAME (${row.name})`,
     (key: string) => row.record(key),
     (key: string) => row.notice(key),
-    async (h: RecoveryHarness, key: string) => {
-      h.script({ killError: row.build() })
-      expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_LATCHED)
-    },
+    (run: AutomatedPathsRun, key: string) => restartRunKillAnswering(run, key, row.build()),
   ] as const),
 ]
 
@@ -2758,7 +2782,7 @@ describe('SRJ-110, SRJ-505 (AC 9): a CONFLICT or UNUSABLE NAME at P\'s kill hold
     const [p, q] = h.keys as [string, string]
     h.controller.arm(p, { kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR })
 
-    await latch(h, p)
+    await latch(run, p)
     await h.settle()
 
     expect(h.latch.record(p)).toEqual(record(p))
