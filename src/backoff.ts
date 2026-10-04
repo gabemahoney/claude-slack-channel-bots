@@ -65,8 +65,9 @@ export function recordSuccess(key: string): void {
 
 /**
  * Forget persona `key`'s consecutive-failure count and cap-notified latch
- * (b.av2 SR-6.5, a teardown): the same reset as `recordSuccess`, but not a
- * success. No other persona's state changes; logs and posts nothing.
+ * (b.av2 SR-6.5, a teardown; b.jg5 SRJ-509, a clear by hand that clears the
+ * persona's latch): the same reset as `recordSuccess`, but not a success. No
+ * other persona's state changes; logs and posts nothing.
  */
 export function forgetFailures(key: string): void {
   failureCounts.delete(key)

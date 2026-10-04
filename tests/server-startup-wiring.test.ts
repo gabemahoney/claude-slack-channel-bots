@@ -254,7 +254,9 @@
  *   calls), bound to a const in main()'s own statement list, over exactly
  *   the one latch, the system clock, the one persona lifecycle serializer's
  *   run (the restart module's), the applied configuration read at each round,
- *   the server log and the one notice episodes instance, after the latch's
+ *   the server log, the one notice episodes instance, the relaunch gate, the
+ *   restart cap over the one failure counter (bug b.xkd) and that counter's
+ *   reset, `forgetFailures`, for the clear by hand (bug b.ebi), after the latch's
  *   holds and CONFLICT notice are bound and before the start pass; it is bound
  *   to the latch once (`bindLatchRecheck`), after both, with no await since
  *   its build. server.ts builds no re-check controller, round or clear of its
@@ -3984,6 +3986,7 @@ describe('main() builds the latch re-check once, through the session manager\'s 
   const EPISODES: keyof LatchRecheckInput = 'episodes'
   const CAN_RELAUNCH: keyof LatchRecheckInput = 'canRelaunch'
   const IS_AT_CAP: keyof LatchRecheckInput = 'isAtCap'
+  const RESET_RESTART_FAILURES: keyof LatchRecheckInput = 'resetRestartFailures'
 
   /** The module-scope holder shutdown() stops: the one `let <name>: LatchRecheckController | undefined`, outside main(). */
   function holder(): string {
@@ -4018,9 +4021,9 @@ describe('main() builds the latch re-check once, through the session manager\'s 
     for (const later of latchStartPass()) expect(at).toBeLessThan(later)
   })
 
-  test('its input is exactly the one latch, the system clock, the one persona lifecycle serializer\'s run (the restart module\'s too, so a round never overlaps a teardown, a bring-up or a restart for the persona), the applied configuration read at each round, the server log, the one notice episodes instance, the relaunch gate the restart path asks, read at call time (b.av2 SR-6.4), and the restart cap over the one failure counter (b.av2 SR-6.3; bug b.xkd: the cap wins over the re-check)', () => {
+  test('its input is exactly the one latch, the system clock, the one persona lifecycle serializer\'s run (the restart module\'s too, so a round never overlaps a teardown, a bring-up or a restart for the persona), the applied configuration read at each round, the server log, the one notice episodes instance, the relaunch gate the restart path asks, read at call time (b.av2 SR-6.4), the restart cap over the one failure counter (b.av2 SR-6.3; bug b.xkd: the cap wins over the re-check) and that counter\'s own reset, for the clear by hand (b.jg5 SRJ-509; bug b.ebi)', () => {
     const props = onlyCallProps(RECHECK_BUILDER)
-    expect([...props.keys()].sort()).toEqual([APPLIED_CONFIG, CAN_RELAUNCH, CLOCK, EPISODES, IS_AT_CAP, RECHECK_LATCH, LOG, SERIALIZE].sort())
+    expect([...props.keys()].sort()).toEqual([APPLIED_CONFIG, CAN_RELAUNCH, CLOCK, EPISODES, IS_AT_CAP, RECHECK_LATCH, LOG, RESET_RESTART_FAILURES, SERIALIZE].sort())
     expect(props.get(RECHECK_LATCH)).toBe(constOf(LATCH_FACTORY))
     expect(props.get(CLOCK)).toBe('SYSTEM_PERSONA_CONNECTION_CLOCK')
     expect(importSource(SERVER_CODE, 'SYSTEM_PERSONA_CONNECTION_CLOCK')).toBe('./persona-connections.ts')
@@ -4040,6 +4043,11 @@ describe('main() builds the latch re-check once, through the session manager\'s 
     expect(props.get(IS_AT_CAP)).toMatch(/^\(?(\w+)\)? => backoffIsAtCap\(\1, RESTART_FAILURE_CAP\)$/)
     expect(importSource(SERVER_CODE, 'backoffIsAtCap')).toBe('./backoff.ts')
     expect(importSource(SERVER_CODE, 'RESTART_FAILURE_CAP')).toBe('./restart.ts')
+    // The reset of that same counter (and its cap-notified latch), not a
+    // stub or another forget of the same type: a clear by hand that clears
+    // a latch resets what the cap query above reads.
+    expect(props.get(RESET_RESTART_FAILURES)).toBe('forgetFailures')
+    expect(importSource(SERVER_CODE, 'forgetFailures')).toBe('./backoff.ts')
   })
 
   test('it is bound exactly once, in main()\'s own statement list, to the one latch, after its build with no await between, after the holds\' and the notice\'s bindings (so a set runs the holds, the notice, then the timer\'s arm) and before the start pass; server.ts adds no set or forget observer by hand', () => {

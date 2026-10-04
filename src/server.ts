@@ -3560,13 +3560,21 @@ export async function main(): Promise<void> {
     // cap gets its reads, so its latch can still clear, but no launch and no
     // run of the restart path's decision from a round.
     isAtCap: (key) => backoffIsAtCap(key, RESTART_FAILURE_CAP),
+    // b.av2 SR-6.3, b.jg5 SRJ-509: a clear by hand that clears a latch resets
+    // the persona's restart failure count (the counter the cap query above
+    // reads) before its retry at once, so the cap does not refuse that retry.
+    // Only the clear by hand is handed it; the re-check's own clears leave
+    // the count as it is.
+    resetRestartFailures: forgetFailures,
   })
   latchRecheckTimers = latchRecheck
   bindLatchRecheck(conflictLatch, latchRecheck)
-  // b.jg5 SRJ-510, SRJ-506: the clear by hand the `/clear-latch` route uses,
-  // through the re-check's one clear entry and after-clear sequence with the
-  // "cleared by hand" reason; it answers once the clear has run in the
-  // persona's serializer turn.
+  // b.jg5 SRJ-510, SRJ-509, SRJ-506: the clear by hand the `/clear-latch`
+  // route uses, through the re-check's one clear entry and after-clear
+  // sequence with the "cleared by hand" reason. A clear that clears a latch
+  // also resets the persona's restart failure count before the retry at once;
+  // one that finds the persona unlatched changes nothing. It answers once the
+  // clear (and that reset) has run in the persona's serializer turn.
   const clearByHand = clearByHandOf(latchRecheck)
   // b.jg5 SRJ-1011: the persona routing's lost-message state reads it.
   personaLatch = conflictLatch
