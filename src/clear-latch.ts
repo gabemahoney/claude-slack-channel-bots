@@ -1,7 +1,7 @@
 /**
  * clear-latch.ts — The `clear-latch` command's names, the server's
- * `POST /clear-latch` request handler and the `server.port` record
- * (b.jg5 SRJ-509, SRJ-510, SRJ-511).
+ * `POST /clear-latch` request handler, the `server.port` record and the
+ * CLI's request to the route (b.jg5 SRJ-509, SRJ-510, SRJ-511).
  *
  * The route and the command are for the operator only (SRJ-511): no MCP
  * tool, no text of the MCP instructions, no tool description and no notice
@@ -21,8 +21,10 @@
  *        clear has run in the persona's lifecycle serializer turn; the
  *        bypassing `find-missing` and the retry follow without being awaited
  *
- * The CLI dials `127.0.0.1` at the port in `server.port`, so a server whose
- * `bind` gives it no `127.0.0.1` listener cannot be reached by `clear-latch`.
+ * The CLI dials `127.0.0.1` at the port in `server.port` (`dialClearLatch`,
+ * the production dial; `parseClearLatchAnswer` reads a 200's body), directly
+ * and never through a proxy the environment names, so a server whose `bind`
+ * gives it no `127.0.0.1` listener cannot be reached by `clear-latch`.
  *
  * `server.port` is the server's own record of its PID and its listener's
  * bound port, `{"pid":<pid>,"port":<port>}` and a newline, written in one
@@ -35,9 +37,9 @@
  * Side-effect free: importing this module reads no file, environment variable
  * or config, binds nothing and logs nothing. The persona config, the clear and
  * the logger are injected per call, and the file-system calls of the record's
- * write, read and removal are injectable. `src/cli.ts` imports it, so it loads
- * no server-only module: the clear by hand and its "cleared by hand" reason
- * are bound by the server and handed in.
+ * write, read and removal and the dial's `node:http` request are injectable. `src/cli.ts`
+ * imports it, so it loads no server-only module: the clear by hand and its
+ * "cleared by hand" reason are bound by the server and handed in.
  *
  * Log lines (none for 400, 403 or 405; a latched persona's clear logs only the
  * clear entry's own line):
@@ -51,6 +53,7 @@
  */
 
 import { existsSync, readFileSync, unlinkSync } from 'node:fs'
+import { request as httpRequest, type ClientRequest, type IncomingMessage, type RequestOptions } from 'node:http'
 import { join } from 'node:path'
 import type { Persona } from './config.ts'
 import { atomicWriteFileSync } from './atomic-write.ts'
@@ -67,6 +70,9 @@ export const CLEAR_LATCH_COMMAND = 'clear-latch'
 
 /** The route on the server's MCP listener the command calls. */
 export const CLEAR_LATCH_ROUTE = '/clear-latch'
+
+/** The address the CLI dials: the server's listener on loopback, as the scheduled-prompt dispatcher dials it. */
+export const CLEAR_LATCH_DIAL_HOST = '127.0.0.1'
 
 /** The record's file name, in the server's state directory beside `server.pid`. */
 export const SERVER_PORT_FILE_NAME = 'server.port'
@@ -220,6 +226,112 @@ export function removeServerPortRecord(path: string, fs: ServerPortRemoveFs = NO
   } catch {
     /* ignore: best effort, absent included */
   }
+}
+
+// ---------------------------------------------------------------------------
+// The CLI's request
+// ---------------------------------------------------------------------------
+
+/** The route's answer as the CLI's dial gets it: the HTTP status and the body text. */
+export interface ClearLatchDialAnswer {
+  readonly status: number
+  readonly body: string
+}
+
+/**
+ * The request call the production dial makes, in the shape of `node:http`'s
+ * `request(options, onResponse)`: it returns the request, which the dial ends
+ * with the body.
+ */
+export type ClearLatchRequest = (options: RequestOptions, onResponse: (res: IncomingMessage) => void) => ClientRequest
+
+/** The URL the CLI posts to: the route on `127.0.0.1` at `port`. Pure. */
+export function clearLatchUrl(port: number): string {
+  return `http://${CLEAR_LATCH_DIAL_HOST}:${port}${CLEAR_LATCH_ROUTE}`
+}
+
+/**
+ * The options of the production dial's one request (the URL of
+ * {@link clearLatchUrl}) for `bodyBytes` bytes of JSON body: a `POST` to the
+ * route on `127.0.0.1` at `port`, on a connection of its own (no agent, so no
+ * pooled socket keeps the CLI alive), and no timeout. Pure.
+ */
+export function clearLatchRequestOptions(port: number, bodyBytes: number): RequestOptions {
+  return {
+    host: CLEAR_LATCH_DIAL_HOST,
+    port,
+    path: CLEAR_LATCH_ROUTE,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': bodyBytes },
+    agent: false,
+  }
+}
+
+/**
+ * The production dial of the `clear-latch` command (b.jg5 SRJ-510): one
+ * `POST` of `{ "persona": <persona> }` to the route on `127.0.0.1` at `port`,
+ * answering the status and the body text once the whole body is read.
+ *
+ * It goes through `node:http`'s `request`, straight to the loopback address:
+ * unlike `fetch`, which sends the request to the proxy that `HTTP_PROXY` names
+ * when `NO_PROXY` does not exempt `127.0.0.1`, it reads no proxy environment
+ * variable, so the persona argument (perhaps a token typed by mistake) never
+ * leaves the host. A failed connection, request or body read rejects with the
+ * runtime's error. It sets no timeout of its own: the CLI bounds the wait for
+ * it on its injected clock, so a dial cut short never stands in for that
+ * wait. Logs nothing, the body included.
+ *
+ * @param requestFn  The request; `node:http`'s `request`, looked up at call time, by default.
+ */
+export function dialClearLatch(
+  port: number,
+  persona: string,
+  requestFn: ClearLatchRequest = (options, onResponse) => httpRequest(options, onResponse),
+): Promise<ClearLatchDialAnswer> {
+  const body = Buffer.from(JSON.stringify({ persona }), 'utf-8')
+  return new Promise<ClearLatchDialAnswer>((resolve, reject) => {
+    let req: ClientRequest
+    try {
+      req = requestFn(clearLatchRequestOptions(port, body.byteLength), (res) => {
+        const chunks: Buffer[] = []
+        res.on('data', (chunk: Buffer | string) => {
+          chunks.push(typeof chunk === 'string' ? Buffer.from(chunk, 'utf-8') : chunk)
+        })
+        res.on('error', reject)
+        res.on('aborted', () => reject(new Error('the response was aborted before its end')))
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf-8') }))
+      })
+      req.on('error', reject)
+      req.end(body)
+    } catch (err) {
+      reject(err)
+    }
+  })
+}
+
+/** A well-formed 200 answer: the applied persona's name and whether it was latched. */
+export interface ClearLatchAnswer {
+  readonly persona: string
+  readonly cleared: boolean
+}
+
+/**
+ * The 200 answer's body `text` (`{ ok: true, persona: <name>, cleared:
+ * true | false }`), or null when it is malformed: not JSON, not an object,
+ * `ok` not `true`, `persona` not a non-empty string or `cleared` not a
+ * boolean. Pure; never throws.
+ */
+export function parseClearLatchAnswer(text: string): ClearLatchAnswer | null {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return null
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null
+  const { ok, persona, cleared } = parsed as { ok?: unknown; persona?: unknown; cleared?: unknown }
+  if (ok !== true || typeof persona !== 'string' || persona === '' || typeof cleared !== 'boolean') return null
+  return { persona, cleared }
 }
 
 // ---------------------------------------------------------------------------

@@ -1,38 +1,74 @@
 /**
- * clear-latch.test.ts — The server half of `clear-latch` (b.jg5 SRJ-510): the
+ * clear-latch.test.ts — `clear-latch` (b.jg5 SRJ-509, SRJ-510): the server's
  * `POST /clear-latch` route, the `server.port` record and their wiring in
- * src/server.ts.
+ * src/server.ts, and the command's lines, exit codes and request (`createCli`,
+ * src/cli.ts).
  *
  * - The route: the real `handleClearLatch` (src/clear-latch.ts) over injected
  *   dependencies, a two-persona config from `makeMultiPersonaConfig`, a
  *   recording clear by hand answering true or false (or held pending, or
- *   rejecting) and a capturing logger. One real loopback request runs over a
+ *   rejecting) and a capturing logger. Real loopback requests run over a
  *   port-0 `Bun.serve` bound to 127.0.0.1 (`startClearLatchServer`, below,
- *   which E31 T2's CLI rows reuse). The clear by hand itself, in P's serializer
- *   turn with its recovery post, `find-missing` and retry, is
- *   tests/conflict-latch.test.ts's.
+ *   used by the route's and the command's loopback cases). The clear by hand
+ *   itself, in P's serializer turn with its recovery post, `find-missing` and
+ *   retry, is tests/conflict-latch.test.ts's.
  * - The record: write, read and removal in the test's own `mkdtempSync`
  *   directory standing in for the state directory.
  * - The wiring: `main()` cannot run in a test, so "the record holds the
  *   server's PID and bound port while it runs and is gone after shutdown" and
  *   the route's delegation are proven by a comment-stripped source audit of
- *   src/server.ts; the CLI's half of SRJ-510 (it dials the port in
- *   `server.port`) and `stop`'s removal are E31 T2's and tests/cli.test.ts's.
+ *   src/server.ts.
+ * - The command: `createCli(…).clearLatch` over a local `CliDeps` whose
+ *   members `clear-latch` must not use throw (the loaders, spawns, kill,
+ *   director verbs, the credentials runner, the client init, `unlinkSync`), a
+ *   recording dial with scripted answers, a `createFakeClock` clock and the
+ *   same stand-in state directory: one pin table of SRJ-509's seven lines
+ *   and its usage-text entry, one
+ *   case per row with its exact stderr line and exit code, the PID-checked
+ *   `server.port`, the bounded wait, an in-process run against the real
+ *   handler and a real loopback run with the production dial. Every run checks
+ *   that `clear-latch` writes and removes nothing. The usage text and the
+ *   entry point are tests/cli.test.ts's, as is `stop`'s removal of
+ *   `server.port` with the PID file.
+ * - The production dial: `dialClearLatch` over a recording `ClearLatchRequest`
+ *   (`fakeHttp`, below: fake `node:http` request and response emitters) for
+ *   its options, body, answer and each way it rejects, and once for real
+ *   against the port-0 listener with `HTTP_PROXY`/`http_proxy` naming a
+ *   closed proxy, restored in `finally`.
  *
- * Every value compared (the route, the log lines, the causes, the cap) comes
- * from src/; the response bodies are the handler's own literals, pinned here.
- * Every argument that must never be repeated is built with `fakeToken`, and
- * `assertNoLeak` runs over every captured line and response body.
+ * Every value compared (the route, the log lines, the causes, the cap, the
+ * command's lines and wait) comes from src/; the response bodies are the
+ * handler's own literals, and SRJ-509's lines are pinned once, in the pin
+ * table. Every argument that must never be repeated is built with
+ * `fakeToken`, and `assertNoLeak` runs over every captured line and response
+ * body.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+import { EventEmitter } from 'node:events'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import type { ClientRequest, IncomingMessage, RequestOptions } from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 import {
+  CLEAR_LATCH_USAGE,
+  CLEAR_LATCH_USAGE_ENTRY,
+  CLEAR_LATCH_WAIT_MS,
+  clearLatchCliClearedLine,
+  clearLatchCliNoPersonaLine,
+  clearLatchCliNoServerLine,
+  clearLatchCliNotAnsweredLine,
+  clearLatchCliNotConfirmedLine,
+  clearLatchCliNotLatchedLine,
+  clearLatchStatusCause,
+  createCli,
+  type CliDeps,
+} from '../src/cli.ts'
+import {
+  CLEAR_LATCH_DIAL_HOST,
   CLEAR_LATCH_ROUTE,
   SERVER_PORT_CAUSE_ABSENT,
   SERVER_PORT_CAUSE_MALFORMED,
@@ -42,7 +78,10 @@ import {
   SERVER_PORT_FILE_NAME,
   clearLatchFailedLine,
   clearLatchNotLatchedLine,
+  clearLatchRequestOptions,
   clearLatchUnknownPersonaLine,
+  clearLatchUrl,
+  dialClearLatch,
   handleClearLatch,
   readServerPortRecord,
   removeServerPortRecord,
@@ -51,14 +90,25 @@ import {
   serverPortWriteFailedLine,
   writeServerPortRecord,
   type ClearLatchDeps,
+  type ClearLatchDialAnswer,
+  type ClearLatchRequest,
   type ServerPortRecord,
 } from '../src/clear-latch.ts'
 import type { PersonaConfig } from '../src/config.ts'
 import { INTERJECT_BODY_CAP_BYTES } from '../src/interject.ts'
 import { describeThrownValue } from '../src/persona-connection-errors.ts'
 import { personaKey } from '../src/persona-identity.ts'
-import { BOT_TOKEN_PREFIX, assertNoLeak, fakeToken, sentinelInMessage } from './test-helpers/credentials.ts'
-import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
+import { isProcessRunning } from '../src/pid.ts'
+import { reloadFilePaths } from '../src/reload.ts'
+import {
+  BOT_TOKEN_PREFIX,
+  REDACTED_SENTINEL_TAIL,
+  assertNoLeak,
+  fakeToken,
+  sentinelInMessage,
+} from './test-helpers/credentials.ts'
+import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import { makeMultiPersonaConfig, makePersona, makePersonaConfigInput, writeConfigFile } from './test-helpers/persona-config.ts'
 import {
   atMainTopLevel,
   balancedAfter,
@@ -732,5 +782,725 @@ describe('src/server.ts wires the route and the record (static audit)', () => {
     // Not vacuous: the walk reaches the module it takes the cap and the loopback rule from.
     expect(loads.modules.has('interject.ts')).toBe(true)
     expect(forbidden).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The command (SRJ-509; SRJ-510's CLI half): `createCli(…).clearLatch` over a
+// local `CliDeps`, with `dir` as the server's state directory.
+// ---------------------------------------------------------------------------
+
+/** The running server's PID in the stub-dial cases: the default `isProcessRunning` answers true for it alone. */
+const SERVER_PID = 4242
+/** The port the stub-dial cases' `server.port` records. */
+const RECORD_PORT = 41_001
+
+/** What the local `exit` throws, so a run ends where the CLI calls it. */
+class ExitSignal extends Error {
+  constructor(readonly code: number) {
+    super(`exit(${code})`)
+  }
+}
+
+/** How one `clear-latch` run's dependencies behave. */
+interface CliRunOptions {
+  /** The dial's answer for each request; a 200 for B, not latched, by default. */
+  dial?: (port: number, persona: string) => Promise<ClearLatchDialAnswer>
+  /** Which PIDs are running; `SERVER_PID` alone by default. */
+  isProcessRunning?: (pid: number) => boolean
+  /** The run's fake clock; a fresh `createFakeClock()` by default. */
+  fakeClock?: FakeClock
+  /** Awaited at the start of each sleep, before the fake clock moves. */
+  beforeSleep?: () => Promise<void>
+  /** The most one sleep moves the fake clock; the whole sleep by default. */
+  maxStepMs?: number
+  /** A `now` and `sleep` used in place of the fake clock's (the real loopback run). */
+  clock?: Pick<CliDeps, 'now' | 'sleep'>
+}
+
+/** One run's outcome: its exit code and stderr lines, and what it asked of its dependencies. */
+interface CliRun {
+  readonly code: number
+  readonly stderr: readonly string[]
+  /** Each dial's port and argument, in order. */
+  readonly dials: ReadonlyArray<readonly [port: number, persona: string]>
+  /** Each path the run checked or read, in order. */
+  readonly reads: readonly string[]
+  /** The run's clock when it called `exit`. */
+  readonly exitAt: number
+  /** Each sleep the wait asked for, in ms. */
+  readonly sleeps: readonly number[]
+}
+
+/** The stderr lines of the current case; the console spy appends every `console.error` call. */
+let stderr: string[]
+/** Every fake clock the current case built; none may keep a pending timer. */
+let clocks: FakeClock[]
+
+/** The stand-in state directory's PID file and record. */
+const pidPath = (): string => join(dir, 'server.pid')
+const portPath = (): string => serverPortFilePath(dir)
+
+/** A running server: `server.pid` naming `SERVER_PID` and its `server.port` naming `RECORD_PORT`. */
+function writeRunningServer(): void {
+  writeFileSync(pidPath(), `${SERVER_PID}\n`)
+  writeServerPortRecord(portPath(), { pid: SERVER_PID, port: RECORD_PORT })
+}
+
+/** A dial that answers `status` and `body` at once. */
+const answering = (status: number, body: string) => (): Promise<ClearLatchDialAnswer> => Promise.resolve({ status, body })
+
+/** The route's 200 body for the persona named `name`. */
+const okBody = (name: string, cleared: boolean): string => JSON.stringify({ ok: true, persona: name, cleared })
+
+/**
+ * Every path under `root`, sorted, with each file's bytes in base64 and null
+ * for a directory: two snapshots are equal only when nothing was added,
+ * removed or changed.
+ */
+function snapshotTree(root: string): Record<string, string | null> {
+  const entries = (readdirSync(root, { recursive: true }) as string[]).sort()
+  return Object.fromEntries(
+    entries.map((rel) => {
+      const path = join(root, rel)
+      return [rel, statSync(path).isFile() ? readFileSync(path, 'base64') : null]
+    }),
+  )
+}
+
+/**
+ * Run `clear-latch` with `args` over a local `CliDeps`: the state directory is
+ * `dir`; reads are real and recorded; the dial is recorded then scripted;
+ * `exit` records and throws `ExitSignal`; every member `clear-latch` must not
+ * use throws and is recorded. Fails unless the run ended in exactly one
+ * `exit`, used no such member and left `dir` byte-for-byte unchanged
+ * (`clear-latch` writes and removes nothing; SRJ-510, hatch A3).
+ */
+async function runClearLatch(args: readonly string[], o: CliRunOptions = {}): Promise<CliRun> {
+  const before = snapshotTree(dir)
+  const firstLine = stderr.length
+  const fakeClock = o.fakeClock ?? createFakeClock()
+  clocks.push(fakeClock)
+  const sleeps: number[] = []
+  const now = o.clock?.now ?? (() => fakeClock.now())
+  const sleep =
+    o.clock?.sleep ??
+    (async (ms: number): Promise<void> => {
+      sleeps.push(ms)
+      await o.beforeSleep?.()
+      await fakeClock.advance(Math.min(ms, o.maxStepMs ?? ms))
+    })
+  const dial = o.dial ?? answering(200, okBody(B_NAME, false))
+  const dials: Array<[number, string]> = []
+  const reads: string[] = []
+  const exits: Array<[code: number, at: number]> = []
+  const misused: string[] = []
+  const unused = (name: string) => (): never => {
+    misused.push(name)
+    throw new Error(`clear-latch used CliDeps.${name}`)
+  }
+  const deps: CliDeps = {
+    spawnSync: unused('spawnSync'),
+    spawnDaemon: unused('spawnDaemon'),
+    openLogAppend: unused('openLogAppend'),
+    closeFd: unused('closeFd'),
+    initLogging: unused('initLogging'),
+    existsSync: (path) => {
+      reads.push(path)
+      return existsSync(path)
+    },
+    readFileSync: (path) => {
+      reads.push(path)
+      return readFileSync(path, 'utf-8')
+    },
+    fileSize: unused('fileSize'),
+    readFileFrom: unused('readFileFrom'),
+    now,
+    sleep,
+    unlinkSync: unused('unlinkSync'),
+    isProcessRunning: o.isProcessRunning ?? ((pid) => pid === SERVER_PID),
+    kill: unused('kill'),
+    resolveStateDir: () => dir,
+    resolveConfigPath: unused('resolveConfigPath'),
+    startServer: unused('startServer'),
+    exit: (code): never => {
+      exits.push([code, now()])
+      throw new ExitSignal(code)
+    },
+    loadConfig: unused('loadConfig'),
+    loadConfigFile: unused('loadConfigFile'),
+    runCredentialsScript: unused('runCredentialsScript'),
+    initClient: unused('initClient'),
+    directorGet: unused('directorGet'),
+    directorReadPane: unused('directorReadPane'),
+    directorStatus: unused('directorStatus'),
+    directorPause: unused('directorPause'),
+    directorKill: unused('directorKill'),
+    directorList: unused('directorList'),
+    appendServerLogLine: unused('appendServerLogLine'),
+    recordStartupErrorEntry: unused('recordStartupErrorEntry'),
+    dialClearLatch: async (port, persona) => {
+      dials.push([port, persona])
+      return dial(port, persona)
+    },
+  }
+
+  const ended = await createCli(deps).clearLatch(args).then(
+    () => undefined,
+    (err: unknown) => err,
+  )
+  expect(ended).toBeInstanceOf(ExitSignal)
+  expect(exits).toHaveLength(1)
+  expect(misused).toEqual([])
+  expect(snapshotTree(dir)).toEqual(before)
+  const [code, exitAt] = exits[0]!
+  return { code, stderr: stderr.slice(firstLine), dials, reads, exitAt, sleeps }
+}
+
+describe('clear-latch: the command (SRJ-509; SRJ-510\'s CLI half)', () => {
+  let errorSpy: ReturnType<typeof spyOn>
+
+  beforeEach(() => {
+    stderr = []
+    clocks = []
+    errorSpy = spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+      stderr.push(args.map(String).join(' '))
+    })
+  })
+
+  afterEach(() => {
+    errorSpy.mockRestore()
+    assertNoLeak({ stderr })
+    // Every wait ran on its fake clock and none is left behind.
+    for (const clock of clocks) expect(clock.pending()).toEqual([])
+  })
+
+  describe('SRJ-509\'s lines, pinned once', () => {
+    // The only place the lines are written out: each row is the SRD's text
+    // with its placeholders filled from the case. Every other case compares
+    // with the exported line or builder.
+    test.each([
+      ['not exactly one non-empty argument', 'Usage: claude-slack-channel-bots clear-latch <persona name or key>', CLEAR_LATCH_USAGE],
+      [
+        'the general usage text\'s entry',
+        "  clear-latch    <persona name or key>: clear a persona's latch (a session conflict, an unusable recorded name or a launch with no recorded start) on the running server",
+        CLEAR_LATCH_USAGE_ENTRY,
+      ],
+      ['no server running', 'clear-latch: no server is running', clearLatchCliNoServerLine()],
+      [
+        'cannot be reached, a server.port cause',
+        `clear-latch: the server did not answer: ${SERVER_PORT_CAUSE_ABSENT}`,
+        clearLatchCliNotAnsweredLine(SERVER_PORT_CAUSE_ABSENT),
+      ],
+      [
+        'cannot be reached, an unexpected status (the cause is "HTTP <status>")',
+        'clear-latch: the server did not answer: HTTP 500',
+        clearLatchCliNotAnsweredLine(clearLatchStatusCause(500)),
+      ],
+      [
+        'did not confirm within the wait',
+        "clear-latch: the server did not confirm within 30 s; the clear is queued and may still run. Check this persona's latch in the server log before trying again.",
+        clearLatchCliNotConfirmedLine(),
+      ],
+      [
+        'no applied persona has that name or key',
+        'clear-latch: no persona in the running configuration has that name or key',
+        clearLatchCliNoPersonaLine(),
+      ],
+      ['latched', 'clear-latch: cleared the latch of persona "reviewer" (key=reviewer)', clearLatchCliClearedLine('reviewer')],
+      [
+        'latched, a name whose key is hashed',
+        `clear-latch: cleared the latch of persona "Planner Bot" (key=${A_KEY})`,
+        clearLatchCliClearedLine('Planner Bot'),
+      ],
+      [
+        'not latched',
+        'clear-latch: persona "reviewer" (key=reviewer) was not latched; nothing changed',
+        clearLatchCliNotLatchedLine('reviewer'),
+      ],
+    ])('%s', (_row, srd, built) => {
+      expect(built).toBe(srd)
+    })
+
+    test('the wait is 30000 ms, the "30 s" of the did-not-confirm line', () => {
+      expect(CLEAR_LATCH_WAIT_MS).toBe(30_000)
+    })
+  })
+
+  describe('not exactly one non-empty argument → the usage line, exit 2', () => {
+    test.each([
+      ['no argument', []],
+      ['one empty argument', ['']],
+      ['two arguments', [A_NAME, B_NAME]],
+      ['an empty argument and a name', ['', A_NAME]],
+      ['a token typed twice', [TYPO_TOKEN, TYPO_TOKEN]],
+    ])('%s: nothing read or dialled', async (_label, args) => {
+      writeRunningServer()
+      const run = await runClearLatch(args)
+      expect(run).toMatchObject({ code: 2, stderr: [CLEAR_LATCH_USAGE], dials: [], reads: [] })
+    })
+  })
+
+  describe('no server running → exit 1, no request, nothing removed', () => {
+    // A valid server.port for SERVER_PID sits beside each PID file: it is
+    // neither read, used nor removed.
+    test.each([
+      ['the PID file is absent', () => {}, undefined],
+      ['the PID file is unreadable (a directory where it goes)', () => mkdirSync(pidPath()), undefined],
+      ['the PID file does not hold a number', () => writeFileSync(pidPath(), 'not-a-pid\n'), undefined],
+      ['the PID file is stale (its process is not running)', () => writeFileSync(pidPath(), `${SERVER_PID}\n`), () => false],
+    ])('%s', async (_label, writePidFile, running) => {
+      writeServerPortRecord(portPath(), { pid: SERVER_PID, port: RECORD_PORT })
+      writePidFile()
+      const run = await runClearLatch([TYPO_TOKEN], running ? { isProcessRunning: running } : {})
+      expect(run).toMatchObject({ code: 1, stderr: [clearLatchCliNoServerLine()], dials: [] })
+      expect(new Set(run.reads)).toEqual(new Set([pidPath()]))
+    })
+  })
+
+  describe('the server cannot be reached → exit 1 with the cause', () => {
+    test.each([
+      [SERVER_PORT_CAUSE_ABSENT, () => {}],
+      [SERVER_PORT_CAUSE_UNREADABLE, () => mkdirSync(portPath())],
+      [SERVER_PORT_CAUSE_MALFORMED, () => writeFileSync(portPath(), 'not json {{{')],
+      [SERVER_PORT_CAUSE_OUT_OF_RANGE, () => writeFileSync(portPath(), `{"pid":${SERVER_PID},"port":0}\n`)],
+      [SERVER_PORT_CAUSE_OTHER_PID, () => writeServerPortRecord(portPath(), { pid: SERVER_PID + 1, port: RECORD_PORT })],
+    ])('server.port unusable (%s): no request is made', async (cause, writeRecord) => {
+      writeFileSync(pidPath(), `${SERVER_PID}\n`)
+      writeRecord()
+      const run = await runClearLatch([TYPO_TOKEN])
+      expect(run).toMatchObject({ code: 1, stderr: [clearLatchCliNotAnsweredLine(cause)], dials: [] })
+    })
+
+    test('a record whose PID is not the running server\'s is not used, even while that PID runs too', async () => {
+      writeFileSync(pidPath(), `${SERVER_PID}\n`)
+      writeServerPortRecord(portPath(), { pid: SERVER_PID + 1, port: RECORD_PORT })
+      const run = await runClearLatch([A_NAME], { isProcessRunning: () => true })
+      expect(run).toMatchObject({ code: 1, stderr: [clearLatchCliNotAnsweredLine(SERVER_PORT_CAUSE_OTHER_PID)], dials: [] })
+    })
+
+    test.each([
+      ['a refused connection carrying the sentinel', () => Object.assign(new Error(`connect failed (${sentinelInMessage('dial')})`), { code: 'ECONNREFUSED' }), true],
+      ['a fetch TypeError', () => new TypeError('fetch failed'), false],
+      ['a thrown string carrying the sentinel', () => `socket closed (${sentinelInMessage('string')})`, true],
+    ])('a dial that fails (%s): the failure as describeThrownValue describes it, redacted', async (_label, makeError, carriesSentinel) => {
+      writeRunningServer()
+      const error = makeError()
+      const run = await runClearLatch([A_NAME], { dial: () => Promise.reject(error) })
+      expect(run).toMatchObject({
+        code: 1,
+        stderr: [clearLatchCliNotAnsweredLine(describeThrownValue(error))],
+        dials: [[RECORD_PORT, A_NAME]],
+      })
+      if (carriesSentinel) expect(run.stderr[0]).toContain(REDACTED_SENTINEL_TAIL)
+    })
+
+    test.each([
+      [201, okBody(B_NAME, true)],
+      [400, JSON.stringify({ error: 'Missing or invalid field: persona (string) required' })],
+      [403, JSON.stringify({ error: 'Forbidden' })],
+      [405, JSON.stringify({ error: 'Method Not Allowed' })],
+      [500, JSON.stringify({ error: fakeToken(BOT_TOKEN_PREFIX, 'body') })],
+      [500, okBody(B_NAME, true)],
+      [503, 'upstream unavailable'],
+    ])('an answer with status %i: the cause names the status, never the body', async (status, body) => {
+      writeRunningServer()
+      const run = await runClearLatch([B_NAME], { dial: answering(status, body) })
+      expect(run).toMatchObject({
+        code: 1,
+        stderr: [clearLatchCliNotAnsweredLine(clearLatchStatusCause(status))],
+        dials: [[RECORD_PORT, B_NAME]],
+      })
+    })
+
+    test.each([
+      ['an empty body', ''],
+      ['not JSON', 'not json {{{'],
+      ['JSON null', 'null'],
+      ['a JSON array', JSON.stringify([B_NAME, true])],
+      ['no cleared', JSON.stringify({ ok: true, persona: B_NAME })],
+      ['a string cleared', JSON.stringify({ ok: true, persona: B_NAME, cleared: 'true' })],
+      ['ok false', JSON.stringify({ ok: false, persona: B_NAME, cleared: true })],
+      ['no ok', JSON.stringify({ persona: B_NAME, cleared: true })],
+      ['an empty persona', JSON.stringify({ ok: true, persona: '', cleared: true })],
+      ['a numeric persona', JSON.stringify({ ok: true, persona: 42, cleared: true })],
+      ['a token for cleared', JSON.stringify({ ok: true, persona: B_NAME, cleared: fakeToken(BOT_TOKEN_PREFIX, 'cleared') })],
+    ])('a malformed 200 (%s): the cause is the status alone', async (_label, body) => {
+      writeRunningServer()
+      const run = await runClearLatch([B_NAME], { dial: answering(200, body) })
+      expect(run).toMatchObject({ code: 1, stderr: [clearLatchCliNotAnsweredLine(clearLatchStatusCause(200))] })
+    })
+  })
+
+  describe('no answer within CLEAR_LATCH_WAIT_MS → "did not confirm", exit 1 (hatch A3)', () => {
+    test('a dial that never answers ends on the fake clock at the bound, never on the cannot-be-reached row', async () => {
+      writeRunningServer()
+      const run = await runClearLatch([TYPO_TOKEN], { dial: () => new Promise<never>(() => {}) })
+      expect(run).toMatchObject({ code: 1, stderr: [clearLatchCliNotConfirmedLine()], dials: [[RECORD_PORT, TYPO_TOKEN]] })
+      expect(run.exitAt).toBe(CLEAR_LATCH_WAIT_MS)
+    })
+
+    test('a sleep that wakes early is slept again until the clock reaches the bound', async () => {
+      writeRunningServer()
+      const run = await runClearLatch([A_NAME], { dial: () => new Promise<never>(() => {}), maxStepMs: 7_000 })
+      expect(run).toMatchObject({ code: 1, stderr: [clearLatchCliNotConfirmedLine()] })
+      expect(run.exitAt).toBe(CLEAR_LATCH_WAIT_MS)
+      expect(run.sleeps.length).toBeGreaterThan(1)
+    })
+
+    test('an answer or failure that comes after the bound changes nothing: one line, one exit', async () => {
+      writeRunningServer()
+      const late = Promise.withResolvers<ClearLatchDialAnswer>()
+      const run = await runClearLatch([A_NAME], { dial: () => late.promise })
+      expect(run).toMatchObject({ code: 1, stderr: [clearLatchCliNotConfirmedLine()] })
+      late.resolve({ status: 200, body: okBody(A_NAME, true) })
+      for (let i = 0; i < 20; i++) await Promise.resolve()
+      expect(stderr).toEqual([clearLatchCliNotConfirmedLine()])
+    })
+
+    test('an answer 1 ms before the bound is the answer, not "did not confirm"', async () => {
+      writeRunningServer()
+      const fakeClock = createFakeClock()
+      const dial = (): Promise<ClearLatchDialAnswer> =>
+        new Promise((resolve) => {
+          fakeClock.setTimeout(() => resolve({ status: 200, body: okBody(A_NAME, true) }), CLEAR_LATCH_WAIT_MS - 1)
+        })
+      const run = await runClearLatch([A_NAME], { dial, fakeClock })
+      expect(run).toMatchObject({ code: 0, stderr: [clearLatchCliClearedLine(A_NAME)] })
+      expect(run.exitAt).toBe(CLEAR_LATCH_WAIT_MS - 1)
+    })
+  })
+
+  describe('an answer → its line', () => {
+    test('404 → exit 1 with the no-persona line; the argument is dialled as typed and never printed', async () => {
+      writeRunningServer()
+      const run = await runClearLatch([TYPO_TOKEN], {
+        dial: answering(404, JSON.stringify({ error: 'Persona not found in the applied config' })),
+      })
+      expect(run).toMatchObject({ code: 1, stderr: [clearLatchCliNoPersonaLine()], dials: [[RECORD_PORT, TYPO_TOKEN]] })
+      expect(run.stderr.join('\n')).not.toContain(TYPO_TOKEN)
+    })
+
+    test.each([
+      ['A by name, latched', A_NAME, A_NAME, true],
+      ['A by key, latched', A_KEY, A_NAME, true],
+      ['A by key, not latched', A_KEY, A_NAME, false],
+      ['B by name, not latched', B_NAME, B_NAME, false],
+    ] as const)('200 for %s → exit 0, the name from the answer and its personaKey', async (_label, target, name, cleared) => {
+      writeRunningServer()
+      const run = await runClearLatch([target], { dial: answering(200, okBody(name, cleared)) })
+      const line = cleared ? clearLatchCliClearedLine(name) : clearLatchCliNotLatchedLine(name)
+      expect(run).toMatchObject({ code: 0, stderr: [line], dials: [[RECORD_PORT, target]] })
+      expect(line).toContain(`(key=${personaKey(name)})`)
+      // An answer at once ends the run at once: the wait is a bound, not a delay.
+      expect(run.exitAt).toBe(0)
+    })
+
+    test.each([
+      ['a quote', 'say "hi"', '"say \\"hi\\""'],
+      ['a tab', 'tab\there', '"tab\\there"'],
+      ['a line break', 'two\nlines', '"two\\nlines"'],
+    ])('a name holding %s prints escaped, as renderPersonaRef renders it (hatch A3)', async (_label, name, quoted) => {
+      writeRunningServer()
+      for (const cleared of [true, false]) {
+        const run = await runClearLatch([name], { dial: answering(200, okBody(name, cleared)) })
+        const ref = `${quoted} (key=${personaKey(name)})`
+        const line = cleared ? clearLatchCliClearedLine(name) : clearLatchCliNotLatchedLine(name)
+        expect(run).toMatchObject({ code: 0, stderr: [line] })
+        expect(line).toContain(ref)
+        expect(line).not.toMatch(/[\t\n]/)
+      }
+    })
+  })
+
+  test('the CLI dials the port in server.port, never the configuration file\'s or the last-applied record\'s, and reads neither', async () => {
+    const configPath = writeConfigFile(dir, makePersonaConfigInput({ port: RECORD_PORT + 1, personas: [makePersona({ name: A_NAME }, dir)] }, dir))
+    const lastApplied = reloadFilePaths(configPath).lastApplied
+    writeFileSync(lastApplied, JSON.stringify(makePersonaConfigInput({ port: RECORD_PORT + 2, personas: [makePersona({ name: A_NAME }, dir)] }, dir)))
+    writeRunningServer()
+    const run = await runClearLatch([A_NAME], { dial: answering(200, okBody(A_NAME, true)) })
+    expect(run).toMatchObject({ code: 0, stderr: [clearLatchCliClearedLine(A_NAME)], dials: [[RECORD_PORT, A_NAME]] })
+    expect(new Set(run.reads)).toEqual(new Set([pidPath(), portPath()]))
+  })
+
+  describe('against the real handler', () => {
+    /**
+     * The real `handleClearLatch` answering in process over the file's
+     * handler dependencies (`deps()`): `forward` gates when the request
+     * reaches it, and `served` is the dial's answer once the handler answers.
+     */
+    function handlerDial(forward: Promise<void>): {
+      dial: (port: number, persona: string) => Promise<ClearLatchDialAnswer>
+      served: () => Promise<ClearLatchDialAnswer>
+    } {
+      let served: Promise<ClearLatchDialAnswer> | undefined
+      const dial = (port: number, persona: string): Promise<ClearLatchDialAnswer> => {
+        served = (async () => {
+          await forward
+          const req = new Request(clearLatchUrl(port), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ persona }),
+          })
+          const res = await handleClearLatch(req, '127.0.0.1', deps())
+          return { status: res.status, body: await res.text() }
+        })()
+        return served
+      }
+      return {
+        dial,
+        served: () => {
+          if (served === undefined) throw new Error('handlerDial: no request was dialled')
+          return served
+        },
+      }
+    }
+
+    test.each([
+      ['received before the wait ran out, its clear still waiting in P\'s turn', false],
+      ['received only after the wait ran out', true],
+    ])('a clear %s still runs once, and the CLI ended on "did not confirm" (SRJ-510; hatch A3)', async (_label, late) => {
+      writeRunningServer()
+      const gate = Promise.withResolvers<boolean>()
+      const received = Promise.withResolvers<void>()
+      clearAnswer = () => {
+        received.resolve()
+        return gate.promise
+      }
+      const cliEnded = Promise.withResolvers<void>()
+      const { dial, served } = handlerDial(late ? cliEnded.promise : Promise.resolve())
+
+      // Early: the wait sleeps only once the clear has been received.
+      const run = await runClearLatch([A_NAME], { dial, beforeSleep: late ? undefined : () => received.promise })
+      expect(run).toMatchObject({ code: 1, stderr: [clearLatchCliNotConfirmedLine()], dials: [[RECORD_PORT, A_NAME]] })
+      expect(clearCalls).toEqual(late ? [] : [A_KEY])
+
+      cliEnded.resolve()
+      await received.promise
+      gate.resolve(true)
+      const answer = await served()
+      const body: unknown = JSON.parse(answer.body)
+      bodies.push(body)
+      expect({ status: answer.status, body }).toEqual({ status: 200, body: { ok: true, persona: A_NAME, cleared: true } })
+      expect(clearCalls).toEqual([A_KEY])
+      expect(stderr).toEqual([clearLatchCliNotConfirmedLine()])
+    })
+
+    test('over real HTTP: the production dial reaches the handler on 127.0.0.1 at the recorded port; once the server stops, the same run cannot reach it', async () => {
+      /** The production dial, its failures recorded, with a sleep that ends once the dial has settled (no real timer). */
+      function loopback(failures: unknown[]): CliRunOptions {
+        const settled = Promise.withResolvers<void>()
+        return {
+          isProcessRunning,
+          dial: (port, persona) =>
+            dialClearLatch(port, persona)
+              .catch((err: unknown) => {
+                failures.push(err)
+                throw err
+              })
+              .finally(() => settled.resolve()),
+          clock: { now: () => 0, sleep: () => settled.promise },
+        }
+      }
+
+      const server = startClearLatchServer(() => deps())
+      const port = server.port
+      try {
+        writeFileSync(pidPath(), `${process.pid}\n`)
+        writeServerPortRecord(portPath(), { pid: process.pid, port })
+        clearAnswer = () => Promise.resolve(true)
+        const live = await runClearLatch([A_NAME], loopback([]))
+        expect(live).toMatchObject({ code: 0, stderr: [clearLatchCliClearedLine(A_NAME)], dials: [[port, A_NAME]] })
+        expect(clearCalls).toEqual([A_KEY])
+      } finally {
+        server.stop()
+      }
+
+      const failures: unknown[] = []
+      const gone = await runClearLatch([A_NAME], loopback(failures))
+      expect(failures).toHaveLength(1)
+      expect(gone).toMatchObject({
+        code: 1,
+        stderr: [clearLatchCliNotAnsweredLine(describeThrownValue(failures[0]))],
+        dials: [[port, A_NAME]],
+      })
+      expect(clearCalls).toEqual([A_KEY])
+    })
+  })
+})
+
+/** A fake `node:http` request or response: an emitter the case drives. */
+type FakeEmitter = EventEmitter
+
+/**
+ * A recording `ClearLatchRequest` standing in for `node:http`'s `request`:
+ * each call's options and the body its request was ended with, and `respond`,
+ * which hands the dial a fake response with `status` and returns it for the
+ * case to emit `data`, `end`, `error` or `aborted` on. `throwing` makes the
+ * call itself throw.
+ */
+function fakeHttp(throwing?: unknown): {
+  requestFn: ClearLatchRequest
+  calls: Array<{ options: RequestOptions; ended: unknown[] }>
+  request: () => FakeEmitter
+  respond: (status: number) => FakeEmitter
+} {
+  const calls: Array<{ options: RequestOptions; ended: unknown[] }> = []
+  let req: FakeEmitter | undefined
+  let onResponse: ((res: IncomingMessage) => void) | undefined
+  const requestFn: ClearLatchRequest = (options, cb) => {
+    if (throwing !== undefined) throw throwing
+    const call = { options, ended: [] as unknown[] }
+    calls.push(call)
+    onResponse = cb
+    req = Object.assign(new EventEmitter(), {
+      end: (...args: unknown[]) => {
+        call.ended.push(...args)
+      },
+    })
+    return req as unknown as ClientRequest
+  }
+  return {
+    requestFn,
+    calls,
+    request: () => {
+      if (req === undefined) throw new Error('fakeHttp: no request was made')
+      return req
+    },
+    respond: (status) => {
+      if (onResponse === undefined) throw new Error('fakeHttp: no request was made')
+      const res = Object.assign(new EventEmitter(), { statusCode: status })
+      onResponse(res as unknown as IncomingMessage)
+      return res
+    },
+  }
+}
+
+describe('dialClearLatch: the production dial', () => {
+  /** A persona argument whose UTF-8 byte length differs from its length in characters. */
+  const WIDE_NAME = 'Zoë Planner'
+
+  test('one POST of {"persona"} as JSON to the route on 127.0.0.1 at the port, on a connection of its own, answering the status and the body text', async () => {
+    const http = fakeHttp()
+    const sent = Buffer.from(JSON.stringify({ persona: WIDE_NAME }), 'utf-8')
+    expect(sent.byteLength).not.toBe(JSON.stringify({ persona: WIDE_NAME }).length)
+
+    const dialled = dialClearLatch(3101, WIDE_NAME, http.requestFn)
+    expect(http.calls).toHaveLength(1)
+    const { options, ended } = http.calls[0]!
+    expect(options).toEqual(clearLatchRequestOptions(3101, sent.byteLength))
+    expect(options).toEqual({
+      host: CLEAR_LATCH_DIAL_HOST,
+      port: 3101,
+      path: CLEAR_LATCH_ROUTE,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': sent.byteLength },
+      agent: false,
+    })
+    // The options name the same place as the route's URL.
+    const url = new URL(clearLatchUrl(3101))
+    expect<unknown[]>([url.hostname, Number(url.port), url.pathname]).toEqual([options.host, options.port, options.path])
+    // The request is ended with the whole body, once.
+    expect(ended).toHaveLength(1)
+    expect(Buffer.from(ended[0] as Uint8Array).equals(sent)).toBe(true)
+
+    // The answer's body arrives split inside a two-byte character, as a Buffer and then as text.
+    const answerBytes = Buffer.from(okBody(WIDE_NAME, true), 'utf-8')
+    const split = answerBytes.indexOf(Buffer.from('ë', 'utf-8')) + 1
+    const res = http.respond(200)
+    res.emit('data', answerBytes.subarray(0, split))
+    res.emit('data', answerBytes.subarray(split, split + 3))
+    res.emit('data', answerBytes.subarray(split + 3).toString('utf-8'))
+    res.emit('end')
+    expect(await dialled).toEqual({ status: 200, body: okBody(WIDE_NAME, true) })
+  })
+
+  test('a status other than 200 is answered as is, not rejected', async () => {
+    const http = fakeHttp()
+    const dialled = dialClearLatch(3101, A_NAME, http.requestFn)
+    const res = http.respond(404)
+    const body = JSON.stringify({ error: 'Persona not found in the applied config' })
+    res.emit('data', Buffer.from(body, 'utf-8'))
+    res.emit('end')
+    expect(await dialled).toEqual({ status: 404, body })
+  })
+
+  test.each([
+    ['the request call throws', (_http: ReturnType<typeof fakeHttp>, _err: Error) => {}, true],
+    ['the request emits error (a failed connection)', (http: ReturnType<typeof fakeHttp>, err: Error) => {
+      http.request().emit('error', err)
+    }, false],
+    ['the response emits error (a failed body read)', (http: ReturnType<typeof fakeHttp>, err: Error) => {
+      const res = http.respond(200)
+      res.emit('data', Buffer.from('{"ok":', 'utf-8'))
+      res.emit('error', err)
+    }, false],
+  ] as const)('%s → rejects with that error unchanged', async (_label, fail, throwing) => {
+    const err = new Error(`connect ECONNREFUSED ${CLEAR_LATCH_DIAL_HOST}:3101`)
+    const http = fakeHttp(throwing ? err : undefined)
+    const dialled = dialClearLatch(3101, A_NAME, http.requestFn)
+    fail(http, err)
+    await expect(dialled).rejects.toBe(err)
+  })
+
+  test('a response aborted before its end rejects, and an end after it answers nothing', async () => {
+    const http = fakeHttp()
+    const dialled = dialClearLatch(3101, A_NAME, http.requestFn)
+    const res = http.respond(200)
+    const truncated = okBody(A_NAME, true).slice(0, 8)
+    res.emit('data', Buffer.from(truncated, 'utf-8'))
+    res.emit('aborted')
+    res.emit('end')
+    const failure = await dialled.then(
+      (answer) => answer,
+      (err: unknown) => err,
+    )
+    expect(failure).toBeInstanceOf(Error)
+  })
+
+  test('a proxy in HTTP_PROXY and http_proxy, with no NO_PROXY, is not used: the dial still reaches the real handler on 127.0.0.1 (SRJ-510)', async () => {
+    // The runtime's own environment (`Bun.env`): other suites replace `process.env` with a plain
+    // copy, which the runtime no longer reads. A variable is unset by blanking it before the
+    // delete: a bare delete leaves the runtime's `fetch` on the old proxy, poisoning later suites.
+    const env = Bun.env
+    const PROXY_VARS = ['HTTP_PROXY', 'http_proxy', 'NO_PROXY', 'no_proxy'] as const
+    const saved = new Map(PROXY_VARS.map((name) => [name, env[name]] as const))
+    const unset = (name: string): void => {
+      env[name] = ''
+      delete env[name]
+    }
+    // A closed port: a request sent through this proxy cannot connect.
+    const closedProxy = `http://${CLEAR_LATCH_DIAL_HOST}:9`
+    const server = startClearLatchServer(() => deps())
+    try {
+      env.HTTP_PROXY = closedProxy
+      env.http_proxy = closedProxy
+      unset('NO_PROXY')
+      unset('no_proxy')
+
+      // Not vacuous: `fetch` under the same environment goes to the proxy and never reaches the server.
+      const viaFetch = await fetch(clearLatchUrl(server.port), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ persona: A_NAME }),
+      }).then(
+        (res) => res.status,
+        (err: unknown) => err,
+      )
+      expect(viaFetch).toBeInstanceOf(Error)
+      expect(clearCalls).toEqual([])
+
+      const answer = await dialClearLatch(server.port, A_NAME)
+      const body: unknown = JSON.parse(answer.body)
+      bodies.push(body)
+      expect({ status: answer.status, body }).toEqual({ status: 200, body: { ok: true, persona: A_NAME, cleared: true } })
+      expect(clearCalls).toEqual([A_KEY])
+    } finally {
+      server.stop()
+      for (const [name, value] of saved) {
+        if (value === undefined) unset(name)
+        else env[name] = value
+      }
+    }
   })
 })

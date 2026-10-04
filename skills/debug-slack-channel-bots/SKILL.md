@@ -51,6 +51,10 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
   [A persona posts a Held: unusable tmux session name notice](#a-persona-posts-a-held-unusable-tmux-session-name-notice)
   and
   [A persona posts a Held: launch start not recorded notice](#a-persona-posts-a-held-launch-start-not-recorded-notice)).
+- NEVER run `clear-latch` without the operator's explicit say-so, as for
+  starting or stopping the server, and never tell a persona, or any bot, to
+  run it. It is the operator's command (see
+  [Clearing a hold by hand: `clear-latch`](#clearing-a-hold-by-hand-clear-latch)).
 - NEVER change, or offer to change, the agent-director install for a
   *Cannot launch* notice, and never act on the persona's row or session
   beyond the read-only checks. That notice is for a human only (see
@@ -215,6 +219,9 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
     `clean_restart` the server was started again if agent-director
     answered, and otherwise not (`clean-restart-not-restarted`). See
     [`stop --stop-bots` or `clean_restart` could not stop a persona](#stop---stop-bots-or-clean_restart-could-not-stop-a-persona).
+11. **The cause of a hold is fixed but the persona is still held, or
+    `clear-latch` printed a line and exited non-zero?** See
+    [Clearing a hold by hand: `clear-latch`](#clearing-a-hold-by-hand-clear-latch).
 
 ---
 
@@ -1823,7 +1830,10 @@ next check comes 2 minutes later.
 **How a hold clears.** The hold clears on its own once its cause is gone,
 found by the server's own check every 2 minutes; no restart is needed. After
 a human follows the "Operator actions" section of agent-director's README,
-the server notices within 2 minutes. By the hold's case:
+the server notices within 2 minutes, or, on the operator's say-so, the hold
+is cleared at once by hand (see
+[Clearing a hold by hand: `clear-latch`](#clearing-a-hold-by-hand-clear-latch)),
+which also ends a hold the check cannot clear. By the hold's case:
 
 | Hold (`case=`) | What the check looks for | It clears when |
 |---|---|---|
@@ -1835,7 +1845,7 @@ the server notices within 2 minutes. By the hold's case:
 | `conflicting-labels` | The note on the row | The note is gone, and the look at a still-starting screen finds a screen or no session, or the restart attempt or launch is not refused. |
 | `unusable-recorded-name` | The row | The row is gone; the persona comes up fresh. |
 | `launch-start-not-recorded` | The row | The row reads running, `ended` or `missing`, or is gone. |
-| `unrecognised`, `never-reported-in` | The row | Only as the first row says; otherwise only a removal, a destructive change or a server restart ends it. |
+| `unrecognised`, `never-reported-in` | The row | Only as the first row says; otherwise only `clear-latch`, a removal, a destructive change or a server restart ends it. |
 
 A launch or restart attempt is "not refused" when it succeeds or fails
 outright (agent-director could not create its session, or the working
@@ -1845,8 +1855,8 @@ its usual notice.
 **What a clear posts.** One recovery notice per clear, to the persona's
 destination: *Conflict cleared* for a tmux session conflict, *Hold cleared*
 for an unusable tmux session name or a launch start not recorded. It says why
-(the row is gone, the row reads a state, a retry was not refused, or the row
-finished and a relaunch was not refused) and closes with "CSCB is recovering
+(the row is gone, the row reads a state, a retry was not refused, the row
+finished and a relaunch was not refused, or it was cleared by hand) and closes with "CSCB is recovering
 this persona again." Nothing is posted before a launch the check makes; only
 its answer clears.
 
@@ -1854,8 +1864,9 @@ its answer clears.
 
 - Cleared by the check's read (row gone or running), by the look at a
   still-starting screen, or a launch start not recorded whose row reads
-  `ended` or `missing`: nothing was launched, so the persona is brought up at
-  once, as a restart would. After a clear by the read the server first runs
+  `ended` or `missing`, or by hand (`clear-latch`): nothing was launched, so
+  the persona is brought up at once, as a restart would. After a clear by the
+  read or by hand the server first runs
   `find-missing` once; if conflicting labels are still noted after it, the
   persona is held again with one new notice, and if that run fails nothing is
   launched then and the persona's automatic retries take over.
@@ -1868,7 +1879,10 @@ holds the persona again with one new hold notice and no recovery notice. A
 persona whose hold cleared and that later meets a problem again is held
 again, with one new notice.
 
-**The other ends.** Removing the persona from the configuration (a
+**The other ends.** The operator's `clear-latch` ends the hold, with one
+recovery notice (see
+[Clearing a hold by hand: `clear-latch`](#clearing-a-hold-by-hand-clear-latch)).
+Removing the persona from the configuration (a
 confirmed change) ends its hold, with no post. A destructive change (its
 name, credentials file or working directory) also brings the persona up
 unheld; it is held again, with one post to its destination, only if it meets
@@ -1889,7 +1903,8 @@ session again (`refused=reuse-spawn`); nothing is deleted.
 
 It means the hold ended for `<reason>` and the recovery notice was posted;
 the check's own line shows `answer=cleared (…)` or, after a look at the
-screen, `probe-cleared (…); …`. The cause is whatever removed the problem,
+screen, `probe-cleared (…); …`. A clear by hand has `reason="cleared by
+hand"` and no check line before it. The cause is whatever removed the problem,
 usually a human following "Operator actions". Nothing to fix: watch the
 `latch-clear:` lines that follow for the bring-up (table below). With
 `recovery notice not posted (the notice episodes are closed)` the server was
@@ -2003,7 +2018,7 @@ grep -h -E 'conflict-latch: (persona=ops_bot |re-check of .*\(key=ops_bot\) )|la
 | `[slack] latch-clear: "<name>" (key=<key>)'s retry at once after its latch cleared answered <outcome> (b.jg5 SRJ-506)` | After a clear that launched nothing, the persona was brought up at once; `<outcome>` is what that restart attempt did (for example `launched`, `already-connected`, `pending-deferred` when its row is still starting and its retries wait it out, or `capped`). | Nothing, unless `<outcome>` is a failure: then as for that failure's notice. |
 | `[slack] latch-clear: the bypassing find-missing after "<name>" (key=<key>)'s latch cleared was refused — no launch in this attempt; the persona is left to its retry timer (b.jg5 SRJ-506, SRJ-120)` | The `find-missing` run after the clear failed, so nothing was launched then; the persona is no longer held, and its automatic retries bring it up. | See [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own). |
 | `[slack] latch-clear: "<name>" (key=<key>) is latched again after the bypassing find-missing that followed its clear — no retry (b.jg5 SRJ-506, SRJ-114)` | The run after the clear still found conflicting labels on the persona's row: it is held again, with one new notice. | As for the new notice. |
-| `[slack] latch-clear: "<name>" (key=<key>) is latched again before the run that follows its clear — nothing is called for it (b.jg5 SRJ-506, SRJ-502)`, `[slack] latch-clear: persona=<key> is not in the applied configuration — no find-missing and no retry after its latch cleared (b.jg5 SRJ-506)` | The persona was held again (by another check) before its bring-up ran, or it was removed meanwhile: nothing was called. | For a new hold, as for its notice; otherwise nothing. |
+| `[slack] latch-clear: "<name>" (key=<key>) is latched again before the run that follows its clear — nothing is called for it (b.jg5 SRJ-506, SRJ-502)`, `[slack] latch-clear: persona=<key> is not in the applied configuration — no find-missing and no retry after its latch cleared (b.jg5 SRJ-506)` | The server's own check cleared the hold, and the persona was held again before the bring-up that check owed it ran (a clear by hand never logs this), or it was removed meanwhile: nothing was called. | For a new hold, as for its notice; otherwise nothing. |
 | `[slack] clear-latch: persona "<name>" (key=<key>) was not latched; nothing changed` | A request to clear the persona's hold by hand reached the server, but the persona was not held: nothing was posted, called or changed. A hold cleared by hand logs only the clear line above, with `reason="cleared by hand"`, and posts the recovery notice; the `latch-clear:` lines of its bring-up follow. | Nothing. |
 | `[slack] clear-latch: no persona in the applied configuration has the requested name or key; nothing cleared` | A request to clear a hold by hand named no persona of the configuration the server runs (the name or key it gave is never logged). Nothing was cleared. | Check the persona's name or key against the configuration the server runs (the last-applied record when there is one), then ask again. |
 | `[slack] clear-latch: the clear of persona "<name>" (key=<key>) failed: <error>`, `[slack] latch-clear: the clear of persona=<key> failed: <error> — nothing runs after it (b.jg5 SRJ-506)`, `[slack] latch-clear: the run after persona=<key>'s latch cleared failed: <error> (b.jg5 SRJ-506)` | An internal error in a clear by hand: the clear itself failed, so whether the persona is still held is unknown and nothing ran after it; or the bring-up after a clear that succeeded failed. | Report it as a bug, with the persona's lines. Look for its `conflict-latch: persona=<key> cleared` line to tell whether the hold ended. |
@@ -2111,7 +2126,11 @@ hold began on a row recorded `ended`, `missing`, `pending` or `no-row`. The
 persona's destination gets one *Hold cleared* notice, its `cleared` line is
 logged with `reason="its agent-director row is gone"` (or `reads <state>`),
 and the persona comes up fresh at once, after one `find-missing` run (its
-`latch-clear:` lines). The other ends are as for a tmux session conflict: see
+`latch-clear:` lines). Once a human has removed the row, the operator can
+also clear the hold at once by hand (see
+[Clearing a hold by hand: `clear-latch`](#clearing-a-hold-by-hand-clear-latch));
+while the row is still there, the persona is held again at its next launch.
+The other ends are as for a tmux session conflict: see
 **How a hold clears** under
 [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice).
 
@@ -2228,7 +2247,10 @@ notice, its `cleared` line is logged with `reason="its agent-director row
 reads <state>"` (or `is gone`), and the persona is brought up at once: on an
 `ended` or `missing` row by one restart attempt with no `find-missing` first;
 on a running or gone row after one `find-missing` run (its `latch-clear:`
-lines). The other ends are as for a tmux session conflict: see **How a hold
+lines). Once the cause is resolved, the operator can also clear the hold at
+once by hand (see
+[Clearing a hold by hand: `clear-latch`](#clearing-a-hold-by-hand-clear-latch)).
+The other ends are as for a tmux session conflict: see **How a hold
 clears** under
 [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice).
 
@@ -2277,6 +2299,81 @@ restart or retry, a wait or check that ended): see the table under
 | The same two lines ending `— the persona relatched; …` | The persona was held for another reason and is now held for this one, with one new notice. | As for the notice. |
 | `[slack] spawnForPersona: <step> refused for <persona>: <error> — CONFLICT: the latch-time status read latched the persona, so that latch stands; no spawn-failure notice; nothing more is called (b.jg5 SRJ-105, SRJ-501)`, or the same with `— UNUSABLE NAME:` and `(b.jg5 SRJ-105, SRJ-512)` | A launch step met a tmux session conflict or an unusable tmux session name, and the one state read made right after it found the row pending with no launch start, which held the persona for that (its `spawnForPersona: latch-time status read` line comes first). One hold and one notice, *Held: launch start not recorded*. | As for the notice. |
 | The two lines above with `latching the persona failed: <error>` as the outcome, `[slack] persona-episodes: persona=<key> launch-start-not-recorded notice failed: <error>`, `[slack] <site>: <what> for <persona>: applying the own-row rules failed: <error> (b.jg5 SRJ-115)` | An internal error while holding the persona or posting its notice: the step that read the row still stopped, but the hold may not be recorded or the notice may be missing. | Report it as a bug, with the persona's lines. |
+
+---
+
+## Clearing a hold by hand: `clear-latch`
+
+The operator ends one persona's hold on the running server, whichever of
+these held it (*Held: tmux session conflict*, *Held: unusable tmux session
+name* or *Held: launch start not recorded*), with the command below. A
+*Cannot launch* hold (`ErrInvalidFlags`) is not one of these: the command
+does not end it and answers `was not latched`.
+
+```sh
+claude-slack-channel-bots clear-latch <persona>
+```
+
+`<persona>` is the persona's name or key in the configuration the server
+runs; a name with spaces is quoted for the shell. Only that persona's hold is
+cleared. It is run only on the operator's explicit say-so, never by a
+persona (see [Constraints](#constraints)).
+
+**When the operator uses it.** Once a human has resolved the hold's cause
+through the "Operator actions" section of agent-director's README, to bring
+the persona back at once instead of at the server's own check every 2
+minutes, or for a hold that check cannot clear (`case=unrecognised` or
+`case=never-reported-in` on a row that stays as it is). No restart is
+needed.
+
+**What a clear posts.** For a held persona: one recovery notice, *Conflict
+cleared* or *Hold cleared*, closing with "CSCB is recovering this persona
+again." The server logs the clear line with `reason="cleared by hand"`, then
+runs `find-missing` once and brings the persona up at once; its
+`latch-clear:` lines follow (see **What follows a clear** under
+[A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice)).
+A persona whose cause is still there is held again, with one new notice:
+after that `find-missing` run when conflicting labels are still noted
+(`is latched again after the bypassing find-missing`), or at the launch that
+meets the problem again (a new `latched` line). An unheld persona gets
+nothing: no post, no call, and one `was not latched` line.
+
+**How it reaches the server.** It reads `server.pid` as `stop` does, then
+`server.port`, which the running server writes beside it, and uses that
+record only when its PID is the running server's. It sends one request to
+`127.0.0.1` at the recorded port, never to the `bind` or `port` of
+`config.json` or the last-applied record, connecting directly whatever
+proxy variable (`HTTP_PROXY` and the like) is set, and waits at most 30 s for the
+answer. So it reaches only a server whose `bind` is `127.0.0.1` (the
+default) or `0.0.0.0`, as scheduled prompts do. On any other `bind` a hold
+ends only by the server's own check, by the persona's teardown (its removal
+or a destructive change), or by a server restart, which drops every hold.
+It reads no configuration file, needs no agent-director, and writes or
+removes no file.
+
+**Its lines.** Each run prints one line on stderr; none repeats the
+argument.
+
+| Line (exit code) | Meaning and cause | Fix |
+|---|---|---|
+| `Usage: claude-slack-channel-bots clear-latch <persona name or key>` (2) | It was not given exactly one non-empty argument: none, more than one (a name with spaces left unquoted), or an empty one. | Run it again with one persona name or key, quoted if it has spaces. |
+| `clear-latch: no server is running` (1) | `server.pid` is absent, unreadable or names a process that is not running: no server runs against this state directory, so there is no hold to clear (a hold lives only in the running server's memory). | Check `SLACK_STATE_DIR` is the server's. Starting the server is the operator's call; a fresh start holds a persona again only if its cause is still there. |
+| `clear-latch: the server did not answer: <cause>` (1) | The server could not be reached, so nothing was cleared, or the clear's result is unknown. `<cause>` says why: `server.port is absent`, `server.port could not be read`, `server.port is malformed`, `server.port holds a PID or port out of range` or `server.port was written by another process` (no request was made: the record is missing or not the running server's, for example after its write failed at start, or a server stopped between the check and the read); a connection error (the server stopped meanwhile, or its `bind` gives it no `127.0.0.1` listener); or `HTTP <status>`, an answer the command did not expect (`HTTP 500`: the clear failed inside the server). | Look for a `server.port: could not write` line (see [Other lines you may see](#other-lines-you-may-see)) and check the `bind` in the configuration the server runs. For `HTTP 500`, look for the `clear-latch: the clear of persona … failed` line and the persona's `cleared` line (grep below). Then, on the operator's say-so, run it again. |
+| `clear-latch: the server did not confirm within 30 s; the clear is queued and may still run. Check this persona's latch in the server log before trying again.` (1) | No answer came back within 30 s, usually because other work for the persona was still running; the clear is queued behind it and may still run. | Run the grep below: a `cleared` line with `reason="cleared by hand"` means the hold ended. Try again only if the persona is still held. |
+| `clear-latch: no persona in the running configuration has that name or key` (1) | No persona of the configuration the server runs (the last-applied record when there is one) has that name or key. Nothing changed. | Check the name or key against that configuration (see [Reading a persona line](#reading-a-persona-line)), then run it again. |
+| `clear-latch: cleared the latch of persona "<name>" (key=<key>)` (0) | The persona was held, and the hold is cleared: its recovery notice is posted and it is being brought up. | Nothing; follow its `latch-clear:` lines. If it is held again, its cause is still there: follow the new notice. |
+| `clear-latch: persona "<name>" (key=<key>) was not latched; nothing changed` (0) | The persona was not held, for example because the server's own check already cleared it. A *Cannot launch* hold also answers this, since the command does not end it. | Nothing; for a *Cannot launch* hold, follow that notice's section. |
+
+To follow a clear by hand for one persona (`ops_bot` here), read-only:
+
+```sh
+grep -h -E 'conflict-latch: persona=ops_bot cleared — .*reason="cleared by hand"|latch-clear: .*(\(key=ops_bot\)|persona=ops_bot[^_a-zA-Z0-9])|clear-latch: .*\(key=ops_bot\)' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
+```
+
+The server's own lines for a clear by hand (`clear-latch: … was not
+latched`, `no persona in the applied configuration`, `the clear of persona …
+failed`) are in the hold's table under
+[A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice).
 
 ---
 

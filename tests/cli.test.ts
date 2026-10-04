@@ -1,7 +1,11 @@
 /**
  * cli.test.ts — Coverage for the CLI surface (`start`, `stop`,
  * `clean_restart`, `credentials`) at the createCli factory level, with all
- * I/O injected. `credentials <persona>` finds the persona by name or key in
+ * I/O injected; for `clear-latch` (b.jg5 SRJ-509), only its usage entry, the
+ * entry point, the production dial's wiring and the retired-key check, its
+ * rows being tests/clear-latch.test.ts's. No other command dials
+ * `clear-latch`'s route: the fixture's default dial records any call and
+ * fails the case. `credentials <persona>` finds the persona by name or key in
  * `config.json` as it stands (never the record) and hands its
  * `credentials_file` to an injected fake of the credentials-script runner;
  * the script itself, and the one real run of the CLI through it, are
@@ -23,9 +27,10 @@
  * removed for the whole file (restored afterwards), so no case or failure
  * message can see an ambient token. `start`'s daemon is always the injected
  * fake `spawnDaemon`; the only real spawns are the eight tests of the
- * `unknown subcommand` block (and its hidden-subcommand `beforeAll`) and the
+ * `unknown subcommand` block (and its hidden-subcommand `beforeAll`), the
  * two real-CLI tests of `credentials` (a usage error and an unknown persona,
- * neither of which reaches the script), which
+ * neither of which reaches the script) and the two of `clear-latch` (a usage
+ * error and no PID file, neither of which dials), which
  * run the CLI script through `runCli`, whose env is a direct `hostSafeChildEnv`
  * call (temp HOME, no PATH directory, its own TMUX_TMPDIR, plus temp
  * SLACK_STATE_DIR and BUN_RUNTIME_TRANSPILER_CACHE_PATH=0). Waits in `start` and
@@ -106,6 +111,9 @@ import {
 import { tmpdir } from 'node:os'
 import { join, relative, resolve } from 'node:path'
 import {
+  CLEAR_LATCH_USAGE,
+  CLEAR_LATCH_USAGE_ENTRY,
+  CLI_USAGE_LINES,
   CREDENTIALS_SCRIPT_PATH,
   CREDENTIALS_USAGE,
   DAEMON_FAILURE_LOG_LINES,
@@ -115,6 +123,7 @@ import {
   STOP_POLL_MS,
   StartupGateFailedError,
   callWithCliTries,
+  clearLatchCliNoServerLine,
   createCli,
   createDirectorOps,
   initProductionClient,
@@ -124,7 +133,12 @@ import {
   type DirectorOps,
   type InitClientGateOptions,
 } from '../src/cli.ts'
-import { serverPortFilePath } from '../src/clear-latch.ts'
+import {
+  CLEAR_LATCH_COMMAND,
+  serverPortFilePath,
+  writeServerPortRecord,
+  type ClearLatchDialAnswer,
+} from '../src/clear-latch.ts'
 import {
   AD_CONFIG_FILE_DISPLAY_NAME,
   CLEAN_RESTART_NOT_RESTARTED_LABEL,
@@ -375,9 +389,16 @@ let errorSpy: ReturnType<typeof spyOn>
 let savedArgv: string[]
 /** The fake clock of the case's last `makeDeps` bundle; checked for pending timers after each case. */
 let currentClock: FakeClock | null
+/**
+ * Every call of a `makeDeps` bundle's default `dialClearLatch` in the case,
+ * as `[port, persona]`; checked empty after each case, so a command other
+ * than `clear-latch` that dials fails it (b.jg5 SRJ-509).
+ */
+let unexpectedDials: Array<[port: number, persona: string]>
 
 beforeEach(() => {
   currentClock = null
+  unexpectedDials = []
   root = mkdtempSync(join(tmpdir(), 'cscb-cli-'))
   stateDir = join(root, 'state')
   mkdirSync(stateDir)
@@ -404,6 +425,8 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true })
   // Every wait ran on the fake clock and none is left behind (b.jg5 SRJ-908).
   expect(currentClock?.pending() ?? []).toEqual([])
+  // Only clear-latch dials, and no case here runs it over the default dial.
+  expect(unexpectedDials).toEqual([])
 })
 
 /**
@@ -543,6 +566,12 @@ interface Overrides {
    * tree, with no copy on fd 2 (b.jg5 SRJ-909, SRJ-1013).
    */
   recordStartupErrorEntry?: CliDeps['recordStartupErrorEntry']
+  /**
+   * `clear-latch`'s dial (b.jg5 SRJ-510). Default: none of this file's
+   * commands may dial; the default records the call in `unexpectedDials`,
+   * which fails the case, and rejects.
+   */
+  dialClearLatch?: CliDeps['dialClearLatch']
 }
 
 interface Bundle {
@@ -586,6 +615,8 @@ interface Bundle {
   credentialsRuns: string[]
   /** Each path given to `unlinkSync`, in call order; the fake removes nothing. */
   unlinked: string[]
+  /** Each `dialClearLatch` call as `[port, persona]`, in call order, the default's included. */
+  dialCalls: Array<[port: number, persona: string]>
   readonly startServerCalled: boolean
 }
 
@@ -625,6 +656,7 @@ function makeDeps(o: Overrides = {}): Bundle {
   const configFileLoads: string[] = []
   const credentialsRuns: string[] = []
   const unlinked: string[] = []
+  const dialCalls: Bundle['dialCalls'] = []
   let startServerCalled = false
   if (o.serverPid !== undefined) writeFileSync(pidPath, `${o.serverPid}\n`)
   const stateEnv = { SLACK_STATE_DIR: stateDir }
@@ -744,11 +776,18 @@ function makeDeps(o: Overrides = {}): Bundle {
       await directorCall(LIST_CALL)
       return o.directorList ? o.directorList() : []
     },
+    dialClearLatch: async (port, persona) => {
+      dialCalls.push([port, persona])
+      events.push('dialClearLatch')
+      if (o.dialClearLatch) return o.dialClearLatch(port, persona)
+      unexpectedDials.push([port, persona])
+      throw new Error('precondition: no command in this case dials clear-latch\'s route')
+    },
   }
   return {
     deps, clock, exitCodes, exitTimes, spawnCalls, daemonSpawns, logOpens, closedFds, logInits, loadPaths,
     getCalls, readPaneCalls, directorCallTimes, statusCalls, pauseCalls, killCalls,
-    serverSignals, events, initClientCalls, initClientGates, configFileLoads, credentialsRuns, unlinked,
+    serverSignals, events, initClientCalls, initClientGates, configFileLoads, credentialsRuns, unlinked, dialCalls,
     get startServerCalled() { return startServerCalled },
   }
 }
@@ -5219,6 +5258,47 @@ describe('credentials <persona>', () => {
 })
 
 // ---------------------------------------------------------------------------
+// clear-latch <persona>: the entry point and the production dial (b.jg5
+// SRJ-509, SRJ-510; AC 47). Each of its rows over injected deps is
+// tests/clear-latch.test.ts's; its usage entry is the unknown-subcommand
+// block's.
+// ---------------------------------------------------------------------------
+
+describe('clear-latch <persona>: entry point and production wiring', () => {
+  test('production wiring (static): realDeps dials through dialClearLatch of src/clear-latch.ts with the port and the persona only', () => {
+    const code = stripComments(readFileSync(CLI_SOURCE, 'utf-8'))
+    const main = indicesOf(/\bif\s*\(\s*import\.meta\.main\s*\)/g, code)
+    expect(main).toHaveLength(1)
+    const mainBlock = code.slice(...balancedAfter(code, main[0]!, '{', '}'))
+    const props = objectProperties(mainBlock.slice(mainBlock.indexOf('const realDeps: CliDeps =')))
+    expect(props.get('dialClearLatch')).toMatch(/^\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*=>\s*dialClearLatch\(\s*\1\s*,\s*\2\s*\)$/)
+    expect(code).toMatch(/import\s*\{[^}]*\bdialClearLatch\b[^}]*\}\s*from\s*'\.\/clear-latch\.ts'/)
+  })
+
+  test('the real CLI: `clear-latch` alone is accepted and prints its own usage line (not the unknown-subcommand usage), exits 2 and leaves the tree as it was', () => {
+    const before = snapshotTree()
+
+    const result = runCli([CLEAR_LATCH_COMMAND])
+
+    expect(result.status).toBe(2)
+    expect(result.stderr).toBe(`${CLEAR_LATCH_USAGE}\n`)
+    expect(result.stdout).toBe('')
+    expect(snapshotTree()).toEqual(before)
+  })
+
+  test('the real CLI: `clear-latch <name>` with no PID file gets the argument after the subcommand, exits 1 with the no-server line and leaves the tree as it was', () => {
+    const before = snapshotTree()
+
+    const result = runCli([CLEAR_LATCH_COMMAND, OPS_NAME])
+
+    expect(result.status).toBe(1)
+    expect(result.stderr).toBe(`${clearLatchCliNoServerLine()}\n`)
+    expect(result.stdout).toBe('')
+    expect(snapshotTree()).toEqual(before)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // The retired-key record: only the server writes it (b.jg5 SRJ-801)
 //
 // The CLI shares modules with the server (src/reload.ts, src/config.ts), so
@@ -5279,12 +5359,24 @@ describe('no CLI command writes the retired-key record (b.jg5 SRJ-801)', () => {
     return { serverPid: 4242, isProcessRunning: () => ++calls === 1 }
   }
 
+  /**
+   * A running server with its `server.port` record, whose route answers that
+   * the Ops persona's latch was cleared (b.jg5 SRJ-509, SRJ-510); the dial is
+   * a stub, so no request is made.
+   */
+  const clearsOnRunningServer = (): Overrides => {
+    writeServerPortRecord(serverPortFilePath(stateDir), { pid: 4242, port: 39_999 })
+    const answer: ClearLatchDialAnswer = { status: 200, body: JSON.stringify({ ok: true, persona: OPS_NAME, cleared: true }) }
+    return { serverPid: 4242, isProcessRunning: () => true, dialClearLatch: async () => answer }
+  }
+
   const COMMANDS: Array<[string, () => Overrides, (b: Bundle) => Promise<void>, boolean]> = [
     ['start (pre-flight and daemon start)', () => ({}), (b) => createCli(b.deps).start(), false],
     ['stop', upOnce, (b) => createCli(b.deps).stop(), false],
     ['stop --stop-bots', upOnce, (b) => createCli(b.deps).stop({ stopBots: true }), true],
     ['clean_restart', () => ({}), (b) => createCli(b.deps).clean_restart(), true],
     ['credentials <persona>', () => ({}), (b) => createCli(b.deps).credentials([OPS_NAME]), false],
+    ['clear-latch <persona> (a running server clears the latch)', clearsOnRunningServer, (b) => createCli(b.deps).clearLatch([OPS_NAME]), false],
   ]
 
   test.each(COMMANDS.flatMap(([label, overrides, run, readsRows]) => [
@@ -5297,8 +5389,9 @@ describe('no CLI command writes the retired-key record (b.jg5 SRJ-801)', () => {
     await run(b).catch((err) => { if (!(err instanceof ExitError)) throw err })
 
     // The command acted: the daemon spawned, the server signalled, the rows
-    // prechecked, read and torn down, or the script run.
-    expect(b.daemonSpawns.length + b.serverSignals.length + b.credentialsRuns.length + b.spawnCalls.length).toBeGreaterThan(0)
+    // prechecked, read and torn down, the script run, or clear-latch's route
+    // dialled.
+    expect(b.daemonSpawns.length + b.serverSignals.length + b.credentialsRuns.length + b.spawnCalls.length + b.dialCalls.length).toBeGreaterThan(0)
     if (readsRows) {
       expect(getCalls).toEqual([{ claude_instance_id: opsId() }])
       expect(readPaneCalls).toEqual([{ claude_instance_id: opsId(), n_lines: PROBE_PANE_READ_LINES }])
@@ -5397,17 +5490,23 @@ describe('unknown subcommand', () => {
     expect(reloadTermsIn(output)).toEqual([])
   })
 
-  test('AC 74: no arguments exits non-zero with usage listing exactly start, stop, clean_restart and credentials, and only --stop-bots, under stop, with no reload wording', () => {
+  test('AC 74, AC 47: no arguments exits non-zero with usage listing exactly start, stop, clean_restart, credentials and clear-latch (with SRJ-509\'s line), and only --stop-bots, under stop, with no reload wording', () => {
     const result = runCli([])
 
     expect(result.status).not.toBe(0)
+    // The printed usage is the exported text, line for line, on stderr only.
+    expect(result.stderr).toBe(CLI_USAGE_LINES.map((line) => `${line}\n`).join(''))
+    expect(result.stdout).toBe('')
     const usage = usageEntries(result.output)
-    expect(usage.synopsis.sort()).toEqual(['clean_restart', 'credentials', 'start', 'stop'])
-    expect(usage.listed.sort()).toEqual(['clean_restart', 'credentials', 'start', 'stop'])
+    expect(usage.synopsis.sort()).toEqual(['clean_restart', 'clear-latch', 'credentials', 'start', 'stop'])
+    expect(usage.listed.sort()).toEqual(['clean_restart', 'clear-latch', 'credentials', 'start', 'stop'])
     expect(usage.flags).toEqual({ stop: ['--stop-bots'] })
     expect(usage.unexpected).toEqual([])
     expect(usage.allFlags).toEqual(['--stop-bots'])
     expect(reloadTermsIn(result.output)).toEqual([])
+    // b.jg5 SRJ-509: clear-latch's one entry is the exported one (its wording is
+    // pinned against SRJ-509's line in tests/clear-latch.test.ts's pin table).
+    expect(result.stderr.split('\n').filter((line) => /^\s+clear-latch\b/.test(line))).toEqual([CLEAR_LATCH_USAGE_ENTRY])
   })
 
   describe('AC 74: hidden subcommands', () => {

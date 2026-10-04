@@ -17,6 +17,22 @@
  *                    credentials file from the operator's terminal, by
  *                    running the packaged `scripts/write-credentials.sh`
  *                    (b.av2 SR-12, SR-1.4 part).
+ *   clear-latch    — `clear-latch <persona>`: clear that persona's latch on
+ *                    the running server, through one `POST /clear-latch` to
+ *                    `127.0.0.1` at the port in `server.port` (b.jg5 SRJ-509,
+ *                    SRJ-510). For the operator only: nothing offers it to a
+ *                    bot (SRJ-511).
+ *
+ * `clear-latch` checks the PID file as `stop` does (`readServerPid`): an
+ * absent, unreadable or stale PID file is "no server is running". It uses
+ * `server.port` only when the PID it records is the running server's, and
+ * never the configuration file or the last-applied record. It waits for the
+ * answer at most CLEAR_LATCH_WAIT_MS on the injected clock: a wait that runs
+ * out is the "did not confirm" line, since the clear may still run in the
+ * persona's turn. It makes no agent-director call, loads no configuration,
+ * writes and removes no file and never repeats its argument. Each outcome
+ * prints one line to stderr (`CLEAR_LATCH_USAGE` and the `clearLatchCli*Line`
+ * builders) and exits 2 (usage), 1 or 0.
  *
  * `start`, `stop` and `clean_restart` take their settings and persona set from
  * the configuration the server runs (b.av2 SR-8.7): the last-applied record
@@ -107,7 +123,15 @@ import { join, resolve } from 'path'
 import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, statSync, unlinkSync } from 'fs'
 import { spawn, spawnSync } from 'child_process'
 import { isProcessRunning } from './pid.ts'
-import { removeServerPortRecord, serverPortFilePath } from './clear-latch.ts'
+import {
+  CLEAR_LATCH_COMMAND,
+  dialClearLatch,
+  parseClearLatchAnswer,
+  readServerPortRecord,
+  removeServerPortRecord,
+  serverPortFilePath,
+  type ClearLatchDialAnswer,
+} from './clear-latch.ts'
 import {
   agentDirectorCallTimeoutMsOf,
   loadPersonaConfig,
@@ -127,7 +151,7 @@ import type { Phase1GetResult } from './ad-phase1-types.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import { getClient } from './agent-director-client.ts'
 import type { Client, ListRow } from 'agent-director'
-import { SERVICE_LABEL, personaInstanceId, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
+import { SERVICE_LABEL, personaInstanceId, personaKey, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
 import { REFUSAL_KIND_CLIENT_TOO_OLD, runStartupGate } from './agent-director-startup.ts'
 import type { StartupGateDeps, StartupGateOptions, StartupGateRefusalKind } from './agent-director-startup.ts'
 import { PROBE_PANE_READ_LINES } from './pane-read.ts'
@@ -227,6 +251,93 @@ export const CREDENTIALS_SCRIPT_PATH = resolve(import.meta.dir, '..', 'scripts',
 export const CREDENTIALS_USAGE = 'Usage: claude-slack-channel-bots credentials <persona name or key>'
 
 // ---------------------------------------------------------------------------
+// The usage text
+// ---------------------------------------------------------------------------
+
+/** `clear-latch`'s entry in the usage text (b.jg5 SRJ-509). */
+export const CLEAR_LATCH_USAGE_ENTRY =
+  `  ${CLEAR_LATCH_COMMAND}    <persona name or key>: clear a persona's latch ` +
+  '(a session conflict, an unusable recorded name or a launch with no recorded start) on the running server'
+
+/**
+ * The usage text, one line per entry: printed to stderr, line by line, when
+ * the entry point gets no subcommand or one it does not accept, before it
+ * exits 1. It lists every subcommand the entry point accepts and `stop`'s one
+ * flag, and nothing else (b.av2 SR-8.8: no reload gesture is advertised).
+ */
+export const CLI_USAGE_LINES: readonly string[] = Object.freeze([
+  `Usage: cli.ts <start|stop|clean_restart|credentials|${CLEAR_LATCH_COMMAND}> [flags]`,
+  '',
+  '  start          Validate prerequisites and start the server in the background',
+  '  stop           Send SIGTERM to a running server',
+  '  clean_restart  Exit all managed sessions, then stop and start the server',
+  "  credentials    <persona name or key>: write that persona's credentials file from this terminal",
+  CLEAR_LATCH_USAGE_ENTRY,
+  '',
+  'stop flags:',
+  '  --stop-bots    Gracefully exit all managed bots before stopping the server',
+])
+
+// ---------------------------------------------------------------------------
+// clear-latch's lines and wait (b.jg5 SRJ-509, SRJ-510)
+// ---------------------------------------------------------------------------
+
+/** `clear-latch`'s usage line, printed with exit 2 when it is not given exactly one non-empty argument. */
+export const CLEAR_LATCH_USAGE = `Usage: claude-slack-channel-bots ${CLEAR_LATCH_COMMAND} <persona name or key>`
+
+/**
+ * How long `clear-latch` waits for the server's answer, on the CLI's injected
+ * clock (`CliDeps.now`, `CliDeps.sleep`). A wait that runs out is the "did
+ * not confirm" line, whose "30 s" is this value: the route answers once the
+ * clear has run in the persona's lifecycle serializer turn, so a busy turn
+ * can outlast the wait, and the clear it received still runs.
+ */
+export const CLEAR_LATCH_WAIT_MS = 30_000
+
+/** No server is running: the PID file is absent, unreadable or stale, as `stop` reads it. Pure. */
+export function clearLatchCliNoServerLine(): string {
+  return `${CLEAR_LATCH_COMMAND}: no server is running`
+}
+
+/**
+ * The server cannot be reached; `cause` is a `server.port` read's cause
+ * (`SERVER_PORT_CAUSE_*`), a failed connection described by
+ * `describeThrownValue`, or an unexpected answer's status
+ * (`clearLatchStatusCause`). Pure.
+ */
+export function clearLatchCliNotAnsweredLine(cause: string): string {
+  return `${CLEAR_LATCH_COMMAND}: the server did not answer: ${cause}`
+}
+
+/** The cause of an answer other than 200 or 404, or of a malformed 200: the status, never the body. Pure. */
+export function clearLatchStatusCause(status: number): string {
+  return `HTTP ${status}`
+}
+
+/** No answer within CLEAR_LATCH_WAIT_MS: the clear may still run. Pure. */
+export function clearLatchCliNotConfirmedLine(): string {
+  return (
+    `${CLEAR_LATCH_COMMAND}: the server did not confirm within ${CLEAR_LATCH_WAIT_MS / 1000} s; ` +
+    "the clear is queued and may still run. Check this persona's latch in the server log before trying again."
+  )
+}
+
+/** No applied persona has the name or key; the argument is never repeated. Pure. */
+export function clearLatchCliNoPersonaLine(): string {
+  return `${CLEAR_LATCH_COMMAND}: no persona in the running configuration has that name or key`
+}
+
+/** The persona named `name` in the server's answer was latched and is cleared; its key is `personaKey(name)`. Pure. */
+export function clearLatchCliClearedLine(name: string): string {
+  return `${CLEAR_LATCH_COMMAND}: cleared the latch of persona ${renderPersonaRef(name, personaKey(name))}`
+}
+
+/** The persona named `name` in the server's answer was not latched; its key is `personaKey(name)`. Pure. */
+export function clearLatchCliNotLatchedLine(name: string): string {
+  return `${CLEAR_LATCH_COMMAND}: persona ${renderPersonaRef(name, personaKey(name))} was not latched; nothing changed`
+}
+
+// ---------------------------------------------------------------------------
 // Daemon child
 // ---------------------------------------------------------------------------
 
@@ -280,9 +391,9 @@ export interface CliDeps {
   fileSize: (path: string) => number
   /** A file's bytes from `offset` to the end, as UTF-8 text; '' when it cannot be read. */
   readFileFrom: (path: string, offset: number) => string
-  /** Current time in milliseconds (the clock of the daemon startup wait, `stop`'s exit polls, the precheck's tries, the teardown's pause tries, poll and kill tries, and `clean_restart`'s answer check). */
+  /** Current time in milliseconds (the clock of the daemon startup wait, `stop`'s exit polls, the precheck's tries, the teardown's pause tries, poll and kill tries, `clean_restart`'s answer check, and `clear-latch`'s `CLEAR_LATCH_WAIT_MS` wait for the server's answer). */
   now: () => number
-  /** Resolve after `ms` milliseconds (the clock of the daemon startup wait, `stop`'s exit polls, the precheck's tries, the teardown's pause tries, poll and kill tries, and `clean_restart`'s answer check). */
+  /** Resolve after `ms` milliseconds (the clock of the daemon startup wait, `stop`'s exit polls, the precheck's tries, the teardown's pause tries, poll and kill tries, `clean_restart`'s answer check, and `clear-latch`'s `CLEAR_LATCH_WAIT_MS` wait for the server's answer). */
   sleep: (ms: number) => Promise<void>
   /** Remove a file. */
   unlinkSync: (path: string) => void
@@ -417,6 +528,61 @@ export interface CliDeps {
    * Writes nothing else: no reload file, no retired-key record.
    */
   recordStartupErrorEntry: (classLabel: string, message: string) => void
+  /**
+   * `clear-latch`'s one request (b.jg5 SRJ-510): `POST /clear-latch` of
+   * `{ "persona": <persona> }` to `127.0.0.1` at `port` (`dialClearLatch`,
+   * `src/clear-latch.ts`, in production), answering the status and the body
+   * text, or rejecting when the connection or the body read fails. It sets
+   * no timeout of its own: the handler bounds the wait at CLEAR_LATCH_WAIT_MS
+   * on `now` and `sleep`. Logs nothing.
+   */
+  dialClearLatch: (port: number, persona: string) => Promise<ClearLatchDialAnswer>
+}
+
+// ---------------------------------------------------------------------------
+// The PID file, read as `stop` reads it (b.jg5 SRJ-509)
+// ---------------------------------------------------------------------------
+
+/** The PID file does not exist. */
+export const SERVER_PID_ABSENT = 'absent'
+/** The PID file could not be read, or does not start with a number. */
+export const SERVER_PID_UNREADABLE = 'unreadable'
+/** The PID file names a process that is not running. */
+export const SERVER_PID_STALE = 'stale'
+/** The PID file names a running process: the server. */
+export const SERVER_PID_RUNNING = 'running'
+
+/**
+ * What the PID file says about the server. An unreadable file's `error` is
+ * what the read threw, or the invalid-PID error for text that is not a number.
+ */
+export type ServerPidRead =
+  | { readonly kind: typeof SERVER_PID_ABSENT }
+  | { readonly kind: typeof SERVER_PID_UNREADABLE; readonly error: unknown }
+  | { readonly kind: typeof SERVER_PID_STALE; readonly pid: number }
+  | { readonly kind: typeof SERVER_PID_RUNNING; readonly pid: number }
+
+/** The calls the PID file's read makes, in `CliDeps`'s shape. */
+export type ServerPidReadDeps = Pick<CliDeps, 'existsSync' | 'readFileSync' | 'isProcessRunning'>
+
+/**
+ * Read the PID file at `pidFile`: absent; unreadable (a failed read, or text
+ * whose start is not a number); stale (its process is not running); or
+ * running, with the PID. The one reading `stop` and `clear-latch` share
+ * (b.jg5 SRJ-509): it only reads, and each caller decides what to print and
+ * what to remove. A throw from `existsSync` or `isProcessRunning` propagates.
+ */
+export function readServerPid(pidFile: string, deps: ServerPidReadDeps): ServerPidRead {
+  if (!deps.existsSync(pidFile)) return { kind: SERVER_PID_ABSENT }
+  let pid: number
+  try {
+    const raw = deps.readFileSync(pidFile).trim()
+    pid = parseInt(raw, 10)
+    if (isNaN(pid)) throw new Error(`invalid PID: ${raw}`)
+  } catch (error) {
+    return { kind: SERVER_PID_UNREADABLE, error }
+  }
+  return deps.isProcessRunning(pid) ? { kind: SERVER_PID_RUNNING, pid } : { kind: SERVER_PID_STALE, pid }
 }
 
 // ---------------------------------------------------------------------------
@@ -561,6 +727,35 @@ export interface CliHandlers {
   clean_restart: () => Promise<void>
   /** `credentials <persona>`, given the arguments after the subcommand. */
   credentials: (args: readonly string[]) => Promise<void>
+  /** `clear-latch <persona>`, given the arguments after the subcommand (b.jg5 SRJ-509). */
+  clearLatch: (args: readonly string[]) => Promise<void>
+}
+
+/** How `clear-latch`'s request ended: an answer, a failed dial, or no answer within CLEAR_LATCH_WAIT_MS. */
+type ClearLatchOutcome =
+  | { readonly kind: 'answered'; readonly answer: ClearLatchDialAnswer }
+  | { readonly kind: 'failed'; readonly error: unknown }
+  | { readonly kind: 'timed-out' }
+
+/**
+ * `clear-latch`'s line and exit code for its request's outcome (b.jg5
+ * SRJ-509, SRJ-510): a well-formed 200 is the cleared or the not-latched
+ * line, exit 0; a 404 the no-persona line; a failed dial the not-answered
+ * line with its description; any other status, and a malformed 200, the
+ * not-answered line naming the status only; no answer in time the "did not
+ * confirm" line; each of these exit 1. Pure.
+ */
+function clearLatchReportOf(outcome: ClearLatchOutcome): { readonly line: string; readonly exitCode: number } {
+  if (outcome.kind === 'timed-out') return { line: clearLatchCliNotConfirmedLine(), exitCode: 1 }
+  if (outcome.kind === 'failed') return { line: clearLatchCliNotAnsweredLine(describeThrownValue(outcome.error)), exitCode: 1 }
+  const { status, body } = outcome.answer
+  if (status === 404) return { line: clearLatchCliNoPersonaLine(), exitCode: 1 }
+  const answer = status === 200 ? parseClearLatchAnswer(body) : null
+  if (answer === null) return { line: clearLatchCliNotAnsweredLine(clearLatchStatusCause(status)), exitCode: 1 }
+  return {
+    line: answer.cleared ? clearLatchCliClearedLine(answer.persona) : clearLatchCliNotLatchedLine(answer.persona),
+    exitCode: 0,
+  }
 }
 
 /** A persona the precheck could not reach, with its failure (b.jg5 SRJ-901). */
@@ -1213,23 +1408,18 @@ export function createCli(deps: CliDeps): CliHandlers {
     // path that removes it, so a server ended by SIGKILL leaves none.
     const serverPortFile = serverPortFilePath(stateDir)
 
-    if (!deps.existsSync(pidFile)) {
+    // The PID file's reading `clear-latch` shares (b.jg5 SRJ-509).
+    const server = readServerPid(pidFile, deps)
+    if (server.kind === SERVER_PID_ABSENT) {
       console.error('server is not running')
       return 0
     }
-
-    let pid: number
-    try {
-      const raw = deps.readFileSync(pidFile).trim()
-      pid = parseInt(raw, 10)
-      if (isNaN(pid)) throw new Error(`invalid PID: ${raw}`)
-    } catch (err) {
+    if (server.kind === SERVER_PID_UNREADABLE) {
+      const err = server.error
       console.error(`[slack] Could not read PID file: ${err}`)
       return 1
     }
-
-    if (!deps.isProcessRunning(pid!)) {
-      // Stale PID file
+    if (server.kind === SERVER_PID_STALE) {
       try {
         deps.unlinkSync(pidFile)
       } catch { /* ignore */ }
@@ -1237,6 +1427,7 @@ export function createCli(deps: CliDeps): CliHandlers {
       console.error('server is not running (removed stale PID file)')
       return 0
     }
+    const pid = server.pid
 
     // Load stop_timeout from the record or config (fall back to 30s if
     // unavailable, a pre-persona file included). A read failure is reported in
@@ -1255,12 +1446,12 @@ export function createCli(deps: CliDeps): CliHandlers {
     }
 
     // Live process — send SIGTERM and poll until exit or stop_timeout
-    deps.kill(pid!, 'SIGTERM')
+    deps.kill(pid, 'SIGTERM')
 
     const deadline = deps.now() + stopTimeoutMs
     while (deps.now() < deadline) {
       await deps.sleep(STOP_POLL_MS)
-      if (!deps.isProcessRunning(pid!)) {
+      if (!deps.isProcessRunning(pid)) {
         try { deps.unlinkSync(pidFile) } catch { /* ignore */ }
         removeServerPortRecord(serverPortFile, deps)
         console.error('[slack] Server stopped.')
@@ -1270,13 +1461,13 @@ export function createCli(deps: CliDeps): CliHandlers {
 
     // SIGTERM timed out — escalate to SIGKILL
     console.error(`[slack] Warning: server did not stop within ${stopTimeoutMs / 1000}s after SIGTERM — sending SIGKILL.`)
-    deps.kill(pid!, 'SIGKILL')
+    deps.kill(pid, 'SIGKILL')
 
     // Poll briefly (~2s) to confirm death after SIGKILL
     const killDeadline = deps.now() + STOP_KILL_WAIT_MS
     while (deps.now() < killDeadline) {
       await deps.sleep(STOP_POLL_MS)
-      if (!deps.isProcessRunning(pid!)) {
+      if (!deps.isProcessRunning(pid)) {
         try { deps.unlinkSync(pidFile) } catch { /* ignore */ }
         removeServerPortRecord(serverPortFile, deps)
         console.error('[slack] Server killed.')
@@ -1460,7 +1651,77 @@ export function createCli(deps: CliDeps): CliHandlers {
     return deps.exit(deps.runCredentialsScript(persona.credentials_file))
   }
 
-  return { start, stop, clean_restart, credentials }
+  /**
+   * `clear-latch <persona>` (b.jg5 SRJ-509, SRJ-510), in this order: the
+   * argument check (exactly one non-empty argument, else the usage line and
+   * exit 2); the PID file, read as `stop` reads it (`readServerPid`), where
+   * anything but a running server is "no server is running"; `server.port`,
+   * used only when it records that server's PID (`readServerPortRecord`), an
+   * unusable record being "cannot be reached" with its cause and no request;
+   * then one request to `127.0.0.1` at the record's port
+   * (`clearLatchRequest`), whose outcome gives the line and the exit code
+   * (`clearLatchReportOf`). Every line goes to stderr and none repeats the
+   * argument. Ends through `deps.exit`, so neither the losing wait nor an
+   * unanswered request keeps the process alive. Never reads the
+   * configuration file or the last-applied record, builds no agent-director
+   * client, and writes and removes no file.
+   */
+  async function clearLatch(args: readonly string[]): Promise<void> {
+    if (args.length !== 1 || args[0] === '') {
+      console.error(CLEAR_LATCH_USAGE)
+      return deps.exit(2)
+    }
+    const stateDir = deps.resolveStateDir()
+    const server = readServerPid(join(stateDir, 'server.pid'), deps)
+    if (server.kind !== SERVER_PID_RUNNING) {
+      console.error(clearLatchCliNoServerLine())
+      return deps.exit(1)
+    }
+    const record = readServerPortRecord(serverPortFilePath(stateDir), server.pid, deps)
+    if (!record.ok) {
+      console.error(clearLatchCliNotAnsweredLine(record.cause))
+      return deps.exit(1)
+    }
+    const { line, exitCode } = clearLatchReportOf(await clearLatchRequest(record.record.port, args[0]))
+    console.error(line)
+    return deps.exit(exitCode)
+  }
+
+  /**
+   * `clear-latch`'s one request of `target` to `port` (`deps.dialClearLatch`)
+   * raced against CLEAR_LATCH_WAIT_MS on the injected clock: the wait sleeps
+   * (`deps.sleep`) until `deps.now` reaches its deadline, and stops once the
+   * request has settled. Answers the request's answer or failure, or
+   * `timed-out` when the deadline comes first; the request is not cancelled,
+   * and the route still runs a clear it has received. Never rejects for the
+   * request; a throw from `now` or `sleep` propagates.
+   */
+  async function clearLatchRequest(port: number, target: string): Promise<ClearLatchOutcome> {
+    let settled = false
+    const dialed = (async (): Promise<ClearLatchOutcome> => {
+      try {
+        return { kind: 'answered', answer: await deps.dialClearLatch(port, target) }
+      } catch (error) {
+        return { kind: 'failed', error }
+      }
+    })()
+    const waited = (async (): Promise<ClearLatchOutcome> => {
+      const deadline = deps.now() + CLEAR_LATCH_WAIT_MS
+      for (let left = CLEAR_LATCH_WAIT_MS; left > 0 && !settled; left = deadline - deps.now()) {
+        await deps.sleep(left)
+      }
+      return { kind: 'timed-out' }
+    })()
+    // A wait that fails after the request has won is not this command's failure.
+    waited.catch(() => {})
+    try {
+      return await Promise.race([dialed, waited])
+    } finally {
+      settled = true
+    }
+  }
+
+  return { start, stop, clean_restart, credentials, clearLatch }
 }
 
 // ---------------------------------------------------------------------------
@@ -1619,16 +1880,14 @@ export async function initProductionClient(
 if (import.meta.main) {
   const subcommand = process.argv[2]
 
-  if (subcommand !== 'start' && subcommand !== 'stop' && subcommand !== 'clean_restart' && subcommand !== 'credentials') {
-    console.error('Usage: cli.ts <start|stop|clean_restart|credentials> [flags]')
-    console.error('')
-    console.error('  start          Validate prerequisites and start the server in the background')
-    console.error('  stop           Send SIGTERM to a running server')
-    console.error('  clean_restart  Exit all managed sessions, then stop and start the server')
-    console.error("  credentials    <persona name or key>: write that persona's credentials file from this terminal")
-    console.error('')
-    console.error('stop flags:')
-    console.error('  --stop-bots    Gracefully exit all managed bots before stopping the server')
+  if (
+    subcommand !== 'start' &&
+    subcommand !== 'stop' &&
+    subcommand !== 'clean_restart' &&
+    subcommand !== 'credentials' &&
+    subcommand !== CLEAR_LATCH_COMMAND
+  ) {
+    for (const line of CLI_USAGE_LINES) console.error(line)
     process.exit(1)
   }
 
@@ -1672,6 +1931,8 @@ if (import.meta.main) {
     appendServerLogLine: (line, at) => appendLogLine(join(resolveServerStateDir(), 'server.log'), line, at),
     recordStartupErrorEntry: (classLabel, message) =>
       recordStartupError(classLabel, message, undefined, { logDir: resolveServerStateDir(), omitStderr: true }),
+    // b.jg5 SRJ-510: clear-latch's one request to 127.0.0.1, with no timeout of its own.
+    dialClearLatch: (port, persona) => dialClearLatch(port, persona),
   }
 
   const cli = createCli(realDeps)
@@ -1689,6 +1950,11 @@ if (import.meta.main) {
     })
   } else if (subcommand === 'credentials') {
     cli.credentials(process.argv.slice(3)).catch((err) => {
+      console.error('[slack] Fatal:', err)
+      process.exit(1)
+    })
+  } else if (subcommand === CLEAR_LATCH_COMMAND) {
+    cli.clearLatch(process.argv.slice(3)).catch((err) => {
       console.error('[slack] Fatal:', err)
       process.exit(1)
     })

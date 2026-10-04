@@ -24,6 +24,9 @@
  * - the README's receiving section (SR-12, SR-4.4): its table's row for each
  *   `via` value shows that value, and both injected kinds' rows show none;
  * - the MCP instructions carry no reload wording (AC 74, SR-8.8);
+ * - the MCP instructions and the Reply Guard's reminder text name no
+ *   spelling of `clear-latch` (AC 47, b.jg5 SRJ-511); the README and the
+ *   skills may, for the operator;
  * - the two agent-director refusal classes, `ad-below-phase1-floor` and
  *   `ad-system-install-too-old` (b.jg5 SRJ-208): the debugging skill has an
  *   entry per label inside its refusal section and README "Startup errors" a
@@ -68,6 +71,7 @@ import {
   splitFences,
 } from './test-helpers/markdown.ts'
 import { RELOAD_TERMS } from './test-helpers/reload-terms.ts'
+import { CLEAR_LATCH_TERMS, clearLatchTermsIn } from './test-helpers/clear-latch-terms.ts'
 import { UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
 import { CRONTABLE_TEMPLATE_HEADER } from '../src/cron-bootstrap.ts'
 import type { Via } from '../src/delivery-decision.ts'
@@ -1198,6 +1202,29 @@ describe('AC 74: the MCP instructions carry no reload wording (SR-8.8)', () => {
     const text = mcpInstructionsText()
     expect(typeof term === 'string' ? text.includes(term) : term.test(text)).toBe(false)
   })
+})
+
+// ---------------------------------------------------------------------------
+// AC 47 (shipped-docs leg): clear-latch is not offered to a bot (b.jg5 SRJ-511)
+// ---------------------------------------------------------------------------
+
+// `CLEAR_LATCH_TERMS` (tests/test-helpers/clear-latch-terms.ts) is the list the
+// tool-list and notice-text cases use too. The command is the operator's: the
+// README and the debugging skill describe it, so they are not read here and the
+// command is not one of `FORBIDDEN_TERMS`; the manifest, the crontable header
+// and the CLI usage text are not read either.
+describe('AC 47: the MCP instructions and the Reply Guard reminder do not name clear-latch (SRJ-511)', () => {
+  const BOT_FACING_TEXTS: [name: string, read: () => string][] = [
+    [MCP_INSTRUCTIONS_NAME, mcpInstructionsText],
+    [`${REPLY_GUARD_FILE} (reminder text)`, replyGuardReminderText],
+  ]
+
+  test.each(BOT_FACING_TEXTS.flatMap(([name, read]) => CLEAR_LATCH_TERMS.map((term) => [name, term, read] as const)))(
+    '%s: %s is absent',
+    (_name, term, read) => {
+      expect(clearLatchTermsIn(read()).filter((found) => found === term)).toEqual([])
+    },
+  )
 })
 
 // ---------------------------------------------------------------------------

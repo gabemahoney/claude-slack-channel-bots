@@ -594,7 +594,7 @@ function emitRowDecision(
  * state=check_permission, with no open-row exemption — so the only correct
  * recovery is read-pane + kill/respawn.
  */
-function buildWedgeWarningText(persona: Pick<Persona, 'name' | 'key'>, claudeInstanceId: string): string {
+export function buildWedgeWarningText(persona: Pick<Persona, 'name' | 'key'>, claudeInstanceId: string): string {
   return formatPersonaNotice(persona, wedgeWarningBody(claudeInstanceId))
 }
 

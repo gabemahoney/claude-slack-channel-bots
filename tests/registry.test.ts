@@ -16,6 +16,8 @@
  * held directory is refused as held, whichever persona names it, with one
  * line naming the directory and every held id, before any persona is
  * matched; a throwing query refuses as held.
+ * The tool-list block also holds b.jg5 SRJ-511 (AC 47): no tool definition
+ * and not the instructions a session receives name `clear-latch`.
  * The global `fetch` is stubbed for every test (it throws unless a test sets
  * `h.fetchHandler`), so no test reaches the network, and every tool result
  * and log line is leak-checked in `afterEach`.
@@ -102,6 +104,7 @@ import {
   writtenFile,
 } from './test-helpers/credentials.ts'
 import { reloadTermsIn } from './test-helpers/reload-terms.ts'
+import { clearLatchTermsIn } from './test-helpers/clear-latch-terms.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -2179,6 +2182,28 @@ describe('tool list and instructions', () => {
     expect(Object.fromEntries(tools.map((t) => [t.name, reloadTermsIn(JSON.stringify(t))]))).toEqual(
       Object.fromEntries(tools.map((t) => [t.name, []])),
     )
+  })
+
+  // b.jg5 SRJ-511 (AC 47): the clear-latch command is the operator's alone. The
+  // whole serialized definition of every tool (name, description, every schema
+  // property name and description) and the instructions the session receives
+  // carry no spelling of it (tests/test-helpers/clear-latch-terms.ts); a
+  // failure names the tool, or the instructions, and the terms found.
+  test('SRJ-511 (AC 47): no tool definition and not the instructions the session receives name clear-latch in any spelling', async () => {
+    const { client } = await openPersonaSession(h.alpha)
+
+    const { tools } = await client.listTools()
+    const instructions = client.getInstructions()
+
+    expect(tools.length).toBeGreaterThan(0)
+    expect(typeof instructions).toBe('string')
+    expect({
+      tools: Object.fromEntries(tools.map((t) => [t.name, clearLatchTermsIn(JSON.stringify(t))])),
+      instructions: clearLatchTermsIn(instructions ?? ''),
+    }).toEqual({
+      tools: Object.fromEntries(tools.map((t) => [t.name, []])),
+      instructions: [],
+    })
   })
 
   test.each(['reload', 'apply_config'])(

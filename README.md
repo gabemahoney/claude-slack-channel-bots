@@ -384,7 +384,7 @@ These top-level fields apply to the whole server. A confirmed change to one take
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `bind` | string | `"127.0.0.1"` | Interface the HTTP server binds to. Use `"0.0.0.0"` to expose on all interfaces. The in-process cron scheduler delivers via `127.0.0.1`, so `bind` must include loopback (the default, or `0.0.0.0`) for scheduled fires to work. |
+| `bind` | string | `"127.0.0.1"` | Interface the HTTP server binds to. Use `"0.0.0.0"` to expose on all interfaces. The in-process cron scheduler delivers via `127.0.0.1`, and [`clear-latch`](#claude-slack-channel-bots-clear-latch) reaches the server there, so `bind` must include loopback (the default, or `0.0.0.0`) for scheduled fires and `clear-latch` to work. |
 | `port` | number | `3100` | Port the HTTP server listens on. |
 | `session_restart_delay` | number | `60` | Seconds to wait before auto-restarting a dead session. Set to `0` to disable auto-restart and the health check's reconnects (not the retries of a persona agent-director refused; see [Troubleshooting](#troubleshooting)); a persona whose session runs but can't receive messages then gets a *Not connected* or *Not receiving messages* notice at its destination (see [Troubleshooting](#troubleshooting)). At any value, a persona reported as `working` that the server can't prove idle for 10 minutes gets a *Not connected* notice. Must be non-negative. |
 | `health_check_interval` | number | `120` | Seconds between periodic liveness polls. Set to `0` to disable; the retries of a persona agent-director refused still run. Must be non-negative. |
@@ -697,7 +697,7 @@ A confirmation needs a running server. When the record keeps the server from sta
 
 ## CLI Reference
 
-The `claude-slack-channel-bots` binary exposes four subcommands.
+The `claude-slack-channel-bots` binary exposes five subcommands.
 
 ### `claude-slack-channel-bots start`
 
@@ -980,11 +980,41 @@ It needs `bash` and `curl`. Exit codes: `0` when the file was written; `2` witho
 
 On a running server, a new or replaced credentials file waits for confirmation like a `config.json` edit (see [Reload](#reload)).
 
+### `claude-slack-channel-bots clear-latch`
+
+Ends one persona's hold on the running server, whichever of these held it: a *Held: tmux session conflict*, *Held: unusable tmux session name* or *Held: launch start not recorded* notice (see "How a hold ends" under [Troubleshooting](#troubleshooting)). A *Cannot launch* hold is not one of these: `clear-latch` does not end it and answers that the persona `was not latched` (see "A persona posts a *Cannot launch* notice" under [Troubleshooting](#troubleshooting)).
+
+```sh
+claude-slack-channel-bots clear-latch <persona>
+```
+
+`<persona>` is the persona's name or its key in the configuration the server runs; quote a name with spaces for your shell. Only that persona's hold is cleared.
+
+Use it once a human has resolved the hold's cause through the "Operator actions" section of agent-director's README: it brings the persona back at once instead of at the server's own check every 2 minutes, and it ends a hold that check cannot clear, such as one on a description the server does not recognise. It is for a human only: no bot is offered it. No restart is needed.
+
+When the persona was held, its destination gets one recovery notice, *Conflict cleared* or *Hold cleared*, and the server brings the persona up at once. If the cause is still there, the persona is held again, with one new notice.
+
+It prints one line on stderr and never repeats its argument:
+
+| Line | Exit | When |
+|---|---|---|
+| `Usage: claude-slack-channel-bots clear-latch <persona name or key>` | `2` | Not given exactly one non-empty argument. |
+| `clear-latch: no server is running` | `1` | `STATE_DIR/server.pid` is absent, unreadable or stale, read as `stop` reads it. |
+| `clear-latch: the server did not answer: <cause>` | `1` | The server could not be reached. `<cause>` says why: `server.port is absent`, `server.port could not be read`, `server.port is malformed`, `server.port holds a PID or port out of range` or `server.port was written by another process` (see [PID file](#pid-file)); the connection failed, for example `Error: connect ECONNREFUSED 127.0.0.1:<port>`; or the server gave an unexpected answer, `HTTP <status>`. Check that the server is running and its `bind` (below). |
+| `clear-latch: the server did not confirm within 30 s; the clear is queued and may still run. Check this persona's latch in the server log before trying again.` | `1` | No answer came within 30 s, for example while work for the persona was still running; the clear may still run. Look for the persona's `conflict-latch: persona=<key> cleared` line in `server.log` before running the command again. |
+| `clear-latch: no persona in the running configuration has that name or key` | `1` | No persona of the configuration the server runs has that name or key. Nothing changed. |
+| `clear-latch: cleared the latch of persona "<name>" (key=<key>)` | `0` | The persona was held; the hold is cleared. |
+| `clear-latch: persona "<name>" (key=<key>) was not latched; nothing changed` | `0` | The persona was not held, or only by a *Cannot launch* hold, which this command does not end. |
+
+It reaches the server at `127.0.0.1`, at the port the running server recorded in `server.port`, not at the `port` of `config.json`. It connects directly and ignores proxy environment variables such as `HTTP_PROXY`, so its argument never leaves the host. So the server's `bind` must be `127.0.0.1` (the default) or `0.0.0.0`, as scheduled prompts need. On any other `bind` it cannot reach the server, and a hold ends only by the server's own check every 2 minutes, by the persona's teardown (removing it, or a destructive change to it), or by a server restart, which drops every hold.
+
+It needs no agent-director, reads no configuration file and writes or removes no file.
+
 ### PID file
 
 The PID file is stored at `STATE_DIR/server.pid` (default: `~/.claude/channels/slack/server.pid`). It is written on startup and removed on clean shutdown. A conflict check at startup prevents running two servers against the same state directory.
 
-Beside it, `STATE_DIR/server.port` records the server's process ID and the port it actually listens on. The server writes it once it is listening and removes it on shutdown. A start that finds a stale PID file removes a stale `server.port` with it, and `stop` removes it with the PID file.
+Beside it, `STATE_DIR/server.port` records the server's process ID and the port it actually listens on. The server writes it once it is listening and removes it on shutdown. A start that finds a stale PID file removes a stale `server.port` with it, and `stop` removes it with the PID file. [`clear-latch`](#claude-slack-channel-bots-clear-latch) reads it to find the server, and uses it only when the process ID it records is the one in `server.pid`.
 
 ### Installing from a local worktree
 
@@ -1865,7 +1895,7 @@ What a check can lead to:
 
 A server start's clean-up of old instances holds nothing either: when one of its kills meets a session conflict, nobody is held and nothing is posted; the kill is only logged, and recorded as an `orphan-cleanup` entry (see [Startup errors](#startup-errors)). A confirmed change's teardown of the persona (a removal, or the old half of a `credentials_file` path or `working_directory` change) holds nothing: when its kill meets a session conflict, the persona is not held and nothing is posted; the conflict is only logged, to `server.log` and as a `persona-teardown-notice` entry in `startup-errors.log` (see [Startup errors](#startup-errors)). A *Held:* notice that a launch still running raises during the teardown is written there too, not posted.
 
-**How a hold ends.** The hold clears on its own once its cause is gone, found by the server's own check every 2 minutes; no restart is needed. After a human follows the "Operator actions" section of agent-director's README, the server notices within 2 minutes. By the hold (the first line of its notice, or the notice's title for the two row holds below):
+**How a hold ends.** The hold clears on its own once its cause is gone, found by the server's own check every 2 minutes; no restart is needed. After a human follows the "Operator actions" section of agent-director's README, the server notices within 2 minutes, or the human ends the hold at once with [`clear-latch`](#claude-slack-channel-bots-clear-latch), which also ends a hold the check cannot clear. By the hold (the first line of its notice, or the notice's title for the two row holds below):
 
 | Hold | What the check looks for | It clears when |
 |---|---|---|
@@ -1877,18 +1907,18 @@ A server start's clean-up of old instances holds nothing either: when one of its
 | Conflicting labels | Whether agent-director still notes conflicting labels on the row | The note is gone, and a look at a still-starting screen finds a screen or no session, or the restart attempt or launch tried again is not refused. |
 | *Held: unusable tmux session name* | The persona's row | The row is gone; the persona then comes up fresh. |
 | *Held: launch start not recorded* | The persona's row | The row reads running, ended or missing, or is gone. |
-| A description the server does not recognise | The persona's row | Only when the row is gone or has started running, as the first row says; otherwise only a removal, a destructive change or a server restart ends it (below). |
+| A description the server does not recognise | The persona's row | Only when the row is gone or has started running, as the first row says; otherwise only `clear-latch`, a removal, a destructive change or a server restart ends it (below). |
 
 A launch or restart attempt the check makes is "not refused" when it succeeds or fails outright (agent-director could not create its session, or the working directory is missing); a failure is then counted toward the restart limit with its usual notice.
 
-When a hold clears, the persona's destination gets one recovery notice, once per clear: *Conflict cleared* for a tmux session conflict, *Hold cleared* for an unusable tmux session name or a launch start not recorded. It says why the hold cleared (the row is gone, the row reads a given state, a retry was not refused, or the row finished and a relaunch was not refused) and closes with "CSCB is recovering this persona again." The persona is then brought up:
+When a hold clears, the persona's destination gets one recovery notice, once per clear: *Conflict cleared* for a tmux session conflict, *Hold cleared* for an unusable tmux session name or a launch start not recorded. It says why the hold cleared (the row is gone, the row reads a given state, a retry was not refused, the row finished and a relaunch was not refused, or it was cleared by hand) and closes with "CSCB is recovering this persona again." The persona is then brought up:
 
-- **Cleared by the check's read, or by a look at a still-starting screen, or a launch start not recorded whose row reads ended or missing:** nothing was launched, so the server brings the persona up at once, as a restart would. When the read found the row gone or running, it first runs agent-director's `find-missing` once, so a note your action has made stale is gone before the row is read again; if agent-director still notes conflicting labels on the row after that run, the persona is held again, with one new notice. When that run fails (agent-director not answering, for example), nothing is launched then and the persona's automatic retries take over (see "A persona is retried after agent-director refuses it" above).
+- **Cleared by the check's read, or by a look at a still-starting screen, or a launch start not recorded whose row reads ended or missing, or by `clear-latch`:** nothing was launched, so the server brings the persona up at once, as a restart would. When the read found the row gone or running, and after `clear-latch`, it first runs agent-director's `find-missing` once, so a note your action has made stale is gone before the row is read again; if agent-director still notes conflicting labels on the row after that run, the persona is held again, with one new notice. When that run fails (agent-director not answering, for example), nothing is launched then and the persona's automatic retries take over (see "A persona is retried after agent-director refuses it" above).
 - **Cleared by a launch or restart attempt the check made:** that attempt's result stands, and nothing is launched a second time.
 
 A launch the check makes that meets the same case again keeps the hold and posts nothing. One that meets another case, or an unusable tmux session name, holds the persona again for that reason, with one new hold notice and no recovery notice. A persona whose hold has cleared and that later meets a problem again is held again, with one new notice.
 
-The hold also ends in these ways. Removing the persona from the configuration (a confirmed change) ends its hold, with no post. A destructive change (its name, credentials file or working directory) also brings the persona up unheld; it is held again, with one post to its destination, only if it meets a conflict again: at its launch, or when the server later reads conflicting labels on its own row. The hold is kept in the server's memory only, so a server restart drops every hold; a persona whose conflict is still there is held again, with one new post: at that start, when its listing shows conflicting labels on the persona's own row, or else at its next launch.
+The hold also ends in these ways. A human runs [`clear-latch`](#claude-slack-channel-bots-clear-latch) for the persona, once the cause is resolved; a persona whose cause is still there is held again, with one new notice. Removing the persona from the configuration (a confirmed change) ends its hold, with no post. A destructive change (its name, credentials file or working directory) also brings the persona up unheld; it is held again, with one post to its destination, only if it meets a conflict again: at its launch, or when the server later reads conflicting labels on its own row. The hold is kept in the server's memory only, so a server restart drops every hold; a persona whose conflict is still there is held again, with one new post: at that start, when its listing shows conflicting labels on the persona's own row, or else at its next launch.
 
 The notice is posted once per hold, even when the persona already has a *Waiting on a prompt* or *Not connected* notice. When agent-director refused a launch or resume, the notice quotes agent-director's description of the conflict, with anything that looks like a token removed. When the hold came from conflicting labels noted on the row, the notice names the persona's own tmux session (`slack_bot_<key>`) and quotes no description. Its first line names the case:
 
@@ -1941,7 +1971,7 @@ grep -E 'conflict-latch: persona=<key> (latched|relatched) — case=unusable-rec
 
 `[slack] conflict-latch: persona=<key> latched — case=unusable-recorded-name session="<name>" refused=none state=<state> message="<description>"` marks the hold, and the step that met the answer logs a line containing `— UNUSABLE NAME: the persona latched`. While the persona is held, the health check and the persona's own check still read its state; a read that gets the same answer logs a line containing `— UNUSABLE NAME: the persona was already latched with this case`, and nothing more is done for it. The `debug-slack-channel-bots` skill explains every line.
 
-How a hold ends: the server's own check clears it once the row is gone, with one *Hold cleared* notice, and the persona then comes up fresh (see the *Held: unusable tmux session name* row of "How a hold ends" under "A persona posts a *Held: tmux session conflict* notice" above, which also gives the other ways a hold ends).
+How a hold ends: the server's own check clears it once the row is gone, with one *Hold cleared* notice, and the persona then comes up fresh; once the row is gone, a human can also clear it at once with [`clear-latch`](#claude-slack-channel-bots-clear-latch) (see the *Held: unusable tmux session name* row of "How a hold ends" under "A persona posts a *Held: tmux session conflict* notice" above, which also gives the other ways a hold ends).
 
 **A persona posts a *Held: launch start not recorded* notice**
 Symptom: the persona is silent, and its destination has a *Held: launch start not recorded* notice naming the persona and its tmux session, `slack_bot_<key>`. The persona's agent-director row, `cscb_<key>`, reads pending but records no launch start. Only an agent-director process older than the installed one, or a hand edit of agent-director's store, writes such a row, and agent-director will not act on a session for it.
@@ -1961,7 +1991,7 @@ grep -E 'conflict-latch: persona=<key> (latched|relatched) — case=launch-start
 
 `[slack] conflict-latch: persona=<key> latched — case=launch-start-not-recorded session="slack_bot_<key>" refused=none state=pending` marks the hold (`relatched` and `(was <case>)` after the case when the persona was held for another reason). The read that found the row logs a line containing `its row reads pending with no launch start (state=pending) — the persona latched` or `its row read latches the persona (case=launch-start-not-recorded, state=pending) — the persona latched`. While the row stays as it is, each health check and each of the persona's own checks reads it again and logs the second line ending `— the persona was already latched with this case; nothing more is called for it (b.jg5 SRJ-115, SRJ-501)`, and nothing more is done for the persona. A hold set by a start's listing is followed by `[slack] reconcileOrphans: "<name>" (key=<key>) latched from its own listed row instanceId=cscb_<key> (case=launch-start-not-recorded) — its own row and every row labelled with it are left unkilled (b.jg5 SRJ-116, SRJ-502, SRJ-714)`. The `debug-slack-channel-bots` skill explains every line.
 
-How a hold ends: the server's own check clears it once the row reads running, ended or missing, or is gone, with one *Hold cleared* notice, and the persona is then brought up at once (see the *Held: launch start not recorded* row of "How a hold ends" under "A persona posts a *Held: tmux session conflict* notice" above, which also gives the other ways a hold ends).
+How a hold ends: the server's own check clears it once the row reads running, ended or missing, or is gone, with one *Hold cleared* notice, and the persona is then brought up at once; a human can also clear it at once with [`clear-latch`](#claude-slack-channel-bots-clear-latch) once the cause is resolved (see the *Held: launch start not recorded* row of "How a hold ends" under "A persona posts a *Held: tmux session conflict* notice" above, which also gives the other ways a hold ends).
 
 **A persona posts a *Cannot launch* notice**
 Symptom: the persona is silent, and its destination has one *Cannot launch* notice: the host's agent-director rejected the flags of this persona's launch (`ErrInvalidFlags`). The installed agent-director may not match this CSCB release. The server holds the persona when agent-director gives this answer to the launch that brings the persona up fresh on its own agent-director row, after one immediate check of the agent-director binary's version that does not stop the server.

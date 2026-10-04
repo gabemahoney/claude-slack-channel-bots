@@ -386,7 +386,9 @@
  * or pane clears and arms the pending-only watch; the holds' clears (AC 77,
  * 85, 86); E18's slow-recovery episode posting again after a clear; the
  * after-clear job's ordering in P's serializer turn (a queued operation runs
- * after it, a health tick at its find-missing reads nothing of P); and
+ * after it, a health tick at its find-missing reads nothing of P, and P
+ * latched again between the round's clear and the run it owes gets no call
+ * and keeps its new latch); and
  * `runLatchClearSequence` and the builder's `clear` and `clearAndRecover`
  * (not latched, the clear before it returns, its outcomes and lines).
  *
@@ -6540,6 +6542,45 @@ describe('the after-clear job runs in P\'s serializer turn right after the round
     expect(order.slice(3, -1).length).toBeGreaterThan(0)
     expect([scheduled, retryAtOnceLinesOf(h, p).length, isRestartPendingOrActive(p)]).toEqual([[], 1, false])
     await stopApprover(h, p)
+  })
+
+  test('P latched again between the round\'s clear and the run it owes: the run calls nothing for P and logs one "latched again" line, and the new latch stays with its one post and its re-check timer', async () => {
+    const { h, p, q, model, record } = latchForRecheck(ANOTHER_STORE_RESUME_ROW, { state: LIVENESS_DEAD_ROW_ENDED })
+    // Step 1 reads the row reported in: a step-1 clear, its run owed to the round.
+    model.setState('waiting')
+    const reason = latchRecoveryReasonRowReads('waiting')
+    const clearedLine = latchClearedLine(p, record, reason, true)
+    const relatched: { outcome: unknown; record: ConflictLatchRecord | undefined }[] = []
+    // The clear's last step is its cleared line, after which the round hands
+    // its run on: relatch P there, once, so the latch is set before the run.
+    const logTo = console.error
+    console.error = (...args: unknown[]) => {
+      logTo(...args)
+      if (relatched.length === 0 && args[0] === clearedLine) {
+        const outcome = SCAN_LEFTOVER_ROW.latchOn(h.latchSet, p)
+        relatched.push({ outcome, record: h.latch.record(p) })
+      }
+    }
+    let round: RecheckRoundRun
+    try {
+      round = await recheckRound(h, p)
+    } finally {
+      console.error = logTo
+    }
+    await h.settle()
+
+    expect(relatched.map((entry) => [entry.outcome, entry.record?.latchCase])).toEqual([[CONFLICT_LATCH_SET_LATCHED, LATCH_CASE_LEFTOVER]])
+    // Step 1's read only: no find-missing, no retry at once.
+    expect(round.verbs).toEqual(['status'])
+    expect(retryAtOnceLinesOf(h, p)).toEqual([])
+    expect(h.errors.filter((line) => line.includes('is latched again before the run that follows its clear'))).toEqual([
+      `[slack] latch-clear: ${renderPersonaRef(personaOf(h, p).name, p)} is latched again before the run that follows its clear — nothing is called for it (b.jg5 SRJ-506, SRJ-502)`,
+    ])
+    // The cleared latch's one recovery post, then the new latch's one post; the new latch kept, its timer armed.
+    expect(clearedLinesIn(h.errors, p)).toEqual([clearedLine])
+    expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, reason), { key: p, text: SCAN_LEFTOVER_ROW.notice.text }])
+    expect([h.latch.record(p), h.latchRecheck.isArmed(p), isRestartPendingOrActive(p)]).toEqual([relatched[0]!.record, true, false])
+    expect([h.latch.isLatched(q), personaCallCounts(h, q)]).toEqual([false, {}])
   })
 })
 
