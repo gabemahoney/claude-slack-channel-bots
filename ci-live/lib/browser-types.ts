@@ -22,6 +22,8 @@ export interface HumanApi {
 export interface SlackUrls {
   /** The workspace's email + password sign-in page. */
   signIn(domain: string): string
+  /** The workspace's email sign-in page, where Slack emails a code (an account with no password). */
+  codeSignIn(domain: string): string
   /** The workspace's Web API base for the human session (ends with `/api/`). */
   humanApiBase(domain: string): string
   /** A page on the workspace's client domain where the web client stores its session config. */

@@ -177,8 +177,8 @@ Later runs reuse that session and read the password only when Slack needs a
 fresh sign-in. When Slack emails a new-device code during a run, the run reads
 it from the test mailbox (below) and types it. With no mailbox, or no code
 within 2 minutes, it exits 2 with "Slack asked for an emailed sign-in code":
-run `login` again. `login` itself asks on the terminal and doesn't read the
-mailbox. It takes the same lock as a run (see step 6): while a run is going,
+run `login` again. `login` itself reads the mailbox the same way first, then
+asks on the terminal. It takes the same lock as a run (see step 6): while a run is going,
 it exits 2.
 
 ### The test mailbox
@@ -365,10 +365,24 @@ secrecy scan.
 Without a second account, Checks 14, 16 and 20 report
 `SKIPPED (no second account)`. To run them:
 
-1. Invite a second account to `cscb-ci-test` (another non-SSO email, email
-   and password login, no 2FA). It must be new to the personas: no post in
-   `a-home`, and no DM with a "CSCB Test" app. It plays both the plan's
-   first-time user (Check 14) and its second test user (Checks 16 and 20).
+1. Invite a second account to `cscb-ci-test` (another non-SSO email, no
+   2FA). It must be new to the personas: no post in `a-home`, and no DM with
+   a "CSCB Test" app. It plays both the plan's first-time user (Check 14) and
+   its second test user (Checks 16 and 20). It can have a password, or none
+   (it then signs in by emailed code, below).
+
+   For a code-only account, use another `+tag` address of the test human's
+   Gmail (not `<TEST_EMAIL>` itself: Slack allows one account per email),
+   and forward its mail to the test mailbox with a second Gmail filter (as
+   in "The test mailbox" above, with **To** that address). Skip step 2 and
+   leave the password keys out in step 3:
+
+   ```sh
+   ( umask 077; IFS= read -r -p 'Second account email: ' e2 \
+     && jq --arg e2 "$e2" '.second_user = {email: $e2}' ~/.config/cscb-test/live.json > ~/.config/cscb-test/live.json.new \
+     && mv ~/.config/cscb-test/live.json.new ~/.config/cscb-test/live.json )
+   ```
+
 2. Write its password to a file:
 
    ```sh
@@ -386,20 +400,33 @@ Without a second account, Checks 14, 16 and 20 report
 
    The runner uses the `password_env` variable when it is set, else
    `password_file`. The file path must be absolute (`~` is not expanded) and
-   the file mode 600.
+   the file mode 600. A `second_user` with neither key is a code-only
+   account: the runner asks Slack to email it a code, on the workspace's
+   email sign-in page, instead of typing a password.
 
-4. Sign it in once, in your own interactive terminal:
+   Slack can answer that request with a reCAPTCHA ("I'm not a robot") in
+   place of the email; it did for headless Chrome when this was written. The
+   runner never answers a captcha: it exits 2 with `Slack showed a captcha
+   ("I'm not a robot") instead of emailing a sign-in code`. Give the account
+   a password then (steps 2 and 3). A password sign-in shows no captcha, and
+   a new-device code for the account is still read from the test mailbox.
+
+4. Sign it in once:
 
    ```sh
    bun ci-live/run.ts login --second
    ```
 
    It works like `login`, for the second account, and saves its session to
-   `~/.config/cscb-test/playwright-state-second.json`.
+   `~/.config/cscb-test/playwright-state-second.json`. When Slack emails the
+   account a code, `login` (and `login --second`) first waits up to 2 minutes
+   for it in the test mailbox, sent to that account's own email, and types
+   it; only then does it ask on the terminal. With the account's mail
+   forwarded, it needs no terminal.
 
-The second account's mail doesn't go to the test mailbox. If Slack asks it
-for an emailed code during a run, the run goes on and reports Checks 14, 16
-and 20 as
+When Slack asks the second account for an emailed code during a run, the run
+reads it from the test mailbox in the same way. With no forwarded mail, or no
+code within 2 minutes, the run goes on and reports Checks 14, 16 and 20 as
 `SKIPPED (second account needs a sign-in code: run login --second)`.
 
 After one run, the account is no longer new to the personas. On a rerun,

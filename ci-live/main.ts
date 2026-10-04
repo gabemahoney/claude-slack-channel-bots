@@ -118,6 +118,7 @@ import { writeResults, type RunSummary } from './lib/results.ts'
 import { isLiveRunnerPid, lockHolder, nodeLockDeps, RunLock } from './lib/run-lock.ts'
 import { describeScan, scanOutputs, scanText } from './lib/secrecy-scan.ts'
 import { isInside, nodeSecureFs, NotRunnableError, SecretStore, SignInCodeNeededError } from './lib/secrets.ts'
+import { answerSignInCodeFromMailbox } from './lib/sign-in-code.ts'
 import { realClock } from './lib/wait.ts'
 import { REAL_LOCK_WHAT, runMaintenance } from './maintenance.ts'
 import { appsStateForStrayDeletion, classifyListedApps, deleteStrayApps, testWorkspaceName } from './provision/app-listing.ts'
@@ -991,7 +992,11 @@ async function promptHidden(question: string): Promise<string> {
   return r.stdout.trim()
 }
 
-/** `login` (the test human) or `login --second` (the second workspace user): sign in, answer an emailed code, save the session. */
+/**
+ * `login` (the test human) or `login --second` (the second workspace user):
+ * sign in, answer an emailed code (from the test mailbox when the account's
+ * mail reaches it, else typed on the terminal), save the session.
+ */
 async function runLogin(env: RunEnv, signals: SignalControl): Promise<number> {
   const ws = openWorkspace({ repoRoot: REPO_ROOT, runId: env.runId, redactor: env.redactor, log: env.log }, 'real')
   let driver: BrowserDriver | null = null
@@ -1002,15 +1007,31 @@ async function runLogin(env: RunEnv, signals: SignalControl): Promise<number> {
     const who = env.options.second === true ? 'second' : 'human'
     const second = ws.live.secondUser
     if (who === 'second' && !second) {
-      throw new NotRunnableError(`live.json configures no second_user (email and password_file or password_env): add it to ${store.paths.liveJson}`)
+      throw new NotRunnableError(`live.json configures no second_user (its email, and password_file or password_env unless it signs in by emailed code): add it to ${store.paths.liveJson}`)
     }
+    const email = who === 'second' && second ? second.email : ws.live.testEmail
     const identity =
       who === 'second' && second
-        ? () => ({ email: second.email, password: store.readSecondPassword(second) })
-        : () => ({ email: ws.live.testEmail, password: store.readPassword() })
+        ? () => ({ email, password: store.readSecondPassword(second) })
+        : () => ({ email, password: store.readPassword() })
     const account = who === 'second' ? 'the second account' : 'the test human'
-    driver = await launchDriver({ urls: ws.urls, domain: ws.live.workspaceDomain, identity, storage: store.storageState(who), redactor: env.redactor, log: env.log })
-    let outcome = await driver.ensureSignedIn()
+    const signIn = await launchDriver({ urls: ws.urls, domain: ws.live.workspaceDomain, identity, storage: store.storageState(who), redactor: env.redactor, log: env.log })
+    driver = signIn
+    // Before the sign-in is submitted: Slack's email for this attempt is newer than this.
+    const attemptStartedAt = realClock.now()
+    let outcome = await signIn.ensureSignedIn()
+    // The mailbox first, when the account's mail reaches it; else the operator types the code.
+    if (outcome === 'needs-code') {
+      outcome = await answerSignInCodeFromMailbox({
+        openMailbox: ws.openMailbox,
+        submitCode: (code) => signIn.submitSignInCode(code),
+        testEmail: email,
+        addSecret: (value) => env.redactor.addSecret(value),
+        clock: realClock,
+        log: env.log,
+        attemptStartedAt,
+      })
+    }
     for (let attempt = 0; outcome === 'needs-code' && attempt < 3; attempt++) {
       const code = await promptHidden(`Slack emailed ${account} a sign-in code. Type it (not shown): `)
       env.redactor.addSecret(code)

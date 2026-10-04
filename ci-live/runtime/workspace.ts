@@ -107,11 +107,12 @@ async function launch(
   chrome: () => Promise<ChromeHost>,
   urls: SlackUrls,
   domain: string,
-  identity: () => { email: string; password: string },
+  identity: () => { email: string; password: string | null },
   storage: StorageStateStore,
   /**
-   * Where an emailed sign-in code can be read (the test human's forwarded
-   * mail, only Slack mail sent to `testEmail` counting); `null`: nowhere.
+   * Where an emailed sign-in code can be read (the test mailbox, only Slack
+   * mail sent to `testEmail`, the account's own email, counting); `null`:
+   * nowhere.
    */
   mailbox: { open: () => MailTmClient | null; testEmail: string; pollMs?: number } | null,
 ): Promise<AccountBrowser> {
@@ -233,7 +234,9 @@ export function openWorkspace(o: WorkspaceOptions, mode: 'real' | 'dry-run'): Wo
     secondBrowser() {
       const cfg = live.secondUser
       if (!cfg || mode === 'dry-run') return Promise.resolve(null)
-      second ??= launch(o, 'second', chrome, urls, live.workspaceDomain, () => ({ email: cfg.email, password: store.readSecondPassword(cfg) }), store.storageState('second'), null)
+      // Its code is read from the mailbox too, when its mail reaches it (a code-only account's must).
+      const secondMailbox = { open: openMailbox, testEmail: cfg.email }
+      second ??= launch(o, 'second', chrome, urls, live.workspaceDomain, () => ({ email: cfg.email, password: store.readSecondPassword(cfg) }), store.storageState('second'), secondMailbox)
       return second
     },
     browserStats: () => {

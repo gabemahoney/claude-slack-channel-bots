@@ -453,8 +453,8 @@ export const SLACK_SENDER_DOMAINS = ['slack.com', 'slack-mail.com'] as const
 /** Google's sender domain for Gmail's forwarding confirmation (`forwarding-noreply@google.com`). */
 export const GOOGLE_SENDER_DOMAINS = ['google.com'] as const
 
-/** A subject that names a code: "Slack confirmation code: ABC-DEF". */
-const SLACK_CODE_SUBJECT_RE = /\b(?:confirmation|sign[- ]?in|verification|login) code\b/i
+/** A subject that names a code: "Slack confirmation code: ABC-DEF", "Your Slack security code is 123456". */
+const SLACK_CODE_SUBJECT_RE = /\b(?:confirmation|sign[- ]?in|verification|login|security) code\b/i
 /** A subject that names Gmail's forwarding confirmation. */
 const GMAIL_FORWARDING_SUBJECT_RE = /\bforwarding confirmation\b/i
 

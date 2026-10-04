@@ -158,7 +158,7 @@ export const check14: CheckDef<CheckContext> = {
     const second = need2(ctx)
     const ids = ctx.ids
     for (const l of ['a', 'b', 'c'] as const) {
-      if ((await second.human.existingDm(ids.bots[l].userId)) !== null) {
+      if ((await second.human.usedDm(ids.bots[l].userId)) !== null) {
         return skipped('not verified: the second account already has a DM with a persona (a rerun; it is no longer a first-time user)')
       }
     }
@@ -258,7 +258,7 @@ export const check16: CheckDef<CheckContext> = {
   async run(ctx) {
     const f = new Findings()
     const second = need2(ctx)
-    if ((await second.human.existingDm(ctx.ids.bots.a.userId)) !== null) {
+    if ((await second.human.usedDm(ctx.ids.bots.a.userId)) !== null) {
       return skipped('not verified: the second account already has a DM with A (a rerun)')
     }
     const m = await mark(ctx)
@@ -281,7 +281,7 @@ export const check16: CheckDef<CheckContext> = {
     f.expect(call.includes(`Persona "persona_a" (key=persona_a) may not target "${second.userId}": DMs are off for this persona (dm.enabled is false).`), 'the refusal text is not the expected one')
     const open = (await sinceGrep(ctx, m, 'could not open a DM')).filter((l) => l.includes('persona_a') && l.includes(second.userId))
     f.expect(open.length === 0, 'a failed DM open was logged')
-    f.expect((await second.human.existingDm(ctx.ids.bots.a.userId)) === null, 'the second user has a DM with A')
+    f.expect((await second.human.usedDm(ctx.ids.bots.a.userId)) === null, 'the second user has a DM with A')
     return f.result()
   },
 }
@@ -445,7 +445,7 @@ export const check20: CheckDef<CheckContext> = {
   async run(ctx) {
     const f = new Findings()
     const second = need2(ctx)
-    if ((await second.human.existingDm(ctx.ids.bots.a.userId)) !== null) {
+    if ((await second.human.usedDm(ctx.ids.bots.a.userId)) !== null) {
       return skipped('not verified: the second account already has a DM with A (a rerun)')
     }
     const m = await mark(ctx)

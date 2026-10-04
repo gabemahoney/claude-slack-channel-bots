@@ -35,7 +35,7 @@ import { NotRunnableError } from '../lib/secrets.ts'
 import { generateAppToken, revokeAppToken } from './app-token.flow.ts'
 import { listApps } from './apps-list.flow.ts'
 import { installAndReadBotToken } from './install.flow.ts'
-import { signInWithPassword, submitConfirmationCode } from './login.flow.ts'
+import { signInWithEmailedCode, signInWithPassword, submitConfirmationCode } from './login.flow.ts'
 import { clickMessageButton } from './message.flow.ts'
 import { contextHumanApi, readSessionToken } from './session.flow.ts'
 
@@ -50,8 +50,8 @@ export interface StorageStateStore {
 export interface DriverOptions {
   urls: SlackUrls
   domain: string
-  /** The sign-in identity, read only when a sign-in is needed. */
-  identity: () => { email: string; password: string }
+  /** The sign-in identity, read only when a sign-in is needed. No password: the account signs in by emailed code. */
+  identity: () => { email: string; password: string | null }
   storage: StorageStateStore
   redactor: Redactor
   log: { info(message: string): void; detail(message: string): void }
@@ -177,8 +177,9 @@ class PlaywrightDriver implements LiveBrowserDriver {
       if (await this.adoptSessionToken()) return 'signed-in'
       const { email, password } = this.o.identity()
       this.o.redactor.addSecret(password)
-      this.o.log.info('browser: signing the test human in (email + password)')
-      outcome = await signInWithPassword(await this.usablePage(), this.o.urls, this.o.domain, email, password)
+      this.o.log.info(`browser: signing the test human in (email + ${password === null ? 'emailed code' : 'password'})`)
+      if (password === null) outcome = await signInWithEmailedCode(await this.usablePage(), this.o.urls, this.o.domain, email)
+      else outcome = await signInWithPassword(await this.usablePage(), this.o.urls, this.o.domain, email, password)
       if (outcome === 'needs-code') return 'needs-code'
       if (!(await this.adoptSessionToken())) throw new NotRunnableError('signed in, but the web client holds no session for the test workspace')
       await this.saveState()

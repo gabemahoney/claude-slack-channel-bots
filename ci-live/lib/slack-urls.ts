@@ -7,6 +7,7 @@ import type { SlackUrls } from './browser-types.ts'
 
 export const REAL_SLACK_URLS: SlackUrls = {
   signIn: (domain) => `https://${domain}.slack.com/sign_in_with_password`,
+  codeSignIn: (domain) => `https://${domain}.slack.com/`,
   humanApiBase: (domain) => `https://${domain}.slack.com/api/`,
   clientHome: () => 'https://app.slack.com/client',
   installApp: (appId) => `https://api.slack.com/apps/${appId}/install-on-team`,

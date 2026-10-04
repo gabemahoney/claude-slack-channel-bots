@@ -140,6 +140,8 @@ const CODE = signInCode(1)
 const OTHER_CODE = signInCode(2)
 /** A six-character code without a dash (it holds a digit, as a bare code must). */
 const BARE_CODE = `${bareCode(signInCode(3)).slice(0, 5)}7`
+/** A six-digit code, as Slack's "security code" email shows it, built at runtime. */
+const DIGIT_CODE = String(104_729 * 3 + 7919)
 
 function makeConfig(overrides: Partial<MailboxConfig> = {}): MailboxConfig {
   return { api: API, address: ADDRESS, password: PASSWORD, accountId: 'acct0001', token: STALE_TOKEN, extra: {}, ...overrides }
@@ -823,6 +825,7 @@ describe('extractSlackSignInCode', () => {
     ['a Slack subdomain sender', () => slackMail(CODE, { from: { address: 'feedback@email.slack.com', name: '' } }), CODE],
     ['the slack-mail.com sender', () => slackMail(CODE, { from: { address: 'no-reply@slack-mail.com', name: 'Slack' } }), CODE],
     ['a login-code subject ("is" before the code)', () => slackMail(CODE, { subject: `Your Slack login code is ${CODE}` }), CODE],
+    ['a security-code subject with a six-digit code (a password account on a new device)', () => slackMail(DIGIT_CODE, { subject: `Your Slack security code is ${DIGIT_CODE}` }), DIGIT_CODE],
   ])('reads %s', (_what, message, expected) => {
     expect(extractSlackSignInCode(message())).toBe(expected)
   })
