@@ -143,7 +143,7 @@ export type OldLifeWaitRefusalAt =
   | typeof OLD_LIFE_WAIT_AT_GET
   | typeof OLD_LIFE_WAIT_AT_FIND_MISSING
 
-/** One CONFLICT or UNUSABLE NAME answer a round met: where, its class (by name) and the thrown value, raw. Latches no one. */
+/** One CONFLICT or UNUSABLE NAME answer a round met: where, its class (by the classifier) and the thrown value, raw. Latches no one. */
 export interface OldLifeWaitRefusal {
   readonly at: OldLifeWaitRefusalAt
   readonly errorClass: typeof AD_ERROR_CLASS_CONFLICT | typeof AD_ERROR_CLASS_UNUSABLE_NAME

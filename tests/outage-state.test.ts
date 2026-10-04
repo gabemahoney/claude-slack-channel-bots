@@ -3184,7 +3184,7 @@ describe('the latch re-check\'s no-information scope at the wrappers and the sit
 
   /**
    * The answers to a probe or retry that give no information (b.jg5
-   * SRJ-505), each built for the verb, with its class by name.
+   * SRJ-505), each built for the verb, with its class.
    */
   const NO_INFORMATION_ANSWERS: ReadonlyArray<readonly [string, (verb: string) => unknown, string]> = [
     ...unavailableForms('ErrTmuxUnresponsive', 'ErrCallTimeout', ['ErrUnknownErrorName', 'an UNAVAILABLE-classed ErrUnknownErrorName'], 'a wrapped UnknownError')

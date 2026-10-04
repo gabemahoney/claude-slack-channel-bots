@@ -289,9 +289,9 @@ import {
   AD_ERROR_CLASS_CONFLICT,
   AD_ERROR_CLASS_ENVIRONMENT,
   AD_ERROR_CLASS_UNUSABLE_NAME,
-  hasAdErrorName,
+  isAdErrorInstance,
 } from './ad-error-class.ts'
-import { ERR_SYSTEM_INSTALL_DISAPPEARED_NAME } from './agent-director-errors.ts'
+import { ErrSystemInstallDisappeared } from './agent-director-errors.ts'
 import {
   KILL_REFUSAL_AT_KILL,
   KILL_REFUSAL_AT_READ,
@@ -705,7 +705,7 @@ function raisableKillFailureAlertOf(killed: unknown, malformed: (what: string) =
  * The outage a teardown kill's standing non-success raises when its persona
  * is in the applied configuration (b.jg5 SRJ-110, SRJ-311, SRJ-316): an
  * ENVIRONMENT answer `tmux-unavailable`, a CONFIG answer
- * `ad-config-malformed`; `ErrSystemInstallDisappeared` (by name) raises
+ * `ad-config-malformed`; `ErrSystemInstallDisappeared` (by class) raises
  * `ad-unreachable` whatever the configuration. Undefined for every other
  * outcome, which raises no outage. Never throws.
  */
@@ -713,7 +713,7 @@ function teardownKillOutageClassOf(outcome: KillFailure): string | undefined {
   try {
     if (outcome.errorClass === AD_ERROR_CLASS_ENVIRONMENT) return 'tmux-unavailable'
     if (outcome.errorClass === AD_ERROR_CLASS_CONFIG) return 'ad-config-malformed'
-    if (hasAdErrorName(outcome.error, ERR_SYSTEM_INSTALL_DISAPPEARED_NAME)) return 'ad-unreachable'
+    if (isAdErrorInstance(outcome.error, ErrSystemInstallDisappeared)) return 'ad-unreachable'
   } catch {
     /* an unreadable value raises no outage */
   }

@@ -425,8 +425,12 @@
  * launch starts come from the stub's `SAMPLE_LAUNCH_START*` constants, the
  * unparseable one derived from a sample (checked not to parse by
  * `tests/conflict-latch.test.ts`, never at import).
- * No Phase-1-only export
- * is named, and no `mock.module()` is used.
+ * Every CONFLICT a row builds is the stub's `errTmuxSessionConflict`, an
+ * instance of the `ErrTmuxSessionConflict` binding of
+ * `src/agent-director-errors.ts`, so the classifier and `conflictDescriptionOf`
+ * take it by class; none is a base `AgentDirectorError` carrying the name.
+ * This file imports none of the three Phase-1-only classes, from
+ * `agent-director` or elsewhere, and uses no `mock.module()`.
  *
  * SPDX-License-Identifier: MIT
  */

@@ -4,10 +4,13 @@
  * rendering (`src/checked-kill.ts`; b.jg5 SRJ-110, SRJ-701, SRJ-703).
  *
  * Every kill goes through the stub client's `kill` (its result, error and
- * queue members and `cannedKillResult`), every error is built by name with
- * the stub's builders (a DIRECTORY value, which the stub has no builder for,
- * with `new` on the client's own class), and every class and outcome label is
- * imported from `src/`. Only a success (`kill_sent` true, false or absent),
+ * queue members and `cannedKillResult`), every error is an instance of its
+ * class, built with the stub's builders (a DIRECTORY value, which the stub has
+ * no builder for, with `new` on the client's own class), and every class and
+ * outcome label is imported from `src/`. Only an `ErrTmuxKillFailed` instance
+ * is a kill failure: an `ErrUnknownErrorName` carrying that name is an
+ * UNAVAILABLE value like any other, with no kill-failure description. Only a
+ * success (`kill_sent` true, false or absent),
  * `ErrSpawnNotFound` and GONE (SRJ-104: for `kill`, gone is success) pass the
  * predicate, GONE only with no options (every server site); under
  * `goneIsFailure` (the CLI's teardown, SRJ-904) GONE is the GONE non-success
@@ -158,7 +161,7 @@ const PLAIN_KILL_CALL = { claude_instance_id: STUB_INSTANCE_ID }
 type NonSuccessRow = readonly [label: string, build: () => unknown, expected: AdErrorClass, unlistedClass?: KillUnlistedClass]
 
 /**
- * HO C2's non-success list (SRJ-110's Test line), each built by name, plus the
+ * HO C2's non-success list (SRJ-110's Test line), each built from its class, plus the
  * unusable-name value, `ErrConfigMalformed`, a value that is not an
  * agent-director error, and values of a class SRJ-110 gives no row
  * (UNCLASSIFIED: no step follows).
@@ -183,7 +186,7 @@ const NON_SUCCESS_ROWS: readonly NonSuccessRow[] = [
   ['ErrCwdNotADirectory (DIRECTORY: no SRJ-110 row)', () => errCwd(ErrCwdNotADirectory), AD_ERROR_CLASS_UNCLASSIFIED, AD_ERROR_CLASS_DIRECTORY],
 ]
 
-/** The GONE values (SRJ-104: for `kill`, gone is success), each built by name with the stub. */
+/** The GONE values (SRJ-104: for `kill`, gone is success), each built from its class with the stub. */
 const GONE_ROWS: readonly (readonly [label: string, build: () => Error & { errName: string }])[] = [
   ['errTmuxSendKeys', () => errTmuxSendKeys()],
   ['errTmuxCaptureFailed', () => errTmuxCaptureFailed(undefined, 'kill')],
@@ -231,7 +234,7 @@ describe('checkedKill: success (SRJ-110, SRJ-703)', () => {
     'b.jg5 SRJ-104, SRJ-110: %s (GONE) at a kill is the session-gone success carrying its name, and lets the next step run',
     async (_label, build) => {
       const thrown = build()
-      // Precondition: the classifier gives it GONE, by name.
+      // Precondition: the classifier gives it GONE, by class.
       expect(classifyAdError(thrown).errorClass).toBe(AD_ERROR_CLASS_GONE)
       const { outcome, calls } = await killThroughStub({ killError: thrown })
       expect(outcome).toEqual({ kind: KILL_OUTCOME_SESSION_GONE, name: thrown.errName })
@@ -281,7 +284,7 @@ describe('checkedKill: non-success (SRJ-110, SRJ-701)', () => {
       expect(killLetsNextStepRun(outcome)).toBe(false)
       expect(isKillOutcome(outcome)).toBe(true)
       expect(calls).toEqual([PLAIN_KILL_CALL])
-      // The class is the classifier's, by name, wherever SRJ-110 has a row for it.
+      // The class is the classifier's wherever SRJ-110 has a row for it.
       const classified = classifyAdError(thrown).errorClass
       if ((KILL_FAILURE_CLASSES as readonly string[]).includes(classified)) expect(outcome.errorClass as AdErrorClass).toBe(classified)
       // A class SRJ-110 has no row for (b.jg5 SRJ-104, SRJ-110) is UNCLASSIFIED
@@ -311,15 +314,16 @@ describe('checkedKill: non-success (SRJ-110, SRJ-701)', () => {
     })
   })
 
-  test('an ErrUnknownErrorName carrying the ErrTmuxKillFailed name is told apart with its envelope description', () => {
+  test('an ErrUnknownErrorName carrying the ErrTmuxKillFailed name is UNAVAILABLE, not told apart as a kill failure, and carries no description', () => {
+    // Only an instance of the ErrTmuxKillFailed class is a kill failure; the
+    // name in an unknown-name envelope is no kill failure.
     const description = errTmuxKillFailed(undefined, 'no-session-no-kill').errDescription
     const thrown = errUnknownErrorName(ERR_TMUX_KILL_FAILED_NAME, description)
     expect(killOutcomeOf({ thrown })).toEqual({
       kind: KILL_OUTCOME_NOT_KILLED,
       errorClass: AD_ERROR_CLASS_UNAVAILABLE,
       error: thrown,
-      killFailed: true,
-      killFailedDescription: description,
+      killFailed: false,
     })
   })
 
@@ -526,16 +530,23 @@ describe('describeKillOutcome', () => {
 
   test.each<[string, () => unknown]>([
     ...KILL_FAILED_DESCRIPTIONS.map((d): [string, () => unknown] => [`errTmuxKillFailed (${d})`, () => errTmuxKillFailed(TOKEN_SESSION, d)]),
-    [
-      'an ErrUnknownErrorName carrying the ErrTmuxKillFailed name',
-      () => errUnknownErrorName(ERR_TMUX_KILL_FAILED_NAME, errTmuxKillFailed(TOKEN_SESSION, 'unverifiable-session-present').errDescription),
-    ],
     ['errTmuxSessionConflict (not-this-launch)', () => errTmuxSessionConflict('kill', 'not-this-launch', TOKEN_SESSION)],
     ['errTmuxUnresponsive (still stopping)', () => errTmuxUnresponsive('kill', `the agent in tmux session ${JSON.stringify(TOKEN_SESSION)} is still stopping`)],
   ])('%s: a fake token in its session name comes out redacted, on one line', (_label, build) => {
     const line = describeKillOutcome(killOutcomeOf({ thrown: build() }))
     expect(line).toContain(REDACTED_TOKEN_PLACEHOLDER)
     expect(line).not.toMatch(/[\r\n]/)
+    assertNoLeak({ line })
+  })
+
+  test('an ErrUnknownErrorName carrying the ErrTmuxKillFailed name renders as any UNAVAILABLE value, with no kill-failure description: its envelope\'s token-bearing description never reaches the line', () => {
+    const envelopeDescription = errTmuxKillFailed(TOKEN_SESSION, 'unverifiable-session-present').errDescription
+    const thrown = errUnknownErrorName(ERR_TMUX_KILL_FAILED_NAME, envelopeDescription)
+    const line = describeKillOutcome(killOutcomeOf({ thrown }))
+    expect(line).toBe(
+      `outcome=${KILL_OUTCOME_NOT_KILLED} class=${AD_ERROR_CLASS_UNAVAILABLE} ${thrown.errName} message=${JSON.stringify(thrown.errDescription)}`,
+    )
+    expect(line).not.toContain(envelopeDescription)
     assertNoLeak({ line })
   })
 

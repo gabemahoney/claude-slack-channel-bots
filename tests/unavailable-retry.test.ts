@@ -808,7 +808,8 @@ describe('unavailable retry: the schedule', () => {
     ['throws', (err) => () => { throw err }],
     ['rejects', (err) => async () => { throw err }],
   ])('an action that %s counts as a refusal: re-armed at the next wait, its error logged only as its redacted description', async (_how, make) => {
-    const err = Object.assign(errGeneric('spawn', 'ErrTmuxNotAvailable', `spawn refused (${sentinelInMessage('retry')})`), { detail: LEAK_SENTINEL })
+    // The builder puts its socket path argument in the description.
+    const err = Object.assign(errTmuxNotAvailable(`(${sentinelInMessage('retry')})`, 'spawn'), { detail: LEAK_SENTINEL })
     const { clock, controller, lines } = makeRig(make(err))
     controller.arm(KEY, { kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, error: err })
     await clock.advance(waitMs(0))
@@ -816,11 +817,10 @@ describe('unavailable retry: the schedule', () => {
 
     expect(delays(clock)).toEqual([waitMs(1)])
     expect(controller.view(KEY)?.refusals).toBe(1)
-    const described = lines.filter((line) => line.includes('errName=ErrTmuxNotAvailable'))
+    const described = lines.filter((line) => line.includes('ErrTmuxNotAvailable message="'))
     expect(described).toHaveLength(2)
     for (const line of described) {
-      expect(line).toContain('AgentDirectorError errName=ErrTmuxNotAvailable message="')
-      expect(line).toContain(`spawn refused (${REDACTED_SENTINEL_TAIL})"`)
+      expect(line).toContain(`tmux socket (${REDACTED_SENTINEL_TAIL}) is not accessible to this user"`)
     }
     assertNoLeak(lines)
   })

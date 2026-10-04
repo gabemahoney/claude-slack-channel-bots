@@ -124,6 +124,7 @@
 import type { Client } from 'agent-director'
 import {
   AD_ERROR_CLASS_CONFIG,
+  AD_ERROR_CLASS_DIRECTORY,
   AD_ERROR_CLASS_ENVIRONMENT,
   AD_ERROR_CLASS_GONE,
   AD_ERROR_CLASS_UNAVAILABLE,
@@ -131,6 +132,7 @@ import {
   adCallVerb,
   classifyAdError,
   describeAdErrorClassification,
+  isAdErrorInstance,
   isDifferentTmuxServerError,
   isLaunchCall,
   isTmuxTouchingCall,
@@ -138,11 +140,7 @@ import {
   type AdErrorClassification,
   type AdVerb,
 } from './ad-error-class.ts'
-import {
-  ErrSystemInstallDisappeared,
-  ErrCwdNotFound,
-  ErrCwdNotADirectory,
-} from './agent-director-errors.ts'
+import { ErrSystemInstallDisappeared } from './agent-director-errors.ts'
 import { describeThrownValue, renderLogMessageText } from './persona-connection-errors.ts'
 import { escapeSlackControlCharacters } from './slack-text-escape.ts'
 import {
@@ -494,7 +492,7 @@ export function raiseTmuxUnavailable(key: string, err: unknown, verb?: AdVerb): 
  * raiseAdConfigMalformed — the one raise entry for `ad-config-malformed`
  * (b.jg5 SRJ-316, SRJ-1018), for every site that raises it on a CONFIG answer
  * (`ErrConfigMalformed`, decided by the caller through `src/ad-error-class.ts`
- * by name): the wrappers and the liveness adapter's bare `status`. `err` is
+ * by the `ErrUnknownErrorName`'s `unknownName`): the wrappers and the liveness adapter's bare `status`. `err` is
  * the thrown value. The flag is set first, then one server-log line names
  * the persona and the classification (`describeAdErrorClassification`: the
  * reported name and the rendered message, no token), then the onset
@@ -739,13 +737,13 @@ export async function withOutageDetection<T>(
     // b.jg5 SRJ-110 (hatch A3): a call that arms nothing raises an
     // ENVIRONMENT or CONFIG outage only for a configured persona.
     const raisesOutage = armsNothing === undefined || armsNothingPersonaConfigured(armsNothing)
-    if (err instanceof ErrSystemInstallDisappeared) {
+    if (isAdErrorInstance(err, ErrSystemInstallDisappeared)) {
       setOutageFlag(key, 'ad-unreachable', err.binaryPath)
     } else if (errorClass === AD_ERROR_CLASS_ENVIRONMENT) {
       if (raisesOutage) raiseTmuxUnavailable(key, err, adCallVerb(call))
     } else if (errorClass === AD_ERROR_CLASS_CONFIG) {
       if (raisesOutage) raiseAdConfigMalformed(key, err)
-    } else if (err instanceof ErrCwdNotFound || err instanceof ErrCwdNotADirectory) {
+    } else if (errorClass === AD_ERROR_CLASS_DIRECTORY) {
       if (workingDirectory !== undefined) {
         setOutageFlag(key, 'cwd-unreachable', workingDirectory)
       } else {

@@ -109,11 +109,11 @@ const SUPPORTED_PLATFORMS = ['linux-x64', 'darwin-arm64'] as const
  * anchor on the class declaration.
  *
  * The three Phase-1-only names (`PHASE1_ONLY_ERR_NAMES`, b.jg5 SRJ-102) are
- * required although CSCB recognises those errors by name until the Phase 1
- * client is adopted (E37): a client without their classes turns a Phase 1
+ * required: CSCB recognises those errors by the client's own classes
+ * (`src/agent-director-errors.ts`), and a client without them turns a Phase 1
  * binary's errors into `ErrUnknownErrorName`, which the classifier would
- * misclassify. The check reads names in the dist text and imports none of
- * them (SRJ-101 interim rule).
+ * misclassify, and leaves CSCB on its stand-in classes. The check reads names
+ * in the dist text and imports none of them (b.jg5 SRJ-101).
  */
 export const REQUIRED_ERR_NAMES = [
   'ErrInvalidFlags',

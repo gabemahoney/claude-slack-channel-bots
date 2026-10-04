@@ -1,28 +1,34 @@
 /**
  * ad-error-class.test.ts — the one classifier of agent-director errors
- * (b.jg5 SRJ-104), the `ErrInvalidFlags` step beside it, the re-bound-socket
- * predicate `isDifferentTmuxServerError` (b.jg5 SRJ-311, SRJ-1021), the
- * CONFLICT description accessor `conflictDescriptionOf` (b.jg5 SRJ-501,
- * SRJ-507; by class, so an `ErrUnknownErrorName` carrying the CONFLICT name,
- * UNAVAILABLE by SRJ-104, answers nothing), the kill-failure description
- * accessor `killFailedDescriptionOf` (b.jg5 SRJ-110, SRJ-702; by name, so an
- * `ErrUnknownErrorName` carrying the `ErrTmuxKillFailed` name answers its
- * envelope's description), the launch-timeout predicate
- * `isLaunchTimeoutError` / `launchTimeoutFormOf` (b.jg5 SRJ-407; by name and
- * the declared call: `ErrCallTimeout`, or `ErrTmuxUnresponsive` whose
- * description carries `LAUNCH_TIMEOUT_PHRASE`, an `ErrUnknownErrorName`
- * carrying that name included, only at a launch call; both forms stay
- * UNAVAILABLE), the one-line description
- * `describeReportedAdFailure` (b.jg5 SRJ-104: what agent-director reported,
- * else `describeAgentDirectorFailure`'s description), and the
- * stub's error builders it is fed with (b.jg5 SRJ-1303; their shape checks
- * live here).
+ * (b.jg5 SRJ-104), which recognises every error the client declares as a
+ * class by `instanceof` that class (b.jg5 SRJ-101), never by its `errName` or
+ * `name`; the by-class helper `isAdErrorInstance` and the GONE label
+ * `goneErrNameOf`; the `ErrInvalidFlags` step beside it; the re-bound-socket
+ * predicate `isDifferentTmuxServerError` (b.jg5 SRJ-311, SRJ-1021; class plus
+ * phrase); the CONFLICT description accessor `conflictDescriptionOf` (b.jg5
+ * SRJ-501, SRJ-507) and the kill-failure description accessor
+ * `killFailedDescriptionOf` (b.jg5 SRJ-110, SRJ-702), each answering only
+ * for an instance of its class (an `ErrUnknownErrorName` carrying the name,
+ * UNAVAILABLE by SRJ-104, answers nothing); the launch-timeout predicate
+ * `isLaunchTimeoutError` / `launchTimeoutFormOf` (b.jg5 SRJ-407; class plus
+ * phrase and the declared call: an `ErrCallTimeout` instance, or an
+ * `ErrTmuxUnresponsive` instance whose description carries
+ * `LAUNCH_TIMEOUT_PHRASE`, only at a launch call; both forms stay
+ * UNAVAILABLE); the one-line description `describeReportedAdFailure` (b.jg5
+ * SRJ-104: what agent-director reported, else
+ * `describeAgentDirectorFailure`'s description); and the stub's error
+ * builders it is fed with (b.jg5 SRJ-1303; their shape checks live here).
  *
- * Every value is built with the stub's builders. The three Phase-1-only names and the three store-open
- * names come from `src/agent-director-errors.ts` as strings; no class of
- * theirs is imported. Class labels come from `src/ad-error-class.ts`, the
- * description words, the survivor pattern and `survivorPids` from
- * `src/ad-description-phrases.ts` and the cap from
+ * Every value is built with the stub's builders; a value of a class with a
+ * description no builder takes has that description set on the builder's
+ * value. A base `AgentDirectorError` named like a class (`errGeneric`), an
+ * `Error` named like one and an object shaped like one are the by-class
+ * negatives. The client's classes, the bindings of the three Phase-1-only
+ * classes (`ErrTmuxKillFailed`, `ErrTmuxUnresponsive`,
+ * `ErrTmuxSessionConflict`: the host client's stand-ins) and the name
+ * constants come from `src/agent-director-errors.ts`. Class labels come from
+ * `src/ad-error-class.ts`, the description words, the survivor pattern and
+ * `survivorPids` from `src/ad-description-phrases.ts` and the cap from
  * `src/persona-connection-errors.ts`.
  *
  * The step's re-check is either an injected recording trigger or E3's
@@ -50,6 +56,8 @@ import {
   AD_ERROR_CLASS_UNAVAILABLE,
   AD_ERROR_CLASS_UNCLASSIFIED,
   AD_ERROR_CLASS_UNUSABLE_NAME,
+  AD_GONE_ERR_NAMES,
+  AD_GONE_ERROR_CLASSES,
   AD_LAUNCH_VERBS,
   AD_VERBS,
   AD_VERB_KILL,
@@ -63,7 +71,8 @@ import {
   describeAdErrorClassification,
   describeAgentDirectorFailure,
   describeReportedAdFailure,
-  hasAdErrorName,
+  goneErrNameOf,
+  isAdErrorInstance,
   isDifferentTmuxServerError,
   isInvalidFlagsError,
   isLaunchTimeoutError,
@@ -73,6 +82,7 @@ import {
   type AdCall,
   type AdErrorClass,
   type AdErrorClassification,
+  type AdErrorConstructor,
   type AdVerb,
   type AdVersionRecheckTrigger,
   type LaunchTimeoutForm,
@@ -122,6 +132,25 @@ import {
   ERR_TMUX_KILL_FAILED_NAME,
   ERR_TMUX_SESSION_CONFLICT_NAME,
   ERR_TMUX_UNRESPONSIVE_NAME,
+  ErrCallTimeout,
+  ErrCwdNotADirectory,
+  ErrCwdNotFound,
+  ErrInstanceIdCollision,
+  ErrInvalidFlags,
+  ErrJsonlMissing,
+  ErrJsonlNeverWritten,
+  ErrNoSessionId,
+  ErrSpawnNotFound,
+  ErrSpawnNotInteractive,
+  ErrSpawnNotPausable,
+  ErrSpawnNotResumable,
+  ErrTmuxCaptureFailed,
+  ErrTmuxKillFailed,
+  ErrTmuxNotAvailable,
+  ErrTmuxSendKeys,
+  ErrTmuxSessionConflict,
+  ErrTmuxSessionCreate,
+  ErrTmuxUnresponsive,
   ErrUnknownErrorName,
   PHASE1_ONLY_ERR_NAMES,
   STORE_OPEN_ERR_NAMES,
@@ -227,6 +256,11 @@ function baseError(errName: string, description = 'described'): AgentDirectorErr
   return errGeneric('resume', errName, description)
 }
 
+/** `value` (a builder's error, of its class) with its `errDescription` set to `description`. */
+function withErrDescription<T extends AgentDirectorError>(value: T, description: string): T {
+  return Object.defineProperty(value, 'errDescription', { value: description })
+}
+
 // ---------------------------------------------------------------------------
 // Every row of SRJ-104's table
 // ---------------------------------------------------------------------------
@@ -259,19 +293,9 @@ const ROWS: readonly Row[] = [
   ]),
   ['a wrapped UnknownError', () => baseError(CSCB_UNKNOWN_ERROR_NAME, 'Error: boom'), AD_ERROR_CLASS_UNAVAILABLE],
   ['a plain Error', () => new Error('boom'), AD_ERROR_CLASS_UNAVAILABLE],
-  ...PHASE1_ONLY_ERR_NAMES.map((name): Row => [
-    `a plain Error named ${name}`,
-    () => plainErrorNamed(name),
-    AD_ERROR_CLASS_UNAVAILABLE,
-  ]),
   ['a string', () => 'boom', AD_ERROR_CLASS_UNAVAILABLE],
   ['undefined', () => undefined, AD_ERROR_CLASS_UNAVAILABLE],
   ['null', () => null, AD_ERROR_CLASS_UNAVAILABLE],
-  [
-    'an object shaped like an agent-director error',
-    () => ({ verb: 'resume', errName: ERR_TMUX_SESSION_CONFLICT_NAME, errDescription: 'x', name: ERR_TMUX_SESSION_CONFLICT_NAME }),
-    AD_ERROR_CLASS_UNAVAILABLE,
-  ],
   // CONFLICT
   ...CONFLICT_CASES.map((c): Row => [
     `errTmuxSessionConflict (resume, ${c})`,
@@ -434,6 +458,39 @@ describe('classifyAdError: A-13 (a client class named ErrInternal, ErrConfigMalf
   })
 })
 
+/** A description carrying the UNUSABLE NAME phrase, so a base `ErrInternal` takes its most specific answer. */
+const NAMED_BY_ERRNAME_DESCRIPTION = `${UNUSABLE_RECORDED_NAME_PHRASE} is empty`
+
+/** Each `errName` the classifier reads only off a value of no table class, with a base error's answer for it. */
+const ERRNAME_ROWS: ReadonlyArray<readonly [name: string, baseAnswer: AdErrorClass]> = [
+  [ERR_INTERNAL, AD_ERROR_CLASS_UNUSABLE_NAME],
+  [ERR_CONFIG_MALFORMED, AD_ERROR_CLASS_CONFIG],
+  ...STORE_OPEN_ERR_NAMES.map((name) => [name, AD_ERROR_CLASS_UNCLASSIFIED] as const),
+  [CSCB_UNKNOWN_ERROR_NAME, AD_ERROR_CLASS_UNAVAILABLE],
+]
+
+/** Table classes of differing answers, each built with a given `errName` and description. */
+const ERRNAME_CLASS_ROWS: ReadonlyArray<readonly [build: (name: string, description: string) => AgentDirectorError, classAnswer: AdErrorClass]> = [
+  [(name, description) => new ErrTmuxSendKeys('send-keys', name, description), AD_ERROR_CLASS_GONE],
+  [(name, description) => new ErrSpawnNotFound('get', name, description), AD_ERROR_CLASS_STATE],
+  [(name, description) => new ErrTmuxUnresponsive('resume', name, description), AD_ERROR_CLASS_UNAVAILABLE],
+]
+
+describe('classifyAdError: a table class wins over an A-13 or UnknownError errName', () => {
+  test.each(
+    ERRNAME_ROWS.flatMap(([name, baseAnswer]) =>
+      ERRNAME_CLASS_ROWS.map(([build, classAnswer]) => {
+        const value = build(name, NAMED_BY_ERRNAME_DESCRIPTION)
+        return [value.constructor.name, name, classAnswer, baseAnswer, value] as const
+      }),
+    ),
+  )('an %s whose errName is %s is %s (a base error so named is %s)', (_className, name, classAnswer, baseAnswer, value) => {
+    expect(value.errName).toBe(name)
+    expect(classifyAdError(value)).toEqual({ errorClass: classAnswer })
+    expect(classifyAdError(baseError(name, NAMED_BY_ERRNAME_DESCRIPTION)).errorClass).toBe(baseAnswer)
+  })
+})
+
 // ---------------------------------------------------------------------------
 // The store-open names (b.jg5 SRJ-104; A-32, Q-15)
 // ---------------------------------------------------------------------------
@@ -475,33 +532,102 @@ describe('classifyAdError: the store-open names', () => {
 })
 
 // ---------------------------------------------------------------------------
-// By name, never by `name`
+// By class, never by `errName` or `name` (b.jg5 SRJ-101)
 // ---------------------------------------------------------------------------
 
-const PHASE1_BUILDERS: ReadonlyArray<readonly [string, () => AgentDirectorError]> = [
-  [ERR_TMUX_UNRESPONSIVE_NAME, () => errTmuxUnresponsive()],
-  [ERR_TMUX_KILL_FAILED_NAME, () => errTmuxKillFailed()],
-  [ERR_TMUX_SESSION_CONFLICT_NAME, () => errTmuxSessionConflict('resume', 'own-id')],
+/** A class the classifier decides by `instanceof`, a stub value of it, and that class's answer. */
+type ClassRow = readonly [errorClass: AdErrorConstructor, build: () => AgentDirectorError, expected: AdErrorClass]
+
+/** Every class the classifier decides by `instanceof`: SRJ-104's classes and `ErrUnknownErrorName`. */
+const BY_CLASS_ROWS: readonly ClassRow[] = [
+  [ErrTmuxSendKeys, () => errTmuxSendKeys(), AD_ERROR_CLASS_GONE],
+  [ErrTmuxCaptureFailed, () => errTmuxCaptureFailed(), AD_ERROR_CLASS_GONE],
+  [ErrTmuxUnresponsive, () => errTmuxUnresponsive(), AD_ERROR_CLASS_UNAVAILABLE],
+  [ErrTmuxKillFailed, () => errTmuxKillFailed(), AD_ERROR_CLASS_UNAVAILABLE],
+  [ErrCallTimeout, () => errCallTimeout(), AD_ERROR_CLASS_UNAVAILABLE],
+  [ErrUnknownErrorName, () => errUnknownErrorName(), AD_ERROR_CLASS_UNAVAILABLE],
+  [ErrTmuxSessionConflict, () => errTmuxSessionConflict('resume', 'own-id'), AD_ERROR_CLASS_CONFLICT],
+  [ErrTmuxNotAvailable, () => errTmuxNotAvailable(), AD_ERROR_CLASS_ENVIRONMENT],
+  [ErrTmuxSessionCreate, () => errTmuxSessionCreate(), AD_ERROR_CLASS_LAUNCH_FAILURE],
+  [ErrSpawnNotFound, () => errSpawnNotFound(), AD_ERROR_CLASS_STATE],
+  [ErrInstanceIdCollision, () => errInstanceIdCollision(), AD_ERROR_CLASS_STATE],
+  [ErrSpawnNotResumable, () => errSpawnNotResumable(), AD_ERROR_CLASS_STATE],
+  [ErrSpawnNotInteractive, () => errSpawnNotInteractive(), AD_ERROR_CLASS_STATE],
+  [ErrSpawnNotPausable, () => errSpawnNotPausable(), AD_ERROR_CLASS_STATE],
+  [ErrNoSessionId, () => errNoSessionId(), AD_ERROR_CLASS_STATE],
+  [ErrJsonlMissing, () => errJsonlMissing(), AD_ERROR_CLASS_STATE],
+  [ErrJsonlNeverWritten, () => errJsonlNeverWritten(), AD_ERROR_CLASS_STATE],
+  [ErrInvalidFlags, () => errInvalidFlags(), AD_ERROR_CLASS_STATE],
+  [ErrCwdNotFound, () => errCwdNotFound(), AD_ERROR_CLASS_DIRECTORY],
+  [ErrCwdNotADirectory, () => errCwdNotADirectory(), AD_ERROR_CLASS_DIRECTORY],
 ]
 
-describe('classifyAdError: recognised by errName', () => {
-  test.each(PHASE1_BUILDERS)('the %s builder gives an AgentDirectorError named for it', (name, build) => {
-    const err = build()
-    expect(err).toBeInstanceOf(AgentDirectorError)
-    expect(err.name).toBe(name)
-    expect(err.errName).toBe(name)
+/** The by-class rows labelled by their stub value's `errName`. */
+const NAMED_CLASS_ROWS = BY_CLASS_ROWS.map(([errorClass, build, expected]) => [build().errName, errorClass, build, expected] as const)
+
+/**
+ * The three look-alikes of a class's stub value, none an instance of it: a
+ * base `AgentDirectorError` with its `errName` and description (UNCLASSIFIED,
+ * reporting both, as every other agent-director error), an `Error` named for
+ * it and an object with its fields (neither an agent-director error:
+ * UNAVAILABLE).
+ */
+const LOOK_ALIKES: ReadonlyArray<readonly [label: string, make: (like: AgentDirectorError) => unknown, expected: (like: AgentDirectorError) => AdErrorClassification]> = [
+  [
+    'a base AgentDirectorError whose errName is',
+    (like) => errGeneric(like.verb, like.errName, like.errDescription),
+    (like) => ({ errorClass: AD_ERROR_CLASS_UNCLASSIFIED, reportedName: like.errName, message: like.errDescription }),
+  ],
+  ['an Error named', (like) => Object.assign(plainErrorNamed(like.errName), { message: like.errDescription }), () => ({ errorClass: AD_ERROR_CLASS_UNAVAILABLE })],
+  [
+    'an object shaped like',
+    (like) => ({ verb: like.verb, errName: like.errName, errDescription: like.errDescription, name: like.errName }),
+    () => ({ errorClass: AD_ERROR_CLASS_UNAVAILABLE }),
+  ],
+]
+
+describe('classifyAdError: by class', () => {
+  test.each(NAMED_CLASS_ROWS)('the stub\'s %s is an instance of its class and is %s', (_name, errorClass, build, expected) => {
+    const value = build()
+    expect(value).toBeInstanceOf(errorClass)
+    expect(isAdErrorInstance(value, errorClass)).toBe(true)
+    expect(classifyAdError(value).errorClass).toBe(expected)
   })
 
-  test.each(PHASE1_BUILDERS)('a base error with errName %s and its default name classifies as the builder\'s', (name, build) => {
-    const err = baseError(name)
-    expect(err.name).not.toBe(name)
-    expect(classifyAdError(err)).toEqual(classifyAdError(build()))
+  test('the table holds every class SRJ-104 decides: each classified row that is an agent-director error, CSCB\'s wrapper aside, is an instance of one of its classes', () => {
+    const decided = ROWS
+      .filter(([, , expected]) => expected !== AD_ERROR_CLASS_UNCLASSIFIED)
+      .map(([label, build]) => [label, build()] as const)
+      .filter(([, value]) => value instanceof AgentDirectorError && value.errName !== CSCB_UNKNOWN_ERROR_NAME)
+    expect(decided.length).toBeGreaterThan(0)
+    for (const [label, value] of decided) {
+      expect({ label, covered: BY_CLASS_ROWS.some(([errorClass]) => value instanceof errorClass) }).toEqual({ label, covered: true })
+    }
+    expect(BY_CLASS_ROWS.filter(([, , expected]) => expected === AD_ERROR_CLASS_GONE).map(([errorClass]) => errorClass)).toEqual([
+      ...AD_GONE_ERROR_CLASSES,
+    ])
   })
 
-  test('a value whose name is a Phase-1-only name but whose errName is a STATE name is STATE', () => {
+  test.each(
+    NAMED_CLASS_ROWS.flatMap(([name, errorClass, build, expected]) =>
+      LOOK_ALIKES.map(([form, make, answer]) => [`${form} ${name}`, expected, errorClass, build, make, answer] as const),
+    ),
+  )('%s is not of that class (whose answer is %s)', (_label, _expected, errorClass, build, make, answer) => {
+    const like = build()
+    const value = make(like)
+    expect(isAdErrorInstance(value, errorClass)).toBe(false)
+    expect(classifyAdError(value)).toEqual(answer(like))
+  })
+
+  test('a value whose name is a Phase-1-only name but which is an ErrSpawnNotFound is STATE', () => {
     const err = errSpawnNotFound()
     err.name = ERR_TMUX_SESSION_CONFLICT_NAME
     expect(classifyAdError(err)).toEqual({ errorClass: AD_ERROR_CLASS_STATE })
+  })
+
+  test('an ErrTmuxCaptureFailed behind a proxy whose every read throws is still GONE: instanceof reads no property', () => {
+    const value = new Proxy(errTmuxCaptureFailed(), { get: () => { throw new Error('boom') } })
+    expect(classifyAdError(value)).toEqual({ errorClass: AD_ERROR_CLASS_GONE })
   })
 })
 
@@ -615,7 +741,50 @@ const OPTION_CASES: ReadonlyArray<readonly [keyof ConflictOptions, readonly Conf
   ['scan', ['conflicting-labels']],
 ]
 
+/**
+ * Every builder of the three Phase-1-only errors, with the binding of
+ * `src/agent-director-errors.ts` it builds on, its name constant and the verb
+ * it carries.
+ */
+const PHASE1_BUILDS: ReadonlyArray<readonly [label: string, errorClass: AdErrorConstructor, name: string, verb: string, build: () => AgentDirectorError]> = [
+  ['errTmuxUnresponsive', ErrTmuxUnresponsive, ERR_TMUX_UNRESPONSIVE_NAME, 'kill', () => errTmuxUnresponsive('kill')],
+  ['errTmuxUnresponsiveAfterDuplicateSession', ErrTmuxUnresponsive, ERR_TMUX_UNRESPONSIVE_NAME, 'resume', () => errTmuxUnresponsiveAfterDuplicateSession('resume')],
+  ['errTmuxUnresponsiveLaunchTimeout', ErrTmuxUnresponsive, ERR_TMUX_UNRESPONSIVE_NAME, 'spawn', () => errTmuxUnresponsiveLaunchTimeout('spawn')],
+  ['errTmuxUnresponsiveStillStopping', ErrTmuxUnresponsive, ERR_TMUX_UNRESPONSIVE_NAME, 'resume', () => errTmuxUnresponsiveStillStopping('resume')],
+  ['errTmuxUnresponsiveStillStarting', ErrTmuxUnresponsive, ERR_TMUX_UNRESPONSIVE_NAME, 'resume', () => errTmuxUnresponsiveStillStarting('resume')],
+  ['errTmuxUnresponsiveNewRowEnded', ErrTmuxUnresponsive, ERR_TMUX_UNRESPONSIVE_NAME, 'spawn', () => errTmuxUnresponsiveNewRowEnded('spawn')],
+  ...KILL_FAILED_DESCRIPTIONS.map((d) => [`errTmuxKillFailed (${d})`, ErrTmuxKillFailed, ERR_TMUX_KILL_FAILED_NAME, 'kill', () => errTmuxKillFailed(STUB_TMUX_SESSION_NAME, d)] as const),
+  ...CONFLICT_CASES.map((c) => [`errTmuxSessionConflict (${c})`, ErrTmuxSessionConflict, ERR_TMUX_SESSION_CONFLICT_NAME, 'read-pane', () => errTmuxSessionConflict('read-pane', c)] as const),
+]
+
 describe('stub builders: shape (SRJ-1303)', () => {
+  test.each(PHASE1_BUILDS)(
+    '%s builds an instance of its binding, with the name constant as errName, its verb and a description',
+    (_label, errorClass, name, verb, build) => {
+      const err = build()
+      expect(err).toBeInstanceOf(errorClass)
+      expect(err).toBeInstanceOf(AgentDirectorError)
+      expect(err.errName).toBe(name)
+      expect(err.verb).toBe(verb)
+      expect(typeof err.errDescription).toBe('string')
+      expect(err.errDescription).not.toBe('')
+    },
+  )
+
+  test('the three bindings are distinct classes, each named for its error, and no builder value is an instance of another\'s', () => {
+    const bindings: ReadonlyArray<readonly [AdErrorConstructor, string]> = [
+      [ErrTmuxUnresponsive, ERR_TMUX_UNRESPONSIVE_NAME],
+      [ErrTmuxKillFailed, ERR_TMUX_KILL_FAILED_NAME],
+      [ErrTmuxSessionConflict, ERR_TMUX_SESSION_CONFLICT_NAME],
+    ]
+    expect(new Set(bindings.map(([errorClass]) => errorClass)).size).toBe(PHASE1_ONLY_ERR_NAMES.length)
+    expect(bindings.map(([errorClass]) => errorClass.name)).toEqual(bindings.map(([, name]) => name))
+    for (const [label, errorClass, , , build] of PHASE1_BUILDS) {
+      const others = bindings.filter(([other]) => other !== errorClass && build() instanceof other)
+      expect({ label, others }).toEqual({ label, others: [] })
+    }
+  })
+
   test.each([...KILL_FAILED_DESCRIPTIONS])(
     'errTmuxKillFailed (%s) carries the quoted session name, verb kill, "retry kill later" and "never delete this row"',
     (d) => {
@@ -848,8 +1017,7 @@ describe('classifyAdError: reported name and message', () => {
         new ErrUnknownErrorName(name, { err_name: name, err_description: description, detail: LEAK_SENTINEL }),
         { note: LEAK_SENTINEL },
       )
-    const errNamed = (errName: string): AgentDirectorError =>
-      Object.assign(baseError(errName, secret), { note: LEAK_SENTINEL })
+    const secretOf = <T extends AgentDirectorError>(value: T): T => Object.assign(withErrDescription(value, secret), { note: LEAK_SENTINEL })
     const cases = [
       [classifyAdError(unknownNamed(ERR_INTERNAL, secret)), ERR_INTERNAL, redacted],
       [
@@ -858,9 +1026,9 @@ describe('classifyAdError: reported name and message', () => {
         `${UNUSABLE_RECORDED_NAME_PHRASE} ${redacted}`,
       ],
       [classifyAdError(unknownNamed(ERR_CONFIG_MALFORMED, secret)), ERR_CONFIG_MALFORMED, redacted],
-      [classifyAdError(errNamed(errSendKeysWhileRelayed().errName)), errSendKeysWhileRelayed().errName, redacted],
+      [classifyAdError(secretOf(errSendKeysWhileRelayed())), errSendKeysWhileRelayed().errName, redacted],
       [
-        (await classifyWithInvalidFlagsRecheck(errNamed(errInvalidFlags().errName), recordingTrigger(PASS).trigger)).classification,
+        (await classifyWithInvalidFlagsRecheck(secretOf(errInvalidFlags()), recordingTrigger(PASS).trigger)).classification,
         errInvalidFlags().errName,
         redacted,
       ],
@@ -933,9 +1101,14 @@ describe('classifyAdError: reported name and message', () => {
 describe('classifyAdError: never throws', () => {
   test.each([
     [
-      'an errName getter that throws',
+      'an ErrSpawnNotFound whose errName getter throws (the class decides)',
       () => Object.defineProperty(errSpawnNotFound(), 'errName', { get: () => { throw new Error('boom') } }),
-      { errorClass: AD_ERROR_CLASS_UNCLASSIFIED, message: 'spawn not found' },
+      { errorClass: AD_ERROR_CLASS_STATE },
+    ],
+    [
+      'a base error whose errName getter throws',
+      () => Object.defineProperty(baseError(ERR_SPAWN_NOT_FOUND_NAME), 'errName', { get: () => { throw new Error('boom') } }),
+      { errorClass: AD_ERROR_CLASS_UNCLASSIFIED, message: baseError(ERR_SPAWN_NOT_FOUND_NAME).errDescription },
     ],
     [
       'an envelope whose err_description getter throws',
@@ -959,41 +1132,72 @@ describe('classifyAdError: never throws', () => {
 describe('isInvalidFlagsError', () => {
   test.each([
     ['the client\'s ErrInvalidFlags', true, () => errInvalidFlags()],
-    ['a base error with that errName', true, () => baseError(errInvalidFlags().errName)],
+    ['the client\'s ErrInvalidFlags whose errName getter throws (the class decides)', true, () => Object.defineProperty(errInvalidFlags(), 'errName', { get: () => { throw new Error('boom') } })],
+    ['a base error with that errName', false, () => baseError(errInvalidFlags().errName)],
     ['an Error named ErrInvalidFlags', false, () => plainErrorNamed(errInvalidFlags().errName)],
     ['an object with that errName', false, () => ({ errName: errInvalidFlags().errName })],
     ['another agent-director error', false, () => errSpawnNotFound()],
     ['undefined', false, () => undefined],
-    ['its errName getter throws', false, () => Object.defineProperty(errInvalidFlags(), 'errName', { get: () => { throw new Error('boom') } })],
+    ['a proxy whose every trap throws', false, () => hostileProxy()],
   ])('%s → %p', (_label, expected, build) => {
     expect(isInvalidFlagsError(build())).toBe(expected)
   })
 })
 
 // ---------------------------------------------------------------------------
-// hasAdErrorName
+// isAdErrorInstance and goneErrNameOf
 // ---------------------------------------------------------------------------
 
-describe('hasAdErrorName', () => {
-  test.each<[string, boolean, () => unknown, string]>([
-    ['errSpawnNotFound against ERR_SPAWN_NOT_FOUND_NAME', true, () => errSpawnNotFound(), ERR_SPAWN_NOT_FOUND_NAME],
-    ['errTmuxKillFailed against ERR_TMUX_KILL_FAILED_NAME', true, () => errTmuxKillFailed(), ERR_TMUX_KILL_FAILED_NAME],
-    ['a base error with that errName', true, () => baseError(ERR_SPAWN_NOT_FOUND_NAME), ERR_SPAWN_NOT_FOUND_NAME],
-    ['errSpawnNotFound against another name', false, () => errSpawnNotFound(), ERR_TMUX_KILL_FAILED_NAME],
-    ['errTmuxKillFailed against another name', false, () => errTmuxKillFailed(), ERR_SPAWN_NOT_FOUND_NAME],
-    ['an agent-director error whose name, not errName, matches', false, () => Object.assign(baseError(ERR_INTERNAL), { name: ERR_SPAWN_NOT_FOUND_NAME }), ERR_SPAWN_NOT_FOUND_NAME],
-    ['an Error named for it', false, () => plainErrorNamed(ERR_SPAWN_NOT_FOUND_NAME), ERR_SPAWN_NOT_FOUND_NAME],
-    ['a plain object with a matching errName', false, () => ({ errName: ERR_TMUX_KILL_FAILED_NAME }), ERR_TMUX_KILL_FAILED_NAME],
-    ['undefined', false, () => undefined, ERR_SPAWN_NOT_FOUND_NAME],
-    ['a string of that name', false, () => ERR_SPAWN_NOT_FOUND_NAME, ERR_SPAWN_NOT_FOUND_NAME],
-    ['an errName getter that throws', false, () => Object.defineProperty(errSpawnNotFound(), 'errName', { get: () => { throw new Error('boom') } }), ERR_SPAWN_NOT_FOUND_NAME],
-    ['a proxy whose every trap throws', false, () => new Proxy({}, { get: () => { throw new Error('boom') }, getPrototypeOf: () => { throw new Error('boom') } }), ERR_SPAWN_NOT_FOUND_NAME],
-  ])('%s → %p', (_label, expected, build, name) => {
-    expect(hasAdErrorName(build(), name)).toBe(expected)
+describe('isAdErrorInstance', () => {
+  test.each<[string, boolean, () => unknown, AdErrorConstructor]>([
+    ['errSpawnNotFound against ErrSpawnNotFound', true, () => errSpawnNotFound(), ErrSpawnNotFound],
+    ['errSpawnNotFound against the base AgentDirectorError', true, () => errSpawnNotFound(), AgentDirectorError],
+    ['errTmuxKillFailed against the ErrTmuxKillFailed binding', true, () => errTmuxKillFailed(), ErrTmuxKillFailed],
+    ['errTmuxUnresponsive against the ErrTmuxUnresponsive binding', true, () => errTmuxUnresponsive(), ErrTmuxUnresponsive],
+    ['errTmuxSessionConflict against the ErrTmuxSessionConflict binding', true, () => errTmuxSessionConflict('resume', 'own-id'), ErrTmuxSessionConflict],
+    ['an ErrSpawnNotFound whose errName getter throws (the class decides)', true, () => Object.defineProperty(errSpawnNotFound(), 'errName', { get: () => { throw new Error('boom') } }), ErrSpawnNotFound],
+    ['a base error named ErrSpawnNotFound (a STATE class)', false, () => baseError(ERR_SPAWN_NOT_FOUND_NAME), ErrSpawnNotFound],
+    ['a base error named ErrTmuxKillFailed', false, () => baseError(ERR_TMUX_KILL_FAILED_NAME), ErrTmuxKillFailed],
+    ['an ErrUnknownErrorName carrying ErrTmuxKillFailed', false, () => errUnknownErrorName(ERR_TMUX_KILL_FAILED_NAME), ErrTmuxKillFailed],
+    ['errSpawnNotFound against ErrTmuxKillFailed', false, () => errSpawnNotFound(), ErrTmuxKillFailed],
+    ['errTmuxKillFailed against ErrSpawnNotFound', false, () => errTmuxKillFailed(), ErrSpawnNotFound],
+    ['errTmuxUnresponsive against ErrTmuxKillFailed', false, () => errTmuxUnresponsive(), ErrTmuxKillFailed],
+    ['an agent-director error whose name, not class, matches', false, () => Object.assign(baseError(ERR_INTERNAL), { name: ERR_SPAWN_NOT_FOUND_NAME }), ErrSpawnNotFound],
+    ['an Error named for it', false, () => plainErrorNamed(ERR_SPAWN_NOT_FOUND_NAME), ErrSpawnNotFound],
+    ['a plain object with a matching errName', false, () => ({ errName: ERR_TMUX_KILL_FAILED_NAME }), ErrTmuxKillFailed],
+    ['undefined', false, () => undefined, ErrSpawnNotFound],
+    ['a string of that name', false, () => ERR_SPAWN_NOT_FOUND_NAME, ErrSpawnNotFound],
+    ['a proxy whose every trap throws', false, () => hostileProxy(), ErrSpawnNotFound],
+  ])('%s → %p', (_label, expected, build, errorClass) => {
+    const value = build()
+    expect(() => isAdErrorInstance(value, errorClass)).not.toThrow()
+    expect(isAdErrorInstance(value, errorClass)).toBe(expected)
   })
 
   test('ERR_SPAWN_NOT_FOUND_NAME is the errName of the client\'s ErrSpawnNotFound', () => {
     expect(errSpawnNotFound().errName).toBe(ERR_SPAWN_NOT_FOUND_NAME)
+  })
+})
+
+describe('goneErrNameOf', () => {
+  test('AD_GONE_ERR_NAMES labels AD_GONE_ERROR_CLASSES in order: each GONE builder\'s errName', () => {
+    expect<readonly string[]>([...AD_GONE_ERR_NAMES]).toEqual([errTmuxSendKeys().errName, errTmuxCaptureFailed().errName])
+    expect([...AD_GONE_ERROR_CLASSES]).toEqual([ErrTmuxSendKeys, ErrTmuxCaptureFailed])
+  })
+
+  test.each<[string, () => unknown, string | undefined]>([
+    ['errTmuxSendKeys', () => errTmuxSendKeys(), errTmuxSendKeys().errName],
+    ['errTmuxCaptureFailed', () => errTmuxCaptureFailed(), errTmuxCaptureFailed().errName],
+    ['a base error named ErrTmuxSendKeys', () => baseError(errTmuxSendKeys().errName), undefined],
+    ['an Error named ErrTmuxCaptureFailed', () => plainErrorNamed(errTmuxCaptureFailed().errName), undefined],
+    ['an ErrUnknownErrorName carrying ErrTmuxSendKeys', () => errUnknownErrorName(errTmuxSendKeys().errName), undefined],
+    ['errSpawnNotFound', () => errSpawnNotFound(), undefined],
+    ['undefined', () => undefined, undefined],
+    ['a proxy whose every trap throws', () => hostileProxy(), undefined],
+  ])('%s → %p', (_label, build, expected) => {
+    const value = build()
+    expect(() => goneErrNameOf(value)).not.toThrow()
+    expect<string | undefined>(goneErrNameOf(value)).toBe(expected)
   })
 })
 
@@ -1020,8 +1224,11 @@ describe('isDifferentTmuxServerError', () => {
     ['the stub\'s different-server form', () => errTmuxNotAvailableDifferentServer()],
     ['the different-server form on another socket', () => errTmuxNotAvailableDifferentServer(OTHER_SOCKET_PATH)],
     ['the different-server form from read-pane', () => errTmuxNotAvailableDifferentServer(STUB_TMUX_SOCKET_PATH, 'read-pane')],
-    ['a base error named ErrTmuxNotAvailable carrying the words', () => baseError(ERR_TMUX_NOT_AVAILABLE, DIFFERENT_SERVER_DESCRIPTION)],
-    ['an ErrTmuxNotAvailable whose description is exactly the words', () => errGeneric('resume', ERR_TMUX_NOT_AVAILABLE, DIFFERENT_TMUX_SERVER_PHRASE)],
+    ['an ErrTmuxNotAvailable whose description is exactly the words', () => differentServerWithDescription({ value: DIFFERENT_TMUX_SERVER_PHRASE })],
+    [
+      'the different-server form whose errName getter throws (the class decides)',
+      () => Object.defineProperty(errTmuxNotAvailableDifferentServer(), 'errName', { get: () => { throw new Error('boom') } }),
+    ],
   ])('%s is the re-bound form', (_label, build) => {
     const value = build()
     expect(classifyAdError(value).errorClass).toBe(AD_ERROR_CLASS_ENVIRONMENT)
@@ -1040,11 +1247,12 @@ describe('isDifferentTmuxServerError', () => {
   })
 
   test.each<[string, () => unknown, AdErrorClass]>([
-    ['ErrTmuxUnresponsive', () => baseError(ERR_TMUX_UNRESPONSIVE_NAME, DIFFERENT_SERVER_DESCRIPTION), AD_ERROR_CLASS_UNAVAILABLE],
-    ['ErrTmuxSessionConflict', () => baseError(ERR_TMUX_SESSION_CONFLICT_NAME, DIFFERENT_SERVER_DESCRIPTION), AD_ERROR_CLASS_CONFLICT],
-    ['ErrTmuxSessionCreate', () => baseError(errTmuxSessionCreate().errName, DIFFERENT_SERVER_DESCRIPTION), AD_ERROR_CLASS_LAUNCH_FAILURE],
-    ['ErrSpawnNotFound', () => baseError(ERR_SPAWN_NOT_FOUND_NAME, DIFFERENT_SERVER_DESCRIPTION), AD_ERROR_CLASS_STATE],
-    ['ErrTmuxSendKeys', () => baseError(errTmuxSendKeys().errName, DIFFERENT_SERVER_DESCRIPTION), AD_ERROR_CLASS_GONE],
+    ['a base error named ErrTmuxNotAvailable', () => baseError(ERR_TMUX_NOT_AVAILABLE, DIFFERENT_SERVER_DESCRIPTION), AD_ERROR_CLASS_UNCLASSIFIED],
+    ['an ErrTmuxUnresponsive', () => errTmuxUnresponsive('resume', DIFFERENT_SERVER_DESCRIPTION), AD_ERROR_CLASS_UNAVAILABLE],
+    ['an ErrTmuxSessionConflict', () => conflictWithDescription({ value: DIFFERENT_SERVER_DESCRIPTION }), AD_ERROR_CLASS_CONFLICT],
+    ['an ErrTmuxSessionCreate', () => withErrDescription(errTmuxSessionCreate(), DIFFERENT_SERVER_DESCRIPTION), AD_ERROR_CLASS_LAUNCH_FAILURE],
+    ['an ErrSpawnNotFound', () => withErrDescription(errSpawnNotFound(), DIFFERENT_SERVER_DESCRIPTION), AD_ERROR_CLASS_STATE],
+    ['an ErrTmuxSendKeys', () => withErrDescription(errTmuxSendKeys(), DIFFERENT_SERVER_DESCRIPTION), AD_ERROR_CLASS_GONE],
     ['CSCB\'s wrapped UnknownError', () => baseError(CSCB_UNKNOWN_ERROR_NAME, DIFFERENT_SERVER_DESCRIPTION), AD_ERROR_CLASS_UNAVAILABLE],
     ['an ErrInternal (envelope description)', () => errInternal(DIFFERENT_SERVER_DESCRIPTION), AD_ERROR_CLASS_UNCLASSIFIED],
     ['an ErrConfigMalformed (envelope description)', () => errUnknownErrorName(ERR_CONFIG_MALFORMED, DIFFERENT_SERVER_DESCRIPTION), AD_ERROR_CLASS_CONFIG],
@@ -1094,11 +1302,6 @@ describe('isDifferentTmuxServerError', () => {
     expect(isDifferentTmuxServerError(value)).toBe(false)
   })
 
-  test('an errName getter that throws answers false and throws nothing', () => {
-    const value = Object.defineProperty(errTmuxNotAvailableDifferentServer(), 'errName', { get: () => { throw new Error('boom') } })
-    expect(() => isDifferentTmuxServerError(value)).not.toThrow()
-    expect(isDifferentTmuxServerError(value)).toBe(false)
-  })
 })
 
 // ---------------------------------------------------------------------------
@@ -1123,7 +1326,6 @@ const CONFLICT_BUILDS: readonly Built[] = [
     `errTmuxSessionConflict (${label}, another session)`,
     () => errTmuxSessionConflict(verb, c, OTHER_SESSION_NAME, options),
   ]),
-  ['a base error with the CONFLICT errName and its default name', () => baseError(ERR_TMUX_SESSION_CONFLICT_NAME, 'a session conflict')],
 ]
 
 /** A proxy whose every trap throws. */
@@ -1173,12 +1375,25 @@ describe('conflictDescriptionOf', () => {
 
   test('the description comes back raw: not redacted onto one line, not capped, a case word past the cap kept', () => {
     const description = `first line\nsecond line\r\n${'x'.repeat(MAX_LOGGED_MESSAGE_LENGTH)} ${CONFLICT_ANOTHER_STORE_PHRASE}`
-    const value = baseError(ERR_TMUX_SESSION_CONFLICT_NAME, description)
+    const value = conflictWithDescription({ value: description })
     expect(conflictDescriptionOf(value)).toBe(description)
   })
 
   test('an empty CONFLICT description comes back as the empty string', () => {
-    expect(conflictDescriptionOf(baseError(ERR_TMUX_SESSION_CONFLICT_NAME, ''))).toBe('')
+    expect(conflictDescriptionOf(conflictWithDescription({ value: '' }))).toBe('')
+  })
+
+  test('a CONFLICT whose errName getter throws still answers its description: the class decides', () => {
+    const expected = errTmuxSessionConflict('resume', 'own-id').errDescription
+    const value = Object.defineProperty(errTmuxSessionConflict('resume', 'own-id'), 'errName', { get: () => { throw new Error('boom') } })
+    expect(classifyAdError(value)).toEqual({ errorClass: AD_ERROR_CLASS_CONFLICT })
+    expect(conflictDescriptionOf(value)).toBe(expected)
+  })
+
+  test('a base error with the CONFLICT errName, carrying a CONFLICT description, is UNCLASSIFIED and answers nothing', () => {
+    const value = baseError(ERR_TMUX_SESSION_CONFLICT_NAME, errTmuxSessionConflict('resume', 'own-id').errDescription)
+    expect(classifyAdError(value).errorClass).toBe(AD_ERROR_CLASS_UNCLASSIFIED)
+    expect(conflictDescriptionOf(value)).toBeUndefined()
   })
 
   // SRJ-104: an ErrUnknownErrorName whose unknownName is not one of the five
@@ -1210,10 +1425,10 @@ describe('conflictDescriptionOf', () => {
   })
 
   test.each<[string, () => unknown, AdErrorClass]>([
-    ['ErrTmuxUnresponsive', () => baseError(ERR_TMUX_UNRESPONSIVE_NAME, errTmuxSessionConflict('resume', 'own-id').errDescription), AD_ERROR_CLASS_UNAVAILABLE],
-    ['ErrTmuxKillFailed', () => baseError(ERR_TMUX_KILL_FAILED_NAME, errTmuxSessionConflict('kill', 'not-this-launch').errDescription), AD_ERROR_CLASS_UNAVAILABLE],
-    ['ErrSpawnNotFound', () => baseError(ERR_SPAWN_NOT_FOUND_NAME, errTmuxSessionConflict('resume', 'leftover').errDescription), AD_ERROR_CLASS_STATE],
-    ['ErrTmuxSessionCreate', () => baseError(errTmuxSessionCreate().errName, errTmuxSessionConflict('spawn', 'conflicting-labels').errDescription), AD_ERROR_CLASS_LAUNCH_FAILURE],
+    ['an ErrTmuxUnresponsive', () => errTmuxUnresponsive('resume', errTmuxSessionConflict('resume', 'own-id').errDescription), AD_ERROR_CLASS_UNAVAILABLE],
+    ['an ErrTmuxKillFailed', () => withErrDescription(errTmuxKillFailed(), errTmuxSessionConflict('kill', 'not-this-launch').errDescription), AD_ERROR_CLASS_UNAVAILABLE],
+    ['an ErrSpawnNotFound', () => withErrDescription(errSpawnNotFound(), errTmuxSessionConflict('resume', 'leftover').errDescription), AD_ERROR_CLASS_STATE],
+    ['an ErrTmuxSessionCreate', () => withErrDescription(errTmuxSessionCreate(), errTmuxSessionConflict('spawn', 'conflicting-labels').errDescription), AD_ERROR_CLASS_LAUNCH_FAILURE],
     ['an ErrInternal (envelope description)', () => errInternal(errTmuxSessionConflict('resume', 'another-store').errDescription), AD_ERROR_CLASS_UNCLASSIFIED],
   ])('%s carrying a CONFLICT description answers nothing: the class decides, never the words', (_label, build, expected) => {
     const value = build()
@@ -1252,7 +1467,6 @@ describe('conflictDescriptionOf', () => {
   })
 
   test.each<Built>([
-    ['an errName getter that throws', () => Object.defineProperty(errTmuxSessionConflict('resume', 'own-id'), 'errName', { get: () => { throw new Error('boom') } })],
     ['a proxy whose every trap throws', hostileProxy],
     [
       'a proxy over a CONFLICT whose every read throws',
@@ -1266,7 +1480,7 @@ describe('conflictDescriptionOf', () => {
 
   test("the CONFLICT classification is unchanged: no description in it, so its log line carries none", () => {
     const secret = `${CONFLICT_OWN_ID_PHRASE} (${sentinelInMessage('conflict')})`
-    const value = baseError(ERR_TMUX_SESSION_CONFLICT_NAME, secret)
+    const value = conflictWithDescription({ value: secret })
     const before = classifyAdError(value)
     expect(conflictDescriptionOf(value)).toBe(secret)
     const after = classifyAdError(value)
@@ -1295,11 +1509,8 @@ describe('conflictDescriptionOf', () => {
 // killFailedDescriptionOf (b.jg5 SRJ-110, SRJ-702)
 // ---------------------------------------------------------------------------
 
-/** The ROWS labels that build an `ErrTmuxKillFailed` by name: the four descriptions and the `ErrUnknownErrorName` envelope form. */
-const KILL_FAILED_ROW_LABELS: ReadonlySet<string> = new Set([
-  ...KILL_FAILED_DESCRIPTIONS.map((d) => `errTmuxKillFailed (${d})`),
-  `errUnknownErrorName with the Phase-1-only name ${ERR_TMUX_KILL_FAILED_NAME}`,
-])
+/** The ROWS labels that build an `ErrTmuxKillFailed` instance: one per description. */
+const KILL_FAILED_ROW_LABELS: ReadonlySet<string> = new Set(KILL_FAILED_DESCRIPTIONS.map((d) => `errTmuxKillFailed (${d})`))
 
 /** An `ErrUnknownErrorName` carrying the `ErrTmuxKillFailed` name and the stub's description `d` in its envelope. */
 function unknownNamedKillFailed(d: (typeof KILL_FAILED_DESCRIPTIONS)[number], sessionName = STUB_TMUX_SESSION_NAME): ErrUnknownErrorName {
@@ -1316,15 +1527,23 @@ describe('killFailedDescriptionOf', () => {
     }
   })
 
+  test('an ErrTmuxKillFailed whose errName getter throws still answers its description: the class decides', () => {
+    const expected = errTmuxKillFailed().errDescription
+    const value = Object.defineProperty(errTmuxKillFailed(), 'errName', { get: () => { throw new Error('boom') } })
+    expect(killFailedDescriptionOf(value)).toBe(expected)
+  })
+
+  // b.jg5 SRJ-104: an ErrUnknownErrorName carrying the kill-failure name is
+  // UNAVAILABLE and no kill failure, whatever its envelope says.
   test.each([...KILL_FAILED_DESCRIPTIONS])(
-    'an ErrUnknownErrorName whose unknownName is ErrTmuxKillFailed, carrying the %s description, answers the envelope description, not its own errDescription',
+    'an ErrUnknownErrorName whose unknownName is ErrTmuxKillFailed, carrying the %s description in its envelope, is UNAVAILABLE and answers nothing',
     (d) => {
       const value = unknownNamedKillFailed(d, OTHER_SESSION_NAME)
-      const expected = (value.envelope as { err_description: string }).err_description
-      // Precondition: the envelope holds the stub's description and the client's own text differs.
-      expect(expected).toBe(errTmuxKillFailed(OTHER_SESSION_NAME, d).errDescription)
-      expect(value.errDescription).not.toBe(expected)
-      expect(killFailedDescriptionOf(value)).toBe(expected)
+      // Precondition: the envelope holds the stub's description under the kill-failure name.
+      expect(value.unknownName).toBe(ERR_TMUX_KILL_FAILED_NAME)
+      expect((value.envelope as { err_description: string }).err_description).toBe(errTmuxKillFailed(OTHER_SESSION_NAME, d).errDescription)
+      expect(classifyAdError(value)).toEqual({ errorClass: AD_ERROR_CLASS_UNAVAILABLE })
+      expect(killFailedDescriptionOf(value)).toBeUndefined()
     },
   )
 
@@ -1335,12 +1554,13 @@ describe('killFailedDescriptionOf', () => {
   })
 
   test.each<Built>([
-    ['ErrTmuxSessionConflict (kill, not-this-launch)', () => baseError(ERR_TMUX_SESSION_CONFLICT_NAME, errTmuxKillFailed().errDescription)],
-    ['ErrTmuxUnresponsive', () => baseError(ERR_TMUX_UNRESPONSIVE_NAME, errTmuxKillFailed().errDescription)],
-    ['ErrSpawnNotFound', () => baseError(ERR_SPAWN_NOT_FOUND_NAME, errTmuxKillFailed().errDescription)],
+    ['a base error named ErrTmuxKillFailed', () => baseError(ERR_TMUX_KILL_FAILED_NAME, errTmuxKillFailed().errDescription)],
+    ['an ErrTmuxSessionConflict (kill, not-this-launch)', () => withErrDescription(errTmuxSessionConflict('kill', 'not-this-launch'), errTmuxKillFailed().errDescription)],
+    ['an ErrTmuxUnresponsive', () => errTmuxUnresponsive('kill', errTmuxKillFailed().errDescription)],
+    ['an ErrSpawnNotFound', () => withErrDescription(errSpawnNotFound(), errTmuxKillFailed().errDescription)],
     ['an ErrInternal (envelope description)', () => errInternal(errTmuxKillFailed().errDescription)],
     ['an ErrUnknownErrorName of another name', () => errUnknownErrorName('ErrFromALaterBinary', errTmuxKillFailed().errDescription)],
-  ])('%s carrying a kill-failure description answers nothing: the name decides, never the words', (_label, build) => {
+  ])('%s carrying a kill-failure description answers nothing: the class decides, never the words', (_label, build) => {
     expect(killFailedDescriptionOf(build())).toBeUndefined()
   })
 
@@ -1357,11 +1577,8 @@ describe('killFailedDescriptionOf', () => {
   })
 
   test.each<Built>([
-    ['an errName getter that throws', () => Object.defineProperty(errTmuxKillFailed(), 'errName', { get: () => { throw new Error('boom') } })],
     ['an errDescription getter that throws', () => Object.defineProperty(errTmuxKillFailed(), 'errDescription', { get: () => { throw new Error('boom') } })],
     ['an errDescription that is not a string', () => Object.defineProperty(errTmuxKillFailed(), 'errDescription', { value: 42 })],
-    ['an envelope getter that throws', () => Object.defineProperty(unknownNamedKillFailed('outlived-exit-wait'), 'envelope', { get: () => { throw new Error('boom') } })],
-    ['an envelope with no description', () => Object.defineProperty(unknownNamedKillFailed('outlived-exit-wait'), 'envelope', { value: { err_name: ERR_TMUX_KILL_FAILED_NAME } })],
     ['a proxy whose every trap throws', hostileProxy],
     ['a proxy over an ErrTmuxKillFailed whose every read throws', () => new Proxy(errTmuxKillFailed(), { get: () => { throw new Error('boom') } })],
   ])('%s answers nothing, and nothing throws', (_label, build) => {
@@ -1372,8 +1589,7 @@ describe('killFailedDescriptionOf', () => {
 
   test('the description comes back raw: not redacted, not put on one line, not capped', () => {
     const description = `${RETRY_KILL_LATER_PHRASE}\n${sentinelInMessage('kill')}\r\n${'x'.repeat(MAX_LOGGED_MESSAGE_LENGTH)} ${NEVER_DELETE_ROW_PHRASE}`
-    expect(killFailedDescriptionOf(baseError(ERR_TMUX_KILL_FAILED_NAME, description))).toBe(description)
-    expect(killFailedDescriptionOf(errUnknownErrorName(ERR_TMUX_KILL_FAILED_NAME, description))).toBe(description)
+    expect(killFailedDescriptionOf(withErrDescription(errTmuxKillFailed(), description))).toBe(description)
   })
 
   test('reading the description changes no value and makes no agent-director call', () => {
@@ -1394,7 +1610,7 @@ describe('killFailedDescriptionOf', () => {
 // ---------------------------------------------------------------------------
 // isLaunchTimeoutError / launchTimeoutFormOf (b.jg5 SRJ-407): a launch call's
 // `ErrCallTimeout`, or its `ErrTmuxUnresponsive` carrying the launch-timeout
-// words; recognised by name, the declared call deciding whether it is a launch
+// words; recognised by class, the declared call deciding whether it is a launch
 // ---------------------------------------------------------------------------
 
 /** The launch calls a site declares (`AD_LAUNCH_VERBS`): `spawn`, plain or reuse alike, and `resume`. */
@@ -1414,11 +1630,9 @@ const callLabel = (call: AdCall): string => (typeof call === 'string' ? call : `
 type LaunchTimeoutRow = readonly [label: string, build: (verb: string) => unknown, form: LaunchTimeoutForm]
 
 /**
- * Every value that ends a launch call as a launch timeout: the client's
- * `ErrCallTimeout` (whatever verb it carries: the site's declared call
- * decides), agent-director's `ErrTmuxUnresponsive` carrying the phrase, and
- * the 0.10.0 client's `ErrUnknownErrorName` carrying that name, the phrase in
- * its envelope's description.
+ * Every value that ends a launch call as a launch timeout: an `ErrCallTimeout`
+ * instance (whatever verb it carries: the site's declared call decides), and
+ * an `ErrTmuxUnresponsive` instance carrying the phrase (class plus phrase).
  */
 const LAUNCH_TIMEOUT_ROWS: readonly LaunchTimeoutRow[] = [
   ['errCallTimeout', (verb) => errCallTimeout(verb), LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT],
@@ -1429,18 +1643,7 @@ const LAUNCH_TIMEOUT_ROWS: readonly LaunchTimeoutRow[] = [
     (verb) => errTmuxUnresponsiveLaunchTimeout(verb, `${STUB_TMUX_SESSION_NAME}_other_id`),
     LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE,
   ],
-  ['a base error named ErrTmuxUnresponsive whose description is exactly the phrase', () => baseError(ERR_TMUX_UNRESPONSIVE_NAME, LAUNCH_TIMEOUT_PHRASE), LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE],
-  [
-    'the 0.10.0 client\'s ErrUnknownErrorName carrying ErrTmuxUnresponsive, the phrase in its envelope\'s description',
-    (verb) => {
-      const err = errUnknownErrorName(ERR_TMUX_UNRESPONSIVE_NAME, errTmuxUnresponsiveLaunchTimeout(verb).errDescription)
-      // Precondition: the phrase is only in the envelope, never in the client's own text.
-      expect((err.envelope as { err_description: string }).err_description).toContain(LAUNCH_TIMEOUT_PHRASE)
-      expect(err.errDescription).not.toContain(LAUNCH_TIMEOUT_PHRASE)
-      return err
-    },
-    LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE,
-  ],
+  ['an ErrTmuxUnresponsive whose description is exactly the phrase', (verb) => errTmuxUnresponsive(verb, LAUNCH_TIMEOUT_PHRASE), LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE],
 ]
 
 /** The ROWS labels that are launch timeouts when declared at a launch call. */
@@ -1486,7 +1689,6 @@ describe('isLaunchTimeoutError and launchTimeoutFormOf (b.jg5 SRJ-407)', () => {
     ['errTmuxUnresponsiveStillStopping', () => errTmuxUnresponsiveStillStopping()],
     ['errTmuxUnresponsiveStillStarting', () => errTmuxUnresponsiveStillStarting()],
     ['errTmuxUnresponsiveAfterDuplicateSession (its holder could not be read)', () => errTmuxUnresponsiveAfterDuplicateSession()],
-    ['an ErrUnknownErrorName carrying ErrTmuxUnresponsive with no phrase', () => errUnknownErrorName(ERR_TMUX_UNRESPONSIVE_NAME, errTmuxUnresponsive().errDescription)],
     ...ROWS.filter(([label]) => !LAUNCH_TIMEOUT_ROW_LABELS.has(label)).map(([label, build]): Built => [`${label} (SRJ-104's row)`, build]),
   ])('%s, at either launch call, is no launch timeout', (_label, build) => {
     for (const call of LAUNCH_CALLS) {
@@ -1497,15 +1699,41 @@ describe('isLaunchTimeoutError and launchTimeoutFormOf (b.jg5 SRJ-407)', () => {
   })
 
   test.each<Built>([
-    ['ErrTmuxKillFailed', () => baseError(ERR_TMUX_KILL_FAILED_NAME, LAUNCH_TIMEOUT_PHRASE)],
-    ['ErrTmuxSessionCreate', () => baseError(errTmuxSessionCreate().errName, errTmuxUnresponsiveLaunchTimeout().errDescription)],
-    ['ErrTmuxSessionConflict', () => baseError(ERR_TMUX_SESSION_CONFLICT_NAME, LAUNCH_TIMEOUT_PHRASE)],
-    ['ErrSpawnNotFound', () => baseError(ERR_SPAWN_NOT_FOUND_NAME, LAUNCH_TIMEOUT_PHRASE)],
+    ['an ErrCallTimeout whose errName getter throws', () => Object.defineProperty(errCallTimeout('spawn'), 'errName', { get: () => { throw new Error('boom') } })],
+    ['an ErrCallTimeout behind a proxy whose every read throws', () => new Proxy(errCallTimeout('spawn'), { get: () => { throw new Error('boom') } })],
+  ])('%s is the ErrCallTimeout form at either launch call: the class decides, and nothing throws', (_label, build) => {
+    for (const call of LAUNCH_CALLS) {
+      const value = build()
+      expect(() => launchTimeoutFormOf(value, call)).not.toThrow()
+      expect({ call, form: launchTimeoutFormOf(value, call) }).toEqual({ call, form: LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT })
+    }
+  })
+
+  test.each<Built>([
+    ['a base error named ErrTmuxUnresponsive', () => baseError(ERR_TMUX_UNRESPONSIVE_NAME, errTmuxUnresponsiveLaunchTimeout().errDescription)],
+    ['a base error named ErrCallTimeout', () => baseError(errCallTimeout().errName, LAUNCH_TIMEOUT_PHRASE)],
+    [
+      'an ErrUnknownErrorName carrying ErrTmuxUnresponsive (envelope description)',
+      () => {
+        const err = errUnknownErrorName(ERR_TMUX_UNRESPONSIVE_NAME, errTmuxUnresponsiveLaunchTimeout().errDescription)
+        // Precondition: the phrase is in the envelope's description, under the ErrTmuxUnresponsive name.
+        expect(err.unknownName).toBe(ERR_TMUX_UNRESPONSIVE_NAME)
+        expect((err.envelope as { err_description: string }).err_description).toContain(LAUNCH_TIMEOUT_PHRASE)
+        return err
+      },
+    ],
+    ['an ErrTmuxKillFailed', () => withErrDescription(errTmuxKillFailed(), LAUNCH_TIMEOUT_PHRASE)],
+    ['an ErrTmuxSessionCreate', () => withErrDescription(errTmuxSessionCreate('spawn'), errTmuxUnresponsiveLaunchTimeout().errDescription)],
+    ['an ErrTmuxSessionConflict', () => conflictWithDescription({ value: LAUNCH_TIMEOUT_PHRASE })],
+    ['an ErrSpawnNotFound', () => withErrDescription(errSpawnNotFound(), LAUNCH_TIMEOUT_PHRASE)],
     ['CSCB\'s wrapped UnknownError', () => baseError(CSCB_UNKNOWN_ERROR_NAME, LAUNCH_TIMEOUT_PHRASE)],
     ['an ErrInternal (envelope description)', () => errInternal(LAUNCH_TIMEOUT_PHRASE)],
     ['an ErrUnknownErrorName of another name (envelope description)', () => errUnknownErrorName('ErrFromALaterBinary', LAUNCH_TIMEOUT_PHRASE)],
-  ])('%s carrying the phrase is no launch timeout: the name decides, never the words alone', (_label, build) => {
-    for (const call of LAUNCH_CALLS) expect({ call, timeout: isLaunchTimeoutError(build(), call) }).toEqual({ call, timeout: false })
+  ])('%s carrying the phrase is no launch timeout: the class decides, never the words alone', (_label, build) => {
+    for (const call of LAUNCH_CALLS) {
+      const value = build()
+      expect({ call, form: launchTimeoutFormOf(value, call), timeout: isLaunchTimeoutError(value, call) }).toEqual({ call, form: undefined, timeout: false })
+    }
   })
 
   test.each<Built>([
@@ -1519,19 +1747,10 @@ describe('isLaunchTimeoutError and launchTimeoutFormOf (b.jg5 SRJ-407)', () => {
     ['the launch-timeout description string itself', () => errTmuxUnresponsiveLaunchTimeout().errDescription],
     ['undefined', () => undefined],
     ['null', () => null],
-    ['an errName getter that throws', () => Object.defineProperty(errCallTimeout('spawn'), 'errName', { get: () => { throw new Error('boom') } })],
     ['an errDescription getter that throws', () => Object.defineProperty(errTmuxUnresponsiveLaunchTimeout(), 'errDescription', { get: () => { throw new Error('boom') } })],
     ['an errDescription that is not a string', () => Object.defineProperty(errTmuxUnresponsiveLaunchTimeout(), 'errDescription', { value: [LAUNCH_TIMEOUT_PHRASE] })],
-    [
-      'an ErrUnknownErrorName carrying ErrTmuxUnresponsive whose envelope getter throws',
-      () => Object.defineProperty(errUnknownErrorName(ERR_TMUX_UNRESPONSIVE_NAME, LAUNCH_TIMEOUT_PHRASE), 'envelope', { get: () => { throw new Error('boom') } }),
-    ],
-    [
-      'an ErrUnknownErrorName carrying ErrTmuxUnresponsive whose envelope has no description',
-      () => Object.defineProperty(errUnknownErrorName(ERR_TMUX_UNRESPONSIVE_NAME, LAUNCH_TIMEOUT_PHRASE), 'envelope', { value: { err_name: ERR_TMUX_UNRESPONSIVE_NAME } }),
-    ],
     ['a proxy whose every trap throws', hostileProxy],
-    ['a proxy over an ErrCallTimeout whose every read throws', () => new Proxy(errCallTimeout('spawn'), { get: () => { throw new Error('boom') } })],
+    ['an ErrTmuxUnresponsive carrying the phrase behind a proxy whose every read throws', () => new Proxy(errTmuxUnresponsiveLaunchTimeout(), { get: () => { throw new Error('boom') } })],
   ])('%s is no launch timeout at either launch call, and nothing throws', (_label, build) => {
     for (const call of LAUNCH_CALLS) {
       const value = build()
@@ -1691,9 +1910,14 @@ describe('describeReportedAdFailure (b.jg5 SRJ-104)', () => {
   // What is still readable is reported; a value that reports nothing gets describeAgentDirectorFailure's description.
   test.each<readonly [string, () => unknown, (value: unknown) => string]>([
     [
-      'an errName getter that throws (its description is still reported)',
-      () => Object.defineProperty(errSpawnNotFound(), 'errName', { get: () => { throw new Error('boom') } }),
+      'a base error whose errName getter throws (its description is still reported)',
+      () => Object.defineProperty(baseError(ERR_SPAWN_NOT_FOUND_NAME), 'errName', { get: () => { throw new Error('boom') } }),
       (value) => `message=${JSON.stringify((value as { readonly errDescription: string }).errDescription)}`,
+    ],
+    [
+      'an ErrSpawnNotFound whose errName getter throws (STATE by class: nothing is reported)',
+      () => Object.defineProperty(errSpawnNotFound(), 'errName', { get: () => { throw new Error('boom') } }),
+      (value) => describeAgentDirectorFailure(value),
     ],
     [
       'an envelope whose err_description getter throws (its name is still reported)',
@@ -1806,6 +2030,7 @@ describe('classifyWithInvalidFlagsRecheck', () => {
     ['errInternal', () => errInternal()],
     ['errTmuxSessionConflict', () => errTmuxSessionConflict('resume', 'leftover')],
     ['a plain Error named ErrInvalidFlags', () => plainErrorNamed(errInvalidFlags().errName)],
+    ['a base error named ErrInvalidFlags', () => baseError(errInvalidFlags().errName)],
   ])('%s makes no re-check and gives its table class', async (_label, build) => {
     const t = recordingTrigger(PASS)
     const result = await classifyWithInvalidFlagsRecheck(build(), t.trigger)
@@ -1825,11 +2050,8 @@ describe('classifyWithInvalidFlagsRecheck', () => {
     expect(result.classification.errorClass).toBe(AD_ERROR_CLASS_UNCLASSIFIED)
   })
 
-  test.each([
-    ['the client\'s ErrInvalidFlags', () => errInvalidFlags('resume')],
-    ['a base error with that errName', () => baseError(errInvalidFlags().errName)],
-  ])('%s narrowed by isInvalidFlagsError gets an answer whose re-check is always present', async (_label, build) => {
-    const value: unknown = build()
+  test('the client\'s ErrInvalidFlags narrowed by isInvalidFlagsError gets an answer whose re-check is always present', async () => {
+    const value: unknown = errInvalidFlags('resume')
     if (!isInvalidFlagsError(value)) throw new Error('isInvalidFlagsError did not recognise the value')
     const t = recordingTrigger(STOP)
     const answer = await classifyWithInvalidFlagsRecheck(value, t.trigger)

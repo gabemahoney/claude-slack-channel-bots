@@ -4816,7 +4816,7 @@ describe('AC 20: the restart kill adapter\'s lines carry no credential value', (
   // (b.jg5 SRJ-105); a base AgentDirectorError of a name CSCB gives no
   // handling is UNCLASSIFIED (b.jg5 SRJ-313); each answers its non-success
   // outcome with the adapter's one outcome line, its message redacted. A GONE
-  // name (by name) is the session-gone success (b.jg5 SRJ-104: for `kill`,
+  // class is the session-gone success (b.jg5 SRJ-104: for `kill`,
   // gone is success): its line names the outcome and the GONE name only, so
   // the description's token never reaches it.
   test.each<[string, () => Error, (key: string) => string, object]>([
@@ -4835,8 +4835,9 @@ describe('AC 20: the restart kill adapter\'s lines carry no credential value', (
       { kind: KILL_OUTCOME_NOT_KILLED, errorClass: AD_ERROR_CLASS_UNCLASSIFIED },
     ],
     [
-      'b.jg5 SRJ-104, SRJ-110: a base AgentDirectorError of a GONE name (ErrTmuxCaptureFailed) whose description carries a fake token — one outcome line; the adapter answers the session-gone success (for kill, gone is success)',
-      () => errGeneric('kill', 'ErrTmuxCaptureFailed', `capture failed (${sentinelInMessage('kill', APP_TOKEN_PREFIX)})`),
+      'b.jg5 SRJ-104, SRJ-110: an ErrTmuxCaptureFailed (GONE) whose description carries a fake token — one outcome line; the adapter answers the session-gone success (for kill, gone is success)',
+      // The builder puts its session name argument in the description.
+      () => errTmuxCaptureFailed(`capture failed (${sentinelInMessage('kill', APP_TOKEN_PREFIX)})`, 'kill'),
       (key) => `[slack] killSession (restart adapter): kill for persona=${key}: outcome=${KILL_OUTCOME_SESSION_GONE} (ErrTmuxCaptureFailed)`,
       { kind: KILL_OUTCOME_SESSION_GONE, name: 'ErrTmuxCaptureFailed' },
     ],
@@ -4991,7 +4992,7 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
   })
 
   // Each site answers UNAVAILABLE with each generic value, and the kill with
-  // ErrTmuxKillFailed, the kill-failure cause told apart by name.
+  // ErrTmuxKillFailed, the kill-failure cause told apart by class.
   type Site = 'kill' | 'send-keys' | 'read-pane' | 'spawn'
   const UNAVAILABLE_VALUES: ReadonlyArray<[string, (verb: string) => Error]> = [
     ['a plain Error', () => plainError()],
@@ -7193,7 +7194,7 @@ describe('b.jg5 SRJ-502: the restart path makes no attempt for a latched persona
     tail: '; no timer armed (b.jg5 SRJ-502)',
   })
   const fullLine = (line: LatchedLine): string => `${line.head}${line.tail}`
-  /** agent-director's CONFLICT (by name): the pre-spawn scan found a session left over from an earlier life. */
+  /** agent-director's CONFLICT (the stub's `errTmuxSessionConflict`): the pre-spawn scan found a session left over from an earlier life. */
   const conflict = () => errTmuxSessionConflict('spawn', 'scan-leftover')
 
   describe('over the file\'s deps', () => {

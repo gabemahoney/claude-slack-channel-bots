@@ -450,7 +450,7 @@ import {
 } from '../src/ad-description-phrases.ts'
 import { adAlertThresholdMsInEffect, adLaunchBoundMsInEffect } from '../src/ad-settings.ts'
 import type { Phase1GetResult, Phase1ListRow } from '../src/ad-phase1-types.ts'
-import { ERR_TMUX_SESSION_CONFLICT_NAME } from '../src/agent-director-errors.ts'
+import { ERR_TMUX_SESSION_CONFLICT_NAME, ErrTmuxSessionConflict } from '../src/agent-director-errors.ts'
 import {
   CONFLICT_CASE_ORDER,
   CONFLICT_CASE_SENTENCES,
@@ -708,7 +708,6 @@ import {
   cannedListRow,
   cannedOk,
   cannedStatusResult,
-  errGeneric,
   errCallTimeout,
   errInvalidFlags,
   errConfigMalformed,
@@ -875,6 +874,15 @@ import { PROBE_PANE_READ_LINES } from '../src/pane-read.ts'
 const KEY = 'alpha'
 /** A second persona. */
 const OTHER = 'beta'
+
+/**
+ * A `resume`'s CONFLICT carrying `description`, built with `new` on the
+ * `ErrTmuxSessionConflict` binding of `src/agent-director-errors.ts` (the
+ * class the stub's `errTmuxSessionConflict` builds), for a description none
+ * of the stub's cases gives.
+ */
+const conflictError = (description: string) =>
+  new ErrTmuxSessionConflict('resume', ERR_TMUX_SESSION_CONFLICT_NAME, description)
 
 interface LatchRun {
   readonly latch: ConflictLatch
@@ -1098,7 +1106,7 @@ describe('the latch record', () => {
     expect(conflictSessionName(undefined, KEY)).toBe(personaTmuxSessionName(KEY))
 
     const run = makeLatchRun()
-    const noName = errGeneric('resume', ERR_TMUX_SESSION_CONFLICT_NAME, CONFLICT_OWN_ID_PHRASE)
+    const noName = conflictError(CONFLICT_OWN_ID_PHRASE)
     run.latch.setFromConflict(KEY, noName, { refusedOperation: REFUSED_OPERATION_RESUME, rowState: LATCH_ROW_STATE_NO_ROW })
     expect(run.latch.record(KEY)?.sessionName).toBe(personaTmuxSessionName(KEY))
     run.latch.set(OTHER, { latchCase: LATCH_CASE_OWN_ID, refusedOperation: REFUSED_OPERATION_RESUME, rowState: LATCH_ROW_STATE_NO_ROW })
@@ -1113,7 +1121,7 @@ describe('the latch record', () => {
 
     const run = makeLatchRun()
     const description = `${CONFLICT_OWN_ID_PHRASE} "" then ${JSON.stringify(name)}`
-    run.latch.setFromConflict(KEY, errGeneric('resume', ERR_TMUX_SESSION_CONFLICT_NAME, description), {
+    run.latch.setFromConflict(KEY, conflictError(description), {
       refusedOperation: REFUSED_OPERATION_RESUME,
       rowState: LATCH_ROW_STATE_NO_ROW,
     })
@@ -1162,7 +1170,7 @@ describe('the latch record', () => {
   test('the description is kept redacted, on one line and capped; a token-shaped quoted name is redacted', () => {
     const run = makeLatchRun()
     const long = `${CONFLICT_OWN_ID_PHRASE} (${sentinelInMessage('d')})\n${NO_KILL_SENT_PHRASE} ${'x'.repeat(MAX_LOGGED_MESSAGE_LENGTH)}`
-    run.latch.setFromConflict(KEY, errGeneric('resume', ERR_TMUX_SESSION_CONFLICT_NAME, long), {
+    run.latch.setFromConflict(KEY, conflictError(long), {
       refusedOperation: REFUSED_OPERATION_RESUME,
       rowState: LATCH_ROW_STATE_NO_ROW,
     })
@@ -1442,9 +1450,6 @@ afterEach(() => {
   expect(pending).toEqual(pending.map(() => 0))
   assertNoLeak(posts, 'posts')
 })
-
-/** A CONFLICT error carrying `description`, as agent-director throws it. */
-const conflictError = (description: string) => errGeneric('resume', ERR_TMUX_SESSION_CONFLICT_NAME, description)
 
 /** Latch `key` on a CONFLICT error carrying `description`. */
 function latchOnDescription(latch: ConflictLatch, key: string, description: string) {

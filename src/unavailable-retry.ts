@@ -155,7 +155,7 @@
  * which the agent-director wrappers and the liveness adapter reach through
  * `src/outage-state.ts`: inside an attempt for `key`, the arming predicate
  * `unavailableRetryCauseFor(value, verb)` decides the cause (UNAVAILABLE from
- * any verb, `ErrTmuxKillFailed` told apart by name; ENVIRONMENT from any
+ * any verb, `ErrTmuxKillFailed` told apart by class; ENVIRONMENT from any
  * verb; CONFIG from any verb; UNCLASSIFIED from any verb but the reads,
  * b.jg5 SRJ-313; any other `status`, `get` or `list` error but
  * `ErrSpawnNotFound` and UNUSABLE NAME), the trigger sink
@@ -316,9 +316,9 @@ import {
   AD_ERROR_CLASS_UNUSABLE_NAME,
   AD_READ_VERBS,
   classifyAdError,
-  hasAdErrorName,
+  isAdErrorInstance,
 } from './ad-error-class.ts'
-import { ERR_SPAWN_NOT_FOUND_NAME, ERR_TMUX_KILL_FAILED_NAME } from './agent-director-errors.ts'
+import { ErrSpawnNotFound, ErrTmuxKillFailed } from './agent-director-errors.ts'
 import { doublingBackoffDelay } from './backoff.ts'
 import { AGENT_DIRECTOR_LIVE_STATES, LIVENESS_LIVE } from './liveness-reading.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
@@ -338,7 +338,7 @@ export const UNAVAILABLE_RETRY_CEILING_S = 300
 /** The cause of an UNAVAILABLE outcome from any verb in an attempt (b.jg5 SRJ-301). */
 export const UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE = 'unavailable'
 
-/** The cause of an `ErrTmuxKillFailed` in an attempt: UNAVAILABLE, told apart by name. */
+/** The cause of an `ErrTmuxKillFailed` in an attempt: UNAVAILABLE, told apart by class. */
 export const UNAVAILABLE_RETRY_CAUSE_KILL_FAILED = 'kill-failed'
 
 /**
@@ -355,7 +355,7 @@ export const UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT = 'environment'
 
 /**
  * The cause of a CONFIG answer (`ErrConfigMalformed`, an
- * `ErrUnknownErrorName` recognised by name) from any verb for the persona
+ * `ErrUnknownErrorName` recognised by its `unknownName`) from any verb for the persona
  * (b.jg5 SRJ-301, SRJ-316, SRJ-105), in or out of an attempt, as the
  * ENVIRONMENT cause arms: the persona is retried on its timer whatever
  * `session_restart_delay` and `health_check_interval` are. Never counted, and
@@ -2195,7 +2195,8 @@ function describeCause(cause: UnavailableRetryCause): string {
  * `classifyAdError`, in this order:
  *
  * - UNAVAILABLE from any verb: an `unavailable` cause, or a `kill-failed`
- *   cause when the value's name is `ErrTmuxKillFailed`;
+ *   cause when the value is an `ErrTmuxKillFailed` instance (an
+ *   `ErrUnknownErrorName` carrying that name is an `unavailable` cause);
  * - ENVIRONMENT (`ErrTmuxNotAvailable`) from any verb, `kill` and the read
  *   verbs included: an `environment` cause
  *   (`UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT`, SRJ-311). It is decided before
@@ -2230,7 +2231,7 @@ export function unavailableRetryCauseFor(value: unknown, verb: string | undefine
   try {
     const { errorClass } = classifyAdError(value)
     if (errorClass === AD_ERROR_CLASS_UNAVAILABLE) {
-      const kind = hasAdErrorName(value, ERR_TMUX_KILL_FAILED_NAME)
+      const kind = isAdErrorInstance(value, ErrTmuxKillFailed)
         ? UNAVAILABLE_RETRY_CAUSE_KILL_FAILED
         : UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE
       return { kind, error: value }
@@ -2242,7 +2243,7 @@ export function unavailableRetryCauseFor(value: unknown, verb: string | undefine
       return errorClass === AD_ERROR_CLASS_UNCLASSIFIED ? { kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, error: value } : undefined
     }
     if (errorClass === AD_ERROR_CLASS_UNUSABLE_NAME) return undefined
-    if (hasAdErrorName(value, ERR_SPAWN_NOT_FOUND_NAME)) return undefined
+    if (isAdErrorInstance(value, ErrSpawnNotFound)) return undefined
     return { kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR, error: value }
   } catch {
     return undefined

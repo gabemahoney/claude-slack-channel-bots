@@ -173,11 +173,9 @@ export type GetPermissionParams = ADGetPermissionParams
 export type GetPermissionResult = ADGetPermissionResult
 
 /**
- * Local sentinel matcher for AD's `ErrPermissionRequestNotFound`. Matches on
- * `errName` so both the typed class (`^0.6.0`+ exposes it) and the stub's
- * AgentDirectorError-shape resolve cleanly. The errName-based predicate keeps
- * working with the typed class when the lockfile catches up to the bumped
- * pin (same pattern as `ErrInvalidFlags`).
+ * Local sentinel matcher for AD's `ErrPermissionRequestNotFound`. Matches an
+ * `AgentDirectorError` whose `errName` is `ErrPermissionRequestNotFound`, so
+ * the client's typed class and the stub's base-class value both match.
  */
 export function isErrPermissionRequestNotFound(err: unknown): boolean {
   return err instanceof AgentDirectorError && err.errName === 'ErrPermissionRequestNotFound'

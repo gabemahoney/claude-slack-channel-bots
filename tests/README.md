@@ -167,6 +167,9 @@ tests/
       exact-tmux-driver.ts         # Test 11 driver: runs one raw-tmux persona path against real tmux, with a stand-in agent-director
       stub-claude.sh               # fake `claude` (Tests 4, 10 and 12): prints the dev-channels dialog, fires SessionStart
       slack-stub-server.ts         # Tests 10 and 12 loopback Slack stub: Web API, apps.connections.open, Socket Mode WebSocket, JSONL record
+      phase1-client-check.ts       # against the agent-director client the installed package resolves: the package's Phase-1-only bindings and SRJ-103 classes are the client's own,
+                                   # client-built errors classify by class, the description and predicate helpers hold; refuses to run without the image marker /etc/cscb-ci-image
+                                   # (its pure checker is unit-tested in tests/phase1-client-check.test.ts)
     .shellcheckrc                  # lets shellcheck follow `source lib/scenario.sh` without -x
     session-leader.test.ts         # bun test, not run by runner.sh
   runner.sh                        # sequential runner (Tests 1-4, then discovery), writes /test-results/verdict.txt

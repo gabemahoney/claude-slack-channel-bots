@@ -29,20 +29,27 @@
  *                   ErrSchemaMigrationRequired and ErrStoreOpen (a store
  *                   agent-director cannot open, A-32);
  *                   ErrSystemInstallDisappeared and every other
- *                   agent-director error name
+ *                   agent-director error, a base AgentDirectorError whose
+ *                   `errName` merely equals one of the class names above
+ *                   included
  *
- * Recognition is by name (b.jg5 SRJ-101 interim rule): the value's `errName`,
- * and for an `ErrUnknownErrorName` its `unknownName` and the envelope's
- * `err_description`; never the value's `name`. The three Phase-1-only names,
- * the three store-open names and `ErrInternal` come from
- * `src/agent-director-errors.ts` as strings, and nothing here imports the
- * Phase-1-only classes, which the
- * branch's 0.10.0 client lacks. Only the base `AgentDirectorError` is tested
- * by class. `ErrInternal`, `ErrConfigMalformed` and the three store-open names
- * arrive as `ErrUnknownErrorName`, matched exactly (a differently cased name
- * is any other name); a value whose own `errName` is one of them is
- * classified the same way, its description taken from `errDescription`
- * (Assumption A-13).
+ * Recognition is by class: every row names an error class the client
+ * declares, and a value is of that row when it is an instance of the class
+ * (`instanceof`, through {@link isAdErrorInstance}), never by its `errName`
+ * or `name`. The classes come from `src/agent-director-errors.ts`, the three
+ * Phase-1-only ones (`ErrTmuxKillFailed`, `ErrTmuxUnresponsive`,
+ * `ErrTmuxSessionConflict`) through its bindings. An `ErrUnknownErrorName`
+ * instance is then decided by its `unknownName` and the envelope's
+ * `err_description`: `ErrInternal`, `ErrConfigMalformed` and the three
+ * store-open names, which no client declares as a class, are matched exactly
+ * (a differently cased name is any other name), and every other
+ * `unknownName`, a Phase-1-only name included, is UNAVAILABLE. An instance of
+ * a class the table names takes that class's row whatever its `errName`. Any
+ * other value whose own `errName` is one of those five names is classified
+ * the same way as that `unknownName`, its description taken from
+ * `errDescription` (Assumption A-13), and CSCB's own `UnknownError` wrapper,
+ * likewise not an instance of a class the table names, is recognised by its
+ * `errName`.
  *
  * An UNCLASSIFIED, UNUSABLE_NAME or CONFIG classification carries the
  * reported name (`unknownName` for an `ErrUnknownErrorName`, else `errName`)
@@ -55,16 +62,15 @@
  * line from those fields only.
  *
  * {@link conflictDescriptionOf} answers the description of a value that
- * classifies as CONFLICT (its `errDescription`, read by name), and nothing
- * for any other value; the conflict latch (`src/conflict-latch.ts`; b.jg5
+ * classifies as CONFLICT (an `ErrTmuxSessionConflict` instance's
+ * `errDescription`), and nothing for any other value; the conflict latch (`src/conflict-latch.ts`; b.jg5
  * SRJ-501, SRJ-507) reads its quoted session and its case from it. A CONFLICT
  * classification itself carries no description, so
  * `describeAdErrorClassification` never logs the raw text. Never throws.
  *
- * {@link killFailedDescriptionOf} answers the description of a value that is
- * an `ErrTmuxKillFailed` by name (its own `errName`, or an
- * `ErrUnknownErrorName` carrying that name, with the envelope's
- * description), and nothing for any other value; the kill outcome
+ * {@link killFailedDescriptionOf} answers the description of an
+ * `ErrTmuxKillFailed` instance, and nothing for any other value (an
+ * `ErrUnknownErrorName` carrying that name included); the kill outcome
  * (`src/checked-kill.ts`; b.jg5 SRJ-110, SRJ-702) carries it raw, and every
  * log line renders it redacted. An UNAVAILABLE classification carries no
  * description either. Never throws.
@@ -72,10 +78,10 @@
  * The classifier is pure: no I/O, clock, module state or agent-director call,
  * and it never throws (a throwing property read counts as an absent field).
  *
- * {@link hasAdErrorName} answers whether a value is an agent-director error of
- * one given `errName`, for a site that must tell one name from another (a
- * STATE name's meaning is set per site); {@link isInvalidFlagsError} is its
- * use for `ErrInvalidFlags`. Never throws.
+ * {@link isAdErrorInstance} answers whether a value is an instance of one
+ * given agent-director error class, for a site that must tell one class from
+ * another (a STATE class's meaning is set per site); {@link isInvalidFlagsError}
+ * is its use for `ErrInvalidFlags`. Never throws.
  *
  * {@link isDifferentTmuxServerError} answers whether a value is the
  * re-bound-socket form of ENVIRONMENT (b.jg5 SRJ-1021): ENVIRONMENT by the
@@ -83,8 +89,9 @@
  * (`src/ad-description-phrases.ts`). Never throws.
  *
  * {@link isLaunchTimeoutError} answers whether a value ends a declared launch
- * call as a launch timeout (b.jg5 SRJ-407): `ErrCallTimeout`, or an
- * `ErrTmuxUnresponsive` whose description carries `LAUNCH_TIMEOUT_PHRASE`;
+ * call as a launch timeout (b.jg5 SRJ-407): an `ErrCallTimeout` instance, or
+ * an `ErrTmuxUnresponsive` instance whose description carries
+ * `LAUNCH_TIMEOUT_PHRASE` (class plus phrase);
  * {@link launchTimeoutFormOf} names the form. Both forms keep their
  * UNAVAILABLE class. Never throws.
  *
@@ -136,10 +143,27 @@ import {
 import {
   AgentDirectorError,
   ERR_INTERNAL_NAME,
-  ERR_SPAWN_NOT_FOUND_NAME,
-  ERR_TMUX_KILL_FAILED_NAME,
-  ERR_TMUX_SESSION_CONFLICT_NAME,
   ERR_TMUX_UNRESPONSIVE_NAME,
+  ErrCallTimeout,
+  ErrCwdNotADirectory,
+  ErrCwdNotFound,
+  ErrInstanceIdCollision,
+  ErrInvalidFlags,
+  ErrJsonlMissing,
+  ErrJsonlNeverWritten,
+  ErrNoSessionId,
+  ErrSpawnNotFound,
+  ErrSpawnNotInteractive,
+  ErrSpawnNotPausable,
+  ErrSpawnNotResumable,
+  ErrTmuxCaptureFailed,
+  ErrTmuxKillFailed,
+  ErrTmuxNotAvailable,
+  ErrTmuxSendKeys,
+  ErrTmuxSessionConflict,
+  ErrTmuxSessionCreate,
+  ErrTmuxUnresponsive,
+  ErrUnknownErrorName,
   STORE_OPEN_ERR_NAMES,
 } from './agent-director-errors.ts'
 import {
@@ -304,14 +328,34 @@ export const AD_ERROR_CLASSES = [
 export type AdErrorClass = (typeof AD_ERROR_CLASSES)[number]
 
 // ---------------------------------------------------------------------------
-// Names
+// Classes and names
 // ---------------------------------------------------------------------------
 
-/** `errName` of the client's error for an `err_name` it has no class for. */
-const ERR_UNKNOWN_ERROR_NAME = 'ErrUnknownErrorName'
+/**
+ * Any agent-director error class (the client's own, a Phase-1-only binding
+ * from `src/agent-director-errors.ts`, or CSCB's own subclass), whatever its
+ * constructor's parameters: what {@link isAdErrorInstance} tests against.
+ */
+export type AdErrorConstructor = abstract new (...args: never[]) => AgentDirectorError
 
-/** The agent-director error names the table classes GONE; the one source of them. */
+/** The agent-director error classes the table classes GONE; the one source of them. */
+export const AD_GONE_ERROR_CLASSES: readonly AdErrorConstructor[] = [ErrTmuxSendKeys, ErrTmuxCaptureFailed]
+
+/** The names of the GONE classes, in the order of {@link AD_GONE_ERROR_CLASSES}: labels only, never a test. */
 export const AD_GONE_ERR_NAMES = ['ErrTmuxSendKeys', 'ErrTmuxCaptureFailed'] as const
+
+/** One GONE class's name. */
+export type AdGoneErrName = (typeof AD_GONE_ERR_NAMES)[number]
+
+/**
+ * The name of the GONE class `value` is an instance of (one of
+ * {@link AD_GONE_ERR_NAMES}, for a log label), decided by class;
+ * `undefined` for any other value. Never throws.
+ */
+export function goneErrNameOf(value: unknown): AdGoneErrName | undefined {
+  const index = AD_GONE_ERROR_CLASSES.findIndex((errorClass) => isAdErrorInstance(value, errorClass))
+  return index === -1 ? undefined : AD_GONE_ERR_NAMES[index]
+}
 
 /** `unknownName` of a malformed agent-director config (no class in any client). */
 const ERR_CONFIG_MALFORMED_NAME = 'ErrConfigMalformed'
@@ -322,38 +366,41 @@ const STORE_OPEN_NAMES: ReadonlySet<unknown> = new Set<unknown>(STORE_OPEN_ERR_N
 /** `errName` of CSCB's own wrapper around a thrown value that was not an agent-director error. */
 export const CSCB_UNKNOWN_ERROR_NAME = 'UnknownError'
 
-/** `errName` of the client's own per-call timeout (any verb). */
+/** `errName` of the client's own per-call timeout (any verb): a label only; the error is recognised by class. */
 const ERR_CALL_TIMEOUT_NAME = 'ErrCallTimeout'
 
-/** `errName` of the error agent-director returns for flags this binary does not accept. */
+/** `errName` of the error agent-director returns for flags this binary does not accept: a type mark only (`InvalidFlagsError`). */
 const ERR_INVALID_FLAGS_NAME = 'ErrInvalidFlags'
 
 /**
- * The class of each agent-director error name the table names directly.
- * `ErrInternal`, `ErrConfigMalformed`, the three store-open names,
- * `ErrUnknownErrorName` and CSCB's `UnknownError` are decided in
- * {@link classifyAdError}; any other name is UNCLASSIFIED.
+ * The class of each agent-director error class the table names directly,
+ * tested by `instanceof` in this order. {@link classifyAdError} decides an
+ * `ErrUnknownErrorName` before this table, and an instance of a class here by
+ * this table, whatever its `errName`; only a value that is neither is then
+ * decided by an `errName` of `ErrInternal`, `ErrConfigMalformed`, a store-open
+ * name or CSCB's `UnknownError`, and any other agent-director error is
+ * UNCLASSIFIED.
  */
-const CLASS_BY_ERR_NAME: ReadonlyMap<string, AdErrorClass> = new Map<string, AdErrorClass>([
-  ...AD_GONE_ERR_NAMES.map((name): [string, AdErrorClass] => [name, AD_ERROR_CLASS_GONE]),
-  [ERR_TMUX_UNRESPONSIVE_NAME, AD_ERROR_CLASS_UNAVAILABLE],
-  [ERR_TMUX_KILL_FAILED_NAME, AD_ERROR_CLASS_UNAVAILABLE],
-  [ERR_CALL_TIMEOUT_NAME, AD_ERROR_CLASS_UNAVAILABLE],
-  [ERR_TMUX_SESSION_CONFLICT_NAME, AD_ERROR_CLASS_CONFLICT],
-  ['ErrTmuxNotAvailable', AD_ERROR_CLASS_ENVIRONMENT],
-  ['ErrTmuxSessionCreate', AD_ERROR_CLASS_LAUNCH_FAILURE],
-  [ERR_SPAWN_NOT_FOUND_NAME, AD_ERROR_CLASS_STATE],
-  ['ErrInstanceIdCollision', AD_ERROR_CLASS_STATE],
-  ['ErrSpawnNotResumable', AD_ERROR_CLASS_STATE],
-  ['ErrSpawnNotInteractive', AD_ERROR_CLASS_STATE],
-  ['ErrSpawnNotPausable', AD_ERROR_CLASS_STATE],
-  ['ErrNoSessionId', AD_ERROR_CLASS_STATE],
-  ['ErrJsonlMissing', AD_ERROR_CLASS_STATE],
-  ['ErrJsonlNeverWritten', AD_ERROR_CLASS_STATE],
-  [ERR_INVALID_FLAGS_NAME, AD_ERROR_CLASS_STATE],
-  ['ErrCwdNotFound', AD_ERROR_CLASS_DIRECTORY],
-  ['ErrCwdNotADirectory', AD_ERROR_CLASS_DIRECTORY],
-])
+const CLASS_BY_ERROR_CLASS: ReadonlyArray<readonly [AdErrorConstructor, AdErrorClass]> = [
+  ...AD_GONE_ERROR_CLASSES.map((errorClass) => [errorClass, AD_ERROR_CLASS_GONE] as const),
+  [ErrTmuxUnresponsive, AD_ERROR_CLASS_UNAVAILABLE],
+  [ErrTmuxKillFailed, AD_ERROR_CLASS_UNAVAILABLE],
+  [ErrCallTimeout, AD_ERROR_CLASS_UNAVAILABLE],
+  [ErrTmuxSessionConflict, AD_ERROR_CLASS_CONFLICT],
+  [ErrTmuxNotAvailable, AD_ERROR_CLASS_ENVIRONMENT],
+  [ErrTmuxSessionCreate, AD_ERROR_CLASS_LAUNCH_FAILURE],
+  [ErrSpawnNotFound, AD_ERROR_CLASS_STATE],
+  [ErrInstanceIdCollision, AD_ERROR_CLASS_STATE],
+  [ErrSpawnNotResumable, AD_ERROR_CLASS_STATE],
+  [ErrSpawnNotInteractive, AD_ERROR_CLASS_STATE],
+  [ErrSpawnNotPausable, AD_ERROR_CLASS_STATE],
+  [ErrNoSessionId, AD_ERROR_CLASS_STATE],
+  [ErrJsonlMissing, AD_ERROR_CLASS_STATE],
+  [ErrJsonlNeverWritten, AD_ERROR_CLASS_STATE],
+  [ErrInvalidFlags, AD_ERROR_CLASS_STATE],
+  [ErrCwdNotFound, AD_ERROR_CLASS_DIRECTORY],
+  [ErrCwdNotADirectory, AD_ERROR_CLASS_DIRECTORY],
+]
 
 // ---------------------------------------------------------------------------
 // Classifier
@@ -384,16 +431,17 @@ export interface AdErrorClassification {
 export function classifyAdError(value: unknown): AdErrorClassification {
   try {
     if (!isAgentDirectorError(value)) return { errorClass: AD_ERROR_CLASS_UNAVAILABLE }
-    const errName = readProp(value, 'errName')
-    if (errName === ERR_UNKNOWN_ERROR_NAME) {
+    if (isAdErrorInstance(value, ErrUnknownErrorName)) {
       return classifyUnknownName(readProp(value, 'unknownName'), readProp(readProp(value, 'envelope'), 'err_description'))
     }
+    for (const [errorClass, adErrorClass] of CLASS_BY_ERROR_CLASS) {
+      if (isAdErrorInstance(value, errorClass)) return { errorClass: adErrorClass }
+    }
+    const errName = readProp(value, 'errName')
     if (errName === ERR_INTERNAL_NAME || errName === ERR_CONFIG_MALFORMED_NAME || STORE_OPEN_NAMES.has(errName)) {
       return classifyUnknownName(errName, readProp(value, 'errDescription'))
     }
     if (errName === CSCB_UNKNOWN_ERROR_NAME) return { errorClass: AD_ERROR_CLASS_UNAVAILABLE }
-    const errorClass = typeof errName === 'string' ? CLASS_BY_ERR_NAME.get(errName) : undefined
-    if (errorClass !== undefined) return { errorClass }
     return reported(AD_ERROR_CLASS_UNCLASSIFIED, errName, readProp(value, 'errDescription'))
   } catch {
     return { errorClass: AD_ERROR_CLASS_UNAVAILABLE }
@@ -402,17 +450,18 @@ export function classifyAdError(value: unknown): AdErrorClassification {
 
 /**
  * The description of a value that {@link classifyAdError} classifies as
- * CONFLICT: its `errDescription`, read by name (b.jg5 SRJ-101 interim rule),
- * raw as agent-director wrote it, when it is a string. `undefined` for a value
- * of any other class (an `ErrUnknownErrorName` included, whatever its
- * `unknownName`: SRJ-104 classes it by that name, never as CONFLICT), for a
+ * CONFLICT, an `ErrTmuxSessionConflict` instance: its `errDescription`, raw as
+ * agent-director wrote it, when it is a string. `undefined` for a value of any
+ * other class (an `ErrUnknownErrorName` included, whatever its `unknownName`:
+ * SRJ-104 classes it by that name, never as CONFLICT; a base
+ * `AgentDirectorError` merely named `ErrTmuxSessionConflict` included), for a
  * value that is not an agent-director error, and when the read throws or
  * finds no string. The caller redacts it before it reaches a log line, a
  * stored record or a notice. Pure; never throws.
  */
 export function conflictDescriptionOf(value: unknown): string | undefined {
   try {
-    if (classifyAdError(value).errorClass !== AD_ERROR_CLASS_CONFLICT) return undefined
+    if (!isAdErrorInstance(value, ErrTmuxSessionConflict)) return undefined
     const description = readProp(value, 'errDescription')
     return typeof description === 'string' ? description : undefined
   } catch {
@@ -421,55 +470,56 @@ export function conflictDescriptionOf(value: unknown): string | undefined {
 }
 
 /**
- * The description of a value that is an `ErrTmuxKillFailed` by name (b.jg5
- * SRJ-101 interim rule): for a value whose own `errName` is
- * `ErrTmuxKillFailed`, its `errDescription`; for an `ErrUnknownErrorName`
- * whose `unknownName` is `ErrTmuxKillFailed` (a client that has no class of
- * that name), the envelope's `err_description`. Raw, as agent-director wrote
- * it, when it is a string. `undefined` for a value of any other name, for a
- * value that is not an agent-director error, and when a read throws or finds
- * no string. The kill outcome (`src/checked-kill.ts`) carries it; the caller
+ * The description of an `ErrTmuxKillFailed` instance: its `errDescription`,
+ * raw as agent-director wrote it, when it is a string. `undefined` for a value
+ * of any other class (an `ErrUnknownErrorName` included, whatever its
+ * `unknownName`: SRJ-104 classes it UNAVAILABLE, never a kill failure; a base
+ * `AgentDirectorError` merely named `ErrTmuxKillFailed` included), for a value
+ * that is not an agent-director error, and when a read throws or finds no
+ * string. The kill outcome (`src/checked-kill.ts`) carries it; the caller
  * redacts it before it reaches a log line, a stored record or a notice. A
  * classification never carries it, so `describeAdErrorClassification` never
  * logs the raw text. Pure; never throws.
  */
 export function killFailedDescriptionOf(value: unknown): string | undefined {
   try {
-    if (!isAgentDirectorError(value)) return undefined
-    const errName = readProp(value, 'errName')
-    let description: unknown
-    if (errName === ERR_TMUX_KILL_FAILED_NAME) {
-      description = readProp(value, 'errDescription')
-    } else if (errName === ERR_UNKNOWN_ERROR_NAME && readProp(value, 'unknownName') === ERR_TMUX_KILL_FAILED_NAME) {
-      description = readProp(readProp(value, 'envelope'), 'err_description')
-    }
+    if (!isAdErrorInstance(value, ErrTmuxKillFailed)) return undefined
+    const description = readProp(value, 'errDescription')
     return typeof description === 'string' ? description : undefined
   } catch {
     return undefined
   }
 }
 
-/** An agent-director error whose `errName` is `ErrInvalidFlags`. */
-export type InvalidFlagsError = AgentDirectorError & { readonly errName: typeof ERR_INVALID_FLAGS_NAME }
+/**
+ * An `ErrInvalidFlags` instance. The `errName` member is a type-level mark
+ * only, so the type is not every `AgentDirectorError` (the client's
+ * `ErrInvalidFlags` declares no member of its own); {@link isInvalidFlagsError}
+ * decides by class.
+ */
+export type InvalidFlagsError = ErrInvalidFlags & { readonly errName: typeof ERR_INVALID_FLAGS_NAME }
 
 /**
- * True when `value` is an agent-director `ErrInvalidFlags`, recognised by its
- * `errName`. Never throws.
+ * True when `value` is an instance of the client's `ErrInvalidFlags`. Never
+ * throws.
  */
 export function isInvalidFlagsError(value: unknown): value is InvalidFlagsError {
-  return hasAdErrorName(value, ERR_INVALID_FLAGS_NAME)
+  return isAdErrorInstance(value, ErrInvalidFlags)
 }
 
 /**
- * True when `value` is an agent-director error whose `errName` is `name`
- * (b.jg5 SRJ-101 interim rule: recognition by name). The one way a site tells
- * one agent-director error name from another; pass a name constant from
- * `src/agent-director-errors.ts`. Never throws: a value that is not an
- * agent-director error, or whose `errName` cannot be read, answers false.
+ * True when `value` is an instance of the agent-director error class
+ * `errorClass`: one of the client's classes, imported from
+ * `src/agent-director-errors.ts` (a Phase-1-only one through its binding
+ * there), or CSCB's own subclass. The one way a site tells one agent-director
+ * error class from another (a STATE class's meaning is set per site). A base
+ * `AgentDirectorError` whose `errName` merely equals a class's name is not an
+ * instance of that class. Never throws: a value that is not an object, or an
+ * `instanceof` that throws, answers false.
  */
-export function hasAdErrorName(value: unknown, name: string): boolean {
+export function isAdErrorInstance<T extends AdErrorConstructor>(value: unknown, errorClass: T): value is InstanceType<T> {
   try {
-    return isAgentDirectorError(value) && readProp(value, 'errName') === name
+    return value instanceof errorClass
   } catch {
     return false
   }
@@ -487,30 +537,22 @@ export type LaunchTimeoutForm = typeof LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT | typeof
  * The form in which `value` ends the declared launch call `call` as a launch
  * timeout (b.jg5 SRJ-407), or `undefined` when it does not: `call` is a
  * launch call ({@link isLaunchCall}: `spawn`, plain or reuse, or `resume`),
- * and either the client threw `ErrCallTimeout` for it
- * ({@link LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT}), or agent-director answered
- * `ErrTmuxUnresponsive` whose description contains `LAUNCH_TIMEOUT_PHRASE`
- * ("the session may have been created"; `src/ad-description-phrases.ts`;
- * {@link LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE}). Recognition is by name
- * ({@link hasAdErrorName}; b.jg5 SRJ-101 interim rule); an
- * `ErrUnknownErrorName` whose `unknownName` is `ErrTmuxUnresponsive` (a client
- * with no class of that name) is read the same way, its description taken
- * from the envelope's `err_description`. The value's class is unchanged:
- * both forms stay UNAVAILABLE. Pure; never throws.
+ * and either the client threw an `ErrCallTimeout` instance for it
+ * ({@link LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT}), or agent-director answered an
+ * `ErrTmuxUnresponsive` instance whose `errDescription` contains
+ * `LAUNCH_TIMEOUT_PHRASE` ("the session may have been created";
+ * `src/ad-description-phrases.ts`;
+ * {@link LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE}): class plus phrase
+ * ({@link isAdErrorInstance}). An `ErrUnknownErrorName`, whatever its
+ * `unknownName`, is neither form. The value's class is unchanged: both forms
+ * stay UNAVAILABLE. Pure; never throws.
  */
 export function launchTimeoutFormOf(value: unknown, call: AdCall): LaunchTimeoutForm | undefined {
   try {
     if (!isLaunchCall(call)) return undefined
-    if (hasAdErrorName(value, ERR_CALL_TIMEOUT_NAME)) return LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT
-    let description: unknown
-    if (hasAdErrorName(value, ERR_TMUX_UNRESPONSIVE_NAME)) {
-      description = readProp(value, 'errDescription')
-    } else if (
-      hasAdErrorName(value, ERR_UNKNOWN_ERROR_NAME) &&
-      readProp(value, 'unknownName') === ERR_TMUX_UNRESPONSIVE_NAME
-    ) {
-      description = readProp(readProp(value, 'envelope'), 'err_description')
-    }
+    if (isAdErrorInstance(value, ErrCallTimeout)) return LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT
+    if (!isAdErrorInstance(value, ErrTmuxUnresponsive)) return undefined
+    const description = readProp(value, 'errDescription')
     return typeof description === 'string' && description.includes(LAUNCH_TIMEOUT_PHRASE)
       ? LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE
       : undefined
@@ -611,15 +653,14 @@ export function describeReportedAdFailure(err: unknown): string {
 export function unclassifiedClassificationOf(value: unknown): AdErrorClassification {
   try {
     if (!isAgentDirectorError(value)) return { errorClass: AD_ERROR_CLASS_UNCLASSIFIED }
-    const errName = readProp(value, 'errName')
-    if (errName === ERR_UNKNOWN_ERROR_NAME) {
+    if (isAdErrorInstance(value, ErrUnknownErrorName)) {
       return reported(
         AD_ERROR_CLASS_UNCLASSIFIED,
         readProp(value, 'unknownName'),
         readProp(readProp(value, 'envelope'), 'err_description'),
       )
     }
-    return reported(AD_ERROR_CLASS_UNCLASSIFIED, errName, readProp(value, 'errDescription'))
+    return reported(AD_ERROR_CLASS_UNCLASSIFIED, readProp(value, 'errName'), readProp(value, 'errDescription'))
   } catch {
     return { errorClass: AD_ERROR_CLASS_UNCLASSIFIED }
   }

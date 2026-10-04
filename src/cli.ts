@@ -143,8 +143,8 @@ import {
 import { readAppliedPersonaConfig, reloadFilePaths } from './reload.ts'
 import { appendLogLine, initLogging, type AppendLogLineResult } from './logging.ts'
 import { recordStartupError } from './startup-errors.ts'
-import { ERR_SPAWN_NOT_FOUND_NAME } from './agent-director-errors.ts'
-import { hasAdErrorName } from './ad-error-class.ts'
+import { ErrSpawnNotFound } from './agent-director-errors.ts'
+import { isAdErrorInstance } from './ad-error-class.ts'
 import { checkedKill, type PlainKillParams } from './checked-kill.ts'
 import { killRetrySeedOfState, runKillRetry, type KillRetryRead } from './kill-retry.ts'
 import type { Phase1GetResult } from './ad-phase1-types.ts'
@@ -464,7 +464,7 @@ export interface CliDeps {
    * The precheck's read of a persona's row (b.jg5 SRJ-901): one `get` of its
    * instance ID (`cscb_<key>`), answering the row's state, `liveness_note` and
    * launch start. Returns null only when the row is absent (ErrSpawnNotFound,
-   * by name); every other error propagates for the precheck to classify.
+   * by class); every other error propagates for the precheck to classify.
    * Latches, records and logs nothing.
    */
   directorGet: (instanceId: string) => Promise<PrecheckRow | null>
@@ -479,7 +479,7 @@ export interface CliDeps {
   /**
    * Query the agent-director state of a persona's instance, addressed by its
    * instance ID (`cscb_<key>`). Returns null only when the row is absent
-   * (ErrSpawnNotFound, by name); every other error propagates for the
+   * (ErrSpawnNotFound, by class); every other error propagates for the
    * teardown to classify (b.qwo).
    */
   directorStatus: (instanceId: string) => Promise<{ state: string } | null>
@@ -886,7 +886,7 @@ export function createCli(deps: CliDeps): CliHandlers {
     const ref = renderPersonaRef(persona.name, persona.key)
 
     // State read. "No spawn row" is reported only for a row that is
-    // genuinely absent (ErrSpawnNotFound, by name); any other error (b.qwo:
+    // genuinely absent (ErrSpawnNotFound, by class); any other error (b.qwo:
     // agent-director unreachable, no client installed) fails the persona.
     const initial = await teardownStateRead(id)
     if (initial.kind === STATE_READ_VERDICT_ABSENT) {
@@ -1784,7 +1784,7 @@ export type DirectorClient = Pick<Client, 'get' | 'readPane' | 'status' | 'pause
  *
  * Each `id` is a persona's instance ID, `cscb_<key>` (b.av2 SR-8.7). b.qwo:
  * `directorGet` and `directorStatus` return null for ErrSpawnNotFound alone,
- * recognised by name (`hasAdErrorName`), and pass every other error (AD
+ * recognised by class (`isAdErrorInstance`), and pass every other error (AD
  * unreachable, no Client installed, a call timeout, …) through, so the
  * precheck or the teardown classifies it and a failure is loud.
  * `directorReadPane`, `directorPause` and `directorKill` pass every error
@@ -1805,7 +1805,7 @@ export function createDirectorOps(getClient: () => DirectorClient): DirectorOps 
         const r: Phase1GetResult = await getClient().get({ claude_instance_id: id })
         return { state: r.state, liveness_note: r.liveness_note, launch_started_at: r.launch_started_at }
       } catch (err) {
-        if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) return null
+        if (isAdErrorInstance(err, ErrSpawnNotFound)) return null
         throw err
       }
     },
@@ -1818,7 +1818,7 @@ export function createDirectorOps(getClient: () => DirectorClient): DirectorOps 
         const r = await getClient().status({ claude_instance_id: id })
         return { state: r.state }
       } catch (err) {
-        if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) return null
+        if (isAdErrorInstance(err, ErrSpawnNotFound)) return null
         throw err
       }
     },

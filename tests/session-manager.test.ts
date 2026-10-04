@@ -211,8 +211,9 @@
  *     other, answering each state as is (`pending` included), a `pending`
  *     row's launch start raw and no launch start for any other state or for a
  *     missing, `null` or empty one, `absent` for
- *     `ErrSpawnNotFound` (by name), and any other error rethrown as the same
- *     value, quietly; through the outage wrapper (flags raised and cleared as
+ *     `ErrSpawnNotFound` (by class), and any other error, a base
+ *     `AgentDirectorError` merely named `ErrSpawnNotFound` included, rethrown
+ *     as the same value, quietly; through the outage wrapper (flags raised and cleared as
  *     for any wrapped `status`; an error reported to a recording sink only
  *     inside a recovery attempt for that persona, with the predicate's cause).
  *   - b.av2 SR-6.2 ladder guards, as amended (b.jg5 SRJ-1503, SRJ-1504,
@@ -242,7 +243,7 @@
  *     "plain spawn" with the state last read; `ErrSpawnNotResumable` SRJ-710's
  *     re-read; UNUSABLE NAME, CONFIG and UNCLASSIFIED SRJ-105's;
  *     `ErrInvalidFlags` one re-check, then UNCLASSIFIED, never the hold; a
- *     collision (by name, an answer agent-director's `resume` never gives)
+ *     collision (by class, an answer agent-director's `resume` never gives)
  *     SRJ-713's guard: the collision cause armed, `retrying`, its one line
  *     (`resumeCollisionLine`), never counted or the spawn-failure notice. The
  *     CONFLICT rows (HO rev 15's "another agent-director store" and rev 20's
@@ -295,7 +296,7 @@
  *     and no spawn in its place. SRJ-711: no plain spawn carries the reuse
  *     flag, and a first spawn that collides goes to `get` and `resume`.
  *   - b.jg5 SRJ-707, SRJ-712: `resume`'s `ErrNoSessionId`,
- *     `ErrJsonlNeverWritten` and `ErrJsonlMissing` (by name) go on to exactly
+ *     `ErrJsonlNeverWritten` and `ErrJsonlMissing` (by class) go on to exactly
  *     one reuse spawn of `cscb_<key>` with the flag and the persona's
  *     `extra_env`, deleting nothing, at the collision ladder and at the
  *     sequence-launch entry's `resume` leg; on `ErrJsonlMissing` the
@@ -1037,12 +1038,14 @@ import {
   ErrSystemInstallDisappeared,
   ErrTmuxNotAvailable,
   ErrCwdNotFound,
+  ErrInstanceIdCollision,
   ErrJsonlMissing,
   ErrSpawnNotFound,
-  ERR_INSTANCE_ID_COLLISION_NAME,
-  ERR_JSONL_MISSING_NAME,
-  ERR_JSONL_NEVER_WRITTEN_NAME,
-  ERR_NO_SESSION_ID_NAME,
+  ErrSpawnNotInteractive,
+  ErrSpawnNotResumable,
+  ErrTmuxCaptureFailed,
+  ErrTmuxSendKeys,
+  ErrTmuxSessionCreate,
   ERR_STORE_OPEN_NAME,
 } from '../src/agent-director-errors.ts'
 import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER } from '../src/slack-log-redaction.ts'
@@ -8156,7 +8159,7 @@ const FAKE_WAIT_TIMEOUT_MS = 3 * 60_000
 /** A `status` error other than `ErrSpawnNotFound` that the working-row wait meets (b.jg5 SRJ-605). */
 interface WaitStatusError {
   readonly label: string
-  /** Builds it by name, for the `status` verb. */
+  /** Builds it for the `status` verb. */
   readonly make: () => Error
   /** Its class, as the wait's lines name it. */
   readonly errorClass: AdErrorClass
@@ -11502,9 +11505,18 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
       note: LEAK_SENTINEL,
     })
 
-  /** An agent-director error named `errName` at `verb`, its message carrying fake tokens, and its expected redacted form. */
-  const namedTokenError = (verb: string, errName: string): { err: Error; shown: string } => ({
-    err: errGeneric(verb, errName, leakyMessage('refused', verb)),
+  /**
+   * An agent-director error of `ErrorClass` (the client's class for a name it
+   * declares; the base class for a name CSCB gives no handling) named
+   * `errName` at `verb`, its message carrying fake tokens, and its expected
+   * redacted form.
+   */
+  const namedTokenError = (
+    verb: string,
+    errName: string,
+    ErrorClass: new (verb: string, errName: string, description: string) => AgentDirectorError = AgentDirectorError,
+  ): { err: Error; shown: string } => ({
+    err: new ErrorClass(verb, errName, leakyMessage('refused', verb)),
     shown: `${errName} message=${JSON.stringify(redactedLeakyMessage('refused'))}`,
   })
 
@@ -11554,7 +11566,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
     [
       'readPane GONE (ErrTmuxCaptureFailed)',
       () => {
-        const { err, shown } = namedTokenError('read-pane', 'ErrTmuxCaptureFailed')
+        const { err, shown } = namedTokenError('read-pane', 'ErrTmuxCaptureFailed', ErrTmuxCaptureFailed)
         return { err, opts: { statusQueue: statusReads('pending', 'waiting'), readPaneError: err }, shown }
       },
       (failure) => approverGoneMessage(C_REF, 'read-pane', failure),
@@ -11563,7 +11575,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
     [
       'sendKeys ErrSpawnNotInteractive',
       () => {
-        const { err, shown } = namedTokenError('send-keys', 'ErrSpawnNotInteractive')
+        const { err, shown } = namedTokenError('send-keys', 'ErrSpawnNotInteractive', ErrSpawnNotInteractive)
         return { err, opts: toEnter(err), shown }
       },
       (failure) => approverNotInteractiveMessage(C_REF, 'send-keys', failure),
@@ -11572,7 +11584,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
     [
       'status ENVIRONMENT (ErrTmuxNotAvailable)',
       () => {
-        const { err, shown } = namedTokenError('status', 'ErrTmuxNotAvailable')
+        const { err, shown } = namedTokenError('status', 'ErrTmuxNotAvailable', ErrTmuxNotAvailable)
         return { err, opts: { statusQueue: [cannedErr(err), ...statusReads('waiting')] }, shown }
       },
       (failure) => approverTmuxUnavailableMessage(C_REF, 'status', failure),
@@ -12032,7 +12044,7 @@ const SUCCESS_SITES_WITH_PRE_TRUST = SUCCESS_SITES.map(
 /** Both forms of a launch timeout (b.jg5 SRJ-407): `ErrCallTimeout`, and `ErrTmuxUnresponsive` carrying "the session may have been created". */
 const LAUNCH_TIMEOUT_FORMS: readonly LaunchTimeoutForm[] = [LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT, LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE]
 
-/** The launch timeout of `form` ending a `verb` call of instance `id`, built by name. */
+/** The launch timeout of `form` ending a `verb` call of instance `id`, from the stub's builder for its class. */
 function launchTimeoutOf(form: LaunchTimeoutForm, verb: 'spawn' | 'resume', id: string): Error {
   return form === LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT ? errCallTimeout(verb) : errTmuxUnresponsiveLaunchTimeout(verb, id)
 }
@@ -13920,11 +13932,11 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   })
 
   // AC 20 with b.jg5 SRJ-712, SRJ-113: `resume`'s answers are classified by
-  // name, so an ErrJsonlMissing value whose errName is token-shaped is not a
-  // no-transcript answer: no diagnosis and no reuse; the resume's failure
-  // handling answers `failed`. Its errName and description never leak into a
-  // line, an entry or a notice.
-  test('AC 20: an ErrJsonlMissing value whose errName is token-shaped and whose description holds a URL and a fake token is no no-transcript answer (by name): failed, with no diagnosis, no reuse and no delete; nothing leaks', async () => {
+  // class, so the client's ErrJsonlMissing whose errName is token-shaped is
+  // still a no-transcript answer: the diagnosis runs, then the one reuse
+  // spawn. Its errName and description never leak into a line, an entry or a
+  // notice; the lost record's cause names the class and carries both redacted.
+  test('AC 20: the client\'s ErrJsonlMissing whose errName is token-shaped and whose description holds a URL and a fake token is a no-transcript answer (by class): the diagnosis get, then one reuse spawn and no delete; the lost record carries both redacted; nothing leaks', async () => {
     const readLog = captureStartupErrors()
     const startedAt = '2026-09-20T05:00:00Z'
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, {
@@ -13946,13 +13958,14 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
     })
 
-    expect(result?.action).toBe('failed')
-    // The collision get only: no diagnosis get, and nothing launched after the resume.
-    expect([getCalls.length, spawnCalls.length, deleteCalls]).toEqual([1, 1, []])
+    expect(result?.action).toBe('fresh-after-amnesia')
+    // The collision get, then the diagnosis get; the colliding plain spawn, then the one reuse.
+    expect([getCalls.length, deleteCalls]).toEqual([2, []])
+    expect((spawnCalls as Phase1SpawnParams[]).map((call) => call.reuse_finished)).toEqual([undefined, true])
     const log = readLog()
-    expect(countStartupEntries(log, JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)).toBe(0)
     expect(countStartupEntries(log, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
-    expect(errLog).not.toContain('ErrJsonlMissing diagnostic: ')
+    const entry = onlyStartupEntry(log, JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)
+    expect(entry).toContain(`ErrJsonlMissing message=${JSON.stringify(`${REDACTED_TOKEN_PLACEHOLDER} ${REDACTED_AD_DESCRIPTION}`)}`)
     assertNoLeak({ errLog, startupErrorsLog: log, notices })
   })
 
@@ -14831,10 +14844,9 @@ describe('persona notices (b.av2 SR-7.2)', () => {
     ])
   })
 
-  // b.jg5 SRJ-713, SRJ-101: the remediation line is decided by the error's name; a collision has no line of its own.
+  // b.jg5 SRJ-713, SRJ-101: the remediation line is decided by the error's class; a collision has no line of its own.
   test.each<[string, () => AgentDirectorError, string]>([
     ['ErrSpawnNotFound (the client\'s class)', () => errSpawnNotFound(), SPAWN_NOT_FOUND_REMEDIATION],
-    ['ErrSpawnNotFound by name only', () => errGeneric('resume', errSpawnNotFound().errName), SPAWN_NOT_FOUND_REMEDIATION],
     ['a collision handed to it directly (ErrInstanceIdCollision), which no launch site does', () => errInstanceIdCollision(), SPAWN_FAILURE_DEFAULT_REMEDIATION],
     ['any other error', () => errGeneric('spawn', 'ErrSpawnBroken'), SPAWN_FAILURE_DEFAULT_REMEDIATION],
   ])('notifySpawnFailure with %s: one notice whose remediation line is the error\'s own, calling nothing a "dispatcher bug"', async (_label, make, remediation) => {
@@ -15175,14 +15187,15 @@ describe('persona notices (b.av2 SR-7.2)', () => {
 // ---------------------------------------------------------------------------
 // b.jg5 SRJ-713, SRJ-101: the spawn-failure notice's remediation hint
 // (`remediationHint`, the body only, comments stripped) has no collision
-// branch and decides by name, never by `instanceof`; no file in `src/`, its
+// branch and decides by class through `isAdErrorInstance`, never by an
+// error's name and with no `instanceof` of its own; no file in `src/`, its
 // comments included, calls anything a "dispatcher bug". That no collision
 // reaches the notice at a launch site is the SRJ-111, SRJ-112 and SRJ-113
 // describes' (and `srj105AfterEach` checks every harness case's posts and
 // lines for the wording).
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-713: remediationHint has no collision branch and decides by name; no src/ file says "dispatcher bug"', () => {
+describe('b.jg5 SRJ-713: remediationHint has no collision branch and decides by class; no src/ file says "dispatcher bug"', () => {
   /** The code of `remediationHint`'s body in `src/session-manager.ts`, comments stripped, so its doc block is no part of it. */
   function remediationHintBody(): string {
     const code = srcModules().get('session-manager.ts')!
@@ -15191,13 +15204,15 @@ describe('b.jg5 SRJ-713: remediationHint has no collision branch and decides by 
     return code.slice(...balancedAfter(code, at, '{', '}'))
   }
 
-  test('its body names no collision (neither the class nor its name), has no instanceof and no "dispatcher bug"; it decides through hasAdErrorName', () => {
+  test('its body names no collision (neither the class nor its name), has no instanceof and no "dispatcher bug"; it decides through isAdErrorInstance, never by a name', () => {
     const body = remediationHintBody()
     expect(body).toContain('return ')
     expect(body).not.toMatch(/InstanceIdCollision|INSTANCE_ID_COLLISION/)
     expect(body).not.toMatch(/\binstanceof\b/)
     expect(body).not.toMatch(DISPATCHER_BUG_WORDING)
-    expect(body).toContain('hasAdErrorName(')
+    expect(body).toContain('isAdErrorInstance(error, ErrSpawnNotFound)')
+    expect(body).toContain('isAdErrorInstance(error, ErrSpawnCapReached)')
+    expect(body).not.toMatch(/\berrName\b|_NAME\b|hasAdErrorName/)
   })
 
   test('no file in src/, its comments included, carries "dispatcher bug"', () => {
@@ -15564,7 +15579,7 @@ describe('killPersonaInstanceForTeardown: the persona teardown\'s bounded, check
 // `withOutageDetection` (no findMissing sweep, no other call) and logs
 // nothing. It answers `{ state }`: the row's state as agent-director reports
 // it, `pending` included, or `UNAVAILABLE_RETRY_ROW_ABSENT` for
-// `ErrSpawnNotFound` (by name). On a `pending` row only it also answers the
+// `ErrSpawnNotFound` (by class). On a `pending` row only it also answers the
 // launch start the result shows (`launchStartedAt`, raw); a missing, `null`
 // or empty one, or one on another state, gives no `launchStartedAt` key (the
 // cases compare with `toStrictEqual`, so an `undefined` key fails them). Any
@@ -15682,7 +15697,6 @@ describe('readPersonaRowState: the retry timer\'s row read, one status call thro
 
   test.each<[string, () => Error]>([
     ['the client\'s ErrSpawnNotFound', () => new ErrSpawnNotFound('status', 'ErrSpawnNotFound', 'spawn not found')],
-    ['a base AgentDirectorError named ErrSpawnNotFound', () => errGeneric('status', 'ErrSpawnNotFound', 'spawn not found')],
   ])('no row (%s) → { state: absent }, not an error, after one status call; quiet', async (_label, build) => {
     const calls = makeStubCallLog()
     installStub({ ...calls, statusError: build() })
@@ -15698,6 +15712,8 @@ describe('readPersonaRowState: the retry timer\'s row read, one status call thro
     ['an UNAVAILABLE error (ErrTmuxUnresponsive)', () => errTmuxUnresponsive('status')],
     ['an UNCLASSIFIED error (ErrInternal)', () => errInternal()],
     ['a base AgentDirectorError whose description carries a fake token', () => errGeneric('status', 'ErrBroken', `status refused (${sentinelInMessage('status')})`)],
+    // b.jg5 SRJ-101, SRJ-104: no row is decided by the client's class; a look-alike merely named so is UNCLASSIFIED.
+    ['a base AgentDirectorError merely named ErrSpawnNotFound (no instance of the client\'s class)', () => errGeneric('status', 'ErrSpawnNotFound', 'spawn not found')],
     ['a plain Error', () => new Error(`boom (${sentinelInMessage('plain')})`)],
   ])('%s propagates to the caller as the same value, with no line, startup error or notice of its own', async (_label, build) => {
     const err = build()
@@ -16020,13 +16036,13 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
     assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
   })
 
-  // A LAUNCH FAILURE answer named by name (the base class, which the plain
-  // spawn's handling decides by name: one counted failure, no spawn in its
-  // place): the record's text is the point.
+  // A LAUNCH FAILURE answer (the client's ErrTmuxSessionCreate, which the
+  // plain spawn's handling decides by class: one counted failure, no spawn in
+  // its place): the record's text is the point.
   test('a failed spawn with a safe errName → the spawn-failed record ends in `<errName> message="<redacted description>"`, with no cause tail', async () => {
     const readLog = captureStartupErrors()
     const launchFailureName = errTmuxSessionCreate('spawn').errName
-    installStub({ spawnError: errGeneric('spawn', launchFailureName, adDescription()) })
+    installStub({ spawnError: new ErrTmuxSessionCreate('spawn', launchFailureName, adDescription()) })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     const errLog = await withCapturedErr(async () => {
       await spawnForPersona(personaOf(cfg, 'C'), cfg)
@@ -16079,7 +16095,7 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
 // installed as `main()` installs it. Launches go through the real
 // `spawnForPersona` as the start pass makes them (`h.launch`, so a
 // `spawn-failed` startup-errors entry would be written), then once more
-// through `launchSession`. Errors come from E4's by-name stub builders.
+// through `launchSession`. Errors come from E4's stub builders.
 //
 // At every site the refused call is the last launch or destructive call: the
 // stub's `spawn`, `resume`, `kill`, `delete` and `send-keys` counts are
@@ -16095,7 +16111,7 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
 // leaks a secret (`assertNoLeak`, in each describe's `afterEach`).
 // ---------------------------------------------------------------------------
 
-/** E4's UNAVAILABLE forms of agent-director's own errors but `ErrTmuxKillFailed`, each built for the verb that meets it (by name). */
+/** E4's UNAVAILABLE forms of agent-director's own errors but `ErrTmuxKillFailed`, each built for the verb that meets it. */
 const SRJ105_UNAVAILABLE = unavailableForms('ErrUnknownErrorName', 'ErrCallTimeout', 'a wrapped UnknownError', 'ErrTmuxUnresponsive')
 
 /** `ErrTmuxKillFailed`, the UNAVAILABLE form only a kill answers. */
@@ -17888,7 +17904,7 @@ describe('b.jg5 SRJ-118, SRJ-412, SRJ-1017: the record of a launch whose send-ke
 // ---------------------------------------------------------------------------
 
 /**
- * The ENVIRONMENT answers, each built for the verb that meets it (by name),
+ * The ENVIRONMENT answers, each built for the verb that meets it,
  * with the onset it raises: tmux cannot be run, with today's onset text, and
  * the different-server form, with b.jg5 SRJ-1021's.
  */
@@ -18048,7 +18064,7 @@ describe('b.jg5 SRJ-105, SRJ-316: a CONFIG answer (ErrConfigMalformed) at the co
 // recording sinks at the end.
 // ---------------------------------------------------------------------------
 
-/** The UNCLASSIFIED answers fed to every site, each built for the verb that meets it (by name). */
+/** The UNCLASSIFIED answers fed to every site, each built for the verb that meets it. */
 const SRJ313_UNCLASSIFIED: ReadonlyArray<readonly [string, (verb: string) => Error]> = [
   ['an ErrInternal (its description not the unusable recorded name)', () => errInternal()],
   ['a name CSCB gives no handling (ErrNotHandled)', (verb) => errGeneric(verb, 'ErrNotHandled')],
@@ -18239,7 +18255,7 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNCLASSIFIED outcome at the collision ladde
 /** The outage a joined sweep's answer raises for each persona: its class and the onset text for the thrown value. */
 type JoinedSweepOutage = readonly [OutageClass, (err: Error) => string]
 
-/** Each answer of the joined sweep, built for `find-missing` (by name), with the cause it arms and the outage it raises (none for `undefined`). */
+/** Each answer of the joined sweep, built for `find-missing`, with the cause it arms and the outage it raises (none for `undefined`). */
 const JOINED_SWEEP_ANSWERS: ReadonlyArray<readonly [string, (verb: string) => Error, string, JoinedSweepOutage | undefined]> = [
   ...SRJ105_UNAVAILABLE.map(([what, make, kind]) => [`${what} (UNAVAILABLE)`, make, kind, undefined] as const),
   // The re-bound (different-server) row pins wiring only: today's agent-director never returns this error from `find-missing`; it proves the joiner's site hands its error to `raiseTmuxUnavailable`.
@@ -21605,7 +21621,7 @@ describe('b.jg5 SRJ-117, SRJ-604: the restart path\'s waiting-row check (checkWa
 // `srj105AfterEach` runs `assertNoLeak`.
 // ---------------------------------------------------------------------------
 
-/** The evidence read's answers that are no evidence, each built for `read-pane` by name, with its class and, when it raises P's outage, the onset. */
+/** The evidence read's answers that are no evidence, each built for `read-pane`, with its class and, when it raises P's outage, the onset. */
 const EVIDENCE_READ_NO_EVIDENCE: ReadonlyArray<readonly [string, () => Error, AdErrorClass, ((err: Error) => string) | undefined]> = [
   ['GONE (ErrTmuxCaptureFailed)', () => errTmuxCaptureFailed(), AD_ERROR_CLASS_GONE, undefined],
   ['the row absent (ErrSpawnNotFound)', () => errSpawnNotFound(), AD_ERROR_CLASS_STATE, undefined],
@@ -24262,8 +24278,8 @@ const LAUNCH_AND_READ_VERBS: ReadonlySet<string> = new Set(['spawn', 'resume', '
 /** The `retrying` launch result, uncounted (b.jg5 SRJ-105, SRJ-301, SRJ-1015). */
 const RETRYING_ANSWER = { action: SPAWN_ACTION_RETRYING } as const
 
-/** A `resume`'s collision, an `AgentDirectorError` named `ErrInstanceIdCollision` that is no instance of the client's class (decided by name, b.jg5 SRJ-101). */
-const resumeCollision = (): Error => errGeneric('resume', ERR_INSTANCE_ID_COLLISION_NAME, 'claude_instance_id already in use')
+/** A `resume`'s collision: the client's `ErrInstanceIdCollision`, built for `resume` (decided by class, b.jg5 SRJ-101). */
+const resumeCollision = (): Error => new ErrInstanceIdCollision('resume', 'ErrInstanceIdCollision', 'claude_instance_id already in use')
 
 /** The same outcome at both sites. */
 const atBothSites = (outcome: ResumeSiteOutcome): Pick<ResumeOutcomeRow, 'ladder' | 'entry'> => ({ ladder: outcome, entry: outcome })
@@ -24348,7 +24364,7 @@ const RESUME_OUTCOME_ROWS: readonly ResumeOutcomeRow[] = [
   },
   // b.jg5 SRJ-713: agent-director's `resume` gives no such answer; the guard keeps a collision from the spawn-failure notice.
   {
-    name: 'a collision (ErrInstanceIdCollision, by name) → the collision cause armed, retrying; never counted, never the spawn-failure notice',
+    name: 'a collision (ErrInstanceIdCollision, by class) → the collision cause armed, retrying; never counted, never the spawn-failure notice',
     make: resumeCollision,
     ...atBothSites({
       answer: RETRYING_ANSWER,
@@ -25289,7 +25305,7 @@ describe('b.jg5 SRJ-602, SRJ-711: ErrTmuxSessionCreate is one counted launch fai
 // ---------------------------------------------------------------------------
 // b.jg5 SRJ-707, SRJ-712 (E22 T3), with SRJ-112 and SRJ-113, on
 // `makeRecoveryHarness`: `resume`'s `ErrNoSessionId`, `ErrJsonlNeverWritten`
-// and `ErrJsonlMissing` (by name) go on to exactly one reuse spawn of
+// and `ErrJsonlMissing` (by class) go on to exactly one reuse spawn of
 // `cscb_<key>`, carrying the reuse flag and the persona's `extra_env`, with
 // no `delete`, kill or plain spawn; on `ErrJsonlMissing` the diagnosis's `get`
 // comes first (the harness configures no message archive, so it is
@@ -25314,10 +25330,6 @@ describe('b.jg5 SRJ-707, SRJ-712: resume\'s no-transcript answers go on to one r
     ['ErrNoSessionId', () => errNoSessionId(), 'spawned', ['spawn', 'get', 'resume']],
     ['ErrJsonlNeverWritten', () => errJsonlNeverWritten(), 'spawned', ['spawn', 'get', 'resume']],
     ['ErrJsonlMissing', () => errJsonlMissing(), 'fresh-after-inconclusive-amnesia', ['spawn', 'get', 'resume', 'get']],
-    // Classified by name: a base AgentDirectorError carrying each name is the same answer.
-    [`${ERR_NO_SESSION_ID_NAME} by name (a base AgentDirectorError)`, () => errGeneric('resume', ERR_NO_SESSION_ID_NAME), 'spawned', ['spawn', 'get', 'resume']],
-    [`${ERR_JSONL_NEVER_WRITTEN_NAME} by name (a base AgentDirectorError)`, () => errGeneric('resume', ERR_JSONL_NEVER_WRITTEN_NAME), 'spawned', ['spawn', 'get', 'resume']],
-    [`${ERR_JSONL_MISSING_NAME} by name (a base AgentDirectorError)`, () => errGeneric('resume', ERR_JSONL_MISSING_NAME), 'fresh-after-inconclusive-amnesia', ['spawn', 'get', 'resume', 'get']],
   ]
 
   test.each(NO_TRANSCRIPT_ANSWERS)('at the collision ladder, resume answering %s: exactly one reuse spawn of cscb_<key> with the flag and P\'s extra_env, after the diagnosis get on ErrJsonlMissing; no delete, kill or plain spawn after the resume; the launch answers %s', async (_label, make, action, before) => {
@@ -29921,8 +29933,8 @@ const PLAIN_SPAWN_ROWS: readonly PlainSpawnRow[] = [
     unclassified: true,
   },
   ...([
-    ['a STATE name (ErrSpawnNotResumable)', () => errGeneric('spawn', errSpawnNotResumable().errName)],
-    ['a GONE name (ErrTmuxSendKeys)', () => errGeneric('spawn', errTmuxSendKeys().errName)],
+    ['a STATE class (ErrSpawnNotResumable)', () => new ErrSpawnNotResumable('spawn', errSpawnNotResumable().errName, errSpawnNotResumable().errDescription)],
+    ['a GONE class (ErrTmuxSendKeys)', () => new ErrTmuxSendKeys('spawn', errTmuxSendKeys().errName, errTmuxSendKeys().errDescription)],
   ] as const).map(([label, make]): PlainSpawnRow => ({
     name: `${label} the plain spawn gives no meaning → UNCLASSIFIED (b.jg5 SRJ-104), refused, never counted`,
     make,

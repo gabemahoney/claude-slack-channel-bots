@@ -2149,7 +2149,7 @@ describe('decidePendingRowLapEnter: the lap\'s Enter, one case per outcome; a "S
   })
 })
 
-describe('pendingRowLapEnterFailureOf: a thrown Enter by class and by name, never by class identity (b.jg5 SRJ-118)', () => {
+describe('pendingRowLapEnterFailureOf: a thrown Enter decided by its class (b.jg5 SRJ-118)', () => {
   test.each<[string, () => Error, PendingRowLapEnterFailure['kind'], boolean]>([
     ['GONE (ErrTmuxSendKeys)', errTmuxSendKeys, PENDING_ROW_LAP_ENTER_GONE, false],
     ['ErrSpawnNotFound', errSpawnNotFound, PENDING_ROW_LAP_ENTER_ABSENT, false],

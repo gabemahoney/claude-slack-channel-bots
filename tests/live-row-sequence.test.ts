@@ -301,7 +301,6 @@ import {
   errCallTimeout,
   errConfigMalformed,
   errCwdNotFound,
-  errGeneric,
   errInstanceIdCollision,
   errInvalidFlags,
   errInternal,
@@ -1179,7 +1178,7 @@ describe('failed runs: a refused run ends the sequence; any other failed run jud
 /**
  * HO C2's non-success list at a kill (SRJ-110's Test line), the outcomes that
  * latch no one, with CONFIG and `ErrSystemInstallDisappeared` beside them:
- * each with its class, a value of it built by name and the tries the bounded
+ * each with its class, a value of it built from its class and the tries the bounded
  * retry makes of a row last read live (only UNAVAILABLE is tried again).
  * `ErrTmuxKillFailed` has its own cases below; CONFLICT and UNUSABLE NAME
  * latch P: their cases are tests/conflict-latch.test.ts's.
@@ -2155,7 +2154,7 @@ describe('the lines that carry agent-director text: redacted, on one line', () =
   const tokenText = (): string => `line one\n${sentinelInMessage('sequence')}`
 
   test.each<[string, () => string]>([
-    ['a get that failed', () => liveRowSequenceGetLine('persona=p', 2, { kind: LIVE_ROW_READ_REFUSED, error: errGeneric('get', 'ErrTmuxUnresponsive', tokenText()) })],
+    ['a get that failed', () => liveRowSequenceGetLine('persona=p', 2, { kind: LIVE_ROW_READ_REFUSED, error: errTmuxUnresponsive('get', tokenText()) })],
     [
       'a kill that failed',
       () =>

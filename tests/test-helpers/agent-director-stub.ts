@@ -69,23 +69,24 @@
  * failure with an error, and release of every held call for cleanup.
  *
  * Phase 1 errors and results (b.jg5 SRJ-1303):
- *   - Every error builder uses the 0.10.0 client's own class, except:
+ *   - Every error builder uses the installed client's own class, except:
  *       - `errGeneric`, which builds the base `AgentDirectorError` for any
- *         `errName`;
+ *         `errName` (a base error named like a class is not that class:
+ *         the classifier answers UNCLASSIFIED for it);
  *       - `errAmbiguousRequest` and `errPermissionRequestNotFound`, which
  *         build the base `AgentDirectorError` with the error's `errName`
- *         although 0.10.0 exports a class for each, because the code under
- *         test recognises both by `errName`;
- *       - the three for the errors only the Phase 1 client declares
- *         (`errTmuxUnresponsive*`, `errTmuxKillFailed`,
- *         `errTmuxSessionConflict`).
- *     Under the interim rule (b.jg5 SRJ-101) no file names a Phase-1-only
- *     export in a named import or re-export, since a missing named export
- *     fails every module that loads it; those three builders build the
- *     client's base `AgentDirectorError` whose `name` and `errName` are the
- *     error's name, taken from the string constants in
- *     `src/agent-director-errors.ts`. Once the Phase 1 client is adopted
- *     (b.jg5 E37) they switch to its classes.
+ *         although the client exports a class for each, because the code
+ *         under test recognises both by `errName`.
+ *     The three families for the errors only the Phase 1 client declares
+ *     (`errTmuxUnresponsive*`, `errTmuxKillFailed`, `errTmuxSessionConflict`)
+ *     build with `new` on the bindings `ErrTmuxUnresponsive`,
+ *     `ErrTmuxKillFailed` and `ErrTmuxSessionConflict` of
+ *     `src/agent-director-errors.ts`: the installed client's own classes when
+ *     it declares them, else CSCB's stand-ins (the host's 0.10.0 client).
+ *     No file names those three in a named import, re-export or
+ *     destructuring of `agent-director` (b.jg5 SRJ-101); this helper reads
+ *     them only through `src/agent-director-errors.ts`. Each value carries
+ *     its verb, its name as `errName` and its description.
  *   - `ErrInternal`, `ErrConfigMalformed` and the three store-open names
  *     (`ErrSchemaMismatch`, `ErrSchemaMigrationRequired`, `ErrStoreOpen`)
  *     have no class in any client and arrive as `ErrUnknownErrorName`;
@@ -219,7 +220,9 @@ import {
   ERR_TMUX_KILL_FAILED_NAME,
   ERR_TMUX_SESSION_CONFLICT_NAME,
   ERR_TMUX_UNRESPONSIVE_NAME,
-  type Phase1OnlyErrName,
+  ErrTmuxKillFailed,
+  ErrTmuxSessionConflict,
+  ErrTmuxUnresponsive,
 } from '../../src/agent-director-errors.ts'
 import {
   CONFLICT_ANOTHER_STORE_PHRASE,
@@ -777,19 +780,8 @@ export const STUB_TMUX_SOCKET_PATH = '/tmp/tmux-1000/default'
 const STUB_AD_CONFIG_PATH = '/home/agent/.agent-director/config.toml'
 
 /**
- * A Phase-1-only error by name (interim rule, b.jg5 SRJ-101): the 0.10.0
- * client's base `AgentDirectorError` whose `errName` and `name` are `name`,
- * so it classifies by name exactly as the Phase 1 class would. Switches to
- * the Phase 1 client's classes once that client is adopted (b.jg5 E37).
- */
-function phase1OnlyError(name: Phase1OnlyErrName, verb: string, description: string): AgentDirectorError {
-  const err = new AgentDirectorError(verb, name, description)
-  err.name = name
-  return err
-}
-
-/**
- * Build an `ErrTmuxUnresponsive` (by name): a tmux call that did not answer
+ * Build an `ErrTmuxUnresponsive` (the class binding of
+ * `src/agent-director-errors.ts`): a tmux call that did not answer
  * (default verb `resume`; `status` only reads the store and never returns
  * it). The default description is a call timeout that did nothing; pass
  * `description` for another. See `errTmuxUnresponsiveLaunchTimeout`,
@@ -801,24 +793,24 @@ export function errTmuxUnresponsive(
   verb: string = 'resume',
   description: string = 'tmux display-message did not answer within 5 s; nothing was done; retry later',
 ): AgentDirectorError {
-  return phase1OnlyError(ERR_TMUX_UNRESPONSIVE_NAME, verb, description)
+  return new ErrTmuxUnresponsive(verb, ERR_TMUX_UNRESPONSIVE_NAME, description)
 }
 
 /**
- * Build an `ErrTmuxUnresponsive` (by name) met after tmux answered
+ * Build an `ErrTmuxUnresponsive` (the class binding) met after tmux answered
  * "duplicate session": the session holding the name could not be read, so
  * nothing was started (default verb `resume`).
  */
 export function errTmuxUnresponsiveAfterDuplicateSession(verb: string = 'resume'): AgentDirectorError {
-  return phase1OnlyError(
-    ERR_TMUX_UNRESPONSIVE_NAME,
+  return new ErrTmuxUnresponsive(
     verb,
+    ERR_TMUX_UNRESPONSIVE_NAME,
     'tmux new-session answered duplicate session and the session holding the name could not be read; nothing was started',
   )
 }
 
 /**
- * Build an `ErrTmuxUnresponsive` (by name) that ends a launch call as a launch
+ * Build an `ErrTmuxUnresponsive` (the class binding) that ends a launch call as a launch
  * timeout: its description carries "the session may have been created"
  * (default verb `spawn`; pass `resume` for a resume).
  */
@@ -826,15 +818,15 @@ export function errTmuxUnresponsiveLaunchTimeout(
   verb: string = 'spawn',
   instanceId: string = STUB_INSTANCE_ID,
 ): AgentDirectorError {
-  return phase1OnlyError(
-    ERR_TMUX_UNRESPONSIVE_NAME,
+  return new ErrTmuxUnresponsive(
     verb,
+    ERR_TMUX_UNRESPONSIVE_NAME,
     `${verb} of ${instanceId}: tmux new-session did not answer within 5 s; ${LAUNCH_TIMEOUT_PHRASE} and the row stays pending; do not retry until get shows the row ended or missing`,
   )
 }
 
 /**
- * Build an `ErrTmuxUnresponsive` (by name) for a row that "appears to still be
+ * Build an `ErrTmuxUnresponsive` (the class binding) for a row that "appears to still be
  * stopping": it ended less than the stopping window (90 s) ago and its own
  * session still runs. The description names the quoted session name, as
  * agent-director's does (default verb `resume`; reuse and
@@ -844,15 +836,15 @@ export function errTmuxUnresponsiveStillStopping(
   verb: string = 'resume',
   sessionName: string = STUB_TMUX_SESSION_NAME,
 ): AgentDirectorError {
-  return phase1OnlyError(
-    ERR_TMUX_UNRESPONSIVE_NAME,
+  return new ErrTmuxUnresponsive(
     verb,
+    ERR_TMUX_UNRESPONSIVE_NAME,
     `the agent in tmux session ${JSON.stringify(sessionName)} ${STILL_STOPPING_PHRASE}: its row ended less than the stopping window (90 s) ago; nothing was done; retry later`,
   )
 }
 
 /**
- * Build an `ErrTmuxUnresponsive` (by name) for a row that "appears to still be
+ * Build an `ErrTmuxUnresponsive` (the class binding) for a row that "appears to still be
  * starting": its own session is younger than the starting-session bound
  * (300 s). The description names the quoted session name, as
  * agent-director's does (default verb `resume`; reuse also returns it).
@@ -861,9 +853,9 @@ export function errTmuxUnresponsiveStillStarting(
   verb: string = 'resume',
   sessionName: string = STUB_TMUX_SESSION_NAME,
 ): AgentDirectorError {
-  return phase1OnlyError(
-    ERR_TMUX_UNRESPONSIVE_NAME,
+  return new ErrTmuxUnresponsive(
     verb,
+    ERR_TMUX_UNRESPONSIVE_NAME,
     `the agent in tmux session ${JSON.stringify(sessionName)} ${STILL_STARTING_PHRASE}: the session is younger than the starting-session bound (300 s); nothing was done; retry later`,
   )
 }
@@ -877,7 +869,7 @@ export function errTmuxUnresponsiveStillStarting(
 export const NEW_ROW_ENDED_RETRY = 'retry with reuse_finished once the session name is free'
 
 /**
- * Build an `ErrTmuxUnresponsive` (by name) from a plain spawn whose
+ * Build an `ErrTmuxUnresponsive` (the class binding) from a plain spawn whose
  * `tmux new-session` answered "duplicate session" and whose re-lookup of the
  * session holding the name could not answer (HO rev 26; b.jg5 SRJ-111,
  * SRJ-1303): agent-director ended the new row, so the description carries
@@ -889,9 +881,9 @@ export function errTmuxUnresponsiveNewRowEnded(
   verb: string = 'spawn',
   sessionName: string = STUB_TMUX_SESSION_NAME,
 ): AgentDirectorError {
-  return phase1OnlyError(
-    ERR_TMUX_UNRESPONSIVE_NAME,
+  return new ErrTmuxUnresponsive(
     verb,
+    ERR_TMUX_UNRESPONSIVE_NAME,
     `tmux new-session answered duplicate session for tmux session ${JSON.stringify(sessionName)} and the re-lookup of the session holding the name did not answer within 5 s; ${NEW_ROW_ENDED_PHRASE}; ${NEW_ROW_ENDED_RETRY}`,
   )
 }
@@ -930,7 +922,8 @@ export const KILL_FAILED_DESCRIPTIONS: readonly KillFailedDescription[] = [
 export const STUB_SURVIVOR_PIDS: readonly number[] = [4194400]
 
 /**
- * Build an `ErrTmuxKillFailed` (by name; verb `kill`) with one of its four
+ * Build an `ErrTmuxKillFailed` (the class binding of
+ * `src/agent-director-errors.ts`; verb `kill`) with one of its four
  * descriptions, each carrying the quoted session name, "retry kill later" and
  * "never delete this row". Only `'pane-process-survived'` names a pid: each of
  * `pids` (one or more) as `pid <n>`, joined with ", "; the other three ignore
@@ -963,7 +956,7 @@ export function errTmuxKillFailed(
   if (JSON.stringify(survivorPids(text[description])) !== JSON.stringify(expected)) {
     throw new Error(`errTmuxKillFailed (${description}): the description does not name exactly the pids ${JSON.stringify(expected)}`)
   }
-  return phase1OnlyError(ERR_TMUX_KILL_FAILED_NAME, 'kill', text[description])
+  return new ErrTmuxKillFailed('kill', ERR_TMUX_KILL_FAILED_NAME, text[description])
 }
 
 /**
@@ -1027,7 +1020,8 @@ const CONFLICT_OPTION_CASES: Readonly<Record<keyof ConflictOptions, readonly Con
 export const STUB_TMUX_SESSION_ID = '$7'
 
 /**
- * Build an `ErrTmuxSessionConflict` (by name) for `conflictCase`. Each
+ * Build an `ErrTmuxSessionConflict` (the class binding of
+ * `src/agent-director-errors.ts`) for `conflictCase`. Each
  * description carries the quoted session name and the case words of ADSRD
  * SR-1.4 (from `src/ad-description-phrases.ts`), with that table's extras,
  * and ends with the `list --tmux-session-name` line naming the session:
@@ -1097,7 +1091,7 @@ export function errTmuxSessionConflict(
       `the agent in ${session} carries ${CONFLICT_OWN_ID_PHRASE} but ${CONFLICT_NEVER_REPORTED_IN_PHRASE}; ${NO_KILL_SENT_PHRASE}; ${humanMustLook}; ${listLine}`,
     'unrecognised': `${session} could not be matched to the row; ${humanMustLook}; ${listLine}`,
   }
-  return phase1OnlyError(ERR_TMUX_SESSION_CONFLICT_NAME, verb, text[conflictCase])
+  return new ErrTmuxSessionConflict(verb, ERR_TMUX_SESSION_CONFLICT_NAME, text[conflictCase])
 }
 
 /**
@@ -1217,7 +1211,7 @@ export function errInternal(description: string = 'the store could not be read')
 export type UnavailableForm = readonly [label: string, make: (verb: string) => Error, causeKind: string]
 
 /**
- * Every UNAVAILABLE form, each built by name: `ErrTmuxUnresponsive` and its
+ * Every UNAVAILABLE form, each built from its class: `ErrTmuxUnresponsive` and its
  * three variants CSCB tells apart, `ErrCallTimeout`, an unknown error name
  * from a later binary, CSCB's `UnknownError` wrapper, `ErrTmuxKillFailed`
  * (the kill-failure cause; only a kill answers it) and a plain `Error` (not

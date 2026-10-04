@@ -3,10 +3,12 @@
  * and its class mapper (`src/pane-read.ts`; b.jg5 SRJ-117 over SRJ-104's
  * classes), and the full-read line count the session manager's reads use.
  *
- * One row per value S1 names, each mapped to exactly one outcome by class
- * and by name through `src/ad-error-class.ts`. Every value is built with the
- * stub's builders. Phase-1-only and store-open names come from
- * `src/agent-director-errors.ts` as strings. Kinds, class labels and the line count are
+ * One row per value S1 names, each mapped to exactly one outcome through
+ * `src/ad-error-class.ts`: by class, and an `ErrUnknownErrorName` by the name
+ * it carries where SRJ-104 lists that name. Every value is built with the
+ * stub's builders. The Phase-1-only and store-open names an
+ * `ErrUnknownErrorName` carries come from `src/agent-director-errors.ts` as
+ * strings. Kinds, class labels and the line count are
  * imported from `src/`; the line count and the class note are pinned once
  * as literals.
  *
@@ -135,15 +137,19 @@ describe('paneReadFailureOf: each value a read-pane throws maps to exactly one o
     expect(kinds.size).toBe(PANE_READ_FAILURE_KINDS.length + 2)
   })
 
-  test('an agent-director error whose every property read throws maps as one with no name (UNCLASSIFIED) without throwing', () => {
+  test('an ErrTmuxCaptureFailed whose every property read throws still maps by its class (GONE), without throwing', () => {
+    // The class is decided by `instanceof`, which reads no property, so the
+    // throwing reads leave the class as it is; only the description is lost.
     const hostile = new Proxy(errTmuxCaptureFailed(), {
       get() {
         throw new Error('hostile read')
       },
     })
     const outcome = paneReadFailureOf(hostile)
-    expect([outcome.kind, outcome.errorClass]).toEqual([PANE_READ_UNCLASSIFIED, AD_ERROR_CLASS_UNCLASSIFIED])
+    expect([outcome.kind, outcome.errorClass]).toEqual([PANE_READ_GONE, AD_ERROR_CLASS_GONE])
+    expect('error' in outcome).toBe(false)
     expect(typeof outcome.description).toBe('string')
+    expect(outcome.description.includes('\n')).toBe(false)
   })
 })
 

@@ -251,14 +251,14 @@ import { KILL_RETRY_SEED_NOT_LIVE_VALUE, KILL_RETRY_SYSTEM_CLOCK, killRetryStopp
 import { cleanSession, getCozempicAvailable } from './cozempic.ts'
 import { resolveSystemBinary } from 'agent-director'
 import {
-  ERR_SPAWN_NOT_FOUND_NAME,
-  ERR_SYSTEM_INSTALL_DISAPPEARED_NAME,
+  ErrSpawnNotFound,
+  ErrSystemInstallDisappeared,
 } from './agent-director-errors.ts'
 import {
   AD_ERROR_CLASS_CONFIG,
   AD_ERROR_CLASS_ENVIRONMENT,
   classifyAdError,
-  hasAdErrorName,
+  isAdErrorInstance,
 } from './ad-error-class.ts'
 import {
   AGENT_DIRECTOR_DEAD_STATES,
@@ -1534,7 +1534,7 @@ export async function _runCallTimeoutStartStep(
  * answering; only a tmux-touching success or GONE (the outage wrappers), or a
  * check that finds the row live and connected with its stream (the health
  * tick's healthy branch, a retry's healthy row), clears it. A `status` error
- * is decided by name through `src/ad-error-class.ts`:
+ * is decided by class through `src/ad-error-class.ts`:
  *   - `ErrSpawnNotFound` → `dead`, carrying no row as what it read
  *     (`LIVENESS_READING_DEAD_NO_ROW`); clears `ad-unreachable` and
  *     `ad-config-malformed`, as a state answer does;
@@ -1631,7 +1631,7 @@ export function _buildIsSessionAliveAdapter(
       // persona's unclassified-error episode, except ErrSystemInstallDisappeared,
       // which keeps its `dead` reading (SRJ-105, SRJ-314).
       reportAgentDirectorError(key, err, 'status', {
-        reportUnclassified: !hasAdErrorName(err, ERR_SYSTEM_INSTALL_DISAPPEARED_NAME),
+        reportUnclassified: !isAdErrorInstance(err, ErrSystemInstallDisappeared),
       })
       // b.jg5 SRJ-105, SRJ-512: an UNUSABLE NAME answer latches the persona
       // (the own-row `status` step) and reads `unknown`, never `dead`.
@@ -1659,19 +1659,19 @@ function livenessLatchedReading(): LivenessReading {
 
 /**
  * The liveness adapter's reading for a `status` error (b.jg5 SRJ-314), with
- * its outage flags; see `_buildIsSessionAliveAdapter`. Decided by name
+ * its outage flags; see `_buildIsSessionAliveAdapter`. Decided by class
  * through `src/ad-error-class.ts`. Only `ErrSpawnNotFound` and
  * `ErrSystemInstallDisappeared` read `dead`.
  */
 function statusErrorReading(key: string, err: unknown): LivenessReading {
-  if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) {
+  if (isAdErrorInstance(err, ErrSpawnNotFound)) {
     // b.jg5 SRJ-312: agent-director answered, but tmux did not; `tmux-unavailable` stays raised.
     // It loaded its config and read the store, so `ad-config-malformed` clears.
     clearOutageFlag(key, 'ad-unreachable')
     clearOutageFlag(key, 'ad-config-malformed')
     return LIVENESS_READING_DEAD_NO_ROW
   }
-  if (hasAdErrorName(err, ERR_SYSTEM_INSTALL_DISAPPEARED_NAME)) {
+  if (isAdErrorInstance(err, ErrSystemInstallDisappeared)) {
     setOutageFlag(key, 'ad-unreachable', binaryPathOf(err))
     // b.jg5 SRJ-610: `dead` all the same, marked as read from no row, so the
     // slow-recovery count resets without ending its episode (hatch A2).
@@ -1796,8 +1796,8 @@ const KILL_SESSION_ADAPTER_SITE = 'killSession (restart adapter)'
  * applied configuration), and starts no `tmux-unresponsive` condition. A
  * stop of the tries (a read between tries that latched the persona, or the
  * keep-going check) answers the last outcome with no class handling, and the
- * restart work answers `latched` when the persona is latched. Every class
- * is decided by name through `src/ad-error-class.ts`. The restart work
+ * restart work answers `latched` when the persona is latched. Every answer
+ * is classified by error class through `src/ad-error-class.ts`. The restart work
  * launches only after a success (any `kill_sent`, `ErrSpawnNotFound`,
  * GONE, or a read that found the row finished). By class:
  *   - CONFLICT: the persona latches through the latch's CONFLICT entry with

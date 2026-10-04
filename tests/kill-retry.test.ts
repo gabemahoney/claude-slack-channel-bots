@@ -462,7 +462,7 @@ describe('runKillRetry: one status read before each further try (b.jg5 SRJ-702, 
   test.each<[string, ReadStep, KillRowFinishedRead]>([
     ['ended', readState('ended'), KILL_ROW_FINISHED_ENDED],
     ['missing', readState('missing'), KILL_ROW_FINISHED_MISSING],
-    ['ErrSpawnNotFound (by name)', cannedErr(errSpawnNotFound()), KILL_ROW_FINISHED_NO_ROW],
+    ['ErrSpawnNotFound', cannedErr(errSpawnNotFound()), KILL_ROW_FINISHED_NO_ROW],
     ['no row (the caller\'s read answered it)', { kind: KILL_RETRY_READ_NO_ROW }, KILL_ROW_FINISHED_NO_ROW],
   ])('a read of %s ends the tries as the row-finished success with no further kill and, with no survivor-naming failure before it, no alert', async (_label, read, finished) => {
     const r = await run({ kills: failing(KILL_RETRY_TRIES, () => errTmuxUnresponsive('kill')), reads: [read] })

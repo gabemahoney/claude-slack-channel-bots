@@ -145,7 +145,7 @@
  *
  * The module holds no module-scope state, runs nothing at
  * import, and loads neither the session manager, the server, the notifier
- * nor any Slack module. Errors are classified by name through
+ * nor any Slack module. Errors are classified by class through
  * `src/ad-error-class.ts`; agent-director text reaches a line only through
  * the shared redaction.
  *

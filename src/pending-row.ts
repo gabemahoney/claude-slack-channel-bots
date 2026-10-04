@@ -132,9 +132,9 @@
  * import; the clock is always passed in. Every function but the posters, the
  * episode's end, the rule's driver and the abort is pure; those act only
  * through the dependencies they are given (the abort's per-episode state
- * lives in its instance). Errors are classified by class and name
- * through `src/ad-error-class.ts`. Nothing names an export only the Phase 1
- * client has; the result field is typed through CSCB's own Phase 1
+ * lives in its instance). Errors are classified by class through
+ * `src/ad-error-class.ts`, the Phase-1-only classes through the bindings
+ * of `src/agent-director-errors.ts`; the result field is typed through CSCB's own Phase 1
  * declarations (`src/ad-phase1-types.ts`, a type-only import).
  *
  * SPDX-License-Identifier: MIT
@@ -149,7 +149,7 @@ import {
   AD_ERROR_CLASS_UNUSABLE_NAME,
   classifyAdError,
   describeAgentDirectorFailure,
-  hasAdErrorName,
+  isAdErrorInstance,
   type AdErrorClass,
 } from './ad-error-class.ts'
 import type { Phase1StatusResult } from './ad-phase1-types.ts'
@@ -161,7 +161,7 @@ import {
   type NeverEarlyWaitClock,
   type NeverEarlyWaitLength,
 } from './ad-settings.ts'
-import { ERR_SPAWN_NOT_FOUND_NAME, ERR_SPAWN_NOT_INTERACTIVE_NAME } from './agent-director-errors.ts'
+import { ErrSpawnNotFound, ErrSpawnNotInteractive } from './agent-director-errors.ts'
 import {
   AGENT_DIRECTOR_DEAD_STATES,
   AGENT_DIRECTOR_LIVE_STATES,
@@ -1020,8 +1020,8 @@ export const PENDING_ROW_LAP_ENTER_NOT_SENT_LATCHED: PendingRowLapEnterLatched =
 /**
  * The failure of a value thrown by the lap's Enter (`send-keys` with an
  * empty text and `allow_pending`, b.jg5 SRJ-118's approver-and-lap row), by
- * class and by name through `src/ad-error-class.ts`, never by testing the
- * value against an error class: GONE; `ErrSpawnNotFound` (absent);
+ * the classifier's class and by error class through `src/ad-error-class.ts`
+ * (`classifyAdError`, `isAdErrorInstance`), never by an error's name: GONE; `ErrSpawnNotFound` (absent);
  * `ErrSpawnNotInteractive`; CONFLICT; UNUSABLE NAME; CONFIG; ENVIRONMENT;
  * UNAVAILABLE; and every other value UNCLASSIFIED (`ErrSendKeysWhileRelayed`
  * included). Pure; never throws.
@@ -1030,8 +1030,8 @@ export function pendingRowLapEnterFailureOf(value: unknown): PendingRowLapEnterF
   const { errorClass } = classifyAdError(value)
   const description = describeAgentDirectorFailure(value)
   if (errorClass === AD_ERROR_CLASS_GONE) return { kind: PENDING_ROW_LAP_ENTER_GONE, errorClass, description }
-  if (hasAdErrorName(value, ERR_SPAWN_NOT_FOUND_NAME)) return { kind: PENDING_ROW_LAP_ENTER_ABSENT, errorClass, description }
-  if (hasAdErrorName(value, ERR_SPAWN_NOT_INTERACTIVE_NAME)) {
+  if (isAdErrorInstance(value, ErrSpawnNotFound)) return { kind: PENDING_ROW_LAP_ENTER_ABSENT, errorClass, description }
+  if (isAdErrorInstance(value, ErrSpawnNotInteractive)) {
     return { kind: PENDING_ROW_LAP_ENTER_NOT_INTERACTIVE, errorClass, description }
   }
   switch (errorClass) {
@@ -1912,7 +1912,7 @@ export const STUCK_LAUNCH_ABORT_KILL_STOPPED = 'stopped'
 
 /**
  * What the abort's one checked kill answers (the session manager's
- * `abortKillOwnStuckLaunch`), decided by class and name through
+ * `abortKillOwnStuckLaunch`), decided by class through
  * `src/ad-error-class.ts`. `description` is the standing outcome as one log
  * line renders it (`describeKillOutcome`: redacted, `kill_sent` included).
  */

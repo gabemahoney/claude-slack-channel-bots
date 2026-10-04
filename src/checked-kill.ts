@@ -48,8 +48,11 @@
  *     re-check's answer kind as `recheck`; a `stop` answer
  *     ({@link killOutcomeStopsServer}) means the server stops, and the caller
  *     does nothing more (SRJ-205).
- * Every class is decided by name through `src/ad-error-class.ts`
- * (`classifyAdError`, `hasAdErrorName`); no `instanceof` decides one.
+ * Every class is decided by class through `src/ad-error-class.ts`
+ * (`classifyAdError`, `isAdErrorInstance`, `killFailedDescriptionOf`); no
+ * `instanceof` ladder here decides one, and no error name is compared. An
+ * `ErrUnknownErrorName`, whatever its `unknownName` (`ErrTmuxKillFailed`
+ * included), is UNAVAILABLE and never a kill failure.
  *
  * {@link checkedKill} makes exactly one plain `kill` call through the
  * injected call, with `claude_instance_id` alone (CSCB never sets
@@ -103,12 +106,13 @@ import {
   classifyAdError,
   describeAdErrorClassification,
   describeAgentDirectorFailure,
-  hasAdErrorName,
+  goneErrNameOf,
+  isAdErrorInstance,
   killFailedDescriptionOf,
 } from './ad-error-class.ts'
 import type { Phase1KillResult } from './ad-phase1-types.ts'
 import { RECHECK_OUTCOME_STOP, type AdVersionRecheckTriggerAnswer } from './ad-version-gate.ts'
-import { ERR_SPAWN_NOT_FOUND_NAME, ERR_TMUX_KILL_FAILED_NAME } from './agent-director-errors.ts'
+import { ERR_TMUX_KILL_FAILED_NAME, ErrSpawnNotFound, ErrTmuxKillFailed } from './agent-director-errors.ts'
 import { describeLogMessage } from './persona-connection-errors.ts'
 
 // ---------------------------------------------------------------------------
@@ -195,7 +199,7 @@ export interface KillFailureUnavailable {
   readonly errorClass: typeof AD_ERROR_CLASS_UNAVAILABLE
   /** The thrown value, for the caller's own handling. Never logged raw. */
   readonly error: unknown
-  /** True for `ErrTmuxKillFailed` (by name), false for any other UNAVAILABLE value. */
+  /** True for an `ErrTmuxKillFailed` instance (by class), false for any other UNAVAILABLE value. */
   readonly killFailed: boolean
   /**
    * `ErrTmuxKillFailed` only: agent-director's description, raw
@@ -303,11 +307,11 @@ const UNLISTED_CLASSES: ReadonlySet<string> = new Set<string>(KILL_UNLISTED_CLAS
 /**
  * The outcome of a kill that settled as `settled` (SRJ-110). A result is a
  * success with its `kill_sent` kept as given (absent when the result has no
- * boolean `kill_sent`). A thrown `ErrSpawnNotFound` (by name) is the
+ * boolean `kill_sent`). A thrown `ErrSpawnNotFound` (by class) is the
  * `row-gone` success, and a thrown GONE value the `session-gone` success
  * (SRJ-104: for `kill`, gone is success), or the GONE non-success under
  * `options.goneIsFailure`; any other thrown value is a
- * non-success of the class `classifyAdError` answers by name, a class SRJ-110
+ * non-success of the class `classifyAdError` answers, a class SRJ-110
  * has no row for counting as UNCLASSIFIED with that class kept as
  * `unlistedClass`. Pure; never throws.
  */
@@ -341,10 +345,10 @@ function readKillSent(result: unknown): boolean | undefined {
 
 /** The outcome for a value a kill threw; a GONE value is a non-success when `goneIsFailure`. */
 function thrownOutcome(error: unknown, goneIsFailure: boolean): AnyKillOutcome {
-  if (hasAdErrorName(error, ERR_SPAWN_NOT_FOUND_NAME)) return { kind: KILL_OUTCOME_ROW_GONE }
+  if (isAdErrorInstance(error, ErrSpawnNotFound)) return { kind: KILL_OUTCOME_ROW_GONE }
   const { errorClass } = classifyAdError(error)
   if (errorClass === AD_ERROR_CLASS_GONE) {
-    const name = AD_GONE_ERR_NAMES.find((goneName) => hasAdErrorName(error, goneName))
+    const name = goneErrNameOf(error)
     const named = name === undefined ? {} : { name }
     return goneIsFailure
       ? { kind: KILL_OUTCOME_NOT_KILLED, errorClass, error, ...named }
@@ -352,7 +356,7 @@ function thrownOutcome(error: unknown, goneIsFailure: boolean): AnyKillOutcome {
   }
   if (errorClass === AD_ERROR_CLASS_UNAVAILABLE) {
     const killFailedDescription = killFailedDescriptionOf(error)
-    const killFailed = killFailedDescription !== undefined || hasAdErrorName(error, ERR_TMUX_KILL_FAILED_NAME)
+    const killFailed = isAdErrorInstance(error, ErrTmuxKillFailed)
     return {
       kind: KILL_OUTCOME_NOT_KILLED,
       errorClass,
@@ -514,7 +518,7 @@ export const KILL_REFUSAL_AT_READ = 'status read'
 /**
  * One CONFLICT or UNUSABLE NAME answer a kill met where nothing latches on
  * it (a persona teardown's kill, an old-life wait's kill; SRJ-1002): where,
- * its class (by name) and the thrown value, raw. Never logged raw.
+ * its class (by the classifier) and the thrown value, raw. Never logged raw.
  */
 export interface KillRefusal {
   readonly at: typeof KILL_REFUSAL_AT_KILL | typeof KILL_REFUSAL_AT_READ

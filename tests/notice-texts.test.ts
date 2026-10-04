@@ -149,6 +149,12 @@ import { retiredKeysUnreadableMessage } from '../src/retired-keys.ts'
 import { REDACTED_TOKEN_PLACEHOLDER } from '../src/slack-log-redaction.ts'
 import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import { slowRecoveryText } from '../src/slow-recovery.ts'
+import {
+  ERR_TMUX_KILL_FAILED_NAME,
+  ERR_TMUX_SESSION_CONFLICT_NAME,
+  ErrTmuxKillFailed,
+  ErrTmuxSessionConflict,
+} from '../src/agent-director-errors.ts'
 
 import {
   errConfigMalformed,
@@ -393,17 +399,28 @@ function wedgeWarningEntries(): NoticeEntry[] {
   ]
 }
 
-/** A kill's non-success outcome from the stub's `ErrTmuxKillFailed`, a fake token in its description. */
+/**
+ * A kill's non-success outcome from an `ErrTmuxKillFailed` (`new` on the class
+ * binding of `src/agent-director-errors.ts`, as the stub's builder does), the
+ * stub's description with a fake token appended.
+ */
 function killFailedOutcome(): KillFailure {
-  const outcome = killOutcomeOf({ thrown: errGeneric('kill', 'ErrTmuxKillFailed', killFailedDescription('outlived-exit-wait')) })
-  if (outcome.kind !== KILL_OUTCOME_NOT_KILLED) throw new Error('notice-texts: the stub kill failure did not give a not-killed outcome')
+  const outcome = killOutcomeOf({ thrown: new ErrTmuxKillFailed('kill', ERR_TMUX_KILL_FAILED_NAME, killFailedDescription('outlived-exit-wait')) })
+  if (outcome.kind !== KILL_OUTCOME_NOT_KILLED || !('killFailed' in outcome) || outcome.killFailed !== true) {
+    throw new Error('notice-texts: the kill failure did not give a not-killed kill-failure outcome')
+  }
   return outcome as KillFailure
 }
 
-/** A CONFLICT answer at a kill, a fake token in its description. */
+/**
+ * A CONFLICT answer at a kill (`new` on the `ErrTmuxSessionConflict` binding,
+ * as the stub's builder does), the stub's description with a fake token
+ * appended.
+ */
 function conflictAtKill() {
   const session = personaTmuxSessionName(OLD_KEY)
-  return errGeneric('kill', 'ErrTmuxSessionConflict', withToken(errTmuxSessionConflict('kill', 'not-this-launch', session).errDescription, 'teardown-conflict'))
+  const description = withToken(errTmuxSessionConflict('kill', 'not-this-launch', session).errDescription, 'teardown-conflict')
+  return new ErrTmuxSessionConflict('kill', ERR_TMUX_SESSION_CONFLICT_NAME, description)
 }
 
 /** SRJ-1003: the teardown window's notices for a kill's refusal or non-success (one builder an old-life wait uses too). */
