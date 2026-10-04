@@ -18,8 +18,10 @@
  *        repeated, SRJ-509: it may be a token typed by mistake)
  *   500  the clear rejected unexpectedly (one leak-free line)
  *   200  `{ ok: true, persona: <name>, cleared: true | false }` once the
- *        clear has run in the persona's lifecycle serializer turn; the
- *        bypassing `find-missing` and the retry follow without being awaited
+ *        clear has run in the persona's lifecycle serializer turn (for
+ *        `cleared: true`, with the persona's restart failure count reset);
+ *        the bypassing `find-missing` and the retry follow without being
+ *        awaited
  *
  * The CLI dials `127.0.0.1` at the port in `server.port` (`dialClearLatch`,
  * the production dial; `parseClearLatchAnswer` reads a 200's body), directly
@@ -352,8 +354,11 @@ export interface ClearLatchDeps {
   /**
    * The clear by hand of the persona with this key: settles with whether it
    * was latched once the clear has run in its lifecycle serializer turn, and
-   * leaves what follows the clear running. The server binds it over its
-   * latch re-check, with the "cleared by hand" reason.
+   * leaves what follows the clear running. A clear that cleared a latch has
+   * also reset the persona's restart failure count by then, so the retry at
+   * once that follows is not refused by the restart cap; one that found the
+   * persona unlatched changes nothing. The server binds it over its latch
+   * re-check, with the "cleared by hand" reason.
    */
   clearByHand: (key: string) => Promise<boolean>
   /** Line logger. Defaults to `console.error`. */

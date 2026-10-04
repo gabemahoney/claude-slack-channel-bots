@@ -451,8 +451,11 @@
  *   in a round, b.av2 SR-6.4, and the restart cap (`isAtCap` at
  *   `RESTART_FAILURE_CAP`, over the real failure counter) as its `isAtCap`,
  *   so a persona at the cap gets its reads in a round but no launch and no
- *   run of the restart path's decision, b.av2 SR-6.3, bug b.xkd; every
- *   operation it submits through the
+ *   run of the restart path's decision, b.av2 SR-6.3, bug b.xkd, and the
+ *   reset of that counter (`forgetFailures`) as its `resetRestartFailures`,
+ *   so a clear by hand that clears a latch resets the persona's count before
+ *   its retry at once while the re-check's own clears leave it, b.jg5
+ *   SRJ-509, bug b.ebi; every operation it submits through the
  *   serializer is tracked until it settles); its clear goes through the one clear entry:
  *   one recovery post, the episode ended, the timer stopped, then, after a
  *   clear that launched nothing, the after-clear sequence's run in the same
@@ -1141,7 +1144,7 @@ import {
   type AdSettingsInEffect,
   type NeverEarlyWaitClock,
 } from '../../src/ad-settings.ts'
-import { _resetBackoffState, doublingBackoffDelay, isAtCap } from '../../src/backoff.ts'
+import { _resetBackoffState, doublingBackoffDelay, forgetFailures, isAtCap } from '../../src/backoff.ts'
 import { replySettingsOf, type Persona, type PersonaConfig } from '../../src/config.ts'
 import {
   bindConflictLatchHolds,
@@ -2489,6 +2492,11 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     // `RESTART_FAILURE_CAP` gets its reads in a round but no launch and no run
     // of the restart path's decision.
     isAtCap: (key) => isAtCap(key, RESTART_FAILURE_CAP),
+    // As main() passes it (b.av2 SR-6.3; b.jg5 SRJ-509; bug b.ebi): the reset
+    // of that same real failure counter, handed to the clear by hand only, so
+    // a clear by hand that clears P's latch resets P's count before its retry
+    // at once; the re-check's own clears leave it as it is.
+    resetRestartFailures: forgetFailures,
   })
   if (options.latchRecheck === true) unbindLatch.push(bindLatchRecheck(latch, latchRecheck))
   /** Every key a latch re-check round may run for: the configured and the armed. */

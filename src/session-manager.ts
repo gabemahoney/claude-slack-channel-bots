@@ -430,10 +430,13 @@
  * clear itself, `runLatchClearSequence`), outside the round's scope: one
  * bypassing `find-missing` after step 1's
  * clear and a clear by hand, then the persona retried at once through the
- * in-turn retry entry (`runRestartRetryInTurn`). From the clear to the run's
- * end the persona is held active (`holdRestartActive`), so the health tick
- * reads nothing of it meanwhile. A clear by a retry that was not refused
- * keeps that retry's outcome.
+ * in-turn retry entry (`runRestartRetryInTurn`). A clear by hand that clears
+ * a latch also resets the persona's restart failure count before that retry
+ * (`resetRestartFailures`, b.av2 SR-6.3), so the restart cap does not refuse
+ * that retry; the re-check's own clears leave the count as it is. From
+ * the clear to the run's end the persona is held active
+ * (`holdRestartActive`), so the health tick reads nothing of it meanwhile. A
+ * clear by a retry that was not refused keeps that retry's outcome.
  *
  * No tmux process-tree walks, no JSONL existence checks for resume eligibility:
  * the library encapsulates both.
@@ -20927,6 +20930,11 @@ export function latchClearRunFailedLine(ref: string, failure: string): string {
   return `[slack] ${LATCH_CLEAR_SITE}: the run after ${ref}'s latch cleared failed: ${failure} (b.jg5 SRJ-506)`
 }
 
+/** `[slack] latch-clear: the reset of <ref>'s restart failure count after its clear by hand failed: <failure> (b.av2 SR-6.3; b.jg5 SRJ-506, SRJ-509)` */
+export function latchClearRestartResetFailedLine(ref: string, failure: string): string {
+  return `[slack] ${LATCH_CLEAR_SITE}: the reset of ${ref}'s restart failure count after its clear by hand failed: ${failure} (b.av2 SR-6.3; b.jg5 SRJ-506, SRJ-509)`
+}
+
 /** The persona was not latched: the clear entry did nothing, and nothing followed. */
 export const LATCH_CLEAR_SEQUENCE_NOT_LATCHED = 'not-latched'
 /** The persona is not in the applied configuration when the run's turn came: cleared, with no `find-missing` and no retry. */
@@ -20977,6 +20985,18 @@ export interface LatchClearSequenceDeps {
    * retry" query, `personaRetryBlockCause`).
    */
   readonly retryAtOnce?: (key: string, cwd: string) => Promise<RestartRetryOutcome>
+  /**
+   * The reset of the persona's restart failure count and its cap-notified
+   * latch (production: `forgetFailures`, `src/backoff.ts`; b.av2 SR-6.3,
+   * b.jg5 SRJ-509), made by a clear by hand (`runLatchClearSequence`) only:
+   * once its clear has cleared a latch, before `cleared` settles and before
+   * the retry at once, so the restart cap does not refuse that retry. A clear
+   * that finds the persona unlatched resets nothing, and the re-check's own
+   * clears never call it. Absent, a clear by hand resets nothing. A throw is
+   * logged (`latchClearRestartResetFailedLine`) and changes nothing else the
+   * sequence does.
+   */
+  readonly resetRestartFailures?: (key: string) => void
   /** Where the sequence's lines go. A throwing log is swallowed. */
   readonly log: (line: string) => void
 }
@@ -21057,6 +21077,22 @@ function logLatchClear(deps: LatchClearSequenceDeps, line: string): void {
 }
 
 /**
+ * A clear by hand's reset of persona `key`'s restart failure count
+ * (`deps.resetRestartFailures`; b.av2 SR-6.3, b.jg5 SRJ-509), called once its
+ * clear has cleared a latch: absent, nothing; a throw is logged
+ * (`latchClearRestartResetFailedLine`) and swallowed, so the clear's answer
+ * and the run after it are unchanged. Never throws.
+ */
+function resetRestartFailuresAfterClear(key: string, deps: LatchClearSequenceDeps): void {
+  if (deps.resetRestartFailures === undefined) return
+  try {
+    deps.resetRestartFailures(key)
+  } catch (thrown) {
+    logLatchClear(deps, latchClearRestartResetFailedLine(keyRef(key), describeThrownValue(thrown)))
+  }
+}
+
+/**
  * What a clear by hand answers (`runLatchClearSequence`), in two parts:
  *   - `cleared` settles once the job's clear has run in the persona's
  *     lifecycle serializer turn, with whether the persona was latched, and
@@ -21086,11 +21122,15 @@ export interface LatchClearSequenceAnswer {
  * inside the persona's serializer turn: the job waits for that turn.
  *
  * The job, in its turn, in order:
- *   0. the clear (`clearForSequence`): one recovery post, the episode ended,
- *      the re-check timer stopped, one line, the working-row evidence
- *      forgotten and the persona held active; `cleared` settles here. An
- *      unlatched persona gets nothing more: no call, no post and no timer
- *      change (`not-latched`, `cleared` false);
+ *   0. the clear (`deps.clear`): one recovery post, the episode ended, the
+ *      re-check timer stopped, one line; then, for a persona it cleared, the
+ *      restart failure count and cap-notified latch reset
+ *      (`deps.resetRestartFailures`, a throw logged and swallowed), so the
+ *      restart cap does not refuse step 3's retry; then `cleared` settles;
+ *      then the working-row evidence forgotten and the persona held active
+ *      (`holdForSequence`). An unlatched persona gets nothing more: no call,
+ *      no post, no timer change, no reset and no hold (`not-latched`,
+ *      `cleared` false);
  *   1. a persona not in the applied configuration gets no call
  *      (`not-applied`); a persona latched again meanwhile gets none either
  *      (`relatched`);
@@ -21108,7 +21148,8 @@ export interface LatchClearSequenceAnswer {
  *   3. the persona retried at once, in the same turn: one run of the restart
  *      path's decision through the in-turn retry entry (`deps.retryAtOnce`),
  *      with the retry entry's gates (latched, held, "blocks a retry", the
- *      restart cap) and accounting, which arms the retry timer for a
+ *      restart cap, which a persona whose count step 0 reset is below) and
+ *      accounting, which arms the retry timer for a
  *      `pending` row (b.jg5 SRJ-409) or starts the live-row sequence for a
  *      retired key's row (SRJ-411) as its decision says (`retried`).
  * From the clear to the job's end the persona is held active
@@ -21131,12 +21172,13 @@ export interface LatchClearSequenceAnswer {
  *   [slack] latch-clear: the run after <ref>'s latch cleared could not be run in its serializer turn: <error> (b.jg5 SRJ-506)
  *   [slack] latch-clear: the clear of <ref> failed: <error> — nothing runs after it (b.jg5 SRJ-506)
  *   [slack] latch-clear: the run after <ref>'s latch cleared failed: <error> (b.jg5 SRJ-506)
+ *   [slack] latch-clear: the reset of <ref>'s restart failure count after its clear by hand failed: <error> (b.av2 SR-6.3; b.jg5 SRJ-506, SRJ-509)
  *
  * (one builder each: `latchClearNotAppliedLine`, `latchClearRelatchedBeforeRunLine`,
  * `latchClearFindMissingRefusedLine`, `latchClearRelatchedAfterFindMissingLine`,
  * `latchClearRetryAnsweredLine`, `latchClearRetryFailedLine`,
  * `latchClearNotRunInTurnLine`, `latchClearClearFailedLine`,
- * `latchClearRunFailedLine`).
+ * `latchClearRunFailedLine`, `latchClearRestartResetFailedLine`).
  */
 export function runLatchClearSequence(
   key: string,
@@ -21172,6 +21214,7 @@ export function runLatchClearSequence(
         return { kind: LATCH_CLEAR_SEQUENCE_RETRY_FAILED }
       }
       clearRan = true
+      if (latched) resetRestartFailuresAfterClear(key, deps)
       settleCleared(latched)
       if (!latched) return { kind: LATCH_CLEAR_SEQUENCE_NOT_LATCHED }
       let run: LatchClearRun | undefined
@@ -21201,14 +21244,18 @@ export function runLatchClearSequence(
 }
 
 /**
- * The clear by hand the `/clear-latch` route uses (b.jg5 SRJ-510, SRJ-506,
- * SRJ-1005): `recheck.clearAndRecover` with the "cleared by hand" reason
- * (`LATCH_RECOVERY_REASON_CLEARED_BY_HAND`), answering only its `cleared`
- * part, whether the persona was latched, once the clear has run in the
- * persona's serializer turn. The bypassing `find-missing` and the retry
- * that follow run on, unawaited (`done` never rejects). `main()` applies it
- * once to its latch re-check, and the recovery harness to its own, so both
- * clear by hand through the same composition.
+ * The clear by hand the `/clear-latch` route uses (b.jg5 SRJ-510, SRJ-509,
+ * SRJ-506, SRJ-1005): `recheck.clearAndRecover` with the "cleared by hand"
+ * reason (`LATCH_RECOVERY_REASON_CLEARED_BY_HAND`), answering only its
+ * `cleared` part, whether the persona was latched, once the clear has run in
+ * the persona's serializer turn. A clear that cleared a latch has also reset
+ * the persona's restart failure count by then (the re-check's
+ * `resetRestartFailures`; b.av2 SR-6.3), so the restart cap does not refuse
+ * the retry at once of a persona that was at it; one that was not latched
+ * resets nothing. The bypassing `find-missing` and the retry that follow run on,
+ * unawaited (`done` never rejects). `main()` applies it once to its latch
+ * re-check, and the recovery harness to its own, so both clear by hand
+ * through the same composition.
  */
 export function clearByHandOf(recheck: Pick<LatchRecheck, 'clearAndRecover'>): (key: string) => Promise<boolean> {
   return (key) => recheck.clearAndRecover(key, LATCH_RECOVERY_REASON_CLEARED_BY_HAND).cleared
@@ -21337,6 +21384,15 @@ export interface LatchRecheckInput {
    * (`LatchRecheckRoundDeps.isAtCap`). Absent, no persona is at the cap.
    */
   readonly isAtCap?: (key: string) => boolean
+  /**
+   * The reset of a persona's restart failure count, the count `isAtCap`
+   * reads (`forgetFailures`, `src/backoff.ts`; b.av2 SR-6.3, b.jg5 SRJ-509),
+   * handed to the clear by hand only (`clearAndRecover`,
+   * `LatchClearSequenceDeps.resetRestartFailures`): a clear by hand that
+   * clears a latch resets the count before its retry at once. The re-check's
+   * own clears never reset it. Absent, a clear by hand resets nothing.
+   */
+  readonly resetRestartFailures?: (key: string) => void
 }
 
 /** The re-check as built: its timers, the one clear entry and the after-clear sequence over it. */
@@ -21348,12 +21404,14 @@ export interface LatchRecheck extends LatchRecheckController {
   readonly clear: LatchClear
   /**
    * The clear by hand and its after-clear sequence (`runLatchClearSequence`)
-   * over `clear`, with its bypassing `find-missing` first: for a clear by
-   * hand, with `LATCH_RECOVERY_REASON_CLEARED_BY_HAND` (`clearByHandOf`).
-   * One job through the persona's serializer, the clear its first step;
-   * answers `cleared` once the clear has run in that turn and `done` once
-   * the job has ended. Never awaited from inside the persona's serializer
-   * turn.
+   * over `clear`, with its bypassing `find-missing` first and the restart
+   * failure count's reset (`LatchRecheckInput.resetRestartFailures`) after a
+   * clear that cleared a latch: for a clear by hand, with
+   * `LATCH_RECOVERY_REASON_CLEARED_BY_HAND` (`clearByHandOf`). One job
+   * through the persona's serializer, the clear its first step; answers
+   * `cleared` once the clear (and its reset) has run in that turn and `done`
+   * once the job has ended. Never awaited from inside the persona's
+   * serializer turn.
    */
   readonly clearAndRecover: (key: string, reason: LatchRecoveryReason) => LatchClearSequenceAnswer
 }
@@ -21384,9 +21442,11 @@ export interface LatchRecheck extends LatchRecheckController {
  *     controller's stop of the persona's timer) and, after a clear that
  *     launched nothing, the after-clear sequence's run
  *     (`runLatchRecheckRoundThenOwed`), right after the round in the same
- *     serializer turn, its retry through `runRestartRetryInTurn`.
+ *     serializer turn, its retry through `runRestartRetryInTurn`; these
+ *     clears leave the restart failure count as it is.
  * Answers the controller with the clear entry and the after-clear sequence
- * (`LatchRecheck`); the caller binds its observer to the latch
+ * (`LatchRecheck`), the latter for a clear by hand, the only one handed the
+ * restart failure count's reset (`input.resetRestartFailures`); the caller binds its observer to the latch
  * (`bindLatchRecheck`) after the holds and the notice, stops a persona's
  * timer wherever it forgets the persona's latch at a teardown, and calls
  * `stopAll` at shutdown. The builder reads nothing and starts nothing when
@@ -21403,6 +21463,10 @@ export function buildLatchRecheck(input: LatchRecheckInput): LatchRecheck {
     log: input.log,
   })
   const sequenceDeps: LatchClearSequenceDeps = { clear, appliedConfig: input.appliedConfig, serialize: input.serialize, log: input.log }
+  // Only the clear by hand resets the restart failure count: the re-check's
+  // own clears get `sequenceDeps`, which carries no reset.
+  const byHandDeps: LatchClearSequenceDeps =
+    input.resetRestartFailures === undefined ? sequenceDeps : { ...sequenceDeps, resetRestartFailures: input.resetRestartFailures }
   controller = createLatchRecheckController({
     clock: input.clock,
     isLatched: (key) => input.latch.isLatched(key),
@@ -21413,6 +21477,6 @@ export function buildLatchRecheck(input: LatchRecheckInput): LatchRecheck {
   return {
     ...controller,
     clear,
-    clearAndRecover: (key, reason) => runLatchClearSequence(key, reason, sequenceDeps),
+    clearAndRecover: (key, reason) => runLatchClearSequence(key, reason, byHandDeps),
   }
 }
