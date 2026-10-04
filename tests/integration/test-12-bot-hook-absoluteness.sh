@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Test 12 (b.cnu SR-8.2; the b.2qu absolute-path rule for the reply guard):
-# every hook command a persona's Claude is launched with starts with an
-# absolute path to an existing, executable file. agent-director's own hooks
+# every hook a persona's Claude is launched with has a `command` path that is
+# an absolute path to an existing, executable file. agent-director's own hooks
 # point at the user's agent-director install, outside the customer's
 # node_modules; CSCB's Slack Reply Guard Stop hook points at the installed
 # package's stop-hooks/slack-reply-guard.sh.
@@ -25,31 +25,39 @@
 #   (src/persona-identity.ts personaInstanceId, personaSpawnEnv).
 # - CSCB's: <claude_config_dir>/settings.json (src/stop-hook-bootstrap.ts),
 #   the user settings the launched claude reads through CLAUDE_CONFIG_DIR.
-# Claude Code runs a hook command through a shell, so a command's words are
-# read as a shell reads them (Python's shlex, POSIX mode; nothing is run).
+# agent-director registers its hooks in exec form (`command` with `args`, run
+# with no shell between Claude Code and the hook), so the path this test
+# checks is the hook's `command`, read verbatim, never split into words.
+# CSCB's own Stop hook stays a shell-form command (no `args`), so its words
+# are read as a shell reads them (Python's shlex, POSIX mode; nothing is run)
+# and its `command` path is the first of them. An `args` that is not a list
+# of strings is not the settings shape and fails the test.
 #
 # Steps:
 # 1. Start one persona with its own claude_config_dir (a fresh scratch dir;
 #    stop_hook_bootstrap is on by default). It is brought up: one
 #    persona-start line, the start pass ends with `0 not brought up`, no
 #    `[slack] stop-hook-bootstrap:` line (each is a skip or a failure) and
-#    no stop-hook-bootstrap record in startup-errors.log, and the launched
-#    claude was the stub (its transcript marker).
+#    no stop-hook-bootstrap record in startup-errors.log. The dialog approver
+#    runs after the launch returns, so the start pass does not wait for the
+#    launched claude's SessionStart: within TRANSCRIPT_WAIT_S of the start
+#    pass's end the working dir gets a transcript, and every transcript in it
+#    carries stub-claude's marker (the launched claude was the stub).
 # 2. Exactly one live process carries the persona's instance ID and key and
 #    a `--settings` argument; its CLAUDE_CONFIG_DIR is the persona's
 #    claude_config_dir.
 # 3. agent-director's hooks, from that `--settings` JSON: SessionStart and
 #    PermissionRequest (the permission relay) have one each at least, and
-#    every command's first word is an absolute path to an existing executable
-#    file whose real path is the user's agent-director install (the binary
-#    the agent-director client runs: ~/.agent-director/bin/agent-director when
-#    present, else agent-director on PATH), outside the customer's
-#    node_modules.
-# 4. CSCB's hooks, from <claude_config_dir>/settings.json: every command's
-#    first word is an absolute path to an existing executable file. Exactly
-#    one command is managed (names slack-reply-guard.sh, the SR-3.7
-#    recognition rule): a Stop hook of two words, the installed package's
-#    stop-hooks/slack-reply-guard.sh (by real path) and
+#    every hook's `command` path is an absolute path to an existing
+#    executable file whose real path is the user's agent-director install
+#    (the binary the agent-director client runs:
+#    ~/.agent-director/bin/agent-director when present, else agent-director
+#    on PATH), outside the customer's node_modules.
+# 4. CSCB's hooks, from <claude_config_dir>/settings.json: every hook's
+#    `command` path is an absolute path to an existing executable file.
+#    Exactly one command is managed (names slack-reply-guard.sh, the SR-3.7
+#    recognition rule): a shell-form Stop hook of two words, the installed
+#    package's stop-hooks/slack-reply-guard.sh (by real path) and
 #    <state dir>/reply-guard, where the persona's record reads `true`. Run
 #    through sh exactly as written, with no input, it exits 0 (the guard
 #    fails open on empty input; a command the shell cannot run exits 126 or
@@ -59,8 +67,8 @@
 # An exit hook (on pass and on failure) kills the persona's tmux session and
 # removes stub-claude's transcripts; the agent-director row is left to the
 # ephemeral container (as Test 10). Like Test 10's, this live start's sweep
-# deletes every `service=cscb` row of a persona not in this config. Expected
-# runtime: under a minute.
+# kills the live rows of personas not in this config and records their keys
+# as retired; it deletes no row. Expected runtime: under a minute.
 set -euo pipefail
 
 TEST_NAME="test-12-bot-hook-absoluteness"
@@ -72,7 +80,8 @@ FIXTURES="$(realpath "$(dirname "$0")")/fixtures"
 # --- Bounds (seconds) ------------------------------------------------------
 STUB_WAIT_S=20     # the stub writing its ready file
 START_WAIT_S=120   # the start pass: one bring-up and one launch
-PROC_WAIT_S=15     # the persona's claude being the one process with its IDs
+TRANSCRIPT_WAIT_S=60  # after the start pass: the dialog approver's Enter and SessionStart
+PROC_WAIT_S=15    # the persona's claude being the one process with its IDs
 
 # --- Prerequisites ---------------------------------------------------------
 for tool in bun tmux agent-director jq realpath; do
@@ -178,14 +187,19 @@ MANAGED_MARKER='slack-reply-guard.sh'
 # their argv; when exactly one does, write its <json> to <out-dir>/settings.json
 # and its CLAUDE_CONFIG_DIR (empty when unset) to <out-dir>/claude-config-dir.
 #
-# hooks.py list <settings-file>: one line per hook command (type "command";
+# hooks.py list <settings-file>: one line per command hook (type "command";
 # other hook types carry no path) of the file's `hooks` block, fields joined
-# by the ASCII unit separator: index, event, managed (1 when the command holds
-# slack-reply-guard.sh), word count, first word, second word. Exits 1 with a
-# reason on stderr for a file that is not the settings shape or a command a
-# shell cannot split.
+# by the ASCII unit separator: index, event, form, managed (1 when the
+# `command` holds slack-reply-guard.sh), word count, `command` path, second
+# word. An entry with an `args` list is form `exec`: its words are `command`,
+# verbatim and never split, then each of `args`. An entry without `args` is
+# form `shell`: its words are `command` as a shell splits it. Exits 1 with a
+# reason on stderr for a file that is not the settings shape (an `args` that
+# is not a list of strings among them) or a shell-form command a shell cannot
+# split.
 #
-# hooks.py raw <settings-file> <index>: print hook command <index> verbatim.
+# hooks.py raw <settings-file> <index>: print command hook <index>'s
+# `command` verbatim.
 HOOKS_PY="${SCENARIO_ROOT}/hooks.py"
 cat > "${HOOKS_PY}" << 'EOF'
 import json, os, shlex, sys
@@ -268,23 +282,35 @@ def commands(path):
                 command = hook.get("command")
                 if not isinstance(command, str):
                     die("%s: a hooks.%s command hook has no command string" % (path, event))
-                out.append((event, command))
+                args = None
+                if "args" in hook:
+                    args = hook["args"]
+                    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+                        die("%s: a hooks.%s command hook's `args` is not a list of strings" % (path, event))
+                out.append((event, command, args))
     return out
 
 
 def list_hooks(path):
-    for index, (event, command) in enumerate(commands(path)):
-        try:
-            words = shlex.split(command, posix=True)
-        except ValueError as e:
-            die("%s: hooks.%s command #%d is not shell words (%s)" % (path, event, index, e))
+    for index, (event, command, args) in enumerate(commands(path)):
+        if args is not None:
+            # Exec form: Claude Code runs `command` itself with `args`, no
+            # shell between, so the path is `command` verbatim.
+            form = "exec"
+            words = [command] + args
+        else:
+            form = "shell"
+            try:
+                words = shlex.split(command, posix=True)
+            except ValueError as e:
+                die("%s: hooks.%s command #%d is not shell words (%s)" % (path, event, index, e))
         for text in [event] + words[:2]:
             if SEP in text or "\n" in text:
                 die("%s: hooks.%s command #%d holds a separator or newline" % (path, event, index))
         first = words[0] if words else ""
         second = words[1] if len(words) > 1 else ""
         managed = "1" if MARKER in command else "0"
-        print(SEP.join([str(index), event, managed, str(len(words)), first, second]))
+        print(SEP.join([str(index), event, form, managed, str(len(words)), first, second]))
 
 
 def raw(path, index):
@@ -313,13 +339,23 @@ list_hooks() {
     python3 "${HOOKS_PY}" list "$1" > "$2" || fail "$3: could not list the hook commands of $1"
 }
 
-# check_first_word <step> <word>: an absolute path to an existing,
-# executable regular file.
-check_first_word() {
-    local step="$1" word="$2"
-    [[ "${word}" == /* ]] || fail "${step}: first word '${word}' is not an absolute path"
-    [[ -f "${word}" ]] || fail "${step}: ${word} is not an existing file"
-    [[ -x "${word}" ]] || fail "${step}: ${word} is not executable"
+# check_command_path <step> <path>: a hook's `command` path is an absolute
+# path to an existing, executable regular file.
+check_command_path() {
+    local step="$1" path="$2"
+    [[ "${path}" == /* ]] || fail "${step}: command path '${path}' is not an absolute path"
+    [[ -f "${path}" ]] || fail "${step}: ${path} is not an existing file"
+    [[ -x "${path}" ]] || fail "${step}: ${path} is not executable"
+}
+
+# True when <dir> holds a non-empty transcript (stub-claude writes its one
+# line in a single write, so a non-empty file is a whole one).
+has_transcript() {
+    local f
+    for f in "$1"/*.jsonl; do
+        [[ -s "${f}" ]] && return 0
+    done
+    return 1
 }
 
 # True when <dir> holds at least one transcript and every transcript in it
@@ -411,7 +447,12 @@ expect_count "${BOOTSTRAP_LINE}" 0 "start: stop-hook-bootstrap skip or failure l
 n="$(count_in "${SLACK_STATE_DIR}/startup-errors.log" "${BOOTSTRAP_ERROR_CLASS}")"
 [[ "${n}" == 0 ]] || fail "start: ${n} stop-hook-bootstrap record(s) in startup-errors.log"
 
-[[ -d "${TRANSCRIPTS}" ]] || fail "start: no transcript directory ${TRANSCRIPTS}: the launched claude did not write one"
+# The dialog approver runs after the launch returns, so the start pass ends
+# before the launched claude's SessionStart writes its transcript: wait for
+# it.
+wait_until "${TRANSCRIPT_WAIT_S}" \
+    "start: no transcript in ${TRANSCRIPTS}: the launched claude did not write one" \
+    has_transcript "${TRANSCRIPTS}"
 stub_transcripts_only "${TRANSCRIPTS}" \
     || fail "start: ${TRANSCRIPTS} holds no transcript with stub-claude's session marker: the launched claude was not the stub"
 
@@ -427,7 +468,7 @@ list_hooks "${AD_SETTINGS}" "${AD_HOOKS}" "agent-director hooks"
 ad_total=0
 ad_session_start=0
 ad_permission_request=0
-while IFS="${SCENARIO_SEP}" read -r index event managed nwords first _; do
+while IFS="${SCENARIO_SEP}" read -r index event _ managed nwords path _; do
     step="agent-director hooks: ${event} command #${index}"
     ad_total=$(( ad_total + 1 ))
     case "${event}" in
@@ -436,12 +477,12 @@ while IFS="${SCENARIO_SEP}" read -r index event managed nwords first _; do
     esac
     (( nwords >= 1 )) || fail "${step}: the command is empty"
     [[ "${managed}" == 0 ]] || fail "${step}: agent-director's settings name ${MANAGED_MARKER}"
-    check_first_word "${step}" "${first}"
-    real="$(realpath -e -- "${first}")" || fail "${step}: ${first} does not resolve"
+    check_command_path "${step}" "${path}"
+    real="$(realpath -e -- "${path}")" || fail "${step}: ${path} does not resolve"
     [[ "${real}" == "${AD_REAL}" ]] \
-        || fail "${step}: ${first} resolves to ${real}, not the agent-director install ${AD_REAL}"
+        || fail "${step}: ${path} resolves to ${real}, not the agent-director install ${AD_REAL}"
     [[ "${real}/" != "${NODE_MODULES_REAL}/"* ]] \
-        || fail "${step}: ${first} lies inside the customer's node_modules"
+        || fail "${step}: ${path} lies inside the customer's node_modules"
 done < "${AD_HOOKS}"
 (( ad_total > 0 )) || fail "agent-director hooks: the --settings JSON holds no hook command"
 (( ad_session_start > 0 )) || fail "agent-director hooks: no SessionStart hook command"
@@ -452,20 +493,21 @@ done < "${AD_HOOKS}"
 list_hooks "${CLAUDE_SETTINGS}" "${CSCB_HOOKS}" "reply guard"
 guard_count=0
 guard_index=""
-while IFS="${SCENARIO_SEP}" read -r index event managed nwords first second; do
+while IFS="${SCENARIO_SEP}" read -r index event form managed nwords path second; do
     step="reply guard: ${event} command #${index} of ${CLAUDE_SETTINGS}"
     (( nwords >= 1 )) || fail "${step}: the command is empty"
-    check_first_word "${step}" "${first}"
+    check_command_path "${step}" "${path}"
     if [[ "${managed}" != 1 ]]; then
         continue
     fi
     guard_count=$(( guard_count + 1 ))
     guard_index="${index}"
     [[ "${event}" == Stop ]] || fail "${step}: the managed command is not a Stop hook"
+    [[ "${form}" == shell ]] || fail "${step}: the managed command carries an args list, not a shell-form command"
     [[ "${nwords}" == 2 ]] || fail "${step}: the managed command has ${nwords} words, not the guard and the record dir"
-    real="$(realpath -e -- "${first}")" || fail "${step}: ${first} does not resolve"
+    real="$(realpath -e -- "${path}")" || fail "${step}: ${path} does not resolve"
     [[ "${real}" == "${GUARD_REAL}" ]] \
-        || fail "${step}: ${first} resolves to ${real}, not the installed package's ${GUARD_REAL}"
+        || fail "${step}: ${path} resolves to ${real}, not the installed package's ${GUARD_REAL}"
     [[ "${second}" == "${RECORD_DIR}" ]] \
         || fail "${step}: the record dir is '${second}', not ${RECORD_DIR}"
 done < "${CSCB_HOOKS}"

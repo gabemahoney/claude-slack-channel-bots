@@ -5,7 +5,12 @@
 # (/opt/agent-director-rc/check/rc-client-check.sh --package) replaces the
 # agent-director client the installed package resolves with the release
 # candidate's and checks it; a failed check ends the test with one FAIL line
-# carrying the check's ERROR line. Tests 2 onward use this install.
+# carrying the check's ERROR line. Then the Phase 1 class check
+# (fixtures/phase1-client-check.ts, run with bun and CSCB_PKG_DIR set to the
+# installed package) checks that the installed package uses the swapped-in
+# client's own Phase 1 error classes; a failed check ends the test with one
+# FAIL line naming the fixture's first failing check, and a passed one logs
+# the fixture's PASS line. Tests 2 onward use this install.
 #
 # The config is a persona config (b.av2 SR-13.5): persona "alpha" in two
 # channels (delivery all, prompts to the first), and the zero-channel persona
@@ -22,6 +27,7 @@ STATE_DIR="${HOME}/.claude/channels/slack"
 LOG="${STATE_DIR}/server.log"
 PID_FILE="${STATE_DIR}/server.pid"
 CLI="./node_modules/.bin/claude-slack-channel-bots"
+FIXTURES="$(realpath "$(dirname "$0")")/fixtures"
 
 # The SR-1.7 conversion error for a "routes" key (src/config.ts
 # prePersonaConversionMessage), as the server logs it.
@@ -48,6 +54,22 @@ if ! RC_CHECK_OUT=$("${RC_CLIENT_CHECK}" --package "${INSTALLED_PKG}" 2>/tmp/tes
     fail "the release-candidate client check on ${INSTALLED_PKG} failed: ${RC_CHECK_ERR:-no ERROR line (see /tmp/test-1-rc-client-check.err)}"
 fi
 echo "${RC_CHECK_OUT}"
+
+# --- The Phase 1 class check on the installed package ---------------------
+# The fixture imports the installed package's error modules and the
+# agent-director client that package resolves (the release candidate's, just
+# swapped in) and checks that the package uses the client's own Phase 1
+# classes. Its FAIL lines go to a file, so the runner's verdict is this test's
+# FAIL line, which names the fixture's first failing check.
+PHASE1_CHECK="${FIXTURES}/phase1-client-check.ts"
+test -f "${PHASE1_CHECK}" \
+    || fail "fixture ${PHASE1_CHECK} missing"
+if ! PHASE1_OUT=$(CSCB_PKG_DIR="${INSTALLED_PKG}" bun "${PHASE1_CHECK}" 2>/tmp/test-1-phase1-client-check.err); then
+    PHASE1_FIRST=$(grep -m 1 '^FAIL: ' /tmp/test-1-phase1-client-check.err || true)
+    PHASE1_FIRST="${PHASE1_FIRST#FAIL: }"
+    fail "the Phase 1 class check on ${INSTALLED_PKG} failed: ${PHASE1_FIRST:-no FAIL line (see /tmp/test-1-phase1-client-check.err)}"
+fi
+echo "${PHASE1_OUT}"
 
 test -x "${CLI}" \
     || fail "binary ${CLI} not installed or not executable"

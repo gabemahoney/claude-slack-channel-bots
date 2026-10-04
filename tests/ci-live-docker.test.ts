@@ -90,8 +90,20 @@
  *   install is Claude Code's) and runs `--client` on that global client after
  *   staging its binary, stopping the build on failure; test-1 runs
  *   `--package` on the package it installed into /test-repo right after the
- *   install, failing the test on failure. The check's path is imported, never
- *   typed.
+ *   install, failing the test on failure, then, before its other steps, runs
+ *   the Phase 1 class-check fixture (`fixtures/phase1-client-check.ts`) with
+ *   bun on that package, failing the test with the fixture's first FAIL line.
+ *   The check's path is imported, never typed;
+ * - `Dockerfile.live` pins Claude Code: one `ARG CLAUDE_CODE_VERSION=`
+ *   declaration, assigned nowhere else, a plain major.minor.patch release at
+ *   or above `MIN_CLAUDE_CODE_VERSION` (imported from
+ *   `test-helpers/agent-director-versions.ts`) by numeric order, part by
+ *   part, never string order, and its one Claude Code install is
+ *   `npm install -g` at that build-arg (no unpinned or "latest" install); a
+ *   pin one patch below the minimum, a missing, repeated or unparseable
+ *   declaration and an unpinned install are each refused, never skipped.
+ *   `buildImageArgs` passes no Claude Code build-arg, so the pin is what is
+ *   built. No Claude Code version is written in this file.
  *
  * Nothing here runs docker: spawns go to a recording fake. The wiring that
  * lives in `ci-live/runtime/` and `ci-live/main.ts` (which load
@@ -138,6 +150,7 @@ import { CHILD_ENV_ALLOWLIST, minimalChildEnv, type ProcResult, type SpawnOption
 import { isLiveRunnerPid, lockHolder, lockPid, nodeLockDeps, RunLock, type LockDeps } from '../ci-live/lib/run-lock.ts'
 import { RC_CLIENT_CHECK, RC_CLIENT_CHECK_SOURCE } from '../ci-live/lib/rc-client.ts'
 import { NotRunnableError } from '../ci-live/lib/secrets.ts'
+import { MIN_CLAUDE_CODE_VERSION } from './test-helpers/agent-director-versions.ts'
 import { balancedAfter, callArguments, callsOf, indicesOf, objectProperties, onlyCallArguments, splitTopLevel, stripComments } from './test-helpers/source-audit.ts'
 import { APP_TOKEN_PREFIX, assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL } from './test-helpers/credentials.ts'
 
@@ -1868,9 +1881,14 @@ function repoFile(rel: string): string {
 
 /** A Dockerfile's instructions: comment and blank lines dropped, continuation lines joined. */
 function dockerInstructions(rel: string): string[] {
+  return instructionsOf(repoFile(rel))
+}
+
+/** The instructions of a Dockerfile's (or script's) text, as {@link dockerInstructions} reads them. */
+function instructionsOf(text: string): string[] {
   const out: string[] = []
   let current = ''
-  for (const line of repoFile(rel).split('\n')) {
+  for (const line of text.split('\n')) {
     const body = line.trim()
     if (body.startsWith('#') || body === '') continue
     if (body.endsWith('\\')) {
@@ -2180,6 +2198,156 @@ describe('the client under test (source audit)', () => {
     // A failed check fails the test.
     const fi = lines.indexOf('fi', at)
     expect(lines.slice(at + 1, fi).filter((l) => /^fail\s/.test(l)).length).toBe(1)
+  })
+
+  test("test-1 runs the Phase 1 class-check fixture with bun on the same installed package directly after the RC_CLIENT_CHECK --package check and before its other steps, and fails the test with the fixture's first FAIL line when it fails", () => {
+    const lines = dockerInstructions(TEST_1)
+    const helper = lines.findIndex((l) => /^if ! /.test(l) && l.includes(' --package '))
+    expect(helper).toBeGreaterThan(0)
+    const helperFi = lines.indexOf('fi', helper)
+    const helperPkg = /\s--package "?([^\s")]+)"?/.exec(lines[helper]!)![1]!
+
+    // Exactly one run of the fixture, on the package the check swapped the client into.
+    const runRe = /^if ! (?:\w+=\$\()?CSCB_PKG_DIR="?([^\s"]+)"? bun "?([^\s")]+)"? 2>(\S+)\); then$/
+    const runs = lines.flatMap((l, i) => runRe.test(l) ? [i] : [])
+    expect(runs.length).toBe(1)
+    const at = runs[0]!
+    const [, pkgDir, fixture, errFile] = runRe.exec(lines[at]!)!
+    expect(pkgDir).toBe(helperPkg)
+
+    // The fixture path resolves, beside test-1, to the fixture file.
+    expect(lines).toContain('FIXTURES="$(realpath "$(dirname "$0")")/fixtures"')
+    const vars = new Map([['FIXTURES', join(REPO, dirname(TEST_1), 'fixtures')]])
+    for (const line of lines.slice(0, at)) {
+      const m = /^([A-Z_][A-Z0-9_]*)="?((?:[^"$`()\\]|\$\{\w+\})*)"?$/.exec(line)
+      if (m && m[1] !== 'FIXTURES') vars.set(m[1]!, expand(m[2]!, vars))
+    }
+    const fixturePath = join(REPO, 'tests', 'integration', 'fixtures', 'phase1-client-check.ts')
+    expect(expand(fixture!, vars)).toBe(fixturePath)
+    expect(statSync(fixturePath).isFile()).toBe(true)
+
+    // Order: the check, then only its output, the fixture's path and its existence check, then the fixture, then test-1's other steps.
+    expect(at).toBeGreaterThan(helperFi)
+    expect(lines.slice(helperFi + 1, at).filter((l) => !/^(echo\s|[A-Z_][A-Z0-9_]*=|test -f\s)/.test(l))).toEqual([])
+    expect(at).toBeLessThan(lines.findIndex((l) => l.includes('"${CLI}"')))
+
+    // A failed fixture fails the test, its reason the fixture's first FAIL line, read from the file its stderr goes to.
+    const fi = lines.indexOf('fi', at)
+    const body = lines.slice(at + 1, fi)
+    expect(body.filter((l) => /^fail\s/.test(l)).length).toBe(1)
+    expect(body.filter((l) => l.includes(`grep -m 1 '^FAIL: ' ${errFile}`)).length).toBe(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Dockerfile.live's Claude Code pin (against MIN_CLAUDE_CODE_VERSION)
+// ---------------------------------------------------------------------------
+
+/** The build-arg that pins Dockerfile.live's Claude Code. */
+const CLAUDE_CODE_ARG = 'CLAUDE_CODE_VERSION'
+
+/** The one Claude Code install Dockerfile.live may run: the pinned build-arg's version. */
+const PINNED_CLAUDE_CODE_INSTALL = `npm install -g "@anthropic-ai/claude-code@\${${CLAUDE_CODE_ARG}}"`
+
+/** A plain major.minor.patch release's parts as numbers, or null. */
+function releaseParts(version: string): [number, number, number] | null {
+  const m = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(version)
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null
+}
+
+/** Whether plain release `version` is at or above plain release `min`, part by part as numbers (never as strings). */
+function releaseAtLeast(version: string, min: string): boolean {
+  const [v, floor] = [releaseParts(version), releaseParts(min)]
+  if (v === null || floor === null) throw new Error(`not a plain major.minor.patch release: ${JSON.stringify(v === null ? version : min)}`)
+  for (let i = 0; i < 3; i++) if (v[i] !== floor[i]) return v[i]! > floor[i]!
+  return true
+}
+
+/**
+ * What is wrong with a Dockerfile text's Claude Code pin against `min`: empty
+ * when it declares `ARG CLAUDE_CODE_VERSION=<release>` once (and assigns the
+ * build-arg nowhere else), the release is plain major.minor.patch and at or
+ * above `min`, and its only Claude Code install is {@link PINNED_CLAUDE_CODE_INSTALL}.
+ */
+function claudeCodePinProblems(text: string, min: string): string[] {
+  const problems: string[] = []
+  const instructions = instructionsOf(text)
+  const isDeclaration = (i: string): boolean => new RegExp(`^ARG\\s+${CLAUDE_CODE_ARG}(?:[=\\s]|$)`).test(i)
+  const declarations = instructions.filter(isDeclaration)
+  const overrides = instructions.filter((i) => !isDeclaration(i) && new RegExp(`\\b${CLAUDE_CODE_ARG}=`).test(i))
+  if (declarations.length !== 1) problems.push(`${declarations.length} ARG ${CLAUDE_CODE_ARG} declarations, not one`)
+  else if (overrides.length > 0) problems.push(`${CLAUDE_CODE_ARG} is assigned outside its ARG: ${JSON.stringify(overrides.map((i) => i.slice(0, 80)))}`)
+  else {
+    const value = new RegExp(`^ARG\\s+${CLAUDE_CODE_ARG}=(\\S+)$`).exec(declarations[0]!)?.[1]
+    if (value === undefined || releaseParts(value) === null) problems.push(`${declarations[0]} declares no plain major.minor.patch release`)
+    else if (!releaseAtLeast(value, min)) problems.push(`${CLAUDE_CODE_ARG} ${value} is below ${min}`)
+  }
+  const installs = shellStatements(instructions.filter((i) => i.startsWith('RUN ')))
+    .filter((s) => /claude-code|claude\.ai\/install|\bclaude\s+(?:install|update)\b/.test(s))
+  if (installs.length !== 1 || installs[0] !== PINNED_CLAUDE_CODE_INSTALL) problems.push(`Claude Code installs ${JSON.stringify(installs)}, not only ${PINNED_CLAUDE_CODE_INSTALL}`)
+  return problems
+}
+
+/** `version` one patch below, derived from it. */
+function onePatchBelow(version: string): string {
+  const parts = releaseParts(version)
+  if (parts === null || parts[2] === 0) throw new Error(`${JSON.stringify(version)} has no release one patch below it`)
+  return `${parts[0]}.${parts[1]}.${parts[2] - 1}`
+}
+
+describe("Dockerfile.live's Claude Code pin", () => {
+  const MIN = MIN_CLAUDE_CODE_VERSION
+  const live = (): string => repoFile(LIVE_DOCKERFILE)
+  /** The value of Dockerfile.live's one ARG CLAUDE_CODE_VERSION declaration. */
+  const pinnedValue = (): string => {
+    const values = [...live().matchAll(new RegExp(`^ARG ${CLAUDE_CODE_ARG}=(\\S+)$`, 'gm'))].map((m) => m[1]!)
+    expect(values.length).toBe(1)
+    return values[0]!
+  }
+  /** Dockerfile.live's text with its declaration's value replaced by `value`. */
+  const withPin = (value: string): string => live().replace(`ARG ${CLAUDE_CODE_ARG}=${pinnedValue()}`, `ARG ${CLAUDE_CODE_ARG}=${value}`)
+
+  test('Dockerfile.live declares CLAUDE_CODE_VERSION once, a plain release at or above MIN_CLAUDE_CODE_VERSION, and installs Claude Code only at it; a pin one patch below MIN_CLAUDE_CODE_VERSION is refused', () => {
+    expect(releaseParts(MIN)).not.toBeNull()
+    expect(claudeCodePinProblems(live(), MIN)).toEqual([])
+
+    // Negative control: one patch below the constant, derived from it, is refused, by the comparison and as Dockerfile.live's pin.
+    const below = onePatchBelow(MIN)
+    expect(releaseAtLeast(below, MIN)).toBe(false)
+    expect(claudeCodePinProblems(withPin(below), MIN)).toEqual([`${CLAUDE_CODE_ARG} ${below} is below ${MIN}`])
+  })
+
+  test('the comparison is numeric, part by part, never string order', () => {
+    const [major, minor, patch] = releaseParts(MIN)!
+    // A patch with more digits: above MIN as numbers, below it as strings.
+    const longerPatch = `${major}.${minor}.${10 ** String(patch).length}`
+    expect(longerPatch < MIN).toBe(true)
+    expect(releaseAtLeast(longerPatch, MIN)).toBe(true)
+    expect(claudeCodePinProblems(withPin(longerPatch), MIN)).toEqual([])
+    expect(releaseAtLeast(MIN, longerPatch)).toBe(false)
+    expect(releaseAtLeast(MIN, MIN)).toBe(true)
+    expect(releaseAtLeast(`${major}.${minor + 1}.0`, MIN)).toBe(true)
+    expect(releaseAtLeast(`${major + 1}.0.0`, MIN)).toBe(true)
+    expect(releaseAtLeast(`${major - 1}.${minor + 1}.${patch + 1}`, MIN)).toBe(false)
+  })
+
+  test.each([
+    ['no declaration', (text: string) => text.replace(new RegExp(`^ARG ${CLAUDE_CODE_ARG}=\\S+\\n`, 'm'), ''), '0 ARG CLAUDE_CODE_VERSION declarations, not one'],
+    ['a declaration with no value', (text: string) => text.replace(new RegExp(`^ARG ${CLAUDE_CODE_ARG}=\\S+$`, 'm'), `ARG ${CLAUDE_CODE_ARG}`), `ARG ${CLAUDE_CODE_ARG} declares no plain major.minor.patch release`],
+    ['"latest"', (text: string) => text.replace(new RegExp(`^ARG ${CLAUDE_CODE_ARG}=\\S+$`, 'm'), `ARG ${CLAUDE_CODE_ARG}=latest`), `ARG ${CLAUDE_CODE_ARG}=latest declares no plain major.minor.patch release`],
+    ['a pre-release value', (text: string) => text.replace(new RegExp(`^(ARG ${CLAUDE_CODE_ARG}=\\S+)$`, 'm'), '$1-beta.1'), 'declares no plain major.minor.patch release'],
+    ['two declarations', (text: string) => text.replace(new RegExp(`^(ARG ${CLAUDE_CODE_ARG}=\\S+)$`, 'm'), '$1\n$1'), '2 ARG CLAUDE_CODE_VERSION declarations, not one'],
+    ['an override inside the RUN', (text: string) => text.replace(PINNED_CLAUDE_CODE_INSTALL, `${CLAUDE_CODE_ARG}=latest; ${PINNED_CLAUDE_CODE_INSTALL}`), 'CLAUDE_CODE_VERSION is assigned outside its ARG'],
+    ['an unpinned install', (text: string) => text.replace(PINNED_CLAUDE_CODE_INSTALL, 'npm install -g @anthropic-ai/claude-code'), 'Claude Code installs ["npm install -g @anthropic-ai/claude-code"]'],
+    ['a "latest" install', (text: string) => text.replace(PINNED_CLAUDE_CODE_INSTALL, 'npm install -g "@anthropic-ai/claude-code@latest"'), 'Claude Code installs ["npm install -g \\"@anthropic-ai/claude-code@latest\\""]'],
+    ['a second, unpinned install', (text: string) => text.replace(PINNED_CLAUDE_CODE_INSTALL, `${PINNED_CLAUDE_CODE_INSTALL}; claude update`), 'Claude Code installs ['],
+    ['no install', (text: string) => text.replace(`${PINNED_CLAUDE_CODE_INSTALL}; \\`, '\\'), 'Claude Code installs [], not only'],
+  ])('a pin with %s is refused, never skipped', (_name, mutate, problem) => {
+    const mutated = mutate(live())
+    expect(mutated).not.toBe(live())
+    const problems = claudeCodePinProblems(mutated, MIN)
+    expect(problems.length).toBe(1)
+    expect(problems[0]).toContain(problem)
   })
 })
 

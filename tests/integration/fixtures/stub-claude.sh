@@ -1,43 +1,59 @@
 #!/usr/bin/env bash
-# stub-claude.sh — a fake `claude` binary for the b.vub integration test
-# (test-4-resume-dialog).
+# stub-claude.sh — a fake `claude` binary for the integration tests that launch
+# a real bot through agent-director and tmux (Test 4, Test 10 and Test 12).
 #
-# WHY THIS EXISTS
-# ---------------
-# b.vub shipped because every integration test ran under SLACK_DRY_RUN=1, so a
-# real bot was never spawned, never hit the real --dangerously-load-development-
-# channels dialog, and was never resumed. test-4 exercises the real
-# agent-director + real tmux spawn/resume path, but we do NOT want to burn the
-# live Anthropic API (or depend on a model) just to prove CSCB drives the
-# dialog. This stub stands in for `claude` on PATH.
+# Each of those tests copies this file first on PATH as `claude`, so the real
+# agent-director and tmux launch path runs without the Anthropic API or a
+# model. agent-director starts `claude` in a tmux pane with at least two argv
+# elements, so no shell stands between tmux and this script: the stub's own
+# process is the pane's main process.
 #
-# BEHAVIOR (mimics the pre-SessionStart handshake agent-director relies on)
-# ------------------------------------------------------------------------
-#   1. Print the EXACT dev-channels warning dialog, including the needle
+# BEHAVIOR
+# --------
+#   1. Print the exact dev-channels warning dialog, including the needle
 #      "I am using this for local development" that CSCB's approver matches
-#      (src/session-manager.ts:DEV_CHANNELS_DIALOG_NEEDLE, kept byte-identical
-#      to tests/fixtures/dev-channels-pane-2.1.120.txt).
-#   2. Block on stdin. agent-director spawned us inside a tmux pane; CSCB's
-#      approvePreSessionDialogs sends a bare Enter via `agent-director send-keys`
-#      when it sees the needle. Enter arrives here as a line on stdin.
-#   3. On that first line, fire the SessionStart lifecycle hook exactly as real
-#      Claude Code would — by extracting the hook command agent-director injected
-#      into our own `--settings` arg and piping a SessionStart payload into it.
-#      agent-director derives the row's session_id from the hook's
-#      `transcript_path` basename, so we write a real (minimal) transcript
-#      JSONL at Claude Code's canonical location and point transcript_path at
-#      it. That makes a later `claude --resume <session_id>` possible AND flips
-#      the agent-director row pending -> waiting.
-#   4. Replace the dialog with a live-session banner and keep reading stdin so
-#      the process (and its tmux pane) stays alive in the `waiting` state.
+#      (src/session-manager.ts:DEV_CHANNELS_DIALOG_NEEDLE, byte-identical to
+#      tests/fixtures/dev-channels-pane-2.1.120.txt).
+#   2. Block on stdin. CSCB's approver sends a bare Enter through
+#      `agent-director send-keys` when it sees the needle; Enter arrives here
+#      as a line on stdin.
+#   3. On that first line, write a minimal transcript JSONL at Claude Code's
+#      canonical location and fire every SessionStart hook the `--settings`
+#      JSON registers. agent-director derives the row's session_id from the
+#      payload's `transcript_path` basename, so a later
+#      `claude --resume <session_id>` finds that transcript.
+#   4. Print a live-session banner and keep reading stdin, so the process and
+#      its tmux pane stay alive. Further lines are ignored.
+#   5. On the sentinel line, fire every SessionEnd hook the `--settings` JSON
+#      registers and exit.
 #
-# RESUME LAP
-# ----------
-# agent-director resume re-execs `claude --resume <session_id> …`. We detect the
-# --resume arg, reuse that session_id (and its existing transcript), re-print the
-# dialog, and repeat the handshake. That second lap is the b.vub regression:
-# pre-fix, CSCB's resume-success path never ran the approver, so the dialog stuck
-# forever and the launcher fell into an ErrTmuxSessionCreate respawn loop.
+# HOOK FIRING
+# -----------
+# agent-director applies a hook only when the hook's parent process is the
+# pane's recorded main process, so every hook runs as a direct child of this
+# script's process: the script runs the hook's argv as a simple command, with
+# the payload on stdin by redirect from a file, never through `sh -c`, `eval`,
+# a subshell, a pipeline or a command substitution.
+#
+#   - Every group of the event and every `"type": "command"` entry in it is
+#     fired, in the order `--settings` lists them.
+#   - An entry with an `args` array (exec form) runs `command` verbatim with
+#     those `args`.
+#   - An entry with no `args` (shell form) runs the words of its `command`.
+#   - An entry's `timeout` is not acted on: each hook runs until it exits.
+#   - The payload carries `hook_event_name`, `session_id`, `cwd`,
+#     `transcript_path` and `source` (SessionStart) or `reason` (SessionEnd),
+#     and no `agent_id`.
+#
+# The entries are read once, at start-up, into one flat array per event: for
+# each entry its argv length, then its argv elements.
+#
+# RESUME
+# ------
+# agent-director resume re-execs `claude --resume <session_id> …`. The stub
+# reuses that session_id and its transcript, prints the dialog again and
+# repeats the handshake, so the approver must answer the resumed launch's
+# dialog too.
 set -uo pipefail
 
 # ---------------------------------------------------------------------------
@@ -81,22 +97,37 @@ ensure_transcript() {
 }
 
 # ---------------------------------------------------------------------------
-# Extract the SessionStart / SessionEnd hook commands agent-director injected
-# into --settings. Firing these is how we deterministically move the AD row
-# (pending→waiting on SessionStart, waiting→ended on SessionEnd) — pure DB
-# writes, no /proc probe (b.vub: find-missing is unreliable under Linux/gosu).
-# A hook entry may carry its arguments in a separate `args` array (agent-director
-# 0.11.0 injects `"command": "<binary>", "args": ["hook"]`); Claude Code runs
-# the command with those arguments, so the stub appends them too.
+# Registered hooks. HOOK_ARGV_JQ emits, for each `"type": "command"` entry of
+# event $ev in every group, the entry's argv length and then its argv
+# elements, each NUL-terminated. HOOK_FILE holds jq's output while it is read
+# into the event's array, and later the payload a hook reads on stdin; it lives
+# outside the transcript directory.
 # ---------------------------------------------------------------------------
-HOOK_CMD_JQ='select(.command) | [.command] + (.args // []) | join(" ")'
-START_HOOK_CMD=""
-END_HOOK_CMD=""
+# shellcheck disable=SC2016 # $s and $ev are jq variables, not shell ones.
+HOOK_ARGV_JQ='
+  $s | objects | .hooks | objects | .[$ev] | arrays | .[]
+  | objects | .hooks | arrays | .[]
+  | objects | select(.type == "command" and (.command | type) == "string")
+  | if (.args | type) == "array"
+    then [.command] + [.args[] | tostring]
+    else [.command | splits("[ \t\n]+") | select(length > 0)]
+    end
+  | select(length > 0)
+  | "\(length)\u0000" + (map(. + "\u0000") | join(""))
+'
+HOOK_FILE="${TMPDIR:-/tmp}/stub-claude-hook-$$"
+START_HOOKS=()
+END_HOOKS=()
 if [[ -n "${SETTINGS_JSON}" ]]; then
-    START_HOOK_CMD=$(printf '%s' "${SETTINGS_JSON}" \
-        | jq -r ".hooks.SessionStart[0].hooks[0] | ${HOOK_CMD_JQ}" 2>/dev/null || true)
-    END_HOOK_CMD=$(printf '%s' "${SETTINGS_JSON}" \
-        | jq -r ".hooks.SessionEnd[0].hooks[0] | ${HOOK_CMD_JQ}" 2>/dev/null || true)
+    if jq -nj --argjson s "${SETTINGS_JSON}" --arg ev SessionStart \
+        "${HOOK_ARGV_JQ}" > "${HOOK_FILE}" 2>/dev/null; then
+        mapfile -d '' -t START_HOOKS < "${HOOK_FILE}"
+    fi
+    if jq -nj --argjson s "${SETTINGS_JSON}" --arg ev SessionEnd \
+        "${HOOK_ARGV_JQ}" > "${HOOK_FILE}" 2>/dev/null; then
+        mapfile -d '' -t END_HOOKS < "${HOOK_FILE}"
+    fi
+    rm -f "${HOOK_FILE}"
 fi
 
 # Sentinel line the driver sends via `agent-director send-keys` to request a
@@ -104,20 +135,38 @@ fi
 # the resume lap's approval Enter never triggers an exit.
 SENTINEL="__CSCB_TEST_EXIT__"
 
+# fire_hooks <len> <argv…> [<len> <argv…> …]
+# Runs each argv as a direct child of this process, one after another, with
+# HOOK_FILE on stdin. A hook's exit status is not acted on.
+fire_hooks() {
+    local n
+    while (( $# > 0 )); do
+        n="$1"
+        shift
+        if [[ ! "${n}" =~ ^[0-9]+$ ]] || (( n < 1 || n > $# )); then
+            return 0
+        fi
+        "${@:1:n}" < "${HOOK_FILE}" >/dev/null 2>&1
+        shift "${n}"
+    done
+}
+
 fire_session_start() {
     ensure_transcript
-    if [[ -n "${START_HOOK_CMD}" ]]; then
+    if (( ${#START_HOOKS[@]} > 0 )); then
         printf '{"hook_event_name":"SessionStart","session_id":"%s","cwd":"%s","transcript_path":"%s","source":"startup"}\n' \
-            "${SESSION_ID}" "${REALCWD}" "${TRANSCRIPT}" \
-            | ${START_HOOK_CMD} >/dev/null 2>&1 || true
+            "${SESSION_ID}" "${REALCWD}" "${TRANSCRIPT}" > "${HOOK_FILE}" \
+            && fire_hooks "${START_HOOKS[@]}"
+        rm -f "${HOOK_FILE}"
     fi
 }
 
 fire_session_end() {
-    if [[ -n "${END_HOOK_CMD}" ]]; then
+    if (( ${#END_HOOKS[@]} > 0 )); then
         printf '{"hook_event_name":"SessionEnd","session_id":"%s","cwd":"%s","transcript_path":"%s","reason":"exit"}\n' \
-            "${SESSION_ID}" "${REALCWD}" "${TRANSCRIPT}" \
-            | ${END_HOOK_CMD} >/dev/null 2>&1 || true
+            "${SESSION_ID}" "${REALCWD}" "${TRANSCRIPT}" > "${HOOK_FILE}" \
+            && fire_hooks "${END_HOOKS[@]}"
+        rm -f "${HOOK_FILE}"
     fi
 }
 
@@ -143,11 +192,11 @@ DIALOG
 print_dialog
 
 # Read loop:
-#   - First non-sentinel line = the approver's dialog Enter → fire SessionStart
-#     (row → waiting) and show the live banner.
-#   - The sentinel line = the driver's clean-exit request → fire SessionEnd
-#     (row → ended, deterministically) and exit.
-#   - Any other line while live is ignored (keeps the pane alive at `waiting`).
+#   - First non-sentinel line = the approver's dialog Enter → fire the
+#     SessionStart hooks and show the live banner.
+#   - The sentinel line = the driver's clean-exit request → fire the
+#     SessionEnd hooks and exit.
+#   - Any other line while live is ignored (keeps the pane alive).
 approved=0
 while IFS= read -r line; do
     if [[ "${line}" == "${SENTINEL}" ]]; then

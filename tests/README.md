@@ -122,10 +122,9 @@ scratch HOME, every `homedir()` path lands in `$S`, never in the real
 ## Docker integration suite
 
 Bash scripts that install the packed package, write a persona config and
-start the server in dry run. Four scripts leave dry run: Test 4 runs its
-driver, which spawns under a stub `claude` and starts no server, Tests 10
-and 12 start a live server, against the loopback Slack stub, and Test 11
-runs its driver against real tmux, starting no server.
+start the server in dry run. Three scripts leave dry run: Test 4 runs its
+driver, which spawns under a stub `claude` and starts no server, and Tests 10
+and 12 start a live server, against the loopback Slack stub.
 `/ci` packs
 the package, builds the image from `docker/Dockerfile.test` (on the base in
 `docker/Dockerfile.test.base`, see `docker/README.md`) and runs `tests/runner.sh` inside it. The verdict is
@@ -146,10 +145,11 @@ only skip.
 ```
 tests/
   integration/
-    test-1-install-startup.sh      # b.j9i: install the package, then swap the release candidate's agent-director client into it and check it (rc-client-check.sh --package); a pre-persona config fails start; the persona config starts in dry run
+    test-1-install-startup.sh      # b.j9i: install the package, then swap the release candidate's agent-director client into it and check it (rc-client-check.sh --package),
+                                   # then run fixtures/phase1-client-check.ts on the installed package; a pre-persona config fails start; the persona config starts in dry run
     test-2-dryrun-spawn-skip.sh    # b.3hy: persona load line, per-persona dry-run spawn skip, /interject 404 and 503
     test-3-cozempic-restart.sh     # b.set: cozempic probe, stop --stop-bots per persona, clean restart
-    test-4-resume-dialog.sh        # no ticket: non-dry-run spawn, then resume past the dev-channels dialog (b.vub)
+    test-4-resume-dialog.sh        # no ticket: non-dry-run fresh and resumed launches held at the dev-channels dialog, each cleared by the dialog approver through agent-director on the `pending` row
     test-5-two-personas.sh         # E3/E4, dry run: two personas (one with a derived key) each log their own persona-start and cwd; /interject by name and key
     test-6-missing-working-dir.sh  # E5 (SR-6.4), dry run: a missing working dir, and a dangling claude_config_dir symlink, hold a persona down with no repeated line; each comes up once its dir exists
     test-7-dm-settings.sh          # E6/E7 (SR-1.2, SR-1.5), dry run: DMs switch and `dm` prompt destinations load; six invalid DM settings refuse the start
@@ -157,17 +157,20 @@ tests/
     test-9-reload-destructive-and-server-wide.sh
                                    # E13 dry-run leg (SR-8.6): a working_directory change gives one DESTRUCTIVE: line and touches one persona; a port change waits for the restart
     test-10-credentials-change.sh  # E13 (SR-8.3, SR-8.6), live against the Slack stub: a credentials change reconnects one persona on confirmation; handshake failure and refused change; leak counts
-    test-11-exact-tmux-targets.sh  # b.1ix: persona dev's raw tmux calls (probe, b.vub kill) touch slack_bot_dev only, never its prefix neighbour slack_bot_dev_2; its approver leg is stale (drives the removed raw approver path) and fails until retired
     test-12-bot-hook-absoluteness.sh
-                                   # b.cnu SR-8.2, b.2qu, live against the Slack stub: every hook command of an agent-director-launched persona is an absolute path to an existing executable; agent-director's run the user's agent-director install, the reply guard runs the installed package's script
+                                   # b.cnu SR-8.2, b.2qu, live against the Slack stub: every hook `command` path of an agent-director-launched persona is an absolute path to an existing executable
+                                   # (agent-director's exec-form `command` read verbatim, CSCB's shell-form Stop hook by its first word); agent-director's run the user's agent-director install,
+                                   # the reply guard runs the installed package's script
     lib/
       scenario.sh                  # shared helper sourced by Tests 5 onwards (see Scenario helper below)
     fixtures/
-      driver.ts                    # Test 4 driver: builds a one-persona config, calls spawnForPersona directly
-      exact-tmux-driver.ts         # Test 11 driver: runs one raw-tmux persona path against real tmux, with a stand-in agent-director
-      stub-claude.sh               # fake `claude` (Tests 4, 10 and 12): prints the dev-channels dialog, fires SessionStart
+      driver.ts                    # Test 4 driver: builds a one-persona config, calls spawnForPersona directly, then follows the persona's dialog approver through the package's seams
+                                   # (running when the launch returns, stops because the row went live, keeps the launch start); deletes no row
+      stub-claude.sh               # fake `claude` (Tests 4, 10 and 12): prints the dev-channels dialog; on Enter, and on its exit sentinel, fires every SessionStart, and SessionEnd,
+                                   # hook its `--settings` registers, as direct children of its own process (exec form: `command` with its `args`; shell form: the command's words)
       slack-stub-server.ts         # Tests 10 and 12 loopback Slack stub: Web API, apps.connections.open, Socket Mode WebSocket, JSONL record
-      phase1-client-check.ts       # against the agent-director client the installed package resolves: the package's Phase-1-only bindings and SRJ-103 classes are the client's own,
+      phase1-client-check.ts       # run by Test 1 on the installed package, after the client-under-test check
+                                   # against the agent-director client the installed package resolves: the package's Phase-1-only bindings and SRJ-103 classes are the client's own,
                                    # client-built errors classify by class, the description and predicate helpers hold; refuses to run without the image marker /etc/cscb-ci-image
                                    # (its pure checker is unit-tested in tests/phase1-client-check.test.ts)
     .shellcheckrc                  # lets shellcheck follow `source lib/scenario.sh` without -x
@@ -196,8 +199,7 @@ you change the script, update the testplan. Today that is Tests 1 to 3
 (`testplans/b.j9i`, `b.3hy`, `b.set`).
 
 A script with no ticket is specified by its header comment, and by its
-driver's where it has one (Test 4 and `fixtures/driver.ts`, Test 11 and
-`fixtures/exact-tmux-driver.ts`). Tests 5 to 12
+driver's where it has one (Test 4 and `fixtures/driver.ts`). Tests 5 to 12
 have no testplan ticket: each header comment lists what it checks, and the
 log fragments it expects are taken from `src/` (the function that writes
 each is named in the header or in a constants block near the top), so the
@@ -238,8 +240,9 @@ a config or credentials file from the host:
 `docker/entrypoint.sh` runs `tests/runner.sh` as `testuser`. The runner runs
 the scripts in its order (see Layout) in one container, so state one script
 leaves (the installed package, the running daemon, its PID file and server
-log) is consumed by the scripts after it: Test 1 installs the package and starts the
-daemon, Tests 2 and 3 use that daemon, Test 4 uses the installed package. The
+log) is consumed by the scripts after it: Test 1 installs the package, checks
+the agent-director client it resolves (`rc-client-check.sh --package`, then
+`fixtures/phase1-client-check.ts`) and starts the daemon, Tests 2 and 3 use that daemon, Test 4 uses the installed package. The
 runner stops at the first failure and runs nothing after it.
 
 Tests 5 onwards depend only on Test 1's install. Each runs its own server in
@@ -256,11 +259,6 @@ persona label is killed when live and kept). Every persona row an earlier
 script left behind is gone after Test 10's start, and Test 12's live start
 does the same to Test 10's rows; that is acceptable only because the
 container is ephemeral and the scripts run one at a time.
-
-Test 11 starts no server and makes no agent-director row: its driver's
-agent-director is a stand-in, and each case runs its own tmux server (its own
-`TMUX_TMPDIR` under the scenario's scratch root), so no other script's
-sessions are in its reach.
 
 ### Scenario helper
 

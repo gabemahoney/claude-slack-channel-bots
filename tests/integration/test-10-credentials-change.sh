@@ -22,8 +22,11 @@
 #    line each, no unreachable/refused/credentials line, the start pass ends
 #    with `0 not brought up`, and the stub recorded each persona's own
 #    auth.test and apps.connections.open (by token hash) and a WebSocket.
-#    Each working dir got a stub-claude transcript (its session marker), so
-#    the launched `claude` was the stub.
+#    The dialog approver runs after the launch returns, so the start pass
+#    does not wait for the launched claude's SessionStart: within
+#    TRANSCRIPT_WAIT_S of the start pass's end each working dir gets a
+#    transcript, and every transcript in it carries stub-claude's session
+#    marker, so the launched `claude` was the stub.
 # 2. Rewrite alpha's credentials file with a new token pair. The preview
 #    (config.json.pending and `reload-preview` lines) names alpha's
 #    credentials file only; for a full tick nothing connects with the new
@@ -58,8 +61,8 @@
 # tmux sessions and removes stub-claude's transcripts; agent-director rows
 # are left to the ephemeral container (decision 14). The helper's EXIT trap
 # stops the server (with --stop-bots) and the stub and removes the scratch
-# root. Expected runtime: about 2 minutes (the start pass's two launches
-# dominate; every bound together allows ~6).
+# root. Expected runtime: about 2 minutes (the two launches and their dialog
+# approvals dominate; every bound together allows ~17).
 set -euo pipefail
 
 TEST_NAME="test-10-credentials-change"
@@ -71,7 +74,8 @@ FIXTURES="$(realpath "$(dirname "$0")")/fixtures"
 # --- Bounds (seconds) ------------------------------------------------------
 STUB_WAIT_S=20     # the stub writing its ready file
 START_WAIT_S=150   # the start pass: two bring-ups and two launches
-TICK_WAIT_S=30     # a change showing up in config.json.pending
+TRANSCRIPT_WAIT_S=60  # after the start pass: a persona's dialog approval and SessionStart
+TICK_WAIT_S=30    # a change showing up in config.json.pending
 APPLY_WAIT_S=45    # a confirmation applied (tick + reconnect bounds)
 RECORD_WAIT_S=15   # a line reaching the stub's record
 RETRY_WAIT_S=30    # a failed reconnect's next retry (5 s, then 10 s, after a failure)
@@ -405,6 +409,16 @@ no_new_alpha_pair_seen() {
     rec_none 'label^=alpha-v2'
 }
 
+# True when <dir> holds a non-empty transcript (stub-claude writes its one
+# line in a single write, so a non-empty file is a whole one).
+has_transcript() {
+    local f
+    for f in "$1"/*.jsonl; do
+        [[ -s "${f}" ]] && return 0
+    done
+    return 1
+}
+
 # True when <dir> holds at least one transcript and every transcript in it
 # carries stub-claude's session marker.
 stub_transcripts_only() {
@@ -531,11 +545,13 @@ done
 expect_record_count 0 "start: a call with an unlabelled token" event=api 'label^=unlabelled-'
 expect_record_count 0 "start: a call without a token" event=api label=no-token
 
-# The launched `claude` was stub-claude: each working dir got its transcript
-# (written once the dialog approver's Enter fires SessionStart, which the
-# start pass waits for).
+# The launched `claude` was stub-claude: each working dir gets its transcript
+# once the dialog approver's Enter fires SessionStart. The approver runs
+# after the launch returns, so the start pass does not wait for it: wait here.
 for dir in "${ALPHA_TRANSCRIPTS}" "${BRAVO_TRANSCRIPTS}"; do
-    [[ -d "${dir}" ]] || fail "start: no transcript directory ${dir}: the launched claude did not write one"
+    wait_until "${TRANSCRIPT_WAIT_S}" \
+        "start: no transcript in ${dir}: the launched claude did not write one" \
+        has_transcript "${dir}"
     stub_transcripts_only "${dir}" \
         || fail "start: ${dir} holds no transcript with stub-claude's session marker: the launched claude was not the stub"
 done
