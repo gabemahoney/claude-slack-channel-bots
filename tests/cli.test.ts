@@ -124,6 +124,7 @@ import {
   type DirectorOps,
   type InitClientGateOptions,
 } from '../src/cli.ts'
+import { serverPortFilePath } from '../src/clear-latch.ts'
 import {
   AD_CONFIG_FILE_DISPLAY_NAME,
   CLEAN_RESTART_NOT_RESTARTED_LABEL,
@@ -583,6 +584,8 @@ interface Bundle {
   configFileLoads: string[]
   /** Each credentials file the fake credentials-script runner was given. */
   credentialsRuns: string[]
+  /** Each path given to `unlinkSync`, in call order; the fake removes nothing. */
+  unlinked: string[]
   readonly startServerCalled: boolean
 }
 
@@ -621,6 +624,7 @@ function makeDeps(o: Overrides = {}): Bundle {
   const initClientGates: Bundle['initClientGates'] = []
   const configFileLoads: string[] = []
   const credentialsRuns: string[] = []
+  const unlinked: string[] = []
   let startServerCalled = false
   if (o.serverPid !== undefined) writeFileSync(pidPath, `${o.serverPid}\n`)
   const stateEnv = { SLACK_STATE_DIR: stateDir }
@@ -662,7 +666,8 @@ function makeDeps(o: Overrides = {}): Bundle {
       await o.sleep?.(ms)
       await clock.advance(ms)
     },
-    unlinkSync: () => { /* the stale PID file stays; nothing reads it again */ },
+    // Recorded only: the PID file stays (nothing reads it again) and the tree is unchanged.
+    unlinkSync: (p) => { unlinked.push(p) },
     isProcessRunning: o.isProcessRunning ?? (() => false),
     kill: (_pid, signal) => {
       serverSignals.push(String(signal))
@@ -743,7 +748,7 @@ function makeDeps(o: Overrides = {}): Bundle {
   return {
     deps, clock, exitCodes, exitTimes, spawnCalls, daemonSpawns, logOpens, closedFds, logInits, loadPaths,
     getCalls, readPaneCalls, directorCallTimes, statusCalls, pauseCalls, killCalls,
-    serverSignals, events, initClientCalls, initClientGates, configFileLoads, credentialsRuns,
+    serverSignals, events, initClientCalls, initClientGates, configFileLoads, credentialsRuns, unlinked,
     get startServerCalled() { return startServerCalled },
   }
 }
@@ -1256,6 +1261,65 @@ describe('stop — waits on the injected clock', () => {
     expect(b.exitCodes).toEqual([0])
     expect(b.exitTimes).toEqual([STOP_POLL_MS])
     expect(stderr).toContain('[slack] Server stopped.')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// stop — server.port goes with the PID file (b.jg5 SRJ-510): removed when the
+// PID is stale and after the server stops or is killed, and on no other path.
+// ---------------------------------------------------------------------------
+
+describe('stop — server.port is removed with the PID file', () => {
+  /** A `stop` bundle (stop_timeout 5) whose server's liveness reads `alive` over the signals sent so far. */
+  function stopWith(alive: (signals: readonly string[]) => boolean): Bundle {
+    const b: Bundle = makeDeps({ serverPid: 4242, config: opsConfig({ stop_timeout: 5 }), isProcessRunning: () => alive(b.serverSignals) })
+    return b
+  }
+
+  /** The PID file and the record beside it, in either order, each once. */
+  const bothFiles = (): string[] => [pidPath, serverPortFilePath(stateDir)].sort()
+
+  test.each([
+    ['the PID is stale', () => false, [], 'server is not running (removed stale PID file)'],
+    ['the server exits after SIGTERM', (s: readonly string[]) => s.length === 0, ['SIGTERM'], '[slack] Server stopped.'],
+    ['the server dies only after SIGKILL', (s: readonly string[]) => !s.includes('SIGKILL'), ['SIGTERM', 'SIGKILL'], '[slack] Server killed.'],
+  ] as const)('%s: the PID file and server.port are removed, exit 0', async (label, alive, signals, line) => {
+    const b = stopWith(alive)
+
+    await expect(createCli(b.deps).stop()).rejects.toBeInstanceOf(ExitError)
+
+    expect([...b.unlinked].sort()).toEqual(bothFiles())
+    expect(b.serverSignals).toEqual([...signals])
+    expect(b.exitCodes).toEqual([0])
+    expect(stderr).toContain(line)
+    assertNoLeak({ stderr, exitCodes: b.exitCodes }, `stop (${label})`)
+  })
+
+  test.each([
+    ['there is no PID file', () => makeDeps(), 0, 'server is not running'],
+    ['the PID file is unreadable', () => { writeFileSync(pidPath, 'not-a-pid\n'); return makeDeps() }, 1, '[slack] Could not read PID file: Error: invalid PID: not-a-pid'],
+    ['the server survives SIGKILL', () => stopWith(() => true), 1, '[slack] Warning: server did not die after SIGKILL.'],
+  ] as const)('%s: nothing is removed, exit %d', async (label, build, code, line) => {
+    const b = build()
+
+    await expect(createCli(b.deps).stop()).rejects.toBeInstanceOf(ExitError)
+
+    expect(b.unlinked).toEqual([])
+    expect(b.exitCodes).toEqual([code])
+    expect(stderr).toContain(line)
+    assertNoLeak({ stderr, exitCodes: b.exitCodes }, `stop (${label})`)
+  })
+
+  test('stop --stop-bots over a stale PID removes the PID file and server.port, and tears the persona down as before', async () => {
+    const b = makeStopDeps({ directorStatus: async () => ({ state: 'ended' }) })
+
+    await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
+
+    expect([...b.unlinked].sort()).toEqual(bothFiles())
+    expectOnePrecheckEach(b, [opsId()])
+    expect(b.statusCalls).toEqual([opsId()])
+    expect(b.exitCodes).toEqual([0])
+    assertNoLeak({ stderr, exitCodes: b.exitCodes }, 'stop --stop-bots (stale PID)')
   })
 })
 

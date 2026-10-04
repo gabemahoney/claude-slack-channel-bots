@@ -107,6 +107,7 @@ import { join, resolve } from 'path'
 import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, statSync, unlinkSync } from 'fs'
 import { spawn, spawnSync } from 'child_process'
 import { isProcessRunning } from './pid.ts'
+import { removeServerPortRecord, serverPortFilePath } from './clear-latch.ts'
 import {
   agentDirectorCallTimeoutMsOf,
   loadPersonaConfig,
@@ -1208,6 +1209,9 @@ export function createCli(deps: CliDeps): CliHandlers {
   async function stopServer(): Promise<number> {
     const stateDir = deps.resolveStateDir()
     const pidFile = join(stateDir, 'server.pid')
+    // b.jg5 SRJ-510: the listener's record goes with the PID file on each
+    // path that removes it, so a server ended by SIGKILL leaves none.
+    const serverPortFile = serverPortFilePath(stateDir)
 
     if (!deps.existsSync(pidFile)) {
       console.error('server is not running')
@@ -1229,6 +1233,7 @@ export function createCli(deps: CliDeps): CliHandlers {
       try {
         deps.unlinkSync(pidFile)
       } catch { /* ignore */ }
+      removeServerPortRecord(serverPortFile, deps)
       console.error('server is not running (removed stale PID file)')
       return 0
     }
@@ -1257,6 +1262,7 @@ export function createCli(deps: CliDeps): CliHandlers {
       await deps.sleep(STOP_POLL_MS)
       if (!deps.isProcessRunning(pid!)) {
         try { deps.unlinkSync(pidFile) } catch { /* ignore */ }
+        removeServerPortRecord(serverPortFile, deps)
         console.error('[slack] Server stopped.')
         return 0
       }
@@ -1272,6 +1278,7 @@ export function createCli(deps: CliDeps): CliHandlers {
       await deps.sleep(STOP_POLL_MS)
       if (!deps.isProcessRunning(pid!)) {
         try { deps.unlinkSync(pidFile) } catch { /* ignore */ }
+        removeServerPortRecord(serverPortFile, deps)
         console.error('[slack] Server killed.')
         return 0
       }

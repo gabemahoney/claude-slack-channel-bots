@@ -105,8 +105,11 @@ function jsonResponse(status: number, body: Record<string, unknown>): Response {
   })
 }
 
-/** True for a loopback remote address (127.0.0.1, ::1, ::ffff:127.*). */
-function isLocalAddress(address: string): boolean {
+/**
+ * True for a loopback remote address (127.0.0.1, ::1, ::ffff:127.*): the one
+ * loopback rule of `/interject` and `/clear-latch` (`src/clear-latch.ts`).
+ */
+export function isLocalAddress(address: string): boolean {
   return address === '127.0.0.1' || address === '::1' || address.startsWith('::ffff:127.')
 }
 

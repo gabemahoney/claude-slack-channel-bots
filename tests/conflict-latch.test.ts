@@ -576,9 +576,10 @@ import {
   LIVENESS_DEAD_ROW_ENDED,
   LIVENESS_DEAD_ROW_MISSING,
 } from '../src/liveness-reading.ts'
-import { MAX_LOGGED_MESSAGE_LENGTH, renderLogMessageText } from '../src/persona-connection-errors.ts'
+import { describeThrownValue, MAX_LOGGED_MESSAGE_LENGTH, renderLogMessageText } from '../src/persona-connection-errors.ts'
 import { adConfigMalformedOnset, getOutageFlags, type OutageClass } from '../src/outage-state.ts'
 import { classifyAdError } from '../src/ad-error-class.ts'
+import { CLEAR_LATCH_ROUTE, handleClearLatch } from '../src/clear-latch.ts'
 import {
   STUCK_LAUNCH_ALREADY_POSTED,
   STUCK_LAUNCH_END_LATCHED,
@@ -608,6 +609,7 @@ import type { PersonaSerialize, PersonaSerializer } from '../src/persona-seriali
 import { getFailureCount, isAtCap } from '../src/backoff.ts'
 import { _resetHealthCheckState, initHealthCheck, startHealthCheck, stopHealthCheck } from '../src/health-check.ts'
 import {
+  holdRestartActive,
   isRestartPendingOrActive,
   RESTART_FAILURE_CAP,
   RESTART_OUTCOME_LATCHED,
@@ -646,10 +648,11 @@ import {
   LATCH_CLEAR_SEQUENCE_FIND_MISSING_REFUSED,
   LATCH_CLEAR_SEQUENCE_NOT_APPLIED,
   LATCH_CLEAR_SEQUENCE_NOT_LATCHED,
-  LATCH_CLEAR_SEQUENCE_RELATCHED,
   LATCH_CLEAR_SEQUENCE_RETRIED,
   LATCH_CLEAR_SEQUENCE_RETRY_FAILED,
   runLatchClearSequence,
+  sweepDeadTmuxChannel,
+  ESCALATE_DEAD_WAITING_ROW_PANE_GONE,
   type LatchClearSequenceDeps,
   type ApproverVerb,
   type NotConnectedNotice,
@@ -6329,22 +6332,22 @@ describe('the cleared probe\'s find-missing and single retry: a refused run hold
   })
 })
 
-describe('after a clear by step 1: the bypassing find-missing comes before the next read; a note it removes does not relatch P, one still there relatches with one new post; a refused run makes no launch and leaves P to its retry timer (recovery harness; SRJ-506, SRJ-114, SRJ-120; E14 build)', () => {
-  /**
-   * P latched on "another agent-director store" at a `resume` of its row read
-   * `ended`, which now reads `waiting` and carries the note (a `status` read
-   * does not show it); the store-wide find-missing lists P's row in
-   * `unverified_ids`, so its post-run `get` reads the row.
-   */
-  function latchWithNote(removes: typeof PENDING_ROW_FIND_MISSING_REMOVES_NOTE | typeof PENDING_ROW_FIND_MISSING_REMOVES_NOTHING): LatchedRecheckRun {
-    const h = makeRecheckHarness()
-    const [p, q] = h.keys as [string, string]
-    h.script({ findMissingFn: () => cannedFindMissing({ rows: { [personaInstanceId(p)]: 'unverified_ids' } }) })
-    const model = makePendingRowModel(h, p, { sessionId: 'session-of-p', state: 'waiting', note: true, findMissingRemoves: removes })
-    ANOTHER_STORE_RESUME_ROW.latchOn(h.latchSet, p)
-    return { h, p, q, model, record: h.latch.record(p)! }
-  }
+/**
+ * P latched on "another agent-director store" at a `resume` of its row read
+ * `ended`, which now reads `waiting` and carries the note (a `status` read
+ * does not show it); the store-wide find-missing lists P's row in
+ * `unverified_ids`, so its post-run `get` reads the row.
+ */
+function latchWithNote(removes: typeof PENDING_ROW_FIND_MISSING_REMOVES_NOTE | typeof PENDING_ROW_FIND_MISSING_REMOVES_NOTHING): LatchedRecheckRun {
+  const h = makeRecheckHarness()
+  const [p, q] = h.keys as [string, string]
+  h.script({ findMissingFn: () => cannedFindMissing({ rows: { [personaInstanceId(p)]: 'unverified_ids' } }) })
+  const model = makePendingRowModel(h, p, { sessionId: 'session-of-p', state: 'waiting', note: true, findMissingRemoves: removes })
+  ANOTHER_STORE_RESUME_ROW.latchOn(h.latchSet, p)
+  return { h, p, q, model, record: h.latch.record(p)! }
+}
 
+describe('after a clear by step 1: the bypassing find-missing comes before the next read; a note it removes does not relatch P, one still there relatches with one new post; a refused run makes no launch and leaves P to its retry timer (recovery harness; SRJ-506, SRJ-114, SRJ-120; E14 build)', () => {
   test('a note the run removes: the post-run get reads no note, P stays unlatched and is retried at once', async () => {
     const { h, p, model, record } = latchWithNote(PENDING_ROW_FIND_MISSING_REMOVES_NOTE)
     const round = await recheckRound(h, p)
@@ -6557,24 +6560,29 @@ describe('the exported after-clear sequence (runLatchClearSequence) and the buil
     }
   }
 
-  test('for an unlatched P it does nothing: not-latched, no submission, no post, no call', async () => {
+  test('for an unlatched P: one submission whose clear answers false, and nothing else: not-latched, no post, no call, no hold', async () => {
     const h = makeRecheckHarness()
     const [p] = h.keys as [string]
     const deps = sequenceDeps(h)
     const calls = h.timedCalls.length
-    expect(await runLatchClearSequence(p, LATCH_RECOVERY_REASON_CLEARED_BY_HAND, deps)).toEqual({ kind: LATCH_CLEAR_SEQUENCE_NOT_LATCHED })
-    expect([deps.submitted, h.episodeNotices, h.timedCalls.length - calls, isRestartPendingOrActive(p)]).toEqual([[], [], 0, false])
+    const answer = runLatchClearSequence(p, LATCH_RECOVERY_REASON_CLEARED_BY_HAND, deps)
+    expect(await answer.cleared).toBe(false)
+    expect(await answer.done).toEqual({ kind: LATCH_CLEAR_SEQUENCE_NOT_LATCHED })
+    expect([deps.submitted, h.episodeNotices, h.timedCalls.length - calls, isRestartPendingOrActive(p)]).toEqual([[p], [], 0, false])
+    expect(clearedLinesIn(h.errors, p)).toEqual([])
   })
 
-  test('called directly for a latched P: the clear is made before it returns (one post with the given reason, the timer stopped), then one submission whose job runs one find-missing before the next read of P\'s row and retries P at once', async () => {
+  test('called directly for a latched P: the clear is made in the submitted job (nothing cleared when it returns; then one post with the given reason, the timer stopped), and the job runs one find-missing before the next read of P\'s row and retries P at once', async () => {
     const { h, p, record } = latchForRecheck(ANOTHER_STORE_RESUME_ROW, { state: LIVENESS_DEAD_ROW_ENDED })
     const deps = sequenceDeps(h)
     const from = h.timedCalls.length
     const answer = runLatchClearSequence(p, LATCH_RECOVERY_REASON_CLEARED_BY_HAND, deps)
+    // Submitted, and nothing cleared before the job's turn: P latched with its one post, its timer armed.
+    expect([deps.submitted, h.latch.record(p), h.episodeNotices.length, h.latchRecheck.isArmed(p)]).toEqual([[p], record, 1, true])
+    expect(await answer.cleared).toBe(true)
     expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_CLEARED_BY_HAND)])
     expectClearedState(h, p)
-    expect(isRestartPendingOrActive(p)).toBe(true)
-    expect(await answer).toEqual({ kind: LATCH_CLEAR_SEQUENCE_RETRIED, outcome: RESTART_OUTCOME_LAUNCHED })
+    expect(await answer.done).toEqual({ kind: LATCH_CLEAR_SEQUENCE_RETRIED, outcome: RESTART_OUTCOME_LAUNCHED })
     await h.settle()
     const verbs: string[] = personaCallsFrom(h, p, from).map((call) => call.verb)
     expect(verbs.slice(0, 2)).toEqual(['findMissing', 'status'])
@@ -6586,7 +6594,9 @@ describe('the exported after-clear sequence (runLatchClearSequence) and the buil
   test('the builder\'s clearAndRecover is the same sequence over its clear entry, with its find-missing first', async () => {
     const { h, p, record } = latchForRecheck(ANOTHER_STORE_RESUME_ROW, { state: LIVENESS_DEAD_ROW_ENDED })
     const from = h.timedCalls.length
-    expect(await h.latchRecheck.clearAndRecover(p, LATCH_RECOVERY_REASON_CLEARED_BY_HAND)).toEqual({ kind: LATCH_CLEAR_SEQUENCE_RETRIED, outcome: RESTART_OUTCOME_LAUNCHED })
+    const answer = h.latchRecheck.clearAndRecover(p, LATCH_RECOVERY_REASON_CLEARED_BY_HAND)
+    expect(await answer.cleared).toBe(true)
+    expect(await answer.done).toEqual({ kind: LATCH_CLEAR_SEQUENCE_RETRIED, outcome: RESTART_OUTCOME_LAUNCHED })
     await h.settle()
     expect(personaCallsFrom(h, p, from).map((call) => call.verb).slice(0, 2)).toEqual(['findMissing', 'status'])
     expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_CLEARED_BY_HAND)])
@@ -6605,25 +6615,84 @@ describe('the exported after-clear sequence (runLatchClearSequence) and the buil
   test('with findMissingFirst false the job makes no find-missing before the retry at once', async () => {
     const { h, p } = latchForRecheck(ANOTHER_STORE_RESUME_ROW, { state: LIVENESS_DEAD_ROW_ENDED })
     const from = h.timedCalls.length
-    expect(await runLatchClearSequence(p, LATCH_RECOVERY_REASON_CLEARED_BY_HAND, sequenceDeps(h), { findMissingFirst: false })).toEqual({ kind: LATCH_CLEAR_SEQUENCE_RETRIED, outcome: RESTART_OUTCOME_LAUNCHED })
+    expect(await runLatchClearSequence(p, LATCH_RECOVERY_REASON_CLEARED_BY_HAND, sequenceDeps(h), { findMissingFirst: false }).done).toEqual({
+      kind: LATCH_CLEAR_SEQUENCE_RETRIED,
+      outcome: RESTART_OUTCOME_LAUNCHED,
+    })
     await h.settle()
     expect(personaCallsFrom(h, p, from).map((call) => call.verb)).not.toContain('findMissing')
     await stopApprover(h, p)
   })
 
+  // The sequence's three failure lines, pinned once from runLatchClearSequence's
+  // doc (no builder is exported); `persona=<key>` is its key-only reference.
+  const latchClearLinesIn = (h: RecoveryHarness): string[] => h.errors.filter((line) => line.startsWith('[slack] latch-clear: '))
+  const notRunInTurnLine = (key: string, thrown: unknown): string =>
+    `[slack] latch-clear: the run after persona=${key}'s latch cleared could not be run in its serializer turn: ${describeThrownValue(thrown)} (b.jg5 SRJ-506)`
+  const clearFailedLine = (key: string, thrown: unknown): string =>
+    `[slack] latch-clear: the clear of persona=${key} failed: ${describeThrownValue(thrown)} — nothing runs after it (b.jg5 SRJ-506)`
+  const runFailedLine = (key: string, thrown: unknown): string =>
+    `[slack] latch-clear: the run after persona=${key}'s latch cleared failed: ${describeThrownValue(thrown)} (b.jg5 SRJ-506)`
+
+  const SUBMISSION_ERROR = new Error('serializer closed')
   test.each([
-    ['rejects', (): Promise<never> => Promise.reject(new Error('serializer closed'))],
+    ['rejects', (): Promise<never> => Promise.reject(SUBMISSION_ERROR)],
     ['throws', (): never => {
-      throw new Error('serializer closed')
+      throw SUBMISSION_ERROR
     }],
-  ] as const)('a submission that %s answers retry-failed with one line, releases P\'s hold, and the clear stands', async (_label, serialize) => {
+  ] as const)('a submission that %s: cleared rejects with its error, the run answers retry-failed with the one "could not be run in its serializer turn" line, and nothing is cleared or posted (P latched with its record, its timer armed, no hold)', async (_label, serialize) => {
     const { h, p, record } = latchForRecheck(ANOTHER_STORE_RESUME_ROW, { state: LIVENESS_DEAD_ROW_ENDED })
     const from = h.timedCalls.length
     const deps = sequenceDeps(h, { serialize: serialize as LatchClearSequenceDeps['serialize'] })
-    expect(await runLatchClearSequence(p, LATCH_RECOVERY_REASON_CLEARED_BY_HAND, deps)).toEqual({ kind: LATCH_CLEAR_SEQUENCE_RETRY_FAILED })
-    expect(h.errors.filter((line) => line.includes('could not be run in its serializer turn: ') && line.includes('serializer closed'))).toHaveLength(1)
-    expect([isRestartPendingOrActive(p), h.latch.isLatched(p), h.timedCalls.length - from]).toEqual([false, false, 0])
-    expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_CLEARED_BY_HAND)])
+    const answer = runLatchClearSequence(p, LATCH_RECOVERY_REASON_CLEARED_BY_HAND, deps)
+    await expect(answer.cleared).rejects.toBe(SUBMISSION_ERROR)
+    expect(await answer.done).toEqual({ kind: LATCH_CLEAR_SEQUENCE_RETRY_FAILED })
+    expect(latchClearLinesIn(h)).toEqual([notRunInTurnLine(p, SUBMISSION_ERROR)])
+    expect([isRestartPendingOrActive(p), h.latch.record(p), h.latchRecheck.isArmed(p), h.timedCalls.length - from]).toEqual([false, record, true, 0])
+    expect([h.episodeNotices.length, clearedLinesIn(h.errors, p)]).toEqual([1, []])
+  })
+
+  test('a clear that throws in the job\'s turn: cleared rejects with its error, the run answers retry-failed with the one "clear … failed — nothing runs after it" line, and nothing follows (no hold, no call, no post)', async () => {
+    const { h, p, record } = latchForRecheck(ANOTHER_STORE_RESUME_ROW, { state: LIVENESS_DEAD_ROW_ENDED })
+    const from = h.timedCalls.length
+    const clearError = new Error('clear failed')
+    const deps = sequenceDeps(h, {
+      clear: () => {
+        throw clearError
+      },
+    })
+    const answer = runLatchClearSequence(p, LATCH_RECOVERY_REASON_CLEARED_BY_HAND, deps)
+    await expect(answer.cleared).rejects.toBe(clearError)
+    expect(await answer.done).toEqual({ kind: LATCH_CLEAR_SEQUENCE_RETRY_FAILED })
+    expect(latchClearLinesIn(h)).toEqual([clearFailedLine(p, clearError)])
+    expect([deps.submitted, isRestartPendingOrActive(p), h.latch.record(p), h.timedCalls.length - from, h.episodeNotices.length]).toEqual([[p], false, record, 0, 1])
+  })
+
+  test('a run that throws after the clear answered: cleared stays true, the run answers retry-failed with the one "run after … failed" line, and P\'s active hold is released exactly once', async () => {
+    const { h, p, record } = latchForRecheck(ANOTHER_STORE_RESUME_ROW, { state: LIVENESS_DEAD_ROW_ENDED })
+    const from = h.timedCalls.length
+    const nameError = new Error('name unreadable')
+    // P as applied, its name unreadable: the run's persona reference throws after the clear.
+    const unnamed = Object.defineProperty({ ...personaOf(h, p) }, 'name', {
+      get: () => {
+        throw nameError
+      },
+    })
+    const deps = sequenceDeps(h, { appliedConfig: () => ({ ...h.config, personas: h.config.personas.map((persona) => (persona.key === p ? unnamed : persona)) }) })
+    // An outside hold on P: a second release of the run's hold would end it.
+    const outside = holdRestartActive(p)
+    try {
+      const answer = runLatchClearSequence(p, LATCH_RECOVERY_REASON_CLEARED_BY_HAND, deps)
+      expect(await answer.cleared).toBe(true)
+      expect(await answer.done).toEqual({ kind: LATCH_CLEAR_SEQUENCE_RETRY_FAILED })
+      expect(latchClearLinesIn(h)).toEqual([runFailedLine(p, nameError)])
+      expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_CLEARED_BY_HAND)])
+      expectClearedState(h, p)
+      expect([h.timedCalls.length - from, isRestartPendingOrActive(p)]).toEqual([0, true])
+    } finally {
+      outside()
+    }
+    expect(isRestartPendingOrActive(p)).toBe(false)
   })
 
   test('a retry at once that throws answers retry-failed with one line, after the find-missing; P\'s hold is released', async () => {
@@ -6633,7 +6702,7 @@ describe('the exported after-clear sequence (runLatchClearSequence) and the buil
         throw new Error('retry failed')
       },
     })
-    expect(await runLatchClearSequence(p, LATCH_RECOVERY_REASON_CLEARED_BY_HAND, deps)).toEqual({ kind: LATCH_CLEAR_SEQUENCE_RETRY_FAILED })
+    expect(await runLatchClearSequence(p, LATCH_RECOVERY_REASON_CLEARED_BY_HAND, deps).done).toEqual({ kind: LATCH_CLEAR_SEQUENCE_RETRY_FAILED })
     expect(h.errors.filter((line) => line.includes('retry at once after its latch cleared failed: '))).toHaveLength(1)
     expect([h.callTimes('findMissing').length, isRestartPendingOrActive(p)]).toEqual([1, false])
   })
@@ -6642,30 +6711,382 @@ describe('the exported after-clear sequence (runLatchClearSequence) and the buil
     const { h, p } = latchForRecheck(ANOTHER_STORE_RESUME_ROW, { state: LIVENESS_DEAD_ROW_ENDED })
     const from = h.timedCalls.length
     const deps = sequenceDeps(h, { appliedConfig: () => ({ ...h.config, personas: h.config.personas.filter((persona) => persona.key !== p) }) })
-    expect(await runLatchClearSequence(p, LATCH_RECOVERY_REASON_CLEARED_BY_HAND, deps)).toEqual({ kind: LATCH_CLEAR_SEQUENCE_NOT_APPLIED })
+    const answer = runLatchClearSequence(p, LATCH_RECOVERY_REASON_CLEARED_BY_HAND, deps)
+    expect(await answer.cleared).toBe(true)
+    expect(await answer.done).toEqual({ kind: LATCH_CLEAR_SEQUENCE_NOT_APPLIED })
     expect([h.latch.isLatched(p), h.timedCalls.length - from, isRestartPendingOrActive(p)]).toEqual([false, 0, false])
     expect(h.errors.filter((line) => line.includes('is not in the applied configuration — no find-missing and no retry after its latch cleared'))).toHaveLength(1)
   })
 
-  test('P latched again before its job runs: relatched with one line, nothing called for it', async () => {
+  test('P latched again before its job runs: the job\'s clear clears that new latch with its own one recovery post, then its find-missing and the retry at once', async () => {
     const { h, p } = latchForRecheck(ANOTHER_STORE_RESUME_ROW, { state: LIVENESS_DEAD_ROW_ENDED })
     const from = h.timedCalls.length
+    const relatched: ConflictLatchRecord[] = []
     const deps = sequenceDeps(h, {
       serialize: (key, operation) => {
-        SCAN_LEFTOVER_ROW.latchOn(h.latchSet, key)
+        expect(SCAN_LEFTOVER_ROW.latchOn(h.latchSet, key)).toBe(CONFLICT_LATCH_SET_RELATCHED)
+        relatched.push(h.latch.record(key)!)
         return h.serializer.run(key, operation)
       },
     })
-    expect(await runLatchClearSequence(p, LATCH_RECOVERY_REASON_CLEARED_BY_HAND, deps)).toEqual({ kind: LATCH_CLEAR_SEQUENCE_RELATCHED })
-    expect([h.latch.record(p)?.latchCase, h.timedCalls.length - from, isRestartPendingOrActive(p)]).toEqual([LATCH_CASE_LEFTOVER, 0, false])
-    expect(h.errors.filter((line) => line.includes('is latched again before the run that follows its clear — nothing is called for it'))).toHaveLength(1)
+    const answer = runLatchClearSequence(p, LATCH_RECOVERY_REASON_CLEARED_BY_HAND, deps)
+    expect(await answer.cleared).toBe(true)
+    expect(await answer.done).toEqual({ kind: LATCH_CLEAR_SEQUENCE_RETRIED, outcome: RESTART_OUTCOME_LAUNCHED })
+    await h.settle()
+    const record = relatched[0]!
+    expect(record.latchCase).toBe(LATCH_CASE_LEFTOVER)
+    // The latch's post, the relatch's post, then the one recovery post for the latch the job found.
+    expect(h.episodeNotices).toHaveLength(3)
+    expect(h.episodeNotices.slice(2)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_CLEARED_BY_HAND)])
+    expect(clearedLinesIn(h.errors, p)).toEqual([latchClearedLine(p, record, LATCH_RECOVERY_REASON_CLEARED_BY_HAND, true)])
+    expectClearedState(h, p)
+    expect(personaCallsFrom(h, p, from).map((call) => call.verb).slice(0, 2)).toEqual(['findMissing', 'status'])
+    expect(h.errors.filter((line) => line.includes('is latched again before the run that follows its clear'))).toEqual([])
+    await stopApprover(h, p)
   })
 
   test('its find-missing refused (UNAVAILABLE): find-missing-refused, no launch, P\'s retry timer armed', async () => {
     const { h, p } = latchForRecheck(ANOTHER_STORE_RESUME_ROW, { state: LIVENESS_DEAD_ROW_ENDED })
     failFindMissing(h, errTmuxUnresponsive('find-missing'))
-    expect(await runLatchClearSequence(p, LATCH_RECOVERY_REASON_CLEARED_BY_HAND, sequenceDeps(h))).toEqual({ kind: LATCH_CLEAR_SEQUENCE_FIND_MISSING_REFUSED })
+    const answer = runLatchClearSequence(p, LATCH_RECOVERY_REASON_CLEARED_BY_HAND, sequenceDeps(h))
+    expect(await answer.cleared).toBe(true)
+    expect(await answer.done).toEqual({ kind: LATCH_CLEAR_SEQUENCE_FIND_MISSING_REFUSED })
     expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls, h.controller.isArmed(p)]).toEqual([[], [], true])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The clear by hand (E31 T1; b.jg5 SRJ-510, SRJ-506's clear-latch leg,
+// SRJ-509's server-side bullets, SRJ-1005, SRJ-120): the `/clear-latch`
+// route's clear, `clearByHandOf` over the re-check as `main()` binds it (the
+// harness's `latchRecheck.clearByHand`), driven through the real handler
+// where the route's answer matters.
+// ---------------------------------------------------------------------------
+
+/** A `POST /clear-latch` for one persona, made through the real handler over the harness's clear by hand. */
+interface ClearLatchRequest {
+  /** Settles once the handler has handed the clear to the clear by hand. */
+  readonly submitted: Promise<void>
+  /** The route's answer. */
+  readonly response: Promise<Response>
+  /** How many notices had been posted when the route answered; undefined while it has not. */
+  postsWhenAnswered(): number | undefined
+}
+
+/**
+ * Send `POST /clear-latch` naming persona `key` of `h` from loopback to the
+ * real handler (`handleClearLatch`), whose clear is the harness's clear by
+ * hand (`clearByHandOf` over its re-check, the binding `main()` routes), its
+ * lines to `console.error` (so to `errors`). `signal` is the request's.
+ */
+function requestClearLatch(h: RecoveryHarness, key: string, signal?: AbortSignal): ClearLatchRequest {
+  const submitted = Promise.withResolvers<void>()
+  let posts: number | undefined
+  const req = new Request(`http://127.0.0.1${CLEAR_LATCH_ROUTE}`, { method: 'POST', body: JSON.stringify({ persona: personaOf(h, key).name }), signal })
+  const response = handleClearLatch(req, '127.0.0.1', {
+    getPersonaConfig: () => h.config,
+    clearByHand: (target) => {
+      submitted.resolve()
+      return h.latchRecheck.clearByHand(target)
+    },
+    log: (line) => console.error(line),
+  }).then((answer) => {
+    posts = h.episodeNotices.length
+    return answer
+  })
+  return { submitted: submitted.promise, response, postsWhenAnswered: () => posts }
+}
+
+/** The route's 200 body for persona `key` of `h`. */
+const clearLatchBody = (h: RecoveryHarness, key: string, cleared: boolean) => ({ ok: true, persona: personaOf(h, key).name, cleared })
+
+/** Wait until P's clear-by-hand job (and anything else submitted for P before) has ended, then settle the launches it made. */
+async function settleClearJob(h: RecoveryHarness, key: string): Promise<void> {
+  await h.serializer.whenIdle(key)
+  await h.settle()
+}
+
+/** Hold P's serializer turn open with an operation of the harness's serializer; `release` ends it. */
+function holdTurn(h: RecoveryHarness, key: string): { readonly release: () => Promise<void> } {
+  const turn = Promise.withResolvers<void>()
+  const held = h.serializer.run(key, () => turn.promise)
+  return {
+    release: async () => {
+      turn.resolve()
+      await held
+    },
+  }
+}
+
+/** Every latch kind and case of the case table, once each (the probe-dropped columns are the same latch). */
+const CLEAR_BY_HAND_ROWS = RECHECK_TABLE.filter((row) => !row.probeDropped).map((row) => [row.name, row] as const)
+
+/** An "another agent-director store" latch at a plain spawn over P's row read `ended`: the launch the retry at once makes over such a row. */
+const ANOTHER_STORE_PLAIN_SPAWN_ROW = launchRowOf(REFUSED_OPERATION_PLAIN_SPAWN, LATCH_CASE_ANOTHER_STORE)
+
+/** The after-clear sequence's refused-run line. */
+const REFUSED_RUN_LINE_PART = '\'s latch cleared was refused — no launch in this attempt; the persona is left to its retry timer'
+
+describe('the clear by hand (clear-latch): in P\'s serializer turn, one "cleared by hand" post, one bypassing find-missing before P\'s next row read, P retried at once; the route answers once the clear has run (recovery harness; SRJ-510, SRJ-506, SRJ-509, SRJ-1005, SRJ-120)', () => {
+  test('the rows cover every latch kind and case: every CONFLICT case, unrecognised text included, the "conflicting labels" note latch, the unusable recorded name and the launch start not recorded', () => {
+    const cases = new Set(CLEAR_BY_HAND_ROWS.map(([, row]) => row.record(KEY).latchCase))
+    expect(LATCH_CASES.filter((latchCase) => latchCase !== LATCH_CASE_NEVER_REPORTED_IN && !cases.has(latchCase))).toEqual([])
+    expect(CLEAR_BY_HAND_ROWS.some(([name]) => name.startsWith('the provenance_conflict note '))).toBe(true)
+  })
+
+  test.each(CLEAR_BY_HAND_ROWS)('%s: answers true once its job\'s clear has run, with one "cleared by hand" recovery post of its kind, its line, every latch episode ended and no re-check timer left; then one bypassing find-missing (held open: P unlatched and active, nothing read yet), P\'s next row read and the retry at once', async (_name, row) => {
+    const { h, p, q, record } = latchForRecheck(row, { state: LIVENESS_DEAD_ROW_ENDED })
+    const hold = holdFindMissing(h.stub.client)
+    const watched = watchCalls(h, p)
+
+    const cleared = h.latchRecheck.clearByHand(p)
+    expect([h.latch.record(p), h.episodeNotices.length]).toEqual([record, 1])
+    expect(await cleared).toBe(true)
+
+    const post = recoveryPost(p, record, LATCH_RECOVERY_REASON_CLEARED_BY_HAND)
+    expect(post.text.startsWith(latchKindOf(record.latchCase) === LATCH_KIND_HOLD ? HOLD_RECOVERY_HEAD : CONFLICT_RECOVERY_HEAD)).toBe(true)
+    expect(h.episodeNotices.slice(1)).toEqual([post])
+    expect(clearedLinesIn(h.errors, p)).toEqual([latchClearedLine(p, record, LATCH_RECOVERY_REASON_CLEARED_BY_HAND, true)])
+    expectClearedState(h, p)
+    await hold.entered()
+    expect(watched.map((call) => [call.verb, call.posts, call.latched, call.active])).toEqual([['findMissing', 2, false, true]])
+
+    hold.release(cannedFindMissing())
+    await settleClearJob(h, p)
+    expect(watched.map((call) => call.verb).slice(0, 2)).toEqual(['findMissing', 'status'])
+    expect([watched.filter((call) => call.verb === 'findMissing').length, h.episodeNotices.length, retryAtOnceLinesOf(h, p).length]).toEqual([1, 2, 1])
+    expect([h.latch.isLatched(q), personaCallCounts(h, q)]).toEqual([false, {}])
+    await stopApprover(h, p)
+  })
+
+  test('order: the recovery post, then one bypassing find-missing (a new call inside the memo window an ordinary run just filled), then P\'s next row read, then its retry at once, all at the clear\'s clock time', async () => {
+    const { h, p, q } = latchForRecheck(ANOTHER_STORE_RESUME_ROW, { state: LIVENESS_DEAD_ROW_ENDED })
+    await sweepDeadTmuxChannel(q, ESCALATE_DEAD_WAITING_ROW_PANE_GONE)
+    await sweepDeadTmuxChannel(q, ESCALATE_DEAD_WAITING_ROW_PANE_GONE)
+    // The second ordinary run reused the memo: one call so far.
+    expect(h.callTimes('findMissing')).toHaveLength(1)
+    const watched = watchCalls(h, p)
+    const from = h.timedCalls.length
+    const at = h.clock.now()
+
+    expect(await h.latchRecheck.clearByHand(p)).toBe(true)
+    await settleClearJob(h, p)
+
+    expect(h.callTimes('findMissing')).toHaveLength(2)
+    expect(personaCallsFrom(h, p, from).slice(0, 3).map((call) => [call.verb, call.at])).toEqual([
+      ['findMissing', at],
+      ['status', at],
+      ['spawn', at],
+    ])
+    expect(watched.slice(0, 3).map((call) => [call.verb, call.posts, call.latched])).toEqual([
+      ['findMissing', 2, false],
+      ['status', 2, false],
+      ['spawn', 2, false],
+    ])
+    expect(retryAtOnceLinesOf(h, p)).toEqual([`[slack] latch-clear: ${renderPersonaRef(personaOf(h, p).name, p)}'s retry at once after its latch cleared answered ${RESTART_OUTCOME_LAUNCHED} (b.jg5 SRJ-506)`])
+    await stopApprover(h, p)
+  })
+
+  test('in P\'s turn: with P\'s turn held by another operation, the route has not answered, nothing is posted and P is still latched; once the turn is released the clear runs, and only then the route answers 200 with cleared true', async () => {
+    const { h, p, record } = latchForRecheck(ANOTHER_STORE_RESUME_ROW, { state: LIVENESS_DEAD_ROW_ENDED })
+    const turn = holdTurn(h, p)
+    const route = requestClearLatch(h, p)
+    await route.submitted
+    await h.clock.flush()
+    expect([route.postsWhenAnswered(), h.latch.record(p), h.episodeNotices.length, h.latchRecheck.isArmed(p), clearedLinesIn(h.errors, p)]).toEqual([undefined, record, 1, true, []])
+
+    await turn.release()
+    const response = await route.response
+    expect([response.status, await response.json()]).toEqual([200, clearLatchBody(h, p, true)])
+    // The clear's post was made before the route answered.
+    expect(route.postsWhenAnswered()).toBe(2)
+    expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_CLEARED_BY_HAND)])
+    await settleClearJob(h, p)
+    expect([h.callTimes('findMissing').length, retryAtOnceLinesOf(h, p).length]).toEqual([1, 1])
+    await stopApprover(h, p)
+  })
+
+  test.each([
+    ['the round clears P (its row reported in): the clear answers false, with no second post', 'waiting', false],
+    ['the round leaves P latched (its row reads pending): the clear answers true with its one post', AGENT_DIRECTOR_PENDING_STATE, true],
+  ] as const)('behind a running re-check round, a clear by hand waits for the round and the run it owes; %s', async (_label, state, expected) => {
+    const { h, p, model, record } = latchForRecheck(ANOTHER_STORE_RESUME_ROW, { state: LIVENESS_DEAD_ROW_ENDED })
+    model.setState(state)
+    // Hold the round's step-1 status read of P's row.
+    const gate = Promise.withResolvers<void>()
+    const reached = Promise.withResolvers<void>()
+    const id = personaInstanceId(p)
+    const status = h.stub.client.status.bind(h.stub.client)
+    let held = true
+    h.stub.client.status = async (params) => {
+      if (held && params.claude_instance_id === id) {
+        held = false
+        reached.resolve()
+        await gate.promise
+      }
+      return status(params)
+    }
+    const advancing = h.advance(LATCH_RECHECK_INTERVAL_MS)
+    await reached.promise
+    /** When the clear answered: its answer, the posts made and the retries at once run by then. */
+    const answered: Array<readonly [boolean, number, number]> = []
+    const cleared = h.latchRecheck.clearByHand(p).then((value) => {
+      answered.push([value, h.episodeNotices.length, retryAtOnceLinesOf(h, p).length])
+      return value
+    })
+    await h.clock.flush()
+    expect([answered, h.episodeNotices.length]).toEqual([[], 1])
+
+    gate.resolve()
+    await advancing
+    expect(await cleared).toBe(expected)
+    await settleClearJob(h, p)
+
+    const reason = expected ? LATCH_RECOVERY_REASON_CLEARED_BY_HAND : latchRecoveryReasonRowReads('waiting')
+    // The round's owed run (a step-1 clear's) had ended before the clear answered; one clear, one post, one find-missing, one retry at once.
+    expect(answered).toEqual([[expected, 2, expected ? 0 : 1]])
+    expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, reason)])
+    expect(clearedLinesIn(h.errors, p)).toEqual([latchClearedLine(p, record, reason, true)])
+    expect([h.callTimes('findMissing').length, retryAtOnceLinesOf(h, p).length, h.latch.isLatched(p)]).toEqual([1, 1, false])
+    await stopApprover(h, p)
+  })
+
+  test('the answer before the run: with the bypassing find-missing held open, the route has already answered 200 with cleared true; once it is released, P\'s row read and the retry at once follow in order', async () => {
+    const { h, p } = latchForRecheck(ANOTHER_STORE_RESUME_ROW, { state: LIVENESS_DEAD_ROW_ENDED })
+    const hold = holdFindMissing(h.stub.client)
+    const watched = watchCalls(h, p)
+    const route = requestClearLatch(h, p)
+    await hold.entered()
+    await h.clock.flush()
+    expect([route.postsWhenAnswered(), hold.heldCount(), watched.map((call) => call.verb), isRestartPendingOrActive(p)]).toEqual([2, 1, ['findMissing'], true])
+    const response = await route.response
+    expect([response.status, await response.json()]).toEqual([200, clearLatchBody(h, p, true)])
+
+    hold.release(cannedFindMissing())
+    await settleClearJob(h, p)
+    expect(watched.map((call) => call.verb).slice(0, 3)).toEqual(['findMissing', 'status', 'spawn'])
+    expect([retryAtOnceLinesOf(h, p).length, isRestartPendingOrActive(p)]).toEqual([1, false])
+    await stopApprover(h, p)
+  })
+
+  test.each([
+    ['its request aborted once the clear was handed on', true],
+    ['its answer never read', false],
+  ] as const)('a caller that has gone (%s): the clear still runs once P\'s turn comes, with its one post, its find-missing and its retry at once', async (_label, abort) => {
+    const { h, p, record } = latchForRecheck(ANOTHER_STORE_RESUME_ROW, { state: LIVENESS_DEAD_ROW_ENDED })
+    const turn = holdTurn(h, p)
+    const caller = new AbortController()
+    const route = requestClearLatch(h, p, caller.signal)
+    await route.submitted
+    if (abort) caller.abort()
+
+    await turn.release()
+    await settleClearJob(h, p)
+    expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_CLEARED_BY_HAND)])
+    expectClearedState(h, p)
+    expect([h.callTimes('findMissing').length, retryAtOnceLinesOf(h, p).length]).toEqual([1, 1])
+    await stopApprover(h, p)
+  })
+
+  test('a provenance_conflict note the bypassing run removes does not relatch P: the post-run get reads no note, one recovery post, and P retried at once', async () => {
+    const { h, p, model, record } = latchWithNote(PENDING_ROW_FIND_MISSING_REMOVES_NOTE)
+    const from = h.timedCalls.length
+    expect(await h.latchRecheck.clearByHand(p)).toBe(true)
+    await settleClearJob(h, p)
+    expect(personaCallsFrom(h, p, from).map((call) => call.verb).slice(0, 3)).toEqual(['findMissing', 'get', 'status'])
+    expect(model.note()).toBe(false)
+    expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_CLEARED_BY_HAND)])
+    expect([h.latch.isLatched(p), retryAtOnceLinesOf(h, p).length]).toEqual([false, 1])
+    await stopApprover(h, p)
+  })
+
+  test('a provenance_conflict note still there after the bypassing run relatches P on "conflicting labels" with one new post and no second recovery post; no retry, its re-check timer armed', async () => {
+    const { h, p, record } = latchWithNote(PENDING_ROW_FIND_MISSING_REMOVES_NOTHING)
+    const from = h.timedCalls.length
+    expect(await h.latchRecheck.clearByHand(p)).toBe(true)
+    await settleClearJob(h, p)
+    expect(personaCallsFrom(h, p, from).map((call) => call.verb)).toEqual(['findMissing', 'get'])
+    expect(h.latch.record(p)).toMatchObject({ latchCase: LATCH_CASE_CONFLICTING_LABELS })
+    expect(h.episodeNotices).toHaveLength(3)
+    expect(h.episodeNotices[1]).toEqual(recoveryPost(p, record, LATCH_RECOVERY_REASON_CLEARED_BY_HAND))
+    expect([h.latchRecheck.isArmed(p), retryAtOnceLinesOf(h, p)]).toEqual([true, []])
+    expect(h.errors.filter((line) => line.includes('is latched again after the bypassing find-missing that followed its clear — no retry'))).toHaveLength(1)
+  })
+
+  test.each([
+    ['a CONFLICT ("another agent-director store") whose retry\'s plain spawn is refused again with that case', ANOTHER_STORE_PLAIN_SPAWN_ROW, { state: LIVENESS_DEAD_ROW_ENDED, plainSpawns: [ANOTHER_STORE_PLAIN_SPAWN_ROW.build()] }],
+    ['a "launch start not recorded" hold whose retry reads its row still pending with no launch start', LAUNCH_START_CASE_ROWS[0]!, { launchStartedAt: SAMPLE_LAUNCH_START_NONE }],
+  ] as const)('relatch by hand: %s latches again with one new post after its recovery post, and its re-check timer is armed', async (_label, row, modelOptions: PendingRowModelOptions) => {
+    const { h, p, record } = latchForRecheck(row, modelOptions)
+    const notice = h.episodeNotices[0]!
+    expect(await h.latchRecheck.clearByHand(p)).toBe(true)
+    await settleClearJob(h, p)
+    expect(h.latch.record(p)?.latchCase).toBe(record.latchCase)
+    expect(h.episodeNotices).toEqual([notice, recoveryPost(p, record, LATCH_RECOVERY_REASON_CLEARED_BY_HAND), notice])
+    expect([h.latchRecheck.isArmed(p), h.latchRecheck.nextDueAt()]).toEqual([true, h.clock.now() + LATCH_RECHECK_INTERVAL_MS])
+  })
+
+  test('an unlatched P: cleared false, with no post, no find-missing, no retry, no call for P and no timer', async () => {
+    const h = makeRecheckHarness()
+    const [p] = h.keys as [string]
+    const from = h.timedCalls.length
+    expect(await h.latchRecheck.clearByHand(p)).toBe(false)
+    await settleClearJob(h, p)
+    expect([h.episodeNotices, h.timedCalls.length - from, retryAtOnceLinesOf(h, p), clearedLinesIn(h.errors, p), isRestartPendingOrActive(p), h.latchRecheck.pendingTimers()]).toEqual([
+      [],
+      0,
+      [],
+      [],
+      false,
+      0,
+    ])
+  })
+
+  test('two concurrent clears by hand for one latched P: the first answers true and the second false; one post, one find-missing and one retry at once', async () => {
+    const { h, p, record } = latchForRecheck(ANOTHER_STORE_RESUME_ROW, { state: LIVENESS_DEAD_ROW_ENDED })
+    expect(await Promise.all([h.latchRecheck.clearByHand(p), h.latchRecheck.clearByHand(p)])).toEqual([true, false])
+    await settleClearJob(h, p)
+    expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_CLEARED_BY_HAND)])
+    expect([clearedLinesIn(h.errors, p).length, h.callTimes('findMissing').length, retryAtOnceLinesOf(h, p).length]).toEqual([1, 1, 1])
+    await stopApprover(h, p)
+  })
+
+  test.each([
+    ['not latched', false],
+    ['latched', true],
+  ] as const)('another persona Q beside P, %s, is untouched by P\'s clear by hand: its latch, posts, timer and calls as they were', async (_label, latchQ) => {
+    const { h, p, q } = latchForRecheck(ANOTHER_STORE_RESUME_ROW, { state: LIVENESS_DEAD_ROW_ENDED })
+    if (latchQ) STATUS_ONLY_ROW.latchOn(h.latchSet, q)
+    const qRecord = h.latch.record(q)
+    expect(await h.latchRecheck.clearByHand(p)).toBe(true)
+    await settleClearJob(h, p)
+    expect(h.latch.isLatched(p)).toBe(false)
+    expect([
+      h.latch.record(q),
+      h.episodeNotices.filter((notice) => notice.key === q).length,
+      h.latchRecheck.isArmed(q),
+      personaCallCounts(h, q),
+      isRestartPendingOrActive(q),
+      clearedLinesIn(h.errors, q),
+    ]).toEqual([qRecord, latchQ ? 1 : 0, latchQ, {}, false, []])
+    await stopApprover(h, p)
+  })
+
+  test.each([
+    ['UNAVAILABLE (ErrTmuxUnresponsive)', () => errTmuxUnresponsive('find-missing'), []],
+    ['CONFIG (ErrConfigMalformed)', () => errConfigMalformed(), ['ad-config-malformed']],
+  ] as const)('a refused run (apply21): the bypassing find-missing answering %s; the clear still answers true with its one recovery post, makes no launch in that attempt and leaves P unlatched to its retry timer, armed, with the outage its class raises', async (_label, refusal, outages: readonly OutageClass[]) => {
+    const { h, p, record } = latchForRecheck(ANOTHER_STORE_RESUME_ROW, { state: LIVENESS_DEAD_ROW_ENDED })
+    failFindMissing(h, refusal())
+    const from = h.timedCalls.length
+    expect(await h.latchRecheck.clearByHand(p)).toBe(true)
+    await settleClearJob(h, p)
+    expect(personaCallsFrom(h, p, from).map((call) => call.verb)).toEqual(['findMissing'])
+    expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_CLEARED_BY_HAND)])
+    expectClearedState(h, p)
+    expect([h.controller.isArmed(p), [...getOutageFlags(p)]]).toEqual([true, [...outages]])
+    expect(h.errors.filter((line) => line.includes(REFUSED_RUN_LINE_PART))).toHaveLength(1)
+    expect(retryAtOnceLinesOf(h, p)).toEqual([])
   })
 })
 

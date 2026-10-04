@@ -8,6 +8,8 @@
  */
 
 import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'fs'
+import { dirname } from 'path'
+import { removeServerPortRecord, serverPortFilePath } from './clear-latch.ts'
 
 // ---------------------------------------------------------------------------
 // PID file functions
@@ -33,7 +35,8 @@ export function isProcessRunning(pid: number): boolean {
  * - If PID file exists and the process is running: logs a [slack]-prefixed
  *   error to stderr and exits with code 1.
  * - If PID file exists but the process is not running: removes the stale
- *   file and proceeds.
+ *   file and the `server.port` record beside it (b.jg5 SRJ-510; best effort,
+ *   an absent record included) and proceeds.
  */
 export function checkPidConflict(pidFile: string): void {
   if (!existsSync(pidFile)) return
@@ -46,10 +49,11 @@ export function checkPidConflict(pidFile: string): void {
     process.exit(1)
   }
 
-  // Stale PID file — remove it and proceed
+  // Stale PID file — remove it, and the listener's record beside it, and proceed
   try {
     unlinkSync(pidFile)
   } catch { /* ignore */ }
+  removeServerPortRecord(serverPortFilePath(dirname(pidFile)))
 }
 
 /**

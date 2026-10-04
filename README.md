@@ -748,8 +748,8 @@ Reads `STATE_DIR/server.pid` and sends `SIGTERM` to the process.
 Behavior by case:
 
 - **PID file missing:** prints `server is not running` and exits 0.
-- **Stale PID file** (process no longer running): removes the PID file, prints `server is not running (removed stale PID file)`, exits 0.
-- **Live process:** sends `SIGTERM`, polls for exit for up to `stop_timeout` seconds (default 30s), read from the last-applied record when there is one. Prints `[slack] Server stopped.` on clean exit. Escalates to `SIGKILL` if the process does not exit within `stop_timeout`.
+- **Stale PID file** (process no longer running): removes the PID file and `server.port`, prints `server is not running (removed stale PID file)`, exits 0.
+- **Live process:** sends `SIGTERM`, polls for exit for up to `stop_timeout` seconds (default 30s), read from the last-applied record when there is one. Prints `[slack] Server stopped.` on clean exit. Escalates to `SIGKILL` if the process does not exit within `stop_timeout`, then prints `[slack] Server killed.` once it has exited. Either way, it removes the PID file and `server.port` (see [PID file](#pid-file)).
 
 Plain `stop` leaves the managed bots running — they are meant to survive a server restart. Pass `--stop-bots` to gracefully exit the bots too:
 
@@ -983,6 +983,8 @@ On a running server, a new or replaced credentials file waits for confirmation l
 ### PID file
 
 The PID file is stored at `STATE_DIR/server.pid` (default: `~/.claude/channels/slack/server.pid`). It is written on startup and removed on clean shutdown. A conflict check at startup prevents running two servers against the same state directory.
+
+Beside it, `STATE_DIR/server.port` records the server's process ID and the port it actually listens on. The server writes it once it is listening and removes it on shutdown. A start that finds a stale PID file removes a stale `server.port` with it, and `stop` removes it with the PID file.
 
 ### Installing from a local worktree
 

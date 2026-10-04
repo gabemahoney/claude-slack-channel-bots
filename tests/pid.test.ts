@@ -9,6 +9,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { isProcessRunning, checkPidConflict, writePidFile, removePidFile } from '../src/pid.ts'
+import { serverPortFilePath, writeServerPortRecord } from '../src/clear-latch.ts'
+import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 
 // ---------------------------------------------------------------------------
 // Test isolation helpers
@@ -16,6 +18,8 @@ import { isProcessRunning, checkPidConflict, writePidFile, removePidFile } from 
 
 let tempDir: string
 let pidFile: string
+/** The `server.port` record beside {@link pidFile} (b.jg5 SRJ-510). */
+let portFile: string
 
 /** Capture arrays for stubbed side effects. */
 let errorMessages: string[]
@@ -36,6 +40,7 @@ class ExitError extends Error {
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'pid-test-'))
   pidFile = join(tempDir, 'server.pid')
+  portFile = serverPortFilePath(tempDir)
 
   errorMessages = []
   exitCodes = []
@@ -55,7 +60,12 @@ beforeEach(() => {
 afterEach(() => {
   console.error = orig_console_error
   process.exit = orig_process_exit
-  rmSync(tempDir, { recursive: true, force: true })
+  try {
+    // The PID and server.port files left behind and every line logged (src/clear-latch.ts is a secrecy surface).
+    assertNoLeak({ logs: errorMessages, files: writtenFile(tempDir) })
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true })
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -155,6 +165,13 @@ describe('checkPidConflict — no PID file', () => {
     runCheckPidConflict(pidFile)
     expect(exitCodes).toHaveLength(0)
   })
+
+  test('a server.port with no PID file beside it is left in place (it is removed only with a stale PID file)', () => {
+    writeServerPortRecord(portFile, { pid: 999999999, port: 40123 })
+    runCheckPidConflict(pidFile)
+    expect(existsSync(portFile)).toBe(true)
+    expect(exitCodes).toHaveLength(0)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -177,6 +194,15 @@ describe('checkPidConflict — stale PID file', () => {
   test('does not call process.exit for a stale PID', () => {
     writeFileSync(pidFile, '999999999\n', 'utf-8')
     runCheckPidConflict(pidFile)
+    expect(exitCodes).toHaveLength(0)
+  })
+
+  test('the server.port record beside a stale PID file is removed with it (b.jg5 SRJ-510)', () => {
+    writeFileSync(pidFile, '999999999\n', 'utf-8')
+    writeServerPortRecord(portFile, { pid: 999999999, port: 40123 })
+    runCheckPidConflict(pidFile)
+    expect(existsSync(pidFile)).toBe(false)
+    expect(existsSync(portFile)).toBe(false)
     expect(exitCodes).toHaveLength(0)
   })
 })
@@ -215,5 +241,14 @@ describe('checkPidConflict — running PID (conflict)', () => {
     writeFileSync(pidFile, `${process.pid}\n`, 'utf-8')
     runCheckPidConflict(pidFile)
     expect(existsSync(pidFile)).toBe(true)
+  })
+
+  test('the running server\'s server.port record stays beside its PID file (b.jg5 SRJ-510)', () => {
+    writeFileSync(pidFile, `${process.pid}\n`, 'utf-8')
+    writeServerPortRecord(portFile, { pid: process.pid, port: 40123 })
+    runCheckPidConflict(pidFile)
+    expect(existsSync(pidFile)).toBe(true)
+    expect(existsSync(portFile)).toBe(true)
+    expect(exitCodes).toEqual([1])
   })
 })

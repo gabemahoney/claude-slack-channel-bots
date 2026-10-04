@@ -42,8 +42,10 @@
  *    failure lines, the persona routing, the live-row sequence, whose step
  *    lines carry agent-director failure text, the old-life wait's round
  *    end, whose notice texts carry agent-director's CONFLICT and
- *    unusable-name answers, and the pending-row rule, whose lines quote
- *    the lap's and the run's agent-director outcomes), a value import of one
+ *    unusable-name answers, the pending-row rule, whose lines quote
+ *    the lap's and the run's agent-director outcomes, and the clear-latch
+ *    route, whose clear-failed line carries a clear by hand's rejection), a
+ *    value import of one
  *    of the `HELPER_SURFACES` helpers (the token builders and sentinel, the
  *    config-file writer, the agent-director settings-file writer, the reload,
  *    connection, routing and recovery harnesses, the Slack client factory
@@ -152,6 +154,7 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/invalid-flags-hold\.ts$/, "the ErrInvalidFlags hold, which posts its operator alert and logs the agent-director versions a re-check reported (a version that is not a short version string is logged as unreadable) and its reactions' failures (described, redacted)"],
   [/^src\/pending-row\.ts$/, "the pending-row rule, whose round, gate and failure lines quote the lap's and the bypassing run's agent-director outcomes (described, redacted) and whose lap Enter outcomes keep the thrown agent-director error raw"],
   [/^src\/persona-routing\.ts$/, "the persona routing, which receives a persona's Slack events, archives through its client and logs Slack failure text and its lost-message row read's agent-director failure text (described, redacted)"],
+  [/^src\/clear-latch\.ts$/, "the clear-latch route and the server.port record, whose clear-failed line carries a clear by hand's rejection (described, redacted), which can be agent-director failure text"],
 ]
 
 /** Test helpers whose named exports build tokens, credentials or config files, or plant the sentinel. */

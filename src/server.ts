@@ -88,6 +88,7 @@ import {
   checkPromptRowDeferral,
   checkWaitingRowPane,
   checkWorkingRowPane,
+  clearByHandOf,
   carriedDeadEvidenceOf,
   DEAD_SESSION_CAUSE_ROW_READ_FINISHED,
   type DeadEvidenceSource,
@@ -371,6 +372,14 @@ import { installSlackChannelBotTemplate } from './agent-director-template.ts'
 import { createCronLog } from './cron-log.ts'
 import { createCronDispatcher } from './cron-dispatch.ts'
 import { handleInterject } from './interject.ts'
+import {
+  CLEAR_LATCH_ROUTE,
+  handleClearLatch,
+  removeServerPortRecord,
+  serverPortFilePath,
+  serverPortWriteFailedLine,
+  writeServerPortRecord,
+} from './clear-latch.ts'
 import { createCronScheduler, type CronScheduler } from './cron-scheduler.ts'
 import { configInEffect, createReloadController, reloadFilePaths, type ReloadController } from './reload.ts'
 import { createReloadTickDriver } from './reload-timer.ts'
@@ -419,6 +428,8 @@ const STATE_DIR = resolveServerStateDir()
 const CONFIG_PATH = resolveServerConfigPath()
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const PID_FILE = join(STATE_DIR, 'server.pid')
+/** The listener's PID-and-port record beside the PID file (b.jg5 SRJ-510). */
+const SERVER_PORT_FILE = serverPortFilePath(STATE_DIR)
 const KEEP_ALIVE_INTERVAL_MS = 30_000
 
 // ---------------------------------------------------------------------------
@@ -1437,6 +1448,8 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
     console.error(`[slack] closeClient on shutdown threw (ignored): ${describeThrownValue(err)}`)
   }
 
+  // b.jg5 SRJ-510: the listener's record goes with the PID file.
+  removeServerPortRecord(SERVER_PORT_FILE)
   removePidFile(PID_FILE)
 
   console.error('[slack] Shutdown complete')
@@ -3463,6 +3476,11 @@ export async function main(): Promise<void> {
   })
   latchRecheckTimers = latchRecheck
   bindLatchRecheck(conflictLatch, latchRecheck)
+  // b.jg5 SRJ-510, SRJ-506: the clear by hand the `/clear-latch` route uses,
+  // through the re-check's one clear entry and after-clear sequence with the
+  // "cleared by hand" reason; it answers once the clear has run in the
+  // persona's serializer turn.
+  const clearByHand = clearByHandOf(latchRecheck)
   // b.jg5 SRJ-1011: the persona routing's lost-message state reads it.
   personaLatch = conflictLatch
   // b.jg5 SRJ-501, SRJ-502: the collision ladder latches through it on a
@@ -4076,6 +4094,18 @@ export async function main(): Promise<void> {
         })
       }
 
+      // -----------------------------------------------------------------------
+      // /clear-latch — clear one persona's latch by hand from localhost, for
+      // the operator only (b.jg5 SRJ-510, SRJ-511; handler in
+      // src/clear-latch.ts)
+      // -----------------------------------------------------------------------
+      if (url.pathname === CLEAR_LATCH_ROUTE) {
+        return handleClearLatch(req, server.requestIP(req)?.address, {
+          getPersonaConfig: () => personaConfig,
+          clearByHand,
+        })
+      }
+
       // Only /mcp is the MCP endpoint — everything else is a 404
       if (url.pathname !== '/mcp') {
         return new Response(
@@ -4139,6 +4169,15 @@ export async function main(): Promise<void> {
     },
   })
 
+  // b.jg5 SRJ-510: once the listener is up, record this process's PID and the
+  // listener's bound port (the ephemeral one for a port-0 configuration),
+  // before the PID file, so a `clear-latch` that finds a running PID finds
+  // the record. A failed write is one line; the server keeps serving.
+  try {
+    writeServerPortRecord(SERVER_PORT_FILE, { pid: process.pid, port: httpServer.port ?? mcpPort })
+  } catch (err) {
+    console.error(serverPortWriteFailedLine(SERVER_PORT_FILE, describeThrownValue(err)))
+  }
   writePidFile(PID_FILE)
 
   console.error(`[slack] MCP server listening on http://${mcpHost}:${mcpPort}/mcp`)

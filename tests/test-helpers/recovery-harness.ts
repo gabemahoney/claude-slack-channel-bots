@@ -462,7 +462,9 @@
  *   `pendingTimers()`, beside the controller's `isArmed(key)`,
  *   `armedKeys()` and `whenRoundSettled(key)` (a round's settling includes
  *   the after-clear sequence's run it owes), and the builder's `clear` and
- *   `clearAndRecover`. `advanceToRecheck()` moves
+ *   `clearAndRecover`, and the clear by hand over them (`clearByHand`:
+ *   `clearByHandOf(latchRecheck)`, as `main()` binds the `/clear-latch`
+ *   route's clear, b.jg5 SRJ-510). `advanceToRecheck()` moves
  *   the clock to the earliest pending re-check, settles its round
  *   (`settle()`) and answers the time it fired at; it throws when none is
  *   pending. `advance` awaits the rounds a firing starts (flush-bounded) and
@@ -1269,6 +1271,7 @@ import {
   _setDialogReadyTimeoutMs,
   _whenDialogApproverStopped,
   buildLatchRecheck,
+  clearByHandOf,
   type LatchRecheck,
   buildLiveRowSequenceDeps,
   cancelWorkingRowWait,
@@ -1753,11 +1756,19 @@ export type RecoveryLatchSetEntries = Pick<ConflictLatch, 'set' | 'setFromConfli
  * The harness's latch re-check timers, read-only (b.jg5 SRJ-505): the
  * controller's queries, and the tracked re-check timers on the harness clock;
  * and the builder's one clear entry and after-clear sequence (`clear`,
- * `clearAndRecover`; b.jg5 SRJ-506), as `buildLatchRecheck` answers them.
+ * `clearAndRecover`; b.jg5 SRJ-506), as `buildLatchRecheck` answers them;
+ * and the clear by hand over them (`clearByHand`, b.jg5 SRJ-510).
  */
 export interface RecoveryLatchRecheckView
   extends Pick<LatchRecheckController, 'isArmed' | 'armedKeys' | 'whenRoundSettled'>,
     Pick<LatchRecheck, 'clear' | 'clearAndRecover'> {
+  /**
+   * The clear by hand the `/clear-latch` route uses (b.jg5 SRJ-510, SRJ-506):
+   * `clearByHandOf` over this harness's re-check, the same binding `main()`
+   * makes over its own. Answers whether P was latched once the clear has run
+   * in P's serializer turn; the find-missing and the retry follow, unawaited.
+   */
+  readonly clearByHand: (key: string) => Promise<boolean>
   /** The earliest due time of a pending re-check timer, or undefined when none is pending. */
   nextDueAt(): number | undefined
   /** How many of the harness clock's pending timers are re-check timers. */
@@ -3392,6 +3403,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       whenRoundSettled: (key: string) => latchRecheck.whenRoundSettled(key),
       clear: latchRecheck.clear,
       clearAndRecover: latchRecheck.clearAndRecover,
+      clearByHand: clearByHandOf(latchRecheck),
       nextDueAt: () => nextDueOf(latchRecheckTimers),
       pendingTimers: () => latchRecheckTimers.size,
     }),

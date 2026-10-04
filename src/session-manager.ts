@@ -425,9 +425,10 @@
  * nothing (step 1's, a "launch start not recorded" row read finished, a
  * "conflicting labels" `pending` `read-pane`), and after a clear by hand, the
  * after-clear sequence's run follows as one job in the persona's lifecycle
- * serializer turn (right after the round, in the round's turn; submitted
- * through the serializer for a clear by hand, `runLatchClearSequence`),
- * outside the round's scope: one bypassing `find-missing` after step 1's
+ * serializer turn (right after the round, in the round's turn; for a clear
+ * by hand, one job submitted through the serializer whose first step is the
+ * clear itself, `runLatchClearSequence`), outside the round's scope: one
+ * bypassing `find-missing` after step 1's
  * clear and a clear by hand, then the persona retried at once through the
  * in-turn retry entry (`runRestartRetryInTurn`). From the clear to the run's
  * end the persona is held active (`holdRestartActive`), so the health tick
@@ -637,6 +638,7 @@ import {
   CONFLICT_LATCH_SET_SAME_CASE,
   LATCH_CASE_CONFLICTING_LABELS,
   LATCH_CASE_LAUNCH_START_NOT_RECORDED,
+  LATCH_RECOVERY_REASON_CLEARED_BY_HAND,
   LATCH_RECOVERY_REASON_RELAUNCH_NOT_REFUSED,
   LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED,
   RECHECK_CALL_FINISHED_ROW,
@@ -20349,9 +20351,9 @@ export interface LatchClearSequenceDeps {
   readonly appliedConfig: () => PersonaConfig | null | undefined
   /**
    * The one persona lifecycle serializer's submit (`PersonaSerializer.run`):
-   * a clear made outside the persona's turn (`runLatchClearSequence`)
-   * submits the sequence's run through it, never awaiting it from inside a
-   * turn.
+   * a clear by hand (`runLatchClearSequence`) submits one job through it,
+   * the clear its first step and the after-clear run in the same turn, never
+   * awaiting it from inside a turn.
    */
   readonly serialize: <T>(key: string, operation: () => T | Promise<T>) => Promise<T>
   /**
@@ -20411,6 +20413,15 @@ interface LatchClearRun {
  */
 function clearForSequence(key: string, reason: LatchRecoveryReason, deps: LatchClearSequenceDeps, findMissingFirst: boolean): LatchClearRun | undefined {
   if (!deps.clear(key, reason)) return undefined
+  return holdForSequence(key, deps, findMissingFirst)
+}
+
+/**
+ * What follows a clear that cleared (`clearForSequence`): the persona's
+ * working-row evidence forgotten, the persona held active, and its run
+ * answered, unstarted. Synchronous.
+ */
+function holdForSequence(key: string, deps: LatchClearSequenceDeps, findMissingFirst: boolean): LatchClearRun {
   forgetWorkingRowEvidence(key)
   const release = holdRestartActive(key)
   let ran: Promise<LatchClearSequenceOutcome> | undefined
@@ -20433,19 +20444,40 @@ function logLatchClear(deps: LatchClearSequenceDeps, line: string): void {
 }
 
 /**
- * The after-clear sequence for a clear made outside persona `key`'s
- * lifecycle serializer turn (b.jg5 SRJ-506, SRJ-120): a clear by hand,
- * through `clearAndRecover` (`buildLatchRecheck`). The clear is made
- * synchronously, before this function returns (`clearForSequence`): one
- * recovery post, the episode ended, the re-check timer stopped, one line;
- * an unlatched persona gets nothing more (`not-latched`). Then the
- * sequence's run is submitted through the persona's serializer
- * (`deps.serialize`), as one job, outside every launch or recovery attempt
- * and every latch re-check (`runOutsideAttempts`), so no re-check scope or
- * permit carries into it. Answers once the run has ended. Never awaited
- * from inside the persona's serializer turn: the run waits for that turn.
+ * What a clear by hand answers (`runLatchClearSequence`), in two parts:
+ *   - `cleared` settles once the job's clear has run in the persona's
+ *     lifecycle serializer turn, with whether the persona was latched, and
+ *     keeps that answer whatever the job does next; it rejects when the job
+ *     could not be submitted or the serializer rejected it before it ran
+ *     (nothing cleared or posted), and when the clear threw (no answer);
+ *   - `done` settles with what the whole job did once it has ended (never
+ *     rejects).
+ * A caller may await `cleared` alone: the job runs to its end whether or not
+ * anyone awaits either part, and a rejected `cleared` nobody awaits is no
+ * unhandled rejection.
+ */
+export interface LatchClearSequenceAnswer {
+  readonly cleared: Promise<boolean>
+  readonly done: Promise<LatchClearSequenceOutcome>
+}
+
+/**
+ * The clear by hand of persona `key` with `reason` and the after-clear
+ * sequence that follows it (b.jg5 SRJ-506, SRJ-510, SRJ-120), through
+ * `clearAndRecover` (`buildLatchRecheck`). One job is submitted through the
+ * persona's serializer (`deps.serialize`), outside every launch or recovery
+ * attempt and every latch re-check (`runOutsideAttempts`), so no re-check
+ * scope or permit carries into it; nothing is cleared before its turn comes,
+ * so a clear behind a running re-check round waits for that round (and the
+ * run it owes) and finds the latch as the round left it. Never awaited from
+ * inside the persona's serializer turn: the job waits for that turn.
  *
- * The run, in its turn, in order:
+ * The job, in its turn, in order:
+ *   0. the clear (`clearForSequence`): one recovery post, the episode ended,
+ *      the re-check timer stopped, one line, the working-row evidence
+ *      forgotten and the persona held active; `cleared` settles here. An
+ *      unlatched persona gets nothing more: no call, no post and no timer
+ *      change (`not-latched`, `cleared` false);
  *   1. a persona not in the applied configuration gets no call
  *      (`not-applied`); a persona latched again meanwhile gets none either
  *      (`relatched`);
@@ -20466,10 +20498,16 @@ function logLatchClear(deps: LatchClearSequenceDeps, line: string): void {
  *      restart cap) and accounting, which arms the retry timer for a
  *      `pending` row (b.jg5 SRJ-409) or starts the live-row sequence for a
  *      retired key's row (SRJ-411) as its decision says (`retried`).
- * From the clear to the run's end the persona is held active
- * (`holdRestartActive`). A run that cannot be submitted, or that the
- * serializer rejects, answers `retry-failed` with one line and releases the
- * hold. One line per step after the clear. Never rejects.
+ * From the clear to the job's end the persona is held active
+ * (`holdRestartActive`), and the hold is released once on every path, a
+ * throw inside the job included. A job that cannot be submitted, or that the
+ * serializer rejects before it ran, clears nothing and posts nothing:
+ * `cleared` rejects with the thrown value and `done` answers `retry-failed`
+ * with one line. A clear that throws answers nothing: `cleared` rejects with
+ * the thrown value, nothing runs after it, and `done` answers `retry-failed`
+ * with one line. A throw after the clear answered leaves `cleared` with that
+ * answer, and `done` answers `retry-failed` with one line. One line per step
+ * after the clear. Never throws.
  *
  *   [slack] latch-clear: <ref> is not in the applied configuration — no find-missing and no retry after its latch cleared (b.jg5 SRJ-506)
  *   [slack] latch-clear: <ref> is latched again before the run that follows its clear — nothing is called for it (b.jg5 SRJ-506, SRJ-502)
@@ -20478,27 +20516,83 @@ function logLatchClear(deps: LatchClearSequenceDeps, line: string): void {
  *   [slack] latch-clear: <ref>'s retry at once after its latch cleared answered <outcome> (b.jg5 SRJ-506)
  *   [slack] latch-clear: <ref>'s retry at once after its latch cleared failed: <error> (b.jg5 SRJ-506)
  *   [slack] latch-clear: the run after <ref>'s latch cleared could not be run in its serializer turn: <error> (b.jg5 SRJ-506)
+ *   [slack] latch-clear: the clear of <ref> failed: <error> — nothing runs after it (b.jg5 SRJ-506)
+ *   [slack] latch-clear: the run after <ref>'s latch cleared failed: <error> (b.jg5 SRJ-506)
  */
 export function runLatchClearSequence(
   key: string,
   reason: LatchRecoveryReason,
   deps: LatchClearSequenceDeps,
   options: LatchClearSequenceOptions = {},
-): Promise<LatchClearSequenceOutcome> {
-  return runOutsideAttempts(() => {
-    const cleared = clearForSequence(key, reason, deps, options.findMissingFirst !== false)
-    if (cleared === undefined) return Promise.resolve({ kind: LATCH_CLEAR_SEQUENCE_NOT_LATCHED })
-    const notRun = (thrown: unknown): LatchClearSequenceOutcome => {
-      cleared.release()
-      logLatchClear(deps, `[slack] ${LATCH_CLEAR_SITE}: the run after ${keyRef(key)}'s latch cleared could not be run in its serializer turn: ${describeThrownValue(thrown)} (b.jg5 SRJ-506)`)
-      return { kind: LATCH_CLEAR_SEQUENCE_RETRY_FAILED }
-    }
-    try {
-      return deps.serialize(key, cleared.run).catch(notRun)
-    } catch (thrown) {
-      return Promise.resolve(notRun(thrown))
-    }
+): LatchClearSequenceAnswer {
+  const findMissingFirst = options.findMissingFirst !== false
+  let settleCleared: (latched: boolean) => void = () => {}
+  let failCleared: (thrown: unknown) => void = () => {}
+  const cleared = new Promise<boolean>((resolve, reject) => {
+    settleCleared = resolve
+    failCleared = reject
   })
+  // A caller that awaits only `done` leaves no unhandled rejection behind.
+  cleared.catch(() => {})
+  // Set once the clear has answered: from then on `cleared` is settled with
+  // that answer, and a later failure is the run's, not the submission's.
+  let clearRan = false
+  const afterClearFailed = (thrown: unknown): LatchClearSequenceOutcome => {
+    logLatchClear(deps, `[slack] ${LATCH_CLEAR_SITE}: the run after ${keyRef(key)}'s latch cleared failed: ${describeThrownValue(thrown)} (b.jg5 SRJ-506)`)
+    return { kind: LATCH_CLEAR_SEQUENCE_RETRY_FAILED }
+  }
+  const job = (): Promise<LatchClearSequenceOutcome> =>
+    runOutsideAttempts(async (): Promise<LatchClearSequenceOutcome> => {
+      let latched: boolean
+      try {
+        latched = deps.clear(key, reason)
+      } catch (thrown) {
+        // The clear answered nothing: whether it cleared is unknown.
+        failCleared(thrown)
+        logLatchClear(deps, `[slack] ${LATCH_CLEAR_SITE}: the clear of ${keyRef(key)} failed: ${describeThrownValue(thrown)} — nothing runs after it (b.jg5 SRJ-506)`)
+        return { kind: LATCH_CLEAR_SEQUENCE_RETRY_FAILED }
+      }
+      clearRan = true
+      settleCleared(latched)
+      if (!latched) return { kind: LATCH_CLEAR_SEQUENCE_NOT_LATCHED }
+      let run: LatchClearRun | undefined
+      try {
+        run = holdForSequence(key, deps, findMissingFirst)
+        return await run.run()
+      } catch (thrown) {
+        return afterClearFailed(thrown)
+      } finally {
+        // Idempotent: the run's own release has already run when it ended.
+        run?.release()
+      }
+    })
+  const notRun = (thrown: unknown): LatchClearSequenceOutcome => {
+    if (clearRan) return afterClearFailed(thrown)
+    failCleared(thrown)
+    logLatchClear(deps, `[slack] ${LATCH_CLEAR_SITE}: the run after ${keyRef(key)}'s latch cleared could not be run in its serializer turn: ${describeThrownValue(thrown)} (b.jg5 SRJ-506)`)
+    return { kind: LATCH_CLEAR_SEQUENCE_RETRY_FAILED }
+  }
+  let done: Promise<LatchClearSequenceOutcome>
+  try {
+    done = runOutsideAttempts(() => deps.serialize(key, job)).catch(notRun)
+  } catch (thrown) {
+    done = Promise.resolve(notRun(thrown))
+  }
+  return { cleared, done }
+}
+
+/**
+ * The clear by hand the `/clear-latch` route uses (b.jg5 SRJ-510, SRJ-506,
+ * SRJ-1005): `recheck.clearAndRecover` with the "cleared by hand" reason
+ * (`LATCH_RECOVERY_REASON_CLEARED_BY_HAND`), answering only its `cleared`
+ * part, whether the persona was latched, once the clear has run in the
+ * persona's serializer turn. The bypassing `find-missing` and the retry
+ * that follow run on, unawaited (`done` never rejects). `main()` applies it
+ * once to its latch re-check, and the recovery harness to its own, so both
+ * clear by hand through the same composition.
+ */
+export function clearByHandOf(recheck: Pick<LatchRecheck, 'clearAndRecover'>): (key: string) => Promise<boolean> {
+  return (key) => recheck.clearAndRecover(key, LATCH_RECOVERY_REASON_CLEARED_BY_HAND).cleared
 }
 
 /** The after-clear sequence's run (`runLatchClearSequence`'s steps 1 to 3), in the persona's serializer turn. Never rejects. */
@@ -20616,14 +20710,15 @@ export interface LatchRecheck extends LatchRecheckController {
    */
   readonly clear: LatchClear
   /**
-   * The after-clear sequence (`runLatchClearSequence`) over `clear`, with
-   * its bypassing `find-missing` first: for a clear by hand, with
-   * `LATCH_RECOVERY_REASON_CLEARED_BY_HAND`. The clear is made before it
-   * returns; its run is submitted through the persona's serializer, and the
-   * answer settles once that run has ended. Never awaited from inside the
-   * persona's serializer turn.
+   * The clear by hand and its after-clear sequence (`runLatchClearSequence`)
+   * over `clear`, with its bypassing `find-missing` first: for a clear by
+   * hand, with `LATCH_RECOVERY_REASON_CLEARED_BY_HAND` (`clearByHandOf`).
+   * One job through the persona's serializer, the clear its first step;
+   * answers `cleared` once the clear has run in that turn and `done` once
+   * the job has ended. Never awaited from inside the persona's serializer
+   * turn.
    */
-  readonly clearAndRecover: (key: string, reason: LatchRecoveryReason) => Promise<LatchClearSequenceOutcome>
+  readonly clearAndRecover: (key: string, reason: LatchRecoveryReason) => LatchClearSequenceAnswer
 }
 
 /**

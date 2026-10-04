@@ -588,6 +588,8 @@ const LATCH_FACTORY: keyof typeof ConflictLatchModule = 'createConflictLatch'
 const RECHECK_BUILDER: keyof typeof SessionManagerModule = 'buildLatchRecheck'
 /** The latch re-check's binder (b.jg5 SRJ-505); renaming it fails the typecheck. */
 const RECHECK_BIND: keyof typeof ConflictLatchModule = 'bindLatchRecheck'
+/** The clear by hand's binding over the re-check, the `/clear-latch` route's clear (b.jg5 SRJ-510); renaming it fails the typecheck. */
+const CLEAR_BY_HAND_OF: keyof typeof SessionManagerModule = 'clearByHandOf'
 /** The builder's latch input (b.jg5 SRJ-505); renaming it fails the typecheck. */
 const RECHECK_LATCH: keyof LatchRecheckInput = 'latch'
 
@@ -4044,11 +4046,16 @@ describe('main() builds the latch re-check once, through the session manager\'s 
     expect(indicesOf(new RegExp(`\\.\\s*(?:${ADD_SET}|${ADD_FORGET})\\s*\\(`, 'g'), SERVER_CODE)).toEqual([])
   })
 
-  test('the re-check is named only at its build, the holder\'s one assignment and its binding (the health tick, the restart module and the retry controller are not handed it); the holder is assigned it once, in main()\'s own statement list after the build, and named only at its declaration, that assignment and shutdown\'s stop', () => {
+  test('the re-check is named only at its build, the holder\'s one assignment, its binding and the one clear-by-hand binding over it (the health tick, the restart module and the retry controller are not handed it); the holder is assigned it once, in main()\'s own statement list after the build, and named only at its declaration, that assignment and shutdown\'s stop', () => {
     const recheck = constOf(RECHECK_BUILDER)
     const named = indicesOf(new RegExp(`\\b${recheck}\\b`, 'g'), SERVER_CODE)
-    expect(named).toHaveLength(3)
+    expect(named).toHaveLength(4)
     expect(withinCall(named, onlyCallOf(RECHECK_BIND))).toBe(1)
+    // b.jg5 SRJ-510: the fourth is the sole argument of the one clear-by-hand
+    // binding, not a second build (withinCall skips a first argument, so the
+    // argument's start is checked).
+    expect(onlyCallArgs(CLEAR_BY_HAND_OF)).toEqual([recheck])
+    expect(named).toContain(balancedAfter(SERVER_CODE, onlyCallOf(CLEAR_BY_HAND_OF), '(', ')')[0])
     for (const call of ['initHealthCheck', 'initRestart', 'createUnavailableRetryController']) {
       expect([call, withinCall(named, onlyCallOf(call))]).toEqual([call, 0])
     }
