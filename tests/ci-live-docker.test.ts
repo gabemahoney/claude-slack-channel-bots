@@ -1856,20 +1856,44 @@ describe('runner wiring (source audit of ci-live/)', () => {
     ])
   })
 
-  test("the test human's sign-in answers an emailed code from the mailbox with live.json's test email; the second user's reads no mailbox", () => {
+  test("each account's sign-in answers an emailed code from the mailbox with its own email: the test human's live.json test email, the second user's second_user email", () => {
     const text = code(join('runtime', 'workspace.ts'))
     const answer = objectProperties(onlyCallArguments(text, 'answerSignInCodeFromMailbox'))
     expect([answer.get('openMailbox'), answer.get('testEmail'), answer.get('submitCode')]).toEqual(['mailbox.open', 'mailbox.testEmail', '(code) => driver.submitSignInCode(code)'])
     const humanMailbox = objectProperties(text.slice(text.indexOf('const humanMailbox =')))
     expect([humanMailbox.get('open'), humanMailbox.get('testEmail')]).toEqual(['openMailbox', 'live.testEmail'])
+    const secondMailbox = objectProperties(text.slice(text.indexOf('const secondMailbox =')))
+    expect([secondMailbox.get('open'), secondMailbox.get('testEmail')]).toEqual(['openMailbox', 'cfg.email'])
     // The two calls of launch (not its declaration): who signs in, and the mailbox the code is read from.
     const launches = callsOf(text, 'launch')
       .map((at) => splitTopLevel(callArguments(text, at)))
       .filter((args) => args[0] === 'o')
     expect(launches.map((args) => [args[1], args.at(-1)])).toEqual([
       ["'human'", 'humanMailbox'],
-      ["'second'", 'null'],
+      ["'second'", 'secondMailbox'],
     ])
+  })
+
+  test("login answers an emailed code from the mailbox with the signing-in account's email first, and asks on the terminal only after", () => {
+    const text = code('main.ts')
+    const login = text.slice(...balancedAfter(text, text.indexOf('async function runLogin('), '{', '}'))
+    expect(login).toContain("const email = who === 'second' && second ? second.email : ws.live.testEmail")
+    const answer = objectProperties(onlyCallArguments(login, 'answerSignInCodeFromMailbox'))
+    expect([answer.get('openMailbox'), answer.get('testEmail'), answer.get('submitCode')]).toEqual(['ws.openMailbox', 'email', '(code) => signIn.submitSignInCode(code)'])
+    expectInOrder(login, ['const attemptStartedAt = realClock.now()', 'await signIn.ensureSignedIn()', 'answerSignInCodeFromMailbox(', 'promptHidden('])
+  })
+
+  test('an account with no password asks for an emailed code on the email sign-in page; one with a password signs in with it', () => {
+    const driver = code(join('browser', 'driver.ts'))
+    const signIn = driver.slice(...balancedAfter(driver, driver.indexOf('async ensureSignedIn('), '{', '}'))
+    expect(signIn).toContain('if (password === null) outcome = await signInWithEmailedCode(await this.usablePage(), this.o.urls, this.o.domain, email)')
+    expect(signIn).toContain('else outcome = await signInWithPassword(')
+    const flow = code(join('browser', 'login.flow.ts'))
+    const emailed = flow.slice(...balancedAfter(flow, flow.indexOf('export async function signInWithEmailedCode('), '{', '}'))
+    expectInOrder(emailed, ['gotoWithRetry(page, urls.codeSignIn(domain))', 'emailField.fill(email)', 'submit.click()', 'captcha:', "if (state === 'captcha') {", 'throw new NotRunnableError(', 'return outcomeAfterSubmit(page)'])
+    // A captcha is never answered: no flow clicks or types into the reCAPTCHA frame.
+    expect(flow).not.toMatch(/recaptcha[^\n]*\.(click|fill|check|type)\(/i)
+    expect(code(join('lib', 'slack-urls.ts'))).toContain('codeSignIn: (domain) => `https://${domain}.slack.com/`')
   })
 })
 

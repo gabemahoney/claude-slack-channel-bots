@@ -346,6 +346,12 @@ describe('SecretStore reads', () => {
       assertNoLeak(err)
     })
 
+    test('a code-only account (no password_env, no password_file) has no password: null, nothing read or touched', () => {
+      const h = makeStore({ env: { SECOND_PW } })
+      expect(h.store.readSecondPassword({ email: second.email })).toBeNull()
+      expect([h.store.accessed, h.mem.reads]).toEqual([[], []])
+    })
+
     test('a sign-in code challenge names the login command for that account', () => {
       const errors = [new SignInCodeNeededError('human'), new SignInCodeNeededError('second')]
       expect(errors.map((e) => [e instanceof NotRunnableError, e.who, /`bun ci-live\/run\.ts login( --second)?`/.exec(e.message)?.[0]])).toEqual([
@@ -366,7 +372,9 @@ describe('SecretStore reads', () => {
       [{ email: 'second@example.invalid', password_env: 'SECOND_PW' }, { email: 'second@example.invalid', password_env: 'SECOND_PW' }],
       [{ email: 'second@example.invalid', password_file: '/f' }, { email: 'second@example.invalid', password_file: '/f' }],
       [{ email: 'second@example.invalid', password_env: 'lower-case' }, null],
-      [{ email: 'second@example.invalid' }, null],
+      [{ email: 'second@example.invalid', password_file: '' }, null],
+      // No password source: a code-only account.
+      [{ email: 'second@example.invalid' }, { email: 'second@example.invalid' }],
       [{ email: 'not an email', password_env: 'X' }, null],
     ])('second_user %p gives %p', (second, expected) => {
       const h = makeStore()

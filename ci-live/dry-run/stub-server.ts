@@ -72,6 +72,16 @@ function signInPage(error = ''): Response {
   )
 }
 
+/** The email sign-in page (an account with no password): Slack emails a code. */
+function codeSignInPage(): Response {
+  return page(
+    'Sign in',
+    `<h1>Sign in to the stub workspace</h1>
+<form method="post"><label>Email address <input type="email" name="email" id="signup_email"></label>
+<button type="submit" id="submit_btn">Sign In With Email</button></form>`,
+  )
+}
+
 /**
  * How long the stub takes to answer a typed code. The prompt stays as it
  * was meanwhile, with any refusal it showed: the runner must not take that
@@ -384,6 +394,12 @@ export function startStubServer(options: { domain: string; email: string; passwo
         if (ws.startEmailCode(Date.now())) return redirect('/fixture/confirm_code')
         return redirect('/fixture/client', { 'Set-Cookie': `d=${encodeURIComponent(ws.cookie)}; Path=/; HttpOnly; SameSite=Lax` })
       }
+      if (path === '/fixture/sign_in_with_code') {
+        if (req.method === 'GET') return codeSignInPage()
+        if ((await formOf(req)).email !== ws.email) return codeSignInPage()
+        if (ws.startEmailCode(Date.now())) return redirect('/fixture/confirm_code')
+        return redirect('/fixture/client', { 'Set-Cookie': `d=${encodeURIComponent(ws.cookie)}; Path=/; HttpOnly; SameSite=Lax` })
+      }
       if (path === '/fixture/confirm_code') {
         if (!ws.hasPendingCode()) return redirect('/fixture/sign_in_with_password')
         if (req.method === 'GET') return codePage()
@@ -445,6 +461,7 @@ export function startStubServer(options: { domain: string; email: string; passwo
   const baseUrl = `http://127.0.0.1:${server.port}`
   const urls: SlackUrls = {
     signIn: () => `${baseUrl}/fixture/sign_in_with_password`,
+    codeSignIn: () => `${baseUrl}/fixture/sign_in_with_code`,
     humanApiBase: () => `${baseUrl}/human-api/`,
     clientHome: () => `${baseUrl}/fixture/client`,
     installApp: (appId) => `${baseUrl}/fixture/apps/${appId}/install-on-team`,

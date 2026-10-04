@@ -286,7 +286,10 @@ export function readPrivateFile(fs: SecureFs, path: string): string {
 export interface SecondUserConfig {
   /** The second workspace user's email (config, never logged). */
   email: string
-  /** Where its password is: a file path (mode 600) or an environment variable name. */
+  /**
+   * Where its password is: a file path (mode 600) or an environment variable
+   * name. Neither: the account has no password and signs in by emailed code.
+   */
   password_file?: string
   password_env?: string
 }
@@ -521,8 +524,13 @@ export class SecretStore {
     }
   }
 
-  /** The second user's password: its `password_env` variable, else its `password_file` (mode 600). */
-  readSecondPassword(second: SecondUserConfig): string {
+  /**
+   * The second user's password: its `password_env` variable, else its
+   * `password_file` (mode 600); `null` when it names neither (it signs in by
+   * emailed code).
+   */
+  readSecondPassword(second: SecondUserConfig): string | null {
+    if (!second.password_env && !second.password_file) return null
     if (second.password_env) {
       const value = this.o.env[second.password_env]
       if (value !== undefined && value !== '') {
@@ -626,5 +634,7 @@ function parseSecondUser(value: unknown): SecondUserConfig | null {
   const out: SecondUserConfig = { email: v.email }
   if (typeof v.password_file === 'string' && v.password_file !== '') out.password_file = v.password_file
   if (typeof v.password_env === 'string' && /^[A-Z_][A-Z0-9_]*$/.test(v.password_env)) out.password_env = v.password_env
-  return out.password_file || out.password_env ? out : null
+  // A password source given but unusable is a mistyped entry, not a code-only account.
+  if (!out.password_file && !out.password_env && (v.password_file !== undefined || v.password_env !== undefined)) return null
+  return out
 }

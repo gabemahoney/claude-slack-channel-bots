@@ -7,8 +7,11 @@
  * mailbox when there is one (lib/sign-in-code.ts), and otherwise stops
  * (exit 2) and tells the operator to run `bun ci-live/run.ts login` once,
  * which asks for the code on the terminal without echoing it. A refused
- * password is non-runnable. Neither the email, the password nor a code is
- * logged; each is typed into its field only.
+ * password is non-runnable. An account with no password (a code-only second
+ * account) asks for an emailed code instead, on the workspace's email
+ * sign-in page (`https://<domain>.slack.com/`), and is answered the same way.
+ * Neither the email, the password nor a code is logged; each is typed into
+ * its field only.
  *
  * A code (from either) is typed into the prompt's cleared fields; a refusal
  * still shown from an earlier code is no answer to it until that refusal
@@ -83,6 +86,40 @@ export async function signInWithPassword(page: Page, urls: SlackUrls, domain: st
   ])
   if (!submit) throw new FlowError('sign-in: no sign-in button')
   await submit.click()
+  return outcomeAfterSubmit(page)
+}
+
+/** How long the email sign-in page has to show the code prompt (or a captcha) after the request. */
+const CODE_REQUEST_MS = 30_000
+
+/**
+ * Sign an account with no password in: ask for an emailed code on the
+ * workspace's email sign-in page. `needs-code` once the code prompt shows;
+ * the code is then answered as a new device's is. A reCAPTCHA checkbox
+ * shown instead (as Slack shows headless Chrome) is not runnable: the runner
+ * never answers a captcha.
+ */
+export async function signInWithEmailedCode(page: Page, urls: SlackUrls, domain: string, email: string): Promise<SignInOutcome> {
+  await gotoWithRetry(page, urls.codeSignIn(domain))
+  const emailField = await firstVisible([page.locator('#signup_email'), page.locator('input[type="email"]'), page.getByLabel(/email/i)])
+  if (!emailField) throw new FlowError('sign-in: no email field')
+  await emailField.fill(email)
+  const submit = await firstVisible([page.locator('#submit_btn'), page.getByRole('button', { name: /sign in with email/i })])
+  if (!submit) throw new FlowError('sign-in: no "Sign In With Email" button')
+  await submit.click()
+  const state = await waitForState(
+    {
+      asked: async () => SIGNED_IN_URL_RE.test(bareUrl(page)) || (await firstVisible(codeInputs(page), 200)) !== null,
+      // The checkbox's frame (the first: its challenge frame comes after it).
+      captcha: async () => page.frameLocator('iframe[src*="recaptcha"]').first().getByText(/not a robot/i).first().isVisible(),
+    },
+    CODE_REQUEST_MS,
+  )
+  if (state === 'captcha') {
+    throw new NotRunnableError(
+      'Slack showed a captcha ("I\'m not a robot") instead of emailing a sign-in code: the runner does not answer captchas; give the account a password (live.json second_user.password_file or password_env)',
+    )
+  }
   return outcomeAfterSubmit(page)
 }
 
