@@ -33,6 +33,11 @@
  * interval, time limit, runbook title and the runtime phrase is imported from
  * `src/`; one case pins the interval constant to SRJ-204's 120 s.
  *
+ * The floor is confirmed from the Phase 1 release candidate:
+ * `PHASE1_RC_VERSION` parses as the floor with pre-release `rc.1` (SRJ-201,
+ * SRJ-1304), and any `<floor>-rc.N` passes it (SRJ-202). Its confirmation
+ * from the Phase 1 release itself is the Plan's Epic E51's.
+ *
  * The runtime re-check runs on `createFakeClock` with
  * `makeStubResolveSystemBinary` and no health check (the
  * `health_check_interval` 0 condition): its own timer is the only one armed.
@@ -251,6 +256,24 @@ describe('meetsPhase1Floor', () => {
     expect(meetsPhase1Floor(version)).toBe(true)
   })
 
+  /** Later release candidates of the floor; rc.10 sorts below rc.2 as a string, above it in SemVer. */
+  const FLOOR_RC_2 = `${PHASE1_FLOOR_VERSION}-rc.2`
+  const FLOOR_RC_10 = `${PHASE1_FLOOR_VERSION}-rc.10`
+
+  test('self-check: the floor\'s rc.10 sorts below its rc.2 as a string and above it in SemVer, and both sit below the floor in SemVer', () => {
+    expect(FLOOR_RC_10 < FLOOR_RC_2).toBe(true)
+    expect(semver.gt(FLOOR_RC_10, FLOOR_RC_2)).toBe(true)
+    expect(semver.lt(FLOOR_RC_2, PHASE1_FLOOR_VERSION)).toBe(true)
+    expect(semver.lt(FLOOR_RC_10, PHASE1_FLOOR_VERSION)).toBe(true)
+  })
+
+  test.each([
+    ["the floor's rc.2", FLOOR_RC_2],
+    ["the floor's rc.10", FLOOR_RC_10],
+  ])('passes %s (%s): a <floor>-rc.N counts as the floor, the pre-release not compared (SRJ-201, SRJ-202)', (_label, version) => {
+    expect(meetsPhase1Floor(version)).toBe(true)
+  })
+
   test.each([
     ['the release before Phase 1', OLD_AD_VERSION],
     ["the client's dev sentinel (the client's own rule ranks it above every floor, and CSCB refuses it)", DEV_PLACEHOLDER_VERSION],
@@ -284,6 +307,18 @@ describe('meetsPhase1Floor', () => {
 // ---------------------------------------------------------------------------
 
 describe('agent-director-versions helper', () => {
+  test("PHASE1_RC_VERSION is the floor's first release candidate: strict SemVer, the floor's major.minor.patch, pre-release rc.1 (SRJ-201, SRJ-1304)", () => {
+    const rc = semver.parse(PHASE1_RC_VERSION)
+    const floor = semver.parse(PHASE1_FLOOR_VERSION)
+    expect(rc).not.toBeNull()
+    expect(floor).not.toBeNull()
+    // Strict: the parsed form is the whole string (no leading v, no +build, no whitespace).
+    expect(rc!.version).toBe(PHASE1_RC_VERSION)
+    expect([rc!.major, rc!.minor, rc!.patch]).toEqual([floor!.major, floor!.minor, floor!.patch])
+    expect(rc!.prerelease).toEqual(['rc', 1])
+    expect(rc!.build).toEqual([])
+  })
+
   test('OLD_AD_VERSION is at or above the client minimum: the client admits it, only CSCB refuses it', () => {
     expect(semver.gte(OLD_AD_VERSION, CLIENT_MIN_VERSION)).toBe(true)
     expect(meetsPhase1Floor(OLD_AD_VERSION)).toBe(false)

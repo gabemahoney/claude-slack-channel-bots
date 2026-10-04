@@ -11,7 +11,7 @@
  * the Phase 1 note (b.jg5 SRJ-212) and the block ends with it: the server
  * refuses to start on that binary until agent-director Phase 1 is installed,
  * see the switch-over runbook section. A binary that meets the floor prints
- * the block alone.
+ * the block alone. The note line's label is `INSTALL_CHECK_NOTE_LABEL`.
  *
  * Appends the manual-skill-install instructions block to every failure
  * class EXCEPT ad-version-floor-unreadable — that case's remediation is
@@ -32,6 +32,13 @@ import { AD_VERSION_FLOOR_UNREADABLE, runInstallCheck } from '../src/install-che
 import type { InstallCheckResult } from '../src/install-check.ts'
 import { renderInstallSkillInstructions } from '../src/install-skill-pointer.ts'
 
+/**
+ * The label the OK block's Phase 1 note line starts with, after its indent
+ * (b.jg5 SRJ-212). The install skill relays the note found under this label
+ * (SRJ-1110).
+ */
+export const INSTALL_CHECK_NOTE_LABEL = 'note:'
+
 /** The OK block, then the Phase 1 note when the result carries one. */
 export function renderSuccess(result: InstallCheckResult & { ok: true }): string {
   const lines = [
@@ -41,7 +48,7 @@ export function renderSuccess(result: InstallCheckResult & { ok: true }): string
     `  floor:   ${result.floor}`,
   ]
   if (result.note !== undefined) {
-    lines.push(`  note:    ${result.note}`)
+    lines.push(`  ${INSTALL_CHECK_NOTE_LABEL}    ${result.note}`)
   }
   return lines.join('\n')
 }

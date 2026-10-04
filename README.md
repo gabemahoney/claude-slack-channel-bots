@@ -89,8 +89,8 @@ The script is purely diagnostic — it never prompts, never runs an install comm
 
 ### Installing the install-cscb skill
 
-If `bun run install-check` (or the startup gate) reports one of the
-`ad-system-install-*` failure classes, you can install the `install-cscb`
+If `bun run install-check` passes with a note, or it or the startup gate
+reports one of the `ad-system-install-*` failure classes, you can install the `install-cscb`
 Claude skill for an interactive walkthrough. The skill drives the same
 shared check module but walks you through each failure class: the block
 ["The publishing host"](#the-publishing-host) for a missing binary (and,
@@ -125,15 +125,26 @@ folder:
    /install-cscb
    ```
 
-The skill calls `bun run install-check` on each iteration and runs no
-agent-director install of its own. Three classes end the skill instead of
+The skill first states that this CSCB release and agent-director Phase 1
+are installed, and rolled back, together, by the README sections
+"Switching over to agent-director Phase 1" and "Rolling back the
+switch-over", which it points to by title. It names the agent-director
+client CSCB pins, `agent-director@0.11.0`, which comes installed with
+CSCB; the skill runs no install or upgrade of the client or the binary.
+
+The skill calls `bun run install-check` on each iteration. On a pass that
+carries the install check's `note:` line (the binary is below CSCB's Phase
+1 floor), it relays the note as printed, says the server refuses to start
+on that binary until the switch-over, points to "Switching over to
+agent-director Phase 1" and runs nothing for it. Three classes end the skill instead of
 looping, and it runs nothing for them: for `ad-system-install-not-found` it
 names the block "The publishing host" of the README section "Switching
 over to agent-director Phase 1" (after the startup gate's refusal on a bot
 host, that section's step 1 instead, whose version check as the workers'
 user in the bot server's launcher environment shows whether the launcher's
 HOME or PATH differs from the workers'), for `ad-system-install-too-old` it names
-that section, and for `ad-version-floor-unreadable` it says to check the
+that section and runs no upgrade, since the runbook's `state.db` backup and
+`serve` restarts come with the install, and for `ad-version-floor-unreadable` it says to check the
 `agent-director` npm package installed with CSCB (the skill cannot fix that
 package). For `ad-system-install-unreachable` it gives each reason's
 read-only diagnosis, `chmod +x` for a binary without its executable bit,

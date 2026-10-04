@@ -13,9 +13,10 @@
  * Cases:
  *   - Success with the Phase 1 note (a version below CSCB's floor): the OK
  *     block as without a note, then the note (the builder's text, naming the
- *     runbook section) once, after it.
+ *     runbook section) once, after it, on the one line that begins, after its
+ *     indent, with `INSTALL_CHECK_NOTE_LABEL` followed by the note's text.
  *   - Success without a note (a version that meets the floor): the OK block
- *     alone, with no note text.
+ *     alone, with no note text and no line beginning with the label.
  *   - Idempotency: identical output across two calls.
  *   - not-found / too-old / unreachable (each reason): the class label, the
  *     message, and the install-skill block at the end. Too-old names the
@@ -24,8 +25,8 @@
  *   - No rendered line of any case carries an upgrade form (`UPGRADE_FORMS`)
  *     or "Upgrade agent-director" in any case.
  *
- * Every version, label, title and note text is imported from `src/` or
- * `tests/test-helpers/`.
+ * Every version, label, title and note text is imported from `src/`,
+ * `scripts/install-check.ts` (the note label) or `tests/test-helpers/`.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -34,7 +35,7 @@ import { describe, expect, test } from 'bun:test'
 
 import type { UnreachableReason } from 'agent-director'
 
-import { renderFailure, renderSuccess } from '../scripts/install-check.ts'
+import { INSTALL_CHECK_NOTE_LABEL, renderFailure, renderSuccess } from '../scripts/install-check.ts'
 import {
   buildInstallCheckPhase1Note,
   buildSystemInstallTooOldMessage,
@@ -75,6 +76,11 @@ const SKILL_BLOCK = renderInstallSkillInstructions()
 function scriptFailureBody(result: InstallCheckFailure): string {
   const body = renderFailure(result)
   return result.classLabel === AD_VERSION_FLOOR_UNREADABLE ? body : body + SKILL_BLOCK
+}
+
+/** The lines of `out` that begin, after their indent, with the note label. */
+function linesBeginningWithLabel(out: string): string[] {
+  return out.split('\n').filter((line) => line.trimStart().startsWith(INSTALL_CHECK_NOTE_LABEL))
 }
 
 /** Number of non-overlapping occurrences of `needle` in `haystack`. */
@@ -123,6 +129,15 @@ describe('SR-6 / SRJ-212: install-check script — success with the Phase 1 note
     expect(tail).toContain(version)
     expect(tail).toContain(INSTALL_CHECK_PHASE1_NOTE_PHRASE)
     expect(tail).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
+
+    // The note line begins, after its indent, with the exported label, then
+    // the note's text (SRJ-212, SRJ-1110); no line of the OK block does.
+    const noteLine = tail.trimStart()
+    expect(noteLine.startsWith(INSTALL_CHECK_NOTE_LABEL)).toBe(true)
+    const afterLabel = noteLine.slice(INSTALL_CHECK_NOTE_LABEL.length)
+    expect(afterLabel).toMatch(/^\s+\S/)
+    expect(afterLabel.trim()).toBe(note)
+    expect(linesBeginningWithLabel(out)).toEqual([tail])
   })
 })
 
@@ -139,6 +154,7 @@ describe('SR-6: install-check script — success without a note', () => {
     expect(out).not.toContain(INSTALL_CHECK_PHASE1_NOTE_PHRASE)
     expect(out).not.toContain(PHASE1_RUNBOOK_SECTION_TITLE)
     expect(out).not.toContain(buildInstallCheckPhase1Note(version))
+    expect(linesBeginningWithLabel(out)).toEqual([])
   })
 
   test('re-run idempotency: identical output across two calls, with and without a note', () => {

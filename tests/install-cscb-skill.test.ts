@@ -40,8 +40,9 @@
  *     fenced block, and carries no upgrade form and no offer to run a command.
  *   - `ad-version-floor-unreadable` names the client-package check (the first
  *     clause of `CLIENT_PACKAGE_REMEDY`, src/install-check.ts) and the section
- *     title, holds no fenced block, and carries no upgrade form (`@latest`
- *     and package-manager commands included) and no offer to run a command.
+ *     title, holds no fenced block, and carries no upgrade form (package-manager
+ *     commands included) and no offer to run a command. `@latest` is checked
+ *     over the whole skill (below), not per branch.
  *   - Each `ad-system-install-unreachable` reason, one case per reason, names
  *     the section title and carries no upgrade form (the re-install row
  *     included) and no file removal. `PROBE_COMMAND_SPAN`, the read-only probe
@@ -50,7 +51,52 @@
  *     agent-director command still fails. Only `not-executable` holds a fenced
  *     block, and it is `chmod +x` alone.
  * Self-checks edit an in-memory copy of the skill: a re-install, an upgrade,
- * an installer or `@latest` put back into a branch fails that branch's case.
+ * an installer or a package-manager command put back into a branch fails
+ * that branch's case.
+ *
+ * The pinned client, the install check's note, the coupling and the runbooks
+ * (b.jg5 SRJ-1110, AC 15, AC 20, AC 81; SRJ-101's skill clause; hatch notes
+ * E5, E35, E36):
+ *   - The pin: every `agent-director@<spec>` in the whole skill (a file-local
+ *     extractor) equals `PHASE1_FLOOR_VERSION`, and there is at least one. No
+ *     `@latest` and no other dist-tag appears anywhere in the skill. Self-checks
+ *     build `@latest`, a caret range of the floor, the floor's release
+ *     candidate (`PHASE1_RC_VERSION`) and `OLD_AD_VERSION` from the shared
+ *     versions; each is extracted and fails. The skill's whole prose carries
+ *     no package-manager install command (the shared upgrade-forms row taken
+ *     by its label; the skill runs no client install); self-checks put
+ *     `bun add agent-director@<floor>` into the "This release and
+ *     agent-director Phase 1" section, Step 5 and the Notes, and each fails.
+ *   - The install check: Step 1's one fenced block runs the `package.json`
+ *     script that runs `scripts/install-check.ts`, its name read from
+ *     `package.json`.
+ *   - The note: Step 1 has one bullet for a pass with a line under the
+ *     install check's exported note label (`INSTALL_CHECK_NOTE_LABEL`). It
+ *     says to relay the note as printed, that the server refuses to start
+ *     until the switch-over (naming `PHASE1_RUNBOOK_SECTION_TITLE`), and to
+ *     offer no command and run nothing; it carries no upgrade form and no
+ *     offer to run a command. A Step 1 with no such bullet fails naming the
+ *     count. Step 4 ends the loop on such a pass. "Next
+ *     steps" says agent-director is ready only for a pass with no note line,
+ *     and says it is not ready on a pass with one.
+ *   - The coupling: one case per clause of SRJ-1110's statement (installed
+ *     together; rolled back together; every agent on the host and every
+ *     long-running agent-director process stopped before either binary
+ *     change; started again after it), each self-checked against the
+ *     statement with that clause dropped.
+ *   - The runbooks: the skill names the README section of each runbook by its
+ *     title (the switch-over title from `src/`, the rollback title from
+ *     tests/test-helpers/runbooks.ts). No step title of either README section
+ *     (collected with the helper's step matcher) appears in the skill, and the
+ *     skill has no heading in the runbook step form.
+ * The too-old clause of SRJ-1110 is the too-old branch's block above; the
+ * `access.json` ban for skills lives in tests/access-file-retired.test.ts.
+ *
+ * Residual R2 (E51): once `package.json` pins the released client, a case
+ * asserts that every `agent-director@<spec>` in the skill equals
+ * `package.json`'s `dependencies['agent-director']` (SRJ-101). Until then the
+ * skill's pin is checked against the floor only, and `package.json` still
+ * names the 0.10.0 client's range.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -62,7 +108,8 @@ import { resolve } from 'node:path'
 
 import type { UnreachableReason } from 'agent-director'
 
-import { PHASE1_RUNBOOK_SECTION_TITLE } from '../src/ad-version-gate.ts'
+import { INSTALL_CHECK_NOTE_LABEL } from '../scripts/install-check.ts'
+import { PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_SECTION_TITLE } from '../src/ad-version-gate.ts'
 import { CLIENT_PACKAGE_REMEDY } from '../src/install-check.ts'
 import {
   AD_SYSTEM_INSTALL_NOT_FOUND,
@@ -70,9 +117,10 @@ import {
   AD_SYSTEM_INSTALL_UNREACHABLE,
   AD_VERSION_FLOOR_UNREADABLE,
 } from '../src/install-check-labels.ts'
+import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import { UNREACHABLE_REASONS } from './test-helpers/install-check-fixtures.ts'
-import { classHeading, flat, requiredSection, splitFences } from './test-helpers/markdown.ts'
-import { PUBLISHING_HOST_BLOCK_HEADING } from './test-helpers/runbooks.ts'
+import { classHeading, flat, headings, requiredSection, splitFences } from './test-helpers/markdown.ts'
+import { PUBLISHING_HOST_BLOCK_HEADING, ROLLBACK_RUNBOOK_SECTION_TITLE, stepHeadingPrefix, stepNumberOf } from './test-helpers/runbooks.ts'
 import { type ForbiddenForm, UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
 
 const SKILLS_DIR = resolve(import.meta.dirname, '..', 'skills')
@@ -158,12 +206,17 @@ describe('install-cscb skill: no default-only fallthrough', () => {
 const SKILL_FILE = 'skills/install-cscb/SKILL.md'
 
 /**
- * The body of the `##` section whose title holds `title` as whole words (after
- * any "Step 5 — " label), whitespace collapsed so a phrase wrapped across
- * lines still matches. Throws naming the file and heading when there is none.
+ * The raw body of the `##` section of `text` (the skill by default) whose
+ * title holds `title` as whole words (after any "Step 5 — " label). Throws
+ * naming the file and heading when there is none.
  */
-function section(title: string): string {
-  return flat(requiredSection(skillContent, new RegExp(`^## (?:.*\\W)?${title}(?:\\W.*)?$`), SKILL_FILE))
+function rawSection(title: string, text: string = skillContent): string {
+  return requiredSection(text, new RegExp(`^## (?:.*\\W)?${title}(?:\\W.*)?$`), SKILL_FILE)
+}
+
+/** `rawSection` with whitespace collapsed, so a phrase wrapped across lines still matches. */
+function section(title: string, text: string = skillContent): string {
+  return flat(rawSection(title, text))
 }
 
 describe('install-cscb skill: persona pointer (b.av2 SR-12)', () => {
@@ -356,8 +409,8 @@ const POINTER_BRANCHES: readonly [label: string, required: readonly string[]][] 
 
 /**
  * A pointer branch's problems in `text`: what it lacks, any upgrade form,
- * offer to run a command or branch form, `@latest`, and any fenced block
- * (quoted ones included). `[]` when the branch holds.
+ * offer to run a command or branch form, and any fenced block (quoted ones
+ * included). `[]` when the branch holds.
  */
 function pointerBranchProblems(label: string, required: readonly string[], text: string = skillContent): string[] {
   const raw = unquoted(classBranch(label, text))
@@ -365,13 +418,12 @@ function pointerBranchProblems(label: string, required: readonly string[], text:
   return [
     ...lacks(branch, [PHASE1_RUNBOOK_SECTION_TITLE, 'README', ...required]),
     ...formsIn(branch, [...FORBIDDEN_TOO_OLD_FORMS, ...BRANCH_FORMS]),
-    ...(branch.includes('@latest') ? ['`@latest`'] : []),
     ...splitFences(raw).blocks.map((block) => `a fenced block: ${block.body.trim()}`),
   ]
 }
 
 describe(`install-cscb skill: the ${AD_SYSTEM_INSTALL_NOT_FOUND} and ${AD_VERSION_FLOOR_UNREADABLE} branches point to the runbook and run nothing (E2 gate; b.jg5 SRJ-208, SRJ-1101)`, () => {
-  test.each(POINTER_BRANCHES)('the %s branch names the README section and %p, and holds no command, upgrade, re-install, removal or @latest', (label, required) => {
+  test.each(POINTER_BRANCHES)('the %s branch names the README section and %p, and holds no command, upgrade, re-install or removal', (label, required) => {
     expect(pointerBranchProblems(label, required)).toEqual([])
   })
 
@@ -424,5 +476,300 @@ describe(`install-cscb skill: each ${AD_SYSTEM_INSTALL_UNREACHABLE} reason point
 
   test('self-check: a missing reason fails naming it', () => {
     expect(() => reasonBranch('no-such-reason')).toThrow('no numbered branch for reason `no-such-reason`')
+  })
+})
+
+/** `value` with every RegExp metacharacter escaped, so a pattern built around it matches it literally. */
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/** The skill as prose: blockquote markers dropped and whitespace collapsed, so a phrase in a quote or across a wrap matches. */
+const skillProse = flat(unquoted(skillContent))
+
+/**
+ * Every `agent-director@<spec>` in `text`, as its spec: everything after the
+ * `@` up to whitespace, a backtick, a quote, a bracket, `,` or `;`, less a
+ * trailing `.` or `:` that ends the sentence. An `@` with nothing after it
+ * gives the empty spec.
+ */
+function clientPins(text: string): string[] {
+  return [...text.matchAll(/\bagent-director@([^\s`'"()[\],;]*)/g)].map((m) => m[1].replace(/[.:]+$/, ''))
+}
+
+/**
+ * An npm dist-tag: `@latest` anywhere, or a package spec whose part after `@`
+ * is a letter-led tag, not a version; a `.` may end the sentence after it. An
+ * e-mail address's domain, a dot inside it, is not a tag.
+ */
+const DIST_TAG = /@latest\b|[\w-]@[A-Za-z][\w-]*(?![\w-]|\.\w)/gi
+
+/** The label of the shared upgrade-forms row for a package-manager install command. */
+const PACKAGE_MANAGER_LABEL = 'package-manager install'
+
+/**
+ * The shared upgrade-forms row for a package-manager install command, taken by
+ * its label. The one row read over the whole skill (R7: the skill runs no
+ * client install); the others would hit Step 5's read-only
+ * `agent-director list` command.
+ */
+const PACKAGE_MANAGER_FORM: ForbiddenForm = (() => {
+  const row = UPGRADE_FORMS.find(([label]) => label === PACKAGE_MANAGER_LABEL)
+  if (!row) throw new Error(`UPGRADE_FORMS has no row labelled "${PACKAGE_MANAGER_LABEL}"`)
+  return row
+})()
+
+/** Each `##` section the self-check puts a client install into: [section title, its heading line]. */
+const CLIENT_INSTALL_SECTIONS: [title: string, heading: string][] = [
+  ['This release and agent-director Phase 1', '## This release and agent-director Phase 1\n'],
+  ['Next steps', '## Step 5 — Next steps\n'],
+  ['Notes', '## Notes\n'],
+]
+
+describe('install-cscb skill: the pinned agent-director client (b.jg5 SRJ-1110, SRJ-101; hatch notes E5, E36)', () => {
+  test('removing the pin: the skill names the client as agent-director@<version> at least once', () => {
+    expect(clientPins(skillContent).length).toBeGreaterThan(0)
+  })
+
+  test('a pin other than the floor: every agent-director@<spec> in the skill is PHASE1_FLOOR_VERSION', () => {
+    expect(clientPins(skillContent).filter((spec) => spec !== PHASE1_FLOOR_VERSION)).toEqual([])
+  })
+
+  test('no @latest and no other dist-tag anywhere in the skill', () => {
+    expect(skillContent.match(DIST_TAG) ?? []).toEqual([])
+  })
+
+  test(`a client install put back: no ${PACKAGE_MANAGER_LABEL} command anywhere in the skill`, () => {
+    expect(skillProse).not.toMatch(PACKAGE_MANAGER_FORM[1])
+  })
+
+  test.each(CLIENT_INSTALL_SECTIONS)('self-check: `bun add agent-director@<floor>` put into the "%s" section fails', (title, heading) => {
+    const command = `\`bun add agent-director@${PHASE1_FLOOR_VERSION}\``
+    const edited = skillContent.replace(heading, `${heading}\nInstall the client with ${command}.\n`)
+    expect(edited).not.toBe(skillContent)
+    expect(rawSection(title, edited)).toContain(command)
+    expect(flat(unquoted(edited))).toMatch(PACKAGE_MANAGER_FORM[1])
+  })
+
+  test.each([
+    ['@latest', 'latest'],
+    ['a caret range of the floor', `^${PHASE1_FLOOR_VERSION}`],
+    ["the floor's release candidate", PHASE1_RC_VERSION],
+    ['the release before Phase 1', OLD_AD_VERSION],
+    ['an empty spec', ''],
+  ])('self-check: %s is extracted and is not the pin', (_how, spec) => {
+    const pins = clientPins(`The client is \`agent-director@${spec}\`; run nothing for agent-director@${spec}.`)
+    expect(pins).toEqual([spec, spec])
+    expect(pins.filter((pin) => pin !== PHASE1_FLOOR_VERSION)).toEqual([spec, spec])
+  })
+
+  test('self-check: the floor itself is extracted and passes', () => {
+    expect(clientPins(`The client is \`agent-director@${PHASE1_FLOOR_VERSION}\`, as agent-director@${PHASE1_FLOOR_VERSION}.`)).toEqual([PHASE1_FLOOR_VERSION, PHASE1_FLOOR_VERSION])
+  })
+
+  test.each(['bun add agent-director@latest', 'pin @latest', 'npx claude-slack-channel-bots@next', 'agent-director@beta.'])(
+    'self-check: the dist-tag pattern matches %p',
+    (sample) => {
+      expect(sample.match(DIST_TAG) ?? []).not.toEqual([])
+    },
+  )
+
+  test.each([`agent-director@${PHASE1_FLOOR_VERSION}`, `agent-director@${PHASE1_RC_VERSION}`, 'mail someone@example.test.'])(
+    'self-check: the dist-tag pattern does not match %p',
+    (sample) => {
+      expect(sample.match(DIST_TAG) ?? []).toEqual([])
+    },
+  )
+})
+
+/** The title of the skill's Step 1, which runs the install check. */
+const STEP1_TITLE = 'Run the shared check'
+
+/** `package.json`'s script names whose command runs the install check's script. */
+const INSTALL_CHECK_SCRIPTS: string[] = (() => {
+  const pkg = JSON.parse(readFileSync(resolve(import.meta.dirname, '..', 'package.json'), 'utf-8')) as { scripts?: Record<string, string> }
+  return Object.entries(pkg.scripts ?? {})
+    .filter(([, command]) => command.split(/\s+/).includes('scripts/install-check.ts'))
+    .map(([name]) => name)
+})()
+
+/** The install check's note label as a code span, as the skill names it. */
+const NOTE_LABEL_SPAN = `\`${INSTALL_CHECK_NOTE_LABEL}\``
+
+/** Step 1's top-level bullets in `text`, raw, each up to the next. */
+function step1Bullets(text: string = skillContent): string[] {
+  return rawSection(STEP1_TITLE, text)
+    .split(/\n(?=- )/)
+    .filter((chunk) => chunk.startsWith('- '))
+}
+
+/** Step 1's bullets for a pass with a note line: the bold lead names the label and does not say "no" note. */
+function noteBullets(text: string = skillContent): string[] {
+  return step1Bullets(text).filter((bullet) => {
+    const lead = /^- \*\*(.*?)\*\*/.exec(bullet)?.[1] ?? ''
+    return lead.includes(NOTE_LABEL_SPAN) && !/\b(?:no|without)\b/i.test(lead)
+  })
+}
+
+/** The one Step 1 bullet in `text` (the skill by default) for a pass with a note line, flattened; throws naming the count otherwise. */
+function noteBullet(text: string = skillContent): string {
+  const found = noteBullets(text)
+  if (found.length !== 1) throw new Error(`${SKILL_FILE}: Step 1 has ${found.length} bullets for a pass with a ${NOTE_LABEL_SPAN} line, expected 1`)
+  return flat(unquoted(found[0]))
+}
+
+/** A sentence saying agent-director is ready. */
+const READY = /\bagent-director\b[^.]*\bis\s+(?:now\s+)?ready\b/i
+
+/** A pass with no note line, named by the label. */
+const NO_NOTE = new RegExp(`\\b(?:no|without an?)\\s+${escapeRegExp(NOTE_LABEL_SPAN)}`, 'i')
+
+/** The sentences of the flattened `text` that say agent-director is ready without limiting it to a pass with no note line. */
+function unqualifiedReady(text: string): string[] {
+  return text.split(/(?<=\.)\s+/).filter((sentence) => READY.test(sentence) && !NO_NOTE.test(sentence))
+}
+
+describe("install-cscb skill: the install check and its note (b.jg5 SRJ-1110, SRJ-212; hatch note E5)", () => {
+  test('Step 1 runs the package.json script that runs scripts/install-check.ts, in its one fenced block', () => {
+    expect(INSTALL_CHECK_SCRIPTS).toHaveLength(1)
+    expect(splitFences(rawSection(STEP1_TITLE)).blocks.map((block) => block.body.trim())).toEqual([`bun run ${INSTALL_CHECK_SCRIPTS[0]}`])
+  })
+
+  test(`dropping the note relay: Step 1 has one bullet for a pass with a ${NOTE_LABEL_SPAN} line`, () => {
+    expect(noteBullets()).toHaveLength(1)
+  })
+
+  test('dropping the note relay: the note bullet says to relay the note as printed', () => {
+    expect(noteBullet()).toMatch(/\brelay\b[^.]*\bnote\b[^.]*\bas printed\b/i)
+  })
+
+  test('the note bullet says the server refuses to start until the switch-over, naming the runbook section', () => {
+    expect(noteBullet()).toMatch(/\bserver refuses to start\b[^.]*\buntil the switch-over\b/i)
+    expect(noteBullet()).toContain(`README section "${PHASE1_RUNBOOK_SECTION_TITLE}"`)
+  })
+
+  test('the note bullet offers no command and runs nothing', () => {
+    expect(noteBullet()).toMatch(/\boffer no command and run nothing\b/i)
+  })
+
+  test.each(FORBIDDEN_TOO_OLD_FORMS)('the note bullet carries no %s', (_label, pattern) => {
+    expect(noteBullet()).not.toMatch(pattern)
+  })
+
+  test(`Step 4 ends the loop on a pass with a ${NOTE_LABEL_SPAN} line`, () => {
+    const step4 = section('Loop or exit')
+    expect(step4).toContain(NOTE_LABEL_SPAN)
+    expect(step4).toMatch(/\bends the loop\b/i)
+  })
+
+  test(`"Next steps" says agent-director is ready only for a pass with no ${NOTE_LABEL_SPAN} line`, () => {
+    const next = section('Next steps')
+    expect(next).toMatch(READY)
+    expect(unqualifiedReady(next)).toEqual([])
+  })
+
+  test(`"Next steps" says agent-director is not ready on a pass with a ${NOTE_LABEL_SPAN} line`, () => {
+    const sentences = section('Next steps').split(/(?<=\.)\s+/)
+    expect(sentences.filter((s) => s.includes(NOTE_LABEL_SPAN) && !NO_NOTE.test(s) && /\bagent-director is not ready\b/i.test(s))).not.toEqual([])
+  })
+
+  test('self-check: an unqualified "ready" fails and a qualified one passes', () => {
+    expect(unqualifiedReady('Once the check passes, agent-director is ready to run the personas.')).not.toEqual([])
+    expect(unqualifiedReady(`On a pass with no ${NOTE_LABEL_SPAN} line, agent-director is ready to run the personas.`)).toEqual([])
+  })
+
+  test('self-check: a Step 1 with no note bullet fails naming the count', () => {
+    const edited = skillContent.replace(`with a ${NOTE_LABEL_SPAN} line**`, 'whatever it prints**')
+    expect(edited).not.toBe(skillContent)
+    expect(noteBullets(edited)).toEqual([])
+    expect(() => noteBullet(edited)).toThrow(`${SKILL_FILE}: Step 1 has 0 bullets for a pass with a ${NOTE_LABEL_SPAN} line, expected 1`)
+  })
+})
+
+/** SRJ-1110's coupling statement, as the clauses' self-checks read it. */
+const COUPLING_STATEMENT =
+  'This CSCB release and agent-director Phase 1 are installed, and rolled back, together. ' +
+  'Every agent on the host, with every long-running agent-director process, is stopped before either binary change and started again after it.'
+
+/** Each clause of the coupling statement: its label, its pattern over the skill's prose, and the statement with that clause dropped. */
+const COUPLING_CLAUSES: [label: string, pattern: RegExp, without: string][] = [
+  [
+    'installed together',
+    /\bthis (?:CSCB )?release and agent-director Phase 1 are installed\b[^.]*\btogether\b/i,
+    COUPLING_STATEMENT.replace('installed, and rolled back,', 'rolled back'),
+  ],
+  [
+    'rolled back together',
+    /\bthis (?:CSCB )?release and agent-director Phase 1 are\b[^.]*\brolled back\b[^.]*\btogether\b/i,
+    COUPLING_STATEMENT.replace('installed, and rolled back,', 'installed'),
+  ],
+  [
+    'every agent on the host and every long-running agent-director process stopped before either binary change',
+    /\bevery agent on the host\b[^.]*\bevery long-running agent-director process\b[^.]*\bstopped before either binary change\b/i,
+    COUPLING_STATEMENT.replace(', with every long-running agent-director process,', ''),
+  ],
+  [
+    'started again after it',
+    /\bevery agent on the host\b[^.]*\bstarted again after (?:it|either binary change)\b/i,
+    COUPLING_STATEMENT.replace(' and started again after it', ''),
+  ],
+]
+
+describe('install-cscb skill: the coupled install and rollback (b.jg5 SRJ-1110; HO C15)', () => {
+  test.each(COUPLING_CLAUSES)('the skill states the clause: %s', (_label, pattern) => {
+    expect(skillProse).toMatch(pattern)
+  })
+
+  test.each(COUPLING_CLAUSES)('self-check: the clause "%s" matches the statement and fails with it dropped, the others still matching', (label, pattern, without) => {
+    expect(without).not.toBe(COUPLING_STATEMENT)
+    expect(COUPLING_STATEMENT).toMatch(pattern)
+    expect(COUPLING_CLAUSES.filter(([, p]) => !p.test(without)).map(([l]) => l)).toEqual([label])
+  })
+})
+
+const README_TEXT = readFileSync(resolve(import.meta.dirname, '..', 'README.md'), 'utf-8')
+
+/** The README's two runbooks: [which, section title]. */
+const RUNBOOKS: [which: string, title: string][] = [
+  ['switch-over', PHASE1_RUNBOOK_SECTION_TITLE],
+  ['rollback', ROLLBACK_RUNBOOK_SECTION_TITLE],
+]
+
+/** Each step heading's title in the README's `title` runbook section, without its `Step <n>: ` start. */
+function runbookStepTitles(title: string): string[] {
+  return headings(requiredSection(README_TEXT, `### ${title}`, 'README.md')).flatMap((h) => {
+    const n = stepNumberOf(h.title)
+    return n === undefined ? [] : [h.title.slice(stepHeadingPrefix(n).length)]
+  })
+}
+
+/** Each runbook step title `text` repeats (case-insensitive, over its prose), as `"<section>": <step title>`. */
+function repeatedSteps(text: string): string[] {
+  const prose = flat(unquoted(text)).toLowerCase()
+  return RUNBOOKS.flatMap(([, title]) => runbookStepTitles(title).filter((step) => prose.includes(step.toLowerCase())).map((step) => `"${title}": ${step}`))
+}
+
+describe('install-cscb skill: the runbooks by title, their steps not repeated (b.jg5 SRJ-1110, SRJ-1516; hatch note E35)', () => {
+  test.each(RUNBOOKS)('dropping a runbook title: the skill names the README %s runbook section by its title', (_which, title) => {
+    expect(skillProse).toContain(`README section "${title}"`)
+  })
+
+  test.each(RUNBOOKS)('sanity: the README %s runbook section yields at least one step', (_which, title) => {
+    expect(runbookStepTitles(title).length).toBeGreaterThan(0)
+  })
+
+  test('copying a runbook step: no step title of either runbook appears in the skill', () => {
+    expect(repeatedSteps(skillContent)).toEqual([])
+  })
+
+  test('the skill has no heading in the runbook step form', () => {
+    expect(headings(skillContent).filter((h) => stepNumberOf(h.title) !== undefined).map((h) => h.text)).toEqual([])
+  })
+
+  test.each(RUNBOOKS)('self-check: a %s step title copied into the skill fails naming it', (_which, title) => {
+    const step = runbookStepTitles(title).at(-1)!
+    const edited = skillContent.replace('\n## Notes\n', `\n## Notes\n\n- ${step}.\n`)
+    expect(edited).not.toBe(skillContent)
+    expect(repeatedSteps(edited)).toContain(`"${title}": ${step}`)
   })
 })

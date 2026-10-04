@@ -100,8 +100,10 @@ import { redactSlackLogText } from './slack-log-redaction.ts'
 /**
  * CSCB's Phase 1 floor: the Phase 1 agent-director release's version.
  *
- * b.jg5 SRJ-201: the minor bump over 0.10.x, the version the Phase 1 release
- * candidate counts as (`0.11.0-rc.1`).
+ * b.jg5 SRJ-201: confirmed from the Phase 1 release candidate, which reports
+ * `0.11.0-rc.1` and so counts as 0.11.0 (only major.minor.patch is compared,
+ * SRJ-202). The confirmation from the Phase 1 release itself is the Plan's
+ * Epic E51's, with the client's pin.
  */
 export const PHASE1_FLOOR_VERSION = '0.11.0'
 

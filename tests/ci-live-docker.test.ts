@@ -80,7 +80,10 @@
  *   installing them, puts the release candidate's binary in a directory of
  *   its own first on PATH (never /usr/local/bin) and the 0.10.0 binary,
  *   fetched for its pinned release, off PATH, installs `sqlite3` and `file`
- *   and writes the marker /etc/cscb-ci-image; `Dockerfile.live` and the three
+ *   and writes the marker /etc/cscb-ci-image; the pinned release candidate's
+ *   version is a candidate of CSCB's Phase 1 floor (its major.minor.patch is
+ *   `PHASE1_FLOOR_VERSION`), which confirms the floor (b.jg5 SRJ-201,
+ *   SRJ-202); `Dockerfile.live` and the three
  *   `docker/live` scripts' PATH lines use the base's release-candidate
  *   directory;
  * - the client under test (`ci-live/lib/rc-client.ts`): the base copies the
@@ -118,6 +121,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathS
 import { tmpdir } from 'node:os'
 import { basename, delimiter, dirname, join, relative, resolve } from 'node:path'
 
+import semver from 'semver'
 import { hostAgentDirectorBinary, selectAgentDirectorBinary, type BinaryProbe } from '../ci-live/lib/agent-director-binary.ts'
 import { AGENT_DIRECTOR_BINARY_OPTION } from '../ci-live/lib/args.ts'
 import { BOOT_DONE_FILE, bootProblem, bootReached, parseBootDone, type BootRecord } from '../ci-live/lib/container-boot.ts'
@@ -150,6 +154,7 @@ import { CHILD_ENV_ALLOWLIST, minimalChildEnv, type ProcResult, type SpawnOption
 import { isLiveRunnerPid, lockHolder, lockPid, nodeLockDeps, RunLock, type LockDeps } from '../ci-live/lib/run-lock.ts'
 import { RC_CLIENT_CHECK, RC_CLIENT_CHECK_SOURCE } from '../ci-live/lib/rc-client.ts'
 import { NotRunnableError } from '../ci-live/lib/secrets.ts'
+import { meetsPhase1Floor, PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
 import { MIN_CLAUDE_CODE_VERSION } from './test-helpers/agent-director-versions.ts'
 import { balancedAfter, callArguments, callsOf, indicesOf, objectProperties, onlyCallArguments, splitTopLevel, stripComments } from './test-helpers/source-audit.ts'
 import { APP_TOKEN_PREFIX, assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL } from './test-helpers/credentials.ts'
@@ -2031,6 +2036,14 @@ describe('the /ci images (source audit)', () => {
     expect(binary.target).toBe(join(rcBinDir, 'agent-director'))
     expect(instructions.filter((i) => i.includes('/usr/local/bin/agent-director'))).toEqual([])
     expect(rc.indexOf('command -v agent-director')).toBeGreaterThan(binary.at)
+  })
+
+  test("the pinned release candidate is a candidate of CSCB's Phase 1 floor: its major.minor.patch is PHASE1_FLOOR_VERSION, and it passes the floor (b.jg5 SRJ-201, SRJ-202)", () => {
+    const rc = semver.parse(baseImage().args.AD_RC_VERSION ?? '')
+    expect(rc).not.toBeNull()
+    expect(rc!.prerelease.length).toBeGreaterThan(0)
+    expect(`${rc!.major}.${rc!.minor}.${rc!.patch}`).toBe(PHASE1_FLOOR_VERSION)
+    expect(meetsPhase1Floor(rc!.version)).toBe(true)
   })
 
   test('install.sh is read from its context and checked against the pinned SHA-256 before it is installed off PATH', () => {

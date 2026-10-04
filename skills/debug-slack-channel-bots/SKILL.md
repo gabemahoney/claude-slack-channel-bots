@@ -116,7 +116,7 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    floor is covered under
    [The server refuses the agent-director binary at start](#the-server-refuses-the-agent-director-binary-at-start);
    for a missing or unreachable agent-director, the `install-cscb` skill
-   covers installing it.
+   diagnoses it and names the README section that installs it.
    **The server was running and has stopped?** Read the latest lines of
    `startup-errors.log`. One that says `found by a runtime re-check while the
    server was running` is covered under
@@ -3568,7 +3568,7 @@ agent-director version
 ```
 
 If it doesn't answer, or answers with an error, agent-director is the
-problem: fix it (the `install-cscb` skill covers installing it), and the next
+problem: fix it (the `install-cscb` skill diagnoses it), and the next
 retry recovers the persona with no server restart. With the `environment`
 cause, tmux is the problem. After a *tmux unavailable* notice, install or
 repair it for the user the workers run as, checking it with the read-only
@@ -3685,7 +3685,7 @@ agent-director get --claude-instance-id cscb_<key>
 ```
 
 If agent-director doesn't answer, or answers with an error, fix it (the
-`install-cscb` skill covers installing it); the next retry recovers the
+`install-cscb` skill diagnoses it); the next retry recovers the
 persona with no server restart. An error naming `ErrConfigMalformed` is
 agent-director refusing its config file: see **agent-director refuses its
 config file** above, and don't edit the file. If it answers normally but the lines keep

@@ -9,8 +9,9 @@
  * it.
  *
  * Against the floor:
- *   - passes: `PHASE1_RC_VERSION` (the floor's release candidate; a
- *     pre-release suffix is ignored, so it counts as the floor);
+ *   - passes: `PHASE1_RC_VERSION` (the version the Phase 1 release
+ *     candidate reports, built from the floor; a pre-release suffix is
+ *     ignored, so it counts as the floor);
  *   - refused: `OLD_AD_VERSION` (the release before Phase 1, which the client
  *     itself admits), `DEV_PLACEHOLDER_VERSION` (the client's development
  *     sentinel, which the client ranks above every version) and

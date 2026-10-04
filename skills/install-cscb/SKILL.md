@@ -1,6 +1,6 @@
 ---
 name: install-cscb
-description: Interactive walkthrough that diagnoses the system-installed `agent-director` so claude-slack-channel-bots can boot. Runs bun run install-check and walks the operator through the diagnosis of each failure class; for a missing or too-old install it names the README switch-over runbook and runs nothing.
+description: Interactive walkthrough that diagnoses the system-installed `agent-director` so claude-slack-channel-bots can boot. Runs bun run install-check, relays its note when the binary is below CSCB's Phase 1 floor, and walks the operator through the diagnosis of each failure class; for a missing or too-old install it names the README switch-over runbook and runs nothing. Names the agent-director client CSCB pins and the coupled install and rollback of this release with agent-director Phase 1.
 version: 1.0.0
 license: MIT
 user-invocable: true
@@ -14,8 +14,8 @@ Diagnose a broken or missing `agent-director` system install so
 `claude-slack-channel-bots` (CSCB) can boot. This skill is the interactive
 counterpart to the diagnostic `bun run install-check` script — same shared
 check module, but with a guided diagnosis for each failure class. For an
-install that is missing or too old, the skill names the README's
-switch-over runbook instead of running anything.
+install that is missing or too old, or below CSCB's Phase 1 floor, the skill
+names the README's switch-over runbook instead of running anything.
 
 ## When to invoke
 
@@ -27,9 +27,27 @@ in `~/.claude/channels/slack/startup-errors.log`:
 - `ad-system-install-unreachable`
 
 The gate appends a pointer to this skill on those three classes. Other
-failure classes (`ad-bun-version-too-old`, `ad-shim-*`, `ad-same-user`,
-`ad-version-floor-unreadable`) are NOT remediated by this skill — see
-the README's Startup-errors section for those.
+failure classes (`ad-below-phase1-floor`, `ad-bun-version-too-old`,
+`ad-shim-*`, `ad-same-user`, `ad-version-floor-unreadable`) are NOT
+remediated by this skill — see the README's Startup-errors section for
+those.
+
+## This release and agent-director Phase 1
+
+This CSCB release and agent-director Phase 1 are installed, and rolled
+back, together. Every agent on the host, with every long-running
+agent-director process, is stopped before either binary change and
+started again after it.
+
+Tell the user this before Step 1. The two are installed together by the
+README section "Switching over to agent-director Phase 1", and rolled
+back together by the README section "Rolling back the switch-over". This
+skill points to those sections by title and does not repeat their steps.
+
+The agent-director client CSCB pins is `agent-director@0.11.0`. It comes
+installed with CSCB as its npm dependency. This skill runs no client
+install and names no package-manager command for it: the client changes
+only with CSCB itself.
 
 ## Step 1 — Run the shared check
 
@@ -45,14 +63,20 @@ skill drives internally on every iteration.
 
 Read the output carefully:
 
-- **Exit 0 + "OK"**: agent-director is satisfied. Print the resolved
-  binary path, detected version, and floor from the success output, then
-  go to Step 5. This skill has nothing more to fix. If the output ends
-  with a `note:` line, the binary is below CSCB's Phase 1 floor: show the
-  note to the user. The server refuses to start on that binary until
-  agent-director Phase 1 is in place, which comes only through the README
-  section "Switching over to agent-director Phase 1"; offer no command and
-  run nothing for it.
+- **Exit 0 + "OK", with no `note:` line**: agent-director is satisfied.
+  Print the resolved binary path, the detected version and the client's
+  minimum (the `floor:` line) from the success output, then go to Step 5.
+  This skill has nothing more to fix.
+
+- **Exit 0 + "OK", with a `note:` line**: the binary meets the client's
+  minimum but is below CSCB's Phase 1 floor. Print the success output as
+  above, then:
+  1. Relay the note to the user exactly as printed after the `note:`
+     label.
+  2. Tell the user that the server refuses to start on that binary until
+     the switch-over: agent-director Phase 1 comes onto the host only
+     through the README section "Switching over to agent-director Phase 1".
+  3. Offer no command and run nothing for it. Go to Step 5.
 
 - **Exit non-zero**: identify the class label on stderr (one of
   `ad-system-install-not-found`, `ad-system-install-too-old`,
@@ -88,8 +112,8 @@ PATH while agent-director's store and workers are live; that block is
 not for this host. Tell the user instead:
 
 > The startup gate did not find agent-director. See step 1 of the README
-> section "Switching over to agent-director Phase 1": its check of
-> agent-director's version, as the workers' user in the bot server's
+> section "Switching over to agent-director Phase 1": its version check
+> of agent-director, as the workers' user in the bot server's
 > launcher environment, shows whether the launcher's HOME or PATH differs
 > from the workers'.
 
@@ -105,14 +129,15 @@ stderr block, and the binary path.
 Then tell the user:
 
 > agent-director is installed but at version `<detected>`, below the
-> required version `<required>`. This CSCB release and agent-director
-> Phase 1 are installed together: install agent-director by following the
-> README section "Switching over to agent-director Phase 1".
+> required version `<required>`. agent-director comes onto this host with
+> this CSCB release by following the README section
+> "Switching over to agent-director Phase 1".
 
-Offer no command and run nothing for this class: the runbook's steps
-(including its `state.db` backup and restarts) must come with the
-install. Do not ask whether to run one. Exit without returning to
-Step 1; the user re-invokes the skill after completing the runbook.
+Offer no command and run nothing for this class, and do not ask whether
+to run one: the runbook's `state.db` backup and its `serve` restarts must
+come with the install, so agent-director changes on this host only
+through that runbook. Exit without returning to Step 1; the user
+re-invokes the skill after completing the runbook.
 
 ### `ad-system-install-unreachable` — exhaustive reason switch
 
@@ -190,9 +215,10 @@ user through fixing the agent-director npm package.
 
 Tell the user:
 
-> The agent-director npm package installed with CSCB could not be read.
-> Check the agent-director npm package installed with CSCB; see the
-> README section "Switching over to agent-director Phase 1".
+> The agent-director npm package installed with CSCB, the client CSCB
+> pins at `agent-director@0.11.0`, could not be read.
+> Check the agent-director npm package installed with CSCB; see the README
+> section "Switching over to agent-director Phase 1".
 
 Then exit. Do NOT loop on this class — the user must manually verify
 the AD package is intact before re-invoking the skill.
@@ -201,9 +227,14 @@ the AD package is intact before re-invoking the skill.
 
 The skill loops only after reason 1 of `ad-system-install-unreachable`
 (`not-executable`): once the user has set the executable bit, re-run
-Step 1. It keeps looping until the check passes (print the success output
-and go to Step 5) or the user declines to proceed (exit non-zero with a
-one-line summary).
+Step 1. It keeps looping until the check passes (print the success output,
+relay its note if it carries one as Step 1 says, and go to Step 5) or the
+user declines to proceed (exit non-zero with a one-line summary).
+
+A pass whose output carries a `note:` line ends the loop too: relay the
+note as printed, tell the user the server refuses to start on that binary
+until the switch-over, point to the README section "Switching over to
+agent-director Phase 1", and run nothing for it.
 
 All other failures end the skill instead of looping:
 `ad-system-install-not-found` and `ad-system-install-too-old` (the user
@@ -215,8 +246,14 @@ re-invokes the skill).
 
 ## Step 5 — Next steps
 
-Once the check passes, agent-director is ready to run the personas.
-CSCB launches one agent-director instance per persona, named
+On a pass whose output carries a `note:` line, agent-director is not
+ready for this CSCB release: the server refuses to start on that binary
+until the switch-over by the README section "Switching over to
+agent-director Phase 1", and no persona comes up before it. The rest of
+this step applies once the server can start.
+
+On a pass with no `note:` line, agent-director is ready to run the
+personas. CSCB launches one agent-director instance per persona, named
 `cscb_<key>` after the persona's key; `agent-director list --label
 service=cscb` lists them once the server is running.
 
@@ -232,7 +269,10 @@ service=cscb` lists them once the server is running.
   (reason 1 of `ad-system-install-unreachable`) and offers no command
   that changes it: agent-director comes onto the host, or changes there,
   only as the README section "Switching over to agent-director Phase 1"
-  says.
+  says, and goes back only as the README section "Rolling back the
+  switch-over" says.
+- This skill runs no install of the agent-director client. The client,
+  `agent-director@0.11.0`, comes installed with CSCB.
 - This skill does not touch the persona configuration
   (`~/.claude/channels/slack/config.json`), the persona credentials
   files or the reload files beside the configuration. It only acts on

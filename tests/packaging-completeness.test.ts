@@ -46,7 +46,37 @@
  * (no range): `package.json` `dependencies` names it with that exact spec
  * (never in `devDependencies`), and `bun.lock` records the same spec for the
  * root workspace and resolves the package to that version. Hermetic: both
- * files are read from the tree, with no npm call and no child process.
+ * files are read from the tree, with no npm call and no child process. Its
+ * bun.lock half reads through `lockPin`, the file's bun.lock pin reader
+ * (the root workspace's spec, the other sections naming the package, and the
+ * resolved entry with its source).
+ *
+ * b.jg5 SRJ-101: the shipped `package.json` depends on agent-director at
+ * exactly the Phase 1 release's version — one exact version, with no range
+ * operator, pre-release suffix or build metadata, equal to CSCB's floor
+ * (`PHASE1_FLOOR_VERSION`, SRJ-201) — and `bun.lock` resolves to it.
+ * `srj101PinVerdict` is that rule as a pure, file-local checker: given a spec
+ * and the floor it answers whether the spec is the pin, and names the first
+ * rule broken. Its fixture specs are all built from the floor or the
+ * versions helper (`tests/test-helpers/agent-director-versions.ts`), never
+ * typed; `lockPin`'s fixture lock objects show it reports a mismatched
+ * workspace spec, a release-candidate resolution and a file source.
+ *
+ * Under the ruling on SRJ-101, nothing from agent-director's release
+ * candidate enters this tree: `package.json` keeps the pre-Phase 1
+ * client's caret range until the Plan's Epic E51 pins the released Phase 1 client.
+ * So the real files are checked here only for what holds both now and after
+ * E51 (release-candidate safety): `package.json` names agent-director in
+ * `dependencies` and in no other section, with a registry range that names no
+ * pre-release (no dist-tag, file, link, tarball, git or URL source);
+ * `bun.lock`'s root workspace has the same spec, in `dependencies` only; and
+ * `bun.lock` resolves agent-director from the default registry, with an
+ * integrity hash, to a release version that spec admits. The assertion that
+ * the real `package.json` spec passes `srj101PinVerdict` against the floor,
+ * that the bun.lock root workspace has that exact spec and that its
+ * `packages` entry resolves `agent-director@<floor>` is E51's residual R1,
+ * added there with this checker and reader; it has no skipped or `.todo`
+ * placeholder here.
  *
  * Every npm-backed test shares one memoised pack probe per file load. Each npm
  * child's environment is a direct `hostSafeChildEnv` call (b.jg5 SRJ-1301,
@@ -67,7 +97,9 @@ import { spawnSync } from 'node:child_process'
 import semver from 'semver'
 import { PERSONA_DIAGNOSTIC_CLASSES } from '../src/persona-diagnostics.ts'
 import { RELOAD_DIAGNOSTIC_CLASSES } from '../src/reload.ts'
+import { PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
 import { HostSafetyError, hostSafeChildEnv, resolveToolDir } from './test-helpers/host-safe-env.ts'
+import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 
 const REPO_ROOT = resolve(import.meta.dir, '..')
 
@@ -458,16 +490,69 @@ const TOML_PARSER_PIN = '1.9.0'
 /** The package.json (and bun.lock workspace) sections that are not runtime dependencies. */
 const NON_RUNTIME_SECTIONS = ['devDependencies', 'optionalDependencies', 'peerDependencies'] as const
 
-/** The parts of bun.lock this guard reads. */
+/** The parts of bun.lock these guards read. */
 interface BunLock {
   workspaces?: Record<string, Partial<Record<'dependencies' | (typeof NON_RUNTIME_SECTIONS)[number], DependencyMap>>>
-  /** Package name → [`<name>@<version>`, registry, metadata, integrity]. */
+  /**
+   * Package name → its entry. A registry entry is [`<name>@<version>`,
+   * registry ('' for the default one), metadata, integrity]; a path, tarball,
+   * git or URL entry starts `<name>@<source>`, then metadata, with no
+   * registry or integrity string.
+   */
   packages?: Record<string, unknown[]>
 }
 
 /** bun.lock, parsed tolerantly: it is JSONC, with trailing commas. */
 function readBunLock(): BunLock {
   return Bun.JSONC.parse(readFileSync(resolve(REPO_ROOT, 'bun.lock'), 'utf-8')) as BunLock
+}
+
+/** A package's `packages` entry in bun.lock, as {@link lockPin} reports it. */
+interface LockResolution {
+  /** The entry's `<name>@<version>`, or `<name>@<source>` for a path, tarball, git or URL entry. */
+  id: string
+  /** The text after `<name>@`: the version for a registry entry, else the source; undefined when the id names another package. */
+  ref: string | undefined
+  /** A registry entry's registry field ('' is the default registry); undefined for any other entry. */
+  registry: string | undefined
+  /** A registry entry's integrity hash; undefined when the entry has none. */
+  integrity: string | undefined
+}
+
+/** What bun.lock pins for one package. */
+interface LockPin {
+  /** The spec the root workspace's `dependencies` give the package, if any. */
+  workspaceSpec: string | undefined
+  /** The root workspace's non-runtime sections that name the package. */
+  otherSections: string[]
+  /** The package's `packages` entry; undefined when there is none. */
+  resolved: LockResolution | undefined
+}
+
+/**
+ * bun.lock's pin of `name`: the root workspace's spec for it, the root
+ * workspace's other sections that name it, and the name@version (or
+ * name@source) its `packages` entry resolves, with that entry's registry and
+ * integrity.
+ */
+function lockPin(lock: BunLock, name: string): LockPin {
+  const root = lock.workspaces?.['']
+  const entry = lock.packages?.[name]
+  let resolved: LockResolution | undefined
+  if (Array.isArray(entry) && typeof entry[0] === 'string') {
+    const id = entry[0]
+    resolved = {
+      id,
+      ref: id.startsWith(`${name}@`) ? id.slice(name.length + 1) : undefined,
+      registry: typeof entry[1] === 'string' ? entry[1] : undefined,
+      integrity: typeof entry[3] === 'string' ? entry[3] : undefined,
+    }
+  }
+  return {
+    workspaceSpec: root?.dependencies?.[name],
+    otherSections: NON_RUNTIME_SECTIONS.filter((section) => Object.keys(root?.[section] ?? {}).includes(name)),
+    resolved,
+  }
 }
 
 /**
@@ -490,18 +575,198 @@ describe(`b.jg5 SRJ-209: ${TOML_PARSER} is a runtime dependency at exactly its p
   })
 
   test(`bun.lock's root workspace names ${TOML_PARSER} among its dependencies with the same exact spec, and in no other section`, () => {
-    const root = readBunLock().workspaces?.['']
-    expect(root).toBeDefined()
-    const spec = root!.dependencies?.[TOML_PARSER]
-    expect([spec, isExactVersion(spec ?? '')]).toEqual([TOML_PARSER_PIN, true])
-    for (const section of NON_RUNTIME_SECTIONS) {
-      expect([section, Object.keys(root![section] ?? {}).includes(TOML_PARSER)]).toEqual([section, false])
-    }
+    const lock = readBunLock()
+    expect(lock.workspaces?.['']).toBeDefined()
+    const { workspaceSpec, otherSections } = lockPin(lock, TOML_PARSER)
+    expect([workspaceSpec, isExactVersion(workspaceSpec ?? ''), otherSections]).toEqual([TOML_PARSER_PIN, true, []])
   })
 
   test(`bun.lock resolves ${TOML_PARSER} to exactly the pinned version`, () => {
-    const entry = readBunLock().packages?.[TOML_PARSER]
-    expect(Array.isArray(entry)).toBe(true)
-    expect(entry![0]).toBe(`${TOML_PARSER}@${TOML_PARSER_PIN}`)
+    expect(lockPin(readBunLock(), TOML_PARSER).resolved?.id).toBe(`${TOML_PARSER}@${TOML_PARSER_PIN}`)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 5. b.jg5 SRJ-101 — agent-director is pinned at the Phase 1 floor
+// ---------------------------------------------------------------------------
+
+/** The agent-director npm client, CSCB's runtime dependency. */
+const AD_PACKAGE = 'agent-director'
+
+/**
+ * SRJ-101's rules for the pin, in the order they are checked:
+ *   - `version`: the spec is a version or range at all (not a dist-tag, or a
+ *     file, link, tarball, git or URL source);
+ *   - `no-range`: it is the bare version text — no range operator (`^`, `~`,
+ *     `>=`, `=`), `v` prefix, wildcard, x-range, space or `||` alternation;
+ *   - `no-pre-release`: no `-<pre-release>` suffix;
+ *   - `no-build-metadata`: no `+<build>` suffix;
+ *   - `equals-floor`: the version is the floor.
+ */
+type PinRule = 'version' | 'no-range' | 'no-pre-release' | 'no-build-metadata' | 'equals-floor'
+
+type PinVerdict = { ok: true } | { ok: false; broken: PinRule }
+
+/**
+ * SRJ-101's pin check: whether `spec` is one exact version equal to `floor`,
+ * with no range operator, pre-release suffix or build metadata; otherwise the
+ * first {@link PinRule} it breaks.
+ */
+function srj101PinVerdict(spec: string, floor: string): PinVerdict {
+  const parsed = semver.parse(spec)
+  if (parsed === null) {
+    return { ok: false, broken: semver.validRange(spec) === null ? 'version' : 'no-range' }
+  }
+  const bare = parsed.build.length > 0 ? `${parsed.version}+${parsed.build.join('.')}` : parsed.version
+  if (spec !== bare) return { ok: false, broken: 'no-range' }
+  if (parsed.prerelease.length > 0) return { ok: false, broken: 'no-pre-release' }
+  if (parsed.build.length > 0) return { ok: false, broken: 'no-build-metadata' }
+  if (parsed.version !== floor) return { ok: false, broken: 'equals-floor' }
+  return { ok: true }
+}
+
+/** The floor's next minor release: a later version than the floor. */
+const LATER_MINOR_VERSION = semver.inc(PHASE1_FLOOR_VERSION, 'minor')!
+
+/** The floor's x-range (`<major>.<minor>.x`). */
+const FLOOR_X_RANGE = `${semver.major(PHASE1_FLOOR_VERSION)}.${semver.minor(PHASE1_FLOOR_VERSION)}.x`
+
+describe(`b.jg5 SRJ-101: the pin checker gives each spec its verdict against the floor ${PHASE1_FLOOR_VERSION}`, () => {
+  test('the floor itself is the pin', () => {
+    expect(srj101PinVerdict(PHASE1_FLOOR_VERSION, PHASE1_FLOOR_VERSION)).toEqual({ ok: true })
+  })
+
+  test.each<[string, string, PinRule]>([
+    ['the caret range', `^${PHASE1_FLOOR_VERSION}`, 'no-range'],
+    ['the tilde range', `~${PHASE1_FLOOR_VERSION}`, 'no-range'],
+    ['the >= range', `>=${PHASE1_FLOOR_VERSION}`, 'no-range'],
+    ['the = form', `=${PHASE1_FLOOR_VERSION}`, 'no-range'],
+    ['the v form', `v${PHASE1_FLOOR_VERSION}`, 'no-range'],
+    ['the x-range', FLOOR_X_RANGE, 'no-range'],
+    ['the * wildcard', '*', 'no-range'],
+    ['an || alternation', `${OLD_AD_VERSION} || ${PHASE1_FLOOR_VERSION}`, 'no-range'],
+    ['the latest dist-tag', 'latest', 'version'],
+    ['the floor release candidate', PHASE1_RC_VERSION, 'no-pre-release'],
+    ['the floor with build metadata', `${PHASE1_FLOOR_VERSION}+build.1`, 'no-build-metadata'],
+    ['a file: tarball path', `file:../${AD_PACKAGE}-${PHASE1_FLOOR_VERSION}.tgz`, 'version'],
+    ['a git spec', `git+https://github.com/example/${AD_PACKAGE}.git#v${PHASE1_FLOOR_VERSION}`, 'version'],
+    ['a URL spec', `https://registry.npmjs.org/${AD_PACKAGE}/-/${AD_PACKAGE}-${PHASE1_FLOOR_VERSION}.tgz`, 'version'],
+    ['the release before Phase 1', OLD_AD_VERSION, 'equals-floor'],
+    ['a later minor version', LATER_MINOR_VERSION, 'equals-floor'],
+  ])('refuses %s (%s), breaking rule %s', (_label, spec, broken) => {
+    expect(srj101PinVerdict(spec, PHASE1_FLOOR_VERSION)).toEqual({ ok: false, broken })
+  })
+})
+
+/** A fixture integrity hash for registry entries (not a real digest). */
+const FIXTURE_INTEGRITY = 'sha512-fixture'
+
+/** A registry `packages` entry resolving agent-director at `version`. */
+function registryEntry(version: string): unknown[] {
+  return [`${AD_PACKAGE}@${version}`, '', {}, FIXTURE_INTEGRITY]
+}
+
+/** A fixture bun.lock: the root workspace's sections and agent-director's `packages` entry. */
+function fixtureLock(root: NonNullable<BunLock['workspaces']>[string], entry: unknown[]): BunLock {
+  return { workspaces: { '': root }, packages: { [AD_PACKAGE]: entry } }
+}
+
+describe('b.jg5 SRJ-101: the bun.lock pin reader reports what each fixture lock pins', () => {
+  const fileSource = `file:../${AD_PACKAGE}-${PHASE1_FLOOR_VERSION}.tgz`
+
+  test.each<[string, BunLock, LockPin]>([
+    [
+      'the floor pinned and resolved from the default registry',
+      fixtureLock({ dependencies: { [AD_PACKAGE]: PHASE1_FLOOR_VERSION } }, registryEntry(PHASE1_FLOOR_VERSION)),
+      {
+        workspaceSpec: PHASE1_FLOOR_VERSION,
+        otherSections: [],
+        resolved: { id: `${AD_PACKAGE}@${PHASE1_FLOOR_VERSION}`, ref: PHASE1_FLOOR_VERSION, registry: '', integrity: FIXTURE_INTEGRITY },
+      },
+    ],
+    [
+      'a workspace spec that does not match the resolution, also named in devDependencies',
+      fixtureLock(
+        { dependencies: { [AD_PACKAGE]: `^${OLD_AD_VERSION}` }, devDependencies: { [AD_PACKAGE]: PHASE1_FLOOR_VERSION } },
+        registryEntry(PHASE1_FLOOR_VERSION),
+      ),
+      {
+        workspaceSpec: `^${OLD_AD_VERSION}`,
+        otherSections: ['devDependencies'],
+        resolved: { id: `${AD_PACKAGE}@${PHASE1_FLOOR_VERSION}`, ref: PHASE1_FLOOR_VERSION, registry: '', integrity: FIXTURE_INTEGRITY },
+      },
+    ],
+    [
+      'a release-candidate resolution',
+      fixtureLock({ dependencies: { [AD_PACKAGE]: PHASE1_RC_VERSION } }, registryEntry(PHASE1_RC_VERSION)),
+      {
+        workspaceSpec: PHASE1_RC_VERSION,
+        otherSections: [],
+        resolved: { id: `${AD_PACKAGE}@${PHASE1_RC_VERSION}`, ref: PHASE1_RC_VERSION, registry: '', integrity: FIXTURE_INTEGRITY },
+      },
+    ],
+    [
+      'a file tarball source',
+      fixtureLock({ dependencies: { [AD_PACKAGE]: fileSource } }, [`${AD_PACKAGE}@${fileSource}`, {}]),
+      {
+        workspaceSpec: fileSource,
+        otherSections: [],
+        resolved: { id: `${AD_PACKAGE}@${fileSource}`, ref: fileSource, registry: undefined, integrity: undefined },
+      },
+    ],
+    [
+      'no root workspace and no packages entry',
+      { workspaces: {}, packages: {} },
+      { workspaceSpec: undefined, otherSections: [], resolved: undefined },
+    ],
+  ])('%s', (_label, lock, expected) => {
+    expect(lockPin(lock, AD_PACKAGE)).toEqual(expected)
+  })
+})
+
+/**
+ * The pre-release versions a semver range's comparators name. `*`'s
+ * comparator has no version. The `<X-0` upper bound semver writes for a
+ * caret, tilde or x-range is not counted: `X-0` is X's lowest pre-release, so
+ * that bound admits no pre-release of X.
+ */
+function rangePreReleases(spec: string): string[] {
+  return new semver.Range(spec).set
+    .flat()
+    .filter((comparator) => {
+      const prerelease = comparator.semver.prerelease ?? []
+      const desugaredUpperBound = comparator.operator === '<' && prerelease.length === 1 && prerelease[0] === 0
+      return prerelease.length > 0 && !desugaredUpperBound
+    })
+    .map((comparator) => comparator.semver.version)
+}
+
+describe(`b.jg5 SRJ-101: the real package.json and bun.lock never take ${AD_PACKAGE} from a release candidate, a tag or a non-registry source (hermetic)`, () => {
+  test(`package.json names ${AD_PACKAGE} in dependencies and in no other section`, () => {
+    const pkg = readPkg()
+    expect(pkg.dependencies?.[AD_PACKAGE]).toBeDefined()
+    expect(NON_RUNTIME_SECTIONS.filter((section) => Object.keys(pkg[section] ?? {}).includes(AD_PACKAGE))).toEqual([])
+  })
+
+  test(`package.json's ${AD_PACKAGE} spec is a registry version range that names no pre-release (no dist-tag, file, link, tarball, git or URL source)`, () => {
+    const spec = readPkg().dependencies?.[AD_PACKAGE] ?? ''
+    expect(semver.validRange(spec)).not.toBeNull()
+    expect(rangePreReleases(spec)).toEqual([])
+  })
+
+  test(`bun.lock's root workspace names ${AD_PACKAGE} with package.json's spec, in dependencies only`, () => {
+    const { workspaceSpec, otherSections } = lockPin(readBunLock(), AD_PACKAGE)
+    expect([workspaceSpec, otherSections]).toEqual([readPkg().dependencies?.[AD_PACKAGE], []])
+  })
+
+  test(`bun.lock resolves ${AD_PACKAGE} from the default registry, with integrity, to a release version package.json's spec admits`, () => {
+    const resolved = lockPin(readBunLock(), AD_PACKAGE).resolved
+    expect(resolved).toBeDefined()
+    const version = resolved!.ref ?? ''
+    expect(resolved!.registry).toBe('')
+    expect(resolved!.integrity).toStartWith('sha512-')
+    expect(isExactVersion(version)).toBe(true)
+    expect(semver.prerelease(version)).toBeNull()
+    expect(semver.satisfies(version, readPkg().dependencies?.[AD_PACKAGE] ?? '')).toBe(true)
   })
 })
