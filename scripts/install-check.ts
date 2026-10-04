@@ -15,7 +15,9 @@
  *
  * Appends the manual-skill-install instructions block to every failure
  * class EXCEPT ad-version-floor-unreadable — that case's remediation is
- * "reinstall agent-director from npm," not "install the install skill."
+ * "check the agent-director npm package installed with CSCB" with the
+ * switch-over runbook section (`CLIENT_PACKAGE_REMEDY` in
+ * `src/install-check.ts`), not "install the install skill."
  *
  * The script MUST NOT prompt for input, MUST NOT run any install command,
  * MUST NOT attempt to fetch the install skill. It is purely diagnostic.
@@ -66,7 +68,8 @@ export async function main(): Promise<void> {
   let body = renderFailure(result)
   // SR-6.3: append the manual-skill-install block to every failure class
   // EXCEPT ad-version-floor-unreadable (the skill can't fix a corrupt AD
-  // package; remediation is "reinstall agent-director").
+  // package; remediation is checking the agent-director npm package
+  // installed with CSCB, with the switch-over runbook section).
   if (result.classLabel !== AD_VERSION_FLOOR_UNREADABLE) {
     body += renderInstallSkillInstructions()
   }

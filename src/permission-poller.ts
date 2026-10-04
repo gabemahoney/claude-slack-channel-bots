@@ -588,27 +588,38 @@ function emitRowDecision(
 }
 
 /**
- * b.fae F4 — one-shot warning for a spawn wedged in check_permission with
- * zero open rows. The text names the persona (b.av2 SR-7.2) and gives the
- * HONEST remediation. `send-keys` is NOT offered: AD's relay guard
- * (pkg/api/sendkeys.go) hard-rejects send-keys whenever relay_mode=on &&
- * state=check_permission, with no open-row exemption — so the only correct
- * recovery is read-pane + kill/respawn.
+ * b.fae F4 / b.jg5 SRJ-1012 — one-shot warning for a spawn wedged in
+ * check_permission with zero open rows: the persona prefix (b.av2 SR-7.2)
+ * followed by {@link buildWedgeWarningBody}. The text names agent-director
+ * verbs only, as a human's steps: `read-pane` to see the native prompt, then
+ * `kill` with "check the result", after which the server brings the persona
+ * up again on its own. It names no tmux command and no respawn as a human's
+ * step, and carries SRJ-1001's human-only sentence. `send-keys` is NOT
+ * offered: AD's relay guard hard-rejects send-keys whenever relay_mode=on &&
+ * state=check_permission, with no open-row exemption.
  */
 export function buildWedgeWarningText(persona: Pick<Persona, 'name' | 'key'>, claudeInstanceId: string): string {
-  return formatPersonaNotice(persona, wedgeWarningBody(claudeInstanceId))
+  return formatPersonaNotice(persona, buildWedgeWarningBody(claudeInstanceId))
 }
 
-/** The wedge warning's body, with no persona reference (the notifier adds its own). */
-function wedgeWarningBody(claudeInstanceId: string): string {
+/**
+ * b.jg5 SRJ-1012 — the wedge warning's body, with no persona reference (the
+ * notifier adds its own): SRJ-1012's text, with `claudeInstanceId` in both
+ * places it names the instance id. Used by the post and by the
+ * teardown-window notice alike.
+ */
+export function buildWedgeWarningBody(claudeInstanceId: string): string {
   return (
     '⚠️ This persona appears blocked on a native Claude Code permission prompt that ' +
     "never reached Slack — it will not respond until it's cleared. To recover: run " +
     '`agent-director read-pane --claude-instance-id ' +
     claudeInstanceId +
-    '` to see the native prompt, then kill and respawn the session ' +
-    '(`agent-director kill` / tmux-kill + respawn). Do NOT use send-keys — it is ' +
-    'rejected in this state.'
+    '` to see the native prompt, then end the session with ' +
+    '`agent-director kill --claude-instance-id ' +
+    claudeInstanceId +
+    '` and check the result; the server then brings the persona up again. ' +
+    'Do NOT use send-keys — it is rejected in this state. ' +
+    'These commands are for a human only: no bot, including any persona that sees this post, may run them.'
   )
 }
 
@@ -634,7 +645,7 @@ function writeWedgeWarningInTeardown(deps: PollerDeps, persona: Persona, claudeI
     `[slack] permission-poller: stuck-prompt warning for ${ref} (${claudeInstanceId}) raised during its persona teardown — ` +
       'handed to the notifier, which writes it to the server log and startup-errors.log, not posted (b.jg5 SRJ-1003)',
   )
-  notifySafely(notices.notify, persona.key, wedgeWarningBody(claudeInstanceId), undefined, (err) =>
+  notifySafely(notices.notify, persona.key, buildWedgeWarningBody(claudeInstanceId), undefined, (err) =>
     logViaDeps(deps, `[slack] permission-poller: stuck-prompt warning for ${ref} (${claudeInstanceId}) failed at the notifier: ${describeThrownValue(err)}`),
   )
   return true

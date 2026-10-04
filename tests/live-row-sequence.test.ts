@@ -154,7 +154,7 @@ import {
   LIVE_ROW_ARM_ENDED,
   LIVE_ROW_ARM_LOST_RACE,
   LIVE_ROW_ARM_NOT_JUDGED,
-  LIVE_ROW_ARM_REUSE_COLLISION,
+  LIVE_ROW_ARM_COLLISION,
   LIVE_ROW_LAUNCH_REASON_CONFIG_DIR_MISMATCH,
   LIVE_ROW_LAUNCH_REASON_CWD_MISMATCH,
   LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION,
@@ -285,7 +285,7 @@ import {
   UNAVAILABLE_RETRY_CAUSE_CONFIG,
   UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
   UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
-  UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION,
+  UNAVAILABLE_RETRY_CAUSE_COLLISION,
   UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED,
   UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
@@ -1910,7 +1910,7 @@ describe('the launch\'s end: the outcome carries the launch\'s result, and the e
     expectUntouched(h, q)
   })
 
-  test('a reuse that collides with a live row (ErrInstanceIdCollision): the sequence ends without its launch, not launched (reuse-collision), with the reuse-collision cause armed and no second spawn; nothing counted or posted', async () => {
+  test('a reuse that collides with a live row (ErrInstanceIdCollision): the sequence ends without its launch, not launched (reuse-collision), with the collision cause armed and no second spawn; nothing counted or posted', async () => {
     const { h, p } = build()
     h.script({ getResult: personaRow(h, p, { state: ENDED }), spawnError: errInstanceIdCollision() })
     const order = recordCallOrder(h)
@@ -1924,13 +1924,13 @@ describe('the launch\'s end: the outcome carries the launch\'s result, and the e
       runs: 1,
       kills: 1,
       judgedRuns: 1,
-      armed: LIVE_ROW_ARM_REUSE_COLLISION,
+      armed: LIVE_ROW_ARM_COLLISION,
     })
     expect(order).toEqual(['kill', 'get', 'findMissing', 'get', 'spawn'])
     expect(h.reuseSpawns()).toHaveLength(1)
     const endLine = liveRowSequenceEndLine(`persona=${p}`, outcome)
-    expect(endLine).toContain(`: not launched (reuse; ${LIVE_ROW_NOT_LAUNCHED_REUSE_COLLISION}) — runs=1 kills=1 judged=1; the retry timer armed (${LIVE_ROW_ARM_REUSE_COLLISION}) `)
-    expectEndArmed(h, outcome, UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION)
+    expect(endLine).toContain(`: not launched (reuse; ${LIVE_ROW_NOT_LAUNCHED_REUSE_COLLISION}) — runs=1 kills=1 judged=1; the retry timer armed (${LIVE_ROW_ARM_COLLISION}) `)
+    expectEndArmed(h, outcome, UNAVAILABLE_RETRY_CAUSE_COLLISION)
   })
 
   test.each([
@@ -2785,7 +2785,7 @@ describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the 
   // step 6's ErrSpawnNotFound colliding runs no get-then-act inside the
   // sequence; the sequence ends without its launch and the retry it arms is
   // the get-then-act, through the restart path's ladder.
-  test('step 6\'s resume answering ErrSpawnNotFound, its plain spawn colliding (ErrInstanceIdCollision): not launched (spawn-collision), the reuse-collision cause armed, no second spawn, nothing counted or posted; the retry it arms makes the ladder\'s get-then-act', async () => {
+  test('step 6\'s resume answering ErrSpawnNotFound, its plain spawn colliding (ErrInstanceIdCollision): not launched (spawn-collision), the collision cause armed, no second spawn, nothing counted or posted; the retry it arms makes the ladder\'s get-then-act', async () => {
     const { h, p } = build()
     h.script({ spawnError: errInstanceIdCollision() })
 
@@ -2798,12 +2798,12 @@ describe('started at the ladder\'s ErrSpawnNotResumable with dead evidence: the 
       runs: 1,
       kills: 1,
       judgedRuns: 1,
-      armed: LIVE_ROW_ARM_REUSE_COLLISION,
+      armed: LIVE_ROW_ARM_COLLISION,
     })
     expect(order).toEqual([...SEQUENCE_CALLS, 'spawn'])
     expect(h.stub.calls.spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined])
     expect(liveRowSequenceEndLine(`persona=${p}`, outcome)).toContain(`: not launched (resume; ${LIVE_ROW_NOT_LAUNCHED_SPAWN_COLLISION}) — `)
-    expectEndArmed(h, outcome, UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION)
+    expectEndArmed(h, outcome, UNAVAILABLE_RETRY_CAUSE_COLLISION)
 
     // The retry: the row reads ended with its session id; the ladder's plain
     // first spawn collides, its collision get reads the row and resumes it.

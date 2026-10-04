@@ -1,6 +1,6 @@
 ---
 name: install-cscb
-description: Interactive walkthrough that diagnoses the system-installed `agent-director` so claude-slack-channel-bots can boot. Runs bun run install-check and walks the operator through the fix for each failure class; for a too-old install it names the README switch-over runbook and runs nothing.
+description: Interactive walkthrough that diagnoses the system-installed `agent-director` so claude-slack-channel-bots can boot. Runs bun run install-check and walks the operator through the diagnosis of each failure class; for a missing or too-old install it names the README switch-over runbook and runs nothing.
 version: 1.0.0
 license: MIT
 user-invocable: true
@@ -10,12 +10,12 @@ allowed-tools: [Bash, Read]
 
 # /install-cscb
 
-Diagnose and fix a broken or missing `agent-director` system install so
+Diagnose a broken or missing `agent-director` system install so
 `claude-slack-channel-bots` (CSCB) can boot. This skill is the interactive
 counterpart to the diagnostic `bun run install-check` script — same shared
-check module, but with a guided remediation loop for each failure class.
-For an install that is too old, the skill names the README's switch-over
-runbook instead of running anything.
+check module, but with a guided diagnosis for each failure class. For an
+install that is missing or too old, the skill names the README's
+switch-over runbook instead of running anything.
 
 ## When to invoke
 
@@ -47,7 +47,12 @@ Read the output carefully:
 
 - **Exit 0 + "OK"**: agent-director is satisfied. Print the resolved
   binary path, detected version, and floor from the success output, then
-  go to Step 5. No further remediation is required.
+  go to Step 5. This skill has nothing more to fix. If the output ends
+  with a `note:` line, the binary is below CSCB's Phase 1 floor: show the
+  note to the user. The server refuses to start on that binary until
+  agent-director Phase 1 is in place, which comes only through the README
+  section "Switching over to agent-director Phase 1"; offer no command and
+  run nothing for it.
 
 - **Exit non-zero**: identify the class label on stderr (one of
   `ad-system-install-not-found`, `ad-system-install-too-old`,
@@ -69,29 +74,28 @@ exit non-zero.
 
 ### `ad-system-install-not-found` — agent-director missing
 
-Surface the install command published by `agent-director` verbatim for
-the detected platform. Do NOT invent or maintain a CSCB-owned command —
-consult agent-director's documentation
-(<https://github.com/gabemahoney/agent-director>) for the canonical
-install procedure. The current installer is `install.sh` from
-agent-director's repo; recommend running it.
+Show the user the locations the stderr block says were checked. Then tell
+the user:
 
-Prompt the user (using AskUserQuestion or an equivalent) — the literal
-command must be visible:
+> No agent-director binary was found on PATH or at the standard install
+> path. See the block "The publishing host" of the README section
+> "Switching over to agent-director Phase 1", which covers a host with no
+> agent-director.
 
-> agent-director is not installed system-wide. Run the AD-published install
-> command? `<command>`
->
-> - **Yes** — run the command via Bash and continue.
-> - **No** — install manually then continue.
+If the user came here from the server's startup refusal on a bot host,
+the binary may only be missing from the bot server's launcher HOME or
+PATH while agent-director's store and workers are live; that block is
+not for this host. Tell the user instead:
 
-- **Yes**: run the command via Bash. Capture stdout/stderr for the user
-  to see. Return to Step 1.
-- **No**: instruct the user to install manually. Wait for confirmation.
-  Return to Step 1.
+> The startup gate did not find agent-director. See step 1 of the README
+> section "Switching over to agent-director Phase 1": its check of
+> agent-director's version, as the workers' user in the bot server's
+> launcher environment, shows whether the launcher's HOME or PATH differs
+> from the workers'.
 
-If the user declines to proceed at any point, exit non-zero with a
-one-line summary: "Aborted by user — agent-director still not installed."
+Offer no command and run nothing for this class: agent-director comes onto
+the host only as that README section says. Exit without returning to
+Step 1; the user re-invokes the skill after following the section.
 
 ### `ad-system-install-too-old` — agent-director below the client's minimum
 
@@ -114,7 +118,10 @@ Step 1; the user re-invokes the skill after completing the runbook.
 
 The stderr block carries an `err.reason` value verbatim. Branch on it
 explicitly — every reason has a named branch, no `default:`-only
-fallthrough.
+fallthrough. Each branch below starts with a read-only diagnosis. Past
+that, the skill changes nothing on the host except the executable bit in
+reason 1: every other fix to the host's agent-director goes through the
+README section "Switching over to agent-director Phase 1".
 
 1. **`not-executable`** — the agent-director file exists but lacks the
    executable bit. Show the user the binary path from the stderr block
@@ -122,83 +129,88 @@ fallthrough.
    ```sh
    chmod +x <binary_path>
    ```
-   Re-run Step 1.
+   Re-run Step 1. If the bit cannot be set, point the user to the README
+   section "Switching over to agent-director Phase 1" and exit.
 
 2. **`not-a-regular-file`** — the path resolved by `resolveSystemBinary()`
    is a directory, broken symlink, or other non-file. Recommend
-   inspection (`ls -la <binary_path>`) and removal of the bad entry,
-   then re-installation via the AD install command. Re-run Step 1.
+   inspection (`ls -la <binary_path>`), then point the user to the README
+   section "Switching over to agent-director Phase 1" and exit.
 
 3. **`probe-timeout`** — `agent-director version` did not return within
    the probe window. Likely the binary is hanging on startup
    (corrupted, mismatched architecture, missing shared library).
    Recommend a manual `<binary_path> version` invocation to confirm,
-   then reinstall via the AD install command. Re-run Step 1.
+   then point the user to the README section "Switching over to
+   agent-director Phase 1" and exit.
 
 4. **`probe-nonzero-exit`** — `agent-director version` exited with a
    non-zero code. The stderr block surfaces `exitCode` and any
    `diagnostic` from AD. Show the user the values and recommend a
-   manual reproduction (`<binary_path> version`), then reinstall.
-   Re-run Step 1.
+   manual reproduction (`<binary_path> version`), then point the user to
+   the README section "Switching over to agent-director Phase 1" and
+   exit.
 
 5. **`probe-killed-by-signal`** — `agent-director version` was killed
    by a signal (SIGSEGV, SIGBUS, etc.). The stderr block surfaces
    `signal`. The binary is likely corrupted or built for a different
-   architecture. Recommend a full reinstall via the AD install command.
-   Re-run Step 1.
+   architecture. Show the user the signal and the platform from Step 2,
+   then point the user to the README section "Switching over to
+   agent-director Phase 1" and exit.
 
 6. **`unparseable-version`** — `agent-director version` returned but
    the output could not be parsed as semver. The stderr's `diagnostic`
-   field carries the raw output. Likely the installed binary is from
-   a pre-release line that uses non-semver tags (e.g. `v0.6.3-dev`
-   without sentinel handling). Recommend upgrading to a release AD
-   version via the AD install command. Re-run Step 1.
+   field carries the raw output. Likely the installed binary is a
+   development build that reports a version such as `dev`. Show the user
+   the raw output, then point the user to the README section "Switching
+   over to agent-director Phase 1" and exit.
 
 7. **`spawn-failed`** — the OS rejected the spawn before the subprocess
    ran (ENOENT after stat succeeded, EACCES, EPERM, etc.). The stderr's
    `diagnostic` field carries the underlying OS error. Recommend
-   checking filesystem permissions, then reinstalling. Re-run Step 1.
+   checking filesystem permissions (`ls -la <binary_path>`), then point
+   the user to the README section "Switching over to agent-director
+   Phase 1" and exit.
 
 8. **`other`** — an unexpected failure mode AD's `resolveSystemBinary()`
    could not classify. Print the raw underlying error message from
-   `detail.underlying` (or `diagnostic`) and direct the user to file
-   a bug against `agent-director`:
+   `detail.underlying` (or `diagnostic`), point the user to the README
+   section "Switching over to agent-director Phase 1", and direct the
+   user to file a bug against `agent-director`:
    <https://github.com/gabemahoney/agent-director/issues>
 
-   This is the only branch that recommends bug-filing rather than a
-   local remediation step.
-
-After rendering the per-reason remediation, ask the user to confirm
-they have applied it, then return to Step 1.
+   This is the only branch that recommends bug-filing.
 
 ### `ad-version-floor-unreadable` — corrupt agent-director npm package
 
 This class is NOT a system-install problem — it indicates the
 `node_modules/agent-director/dist/version-floor.json` file is missing,
 malformed, or lacks `.min_binary_version`. The skill cannot walk the
-user through fixing a corrupt AD npm package.
+user through fixing the agent-director npm package.
 
-Print the reinstall guidance:
+Tell the user:
 
-> The agent-director npm package appears corrupted. Reinstall it from
-> npm in CSCB's project root:
->
-> ```sh
-> bun add agent-director@latest
-> ```
+> The agent-director npm package installed with CSCB could not be read.
+> Check the agent-director npm package installed with CSCB; see the
+> README section "Switching over to agent-director Phase 1".
 
 Then exit. Do NOT loop on this class — the user must manually verify
 the AD package is intact before re-invoking the skill.
 
 ## Step 4 — Loop or exit
 
-After each remediation step, re-run Step 1. The skill keeps looping
-until the check passes (print the success output and go to Step 5) or the
-user declines to proceed (exit non-zero with the abort summary).
+The skill loops only after reason 1 of `ad-system-install-unreachable`
+(`not-executable`): once the user has set the executable bit, re-run
+Step 1. It keeps looping until the check passes (print the success output
+and go to Step 5) or the user declines to proceed (exit non-zero with a
+one-line summary).
 
-Two classes end the skill instead of looping: `ad-system-install-too-old`
-(the user follows the README runbook, then re-invokes the skill) and
-`ad-version-floor-unreadable` (the user verifies the npm package, then
+All other failures end the skill instead of looping:
+`ad-system-install-not-found` and `ad-system-install-too-old` (the user
+follows the README runbook, then re-invokes the skill), reasons 2 to 8 of
+`ad-system-install-unreachable` (the user follows the README runbook or
+files the bug, then re-invokes the skill) and
+`ad-version-floor-unreadable` (the user checks the npm package, then
 re-invokes the skill).
 
 ## Step 5 — Next steps
@@ -216,9 +228,11 @@ service=cscb` lists them once the server is running.
 
 ## Notes
 
-- This skill does not maintain its own list of agent-director install
-  commands. AD's documentation is the source of truth; the skill
-  surfaces AD's published command verbatim.
+- This skill runs nothing on the host's agent-director but `chmod +x`
+  (reason 1 of `ad-system-install-unreachable`) and offers no command
+  that changes it: agent-director comes onto the host, or changes there,
+  only as the README section "Switching over to agent-director Phase 1"
+  says.
 - This skill does not touch the persona configuration
   (`~/.claude/channels/slack/config.json`), the persona credentials
   files or the reload files beside the configuration. It only acts on

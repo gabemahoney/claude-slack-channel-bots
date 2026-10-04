@@ -62,7 +62,7 @@
  *      decides on the row state the path last read: a finished row (`ended`,
  *      `missing` or no row) gets a reuse spawn of the same id
  *      (`reuseSpawnForPersona`, SRJ-112), whose collision re-runs this
- *      get-then-act once (a second collision arms the reuse-collision cause
+ *      get-then-act once (a second collision arms the collision cause
  *      and answers `retrying`, uncounted); a live row (`pending`
  *      included) starts the live-row sequence (SRJ-705), which ends in that
  *      reuse spawn, and the ladder answers `sequence-waiting` with no other
@@ -688,6 +688,7 @@ import {
   type LatchRecheckPaneAnswer,
   type LatchRecheckReading,
   type LatchRecoveryReason,
+  CONFLICT_NOTICE_HUMAN_ONLY_LINE,
   LATCH_CASE_NOT_THIS_LAUNCH,
   LATCH_CASE_OWN_ID,
   LATCH_ROW_STATE_KIND_NO_ROW,
@@ -765,7 +766,7 @@ import {
   unavailableRetryCauseFor,
   UNAVAILABLE_RETRY_CAUSE_LOST_RACE,
   UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD,
-  UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION,
+  UNAVAILABLE_RETRY_CAUSE_COLLISION,
   UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED,
   UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED,
   UNAVAILABLE_RETRY_PENDING_STEP_KEPT,
@@ -786,7 +787,7 @@ import {
   LIVE_ROW_ARM_ENDED,
   LIVE_ROW_ARM_LOST_RACE,
   LIVE_ROW_ARM_NOT_JUDGED,
-  LIVE_ROW_ARM_REUSE_COLLISION,
+  LIVE_ROW_ARM_COLLISION,
   LIVE_ROW_LAUNCH_ANSWER_LAUNCHED,
   LIVE_ROW_LAUNCH_REUSE,
   LIVE_ROW_LAUNCH_SUCCESS_ACTIONS,
@@ -1311,16 +1312,29 @@ export function notifySpawnFailure(key: string, error: AgentDirectorError, isSta
   })
 }
 
+/** The `ErrSpawnCapReached` value the restart-cap notice carries. */
+function restartCapReachedError(): ErrSpawnCapReached {
+  return new ErrSpawnCapReached(
+    `${RESTART_FAILURE_CAP} consecutive session-launch failures — automatic restarts suspended`,
+  )
+}
+
+/**
+ * The restart-cap notice body (`notifyRestartCapReached`): the spawn-failure
+ * notice for CSCB's own `ErrSpawnCapReached`. Pure; exported for the notice
+ * catalogue.
+ */
+export function restartCapReachedNoticeText(): string {
+  return spawnFailureNoticeText(restartCapReachedError())
+}
+
 /**
  * Raise the restart-cap notice for persona `key` (restart.ts `onCapReached`):
  * a non-startup spawn-failure notice carrying `ErrSpawnCapReached`, whose
  * remediation says automatic restarts are suspended for this persona.
  */
 export function notifyRestartCapReached(key: string): void {
-  const err = new ErrSpawnCapReached(
-    `${RESTART_FAILURE_CAP} consecutive session-launch failures — automatic restarts suspended`,
-  )
-  notifySpawnFailure(key, err, false)
+  notifySpawnFailure(key, restartCapReachedError(), false)
 }
 
 /** The result a launch or recovery site answers for a refusal: `failed`, which the launch answers as `retrying` when the timer was armed (`retryingWhenArmed`). */
@@ -3688,12 +3702,15 @@ export function _resetNotConnectedEpisodes(): void {
 /**
  * The not-connected notice body (b.f2b). The first line says what is wrong,
  * so a dry-run log line (which carries only the first line) keeps it; the
- * second says what to do. The notifier adds the persona reference. The attach
+ * second says what to do and ends with SRJ-1001's human-only sentence
+ * (`CONFLICT_NOTICE_HUMAN_ONLY_LINE`), since every variant names a command
+ * (b.jg5 SRJ-1001). The notifier adds the persona reference. The attach
  * command names the session exactly (`=slack_bot_<key>`, b.1ix): a bare name
  * would attach to a prefix neighbour's session (`slack_bot_dev_2` for
- * `slack_bot_dev`) once the persona's own is gone.
+ * `slack_bot_dev`) once the persona's own is gone. Pure; exported for the
+ * notice catalogue.
  */
-function buildNotConnectedNotice(key: string, notice: NotConnectedNotice): string {
+export function buildNotConnectedNotice(key: string, notice: NotConnectedNotice): string {
   const attach = `\`tmux attach -t ${tmuxExactSessionTarget(personaTmuxSessionName(key))}\``
   const reconnect = `\`/mcp reconnect ${MCP_SERVER_NAME}\``
   if (notice.reason === 'blocked-on-prompt') {
@@ -3702,7 +3719,7 @@ function buildNotConnectedNotice(key: string, notice: NotConnectedNotice): strin
       : `Once it is answered, CSCB reconnects it when it can tell the session is idle again (its row reads waiting, or its screen and transcript prove it idle); if it stays disconnected, type ${reconnect} there.`
     return (
       `:warning: *Waiting on a prompt* — this persona is not connected to this server, and its session shows a prompt or dialog in its terminal that no one has answered. CSCB never types into a prompt, so it won't reconnect the persona while the prompt is up; messages sent to it until then are lost.\n` +
-      `Attach with ${attach} and answer it. ${after}`
+      `Attach with ${attach} and answer it. ${after} ${CONFLICT_NOTICE_HUMAN_ONLY_LINE}`
     )
   }
   if (notice.reason === 'unproven-idle') {
@@ -3711,18 +3728,18 @@ function buildNotConnectedNotice(key: string, notice: NotConnectedNotice): strin
       : `Otherwise CSCB keeps checking it and reconnects it once its row reads waiting or its screen and transcript prove it idle.`
     return (
       `:warning: *Not connected* — this persona is not connected to this server: its session reads working but CSCB can't prove it's idle, so it won't type into it, and has held back for ${describeWaitSpan(notice.heldMs)}. Messages sent to it until it reconnects are lost.\n` +
-      `Check it with ${attach}: let a running turn finish and answer anything on screen; if it sits idle at its prompt, type ${reconnect} there. ${after}`
+      `Check it with ${attach}: let a running turn finish and answer anything on screen; if it sits idle at its prompt, type ${reconnect} there. ${after} ${CONFLICT_NOTICE_HUMAN_ONLY_LINE}`
     )
   }
   if (notice.streamless === true) {
     return (
       `:warning: *Not receiving messages* — this persona's session is running and connected to this server, but its message stream is gone (${notice.cause}), and automatic restarts are disabled (\`session_restart_delay\` is 0), so nothing will restore it; messages sent to it are lost.\n` +
-      `To recover: attach with ${attach}, deal with anything on screen and type ${reconnect}, or restart the server.`
+      `To recover: attach with ${attach}, deal with anything on screen and type ${reconnect}, or restart the server. ${CONFLICT_NOTICE_HUMAN_ONLY_LINE}`
     )
   }
   return (
     `:warning: *Not connected* — this persona's session is running but is not connected to this server (${notice.cause}), and automatic restarts are disabled (\`session_restart_delay\` is 0), so nothing will reconnect it; messages sent to it are lost.\n` +
-    `To recover: attach with ${attach}, deal with anything on screen and type ${reconnect}, or restart the server.`
+    `To recover: attach with ${attach}, deal with anything on screen and type ${reconnect}, or restart the server. ${CONFLICT_NOTICE_HUMAN_ONLY_LINE}`
   )
 }
 
@@ -10199,8 +10216,11 @@ export const JSONL_NO_CANDIDATES_TEXT = '(no transcript path could be determined
  * joined by "; ", or `JSONL_NO_CANDIDATES_TEXT` when there is none. Every
  * field can carry agent-director's text (its description's enumeration, or a
  * path read from its row), so each is rendered by `renderLogMessageText`
- * (redacted, on one line, capped) before it is joined. Not escaped for Slack:
- * a notice escapes the joined text once. Pure; never throws.
+ * (redacted, on one line, capped) before it is joined, for the log line and
+ * the startup-errors entry. Not escaped for Slack: a notice quotes the joined
+ * text through its own builder (`jsonlTranscriptLostNoticeText`,
+ * `jsonlCandidatesInconclusiveNoticeText`, `jsonlRowAbsentInconclusiveNoticeText`),
+ * which caps the quote as one and escapes it once. Pure; never throws.
  */
 export function jsonlCandidatesText(candidates: readonly JsonlCandidate[]): string {
   if (candidates.length === 0) return JSONL_NO_CANDIDATES_TEXT
@@ -10212,35 +10232,6 @@ export function jsonlCandidatesText(candidates: readonly JsonlCandidate[]): stri
 /** A row's `started_at` as the diagnosis's texts quote it: rendered by `renderLogMessageText`, or `(none)` when absent or empty. Pure. */
 function jsonlStartedAtText(startedAt: unknown): string {
   return renderLogMessageText(startedAt) || '(none)'
-}
-
-/**
- * The persona notice of a `lost` lost-transcript diagnosis (b.jg5 SRJ-712,
- * SRJ-1001): `archived` messages since spawn and `candidates`, the candidate
- * list already rendered (`jsonlCandidatesText`), escaped once for Slack here.
- * Pure; never throws.
- */
-export function jsonlTranscriptLostNoticeText(archived: number, candidates: string): string {
-  return (
-    `⚠️ CSCB: on restart my conversation transcript could not be found, but the message archive shows ` +
-    `${archived} message(s) since I started — my conversation memory has been lost and I ` +
-    `was ${JSONL_DIAGNOSIS_REUSE_WORDING}. An operator should investigate transcript storage. Paths tried: ` +
-    escapeSlackControlCharacters(candidates)
-  )
-}
-
-/**
- * The persona notice of an `inconclusive` lost-transcript diagnosis (b.jg5
- * SRJ-712, SRJ-1001): `reason`, whose agent-director-derived parts are already
- * rendered (`jsonlCandidatesText`, `renderLogMessageText`), escaped once for
- * Slack here. Worded as uncertainty, not loss. Pure; never throws.
- */
-export function jsonlDiagnosisInconclusiveNoticeText(reason: string): string {
-  return (
-    `⚠️ CSCB: on restart I was ${JSONL_DIAGNOSIS_REUSE_WORDING}; I could not determine whether my prior ` +
-    `conversation history was preserved (diagnosis inconclusive: ${escapeSlackControlCharacters(reason)}). An operator should ` +
-    `investigate.`
-  )
 }
 
 /** Local stat label: what WE see at a path right now (never claims AD tried it). */
@@ -10355,14 +10346,8 @@ async function diagnoseJsonlMissing(
     const adDetail = adCandidates.length
       ? jsonlCandidatesText(adCandidates)
       : renderLogMessageText(err.errDescription) || '(no path detail from agent-director)'
-    const notice = reportInconclusiveDiagnosis(
-      ref,
-      claudeInstanceId,
-      `the agent-director row is absent (ErrSpawnNotFound); AD reported: ${adDetail}`,
-      isStartup,
-      err,
-    )
-    return { verdict: 'inconclusive', notice }
+    reportInconclusiveDiagnosis(ref, claudeInstanceId, JSONL_ROW_ABSENT_REASON_LEAD + adDetail, isStartup, err)
+    return { verdict: 'inconclusive', notice: jsonlRowAbsentInconclusiveNoticeText(adDetail) }
   }
   const row = ownRead.row
   read.lastRead = latchRowStateRead(row.state)
@@ -10431,9 +10416,8 @@ async function diagnoseJsonlMissing(
     // Operator-visible signal — reuse the existing startup-errors mechanism.
     if (isStartup) recordStartupError(JSONL_TRANSCRIPT_LOST_ENTRY_CLASS, detail, describeAgentDirectorFailure(err))
     // And a persona notice so it is not buried in logs, posted once the
-    // reuse spawn has brought the persona up.
-    const notice = jsonlTranscriptLostNoticeText(archivedSinceSpawn, candidateStr)
-    return { verdict: 'lost', notice }
+    // reuse spawn has brought the persona up (`jsonlTranscriptLostNoticeText`).
+    return { verdict: 'lost', notice: jsonlTranscriptLostNoticeText(archivedSinceSpawn, candidateStr) }
   }
 
   // Below archivedSinceSpawn is 0 or null. Only an attributable 0 (archive
@@ -10457,7 +10441,10 @@ async function diagnoseJsonlMissing(
 
   // INCONCLUSIVE: we could not gather enough evidence to decide loss vs
   // never-created. Determine WHY — the operator needs the actionable cause.
-  //   (b) started_at absent/unparseable → could not bound "since spawn".
+  //   (b) started_at absent/unparseable → could not bound "since spawn". The
+  //       row's started_at is agent-director's text, so it is quoted
+  //       through renderLogMessageText (redacted, on one line, capped); the
+  //       notice escapes the whole reason for Slack (`jsonlInconclusiveNoticeText`).
   //   (c-config) no message_archive_db configured → diagnosis is structurally
   //              impossible; actionable "turn on the archive" hint.
   //   (c-other) archive configured but file-missing / unreadable / query threw.
@@ -10478,27 +10465,20 @@ async function diagnoseJsonlMissing(
       `the message archive (${config.message_archive_db}) could not be consulted (missing file, ` +
       `unreadable, or the count query failed) — see prior archive-count error line`
   }
-  const notice = reportInconclusiveDiagnosis(
-    ref,
-    claudeInstanceId,
-    `${reason}. Transcript candidates tried (${detailProvenance}): ${candidateStr}`,
-    isStartup,
-    err,
-  )
-  return { verdict: 'inconclusive', notice }
+  reportInconclusiveDiagnosis(ref, claudeInstanceId, jsonlCandidatesReasonLead(reason, detailProvenance) + candidateStr, isStartup, err)
+  return { verdict: 'inconclusive', notice: jsonlCandidatesInconclusiveNoticeText(reason, detailProvenance, candidateStr) }
 }
 
 /**
- * b.fwu, b.jg5 SRJ-712: the operator-visible signal for an INCONCLUSIVE
+ * b.fwu, b.jg5 SRJ-712: the log line and, at start, the startup-errors
+ * entry (`JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS`) for an INCONCLUSIVE
  * `ErrJsonlMissing` diagnosis, one where whether prior history was lost
- * could not be determined. Like the 'lost' verdict, it writes the log line
- * and, at start, the startup-errors entry
- * (`JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS`) now, and answers the persona
- * notice text, which its caller posts once the reuse spawn has brought the
- * persona up. Every text says the persona is brought up fresh by a reuse
- * spawn and its row is kept (`JSONL_DIAGNOSIS_REUSE_WORDING`), and is worded
- * as uncertainty, not loss: a false "your history was destroyed" is its own
- * harm. Never throws.
+ * could not be determined. `reason` is the whole reason (CSCB's lead
+ * followed by the text quoted from agent-director's description or row, as
+ * given). The persona notice is not built here: the caller answers it
+ * (`jsonlRowAbsentInconclusiveNoticeText`,
+ * `jsonlCandidatesInconclusiveNoticeText`) and posts it once the reuse spawn
+ * has brought the persona up. Never throws.
  */
 function reportInconclusiveDiagnosis(
   ref: string,
@@ -10506,16 +10486,86 @@ function reportInconclusiveDiagnosis(
   reason: string,
   isStartup: boolean,
   err: AgentDirectorError,
-): string {
+): void {
   const detail =
     `${ref} instance=${claudeInstanceId}: resume threw ErrJsonlMissing and the persona is ` +
     `${JSONL_DIAGNOSIS_REUSE_WORDING}, but diagnosis was INCONCLUSIVE — could not determine whether conversation ` +
     `history was lost because ${reason}.`
   console.error(`[slack] ErrJsonlMissing diagnostic: ${detail}`)
   if (isStartup) recordStartupError(JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS, detail, describeAgentDirectorFailure(err))
-  // The reason's agent-director-derived parts are already rendered
-  // (`renderLogMessageText`); the notice escapes it once for Slack.
-  return jsonlDiagnosisInconclusiveNoticeText(reason)
+}
+
+/** The inconclusive diagnosis's reason lead when the persona's agent-director row is absent (`ErrSpawnNotFound`). */
+const JSONL_ROW_ABSENT_REASON_LEAD = 'the agent-director row is absent (ErrSpawnNotFound); AD reported: '
+
+/** The inconclusive diagnosis's reason lead when the row was read: CSCB's `reason` and the candidates' provenance. */
+function jsonlCandidatesReasonLead(reason: string, detailProvenance: string): string {
+  return `${reason}. Transcript candidates tried (${detailProvenance}): `
+}
+
+/**
+ * The INCONCLUSIVE diagnosis notice text: `reasonLead` (CSCB's own words,
+ * which may hold a value from agent-director's row already rendered through
+ * `renderLogMessageText`, or the configured archive path) followed by
+ * `quoted` (text taken from agent-director's description or row) through
+ * `renderLogMessageText` (redacted, on one line, capped at
+ * `MAX_LOGGED_MESSAGE_LENGTH`; b.jg5 SRJ-1001). Each is then escaped once
+ * for Slack (`escapeSlackControlCharacters`); the log line and the
+ * startup-errors entry stay unescaped. It says the persona is brought up
+ * fresh by a reuse spawn and its row is kept (`JSONL_DIAGNOSIS_REUSE_WORDING`),
+ * and is worded as uncertainty, not loss: a false "your history was
+ * destroyed" is its own harm.
+ */
+function jsonlInconclusiveNoticeText(reasonLead: string, quoted: string): string {
+  return (
+    `⚠️ CSCB: on restart I was ${JSONL_DIAGNOSIS_REUSE_WORDING}; I could not determine whether my prior ` +
+    `conversation history was preserved (diagnosis inconclusive: ${escapeSlackControlCharacters(reasonLead)}` +
+    `${escapeSlackControlCharacters(renderLogMessageText(quoted))}). An operator should investigate.`
+  )
+}
+
+/**
+ * b.fwu, b.jg5 SRJ-712: the persona notice of an `ErrJsonlMissing`
+ * diagnosis that is INCONCLUSIVE because the persona's agent-director row is
+ * absent (`ErrSpawnNotFound`): the "AD reported:" shape, quoting
+ * `adReported` (the paths agent-director's description enumerates, or its
+ * redacted description) through `renderLogMessageText` (b.jg5 SRJ-1001),
+ * escaped for Slack.
+ * Pure; exported for the notice catalogue.
+ */
+export function jsonlRowAbsentInconclusiveNoticeText(adReported: string): string {
+  return jsonlInconclusiveNoticeText(JSONL_ROW_ABSENT_REASON_LEAD, adReported)
+}
+
+/**
+ * b.fwu, b.jg5 SRJ-712: the persona notice of an `ErrJsonlMissing`
+ * diagnosis that is INCONCLUSIVE with the row read (no usable or
+ * attributable archive count): the "Transcript candidates tried" shape, with
+ * CSCB's `reason`, the candidates' `detailProvenance`, and `candidates` (the
+ * paths tried, from agent-director's description or row) through
+ * `renderLogMessageText` (b.jg5 SRJ-1001), the reason and the quoted text
+ * escaped for Slack. Pure; exported for the notice
+ * catalogue.
+ */
+export function jsonlCandidatesInconclusiveNoticeText(reason: string, detailProvenance: string, candidates: string): string {
+  return jsonlInconclusiveNoticeText(jsonlCandidatesReasonLead(reason, detailProvenance), candidates)
+}
+
+/**
+ * b.fwu, b.jg5 SRJ-712: the persona notice of a LOST `ErrJsonlMissing`
+ * diagnosis (the archive holds `archivedSinceSpawn` messages since spawn,
+ * yet no transcript survives): the "Paths tried" shape, with `pathsTried`
+ * (taken from agent-director's description or row) redacted and capped
+ * through `renderLogMessageText` (b.jg5 SRJ-1001), then escaped for Slack
+ * (`escapeSlackControlCharacters`). Pure; exported for the notice catalogue.
+ */
+export function jsonlTranscriptLostNoticeText(archivedSinceSpawn: number, pathsTried: string): string {
+  return (
+    `⚠️ CSCB: on restart my conversation transcript could not be found, but the message archive shows ` +
+    `${archivedSinceSpawn} message(s) since I started — my conversation memory has been lost and I ` +
+    `was ${JSONL_DIAGNOSIS_REUSE_WORDING}. An operator should investigate transcript storage. Paths tried: ` +
+    escapeSlackControlCharacters(renderLogMessageText(pathsTried))
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -10943,7 +10993,7 @@ async function replacePersonaRow(
  *     (`voidDeadEvidence`), and only a GONE the re-run meets on the life it
  *     reads is evidence there;
  *   - a collision in that re-run (any second collision) makes no further
- *     call, arms the persona's retry timer with the reuse-collision cause
+ *     call, arms the persona's retry timer with the collision cause
  *     (`reportReuseCollisionAtSite`, so the attempt records it) and answers
  *     `retrying` (b.jg5 SRJ-1015): no notice, no `spawn-failed` entry,
  *     nothing counted (SRJ-112, SRJ-301).
@@ -10968,10 +11018,10 @@ async function reuseFinishedRow(
     return ladderGetThenAct({ ...voided.run, reuseCollisionRerun: true })
   }
   // b.jg5 SRJ-112, SRJ-301: a second collision; P is re-evaluated at its
-  // next tick or retry, so its retry timer is armed with the reuse-collision cause.
+  // next tick or retry, so its retry timer is armed with the collision cause.
   const armed = reportReuseCollisionAtSite(key)
   console.error(
-    `[slack] spawnForPersona: the ${what} of ${ref} collided with a live row again, in the re-run of get-then-act — nothing launched; answering retrying, no spawn-failure notice, nothing counted; the retry timer ${armed ? 'is armed' : 'could not be armed'} (cause=${UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION}; b.jg5 SRJ-112, SRJ-1015)`,
+    `[slack] spawnForPersona: the ${what} of ${ref} collided with a live row again, in the re-run of get-then-act — nothing launched; answering retrying, no spawn-failure notice, nothing counted; the retry timer ${armed ? 'is armed' : 'could not be armed'} (cause=${UNAVAILABLE_RETRY_CAUSE_COLLISION}; b.jg5 SRJ-112, SRJ-1015)`,
   )
   return { key, action: SPAWN_ACTION_RETRYING }
 }
@@ -10986,7 +11036,7 @@ async function reuseFinishedRow(
 export function plainSpawnCollisionLine(what: string, ref: string, rerun: boolean, armed: boolean): string {
   const outcome = rerun
     ? 're-running get-then-act once'
-    : `this is the re-run of get-then-act it gave — answering retrying; the retry timer ${armed ? 'is armed' : 'could not be armed'} (cause=${UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION})`
+    : `this is the re-run of get-then-act it gave — answering retrying; the retry timer ${armed ? 'is armed' : 'could not be armed'} (cause=${UNAVAILABLE_RETRY_CAUSE_COLLISION})`
   return `[slack] spawnForPersona: the ${what} of ${ref} collided with a live row — nothing launched, no spawn-failure notice, nothing counted; ${outcome} (b.jg5 SRJ-111, SRJ-114, SRJ-713)`
 }
 
@@ -11104,7 +11154,7 @@ function plainSpawnCollisionAtLadder(run: LadderRun, what: string): Promise<Spaw
  * The no-transcript step's reuse spawn has SRJ-112's outcomes
  * (`reuseSpawnFailedAt`); its collision (`ErrInstanceIdCollision`: the row
  * is live again) takes the finished-row branch's one get-then-act re-run,
- * and a second collision arms the reuse-collision cause and answers
+ * and a second collision arms the collision cause and answers
  * `retrying`, uncounted (`reuseFinishedRow`).
  * This is the `ended`/`missing` state handling, extracted so the
  * b.3ce dead-session fallback in the `waiting`/`working` branches reuses the
@@ -11369,7 +11419,7 @@ async function resumeOrFreshSpawn(
  * with no mark the old life goes through the live-row sequence with the
  * retired-key flag; with the mark set the live row is the new life and is
  * handled as any live row. A collision in that re-run arms the
- * reuse-collision cause and answers `retrying`, uncounted. Nothing is
+ * collision cause and answers `retrying`, uncounted. Nothing is
  * deleted or killed here. Never throws.
  */
 function retiredKeyAtResumeSite(run: LadderRun, lastRead: LatchRowState, retired: RetiredKeyReading): Promise<SpawnPersonaResult> {
@@ -12984,7 +13034,7 @@ async function replaceAtResumeSite(
  * cause.
  */
 export function resumeCollisionLine(ref: string, failure: string, armed: boolean): string {
-  return `[slack] spawnForPersona: ${failure} on the resume of ${ref} — its row is live, so nothing was launched; no spawn-failure notice, nothing counted; answering retrying, the retry timer ${armed ? 'is armed' : 'could not be armed'} (cause=${UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION}), and that retry's run of the restart path's decision is the get-then-act (b.jg5 SRJ-713, SRJ-112, SRJ-301)`
+  return `[slack] spawnForPersona: ${failure} on the resume of ${ref} — its row is live, so nothing was launched; no spawn-failure notice, nothing counted; answering retrying, the retry timer ${armed ? 'is armed' : 'could not be armed'} (cause=${UNAVAILABLE_RETRY_CAUSE_COLLISION}), and that retry's run of the restart path's decision is the get-then-act (b.jg5 SRJ-713, SRJ-112, SRJ-301)`
 }
 
 /**
@@ -14463,7 +14513,7 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *    The replace step (`replacePersonaRow`, b.jg5 SRJ-707) decides on the
  *    row state the path last read: `ended`, `missing` or no row → one reuse
  *    spawn of the same id (`reuseSpawnForPersona`); its collision re-runs
- *    this step 5 once, and a second collision arms the reuse-collision
+ *    this step 5 once, and a second collision arms the collision
  *    cause and answers `retrying`; any live state,
  *    `pending` included → the live-row sequence is started (SRJ-705,
  *    SRJ-706) and the launch answers `sequence-waiting` with no other call.
@@ -15097,7 +15147,7 @@ const REUSE_SPAWN_WHAT = 'reuse spawn'
  * row is live (a launch in progress included), so nothing was launched. Not
  * a launch result: no notice, no entry, nothing counted and nothing armed by
  * the reuse itself. Its caller decides what follows: the live-row sequence
- * ends without its launch and arms the reuse-collision cause; a collision
+ * ends without its launch and arms the collision cause; a collision
  * ladder reuse site re-runs get-then-act once, and a second collision arms
  * that cause and ends the attempt (`reuseFinishedRow`).
  */
@@ -16136,7 +16186,7 @@ export type LiveRowSequenceLaunchEntryResult = SpawnPersonaResult | LiveRowSeque
  *     the persona and answers `held`, SRJ-207). Its collision answers not
  *     launched (`reuse-collision`): no further launch, nothing counted, no
  *     notice; the sequence ends without its launch and arms the persona's
- *     retry timer with the reuse-collision cause (SRJ-112, SRJ-705, SRJ-706);
+ *     retry timer with the collision cause (SRJ-112, SRJ-705, SRJ-706);
  *   - a success runs the after-launch step (`afterLaunchSucceeded`: the
  *     `pre_trust` line and the dialog approver); any other result ends the
  *     sequence without its launch (`runLiveRowSequence` arms by its rule,
@@ -16477,7 +16527,7 @@ export interface LiveRowSequenceDepsInput {
 const LIVE_ROW_SEQUENCE_ARM_CAUSE_LABELS: { readonly [C in LiveRowSequenceArmCause]: C } = Object.freeze({
   [LIVE_ROW_ARM_NOT_JUDGED]: UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED,
   [LIVE_ROW_ARM_ENDED]: UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED,
-  [LIVE_ROW_ARM_REUSE_COLLISION]: UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION,
+  [LIVE_ROW_ARM_COLLISION]: UNAVAILABLE_RETRY_CAUSE_COLLISION,
   [LIVE_ROW_ARM_LOST_RACE]: UNAVAILABLE_RETRY_CAUSE_LOST_RACE,
 })
 
@@ -16505,7 +16555,7 @@ const LIVE_ROW_SEQUENCE_ARM_CAUSE_LABELS: { readonly [C in LiveRowSequenceArmCau
  *     (`launchForLiveRowSequence`) and the retry arm with the sequence's
  *     four causes (`UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED`,
  *     `UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED`,
- *     `UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION`,
+ *     `UNAVAILABLE_RETRY_CAUSE_COLLISION`,
  *     `UNAVAILABLE_RETRY_CAUSE_LOST_RACE`).
  * Every agent-director call goes through `withOutageDetection` inside those
  * entries. The builder reads nothing and starts nothing when called.
@@ -19961,7 +20011,7 @@ export function latchRecheckUnmatchedLine(ref: string, refusedOperation: string,
  * call (`latched`). Once the latch has cleared (a `resume` whose definite
  * answer cleared it went on to a spawn that collided), the persona is
  * handled as after a second collision: its retry timer is armed with the
- * reuse-collision cause and the answer is `retrying`. One line either way.
+ * collision cause and the answer is `retrying`. One line either way.
  * Never throws.
  */
 function latchRecheckCollided(key: string, ref: string, what: string): SpawnPersonaResult {
@@ -19990,10 +20040,10 @@ export function latchRecheckCollisionNoInformationLine(ref: string, what: string
  * (b.jg5 SRJ-112, SRJ-1015, SRJ-1014), `armed` whether the retry timer was
  * armed. Pure.
  *
- *   [slack] latch-recheck: the <what> of <ref> collided with a live row after the latch cleared — nothing launched; answering retrying, the retry timer <is armed|could not be armed> (cause=reuse-collision; b.jg5 SRJ-112, SRJ-1015)
+ *   [slack] latch-recheck: the <what> of <ref> collided with a live row after the latch cleared — nothing launched; answering retrying, the retry timer <is armed|could not be armed> (cause=collision; b.jg5 SRJ-112, SRJ-1015)
  */
 export function latchRecheckCollidedAfterClearLine(ref: string, what: string, armed: boolean): string {
-  return `[slack] ${LATCH_RECHECK_SITE}: the ${what} of ${ref} collided with a live row after the latch cleared — nothing launched; answering retrying, the retry timer ${armed ? 'is armed' : 'could not be armed'} (cause=${UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION}; b.jg5 SRJ-112, SRJ-1015)`
+  return `[slack] ${LATCH_RECHECK_SITE}: the ${what} of ${ref} collided with a live row after the latch cleared — nothing launched; answering retrying, the retry timer ${armed ? 'is armed' : 'could not be armed'} (cause=${UNAVAILABLE_RETRY_CAUSE_COLLISION}; b.jg5 SRJ-112, SRJ-1015)`
 }
 
 /**

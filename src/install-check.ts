@@ -18,8 +18,10 @@
  *     `ErrSystemInstallUnreachable` reason, or a resolved version that does
  *     not parse, reported with reason `unparseable-version`), a binary below
  *     the client's minimum, or any other failure fails with its class label;
- *     the too-old message names the switch-over runbook section and no
- *     message advises upgrading agent-director;
+ *     the too-old message names the switch-over runbook section, the
+ *     not-found message its publishing-host block, the client-package texts
+ *     {@link CLIENT_PACKAGE_REMEDY}, and no message advises installing,
+ *     reinstalling or upgrading agent-director (b.jg5 SRJ-208, SRJ-1101);
  *   - a binary the client accepts but below CSCB's Phase 1 floor (`0.10.0`,
  *     `0.0.0-dev`) passes with the Phase 1 `note`: the server refuses to start
  *     on it until agent-director Phase 1 is installed;
@@ -70,6 +72,8 @@ import {
   HOST_VERSION_FAIL_VERSION_UNREADABLE,
   HOST_VERSION_OUTCOME_FAIL,
   HOST_VERSION_OUTCOME_PASS_BELOW_FLOOR,
+  PHASE1_RUNBOOK_SECTION_TITLE,
+  PUBLISHING_HOST_BLOCK_HEADING,
   readField,
   redactToOneLine,
   settleHostVersionCall,
@@ -93,6 +97,33 @@ export {
   AD_VERSION_FLOOR_UNREADABLE,
 } from './install-check-labels.ts'
 export type { InstallCheckClassLabel } from './install-check-labels.ts'
+
+/**
+ * The README's switch-over runbook section, named by its title
+ * (`PHASE1_RUNBOOK_SECTION_TITLE`), as the install check's and the startup
+ * gate's texts point to it. No text that carries it advises installing,
+ * reinstalling, upgrading or removing anything (b.jg5 SRJ-208, SRJ-212,
+ * SRJ-1101).
+ */
+export const RUNBOOK_SECTION_POINTER = `the README's switch-over runbook section "${PHASE1_RUNBOOK_SECTION_TITLE}"`
+
+/**
+ * The publishing-host block (`PUBLISHING_HOST_BLOCK_HEADING`) inside the
+ * switch-over runbook section: where the install check's not-found text
+ * points, since that block covers a host with no agent-director (b.jg5
+ * SRJ-1108, SRJ-212). The startup gate's not-found text points at
+ * `RUNBOOK_SECTION_POINTER` instead (it runs on a bot host).
+ */
+export const PUBLISHING_HOST_BLOCK_POINTER = `the block "${PUBLISHING_HOST_BLOCK_HEADING}" in ${RUNBOOK_SECTION_POINTER}`
+
+/**
+ * The remedy every text about the agent-director client package carries (the
+ * `ad-version-floor-unreadable` texts here and the startup gate's three
+ * `ad-shim-*` probes; b.jg5 SRJ-208): check the package installed with CSCB,
+ * and the runbook section. It names no reinstall, upgrade, `@latest` or
+ * package-manager command.
+ */
+export const CLIENT_PACKAGE_REMEDY = `Check the agent-director npm package installed with CSCB; see ${RUNBOOK_SECTION_POINTER}.`
 
 /**
  * Success arm: agent-director is installed at or above the client's minimum
@@ -182,7 +213,7 @@ function readFloorFile(deps: ClientMinVersionDeps): string | InstallCheckFailure
       classLabel: AD_VERSION_FLOOR_UNREADABLE,
       message:
         `Could not resolve '${FLOOR_FILE_SPECIFIER}' from the installed ` +
-        `agent-director package. Reinstall agent-director from npm and retry.`,
+        `agent-director package. ${CLIENT_PACKAGE_REMEDY}`,
       detail: { underlying: underlyingMessage(err) },
     }
   }
@@ -196,7 +227,7 @@ function readFloorFile(deps: ClientMinVersionDeps): string | InstallCheckFailure
       classLabel: AD_VERSION_FLOOR_UNREADABLE,
       message:
         `Could not read agent-director's dist/version-floor.json. ` +
-        `Reinstall agent-director from npm and retry.`,
+        CLIENT_PACKAGE_REMEDY,
       detail: { underlying: underlyingMessage(err) },
     }
   }
@@ -210,7 +241,7 @@ function readFloorFile(deps: ClientMinVersionDeps): string | InstallCheckFailure
       classLabel: AD_VERSION_FLOOR_UNREADABLE,
       message:
         `agent-director's dist/version-floor.json failed to parse as JSON. ` +
-        `Reinstall agent-director from npm and retry.`,
+        CLIENT_PACKAGE_REMEDY,
       detail: { underlying: underlyingMessage(err) },
     }
   }
@@ -222,7 +253,7 @@ function readFloorFile(deps: ClientMinVersionDeps): string | InstallCheckFailure
       classLabel: AD_VERSION_FLOOR_UNREADABLE,
       message:
         `agent-director's dist/version-floor.json is missing the required '.min_binary_version' field ` +
-        `(or it is not a non-empty string). Reinstall agent-director from npm and retry.`,
+        `(or it is not a non-empty string). ${CLIENT_PACKAGE_REMEDY}`,
       detail: { parsed },
     }
   }
@@ -278,7 +309,7 @@ function underlyingMessage(err: unknown): string | null {
 function unreachableMessage(binaryPath: string, reason: string): string {
   return (
     `agent-director system install at ${binaryPath} is unreachable. ` +
-    `Reason: ${reason}. Diagnose with the install-cscb skill or re-install agent-director.`
+    `Reason: ${reason}. Diagnose with the install-cscb skill; see ${RUNBOOK_SECTION_POINTER}.`
   )
 }
 
@@ -298,7 +329,7 @@ function failureResult(failure: HostVersionFailure, settled: HostVersionCallResu
         classLabel: AD_SYSTEM_INSTALL_NOT_FOUND,
         message:
           `agent-director not found on PATH or at the standard install path. ` +
-          `Install agent-director system-wide and retry.`,
+          `See ${PUBLISHING_HOST_BLOCK_POINTER}, which covers a host with no agent-director.`,
         detail: { checkedLocations: safeCheckedLocations(readField(error, 'checkedLocations')) },
       }
     case HOST_VERSION_FAIL_BELOW_CLIENT_MINIMUM:
@@ -340,7 +371,7 @@ function failureResult(failure: HostVersionFailure, settled: HostVersionCallResu
         message:
           `agent-director's dist/version-floor.json '.min_binary_version' field is ` +
           `${JSON.stringify(failure.clientMinimum)}, which is not a version, so the host's ` +
-          `agent-director cannot be checked. Check the agent-director npm package installed with CSCB.`,
+          `agent-director cannot be checked. ${CLIENT_PACKAGE_REMEDY}`,
         detail: { minBinaryVersion: failure.clientMinimum },
       }
     case HOST_VERSION_FAIL_OTHER:
@@ -350,7 +381,7 @@ function failureResult(failure: HostVersionFailure, settled: HostVersionCallResu
         classLabel: AD_SYSTEM_INSTALL_UNREACHABLE,
         message:
           `agent-director system install probe failed unexpectedly: ${failure.description}. ` +
-          `Re-install agent-director or file a bug.`,
+          `See ${RUNBOOK_SECTION_POINTER}, or file a bug.`,
         detail: { underlying: failure.description, reason: HOST_VERSION_FAIL_OTHER },
       }
   }

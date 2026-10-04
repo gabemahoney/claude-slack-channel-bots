@@ -12,6 +12,15 @@ the constraints at the end.
 Audience: the repo owner. Everything here is run by hand, in order, and each
 phase is verifiable before the next.
 
+**Scope.** This runbook applies only between CSCB releases on the same
+agent-director. It does not apply to the release that requires agent-director
+Phase 1, or to any later move from a CSCB that ran before Phase 1: that
+switch-over stops the fleet and changes both binaries together, and its
+rollback restores agent-director too. For those, the README sections
+[Switching over to agent-director Phase 1](../README.md#switching-over-to-agent-director-phase-1)
+and [Rolling back the switch-over](../README.md#rolling-back-the-switch-over)
+govern, not this runbook.
+
 ---
 
 ## Why

@@ -81,6 +81,8 @@ import {
   AD_SYSTEM_INSTALL_NOT_FOUND,
   AD_SYSTEM_INSTALL_TOO_OLD,
   AD_SYSTEM_INSTALL_UNREACHABLE,
+  CLIENT_PACKAGE_REMEDY,
+  RUNBOOK_SECTION_POINTER,
 } from './install-check.ts'
 import { PHASE1_ONLY_ERR_NAMES } from './agent-director-errors.ts'
 import { buildBelowPhase1FloorMessage, buildSystemInstallTooOldMessage, meetsPhase1Floor } from './ad-version-gate.ts'
@@ -404,7 +406,9 @@ function constructFailure(err: unknown): StartupGateFailure {
       message:
         `agent-director system install not found. The startup gate searched ` +
         `the standard install path and PATH but did not locate the agent-director ` +
-        `binary. Install agent-director (system-wide) and retry.` +
+        `binary. See ${RUNBOOK_SECTION_POINTER}: its step 1 checks agent-director's version as the ` +
+        `workers' user in the bot server's launcher environment, which shows whether this launcher's ` +
+        `HOME or PATH differs from the workers'.` +
         renderInstallSkillInstructions(),
     }
   }
@@ -432,7 +436,7 @@ function constructFailure(err: unknown): StartupGateFailure {
         `agent-director system install is unreachable. ` +
         `Reason: ${err.reason}. ` +
         `Binary at ${err.binaryPath} could not be invoked successfully. ` +
-        `Diagnose with the install-cscb skill or re-install agent-director.` +
+        `Diagnose with the install-cscb skill; see ${RUNBOOK_SECTION_POINTER}.` +
         renderInstallSkillInstructions(),
     }
   }
@@ -545,7 +549,7 @@ export async function runStartupGate(
       message:
         `agent-director Client is missing the 'getPermission' method. ` +
         `The installed shim is stale relative to the AD binary (${adVersion}). ` +
-        `Run: reinstall a matching 'agent-director' version (confirm the resolved package ships getPermission).`,
+        CLIENT_PACKAGE_REMEDY,
     }
   }
 
@@ -560,9 +564,8 @@ export async function runStartupGate(
       message:
         `agent-director TS error catalog is missing required err_names: ` +
         `${catalogProbe.missing.join(', ')}. ` +
-        `Envelopes with these names would surface as the base AgentDirectorError ` +
-        `instead of typed subclasses, breaking CSCB's classification of agent-director errors. ` +
-        `Run: reinstall a matching 'agent-director' version (confirm the resolved package ships the full catalog).`,
+        `Envelopes with these names would arrive as ErrUnknownErrorName and be misclassified. ` +
+        CLIENT_PACKAGE_REMEDY,
     }
   }
 
@@ -577,7 +580,7 @@ export async function runStartupGate(
       message:
         `agent-director shim's decide() does not pass --request-token to the CLI: ${argvProbe.detail} ` +
         `Permission clicks would resolve against the wrong row. ` +
-        `Run: reinstall a matching 'agent-director' version (confirm the resolved package's buildDecide includes the flag).`,
+        CLIENT_PACKAGE_REMEDY,
     }
   }
 
@@ -605,7 +608,8 @@ export async function runStartupGate(
         message:
           `${AD_STATE_DB_PATH} is owned by UID ${stat.uid} but this process is running as UID ${expectedUid}. ` +
           `agent-director's state DB must be owned by the same user running claude-slack-channel-bots. ` +
-          `Re-install agent-director as the correct user or remove the mismatched file.`,
+          `Run the server as the user that owns ${AD_STATE_DB_PATH}; never remove or recreate the file. ` +
+          `See ${RUNBOOK_SECTION_POINTER}.`,
       }
     }
   } catch (err) {

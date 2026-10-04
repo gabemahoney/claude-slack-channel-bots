@@ -252,7 +252,9 @@
  *
  * Other exports (E13 T2):
  *   - {@link expectedConflictNotice}: the expected notice for any case,
- *     session and description (none: no description line), assembled from
+ *     session and description (none: no description line) and the record's
+ *     `listLineUnsafe` (true: the unsafe-name line in place of the list
+ *     line), assembled from
  *     the fixed lines and the case sentences `src/conflict-latch.ts` exports
  *     (`CONFLICT_NOTICE_*`, `CONFLICT_CASE_SENTENCES`), with the description
  *     rendered as a record holds it (`renderLogMessageText`) and both it and
@@ -271,7 +273,11 @@
  *     `has-session`, either label option's name), and each entry a line
  *     matches. The CONFLICT notice's and the stuck-launch post's checks reuse
  *     them;
- *   - {@link cscbOwnLines}: a notice's lines with agent-director's quoted
+ *   - {@link HUMAN_ONLY_SENTENCE} and {@link humanOnlySentencesIn}: SRJ-1001's
+ *     human-only sentence in every wording the SRD, the notices and the docs
+ *     use, as the one pattern every test file matches it with, and each
+ *     occurrence in a text (for exact counts and for cutting it out);
+ *   - {@link cscbOwnLines}:a notice's lines with agent-director's quoted
  *     description taken out, so a check over CSCB's own words lets the quoted
  *     description through. Two forms: a CONFLICT notice's description line
  *     (SRJ-1004; the line that opens with `CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD`)
@@ -457,6 +463,7 @@ import {
   CONFLICT_NOTICE_LINE_SEPARATOR,
   CONFLICT_NOTICE_LIST_LINE_HEAD,
   CONFLICT_NOTICE_LIST_LINE_TAIL,
+  CONFLICT_NOTICE_LIST_LINE_UNSAFE_NAME,
   CONFLICT_NOTICE_POINTER_LINE,
   LATCH_CASE_ANOTHER_STORE,
   LATCH_CASE_CONFLICTING_LABELS,
@@ -517,6 +524,7 @@ import {
   launchStartNotRecordedNoticeText,
   launchStartNotRecordedSetInput,
   recogniseConflictCase,
+  shellQuoteSessionName,
   takesUnrecognisedHandling,
   unusableNameNoticeText,
   unusableNameSetInput,
@@ -862,7 +870,11 @@ export interface ConflictNoticeCarries {
   readonly pointer: boolean
   /** "a different instance id": `row`, in place of the pointer; "another agent-director store": `store`, before the pointer. */
   readonly mustNotEnd: MustNotEndLine
-  /** The `list` line: every case. */
+  /**
+   * The `list` line: every case whose session name can be shown safely
+   * ({@link listLineShowsName}); otherwise the unsafe-name line stands in
+   * its place.
+   */
   readonly list: boolean
   /** The human-only line: every case. */
   readonly humanOnly: boolean
@@ -880,20 +892,55 @@ export interface ExpectedConflictNotice {
   readonly caseSentence: string | undefined
   /** Its description line; `undefined` when there is no description. */
   readonly descriptionLine: string | undefined
+  /** Its `list` line, or the unsafe-name line in its place when `carries.list` is false. */
+  readonly listLine: string
 }
 
-/** What an expected notice is built from: a CONFLICT latch's case, its quoted session (as the record holds it) and its description, if any. */
+/**
+ * What an expected notice is built from: a CONFLICT latch's case, its quoted
+ * session (as the record holds it), its description, if any, and the
+ * record's `listLineUnsafe` (true: the unsafe-name line stands in place of
+ * the list line, whatever `sessionName` is; a record built from a name it
+ * had to redact, trim, cap or replace holds a name that reads safe).
+ */
 export interface ExpectedConflictNoticeSource {
   readonly latchCase: ConflictLatchCase
   readonly sessionName: string
   readonly description?: string
+  readonly listLineUnsafe?: boolean
 }
 
-/** The flags SRJ-1004 sets for a case. */
-function carriesFor(latchCase: ConflictLatchCase): ConflictNoticeCarries {
+/** The flags SRJ-1004 sets for a case, a session name and the record's `listLineUnsafe`. */
+function carriesFor(latchCase: ConflictLatchCase, sessionName: string, listLineUnsafe: boolean): ConflictNoticeCarries {
   const mustNotEnd: MustNotEndLine =
     latchCase === LATCH_CASE_DIFFERENT_ID ? 'row' : latchCase === LATCH_CASE_ANOTHER_STORE ? 'store' : 'none'
-  return Object.freeze({ pointer: latchCase !== LATCH_CASE_DIFFERENT_ID, mustNotEnd, list: true, humanOnly: true })
+  return Object.freeze({
+    pointer: latchCase !== LATCH_CASE_DIFFERENT_ID,
+    mustNotEnd,
+    list: !listLineUnsafe && listLineShowsName(sessionName),
+    humanOnly: true,
+  })
+}
+
+/**
+ * Whether the `list` line can show `sessionName` (as given): it holds no
+ * character `shellQuoteSessionName` refuses, and `renderLogMessageText`
+ * leaves it as it is (a redacted, trimmed, one-lined or capped name, or one
+ * of whitespace only, would make the command list nothing).
+ */
+function listLineShowsName(sessionName: string): boolean {
+  return renderLogMessageText(sessionName) === sessionName && shellQuoteSessionName(sessionName) !== null
+}
+
+/**
+ * The `list` line for `sessionName` (as given): the unsafe-name line when the
+ * name cannot be shown safely ({@link listLineShowsName}), else the name
+ * shell-quoted by `shellQuoteSessionName` and then escaped once for Slack,
+ * between the line's head and tail.
+ */
+export function expectedConflictListLine(sessionName: string): string {
+  if (!listLineShowsName(sessionName)) return CONFLICT_NOTICE_LIST_LINE_UNSAFE_NAME
+  return CONFLICT_NOTICE_LIST_LINE_HEAD + escapeSlackControlCharacters(shellQuoteSessionName(sessionName)!) + CONFLICT_NOTICE_LIST_LINE_TAIL
 }
 
 /**
@@ -902,12 +949,14 @@ function carriesFor(latchCase: ConflictLatchCase): ConflictNoticeCarries {
  * the first line (`"<session>"`, with the case sentence unless the case takes
  * the unrecognised-text wording), the description line (left out when the
  * rendered description is empty), the must-not-be-ended line and the pointer
- * as `carries` says, the `list` line (`<name>` without quotes) and the
- * human-only line. The session name and the rendered description are escaped
- * once for Slack.
+ * as `carries` says, the `list` line ({@link expectedConflictListLine}: the
+ * name shell-quoted, or the unsafe-name line in its place, as it is too
+ * whenever `source.listLineUnsafe` is true) and the
+ * human-only line. The session name (rendered as the record stores it) and
+ * the rendered description are escaped once for Slack.
  */
 export function expectedConflictNotice(source: ExpectedConflictNoticeSource): ExpectedConflictNotice {
-  const name = escapeSlackControlCharacters(source.sessionName)
+  const name = escapeSlackControlCharacters(renderLogMessageText(source.sessionName))
   const caseSentence = takesUnrecognisedHandling(source.latchCase)
     ? undefined
     : CONFLICT_CASE_SENTENCES[source.latchCase as ConflictCaseWithSentence]
@@ -916,7 +965,8 @@ export function expectedConflictNotice(source: ExpectedConflictNoticeSource): Ex
     rendered === ''
       ? undefined
       : CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD + escapeSlackControlCharacters(rendered) + CONFLICT_NOTICE_DESCRIPTION_LINE_TAIL
-  const carries = carriesFor(source.latchCase)
+  const carries = carriesFor(source.latchCase, source.sessionName, source.listLineUnsafe === true)
+  const listLine = carries.list ? expectedConflictListLine(source.sessionName) : CONFLICT_NOTICE_LIST_LINE_UNSAFE_NAME
   const lines = [
     CONFLICT_NOTICE_FIRST_LINE_HEAD +
       `"${name}"` +
@@ -926,7 +976,7 @@ export function expectedConflictNotice(source: ExpectedConflictNoticeSource): Ex
     ...(carries.mustNotEnd === 'row' ? [CONFLICT_NOTICE_DIFFERENT_ID_MUST_NOT_END_LINE] : []),
     ...(carries.mustNotEnd === 'store' ? [CONFLICT_NOTICE_ANOTHER_STORE_MUST_NOT_END_LINE] : []),
     ...(carries.pointer ? [CONFLICT_NOTICE_POINTER_LINE] : []),
-    CONFLICT_NOTICE_LIST_LINE_HEAD + name + CONFLICT_NOTICE_LIST_LINE_TAIL,
+    listLine,
     CONFLICT_NOTICE_HUMAN_ONLY_LINE,
   ]
   return Object.freeze({
@@ -935,6 +985,7 @@ export function expectedConflictNotice(source: ExpectedConflictNoticeSource): Ex
     carries,
     caseSentence,
     descriptionLine,
+    listLine,
   })
 }
 
@@ -1066,6 +1117,38 @@ export const CSCB_OWN_LINE_FORBIDDEN: readonly RegExp[] = Object.freeze([
 /** Each {@link CSCB_OWN_LINE_FORBIDDEN} entry `line` matches, with the line, so a failure names both; empty when none does. */
 export function cscbOwnLineForbiddenIn(line: string): string[] {
   return CSCB_OWN_LINE_FORBIDDEN.filter((pattern) => pattern.test(line)).map((pattern) => `${pattern} in ${JSON.stringify(line)}`)
+}
+
+// ---------------------------------------------------------------------------
+// The human-only sentence (b.jg5 SRJ-1001)
+// ---------------------------------------------------------------------------
+
+/** What a human-only sentence opens with: "This is", "These commands are", "These remedies are", "Both notices are", "it is", "its commands are". */
+const HUMAN_ONLY_LEAD = String.raw`(?:(?:This|It|it) is|(?:These|these|its) (?:commands|remedies) are|Both notices are)`
+
+/** The persona it names: "any persona that sees this post" in the notices, "a persona that sees the post" in the SRD's and the docs' wordings. */
+const HUMAN_ONLY_PERSONA = String.raw`(?:any|a) persona that sees (?:this|the) post`
+
+/**
+ * SRJ-1001's human-only sentence, the one pattern every test file uses for
+ * it. A notice that names a command or points to "Operator actions" carries
+ * it. Its wordings differ, so no src constant is matched: the notices'
+ * "no bot, including any persona that sees this post, may act on it" (a
+ * pointer), "… may act on them" (several remedies) and "… may run them"
+ * (commands), the SRD's "… any persona that sees the post, may act on it",
+ * and the docs' "no bot runs them, including a persona that sees the post"
+ * and "no bot acts on it" (or "on them"). Not global, so it keeps no
+ * `lastIndex` between tests; {@link humanOnlySentencesIn} finds every one.
+ */
+export const HUMAN_ONLY_SENTENCE = new RegExp(
+  String.raw`\b${HUMAN_ONLY_LEAD} for a human only: no bot` +
+    String.raw`(?:, including ${HUMAN_ONLY_PERSONA}, may (?:act on (?:it|them)|run them)` +
+    String.raw`| (?:acts on (?:it|them)|runs them), including ${HUMAN_ONLY_PERSONA})\.`,
+)
+
+/** Every {@link HUMAN_ONLY_SENTENCE} in `text`, in order; empty when it carries none. */
+export function humanOnlySentencesIn(text: string): string[] {
+  return Array.from(text.matchAll(new RegExp(HUMAN_ONLY_SENTENCE.source, 'g')), (match) => match[0])
 }
 
 /** The verb of a spawn, plain or with `--reuse-finished`. */
@@ -2104,19 +2187,25 @@ export const STUCK_LAUNCH_ABORT_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] =
  * SRJ-501 says a record holds it: the case, the refused operation and the
  * row state as given; the session and the description rendered by
  * `renderLogMessageText` (redacted, on one line, capped), the session
- * `slack_bot_<key>` (`personaTmuxSessionName`) when that is empty, and no
- * description when that is empty. The hold rows build their `input` with
- * `src/conflict-latch.ts`'s own set-input builders, so no field is typed here.
+ * `slack_bot_<key>` (`personaTmuxSessionName`) when that is empty, no
+ * description when that is empty, and `listLineUnsafe` unless the record
+ * holds the session name as given (no name given counts as
+ * `slack_bot_<key>`) and `shellQuoteSessionName` quotes it (final-review
+ * fix #3). The hold rows build their `input` with `src/conflict-latch.ts`'s
+ * own set-input builders, so no field is typed here.
  */
 export function expectedLatchRecord(key: string, input: ConflictLatchSetInput): ConflictLatchRecord {
-  const sessionName = renderLogMessageText(input.sessionName)
+  const rendered = renderLogMessageText(input.sessionName)
+  const sessionName = rendered === '' ? personaTmuxSessionName(key) : rendered
+  const given = input.sessionName ?? sessionName
   const description = renderLogMessageText(input.description)
   return Object.freeze({
-    sessionName: sessionName === '' ? personaTmuxSessionName(key) : sessionName,
+    sessionName,
     latchCase: input.latchCase,
     refusedOperation: input.refusedOperation,
     rowState: input.rowState,
     ...(description === '' ? {} : { description }),
+    ...(given === sessionName && shellQuoteSessionName(given) !== null ? {} : { listLineUnsafe: true as const }),
   })
 }
 

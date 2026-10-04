@@ -23,7 +23,12 @@
  * tests/persona-notifier.test.ts's), and the latch re-check's no-information
  * scope at the wrappers and the site entries (b.jg5 SRJ-505, SRJ-506: AC 71;
  * the scope's own queries and the retry timer's side are
- * tests/unavailable-retry.test.ts's).
+ * tests/unavailable-retry.test.ts's), and the onset texts' scope and remedy
+ * (b.jg5 SRJ-1001): the `ad-unreachable` onset affects every persona and
+ * points to the README's switch-over runbook section by its title
+ * (`PHASE1_RUNBOOK_SECTION_TITLE`), with no install, reinstall or upgrade
+ * (`UPGRADE_FORMS`); the generic `tmux-unavailable` onset speaks for this
+ * persona only and keeps its install-or-repair remediation.
  *
  * Every wrapped call declares its verb. The trigger-sink and condition-sink
  * cases install recording fake sinks (no timer, no episodes) and run the
@@ -148,7 +153,9 @@ import {
 } from '../src/unavailable-retry.ts'
 import { APP_TOKEN_PREFIX, LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
 import { MAX_LOGGED_MESSAGE_LENGTH, describeThrownValue } from '../src/persona-connection-errors.ts'
-import { RECHECK_OUTCOME_NOT_RUNNING, RECHECK_OUTCOME_PASS, createAdVersionRecheck } from '../src/ad-version-gate.ts'
+import { PHASE1_RUNBOOK_SECTION_TITLE, RECHECK_OUTCOME_NOT_RUNNING, RECHECK_OUTCOME_PASS, createAdVersionRecheck } from '../src/ad-version-gate.ts'
+import { UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
+import { flat } from './test-helpers/markdown.ts'
 import { PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { lineParts } from './test-helpers/line-parts.ts'
@@ -679,15 +686,35 @@ describe('persona-keyed notices', () => {
       expect(text).not.toContain('key=')
       expect(text).not.toMatch(/\dT\d/)
     }
-    // The fleet-wide classes say they affect every persona.
+    // ad-unreachable is fleet-wide (the binary is host-wide) and says so; the
+    // generic tmux-unavailable onset speaks for this persona only (b.jg5 SRJ-1001, E11).
     expect(ONSET_TEMPLATES['ad-unreachable']('/bin/ad')).toContain('affects every persona')
-    expect(ONSET_TEMPLATES['tmux-unavailable']()).toContain('affects every persona')
+    const tmux = ONSET_TEMPLATES['tmux-unavailable']()
+    expect(tmux).not.toMatch(/every persona|all personas/i)
+    expect(tmux.split('\n')[0]).toMatch(/^:rotating_light: \*tmux unavailable\* — .*\bthis persona\b/)
+    expect(tmux.split('\n').at(-1)).toBe('Remediation: install or repair tmux.')
     // cwd-unreachable points at the persona's working directory, not a route.
     const cwd = ONSET_TEMPLATES['cwd-unreachable']('/work/dir')
     expect(cwd).toMatch(/Working directory unreachable/)
     expect(cwd).toContain('/work/dir')
     expect(cwd).toContain('`working_directory`')
     expect(cwd).not.toMatch(/remove this/i)
+  })
+
+  test.each([
+    ['a binary path', '/bin/ad'],
+    ['no binary path', undefined],
+  ])('ad-unreachable onset, %s: affects every persona; its remedy points to the README\'s switch-over runbook section by its title, with no install, reinstall or upgrade and no command (b.jg5 SRJ-1001)', (_label, binaryPath) => {
+    const text = ONSET_TEMPLATES['ad-unreachable'](binaryPath)
+    expect(text).toContain('affects every persona')
+    const remedy = text.split('\n').at(-1)!
+    expect(remedy).toStartWith('Remediation: ')
+    expect(remedy).toContain(`"${PHASE1_RUNBOOK_SECTION_TITLE}"`)
+    expect(remedy).toMatch(/\brunbook\b/)
+    expect(text).not.toMatch(/install/i)
+    expect(text).not.toMatch(/`(?:agent-director|tmux)\s/)
+    const hits = UPGRADE_FORMS.filter(([, pattern]) => pattern.test(flat(text))).map(([label]) => label)
+    expect(hits).toEqual([])
   })
 
   test('two personas: raise/clear for A emits only for A; B is untouched and a same-class raise for B is not deduped against A', () => {

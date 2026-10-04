@@ -16,6 +16,19 @@
  *   4a. The floor and too-old refusal messages (b.jg5 SRJ-208): the runbook
  *      section title, no upgrade instruction, the install-skill block only on
  *      the too-old message.
+ *   4b. The remedies (b.jg5 SRJ-208, SRJ-1101; the E2-gate, E4 and E35
+ *      hatch notes): the three API-surface probes carry the client-package
+ *      remedy (`CLIENT_PACKAGE_REMEDY`) naming the runbook section; the
+ *      catalog clause names `ErrUnknownErrorName` and misclassification, not
+ *      the base `AgentDirectorError`; not found names the runbook section
+ *      (whose step 1 checks the workers' agent-director version), never the
+ *      publishing-host block; unreachable the runbook section and the
+ *      install-cscb skill;
+ *      `ad-same-user` the runbook section, the file's owner and the ruling's
+ *      "never remove or recreate the file". One sweep over every message the
+ *      gate builds: no `UPGRADE_FORMS` row (its re-install row included) and
+ *      no `INSTALL_OR_REMOVAL_FORMS` row, once the two allowed spans
+ *      (`ALLOWED_SPANS`) are removed.
  *   5. API-surface probes (getPermission / error catalog / decide argv).
  *   5a. The error-catalogue check (b.jg5 SRJ-102): the pure
  *      `checkErrorCatalog` over dist text built in the test from
@@ -60,9 +73,11 @@ import {
 } from '../src/agent-director-startup.ts'
 import type { StartupGateDeps } from '../src/agent-director-startup.ts'
 import {
+  AgentDirectorError,
   ERR_TMUX_KILL_FAILED_NAME,
   ERR_TMUX_SESSION_CONFLICT_NAME,
   ERR_TMUX_UNRESPONSIVE_NAME,
+  ErrUnknownErrorName,
   PHASE1_ONLY_ERR_NAMES,
 } from '../src/agent-director-errors.ts'
 import { DEFAULT_STORE_PATH, getClient, resetClientForTests } from '../src/agent-director-client.ts'
@@ -77,6 +92,9 @@ import {
   AD_SYSTEM_INSTALL_NOT_FOUND,
   AD_SYSTEM_INSTALL_TOO_OLD,
   AD_SYSTEM_INSTALL_UNREACHABLE,
+  CLIENT_PACKAGE_REMEDY,
+  PUBLISHING_HOST_BLOCK_POINTER,
+  RUNBOOK_SECTION_POINTER,
 } from '../src/install-check.ts'
 import { PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_SECTION_TITLE, RUNTIME_RECHECK_PHRASE } from '../src/ad-version-gate.ts'
 import { renderInstallSkillInstructions } from '../src/install-skill-pointer.ts'
@@ -100,9 +118,10 @@ import {
   OLD_AD_VERSION,
   PHASE1_RC_VERSION,
 } from './test-helpers/agent-director-versions.ts'
-import { STALE_VERSION } from './test-helpers/install-check-fixtures.ts'
+import { STALE_VERSION, UNREACHABLE_REASONS } from './test-helpers/install-check-fixtures.ts'
 import { flat } from './test-helpers/markdown.ts'
-import { UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
+import { PUBLISHING_HOST_BLOCK_HEADING } from './test-helpers/runbooks.ts'
+import { INSTALL_OR_REMOVAL_FORMS, UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers for SR-5.1 sub-cases
@@ -140,6 +159,26 @@ const passingProbes = {
   probeErrorCatalog: () => ({ ok: true as const }),
   probeDecideArgv: async () => ({ ok: true as const }),
 }
+
+/** The re-install row of `UPGRADE_FORMS`. */
+const REINSTALL_ROW = (() => {
+  const row = UPGRADE_FORMS.find(([label]) => /re-install/i.test(label))
+  if (row === undefined) throw new Error('UPGRADE_FORMS has no re-install row')
+  return row
+})()
+
+/** The `ad-same-user` remedy's one removal wording, as the E36 T2 ruling words it ("never remove or recreate it"). */
+const SAME_USER_NEVER_REMOVE = 'never remove or recreate the file'
+
+/**
+ * The spans the sweep removes before it scans a message: each names a
+ * forbidden word for a reason the rows cannot tell.
+ */
+const ALLOWED_SPANS: ReadonlyArray<[reason: string, span: RegExp]> = [
+  // CSCB's "Upgrade Bun (https://bun.sh) and retry." and the client's "upgrade Bun to continue".
+  ['ad-bun-version-too-old upgrades the Bun runtime, not agent-director', /\bupgrade Bun\b/gi],
+  ['the ad-same-user ruling forbids removal in these words', new RegExp(SAME_USER_NEVER_REMOVE, 'g')],
+]
 
 /** The release after the floor's minor, built from the floor constant. */
 const LATER_RELEASE = (() => {
@@ -235,6 +274,20 @@ describe('SR-5.1: same-user check', () => {
       expect(outcome.message).toContain(DEFAULT_STATE_DB_PATH)
       // SR-4.5: same-user mismatch does NOT append the manual-skill-install block.
       expect(outcome.message).not.toContain('skills/install-cscb/SKILL.md')
+    }
+  })
+
+  test('UID mismatch: run the server as the file\'s owner, never remove or recreate it, see the runbook section (E2-gate ruling)', async () => {
+    const outcome = await runStartupGate(makePassingGateDeps({ statSync: () => ({ uid: 7777 }) }))
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.classLabel).toBe('ad-same-user')
+      expect(outcome.message).toContain(`the user that owns ${DEFAULT_STATE_DB_PATH}`)
+      expect(outcome.message).toContain(SAME_USER_NEVER_REMOVE)
+      expect(outcome.message).toContain(RUNBOOK_SECTION_POINTER)
+      expect(outcome.message).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
+      expect(outcome.message).not.toMatch(REINSTALL_ROW[1])
+      expect(outcome.message).not.toMatch(/mismatched file/)
     }
   })
 
@@ -374,8 +427,9 @@ describe('SR-5.1: API surface probes', () => {
       expect(outcome.phase).toBe('api-surface')
       expect(outcome.classLabel).toBe('ad-shim-missing-get-permission')
       expect(outcome.message).toContain('getPermission')
-      // Generic remediation points operators at re-installing a matching shim.
-      expect(outcome.message).toContain('reinstall a matching')
+      // The client-package remedy (SRJ-208): check the package, see the runbook section.
+      expect(outcome.message).toContain(CLIENT_PACKAGE_REMEDY)
+      expect(outcome.message).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
       // SR-4.5: ad-shim-* branches do NOT append the manual-skill-install block.
       expect(outcome.message).not.toContain('skills/install-cscb/SKILL.md')
     }
@@ -404,6 +458,21 @@ describe('SR-5.1: API surface probes', () => {
     }
   })
 
+  test('probeErrorCatalog fails → the names would arrive as ErrUnknownErrorName and be misclassified, not the base error; the client-package remedy (E4)', async () => {
+    const outcome = await runStartupGate(makePassingGateDeps({ probeErrorCatalog: () => ({ ok: false, missing: [ERR_TMUX_KILL_FAILED_NAME] }) }))
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.phase).toBe('api-surface')
+      expect(outcome.classLabel).toBe(AD_SHIM_CATALOG_INCOMPLETE)
+      expect(outcome.message).toContain(ERR_TMUX_KILL_FAILED_NAME)
+      expect(outcome.message).toContain(`arrive as ${ErrUnknownErrorName.name}`)
+      expect(outcome.message).toContain('misclassified')
+      expect(outcome.message).not.toMatch(new RegExp(`\\b${AgentDirectorError.name}\\b`))
+      expect(outcome.message).toContain(CLIENT_PACKAGE_REMEDY)
+      expect(outcome.message).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
+    }
+  })
+
   // -------------------------------------------------------------------------
   // Probe 3 — buildDecide drops --request-token
   // -------------------------------------------------------------------------
@@ -423,6 +492,9 @@ describe('SR-5.1: API surface probes', () => {
       expect(outcome.classLabel).toBe('ad-shim-decide-drops-token')
       expect(outcome.message).toContain('--request-token')
       expect(outcome.message).toContain(detail)
+      // The client-package remedy (SRJ-208): check the package, see the runbook section.
+      expect(outcome.message).toContain(CLIENT_PACKAGE_REMEDY)
+      expect(outcome.message).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
       // SR-4.5: ad-shim-* branches do NOT append the manual-skill-install block.
       expect(outcome.message).not.toContain('skills/install-cscb/SKILL.md')
     }
@@ -683,7 +755,7 @@ describe('b.jg5 SRJ-102: checkErrorCatalog over supplied dist text', () => {
       expect(outcome.classLabel).toBe(AD_SHIM_CATALOG_INCOMPLETE)
       expect(outcome.refusalKind).toBe(REFUSAL_KIND_OTHER)
       expect(outcome.message).toContain(ERR_TMUX_SESSION_CONFLICT_NAME)
-      expect(outcome.message).toContain('reinstall a matching')
+      expect(outcome.message).toContain(CLIENT_PACKAGE_REMEDY)
       // SR-4.5: ad-shim-* branches do NOT append the manual-skill-install block.
       expect(outcome.message).not.toContain(renderInstallSkillInstructions())
     }
@@ -716,6 +788,17 @@ describe('SR-4.2: system-install typed-error branches', () => {
       expect(outcome.phase).toBe('construct')
       expect(outcome.classLabel).toBe(AD_SYSTEM_INSTALL_NOT_FOUND)
       expect(outcome.message).toContain('agent-director')
+      // The runbook section, whose step 1 checks agent-director's version as
+      // the workers' user in the bot server's launcher environment; not the
+      // publishing-host block, and no install advice (final-review fix #4).
+      expect(outcome.message).toContain(RUNBOOK_SECTION_POINTER)
+      expect(outcome.message).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
+      expect(outcome.message).toContain('step 1')
+      expect(outcome.message).toContain("workers' user")
+      expect(outcome.message).not.toContain(PUBLISHING_HOST_BLOCK_POINTER)
+      expect(outcome.message).not.toContain(PUBLISHING_HOST_BLOCK_HEADING)
+      const rest = withoutAllowedSpans(outcome.message)
+      expect([...UPGRADE_FORMS, ...INSTALL_OR_REMOVAL_FORMS].filter(([, pattern]) => pattern.test(rest)).map(([label]) => label)).toEqual([])
       // SR-4.5: appends the manual-skill-install instructions block.
       expect(outcome.message).toContain('skills/install-cscb/SKILL.md')
     }
@@ -740,6 +823,11 @@ describe('SR-4.2: system-install typed-error branches', () => {
     if (!outcome.ok) {
       expect(outcome.classLabel).toBe(AD_SYSTEM_INSTALL_UNREACHABLE)
       expect(outcome.message).toContain('not-executable')
+      // The remedy: the install-cscb skill and the runbook section, no re-install (E2-gate note).
+      expect(outcome.message).toContain('Diagnose with the install-cscb skill')
+      expect(outcome.message).toContain(RUNBOOK_SECTION_POINTER)
+      expect(outcome.message).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
+      expect(outcome.message).not.toMatch(REINSTALL_ROW[1])
       // SR-4.5: appends the manual-skill-install instructions block.
       expect(outcome.message).toContain('skills/install-cscb/SKILL.md')
     }
@@ -1171,34 +1259,107 @@ describe('b.jg5 SRJ-208: version refusal messages', () => {
 // b.jg5 SRJ-203 / SRJ-1513 — every other failure carries refusal kind `other`
 // ---------------------------------------------------------------------------
 
+/** A stat failing with EACCES: the same-user check cannot read the file. */
+const eacces = (): { uid: number } => {
+  const err: NodeJS.ErrnoException = new Error('EACCES')
+  err.code = 'EACCES'
+  throw err
+}
+
+/** Every failure branch but the two version refusals: its class label and the seams that reach it. */
+const OTHER_FAILURE_BRANCHES: ReadonlyArray<[classLabel: string, overrides: Partial<StartupGateDeps>]> = [
+  ['ad-bun-version-too-old', { createClient: makeStubCreateClient({ error: errBunVersionTooOld() }) }],
+  [AD_SYSTEM_INSTALL_NOT_FOUND, { createClient: makeStubCreateClient({ error: errSystemInstallNotFound() }) }],
+  [AD_SYSTEM_INSTALL_UNREACHABLE, { createClient: makeStubCreateClient({ error: errSystemInstallUnreachable() }) }],
+  ['ad-client-construct', { createClient: makeStubCreateClient({ error: new Error('boom') }) }],
+  ['ad-shim-missing-get-permission', { probeGetPermission: () => false }],
+  [AD_SHIM_CATALOG_INCOMPLETE, { probeErrorCatalog: () => ({ ok: false, missing: ['ErrInvalidFlags'] }) }],
+  ['ad-shim-decide-drops-token', { probeDecideArgv: async () => ({ ok: false, detail: 'flag missing' }) }],
+  ['ad-same-user', { statSync: () => ({ uid: 7777 }) }],
+  ['ad-same-user-stat', { statSync: eacces }],
+]
+
 describe('b.jg5 SRJ-203 / SRJ-1513: refusal kind of every other failure branch', () => {
   beforeEach(() => {
     resetClientForTests()
   })
 
-  const eacces = (): { uid: number } => {
-    const err: NodeJS.ErrnoException = new Error('EACCES')
-    err.code = 'EACCES'
-    throw err
-  }
-
-  test.each<[string, Partial<StartupGateDeps>]>([
-    ['ad-bun-version-too-old', { createClient: makeStubCreateClient({ error: errBunVersionTooOld() }) }],
-    [AD_SYSTEM_INSTALL_NOT_FOUND, { createClient: makeStubCreateClient({ error: errSystemInstallNotFound() }) }],
-    [AD_SYSTEM_INSTALL_UNREACHABLE, { createClient: makeStubCreateClient({ error: errSystemInstallUnreachable() }) }],
-    ['ad-client-construct', { createClient: makeStubCreateClient({ error: new Error('boom') }) }],
-    ['ad-shim-missing-get-permission', { probeGetPermission: () => false }],
-    [AD_SHIM_CATALOG_INCOMPLETE, { probeErrorCatalog: () => ({ ok: false, missing: ['ErrInvalidFlags'] }) }],
-    ['ad-shim-decide-drops-token', { probeDecideArgv: async () => ({ ok: false, detail: 'flag missing' }) }],
-    ['ad-same-user', { statSync: () => ({ uid: 7777 }) }],
-    ['ad-same-user-stat', { statSync: eacces }],
-  ])('%s → refusal kind other', async (classLabel, overrides) => {
+  test.each(OTHER_FAILURE_BRANCHES)('%s → refusal kind other', async (classLabel, overrides) => {
     const outcome = await runStartupGate(makePassingGateDeps(overrides))
     expect(outcome.ok).toBe(false)
     if (!outcome.ok) {
       expect(outcome.classLabel).toBe(classLabel)
       expect(outcome.refusalKind).toBe(REFUSAL_KIND_OTHER)
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-208 / SRJ-1101 — no message advises upgrading, re-installing or
+// installing agent-director, or removing a file (E2-gate and E5 hatch notes)
+// ---------------------------------------------------------------------------
+
+/** `text` with each `ALLOWED_SPANS` span removed, whitespace collapsed. */
+function withoutAllowedSpans(text: string): string {
+  return ALLOWED_SPANS.reduce((rest, [, span]) => rest.replace(span, ''), flat(text))
+}
+
+describe('b.jg5 SRJ-208 / SRJ-1101: every message the gate builds names no upgrade, re-install, install or removal', () => {
+  beforeEach(() => {
+    resetClientForTests()
+  })
+
+  /** Every failure branch, the two version refusals and every unreachable reason included. */
+  const SWEEP: ReadonlyArray<[name: string, overrides: Partial<StartupGateDeps>]> = [
+    ...OTHER_FAILURE_BRANCHES,
+    [AD_BELOW_PHASE1_FLOOR, { createClient: clientAt(OLD_AD_VERSION) }],
+    [AD_SYSTEM_INSTALL_TOO_OLD, { createClient: makeStubCreateClient({ error: errSystemInstallTooOld(STALE_VERSION, CLIENT_MIN_VERSION) }) }],
+    ...UNREACHABLE_REASONS.map((reason): [string, Partial<StartupGateDeps>] => [
+      `${AD_SYSTEM_INSTALL_UNREACHABLE} ${reason}`,
+      { createClient: makeStubCreateClient({ error: errSystemInstallUnreachable(reason) }) },
+    ]),
+  ]
+
+  test.each(SWEEP)('%s: no UPGRADE_FORMS or INSTALL_OR_REMOVAL_FORMS row, once the allowed spans are removed', async (_name, overrides) => {
+    const outcome = await runStartupGate(makePassingGateDeps(overrides))
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      const text = withoutAllowedSpans(outcome.message)
+      const hits = [...UPGRADE_FORMS, ...INSTALL_OR_REMOVAL_FORMS].filter(([, pattern]) => pattern.test(text)).map(([label]) => label)
+      expect(hits).toEqual([])
+      expect(text).not.toContain('@latest')
+    }
+  })
+
+  test('the same-user-unenforced warning names no forbidden form', async () => {
+    const warnings: string[] = []
+    const outcome = await runStartupGate(
+      makePassingGateDeps({ geteuid: () => undefined, recordStartupError: (_label: string, message: string) => { warnings.push(message) } }),
+    )
+    expect(outcome.ok).toBe(true)
+    expect(warnings).toHaveLength(1)
+    const text = withoutAllowedSpans(warnings[0]!)
+    expect([...UPGRADE_FORMS, ...INSTALL_OR_REMOVAL_FORMS].filter(([, pattern]) => pattern.test(text)).map(([label]) => label)).toEqual([])
+  })
+
+  test.each(ALLOWED_SPANS)('each allowed span is in the message it allows (%s), so none is stale', async (_reason, span) => {
+    const texts: string[] = []
+    for (const [, overrides] of OTHER_FAILURE_BRANCHES) {
+      const outcome = await runStartupGate(makePassingGateDeps(overrides))
+      if (!outcome.ok) texts.push(flat(outcome.message))
+    }
+    expect(texts.filter((text) => new RegExp(span.source, span.flags.replace('g', '')).test(text))).toHaveLength(1)
+  })
+
+  test.each([
+    ['the old unreachable remedy', 'Diagnose with the install-cscb skill or re-install agent-director.'],
+    ['the old same-user remedy', 'Re-install agent-director as the correct user or remove the mismatched file.'],
+    ['the old shim remedy', "Run: reinstall a matching 'agent-director' version (confirm the resolved package ships getPermission)."],
+    ['the old not-found remedy', 'Install agent-director (system-wide) and retry.'],
+    ['a removal next to the allowed span', `${SAME_USER_NEVER_REMOVE}; else delete it.`],
+  ])('self-check: the sweep flags %s', (_name, text) => {
+    const rest = withoutAllowedSpans(text)
+    expect([...UPGRADE_FORMS, ...INSTALL_OR_REMOVAL_FORMS].some(([, pattern]) => pattern.test(rest))).toBe(true)
   })
 })
 

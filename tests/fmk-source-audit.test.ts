@@ -63,7 +63,15 @@ import { join } from 'node:path'
 import ts from 'typescript'
 
 import { AD_TMUX_TABLE } from '../src/ad-settings.ts'
-import { callArguments, maskLiterals, splitTopLevel, stripComments } from './test-helpers/source-audit.ts'
+import {
+  callArguments,
+  DELETE_HELPERS,
+  maskLiterals,
+  REMOVED_IDENTIFIERS,
+  SOURCE_WORD_RULES,
+  splitTopLevel,
+  stripComments,
+} from './test-helpers/source-audit.ts'
 
 // ---------------------------------------------------------------------------
 // The scanner
@@ -98,27 +106,9 @@ interface NonLiteralStart {
   readonly reason: string
 }
 
-/** The row-delete helpers (SRJ-716) and the `src/cli.ts` audit's delete verbs (`directorDelete`, `deleteSpawn`). */
-const DELETE_HELPERS = ['deleteInstance', 'deleteInstanceRow', 'deletePersonaInstance', 'tryDelete', 'killAndDeleteSweptRow', 'directorDelete', 'deleteSpawn']
-
-/** SRJ-601's removed identifiers, E17 T1's focused approver-seam names and E22 T4's ladder kill clock seam. */
-const REMOVED_IDENTIFIERS = [
-  // The raw runner.
-  'defaultRunTmux', '_runTmux', '_setTmuxCommandRunner', '_resetTmuxCommandRunner', 'TmuxCommandRunner', 'TmuxRunResult',
-  // The tmux server start.
-  'defaultEnsureTmuxServer', '_ensureTmuxServer', '_setTmuxServerEnsurer', '_resetTmuxServerEnsurer',
-  // The liveness probe.
-  'defaultHasTmuxSession', '_hasTmuxSession', '_setTmuxSessionProber', '_resetTmuxSessionProber', 'hasPersonaTmuxSession', 'tmuxFallbackVerdict',
-  // The approver's raw path.
-  'defaultTmuxCapturePane', 'defaultTmuxSendEnter', '_setTmuxCapturePane', '_setTmuxSendEnter', '_resetTmuxDialogHelpers', 'tmuxExactPaneTarget',
-  // E17 T1: the pane reader and Enter sender types, the dead-state streak and its seams, the poll-interval seams and the state sets.
-  'TmuxPaneReader', 'TmuxEnterSender', 'DIALOG_DEAD_GRACE_POLLS', '_setDialogDeadGracePolls', '_resetDialogDeadGracePolls',
-  '_setDialogPollIntervalMs', '_resetDialogPollIntervalMs', 'DIALOG_READY_STATES', 'DIALOG_DEAD_STATES',
-  // The b.vub self-heal.
-  'defaultKillTmuxSession', '_setTmuxSessionKiller', '_resetTmuxSessionKiller', 'selfHealTmuxCollisionAndRespawn',
-  // E22 T4: the ladder's kill clock seam.
-  '_ladderKillClock', '_setLadderKillClock', '_resetLadderKillClock',
-]
+// DELETE_HELPERS, REMOVED_IDENTIFIERS and the word rules (`SOURCE_WORD_RULES`)
+// live in tests/test-helpers/source-audit.ts, so tests/shipped-docs.test.ts
+// reads the same lists over the architecture doc and the engineering guide.
 
 /** Callees that start a process (the CLI's `spawnDaemon` dependency included). */
 const START_NAMES = new Set(['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'spawnDaemon'])
@@ -126,16 +116,7 @@ const START_NAMES = new Set(['spawn', 'spawnSync', 'exec', 'execSync', 'execFile
 /** Modules whose start functions and `$` count as process starts. */
 const PROCESS_MODULE = /^(?:(?:node:)?child_process|bun)$/
 
-/** A whole identifier from `names`. */
-const wholeWord = (names: readonly string[]): RegExp => new RegExp(`(?<![\\w$])(?:${names.join('|')})(?![\\w$])`, 'g')
-
-const WORD_RULES: ReadonlyArray<readonly [Rule, RegExp]> = [
-  ['delete-helper', wholeWord(DELETE_HELPERS)],
-  ['finished-row-option', /include_finished|include-finished/g],
-  ['ad-label', /ad_owner|ad_pane/g],
-  ['raw-tmux-subcommand', /kill-session|has-session|start-server/g],
-  ['removed-identifier', wholeWord(REMOVED_IDENTIFIERS)],
-]
+const WORD_RULES: ReadonlyArray<readonly [Rule, RegExp]> = SOURCE_WORD_RULES
 
 const squash = (text: string): string => text.replace(/\s+/g, '').replace(/\?\./g, '.')
 

@@ -16,8 +16,15 @@
  *   5. The internal docs (engineering guide, architecture) name none of the
  *      retired access terms, and `access.json` only in the one allowed note
  *      that a leftover file is ignored and left in place (SR-12).
- *   6. README's Release section does not mention `access.json`. The rest of
- *      README is audited by tests/shipped-docs.test.ts.
+ *   6. README's Release section does not mention `access.json`. Outside
+ *      "## Release", the README is governed by tests/shipped-docs.test.ts,
+ *      whose `AUDIT_EXCEPTIONS` allow `access.json` only inside the two
+ *      runbook sections, "Switching over to agent-director Phase 1" and
+ *      "Rolling back the switch-over", by name, where the previous CSCB's file
+ *      is saved and restored (b.jg5 SRJ-1516); it stays banned in every other
+ *      README section. That exemption reaches no file read here: the skills
+ *      stay fully in this file's scope (they point to the runbooks and do not
+ *      repeat their steps), and no scope, term or matcher here is narrowed.
  *
  * It reads repository files only and writes nothing. A failure lists every
  * offending `file:line` for the term named in the test title.

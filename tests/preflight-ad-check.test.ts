@@ -14,10 +14,17 @@
  *   failure-mode table in `docs/engineering-guide.md`'s release section.
  *
  * No line the check writes, no SR-2.5 line of the scripts and no SR-2.5 line
- * of either skill advises upgrading agent-director or names `package.json`.
- * The forms are `tests/test-helpers/upgrade-forms.ts`'s, as written, plus
- * `package.json` (see `SR25_FORMS`). Each audit is also run on an in-memory
- * copy with the old SR-2.5 put back, which it must flag.
+ * of either skill advises upgrading or re-installing agent-director or names
+ * `package.json`. The forms are `tests/test-helpers/upgrade-forms.ts`'s
+ * `UPGRADE_FORMS`, as written (its re-install row included), plus
+ * `package.json` (see `SR25_FORMS`). No line the check writes carries an
+ * `INSTALL_OR_REMOVAL_FORMS` row either (an instruction to install
+ * agent-director, or a file removal; E36 T2). The not-found and
+ * below-client-minimum failures name the publishing-host block by its
+ * heading (`PUBLISHING_HOST_BLOCK_HEADING`, from
+ * `tests/test-helpers/runbooks.ts`; b.jg5 SRJ-211, E35 hatch note). Each
+ * audit is also run on an in-memory copy with the old SR-2.5 put back, which
+ * it must flag.
  *
  * Every version, title, phrase, prefix and exit code is imported from `src/`,
  * `scripts/` or `tests/test-helpers/`.
@@ -60,7 +67,8 @@ import {
 } from './test-helpers/agent-director-versions.ts'
 import { cannedFailureResult, STALE_VERSION } from './test-helpers/install-check-fixtures.ts'
 import { flat, requiredSection, splitFences } from './test-helpers/markdown.ts'
-import { UPGRADE_FORMS, type ForbiddenForm } from './test-helpers/upgrade-forms.ts'
+import { PUBLISHING_HOST_BLOCK_HEADING } from './test-helpers/runbooks.ts'
+import { INSTALL_OR_REMOVAL_FORMS, UPGRADE_FORMS, type ForbiddenForm } from './test-helpers/upgrade-forms.ts'
 
 const REPO_ROOT = resolve(import.meta.dir, '..')
 const readRepo = (rel: string): string => readFileSync(join(REPO_ROOT, rel), 'utf-8')
@@ -104,6 +112,8 @@ test('the forbidden-form matcher flags a mixed-case upgrade line, each sample, a
   expect(forbiddenHits(line)).not.toEqual([])
   for (const [label, , sample] of SR25_FORMS) expect(forbiddenHits(sample)).toContain(label)
   expect(forbiddenHits(DEPENDENCY_RESTORE)).not.toEqual([])
+  // An install instruction in a recovery is flagged.
+  expect(installOrRemovalHits('Operator recovery: install agent-director, then rerun.')).not.toEqual([])
   // UPGRADE_FORMS as written, every row unchanged and in order, then package.json.
   expect(SR25_FORMS).toHaveLength(UPGRADE_FORMS.length + 1)
   UPGRADE_FORMS.forEach((form, i) => expect(SR25_FORMS[i]).toBe(form))
@@ -124,10 +134,21 @@ async function runCheck(
   return { run, calls }
 }
 
-/** No stdout or stderr line advises an upgrade or names package.json. */
-function expectNoAdvice(run: AdVersionCheckRun): void {
-  for (const line of [...run.stdout, ...run.stderr]) expect(forbiddenHits(line)).toEqual([])
+/** The labels of the `INSTALL_OR_REMOVAL_FORMS` rows `line` holds (whitespace collapsed). */
+function installOrRemovalHits(line: string): string[] {
+  return INSTALL_OR_REMOVAL_FORMS.filter(([, pattern]) => pattern.test(flat(line))).map(([label]) => label)
 }
+
+/** No stdout or stderr line advises an upgrade, a re-install or an install, names package.json or removes a file. */
+function expectNoAdvice(run: AdVersionCheckRun): void {
+  for (const line of [...run.stdout, ...run.stderr]) {
+    expect(forbiddenHits(line)).toEqual([])
+    expect(installOrRemovalHits(line)).toEqual([])
+  }
+}
+
+/** The publishing-host block, by its heading, as a failure names it. */
+const PUBLISHING_HOST_BLOCK = `"${PUBLISHING_HOST_BLOCK_HEADING}"`
 
 /** A failed run: the fail code, nothing on stdout, one SR-2.5 diagnostic naming the runbook, the rerun hint and `named`. */
 function expectFailure(run: AdVersionCheckRun, named: readonly string[]): void {
@@ -167,13 +188,13 @@ describe('scripts/ad-version-check.ts', () => {
   })
 
   test.each<[string, StubResolveSystemBinaryOutcome, readonly string[]]>([
-    ['a version below the client minimum', { version: STALE_VERSION }, [STALE_VERSION, CLIENT_MIN_VERSION, STUB_RESOLVE_DEFAULT_PATH]],
-    ['ErrSystemInstallTooOld', { throws: errSystemInstallTooOld(STALE_VERSION, CLIENT_MIN_VERSION, STUB_RESOLVE_DEFAULT_PATH) }, [STALE_VERSION, CLIENT_MIN_VERSION]],
-    ['ErrSystemInstallNotFound', { throws: errSystemInstallNotFound() }, []],
+    ['a version below the client minimum', { version: STALE_VERSION }, [STALE_VERSION, CLIENT_MIN_VERSION, STUB_RESOLVE_DEFAULT_PATH, PUBLISHING_HOST_BLOCK]],
+    ['ErrSystemInstallTooOld', { throws: errSystemInstallTooOld(STALE_VERSION, CLIENT_MIN_VERSION, STUB_RESOLVE_DEFAULT_PATH) }, [STALE_VERSION, CLIENT_MIN_VERSION, PUBLISHING_HOST_BLOCK]],
+    ['ErrSystemInstallNotFound', { throws: errSystemInstallNotFound() }, [PUBLISHING_HOST_BLOCK]],
     ['ErrSystemInstallUnreachable', { throws: errSystemInstallUnreachable('other', null, STUB_RESOLVE_DEFAULT_PATH) }, [STUB_RESOLVE_DEFAULT_PATH]],
     ['a version that does not parse', { version: DEV_UNPARSEABLE_VERSION }, [DEV_UNPARSEABLE_VERSION]],
     ['an error of no install class', { throws: new Error('resolver failed') }, []],
-  ])('%s fails SR-2.5 naming the runbook', async (_name, outcome, named) => {
+  ])('%s fails SR-2.5 naming the runbook (not found and below the minimum: its publishing-host block)', async (_name, outcome, named) => {
     const { run, calls } = await runCheck(outcome)
     expectFailure(run, named)
     expect(calls).toHaveLength(1)

@@ -16,6 +16,9 @@
  *     (quotes paired left to right) in agent-director's description, or
  *     `slack_bot_<key>` when it gives none (a note latch has no
  *     description), kept bare (no quotes) and redacted;
+ *   - whether the CONFLICT notice's list line must not name that session
+ *     (`listLineUnsafe`), decided from the name as given before it is
+ *     redacted; the unredacted name is never kept;
  *   - the case ({@link LatchCase}): one of SRJ-507's nine CONFLICT cases,
  *     unrecognised text, or one of the two hold cases, "unusable recorded
  *     name" and "launch start not recorded";
@@ -344,17 +347,25 @@ const LINE_BREAK_RE = /[\r\n\u2028\u2029]/
  * the next. Pure.
  */
 export function conflictSessionName(description: unknown, key: string): string {
-  let quoted: string | undefined
-  if (typeof description === 'string') {
-    for (const match of description.matchAll(QUOTED_SPAN_RE)) {
-      const name = match[1] ?? ''
-      if (name !== '' && !LINE_BREAK_RE.test(name)) {
-        quoted = name
-        break
-      }
-    }
-  }
+  const quoted = rawQuotedSessionName(description)
   return quoted === undefined ? personaTmuxSessionName(key) : redactSlackLogText(quoted)
+}
+
+/**
+ * The first double-quoted name in `description` that is non-empty and on one
+ * line, without its quotes and RAW (not redacted), or `undefined` when there
+ * is none or `description` is not a string. Only `set` may take it: the
+ * record is built from it (redacted then) and it decides whether the list
+ * line may show the name ({@link ConflictLatchRecord.listLineUnsafe}); it is
+ * never logged, stored or posted as it is. Pure.
+ */
+function rawQuotedSessionName(description: unknown): string | undefined {
+  if (typeof description !== 'string') return undefined
+  for (const match of description.matchAll(QUOTED_SPAN_RE)) {
+    const name = match[1] ?? ''
+    if (name !== '' && !LINE_BREAK_RE.test(name)) return name
+  }
+  return undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -468,6 +479,18 @@ export interface ConflictLatchRecord {
    * case begins a new episode and a new record without it.
    */
   readonly probeDropped?: true
+  /**
+   * Set (true) when the CONFLICT notice's list line must not name the
+   * session: the name `set` was given is not the one the record holds (it
+   * was redacted, trimmed, flattened or capped, or it was blank so the record
+   * holds `slack_bot_<key>`), or it cannot be shell-quoted safely
+   * ({@link shellQuoteSessionName}). Decided once, from the name as given,
+   * when the record is built, since the record's own name is already
+   * rendered and cannot show it; absent otherwise. The given name itself is
+   * never kept. The record lives in server memory only and is never
+   * persisted.
+   */
+  readonly listLineUnsafe?: true
 }
 
 /** What `set` takes: the record's fields and, when there is one, agent-director's description. */
@@ -532,7 +555,9 @@ export interface ConflictLatch {
    * `set` with the record built from a thrown value that classifies as
    * CONFLICT: its description through `conflictDescriptionOf`, its case
    * through `recogniseConflictCase` and its session through
-   * `conflictSessionName`. Answers `undefined`, and does nothing, for a value
+   * `conflictSessionName` (`set` takes the quoted name unredacted, to decide
+   * `listLineUnsafe`, and redacts it before it is stored, so the record holds
+   * the same name). Answers `undefined`, and does nothing, for a value
    * of any other class.
    */
   setFromConflict(key: string, value: unknown, fields: ConflictLatchConflictFields): ConflictLatchSetOutcome | undefined
@@ -630,7 +655,9 @@ export function createConflictLatch(deps: ConflictLatchDeps): ConflictLatch {
         latchCase: recogniseConflictCase(description),
         refusedOperation: fields.refusedOperation,
         rowState: fields.rowState,
-        sessionName: conflictSessionName(description, key),
+        // The quoted name as agent-director wrote it: `set` redacts it before
+        // it is stored, and needs it unredacted to decide `listLineUnsafe`.
+        sessionName: rawQuotedSessionName(description) ?? personaTmuxSessionName(key),
         ...(description === undefined ? {} : { description }),
       })
     },
@@ -684,19 +711,38 @@ export function createConflictLatch(deps: ConflictLatchDeps): ConflictLatch {
 /**
  * The frozen record for `input`: the session name and the description
  * rendered by `renderLogMessageText` (redacted, on one line, capped), the
- * session `slack_bot_<key>` when that is empty, and the row state as one of
- * this module's frozen values ({@link normaliseRowState}).
+ * session `slack_bot_<key>` when that is empty, the row state as one of
+ * this module's frozen values ({@link normaliseRowState}), and
+ * `listLineUnsafe` when the name as given cannot be shown exactly in the
+ * list line ({@link listLineShowsExactly}).
  */
 function buildRecord(key: string, input: ConflictLatchSetInput): ConflictLatchRecord {
-  const sessionName = renderLogMessageText(input.sessionName)
+  const rendered = renderLogMessageText(input.sessionName)
+  const sessionName = rendered === '' ? personaTmuxSessionName(key) : rendered
   const description = renderLogMessageText(input.description)
   return Object.freeze({
-    sessionName: sessionName === '' ? personaTmuxSessionName(key) : sessionName,
+    sessionName,
     latchCase: input.latchCase,
     refusedOperation: input.refusedOperation,
     rowState: normaliseRowState(input.rowState),
     ...(description === '' ? {} : { description }),
+    ...(listLineShowsExactly(input.sessionName, sessionName) ? {} : { listLineUnsafe: true as const }),
   })
+}
+
+/**
+ * Whether the list line may name the session whose name `set` was given as
+ * `given` (`undefined`: none given, so the persona's own `slack_bot_<key>`)
+ * and the record holds as `stored`: only when the record holds the given
+ * name unchanged (not redacted, trimmed, flattened or capped, and not blank,
+ * which the record replaces with `slack_bot_<key>`) and it can be
+ * shell-quoted safely ({@link shellQuoteSessionName}). A command filtering
+ * on any other name would list nothing, or another session, and could
+ * mislead a human into ending the wrong one. Pure.
+ */
+function listLineShowsExactly(given: string | undefined, stored: string): boolean {
+  const name = given ?? stored
+  return name === stored && shellQuoteSessionName(name) !== null
 }
 
 /**
@@ -870,6 +916,21 @@ export const CONFLICT_NOTICE_LIST_LINE_HEAD =
 export const CONFLICT_NOTICE_LIST_LINE_TAIL =
   '` on the command line (over MCP, list ignores that filter).'
 
+/**
+ * In place of the list line, when the session's name cannot be shown safely
+ * in it: the record's `listLineUnsafe` (the name as given was redacted,
+ * trimmed, flattened, capped or blank), {@link shellQuoteSessionName}
+ * answers null, or `renderLogMessageText` would change the name.
+ */
+export const CONFLICT_NOTICE_LIST_LINE_UNSAFE_NAME = 'The session name could not be shown safely.'
+
+/**
+ * What keeps a session name out of the list line: a control character
+ * (C0, DEL or C1), a line or paragraph separator, or a backtick, which would
+ * end the line's Slack code span early (mrkdwn has no escape inside one).
+ */
+const UNSAFE_LIST_NAME_RE = /[\p{Cc}\p{Zl}\p{Zp}`]/u
+
 /** The human-only line (SRJ-1001). */
 export const CONFLICT_NOTICE_HUMAN_ONLY_LINE =
   'This is for a human only: no bot, including any persona that sees this post, may act on it.'
@@ -918,6 +979,14 @@ export interface ConflictNoticeSource {
   readonly latchCase: ConflictLatchCase
   /** agent-director's description as the record holds it; absent, the description line is left out. */
   readonly description?: string
+  /**
+   * The record's `listLineUnsafe`: true puts
+   * {@link CONFLICT_NOTICE_LIST_LINE_UNSAFE_NAME} in place of the list line,
+   * whatever `sessionName` holds. Absent or false, the list line is decided
+   * from `sessionName` alone (a caller passing a name not taken from a
+   * record).
+   */
+  readonly listLineUnsafe?: boolean
 }
 
 /**
@@ -929,9 +998,40 @@ function slackQuotedSession(sessionName: string): string {
   return `"${slackName(sessionName)}"`
 }
 
-/** `<name>`: the session's name without quotes, rendered as {@link slackQuotedSession} renders it. */
+/** The session's name without quotes, rendered as {@link slackQuotedSession} renders it. */
 function slackName(sessionName: string): string {
   return escapeSlackControlCharacters(renderLogMessageText(sessionName))
+}
+
+/**
+ * `name` shell-quoted for the list line's command: wrapped in single quotes,
+ * each embedded `'` written as `'\''`, every name quoted (a plain one too).
+ * `null` when `name` cannot be shown safely there: it holds a control
+ * character (C0, DEL or C1), a line or paragraph separator, or a backtick
+ * (which would end the line's Slack code span early). Not escaped for
+ * Slack. Pure; never throws.
+ */
+export function shellQuoteSessionName(name: string): string | null {
+  if (UNSAFE_LIST_NAME_RE.test(name)) return null
+  return `'${name.replaceAll("'", "'\\''")}'`
+}
+
+/**
+ * `<name>` in the list line: the session's name, shell-quoted
+ * ({@link shellQuoteSessionName}), then escaped for Slack. `null` when it
+ * cannot be shown safely: when the record says so (`listLineUnsafe`, decided
+ * from the name as agent-director gave it, since a record's name is already
+ * rendered), when the name is unsafe ({@link shellQuoteSessionName} answers
+ * null), or when rendering it as the record stores it
+ * (`renderLogMessageText`: redacted, on one line, capped) changes it, since
+ * a command filtering on a redacted, trimmed or capped name would list
+ * nothing and mislead a human into ending the session.
+ */
+function listLineName(sessionName: string, listLineUnsafe: boolean): string | null {
+  if (listLineUnsafe) return null
+  if (renderLogMessageText(sessionName) !== sessionName) return null
+  const quoted = shellQuoteSessionName(sessionName)
+  return quoted === null ? null : escapeSlackControlCharacters(quoted)
 }
 
 /**
@@ -949,12 +1049,18 @@ function slackName(sessionName: string): string {
  *   3. the pointer line, or for "a different instance id" its
  *      must-not-be-ended line in place of it, or for "another agent-director
  *      store" its must-not-be-ended line and then the pointer line;
- *   4. the list line, naming the session without its quotes;
+ *   4. the list line, naming the session without its double quotes,
+ *      shell-quoted ({@link shellQuoteSessionName}); or, when the source
+ *      says so (`listLineUnsafe`, the record's), when the name holds a
+ *      control character, a line break or a backtick, or when rendering it
+ *      (`renderLogMessageText`) would change it,
+ *      {@link CONFLICT_NOTICE_LIST_LINE_UNSAFE_NAME} in place of it;
  *   5. the human-only line.
  *
  * The session name is text CSCB did not write, so it is escaped for Slack
- * too, in the first line and the list line. No line of CSCB's own names a
- * session-ending command, a label option or anything SRJ-1001 forbids. Pure.
+ * too, in the first line and the list line (after the shell quoting). No
+ * line of CSCB's own names a session-ending command, a label option or
+ * anything SRJ-1001 forbids. Pure.
  */
 export function conflictNoticeText(source: ConflictNoticeSource): string {
   const session = slackQuotedSession(source.sessionName)
@@ -979,7 +1085,12 @@ export function conflictNoticeText(source: ConflictNoticeSource): string {
     if (source.latchCase === LATCH_CASE_ANOTHER_STORE) lines.push(CONFLICT_NOTICE_ANOTHER_STORE_MUST_NOT_END_LINE)
     lines.push(CONFLICT_NOTICE_POINTER_LINE)
   }
-  lines.push(CONFLICT_NOTICE_LIST_LINE_HEAD + slackName(source.sessionName) + CONFLICT_NOTICE_LIST_LINE_TAIL)
+  const listName = listLineName(source.sessionName, source.listLineUnsafe === true)
+  lines.push(
+    listName === null
+      ? CONFLICT_NOTICE_LIST_LINE_UNSAFE_NAME
+      : CONFLICT_NOTICE_LIST_LINE_HEAD + listName + CONFLICT_NOTICE_LIST_LINE_TAIL,
+  )
   lines.push(CONFLICT_NOTICE_HUMAN_ONLY_LINE)
   return lines.join(CONFLICT_NOTICE_LINE_SEPARATOR)
 }
@@ -1291,7 +1402,16 @@ export function createConflictNoticeObserver(episodes: ConflictNoticeEpisodes): 
       episodes.post(key, kind, HOLD_NOTICES[latchCase].text(key, record))
       return
     }
-    episodes.post(key, kind, conflictNoticeText({ sessionName: record.sessionName, latchCase, description: record.description }))
+    episodes.post(
+      key,
+      kind,
+      conflictNoticeText({
+        sessionName: record.sessionName,
+        latchCase,
+        description: record.description,
+        listLineUnsafe: record.listLineUnsafe === true,
+      }),
+    )
   }
 }
 
