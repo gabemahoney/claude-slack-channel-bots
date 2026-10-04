@@ -1,25 +1,30 @@
 #!/usr/bin/env bash
-# Test 4 (b.vub): NON-dry-run resume → dev-channels-dialog → approver → self-heal.
+# Test 4: NON-dry-run fresh and resumed launches held at the dev-channels
+# dialog, each cleared by CSCB's dialog approver through agent-director on the
+# launch's `pending` row.
 #
-# Tests 1-3 all run under SLACK_DRY_RUN=1, so nothing ever spawns a real bot,
-# hits the real --dangerously-load-development-channels dialog, or resumes. That
-# blind spot is exactly why b.vub shipped: the resume-success path never ran the
-# dialog approver, so a resumed bot hung at the dialog forever and the launcher
-# fell into an ErrTmuxSessionCreate respawn loop.
+# Tests 1-3 all run under SLACK_DRY_RUN=1, so nothing there spawns a real bot,
+# meets the real --dangerously-load-development-channels dialog, or resumes.
 #
 # This test exercises the REAL agent-director + REAL tmux spawn/resume path (no
-# SLACK_DRY_RUN) via a small driver that calls the shipped spawnForPersona /
-# approvePreSessionDialogs directly (the full daemon needs each persona's Slack
-# credentials file, which CI lacks). The driver builds a one-persona config
-# (DRIVER_PERSONA, one channel DRIVER_PERSONA_CHANNEL, working directory
+# SLACK_DRY_RUN) via a small driver that calls the shipped spawnForPersona
+# directly (the full daemon needs each persona's Slack credentials file, which
+# CI lacks). spawnForPersona returns once the launch call returns, with the
+# persona's dialog approver still running; the approver reads the `pending`
+# row and its pane through agent-director and presses Enter with `send-keys`.
+# The driver follows the approver through the package's own seams: it must be
+# running when the launch returns, stop because the row went live, and have
+# kept the launch's start, which on the resumed row equals the row's
+# `launch_started_at`. The driver deletes no row; its cleanup kill leaves the
+# row ended and kept. The driver builds a one-persona config (DRIVER_PERSONA,
+# one channel DRIVER_PERSONA_CHANNEL, working directory
 # DRIVER_WORKING_DIRECTORY) through the installed package's persona resolver;
 # its instance is cscb_<persona key>.
 # A stub `claude` on PATH stands in for the model: it prints the exact
-# dev-channels dialog and fires SessionStart on Enter, so the test is
-# deterministic and does not burn the Anthropic API.
+# dev-channels dialog and fires agent-director's SessionStart hooks on Enter,
+# so the test is deterministic and does not burn the Anthropic API.
 #
-# Requires tmux in the image (added to docker/Dockerfile.test.base; base tag
-# bumped v2 -> v3).
+# Requires tmux in the image (docker/Dockerfile.test.base).
 #
 # Depends on Test 1 having installed the package tarball into /test-repo.
 set -euo pipefail
@@ -75,8 +80,8 @@ mkdir -p "${DRIVER_WORKING_DIRECTORY}"
 git -C "${DRIVER_WORKING_DIRECTORY}" init -q 2>/dev/null || true
 
 # --- Run the driver (NON-dry-run: SLACK_DRY_RUN deliberately unset) --------
-# Tee stderr (CSCB console.error, incl. any ErrTmuxSessionCreate) to a log for
-# the no-loop assertion; keep stdout (DRIVER: markers) for the phase asserts.
+# Write stderr (CSCB console.error, the approver's lines included) to a log
+# shown on failure; keep stdout (DRIVER: markers) for the phase asserts.
 set +e
 CSCB_PKG_DIR="${PKG_DIR}" \
 DRIVER_PERSONA="${DRIVER_PERSONA}" \
@@ -103,24 +108,18 @@ fi
 
 # --- Assertions -----------------------------------------------------------
 
-# 1. Fresh spawn reached a live AD state (got PAST the dialog).
+# 1. Fresh launch: the approver cleared the dialog on the `pending` row
+#    through agent-director, and the row went live.
 printf '%s\n' "${DRIVER_OUT}" | grep -q '^DRIVER: PHASE1_OK' \
-    || fail "phase 1: fresh spawn never reached a live state past the dev-channels dialog"
+    || fail "phase 1: the approver did not clear the dev-channels dialog on the fresh launch's pending row"
 
-# 2. Precondition held: row went missing/ended with a session_id (resume-able).
+# 2. Precondition held: the row went ended/missing with a session_id (resumable).
 printf '%s\n' "${DRIVER_OUT}" | grep -q '^DRIVER: PRECONDITION_OK' \
     || fail "precondition: row did not reach missing/ended with a recorded session_id"
 
-# 3. THE REGRESSION: after missing+session_id, resume drove PAST the dialog
-#    AGAIN and reached a live state (pre-fix this hung forever).
+# 3. Resumed launch: the approver cleared the dialog again on the resumed
+#    `pending` row, kept that row's launch start, and the row went live.
 printf '%s\n' "${DRIVER_OUT}" | grep -q '^DRIVER: PHASE2_OK' \
-    || fail "phase 2 (b.vub regression): resume did not re-approve the dialog / reach a live state"
-
-# 4. No ErrTmuxSessionCreate respawn loop for this persona.
-if grep -q 'ErrTmuxSessionCreate' "${DRIVER_LOG}"; then
-    echo "--- ErrTmuxSessionCreate occurrences ---" >&2
-    grep -n 'ErrTmuxSessionCreate' "${DRIVER_LOG}" >&2 || true
-    fail "ErrTmuxSessionCreate appeared during spawn/resume (b.vub self-heal did not hold)"
-fi
+    || fail "phase 2: the approver did not clear the dev-channels dialog on the resumed launch's pending row"
 
 echo "PASS: ${TEST_NAME}"

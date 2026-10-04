@@ -85,11 +85,6 @@
  * SPDX-License-Identifier: MIT
  */
 
-import {
-  ErrSpawnNotFound,
-  ErrSystemInstallDisappeared,
-  ErrTmuxNotAvailable,
-} from 'agent-director'
 import type {
   GetResult as ADGetResult,
   ListRow,
@@ -104,7 +99,13 @@ import type {
   GetPermissionParams,
   GetPermissionResult,
 } from './agent-director-client.ts'
-import { describeAgentDirectorFailure } from './ad-error-class.ts'
+import {
+  AD_ERROR_CLASS_ENVIRONMENT,
+  classifyAdError,
+  describeAgentDirectorFailure,
+  isAdErrorInstance,
+} from './ad-error-class.ts'
+import { ErrSpawnNotFound, ErrSystemInstallDisappeared } from './agent-director-errors.ts'
 import { withOutageDetection } from './outage-state.ts'
 import { encodePermissionActionId } from './permission-action-id.ts'
 import {
@@ -896,9 +897,9 @@ async function runTick(deps: PollerDeps): Promise<void> {
         // check_permission, so let reconcileWedgeStates re-arm it (do NOT
         // exempt). Every other error is a transient read failure: exempt the
         // spawn from re-arming so its counter survives the flaky tick.
-        if (err instanceof ErrSpawnNotFound) continue
+        if (isAdErrorInstance(err, ErrSpawnNotFound)) continue
         wedgeSkippedThisTick.add(row.claude_instance_id)
-        if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) {
+        if (isAdErrorInstance(err, ErrSystemInstallDisappeared) || classifyAdError(err).errorClass === AD_ERROR_CLASS_ENVIRONMENT) {
           // Outage flag raised; skip per-event log.
           continue
         }
@@ -967,7 +968,7 @@ async function runTick(deps: PollerDeps): Promise<void> {
           getPermission(client, { request_token: entry.requestToken })
         )
       } catch (err) {
-        if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) {
+        if (isAdErrorInstance(err, ErrSystemInstallDisappeared) || classifyAdError(err).errorClass === AD_ERROR_CLASS_ENVIRONMENT) {
           // Outage flag raised; skip per-event log.
           continue
         }

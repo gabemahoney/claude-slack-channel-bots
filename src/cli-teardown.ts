@@ -38,8 +38,8 @@
  * agent-director reported, an `ErrUnknownErrorName` its `unknownName` and
  * the envelope's `err_description`); a CONFIG failure's description names
  * {@link AD_CONFIG_FILE_DISPLAY_NAME}.
- * Recognition is by class and name through `src/ad-error-class.ts`, never by
- * an error class or a message text.
+ * Recognition is by class through `src/ad-error-class.ts` (`classifyAdError`,
+ * `isAdErrorInstance`), never by an error's name or a message text.
  *
  * A call that answers UNAVAILABLE is made at most {@link PRECHECK_TRIES}
  * times, {@link PRECHECK_TRY_SPACING_MS} apart, on the CLI's injected clock
@@ -62,7 +62,7 @@
  *
  * {@link stateReadVerdictOf} decides each of the teardown's own `status`
  * reads (the read before the pause and every read of the poll): a finished
- * row (`ended`, `missing`) or no row (`ErrSpawnNotFound`, by name) ends the
+ * row (`ended`, `missing`) or no row (`ErrSpawnNotFound`, by class) ends the
  * persona's teardown as stopped; any other state is live and goes on; any
  * other error fails the persona at once with its class, with no retry.
  *
@@ -161,11 +161,11 @@ import {
   AD_ERROR_CLASS_UNUSABLE_NAME,
   classifyAdError,
   describeReportedAdFailure,
-  hasAdErrorName,
+  isAdErrorInstance,
   type AdErrorClass,
 } from './ad-error-class.ts'
 import { AD_CONFIG_FILE_DISPLAY_NAME } from './ad-config-file.ts'
-import { ERR_INTERNAL_NAME, ERR_SPAWN_NOT_FOUND_NAME } from './agent-director-errors.ts'
+import { ERR_INTERNAL_NAME, ErrSpawnNotFound } from './agent-director-errors.ts'
 import {
   KILL_OUTCOME_KILLED,
   KILL_OUTCOME_NOT_KILLED,
@@ -360,7 +360,7 @@ export function precheckVerdictOf(answer: PrecheckAnswer): PrecheckVerdict {
 
 /** The verdict over a value a `get` threw. */
 function getErrorVerdict(error: unknown): PrecheckVerdict {
-  if (hasAdErrorName(error, ERR_SPAWN_NOT_FOUND_NAME)) return VERDICT_SKIP
+  if (isAdErrorInstance(error, ErrSpawnNotFound)) return VERDICT_SKIP
   const { errorClass } = classifyAdError(error)
   const description = describeReportedAdFailure(error)
   if (errorClass === AD_ERROR_CLASS_UNAVAILABLE) return { kind: PRECHECK_VERDICT_RETRY, errorClass, description }
@@ -610,13 +610,13 @@ const STATE_READ_ABSENT: StateReadAbsentVerdict = Object.freeze({ kind: STATE_RE
 /**
  * The verdict over one of the teardown's own `status` reads, the read before
  * the pause and each read of the poll (b.jg5 SRJ-903, SRJ-316): no row
- * (`ErrSpawnNotFound`, by name) is absent; a finished row is finished; any
+ * (`ErrSpawnNotFound`, by class) is absent; a finished row is finished; any
  * other state is live; any other error fails at once with its class, a
  * CONFIG answer naming the config file. Pure; never throws.
  */
 export function stateReadVerdictOf(answer: StateReadAnswer): StateReadVerdict {
   if ('error' in answer) {
-    if (hasAdErrorName(answer.error, ERR_SPAWN_NOT_FOUND_NAME)) return STATE_READ_ABSENT
+    if (isAdErrorInstance(answer.error, ErrSpawnNotFound)) return STATE_READ_ABSENT
     return { kind: STATE_READ_VERDICT_FAIL, ...teardownErrorReportOf(answer.error) }
   }
   if (answer.row === null) return STATE_READ_ABSENT

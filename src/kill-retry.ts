@@ -94,9 +94,9 @@ import {
   classifyAdError,
   describeAdErrorClassification,
   describeAgentDirectorFailure,
-  hasAdErrorName,
+  isAdErrorInstance,
 } from './ad-error-class.ts'
-import { ERR_SPAWN_NOT_FOUND_NAME } from './agent-director-errors.ts'
+import { ErrSpawnNotFound } from './agent-director-errors.ts'
 import {
   KILL_OUTCOME_NOT_KILLED,
   KILL_OUTCOME_ROW_FINISHED,
@@ -633,14 +633,14 @@ function judgeRead(read: KillRetryRead, lastRead: KillRetrySeed, configEndsTries
       break
   }
   const error = read.kind === KILL_RETRY_READ_FAILED ? read.error : undefined
-  if (hasAdErrorName(error, ERR_SPAWN_NOT_FOUND_NAME)) return { kind: KILL_RETRY_VERDICT_FINISHED, read: KILL_ROW_FINISHED_NO_ROW }
+  if (isAdErrorInstance(error, ErrSpawnNotFound)) return { kind: KILL_RETRY_VERDICT_FINISHED, read: KILL_ROW_FINISHED_NO_ROW }
   if (classOf(error) === AD_ERROR_CLASS_CONFIG && (configEndsTries || seedIsPending(lastRead))) {
     return { kind: KILL_RETRY_VERDICT_CONFIG_STOP, error }
   }
   return { kind: KILL_RETRY_VERDICT_GO }
 }
 
-/** `error`'s class by name, through `src/ad-error-class.ts`. */
+/** `error`'s class, through `src/ad-error-class.ts`. */
 function classOf(error: unknown): string {
   try {
     return classifyAdError(error).errorClass
@@ -769,7 +769,7 @@ function describeRead(read: KillRetryRead): string {
 
 /** A failed read's class and redacted failure. */
 function describeReadFailure(error: unknown): string {
-  if (hasAdErrorName(error, ERR_SPAWN_NOT_FOUND_NAME)) return 'no row (ErrSpawnNotFound)'
+  if (isAdErrorInstance(error, ErrSpawnNotFound)) return 'no row (ErrSpawnNotFound)'
   try {
     const classification = classifyAdError(error)
     if (classification.reportedName !== undefined || classification.message !== undefined) {

@@ -26,9 +26,12 @@
  *   `host-safe-env.ts` only `node:` builtins, in any load form, so no `src/`,
  *   package or other helper code runs before the refusal; only
  *   the guard's own files (`REAL_HOME_FILES`) reference `realHome` or
- *   `passwdHome`, the helpers that answer the real home's path; no named
- *   import or re-export of a Phase-1-only error class. Each matcher is pinned
- *   with synthetic flagged and allowed sources, then run over the tree.
+ *   `passwdHome`, the helpers that answer the real home's path; while the
+ *   host's client is 0.10.0 (until the package pins the Phase 1 client), no
+ *   named import, re-export or destructuring of a Phase-1-only error class
+ *   from `agent-director`, and only `PHASE1_READ_FILES` read one from it in
+ *   any form. Each matcher is pinned with synthetic flagged and allowed
+ *   sources, then run over the tree.
  * - SRJ-121's call-site audit over every `*.ts` in `src/` and `scripts/`
  *   (`CALL_SITE_AUDITS`, the same parser): `Client.create` is reached only in
  *   the startup gate's module, `runStartupGate` is referenced only there and
@@ -437,7 +440,7 @@ const PRELOAD_PATH = join(TEST_HELPERS_DIR, 'host-safety-preload.ts')
 const AGENT_DIRECTOR_MODULE = 'agent-director'
 /** Names a test may not hold as values from agent-director: they find and run the real binary. */
 const DISCOVERY_NAMES: readonly string[] = ['Client', 'resolveSystemBinary']
-/** Error classes only a Phase-1 agent-director release exports (b.jg5 SRJ-101's interim rule). */
+/** Error classes only the Phase 1 agent-director client exports; the host's 0.10.0 client lacks them (b.jg5 SRJ-101's narrowed interim rule). */
 const PHASE1_ONLY_NAMES: readonly string[] = ['ErrTmuxKillFailed', 'ErrTmuxUnresponsive', 'ErrTmuxSessionConflict']
 const CHILD_PROCESS_MODULES: readonly string[] = ['child_process', 'node:child_process']
 /** The `child_process` functions that start a process. */
@@ -1101,14 +1104,19 @@ function realHomeFindings(sf: ts.SourceFile): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// Static audit: no named import or re-export of a Phase-1-only name
+// Static audits: the Phase-1-only names while the host's client is 0.10.0
 // ---------------------------------------------------------------------------
 
 /**
- * Where `sf` names a Phase-1-only error class as an import from
- * agent-director: a named import or re-export (type-only included, aliased or
- * not), or destructuring of a dynamic `import()` or `require()`. Naming the
- * classes as strings (classification by `errName`) is allowed.
+ * Where `sf` names a Phase-1-only error class in a named import, a re-export
+ * or a destructuring of agent-director (b.jg5 SRJ-101's narrowed interim
+ * rule, which holds while the host's client is 0.10.0, until the package pins
+ * the Phase 1 client). Flagged: a named import or re-export (type-only
+ * included, aliased or not), which fails module load or typecheck on a client
+ * that lacks the export, and destructuring of the module namespace, a copy of
+ * it, or a dynamic `import()` or `require()` (declaration or assignment,
+ * aliased or not). Reads through the namespace are `phase1ReadFindings`'
+ * concern; naming the classes as strings is allowed.
  */
 function phase1ImportFindings(sf: ts.SourceFile): string[] {
   const findings: string[] = []
@@ -1130,15 +1138,101 @@ function phase1ImportFindings(sf: ts.SourceFile): string[] {
         const name = (el.propertyName ?? el.name).text
         if (PHASE1_ONLY_NAMES.includes(name)) flag(el, name, 're-export')
       }
-    } else if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) && node.initializer !== undefined
-      && moduleLoadOf(unwrap(node.initializer)) === AGENT_DIRECTOR_MODULE) {
-      for (const el of node.name.elements) {
-        const name = propertyNameText(el.propertyName ?? el.name)
-        if (name !== undefined && PHASE1_ONLY_NAMES.includes(name)) flag(el, name, 'destructured import')
-      }
     }
   })
+  for (const read of agentDirectorValueReads(sf, PHASE1_ONLY_NAMES)) {
+    const node = read.node
+    if (read.name !== undefined && (ts.isBindingElement(node) || ts.isShorthandPropertyAssignment(node) || ts.isPropertyAssignment(node))) {
+      flag(node, read.name, 'destructuring')
+    }
+  }
   return findings
+}
+
+/**
+ * The only files (by repository path) that may read a Phase-1-only error
+ * class from agent-director (b.jg5 SRJ-101, SRJ-103): the module that
+ * resolves the three for the rest of CSCB, the test of their identities, and
+ * the image-side fixture that checks them on the release-candidate client.
+ * Every other file takes the classes from `src/agent-director-errors.ts`.
+ */
+const PHASE1_READ_FILES: readonly string[] = [
+  'src/agent-director-errors.ts',
+  'tests/integration/fixtures/phase1-client-check.ts',
+  'tests/phase1-client-classes.test.ts',
+]
+
+/**
+ * Every call or `new` argument in `sf` that is the agent-director module
+ * namespace (a static namespace or default import, `import x = require`, a
+ * dynamic `import()` or `require()`) or a copy of one (`const x = ns`,
+ * `const x = { ...ns }`, `const { ...x } = ns`), through any wrapper (a cast,
+ * `!`, parentheses, `await`): the callee may read any export.
+ */
+function agentDirectorNamespaceArguments(sf: ts.SourceFile): ts.Expression[] {
+  const namespaces = new Set<string>()
+  const isNamespace = (expr: ts.Expression): boolean => {
+    const inner = unwrap(expr)
+    return (ts.isIdentifier(inner) && namespaces.has(inner.text)) || moduleLoadOf(inner) === AGENT_DIRECTOR_MODULE
+  }
+  forEachNode(sf, (node) => {
+    if (ts.isImportDeclaration(node) && stringText(node.moduleSpecifier) === AGENT_DIRECTOR_MODULE) {
+      const clause = node.importClause
+      if (clause === undefined || clause.isTypeOnly) return
+      if (clause.name !== undefined) namespaces.add(clause.name.text)
+      const bindings = clause.namedBindings
+      if (bindings !== undefined && ts.isNamespaceImport(bindings)) namespaces.add(bindings.name.text)
+      else if (bindings !== undefined) {
+        for (const el of bindings.elements) if (!el.isTypeOnly && (el.propertyName ?? el.name).text === 'default') namespaces.add(el.name.text)
+      }
+    } else if (ts.isImportEqualsDeclaration(node) && !node.isTypeOnly && ts.isExternalModuleReference(node.moduleReference)
+      && stringText(node.moduleReference.expression) === AGENT_DIRECTOR_MODULE) {
+      namespaces.add(node.name.text)
+    }
+  })
+  for (let grew = true; grew;) {
+    grew = false
+    forEachNode(sf, (node) => {
+      if (!ts.isVariableDeclaration(node) || node.initializer === undefined) return
+      const init = unwrap(node.initializer)
+      const copies: string[] = []
+      if (ts.isIdentifier(node.name) && (isNamespace(init) || (ts.isObjectLiteralExpression(init) && init.properties.some((p) => ts.isSpreadAssignment(p) && isNamespace(p.expression))))) {
+        copies.push(node.name.text)
+      } else if (ts.isObjectBindingPattern(node.name) && isNamespace(init)) {
+        for (const el of node.name.elements) if (el.dotDotDotToken !== undefined && ts.isIdentifier(el.name)) copies.push(el.name.text)
+      }
+      for (const name of copies) {
+        if (!namespaces.has(name)) {
+          namespaces.add(name)
+          grew = true
+        }
+      }
+    })
+  }
+  const found: ts.Expression[] = []
+  forEachNode(sf, (node) => {
+    if (ts.isCallExpression(node) || ts.isNewExpression(node)) found.push(...(node.arguments ?? []).filter(isNamespace))
+  })
+  return found
+}
+
+/**
+ * Where `sf` reads a Phase-1-only error class from agent-director, in any
+ * form the parser can see (b.jg5 SRJ-101): every place
+ * `agentDirectorValueReads` finds one of the three (a value import or
+ * re-export; a property or element read through a namespace, default or
+ * `import x = require` binding, a dynamic `import()` or `require()`, or a
+ * copy of one, a cast included; destructuring), every read it cannot name (a
+ * computed read or destructuring, `export *`, a load it cannot follow), and
+ * the namespace or a copy of it passed to a call. Allowed: type-only imports
+ * (which `phase1ImportFindings` bans), other names, the namespace spread into
+ * an object literal (a `mock.module` factory), and the names as strings.
+ */
+function phase1ReadFindings(sf: ts.SourceFile): string[] {
+  return [
+    ...agentDirectorValueReads(sf, PHASE1_ONLY_NAMES).map((read) => finding(sf, read.node, read.what)),
+    ...agentDirectorNamespaceArguments(sf).map((arg) => finding(sf, arg, 'the agent-director namespace passed to a call')),
+  ]
 }
 
 // ---------------------------------------------------------------------------
@@ -1728,7 +1822,7 @@ describe('static audit: only the guard’s own files name the real home (realHom
   })
 })
 
-describe('static audit: no named import or re-export of a Phase-1-only name', () => {
+describe('static audit: no named import, re-export or destructuring of a Phase-1-only name from agent-director (host client 0.10.0)', () => {
   const flagged: [label: string, source: string][] = [
     ['a named import', "import { ErrTmuxKillFailed } from 'agent-director'"],
     ['an aliased named import beside another', "import { ErrSystemInstallNotFound, ErrTmuxSessionConflict as Conflict } from 'agent-director'"],
@@ -1737,6 +1831,11 @@ describe('static audit: no named import or re-export of a Phase-1-only name', ()
     ['a re-export', "export { ErrTmuxKillFailed } from 'agent-director'"],
     ['an aliased type-only re-export', "export type { ErrTmuxUnresponsive as Unresponsive } from 'agent-director'"],
     ['a destructured dynamic import', "const { ErrTmuxSessionConflict } = await import('agent-director')"],
+    ['a destructured require', "const { ErrTmuxKillFailed: KillFailed } = require('agent-director')"],
+    ['destructuring of the namespace', lines(AD_NS, 'const { ErrTmuxUnresponsive } = ad')],
+    ['destructuring of the namespace through a cast', lines(AD_NS, 'const { ErrTmuxKillFailed } = ad as unknown as Phase1ErrorNamespace')],
+    ['destructuring of a spread copy of the namespace', lines(AD_NS, 'const REAL = { ...ad }', "const { 'ErrTmuxSessionConflict': Conflict } = REAL")],
+    ['a destructuring assignment from the namespace', lines(AD_NS, 'let ErrTmuxSessionConflict', '({ ErrTmuxSessionConflict } = ad)')],
   ]
 
   test.each(flagged)('flags %s', (_label, source) => {
@@ -1744,23 +1843,86 @@ describe('static audit: no named import or re-export of a Phase-1-only name', ()
   })
 
   const allowed: [label: string, source: string][] = [
-    ['the names as strings (classification by name)', lines(
+    ['the names as strings', lines(
       "const PHASE1 = ['ErrTmuxKillFailed', 'ErrTmuxUnresponsive']",
-      "if (err.errName === 'ErrTmuxSessionConflict') retry()",
+      "log(`kill failed: ${'ErrTmuxKillFailed'}`)",
     )],
-    ['the names in comments', "// ErrTmuxKillFailed arrives with a Phase-1 agent-director release"],
+    ['the names in comments', '// ErrTmuxKillFailed is declared only by the Phase 1 agent-director client'],
     ['a released tmux error class', "import { ErrTmuxNotAvailable } from 'agent-director'"],
+    ['destructuring a released class from the namespace', lines(AD_NS, 'const { ErrTmuxNotAvailable } = ad')],
     ['a same-named class from another module', "import { ErrTmuxKillFailed } from './local-errors.ts'"],
+    ['destructuring a same-named class from another module', "const { ErrTmuxKillFailed } = await import('../src/agent-director-errors.ts')"],
+    ['a guarded namespace read through a typed optional cast', lines(AD_NS, 'const killFailed = (ad as unknown as Phase1ErrorNamespace).ErrTmuxKillFailed')],
   ]
 
   test.each(allowed)('allows %s', (_label, source) => {
     expect(phase1ImportFindings(parse(source))).toEqual([])
   })
 
-  test('the current tree: no file in src/ or tests/ imports or re-exports one', () => {
+  test('the current tree: no file in src/ or tests/ names one in a named import, re-export or destructuring', () => {
     const files = [...filesUnder(SRC_DIR, (path) => SCRIPT_FILE.test(path)), ...filesUnder(TESTS_DIR, (path) => SCRIPT_FILE.test(path))]
-    expect(files).toContain(join(SRC_DIR, 'install-check.ts'))
+    expect(files).toContain(join(SRC_DIR, 'agent-director-errors.ts'))
     expect(auditTree(files, phase1ImportFindings)).toEqual([])
+  })
+})
+
+describe('static audit: only PHASE1_READ_FILES read a Phase-1-only name from agent-director (host client 0.10.0)', () => {
+  const flagged: [label: string, source: string][] = [
+    ['a namespace property read', lines(AD_NS, 'const killFailed = ad.ErrTmuxKillFailed')],
+    ['a namespace read through a typed optional cast', lines(AD_NS, 'const killFailed = (ad as unknown as Phase1ErrorNamespace).ErrTmuxKillFailed')],
+    ['a namespace element read', lines(AD_NS, "const unresponsive = ad['ErrTmuxUnresponsive']")],
+    ['a computed namespace element read', lines(AD_NS, "const key = 'ErrTmuxSessionConflict'", 'const conflict = ad[key]')],
+    ['a read through a cast copy of the namespace', lines(AD_NS, 'const ns = ad as unknown as Phase1ErrorNamespace', 'ns.ErrTmuxSessionConflict')],
+    ['a read through a spread copy of the namespace', lines(AD_NS, 'const REAL = { ...ad }', 'REAL.ErrTmuxKillFailed')],
+    ['destructuring of the namespace', lines(AD_NS, 'const { ErrTmuxUnresponsive } = ad')],
+    ['a default import read', lines("import ad from 'agent-director'", 'ad.ErrTmuxSessionConflict')],
+    ['an import-equals require read', lines("import ad = require('agent-director')", 'ad.ErrTmuxKillFailed')],
+    ['a read on a dynamic import', "const Conflict = (await import('agent-director')).ErrTmuxSessionConflict"],
+    ['a read through a dynamic import binding', lines("const ad = await import('agent-director')", 'ad.ErrTmuxKillFailed')],
+    ['a read through a require binding', lines("const ad = require('agent-director')", "ad['ErrTmuxUnresponsive']")],
+    ['a dynamic import used through then()', "import('agent-director').then((ad) => ad.ErrTmuxKillFailed)"],
+    ['the namespace passed to the resolver through a cast', lines(AD_NS, 'const classes = resolvePhase1ErrorClasses(ad as unknown as Phase1ErrorNamespace)')],
+    ['a dynamic import passed to a call', "const classes = resolvePhase1ErrorClasses(await import('agent-director'))"],
+    ['a copy of the namespace passed to a call', lines(AD_NS, 'const REAL = { ...ad }', 'const entries = Object.entries(REAL)')],
+    ['a re-export of the whole module', "export * from 'agent-director'"],
+  ]
+
+  test.each(flagged)('flags %s', (_label, source) => {
+    expect(phase1ReadFindings(parse(source)).length).toBeGreaterThan(0)
+  })
+
+  const allowed: [label: string, source: string][] = [
+    ['other names through the namespace', lines(AD_NS, 'ad.ErrTmuxNotAvailable', "ad['ErrTmuxSendKeys']", 'const { ErrSpawnNotFound } = ad')],
+    ['the namespace spread into a mock.module factory that sets one', lines(AD_NS, "mock.module('agent-director', () => ({ ...ad, ErrTmuxKillFailed: StandIn }))")],
+    ['the bindings from src/agent-director-errors.ts', lines(
+      "import { ErrTmuxKillFailed, ErrTmuxSessionConflict } from '../src/agent-director-errors.ts'",
+      "const err = new ErrTmuxKillFailed('kill', 'ErrTmuxKillFailed', 'retry kill later')",
+      'expect(err).toBeInstanceOf(ErrTmuxSessionConflict)',
+    )],
+    ['a fake namespace passed to the resolver', "resolvePhase1ErrorClasses({ ErrTmuxKillFailed: Fake, ErrTmuxUnresponsive: undefined })"],
+    ['a type-only import (banned by the named-import audit instead)', "import type { ErrTmuxUnresponsive } from 'agent-director'"],
+    ['an import type in a type position', "let cls: typeof import('agent-director').ErrTmuxKillFailed | undefined"],
+    ['text in strings, templates and comments', lines(
+      '// ad.ErrTmuxKillFailed',
+      "const s = \"(await import('agent-director')).ErrTmuxSessionConflict\"",
+      'const t = `ad.ErrTmuxUnresponsive`',
+    )],
+  ]
+
+  test.each(allowed)('allows %s', (_label, source) => {
+    expect(phase1ReadFindings(parse(source))).toEqual([])
+  })
+
+  test('src/agent-director-errors.ts reads the three in a form the audit sees', () => {
+    expect(phase1ReadFindings(parseFile(join(SRC_DIR, 'agent-director-errors.ts')))).not.toEqual([])
+  })
+
+  test('the current tree: no script file outside PHASE1_READ_FILES reads one', () => {
+    const files = filesUnder(REPO_ROOT, (path) => SCRIPT_FILE.test(path))
+    const allowedFiles = new Set(PHASE1_READ_FILES)
+
+    expect(files).toEqual(expect.arrayContaining([join(SRC_DIR, 'server.ts'), join(SRC_DIR, 'agent-director-errors.ts'), join(TESTS_DIR, 'integration', 'fixtures', 'phase1-client-check.ts')]))
+    expect(auditTree(files.filter((path) => !allowedFiles.has(relative(REPO_ROOT, path))), phase1ReadFindings)).toEqual([])
   })
 })
 

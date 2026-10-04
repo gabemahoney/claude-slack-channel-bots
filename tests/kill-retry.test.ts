@@ -118,6 +118,7 @@ import { REDACTED_TOKEN_PLACEHOLDER } from '../src/slack-log-redaction.ts'
 import {
   STUB_INSTANCE_ID,
   STUB_SURVIVOR_PIDS,
+  STUB_WORKER_PID,
   cannedErr,
   cannedKillResult,
   cannedOk,
@@ -136,6 +137,7 @@ import {
   makeStubClient,
   unavailableForms,
   type CannedResponse,
+  type KillFailedOptions,
 } from './test-helpers/agent-director-stub.ts'
 import {
   BOT_TOKEN_PREFIX,
@@ -295,10 +297,11 @@ const notKilled = (err: unknown): KillOutcome => killOutcomeOf({ thrown: err })
 /** The row-finished success a read of `read` gives. */
 const rowFinished = (read: KillRowFinishedRead): KillOutcome => ({ kind: KILL_OUTCOME_ROW_FINISHED, read })
 
-/** A survivor-naming `ErrTmuxKillFailed` naming `pids`. */
-const survivorKillFailed = (pids: readonly number[] = STUB_SURVIVOR_PIDS): Error => errTmuxKillFailed(undefined, 'pane-process-survived', pids)
+/** A survivor-naming `ErrTmuxKillFailed` whose survivor clause names `pids`. */
+const survivorKillFailed = (pids: readonly number[] = STUB_SURVIVOR_PIDS, options: KillFailedOptions = {}): Error =>
+  errTmuxKillFailed(undefined, 'pane-process-survived', pids, options)
 
-/** An `ErrTmuxKillFailed` naming no survivor. */
+/** An `ErrTmuxKillFailed` naming no survivor (the worker's own pid only). */
 const plainKillFailed = (): Error => errTmuxKillFailed(undefined, 'outlived-exit-wait')
 
 /** An error's agent-director description. */
@@ -486,7 +489,7 @@ describe('runKillRetry: one status read before each further try (b.jg5 SRJ-702, 
   test.each<[string, ReadStep, KillRowFinishedRead]>([
     ['ended', readState('ended'), KILL_ROW_FINISHED_ENDED],
     ['missing', readState('missing'), KILL_ROW_FINISHED_MISSING],
-    ['ErrSpawnNotFound (by name)', cannedErr(errSpawnNotFound()), KILL_ROW_FINISHED_NO_ROW],
+    ['ErrSpawnNotFound', cannedErr(errSpawnNotFound()), KILL_ROW_FINISHED_NO_ROW],
     ['no row (the caller\'s read answered it)', { kind: KILL_RETRY_READ_NO_ROW }, KILL_ROW_FINISHED_NO_ROW],
   ])('a read of %s ends the tries as the row-finished success with no further kill and, with no survivor-naming failure before it, no alert; its read line, then the end line', async (_label, read, finished) => {
     const r = await run({ kills: failing(KILL_RETRY_TRIES, () => errTmuxUnresponsive('kill')), reads: [read] })
@@ -704,6 +707,25 @@ describe('runKillRetry: the survivor rule and the alert decision (b.jg5 SRJ-702,
 
     expect(r.calls).toEqual(['kill', 'status'])
     expect(r.result).toEqual({ outcome: rowFinished(finished), end: KILL_RETRY_END_ROW_FINISHED, tries: 1, reads: 1, alert: survivor })
+  })
+
+  // The release candidate's wording (b.jg5 SRJ-702, R14): the worker's own
+  // "(pid N)" names no survivor, alone or beside the survivor clause.
+  test.each<[string, () => Error, (description: string) => KillRetryAlert]>([
+    ['\'outlived-exit-wait\' (naming only the worker\'s pid), then a read of ended: no alert', plainKillFailed, () => ({ kind: KILL_RETRY_ALERT_NONE })],
+    [
+      'pane-process-survived with the worker\'s pid beside its survivor clause, then a read of ended: one survivor version quoting it',
+      () => survivorKillFailed(STUB_SURVIVOR_PIDS, { workerAlsoRunning: true }),
+      (description) => ({ kind: KILL_RETRY_ALERT_SURVIVOR, survivorDescription: description }),
+    ],
+  ])('a first try answering ErrTmuxKillFailed %s; the tries end as the row-finished success with no further kill', async (_label, make, alert) => {
+    const err = make()
+    expect(descriptionOf(err)).toContain(String(STUB_WORKER_PID))
+
+    const r = await run({ kills: [cannedErr(err), ...failing(KILL_RETRY_TRIES, () => errTmuxUnresponsive('kill'))], reads: [readState('ended')] })
+
+    expect(r.calls).toEqual(['kill', 'status'])
+    expect(r.result).toEqual({ outcome: rowFinished(KILL_ROW_FINISHED_ENDED), end: KILL_RETRY_END_ROW_FINISHED, tries: 1, reads: 1, alert: alert(descriptionOf(err)) })
   })
 
   const LATER_SUCCESSES: ReadonlyArray<readonly [string, CannedResponse<Phase1KillResult>, KillOutcome]> = [

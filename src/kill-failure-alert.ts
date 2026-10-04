@@ -35,9 +35,9 @@
  * `agent-director kill` in the ordinary version) is a human's step, and the
  * text says that no bot, including any persona that sees the post, may run
  * it; the survivor version names no command. The survivor version's pid list
- * rests on SRJ-702's survivor-naming form (`SURVIVOR_PID_PATTERN`), the
- * wording of agent-director's release candidate; reading it from the
- * description is interim (b.jg5 SRJ-702).
+ * holds the pids of the description's survivor clause only, in the form
+ * `SURVIVOR_PID_PATTERN` defines (SRJ-702, checked against agent-director's
+ * release candidate), never the worker's own pid.
  *
  * The route selection ({@link selectKillFailureAlertRoute}, SRJ-704, first
  * match wins, for either version):
@@ -446,10 +446,10 @@ export function killFailureOrdinaryBody(input: KillFailureOrdinaryBodyInput): st
 }
 
 /**
- * `<pid list>` (SRJ-1007): "pid N" for each pid `description` names in the
- * survivor-naming form (`survivorPids`, one per match of
- * `SURVIVOR_PID_PATTERN`), in its order, joined with ", "; the empty string
- * when it names none. Never throws.
+ * `<pid list>` (SRJ-1007): "pid S" for each pid `description`'s survivor
+ * clause names (`survivorPids`: one for "(pid S)", each of "(pids S1, S2)";
+ * never the worker's), in its order, joined with ", "; the empty string when
+ * it names none. Never throws.
  */
 export function killFailureSurvivorPidList(description: string): string {
   try {

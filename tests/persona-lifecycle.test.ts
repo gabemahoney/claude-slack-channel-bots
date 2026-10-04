@@ -1546,8 +1546,8 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 
   // b.jg5 SRJ-110, SRJ-1003: a standing non-success that no other notice
   // records is raised as one notice through the notifier, right after the
-  // kill step. An ENVIRONMENT or CONFIG outcome (and ErrSystemInstallDisappeared,
-  // by name) is recorded by its outage's onset when that outage is raised:
+  // kill step. An ENVIRONMENT or CONFIG outcome (and ErrSystemInstallDisappeared)
+  // is recorded by its outage's onset when that outage is raised:
   // with the outage reader (production: getOutageFlags) when it reads the
   // class raised now; without one, the kill's own rule (ENVIRONMENT and
   // CONFIG while the key is applied, ErrSystemInstallDisappeared always).

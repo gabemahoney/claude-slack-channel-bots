@@ -21,10 +21,6 @@
  *      `checkErrorCatalog` over dist text built in the test from
  *      `REQUIRED_ERR_NAMES`, never the installed client's dist, and a
  *      probe built from it through the gate and its wrapper.
- *   5b. The 0.10.0 error classes `src/agent-director-errors.ts`
- *      re-exports for the classifier (the four tmux-side and unknown-name
- *      classes and ErrSendKeysWhileRelayed) are the client's own (b.jg5
- *      SRJ-103).
  *   6. Same-user mismatch on ~/.agent-director/state.db.
  *   7. Happy path: gate passes silently and installs the Client into the
  *      module-level singleton via setClient(...).
@@ -51,14 +47,6 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
-  ErrSendKeysWhileRelayed as AdErrSendKeysWhileRelayed,
-  ErrTmuxCaptureFailed as AdErrTmuxCaptureFailed,
-  ErrTmuxSendKeys as AdErrTmuxSendKeys,
-  ErrTmuxSessionCreate as AdErrTmuxSessionCreate,
-  ErrUnknownErrorName as AdErrUnknownErrorName,
-} from 'agent-director'
-
-import {
   runStartupGate,
   runAgentDirectorStartupGate,
   buildPersonaClient,
@@ -75,11 +63,6 @@ import {
   ERR_TMUX_KILL_FAILED_NAME,
   ERR_TMUX_SESSION_CONFLICT_NAME,
   ERR_TMUX_UNRESPONSIVE_NAME,
-  ErrSendKeysWhileRelayed,
-  ErrTmuxCaptureFailed,
-  ErrTmuxSendKeys,
-  ErrTmuxSessionCreate,
-  ErrUnknownErrorName,
   PHASE1_ONLY_ERR_NAMES,
 } from '../src/agent-director-errors.ts'
 import { DEFAULT_STORE_PATH, getClient, resetClientForTests } from '../src/agent-director-client.ts'
@@ -704,25 +687,6 @@ describe('b.jg5 SRJ-102: checkErrorCatalog over supplied dist text', () => {
       // SR-4.5: ad-shim-* branches do NOT append the manual-skill-install block.
       expect(outcome.message).not.toContain(renderInstallSkillInstructions())
     }
-  })
-})
-
-// ---------------------------------------------------------------------------
-// b.jg5 SRJ-103 — the 0.10.0 error classes are the client's own
-// ---------------------------------------------------------------------------
-//
-// The three Phase-1-only classes are recognised by name only and get their
-// identity checks once the Phase 1 client is adopted (E37).
-
-describe('b.jg5 SRJ-103: re-exported error classes', () => {
-  test.each([
-    [AdErrTmuxSendKeys.name, ErrTmuxSendKeys, AdErrTmuxSendKeys],
-    [AdErrTmuxCaptureFailed.name, ErrTmuxCaptureFailed, AdErrTmuxCaptureFailed],
-    [AdErrTmuxSessionCreate.name, ErrTmuxSessionCreate, AdErrTmuxSessionCreate],
-    [AdErrUnknownErrorName.name, ErrUnknownErrorName, AdErrUnknownErrorName],
-    [AdErrSendKeysWhileRelayed.name, ErrSendKeysWhileRelayed, AdErrSendKeysWhileRelayed],
-  ])('%s from src/agent-director-errors.ts is the client\'s own class', (_name, reExported, own) => {
-    expect(reExported).toBe(own)
   })
 })
 

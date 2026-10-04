@@ -45,6 +45,7 @@ import { resolveRealPathStrict, type Persona, type PersonaConfig, type ServerSet
 import { recordStartupError as defaultRecordStartupError } from './startup-errors.ts'
 import { withOutageDetection } from './outage-state.ts'
 import { ErrSpawnNotFound } from './agent-director-errors.ts'
+import { isAdErrorInstance } from './ad-error-class.ts'
 import { personaInstanceId, renderPersonaRef, resolveClaudeConfigDir } from './persona-identity.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import { resolveJsonlPath } from './cozempic.ts'
@@ -498,7 +499,7 @@ async function checkPersonaTranscript(persona: Persona, fx: Layer2Effects): Prom
   try {
     row = await fx.getRow(key, claudeInstanceId)
   } catch (err) {
-    if (err instanceof ErrSpawnNotFound) {
+    if (isAdErrorInstance(err, ErrSpawnNotFound)) {
       // Case 1: no row — nothing to lose.
       console.error(`[slack] jsonl-persistence-check: no AD row for ${ref} — nothing to resume`)
       return

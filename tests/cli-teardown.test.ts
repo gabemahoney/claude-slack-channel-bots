@@ -20,8 +20,11 @@
  * answer check and the routes of its not-restarted alert are
  * tests/cli.test.ts's.
  *
- * Every agent-director error is built by name with the stub's builders; class
- * labels, finished and live states, notes and launch starts are imported. The
+ * Every agent-director error is built with the stub's builders, each error of a
+ * class the client declares by that class's builder (never `errGeneric`, which
+ * the classifier reads as UNCLASSIFIED, save the look-alike rows that pin
+ * exactly that); class labels, finished and live
+ * states, notes and launch starts are imported. The
  * SRD's numbers (3 tries, 2 s apart), the config file's name and one line of
  * each builder are pinned once as literals, the forms SRJ-901 and SRJ-907
  * state. The kill-failure alert's text and closing sentences come from
@@ -65,8 +68,6 @@ import {
   ERR_SCHEMA_MISMATCH_NAME,
   ERR_SPAWN_NOT_FOUND_NAME,
   ERR_STORE_OPEN_NAME,
-  ERR_TMUX_KILL_FAILED_NAME,
-  ERR_TMUX_SESSION_CONFLICT_NAME,
   STORE_OPEN_ERR_NAMES,
 } from '../src/agent-director-errors.ts'
 import {
@@ -281,11 +282,14 @@ const READ_PANE_ERROR_ROWS: readonly ErrorRow[] = [
 ]
 
 /**
- * The same classes at `get`: `ErrSpawnNotFound` is no row (skipped); GONE,
- * which a `get` gives no meaning, fails as UNCLASSIFIED with no retry.
+ * The same classes at `get`: `ErrSpawnNotFound` is no row (skipped), decided
+ * by the client's class, so a base `AgentDirectorError` merely named so fails
+ * as UNCLASSIFIED; GONE, which a `get` gives no meaning, fails as
+ * UNCLASSIFIED with no retry.
  */
 const GET_ERROR_ROWS: readonly ErrorRow[] = [
   ['ErrSpawnNotFound (no row)', () => errSpawnNotFound(), PRECHECK_VERDICT_SKIP, null],
+  ['a base AgentDirectorError merely named ErrSpawnNotFound (not that class: no missing row)', () => errGeneric(PRECHECK_CALL_GET, ERR_SPAWN_NOT_FOUND_NAME, 'spawn not found'), PRECHECK_VERDICT_FAIL, AD_ERROR_CLASS_UNCLASSIFIED],
   ['ErrTmuxCaptureFailed (GONE)', () => errTmuxCaptureFailed(undefined, PRECHECK_CALL_GET), PRECHECK_VERDICT_FAIL, AD_ERROR_CLASS_UNCLASSIFIED],
   ...failingRows(PRECHECK_CALL_GET),
 ]
@@ -405,7 +409,7 @@ describe('precheck failure lines (b.jg5 SRJ-901)', () => {
   test('a CONFIG failure\'s line names the config file; a CONFLICT and an UNCLASSIFIED description carrying fake tokens render redacted on one line', () => {
     const lines = [
       errConfigMalformed(),
-      errGeneric(PRECHECK_CALL_READ_PANE, ERR_TMUX_SESSION_CONFLICT_NAME, `session refused (${sentinelInMessage('conflict')})`),
+      errTmuxSessionConflict(PRECHECK_CALL_READ_PANE, 'unrecognised', sentinelInMessage('conflict')),
       errGeneric(PRECHECK_CALL_READ_PANE, 'ErrNoHandlingInCscb', `refused (${sentinelInMessage('unclassified')})`),
     ].map((value) => precheckFailureLine(CLI_COMMAND_CLEAN_RESTART, PERSONA, failOf(precheckVerdictOf({ call: PRECHECK_CALL_READ_PANE, error: value }))))
 
@@ -520,12 +524,14 @@ describe('pauseVerdictOf: each pause answer by class (b.jg5 SRJ-903, SRJ-119; ha
 type StateReadErrorRow = readonly [label: string, make: () => unknown, errorClass: AdErrorClass | null]
 
 /**
- * The teardown's own `status` read: `ErrSpawnNotFound` is no row; every
- * other answer fails at once with the classifier's class, never relabelled
- * UNCLASSIFIED as the precheck's `get` relabels.
+ * The teardown's own `status` read: `ErrSpawnNotFound` is no row, decided by
+ * the client's class (a base `AgentDirectorError` merely named so is
+ * UNCLASSIFIED); every other answer fails at once with the classifier's
+ * class, never relabelled UNCLASSIFIED as the precheck's `get` relabels.
  */
 const STATE_READ_ERROR_ROWS: readonly StateReadErrorRow[] = [
   ['ErrSpawnNotFound (no row)', () => errSpawnNotFound(), null],
+  ['a base AgentDirectorError merely named ErrSpawnNotFound (not that class: no missing row)', () => errGeneric(STATUS_VERB, ERR_SPAWN_NOT_FOUND_NAME, 'spawn not found'), AD_ERROR_CLASS_UNCLASSIFIED],
   ...UNAVAILABLE_FORMS.map(([label, make]): StateReadErrorRow => [`${label} (UNAVAILABLE)`, () => make(STATUS_VERB), AD_ERROR_CLASS_UNAVAILABLE]),
   ['ErrConfigMalformed (CONFIG)', () => errConfigMalformed(), AD_ERROR_CLASS_CONFIG],
   ['ErrTmuxSessionConflict (CONFLICT)', () => errTmuxSessionConflict(STATUS_VERB, 'unrecognised'), AD_ERROR_CLASS_CONFLICT],
@@ -578,7 +584,7 @@ describe('the teardown\'s per-persona outcome and its error report (b.jg5 SRJ-90
 
   test('a CONFLICT, an UNCLASSIFIED and a plain ErrInternal description carrying fake tokens come out redacted on one line, at the pause (failing or escalating) and at a status read', () => {
     const values = [
-      errGeneric(PAUSE_VERB, ERR_TMUX_SESSION_CONFLICT_NAME, `session refused (${sentinelInMessage('teardown-conflict')})`),
+      errTmuxSessionConflict(PAUSE_VERB, 'unrecognised', sentinelInMessage('teardown-conflict')),
       errGeneric(PAUSE_VERB, 'ErrNoHandlingInCscb', `refused (${sentinelInMessage('teardown-unclassified')})`),
       errInternal(`the store could not be read (${sentinelInMessage('teardown-internal')})`),
     ]
@@ -608,7 +614,7 @@ describe('src/cli-teardown.ts is pure (b.jg5 SRJ-114, SRJ-115, SRJ-801, SRJ-908)
     expect(importedSpecifiers(code).filter((s) => !s.startsWith('./') && !s.startsWith('node:'))).toEqual([])
   })
 
-  test('it reads no clock, arms no timer and tells no error apart by its class (instanceof)', () => {
+  test('it reads no clock, arms no timer and has no instanceof of its own (it tells error classes apart only through src/ad-error-class.ts)', () => {
     for (const banned of [/\bDate\.now\b/, /\bsetTimeout\b/, /\bsetInterval\b/, /\binstanceof\b/]) {
       expect([banned.source, banned.test(code)]).toEqual([banned.source, false])
     }
@@ -693,7 +699,6 @@ const SUCCESS_RESULTS: ReadonlyArray<readonly [string, () => KillRetryResult<Any
   ['a kill result with kill_sent false', () => retryResult(killOutcomeOf({ result: cannedKillResult(false) }, TEARDOWN_KILL_OPTIONS), KILL_RETRY_END_SETTLED, 1, 0)],
   ['a kill result with no kill_sent (a binary older than Phase 1)', () => retryResult(killOutcomeOf({ result: cannedKillResult() }, TEARDOWN_KILL_OPTIONS), KILL_RETRY_END_SETTLED, 1, 0)],
   ['ErrSpawnNotFound at a try', () => retryResult(thrownOutcome(errSpawnNotFound()), KILL_RETRY_END_SETTLED, 1, 0)],
-  ['ErrSpawnNotFound by name only at a try', () => retryResult(thrownOutcome(errGeneric(KILL_VERB, ERR_SPAWN_NOT_FOUND_NAME, 'row gone')), KILL_RETRY_END_SETTLED, 1, 0)],
   ...([KILL_ROW_FINISHED_ENDED, KILL_ROW_FINISHED_MISSING, KILL_ROW_FINISHED_NO_ROW] as const).map((read) =>
     [`a read between tries finding the row finished (${read})`, () => retryResult({ kind: KILL_OUTCOME_ROW_FINISHED, read }, KILL_RETRY_END_ROW_FINISHED, 1, 1)] as const),
 ]
@@ -711,7 +716,7 @@ const NOT_KILLED_ROWS: readonly FailureRow[] = [
   ...UNUSABLE_NAME_FAULTS.map((f): FailureRow => [`the unusable-name ErrInternal, ${f} (UNUSABLE NAME)`, () => errUnusableName(f), AD_ERROR_CLASS_UNUSABLE_NAME]),
   ['a plain ErrInternal (UNCLASSIFIED)', () => errInternal(), AD_ERROR_CLASS_UNCLASSIFIED],
   ['a plain ErrInternal whose description carries fake tokens (UNCLASSIFIED)', () => errInternal(`the store could not be read (${sentinelInMessage('kill-internal')})`), AD_ERROR_CLASS_UNCLASSIFIED],
-  ['a CONFLICT whose description carries fake tokens', () => errGeneric(KILL_VERB, ERR_TMUX_SESSION_CONFLICT_NAME, `session refused (${sentinelInMessage('kill-conflict')})`), AD_ERROR_CLASS_CONFLICT],
+  ['a CONFLICT whose description carries fake tokens', () => errTmuxSessionConflict(KILL_VERB, 'unrecognised', sentinelInMessage('kill-conflict')), AD_ERROR_CLASS_CONFLICT],
   [`${ERR_SCHEMA_MISMATCH_NAME} (a store name, UNCLASSIFIED)`, () => errSchemaMismatch(), AD_ERROR_CLASS_UNCLASSIFIED],
   ...STORE_OPEN_ERR_NAMES.filter((name) => name !== ERR_SCHEMA_MISMATCH_NAME)
     .map((name): FailureRow => [`${name} (a store name, UNCLASSIFIED)`, () => errUnknownErrorName(name), AD_ERROR_CLASS_UNCLASSIFIED]),
@@ -1028,7 +1033,7 @@ describe('the failure line and the last line (b.jg5 SRJ-907, SRJ-1013)', () => {
 
   test.each(REPORT_COMMANDS)('%s: a CONFLICT and an UNCLASSIFIED description carrying fake tokens come out redacted on one line', (command) => {
     const outputs = [
-      errGeneric(KILL_VERB, ERR_TMUX_SESSION_CONFLICT_NAME, `session refused (${sentinelInMessage('line-conflict')})`),
+      errTmuxSessionConflict(KILL_VERB, 'unrecognised', sentinelInMessage('line-conflict')),
       errGeneric(KILL_VERB, 'ErrNoHandlingInCscb', `refused (${sentinelInMessage('line-unclassified')})`),
     ].map((value) => teardownFailureLine(command, REPORT_PERSONA, teardownErrorReportOf(value)))
     for (const output of outputs) {
@@ -1171,7 +1176,7 @@ describe('personaTeardownReportOf: each persona\'s report plan (b.jg5 SRJ-907, S
   })
 
   test.each(REPORT_COMMANDS)('%s: descriptions carrying fake tokens, in the failure line and in both versions\' quotes, come out redacted in every printed line, logged line and entry', (command) => {
-    const killValue = errGeneric(KILL_VERB, ERR_TMUX_KILL_FAILED_NAME, `the kill was refused (${sentinelInMessage('report-last')})`)
+    const killValue = errTmuxKillFailed(sentinelInMessage('report-last'), 'outlived-exit-wait')
     const survivorWithToken = `${survivorDescription()} (${sentinelInMessage('report-survivor')})`
     const failed = personaTeardownReportOf(command, REPORT_PERSONA, failedKillOutcome(killValue, AD_ERROR_CLASS_UNAVAILABLE, {
       kind: KILL_RETRY_ALERT_ORDINARY, lastKillFailedDescription: teardownKillFailedDescription(killValue), earlierSurvivorDescription: survivorWithToken,
@@ -1261,7 +1266,7 @@ describe('the not-restarted alert and its class, the answer check\'s line and th
 
   test('the alert carries no agent-director description: failures whose descriptions carry fake tokens give an alert holding neither the redacted description nor the token', () => {
     const failures = [
-      errGeneric(KILL_VERB, ERR_TMUX_SESSION_CONFLICT_NAME, `session refused (${sentinelInMessage('not-restarted-conflict')})`),
+      errTmuxSessionConflict(KILL_VERB, 'unrecognised', sentinelInMessage('not-restarted-conflict')),
       errGeneric(KILL_VERB, 'ErrNoHandlingInCscb', `refused (${sentinelInMessage('not-restarted-unclassified')})`),
     ].map((value, i) => {
       const report = teardownErrorReportOf(value)

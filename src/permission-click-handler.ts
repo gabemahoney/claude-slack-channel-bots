@@ -45,14 +45,20 @@
 
 import type { WebClient } from '@slack/web-api'
 
-import { classifyWithInvalidFlagsRecheck, type AdVersionRecheckTrigger } from './ad-error-class.ts'
+import {
+  AD_ERROR_CLASS_ENVIRONMENT,
+  classifyAdError,
+  classifyWithInvalidFlagsRecheck,
+  isAdErrorInstance,
+  isInvalidFlagsError,
+  type AdVersionRecheckTrigger,
+} from './ad-error-class.ts'
 import { decideWithToken } from './agent-director-client.ts'
 import {
   AgentDirectorError,
   ErrAlreadyDecided,
   ErrRelayFallenBack,
   ErrSystemInstallDisappeared,
-  ErrTmuxNotAvailable,
 } from './agent-director-errors.ts'
 import type { Persona } from './config.ts'
 import { withOutageDetection } from './outage-state.ts'
@@ -113,7 +119,7 @@ function logDeps(deps: ClickDeps, ...args: unknown[]): void {
 function classifyAdDecideError(err: unknown): AdDecideResponseClass {
   if (err instanceof ErrAlreadyDecided) return 'ErrAlreadyDecided'
   if (err instanceof ErrRelayFallenBack) return 'ErrRelayFallenBack'
-  if (err instanceof AgentDirectorError && err.errName === 'ErrInvalidFlags') return 'ErrInvalidFlags'
+  if (isInvalidFlagsError(err)) return 'ErrInvalidFlags'
   if (err instanceof AgentDirectorError && err.errName === 'ErrAmbiguousRequest') return 'ErrAmbiguousRequest'
   return 'other'
 }
@@ -311,7 +317,11 @@ export async function handlePermissionClick(
     // SR-V-2.7 call-side success emission.
     emit({ ...decideEnvelope, result_class: 'ok' satisfies AdDecideResponseClass })
   } catch (err) {
-    if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) {
+    // The `AgentDirectorError` check only narrows the type for the trail fields.
+    if (
+      err instanceof AgentDirectorError &&
+      (isAdErrorInstance(err, ErrSystemInstallDisappeared) || classifyAdError(err).errorClass === AD_ERROR_CLASS_ENVIRONMENT)
+    ) {
       // SR-V-2.7 ad/tmux carve-out: the wrapper already raised the outage
       // flag (one Slack onset alert via the state machine). Forensic
       // requirement: the trail JSONL must still carry the typed error name
@@ -378,7 +388,7 @@ export async function handlePermissionClick(
       }
       return true
     }
-    if (err instanceof AgentDirectorError && err.errName === 'ErrInvalidFlags') {
+    if (isInvalidFlagsError(err)) {
       logDeps(deps, `[slack] permission-click: ErrInvalidFlags from decide for ${claudeInstanceId} (request_token=${requestToken})`)
       // b.jg5 SRJ-204, SRJ-104: the ErrInvalidFlags step — one immediate
       // version re-check (a stop it decides ends the process), class

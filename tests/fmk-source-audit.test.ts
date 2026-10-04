@@ -38,6 +38,20 @@
  *   seam names and E22 T4's ladder kill clock seam, in code or a string.
  *
  * Log text naming tmux sub-commands (`tmux attach -t`) is no process start.
+ *
+ * A second audit, `byNameFindings`, reads every `src/` file and the
+ * agent-director stub (`tests/test-helpers/agent-director-stub.ts`) with the
+ * TypeScript parser, so text in strings and comments never counts, and finds
+ * any recognition of the three Phase-1-only classes (`ErrTmuxKillFailed`,
+ * `ErrTmuxUnresponsive`, `ErrTmuxSessionConflict`) by name rather than by
+ * class (b.jg5 SRJ-101, SRJ-104). A name is the literal, a constant holding
+ * it, or an element of a collection of them; its rules are listed at
+ * `byNameFindings`. The same rows pin each rule with a planted violation and
+ * the allowed uses (the name constants and `PHASE1_ONLY_ERR_NAMES`,
+ * `REQUIRED_ERR_NAMES` and the catalogue check, log labels, the stub's
+ * builders on the class bindings, and the stand-in declarations in
+ * `src/agent-director-errors.ts`).
+ *
  * The file starts no process and reads nothing outside the repository.
  *
  * SPDX-License-Identifier: MIT
@@ -46,6 +60,7 @@
 import { describe, expect, test } from 'bun:test'
 import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import ts from 'typescript'
 
 import { AD_TMUX_TABLE } from '../src/ad-settings.ts'
 import { callArguments, maskLiterals, splitTopLevel, stripComments } from './test-helpers/source-audit.ts'
@@ -539,5 +554,404 @@ describe('the closed list of non-literal process starts is keyed by file, callee
 
   test('an entry that matches no start is stale', () => {
     expect(findingsOf(file, 'const nothing = 0', [entry])).toEqual([{ file, rule: 'stale-process-start-entry' }])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// By-name recognition of the Phase-1-only classes (b.jg5 SRJ-101, SRJ-104)
+// ---------------------------------------------------------------------------
+
+type ByNameRule = 'phase1-name-comparison' | 'phase1-name-lookup' | 'phase1-by-name-call' | 'base-error-named'
+
+interface ByNameFinding {
+  /** The file, relative to the repository root. */
+  readonly file: string
+  readonly rule: ByNameRule
+  /** `line: code` of the finding, for the failure message only. */
+  readonly at: string
+}
+
+/** The classes only the Phase 1 agent-director client declares. */
+const PHASE1_NAMES: readonly string[] = ['ErrTmuxKillFailed', 'ErrTmuxUnresponsive', 'ErrTmuxSessionConflict']
+
+/** What an error's name is read as: these properties (`x.errName`, `x['name']`) or bare identifiers. */
+const NAME_KEYS: readonly string[] = ['errName', 'unknownName', 'name']
+
+/** The properties a builder may set on a base error to name it. */
+const NAME_SET_KEYS: readonly string[] = ['name', 'errName']
+
+/** Methods that look a key up in a collection. */
+const LOOKUP_METHODS: readonly string[] = ['get', 'has', 'includes', 'indexOf', 'lastIndexOf']
+
+/** Callees whose arguments are log text (`console.error`, `log`, `deps.warn`). */
+const LOG_CALLEES: readonly string[] = ['log', 'warn', 'error', 'info', 'debug']
+
+/**
+ * The module that resolves the three classes from the client, and its
+ * declarations that make the stand-ins and pick each class by name (b.jg5
+ * SRJ-101): the audit allows anything inside them, in that file only.
+ */
+const STAND_IN_FILE = 'src/agent-director-errors.ts'
+const STAND_IN_DECLARATIONS: readonly string[] = ['phase1StandIn', 'PHASE1_STAND_INS', 'resolvePhase1ErrorClasses']
+
+/** The agent-director stub, audited beside `src/`. */
+const STUB_FILE = 'tests/test-helpers/agent-director-stub.ts'
+
+/** Identifiers found to hold a Phase-1-only name (`constants`) or a collection holding one (`collections`). */
+interface Phase1NameBindings {
+  readonly constants: Set<string>
+  readonly collections: Set<string>
+}
+
+const parseSource = (file: string, text: string): ts.SourceFile => ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+
+/** Calls `visit` on every node under `root`, depth first. */
+function forEachNode(root: ts.Node, visit: (node: ts.Node) => void): void {
+  const walk = (node: ts.Node): void => {
+    visit(node)
+    ts.forEachChild(node, walk)
+  }
+  walk(root)
+}
+
+/** `expr` without parentheses, casts, `!`, `satisfies`, `await` and `Object.freeze(…)`. */
+function unwrap(expr: ts.Expression): ts.Expression {
+  for (;;) {
+    if (ts.isParenthesizedExpression(expr) || ts.isAsExpression(expr) || ts.isNonNullExpression(expr) || ts.isSatisfiesExpression(expr)
+      || ts.isTypeAssertionExpression(expr) || ts.isAwaitExpression(expr)) {
+      expr = expr.expression
+    } else if (ts.isCallExpression(expr) && expr.expression.getText() === 'Object.freeze' && expr.arguments.length === 1) {
+      expr = expr.arguments[0]!
+    } else {
+      return expr
+    }
+  }
+}
+
+/** The name a reference ends in: `x` for `x`, `a.x` or `a?.x`; undefined for anything else. */
+function memberName(expr: ts.Expression): string | undefined {
+  if (ts.isIdentifier(expr)) return expr.text
+  if (ts.isPropertyAccessExpression(expr)) return expr.name.text
+  return undefined
+}
+
+/** The text of a string literal or a template with no substitution, else undefined. */
+const literalOf = (node: ts.Node): string | undefined => (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) ? node.text : undefined)
+
+/** Whether `expr` is a Phase-1-only name: the literal, a constant holding it, or an element (by index) of a collection of them. */
+function isPhase1Name(expr: ts.Expression, b: Phase1NameBindings): boolean {
+  const inner = unwrap(expr)
+  const literal = literalOf(inner)
+  if (literal !== undefined) return PHASE1_NAMES.includes(literal)
+  const name = memberName(inner)
+  if (name !== undefined) return b.constants.has(name)
+  return ts.isElementAccessExpression(inner) && ts.isNumericLiteral(inner.argumentExpression) && isCollection(inner.expression, b)
+}
+
+/** Whether `expr` reads an error's name (`NAME_KEYS`). */
+function isNameRead(expr: ts.Expression): boolean {
+  const inner = unwrap(expr)
+  if (ts.isElementAccessExpression(inner)) return NAME_KEYS.includes(literalOf(inner.argumentExpression) ?? '')
+  return NAME_KEYS.includes(memberName(inner) ?? '')
+}
+
+/**
+ * Whether `expr` is a collection holding a Phase-1-only name: an identifier
+ * found to hold one, an array literal with one (nested arrays and spreads
+ * included), an object literal keyed by one (a computed key, or a plain key
+ * spelled as one), or a `new Set(…)` / `new Map(…)` over one.
+ */
+function isCollection(expr: ts.Expression, b: Phase1NameBindings): boolean {
+  const inner = unwrap(expr)
+  const name = memberName(inner)
+  if (name !== undefined) return b.collections.has(name)
+  if (ts.isArrayLiteralExpression(inner)) {
+    return inner.elements.some((el) => {
+      const item = ts.isSpreadElement(el) ? el.expression : el
+      return isPhase1Name(item, b) || isCollection(item, b)
+    })
+  }
+  if (ts.isObjectLiteralExpression(inner)) {
+    return inner.properties.some((p) => {
+      if (ts.isSpreadAssignment(p)) return isCollection(p.expression, b)
+      if (p.name === undefined) return false
+      if (ts.isComputedPropertyName(p.name)) return isPhase1Name(p.name.expression, b)
+      return PHASE1_NAMES.includes(ts.isIdentifier(p.name) ? p.name.text : literalOf(p.name) ?? '')
+    })
+  }
+  if (ts.isNewExpression(inner) && ['Set', 'Map'].includes(memberName(inner.expression) ?? '')) return (inner.arguments ?? []).some((a) => isCollection(a, b))
+  return false
+}
+
+/**
+ * The identifiers in `sources` declared with a Phase-1-only name (constants)
+ * or a collection of them, followed through other declarations (`const X = Y`)
+ * to a fixed point, starting from `base`.
+ */
+function phase1NameBindings(sources: readonly ts.SourceFile[], base?: Phase1NameBindings): Phase1NameBindings {
+  const b: Phase1NameBindings = { constants: new Set(base?.constants), collections: new Set(base?.collections) }
+  for (let grew = true; grew;) {
+    grew = false
+    for (const sf of sources) {
+      forEachNode(sf, (node) => {
+        if (!ts.isVariableDeclaration(node) || !ts.isIdentifier(node.name) || node.initializer === undefined) return
+        const into = isPhase1Name(node.initializer, b) ? b.constants : isCollection(node.initializer, b) ? b.collections : undefined
+        if (into !== undefined && !into.has(node.name.text)) {
+          into.add(node.name.text)
+          grew = true
+        }
+      })
+    }
+  }
+  return b
+}
+
+/** Whether `expr` is `new AgentDirectorError(…)` (the base class, by any import name ending in it). */
+function isBaseErrorNew(expr: ts.Expression): boolean {
+  const inner = unwrap(expr)
+  return ts.isNewExpression(inner) && memberName(inner.expression) === 'AgentDirectorError'
+}
+
+/** Whether `node` sits inside one of `STAND_IN_DECLARATIONS`. */
+function inStandInDeclaration(node: ts.Node): boolean {
+  for (let at = node.parent; at !== undefined; at = at.parent) {
+    if ((ts.isFunctionDeclaration(at) || ts.isVariableDeclaration(at)) && at.name !== undefined && ts.isIdentifier(at.name) && STAND_IN_DECLARATIONS.includes(at.name.text)) return true
+  }
+  return false
+}
+
+const EQUALITY_OPERATORS = new Set([ts.SyntaxKind.EqualsEqualsEqualsToken, ts.SyntaxKind.ExclamationEqualsEqualsToken, ts.SyntaxKind.EqualsEqualsToken, ts.SyntaxKind.ExclamationEqualsToken])
+
+/**
+ * Every place `files` ([repository path, text]) recognises a Phase-1-only
+ * class by name, the names and collections found in `files` added to `base`
+ * (the tree's, so a planted source can use the real constants):
+ *
+ * - `phase1-name-comparison`: `===`, `!==`, `==` or `!=` between a name read
+ *   (`errName`, `unknownName`, `name`) and a Phase-1-only name, or a
+ *   `switch` on a name read with a `case` of one.
+ * - `phase1-name-lookup`: `get`, `has`, `includes`, `indexOf` or
+ *   `lastIndexOf` with a Phase-1-only name, or on a collection of them with a
+ *   name read; an element read at a Phase-1-only name, or of a collection of
+ *   them at a name read; `in` with either.
+ * - `phase1-by-name-call`: any other call with a Phase-1-only name as an
+ *   argument (a by-name helper such as `hasAdErrorName(err, NAME)`, or a
+ *   by-name builder such as `errGeneric(verb, NAME, description)`), except a
+ *   log call (`LOG_CALLEES`).
+ * - `base-error-named`: a base `AgentDirectorError` built with a
+ *   Phase-1-only name, or a base error whose `name` or `errName` is then set
+ *   (an assignment, `Object.defineProperty` or `Object.assign` on it).
+ *
+ * Allowed: anything inside `STAND_IN_DECLARATIONS` in `STAND_IN_FILE`; a
+ * `new` of any other class with a name (the stub's builders on the class
+ * bindings); names in templates and string concatenation (log labels);
+ * declaring and iterating the constants and collections
+ * (`PHASE1_ONLY_ERR_NAMES`, `REQUIRED_ERR_NAMES` and the catalogue check).
+ */
+function byNameFindings(files: ReadonlyArray<readonly [string, string]>, base?: Phase1NameBindings): ByNameFinding[] {
+  const sources = files.map(([file, text]) => parseSource(file, text))
+  const b = phase1NameBindings(sources, base)
+  const findings: ByNameFinding[] = []
+  for (const sf of sources) {
+    const file = sf.fileName
+    const add = (rule: ByNameRule, node: ts.Node): void => {
+      if (file === STAND_IN_FILE && inStandInDeclaration(node)) return
+      const line = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1
+      findings.push({ file, rule, at: `${line}: ${node.getText(sf).replace(/\s+/g, ' ').slice(0, 120)}` })
+    }
+    const baseErrors = new Set<string>()
+    forEachNode(sf, (node) => {
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer !== undefined && isBaseErrorNew(node.initializer)) baseErrors.add(node.name.text)
+    })
+    const isBaseError = (expr: ts.Expression): boolean => {
+      const inner = unwrap(expr)
+      return isBaseErrorNew(inner) || (ts.isIdentifier(inner) && baseErrors.has(inner.text))
+    }
+    const setsBaseErrorName = (target: ts.Expression): boolean => {
+      const inner = unwrap(target)
+      if (ts.isPropertyAccessExpression(inner)) return NAME_SET_KEYS.includes(inner.name.text) && isBaseError(inner.expression)
+      return ts.isElementAccessExpression(inner) && NAME_SET_KEYS.includes(literalOf(inner.argumentExpression) ?? '') && isBaseError(inner.expression)
+    }
+    const namesAProperty = (arg: ts.Expression): boolean => ts.isObjectLiteralExpression(arg)
+      && arg.properties.some((p) => p.name !== undefined && NAME_SET_KEYS.includes(ts.isIdentifier(p.name) ? p.name.text : literalOf(p.name) ?? ''))
+
+    forEachNode(sf, (node) => {
+      if (ts.isBinaryExpression(node)) {
+        const { left, right } = node
+        const op = node.operatorToken.kind
+        if (EQUALITY_OPERATORS.has(op) && ((isNameRead(left) && isPhase1Name(right, b)) || (isPhase1Name(left, b) && isNameRead(right)))) add('phase1-name-comparison', node)
+        else if (op === ts.SyntaxKind.InKeyword && (isPhase1Name(left, b) || (isNameRead(left) && isCollection(right, b)))) add('phase1-name-lookup', node)
+        else if (op === ts.SyntaxKind.EqualsToken && setsBaseErrorName(left)) add('base-error-named', node)
+      } else if (ts.isSwitchStatement(node) && isNameRead(node.expression)) {
+        for (const clause of node.caseBlock.clauses) if (ts.isCaseClause(clause) && isPhase1Name(clause.expression, b)) add('phase1-name-comparison', clause)
+      } else if (ts.isElementAccessExpression(node)) {
+        if (isPhase1Name(node.argumentExpression, b) || (isCollection(node.expression, b) && isNameRead(node.argumentExpression))) add('phase1-name-lookup', node)
+      } else if (ts.isNewExpression(node)) {
+        if (isBaseErrorNew(node) && (node.arguments ?? []).some((a) => isPhase1Name(a, b))) add('base-error-named', node)
+      } else if (ts.isCallExpression(node)) {
+        const callee = node.expression
+        const args = node.arguments
+        const calleeText = callee.getText(sf).replace(/\s+/g, '')
+        if (calleeText === 'Object.defineProperty' && args.length >= 2 && isBaseError(args[0]!) && NAME_SET_KEYS.includes(literalOf(args[1]!) ?? '')) {
+          add('base-error-named', node)
+        } else if (calleeText === 'Object.assign' && args.length >= 2 && isBaseError(args[0]!) && args.slice(1).some(namesAProperty)) {
+          add('base-error-named', node)
+        } else if (ts.isPropertyAccessExpression(callee) && LOOKUP_METHODS.includes(callee.name.text)
+          && (args.some((a) => isPhase1Name(a, b)) || (isCollection(callee.expression, b) && args.some((a) => isNameRead(a))))) {
+          add('phase1-name-lookup', node)
+        } else if (!LOG_CALLEES.includes(memberName(callee) ?? '') && args.some((a) => isPhase1Name(a, b))) {
+          add('phase1-by-name-call', node)
+        }
+      }
+    })
+  }
+  return findings
+}
+
+/** Every `src/` file (`src/<name>`) and the stub: [repository path, text]. */
+const BY_NAME_TREE: ReadonlyArray<readonly [string, string]> = [
+  ...SRC_FILES.map(([name, text]) => [`src/${name}`, text] as const),
+  [STUB_FILE, readFileSync(join(import.meta.dir, '..', STUB_FILE), 'utf-8')],
+]
+
+/** The tree's name constants and collections, which planted sources may use. */
+const TREE_BINDINGS = phase1NameBindings(BY_NAME_TREE.map(([file, text]) => parseSource(file, text)))
+
+const ERRORS_IMPORT = "import { ERR_TMUX_KILL_FAILED_NAME, ERR_TMUX_SESSION_CONFLICT_NAME, ERR_TMUX_UNRESPONSIVE_NAME, PHASE1_ONLY_ERR_NAMES } from './agent-director-errors.ts'"
+
+/** [what is planted, the synthetic source, the one rule it breaks]. */
+const BY_NAME_PLANTED: ReadonlyArray<readonly [string, string, ByNameRule]> = [
+  // Comparisons of errName, unknownName or name with a name.
+  ["errName === a literal", "if (err.errName === 'ErrTmuxKillFailed') retry()", 'phase1-name-comparison'],
+  ['a constant === errName', `${ERRORS_IMPORT}\nif (ERR_TMUX_SESSION_CONFLICT_NAME === err.errName) latch()`, 'phase1-name-comparison'],
+  ['unknownName !== a constant', `${ERRORS_IMPORT}\nif (err.unknownName !== ERR_TMUX_UNRESPONSIVE_NAME) return`, 'phase1-name-comparison'],
+  ['name == a literal', "if (err.name == 'ErrTmuxSessionConflict') latch()", 'phase1-name-comparison'],
+  ['errName != a template literal', 'if (err.errName != `ErrTmuxUnresponsive`) return', 'phase1-name-comparison'],
+  ['errName through a cast, optional chaining and a namespace constant', "import * as errors from './agent-director-errors.ts'\nif ((err as AgentDirectorError)?.errName === errors.ERR_TMUX_KILL_FAILED_NAME) retry()", 'phase1-name-comparison'],
+  ["err['errName'] === a constant", `${ERRORS_IMPORT}\nif (err['errName'] === ERR_TMUX_KILL_FAILED_NAME) retry()`, 'phase1-name-comparison'],
+  ['the constructor name === a literal', "if (err.constructor.name === 'ErrTmuxKillFailed') retry()", 'phase1-name-comparison'],
+  ['a destructured errName === a constant', `${ERRORS_IMPORT}\nconst { errName } = err\nif (errName === ERR_TMUX_UNRESPONSIVE_NAME) retry()`, 'phase1-name-comparison'],
+  ['errName === a local alias of a constant', `${ERRORS_IMPORT}\nconst KILL = ERR_TMUX_KILL_FAILED_NAME\nif (err.errName === KILL) retry()`, 'phase1-name-comparison'],
+  ['errName === a src alias of a constant', "import { LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE } from './ad-error-class.ts'\nif (err.errName === LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE) wait()", 'phase1-name-comparison'],
+  ['errName === an element of PHASE1_ONLY_ERR_NAMES', `${ERRORS_IMPORT}\nif (err.errName === PHASE1_ONLY_ERR_NAMES[0]) retry()`, 'phase1-name-comparison'],
+  ['a switch on errName with a case of a constant', `${ERRORS_IMPORT}\nswitch (err.errName) {\n  case ERR_TMUX_SESSION_CONFLICT_NAME: return 'conflict'\n  default: return 'other'\n}`, 'phase1-name-comparison'],
+  // By-name helper calls.
+  ['hasAdErrorName with a constant', `${ERRORS_IMPORT}\nif (hasAdErrorName(err, ERR_TMUX_KILL_FAILED_NAME)) retry()`, 'phase1-by-name-call'],
+  ['a by-name helper with a literal', "if (isNamed(err, 'ErrTmuxUnresponsive')) wait()", 'phase1-by-name-call'],
+  ['an optional by-name helper on a receiver', `${ERRORS_IMPORT}\ndeps.matchesName?.(err, ERR_TMUX_UNRESPONSIVE_NAME)`, 'phase1-by-name-call'],
+  ['a by-name builder (errGeneric)', `${ERRORS_IMPORT}\nthrow errGeneric('spawn', ERR_TMUX_SESSION_CONFLICT_NAME, 'not this launch')`, 'phase1-by-name-call'],
+  ['a call inside a function named like a stand-in declaration, outside src/agent-director-errors.ts', `${ERRORS_IMPORT}\nfunction resolvePhase1ErrorClasses(err: unknown) { return hasAdErrorName(err, ERR_TMUX_KILL_FAILED_NAME) }`, 'phase1-by-name-call'],
+  // Map or set lookups keyed by a name.
+  ['a map get at a constant', `${ERRORS_IMPORT}\nconst cls = CLASS_BY_NAME.get(ERR_TMUX_KILL_FAILED_NAME)`, 'phase1-name-lookup'],
+  ['PHASE1_ONLY_ERR_NAMES.includes(errName)', `${ERRORS_IMPORT}\nif (PHASE1_ONLY_ERR_NAMES.includes(err.errName)) retry()`, 'phase1-name-lookup'],
+  ['a Set over PHASE1_ONLY_ERR_NAMES has unknownName', `${ERRORS_IMPORT}\nif (new Set(PHASE1_ONLY_ERR_NAMES).has(err.unknownName)) retry()`, 'phase1-name-lookup'],
+  ['an inline array of literals includes name', "if (['ErrTmuxKillFailed', 'ErrTmuxUnresponsive'].includes(err.name)) retry()", 'phase1-name-lookup'],
+  ['a declared Set of constants has errName', `${ERRORS_IMPORT}\nconst RETRYABLE = new Set([ERR_TMUX_UNRESPONSIVE_NAME, ERR_TMUX_KILL_FAILED_NAME])\nif (RETRYABLE.has(err.errName)) retry()`, 'phase1-name-lookup'],
+  ['a frozen Map of constants get errName', `${ERRORS_IMPORT}\nconst KIND = Object.freeze(new Map([[ERR_TMUX_KILL_FAILED_NAME, 'kill']]))\nconst kind = KIND.get(err.errName)`, 'phase1-name-lookup'],
+  ['a table keyed by a computed constant, read at errName', `${ERRORS_IMPORT}\nconst CLASS_OF = { [ERR_TMUX_SESSION_CONFLICT_NAME]: 'CONFLICT' } as const\nconst cls = CLASS_OF[err.errName]`, 'phase1-name-lookup'],
+  ['a table keyed by a plain name, read at errName', "const CLASS_OF = { ErrTmuxKillFailed: 'UNAVAILABLE' }\nconst cls = CLASS_OF[err.errName]", 'phase1-name-lookup'],
+  ['a table read at a constant', `${ERRORS_IMPORT}\nconst handle = HANDLERS[ERR_TMUX_KILL_FAILED_NAME]`, 'phase1-name-lookup'],
+  ['errName in a table keyed by a constant', `${ERRORS_IMPORT}\nconst CLASS_OF = { [ERR_TMUX_UNRESPONSIVE_NAME]: 'UNAVAILABLE' }\nif (err.errName in CLASS_OF) retry()`, 'phase1-name-lookup'],
+  // A base error named like a class.
+  ['a builder that makes a base error and then sets its name', 'function byName(name: string, verb: string, description: string) {\n  const err = new AgentDirectorError(verb, name, description)\n  err.name = name\n  return err\n}', 'base-error-named'],
+  ["a base error's name set in the bracket form", "const err = new AgentDirectorError(verb, errName, description)\nerr['name'] = errName", 'base-error-named'],
+  ["a base error's name set by Object.defineProperty", "const err = new AgentDirectorError(verb, errName, description)\nObject.defineProperty(err, 'name', { value: errName })", 'base-error-named'],
+  ['a base error named by Object.assign', 'return Object.assign(new AgentDirectorError(verb, errName, description), { name: errName })', 'base-error-named'],
+  ['a base error built with a constant', `${ERRORS_IMPORT}\nthrow new AgentDirectorError('kill', ERR_TMUX_KILL_FAILED_NAME, 'retry kill later')`, 'base-error-named'],
+  ['a base error built through a namespace with a literal', "import * as ad from 'agent-director'\nthrow new ad.AgentDirectorError('spawn', 'ErrTmuxUnresponsive', 'did not answer')", 'base-error-named'],
+]
+
+/** [what the source holds, its repository path, the synthetic source]: none is a finding. */
+const BY_NAME_ALLOWED: ReadonlyArray<readonly [string, string, string]> = [
+  ['the name constants and PHASE1_ONLY_ERR_NAMES declared', 'planted/declarations.ts', [
+    "export const ERR_TMUX_KILL_FAILED_NAME = 'ErrTmuxKillFailed'",
+    "export const ERR_TMUX_UNRESPONSIVE_NAME = 'ErrTmuxUnresponsive'",
+    'export const PHASE1_ONLY_ERR_NAMES = [ERR_TMUX_KILL_FAILED_NAME, ERR_TMUX_UNRESPONSIVE_NAME] as const',
+    'export type Phase1OnlyErrName = (typeof PHASE1_ONLY_ERR_NAMES)[number]',
+  ].join('\n')],
+  ['REQUIRED_ERR_NAMES and the catalogue check', 'planted/catalogue.ts', [
+    ERRORS_IMPORT,
+    "export const REQUIRED_ERR_NAMES = ['ErrInvalidFlags', ...PHASE1_ONLY_ERR_NAMES] as const",
+    'for (const name of REQUIRED_ERR_NAMES) {',
+    '  if (!new RegExp(`class\\\\s+${name}\\\\s`).test(distText)) missing.push(name)',
+    '}',
+  ].join('\n')],
+  ['log labels', 'planted/log-labels.ts', [
+    ERRORS_IMPORT,
+    'log(`[slack] kill failed: ${ERR_TMUX_KILL_FAILED_NAME} ${message}`)',
+    "console.error('[slack] unavailable:', ERR_TMUX_UNRESPONSIVE_NAME)",
+    "const line = 'conflict ' + ERR_TMUX_SESSION_CONFLICT_NAME",
+  ].join('\n')],
+  ['deciding by class', 'planted/by-class.ts', [
+    "import { ErrTmuxKillFailed, ErrTmuxSessionConflict } from './agent-director-errors.ts'",
+    'if (isAdErrorInstance(err, ErrTmuxKillFailed)) retry()',
+    'if (err instanceof ErrTmuxSessionConflict) latch()',
+  ].join('\n')],
+  ["the stub's builders on the class bindings", 'planted/stub-builders.ts', [
+    ERRORS_IMPORT,
+    "return new ErrTmuxKillFailed('kill', ERR_TMUX_KILL_FAILED_NAME, text[description])",
+    'return new ErrTmuxUnresponsive(verb, ERR_TMUX_UNRESPONSIVE_NAME, description)',
+  ].join('\n')],
+  ['comparisons and base errors for other names', 'planted/other-names.ts', [
+    "if (err.errName === 'ErrAmbiguousRequest') return",
+    'if (err.unknownName === ERR_INTERNAL_NAME) return',
+    "return new AgentDirectorError('decide', 'ErrAmbiguousRequest', 'ambiguous request')",
+  ].join('\n')],
+  ['an error rebuilt from its own class with its own name', 'planted/rebuild.ts', [
+    'const Made = err.constructor as new (verb: string, errName: string, description: string) => E',
+    'const restored = new Made(err.verb, err.errName, `${err.errDescription}; ${sentence}`)',
+    'restored.name = err.name',
+  ].join('\n')],
+  ['a table of labelled rows found by its label', 'planted/forms.ts', [
+    "const FORMS = [['ErrTmuxKillFailed', () => errTmuxKillFailed()], ['ErrCallTimeout', () => errCallTimeout()]] as const",
+    'const form = FORMS.find(([l]) => l === label)',
+  ].join('\n')],
+  ['the names in strings and comments', 'planted/text.ts', [
+    "// if (err.errName === 'ErrTmuxKillFailed') retry()",
+    '/* hasAdErrorName(err, ERR_TMUX_KILL_FAILED_NAME) */',
+    "const doc = \"err.errName === 'ErrTmuxSessionConflict'\"",
+  ].join('\n')],
+  ['the stand-in declarations in src/agent-director-errors.ts', STAND_IN_FILE, [
+    "export const ERR_TMUX_KILL_FAILED_NAME = 'ErrTmuxKillFailed'",
+    'function phase1StandIn(name: string) {',
+    '  const StandIn = class extends AgentDirectorError { constructor(v: string, e: string, d: string) { super(v, e, d); this.name = name } }',
+    "  Object.defineProperty(StandIn, 'name', { value: name })",
+    '  return StandIn',
+    '}',
+    'const PHASE1_STAND_INS = { [ERR_TMUX_KILL_FAILED_NAME]: phase1StandIn(ERR_TMUX_KILL_FAILED_NAME) }',
+    'export function resolvePhase1ErrorClasses(namespace: Record<string, unknown>) {',
+    '  const pick = (name: string) => namespace[name] ?? PHASE1_STAND_INS[name]',
+    '  return { ErrTmuxKillFailed: pick(ERR_TMUX_KILL_FAILED_NAME) }',
+    '}',
+  ].join('\n')],
+]
+
+describe('b.jg5 SRJ-101, SRJ-104: no by-name recognition of a Phase-1-only class in src/ or the stub', () => {
+  test('the real src/ and the stub have no finding', () => {
+    expect(BY_NAME_TREE.map(([file]) => file)).toEqual(expect.arrayContaining([STAND_IN_FILE, 'src/ad-error-class.ts', STUB_FILE]))
+    expect(byNameFindings(BY_NAME_TREE)).toEqual([])
+  })
+
+  test('the audit finds the real name constants and collections', () => {
+    expect([...TREE_BINDINGS.constants]).toEqual(expect.arrayContaining(['ERR_TMUX_KILL_FAILED_NAME', 'ERR_TMUX_UNRESPONSIVE_NAME', 'ERR_TMUX_SESSION_CONFLICT_NAME']))
+    expect([...TREE_BINDINGS.collections]).toEqual(expect.arrayContaining(['PHASE1_ONLY_ERR_NAMES', 'REQUIRED_ERR_NAMES']))
+  })
+
+  test('every allowed stand-in declaration is declared in src/agent-director-errors.ts', () => {
+    const sf = parseSource(STAND_IN_FILE, BY_NAME_TREE.find(([file]) => file === STAND_IN_FILE)![1])
+    const declared: string[] = []
+    forEachNode(sf, (node) => {
+      if ((ts.isFunctionDeclaration(node) || ts.isVariableDeclaration(node)) && node.name !== undefined && ts.isIdentifier(node.name)) declared.push(node.name.text)
+    })
+    expect(declared).toEqual(expect.arrayContaining([...STAND_IN_DECLARATIONS]))
+  })
+
+  test.each(BY_NAME_PLANTED)('%s: one finding of its rule, naming the synthetic file', (what, source, rule) => {
+    const file = plantedFile(what)
+    expect(byNameFindings([[file, source]], TREE_BINDINGS).map(({ file: f, rule: r }) => ({ file: f, rule: r }))).toEqual([{ file, rule }])
+  })
+
+  test.each(BY_NAME_ALLOWED)('%s: no finding', (_what, file, source) => {
+    expect(byNameFindings([[file, source]], TREE_BINDINGS)).toEqual([])
   })
 })

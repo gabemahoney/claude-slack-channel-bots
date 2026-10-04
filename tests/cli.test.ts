@@ -199,7 +199,6 @@ import {
   AgentDirectorError,
   ERR_SCHEMA_MISMATCH_NAME,
   ERR_SPAWN_NOT_FOUND_NAME,
-  ERR_TMUX_SESSION_CONFLICT_NAME,
   ErrCallTimeout,
   STORE_OPEN_ERR_NAMES,
 } from '../src/agent-director-errors.ts'
@@ -2447,9 +2446,10 @@ describe('createDirectorOps', () => {
   }
 
   /**
-   * Every error an op meets, built by name. Only directorGet and directorStatus
-   * read a missing row (ErrSpawnNotFound, recognised by its name, never by the
-   * client's class) as no row; every other op, and every other error, rejects
+   * Every error an op meets. Only directorGet and directorStatus read a missing
+   * row (ErrSpawnNotFound, recognised by the client's class) as no row; a base
+   * AgentDirectorError merely named ErrSpawnNotFound is not that class and
+   * rejects like any other error. Every other op, and every other error, rejects
    * with the same value: the precheck classifies its get and read-pane errors
    * itself (b.jg5 SRJ-117, SRJ-901; ErrSpawnNotFound takes read-pane's GONE
    * column), the teardown's checked kill reads ErrSpawnNotFound as a success
@@ -2458,11 +2458,11 @@ describe('createDirectorOps', () => {
    */
   const OP_ERRORS: ReadonlyArray<readonly [string, () => unknown, missingRow: boolean]> = [
     ['ErrSpawnNotFound', () => errSpawnNotFound(), true],
-    ['ErrSpawnNotFound by name only (the base AgentDirectorError, as from a client with no class for it)', () => {
+    ['a base AgentDirectorError merely named ErrSpawnNotFound (not that class: no missing row)', () => {
       const err = errGeneric(PRECHECK_CALL_GET, ERR_SPAWN_NOT_FOUND_NAME, 'row gone')
       if (Object.getPrototypeOf(err) !== AgentDirectorError.prototype) throw new Error('precondition: no client subclass to match')
       return err
-    }, true],
+    }, false],
     ['a connection error', () => new Error('AD connection refused'), false],
     ['ErrCallTimeout', () => errCallTimeout(PRECHECK_CALL_GET), false],
     ['ErrTmuxSessionConflict', () => errTmuxSessionConflict(PRECHECK_CALL_READ_PANE, 'not-this-launch'), false],
@@ -3000,7 +3000,7 @@ describe('precheck before anything is stopped (b.jg5 SRJ-901, AC 74)', () => {
   })
 
   test.each(COMMANDS)('%s: a CONFLICT and an UNCLASSIFIED description carrying fake tokens render redacted; nothing printed leaks', async (command, make, run) => {
-    const conflict = errGeneric(PRECHECK_CALL_READ_PANE, ERR_TMUX_SESSION_CONFLICT_NAME, `session refused (${sentinelInMessage('conflict')})`)
+    const conflict = errTmuxSessionConflict(PRECHECK_CALL_READ_PANE, 'unrecognised', sentinelInMessage('conflict'))
     const unclassified = errGeneric(PRECHECK_CALL_READ_PANE, 'ErrNoHandlingInCscb', `refused (${sentinelInMessage('unclassified', APP_TOKEN_PREFIX)})`)
     const b = make({
       config: twoPersonas(),
@@ -3546,7 +3546,6 @@ const KILL_CLASS_ROWS: ReadonlyArray<readonly [string, () => KillCase]> = [
   ['kill_sent false (a success)', () => stops([cannedKillResult(false)], [1, 0])],
   ['no kill_sent from a binary older than Phase 1 (a plain success)', () => stops([cannedKillResult()], [1, 0])],
   ['ErrSpawnNotFound (a success: b.dnt\'s already-gone race)', () => stops([thrown(errSpawnNotFound())], [1, 0])],
-  ['ErrSpawnNotFound by name only (a success)', () => stops([thrown(errGeneric(KILL_VERB, ERR_SPAWN_NOT_FOUND_NAME, 'row gone'))], [1, 0])],
   // UNAVAILABLE: KILL_RETRY_TRIES kills, a read before each further one, then the persona fails (b.dnt: agent-director
   // dying mid-teardown fails it loudly).
   ...UNAVAILABLE_KILL_ANSWERS.map(([label, make]) => [`UNAVAILABLE (${label}) on every try`, (): KillCase => {
@@ -4328,7 +4327,7 @@ describe('after a failed teardown: stop --stop-bots stays stopped, clean_restart
   /** A CONFLICT at the pause whose description carries fake tokens: the failure line shows it redacted, the alert not at all. */
   const sentinelConflictAtPause = (): InjectedFailure => ({
     at: PAUSE_VERB,
-    error: errGeneric(PAUSE_VERB, ERR_TMUX_SESSION_CONFLICT_NAME, `session refused (${sentinelInMessage('not-restarted')})`),
+    error: errTmuxSessionConflict(PAUSE_VERB, 'unrecognised', sentinelInMessage('not-restarted')),
     errorClass: AD_ERROR_CLASS_CONFLICT,
   })
 

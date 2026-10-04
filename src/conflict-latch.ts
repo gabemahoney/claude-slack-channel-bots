@@ -750,7 +750,8 @@ function safeLog(log: (line: string) => void, line: string): void {
 /**
  * True when `value` classifies as UNUSABLE NAME (b.jg5 SRJ-104: an
  * `ErrInternal` whose description carries "the recorded tmux session name"),
- * decided by the classifier (`classifyAdError`, by name). For a site that
+ * decided by the classifier (`classifyAdError`, by the `ErrUnknownErrorName`
+ * class and its `unknownName`). For a site that
  * must branch before it knows the row state to record. Every other
  * `ErrInternal` is UNCLASSIFIED and answers false (SRJ-313). Pure; never
  * throws.

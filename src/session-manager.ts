@@ -102,7 +102,7 @@
  *      the launch answers as `retrying` once that error armed the retry
  *      timer: no notice, no `spawn-failed` entry, no `dead-session`
  *      verdict, and no further launch. An `ErrTmuxSessionCreate` (LAUNCH
- *      FAILURE, decided by name) at any spawn or resume the ladder makes is
+ *      FAILURE, decided by class) at any spawn or resume the ladder makes is
  *      one counted launch failure (b.jg5 SRJ-602, SRJ-111, SRJ-113): one
  *      line, the notice, a `spawn-failed` entry at start and `failed`;
  *      nothing is killed because of it and no spawn is made in its place,
@@ -330,7 +330,7 @@
  * second sequence), or the reuse spawn
  * (`reuseSpawnForPersona`, b.jg5
  * SRJ-112, SRJ-708: `buildSpawnParams` with the reuse flag, its outcomes
- * classified by name), whose collision ends the sequence without its launch;
+ * classified by class), whose collision ends the sequence without its launch;
  * the entry counts its launch's result once. Sequences run in the
  * server's one registry (`setLiveRowSequenceRegistry`, b.jg5 SRJ-706),
  * reached through the start entry (`startLiveRowSequence`) and the running
@@ -498,15 +498,15 @@ import {
 } from './outage-state.ts'
 import {
   AgentDirectorError,
+  ErrInstanceIdCollision,
+  ErrJsonlMissing,
+  ErrJsonlNeverWritten,
+  ErrNoSessionId,
   ErrSpawnCapReached,
-  ERR_INSTANCE_ID_COLLISION_NAME,
-  ERR_JSONL_MISSING_NAME,
-  ERR_JSONL_NEVER_WRITTEN_NAME,
-  ERR_NO_SESSION_ID_NAME,
-  ERR_SPAWN_CAP_REACHED_NAME,
+  ErrSpawnNotFound,
+  ErrSpawnNotInteractive,
+  ErrSpawnNotResumable,
   ERR_SPAWN_NOT_FOUND_NAME,
-  ERR_SPAWN_NOT_INTERACTIVE_NAME,
-  ERR_SPAWN_NOT_RESUMABLE_NAME,
 } from './agent-director-errors.ts'
 import {
   AD_ERROR_CLASS_CONFIG,
@@ -529,7 +529,7 @@ import {
   describeAdErrorClassification,
   describeAdFailureForLog,
   describeAgentDirectorFailure,
-  hasAdErrorName,
+  isAdErrorInstance,
   isInvalidFlagsError,
   isLaunchTimeoutError,
   LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT,
@@ -1333,7 +1333,7 @@ type LatchedSiteResult = { key: string; action: 'latched' }
  * b.jg5 SRJ-105, SRJ-311, SRJ-313, SRJ-316: the one handling of a refusal at
  * the launch and recovery sites. `err` was thrown by an agent-director call
  * made with `verb` for persona `key`. It is a refusal when the arming
- * predicate (`unavailableRetryCauseFor`, which classifies by name through
+ * predicate (`unavailableRetryCauseFor`, which classifies by class through
  * `src/ad-error-class.ts`) answers a cause for it: UNAVAILABLE from any verb
  * (`ErrTmuxKillFailed` included), ENVIRONMENT (`ErrTmuxNotAvailable`) from
  * any verb (`kill` included: nothing is killed, deleted or respawned because
@@ -1675,7 +1675,7 @@ const LATCH_TIME_READ_LATCHED_ELSEWHERE =
  * b.jg5 SRJ-105, SRJ-501, SRJ-111, SRJ-113: the CONFLICT row of the ladder's
  * refusal handling, at every spawn and `resume` the collision ladder makes
  * and at the reuse spawn (SRJ-112). `err` was thrown by that call for persona `key`. It is the row's only when
- * the classifier (`classifyAdError`, by name) answers CONFLICT
+ * the classifier (`classifyAdError`, by class) answers CONFLICT
  * (`ErrTmuxSessionConflict`); for any other value it answers `undefined`
  * and the site goes on as before.
  *
@@ -1806,7 +1806,7 @@ function logUnusableName(site: string, what: string, ref: string, err: unknown, 
  * (its reuse spawns included) and at a kill of the restart path or the
  * live-row sequence (`latchOnKillOutcomeAt`). `err` was thrown
  * by that call for persona `key`. It is the row's only when
- * `isUnusableNameError` (the classifier, by name) answers true; for any
+ * `isUnusableNameError` (the classifier) answers true; for any
  * other value it answers `undefined` and the site goes on as before (every
  * other `ErrInternal` is UNCLASSIFIED, SRJ-313).
  *
@@ -2134,7 +2134,7 @@ function pendingOldLifeHoldEndStop(instanceId: string): Promise<boolean> | undef
 
 /** A read of a row gave its state (and, from a `get` or a `list` row, its `cwd`). */
 export const OLD_LIFE_ROW_READ_STATE = 'state'
-/** A read of a row found no row (`ErrSpawnNotFound`, by name). */
+/** A read of a row found no row (`ErrSpawnNotFound`, by class). */
 export const OLD_LIFE_ROW_READ_NO_ROW = 'no-row'
 /** A completed `find-missing` run listed the row in its `ids`. */
 export const OLD_LIFE_ROW_READ_FIND_MISSING_IDS = 'find-missing-ids'
@@ -2198,13 +2198,13 @@ function oldLifeReadName(at: OwnRowReadSite): string {
 /**
  * One `status` answer from persona `key`'s own row, given to the old-life
  * read entry (`noteOldLifeRowRead`, b.jg5 SRJ-809): a returned result's
- * state, or no row for a thrown `ErrSpawnNotFound` (by name); any other
+ * state, or no row for a thrown `ErrSpawnNotFound` (by class); any other
  * thrown value read nothing and is not given. A `status` result carries no
  * `cwd`. Never throws.
  */
 function noteOldLifeStatusAnswer(key: string, answer: OwnRowStatusAnswer, at: OwnRowReadSite): void {
   if ('thrown' in answer) {
-    if (hasAdErrorName(answer.thrown, ERR_SPAWN_NOT_FOUND_NAME)) {
+    if (isAdErrorInstance(answer.thrown, ErrSpawnNotFound)) {
       noteOldLifeRowRead(personaInstanceId(key), { kind: OLD_LIFE_ROW_READ_NO_ROW }, oldLifeReadName(at))
     }
     return
@@ -2648,7 +2648,7 @@ function endKillFailureEpisode(key: string, reason: KillFailureEndReason): void 
  */
 function endKillFailureEpisodeOnRead(key: string, answer: { readonly state: unknown } | { readonly thrown: unknown }): void {
   if ('thrown' in answer) {
-    if (hasAdErrorName(answer.thrown, ERR_SPAWN_NOT_FOUND_NAME)) endKillFailureEpisode(key, KILL_FAILURE_END_ROW_GONE)
+    if (isAdErrorInstance(answer.thrown, ErrSpawnNotFound)) endKillFailureEpisode(key, KILL_FAILURE_END_ROW_GONE)
     return
   }
   if (typeof answer.state === 'string' && AGENT_DIRECTOR_DEAD_STATES.has(answer.state)) {
@@ -2780,7 +2780,7 @@ function ownRowActGoes(key: string, at: OwnRowReadSite): boolean {
  *     (`conflictAt`). Every other note, an unknown note, no note, a `pending`
  *     row with a launch start, or either on a row that is not a configured
  *     persona's own changes nothing (C14, C24; b.jg5 SRJ-408);
- *   - `absent` for `ErrSpawnNotFound` (recognised by name);
+ *   - `absent` for `ErrSpawnNotFound` (recognised by class);
  *   - `latched` for an UNUSABLE NAME answer (b.jg5 SRJ-105, SRJ-512): the
  *     persona latches with the case "unusable recorded name", the refused
  *     operation "none" and the state unreadable, since this read, the
@@ -2850,9 +2850,9 @@ export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promis
   } catch (err) {
     // b.jg5 SRJ-714: an answer that settles after the caller stopped is not acted on.
     if (!ownRowActGoes(key, at)) {
-      return hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME) ? { kind: OWN_ROW_READ_ABSENT } : { kind: OWN_ROW_READ_REFUSED, error: err }
+      return isAdErrorInstance(err, ErrSpawnNotFound) ? { kind: OWN_ROW_READ_ABSENT } : { kind: OWN_ROW_READ_REFUSED, error: err }
     }
-    if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) {
+    if (isAdErrorInstance(err, ErrSpawnNotFound)) {
       // b.jg5 SRJ-704, SRJ-1016: the row is gone; the kill-failure episode ends.
       endKillFailureEpisodeOnRead(key, { thrown: err })
       // b.jg5 SRJ-809: no row ends an old-life hold on it.
@@ -3169,7 +3169,7 @@ export function applyOwnRowStatusStep(key: string, answer: OwnRowStatusAnswer, a
     noteOldLifeStatusAnswer(key, answer, at)
     if ('thrown' in answer) {
       // b.jg5 SRJ-310 rule 3: no row is no longer this launch's row.
-      if (hasAdErrorName(answer.thrown, ERR_SPAWN_NOT_FOUND_NAME)) checkThisLaunchRowOnRead(key, THIS_LAUNCH_ROW_READ_ABSENT, false, at)
+      if (isAdErrorInstance(answer.thrown, ErrSpawnNotFound)) checkThisLaunchRowOnRead(key, THIS_LAUNCH_ROW_READ_ABSENT, false, at)
       return latchOnUnusableNameRead(key, answer.thrown, at)
     }
     const row = { ...answer.result, claude_instance_id: personaInstanceId(key) }
@@ -3232,7 +3232,7 @@ export type OwnRowStatusRead =
  *     caller calls nothing more for the persona (b.jg5 SRJ-502);
  *   - `state`, with the raw launch start a `pending` result shows
  *     (`pendingLaunchStartOf`; absent when not shown);
- *   - `absent` for `ErrSpawnNotFound` (recognised by name);
+ *   - `absent` for `ErrSpawnNotFound` (recognised by class);
  *   - `refused` for any other error, carried unchanged for the site's own
  *     handling (`refusalAt`, b.jg5 SRJ-105, or its own rule).
  *
@@ -3251,7 +3251,7 @@ export async function readPersonaOwnRowStatus(key: string, at: OwnRowReadSite): 
     )
   } catch (err) {
     if (applyOwnRowStatusStep(key, { thrown: err }, at)) return { kind: OWN_ROW_STATUS_LATCHED, rowState: LATCH_ROW_STATE_UNREADABLE }
-    return hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)
+    return isAdErrorInstance(err, ErrSpawnNotFound)
       ? { kind: OWN_ROW_STATUS_ABSENT }
       : { kind: OWN_ROW_STATUS_REFUSED, error: err }
   }
@@ -3737,15 +3737,15 @@ export const SPAWN_FAILURE_DEFAULT_REMEDIATION = 'Check server.log for details.'
 
 /**
  * The remediation line of a spawn-failure notice (`notifySpawnFailure`),
- * decided by the error's name (`hasAdErrorName`, `src/ad-error-class.ts`;
- * b.jg5 SRJ-101 interim rule), never by `instanceof`: `ErrSpawnNotFound`,
+ * decided by the error's class (`isAdErrorInstance`, `src/ad-error-class.ts`),
+ * never by its name: `ErrSpawnNotFound`,
  * CSCB's own `ErrSpawnCapReached` (`notifyRestartCapReached`), and any other
  * error. A collision (`ErrInstanceIdCollision`) has no hint: it never reaches
  * the notice, and no post calls it a fault (b.jg5 SRJ-713).
  */
 function remediationHint(error: AgentDirectorError): string {
-  if (hasAdErrorName(error, ERR_SPAWN_NOT_FOUND_NAME)) return SPAWN_NOT_FOUND_REMEDIATION
-  if (hasAdErrorName(error, ERR_SPAWN_CAP_REACHED_NAME)) return SPAWN_CAP_REACHED_REMEDIATION
+  if (isAdErrorInstance(error, ErrSpawnNotFound)) return SPAWN_NOT_FOUND_REMEDIATION
+  if (isAdErrorInstance(error, ErrSpawnCapReached)) return SPAWN_CAP_REACHED_REMEDIATION
   return SPAWN_FAILURE_DEFAULT_REMEDIATION
 }
 
@@ -3967,9 +3967,9 @@ export async function reconnectMcp(
  * `sendKeys` through `withOutageDetection`, declaring the `send-keys` verb
  * (tmux-touching), with the library appending Enter. It never retries, never
  * starts a tmux server and makes no tmux call of its own (b.jg5 SRJ-609, HO
- * C20). Each answer is decided by class and name through
- * `src/ad-error-class.ts`, never by `instanceof` (b.jg5 SRJ-118's reconnect
- * row):
+ * C20). Each answer is decided by class through `src/ad-error-class.ts`
+ * (`classifyAdError`, `isAdErrorInstance`), never by an error's name (b.jg5
+ * SRJ-118's reconnect row):
  *
  *   - a persona already latched (`personaLatchedNow`, b.jg5 SRJ-502): no
  *     `send-keys`; `transient` (latched);
@@ -4071,7 +4071,7 @@ export async function reconnectMcpWithCause(
 
 /**
  * `reconnectMcpWithCause`'s answer to a refused `send-keys` (`err`), by
- * class and name (b.jg5 SRJ-118's reconnect row; see `reconnectMcpWithCause`
+ * class (b.jg5 SRJ-118's reconnect row; see `reconnectMcpWithCause`
  * for the table). Logs its one line. Never throws.
  */
 async function reconnectAnswerTo(key: string, lastRead: LatchRowState, ref: string, err: unknown): Promise<ReconnectResult> {
@@ -4083,11 +4083,11 @@ async function reconnectAnswerTo(key: string, lastRead: LatchRowState, ref: stri
     console.error(reconnectGoneLine(ref, failure))
     return { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_TMUX_GONE }
   }
-  if (hasAdErrorName(err, ERR_SPAWN_NOT_INTERACTIVE_NAME)) {
+  if (isAdErrorInstance(err, ErrSpawnNotInteractive)) {
     console.error(reconnectNotInteractiveLine(ref, failure))
     return { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE }
   }
-  if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) {
+  if (isAdErrorInstance(err, ErrSpawnNotFound)) {
     console.error(reconnectRowAbsentLine(ref, failure))
     return { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_ABSENT }
   }
@@ -4936,7 +4936,7 @@ function approverStopOrLatched(ctx: ApproverContext): ApproverStopReason | undef
  *     `send-keys` with an empty text and `allow_pending`, which presses
  *     Enter.
  *
- * Each refused call is classified by class and name through
+ * Each refused call is classified by class through
  * `src/ad-error-class.ts` (b.jg5 SRJ-117, SRJ-118, SRJ-404), with one line:
  *
  *   - GONE, or `ErrSpawnNotFound` from `read-pane` or `send-keys`: stop
@@ -5234,7 +5234,7 @@ async function approverLap(ctx: ApproverContext): Promise<ApproverStopReason | A
     // b.jg5 SRJ-118, SRJ-412, SRJ-1017: a `send-keys` that answered
     // `ErrSpawnNotInteractive` makes this launch (the launch start the first
     // lap kept) no longer CSCB's own, whatever stops the approver.
-    if (hasAdErrorName(err, ERR_SPAWN_NOT_INTERACTIVE_NAME)) recordSendKeysNotInteractive(key, run.launchStartMs)
+    if (isAdErrorInstance(err, ErrSpawnNotInteractive)) recordSendKeysNotInteractive(key, run.launchStartMs)
     if (run.stopRequested !== undefined) return approverStoppedDuringCall(ctx, 'send-keys', err, run.stopRequested)
     const answer = approverAnswerTo(ctx, 'send-keys', err)
     return 'stop' in answer ? answer.stop : { ...goesOn, backOff: answer.backOff }
@@ -5245,8 +5245,8 @@ async function approverLap(ctx: ApproverContext): Promise<ApproverStopReason | A
 
 /**
  * The approver's one classification of a refused call (b.jg5 SRJ-117,
- * SRJ-118, SRJ-404), by class and name through `src/ad-error-class.ts`
- * (never `instanceof`), with one line from an exported builder carrying the
+ * SRJ-118, SRJ-404), by class through `src/ad-error-class.ts` (never by an
+ * error's name), with one line from an exported builder carrying the
  * persona reference and the redacted description: see
  * `approvePreSessionDialogs` for the table. A `status` read's
  * `ErrSpawnNotFound` and UNUSABLE NAME answers never reach here (the shared
@@ -5257,11 +5257,11 @@ function approverAnswerTo(ctx: ApproverContext, verb: ApproverVerb, err: unknown
   const { errorClass } = classifyAdError(err)
   // The reported name, as the launch sites' refusal lines give it (b.jg5 SRJ-104).
   const failure = describeAdFailureForLog(err)
-  if (errorClass === AD_ERROR_CLASS_GONE || (verb !== 'status' && hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME))) {
+  if (errorClass === AD_ERROR_CLASS_GONE || (verb !== 'status' && isAdErrorInstance(err, ErrSpawnNotFound))) {
     console.error(approverLogLine(approverGoneMessage(ref, verb, failure)))
     return { stop: APPROVER_STOP_GONE }
   }
-  if (hasAdErrorName(err, ERR_SPAWN_NOT_INTERACTIVE_NAME)) {
+  if (isAdErrorInstance(err, ErrSpawnNotInteractive)) {
     console.error(approverLogLine(approverNotInteractiveMessage(ref, verb, failure)))
     return { stop: APPROVER_STOP_NOT_INTERACTIVE }
   }
@@ -8058,7 +8058,7 @@ async function reconcileAndReadRowState(
  * no other call. Answers the row's `state` as agent-director reports it
  * (`pending`, `waiting`, `ended`, `missing` …), or
  * `UNAVAILABLE_RETRY_ROW_ABSENT` when there is no row (`ErrSpawnNotFound`,
- * recognised by name). On a `pending` row it also answers the launch start
+ * recognised by class). On a `pending` row it also answers the launch start
  * the result shows (`launchStartedAt`, raw, `pendingLaunchStartOf`; absent
  * when not shown, and never answered for another state). A read that
  * latched the persona answers the state as the latch recorded it: an
@@ -9232,7 +9232,7 @@ export async function killPersonaInstance(key: string, options: KillPersonaInsta
 /**
  * The `ErrInvalidFlags` step at a kill (b.jg5 SRJ-104, SRJ-204): every kill
  * site gives `ErrInvalidFlags` no meaning, so a non-success whose thrown
- * value is an `ErrInvalidFlags` (by name) gets exactly one immediate version
+ * value is an `ErrInvalidFlags` (by class) gets exactly one immediate version
  * re-check (`classifyWithInvalidFlagsRecheck`; a stop it decides ends the
  * process as the re-check defines) and is answered with the re-check's
  * answer kind as its `recheck`; it stays UNCLASSIFIED. Every other outcome is
@@ -9572,7 +9572,7 @@ async function readPersonaKillRow(key: string, site: string, ref: string): Promi
 
 /**
  * One CONFLICT or UNUSABLE NAME answer the persona teardown's kill met (b.jg5
- * SRJ-715, SRJ-1002, SRJ-1003): where, its class (by name, through
+ * SRJ-715, SRJ-1002, SRJ-1003): where, its class (through
  * `src/ad-error-class.ts`) and the thrown value, raw, for the teardown's own
  * routing. Nothing latched on it. The shape is `KillRefusal`
  * (`src/checked-kill.ts`), whose notice builder the teardown uses.
@@ -9601,7 +9601,7 @@ export interface PersonaTeardownKillOptions {
 /** The line head of the persona teardown kill's tries and reads. */
 const TEARDOWN_KILL_LOG_PREFIX = '[slack] persona teardown kill'
 
-/** `err`'s class when it is CONFLICT or UNUSABLE NAME (by name), else undefined. Never throws. */
+/** `err`'s class when it is CONFLICT or UNUSABLE NAME (by class), else undefined. Never throws. */
 function teardownRefusalClassOf(err: unknown): PersonaTeardownKillRefusal['errorClass'] | undefined {
   try {
     const { errorClass } = classifyAdError(err)
@@ -9737,7 +9737,7 @@ export const TEARDOWN_KILL_STATUS_SITE: OwnRowReadSite = Object.freeze({ site: '
  * with the store's one line naming `TEARDOWN_KILL_STATUS_SITE`. A read of
  * `ended` or `missing`, or no row, ends the old-life hold on `cscb_<key>`
  * (`noteOldLifeRowRead`; b.jg5 SRJ-809). Its state, no row for
- * `ErrSpawnNotFound` (by name), or a failed read; what it answers is the same
+ * `ErrSpawnNotFound` (by class), or a failed read; what it answers is the same
  * whatever the clear or the hold's end did. Never throws.
  */
 async function readTeardownKillRow(key: string): Promise<KillRetryRead> {
@@ -9760,7 +9760,7 @@ async function readTeardownKillRow(key: string): Promise<KillRetryRead> {
     noteOldLifeRowRead(personaInstanceId(key), { kind: OLD_LIFE_ROW_READ_STATE, state: result.state }, oldLifeReadName(TEARDOWN_KILL_STATUS_SITE))
     return { kind: KILL_RETRY_READ_STATE, state: result.state }
   } catch (err) {
-    if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) {
+    if (isAdErrorInstance(err, ErrSpawnNotFound)) {
       // b.jg5 SRJ-809: no row ends the key's old-life hold.
       noteOldLifeRowRead(personaInstanceId(key), { kind: OLD_LIFE_ROW_READ_NO_ROW }, oldLifeReadName(TEARDOWN_KILL_STATUS_SITE))
       return { kind: KILL_RETRY_READ_NO_ROW }
@@ -9846,7 +9846,7 @@ async function latchOnKillOutcomeAt(
 const LAUNCH_FAILURE_LINE_TAIL = ' — a counted launch failure; nothing is killed and no spawn is made in its place (b.jg5 SRJ-602)'
 
 /**
- * Whether `err` is a LAUNCH FAILURE (`ErrTmuxSessionCreate`), decided by name
+ * Whether `err` is a LAUNCH FAILURE (`ErrTmuxSessionCreate`), decided by class
  * (`classifyAdError`): a launch whose session-creating call failed, after
  * "duplicate session" (the new row ended, unless the end write was not
  * applied) or otherwise (a fresh spawn's row left `pending`, never CSCB's
@@ -9934,7 +9934,7 @@ async function invalidFlagsUnclassifiedAt(
  * collision, with no further launch in the attempt:
  *   - `ErrInvalidFlags`: one immediate version re-check, then UNCLASSIFIED
  *     (`invalidFlagsUnclassifiedAt`, SRJ-204, SRJ-313);
- *   - DIRECTORY (`ErrCwdNotFound`, `ErrCwdNotADirectory`, by name): `failed`
+ *   - DIRECTORY (`ErrCwdNotFound`, `ErrCwdNotADirectory`, by class): `failed`
  *     quietly (the spawn's wrapper raised `cwd-unreachable`);
  *   - the refusal handling (`launchRefusalAt`): a CONFLICT, the pre-spawn
  *     scan's refusal (no row written) or one after "duplicate session" (the
@@ -10036,7 +10036,7 @@ export interface PlainSpawnSite<R> {
 /**
  * The one plain-spawn outcome handler (b.jg5 SRJ-111): one plain spawn of
  * persona `site.persona`'s `cscb_<key>` from `site.params`, its outcome
- * decided by name or class (`src/ad-error-class.ts`), never by `instanceof`.
+ * decided by class (`src/ad-error-class.ts`), never by an error's name.
  * Used at every plain-spawn site: the collision ladder's first spawn, its
  * retry spawn after the collision `get` answered `ErrSpawnNotFound`, and the
  * spawn after `resume`'s `ErrSpawnNotFound` at both `resume` sites
@@ -10060,7 +10060,7 @@ export interface PlainSpawnSite<R> {
  *     (`afterLaunchSucceeded`: the dialog approver on the persona's `pending`
  *     row, the pending-only arm of its retry timer, the `pre_trust` line;
  *     SRJ-401, SRJ-301, SRJ-413), and `spawned`;
- *   - `ErrInstanceIdCollision` (by name): nothing was launched, so the
+ *   - `ErrInstanceIdCollision` (by class): nothing was launched, so the
  *     reply-guard steps are undone (restored while still the step's own),
  *     and the site's collision row (`site.collided`) answers: nothing is
  *     counted, and no spawn-failure notice is posted (SRJ-713);
@@ -10083,7 +10083,7 @@ export async function plainSpawnOutcomeAt<R>(site: PlainSpawnSite<R>): Promise<S
   try {
     launched = await launchCallWithWindow(key, persona.working_directory, 'spawn', (client) => client.spawn(params))
   } catch (err) {
-    if (hasAdErrorName(err, ERR_INSTANCE_ID_COLLISION_NAME)) {
+    if (isAdErrorInstance(err, ErrInstanceIdCollision)) {
       // b.av2 SR-9.4: a collision means an instance already exists, so this
       // spawn's reply-guard steps are undone; any later launch runs them again.
       undoPreLaunchReplyGuard(replyGuardUndo, ref)
@@ -10522,16 +10522,16 @@ function reportInconclusiveDiagnosis(
 // The no-transcript step (b.jg5 SRJ-707, SRJ-712)
 // ---------------------------------------------------------------------------
 
-/** `resume`'s no-transcript answers, which go on to a reuse spawn of the same id (b.jg5 SRJ-707, SRJ-113, SRJ-705), by name. */
-const NO_TRANSCRIPT_RESUME_ERR_NAMES = [ERR_NO_SESSION_ID_NAME, ERR_JSONL_MISSING_NAME, ERR_JSONL_NEVER_WRITTEN_NAME] as const
+/** `resume`'s no-transcript answers, which go on to a reuse spawn of the same id (b.jg5 SRJ-707, SRJ-113, SRJ-705), by class. */
+const NO_TRANSCRIPT_RESUME_ERROR_CLASSES = [ErrNoSessionId, ErrJsonlMissing, ErrJsonlNeverWritten] as const
 
 /**
  * Whether `err` is one of `resume`'s no-transcript answers (`ErrNoSessionId`,
- * `ErrJsonlMissing`, `ErrJsonlNeverWritten`). The answer is decided by name
- * (`hasAdErrorName`); the `instanceof` check only narrows the type.
+ * `ErrJsonlMissing`, `ErrJsonlNeverWritten`), decided by class
+ * (`isAdErrorInstance`, `src/ad-error-class.ts`).
  */
 function isNoTranscriptResumeError(err: unknown): err is AgentDirectorError {
-  return err instanceof AgentDirectorError && NO_TRANSCRIPT_RESUME_ERR_NAMES.some((name) => hasAdErrorName(err, name))
+  return NO_TRANSCRIPT_RESUME_ERROR_CLASSES.some((errorClass) => isAdErrorInstance(err, errorClass))
 }
 
 /** What the no-transcript step is told by its caller. */
@@ -10549,7 +10549,7 @@ interface NoTranscriptReuseOptions {
 /**
  * The no-transcript step (b.jg5 SRJ-707, SRJ-712, SRJ-113): what follows a
  * `resume` of persona `persona`'s id that answered `ErrNoSessionId`,
- * `ErrJsonlNeverWritten` or `ErrJsonlMissing` (`err`, by name;
+ * `ErrJsonlNeverWritten` or `ErrJsonlMissing` (`err`, by class;
  * `isNoTranscriptResumeError`). The collision ladder (`resumeOrFreshSpawn`)
  * and the live-row sequence's launch entry's `resume` leg
  * (`sequenceLaunchCall`) both use it. The row `resume` refused for these
@@ -10586,7 +10586,7 @@ async function noTranscriptReuse(
   let diagnosis: JsonlDiagnosis | undefined
   // b.jg5 SRJ-501: the diagnosis `get`, when made, is the last read before the reuse.
   const diagnosisRead: { lastRead?: LatchRowState } = {}
-  if (hasAdErrorName(err, ERR_JSONL_MISSING_NAME)) {
+  if (isAdErrorInstance(err, ErrJsonlMissing)) {
     const diagnosed = await diagnoseJsonlMissing(persona, config, err, options.isStartup, diagnosisRead)
     if ('action' in diagnosed) return diagnosed
     diagnosis = diagnosed
@@ -11027,7 +11027,7 @@ function plainSpawnCollisionAtLadder(run: LadderRun, what: string): Promise<Spaw
  * outcomes follow b.jg5 SRJ-113's table through the one `resume` outcome
  * handler that both `resume` sites use (`resumeAtSite`; the other site is
  * the live-row sequence's launch entry, `launchForLiveRowSequence`), each
- * outcome decided by name or class (`src/ad-error-class.ts`), row by row:
+ * outcome decided by class (`src/ad-error-class.ts`), row by row:
  *   - success: `resumed`, then the after-launch step (`afterLaunchSucceeded`);
  *   - ErrNoSessionId / ErrJsonlMissing / ErrJsonlNeverWritten → the
  *     no-transcript step (`noTranscriptReuse`, b.jg5 SRJ-707, SRJ-712):
@@ -11480,7 +11480,7 @@ interface ResumeSite<R> {
  * `resume` leg (`launchForLiveRowSequence`). One `resume` of persona
  * `site.persona`'s `cscb_<key>` through the ladder's launch helper
  * (`launchWithReplyGuard`: the reply guard, spawn detection, arming by
- * class), its outcome decided by name or class, never by `instanceof`:
+ * class), its outcome decided by class, never by an error's name:
  *   - success: one line, the after-launch step (`afterLaunchSucceeded`: the
  *     `pre_trust` line and the dialog approver on the row, which reads
  *     `pending` until its session reports in, b.jg5 SRJ-402), `resumed`;
@@ -11532,8 +11532,8 @@ async function resumeAtSite<R>(site: ResumeSite<R>): Promise<SpawnPersonaResult 
     // spawn after ErrSpawnNotFound, a counted failure) is handled.
     if (isDefiniteLaunchAnswer(err, 'resume')) clearLatchBeforeOutcome(key)
     if (isNoTranscriptResumeError(err)) return site.noTranscript(err)
-    if (hasAdErrorName(err, ERR_SPAWN_NOT_RESUMABLE_NAME)) return site.notResumable(err)
-    if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) {
+    if (isAdErrorInstance(err, ErrSpawnNotResumable)) return site.notResumable(err)
+    if (isAdErrorInstance(err, ErrSpawnNotFound)) {
       site.resumeNotFound?.()
       return plainSpawnAfterResumeNotFound(site)
     }
@@ -12420,7 +12420,7 @@ export interface StuckLaunchAbortKillOptions {
  *     non-success; for tries SRJ-702's stop rule stopped, neither version,
  *     only its one line (and, for P removed during the tries, its
  *     `persona-kill-failed` entry with no alert text).
- * Answers, by class and name (`src/ad-error-class.ts`):
+ * Answers, by class (`src/ad-error-class.ts`):
  *   - succeeded, with `kill_sent` from agent-director's result (any success
  *     form: `kill_sent` true or false, the row or the session gone, the row
  *     read finished between tries);
@@ -13013,12 +13013,12 @@ function resumeCollisionAt(key: string, ref: string, err: unknown): SpawnPersona
  * (`invalidFlagsUnclassifiedAt`: a stop it decides answers `failed` marked
  * `stopping`; otherwise UNCLASSIFIED through the site entry, b.jg5 SRJ-104,
  * SRJ-313); the
- * DIRECTORY errors (`ErrCwdNotFound`, `ErrCwdNotADirectory`, by name) answer
+ * DIRECTORY errors (`ErrCwdNotFound`, `ErrCwdNotADirectory`, by class) answer
  * `failed` quietly (the wrapper raised `cwd-unreachable`); then the refusal handling
  * (`launchRefusalAt`: a CONFLICT latches with the refused operation
  * "resume" and `lastRead`, an UNUSABLE NAME latches, a refusal answers
  * `failed`); any other error answers `failed` with one line and the
- * spawn-failure notice. An `ErrTmuxSessionCreate` (LAUNCH FAILURE, by name)
+ * spawn-failure notice. An `ErrTmuxSessionCreate` (LAUNCH FAILURE, by class)
  * among those is one counted launch failure (b.jg5 SRJ-113, SRJ-602): one
  * line, the notice, a `spawn-failed` entry at start, and
  * `launchFailureResult`'s answer: nothing is killed, no spawn is made in its
@@ -13026,7 +13026,7 @@ function resumeCollisionAt(key: string, ref: string, err: unknown): SpawnPersona
  * mode, since agent-director's restore of the row may not have applied (HO
  * rev 28), so the retry's read of the row decides (SRJ-301, SRJ-409); the
  * result is marked `countedClass`, and `pendingOnlyArmed` when it armed.
- * An `ErrInstanceIdCollision` (by name) never reaches the notice: it takes
+ * An `ErrInstanceIdCollision` (by class) never reaches the notice: it takes
  * `resumeCollisionAt` first (b.jg5 SRJ-713).
  * Never throws.
  */
@@ -13039,7 +13039,7 @@ async function resumeFailedAt(
 ): Promise<SpawnPersonaResult> {
   const { key } = persona
   // b.jg5 SRJ-713: a collision never reaches the spawn-failure notice.
-  if (hasAdErrorName(err, ERR_INSTANCE_ID_COLLISION_NAME)) return resumeCollisionAt(key, ref, err)
+  if (isAdErrorInstance(err, ErrInstanceIdCollision)) return resumeCollisionAt(key, ref, err)
   // b.jg5 SRJ-104: the resume site gives ErrInvalidFlags no meaning: one
   // immediate version re-check, then UNCLASSIFIED (SRJ-105, SRJ-313).
   if (isInvalidFlagsError(err)) return invalidFlagsUnclassifiedAt(key, err, 'resume', 'resume', ref)
@@ -13684,7 +13684,7 @@ async function launchCallWithWindow<T>(
     result = await withSpawnDetection(key, workingDirectory, verb, call)
   } catch (err) {
     if (isLaunchTimeoutError(err, verb)) endLaunchCallWindow(key, started, LAUNCH_CALL_END_LAUNCH_TIMEOUT)
-    if (hasAdErrorName(err, ERR_INSTANCE_ID_COLLISION_NAME)) restoreLaunchRecords(key, started, keptThisLaunchRow, keptOwnLaunch)
+    if (isAdErrorInstance(err, ErrInstanceIdCollision)) restoreLaunchRecords(key, started, keptThisLaunchRow, keptOwnLaunch)
     throw err
   }
   endLaunchCallWindow(key, started, LAUNCH_CALL_END_RETURNED)
@@ -13693,7 +13693,7 @@ async function launchCallWithWindow<T>(
 
 /**
  * After persona `key`'s launch call whose window is `started` answered
- * `ErrInstanceIdCollision` (by name), which created no row and started no
+ * `ErrInstanceIdCollision` (by class), which created no row and started no
  * launch (b.jg5 SRJ-112, SRJ-713), put back the "this launch's row" record
  * and the record of CSCB's own launch (b.jg5 SRJ-407, SRJ-412) the call set
  * aside at its start, so an earlier launch's records survive a call that
@@ -14474,7 +14474,7 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *    at a plain spawn, any error but a LAUNCH FAILURE (SRJ-111: a collision
  *    is get-then-act, and `ErrInvalidFlags` and the names a plain spawn
  *    gives no meaning are UNCLASSIFIED). An
- *    `ErrTmuxSessionCreate` (LAUNCH FAILURE, by name) at any of them is one
+ *    `ErrTmuxSessionCreate` (LAUNCH FAILURE, by class) at any of them is one
  *    counted launch failure (b.jg5 SRJ-602; `plainSpawnFailedAt`,
  *    `resumeFailedAt`): the notice, a `spawn-failed` entry at start, and
  *    `failed` marked `countedClass`; nothing is killed because of it, no
@@ -14750,7 +14750,7 @@ function runPersonaLadder(
   // "duplicate session" ended the new row unless agent-director's end write
   // was not applied; nothing of the row was read before this first spawn,
   // so the latch-time `status` read gives its state. An
-  // `ErrTmuxSessionCreate` (by name) is one counted launch failure: nothing
+  // `ErrTmuxSessionCreate` (by class) is one counted launch failure: nothing
   // is killed and no spawn is made in its place, and the persona's retry
   // timer is armed at once in pending-only mode. Its `pending` row is never
   // CSCB's own launch, so the retries wait it out through the pending-row
@@ -15220,6 +15220,11 @@ export async function reuseSpawnForPersona(
   }
   const configDirLabel = configDirLabelValue(configDir.realPath, spawnHomeDir())
   // b.jg5 SRJ-708: one derivation of the parameters; only the flag is added.
+  // The Phase 1 client emits `--reuse-finished` for `reuse_finished: true`
+  // (its spawn flag builder, `pkg/ts-bun-client/src/internal/argv.ts` at
+  // agent-director `d787cb4`); the 0.10.0 client drops the field. Once
+  // the package pins the Phase 1 client, its own `SpawnParams` replaces
+  // `Phase1SpawnParams`.
   const params: Phase1SpawnParams = { ...buildSpawnParams(persona, config, configDirLabel), reuse_finished: true }
   // b.av2 SR-6.2: the trust patch precedes every launch, once per attempt.
   if (options.trustPatchRan !== true) runPreLaunchTrustPatch(persona, ref)
@@ -15234,7 +15239,7 @@ export async function reuseSpawnForPersona(
   try {
     launched = await launchCallWithWindow(key, persona.working_directory, 'spawn', (client) => client.spawn(params))
   } catch (err) {
-    if (options.firstLaunch === true && hasAdErrorName(err, ERR_INSTANCE_ID_COLLISION_NAME)) undoPreLaunchReplyGuard(replyGuardUndo, ref)
+    if (options.firstLaunch === true && isAdErrorInstance(err, ErrInstanceIdCollision)) undoPreLaunchReplyGuard(replyGuardUndo, ref)
     // b.jg5 SRJ-506: a latch re-check's retry whose answer is definite clears
     // the latch before the answer's class handling.
     if (isDefiniteLaunchAnswer(err, 'spawn')) clearLatchBeforeOutcome(key)
@@ -15261,7 +15266,7 @@ export async function reuseSpawnForPersona(
 
 /**
  * SRJ-112's outcome table for a value the reuse spawn's call threw (b.jg5
- * SRJ-112, SRJ-709, SRJ-105), classified by name (`src/ad-error-class.ts`),
+ * SRJ-112, SRJ-709, SRJ-105), classified by class (`src/ad-error-class.ts`),
  * with the refused operation "reuse spawn" and `lastRead` as the recorded
  * row state of a latch (nothing read, at a retired key's first launch: the
  * one latch-time `status` read, SRJ-501):
@@ -15320,7 +15325,7 @@ async function reuseSpawnFailedAt(
   retiredAtStart: RetiredKeyAttemptStart,
 ): Promise<ReuseSpawnResult> {
   const { key } = persona
-  if (hasAdErrorName(err, ERR_INSTANCE_ID_COLLISION_NAME)) {
+  if (isAdErrorInstance(err, ErrInstanceIdCollision)) {
     console.error(
       `[slack] ${REUSE_SPAWN_SITE}: ${describeAgentDirectorFailure(err)} on the ${REUSE_SPAWN_WHAT} of ${ref} — its row is live, so nothing was launched; no spawn-failure notice, nothing counted (b.jg5 SRJ-112)`,
     )
@@ -15346,7 +15351,7 @@ async function reuseSpawnFailedAt(
       : refused
   }
   const { errorClass } = classifyAdError(err)
-  // The class is decided by name above; the `instanceof` check only narrows
+  // The class is decided by the classifier above; the `instanceof` check only narrows
   // the type for the describer and the notice.
   if (errorClass === AD_ERROR_CLASS_LAUNCH_FAILURE && err instanceof AgentDirectorError) {
     const described = describeAgentDirectorFailure(err)
@@ -16095,7 +16100,7 @@ export type LiveRowSequenceLaunchEntryResult = SpawnPersonaResult | LiveRowSeque
  *     `resume` of the id through the ladder's launch helper
  *     (`launchWithReplyGuard`: the reply guard, spawn detection, arming by
  *     class). `ErrNoSessionId`, `ErrJsonlMissing` and `ErrJsonlNeverWritten`
- *     (by name) go on to the no-transcript step (`noTranscriptReuse`,
+ *     (by class) go on to the no-transcript step (`noTranscriptReuse`,
  *     SRJ-707, SRJ-712): after `ErrJsonlMissing` the lost-transcript
  *     diagnosis first (a latched or refused diagnosis read ends the launch
  *     with no reuse), then the reuse spawn once with the row state last read
@@ -16894,7 +16899,7 @@ export function oldLifeWaitingPersonas(instanceId: string, bindings: OldLifeWait
 
 /**
  * One answer an old-life wait's call met (b.jg5 SRJ-811, SRJ-1002), by class
- * through `src/ad-error-class.ts` (by name): a CONFLICT or an UNUSABLE NAME
+ * through `src/ad-error-class.ts`: a CONFLICT or an UNUSABLE NAME
  * answer is recorded for its `persona-teardown-notice` entry and latches no
  * one; an ENVIRONMENT answer raises `tmux-unavailable`, and a CONFIG answer
  * `ad-config-malformed`, for each persona waiting on the hold (hatch A3; the
@@ -17230,7 +17235,7 @@ async function readOldLifeRow(target: OldLifeWaitTarget, record: OldLifeWaitReco
     noteOldLifeRowRead(instanceId, { kind: OLD_LIFE_ROW_READ_STATE, state: row.state, cwd: row.cwd }, `${OLD_LIFE_WAIT_SITE}: ${OLD_LIFE_WAIT_GET_WHAT}`)
     return { kind: LIVE_ROW_READ_ROW, row: row as Phase1GetResult }
   } catch (err) {
-    if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) {
+    if (isAdErrorInstance(err, ErrSpawnNotFound)) {
       noteOldLifeRowRead(instanceId, { kind: OLD_LIFE_ROW_READ_NO_ROW }, `${OLD_LIFE_WAIT_SITE}: ${OLD_LIFE_WAIT_GET_WHAT}`)
       return { kind: LIVE_ROW_READ_ABSENT }
     }
@@ -17259,7 +17264,7 @@ async function readOldLifeKillRow(target: OldLifeWaitTarget, record: OldLifeWait
     result = await withOutageDetection(oldKey, undefined, 'status', (client) => client.status({ claude_instance_id: instanceId }), oldLifeWaitCallOptions(target))
     clearOldLifeWaitConfigOutage(target)
   } catch (err) {
-    if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) {
+    if (isAdErrorInstance(err, ErrSpawnNotFound)) {
       if (own) applyOwnRowStatusStep(oldKey, { thrown: err }, at)
       else noteOldLifeRowRead(instanceId, { kind: OLD_LIFE_ROW_READ_NO_ROW }, oldLifeReadName(at))
       return { kind: KILL_RETRY_READ_NO_ROW }
@@ -18478,7 +18483,7 @@ async function sweepKillRead(pass: SweepPass, instanceId: string, configuredKey:
     }
     return { kind: KILL_RETRY_READ_STATE, state: result.state }
   } catch (err) {
-    if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) {
+    if (isAdErrorInstance(err, ErrSpawnNotFound)) {
       // b.jg5 SRJ-809: no row ends an old-life hold on it.
       if (!sweepStopped(pass)) {
         noteOldLifeRowRead(instanceId, { kind: OLD_LIFE_ROW_READ_NO_ROW }, oldLifeReadName(START_SWEEP_KILL_STATUS_SITE))
@@ -19890,11 +19895,11 @@ function clearLatchBeforeOutcome(key: string): void {
  * SRJ-505). For a spawn, plain or reuse, that is a LAUNCH FAILURE or a
  * DIRECTORY answer (every other name is UNCLASSIFIED to it); for a `resume`
  * also its STATE rows (no transcript, `ErrSpawnNotResumable`,
- * `ErrSpawnNotFound`) and GONE. Decided by name and class
+ * `ErrSpawnNotFound`) and GONE. Decided by class
  * (`src/ad-error-class.ts`). Pure; never throws.
  */
 function isDefiniteLaunchAnswer(err: unknown, verb: 'spawn' | 'resume'): boolean {
-  if (hasAdErrorName(err, ERR_INSTANCE_ID_COLLISION_NAME) || isInvalidFlagsError(err)) return false
+  if (isAdErrorInstance(err, ErrInstanceIdCollision) || isInvalidFlagsError(err)) return false
   const { errorClass } = classifyAdError(err)
   if (errorClass === AD_ERROR_CLASS_LAUNCH_FAILURE || errorClass === AD_ERROR_CLASS_DIRECTORY) return true
   return verb === 'resume' && (errorClass === AD_ERROR_CLASS_STATE || errorClass === AD_ERROR_CLASS_GONE)

@@ -1317,7 +1317,7 @@ describe('_buildIsSessionAliveAdapter', () => {
   // and raises no outage flag here. One log line, from the catch-all.
   test.each([
     ['ErrCallTimeout', () => errCallTimeout('status')],
-    ['ErrTmuxUnresponsive (by name)', () => errTmuxUnresponsive('status')],
+    ['ErrTmuxUnresponsive', () => errTmuxUnresponsive('status')],
     ['ErrInternal (an unknown name)', () => errInternal()],
     ['a wrapped UnknownError', () => errGeneric('status', CSCB_UNKNOWN_ERROR_NAME, 'Error: boom')],
     ['a name from a later binary', () => errUnknownErrorName()],
@@ -1473,7 +1473,7 @@ describe('_buildIsSessionAliveAdapter', () => {
 
 // ---------------------------------------------------------------------------
 // b.jg5 SRJ-105: the UNAVAILABLE forms the restart adapters meet (E10's five).
-// Each is built by name for the verb its call uses. Where the builder takes a
+// Each is built from its class for the verb its call uses. Where the builder takes a
 // description it carries the leak marker inside a fake token and a `ticket=`
 // URL (`sentinelInMessage`), which a described line redacts; `redacted` says
 // the described line shows the redaction. An `ErrUnknownErrorName`'s own
@@ -1483,8 +1483,6 @@ describe('_buildIsSessionAliveAdapter', () => {
 /** This file's labels for the shared forms whose label it extends. */
 const FORM_LABELS: Readonly<Record<string, string>> = {
   ErrUnknownErrorName: 'ErrUnknownErrorName (a name from a later binary)',
-  ErrTmuxUnresponsive: 'ErrTmuxUnresponsive (by name)',
-  ErrTmuxKillFailed: 'ErrTmuxKillFailed (by name)',
 }
 
 /** The marked builder of each shared form whose builder takes a description, and whether its described line shows the redacted marker. */
@@ -1893,7 +1891,7 @@ describe('_buildReconnectSessionAdapter', () => {
     ['ErrSpawnNotFound', () => errSpawnNotFound()],
     ['ErrSystemInstallDisappeared', () => errSystemInstallDisappeared('status')],
     ['ErrCallTimeout', () => errCallTimeout('status')],
-    ['ErrTmuxUnresponsive (by name)', () => errTmuxUnresponsive('status')],
+    ['ErrTmuxUnresponsive', () => errTmuxUnresponsive('status')],
     ['a plain Error', () => new Error('boom')],
   ])("SRJ-115: %s at the state read → 'transient', never 'escalate-dead'; no send-keys, pane read or sweep; one line", async (_label, build) => {
     const statusError = build()
@@ -3643,7 +3641,7 @@ describe('_buildReconnectSessionAdapter', () => {
       assertNoLeak({ errArgs: r.errArgs })
     }
 
-    const [TMUX_LABEL, TMUX_BUILD, TMUX_REDACTED] = UNAVAILABLE_FORMS.find(([label]) => label === FORM_LABELS.ErrTmuxUnresponsive)!
+    const [TMUX_LABEL, TMUX_BUILD, TMUX_REDACTED] = UNAVAILABLE_FORMS.find(([label]) => label === 'ErrTmuxUnresponsive')!
 
     test.each(SWEEP_SITES)(`the sweep at %s refused with ${TMUX_LABEL} → 'transient', never 'escalate-dead'; no row read after it, no kill or launch; one described refusal line`, async (_label, site) => {
       await expectRefused(site, TMUX_BUILD('find-missing'), TMUX_REDACTED)
@@ -5576,7 +5574,7 @@ describe('b.jg5 SRJ-810: the reconnect adapter starts the live-row sequence for 
 // alerts are installed here, so an `ErrTmuxKillFailed`'s ordinary decision is
 // one line saying it is not raised (the routes are proved on the recovery
 // harness, in tests/restart.test.ts); nothing is swallowed. A success (`kill_sent` true, false or absent) and
-// `ErrSpawnNotFound` arm nothing. An UNAVAILABLE kill (by name,
+// `ErrSpawnNotFound` arm nothing. An UNAVAILABLE kill (by class,
 // `ErrTmuxKillFailed` included, told apart) arms the timer (b.jg5 SRJ-105); an
 // ENVIRONMENT kill (`ErrTmuxNotAvailable`, b.jg5 SRJ-311) also raises
 // `tmux-unavailable`, a CONFIG kill (`ErrConfigMalformed`, b.jg5 SRJ-316)

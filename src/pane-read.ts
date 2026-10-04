@@ -56,8 +56,9 @@
  * does not use this module.
  *
  * {@link paneReadFailureOf} maps a value thrown by `read-pane` to exactly one
- * failure outcome, by class and by name through `src/ad-error-class.ts`
- * (b.jg5 SRJ-104; never by testing the value against an error class). What
+ * failure outcome, by the classifier's class and by error class through
+ * `src/ad-error-class.ts` (b.jg5 SRJ-104; `classifyAdError`,
+ * `isAdErrorInstance`), never by an error's name. What
  * each outcome means at a site is the caller's to decide:
  *
  *   GONE          `ErrTmuxCaptureFailed` (any GONE class)
@@ -107,10 +108,10 @@ import {
   AD_ERROR_CLASS_UNUSABLE_NAME,
   classifyAdError,
   describeAdFailureForLog,
-  hasAdErrorName,
+  isAdErrorInstance,
   type AdErrorClass,
 } from './ad-error-class.ts'
-import { ERR_SPAWN_NOT_FOUND_NAME } from './agent-director-errors.ts'
+import { ErrSpawnNotFound } from './agent-director-errors.ts'
 
 /**
  * Trailing pane lines a full read asks for (b.jg5 SRJ-117's `n_lines` at the
@@ -252,7 +253,7 @@ export const PANE_READ_NOT_READ_LATCHED: PaneReadLatched = Object.freeze({ kind:
 /**
  * The failure outcome of a value thrown by one `read-pane` of a persona's
  * own row (b.jg5 SRJ-104, SRJ-117); see the module comment. Decided by class
- * and by name through `src/ad-error-class.ts`. Pure; never throws.
+ * through `src/ad-error-class.ts`. Pure; never throws.
  */
 export function paneReadFailureOf(value: unknown): PaneReadFailure {
   const { errorClass } = classifyAdError(value)
@@ -274,7 +275,7 @@ export function paneReadFailureOf(value: unknown): PaneReadFailure {
       // STATE: only `ErrSpawnNotFound` has a meaning here (ABSENT); every
       // other STATE name, LAUNCH FAILURE, DIRECTORY and UNCLASSIFIED map to
       // UNCLASSIFIED.
-      return hasAdErrorName(value, ERR_SPAWN_NOT_FOUND_NAME)
+      return isAdErrorInstance(value, ErrSpawnNotFound)
         ? { kind: PANE_READ_ABSENT, errorClass, description }
         : { kind: PANE_READ_UNCLASSIFIED, errorClass, description }
   }
