@@ -552,6 +552,11 @@ function startWithDeps(
 // ---------------------------------------------------------------------------
 
 describe('pacing and limits: one kill, three runs spaced apart, a second kill, the pause, a fourth run; then the alert (AC 61)', () => {
+  // The one pin case: SRJ-705's run counts, as SRJ-1204 bounds them; every other case imports them.
+  test('SRJ-1204\'s pin: LIVE_ROW_SEQUENCE_MAX_RUNS is SRJ-705\'s 4, step 3\'s 3 runs and step 4\'s one', () => {
+    expect([LIVE_ROW_SEQUENCE_STEP3_RUNS, LIVE_ROW_SEQUENCE_MAX_RUNS]).toEqual([3, 4])
+  })
+
   test('a live row each run leaves in unverified_ids: the calls in order at the exported spacing and pause, the maxima, one get after each run, then exactly one ordinary alert with no description and the not-latched closing, and no launch', async () => {
     const { h, p } = build()
     const id = personaInstanceId(p)

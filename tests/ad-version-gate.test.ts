@@ -22,7 +22,10 @@
  * timer's stop, its end on the version-changed signal (with the listener
  * registered as `main()` registers it, a retry at once for each applied
  * persona), its other ends (a teardown's forget, shutdown, a server restart)
- * and the below-floor stop, on a hold composed as `main()` composes it.
+ * and the below-floor stop, on a hold composed as `main()` composes it. And
+ * b.jg5 SRJ-1204's bound citing SRJ-204 and SRJ-209: with the settings read
+ * installed on the re-check's tick, one re-check and one read per interval,
+ * the `ErrInvalidFlags` step's trigger the only extra re-check.
  *
  * Every version is built from the floor constant's parts or imported from
  * `tests/test-helpers/agent-director-versions.ts`, so a change to
@@ -105,6 +108,8 @@ import {
   type HostVersionFailure,
   type HostVersionOutcome,
 } from '../src/ad-version-gate.ts'
+import { classifyWithInvalidFlagsRecheck } from '../src/ad-error-class.ts'
+import { installAdSettings, resetAdSettingsForTests } from '../src/ad-settings.ts'
 import { resetClientForTests, setClientForTests } from '../src/agent-director-client.ts'
 import * as installCheck from '../src/install-check.ts'
 import * as installCheckLabels from '../src/install-check-labels.ts'
@@ -136,9 +141,11 @@ import { setSessionNotifier } from '../src/session-manager.ts'
 import { sessionEndingCommandsIn } from './test-helpers/conflict-cases.ts'
 import {
   errBunVersionTooOld,
+  errInvalidFlags,
   errSystemInstallNotFound,
   errSystemInstallTooOld,
   errSystemInstallUnreachable,
+  errTmuxUnresponsive,
   makeStubCallLog,
   makeStubClient,
   makeStubResolveSystemBinary,
@@ -502,6 +509,7 @@ function expectRuntimeEntryPointsToDebugSkill(message: string): void {
 afterEach(() => {
   for (const recheck of liveRigs.splice(0)) recheck.dispose()
   resetAdVersionRecheckForTests()
+  resetAdSettingsForTests()
   resetClientForTests()
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
@@ -1291,6 +1299,56 @@ describe('runtime re-check: module-level trigger and version-changed registratio
     await clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
     expect(calls).toHaveLength(2)
     expect(heard).toEqual([['a', BASELINE_VERSION, LATER_PATCH], ['b', BASELINE_VERSION, LATER_PATCH], ['b', LATER_PATCH, LATER_MINOR]])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SRJ-1204's bound, citing SRJ-204 and SRJ-209: the version re-check and the
+// settings read each once per interval, whatever health_check_interval is;
+// the ErrInvalidFlags step's trigger is the only extra re-check
+// ---------------------------------------------------------------------------
+
+describe('runtime re-check: SRJ-1204\'s bound, with the settings installed on its tick as main() installs them (b.jg5 SRJ-204, SRJ-209, SRJ-1204; health_check_interval 0)', () => {
+  test('over several intervals: one re-check and one settings read per interval and one timer pending; an ErrInvalidFlags step mid-interval adds one re-check and no read, another error none, and the next interval comes when it was due', async () => {
+    const clock = createFakeClock()
+    const resolveCalls: Array<object | undefined> = []
+    installAdVersionRecheck(installDeps(clock, [], resolveCalls))
+    const home = mkdtempSync(join(tmpdir(), 'cscb-ad-version-bound-'))
+    tempDirs.push(home)
+    let reads = 0
+    installAdSettings({
+      home: () => {
+        reads += 1
+        return home
+      },
+      log: () => {},
+    })
+    // The startup read at once; no re-check yet, and the re-check's timer the only one.
+    expect([resolveCalls.length, reads, clock.pendingCount()]).toEqual([0, 1, 1])
+
+    const intervals = 4
+    const perInterval: Array<[number, number, number]> = []
+    for (let n = 0; n < intervals; n++) {
+      const [callsBefore, readsBefore] = [resolveCalls.length, reads]
+      await clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
+      perInterval.push([resolveCalls.length - callsBefore, reads - readsBefore, clock.pendingCount()])
+    }
+    expect(perInterval).toEqual(Array.from({ length: intervals }, () => [1, 1, 1]))
+
+    // Mid-interval: a non-ErrInvalidFlags answer triggers nothing; an ErrInvalidFlags one exactly one re-check, with no settings read.
+    const dueAt = clock.pending()[0]!.dueAt
+    await clock.advance(AD_VERSION_RECHECK_INTERVAL_MS / 2)
+    const [callsBefore, readsBefore] = [resolveCalls.length, reads]
+    expect((await classifyWithInvalidFlagsRecheck(errTmuxUnresponsive('spawn'))).recheck).toBeUndefined()
+    expect(resolveCalls.length).toBe(callsBefore)
+    expect((await classifyWithInvalidFlagsRecheck(errInvalidFlags('spawn'))).recheck?.kind).toBe(RECHECK_OUTCOME_PASS)
+    expect([resolveCalls.length - callsBefore, reads - readsBefore, clock.pending().map((timer) => timer.dueAt)]).toEqual([1, 0, [dueAt]])
+
+    // The interval's own re-check and read, at the time it was due.
+    await clock.advanceTo(dueAt - 1)
+    expect([resolveCalls.length - callsBefore, reads - readsBefore]).toEqual([1, 0])
+    await clock.advance(1)
+    expect([resolveCalls.length - callsBefore, reads - readsBefore, clock.pendingCount()]).toEqual([2, 1, 1])
   })
 })
 

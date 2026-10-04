@@ -1003,6 +1003,11 @@ describe('approvePreSessionDialogs: the pace, from the launch start (b.jg5 SRJ-4
     ),
   )
 
+  // The one pin case: SRJ-403's paces, as SRJ-1204 bounds them; every other case imports them.
+  test('SRJ-1204\'s pin: DIALOG_POLL_INTERVAL_MS is SRJ-403\'s 1 s before G and DIALOG_SLOW_POLL_INTERVAL_MS its 5 s from G', () => {
+    expect([FAST, SLOW]).toEqual([1_000, 5_000])
+  })
+
   test.each(ROWS)(
     'launch start %s, %s, the approver %s, on a resumed row whose started_at is older than B: pane reads are the fast pace apart until G from launch_started_at and the slow pace apart from G on, until B',
     async (_form, _grace, _where, raw, tables, offset) => {

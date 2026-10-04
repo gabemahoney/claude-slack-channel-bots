@@ -210,8 +210,11 @@ export const LIVE_ROW_SEQUENCE_GRACE_REARM_LOG_SPACING_MS = 60_000
 /** The number of runs step 3 makes at most (SRJ-705). */
 export const LIVE_ROW_SEQUENCE_STEP3_RUNS = 3
 
-/** The most `find-missing` runs one sequence makes (SRJ-705). */
-export const LIVE_ROW_SEQUENCE_MAX_RUNS = 4
+/**
+ * The most `find-missing` runs one sequence makes (SRJ-705, SRJ-1204): step
+ * 3's runs and step 4's one run.
+ */
+export const LIVE_ROW_SEQUENCE_MAX_RUNS = LIVE_ROW_SEQUENCE_STEP3_RUNS + 1
 
 /** The most kills one sequence makes, each with its tries (SRJ-705). */
 export const LIVE_ROW_SEQUENCE_MAX_KILLS = 2

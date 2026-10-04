@@ -5478,6 +5478,11 @@ function expectStillLatched(run: LatchedRecheckRun, at: number): void {
 }
 
 describe('the re-check timer: its cadence, P\'s serializer turn and its stops (recovery harness; SRJ-505)', () => {
+  // The one pin case: SRJ-505's numbers, as SRJ-1204 bounds them; every other case imports them.
+  test('SRJ-1204\'s pin: LATCH_RECHECK_INTERVAL_MS is SRJ-505\'s 120 s and PROBE_PANE_READ_LINES its one-line read-pane', () => {
+    expect([LATCH_RECHECK_INTERVAL_MS, PROBE_PANE_READ_LINES]).toEqual([120_000, 1])
+  })
+
   test('health_check_interval 0: no call before 120 s after the latch, then one status read every 120 s over four intervals', async () => {
     const run = latchForRecheck(statusOnlyRow(), { state: rowStateOfReading('waiting') }, { healthCheckInterval: 0 })
     const { h, p } = run
