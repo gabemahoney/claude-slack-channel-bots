@@ -17,11 +17,13 @@
  *   - fail (not found, version unreadable, below the client minimum, the
  *     client minimum unreadable, other): one `SR-2.5 (preflight)` diagnostic
  *     on stderr, naming the switch-over runbook section; exit
- *     {@link AD_VERSION_CHECK_FAIL_EXIT_CODE}.
+ *     {@link AD_VERSION_CHECK_FAIL_EXIT_CODE}. The not-found and
+ *     below-client-minimum diagnostics point to that section's
+ *     publishing-host block (`PUBLISHING_HOST_BLOCK_HEADING`).
  *
- * No output advises upgrading agent-director or editing `package.json`'s
- * agent-director version: the switch-over runbook is the one way to change
- * the host's agent-director.
+ * No output advises installing or upgrading agent-director or editing
+ * `package.json`'s agent-director version: the switch-over runbook is the
+ * one way to change the host's agent-director.
  *
  * {@link runAdVersionCheck} holds the logic with its resolver injected (no
  * default), so tests drive it in process with a stub; it neither writes nor
@@ -48,6 +50,7 @@ import {
   HOST_VERSION_OUTCOME_PASS_BELOW_FLOOR,
   PHASE1_FLOOR_VERSION,
   PHASE1_RUNBOOK_SECTION_TITLE,
+  PUBLISHING_HOST_BLOCK_HEADING,
   settleHostVersionCall,
   type HostVersionFailure,
 } from '../src/ad-version-gate.ts'
@@ -71,6 +74,14 @@ const BUMP_KIND_PLACEHOLDER = '<patch|minor|major>'
 
 /** Where every failure diagnostic points the operator. */
 const RUNBOOK_POINTER = `the switch-over runbook in the README (section "${PHASE1_RUNBOOK_SECTION_TITLE}")`
+
+/**
+ * Where the not-found and below-client-minimum diagnostics point the
+ * operator: the runbook section's publishing-host block (b.jg5 SRJ-211,
+ * SRJ-1108), which covers a host with no agent-director and one below the
+ * client's minimum and names no upgrade.
+ */
+const PUBLISHING_HOST_POINTER = `the block "${PUBLISHING_HOST_BLOCK_HEADING}" of ${RUNBOOK_POINTER}`
 
 /** Where the installed client keeps its minimum. */
 const CLIENT_MINIMUM_FIELD = `'min_binary_version' in agent-director/dist/version-floor.json`
@@ -114,21 +125,21 @@ export function buildAdVersionCheckFailure(failure: HostVersionFailure, bumpKind
       return (
         `${SR25_PREFIX}: no agent-director binary was found on this host (PATH or the standard install path). ` +
         `This CSCB release needs agent-director Phase 1 on the host. ` +
-        `Operator recovery: install agent-director by following ${RUNBOOK_POINTER}, then ${rerun}.`
+        `Operator recovery: follow ${PUBLISHING_HOST_POINTER}, then ${rerun}.`
       )
     case HOST_VERSION_FAIL_VERSION_UNREADABLE:
       return (
         `${SR25_PREFIX}: the host's agent-director at ${failure.binaryPath} did not give a version that can be read ` +
         `(${failure.detail}). ` +
         `Operator recovery: check that the binary at ${failure.binaryPath} runs and reports its version; ` +
-        `the host's agent-director is installed by following ${RUNBOOK_POINTER}; then ${rerun}.`
+        `the host's agent-director is covered by ${RUNBOOK_POINTER}; then ${rerun}.`
       )
     case HOST_VERSION_FAIL_BELOW_CLIENT_MINIMUM:
       return (
         `${SR25_PREFIX}: the host's agent-director ${failure.foundVersion} at ${failure.binaryPath} is below ` +
         `the agent-director client's minimum ${failure.requiredVersion}, so the client refuses it. ` +
         `This CSCB release needs agent-director Phase 1 (${PHASE1_FLOOR_VERSION} or later, release candidates included). ` +
-        `Operator recovery: install agent-director by following ${RUNBOOK_POINTER}, then ${rerun}.`
+        `Operator recovery: follow ${PUBLISHING_HOST_POINTER}, then ${rerun}.`
       )
     case HOST_VERSION_FAIL_CLIENT_MINIMUM_UNREADABLE:
       return clientMinimumUnreadable(`${CLIENT_MINIMUM_FIELD} is ${JSON.stringify(failure.clientMinimum)}, which is not a version`, bumpKind)

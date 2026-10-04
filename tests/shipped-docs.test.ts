@@ -85,7 +85,35 @@
  *   kill-and-respawn, `has-session`, an attach target without `=`, a raw tmux
  *   kill outside the switch-over section), and their `auto-restart disabled`
  *   lost-message text keeps not saying the persona will not restart on its
- *   own (the E8 note); each self-checked.
+ *   own (the E8 note); each self-checked. The prefix-key reason's two spans
+ *   (`PREFIX_KEY_REASON_SPANS`, below) are the one attach without `=` the E8
+ *   check leaves out.
+ * - E36 T2's checks, also read through `OPERATOR_TEXTS`:
+ *   - SRJ-1102 (AC 78): the prefix-key reason sentence, built by
+ *     `prefixRelatedKeysReason` in its operator-text form, in each carrier's
+ *     section (README "Persona name and key", the debugging skill's "Across
+ *     personas", the wizard's name step, the engineering guide's
+ *     "Configuration", the architecture doc's "Persona config"; the
+ *     CHANGELOG's note through its `RELEASE_ENTRY_CHECKS` row); the debugging
+ *     skill quotes the validation text the loader renders for `dev` then
+ *     `dev_2`; the example `tmux attach -t slack_bot_dev` stands in no
+ *     operator text outside those two spans (`PREFIX_KEY_REASON_SPANS`, one
+ *     file-local list citing SRJ-1102 and SRJ-1101's exception); and no
+ *     operator text says CSCB or agent-director targets a session by prefix
+ *     or passes a bare name (`PREFIX_TARGETING_CLAIMS`);
+ *   - the E2-gate, E4 and E5 notes over the README: each install-check and
+ *     startup-error entry this Task rewrote names the runbook section (a
+ *     not-found entry its publishing-host block, by a link that resolves) and
+ *     carries no upgrade or re-install form; the catalog entry's
+ *     `ErrUnknownErrorName` clause; the state-DB owner entry runs the server
+ *     as the owner and never removes the file; the "Bots come back with no
+ *     memory" paragraph and the `resume_enabled` row name no pre-floor
+ *     version; "Preflight gates" counts its gates and lists SR-2.5 with
+ *     `AD_VERSION_CHECK_FAIL_EXIT_CODE` (scripts/ad-version-check.ts) and the
+ *     below-floor note; no operator text advises re-installing
+ *     agent-director (`UPGRADE_FORMS`' re-install row, whose self-checks sit
+ *     with the other rows' under SRJ-208). Each self-checked against the
+ *     wording the Task replaced.
  * CHANGELOG.md and docs/ are not shipped descriptions: the forbidden-term
  * audit still reads only `SHIPPED_TEXTS`, which holds neither. Besides the
  * two docs read through `OPERATOR_TEXTS`, the one docs/ file read is
@@ -113,9 +141,12 @@ import {
   PERSONA_TOP_LEVEL_KEYS,
   SERVER_PATH_SETTINGS,
   loadPersonaConfig,
+  prefixRelatedKeysReason,
+  resolvePersonaConfig,
   type PersonaConfig,
 } from '../src/config.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
+import { makePersona } from './test-helpers/persona-config.ts'
 import {
   classHeading,
   findSection,
@@ -125,6 +156,7 @@ import {
   headingSlug,
   requiredSection,
   type Heading,
+  type HeadingMatch,
   sectionRange,
   splitFences,
 } from './test-helpers/markdown.ts'
@@ -135,7 +167,17 @@ import { CRONTABLE_TEMPLATE_HEADER } from '../src/cron-bootstrap.ts'
 import type { Via } from '../src/delivery-decision.ts'
 import { MCP_INSTRUCTIONS } from '../src/registry.ts'
 import { PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_SECTION_TITLE } from '../src/ad-version-gate.ts'
-import { AD_BELOW_PHASE1_FLOOR, AD_SYSTEM_INSTALL_TOO_OLD } from '../src/install-check.ts'
+import {
+  AD_BELOW_PHASE1_FLOOR,
+  AD_SHIM_CATALOG_INCOMPLETE,
+  AD_SYSTEM_INSTALL_NOT_FOUND,
+  AD_SYSTEM_INSTALL_TOO_OLD,
+  AD_SYSTEM_INSTALL_UNREACHABLE,
+  AD_VERSION_FLOOR_UNREADABLE,
+  CLIENT_PACKAGE_REMEDY,
+  PUBLISHING_HOST_BLOCK_POINTER,
+} from '../src/install-check.ts'
+import { AD_VERSION_CHECK_FAIL_EXIT_CODE, SR25_NOTE_PREFIX, SR25_PREFIX } from '../scripts/ad-version-check.ts'
 import {
   AD_CALL_TIMEOUT_NEED_MARGIN_MS,
   AD_CEILING_VERBS,
@@ -1554,6 +1596,13 @@ function labelItem(section: string, label: string, where: string): string {
   return flat(item.join('\n'))
 }
 
+/** The label of `UPGRADE_FORMS`' re-install row (E36 T2 ruling; SRJ-1101); throws when the helper has no such row. */
+const REINSTALL_FORM: string = (() => {
+  const row = UPGRADE_FORMS.find(([label]) => /\bre-install\b/i.test(label))
+  if (row === undefined) throw new Error('UPGRADE_FORMS has no re-install row')
+  return row[0]
+})()
+
 describe('the agent-director refusal classes name the switch-over runbook (b.jg5 SRJ-208)', () => {
   const debugSkill = readRepoFile(DEBUG_SKILL_FILE)
   const readme = readRepoFile('README.md')
@@ -1637,6 +1686,28 @@ describe('the agent-director refusal classes name the switch-over runbook (b.jg5
   test('self-check: no pattern matches the runbook pointer itself', () => {
     const pointer = flat(`Follow the README section "${PHASE1_RUNBOOK_SECTION_TITLE}" to install agent-director, then start the server again.`)
     expect(UPGRADE_FORMS.filter(([, pattern]) => pattern.test(pointer)).map(([form]) => form)).toEqual([])
+  })
+
+  // The re-install row (E36 T2 ruling; SRJ-1101, HO C8): it flags each
+  // re-install advice the install and startup texts gave, and neither the
+  // remedies that replaced them nor re-installing a Slack app or CSCB.
+  test.each([
+    'Reinstall agent-director from npm and retry.',
+    'Diagnose with the install-cscb skill or re-install agent-director.',
+    "Run: reinstall a matching 'agent-director' version.",
+    'check or reinstall the `agent-director` npm package',
+    'Re-install agent-director as the correct user or remove the mismatched file.',
+  ])('self-check: the re-install row flags the old advice "%s"', (text) => {
+    expect(upgradeFormsIn(flat(text))).toContain(REINSTALL_FORM)
+  })
+
+  test.each([
+    ['the client-package remedy', CLIENT_PACKAGE_REMEDY],
+    ['the publishing-host pointer', PUBLISHING_HOST_BLOCK_POINTER],
+    ['re-installing a Slack app', 'Re-install the app to the workspace, then restart agent-director.'],
+    ['reinstalling CSCB', 'reinstall CSCB from the version step 1 recorded'],
+  ])('self-check: the re-install row does not flag %s', (_name, text) => {
+    expect(upgradeFormsIn(flat(text))).not.toContain(REINSTALL_FORM)
   })
 
   test('self-check: a README item missing its label fails naming the label', () => {
@@ -1752,6 +1823,7 @@ const AD_VOCABULARY: Record<string, { text: string; source: string }> = {
   migrationColumns: { text: 'thirteen', source: "HO rev 15: the columns Phase 1's schema migration adds (and the downgrade recipe drops, SRJ-1109 step 6)" },
   storeMeta: { text: code('store_meta'), source: "HO rev 15, rev 19: the one-row table holding the store's id" },
   configMalformed: { text: code('ErrConfigMalformed'), source: "HO §1; ADSRD SR-4.1: agent-director's answer to a malformed settings file" },
+  unknownErrorName: { text: code('ErrUnknownErrorName'), source: "agent-director's client: the error a name outside its catalog arrives as; the E4 hatch note (`ad-shim-catalog-incomplete`)" },
   expireAll: { text: code('--older-than 0d'), source: 'HO C6; SRJ-1108 step 11: never used' },
   'ceiling kill': { text: 'the larger of 2Q + 2A + E + 4W and 3Q + 2A + 5W', source: 'ADSRD SR-13.2; SRJ-213' },
   'ceiling read-pane': { text: '3Q + A + 4W', source: 'ADSRD SR-13.2; SRJ-213' },
@@ -2635,7 +2707,7 @@ const overRollbackCarriers = <T extends readonly unknown[]>(rows: readonly T[]) 
 
 /** A count as the runbooks write it, in words; throws for a count it lacks, so a changed count fails naming it. */
 function countWord(n: number): string {
-  const words: Record<number, string> = { 9: 'nine' }
+  const words: Record<number, string> = { 7: 'seven', 8: 'eight', 9: 'nine' }
   const word = words[n]
   if (word === undefined) throw new Error(`countWord has no word for ${n}`)
   return word
@@ -3266,8 +3338,12 @@ const RELEASE_ENTRY_CHECKS: [element: string, problems: (changelog: string) => s
     noteUnitProblems(changelog, ci('prompt or question open'), (unit) => lacking(unit, [ci('checks the session through agent-director')]))],
   [`the note "The server's own tmux commands act only on a bot's own session" is gone (E17, E18)`, (changelog) =>
     [...flat(changelog).matchAll(/the server's own tmux commands/gi)].map((m) => `the dropped note is back: ${m[0]}`)],
-  [`the prefix-key note's reason does not name agent-director ${OLD_AD_VERSION} (SRJ-1102)`, (changelog) =>
-    noteUnitProblems(changelog, ci("may start with another persona's key"), (unit) => (unit.includes(OLD_AD_VERSION) ? [`names ${OLD_AD_VERSION}: ${unit}`] : []))],
+  [`the prefix-key note's reason is SRJ-1102's sentence and does not name agent-director ${OLD_AD_VERSION} (SRJ-1102)`, (changelog) =>
+    noteUnitProblems(changelog, ci("may start with another persona's key"), (unit) => [
+      // DOCS_PREFIX_KEY_REASON: from the loader's builder, with SRJ-1102's other checks below.
+      ...lacking(unit, [DOCS_PREFIX_KEY_REASON]),
+      ...(unit.includes(OLD_AD_VERSION) ? [`names ${OLD_AD_VERSION}: ${unit}`] : []),
+    ])],
   ['the fresh-once note stays, its rows kept and never resumed, pointing to the switch-over runbook', (changelog) =>
     noteUnitProblems(changelog, ci('starts fresh once'), (unit) => [
       ...lacking(unit, [/\brows? (?:are|is) kept\b/i, ci('never resumed')]),
@@ -3422,6 +3498,8 @@ describe('the CHANGELOG release entry, read through OPERATOR_TEXTS (b.jg5 SRJ-11
         text.replace(/^- \*\*One stuck persona/m, "- **The server's own tmux commands act only on a bot's own session.** When the server ends a bot's leftover tmux session before a relaunch, it now names the session exactly.\n- **One stuck persona")],
       [RELEASE_ENTRY_CHECKS.find(([e]) => e.startsWith("the prefix-key note's"))![0], "b.ob2's reason", (text) =>
         text.replace(/The reason: [^\n]*?could reach another persona's session\./, `agent-director ${OLD_AD_VERSION} finds a persona's tmux session by a name that also matches the start of a longer one, so with such a pair it could read, type into or end the other persona's session.`)],
+      [RELEASE_ENTRY_CHECKS.find(([e]) => e.startsWith("the prefix-key note's"))![0], 'the reason sentence dropped, no version named', (text) =>
+        text.replace(/ The reason: [^\n]*?could reach another persona's session\./, '')],
       ['the fresh-once note stays, its rows kept and never resumed, pointing to the switch-over runbook', "b.ob2's pointer to the upgrade steps", (text) =>
         text.replace(/(starts fresh once\.[^\n]*?)\(see \[[^\]]*\]\([^)]*\)\)/i, `$1(step 1 of [${UPGRADE_STEPS_TITLE}](#${headingSlug(UPGRADE_STEPS_TITLE)}))`)],
       [ROW_DELETION_ELEMENT, 'another agent-director version named', (text) =>
@@ -3671,6 +3749,389 @@ describe('E20: operator texts quote the Kill failed and Process outlived kill al
   })
 })
 
+// ---------------------------------------------------------------------------
+// E36 T2: the prefix-key rule's reason (b.jg5 SRJ-1102, AC 78), read through
+// OPERATOR_TEXTS
+// ---------------------------------------------------------------------------
+
+/** The prefix-related pair the reason's example and the debugging skill's quoted message use: the shorter persona first. */
+const PREFIX_PAIR = ['dev', 'dev_2'] as const
+
+/**
+ * SRJ-1102's reason sentence as the operator texts state it, from the
+ * loader's own builder: the example session is the shorter persona's, what it
+ * could reach is "another persona's session", and `=` and the example command
+ * are code spans.
+ */
+const DOCS_PREFIX_KEY_REASON = prefixRelatedKeysReason(personaTmuxSessionName(PREFIX_PAIR[0]), "another persona's session", code)
+
+/**
+ * The validation text for `PREFIX_PAIR` in array order, after the later
+ * persona's prefix, as the loader renders it (`resolvePersonaConfig`, which
+ * runs `describePrefixRelatedKeys`; pure, no file read): the message the
+ * debugging skill quotes. Throws unless the loader rejects the pair with it.
+ */
+const renderedPrefixKeyMessage = lazy((): string => {
+  const base = join(tmpdir(), 'cscb-shipped-docs-prefix-pair')
+  const raw = { personas: PREFIX_PAIR.map((name) => makePersona({ name }, base)) }
+  let message: string | undefined
+  try {
+    resolvePersonaConfig(raw, base, base, { record: true })
+  } catch (err) {
+    assertNoLeak(err, 'prefix-pair rejection')
+    message = err instanceof Error ? err.message : undefined
+  }
+  const lead = `(key=${PREFIX_PAIR[1]}): `
+  const at = message?.indexOf(lead) ?? -1
+  if (message === undefined || at < 0) throw new Error(`the loader did not reject ${PREFIX_PAIR.join(' then ')} with a persona-entry message: ${message}`)
+  return message.slice(at + lead.length)
+})
+
+/**
+ * The spans an operator text may carry a `tmux attach -t` without `=` in
+ * (b.jg5 SRJ-1102; SRJ-1101's one exception), file-local and built from the
+ * src builders, never written out: the reason sentence in the operator
+ * texts' form, and the validation text rendered for `PREFIX_PAIR`, which the
+ * debugging skill quotes (SRJ-1101's literal exception, the Task's ruling).
+ * Each is removed, as written, from the flattened text before a check looks
+ * for the example or an attach without `=`; nothing else is.
+ */
+const PREFIX_KEY_REASON_SPANS: readonly [label: string, span: () => string][] = [
+  ['the reason sentence in the operator texts (SRJ-1102)', () => DOCS_PREFIX_KEY_REASON],
+  [`the validation text rendered for ${PREFIX_PAIR.join(' then ')}, which the debugging skill quotes (SRJ-1101's literal exception)`, renderedPrefixKeyMessage],
+]
+
+/** `text`, whitespace collapsed, with each `PREFIX_KEY_REASON_SPANS` span removed. */
+function withoutPrefixKeyReason(text: string): string {
+  return PREFIX_KEY_REASON_SPANS.reduce((rest, [, span]) => rest.split(span()).join(' '), flat(text))
+}
+
+/** The reason's example command, `tmux attach -t slack_bot_dev`, wherever it stands, code span or not; a longer session name is not it. */
+const PREFIX_KEY_EXAMPLE = new RegExp(`\\btmux attach(?:-session)?\\s+-t\\s+${escapeRegExp(personaTmuxSessionName(PREFIX_PAIR[0]))}(?![\\w-])`, 'g')
+
+/**
+ * The carriers of the reason (SRJ-1102; the Task's ruling): each text and the
+ * section that states it, found by title. The CHANGELOG's note is a row of
+ * `RELEASE_ENTRY_CHECKS`.
+ */
+const PREFIX_KEY_REASON_CARRIERS: readonly [file: string, heading: HeadingMatch][] = [
+  ['README.md', '#### Persona name and key'],
+  [DEBUG_SKILL_FILE, '### Across personas'],
+  [WIZARD_FILE, /^#### .*\bName$/],
+  ['docs/engineering-guide.md', '## Configuration'],
+  ['docs/architecture.md', '### Persona config'],
+]
+
+/** One carrier's section of `text`, flattened; throws naming the file and heading when there is none. */
+function reasonCarrierSection(file: string, heading: HeadingMatch, text: string = operatorText(file)): string {
+  return flat(requiredSection(text, heading, file))
+}
+
+/**
+ * The claim SRJ-1102 bars (file-local): that CSCB or agent-director targets,
+ * finds or passes a tmux session by prefix or by a bare name. A sentence here
+ * runs to a full stop followed by whitespace, so a version's dots stay inside
+ * it. Each with a synthetic string it must match, b.ob2's and E35's wording.
+ */
+const SAME_SENTENCE = '(?:[^.]|\\.(?=\\S))'
+const PREFIX_TARGETING_CLAIMS: readonly [label: string, pattern: RegExp, sample: string][] = [
+  [
+    'a session name passed to tmux bare',
+    new RegExp(`\\b(?:agent-director|CSCB|the server)\\b${SAME_SENTENCE}{0,160}?\\b(?:pass(?:es|ed)?|hand(?:s|ed)?)\\b${SAME_SENTENCE}{0,80}?\\b(?:to tmux bare|a bare (?:session )?name)\\b`, 'gi'),
+    "agent-director 0.10.0's verbs (read-pane, send-keys, kill) pass `slack_bot_<key>` to tmux bare",
+  ],
+  [
+    "agent-director's or CSCB's tmux calls prefix-match",
+    new RegExp(`\\b(?:agent-director|CSCB|the server)\\b${SAME_SENTENCE}{0,80}?\\bprefix-match\\w*`, 'gi'),
+    "Known gap: agent-director's own tmux calls still prefix-match.",
+  ],
+  [
+    'agent-director or CSCB finds a session by a name that matches a longer one',
+    new RegExp(`\\b(?:agent-director|CSCB|the server)\\b${SAME_SENTENCE}{0,160}?\\b(?:by (?:its )?(?:prefix|start)|matches the start of)`, 'gi'),
+    "agent-director 0.10.0 finds a persona's tmux session by a name that also matches the start of a longer one",
+  ],
+]
+
+describe("E36 T2: the prefix-key rule's reason is SRJ-1102's in every carrier, and its example stands nowhere else (b.jg5 SRJ-1102, AC 78)", () => {
+  test.each(PREFIX_KEY_REASON_CARRIERS)('%s, under %s, states the reason sentence', (file, heading) => {
+    expect(reasonCarrierSection(file, heading)).toContain(DOCS_PREFIX_KEY_REASON)
+  })
+
+  test(`${DEBUG_SKILL_FILE}, under "### Across personas", quotes the validation text rendered for ${PREFIX_PAIR.join(' then ')}`, () => {
+    expect(reasonCarrierSection(DEBUG_SKILL_FILE, '### Across personas')).toContain(code(renderedPrefixKeyMessage()))
+  })
+
+  test.each(OPERATOR_TEXTS)(`%s: the example \`tmux attach -t ${personaTmuxSessionName(PREFIX_PAIR[0])}\` stands only inside the reason sentence`, (_name, read) => {
+    expect(withoutPrefixKeyReason(read()).match(PREFIX_KEY_EXAMPLE) ?? []).toEqual([])
+  })
+
+  test.each(OPERATOR_TEXTS)('%s: no text says CSCB or agent-director targets a tmux session by prefix or by a bare name', (_name, read) => {
+    expect(termsIn(flat(read()), PREFIX_TARGETING_CLAIMS.map(([label, pattern]) => [label, pattern] as const))).toEqual([])
+  })
+
+  describe('self-checks', () => {
+    test("the rendered message carries the reason for the pair's two session names, and both spans hold the example", () => {
+      expect(renderedPrefixKeyMessage()).toContain(prefixRelatedKeysReason(personaTmuxSessionName(PREFIX_PAIR[0]), personaTmuxSessionName(PREFIX_PAIR[1])))
+      for (const [label, span] of PREFIX_KEY_REASON_SPANS) expect({ label, examples: span().match(PREFIX_KEY_EXAMPLE)?.length }).toEqual({ label, examples: 1 })
+    })
+
+    test.each(PREFIX_KEY_REASON_CARRIERS)("%s fails with the reason reverted to b.ob2's wording", (file, heading) => {
+      const text = operatorText(file)
+      // As written, so wrapped across lines in the wizard.
+      const asWritten = new RegExp(escapeRegExp(DOCS_PREFIX_KEY_REASON).replace(/ /g, '\\s+'))
+      const edited = text.replace(asWritten, "agent-director 0.10.0 finds a persona's tmux session by a name that also matches the start of a longer one.")
+      expect(edited).not.toBe(text)
+      expect(reasonCarrierSection(file, heading, edited)).not.toContain(DOCS_PREFIX_KEY_REASON)
+      expect(termsIn(flat(edited), PREFIX_TARGETING_CLAIMS.map(([label, pattern]) => [label, pattern] as const))).not.toEqual([])
+    })
+
+    test('the example outside the reason sentence is reported, wrapped or not; the exact target and a longer session are not', () => {
+      const session = personaTmuxSessionName(PREFIX_PAIR[0])
+      expect(withoutPrefixKeyReason(`${DOCS_PREFIX_KEY_REASON} Attach with \`tmux attach -t\n${session}\`.`).match(PREFIX_KEY_EXAMPLE)).toHaveLength(1)
+      expect(withoutPrefixKeyReason(`tmux attach -t ${session} (for example)`).match(PREFIX_KEY_EXAMPLE)).toHaveLength(1)
+      expect(withoutPrefixKeyReason(`\`tmux attach -t =${session}\` and \`tmux attach -t ${personaTmuxSessionName(PREFIX_PAIR[1])}\``).match(PREFIX_KEY_EXAMPLE)).toBeNull()
+    })
+
+    test.each(PREFIX_TARGETING_CLAIMS)('the %s pattern matches its synthetic string', (_label, pattern, sample) => {
+      expect(flat(sample).match(pattern)).not.toBeNull()
+    })
+
+    test("no claim pattern flags the reason, the rendered message or the engineering guide's exact-target wording", () => {
+      const fine = [
+        DOCS_PREFIX_KEY_REASON,
+        renderedPrefixKeyMessage(),
+        'Build the target with `tmuxExactSessionTarget` (`src/persona-identity.ts`, `=<name>`, used only for the operator\'s `attach` command); never pass a bare name. Why: tmux resolves a bare name by prefix when no session has that exact name.',
+        'it is about a human\'s command, never about how CSCB or agent-director reach a session.',
+      ].join('\n')
+      expect(termsIn(flat(fine), PREFIX_TARGETING_CLAIMS.map(([label, pattern]) => [label, pattern] as const))).toEqual([])
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// E36 T2: the README's install and startup texts point to the runbook and
+// name no install, re-install or removal (the E2-gate, E4 and E5 hatch notes;
+// b.jg5 SRJ-208, SRJ-212, SRJ-1101), read through OPERATOR_TEXTS
+// ---------------------------------------------------------------------------
+
+const INSTALL_CHECK_HEADING = '### Checking your agent-director install'
+const PREFLIGHT_GATES_HEADING = '### Preflight gates'
+const TROUBLESHOOTING_HEADING = '## Troubleshooting'
+
+/** The script SR-2.5 runs in `/publish`'s preflight (b.jg5 SRJ-211). */
+const AD_VERSION_CHECK_SCRIPT = 'scripts/ad-version-check.ts'
+
+/** The README's list item for `label` under `heading`, a nested item (`  - \`label\``) read as a top-level one. */
+function readmeLabelItem(heading: string, label: string, readme: string): string {
+  const section = requiredSection(readme, heading, 'README.md').replace(/^ {2}(?=- `)/gm, '')
+  return labelItem(section, label, `README.md "${heading}"`)
+}
+
+/**
+ * The install-check and startup-error entries of the classes this Task
+ * rewrote (the too-old and below-floor lines of "Startup errors" are checked
+ * under SRJ-208 above): each names the switch-over runbook section by its
+ * title, and a not-found entry its publishing-host block by its heading (the
+ * E35 hatch note's third bullet).
+ */
+const README_REMEDY_ITEMS: readonly [heading: string, label: string, required: readonly string[]][] = [
+  [INSTALL_CHECK_HEADING, AD_SYSTEM_INSTALL_NOT_FOUND, [PHASE1_RUNBOOK_SECTION_TITLE, `"${PUBLISHING_HOST_BLOCK_HEADING}"`]],
+  [INSTALL_CHECK_HEADING, AD_SYSTEM_INSTALL_TOO_OLD, [PHASE1_RUNBOOK_SECTION_TITLE]],
+  [INSTALL_CHECK_HEADING, AD_SYSTEM_INSTALL_UNREACHABLE, [PHASE1_RUNBOOK_SECTION_TITLE]],
+  [INSTALL_CHECK_HEADING, AD_VERSION_FLOOR_UNREADABLE, [PHASE1_RUNBOOK_SECTION_TITLE]],
+  [STARTUP_ERRORS_HEADING, AD_SYSTEM_INSTALL_NOT_FOUND, [PHASE1_RUNBOOK_SECTION_TITLE, `"${PUBLISHING_HOST_BLOCK_HEADING}"`]],
+  [STARTUP_ERRORS_HEADING, AD_SYSTEM_INSTALL_UNREACHABLE, [PHASE1_RUNBOOK_SECTION_TITLE]],
+  [STARTUP_ERRORS_HEADING, AD_VERSION_FLOOR_UNREADABLE, [PHASE1_RUNBOOK_SECTION_TITLE]],
+  [STARTUP_ERRORS_HEADING, AD_SHIM_CATALOG_INCOMPLETE, [vocab('unknownErrorName'), 'be misclassified']],
+]
+
+/** A remedy item's problems: what it lacks and each upgrade form it carries (the re-install row included). */
+function remedyItemProblems(heading: string, label: string, required: readonly string[], readme: string = operatorText('README.md')): string[] {
+  const item = readmeLabelItem(heading, label, readme)
+  return [...lacking(item, required), ...upgradeFormsIn(item)]
+}
+
+/** The `ad-same-user` ruling's own words, the one removal an install or startup text may name (as in tests/dependency-check.test.ts). */
+const NEVER_REMOVE_THE_FILE = 'never remove or recreate the file'
+
+/**
+ * The README "Startup errors" item for a state DB owned by another user (the
+ * `ad-same-user` entry; src/agent-director-startup.ts exports no constant for
+ * that label, so the item is found by what it says): the one class item that
+ * names `DEFAULT_STORE_PATH` as owned by a different UID. Throws unless
+ * exactly one does.
+ */
+function sameUserItem(readme: string): string {
+  const lines = requiredSection(readme, STARTUP_ERRORS_HEADING, 'README.md').split('\n')
+  const items = lines
+    .flatMap((line, i) => (line.startsWith('- `') ? [i] : []))
+    .map((start) => {
+      const end = lines.findIndex((line, i) => i > start && !/^\s+\S/.test(line))
+      return flat(lines.slice(start, end < 0 ? undefined : end).join('\n'))
+    })
+    .filter((item) => item.includes(`${code(DEFAULT_STORE_PATH)} is owned by a different UID`))
+  if (items.length !== 1) throw new Error(`README.md "${STARTUP_ERRORS_HEADING}": ${items.length} class items say ${DEFAULT_STORE_PATH} is owned by a different UID, expected 1`)
+  return items[0]
+}
+
+/** The same-user item's problems (the E2-gate ruling): run as the file's owner, the runbook section, no re-install and no removal but the ruling's own words. */
+function sameUserProblems(readme: string = operatorText('README.md')): string[] {
+  const item = sameUserItem(readme)
+  const rest = item.split(NEVER_REMOVE_THE_FILE).join('')
+  return [
+    ...lacking(item, [`the user that owns ${code(DEFAULT_STORE_PATH)}`, NEVER_REMOVE_THE_FILE, PHASE1_RUNBOOK_SECTION_TITLE]),
+    ...upgradeFormsIn(item),
+    ...[DELETE_WORDS, /\brecreat\w*/i].filter((pattern) => pattern.test(rest)).map((pattern) => `a removal: ${rest.match(pattern)?.[0]}`),
+  ]
+}
+
+/** A version written in prose (`0.8.0`, `0.7.x`). */
+const ANY_VERSION = /\b\d+\.\d+\.(?:\d+|x)\b/g
+
+/** An agent-director version requirement in a table row or paragraph ("`agent-director` ≥ 0.8.0"). */
+const AD_VERSION_CLAIM = /\bagent-director`?[^.|]{0,40}?\d+\.\d+\.\d+/g
+
+/**
+ * The README Troubleshooting paragraph "Bots come back with no memory …" (the
+ * E5 hatch note): it names the below-floor refusal and no version (b.ob2's
+ * "≥ 0.8.0" and install check's `0.7.0` floor are gone), and the
+ * `resume_enabled` row names no agent-director version.
+ */
+function noMemoryProblems(readme: string = operatorText('README.md')): string[] {
+  const units = textUnits(requiredSection(readme, TROUBLESHOOTING_HEADING, 'README.md')).filter((unit) => ci('**Bots come back with no memory').test(unit))
+  if (units.length !== 1) return [`${units.length} Troubleshooting units open with "Bots come back with no memory", expected 1`]
+  const rows = readme.split('\n').filter((line) => line.startsWith('| `resume_enabled` |'))
+  return [
+    ...lacking(units[0], [code(AD_BELOW_PHASE1_FLOOR)]),
+    ...[...units[0].matchAll(ANY_VERSION)].map((m) => `the paragraph names version ${m[0]}`),
+    ...(rows.length === 1 ? [...rows[0].matchAll(AD_VERSION_CLAIM)].map((m) => `the resume_enabled row: ${m[0]}`) : [`${rows.length} resume_enabled rows, expected 1`]),
+  ]
+}
+
+/**
+ * README "Preflight gates" (the E5 hatch note; b.jg5 SRJ-211): the count its
+ * lead names matches its numbered gates, and exactly one gate runs
+ * `scripts/ad-version-check.ts`, naming its exit (`AD_VERSION_CHECK_FAIL_EXIT_CODE`
+ * and its value), its `SR-2.5 (preflight)` line and the below-floor note's
+ * prefix, the runbook section and its publishing-host block, with no upgrade
+ * form.
+ */
+function preflightGateProblems(readme: string = operatorText('README.md')): string[] {
+  const section = requiredSection(readme, PREFLIGHT_GATES_HEADING, 'README.md')
+  const gates = section.split('\n').filter((line) => /^\d+\. /.test(line))
+  const lead = /\benforces (\w+) fail-fast gates\b/.exec(flat(section))?.[1]
+  const sr25 = gates.filter((gate) => gate.includes(code(AD_VERSION_CHECK_SCRIPT))).map(flat)
+  return [
+    ...(lead === countWord(gates.length) ? [] : [`the lead names ${lead} gates, the list has ${gates.length}`]),
+    ...gates.flatMap((gate, i) => (gate.startsWith(`${i + 1}. `) ? [] : [`gate ${i + 1} is numbered "${gate.slice(0, 4)}"`])),
+    ...(sr25.length === 1
+      ? [
+        ...lacking(sr25[0], [
+          `exit ${AD_VERSION_CHECK_FAIL_EXIT_CODE}`,
+          code('AD_VERSION_CHECK_FAIL_EXIT_CODE'),
+          code(SR25_PREFIX),
+          code(SR25_NOTE_PREFIX),
+          PHASE1_RUNBOOK_SECTION_TITLE,
+          `"${PUBLISHING_HOST_BLOCK_HEADING}"`,
+          ci('the server will not start on it'),
+        ]),
+        ...upgradeFormsIn(sr25[0]),
+      ]
+      : [`${sr25.length} gates name ${code(AD_VERSION_CHECK_SCRIPT)}, expected 1`]),
+  ]
+}
+
+describe("E36 T2: the README's install and startup texts point to the runbook and name no install, re-install or removal (E2 gate, E4, E5; b.jg5 SRJ-208, SRJ-212, SRJ-1101)", () => {
+  test.each(README_REMEDY_ITEMS)('README.md "%s": the `%s` item names %p and carries no upgrade or re-install form', (heading, label, required) => {
+    expect(remedyItemProblems(heading, label, required)).toEqual([])
+  })
+
+  test(`the "${PUBLISHING_HOST_BLOCK_HEADING}" links of the not-found items resolve to that block's heading in the switch-over section`, () => {
+    const readme = operatorText('README.md')
+    const anchor = headingSlug(PUBLISHING_HOST_BLOCK_HEADING)
+    for (const heading of [INSTALL_CHECK_HEADING, STARTUP_ERRORS_HEADING]) {
+      expect({ heading, linked: readmeLabelItem(heading, AD_SYSTEM_INSTALL_NOT_FOUND, readme).includes(`(#${anchor})`) }).toEqual({ heading, linked: true })
+    }
+    expect(headingAt(readme, anchor)?.title).toBe(PUBLISHING_HOST_BLOCK_HEADING)
+    const block = sectionRange(readme, new RegExp(`^#+ ${escapeRegExp(PUBLISHING_HOST_BLOCK_HEADING)}$`))
+    const runbook = sectionRange(readme, SWITCH_OVER_HEADING)
+    expect(block !== undefined && runbook !== undefined && block.start > runbook.start && block.end <= runbook.end).toBe(true)
+  })
+
+  test(`the ${STARTUP_ERRORS_HEADING.slice(3)} item for a state DB owned by another user: run as its owner, never remove or recreate it, the runbook section, no re-install`, () => {
+    expect(sameUserProblems()).toEqual([])
+  })
+
+  test('the Troubleshooting "Bots come back with no memory" paragraph and the `resume_enabled` row name no pre-floor agent-director version', () => {
+    expect(noMemoryProblems()).toEqual([])
+  })
+
+  test(`"${PREFLIGHT_GATES_HEADING.slice(4)}" lists SR-2.5 (${AD_VERSION_CHECK_SCRIPT}, exit ${AD_VERSION_CHECK_FAIL_EXIT_CODE}, the below-floor note) and counts its gates`, () => {
+    expect(existsSync(resolve(REPO_ROOT, AD_VERSION_CHECK_SCRIPT))).toBe(true)
+    expect(preflightGateProblems()).toEqual([])
+  })
+
+  test.each(OPERATOR_TEXTS)("%s: no text advises re-installing agent-director (UPGRADE_FORMS' re-install row; SRJ-1101, HO C8)", (_name, read) => {
+    expect(upgradeFormsIn(flat(read())).filter((form) => form === REINSTALL_FORM)).toEqual([])
+  })
+
+  describe('self-checks (each edits an in-memory README back to the wording this Task replaced)', () => {
+    const readme = () => operatorText('README.md')
+
+    test.each([
+      [INSTALL_CHECK_HEADING, AD_SYSTEM_INSTALL_NOT_FOUND, 'Install AD and retry.', /The message points to the block [^\n]*?no agent-director\./],
+      [INSTALL_CHECK_HEADING, AD_VERSION_FLOOR_UNREADABLE, 'The remediation is to check or reinstall the `agent-director` npm package.', /The message says to check the `agent-director` npm package [^\n]*?Phase 1"\./],
+      [STARTUP_ERRORS_HEADING, AD_SYSTEM_INSTALL_UNREACHABLE, 'Diagnose with the install-cscb skill or re-install agent-director.', /says to diagnose with the install-cscb skill, names the README section "[^"]*"/],
+      [STARTUP_ERRORS_HEADING, AD_SHIM_CATALOG_INCOMPLETE, 'Envelopes with these names would surface as the base AgentDirectorError.', /errors with these names would arrive as `ErrUnknownErrorName` and be misclassified/],
+    ] as const)('README.md "%s": the `%s` item fails with "%s"', (heading, label, old, current) => {
+      const text = readme()
+      const edited = text.replace(current, old)
+      expect(edited).not.toBe(text)
+      const required = README_REMEDY_ITEMS.find(([h, l]) => h === heading && l === label)![2]
+      expect(remedyItemProblems(heading, label, required, edited)).not.toEqual([])
+    })
+
+    test('the same-user item fails with "Reinstall agent-director as the correct user or remove the mismatched file."', () => {
+      const text = readme()
+      const edited = text.replace(/Run the server as the user that owns [^\n]*?Phase 1"\./, 'Reinstall agent-director as the correct user or remove the mismatched file.')
+      expect(edited).not.toBe(text)
+      expect(sameUserProblems(edited)).toEqual(expect.arrayContaining([REINSTALL_FORM, 'a removal: remove']))
+    })
+
+    test("the Troubleshooting paragraph fails with b.ob2's version advice back", () => {
+      const text = readme()
+      const edited = text.replace(/(\*\*Bots come back with no memory[^\n]*\n)[^\n]*/, `$1If it comes back amnesiac, confirm the system-installed \`agent-director\` is **≥ 0.8.0** (\`agent-director version\`). Its client floor is \`${CLIENT_MIN_VERSION}\`, so install-check passes on a \`0.7.x\` binary.`)
+      expect(edited).not.toBe(text)
+      expect(noMemoryProblems(edited)).not.toEqual([])
+    })
+
+    test('the resume_enabled row fails with its "≥ 0.8.0" requirement back', () => {
+      const text = readme()
+      const edited = text.replace(/^(\| `resume_enabled` \|[^\n]*?)( \|)$/m, '$1 Requires a system-installed `agent-director` ≥ 0.8.0 for reboot recovery.$2')
+      expect(edited).not.toBe(text)
+      expect(noMemoryProblems(edited)).toEqual(['the resume_enabled row: agent-director` ≥ 0.8.0'])
+    })
+
+    test('"Preflight gates" fails as the seven-gate list without SR-2.5', () => {
+      const text = readme()
+      const edited = text
+        .replace(/^6\. \*\*The host's agent-director[^\n]*\n/m, '')
+        .replace('enforces eight fail-fast gates', 'enforces seven fail-fast gates')
+        .replace(/^7\. \*\*No stranded/m, '6. **No stranded')
+        .replace(/^8\. \*\*`\/ci`/m, '7. **`/ci`')
+      expect(edited).not.toBe(text)
+      expect(preflightGateProblems(edited)).toEqual([`0 gates name ${code(AD_VERSION_CHECK_SCRIPT)}, expected 1`])
+    })
+
+    test('"Preflight gates" fails when the lead\'s count and the list disagree', () => {
+      const text = readme()
+      const edited = text.replace('enforces eight fail-fast gates', 'enforces seven fail-fast gates')
+      expect(edited).not.toBe(text)
+      expect(preflightGateProblems(edited)).not.toEqual([])
+    })
+  })
+})
+
 /** The two texts the E8 note names: the README and the debugging skill. */
 const E8_TEXTS: readonly string[] = ['README.md', DEBUG_SKILL_FILE]
 
@@ -3739,8 +4200,28 @@ function debugSkillAutoRestartEntry(): string {
 }
 
 describe('E8: the README and the debugging skill name no raw-command advice (b.jg5 SRJ-1001, SRJ-1101)', () => {
+  // The prefix-key rule's reason shows an attach without `=` on purpose
+  // (SRJ-1102): its spans, and only they, are left out with the switch-over
+  // section.
   test.each(E8_TEXTS.map((name) => [name] as const))('%s', (name) => {
-    expect(termsIn(withoutSwitchOverSection(operatorText(name), name), RAW_COMMAND_FORMS)).toEqual([])
+    expect(termsIn(withoutPrefixKeyReason(withoutSwitchOverSection(operatorText(name), name)), RAW_COMMAND_FORMS)).toEqual([])
+  })
+
+  test("self-check: the prefix-key reason's spans are left out, and any other attach without = is still reported", () => {
+    const session = personaTmuxSessionName(PREFIX_PAIR[0])
+    const spans = PREFIX_KEY_REASON_SPANS.map(([, span]) => span())
+    expect(spans.map((span) => termsIn(span, RAW_COMMAND_FORMS).length)).toEqual(spans.map(() => 1))
+    expect(termsIn(withoutPrefixKeyReason(spans.join('\n')), RAW_COMMAND_FORMS)).toEqual([])
+    const others = [
+      `Attach with \`tmux attach -t ${session}\`.`,
+      DOCS_PREFIX_KEY_REASON.replace(code(`tmux attach -t ${session}`), code(`tmux attach -t ${personaTmuxSessionName(PREFIX_PAIR[1])}`)),
+      renderedPrefixKeyMessage().replace('could reach', 'reaches'),
+    ]
+    for (const other of others) {
+      expect(termsIn(withoutPrefixKeyReason([...spans, other].join('\n')), RAW_COMMAND_FORMS).map((hit) => hit.split(': ')[0])).toEqual([
+        'a tmux attach target without =',
+      ])
+    }
   })
 
   test.each([

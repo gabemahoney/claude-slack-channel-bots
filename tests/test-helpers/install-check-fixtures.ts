@@ -19,13 +19,19 @@
  *     `src/ad-version-gate.ts`; labels come from `src/install-check-labels.ts`.
  *     The not-found, unreachable and floor-unreadable messages are copies of
  *     `src/install-check.ts`'s text, pinned by `tests/install-check.test.ts`,
- *     which compares real results whole with these canned ones.
+ *     which compares real results whole with these canned ones. Where a
+ *     message names the switch-over runbook section, its publishing-host
+ *     block or the client-package remedy, the copy takes that part from
+ *     `src/install-check.ts`'s exported text (`RUNBOOK_SECTION_POINTER`,
+ *     `PUBLISHING_HOST_BLOCK_POINTER`, `CLIENT_PACKAGE_REMEDY`; b.jg5
+ *     SRJ-208, SRJ-212), never a literal.
  *   - A fixture loader that reads files from tests/fixtures/version-floor/.
  *
  * This module has no top-level mock.module() calls — the pretest gate
  * scripts/check-no-toplevel-mock-module.ts must pass against it — and no
  * value import of `Client` or `resolveSystemBinary` (host-safety audit,
- * b.jg5 SRJ-1301): it imports `src/install-check.ts` for types only.
+ * b.jg5 SRJ-1301): from `src/install-check.ts` it imports the three text
+ * constants above and types only.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -48,11 +54,14 @@ import {
   AD_SYSTEM_INSTALL_UNREACHABLE,
   AD_VERSION_FLOOR_UNREADABLE,
 } from '../../src/install-check-labels.ts'
-import type {
-  InstallCheckClassLabel,
-  InstallCheckFailure,
-  InstallCheckResult,
-  InstallCheckSuccess,
+import {
+  CLIENT_PACKAGE_REMEDY,
+  PUBLISHING_HOST_BLOCK_POINTER,
+  RUNBOOK_SECTION_POINTER,
+  type InstallCheckClassLabel,
+  type InstallCheckFailure,
+  type InstallCheckResult,
+  type InstallCheckSuccess,
 } from '../../src/install-check.ts'
 import { CLIENT_MIN_VERSION, PHASE1_RC_VERSION } from './agent-director-versions.ts'
 
@@ -232,7 +241,7 @@ function defaultMessage(classLabel: InstallCheckClassLabel, detail: Record<strin
     case AD_SYSTEM_INSTALL_NOT_FOUND:
       return (
         `agent-director not found on PATH or at the standard install path. ` +
-        `Install agent-director system-wide and retry.`
+        `See ${PUBLISHING_HOST_BLOCK_POINTER}, which covers a host with no agent-director.`
       )
     case AD_SYSTEM_INSTALL_TOO_OLD:
       // The builder runInstallCheck uses (startup form): names the runbook
@@ -245,12 +254,12 @@ function defaultMessage(classLabel: InstallCheckClassLabel, detail: Record<strin
     case AD_SYSTEM_INSTALL_UNREACHABLE:
       return (
         `agent-director system install at ${detailString(detail, 'binaryPath', CANNED_BINARY_PATH)} is unreachable. ` +
-        `Reason: ${detailString(detail, 'reason', DEFAULT_UNREACHABLE_REASON)}. Diagnose with the install-cscb skill or re-install agent-director.`
+        `Reason: ${detailString(detail, 'reason', DEFAULT_UNREACHABLE_REASON)}. Diagnose with the install-cscb skill; see ${RUNBOOK_SECTION_POINTER}.`
       )
     case AD_VERSION_FLOOR_UNREADABLE:
       return (
         `Could not read agent-director's dist/version-floor.json. ` +
-        `Reinstall agent-director from npm and retry.`
+        CLIENT_PACKAGE_REMEDY
       )
   }
 }

@@ -60,10 +60,12 @@ import { dirname, join } from 'node:path'
 import {
   DEFAULT_PERSONA_CONFIG_FS,
   prePersonaConversionMessage,
+  prefixRelatedKeysReason,
   type Persona,
   type PersonaConfigFs,
   type PersonaInput,
 } from '../src/config.ts'
+import { personaTmuxSessionName } from '../src/persona-identity.ts'
 import type { PersonaBringUpOutcome, PersonaCredentialsChangeResult } from '../src/persona-bringup-controller.ts'
 import { CREDENTIALS_UNREADABLE_MARKER } from '../src/persona-credentials.ts'
 import {
@@ -151,13 +153,18 @@ function configOf(...personas: PersonaInput[]): { personas: PersonaInput[] } {
 /**
  * The loader's rejection of `alpha` then `alpha_2`, whose key starts with
  * `alpha`'s (the prefix-related key rule, b.1ix follow-up), after the
- * `Persona config validation error: ` prefix.
+ * `Persona config validation error: ` prefix. The reason sentence is
+ * b.jg5 SRJ-1102's, built by the loader's own reason builder for
+ * `slack_bot_alpha` and `slack_bot_alpha_2`.
  */
 function prefixRelatedKeysRejection(): string {
+  const reason = prefixRelatedKeysReason(
+    personaTmuxSessionName(h.key('alpha')),
+    personaTmuxSessionName(h.key('alpha_2')),
+  )
   return (
     `personas[1] "alpha_2" (key=${h.key('alpha_2')}): key alpha_2 starts with the key of personas[0] "alpha" (key=${h.key('alpha')}). ` +
-    'tmux matches a session name by its start, so once slack_bot_alpha is gone, a command meant for it ' +
-    '(reading its pane, typing into it, ending it) can act on slack_bot_alpha_2. ' +
+    `${reason} ` +
     "No persona's key may start with another persona's key: rename one of the two so that neither key starts with the other. " +
     'For example, rename personas[0] "alpha" (key=alpha) to "alpha_main" (key=alpha_main).'
   )

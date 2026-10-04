@@ -112,6 +112,18 @@ export const PHASE1_FLOOR_VERSION = '0.11.0'
 export const PHASE1_RUNBOOK_SECTION_TITLE = 'Switching over to agent-director Phase 1'
 
 /**
+ * Heading of the publishing-host block inside the
+ * {@link PHASE1_RUNBOOK_SECTION_TITLE} section (b.jg5 SRJ-1108, SRJ-211,
+ * SRJ-212): the host that publishes the release, or one with no
+ * agent-director. The README's block heading must equal this constant. The
+ * install check's not-found message (`src/install-check.ts`), the startup
+ * gate's not-found message (`src/agent-director-startup.ts`) and `/publish`'s
+ * not-found and below-client-minimum diagnostics
+ * (`scripts/ad-version-check.ts`) name it.
+ */
+export const PUBLISHING_HOST_BLOCK_HEADING = 'The publishing host'
+
+/**
  * The operator instruction every `ad-below-phase1-floor` entry carries
  * (b.jg5 SRJ-1013). It names the switch-over runbook and gives no instruction
  * to upgrade agent-director (b.jg5 SRJ-208).

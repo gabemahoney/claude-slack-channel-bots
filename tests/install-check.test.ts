@@ -29,8 +29,23 @@
  *   - a client minimum that is not a version fails floor unreadable;
  *   - a malformed floor file or a missing field (seeded failures) is returned
  *     unchanged, without calling the resolver;
- *   - one sweep: no message and no note carries an upgrade instruction or
- *     command (`UPGRADE_FORMS`, and "Upgrade agent-director" in any case).
+ *   - the remedies (b.jg5 SRJ-208, SRJ-212; the E2-gate, E5 and E35 hatch
+ *     notes): the shared pointer texts name the runbook section's title, the
+ *     publishing-host block's heading (`PUBLISHING_HOST_BLOCK_HEADING`, from
+ *     `tests/test-helpers/runbooks.ts`) and the client-package check; each of
+ *     the five floor-unreadable failures carries the client-package remedy
+ *     and the section title; the unreachable failure the section title and
+ *     the install-cscb skill; the "other" failure the section title and "file
+ *     a bug"; the not-found failure the publishing-host block and the section
+ *     title. One case per failure, named;
+ *   - one sweep: no message and no note carries an upgrade or re-install
+ *     instruction or command (`UPGRADE_FORMS`, its re-install row included,
+ *     and "Upgrade agent-director" in any case), an instruction to install
+ *     agent-director or a file removal (`INSTALL_OR_REMOVAL_FORMS`); each
+ *     finding names its case. Self-checks: each `INSTALL_OR_REMOVAL_FORMS`
+ *     sample is flagged by its own row, and that list does not flag the
+ *     remedies' own wording. The re-install row's self-checks live with
+ *     `UPGRADE_FORMS`' others in shipped-docs.test.ts.
  *
  * `readClientMinVersion` over its injected resolver and reader:
  *   - a readable floor file gives its `min_binary_version` (a string that is
@@ -78,6 +93,9 @@ import {
   AD_SYSTEM_INSTALL_TOO_OLD,
   AD_SYSTEM_INSTALL_UNREACHABLE,
   AD_VERSION_FLOOR_UNREADABLE,
+  CLIENT_PACKAGE_REMEDY,
+  PUBLISHING_HOST_BLOCK_POINTER,
+  RUNBOOK_SECTION_POINTER,
   type InstallCheckFailure,
   type InstallCheckResolveSystemBinary,
   type InstallCheckResult,
@@ -118,7 +136,8 @@ import {
   UNREACHABLE_REASONS,
 } from './test-helpers/install-check-fixtures.ts'
 import { flat } from './test-helpers/markdown.ts'
-import { UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
+import { PUBLISHING_HOST_BLOCK_HEADING } from './test-helpers/runbooks.ts'
+import { INSTALL_OR_REMOVAL_FORMS, UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -648,10 +667,95 @@ describe('readClientMinVersion: a call with an injected dep bypasses the floor c
 })
 
 // ---------------------------------------------------------------------------
-// No upgrade instruction anywhere (AC 81)
+// The remedies: the runbook section, no install, re-install or removal
+// (b.jg5 SRJ-208, SRJ-212; E2-gate, E5 and E35 hatch notes)
 // ---------------------------------------------------------------------------
 
-describe('runInstallCheck: no message and no note advises upgrading agent-director (SRJ-212, AC 81)', () => {
+/** SRJ-208's client-package check, in the SRD's words. */
+const CLIENT_PACKAGE_CHECK = 'Check the agent-director npm package installed with CSCB'
+
+describe('runInstallCheck: each failure points to the switch-over runbook and names no install (SRJ-208, SRJ-212)', () => {
+  test('the shared texts: the section by its title, its publishing-host block by its heading, the client-package check with the section', () => {
+    expect(RUNBOOK_SECTION_POINTER).toContain(`"${PHASE1_RUNBOOK_SECTION_TITLE}"`)
+    expect(PUBLISHING_HOST_BLOCK_POINTER).toContain(`"${PUBLISHING_HOST_BLOCK_HEADING}"`)
+    expect(PUBLISHING_HOST_BLOCK_POINTER).toContain(RUNBOOK_SECTION_POINTER)
+    expect(CLIENT_PACKAGE_REMEDY.startsWith(CLIENT_PACKAGE_CHECK)).toBe(true)
+    expect(CLIENT_PACKAGE_REMEDY).toContain(RUNBOOK_SECTION_POINTER)
+    expect(CLIENT_PACKAGE_REMEDY).not.toContain('@latest')
+  })
+
+  /** The floor-unreadable failure a minimum that is not a version gives. */
+  async function notAVersionFailure(): Promise<InstallCheckFailure> {
+    setFloorForTests(DEV_UNPARSEABLE_VERSION)
+    return failureOf((await check({ version: PHASE1_RC_VERSION })).result)
+  }
+
+  /** The five floor-unreadable failures: the four failed reads and a minimum that is not a version. */
+  const FLOOR_UNREADABLE_CASES: ReadonlyArray<[mode: string, failure: () => InstallCheckFailure | Promise<InstallCheckFailure>]> = [
+    ...FLOOR_READ_FAILURES.map(([mode, failure]): [string, () => InstallCheckFailure] => [mode, () => failure]),
+    ['a minimum that is not a version', notAVersionFailure],
+  ]
+
+  test.each(FLOOR_UNREADABLE_CASES)('floor unreadable (%s): the client-package remedy naming the section title, no @latest', async (_mode, failureFor) => {
+    const failure = await failureFor()
+    expect(failure.classLabel).toBe(AD_VERSION_FLOOR_UNREADABLE)
+    expect(failure.message).toContain(CLIENT_PACKAGE_REMEDY)
+    expect(failure.message).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
+    expect(failure.message).not.toContain('@latest')
+  })
+
+  test('unreachable: the section title, and the install-cscb skill kept', async () => {
+    const failure = failureOf((await check({ throws: errSystemInstallUnreachable(UNREACHABLE_REASONS[0]) })).result)
+    expect(failure.classLabel).toBe(AD_SYSTEM_INSTALL_UNREACHABLE)
+    expect(failure.message).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
+    expect(failure.message).toContain('install-cscb skill')
+  })
+
+  test('other: the section title, and "file a bug" kept', async () => {
+    const failure = failureOf((await check({ throws: new Error(RAW_THROWN_TEXT) })).result)
+    expect(failure.detail.reason).toBe(HOST_VERSION_FAIL_OTHER)
+    expect(failure.message).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
+    expect(failure.message).toContain('file a bug')
+  })
+
+  test('not found: the publishing-host block by its heading, in the section by its title', async () => {
+    const failure = failureOf((await check({ throws: errSystemInstallNotFound() })).result)
+    expect(failure.classLabel).toBe(AD_SYSTEM_INSTALL_NOT_FOUND)
+    expect(failure.message).toContain(`"${PUBLISHING_HOST_BLOCK_HEADING}"`)
+    expect(failure.message).toContain(PHASE1_RUNBOOK_SECTION_TITLE)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// No upgrade, re-install, install or removal instruction anywhere (AC 81)
+// ---------------------------------------------------------------------------
+
+describe('the forbidden forms the sweep adds: self-checks', () => {
+  test.each(INSTALL_OR_REMOVAL_FORMS)('the %s row flags its own sample', (_label, pattern, sample) => {
+    expect(pattern.test(flat(sample))).toBe(true)
+  })
+
+  // The re-install row's self-checks sit with UPGRADE_FORMS' other
+  // self-checks, in shipped-docs.test.ts.
+  test.each([
+    ['the client-package remedy', CLIENT_PACKAGE_REMEDY],
+    ['the publishing-host pointer', PUBLISHING_HOST_BLOCK_POINTER],
+    ['the install-cscb skill', 'Diagnose with the install-cscb skill.'],
+    ['the too-old message', buildSystemInstallTooOldMessage({ foundVersion: BELOW_CLIENT_MIN_VERSION, requiredVersion: CLIENT_MIN_VERSION, binaryPath: binaryPath('self-check') })],
+  ])('the install-or-removal rows do not flag %s', (_name, text) => {
+    expect(INSTALL_OR_REMOVAL_FORMS.filter(([, pattern]) => pattern.test(flat(text))).map(([label]) => label)).toEqual([])
+  })
+
+  test.each([
+    'Install agent-director system-wide and retry.',
+    'Operator recovery: install agent-director, then rerun.',
+    'install agent-director by following your own notes',
+  ])('the install row flags an install instruction that does not follow the switch-over runbook: %s', (text) => {
+    expect(INSTALL_OR_REMOVAL_FORMS[0]![1].test(flat(text))).toBe(true)
+  })
+})
+
+describe('runInstallCheck: no message and no note advises upgrading, re-installing or installing agent-director, or removing a file (SRJ-208, SRJ-212, AC 81)', () => {
   /** Every case above, as a (floor seed, resolver) pair. */
   const SWEEP: ReadonlyArray<[label: string, floor: string | InstallCheckFailure, resolve: InstallCheckResolveSystemBinary]> = [
     ...[PHASE1_RC_VERSION, OLD_AD_VERSION, DEV_PLACEHOLDER_VERSION, CLIENT_MIN_VERSION, BELOW_CLIENT_MIN_VERSION].map(
@@ -683,7 +787,7 @@ describe('runInstallCheck: no message and no note advises upgrading agent-direct
     ]),
   ]
 
-  test('every case: no message and no note carries an upgrade form or "Upgrade agent-director"', async () => {
+  test('every case: no message and no note carries an upgrade, re-install, install or removal form, or "Upgrade agent-director"', async () => {
     const texts: string[] = []
     for (const [label, floor, resolve] of SWEEP) {
       resetCacheForTests()
@@ -696,7 +800,7 @@ describe('runInstallCheck: no message and no note advises upgrading agent-direct
         label,
         upgradeAgentDirector: false,
       })
-      for (const [form, pattern] of UPGRADE_FORMS) {
+      for (const [form, pattern] of [...UPGRADE_FORMS, ...INSTALL_OR_REMOVAL_FORMS]) {
         expect({ label, form, matches: pattern.test(flat(text)) }).toEqual({ label, form, matches: false })
       }
     }

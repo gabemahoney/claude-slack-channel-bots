@@ -1320,12 +1320,44 @@ const PREFIX_RELATED_KEYS_HINT =
   "No persona's key may start with another persona's key: rename one of the two so that neither key starts with the other."
 
 /**
+ * The prefix-related key rule's reason sentence (b.jg5 SRJ-1102): tmux
+ * matches a session target by prefix unless it is written with `=`, so a
+ * human's tmux command without `=` for one persona could reach another
+ * persona's session. The one source of that sentence: the validation text
+ * ({@link describePrefixRelatedKeys}) passes the shorter key's session name
+ * and the longer key's session name; the operator docs' form passes
+ * `slack_bot_dev` and "another persona's session", with `code` wrapping each
+ * code span (`=` and the example command) in backticks. It is about a
+ * human's command only, never about how CSCB or agent-director reach a
+ * session. Pure.
+ *
+ * @param exampleSession  The session name in the example command
+ *   (`tmux attach -t <exampleSession>`).
+ * @param reaches  What that command could reach: the longer key's session
+ *   name, or a description of it.
+ * @param code  Formats a code span; default: the text unchanged.
+ */
+export function prefixRelatedKeysReason(
+  exampleSession: string,
+  reaches: string,
+  code: (text: string) => string = (text) => text,
+): string {
+  return (
+    `tmux matches a session target by prefix unless it is written with ${code('=')}, ` +
+    `so a human's tmux command without ${code('=')} for one persona ` +
+    `(for example ${code(`tmux attach -t ${exampleSession}`)}) could reach ${reaches}.`
+  )
+}
+
+/**
  * The error text, after the later persona's prefix, for two personas whose
  * keys are prefix-related (and not equal: the unique-key rule runs first).
- * Names the earlier persona, says which key starts with which and what tmux
- * would do with the two session names, and suggests a new name for the
- * persona with the shorter key when `suggestNonPrefixingName` finds one
- * against every other persona in `personas`.
+ * Names the earlier persona, says which key starts with which, gives the
+ * rule's reason ({@link prefixRelatedKeysReason}, with the shorter key's
+ * session name as the example and the longer key's as what it could reach),
+ * and suggests a new name for the persona with the shorter key when
+ * `suggestNonPrefixingName` finds one against every other persona in
+ * `personas`.
  */
 function describePrefixRelatedKeys(earlier: Persona, later: Persona, personas: readonly Persona[]): string {
   const other = renderIndexedPersonaRef(earlier)
@@ -1334,10 +1366,7 @@ function describePrefixRelatedKeys(earlier: Persona, later: Persona, personas: r
   const relation = laterIsLonger
     ? `key ${later.key} starts with the key of ${other}.`
     : `key ${later.key} is the start of the key of ${other}.`
-  const shorterSession = personaTmuxSessionName(shorter.key)
-  const why =
-    `tmux matches a session name by its start, so once ${shorterSession} is gone, a command meant for it ` +
-    `(reading its pane, typing into it, ending it) can act on ${personaTmuxSessionName(longer.key)}.`
+  const why = prefixRelatedKeysReason(personaTmuxSessionName(shorter.key), personaTmuxSessionName(longer.key))
   const suggestion = suggestNonPrefixingName(shorter.key, personas.filter((p) => p !== shorter))
   const example =
     suggestion === undefined
@@ -1348,13 +1377,11 @@ function describePrefixRelatedKeys(earlier: Persona, later: Persona, personas: r
 
 /**
  * No persona's key may be a prefix of another persona's key (b.1ix
- * follow-up). tmux resolves a session target that names no session exactly
- * as the start of a longer session name, and agent-director 0.10.0's own
- * verbs (read-pane, send-keys, kill, the has-session inside resume) pass
- * `slack_bot_<key>` to tmux bare. With keys `dev` and `dev_2`, once
- * `slack_bot_dev` is gone, a pane read, keys or a kill meant for `dev` land
- * in `dev_2`'s session. The instance IDs (`cscb_<key>`) stand in the same
- * relation, so this one rule covers them too.
+ * follow-up; reason per b.jg5 SRJ-1102, {@link prefixRelatedKeysReason}).
+ * tmux matches a session target by prefix unless it is written with `=`, so
+ * with keys `dev` and `dev_2` a human's `tmux attach -t slack_bot_dev`
+ * could reach `slack_bot_dev_2`. The instance IDs (`cscb_<key>`) stand in
+ * the same relation, so this one rule covers them too.
  *
  * Order: personas are scanned in array order; the first one whose key is
  * prefix-related to an earlier persona's key is reported, against the

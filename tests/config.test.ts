@@ -37,6 +37,7 @@ import {
   parsePersonaConfigBytes,
   PersonaConfigReadError,
   personaKeysPrefixRelated,
+  prefixRelatedKeysReason,
   readPersonaConfigBytes,
   referencedCredentialsPaths,
   resolveServerConfigPath,
@@ -46,7 +47,7 @@ import {
   type PersonaConfigInput,
   type PersonaInput,
 } from '../src/config.ts'
-import { personaKey } from '../src/persona-identity.ts'
+import { personaKey, personaTmuxSessionName } from '../src/persona-identity.ts'
 import { assertSendable } from '../src/lib.ts'
 import {
   makePersona,
@@ -887,14 +888,19 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     })
   })
 
-  // b.1ix follow-up: tmux resolves a session target that names no session
-  // exactly as the start of a longer session name, and agent-director
-  // 0.10.0's verbs pass `slack_bot_<key>` bare, so no persona's key may start
-  // with another persona's key. The rule runs after the name/key uniqueness
-  // rule and before the shared-path rule, in record mode too.
+  // b.1ix follow-up: no persona's key may start with another persona's key.
+  // The reason (b.jg5 SRJ-1102): tmux matches a session target by prefix
+  // unless it is written with `=`, so a human's tmux command without `=` for
+  // one persona could reach another persona's session. The rule runs after
+  // the name/key uniqueness rule and before the shared-path rule, in record
+  // mode too.
   describe('prefix-related keys (b.1ix follow-up)', () => {
     const HINT =
       "No persona's key may start with another persona's key: rename one of the two so that neither key starts with the other."
+
+    /** SRJ-1102's reason sentence for a shorter and a longer key, from the loader's own reason builder. */
+    const reasonFor = (shorterKey: string, longerKey: string) =>
+      prefixRelatedKeysReason(personaTmuxSessionName(shorterKey), personaTmuxSessionName(longerKey))
 
     /** `personas[i]` plus the b.av2 SR-2.2 reference (JSON-quoted name with its key). */
     const indexedRef = (index: number, name: string) =>
@@ -909,8 +915,8 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       expect(loadError(withPersonas(...personasOf('dev', 'dev_2')))).toBe(
         `loadPersonaConfig: invalid persona config in "${join(dir, 'config.json')}": Persona config validation error: ` +
           'personas[1] "dev_2" (key=dev_2): key dev_2 starts with the key of personas[0] "dev" (key=dev). ' +
-          'tmux matches a session name by its start, so once slack_bot_dev is gone, a command meant for it ' +
-          '(reading its pane, typing into it, ending it) can act on slack_bot_dev_2. ' +
+          'tmux matches a session target by prefix unless it is written with =, so a human\'s tmux command ' +
+          'without = for one persona (for example tmux attach -t slack_bot_dev) could reach slack_bot_dev_2. ' +
           `${HINT} For example, rename personas[0] "dev" (key=dev) to "dev_main" (key=dev_main).`,
       )
     })
@@ -1022,8 +1028,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       })
       const shorterKey = personaKey(names[shorter]!)
       const longerKey = personaKey(names[longer]!)
-      expect(message).toContain(`once slack_bot_${shorterKey} is gone, a command meant for it`)
-      expect(message).toContain(`can act on slack_bot_${longerKey}. ${HINT}`)
+      expect(message).toContain(`${relation} ${reasonFor(shorterKey, longerKey)} ${HINT}`)
       if (rename === undefined) {
         expect(message).toEndWith(HINT)
         expect(message).not.toContain('For example')
@@ -1032,6 +1037,22 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
           `${HINT} For example, rename ${indexedRef(shorter, names[shorter]!)} to ${JSON.stringify(rename)} (key=${rename}).`,
         )
       }
+    })
+
+    // AC 78: the reason is about a human's tmux command only. No rejection
+    // keeps the old "once <shorter> is gone" clause, names agent-director,
+    // CSCB or a version, or says anything but tmux matches by prefix.
+    test.each(rows)('rejected: $label, with no old clause and no claim that CSCB or agent-director matches by prefix', ({ names }) => {
+      const message = loadError(withPersonas(...personasOf(...names)))
+      const text = message.slice(message.indexOf('Persona config validation error: '))
+      for (const old of ['is gone', 'a command meant for it', 'can act on', 'by its start']) {
+        expect(text).not.toContain(old)
+      }
+      expect(text).not.toMatch(/agent-director|CSCB|\bserver\b|\bbare\b/i)
+      expect(text).not.toMatch(/\bAD\b/)
+      expect(text).not.toMatch(/\d+\.\d+/)
+      expect(text.split('by prefix')).toHaveLength(2)
+      expect(text).toContain('tmux matches a session target by prefix unless it is written with =, ')
     })
 
     test.each([
@@ -1115,7 +1136,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       const shorter = key.slice(0, key.indexOf('_'))
       const message = loadError(withPersonas(...personasOf(shorter, name)), name)
       expect(message).toContain(`${indexedRef(1, name)}: key ${key} starts with the key of ${indexedRef(0, shorter)}.`)
-      expect(message).toContain(`can act on slack_bot_${key}.`)
+      expect(message).toContain(` ${reasonFor(shorter, key)} ${HINT}`)
       expect(message).toEndWith(`For example, rename ${indexedRef(0, shorter)} to "${shorter}_main" (key=${shorter}_main).`)
     })
   })
