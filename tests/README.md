@@ -122,9 +122,9 @@ scratch HOME, every `homedir()` path lands in `$S`, never in the real
 ## Docker integration suite
 
 Bash scripts that install the packed package, write a persona config and
-start the server in dry run. Three scripts leave dry run: Test 4 runs its
-driver, which spawns under a stub `claude` and starts no server, and Tests 10
-and 12 start a live server, against the loopback Slack stub.
+start the server in dry run. Four scripts leave dry run: Test 4 runs its
+driver, which spawns under a stub `claude` and starts no server, and Test 0
+and Tests 10 and 12 start a live server, against the loopback Slack stub.
 `/ci` packs
 the package, builds the image from `docker/Dockerfile.test` (on the base in
 `docker/Dockerfile.test.base`, see `docker/README.md`) and runs `tests/runner.sh` inside it. The verdict is
@@ -154,14 +154,16 @@ why:
   `FAIL: <test>: refused: /etc/cscb-ci-image is absent …` and exits 1 before
   it makes a scratch root, picks a port or sets a trap. Tests 1 to 4, which do
   not source the helper, carry the same check as their own first step.
-- `fixtures/fmk-driver.ts`: its first statement checks the marker and exits
-  2 before it reads an argument or loads a module; it statically imports only
-  `node:` built-ins. (`fixtures/phase1-client-check.ts` also refuses to run
-  without the marker.)
+- `fixtures/fmk-driver.ts` and `fixtures/stub-mcp-session.ts`: the first
+  statement of each checks the marker and exits 2 before it reads an argument
+  or loads a module; each statically imports only `node:` built-ins.
+  (`fixtures/phase1-client-check.ts` also refuses to run without the marker.)
 - Every `scenario.sh` step that installs, moves or swaps an agent-director
-  binary or the shim, every harness agent-director call (`ad`, `ad_capture`)
-  and every harness `sqlite3` read or edit (`ad_store_edit`, `ad_store_id`)
-  calls `require_ci_image` as its first step, which fails with
+  binary or the shim, every harness agent-director call (`ad`, `ad_capture`),
+  every harness `sqlite3` read or edit (`ad_store_edit`, `ad_store_id`,
+  `ad_store_pending_no_launch`) and every stub-worker helper (`stub_mode`,
+  `stub_press_enter`, `write_mcp_config`) calls `require_ci_image` as its
+  first step, which fails with
   `FAIL: <test>: <step>: refused: /etc/cscb-ci-image is absent …`.
 
 The same helpers then call `require_scenario_home`, which refuses unless
@@ -207,19 +209,34 @@ tests/
                                    # real tmux; a live one-persona start whose dialog the approver clears through agent-director, with no tmux line whose parent is
                                    # the bot server and the three closing assertions passing, both positive controls met by that start's own lines; harness
                                    # `kill --include-finished` calls passing; each assertion, positive control and count helper failing on a violating log; the
-                                   # closing enforcement; and the trap stopping the scenario's tmux server. It ends with the three closing assertions
+                                   # closing enforcement; and the trap stopping the scenario's tmux server. Its stub legs show the stub's MCP session registered as
+                                   # the persona's, with no reconnect or relaunch over three health ticks and the persona not connected once the stub ends; the stub
+                                   # run directly (its version line, the default dev-channels dialog, `silent`, a stop line on stderr); the stub helpers refusing
+                                   # and working; the SessionStart re-fire in every reporting path (at once, a folder trusted in either config, and the dev-channels,
+                                   # unrecognised and folder-trust dialogs answered by `stub_press_enter`) against a row a silent worker holds `pending`, every fire
+                                   # ignored as `pid_mismatch` and none after G; exactly one stop line after a failed `status` read and after a `pending` row with no
+                                   # launch start; and no stub line counted as CSCB's. The re-fire legs wait out agent-director's default G (60 s; the self-check
+                                   # writes no `[tmux]` table), so it runs about two minutes. It ends with the three closing assertions
     lib/
       scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards (see Scenario helper below)
     fixtures/
       agent-director-shim.sh       # the logging agent-director shim of fmk mode: logs each call's argv and parent, then execs the real binary beside it
       tmux-shim.sh                 # the logging tmux shim of fmk mode, first on the PATH of every CSCB process: logs each call's argv and parent, then acts on its
                                    # mode (log, fail-kill, fail-create, slow-create, wedge)
-      fmk-driver.ts                # the driver of the calls an fmk scenario forces; refuses to run without the image marker /etc/cscb-ci-image and
-                                   # imports the installed package and its agent-director client only after that check
+      fmk-driver.ts                # the driver of the calls an fmk scenario forces, run through `cscb_run`, each through the installed package's production code
+                                   # with one `DRIVER:` outcome line: a `resume` (scenario 5) and a reuse spawn (scenarios 8 and 25) through the package's
+                                   # forced-launch seams, and the persona's pane read under another TMUX_TMPDIR (scenario 26); refuses to run without the image
+                                   # marker /etc/cscb-ci-image and imports the installed package and its agent-director client only after that check
       driver.ts                    # Test 4 driver: builds a one-persona config, calls spawnForPersona directly, then follows the persona's dialog approver through the package's seams
                                    # (running when the launch returns, stops because the row went live, keeps the launch start); deletes no row
-      stub-claude.sh               # fake `claude` (Tests 4, 10 and 12): prints the dev-channels dialog; on Enter, and on its exit sentinel, fires every SessionStart, and SessionEnd,
-                                   # hook its `--settings` registers, as direct children of its own process (exec form: `command` with its `args`; shell form: the command's words)
+      stub-claude.sh               # fake `claude` (Tests 4, 10 and 12, and every fmk script): runs the mode its working directory selects (the dev-channels
+                                   # dialog by default, at once, silent, an unrecognised dialog, the folder-trust prompt), reports in by firing every SessionStart
+                                   # hook its `--settings` registers, and SessionEnd on its exit sentinel, as direct children of its own process (exec form:
+                                   # `command` with its `args`; shell form: the command's words); re-fires SessionStart while its row reads `pending`, up to G;
+                                   # holds an MCP session to the bot server (see The stub worker)
+      stub-mcp-session.ts          # the stub's MCP session client, copied beside the stub in every fmk script: connects to the bot server named by the stub's
+                                   # `--mcp-config` with the package's own MCP SDK and holds the session until the stub ends; refuses to run without the image
+                                   # marker /etc/cscb-ci-image and imports the package only after that check
       slack-stub-server.ts         # Tests 10 and 12 loopback Slack stub: Web API, apps.connections.open, Socket Mode WebSocket, JSONL record
       phase1-client-check.ts       # run by Test 1 on the installed package, after the client-under-test check
                                    # against the agent-director client the installed package resolves: the package's Phase-1-only bindings and SRJ-103 classes are the client's own,
@@ -365,7 +382,8 @@ fmk mode. Sourcing also:
   the scenario's own tmux server;
 - exports a PATH that starts with the scenario's bin directory
   (`SCENARIO_BIN`), where `claude` is a copy of `fixtures/stub-claude.sh`,
-  followed by the container's PATH without every directory that holds an
+  with a copy of `fixtures/stub-mcp-session.ts` beside it and the stub's mode
+  selections (see The stub worker), followed by the container's PATH without every directory that holds an
   `agent-director` (the image's default agent-director directory among them)
   and without relative or empty entries. bun's directory stays. No process of
   the scenario finds an agent-director on PATH: the client finds the scenario
@@ -385,6 +403,10 @@ fmk mode. Sourcing also:
 - writes no agent-director `config.toml`, so agent-director runs on its
   default settings. Scenarios 10 and 24 are the exceptions: they write a
   `[tmux]` table;
+- once `SCENARIO_PORT` is picked, writes `$HOME/.claude/slack-mcp.json`
+  (`write_mcp_config`), naming the bot server's MCP URL on that port, the
+  `mcp_config_path` a persona config defaults to, so the stub's MCP session
+  reaches the scenario's server;
 - installs the tmux shim for the scenario's CSCB processes, in `log` mode, and
   starts the CSCB process record (see The tmux shim and CSCB processes below).
 
@@ -450,6 +472,8 @@ Harness agent-director calls and store helpers:
   scenario HOME's `.agent-director/state.db` and fails with sqlite3's error;
   `ad_store_id` opens the store read-only and prints its store id, failing,
   saying why, unless it is 16 lowercase hex characters.
+  `ad_store_pending_no_launch <instance-id>` is one such edit (see The stub
+  worker).
 - Each of these, `install_ad_shim` and every other install helper above calls
   `require_ci_image` and then `require_scenario_home` as its first two steps
   (see Image marker).
@@ -690,6 +714,95 @@ These hold for every fmk script (b.jg5 SRJ-1401):
   --record`).
 - Shim logs are read by parent process, as above, never by scraping a pane.
 
+### The stub worker
+
+`fixtures/stub-claude.sh` stands in for `claude` in every script that
+launches through the real agent-director (Test 4, Tests 10 and 12, every fmk
+script). Its header comment is the full statement; this is the part every
+scenario relies on (b.jg5 SRJ-1306).
+
+Modes. The stub's working directory, by its real path, selects its mode.
+`stub_mode <dir> <mode>` adds the selection to `stub-claude-modes` beside the
+stub in `SCENARIO_BIN` (fmk mode only; `<dir>` must be a directory under
+`SCENARIO_ROOT`); the last selection of a directory wins, and a stub reads it
+when it starts, so it holds from the next launch or resume there. The mode
+names are `scenario.sh` constants:
+
+| Mode | Constant | What the stub does |
+|---|---|---|
+| `dev-channels` | `STUB_MODE_DEV_CHANNELS` | Prints the dev-channels dialog, which CSCB's approver answers, and reports in on the Enter. A directory with no selection, and a stub with no selection file beside it (Tests 4, 10 and 12), runs this mode |
+| `at-once` | `STUB_MODE_AT_ONCE` | Reports in at once |
+| `silent` | `STUB_MODE_SILENT` | Prints nothing and never reports in; its exit sentinel fires no SessionEnd |
+| `unrecognised-dialog` | `STUB_MODE_UNRECOGNISED` | Prints a startup dialog that neither of the approver's needles matches, so CSCB never answers it, and reports in once Enter reaches its pane: the harness's `stub_press_enter <target>`, a human answering (scenarios 20 and 21) |
+| `folder-trust` | `STUB_MODE_FOLDER_TRUST` | Reports in at once when its folder is trusted in `<CLAUDE_CONFIG_DIR>/.claude.json`, or in `~/.claude.json` when `CLAUDE_CONFIG_DIR` is unset or empty; otherwise prints the folder-trust prompt and reports in once it is answered by Enter (scenario 22) |
+
+`stub_press_enter <target>` sends Enter with the real tmux, from the
+scenario's own shell, into a pane on the scenario's tmux server: a pane id is
+used as given, and a session name is matched exactly, never as a prefix of
+another session's. It fails with tmux's message when tmux refuses, and
+refuses when `TMUX` is set or `TMUX_TMPDIR` is not the scenario's.
+
+A scenario whose launch loses its create reply (`slow-create`) keeps a mode
+that waits for the approver's Enter, as the default does: agent-director
+applies no hook to a row whose pane it has not adopted, and the approver's
+`send-keys` adopts it before the stub reports in.
+
+Hooks. To report in, the stub fires every SessionStart hook its `--settings`
+registers; its exit sentinel `__CSCB_TEST_EXIT__` fires every SessionEnd hook.
+Each hook runs as a direct child of the stub's process, the pane's main
+process, with its payload on standard input and no `agent_id` in it, never
+through a shell. An exec-form entry runs `command` with its `args`; an entry
+with no `args` (agent-director 0.10.0's shell form) runs the words of its
+`command`. An entry's `timeout` is not acted on.
+
+The SessionStart re-fire. In every mode that reports in, whatever made it
+report in (at once, a trusted folder, Enter at a dialog, a resume), the stub
+then reads its own row every 2 s and fires SessionStart again while the row
+reads `pending`, until G has passed since the row's launch start.
+
+- It reads the row with `status --claude-instance-id <id>`, run with the
+  program its first registered SessionStart hook names. Under the release
+  candidate's hooks that is the real binary, so the reads bypass the
+  agent-director shim. The id is `AGENT_DIRECTOR_INSTANCE_ID`, which
+  agent-director puts in the worker's environment; the hooks' `args` carry
+  none.
+- G is `[tmux] pending_grace_seconds` in the scenario HOME's
+  `.agent-director/config.toml`, read at every tick; with no such value it is
+  agent-director's default, 60 s.
+- A row that reads another state, or `pending` past G, ends the re-fire with
+  nothing written.
+- A failed read (no instance id, a non-zero exit, output that is not a status
+  object, a launch start that is not a time), or a row that reads `pending`
+  with no launch start, ends the re-fire too: the stub fires nothing more and
+  writes one stop line. `ad_store_pending_no_launch <instance-id>` makes such
+  a row from a live one, with one store edit, and checks it reads so.
+
+The stop line is the agent-director shim's line format with kind `stop`; its
+words are `stub-claude stopped re-firing SessionStart for instance <id>:
+<why>`. It is appended to `agent-director-shim.log` beside the binary the
+reads run, the shim's log in an fmk HOME, or written to the stub's standard
+error where no such file exists (Tests 4, 10 and 12). A reader of invocations
+takes only `call` lines, so a stop line never counts as a call.
+
+The MCP session. Once it has reported in, the stub opens an MCP session to
+the bot server, as the real `claude` does, and holds it until the stub ends,
+so the server registers it as the persona's session and a health tick reads
+the persona connected. The session is `stub-mcp-session.ts`, run with bun as
+the stub's child, which reads the stub's `--mcp-config`, connects with the
+package's own MCP SDK as client `stub-claude` version `0.0.0-stub`, and
+answers the server's roots request with the stub's working directory, by
+which the server matches the persona. It ends with the stub (its exit, a
+kill, the pane's hang-up), so a stopped persona reads not connected; when the
+server ends it, a later `/mcp reconnect` in the pane opens a new one. Its
+lines go to `stub-mcp-session.log` beside the stub. No session is opened in
+a mode that has not reported in, without `--mcp-config`, or where the client
+is not beside the stub (Tests 4, 10 and 12, which copy only the stub and run
+with `health_check_interval` 0).
+
+None of the stub's lines or calls is CSCB's: its hooks, its `status` reads
+and its MCP session are children of the stub, never of a CSCB process, so
+`cscb_ad_calls`, `cscb_ad_count` and the closing assertions never count them.
+
 ### Slack stub
 
 `tests/integration/fixtures/slack-stub-server.ts` is a Bun HTTP and WebSocket
@@ -711,9 +824,11 @@ variable for the integration suite only (see Environment Variables in
   the scenario assigned to the token and a token hash, never the token.
 - It has no `bun test` suite of its own; Test 10 exercises it end to end.
 
-A live start (Tests 10 and 12) also launches each persona through the real
-agent-director, so the script puts `fixtures/stub-claude.sh` first on `PATH`
-as `claude` (as Test 4 does) and stops with `--stop-bots`.
+A live start also launches each persona through the real agent-director
+under the stub `claude` (see The stub worker), and stops with `--stop-bots`.
+Tests 10 and 12 put `fixtures/stub-claude.sh` first on `PATH` as `claude`
+themselves, as Test 4 does; an fmk script's start finds the copy `scenario.sh`
+put first on its PATH, with the stub's MCP session client beside it.
 
 ### Verdict file format
 

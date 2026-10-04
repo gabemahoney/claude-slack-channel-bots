@@ -75,7 +75,9 @@
 #                    directory under /tmp holding a decoy install and store,
 #                    and a symlink under SCENARIO_ROOT that resolves to it),
 #                    every install, re-shim, swap, hide and restore helper,
-#                    `ad`, `ad_store_edit` and `ad_store_id` fails with the
+#                    `ad`, `ad_store_edit`, `ad_store_id`,
+#                    `ad_store_pending_no_launch`, `stub_mode`,
+#                    `stub_press_enter` and `write_mcp_config` fails with the
 #                    guard's reason, and the decoy is left exactly as it was.
 #   shim_check       `check_ad_shim` passes a correct layout and fails, with
 #                    its reason, on a symlink to the shim and on a copy of the
@@ -148,12 +150,111 @@
 #                    from before it both positive controls fail, so both are
 #                    met by this start's own lines. `cscb_ad_calls` prints no
 #                    harness call. The start is stopped with --stop-bots.
+#   mcp_session      a live one-persona start in a state directory of its own,
+#                    with health ticks every MCP_TICK_S: once the stub (held
+#                    at the dev-channels dialog until the approver's Enter)
+#                    reports in, the server registers its MCP session as the
+#                    persona's (`Session connected`); the session client is a
+#                    child of the stub. Over at least MCP_TICKS more health
+#                    ticks (the bot server's `status` reads of the row) the
+#                    server logs no reconnect, relaunch, restart or
+#                    not-connected line, no CSCB process runs send-keys,
+#                    spawn, resume or kill for the row, the row reads
+#                    `waiting` and /interject answers 200. After the sentinel
+#                    ends the stub, the server logs the session's end, the
+#                    client is gone and /interject answers 503: the persona
+#                    reads not connected. The start is stopped with
+#                    --stop-bots.
 #   harness_include_finished
 #                    a harness `kill --include-finished` from the scenario's
 #                    shell, from a command substitution and from a pipeline
 #                    each add a line whose parent has the shell's command
 #                    line (the shell itself, then subshells of it), and
 #                    `assert_no_cscb_include_finished` passes.
+#   stub_direct      the stub run from the scenario's shell, its hooks each
+#                    touching a marker file: `claude --version` prints
+#                    `2.1.280 (Claude Code)`; in a directory with no selection
+#                    it prints the dev-channels dialog, byte for byte
+#                    tests/fixtures/dev-channels-pane-2.1.120.txt; `silent`
+#                    prints nothing, fires no hook, and on the sentinel fires
+#                    no SessionEnd; `at-once` with no
+#                    AGENT_DIRECTOR_INSTANCE_ID prints its banner, fires
+#                    SessionStart, writes one stop line (reason
+#                    `AGENT_DIRECTOR_INSTANCE_ID is unset or empty`, id `-`)
+#                    to standard error, as no shim log is beside its hooks'
+#                    binary, and on the sentinel fires SessionEnd.
+#   stub_helpers     `stub_mode` refuses an unknown mode, a directory outside
+#                    SCENARIO_ROOT (as written and by real path) and a path
+#                    that is no directory, and a directory's last selection
+#                    wins (the stub then runs it); `stub_press_enter` fails
+#                    with tmux's answer for no such pane and for a prefix of a
+#                    session's name (which gets no Enter), delivers Enter by
+#                    the full session name and by pane id, and refuses with
+#                    TMUX set or another TMUX_TMPDIR; `ad_store_pending_no_launch`
+#                    refuses an id with other characters and an id with no
+#                    row; `write_mcp_config` refuses a value that is not a
+#                    port, and the setup's MCP config names the server
+#                    `slack-channel-router` at the scenario's port over http.
+#
+# The re-fire legs read SessionStart records in the scenario HOME's
+# ~/.agent-director/ad-trail.jsonl: `ad.hook.fired` (by instance id) and
+# `ad.hook.ignored` (by instance id, and by the hook's parent PID, which is the
+# stub's own process). G is agent-director's default pending grace period
+# (REFIRE_GRACE_S): the self-check writes no config.toml.
+#   refire_hold      a harness spawn of row REFIRE_ID, its working directory
+#                    selected for the silent mode: the row reads `pending` with
+#                    a launch start; its worker's --settings hooks are exec
+#                    form and name the binary beside the shim's log; for longer
+#                    than a re-fire period the worker's pane shows nothing and
+#                    the trail holds no SessionStart record for the row.
+#   refire_at_once, refire_trusted_config_dir, refire_trusted_home,
+#   refire_dev_channels, refire_unrecognised, refire_folder_trust
+#                    one reporting stub per path, each the process of its own
+#                    tmux pane on the scenario's server, given the held row's
+#                    AGENT_DIRECTOR_INSTANCE_ID and its worker's --settings,
+#                    and a working directory selected for the path's mode:
+#                    `at-once`; `folder-trust` in a folder trusted in
+#                    <CLAUDE_CONFIG_DIR>/.claude.json, and in one trusted in
+#                    ~/.claude.json with no CLAUDE_CONFIG_DIR (both report in
+#                    with no dialog); and the dev-channels dialog, the
+#                    unrecognised dialog (which holds neither approver
+#                    needle) and the folder-trust prompt, each shown in its
+#                    pane and answered by `stub_press_enter`: before the Enter,
+#                    for longer than a period, the stub fires no SessionStart
+#                    and shows no banner.
+#   stop_status_failure
+#                    a reporting stub given an instance id with no row: its
+#                    report-in fires SessionStart once, then nothing, and the
+#                    shim's log holds exactly one stop line naming the id,
+#                    written by the stub, reason `the status read exited <n>`.
+#   stop_no_launch_start
+#                    a second row held the same way, and a reporting stub for
+#                    it: once it has re-fired, `ad_store_pending_no_launch`
+#                    leaves the row `pending` with no launch start; then
+#                    exactly one stop line names the id, written by the stub,
+#                    reason `the row reads pending with no launch start`, and
+#                    no SessionStart record from the stub comes after it.
+#   refire_grace     after G (plus REFIRE_SETTLE_S): each path's stub's
+#                    records start at its report-in (within REFIRE_FIRST_S of
+#                    its start or its Enter), come about every REFIRE_PERIOD_S
+#                    (each gap within REFIRE_GAP_MIN_S..REFIRE_GAP_MAX_S),
+#                    run until G (the last within REFIRE_GAP_MAX_S of it) and
+#                    none after (REFIRE_HOOK_S allowed for a hook's own run),
+#                    with none added over REFIRE_QUIET_S more; each is
+#                    ignored as `pid_mismatch` against the silent worker's
+#                    pane, and the stub still runs. The silent worker fired
+#                    nothing (every SessionStart fired for the row was
+#                    ignored); the row still reads `pending` with its launch
+#                    start; no stop line names it (the stop past G is
+#                    silent).
+#   stub_lines_not_cscb
+#                    the shim log's lines since the hold are the two stop
+#                    lines and the harness's own calls (their parent the
+#                    scenario's shell), all in its format; over them
+#                    `cscb_ad_count` counts nothing and `cscb_ad_calls`
+#                    prints nothing, and CSCB's whole count is unchanged; the
+#                    three closing assertions pass over a copy of the whole
+#                    record, stop lines included.
 #   synthetic_server_tmux, synthetic_include_finished, synthetic_delete
 #                    in subshells pointed at synthetic logs and records under
 #                    SCENARIO_ROOT: each assertion passes a clean log and
@@ -179,7 +280,8 @@
 #                    as not passed; one that fails on its own prints only its
 #                    own FAIL line.
 # The script then ends with the three closing assertions in its own shell,
-# met by the live start's own lines.
+# met by the live start's own lines, with the stub's stop lines in the shim's
+# log.
 # Teardown: an exit hook confirms that the trap stopped the scenario's tmux
 # server (its PID gone, no socket under SCENARIO_ROOT answering).
 set -euo pipefail
@@ -228,6 +330,63 @@ LIVE_INSTANCE_ID="cscb_${LIVE_KEY}"
 LIVE_STUB_WAIT_S=20    # the Slack stub writing its ready file
 LIVE_START_WAIT_S=120  # the start pass: one bring-up and one launch
 LIVE_REPORT_WAIT_S=60  # after the start pass: the approver's Enter and the row reporting in
+
+# The mcp_session leg's persona, its health-check interval, how many ticks it
+# watches, and a restart delay longer than the leg's run after the stub ends
+# (so no relaunch connects the persona again while the leg reads it).
+MCP_NAME="${SCENARIO_TAG}_mcp"
+MCP_INSTANCE_ID="cscb_$(persona_key "${MCP_NAME}")"
+MCP_TICK_S=3
+MCP_TICKS=3
+MCP_TICKS_WAIT_S=30    # for MCP_TICKS ticks after the session connected
+MCP_RESTART_DELAY_S=120
+MCP_CONNECT_WAIT_S=30  # after the row reported in: the server registering the stub's session
+MCP_END_WAIT_S=20      # after the sentinel: the server seeing the session end
+# A server log line about a reconnect, relaunch, restart or not-connected
+# persona (case-insensitive ERE).
+MCP_TROUBLE='reconnect|relaunch|restart|not[- ]connected|disconnected'
+
+# The re-fire legs. A row held `pending` by a silent worker; reporting stubs
+# for it (one per path), whose SessionStart hooks agent-director ignores with
+# `pid_mismatch`; and the two stop legs' instance ids (a row with no launch
+# start, and an id with no row).
+REFIRE_ID="t0-refire"
+NOLS_ID="t0-refire-nols"
+NOROW_ID="t0-refire-no-row"
+REFIRE_PATHS=(at-once trusted-config-dir trusted-home dev-channels unrecognised folder-trust)
+# G: agent-director's default pending_grace_seconds (the self-check writes no
+# ~/.agent-director/config.toml; the hold leg checks there is none).
+REFIRE_GRACE_S=60
+# The re-fire's period, and the gap allowed between two of one stub's records
+# (the period, plus its status read and hooks).
+REFIRE_PERIOD_S=2
+REFIRE_GAP_MIN_S=1.5
+REFIRE_GAP_MAX_S=4.5
+# How long a fired hook may take to write its record: a record of a fire
+# made before G can be stamped up to this long after G.
+REFIRE_HOOK_S=1
+# Read after G plus REFIRE_SETTLE_S (every stub has read its row past G by
+# then), and again REFIRE_QUIET_S later (three periods): no new record.
+REFIRE_SETTLE_S=3
+REFIRE_QUIET_S=6
+# A reporting stub's first record comes within this long of its start (or
+# its Enter).
+REFIRE_FIRST_S=3
+REFIRE_TRAIL="${HOME}/.agent-director/ad-trail.jsonl"
+
+# Set by the re-fire legs: the held row's worker PID, its launch start
+# (epoch seconds with milliseconds, and as status printed it) and the
+# --settings its worker was given; per path, the reporting stub's PID and the
+# time from which its records may come; the shim log's length before the
+# legs, and CSCB's call count then.
+REFIRE_SILENT_PID=""
+REFIRE_LS=""
+REFIRE_LAUNCH=""
+REFIRE_SETTINGS=""
+declare -A REFIRE_PID=()
+declare -A REFIRE_FROM=()
+REFIRE_AD_BEFORE=0
+REFIRE_CSCB_BEFORE=0
 
 # The closing enforcement's FAIL line, after `FAIL: <test>: `, up to its list
 # of the assertions not passed.
@@ -344,7 +503,8 @@ expect_ad_version() {
 
 # expect_fails_in_home <step> <home> <reason> <command> [<arg>...]: run the
 # command in a subshell with HOME=<home>; fail unless it exits non-zero with
-# a FAIL line of this test carrying <reason>.
+# a FAIL line of this test carrying <reason>. Either failure of it names
+# <reason>.
 expect_fails_in_home() {
     local step="$1" home="$2" reason="$3"
     shift 3
@@ -352,7 +512,7 @@ expect_fails_in_home() {
     ( export HOME="${home}"; "$@" ) > "${out}" 2>&1 || rc=$?
     if (( rc == 0 )); then
         sed 's/^/  | /' "${out}" >&2
-        fail "${step}: '$*' with HOME ${home} succeeded"
+        fail "${step}: '$*' with HOME ${home} succeeded, not failing with '${reason}'"
     fi
     line="$(grep -m1 '^FAIL:' "${out}" || true)"
     if [[ "${line}" != "FAIL: ${TEST_NAME}: "*"${reason}"* ]]; then
@@ -703,6 +863,258 @@ nested_own_failure() {
 }
 
 # ---------------------------------------------------------------------------
+# Live starts (the live_start and mcp_session legs)
+# ---------------------------------------------------------------------------
+
+# start_slack_stub <dir> <suffix>: start the Slack stub in a new <dir>,
+# answering ok for the token pair with <suffix> and refusing any other; wait
+# for its ready file; export CSCB_SLACK_API_URL; set SLACK_STUB_PID.
+start_slack_stub() {
+    local dir="$1" suffix="$2" step="slack stub ${1##*/}" api_url
+    mkdir "${dir}" || fail "${step}: could not create ${dir}"
+    python3 - "${suffix}" << 'EOF' | write_file "${dir}/control.json"
+import json, sys
+print(json.dumps({
+    "tokens": [{"suffix": sys.argv[1], "label": sys.argv[1], "auth": "ok", "connections": "ok"}],
+    "default": {"auth": "invalid_auth", "connections": "invalid_auth"},
+}))
+EOF
+    (cd "${dir}" && exec bun "${SCENARIO_FIXTURES}/slack-stub-server.ts" --record "${dir}/record.jsonl" \
+        --control "${dir}/control.json" --ready-file "${dir}/ready.json") > "${dir}/stub.out" 2>&1 &
+    SLACK_STUB_PID=$!
+    track_pid "${SLACK_STUB_PID}"
+    wait_for_file "${dir}/ready.json" "${LIVE_STUB_WAIT_S}" "${step}: the Slack stub never wrote its ready file"
+    api_url="$(jq -r '.api_url' "${dir}/ready.json")"
+    [[ "${api_url}" =~ ^http://127\.0\.0\.1:[0-9]+/api/$ ]] || fail "${step}: the stub's api_url '${api_url}' is not loopback"
+    export CSCB_SLACK_API_URL="${api_url}"
+}
+
+# ---------------------------------------------------------------------------
+# Stub workers (the re-fire legs)
+# ---------------------------------------------------------------------------
+
+# jq: a trail record's time (`ts`, UTC with milliseconds) as epoch seconds
+# with its milliseconds, as text.
+TRAIL_EPOCH_JQ='def epoch: (.ts[0:19] + "Z" | fromdateiso8601 | tostring) + "." + .ts[20:23];'
+# The trail records a re-fire leg reads: SessionStart ignored with the hook's
+# parent $p; SessionStart fired, or ignored, for instance $id; and SessionStart
+# ignored with parent $p for any reason but pid_mismatch, or naming a recorded
+# pane process other than $pane.
+TRAIL_IGNORED_FROM='.event == "ad.hook.ignored" and .hook_event == "SessionStart" and .parent_pid == $p'
+TRAIL_FIRED_FOR='.event == "ad.hook.fired" and .event_name == "SessionStart" and .claude_instance_id == $id'
+TRAIL_IGNORED_FOR='.event == "ad.hook.ignored" and .hook_event == "SessionStart" and .claude_instance_id == $id'
+TRAIL_NOT_MISMATCH='.event == "ad.hook.ignored" and .hook_event == "SessionStart" and .parent_pid == $p and (.reason != "pid_mismatch" or .row_pane_pid != $pane)'
+
+# trail_read <array-name> <jq-condition> [<jq-option>...]: set the array to
+# the times of the trail's records that <jq-condition> keeps, in trail order
+# (none when there is no trail yet). The options bind its variables.
+trail_read() {
+    local -n trail_read_out="$1"
+    local cond="$2" out="${SCENARIO_ROOT}/trail-read.out"
+    shift 2
+    trail_read_out=()
+    [[ -f "${REFIRE_TRAIL}" ]] || return 0
+    jq -r "$@" "${TRAIL_EPOCH_JQ} select(${cond}) | epoch" "${REFIRE_TRAIL}" > "${out}" \
+        || fail "trail: jq could not read ${REFIRE_TRAIL}"
+    mapfile -t trail_read_out < "${out}"
+}
+
+# Print the number of SessionStart records ignored with parent <pid>.
+records_from() {
+    local times=()
+    trail_read times "${TRAIL_IGNORED_FROM}" --argjson p "$1"
+    echo "${#times[@]}"
+}
+
+# True when at least <n> SessionStart records were ignored with parent <pid>.
+records_from_at_least() {
+    (( $(records_from "$1") >= $2 ))
+}
+
+# Print the time now, epoch seconds with microseconds.
+now_s() {
+    printf '%s\n' "${EPOCHREALTIME/,/.}"
+}
+
+# Print <a> + <b>, both seconds with decimals.
+seconds_plus() {
+    awk -v a="$1" -v b="$2" 'BEGIN { printf "%.6f\n", a + b }'
+}
+
+# Sleep until the time <t> (epoch seconds); return at once when it has passed.
+sleep_until() {
+    sleep "$(awk -v t="$1" -v n="$(now_s)" 'BEGIN { d = t - n; printf "%.3f\n", (d > 0 ? d : 0) }')"
+}
+
+# True when <pid> runs the scenario's stub `claude`.
+stub_running() {
+    grep -qzxF -- "${SCENARIO_BIN}/claude" "/proc/$1/cmdline" 2> /dev/null
+}
+
+# True when tmux pane <target> on the scenario's server shows <text>.
+pane_shows() {
+    "${SCENARIO_REAL_TMUX}" capture-pane -p -t "$1" 2> /dev/null | grep -F -- "$2" > /dev/null
+}
+
+# hold_row <step> <instance-id> <dir-name>: a harness spawn, from the
+# scenario's own shell, of row <instance-id> in a working directory selected
+# for the silent mode, so its worker never reports in and the row stays
+# `pending`. Sets HELD_PID (the worker, the pane's process), HELD_LS (the
+# launch start, epoch seconds with milliseconds), HELD_LAUNCH (as status
+# printed it) and HELD_SETTINGS (the --settings the worker was given).
+hold_row() {
+    local step="$1" id="$2" dir argv=() i launch
+    dir="$(make_workdir "$3")"
+    stub_mode "${dir}" "${STUB_MODE_SILENT}"
+    ad_capture spawn --cwd "${dir}" --claude-instance-id "${id}" --tmux-session-name "${id}" --no-pre-trust
+    if (( AD_RC != 0 )); then
+        sed 's/^/  | /' "${AD_OUT}" "${AD_ERR}" >&2
+        fail "${step}: harness spawn of ${id} exited ${AD_RC}"
+    fi
+    HELD_PID="$("${SCENARIO_REAL_TMUX}" display-message -p -t "${id}" '#{pane_pid}')" \
+        || fail "${step}: no pane for session ${id}"
+    wait_until 10 "${step}: ${id}'s pane process ${HELD_PID} never became the stub" stub_running "${HELD_PID}"
+    mapfile -d '' -t argv < "/proc/${HELD_PID}/cmdline"
+    HELD_SETTINGS=""
+    for i in "${!argv[@]}"; do
+        [[ "${argv[i]}" == --settings ]] && HELD_SETTINGS="${argv[i + 1]:-}"
+    done
+    [[ -n "${HELD_SETTINGS}" ]] || fail "${step}: ${id}'s worker was given no --settings"
+    ad_capture status --claude-instance-id "${id}"
+    (( AD_RC == 0 )) || fail "${step}: harness status of ${id} exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
+    [[ "$(jq -r '.state // empty' "${AD_OUT}")" == pending ]] \
+        || fail "${step}: ${id} reads '$(jq -r '.state // empty' "${AD_OUT}")', not pending"
+    launch="$(jq -r '.launch_started_at // empty' "${AD_OUT}")"
+    [[ -n "${launch}" ]] || fail "${step}: ${id} reads pending with no launch start"
+    HELD_LAUNCH="${launch}"
+    HELD_LS="$(date -u -d "${launch}" +%s.%3N)" || fail "${step}: ${id}'s launch start '${launch}' is not a time"
+}
+
+# refire_stub <step> <session> <dir> <instance-id> <settings> [<VAR>=<value>...]:
+# start a stub worker (the scenario's `claude`) in its own tmux session on
+# the scenario's server, as the pane's process, with working directory <dir>,
+# AGENT_DIRECTOR_INSTANCE_ID <instance-id>, `--settings <settings>`, no
+# CLAUDE_CONFIG_DIR and the given variables. Sets STUB_PID.
+refire_stub() {
+    local step="$1" session="$2" dir="$3" id="$4" settings="$5"
+    shift 5
+    "${SCENARIO_REAL_TMUX}" new-session -d -s "${session}" -x 200 -y 50 -c "${dir}" -- \
+        env -u CLAUDE_CONFIG_DIR "AGENT_DIRECTOR_INSTANCE_ID=${id}" "$@" "${SCENARIO_BIN}/claude" --settings "${settings}" \
+        || fail "${step}: could not start a stub in tmux session ${session}"
+    STUB_PID="$("${SCENARIO_REAL_TMUX}" display-message -p -t "${session}" '#{pane_pid}')" \
+        || fail "${step}: no pane for session ${session}"
+    wait_until 10 "${step}: ${session}'s pane process ${STUB_PID} never became the stub" stub_running "${STUB_PID}"
+}
+
+# refire_start <path> [<VAR>=<value>...]: a reporting stub for the held row
+# in REFIRE_DIR (made by refire_dir); records its PID and its start time for
+# <path>.
+refire_start() {
+    local path="$1" t
+    shift
+    t="$(now_s)"
+    refire_stub "re-fire ${path}" "t0-refire-${path}" "${REFIRE_DIR}" "${REFIRE_ID}" "${REFIRE_SETTINGS}" "$@"
+    REFIRE_PID["${path}"]="${STUB_PID}"
+    REFIRE_FROM["${path}"]="${t}"
+}
+
+# refire_dir <path> <mode>: make the working directory of <path>'s stub and
+# select <mode> for it; sets REFIRE_DIR (its real path).
+refire_dir() {
+    REFIRE_DIR="$(make_workdir "refire-$1")"
+    REFIRE_DIR="$(realpath -e -- "${REFIRE_DIR}")"
+    stub_mode "${REFIRE_DIR}" "$2"
+}
+
+# expect_reported_at_once <path>: <path>'s stub reported in with no Enter:
+# its pane shows the live-session banner and no dialog.
+expect_reported_at_once() {
+    local step="re-fire $1" session="t0-refire-$1"
+    wait_until 10 "${step}: the stub never reported in (no banner in its pane)" \
+        pane_shows "${session}" "Listening for channel messages"
+    ! pane_shows "${session}" "Enter to confirm" || fail "${step}: the stub's pane shows a dialog"
+}
+
+# refire_enter_leg <path> <mode> <dialog-line>: <path>'s stub, held at its
+# dialog (whose pane shows <dialog-line>) for longer than a period, fires no
+# SessionStart and shows no banner; the harness's Enter makes it report in.
+refire_enter_leg() {
+    local path="$1" mode="$2" text="$3" step="re-fire $1" session="t0-refire-$1" t
+    refire_dir "${path}" "${mode}"
+    refire_start "${path}"
+    wait_until 10 "${step}: the pane never showed the dialog line '${text}'" pane_shows "${session}" "${text}"
+    sleep "$(seconds_plus "${REFIRE_PERIOD_S}" 0.5)"
+    [[ "$(records_from "${REFIRE_PID[${path}]}")" == 0 ]] \
+        || fail "${step}: the stub fired SessionStart before the Enter"
+    ! pane_shows "${session}" "Listening for channel messages" || fail "${step}: the stub reported in before the Enter"
+    pid_alive "${REFIRE_PID[${path}]}" || fail "${step}: the stub ended at its dialog"
+    t="$(now_s)"
+    stub_press_enter "${session}"
+    REFIRE_FROM["${path}"]="${t}"
+    wait_until 10 "${step}: the stub never reported in after the Enter" \
+        pane_shows "${session}" "Listening for channel messages"
+}
+
+# stop_lines_for <instance-id>: print the shim log's stop lines whose words
+# name instance <instance-id> (`… for instance <id>: …`).
+stop_lines_for() {
+    local id="$1" line words=()
+    [[ -f "${SCENARIO_AD_SHIM_LOG}" ]] || return 0
+    while IFS= read -r line; do
+        _scenario_split_line "${line}" || continue
+        _scenario_eval_words words "${_L_RAW_WORDS}" || continue
+        [[ "${words[0]:-}" == stub-claude && "${words[6]:-}" == "${id}:" ]] && printf '%s\n' "${line}"
+    done < <(awk -F'\t' '$1 == "stop"' "${SCENARIO_AD_SHIM_LOG}")
+    return 0
+}
+
+# True when a stop line names instance <instance-id>.
+has_stop_line() {
+    [[ -n "$(stop_lines_for "$1")" ]]
+}
+
+# expect_one_stop_line <step> <instance-id> <pid>: exactly one stop line names
+# <instance-id>; it is the shim log's format, kind `stop`, written by <pid>,
+# and its words are `stub-claude stopped re-firing SessionStart for instance
+# <id>:` and a reason. Sets STOP_WHY (the reason's words) and STOP_T (its
+# time, epoch seconds).
+expect_one_stop_line() {
+    local step="$1" id="$2" pid="$3" lines=() words=() head=() want=()
+    mapfile -t lines < <(stop_lines_for "${id}")
+    if (( ${#lines[@]} != 1 )); then
+        printf '  | %s\n' ${lines[@]+"${lines[@]}"} >&2
+        fail "${step}: ${#lines[@]} stop line(s) name instance ${id}, not exactly one"
+    fi
+    _scenario_split_line "${lines[0]}" || fail "${step}: the stop line is not in the shim log's format: ${lines[0]}"
+    [[ "${_L_KIND}" == stop ]] || fail "${step}: the stop line's kind is '${_L_KIND}'"
+    [[ "${_L_PID}" == "${pid}" ]] || fail "${step}: the stop line's pid is ${_L_PID}, not the stub's ${pid}"
+    _scenario_eval_words words "${_L_RAW_WORDS}" || fail "${step}: the stop line's words do not parse: ${_L_RAW_WORDS}"
+    head=("${words[@]:0:7}")
+    want=(stub-claude stopped re-firing SessionStart for instance "${id}:")
+    same_words head want || fail "${step}: the stop line's words begin $(quoted "${head[@]}"), not $(quoted "${want[@]}")"
+    STOP_WHY=("${words[@]:7}")
+    STOP_T="$(awk -v us="${_L_US}" 'BEGIN { printf "%.6f\n", us / 1000000 }')"
+}
+
+# expect_none_after <step> <what> <time> <record-time>...: no record time is
+# at or after <time>.
+expect_none_after() {
+    local step="$1" what="$2" t="$3" r
+    shift 3
+    for r in "$@"; do
+        time_before "${r}" "${t}" || fail "${step}: ${what} at ${r}, after ${t}"
+    done
+}
+
+# refire_gap_out <time>...: print the first two consecutive times whose gap is
+# outside REFIRE_GAP_MIN_S..REFIRE_GAP_MAX_S, and the gap; nothing when none.
+refire_gap_out() {
+    printf '%s\n' "$@" | awk -v lo="${REFIRE_GAP_MIN_S}" -v hi="${REFIRE_GAP_MAX_S}" '
+        NR > 1 { g = $1 - prev; if (g < lo || g > hi) { printf "%s then %s (%.3fs)\n", prev, $1, g; exit } }
+        { prev = $1 }'
+}
+
+# ---------------------------------------------------------------------------
 # Exit hooks
 # ---------------------------------------------------------------------------
 
@@ -995,6 +1407,10 @@ leg_guard_refusals() {
         expect_fails_in_home "${step}" "${home}" "${reason}" ad version
         expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_edit "UPDATE spawns SET labels = '{}'"
         expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_id
+        expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_pending_no_launch "${T0_ROW_ID}"
+        expect_fails_in_home "${step}" "${home}" "${reason}" stub_mode "${SCENARIO_ROOT}/work" "${STUB_MODE_AT_ONCE}"
+        expect_fails_in_home "${step}" "${home}" "${reason}" stub_press_enter "${T0_SESSION}"
+        expect_fails_in_home "${step}" "${home}" "${reason}" write_mcp_config "${SCENARIO_PORT}"
     done
     [[ "$(tree_digest "${OUTSIDE_HOME}")" == "${before}" ]] \
         || fail "${step}: the HOME outside SCENARIO_ROOT changed under the refused helpers"
@@ -1215,10 +1631,8 @@ leg_path_wiring() {
 }
 
 leg_live_start() {
-    local step="live start" stub_dir stub_pid api_url creds work config_dir tmux_before ad_before
+    local step="live start" creds work config_dir tmux_before ad_before
     local tmux_after ad_after server_path line n lines=()
-    stub_dir="${SCENARIO_ROOT}/slack-stub"
-    mkdir -p "${stub_dir}"
     creds="${SCENARIO_ROOT}/credentials"
     mkdir -m 700 "${creds}"
     config_dir="${SCENARIO_ROOT}/claude-config"
@@ -1226,21 +1640,7 @@ leg_live_start() {
     work="$(make_workdir live)"
 
     # The Slack stub: one token pair, answered ok; any other refused.
-    python3 - << 'EOF' | write_file "${stub_dir}/control.json"
-import json
-print(json.dumps({
-    "tokens": [{"suffix": "livev1", "label": "live", "auth": "ok", "connections": "ok"}],
-    "default": {"auth": "invalid_auth", "connections": "invalid_auth"},
-}))
-EOF
-    (cd "${stub_dir}" && exec bun "${SCENARIO_FIXTURES}/slack-stub-server.ts" --record "${stub_dir}/record.jsonl" \
-        --control "${stub_dir}/control.json" --ready-file "${stub_dir}/ready.json") > "${stub_dir}/stub.out" 2>&1 &
-    stub_pid=$!
-    track_pid "${stub_pid}"
-    wait_for_file "${stub_dir}/ready.json" "${LIVE_STUB_WAIT_S}" "${step}: the Slack stub never wrote its ready file"
-    api_url="$(jq -r '.api_url' "${stub_dir}/ready.json")"
-    [[ "${api_url}" =~ ^http://127\.0\.0\.1:[0-9]+/api/$ ]] || fail "${step}: the stub's api_url '${api_url}' is not loopback"
-    export CSCB_SLACK_API_URL="${api_url}"
+    start_slack_stub "${SCENARIO_ROOT}/slack-stub" livev1
 
     printf '{"bot_token": "%s", "app_token": "%s"}\n' "$(fake_token bot livev1)" "$(fake_token app livev1)" \
         | write_file "${creds}/live.json" 600
@@ -1313,7 +1713,458 @@ EOF
     expect_on_files "${step}: the lines before it" "${SCENARIO_ROOT}/window-before" fail assert_no_cscb_include_finished "positive control"
 
     stop_server --stop-bots
-    stop_tracked_pid "${stub_pid}" 10 "${step}: the Slack stub did not exit on SIGTERM"
+    stop_tracked_pid "${SLACK_STUB_PID}" 10 "${step}: the Slack stub did not exit on SIGTERM"
+}
+
+leg_mcp_session() {
+    local step="MCP session" creds work config_dir ref connected session stub_pid client_pid s0 verb t_conn conn_line
+    local disconnected window="${SCENARIO_ROOT}/mcp-session-window.log" hits
+    local -A before=()
+    creds="${SCENARIO_ROOT}/credentials-mcp"
+    mkdir -m 700 "${creds}"
+    config_dir="${SCENARIO_ROOT}/claude-config-mcp"
+    mkdir -p "${config_dir}"
+    work="$(make_workdir mcp)"
+    ref="$(persona_ref "${MCP_NAME}")"
+    connected="$(matcher "[slack] Session connected: persona ${ref}")"
+    disconnected="$(matcher "[slack] Session disconnected" ": persona ${ref}")"
+
+    # A state directory of its own: a start runs the last-applied record of
+    # its state directory, so the live start's settings would hold there.
+    new_state_dir mcp-session
+    start_slack_stub "${SCENARIO_ROOT}/slack-stub-mcp" mcpv1
+    printf '{"bot_token": "%s", "app_token": "%s"}\n' "$(fake_token bot mcpv1)" "$(fake_token app mcpv1)" \
+        | write_file "${creds}/mcp.json" 600
+    write_config << EOF
+{
+  "personas": [
+    {
+      "name": "${MCP_NAME}",
+      "credentials_file": "${creds}/mcp.json",
+      "working_directory": "${work}",
+      "claude_config_dir": "${config_dir}",
+      "channels": [{ "id": "C0T0MCP01", "delivery": "all" }],
+      "permission_prompts": "C0T0MCP01"
+    }
+  ],
+  "bind": "127.0.0.1",
+  "port": ${SCENARIO_PORT},
+  "health_check_interval": ${MCP_TICK_S},
+  "session_restart_delay": ${MCP_RESTART_DELAY_S},
+  "exit_timeout": 5
+}
+EOF
+
+    start_server --live
+    wait_for_log "$(completion_match 1)" "${LIVE_START_WAIT_S}" "${step}: the start pass never completed"
+    expect_completion 1 "${step}" "0 not brought up"
+    wait_until "${LIVE_REPORT_WAIT_S}" "${step}: row ${MCP_INSTANCE_ID} never reported in (waiting)" \
+        row_state_is "${MCP_INSTANCE_ID}" waiting
+    # The stub opened its session once it reported in, and the server
+    # registered it as the persona's.
+    wait_for_log "${connected}" "${MCP_CONNECT_WAIT_S}" "${step}: the server never registered the stub's session as ${ref}'s"
+    ad_capture get --claude-instance-id "${MCP_INSTANCE_ID}"
+    session="$(jq -r '.tmux_session_name // empty' "${AD_OUT}")"
+    [[ -n "${session}" ]] || fail "${step}: row ${MCP_INSTANCE_ID} names no tmux session"
+    stub_pid="$("${SCENARIO_REAL_TMUX}" display-message -p -t "${session}" '#{pane_pid}')" \
+        || fail "${step}: no pane for session ${session}"
+    stub_running "${stub_pid}" || fail "${step}: the pane's process ${stub_pid} is not the stub"
+    client_pid="$(pgrep -P "${stub_pid}" -f stub-mcp-session.ts || true)"
+    [[ "${client_pid}" =~ ^[0-9]+$ ]] || fail "${step}: the stub ${stub_pid} has no single MCP session client child ('${client_pid}')"
+
+    # Health ticks: at least MCP_TICKS more liveness reads of the row by the
+    # bot server, over at least MCP_TICKS tick intervals, with the persona
+    # connected throughout: no reconnect, relaunch or not-connected line in
+    # the server's log, and no send-keys, spawn, resume or kill of the row by
+    # a CSCB process.
+    t_conn="$(now_s)"
+    s0="$(cscb_ad_count status "${MCP_INSTANCE_ID}")"
+    for verb in send-keys spawn resume kill; do
+        before["${verb}"]="$(cscb_ad_count "${verb}" "${MCP_INSTANCE_ID}")"
+    done
+    conn_line="$(first_log_line "${connected}")"
+    wait_until "${MCP_TICKS_WAIT_S}" "${step}: fewer than ${MCP_TICKS} health ticks read ${MCP_INSTANCE_ID} after it connected" \
+        mcp_ticks_or_trouble "${MCP_INSTANCE_ID}" "$(( s0 + MCP_TICKS ))" "${conn_line}"
+    sleep_until "$(seconds_plus "${t_conn}" "$(( MCP_TICKS * MCP_TICK_S ))")"
+    echo "${TEST_NAME}: ${step}: $(( $(cscb_ad_count status "${MCP_INSTANCE_ID}") - s0 )) status read(s) of ${MCP_INSTANCE_ID} by the server in $(seconds_between "${t_conn}" "$(now_s)")s after it connected"
+    tail -n "+$(( conn_line + 1 ))" "${SLACK_STATE_DIR}/server.log" > "${window}"
+    hits="$(grep -iE "${MCP_TROUBLE}" "${window}" || true)"
+    if [[ -n "${hits}" ]]; then
+        sed 's/^/  | /' <<< "${hits}" >&2
+        fail "${step}: the server logged a reconnect, relaunch or not-connected line for a connected persona"
+    fi
+    for verb in send-keys spawn resume kill; do
+        [[ "$(cscb_ad_count "${verb}" "${MCP_INSTANCE_ID}")" == "${before[${verb}]}" ]] \
+            || fail "${step}: a CSCB process ran ${verb} for ${MCP_INSTANCE_ID} while it was connected"
+    done
+    expect_row_state "${step}" "${MCP_INSTANCE_ID}" waiting
+    expect_interject "${MCP_NAME}" 200 "${step}: with the stub's session held"
+
+    # The stub ends (the sentinel): its session ends with it, and the
+    # persona reads not connected.
+    "${SCENARIO_REAL_TMUX}" send-keys -t "${session}" __CSCB_TEST_EXIT__ Enter \
+        || fail "${step}: could not send the sentinel into ${session}"
+    wait_for_log "${disconnected}" "${MCP_END_WAIT_S}" "${step}: the server never saw ${ref}'s session end"
+    wait_until 10 "${step}: the stub ${stub_pid} still runs after the sentinel" _scenario_pid_gone "${stub_pid}"
+    wait_until 10 "${step}: the MCP session client ${client_pid} outlived the stub" _scenario_pid_gone "${client_pid}"
+    expect_interject "${MCP_NAME}" 503 "${step}: after the stub ended"
+
+    stop_server --stop-bots
+    stop_tracked_pid "${SLACK_STUB_PID}" 10 "${step}: the Slack stub did not exit on SIGTERM"
+}
+
+# True when CSCB processes made at least <n> <verb> calls naming <instance-id>.
+cscb_count_at_least() {
+    (( $(cscb_ad_count "$1" "$2") >= $3 ))
+}
+
+# mcp_ticks_or_trouble <instance-id> <n> <line>: true when CSCB processes made
+# at least <n> status calls naming <instance-id>, or when the server's log
+# holds, after its line <line>, a line MCP_TROUBLE matches (so the leg names
+# that line rather than the ticks it waited for).
+mcp_ticks_or_trouble() {
+    tail -n "+$(( $3 + 1 ))" "${SLACK_STATE_DIR}/server.log" | grep -iE "${MCP_TROUBLE}" > /dev/null \
+        || cscb_count_at_least status "$1" "$2"
+}
+
+# The stub run directly from the scenario's shell (no tmux, no
+# agent-director), with hooks that each touch a marker file.
+leg_stub_direct() {
+    local step="stub direct" dir out="${SCENARIO_ROOT}/stub-direct.out" err="${SCENARIO_ROOT}/stub-direct.err"
+    local mark="${SCENARIO_ROOT}/stub-direct-mark" settings got rc=0 before words=() want=()
+    local fixture="${SCENARIO_FIXTURES}/../../fixtures/dev-channels-pane-2.1.120.txt"
+    settings="$(jq -nc --arg m "${mark}" '{hooks: {
+        SessionStart: [{hooks: [{type: "command", command: "/usr/bin/touch", args: [($m + ".start")]}]}],
+        SessionEnd: [{hooks: [{type: "command", command: "/usr/bin/touch", args: [($m + ".end")]}]}]}}')"
+
+    got="$("${SCENARIO_BIN}/claude" --version)" || fail "${step}: claude --version exited non-zero"
+    [[ "${got}" == "2.1.280 (Claude Code)" ]] || fail "${step}: claude --version printed '${got}'"
+
+    # A directory with no selection: the dev-channels dialog, byte for byte.
+    dir="$(make_workdir stub-default)"
+    (cd "${dir}" && "${SCENARIO_BIN}/claude" < /dev/null) > "${out}" 2> "${err}" || rc=$?
+    (( rc == 0 )) || fail "${step}: the stub in a directory with no selection exited ${rc}"
+    cmp -s -- "${fixture}" "${out}" || fail "${step}: with no selection the stub's output is not ${fixture##*/}, byte for byte"
+    [[ ! -s "${err}" ]] || fail "${step}: with no selection the stub wrote to standard error: $(head -c 300 "${err}")"
+
+    # Silent: no output, no SessionStart, and the sentinel fires no SessionEnd.
+    dir="$(make_workdir stub-silent)"
+    stub_mode "${dir}" "${STUB_MODE_SILENT}"
+    (cd "${dir}" && printf 'hello\n__CSCB_TEST_EXIT__\n' | "${SCENARIO_BIN}/claude" --settings "${settings}") \
+        > "${out}" 2> "${err}" || rc=$?
+    (( rc == 0 )) || fail "${step}: the silent stub exited ${rc}"
+    [[ ! -s "${out}" && ! -s "${err}" ]] || fail "${step}: the silent stub printed: $(head -c 300 "${out}" "${err}")"
+    [[ ! -e "${mark}.start" && ! -e "${mark}.end" ]] || fail "${step}: the silent stub fired a hook"
+
+    # At once, with no AGENT_DIRECTOR_INSTANCE_ID and hooks naming a binary
+    # with no shim log beside it: it reports in and fires SessionStart, its
+    # first tick writes the one stop line to standard error, and the sentinel
+    # fires SessionEnd.
+    dir="$(make_workdir stub-no-id)"
+    stub_mode "${dir}" "${STUB_MODE_AT_ONCE}"
+    before="$(line_count "${SCENARIO_AD_SHIM_LOG}")"
+    (cd "${dir}" && { sleep "$(seconds_plus "${REFIRE_PERIOD_S}" 1.5)"; echo __CSCB_TEST_EXIT__; } \
+        | env -u AGENT_DIRECTOR_INSTANCE_ID "${SCENARIO_BIN}/claude" --settings "${settings}") > "${out}" 2> "${err}" || rc=$?
+    (( rc == 0 )) || fail "${step}: the at-once stub exited ${rc}"
+    grep -qxF "Listening for channel messages from: server:slack-channel-router" "${out}" \
+        || fail "${step}: the at-once stub printed no banner: $(head -c 300 "${out}")"
+    [[ -e "${mark}.start" && -e "${mark}.end" ]] || fail "${step}: the at-once stub did not fire SessionStart and SessionEnd"
+    [[ "$(line_count "${err}")" == 1 ]] || fail "${step}: standard error holds $(line_count "${err}") line(s), not one stop line"
+    _scenario_split_line "$(cat "${err}")" && [[ "${_L_KIND}" == stop ]] \
+        || fail "${step}: standard error's line is not a stop line in the shim log's format: $(head -c 300 "${err}")"
+    _scenario_eval_words words "${_L_RAW_WORDS}" || fail "${step}: the stop line's words do not parse"
+    want=(stub-claude stopped re-firing SessionStart for instance -: AGENT_DIRECTOR_INSTANCE_ID is unset or empty)
+    same_words words want || fail "${step}: the stop line's words are $(quoted "${words[@]}"), not $(quoted "${want[@]}")"
+    [[ "$(line_count "${SCENARIO_AD_SHIM_LOG}")" == "${before}" ]] || fail "${step}: the stub wrote to the shim log"
+}
+
+# The stub helpers' own refusals, the mode selection file and the MCP config.
+leg_stub_helpers() {
+    local step="stub helpers" dir link file got
+    dir="$(make_workdir stub-select)"
+    expect_fails_in_home "${step}" "${HOME}" "unknown mode 'bogus'" stub_mode "${dir}" bogus
+    expect_fails_in_home "${step}" "${HOME}" "refused: /tmp is not under SCENARIO_ROOT" stub_mode /tmp "${STUB_MODE_AT_ONCE}"
+    link="${SCENARIO_ROOT}/work/stub-select-outside"
+    ln -s /tmp "${link}"
+    expect_fails_in_home "${step}" "${HOME}" "refused: ${link} resolves to" stub_mode "${link}" "${STUB_MODE_AT_ONCE}"
+    expect_fails_in_home "${step}" "${HOME}" "is not a directory" stub_mode "${dir}/none" "${STUB_MODE_AT_ONCE}"
+    # The last selection of a directory wins.
+    stub_mode "${dir}" "${STUB_MODE_SILENT}"
+    stub_mode "${dir}" "${STUB_MODE_AT_ONCE}"
+    file="${SCENARIO_BIN}/stub-claude-modes"
+    [[ "$(tail -n 1 "${file}")" == "${STUB_MODE_AT_ONCE}"$'\t'"$(realpath -e -- "${dir}")" ]] \
+        || fail "${step}: the selection file's last line is '$(tail -n 1 "${file}")'"
+    got="$(cd "${dir}" && printf '__CSCB_TEST_EXIT__\n' | "${SCENARIO_BIN}/claude")" \
+        || fail "${step}: the stub in ${dir} exited non-zero"
+    [[ "${got}" == "Listening for channel messages from: server:slack-channel-router" ]] \
+        || fail "${step}: after silent then at-once, the stub printed '${got}', not the at-once banner"
+
+    expect_fails_in_home "${step}" "${HOME}" "tmux send-keys exited" stub_press_enter t0-no-such-pane
+    expect_fails_in_home "${step}" "${HOME}" "refused: TMUX is set" with_tmux_set stub_press_enter "${T0_SESSION}"
+    expect_fails_in_home "${step}" "${HOME}" "refused: TMUX_TMPDIR '/tmp' is not the scenario's" \
+        with_tmux_tmpdir /tmp stub_press_enter "${T0_SESSION}"
+    press_enter_exact "${step}"
+
+    expect_fails_in_home "${step}" "${HOME}" "holds a character other than letters, digits and ._:@-" \
+        ad_store_pending_no_launch "t0 bad'id"
+    expect_fails_in_home "${step}" "${HOME}" "no row has instance id t0-no-such-row" \
+        ad_store_pending_no_launch t0-no-such-row
+
+    expect_fails_in_home "${step}" "${HOME}" "'0' is not a port" write_mcp_config 0
+    file="${HOME}/.claude/slack-mcp.json"
+    got="$(jq -r --arg n "${SCENARIO_MCP_SERVER_NAME}" '.mcpServers[$n] | "\(.type) \(.url)"' "${file}")" \
+        || fail "${step}: ${file} is not JSON"
+    [[ "${got}" == "http http://127.0.0.1:${SCENARIO_PORT}/mcp" ]] \
+        || fail "${step}: ${file} names '${got}', not the scenario's port ${SCENARIO_PORT}"
+}
+
+# press_enter_exact <step>: `stub_press_enter` matches a session name exactly.
+# A session whose name only starts with the target (as written, or with a
+# window part) gets no Enter, and the call fails with tmux's answer; the full
+# name, the full name with a window part and the pane id each deliver one.
+press_enter_exact() {
+    local step="$1: exact target" session="t0-press-exact-long" prefix="t0-press-exact" pane n target
+    ! has_session "${prefix}" || fail "${step}: a session named ${prefix} already exists"
+    "${SCENARIO_REAL_TMUX}" new-session -d -s "${session}" -x 200 -y 50 -- \
+        bash -c 'n=0; while read -r _; do n=$((n + 1)); echo "pressed ${n}"; done; sleep 600' \
+        || fail "${step}: could not make ${session}"
+    pane="$("${SCENARIO_REAL_TMUX}" display-message -p -t "=${session}:" '#{pane_id}')" \
+        || fail "${step}: no pane for ${session}"
+    expect_fails_in_home "${step}" "${HOME}" "tmux send-keys exited" stub_press_enter "${prefix}"
+    expect_fails_in_home "${step}" "${HOME}" "tmux send-keys exited" stub_press_enter "${prefix}:"
+    sleep 0.5
+    ! pane_shows "=${session}:" "pressed" || fail "${step}: a prefix of ${session} sent it an Enter"
+    n=0
+    for target in "${session}" "${session}:" "${pane}"; do
+        n=$((n + 1))
+        stub_press_enter "${target}"
+        wait_until 5 "${step}: '${target}' sent ${session} no Enter" pane_shows "=${session}:" "pressed ${n}"
+    done
+    "${SCENARIO_REAL_TMUX}" kill-session -t "=${session}" || fail "${step}: could not end ${session}"
+}
+
+# with_tmux_set <command> [<arg>...]: run <command> with TMUX set (in the
+# caller's subshell).
+with_tmux_set() {
+    export TMUX=/tmp/t0-other-tmux,1,0
+    "$@"
+}
+
+# with_tmux_tmpdir <dir> <command> [<arg>...]: run <command> with TMUX_TMPDIR
+# <dir> (in the caller's subshell).
+with_tmux_tmpdir() {
+    export TMUX_TMPDIR="$1"
+    shift
+    "$@"
+}
+
+leg_refire_hold() {
+    local step="re-fire hold" times=() bin
+    [[ ! -e "${HOME}/.agent-director/config.toml" ]] \
+        || fail "${step}: ${HOME}/.agent-director/config.toml exists, so G may not be the default ${REFIRE_GRACE_S}s"
+    REFIRE_AD_BEFORE="$(line_count "${SCENARIO_AD_SHIM_LOG}")"
+    REFIRE_CSCB_BEFORE="$(cscb_ad_count "")"
+    hold_row "${step}" "${REFIRE_ID}" refire-held
+    REFIRE_SILENT_PID="${HELD_PID}"
+    REFIRE_LS="${HELD_LS}"
+    REFIRE_LAUNCH="${HELD_LAUNCH}"
+    REFIRE_SETTINGS="${HELD_SETTINGS}"
+    # The worker's hooks are exec form and name the real binary, beside the
+    # shim's log, where the stub writes its stop lines.
+    bin="$(jq -r '.hooks.SessionStart[0].hooks[0].command // empty' <<< "${REFIRE_SETTINGS}")"
+    jq -e '.hooks.SessionStart[0].hooks[0].args | type == "array"' <<< "${REFIRE_SETTINGS}" > /dev/null \
+        || fail "${step}: the worker's SessionStart hook is not exec form (no args)"
+    [[ "${bin%/*}" == "${SCENARIO_AD_SHIM_LOG%/*}" ]] \
+        || fail "${step}: the SessionStart hook names ${bin}, not a binary beside the shim log ${SCENARIO_AD_SHIM_LOG}"
+
+    # The silent worker prints nothing and fires nothing, for longer than a
+    # period.
+    sleep "$(seconds_plus "${REFIRE_PERIOD_S}" 0.5)"
+    [[ -z "$("${SCENARIO_REAL_TMUX}" capture-pane -p -t "${REFIRE_ID}" | tr -d '[:space:]')" ]] \
+        || fail "${step}: the silent worker's pane shows output"
+    trail_read times "${TRAIL_FIRED_FOR} or ${TRAIL_IGNORED_FOR}" --arg id "${REFIRE_ID}"
+    (( ${#times[@]} == 0 )) || fail "${step}: the trail holds ${#times[@]} SessionStart record(s) for ${REFIRE_ID} before any reporting stub"
+    expect_row_state "${step}" "${REFIRE_ID}" pending
+}
+
+leg_refire_at_once() {
+    refire_dir at-once "${STUB_MODE_AT_ONCE}"
+    refire_start at-once
+    expect_reported_at_once at-once
+}
+
+leg_refire_trusted_config_dir() {
+    local cfg="${SCENARIO_ROOT}/refire-claude-config"
+    refire_dir trusted-config-dir "${STUB_MODE_FOLDER_TRUST}"
+    mkdir -p "${cfg}"
+    jq -n --arg d "${REFIRE_DIR}" '{projects: {($d): {hasTrustDialogAccepted: true}}}' | write_file "${cfg}/.claude.json"
+    refire_start trusted-config-dir "CLAUDE_CONFIG_DIR=${cfg}"
+    expect_reported_at_once trusted-config-dir
+}
+
+leg_refire_trusted_home() {
+    local step="re-fire trusted-home" file="${HOME}/.claude.json" pid
+    refire_dir trusted-home "${STUB_MODE_FOLDER_TRUST}"
+    if [[ -f "${file}" ]]; then
+        jq --arg d "${REFIRE_DIR}" '.projects[$d].hasTrustDialogAccepted = true' "${file}" | write_file "${file}"
+    else
+        jq -n --arg d "${REFIRE_DIR}" '{projects: {($d): {hasTrustDialogAccepted: true}}}' | write_file "${file}"
+    fi
+    refire_start trusted-home
+    pid="${REFIRE_PID[trusted-home]}"
+    ! tr '\0' '\n' < "/proc/${pid}/environ" | grep '^CLAUDE_CONFIG_DIR=' > /dev/null \
+        || fail "${step}: the stub ${pid} has CLAUDE_CONFIG_DIR in its environment"
+    expect_reported_at_once trusted-home
+}
+
+leg_refire_dev_channels() {
+    refire_enter_leg dev-channels "${STUB_MODE_DEV_CHANNELS}" "I am using this for local development"
+}
+
+leg_refire_unrecognised() {
+    local step="re-fire unrecognised" session="t0-refire-unrecognised"
+    refire_enter_leg unrecognised "${STUB_MODE_UNRECOGNISED}" "Choose the text style that looks best with your terminal"
+    ! pane_shows "${session}" "I am using this for local development" && ! pane_shows "${session}" "Yes, I trust this folder" \
+        || fail "${step}: the unrecognised dialog holds an approver's needle"
+}
+
+leg_refire_folder_trust() {
+    refire_enter_leg folder-trust "${STUB_MODE_FOLDER_TRUST}" "Yes, I trust this folder"
+}
+
+leg_stop_status_failure() {
+    local step="stop: the status read fails" dir pid times=()
+    ad_capture status --claude-instance-id "${NOROW_ID}"
+    (( AD_RC != 0 )) || fail "${step}: a harness status read of ${NOROW_ID} succeeded: a row has that id"
+    dir="$(make_workdir refire-no-row)"
+    stub_mode "${dir}" "${STUB_MODE_AT_ONCE}"
+    refire_stub "${step}" t0-stop-no-row "${dir}" "${NOROW_ID}" "${REFIRE_SETTINGS}"
+    pid="${STUB_PID}"
+    wait_until 15 "${step}: no stop line names ${NOROW_ID}" has_stop_line "${NOROW_ID}"
+    sleep "${REFIRE_QUIET_S}"
+    expect_one_stop_line "${step}" "${NOROW_ID}" "${pid}"
+    (( ${#STOP_WHY[@]} == 5 )) && [[ "${STOP_WHY[*]:0:4}" == "the status read exited" && "${STOP_WHY[4]}" =~ ^[1-9][0-9]*$ ]] \
+        || fail "${step}: the stop line's reason is $(quoted "${STOP_WHY[@]}"), not 'the status read exited <n>'"
+    # Its report-in fired SessionStart once; nothing after.
+    trail_read times "${TRAIL_FIRED_FOR}" --arg id "${NOROW_ID}"
+    (( ${#times[@]} == 1 )) || fail "${step}: ${#times[@]} SessionStart record(s) for ${NOROW_ID}, not the report-in's one"
+    expect_none_after "${step}" "a SessionStart record for ${NOROW_ID}" "${STOP_T}" "${times[@]}"
+    pid_alive "${pid}" || fail "${step}: the stub ended: it did not stop re-firing on its own"
+}
+
+leg_stop_no_launch_start() {
+    local step="stop: no launch start" dir pid times=() n
+    hold_row "${step}" "${NOLS_ID}" refire-nols-held
+    dir="$(make_workdir refire-nols)"
+    stub_mode "${dir}" "${STUB_MODE_AT_ONCE}"
+    refire_stub "${step}" t0-stop-nols "${dir}" "${NOLS_ID}" "${HELD_SETTINGS}"
+    pid="${STUB_PID}"
+    # It re-fires while the row reads pending with its launch start.
+    wait_until 15 "${step}: the stub never re-fired for ${NOLS_ID}" records_from_at_least "${pid}" 2
+    ! has_stop_line "${NOLS_ID}" || fail "${step}: a stop line names ${NOLS_ID} before the edit"
+    ad_store_pending_no_launch "${NOLS_ID}"
+    wait_until 10 "${step}: no stop line names ${NOLS_ID} after the edit" has_stop_line "${NOLS_ID}"
+    sleep "${REFIRE_QUIET_S}"
+    expect_one_stop_line "${step}" "${NOLS_ID}" "${pid}"
+    [[ "${STOP_WHY[*]}" == "the row reads pending with no launch start" ]] \
+        || fail "${step}: the stop line's reason is $(quoted "${STOP_WHY[@]}"), not 'the row reads pending with no launch start'"
+    trail_read times "${TRAIL_IGNORED_FROM}" --argjson p "${pid}"
+    n="${#times[@]}"
+    (( n >= 2 )) || fail "${step}: ${n} SessionStart record(s) from the stub, not its report-in and a re-fire"
+    expect_none_after "${step}" "a SessionStart record from the stub ${pid}" "${STOP_T}" "${times[@]}"
+    trail_read times "${TRAIL_FIRED_FOR}" --arg id "${NOLS_ID}"
+    (( ${#times[@]} == n )) || fail "${step}: ${#times[@]} SessionStart record(s) for ${NOLS_ID}, not the stub's ${n}"
+    pid_alive "${pid}" || fail "${step}: the stub ended: it did not stop re-firing on its own"
+}
+
+leg_refire_grace() {
+    local step="re-fire until G" path pid times=() fired=() n first last g_end gap at_settle
+    local -A settled=()
+    g_end="$(seconds_plus "${REFIRE_LS}" "${REFIRE_GRACE_S}")"
+    sleep_until "$(seconds_plus "${g_end}" "${REFIRE_SETTLE_S}")"
+    for path in "${REFIRE_PATHS[@]}"; do
+        settled["${path}"]="$(records_from "${REFIRE_PID[${path}]}")"
+    done
+    sleep "${REFIRE_QUIET_S}"
+
+    for path in "${REFIRE_PATHS[@]}"; do
+        pid="${REFIRE_PID[${path}]}"
+        trail_read times "${TRAIL_IGNORED_FROM}" --argjson p "${pid}"
+        n="${#times[@]}"
+        (( n >= 3 )) || fail "${step}: ${path}: ${n} SessionStart record(s) from the stub ${pid}"
+        first="${times[0]}"
+        last="${times[n - 1]}"
+        # Its first record at its report-in: after its start (or Enter), soon.
+        ! time_before "${first}" "$(seconds_plus "${REFIRE_FROM[${path}]}" -0.01)" \
+            && time_before "${first}" "$(seconds_plus "${REFIRE_FROM[${path}]}" "${REFIRE_FIRST_S}")" \
+            || fail "${step}: ${path}: its first record at ${first} is not within ${REFIRE_FIRST_S}s after ${REFIRE_FROM[${path}]}"
+        # Then one about every REFIRE_PERIOD_S, up to G and not after.
+        gap="$(refire_gap_out "${times[@]}")"
+        [[ -z "${gap}" ]] || fail "${step}: ${path}: two records ${gap} apart, not about ${REFIRE_PERIOD_S}s"
+        ! time_before "${last}" "$(seconds_plus "${g_end}" "-${REFIRE_GAP_MAX_S}")" \
+            || fail "${step}: ${path}: its last record at ${last} is more than ${REFIRE_GAP_MAX_S}s before G (${g_end})"
+        expect_none_after "${step}" "${path}: a record" "$(seconds_plus "${g_end}" "${REFIRE_HOOK_S}")" "${times[@]}"
+        [[ "${n}" == "${settled[${path}]}" ]] \
+            || fail "${step}: ${path}: ${settled[${path}]} record(s) ${REFIRE_SETTLE_S}s after G, ${n} ${REFIRE_QUIET_S}s later"
+        # Every one ignored as pid_mismatch against the silent worker's pane.
+        trail_read times "${TRAIL_NOT_MISMATCH}" --argjson p "${pid}" --argjson pane "${REFIRE_SILENT_PID}"
+        (( ${#times[@]} == 0 )) \
+            || fail "${step}: ${path}: ${#times[@]} record(s) not pid_mismatch against the worker ${REFIRE_SILENT_PID}"
+        pid_alive "${pid}" || fail "${step}: ${path}: the stub ${pid} ended before G"
+        echo "${TEST_NAME}: ${step}: ${path}: ${n} records from ${first} to ${last} (G ends ${g_end})"
+    done
+
+    # The silent worker fired nothing: every SessionStart for the row was a
+    # reporting stub's, ignored; and the row still reads pending, its launch
+    # start unchanged, with no stop line for it.
+    trail_read times "${TRAIL_IGNORED_FROM}" --argjson p "${REFIRE_SILENT_PID}"
+    (( ${#times[@]} == 0 )) || fail "${step}: the silent worker ${REFIRE_SILENT_PID} fired SessionStart"
+    trail_read fired "${TRAIL_FIRED_FOR}" --arg id "${REFIRE_ID}"
+    trail_read times "${TRAIL_IGNORED_FOR}" --arg id "${REFIRE_ID}"
+    (( ${#fired[@]} == ${#times[@]} )) \
+        || fail "${step}: ${#fired[@]} SessionStart fired for ${REFIRE_ID}, but ${#times[@]} ignored: one was applied"
+    ad_capture status --claude-instance-id "${REFIRE_ID}"
+    [[ "$(jq -r '.state // empty' "${AD_OUT}")" == pending && "$(jq -r '.launch_started_at // empty' "${AD_OUT}")" == "${REFIRE_LAUNCH}" ]] \
+        || fail "${step}: ${REFIRE_ID} reads $(tr '\n' ' ' < "${AD_OUT}"), not pending with launch start ${REFIRE_LAUNCH}"
+    [[ -z "$(stop_lines_for "${REFIRE_ID}")" ]] || fail "${step}: a stop line names ${REFIRE_ID}: the stop past G wrote one"
+    pid_alive "${REFIRE_SILENT_PID}" || fail "${step}: the silent worker ${REFIRE_SILENT_PID} ended"
+
+    for path in "${REFIRE_PATHS[@]/#/t0-refire-}" t0-stop-no-row t0-stop-nols; do
+        "${SCENARIO_REAL_TMUX}" kill-session -t "=${path}" || fail "${step}: could not kill ${path}"
+    done
+}
+
+leg_stub_lines_not_cscb() {
+    local step="stub lines not CSCB's" dir="${SCENARIO_ROOT}/window-stubs" ad_after line n stops=0 mine=() got
+    ad_after="$(line_count "${SCENARIO_AD_SHIM_LOG}")"
+    window_copy "${dir}" 1 0 "$(( REFIRE_AD_BEFORE + 1 ))" "${ad_after}"
+    # The window holds the two stop legs' stop lines and the harness's own
+    # calls, all in the shim log's format.
+    mapfile -d '' -t mine < "/proc/$$/cmdline"
+    while IFS= read -r line; do
+        _scenario_split_line "${line}" || fail "${step}: a shim log line is not in its format: ${line}"
+        case "${_L_KIND}" in
+            stop) stops=$(( stops + 1 )) ;;
+            call)
+                read_call "${step}" "${line}"
+                same_words CALL_PARENT mine || fail "${step}: a call line whose parent is not the scenario's shell: ${line:0:200}…"
+                ;;
+            *) fail "${step}: a shim log line of kind '${_L_KIND}': ${line}" ;;
+        esac
+    done < "${dir}/agent-director-shim.log"
+    (( stops == 2 )) || fail "${step}: ${stops} stop line(s) since the hold, not the two stop legs'"
+    # No count helper counts a stub's line.
+    n="$(on_files "${dir}" cscb_ad_count "")" || fail "${step}: cscb_ad_count failed on the window"
+    [[ "${n}" == 0 ]] || fail "${step}: cscb_ad_count counts ${n} line(s) of the window"
+    got="$(on_files "${dir}" cscb_ad_calls "")" || fail "${step}: cscb_ad_calls failed on the window"
+    [[ -z "${got}" ]] || fail "${step}: cscb_ad_calls prints a line of the window: ${got}"
+    [[ "$(cscb_ad_count "")" == "${REFIRE_CSCB_BEFORE}" ]] \
+        || fail "${step}: cscb_ad_count changed from ${REFIRE_CSCB_BEFORE} to $(cscb_ad_count "") with no CSCB process running"
+    # The closing assertions pass over the whole record, stop lines included.
+    window_copy "${dir}-all" 1 "$(line_count "${SCENARIO_TMUX_SHIM_LOG}")" 1 "${ad_after}"
+    expect_on_files "${step}" "${dir}-all" pass assert_no_server_tmux
+    expect_on_files "${step}" "${dir}-all" pass assert_no_cscb_include_finished
+    expect_on_files "${step}" "${dir}-all" pass assert_no_cscb_delete
 }
 
 leg_harness_include_finished() {
@@ -1609,7 +2460,21 @@ LEGS=(
     mode_spawns_not_cscb
     path_wiring
     live_start
+    mcp_session
     harness_include_finished
+    stub_direct
+    stub_helpers
+    refire_hold
+    refire_at_once
+    refire_trusted_config_dir
+    refire_trusted_home
+    refire_dev_channels
+    refire_unrecognised
+    refire_folder_trust
+    stop_status_failure
+    stop_no_launch_start
+    refire_grace
+    stub_lines_not_cscb
     synthetic_server_tmux
     synthetic_include_finished
     synthetic_delete

@@ -506,6 +506,7 @@ import {
   ErrSpawnNotFound,
   ErrSpawnNotInteractive,
   ErrSpawnNotResumable,
+  ErrUnknownErrorName,
   ERR_SPAWN_NOT_FOUND_NAME,
 } from './agent-director-errors.ts'
 import {
@@ -10588,12 +10589,18 @@ function isNoTranscriptResumeError(err: unknown): err is AgentDirectorError {
 interface NoTranscriptReuseOptions {
   /** Whether the launch is part of the start pass (startup-errors entries are written only then). */
   readonly isStartup: boolean
-  /** The row state the caller last read before the `resume` (the diagnosis's read replaces it when it makes one). */
-  readonly lastRead: LatchRowState
+  /** The row state the caller last read before the `resume` (the diagnosis's read replaces it when it makes one); `NOTHING_READ` at the forced `resume`, which read nothing. */
+  readonly lastRead: LastRowRead
   /** True when the caller ran the pre-launch trust patch in this launch attempt. */
   readonly trustPatchRan: boolean
   /** The store's reading of the key when the launch attempt started, for the reuse (`ReuseSpawnOptions.retiredAtStart`, b.jg5 SRJ-806). */
   readonly retiredAtStart: RetiredKeyAttemptStart | undefined
+  /**
+   * Set only by the forced `resume`'s seam (`_forceResumeForPersona`): what
+   * its lines call the forced launch, passed on to the reuse
+   * (`ReuseSpawnOptions.forcedWhat`).
+   */
+  readonly forcedWhat?: string
 }
 
 /**
@@ -10610,7 +10617,8 @@ interface NoTranscriptReuseOptions {
  *     (b.jg5 SRJ-502, SRJ-105), and are answered as they are.
  *   - Then one reuse spawn of the same id (`reuseSpawnForPersona`), with the
  *     row state last read: the diagnosis's read when it made one, else
- *     `options.lastRead`.
+ *     `options.lastRead`, and the forced launch's name (`options.forcedWhat`)
+ *     when the forced `resume` gave one.
  *   - A `fresh-retired` success (a retired key's, whose mark the reuse set,
  *     b.jg5 SRJ-806) is answered as it is, after any of the three answers
  *     (SRJ-112's success row): no amnesia result, and the diagnosis's
@@ -10646,6 +10654,7 @@ async function noTranscriptReuse(
     lastRead: diagnosisRead.lastRead ?? options.lastRead,
     trustPatchRan: options.trustPatchRan,
     retiredAtStart: options.retiredAtStart,
+    forcedWhat: options.forcedWhat,
   })
   // b.jg5 SRJ-112's success row: a retired key's success is `fresh-retired`,
   // its mark set by the reuse; the amnesia results are for any other key.
@@ -11491,8 +11500,14 @@ interface ResumeSite<R> {
   /** Whether the launch is part of the start pass (startup-errors entries are written only then). */
   readonly isStartup: boolean
   readonly ref: string
-  /** The row state the site last read before the `resume`: the state a CONFLICT or UNUSABLE NAME latch records (b.jg5 SRJ-501). */
-  readonly lastRead: LatchRowState
+  /**
+   * The row state the site last read before the `resume`: the state a
+   * CONFLICT or UNUSABLE NAME latch records (b.jg5 SRJ-501). `NOTHING_READ`
+   * only at the forced `resume` (`_forceResumeForPersona`), which reads
+   * nothing of the row first: a CONFLICT or UNUSABLE NAME there takes the one
+   * latch-time `status` read, as the plain first spawn's does.
+   */
+  readonly lastRead: LastRowRead
   /** The plain spawn's parameters (`buildSpawnParams`, no reuse flag), for the spawn after `ErrSpawnNotFound`. */
   readonly params: SpawnParams
   /** The head of the site's lines (`[slack] spawnForPersona:`, or the live-row sequence's prefix). */
@@ -13712,7 +13727,9 @@ export function isCscbOwnLaunch(key: string, launchStart: unknown): boolean {
  * when the call returns success or, for a launch timeout
  * (`isLaunchTimeoutError`: `ErrCallTimeout`, or `ErrTmuxUnresponsive` whose
  * description carries "the session may have been created"), when the call's
- * error reaches CSCB. Any other error leaves the window with no end. The
+ * error reaches CSCB. Any other error leaves the window with no end. A
+ * forced-launch seam's observer set for the persona is told how the call
+ * settled (`tellForcedLaunchObserver`; none is set outside those seams). The
  * call's answer or error is passed on unchanged. Every launch call goes
  * through here: every plain spawn (`plainSpawnOutcomeAt`) and a reuse spawn
  * directly, and every `resume` through `launchWithReplyGuard`.
@@ -13733,10 +13750,12 @@ async function launchCallWithWindow<T>(
   try {
     result = await withSpawnDetection(key, workingDirectory, verb, call)
   } catch (err) {
+    tellForcedLaunchObserver(key, { threw: true, error: err })
     if (isLaunchTimeoutError(err, verb)) endLaunchCallWindow(key, started, LAUNCH_CALL_END_LAUNCH_TIMEOUT)
     if (isAdErrorInstance(err, ErrInstanceIdCollision)) restoreLaunchRecords(key, started, keptThisLaunchRow, keptOwnLaunch)
     throw err
   }
+  tellForcedLaunchObserver(key, { threw: false })
   endLaunchCallWindow(key, started, LAUNCH_CALL_END_RETURNED)
   return result
 }
@@ -15179,10 +15198,11 @@ export interface ReuseSpawnOptions {
   /**
    * The row state the caller last read before the reuse (`LATCH_ROW_STATE_NO_ROW`
    * included): the state a CONFLICT or UNUSABLE NAME latch records (b.jg5
-   * SRJ-501). Never re-read here. Undefined only for a retired key's first
-   * launch (SRJ-805), which read nothing of the row: a CONFLICT or UNUSABLE
-   * NAME there takes the one latch-time `status` read, as the plain first
-   * spawn's does.
+   * SRJ-501). Never re-read here. Undefined only for a launch that read
+   * nothing of the row: a retired key's first launch (SRJ-805), the forced
+   * reuse spawn (`_forceReuseSpawnForPersona`) and the reuse after the forced
+   * `resume`'s no-transcript answer. A CONFLICT or UNUSABLE NAME there takes
+   * the one latch-time `status` read, as the plain first spawn's does.
    */
   readonly lastRead: LatchRowState | undefined
   /**
@@ -15197,6 +15217,15 @@ export interface ReuseSpawnOptions {
    * spawn's collision does.
    */
   readonly firstLaunch?: boolean
+  /**
+   * Set only by the forced-launch seams: the forced reuse spawn's
+   * (`_forceReuseSpawnForPersona`), and the forced `resume`'s
+   * (`_forceResumeForPersona`) through the no-transcript step
+   * (`NoTranscriptReuseOptions.forcedWhat`). What their lines call the forced
+   * launch. A success with nothing read names it as the reason nothing was
+   * read, in place of a retired key's first launch.
+   */
+  readonly forcedWhat?: string
   /**
    * The installed retired-key store's reading of the key and its record
    * generation when the launch attempt this reuse runs in started (b.jg5
@@ -15230,7 +15259,8 @@ export interface ReuseSpawnOptions {
  *   - A success logs one line naming the reuse spawn and the persona (and,
  *     when `options.lastRead` is no row, that no earlier life is kept: an
  *     ordinary fresh spawn, SRJ-112; when it is nothing read, a retired
- *     key's first launch, that any finished row is kept as an earlier life),
+ *     key's first launch or, with `options.forcedWhat`, the forced launch
+ *     through its test seam, that any finished row is kept as an earlier life),
  *     then, for a key the installed retired-key store had recorded when the
  *     launch attempt started (`options.retiredAtStart`; when the call was
  *     made, for a reuse with no attempt context) and still has recorded,
@@ -15303,7 +15333,9 @@ export async function reuseSpawnForPersona(
     options.lastRead === LATCH_ROW_STATE_NO_ROW
       ? 'the id had no row when last read (an ordinary fresh spawn), so no earlier life is kept'
       : options.lastRead === NOTHING_READ
-        ? "nothing of its row was read before it (a retired key's first launch), so any finished row is kept as an earlier life"
+        ? options.forcedWhat !== undefined
+          ? `nothing of its row was read before it (the ${options.forcedWhat}, made through its test seam), so any finished row is kept as an earlier life`
+          : "nothing of its row was read before it (a retired key's first launch), so any finished row is kept as an earlier life"
         : 'its row is kept as an earlier life'
   console.error(
     `[slack] ${REUSE_SPAWN_SITE}: reuse-spawned ${ref} instanceId=${personaInstanceId(key)} — a new life on its own id; ${earlierLife} (b.jg5 SRJ-112)`,
@@ -21415,4 +21447,306 @@ export function buildLatchRecheck(input: LatchRecheckInput): LatchRecheck {
     clear,
     clearAndRecover: (key, reason) => runLatchClearSequence(key, reason, sequenceDeps),
   }
+}
+
+// ---------------------------------------------------------------------------
+// The forced-launch seams (b.jg5 SRJ-1306, SRJ-1401): a `resume` and a reuse
+// spawn forced through CSCB's own launch path, for
+// tests/integration/fixtures/fmk-driver.ts only
+// ---------------------------------------------------------------------------
+
+/** The head of the forced-launch seams' own lines. */
+const FORCED_LAUNCH_LOG_PREFIX = '[slack] forced-launch:'
+
+/** What the forced-launch seams' lines call the forced `resume`. */
+const FORCED_RESUME_WHAT = 'forced resume'
+
+/** What the forced-launch seams' lines call the forced reuse spawn. */
+const FORCED_REUSE_SPAWN_WHAT = 'forced reuse spawn'
+
+/** How one launch call of a persona settled, as `launchCallWithWindow` tells a forced-launch seam's observer. */
+type ForcedLaunchSettled = { readonly threw: false } | { readonly threw: true; readonly error: unknown }
+
+/**
+ * The forced-launch seams' observers, by persona key: each is told how every
+ * launch call of its persona settled while its seam runs
+ * (`launchCallWithWindow`), and keeps the first, the forced call's own. Set
+ * and removed only by the seams (`runForcedLaunch`); empty otherwise.
+ */
+const forcedLaunchObservers = new Map<string, (settled: ForcedLaunchSettled) => void>()
+
+/** Tell persona `key`'s forced-launch observer, when one is set, how a launch call settled. Never throws. */
+function tellForcedLaunchObserver(key: string, settled: ForcedLaunchSettled): void {
+  try {
+    forcedLaunchObservers.get(key)?.(settled)
+  } catch {
+    /* an observer only records */
+  }
+}
+
+/** A forced launch call's own error, as CSCB classified it. Every text is token-safe. */
+export interface ForcedLaunchError {
+  /**
+   * The error's name: an agent-director error's `errName`
+   * (`ErrUnknownErrorName` for an unknown one), another error's `name`, when
+   * it is a short identifier (`isSafeIdentifier`); `unknown` otherwise.
+   */
+  readonly name: string
+  /** CSCB's class for it (`classifyAdError`, b.jg5 SRJ-104). */
+  readonly errorClass: AdErrorClass
+  /**
+   * Its description, rendered on one line, redacted and capped
+   * (`renderLogMessageText`): agent-director's `errDescription` (for an
+   * `ErrUnknownErrorName`, the envelope's `err_description` when it has one),
+   * or another error's message; empty when it has none.
+   */
+  readonly description: string
+  /** `unknownName` of an `ErrUnknownErrorName`, when it is a short identifier. */
+  readonly unknownName?: string
+}
+
+/** What a forced-launch seam (`_forceResumeForPersona`, `_forceReuseSpawnForPersona`) answers. */
+export interface ForcedLaunchOutcome {
+  /**
+   * Whether the forced launch call was made. False when a launch of the
+   * persona was already in flight in this process (`result` is that launch's),
+   * when its `claude_config_dir` did not resolve (`deferred`) and in a dry run
+   * (`no-op`).
+   */
+  readonly called: boolean
+  /** The production path's answer for the launch, `retrying` in place of `failed` when the attempt armed the retry timer (`retryingWhenArmed`). */
+  readonly result: SpawnPersonaResult
+  /** The forced call's own error; absent when the call returned success or was not made. */
+  readonly error?: ForcedLaunchError
+  /** Whether the result was counted as one launch failure (`countLaunchOutsideRestartWork`: `failed`, not stopping, marked `countedClass`). */
+  readonly counted: boolean
+  /** Whether the persona is latched once the launch settled: the result is `latched`, or the installed latch answers it latched (`personaLatchedNow`). */
+  readonly latched: boolean
+}
+
+/** The forced call's error (`ForcedLaunchError`) from the value it threw. Never throws. */
+function forcedLaunchErrorOf(value: unknown): ForcedLaunchError {
+  const { errorClass } = classifyAdError(value)
+  let name = 'unknown'
+  let description = ''
+  let unknownName: string | undefined
+  try {
+    if (value instanceof AgentDirectorError) {
+      if (isSafeIdentifier(value.errName)) name = value.errName
+      description = renderLogMessageText(value.errDescription)
+      if (isAdErrorInstance(value, ErrUnknownErrorName)) {
+        if (isSafeIdentifier(value.unknownName)) unknownName = value.unknownName
+        const envelope: unknown = value.envelope
+        const reported = typeof envelope === 'object' && envelope !== null ? (envelope as { err_description?: unknown }).err_description : undefined
+        const rendered = renderLogMessageText(reported)
+        if (rendered !== '') description = rendered
+      }
+    } else if (value instanceof Error) {
+      if (isSafeIdentifier(value.name)) name = value.name
+      description = renderLogMessageText(value.message)
+    }
+  } catch {
+    /* a throwing property read keeps what was read before it */
+  }
+  return unknownName === undefined ? { name, errorClass, description } : { name, errorClass, description, unknownName }
+}
+
+/**
+ * A collision met inside a forced launch (the forced reuse spawn's, the
+ * no-transcript step's reuse after the forced `resume`, or the plain spawn
+ * after its `ErrSpawnNotFound`; b.jg5 SRJ-112, SRJ-111, SRJ-1015): the row
+ * is live, so nothing was launched. As at a site that ends its attempt on a
+ * collision, no get-then-act and no further call: the persona's retry timer
+ * armed with the collision cause (`reportReuseCollisionAtSite`), one line,
+ * `retrying`. Nothing is counted or posted. Never throws.
+ *
+ *   [slack] forced-launch: the <what> of <ref> collided with a live row — nothing launched; answering retrying, the retry timer <is armed|could not be armed> (cause=collision; b.jg5 SRJ-112, SRJ-1015)
+ */
+function forcedLaunchCollided(key: string, ref: string, what: string): SpawnPersonaResult {
+  const armed = reportReuseCollisionAtSite(key)
+  console.error(
+    `${FORCED_LAUNCH_LOG_PREFIX} the ${what} of ${ref} collided with a live row — nothing launched; answering retrying, the retry timer ${armed ? 'is armed' : 'could not be armed'} (cause=${UNAVAILABLE_RETRY_CAUSE_COLLISION}; b.jg5 SRJ-112, SRJ-1015)`,
+  )
+  return { key, action: SPAWN_ACTION_RETRYING }
+}
+
+/**
+ * One forced launch of persona `persona` (`what` names it in the lines),
+ * made by `call` with its reference and the `config_dir` label value, as
+ * every launch outside the restart work is made (`latchRecheckLaunch`,
+ * `sequenceLaunchAttempt`), with no gate that would decide against it: a
+ * launch already in flight for the persona in this process is joined, with
+ * no call (`called` false, its result); a `claude_config_dir` that does not
+ * resolve goes to the deferral hook and answers `deferred`, and a dry run
+ * answers `no-op`, each with no call. Otherwise the earlier row's idle
+ * evidence and deferrals are forgotten, as at any launch, one line is logged,
+ * and the call runs as a launch attempt (`runInAttempt`, `retrying` in place
+ * of `failed` when the attempt armed the retry timer), registered as the
+ * persona's launch in flight, and its result is counted as a launch outside
+ * the restart work's (`countLaunchOutsideRestartWork`). The persona's
+ * forced-launch observer records how the first launch call settled, which is
+ * the forced call: its error, when it threw, is classified into the answer.
+ * Never throws.
+ *
+ *   [slack] forced-launch: <what> of <ref> — no row state decides it (a test seam for tests/integration/fixtures/fmk-driver.ts)
+ */
+async function runForcedLaunch(
+  persona: Persona,
+  what: string,
+  call: (ref: string, configDirLabel: string) => Promise<SpawnPersonaResult>,
+): Promise<ForcedLaunchOutcome> {
+  const { key } = persona
+  const ref = personaRef(persona)
+  const latchedAfter = (result: SpawnPersonaResult): boolean => result.action === 'latched' || personaLatchedNow(key)
+  const inFlight = inFlightLaunches.get(key)
+  if (inFlight) {
+    console.error(`${FORCED_LAUNCH_LOG_PREFIX} launch already in flight for ${ref} — no ${what}; joining it`)
+    const joined = await inFlight
+    return { called: false, result: joined, counted: false, latched: latchedAfter(joined) }
+  }
+  const configDir = checkLaunchConfigDir(persona)
+  if (!configDir.ok) {
+    deferLaunchForConfigDir(persona, configDir)
+    const deferred = deferredResult(persona, configDir)
+    return { called: false, result: deferred, counted: false, latched: latchedAfter(deferred) }
+  }
+  if (isDryRun()) {
+    console.error(`[slack] dry-run: skipping the ${what} of ${ref} cwd=${persona.working_directory}`)
+    const skipped: SpawnPersonaResult = { key, action: 'no-op' }
+    return { called: false, result: skipped, counted: false, latched: latchedAfter(skipped) }
+  }
+  const configDirLabel = configDirLabelValue(configDir.realPath, spawnHomeDir())
+  // b.f2b, b.jdc: as at any launch, the earlier row's idle evidence and
+  // deferrals say nothing about the session this launch brings up.
+  forgetWorkingRowEvidence(key)
+  endWorkingRowDeferral(key)
+  endPromptRowDeferral(key)
+  const seen: { settled?: ForcedLaunchSettled } = {}
+  const observer = (settled: ForcedLaunchSettled): void => {
+    if (seen.settled === undefined) seen.settled = settled
+  }
+  forcedLaunchObservers.set(key, observer)
+  console.error(`${FORCED_LAUNCH_LOG_PREFIX} ${what} of ${ref} — no row state decides it (a test seam for tests/integration/fixtures/fmk-driver.ts)`)
+  const launch = runInAttempt(key, 'launch', async (attempt) => retryingWhenArmed(await call(ref, configDirLabel), attempt))
+  inFlightLaunches.set(key, launch)
+  let result: SpawnPersonaResult
+  let counted: boolean
+  try {
+    result = await launch
+    counted = sequenceLaunchCounted(result)
+    countLaunchOutsideRestartWork(key, ref, result, FORCED_LAUNCH_LOG_PREFIX)
+  } finally {
+    if (forcedLaunchObservers.get(key) === observer) forcedLaunchObservers.delete(key)
+    if (inFlightLaunches.get(key) === launch) {
+      inFlightLaunches.delete(key)
+      cancelledLaunchWaits.delete(key)
+      cancelledComingApprovers.delete(key)
+    }
+  }
+  const { settled } = seen
+  const base = { called: settled !== undefined, result, counted, latched: latchedAfter(result) }
+  return settled?.threw === true ? { ...base, error: forcedLaunchErrorOf(settled.error) } : base
+}
+
+/**
+ * Test seam, for `tests/integration/fixtures/fmk-driver.ts` only (b.jg5
+ * SRJ-1306, SRJ-1401; scenarios 5 and 25): one `resume` of persona
+ * `persona`'s own row (`cscb_<key>`) whatever its state, with no state check
+ * deciding whether to resume and nothing read of the row first. No
+ * production path calls it.
+ *
+ * It runs as `runForcedLaunch` runs a launch, through the production
+ * `resume` path: the pre-launch trust patch, then the one `resume` outcome
+ * handler (`resumeAtSite`, b.jg5 SRJ-113) with the plain spawn's parameters
+ * (`buildSpawnParams`), which makes the call through `launchWithReplyGuard`
+ * (the reply guard, the launch-call window, spawn detection with its outage
+ * reports by class) and handles every answer by class as at any `resume`
+ * site, with nothing read before it (`NOTHING_READ`: a CONFLICT or UNUSABLE
+ * NAME latches after the one latch-time `status` read). Its site's own rows:
+ *   - `ErrSpawnNotResumable`: as the latch re-check's `resume` site, no
+ *     re-read, nothing killed or launched; the lost-race cause armed
+ *     (`reportLostRaceAtSite`), one line, `retrying`: not counted, not
+ *     posted (b.jg5 SRJ-710);
+ *   - a no-transcript answer: the no-transcript step's reuse spawn of the
+ *     same id (`noTranscriptReuse`, b.jg5 SRJ-707, SRJ-712), as at every
+ *     `resume` site, told the forced launch's name (`FORCED_RESUME_WHAT`),
+ *     which its success line gives as the reason nothing was read when no
+ *     diagnosis read the row;
+ *   - `ErrSpawnNotFound`: the handler's one plain spawn of the same id
+ *     (b.jg5 SRJ-111); a collision of it, or of the no-transcript reuse,
+ *     ends the launch (`forcedLaunchCollided`);
+ *   - a DIRECTORY failure is marked `countedClass`, as at every launch
+ *     outside the restart work.
+ * Nothing here deletes, kills or sets `include_finished`, and it adds no
+ * agent-director call to the ones that path makes. Answers the launch's
+ * outcome (`ForcedLaunchOutcome`), with the `resume`'s own error when it
+ * threw. Never throws.
+ *
+ *   [slack] forced-launch: ErrSpawnNotResumable <description> on the forced resume of <ref> — nothing is read, killed or launched; answering retrying, no spawn-failure notice, nothing counted; the retry timer <is armed|could not be armed> (cause=lost-race; b.jg5 SRJ-710)
+ */
+export function _forceResumeForPersona(persona: Persona, config: PersonaConfig): Promise<ForcedLaunchOutcome> {
+  const { key } = persona
+  return runForcedLaunch(persona, FORCED_RESUME_WHAT, (ref, configDirLabel) => {
+    const params = buildSpawnParams(persona, config, configDirLabel)
+    // b.av2 SR-6.2: the trust patch precedes every launch.
+    runPreLaunchTrustPatch(persona, ref)
+    return resumeAtSite<SpawnPersonaResult>({
+      persona,
+      isStartup: false,
+      ref,
+      lastRead: NOTHING_READ,
+      params,
+      head: FORCED_LAUNCH_LOG_PREFIX,
+      marksDirectoryCounted: true,
+      noTranscript: async (err) => {
+        console.error(
+          `${FORCED_LAUNCH_LOG_PREFIX} ${describeAgentDirectorFailure(err)} on the ${FORCED_RESUME_WHAT} of ${ref} — a reuse spawn of the same id follows; nothing is deleted (b.jg5 SRJ-707)`,
+        )
+        const reused = await noTranscriptReuse(persona, config, err, {
+          isStartup: false,
+          lastRead: NOTHING_READ,
+          trustPatchRan: true,
+          retiredAtStart: undefined,
+          forcedWhat: FORCED_RESUME_WHAT,
+        })
+        return isReuseSpawnCollided(reused) ? forcedLaunchCollided(key, ref, REUSE_SPAWN_WHAT) : reused
+      },
+      notResumable: (err) => {
+        const armed = reportLostRaceAtSite(key)
+        console.error(
+          `${FORCED_LAUNCH_LOG_PREFIX} ${describeAgentDirectorFailure(err)} on the ${FORCED_RESUME_WHAT} of ${ref} — nothing is read, killed or launched; answering retrying, no spawn-failure notice, nothing counted; the retry timer ${armed ? 'is armed' : 'could not be armed'} (cause=${UNAVAILABLE_RETRY_CAUSE_LOST_RACE}; b.jg5 SRJ-710)`,
+        )
+        return Promise.resolve({ key, action: SPAWN_ACTION_RETRYING })
+      },
+      plainSpawnCollided: () => Promise.resolve(forcedLaunchCollided(key, ref, RESUME_NOT_FOUND_SPAWN_WHAT)),
+    })
+  })
+}
+
+/**
+ * Test seam, for `tests/integration/fixtures/fmk-driver.ts` only (b.jg5
+ * SRJ-1306, SRJ-1401; scenarios 8 and 25): one reuse spawn
+ * (`reuse_finished`) of persona `persona`'s own id, whatever its row, with
+ * nothing read of the row first. No production path calls it.
+ *
+ * It runs as `runForcedLaunch` runs a launch, through the one reuse launch
+ * (`reuseSpawnForPersona`, b.jg5 SRJ-112, SRJ-708): its `claude_config_dir`
+ * check, the parameters `buildSpawnParams` gives with only `reuse_finished`
+ * added, the pre-launch trust patch and reply guard, the call through the
+ * launch-call window and spawn detection, and SRJ-112's outcome table by
+ * class (`reuseSpawnFailedAt`: `ErrInvalidFlags` takes the version re-check
+ * and the hold decision; a CONFLICT or UNUSABLE NAME latches after the one
+ * latch-time `status` read, `lastRead` being `NOTHING_READ`; UNAVAILABLE,
+ * ENVIRONMENT, CONFIG and UNCLASSIFIED are refusals; LAUNCH FAILURE and
+ * DIRECTORY are counted). Its collided answer ends the launch
+ * (`forcedLaunchCollided`). Nothing here deletes, kills or sets
+ * `include_finished`, and it adds no agent-director call to the ones that
+ * path makes. Answers the launch's outcome (`ForcedLaunchOutcome`), with the
+ * reuse spawn's own error when it threw. Never throws.
+ */
+export function _forceReuseSpawnForPersona(persona: Persona, config: PersonaConfig): Promise<ForcedLaunchOutcome> {
+  return runForcedLaunch(persona, FORCED_REUSE_SPAWN_WHAT, async (ref) => {
+    const reused = await reuseSpawnForPersona(persona, config, { isStartup: false, lastRead: NOTHING_READ, forcedWhat: FORCED_REUSE_SPAWN_WHAT })
+    return isReuseSpawnCollided(reused) ? forcedLaunchCollided(persona.key, ref, REUSE_SPAWN_WHAT) : reused
+  })
 }

@@ -61,7 +61,10 @@
 #   the scenario's own tmux server;
 # - exports a PATH that starts with the scenario's bin directory
 #   (SCENARIO_BIN, `$SCENARIO_ROOT/bin`), in which `claude` is a copy of
-#   fixtures/stub-claude.sh, followed by the container's PATH without every
+#   fixtures/stub-claude.sh, with a copy of its MCP session client
+#   fixtures/stub-mcp-session.ts beside it (see "Stub workers"), and in which
+#   the stub's mode selections are kept (`stub_mode`), followed by the
+#   container's PATH without every
 #   directory that holds an `agent-director` (the image's default binary's
 #   own directory among them) and without relative or empty entries. bun's
 #   directory stays. No process of the scenario finds an agent-director on
@@ -74,6 +77,9 @@
 #   no release-candidate install and no store yet (SCENARIO_AD_START is `rc`
 #   or `0.10.0`; a shared-mode script that sets it fails);
 # - writes no agent-director config.toml: agent-director's default settings;
+# - once SCENARIO_PORT is picked, writes the MCP config the stub's session
+#   reads, $HOME/.claude/slack-mcp.json naming that port (`write_mcp_config`),
+#   which is the `mcp_config_path` a persona config defaults to;
 # - installs the tmux shim (fixtures/tmux-shim.sh) for the scenario's CSCB
 #   processes, in `log` mode, and starts the CSCB process record (see "CSCB
 #   processes and the tmux shim").
@@ -268,6 +274,43 @@
 #   ad_store_id                        open the store read-only and print its store id (store_meta
 #                                      key store_id); fail, saying why, unless it is 16 lowercase hex
 #                                      characters (a 0.10.0 store has none)
+#   ad_store_pending_no_launch <instance-id>
+#                                      b.jg5 SRJ-1306's `pending` row with no launch start, made from
+#                                      the row (the persona's live row) with one `ad_store_edit`
+#                                      UPDATE: state `pending`; launch_started_at, launch_token, pid,
+#                                      proc_starttime, pane_id, pane_pid and pane_starttime NULL;
+#                                      row_version advanced by one; every other column kept. Fails
+#                                      when no row has <instance-id> (the UPDATE returns none) or the
+#                                      id holds a character other than letters, digits and `._:@-`;
+#                                      then a harness `status` read (`ad_capture`) must read `pending`
+#                                      with no launch_started_at, or it fails
+#
+#   Stub workers (fmk mode; fixtures/stub-claude.sh's header states the modes, the
+#   SessionStart re-fire, its stop line and the MCP session; each runs both guards first)
+#   STUB_MODE_DEV_CHANNELS STUB_MODE_AT_ONCE STUB_MODE_SILENT STUB_MODE_UNRECOGNISED
+#   STUB_MODE_FOLDER_TRUST             the five modes' names (`dev-channels`, the default of a
+#                                      directory with no selection; `at-once`; `silent`;
+#                                      `unrecognised-dialog`; `folder-trust`)
+#   stub_mode <dir> <mode>             select <mode> for every stub worker whose working directory is
+#                                      <dir>: one `<mode> TAB <real path of dir>` line added to
+#                                      $SCENARIO_BIN/stub-claude-modes (by an atomic rewrite), which
+#                                      the stub reads at start-up, so it holds from the next launch or
+#                                      resume in <dir> on; the last selection of a directory wins;
+#                                      fails for an unknown mode, or a <dir> that is not a directory
+#                                      under SCENARIO_ROOT (as written and by real path)
+#   stub_press_enter <target>          a human answering a stub held at a startup dialog: send Enter
+#                                      into the tmux pane <target> (a pane id such as %3, or
+#                                      session[:window[.pane]], the session name matched exactly, never
+#                                      as a prefix of another session's) on the scenario's own tmux server, with
+#                                      the real tmux, from the scenario's own shell (never a CSCB
+#                                      process); fails, with tmux's message, when tmux refuses (no
+#                                      such pane, say), and refuses when TMUX_TMPDIR is not the
+#                                      scenario's or TMUX is set; it does not read the pane to check
+#                                      the effect
+#   write_mcp_config [<port>]          write $HOME/.claude/slack-mcp.json, the MCP config the stub's
+#                                      session reads, naming http://127.0.0.1:<port>/mcp under the
+#                                      server name slack-channel-router, as the package's install
+#                                      writes it (default <port>: SCENARIO_PORT; setup writes it so)
 #
 #   CSCB processes and the tmux shim (see "CSCB processes and the tmux shim")
 #   cscb_run <command> [<arg>...]      run <command> as a CSCB process (a CLI command of the package
@@ -444,6 +487,22 @@ SCENARIO_TMUX_STOP_S=10
 SCENARIO_TMUX_SHIM_SRC="${SCENARIO_FIXTURES}/tmux-shim.sh"
 SCENARIO_TMUX_SHIM_MARKER='# CSCB_CI_TMUX_SHIM_MARKER'
 SCENARIO_TMUX_SHIM_MODES=(log fail-kill fail-create slow-create wedge)
+
+# The stub worker's modes (fixtures/stub-claude.sh states what each does),
+# its MCP session client, and the file of its mode selections beside it.
+STUB_MODE_DEV_CHANNELS=dev-channels
+STUB_MODE_AT_ONCE=at-once
+STUB_MODE_SILENT=silent
+STUB_MODE_UNRECOGNISED=unrecognised-dialog
+STUB_MODE_FOLDER_TRUST=folder-trust
+SCENARIO_STUB_MODES=("${STUB_MODE_DEV_CHANNELS}" "${STUB_MODE_AT_ONCE}" "${STUB_MODE_SILENT}"
+    "${STUB_MODE_UNRECOGNISED}" "${STUB_MODE_FOLDER_TRUST}")
+SCENARIO_STUB_MCP_SRC="${SCENARIO_FIXTURES}/stub-mcp-session.ts"
+SCENARIO_STUB_MODES_NAME=stub-claude-modes
+
+# The MCP server name the package's install writes into slack-mcp.json
+# (src/config.ts MCP_SERVER_NAME).
+SCENARIO_MCP_SERVER_NAME=slack-channel-router
 
 # The closing assertions every fmk script ends with.
 SCENARIO_CLOSING_ASSERTIONS=(assert_no_server_tmux assert_no_cscb_include_finished assert_no_cscb_delete)
@@ -1716,6 +1775,102 @@ ad_store_id() {
     printf '%s\n' "${out}"
 }
 
+ad_store_pending_no_launch() {
+    require_ci_image "ad_store_pending_no_launch"
+    require_scenario_home "ad_store_pending_no_launch"
+    local id="${1:-}" step out
+    step="ad_store_pending_no_launch ${id}"
+    [[ "${id}" =~ ^[A-Za-z0-9._:@-]+$ ]] \
+        || fail "${step}: instance id '${id}' is empty or holds a character other than letters, digits and ._:@-"
+    # One statement; RETURNING names the row it changed, so no row is seen.
+    out="$(ad_store_edit "UPDATE spawns SET state = 'pending', launch_started_at = NULL, launch_token = NULL, pid = NULL, proc_starttime = NULL, pane_id = NULL, pane_pid = NULL, pane_starttime = NULL, row_version = row_version + 1 WHERE claude_instance_id = '${id}' RETURNING claude_instance_id")" \
+        || exit 1
+    [[ "${out}" == "${id}" ]] || fail "${step}: no row has instance id ${id}"
+    ad_capture status --claude-instance-id "${id}"
+    [[ "${AD_RC}" == 0 ]] \
+        || fail "${step}: the harness status read exited ${AD_RC}: $(tr '\n' ' ' < "${AD_ERR}")"
+    jq -e 'type == "object" and .state == "pending" and (has("launch_started_at") | not)' "${AD_OUT}" > /dev/null 2>&1 \
+        || fail "${step}: after the edit the row does not read pending with no launch start: $(tr '\n' ' ' < "${AD_OUT}")"
+}
+
+# ---------------------------------------------------------------------------
+# Stub workers (fmk mode)
+# ---------------------------------------------------------------------------
+
+stub_mode() {
+    local dir="${1:-}" mode="${2:-}" step m known=0 real_root real_dir file tmp
+    step="stub_mode ${dir} ${mode}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    [[ "${SCENARIO_FMK}" == 1 ]] || fail "${step}: stub modes are for fmk scripts only"
+    for m in "${SCENARIO_STUB_MODES[@]}"; do
+        [[ "${m}" == "${mode}" ]] && known=1
+    done
+    (( known )) || fail "${step}: unknown mode '${mode}' (${SCENARIO_STUB_MODES[*]})"
+    [[ "${dir}" == "${SCENARIO_ROOT}"/* ]] \
+        || fail "${step}: refused: ${dir} is not under SCENARIO_ROOT ${SCENARIO_ROOT}"
+    [[ -d "${dir}" ]] || fail "${step}: ${dir} is not a directory"
+    real_root="$(realpath -e -- "${SCENARIO_ROOT}" 2> /dev/null)" \
+        || fail "${step}: cannot resolve SCENARIO_ROOT ${SCENARIO_ROOT}"
+    real_dir="$(realpath -e -- "${dir}" 2> /dev/null)" || fail "${step}: cannot resolve ${dir}"
+    [[ "${real_dir}" == "${real_root}"/* ]] \
+        || fail "${step}: refused: ${dir} resolves to ${real_dir}, which is not under SCENARIO_ROOT ${real_root}"
+    [[ "${real_dir}" != *[$'\t\n']* ]] || fail "${step}: ${real_dir} holds a TAB or a newline"
+    file="${SCENARIO_BIN}/${SCENARIO_STUB_MODES_NAME}"
+    tmp="$(mktemp "${SCENARIO_BIN}/.scenario-stub-modes.XXXXXX")" \
+        || fail "${step}: could not create a temp file beside ${file}"
+    {
+        if [[ -f "${file}" ]]; then
+            cat -- "${file}"
+        fi
+        printf '%s\t%s\n' "${mode}" "${real_dir}"
+    } > "${tmp}" || fail "${step}: could not write ${tmp}"
+    # One rename, so a starting stub never reads a half-written file.
+    mv -f -- "${tmp}" "${file}" || fail "${step}: could not rename into ${file}"
+}
+
+stub_press_enter() {
+    local target="${1:-}" step err exact rc=0
+    step="stub_press_enter ${target}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    [[ "${SCENARIO_FMK}" == 1 ]] || fail "${step}: the scenario's tmux server is for fmk scripts only"
+    [[ -n "${target}" ]] || fail "${step}: no pane named"
+    [[ "${TMUX_TMPDIR:-}" == "${SCENARIO_ROOT}/tmux" ]] \
+        || fail "${step}: refused: TMUX_TMPDIR '${TMUX_TMPDIR:-}' is not the scenario's ${SCENARIO_ROOT}/tmux"
+    [[ -z "${TMUX:-}" ]] || fail "${step}: refused: TMUX is set, naming another tmux server"
+    # A pane id is exact; a session name is matched exactly (tmux's `=`, and a
+    # `:` so it is read as a session, never as a window or a name prefix).
+    case "${target}" in
+        %*) exact="${target}" ;;
+        *:*) exact="=${target}" ;;
+        *) exact="=${target}:" ;;
+    esac
+    err="${SCENARIO_ROOT}/stub-press-enter.err"
+    "${SCENARIO_REAL_TMUX}" send-keys -t "${exact}" Enter 2> "${err}" || rc=$?
+    (( rc == 0 )) || fail "${step}: tmux send-keys exited ${rc}: $(tr '\n' ' ' < "${err}")"
+}
+
+write_mcp_config() {
+    local port="${1:-${SCENARIO_PORT:-}}" step dir
+    step="write_mcp_config ${port}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    [[ "${port}" =~ ^[1-9][0-9]*$ ]] && (( port <= 65535 )) || fail "${step}: '${port}' is not a port"
+    dir="${HOME}/.claude"
+    mkdir -p "${dir}" || fail "${step}: could not create ${dir}"
+    write_file "${dir}/slack-mcp.json" << EOF
+{
+  "mcpServers": {
+    "${SCENARIO_MCP_SERVER_NAME}": {
+      "type": "http",
+      "url": "http://127.0.0.1:${port}/mcp"
+    }
+  }
+}
+EOF
+}
+
 # ---------------------------------------------------------------------------
 # Reading the shim logs against the CSCB process record (fmk mode)
 # ---------------------------------------------------------------------------
@@ -2078,6 +2233,9 @@ _scenario_fmk_setup() {
         || fail "could not create the scenario's HOME, bin and tmux directories"
     chmod 00700 "${SCENARIO_ROOT}/tmux" || fail "could not set the mode of ${SCENARIO_ROOT}/tmux"
     _scenario_place "${SCENARIO_FIXTURES}/stub-claude.sh" "${SCENARIO_BIN}/claude" "the stub claude"
+    [[ -f "${SCENARIO_STUB_MCP_SRC}" ]] \
+        || fail "stub MCP session client missing at ${SCENARIO_STUB_MCP_SRC}"
+    _scenario_place "${SCENARIO_STUB_MCP_SRC}" "${SCENARIO_BIN}/${SCENARIO_STUB_MCP_SRC##*/}" "the stub's MCP session client"
 
     # The tmux shim, its real tmux, its mode (`log`) and its log, for the
     # CSCB processes' PATH only; the scenario's own shell keeps the real tmux.
@@ -2167,3 +2325,6 @@ fi
 new_state_dir main
 SCENARIO_PORT="$(free_port)"
 export SCENARIO_PORT
+if [[ "${SCENARIO_FMK}" == 1 ]]; then
+    write_mcp_config "${SCENARIO_PORT}"
+fi
