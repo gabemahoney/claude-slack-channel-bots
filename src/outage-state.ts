@@ -138,6 +138,7 @@ import {
   type AdErrorClassification,
   type AdVerb,
 } from './ad-error-class.ts'
+import { PHASE1_RUNBOOK_SECTION_TITLE } from './ad-version-gate.ts'
 import {
   ErrSystemInstallDisappeared,
   ErrCwdNotFound,
@@ -153,7 +154,7 @@ import {
 } from './persona-episodes.ts'
 import {
   UNAVAILABLE_RETRY_CAUSE_LOST_RACE,
-  UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION,
+  UNAVAILABLE_RETRY_CAUSE_COLLISION,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
   UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
   UNAVAILABLE_RETRY_ROW_PENDING,
@@ -350,6 +351,12 @@ export const OUTAGE_CLASS_ORDER: readonly OutageClass[] = Object.freeze([
 
 /**
  * ONSET_TEMPLATES — one template function per outage class.
+ * `ad-unreachable` says it affects every persona (the binary is host-wide)
+ * and points to the README's switch-over runbook section by its title
+ * (`PHASE1_RUNBOOK_SECTION_TITLE`), with no install, reinstall or upgrade
+ * command (b.jg5 SRJ-1001). The generic `tmux-unavailable` onset speaks for
+ * this persona only, since the outage is raised and cleared per persona; the
+ * re-bound socket's onset is {@link tmuxServerChangedOnset} (SRJ-1021).
  * The optional `detail` parameter carries class-specific context
  * (binary path for ad-unreachable; the persona's working directory for
  * cwd-unreachable; agent-director's description for ad-config-malformed,
@@ -361,10 +368,10 @@ export const OUTAGE_CLASS_ORDER: readonly OutageClass[] = Object.freeze([
  */
 export const ONSET_TEMPLATES: Record<OutageClass, (detail?: string) => string> = {
   'ad-unreachable': (binaryPath?: string) =>
-    `:rotating_light: *agent-director unreachable* — affects every persona.\nBinary: \`${binaryPath ?? '<unknown>'}\`\nRemediation: reinstall agent-director.`,
+    `:rotating_light: *agent-director unreachable* — affects every persona.\nBinary: \`${binaryPath ?? '<unknown>'}\`\nRemediation: follow the README's switch-over runbook section "${PHASE1_RUNBOOK_SECTION_TITLE}".`,
 
   'tmux-unavailable': (_detail?: string) =>
-    `:rotating_light: *tmux unavailable* — affects every persona.\nRemediation: install or repair tmux.`,
+    `:rotating_light: *tmux unavailable* — agent-director cannot reach tmux for this persona.\nRemediation: install or repair tmux.`,
 
   'cwd-unreachable': (workingDirectory?: string) =>
     `:rotating_light: *Working directory unreachable* — \`${workingDirectory ?? '<unknown>'}\`\nRemediation: restore the directory or correct this persona's \`working_directory\` in \`config.json\`.`,
@@ -881,15 +888,15 @@ export function reportUnclassifiedAtSite(
  * the one re-run of get-then-act a plain spawn's collision gave (SRJ-111,
  * SRJ-114), or a `resume` that answered a collision (SRJ-713, which keeps it
  * from the spawn-failure notice): inside a launch or recovery attempt
- * for `key` it arms the persona's retry timer with the reuse-collision cause
- * (`UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION`) through the installed trigger
+ * for `key` it arms the persona's retry timer with the collision cause
+ * (`UNAVAILABLE_RETRY_CAUSE_COLLISION`) through the installed trigger
  * sink, and the attempt records it as its last error, so a launch it ends is
  * never counted and answers `retrying` when the timer was armed; outside one
  * it does nothing. It starts no condition, posts nothing and never throws.
  * Answers whether the timer was armed.
  */
 export function reportReuseCollisionAtSite(key: string): boolean {
-  return reportAttemptCause(key, { kind: UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION }, 'spawn', deps?.triggerSink)
+  return reportAttemptCause(key, { kind: UNAVAILABLE_RETRY_CAUSE_COLLISION }, 'spawn', deps?.triggerSink)
 }
 
 /**

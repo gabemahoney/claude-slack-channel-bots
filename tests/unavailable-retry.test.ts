@@ -419,7 +419,7 @@ import {
   UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CAUSE_LOST_RACE,
-  UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION,
+  UNAVAILABLE_RETRY_CAUSE_COLLISION,
   UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED,
   UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
@@ -8900,14 +8900,14 @@ describe('unavailable retry: a running live-row sequence blocks P\'s retry and i
 // ---------------------------------------------------------------------------
 
 describe('unavailable retry: the collision ladder\'s second reuse collision, its lost race and its sequence start as triggers (SRJ-301, SRJ-112, SRJ-710, SRJ-706)', () => {
-  test('a second collision: the reuse of a finished row in another directory collides, the re-run\'s get reads it ended, and the second reuse collides; P\'s timer is armed once with the reuse-collision cause and nothing is counted', async () => {
+  test('a second collision: the reuse of a finished row in another directory collides, the re-run\'s get reads it ended, and the second reuse collides; P\'s timer is armed once with the collision cause and nothing is counted', async () => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     const [key, other] = h.keys as [string, string]
     h.script(collided(h, personaOf(h, key), { cwd: h.home, state: LIVENESS_DEAD_ROW_ENDED }, errInstanceIdCollision(), errInstanceIdCollision()))
 
     expect(await h.launch(key)).toEqual({ key, action: SPAWN_ACTION_RETRYING })
 
-    expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION)
+    expectArmedOnce(h, key, UNAVAILABLE_RETRY_CAUSE_COLLISION)
     expect(callCounts(h)).toEqual({ spawnCalls: 3, getCalls: 2 })
     expect(h.reuseSpawns()).toHaveLength(2)
     expect(getFailureCount(key)).toBe(0)
@@ -9921,7 +9921,7 @@ describe('unavailable retry: nothing arms a persona\'s timer inside its latch re
       UNAVAILABLE_RETRY_CAUSE_CONFIG,
       UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
       UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
-      UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION,
+      UNAVAILABLE_RETRY_CAUSE_COLLISION,
       UNAVAILABLE_RETRY_CAUSE_LOST_RACE,
     ].map((kind) => [`arm with the ${kind} cause`, (c: UnavailableRetryController, key: string) => c.arm(key, { kind } as UnavailableRetryCause), kind, false] as const),
     ['armPendingOnly', (c, key) => c.armPendingOnly(key), UNAVAILABLE_RETRY_CAUSE_PENDING_ROW, undefined],
@@ -9984,7 +9984,7 @@ describe('unavailable retry: nothing arms a persona\'s timer inside its latch re
     ['CONFIG (ErrConfigMalformed) from spawn', (sink) => reportAttemptError(KEY, errConfigMalformed(), 'spawn', sink), 'spawn', UNAVAILABLE_RETRY_CAUSE_CONFIG],
     ['UNCLASSIFIED (an unclassified ErrInternal) from spawn', (sink) => reportAttemptError(KEY, errInternal(), 'spawn', sink), 'spawn', UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED],
     ['ErrTmuxKillFailed from kill', (sink) => reportAttemptError(KEY, errTmuxKillFailed(), 'kill', sink), 'kill', UNAVAILABLE_RETRY_CAUSE_KILL_FAILED],
-    ['reportAttemptCause with the reuse-collision cause', (sink) => reportAttemptCause(KEY, { kind: UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION }, 'spawn', sink), 'spawn', UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION],
+    ['reportAttemptCause with the collision cause', (sink) => reportAttemptCause(KEY, { kind: UNAVAILABLE_RETRY_CAUSE_COLLISION }, 'spawn', sink), 'spawn', UNAVAILABLE_RETRY_CAUSE_COLLISION],
     ['reportAttemptCause with the UNCLASSIFIED cause (a site\'s own classification)', (sink) => reportAttemptCause(KEY, { kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, error: errInvalidFlags('resume') }, 'resume', sink), 'resume', UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED],
   ]
 

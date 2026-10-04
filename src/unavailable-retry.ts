@@ -418,7 +418,7 @@ export const UNAVAILABLE_RETRY_CAUSE_SEQUENCE_NOT_JUDGED = 'sequence-not-judged'
  * alert), no kill under the `ad-config-malformed` rule, a launch not made, or
  * a final launch that failed or threw. A stop for a latch, a teardown or
  * shutdown, a launch that latched the persona or stops the server, a reuse
- * collision (`UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION`), a final `resume`'s
+ * collision (`UNAVAILABLE_RETRY_CAUSE_COLLISION`), a final `resume`'s
  * `ErrSpawnNotResumable` whose re-read found a lost race
  * (`UNAVAILABLE_RETRY_CAUSE_LOST_RACE`; one whose re-read found the row
  * `pending` arms this cause, b.jg5 SRJ-710) and a final launch
@@ -441,7 +441,7 @@ export const UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED = 'sequence-ended-without-la
  * collision gave ends it (`reportReuseCollisionAtSite`,
  * `src/outage-state.ts`). Never counted.
  */
-export const UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION = 'reuse-collision'
+export const UNAVAILABLE_RETRY_CAUSE_COLLISION = 'collision'
 
 /**
  * The cause of a lost race on `resume`'s `ErrSpawnNotResumable` (b.jg5

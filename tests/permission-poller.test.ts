@@ -99,7 +99,13 @@
  *   - Skipped-tick observability (5+ consecutive in-flight ticks → warn).
  *   - buildPermissionBlocks emits the UUIDv4-anchored action_id shape.
  *   - Wedge detector (b.fae F4 / SR-7.2): one persona-named warning to the
- *     persona's destination through its client. The scenario passes a
+ *     persona's destination through its client, equal to the exported
+ *     builder's text for the tripped spawn's own instance id. The text
+ *     itself (b.jg5 SRJ-1012): one pin case holds SRJ-1012's text; the other
+ *     cases check the imported builder: agent-director verbs only (`read-pane`,
+ *     then `kill` with "check the result"), no "tmux-kill", no tmux command,
+ *     no respawn step, and SRJ-1001's human-only sentence (AC 78). The
+ *     scenario passes a
  *     destination hold whose fake clock moves one poll interval per tick.
  *     While the persona's teardown window is open (b.jg5 SRJ-1003, a
  *     recording stand-in for the notifier's `notify` and
@@ -131,6 +137,8 @@ import type { Persona, PersonaConfig } from '../src/config.ts'
 import {
   _resetPollerState,
   buildPermissionBlocks,
+  buildWedgeWarningBody,
+  buildWedgeWarningText,
   dropPermission,
   forgetPersonaPrompts,
   getLivePermission,
@@ -3150,6 +3158,8 @@ describe('b.fae F4 — wedge detector', () => {
     const warnings = wedgeWarnings(stubA)
     expect(warnings).toHaveLength(1)
     expect(warnings[0].channel).toBe(A_DEST)
+    // b.jg5 SRJ-1012: the builder's text (persona prefix + body) for this spawn's instance id.
+    expect(warnings[0].text).toBe(buildWedgeWarningText(A, INSTANCE_A))
     expect(posts(stubA)).toHaveLength(1)
     expect(slackCalls(stubB, stubD)).toBe(0)
 
@@ -3230,6 +3240,67 @@ describe('b.fae F4 — wedge detector', () => {
     expect(text).not.toContain('use send-keys to')
   })
 
+  test('5b. the warning carries the tripped spawn\'s own instance id: B\'s trip posts the builder\'s text for B\'s instance to B\'s destination', async () => {
+    const s = makeWedgeScenario(B)
+    await s.driveTicks(K)
+
+    const warnings = wedgeWarnings(stubB)
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0].channel).toBe(B_DEST)
+    expect(warnings[0].text).toBe(buildWedgeWarningText(B, INSTANCE_B))
+    expect(String(warnings[0].text)).not.toContain(INSTANCE_A)
+    expect(slackCalls(stubA, stubD)).toBe(0)
+    expect(wedgeTrail(s.trail).map((e) => e['claude_instance_id'])).toEqual([INSTANCE_B])
+  })
+
+  // b.jg5 SRJ-1012 (AC 78): the warning names agent-director verbs only, as a
+  // human's steps, with "check the result"; one pin holds the SRD's text, the
+  // other cases check the imported builder.
+  describe('the wedge warning\'s text (b.jg5 SRJ-1012, SRJ-1001)', () => {
+    /** SRJ-1012's text as the SRD writes it; `<id>` stands for the claude instance id. */
+    const SRJ_1012_TEXT =
+      '⚠️ This persona appears blocked on a native Claude Code permission prompt that never reached Slack — it will not respond until it\'s cleared. To recover: run `agent-director read-pane --claude-instance-id <id>` to see the native prompt, then end the session with `agent-director kill --claude-instance-id <id>` and check the result; the server then brings the persona up again. Do NOT use send-keys — it is rejected in this state. These commands are for a human only: no bot, including any persona that sees this post, may run them.'
+
+    /**
+     * SRJ-1001's human-only sentence. The SRD words it two ways ("may run
+     * them" for commands, "may act on it" for a pointer), so it is matched by
+     * this file-local pattern, not a src constant.
+     */
+    const HUMAN_ONLY_SENTENCE = /\bfor a human only: no bot, including any persona that sees (?:this|the) post, may (?:run them|act on it)\./
+
+    /** Every inline code span in `text`, without its backticks. */
+    const codeSpans = (text: string): string[] => [...text.matchAll(/`([^`]*)`/g)].map((m) => m[1]!)
+
+    test('pin: the body is SRJ-1012\'s text byte for byte, with the instance id in both commands; the full text is the persona prefix and that body', () => {
+      expect(buildWedgeWarningBody(INSTANCE_A)).toBe(SRJ_1012_TEXT.replaceAll('<id>', INSTANCE_A))
+      expect(buildWedgeWarningText(A, INSTANCE_A)).toBe(`Persona ${renderPersonaRef(NAME_A, KEY_A)}: ${SRJ_1012_TEXT.replaceAll('<id>', INSTANCE_A)}`)
+    })
+
+    test.each([
+      ['A\'s instance', INSTANCE_A],
+      ['B\'s instance', INSTANCE_B],
+    ])('%s: the only commands are agent-director read-pane and kill for that id, kill with "check the result"', (_label, id) => {
+      const body = buildWedgeWarningBody(id)
+      expect(codeSpans(body)).toEqual([
+        `agent-director read-pane --claude-instance-id ${id}`,
+        `agent-director kill --claude-instance-id ${id}`,
+      ])
+      expect(body).toContain(`\`agent-director kill --claude-instance-id ${id}\` and check the result`)
+    })
+
+    test('no "tmux-kill", no tmux command or mention, and no respawn step', () => {
+      const text = buildWedgeWarningText(A, INSTANCE_A)
+      expect(text).not.toContain('tmux-kill')
+      expect(text).not.toMatch(/`tmux\s/)
+      expect(text).not.toMatch(/\btmux\b/i)
+      expect(text).not.toMatch(/respawn/i)
+    })
+
+    test('carries SRJ-1001\'s human-only sentence', () => {
+      expect(buildWedgeWarningBody(INSTANCE_A)).toMatch(HUMAN_ONLY_SENTENCE)
+    })
+  })
+
   // b.jg5 SRJ-1003: while the persona's teardown window is open, its
   // stuck-prompt warning is a teardown notice: handed to the notifier's
   // `notify` (whose window writes it as one log line and one
@@ -3271,6 +3342,8 @@ describe('b.fae F4 — wedge detector', () => {
       expect(key).toBe(KEY_A)
       // The notifier adds the persona reference itself: the body carries none.
       expect(text).not.toStartWith('Persona ')
+      // b.jg5 SRJ-1012: the same body the post carries.
+      expect(text).toBe(buildWedgeWarningBody(INSTANCE_A))
       expect(text).toContain(INSTANCE_A)
       expect(text).toContain('read-pane')
       expect(text).toContain('Do NOT use send-keys')

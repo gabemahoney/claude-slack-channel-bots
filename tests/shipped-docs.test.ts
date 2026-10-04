@@ -76,6 +76,16 @@
  *   exports; the two runbook copies, which join `SWITCH_OVER_CARRIERS` and
  *   `ROLLBACK_CARRIERS`, name the README as the maintained copy and match it
  *   word for word; and every CHANGELOG link resolves (hatch A3).
+ * - E36 T1's checks, also read through `OPERATOR_TEXTS`: no operator text
+ *   quotes a sentence of the *Kill failed* or *Process outlived kill* alert
+ *   but its title and closing sentences (the E20 note; both versions rendered
+ *   from src/kill-failure-alert.ts with the stub's descriptions, one case per
+ *   text and sentence); the README and the debugging skill name no
+ *   raw-command advice (a positional `agent-director kill` id, tmux-kill or
+ *   kill-and-respawn, `has-session`, an attach target without `=`, a raw tmux
+ *   kill outside the switch-over section), and their `auto-restart disabled`
+ *   lost-message text keeps not saying the persona will not restart on its
+ *   own (the E8 note); each self-checked.
  * CHANGELOG.md and docs/ are not shipped descriptions: the forbidden-term
  * audit still reads only `SHIPPED_TEXTS`, which holds neither. Besides the
  * two docs read through `OPERATOR_TEXTS`, the one docs/ file read is
@@ -141,13 +151,37 @@ import {
 } from '../src/ad-settings.ts'
 import { DEFAULT_STORE_PATH } from '../src/agent-director-client.ts'
 import { AD_ERROR_CLASS_CONFLICT, AD_ERROR_CLASS_UNAVAILABLE } from '../src/ad-error-class.ts'
-import { PERSONA_INSTANCE_ID_PREFIX, PERSONA_TMUX_SESSION_PREFIX, SERVICE_LABEL } from '../src/persona-identity.ts'
+import {
+  PERSONA_INSTANCE_ID_PREFIX,
+  PERSONA_TMUX_SESSION_PREFIX,
+  personaInstanceId,
+  personaTmuxSessionName,
+  SERVICE_LABEL,
+} from '../src/persona-identity.ts'
 import { LAST_APPLIED_FILE_SUFFIX } from '../src/reload.ts'
 import { RETIRED_KEYS_FILE_NAME } from '../src/retired-keys.ts'
 import { CLEAR_LATCH_COMMAND, SERVER_PORT_FILE_NAME } from '../src/clear-latch.ts'
 import { CLEAN_RESTART_NOT_RESTARTED_LABEL, CLI_TEARDOWN_FAILED_LABEL } from '../src/cli-teardown.ts'
-import { PERSONA_KILL_FAILED_LABEL, PERSONA_KILL_SURVIVOR_LABEL } from '../src/kill-failure-alert.ts'
+import {
+  KILL_FAILURE_CLOSING_CLI_TEARDOWN,
+  KILL_FAILURE_CLOSING_DESTINATION,
+  KILL_FAILURE_CLOSING_DESTINATION_LATCHED,
+  KILL_FAILURE_CLOSING_LOG_ONLY,
+  KILL_FAILURE_VERSION_ORDINARY,
+  KILL_FAILURE_VERSION_SURVIVOR,
+  killFailureAlertText,
+  killFailureClosingSentence,
+  killFailureSurvivorPidList,
+  PERSONA_KILL_FAILED_LABEL,
+  PERSONA_KILL_SURVIVOR_LABEL,
+  type KillFailureAlertContent,
+  type KillFailureAlertVersion,
+  type KillFailureClosing,
+} from '../src/kill-failure-alert.ts'
+import { STATE_WORDING } from '../src/lost-message.ts'
+import { renderLogMessageText } from '../src/persona-connection-errors.ts'
 import { startupSummaryEnding } from '../src/session-manager.ts'
+import { errTmuxKillFailed, KILL_FAILED_DESCRIPTIONS, STUB_SURVIVOR_PIDS } from './test-helpers/agent-director-stub.ts'
 import { CLIENT_MIN_VERSION, MIN_CLAUDE_CODE_VERSION, OLD_AD_VERSION } from './test-helpers/agent-director-versions.ts'
 import {
   PUBLISHING_HOST_BLOCK_HEADING,
@@ -3451,5 +3485,308 @@ describe('the CHANGELOG release entry, read through OPERATOR_TEXTS (b.jg5 SRJ-11
     ])('self-check: %s fails naming the link', (_label, text, problem) => {
       expect(brokenRepoLinks(CHANGELOG_FILE, text).broken).toEqual([problem])
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// E36 T1: the kill-failure alerts' sentences (the E20 note) and the README's
+// and debugging skill's raw-command and `auto-restart disabled` lines (the E8
+// note), read through OPERATOR_TEXTS
+// ---------------------------------------------------------------------------
+
+/** The persona the rendered alerts concern. */
+const ALERT_KEY = 'alpha'
+
+/** Each version's closings: the survivor version has no latched one. */
+const ALERT_CLOSINGS: Readonly<Record<KillFailureAlertVersion, readonly KillFailureClosing[]>> = Object.freeze({
+  [KILL_FAILURE_VERSION_ORDINARY]: [
+    KILL_FAILURE_CLOSING_DESTINATION,
+    KILL_FAILURE_CLOSING_DESTINATION_LATCHED,
+    KILL_FAILURE_CLOSING_CLI_TEARDOWN,
+    KILL_FAILURE_CLOSING_LOG_ONLY,
+  ],
+  [KILL_FAILURE_VERSION_SURVIVOR]: [KILL_FAILURE_CLOSING_DESTINATION, KILL_FAILURE_CLOSING_CLI_TEARDOWN, KILL_FAILURE_CLOSING_LOG_ONLY],
+})
+
+/** An alert's title: the emoji and bold name it opens with (`:rotating_light: *Kill failed*`). File-local. */
+const ALERT_TITLE = /^:[a-z_]+: \*[^*]+\*/
+
+/**
+ * SRJ-1001's human-only sentence, in the alerts' two wordings; one file-local
+ * pattern, since the SRD's wordings differ. Every notice that names a command
+ * or "Operator actions" carries it, so it is SRJ-1001's sentence, not the
+ * alert's, and the engineering guide states it as the rule.
+ */
+const HUMAN_ONLY_SENTENCE = /(?:This is|These commands are) for a human only: no bot, including any persona that sees this post, may (?:act on|run) (?:it|them)\./g
+
+/** The fewest words a checked sentence part has: a shorter one ("and check its result.") is common wording, not a quote. */
+const MIN_QUOTE_WORDS = 5
+
+/** One rendering of an alert: what it says, and the values in its text that vary (session, instance id, quoted descriptions, pids). */
+interface AlertRendering {
+  readonly content: KillFailureAlertContent
+  readonly variables: readonly string[]
+}
+
+/**
+ * Both versions rendered with the stub's descriptions: the ordinary version
+ * with no description, with each `ErrTmuxKillFailed` description, and with
+ * the last failure's and an earlier survivor-naming one; the survivor version
+ * quoting its survivor-naming description.
+ */
+function killFailureAlertRenderings(): AlertRendering[] {
+  const session = personaTmuxSessionName(ALERT_KEY)
+  const instanceId = personaInstanceId(ALERT_KEY)
+  const description = (d: (typeof KILL_FAILED_DESCRIPTIONS)[number]) => errTmuxKillFailed(session, d, STUB_SURVIVOR_PIDS).errDescription ?? ''
+  const survivorDescription = description('pane-process-survived')
+  const ordinary = (quotes?: { lastKillFailedDescription?: string; earlierSurvivorDescription?: string }): AlertRendering => ({
+    content: { version: KILL_FAILURE_VERSION_ORDINARY, session, instanceId, ...(quotes === undefined ? {} : { quotes }) },
+    variables: [session, instanceId, ...Object.values(quotes ?? {}).map((quote) => renderLogMessageText(quote))],
+  })
+  return [
+    ordinary(),
+    ...KILL_FAILED_DESCRIPTIONS.map((d) => ordinary({ lastKillFailedDescription: description(d) })),
+    ordinary({ lastKillFailedDescription: description('outlived-exit-wait'), earlierSurvivorDescription: survivorDescription }),
+    {
+      content: { version: KILL_FAILURE_VERSION_SURVIVOR, session, survivorDescription },
+      variables: [session, renderLogMessageText(survivorDescription), killFailureSurvivorPidList(survivorDescription)],
+    },
+  ]
+}
+
+/**
+ * The sentence parts of an alert's `text` that an operator text may not
+ * quote: `text` with its title, its closing sentences and the human-only
+ * sentence taken out, cut at each varying value and split into sentences (at
+ * `.` or `;`), each part of at least `MIN_QUOTE_WORDS` words (a word holds a
+ * letter, so a lone quote mark or backtick is none).
+ */
+function quotableAlertParts(text: string, version: KillFailureAlertVersion, variables: readonly string[]): string[] {
+  let rest = text.replace(ALERT_TITLE, '\n').replace(HUMAN_ONLY_SENTENCE, '\n')
+  for (const closing of ALERT_CLOSINGS[version]) rest = rest.split(killFailureClosingSentence(version, closing)).join('\n')
+  for (const value of [...variables].filter((v) => v !== '').sort((a, b) => b.length - a.length)) rest = rest.split(value).join('\n')
+  return rest
+    .split(/\n|(?<=[.;])\s+/)
+    .map((part) => part.trim())
+    .filter((part) => part.split(/\s+/).filter((word) => /[a-z]/i.test(word)).length >= MIN_QUOTE_WORDS)
+}
+
+/** Every [version, sentence part] of both alerts, over every rendering, closing and form, each once. */
+const KILL_ALERT_PARTS: readonly (readonly [version: KillFailureAlertVersion, part: string])[] = (() => {
+  const seen = new Set<string>()
+  const parts: [KillFailureAlertVersion, string][] = []
+  for (const { content, variables } of killFailureAlertRenderings()) {
+    for (const closing of ALERT_CLOSINGS[content.version]) {
+      for (const forSlack of [false, true]) {
+        for (const part of quotableAlertParts(killFailureAlertText(content, closing, forSlack), content.version, variables)) {
+          const key = `${content.version}\n${part}`
+          if (!seen.has(key)) {
+            seen.add(key)
+            parts.push([content.version, part])
+          }
+        }
+      }
+    }
+  }
+  return parts
+})()
+
+/**
+ * A run this many words long of an alert sentence is a quote of it, even
+ * with the words around it changed (a sentence restated with "GONE" for
+ * `ErrTmuxCaptureFailed` still quotes it). Shorter runs are wording a
+ * passage may share with the alert because both repeat agent-director's
+ * description ("no session or pane of this launch was found"), as the
+ * debugging skill's own `read-pane` caveats do.
+ */
+const QUOTE_RUN_WORDS = 15
+
+/** `text` for comparing words: lower case, Markdown's backticks and emphasis dropped, one space apart, padded with a space. */
+function quoteComparable(text: string): string {
+  return ` ${text.toLowerCase().replace(/[`*]/g, '').split(/\s+/).filter((word) => word !== '').join(' ')} `
+}
+
+/**
+ * Whether `comparable` (from `quoteComparable`) quotes `part`: the whole
+ * part (its edges may be cut at a varying value, so it is matched as is), or
+ * any run of `QUOTE_RUN_WORDS` of its words, matched as whole words.
+ */
+function quotesAlertPart(comparable: string, part: string): boolean {
+  const words = quoteComparable(part).trim().split(' ')
+  if (comparable.includes(words.join(' '))) return true
+  return Array.from({ length: Math.max(0, words.length - QUOTE_RUN_WORDS + 1) }, (_, i) => words.slice(i, i + QUOTE_RUN_WORDS)).some((run) =>
+    comparable.includes(` ${run.join(' ')} `),
+  )
+}
+
+/** Each alert sentence part `text` quotes (across line breaks and Markdown marks), as `<version>: <part>`. */
+function alertPartsQuotedIn(text: string): string[] {
+  const comparable = quoteComparable(text)
+  return KILL_ALERT_PARTS.filter(([, part]) => quotesAlertPart(comparable, part)).map(([version, part]) => `${version}: ${part}`)
+}
+
+/** Each operator text, made comparable once. */
+const COMPARABLE_OPERATOR_TEXTS = new Map(OPERATOR_TEXTS.map(([name, read]) => [name, lazy(() => quoteComparable(read()))] as const))
+
+describe('E20: operator texts quote the Kill failed and Process outlived kill alerts only by title and closing sentence (b.jg5 SRJ-1001, SRJ-1007)', () => {
+  test.each(OPERATOR_TEXTS.flatMap(([name]) => KILL_ALERT_PARTS.map(([version, part]) => [name, version, part] as const)))(
+    '%s does not quote the %s alert sentence "%s"',
+    (name, _version, part) => {
+      expect(quotesAlertPart(COMPARABLE_OPERATOR_TEXTS.get(name)!(), part)).toBe(false)
+    },
+  )
+
+  test('both versions give sentences to check, apart from their titles and closings', () => {
+    for (const version of [KILL_FAILURE_VERSION_ORDINARY, KILL_FAILURE_VERSION_SURVIVOR]) {
+      expect({ version, parts: KILL_ALERT_PARTS.filter(([v]) => v === version).length >= 3 }).toEqual({ version, parts: true })
+    }
+  })
+
+  test.each(KILL_ALERT_PARTS.map(([version, part]) => [version, part] as const))('self-check: a text quoting the %s alert sentence "%s", wrapped, is reported', (version, part) => {
+    const wrapped = `An operator text.\nThe alert says: ${part.replace(' ', '\n')} And more.`
+    expect(alertPartsQuotedIn(wrapped)).toContain(`${version}: ${part}`)
+  })
+
+  test(`self-check: a sentence restated with a word changed is reported while ${QUOTE_RUN_WORDS} of its words run unchanged, and not with one fewer`, () => {
+    const [version, part] = [...KILL_ALERT_PARTS].sort(([, a], [, b]) => b.length - a.length)[0]!
+    const words = part.split(' ')
+    expect(words.length).toBeGreaterThan(QUOTE_RUN_WORDS)
+    const restated = ['Restated:', ...words.slice(1, QUOTE_RUN_WORDS + 1), 'CHANGED'].join(' ')
+    expect(alertPartsQuotedIn(restated)).toContain(`${version}: ${part}`)
+    const shorter = ['Restated:', ...words.slice(1, QUOTE_RUN_WORDS), 'CHANGED'].join(' ')
+    expect(alertPartsQuotedIn(shorter)).not.toContain(`${version}: ${part}`)
+  })
+
+  test('self-check: a text quoting a whole alert is reported for each of its sentences; its title, closing and human-only sentences alone are not', () => {
+    for (const { content, variables } of killFailureAlertRenderings()) {
+      for (const closing of ALERT_CLOSINGS[content.version]) {
+        const text = killFailureAlertText(content, closing, false)
+        const parts = quotableAlertParts(text, content.version, variables)
+        expect(alertPartsQuotedIn(text)).toEqual(expect.arrayContaining(parts.map((part) => `${content.version}: ${part}`)))
+        const allowed = [ALERT_TITLE.exec(text)?.[0] ?? '', killFailureClosingSentence(content.version, closing), ...(text.match(HUMAN_ONLY_SENTENCE) ?? [])]
+        expect(allowed.filter((sentence) => sentence === '')).toEqual([])
+        expect(alertPartsQuotedIn(allowed.join(' '))).toEqual([])
+      }
+    }
+  })
+})
+
+/** The two texts the E8 note names: the README and the debugging skill. */
+const E8_TEXTS: readonly string[] = ['README.md', DEBUG_SKILL_FILE]
+
+/**
+ * The raw-command advice the E8 note removed (file-local): an
+ * `agent-director kill` with a positional id rather than
+ * `--claude-instance-id` (a log line's "`agent-director kill of …`" is no
+ * command), tmux-kill or kill-and-respawn advice, a `has-session` probe, a
+ * `tmux attach` target without `=`, and a raw tmux session or server kill.
+ */
+const RAW_COMMAND_FORMS: readonly [label: string, pattern: RegExp][] = [
+  ['`agent-director kill` without --claude-instance-id', /`agent-director kill (?!--claude-instance-id\b|of\b)[^`]*`/g],
+  ['tmux-kill advice', /\btmux-kill\b/gi],
+  ['kill-and-respawn advice', /\bkill(?:s|ed|ing)?\s*(?:and|\+|\/)\s*respawn\w*/gi],
+  ['a has-session probe', /\bhas-session\b/g],
+  ['a tmux attach target without =', /\btmux attach(?:-session)?\s+-t\s*(?!=)[^\s`]+/g],
+  ['a raw tmux session or server kill', /\btmux kill-(?:session|server)\b/g],
+]
+
+/**
+ * `text` without its switch-over section, the one place SRJ-1101 lets an
+ * operator text name `tmux kill-session -t =` (steps 5 and 6, checked in that
+ * section's own cases). Throws when the README has no such section.
+ */
+function withoutSwitchOverSection(text: string, file: string): string {
+  if (file !== 'README.md') return text
+  const range = sectionRange(text, SWITCH_OVER_HEADING)
+  if (range === undefined) throw new Error(`${file} has no heading "${SWITCH_OVER_HEADING}"`)
+  return text
+    .split('\n')
+    .filter((_, i) => i < range.start || i >= range.end)
+    .join('\n')
+}
+
+/** A lost-message state's label as the notice and the docs name it: the words between `Recovery: ` and ` —`. */
+function lostMessageStateLabel(state: keyof typeof STATE_WORDING): string {
+  const label = /^Recovery: (.+?) —/.exec(STATE_WORDING[state])?.[1]
+  if (label === undefined) throw new Error(`STATE_WORDING["${state}"] has no "Recovery: <label> —" lead`)
+  return label
+}
+
+/**
+ * The claim the E8 note removed, that an `auto-restart disabled` persona will
+ * not restart or come back on its own (false since E8 for a persona its
+ * UNAVAILABLE retry timer owns). File-local, citing the E8 note.
+ */
+const STALE_AUTO_RESTART_CLAIM: readonly [label: string, pattern: RegExp][] = [
+  ['will not restart or come back on its own', /\b(?:will not|won't|does not|doesn't|never|cannot|can't)\s+(?:be\s+)?(?:restart|come back|recover)\w*/gi],
+]
+
+/** The README's `auto-restart disabled` row in its lost-message recovery table; throws unless there is exactly one. */
+function readmeAutoRestartRow(): string {
+  const lead = `| \`${lostMessageStateLabel('auto-restart-disabled')}\` |`
+  const rows = operatorText('README.md').split('\n').filter((line) => line.startsWith(lead))
+  if (rows.length !== 1) throw new Error(`README.md has ${rows.length} rows starting ${lead}`)
+  return rows[0]
+}
+
+/** The debugging skill's `auto-restart disabled` state, up to the next state (`restart limit reached`), in its lost-message entry. */
+function debugSkillAutoRestartEntry(): string {
+  const text = flat(operatorText(DEBUG_SKILL_FILE))
+  const start = text.indexOf(`\`${lostMessageStateLabel('auto-restart-disabled')}\`: `)
+  const end = text.indexOf(`\`${lostMessageStateLabel('restart-limit-reached')}\`: `, start)
+  if (start < 0 || end < 0) throw new Error(`${DEBUG_SKILL_FILE} has no lost-message entry with the auto-restart disabled and restart limit reached states`)
+  return text.slice(start, end)
+}
+
+describe('E8: the README and the debugging skill name no raw-command advice (b.jg5 SRJ-1001, SRJ-1101)', () => {
+  test.each(E8_TEXTS.map((name) => [name] as const))('%s', (name) => {
+    expect(termsIn(withoutSwitchOverSection(operatorText(name), name), RAW_COMMAND_FORMS)).toEqual([])
+  })
+
+  test.each([
+    [`ends it with \`agent-director kill ${personaInstanceId(ALERT_KEY)}\``, '`agent-director kill` without --claude-instance-id'],
+    ['run `agent-director kill <id>`', '`agent-director kill` without --claude-instance-id'],
+    ['(`agent-director kill` / tmux-kill + respawn)', 'tmux-kill advice'],
+    ['then kill and respawn the session', 'kill-and-respawn advice'],
+    [`check it with \`tmux has-session -t =${personaTmuxSessionName(ALERT_KEY)}\``, 'a has-session probe'],
+    [`while it is pending, attach with \`tmux attach -t ${PERSONA_TMUX_SESSION_PREFIX}<key>\``, 'a tmux attach target without ='],
+    [`end it with \`tmux kill-session -t =${personaTmuxSessionName(ALERT_KEY)}\``, 'a raw tmux session or server kill'],
+  ] as const)('self-check: "%s" is reported as %s', (text, label) => {
+    expect(termsIn(text, RAW_COMMAND_FORMS).map((hit) => hit.split(': ')[0])).toContain(label)
+  })
+
+  test('self-check: the exact-name attach, the checked kill, a kill log line and "don\'t delete or respawn" are not reported', () => {
+    const fine = [
+      `attach with \`tmux attach -t =${personaTmuxSessionName(ALERT_KEY)}\``,
+      `run \`agent-director kill --claude-instance-id ${personaInstanceId(ALERT_KEY)}\` and check the result; on an error, don't delete or respawn`,
+      `\`agent-director kill of ${personaInstanceId(ALERT_KEY)} refused at a try: outcome=not-killed class=CONFLICT …\``,
+      'then `agent-director kill`, whose result the human checks; on an error, nothing is deleted or respawned',
+    ].join('\n')
+    expect(termsIn(fine, RAW_COMMAND_FORMS)).toEqual([])
+  })
+
+  test(`self-check: the README's switch-over section is the part left out, and only that`, () => {
+    const readme = operatorText('README.md')
+    const rest = withoutSwitchOverSection(readme, 'README.md')
+    expect(readme.length - rest.length).toBeGreaterThan(0)
+    expect(rest).toContain(ROLLBACK_HEADING)
+    expect(rest).not.toContain(SWITCH_OVER_HEADING)
+  })
+})
+
+describe("E8: the README's and debugging skill's `auto-restart disabled` text keeps not saying the persona will not restart on its own (b.jg5 SRJ-1011)", () => {
+  test.each([
+    ['README.md: the lost-message recovery row', readmeAutoRestartRow],
+    [`${DEBUG_SKILL_FILE}: the lost-message entry's state`, debugSkillAutoRestartEntry],
+  ] as const)('%s', (_label, passage) => {
+    const text = passage()
+    expect(text).toContain(lostMessageStateLabel('auto-restart-disabled'))
+    expect(termsIn(text, STALE_AUTO_RESTART_CLAIM)).toEqual([])
+  })
+
+  test('self-check: the old claim is reported; the lost-message notice\'s own wording is not', () => {
+    expect(termsIn('`session_restart_delay` is `0`, so the instance will not restart on its own.', STALE_AUTO_RESTART_CLAIM)).not.toEqual([])
+    expect(termsIn("the persona won't come back on its own", STALE_AUTO_RESTART_CLAIM)).not.toEqual([])
+    expect(termsIn(STATE_WORDING['auto-restart-disabled'], STALE_AUTO_RESTART_CLAIM)).toEqual([])
   })
 })
