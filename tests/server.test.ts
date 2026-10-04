@@ -222,6 +222,7 @@ import {
   _resetConfiguredPersonaQuery,
   setKillFailureAlerts,
   setSessionNotifier,
+  setStuckLaunchEpisodes,
   spawnForPersona,
   carriedDeadEvidenceOf,
   DEAD_SESSION_CAUSE_ROW_READ_FINISHED,
@@ -248,6 +249,7 @@ import {
 import {
   KILL_FAILURE_END_ROW_FINISHED,
   KILL_FAILURE_END_ROW_GONE,
+  PERSONA_EPISODE_KIND_STUCK_LAUNCH,
   createKillFailureAlerts,
   createPersonaEpisodes,
   type KillFailureAlerts,
@@ -336,6 +338,10 @@ import {
   PENDING_ROW_REASON_CWD_MISMATCH,
   PENDING_ROW_REASON_CWD_UNRESOLVED,
   PENDING_ROW_REASON_RETIRED_OLD_LIFE,
+  STUCK_LAUNCH_POSTED,
+  postStuckLaunchHeld,
+  stuckLaunchEndRowLiveReason,
+  stuckLaunchEpisodeEndedLine,
   type PendingRowNotCoveredReason,
 } from '../src/pending-row.ts'
 import { describeThrownValue, renderLogMessageText } from '../src/persona-connection-errors.ts'
@@ -4541,6 +4547,114 @@ describe('b.jg5 SRJ-704, SRJ-1016: the liveness and reconnect adapters\' own-row
 
     expect(alerts.isOpen('C1')).toBe(true)
     expect(lines.filter((line) => line.includes(' ended — '))).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-1016, SRJ-1017: the liveness and reconnect adapters' own-row step
+// ends the stuck-launch episode
+//
+// The episode runs from the first stuck-launch post until P's own row reads
+// live out of `pending` (`waiting`, `working`, `ask_user` or
+// `check_permission`), P latches or P is torn down. Both adapters read the row
+// through the session manager's own-row `status` step, so either one's live
+// reading out of `pending` ends P's open episode silently (one ended line on
+// the server log, nothing posted); a `pending` reading keeps it, and a read of
+// one persona's row never ends another's. The episodes are a real
+// `createPersonaEpisodes` on a fake clock, installed in the session manager
+// (`setStuckLaunchEpisodes`) as main() installs its notice episodes; C1's and
+// C2's episodes are opened by posting the held text for each through the real
+// poster. Which reads end it at the shared reads themselves is covered in
+// tests/session-manager.test.ts.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-1016, SRJ-1017: the liveness and reconnect adapters\' own-row step ends the stuck-launch episode on a live reading out of pending', () => {
+  let dir: string
+  let episodes: PersonaEpisodes
+  /** The episodes' posts. */
+  let posts: Array<{ key: string; text: string }>
+  /** The episodes' and the poster's lines. */
+  let lines: string[]
+  let captured: unknown[][]
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'server-stuck-launch-episode-'))
+    posts = []
+    lines = []
+    captured = []
+    episodes = createPersonaEpisodes({ sink: (key, text) => { posts.push({ key, text }) }, log: (line) => { lines.push(line) }, clock: createFakeClock() })
+    setStuckLaunchEpisodes(episodes)
+    setConfiguredPersonaQuery((key) => key === 'C1' || key === 'C2')
+    const poster = { episodes, tmuxUnavailableRaised: () => false, log: (line: string) => { lines.push(line) } }
+    for (const key of ['C1', 'C2']) expect(postStuckLaunchHeld(poster, key, SAMPLE_LAUNCH_START_WHOLE, false)).toBe(STUCK_LAUNCH_POSTED)
+    expect(posts.map((post) => post.key)).toEqual(['C1', 'C2'])
+  })
+
+  afterEach(() => {
+    setStuckLaunchEpisodes(undefined)
+    episodes.close()
+    _resetConfiguredPersonaQuery()
+    resetClientForTests()
+    _resetOutageState()
+    _resetFindMissingMemo()
+    _resetNotConnectedEpisodes()
+    setSessionNotifier(undefined)
+    rmSync(dir, { recursive: true, force: true })
+    assertNoLeak({ captured, posts, lines })
+  })
+
+  /** A stub whose `status` answers `answer` for `key`'s row and `waiting` for every other row; every send-keys succeeds. */
+  function install(key: string, answer: Phase1StatusResult): void {
+    const stub = makeStubClient({
+      statusFn: ({ claude_instance_id }) => (claude_instance_id === personaInstanceId(key) ? answer : cannedStatusResult({ state: 'waiting' })),
+      sendKeysResult: {},
+    })
+    _resetOutageState()
+    initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
+    setClientForTests(stub as unknown as Client)
+    setSessionNotifier(() => {})
+  }
+
+  /** The two adapters' reads of `key`'s row, each outside any attempt. */
+  const ADAPTERS: ReadonlyArray<readonly [string, (key: string) => Promise<unknown>]> = [
+    ['the liveness adapter', (key) => {
+      const config = makeStandInPersonaConfig({ C1: {}, C2: {} }, dir)
+      return _buildIsSessionAliveAdapter(() => config)(key)
+    }],
+    ['the reconnect adapter', (key) => _buildReconnectSessionAdapter(undefined, () => false)(key)],
+  ]
+
+  async function read(adapter: (key: string) => Promise<unknown>, key: string): Promise<void> {
+    const { errArgs } = await capturingErrorArgs(() => adapter(key))
+    captured.push(...errArgs)
+  }
+
+  /** The server log's stuck-launch episode-ended lines for `key`. */
+  function endedLines(key: string): unknown[] {
+    return captured.map((args) => args[0]).filter((line) => typeof line === 'string' && line.startsWith(stuckLaunchEpisodeEndedLine(key, '')))
+  }
+
+  const isOpen = (key: string) => episodes.isOpen(key, PERSONA_EPISODE_KIND_STUCK_LAUNCH)
+
+  test.each(ADAPTERS.flatMap(([name, adapter]) => LIVE_NOT_PENDING_STATES.map((state) => [name, state, adapter] as const)))('%s reading C1\'s row %s ends C1\'s episode silently, one ended line and nothing posted; C2\'s episode stays open', async (_name, state, adapter) => {
+    install('C1', cannedStatusResult({ state }))
+
+    await read(adapter, 'C1')
+
+    expect([isOpen('C1'), isOpen('C2')]).toEqual([false, true])
+    expect(endedLines('C1')).toEqual([stuckLaunchEpisodeEndedLine('C1', stuckLaunchEndRowLiveReason(state))])
+    expect(endedLines('C2')).toEqual([])
+    expect(posts).toHaveLength(2)
+  })
+
+  test.each(ADAPTERS.map(([name, adapter]) => [name, adapter] as const))('%s reading C1\'s row pending (a launch start recorded) leaves C1\'s episode open', async (_name, adapter) => {
+    install('C1', cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_WHOLE }))
+
+    await read(adapter, 'C1')
+
+    expect([isOpen('C1'), isOpen('C2')]).toEqual([true, true])
+    expect([endedLines('C1'), endedLines('C2')]).toEqual([[], []])
+    expect(posts).toHaveLength(2)
   })
 })
 

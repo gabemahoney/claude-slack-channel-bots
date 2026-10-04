@@ -117,6 +117,7 @@ import {
   retryPersonaKill,
   setKillFailureAlerts,
   setPersonaKillKeepGoingQuery,
+  setStuckLaunchEpisodes,
   launchSession,
   noteWorkingRowDeferral,
   notifyDisconnectedWithAutoRestartDisabled,
@@ -196,6 +197,7 @@ import {
   latchRowStateRead,
   type ConflictLatch,
 } from './conflict-latch.ts'
+import { endStuckLaunchEpisodeForLatch } from './pending-row.ts'
 import {
   bindInvalidFlagsHoldSetReaction,
   createInvalidFlagsHold,
@@ -3284,6 +3286,11 @@ export async function main(): Promise<void> {
     teardownWindow: (key) => personaNotifier.teardownWindowState(key),
   })
   personaEpisodes = noticeEpisodes
+  // b.jg5 SRJ-1016, SRJ-1017: the stuck-launch episode lives in these
+  // episodes; the session manager's shared own-row reads end it on a row
+  // read live out of `pending` (installed before the start pass, so the
+  // first read already ends it). Shutdown's `close` ends every episode.
+  setStuckLaunchEpisodes(noticeEpisodes)
 
   // b.jg5 SRJ-501, SRJ-508, SRJ-1016: the server's one per-persona latch, in
   // memory only (nothing is loaded from a file), built before the start pass
@@ -3301,7 +3308,8 @@ export async function main(): Promise<void> {
   // apply to a latch), its tmux-unresponsive condition ends silently (no
   // recovery notice; the latch's notice follows), its unclassified-error
   // episode ends, and its slow-recovery count resets and that episode ends
-  // silently (b.jg5 SRJ-610, SRJ-1016). The four are built below; no latch
+  // silently (b.jg5 SRJ-610, SRJ-1016), and its stuck-launch episode ends
+  // silently (b.jg5 SRJ-1016). The first four are built below; no latch
   // can be set before the start pass, by which time they exist.
   const conflictLatch = createConflictLatch({ log: (line) => console.error(line) })
   bindConflictLatchHolds(
@@ -3316,6 +3324,9 @@ export async function main(): Promise<void> {
       },
       endSlowRecovery: (key) => {
         slowRecovery.endForLatch(key)
+      },
+      endStuckLaunch: (key) => {
+        endStuckLaunchEpisodeForLatch(noticeEpisodes, key, (line) => console.error(line))
       },
     },
     (line) => console.error(line),

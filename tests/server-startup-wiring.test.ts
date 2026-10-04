@@ -225,8 +225,9 @@
  *   controller's `stop` with `UNAVAILABLE_RETRY_STOP_LATCHED`, the
  *   tmux-unresponsive condition's silent `end` with
  *   `TMUX_UNRESPONSIVE_END_LATCHED`, the unclassified-error episodes'
- *   `end` with `UNCLASSIFIED_ERROR_END_LATCHED` and the slow-recovery
- *   tracker's latch end (below). The latch is installed in
+ *   `end` with `UNCLASSIFIED_ERROR_END_LATCHED`, the slow-recovery
+ *   tracker's latch end and the stuck-launch episode's latch end (both
+ *   below). The latch is installed in
  *   the session manager once (`setConflictLatch`), after both bindings and
  *   before the retry controller and the start pass, with no await before the
  *   holds' targets are built; its `isLatched` is bound, as a call-time read,
@@ -243,6 +244,13 @@
  *   `endSlowRecovery` hold calls its `endForLatch` for the key. It is named
  *   only there; server.ts calls none of its restart-run notes, and no other
  *   src file builds one.
+ * - b.jg5 SRJ-1016 / SRJ-1017 / SRJ-502: the stuck-launch episode lives in
+ *   the one notice episodes instance. It is installed in the session manager
+ *   once (`setStuckLaunchEpisodes`), in main()'s own statement list, with
+ *   exactly that instance, after its build and before the start sweep and
+ *   the start pass, and never removed; the latch's `endStuckLaunch` hold
+ *   ends the episode through `endStuckLaunchEpisodeForLatch` over that same
+ *   instance with the server log, server.ts's only call of it.
  * - b.jg5 SRJ-114 / SRJ-501: the session manager's configured-persona query
  *   is installed once (`setConfiguredPersonaQuery`), in main()'s own
  *   statement list, as a call-time read of the live applied-persona lookup
@@ -396,6 +404,7 @@ import type * as ConflictLatchModule from '../src/conflict-latch.ts'
 import type { ConflictLatch, ConflictLatchDeps, ConflictLatchHolds } from '../src/conflict-latch.ts'
 import type * as PersonaEpisodesModule from '../src/persona-episodes.ts'
 import type * as SlowRecoveryModule from '../src/slow-recovery.ts'
+import type * as PendingRowModule from '../src/pending-row.ts'
 import type { SlowRecoveryTracker, SlowRecoveryTrackerDeps } from '../src/slow-recovery.ts'
 import type {
   KillFailureAlerts,
@@ -477,11 +486,12 @@ function isolated(call: string): string {
 
 /** The latch's holds binder (b.jg5 SRJ-502); renaming it fails the typecheck. */
 const BIND_LATCH_HOLDS: keyof typeof ConflictLatchModule = 'bindConflictLatchHolds'
-/** The latch's four holds (b.jg5 SRJ-305, SRJ-310, SRJ-313, SRJ-610); renaming one fails the typecheck. */
+/** The latch's five holds (b.jg5 SRJ-305, SRJ-310, SRJ-313, SRJ-610, SRJ-1016); renaming one fails the typecheck. */
 const HOLD_STOP_RETRY: keyof ConflictLatchHolds = 'stopRetryTimer'
 const HOLD_END_TMUX: keyof ConflictLatchHolds = 'endTmuxUnresponsive'
 const HOLD_END_UNCLASSIFIED: keyof ConflictLatchHolds = 'endUnclassifiedError'
 const HOLD_END_SLOW_RECOVERY: keyof ConflictLatchHolds = 'endSlowRecovery'
+const HOLD_END_STUCK_LAUNCH: keyof ConflictLatchHolds = 'endStuckLaunch'
 
 /** `(key) => <call>` or `(key) => { <call> }`, `<call>` given `\1` for the parameter, whose name is free. */
 function oneKeyArrow(call: string): RegExp {
@@ -3582,8 +3592,8 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
     expect(callsOf(HOLD_OBSERVER_FACTORY)).toEqual([])
   })
 
-  test('the holds are exactly four: the retry timer stop, the silent end of tmux-unresponsive, the end of the unclassified-error episode and the slow-recovery end (b.jg5 SRJ-610; its binding is pinned in the slow-recovery describe below)', () => {
-    expect([...latchHoldProps().keys()].sort()).toEqual([HOLD_STOP_RETRY, HOLD_END_TMUX, HOLD_END_UNCLASSIFIED, HOLD_END_SLOW_RECOVERY].sort())
+  test('the holds are exactly five: the retry timer stop, the silent end of tmux-unresponsive, the end of the unclassified-error episode, the slow-recovery end and the stuck-launch end (b.jg5 SRJ-610, SRJ-1016; the last two bindings are pinned in their describes below)', () => {
+    expect([...latchHoldProps().keys()].sort()).toEqual([HOLD_STOP_RETRY, HOLD_END_TMUX, HOLD_END_UNCLASSIFIED, HOLD_END_SLOW_RECOVERY, HOLD_END_STUCK_LAUNCH].sort())
   })
 
   test('the retry-timer hold stops the persona\'s timer on the one retry controller through its stop entry, with the latch\'s own stop reason, never through the condition-end entry (b.jg5 SRJ-305)', () => {
@@ -3784,6 +3794,57 @@ describe('main() builds the one slow-recovery tracker over the notice episodes b
 
     const builders = srcFiles().filter(([, text]) => new RegExp(`\\b${FACTORY}\\s*\\(`).test(stripComments(text)))
     expect(builders.map(([path]) => path).sort()).toEqual(['src/server.ts', 'src/slow-recovery.ts'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: b.jg5 SRJ-1016 / SRJ-1017 / SRJ-502 — the stuck-launch
+// episode's production bindings
+//
+// The session manager's install is optional (absent, no own-row read ever
+// ends a stuck-launch episode) and so is `ConflictLatchHolds.endStuckLaunch`
+// (absent, a latch leaves the episode open), and any episodes object
+// type-checks as either's target. So a production wiring that dropped
+// either, bound it to episodes other than the one notice episodes instance
+// (whose posts the episode counts, and which a teardown forgets and shutdown
+// closes), installed it after the start sweep or the start pass, or removed
+// it would type-check and pass every behaviour suite while a persona's
+// stuck-launch episode never ended. What the end does is tested in
+// tests/session-manager.test.ts and tests/server.test.ts (the reads) and
+// tests/conflict-latch.test.ts (the latch); pinned here: the bindings.
+// ---------------------------------------------------------------------------
+
+describe('main() installs the one notice episodes instance in the session manager for the stuck-launch episode before the start sweep and the start pass, and binds the latch\'s stuck-launch hold to end that episode over the same instance (b.jg5 SRJ-1016, SRJ-1017, SRJ-502)', () => {
+  // Tied to src by type: renaming any of these fails the typecheck.
+  const EPISODES_FACTORY: keyof typeof PersonaEpisodesModule = 'createPersonaEpisodes'
+  const INSTALL: keyof typeof SessionManagerModule = 'setStuckLaunchEpisodes'
+  const START_SWEEP: keyof typeof SessionManagerModule = 'reconcileOrphans'
+  const LATCH_END: keyof typeof PendingRowModule = 'endStuckLaunchEpisodeForLatch'
+
+  test('the episodes are installed exactly once (nothing removes them), in main()\'s own statement list, with exactly the one notice episodes instance, after its build and before the start sweep and the start pass; the install is the session manager\'s import', () => {
+    const at = onlyCallOf(INSTALL)
+    expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+    expect(onlyCallArgs(INSTALL)).toEqual([constOf(EPISODES_FACTORY)])
+    expect(importSource(SERVER_CODE, INSTALL)).toBe('./session-manager.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${INSTALL}\\b`, 'g'), SERVER_CODE)).toEqual([])
+
+    expect(at).toBeGreaterThan(onlyCallOf(EPISODES_FACTORY))
+    for (const later of [onlyCallOf(START_SWEEP), ...latchStartPass()]) expect(at).toBeLessThan(later)
+  })
+
+  test('the latch\'s stuck-launch hold ends the persona\'s episode through endStuckLaunchEpisodeForLatch over the one notice episodes instance, for the key it is given, with the server log', () => {
+    const hold = latchHoldProps().get(HOLD_END_STUCK_LAUNCH)!
+    const shape = hold.match(oneKeyArrow(`${LATCH_END}\\(.*\\)`))
+    expect(shape).not.toBeNull()
+    const [episodes, key, log, ...extra] = splitTopLevel(onlyCallArguments(hold, LATCH_END))
+    expect([episodes, key, extra]).toEqual([constOf(EPISODES_FACTORY), shape![1]!, []])
+    expect(log).toMatch(/^\(?(\w+)\)? => console\.error\(\1\)$/)
+  })
+
+  test('endStuckLaunchEpisodeForLatch is the pending-row module\'s import, declared nowhere in server.ts, and called once, inside the latch\'s holds binding', () => {
+    expect(importSource(SERVER_CODE, LATCH_END)).toBe('./pending-row.ts')
+    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${LATCH_END}\\b`, 'g'), SERVER_CODE)).toEqual([])
+    expect(withinCall([onlyCallOf(LATCH_END)], onlyCallOf(BIND_LATCH_HOLDS))).toBe(1)
   })
 })
 

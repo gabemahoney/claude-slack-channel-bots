@@ -289,6 +289,17 @@
  *   `killFailureOpen(key)` reads whether the persona's episode is open
  *   (the lost-message driver's kill-failed input); nothing sets it by hand.
  *   The applied set is the harness's own, so a removal ends with it.
+ * - The stuck-launch episode (b.jg5 SRJ-1016, SRJ-1017): `episodes` is
+ *   installed in the session manager (`setStuckLaunchEpisodes`, removed by
+ *   `cleanup()`) as `main()` installs its notice episodes, before any
+ *   launch, so every own-row read of the session manager that reads the row
+ *   `waiting`, `working`, `ask_user` or `check_permission` ends the persona's
+ *   stuck-launch episode silently (the session manager logs its line through
+ *   `console.error`, so it goes to `errors`); the latch's fifth hold ends it
+ *   too (below; that line goes to `lines`). The harness posts no stuck-launch text: a
+ *   case posts through `postStuckLaunchHeld` / `postStuckLaunchRelaunching`
+ *   (`src/pending-row.ts`) over `episodes`, and the post lands in
+ *   `episodeNotices`.
  * - `latch` and `latchEvents` (b.jg5 SRJ-501, SRJ-502, SRJ-508): one latch
  *   per harness (`createConflictLatch`, its lines to `lines`), composed as
  *   `main()` composes it: installed in the session manager
@@ -308,14 +319,18 @@
  *   TMUX_UNRESPONSIVE_END_LATCHED, undefined, { silent: true })`: no recovery
  *   post; a holding condition's end shows in `conditionEnds`), the
  *   unclassified-error episode's end (`end(key,
- *   UNCLASSIFIED_ERROR_END_LATCHED)`) and the slow-recovery tracker's latch
+ *   UNCLASSIFIED_ERROR_END_LATCHED)`), the slow-recovery tracker's latch
  *   end (`slowRecovery.endForLatch(key)`: the count reset and the episode
- *   ended silently). `latch` is read-only: `isLatched(key)`
+ *   ended silently) and the stuck-launch episode's end
+ *   (`endStuckLaunchEpisodeForLatch(episodes, key, log)`, `src/pending-row.ts`:
+ *   the episode ended silently, with one line when one was open). `latch` is
+ *   read-only: `isLatched(key)`
  *   and `record(key)`. `latchEvents` holds, in order, each set as the
  *   observers see it (`{ step: 'set', key, outcome, record }`, recorded by an
  *   observer added before the holds), each of the first three holds as it is
- *   called (`{ step: 'hold', key, hold }`; the slow-recovery end is not
- *   recorded, and a case reads it through `slowRecovery`) and each CONFLICT
+ *   called (`{ step: 'hold', key, hold }`; the slow-recovery and stuck-launch
+ *   ends are not recorded, and a case reads them through `slowRecovery` and
+ *   `episodes.isOpen(key, PERSONA_EPISODE_KIND_STUCK_LAUNCH)`) and each CONFLICT
  *   notice posted (`{ step: 'notice', key, text }`), so a case can read that
  *   every hold ran before the notice.
  *   The harness has no health tick, so `HealthCheckDeps.isLatched` is not
@@ -757,6 +772,7 @@
  *   the session manager's latch install and the latch's set observers, the
  *   hold's install and its set reaction, the version-changed listener,
  *   the kill-failure alerts' install,
+ *   the stuck-launch episodes' install,
  *   the kill retry's keep-going query,
  *   the configured-persona query (`_resetConfiguredPersonaQuery`), so two
  *   harnesses built one after the other share no query,
@@ -961,7 +977,7 @@ import {
   type KillFailureClosing,
 } from '../../src/kill-failure-alert.ts'
 import { LOST_MESSAGE_STATES, STATE_WORDING, type LostMessageState } from '../../src/lost-message.ts'
-import { parseLaunchStart, type LaunchCallWindow } from '../../src/pending-row.ts'
+import { endStuckLaunchEpisodeForLatch, parseLaunchStart, type LaunchCallWindow } from '../../src/pending-row.ts'
 import { _resetOutageState, clearOutageFlag, getOutageFlags, initOutageState, resetAllToHealthy, type OutageClass } from '../../src/outage-state.ts'
 import type { PersonaLifecycleDeps } from '../../src/persona-lifecycle.ts'
 import type { PersonaConnectionStatus } from '../../src/persona-connections.ts'
@@ -1074,6 +1090,7 @@ import {
   setPersonaKillKeepGoingQuery,
   setRetiredKeyStore,
   setSessionNotifier,
+  setStuckLaunchEpisodes,
   spawnForPersona,
   startLiveRowSequence,
   stopAllDialogApprovers,
@@ -1336,8 +1353,9 @@ export interface RecoveryStop {
 
 /**
  * The holds a latch runs that `latchEvents` records, by the names the hold
- * observer logs them under, in its order. The fourth, `'slow-recovery end'`,
- * runs after them and is not recorded.
+ * observer logs them under, in its order. The fourth and fifth,
+ * `'slow-recovery end'` and `'stuck-launch end'`, run after them and are not
+ * recorded.
  */
 export type RecoveryLatchHold = 'retry timer stop' | 'tmux-unresponsive end' | 'unclassified-error end'
 
@@ -1934,11 +1952,12 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   // harness, its lines to `lines`. A recorder observer first (it only records
   // the set in `latchEvents`), then, in main()'s order, the holds (the timer's
   // stop with the latch's reason, the condition's silent end, the
-  // unclassified-error episode's end, the slow-recovery tracker's latch end),
-  // then the CONFLICT notice over the episodes, so every hold is done before
-  // the notice is posted. The first three holds are recorded in
-  // `latchEvents`; the slow-recovery end is not (its effect is read through
-  // `slowRecovery`), so a latch's events are the set, three holds and the
+  // unclassified-error episode's end, the slow-recovery tracker's latch end,
+  // the stuck-launch episode's end), then the CONFLICT notice over the
+  // episodes, so every hold is done before the notice is posted. The first
+  // three holds are recorded in `latchEvents`; the slow-recovery and
+  // stuck-launch ends are not (their effects are read through `slowRecovery`
+  // and `episodes`), so a latch's events are the set, three holds and the
   // notice. The session manager's installer comes with the other installs
   // below.
   const latchEvents: RecoveryLatchEvent[] = []
@@ -1969,6 +1988,13 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
         // the episode ended silently; not recorded in `latchEvents`.
         endSlowRecovery: (key) => {
           slowRecovery.endForLatch(key)
+        },
+        // As main() binds it (b.jg5 SRJ-1016): the persona's stuck-launch
+        // episode ended silently over the same episodes instance; not
+        // recorded in `latchEvents` (a case reads it through
+        // `episodes.isOpen`).
+        endStuckLaunch: (key) => {
+          endStuckLaunchEpisodeForLatch(episodes, key, log)
         },
       },
       log,
@@ -2190,6 +2216,11 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   // the restart path's kill and the live-row sequence's kills raise through
   // them, and the session manager's own-row reads end a persona's episode.
   setKillFailureAlerts(killFailureAlerts)
+  // As main() installs it, before the start pass (b.jg5 SRJ-1016): the one
+  // episodes instance, so every own-row read of the session manager that
+  // reads the row live out of `pending` ends the persona's stuck-launch
+  // episode silently.
+  setStuckLaunchEpisodes(episodes)
   // As main() installs them with the registry (b.jg5 SRJ-811, SRJ-812,
   // SRJ-1512): the old-life wait's bindings. Each waiting persona's timer is
   // armed through the trigger sink (recorded in `triggers`, then armed on the
@@ -3109,6 +3140,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       _resetInvalidFlagsHold()
       unbindHold()
       setKillFailureAlerts(undefined)
+      setStuckLaunchEpisodes(undefined)
       _resetConfiguredPersonaQuery()
       _resetRetiredKeyStore()
       removeHoldEndRetry()

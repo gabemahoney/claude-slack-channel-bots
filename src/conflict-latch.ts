@@ -105,8 +105,9 @@
  * ({@link createConflictLatchHoldObserver}, bound by
  * {@link bindConflictLatchHolds} in `main()` before the notice) stops the
  * persona's retry timer, ends its `tmux-unresponsive` condition silently,
- * ends its unclassified-error episode and ends its slow-recovery episode
- * with its count (SRJ-610) on every set, through the injected
+ * ends its unclassified-error episode, ends its slow-recovery episode
+ * with its count (SRJ-610) and ends its stuck-launch episode (SRJ-1016) on
+ * every set, through the injected
  * {@link ConflictLatchHolds}. What else a latch holds back is asked of the
  * latch where it happens: the collision ladder (`src/session-manager.ts`,
  * which latches on a CONFLICT or an UNUSABLE NAME at a spawn or resume and
@@ -1181,8 +1182,8 @@ export function bindConflictNotice(latch: Pick<ConflictLatch, 'addSetObserver'>,
 /**
  * What a latch holds back at once for the persona, each given its key.
  * `main()` binds them to the server's retry controller, its
- * `tmux-unresponsive` condition, its unclassified-error episodes and its
- * slow-recovery tracker.
+ * `tmux-unresponsive` condition, its unclassified-error episodes, its
+ * slow-recovery tracker and its notice episodes' stuck-launch kind.
  */
 export interface ConflictLatchHolds {
   /** Stop the persona's retry timer with the latch's stop reason, through the controller's `stop` (SRJ-305: "P latches, whatever the case"). */
@@ -1198,6 +1199,13 @@ export interface ConflictLatchHolds {
    * end.
    */
   endSlowRecovery?(key: string): void
+  /**
+   * End the persona's stuck-launch episode silently (SRJ-1016; `main()`
+   * binds `endStuckLaunchEpisodeForLatch`, `src/pending-row.ts`, over its
+   * notice episodes). Absent: no stuck-launch episode is kept for the latch
+   * to end.
+   */
+  endStuckLaunch?(key: string): void
 }
 
 /**
@@ -1205,7 +1213,8 @@ export interface ConflictLatchHolds {
  * and a same-case set alike and whatever the case, it stops the persona's
  * retry timer, then ends its `tmux-unresponsive` condition silently, then
  * ends its unclassified-error episode, then resets its slow-recovery count
- * and ends that episode silently (SRJ-610, SRJ-1016), in that order. A same-case set runs
+ * and ends that episode silently (SRJ-610, SRJ-1016), then ends its
+ * stuck-launch episode silently (SRJ-1016), in that order. A same-case set runs
  * them too: a refusal met while P was already latched (the latch-time
  * `status` read's error included) may have armed the timer again. Each hold
  * is isolated: one that throws is logged to `log` and the next still runs.
@@ -1221,6 +1230,7 @@ export function createConflictLatchHoldObserver(
     ['tmux-unresponsive end', (key) => holds.endTmuxUnresponsive(key)],
     ['unclassified-error end', (key) => holds.endUnclassifiedError(key)],
     ['slow-recovery end', (key) => holds.endSlowRecovery?.(key)],
+    ['stuck-launch end', (key) => holds.endStuckLaunch?.(key)],
   ]
   return ({ key }) => {
     for (const [name, step] of steps) {

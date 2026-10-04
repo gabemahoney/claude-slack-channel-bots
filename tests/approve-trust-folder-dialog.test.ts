@@ -63,6 +63,20 @@
  * CONFIG, started a `tmux-unresponsive` condition or reached the
  * unclassified sink, and that no session notice was sent (hatch A2).
  *
+ * The not-interactive record (b.jg5 SRJ-118, SRJ-412, SRJ-1017): the
+ * approver's `send-keys` answering `ErrSpawnNotInteractive` (both variants),
+ * at the first lap or a later one, records the launch start the first lap
+ * kept, for both launch-start forms, and the record
+ * (`launchMetSendKeysNotInteractive`) answers yes for that launch start as
+ * raw text, parsed instant or a numeric offset naming it, and no for another
+ * instant, none, or the other persona; a stop asked during that `send-keys`
+ * still leaves it set (the answer counts, not the stop). A `read-pane` or
+ * `status` answer of that name, an approver that never read a launch start,
+ * and every other stop (live, finished, absent, superseded, gone,
+ * `tmux-unavailable`, latched, the cap, and an UNAVAILABLE answer that polls
+ * on) record nothing. `afterEach` forgets both personas' records
+ * (`forgetLaunchCalls`).
+ *
  * The registry (b.jg5 SRJ-401, SRJ-404; hatch A2) is driven through its
  * entries (`startDialogApprover`, `stopDialogApprover`,
  * `stopAllDialogApprovers`, `isDialogApproverRunning`,
@@ -159,7 +173,9 @@ import {
   DIALOG_READY_TIMEOUT_MS,
   DIALOG_SLOW_POLL_INTERVAL_MS,
   dialogApproverLaunchStart,
+  forgetLaunchCalls,
   isDialogApproverRunning,
+  launchMetSendKeysNotInteractive,
   setSessionNotifier,
   startDialogApprover,
   STARTUP_ERROR_APPROVE_NOT_READY,
@@ -244,6 +260,7 @@ import {
 } from '../src/outage-state.ts'
 import {
   cannedErr,
+  cannedOk,
   cannedStatusResult,
   errConfigMalformed,
   errGeneric,
@@ -536,6 +553,8 @@ afterEach(() => {
     _resetConfiguredPersonaQuery()
     setSessionNotifier(undefined)
     resetAdSettingsForTests()
+    // A `send-keys` answering `ErrSpawnNotInteractive` records its launch (b.jg5 SRJ-412): none outlives the case.
+    for (const who of PERSONAS) forgetLaunchCalls(who.key)
     if (settingsHome !== undefined) rmSync(settingsHome, { recursive: true, force: true })
     if (savedStateDir === undefined) delete process.env['SLACK_STATE_DIR']
     else process.env['SLACK_STATE_DIR'] = savedStateDir
@@ -1524,6 +1543,185 @@ describe('approvePreSessionDialogs: each answer by class, one case per cell (b.j
 })
 
 // ---------------------------------------------------------------------------
+// The not-interactive record (b.jg5 SRJ-118, SRJ-412, SRJ-1017)
+// ---------------------------------------------------------------------------
+
+/** The stub's two launch-start forms that carry one: [form, raw]. */
+const RECORD_LAUNCH_STARTS: ReadonlyArray<readonly [string, string]> = [
+  ['fractional', SAMPLE_LAUNCH_STARTS.fractional!],
+  ['whole', SAMPLE_LAUNCH_STARTS.whole!],
+]
+
+/** A `pending` row whose launch start is `raw`. */
+function pendingRowAt(raw: string): Phase1StatusResult {
+  return cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: raw })
+}
+
+/** A newer launch's `pending` row: the whole sample, another instant than the stub's default. */
+const NEWER_RECORD_ROW = pendingRowAt(SAMPLE_LAUNCH_STARTS.whole!)
+
+/** One launch start's forms that name its instant: the raw text, its parsed instant, and a numeric offset naming it. */
+function sameLaunchStartForms(raw: string): unknown[] {
+  const instant = parseLaunchStart(raw)!
+  const offsetHours = 2
+  const offsetForm = isoAt(instant + offsetHours * 3_600_000).replace(/Z$/, `+0${offsetHours}:00`)
+  expect(parseLaunchStart(offsetForm)).toBe(instant)
+  return [raw, instant, offsetForm]
+}
+
+/** Launch starts that name another instant than `raw`'s, or none. */
+function otherLaunchStarts(raw: string): unknown[] {
+  const instant = parseLaunchStart(raw)!
+  const others = RECORD_LAUNCH_STARTS.map(([, other]) => other).filter((other) => parseLaunchStart(other) !== instant)
+  return [...others, instant + 1, instant - 1, undefined, '']
+}
+
+/** Whether the record answers yes for persona `key` and launch start `launchStart`. */
+const met = (key: string, launchStart: unknown): boolean => launchMetSendKeysNotInteractive(key, launchStart)
+
+/** Expect no record for either persona and any launch start the cases use. */
+function expectNoRecord(): void {
+  for (const who of PERSONAS) {
+    for (const [, raw] of RECORD_LAUNCH_STARTS) for (const form of sameLaunchStartForms(raw)) expect(met(who.key, form)).toBe(false)
+  }
+}
+
+describe('the approver\'s send-keys answering ErrSpawnNotInteractive records its launch; nothing else does (b.jg5 SRJ-118, SRJ-412, SRJ-1017)', () => {
+  beforeEach(() => {
+    startClockAt(LAUNCH_START_MS)
+    for (const who of PERSONAS) forgetLaunchCalls(who.key)
+  })
+
+  /** Both of the stub's `ErrSpawnNotInteractive` variants for `verb`. */
+  const notInteractiveVariants = (verb: ApproverVerb): ReadonlyArray<readonly [string, () => Error]> => [
+    ["a leftover's session", () => errSpawnNotInteractiveLeftover(undefined, verb)],
+    ['no launch start', () => errSpawnNotInteractiveNoLaunchStart(verb)],
+  ]
+
+  test.each(
+    PERSONAS.flatMap((who) =>
+      RECORD_LAUNCH_STARTS.flatMap(([form, raw]) =>
+        notInteractiveVariants('send-keys').map(([variant, make]) => [who.label, form, variant, who, raw, make] as const),
+      ),
+    ),
+  )(
+    '%s, the %s launch start, send-keys answering ErrSpawnNotInteractive (%s) at the first lap: stops not-interactive, and the record answers yes for that launch start in every form, no for any other and for the other persona',
+    async (_label, _form, _variant, who, raw, make) => {
+      installStub([pendingRowAt(raw)], { readPaneResults: [dialogPane(TRUST_DIALOG_NEEDLE)], sendKeysQueue: [cannedErr(make())] })
+
+      expect(await approve(who, false)).toBe(APPROVER_STOP_NOT_INTERACTIVE)
+
+      expect(calls.sendKeysCalls).toEqual([expectedEnter(who.id)])
+      for (const form of sameLaunchStartForms(raw)) expect(met(who.key, form)).toBe(true)
+      for (const other of otherLaunchStarts(raw)) expect(met(who.key, other)).toBe(false)
+      const otherPersona = PERSONAS.find((p) => p.key !== who.key)!
+      expect(met(otherPersona.key, raw)).toBe(false)
+    },
+  )
+
+  test.each(RECORD_LAUNCH_STARTS)(
+    'the %s launch start: a first lap whose Enter is typed records nothing; a later lap\'s send-keys answering ErrSpawnNotInteractive records the launch start the first lap kept',
+    async (_form, raw) => {
+      installStub([pendingRowAt(raw)], {
+        readPaneResults: [dialogPane(TRUST_DIALOG_NEEDLE)],
+        sendKeysQueue: [cannedOk({}), cannedErr(errSpawnNotInteractiveLeftover(undefined, 'send-keys'))],
+      })
+      const run = startApprover(PLAIN, false)
+
+      await clock.flush()
+      expect(calls.sendKeysCalls).toHaveLength(1)
+      expect(run.stop()).toBeUndefined()
+      expectNoRecord()
+
+      expect(await runToStop(run)).toBe(APPROVER_STOP_NOT_INTERACTIVE)
+      expect(calls.sendKeysCalls).toHaveLength(2)
+      for (const form of sameLaunchStartForms(raw)) expect(met(PLAIN.key, form)).toBe(true)
+    },
+  )
+
+  test.each(
+    RECORD_LAUNCH_STARTS.flatMap(([form, raw]) => notInteractiveVariants('read-pane').map(([variant, make]) => [form, variant, raw, make] as const)),
+  )(
+    'the %s launch start kept, read-pane answering ErrSpawnNotInteractive (%s): stops not-interactive with nothing typed, and records nothing (send-keys only)',
+    async (_form, _variant, raw, make) => {
+      installStub([pendingRowAt(raw)], { readPaneQueue: [cannedErr(make())] })
+
+      expect(await approve(PLAIN, false)).toBe(APPROVER_STOP_NOT_INTERACTIVE)
+
+      expect(calls.readPaneCalls).toHaveLength(1)
+      expect(calls.sendKeysCalls).toEqual([])
+      expectNoRecord()
+    },
+  )
+
+  test.each(notInteractiveVariants('status'))(
+    'an approver that never read a launch start (its status answering ErrSpawnNotInteractive, %s): stops not-interactive with no pane call, and records nothing',
+    async (_variant, make) => {
+      installStub([make()])
+
+      expect(await approve(PLAIN, false)).toBe(APPROVER_STOP_NOT_INTERACTIVE)
+
+      expect([calls.readPaneCalls, calls.sendKeysCalls]).toEqual([[], []])
+      expectNoRecord()
+    },
+  )
+
+  test('an approver that never read a launch start (a pending row with none): stops with no pane call, and records nothing', async () => {
+    installStub([cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_STARTS.none })])
+
+    expect(await approve(PLAIN, false)).toBe(APPROVER_STOP_NO_LAUNCH_START)
+
+    expect([calls.readPaneCalls, calls.sendKeysCalls]).toEqual([[], []])
+    expectNoRecord()
+  })
+
+  /** The approver's CONFLICT and UNUSABLE NAME rows at its `send-keys`. */
+  const SEND_KEYS_CONFLICT_ROW = APPROVER_CONFLICT_CASE_ROWS.find((row) => row.verb === 'send-keys')!
+  const SEND_KEYS_UNUSABLE_NAME_ROW = APPROVER_UNUSABLE_NAME_CASE_ROWS.find((row) => row.verb === 'send-keys')!
+
+  /**
+   * Every other stop, and a refusal that polls on: [name, the status answers
+   * (the dialog on screen), the first send-keys' error (none: typed), whether
+   * the case installs a latch, the stop reason].
+   */
+  const OTHER_STOPS: ReadonlyArray<readonly [string, StatusAnswer[], (() => Error) | undefined, boolean, ApproverStopReason]> = [
+    ['the row live after a typed Enter', [PENDING_ROW, LIVE_ROW], undefined, false, APPROVER_STOP_LIVE],
+    ['the row finished after a typed Enter', [PENDING_ROW, cannedStatusResult({ state: [...AGENT_DIRECTOR_DEAD_STATES][0]! })], undefined, false, APPROVER_STOP_FINISHED],
+    ['the row absent after a typed Enter', [PENDING_ROW, errSpawnNotFound()], undefined, false, APPROVER_STOP_ABSENT],
+    ['another launch start at the next lap', [PENDING_ROW, NEWER_RECORD_ROW], undefined, false, APPROVER_STOP_SUPERSEDED],
+    ['send-keys: GONE (ErrTmuxSendKeys)', [PENDING_ROW], () => errTmuxSendKeys(), false, APPROVER_STOP_GONE],
+    ['send-keys: ErrSpawnNotFound', [PENDING_ROW], () => errSpawnNotFound(), false, APPROVER_STOP_GONE],
+    ['send-keys: ENVIRONMENT (ErrTmuxNotAvailable)', [PENDING_ROW], () => errTmuxNotAvailable(undefined, 'send-keys'), false, APPROVER_STOP_TMUX_UNAVAILABLE],
+    ['send-keys: UNAVAILABLE, polling on until the row is live', [PENDING_ROW, PENDING_ROW, LIVE_ROW], () => errTmuxUnresponsive('send-keys'), false, APPROVER_STOP_LIVE],
+    ['send-keys: CONFLICT', [PENDING_ROW], () => SEND_KEYS_CONFLICT_ROW.build(), true, APPROVER_STOP_LATCHED],
+    ['send-keys: UNUSABLE NAME', [PENDING_ROW], () => SEND_KEYS_UNUSABLE_NAME_ROW.build(), true, APPROVER_STOP_LATCHED],
+  ]
+
+  test.each(OTHER_STOPS)('%s: the approver stops (%s) and records nothing', async (_name, statusAnswers, sendKeysError, latches, reason) => {
+    if (latches) setConflictLatch(createConflictLatch({ log: () => {} }))
+    installStub(statusAnswers, {
+      readPaneResults: [dialogPane(TRUST_DIALOG_NEEDLE)],
+      ...(sendKeysError === undefined ? {} : { sendKeysQueue: [cannedErr(sendKeysError())] }),
+    })
+
+    expect(await approve(PLAIN, false)).toBe(reason)
+
+    expect(calls.sendKeysCalls.length).toBeGreaterThan(0)
+    expectNoRecord()
+  })
+
+  test('the test cap stops an approver whose Enter was typed: nothing recorded', async () => {
+    _setDialogReadyTimeoutMs(DIALOG_POLL_INTERVAL_MS)
+    installStub([PENDING_ROW], { readPaneResults: [dialogPane(TRUST_DIALOG_NEEDLE)] })
+
+    expect(await approve(PLAIN, false)).toBe(APPROVER_STOP_CAP)
+
+    expect(calls.sendKeysCalls.length).toBeGreaterThan(0)
+    expectNoRecord()
+  })
+})
+
+// ---------------------------------------------------------------------------
 // The approver registry (b.jg5 SRJ-401, SRJ-404; hatch A2)
 // ---------------------------------------------------------------------------
 
@@ -1786,6 +1984,35 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
       expect(sendKeysCount(PLAIN)).toBe(verb === 'send-keys' ? 1 : 0)
       expect(clock.pending()).toEqual([])
       expect((await _whenDialogApproverStopped(PLAIN.key))?.reason).toBe(reason)
+      expect(approverLines()).toEqual([approverLogLine(approverStopRequestedMessage(PLAIN.ref, reason))])
+    },
+  )
+
+  // b.jg5 SRJ-412, SRJ-1017: the record follows the send-keys answer, not the
+  // stop's reason, so a stop asked during that call still leaves it set.
+  test.each(STOP_ENTRY_REASONS.map((reason) => [reason] as const))(
+    'a stop (%s) asked while its send-keys is in progress, that send-keys then answering ErrSpawnNotInteractive: the stop asked decides the reason, with its one line, and the launch start kept is still recorded',
+    async (reason) => {
+      rows.set(PLAIN.id, [PENDING_ROW])
+      panes.set(PLAIN.id, dialogPane(TRUST_DIALOG_NEEDLE))
+      const hold = holdNext('send-keys', PLAIN)
+      failures.set(call('send-keys', PLAIN.id), errSpawnNotInteractiveLeftover(undefined, 'send-keys'))
+      startDialogApprover(PLAIN.key, true, PLAIN.ref)
+      await clock.flush()
+      expect(hold.reached).toBe(true)
+      expect(launchMetSendKeysNotInteractive(PLAIN.key, SAMPLE_LAUNCH_START_DEFAULT)).toBe(false)
+
+      const stop = track(stopDialogApprover(PLAIN.key, reason))
+      await clock.flush()
+      hold.release()
+      await clock.flush()
+
+      expect(stop.value).toBe(true)
+      expect(await _whenDialogApproverStopped(PLAIN.key)).toEqual({ reason, launchStartMs: LAUNCH_START_MS })
+      expect(events).toEqual(lap(PLAIN, 'status', 'read-pane', 'send-keys'))
+      expect(launchMetSendKeysNotInteractive(PLAIN.key, SAMPLE_LAUNCH_START_DEFAULT)).toBe(true)
+      expect(launchMetSendKeysNotInteractive(PLAIN.key, LAUNCH_START_MS)).toBe(true)
+      expect(launchMetSendKeysNotInteractive(NAMED.key, SAMPLE_LAUNCH_START_DEFAULT)).toBe(false)
       expect(approverLines()).toEqual([approverLogLine(approverStopRequestedMessage(PLAIN.ref, reason))])
     },
   )

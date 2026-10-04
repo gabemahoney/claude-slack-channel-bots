@@ -1392,9 +1392,11 @@ import {
   approverStartedAfterLaunchTimeoutMessage,
   launchCallWindowOf,
   launchUnavailableFormText,
+  launchUnavailableGetLine,
   launchUnavailableSequenceOutcome,
   thisLaunchRowOf,
   type LaunchCallWindowRecord,
+  type ThisLaunchRowRecord,
 } from '../src/session-manager.ts'
 import { LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT, LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE, type LaunchTimeoutForm } from '../src/ad-error-class.ts'
 import { TMUX_UNRESPONSIVE_END_TMUX_VERB } from '../src/persona-episodes.ts'
@@ -1412,6 +1414,21 @@ import {
   type TimedLaunch,
   type TimedLaunchStart,
 } from './test-helpers/recovery-harness.ts'
+import {
+  forgetLaunchCalls,
+  launchMetSendKeysNotInteractive,
+  recordSendKeysNotInteractive,
+  setStuckLaunchEpisodes,
+} from '../src/session-manager.ts'
+import {
+  describeLaunchStartForLog,
+  STUCK_LAUNCH_POSTED,
+  postStuckLaunchHeld,
+  stuckLaunchEndRowLiveReason,
+  stuckLaunchEpisodeEndedLine,
+  type StuckLaunchPosterDeps,
+} from '../src/pending-row.ts'
+import { PERSONA_EPISODE_KIND_STUCK_LAUNCH } from '../src/persona-episodes.ts'
 
 // ---------------------------------------------------------------------------
 // Test fixture helpers
@@ -17384,6 +17401,20 @@ describe('b.jg5 SRJ-702: the stop\'s cause raisePersonaKillFailureAlert hands th
 // reconnect adapters' own-row step is covered in tests/server.test.ts.
 // ---------------------------------------------------------------------------
 
+/** One shared own-row read of `key`, `status` (`readPersonaOwnRowStatus`) or `get` (`readPersonaOwnRow`), answering `answer` (a state, or a thrown error). */
+async function readOwnRow(h: RecoveryHarness, key: string, read: 'status' | 'get', answer: string | Error): Promise<void> {
+  if (read === 'status') {
+    h.script(answer instanceof Error ? { statusResult: undefined, statusError: answer } : { statusError: undefined, statusResult: cannedStatusResult({ state: answer }) })
+    await readPersonaOwnRowStatus(key, STATUS_READ_SITE)
+  } else {
+    h.script(answer instanceof Error ? { getResult: undefined, getError: answer } : { getError: undefined, getResult: cannedGetResult({ state: answer }, harnessPersona(h, key), h.home) })
+    await readPersonaOwnRow(key, STATUS_READ_SITE)
+  }
+}
+
+/** The two shared own-row reads `readOwnRow` makes. */
+const READS = ['status', 'get'] as const
+
 describe('b.jg5 SRJ-704, SRJ-1016: the shared own-row status and get reads end P\'s kill-failure episode, at a replacement site too', () => {
   afterEach(srj105AfterEach)
 
@@ -17398,19 +17429,6 @@ describe('b.jg5 SRJ-704, SRJ-1016: the shared own-row status and get reads end P
     h.script({ statusQueue: [], killError: undefined })
     return alert
   }
-
-  /** One shared own-row read of `key`, `status` or `get`, answering `answer` (a state, or a thrown error). */
-  async function readOwnRow(h: RecoveryHarness, key: string, read: 'status' | 'get', answer: string | Error): Promise<void> {
-    if (read === 'status') {
-      h.script(answer instanceof Error ? { statusResult: undefined, statusError: answer } : { statusError: undefined, statusResult: cannedStatusResult({ state: answer }) })
-      await readPersonaOwnRowStatus(key, STATUS_READ_SITE)
-    } else {
-      h.script(answer instanceof Error ? { getResult: undefined, getError: answer } : { getError: undefined, getResult: cannedGetResult({ state: answer }, harnessPersona(h, key), h.home) })
-      await readPersonaOwnRow(key, STATUS_READ_SITE)
-    }
-  }
-
-  const READS = ['status', 'get'] as const
 
   test.each(READS.flatMap((read) => [
     [read, 'ended', KILL_FAILURE_END_ROW_FINISHED],
@@ -17507,6 +17525,218 @@ describe('b.jg5 SRJ-704, SRJ-1016: the shared own-row status and get reads end P
     expect(h.episodeNotices).toEqual([alert, killFailureNotice(p, content)])
     expect(killFailureLines(h, p).at(-1)).toBe(killFailurePostedLine(p, content))
     expect(h.killFailureOpen(p)).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-1016: the shared own-row status and get reads end P's
+// stuck-launch episode on a read live out of `pending`, silently; `pending`,
+// `ended`, `missing`, no row and a failed read do not, and a read of Q's row
+// never ends P's. On the recovery harness, which installs its episodes in
+// the session manager as main() does (`setStuckLaunchEpisodes`); the episode
+// is opened through the held text's poster over them.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-1016: the shared own-row status and get reads end P\'s stuck-launch episode on a read live out of pending, silently; no other reading ends it', () => {
+  afterEach(srj105AfterEach)
+
+  const STUCK = PERSONA_EPISODE_KIND_STUCK_LAUNCH
+  /** The live states out of `pending`: the readings that end the episode. */
+  const LIVE_OUT_OF_PENDING = [...AGENT_DIRECTOR_LIVE_STATES].filter((state) => state !== AGENT_DIRECTOR_PENDING_STATE)
+
+  /** Open `key`'s stuck-launch episode: one held post through the poster over the harness's episodes. */
+  function openEpisode(h: RecoveryHarness, key: string): { key: string; text: string } {
+    const deps: StuckLaunchPosterDeps = {
+      episodes: h.episodes,
+      tmuxUnavailableRaised: (k) => getOutageFlags(k).has('tmux-unavailable'),
+      log: (line) => h.lines.push(line),
+    }
+    expect(postStuckLaunchHeld(deps, key, SAMPLE_LAUNCH_START_DEFAULT, false)).toBe(STUCK_LAUNCH_POSTED)
+    expect(h.episodes.isOpen(key, STUCK)).toBe(true)
+    return h.episodeNotices.at(-1)!
+  }
+
+  /** `key`'s stuck-launch episode-end lines the session manager logged, whatever the reason. */
+  const endedLinesOf = (h: RecoveryHarness, key: string): string[] => h.errors.filter((line) => line.startsWith(stuckLaunchEpisodeEndedLine(key, '')))
+
+  test.each(READS.flatMap((read) => LIVE_OUT_OF_PENDING.map((state) => [read, state] as const)))(
+    'the shared %s read of P\'s own row reading %s ends P\'s episode silently, with one ended line naming the state; nothing posted',
+    async (read, state) => {
+      const { h, p } = srj105Build()
+      const post = openEpisode(h, p)
+
+      await readOwnRow(h, p, read, state)
+
+      expect(h.episodes.isOpen(p, STUCK)).toBe(false)
+      expect(h.episodeNotices).toEqual([post])
+      expect(endedLinesOf(h, p)).toEqual([stuckLaunchEpisodeEndedLine(p, stuckLaunchEndRowLiveReason(state))])
+
+      // A second such read finds no episode open: no second line.
+      await readOwnRow(h, p, read, state)
+      expect(endedLinesOf(h, p)).toHaveLength(1)
+    },
+  )
+
+  test.each(READS.flatMap((read) => [
+    [read, 'pending (a launch start recorded)', AGENT_DIRECTOR_PENDING_STATE],
+    [read, 'ended', LIVENESS_DEAD_ROW_ENDED],
+    [read, 'missing', LIVENESS_DEAD_ROW_MISSING],
+    [read, 'no row (ErrSpawnNotFound)', errSpawnNotFound()],
+    [read, 'a failed read (ErrTmuxUnresponsive)', errTmuxUnresponsive(read)],
+  ] as const))('the shared %s read of P\'s own row answering %s leaves P\'s episode open, with no ended line', async (read, _label, answer) => {
+    const { h, p } = srj105Build()
+    const post = openEpisode(h, p)
+
+    await readOwnRow(h, p, read, answer)
+
+    expect(h.episodes.isOpen(p, STUCK)).toBe(true)
+    expect(h.episodeNotices).toEqual([post])
+    expect(endedLinesOf(h, p)).toEqual([])
+  })
+
+  test.each([...READS])('the shared %s read of Q\'s own row reading waiting ends Q\'s episode only; P\'s stays open', async (read) => {
+    const { h, p, b } = srj105Build()
+    openEpisode(h, p)
+    openEpisode(h, b)
+
+    await readOwnRow(h, b, read, 'waiting')
+
+    expect([h.episodes.isOpen(p, STUCK), h.episodes.isOpen(b, STUCK)]).toEqual([true, false])
+    expect(endedLinesOf(h, p)).toEqual([])
+    expect(endedLinesOf(h, b)).toHaveLength(1)
+  })
+
+  test('a get whose caller stopped before it settled (SRJ-714) is not acted on: reading waiting, it leaves P\'s episode open', async () => {
+    const { h, p } = srj105Build()
+    openEpisode(h, p)
+    h.script({ getError: undefined, getResult: cannedGetResult({ state: 'waiting' }, harnessPersona(h, p), h.home) })
+
+    await readPersonaOwnRow(p, { ...STATUS_READ_SITE, actGoes: () => false })
+
+    expect(h.episodes.isOpen(p, STUCK)).toBe(true)
+    expect(endedLinesOf(h, p)).toEqual([])
+  })
+
+  test('with no episodes installed in the session manager a read live out of pending ends nothing and throws nothing', async () => {
+    const { h, p } = srj105Build()
+    openEpisode(h, p)
+    setStuckLaunchEpisodes(undefined)
+
+    await readOwnRow(h, p, 'status', 'waiting')
+    await readOwnRow(h, p, 'get', 'working')
+
+    expect(h.episodes.isOpen(p, STUCK)).toBe(true)
+    expect(endedLinesOf(h, p)).toEqual([])
+  })
+
+  test('after the read ended it, P\'s next held post begins a new episode and posts again', async () => {
+    const { h, p } = srj105Build()
+    const post = openEpisode(h, p)
+    await readOwnRow(h, p, 'get', 'waiting')
+
+    expect(openEpisode(h, p)).toEqual(post)
+    expect(h.episodeNotices).toEqual([post, post])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-118, SRJ-412, SRJ-1017: the per-launch record of a send-keys that
+// answered ErrSpawnNotInteractive. Set and read by launch start, raw or
+// parsed, so every form of one instant matches; any other instant, another
+// key, or no launch start does not; a later record replaces it; the
+// teardown's forget and the reset clear it. Module state, reset after each
+// case by the file's `_resetInFlightLaunches`.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-118, SRJ-412, SRJ-1017: the record of a launch whose send-keys answered ErrSpawnNotInteractive', () => {
+  const P = 'alpha'
+  const Q = 'beta'
+  /** The whole-second sample's instant (epoch ms). */
+  const WHOLE_MS = parseLaunchStart(SAMPLE_LAUNCH_START_WHOLE)!
+  /** The fractional sample's instant: another instant than `WHOLE_MS`. */
+  const FRACTIONAL_MS = parseLaunchStart(SAMPLE_LAUNCH_START_FRACTIONAL)!
+  /**
+   * Every form of the whole-second instant: agent-director's raw form (no
+   * fraction), the same instant with its zero fraction shown, and the parsed
+   * number.
+   */
+  const WHOLE_FORMS: ReadonlyArray<readonly [string, unknown]> = [
+    ['the raw form with no fraction', SAMPLE_LAUNCH_START_WHOLE],
+    ['the raw form with its zero fraction shown', new Date(WHOLE_MS).toISOString()],
+    ['the parsed number', WHOLE_MS],
+  ]
+  /** Launch starts that name no instant. */
+  const NO_INSTANT: ReadonlyArray<readonly [string, unknown]> = [
+    ['absent', SAMPLE_LAUNCH_START_NONE],
+    ['null', null],
+    ['an unparseable string', 'not a time'],
+    ['NaN', Number.NaN],
+  ]
+
+  test('the raw forms name one instant, and the fractional sample another', () => {
+    expect(parseLaunchStart(new Date(WHOLE_MS).toISOString())).toBe(WHOLE_MS)
+    expect(new Date(WHOLE_MS).toISOString()).not.toBe(SAMPLE_LAUNCH_START_WHOLE)
+    expect(FRACTIONAL_MS).not.toBe(WHOLE_MS)
+  })
+
+  test('with no record kept the query answers false for every form', () => {
+    expect(WHOLE_FORMS.map(([, form]) => launchMetSendKeysNotInteractive(P, form))).toEqual(WHOLE_FORMS.map(() => false))
+  })
+
+  test.each(WHOLE_FORMS)('set with %s, the query answers true for every form of that instant', (_label, setForm) => {
+    recordSendKeysNotInteractive(P, setForm)
+    expect(WHOLE_FORMS.map(([label, form]) => [label, launchMetSendKeysNotInteractive(P, form)])).toEqual(WHOLE_FORMS.map(([label]) => [label, true]))
+  })
+
+  test('the query refuses another instant (either form, one millisecond on), another key and a launch start naming no instant', () => {
+    recordSendKeysNotInteractive(P, SAMPLE_LAUNCH_START_WHOLE)
+    expect([
+      launchMetSendKeysNotInteractive(P, SAMPLE_LAUNCH_START_FRACTIONAL),
+      launchMetSendKeysNotInteractive(P, FRACTIONAL_MS),
+      launchMetSendKeysNotInteractive(P, WHOLE_MS + 1),
+      launchMetSendKeysNotInteractive(Q, SAMPLE_LAUNCH_START_WHOLE),
+      ...NO_INSTANT.map(([, form]) => launchMetSendKeysNotInteractive(P, form)),
+    ]).toEqual([false, false, false, false, ...NO_INSTANT.map(() => false)])
+  })
+
+  test.each(NO_INSTANT)('a launch start that is %s records nothing, and keeps an earlier record', (_label, form) => {
+    recordSendKeysNotInteractive(P, form)
+    expect(launchMetSendKeysNotInteractive(P, SAMPLE_LAUNCH_START_WHOLE)).toBe(false)
+
+    recordSendKeysNotInteractive(P, SAMPLE_LAUNCH_START_WHOLE)
+    recordSendKeysNotInteractive(P, form)
+    expect(launchMetSendKeysNotInteractive(P, SAMPLE_LAUNCH_START_WHOLE)).toBe(true)
+  })
+
+  test('a later record replaces the earlier one: the later launch start answers true, the earlier false', () => {
+    recordSendKeysNotInteractive(P, SAMPLE_LAUNCH_START_WHOLE)
+    recordSendKeysNotInteractive(P, SAMPLE_LAUNCH_START_FRACTIONAL)
+    expect([launchMetSendKeysNotInteractive(P, SAMPLE_LAUNCH_START_FRACTIONAL), launchMetSendKeysNotInteractive(P, SAMPLE_LAUNCH_START_WHOLE)]).toEqual([true, false])
+  })
+
+  test('each persona keeps its own record', () => {
+    recordSendKeysNotInteractive(P, SAMPLE_LAUNCH_START_WHOLE)
+    recordSendKeysNotInteractive(Q, SAMPLE_LAUNCH_START_FRACTIONAL)
+    expect([
+      launchMetSendKeysNotInteractive(P, SAMPLE_LAUNCH_START_WHOLE),
+      launchMetSendKeysNotInteractive(Q, SAMPLE_LAUNCH_START_FRACTIONAL),
+      launchMetSendKeysNotInteractive(P, SAMPLE_LAUNCH_START_FRACTIONAL),
+      launchMetSendKeysNotInteractive(Q, SAMPLE_LAUNCH_START_WHOLE),
+    ]).toEqual([true, true, false, false])
+  })
+
+  test('the teardown\'s forget (forgetLaunchCalls) clears P\'s record only', () => {
+    recordSendKeysNotInteractive(P, SAMPLE_LAUNCH_START_WHOLE)
+    recordSendKeysNotInteractive(Q, SAMPLE_LAUNCH_START_WHOLE)
+    forgetLaunchCalls(P)
+    expect([launchMetSendKeysNotInteractive(P, SAMPLE_LAUNCH_START_WHOLE), launchMetSendKeysNotInteractive(Q, SAMPLE_LAUNCH_START_WHOLE)]).toEqual([false, true])
+  })
+
+  test('the reset (_resetInFlightLaunches) clears every record', () => {
+    recordSendKeysNotInteractive(P, SAMPLE_LAUNCH_START_WHOLE)
+    recordSendKeysNotInteractive(Q, SAMPLE_LAUNCH_START_FRACTIONAL)
+    _resetInFlightLaunches()
+    expect([launchMetSendKeysNotInteractive(P, SAMPLE_LAUNCH_START_WHOLE), launchMetSendKeysNotInteractive(Q, SAMPLE_LAUNCH_START_FRACTIONAL)]).toEqual([false, false])
   })
 })
 
@@ -28865,7 +29095,9 @@ describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the l
 // (`thisLaunchRowOf`: only a `pending` row whose launch start lies inside the
 // window, both bounds included; AC 31 for `resume`), the approver (only for
 // a covered `pending` row, started after the launch call returned), the arms
-// and the answer: the uncounted `retrying`, `latched` or `sequence-waiting`.
+// and the answer: the uncounted `retrying`, `latched` or `sequence-waiting`;
+// the step's line names this launch's row's launch start only through the
+// one renderer (`describeLaunchStartForLog`, ISO 8601 UTC with `Z`).
 // A live-row sequence's start is read from a recording registry
 // (`recordSequenceStarts`), so none runs. Every other UNAVAILABLE launch
 // outcome gets the one `get` too, and a `pending` row then gets no approver
@@ -29039,6 +29271,38 @@ describe('b.jg5 SRJ-407: launchUnavailableFormText (pure)', () => {
   })
 })
 
+describe('b.jg5 SRJ-407, SRJ-1017: launchUnavailableGetLine renders this launch\'s row\'s launch start through the one renderer (pure)', () => {
+  /** An ISO 8601 UTC timestamp with milliseconds, ending in `Z`, as `Date.prototype.toISOString` writes one. */
+  const ISO_UTC_Z = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/
+  const lineFor = (thisLaunchRow: ThisLaunchRowRecord | undefined): string =>
+    launchUnavailableGetLine('P', 'spawn', 'a launch timeout', 'pending', thisLaunchRow, LAUNCH_UNAVAILABLE_OUTCOME_APPROVER)
+  const recordAt = (launchStartMs: number): ThisLaunchRowRecord => ({
+    launchStartMs,
+    window: { verb: 'spawn', startMs: launchStartMs, endMs: launchStartMs + 1, end: LAUNCH_CALL_END_LAUNCH_TIMEOUT },
+  })
+
+  test.each([
+    ['with fractional seconds', SAMPLE_LAUNCH_START_FRACTIONAL],
+    ['whole seconds', SAMPLE_LAUNCH_START_WHOLE],
+  ])('this launch\'s row, its launch start the stub\'s sample %s: "yes (launch start <ISO 8601 UTC with Z>)", the renderer\'s string, never the raw text unless it is that string', (_form, raw) => {
+    const launchStartMs = parseLaunchStart(raw)!
+    const rendered = describeLaunchStartForLog(launchStartMs)
+    expect(rendered).toMatch(ISO_UTC_Z)
+    expect(rendered).toBe(new Date(launchStartMs).toISOString())
+    // The raw text and the parsed number of one instant render alike.
+    expect(describeLaunchStartForLog(raw)).toBe(rendered)
+    const line = lineFor(recordAt(launchStartMs))
+    expect(line).toContain(`; this launch's row: yes (launch start ${rendered}) — `)
+    if (raw !== rendered) expect(line).not.toContain(raw)
+  })
+
+  test('no record: "this launch\'s row: no", with no launch start', () => {
+    const line = lineFor(undefined)
+    expect(line).toContain('; this launch\'s row: no — ')
+    expect(line).not.toContain('launch start')
+  })
+})
+
 describe('b.jg5 SRJ-407: each launch call\'s window, and one get after a launch timeout or any other UNAVAILABLE launch outcome, never launching over what it reads', () => {
   afterEach(() => {
     expectNoDeleteOrIncludeFinished(srj105Harness)
@@ -29098,6 +29362,8 @@ describe('b.jg5 SRJ-407: each launch call\'s window, and one get after a launch 
     expect(lines).toHaveLength(1)
     expect(lines[0]).toContain(` ended in ${launchUnavailableFormText(form, describeAgentDirectorFailure(t.error))}: `)
     if (row.read !== undefined) expect(lines[0]).toContain(`: read ${row.read}; `)
+    // Its launch start only as the one renderer writes it.
+    expect(lines[0]).toContain(`; this launch's row: ${row.ownRow === true ? `yes (launch start ${describeLaunchStartForLog(ownRowAtReturn!.launchStartMs)})` : 'no'} — `)
     expect(lines[0]).toEndWith(` — ${row.outcome}; no launch in this attempt (b.jg5 SRJ-407)`)
     expect(h.triggers.filter((trigger) => trigger.key === p)).toEqual([
       { key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE },

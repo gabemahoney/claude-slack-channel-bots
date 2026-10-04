@@ -1,6 +1,8 @@
 /**
- * pending-row.ts — A `pending` row's launch start (b.jg5 SRJ-406, SRJ-408)
- * and the pending-with-no-launch-start predicate (b.jg5 SRJ-513).
+ * pending-row.ts — A `pending` row's launch start (b.jg5 SRJ-406, SRJ-408),
+ * the pending-with-no-launch-start predicate (b.jg5 SRJ-513), and the
+ * stuck-launch post's texts, posters and episode end (b.jg5 SRJ-1017,
+ * SRJ-1016).
  *
  * agent-director shows a row's launch start (`launch_started_at`) on `pending`
  * rows only, from `status`, `get` and `list` alike: an RFC 3339 UTC timestamp
@@ -58,20 +60,54 @@
  * {@link isLaunchStartInWindow} answers whether a row's launch start lies
  * inside such a window, both ends included; a row whose launch start does so
  * after a launch timeout is that launch's own row.
- * {@link describeLaunchStartForLog} renders a launch start for a log line.
+ * {@link describeLaunchStartForLog} is the one renderer of a launch start,
+ * for a log line and for the stuck-launch post: an ISO 8601 UTC timestamp
+ * ending in `Z`, the same for both launch-start forms of one instant
+ * ({@link launchStartInstantOf}).
  *
- * Pure: no module-scope state, no I/O, no agent-director call, no log line,
- * nothing run at import; the clock is always passed in. Nothing names an
- * export only the Phase 1 client has; the result field is typed through
- * CSCB's own Phase 1 declarations (`src/ad-phase1-types.ts`, a type-only
- * import).
+ * The stuck-launch post (b.jg5 SRJ-1017, SRJ-1016, SRJ-1001), made by the
+ * pending-row rule at B (SRJ-410 step 3) to P's destination, naming P's
+ * session (`quotedPersonaSessionName`, `src/persona-identity.ts`):
+ * {@link stuckLaunchRelaunchingText} for CSCB's own stuck launch, with B in
+ * whole minutes, and {@link stuckLaunchHeldText} for any other `pending` row,
+ * with its three remedy lines and its human-only line, the attach line left
+ * out and {@link STUCK_LAUNCH_NOT_STARTED_BY_CSCB_CLAUSE} added when a
+ * `send-keys` on the row answered `ErrSpawnNotInteractive` during its current
+ * launch. Neither names a command that ends a session. The fixed pieces are
+ * exported. Each text has one poster ({@link postStuckLaunchRelaunching},
+ * {@link postStuckLaunchHeld}) over injected dependencies (the server's one
+ * episodes instance, a `tmux-unavailable` query and a log sink): while P's
+ * `tmux-unavailable` outage is raised it posts nothing and begins no episode;
+ * otherwise it begins or keeps P's stuck-launch episode
+ * (`PERSONA_EPISODE_KIND_STUCK_LAUNCH`, `src/persona-episodes.ts`) and posts
+ * its text at most once in it, under its own mark
+ * ({@link STUCK_LAUNCH_MARK_RELAUNCHING}, {@link STUCK_LAUNCH_MARK_HELD}),
+ * through the episodes' sink (the persona notifier), never straight to
+ * Slack, with one line per call ({@link stuckLaunchPostLine}). The episode
+ * and its marks live only in the episodes instance. The episode ends
+ * silently ({@link endStuckLaunchEpisode}) at a read of P's own row in
+ * `waiting`, `working`, `ask_user` or `check_permission`
+ * ({@link isStuckLaunchEpisodeEndState}; the session manager's shared
+ * own-row reads), when P latches ({@link endStuckLaunchEpisodeForLatch}, the
+ * latch's hold observer), and at P's teardown (the episodes' `forget`); a
+ * read of `pending`, `ended`, `missing` or no row does not end it.
+ *
+ * No module-scope state, no I/O, no agent-director call and nothing run at
+ * import; the clock is always passed in. Every function but the posters and
+ * the episode's end is pure; those act only through the dependencies they
+ * are given. Nothing names an export only the Phase 1 client has; the
+ * result field is typed through CSCB's own Phase 1 declarations
+ * (`src/ad-phase1-types.ts`, a type-only import).
  *
  * SPDX-License-Identifier: MIT
  */
 
 import type { Phase1StatusResult } from './ad-phase1-types.ts'
-import { armNeverEarlyWait, type NeverEarlyWaitClock, type NeverEarlyWaitLength } from './ad-settings.ts'
-import { AGENT_DIRECTOR_PENDING_STATE, pendingLaunchStartOf } from './liveness-reading.ts'
+import { armNeverEarlyWait, wholeMinutes, type NeverEarlyWaitClock, type NeverEarlyWaitLength } from './ad-settings.ts'
+import { AGENT_DIRECTOR_LIVE_STATES, AGENT_DIRECTOR_PENDING_STATE, pendingLaunchStartOf } from './liveness-reading.ts'
+import { describeThrownValue } from './persona-connection-errors.ts'
+import type { MUTED_BY_TEARDOWN, PERSONA_EPISODE_KIND_STUCK_LAUNCH, PersonaEpisodes } from './persona-episodes.ts'
+import { personaTmuxSessionName, quotedPersonaSessionName, tmuxExactSessionTarget } from './persona-identity.ts'
 
 // ---------------------------------------------------------------------------
 // The launch start (b.jg5 SRJ-406, SRJ-408)
@@ -403,19 +439,376 @@ export function isLaunchStartInWindow(rawLaunchStart: unknown, window: LaunchCal
 }
 
 /**
- * A launch start for a log line, only in a form CSCB builds itself: given a
- * number, that instant (epoch ms, as {@link parseLaunchStart} answers it);
- * given anything else, the instant {@link parseLaunchStart} reads from it;
- * either as an ISO 8601 UTC timestamp, or `none` for a launch start that is
- * absent, does not parse or is not a finite time. The raw text agent-director
- * wrote never reaches the line. Pure; never throws.
+ * The instant of a launch start given in either form CSCB holds one in: a
+ * number is taken as that instant (epoch ms, as {@link parseLaunchStart}
+ * answers it); anything else is read by {@link parseLaunchStart}. Answers
+ * `undefined` for a launch start that is absent, does not parse or is not a
+ * finite time, so two forms of one instant (with and without fractional
+ * seconds, `Z` or an offset, or the parsed number) give one answer. Pure;
+ * never throws.
+ */
+export function launchStartInstantOf(launchStart: unknown): number | undefined {
+  const launchStartMs = typeof launchStart === 'number' ? launchStart : parseLaunchStart(launchStart)
+  return launchStartMs !== undefined && Number.isFinite(launchStartMs) ? launchStartMs : undefined
+}
+
+/**
+ * The one renderer of a launch start, for a log line and for the stuck-launch
+ * post's held text (b.jg5 SRJ-1017: `<the launch start>`), only in a form
+ * CSCB builds itself: the instant {@link launchStartInstantOf} reads, as an
+ * ISO 8601 UTC timestamp ending in `Z`, so both launch-start forms of one
+ * instant render alike; `none` for a launch start that is absent, does not
+ * parse or is not a finite time. The raw text agent-director wrote never
+ * reaches a line or a post. Pure; never throws.
  */
 export function describeLaunchStartForLog(launchStart: unknown): string {
-  const launchStartMs = typeof launchStart === 'number' ? launchStart : parseLaunchStart(launchStart)
-  if (launchStartMs === undefined || !Number.isFinite(launchStartMs)) return 'none'
+  const launchStartMs = launchStartInstantOf(launchStart)
+  if (launchStartMs === undefined) return 'none'
   try {
     return new Date(launchStartMs).toISOString()
   } catch {
     return 'none'
   }
+}
+
+// ---------------------------------------------------------------------------
+// The stuck-launch post's two texts (b.jg5 SRJ-1017, SRJ-1001)
+// ---------------------------------------------------------------------------
+
+/** The relaunching text's head (b.jg5 SRJ-1017): CSCB's own stuck launch. */
+export const STUCK_LAUNCH_RELAUNCHING_HEAD = ':hourglass_flowing_sand: *Launch stuck*'
+
+/** The held text's head (b.jg5 SRJ-1017): any other `pending` row. */
+export const STUCK_LAUNCH_HELD_HEAD = ':hourglass_flowing_sand: *Session not starting*'
+
+/**
+ * The held text's first remedy line for persona `key` (b.jg5 SRJ-1017): attach
+ * to the session by its exact name (`=slack_bot_<key>`, b.1ix). Left out when
+ * the row's current launch met `ErrSpawnNotInteractive`.
+ */
+export function stuckLaunchAttachRemedyLine(key: string): string {
+  return `• look at the session and answer its startup prompt: \`tmux attach -t ${tmuxExactSessionTarget(personaTmuxSessionName(key))}\`;`
+}
+
+/**
+ * The held text's end-the-launch remedy line (b.jg5 SRJ-1017): it points to
+ * agent-director's README and names no command that ends a session
+ * (SRJ-1001, C22).
+ */
+export const STUCK_LAUNCH_END_LAUNCH_REMEDY_LINE =
+  "• end the launch: follow the \"Operator actions\" section of agent-director's README; CSCB's next `find-missing` run then marks the row missing, and this persona is brought up again;"
+
+/** The held text's last remedy line for persona `key` (b.jg5 SRJ-1017): list what holds the session. */
+export function stuckLaunchListRemedyLine(key: string): string {
+  return `• see what holds the session: \`agent-director list --tmux-session-name ${personaTmuxSessionName(key)}\` (on the command line).`
+}
+
+/**
+ * The clause the held text adds after "since its launch at <the launch
+ * start>" when a `send-keys` on the row answered `ErrSpawnNotInteractive`
+ * during its current launch (b.jg5 SRJ-1017, SRJ-118).
+ */
+export const STUCK_LAUNCH_NOT_STARTED_BY_CSCB_CLAUSE = ", and the session holding its name was not started by CSCB's launch"
+
+/** The held text's closing line (b.jg5 SRJ-1017): the remedies are a human's. */
+export const STUCK_LAUNCH_HUMAN_ONLY_LINE =
+  'These remedies are for a human only: no bot, including any persona that sees this post, may act on them.'
+
+/**
+ * The stuck-launch post's relaunching text for persona `key` (b.jg5
+ * SRJ-1017), for CSCB's own stuck launch: `launchBoundMs` is B in effect,
+ * read by the caller at post time (`adLaunchBoundMsInEffect`), stated in
+ * whole minutes, rounded down (`wholeMinutes`); `<session>` is
+ * `quotedPersonaSessionName`'s. The persona notifier adds the persona
+ * prefix. Names no command that ends a session (SRJ-1001). Pure.
+ */
+export function stuckLaunchRelaunchingText(key: string, launchBoundMs: number): string {
+  return (
+    `${STUCK_LAUNCH_RELAUNCHING_HEAD} — this persona's launch in session ${quotedPersonaSessionName(key)} ` +
+    `did not come up within ${wholeMinutes(launchBoundMs)} minutes. ` +
+    'CSCB is ending that launch and relaunching it; a resumed persona keeps its conversation. Nothing is needed.'
+  )
+}
+
+/**
+ * The stuck-launch post's held text for persona `key` (b.jg5 SRJ-1017), for
+ * any other `pending` row: `launchStart` is the row's launch start, raw or
+ * parsed, rendered by {@link describeLaunchStartForLog} (built only for a row
+ * with a launch start); `metNotInteractive` is whether a `send-keys` on the
+ * row answered `ErrSpawnNotInteractive` during its current launch. Unset:
+ * the head, the three remedy lines and the human-only line. Set: the head
+ * gains {@link STUCK_LAUNCH_NOT_STARTED_BY_CSCB_CLAUSE} and the attach line
+ * is left out (answering that session's prompt would put an earlier
+ * launch's worker on this row). One line each, joined by newlines; the
+ * persona notifier adds the persona prefix. Names no command that ends a
+ * session (SRJ-1001). Pure.
+ */
+export function stuckLaunchHeldText(key: string, launchStart: unknown, metNotInteractive: boolean): string {
+  const clause = metNotInteractive ? STUCK_LAUNCH_NOT_STARTED_BY_CSCB_CLAUSE : ''
+  const head =
+    `${STUCK_LAUNCH_HELD_HEAD} — this persona's session ${quotedPersonaSessionName(key)} ` +
+    `has not reported in since its launch at ${describeLaunchStartForLog(launchStart)}${clause}, ` +
+    "and may be held at a startup prompt CSCB cannot answer. CSCB keeps checking. A human's remedies:"
+  const remedies = metNotInteractive
+    ? [STUCK_LAUNCH_END_LAUNCH_REMEDY_LINE, stuckLaunchListRemedyLine(key)]
+    : [stuckLaunchAttachRemedyLine(key), STUCK_LAUNCH_END_LAUNCH_REMEDY_LINE, stuckLaunchListRemedyLine(key)]
+  return [head, ...remedies, STUCK_LAUNCH_HUMAN_ONLY_LINE].join('\n')
+}
+
+// ---------------------------------------------------------------------------
+// The stuck-launch poster (b.jg5 SRJ-1017, SRJ-1016)
+// ---------------------------------------------------------------------------
+
+/**
+ * The stuck-launch episode kind (`PERSONA_EPISODE_KIND_STUCK_LAUNCH`,
+ * `src/persona-episodes.ts`). Held here under that constant's own literal
+ * type, so the compiler refuses any other value, because this module loads
+ * no server-side module at run time (the live-row sequence, which loads it,
+ * must not load the episodes module).
+ */
+const STUCK_LAUNCH_KIND: typeof PERSONA_EPISODE_KIND_STUCK_LAUNCH = 'stuck-launch'
+
+/** `MUTED_BY_TEARDOWN` (`src/persona-episodes.ts`) under its own literal type, for the same reason as {@link STUCK_LAUNCH_KIND}. */
+const MUTED_BY_TEARDOWN_TEXT: typeof MUTED_BY_TEARDOWN = 'muted, its persona teardown was submitted'
+
+/** The relaunching text's mark in the stuck-launch episode, and its name in the poster's lines. */
+export const STUCK_LAUNCH_MARK_RELAUNCHING = 'relaunching'
+/** The held text's mark in the stuck-launch episode, and its name in the poster's lines. */
+export const STUCK_LAUNCH_MARK_HELD = 'held'
+
+/** One of the stuck-launch post's two texts, by its mark. */
+export type StuckLaunchTextMark = typeof STUCK_LAUNCH_MARK_RELAUNCHING | typeof STUCK_LAUNCH_MARK_HELD
+
+/** A poster's answer: the text was handed to the episodes' sink (or muted by a submitted teardown, counting as posted). */
+export const STUCK_LAUNCH_POSTED = 'posted'
+/** A poster's answer: the text was already posted in this stuck-launch episode, so nothing was handed on. */
+export const STUCK_LAUNCH_ALREADY_POSTED = 'already-posted'
+/** A poster's answer: P's `tmux-unavailable` outage is raised, so nothing was posted and no episode begun. */
+export const STUCK_LAUNCH_SUPPRESSED = 'suppressed'
+/** A poster's answer: the episodes are closed (shutdown), so nothing was posted. */
+export const STUCK_LAUNCH_NOT_POSTED_CLOSED = 'closed'
+
+/** What a stuck-launch poster answers. */
+export type StuckLaunchPostAnswer =
+  | typeof STUCK_LAUNCH_POSTED
+  | typeof STUCK_LAUNCH_ALREADY_POSTED
+  | typeof STUCK_LAUNCH_SUPPRESSED
+  | typeof STUCK_LAUNCH_NOT_POSTED_CLOSED
+
+/** What the posters use of the server's one episodes instance (`createPersonaEpisodes`, `src/persona-episodes.ts`). */
+export type StuckLaunchPostEpisodes = Pick<PersonaEpisodes, 'begin' | 'post' | 'teardownWindowState'>
+
+/** The posters' injected dependencies. */
+export interface StuckLaunchPosterDeps {
+  /** The server's one episodes instance (production: `main()`'s notice episodes over the persona notifier). */
+  readonly episodes: StuckLaunchPostEpisodes
+  /**
+   * Whether persona `key`'s `tmux-unavailable` outage is raised now
+   * (production: `getOutageFlags(key)`, `src/outage-state.ts`). A throw is
+   * taken as raised.
+   */
+  readonly tmuxUnavailableRaised: (key: string) => boolean
+  /** Receives each `[slack] pending-row:` line (the server log). A throwing log is swallowed. */
+  readonly log: (line: string) => void
+}
+
+/** The head of every stuck-launch line for persona `key`. */
+function stuckLaunchLineHead(key: string): string {
+  return `[slack] pending-row: persona=${key} stuck-launch`
+}
+
+/** The text's name in a poster line: its mark, and for the held text which form. */
+function stuckLaunchTextName(mark: StuckLaunchTextMark, metNotInteractive: boolean): string {
+  if (mark === STUCK_LAUNCH_MARK_RELAUNCHING) return `${mark} text`
+  return metNotInteractive ? `${mark} text (no attach line: the session holding its name was not started by CSCB's launch)` : `${mark} text`
+}
+
+/**
+ * The line of a stuck-launch poster's answer for persona `key` (b.jg5
+ * SRJ-1017, SRJ-1003), one per call:
+ *
+ *   [slack] pending-row: persona=<key> stuck-launch <text> posted
+ *   [slack] pending-row: persona=<key> stuck-launch <text> not posted — muted, its persona teardown was submitted; it counts as posted in its episode
+ *   [slack] pending-row: persona=<key> stuck-launch <text> not posted — already posted in this stuck-launch episode
+ *   [slack] pending-row: persona=<key> stuck-launch <text> not posted — its tmux-unavailable outage is raised, whose onset is its notice; no episode begun
+ *   [slack] pending-row: persona=<key> stuck-launch <text> not posted — the server is shutting down
+ *
+ * where `<text>` is `relaunching text`, `held text`, or `held text (no attach
+ * line: the session holding its name was not started by CSCB's launch)`.
+ * `muted` is true for a post its submitted persona teardown muted. Pure.
+ */
+export function stuckLaunchPostLine(
+  key: string,
+  mark: StuckLaunchTextMark,
+  answer: StuckLaunchPostAnswer,
+  options: { readonly metNotInteractive?: boolean; readonly muted?: boolean } = {},
+): string {
+  const head = `${stuckLaunchLineHead(key)} ${stuckLaunchTextName(mark, options.metNotInteractive === true)}`
+  switch (answer) {
+    case STUCK_LAUNCH_POSTED:
+      return options.muted === true ? `${head} not posted — ${MUTED_BY_TEARDOWN_TEXT}; it counts as posted in its episode` : `${head} posted`
+    case STUCK_LAUNCH_ALREADY_POSTED:
+      return `${head} not posted — already posted in this stuck-launch episode`
+    case STUCK_LAUNCH_SUPPRESSED:
+      return `${head} not posted — its tmux-unavailable outage is raised, whose onset is its notice; no episode begun`
+    case STUCK_LAUNCH_NOT_POSTED_CLOSED:
+      return `${head} not posted — the server is shutting down`
+  }
+}
+
+/** The line for a `tmux-unavailable` query that threw for persona `key`: taken as raised. */
+export function stuckLaunchOutageQueryFailedLine(key: string, described: string): string {
+  return `${stuckLaunchLineHead(key)} tmux-unavailable query failed: ${described} — taken as raised`
+}
+
+/** The line for a poster call on persona `key` that threw inside (an episodes call): nothing more was done. */
+export function stuckLaunchPostFailedLine(key: string, described: string): string {
+  return `${stuckLaunchLineHead(key)} post failed: ${described}`
+}
+
+/** The line for an end of persona `key`'s stuck-launch episode that threw inside (an episodes call): nothing more was done. */
+export function stuckLaunchEpisodeEndFailedLine(key: string, described: string): string {
+  return `${stuckLaunchLineHead(key)} episode end failed: ${described}`
+}
+
+/** Hand `line` to `log`; a throwing log is swallowed. */
+function safePendingRowLog(log: (line: string) => void, line: string): void {
+  try {
+    log(line)
+  } catch {
+    /* a failing logger must not change what a poster does */
+  }
+}
+
+/** Whether persona `key`'s `tmux-unavailable` outage is raised by the injected query; a throw is taken as raised, with one line. */
+function tmuxUnavailableRaisedFor(deps: StuckLaunchPosterDeps, key: string): boolean {
+  try {
+    return deps.tmuxUnavailableRaised(key) === true
+  } catch (err) {
+    safePendingRowLog(deps.log, stuckLaunchOutageQueryFailedLine(key, describeThrownValue(err)))
+    return true
+  }
+}
+
+/**
+ * Post `text` under `mark` in persona `key`'s stuck-launch episode (b.jg5
+ * SRJ-1017, SRJ-1016): nothing, and no episode begun, while `tmux-unavailable`
+ * is raised; otherwise begin or keep the episode and post at most once per
+ * mark in it. One line per call ({@link stuckLaunchPostLine}). Never throws:
+ * an episodes call that throws logs {@link stuckLaunchPostFailedLine} and
+ * answers suppressed.
+ */
+function postStuckLaunchText(
+  deps: StuckLaunchPosterDeps,
+  key: string,
+  mark: StuckLaunchTextMark,
+  buildText: () => string,
+  metNotInteractive: boolean,
+): StuckLaunchPostAnswer {
+  const line = (answer: StuckLaunchPostAnswer, muted = false): StuckLaunchPostAnswer => {
+    safePendingRowLog(deps.log, stuckLaunchPostLine(key, mark, answer, { metNotInteractive, muted }))
+    return answer
+  }
+  try {
+    if (tmuxUnavailableRaisedFor(deps, key)) return line(STUCK_LAUNCH_SUPPRESSED)
+    const { episodes } = deps
+    if (episodes.begin(key, STUCK_LAUNCH_KIND) === 'closed') return line(STUCK_LAUNCH_NOT_POSTED_CLOSED)
+    // b.jg5 SRJ-1003: read before the post, which a submitted teardown mutes
+    // (the episode still counts it as posted).
+    const muted = episodes.teardownWindowState(key) === 'submitted'
+    if (!episodes.post(key, STUCK_LAUNCH_KIND, buildText(), mark)) return line(STUCK_LAUNCH_ALREADY_POSTED)
+    return line(STUCK_LAUNCH_POSTED, muted)
+  } catch (err) {
+    safePendingRowLog(deps.log, stuckLaunchPostFailedLine(key, describeThrownValue(err)))
+    return STUCK_LAUNCH_SUPPRESSED
+  }
+}
+
+/**
+ * Post the relaunching text ({@link stuckLaunchRelaunchingText}, B from
+ * `launchBoundMs`) for persona `key`'s own stuck launch, at most once per
+ * stuck-launch episode, under {@link STUCK_LAUNCH_MARK_RELAUNCHING} (b.jg5
+ * SRJ-1017): see {@link postStuckLaunchText}. The `ad-config-malformed` gate
+ * is the caller's. Goes through `deps.episodes` only, never straight to
+ * Slack. Never throws.
+ */
+export function postStuckLaunchRelaunching(deps: StuckLaunchPosterDeps, key: string, launchBoundMs: number): StuckLaunchPostAnswer {
+  return postStuckLaunchText(deps, key, STUCK_LAUNCH_MARK_RELAUNCHING, () => stuckLaunchRelaunchingText(key, launchBoundMs), false)
+}
+
+/**
+ * Post the held text ({@link stuckLaunchHeldText}) for persona `key`'s
+ * `pending` row with the launch start `launchStart`, in the form
+ * `metNotInteractive` picks, at most once per stuck-launch episode, under
+ * {@link STUCK_LAUNCH_MARK_HELD} (b.jg5 SRJ-1017): see
+ * {@link postStuckLaunchText}. Goes through `deps.episodes` only, never
+ * straight to Slack. Never throws.
+ */
+export function postStuckLaunchHeld(
+  deps: StuckLaunchPosterDeps,
+  key: string,
+  launchStart: unknown,
+  metNotInteractive: boolean,
+): StuckLaunchPostAnswer {
+  return postStuckLaunchText(deps, key, STUCK_LAUNCH_MARK_HELD, () => stuckLaunchHeldText(key, launchStart, metNotInteractive), metNotInteractive)
+}
+
+// ---------------------------------------------------------------------------
+// The stuck-launch episode's end (b.jg5 SRJ-1016)
+// ---------------------------------------------------------------------------
+
+/**
+ * True for a row state whose read ends the stuck-launch episode (b.jg5
+ * SRJ-1016): `waiting`, `working`, `ask_user` or `check_permission`, the
+ * live states out of `pending`. False for `pending`, `ended`, `missing`, any
+ * other value and no row. Pure; never throws.
+ */
+export function isStuckLaunchEpisodeEndState(state: unknown): boolean {
+  return typeof state === 'string' && state !== AGENT_DIRECTOR_PENDING_STATE && AGENT_DIRECTOR_LIVE_STATES.has(state)
+}
+
+/** What ended a stuck-launch episode, in its line: a read of the row in `state`, live out of `pending`. */
+export function stuckLaunchEndRowLiveReason(state: string): string {
+  return `its own row read ${state}, live out of pending`
+}
+
+/** What ended a stuck-launch episode, in its line: the persona latched. */
+export const STUCK_LAUNCH_END_LATCHED = 'the persona latched'
+
+/** The line for persona `key`'s open stuck-launch episode ended for `reason`. */
+export function stuckLaunchEpisodeEndedLine(key: string, reason: string): string {
+  return `${stuckLaunchLineHead(key)} episode ended — ${reason}`
+}
+
+/**
+ * End persona `key`'s open stuck-launch episode silently (b.jg5 SRJ-1016):
+ * nothing is posted; one line ({@link stuckLaunchEpisodeEndedLine}) when one
+ * was open. A later post begins a new episode, whose texts post again.
+ * Answers whether one was open. Never throws.
+ */
+export function endStuckLaunchEpisode(
+  episodes: Pick<PersonaEpisodes, 'end'>,
+  key: string,
+  reason: string,
+  log: (line: string) => void,
+): boolean {
+  try {
+    if (!episodes.end(key, STUCK_LAUNCH_KIND)) return false
+    safePendingRowLog(log, stuckLaunchEpisodeEndedLine(key, reason))
+    return true
+  } catch (err) {
+    safePendingRowLog(log, stuckLaunchEpisodeEndFailedLine(key, describeThrownValue(err)))
+    return false
+  }
+}
+
+/**
+ * The latch's hold for the stuck-launch episode (b.jg5 SRJ-1016): end
+ * persona `key`'s episode silently, with {@link STUCK_LAUNCH_END_LATCHED}.
+ * `main()` binds it into the latch's hold observer
+ * (`ConflictLatchHolds.endStuckLaunch`, `src/conflict-latch.ts`) over its
+ * notice episodes; the recovery harness composes the same call. Never throws.
+ */
+export function endStuckLaunchEpisodeForLatch(episodes: Pick<PersonaEpisodes, 'end'>, key: string, log: (line: string) => void): void {
+  endStuckLaunchEpisode(episodes, key, STUCK_LAUNCH_END_LATCHED, log)
 }

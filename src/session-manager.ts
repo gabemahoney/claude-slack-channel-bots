@@ -427,6 +427,7 @@ import {
   personaTmuxSessionName,
   renderPersonaRef,
   resolveClaudeConfigDir,
+  tmuxExactSessionTarget,
 } from './persona-identity.ts'
 import { getClient } from './agent-director-client.ts'
 import {
@@ -531,6 +532,7 @@ import {
   createUnclassifiedErrorEpisodes,
   type KillFailureAlerts,
   type KillFailureEndReason,
+  type PersonaEpisodes,
   type PersonaEpisodesClock,
   type UnclassifiedErrorEpisodes,
 } from './persona-episodes.ts'
@@ -790,9 +792,13 @@ import {
   armPendingRowWait,
   decidePendingRowCover,
   describeLaunchStartForLog,
+  endStuckLaunchEpisode,
   isLaunchStartInWindow,
   isPendingRowAged,
+  isStuckLaunchEpisodeEndState,
+  launchStartInstantOf,
   parseLaunchStart,
+  stuckLaunchEndRowLiveReason,
   type LaunchCallWindow,
   type PendingRowCover,
   type PendingRowFields,
@@ -2299,6 +2305,37 @@ function endKillFailureEpisodeOnRead(key: string, answer: { readonly state: unkn
   }
 }
 
+/**
+ * The server's one notice episodes instance, for the stuck-launch episode
+ * (b.jg5 SRJ-1016, SRJ-1017; `createPersonaEpisodes`,
+ * `src/persona-episodes.ts`). Production installs `main()`'s notice episodes
+ * (`setStuckLaunchEpisodes`), before the start pass. Every own-row read that
+ * reads the row live out of `pending` ends the persona's stuck-launch
+ * episode through it (`endStuckLaunchEpisodeOnRead`). With none installed
+ * (unit tests, the integration driver) no episode is ended.
+ */
+let stuckLaunchEpisodes: PersonaEpisodes | undefined
+
+/** Install the notice episodes the stuck-launch episode lives in (production: `main()`), or remove them with undefined. */
+export function setStuckLaunchEpisodes(episodes: PersonaEpisodes | undefined): void {
+  stuckLaunchEpisodes = episodes
+}
+
+/**
+ * The stuck-launch episode's end at a read of persona `key`'s own row
+ * (b.jg5 SRJ-1016): a row read `waiting`, `working`, `ask_user` or
+ * `check_permission` (`isStuckLaunchEpisodeEndState`) ends the persona's open
+ * episode silently, through the installed episodes, with one line when one
+ * was open (`endStuckLaunchEpisode`). Nothing else ends it here: not
+ * `pending`, `ended`, `missing`, no row (`ErrSpawnNotFound`), a failed read
+ * or a kill. Never throws.
+ */
+function endStuckLaunchEpisodeOnRead(key: string, state: unknown): void {
+  const episodes = stuckLaunchEpisodes
+  if (episodes === undefined || !isStuckLaunchEpisodeEndState(state)) return
+  endStuckLaunchEpisode(episodes, key, stuckLaunchEndRowLiveReason(state as string), (line) => console.error(line))
+}
+
 /** `readPersonaOwnRow` read the row: `latched` is true when this read latched the persona. */
 export const OWN_ROW_READ_ROW = 'row'
 /** `readPersonaOwnRow`'s `get` answered `ErrSpawnNotFound`: the row is absent. */
@@ -2410,6 +2447,10 @@ function ownRowActGoes(key: string, at: OwnRowReadSite): boolean {
  * `cwd` becomes the held directory (`noteOldLifeRowRead`; b.jg5 SRJ-809).
  * While the persona holds a "this launch's row" record (b.jg5 SRJ-407), the
  * read applies SRJ-310's third end rule to it (`checkThisLaunchRowOnRead`).
+ * A row read `waiting`, `working`, `ask_user` or `check_permission` ends the
+ * persona's stuck-launch episode silently (`endStuckLaunchEpisodeOnRead`;
+ * b.jg5 SRJ-1016); `pending`, `ended`, `missing`, no row and a failed read
+ * do not.
  *
  * When `at.actGoes` answers that the caller has stopped once the `get`
  * settles (`ownRowActGoes`; b.jg5 SRJ-714), nothing below is acted on: no
@@ -2479,6 +2520,8 @@ export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promis
   if (!ownRowActGoes(key, at)) return { kind: OWN_ROW_READ_ROW, row, latched: false }
   // b.jg5 SRJ-704, SRJ-1016: a row read `ended` or `missing` ends the kill-failure episode.
   endKillFailureEpisodeOnRead(key, { state: row.state })
+  // b.jg5 SRJ-1016: a row read live out of `pending` ends the stuck-launch episode.
+  endStuckLaunchEpisodeOnRead(key, row.state)
   // b.jg5 SRJ-809: a row read `ended` or `missing` ends an old-life hold on
   // it, and a live one's `cwd` becomes the held directory.
   noteOldLifeRowRead(personaInstanceId(key), { kind: OLD_LIFE_ROW_READ_STATE, state: row.state, cwd: row.cwd }, oldLifeReadName(at))
@@ -2743,6 +2786,11 @@ export type OwnRowStatusAnswer =
  *     state keeps it. So every own-row `status` the server makes ends the
  *     hold this way: the shared own-row `status` read, a persona kill
  *     retry's between-try read, and the liveness and reconnect adapters.
+ *   - A returned result reading `waiting`, `working`, `ask_user` or
+ *     `check_permission` ends the persona's stuck-launch episode silently
+ *     (`endStuckLaunchEpisodeOnRead`; b.jg5 SRJ-1016), whoever made the
+ *     call, the liveness and reconnect adapters included; `pending`,
+ *     `ended`, `missing`, `ErrSpawnNotFound` and a failed read do not.
  *   - While the persona holds a "this launch's row" record (b.jg5 SRJ-407),
  *     the answer applies SRJ-310's third end rule to it
  *     (`checkThisLaunchRowOnRead`), so every own-row `status` the server
@@ -2760,6 +2808,9 @@ export function applyOwnRowStatusStep(key: string, answer: OwnRowStatusAnswer, a
     // b.jg5 SRJ-704, SRJ-1016: a row read `ended` or `missing`, or gone, ends
     // the persona's kill-failure episode, whoever made the call.
     endKillFailureEpisodeOnRead(key, 'thrown' in answer ? { thrown: answer.thrown } : { state: answer.result.state })
+    // b.jg5 SRJ-1016: a row read live out of `pending` ends the stuck-launch
+    // episode, whoever made the call.
+    if (!('thrown' in answer)) endStuckLaunchEpisodeOnRead(key, answer.result.state)
     // b.jg5 SRJ-809: a row read `ended` or `missing`, or gone, ends an
     // old-life hold on it, whoever made the call.
     noteOldLifeStatusAnswer(key, answer, at)
@@ -3220,22 +3271,6 @@ export function _setTmuxCommandRunner(fn: TmuxCommandRunner): void {
 /** Test-only seam: restore the default tmux command runner. */
 export function _resetTmuxCommandRunner(): void {
   _runTmux = defaultRunTmux
-}
-
-/**
- * tmux resolves a bare `-t <name>` to the session with that exact name when
- * there is one, and otherwise to the one session whose name starts with it.
- * Persona keys can prefix one another (`dev`, `dev_2`), so a bare
- * `slack_bot_dev` reaches `slack_bot_dev_2` whenever `slack_bot_dev` is gone:
- * an operator's `attach` would reach the neighbour's bot. A `=` prefix accepts only
- * the exact name (b.1ix). Verified against tmux 3.2a, the version in the
- * `/ci` image.
- *
- * The `attach` command the not-connected notices give an operator names
- * its session target as `=<name>`.
- */
-function tmuxExactSessionTarget(sessionName: string): string {
-  return `=${sessionName}`
 }
 
 // ---------------------------------------------------------------------------
@@ -4390,7 +4425,11 @@ function approverStopOrLatched(ctx: ApproverContext): ApproverStopReason | undef
  *   - GONE, or `ErrSpawnNotFound` from `read-pane` or `send-keys`: stop
  *     (`gone`);
  *   - `ErrSpawnNotInteractive`: stop with nothing typed and nothing killed
- *     (`not-interactive`);
+ *     (`not-interactive`); from `send-keys` only, the launch start the first
+ *     lap kept is also recorded as a launch that met it
+ *     (`recordSendKeysNotInteractive`; b.jg5 SRJ-118, SRJ-412, SRJ-1017),
+ *     even when a stop asked during that call decides the stop's reason; a
+ *     `read-pane` answer of that name records nothing;
  *   - CONFLICT: the persona latches through the latch's CONFLICT entry
  *     (`setFromConflict`) with the refused operation "P's next check or
  *     recovery" and the recorded state `pending` (unreadable for a `status`
@@ -4664,6 +4703,10 @@ async function approverLap(ctx: ApproverContext): Promise<ApproverStopReason | A
       client.sendKeys({ claude_instance_id, text: '', allow_pending: true }),
     )
   } catch (err) {
+    // b.jg5 SRJ-118, SRJ-412, SRJ-1017: a `send-keys` that answered
+    // `ErrSpawnNotInteractive` makes this launch (the launch start the first
+    // lap kept) no longer CSCB's own, whatever stops the approver.
+    if (hasAdErrorName(err, ERR_SPAWN_NOT_INTERACTIVE_NAME)) recordSendKeysNotInteractive(key, run.launchStartMs)
     if (run.stopRequested !== undefined) return approverStoppedDuringCall(ctx, 'send-keys', err, run.stopRequested)
     const answer = approverAnswerTo(ctx, 'send-keys', err)
     return 'stop' in answer ? answer.stop : { ...goesOn, backOff: answer.backOff }
@@ -12087,14 +12130,62 @@ export function launchCallWindowOf(key: string): LaunchCallWindowRecord | undefi
 }
 
 /**
- * Forget persona `key`'s launch-call window and its "this launch's row"
- * record (b.jg5 SRJ-407, SRJ-310), as its teardown does
+ * Forget persona `key`'s launch-call window, its "this launch's row"
+ * record (b.jg5 SRJ-407, SRJ-310) and its record of a launch whose
+ * `send-keys` answered `ErrSpawnNotInteractive` (b.jg5 SRJ-412), as its
+ * teardown does
  * (`killPersonaInstanceForTeardown`, which runs once the persona's launch in
  * flight has settled). Silent; never throws.
  */
 export function forgetLaunchCalls(key: string): void {
   launchCallWindows.delete(key)
   thisLaunchRows.delete(key)
+  notInteractiveLaunches.delete(key)
+}
+
+/**
+ * Each persona's latest launch whose `send-keys` answered
+ * `ErrSpawnNotInteractive` (b.jg5 SRJ-118, SRJ-412, SRJ-1017): the launch
+ * start of that launch (epoch ms), kept beside the launch-in-flight state,
+ * in memory only (a server restart forgets it). Set by
+ * `recordSendKeysNotInteractive` (the dialog approver's `send-keys`; the
+ * pending-row lap's), a later record replacing it; read by
+ * `launchMetSendKeysNotInteractive`. Forgotten at the persona's teardown's
+ * kill (`forgetLaunchCalls`) and by `_resetInFlightLaunches`. A new launch
+ * call keeps it: the record names its launch by its launch start, so a new
+ * launch, with a new launch start, reads no.
+ */
+const notInteractiveLaunches = new Map<string, number>()
+
+/**
+ * Record that a `send-keys` on persona `key`'s row answered
+ * `ErrSpawnNotInteractive` during the launch whose launch start is
+ * `launchStart` (b.jg5 SRJ-118, SRJ-412, SRJ-1017), raw or parsed
+ * (`launchStartInstantOf`): the session holding the name is not that
+ * launch's. Replaces the persona's earlier record. A launch start that is
+ * absent or does not parse records nothing (an approver that never read
+ * one). Only a `send-keys` answer counts: a `read-pane` or `status` answer
+ * of that name is never recorded (SRJ-412, SRJ-1017). Silent; never throws.
+ */
+export function recordSendKeysNotInteractive(key: string, launchStart: unknown): void {
+  const launchStartMs = launchStartInstantOf(launchStart)
+  if (launchStartMs === undefined) return
+  notInteractiveLaunches.set(key, launchStartMs)
+}
+
+/**
+ * Whether persona `key`'s launch with the launch start `launchStart`, raw
+ * or parsed, met a `send-keys` that answered `ErrSpawnNotInteractive`
+ * (b.jg5 SRJ-118, SRJ-412, SRJ-1017): true only when the persona's record
+ * names that instant (`launchStartInstantOf`, so both launch-start forms of
+ * one instant match); false for any other launch start, for one that is
+ * absent or does not parse, and when no record is kept. Read-only; never
+ * throws.
+ */
+export function launchMetSendKeysNotInteractive(key: string, launchStart: unknown): boolean {
+  const recorded = notInteractiveLaunches.get(key)
+  if (recorded === undefined) return false
+  return launchStartInstantOf(launchStart) === recorded
 }
 
 /**
@@ -12249,8 +12340,9 @@ const inFlightLaunches = new Map<string, Promise<SpawnPersonaResult>>()
 
 /**
  * Test-only seam: forget every in-flight launch (and, b.f2b, every cancel of
- * a wait one had not started), every launch call's window and every "this
- * launch's row" record (b.jg5 SRJ-407); cancel, wake and forget every running wait for
+ * a wait one had not started), every launch call's window, every "this
+ * launch's row" record (b.jg5 SRJ-407) and every record of a launch whose
+ * `send-keys` answered `ErrSpawnNotInteractive` (b.jg5 SRJ-412); cancel, wake and forget every running wait for
  * a `working` row, as `cancelWorkingRowWait` does but without its log line, so
  * the wait types nothing more and returns `cancelled` instead of polling on
  * to its deadline; and stop and forget every dialog approver
@@ -12261,6 +12353,7 @@ export function _resetInFlightLaunches(): void {
   cancelledLaunchWaits.clear()
   launchCallWindows.clear()
   thisLaunchRows.clear()
+  notInteractiveLaunches.clear()
   for (const wait of workingRowWaits.values()) {
     wait.cancelled = true
     wait.wake()

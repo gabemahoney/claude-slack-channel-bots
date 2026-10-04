@@ -178,6 +178,32 @@ export function personaTmuxSessionName(key: string): string {
 }
 
 /**
+ * `<session>` in a notice about persona `key` (b.jg5 SRJ-1001): its tmux
+ * session name in double quotes, `"slack_bot_<key>"`. The one rendering the
+ * `tmux-unresponsive` notices and the stuck-launch post share.
+ */
+export function quotedPersonaSessionName(key: string): string {
+  return `"${personaTmuxSessionName(key)}"`
+}
+
+/**
+ * tmux resolves a bare `-t <name>` to the session with that exact name when
+ * there is one, and otherwise to the one session whose name starts with it.
+ * Persona keys can prefix one another (`dev`, `dev_2`), so a bare
+ * `slack_bot_dev` reaches `slack_bot_dev_2` whenever `slack_bot_dev` is gone:
+ * an operator's `attach` would reach the neighbour's bot. A `=` prefix accepts only
+ * the exact name (b.1ix). Verified against tmux 3.2a, the version in the
+ * `/ci` image.
+ *
+ * Every `attach` command a notice gives an operator (the not-connected
+ * notices, the stuck-launch post's held text) names its session target as
+ * `=<name>`.
+ */
+export function tmuxExactSessionTarget(sessionName: string): string {
+  return `=${sessionName}`
+}
+
+/**
  * Resolve the effective claude_config_dir lexically.
  *
  * An absent (or empty) `configDir` means neither the persona nor the top level

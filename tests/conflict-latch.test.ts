@@ -37,7 +37,7 @@
  * the pointer and no "Operator actions"; "another agent-director store": its
  * must-not-be-ended line, then the pointer, then the `list` line); CSCB's own
  * lines (`cscbOwnLines`) match none of `SESSION_ENDING_COMMAND_FORMS` and none
- * of this file's `CSCB_OWN_LINE_FORBIDDEN` (kill-pane, set-option,
+ * of the helper's `CSCB_OWN_LINE_FORBIDDEN` (kill-pane, set-option,
  * agent-director delete, clear-latch, has-session, a label option name), while
  * the quoted "no kill was sent" is let through; the description is redacted,
  * capped and escaped once for Slack (the log line stays unescaped), and a
@@ -162,7 +162,10 @@
  * four holds (the timer's stop, the condition's end, the unclassified end and
  * the slow-recovery end) run for the persona in that order, before a notice
  * observer bound after them; a hold that throws is logged and the next still
- * runs; holds with no slow-recovery end run the other three. The latch's
+ * runs; holds with no slow-recovery end run the other three. With the
+ * stuck-launch end bound it runs fifth, after the slow-recovery end, on a
+ * latch, a relatch and a same-case set alike, and still runs when an
+ * earlier hold throws; one that throws is logged under its name. The latch's
  * slow-recovery end on `makeRecoveryHarness` (SRJ-610, SRJ-1016, SRJ-502):
  * P's and Q's rows read `working` with their panes gone, so three restart
  * runs each escalate dead with a live re-probe and open both slow-recovery
@@ -172,6 +175,16 @@
  * lines and no slow-recovery post, exactly one CONFLICT post follows, later
  * runs for P are latched and post nothing, and Q keeps its count and open
  * episode; the harness's cleanup leaves no count or episode behind.
+ *
+ * The latch's stuck-launch end on `makeRecoveryHarness` (SRJ-1016, SRJ-502):
+ * P's and Q's stuck-launch posts (`postStuckLaunchHeld`,
+ * `postStuckLaunchRelaunching` over the harness's episodes) open both
+ * episodes; P's latch (a plain-spawn `scan-leftover` CONFLICT, whose
+ * latch-time read finds no row), and separately P's relatch with a new case
+ * (a `provenance_conflict` note on its own `ended` row, after a first latch),
+ * end P's episode by the CONFLICT notice, with one line carrying the latched
+ * reason and no post from the end; Q's episode stays open; a later post of
+ * the same text for P posts again.
  *
  * A lost message while latched (SRJ-502, SRJ-1011, AC 68, on
  * `makeRecoveryHarness` with both settings 0): P latches through the launch
@@ -329,7 +342,7 @@ import {
   PLAIN_SPAWN_LABEL_NOT_THIS_ID_PHRASE,
   RETRY_KILL_LATER_PHRASE,
 } from '../src/ad-description-phrases.ts'
-import { adAlertThresholdMsInEffect } from '../src/ad-settings.ts'
+import { adAlertThresholdMsInEffect, adLaunchBoundMsInEffect } from '../src/ad-settings.ts'
 import type { Phase1GetResult, Phase1ListRow } from '../src/ad-phase1-types.ts'
 import { ERR_TMUX_SESSION_CONFLICT_NAME } from '../src/agent-director-errors.ts'
 import {
@@ -441,12 +454,25 @@ import {
   LIVENESS_DEAD_ROW_MISSING,
 } from '../src/liveness-reading.ts'
 import { MAX_LOGGED_MESSAGE_LENGTH, renderLogMessageText } from '../src/persona-connection-errors.ts'
+import { getOutageFlags } from '../src/outage-state.ts'
+import {
+  STUCK_LAUNCH_ALREADY_POSTED,
+  STUCK_LAUNCH_END_LATCHED,
+  STUCK_LAUNCH_POSTED,
+  postStuckLaunchHeld,
+  postStuckLaunchRelaunching,
+  stuckLaunchEpisodeEndedLine,
+  stuckLaunchHeldText,
+  stuckLaunchRelaunchingText,
+  type StuckLaunchPosterDeps,
+} from '../src/pending-row.ts'
 import { formatPersonaNotice } from '../src/persona-notifier.ts'
 import {
   createPersonaEpisodes,
   PERSONA_EPISODE_KIND_CONFLICT,
   PERSONA_EPISODE_KIND_LAUNCH_START_NOT_RECORDED,
   PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY,
+  PERSONA_EPISODE_KIND_STUCK_LAUNCH,
   PERSONA_EPISODE_KIND_UNUSABLE_RECORDED_NAME,
   TMUX_UNRESPONSIVE_END_LATCHED,
   UNCLASSIFIED_ERROR_END_LATCHED,
@@ -563,6 +589,7 @@ import {
   sequenceKillConflictRowsAt,
   SESSION_ENDING_COMMAND_FORMS,
   UNUSABLE_NAME_CASE_ROWS,
+  cscbOwnLineForbiddenIn,
   cscbOwnLines,
   cscbOwnText,
   expectedConflictNotice,
@@ -1368,31 +1395,12 @@ describe('the CONFLICT notice by row', () => {
 // No session-ending command in CSCB's own lines (SRJ-1001, SRJ-1004; AC 40)
 // ---------------------------------------------------------------------------
 
-/**
- * What CSCB's own notice and recovery lines never spell, beyond SR-1.4's five
- * session-ending forms (SRJ-1001; SRJ-716's label option names): a pane kill,
- * a tmux option write, an agent-director row delete, the latch-clearing
- * command, a session probe, and either label option's name.
- */
-const CSCB_OWN_LINE_FORBIDDEN: readonly RegExp[] = [
-  /kill-pane/i,
-  /set-option/i,
-  /agent-director\s+delete/i,
-  /clear-latch|clear_latch|clearLatch/,
-  /has-session/i,
-  /ad_owner|ad_pane/,
-]
-
-/** Each `CSCB_OWN_LINE_FORBIDDEN` entry a line matches, with the line, so a failure names both. */
-const forbiddenIn = (line: string): string[] =>
-  CSCB_OWN_LINE_FORBIDDEN.filter((pattern) => pattern.test(line)).map((pattern) => `${pattern} in ${JSON.stringify(line)}`)
-
 describe('no session-ending command', () => {
   test.each(ROWS)('%s: CSCB\'s own lines name no session-ending command, no --include-finished, and no kill-pane, set-option, agent-director delete, clear-latch, has-session or label option', (_name, row) => {
     const own = cscbOwnLines(conflictNoticeText({ sessionName: row.sessionName, latchCase: row.latchCase, description: descriptionOf(row) }))
     expect(own.length).toBe(row.notice.lines.length - 1)
     expect(own.flatMap(sessionEndingCommandsIn)).toEqual([])
-    expect(own.flatMap(forbiddenIn)).toEqual([])
+    expect(own.flatMap(cscbOwnLineForbiddenIn)).toEqual([])
   })
 
   /** One sample per spelling the forbidden list names; each matches exactly one entry. */
@@ -1410,8 +1418,8 @@ describe('no session-ending command', () => {
 
   test.each(FORBIDDEN_SAMPLES.map((sample) => [sample]))('%p in a line of CSCB\'s own is caught; in the quoted description it is let through', (sample) => {
     const notice = conflictNoticeText({ sessionName: STUB_TMUX_SESSION_NAME, latchCase: LATCH_CASE_OWN_ID, description: sample })
-    expect(cscbOwnLines(notice).flatMap(forbiddenIn)).toEqual([])
-    expect(cscbOwnLines(`${notice}${CONFLICT_NOTICE_LINE_SEPARATOR}${sample}`).flatMap(forbiddenIn).length).toBe(1)
+    expect(cscbOwnLines(notice).flatMap(cscbOwnLineForbiddenIn)).toEqual([])
+    expect(cscbOwnLines(`${notice}${CONFLICT_NOTICE_LINE_SEPARATOR}${sample}`).flatMap(cscbOwnLineForbiddenIn).length).toBe(1)
   })
 
   test('the never-reported-in and not-this-launch kill rows quote "no kill was sent", and the check lets it through', () => {
@@ -1651,7 +1659,7 @@ describe('the recovery notice', () => {
     )
     expect(text.includes(name)).toBe(kind === LATCH_KIND_CONFLICT)
     expect(sessionEndingCommandsIn(text)).toEqual([])
-    expect(text.split(CONFLICT_NOTICE_LINE_SEPARATOR).flatMap(forbiddenIn)).toEqual([])
+    expect(text.split(CONFLICT_NOTICE_LINE_SEPARATOR).flatMap(cscbOwnLineForbiddenIn)).toEqual([])
   })
 
   test('each case maps to its latch kind: the two hold cases to hold, every other case to conflict', () => {
@@ -1723,7 +1731,7 @@ describe('the unusable-recorded-name hold: SRJ-1019\'s notice, the record and th
     expect(own.includes(row.description)).toBe(false)
     expect(own.includes(personaInstanceId(KEY))).toBe(true)
     expect(sessionEndingCommandsIn(own)).toEqual([])
-    expect(own.split(CONFLICT_NOTICE_LINE_SEPARATOR).flatMap(forbiddenIn)).toEqual([])
+    expect(own.split(CONFLICT_NOTICE_LINE_SEPARATOR).flatMap(cscbOwnLineForbiddenIn)).toEqual([])
   })
 
   test('a token-bearing description is redacted in the notice and the post passes assertNoLeak; an overlong one is capped at MAX_LOGGED_MESSAGE_LENGTH before it is quoted', () => {
@@ -1878,8 +1886,14 @@ describe('the unusable-recorded-name notice\'s episode (SRJ-508, SRJ-1016)', () 
 // The holds' set observer (SRJ-502; SRJ-610 and SRJ-1016's slow-recovery end)
 // ---------------------------------------------------------------------------
 
-/** The holds as `bindConflictLatchHolds` takes them, each recording `[hold, key]` in `calls`; `slowRecovery: false` leaves the optional slow-recovery end out. */
-function recordingHolds(calls: Array<readonly [string, string]>, opts: { slowRecovery?: boolean; throwAt?: keyof ConflictLatchHolds } = {}): ConflictLatchHolds {
+/**
+ * The holds as `bindConflictLatchHolds` takes them, each recording `[hold, key]` in `calls`;
+ * `slowRecovery: false` leaves the optional slow-recovery end out, and `stuckLaunch: true` adds the optional stuck-launch end.
+ */
+function recordingHolds(
+  calls: Array<readonly [string, string]>,
+  opts: { slowRecovery?: boolean; stuckLaunch?: boolean; throwAt?: keyof ConflictLatchHolds } = {},
+): ConflictLatchHolds {
   const hold = (name: keyof ConflictLatchHolds) => (key: string): void => {
     calls.push([name, key])
     if (opts.throwAt === name) throw new Error(`${name} failed`)
@@ -1889,6 +1903,7 @@ function recordingHolds(calls: Array<readonly [string, string]>, opts: { slowRec
     endTmuxUnresponsive: hold('endTmuxUnresponsive'),
     endUnclassifiedError: hold('endUnclassifiedError'),
     ...(opts.slowRecovery === false ? {} : { endSlowRecovery: hold('endSlowRecovery') }),
+    ...(opts.stuckLaunch === true ? { endStuckLaunch: hold('endStuckLaunch') } : {}),
   }
 }
 
@@ -1918,6 +1933,49 @@ describe('the holds\' set observer: the slow-recovery end is the fourth hold (SR
     latchOnRow(latch, KEY, ROWS[0]![1])
     expect(calls.map(([name]) => name)).toEqual(['stopRetryTimer', 'endTmuxUnresponsive', 'endUnclassifiedError'])
     expect(lines.filter((line) => line.includes(' hold failed '))).toEqual([])
+  })
+})
+
+describe('the holds\' set observer: the stuck-launch end is the fifth hold (SRJ-502, SRJ-1016)', () => {
+  test('on a latch, a relatch and a same-case set the five holds run for the persona in order, the stuck-launch end last, before a notice observer bound after them; a throwing slow-recovery end is logged and the stuck-launch end still runs', () => {
+    const { latch, lines } = makeLatchRun()
+    const calls: Array<readonly [string, string]> = []
+    bindConflictLatchHolds(latch, recordingHolds(calls, { stuckLaunch: true, throwAt: 'endSlowRecovery' }), (line) => lines.push(line))
+    latch.addSetObserver(({ key }) => {
+      calls.push(['notice', key])
+    })
+    const first = ROWS[0]![1]
+    const other = rowWhere((row) => row.latchCase !== first.latchCase)
+    const fiveHolds: Array<readonly [string, string]> = [
+      ['stopRetryTimer', KEY],
+      ['endTmuxUnresponsive', KEY],
+      ['endUnclassifiedError', KEY],
+      ['endSlowRecovery', KEY],
+      ['endStuckLaunch', KEY],
+      ['notice', KEY],
+    ]
+    expect([latchOnRow(latch, KEY, first), latchOnRow(latch, KEY, other), latchOnRow(latch, KEY, other)]).toEqual([
+      CONFLICT_LATCH_SET_LATCHED,
+      CONFLICT_LATCH_SET_RELATCHED,
+      CONFLICT_LATCH_SET_SAME_CASE,
+    ])
+    expect(calls).toEqual([...fiveHolds, ...fiveHolds, ...fiveHolds])
+    expect(lines.filter((line) => line.includes(' hold failed '))).toEqual(
+      [1, 2, 3].map(() => expect.stringContaining(`persona=${KEY} hold failed (slow-recovery end): `)),
+    )
+  })
+
+  test('a stuck-launch end that throws is logged under its name and the next set still runs every hold', () => {
+    const { latch, lines } = makeLatchRun()
+    const calls: Array<readonly [string, string]> = []
+    bindConflictLatchHolds(latch, recordingHolds(calls, { stuckLaunch: true, throwAt: 'endStuckLaunch' }), (line) => lines.push(line))
+    latchOnRow(latch, KEY, ROWS[0]![1])
+    latchOnRow(latch, OTHER, ROWS[0]![1])
+    expect(calls.filter(([name]) => name === 'endStuckLaunch')).toEqual([['endStuckLaunch', KEY], ['endStuckLaunch', OTHER]])
+    expect(lines.filter((line) => line.includes(' hold failed '))).toEqual([
+      expect.stringContaining(`persona=${KEY} hold failed (stuck-launch end): `),
+      expect.stringContaining(`persona=${OTHER} hold failed (stuck-launch end): `),
+    ])
   })
 })
 
@@ -2421,6 +2479,121 @@ describe('SRJ-610, SRJ-1016, SRJ-502: P\'s latch ends its open slow-recovery epi
       h.cleanup()
     }
     expect([h.slowRecovery.count(q), h.slowRecovery.isOpen(q), h.clock.pendingCount()]).toEqual([0, false, 0])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SRJ-1016, SRJ-502: a latch, and a relatch with a new case, end P's open
+// stuck-launch episode silently, through the harness's hold observer as
+// main() binds it; a later post of the same text posts again; Q's episode is
+// left as it is
+// ---------------------------------------------------------------------------
+
+describe('SRJ-1016, SRJ-502: P\'s latch and relatch end its open stuck-launch episode silently; a later post posts again; Q\'s is untouched (recovery harness)', () => {
+  const STUCK = PERSONA_EPISODE_KIND_STUCK_LAUNCH
+  /** P's first latch: the plain first spawn meets the pre-spawn scan's leftover. */
+  const leftoverRow = rowWhere(
+    (row) => row.refusedOperation === REFUSED_OPERATION_PLAIN_SPAWN && row.stubCase === 'scan-leftover' && row.rowState === LATCH_ROW_STATE_NO_ROW,
+  )
+  /** The leftover's script: the latch-time `status` read finds no row, as after the scan's refusal, so no read ends a stuck-launch episode and the end is the latch's. */
+  const leftoverLatch = (): RecoveryStubScript => ({ spawnError: leftoverRow.build(), statusError: errSpawnNotFound() })
+  /** The reading site the own-row read's lines name. */
+  const SITE: OwnRowReadSite = { site: 'conflict-latch.test', what: 'own-row get' }
+
+  /** A recovery harness, cleaned up and leak-checked in `afterEach`, and the posters' dependencies over its episodes, as the rule binds them. */
+  function makeStuckRun(): { h: RecoveryHarness; p: string; q: string; deps: StuckLaunchPosterDeps } {
+    const h = makeRecoveryHarness()
+    harnesses.push(h)
+    const [p, q] = h.keys as [string, string]
+    const deps: StuckLaunchPosterDeps = {
+      episodes: h.episodes,
+      tmuxUnavailableRaised: (key) => getOutageFlags(key).has('tmux-unavailable'),
+      log: (line) => h.lines.push(line),
+    }
+    return { h, p, q, deps }
+  }
+
+  /** `key`'s held post for the stub's launch start, in the attach-line form. */
+  const heldPost = (key: string) => ({ key, text: stuckLaunchHeldText(key, SAMPLE_LAUNCH_START_DEFAULT, false) })
+  /** `key`'s stuck-launch episode-end lines among `lines`, whatever the reason. */
+  const endedLinesOf = (lines: readonly string[], key: string): string[] =>
+    lines.filter((line) => line.startsWith(stuckLaunchEpisodeEndedLine(key, '')))
+  /** Record P's and Q's episode state when the next episode notice is posted (the CONFLICT notice, after every hold). */
+  function stateAtNotice(h: RecoveryHarness, p: string, q: string): unknown[] {
+    const atNotice: unknown[] = []
+    const post = h.episodeNotices.push.bind(h.episodeNotices)
+    h.episodeNotices.push = (...notices) => {
+      atNotice.push([h.episodes.isOpen(p, STUCK), h.episodes.isOpen(q, STUCK)])
+      return post(...notices)
+    }
+    return atNotice
+  }
+
+  test('a latch: P\'s and Q\'s held posts open their episodes; P\'s CONFLICT latches it, and by the CONFLICT notice P\'s episode is closed with one latched-reason line and no post from the end; Q\'s stays open; P\'s later held post posts again', async () => {
+    const { h, p, q, deps } = makeStuckRun()
+    expect([postStuckLaunchHeld(deps, p, SAMPLE_LAUNCH_START_DEFAULT, false), postStuckLaunchHeld(deps, q, SAMPLE_LAUNCH_START_DEFAULT, false)]).toEqual([
+      STUCK_LAUNCH_POSTED,
+      STUCK_LAUNCH_POSTED,
+    ])
+    expect([h.episodes.isOpen(p, STUCK), h.episodes.isOpen(q, STUCK)]).toEqual([true, true])
+    // Once per episode: the same text again posts nothing.
+    expect(postStuckLaunchHeld(deps, p, SAMPLE_LAUNCH_START_DEFAULT, false)).toBe(STUCK_LAUNCH_ALREADY_POSTED)
+    expect(h.episodeNotices).toEqual([heldPost(p), heldPost(q)])
+
+    const atNotice = stateAtNotice(h, p, q)
+    const linesBefore = h.lines.length
+    h.script(leftoverLatch())
+    expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
+    expect(h.latch.record(p)).toMatchObject({ latchCase: leftoverRow.latchCase, rowState: LATCH_ROW_STATE_NO_ROW })
+    // The hold is not recorded in latchEvents: one latch is still the set, three holds and the notice.
+    expect(latchSteps(h)).toEqual(oneLatch(p))
+    // By the notice P's episode was ended; Q's was not.
+    expect(atNotice).toEqual([[false, true]])
+    // Silently: the only new post is the CONFLICT notice; one ended line, with the latched reason.
+    expect(h.episodeNotices).toEqual([heldPost(p), heldPost(q), { key: p, text: leftoverRow.notice.text }])
+    expect(endedLinesOf(h.lines.slice(linesBefore), p)).toEqual([stuckLaunchEpisodeEndedLine(p, STUCK_LAUNCH_END_LATCHED)])
+    expect(endedLinesOf(h.lines, q)).toEqual([])
+    expect([h.episodes.isOpen(p, STUCK), h.episodes.isOpen(q, STUCK)]).toEqual([false, true])
+
+    // A later post of the same text begins a new episode and posts again; Q's episode still holds its post.
+    expect(postStuckLaunchHeld(deps, p, SAMPLE_LAUNCH_START_DEFAULT, false)).toBe(STUCK_LAUNCH_POSTED)
+    expect(postStuckLaunchHeld(deps, q, SAMPLE_LAUNCH_START_DEFAULT, false)).toBe(STUCK_LAUNCH_ALREADY_POSTED)
+    expect(h.episodeNotices).toEqual([heldPost(p), heldPost(q), { key: p, text: leftoverRow.notice.text }, heldPost(p)])
+    expect(h.episodes.isOpen(p, STUCK)).toBe(true)
+  })
+
+  test('a relatch with a new case: P latched first, then its held post opens an episode; a provenance_conflict note on P\'s own ended row relatches it, and by the new CONFLICT notice P\'s episode is closed with one latched-reason line and no post from the end; Q\'s stays open; P\'s later held post posts again', async () => {
+    const { h, p, q, deps } = makeStuckRun()
+    h.script(leftoverLatch())
+    expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
+    // The first latch ended no stuck-launch episode: none was open.
+    expect(endedLinesOf(h.lines, p)).toEqual([])
+
+    // P's own stuck launch gets the relaunching text; Q's row the held text.
+    const relaunchingPost = { key: p, text: stuckLaunchRelaunchingText(p, adLaunchBoundMsInEffect()) }
+    expect([postStuckLaunchRelaunching(deps, p, adLaunchBoundMsInEffect()), postStuckLaunchHeld(deps, q, SAMPLE_LAUNCH_START_DEFAULT, false)]).toEqual([
+      STUCK_LAUNCH_POSTED,
+      STUCK_LAUNCH_POSTED,
+    ])
+    expect([h.episodes.isOpen(p, STUCK), h.episodes.isOpen(q, STUCK)]).toEqual([true, true])
+
+    // An `ended` read ends no stuck-launch episode by itself (SRJ-1016), so the end below is the relatch's.
+    const atNotice = stateAtNotice(h, p, q)
+    const linesBefore = h.lines.length
+    h.script({ spawnError: undefined, getResult: cannedGetResult({ state: 'ended', liveness_note: provenanceNote }, personaOf(h, p), h.home) })
+    expect(await readPersonaOwnRow(p, SITE)).toMatchObject({ kind: OWN_ROW_READ_ROW, latched: true })
+    expect(h.latch.record(p)?.latchCase).toBe(LATCH_CASE_CONFLICTING_LABELS)
+    expect(h.latchEvents.flatMap((event) => (event.step === 'set' ? [event.outcome] : []))).toEqual([CONFLICT_LATCH_SET_LATCHED, CONFLICT_LATCH_SET_RELATCHED])
+    expect(atNotice).toEqual([[false, true]])
+    const noteNotice = expectedConflictNotice({ latchCase: LATCH_CASE_CONFLICTING_LABELS, sessionName: personaTmuxSessionName(p) }).text
+    expect(h.episodeNotices).toEqual([{ key: p, text: leftoverRow.notice.text }, relaunchingPost, heldPost(q), { key: p, text: noteNotice }])
+    expect(endedLinesOf(h.lines.slice(linesBefore), p)).toEqual([stuckLaunchEpisodeEndedLine(p, STUCK_LAUNCH_END_LATCHED)])
+    expect(endedLinesOf(h.lines, q)).toEqual([])
+    expect([h.episodes.isOpen(p, STUCK), h.episodes.isOpen(q, STUCK)]).toEqual([false, true])
+
+    // A later post of the same text posts again.
+    expect(postStuckLaunchRelaunching(deps, p, adLaunchBoundMsInEffect())).toBe(STUCK_LAUNCH_POSTED)
+    expect(h.episodeNotices.slice(-1)).toEqual([relaunchingPost])
   })
 })
 
@@ -3304,7 +3477,7 @@ describe('SRJ-1020\'s notice for a launch start not recorded', () => {
     const own = cscbOwnText(notice)
     expect(own).toBe(notice)
     expect(sessionEndingCommandsIn(own)).toEqual([])
-    expect(own.split(CONFLICT_NOTICE_LINE_SEPARATOR).flatMap(forbiddenIn)).toEqual([])
+    expect(own.split(CONFLICT_NOTICE_LINE_SEPARATOR).flatMap(cscbOwnLineForbiddenIn)).toEqual([])
     assertNoLeak([notice])
   })
 
@@ -4362,7 +4535,7 @@ describe('the reuse spawn\'s latches at the sequence\'s final launch: CONFLICT w
     expect(post!.text.includes(JSON.stringify(operatorActionsTitle()))).toBe(true)
     const own = cscbOwnText(post!.text)
     expect(sessionEndingCommandsIn(own)).toEqual([])
-    expect(own.split(CONFLICT_NOTICE_LINE_SEPARATOR).flatMap(forbiddenIn)).toEqual([])
+    expect(own.split(CONFLICT_NOTICE_LINE_SEPARATOR).flatMap(cscbOwnLineForbiddenIn)).toEqual([])
 
     await expectLostMessageReports(h, p, 'held-for-human')
     expect([h.restartAsks.filter((key) => key === p), isRestartPendingOrActive(p), personaCallCounts(h, p)]).toEqual([[], false, pCallsAtLatch])

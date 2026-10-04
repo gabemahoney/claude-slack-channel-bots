@@ -3,7 +3,8 @@
  *
  * Covers b.av2 SR-2.1 (key rule and fit constraints), SR-2.2 (instance ID,
  * tmux name, labels, spawn env, with Claude Code's prompt suggestions off in
- * every persona env, b.svb), the effective config-dir set (SR-6.2, SR-8.6
+ * every persona env, b.svb; a notice's quoted session and the exact attach
+ * target, b.jg5 SRJ-1001), the effective config-dir set (SR-6.2, SR-8.6
  * step 5), SR-9.1/SR-9.3 (persona target resolution),
  * SR-10.3 (persona-reference rendering) and SR-13.1 (no import side effects),
  * plus the test helper's token matcher (`TOKEN_LIKE` / `isTokenLike`), which
@@ -38,9 +39,11 @@ import {
   personaLabels,
   personaSpawnEnv,
   personaTmuxSessionName,
+  quotedPersonaSessionName,
   renderPersonaRef,
   resolveClaudeConfigDir,
   resolvePersonaTarget,
+  tmuxExactSessionTarget,
 } from '../src/persona-identity.ts'
 import { encodePermissionActionId, parsePermissionActionId } from '../src/permission-action-id.ts'
 import { APP_TOKEN_PREFIX, BOT_TOKEN_PREFIX, fakeToken, isTokenLike } from './test-helpers/credentials.ts'
@@ -152,6 +155,14 @@ describe('derived identifiers', () => {
   test('instance ID is cscb_<key> and tmux name is slack_bot_<key>', () => {
     expect(personaInstanceId('ops_bot_5e2526f3')).toBe('cscb_ops_bot_5e2526f3')
     expect(personaTmuxSessionName('ops_bot_5e2526f3')).toBe('slack_bot_ops_bot_5e2526f3')
+  })
+
+  test('a notice\'s <session> is the tmux name in double quotes (b.jg5 SRJ-1001), and an attach target is the exact name, =<name> (b.1ix)', () => {
+    expect(quotedPersonaSessionName('dev')).toBe('"slack_bot_dev"')
+    expect(quotedPersonaSessionName('dev_2')).toBe('"slack_bot_dev_2"')
+    expect(tmuxExactSessionTarget('slack_bot_dev')).toBe('=slack_bot_dev')
+    // Keys that prefix one another stay apart: the closing quote ends the name.
+    expect(quotedPersonaSessionName('dev_2').includes(quotedPersonaSessionName('dev'))).toBe(false)
   })
 
   test('labels are service, persona and a 12-hex config_dir hash of the resolved dir', () => {

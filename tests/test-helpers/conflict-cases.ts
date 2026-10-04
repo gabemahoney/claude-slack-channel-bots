@@ -192,6 +192,12 @@
  *     the forms a text matches. None matches agent-director's own "no kill was
  *     sent", "retry kill later" or "never delete this row". E16's, E29's and
  *     E36's text checks reuse them;
+ *   - {@link CSCB_OWN_LINE_FORBIDDEN} and {@link cscbOwnLineForbiddenIn}: what
+ *     CSCB's own lines never spell beyond those five forms (`kill-pane`,
+ *     `set-option`, `agent-director delete`, the latch-clearing command,
+ *     `has-session`, either label option's name), and each entry a line
+ *     matches. The CONFLICT notice's and the stuck-launch post's checks reuse
+ *     them;
  *   - {@link cscbOwnLines}: a notice's lines with agent-director's quoted
  *     description taken out, so a check over CSCB's own words lets the quoted
  *     description through. Two forms: a CONFLICT notice's description line
@@ -865,6 +871,27 @@ export const SESSION_ENDING_COMMAND_FORMS: readonly SessionEndingCommandForm[] =
 /** The names of the session-ending command forms `text` matches, in table order; empty when none does. */
 export function sessionEndingCommandsIn(text: string): string[] {
   return SESSION_ENDING_COMMAND_FORMS.filter((form) => form.pattern.test(text)).map((form) => form.name)
+}
+
+/**
+ * What CSCB's own notice and recovery lines never spell, beyond SR-1.4's five
+ * session-ending forms (b.jg5 SRJ-1001; SRJ-716's label option names): a pane
+ * kill, a tmux option write, an agent-director row delete, the latch-clearing
+ * command, a session probe, and either label option's name. Not global, so
+ * no pattern keeps a `lastIndex` between tests.
+ */
+export const CSCB_OWN_LINE_FORBIDDEN: readonly RegExp[] = Object.freeze([
+  /kill-pane/i,
+  /set-option/i,
+  /agent-director\s+delete/i,
+  /clear-latch|clear_latch|clearLatch/,
+  /has-session/i,
+  /ad_owner|ad_pane/,
+])
+
+/** Each {@link CSCB_OWN_LINE_FORBIDDEN} entry `line` matches, with the line, so a failure names both; empty when none does. */
+export function cscbOwnLineForbiddenIn(line: string): string[] {
+  return CSCB_OWN_LINE_FORBIDDEN.filter((pattern) => pattern.test(line)).map((pattern) => `${pattern} in ${JSON.stringify(line)}`)
 }
 
 /** The verb of a spawn, plain or with `--reuse-finished`. */

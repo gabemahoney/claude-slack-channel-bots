@@ -70,6 +70,39 @@
  * retry, the ladder) is tests/server.test.ts's,
  * tests/unavailable-retry.test.ts's and tests/session-manager.test.ts's.
  *
+ * The stuck-launch post (b.jg5 SRJ-1017, SRJ-1016, SRJ-1001; AC 67). One pin
+ * case holds SRJ-1017's texts literally (the file's only literal text): the
+ * relaunching text at the default settings (B 5 minutes) and with
+ * `pending_grace_seconds` 300 (6 minutes), and the held text with and
+ * without the attach line. Every other case builds its expectation from
+ * `src/`'s exports: B as `wholeMinutes(adLaunchBoundMsInEffect())`, rounded
+ * down (a B that is not whole minutes); the session through
+ * `quotedPersonaSessionName`, keys that prefix one another kept apart; the
+ * held text's lines from the exported pieces, the flagged form with the
+ * clause after the launch start and no attach line, the unflagged one with
+ * all three remedies and the human-only line; the launch start through the
+ * one renderer (`describeLaunchStartForLog`): an ISO 8601 UTC timestamp
+ * ending in `Z`, one string for the stub's two sample forms, a numeric
+ * offset and the parsed number of one instant, and never the raw text.
+ * SRJ-1001: neither text in any form matches a session-ending command form
+ * (`SESSION_ENDING_COMMAND_FORMS`), no line names anything of
+ * `CSCB_OWN_LINE_FORBIDDEN` (kill-pane, set-option, agent-director delete,
+ * clear-latch, has-session, a label option), every tmux target is exact
+ * (`=`), and no text says "dispatcher bug" (SRJ-713). The posters over a real
+ * `createPersonaEpisodes` on `createFakeClock`: each text once per
+ * episode (both held forms share one mark), the other text still once; a
+ * new episode after `endStuckLaunchEpisode` posts each again; nothing posted
+ * and no episode begun while the injected `tmux-unavailable` query answers
+ * raised or throws; `closed` after `close()`; a submitted teardown mutes the
+ * post, which still counts; an episodes call that throws answers
+ * suppressed; two personas are independent; one line per call, from the
+ * exported line builders. The episode-end predicate's table. `assertNoLeak`
+ * over every text and line, with a key carrying a fake token (masked by
+ * `withoutName`), a raw launch start carrying one, and thrown values
+ * carrying the leak marker. Where the episode ends at the session manager's
+ * reads and at a latch is tests/session-manager.test.ts's and
+ * tests/conflict-latch.test.ts's.
+ *
  * E29 (the pending-row rule) extends this file.
  *
  * SPDX-License-Identifier: MIT
@@ -84,15 +117,46 @@ import {
   AD_SETTING_INTEGER_MAX,
   AD_WAIT_NEVER_ENDS,
   adGraceMsInEffect,
+  adLaunchBoundMsInEffect,
   DEFAULT_AD_SETTINGS,
   installAdSettings,
   resetAdSettingsForTests,
+  wholeMinutes,
   type AdSettingsReader,
 } from '../src/ad-settings.ts'
 import {
   armPendingRowWait,
   decidePendingRowCover,
+  describeLaunchStartForLog,
+  endStuckLaunchEpisode,
   isPendingRowAged,
+  isStuckLaunchEpisodeEndState,
+  postStuckLaunchHeld,
+  postStuckLaunchRelaunching,
+  STUCK_LAUNCH_ALREADY_POSTED,
+  STUCK_LAUNCH_END_LAUNCH_REMEDY_LINE,
+  STUCK_LAUNCH_HELD_HEAD,
+  STUCK_LAUNCH_HUMAN_ONLY_LINE,
+  STUCK_LAUNCH_MARK_HELD,
+  STUCK_LAUNCH_MARK_RELAUNCHING,
+  STUCK_LAUNCH_NOT_POSTED_CLOSED,
+  STUCK_LAUNCH_NOT_STARTED_BY_CSCB_CLAUSE,
+  STUCK_LAUNCH_POSTED,
+  STUCK_LAUNCH_RELAUNCHING_HEAD,
+  STUCK_LAUNCH_SUPPRESSED,
+  stuckLaunchAttachRemedyLine,
+  stuckLaunchEndRowLiveReason,
+  stuckLaunchEpisodeEndedLine,
+  stuckLaunchHeldText,
+  stuckLaunchListRemedyLine,
+  stuckLaunchOutageQueryFailedLine,
+  stuckLaunchPostFailedLine,
+  stuckLaunchPostLine,
+  stuckLaunchRelaunchingText,
+  type StuckLaunchPostAnswer,
+  type StuckLaunchPostEpisodes,
+  type StuckLaunchPosterDeps,
+  type StuckLaunchTextMark,
   isPendingWithNoLaunchStart,
   parseLaunchStart,
   PENDING_ROW_COVERED,
@@ -113,10 +177,20 @@ import {
   type PendingRowUndecidedReason,
   type PendingRowWaitArmed,
 } from '../src/pending-row.ts'
-import { AGENT_DIRECTOR_PENDING_STATE } from '../src/liveness-reading.ts'
+import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_LIVE_STATES, AGENT_DIRECTOR_PENDING_STATE } from '../src/liveness-reading.ts'
 import { KILL_FAILURE_CONTEXT_RECOVERY } from '../src/kill-failure-alert.ts'
 import { LIVE_ROW_SEQUENCE_ENTRY_KILL, LIVE_ROW_START_STARTED, type LiveRowSequenceRequest } from '../src/live-row-sequence.ts'
-import { CONFIG_DIR_LABEL_PREFIX, personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
+import {
+  CONFIG_DIR_LABEL_PREFIX,
+  personaInstanceId,
+  personaTmuxSessionName,
+  quotedPersonaSessionName,
+  renderPersonaRef,
+  tmuxExactSessionTarget,
+} from '../src/persona-identity.ts'
+import { createPersonaEpisodes, PERSONA_EPISODE_KIND_STUCK_LAUNCH, type PersonaEpisodes } from '../src/persona-episodes.ts'
+import type { PersonaTeardownWindowState } from '../src/persona-notifier.ts'
+import { describeThrownValue } from '../src/persona-connection-errors.ts'
 import {
   _resetConfigDirFs,
   _setConfigDirFs,
@@ -141,8 +215,14 @@ import {
   type PersonaGetResultOverrides,
 } from './test-helpers/agent-director-stub.ts'
 import { writeAgentDirectorConfig, type AdConfigTables } from './test-helpers/ad-settings.ts'
-import { LAUNCH_START_CASE_ROWS } from './test-helpers/conflict-cases.ts'
-import { assertNoLeak } from './test-helpers/credentials.ts'
+import {
+  CSCB_OWN_LINE_FORBIDDEN,
+  cscbOwnLineForbiddenIn,
+  LAUNCH_START_CASE_ROWS,
+  SESSION_ENDING_COMMAND_FORMS,
+  sessionEndingCommandsIn,
+} from './test-helpers/conflict-cases.ts'
+import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, sentinelInMessage, withoutName } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import {
   expectPendingOnlyWatch,
@@ -997,5 +1077,568 @@ describe('readAndStepPendingRow: one get, then a covered or undecided row armed 
     expect(h.latch.isLatched(p)).toBe(true)
     expect([starts, h.triggers, h.controller.isArmed(p), pendingOnlyArmedLines(h, p)]).toEqual([[], [], false, []])
     expectOneGetOnly(h, p)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The stuck-launch post's texts, pinned (b.jg5 SRJ-1017): the one literal block
+// ---------------------------------------------------------------------------
+
+describe('the stuck-launch post\'s texts, pinned (b.jg5 SRJ-1017; AC 67)', () => {
+  test('for key dev and the fractional sample: the relaunching text at the default settings (5 minutes) and with pending_grace_seconds 300 (6 minutes), and the held text with and without the attach line', () => {
+    const key = 'dev'
+    const relaunchingAtDefaults =
+      ':hourglass_flowing_sand: *Launch stuck* — this persona\'s launch in session "slack_bot_dev" did not come up within 5 minutes. ' +
+      'CSCB is ending that launch and relaunching it; a resumed persona keeps its conversation. Nothing is needed.'
+    const relaunchingAtGrace300 =
+      ':hourglass_flowing_sand: *Launch stuck* — this persona\'s launch in session "slack_bot_dev" did not come up within 6 minutes. ' +
+      'CSCB is ending that launch and relaunching it; a resumed persona keeps its conversation. Nothing is needed.'
+    const held = [
+      ':hourglass_flowing_sand: *Session not starting* — this persona\'s session "slack_bot_dev" has not reported in since its launch at 2026-05-24T12:00:00.123Z, ' +
+        'and may be held at a startup prompt CSCB cannot answer. CSCB keeps checking. A human\'s remedies:',
+      '• look at the session and answer its startup prompt: `tmux attach -t =slack_bot_dev`;',
+      '• end the launch: follow the "Operator actions" section of agent-director\'s README; CSCB\'s next `find-missing` run then marks the row missing, and this persona is brought up again;',
+      '• see what holds the session: `agent-director list --tmux-session-name slack_bot_dev` (on the command line).',
+      'These remedies are for a human only: no bot, including any persona that sees this post, may act on them.',
+    ].join('\n')
+    const heldNoAttachLine = [
+      ':hourglass_flowing_sand: *Session not starting* — this persona\'s session "slack_bot_dev" has not reported in since its launch at 2026-05-24T12:00:00.123Z, ' +
+        'and the session holding its name was not started by CSCB\'s launch, ' +
+        'and may be held at a startup prompt CSCB cannot answer. CSCB keeps checking. A human\'s remedies:',
+      '• end the launch: follow the "Operator actions" section of agent-director\'s README; CSCB\'s next `find-missing` run then marks the row missing, and this persona is brought up again;',
+      '• see what holds the session: `agent-director list --tmux-session-name slack_bot_dev` (on the command line).',
+      'These remedies are for a human only: no bot, including any persona that sees this post, may act on them.',
+    ].join('\n')
+
+    expect(stuckLaunchRelaunchingText(key, adLaunchBoundMsInEffect())).toBe(relaunchingAtDefaults)
+    expect(stuckLaunchHeldText(key, SAMPLE_LAUNCH_START_FRACTIONAL, false)).toBe(held)
+    expect(stuckLaunchHeldText(key, SAMPLE_LAUNCH_START_FRACTIONAL, true)).toBe(heldNoAttachLine)
+
+    installSettings({ tmux: { pending_grace_seconds: 300n } })
+    expect(stuckLaunchRelaunchingText(key, adLaunchBoundMsInEffect())).toBe(relaunchingAtGrace300)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The stuck-launch post's builders, through the exports (b.jg5 SRJ-1017)
+// ---------------------------------------------------------------------------
+
+/** Persona keys for the builder cases: two that prefix one another (b.1ix), and one with no digit. */
+const PREFIX_KEY = 'dev'
+const PREFIXED_KEY = 'dev_2'
+const BUILDER_KEYS = [PREFIX_KEY, PREFIXED_KEY, 'ops_bot'] as const
+
+/** Both forms of the held text: [name, whether a `send-keys` met `ErrSpawnNotInteractive`]. */
+const HELD_FORMS: ReadonlyArray<readonly [string, boolean]> = [
+  ['with the attach line', false],
+  ['without the attach line', true],
+]
+
+/** One instant's launch start in other forms: its parsed instant, and a numeric offset naming the same instant. */
+function sameInstantForms(raw: string): ReadonlyArray<readonly [string, unknown]> {
+  const instant = parseLaunchStart(raw)!
+  const offsetHours = 2
+  const shifted = new Date(instant + offsetHours * 60 * MINUTE_MS).toISOString()
+  return [
+    ['its parsed instant (epoch ms)', instant],
+    [`a +0${offsetHours}:00 offset`, shifted.replace(/Z$/, `+0${offsetHours}:00`)],
+  ]
+}
+
+describe('stuckLaunchRelaunchingText: B in whole minutes, rounded down, and P\'s quoted session (b.jg5 SRJ-1017, SRJ-210)', () => {
+  /** [settings, the agent-director settings written (none: the defaults), whether B is whole minutes there]. */
+  const B_SETTINGS: ReadonlyArray<readonly [string, AdConfigTables | undefined, boolean]> = [
+    ['the default settings', undefined, true],
+    ['pending_grace_seconds 300', { tmux: { pending_grace_seconds: 300n } }, true],
+    ['a G that leaves B short of a whole minute', { tmux: { pending_grace_seconds: 359n } }, false],
+  ]
+
+  test.each(B_SETTINGS)('at %s: B is wholeMinutes(adLaunchBoundMsInEffect()), the text\'s only number, rounded down', (_label, tables, wholeMinute) => {
+    if (tables !== undefined) installSettings(tables)
+    const boundMs = adLaunchBoundMsInEffect()
+    const minutes = wholeMinutes(boundMs)
+    expect(boundMs % MINUTE_MS === 0).toBe(wholeMinute)
+    expect(minutes).toBe(Math.floor(boundMs / MINUTE_MS))
+
+    const text = stuckLaunchRelaunchingText(PREFIX_KEY, boundMs)
+    expect(text.startsWith(`${STUCK_LAUNCH_RELAUNCHING_HEAD} `)).toBe(true)
+    expect(text.replace(quotedPersonaSessionName(PREFIX_KEY), '').match(/\d+/g)).toEqual([String(minutes)])
+    // Rounded down: B's text is its whole minutes' text, never the next minute's.
+    expect(text).toBe(stuckLaunchRelaunchingText(PREFIX_KEY, minutes * MINUTE_MS))
+    expect(text).not.toBe(stuckLaunchRelaunchingText(PREFIX_KEY, (minutes + 1) * MINUTE_MS))
+  })
+
+  test('pending_grace_seconds 300 states one minute more than the defaults (5 → 6)', () => {
+    const atDefaults = wholeMinutes(adLaunchBoundMsInEffect())
+    installSettings({ tmux: { pending_grace_seconds: 300n } })
+    expect(wholeMinutes(adLaunchBoundMsInEffect())).toBe(atDefaults + 1)
+  })
+})
+
+describe('both texts name P\'s own session, quoted (b.jg5 SRJ-1017, SRJ-1001; b.1ix)', () => {
+  test.each([
+    [PREFIX_KEY, PREFIXED_KEY],
+    [PREFIXED_KEY, PREFIX_KEY],
+  ])('persona %s: its quoted session in every text, never %s\'s', (key, other) => {
+    const texts = [
+      stuckLaunchRelaunchingText(key, adLaunchBoundMsInEffect()),
+      ...HELD_FORMS.map(([, flagged]) => stuckLaunchHeldText(key, SAMPLE_LAUNCH_START_FRACTIONAL, flagged)),
+    ]
+    for (const text of texts) {
+      expect(text.split(quotedPersonaSessionName(key))).toHaveLength(2)
+      expect(text).not.toContain(quotedPersonaSessionName(other))
+    }
+  })
+
+  test.each([
+    [PREFIX_KEY, PREFIXED_KEY],
+    [PREFIXED_KEY, PREFIX_KEY],
+  ])('persona %s: the attach line targets its exact session (=<name>) and the list line names its session once; each differs from %s\'s only in the name', (key, other) => {
+    const attach = stuckLaunchAttachRemedyLine(key)
+    const list = stuckLaunchListRemedyLine(key)
+    expect(attach.split(tmuxExactSessionTarget(personaTmuxSessionName(key)))).toHaveLength(2)
+    expect(list.split(personaTmuxSessionName(key))).toHaveLength(2)
+    expect(list).not.toContain(tmuxExactSessionTarget(personaTmuxSessionName(key)))
+    expect(attach.replace(personaTmuxSessionName(key), personaTmuxSessionName(other))).toBe(stuckLaunchAttachRemedyLine(other))
+    expect(list.replace(personaTmuxSessionName(key), personaTmuxSessionName(other))).toBe(stuckLaunchListRemedyLine(other))
+  })
+})
+
+describe('stuckLaunchHeldText: with and without the attach line (b.jg5 SRJ-1017)', () => {
+  test.each(BUILDER_KEYS.flatMap((key) => VALID_LAUNCH_STARTS.map(([form, raw]) => [key, form, raw] as const)))(
+    'persona %s, the %s launch start: unflagged, the head and all three remedies and the human-only line; flagged, the clause after the launch start and no attach line',
+    (key, _form, raw) => {
+      const rendered = describeLaunchStartForLog(raw)
+      const [head, ...rest] = stuckLaunchHeldText(key, raw, false).split('\n')
+      const [flaggedHead, ...flaggedRest] = stuckLaunchHeldText(key, raw, true).split('\n')
+
+      expect(rest).toEqual([
+        stuckLaunchAttachRemedyLine(key),
+        STUCK_LAUNCH_END_LAUNCH_REMEDY_LINE,
+        stuckLaunchListRemedyLine(key),
+        STUCK_LAUNCH_HUMAN_ONLY_LINE,
+      ])
+      expect(flaggedRest).toEqual([STUCK_LAUNCH_END_LAUNCH_REMEDY_LINE, stuckLaunchListRemedyLine(key), STUCK_LAUNCH_HUMAN_ONLY_LINE])
+
+      expect(head!.startsWith(`${STUCK_LAUNCH_HELD_HEAD} `)).toBe(true)
+      expect(head).toContain(quotedPersonaSessionName(key))
+      expect(head!.split(rendered)).toHaveLength(2)
+      expect(head).not.toContain(STUCK_LAUNCH_NOT_STARTED_BY_CSCB_CLAUSE)
+      // The flagged head is the unflagged one with the clause right after the launch start.
+      expect(flaggedHead).toBe(head!.replace(rendered, `${rendered}${STUCK_LAUNCH_NOT_STARTED_BY_CSCB_CLAUSE}`))
+
+      const target = tmuxExactSessionTarget(personaTmuxSessionName(key))
+      expect(stuckLaunchHeldText(key, raw, false)).toContain(target)
+      expect(stuckLaunchHeldText(key, raw, true)).not.toContain(target)
+    },
+  )
+})
+
+describe('the launch start in the held text: one renderer, ISO 8601 UTC ending in Z (b.jg5 SRJ-1017, hatch A3)', () => {
+  /** An ISO 8601 UTC timestamp with milliseconds, ending in `Z`, as `Date.prototype.toISOString` writes one. */
+  const ISO_UTC_Z = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/
+
+  test.each(VALID_LAUNCH_STARTS)('the stub\'s %s sample renders as its instant in ISO 8601 UTC with Z, in the held text', (_form, raw) => {
+    const rendered = describeLaunchStartForLog(raw)
+    expect(rendered).toMatch(ISO_UTC_Z)
+    expect(rendered).toBe(new Date(parseLaunchStart(raw)!).toISOString())
+    for (const [, flagged] of HELD_FORMS) expect(stuckLaunchHeldText(PREFIX_KEY, raw, flagged)).toContain(rendered)
+  })
+
+  test.each(VALID_LAUNCH_STARTS.flatMap(([form, raw]) => sameInstantForms(raw).map(([other, value]) => [form, other, raw, value] as const)))(
+    'the %s sample and %s naming the same instant give one held text, in both forms, and the raw offset text never reaches it',
+    (_form, _other, raw, value) => {
+      for (const [, flagged] of HELD_FORMS) {
+        const text = stuckLaunchHeldText(PREFIX_KEY, value, flagged)
+        expect(text).toBe(stuckLaunchHeldText(PREFIX_KEY, raw, flagged))
+        if (typeof value === 'string') expect(text).not.toContain(value)
+      }
+    },
+  )
+
+  test('the whole sample\'s raw text does not reach the held text: its instant does, with milliseconds', () => {
+    const text = stuckLaunchHeldText(PREFIX_KEY, SAMPLE_LAUNCH_START_WHOLE, false)
+    expect(text).not.toContain(SAMPLE_LAUNCH_START_WHOLE)
+    expect(text).toContain(new Date(WHOLE_INSTANT).toISOString())
+  })
+})
+
+describe('neither stuck-launch text names a session-ending command (b.jg5 SRJ-1001, C22)', () => {
+  /** Every text, in every form, for every key and launch start, at the default B and with `pending_grace_seconds` 300. */
+  function everyStuckLaunchText(): string[] {
+    const texts: string[] = []
+    for (const key of BUILDER_KEYS) {
+      texts.push(stuckLaunchRelaunchingText(key, adLaunchBoundMsInEffect()))
+      for (const [, raw] of VALID_LAUNCH_STARTS) for (const [, flagged] of HELD_FORMS) texts.push(stuckLaunchHeldText(key, raw, flagged))
+    }
+    installSettings({ tmux: { pending_grace_seconds: 300n } })
+    for (const key of BUILDER_KEYS) texts.push(stuckLaunchRelaunchingText(key, adLaunchBoundMsInEffect()))
+    return texts
+  }
+
+  test('every text, in every form, for every key, launch start and B, matches none of SESSION_ENDING_COMMAND_FORMS', () => {
+    const texts = everyStuckLaunchText()
+    expect(SESSION_ENDING_COMMAND_FORMS.length).toBeGreaterThan(0)
+    expect(texts.flatMap(sessionEndingCommandsIn)).toEqual([])
+  })
+
+  test('no line of any text names kill-pane, set-option, agent-director delete, clear-latch, has-session or a label option (CSCB_OWN_LINE_FORBIDDEN); a tmux target is always exact (=)', () => {
+    const lines = everyStuckLaunchText().flatMap((text) => text.split('\n'))
+    expect(CSCB_OWN_LINE_FORBIDDEN.length).toBeGreaterThan(0)
+    expect(lines.flatMap(cscbOwnLineForbiddenIn)).toEqual([])
+    // Every `-t` target any line names is an exact one (SRJ-1001: no tmux target without `=`).
+    const targets = lines.flatMap((line) => [...line.matchAll(/-t\s+(\S+)/g)].map((match) => match[1]!))
+    expect(targets.length).toBeGreaterThan(0)
+    for (const target of targets) expect(target.startsWith(tmuxExactSessionTarget(''))).toBe(true)
+  })
+
+  test('no text calls anything a "dispatcher bug" (b.jg5 SRJ-713)', () => {
+    for (const text of everyStuckLaunchText()) expect(text).not.toMatch(/dispatcher\s+bug/i)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The stuck-launch posters (b.jg5 SRJ-1017, SRJ-1016)
+// ---------------------------------------------------------------------------
+
+/** One stuck-launch text as a poster posts it: its mark, its held form, its poster and its text for a key. */
+interface StuckLaunchTextCase {
+  readonly name: string
+  readonly mark: StuckLaunchTextMark
+  readonly flagged: boolean
+  readonly post: (deps: StuckLaunchPosterDeps, key: string) => StuckLaunchPostAnswer
+  readonly text: (key: string) => string
+}
+
+/** The launch start the held posts carry: the stub's default sample. */
+const POSTED_LAUNCH_START = SAMPLE_LAUNCH_START_FRACTIONAL
+
+const RELAUNCHING: StuckLaunchTextCase = {
+  name: 'the relaunching text',
+  mark: STUCK_LAUNCH_MARK_RELAUNCHING,
+  flagged: false,
+  post: (deps, key) => postStuckLaunchRelaunching(deps, key, adLaunchBoundMsInEffect()),
+  text: (key) => stuckLaunchRelaunchingText(key, adLaunchBoundMsInEffect()),
+}
+
+/** The held text's poster in the form `flagged` picks. */
+function heldCase(flagged: boolean): StuckLaunchTextCase {
+  return {
+    name: flagged ? 'the held text without the attach line' : 'the held text with the attach line',
+    mark: STUCK_LAUNCH_MARK_HELD,
+    flagged,
+    post: (deps, key) => postStuckLaunchHeld(deps, key, POSTED_LAUNCH_START, flagged),
+    text: (key) => stuckLaunchHeldText(key, POSTED_LAUNCH_START, flagged),
+  }
+}
+
+const HELD = heldCase(false)
+const HELD_NO_ATTACH = heldCase(true)
+const TEXT_CASES: readonly StuckLaunchTextCase[] = [RELAUNCHING, HELD, HELD_NO_ATTACH]
+
+/** The poster's line for `text` posted for `key` with `answer`. */
+function posterLine(key: string, text: StuckLaunchTextCase, answer: StuckLaunchPostAnswer, muted = false): string {
+  return stuckLaunchPostLine(key, text.mark, answer, { metNotInteractive: text.flagged, muted })
+}
+
+/** Two personas. */
+const P = 'alpha'
+const Q = 'beta'
+
+/** A posters' rig: a real episodes instance on the case's fake clock, recording its sink and lines; the outage query and teardown state set by the case. */
+interface PosterRig {
+  readonly episodes: PersonaEpisodes
+  readonly deps: StuckLaunchPosterDeps
+  /** What the episodes' sink received (the persona notifier in production). */
+  readonly posts: Array<{ readonly key: string; readonly text: string }>
+  /** The posters' lines (their injected log). */
+  readonly lines: string[]
+  /** The episodes' own lines. */
+  readonly episodeLines: string[]
+  /** The keys whose `tmux-unavailable` outage the injected query answers raised. */
+  readonly raised: Set<string>
+  /** Each key's persona-teardown state (none unless set). */
+  readonly teardown: Map<string, PersonaTeardownWindowState>
+}
+
+function posterRig(overrides: Partial<StuckLaunchPosterDeps> = {}): PosterRig {
+  const clock = clockAt(WHOLE_INSTANT)
+  const posts: Array<{ key: string; text: string }> = []
+  const lines: string[] = []
+  const episodeLines: string[] = []
+  const raised = new Set<string>()
+  const teardown = new Map<string, PersonaTeardownWindowState>()
+  const episodes = createPersonaEpisodes({
+    sink: (key, text) => {
+      posts.push({ key, text })
+    },
+    log: (line) => {
+      episodeLines.push(line)
+    },
+    clock,
+    teardownWindow: (key) => teardown.get(key) ?? 'none',
+  })
+  const deps: StuckLaunchPosterDeps = {
+    episodes,
+    tmuxUnavailableRaised: (key) => raised.has(key),
+    log: (line) => {
+      lines.push(line)
+    },
+    ...overrides,
+  }
+  return { episodes, deps, posts, lines, episodeLines, raised, teardown }
+}
+
+/** Whether `key`'s stuck-launch episode is open in `rig`. */
+const isOpen = (rig: PosterRig, key: string): boolean => rig.episodes.isOpen(key, PERSONA_EPISODE_KIND_STUCK_LAUNCH)
+
+/** A row state whose read ends the episode (a live state out of `pending`). */
+const LIVE_OUT_OF_PENDING = [...AGENT_DIRECTOR_LIVE_STATES].find((state) => state !== AGENT_DIRECTOR_PENDING_STATE)!
+
+describe('the stuck-launch posters: each text at most once per stuck-launch episode (b.jg5 SRJ-1017, SRJ-1016; AC 67)', () => {
+  /** Each text against each text with the other mark, in both orders. */
+  const ORDERED_PAIRS = TEXT_CASES.flatMap((first) =>
+    TEXT_CASES.filter((second) => second.mark !== first.mark).map((second) => [first.name, second.name, first, second] as const),
+  )
+
+  test.each(ORDERED_PAIRS)('%s, then %s: each posts once, a second post of it posts nothing, and one episode holds both marks', (_first, _second, first, second) => {
+    const rig = posterRig()
+
+    expect(first.post(rig.deps, P)).toBe(STUCK_LAUNCH_POSTED)
+    expect(first.post(rig.deps, P)).toBe(STUCK_LAUNCH_ALREADY_POSTED)
+    expect(second.post(rig.deps, P)).toBe(STUCK_LAUNCH_POSTED)
+    expect(second.post(rig.deps, P)).toBe(STUCK_LAUNCH_ALREADY_POSTED)
+    expect(first.post(rig.deps, P)).toBe(STUCK_LAUNCH_ALREADY_POSTED)
+
+    expect(rig.posts).toEqual([
+      { key: P, text: first.text(P) },
+      { key: P, text: second.text(P) },
+    ])
+    expect(rig.lines).toEqual([
+      posterLine(P, first, STUCK_LAUNCH_POSTED),
+      posterLine(P, first, STUCK_LAUNCH_ALREADY_POSTED),
+      posterLine(P, second, STUCK_LAUNCH_POSTED),
+      posterLine(P, second, STUCK_LAUNCH_ALREADY_POSTED),
+      posterLine(P, first, STUCK_LAUNCH_ALREADY_POSTED),
+    ])
+    expect(rig.episodes.view(P, PERSONA_EPISODE_KIND_STUCK_LAUNCH)?.posted).toEqual([first.mark, second.mark])
+    expect(rig.episodeLines).toEqual([])
+    assertNoLeak({ posts: rig.posts, lines: rig.lines })
+  })
+
+  test.each([
+    [HELD.name, HELD_NO_ATTACH.name, HELD, HELD_NO_ATTACH],
+    [HELD_NO_ATTACH.name, HELD.name, HELD_NO_ATTACH, HELD],
+  ])('%s, then %s: the held text\'s two forms share one mark, so the second posts nothing', (_first, _second, first, second) => {
+    const rig = posterRig()
+
+    expect(first.post(rig.deps, P)).toBe(STUCK_LAUNCH_POSTED)
+    expect(second.post(rig.deps, P)).toBe(STUCK_LAUNCH_ALREADY_POSTED)
+
+    expect(rig.posts).toEqual([{ key: P, text: first.text(P) }])
+    expect(rig.lines).toEqual([posterLine(P, first, STUCK_LAUNCH_POSTED), posterLine(P, second, STUCK_LAUNCH_ALREADY_POSTED)])
+  })
+
+  test('after the episode ends (silently, with its one line), a new episode posts each text again', () => {
+    const rig = posterRig()
+    const reason = stuckLaunchEndRowLiveReason(LIVE_OUT_OF_PENDING)
+    // No episode open yet: the end does nothing and logs nothing.
+    expect(endStuckLaunchEpisode(rig.episodes, P, reason, rig.deps.log)).toBe(false)
+
+    expect(RELAUNCHING.post(rig.deps, P)).toBe(STUCK_LAUNCH_POSTED)
+    expect(HELD.post(rig.deps, P)).toBe(STUCK_LAUNCH_POSTED)
+    const firstEpisode = rig.episodes.view(P, PERSONA_EPISODE_KIND_STUCK_LAUNCH)!.episode
+
+    expect(endStuckLaunchEpisode(rig.episodes, P, reason, rig.deps.log)).toBe(true)
+    expect(isOpen(rig, P)).toBe(false)
+    expect(rig.posts).toHaveLength(2)
+
+    expect(RELAUNCHING.post(rig.deps, P)).toBe(STUCK_LAUNCH_POSTED)
+    expect(HELD_NO_ATTACH.post(rig.deps, P)).toBe(STUCK_LAUNCH_POSTED)
+    expect(rig.episodes.view(P, PERSONA_EPISODE_KIND_STUCK_LAUNCH)!.episode).toBeGreaterThan(firstEpisode)
+
+    expect(rig.posts).toEqual([
+      { key: P, text: RELAUNCHING.text(P) },
+      { key: P, text: HELD.text(P) },
+      { key: P, text: RELAUNCHING.text(P) },
+      { key: P, text: HELD_NO_ATTACH.text(P) },
+    ])
+    expect(rig.lines).toEqual([
+      posterLine(P, RELAUNCHING, STUCK_LAUNCH_POSTED),
+      posterLine(P, HELD, STUCK_LAUNCH_POSTED),
+      stuckLaunchEpisodeEndedLine(P, reason),
+      posterLine(P, RELAUNCHING, STUCK_LAUNCH_POSTED),
+      posterLine(P, HELD_NO_ATTACH, STUCK_LAUNCH_POSTED),
+    ])
+  })
+
+  test('two personas are independent: each posts its own texts once, and ending one\'s episode leaves the other\'s', () => {
+    const rig = posterRig()
+    for (const key of [P, Q]) for (const text of [RELAUNCHING, HELD]) expect(text.post(rig.deps, key)).toBe(STUCK_LAUNCH_POSTED)
+
+    expect(endStuckLaunchEpisode(rig.episodes, P, stuckLaunchEndRowLiveReason(LIVE_OUT_OF_PENDING), rig.deps.log)).toBe(true)
+    expect([isOpen(rig, P), isOpen(rig, Q)]).toEqual([false, true])
+    expect(RELAUNCHING.post(rig.deps, Q)).toBe(STUCK_LAUNCH_ALREADY_POSTED)
+    expect(RELAUNCHING.post(rig.deps, P)).toBe(STUCK_LAUNCH_POSTED)
+
+    expect(rig.posts).toEqual([
+      { key: P, text: RELAUNCHING.text(P) },
+      { key: P, text: HELD.text(P) },
+      { key: Q, text: RELAUNCHING.text(Q) },
+      { key: Q, text: HELD.text(Q) },
+      { key: P, text: RELAUNCHING.text(P) },
+    ])
+  })
+})
+
+describe('the stuck-launch posters: nothing posted and no episode begun while tmux-unavailable is raised (b.jg5 SRJ-1017, SRJ-410 step 3)', () => {
+  test.each(TEXT_CASES.map((text) => [text.name, text] as const))('%s while P\'s outage is raised: suppressed, nothing posted, no episode begun; Q still posts', (_name, text) => {
+    const rig = posterRig()
+    rig.raised.add(P)
+
+    expect(text.post(rig.deps, P)).toBe(STUCK_LAUNCH_SUPPRESSED)
+    expect(text.post(rig.deps, Q)).toBe(STUCK_LAUNCH_POSTED)
+
+    expect(isOpen(rig, P)).toBe(false)
+    expect(rig.episodes.view(P, PERSONA_EPISODE_KIND_STUCK_LAUNCH)).toBeUndefined()
+    expect(rig.posts).toEqual([{ key: Q, text: text.text(Q) }])
+    expect(rig.lines).toEqual([posterLine(P, text, STUCK_LAUNCH_SUPPRESSED), posterLine(Q, text, STUCK_LAUNCH_POSTED)])
+  })
+
+  test('raised while an episode is open: the post is suppressed and the episode keeps its marks; once cleared, the text not yet posted posts', () => {
+    const rig = posterRig()
+    expect(RELAUNCHING.post(rig.deps, P)).toBe(STUCK_LAUNCH_POSTED)
+
+    rig.raised.add(P)
+    expect(HELD.post(rig.deps, P)).toBe(STUCK_LAUNCH_SUPPRESSED)
+    expect(rig.episodes.view(P, PERSONA_EPISODE_KIND_STUCK_LAUNCH)?.posted).toEqual([RELAUNCHING.mark])
+
+    rig.raised.delete(P)
+    expect(HELD.post(rig.deps, P)).toBe(STUCK_LAUNCH_POSTED)
+    expect(RELAUNCHING.post(rig.deps, P)).toBe(STUCK_LAUNCH_ALREADY_POSTED)
+    expect(rig.posts).toEqual([
+      { key: P, text: RELAUNCHING.text(P) },
+      { key: P, text: HELD.text(P) },
+    ])
+  })
+
+  test.each(TEXT_CASES.map((text) => [text.name, text] as const))('%s with a tmux-unavailable query that throws: taken as raised, with its line; nothing posted and no episode begun', (_name, text) => {
+    const err = new Error(`outage query refused (${sentinelInMessage('outage')})`)
+    const rig = posterRig({
+      tmuxUnavailableRaised: () => {
+        throw err
+      },
+    })
+
+    expect(text.post(rig.deps, P)).toBe(STUCK_LAUNCH_SUPPRESSED)
+
+    expect(isOpen(rig, P)).toBe(false)
+    expect(rig.posts).toEqual([])
+    expect(rig.lines).toEqual([stuckLaunchOutageQueryFailedLine(P, describeThrownValue(err)), posterLine(P, text, STUCK_LAUNCH_SUPPRESSED)])
+    assertNoLeak(rig.lines)
+  })
+})
+
+describe('the stuck-launch posters: closed episodes, a submitted teardown, and failures (b.jg5 SRJ-1017, SRJ-1003)', () => {
+  test.each(TEXT_CASES.map((text) => [text.name, text] as const))('%s after the episodes are closed (shutdown): closed, nothing posted', (_name, text) => {
+    const rig = posterRig()
+    rig.episodes.close()
+
+    expect(text.post(rig.deps, P)).toBe(STUCK_LAUNCH_NOT_POSTED_CLOSED)
+
+    expect(rig.posts).toEqual([])
+    expect(rig.lines).toEqual([posterLine(P, text, STUCK_LAUNCH_NOT_POSTED_CLOSED)])
+  })
+
+  test.each(TEXT_CASES.map((text) => [text.name, text] as const))('%s while P\'s teardown is submitted: muted, with its muted line, and it counts as posted in its episode', (_name, text) => {
+    const rig = posterRig()
+    rig.teardown.set(P, 'submitted')
+
+    expect(text.post(rig.deps, P)).toBe(STUCK_LAUNCH_POSTED)
+    expect(text.post(rig.deps, P)).toBe(STUCK_LAUNCH_ALREADY_POSTED)
+
+    expect(rig.posts).toEqual([])
+    expect(rig.episodes.hasPosted(P, PERSONA_EPISODE_KIND_STUCK_LAUNCH, text.mark)).toBe(true)
+    expect(rig.lines).toEqual([posterLine(P, text, STUCK_LAUNCH_POSTED, true), posterLine(P, text, STUCK_LAUNCH_ALREADY_POSTED)])
+    // The episodes log their own mute line once.
+    expect(rig.episodeLines).toHaveLength(1)
+  })
+
+  test('an episodes call that throws: suppressed, with its one line, and nothing posted', () => {
+    const err = new Error(`episodes refused (${sentinelInMessage('episodes')})`)
+    const posts: string[] = []
+    const episodes: StuckLaunchPostEpisodes = {
+      begin: () => {
+        throw err
+      },
+      post: (_key, _kind, text) => {
+        posts.push(text)
+        return true
+      },
+      teardownWindowState: () => 'none',
+    }
+    const lines: string[] = []
+    const deps: StuckLaunchPosterDeps = { episodes, tmuxUnavailableRaised: () => false, log: (line) => void lines.push(line) }
+
+    for (const text of TEXT_CASES) expect(text.post(deps, P)).toBe(STUCK_LAUNCH_SUPPRESSED)
+
+    expect(posts).toEqual([])
+    expect(lines).toEqual(TEXT_CASES.map(() => stuckLaunchPostFailedLine(P, describeThrownValue(err))))
+    assertNoLeak(lines)
+  })
+
+  test('a log that throws changes nothing: the text posts once, then posts nothing', () => {
+    const rig = posterRig({
+      log: () => {
+        throw new Error('log refused')
+      },
+    })
+
+    expect(RELAUNCHING.post(rig.deps, P)).toBe(STUCK_LAUNCH_POSTED)
+    expect(RELAUNCHING.post(rig.deps, P)).toBe(STUCK_LAUNCH_ALREADY_POSTED)
+    expect(rig.posts).toEqual([{ key: P, text: RELAUNCHING.text(P) }])
+  })
+})
+
+describe('isStuckLaunchEpisodeEndState: a live state out of pending ends the episode; pending, ended, missing and no row do not (b.jg5 SRJ-1016)', () => {
+  test.each([...AGENT_DIRECTOR_LIVE_STATES].filter((state) => state !== AGENT_DIRECTOR_PENDING_STATE))('%s ends it', (state) => {
+    expect(isStuckLaunchEpisodeEndState(state)).toBe(true)
+  })
+
+  test.each<[string, unknown]>([
+    [AGENT_DIRECTOR_PENDING_STATE, AGENT_DIRECTOR_PENDING_STATE],
+    ...[...AGENT_DIRECTOR_DEAD_STATES].map((state): [string, unknown] => [state, state]),
+    ['no row (undefined)', undefined],
+    ['null', null],
+    ['an unknown state', 'starting'],
+    ['a non-string', 1],
+  ])('%s does not', (_label, state) => {
+    expect(isStuckLaunchEpisodeEndState(state)).toBe(false)
+  })
+})
+
+describe('assertNoLeak over the stuck-launch texts and lines (b.jg5 SRJ-1017)', () => {
+  test('a key carrying a fake token: every text and line carries it only as the key, and nothing else token-like', () => {
+    const key = `p_${fakeToken(BOT_TOKEN_PREFIX, 'key')}`
+    const texts = [
+      stuckLaunchRelaunchingText(key, adLaunchBoundMsInEffect()),
+      ...HELD_FORMS.map(([, flagged]) => stuckLaunchHeldText(key, POSTED_LAUNCH_START, flagged)),
+    ]
+    const answers: StuckLaunchPostAnswer[] = [STUCK_LAUNCH_POSTED, STUCK_LAUNCH_ALREADY_POSTED, STUCK_LAUNCH_SUPPRESSED, STUCK_LAUNCH_NOT_POSTED_CLOSED]
+    const lines = [
+      ...TEXT_CASES.flatMap((text) => answers.map((answer) => posterLine(key, text, answer))),
+      posterLine(key, RELAUNCHING, STUCK_LAUNCH_POSTED, true),
+      stuckLaunchEpisodeEndedLine(key, stuckLaunchEndRowLiveReason(LIVE_OUT_OF_PENDING)),
+    ]
+
+    // The key is in them (the check would fail unmasked), and nothing else is token-like.
+    expect(() => assertNoLeak({ texts, lines })).toThrow()
+    assertNoLeak(withoutName({ texts, lines }, key, key))
+  })
+
+  test('a raw launch start carrying a fake token never reaches the held text: it renders as no launch start', () => {
+    const raw = `${SAMPLE_LAUNCH_START_WHOLE}${fakeToken(BOT_TOKEN_PREFIX, 'launch')}`
+    expect(describeLaunchStartForLog(raw)).toBe(describeLaunchStartForLog(undefined))
+    assertNoLeak(HELD_FORMS.map(([, flagged]) => stuckLaunchHeldText(PREFIX_KEY, raw, flagged)))
   })
 })

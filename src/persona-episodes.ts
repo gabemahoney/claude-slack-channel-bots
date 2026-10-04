@@ -83,9 +83,10 @@
  * kill-failure alerts (below), which post the ordinary version once per
  * episode and the survivor version with no episode; `invalid-flags-hold`'s
  * by the `ErrInvalidFlags` hold's reactions (`src/invalid-flags-hold.ts`),
- * which post SRJ-1008's alert once per episode;
- * every other kind has no poster yet: its begin and end triggers and text
- * come with the Epic that posts it, named on its label below.
+ * which post SRJ-1008's alert once per episode; `stuck-launch`'s by the
+ * stuck-launch posters (`src/pending-row.ts`), which post each of SRJ-1017's
+ * two texts once per episode; `ad-config-malformed` posts nothing here (its
+ * outage flag is its latch).
  *
  * The `tmux-unresponsive` condition (b.jg5 SRJ-307 to SRJ-310, SRJ-1006).
  * `createTmuxUnresponsiveCondition(deps)` builds it over one episodes
@@ -179,7 +180,8 @@
  *   call.
  *
  * Texts (SRJ-1006; `<session>` the persona's quoted session name,
- * `"slack_bot_<key>"`, SRJ-1001): `tmuxUnresponsiveOnsetText`,
+ * `"slack_bot_<key>"`, SRJ-1001, from the one shared helper
+ * `quotedPersonaSessionName`, `src/persona-identity.ts`): `tmuxUnresponsiveOnsetText`,
  * `tmuxUnresponsiveAlertText` and `tmuxUnresponsiveRecoveryText`.
  *
  * Log lines, to the injected log (a throwing log is swallowed):
@@ -331,7 +333,7 @@ import {
 import type { KillRetryAlert } from './kill-retry.ts'
 import { describeThrownValue, isSafeIdentifier } from './persona-connection-errors.ts'
 import { SYSTEM_PERSONA_CONNECTION_CLOCK, type PersonaConnectionClock } from './persona-connections.ts'
-import { personaInstanceId, personaTmuxSessionName } from './persona-identity.ts'
+import { personaInstanceId, personaTmuxSessionName, quotedPersonaSessionName } from './persona-identity.ts'
 import {
   PERSONA_TEARDOWN_NOTICE_LABEL,
   personaTeardownNoticeEntryText,
@@ -451,10 +453,20 @@ export const PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR = 'unclassified-error'
 export const PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY = 'slow-dead-session-recovery'
 
 /**
- * Stuck launch (SRJ-410, SRJ-1017): from its first post until the row
- * reaches a live state out of `pending`, the persona latches, or it is torn
- * down. Each of its two texts posts at most once (one mark each), and a
- * relaunch after CSCB's abort keeps the episode. No poster yet (b.jg5 E29).
+ * Stuck launch (SRJ-410, SRJ-1016, SRJ-1017): from its first post until the
+ * row reaches a live state out of `pending` (`waiting`, `working`,
+ * `ask_user` or `check_permission`), the persona latches, or it is torn
+ * down; a read of `pending`, `ended`, `missing` or no row does not end it.
+ * Each of its two texts posts at most once (one mark each), and a relaunch
+ * after CSCB's abort keeps the episode. Posted by the stuck-launch posters
+ * (`postStuckLaunchRelaunching`, `postStuckLaunchHeld`, `src/pending-row.ts`):
+ * a post begins or keeps the episode, and neither posts or begins one while
+ * the persona's `tmux-unavailable` outage is raised. The session manager's
+ * shared own-row reads end it on a live state out of `pending`
+ * (`src/session-manager.ts`), and the latch's hold observer ends it
+ * (`endStuckLaunchEpisodeForLatch`, bound in `main()`); both end it
+ * silently. A teardown needs no step of its own: its `forget` drops the
+ * episode, as shutdown's `close` does.
  */
 export const PERSONA_EPISODE_KIND_STUCK_LAUNCH = 'stuck-launch'
 
@@ -833,15 +845,10 @@ function safeLog(log: (line: string) => void, line: string): void {
  */
 export const TMUX_UNRESPONSIVE_ONSET_FLOOR_MS = 120_000
 
-/** `<session>` in SRJ-1006's texts: the persona's quoted session name (SRJ-1001). */
-function quotedSession(key: string): string {
-  return `"${personaTmuxSessionName(key)}"`
-}
-
 /** The onset notice's body for persona `key` (b.jg5 SRJ-1006); the persona notifier adds the persona prefix. */
 export function tmuxUnresponsiveOnsetText(key: string): string {
   return (
-    `:hourglass_flowing_sand: *Not answering* — agent-director or tmux is not answering for this persona's session ${quotedSession(key)}. ` +
+    `:hourglass_flowing_sand: *Not answering* — agent-director or tmux is not answering for this persona's session ${quotedPersonaSessionName(key)}. ` +
     'CSCB keeps retrying; nothing is needed yet.'
   )
 }
@@ -853,7 +860,7 @@ export function tmuxUnresponsiveOnsetText(key: string): string {
  */
 export function tmuxUnresponsiveAlertText(key: string, thresholdMs: number): string {
   return (
-    `:rotating_light: *Still not answering* — this persona has not reached its session ${quotedSession(key)} ` +
+    `:rotating_light: *Still not answering* — this persona has not reached its session ${quotedPersonaSessionName(key)} ` +
     `for over ${wholeMinutes(thresholdMs)} minutes. CSCB keeps retrying and takes no destructive action. ` +
     "If this persists, a human should check the host's tmux server and agent-director."
   )
@@ -861,7 +868,7 @@ export function tmuxUnresponsiveAlertText(key: string, thresholdMs: number): str
 
 /** The recovery notice's body for persona `key` (b.jg5 SRJ-1006). */
 export function tmuxUnresponsiveRecoveryText(key: string): string {
-  return `:white_check_mark: *Answering again* — this persona reaches its session ${quotedSession(key)} again.`
+  return `:white_check_mark: *Answering again* — this persona reaches its session ${quotedPersonaSessionName(key)} again.`
 }
 
 /** The onset's mark: the default one, so `hasPosted` with no mark answers whether the onset was posted. */
