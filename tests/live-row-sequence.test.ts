@@ -191,6 +191,7 @@ import {
   LIVE_ROW_SEQUENCE_ENTRY_GET,
   LIVE_ROW_SEQUENCE_ENTRY_KILL,
   LIVE_ROW_SEQUENCE_GRACE_NEVER_ENDS_TEXT,
+  LIVE_ROW_SEQUENCE_GRACE_REARM_LOG_SPACING_MS,
   LIVE_ROW_SEQUENCE_GRACE_REARM_MS,
   LIVE_ROW_SEQUENCE_GRACE_UNREADABLE_TEXT,
   LIVE_ROW_SEQUENCE_LOG_PREFIX,
@@ -798,6 +799,12 @@ describe('the pending wait: until G past the launch start, never early (SRJ-705 
    * its message only (no stack frame, so no absolute file path).
    */
   function armFailedLines(h: RecoveryHarness, key: string, unreadable: () => number): string[] {
+    const expected = armFailedLine(h, key, unreadable)
+    return h.lines.filter((line) => line === expected)
+  }
+
+  /** Persona `key`'s arm-failed line for what arming over `unreadable` throws (see `armFailedLines`). */
+  function armFailedLine(h: RecoveryHarness, key: string, unreadable: () => number): string {
     let thrown: Error | undefined
     try {
       armNeverEarlyWait(h.clock, LAUNCH_START_MS, unreadable, () => {})
@@ -805,8 +812,7 @@ describe('the pending wait: until G past the launch start, never early (SRJ-705 
       thrown = err as Error
     }
     if (thrown === undefined) throw new Error('the accessor armed a wait')
-    const expected = liveRowSequenceWaitArmFailedLine(`persona=${key}`, `${thrown.name} ${describeLogMessage(thrown.message)}`)
-    return h.lines.filter((line) => line === expected)
+    return liveRowSequenceWaitArmFailedLine(`persona=${key}`, `${thrown.name} ${describeLogMessage(thrown.message)}`)
   }
 
   /** Persona `key`'s step-2 armed lines in `h` for a launch start of `LAUNCH_START_MS` (any G). */
@@ -826,10 +832,11 @@ describe('the pending wait: until G past the launch start, never early (SRJ-705 
     return startWithDeps(h, key, stop, { graceMs }, { lastReadState: PENDING, entryStep: LIVE_ROW_SEQUENCE_ENTRY_GET })
   }
 
-  test.each(UNREADABLE_G)('a G accessor that %s while arming: one line and no run, the arm tried again every re-arm wait; once G reads, the first run comes exactly at G past the launch start', async (_label, unreadable) => {
+  test.each(UNREADABLE_G)('a G accessor that %s while arming: one line at the first failure and no run, the arm tried again every re-arm wait with no line inside the log spacing; once G reads, the first run comes exactly at G past the launch start', async (_label, unreadable) => {
     const { h, p } = build()
     const REARMS = 2
     expect((REARMS + 1) * LIVE_ROW_SEQUENCE_GRACE_REARM_MS).toBeLessThan(adGraceMsInEffect())
+    expect(REARMS * LIVE_ROW_SEQUENCE_GRACE_REARM_MS).toBeLessThan(LIVE_ROW_SEQUENCE_GRACE_REARM_LOG_SPACING_MS)
     await clockAt(h, LAUNCH_START_MS)
     pendingThenMarkedMissing(h, p, {})
     const times = runTimes(h)
@@ -841,13 +848,13 @@ describe('the pending wait: until G past the launch start, never early (SRJ-705 
       expect(h.clock.pending().map((timer) => timer.delayMs)).toEqual([LIVE_ROW_SEQUENCE_GRACE_REARM_MS])
       await h.clock.runNext()
     }
-    expect(armFailedLines(h, p, unreadable)).toHaveLength(REARMS + 1)
+    expect(armFailedLines(h, p, unreadable)).toHaveLength(1)
     expect(times).toEqual([])
 
     readable = true
     expect(await h.driveSequence(outcome)).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, runs: 1 })
     expect(times).toEqual([LAUNCH_START_MS + adGraceMsInEffect()])
-    expect(armFailedLines(h, p, unreadable)).toHaveLength(REARMS + 1)
+    expect(armFailedLines(h, p, unreadable)).toHaveLength(1)
   })
 
   test.each(UNREADABLE_G)('a G accessor that %s while arming: the armed line names G as unreadable with no deadline, and no G line carries a stack frame or a file path', async (_label, unreadable) => {
@@ -863,9 +870,9 @@ describe('the pending wait: until G past the launch start, never early (SRJ-705 
     expect(armedLines(h, p)[0]).toContain(`G=${LIVE_ROW_SEQUENCE_GRACE_UNREADABLE_TEXT})`)
     expect(armedLines(h, p)[0]).not.toContain(LIVE_ROW_SEQUENCE_GRACE_NEVER_ENDS_TEXT)
     expect(armedLines(h, p)[0]).not.toContain('deadline=')
-    expect(armFailedLines(h, p, unreadable)).toHaveLength(2)
+    expect(armFailedLines(h, p, unreadable)).toHaveLength(1)
     const lines = step2Lines(h, p)
-    expect(lines).toHaveLength(3)
+    expect(lines).toHaveLength(2)
     for (const line of lines) {
       expect(line).not.toContain(' at ')
       expect(line).not.toContain(' <- ')
@@ -900,7 +907,7 @@ describe('the pending wait: until G past the launch start, never early (SRJ-705 
     expect(h.clock.pendingCount()).toBe(0)
   })
 
-  test.each(UNREADABLE_G)('a G accessor that %s while arming, long past G: no run or other call, one timer at a time; a stop ends the wait as stopped and leaves no timer', async (_label, unreadable) => {
+  test.each(UNREADABLE_G)('a G accessor that %s while arming, long past G: no run or other call, one timer at a time, its line once per log spacing from the first failure; a stop ends the wait as stopped and leaves no timer', async (_label, unreadable) => {
     const { h, p } = build()
     await clockAt(h, LAUNCH_START_MS)
     pendingThenMarkedMissing(h, p, {})
@@ -909,20 +916,95 @@ describe('the pending wait: until G past the launch start, never early (SRJ-705 
     const outcome = startOnPendingRow(h, p, stop, unreadable)
     await h.clock.flush()
 
-    let tries = 1
+    // The clock time of each arm-failed line: the re-arm wait divides the spacing, so a try falls on each spacing.
+    expect(LIVE_ROW_SEQUENCE_GRACE_REARM_LOG_SPACING_MS % LIVE_ROW_SEQUENCE_GRACE_REARM_MS).toBe(0)
+    expect(armFailedLines(h, p, unreadable)).toHaveLength(1)
+    const loggedAt = [h.clock.now()]
     while (h.clock.now() < LAUNCH_START_MS + 2 * adGraceMsInEffect()) {
       expect(h.clock.pending().map((timer) => timer.delayMs)).toEqual([LIVE_ROW_SEQUENCE_GRACE_REARM_MS])
+      const before = armFailedLines(h, p, unreadable).length
       await h.clock.runNext()
-      tries++
+      if (armFailedLines(h, p, unreadable).length > before) loggedAt.push(h.clock.now())
     }
     expect(calls).toEqual([['get', LAUNCH_START_MS]])
-    expect(armFailedLines(h, p, unreadable)).toHaveLength(tries)
+    const spacings = Math.floor((h.clock.now() - LAUNCH_START_MS) / LIVE_ROW_SEQUENCE_GRACE_REARM_LOG_SPACING_MS)
+    expect(spacings).toBeGreaterThan(1)
+    expect(loggedAt).toEqual(Array.from({ length: spacings + 1 }, (_, i) => LAUNCH_START_MS + i * LIVE_ROW_SEQUENCE_GRACE_REARM_LOG_SPACING_MS))
+    expect(armFailedLines(h, p, unreadable)).toHaveLength(loggedAt.length)
 
     stop.stop(LIVE_ROW_STOP_TEARDOWN)
 
     expect(await h.driveSequence(outcome)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_TEARDOWN, runs: 0, kills: 0 })
     expect(h.clock.pendingCount()).toBe(0)
     expect(calls).toEqual([['get', LAUNCH_START_MS]])
+  })
+
+  /** The unreadable G accessors by label (see `UNREADABLE_G`). */
+  const unreadableG = (label: string): (() => number) => UNREADABLE_G.find(([name]) => name === label)![1]
+
+  test('a G accessor whose failure changes while arming: a line at each failure whose description differs from the last one logged, inside the log spacing, and none for a repeat', async () => {
+    const { h, p } = build()
+    await clockAt(h, LAUNCH_START_MS)
+    pendingThenMarkedMissing(h, p, {})
+    const throws = unreadableG('throws')
+    const nan = unreadableG('answers NaN')
+    // One accessor per try: throws, throws, NaN, NaN, throws.
+    const tries = [throws, throws, nan, nan, throws]
+    expect((tries.length - 1) * LIVE_ROW_SEQUENCE_GRACE_REARM_MS).toBeLessThan(LIVE_ROW_SEQUENCE_GRACE_REARM_LOG_SPACING_MS)
+    let at = 0
+    const stop = createLiveRowSequenceStop()
+    const outcome = startOnPendingRow(h, p, stop, () => tries[Math.min(at, tries.length - 1)]!())
+    await h.clock.flush()
+    for (at = 1; at < tries.length; at++) await h.clock.runNext()
+
+    const thrownLine = armFailedLine(h, p, throws)
+    const nanLine = armFailedLine(h, p, nan)
+    expect(thrownLine).not.toBe(nanLine)
+    expect(h.lines.filter((line) => line === thrownLine || line === nanLine)).toEqual([thrownLine, nanLine, thrownLine])
+    expect(h.clock.pending().map((timer) => timer.delayMs)).toEqual([LIVE_ROW_SEQUENCE_GRACE_REARM_MS])
+
+    stop.stop(LIVE_ROW_STOP_TEARDOWN)
+    expect(await h.driveSequence(outcome)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_TEARDOWN, runs: 0 })
+    expect(h.clock.pendingCount()).toBe(0)
+  })
+
+  test('a clock that cannot be read while G cannot either: the first failure\'s line and then a changed failure\'s only, never a spacing line; the re-arms go on', async () => {
+    const { h, p } = build()
+    await clockAt(h, LAUNCH_START_MS)
+    pendingThenMarkedMissing(h, p, {})
+    const clock: LiveRowSequenceDeps['clock'] = {
+      now: () => {
+        throw new Error('the clock could not be read')
+      },
+      setTimeout: (callback, ms) => h.clock.setTimeout(callback, ms),
+      clearTimeout: (handle) => h.clock.clearTimeout(handle),
+    }
+    const throws = unreadableG('throws')
+    const nan = unreadableG('answers NaN')
+    let unreadable = throws
+    const stop = createLiveRowSequenceStop()
+    const outcome = startWithDeps(h, p, stop, { clock, graceMs: () => unreadable() }, { lastReadState: PENDING, entryStep: LIVE_ROW_SEQUENCE_ENTRY_GET })
+    await h.clock.flush()
+
+    // Past two log spacings on the harness clock, re-arming all the while.
+    const rearmsPast = (spacings: number): number => (spacings * LIVE_ROW_SEQUENCE_GRACE_REARM_LOG_SPACING_MS) / LIVE_ROW_SEQUENCE_GRACE_REARM_MS + 1
+    const rearm = async (count: number): Promise<void> => {
+      for (let i = 0; i < count; i++) {
+        expect(h.clock.pending().map((timer) => timer.delayMs)).toEqual([LIVE_ROW_SEQUENCE_GRACE_REARM_MS])
+        await h.clock.runNext()
+      }
+    }
+    await rearm(rearmsPast(2))
+    expect(armFailedLines(h, p, throws)).toHaveLength(1)
+
+    unreadable = nan
+    await rearm(rearmsPast(2))
+    expect(armFailedLines(h, p, nan)).toHaveLength(1)
+    expect(armFailedLines(h, p, throws)).toHaveLength(1)
+
+    stop.stop(LIVE_ROW_STOP_TEARDOWN)
+    expect(await h.driveSequence(outcome)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_TEARDOWN, runs: 0 })
+    expect(h.clock.pendingCount()).toBe(0)
   })
 
   test.each([

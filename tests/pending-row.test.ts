@@ -165,9 +165,10 @@
  * before or after its window get the held post and no kill; the relaunch
  * still `pending` at its B gets the held text once and no kill; the abort
  * kill's `ErrTmuxKillFailed` (3 tries, 2 s apart, one alert with the
- * 'stuck-launch abort' context, the held text once at the next retry), each
- * CONFLICT and UNUSABLE NAME row of `conflict-cases.ts` (a latch with one
- * post, never retried, the kill backstop included), UNAVAILABLE from the
+ * 'stuck-launch abort' context, the held text once at the next retry), the
+ * CONFLICT kill backstop and one UNUSABLE NAME row of `conflict-cases.ts` (a
+ * latch with one post, never retried; every row is session-manager.test.ts's
+ * at unit level), UNAVAILABLE from the
  * approver's stop and from a retry (`tmux-unresponsive` or the arm, hatch
  * A2, then the same abort with no second post), `ErrTmuxNotAvailable` (the
  * same abort only once a lap clears the outage), CONFIG (the abort waits for
@@ -266,6 +267,9 @@ import {
   stuckLaunchAbortKillUsesAbort,
   stuckLaunchAbortSequenceLine,
   stuckLaunchAbortSkippedLine,
+  STUCK_LAUNCH_POST_SKIP_CONFIG_MALFORMED,
+  STUCK_LAUNCH_POST_SKIP_CONFIG_MALFORMED_ABORT_USED,
+  stuckLaunchPostSkippedLine,
   stuckLaunchAbortStartedLine,
   type StuckLaunchAbortDeps,
   type StuckLaunchAbortKillAnswer,
@@ -376,6 +380,7 @@ import {
   type PendingRowOwnLaunchHooks,
   type PendingRowRelaunchAnswer,
   type PendingRowRuleAnswer,
+  type PendingRowRuleRefusalReason,
   type PendingRowRuleDeps,
   type PendingRowRuleGet,
   type PendingRowRuleInput,
@@ -407,8 +412,9 @@ import { OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL } from '../src/retired-keys.ts'
 import { KILL_FAILURE_CLOSING_DESTINATION, KILL_FAILURE_CONTEXT_RECOVERY, KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT } from '../src/kill-failure-alert.ts'
 import { KILL_RETRY_SPACING_MS, KILL_RETRY_TRIES } from '../src/kill-retry.ts'
 import { describeKillOutcome, KILL_OUTCOME_KILLED } from '../src/checked-kill.ts'
-import { LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT } from '../src/ad-error-class.ts'
-import { getFailureCount } from '../src/backoff.ts'
+import { AD_ERROR_CLASS_UNAVAILABLE, LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT } from '../src/ad-error-class.ts'
+import { getFailureCount, recordFailure } from '../src/backoff.ts'
+import { RESTART_FAILURE_CAP } from '../src/restart.ts'
 import { LIVE_ROW_SEQUENCE_ENTRY_KILL, LIVE_ROW_START_STARTED, type LiveRowSequenceRequest } from '../src/live-row-sequence.ts'
 import {
   CONFIG_DIR_LABEL_PREFIX,
@@ -426,7 +432,9 @@ import {
   _resetFindMissingMemo,
   _setConfigDirFs,
   _setFindMissingMemoTtlMs,
+  APPROVER_STOP_CAP,
   APPROVER_STOP_STUCK_LAUNCH_ABORT,
+  buildPendingRowRuleDeps,
   isCscbOwnLaunch,
   LAUNCH_CALL_END_LAUNCH_TIMEOUT,
   launchCallWindowOf,
@@ -434,7 +442,11 @@ import {
   paneShowsStartupDialog,
   PENDING_ROW_STEP_LATCHED,
   pendingRowComparisonFor,
+  pendingRowRuleApproverStopGatedLine,
+  pendingRowRuleApproverStopLine,
+  pendingRowRuleNoEpisodesLine,
   readAndStepPendingRow,
+  setStuckLaunchEpisodes,
   SPAWN_ACTION_RETRYING,
   type RowPersonaComparison,
   type SpawnPersonaResult,
@@ -443,12 +455,20 @@ import {
 } from '../src/session-manager.ts'
 import {
   RETRY_BLOCK_LAUNCH,
+  UNAVAILABLE_RETRY_AGAIN_ROW_PENDING,
+  UNAVAILABLE_RETRY_AGAIN_SEQUENCE_STARTED,
   UNAVAILABLE_RETRY_BASE_S,
   UNAVAILABLE_RETRY_CAUSE_CONFIG,
   UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
   UNAVAILABLE_RETRY_CEILING_S,
+  UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
+  UNAVAILABLE_RETRY_ROW_PENDING,
+  UNAVAILABLE_RETRY_STOP_CAPPED,
+  UNAVAILABLE_RETRY_STOP_HELD,
   UNAVAILABLE_RETRY_STOP_LATCHED,
+  UNAVAILABLE_RETRY_STOP_NOT_APPLIED,
+  UNAVAILABLE_RETRY_STOP_NOT_UP,
   UNAVAILABLE_RETRY_STOP_ROW_GONE,
   UNAVAILABLE_RETRY_STOP_ROW_LIVE,
 } from '../src/unavailable-retry.ts'
@@ -463,6 +483,7 @@ import {
   errConfigMalformed,
   errGeneric,
   errInstanceIdCollision,
+  errInvalidFlags,
   errNoSessionId,
   errSendKeysWhileRelayed,
   errSpawnNotFound,
@@ -533,8 +554,11 @@ import {
   makeRecoveryHarness,
   ordinaryAlertContent,
   personaOf,
+  pendingOnlyStoppedLine,
   personaRow,
+  reArmedLine,
   recordSequenceStarts,
+  retryLinesOf,
   retryNow,
   scriptModelLaunch,
   type RecoveryHarness,
@@ -967,7 +991,7 @@ describe('armPendingRowWait: never early, from the launch start, on createFakeCl
     expect(fired).toEqual([launchStartMs + newGraceMs])
   })
 
-  test('a G beyond the timer maximum (the one such case here, E6): no fire after 1 ms, one timer at a time none asking more than the maximum, and one fire exactly at launch start + G', async () => {
+  test('a G beyond the timer maximum at the pending wait\'s arm (E6; the rule\'s harness has its own case at a retry): no fire after 1 ms, one timer at a time none asking more than the maximum, and one fire exactly at launch start + G', async () => {
     installSettings({ tmux: { pending_grace_seconds: BigInt(Math.ceil(MAX_TIMER_DELAY_MS / MS_PER_SECOND)) } })
     const graceMs = adGraceMsInEffect()
     expect(graceMs).toBeGreaterThan(MAX_TIMER_DELAY_MS)
@@ -1480,11 +1504,6 @@ describe('stuckLaunchRelaunchingText: B in whole minutes, rounded down, and P\'s
     expect(text).not.toBe(stuckLaunchRelaunchingText(PREFIX_KEY, (minutes + 1) * MINUTE_MS))
   })
 
-  test('pending_grace_seconds 300 states one minute more than the defaults (5 → 6)', () => {
-    const atDefaults = wholeMinutes(adLaunchBoundMsInEffect())
-    installSettings({ tmux: { pending_grace_seconds: 300n } })
-    expect(wholeMinutes(adLaunchBoundMsInEffect())).toBe(atDefaults + 1)
-  })
 })
 
 describe('both texts name P\'s own session, quoted (b.jg5 SRJ-1017, SRJ-1001; b.1ix)', () => {
@@ -1900,6 +1919,16 @@ describe('the stuck-launch posters: closed episodes, a submitted teardown, and f
     assertNoLeak(lines)
   })
 
+  test('the session manager\'s held poster with no episodes instance: failed (never suppressed, the tmux-unavailable gate\'s answer), with its one line', () => {
+    setStuckLaunchEpisodes(undefined)
+    const lines: string[] = []
+    const deps = buildPendingRowRuleDeps({ appliedPersona: () => undefined, log: (line) => void lines.push(line) })
+
+    expect(deps.postHeld(P, RULE_START, false)).toBe(STUCK_LAUNCH_POST_FAILED)
+
+    expect(lines).toEqual([pendingRowRuleNoEpisodesLine(P)])
+  })
+
   test('a log that throws changes nothing: the text posts once, then posts nothing', () => {
     const rig = posterRig({
       log: () => {
@@ -2207,6 +2236,7 @@ describe('decidePendingRowStepThree: still pending at B, judged or not (b.jg5 SR
     ['CSCB\'s own launch, its abort available', { ownLaunch: true, abortAvailable: true }, { kind: PENDING_ROW_STEP3_RELAUNCH }],
     ['CSCB\'s own launch, its abort available, ad-config-malformed raised', { ownLaunch: true, abortAvailable: true, configMalformedRaised: true }, { kind: PENDING_ROW_STEP3_CONFIG_MALFORMED }],
     ['CSCB\'s own launch, its abort spent: the held text', { ownLaunch: true }, { kind: PENDING_ROW_STEP3_HELD, attachLine: true }],
+    ['CSCB\'s own launch, its abort spent, ad-config-malformed raised: neither text', { ownLaunch: true, configMalformedRaised: true }, { kind: PENDING_ROW_STEP3_CONFIG_MALFORMED }],
     ['any other row: the held text with the attach line', {}, { kind: PENDING_ROW_STEP3_HELD, attachLine: true }],
     ['any other row, ad-config-malformed raised: still the held text', { configMalformedRaised: true }, { kind: PENDING_ROW_STEP3_HELD, attachLine: true }],
     ['any other row whose launch met ErrSpawnNotInteractive: the held text without the attach line', { metNotInteractive: true }, { kind: PENDING_ROW_STEP3_HELD, attachLine: false }],
@@ -2343,7 +2373,7 @@ function ruleInput(overrides: Partial<PendingRowRuleInput> = {}): PendingRowRule
 const RULE_INPUT_ORIGINS: Array<PendingRowRuleInput['origin']> = [PENDING_ROW_RULE_ORIGIN_RETRY, PENDING_ROW_RULE_ORIGIN_APPROVER_STOP]
 
 /** A refusal answer with `reason`. */
-const refusalOf = (reason: string): PendingRowRuleAnswer => ({ kind: PENDING_ROW_RULE_REFUSAL, reason }) as PendingRowRuleAnswer
+const refusalOf = (reason: PendingRowRuleRefusalReason): PendingRowRuleAnswer => ({ kind: PENDING_ROW_RULE_REFUSAL, reason })
 
 /** The fixed start of the rule's gate line for `ref` at `origin` (everything before its reason). */
 const gateLineStart = (ref: string, origin: PendingRowRuleInput['origin']): string => pendingRowRuleGateLine(ref, origin, '').split(' — ')[0]!
@@ -2613,15 +2643,40 @@ describe('the pending-row rule\'s step 3 at B: the held post, never a kill; noth
     }
   }
 
-  test.each<[string, () => boolean, boolean, Partial<PendingRowRuleDeps>, string]>([
-    ['the own-launch slot answering own with its abort available: the slot\'s branch, no held post', () => true, true, {}, 'relaunch'],
-    ['own, its abort available, ad-config-malformed raised: neither text, no abort', () => true, true, { isConfigMalformedRaised: () => true }, 'config-malformed'],
-    ['own, its abort spent: the held post', () => true, false, {}, 'held'],
-    ['an own-launch query that throws: not own, the held post', () => { throw new Error('record failed') }, true, {}, 'held'],
-    ['own while tmux-unavailable is raised: nothing', () => true, true, { isTmuxUnavailableRaised: () => true }, 'tmux-unavailable'],
-  ])('%s', async (_label, own, abort, overrides, expected) => {
+  /**
+   * Overrides that latch P at step 3 itself: P is not latched until step 3
+   * asks its tmux-unavailable query (not raised), so the latched query step 3
+   * asks next is the first to answer latched.
+   */
+  function latchedAtStepThree(): Partial<PendingRowRuleDeps> {
+    let latched = false
+    return {
+      isLatched: () => latched,
+      isTmuxUnavailableRaised: () => {
+        latched = true
+        return false
+      },
+    }
+  }
+
+  // SRJ-412: the "earlier abort" line is logged exactly when CSCB's own
+  // launch, its episode's abort used, gets the held text, just before the
+  // held round line; never when step 3 answers anything else. SRJ-1017: the
+  // skipped-post line is logged exactly when step 3 answers config-malformed
+  // (CSCB's own launch only), just before that round line.
+  test.each<[string, () => boolean, boolean, Partial<PendingRowRuleDeps>, RuleRigOptions, 'relaunch' | 'held' | 'latched' | PendingRowRuleRefusalReason, boolean]>([
+    ['the own-launch slot answering own with its abort available: the slot\'s branch, no held post', () => true, true, {}, {}, 'relaunch', false],
+    ['own, its abort available, ad-config-malformed raised: neither text, no abort', () => true, true, { isConfigMalformedRaised: () => true }, {}, 'config-malformed', false],
+    ['own, its abort spent, ad-config-malformed raised: neither text, no earlier-abort line', () => true, false, { isConfigMalformedRaised: () => true }, {}, 'config-malformed', false],
+    ['not own, ad-config-malformed raised: still the held post, no skipped-post line', () => false, false, { isConfigMalformedRaised: () => true }, {}, 'held', false],
+    ['own, its abort spent: the held post, after the earlier-abort line', () => true, false, {}, {}, 'held', true],
+    ['an own-launch query that throws: not own, the held post, no earlier-abort line', () => { throw new Error('record failed') }, true, {}, {}, 'held', false],
+    ['own while tmux-unavailable is raised: nothing', () => true, true, { isTmuxUnavailableRaised: () => true }, {}, 'tmux-unavailable', false],
+    ['own, its abort spent, tmux-unavailable raised: nothing, no earlier-abort line', () => true, false, { isTmuxUnavailableRaised: () => true }, {}, 'tmux-unavailable', false],
+    ['own, its abort spent, latched at step 3: nothing, no earlier-abort line', () => true, false, latchedAtStepThree(), {}, 'latched', false],
+  ])('%s', async (_label, own, abort, overrides, options, expected, earlierAbortLine) => {
     const relaunched: unknown[] = []
-    const rig = ruleRig({ ownLaunch: ownLaunchHooks(own, abort, relaunched), ...overrides }, atB)
+    const rig = ruleRig({ ownLaunch: ownLaunchHooks(own, abort, relaunched), ...overrides }, { ...atB, ...options })
     const answer = await rig.rule.run(ruleInput())
     switch (expected) {
       case 'relaunch':
@@ -2632,9 +2687,29 @@ describe('the pending-row rule\'s step 3 at B: the held post, never a kill; noth
         expect(answer.kind).toBe(PENDING_ROW_RULE_HELD)
         expect([relaunched, rig.posts]).toEqual([[], [[RULE_KEY, RULE_START, false]]])
         break
+      case 'latched':
+        expect(answer.kind).toBe(PENDING_ROW_RULE_LATCHED)
+        expect([relaunched, rig.posts]).toEqual([[], []])
+        break
       default:
         expect(answer).toEqual(refusalOf(expected))
         expect([relaunched, rig.posts]).toEqual([[], []])
+    }
+    const earlier = stuckLaunchAbortSkippedLine(RULE_KEY, STUCK_LAUNCH_ABORT_SKIP_EARLIER_ABORT)
+    if (earlierAbortLine) {
+      expect(rig.lines.slice(-2)).toEqual([earlier, rig.lines.at(-1)!])
+      expect(rig.lines.at(-1)!.startsWith(roundLineStart(RULE_REF, PENDING_ROW_RULE_ORIGIN_RETRY, RULE_START))).toBe(true)
+      expect(rig.lines.filter((line) => line === earlier)).toHaveLength(1)
+    } else {
+      expect(rig.lines).not.toContain(earlier)
+    }
+    const skippedLines = [STUCK_LAUNCH_POST_SKIP_CONFIG_MALFORMED, STUCK_LAUNCH_POST_SKIP_CONFIG_MALFORMED_ABORT_USED].map((why) => stuckLaunchPostSkippedLine(RULE_KEY, why))
+    if (expected === PENDING_ROW_STEP3_CONFIG_MALFORMED) {
+      const skipped = stuckLaunchPostSkippedLine(RULE_KEY, abort ? STUCK_LAUNCH_POST_SKIP_CONFIG_MALFORMED : STUCK_LAUNCH_POST_SKIP_CONFIG_MALFORMED_ABORT_USED)
+      expect(rig.lines.filter((line) => skippedLines.includes(line))).toEqual([skipped])
+      expect(rig.lines.at(-2)).toBe(skipped)
+    } else {
+      expect(rig.lines.filter((line) => skippedLines.includes(line))).toEqual([])
     }
   })
 
@@ -2658,6 +2733,47 @@ describe('the pending-row rule\'s step 3 at B: the held post, never a kill; noth
     expect(abort.posters.posts).toEqual([{ key: P, text: RELAUNCHING.text(P) }])
     expect(rig.posts).toEqual([])
     expect(abort.abort.isAbortUsed(P)).toBe(true)
+  })
+
+  // SRJ-1017 over SRJ-412: CSCB's own launch whose one abort is used gets
+  // neither text while ad-config-malformed is raised; once it clears, the held
+  // text through the real poster, once in the episode.
+  test('CSCB\'s own launch whose abort is used, still pending at B while ad-config-malformed is raised: no post and the abort-used skipped-post line at every round; once it clears, the held text once', async () => {
+    const abort = abortRig()
+    const rig = ruleRig(
+      {
+        ownLaunch: abort.abort,
+        isConfigMalformedRaised: () => abort.flags.configMalformed,
+        postHeld: (key, launchStart, metNotInteractive) => postStuckLaunchHeld(abort.posters.deps, key, launchStart, metNotInteractive),
+      },
+      atB,
+    )
+    expect(await rig.rule.run(ruleInput())).toEqual({ kind: PENDING_ROW_RULE_RELAUNCH, answer: { kind: PENDING_ROW_RELAUNCH_SEQUENCE_STARTED } })
+    expect(abort.abort.isAbortUsed(P)).toBe(true)
+    const callsAfterAbort = [...abort.calls]
+
+    abort.flags.configMalformed = true
+    const skipped = stuckLaunchPostSkippedLine(RULE_KEY, STUCK_LAUNCH_POST_SKIP_CONFIG_MALFORMED_ABORT_USED)
+    const earlier = stuckLaunchAbortSkippedLine(RULE_KEY, STUCK_LAUNCH_ABORT_SKIP_EARLIER_ABORT)
+    const origins = [PENDING_ROW_RULE_ORIGIN_APPROVER_STOP, PENDING_ROW_RULE_ORIGIN_RETRY] as const
+    for (const origin of origins) {
+      const before = rig.lines.length
+      expect(await rig.rule.run(ruleInput({ origin }))).toEqual(refusalOf(PENDING_ROW_STEP3_CONFIG_MALFORMED))
+      expect(rig.lines.slice(before)).toHaveLength(2)
+      expect(rig.lines[before]).toBe(skipped)
+    }
+    expect(rig.lines).not.toContain(earlier)
+    expect([abort.calls, abort.posters.posts]).toEqual([callsAfterAbort, [{ key: P, text: RELAUNCHING.text(P) }]])
+
+    abort.flags.configMalformed = false
+    expect(await rig.rule.run(ruleInput())).toEqual({ kind: PENDING_ROW_RULE_HELD, post: STUCK_LAUNCH_POSTED })
+    expect(await rig.rule.run(ruleInput())).toEqual({ kind: PENDING_ROW_RULE_HELD, post: STUCK_LAUNCH_ALREADY_POSTED })
+    expect(abort.posters.posts).toEqual([
+      { key: P, text: RELAUNCHING.text(P) },
+      { key: P, text: stuckLaunchHeldText(P, RULE_START, false) },
+    ])
+    expect(rig.lines.filter((line) => line === skipped)).toHaveLength(origins.length)
+    expect(abort.calls).toEqual(callsAfterAbort)
   })
 })
 
@@ -2700,7 +2816,7 @@ interface AbortRig {
 /** A kill answer of `kind` (`try-later` as UNAVAILABLE), with a fixed description. */
 function abortKillAnswer(kind: StuckLaunchAbortKillAnswer['kind'], killSent?: boolean): StuckLaunchAbortKillAnswer {
   const description = `the case's ${kind} outcome`
-  if (kind === STUCK_LAUNCH_ABORT_KILL_TRY_LATER) return { kind, errorClass: 'UNAVAILABLE', description }
+  if (kind === STUCK_LAUNCH_ABORT_KILL_TRY_LATER) return { kind, errorClass: AD_ERROR_CLASS_UNAVAILABLE, description }
   if (kind === STUCK_LAUNCH_ABORT_KILL_SUCCEEDED && killSent !== undefined) return { kind, killSent, description }
   return { kind, description } as StuckLaunchAbortKillAnswer
 }
@@ -2801,7 +2917,7 @@ describe('createStuckLaunchAbort: the relaunching post, the approver stopped, on
     expect(rig.posters.lines.filter((line) => line === posterLine(P, RELAUNCHING, STUCK_LAUNCH_ALREADY_POSTED))).toHaveLength(2)
   })
 
-  test('once the abort is used: the abort is not available (one line per ask), and a further relaunch makes no kill; Q\'s abort is its own', async () => {
+  test('once the abort is used: the abort is not available (a pure query: no line), and a further relaunch makes no kill, with its one line; Q\'s abort is its own', async () => {
     const rig = abortRig()
     expect(rig.abort.isAbortAvailable(P)).toBe(true)
     expect(rig.posters.lines).toEqual([])
@@ -2809,8 +2925,13 @@ describe('createStuckLaunchAbort: the relaunching post, the approver stopped, on
     const lines = rig.posters.lines.length
 
     expect(rig.abort.isAbortAvailable(P)).toBe(false)
-    expect(rig.posters.lines.slice(lines)).toEqual([stuckLaunchAbortSkippedLine(P, STUCK_LAUNCH_ABORT_SKIP_EARLIER_ABORT)])
+    expect(rig.abort.isAbortAvailable(P)).toBe(false)
+    expect(rig.posters.lines.slice(lines)).toEqual([])
     expect(await relaunchOf(rig)).toEqual(keptFor(STUCK_LAUNCH_ABORT_SKIP_EARLIER_ABORT))
+    expect(rig.posters.lines.slice(lines)).toEqual([
+      posterLine(P, RELAUNCHING, STUCK_LAUNCH_ALREADY_POSTED),
+      stuckLaunchAbortSkippedLine(P, STUCK_LAUNCH_ABORT_SKIP_EARLIER_ABORT),
+    ])
     expect([rig.abort.isAbortAvailable(Q), rig.abort.isAbortUsed(Q)]).toEqual([true, false])
 
     expect(rig.calls).toEqual(['stop', 'kill', 'sequence'])
@@ -2853,15 +2974,17 @@ describe('createStuckLaunchAbort: the relaunching post, the approver stopped, on
 
   test('an abort of P in progress: a second call makes no post, stop or kill, with its line; the first then ends as before', async () => {
     let release!: (answer: StuckLaunchAbortKillAnswer) => void
+    let entered!: () => void
+    const killEntered = new Promise<void>((resolve) => (entered = resolve))
     const rig = abortRig([], {
       abortKill: () => {
         rig.calls.push('kill')
+        entered()
         return new Promise((resolve) => (release = resolve))
       },
     })
     const first = relaunchOf(rig)
-    await Promise.resolve()
-    await Promise.resolve()
+    await killEntered
     expect(rig.calls).toEqual(['stop', 'kill'])
 
     expect(await relaunchOf(rig)).toEqual(keptFor(STUCK_LAUNCH_ABORT_SKIP_IN_PROGRESS))
@@ -3055,6 +3178,10 @@ interface RuleRound {
   readonly refusals: number | undefined
   /** P's held posts so far. */
   readonly posts: number
+  /** The retry's number on P's timer (`h.attempts`). */
+  readonly retry: number
+  /** The retry timer's last line for P after the round (its re-armed or stopped line). */
+  readonly retryLine: string | undefined
 }
 
 /** Every post to P's destination in `h`, in order: the session manager's, the outage state's, the episodes' and the lost-message driver's. */
@@ -3069,6 +3196,13 @@ const readPaneTimesOf = (h: RecoveryHarness, row: PendingRowModel, fromMs = 0): 
 const heldPostsOf = (h: RecoveryHarness, p: string): string[] =>
   h.episodeNotices.filter((notice) => notice.key === p && notice.text.startsWith(STUCK_LAUNCH_HELD_HEAD)).map((notice) => notice.text)
 
+/** The number of P's last retry in `h`. */
+const lastRetryOf = (h: RecoveryHarness, p: string): number => h.attempts.filter((attempt) => attempt.key === p).at(-1)!.retry
+
+/** The retry timer's re-armed line for a pending-only retry `retry` of P that its rule kept on the pending row (`reason`), after `refusals` refusals. */
+const pendingOnlyReArmedLine = (p: string, retry: number, refusals: number, reason: string = UNAVAILABLE_RETRY_AGAIN_ROW_PENDING): string =>
+  reArmedLine(p, retry, reason, refusals, { ranPendingOnly: true })
+
 /** Run `count` retries of P's timer, each settled, recording each round. */
 async function runRounds(h: RecoveryHarness, p: string, row: PendingRowModel, count: number): Promise<RuleRound[]> {
   const rounds: RuleRound[] = []
@@ -3076,7 +3210,15 @@ async function runRounds(h: RecoveryHarness, p: string, row: PendingRowModel, co
     const waitMs = h.controller.view(p)!.waitMs!
     const before = row.calls.length
     const at = await retryNow(h, p)
-    rounds.push({ at, waitMs, verbs: row.calls.slice(before).map((call) => call.verb), refusals: h.controller.view(p)?.refusals, posts: heldPostsOf(h, p).length })
+    rounds.push({
+      at,
+      waitMs,
+      verbs: row.calls.slice(before).map((call) => call.verb),
+      refusals: h.controller.view(p)?.refusals,
+      posts: heldPostsOf(h, p).length,
+      retry: lastRetryOf(h, p),
+      retryLine: retryLinesOf(h, p).at(-1),
+    })
   }
   return rounds
 }
@@ -3115,6 +3257,13 @@ function failNextLapRead(h: RecoveryHarness, p: string, make: () => Error): void
 /** The launch-path verbs that must never reach a `pending` row: no kill and no launch over it. */
 const KILL_OR_LAUNCH: readonly PendingRowModelVerb[] = ['kill', 'spawn', 'resume']
 
+/** A lap-column answer's own effect: P's `tmux-unavailable` raised. */
+const LAP_COLUMN_TMUX_UNAVAILABLE = 'tmux-unavailable'
+/** A lap-column answer's own effect: P's CONFIG cause armed. */
+const LAP_COLUMN_CONFIG_CAUSE = 'config-cause'
+/** A lap-column answer's own effect, if any. */
+type LapColumnEffect = typeof LAP_COLUMN_TMUX_UNAVAILABLE | typeof LAP_COLUMN_CONFIG_CAUSE | undefined
+
 /** `afterEach` of the rule's harness cases: the seams reset, the case's harness leak-checked and cleaned up. */
 function cleanUpRuleHarness(): void {
   const h = ruleHarness
@@ -3152,6 +3301,9 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     for (const round of rounds) expect(round.verbs).toEqual(round.at < launchStartMs + graceMs ? READ_ONLY_ROUND : LAP_RUN_ROUND)
     expect(rounds.map((round) => round.refusals)).toEqual(rounds.map((_, i) => i + 1))
     expect(rounds.map((round) => round.waitMs)).toEqual(timerWaits(rounds.length))
+    // Every round, before G, from G and at B alike, re-arms the timer on the pending row, pending-only.
+    expect(rounds.map((round) => round.retryLine)).toEqual(rounds.map((round) => pendingOnlyReArmedLine(p, round.retry, round.refusals!)))
+    expect(h.controller.view(p)).toMatchObject({ phase: 'waiting', mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
     // A new find-missing call at every round from G, the memo notwithstanding.
     expect(h.callTimes('findMissing').slice(findMissingBefore)).toEqual(rounds.filter((round) => round.at >= launchStartMs + graceMs).map((round) => round.at))
     // One round line per acting round; none for a round younger than G.
@@ -3189,7 +3341,7 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     const { h, p } = ruleHarnessOf()
     const row = await ORIGIN_START_PASS.begin(h, p, { dialog: PENDING_ROW_DIALOG_UNRECOGNISED, readPane: [make()] })
     const launchStartMs = row.launchStartMs()!
-    while (h.controller.view(p)!.dueAt! < launchStartMs + adGraceMsInEffect()) await retryNow(h, p)
+    await retryUntil(h, p, launchStartMs + adGraceMsInEffect())
 
     const [failed] = await runRounds(h, p, row, 1)
     expect(failed!.verbs).toEqual(LAP_RUN_ROUND)
@@ -3214,7 +3366,7 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     let failLaps = true
     wrapModelKnob(h, 'readPaneFn', (modelReadPane) => (params) => (failLaps && isLapRead(params) ? errTmuxNotAvailable(undefined, 'read-pane') : modelReadPane(params)))
 
-    while (h.controller.view(p)!.dueAt! < launchStartMs + boundMs) await retryNow(h, p)
+    await retryUntil(h, p, launchStartMs + boundMs)
     const [pastB] = await runRounds(h, p, row, 1)
     expect(pastB!.at).toBeGreaterThanOrEqual(launchStartMs + boundMs)
     expect(pastB!.verbs).toEqual(FAILED_LAP_RUN_ROUND)
@@ -3255,6 +3407,9 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     // The second Enter cleared the dialog; the round's get read the row live, and the retry stopped the timer.
     expect([row.dialog(), row.state()]).toEqual([PENDING_ROW_DIALOG_NONE, 'waiting'])
     expect(h.stops).toContainEqual({ key: p, reason: UNAVAILABLE_RETRY_STOP_ROW_LIVE })
+    expect(rounds.at(-1)!.retryLine).toBe(pendingOnlyStoppedLine(p, UNAVAILABLE_RETRY_STOP_ROW_LIVE, 'waiting'))
+    expect(rounds.slice(0, -1).map((round) => round.retryLine)).toEqual(rounds.slice(0, -1).map((round) => pendingOnlyReArmedLine(p, round.retry, round.refusals!)))
+    expect([h.controller.isArmed(p), h.clock.pendingCount()]).toEqual([false, 0])
     expect(row.calls.slice(fromOrigin).filter((call) => KILL_OR_LAUNCH.includes(call.verb))).toEqual([])
     expect(h.episodeNotices.filter((notice) => notice.key === p)).toEqual([])
   })
@@ -3285,7 +3440,8 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     await h.runApproverToStop(p)
     await h.settle()
     const stopRunAt = h.clock.now()
-    expect(ruleLinesOf(h, p, PENDING_ROW_RULE_ORIGIN_APPROVER_STOP).length).toBeGreaterThan(0)
+    // The one run: its round line and its answer line.
+    expect(ruleLinesOf(h, p, PENDING_ROW_RULE_ORIGIN_APPROVER_STOP)).toHaveLength(2)
     expect(h.callTimes('findMissing')).toEqual([stopRunAt])
 
     const rounds = await runRounds(h, p, row, 4)
@@ -3376,25 +3532,26 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     expect(h.controller.isArmed(p)).toBe(true)
   })
 
-  // SRJ-117's lap column, end to end: what is typed and whether the run follows.
-  test.each<[string, PendingRowModelOptions['dialog'], () => Error | undefined, boolean, boolean]>([
-    ['a pane showing the trust dialog: Enter typed, the run follows', PENDING_ROW_DIALOG_TRUST, () => undefined, true, true],
-    ['a pane showing the dev-channels dialog: Enter typed, the run follows', PENDING_ROW_DIALOG_DEV_CHANNELS, () => undefined, true, true],
-    ['a pane with no needle: nothing typed, the run follows', PENDING_ROW_DIALOG_UNRECOGNISED, () => undefined, false, true],
-    ['GONE (ErrTmuxCaptureFailed): nothing typed, the run follows', PENDING_ROW_DIALOG_TRUST, () => errTmuxCaptureFailed(), false, true],
-    ['ErrSpawnNotFound: nothing typed, the run follows', PENDING_ROW_DIALOG_TRUST, () => errSpawnNotFound(), false, true],
-    ['UNAVAILABLE: nothing typed, the run follows', PENDING_ROW_DIALOG_TRUST, () => errCallTimeout('read-pane'), false, true],
-    ['CONFLICT: nothing typed; P latches, no run', PENDING_ROW_DIALOG_TRUST, () => errTmuxSessionConflict('read-pane', 'leftover', personaTmuxSessionName(ruleHarness!.keys[0]!)), false, false],
-    ['ENVIRONMENT: nothing typed, tmux-unavailable raised, the run follows', PENDING_ROW_DIALOG_TRUST, () => errTmuxNotAvailable(undefined, 'read-pane'), false, true],
-    ['UNCLASSIFIED: nothing typed, the run follows', PENDING_ROW_DIALOG_TRUST, () => unclassifiedAt('read-pane'), false, true],
-    ['UNUSABLE NAME: nothing typed; P latches, no run', PENDING_ROW_DIALOG_TRUST, () => errUnusableName(), false, false],
-    ['CONFIG: nothing typed, its cause armed, the run follows', PENDING_ROW_DIALOG_TRUST, () => errConfigMalformed(), false, true],
-  ])('the lap column, %s', async (label, dialog, answer, typed, runs) => {
+  // SRJ-117's lap column, end to end: what is typed, whether the run follows,
+  // and the answer's own effect (tmux-unavailable raised, or CONFIG's cause armed).
+  test.each<[string, PendingRowModelOptions['dialog'], (key: string) => Error | undefined, boolean, boolean, LapColumnEffect]>([
+    ['a pane showing the trust dialog: Enter typed, the run follows', PENDING_ROW_DIALOG_TRUST, () => undefined, true, true, undefined],
+    ['a pane showing the dev-channels dialog: Enter typed, the run follows', PENDING_ROW_DIALOG_DEV_CHANNELS, () => undefined, true, true, undefined],
+    ['a pane with no needle: nothing typed, the run follows', PENDING_ROW_DIALOG_UNRECOGNISED, () => undefined, false, true, undefined],
+    ['GONE (ErrTmuxCaptureFailed): nothing typed, the run follows', PENDING_ROW_DIALOG_TRUST, () => errTmuxCaptureFailed(), false, true, undefined],
+    ['ErrSpawnNotFound: nothing typed, the run follows', PENDING_ROW_DIALOG_TRUST, () => errSpawnNotFound(), false, true, undefined],
+    ['UNAVAILABLE: nothing typed, the run follows', PENDING_ROW_DIALOG_TRUST, () => errCallTimeout('read-pane'), false, true, undefined],
+    ['CONFLICT: nothing typed; P latches, no run', PENDING_ROW_DIALOG_TRUST, (key) => errTmuxSessionConflict('read-pane', 'leftover', personaTmuxSessionName(key)), false, false, undefined],
+    ['ENVIRONMENT: nothing typed, tmux-unavailable raised, the run follows', PENDING_ROW_DIALOG_TRUST, () => errTmuxNotAvailable(undefined, 'read-pane'), false, true, LAP_COLUMN_TMUX_UNAVAILABLE],
+    ['UNCLASSIFIED: nothing typed, the run follows', PENDING_ROW_DIALOG_TRUST, () => unclassifiedAt('read-pane'), false, true, undefined],
+    ['UNUSABLE NAME: nothing typed; P latches, no run', PENDING_ROW_DIALOG_TRUST, () => errUnusableName(), false, false, undefined],
+    ['CONFIG: nothing typed, its cause armed, the run follows', PENDING_ROW_DIALOG_TRUST, () => errConfigMalformed(), false, true, LAP_COLUMN_CONFIG_CAUSE],
+  ])('the lap column, %s', async (_label, dialog, answer, typed, runs, effect) => {
     const { h, p } = ruleHarnessOf()
-    const err = answer()
+    const err = answer(p)
     const row = await ORIGIN_START_PASS.begin(h, p, { dialog, readPane: [err] })
     const launchStartMs = row.launchStartMs()!
-    while (h.controller.view(p)!.dueAt! < launchStartMs + adGraceMsInEffect()) await retryNow(h, p)
+    await retryUntil(h, p, launchStartMs + adGraceMsInEffect())
     const lapAt = h.controller.view(p)!.dueAt!
     await retryNow(h, p)
 
@@ -3402,9 +3559,9 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     expect(h.stub.calls.sendKeysCalls).toEqual(typed ? [{ claude_instance_id: row.instanceId, text: '', allow_pending: true }] : [])
     expect(h.callTimes('findMissing')).toEqual(runs ? [lapAt] : [])
     expect(h.latch.isLatched(p)).toBe(!runs)
-    if (label.startsWith('ENVIRONMENT')) expect(getOutageFlags(p).has('tmux-unavailable')).toBe(true)
+    expect(getOutageFlags(p).has('tmux-unavailable')).toBe(effect === LAP_COLUMN_TMUX_UNAVAILABLE)
     // The CONFIG answer raised ad-config-malformed (its onset posted) and armed its cause; the run's success cleared it.
-    if (label.startsWith('CONFIG')) expect(h.triggers).toContainEqual({ key: p, kind: UNAVAILABLE_RETRY_CAUSE_CONFIG })
+    expect(h.triggers.some((trigger) => trigger.key === p && trigger.kind === UNAVAILABLE_RETRY_CAUSE_CONFIG)).toBe(effect === LAP_COLUMN_CONFIG_CAUSE)
     expect(row.calls.filter((call) => KILL_OR_LAUNCH.includes(call.verb)).map((call) => call.verb)).toEqual(['spawn'])
   })
 
@@ -3449,7 +3606,7 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
       sendKeys: [errSpawnNotInteractive('send-keys')],
     })
     const firstStartMs = row.launchStartMs()!
-    while (h.controller.view(p)!.dueAt! < firstStartMs + adGraceMsInEffect()) await retryNow(h, p)
+    await retryUntil(h, p, firstStartMs + adGraceMsInEffect())
     await runRounds(h, p, row, 2)
     expect(readPaneTimesOf(h, row)).toHaveLength(1)
 
@@ -3459,7 +3616,7 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     const newStartMs = row.launchStartMs()!
     expect(newStartMs).toBeGreaterThan(firstStartMs)
     row.setJudgment(judgeNotJudged)
-    while (h.controller.view(p)!.dueAt! < newStartMs + adGraceMsInEffect()) await retryNow(h, p)
+    await retryUntil(h, p, newStartMs + adGraceMsInEffect())
     expect(readPaneTimesOf(h, row, newStartMs + adGraceMsInEffect())).toEqual([])
     const lapAt = await retryNow(h, p)
     expect(readPaneTimesOf(h, row, newStartMs + adGraceMsInEffect())).toEqual([lapAt])
@@ -3470,7 +3627,7 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     const { h, p } = ruleHarnessOf()
     const row = await ORIGIN_START_PASS.begin(h, p, { dialog: PENDING_ROW_DIALOG_TRUST, readPane: [errTmuxSessionConflict('read-pane', 'leftover', personaTmuxSessionName(p))] })
     const launchStartMs = row.launchStartMs()!
-    while (h.controller.view(p)!.dueAt! < launchStartMs + adGraceMsInEffect()) await retryNow(h, p)
+    await retryUntil(h, p, launchStartMs + adGraceMsInEffect())
     await retryNow(h, p)
     expect(h.latch.isLatched(p)).toBe(true)
     expect(h.stops).toContainEqual({ key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED })
@@ -3533,7 +3690,7 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     const { h, p } = ruleHarnessOf()
     const row = await ORIGIN_START_PASS.begin(h, p, { dialog: PENDING_ROW_DIALOG_UNRECOGNISED })
     const launchStartMs = row.launchStartMs()!
-    while (h.controller.view(p)!.dueAt! < launchStartMs + adGraceMsInEffect()) await retryNow(h, p)
+    await retryUntil(h, p, launchStartMs + adGraceMsInEffect())
     expect(holds(h, p)).toBe(false)
     failNextLapRead(h, p, make)
 
@@ -3551,7 +3708,8 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     await h.runApproverToStop(p)
     await h.settle()
 
-    expect(ruleLinesOf(h, p, PENDING_ROW_RULE_ORIGIN_APPROVER_STOP).length).toBeGreaterThan(0)
+    // The one run: its round line and its answer line.
+    expect(ruleLinesOf(h, p, PENDING_ROW_RULE_ORIGIN_APPROVER_STOP)).toHaveLength(2)
     expect(h.callTimes('findMissing')).toEqual([h.clock.now()])
     expect(holds(h, p)).toBe(true)
   })
@@ -3561,7 +3719,7 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     const { h, p } = ruleHarnessOf()
     const row = await ORIGIN_START_PASS.begin(h, p, { dialog: PENDING_ROW_DIALOG_UNRECOGNISED })
     const launchStartMs = row.launchStartMs()!
-    while (h.controller.view(p)!.dueAt! < launchStartMs + adLaunchBoundMsInEffect()) await retryNow(h, p)
+    await retryUntil(h, p, launchStartMs + adLaunchBoundMsInEffect())
     // The get right after this round's run (and only this round's) answers UNAVAILABLE.
     let failThisRound = true
     let failNextGet = false
@@ -3621,6 +3779,116 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
   })
 })
 
+// ---------------------------------------------------------------------------
+// The run at the approver's stop, gated as a retry is (b.jg5 SRJ-404, SRJ-410,
+// SRJ-411, SRJ-305): the harness installs the rule with main()'s gate (the
+// retry action's, `retryRunGateStop`), asked when the run's turn in P's
+// serializer starts. Here, end to end: the stops for a persona removed (its
+// teardown's turn ahead of the run), latched, held, not up or at the cap. The
+// gate's own shutdown, its throws and when it is asked are
+// tests/approve-trust-folder-dialog.test.ts's; its order is
+// tests/session-manager.test.ts's.
+// ---------------------------------------------------------------------------
+
+/** P's approver stopped at its test cap past G with the row `pending`, its one run queued behind a turn of P's serializer the case holds. */
+interface QueuedApproverStopRun {
+  readonly h: RecoveryHarness
+  readonly p: string
+  readonly row: PendingRowModel
+  /** End the held turn, so the queued run's turn starts. */
+  release(): void
+}
+
+async function approverStopRunQueuedBehindTurn(): Promise<QueuedApproverStopRun> {
+  const capMs = adGraceMsInEffect() + 20 * MS_PER_SECOND
+  const { h, p } = ruleHarnessOf({ approverCapMs: capMs })
+  const row = makePendingRowModel(h, p, { state: PENDING_ROW_MODEL_NO_ROW, dialog: PENDING_ROW_DIALOG_UNRECOGNISED })
+  const startedAt = h.clock.now()
+  await h.launch(p)
+  await h.settle()
+  let release!: () => void
+  void h.serializer.run(p, () => new Promise<void>((resolve) => (release = resolve)))
+  // The clock moved to the approver's cap by hand: `runApproverToStop` and
+  // `settle` await the queued run, which waits for the held turn.
+  await h.advance(startedAt + capMs - h.clock.now())
+  expect(h.approverRunning(p)).toBe(false)
+  expect(row.state()).toBe(AGENT_DIRECTOR_PENDING_STATE)
+  expect(ruleLinesOf(h, p, PENDING_ROW_RULE_ORIGIN_APPROVER_STOP)).toEqual([])
+  return { h, p, row, release: () => release() }
+}
+
+/** Hold P on `ErrInvalidFlags` through a real reuse (SRJ-207): a launch whose spawn collides with P's row read `ended` elsewhere, and whose reuse spawn answers `ErrInvalidFlags`. */
+async function holdOnInvalidFlags(h: RecoveryHarness, p: string): Promise<void> {
+  const ended = cannedGetResult({ cwd: h.home, state: LIVENESS_DEAD_ROW_ENDED }, personaOf(h, p), h.home)
+  h.script({
+    spawnFn: (params) => ('reuse_finished' in params ? errInvalidFlags('spawn') : errInstanceIdCollision()),
+    getFn: () => ended,
+  })
+  expect(await h.launch(p)).toStrictEqual({ key: p, action: 'held' })
+  expect(h.invalidFlagsHold.isHeld(p)).toBe(true)
+}
+
+describe('the run at the approver\'s stop is dropped when the retry action\'s gate would stop a retry then (recovery harness; b.jg5 SRJ-404, SRJ-410, SRJ-411, SRJ-305)', () => {
+  afterEach(cleanUpRuleHarness)
+
+  test.each<[string, (h: RecoveryHarness, p: string, row: PendingRowModel) => Promise<void> | void, string]>([
+    [
+      'P\'s teardown, its turn ahead of the run (P removed from the applied set)',
+      (h, p) => {
+        h.remove(p)
+        h.teardown(p)
+        h.episodes.forget(p)
+      },
+      UNAVAILABLE_RETRY_STOP_NOT_APPLIED,
+    ],
+    [
+      'P latched while the run waits (its own row read with no launch start)',
+      async (h, p, row) => {
+        row.setLaunchStartedAt(SAMPLE_LAUNCH_STARTS.none)
+        expect(await readAndStepPendingRow(personaOf(h, p))).toEqual({ kind: PENDING_ROW_STEP_LATCHED })
+        expect(h.latch.isLatched(p)).toBe(true)
+      },
+      UNAVAILABLE_RETRY_STOP_LATCHED,
+    ],
+    ['P held on ErrInvalidFlags while the run waits', (h, p) => holdOnInvalidFlags(h, p), UNAVAILABLE_RETRY_STOP_HELD],
+    ['P no longer up', (h, p) => h.setUp(p, false), UNAVAILABLE_RETRY_STOP_NOT_UP],
+    [
+      'P at the restart cap',
+      (_h, p) => {
+        for (let failures = 0; failures < RESTART_FAILURE_CAP; failures++) recordFailure(p)
+      },
+      UNAVAILABLE_RETRY_STOP_CAPPED,
+    ],
+  ])('%s: when the run\'s turn starts it is dropped with one line; no read-pane, Enter, find-missing, get, post or kill', async (_label, arrange, why) => {
+    const { h, p, row, release } = await approverStopRunQueuedBehindTurn()
+    await arrange(h, p, row)
+    const callsBefore = h.timedCalls.length
+    const noticesBefore = noticesOf(h, p)
+
+    release()
+    await h.settle()
+
+    expect(ruleLinesOf(h, p, PENDING_ROW_RULE_ORIGIN_APPROVER_STOP)).toEqual([pendingRowRuleApproverStopGatedLine(renderPersonaRef(personaOf(h, p).name, p), why)])
+    expect(h.timedCalls.slice(callsBefore)).toEqual([])
+    expect(noticesOf(h, p)).toEqual(noticesBefore)
+  })
+
+  test('with every stop of the gate open, the same run makes its round when its turn starts: a lap, one bypassing find-missing and one get', async () => {
+    const { h, p, row, release } = await approverStopRunQueuedBehindTurn()
+    const callsBefore = row.calls.length
+
+    release()
+    await h.settle()
+
+    const ref = renderPersonaRef(personaOf(h, p).name, p)
+    const lines = ruleLinesOf(h, p, PENDING_ROW_RULE_ORIGIN_APPROVER_STOP)
+    // Its round line, then its answer line.
+    expect(lines).toHaveLength(2)
+    expect(lines[0]!.startsWith(roundLineStart(ref, PENDING_ROW_RULE_ORIGIN_APPROVER_STOP, row.launchStartedAt()))).toBe(true)
+    expect(lines[1]).toBe(pendingRowRuleApproverStopLine(ref, APPROVER_STOP_CAP, refusalOf('not-judged')))
+    expect(row.calls.slice(callsBefore).map((call) => call.verb)).toEqual(['read-pane', 'find-missing', 'get'])
+  })
+})
 
 // ---------------------------------------------------------------------------
 // CSCB's own stuck launch at B on the recovery harness (b.jg5 SRJ-412; AC 9, AC 31, AC 48, AC 67, AC 84)
@@ -3674,6 +3942,11 @@ async function retryDriven(h: RecoveryHarness, p: string): Promise<number> {
   await h.drive(h.settle())
   await h.driveSequence(h.sequenceSettled(p))
   return at
+}
+
+/** Retry P's timer (each retry settled) until its next retry is the first at or past `atMs`. */
+async function retryUntil(h: RecoveryHarness, p: string, atMs: number): Promise<void> {
+  while (h.controller.view(p)!.dueAt! < atMs) await retryNow(h, p)
 }
 
 /** Retry P's timer until its next retry is the first at or past B from the row's launch start now; answers that B. */
@@ -3780,6 +4053,36 @@ describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill,
     expect(row.callTimes('kill')).toEqual([roundAt])
     expect(relaunchingPostsOf(h, p)).toEqual([relaunchingTextOf(p)])
     expect([heldPostsOf(h, p), otherNoticesOf(h, p), getFailureCount(p)]).toEqual([[], [], 0])
+    expect(h.stuckLaunchAbortUsed(p)).toBe(true)
+    // The retry is a refusal naming the live-row sequence its rule started, the last row read kept pending.
+    expect(retryLinesOf(h, p)).toContain(pendingOnlyReArmedLine(p, lastRetryOf(h, p), h.controller.view(p)!.refusals, UNAVAILABLE_RETRY_AGAIN_SEQUENCE_STARTED))
+    expect(h.controller.view(p)).toMatchObject({ mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
+  })
+
+  // SRJ-412, SRJ-713: a later launch call of P that answers
+  // ErrInstanceIdCollision started no launch, so CSCB's own launch keeps its
+  // record and still gets the relaunching post and its abort at B.
+  test('a later spawn of P colliding with CSCB\'s own pending launch keeps that launch\'s own-launch record: at B the relaunching post and the abort\'s one kill, no held post', async () => {
+    const { h, p, row } = ownStuckLaunchOf({}, ABORT_ORIGIN_RETRY)
+    const launchStart = await launchOwnPending(h, row)
+    const record = ownLaunchRecordOf(p)
+    expect(record).toBeDefined()
+    const spawnsBefore = h.stub.calls.spawnCalls.length
+    row.scriptLaunches(errInstanceIdCollision())
+
+    await h.launch(p)
+    await h.settle()
+
+    expect(h.stub.calls.spawnCalls).toHaveLength(spawnsBefore + 1)
+    expect([row.state(), row.launchStartedAt()]).toEqual([AGENT_DIRECTOR_PENDING_STATE, launchStart])
+    expect(ownLaunchRecordOf(p)).toEqual(record)
+    expect(isCscbOwnLaunch(p, launchStart)).toBe(true)
+
+    const atB = await abortRoundAtB(h, p, row, ABORT_ORIGIN_RETRY)
+
+    expect(row.callTimes('kill')).toEqual([atB])
+    expect(relaunchingPostsOf(h, p)).toEqual([relaunchingTextOf(p)])
+    expect(heldPostsOf(h, p)).toEqual([])
     expect(h.stuckLaunchAbortUsed(p)).toBe(true)
   })
 
@@ -3898,9 +4201,11 @@ describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill,
   })
 
   // SRJ-501, SRJ-505, SRJ-512, SRJ-613 (AC 9): the abort kill's CONFLICT and UNUSABLE NAME latch P, never retried.
+  // End to end, SRJ-613's kill backstop ("not this launch's session") and one
+  // UNUSABLE NAME row; every row is session-manager.test.ts's at unit level.
   const ABORT_KILL_LATCHES: ReadonlyArray<readonly [string, () => Error, (key: string) => ConflictLatchRecord, (key: string) => string]> = [
-    ...STUCK_LAUNCH_ABORT_CONFLICT_CASE_ROWS.map((caseRow) => [
-      `CONFLICT (${caseRow.name}${caseRow.killBackstop === true ? ", SRJ-613's kill backstop" : ''})`,
+    ...STUCK_LAUNCH_ABORT_CONFLICT_CASE_ROWS.filter((caseRow) => caseRow.killBackstop === true).map((caseRow) => [
+      `CONFLICT (${caseRow.name}, SRJ-613's kill backstop)`,
       caseRow.build,
       (key: string) =>
         expectedLatchRecord(key, {
@@ -3912,7 +4217,7 @@ describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill,
         }),
       () => caseRow.notice.text,
     ] as const),
-    ...STUCK_LAUNCH_ABORT_UNUSABLE_NAME_CASE_ROWS.map((caseRow) => [`UNUSABLE NAME (${caseRow.name})`, caseRow.build, caseRow.record, caseRow.notice] as const),
+    ...STUCK_LAUNCH_ABORT_UNUSABLE_NAME_CASE_ROWS.slice(0, 1).map((caseRow) => [`UNUSABLE NAME (${caseRow.name})`, caseRow.build, caseRow.record, caseRow.notice] as const),
   ]
 
   test.each(ABORT_KILL_LATCHES)('the abort kill answering %s: P latches with the row\'s record and one post; nothing is sent after the kill (no launch, delete or further call), and it is never tried again', async (_label, error, record, notice) => {

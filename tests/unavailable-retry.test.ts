@@ -263,7 +263,6 @@ import {
   PENDING_ROW_REASON_CWD_UNRESOLVED,
   PENDING_ROW_RULE_LOG_HEAD,
   PENDING_ROW_RULE_ORIGIN_RETRY,
-  stuckLaunchHeldText,
   stuckLaunchRelaunchingText,
 } from '../src/pending-row.ts'
 import {
@@ -523,13 +522,19 @@ import {
   callCountsSince,
   ownRowsLiveThenMissing,
   pastSampleGrace,
+  pendingOnlyStoppedLine,
   personaCallCounts,
   personaOf,
   personaRow,
+  reArmedLine,
   recordCallOrder,
+  retryLinesOf,
   retryNow,
+  retryWaitMs,
   reuseSpawnOf,
+  stoppedLine,
   startSequenceHeldAtRun,
+  type ReArmedModes,
   runSequenceStoppedAtKill,
   unclassifiedEndedLine,
   unclassifiedLines,
@@ -588,10 +593,8 @@ const KEY = 'alpha'
 const OTHER = 'beta'
 const UNAVAILABLE = { kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE } as const
 
-/** The wait after `refusals` refused retries, in ms, from the exported base and ceiling. */
-function waitMs(refusals: number): number {
-  return doublingBackoffDelay(UNAVAILABLE_RETRY_BASE_S, refusals, UNAVAILABLE_RETRY_CEILING_S) * 1000
-}
+/** The wait after `refusals` refused retries, in ms (the harness's `retryWaitMs`). */
+const waitMs = retryWaitMs
 
 /** Refusals until the wait reaches the ceiling. */
 function refusalsToCeiling(): number {
@@ -2120,32 +2123,6 @@ describe('unavailable retry: an attempt started from a continuation that outlive
 // Again-reasons and close (b.jg5 SRJ-303, SRJ-305) on the bare controller
 // ---------------------------------------------------------------------------
 
-/** How a re-armed line names the modes: the retry ran pending-only, and the mode the retry switched the timer to. */
-interface ReArmedModes {
-  readonly ranPendingOnly?: boolean
-  readonly switchedTo?: UnavailableRetryMode
-}
-
-/** The line a retry answered `again` logs: its reason and the next wait, after `refusals` refusals. */
-function reArmedLine(key: string, retry: number, reason: string, refusals: number, modes: ReArmedModes = {}): string {
-  const ran = modes.ranPendingOnly === true ? ` (${UNAVAILABLE_RETRY_MODE_PENDING_ONLY})` : ''
-  const switched = modes.switchedTo !== undefined ? ` in ${modes.switchedTo} mode` : ''
-  return `[slack] unavailable-retry: persona=${key} retry ${retry}${ran}: ${reason} — re-armed${switched}, next retry in ${waitMs(refusals) / 1000} s`
-}
-
-/** The line a stopped timer logs; `tags` are the parenthesised mode and row, when the stop names them. */
-function stoppedLine(key: string, reason: string, ...tags: string[]): string {
-  const tagged = tags.length > 0 ? ` (${tags.join(', ')})` : ''
-  return `[slack] unavailable-retry: persona=${key} stopped${tagged} — ${reason}`
-}
-
-/** The stopped line of a pending-only timer, naming the row its retry read when given. */
-function pendingOnlyStoppedLine(key: string, reason: string, row?: string): string {
-  return row === undefined
-    ? stoppedLine(key, reason, UNAVAILABLE_RETRY_MODE_PENDING_ONLY)
-    : stoppedLine(key, reason, UNAVAILABLE_RETRY_MODE_PENDING_ONLY, `row ${row}`)
-}
-
 describe('unavailable retry: again-reasons and close', () => {
   test.each<[string, unknown, string]>([
     ['a label', UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT, UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT],
@@ -3186,11 +3163,6 @@ function pendingOnlyRetryLine(key: string, retry: number): string {
   return `[slack] unavailable-retry: persona=${key} retry ${retry} (pending-only) — reading its row`
 }
 
-/** The retry timer's lines for persona `key`, in order. */
-function retryLinesOf(h: RecoveryHarness, key: string): string[] {
-  return h.lines.filter((line) => line.startsWith(`[slack] unavailable-retry: persona=${key} `))
-}
-
 /** Persona `key`'s timer is stopped and nothing is pending on the clock. */
 function expectStopped(h: RecoveryHarness, key: string): void {
   expect(h.controller.isArmed(key)).toBe(false)
@@ -3731,46 +3703,20 @@ describe('unavailable retry: the covered-row triggers and the pending-only retry
     expect(h.attempts).toEqual([])
     expect(h.stub.calls.spawnCalls).toHaveLength(1)
   })
-
-  // Hatch note E10, by SRJ-305 and SRJ-309: with the health check off and
-  // P's condition holding, a pending-only retry that finds the row live but
-  // not connected stops the timer, and that stop cancels the condition's
-  // alert check: no "keeps retrying" alert ever posts while no timer runs.
-  test('E10: health check off, P\'s tmux-unresponsive condition holding, its pending-only retry finding the row live (waiting) but not connected: the timer stops, the alert check is cancelled with it, and no alert posts past the threshold', async () => {
-    const h = (harness = makeRecoveryHarness())
-    expect(h.config.health_check_interval).toBe(0)
-    const [key] = h.keys as [string]
-    modelRow(h, 'waiting')
-    const startedAt = h.clock.now()
-    expect(h.tmuxUnresponsive.start(key, 'read-pane', errTmuxUnresponsive('read-pane'))).toBe('started')
-    h.controller.armPendingOnly(key)
-    h.setConnected(key, false)
-
-    await retryNow(h, key)
-
-    expect(retryLinesOf(h, key).at(-1)).toBe(pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_ROW_LIVE, 'waiting'))
-    expect(h.controller.isArmed(key)).toBe(false)
-    expect(h.tmuxUnresponsive.holds(key)).toBe(true)
-    expect(conditionLines(h, key)).toContain(`${conditionLinePrefix(key)}alert check cancelled — its retry timer stopped: ${UNAVAILABLE_RETRY_STOP_ROW_LIVE}`)
-    await h.advance(startedAt + adAlertThresholdMsInEffect() + 1 - h.clock.now())
-    expect(h.episodeNotices).toEqual([])
-    expect(h.clock.pendingCount()).toBe(0)
-  })
 })
 
 // ---------------------------------------------------------------------------
 // The pending-row rule at the retries (b.jg5 SRJ-410, SRJ-303), on the
 // recovery harness with the rule installed as main() installs it and P's own
 // covered `pending` row scripted by the pending-row model (its launch start
-// the stub's sample). What each retry does with the rule's answer: before G
-// only the row read and the step's get; from G the rule's round (a lap when
-// no approver runs, one bypassing find-missing and one get), a refusal at the
-// timer's pace; a run that marks the row missing hands P to the restart
-// decision once; a lap that clears the dialog stops the timer on the live
-// row; at B the held post, no kill. A retry that finds only P's approver
-// running makes the run and no lap (SRJ-303's Test line). In full mode the
-// rule runs through the restart path's deferral. The rule's own decisions,
-// lines and texts are tests/pending-row.test.ts's; the deferral's answers are
+// the stub's sample). Here: a pending-only run that marks the row missing
+// hands P to the restart decision once; a retry that finds only P's approver
+// running makes the run and no lap (SRJ-303's Test line); in full mode the
+// rule runs through the restart path's deferral. The rule's rounds at a
+// pending-only retry before G, from G, at a lap that clears the dialog, at B
+// and for CSCB's own launch past B, with the retry timer's re-armed and
+// stopped lines for each, are tests/pending-row.test.ts's, as are the rule's
+// own decisions, lines and texts; the deferral's answers are
 // tests/server.test.ts's and the restart run's tests/restart.test.ts's.
 // ---------------------------------------------------------------------------
 
@@ -3812,41 +3758,6 @@ function expectNoKillLaunchOrKeys(h: RecoveryHarness): void {
 }
 
 describe('unavailable retry: the pending-row rule at each retry of P\'s timer (SRJ-410, SRJ-303)', () => {
-  test('pending-only, younger than G (a run would mark it missing): the retry makes only its row read and the step\'s get, logs no rule line and re-arms on the pending row', async () => {
-    const h = (harness = makeRecoveryHarness())
-    const [key] = h.keys as [string]
-    await armAtRowAge(h, key, adGraceMsInEffect() - 1, UNAVAILABLE_RETRY_MODE_PENDING_ONLY, { judgment: judgeMissingFromG() })
-
-    await retryNow(h, key)
-
-    expect(callCounts(h)).toEqual({ statusCalls: 1, getCalls: 1 })
-    expect(ruleLinesOf(h, key)).toEqual([])
-    expect(retryLinesOf(h, key).at(-1)).toBe(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_ROW_PENDING, 1, { ranPendingOnly: true }))
-  })
-
-  test('pending-only, from G until B, not judged: each retry adds the rule\'s round (a lap, as no approver runs; one bypassing find-missing; one get) with one rule line and stays a refusal; the runs come one per retry at its due time, never closer than the timer\'s interval; no kill, launch, keystroke or post', async () => {
-    const h = (harness = makeRecoveryHarness())
-    const [key, other] = h.keys as [string, string]
-    const row = await armAtRowAge(h, key, adGraceMsInEffect(), UNAVAILABLE_RETRY_MODE_PENDING_ONLY)
-    const dueTimes: number[] = []
-
-    for (const retry of [1, 2, 3]) {
-      const before = callCounts(h)
-      dueTimes.push(await retryNow(h, key))
-      expect(callsSince(h, before)).toEqual({ statusCalls: 1, getCalls: 2, readPaneCalls: 1, findMissingCalls: 1 })
-      expect(ruleLinesOf(h, key)).toHaveLength(retry)
-      expect(retryLinesOf(h, key).at(-1)).toBe(reArmedLine(key, retry, UNAVAILABLE_RETRY_AGAIN_ROW_PENDING, retry, { ranPendingOnly: true }))
-    }
-
-    expect(dueTimes.at(-1)! - row.launchStartMs()!).toBeLessThan(adLaunchBoundMsInEffect())
-    expect(h.callTimes('findMissing')).toEqual(dueTimes)
-    expect(dueTimes.slice(1).map((at, i) => at - dueTimes[i]!)).toEqual([waitMs(1), waitMs(2)])
-    expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', refusals: 3, mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
-    expectNoKillLaunchOrKeys(h)
-    expect(h.episodeNotices).toEqual([])
-    expect(h.controller.isArmed(other)).toBe(false)
-  })
-
   test('pending-only, from G, a run that marks the row missing: the retry stops on the gone row and hands P to the restart decision once, one launch with no kill, whose new pending row is watched again', async () => {
     const h = (harness = makeRecoveryHarness())
     const [key] = h.keys as [string]
@@ -3866,55 +3777,6 @@ describe('unavailable retry: the pending-row rule at each retry of P\'s timer (S
     expect(h.stub.calls.killCalls).toEqual([])
     expect(row.state()).toBe(AGENT_DIRECTOR_PENDING_STATE)
     expectPendingOnlyWatch(h, key)
-    expect(getFailureCount(key)).toBe(0)
-  })
-
-  test('pending-only, from G, no approver running and the trust dialog showing: the lap reads the pane and sends Enter, the row reaches waiting, the run and its get follow, and the timer stops on the live row with no kill or launch', async () => {
-    const h = (harness = makeRecoveryHarness())
-    const [key] = h.keys as [string]
-    const row = await armAtRowAge(h, key, adGraceMsInEffect(), UNAVAILABLE_RETRY_MODE_PENDING_ONLY, { dialog: PENDING_ROW_DIALOG_TRUST })
-
-    const dueAt = await retryNow(h, key)
-
-    expect(verbsAt(h, key, dueAt)).toEqual(['status', 'get', 'readPane', 'sendKeys', 'findMissing', 'get'])
-    expect(row.state()).toBe('waiting')
-    expect(retryLinesOf(h, key).at(-1)).toBe(pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_ROW_LIVE, 'waiting'))
-    expectStopped(h, key)
-    expect([h.stub.calls.killCalls, h.stub.calls.spawnCalls, h.stub.calls.resumeCalls]).toEqual([[], [], []])
-  })
-
-  test('pending-only, at B, not judged: one held post, the row never killed, and the retry a refusal that keeps the timer on the pending row', async () => {
-    const h = (harness = makeRecoveryHarness())
-    const [key] = h.keys as [string]
-    const row = await armAtRowAge(h, key, adLaunchBoundMsInEffect(), UNAVAILABLE_RETRY_MODE_PENDING_ONLY)
-
-    await retryNow(h, key)
-
-    expect(h.episodeNotices).toEqual([{ key, text: stuckLaunchHeldText(key, row.launchStartedAt(), false) }])
-    expectNoKillLaunchOrKeys(h)
-    expect(retryLinesOf(h, key).at(-1)).toBe(reArmedLine(key, 1, UNAVAILABLE_RETRY_AGAIN_ROW_PENDING, 1, { ranPendingOnly: true }))
-    expect(h.controller.view(key)).toMatchObject({ phase: 'waiting', mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
-  })
-
-  // b.jg5 SRJ-412: the abort's own cases are tests/pending-row.test.ts's; this
-  // is what the pending-only retry answers when its rule made the abort.
-  test('pending-only, past B, CSCB\'s own launch: the retry\'s rule makes the relaunching post and the abort\'s one kill, and the retry is a refusal naming the live-row sequence it started, the last row read kept pending', async () => {
-    const h = (harness = makeRecoveryHarness({ harnessNow: true }))
-    const [key] = h.keys as [string]
-    const row = makePendingRowModel(h, key, { state: PENDING_ROW_MODEL_NO_ROW, dialog: PENDING_ROW_DIALOG_UNRECOGNISED })
-    // The approver stops at the harness's test cap, well before G: no rule run then reaches step 3.
-    await launchOwnPending(h, row)
-    expectPendingOnlyWatch(h, key)
-
-    while (h.controller.view(key)!.dueAt! - row.launchStartMs()! < adLaunchBoundMsInEffect()) await retryNow(h, key)
-    expect([h.episodeNotices, h.stub.calls.killCalls]).toEqual([[], []])
-    const retry = h.attempts.filter((attempt) => attempt.key === key).length + 1
-    await retryNow(h, key)
-
-    expect(h.episodeNotices).toEqual([{ key, text: stuckLaunchRelaunchingText(key, adLaunchBoundMsInEffect()) }])
-    expect(h.stub.calls.killCalls).toEqual([{ claude_instance_id: personaInstanceId(key) }])
-    expect(retryLinesOf(h, key)).toContain(reArmedLine(key, retry, UNAVAILABLE_RETRY_AGAIN_SEQUENCE_STARTED, retry, { ranPendingOnly: true }))
-    expect(h.controller.view(key)).toMatchObject({ mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, lastRow: UNAVAILABLE_RETRY_ROW_PENDING })
     expect(getFailureCount(key)).toBe(0)
   })
 
@@ -8854,7 +8716,7 @@ function refuseOverModel(h: RecoveryHarness, refusal: () => Error | undefined): 
   })
 }
 
-describe('unavailable retry: SRJ-316\'s C21 half — no abort of CSCB\'s own stuck launch while ad-config-malformed is raised (SRJ-316, SRJ-412, AC 84)', () => {
+describe('unavailable retry: SRJ-316\'s C21 half — no abort of CSCB\'s own stuck launch while every call answers CONFIG (no round reaches step 3), and the abort once calls succeed (SRJ-316, SRJ-412, AC 84)', () => {
   test('CONFIG on every call while CSCB\'s own launch stays pending past B: one onset, and no relaunching post, kill, delete or launch and nothing counted across several retries; once calls succeed, one all-clear, the next retry reaching step 3 makes the relaunching post and the abort\'s one kill, its sequence launches P again, and P comes up', async () => {
     const h = (harness = makeRecoveryHarness({ harnessNow: true }))
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])

@@ -234,6 +234,8 @@ import {
   approverStopArmsPendingRow,
   buildPendingRowRuleDeps,
   pendingRowRuleApproverStopDroppedLine,
+  pendingRowRuleApproverStopGatedLine,
+  pendingRowRuleApproverStopGateFailedWhy,
   pendingRowRuleApproverStopLine,
   setPendingRowRule,
   setConfiguredPersonaQuery,
@@ -266,13 +268,18 @@ import {
   stuckLaunchHeldText,
   type PendingRowRuleAnswer,
 } from '../src/pending-row.ts'
-import { createPersonaEpisodes } from '../src/persona-episodes.ts'
+import { createPersonaEpisodes, type PersonaEpisodes } from '../src/persona-episodes.ts'
 import {
   isInsideAttempt,
   runInAttempt,
   UNAVAILABLE_RETRY_CAUSE_CONFIG,
   UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
+  UNAVAILABLE_RETRY_STOP_HELD,
+  UNAVAILABLE_RETRY_STOP_LATCHED,
+  UNAVAILABLE_RETRY_STOP_SHUTDOWN,
+  type RetryRunGateDeps,
 } from '../src/unavailable-retry.ts'
+import { describeThrownValue } from '../src/persona-connection-errors.ts'
 import {
   AGENT_DIRECTOR_DEAD_STATES,
   AGENT_DIRECTOR_LIVE_STATES,
@@ -1633,13 +1640,6 @@ function sameLaunchStartForms(raw: string): unknown[] {
   return [raw, instant, offsetForm]
 }
 
-/** Launch starts that name another instant than `raw`'s, or none. */
-function otherLaunchStarts(raw: string): unknown[] {
-  const instant = parseLaunchStart(raw)!
-  const others = RECORD_LAUNCH_STARTS.map(([, other]) => other).filter((other) => parseLaunchStart(other) !== instant)
-  return [...others, instant + 1, instant - 1, undefined, '']
-}
-
 /** Whether the record answers yes for persona `key` and launch start `launchStart`. */
 const met = (key: string, launchStart: unknown): boolean => launchMetSendKeysNotInteractive(key, launchStart)
 
@@ -1669,17 +1669,15 @@ describe('the approver\'s send-keys answering ErrSpawnNotInteractive records its
       ),
     ),
   )(
-    '%s, the %s launch start, send-keys answering ErrSpawnNotInteractive (%s) at the first lap: stops not-interactive, and the record answers yes for that launch start in every form, no for any other and for the other persona',
+    '%s, the %s launch start, send-keys answering ErrSpawnNotInteractive (%s) at the first lap: stops not-interactive, and the record is set for the launch start it read',
     async (_label, _form, _variant, who, raw, make) => {
       installStub([pendingRowAt(raw)], { readPaneResults: [dialogPane(TRUST_DIALOG_NEEDLE)], sendKeysQueue: [cannedErr(make())] })
 
       expect(await approve(who, false)).toBe(APPROVER_STOP_NOT_INTERACTIVE)
 
       expect(calls.sendKeysCalls).toEqual([expectedEnter(who.id)])
-      for (const form of sameLaunchStartForms(raw)) expect(met(who.key, form)).toBe(true)
-      for (const other of otherLaunchStarts(raw)) expect(met(who.key, other)).toBe(false)
-      const otherPersona = PERSONAS.find((p) => p.key !== who.key)!
-      expect(met(otherPersona.key, raw)).toBe(false)
+      // The record's matching (forms, other instants, other keys) is session-manager.test.ts's.
+      expect(met(who.key, raw)).toBe(true)
     },
   )
 
@@ -1699,7 +1697,7 @@ describe('the approver\'s send-keys answering ErrSpawnNotInteractive records its
 
       expect(await runToStop(run)).toBe(APPROVER_STOP_NOT_INTERACTIVE)
       expect(calls.sendKeysCalls).toHaveLength(2)
-      for (const form of sameLaunchStartForms(raw)) expect(met(PLAIN.key, form)).toBe(true)
+      expect(met(PLAIN.key, raw)).toBe(true)
     },
   )
 
@@ -2911,6 +2909,19 @@ describe('the pending-row rule runs once at the approver\'s stop, for the stops 
   let turns: QueuedTurn[]
   let posts: Notice[]
   let episodeLines: string[]
+  let episodes: PersonaEpisodes
+
+  /** Install the rule as main() does, with a serializer that queues each turn, and `gate` when given (absent: no gate). */
+  function installRule(gate?: RetryRunGateDeps): void {
+    setPendingRowRule({
+      rule: createPendingRowRule(buildPendingRowRuleDeps({ appliedPersona: () => undefined, episodes })),
+      serialize: <T,>(key: string, operation: () => T | Promise<T>): Promise<T> =>
+        new Promise<T>((resolve, reject) => {
+          turns.push({ key, run: () => Promise.resolve().then(operation).then(resolve, reject) })
+        }),
+      ...(gate === undefined ? {} : { gate }),
+    })
+  }
 
   beforeEach(() => {
     _resetDialogApprovers()
@@ -2919,7 +2930,7 @@ describe('the pending-row rule runs once at the approver\'s stop, for the stops 
     posts = []
     episodeLines = []
     _setNow(() => clock.now())
-    const episodes = createPersonaEpisodes({
+    episodes = createPersonaEpisodes({
       sink: (key, text) => {
         posts.push({ key, text })
       },
@@ -2928,13 +2939,7 @@ describe('the pending-row rule runs once at the approver\'s stop, for the stops 
       },
       clock,
     })
-    setPendingRowRule({
-      rule: createPendingRowRule(buildPendingRowRuleDeps({ appliedPersona: () => undefined, episodes })),
-      serialize: <T,>(key: string, operation: () => T | Promise<T>): Promise<T> =>
-        new Promise<T>((resolve, reject) => {
-          turns.push({ key, run: () => Promise.resolve().then(operation).then(resolve, reject) })
-        }),
-    })
+    installRule()
   })
 
   afterEach(async () => {
@@ -3213,6 +3218,116 @@ describe('the pending-row rule runs once at the approver\'s stop, for the stops 
 
     expect(countsSince(callCountsOf(calls), atStop)).toEqual({})
     expect(approverStopRunLines()).toEqual([pendingRowRuleApproverStopDroppedLine(who.ref)])
+  })
+
+  // b.jg5 SRJ-404, SRJ-305, SRJ-303: the installed gate is the retry
+  // action's (`retryRunGateStop`), asked when the run's turn starts. Its
+  // stops for a persona removed, latched, held, not up or at the cap, and a
+  // teardown queued ahead, are tests/pending-row.test.ts's, end to end; here:
+  // when it is asked, its open answer, its shutdown, its throws and the
+  // server's own shutdown ahead of it.
+
+  /** P as the applied configuration holds it. */
+  const APPLIED = makeMultiPersonaConfig([{ name: who.name }], tmpdir()).personas[0]!
+
+  /** A gate over P with every stop open, recording each member asked as `[member, key]`, `changed` members replaced. */
+  function recordingGate(changed: Partial<RetryRunGateDeps> = {}): { gate: RetryRunGateDeps; asked: Array<readonly [string, string | undefined]> } {
+    const asked: Array<readonly [string, string | undefined]> = []
+    const open: RetryRunGateDeps = {
+      isShuttingDown: () => false,
+      appliedPersona: (key) => (key === who.key ? APPLIED : undefined),
+      isLatched: () => false,
+      isHeld: () => false,
+      canRelaunch: () => true,
+      isAtCap: () => false,
+    }
+    const members = { ...open, ...changed }
+    const gate = Object.fromEntries(
+      Object.entries(members).map(([name, member]) => [
+        name,
+        (key?: string) => {
+          asked.push([name, key])
+          return (member as (key?: string) => unknown)(key)
+        },
+      ]),
+    ) as unknown as RetryRunGateDeps
+    return { gate, asked }
+  }
+
+  /** P's approver stopped at the test cap at G, its run queued and not yet run; the call counts at the stop. */
+  async function capStopQueued(): Promise<Record<string, number>> {
+    startAtG()
+    _setDialogReadyTimeoutMs(CAP_MS)
+    pendingNoDialog()
+    startDialogApprover(who.key, false, who.ref)
+    expect((await untilStopped())?.reason).toBe(APPROVER_STOP_CAP)
+    expect(turns.map((turn) => turn.key)).toEqual([who.key])
+    return callCountsOf(calls)
+  }
+
+  test('a gate with every stop open is asked for P only once the run\'s turn starts, never at the stop, and the run is the one with no gate', async () => {
+    const { gate, asked } = recordingGate()
+    installRule(gate)
+    const atStop = await capStopQueued()
+    expect(asked).toEqual([])
+
+    await runTurns()
+
+    expect(asked).toContainEqual(['appliedPersona', who.key])
+    expect(asked.filter(([, key]) => key !== undefined && key !== who.key)).toEqual([])
+    expect(countsSince(callCountsOf(calls), atStop)).toEqual(LAP_RUN_GET)
+    expect(approverStopRunLines()).toEqual([pendingRowRuleApproverStopLine(who.ref, APPROVER_STOP_CAP, NOT_JUDGED)])
+  })
+
+  test('the gate\'s own shutdown read drops the run with the gated line naming the retry action\'s shutdown stop, and no call', async () => {
+    installRule(recordingGate({ isShuttingDown: () => true }).gate)
+    const atStop = await capStopQueued()
+
+    await runTurns()
+
+    expect(countsSince(callCountsOf(calls), atStop)).toEqual({})
+    expect(approverStopRunLines()).toEqual([pendingRowRuleApproverStopGatedLine(who.ref, UNAVAILABLE_RETRY_STOP_SHUTDOWN)])
+    expect(posts).toEqual([])
+  })
+
+  test('the server\'s shutdown, begun while the run waits, drops it with the shutdown line before the gate is asked', async () => {
+    const { gate, asked } = recordingGate({ appliedPersona: () => undefined })
+    installRule(gate)
+    const atStop = await capStopQueued()
+
+    await stopAllDialogApprovers()
+    await runTurns()
+
+    expect(asked).toEqual([])
+    expect(countsSince(callCountsOf(calls), atStop)).toEqual({})
+    expect(approverStopRunLines()).toEqual([pendingRowRuleApproverStopDroppedLine(who.ref)])
+  })
+
+  /** A gate member's failure. */
+  const GATE_FAILURE = new Error('the gate member failed')
+  const throwing = (): never => {
+    throw GATE_FAILURE
+  }
+
+  // A latched or held query that throws counts as latched or held (the retry
+  // action's fail-safe, with its own line); any other member that throws
+  // fails the gate, which counts as stopped.
+  test.each<readonly [keyof RetryRunGateDeps, string]>([
+    ['isLatched', UNAVAILABLE_RETRY_STOP_LATCHED],
+    ['isHeld', UNAVAILABLE_RETRY_STOP_HELD],
+    ['isShuttingDown', pendingRowRuleApproverStopGateFailedWhy(describeThrownValue(GATE_FAILURE))],
+    ['appliedPersona', pendingRowRuleApproverStopGateFailedWhy(describeThrownValue(GATE_FAILURE))],
+    ['canRelaunch', pendingRowRuleApproverStopGateFailedWhy(describeThrownValue(GATE_FAILURE))],
+    ['isAtCap', pendingRowRuleApproverStopGateFailedWhy(describeThrownValue(GATE_FAILURE))],
+  ])('a gate whose %s throws: the run is dropped with one gated line (%s), no call and no post', async (member, why) => {
+    installRule(recordingGate({ [member]: throwing }).gate)
+    const atStop = await capStopQueued()
+
+    await runTurns()
+
+    expect(countsSince(callCountsOf(calls), atStop)).toEqual({})
+    expect(approverStopRunLines()).toEqual([pendingRowRuleApproverStopGatedLine(who.ref, why)])
+    expect(posts).toEqual([])
   })
 })
 

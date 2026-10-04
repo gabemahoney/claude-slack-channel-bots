@@ -108,6 +108,7 @@
  * and one `get` ({@link readPendingRowRun}: before B a run that did not judge
  * the row leads to nothing that round); still `pending` at B, judged or not,
  * step 3 ({@link decidePendingRowStepThree}): nothing while `tmux-unavailable`
+ * is raised, nothing for CSCB's own stuck launch while `ad-config-malformed`
  * is raised, CSCB's own stuck launch through the own-launch slot, any other
  * row the held text, never a kill. The driver
  * ({@link createPendingRowRule}) is a factory over injected dependencies
@@ -757,6 +758,25 @@ export function stuckLaunchPostFailedLine(key: string, described: string): strin
   return `${stuckLaunchLineHead(key)} post failed: ${described}`
 }
 
+/** No stuck-launch text for CSCB's own launch, its abort available: `ad-config-malformed` is raised; the relaunching text and the abort follow once it clears. */
+export const STUCK_LAUNCH_POST_SKIP_CONFIG_MALFORMED =
+  "its ad-config-malformed outage is raised, and CSCB's own stuck launch gets neither text while it is; the relaunching text and the abort follow once it clears"
+/** No stuck-launch text for CSCB's own launch, its abort used: `ad-config-malformed` is raised; the held text follows once it clears. */
+export const STUCK_LAUNCH_POST_SKIP_CONFIG_MALFORMED_ABORT_USED =
+  "its ad-config-malformed outage is raised, and CSCB's own stuck launch gets neither text while it is; its one abort is used, so the held text follows once it clears"
+
+/**
+ * The line of a stuck-launch text not posted for persona `key` at step 3
+ * (b.jg5 SRJ-1017), with why (one of the `STUCK_LAUNCH_POST_SKIP_*` texts):
+ *
+ *   [slack] pending-row: persona=<key> stuck-launch post not made — <why> (b.jg5 SRJ-1017)
+ *
+ * Pure.
+ */
+export function stuckLaunchPostSkippedLine(key: string, why: string): string {
+  return `${stuckLaunchLineHead(key)} post not made — ${why} (b.jg5 SRJ-1017)`
+}
+
 /** The line for an end of persona `key`'s stuck-launch episode that threw inside (an episodes call): nothing more was done. */
 export function stuckLaunchEpisodeEndFailedLine(key: string, described: string): string {
   return `${stuckLaunchLineHead(key)} episode end failed: ${described}`
@@ -1355,7 +1375,7 @@ export function readPendingRowRun(run: PendingRowRunPlacement, get: PendingRowRu
 export const PENDING_ROW_STEP3_TMUX_UNAVAILABLE = 'tmux-unavailable'
 /** {@link decidePendingRowStepThree}: P is latched: nothing (SRJ-502). */
 export const PENDING_ROW_STEP3_LATCHED = 'latched'
-/** {@link decidePendingRowStepThree}: CSCB's own stuck launch while `ad-config-malformed` is raised: neither text and no abort until it clears. */
+/** {@link decidePendingRowStepThree}: CSCB's own stuck launch while `ad-config-malformed` is raised, its abort available or used: neither text and no abort until it clears. */
 export const PENDING_ROW_STEP3_CONFIG_MALFORMED = 'config-malformed'
 /** {@link decidePendingRowStepThree}: CSCB's own stuck launch: the relaunching text, then the abort (SRJ-412). */
 export const PENDING_ROW_STEP3_RELAUNCH = 'relaunch'
@@ -1392,19 +1412,21 @@ export type PendingRowStepThree =
  * judged it (HO C21 steps 2 and 3):
  *   1. `tmux-unavailable` raised: nothing, whatever else holds;
  *   2. P latched: nothing;
- *   3. CSCB's own stuck launch with its one abort still available: nothing
- *      while `ad-config-malformed` is raised, else the relaunching text and
- *      the abort;
- *   4. any other row: the held text, with the attach line unless the
- *      launch met `ErrSpawnNotInteractive`.
+ *   3. CSCB's own stuck launch while `ad-config-malformed` is raised:
+ *      nothing, neither text and no abort, whether or not its one abort is
+ *      still available (SRJ-1017);
+ *   4. CSCB's own stuck launch with its one abort still available: the
+ *      relaunching text and the abort;
+ *   5. any other row, and CSCB's own launch once its abort is used: the held
+ *      text, with the attach line unless the launch met
+ *      `ErrSpawnNotInteractive`.
  * Pure; never throws.
  */
 export function decidePendingRowStepThree(input: PendingRowStepThreeInput): PendingRowStepThree {
   if (input.tmuxUnavailableRaised) return { kind: PENDING_ROW_STEP3_TMUX_UNAVAILABLE }
   if (input.latched) return { kind: PENDING_ROW_STEP3_LATCHED }
-  if (input.ownLaunch && input.abortAvailable) {
-    return input.configMalformedRaised ? { kind: PENDING_ROW_STEP3_CONFIG_MALFORMED } : { kind: PENDING_ROW_STEP3_RELAUNCH }
-  }
+  if (input.ownLaunch && input.configMalformedRaised) return { kind: PENDING_ROW_STEP3_CONFIG_MALFORMED }
+  if (input.ownLaunch && input.abortAvailable) return { kind: PENDING_ROW_STEP3_RELAUNCH }
   return { kind: PENDING_ROW_STEP3_HELD, attachLine: !input.metNotInteractive }
 }
 
@@ -1688,9 +1710,11 @@ const RULE_LATCHED: PendingRowRuleAnswer = Object.freeze({ kind: PENDING_ROW_RUL
  *     answered; before B, a row still `pending` is a refusal, judged or not.
  *   - **Step 3**, still `pending` at B or older, judged or not
  *     ({@link decidePendingRowStepThree}): nothing while `tmux-unavailable`
- *     is raised; CSCB's own stuck launch through the own-launch slot (none
- *     until it is filled); any other row the held text through its poster,
- *     and nothing else: the row is never killed.
+ *     is raised; nothing for CSCB's own stuck launch while
+ *     `ad-config-malformed` is raised, one {@link stuckLaunchPostSkippedLine}
+ *     said; CSCB's own stuck launch through the own-launch slot (none until
+ *     it is filled); any other row the held text through its poster, and
+ *     nothing else: the row is never killed.
  *
  * The latched query is asked again after every call, and no further call is
  * made once P latched. The rule never kills, launches or reuses the row. One
@@ -1808,12 +1832,17 @@ export function createPendingRowRule(deps: PendingRowRuleDeps): PendingRowRule {
     const metNow = askQuery(() => deps.launchMetNotInteractive(key, currentStart), true)
     const hooks = deps.ownLaunch
     const ownLaunch = hooks !== undefined && askQuery(() => hooks.isOwnLaunch(key, currentStart), false)
+    // Asked in this order: tmux-unavailable, latched, ad-config-malformed, then the abort.
+    const tmuxUnavailableRaised = askQuery(() => deps.isTmuxUnavailableRaised(key), true)
+    const latched = latchedNow(key)
+    const configMalformedRaised = askQuery(() => deps.isConfigMalformedRaised(key), true)
+    const abortAvailable = ownLaunch && hooks !== undefined && askQuery(() => hooks.isAbortAvailable(key), false)
     const branch = decidePendingRowStepThree({
-      tmuxUnavailableRaised: askQuery(() => deps.isTmuxUnavailableRaised(key), true),
-      latched: latchedNow(key),
+      tmuxUnavailableRaised,
+      latched,
       ownLaunch,
-      configMalformedRaised: askQuery(() => deps.isConfigMalformedRaised(key), true),
-      abortAvailable: ownLaunch && hooks !== undefined && askQuery(() => hooks.isAbortAvailable(key), false),
+      configMalformedRaised,
+      abortAvailable,
       metNotInteractive: metNow,
     })
     switch (branch.kind) {
@@ -1822,7 +1851,13 @@ export function createPendingRowRule(deps: PendingRowRuleDeps): PendingRowRule {
       case PENDING_ROW_STEP3_LATCHED:
         return round('the persona latched: nothing more', RULE_LATCHED)
       case PENDING_ROW_STEP3_CONFIG_MALFORMED:
-        return round("at B: CSCB's own stuck launch while ad-config-malformed is raised: neither text and no abort until it clears", refusal('config-malformed'))
+        log(stuckLaunchPostSkippedLine(key, abortAvailable ? STUCK_LAUNCH_POST_SKIP_CONFIG_MALFORMED : STUCK_LAUNCH_POST_SKIP_CONFIG_MALFORMED_ABORT_USED))
+        return round(
+          abortAvailable
+            ? "at B: CSCB's own stuck launch while ad-config-malformed is raised: neither text and no abort until it clears"
+            : "at B: CSCB's own stuck launch, its abort used, while ad-config-malformed is raised: neither text until it clears",
+          refusal('config-malformed'),
+        )
       case PENDING_ROW_STEP3_RELAUNCH: {
         // Reached only with the own-launch slot filled (`ownLaunch` is false without it).
         if (hooks === undefined) return round('nothing more this round', refusal('still-pending'))
@@ -1830,6 +1865,9 @@ export function createPendingRowRule(deps: PendingRowRuleDeps): PendingRowRule {
         return round(`at B: CSCB's own stuck launch: the relaunching post and the abort (${answer.kind})`, { kind: PENDING_ROW_RULE_RELAUNCH, answer })
       }
       case PENDING_ROW_STEP3_HELD: {
+        // SRJ-412: CSCB's own launch reaches the held branch only once its
+        // episode's one abort is used; said here, where the held text is the outcome.
+        if (ownLaunch) log(stuckLaunchAbortSkippedLine(key, STUCK_LAUNCH_ABORT_SKIP_EARLIER_ABORT))
         const text = branch.attachLine ? 'the held text' : 'the held text without the attach line'
         log(pendingRowRuleRoundLine(ref, origin, launchStart, steps, `at B: ${text}; the row is left, never killed`))
         return { kind: PENDING_ROW_RULE_HELD, post: deps.postHeld(key, currentStart, !branch.attachLine) }
@@ -2054,8 +2092,9 @@ const RELAUNCH_LATCHED: PendingRowRelaunchAnswer = Object.freeze({ kind: PENDING
  *
  *   - `isOwnLaunch`: `deps.isOwnLaunch` (a throw is not own).
  *   - `isAbortAvailable`: false once P's open stuck-launch episode has used
- *     its one abort, with one line ({@link STUCK_LAUNCH_ABORT_SKIP_EARLIER_ABORT}):
- *     the rule then takes the held branch, so a relaunch still `pending` at B
+ *     its one abort; a pure query that logs nothing (the rule logs
+ *     {@link STUCK_LAUNCH_ABORT_SKIP_EARLIER_ABORT} only when its step 3
+ *     then takes the held branch), so a relaunch still `pending` at B
  *     in the same episode gets the held text once and is never killed. The
  *     state lives in this instance, per persona, and is disposed when the
  *     episode closes (`whenClosed` of the stuck-launch kind: a read of the
@@ -2166,11 +2205,7 @@ export function createStuckLaunchAbort(deps: StuckLaunchAbortDeps): StuckLaunchA
 
   return {
     isOwnLaunch: (key, launchStart) => askQuery(() => deps.isOwnLaunch(key, launchStart), false),
-    isAbortAvailable: (key) => {
-      if (states.get(key)?.used !== true) return true
-      log(stuckLaunchAbortSkippedLine(key, STUCK_LAUNCH_ABORT_SKIP_EARLIER_ABORT))
-      return false
-    },
+    isAbortAvailable: (key) => states.get(key)?.used !== true,
     isAbortUsed: (key) => states.get(key)?.used === true,
     relaunch: async (key, ref, launchStart) => {
       try {

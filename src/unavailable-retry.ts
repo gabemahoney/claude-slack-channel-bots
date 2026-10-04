@@ -1755,25 +1755,55 @@ export function createFullModeRetryAction(deps: FullModeRetryDeps): UnavailableR
   return (key, attempt) => runInTimerRetry(key, () => retryActionRun(deps, key, attempt))
 }
 
+/**
+ * What the gate before any call of a run for persona P reads
+ * (`retryRunGateStop`): the members of `FullModeRetryDeps` the retry action
+ * asks first. The pending-row rule's one run at a dialog approver's stop is
+ * given the same object (`PendingRowRuleInstall.gate`, `src/session-manager.ts`).
+ */
+export type RetryRunGateDeps = Pick<
+  FullModeRetryDeps,
+  'isShuttingDown' | 'appliedPersona' | 'isLatched' | 'isHeld' | 'canRelaunch' | 'isAtCap'
+>
+
+/**
+ * The gate before any call of a run for persona `key` (b.jg5 SRJ-303,
+ * SRJ-305; b.av2 SR-8.6), in order: the server shutting down, the persona
+ * not in the applied configuration, latched, held on `ErrInvalidFlags`, not
+ * up, at the restart cap. Answers the stop reason of the first that holds
+ * (`UNAVAILABLE_RETRY_STOP_SHUTDOWN`, `…_NOT_APPLIED`, `…_LATCHED`,
+ * `…_HELD`, `…_NOT_UP`, `…_CAPPED`), or `undefined` when none does. A
+ * latched or held query that throws counts as latched or held, with its one
+ * line; any other dependency that throws throws. Used by the retry action
+ * (`createFullModeRetryAction`) and by the pending-row rule's run at a
+ * dialog approver's stop.
+ */
+export function retryRunGateStop(deps: RetryRunGateDeps, key: string): string | undefined {
+  if (deps.isShuttingDown()) return UNAVAILABLE_RETRY_STOP_SHUTDOWN
+  // b.av2 SR-8.6 (b.jg5 SRJ-1512): a retry does nothing for a key outside
+  // the applied set. Its one exception, an old-life wait's kill and
+  // find-missing steps on a retired key (SRJ-811), runs in the session
+  // manager's live-row sequence registry, never on this timer, and never
+  // launches that key; no timer is armed for the old key.
+  if (deps.appliedPersona(key) === undefined) return UNAVAILABLE_RETRY_STOP_NOT_APPLIED
+  if (latched(key, deps.isLatched)) return UNAVAILABLE_RETRY_STOP_LATCHED
+  // b.jg5 SRJ-207, SRJ-303: no attempt while the persona is held on ErrInvalidFlags.
+  if (held(key, deps.isHeld)) return UNAVAILABLE_RETRY_STOP_HELD
+  if (!deps.canRelaunch(key)) return UNAVAILABLE_RETRY_STOP_NOT_UP
+  if (deps.isAtCap(key)) return UNAVAILABLE_RETRY_STOP_CAPPED
+  return undefined
+}
+
 /** One run of the retry action (`createFullModeRetryAction`) for persona `key`, inside its retry marker. */
 async function retryActionRun(
   deps: FullModeRetryDeps,
   key: string,
   attempt: UnavailableRetryAttempt,
 ): Promise<UnavailableRetryOutcome> {
-  if (deps.isShuttingDown()) return stopWith(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
+  const gateStop = retryRunGateStop(deps, key)
+  if (gateStop !== undefined) return stopWith(gateStop)
   const persona = deps.appliedPersona(key)
-  // b.av2 SR-8.6 (b.jg5 SRJ-1512): a retry does nothing for a key outside
-  // the applied set. Its one exception, an old-life wait's kill and
-  // find-missing steps on a retired key (SRJ-811), runs in the session
-  // manager's live-row sequence registry, never on this timer, and never
-  // launches that key; no timer is armed for the old key.
   if (persona === undefined) return stopWith(UNAVAILABLE_RETRY_STOP_NOT_APPLIED)
-  if (latched(key, deps.isLatched)) return stopWith(UNAVAILABLE_RETRY_STOP_LATCHED)
-  // b.jg5 SRJ-207, SRJ-303: no attempt while the persona is held on ErrInvalidFlags.
-  if (held(key, deps.isHeld)) return stopWith(UNAVAILABLE_RETRY_STOP_HELD)
-  if (!deps.canRelaunch(key)) return stopWith(UNAVAILABLE_RETRY_STOP_NOT_UP)
-  if (deps.isAtCap(key)) return stopWith(UNAVAILABLE_RETRY_STOP_CAPPED)
   const cwd = persona.working_directory
   if (attempt.mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY) {
     if (inFlight(key, deps.isInFlight)) {
@@ -1804,7 +1834,7 @@ async function retryActionRun(
     return pendingOnlyAnswer(row.state, restart)
   }
   const outcome = await deps.retry(key, cwd, deps.isInFlight, deps.retryBlockCause)
-  // Since b.jg5 E9, `already-connected` is answered only for a `live`
+  // b.jg5 SRJ-303, SRJ-310: `already-connected` is answered only for a `live`
   // reading (never `pending`) whose session is connected with its stream.
   if (outcome === 'already-connected') endCondition(key, LIVENESS_LIVE, deps.endTmuxUnresponsive)
   return answerFor(outcome, () => readRetryBlockCause(key, deps.retryBlockCause))

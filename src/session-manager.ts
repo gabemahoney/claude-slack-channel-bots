@@ -659,6 +659,7 @@ import {
   runDetachedRecoveryAttempt,
   runInAttempt,
   runOutsideAttempts,
+  retryRunGateStop,
   unavailableRetryCauseFor,
   UNAVAILABLE_RETRY_CAUSE_LOST_RACE,
   UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD,
@@ -672,6 +673,7 @@ import {
   UNAVAILABLE_RETRY_ROW_ABSENT,
   type AttemptView,
   type RetryBlockCause,
+  type RetryRunGateDeps,
   type UnavailableRetryPendingStep,
   type UnavailableRetryRowRead,
   type UnavailableRetryTriggerSink,
@@ -828,7 +830,6 @@ import {
   STUCK_LAUNCH_ABORT_SEQUENCE_NOT_STARTED,
   STUCK_LAUNCH_ABORT_SEQUENCE_STARTED,
   STUCK_LAUNCH_POST_FAILED,
-  STUCK_LAUNCH_SUPPRESSED,
   createStuckLaunchAbort,
   describePendingRowRuleAnswer,
   pendingRowLapEnterFailureOf,
@@ -4787,7 +4788,7 @@ async function runApproverLoop(key: string, isStartup: boolean, ref: string, run
   if (capMs !== undefined) {
     armApproverLimit(clock, run, APPROVER_STOP_CAP, startMs, () => capMs)
   } else {
-    // b.jg5 E17 ruling: before any launch start is read, B runs from the approver's own start.
+    // b.jg5 SRJ-404, SRJ-406: before any launch start is read, B runs from the approver's own start.
     armApproverLimit(clock, run, APPROVER_STOP_BOUND, startMs, adLaunchBoundMsInEffect)
   }
   let reason: ApproverStopReason
@@ -4858,7 +4859,7 @@ function approverLimitReached(ctx: ApproverContext, reason: ApproverLimitReason,
 
 /**
  * Keep `launchStartMs`, the first launch start a lap read (b.jg5 SRJ-401),
- * and re-arm B from it (b.jg5 E17 ruling: B runs from the approver's own
+ * and re-arm B from it (b.jg5 SRJ-404, SRJ-406: B runs from the approver's own
  * start only until a lap reads a launch start). The approver's start is
  * never earlier than the launch start, so the bound armed first was never
  * early. With the test cap set nothing is re-armed. `launchStartedAt` is
@@ -11978,22 +11979,6 @@ export interface PendingRowRuleDepsInput {
 }
 
 /**
- * What work in flight blocks the pending-row rule for persona `key` (b.jg5
- * SRJ-303, SRJ-410), by name, or `undefined`: `personaRetryBlockCause`'s
- * cause, except that `withinOwnLaunch` (the collision ladder's `pending`
- * step, inside the launch it belongs to, before any launch call of its own)
- * leaves that launch in flight out and asks the other causes. A running
- * dialog approver never counts. Never throws.
- */
-function pendingRowRuleBlockCause(key: string, withinOwnLaunch: boolean): RetryBlockCause | undefined {
-  if (!withinOwnLaunch) return personaRetryBlockCause(key)
-  if (liveRowSequenceRegistry?.isNoLaunchRunning(personaInstanceId(key)) === true) return RETRY_BLOCK_OLD_LIFE_WAIT
-  if (isLiveRowSequenceRunning(key)) return RETRY_BLOCK_LIVE_ROW_SEQUENCE
-  if (isOldLifeWaitRunningFor(key)) return RETRY_BLOCK_OLD_LIFE_WAIT
-  return undefined
-}
-
-/**
  * Whether persona `key`'s working directory is held for an old life, for
  * the pending-row rule's gate (b.jg5 SRJ-810): its own row held
  * (`isOwnRowOldLifeHeld`), or a hold on its working directory, through the
@@ -12271,7 +12256,7 @@ export function buildPendingRowRuleDeps(input: PendingRowRuleDepsInput): Pending
     now: () => _now(),
     log,
     isLatched: (key) => personaLatchedNow(key),
-    retryBlockedBy: (key, withinOwnLaunch) => pendingRowRuleBlockCause(key, withinOwnLaunch),
+    retryBlockedBy: (key, withinOwnLaunch) => retryBlockCauseOf(key, withinOwnLaunch),
     isHeldForOldLife: (key) => pendingRowRuleHeldForOldLife(key, input.appliedPersona),
     isApproverRunning: (key) => isDialogApproverRunning(key),
     launchMetNotInteractive: (key, launchStart) => launchMetSendKeysNotInteractive(key, launchStart),
@@ -12287,7 +12272,7 @@ export function buildPendingRowRuleDeps(input: PendingRowRuleDepsInput): Pending
       const episodes = episodesNow()
       if (episodes === undefined) {
         log(pendingRowRuleNoEpisodesLine(key))
-        return STUCK_LAUNCH_SUPPRESSED
+        return STUCK_LAUNCH_POST_FAILED
       }
       return postStuckLaunchHeld({ episodes, tmuxUnavailableRaised, log }, key, launchStart, metNotInteractive)
     },
@@ -12305,6 +12290,17 @@ export interface PendingRowRuleInstall {
    * Absent: that run starts at once, on its own.
    */
   readonly serialize?: PersonaSerialize
+  /**
+   * The retry action's gate before any call (`retryRunGateStop`,
+   * `src/unavailable-retry.ts`; production: the same dependencies `main()`
+   * gives the retry action): asked when the rule's run at a dialog
+   * approver's stop starts, after its turn in P's serializer, so a run that
+   * waited behind P's teardown, or finds P latched, held on
+   * `ErrInvalidFlags`, not up or at the restart cap, is dropped with no call
+   * (b.jg5 SRJ-404, SRJ-410, SRJ-411, SRJ-305; b.av2 SR-8.6). Absent: only
+   * the shutdown drop applies there.
+   */
+  readonly gate?: RetryRunGateDeps
 }
 
 /**
@@ -12434,6 +12430,24 @@ export function pendingRowRuleApproverStopDroppedLine(ref: string): string {
   return `[slack] pending-row: ${ref} rule (${PENDING_ROW_RULE_ORIGIN_APPROVER_STOP}): dropped — the server is shutting down; no call (b.jg5 SRJ-404)`
 }
 
+/**
+ * The line for a queued approver-stop run dropped at its start by the retry
+ * action's gate (`retryRunGateStop`): `why` is the gate's stop reason (P not
+ * in the applied configuration, latched, held on `ErrInvalidFlags`, not up,
+ * at the restart cap, the server shutting down) or the gate's failure. No
+ * call:
+ *
+ *   [slack] pending-row: <ref> rule (approver-stop): dropped — <why>; no call (b.jg5 SRJ-404, SRJ-410, SRJ-305)
+ */
+export function pendingRowRuleApproverStopGatedLine(ref: string, why: string): string {
+  return `[slack] pending-row: ${ref} rule (${PENDING_ROW_RULE_ORIGIN_APPROVER_STOP}): dropped — ${why}; no call (b.jg5 SRJ-404, SRJ-410, SRJ-305)`
+}
+
+/** The `why` of `pendingRowRuleApproverStopGatedLine` when the gate itself threw: taken as stopped (fail safe). */
+export function pendingRowRuleApproverStopGateFailedWhy(described: string): string {
+  return `its gate failed (${described}), taken as stopped`
+}
+
 /** The line for an approver stop that would run the rule with none installed: the pending-only arm only. */
 export function pendingRowRuleApproverStopNotInstalledLine(ref: string, reason: ApproverStopReason): string {
   return `[slack] pending-row: ${ref}: its dialog approver stopped (${reason}) with the row pending, and no pending-row rule is installed — the pending-only arm only; no lap, run or post (b.jg5 SRJ-404, SRJ-410)`
@@ -12454,9 +12468,11 @@ export function pendingRowRuleApproverStopNotInstalledLine(ref: string, reason: 
  * as a recovery attempt of its own (`runDetachedRecoveryAttempt`; hatch A2:
  * its UNAVAILABLE arms, a tmux-touching call's UNAVAILABLE starts
  * `tmux-unresponsive`, its UNCLASSIFIED opens an episode), on that last
- * read, exempt from the retry timer's cadence; the rule's own gates apply
- * when it starts. A run that starts after shutdown began is dropped with no
- * call. Its answer is logged in one line; a gone row is left to the timer
+ * read, exempt from the retry timer's cadence. When it starts, a run after
+ * shutdown began, or one the retry action's gate stops
+ * (`PendingRowRuleInstall.gate`: P not applied, latched, held on
+ * `ErrInvalidFlags`, not up, at the cap), is dropped with one line and no
+ * call; then the rule's own gates apply. Its answer is logged in one line; a gone row is left to the timer
  * the stop's arm armed. No run for any other reason, for a last read in another
  * state, with none, or with no launch start. With no rule installed, one
  * line and nothing more. Never throws.
@@ -12473,7 +12489,7 @@ function queueApproverStopRuleRun(key: string, ref: string, reason: ApproverStop
       return
     }
     const row: PendingRowRuleRow = { state: AGENT_DIRECTOR_PENDING_STATE, launchStartedAt }
-    const operation = (): Promise<void> => approverStopRuleRun(key, ref, reason, row, installed.rule)
+    const operation = (): Promise<void> => approverStopRuleRun(key, ref, reason, row, installed)
     const queued = installed.serialize === undefined ? operation() : installed.serialize(key, operation)
     void queued.catch((err: unknown) => {
       console.error(pendingRowRuleFailedLine(ref, PENDING_ROW_RULE_ORIGIN_APPROVER_STOP, describeThrownValue(err)))
@@ -12483,18 +12499,41 @@ function queueApproverStopRuleRun(key: string, ref: string, reason: ApproverStop
   }
 }
 
-/** The queued approver-stop run itself (`queueApproverStopRuleRun`): dropped after shutdown began, else one rule run as a recovery attempt, and its line. */
+/**
+ * The queued approver-stop run itself (`queueApproverStopRuleRun`), when its
+ * turn starts: dropped with one line after shutdown began
+ * (`pendingRowRuleApproverStopDroppedLine`), or when the installed gate
+ * (`PendingRowRuleInstall.gate`, through `retryRunGateStop`) answers a stop
+ * reason or throws (`pendingRowRuleApproverStopGatedLine`): no `read-pane`,
+ * Enter, `find-missing`, `get`, post or kill for a persona removed, latched,
+ * held, not up or at the cap. Else one rule run as a recovery attempt, and
+ * its line.
+ */
 async function approverStopRuleRun(
   key: string,
   ref: string,
   reason: ApproverStopReason,
   row: PendingRowRuleRow,
-  rule: PendingRowRule,
+  installed: PendingRowRuleInstall,
 ): Promise<void> {
   if (approversClosed) {
     console.error(pendingRowRuleApproverStopDroppedLine(ref))
     return
   }
+  const gate = installed.gate
+  if (gate !== undefined) {
+    let why: string | undefined
+    try {
+      why = retryRunGateStop(gate, key)
+    } catch (err) {
+      why = pendingRowRuleApproverStopGateFailedWhy(describeThrownValue(err))
+    }
+    if (why !== undefined) {
+      console.error(pendingRowRuleApproverStopGatedLine(ref, why))
+      return
+    }
+  }
+  const { rule } = installed
   const ruled = await runDetachedRecoveryAttempt(key, () =>
     rule.run({ key, ref, row, origin: PENDING_ROW_RULE_ORIGIN_APPROVER_STOP }),
   )
@@ -13197,7 +13236,8 @@ export interface OwnLaunchRecord {
  * after the approver has stopped. Unlike "this launch's row"
  * (`thisLaunchRows`), no read forgets it: a read only compares the launch
  * start it carries (`isCscbOwnLaunch`). Forgotten at a new launch call for
- * the persona (`launchCallWithWindow`), at its teardown's kill
+ * the persona (`launchCallWithWindow`; put back after a call that answered
+ * `ErrInstanceIdCollision`, `restoreLaunchRecords`), at its teardown's kill
  * (`forgetLaunchCalls`) and by `_resetInFlightLaunches`. A launch call that
  * failed in any other way (no window end), another process's or a human's
  * launch, a row with no launch start and a launch start outside the window
@@ -13266,7 +13306,9 @@ export function isCscbOwnLaunch(key: string, launchStart: unknown): boolean {
  * starts just before the call, on the session manager's clock (`_now`),
  * replacing the persona's earlier one, and the call forgets the persona's
  * "this launch's row" record (`thisLaunchRows`) and its record of CSCB's own
- * launch (`ownLaunches`, b.jg5 SRJ-412); the window's end is taken
+ * launch (`ownLaunches`, b.jg5 SRJ-412), putting both back when it answers
+ * `ErrInstanceIdCollision`, which started no launch
+ * (`restoreLaunchRecords`); the window's end is taken
  * when the call returns success or, for a launch timeout
  * (`isLaunchTimeoutError`: `ErrCallTimeout`, or `ErrTmuxUnresponsive` whose
  * description carries "the session may have been created"), when the call's
@@ -13281,6 +13323,8 @@ async function launchCallWithWindow<T>(
   verb: 'spawn' | 'resume',
   call: (client: Client) => Promise<T>,
 ): Promise<T> {
+  const keptThisLaunchRow = thisLaunchRows.get(key)
+  const keptOwnLaunch = ownLaunches.get(key)
   thisLaunchRows.delete(key)
   ownLaunches.delete(key)
   const started: LaunchCallWindowRecord = { verb, startMs: _now() }
@@ -13290,10 +13334,42 @@ async function launchCallWithWindow<T>(
     result = await withSpawnDetection(key, workingDirectory, verb, call)
   } catch (err) {
     if (isLaunchTimeoutError(err, verb)) endLaunchCallWindow(key, started, LAUNCH_CALL_END_LAUNCH_TIMEOUT)
+    if (hasAdErrorName(err, ERR_INSTANCE_ID_COLLISION_NAME)) restoreLaunchRecords(key, started, keptThisLaunchRow, keptOwnLaunch)
     throw err
   }
   endLaunchCallWindow(key, started, LAUNCH_CALL_END_RETURNED)
   return result
+}
+
+/**
+ * After persona `key`'s launch call whose window is `started` answered
+ * `ErrInstanceIdCollision` (by name), which created no row and started no
+ * launch (b.jg5 SRJ-112, SRJ-713), put back the "this launch's row" record
+ * and the record of CSCB's own launch (b.jg5 SRJ-407, SRJ-412) the call set
+ * aside at its start, so an earlier launch's records survive a call that
+ * changed nothing. Each record is put back only while `started` is still the
+ * persona's latest window (no later launch call, and no teardown's
+ * `forgetLaunchCalls`, came after it) and nothing set that record during the
+ * call. Every other outcome, a CONFLICT refusal included (CSCB cannot tell
+ * agent-director's pre-spawn scan refusal, which writes no row, from one
+ * after "duplicate session", which may leave this call's row `pending`), may
+ * have started a launch, and the records stay forgotten. Either record still
+ * counts only for the launch start it carries (`isCscbOwnLaunch`,
+ * `checkThisLaunchRowOnRead`). Silent; never throws.
+ */
+function restoreLaunchRecords(
+  key: string,
+  started: LaunchCallWindowRecord,
+  thisLaunchRow: ThisLaunchRowRecord | undefined,
+  ownLaunch: OwnLaunchRecord | undefined,
+): void {
+  try {
+    if (launchCallWindows.get(key) !== started) return
+    if (thisLaunchRow !== undefined && !thisLaunchRows.has(key)) thisLaunchRows.set(key, thisLaunchRow)
+    if (ownLaunch !== undefined && !ownLaunches.has(key)) ownLaunches.set(key, ownLaunch)
+  } catch {
+    /* a record not put back only fails safe: no abort, the held text */
+  }
 }
 
 /**
@@ -13312,8 +13388,10 @@ export interface ThisLaunchRowRecord {
  * Each persona's "this launch's row" record (`ThisLaunchRowRecord`), set by
  * the step after a launch's UNAVAILABLE outcome (`afterLaunchUnavailable`)
  * and checked at every shared own-row read (`checkThisLaunchRowOnRead`).
- * Forgotten at a new launch call for the persona (`launchCallWithWindow`),
- * by rule 3's check, at its teardown's kill (`forgetLaunchCalls`) and by
+ * Forgotten at a new launch call for the persona (`launchCallWithWindow`; put
+ * back after a call that answered `ErrInstanceIdCollision`,
+ * `restoreLaunchRecords`), by rule 3's check, at its teardown's kill
+ * (`forgetLaunchCalls`) and by
  * `_resetInFlightLaunches`.
  */
 const thisLaunchRows = new Map<string, ThisLaunchRowRecord>()
@@ -17240,7 +17318,19 @@ export function isSequenceOrOldLifeWaitRunning(key: string): boolean {
  * "blocks a retry" is true exactly when this answers a cause. Never throws.
  */
 export function personaRetryBlockCause(key: string): RetryBlockCause | undefined {
-  if (isLaunchInFlight(key)) return RETRY_BLOCK_LAUNCH
+  return retryBlockCauseOf(key, false)
+}
+
+/**
+ * The one list of "blocks a retry" causes (b.jg5 SRJ-303), in order, behind
+ * `personaRetryBlockCause` and the pending-row rule's gate
+ * (`buildPendingRowRuleDeps`): `exceptOwnLaunch` (the collision ladder's
+ * `pending` step, inside the launch it belongs to, before any launch call of
+ * its own) leaves the launch call in flight out and asks the other causes.
+ * Never throws.
+ */
+function retryBlockCauseOf(key: string, exceptOwnLaunch: boolean): RetryBlockCause | undefined {
+  if (!exceptOwnLaunch && isLaunchInFlight(key)) return RETRY_BLOCK_LAUNCH
   if (liveRowSequenceRegistry?.isNoLaunchRunning(personaInstanceId(key)) === true) return RETRY_BLOCK_OLD_LIFE_WAIT
   if (isLiveRowSequenceRunning(key)) return RETRY_BLOCK_LIVE_ROW_SEQUENCE
   if (isOldLifeWaitRunningFor(key)) return RETRY_BLOCK_OLD_LIFE_WAIT

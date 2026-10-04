@@ -115,15 +115,30 @@ export function splitTopLevel(list: string): string[] {
 /**
  * The top-level properties of the object literal that starts at the first `{`
  * in `text`: name → value text (whitespace collapsed). A shorthand property
- * `clientFor` maps to `clientFor`. Throws on a spread or a duplicate name.
+ * `clientFor` maps to `clientFor`. Throws on a duplicate name.
+ *
+ * A spread of a bare name (`...gate`) is resolved through `spread`, which
+ * answers the text of the object literal that name holds (its first `{`
+ * starts it); its properties are read the same way (spreads in it included)
+ * and merged in, and a name given both by a spread and by the literal itself
+ * (an override) is a duplicate, so it throws. Without `spread`, any spread
+ * throws, as does a spread of anything other than a bare name.
  */
-export function objectProperties(text: string): Map<string, string> {
+export function objectProperties(text: string, spread?: (name: string) => string): Map<string, string> {
   const props = new Map<string, string>()
+  const add = (name: string, value: string): void => {
+    if (props.has(name)) throw new Error(`source-audit: duplicate property ${name}`)
+    props.set(name, value)
+  }
   for (const part of splitTopLevel(text.slice(...balancedAfter(text, 0, '{', '}')))) {
+    const spreadOf = part.match(/^\.\.\.\s*([A-Za-z_$][\w$]*)$/)
+    if (spreadOf && spread) {
+      for (const [name, value] of objectProperties(spread(spreadOf[1]!), spread)) add(name, value)
+      continue
+    }
     const m = part.match(/^([A-Za-z_$][\w$]*)\s*(?::\s*([\s\S]*))?$/)
     if (!m) throw new Error(`source-audit: not a plain property: ${part.slice(0, 40)}`)
-    if (props.has(m[1]!)) throw new Error(`source-audit: duplicate property ${m[1]}`)
-    props.set(m[1]!, m[2] ?? m[1]!)
+    add(m[1]!, m[2] ?? m[1]!)
   }
   return props
 }

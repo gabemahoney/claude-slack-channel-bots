@@ -314,6 +314,7 @@ import {
   UNAVAILABLE_RETRY_STOP_LATCHED,
   UNAVAILABLE_RETRY_STOP_SHUTDOWN,
   UNAVAILABLE_RETRY_STOP_TORN_DOWN,
+  type RetryRunGateDeps,
   type UnavailableRetryController,
 } from './unavailable-retry.ts'
 import {
@@ -2842,7 +2843,7 @@ export async function deferPendingRow(
     const step = await readAndStepPendingRow(persona)
     switch (step.kind) {
       case PENDING_ROW_STEP_NOT_PENDING:
-        if (atRetry && isDeadRowRead(step.state)) return deferralGone(key, step.state)
+        if (atRetry && isFinishedRowState(step.state)) return deferralGone(key, step.state)
         console.error(`[slack] Deferring persona=${key}: its row now reads ${renderLogMessageText(step.state)} — nothing more in this run; the next run decides (b.jg5 SRJ-409)`)
         break
       case PENDING_ROW_STEP_NO_ROW:
@@ -2892,8 +2893,8 @@ export interface DeferPendingRowOptions {
  */
 export type DeferPendingRowAnswer = 'pending' | DeadRowRead
 
-/** True for a row state the deferral's gone answer carries (`ended` or `missing`). Pure. */
-function isDeadRowRead(state: string): state is typeof LIVENESS_DEAD_ROW_ENDED | typeof LIVENESS_DEAD_ROW_MISSING {
+/** True for a finished row state (`ended` or `missing`), which the deferral's gone answer carries; no row is not a state, so not included. Pure. */
+function isFinishedRowState(state: string): state is typeof LIVENESS_DEAD_ROW_ENDED | typeof LIVENESS_DEAD_ROW_MISSING {
   return state === LIVENESS_DEAD_ROW_ENDED || state === LIVENESS_DEAD_ROW_MISSING
 }
 
@@ -3604,6 +3605,21 @@ export async function main(): Promise<void> {
   // `tmux-unavailable` condition cleared or the `tmux-unresponsive`
   // condition ended. Each consumer is isolated, so one that throws does not
   // skip the other.
+  // b.jg5 SRJ-303, SRJ-305, SRJ-404: the retry action's gate before any call
+  // (applied, latched, held on ErrInvalidFlags, up, the cap, shutdown), one
+  // object for the retry action and the pending-row rule's run at a dialog
+  // approver's stop, so that run is gated as a retry's is.
+  const retryRunGate: RetryRunGateDeps = {
+    appliedPersona: getAppliedPersona,
+    canRelaunch: (key) => canRelaunch(key),
+    isAtCap: (key) => backoffIsAtCap(key, RESTART_FAILURE_CAP),
+    isShuttingDown: () => shuttingDown,
+    // b.jg5 SRJ-303, SRJ-305: a retry of a latched persona makes no call and stops the timer.
+    isLatched: (key) => conflictLatch.isLatched(key),
+    // b.jg5 SRJ-207, SRJ-303, SRJ-305: so does a retry of a persona held on
+    // ErrInvalidFlags, whatever its causes.
+    isHeld: (key) => invalidFlagsHold.isHeld(key),
+  }
   const retryTimers = createUnavailableRetryController({
     log: (line) => console.error(line),
     onRetryFire: (key, firedAt) => tmuxUnresponsive.onsetAtRetry(key, firedAt),
@@ -3621,15 +3637,7 @@ export async function main(): Promise<void> {
     },
     action: createFullModeRetryAction({
       retry: runRestartRetry,
-      appliedPersona: getAppliedPersona,
-      canRelaunch: (key) => canRelaunch(key),
-      isAtCap: (key) => backoffIsAtCap(key, RESTART_FAILURE_CAP),
-      isShuttingDown: () => shuttingDown,
-      // b.jg5 SRJ-303, SRJ-305: a retry of a latched persona makes no call and stops the timer.
-      isLatched: (key) => conflictLatch.isLatched(key),
-      // b.jg5 SRJ-207, SRJ-303, SRJ-305: so does a retry of a persona held on
-      // ErrInvalidFlags, whatever its causes.
-      isHeld: (key) => invalidFlagsHold.isHeld(key),
+      ...retryRunGate,
       // b.jg5 SRJ-303: only work that blocks a retry skips it; a running
       // dialog approver alone never does (SRJ-401). The skip's again-reason
       // and the restart retry's skip line name what blocks it.
@@ -3684,7 +3692,8 @@ export async function main(): Promise<void> {
   // registry, before the start pass. It runs only at a retry of a persona's
   // timer (the pending-only step, the restart path's deferral, the ladder's
   // `pending` step) and once at a dialog approver's stop, which takes the
-  // persona's turn in the lifecycle serializer; every other origin only arms.
+  // persona's turn in the lifecycle serializer and is dropped when the retry
+  // action's gate would stop a retry then; every other origin only arms.
   setPendingRowRule({
     rule: createPendingRowRule(
       buildPendingRowRuleDeps({
@@ -3694,6 +3703,7 @@ export async function main(): Promise<void> {
       }),
     ),
     serialize: personaLifecycle.run,
+    gate: retryRunGate,
   })
 
   // b.jg5 SRJ-811, SRJ-812, SRJ-1512: the old-life wait's bindings, installed

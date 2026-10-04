@@ -198,6 +198,15 @@ export const LIVE_ROW_SEQUENCE_STEP4_PAUSE_MS = 5_000
  */
 export const LIVE_ROW_SEQUENCE_GRACE_REARM_MS = 5_000
 
+/**
+ * The least time between two of one wait's lines saying G could not be read
+ * while arming (`liveRowSequenceWaitArmFailedLine`), in ms: the first failure
+ * is logged, then a failure whose description changed, and otherwise at most
+ * one line per this spacing; the arm is still tried again every
+ * `LIVE_ROW_SEQUENCE_GRACE_REARM_MS`.
+ */
+export const LIVE_ROW_SEQUENCE_GRACE_REARM_LOG_SPACING_MS = 60_000
+
 /** The number of runs step 3 makes at most (SRJ-705). */
 export const LIVE_ROW_SEQUENCE_STEP3_RUNS = 3
 
@@ -1239,10 +1248,13 @@ export async function runLiveRowSequence(
    * accessor read at every fire; SRJ-406, never from `started_at`); ends
    * early (false) once stopped. Never ends early (SRJ-210: waiting too short
    * never leads to a destructive step): a G accessor that throws or answers
-   * NaN while arming arms nothing, with one line
-   * (`liveRowSequenceWaitArmFailedLine`), and the arm is tried again after
+   * NaN while arming arms nothing, and the arm is tried again after
    * `LIVE_ROW_SEQUENCE_GRACE_REARM_MS` on the clock, until it arms or the
-   * sequence is stopped; only the armed wait's own fire ends the wait.
+   * sequence is stopped; only the armed wait's own fire ends the wait. Its
+   * line (`liveRowSequenceWaitArmFailedLine`) is written at the first
+   * failure, at a failure whose description differs from the last one
+   * logged, and otherwise at most once per
+   * `LIVE_ROW_SEQUENCE_GRACE_REARM_LOG_SPACING_MS` on the clock.
    */
   const waitForGrace = (launchStartedAt: unknown): Promise<boolean> => {
     if (stop.reason !== undefined) return Promise.resolve(false)
@@ -1250,6 +1262,7 @@ export async function runLiveRowSequence(
       let done = false
       let cancel: () => void = () => {}
       let unsubscribe: () => void = () => {}
+      let lastArmFailure: { readonly described: string; readonly loggedAtMs: number } | undefined
       const settle = (elapsed: boolean): void => {
         if (done) return
         done = true
@@ -1274,7 +1287,21 @@ export async function runLiveRowSequence(
           } catch {
             /* an error whose name or message cannot be read stays `unknown` */
           }
-          log(liveRowSequenceWaitArmFailedLine(ref, described))
+          // One line for the first failure, a changed error, or after the spacing; the re-arm is never skipped.
+          let nowMs = Number.NaN
+          try {
+            nowMs = deps.clock.now()
+          } catch {
+            /* a clock that cannot be read logs only the first or a changed failure */
+          }
+          if (
+            lastArmFailure === undefined ||
+            lastArmFailure.described !== described ||
+            nowMs - lastArmFailure.loggedAtMs >= LIVE_ROW_SEQUENCE_GRACE_REARM_LOG_SPACING_MS
+          ) {
+            log(liveRowSequenceWaitArmFailedLine(ref, described))
+            lastArmFailure = { described, loggedAtMs: nowMs }
+          }
           const handle = deps.clock.setTimeout(arm, LIVE_ROW_SEQUENCE_GRACE_REARM_MS)
           cancel = () => deps.clock.clearTimeout(handle)
           return

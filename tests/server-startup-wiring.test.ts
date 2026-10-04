@@ -123,6 +123,11 @@
  *   `run`, after the live-row sequence registry's install and before the
  *   restart module, the start sweep, the start bring-up and the health check;
  *   no other src file builds or installs one.
+ * - b.jg5 SRJ-303 / SRJ-305 / SRJ-404: one retry run gate object
+ *   (`RetryRunGateDeps`: applied, latched, held, up, cap, shutdown) is
+ *   declared once in main(), spread into the full-mode retry action's deps
+ *   (no own member overrides it) and installed as the pending-row rule's
+ *   `gate`, so the approver-stop run is gated as a retry is.
  * - b.jg5 SRJ-1016: the one set of per-persona notice episodes is built once,
  *   imported from the episodes module, in main()'s own statement list, before
  *   the retry controller, the restart module, the start bring-up and the
@@ -427,7 +432,7 @@ import type {
   UnclassifiedErrorEpisodesDeps,
 } from '../src/persona-episodes.ts'
 import type * as UnavailableRetryModule from '../src/unavailable-retry.ts'
-import type { FullModeRetryDeps, UnavailableRetryController, UnavailableRetryDeps } from '../src/unavailable-retry.ts'
+import type { FullModeRetryDeps, RetryRunGateDeps, UnavailableRetryController, UnavailableRetryDeps } from '../src/unavailable-retry.ts'
 import type * as LivenessReadingModule from '../src/liveness-reading.ts'
 import type * as KillRetryModule from '../src/kill-retry.ts'
 import type * as SessionManagerModule from '../src/session-manager.ts'
@@ -472,9 +477,50 @@ function onlyCallArgs(name: string): string[] {
   return splitTopLevel(onlyCallArguments(SERVER_CODE, name))
 }
 
-/** The top-level properties of the object literal passed to the only call of `name`. */
+/**
+ * The top-level properties of the object literal passed to the only call of
+ * `name`, a spread of a const object merged in (see `spreadConstObject`; an
+ * override of a spread member throws).
+ */
 function onlyCallProps(name: string): Map<string, string> {
-  return objectProperties(onlyCallArguments(SERVER_CODE, name))
+  return objectProperties(onlyCallArguments(SERVER_CODE, name), spreadConstObject)
+}
+
+/**
+ * The object literal a spread `...<name>` in server.ts takes its members
+ * from: the one `const <name>(: <Type>)? = { … }` declaration, from its `{`.
+ * Fails unless there is exactly one.
+ */
+function spreadConstObject(name: string): string {
+  const decls = indicesOf(new RegExp(`\\bconst\\s+${name}(?:\\s*:\\s*\\w+)?\\s*=\\s*\\{`, 'g'), SERVER_CODE)
+  expect([name, decls]).toEqual([name, [expect.any(Number)]])
+  return SERVER_CODE.slice(SERVER_CODE.indexOf('{', decls[0]!))
+}
+
+/** The retry run's gate type (b.jg5 SRJ-303, SRJ-305, SRJ-404), as imported in server.ts. */
+const RETRY_RUN_GATE_TYPE = 'RetryRunGateDeps'
+
+/**
+ * b.jg5 SRJ-303, SRJ-305, SRJ-404: the one `const <name>: RetryRunGateDeps =
+ * { … }` in main() that both the full-mode retry action and the pending-row
+ * rule's approver-stop run are gated on. Fails unless it is declared exactly
+ * once in server.ts. Returns its name, its object literal's [start, end)
+ * (braces excluded) and its properties.
+ */
+function retryRunGate(): { name: string; at: number; start: number; end: number; props: Map<string, string> } {
+  const decls = [...SERVER_CODE.matchAll(new RegExp(`\\bconst\\s+(\\w+)\\s*:\\s*${RETRY_RUN_GATE_TYPE}\\s*=\\s*\\{`, 'g'))]
+  expect(decls).toHaveLength(1)
+  const name = decls[0]![1]!
+  declaredOnce(name)
+  const at = decls[0]!.index!
+  const [start, end] = balancedAfter(SERVER_CODE, at, '{', '}')
+  return { name, at, start, end, props: objectProperties(SERVER_CODE.slice(start - 1)) }
+}
+
+/** How many of `offsets` lie inside the retry run's gate object (see `retryRunGate`). */
+function withinRetryRunGate(offsets: number[]): number {
+  const { start, end } = retryRunGate()
+  return offsets.filter((offset) => offset > start && offset < end).length
 }
 
 /** The name `const <name> = <call>(` binds, for the only such declaration; fails unless there is exactly one. */
@@ -2626,6 +2672,71 @@ describe('main() passes the full-mode retry action the pending-row step, retryPe
 })
 
 // ---------------------------------------------------------------------------
+// Static audit: b.jg5 SRJ-303, SRJ-305, SRJ-404 — one retry run gate for the
+// retry action and the pending-row rule's approver-stop run
+//
+// `PendingRowRuleInstall.gate` is optional (absent, the approver-stop run is
+// dropped only at shutdown), and the retry action takes any applied, latched,
+// held, up, cap and shutdown reads. So a production wiring that dropped the
+// install's gate, or gave the approver-stop run a second hand-made gate that
+// drifts from the retry action's, would type-check and pass every behaviour
+// suite while a run queued behind P's teardown made calls for a key outside
+// the applied set. What the gate does is tested in tests/pending-row.test.ts
+// and tests/session-manager.test.ts; each member's binding is pinned with the
+// retry action's (above, and the latch's and the hold's describes); pinned
+// here: one object, shared.
+// ---------------------------------------------------------------------------
+
+describe('main() builds one retry run gate, spreads it into the full-mode retry action and installs it as the pending-row rule\'s gate (b.jg5 SRJ-303, SRJ-305, SRJ-404)', () => {
+  // Every member of the gate's type; a member added to it fails the typecheck here.
+  const GATE_MEMBERS: Record<keyof RetryRunGateDeps, true> = {
+    isShuttingDown: true,
+    appliedPersona: true,
+    isLatched: true,
+    isHeld: true,
+    canRelaunch: true,
+    isAtCap: true,
+  }
+  const INSTALL: keyof typeof SessionManagerModule = 'setPendingRowRule'
+  const GATE: keyof PendingRowRuleInstall = 'gate'
+
+  test('declared once, in main()\'s own statement list, typed by the unavailable-retry module\'s gate type, before the retry controller and the rule\'s install; its members are exactly the gate type\'s', () => {
+    const gate = retryRunGate()
+    expect(atMainTopLevel(SERVER_CODE, gate.at)).toBe(true)
+    expect(SERVER_CODE).toMatch(new RegExp(`\\bimport\\s*\\{[^}]*\\btype\\s+${RETRY_RUN_GATE_TYPE}\\b[^}]*\\}\\s*from\\s*'\\./unavailable-retry\\.ts'`))
+    expect(gate.at).toBeLessThan(onlyCallOf('createUnavailableRetryController'))
+    expect(gate.at).toBeLessThan(onlyCallOf(INSTALL))
+    expect([...gate.props.keys()].sort()).toEqual(Object.keys(GATE_MEMBERS).sort())
+  })
+
+  test('named exactly three times: its declaration, one spread into the retry action\'s deps (none of whose own members overrides it) and the install\'s gate, bound by its bare name', () => {
+    const { name, at, props } = retryRunGate()
+    const named = indicesOf(new RegExp(`\\b${name}\\b`, 'g'), SERVER_CODE)
+    expect(named).toHaveLength(3)
+    expect(named[0]).toBe(SERVER_CODE.indexOf(name, at))
+    const actionParts = splitTopLevel(SERVER_CODE.slice(...balancedAfter(SERVER_CODE, onlyCallOf('createFullModeRetryAction'), '{', '}')))
+    expect(actionParts.filter((part) => part.startsWith('...'))).toEqual([`...${name}`])
+    expect(withinCall(named, onlyCallOf('createFullModeRetryAction'))).toBe(1)
+    // An own member of the action named like a gate member would override the
+    // spread; the merged read throws on that (objectProperties' duplicate).
+    const action = onlyCallProps('createFullModeRetryAction')
+    for (const member of Object.keys(GATE_MEMBERS)) expect([member, action.get(member)]).toEqual([member, props.get(member)])
+    expect(onlyCallProps(INSTALL).get(GATE)).toBe(name)
+    expect(withinCall(named, onlyCallOf(INSTALL))).toBe(1)
+  })
+
+  test('the merged read refuses a spread member overridden by an own member', () => {
+    const spread = (): string => '{ isLatched: a }'
+    expect(() => objectProperties('{ ...g, isLatched: b }', spread)).toThrow(/duplicate property isLatched/)
+    expect([...objectProperties('{ ...g, retry: r }', spread)]).toEqual([
+      ['isLatched', 'a'],
+      ['retry', 'r'],
+    ])
+    expect(() => objectProperties('{ ...g }')).toThrow(/not a plain property/)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Static audit: b.jg5 SRJ-410, SRJ-404 — main()'s one pending-row rule
 //
 // The session manager's install is optional (with none installed, a retry or
@@ -2653,6 +2764,7 @@ describe('main() builds the one pending-row rule through its factory over the se
   const START_SWEEP: keyof typeof SessionManagerModule = 'reconcileOrphans'
   const RULE: keyof PendingRowRuleInstall = 'rule'
   const SERIALIZE: keyof PendingRowRuleInstall = 'serialize'
+  const GATE: keyof PendingRowRuleInstall = 'gate'
   const APPLIED: keyof PendingRowRuleDepsInput = 'appliedPersona'
   const EPISODES: keyof PendingRowRuleDepsInput = 'episodes'
   const LOG: keyof PendingRowRuleDepsInput = 'log'
@@ -2671,10 +2783,12 @@ describe('main() builds the one pending-row rule through its factory over the se
     expect(indicesOf(new RegExp(`\\b${RESET}\\b`, 'g'), SERVER_CODE)).toEqual([])
   })
 
-  test('the install is exactly the rule, the pending-row module\'s factory called on the session manager\'s one dependency builder, and the persona lifecycle serializer\'s run, the turn the approver-stop run takes', () => {
+  test('the install is exactly the rule, the pending-row module\'s factory called on the session manager\'s one dependency builder, the persona lifecycle serializer\'s run, the turn the approver-stop run takes, and the retry run\'s gate, the very object the retry action spreads (b.jg5 SRJ-404, SRJ-305)', () => {
     const props = onlyCallProps(INSTALL)
-    expect([...props.keys()].sort()).toEqual([RULE, SERIALIZE].sort())
+    expect([...props.keys()].sort()).toEqual([RULE, SERIALIZE, GATE].sort())
     expect(props.get(SERIALIZE)).toBe(`${constOf('createPersonaSerializer')}.run`)
+    // The gate is bound by its bare name: the same object, never a copy.
+    expect(props.get(GATE)).toBe(retryRunGate().name)
     const rule = props.get(RULE)!
     expect(rule.startsWith(`${FACTORY}(`)).toBe(true)
     const ruleArgs = splitTopLevel(onlyCallArguments(rule, FACTORY))
@@ -3586,8 +3700,9 @@ describe('main() builds the one per-persona latch, in server memory only, before
 
     // Named only at its build, then once inside each of: the holds' binding
     // and the notice's binding (b.jg5 SRJ-502, SRJ-508), the session
-    // manager's install, the retry action's and the health check's latched
-    // queries, and the persona teardown's latch forget (b.jg5 SRJ-504; its
+    // manager's install, the retry run's gate's latched query (the retry
+    // action's and the approver-stop run's, b.jg5 SRJ-404), the health
+    // check's latched query, and the persona teardown's latch forget (b.jg5 SRJ-504; its
     // form is pinned in tests/reload-wiring.test.ts); twice inside the restart
     // module's call: its own latched query and the reconnect adapter's, asked
     // right before /mcp reconnect is typed (b.jg5 SRJ-502); and once as the
@@ -3606,7 +3721,8 @@ describe('main() builds the one per-persona latch, in server memory only, before
     const within = (call: string) => withinAt(onlyCallOf(call))
     expect(
       [BIND_LATCH_HOLDS, BIND, 'setConflictLatch', 'createFullModeRetryAction', 'initRestart', 'initHealthCheck', 'createPersonaLifecycle'].map(within),
-    ).toEqual([1, 1, 1, 1, 2, 1, 1])
+    ).toEqual([1, 1, 1, 0, 2, 1, 1])
+    expect(withinRetryRunGate(named)).toBe(1)
     // The restart module's second: the reconnect adapter's, built inside its call.
     const [restartOpen, restartClose] = balancedAfter(SERVER_CODE, onlyCallOf('initRestart'), '(', ')')
     const adapter = onlyReconnectAdapterBuild()
@@ -3773,10 +3889,13 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
     // parameter's type annotation (the reconnect adapter's latched gate), no
     // binding.
     const within = withinCall
+    // The retry action's member and query sit in the retry run's gate, which
+    // the action spreads (b.jg5 SRJ-404; see the gate's describe).
     const allMembers = indicesOf(new RegExp(`\\b${IS_LATCHED}\\s*:`, 'g'), SERVER_CODE)
     const members = allMembers.filter(insideMain)
     expect(members).toHaveLength(3)
-    expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck'].map((call) => within(members, onlyCallOf(call)))).toEqual([1, 1, 1])
+    expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck'].map((call) => within(members, onlyCallOf(call)))).toEqual([0, 1, 1])
+    expect(withinRetryRunGate(members)).toBe(1)
     const outside = allMembers.filter((offset) => !insideMain(offset))
     const check = retryCheckDeps()
     const inCheck = (offsets: number[]) => offsets.filter((offset) => offset > check.start && offset < check.end).length
@@ -3786,7 +3905,8 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
     expect(within(outside, SERVER_CODE.search(/\bfunction\s+reconnectLatchedAt\s*\(/))).toBe(1)
     const queries = indicesOf(new RegExp(`\\.\\s*${IS_LATCHED}\\s*\\(`, 'g'), SERVER_CODE)
     expect(queries).toHaveLength(7)
-    expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck', 'createPersonaRouting'].map((call) => within(queries, onlyCallOf(call)))).toEqual([1, 2, 1, 1])
+    expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck', 'createPersonaRouting'].map((call) => within(queries, onlyCallOf(call)))).toEqual([0, 2, 1, 1])
+    expect(withinRetryRunGate(queries)).toBe(1)
     expect(within(queries, onlyReconnectAdapterBuild())).toBe(1)
     expect(inCheck(queries)).toBe(1)
     const CHECK: keyof typeof ServerModule = 'armMissingTmuxUnavailableRetry'
@@ -4121,12 +4241,16 @@ describe('main() builds the one ErrInvalidFlags hold before the start pass, inst
     expect(onlyCallProps('initRestart').get(RESTART_HELD)).toMatch(query)
     expect(onlyCallProps('initHealthCheck').get(TICK_HELD)).toMatch(query)
 
+    // The retry action's member and query sit in the retry run's gate, which
+    // the action spreads (b.jg5 SRJ-404; see the gate's describe).
     const members = indicesOf(new RegExp(`\\b${IS_HELD}\\s*:`, 'g'), SERVER_CODE)
     expect(members).toHaveLength(3)
-    expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck'].map((call) => withinCall(members, onlyCallOf(call)))).toEqual([1, 1, 1])
+    expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck'].map((call) => withinCall(members, onlyCallOf(call)))).toEqual([0, 1, 1])
+    expect(withinRetryRunGate(members)).toBe(1)
     const queries = indicesOf(new RegExp(`\\.\\s*${IS_HELD}\\s*\\(`, 'g'), SERVER_CODE)
     expect(queries).toHaveLength(4)
-    expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck', 'createPersonaRouting'].map((call) => withinCall(queries, onlyCallOf(call)))).toEqual([1, 1, 1, 1])
+    expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck', 'createPersonaRouting'].map((call) => withinCall(queries, onlyCallOf(call)))).toEqual([0, 1, 1, 1])
+    expect(withinRetryRunGate(queries)).toBe(1)
     expect(indicesOf(new RegExp(`\\b${ROUTING_HELD}\\s*:`, 'g'), SERVER_CODE)).toHaveLength(1)
   })
 
@@ -4152,7 +4276,9 @@ describe('main() builds the one ErrInvalidFlags hold before the start pass, inst
       const [open, close] = balancedAfter(SERVER_CODE, onlyCallOf(call), '(', ')')
       return named.filter((offset) => offset >= open && offset < close).length
     }
-    expect([BIND_SET, INSTALL, VERSION_CHANGE, 'createFullModeRetryAction', 'initRestart', 'initHealthCheck', 'createPersonaLifecycle'].map(within)).toEqual([1, 1, 1, 1, 1, 1, 1])
+    expect([BIND_SET, INSTALL, VERSION_CHANGE, 'createFullModeRetryAction', 'initRestart', 'initHealthCheck', 'createPersonaLifecycle'].map(within)).toEqual([1, 1, 1, 0, 1, 1, 1])
+    // The retry action's held query sits in the retry run's gate, which it spreads.
+    expect(withinRetryRunGate(named)).toBe(1)
     expect(onlyCallProps('createPersonaLifecycle').get('forgetInvalidFlagsHold')).toContain(`${hold}.`)
     // The ninth: the routing holder's one assignment, the bare hold.
     const assigned = assignmentsTo(holderName())

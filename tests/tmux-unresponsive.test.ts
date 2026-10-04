@@ -2497,14 +2497,15 @@ describe('tmux-unresponsive: SRJ-310’s third end rule after a launch timeout (
     const window = launch.window()!
     expect(window.endMs! - window.startMs).toBe(LAUNCH_TAKES_MS)
     expectHolds(h, p, 'spawn', window.endMs!)
-    expect(thisLaunchRowOf(p)).toEqual({ launchStartMs: Date.parse(launch.launchStartedAt()!), window: launchCallWindowOf(p)! })
+    const record = thisLaunchRowOf(p)
+    expect(record).toEqual({ launchStartMs: Date.parse(launch.launchStartedAt()!), window: launchCallWindowOf(p)! })
     // The approver started on the covered row reads it pending at its lap, and stops at its cap.
     expect(await h.runApproverToStop(p)).toMatchObject({ reason: APPROVER_STOP_CAP })
     await tickRead(h, p)
     expect(h.stub.calls.statusCalls.length).toBeGreaterThanOrEqual(2)
 
     expectHolds(h, p, 'spawn', window.endMs!)
-    expect(thisLaunchRowOf(p)).toBeDefined()
+    expect(thisLaunchRowOf(p)).toEqual(record)
     expect(h.conditionEnds).toEqual([])
     expect(launchRowLiveLines(h, p, LIVE_STATE)).toEqual([])
     expectNeverStarted(h, b)
@@ -2555,13 +2556,15 @@ describe('tmux-unresponsive: SRJ-310’s third end rule after a launch timeout (
 
   test('an approver lap whose read-pane succeeds ends the condition first, by the first rule (a tmux-touching success), with this launch’s row still pending; the row read live afterwards ends nothing more', async () => {
     const { h, p } = build({ harnessNow: true })
-    const { reads } = await spawnTimingOut(h, p, LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE, {}, true)
+    const { launch, reads } = await spawnTimingOut(h, p, LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE, {}, true)
+    const record = thisLaunchRowOf(p)
+    expect(record).toEqual({ launchStartMs: Date.parse(launch.launchStartedAt()!), window: launchCallWindowOf(p)! })
     await h.settle()
 
     expect(h.stub.calls.readPaneCalls).toHaveLength(1)
     expect(h.tmuxUnresponsive.holds(p)).toBe(false)
     expect(conditionEndedLines(h, p)).toEqual([conditionEndedLine(p, TMUX_UNRESPONSIVE_END_TMUX_VERB)])
-    expect(thisLaunchRowOf(p)).toBeDefined()
+    expect(thisLaunchRowOf(p)).toEqual(record)
     expect(await h.runApproverToStop(p)).toMatchObject({ reason: APPROVER_STOP_CAP })
     reads(LIVE_STATE)
 

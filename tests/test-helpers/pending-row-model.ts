@@ -93,7 +93,7 @@ import type {
 } from 'agent-director'
 
 import type { Phase1GetResult, Phase1KillResult, Phase1ResumeResult, Phase1SpawnParams, Phase1SpawnResult, Phase1StatusResult } from '../../src/ad-phase1-types.ts'
-import { adGraceMsInEffect, adLaunchBoundMsInEffect } from '../../src/ad-settings.ts'
+import { adGraceMsInEffect } from '../../src/ad-settings.ts'
 import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_PENDING_STATE, LIVENESS_DEAD_ROW_ENDED, LIVENESS_DEAD_ROW_MISSING } from '../../src/liveness-reading.ts'
 import { parseLaunchStart } from '../../src/pending-row.ts'
 import { personaInstanceId } from '../../src/persona-identity.ts'
@@ -235,16 +235,6 @@ export function judgeMissingFromG(): PendingRowJudgment {
   return judgeMissingFrom(({ launchStartMs }) => (launchStartMs === undefined ? undefined : launchStartMs + adGraceMsInEffect()))
 }
 
-/** As `judgeMissingFromG`, from B (`adLaunchBoundMsInEffect`) past the launch start. */
-export function judgeMissingFromB(): PendingRowJudgment {
-  return judgeMissingFrom(({ launchStartMs }) => (launchStartMs === undefined ? undefined : launchStartMs + adLaunchBoundMsInEffect()))
-}
-
-/** Every run fails with `make()` (e.g. an UNAVAILABLE, `FIND_MISSING_REFUSED`'s cause, or a latching CONFLICT). */
-export function judgeFailing(make: () => Error): PendingRowJudgment {
-  return () => make()
-}
-
 // ---------------------------------------------------------------------------
 // The model
 // ---------------------------------------------------------------------------
@@ -302,9 +292,8 @@ export interface PendingRowModel {
   launchStartedAt(): string | null | undefined
   /** The row's launch start now, parsed (`parseLaunchStart`); undefined when it has none. */
   launchStartMs(): number | undefined
-  /** What the pane shows now, and its text. */
+  /** What the pane shows now. */
   dialog(): PendingRowDialog
-  pane(): string
   /** The row as `status` and `get` answer it now; each throws when there is no row. */
   statusRow(): Phase1StatusResult
   getRow(): CannedGetResult
@@ -313,8 +302,7 @@ export interface PendingRowModel {
   setLaunchStartedAt(raw: string | null | undefined): void
   setDialog(dialog: PendingRowDialog): void
   setJudgment(judgment: PendingRowJudgment): void
-  /** Queue more answers after those still queued (see the options of the same names). */
-  scriptReadPane(...answers: Array<Error | undefined>): void
+  /** Queue more answers after those still queued (see the options `sendKeys`, `kill` and `launches`). */
   scriptSendKeys(...answers: Array<Error | undefined>): void
   scriptKill(...answers: Array<Phase1KillResult | Error>): void
   scriptLaunches(...answers: Array<Error | undefined>): void
@@ -472,7 +460,6 @@ export function makePendingRowModel(host: PendingRowModelHost, key: string, opti
     launchStartedAt: () => launchStartedAt,
     launchStartMs,
     dialog: () => dialog,
-    pane: () => pendingRowDialogPane(dialog),
     statusRow,
     getRow,
     setState(next) {
@@ -486,9 +473,6 @@ export function makePendingRowModel(host: PendingRowModelHost, key: string, opti
     },
     setJudgment(next) {
       judgment = next
-    },
-    scriptReadPane: (...answers) => {
-      readPaneAnswers.push(...answers)
     },
     scriptSendKeys: (...answers) => {
       sendKeysAnswers.push(...answers)

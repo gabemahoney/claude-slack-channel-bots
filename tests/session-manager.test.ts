@@ -1344,6 +1344,7 @@ import {
   oldLifeWaitNotStartedLine,
   oldLifeWaitRefusalLine,
   personaRetryBlockCause,
+  buildPendingRowRuleDeps,
 } from '../src/session-manager.ts'
 import { LIVE_ROW_START_ALREADY_RUNNING, LIVE_ROW_START_CLOSED } from '../src/live-row-sequence.ts'
 import {
@@ -1406,6 +1407,7 @@ import {
   launchUnavailableSequenceOutcome,
   thisLaunchRowOf,
   type LaunchCallWindowRecord,
+  type OwnLaunchRecord,
   type ThisLaunchRowRecord,
 } from '../src/session-manager.ts'
 import { LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT, LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE, type LaunchTimeoutForm } from '../src/ad-error-class.ts'
@@ -12664,10 +12666,28 @@ describe('b.jg5 SRJ-409, SRJ-404: the row an approver leaves pending when it sto
 
   // The closed set of stop reasons: exactly SRJ-404's pending-row stops (and a loop that threw) arm.
   test('approverStopArmsPendingRow answers for every stop reason', () => {
-    const arming: ApproverStopReason[] = [APPROVER_STOP_BOUND, APPROVER_STOP_CAP, APPROVER_STOP_GONE, APPROVER_STOP_NOT_INTERACTIVE, APPROVER_STOP_TMUX_UNAVAILABLE, APPROVER_STOP_SUPERSEDED, APPROVER_STOP_FAILED]
-    const others: ApproverStopReason[] = [APPROVER_STOP_LIVE, APPROVER_STOP_FINISHED, APPROVER_STOP_ABSENT, APPROVER_STOP_NO_LAUNCH_START, APPROVER_STOP_SHUTDOWN, APPROVER_STOP_LATCHED, APPROVER_STOP_TEARDOWN, APPROVER_STOP_RETIRED_KEY]
-    expect(arming.map((reason) => approverStopArmsPendingRow(reason))).toEqual(arming.map(() => true))
-    expect(others.map((reason) => approverStopArmsPendingRow(reason))).toEqual(others.map(() => false))
+    // Keyed by every reason: a reason added to ApproverStopReason fails the typecheck here until it has a row.
+    const ARMS: Record<ApproverStopReason, boolean> = {
+      [APPROVER_STOP_BOUND]: true,
+      [APPROVER_STOP_CAP]: true,
+      [APPROVER_STOP_GONE]: true,
+      [APPROVER_STOP_NOT_INTERACTIVE]: true,
+      [APPROVER_STOP_TMUX_UNAVAILABLE]: true,
+      [APPROVER_STOP_SUPERSEDED]: true,
+      [APPROVER_STOP_FAILED]: true,
+      [APPROVER_STOP_LIVE]: false,
+      [APPROVER_STOP_FINISHED]: false,
+      [APPROVER_STOP_ABSENT]: false,
+      [APPROVER_STOP_NO_LAUNCH_START]: false,
+      [APPROVER_STOP_SHUTDOWN]: false,
+      [APPROVER_STOP_LATCHED]: false,
+      [APPROVER_STOP_TEARDOWN]: false,
+      [APPROVER_STOP_RETIRED_KEY]: false,
+      // b.jg5 SRJ-412: the abort of CSCB's own stuck launch kills the row; nothing is left to arm for.
+      [APPROVER_STOP_STUCK_LAUNCH_ABORT]: false,
+    }
+    const reasons = Object.keys(ARMS) as ApproverStopReason[]
+    expect(reasons.map((reason) => [reason, approverStopArmsPendingRow(reason)])).toEqual(reasons.map((reason) => [reason, ARMS[reason]]))
   })
 })
 
@@ -17786,13 +17806,14 @@ describe('b.jg5 SRJ-118, SRJ-412, SRJ-1017: the record of a launch whose send-ke
   const FRACTIONAL_MS = parseLaunchStart(SAMPLE_LAUNCH_START_FRACTIONAL)!
   /**
    * Every form of the whole-second instant: agent-director's raw form (no
-   * fraction), the same instant with its zero fraction shown, and the parsed
-   * number.
+   * fraction), the same instant with its zero fraction shown, the parsed
+   * number, and a numeric offset naming it.
    */
   const WHOLE_FORMS: ReadonlyArray<readonly [string, unknown]> = [
     ['the raw form with no fraction', SAMPLE_LAUNCH_START_WHOLE],
     ['the raw form with its zero fraction shown', new Date(WHOLE_MS).toISOString()],
     ['the parsed number', WHOLE_MS],
+    ['a +02:00 offset naming it', new Date(WHOLE_MS + 2 * 3_600_000).toISOString().replace(/Z$/, '+02:00')],
   ]
   /** Launch starts that name no instant. */
   const NO_INSTANT: ReadonlyArray<readonly [string, unknown]> = [
@@ -17801,12 +17822,6 @@ describe('b.jg5 SRJ-118, SRJ-412, SRJ-1017: the record of a launch whose send-ke
     ['an unparseable string', 'not a time'],
     ['NaN', Number.NaN],
   ]
-
-  test('the raw forms name one instant, and the fractional sample another', () => {
-    expect(parseLaunchStart(new Date(WHOLE_MS).toISOString())).toBe(WHOLE_MS)
-    expect(new Date(WHOLE_MS).toISOString()).not.toBe(SAMPLE_LAUNCH_START_WHOLE)
-    expect(FRACTIONAL_MS).not.toBe(WHOLE_MS)
-  })
 
   test('with no record kept the query answers false for every form', () => {
     expect(WHOLE_FORMS.map(([, form]) => launchMetSendKeysNotInteractive(P, form))).toEqual(WHOLE_FORMS.map(() => false))
@@ -28812,6 +28827,16 @@ describe('b.jg5 SRJ-303, SRJ-811, SRJ-1011 (E27 T2): what blocks P\'s retry, and
 
   type Answers = [cause: RetryBlockCause | undefined, waitRunsForP: boolean, sequenceOrWait: boolean]
 
+  /**
+   * The pending-row rule's work-in-flight cause for `key` (`retryBlockedBy`,
+   * b.jg5 SRJ-303, SRJ-410), as `buildPendingRowRuleDeps` binds it: outside
+   * and inside the launch it belongs to. One list with personaRetryBlockCause.
+   */
+  const ruleCauses = (key: string): [outside: string | undefined, withinOwnLaunch: string | undefined] => {
+    const deps = buildPendingRowRuleDeps({ appliedPersona: () => undefined })
+    return [deps.retryBlockedBy(key, false), deps.retryBlockedBy(key, true)]
+  }
+
   test.each<[string, (h: RecoveryHarness, p: string, b: string, hold: ReturnType<typeof holdFindMissing>) => Promise<{ readonly outcome?: Promise<unknown> }>, Answers]>([
     ['nothing runs', async () => ({}), [undefined, false, false]],
     ['P\'s live-row sequence runs (its first run held)', async (h, p, _b, hold) => {
@@ -28835,13 +28860,14 @@ describe('b.jg5 SRJ-303, SRJ-811, SRJ-1011 (E27 T2): what blocks P\'s retry, and
       h.remove(p)
       return started
     }, [undefined, false, false]],
-  ])('%s: P\'s answers; B, which waits on nothing, answers none', async (_label, arrange, [cause, waitRuns, either]) => {
+  ])('%s: P\'s answers, the pending-row rule\'s cause the same in and outside its own launch; B, which waits on nothing, answers none', async (_label, arrange, [cause, waitRuns, either]) => {
     const { h, p, b } = srj105Build()
     const hold = holdFindMissing(h.stub.client)
     const { outcome } = await arrange(h, p, b, hold)
 
     expect([personaRetryBlockCause(p), isOldLifeWaitRunningFor(p), isSequenceOrOldLifeWaitRunning(p)]).toEqual([cause, waitRuns, either])
     expect([personaRetryBlockCause(b), isOldLifeWaitRunningFor(b), isSequenceOrOldLifeWaitRunning(b)]).toEqual([undefined, false, false])
+    expect([ruleCauses(p), ruleCauses(b)]).toEqual([[cause, cause], [undefined, undefined]])
 
     if (outcome !== undefined) {
       hold.release(cannedFindMissing({ rows: { [PRE_PERSONA_ID]: 'ids', [personaInstanceId(p)]: 'ids' } }))
@@ -28851,13 +28877,14 @@ describe('b.jg5 SRJ-303, SRJ-811, SRJ-1011 (E27 T2): what blocks P\'s retry, and
     }
   })
 
-  test('a launch call of P in flight (its spawn held): the cause is a launch, and no wait step runs for P', async () => {
+  test('a launch call of P in flight (its spawn held): the cause is a launch, which the pending-row rule leaves out only within that launch, and no wait step runs for P', async () => {
     const { h, p } = srj105Build()
     const spawns = holdSpawns(h.stub.client, (id) => id === personaInstanceId(p))
     const launch = h.launch(p)
     await spawns.entered(personaInstanceId(p))
 
     expect([personaRetryBlockCause(p), isOldLifeWaitRunningFor(p), isSequenceOrOldLifeWaitRunning(p)]).toEqual([RETRY_BLOCK_LAUNCH, false, false])
+    expect(ruleCauses(p)).toEqual([RETRY_BLOCK_LAUNCH, undefined])
 
     spawns.release(personaInstanceId(p))
     await launch
@@ -30798,6 +30825,73 @@ describe('b.jg5 SRJ-412, SRJ-407: the record of CSCB\'s own launch, its set and 
     expect([launchCallWindowOf(p)?.verb, launchCallWindowOf(p)?.end]).toEqual(['resume', succeeds ? LAUNCH_CALL_END_RETURNED : undefined])
     expect(ownLaunchRecordOf(p)).toEqual(second === undefined ? undefined : { launchStartMs: Date.parse(second.launchStartedAt()!), window: launchCallWindowOf(p)! })
     expect(isCscbOwnLaunch(p, first.launchStartedAt())).toBe(false)
+  })
+
+  /**
+   * P's launch L1 ending in a launch timeout whose one get read its own
+   * `pending` row inside the window: both records set, to the same value
+   * (see the launch-timeout cases above); its approver stopped. Resolves with
+   * the timed launch and that record.
+   */
+  async function bothRecordsKept(h: RecoveryHarness, p: string): Promise<{ t: TimedLaunch; record: OwnLaunchRecord }> {
+    const t = scriptTimedLaunch(h, p, { verb: 'spawn', reuse: false, takesMs: TIMED_CALL_MS, end: LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT })
+    statusOnTimedRow(h, t)
+    await h.launch(p)
+    const record = ownLaunchRecordOf(p)!
+    expect(record).toBeDefined()
+    expect(thisLaunchRowOf(p)).toEqual(record)
+    await stopDialogApprover(p, APPROVER_STOP_TEARDOWN)
+    return { t, record }
+  }
+
+  /** P's two records, "this launch's row" first, each time a `resume` call starts; `during` runs inside the call before it answers. */
+  function recordsAtResume(h: RecoveryHarness, p: string, during: () => void = () => {}): unknown[] {
+    const atCall: unknown[] = []
+    const resume = h.stub.client.resume.bind(h.stub.client)
+    h.stub.client.resume = async (params) => {
+      atCall.push([thisLaunchRowOf(p), ownLaunchRecordOf(p)])
+      during()
+      return resume(params)
+    }
+    return atCall
+  }
+
+  // b.jg5 SRJ-412, SRJ-407, SRJ-713: a launch call that answers
+  // ErrInstanceIdCollision created no row and started no launch, so the
+  // records it set aside as it began are put back. A CONFLICT refusal, even
+  // the pre-spawn scan's that writes no row, cannot be told from one after
+  // "duplicate session" (which may leave this call's row pending), so the
+  // records stay forgotten.
+  test.each([
+    ['answers ErrInstanceIdCollision: both records are put back as they were, and L1 is still CSCB\'s own', () => errInstanceIdCollision(), true],
+    ['answers a CONFLICT refusal (the pre-spawn scan\'s, no row written): both stay forgotten', () => errTmuxSessionConflict('resume', 'conflicting-labels', undefined, { scan: true }), false],
+  ] as const)('a later launch call of P (the live-row sequence\'s resume) that %s; during the call both are absent, and its window stays the latest', async (_label, error, restored) => {
+    const { h, p } = await timedLaunchBuild()
+    const { t, record } = await bothRecordsKept(h, p)
+    h.script({ resumeError: error() })
+    const atCall = recordsAtResume(h, p)
+
+    await launchForLiveRowSequence(harnessPersona(h, p), h.config, { kind: LIVE_ROW_LAUNCH_RESUME, lastRead: ENDED_READ })
+    await h.settle()
+
+    expect(atCall).toEqual([[undefined, undefined]])
+    expect([launchCallWindowOf(p)?.verb, launchCallWindowOf(p)?.end]).toEqual(['resume', undefined])
+    expect([thisLaunchRowOf(p), ownLaunchRecordOf(p)]).toEqual(restored ? [record, record] : [undefined, undefined])
+    expect(isCscbOwnLaunch(p, t.launchStartedAt())).toBe(restored)
+  })
+
+  test('a collided launch call during which the teardown\'s forget (forgetLaunchCalls) came puts nothing back: its window is no longer P\'s latest', async () => {
+    const { h, p } = await timedLaunchBuild()
+    const { t } = await bothRecordsKept(h, p)
+    h.script({ resumeError: errInstanceIdCollision() })
+    const atCall = recordsAtResume(h, p, () => forgetLaunchCalls(p))
+
+    await launchForLiveRowSequence(harnessPersona(h, p), h.config, { kind: LIVE_ROW_LAUNCH_RESUME, lastRead: ENDED_READ })
+    await h.settle()
+
+    expect(atCall).toEqual([[undefined, undefined]])
+    expect([launchCallWindowOf(p), thisLaunchRowOf(p), ownLaunchRecordOf(p)]).toEqual([undefined, undefined, undefined])
+    expect(isCscbOwnLaunch(p, t.launchStartedAt())).toBe(false)
   })
 
   test('the teardown\'s kill forgets the torn-down persona\'s record before its first try, and only that one; the reset forgets every record', async () => {

@@ -322,7 +322,10 @@
  *   text, lands in `episodeNotices`) and `console.error` as its log (its
  *   `[slack] pending-row:` lines go to `errors`), with the harness's
  *   serializer (`serializer.run`, as `main()`'s `personaLifecycle.run`) as
- *   the turn its one run at a dialog approver's stop takes. So the
+ *   the turn its one run at a dialog approver's stop takes, and the retry
+ *   action's gate (`retryRunGate`: applied, latched, held on
+ *   `ErrInvalidFlags`, up, the cap, shutdown) as the gate that run is
+ *   dropped by when it starts (`PendingRowRuleInstall.gate`). So the
  *   production rule runs at each retry of a persona's timer that reaches a
  *   covered `pending` row (a pending-only retry's step, a full-mode retry's
  *   `pending` deferral, the collision ladder's `pending` step) and once at
@@ -921,7 +924,11 @@
  * alone: no trigger, timer, notice, outage flag or call),
  * `expectPendingOnlyWatch` (a persona's retry timer armed and waiting in
  * pending-only mode with the pending-row cause, and its pending-row trigger
- * recorded), `dispatcherBugWordingIn` (every captured line, `console.error`
+ * recorded), the retry timer's lines (`src/unavailable-retry.ts` exports no
+ * builder for them): `retryLinesOf` (a persona's among `lines`),
+ * `reArmedLine` (a retry answered `again`, its next wait from `retryWaitMs`),
+ * `stoppedLine` and `pendingOnlyStoppedLine` (a stopped timer),
+ * `dispatcherBugWordingIn` (every captured line, `console.error`
  * line, notice and startup-errors entry carrying `DISPATCHER_BUG_WORDING`,
  * which no post or line may give a collision, b.jg5 SRJ-713),
  * `expectLostMessageReports` (lose one message through the driver
@@ -1051,7 +1058,7 @@ import {
   type AdSettingsInEffect,
   type NeverEarlyWaitClock,
 } from '../../src/ad-settings.ts'
-import { _resetBackoffState, isAtCap } from '../../src/backoff.ts'
+import { _resetBackoffState, doublingBackoffDelay, isAtCap } from '../../src/backoff.ts'
 import { replySettingsOf, type Persona, type PersonaConfig } from '../../src/config.ts'
 import {
   bindConflictLatchHolds,
@@ -1258,8 +1265,10 @@ import {
   createUnavailableRetryController,
   runDetachedRecoveryAttempt,
   runOutsideAttempts,
+  UNAVAILABLE_RETRY_BASE_S,
   UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
   UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD,
+  UNAVAILABLE_RETRY_CEILING_S,
   UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE,
@@ -1272,6 +1281,7 @@ import {
   UNAVAILABLE_RETRY_STOP_LATCHED,
   UNAVAILABLE_RETRY_STOP_SHUTDOWN,
   UNAVAILABLE_RETRY_STOP_TORN_DOWN,
+  type RetryRunGateDeps,
   type UnavailableRetryAction,
   type UnavailableRetryConditionEndResult,
   type UnavailableRetryTriggerSink,
@@ -2046,9 +2056,11 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
   const queued = new Map<string, UnavailableRetryOutcome[]>()
   const scripted: UnavailableRetryAction = (key) => queued.get(key)?.shift() ?? SCRIPTED_REFUSAL
-  const fullMode = createFullModeRetryAction({
-    readRow: readPersonaRowState,
-    retry: runRestartRetry,
+  // As main()'s `retryRunGate` (b.jg5 SRJ-303, SRJ-305, SRJ-404): the retry
+  // action's gate before any call, one object for the retry action and the
+  // pending-row rule's run at a dialog approver's stop (`setPendingRowRule`
+  // below), so that run is gated as a retry's is.
+  const retryRunGate: RetryRunGateDeps = {
     appliedPersona,
     canRelaunch,
     isAtCap: (key) => isAtCap(key, RESTART_FAILURE_CAP),
@@ -2059,6 +2071,11 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     // As main() binds it (b.jg5 SRJ-207, SRJ-303, SRJ-305): so does a retry
     // of a persona held on ErrInvalidFlags.
     isHeld: (key) => invalidFlagsHold.isHeld(key),
+  }
+  const fullMode = createFullModeRetryAction({
+    readRow: readPersonaRowState,
+    retry: runRestartRetry,
+    ...retryRunGate,
     // As main() binds it (b.jg5 SRJ-303): only work that blocks a retry
     // skips it; a running dialog approver alone never does (SRJ-401). The
     // skip's again-reason and the restart retry's skip line name the cause.
@@ -2471,6 +2488,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     setPendingRowRule({
       rule: createPendingRowRule(harnessNow ? ruleDeps : { ...ruleDeps, now: () => clock.now() }),
       serialize: serializeRuleRun,
+      gate: retryRunGate,
     })
   }
   // As main() installs it, beside the latch (b.jg5 SRJ-114): a key counts as
@@ -3603,6 +3621,42 @@ export function expectPendingOnlyWatch(h: RecoveryHarness, key: string): void {
   expect(view).toMatchObject({ phase: 'waiting', mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY })
   expect(view?.causes).toContain(UNAVAILABLE_RETRY_CAUSE_PENDING_ROW)
   expect(h.triggers).toContainEqual({ key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW })
+}
+
+/** The retry timer's wait after `refusals` refused retries, in ms, from the exported base and ceiling (`src/unavailable-retry.ts`). */
+export function retryWaitMs(refusals: number): number {
+  return doublingBackoffDelay(UNAVAILABLE_RETRY_BASE_S, refusals, UNAVAILABLE_RETRY_CEILING_S) * 1000
+}
+
+/** How a re-armed line names the modes: the retry ran pending-only, and the mode the retry switched the timer to. */
+export interface ReArmedModes {
+  readonly ranPendingOnly?: boolean
+  readonly switchedTo?: UnavailableRetryMode
+}
+
+/** The retry timer's line for a retry answered `again`: its reason and the next wait, after `refusals` refusals. */
+export function reArmedLine(key: string, retry: number, reason: string, refusals: number, modes: ReArmedModes = {}): string {
+  const ran = modes.ranPendingOnly === true ? ` (${UNAVAILABLE_RETRY_MODE_PENDING_ONLY})` : ''
+  const switched = modes.switchedTo !== undefined ? ` in ${modes.switchedTo} mode` : ''
+  return `[slack] unavailable-retry: persona=${key} retry ${retry}${ran}: ${reason} — re-armed${switched}, next retry in ${retryWaitMs(refusals) / 1000} s`
+}
+
+/** The retry timer's line for a stopped timer; `tags` are the parenthesised mode and row, when the stop names them. */
+export function stoppedLine(key: string, reason: string, ...tags: string[]): string {
+  const tagged = tags.length > 0 ? ` (${tags.join(', ')})` : ''
+  return `[slack] unavailable-retry: persona=${key} stopped${tagged} — ${reason}`
+}
+
+/** The stopped line of a pending-only timer, naming the row its retry read when given. */
+export function pendingOnlyStoppedLine(key: string, reason: string, row?: string): string {
+  return row === undefined
+    ? stoppedLine(key, reason, UNAVAILABLE_RETRY_MODE_PENDING_ONLY)
+    : stoppedLine(key, reason, UNAVAILABLE_RETRY_MODE_PENDING_ONLY, `row ${row}`)
+}
+
+/** The retry timer's lines for persona `key` in `h.lines`, in order. */
+export function retryLinesOf(h: RecoveryHarness, key: string): string[] {
+  return h.lines.filter((line) => line.startsWith(`[slack] unavailable-retry: persona=${key} `))
 }
 
 /**
