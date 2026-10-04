@@ -101,7 +101,9 @@
  * imported from `src/` or the stub builders, and every expected alert text
  * is built with `src/kill-failure-alert.ts`'s builders (through the
  * harness's helpers). `afterEach` checks that no call was a `delete` or set
- * `include_finished`, runs `assertNoLeak` over the harness's `captured()`
+ * `include_finished` and that nothing captured says "dispatcher bug"
+ * (b.jg5 SRJ-713, `dispatcherBugWordingIn`), runs `assertNoLeak` over the
+ * harness's `captured()`
  * and cleans it up, which fails while any timer is still pending.
  *
  * SPDX-License-Identifier: MIT
@@ -362,6 +364,7 @@ import {
   unclassifiedStartedLines,
   expectUntouched,
   expectPendingOnlyWatch,
+  dispatcherBugWordingIn,
   type RecoveryHarness,
   type RecoveryHarnessOptions,
   type RecoverySequenceRequest,
@@ -386,6 +389,8 @@ afterEach(() => {
       expect(h.stub.calls.deleteCalls).toEqual([])
       const everyCall = Object.values(h.stub.calls).flat() as unknown[]
       expect(everyCall.filter((params) => typeof params === 'object' && params !== null && 'include_finished' in params)).toEqual([])
+      // b.jg5 SRJ-713: no post or line, a collision's included, calls anything a "dispatcher bug".
+      expect(dispatcherBugWordingIn(h)).toEqual([])
       assertNoLeak(h.captured())
     } finally {
       h.cleanup()

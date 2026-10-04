@@ -858,9 +858,10 @@ export function reportUnclassifiedAtSite(
  * reportReuseCollisionAtSite — a reuse spawn's second collision
  * (`ErrInstanceIdCollision`, b.jg5 SRJ-112, SRJ-301) at a launch site that
  * ends its attempt on it (a collision ladder reuse site, in the one re-run
- * of get-then-act the first collision gave), or a plain spawn's collision in
+ * of get-then-act the first collision gave), a plain spawn's collision in
  * the one re-run of get-then-act a plain spawn's collision gave (SRJ-111,
- * SRJ-114): inside a launch or recovery attempt
+ * SRJ-114), or a `resume` that answered a collision (SRJ-713, which keeps it
+ * from the spawn-failure notice): inside a launch or recovery attempt
  * for `key` it arms the persona's retry timer with the reuse-collision cause
  * (`UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION`) through the installed trigger
  * sink, and the attempt records it as its last error, so a launch it ends is

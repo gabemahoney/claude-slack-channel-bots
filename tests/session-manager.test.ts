@@ -241,7 +241,10 @@
  *     reuse flag and no spawn-failure notice, its scan CONFLICT latching
  *     "plain spawn" with the state last read; `ErrSpawnNotResumable` SRJ-710's
  *     re-read; UNUSABLE NAME, CONFIG and UNCLASSIFIED SRJ-105's;
- *     `ErrInvalidFlags` one re-check, then UNCLASSIFIED, never the hold. The
+ *     `ErrInvalidFlags` one re-check, then UNCLASSIFIED, never the hold; a
+ *     collision (by name, an answer agent-director's `resume` never gives)
+ *     SRJ-713's guard: the collision cause armed, `retrying`, its one line
+ *     (`resumeCollisionLine`), never counted or the spawn-failure notice. The
  *     CONFLICT rows (HO rev 15's "another agent-director store" and rev 20's
  *     "conflicting labels" after "duplicate session" included) latch "resume"
  *     with the state last read and kill nothing. HO rev 28's four restore
@@ -779,11 +782,15 @@ import {
   notResumableSequenceOutcome,
   replaceRereadLine,
   resumeNotFoundSpawnLine,
+  resumeCollisionLine,
   plainSpawnCollisionLine,
   spawnNotResumableLine,
   type PersonaRowReread,
   PENDING_ROW_STEP_LOG_PREFIX,
   undecidedPendingRowLine,
+  SPAWN_CAP_REACHED_REMEDIATION,
+  SPAWN_FAILURE_DEFAULT_REMEDIATION,
+  SPAWN_NOT_FOUND_REMEDIATION,
 } from '../src/session-manager.ts'
 import {
   LIVE_ROW_ARM_ENDED,
@@ -822,7 +829,7 @@ import {
 } from '../src/live-row-sequence.ts'
 import type { TranscriptReading, TranscriptSnapshot } from '../src/session-transcript.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
-import { stripComments } from './test-helpers/source-audit.ts'
+import { balancedAfter, srcModules, stripComments } from './test-helpers/source-audit.ts'
 import {
   _resetLaunchedWithDirs,
   getLaunchedWithDir,
@@ -1033,6 +1040,7 @@ import {
   ErrCwdNotFound,
   ErrJsonlMissing,
   ErrSpawnNotFound,
+  ERR_INSTANCE_ID_COLLISION_NAME,
   ERR_JSONL_MISSING_NAME,
   ERR_JSONL_NEVER_WRITTEN_NAME,
   ERR_NO_SESSION_ID_NAME,
@@ -1112,6 +1120,8 @@ import {
   conditionStartedLines,
   expectLostMessageReports,
   expectPendingOnlyWatch,
+  DISPATCHER_BUG_WORDING,
+  dispatcherBugWordingIn,
   killFailureEndedLine,
   killFailureLines,
   killFailureNotRaisedLine,
@@ -2482,7 +2492,7 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
     const text = expectOneNoticeToDestination(h)
     expect(text).toContain('Spawn failure:\n')
     expect(text).toContain(`Error: \`${launchFailure.errName}\``)
-    expect(text).toContain('Remediation: Check server.log for details.')
+    expect(text).toContain(`Remediation: ${SPAWN_FAILURE_DEFAULT_REMEDIATION}`)
     // startup-error side effect is part of the tested contract
     expect(readLog()).toContain('[spawn-failed]')
   })
@@ -14803,7 +14813,33 @@ describe('persona notices (b.av2 SR-7.2)', () => {
     expect(text).toContain('Spawn failure:\n')
     expect(text).toContain('Error: `SpawnCapReached`')
     expect(text).toContain(`${RESTART_FAILURE_CAP} consecutive session-launch failures`)
-    expect(text).toContain('automatic restarts are suspended for this persona')
+    expect(text).toContain(`Remediation: ${SPAWN_CAP_REACHED_REMEDIATION}`)
+  })
+
+  // The spawn-failure remediation texts, pinned: the one literal copy of them in tests/.
+  test('the spawn-failure remediation texts are unchanged', () => {
+    expect([SPAWN_NOT_FOUND_REMEDIATION, SPAWN_CAP_REACHED_REMEDIATION, SPAWN_FAILURE_DEFAULT_REMEDIATION]).toEqual([
+      'transient — restarting the server should resolve',
+      'restart the server to retry — automatic restarts are suspended for this persona',
+      'Check server.log for details.',
+    ])
+  })
+
+  // b.jg5 SRJ-713, SRJ-101: the remediation line is decided by the error's name; a collision has no line of its own.
+  test.each<[string, () => AgentDirectorError, string]>([
+    ['ErrSpawnNotFound (the client\'s class)', () => errSpawnNotFound(), SPAWN_NOT_FOUND_REMEDIATION],
+    ['ErrSpawnNotFound by name only', () => errGeneric('resume', errSpawnNotFound().errName), SPAWN_NOT_FOUND_REMEDIATION],
+    ['a collision handed to it directly (ErrInstanceIdCollision), which no launch site does', () => errInstanceIdCollision(), SPAWN_FAILURE_DEFAULT_REMEDIATION],
+    ['any other error', () => errGeneric('spawn', 'ErrSpawnBroken'), SPAWN_FAILURE_DEFAULT_REMEDIATION],
+  ])('notifySpawnFailure with %s: one notice whose remediation line is the error\'s own, calling nothing a "dispatcher bug"', async (_label, make, remediation) => {
+    const h = installNoticeNotifier(makeNoticeConfig())
+
+    notifySpawnFailure(NOTICE_KEY, make(), false)
+    await settleNotices()
+
+    const text = expectOneNoticeToDestination(h)
+    expect(text.split('\n').map((line) => line.trim()).filter((line) => line.startsWith('Remediation:'))).toEqual([`Remediation: ${remediation}`])
+    expect(text).not.toMatch(DISPATCHER_BUG_WORDING)
   })
 
   // --- spawn-failure-post (b.av2 SR-11, startup-errors.log classes) --------
@@ -15127,6 +15163,42 @@ describe('persona notices (b.av2 SR-7.2)', () => {
     expect(notices[0].text.startsWith('Spawn failure:\n')).toBe(true)
     expect(notices[0].text).not.toContain(NOTICE_NAME)
     expect(typeof notices[0].options?.onPostFailure).toBe('function')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-713, SRJ-101: the spawn-failure notice's remediation hint
+// (`remediationHint`, the body only, comments stripped) has no collision
+// branch and decides by name, never by `instanceof`; no file in `src/`, its
+// comments included, calls anything a "dispatcher bug". That no collision
+// reaches the notice at a launch site is the SRJ-111, SRJ-112 and SRJ-113
+// describes' (and `srj105AfterEach` checks every harness case's posts and
+// lines for the wording).
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-713: remediationHint has no collision branch and decides by name; no src/ file says "dispatcher bug"', () => {
+  /** The code of `remediationHint`'s body in `src/session-manager.ts`, comments stripped, so its doc block is no part of it. */
+  function remediationHintBody(): string {
+    const code = srcModules().get('session-manager.ts')!
+    const at = code.indexOf('function remediationHint(')
+    expect(at).toBeGreaterThanOrEqual(0)
+    return code.slice(...balancedAfter(code, at, '{', '}'))
+  }
+
+  test('its body names no collision (neither the class nor its name), has no instanceof and no "dispatcher bug"; it decides through hasAdErrorName', () => {
+    const body = remediationHintBody()
+    expect(body).toContain('return ')
+    expect(body).not.toMatch(/InstanceIdCollision|INSTANCE_ID_COLLISION/)
+    expect(body).not.toMatch(/\binstanceof\b/)
+    expect(body).not.toMatch(DISPATCHER_BUG_WORDING)
+    expect(body).toContain('hasAdErrorName(')
+  })
+
+  test('no file in src/, its comments included, carries "dispatcher bug"', () => {
+    const srcDir = join(import.meta.dir, '..', 'src')
+    const files = readdirSync(srcDir).filter((name) => name.endsWith('.ts'))
+    expect(files.length).toBeGreaterThan(0)
+    expect(files.filter((name) => DISPATCHER_BUG_WORDING.test(readFileSync(join(srcDir, name), 'utf-8')))).toEqual([])
   })
 })
 
@@ -16478,6 +16550,8 @@ function srj105AfterEach(): void {
   srj105Harness = undefined
   if (h === undefined) return
   try {
+    // b.jg5 SRJ-713: no post or line of any case, a collision's included, calls anything a "dispatcher bug".
+    expect(dispatcherBugWordingIn(h)).toEqual([])
     assertNoLeak(h.captured())
   } finally {
     h.cleanup()
@@ -18748,8 +18822,9 @@ function launchStartLatch(p: string, row: LaunchStartCaseRow): ExpectedLatch {
 /**
  * P latched once, as `expected` says: its whole record, the set and the
  * three holds in order before the one notice, one line of the latch's kind
- * saying it latched, and nothing counted, posted through the session
- * manager's notices (no spawn-failure notice, and no diagnosis notice: an
+ * saying it latched, and nothing counted, posted through the outage state
+ * or the lost-message driver, or posted through the session manager's
+ * notices (no spawn-failure notice, and no diagnosis notice: an
  * ErrJsonlMissing diagnosis's notice waits for the reuse spawn to bring P up,
  * b.jg5 SRJ-712), recorded `spawn-failed` or as any diagnosis entry but the
  * `inconclusiveEntries` the path wrote before the latching call, armed,
@@ -18762,7 +18837,8 @@ function expectLatchedOnce(h: RecoveryHarness, p: string, expected: ExpectedLatc
   expect(h.latchEvents.map((event) => [event.step, event.key])).toEqual(ONE_LATCH_STEPS.map((step) => [step, p]))
   expect(h.latchEvents[0]).toMatchObject({ step: 'set', key: p, outcome: CONFLICT_LATCH_SET_LATCHED })
   expect(h.episodeNotices).toEqual([{ key: p, text: expected.notice }])
-  expect(h.notices).toEqual([])
+  // The latch's one post is P's only post: no spawn-failure notice, outage onset or lost-message notice (b.jg5 SRJ-713, AC 7).
+  expect([h.notices, h.outageNotices, h.lostMessageNotices]).toEqual([[], [], []])
   const log = h.startupErrors().join('\n')
   expect(countStartupEntries(log, 'spawn-failed')).toBe(0)
   expect(countStartupEntries(log, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(inconclusiveEntries)
@@ -24192,6 +24268,8 @@ interface ResumeSiteOutcome {
   readonly notices?: number
   /** The reuse spawns made; none when unset. */
   readonly reuses?: number
+  /** Lines the launch wrote for persona `p`, each exactly once; none checked when unset. */
+  readonly lines?: (p: string) => readonly string[]
 }
 
 /** One row of SRJ-113's table: the `resume`'s answer (success when `make` is unset) and what it gives at each site. */
@@ -24209,6 +24287,9 @@ const LAUNCH_AND_READ_VERBS: ReadonlySet<string> = new Set(['spawn', 'resume', '
 
 /** The `retrying` launch result, uncounted (b.jg5 SRJ-105, SRJ-301, SRJ-1015). */
 const RETRYING_ANSWER = { action: SPAWN_ACTION_RETRYING } as const
+
+/** A `resume`'s collision, an `AgentDirectorError` named `ErrInstanceIdCollision` that is no instance of the client's class (decided by name, b.jg5 SRJ-101). */
+const resumeCollision = (): Error => errGeneric('resume', ERR_INSTANCE_ID_COLLISION_NAME, 'claude_instance_id already in use')
 
 /** The same outcome at both sites. */
 const atBothSites = (outcome: ResumeSiteOutcome): Pick<ResumeOutcomeRow, 'ladder' | 'entry'> => ({ ladder: outcome, entry: outcome })
@@ -24291,13 +24372,25 @@ const RESUME_OUTCOME_ROWS: readonly ResumeOutcomeRow[] = [
     recheck: true,
     ...atBothSites({ answer: RETRYING_ANSWER, calls: ['resume'], triggers: [UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED] }),
   },
+  // b.jg5 SRJ-713: agent-director's `resume` gives no such answer; the guard keeps a collision from the spawn-failure notice.
+  {
+    name: 'a collision (ErrInstanceIdCollision, by name) → the collision cause armed, retrying; never counted, never the spawn-failure notice',
+    make: resumeCollision,
+    ...atBothSites({
+      answer: RETRYING_ANSWER,
+      calls: ['resume'],
+      triggers: [UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION],
+      lines: (p) => [resumeCollisionLine(renderPersonaRef(p, p), describeAgentDirectorFailure(resumeCollision()), true)],
+    }),
+  },
 ]
 
 /**
  * Assert what a row's outcome at one site, `outcome`, shows for persona `p`
  * once the launch answered `result`: the answer, the calls from the `resume`
  * on (`order`, every stub call in order), the causes sent, the flags raised,
- * the failures counted, the notices and the reuse spawns; no kill or delete;
+ * the failures counted, the notices, each line the row names (once) and the
+ * reuse spawns; no kill or delete;
  * one version re-check where the row makes one. Then P's dialog approver,
  * when a launch started it, is run to its stop.
  */
@@ -24316,6 +24409,7 @@ async function expectResumeOutcome(
   expect([...getOutageFlags(p)]).toEqual([...(outcome.flags ?? [])])
   expect(getFailureCount(p)).toBe(outcome.counted ?? 0)
   expect(h.notices.filter((n) => n.key === p)).toHaveLength(outcome.notices ?? 0)
+  for (const line of outcome.lines?.(p) ?? []) expect(h.errors.filter((logged) => logged === line)).toHaveLength(1)
   expect(h.reuseSpawns()).toHaveLength(outcome.reuses ?? 0)
   // A plain spawn never carries the reuse flag: only the reuses do.
   expect(h.stub.calls.spawnCalls.filter((call) => call.reuse_finished === true)).toHaveLength(outcome.reuses ?? 0)

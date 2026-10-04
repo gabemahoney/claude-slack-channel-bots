@@ -87,7 +87,8 @@
  * (UNCLASSIFIED, by name), never imported.
  *
  * CSCB-synthetic subclasses (NOT emitted by the agent-director library — minted
- * inside CSCB and branched on via `instanceof` so SR-0.2 holds for them too):
+ * inside CSCB and recognised by their `errName`, like agent-director's own
+ * errors, so SR-0.2 holds for them too):
  *   - ErrSpawnCapReached        (restart backoff / consecutive-failure cap latch)
  *
  * SPDX-License-Identifier: MIT
@@ -96,15 +97,22 @@
 import { AgentDirectorError } from 'agent-director'
 
 /**
+ * `errName` of CSCB's own `ErrSpawnCapReached`. The spawn-failure notice's
+ * remediation line tells it apart by this name (`hasAdErrorName` in
+ * `src/ad-error-class.ts`; SR-0.2 — no message matching).
+ */
+export const ERR_SPAWN_CAP_REACHED_NAME = 'SpawnCapReached'
+
+/**
  * CSCB-synthetic error — never emitted by the agent-director library. Minted by
  * the restart backoff cap path (`notifyRestartCapReached` in session-manager.ts,
  * called from restart.ts `onCapReached`) when a persona hits the consecutive
- * session-launch failure cap and automatic restarts are suspended.
- * Branched on via `instanceof` in remediationHint (SR-0.2 — no string matching).
+ * session-launch failure cap and automatic restarts are suspended. Its
+ * `errName` is `ERR_SPAWN_CAP_REACHED_NAME`.
  */
 export class ErrSpawnCapReached extends AgentDirectorError {
   constructor(description: string) {
-    super('spawn', 'SpawnCapReached', description)
+    super('spawn', ERR_SPAWN_CAP_REACHED_NAME, description)
   }
 }
 
@@ -199,9 +207,9 @@ export const ERR_SPAWN_NOT_RESUMABLE_NAME = 'ErrSpawnNotResumable'
 
 /**
  * `errName` of the error agent-director answers when a spawn names an id
- * whose row is live (a reuse spawn's collision, b.jg5 SRJ-112). Every client
- * declares its class; the name is kept here for the reuse spawn, which tells
- * it apart by name (`hasAdErrorName`).
+ * whose row is live (a plain spawn's or a reuse spawn's collision, b.jg5
+ * SRJ-111, SRJ-112). Every client declares its class; the name is kept here
+ * for the launch sites that tell it apart by name (`hasAdErrorName`).
  */
 export const ERR_INSTANCE_ID_COLLISION_NAME = 'ErrInstanceIdCollision'
 

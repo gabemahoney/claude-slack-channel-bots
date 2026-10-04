@@ -83,8 +83,9 @@
  *      sites) takes SRJ-111's table through one handler
  *      (`plainSpawnOutcomeAt`): a later plain spawn's collision re-runs this
  *      get-then-act once, and a plain spawn's collision in that re-run arms
- *      the collision cause and answers `retrying`, uncounted; no collision
- *      raises a spawn-failure notice.
+ *      the collision cause and answers `retrying`, uncounted; no collision,
+ *      at a plain spawn, a reuse spawn or a `resume`, raises a spawn-failure
+ *      notice (b.jg5 SRJ-713).
  *   3. Any other error raises a spawn-failure notice for the persona via
  *      `notifySpawnFailure` (through the per-persona notifier) and is logged,
  *      except a refusal (b.jg5 SRJ-105, `refusalAt`): an UNAVAILABLE,
@@ -107,7 +108,9 @@
  *      nothing is killed because of it and no spawn is made in its place,
  *      and the persona's retry timer is armed at once in pending-only mode,
  *      so that the retry's read of the row decides (`launchFailureResult`;
- *      SRJ-301, SRJ-409). An UNCLASSIFIED outcome has also been
+ *      SRJ-301, SRJ-409): a failed fresh spawn's `pending` row, never CSCB's
+ *      own launch, is waited out through the pending-row rule and never
+ *      killed (SRJ-713, SRJ-410). An UNCLASSIFIED outcome has also been
  *      reported to the persona's unclassified-error episode
  *      (`src/persona-episodes.ts`). A `status` error in the working-row wait
  *      is no refusal: the wait goes on, or at its timeout ends
@@ -453,13 +456,12 @@ import {
 } from './outage-state.ts'
 import {
   AgentDirectorError,
-  ErrInstanceIdCollision,
-  ErrSpawnNotFound,
   ErrSpawnCapReached,
   ERR_INSTANCE_ID_COLLISION_NAME,
   ERR_JSONL_MISSING_NAME,
   ERR_JSONL_NEVER_WRITTEN_NAME,
   ERR_NO_SESSION_ID_NAME,
+  ERR_SPAWN_CAP_REACHED_NAME,
   ERR_SPAWN_NOT_FOUND_NAME,
   ERR_SPAWN_NOT_INTERACTIVE_NAME,
   ERR_SPAWN_NOT_RESUMABLE_NAME,
@@ -1143,6 +1145,15 @@ function spawnFailureLabel(error: AgentDirectorError): string {
  * `MAX_LOGGED_MESSAGE_LENGTH` characters) and a remediation hint. When a
  * startup notice's post fails, the `spawn-failure-post` startup error is
  * recorded; outside startup the failure is logged.
+ *
+ * Its callers: a launch's `ErrTmuxSessionCreate` (a plain spawn's
+ * `plainSpawnFailedAt`, a reuse spawn's `reuseSpawnFailedAt`, a `resume`'s
+ * `resumeFailedAt`), a `resume`'s error with no row of its own
+ * (`resumeFailedAt`), and the restart cap (`notifyRestartCapReached`). A
+ * collision (`ErrInstanceIdCollision`) never reaches it (b.jg5 SRJ-713): a
+ * plain spawn's goes to get-then-act (`plainSpawnOutcomeAt`), a reuse
+ * spawn's to its collided answer (`reuseSpawnFailedAt`), and a `resume`'s
+ * to the collision cause's retry (`resumeCollisionAt`).
  */
 export function notifySpawnFailure(key: string, error: AgentDirectorError, isStartup = true): void {
   const ref = keyRef(key)
@@ -3438,11 +3449,27 @@ function buildNotConnectedNotice(key: string, notice: NotConnectedNotice): strin
   )
 }
 
+/** Spawn-failure remediation when agent-director raised `ErrSpawnNotFound`. */
+export const SPAWN_NOT_FOUND_REMEDIATION = 'transient — restarting the server should resolve'
+
+/** Spawn-failure remediation when CSCB's own restart cap (`ErrSpawnCapReached`) was reached. */
+export const SPAWN_CAP_REACHED_REMEDIATION = 'restart the server to retry — automatic restarts are suspended for this persona'
+
+/** Spawn-failure remediation for any other error. */
+export const SPAWN_FAILURE_DEFAULT_REMEDIATION = 'Check server.log for details.'
+
+/**
+ * The remediation line of a spawn-failure notice (`notifySpawnFailure`),
+ * decided by the error's name (`hasAdErrorName`, `src/ad-error-class.ts`;
+ * b.jg5 SRJ-101 interim rule), never by `instanceof`: `ErrSpawnNotFound`,
+ * CSCB's own `ErrSpawnCapReached` (`notifyRestartCapReached`), and any other
+ * error. A collision (`ErrInstanceIdCollision`) has no hint: it never reaches
+ * the notice, and no post calls it a fault (b.jg5 SRJ-713).
+ */
 function remediationHint(error: AgentDirectorError): string {
-  if (error instanceof ErrInstanceIdCollision) return 'spawn dispatcher bug — please report'
-  if (error instanceof ErrSpawnNotFound) return 'transient — restarting the server should resolve'
-  if (error instanceof ErrSpawnCapReached) return 'restart the server to retry — automatic restarts are suspended for this persona'
-  return 'Check server.log for details.'
+  if (hasAdErrorName(error, ERR_SPAWN_NOT_FOUND_NAME)) return SPAWN_NOT_FOUND_REMEDIATION
+  if (hasAdErrorName(error, ERR_SPAWN_CAP_REACHED_NAME)) return SPAWN_CAP_REACHED_REMEDIATION
+  return SPAWN_FAILURE_DEFAULT_REMEDIATION
 }
 
 // ---------------------------------------------------------------------------
@@ -9537,7 +9564,13 @@ async function latchOnKillOutcomeAt(
 /** The tail of the one line a launch's LAUNCH FAILURE writes (b.jg5 SRJ-602). */
 const LAUNCH_FAILURE_LINE_TAIL = ' — a counted launch failure; nothing is killed and no spawn is made in its place (b.jg5 SRJ-602)'
 
-/** Whether `err` is a LAUNCH FAILURE (`ErrTmuxSessionCreate`), decided by name (`classifyAdError`). Never throws. */
+/**
+ * Whether `err` is a LAUNCH FAILURE (`ErrTmuxSessionCreate`), decided by name
+ * (`classifyAdError`): a launch whose session-creating call failed, after
+ * "duplicate session" (the new row ended, unless the end write was not
+ * applied) or otherwise (a fresh spawn's row left `pending`, never CSCB's
+ * own launch; b.jg5 SRJ-713). Never throws.
+ */
 function isLaunchFailure(err: unknown): boolean {
   return classifyAdError(err).errorClass === AD_ERROR_CLASS_LAUNCH_FAILURE
 }
@@ -9549,12 +9582,24 @@ function isLaunchFailure(err: unknown): boolean {
  * `spawn-failed` entry. Nothing is killed because of it and no launch
  * follows it. The persona's retry timer is armed at once, with no `get`
  * first, in pending-only mode (`armPendingOnlyAfterLaunchFailure`; SRJ-301,
- * SRJ-409; HO rev 28), so that the retry's read of the row decides: a plain
- * spawn's row reads `pending`, or `ended` after a "duplicate session" whose
- * holder had vanished; a `resume`'s or a reuse's reads as agent-director's
- * restore left it. Answers `failed` marked `countedClass`, and
- * `pendingOnlyArmed` when the timer was armed (inside a launch attempt with a
- * sink installed). Never throws.
+ * SRJ-409; HO rev 28), so that the retry's read of the row decides, with
+ * neither `session_restart_delay` nor `health_check_interval` needed:
+ *   - a fresh spawn's launch that failed other than by "duplicate session"
+ *     leaves its row `pending`, covered unless its key is retired with no
+ *     "new life has begun" mark (SRJ-411). It is never CSCB's own launch:
+ *     the call neither returned success nor timed out, so its window has no
+ *     end (`launchCallWithWindow`) and no own-launch record is set
+ *     (SRJ-412). The retries wait it out through the pending-row rule
+ *     (SRJ-410): it is never killed, gets at most the held post at B, and P
+ *     is brought up once agent-director marks it `missing` (SRJ-713);
+ *   - after "duplicate session" agent-director ended the new row (`ended`),
+ *     and a leftover's hooks never revive it; only an end write that was
+ *     not applied leaves it `pending`, waited out the same way;
+ *   - a `resume`'s or a reuse's row reads as agent-director's restore left
+ *     it; one still `pending` is handled as a failed fresh spawn's.
+ * Answers `failed` marked `countedClass`, and `pendingOnlyArmed` when the
+ * timer was armed (inside a launch attempt with a sink installed). Never
+ * throws.
  */
 function launchFailureResult(key: string): SpawnPersonaResult {
   return armPendingOnlyAfterLaunchFailure(key)
@@ -9611,9 +9656,11 @@ async function invalidFlagsUnclassifiedAt(
  *   - DIRECTORY (`ErrCwdNotFound`, `ErrCwdNotADirectory`, by name): `failed`
  *     quietly (the spawn's wrapper raised `cwd-unreachable`);
  *   - the refusal handling (`launchRefusalAt`): a CONFLICT, the pre-spawn
- *     scan's refusal or one after "duplicate session" alike (CSCB does not
- *     tell them apart by their words), latches with the refused operation
- *     "plain spawn" and `lastRead`, with nothing counted and no kill; an
+ *     scan's refusal (no row written) or one after "duplicate session" (the
+ *     new row ended, unless agent-director's end write was not applied)
+ *     alike (CSCB does not tell them apart by their words), latches with the
+ *     refused operation "plain spawn" and `lastRead`, with nothing counted
+ *     and no kill; an
  *     UNUSABLE NAME latches; UNAVAILABLE, ENVIRONMENT, CONFIG and
  *     UNCLASSIFIED answer `failed` with no notice, the reporting point having
  *     armed the persona's retry timer, raised the outage or fed the
@@ -9627,7 +9674,10 @@ async function invalidFlagsUnclassifiedAt(
  *     spawn), a `spawn-failed` entry at start and the spawn-failure notice,
  *     and one counted launch failure (`launchFailureResult`): nothing is
  *     killed, no spawn is made in its place (SRJ-602), and the persona's
- *     retry timer is armed at once in pending-only mode;
+ *     retry timer is armed at once in pending-only mode. Unless it followed
+ *     "duplicate session", its row stays `pending`, never CSCB's own launch
+ *     (the call set no window end), and the retries wait it out through the
+ *     pending-row rule until agent-director marks it `missing` (SRJ-713);
  *   - any other value (a STATE or GONE name a plain spawn gives no meaning):
  *     SRJ-105's UNCLASSIFIED row through the site entry
  *     (`reportUnclassifiedAtSite`), one refusal line, `failed`, no notice.
@@ -9711,7 +9761,16 @@ export interface PlainSpawnSite<R> {
  * spawn after `resume`'s `ErrSpawnNotFound` at both `resume` sites
  * (`resumeOrFreshSpawn` and the live-row sequence's launch entry, through
  * `plainSpawnAfterResumeNotFound`). agent-director's pre-spawn scan runs
- * inside the spawn and writes nothing when it refuses (HO rev 15).
+ * inside the spawn and writes nothing when it refuses (HO rev 15): no row
+ * exists afterwards. A spawn whose session-creating call meets "duplicate
+ * session" ends its new row (`ended`), which a leftover's hooks never
+ * revive, unless agent-director's end write was not applied, which leaves it
+ * `pending` (HO rev 15, rev 17). A fresh spawn whose launch failed otherwise
+ * (`ErrTmuxSessionCreate`) leaves a `pending` row that is never CSCB's own
+ * launch, waited out by the pending-row rule, never killed (b.jg5 SRJ-713,
+ * SRJ-410). A row whose create reply was lost and whose worker then exited
+ * is counted gone by agent-director's `find-missing` once no pane carries
+ * its launch's per-pane label, and is marked `missing` past G (HO rev 18).
  *
  * The installed reply-guard steps run immediately before the call (b.av2
  * SR-9.4), and the call records its window (`launchCallWithWindow`, b.jg5
@@ -10663,7 +10722,9 @@ function plainSpawnCollisionAtLadder(run: LadderRun, what: string): Promise<Spaw
  *     DIRECTORY errors give `cwd-unreachable` (raised by the wrapper),
  *     counted; ErrInvalidFlags takes the version re-check, then
  *     UNCLASSIFIED (below); UNUSABLE NAME, CONFIG and UNCLASSIFIED are
- *     SRJ-105's.
+ *     SRJ-105's; a collision arms the collision cause and answers
+ *     `retrying`, never the spawn-failure notice (`resumeCollisionAt`,
+ *     SRJ-713).
  * These two are the handler's only sites: a refused `resume` is not retried
  * anywhere else.
  *
@@ -11106,7 +11167,10 @@ interface ResumeSite<R> {
  *     NAME latches; `ErrTmuxSessionCreate` is one counted launch failure
  *     that arms the retry timer at once in pending-only mode; the DIRECTORY
  *     errors give `cwd-unreachable`, counted; `ErrInvalidFlags` takes the
- *     version re-check, then UNCLASSIFIED). Nothing assumes the row was
+ *     version re-check, then UNCLASSIFIED; an `ErrInstanceIdCollision`,
+ *     which agent-director's `resume` does not answer, arms the collision
+ *     cause and answers `retrying`, never the spawn-failure notice,
+ *     `resumeCollisionAt`). Nothing assumes the row was
  *     restored after a failed `resume` (HO rev 28): a later read decides.
  * Nothing here deletes, kills or sets `include_finished`. Never throws.
  */
@@ -12533,6 +12597,36 @@ async function replaceAtResumeSite(
 }
 
 /**
+ * The line of a `resume` of persona `ref` that answered
+ * `ErrInstanceIdCollision` (`resumeCollisionAt`; b.jg5 SRJ-713, SRJ-112,
+ * SRJ-301): `failure` is the error as `describeAgentDirectorFailure` renders
+ * it, and `armed` says whether the retry timer was armed with the collision
+ * cause.
+ */
+export function resumeCollisionLine(ref: string, failure: string, armed: boolean): string {
+  return `[slack] spawnForPersona: ${failure} on the resume of ${ref} — its row is live, so nothing was launched; no spawn-failure notice, nothing counted; answering retrying, the retry timer ${armed ? 'is armed' : 'could not be armed'} (cause=${UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION}), and that retry's run of the restart path's decision is the get-then-act (b.jg5 SRJ-713, SRJ-112, SRJ-301)`
+}
+
+/**
+ * A `resume` of persona `key` that answered `ErrInstanceIdCollision` (by
+ * name), at either `resume` site (`resumeFailedAt`). agent-director's
+ * `resume` has no such answer (b.jg5 SRJ-113's table has no row for it), so
+ * this only keeps a collision away from the spawn-failure notice (SRJ-713):
+ * a collision means the row is live, a launch in progress included, and
+ * nothing was launched. As a reuse spawn's second collision (SRJ-112), it
+ * makes no further call, arms the persona's retry timer with the collision
+ * cause (`reportReuseCollisionAtSite`, so the attempt records it) and
+ * answers `retrying`; that retry's run of the restart path's decision is the
+ * get-then-act. Nothing is counted, posted or killed; one line
+ * (`resumeCollisionLine`). Never throws.
+ */
+function resumeCollisionAt(key: string, ref: string, err: unknown): SpawnPersonaResult {
+  const armed = reportReuseCollisionAtSite(key)
+  console.error(resumeCollisionLine(ref, describeAgentDirectorFailure(err), armed))
+  return { key, action: SPAWN_ACTION_RETRYING }
+}
+
+/**
  * A `resume`'s failure by class, once the one `resume` outcome handler's
  * own rows have passed it (`resumeAtSite`, at `resumeOrFreshSpawn` and at
  * the live-row sequence's launch entry), with no further launch: `ErrInvalidFlags` gets one immediate version re-check
@@ -12552,6 +12646,8 @@ async function replaceAtResumeSite(
  * mode, since agent-director's restore of the row may not have applied (HO
  * rev 28), so the retry's read of the row decides (SRJ-301, SRJ-409); the
  * result is marked `countedClass`, and `pendingOnlyArmed` when it armed.
+ * An `ErrInstanceIdCollision` (by name) never reaches the notice: it takes
+ * `resumeCollisionAt` first (b.jg5 SRJ-713).
  * Never throws.
  */
 async function resumeFailedAt(
@@ -12562,6 +12658,8 @@ async function resumeFailedAt(
   lastRead: LastRowRead,
 ): Promise<SpawnPersonaResult> {
   const { key } = persona
+  // b.jg5 SRJ-713: a collision never reaches the spawn-failure notice.
+  if (hasAdErrorName(err, ERR_INSTANCE_ID_COLLISION_NAME)) return resumeCollisionAt(key, ref, err)
   // b.jg5 SRJ-104: the resume site gives ErrInvalidFlags no meaning: one
   // immediate version re-check, then UNCLASSIFIED (SRJ-105, SRJ-313).
   if (isInvalidFlagsError(err)) return invalidFlagsUnclassifiedAt(key, err, 'resume', 'resume', ref)
@@ -14219,14 +14317,19 @@ function runPersonaLadder(
   // own, and the hook re-evaluated against the persona's current config) and
   // any later spawn or resume below runs them again.
   // b.jg5 SRJ-111: SRJ-111's table through the one plain-spawn outcome
-  // handler. A CONFLICT (the pre-spawn scan's, or one after "duplicate
-  // session") latches the persona with the refused operation "plain spawn";
-  // nothing of the row was read before this first spawn, so the latch-time
-  // `status` read gives its state. An `ErrTmuxSessionCreate` (by name) is one
-  // counted launch failure: nothing is killed and no spawn is made in its
-  // place, and the persona's retry timer is armed at once in pending-only
-  // mode (b.jg5 SRJ-602, SRJ-713, SRJ-409). Its collision leads on to
-  // get-then-act, as its first run, not a re-run (SRJ-114).
+  // handler. A CONFLICT latches the persona with the refused operation
+  // "plain spawn": the pre-spawn scan's refusal wrote no row, and one after
+  // "duplicate session" ended the new row unless agent-director's end write
+  // was not applied; nothing of the row was read before this first spawn,
+  // so the latch-time `status` read gives its state. An
+  // `ErrTmuxSessionCreate` (by name) is one counted launch failure: nothing
+  // is killed and no spawn is made in its place, and the persona's retry
+  // timer is armed at once in pending-only mode. Its `pending` row is never
+  // CSCB's own launch, so the retries wait it out through the pending-row
+  // rule, never killing it, and bring the persona up once it reads
+  // `missing` (b.jg5 SRJ-602, SRJ-713, SRJ-409, SRJ-410). Its collision
+  // leads on to get-then-act, as its first run, not a re-run, and never to
+  // the spawn-failure notice (SRJ-114, SRJ-713).
   return plainSpawnOutcomeAt<SpawnPersonaResult>({
     persona,
     isStartup,

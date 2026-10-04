@@ -921,7 +921,10 @@
  * alone: no trigger, timer, notice, outage flag or call),
  * `expectPendingOnlyWatch` (a persona's retry timer armed and waiting in
  * pending-only mode with the pending-row cause, and its pending-row trigger
- * recorded), `expectLostMessageReports` (lose one message through the driver
+ * recorded), `dispatcherBugWordingIn` (every captured line, `console.error`
+ * line, notice and startup-errors entry carrying `DISPATCHER_BUG_WORDING`,
+ * which no post or line may give a collision, b.jg5 SRJ-713),
+ * `expectLostMessageReports` (lose one message through the driver
  * and assert its state, its stub calls, by default none in states 1 to 5 and
  * one `status` of the persona's instance after them, and no restart asked
  * for or pending unless `restartRequested`; resolves with the outcome), `collided` (the stub answers of a launch whose optimistic spawn
@@ -3600,6 +3603,23 @@ export function expectPendingOnlyWatch(h: RecoveryHarness, key: string): void {
   expect(view).toMatchObject({ phase: 'waiting', mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY })
   expect(view?.causes).toContain(UNAVAILABLE_RETRY_CAUSE_PENDING_ROW)
   expect(h.triggers).toContainEqual({ key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW })
+}
+
+/**
+ * The wording no post or line may give a collision (b.jg5 SRJ-713): a
+ * collision is never a "dispatcher bug". Not global, so it keeps no
+ * `lastIndex` between tests.
+ */
+export const DISPATCHER_BUG_WORDING = /dispatcher\s+bug/i
+
+/**
+ * Everything `h` captured that carries {@link DISPATCHER_BUG_WORDING}: its
+ * lines, its `console.error` lines, the text of every notice of the four
+ * notice lists and its startup-errors entries. Empty when nothing does.
+ */
+export function dispatcherBugWordingIn(h: RecoveryHarness): string[] {
+  const notices = [...h.notices, ...h.outageNotices, ...h.episodeNotices, ...h.lostMessageNotices].map((notice) => notice.text)
+  return [...h.lines, ...h.errors, ...notices, ...h.startupErrors()].filter((text) => DISPATCHER_BUG_WORDING.test(text))
 }
 
 /** States 1 to 5 of SRJ-1011: those that apply before the lost-message row read is made. */

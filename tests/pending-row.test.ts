@@ -182,6 +182,25 @@
  * kill's typed answers are tests/session-manager.test.ts's; the approver's
  * stop reason is tests/approve-trust-folder-dialog.test.ts's.
  *
+ * A failed launch's `pending` row waited out (b.jg5 SRJ-713, SRJ-111; HO
+ * rev 26, rev 28; AC 6, AC 30), on the same harness with `harnessNow`: a
+ * fresh plain spawn's `ErrTmuxSessionCreate`, a "duplicate session" whose end
+ * write was not applied (its `ErrTmuxSessionCreate`, and HO rev 26's
+ * re-lookup `ErrTmuxUnresponsive`), and a `resume`'s and a reuse's
+ * `ErrTmuxSessionCreate` whose row was not restored: P's answer (a LAUNCH
+ * FAILURE counted once, the UNAVAILABLE re-lookup not), P's timer armed at
+ * once with no approver, the call's window with no end and no own-launch
+ * record; runs only from G, one held post at B and never the relaunching
+ * post, an abort, a kill, a sequence or a further count; P brought up once
+ * the row reads `missing`. An attempt meanwhile collides and its `get` reads
+ * the same covered row: `no-op`, no second launch. HO rev 18's lost-reply
+ * row (a timed-out launch) marked `missing` past G and before B: that
+ * round's hand-off resumes it through get-then-act. These cases and AC 30's
+ * check that nothing the harness captured says "dispatcher bug"
+ * (`dispatcherBugWordingIn`). An uncovered row's
+ * and a raised `tmux-unavailable`'s missing post are the rule's harness
+ * describe's above.
+ *
  * SPDX-License-Identifier: MIT
  */
 
@@ -410,12 +429,15 @@ import {
   APPROVER_STOP_STUCK_LAUNCH_ABORT,
   isCscbOwnLaunch,
   LAUNCH_CALL_END_LAUNCH_TIMEOUT,
+  launchCallWindowOf,
   ownLaunchRecordOf,
   paneShowsStartupDialog,
   PENDING_ROW_STEP_LATCHED,
   pendingRowComparisonFor,
   readAndStepPendingRow,
+  SPAWN_ACTION_RETRYING,
   type RowPersonaComparison,
+  type SpawnPersonaResult,
   uncoveredPendingRowLine,
   undecidedPendingRowLine,
 } from '../src/session-manager.ts'
@@ -441,6 +463,7 @@ import {
   errConfigMalformed,
   errGeneric,
   errInstanceIdCollision,
+  errNoSessionId,
   errSendKeysWhileRelayed,
   errSpawnNotFound,
   errSpawnNotInteractive,
@@ -451,8 +474,10 @@ import {
   errTmuxNotAvailable,
   errTmuxSendKeys,
   errTmuxSessionConflict,
+  errTmuxSessionCreate,
   errTmuxSessionCreateStaysPending,
   errTmuxUnresponsive,
+  errTmuxUnresponsiveNewRowEnded,
   errUnusableName,
   holdFindMissing,
   SAMPLE_LAUNCH_START_DEFAULT,
@@ -465,6 +490,7 @@ import {
 } from './test-helpers/agent-director-stub.ts'
 import {
   judgeMissingFrom,
+  judgeMissingFromG,
   judgeNotJudged,
   judgeUnverified,
   launchStartText,
@@ -495,6 +521,8 @@ import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, sentinelInMessage, withoutNa
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import {
   adConfigMalformedRaiseLines,
+  DISPATCHER_BUG_WORDING,
+  dispatcherBugWordingIn,
   driveToB,
   expectPendingOnlyWatch,
   killFailureLines,
@@ -1577,12 +1605,9 @@ describe('neither stuck-launch text names a session-ending command (b.jg5 SRJ-10
   })
 
   test('no text calls anything a "dispatcher bug" (b.jg5 SRJ-713)', () => {
-    for (const text of everyStuckLaunchText()) expect(text).not.toMatch(DISPATCHER_BUG)
+    for (const text of everyStuckLaunchText()) expect(text).not.toMatch(DISPATCHER_BUG_WORDING)
   })
 })
-
-/** The wording SRJ-713 forbids in any post: a collision is never a "dispatcher bug". */
-const DISPATCHER_BUG = /dispatcher\s+bug/i
 
 // ---------------------------------------------------------------------------
 // The stuck-launch posters (b.jg5 SRJ-1017, SRJ-1016)
@@ -2934,7 +2959,7 @@ function ruleHarnessOf(options: RecoveryHarnessOptions = {}): { h: RecoveryHarne
 }
 
 /** Replace the model's knob `name` with `wrap` over it (the model's own answer stays reachable). */
-function wrapModelKnob<K extends 'spawnFn' | 'getFn' | 'readPaneFn' | 'findMissingFn' | 'killFn'>(
+function wrapModelKnob<K extends 'spawnFn' | 'resumeFn' | 'getFn' | 'readPaneFn' | 'findMissingFn' | 'killFn'>(
   h: RecoveryHarness,
   name: K,
   wrap: (model: NonNullable<StubClientOptions[K]>) => NonNullable<StubClientOptions[K]>,
@@ -2965,20 +2990,37 @@ const ORIGIN_START_PASS: RuleOrigin = {
   },
 }
 
+/** A launch call that fails having left P's row `pending` (b.jg5 SRJ-713; HO rev 28): which call of P's own id, and its answer. */
+interface FailedLaunch {
+  /** A plain spawn, a reuse spawn (`reuse_finished`) or a `resume`. */
+  readonly call: 'plain spawn' | 'reuse spawn' | 'resume'
+  readonly error: () => Error
+}
+
+/** P's next `launch.call` leaves `row` `pending`, its launch start the clock's now, and answers `launch.error()`; every other call is the model's. */
+function failNextLaunch(h: RecoveryHarness, row: PendingRowModel, launch: FailedLaunch): void {
+  let used = false
+  const fail = (): Error => {
+    used = true
+    row.setState(AGENT_DIRECTOR_PENDING_STATE)
+    row.setLaunchStartedAt(launchStartText(h.clock.now()))
+    return launch.error()
+  }
+  if (launch.call === 'resume') {
+    wrapModelKnob(h, 'resumeFn', (modelResume) => (params) => (used || params.claude_instance_id !== row.instanceId ? modelResume(params) : fail()))
+    return
+  }
+  const reuse = launch.call === 'reuse spawn'
+  wrapModelKnob(h, 'spawnFn', (modelSpawn) => (params) => (used || params.claude_instance_id !== row.instanceId || 'reuse_finished' in params !== reuse ? modelSpawn(params) : fail()))
+}
+
 /** A failed fresh spawn: no row, then the spawn leaves the row `pending` and answers `ErrTmuxSessionCreate` (`launchError`, for the outage case). */
 function failedSpawnOrigin(launchError: () => Error = () => errTmuxSessionCreateStaysPending('spawn')): RuleOrigin {
   return {
     name: 'a failed fresh spawn',
     async begin(h, p, model) {
       const row = makePendingRowModel(h, p, { ...model, state: PENDING_ROW_MODEL_NO_ROW })
-      let used = false
-      wrapModelKnob(h, 'spawnFn', (modelSpawn) => (params) => {
-        if (used || params.claude_instance_id !== row.instanceId) return modelSpawn(params)
-        used = true
-        row.setState(AGENT_DIRECTOR_PENDING_STATE)
-        row.setLaunchStartedAt(launchStartText(h.clock.now()))
-        return launchError()
-      })
+      failNextLaunch(h, row, { call: 'plain spawn', error: launchError })
       await h.launch(p)
       await h.settle()
       return row
@@ -3135,8 +3177,8 @@ describe('the pending-row rule on the recovery harness (b.jg5 SRJ-410; AC 30, AC
     expect(h.stops).toContainEqual({ key: p, reason: UNAVAILABLE_RETRY_STOP_ROW_GONE })
     expect(row.state()).toBe(AGENT_DIRECTOR_PENDING_STATE)
     expect(row.launchStartMs()).toBeGreaterThan(launchStartMs)
-    // SRJ-713 (AC 6's unit half): no post of the whole case, the origin's own included, calls anything a "dispatcher bug".
-    expect(noticesOf(h, p).filter((text) => DISPATCHER_BUG.test(text))).toEqual([])
+    // SRJ-713 (AC 6's unit half): no post or line of the whole case, the origin's own included, calls anything a "dispatcher bug".
+    expect(dispatcherBugWordingIn(h)).toEqual([])
   })
 
   // AC 30's conditions: the timer keeps running while the row is pending.
@@ -4099,5 +4141,153 @@ describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill,
     // The retry's own reads, then the rule's run and get with no lap (the approver ran), the kill and the sequence.
     expect(roundVerbsFrom(h, row, atB).slice(0, 9)).toEqual(['status', 'get', 'find-missing', 'get', 'kill', 'get', 'find-missing', 'get', 'resume'])
     expect(relaunchingPostsOf(h, p)).toEqual([relaunchingTextOf(p)])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SRJ-713: a failed launch's pending row waited out through the rule (recovery harness; b.jg5 SRJ-713, SRJ-111, SRJ-410, SRJ-412; AC 6, AC 30)
+// ---------------------------------------------------------------------------
+
+/** One launch of SRJ-713 (with HO rev 28's `resume` and reuse legs) that leaves P's row `pending`: P's row before it, the failing call and P's launch's answer. */
+interface WaitedOutLaunch extends FailedLaunch {
+  readonly name: string
+  readonly before: PendingRowModelOptions
+  readonly answer: Omit<SpawnPersonaResult, 'key'>
+}
+
+/** A LAUNCH FAILURE's answer: counted once, P's timer armed at once in pending-only mode (b.jg5 SRJ-602, SRJ-301). */
+const COUNTED_LAUNCH_FAILURE: Omit<SpawnPersonaResult, 'key'> = { action: 'failed', countedClass: true, pendingOnlyArmed: true }
+
+/** P's row `ended` with a session id, the start pass's plain spawn colliding with it, then `more` launch answers: P's launch is a `resume`, or after `ErrNoSessionId` a reuse spawn. */
+const endedRowColliding = (...more: Error[]): PendingRowModelOptions => ({ state: LIVENESS_DEAD_ROW_ENDED, sessionId: OWN_SESSION_ID, launches: [errInstanceIdCollision(), ...more] })
+
+const WAITED_OUT_LAUNCHES: readonly WaitedOutLaunch[] = [
+  {
+    name: 'a fresh plain spawn answering ErrTmuxSessionCreate',
+    before: { state: PENDING_ROW_MODEL_NO_ROW },
+    call: 'plain spawn',
+    error: () => errTmuxSessionCreateStaysPending('spawn'),
+    answer: COUNTED_LAUNCH_FAILURE,
+  },
+  {
+    name: 'a plain spawn meeting "duplicate session" whose end write was not applied (ErrTmuxSessionCreate)',
+    before: { state: PENDING_ROW_MODEL_NO_ROW },
+    call: 'plain spawn',
+    error: () => errTmuxSessionCreate('spawn'),
+    answer: COUNTED_LAUNCH_FAILURE,
+  },
+  {
+    name: 'a plain spawn whose re-lookup after "duplicate session" could not answer, its end write not applied (HO rev 26, ErrTmuxUnresponsive)',
+    before: { state: PENDING_ROW_MODEL_NO_ROW },
+    call: 'plain spawn',
+    error: () => errTmuxUnresponsiveNewRowEnded('spawn'),
+    answer: { action: SPAWN_ACTION_RETRYING },
+  },
+  {
+    name: 'a resume answering ErrTmuxSessionCreate, its row not restored (HO rev 28)',
+    before: endedRowColliding(),
+    call: 'resume',
+    error: () => errTmuxSessionCreateStaysPending('resume'),
+    answer: COUNTED_LAUNCH_FAILURE,
+  },
+  {
+    name: 'a reuse of a key that is not retired answering ErrTmuxSessionCreate, its row not restored (HO rev 28)',
+    before: endedRowColliding(errNoSessionId()),
+    call: 'reuse spawn',
+    error: () => errTmuxSessionCreateStaysPending('spawn'),
+    answer: COUNTED_LAUNCH_FAILURE,
+  },
+]
+
+/** P's start-pass launch over `row`, its `launch.call` failing as `launch` says; answers the launch's result, once settled. */
+async function launchFailing(h: RecoveryHarness, p: string, row: PendingRowModel, launch: FailedLaunch): Promise<SpawnPersonaResult> {
+  failNextLaunch(h, row, launch)
+  const result = await h.launch(p)
+  await h.settle()
+  return result
+}
+
+describe('SRJ-713: a failed launch\'s pending row, never CSCB\'s own, waited out through the rule until it reads missing (recovery harness; b.jg5 SRJ-713, SRJ-111, SRJ-410, SRJ-412; AC 6, AC 30)', () => {
+  afterEach(cleanUpRuleHarness)
+
+  test.each(WAITED_OUT_LAUNCHES.map((launch) => [launch.name, launch] as const))('%s: P\'s timer armed at once; never CSCB\'s own; runs only from G; at B one held post and never the relaunching post, an abort or a kill; nothing more counted; P brought up once the row reads missing; no "dispatcher bug"', async (_name, launch) => {
+    const { h, p } = ruleHarnessOf({ harnessNow: true })
+    const row = makePendingRowModel(h, p, { dialog: PENDING_ROW_DIALOG_UNRECOGNISED, ...launch.before })
+    const starts = recordSequenceStarts()
+
+    expect(await launchFailing(h, p, row, launch)).toStrictEqual({ key: p, ...launch.answer })
+
+    // Armed at once over the pending row, with no approver; the failed call's window has no end, so no own-launch record.
+    expect([row.state(), h.controller.isArmed(p), h.approverRunning(p)]).toEqual([AGENT_DIRECTOR_PENDING_STATE, true, false])
+    expect(h.triggers).toContainEqual({ key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW })
+    expect(launchCallWindowOf(p)?.end).toBeUndefined()
+    expect([ownLaunchRecordOf(p), isCscbOwnLaunch(p, row.launchStartedAt())]).toEqual([undefined, false])
+    const launchStartMs = row.launchStartMs()!
+    const launches = launchesOf(row)
+    const noticesBefore = noticesOf(h, p).length
+
+    const rounds: RuleRound[] = []
+    while (rounds.length === 0 || rounds.at(-1)!.at < launchStartMs + adLaunchBoundMsInEffect()) rounds.push(...(await runRounds(h, p, row, 1)))
+    rounds.push(...(await runRounds(h, p, row, 1)))
+
+    expect(rounds.some((round) => round.at < launchStartMs + adGraceMsInEffect())).toBe(true)
+    for (const round of rounds) expect(round.verbs.includes('find-missing')).toBe(round.at >= launchStartMs + adGraceMsInEffect())
+    for (const round of rounds) expect(round.posts).toBe(round.at >= launchStartMs + adLaunchBoundMsInEffect() ? 1 : 0)
+    expect(heldPostsOf(h, p)).toEqual([stuckLaunchHeldText(p, row.launchStartedAt(), false)])
+    // From the failure on, the held post is P's only post: no relaunching post, alert or other notice.
+    expect(noticesOf(h, p).slice(noticesBefore)).toEqual(heldPostsOf(h, p))
+    expect([launchesOf(row), row.callTimes('kill'), starts, h.stuckLaunchAbortUsed(p), getFailureCount(p)]).toEqual([launches, [], [], false, 0])
+
+    // Marked missing: the retry hands P to the restart path's decision, which brings P up with no kill.
+    row.setJudgment(judgeMissingFrom(h.clock.now()))
+    await retryNow(h, p)
+    expect(launchesOf(row)).toHaveLength(launches.length + 1)
+    expect([row.state(), row.callTimes('kill'), getFailureCount(p)]).toEqual([AGENT_DIRECTOR_PENDING_STATE, [], 0])
+    expect(row.launchStartMs()).toBeGreaterThan(launchStartMs)
+    expect(dispatcherBugWordingIn(h)).toEqual([])
+  })
+
+  test('an attempt that spawns while a failed fresh spawn\'s row waits collides, and its get reads the same covered pending row: no second launch, nothing counted or posted, the row still waited out', async () => {
+    const { h, p } = ruleHarnessOf({ harnessNow: true })
+    const [freshSpawn] = WAITED_OUT_LAUNCHES
+    const row = makePendingRowModel(h, p, { dialog: PENDING_ROW_DIALOG_UNRECOGNISED, ...freshSpawn!.before })
+    await launchFailing(h, p, row, freshSpawn!)
+    await runRounds(h, p, row, 1)
+    const launchStart = row.launchStartedAt()
+    const fromCalls = row.calls.length
+    const noticesBefore = noticesOf(h, p).length
+    row.scriptLaunches(errInstanceIdCollision())
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'no-op' })
+    await h.settle()
+
+    expect(row.calls.slice(fromCalls).map((call) => call.verb)).toEqual(['spawn', 'get'])
+    expect([row.launchStartedAt(), getFailureCount(p), noticesOf(h, p).slice(noticesBefore), h.approverRunning(p)]).toEqual([launchStart, 0, [], false])
+    expectPendingOnlyWatch(h, p)
+    expect(dispatcherBugWordingIn(h)).toEqual([])
+  })
+
+  test('HO rev 18: a lost-reply row (its launch call timed out) marked missing past G, before B, by the rule\'s run: that step hands P to the restart decision, whose get-then-act resumes the row, keeping its conversation; no kill, no post, nothing counted', async () => {
+    const { h, p } = ruleHarnessOf({ harnessNow: true })
+    const row = makePendingRowModel(h, p, { ...PLAIN_SPAWN_LAUNCH, sessionId: OWN_SESSION_ID, dialog: PENDING_ROW_DIALOG_UNRECOGNISED, judgment: judgeMissingFromG() })
+    scriptModelLaunch(h, row, { end: LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT })
+    await h.launch(p)
+    await h.settle()
+    const launchStartMs = row.launchStartMs()!
+    // agent-director answers the restart path's plain spawn of the finished row with a collision.
+    row.scriptLaunches(errInstanceIdCollision())
+
+    const rounds: RuleRound[] = []
+    while (h.stub.calls.resumeCalls.length === 0 && rounds.length < 12) rounds.push(...(await runRounds(h, p, row, 1)))
+
+    const recovered = rounds.at(-1)!
+    expect(recovered.at).toBeGreaterThanOrEqual(launchStartMs + adGraceMsInEffect())
+    expect(recovered.at).toBeLessThan(launchStartMs + adLaunchBoundMsInEffect())
+    // The round's lap, run and get read the row missing; then the restart decision's plain spawn collides, its get reads the row and it resumes.
+    expect(recovered.verbs.slice(0, LAP_RUN_ROUND.length + 3)).toEqual([...LAP_RUN_ROUND, 'spawn', 'get', 'resume'])
+    expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: row.instanceId }])
+    expect([row.getRow().claude_session_id, h.reuseSpawns(), row.callTimes('kill')]).toEqual([OWN_SESSION_ID, [], []])
+    expect([heldPostsOf(h, p), relaunchingPostsOf(h, p), getFailureCount(p)]).toEqual([[], [], 0])
+    expect(dispatcherBugWordingIn(h)).toEqual([])
   })
 })
