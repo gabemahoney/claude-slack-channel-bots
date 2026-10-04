@@ -109,6 +109,8 @@ import {
   RETRY_KILL_LATER_PHRASE,
   STILL_STARTING_PHRASE,
   STILL_STOPPING_PHRASE,
+  SURVIVOR_CLAUSE_MANY_PHRASE,
+  SURVIVOR_CLAUSE_ONE_PHRASE,
   SURVIVOR_PID_PATTERN,
   UNUSABLE_RECORDED_NAME_PHRASE,
   survivorPids,
@@ -164,6 +166,7 @@ import {
   KILL_FAILED_DESCRIPTIONS,
   STUB_RESOLVE_DEFAULT_PATH,
   STUB_SURVIVOR_PIDS,
+  STUB_WORKER_PID,
   STUB_TMUX_SESSION_ID,
   STUB_TMUX_SESSION_NAME,
   STUB_TMUX_SOCKET_PATH,
@@ -757,6 +760,36 @@ const PHASE1_BUILDS: ReadonlyArray<readonly [label: string, errorClass: AdErrorC
   ...CONFLICT_CASES.map((c) => [`errTmuxSessionConflict (${c})`, ErrTmuxSessionConflict, ERR_TMUX_SESSION_CONFLICT_NAME, 'read-pane', () => errTmuxSessionConflict('read-pane', c)] as const),
 ]
 
+/**
+ * One row per `ErrTmuxKillFailed` description, and one for the survivor
+ * description with the worker-and-survivor option, each with the default
+ * pids: the survivor pids its survivor clause names (none for the three
+ * descriptions without one) and whether it names the worker's pid. The forms
+ * are agent-director 0.11.0-rc.1's (commit `d787cb4`,
+ * `pkg/api/kill_errors.go`): the worker's pid is named in the
+ * `outlived-exit-wait` and `no-session-no-kill` descriptions and beside the
+ * survivor clause with the option, and is never a survivor.
+ */
+const KILL_FAILED_BUILDS: ReadonlyArray<
+  readonly [label: string, build: (sessionName: string) => AgentDirectorError, survivors: readonly number[], namesWorker: boolean]
+> = [
+  ...KILL_FAILED_DESCRIPTIONS.map(
+    (d) =>
+      [
+        d,
+        (sessionName: string) => errTmuxKillFailed(sessionName, d),
+        d === 'pane-process-survived' ? STUB_SURVIVOR_PIDS : [],
+        d === 'outlived-exit-wait' || d === 'no-session-no-kill',
+      ] as const,
+  ),
+  [
+    'pane-process-survived, worker also running',
+    (sessionName: string) => errTmuxKillFailed(sessionName, 'pane-process-survived', STUB_SURVIVOR_PIDS, { workerAlsoRunning: true }),
+    STUB_SURVIVOR_PIDS,
+    true,
+  ],
+]
+
 describe('stub builders: shape (SRJ-1303)', () => {
   test.each(PHASE1_BUILDS)(
     '%s builds an instance of its binding, with the name constant as errName, its verb and a description',
@@ -785,14 +818,15 @@ describe('stub builders: shape (SRJ-1303)', () => {
     }
   })
 
-  test.each([...KILL_FAILED_DESCRIPTIONS])(
-    'errTmuxKillFailed (%s) carries the quoted session name, verb kill, "retry kill later" and "never delete this row"',
-    (d) => {
-      const err = errTmuxKillFailed(OTHER_SESSION_NAME, d)
+  test.each(KILL_FAILED_BUILDS)(
+    'errTmuxKillFailed (%s) carries the quoted session name and verb kill, and ends "retry kill later", then "never delete this row"',
+    (_label, build) => {
+      const err = build(OTHER_SESSION_NAME)
       expect(err.verb).toBe('kill')
       expect(err.errDescription).toContain(JSON.stringify(OTHER_SESSION_NAME))
       expect(err.errDescription).toContain(RETRY_KILL_LATER_PHRASE)
-      expect(err.errDescription).toContain(NEVER_DELETE_ROW_PHRASE)
+      expect(err.errDescription.endsWith(NEVER_DELETE_ROW_PHRASE)).toBe(true)
+      expect(err.errDescription.lastIndexOf(RETRY_KILL_LATER_PHRASE)).toBeLessThan(err.errDescription.lastIndexOf(NEVER_DELETE_ROW_PHRASE))
     },
   )
 
@@ -802,26 +836,54 @@ describe('stub builders: shape (SRJ-1303)', () => {
     expect(new Set(texts).size).toBe(KILL_FAILED_DESCRIPTIONS.length)
   })
 
-  test.each(KILL_FAILED_DESCRIPTIONS.map((d) => [d, d === 'pane-process-survived'] as const))(
-    'SURVIVOR_PID_PATTERN on the errTmuxKillFailed (%s) description matches: %p',
-    (d, matches) => {
-      expect(SURVIVOR_PID_PATTERN.test(errTmuxKillFailed(STUB_TMUX_SESSION_NAME, d).errDescription)).toBe(matches)
+  test.each(KILL_FAILED_BUILDS)(
+    'errTmuxKillFailed (%s): SURVIVOR_PID_PATTERN matches only a survivor clause, survivorPids reads its pids, and the worker\'s pid is never among them',
+    (_label, build, survivors, namesWorker) => {
+      const { errDescription } = build(STUB_TMUX_SESSION_NAME)
+      expect(STUB_SURVIVOR_PIDS).not.toContain(STUB_WORKER_PID)
+      expect(SURVIVOR_PID_PATTERN.test(errDescription)).toBe(survivors.length > 0)
+      expect(survivorPids(errDescription)).toEqual([...survivors])
+      expect(errDescription.includes(String(STUB_WORKER_PID))).toBe(namesWorker)
+      expect(survivorPids(errDescription)).not.toContain(STUB_WORKER_PID)
     },
   )
 
-  test.each([
-    ['the default pid', undefined, STUB_SURVIVOR_PIDS],
-    ['one pid', [4194401], [4194401]],
-    ['two pids, in the order given', [4194403, 4194402], [4194403, 4194402]],
-  ] as const)('the survivor description built with %s names each pid once, in order', (_label, pids, expected) => {
-    const description = errTmuxKillFailed(STUB_TMUX_SESSION_NAME, 'pane-process-survived', pids).errDescription
-    expect(survivorPids(description)).toEqual([...expected])
-  })
+  test.each(
+    (
+      [
+        ['one pid', [4194401], SURVIVOR_CLAUSE_ONE_PHRASE, SURVIVOR_CLAUSE_MANY_PHRASE],
+        ['two pids, in the order given', [4194403, 4194402], SURVIVOR_CLAUSE_MANY_PHRASE, SURVIVOR_CLAUSE_ONE_PHRASE],
+        ['three pids, in the order given', [4194404, 4194401, 4194403], SURVIVOR_CLAUSE_MANY_PHRASE, SURVIVOR_CLAUSE_ONE_PHRASE],
+      ] as const
+    ).flatMap(([label, pids, clause, otherClause]) => [false, true].map((workerAlsoRunning) => [label, workerAlsoRunning, pids, clause, otherClause] as const)),
+  )(
+    'the survivor description built with %s (worker also running: %p) carries its clause\'s words and names each pid once, in order, never the worker\'s',
+    (_label, workerAlsoRunning, pids, clause, otherClause) => {
+      const { errDescription } = errTmuxKillFailed(STUB_TMUX_SESSION_NAME, 'pane-process-survived', pids, { workerAlsoRunning })
+      expect(errDescription).toContain(clause)
+      expect(errDescription).not.toContain(otherClause)
+      expect(SURVIVOR_PID_PATTERN.test(errDescription)).toBe(true)
+      expect(survivorPids(errDescription)).toEqual([...pids])
+      expect(errDescription.includes(String(STUB_WORKER_PID))).toBe(workerAlsoRunning)
+      expect(survivorPids(errDescription)).not.toContain(STUB_WORKER_PID)
+    },
+  )
 
   test.each(KILL_FAILED_DESCRIPTIONS.filter((d) => d !== 'pane-process-survived'))(
     'errTmuxKillFailed (%s) ignores the pids it is given and names none',
     (d) => {
       expect(survivorPids(errTmuxKillFailed(STUB_TMUX_SESSION_NAME, d, [4194401, 4194402]).errDescription)).toEqual([])
+    },
+  )
+
+  test('errTmuxKillFailed (pane-process-survived) given no pids throws', () => {
+    expect(() => errTmuxKillFailed(STUB_TMUX_SESSION_NAME, 'pane-process-survived', [])).toThrow('one or more pids')
+  })
+
+  test.each(KILL_FAILED_DESCRIPTIONS.filter((d) => d !== 'pane-process-survived'))(
+    'errTmuxKillFailed (%s) with the worker-and-survivor option throws',
+    (d) => {
+      expect(() => errTmuxKillFailed(STUB_TMUX_SESSION_NAME, d, STUB_SURVIVOR_PIDS, { workerAlsoRunning: true })).toThrow('workerAlsoRunning')
     },
   )
 
@@ -956,31 +1018,48 @@ describe('stub builders: shape (SRJ-1303)', () => {
 // The survivor-naming form
 // ---------------------------------------------------------------------------
 
+/**
+ * The survivor clause's forms are agent-director 0.11.0-rc.1's (commit
+ * `d787cb4`, `pkg/api/kill_errors.go`): one survivor named after
+ * `SURVIVOR_CLAUSE_ONE_PHRASE`, two or more after
+ * `SURVIVOR_CLAUSE_MANY_PHRASE`. Every description is built by the stub's
+ * `errTmuxKillFailed`; a clause whose words and pid form disagree is a stub
+ * description with the other clause's words swapped in.
+ */
 describe('SURVIVOR_PID_PATTERN and survivorPids (b.jg5 SRJ-702)', () => {
+  const oneSurvivor = errTmuxKillFailed(STUB_TMUX_SESSION_NAME, 'pane-process-survived', [4194401]).errDescription
+  const twoSurvivors = errTmuxKillFailed(STUB_TMUX_SESSION_NAME, 'pane-process-survived', [4194403, 4194402]).errDescription
+
   test('SURVIVOR_PID_PATTERN has no flags, so .test() keeps no state between calls', () => {
     expect(SURVIVOR_PID_PATTERN.flags).toBe('')
   })
 
-  test('two .test() calls in a row on "pid 4242" both match', () => {
-    expect(SURVIVOR_PID_PATTERN.test('pid 4242')).toBe(true)
-    expect(SURVIVOR_PID_PATTERN.test('pid 4242')).toBe(true)
+  test.each([
+    ['one survivor', oneSurvivor],
+    ['two survivors', twoSurvivors],
+  ])('two .test() calls in a row on the %s description both match', (_label, description) => {
+    expect(SURVIVOR_PID_PATTERN.test(description)).toBe(true)
+    expect(SURVIVOR_PID_PATTERN.test(description)).toBe(true)
   })
 
-  test.each(['pids 12', 'rapid 12', 'pid', 'pid x', 'a kill was sent'])(
-    'SURVIVOR_PID_PATTERN does not match %p',
-    (text) => {
-      expect(SURVIVOR_PID_PATTERN.test(text)).toBe(false)
-    },
-  )
-
-  test('survivorPids lists every named pid in order, the same on two calls in a row', () => {
-    const description = 'the kill left survivors: pid 11, pid 22 still run'
-    expect(survivorPids(description)).toEqual([11, 22])
-    expect(survivorPids(description)).toEqual([11, 22])
+  test.each([
+    ['rapid 12', 'rapid 12'],
+    ['pid', 'pid'],
+    ['pid x', 'pid x'],
+    ['a kill was sent', 'a kill was sent'],
+    ['a bare pid with no clause words', `pid ${STUB_WORKER_PID}`],
+    ['the one-survivor words with no pid', SURVIVOR_CLAUSE_ONE_PHRASE],
+    ['the several-survivors words with no pids', SURVIVOR_CLAUSE_MANY_PHRASE],
+    ['the one-survivor words before a list of pids', twoSurvivors.replace(SURVIVOR_CLAUSE_MANY_PHRASE, SURVIVOR_CLAUSE_ONE_PHRASE)],
+    ['the several-survivors words before a single pid', oneSurvivor.replace(SURVIVOR_CLAUSE_ONE_PHRASE, SURVIVOR_CLAUSE_MANY_PHRASE)],
+  ])('SURVIVOR_PID_PATTERN does not match %s, and survivorPids reads none from it', (_label, text) => {
+    expect(SURVIVOR_PID_PATTERN.test(text)).toBe(false)
+    expect(survivorPids(text)).toEqual([])
   })
 
-  test('survivorPids is empty when no pid is named in the form', () => {
-    expect(survivorPids('rapid 12; pids 13')).toEqual([])
+  test('survivorPids lists every pid of the several-survivors clause in order, the same on two calls in a row', () => {
+    expect(survivorPids(twoSurvivors)).toEqual([4194403, 4194402])
+    expect(survivorPids(twoSurvivors)).toEqual([4194403, 4194402])
   })
 })
 

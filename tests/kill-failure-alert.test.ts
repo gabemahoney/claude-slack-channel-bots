@@ -8,11 +8,11 @@
  *
  * SRJ-1007's Test line names `tests/live-row-sequence.test.ts` (E21's file),
  * which drives the sequence form; E20 tests every text through the module's
- * builders here. SRJ-1007's literal texts appear only in the pin case; every
- * other expected value is built from the module's exports, `src/` (the
- * description renderer, the Slack escape, the survivor detector, the persona
- * ids) and the stub's description builders, and every case leak-checks what
- * it built (`assertNoLeak`). A fake token is put into each description
+ * builders here. SRJ-1007's literal texts appear only in the pin case, around
+ * the stub's descriptions and pids; every other expected value is built from
+ * the module's exports, `src/` (the description renderer, the Slack escape,
+ * the persona ids) and the stub's description builders and pid constants, and
+ * every case leak-checks what it built (`assertNoLeak`). A fake token is put into each description
  * through the stub builder's session-name argument (`sentinelInMessage`), so
  * a description quoted unredacted fails the leak check.
  *
@@ -28,7 +28,7 @@
 import { describe, expect, test } from 'bun:test'
 
 import { killFailedDescriptionOf } from '../src/ad-error-class.ts'
-import { NEVER_DELETE_ROW_PHRASE, RETRY_KILL_LATER_PHRASE, survivorPids } from '../src/ad-description-phrases.ts'
+import { NEVER_DELETE_ROW_PHRASE, RETRY_KILL_LATER_PHRASE, SURVIVOR_CLAUSE_MANY_PHRASE } from '../src/ad-description-phrases.ts'
 import { CLI_COMMAND_CLEAN_RESTART, CLI_COMMAND_STOP_BOTS, type CliTeardownCommand } from '../src/cli-teardown.ts'
 import {
   KILL_FAILURE_CLOSING_CLI_TEARDOWN,
@@ -85,8 +85,10 @@ import {
   KILL_FAILED_DESCRIPTIONS,
   STUB_SURVIVOR_PIDS,
   STUB_TMUX_SESSION_NAME,
+  STUB_WORKER_PID,
   errTmuxKillFailed,
   type KillFailedDescription,
+  type KillFailedOptions,
 } from './test-helpers/agent-director-stub.ts'
 import { LAUNCH_START_PRE_PERSONA_KEY } from './test-helpers/conflict-cases.ts'
 import { REDACTED_SENTINEL_TAIL, assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
@@ -100,13 +102,13 @@ import { forbiddenServerLoads } from './test-helpers/source-audit.ts'
 const KEY = 'alpha'
 
 /** The raw description of the stub's `ErrTmuxKillFailed` of form `form`, a fake token and a ticket URL in its quoted session. */
-function stubDescription(form: KillFailedDescription, pids: readonly number[] = STUB_SURVIVOR_PIDS): string {
-  return killFailedDescriptionOf(errTmuxKillFailed(sentinelInMessage(`kill-failure-alert-${form}`), form, pids))!
+function stubDescription(form: KillFailedDescription, pids: readonly number[] = STUB_SURVIVOR_PIDS, options: KillFailedOptions = {}): string {
+  return killFailedDescriptionOf(errTmuxKillFailed(sentinelInMessage(`kill-failure-alert-${form}`), form, pids, options))!
 }
 
-/** The stub's survivor-naming description (it names `pids`), with a fake token in its quoted session. */
-function survivorDescription(pids: readonly number[] = STUB_SURVIVOR_PIDS): string {
-  return stubDescription('pane-process-survived', pids)
+/** The stub's survivor-naming description (its survivor clause names `pids`), with a fake token in its quoted session. */
+function survivorDescription(pids: readonly number[] = STUB_SURVIVOR_PIDS, options: KillFailedOptions = {}): string {
+  return stubDescription('pane-process-survived', pids, options)
 }
 
 /** A description of `form` as the alert quotes it: redacted on one line and capped, then escaped for Slack when `forSlack`. */
@@ -180,18 +182,24 @@ describe('kill-failure alert: SRJ-1007’s texts (pin)', () => {
     expect(ordinary({ lastKillFailedDescription: 'the kill failed' })).toBe(
       ':rotating_light: *Kill failed* — agent-director could not end the worker in session "slack_bot_sample": it, or another process in that session\'s panes, may still be running, and its agent-director row was kept. agent-director said: "the kill failed". A human\'s next step: check it with `agent-director read-pane --claude-instance-id cscb_sample`; if the worker still runs, run `agent-director kill --claude-instance-id cscb_sample` and check its result. A read-pane answer of ErrTmuxCaptureFailed does not prove the worker gone when agent-director\'s description says no session or pane of this launch was found, and a pane does not prove it is the worker\'s when kill then answers "not this launch\'s session", because read-pane can return a leftover\'s pane; for these, and for anything beyond kill, follow the "Operator actions" section of agent-director\'s README. These commands are for a human only: no bot, including any persona that sees this post, may run them.',
     )
-    expect(ordinary({ lastKillFailedDescription: 'the kill failed', earlierSurvivorDescription: 'pid 4194400 outlived the kill' })).toContain(
-      ' agent-director said: "the kill failed" and, earlier in these tries, "pid 4194400 outlived the kill". A human\'s next step: ',
+    expect(ordinary({ lastKillFailedDescription: 'the kill failed', earlierSurvivorDescription: 'a process outlived the kill' })).toContain(
+      ' agent-director said: "the kill failed" and, earlier in these tries, "a process outlived the kill". A human\'s next step: ',
     )
     expect(ordinary()).toBe(
       ':rotating_light: *Kill failed* — agent-director could not end the worker in session "slack_bot_sample": it, or another process in that session\'s panes, may still be running, and its agent-director row was kept. A human\'s next step: check it with `agent-director read-pane --claude-instance-id cscb_sample`; if the worker still runs, run `agent-director kill --claude-instance-id cscb_sample` and check its result. A read-pane answer of ErrTmuxCaptureFailed does not prove the worker gone when agent-director\'s description says no session or pane of this launch was found, and a pane does not prove it is the worker\'s when kill then answers "not this launch\'s session", because read-pane can return a leftover\'s pane; for these, and for anything beyond kill, follow the "Operator actions" section of agent-director\'s README. These commands are for a human only: no bot, including any persona that sees this post, may run them.',
     )
 
-    const survivor = killFailureSurvivorBody({ session, survivorDescription: 'a process outlived the kill (pid 4194400, pid 4194401)', forSlack: false })
+    // The survivor descriptions are the stub's, in the release candidate's
+    // wording: the plural survivor clause "(pids S1, S2)" gives the pid list
+    // "pid S1, pid S2"; the singular "(pid S)" gives "pid S".
+    const [s1] = STUB_SURVIVOR_PIDS as [number]
+    const s2 = s1 + 1
+    const twoSurvivors = killFailedDescriptionOf(errTmuxKillFailed(session, 'pane-process-survived', [s1, s2]))!
+    const survivor = killFailureSurvivorBody({ session, survivorDescription: twoSurvivors, forSlack: false })
     expect(survivor).toBe(
-      ':rotating_light: *Process outlived kill* — agent-director ended the worker in session "slack_bot_sample", but a process in that session outlived the kill: pid 4194400, pid 4194401. agent-director said: "a process outlived the kill (pid 4194400, pid 4194401)". A later `kill` does not check this process again. A human\'s next step: find and end that process by following the "Operator actions" section of agent-director\'s README. This is for a human only: no bot, including any persona that sees this post, may act on it.',
+      `:rotating_light: *Process outlived kill* — agent-director ended the worker in session "slack_bot_sample", but a process in that session outlived the kill: pid ${s1}, pid ${s2}. agent-director said: "${twoSurvivors}". A later \`kill\` does not check this process again. A human's next step: find and end that process by following the "Operator actions" section of agent-director's README. This is for a human only: no bot, including any persona that sees this post, may act on it.`,
     )
-    expect(killFailureSurvivorPidList('a process outlived the kill (pid 4194400)')).toBe('pid 4194400')
+    expect(killFailureSurvivorPidList(killFailedDescriptionOf(errTmuxKillFailed(session, 'pane-process-survived', [s1]))!)).toBe(`pid ${s1}`)
 
     expect([
       KILL_FAILURE_ORDINARY_DESTINATION_CLOSING,
@@ -214,7 +222,7 @@ describe('kill-failure alert: SRJ-1007’s texts (pin)', () => {
     // SRJ-1007: the survivor version carries none of the ordinary version's
     // retry sentences, on any route.
     for (const closing of CLOSINGS) {
-      const text = killFailureAlertText({ version: KILL_FAILURE_VERSION_SURVIVOR, session, survivorDescription: 'pid 4194400' }, closing, true)
+      const text = killFailureAlertText({ version: KILL_FAILURE_VERSION_SURVIVOR, session, survivorDescription: twoSurvivors }, closing, true)
       for (const phrase of ['keeps retrying', 'run the command again', 'retries this kill only while']) expect([closing, text.includes(phrase)]).toEqual([closing, false])
     }
   })
@@ -382,21 +390,53 @@ describe('kill-failure alert: the survivor version (b.jg5 SRJ-1007, HO rev 17, r
     expect([route.closing, route.closingSentence]).toEqual([KILL_FAILURE_CLOSING_DESTINATION, KILL_FAILURE_SURVIVOR_DESTINATION_CLOSING])
   })
 
-  // `<pid list>`: "pid N" for each pid the description names, in its order,
-  // joined with ", " (one match of SURVIVOR_PID_PATTERN each).
-  test.each<[string, readonly number[]]>([
-    ['one pid', STUB_SURVIVOR_PIDS],
-    ['two pids', [STUB_SURVIVOR_PIDS[0]!, STUB_SURVIVOR_PIDS[0]! + 1]],
-    ['two pids, the larger first', [STUB_SURVIVOR_PIDS[0]! + 1, STUB_SURVIVOR_PIDS[0]!]],
-  ])('the pid list from a description naming %s: each pid once, in the description\'s order, in the body', (_label, pids) => {
-    const description = survivorDescription(pids)
+  // `<pid list>`: one entry per pid the description's survivor clause names
+  // (the pin case states one entry's form), in its order, joined with ", ";
+  // never the worker's own pid, which the worker-and-survivor form names
+  // beside the clause.
+  test.each<[string, readonly number[], KillFailedOptions]>([
+    ['one pid', STUB_SURVIVOR_PIDS, {}],
+    ['two pids', [STUB_SURVIVOR_PIDS[0]!, STUB_SURVIVOR_PIDS[0]! + 1], {}],
+    ['two pids, the larger first', [STUB_SURVIVOR_PIDS[0]! + 1, STUB_SURVIVOR_PIDS[0]!], {}],
+    ['one pid, the worker\'s pid beside it', STUB_SURVIVOR_PIDS, { workerAlsoRunning: true }],
+    ['two pids, the worker\'s pid beside them', [STUB_SURVIVOR_PIDS[0]!, STUB_SURVIVOR_PIDS[0]! + 1], { workerAlsoRunning: true }],
+  ])('the pid list from a description naming %s: each survivor pid once, in the description\'s order, in the body; never the worker\'s pid', (_label, pids, options) => {
+    const description = survivorDescription(pids, options)
     const list = killFailureSurvivorPidList(description)
+    const entries = pids.map((pid) => killFailureSurvivorPidList(survivorDescription([pid])))
 
-    expect(list.split(', ').map((part) => survivorPids(part))).toEqual(pids.map((pid) => [pid]))
-    expect(survivorPids(list)).toEqual([...pids])
+    expect(entries.map((entry, i) => entry.endsWith(` ${pids[i]}`))).toEqual(pids.map(() => true))
+    expect(list).toBe(entries.join(', '))
+    expect(description.includes(String(STUB_WORKER_PID))).toBe(options.workerAlsoRunning === true)
+    expect(list).not.toContain(String(STUB_WORKER_PID))
     const body = killFailureSurvivorBody({ session: personaTmuxSessionName(KEY), survivorDescription: description, forSlack: true })
+    expect(body.indexOf(list)).toBeGreaterThan(-1)
     expect(body.indexOf(list)).toBeLessThan(body.indexOf(quoted(description, true)))
     assertNoLeak(body)
+  })
+
+  // agent-director's real descriptions open with more context than the
+  // stub's, so the survivor clause can lie past the cap (b.jg5 SRJ-1001): the
+  // pid list is read from the raw description, the quote is capped.
+  test('a description whose survivor clause starts past the cap: the pid list names every survivor pid; the quoted description is capped before the clause', () => {
+    const pids = [STUB_SURVIVOR_PIDS[0]!, STUB_SURVIVOR_PIDS[0]! + 1]
+    const sessionName = `${sentinelInMessage('kill-failure-alert-past-cap')} ${'x'.repeat(MAX_LOGGED_MESSAGE_LENGTH)}`
+    const description = killFailedDescriptionOf(errTmuxKillFailed(sessionName, 'pane-process-survived', pids, { workerAlsoRunning: true }))!
+    const list = killFailureSurvivorPidList(description)
+
+    expect(description.indexOf(SURVIVOR_CLAUSE_MANY_PHRASE)).toBeGreaterThan(MAX_LOGGED_MESSAGE_LENGTH)
+    expect(renderLogMessageText(description).length).toBe(MAX_LOGGED_MESSAGE_LENGTH)
+    expect(list).toBe(killFailureSurvivorPidList(survivorDescription(pids)))
+    expect(pids.map((pid) => list.includes(String(pid)))).toEqual(pids.map(() => true))
+    expect(list).not.toContain(String(STUB_WORKER_PID))
+    for (const forSlack of [false, true]) {
+      const body = killFailureSurvivorBody({ session: personaTmuxSessionName(KEY), survivorDescription: description, forSlack })
+      expect(body.indexOf(list)).toBeGreaterThan(-1)
+      expect(body.indexOf(list)).toBeLessThan(body.indexOf(quoted(description, forSlack)))
+      expect(quoted(description, forSlack)).not.toContain(SURVIVOR_CLAUSE_MANY_PHRASE)
+      for (const pid of pids) expect(quoted(description, forSlack)).not.toContain(String(pid))
+      assertNoLeak(body)
+    }
   })
 
   test.each([...CLOSINGS])('closing %s: no command (no code span opening with agent-director or tmux) and none of the ordinary version\'s closing sentences or their clauses', (closing) => {

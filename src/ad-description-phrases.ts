@@ -35,8 +35,9 @@
  *
  * Besides words, this module holds one pattern and its one helper: the
  * survivor-naming form of a kill failure (`SURVIVOR_PID_PATTERN`, b.jg5
- * SRJ-702, SRJ-1303) and `survivorPids`, which lists the pids a description
- * names in that form. No other module defines the form.
+ * SRJ-702, SRJ-1303), built from the survivor clause's words, and
+ * `survivorPids`, which lists the pids a description's survivor clause names.
+ * No other module defines the form.
  *
  * It defines no order in which the CONFLICT case words are checked; that
  * order (b.jg5 SRJ-507) belongs to the code that resolves a CONFLICT case, and
@@ -128,22 +129,57 @@ export const RETRY_KILL_LATER_PHRASE = 'retry kill later'
 export const NEVER_DELETE_ROW_PHRASE = 'never delete this row'
 
 /**
- * The survivor-naming form (b.jg5 SRJ-702, SRJ-1303): the word "pid", a
- * space, then a number. An `ErrTmuxKillFailed` description that matches names
- * a process of the labelled session's panes that outlived the kill. It has no
- * `g` flag, so `.test()` keeps no state between calls. The form is a working
- * default, to be checked against the release candidate's kill-failure
- * descriptions.
+ * The survivor clause's words for one survivor (b.jg5 SRJ-702, SRJ-1303),
+ * written by `kill` before "(pid S)".
  */
-export const SURVIVOR_PID_PATTERN = /\bpid (\d+)/
+export const SURVIVOR_CLAUSE_ONE_PHRASE = 'another process of a pane of the labelled session'
 
 /**
- * Every pid `description` names in the survivor-naming form, in the order it
- * names them; empty when it names none.
+ * The survivor clause's words for two or more survivors (b.jg5 SRJ-702,
+ * SRJ-1303), written by `kill` before "(pids S1, S2)".
+ */
+export const SURVIVOR_CLAUSE_MANY_PHRASE = 'other processes of panes of the labelled session'
+
+/**
+ * The survivor-naming form (b.jg5 SRJ-702, SRJ-1303, SRJ-1007): the survivor
+ * clause of an `ErrTmuxKillFailed` description, which names the processes of
+ * the labelled session's panes that outlived the kill exit wait. Checked
+ * against agent-director 0.11.0-rc.1 (commit `d787cb4`,
+ * `pkg/api/kill_errors.go`, `waitExpiredError` and `noPaneError`; pinned by
+ * `pkg/api/apitest/descriptions_kill.go`):
+ *   - one survivor: "another process of a pane of the labelled session
+ *     (pid S)" ({@link SURVIVOR_CLAUSE_ONE_PHRASE});
+ *   - several: "other processes of panes of the labelled session
+ *     (pids S1, S2)" ({@link SURVIVOR_CLAUSE_MANY_PHRASE}), the pids joined
+ *     with ", ".
+ * The worker's own pid is written as "the agent process (pid N)" after the
+ * kill exit wait (joined with " and " to the survivor clause when both
+ * outlived it) and as "while its agent process still runs (pid N)" when no
+ * session or pane of the launch was found. Neither carries the clause's
+ * words, so the pattern never matches the worker's pid. Group 1 holds the
+ * one survivor's pid, group 2 the several survivors' list.
+ *
+ * Reading the pids from the description is interim: a description is text
+ * for humans, agent-director's structured `survivor_pids` is on the
+ * `ad.kill.called` trail, and CSCB has asked agent-director for the survivor
+ * pids on the error itself (SRJ-702).
+ *
+ * It has no `g` flag, so `.test()` keeps no state between calls.
+ */
+export const SURVIVOR_PID_PATTERN = new RegExp(
+  `\\b${SURVIVOR_CLAUSE_ONE_PHRASE} \\(pid (\\d+)\\)|\\b${SURVIVOR_CLAUSE_MANY_PHRASE} \\(pids (\\d+(?:, \\d+)*)\\)`,
+)
+
+/**
+ * Every pid `description`'s survivor clause names, in the order it names
+ * them; empty when it carries no survivor clause. Never the worker's pid.
  */
 export function survivorPids(description: string): number[] {
   const everyMatch = new RegExp(SURVIVOR_PID_PATTERN.source, 'g')
-  return Array.from(description.matchAll(everyMatch), (match) => Number(match[1]))
+  return Array.from(description.matchAll(everyMatch)).flatMap((match) => {
+    const named = match[1] ?? match[2]
+    return named === undefined ? [] : named.split(', ').map(Number)
+  })
 }
 
 // ---------------------------------------------------------------------------

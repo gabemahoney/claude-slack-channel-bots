@@ -246,6 +246,8 @@ import {
   RETRY_KILL_LATER_PHRASE,
   STILL_STARTING_PHRASE,
   STILL_STOPPING_PHRASE,
+  SURVIVOR_CLAUSE_MANY_PHRASE,
+  SURVIVOR_CLAUSE_ONE_PHRASE,
   UNUSABLE_RECORDED_NAME_PHRASE,
   survivorPids,
 } from '../../src/ad-description-phrases.ts'
@@ -889,16 +891,25 @@ export function errTmuxUnresponsiveNewRowEnded(
 }
 
 /**
- * The four `ErrTmuxKillFailed` descriptions:
- *   - `'outlived-exit-wait'`: a kill was sent and the agent process outlived
- *     the kill exit wait;
- *   - `'pane-process-survived'`: a kill was sent and another process of the
- *     labelled session's panes outlived it, each such process named as
- *     `pid <n>` (the survivor-naming form `SURVIVOR_PID_PATTERN` matches);
- *   - `'unverifiable-session-present'`: a kill was sent, the process cannot be
- *     checked and the labelled session is still there;
- *   - `'no-session-no-kill'`: no session or pane of this launch was found
- *     while the process runs, and no kill was sent.
+ * The four `ErrTmuxKillFailed` descriptions, in agent-director 0.11.0-rc.1's
+ * wording (`pkg/api/kill_errors.go`):
+ *   - `'outlived-exit-wait'`: variant (a), worker only: a kill was sent and
+ *     "the agent process (pid N)" was still running after the kill exit wait
+ *     of 5 s, N being {@link STUB_WORKER_PID};
+ *   - `'pane-process-survived'`: variant (a) with survivors: a kill was sent
+ *     and the survivor clause (the form `SURVIVOR_PID_PATTERN` matches),
+ *     "another process of a pane of the labelled session (pid S)" for one pid
+ *     or "other processes of panes of the labelled session (pids S1, S2)" for
+ *     several, was/were still running after the kill exit wait of 5 s; with
+ *     the worker-and-survivor option ({@link KillFailedOptions}) the worker's
+ *     clause comes first, joined with " and ", and "were still running";
+ *   - `'unverifiable-session-present'`: variant (b): a kill was sent, but the
+ *     agent process cannot be checked and its labelled session is still
+ *     there;
+ *   - `'no-session-no-kill'`: variant (c): no session or pane of this launch
+ *     was found while its agent process still runs ("(pid N)", N being
+ *     {@link STUB_WORKER_PID}), so no kill was sent, and a human can find and
+ *     look at the process, with the "Operator actions" pointer.
  */
 export type KillFailedDescription =
   | 'outlived-exit-wait'
@@ -922,37 +933,72 @@ export const KILL_FAILED_DESCRIPTIONS: readonly KillFailedDescription[] = [
 export const STUB_SURVIVOR_PIDS: readonly number[] = [4194400]
 
 /**
+ * The worker's pid that `errTmuxKillFailed`'s `'outlived-exit-wait'` and
+ * `'no-session-no-kill'` descriptions name, and `'pane-process-survived'`
+ * names with the worker-and-survivor option: one fake pid, above Linux's
+ * largest pid (2^22), so it can never be a real process, and distinct from
+ * every pid of {@link STUB_SURVIVOR_PIDS}.
+ */
+export const STUB_WORKER_PID = 4194350
+
+/** Options of `errTmuxKillFailed`. */
+export interface KillFailedOptions {
+  /**
+   * With `'pane-process-survived'` only: name the worker's pid
+   * ({@link STUB_WORKER_PID}) beside the survivor clause, as agent-director
+   * does when the worker and the survivors both outlived the kill exit wait:
+   * "the agent process (pid N) and <survivor clause> were still running".
+   */
+  readonly workerAlsoRunning?: boolean
+}
+
+/**
  * Build an `ErrTmuxKillFailed` (the class binding of
  * `src/agent-director-errors.ts`; verb `kill`) with one of its four
- * descriptions, each carrying the quoted session name, "retry kill later" and
- * "never delete this row". Only `'pane-process-survived'` names a pid: each of
- * `pids` (one or more) as `pid <n>`, joined with ", "; the other three ignore
- * `pids` and name none. The builder checks its own text with `survivorPids`
- * and throws when the pids it names are not exactly `pids` (none for the
- * other three).
+ * descriptions ({@link KillFailedDescription}), each starting at the quoted
+ * session name and ending "retry kill later; never delete this row". Only
+ * `'pane-process-survived'` carries the survivor clause, built from
+ * `SURVIVOR_CLAUSE_ONE_PHRASE` for one of `pids` and
+ * `SURVIVOR_CLAUSE_MANY_PHRASE` for several; the other three ignore `pids`.
+ * The builder checks its own text with `survivorPids` and throws when the
+ * pids it reads are not exactly `pids` for the survivor description (with or
+ * without `workerAlsoRunning`) or not none for the other three. It throws when
+ * the survivor description is given no pids, and when `workerAlsoRunning` is
+ * given with another description.
  */
 export function errTmuxKillFailed(
   sessionName: string = STUB_TMUX_SESSION_NAME,
   description: KillFailedDescription = 'outlived-exit-wait',
   pids: readonly number[] = STUB_SURVIVOR_PIDS,
+  options: KillFailedOptions = {},
 ): AgentDirectorError {
-  const quoted = JSON.stringify(sessionName)
-  const tail = `${RETRY_KILL_LATER_PHRASE}; ${NEVER_DELETE_ROW_PHRASE}`
-  const named = pids.map((pid) => `pid ${pid}`).join(', ')
-  const text: Record<KillFailedDescription, string> = {
-    'outlived-exit-wait':
-      `a kill was sent to tmux session ${quoted} and the agent process outlived the kill exit wait (5 s); the row stays live and nothing was marked; ${tail}`,
-    'pane-process-survived':
-      `a kill was sent to tmux session ${quoted} and the agent process exited, but another process of the labelled session's panes outlived it (${named}); the row stays live; ${tail}`,
-    'unverifiable-session-present':
-      `a kill was sent to tmux session ${quoted}; the agent process cannot be checked and the labelled session is still there; the row stays live; ${tail}`,
-    'no-session-no-kill':
-      `no session or pane of this launch was found (tmux session ${quoted}) while the agent process runs; ${NO_KILL_SENT_PHRASE}; ${tail}`,
-  }
-  const expected = description === 'pane-process-survived' ? [...pids] : []
   if (description === 'pane-process-survived' && pids.length === 0) {
     throw new Error("errTmuxKillFailed: 'pane-process-survived' names one or more pids")
   }
+  if (options.workerAlsoRunning === true && description !== 'pane-process-survived') {
+    throw new Error(`errTmuxKillFailed (${description}): workerAlsoRunning applies to 'pane-process-survived' only`)
+  }
+  const context = `tmux session ${JSON.stringify(sessionName)}`
+  const sent = "a kill was sent to the agent's pane and to its labelled session"
+  const exitWait = 'still running after the kill exit wait of 5 s'
+  const tail = `${RETRY_KILL_LATER_PHRASE}; ${NEVER_DELETE_ROW_PHRASE}`
+  const worker = `the agent process (pid ${STUB_WORKER_PID})`
+  const survivors =
+    pids.length === 1
+      ? `${SURVIVOR_CLAUSE_ONE_PHRASE} (pid ${pids[0]})`
+      : `${SURVIVOR_CLAUSE_MANY_PHRASE} (pids ${pids.join(', ')})`
+  const running = options.workerAlsoRunning === true ? `${worker} and ${survivors}` : survivors
+  const verb = options.workerAlsoRunning === true || pids.length > 1 ? 'were' : 'was'
+  const text: Record<KillFailedDescription, string> = {
+    'outlived-exit-wait': `${context}: ${sent}, and ${worker} was ${exitWait}; ${tail}`,
+    'pane-process-survived': `${context}: ${sent}, and ${running} ${verb} ${exitWait}; ${tail}`,
+    'unverifiable-session-present':
+      `${context}: ${sent}, but the agent process cannot be checked and its labelled session is still there; ${tail}`,
+    'no-session-no-kill':
+      `${context}: no session or pane of this launch was found while its agent process still runs (pid ${STUB_WORKER_PID}), ` +
+      `so ${NO_KILL_SENT_PHRASE}; a human can find and look at the process, see "Operator actions" in the agent-director README; ${tail}`,
+  }
+  const expected = description === 'pane-process-survived' ? [...pids] : []
   if (JSON.stringify(survivorPids(text[description])) !== JSON.stringify(expected)) {
     throw new Error(`errTmuxKillFailed (${description}): the description does not name exactly the pids ${JSON.stringify(expected)}`)
   }
