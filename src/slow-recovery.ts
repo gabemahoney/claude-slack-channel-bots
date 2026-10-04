@@ -52,7 +52,8 @@
  * `ended` or `missing` or no row, a latch or a teardown ends it.
  *
  * Text (SRJ-1010; `<session>` the persona's quoted session name,
- * `"slack_bot_<key>"`, as the other notices render it): `slowRecoveryText`.
+ * `"slack_bot_<key>"`, from `quotedPersonaSessionName`, the rendering the
+ * other notices share): `slowRecoveryText`.
  *
  * Log lines, to the injected log, with the persona reference only (a
  * throwing log is swallowed):
@@ -82,7 +83,7 @@
 
 import { describeThrownValue } from './persona-connection-errors.ts'
 import { MUTED_BY_TEARDOWN, PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY, type PersonaEpisodes } from './persona-episodes.ts'
-import { personaTmuxSessionName } from './persona-identity.ts'
+import { quotedPersonaSessionName } from './persona-identity.ts'
 import {
   RESTART_SLOW_RECOVERY_OTHER_PENDING_PROBE,
   RESTART_SLOW_RECOVERY_OTHER_PENDING_REPROBE,
@@ -100,7 +101,7 @@ export const SLOW_RECOVERY_POST_THRESHOLD = 3
  */
 export function slowRecoveryText(key: string): string {
   return (
-    `:hourglass_flowing_sand: *Slow recovery* — agent-director has not yet marked the worker row of this persona's session "${personaTmuxSessionName(key)}" ended or missing. ` +
+    `:hourglass_flowing_sand: *Slow recovery* — agent-director has not yet marked the worker row of this persona's session ${quotedPersonaSessionName(key)} ended or missing. ` +
     'CSCB keeps retrying; no action is needed unless this persists.'
   )
 }

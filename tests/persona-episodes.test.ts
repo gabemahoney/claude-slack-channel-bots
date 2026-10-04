@@ -57,7 +57,13 @@
  * the sink only, any other key to the log-only route only (with the
  * `persona-unclassified-error` label on its line), a throwing lookup taking
  * the log-only route, a missing or throwing log-only route logged, and one
- * latch for both routes. Ends: `end` for each reason and `retryStopped` for
+ * latch for both routes; a key no longer applied whose teardown window is
+ * open takes the teardown route while a configured key beside it posts. The
+ * `ref` and `notConfiguredWording` hooks (SRJ-1007, the old-life wait's):
+ * absent, `persona=<key>` and `UNCLASSIFIED_NOT_CONFIGURED_WORDING`; given,
+ * every line names the hook's reference (a throwing hook the default) and the
+ * log-only and not-routed lines the hook's wording, the routes still keyed
+ * by the key. Ends: `end` for each reason and `retryStopped` for
  * `UNAVAILABLE_RETRY_STOP_RECOVERED`, `UNAVAILABLE_RETRY_STOP_ROW_LIVE`,
  * `UNAVAILABLE_RETRY_STOP_TMUX_UNAVAILABLE_CLEARED`,
  * `UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED` and
@@ -214,6 +220,7 @@ import {
   UNCLASSIFIED_ERROR_END_RECOVERED,
   UNCLASSIFIED_ERROR_END_ROW_GONE,
   UNCLASSIFIED_ERROR_END_ROW_LIVE,
+  UNCLASSIFIED_NOT_CONFIGURED_WORDING,
   createKillFailureAlerts,
   createPersonaEpisodes,
   createTmuxUnresponsiveCondition,
@@ -1987,9 +1994,14 @@ describe('the unclassified-error episodes (b.jg5 SRJ-313, SRJ-1009)', () => {
     })
   }
 
-  /** `persona=<key> unclassified-error <text>`. */
+  /** `<ref> unclassified-error <text>`: a line naming its key by `ref`. */
+  function refLine(ref: string, text: string): string {
+    return `[slack] persona-episodes: ${ref} ${KIND} ${text}`
+  }
+
+  /** `persona=<key> unclassified-error <text>`: the default reference. */
   function personaLine(key: string, text: string): string {
-    return `[slack] persona-episodes: persona=${key} ${KIND} ${text}`
+    return refLine(`persona=${key}`, text)
   }
 
   function startedLine(key: string, err: unknown): string {
@@ -2009,11 +2021,13 @@ describe('the unclassified-error episodes (b.jg5 SRJ-313, SRJ-1009)', () => {
     return personaLine(key, `alert posted to its destination — ${met(elapsedMs, thresholdMs, classification)}`)
   }
 
+  /** The log-only alert's line, naming why the key takes that route (`wording`; by default the episodes' not-configured wording), under `ref`. */
+  function logOnlyRefLine(ref: string, elapsedMs: number, thresholdMs: number, classification: AdErrorClassification, wording = UNCLASSIFIED_NOT_CONFIGURED_WORDING): string {
+    return refLine(ref, `alert written to the server log and startup-errors.log (${PERSONA_UNCLASSIFIED_ERROR_LABEL}) — ${wording}; ${met(elapsedMs, thresholdMs, classification)}`)
+  }
+
   function logOnlyLine(key: string, elapsedMs: number, thresholdMs: number, classification: AdErrorClassification): string {
-    return personaLine(
-      key,
-      `alert written to the server log and startup-errors.log (${PERSONA_UNCLASSIFIED_ERROR_LABEL}) — the persona is not in the applied configuration; ${met(elapsedMs, thresholdMs, classification)}`,
-    )
+    return logOnlyRefLine(`persona=${key}`, elapsedMs, thresholdMs, classification)
   }
 
   /** The alert as the sink receives it for `err`. */
@@ -2295,8 +2309,115 @@ describe('the unclassified-error episodes (b.jg5 SRJ-313, SRJ-1009)', () => {
     expect(u.report('K', errInternal())).toBe('continued')
 
     expect(posts).toEqual([])
-    expect(lines.filter((l) => l.startsWith(personaLine('K', 'alert not routed — ')))).toHaveLength(1)
+    expect(lines.filter((l) => l.startsWith(personaLine('K', `alert not routed — ${UNCLASSIFIED_NOT_CONFIGURED_WORDING} `)))).toHaveLength(1)
     expect(lines).toHaveLength(2)
+  })
+
+  // -------------------------------------------------------------------------
+  // The reference and not-configured wording hooks (b.jg5 SRJ-1007): the
+  // old-life wait's episodes, keyed by a held instance id, name it as
+  // `instanceId=<id>` and give their own reason for the log-only route.
+  // -------------------------------------------------------------------------
+
+  /** A reference hook's rendering, unlike the default's. */
+  const instanceRef = (key: string): string => `instanceId=${key}`
+  /** A wording of the episodes' own, unlike the default. */
+  const OWN_WORDING = 'the row is a test\'s own old life'
+
+  test('the hooks absent: every line names the key persona=<key>, and the log-only line gives the exported not-configured wording', async () => {
+    const u = buildUnclassified({ isConfigured: () => false })
+    const err = errInternal()
+
+    await untilAlert(u, 'K', err)
+    u.end('K', UNCLASSIFIED_ERROR_END_RECOVERED)
+
+    expect(lines).toEqual([
+      startedLine('K', errInternal()),
+      logOnlyRefLine('persona=K', DEFAULT_THRESHOLD_MS + 1, DEFAULT_THRESHOLD_MS, classifyAdError(err), UNCLASSIFIED_NOT_CONFIGURED_WORDING),
+      endedLine('K', UNCLASSIFIED_ERROR_END_RECOVERED),
+    ])
+  })
+
+  test('a ref hook names the key in every line (started, log-only alert, ended), asked with the key; the log-only route and the episode stay keyed by the key itself', async () => {
+    const asked: string[] = []
+    const u = buildUnclassified({
+      isConfigured: () => false,
+      ref: (key) => {
+        asked.push(key)
+        return instanceRef(key)
+      },
+    })
+    const err = errInternal()
+
+    await untilAlert(u, 'cscb_old', err)
+    expect(u.end('cscb_old', UNCLASSIFIED_ERROR_END_RECOVERED)).toBe(true)
+
+    expect(lines).toEqual([
+      refLine(instanceRef('cscb_old'), `started — ${describeAdErrorClassification(classifyAdError(errInternal()))}`),
+      logOnlyRefLine(instanceRef('cscb_old'), DEFAULT_THRESHOLD_MS + 1, DEFAULT_THRESHOLD_MS, classifyAdError(err)),
+      refLine(instanceRef('cscb_old'), `ended — ${UNCLASSIFIED_ERROR_END_RECOVERED}`),
+    ])
+    expect(lines.filter((line) => line.includes('persona=cscb_old'))).toEqual([])
+    expect(new Set(asked)).toEqual(new Set(['cscb_old']))
+    expect(logOnlyCalls).toEqual([{ key: 'cscb_old', text: unclassifiedErrorAlertText(classifyAdError(err), { escapeForSlack: false }) }])
+    expect(posts).toEqual([])
+  })
+
+  test('a ref hook on a configured key: the posted line names it by the hook, and the post is keyed by the key', async () => {
+    const u = buildUnclassified({ isConfigured: () => true, ref: instanceRef })
+    const err = errInternal()
+
+    await untilAlert(u, 'K', err)
+
+    expect(lines.at(-1)).toBe(refLine(instanceRef('K'), `alert posted to its destination — ${met(DEFAULT_THRESHOLD_MS + 1, DEFAULT_THRESHOLD_MS, classifyAdError(err))}`))
+    expect(posts).toEqual([alertPost('K', err)])
+  })
+
+  test('a ref hook that throws gives the default persona=<key> reference, and the episode goes on', async () => {
+    const u = buildUnclassified({
+      isConfigured: () => false,
+      ref: () => {
+        throw new Error(`ref refused (${sentinelInMessage('ref')})`)
+      },
+    })
+    const err = errInternal()
+
+    await untilAlert(u, 'K', err)
+
+    expect(lines).toEqual([startedLine('K', errInternal()), logOnlyLine('K', DEFAULT_THRESHOLD_MS + 1, DEFAULT_THRESHOLD_MS, classifyAdError(err))])
+    expect(logOnlyCalls).toHaveLength(1)
+    assertNoLeak({ lines })
+  })
+
+  test('a not-configured wording hook replaces the default in the log-only alert\'s line', async () => {
+    const u = buildUnclassified({ isConfigured: () => false, notConfiguredWording: OWN_WORDING })
+    const err = errInternal()
+
+    await untilAlert(u, 'K', err)
+
+    expect(lines.at(-1)).toBe(logOnlyRefLine('persona=K', DEFAULT_THRESHOLD_MS + 1, DEFAULT_THRESHOLD_MS, classifyAdError(err), OWN_WORDING))
+    expect(lines.filter((line) => line.includes(UNCLASSIFIED_NOT_CONFIGURED_WORDING))).toEqual([])
+    expect(logOnlyCalls).toHaveLength(1)
+  })
+
+  test('a not-configured wording hook replaces the default in the not-routed line too (no log-only route installed)', async () => {
+    const u = buildUnclassified({ isConfigured: () => false, logOnly: undefined, notConfiguredWording: OWN_WORDING })
+
+    await untilAlert(u)
+
+    expect(lines.filter((l) => l.startsWith(personaLine('K', `alert not routed — ${OWN_WORDING} `)))).toHaveLength(1)
+    expect(lines.filter((line) => line.includes(UNCLASSIFIED_NOT_CONFIGURED_WORDING))).toEqual([])
+    expect(posts).toEqual([])
+  })
+
+  test('both hooks, a configured key: the wording is never used (the alert is posted), the ref is', async () => {
+    const u = buildUnclassified({ isConfigured: () => true, ref: instanceRef, notConfiguredWording: OWN_WORDING })
+
+    await untilAlert(u)
+
+    expect(lines.filter((line) => line.includes(OWN_WORDING))).toEqual([])
+    expect(lines.every((line) => line.startsWith(refLine(instanceRef('K'), '')))).toBe(true)
+    expect(posts).toHaveLength(1)
   })
 
   test('the log-only route\'s written line is logged only after the route returns', async () => {
@@ -2413,6 +2534,23 @@ describe('the unclassified-error episodes (b.jg5 SRJ-313, SRJ-1009)', () => {
       expect(u.report('K', errInternal())).toBe('continued')
       expect(posts).toEqual([])
       expect(lines.filter((line) => line === mutedLine('K', KIND))).toHaveLength(1)
+    })
+
+    test('b.jg5 SRJ-1002: R no longer applied, its window open, takes the teardown route (one persona-teardown-notice line, never the log-only route), while K configured beside it with no window still posts escaped', async () => {
+      const u = buildUnclassified({ isConfigured: (key) => key === 'K' })
+      const err = errInternal(MENTIONING)
+      expect(u.report('R', errInternal())).toBe('begun')
+      teardownStates.set('R', 'open')
+      await clock.advance(DEFAULT_THRESHOLD_MS + 1)
+      expect(u.report('R', err)).toBe('alerted')
+
+      await untilAlert(u, 'K', err)
+
+      expect(posts).toEqual([{ key: 'R', text: unclassifiedErrorAlertText(classifyAdError(err), { escapeForSlack: false }) }, alertPost('K', err)])
+      expect(logOnlyCalls).toEqual([])
+      expect(lines.filter((line) => line.startsWith(personaLine('R', 'alert ')))).toEqual([teardownLine('R', DEFAULT_THRESHOLD_MS + 1, DEFAULT_THRESHOLD_MS, classifyAdError(err))])
+      expect(lines.filter((line) => line.startsWith(personaLine('K', 'alert ')))).toEqual([postedLine('K', DEFAULT_THRESHOLD_MS + 1, DEFAULT_THRESHOLD_MS, classifyAdError(err))])
+      expect(lines.filter((line) => line.includes(PERSONA_UNCLASSIFIED_ERROR_LABEL))).toEqual([])
     })
 
     test('control, no window open: a configured key\'s alert is posted escaped and one no longer applied writes persona-unclassified-error, while another persona\'s window is open', async () => {

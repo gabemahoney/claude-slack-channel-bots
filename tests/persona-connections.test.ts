@@ -179,6 +179,7 @@ import {
   describeLogMessage,
   describeSlackCallFailure,
   describeThrownValue,
+  describeThrownValueWithoutStack,
   isSafeIdentifier,
   slackPlatformReason,
 } from '../src/persona-connection-errors.ts'
@@ -4386,6 +4387,25 @@ describe('describeThrownValue: the message is kept, redacted, on one line and ca
     expect(describeThrownValue(message)).toBe(`string ${rendered}`)
     for (const empty of ['', '   ', undefined, null, 42, { message }]) expect(describeLogMessage(empty)).toBe('')
     assertNoLeak({ rendered })
+  })
+})
+
+// describeThrownValueWithoutStack (b.jg5 SRJ-1014): the same one-line
+// description with no stack frames, for a line naming an expected failure's
+// cause (the retry timer's armed line), so it carries no host path.
+describe('describeThrownValueWithoutStack: describeThrownValue\'s head and message, never a frame (b.jg5 SRJ-1014)', () => {
+  test.each<[string, () => unknown]>([
+    ['an Error with a code and a message holding a token and a URL', () => Object.assign(new TypeError(`bad (${sentinelInMessage('no-stack')})`), { code: 'EIO' })],
+    ['a plain Error with no message', () => new Error()],
+    ['a thrown string', () => `thrown (${sentinelInMessage('no-stack-string')})`],
+    ['null', () => null],
+  ])('%s: the parts describeThrownValue gives, with no frames and no file path', (_label, make) => {
+    const value = make()
+    const described = describeThrownValueWithoutStack(value)
+
+    expect(describedParts(described)).toEqual({ ...describedParts(describeThrownValue(value)), frames: '' })
+    expect(described).not.toContain(import.meta.dir)
+    assertNoLeak({ described })
   })
 })
 

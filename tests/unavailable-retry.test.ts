@@ -3,7 +3,14 @@
  * (b.jg5 SRJ-301 code line, SRJ-302, SRJ-303, SRJ-304, SRJ-305, SRJ-306), and
  * the retry's side of the `tmux-unresponsive` condition's end (SRJ-310).
  *
- * The schedule, the never-give-up rule, arming while armed, isolation,
+ * The timer's lines (b.jg5 SRJ-1014) compare with their exported builders
+ * (`unavailableRetryArmedLine`, `unavailableRetryRetryLine`,
+ * `unavailableRetryReArmedLine`, `unavailableRetryPromotedLine`,
+ * `unavailableRetryStoppedLine`, `unavailableRetryKeptLine`); a cause's
+ * error is described with no stack frame (`describeThrownValueWithoutStack`),
+ * so the arm and promoted lines carry no host path, and a part a case cannot
+ * rebuild (a failed action's description) is matched around
+ * (`builtAround`). The schedule, the never-give-up rule, arming while armed, isolation,
  * again-reasons and `close`, and the switch to pending-only mode, the last row
  * read and a condition that ends during a run, run on the bare controller
  * over `createFakeClock` with a scripted or held action; settings independence runs on `makeRecoveryHarness`
@@ -303,10 +310,11 @@ import {
   type OutageClass,
 } from '../src/outage-state.ts'
 import { _resetPollerState, stopPermissionPoller, type PollerDeps } from '../src/permission-poller.ts'
-import { MAX_LOGGED_MESSAGE_LENGTH } from '../src/persona-connection-errors.ts'
+import { MAX_LOGGED_MESSAGE_LENGTH, describeThrownValue, describeThrownValueWithoutStack } from '../src/persona-connection-errors.ts'
 import { personaInstanceId, personaTmuxSessionName, renderPersonaRef } from '../src/persona-identity.ts'
 import {
   PERSONA_UNCLASSIFIED_ERROR_LABEL,
+  personaUnclassifiedErrorEntryText,
   TMUX_UNRESPONSIVE_END_LATCHED,
   TMUX_UNRESPONSIVE_END_RETRY,
   TMUX_UNRESPONSIVE_END_TICK,
@@ -448,7 +456,14 @@ import {
   UNAVAILABLE_RETRY_STOP_TMUX_UNRESPONSIVE_ENDED,
   UNAVAILABLE_RETRY_STOP_TORN_DOWN,
   UNAVAILABLE_RETRY_TERMINAL_STOPS,
+  unavailableRetryArmedLine,
+  unavailableRetryNotArmedClosedLine,
   unavailableRetryCauseFor,
+  unavailableRetryKeptLine,
+  unavailableRetryPromotedLine,
+  unavailableRetryReArmedLine,
+  unavailableRetryRetryLine,
+  unavailableRetryStoppedLine,
   type UnavailableRetryAction,
   type UnavailableRetryCause,
   type UnavailableRetryCondition,
@@ -574,7 +589,7 @@ import { errInvalidFlags } from './test-helpers/agent-director-stub.ts'
 import type { FindMissingHold } from './test-helpers/agent-director-stub.ts'
 import { _resetHealthCheckState, _runHealthCheckTickForTest, initHealthCheck } from '../src/health-check.ts'
 import { LIVENESS_READING_DEAD } from '../src/liveness-reading.ts'
-import { restartRetrySkippedLine } from '../src/restart.ts'
+import { restartRetryCapSkippedLine, restartRetrySkippedLine } from '../src/restart.ts'
 import { OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1, OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL } from '../src/retired-keys.ts'
 import { personaRetryBlockCause } from '../src/session-manager.ts'
 import { RETRY_BLOCK_OLD_LIFE_WAIT, UNAVAILABLE_RETRY_AGAIN_OLD_LIFE_WAIT_IN_FLIGHT, UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD } from '../src/unavailable-retry.ts'
@@ -624,6 +639,24 @@ function refusalsToCeiling(): number {
   let n = 0
   while (waitMs(n) < UNAVAILABLE_RETRY_CEILING_S * 1000) n++
   return n
+}
+
+/**
+ * The lines `build` makes whatever it is given as its one open part (a
+ * thrown value's description, which carries its stack frames, or a cause's
+ * error a case cannot rebuild): a pattern of the builder's own text before
+ * and after that part, with anything in it.
+ */
+function builtAround(build: (hole: string) => string): RegExp {
+  const hole = '\u0000'
+  const [head, tail] = build(hole).split(hole) as [string, string]
+  const quote = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(`^${quote(head)}.*${quote(tail)}$`)
+}
+
+/** A cause's description in the timer's lines (`<kind>: <one-line error>`), its error described with no stack frame. */
+function causeDescription(kind: string, error: unknown): string {
+  return `${kind}: ${describeThrownValueWithoutStack(error)}`
 }
 
 /** A bare controller on its own fake clock, with its lines and the retries its action saw. */
@@ -881,6 +914,75 @@ describe('unavailable retry: the schedule', () => {
     controller.arm(KEY, UNAVAILABLE)
     expect(delays(clock)).toEqual([waitMs(0)])
     expect(controller.view(KEY)).toMatchObject({ phase: 'waiting', refusals: 0 })
+  })
+})
+
+describe('unavailable retry: its arm, retry, re-arm, mode and stop lines, each from its exported builder (SRJ-1014)', () => {
+  /** A host path only a stack frame would show. */
+  const HOST_PATH = '/srv/cscb-host-only/src/somewhere.ts'
+
+  /** An UNAVAILABLE refusal from the stub whose message carries a fake token and URL, with a stack frame naming `HOST_PATH`. */
+  function refusalWithStack(): Error {
+    const err = errTmuxUnresponsive('spawn', `tmux did not answer (${sentinelInMessage('cause')})`)
+    err.stack = `${err.name}: ${err.message}\n    at refuse (${HOST_PATH}:10:5)`
+    return err
+  }
+
+  test('full mode: the arm names its cause with the error on one line and no stack frame, so no host path; then each retry, its re-arm with the again-reason and next wait, and the stop with its reason', async () => {
+    const err = refusalWithStack()
+    // The stack frame is there to leave out: the full describer shows it.
+    expect(describeThrownValue(err)).toContain(HOST_PATH)
+    const answers: UnavailableRetryOutcome[] = [
+      { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT },
+      { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_RECOVERED },
+    ]
+    const { clock, controller, lines } = makeRig(() => answers.shift()!)
+
+    controller.arm(KEY, { kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, error: err })
+    await clock.advance(waitMs(0))
+    await controller.whenRunSettled(KEY)
+    await clock.advance(waitMs(1))
+    await controller.whenRunSettled(KEY)
+
+    const description = causeDescription(UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, err)
+    expect(lines).toEqual([
+      unavailableRetryArmedLine(KEY, false, description, waitMs(0)),
+      unavailableRetryRetryLine(KEY, 1, false),
+      unavailableRetryReArmedLine(KEY, 1, false, UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT, undefined, waitMs(1)),
+      unavailableRetryRetryLine(KEY, 2, false),
+      unavailableRetryStoppedLine(KEY, false, undefined, UNAVAILABLE_RETRY_STOP_RECOVERED),
+    ])
+    expect(lines[0]).toContain(REDACTED_SENTINEL_TAIL)
+    expect(lines.filter((line) => line.includes(HOST_PATH) || line.includes(' <- '))).toEqual([])
+    assertNoLeak(lines)
+  })
+
+  test('pending-only mode and its changes: the pending-only arm; a full-mode cause promotes it, its description with no stack frame; a retry whose launch succeeded re-arms naming the switch back; the pending-only retry and its stop name the mode and the row read', async () => {
+    const err = refusalWithStack()
+    const answers: UnavailableRetryOutcome[] = [
+      { kind: 'again', reason: UNAVAILABLE_RETRY_AGAIN_LAUNCHED, switchToPendingOnly: true },
+      { kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_ROW_LIVE, row: 'waiting' },
+    ]
+    const { clock, controller, lines } = makeRig(() => answers.shift()!)
+
+    controller.armPendingOnly(KEY)
+    controller.arm(KEY, { kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, error: err })
+    await clock.advance(waitMs(0))
+    await controller.whenRunSettled(KEY)
+    expect(controller.view(KEY)?.mode).toBe(UNAVAILABLE_RETRY_MODE_PENDING_ONLY)
+    await clock.advance(waitMs(1))
+    await controller.whenRunSettled(KEY)
+
+    expect(lines).toEqual([
+      unavailableRetryArmedLine(KEY, true, UNAVAILABLE_RETRY_CAUSE_PENDING_ROW, waitMs(0)),
+      unavailableRetryPromotedLine(KEY, causeDescription(UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, err)),
+      unavailableRetryRetryLine(KEY, 1, false),
+      unavailableRetryReArmedLine(KEY, 1, false, UNAVAILABLE_RETRY_AGAIN_LAUNCHED, UNAVAILABLE_RETRY_MODE_PENDING_ONLY, waitMs(1)),
+      unavailableRetryRetryLine(KEY, 2, true),
+      unavailableRetryStoppedLine(KEY, true, 'waiting', UNAVAILABLE_RETRY_STOP_ROW_LIVE),
+    ])
+    expect(lines.filter((line) => line.includes(HOST_PATH) || line.includes(' <- '))).toEqual([])
+    assertNoLeak(lines)
   })
 })
 
@@ -2178,7 +2280,7 @@ describe('unavailable retry: again-reasons and close', () => {
     expect(lines.slice(2)).toEqual([
       stoppedLine(KEY, UNAVAILABLE_RETRY_STOP_SHUTDOWN),
       stoppedLine(OTHER, UNAVAILABLE_RETRY_STOP_SHUTDOWN),
-      `[slack] unavailable-retry: persona=${KEY} not armed (status-error) — ${UNAVAILABLE_RETRY_STOP_SHUTDOWN}`,
+      unavailableRetryNotArmedClosedLine(KEY, 'status-error', UNAVAILABLE_RETRY_STOP_SHUTDOWN),
     ])
   })
 
@@ -2635,9 +2737,8 @@ describe('unavailable retry: the full-mode retry on the recovery harness (SRJ-30
       // The refused retry re-arms on the refusal it met during its run, at
       // the next wait of the one sequence.
       const retry = n + 1
-      const prefix = `[slack] unavailable-retry: persona=${key} retry ${retry}: ${UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE}: `
-      const suffix = ` — re-armed, next retry in ${waitMs(retry) / 1000} s`
-      expect([retry, h.lines.filter((l) => l.startsWith(prefix) && l.endsWith(suffix))]).toEqual([retry, [expect.any(String)]])
+      const reArmed = builtAround((hole) => unavailableRetryReArmedLine(key, retry, false, `${UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE}: ${hole}`, undefined, waitMs(retry)))
+      expect([retry, h.lines.filter((l) => reArmed.test(l))]).toEqual([retry, [expect.any(String)]])
       if (!onsetDone && dueAt - refusedAt >= TMUX_UNRESPONSIVE_ONSET_FLOOR_MS) {
         onsetDone = true
         posts.push(tmuxUnresponsiveOnsetText(key))
@@ -3075,9 +3176,7 @@ describe('unavailable retry: the stop rules that exist now on the recovery harne
     expect(getFailureCount(key)).toBe(RESTART_FAILURE_CAP)
     expect(h.capReached).toEqual([key])
     expect(h.notices.filter((n) => n.text.includes('automatic restarts suspended'))).toEqual([expect.objectContaining({ key })])
-    expect(h.errors.filter((line) => line.startsWith(`[slack] Restart retry skipped for persona=${key}`))).toEqual([
-      `[slack] Restart retry skipped for persona=${key} — the persona is at the restart cap; nothing killed or launched`,
-    ])
+    expect(h.errors.filter((line) => line.startsWith('[slack] Restart retry skipped for '))).toEqual([restartRetryCapSkippedLine(key)])
     expect(retryLinesOf(h, key).at(-1)).toBe(stoppedLine(key, UNAVAILABLE_RETRY_STOP_CAPPED))
     expectStopped(h, key)
   })
@@ -3145,7 +3244,8 @@ describe('unavailable retry: the stop rules that exist now on the recovery harne
     const h = (harness = makeRecoveryHarness())
     const [key, other] = h.keys as [string, string]
     await armBoth(h, key, other)
-    h.script({ spawnError: errTmuxUnresponsive('spawn') })
+    const refusal = errTmuxUnresponsive('spawn')
+    h.script({ spawnError: refusal })
 
     h.shutdown()
     // The closed controller refuses the arm (its sink answers false), so the
@@ -3161,7 +3261,8 @@ describe('unavailable retry: the stop rules that exist now on the recovery harne
       stoppedLine(key, UNAVAILABLE_RETRY_STOP_SHUTDOWN),
       stoppedLine(other, UNAVAILABLE_RETRY_STOP_SHUTDOWN),
     ]))
-    expect(h.lines.filter((line) => line.includes(`persona=${key} not armed (${UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE}`))).toHaveLength(1)
+    const notArmed = unavailableRetryNotArmedClosedLine(key, causeDescription(UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, refusal), UNAVAILABLE_RETRY_STOP_SHUTDOWN)
+    expect(h.lines.filter((line) => line === notArmed)).toHaveLength(1)
   })
 })
 
@@ -3178,12 +3279,12 @@ describe('unavailable retry: the stop rules that exist now on the recovery harne
 
 /** The line a direct pending-only arm logs. */
 function pendingOnlyArmedLine(key: string): string {
-  return `[slack] unavailable-retry: persona=${key} armed in pending-only mode (${UNAVAILABLE_RETRY_CAUSE_PENDING_ROW}) — first retry in ${waitMs(0) / 1000} s`
+  return unavailableRetryArmedLine(key, true, UNAVAILABLE_RETRY_CAUSE_PENDING_ROW, waitMs(0))
 }
 
 /** The line a pending-only retry logs as it starts. */
 function pendingOnlyRetryLine(key: string, retry: number): string {
-  return `[slack] unavailable-retry: persona=${key} retry ${retry} (pending-only) — reading its row`
+  return unavailableRetryRetryLine(key, retry, true)
 }
 
 /** Persona `key`'s timer is stopped and nothing is pending on the clock. */
@@ -3312,7 +3413,8 @@ describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301,
       pendingOnlyRetryLine(key, 1),
       pendingOnlyStoppedLine(key, UNAVAILABLE_RETRY_STOP_ROW_GONE, 'ended'),
     ])
-    expect(lines.slice(3)).toEqual([expect.stringMatching(new RegExp(`^\\[slack\\] unavailable-retry: persona=${key} armed \\(${UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE}: .* — first retry in ${waitMs(0) / 1000} s$`))])
+    // Its cause's description has no stack frame: the line is rebuilt exactly.
+    expect(lines.slice(3)).toEqual([unavailableRetryArmedLine(key, false, causeDescription(UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, errTmuxUnresponsive('spawn')), waitMs(0))])
     expect(h.controller.view(key)).toEqual({
       phase: 'waiting',
       dueAt: h.clock.now() + waitMs(0),
@@ -3338,7 +3440,7 @@ describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301,
     h.script({ spawnError: undefined })
 
     expect(retryLinesOf(h, key).slice(1)).toEqual([
-      expect.stringMatching(new RegExp(`^\\[slack\\] unavailable-retry: persona=${key} promoted to full mode \\(${UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE}: .* — its due time is kept$`)),
+      unavailableRetryPromotedLine(key, causeDescription(UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, errTmuxUnresponsive('spawn'))),
     ])
     expect(h.controller.view(key)).toEqual({
       phase: 'waiting',
@@ -3442,7 +3544,7 @@ describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301,
     expect(h.stub.callCount()).toBe(before)
     expect(retryLinesOf(h, key).slice(-2)).toEqual([
       pendingOnlyRetryLine(key, 1),
-      `[slack] unavailable-retry: persona=${key} retry 1 (pending-only): ${UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT} — re-armed, next retry in ${waitMs(1) / 1000} s`,
+      unavailableRetryReArmedLine(key, 1, true, UNAVAILABLE_RETRY_AGAIN_LAUNCH_IN_FLIGHT, undefined, waitMs(1)),
     ])
     expect(h.controller.view(key)).toEqual({
       phase: 'waiting',
@@ -3484,8 +3586,8 @@ describe('unavailable retry: pending-only mode on the recovery harness (SRJ-301,
     expect(h.triggers).toEqual([{ key, kind }])
     expect(retryLinesOf(h, key).slice(1)).toEqual([
       pendingOnlyRetryLine(key, 1),
-      expect.stringMatching(new RegExp(`^\\[slack\\] unavailable-retry: persona=${key} promoted to full mode \\(${kind}: .* — its due time is kept$`)),
-      expect.stringMatching(new RegExp(`^\\[slack\\] unavailable-retry: persona=${key} retry 1 \\(pending-only\\): the retry failed: .* — re-armed in full mode, next retry in ${waitMs(1) / 1000} s$`)),
+      unavailableRetryPromotedLine(key, causeDescription(kind, make())),
+      expect.stringMatching(builtAround((hole) => unavailableRetryReArmedLine(key, 1, true, hole, UNAVAILABLE_RETRY_MODE_FULL, waitMs(1)))),
     ])
     expect(h.controller.view(key)).toEqual({
       phase: 'waiting',
@@ -3875,7 +3977,7 @@ const CONDITION_ENDS: ReadonlyArray<readonly [UnavailableRetryCondition, string]
 
 /** The line the condition-end entry logs when an exception keeps the timer. */
 function keptLine(key: string, ended: string, why: string): string {
-  return `[slack] unavailable-retry: persona=${key} kept — ${ended}, but ${why}`
+  return unavailableRetryKeptLine(key, ended, [why])
 }
 
 /** Tell the entry each condition ended; each keeps persona `key`'s timer as it was, with one kept line naming `why`. */
@@ -3999,8 +4101,7 @@ describe('unavailable retry: the pending and kill-failure exceptions (SRJ-306)',
     expect(getFailureCount(key)).toBe(0)
     expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR }, { key, kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED }])
     // A refusal gives no again-reason: the re-armed line names the cause.
-    expect(retryLinesOf(h, key).at(-1)).toStartWith(`[slack] unavailable-retry: persona=${key} retry 1: ${UNAVAILABLE_RETRY_CAUSE_KILL_FAILED}`)
-    expect(retryLinesOf(h, key).at(-1)).toEndWith(` — re-armed, next retry in ${waitMs(1) / 1000} s`)
+    expect(retryLinesOf(h, key).at(-1)).toMatch(builtAround((hole) => unavailableRetryReArmedLine(key, 1, false, `${UNAVAILABLE_RETRY_CAUSE_KILL_FAILED}${hole}`, undefined, waitMs(1))))
     expect(h.controller.view(key)).toEqual({
       phase: 'waiting',
       dueAt: h.clock.now() + waitMs(1),
@@ -4654,10 +4755,9 @@ describe('unavailable retry: the switch, the last row read and a condition end d
     finish(held)
     await controller.whenRunSettled(KEY)
 
-    const ran = ranPendingOnly ? ` (${UNAVAILABLE_RETRY_MODE_PENDING_ONLY})` : ''
     expect(lines.slice(linesBefore)).toEqual([
       keptLine(KEY, ended, why),
-      expect.stringMatching(new RegExp(`^\\[slack\\] unavailable-retry: persona=${KEY} retry 1${ran.replace(/[()]/g, '\\$&')}: .* — re-armed, next retry in ${waitMs(1) / 1000} s$`)),
+      expect.stringMatching(builtAround((hole) => unavailableRetryReArmedLine(KEY, 1, ranPendingOnly, hole, undefined, waitMs(1)))),
     ])
     expect(controller.view(KEY)).toMatchObject({ phase: 'waiting', dueAt: clock.now() + waitMs(1), refusals: 1 })
   })
@@ -4823,7 +4923,7 @@ describe('unavailable retry: the switch, the last row read and a condition end d
 
 /** The line a pending-only timer logs when a full-mode cause of kind `kind` (with no error) promotes it. */
 function promotedLine(key: string, kind: string): string {
-  return `[slack] unavailable-retry: persona=${key} promoted to full mode (${kind}) — its due time is kept`
+  return unavailableRetryPromotedLine(key, kind)
 }
 
 /**
@@ -5012,7 +5112,7 @@ function observedRig(action: UnavailableRetryAction = () => ({ kind: 'again' }),
 
 /** The line a full-mode retry logs as it starts. */
 function fullRetryLine(key: string, retry: number): string {
-  return `[slack] unavailable-retry: persona=${key} retry ${retry} — rerunning its recovery`
+  return unavailableRetryRetryLine(key, retry, false)
 }
 
 /** The observer's then the action's step for one retry of `key` at `at`, after `retryLine`. */
@@ -5596,9 +5696,8 @@ async function environmentLaunch(h: RecoveryHarness, key: string): Promise<numbe
 
 /** The re-armed line of a retry refused by ENVIRONMENT: its prefix and suffix, after `refusals` refusals. */
 function environmentReArmed(h: RecoveryHarness, key: string, retry: number, refusals: number): string[] {
-  const prefix = `[slack] unavailable-retry: persona=${key} retry ${retry}: ${UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT}: `
-  const suffix = ` — re-armed, next retry in ${waitMs(refusals) / 1000} s`
-  return retryLinesOf(h, key).filter((line) => line.startsWith(prefix) && line.endsWith(suffix))
+  const reArmed = builtAround((hole) => unavailableRetryReArmedLine(key, retry, false, `${UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT}: ${hole}`, undefined, waitMs(refusals)))
+  return retryLinesOf(h, key).filter((line) => reArmed.test(line))
 }
 
 /** Record the clock time of every stub `kill` call, in order. */
@@ -7195,7 +7294,7 @@ describe('unavailable retry: UNCLASSIFIED outcomes are never destructive or coun
     expect(h.outageNotices).toEqual([])
     const entries = h.startupErrors()
     expect(entries).toHaveLength(1)
-    expect(entries[0]!.endsWith(`] [${PERSONA_UNCLASSIFIED_ERROR_LABEL}] persona=${key}: ${unclassifiedErrorAlertText(classifyAdError(err), { escapeForSlack: false })}`)).toBe(true)
+    expect(entries[0]!.endsWith(`] [${PERSONA_UNCLASSIFIED_ERROR_LABEL}] ${personaUnclassifiedErrorEntryText(key, unclassifiedErrorAlertText(classifyAdError(err), { escapeForSlack: false }))}`)).toBe(true)
     expect(unclassifiedLines(h, key).at(-1)).toBe(unclassifiedLoggedLine(key, alert.dueAt - armedAt, thresholdMs, err))
     expect(unclassifiedLines(h, key).filter((line) => line.includes(' alert '))).toHaveLength(1)
     assertNoLeak([entries, h.lines])
@@ -7371,7 +7470,7 @@ describe('unavailable retry: the no-transcript reuse spawn after resume’s ErrN
     expect([h.episodeNotices, h.notices, h.outageNotices]).toEqual([[], [], []])
     const entries = h.startupErrors()
     expect(entries).toHaveLength(1)
-    expect(entries[0]!.endsWith(`] [${PERSONA_UNCLASSIFIED_ERROR_LABEL}] persona=${key}: ${unclassifiedErrorAlertText(classifyAdError(err), { escapeForSlack: false })}`)).toBe(true)
+    expect(entries[0]!.endsWith(`] [${PERSONA_UNCLASSIFIED_ERROR_LABEL}] ${personaUnclassifiedErrorEntryText(key, unclassifiedErrorAlertText(classifyAdError(err), { escapeForSlack: false }))}`)).toBe(true)
     expect(unclassifiedLines(h, key).at(-1)).toBe(unclassifiedLoggedLine(key, alert.dueAt - armedAt, thresholdMs, err))
     expect(unclassifiedLines(h, key).filter((line) => line.includes(' alert '))).toHaveLength(1)
     expect([h.stub.calls.deleteCalls, getFailureCount(key)]).toEqual([[], 0])

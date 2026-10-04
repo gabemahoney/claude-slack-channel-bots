@@ -84,13 +84,18 @@
  *   agent-director's defaults and "over 3 minutes" at AC 80's settings);
  *   every other case builds its texts with the exported builders and its
  *   times from the exported floor and E6's threshold accessor. The log
- *   lines have no exported builder, so the recovery harness's line builders
+ *   lines (b.jg5 SRJ-1014): one case compares an episode's start, onset,
+ *   alert and end lines with the exported builders
+ *   (`tmuxUnresponsiveStartedLine`, `tmuxUnresponsiveOnsetLine`,
+ *   `tmuxUnresponsiveAlertLine`, `tmuxUnresponsiveEndedLine`), the start
+ *   line's refusal redacted; this file's `onsetHeldLine`, `alertCancelledLine`,
+ *   `alertRearmedLine` and `onsetStoppedLine` are the exported builder and
+ *   phrase constants; the recovery harness's line builders
  *   (`conditionOnsetLine`, `conditionAlertLine`, `conditionEndedLine`,
- *   `conditionRecoveryLine`, `conditionSilentEndLine`) and this file's
- *   (`onsetHeldLine`, `alertCancelledLine`, `alertRearmedLine`,
- *   `onsetStoppedLine`, and the health tick's `tickArmingLine`) hold their
- *   fixed words; their seconds come from the clock and the threshold in effect, and the notice cases assert every notice and
- *   ended line exactly, in order.
+ *   `conditionRecoveryLine`, `conditionSilentEndLine`) and the health tick's
+ *   `tickArmingLine` hold their fixed words; their seconds come from the
+ *   clock and the threshold in effect, and the notice cases assert every
+ *   notice and ended line exactly, in order.
  * - The onset (SRJ-308): with the health check on, at the end of the first
  *   health tick that started after the first refusal while the condition
  *   still holds; with it off, at the first retry at least the floor after
@@ -148,6 +153,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import {
   AD_CALL_KILL_ROW_NOT_READ_LIVE,
   AD_CALL_KILL_ROW_READ_LIVE,
+  describeAgentDirectorFailure,
   LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT,
   LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE,
   type AdCall,
@@ -174,10 +180,19 @@ import {
   TMUX_UNRESPONSIVE_END_TEXT,
   TMUX_UNRESPONSIVE_END_TICK,
   TMUX_UNRESPONSIVE_END_TMUX_VERB,
+  TMUX_UNRESPONSIVE_ALERT_CHECK_ARMED_AGAIN,
   TMUX_UNRESPONSIVE_ONSET_FLOOR_MS,
+  TMUX_UNRESPONSIVE_ONSET_HELD_BY_ALERT,
+  TMUX_UNRESPONSIVE_ONSET_HELD_BY_STOP,
+  tmuxUnresponsiveAlertCheckCancelledLine,
+  tmuxUnresponsiveAlertLine,
   tmuxUnresponsiveAlertText,
+  tmuxUnresponsiveEndedLine,
+  tmuxUnresponsiveLine,
+  tmuxUnresponsiveOnsetLine,
   tmuxUnresponsiveOnsetText,
   tmuxUnresponsiveRecoveryText,
+  tmuxUnresponsiveStartedLine,
   type TmuxUnresponsiveEndReason,
 } from '../src/persona-episodes.ts'
 import { personaInstanceId } from '../src/persona-identity.ts'
@@ -256,7 +271,7 @@ import {
   REFUSED_OPERATION_RESUME,
   REFUSED_OPERATION_REUSE_SPAWN,
 } from '../src/conflict-latch.ts'
-import { assertNoLeak } from './test-helpers/credentials.ts'
+import { REDACTED_SENTINEL_TAIL, assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
 import {
   callCounts,
   callCountsSince,
@@ -1625,6 +1640,29 @@ describe('tmux-unresponsive: the recovery (SRJ-310)', () => {
     ])
   })
 
+  test('SRJ-1014: the start, onset, alert and end lines are their exported builders\' lines, each naming the persona; the start line carries the refusal\'s description redacted, and nothing leaks', async () => {
+    const { h, p } = build(TICK_MODE)
+    const thresholdMs = adAlertThresholdMsInEffect()
+    const refusal = (verb: string): Error => errTmuxUnresponsive(verb, `tmux did not answer (${sentinelInMessage('tmux')})`)
+    const at = await refuse(h, p, refusal)
+    await h.advance(tickMs(h))
+    tick(h)
+    await h.advance(at + thresholdMs + 1 - h.clock.now())
+    expect(h.tickEnd(p)).toBe('ended-after-notice')
+
+    const started = tmuxUnresponsiveStartedLine(p, 'spawn', describeAgentDirectorFailure(refusal('spawn')))
+    expect(started).toContain(REDACTED_SENTINEL_TAIL)
+    const wholeS = (ms: number): number => Math.floor(ms / 1000)
+    expect(conditionLines(h, p)).toEqual([
+      started,
+      tmuxUnresponsiveOnsetLine(p, false, 'a health tick', wholeS(tickMs(h))),
+      tmuxUnresponsiveAlertLine(p, false, wholeS(thresholdMs + 1), wholeS(thresholdMs)),
+      tmuxUnresponsiveEndedLine(p, TMUX_UNRESPONSIVE_END_TICK),
+      conditionRecoveryLine(p),
+    ])
+    assertNoLeak(conditionLines(h, p))
+  })
+
   test('an end after the alert alone (no onset) posts one recovery; a later end posts nothing more', async () => {
     const { h, p } = build(TICK_MODE)
     const thresholdMs = adAlertThresholdMsInEffect()
@@ -1718,17 +1756,17 @@ describe('tmux-unresponsive: the recovery (SRJ-310)', () => {
 
 /** The line when the onset is held back because the episode's alert already posted: once per episode. */
 function onsetHeldLine(key: string): string {
-  return `${conditionLinePrefix(key)}onset not posted — its alert already posted`
+  return tmuxUnresponsiveLine(key, TMUX_UNRESPONSIVE_ONSET_HELD_BY_ALERT)
 }
 
 /** The line when a stop of the persona's retry timer cancels its pending alert check. */
 function alertCancelledLine(key: string, stopReason: string): string {
-  return `${conditionLinePrefix(key)}alert check cancelled — its retry timer stopped: ${stopReason}`
+  return tmuxUnresponsiveAlertCheckCancelledLine(key, stopReason)
 }
 
 /** The line when a later refusal arms a cancelled alert check again. */
 function alertRearmedLine(key: string): string {
-  return `${conditionLinePrefix(key)}alert check armed again — a new refusal armed its retry timer again`
+  return tmuxUnresponsiveLine(key, TMUX_UNRESPONSIVE_ALERT_CHECK_ARMED_AGAIN)
 }
 
 describe('tmux-unresponsive: the alert before the onset (SRJ-308, SRJ-309)', () => {
@@ -1965,7 +2003,7 @@ describe('tmux-unresponsive: the alert and the retry timer’s stops (SRJ-309)',
 
 /** The line when a stop of the persona's retry timer holds its onset back: once per episode. */
 function onsetStoppedLine(key: string): string {
-  return `${conditionLinePrefix(key)}onset not posted — its retry timer stopped and no refusal has re-armed it`
+  return tmuxUnresponsiveLine(key, TMUX_UNRESPONSIVE_ONSET_HELD_BY_STOP)
 }
 
 /** The health tick's line when it arms the retry timer of a persona held off on `tmux-unavailable` (`armMissingRetryTimer`). */

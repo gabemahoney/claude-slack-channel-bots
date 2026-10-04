@@ -15,7 +15,7 @@
  * `PERSONA_KEY_RE` is refused before any filesystem call, so a record path
  * can never leave the record directory.
  *
- * The teardown helper E12 calls (delete the record and forget the persona's
+ * The teardown helper a persona's teardown calls (delete the record and forget the persona's
  * launched-with directory) is `teardownPersonaReplyGuard` in
  * `src/stop-hook-bootstrap.ts`.
  *

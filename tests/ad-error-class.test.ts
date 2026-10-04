@@ -61,6 +61,7 @@ import {
   classifyWithInvalidFlagsRecheck,
   conflictDescriptionOf,
   describeAdErrorClassification,
+  describeAdFailureForLog,
   describeAgentDirectorFailure,
   describeReportedAdFailure,
   hasAdErrorName,
@@ -1734,6 +1735,73 @@ describe('describeReportedAdFailure (b.jg5 SRJ-104)', () => {
     const fallback = describeReportedAdFailure(tokenNamed)
     expect(fallback).toBe(describeAgentDirectorFailure(tokenNamed))
     assertNoLeak({ lines, fallback })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// describeAdFailureForLog (b.jg5 SRJ-104, SRJ-1014): the reported name when
+// the classifier gives one, else describeAgentDirectorFailure's description
+// ---------------------------------------------------------------------------
+
+describe('describeAdFailureForLog (b.jg5 SRJ-104, SRJ-1014)', () => {
+  test.each<Built>([
+    ['a plain ErrInternal', () => errInternal()],
+    ['the unusable-name ErrInternal', () => errUnusableName()],
+    ['ErrConfigMalformed', () => errConfigMalformed()],
+    ['ErrSchemaMismatch', () => errSchemaMismatch()],
+    [ERR_STORE_OPEN_NAME, () => errUnknownErrorName(ERR_STORE_OPEN_NAME, 'the store could not be opened')],
+    ['an error of its own class with a name CSCB gives no handling', () => errSendKeysWhileRelayed()],
+  ])('%s, which reports a name → describeReportedAdFailure\'s description, naming the reported name', (_label, build) => {
+    const value = build()
+    const { reportedName } = classifyAdError(value)
+    expect(reportedName).toBeDefined()
+    const line = describeAdFailureForLog(value)
+    expect(line).toBe(describeReportedAdFailure(value))
+    expect(line.startsWith(`${reportedName!} `)).toBe(true)
+  })
+
+  test('an ErrUnknownErrorName carrying a store-open name shows that name, never the client\'s placeholder name or text', () => {
+    const value = errUnknownErrorName(ERR_STORE_OPEN_NAME, 'the store could not be opened')
+    const line = describeAdFailureForLog(value)
+    expect(line).not.toContain(value.errName)
+    expect(line).not.toContain(value.errDescription)
+    expect(line).not.toBe(describeAgentDirectorFailure(value))
+  })
+
+  test.each<Built>([
+    ...CONFLICT_CASES.map((c): Built => [`CONFLICT (${c})`, () => errTmuxSessionConflict('read-pane', c)]),
+    ['GONE (errTmuxSendKeys)', () => errTmuxSendKeys()],
+    ['STATE (errSpawnNotFound)', () => errSpawnNotFound()],
+    ['UNAVAILABLE (errTmuxUnresponsive)', () => errTmuxUnresponsive()],
+    ['UNAVAILABLE (an ErrUnknownErrorName with a later name)', () => errUnknownErrorName()],
+    ['a plain Error', () => new Error('boom')],
+    ['a string', () => 'boom'],
+    ['undefined', () => undefined],
+  ])('%s, which reports no name → describeAgentDirectorFailure\'s description', (_label, build) => {
+    const value = build()
+    expect(classifyAdError(value).reportedName).toBeUndefined()
+    expect(describeAdFailureForLog(value)).toBe(describeAgentDirectorFailure(value))
+  })
+
+  test.each([
+    ['with a space', () => 'not a safe name'],
+    ['token-shaped', () => fakeToken(BOT_TOKEN_PREFIX, 'name')],
+    ['overlong', () => `Err${'x'.repeat(MAX_LOGGED_MESSAGE_LENGTH)}`],
+  ])('an errName that is not a safe identifier (%s) → describeAgentDirectorFailure\'s description, keeping the value\'s type, never the message-only reported form', (_label, buildName) => {
+    const name = buildName()
+    const value = errGeneric('get', name, `described (${sentinelInMessage('unsafe-name')})`)
+    expect(classifyAdError(value).reportedName).toBeUndefined()
+    const line = describeAdFailureForLog(value)
+    expect(line).toBe(describeAgentDirectorFailure(value))
+    expect(line).not.toBe(describeReportedAdFailure(value))
+    expect(line.startsWith(`${value.constructor.name} `)).toBe(true)
+    assertNoLeak(line)
+  })
+
+  test('a proxy whose every trap throws: never throws, and gives describeAgentDirectorFailure\'s description', () => {
+    const value = hostileProxy()
+    expect(() => describeAdFailureForLog(value)).not.toThrow()
+    expect(describeAdFailureForLog(value)).toBe(describeAgentDirectorFailure(value))
   })
 })
 

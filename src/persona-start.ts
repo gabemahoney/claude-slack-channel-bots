@@ -24,7 +24,7 @@
  * persona that is up, including one that reaches up through a retry.
  *
  * A failure at steps 1–3 ends the bring-up without a launch. Steps 1–2
- * failures are logged by E2's checks through the injected logger; Slack
+ * failures are logged by the bring-up checks through the injected logger; Slack
  * failures are logged only by the connection manager, so this module adds no
  * line for them. Nothing here posts to Slack, records a
  * startup error or counts a failed spawn. Neither the health check nor a

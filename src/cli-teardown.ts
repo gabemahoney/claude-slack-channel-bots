@@ -6,7 +6,7 @@
  * SRJ-901, SRJ-902, SRJ-117, SRJ-908); the teardown's per-persona
  * outcome, its pause verdict, its state-read verdict, its kill's options
  * and mapping, and the bounds of its cost (SRJ-903, SRJ-904, SRJ-119,
- * SRJ-316, SRJ-908; hatch note E12); the teardown's report: each persona's
+ * SRJ-316, SRJ-908); the teardown's report: each persona's
  * failure line, kill-failure alert and startup-errors entry, and the last
  * line (SRJ-907, SRJ-909, SRJ-1013); `clean_restart`'s answer check line,
  * not-restarted alert and its class, and its restart lines (SRJ-906,
@@ -67,7 +67,7 @@
  * other error fails the persona at once with its class, with no retry.
  *
  * {@link pauseVerdictOf} decides each `pause` answer on a live row by class
- * (SRJ-903; hatch note E12: every answer through `classifyAdError`):
+ * (SRJ-903; every answer through `classifyAdError`):
  *
  *   - success: done, and the poll follows;
  *   - UNAVAILABLE (`ErrCallTimeout` and a non-agent-director throw
@@ -532,7 +532,7 @@ export function teardownFailed(step: TeardownStep, report: TeardownErrorReport):
 
 /**
  * What a teardown failure reports for a value an agent-director call threw
- * (b.jg5 SRJ-104, SRJ-316; hatch note E12): the classifier's class, unchanged,
+ * (b.jg5 SRJ-104, SRJ-316): the classifier's class, unchanged,
  * and `describeReportedAdFailure`'s description, after a lead naming
  * {@link AD_CONFIG_FILE_DISPLAY_NAME} for a CONFIG answer. Pure; never throws.
  */
@@ -1065,7 +1065,7 @@ function cliTeardownAlertOf(
  *   - any other failure: the failure line, printed and logged, and one
  *     {@link CLI_TEARDOWN_FAILED_LABEL} entry.
  *
- * The alert line is E20's log-line and entry form
+ * The alert line is the kill-failure alert's log-line and entry form
  * (`persona "<name>" (key=<key>) (CLI teardown, <command>): <text>`); its
  * route, closing sentence and class come from `selectKillFailureAlertRoute`.
  */

@@ -56,7 +56,7 @@ import {
   type ConflictLatch,
   type ConflictLatchRecord,
 } from '../src/conflict-latch.ts'
-import { describeAgentDirectorFailure } from '../src/ad-error-class.ts'
+import { describeAdFailureForLog } from '../src/ad-error-class.ts'
 import { createPersonaEpisodes } from '../src/persona-episodes.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { NO_LAUNCH_START_FORMS, UNUSABLE_NAME_CASE_ROWS, launchStartRecord } from './test-helpers/conflict-cases.ts'
@@ -3118,7 +3118,7 @@ describe('b.jg5 SRJ-512, SRJ-513: a tick whose own liveness read latches P', () 
 
   /** P's own-row `status` step line at the liveness read for an UNUSABLE NAME answer `err`. */
   const unusableStepLine = (err: unknown) => (outcome: string): string =>
-    `[slack] isSessionAlive: status for persona=${P}: ${describeAgentDirectorFailure(err)} — UNUSABLE NAME: ${outcome}; nothing more is called for it (b.jg5 SRJ-105, SRJ-512)`
+    `[slack] isSessionAlive: status for persona=${P}: ${describeAdFailureForLog(err)} — UNUSABLE NAME: ${outcome}; nothing more is called for it (b.jg5 SRJ-105, SRJ-512)`
   /** P's own-row `status` step line at the liveness read for its `pending` row with no launch start. */
   const launchStartStepLine = (outcome: string): string =>
     `[slack] isSessionAlive: status for persona=${P}: its row read latches the persona (case=${LATCH_CASE_LAUNCH_START_NOT_RECORDED}, state=${AGENT_DIRECTOR_PENDING_STATE}) — ${outcome}; nothing more is called for it (b.jg5 SRJ-115, SRJ-501)`

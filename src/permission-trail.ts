@@ -230,7 +230,7 @@ export function emitTrailEvent(event: TrailEvent): void {
 }
 
 /**
- * Recommended call-site API for Epics 2–5: stamps `ts` from
+ * Recommended call-site API: stamps `ts` from
  * `new Date().toISOString()` (RFC 3339 with ms precision) and delegates to
  * `emitTrailEvent`. Callers pass everything except `ts`.
  */

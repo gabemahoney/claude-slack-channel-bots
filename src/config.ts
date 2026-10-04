@@ -1420,8 +1420,7 @@ function rejectSharedRealPath(personas: readonly Persona[], setting: UniquePerso
  *
  * Resolves paths only: never requires them to exist and never opens, reads,
  * creates or writes a file. Kept as its own step so a start from the record
- * (E11) can treat these collisions differently without restructuring the
- * loader.
+ * can treat these collisions differently without restructuring the loader.
  */
 function checkRealPathCollisions(personas: readonly Persona[]): void {
   for (const setting of UNIQUE_PERSONA_PATH_SETTINGS) rejectSharedRealPath(personas, setting)

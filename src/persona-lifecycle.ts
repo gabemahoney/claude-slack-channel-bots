@@ -21,7 +21,12 @@
  *   never reaches its new half's destination. At the start of its turn, with
  *   nothing awaited before them, its outage flags are forgotten silently (a
  *   flag raised before the teardown posts no all-clear) and its notice
- *   window opens (`openTeardownWindow`, b.jg5 SRJ-1003): from there until it
+ *   window opens (`openTeardownWindow`, b.jg5 SRJ-1003) and its held
+ *   destination notices are cancelled at once (the hold's one line; a notice
+ *   raised in the window is written, never handed to the hold), so a notice
+ *   the destination hold kept before the window is never retried and posted
+ *   while it is open, to the new half's destination of a destructive modify
+ *   included: from there until it
  *   completes, every notice raised for its key (an outage onset from its
  *   calls or from the launch in flight it waits for, a latch's or an
  *   `ErrInvalidFlags` hold's notice that launch raises, an unclassified
@@ -74,7 +79,9 @@
  *   5. its Slack connection is stopped (so no further event arrives for it),
  *      then its inbound dedupe store and its ack-tracker entries are dropped;
  *   6. its cached DM destination is forgotten, its held destination notices
- *      are cancelled, and its pre-validation held notices dropped
+ *      are cancelled again (closing a destination episode a re-derived
+ *      prompt's failure opened in the window), and its pre-validation held
+ *      notices dropped
  *      (`notifier.forget`, with its one line): only notices held before the
  *      window opened, since a notice raised in it is written, never held;
  *   7. its tracked permission prompts and wedge state are dropped (their
@@ -656,6 +663,13 @@ export const LIVE_ROW_SEQUENCE_STOP_STEP = 'stopping its live-row sequence'
 /** The teardown's second stop of the persona's live-row sequence, once its launch in flight settled: its log label. */
 export const LIVE_ROW_SEQUENCE_STOP_AGAIN_STEP = 'stopping its live-row sequence again, after its launch in flight settled'
 
+/**
+ * The teardown step, right after its notice window opens, that cancels the
+ * persona's held destination notices (b.jg5 SRJ-1003): its log label. Its
+ * step 6 cancels them again (`cancelling its held destination notices`).
+ */
+export const DESTINATION_HOLD_CANCEL_AT_WINDOW_STEP = 'cancelling its held destination notices as its notice window opens'
+
 /** The suffix of each teardown step repeated once its launch in flight settled (b.jg5 SRJ-715). */
 const AGAIN_AFTER_LAUNCH = 'again, after its launch in flight settled'
 
@@ -906,6 +920,11 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     // again and its all-clear, whenever it comes, is written as the onset was.
     syncStep('forgetting its outage state', () => deps.resetOutageState([key]))
     syncStep('opening its notice window', () => deps.notifier.openTeardownWindow?.(persona))
+    // b.jg5 SRJ-1003: a notice the destination hold kept before the window
+    // is dropped now, with nothing awaited since the window opened, so its
+    // retry timer cannot post it while the window is open (for a destructive
+    // modify's old half, to the new half's destination).
+    syncStep(DESTINATION_HOLD_CANCEL_AT_WINDOW_STEP, () => deps.destinationHold.cancel(key))
     try {
       await runTeardownSteps(persona, prefix, step, () => {
         failed++
@@ -979,6 +998,9 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     await step('forgetting its inbound dedupe store', () => deps.routing.forget(key))
     await step('forgetting its ack-reaction entries', () => deps.forgetAcks(key))
     await step('forgetting its DM destination', () => deps.destinations.forget(key))
+    // Again: a re-derived prompt's failure in the window can have opened a
+    // destination episode for the key, which would hold the new half's first
+    // notices of a destructive modify; no notice is held for the key here.
     await step('cancelling its held destination notices', () => deps.destinationHold.cancel(key))
     await step('dropping its held notices', () => deps.notifier.forget(key))
     await step('dropping its tracked permission prompts', () => deps.forgetPersonaPrompts(key))

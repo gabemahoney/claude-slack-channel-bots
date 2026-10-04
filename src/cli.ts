@@ -415,7 +415,7 @@ export interface CliDeps {
    * record beside it when one exists, otherwise the file itself. Throws the
    * start's wording on failure: a record that cannot be read or validated is
    * named with the deletion hint (never falling back to the file), and a
-   * file error carries the loader's message, including E1's conversion error
+   * file error carries the loader's message, including its conversion error
    * for a pre-persona file (b.av2 SR-1.7). Never writes any reload file.
    */
   loadConfig: (path: string) => PersonaConfig
@@ -908,8 +908,7 @@ export function createCli(deps: CliDeps): CliHandlers {
     // No latch check holds the kill back: a human-initiated teardown makes
     // its ordinary checked kill of a row the server would hold, a `pending`
     // row with or without a launch start included, which goes pause,
-    // ErrSpawnNotPausable, then the kill (b.jg5 SRJ-503, SRJ-513; hatch
-    // note E16).
+    // ErrSpawnNotPausable, then the kill (b.jg5 SRJ-503, SRJ-513).
     const pause = await pauseTries(id)
     if (pause.kind === PAUSE_VERDICT_FAIL) return teardownFailed(TEARDOWN_STEP_PAUSE, pause)
     if (pause.kind !== PAUSE_VERDICT_DONE) {
@@ -919,9 +918,8 @@ export function createCli(deps: CliDeps): CliHandlers {
 
     // Poll for `ended` or `missing`. Each read goes through the same verdict
     // as the state read; it latches nothing, reads and writes no record and
-    // never clears a retired-key entry (hatch note E24: an SRJ-115 site;
-    // b.jg5 SRJ-801: the CLI never writes retired-keys.json and installs no
-    // store).
+    // never clears a retired-key entry (an SRJ-115 site; b.jg5 SRJ-801: the
+    // CLI never writes retired-keys.json and installs no store).
     const startTime = deps.now()
     const deadline = startTime + exitTimeoutMsOf(exit_timeout)
     let wait = TEARDOWN_POLL_FIRST_WAIT_MS
@@ -1214,7 +1212,7 @@ export function createCli(deps: CliDeps): CliHandlers {
    *   line;
    * - the daemon exited (or could not be spawned): 1, repeating the lines
    *   this run appended to `server.log`, which carry the server's own fatal
-   *   reason (E1's conversion error verbatim for a pre-persona file). Server
+   *   reason (the loader's conversion error verbatim for a pre-persona file). Server
    *   log lines never carry a token (b.av2 SR-10.3);
    * - the wait expired: 0, saying the server is still starting and where its
    *   log is. The daemon is never signalled.

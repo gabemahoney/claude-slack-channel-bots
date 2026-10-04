@@ -65,8 +65,11 @@
  *   wait and a live-row sequence never run at once on one id (held
  *   `find-missing`). Its results by class (SRJ-811, SRJ-702, SRJ-717,
  *   SRJ-1002, SRJ-1013), for every id form, UNAVAILABLE and ENVIRONMENT at
- *   the kill and at the `get` and UNAVAILABLE at a run included: what the
- *   calls are, the round's one end line, whether the hold goes on and is
+ *   the kill and at the `get`, CONFIG, UNCLASSIFIED and a STATE answer at
+ *   the `get`, and UNAVAILABLE at a run included: what the calls are, the
+ *   round's one end line (a failed `get` or run's naming the failing
+ *   answer's class, a class with no end of its own a failed call), whether
+ *   the hold goes on and is
  *   marked kill-failed (SRJ-812), the waiting persona armed uncounted, the
  *   outages raised for it, the kill-failure alert's own line (its version on
  *   the not-configured, log-only route), the exact startup-errors entries
@@ -79,7 +82,9 @@
  *   hold to the wait's own unclassified-error episode on the held id (E12:
  *   nothing at the first round, the one log-only `persona-unclassified-error`
  *   entry at the first round past the alert threshold, none later; the
- *   hold's end ends it; a round a shutdown stopped reports nothing); the
+ *   hold's end ends it; a round a shutdown stopped reports nothing; its
+ *   lines name `instanceId=<id>` and say the row is an old life the server
+ *   is ending, a configured persona's own row included); the
  *   session a stand-in id's alert names (the start sweep's listing, else
  *   "unknown"); an UNUSABLE NAME at a `get`, a run or a `status` read
  *   routed; SRJ-408's old `pending` row with no launch start killed and run
@@ -103,7 +108,9 @@
  *   persona's own-row latch stopped arms only the waiting personas that are
  *   not latched (SRJ-305), with one latched line for each that is; a
  *   waiting persona not up or held on `ErrInvalidFlags` is never armed (one
- *   skip line at each arm) and not retried at its hold's end (SRJ-305). The
+ *   skip line at each arm, the hold step's line naming the skip) and not
+ *   retried at its hold's end (SRJ-305), while an arm asked for that fails
+ *   or throws is named "could not be armed". The
  *   start sweep's listing of a same-key row `pending` seeds its hold's first
  *   wait `pending`, so with `ad-config-malformed` raised that wait makes no
  *   kill (SRJ-316).
@@ -222,6 +229,7 @@ import {
   OLD_LIFE_WAIT_END_REFUSED,
   OLD_LIFE_WAIT_END_STOPPED,
   OLD_LIFE_WAIT_END_UNAVAILABLE,
+  OLD_LIFE_WAIT_END_UNCLASSIFIED,
   OLD_LIFE_WAIT_AT_FIND_MISSING,
   OLD_LIFE_WAIT_AT_GET,
   OLD_LIFE_WAIT_AT_KILL,
@@ -234,7 +242,13 @@ import {
   type OldLifeWaitRefusalAt,
 } from '../src/old-life-wait.ts'
 import { getOutageFlags, raiseAdConfigMalformed, type OutageClass } from '../src/outage-state.ts'
-import { PERSONA_UNCLASSIFIED_ERROR_LABEL, UNCLASSIFIED_ERROR_END_HOLD_ENDED, killFailureStoppedRetryText, unclassifiedErrorAlertText } from '../src/persona-episodes.ts'
+import {
+  PERSONA_UNCLASSIFIED_ERROR_LABEL,
+  UNCLASSIFIED_ERROR_END_HOLD_ENDED,
+  UNCLASSIFIED_NOT_CONFIGURED_WORDING,
+  killFailureStoppedRetryText,
+  unclassifiedErrorAlertText,
+} from '../src/persona-episodes.ts'
 import { describeThrownValue } from '../src/persona-connection-errors.ts'
 import { personaInstanceId, personaTmuxSessionName } from '../src/persona-identity.ts'
 import { PERSONA_TEARDOWN_NOTICE_DURING_WAIT, personaTeardownNoticeEntryText } from '../src/persona-notifier.ts'
@@ -272,6 +286,8 @@ import {
   type RetiredKeyCause,
 } from '../src/retired-keys.ts'
 import {
+  OLD_LIFE_HOLD_ARM_SKIPPED,
+  OLD_LIFE_HOLD_SKIPPED_TIMER_PHRASE,
   OLD_LIFE_HOLD_END_NOT_RETRIED_HELD,
   OLD_LIFE_HOLD_END_NOT_RETRIED_LATCHED,
   OLD_LIFE_HOLD_END_NOT_RETRIED_NOT_APPLIED,
@@ -285,6 +301,7 @@ import {
   OLD_LIFE_WAIT_STOP_CAUSE_LATCHED,
   OLD_LIFE_WAIT_STOP_CAUSE_SHUTDOWN,
   OLD_LIFE_WAIT_STOP_CAUSE_TEARDOWN,
+  OLD_LIFE_WAIT_UNCLASSIFIED_WORDING,
   OWN_ROW_READ_ROW,
   SPAWN_ACTION_FRESH_RETIRED,
   SPAWN_ACTION_RETRYING,
@@ -377,6 +394,7 @@ import {
   startupEntries,
   unavailableAt,
   unclassifiedEndedLine,
+  unclassifiedLoggedLine,
   unclassifiedStartedLine,
   type RecoveryHarness,
   type RecoveryHarnessOptions,
@@ -1198,6 +1216,21 @@ function expectNoLatchOrPost(h: RecoveryHarness): void {
   for (const key of h.keys) expect(h.slack(key).callLog).toEqual([])
 }
 
+/**
+ * An unclassified-error line of the wait's own episode on `instanceId`, from
+ * the harness's line for a persona keyed `instanceId`: the wait's episodes
+ * name the key `instanceId=<id>` (`oldLifeWaitRef` of an id standing for
+ * itself) in place of `persona=<id>` (`oldLifeWaitRef`'s persona form), and
+ * say the row is an old life the server is ending in place of the
+ * not-configured wording (b.jg5 SRJ-1007; the episodes' `ref` and
+ * `notConfiguredWording` hooks).
+ */
+function waitUnclassifiedLine(instanceId: string, line: string): string {
+  const personaRef = `${oldLifeWaitRef(`${instanceId}_other`, instanceId)} `
+  expect(line).toContain(personaRef)
+  return line.replace(personaRef, `${oldLifeWaitRef(instanceId, instanceId)} `).replace(UNCLASSIFIED_NOT_CONFIGURED_WORDING, OLD_LIFE_WAIT_UNCLASSIFIED_WORDING)
+}
+
 /** The triggers of the old-life cause, by key. */
 function oldLifeArms(h: RecoveryHarness): string[] {
   return h.triggers.filter((t) => t.kind === UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD).map((t) => t.key)
@@ -1373,18 +1406,31 @@ const RESULTS: ReadonlyArray<readonly [string, ResultArrange, ResultRow]> = [
     h.script({ killError: errTmuxNotAvailable(undefined, 'kill') })
     return []
   }, { order: ['kill'], end: OLD_LIFE_WAIT_END_ENVIRONMENT, kept: true, marked: false, outages: ['tmux-unavailable'], entries: () => [] }],
+  // A failed get or run's end line names the failing answer's class (OldLifeWaitAnswers.failedCallClass).
   ['UNAVAILABLE at the get (ErrCallTimeout)', (h) => {
     h.script({ getError: unavailableAt('get') })
     return []
-  }, { order: ['kill', 'get'], end: OLD_LIFE_WAIT_END_CALL_FAILED, kept: true, marked: false, entries: () => [] }],
+  }, { order: ['kill', 'get'], end: OLD_LIFE_WAIT_END_UNAVAILABLE, kept: true, marked: false, entries: () => [] }],
   ['ENVIRONMENT at the get (ErrTmuxNotAvailable)', (h) => {
     h.script({ getError: errTmuxNotAvailable(undefined, 'get') })
     return []
-  }, { order: ['kill', 'get'], end: OLD_LIFE_WAIT_END_CALL_FAILED, kept: true, marked: false, outages: ['tmux-unavailable'], entries: () => [] }],
+  }, { order: ['kill', 'get'], end: OLD_LIFE_WAIT_END_ENVIRONMENT, kept: true, marked: false, outages: ['tmux-unavailable'], entries: () => [] }],
+  ['CONFIG at the get (ErrConfigMalformed)', (h) => {
+    h.script({ getError: errConfigMalformed() })
+    return []
+  }, { order: ['kill', 'get'], end: OLD_LIFE_WAIT_END_CONFIG, kept: true, marked: false, outages: ['ad-config-malformed'], entries: () => [] }],
+  ['UNCLASSIFIED at the get (an unknown error name): the first round begins the wait\'s episode and writes nothing', (h) => {
+    h.script({ getError: errInternal() })
+    return []
+  }, { order: ['kill', 'get'], end: OLD_LIFE_WAIT_END_UNCLASSIFIED, kept: true, marked: false, entries: () => [] }],
+  ['a STATE answer at the get (ErrInstanceIdCollision), a class with no end of its own: a failed call', (h) => {
+    h.script({ getError: errInstanceIdCollision() })
+    return []
+  }, { order: ['kill', 'get'], end: OLD_LIFE_WAIT_END_CALL_FAILED, kept: true, marked: false, entries: () => [] }],
   ['UNAVAILABLE at the run (ErrCallTimeout), the row read live: the round stops at that run', (h, old) => {
     h.script({ getResult: old.row(), findMissingError: unavailableAt('find-missing') })
     return []
-  }, { order: ['kill', 'get', 'findMissing'], end: OLD_LIFE_WAIT_END_CALL_FAILED, kept: true, marked: false, entries: () => [] }],
+  }, { order: ['kill', 'get', 'findMissing'], end: OLD_LIFE_WAIT_END_UNAVAILABLE, kept: true, marked: false, entries: () => [] }],
   ['ErrTmuxKillFailed after the tries', (h) => {
     const err = errTmuxKillFailed()
     h.script({ killError: err })
@@ -1591,12 +1637,19 @@ describe('b.jg5 SRJ-811, E12: UNCLASSIFIED and CONFIG in the wait', () => {
 
     await round()
     expect([startupEntries(h), h.oldLifeWaitUnclassifiedOpen(old.instanceId)]).toEqual([[], true])
-    expect(h.errors.filter((line) => line === unclassifiedStartedLine(old.instanceId, err))).toHaveLength(1)
+    // The wait's episode lines name the held id as instanceId=<id>, never persona=<id> (the episodes' ref hook).
+    expect(h.errors.filter((line) => line === waitUnclassifiedLine(old.instanceId, unclassifiedStartedLine(old.instanceId, err)))).toHaveLength(1)
+    expect(h.errors.filter((line) => line === unclassifiedStartedLine(old.instanceId, err))).toEqual([])
 
     await h.clock.advance(adAlertThresholdMsInEffect() + 1)
     await round()
     expect(startupEntries(h)).toEqual([entry])
     expect(entry[1]).toBe(`${oldLifeWaitRef(old.instanceId, old.oldKey)}: ${unclassifiedErrorAlertText(classifyAdError(err), { escapeForSlack: false })}`)
+    // The alert's line says the row is an old life the server is ending, also for a configured persona's own row, never that the persona is not configured.
+    const alertLine = waitUnclassifiedLine(old.instanceId, unclassifiedLoggedLine(old.instanceId, adAlertThresholdMsInEffect() + 1, adAlertThresholdMsInEffect(), err))
+    expect(alertLine).toContain(OLD_LIFE_WAIT_UNCLASSIFIED_WORDING)
+    expect(h.errors.filter((line) => line === alertLine)).toHaveLength(1)
+    expect(h.errors.filter((line) => line.includes(UNCLASSIFIED_NOT_CONFIGURED_WORDING))).toEqual([])
 
     await h.clock.advance(adAlertThresholdMsInEffect() + 1)
     await round()
@@ -1609,7 +1662,7 @@ describe('b.jg5 SRJ-811, E12: UNCLASSIFIED and CONFIG in the wait', () => {
 
     endHoldByAnotherRead(old)
     expect(h.oldLifeWaitUnclassifiedOpen(old.instanceId)).toBe(false)
-    expect(h.errors.filter((line) => line === unclassifiedEndedLine(old.instanceId, UNCLASSIFIED_ERROR_END_HOLD_ENDED))).toHaveLength(1)
+    expect(h.errors.filter((line) => line === waitUnclassifiedLine(old.instanceId, unclassifiedEndedLine(old.instanceId, UNCLASSIFIED_ERROR_END_HOLD_ENDED)))).toHaveLength(1)
   })
 
   test('with no unclassified-error episodes in the wait\'s bindings, a round that met UNCLASSIFIED writes no entry and logs the not-reported line once', async () => {
@@ -1837,7 +1890,13 @@ describe('b.jg5 SRJ-305, SRJ-811, SRJ-810: a waiting persona not up, or held on 
     expect(h.oldLifeHolds.holdOf(old.instanceId)?.waiting).toEqual([p])
     expect([oldLifeArms(h), h.controller.isArmed(p), getFailureCount(p)]).toEqual([[], false, 0])
     expect(h.errors.filter((line) => line === skipLine(p))).toHaveLength(2)
-    expect(gateLinesIn(h)).toEqual([oldLifeHoldLaunchLine('runRestartWork', `persona=${p}`, realpathSync(personaOf(h, p).working_directory), [{ instanceId: old.instanceId, wait: LIVE_ROW_START_STARTED }], false)])
+    // The hook's line names the skip, never an arm failure: the step skipped P on purpose, with its skip line before.
+    const waits = [{ instanceId: old.instanceId, wait: LIVE_ROW_START_STARTED }] as const
+    const directory = realpathSync(personaOf(h, p).working_directory)
+    expect(gateLinesIn(h)).toEqual([oldLifeHoldLaunchLine('runRestartWork', `persona=${p}`, directory, waits, OLD_LIFE_HOLD_ARM_SKIPPED)])
+    expect(gateLinesIn(h)[0]).toContain(OLD_LIFE_HOLD_SKIPPED_TIMER_PHRASE)
+    expect(gateLinesIn(h)).not.toContain(oldLifeHoldLaunchLine('runRestartWork', `persona=${p}`, directory, waits, false))
+    expect(h.errors.indexOf(skipLine(p))).toBeLessThan(h.errors.indexOf(gateLinesIn(h)[0]!))
     expect(h.errors.filter((line) => line.startsWith(waitEndLinePrefix(old.instanceId, old.oldKey)))).toEqual([
       waitEndLine(old.instanceId, old.oldKey, { kind: OLD_LIFE_WAIT_END_NOT_JUDGED, kept: true }, []),
     ])
@@ -1847,6 +1906,39 @@ describe('b.jg5 SRJ-305, SRJ-811, SRJ-810: a waiting persona not up, or held on 
 
     expect(h.holdEndRetries).toEqual([])
     expect(h.errors.filter((line) => line === oldLifeHoldEndRetryLine(old.instanceId, [], [`${p} (${reason})`]))).toHaveLength(1)
+  })
+})
+
+describe('b.jg5 SRJ-810, SRJ-1014: the old-life hold step\'s line tells an arm that was asked for and failed from a skipped one', () => {
+  afterEach(waitAfterEach)
+
+  test.each<[string, () => boolean]>([
+    ['the arm answers false', () => false],
+    ['the arm throws', () => {
+      throw new Error('the arm refused')
+    }],
+  ])('P up, applied, not latched and not held, its arm asked for and not made (%s): the hook\'s line says its timer could not be armed, never the skip phrase, and P is not armed', async (_label, arm) => {
+    const { h, p, b } = build()
+    const old = OLD_ROWS[1]![1](h, p, b)
+    holdOldAt(h, old.instanceId, old.oldKey, p)
+    await pastSampleGrace(h)
+    h.script({ getResult: old.row({ state: AGENT_DIRECTOR_PENDING_STATE }) })
+    setOldLifeWaitBindings({ retryArm: { arm, armPendingOnly: () => {} }, clock: h.clock, log: () => {}, appliedConfig: () => h.config })
+
+    expect(oldLifeHoldStep(personaOf(h, p), 'runRestartWork')).toBe(true)
+    const settled = h.oldLifeWaitSettled(old.instanceId)
+    // These bindings' clock is the harness clock itself, untracked by driveSequence: move it until the wait's round is over.
+    for (let turn = 0; turn < 100 && h.oldLifeWaitRunning(old.instanceId); turn++) await h.clock.advance(1_000)
+    expect(await settled).toMatchObject({ kind: LIVE_ROW_OUTCOME_NOT_JUDGED })
+
+    const waits = [{ instanceId: old.instanceId, wait: LIVE_ROW_START_STARTED }] as const
+    const failed = oldLifeHoldLaunchLine('runRestartWork', `persona=${p}`, realpathSync(personaOf(h, p).working_directory), waits, false)
+    expect(gateLinesIn(h)).toEqual([failed])
+    expect(failed).not.toContain(OLD_LIFE_HOLD_SKIPPED_TIMER_PHRASE)
+    expect(failed).not.toBe(oldLifeHoldLaunchLine('runRestartWork', `persona=${p}`, realpathSync(personaOf(h, p).working_directory), waits, OLD_LIFE_HOLD_ARM_SKIPPED))
+    expect([oldLifeArms(h), h.controller.isArmed(p), getFailureCount(p)]).toEqual([[], false, 0])
+    // No skip line: the step skipped nothing.
+    expect(h.errors.filter((line) => [oldLifeWaitNotUpLine(p), oldLifeWaitHeldLine(p), oldLifeWaitLatchedLine(p)].includes(line))).toEqual([])
   })
 })
 

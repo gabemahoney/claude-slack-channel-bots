@@ -79,7 +79,8 @@
  *   that started before the open episode opened changes nothing either: it is
  *   older evidence than the failure that opened the episode.
  * - The first successful retry ends the episode with one cleared line (the
- *   same class label, the cause starting `cleared:`, E2's convention, naming
+ *   same class label, the cause starting `cleared:`, as the other persona
+ *   lines' clears do, naming
  *   the destination that post went to) and resets the schedule; a later
  *   failure opens a new episode and logs again.
  * - Nothing is logged per attempt. The code is copied only when it is a short
@@ -95,7 +96,7 @@
  * waiting for its retry; re-derived items compare the clock with the due
  * time, so a hold used only by the poller never creates a timer. Every timer
  * callback catches its own errors. `cancel(key)` drops the persona's held
- * notices, clears its timer and closes its episode (E12's teardown); an
+ * notices, clears its timer and closes its episode (the persona's teardown); an
  * attempt in flight then changes nothing. `cancelAll()` cancels every persona
  * (shutdown). Neither posts what it drops; each logs one line per persona
  * that had notices held (`hold cancelled` / `shutting down`), none otherwise.

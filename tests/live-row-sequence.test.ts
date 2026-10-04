@@ -217,9 +217,13 @@ import {
   liveRowSequenceFailedLine,
   liveRowSequenceGetLine,
   liveRowSequenceKillLine,
+  liveRowSequenceLaunchLine,
+  liveRowSequenceNoKillLine,
   liveRowSequenceNotStartedLine,
+  liveRowSequenceNoWaitLine,
   liveRowSequenceRunLine,
   liveRowSequenceStartLine,
+  liveRowSequenceWaitEndedLine,
   liveRowSequenceStopAskedLine,
   liveRowSequenceWaitArmedLine,
   liveRowSequenceWaitArmFailedLine,
@@ -708,6 +712,8 @@ describe('the pending wait: until G past the launch start, never early (SRJ-705 
 
     expect(times).toEqual([launchStartMs + adGraceMsInEffect()])
     expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, runs: 1, kills: 0, judgedRuns: 1 })
+    // SRJ-1014: the wait's end line, once, when G has passed.
+    expect(h.lines.filter((line) => line === liveRowSequenceWaitEndedLine(`persona=${p}`))).toHaveLength(1)
   })
 
   test('a resumed row whose started_at is older than G still waits from its launch start', async () => {
@@ -1019,6 +1025,8 @@ describe('the pending wait: until G past the launch start, never early (SRJ-705 
     const outcome = await h.runSequence(p, { lastReadState: PENDING })
 
     expect(calls).toEqual([['kill', 0], ['get', 0], ['findMissing', 0], ['get', 0]])
+    expect(h.lines.filter((line) => line === liveRowSequenceNoWaitLine(`persona=${p}`))).toHaveLength(1)
+    expect(h.lines.filter((line) => line === liveRowSequenceWaitEndedLine(`persona=${p}`))).toEqual([])
     // The key is not in the applied configuration: no launch, and no one latched.
     expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_NOT_LAUNCHED, notLaunched: LIVE_ROW_NOT_LAUNCHED_NOT_APPLIED, runs: 1 })
     expect(h.latch.isLatched(p)).toBe(false)
@@ -1390,6 +1398,7 @@ describe('ad-config-malformed: no kill of a row last read pending while P\'s out
 
     expect(outcome).toEqual({ kind: LIVE_ROW_OUTCOME_CONFIG_MALFORMED, step: 1, runs: 0, kills: 0, judgedRuns: 0, armed: LIVE_ROW_ARM_ENDED })
     expect(h.stub.callCount()).toBe(0)
+    expect(h.lines.filter((line) => line === liveRowSequenceNoKillLine(`persona=${p}`, 1))).toHaveLength(1)
     expectEndArmed(h, outcome, UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED)
   })
 
@@ -1594,6 +1603,9 @@ describe('the launch: a resume when the row has a session id and P keeps its con
       result: { key: p },
     })
     expect(h.stub.calls.resumeCalls).toEqual([{ claude_instance_id: personaInstanceId(p) }])
+    // SRJ-1014: step 6's line names the launch kind and its reason, once, before the launch.
+    const launchLine = liveRowSequenceLaunchLine(`persona=${p}`, { kind: LIVE_ROW_LAUNCH_RESUME, reason: LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION })
+    expect(h.lines.filter((line) => line === launchLine)).toHaveLength(1)
     // No reuse after the resume succeeded, and no sequence cause armed (SRJ-301): only the launch's own
     // pending-only arm for the row it left (b.jg5 SRJ-409).
     expect(h.stub.calls.spawnCalls).toEqual([])

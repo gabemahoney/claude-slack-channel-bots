@@ -199,7 +199,7 @@ export interface ApplyBringUpOptions {
 /**
  * What `reconnectCredentials` resolves with when the persona is broken by its
  * credentials by the time the operation runs: it was not reconnected, and
- * step 6 brings it up instead (E13 Director decision 4). Anything else counts
+ * step 6 brings it up instead. Anything else counts
  * as reconnected.
  */
 export interface CredentialsBrokenAtReconnect {
@@ -208,8 +208,8 @@ export interface CredentialsBrokenAtReconnect {
 
 /**
  * Whether persona `key` is broken by its credentials now (b.av2 SR-6.4),
- * asked by steps 4 and 6 when they run, not at the preview (E13 Director
- * decision 4); undefined when it cannot be told, and the plan's
+ * asked by steps 4 and 6 when they run, not at the preview; undefined when
+ * it cannot be told, and the plan's
  * `credentialsBroken` decides.
  */
 export type CredentialsBrokenNowQuery = (key: string) => boolean | undefined
@@ -309,8 +309,8 @@ function isCredentialsBrokenAtReconnect(result: unknown): result is CredentialsB
  * broken by its credentials is asked when step 4 runs
  * (`credentialsBrokenNow`; without an answer the plan's split into
  * `credentials` and `credentialsBroken` decides), because a Web API call can
- * break a persona between the preview and the apply (E13 Director decision
- * 4); a persona the reconnect found broken by its credentials when it ran
+ * break a persona between the preview and the apply; a persona the
+ * reconnect found broken by its credentials when it ran
  * (`CredentialsBrokenAtReconnect`) is left to step 6 too. The recovery
  * re-checks inside the persona's serializer turn: a persona that is not
  * broken any more by then (a pending reconnect of an earlier change brought

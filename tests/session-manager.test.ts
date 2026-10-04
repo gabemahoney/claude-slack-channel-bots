@@ -645,6 +645,7 @@ import {
   APPROVER_STOP_TMUX_UNAVAILABLE,
   STARTUP_ERROR_APPROVE_NOT_READY,
   STARTUP_ERROR_APPROVE_SPAWN_DIED,
+  STARTUP_ERROR_SPAWN_FAILED,
   approverBoundMessage,
   approverCapMessage,
   approverFinishedMessage,
@@ -669,6 +670,7 @@ import {
   compareRowToPersona,
   setSessionNotifier,
   notifySpawnFailure,
+  spawnFailureNoticeText,
   notifyRestartCapReached,
   setPreLaunchTrustPatcher,
   _resetPreLaunchTrustPatcher,
@@ -844,7 +846,8 @@ import { resolveJsonlPath } from '../src/cozempic.ts'
 import type { PersonaNoticeOptions } from '../src/persona-notifier.ts'
 import type { PersonaDestinationHold } from '../src/persona-destination-hold.ts'
 import { PERSONA_CONFIG_DIR_UNRESOLVABLE, PERSONA_DESTINATION_FAILED } from '../src/persona-diagnostics.ts'
-import { describeThrownValue } from '../src/persona-connection-errors.ts'
+import { describeThrownValue, MAX_LOGGED_MESSAGE_LENGTH, renderLogMessageText } from '../src/persona-connection-errors.ts'
+import { escapeSlackControlCharacters, unescapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import {
   makeDeferredConnect,
   makeStubSlack,
@@ -1060,6 +1063,7 @@ import {
   AD_ERROR_CLASS_UNUSABLE_NAME,
   classifyAdError,
   describeAdErrorClassification,
+  describeAdFailureForLog,
   describeAgentDirectorFailure,
   killFailedDescriptionOf,
   type AdErrorClass,
@@ -1204,6 +1208,7 @@ import {
   createConflictLatch,
   describeLatchRowState,
   latchRowStateRead,
+  notConfiguredLatchOutcome,
   type ConflictLatch,
   type ConflictLatchRecord,
   type ConflictLatchSetInput,
@@ -1254,15 +1259,23 @@ import {
   RECHECK_CLEARED_BY_FINISHED_ROW_RETRY,
   RECHECK_CLEARED_BY_RESTART_DECISION,
   RECHECK_CLEARED_BY_RETRY,
+  RECHECK_STEP_FINISHED_ROW_RETRY,
+  RECHECK_STEP_SPAWN_RETRY,
+  RECHECK_STEP_TABLE,
   latchRecheckRoundLine,
   type LatchCase,
   type LatchRecheckCleared,
+  type LatchRecheckLineStep,
 } from '../src/conflict-latch.ts'
 import {
   LATCH_RECHECK_OBSERVER_FAILED,
   LATCH_RECHECK_STATUS_READ_SITE,
   latchedElsewhereDuringCallLine,
+  latchRecheckCollidedAfterClearLine,
+  latchRecheckCollisionNoInformationLine,
+  latchRecheckNotUpLine,
   latchRecheckObserverFailedLine,
+  latchedLaunchSkipLine,
   oldLifeHoldLaunchLine,
   reuseSpawnForPersona,
   runLatchRecheckRound,
@@ -2530,7 +2543,7 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
     expect(text).toContain(`Error: \`${launchFailure.errName}\``)
     expect(text).toContain(`Remediation: ${SPAWN_FAILURE_DEFAULT_REMEDIATION}`)
     // startup-error side effect is part of the tested contract
-    expect(readLog()).toContain('[spawn-failed]')
+    expect(readLog()).toContain(`[${STARTUP_ERROR_SPAWN_FAILED}]`)
   })
 
   test('ErrSpawnNotFound after collision → single retry-spawn', async () => {
@@ -2743,7 +2756,7 @@ describe('collision ladder: ErrInvalidFlags on resume makes one version re-check
     expect(stops).toEqual([])
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, resume: 1 }))
     expect(h.notices).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     expect(refusalLines(h, p)).toEqual([invalidFlagsRefusalLine(p, invalidFlags, kind)])
     expect(h.errors.filter((line) => line.includes(`resume failed for ${renderPersonaRef(p, p)}: `))).toEqual([])
     expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
@@ -5421,7 +5434,9 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       expect(r.killCalls).toEqual(['cscb_alpha'])
       expect(r.deleteCalls).toEqual([])
       expect(startupEntriesIn(r.entries, ORPHAN_CLEANUP_LABEL)).toEqual([sweepKillFailedEntry(r.rows[0]!, renderPersonaRef('alpha', 'alpha'), killOutcomeOf({ thrown: err }))])
-      expect(r.latch.isLatched('alpha')).toBe(false)
+      // b.jg5 SRJ-1002: its server-log line is the entry's own (written to stderr by its writer); no latch line of either kind.
+      expect(r.errLog.split('\n').filter((line) => line.includes(' — CONFLICT: ') || line.includes(' — UNUSABLE NAME: ') || line.includes('conflict-latch: '))).toEqual([])
+      expect([r.latch.isLatched('alpha'), r.latch.record('alpha')]).toEqual([false, undefined])
       expect([notices, outageEmissions, armed, reported]).toEqual([[], [], [], []])
     })
 
@@ -7602,7 +7617,7 @@ describe('startupSessionManager', () => {
     const rendered = `"Ops \\"Prod\\" Bot" (key=${key})`
     expect(rendered).toBe(renderPersonaRef(name, key))
     const log = readLog()
-    expect(log).toContain('[spawn-failed]')
+    expect(log).toContain(`[${STARTUP_ERROR_SPAWN_FAILED}]`)
     expect(log).toContain(`spawn failed for ${rendered}: ${launchFailure.errName}`)
     expect(lines.some((l) => l.includes(`spawnForPersona: spawn failed for ${rendered}: ${launchFailure.errName}`))).toBe(true)
   })
@@ -7781,7 +7796,7 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
     expect(result.notBroughtUp).toBe(0)
     expect(spawnCalls.map((p) => p.claude_instance_id)).toEqual([`cscb_${f.b.key}`])
     expect(errLog).toContain(`startupSessionManager: unexpected error for ${renderPersonaRef(f.a.name, f.a.key)}`)
-    expect(countStartupEntries(readLog(), 'spawn-failed')).toBe(1)
+    expect(countStartupEntries(readLog(), STARTUP_ERROR_SPAWN_FAILED)).toBe(1)
     expect(readLog()).toContain(`unexpected error spawning ${renderPersonaRef(f.a.name, f.a.key)}`)
     assertNoLeak({ lines: f.lines, errLog, result })
   })
@@ -7824,9 +7839,9 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
     expect(lines[0]).toHaveLength(1)
     const described = `Error code=EIO message=${JSON.stringify(redactedLeakyMessage('launch exploded'))} at `
     expect(String(lines[0]![0])).toStartWith(`[slack] startupSessionManager: unexpected error for ${ref}: ${described}`)
-    const entries = readLog().split('\n').filter((l) => l.includes('] [spawn-failed] '))
+    const entries = readLog().split('\n').filter((l) => l.includes(`] [${STARTUP_ERROR_SPAWN_FAILED}] `))
     expect(entries).toHaveLength(1)
-    expect(entries[0]).toContain(`] [spawn-failed] unexpected error spawning ${ref}: ${described}`)
+    expect(entries[0]).toContain(`] [${STARTUP_ERROR_SPAWN_FAILED}] unexpected error spawning ${ref}: ${described}`)
     expect(entries[0]).not.toContain(' — ')
     assertNoLeak({ lines: f.lines, errArgs, startupErrorsLog: readLog(), result })
   })
@@ -8103,7 +8118,7 @@ describe('b.rmy: ErrTmuxSendKeys at the reconnect + reconnect outcome', () => {
     // The recovery's failure raises a spawn-failure notice and its own one
     // spawn-failed entry (the resume's); no reconnect-failed startup entry.
     expect(notices.map((n) => n.key)).toEqual(['C'])
-    expect(onlyStartupEntry(readLog(), 'spawn-failed')).toContain(`resume failed for ${renderPersonaRef('C', 'C')}: `)
+    expect(onlyStartupEntry(readLog(), STARTUP_ERROR_SPAWN_FAILED)).toContain(`resume failed for ${renderPersonaRef('C', 'C')}: `)
     expect(readLog()).not.toContain('reconnect failed')
   })
 
@@ -8546,14 +8561,14 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     expect(outageEmissions.filter((e) => e.key === 'C' && e.text === outage!.onset(err))).toHaveLength(raises)
     expect(outageEmissions[0]).toEqual({ key: 'C', text: outage!.onset(err) })
     expect(outageEmissions.filter((e) => e.text !== outage!.onset(err)).every((e) => e.text.startsWith(':white_check_mark: *All clear.*'))).toBe(true)
-    expect(countStartupEntries(readLog(), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(readLog(), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     expect(readLog()).not.toContain('reconnect failed')
 
     // The restart path's launch over the same row: a launch that did not fail, never counted.
     install()
     expect(await launchSession('C', cfg)).toBe(true)
     expect(getFailureCount('C')).toBe(0)
-    expect(countStartupEntries(readLog(), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(readLog(), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     assertNoLeak({ errLog, notices, startupErrors: readLog() })
   })
 
@@ -10677,7 +10692,7 @@ describe('b.jg5 SRJ-613: the launch wait for a working row acts on no pane alone
 
 describe('b.dup: a row a findMissing sweep ended just before /mcp reconnect landed (ErrSpawnNotInteractive)', () => {
   /** The reconnect's one line for persona `ref` when agent-director refuses its keystrokes as not interactive (b.jg5 SRJ-609). */
-  const refusedLine = (ref: string): string => reconnectNotInteractiveLine(ref, describeAgentDirectorFailure(errSpawnNotInteractive('send-keys')))
+  const refusedLine = (ref: string): string => reconnectNotInteractiveLine(ref, describeAdFailureForLog(errSpawnNotInteractive('send-keys')))
 
   /** Personas `A` and `B`, each launch polling every 1 ms. */
   function raceConfig(): PersonaConfig {
@@ -11146,7 +11161,7 @@ describe('b.f2b: one persona waiting for its working row does not hold up the st
       `[slack] startupSessionManager: unexpected error in the background launch for ${ref}: Error message=${JSON.stringify(redactedLeakyMessage('recovery launch failed'))}`,
     )
     expect(linesWith(errLog, `background launch for ${ref} settled`)).toEqual([])
-    const entry = onlyStartupEntry(readLog(), 'spawn-failed')
+    const entry = onlyStartupEntry(readLog(), STARTUP_ERROR_SPAWN_FAILED)
     expect(entry).toContain(`unexpected error spawning ${ref}: Error message=${JSON.stringify(redactedLeakyMessage('recovery launch failed'))}`)
     expect(unhandledRejections).toEqual([])
     assertNoLeak({ errLog, startupErrors: writtenFile(join(fixtureDir, 'state', 'startup-errors.log')) })
@@ -11594,7 +11609,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
 
     expect(stop).toBe(expectedStop)
     const lines = errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.startsWith(APPROVER_LOG_PREFIX))
-    expect(lines).toEqual([approverLogLine(message(describeAgentDirectorFailure(err)))])
+    expect(lines).toEqual([approverLogLine(message(describeAdFailureForLog(err)))])
     expect(lines[0]).toContain(`: ${shown}`)
     assertNoLeak({ errArgs, outageEmissions })
   })
@@ -11692,7 +11707,7 @@ describe('b.jg5 SRJ-404, SRJ-405, SRJ-118, SRJ-316: what follows the dialog appr
     } else {
       expect(log).toBe('')
     }
-    expect(countStartupEntries(log, 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(log, STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     // SRJ-405: nothing reaches the notifier from the approver.
     expect(h.posts(NOTICE_KEY).filter((post) => post.channel === NOTICE_DEST)).toEqual([])
     expect(h.posts(NOTICE_KEY)).toEqual([])
@@ -11736,7 +11751,7 @@ describe('b.jg5 SRJ-404, SRJ-405, SRJ-118, SRJ-316: what follows the dialog appr
     // It polled on past its first lap (started_at plus B had long passed there).
     expect(calls.statusCalls.length).toBeGreaterThan(1)
     expect(approverLines(errLog)).toEqual([approverLogLine(approverBoundMessage(C_REF, boundMs, APPROVER_BOUND_FROM_LAUNCH_START))])
-    expect(countStartupEntries(readLog(), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(readLog(), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     expect(notices).toEqual([])
     expect(getFailureCount('C')).toBe(0)
     expect(calls.sendKeysCalls).toEqual([])
@@ -11781,7 +11796,7 @@ describe('b.jg5 SRJ-404, SRJ-405, SRJ-118, SRJ-316: what follows the dialog appr
     expect(clock.pendingCount()).toBe(0)
     expect(calls.killCalls).toEqual([])
     expect(calls.deleteCalls).toEqual([])
-    expect(approverLines(errLog)).toEqual([approverLogLine(approverNotInteractiveMessage(C_REF, 'send-keys', describeAgentDirectorFailure(refused)))])
+    expect(approverLines(errLog)).toEqual([approverLogLine(approverNotInteractiveMessage(C_REF, 'send-keys', describeAdFailureForLog(refused)))])
     expect(notices).toEqual([])
     expect(readLog()).toBe('')
     expect(getFailureCount('C')).toBe(0)
@@ -11820,7 +11835,7 @@ describe('b.jg5 SRJ-404, SRJ-405, SRJ-118, SRJ-316: what follows the dialog appr
     const laps = boundMs / DIALOG_SLOW_POLL_INTERVAL_MS
     expect(calls.statusCalls).toHaveLength(laps)
     expect(calls.readPaneCalls).toHaveLength(1)
-    const failure = describeAgentDirectorFailure(err)
+    const failure = describeAdFailureForLog(err)
     expect(approverLines(errLog)).toEqual([
       approverLogLine(approverPaneCallFailedMessage(C_REF, 'read-pane', failure)),
       ...Array.from({ length: laps - 1 }, () => approverLogLine(approverStatusRefusedMessage(C_REF, failure))),
@@ -11831,7 +11846,7 @@ describe('b.jg5 SRJ-404, SRJ-405, SRJ-118, SRJ-316: what follows the dialog appr
     expect(armed[0]).toEqual({ key: 'C', kind: UNAVAILABLE_RETRY_CAUSE_CONFIG })
     expect(armed.filter((a) => a.key !== 'C' || a.kind !== UNAVAILABLE_RETRY_CAUSE_CONFIG)).toEqual([])
     expect(notices).toEqual([])
-    expect(countStartupEntries(readLog(), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(readLog(), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     expect(getFailureCount('C')).toBe(0)
     expect(calls.sendKeysCalls).toEqual([])
     expect(calls.killCalls).toEqual([])
@@ -13663,7 +13678,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(spawnCalls).toHaveLength(1) // the colliding optimistic spawn only
     const log = readLog()
     expect(countStartupEntries(log, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
-    expect(countStartupEntries(log, 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(log, STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     expect(notices).toEqual([])
     expect([...getOutageFlags(CH)]).toEqual(['ad-config-malformed'])
     expect(outageEmissions).toEqual([{ key: CH, text: adConfigMalformedOnset(err) }])
@@ -13717,16 +13732,14 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
    * a CONFIG or UNUSABLE NAME answer takes): its errName and the client's own
    * description; the envelope's description is not shown.
    */
-  const unknownNameShown = (err: { errName: string; errDescription: string }): string =>
-    `${err.errName} ${quoted(err.errDescription)}`
 
   // AC 20 (b.av2 SR-10.3) with b.jg5 SRJ-105, SRJ-512: an UNUSABLE NAME
   // answer at the row fetch is no read error and reaches no inconclusive
   // report: it latches the persona, so no diagnosis is reported (no
   // inconclusive line, record or notice) and nothing is deleted or spawned.
-  // Its one UNUSABLE NAME line names it by describeAgentDirectorFailure — an
-  // agent-director error's errName and redacted description when the errName
-  // is a short identifier — and the latch's record holds the classification's
+  // Its one UNUSABLE NAME line names it by describeAdFailureForLog — the
+  // reported name and the redacted description, as the launch sites' refusal
+  // lines give it (b.jg5 SRJ-104) — and the latch's record holds the classification's
   // redacted description; never the thrown value's raw message, description
   // or envelope, which carry fake tokens here.
   const leakyConfig = (): unknown => errUnknownErrorName('ErrConfigMalformed', adDescription())
@@ -13740,7 +13753,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const deleteCalls: import('agent-director').DeleteParams[] = []
     installDiagnosisGetFailure(cfg, leakyUnusableName, { spawnCalls, deleteCalls })
-    const shown = unknownNameShown(leakyUnusableName() as { errName: string; errDescription: string })
+    const shown = describeAdFailureForLog(leakyUnusableName())
     let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
     const errArgs = await withErrArgs(async () => {
       result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
@@ -13751,7 +13764,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     const lines = errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.startsWith(prefix))
     expect(lines).toHaveLength(1)
     expect(lines[0]).not.toContain('\n')
-    expect(lines[0]!.slice(prefix.length).split(' — UNUSABLE NAME: ')[0]!.split(' at ')[0]).toBe(shown)
+    expect(lines[0]!.slice(prefix.length).split(' — UNUSABLE NAME: ')[0]).toBe(shown)
     expect(lines[0]).toEndWith(' — UNUSABLE NAME: the persona latched; nothing more is called for it (b.jg5 SRJ-105, SRJ-512)')
     const record = latch.record(CH)
     expect(record).toMatchObject({ latchCase: LATCH_CASE_UNUSABLE_RECORDED_NAME, refusedOperation: REFUSED_OPERATION_NONE, rowState: LATCH_ROW_STATE_UNREADABLE })
@@ -13795,8 +13808,10 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   // AC 20 with b.jg5 SRJ-105: every other row-fetch failure is a read error,
   // and a CONFIG answer has its own refusal row (SRJ-316), so the diagnostic
   // get is refused. The refusal line names each shape by
-  // describeAgentDirectorFailure (redacted, on one line: a two-line errName
-  // cannot inject a line), and nothing is posted: no inconclusive notice, no
+  // describeAdFailureForLog (redacted, on one line: a two-line errName
+  // cannot inject a line; an `ErrUnknownErrorName` by the name and the
+  // description agent-director reported, never the client's placeholder,
+  // b.jg5 SRJ-104), and nothing is posted: no inconclusive notice, no
   // jsonl-diagnosis-inconclusive or spawn-failed entry, no delete, no spawn.
   // Only the CONFIG answer raises an outage: its onset, which quotes the
   // description redacted, is leak-checked with the rest.
@@ -13804,7 +13819,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     [
       'a CONFIG answer whose envelope description holds a URL and a fake token (b.jg5 SRJ-316)',
       leakyConfig,
-      unknownNameShown(leakyConfig() as { errName: string; errDescription: string }),
+      `ErrConfigMalformed ${quoted(REDACTED_AD_DESCRIPTION)}`,
     ],
     [
       'a base AgentDirectorError',
@@ -13853,7 +13868,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(notices).toEqual([])
     const log = readLog()
     expect(countStartupEntries(log, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
-    expect(countStartupEntries(log, 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(log, STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     expect(errArgs.flat().map(String).filter((l) => l.includes('ErrJsonlMissing diagnosis get failed for '))).toEqual([])
     expect(deleteCalls).toEqual([])
     expect(spawnCalls).toHaveLength(1) // the colliding optimistic spawn only
@@ -13883,7 +13898,9 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     const entry = onlyStartupEntry(readLog(), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)
     expect(entry).toContain(reported)
     expect(entry.endsWith(` — ErrJsonlMissing message=${JSON.stringify(REDACTED_AD_DESCRIPTION)}`)).toBe(true)
-    expect(notices.map((n) => n.text).filter((t) => t.includes(reported))).toHaveLength(1)
+    // The notice quotes it escaped once for Slack (b.jg5 SRJ-1018).
+    expect(notices.map((n) => n.text).filter((t) => t.includes(escapeSlackControlCharacters(reported)))).toHaveLength(1)
+    expect(notices.map((n) => n.text).filter((t) => t.includes(REDACTED_URL_PLACEHOLDER))).toEqual([])
     assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
   })
 
@@ -13916,6 +13933,40 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     const cause = entry.slice(entry.lastIndexOf(' — ') + ' — '.length)
     expect(cause).toBe(`ErrJsonlMissing message=${JSON.stringify(REDACTED_AD_DESCRIPTION)}`)
     expect(notices.map((notice) => notice.key)).toEqual([CH])
+    assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
+  })
+
+  // b.jg5 SRJ-1018: the lost notice's "Paths tried" names the transcript
+  // candidates, one of them the row's jsonl_path as agent-director reported
+  // it; posted to Slack, it is escaped once, so a `<!here>` or an `&` in a
+  // path is text, never markup. The server log and the record keep the path
+  // as read.
+  test('b.jg5 SRJ-1018: lost, with a row jsonl_path holding Slack control characters → the notice\'s "Paths tried" quotes the candidates escaped once for Slack; the log line and the record keep the path as read', async () => {
+    const readLog = captureStartupErrors()
+    const startedAt = '2026-09-20T05:00:00Z'
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, {
+      message_archive_db: makeArchiveWithMessagesSince(startedAt, 2),
+    })
+    const jsonlPath = '/data/<!here>&proj/sess-6.jsonl'
+    installAmnesia({
+      cfg,
+      spawnCalls: [],
+      getResult: { jsonl_path: jsonlPath, claude_session_id: 'sess-6', cwd: CWD, started_at: startedAt },
+    })
+    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
+    })
+
+    expect(result?.action).toBe('fresh-after-amnesia')
+    expect(notices).toHaveLength(1)
+    const text = notices[0]!.text
+    const tried = text.slice(text.indexOf('Paths tried: ') + 'Paths tried: '.length)
+    expect(tried).toContain(escapeSlackControlCharacters(jsonlPath))
+    expect(tried).not.toMatch(/[<>]/)
+    expect(text).not.toContain(jsonlPath)
+    expect(onlyStartupEntry(readLog(), JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)).toContain(jsonlPath)
+    expect(errLog).toContain(jsonlPath)
     assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
   })
 
@@ -16010,7 +16061,7 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
     })
 
     expect(result).toEqual({ key: 'C', action: 'failed' })
-    expect(countStartupEntries(readLog(), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(readLog(), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     expect(notices).toEqual([])
     const refused = errLog.split('\n').filter((l) => l.startsWith(`[slack] spawnForPersona: spawn refused for ${renderPersonaRef('C', 'C')}: `))
     expect(refused).toHaveLength(1)
@@ -16032,22 +16083,24 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
       await spawnForPersona(personaOf(cfg, 'C'), cfg)
     })
 
-    const entry = onlyStartupEntry(readLog(), 'spawn-failed')
-    expect(entry.endsWith(`] [spawn-failed] spawn failed for ${renderPersonaRef('C', 'C')}: ${launchFailureName} message=${JSON.stringify(REDACTED_AD_DESCRIPTION)}`)).toBe(true)
+    const entry = onlyStartupEntry(readLog(), STARTUP_ERROR_SPAWN_FAILED)
+    expect(entry.endsWith(`] [${STARTUP_ERROR_SPAWN_FAILED}] spawn failed for ${renderPersonaRef('C', 'C')}: ${launchFailureName} message=${JSON.stringify(REDACTED_AD_DESCRIPTION)}`)).toBe(true)
     assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
   })
 
   // notifySpawnFailure (E13 carry): the notice's Error line is
   // "`<label>` — <description>". The label is the errName when it is a short
-  // identifier, else the describer's type and frames without its message (so
-  // neither the unchecked errName nor a second copy of the description shows);
-  // the description is redacted first and then cut to 300 characters, so text
-  // past character 300 of the raw description shows when a long URL shrinks
-  // to its placeholder. The description appears once in the posted text.
+  // identifier, else the describer's type with no message and no stack
+  // frames (so neither the unchecked errName, a second copy of the
+  // description nor a host path shows); the description is redacted first,
+  // then cut to MAX_LOGGED_MESSAGE_LENGTH characters (renderLogMessageText),
+  // then escaped once for Slack, so text past character 300 of the raw
+  // description shows when a long URL shrinks to its placeholder. The
+  // description appears once in the posted text.
   test.each<[string, () => string, (label: string) => void]>([
-    ['a token-shaped errName is named by its type', tokenErrName, (label) => expect(label.startsWith('AgentDirectorError ')).toBe(true)],
+    ['a token-shaped errName is named by its type alone', tokenErrName, (label) => expect(label).toBe(AgentDirectorError.name)],
     ['a safe errName is named as is', () => 'ErrSpawnBroken', (label) => expect(label).toBe('ErrSpawnBroken')],
-  ])('the spawn-failure notice posted to Slack: %s; its description (a fake token and a ?ticket= URL) is redacted, then capped at 300 characters, and shown once; nothing leaks', async (_label, errName, checkLabel) => {
+  ])('the spawn-failure notice posted to Slack: %s; its description (a fake token and a ?ticket= URL) is redacted, then capped at 300 characters, escaped for Slack and shown once; nothing leaks', async (_label, errName, checkLabel) => {
     captureStartupErrors()
     const cfg = makeNoticeConfig()
     const h = installNoticeNotifier(cfg, { leakMarker: LEAK_SENTINEL })
@@ -16062,11 +16115,71 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
     expect(errorLine).toHaveLength(1)
     const [, label, shown] = /^ {2}Error: `(.*)` — (.*)$/.exec(errorLine[0]!) ?? []
     checkLabel(label!)
-    expect(shown).toBe(`${REDACTED_URL_PLACEHOLDER} ${REDACTED_TOKEN_PLACEHOLDER} ${'y'.repeat(400)} end`.slice(0, 300))
+    expect(shown).toBe(escapeSlackControlCharacters(renderLogMessageText(description)))
+    const plain = unescapeSlackControlCharacters(shown!)
+    expect(plain).toHaveLength(MAX_LOGGED_MESSAGE_LENGTH)
+    expect(plain).toStartWith(`${REDACTED_URL_PLACEHOLDER} ${REDACTED_TOKEN_PLACEHOLDER} ${'y'.repeat(200)}`)
+    expect(shown).not.toMatch(/[<>]/)
     // Once: the label carries no copy of the description.
-    expect(text.split(REDACTED_URL_PLACEHOLDER)).toHaveLength(2)
-    expect(text.split(REDACTED_TOKEN_PLACEHOLDER)).toHaveLength(2)
+    expect(text.split(escapeSlackControlCharacters(REDACTED_URL_PLACEHOLDER))).toHaveLength(2)
+    expect(text.split(escapeSlackControlCharacters(REDACTED_TOKEN_PLACEHOLDER))).toHaveLength(2)
     assertNoLeak({ text, logs: h.logs, notices })
+  })
+
+  // spawnFailureNoticeText (b.av2 SR-7.2, b.jg5 SRJ-1018): the notice's body
+  // is three lines; its Error line quotes agent-director's description as
+  // SRJ-1018 quotes one: redacted, on one line, capped
+  // (renderLogMessageText), then escaped once for Slack, so a `<!channel>`,
+  // a `<@U…>` mention or an `&` in it reaches Slack as text, never markup.
+  describe('spawnFailureNoticeText', () => {
+    const errorLineOf = (text: string): { label: string; shown: string } => {
+      const lines = text.split('\n')
+      expect(lines).toHaveLength(3)
+      expect(lines[0]).toBe('Spawn failure:')
+      expect(lines[2]).toStartWith('  Remediation: ')
+      const [, label, shown] = /^ {2}Error: `(.*)` — (.*)$/.exec(lines[1]!) ?? []
+      expect([label, shown].every((part) => part !== undefined)).toBe(true)
+      return { label: label!, shown: shown! }
+    }
+
+    test('a multi-line description with Slack control characters, a fake token and a URL: one Error line, redacted, its line breaks collapsed and each control character escaped once; nothing leaks', () => {
+      const description = `refused <!channel> &\nping <@U0MENTION> ${fakeToken(BOT_TOKEN_PREFIX, 'escape')}\r\nsee https://example.invalid/x?ticket=${LEAK_SENTINEL} &amp; done`
+      const text = spawnFailureNoticeText(errGeneric('spawn', 'ErrSpawnBroken', description))
+
+      const { label, shown } = errorLineOf(text)
+      expect(label).toBe('ErrSpawnBroken')
+      expect(shown).toBe(escapeSlackControlCharacters(renderLogMessageText(description)))
+      expect(shown).not.toMatch(/[<>\n\r]/)
+      expect(shown).toContain('&lt;!channel&gt; &amp;')
+      expect(shown).toContain('&lt;@U0MENTION&gt;')
+      // Escaped once: an `&amp;` in the description shows as `&amp;amp;`, and unescaping gives the rendered text back.
+      expect(shown).toContain('&amp;amp; done')
+      expect(unescapeSlackControlCharacters(shown)).toBe(renderLogMessageText(description))
+      expect(shown).toContain(escapeSlackControlCharacters(REDACTED_TOKEN_PLACEHOLDER))
+      expect(shown).toContain(escapeSlackControlCharacters(REDACTED_URL_PLACEHOLDER))
+      assertNoLeak({ text })
+    })
+
+    test('a description longer than MAX_LOGGED_MESSAGE_LENGTH is capped before it is escaped: the unescaped text is exactly the cap', () => {
+      const description = `${'<'.repeat(10)} ${'z'.repeat(MAX_LOGGED_MESSAGE_LENGTH * 2)}`
+      const { shown } = errorLineOf(spawnFailureNoticeText(errGeneric('spawn', 'ErrSpawnBroken', description)))
+
+      expect(unescapeSlackControlCharacters(shown)).toHaveLength(MAX_LOGGED_MESSAGE_LENGTH)
+      expect(shown).toBe(escapeSlackControlCharacters(renderLogMessageText(description)))
+      expect(shown).toStartWith('&lt;'.repeat(10))
+    })
+
+    test('a token-shaped errName is named by the error\'s type alone: no errName, no copy of the description and no stack frame; nothing leaks', () => {
+      const err = new AgentDirectorError('spawn', tokenErrName(), adDescription())
+      const text = spawnFailureNoticeText(err)
+
+      const { label, shown } = errorLineOf(text)
+      expect(label).toBe(AgentDirectorError.name)
+      expect(shown).toBe(escapeSlackControlCharacters(REDACTED_AD_DESCRIPTION))
+      expect(text).not.toContain(' <- ')
+      expect(text.split(escapeSlackControlCharacters(REDACTED_URL_PLACEHOLDER))).toHaveLength(2)
+      assertNoLeak({ text })
+    })
   })
 })
 
@@ -16603,14 +16716,14 @@ async function expectRefusedAt(
     expect(h.outageNotices[0]!.text).toBe(onsetText)
     expect(getOutageFlags(p).has(outageClass)).toBe(true)
   }
-  expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+  expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
   if (site.reconnectBranch === undefined) {
     expect(refusalLines(h, p)).toHaveLength(1)
   } else {
     // b.jg5 SRJ-118: the reconnect's transient line, then the ladder's, and no refusal line.
     const ref = renderPersonaRef(p, p)
     expect(refusalLines(h, p)).toEqual([])
-    expect(h.errors.filter((line) => line === reconnectTransientLine(ref, describeAgentDirectorFailure(err), classifyAdError(err).errorClass))).toHaveLength(1)
+    expect(h.errors.filter((line) => line === reconnectTransientLine(ref, describeAdFailureForLog(err), classifyAdError(err).errorClass))).toHaveLength(1)
     expect(h.errors.filter((line) => line === transientReconnectLine(ref, site.reconnectBranch!, SPAWN_ACTION_RETRYING))).toHaveLength(1)
   }
   expect(h.triggers).toEqual([{ key: p, kind: triggerKind }])
@@ -16622,7 +16735,7 @@ async function expectRefusedAt(
   expect(await h.drive(launchSession(p, h.config))).toBe('refused')
   expect(getFailureCount(p)).toBe(0)
   expect(h.notices).toEqual([])
-  expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+  expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
 
   // B's launch is unaffected: only its own launch's pending-only watch.
   h.script(clearedScript(script))
@@ -16690,7 +16803,7 @@ async function expectWaitGoesOnAt(
     expect(h.outageNotices[0]).toEqual({ key: p, text: onsetText })
     expect(h.outageNotices.filter((n) => n.text === onsetText)).toHaveLength(1)
   }
-  expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+  expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
   expect(h.startupErrors().join('\n')).not.toContain('reconnect failed')
   expect(refusalLines(h, p)).toEqual([])
   expect(h.triggers).toEqual([{ key: p, kind: triggerKind }])
@@ -16705,7 +16818,7 @@ async function expectWaitGoesOnAt(
   h.script(site.script(h, persona, err))
   expect(await launchSession(p, h.config)).toBe(true)
   expect(getFailureCount(p)).toBe(0)
-  expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+  expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
 
   // B's launch is unaffected: only its own launch's pending-only watch.
   h.script(clearedScript(script))
@@ -16855,7 +16968,7 @@ describe('b.jg5 SRJ-105: UNAVAILABLE is never destructive', () => {
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: site.sendKeys }))
     expect(h.stub.calls.readPaneCalls.length).toBeGreaterThan(0)
     expect(h.notices).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     expect(refusalLines(h, p)).toEqual([])
     expect(getFailureCount(p)).toBe(0)
   })
@@ -17018,7 +17131,7 @@ describe('b.jg5 SRJ-105, SRJ-605: a read error at the collision get or the ErrJs
 
     expect(h.notices.filter((n) => n.key === p && n.text.includes(ErrSpawnNotFound.name))).toHaveLength(1)
     expect(onlyStartupEntry(h.startupErrors().join('\n'), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toContain(ErrSpawnNotFound.name)
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     expect(h.latchEvents).toEqual([])
   })
 })
@@ -18280,7 +18393,7 @@ describe('b.jg5 SRJ-301, SRJ-105: a persona that joins another\'s in-flight shar
     expect(h.outageNotices).toHaveLength(outage === undefined ? 0 : 2)
     expect(h.notices).toEqual([])
     expect(h.episodeNotices).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
   })
 })
 
@@ -18329,7 +18442,7 @@ const APPROVER_CALL_SITES: readonly ApproverCallSite[] = [
     script: (err) => ({ statusError: err }),
     paneReadsPerLap: 0,
     entersPerLap: 0,
-    line: (ref, err) => approverLogLine(approverStatusRefusedMessage(ref, describeAgentDirectorFailure(err))),
+    line: (ref, err) => approverLogLine(approverStatusRefusedMessage(ref, describeAdFailureForLog(err))),
   },
   {
     name: 'the dialog approver\'s pane read',
@@ -18337,7 +18450,7 @@ const APPROVER_CALL_SITES: readonly ApproverCallSite[] = [
     script: (err) => ({ statusResult: cannedStatusResult({ state: 'pending' }), readPaneError: err }),
     paneReadsPerLap: 1,
     entersPerLap: 0,
-    line: (ref, err) => approverLogLine(approverPaneCallFailedMessage(ref, 'read-pane', describeAgentDirectorFailure(err))),
+    line: (ref, err) => approverLogLine(approverPaneCallFailedMessage(ref, 'read-pane', describeAdFailureForLog(err))),
   },
   {
     name: 'the dialog approver\'s Enter on a dialog',
@@ -18345,7 +18458,7 @@ const APPROVER_CALL_SITES: readonly ApproverCallSite[] = [
     script: (err) => ({ statusResult: cannedStatusResult({ state: 'pending' }), readPaneResults: [{ pane: DEV_CHANNELS_DIALOG_PANE }], sendKeysError: err }),
     paneReadsPerLap: 1,
     entersPerLap: 1,
-    line: (ref, err) => approverLogLine(approverPaneCallFailedMessage(ref, 'send-keys', describeAgentDirectorFailure(err))),
+    line: (ref, err) => approverLogLine(approverPaneCallFailedMessage(ref, 'send-keys', describeAdFailureForLog(err))),
   },
 ]
 
@@ -18379,7 +18492,7 @@ const APPROVER_RAISED_ANSWERS: readonly ApproverRaisedAnswer[] = [
     kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
     outage: 'tmux-unavailable',
     onset: () => text,
-    line: (site, ref, err) => approverLogLine(approverTmuxUnavailableMessage(ref, site.verb, describeAgentDirectorFailure(err))),
+    line: (site, ref, err) => approverLogLine(approverTmuxUnavailableMessage(ref, site.verb, describeAdFailureForLog(err))),
     stop: APPROVER_STOP_TMUX_UNAVAILABLE,
   })),
   {
@@ -18424,7 +18537,7 @@ describe('b.jg5 SRJ-401, SRJ-404, SRJ-105, SRJ-311, SRJ-313, SRJ-316, SRJ-501, S
     expect(h.notices).toEqual([])
     expect(h.outageNotices).toEqual([])
     expect([...getOutageFlags(p)]).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     expect(refusalLines(h, p)).toEqual([])
     expect(getFailureCount(p)).toBe(0)
     // Outside the attempt: nothing armed, started or opened but the launch's
@@ -18478,7 +18591,7 @@ describe('b.jg5 SRJ-401, SRJ-404, SRJ-105, SRJ-311, SRJ-313, SRJ-316, SRJ-501, S
     expect(getFailureCount(p)).toBe(0)
     expect(refusalLines(h, p)).toEqual([])
     expect(h.notices).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     expect(h.tmuxUnresponsive.holds(p)).toBe(false)
     expect(conditionStartedLines(h, p)).toEqual([])
     expect(unclassifiedStartedLines(h, p)).toEqual([])
@@ -18841,7 +18954,7 @@ function expectLatchedOnce(h: RecoveryHarness, p: string, expected: ExpectedLatc
   // The latch's one post is P's only post: no spawn-failure notice, outage onset or lost-message notice (b.jg5 SRJ-713, AC 7).
   expect([h.notices, h.outageNotices, h.lostMessageNotices]).toEqual([[], [], []])
   const log = h.startupErrors().join('\n')
-  expect(countStartupEntries(log, 'spawn-failed')).toBe(0)
+  expect(countStartupEntries(log, STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
   expect(countStartupEntries(log, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(inconclusiveEntries)
   expect(countStartupEntries(log, JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)).toBe(0)
   expect(getFailureCount(p)).toBe(0)
@@ -18880,7 +18993,7 @@ async function expectLaunchedByNoPath(h: RecoveryHarness, p: string, b: string, 
   expect(h.notices).toHaveLength(noticesBefore)
   expect(getFailureCount(p)).toBe(0)
   expect(h.controller.isArmed(p)).toBe(false)
-  expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+  expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
 
   h.script(clearedScript(script))
   expect(await h.launch(b)).toEqual({ key: b, action: 'spawned' })
@@ -18961,7 +19074,7 @@ describe('b.jg5 SRJ-105, SRJ-501, SRJ-502: a CONFLICT at any spawn or resume of 
     expect(h.stub.calls.statusCalls).toEqual([])
     // The inconclusive diagnosis keeps its entry; its notice waits for a reuse that brings P up, so none is posted.
     expect(countStartupEntries(h.startupErrors().join('\n'), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(1)
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     expect(h.notices).toEqual([])
     expect(h.episodeNotices).toEqual([{ key: p, text: row.notice.text }])
     expect(getFailureCount(p)).toBe(0)
@@ -19010,7 +19123,7 @@ describe('b.jg5 SRJ-105, SRJ-501, SRJ-502: a CONFLICT at any spawn or resume of 
     expect(first.failed).toBe(0)
     expect(first.succeeded).toBe(1)
     expect(first.freshSpawned).toBe(1)
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     expect(h.notices).toEqual([])
     expect(h.episodeNotices).toEqual([{ key: p, text: row.notice.text }])
     expect(h.latch.record(p)?.rowState).toEqual(LATCH_ROW_STATE_NO_ROW)
@@ -19050,7 +19163,7 @@ describe('b.jg5 SRJ-501, SRJ-502: the session manager\'s latch install', () => {
     expect(statusCalls).toEqual([])
     expect(spawnCalls).toHaveLength(1)
     expect(notices).toEqual([])
-    expect(countStartupEntries(readLog(), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(readLog(), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     expect(getFailureCount('C')).toBe(0)
     assertNoLeak({ errLog, notices })
 
@@ -19095,7 +19208,7 @@ describe('b.jg5 SRJ-501, SRJ-502: the session manager\'s latch install', () => {
     expect(conflictLines[0]).toContain(' — CONFLICT: latching the persona failed: ')
     expect(conflictLines[0]).toContain('latch store broken')
     expect(notices).toEqual([])
-    expect(countStartupEntries(readLog(), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(readLog(), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     expect(getFailureCount('C')).toBe(0)
   })
 
@@ -19142,7 +19255,7 @@ describe('b.jg5 SRJ-501, SRJ-502: the session manager\'s latch install', () => {
     expect(noteLines).toHaveLength(1)
     expect(noteLines[0]).toContain(outcome)
     expect(notices).toEqual([])
-    expect(countStartupEntries(readLog(), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(readLog(), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     expect(getFailureCount('C')).toBe(0)
     assertNoLeak({ errLog, notices })
   })
@@ -19193,7 +19306,7 @@ describe('b.jg5 SRJ-501, SRJ-502: the session manager\'s latch install', () => {
     expect(gateLines).toHaveLength(3)
     expect(gateLines.every((line) => line.includes(logged) && line.includes('case=unknown'))).toBe(true)
     expect(notices).toEqual([])
-    expect(countStartupEntries(readLog(), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(readLog(), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     expect(getFailureCount('C')).toBe(0)
     assertNoLeak({ errLog, notices })
   })
@@ -19294,7 +19407,7 @@ function expectNoteLatchedOnce(h: RecoveryHarness, p: string, rowState: LatchRow
   expect(h.episodeNotices).toEqual([{ key: p, text: noteLatchNotice(p) }])
   expect(h.notices).toEqual([])
   const log = h.startupErrors().join('\n')
-  expect(countStartupEntries(log, 'spawn-failed')).toBe(0)
+  expect(countStartupEntries(log, STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
   expect(countStartupEntries(log, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
   expect(getFailureCount(p)).toBe(0)
   expect(h.controller.isArmed(p)).toBe(false)
@@ -20542,7 +20655,7 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
 
     expect(order).toEqual(['list', 'kill', 'findMissing', 'get'])
     expect(getIds(h)).toEqual([personaInstanceId(p)])
-    const failure = describeAgentDirectorFailure(err)
+    const failure = describeAdFailureForLog(err)
     expect(h.errors.filter((line) => line.includes(' — UNUSABLE NAME met in '))).toEqual([
       `[slack] reconcileOrphans: post-sweep get for persona=${p}: ${failure} — UNUSABLE NAME met in the start sweep: routed to the server log; nothing latches (b.jg5 SRJ-512, SRJ-1002)`,
     ])
@@ -20912,6 +21025,152 @@ describe('b.jg5 SRJ-105, SRJ-512, SRJ-501, SRJ-502: an UNUSABLE NAME answer at a
   })
 })
 
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-1002, SRJ-501, SRJ-512 (t3.b6r.eg.r1.j3): a CONFLICT or an
+// UNUSABLE NAME met at a launch for a key the configured-persona query no
+// longer holds (an apply removed it while its launch ran) latches nothing:
+// no latch-time read, no latch entry, no post, no episode; the site's one
+// line carries `notConfiguredLatchOutcome`'s outcome, and no startup-errors
+// entry is written (SRJ-1013 has no class for it). The same answer for an
+// applied key beside it latches as before, and with no configured-persona
+// query installed, or one that throws, the removed key latches as before.
+// Two launch sites: the first spawn (which read nothing, so a latch would
+// make the latch-time read) and the resume of an ended row; every CONFLICT
+// case and every UNUSABLE NAME fault the stub builds at each.
+// ---------------------------------------------------------------------------
+
+/** The two launch sites the not-configured guard is driven at: the first spawn and the resume of an ended row. */
+const NOT_CONFIGURED_CONFLICT_SITES: readonly LatchSite[] = [LATCH_SPAWN_SITES[0]!, LATCH_RESUME_SITES[0]!]
+
+/** The same two sites as UNUSABLE NAME ladder sites. */
+const NOT_CONFIGURED_UNUSABLE_SITES: readonly UnusableLadderSite[] = [
+  { ...LATCH_SPAWN_SITES[0]!, kind: 'plain spawn' },
+  { ...LATCH_RESUME_SITES[0]!, kind: 'resume' as const },
+]
+
+/**
+ * P, no longer configured, met a latching answer at `site` and was routed
+ * log-only (b.jg5 SRJ-1002): the launch made exactly the site's calls and no
+ * latch-time read; P has no latch entry, no latch event and no post of any
+ * kind; nothing was counted, armed, refused or reported; no startup-errors
+ * entry of any class was written; and its one line of the answer's kind
+ * (`lines`) carries `says`, the not-configured outcome.
+ */
+function expectNotConfiguredRouted(h: RecoveryHarness, p: string, site: Pick<LatchSite, 'calls' | 'reads'>, lines: readonly string[], says: string): void {
+  expect(ladderCallsMade(h)).toEqual(site.calls)
+  expect(h.stub.calls.statusCalls).toHaveLength(site.reads.status)
+  expect([h.latch.isLatched(p), h.latch.record(p)]).toEqual([false, undefined])
+  expect(h.latchEvents).toEqual([])
+  expect([h.episodeNotices, h.notices, h.outageNotices, h.lostMessageNotices]).toEqual([[], [], [], []])
+  expect(h.startupErrors()).toEqual([])
+  expect([getFailureCount(p), h.controller.isArmed(p), refusalLines(h, p)]).toEqual([0, false, []])
+  expect(h.triggers.filter((t) => t.key === p)).toEqual([])
+  expect([h.unclassifiedErrorOpen(p), unclassifiedStartedLines(h, p)]).toEqual([false, []])
+  expect(lines).toHaveLength(1)
+  expect(lines[0]).toContain(says)
+  assertNoLeak({ lines })
+}
+
+describe('b.jg5 SRJ-1002, SRJ-501, SRJ-512: a launch-site CONFLICT or UNUSABLE NAME for a key no longer in the applied configuration latches nothing, posts nothing and writes one line and no startup-errors entry; an applied key beside it latches', () => {
+  afterEach(srj105AfterEach)
+
+  const conflictCross = NOT_CONFIGURED_CONFLICT_SITES.flatMap((site) => conflictRowsAt(site).map((row) => [site.name, row.name, site, row] as const))
+  test.each(conflictCross)('%s answering %s for P, which the configured-persona query no longer holds: answered latched with no latch-time read; nothing latched or posted; one CONFLICT line naming the case and the refused operation as not configured; no startup-errors entry. Then B, applied, meets the same answer and latches once', async (_site, _row, site, row) => {
+    const { h, p, b } = srj105Build()
+    setConfiguredPersonaQuery((key) => key === b)
+    site.setup?.(h)
+    h.script(site.script(h, harnessPersona(h, p), row.build(), row))
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+
+    expectNotConfiguredRouted(h, p, site, conflictLinesIn(h.errors, p), ` — CONFLICT: ${notConfiguredLatchOutcome(row.latchCase, refusedOperationAt(site))}; `)
+
+    h.script(site.script(h, harnessPersona(h, b), row.build(), row))
+    expect(await h.launch(b)).toStrictEqual({ key: b, action: 'latched' })
+    expectLatchedOnce(h, b, conflictLatch(b, row, refusedOperationAt(site), site.lastRead ?? row.rowState))
+    expect(h.latch.isLatched(p)).toBe(false)
+  })
+
+  const unusableCross = NOT_CONFIGURED_UNUSABLE_SITES.flatMap((site) => unusableNameRowsAt(site.kind).map((row) => [site.name, row.fault, site, row] as const))
+  test.each(unusableCross)('%s answering UNUSABLE NAME (%s) for P, which the configured-persona query no longer holds: answered latched with no latch-time read; nothing latched or posted; one UNUSABLE NAME line saying not configured; no startup-errors entry. Then B, applied, meets the same answer and latches once', async (_site, _fault, site, row) => {
+    const { h, p, b } = srj105Build()
+    setConfiguredPersonaQuery((key) => key === b)
+    site.setup?.(h)
+    h.script(site.script(h, harnessPersona(h, p), row.build(), row))
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+
+    expectNotConfiguredRouted(h, p, site, unusableNameLinesOf(h, p), ` — UNUSABLE NAME: ${notConfiguredLatchOutcome(LATCH_CASE_UNUSABLE_RECORDED_NAME, REFUSED_OPERATION_NONE)}; `)
+
+    h.script(site.script(h, harnessPersona(h, b), row.build(), row))
+    expect(await h.launch(b)).toStrictEqual({ key: b, action: 'latched' })
+    expectLatchedOnce(h, b, unusableNameLatch(b, row, site.lastRead ?? row.rowState))
+    expect(h.latch.isLatched(p)).toBe(false)
+  })
+
+  // With no configured-persona query installed, or one that throws, the guard
+  // is not met: P latches exactly as a configured persona does.
+  const queries: ReadonlyArray<readonly [string, () => void]> = [
+    ['no configured-persona query is installed', () => setConfiguredPersonaQuery(undefined)],
+    ['the configured-persona query throws', () => setConfiguredPersonaQuery(() => { throw new Error('configured query broken') })],
+  ]
+  test.each(queries)('control, %s: a CONFLICT at the first spawn latches P as before, with its latch-time read and one post', async (_label, install) => {
+    const { h, p } = srj105Build()
+    install()
+    const site = LATCH_SPAWN_SITES[0]!
+    const row = conflictRowsAt(site)[0]!
+    h.script(site.script(h, harnessPersona(h, p), row.build(), row))
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+
+    expect(h.stub.calls.statusCalls).toHaveLength(1)
+    expectLatchedOnce(h, p, conflictLatch(p, row, refusedOperationAt(site), row.rowAfter === undefined ? row.rowState : rowAfterState(row.rowAfter)))
+    expect(conflictLinesIn(h.errors, p)[0]).not.toContain(notConfiguredLatchOutcome(row.latchCase, refusedOperationAt(site)))
+  })
+
+  test.each(queries)('control, %s: an UNUSABLE NAME at the first spawn latches P as before, with its latch-time read and one post', async (_label, install) => {
+    const { h, p } = srj105Build()
+    install()
+    const site = NOT_CONFIGURED_UNUSABLE_SITES[0]!
+    const row = unusableNameRowsAt(site.kind)[0]!
+    h.script(site.script(h, harnessPersona(h, p), row.build(), row))
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+
+    expect(h.stub.calls.statusCalls).toHaveLength(1)
+    expectLatchedOnce(h, p, unusableNameLatch(p, row))
+    expect(unusableNameLinesOf(h, p)[0]).not.toContain(notConfiguredLatchOutcome(LATCH_CASE_UNUSABLE_RECORDED_NAME, REFUSED_OPERATION_NONE))
+  })
+})
+
+// b.jg5 SRJ-502, SRJ-1014: the latched gate's line (`latchedLaunchSkipLine`),
+// for a persona latched with a readable record: each launch path logs it once,
+// naming the latch's case, and calls nothing.
+describe('b.jg5 SRJ-502, SRJ-1014: the latched gate logs one latched-launch-skip line per skipped launch', () => {
+  afterEach(srj105AfterEach)
+
+  test('P latched on a CONFLICT: the start pass\'s launch, the restart path\'s and launchSession each log latchedLaunchSkipLine with the latch\'s case and make no call', async () => {
+    const { h, p } = srj105Build()
+    const site = LATCH_SPAWN_SITES[0]!
+    const row = conflictRowsAt(site)[0]!
+    const script = site.script(h, harnessPersona(h, p), row.build(), row)
+    h.script(script)
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+    h.script(clearedScript(script))
+    const callsBefore = h.stub.callCount()
+    const ref = renderPersonaRef(p, p)
+    const skip = latchedLaunchSkipLine(LADDER_HEAD, ref, row.latchCase)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
+    expect(await spawnForPersona(harnessPersona(h, p), h.config, false)).toStrictEqual({ key: p, action: 'latched' })
+    expect(await launchSession(p, h.config)).toBe('skipped')
+
+    expect(h.stub.callCount()).toBe(callsBefore)
+    expect(h.errors.filter((line) => line.startsWith(`${LADDER_HEAD} not launching ${ref} — `))).toEqual([skip, skip, skip])
+    assertNoLeak({ skip })
+  })
+})
+
 /** How the working-row wait's evidence read is reached: directly, or through the launch's collision ladder. */
 const PANE_WAIT_CROSS = WAIT_ENTRIES.flatMap(([entry, before]) => unusableNameRowsAt('read-pane').map((row) => [entry, row.fault, before, row] as const))
 
@@ -21078,12 +21337,12 @@ function paneUnusableNameLatch(p: string, row: UnusableNameCaseRow, rowState: La
 
 /** The failure outcome the reader answers for `err` of `kind`: the class given and the redacting describer's text. */
 function paneFailure(kind: string, errorClass: string, err: unknown): OwnPaneReadOutcome {
-  return { kind, errorClass, description: describeAgentDirectorFailure(err) } as OwnPaneReadOutcome
+  return { kind, errorClass, description: describeAdFailureForLog(err) } as OwnPaneReadOutcome
 }
 
 /** The latched outcome the reader answers for a latching `err` of `kind`: the answer kept as its cause. */
 function paneLatchedBy(kind: string, errorClass: string, err: unknown): OwnPaneReadOutcome {
-  return { kind: PANE_READ_LATCHED, cause: { kind, errorClass, description: describeAgentDirectorFailure(err), error: err } } as OwnPaneReadOutcome
+  return { kind: PANE_READ_LATCHED, cause: { kind, errorClass, description: describeAdFailureForLog(err), error: err } } as OwnPaneReadOutcome
 }
 
 /**
@@ -21210,7 +21469,7 @@ describe('b.jg5 SRJ-117, SRJ-501, SRJ-502, SRJ-512: the shared read-pane of a pe
 
     expect(await readPersonaOwnPane(p, fullPaneRead(row.rowState))).toStrictEqual({
       kind: PANE_READ_LATCHED,
-      cause: { kind: PANE_READ_CONFLICT, errorClass: AD_ERROR_CLASS_CONFLICT, description: describeAgentDirectorFailure(err), error: err },
+      cause: { kind: PANE_READ_CONFLICT, errorClass: AD_ERROR_CLASS_CONFLICT, description: describeAdFailureForLog(err), error: err },
     })
 
     expect(order).toEqual(['readPane'])
@@ -21238,7 +21497,7 @@ describe('b.jg5 SRJ-117, SRJ-501, SRJ-502, SRJ-512: the shared read-pane of a pe
 
     expect(await readPersonaOwnPane(p, fullPaneRead(lastRead))).toStrictEqual({
       kind: PANE_READ_LATCHED,
-      cause: { kind: PANE_READ_UNUSABLE_NAME, errorClass: AD_ERROR_CLASS_UNUSABLE_NAME, description: describeAgentDirectorFailure(err), error: err },
+      cause: { kind: PANE_READ_UNUSABLE_NAME, errorClass: AD_ERROR_CLASS_UNUSABLE_NAME, description: describeAdFailureForLog(err), error: err },
     })
 
     expect(order).toEqual(['readPane'])
@@ -21487,7 +21746,7 @@ describe('b.jg5 SRJ-117, SRJ-501, SRJ-502, SRJ-603: a CONFLICT from the pane rea
 
 /** The check's one line for P's waiting row whose read-pane answered `err` of class `errorClass`: `says` (what it found), then `then` (what it does), closing with `srj`. */
 function waitingRowLine(p: string, says: string, err: Error, then: string, errorClass: AdErrorClass, srj: string): string {
-  return `[slack] reconnectSession: persona=${p} is waiting ${says}: ${describeAgentDirectorFailure(err)} — ${then} ${paneReadClassOpening(errorClass)}${srj})`
+  return `[slack] reconnectSession: persona=${p} is waiting ${says}: ${describeAdFailureForLog(err)} — ${then} ${paneReadClassOpening(errorClass)}${srj})`
 }
 
 /** The check's lines for persona `p`'s waiting row. */
@@ -21639,14 +21898,14 @@ describe('b.jg5 SRJ-117, SRJ-608: the launch wait\'s evidence read — every fai
     expect(order.indexOf('readPane')).toBe(order.indexOf('status') + 1)
     expect(h.stub.calls.sendKeysCalls.map((c) => c.text)).toEqual([RECONNECT_TEXT])
     expect(h.errors.filter((line) => line.includes(`reading the pane of ${renderPersonaRef(p, p)} failed`))).toEqual([
-      `[slack] waitForWaitingAndReconnect: reading the pane of ${renderPersonaRef(p, p)} failed: ${describeAgentDirectorFailure(err)} — no idle evidence from it; still waiting for its working row ${paneReadClassOpening(errorClass)}b.f2b)`,
+      `[slack] waitForWaitingAndReconnect: reading the pane of ${renderPersonaRef(p, p)} failed: ${describeAdFailureForLog(err)} — no idle evidence from it; still waiting for its working row ${paneReadClassOpening(errorClass)}b.f2b)`,
     ])
     expectNoNoteLatch(h)
     expect(allPaneReadLatchLines(h)).toEqual([])
     expect(waitLatchedLines(h)).toEqual([])
     expect(h.notices).toEqual([])
     expect(getFailureCount(p)).toBe(0)
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     if (onset === undefined) {
       expect(h.outageNotices).toEqual([])
     } else {
@@ -21936,9 +22195,9 @@ describe('b.jdc, b.jg5 SRJ-117, SRJ-607: the collision ladder\'s action on a pro
     expect(order).toEqual(['spawn', 'get', 'readPane'])
     expect(stops).toHaveLength(1)
     expect(h.notices).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     expect(getFailureCount(p)).toBe(0)
-    const stopped: PaneReadFailure = { kind: PANE_READ_UNCLASSIFIED, errorClass: AD_ERROR_CLASS_UNCLASSIFIED, description: describeAgentDirectorFailure(err), stopping: true }
+    const stopped: PaneReadFailure = { kind: PANE_READ_UNCLASSIFIED, errorClass: AD_ERROR_CLASS_UNCLASSIFIED, description: describeAdFailureForLog(err), stopping: true }
     expect(linesEqualTo(h, promptRowLadderStoppingLine(renderPersonaRef(p, p), state, stopped))).toBe(1)
   })
 
@@ -22167,13 +22426,13 @@ describe('b.jg5 SRJ-104, SRJ-204: an ErrInvalidFlags answer at the shared read-p
     expect(recheckLines(h)).toEqual([invalidFlagsLine(p, err, RECHECK_OUTCOME_STOP, READ_WORKING_PANE_SITE)])
     const ref = renderPersonaRef(p, p)
     expect(h.errors.filter((line) => line.includes(`reading the pane of ${ref} failed`))).toEqual([
-      `[slack] waitForWaitingAndReconnect: reading the pane of ${ref} failed: ${describeAgentDirectorFailure(err)} — the agent-director version re-check decided that the server stops; the wait ends, nothing more is called and nothing is typed ${paneReadClassOpening(AD_ERROR_CLASS_UNCLASSIFIED)}b.jg5 SRJ-204, SRJ-205)`,
+      `[slack] waitForWaitingAndReconnect: reading the pane of ${ref} failed: ${describeAdFailureForLog(err)} — the agent-director version re-check decided that the server stops; the wait ends, nothing more is called and nothing is typed ${paneReadClassOpening(AD_ERROR_CLASS_UNCLASSIFIED)}b.jg5 SRJ-204, SRJ-205)`,
     ])
     expect(h.notices).toEqual([])
     expect(h.triggers).toEqual([])
     expectNoNoteLatch(h)
     expect(getFailureCount(p)).toBe(0)
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
 
     // The restart path's launch meets the same stop: 'skipped', never counted.
     installRecheck({ version: OLD_AD_VERSION })
@@ -22183,7 +22442,7 @@ describe('b.jg5 SRJ-104, SRJ-204: an ErrInvalidFlags answer at the shared read-p
     expect(h.stub.calls.sendKeysCalls).toEqual([])
     expect(getFailureCount(p)).toBe(0)
     expect(h.notices).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
   })
 
   test.each<[string, () => { readPaneError?: Error; readPaneResults?: Array<{ pane: string }> }]>([
@@ -22529,7 +22788,7 @@ function expectLatchedElsewhereOnly(h: RecoveryHarness, p: string, elsewhere: { 
   expect(elsewhere.latch.record(p)).toStrictEqual(expectedLatchRecord(p, LATCHED_ELSEWHERE))
   expect(h.notices).toEqual([])
   const log = h.startupErrors().join('\n')
-  expect(countStartupEntries(log, 'spawn-failed')).toBe(0)
+  expect(countStartupEntries(log, STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
   expect(countStartupEntries(log, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
   expect(countStartupEntries(log, JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)).toBe(0)
   expect(getFailureCount(p)).toBe(0)
@@ -23586,14 +23845,14 @@ const RECONNECT_LATCHED_SAYS = ': the persona latched; nothing was typed and the
 /** The CONFLICT latch a reconnect of persona `p` sets from case-table `row` (SRJ-501: "P's next check or recovery", the caller's last read). */
 function reconnectConflictLatch(p: string, row: ConflictCaseRow): ExpectedLatch {
   const lines = reconnectLatchLines((outcome) =>
-    reconnectConflictLine(renderPersonaRef(p, p), describeAgentDirectorFailure(row.build()), row.latchCase, outcome),
+    reconnectConflictLine(renderPersonaRef(p, p), describeAdFailureForLog(row.build()), row.latchCase, outcome),
   )
   return { ...conflictLatch(p, row, row.refusedOperation, row.rowState), lines: (h) => lines(h), says: RECONNECT_LATCHED_SAYS }
 }
 
 /** The unusable-name latch a reconnect of persona `p` sets from case-table `row` (SRJ-512: refused operation none, the caller's last read). */
 function reconnectUnusableNameLatch(p: string, row: UnusableNameCaseRow): ExpectedLatch {
-  const lines = reconnectLatchLines((outcome) => reconnectUnusableNameLine(renderPersonaRef(p, p), describeAgentDirectorFailure(row.build()), outcome))
+  const lines = reconnectLatchLines((outcome) => reconnectUnusableNameLine(renderPersonaRef(p, p), describeAdFailureForLog(row.build()), outcome))
   return { ...unusableNameLatch(p, row), lines: (h) => lines(h), says: RECONNECT_LATCHED_SAYS }
 }
 
@@ -23645,7 +23904,7 @@ describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and 
     expect(order).toEqual(['sendKeys'])
     expect(h.stub.calls.sendKeysCalls.map((c) => [c.claude_instance_id, c.text])).toEqual([[personaInstanceId(p), RECONNECT_TEXT]])
     expect(h.notices).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     expect(getFailureCount(p)).toBe(0)
   }
 
@@ -23691,7 +23950,7 @@ describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and 
 
     expect(result).toStrictEqual({ outcome: 'transient' } satisfies ReconnectResult)
     expectOneSendKeysOnly(h, p, order)
-    expectLines(h, ref, reconnectTransientLine(ref, describeAgentDirectorFailure(err), AD_ERROR_CLASS_UNAVAILABLE))
+    expectLines(h, ref, reconnectTransientLine(ref, describeAdFailureForLog(err), AD_ERROR_CLASS_UNAVAILABLE))
     expect(h.outageNotices).toEqual([])
     expect(h.triggers).toEqual([{ key: p, kind: cause }])
   })
@@ -23705,7 +23964,7 @@ describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and 
 
     expect(result).toStrictEqual({ outcome: 'transient' } satisfies ReconnectResult)
     expectOneSendKeysOnly(h, p, order)
-    expectLines(h, ref, reconnectTransientLine(ref, describeAgentDirectorFailure(err), AD_ERROR_CLASS_ENVIRONMENT))
+    expectLines(h, ref, reconnectTransientLine(ref, describeAdFailureForLog(err), AD_ERROR_CLASS_ENVIRONMENT))
     expect(h.outageNotices).toEqual([{ key: p, text: onset }])
     expect(getOutageFlags(p).has('tmux-unavailable')).toBe(true)
     expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT }])
@@ -23717,7 +23976,7 @@ describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and 
 
     expect(result).toStrictEqual({ outcome: 'transient' } satisfies ReconnectResult)
     expectOneSendKeysOnly(h, p, order)
-    expectLines(h, ref, reconnectTransientLine(ref, describeAgentDirectorFailure(err), AD_ERROR_CLASS_CONFIG))
+    expectLines(h, ref, reconnectTransientLine(ref, describeAdFailureForLog(err), AD_ERROR_CLASS_CONFIG))
     expect(h.outageNotices).toEqual([{ key: p, text: adConfigMalformedOnset(err) }])
     expect(getOutageFlags(p).has('ad-config-malformed')).toBe(true)
     expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_CONFIG }])
@@ -23734,7 +23993,7 @@ describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and 
 
     expect(result).toStrictEqual({ outcome: 'transient' } satisfies ReconnectResult)
     expectOneSendKeysOnly(h, p, order)
-    expectLines(h, ref, reconnectTransientLine(ref, describeAgentDirectorFailure(err), AD_ERROR_CLASS_UNCLASSIFIED))
+    expectLines(h, ref, reconnectTransientLine(ref, describeAdFailureForLog(err), AD_ERROR_CLASS_UNCLASSIFIED))
     expect(unclassifiedStartedLines(h, p)).toEqual([unclassifiedStartedLine(p, err)])
     expect(h.unclassifiedErrorOpen(p)).toBe(true)
     expect(h.outageNotices).toEqual([])
@@ -23823,7 +24082,7 @@ describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and 
   test('the row-not-interactive evidence text and the reconnect\'s line claim neither the process nor the worker is gone or dead', () => {
     const claim = /\b(?:process|worker|session)\b[^;.()]*?\b(?:is|are|was|has been|have been)\s+(?:gone|dead|ended|exited)\b/i
     expect(ESCALATE_DEAD_EVIDENCE['row-not-interactive']).not.toMatch(claim)
-    expect(reconnectNotInteractiveLine('persona=C', describeAgentDirectorFailure(errSpawnNotInteractive('send-keys')))).not.toMatch(claim)
+    expect(reconnectNotInteractiveLine('persona=C', describeAdFailureForLog(errSpawnNotInteractive('send-keys')))).not.toMatch(claim)
   })
 })
 
@@ -24130,7 +24389,7 @@ describe('b.jg5 SRJ-118, SRJ-609: the ladder\'s waiting and working branches map
       deadSessionRouteLine(renderPersonaRef(p, p), branchState(branch), carriedDeadEvidenceOf(cause), CARRIED_DEAD_EVIDENCE_NONE),
     ])
     expect(h.notices).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     expect(getFailureCount(p)).toBe(0)
   })
 
@@ -24201,7 +24460,7 @@ describe('b.jg5 SRJ-118, SRJ-609: the ladder\'s waiting and working branches map
     expect(stops).toHaveLength(1)
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: 1 }))
     expect(h.notices).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     expect(getFailureCount(p)).toBe(0)
     expect(h.errors.filter((l) => l === transientReconnectLine(renderPersonaRef(p, p), 'waiting', 'stopping'))).toHaveLength(1)
   })
@@ -25213,7 +25472,7 @@ describe('b.jg5 SRJ-602, SRJ-711: ErrTmuxSessionCreate is one counted launch fai
     expect(order).toEqual([...site.order])
     expect([h.stub.calls.killCalls, h.stub.calls.deleteCalls]).toEqual([[], []])
     expect(h.notices).toEqual([{ key: p, text: expect.stringContaining(`\`${errTmuxSessionCreate().errName}\``) }])
-    expect(h.startupErrors().filter((entry) => entry.includes('[spawn-failed]'))).toHaveLength(site.entries)
+    expect(h.startupErrors().filter((entry) => entry.includes(`[${STARTUP_ERROR_SPAWN_FAILED}]`))).toHaveLength(site.entries)
     expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
     expect(h.controller.view(p)).toMatchObject({ phase: 'waiting', mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW] })
     // Only the entry counts its own launch's failure; the restart path counts its launches' (tests/restart.test.ts).
@@ -25361,7 +25620,7 @@ describe('b.jg5 SRJ-707, SRJ-712: resume\'s no-transcript answers go on to one r
     expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION }])
     expect(h.controller.isArmed(p)).toBe(true)
     expect([getFailureCount(p), h.notices, h.episodeNotices, h.outageNotices]).toEqual([0, [], [], []])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     expect(h.latch.isLatched(p)).toBe(false)
     expect(h.unclassifiedErrorOpen(p)).toBe(false)
 
@@ -25858,7 +26117,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     expect(h.reuseSpawns()).toHaveLength(2)
     expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION }])
     expect([getFailureCount(p), h.notices, h.episodeNotices]).toEqual([0, [], []])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
   })
 
   test.each([...REUSE_SITES, ...NO_TRANSCRIPT_SITES].map((site) => [site.name, site] as const))('SRJ-112, SRJ-602, %s: ErrTmuxSessionCreate at the reuse is one counted launch failure: one notice and one spawn-failed entry, P armed at once in pending-only mode, no kill and no spawn in its place', async (_name, site) => {
@@ -25871,7 +26130,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     expect(order).toEqual(['spawn', ...site.pass])
     expect(h.stub.calls.killCalls).toEqual([])
     expect(h.notices.map((notice) => notice.key)).toEqual([p])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(1)
+    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(1)
     expect(h.controller.view(p)).toMatchObject({ mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW] })
   })
 
@@ -25895,7 +26154,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     expect([rc?.resolves.length ?? 0, rc?.stops ?? []]).toEqual([answer === undefined ? 0 : 1, []])
     expect(order).toEqual(['spawn', ...site.pass])
     expect(h.stub.calls.killCalls).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     expectHeldOnce(h, p, err, kind, version)
     expect(personaCallCounts(h, b)).toEqual({})
   })
@@ -28492,7 +28751,7 @@ describe('b.jg5 SRJ-1015 (AC 72): the start pass counts each launch result once,
     expect(h.errors.filter((line) => line.startsWith('[slack] startupSessionManager: complete — '))).toEqual([startupSummaryLine(1, result)])
     expect(h.triggers.slice(triggersBefore)).toEqual(row.armed === undefined ? [] : [{ key: p, kind: row.armed }])
     expect(h.controller.isArmed(p)).toBe(row.armed !== undefined)
-    expect([getFailureCount(p), h.notices, countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')]).toEqual([0, [], 0])
+    expect([getFailureCount(p), h.notices, countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)]).toEqual([0, [], 0])
     await settleP(h, p)
   })
 
@@ -28613,7 +28872,7 @@ describe('b.jg5 SRJ-205 (the E4 gate): the start pass\'s launch pool starts no q
     expect([personaCallCounts(h, second), personaCallCounts(h, third)]).toEqual([{}, {}])
     expect([second, third].map((key) => h.errors.filter((line) => line === notStartedLine(h, key)).length)).toEqual([1, 1])
     expect(h.errors.filter((line) => line === notStartedLine(h, first))).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     await h.settle()
     await h.runApproverToStop(first)
   })
@@ -29995,7 +30254,7 @@ describe('b.jg5 SRJ-111: the plain spawn\'s outcome table through the one handle
     }
     // Only a LAUNCH FAILURE reaches the spawn-failure notice: none here, and no spawn-failed entry.
     expect(h.notices).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     expect([h.stub.calls.killCalls, h.reuseSpawns(), h.invalidFlagsHold.heldKeys()]).toEqual([[], [], []])
     expect(h.stub.calls.spawnCalls.filter((call) => 'reuse_finished' in call)).toEqual([])
     expect(h.latch.isLatched(p)).toBe(row.latched === true)
@@ -30094,7 +30353,7 @@ describe('b.jg5 SRJ-111: the plain spawn\'s outcome table through the one handle
     expect(h.triggers.filter((trigger) => trigger.key === p).map((trigger) => trigger.kind)).toEqual([...triggers])
     expect([plainSpawnCollisionLinesOf(h, p, true), plainSpawnCollisionLinesOf(h, p, false)].map((lines) => lines.length)).toEqual([1, armedLines])
     expect([h.notices, getFailureCount(p), h.latch.isLatched(p)]).toEqual([[], 0, false])
-    expect(countStartupEntries(h.startupErrors().join('\n'), 'spawn-failed')).toBe(0)
+    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     expect(h.stub.calls.spawnCalls.filter((call) => 'reuse_finished' in call)).toEqual([])
     if (h.approverRunning(p)) await h.runApproverToStop(p)
   })
@@ -30349,7 +30608,7 @@ describe('b.jg5 SRJ-410, SRJ-118: the lap\'s Enter (sendPendingRowLapEnter) is o
 
   /** A failed Enter's outcome: its kind, the class given and the redacting describer's text. */
   const enterFailure = (kind: string, errorClass: string, err: unknown): PendingRowLapEnterOutcome =>
-    ({ kind, errorClass, description: describeAgentDirectorFailure(err) }) as PendingRowLapEnterOutcome
+    ({ kind, errorClass, description: describeAdFailureForLog(err) }) as PendingRowLapEnterOutcome
 
   /** The lap Enter's latch lines of `kind` for P (`ref`). */
   const lapEnterLatchLines = (h: RecoveryHarness, ref: string, kind: 'CONFLICT' | 'UNUSABLE NAME'): string[] =>
@@ -30457,7 +30716,7 @@ describe('b.jg5 SRJ-410, SRJ-118: the lap\'s Enter (sendPendingRowLapEnter) is o
 
     expect(outcome).toStrictEqual({
       kind: PENDING_ROW_LAP_ENTER_LATCHED,
-      cause: { kind: PENDING_ROW_LAP_ENTER_CONFLICT, errorClass: AD_ERROR_CLASS_CONFLICT, description: describeAgentDirectorFailure(err), error: err },
+      cause: { kind: PENDING_ROW_LAP_ENTER_CONFLICT, errorClass: AD_ERROR_CLASS_CONFLICT, description: describeAdFailureForLog(err), error: err },
     })
     expectOneEnterOnly(h, p, order)
     expectLatchedOnce(h, p, { ...conflictLatch(p, row, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE)), lines: () => lapEnterLatchLines(h, ref, 'CONFLICT') })
@@ -30473,7 +30732,7 @@ describe('b.jg5 SRJ-410, SRJ-118: the lap\'s Enter (sendPendingRowLapEnter) is o
 
     expect(outcome).toStrictEqual({
       kind: PENDING_ROW_LAP_ENTER_LATCHED,
-      cause: { kind: PENDING_ROW_LAP_ENTER_UNUSABLE_NAME, errorClass: AD_ERROR_CLASS_UNUSABLE_NAME, description: describeAgentDirectorFailure(err), error: err },
+      cause: { kind: PENDING_ROW_LAP_ENTER_UNUSABLE_NAME, errorClass: AD_ERROR_CLASS_UNUSABLE_NAME, description: describeAdFailureForLog(err), error: err },
     })
     expectOneEnterOnly(h, p, order)
     expectLatchedOnce(h, p, { ...unusableNameLatch(p, row, latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE)), lines: () => lapEnterLatchLines(h, ref, 'UNUSABLE NAME') })
@@ -31097,7 +31356,11 @@ describe('b.jg5 SRJ-412: the abort kill of CSCB\'s own stuck launch (abortKillOw
     expect([h.episodeNotices, killFailureLines(h, p), h.latch.isLatched(p)]).toEqual([[], [], false])
   })
 
-  test('ErrInvalidFlags whose one re-check decides that the server stops: stopped after one try, with no further kill or read; no alert, nothing latched', async () => {
+  // SRJ-702, SRJ-1013 (t3.b6r.eg.r1.yr): the stopped retry is recorded
+  // whatever its decision, a `none` one included: one stop line naming the
+  // re-check's cause and the last outcome's class; for a configured persona
+  // no entry.
+  test('ErrInvalidFlags whose one re-check decides that the server stops: stopped after one try, with no further kill or read; no alert, one stop line and no entry; nothing latched', async () => {
     const { h, p } = srj105Build()
     const { resolves, stops } = h.recheckAnswers(OLD_AD_VERSION)
     h.script({ killError: errInvalidFlags('kill') })
@@ -31107,7 +31370,16 @@ describe('b.jg5 SRJ-412: the abort kill of CSCB\'s own stuck launch (abortKillOw
     expect(answer.kind).toBe(STUCK_LAUNCH_ABORT_KILL_STOPPED)
     expect(stuckLaunchAbortKillUsesAbort(answer)).toBe(false)
     expect([resolves.length, stops.length]).toEqual([1, 1])
-    expect([h.episodeNotices, killFailureLines(h, p), h.latch.isLatched(p)]).toEqual([[], [], false])
+    const stopped = killFailureStoppedRetryText({
+      key: p,
+      decision: { kind: KILL_RETRY_ALERT_NONE },
+      context: KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT,
+      lastOutcomeClass: AD_ERROR_CLASS_UNCLASSIFIED,
+      stopCause: PERSONA_KILL_STOP_CAUSE_RECHECK,
+    })
+    expect(killFailureLines(h, p)).toEqual([stopped.line])
+    expect([h.episodeNotices, h.startupErrors(), h.killFailureOpen(p), h.latch.isLatched(p)]).toEqual([[], [], false, false])
+    assertNoLeak({ lines: killFailureLines(h, p) })
   })
 
   // SRJ-702's stop rule: P not up when a try returns stops the tries; neither
@@ -31385,13 +31657,16 @@ function recheckRoundCalls(order: readonly string[]): string[] {
 
 /** The re-check round lines logged for persona `key` (`latchRecheckRoundLine`: one per round). */
 function recheckRoundLinesOf(h: RecoveryHarness, key: string): string[] {
-  const head = latchRecheckRoundLine(renderPersonaRef(key, key), '\u0000' as LatchCase, '', '').split('\u0000')[0]!
+  const head = latchRecheckRoundLine(renderPersonaRef(key, key), '\u0000' as LatchCase, RECHECK_STEP_TABLE, '', '').split('\u0000')[0]!
   return h.errors.filter((line) => line.startsWith(head))
 }
 
-/** The one round line's head for `key`'s round with `latchCase` and `call` (the answer after it is the round's label). */
-function recheckRoundLineHead(key: string, latchCase: LatchCase, call: string): string {
-  return latchRecheckRoundLine(renderPersonaRef(key, key), latchCase, call, '')
+/**
+ * The one round line's head for `key`'s round with `latchCase`, step 1's
+ * outcome `step` and `call` (the answer after it is the round's label).
+ */
+function recheckRoundLineHead(key: string, latchCase: LatchCase, step: LatchRecheckLineStep, call: string): string {
+  return latchRecheckRoundLine(renderPersonaRef(key, key), latchCase, step, call, '')
 }
 
 /** P's latch and its re-check timer are gone: the clear entry ran (its post is tests/conflict-latch.test.ts's). */
@@ -31431,6 +31706,8 @@ interface RecheckRetrySite {
   readonly script: (h: RecoveryHarness, p: string) => RecoveryStubScript
   /** The calls before the launch (step 1's `status`, and the finished-row retry's `get`). */
   readonly before: readonly string[]
+  /** Step 1's outcome the round line names (HO rev 15: a spawn retry after no row, or a finished-row retry). */
+  readonly step: LatchRecheckLineStep
   /** The round line's call. */
   readonly call: string
   /** The state the re-check last read: what a relatch records (never a latch-time read). */
@@ -31476,6 +31753,7 @@ const RECHECK_RETRY_SITES: readonly RecheckRetrySite[] = [
     recorded: LATCH_ROW_STATE_NO_ROW,
     script: () => step1Status('no row'),
     before: ['status'],
+    step: RECHECK_STEP_SPAWN_RETRY,
     call: RECHECK_CALL_PLAIN_SPAWN,
     lastRead: LATCH_ROW_STATE_NO_ROW,
     clearedBy: RECHECK_CLEARED_BY_RETRY,
@@ -31487,6 +31765,7 @@ const RECHECK_RETRY_SITES: readonly RecheckRetrySite[] = [
     recorded: ROW_WAITING,
     script: (h, p) => ({ ...step1Status(LIVENESS_DEAD_ROW_ENDED), ...finishedRowGet(h, p, 'no row') }),
     before: ['status', 'get'],
+    step: RECHECK_STEP_FINISHED_ROW_RETRY,
     call: `${RECHECK_CALL_FINISHED_ROW}:${RECHECK_CALL_PLAIN_SPAWN}`,
     lastRead: LATCH_ROW_STATE_NO_ROW,
     clearedBy: RECHECK_CLEARED_BY_FINISHED_ROW_RETRY,
@@ -31498,6 +31777,7 @@ const RECHECK_RETRY_SITES: readonly RecheckRetrySite[] = [
     recorded: LATCH_ROW_STATE_NO_ROW,
     script: () => step1Status(LIVENESS_DEAD_ROW_ENDED),
     before: ['status'],
+    step: RECHECK_STEP_TABLE,
     call: RECHECK_CALL_REUSE_SPAWN,
     lastRead: ROW_ENDED,
     clearedBy: RECHECK_CLEARED_BY_RETRY,
@@ -31509,6 +31789,7 @@ const RECHECK_RETRY_SITES: readonly RecheckRetrySite[] = [
     recorded: ROW_ENDED,
     script: () => step1Status(LIVENESS_DEAD_ROW_ENDED),
     before: ['status'],
+    step: RECHECK_STEP_TABLE,
     call: RECHECK_CALL_REUSE_SPAWN,
     lastRead: ROW_ENDED,
     clearedBy: RECHECK_CLEARED_BY_RETRY,
@@ -31520,6 +31801,7 @@ const RECHECK_RETRY_SITES: readonly RecheckRetrySite[] = [
     recorded: ROW_WAITING,
     script: (h, p) => ({ ...step1Status(LIVENESS_DEAD_ROW_ENDED), ...finishedRowGet(h, p, { state: LIVENESS_DEAD_ROW_ENDED, claude_session_id: '' }) }),
     before: ['status', 'get'],
+    step: RECHECK_STEP_FINISHED_ROW_RETRY,
     call: `${RECHECK_CALL_FINISHED_ROW}:${RECHECK_CALL_REUSE_SPAWN}`,
     lastRead: ROW_ENDED,
     clearedBy: RECHECK_CLEARED_BY_FINISHED_ROW_RETRY,
@@ -31531,6 +31813,7 @@ const RECHECK_RETRY_SITES: readonly RecheckRetrySite[] = [
     recorded: ROW_ENDED,
     script: () => step1Status(LIVENESS_DEAD_ROW_ENDED),
     before: ['status'],
+    step: RECHECK_STEP_TABLE,
     call: RECHECK_CALL_RESUME,
     lastRead: ROW_ENDED,
     clearedBy: RECHECK_CLEARED_BY_RETRY,
@@ -31542,6 +31825,7 @@ const RECHECK_RETRY_SITES: readonly RecheckRetrySite[] = [
     recorded: ROW_WAITING,
     script: (h, p) => ({ ...step1Status(LIVENESS_DEAD_ROW_ENDED), ...finishedRowGet(h, p, ENDED_WITH_SESSION) }),
     before: ['status', 'get'],
+    step: RECHECK_STEP_FINISHED_ROW_RETRY,
     call: `${RECHECK_CALL_FINISHED_ROW}:${RECHECK_CALL_RESUME}`,
     lastRead: ROW_ENDED,
     clearedBy: RECHECK_CLEARED_BY_FINISHED_ROW_RETRY,
@@ -31588,9 +31872,9 @@ describe('b.jg5 SRJ-505, SRJ-111, SRJ-112, SRJ-113: each re-check launch goes th
 
   // b.jg5 SRJ-805 (E24–E25 hatch note): a recorded key is never resumed; the re-check's retry of it is the reuse.
   test.each([
-    ['a resume latch on a row read ended', RESUME_RECHECK_LATCH, ROW_ENDED, (_h: RecoveryHarness, _p: string) => step1Status(LIVENESS_DEAD_ROW_ENDED), ['spawn'], RECHECK_CALL_REUSE_SPAWN],
-    ['a finished-row retry whose get reads ended with a session id', NOT_THIS_LAUNCH_RECHECK_LATCH, ROW_WAITING, (h: RecoveryHarness, p: string) => ({ ...step1Status(LIVENESS_DEAD_ROW_ENDED), ...finishedRowGet(h, p, ENDED_WITH_SESSION) }), ['get', 'spawn'], `${RECHECK_CALL_FINISHED_ROW}:${RECHECK_CALL_REUSE_SPAWN}`],
-  ] as const)('E24–E25: %s, for a key recorded in retired-keys.json: the reuse spawn, never a resume', async (_label, latch, recorded, script, calls, call) => {
+    ['a resume latch on a row read ended', RESUME_RECHECK_LATCH, ROW_ENDED, (_h: RecoveryHarness, _p: string) => step1Status(LIVENESS_DEAD_ROW_ENDED), ['spawn'], RECHECK_STEP_TABLE, RECHECK_CALL_REUSE_SPAWN],
+    ['a finished-row retry whose get reads ended with a session id', NOT_THIS_LAUNCH_RECHECK_LATCH, ROW_WAITING, (h: RecoveryHarness, p: string) => ({ ...step1Status(LIVENESS_DEAD_ROW_ENDED), ...finishedRowGet(h, p, ENDED_WITH_SESSION) }), ['get', 'spawn'], RECHECK_STEP_FINISHED_ROW_RETRY, `${RECHECK_CALL_FINISHED_ROW}:${RECHECK_CALL_REUSE_SPAWN}`],
+  ] as const)('E24–E25: %s, for a key recorded in retired-keys.json: the reuse spawn, never a resume', async (_label, latch, recorded, script, calls, step, call) => {
     const { h, p } = srj105Build({ latchRecheck: true })
     h.retireKey(p)
     expect(retiredKeyReadingOf(p).recorded).toBe(true)
@@ -31603,7 +31887,7 @@ describe('b.jg5 SRJ-505, SRJ-111, SRJ-112, SRJ-113: each re-check launch goes th
     expect(recheckRoundCalls(order)).toEqual(['status', ...calls])
     expect(h.stub.calls.resumeCalls).toEqual([])
     expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, p)])
-    expect(recheckRoundLinesOf(h, p)[0]).toStartWith(recheckRoundLineHead(p, latch.latchCase, call))
+    expect(recheckRoundLinesOf(h, p)[0]).toStartWith(recheckRoundLineHead(p, latch.latchCase, step, call))
     expectRecheckCleared(h, p)
     if (h.approverRunning(p)) await h.runApproverToStop(p)
   })
@@ -31689,6 +31973,19 @@ interface RecheckRetryAnswerRow {
   readonly extraReuses?: number
   /** ErrInvalidFlags: agent-director's version re-check is installed, and makes its one immediate re-check (b.jg5 SRJ-104, SRJ-204). */
   readonly versionRecheck?: true
+  /**
+   * The re-check's own `latch-recheck:` line the row's handling logs at
+   * `site` for `ref` (b.jg5 SRJ-1014), as the head and tail around the
+   * launch's name: its builder with a placeholder for the name, split there;
+   * none when unset or undefined.
+   */
+  readonly lineParts?: (site: RecheckRetrySite, ref: string) => readonly [string, string] | undefined
+}
+
+/** `line`, built with `\u0000` for the launch's name, split there into its head and tail. */
+function aroundLaunchName(line: string): readonly [string, string] {
+  const [head, tail] = line.split('\u0000') as [string, string]
+  return [head, tail]
 }
 
 const ALL_RETRY_LAUNCHES = [RECHECK_CALL_PLAIN_SPAWN, RECHECK_CALL_REUSE_SPAWN, RECHECK_CALL_RESUME] as const
@@ -31705,6 +32002,7 @@ const RECHECK_RETRY_ANSWER_ROWS: readonly RecheckRetryAnswerRow[] = [
     at: ALL_RETRY_LAUNCHES,
     make: (site) => (site.launch === RECHECK_CALL_RESUME ? resumeCollision() : errInstanceIdCollision()),
     ends: 'still latched',
+    lineParts: (site, ref) => (site.launch === RECHECK_CALL_RESUME ? undefined : aroundLaunchName(latchRecheckCollisionNoInformationLine(ref, '\u0000'))),
   },
   { name: 'LAUNCH FAILURE (ErrTmuxSessionCreate) → cleared before its class handling: the spawn-failure notice and the pending-only arm, on an unlatched P', at: ALL_RETRY_LAUNCHES, make: (site) => errTmuxSessionCreate(launchVerbAt(site)), ends: 'cleared', triggers: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW], notices: 1 },
   { name: 'LAUNCH FAILURE whose row stays pending (HO rev 28) → cleared, handled by its class', at: [RECHECK_CALL_REUSE_SPAWN, RECHECK_CALL_RESUME], make: (site) => errTmuxSessionCreateStaysPending(launchVerbAt(site)), ends: 'cleared', triggers: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW], notices: 1 },
@@ -31770,7 +32068,20 @@ const RECHECK_RETRY_ANSWER_ROWS: readonly RecheckRetryAnswerRow[] = [
     ends: 'cleared',
     then: ['spawn'],
     triggers: [UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION],
+    lineParts: (_site, ref) => aroundLaunchName(latchRecheckCollidedAfterClearLine(ref, '\u0000', true)),
   },
+  // The no-transcript answers' variant: the reuse spawn after the cleared latch collides.
+  ...[errNoSessionId, errJsonlNeverWritten].map((make): RecheckRetryAnswerRow => ({
+    name: `${make().errName}, then the reuse spawn collides after the latch cleared → retrying with the reuse-collision cause armed; no get`,
+    at: [RECHECK_CALL_RESUME],
+    make: () => make(),
+    after: () => ({ spawnError: errInstanceIdCollision() }),
+    ends: 'cleared',
+    then: ['spawn'],
+    triggers: [UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION],
+    extraReuses: 1,
+    lineParts: (_site, ref) => aroundLaunchName(latchRecheckCollidedAfterClearLine(ref, '\u0000', true)),
+  })),
 ]
 
 describe('b.jg5 SRJ-506, SRJ-111, SRJ-112, SRJ-113: every row of the launch\'s outcome table at each re-check retry site, handled by the one handler, and the answer the round needs', () => {
@@ -31801,7 +32112,9 @@ describe('b.jg5 SRJ-506, SRJ-111, SRJ-112, SRJ-113: every row of the launch\'s o
     expect(h.reuseSpawns()).toHaveLength(reuses)
     expect(h.stub.calls.spawnCalls.filter((call) => call.reuse_finished === true)).toHaveLength(reuses)
     expect(recheckRoundLinesOf(h, p)).toHaveLength(1)
-    expect(recheckRoundLinesOf(h, p)[0]).toStartWith(recheckRoundLineHead(p, site.latch.latchCase, site.call))
+    expect(recheckRoundLinesOf(h, p)[0]).toStartWith(recheckRoundLineHead(p, site.latch.latchCase, site.step, site.call))
+    const parts = row.lineParts?.(site, renderPersonaRef(p, p))
+    if (parts !== undefined) expect(h.errors.filter((line) => line.startsWith(parts[0]) && line.endsWith(parts[1]))).toHaveLength(1)
     expect([...getOutageFlags(p)]).toEqual([...(row.flags ?? [])])
     expect(h.notices.filter((notice) => notice.key === p)).toHaveLength(row.notices ?? 0)
     if (rechecks !== undefined) expect(rechecks.resolves).toHaveLength(1)
@@ -32099,17 +32412,19 @@ describe('b.jg5 SRJ-505, SRJ-207, SRJ-810, b.av2 SR-6.4: a re-check retry stoppe
   }
 
   const GATES: ReadonlyArray<readonly [string, string, (h: RecoveryHarness, p: string, asked: string[]) => Promise<GateArrangement>]> = [
-    ['the relaunch gate refuses P', 'not-up', async (_h, _p, asked) => ({
+    ['the relaunch gate refuses P', 'not-up', async (_h, p, asked) => ({
       canRelaunch: (key) => {
         asked.push(key)
         return false
       },
+      line: latchRecheckNotUpLine(renderPersonaRef(p, p), RECHECK_CALL_REUSE_SPAWN),
     })],
-    ['the relaunch gate throws (counted as not up)', 'not-up', async (_h, _p, asked) => ({
+    ['the relaunch gate throws (counted as not up)', 'not-up', async (_h, p, asked) => ({
       canRelaunch: (key) => {
         asked.push(key)
         throw new Error('the relaunch gate could not be read')
       },
+      line: latchRecheckNotUpLine(renderPersonaRef(p, p), RECHECK_CALL_REUSE_SPAWN),
     })],
     ['P is held on ErrInvalidFlags (its earlier reuse refused)', 'held', async (h, p) => {
       await holdThroughReuse(h, p)
@@ -32153,7 +32468,7 @@ describe('b.jg5 SRJ-505, SRJ-207, SRJ-810, b.av2 SR-6.4: a re-check retry stoppe
     expect(order.filter((verb) => verb === 'spawn' || verb === 'resume')).toEqual([])
     if (gate.release === undefined) expect(order).toEqual(['status'])
     expect(asked).toEqual(gate.canRelaunch === undefined ? [] : [p])
-    expect(recheckRoundLinesOf(h, p)).toEqual([latchRecheckRoundLine(renderPersonaRef(p, p), LATCH_CASE_NO_VALID_ID, RECHECK_CALL_REUSE_SPAWN, `no-information (${answer})`)])
+    expect(recheckRoundLinesOf(h, p)).toEqual([latchRecheckRoundLine(renderPersonaRef(p, p), LATCH_CASE_NO_VALID_ID, RECHECK_STEP_TABLE, RECHECK_CALL_REUSE_SPAWN, `no-information (${answer})`)])
     if (gate.line !== undefined) expect(h.errors.filter((line) => line === gate.line)).toHaveLength(1)
     expect(h.latch.record(p)).toStrictEqual(record)
     expect([h.latchEvents.length, h.episodeNotices.length]).toEqual([eventsBefore, postsBefore])
@@ -32314,7 +32629,7 @@ describe('b.jg5 SRJ-506 (hatch A3): the re-check\'s run of the restart path\'s d
 
     expect(order.filter((verb) => verb === 'spawn' || verb === 'resume')).toEqual([])
     expect(recheckRoundLinesOf(h, p)).toHaveLength(1)
-    expect(recheckRoundLinesOf(h, p)[0]).toStartWith(recheckRoundLineHead(p, LATCH_CASE_NO_VALID_ID, RECHECK_CALL_RESTART_DECISION))
+    expect(recheckRoundLinesOf(h, p)[0]).toStartWith(recheckRoundLineHead(p, LATCH_CASE_NO_VALID_ID, RECHECK_STEP_TABLE, RECHECK_CALL_RESTART_DECISION))
     expectRecheckCleared(h, p)
   })
 
@@ -32535,7 +32850,7 @@ describe('b.jg5 SRJ-506 (hatch A3): the re-check\'s run of the restart path\'s d
 
     expect([runs, handOffs, order]).toEqual([[], [], ['status']])
     expect(h.errors.filter((line) => line === latchRecheckObserverFailedLine(ref, describeThrownValue(refusal)))).toHaveLength(1)
-    expect(recheckRoundLinesOf(h, p)).toEqual([latchRecheckRoundLine(ref, LATCH_CASE_NO_VALID_ID, RECHECK_CALL_RESTART_DECISION, `no-information (${LATCH_RECHECK_OBSERVER_FAILED})`)])
+    expect(recheckRoundLinesOf(h, p)).toEqual([latchRecheckRoundLine(ref, LATCH_CASE_NO_VALID_ID, RECHECK_STEP_TABLE, RECHECK_CALL_RESTART_DECISION, `no-information (${LATCH_RECHECK_OBSERVER_FAILED})`)])
     expect(h.latch.record(p)).toStrictEqual(record)
     expect([h.latchEvents.length, h.episodeNotices.length]).toEqual([eventsBefore, postsBefore])
   })
@@ -32562,7 +32877,7 @@ describe('b.jg5 SRJ-506 (hatch A3): the re-check\'s run of the restart path\'s d
 
     expectRecheckCleared(h, p)
     expect(recheckRoundLinesOf(h, p)).toHaveLength(1)
-    expect(recheckRoundLinesOf(h, p)[0]).toStartWith(recheckRoundLineHead(p, LATCH_CASE_NO_VALID_ID, RECHECK_CALL_RESTART_DECISION))
+    expect(recheckRoundLinesOf(h, p)[0]).toStartWith(recheckRoundLineHead(p, LATCH_CASE_NO_VALID_ID, RECHECK_STEP_TABLE, RECHECK_CALL_RESTART_DECISION))
     expect(order.slice(0, 5)).toEqual(['status', 'status', 'spawn', 'get', 'kill'])
     expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE })
     expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])

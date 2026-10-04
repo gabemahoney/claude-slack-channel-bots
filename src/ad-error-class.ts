@@ -598,6 +598,24 @@ export function describeReportedAdFailure(err: unknown): string {
 }
 
 /**
+ * A server-log description of a failed agent-director call that names the
+ * reported name whenever the classifier gives one (b.jg5 SRJ-104, SRJ-1014):
+ * {@link describeReportedAdFailure}'s description for a value with a
+ * reported name (an `ErrUnknownErrorName` shows its `unknownName` and the
+ * envelope's `err_description`, never the client's placeholder); otherwise
+ * {@link describeAgentDirectorFailure}'s, which keeps the value's type for an
+ * error whose name is not a safe identifier. Never throws.
+ */
+export function describeAdFailureForLog(err: unknown): string {
+  try {
+    if (classifyAdError(err).reportedName !== undefined) return describeReportedAdFailure(err)
+  } catch {
+    /* the classifier never throws; fall back to the generic describer all the same */
+  }
+  return describeAgentDirectorFailure(err)
+}
+
+/**
  * The UNCLASSIFIED classification of `value`, for a site that takes a value
  * of another class as UNCLASSIFIED because it gives that class no meaning
  * (b.jg5 SRJ-104, SRJ-110: at a kill, a STATE name other than

@@ -35,9 +35,9 @@
  * `agent-director kill` in the ordinary version) is a human's step, and the
  * text says that no bot, including any persona that sees the post, may run
  * it; the survivor version names no command. The survivor version's pid list
- * rests on SRJ-702's working default for the survivor-naming form
- * (`SURVIVOR_PID_PATTERN`), not yet checked against agent-director's release
- * candidate (b.jg5 E38 checks it).
+ * rests on SRJ-702's survivor-naming form (`SURVIVOR_PID_PATTERN`), the
+ * wording of agent-director's release candidate; reading it from the
+ * description is interim (b.jg5 SRJ-702).
  *
  * The route selection ({@link selectKillFailureAlertRoute}, SRJ-704, first
  * match wins, for either version):

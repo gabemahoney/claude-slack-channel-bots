@@ -10,7 +10,11 @@
  * `ad-config-malformed` outage a CONFIG answer raises: its raise, clear,
  * report and onset (b.jg5 SRJ-316, SRJ-312, SRJ-1018: one pin case holds
  * the onset's text; every other case compares with the exported template
- * over the classifier's rendered message), and the report of an UNCLASSIFIED
+ * over the classifier's rendered message; the raise and clear lines, b.jg5
+ * SRJ-1014, compare with their exported builders), and, with a notify that
+ * throws or rejects, the wrappers' `ad-unreachable`, `tmux-unavailable` and
+ * `cwd-unreachable` onsets: the call's own error rethrown and one failure
+ * line, and the report of an UNCLASSIFIED
  * outcome met in P's attempt to the unclassified sink, through the wrappers,
  * the reporting point and the site entry (b.jg5 SRJ-313, SRJ-301), and the
  * phase and classes each notice carries to the notifier, the all-clear's
@@ -61,7 +65,9 @@ import {
   ALL_CLEAR_TEMPLATE,
   ONSET_TEMPLATES,
   OUTAGE_CLASS_ORDER,
+  adConfigMalformedClearedLine,
   adConfigMalformedOnset,
+  adConfigMalformedRaisedLine,
   raiseAdConfigMalformed,
   raiseTmuxUnavailable,
   tmuxServerChangedOnset,
@@ -139,7 +145,7 @@ import {
   type LatchRecheckScope,
   type UnavailableRetryCause,
 } from '../src/unavailable-retry.ts'
-import { APP_TOKEN_PREFIX, REDACTED_SENTINEL_TAIL, assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
+import { APP_TOKEN_PREFIX, LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
 import { MAX_LOGGED_MESSAGE_LENGTH, describeThrownValue } from '../src/persona-connection-errors.ts'
 import { RECHECK_OUTCOME_NOT_RUNNING, RECHECK_OUTCOME_PASS, createAdVersionRecheck } from '../src/ad-version-gate.ts'
 import { PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
@@ -2357,6 +2363,100 @@ describe('the cleared-flag observer (b.jg5 SRJ-305, SRJ-311)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// A notify that fails: the failed onset's one line, and the wrappers' own
+// error kept (shared by the ad-config-malformed cases and the other onsets
+// the wrappers raise)
+// ---------------------------------------------------------------------------
+
+/** The one server-log line a failed onset post for persona `key` writes. */
+const onsetFailureLine = (key: string, failure: unknown): string =>
+  `[slack] outage-state: onset notice for persona=${key} failed: ${describeThrownValue(failure)} — the flag stays raised; the notice counts as posted`
+
+/** The lines among `lines` that report a failed onset post (any persona). */
+const onsetFailureLinesIn = (lines: readonly string[]): string[] => lines.filter((line) => line.includes('outage-state: onset notice for persona='))
+
+/** How a notify can fail: it throws the failure, or answers a promise that rejects with it. */
+const NOTIFY_FAILURES: ReadonlyArray<readonly [form: string, fail: (failure: Error) => unknown]> = [
+  ['a notify that throws', (failure) => { throw failure }],
+  ['a notify whose promise rejects', (failure) => Promise.reject(failure)],
+]
+
+/** A failure whose message carries a fake token and URL, so the failure line is leak-checked. */
+const notifyFailure = (): Error => new Error(`slack post failed (${sentinelInMessage('notify')})`)
+
+/**
+ * A fresh outage state whose notify records every call and then fails as
+ * `fail` does, with a recording trigger sink.
+ */
+function makeFailingNotifyHarness(fail: (failure: Error) => unknown, failure: Error): { calls: Emission[]; arms: RecordedArm[] } {
+  const calls: Emission[] = []
+  const arms: RecordedArm[] = []
+  const client = makeStubClient()
+  _resetOutageState()
+  initOutageState({
+    notify: (key, text) => {
+      calls.push({ key, text })
+      return fail(failure)
+    },
+    getClient: () => client as unknown as Client,
+    triggerSink: { arm: (key: string, cause: UnavailableRetryCause) => { arms.push({ key, kind: cause.kind, error: cause.error }); return true } },
+  })
+  return { calls, arms }
+}
+
+/** Let every queued promise reaction (a rejected notify's handler) run. */
+const settle = (): Promise<void> => new Promise((done) => setTimeout(done, 0))
+
+describe('the wrappers\' other onsets with a notify that fails: the call\'s own error is rethrown (b.jg5 SRJ-1014)', () => {
+  /** Every server-log line (`console.error`) the running case wrote. */
+  let lines: string[]
+  let errorSpy: ReturnType<typeof spyOn>
+
+  beforeEach(() => {
+    lines = []
+    errorSpy = spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+      lines.push(args.map(String).join(' '))
+    })
+  })
+
+  afterEach(() => {
+    errorSpy.mockRestore()
+  })
+
+  /** Each onset the wrappers raise outside CONFIG, with the answer that raises it and the onset it posts. */
+  const ONSETS: ReadonlyArray<readonly [cls: OutageClass, build: () => Error, onset: (err: Error) => string]> = [
+    ['ad-unreachable', () => errSystemInstallDisappeared('status'), (err) => ONSET_TEMPLATES['ad-unreachable']((err as ErrSystemInstallDisappeared).binaryPath)],
+    ['tmux-unavailable', () => errTmuxNotAvailable(undefined, 'status'), () => ONSET_TEMPLATES['tmux-unavailable']()],
+    ['cwd-unreachable', () => errCwdNotFound('status', WRAP_WORKDIR), () => ONSET_TEMPLATES['cwd-unreachable'](WRAP_WORKDIR)],
+  ]
+
+  const CASES = NOTIFY_FAILURES.flatMap(([form, fail]) =>
+    ONSETS.flatMap(([cls, build, onset]) => WRAPPERS.map(([w, wrap]) => [cls, form, w, fail, build, onset, wrap] as const)),
+  )
+
+  test.each(CASES)('%s, %s, through %s: the wrapper rejects with the call\'s own error, the flag is raised, notify was called once with the onset and one failure line is logged; a second answer calls notify not at all', async (cls, _form, _w, fail, build, onset, wrap) => {
+    const failure = notifyFailure()
+    const { calls } = makeFailingNotifyHarness(fail, failure)
+    const err = build()
+
+    expect(await rejectionFrom(wrap, P1, 'status', err)).toBe(err)
+    await settle()
+
+    expect([...getOutageFlags(P1)]).toEqual([cls])
+    expect(calls).toEqual([{ key: P1, text: onset(err) }])
+    expect(onsetFailureLinesIn(lines)).toEqual([onsetFailureLine(P1, failure)])
+
+    // The onset counts as posted: the same answer again is rethrown and notify is not called.
+    const again = build()
+    expect(await rejectionFrom(wrap, P1, 'status', again)).toBe(again)
+    await settle()
+    expect([calls.length, onsetFailureLinesIn(lines).length]).toEqual([1, 1])
+    expect(getOutageFlags(P2).size).toBe(0)
+    assertNoLeak({ calls, lines })
+  })
+})
+
+// ---------------------------------------------------------------------------
 // b.jg5 SRJ-316, SRJ-312, SRJ-1018, SRJ-301 — the ad-config-malformed outage
 // a CONFIG answer (`ErrConfigMalformed`) raises: its onset, raise, clear,
 // report, the stable class order, and the version re-check (AC 84)
@@ -2390,11 +2490,24 @@ describe('the ad-config-malformed outage (b.jg5 SRJ-316, SRJ-312, SRJ-1018: AC 8
     errorSpy.mockRestore()
   })
 
-  /** The server-log lines that carry `err`'s classification (the raise line's form). */
-  const raiseLinesFor = (err: unknown): string[] => {
-    const described = describeAdErrorClassification(classifyAdError(err))
-    return lines.filter((line) => line.includes(described))
+  /** The server-log lines that are `key`'s raise line for `err` (`adConfigMalformedRaisedLine` over its classification). */
+  const raiseLinesFor = (err: unknown, key: string = P1): string[] => {
+    const raised = adConfigMalformedRaisedLine(key, classifyAdError(err))
+    return lines.filter((line) => line === raised)
   }
+
+  /** The server-log lines that are `key`'s clear line (`adConfigMalformedClearedLine`). */
+  const clearLinesFor = (key: string): string[] => lines.filter((line) => line === adConfigMalformedClearedLine(key))
+
+  test('the raise line carries the classification\'s description and the clear line the persona, neither the thrown value\'s other text; nothing leaks', () => {
+    const err = Object.assign(configAnswer(`refused (${sentinelInMessage('raise')})`) as Error, { original: LEAK_SENTINEL })
+    const raised = adConfigMalformedRaisedLine(P1, classifyAdError(err))
+    expect(raised).toContain(describeAdErrorClassification(classifyAdError(err)))
+    expect(raised).toContain(`persona=${P1}`)
+    expect(raised).toContain(REDACTED_SENTINEL_TAIL)
+    expect(adConfigMalformedClearedLine(P1)).toContain(`persona=${P1}`)
+    assertNoLeak([raised, adConfigMalformedClearedLine(P1)])
+  })
 
   test('pin: the onset is SRJ-1018\'s text byte for byte, quoting the description; with no description the quoting sentence is dropped', () => {
     const err = configAnswer('config ~/.agent-director/config.toml: refused [tmux] values: [tmux] starting_session_seconds = 30, below its safe minimum 60 s')
@@ -2426,44 +2539,8 @@ describe('the ad-config-malformed outage (b.jg5 SRJ-316, SRJ-312, SRJ-1018: AC 8
     assertNoLeak({ emissions, lines, flags: [...getOutageFlags(P1)] })
   })
 
-  /** The one server-log line a failed onset post for persona `key` writes. */
-  const onsetFailureLine = (key: string, failure: unknown): string =>
-    `[slack] outage-state: onset notice for persona=${key} failed: ${describeThrownValue(failure)} — the flag stays raised; the notice counts as posted`
-
   /** The server-log lines that report a failed onset post (any persona). */
-  const onsetFailureLines = (): string[] => lines.filter((line) => line.includes('outage-state: onset notice for persona='))
-
-  /** How a notify can fail: it throws the failure, or answers a promise that rejects with it. */
-  const NOTIFY_FAILURES: ReadonlyArray<readonly [form: string, fail: (failure: Error) => unknown]> = [
-    ['a notify that throws', (failure) => { throw failure }],
-    ['a notify whose promise rejects', (failure) => Promise.reject(failure)],
-  ]
-
-  /** A failure whose message carries a fake token and URL, so the failure line is leak-checked. */
-  const notifyFailure = (): Error => new Error(`slack post failed (${sentinelInMessage('notify')})`)
-
-  /**
-   * A fresh outage state whose notify records every call and then fails as
-   * `fail` does, with a recording trigger sink.
-   */
-  function makeFailingNotifyHarness(fail: (failure: Error) => unknown, failure: Error): { calls: Emission[]; arms: RecordedArm[] } {
-    const calls: Emission[] = []
-    const arms: RecordedArm[] = []
-    const client = makeStubClient()
-    _resetOutageState()
-    initOutageState({
-      notify: (key, text) => {
-        calls.push({ key, text })
-        return fail(failure)
-      },
-      getClient: () => client as unknown as Client,
-      triggerSink: { arm: (key: string, cause: UnavailableRetryCause) => { arms.push({ key, kind: cause.kind, error: cause.error }); return true } },
-    })
-    return { calls, arms }
-  }
-
-  /** Let every queued promise reaction (a rejected notify's handler) run. */
-  const settle = (): Promise<void> => new Promise((done) => setTimeout(done, 0))
+  const onsetFailureLines = (): string[] => onsetFailureLinesIn(lines)
 
   test.each(NOTIFY_FAILURES.flatMap(([form, fail]) => wrapRows(['status', 'spawn']).map(([w, c, wrap, call]) => [form, w, c, wrap, call, fail] as const)))('%s, %s, %s: one failure line, the flag stays raised, the wrapper reports and rethrows the original CONFIG value; a second CONFIG calls notify not at all', async (_form, _w, _c, wrap, call, fail) => {
     const failure = notifyFailure()
@@ -2611,6 +2688,8 @@ describe('the ad-config-malformed outage (b.jg5 SRJ-316, SRJ-312, SRJ-1018: AC 8
     expect(getOutageFlags(P1).size).toBe(0)
     expect([...getOutageFlags(P2)]).toEqual(['ad-config-malformed'])
     expect(cleared).toEqual([{ key: P1, cls: 'ad-config-malformed', reading: undefined }])
+    // One clear line, for P1 only; the second success logs none.
+    expect([clearLinesFor(P1), clearLinesFor(P2)]).toEqual([[adConfigMalformedClearedLine(P1)], []])
     assertNoLeak({ emissions, lines })
   })
 
@@ -2764,8 +2843,10 @@ describe('the ad-config-malformed outage (b.jg5 SRJ-316, SRJ-312, SRJ-1018: AC 8
 
     expect(emissions).toEqual([{ key: P1, text: onsetFor(err) }])
     expect(raiseLinesFor(err)).toHaveLength(1)
+    expect(clearLinesFor(P1)).toEqual([])
     clearOutageFlag(P1, 'ad-config-malformed')
     expect(emissions.slice(1)).toEqual([{ key: P1, text: configAllClear() }])
+    expect(clearLinesFor(P1)).toHaveLength(1)
 
     _resetOutageState()
     expect(() => raiseAdConfigMalformed(P1, err)).not.toThrow()
@@ -2791,6 +2872,7 @@ describe('the ad-config-malformed outage (b.jg5 SRJ-316, SRJ-312, SRJ-1018: AC 8
     expect(getOutageFlags(P1).size).toBe(0)
     expect(emissions).toHaveLength(1)
     expect(cleared).toEqual([])
+    expect(clearLinesFor(P1)).toEqual([])
 
     await rejectionFrom(withOutageDetection, P1, 'get', err)
     expect(emissions).toEqual([{ key: P1, text: onsetFor(err) }, { key: P1, text: onsetFor(err) }])
@@ -2807,6 +2889,16 @@ describe('the ad-config-malformed outage (b.jg5 SRJ-316, SRJ-312, SRJ-1018: AC 8
 
     expect(emissions.map((e) => e.text)).toEqual([onsetFor(err), configAllClear(), onsetFor(err), configAllClear()])
     expect(raiseLinesFor(err)).toHaveLength(2)
+    expect(clearLinesFor(P1)).toHaveLength(2)
+    // Raise, clear, raise, clear: each line in the order its change happened.
+    const raised = adConfigMalformedRaisedLine(P1, classifyAdError(err))
+    expect(lines.filter((line) => line === raised || line === adConfigMalformedClearedLine(P1))).toEqual([
+      raised,
+      adConfigMalformedClearedLine(P1),
+      raised,
+      adConfigMalformedClearedLine(P1),
+    ])
+    assertNoLeak({ emissions, lines })
   })
 })
 

@@ -46,7 +46,11 @@
  * any other value (0 included), or a `pause` that is not a table, is "not
  * used" and never refuses the read.
  *
- * A refused read changes no value in effect: the reader keeps the values of
+ * An accepted read logs the nine `[tmux]` values in effect at the reader's
+ * first accepted read and at each accepted read that changes them
+ * ({@link buildAdSettingsValuesLine}; b.jg5 SRJ-1014); a change of
+ * `[pause] timeout_seconds` alone logs nothing. A refused read changes no
+ * value in effect: the reader keeps the values of
  * its last accepted read (the defaults at startup) and writes one log line
  * per run of refused reads, at the first refused read after start or after
  * an accepted read ({@link buildAdSettingsRefusedReadLine}). The read raises
@@ -184,8 +188,7 @@ export const DEFAULT_AD_SETTINGS: AdSettingsDefaults = Object.freeze({
     action_timeout_ms: 2000n,
     create_timeout_ms: 5000n,
     pipe_close_wait_ms: 100n,
-    // The working default: the release candidate's placeholder, until the
-    // Phase 1 release notes state the measured value (E51 re-checks it).
+    // agent-director's measured default, the value its release ships (b.jg5 SRJ-209).
     kill_exit_wait_ms: 5000n,
   }),
   pause: Object.freeze({ timeout_seconds: 30n }),
@@ -421,6 +424,33 @@ function readAdSettingsFile(path: string, fs: Partial<PersonaConfigFs> | undefin
 /** The prefix of every line this module logs. */
 export const AD_SETTINGS_LOG_PREFIX = '[slack] agent-director settings:'
 
+/** A `[tmux]` key's unit, from its name's suffix: `s` for a `_seconds` key, `ms` for a `_ms` key (b.jg5 SRJ-209). */
+export function adTmuxKeyUnit(key: AdTmuxKey): 's' | 'ms' {
+  return key.endsWith('_seconds') ? 's' : 'ms'
+}
+
+/**
+ * The values line (b.jg5 SRJ-209, SRJ-1014): the nine `[tmux]` values in
+ * effect, written at the reader's first accepted read and at each later
+ * accepted read whose nine values differ from those in effect:
+ *
+ *   [slack] agent-director settings: the [tmux] values in effect from "<path>": pending_grace_seconds 60 s, stopping_window_seconds 90 s, starting_session_seconds 300 s, sweep_budget_seconds 15 s, query_timeout_ms 1500 ms, action_timeout_ms 2000 ms, create_timeout_ms 5000 ms, pipe_close_wait_ms 100 ms, kill_exit_wait_ms 5000 ms (b.jg5 SRJ-209, SRJ-1014)
+ *
+ * The keys come in {@link AD_TMUX_KEYS}' order, each with its unit
+ * ({@link adTmuxKeyUnit}). The line holds the path and the nine integers
+ * only: no file text, no string value and no token. `[pause]
+ * timeout_seconds` is not on it. Pure.
+ */
+export function buildAdSettingsValuesLine(path: string, values: AdTmuxValues): string {
+  const listed = AD_TMUX_KEYS.map((key) => `${key} ${values[key]} ${adTmuxKeyUnit(key)}`).join(', ')
+  return `${AD_SETTINGS_LOG_PREFIX} the [${AD_TMUX_TABLE}] values in effect from "${path}": ${listed} (b.jg5 SRJ-209, SRJ-1014)`
+}
+
+/** Whether two sets of the nine `[tmux]` values are equal, key by key. */
+function sameTmuxValues(a: AdTmuxValues, b: AdTmuxValues): boolean {
+  return AD_TMUX_KEYS.every((key) => a[key] === b[key])
+}
+
 /**
  * The one line of a run of refused reads (b.jg5 SRJ-209), written at the
  * first refused read after start or after an accepted read:
@@ -450,9 +480,12 @@ export interface AdSettingsReaderDeps {
 export interface AdSettingsReader {
   /**
    * Read the file once, apply the rule and answer the outcome. An accepted
-   * read replaces the values in effect and ends a run of refused reads; a
-   * refused read changes nothing and writes the run's line if it is the
-   * run's first. Never throws.
+   * read replaces the values in effect and ends a run of refused reads; it
+   * writes the values line ({@link buildAdSettingsValuesLine}) when it is the
+   * reader's first accepted read or its nine `[tmux]` values differ from
+   * those in effect, and none otherwise (a change of `[pause]
+   * timeout_seconds` alone writes none). A refused read changes nothing and
+   * writes the run's line if it is the run's first. Never throws.
    */
   read(): AdSettingsReadOutcome
   /** The values in effect: those of the last accepted read, else the defaults. */
@@ -489,9 +522,17 @@ export function createAdSettingsReader(deps: AdSettingsReaderDeps): AdSettingsRe
     read() {
       const { path, outcome } = readOnce()
       if (outcome.kind === 'accepted') {
+        const valuesChanged = !hadAcceptedRead || !sameTmuxValues(inEffect.tmux, outcome.values.tmux)
         inEffect = outcome.values
         hadAcceptedRead = true
         inRefusedRun = false
+        if (valuesChanged) {
+          try {
+            deps.log(buildAdSettingsValuesLine(path ?? AD_CONFIG_FILE_DISPLAY_NAME, outcome.values.tmux))
+          } catch {
+            /* non-critical: the log sink failing changes no value */
+          }
+        }
         return outcome
       }
       if (!inRefusedRun) {
@@ -836,7 +877,7 @@ function maxBigInt(a: bigint, b: bigint): bigint {
  * - `resume`, `spawn-with-reuse` and `plain-spawn`: max(Q + C + 2A + 4W, 2Q + C + 3W)
  * - `find-missing` and `expire`: B + Q + W
  * At the defaults: 12.4, 6.9, 9, 39 (9 + 30), 10.9 and 16.6 s. Pure and
- * exact: computed on the `bigint` values, so no value E6 can hold loses
+ * exact: computed on the `bigint` values, so no value the reader can hold loses
  * precision or wraps.
  */
 export function adVerbCeilingsMs(values: AdSettingsInEffect): AdVerbCeilingsMs {
@@ -868,7 +909,7 @@ export function adVerbCeilingsMs(values: AdSettingsInEffect): AdVerbCeilingsMs {
 /**
  * The need and what sets it: the verb whose ceiling is the largest, or, when
  * `[pause] timeout_seconds` holds a value that is not used, that value
- * (E6's token-free description of it), since `pause`'s wait is then unknown.
+ * (the reader's token-free description of it), since `pause`'s wait is then unknown.
  */
 export type AdCallTimeoutNeedSetBy =
   | { readonly kind: 'verb'; readonly verb: AdCeilingVerb }
@@ -931,7 +972,7 @@ function isAtOrBelow(callTimeoutMs: number, needMs: bigint): boolean {
  *   [slack] agent-director settings: agent_director_call_timeout_ms is <value>, at or below its need of <need> ms (the <ceiling> ceiling plus the 15000 ms margin): a call can time out while its verb still acts; see the README's switch-over runbook, section "<title>" (b.jg5 SRJ-213)
  *   [slack] agent-director settings: agent_director_call_timeout_ms is <value>; its need is unknown: [pause] timeout_seconds holds <found>, a value that is not used, so pause's wait is not counted and the need without it is <need> ms; see the README's switch-over runbook, section "<title>" (b.jg5 SRJ-213)
  *
- * The need is in milliseconds, like the setting. `<found>` is E6's token-free
+ * The need is in milliseconds, like the setting. `<found>` is the reader's token-free
  * description; the line holds no file text, no string value and no token.
  * Pure.
  */

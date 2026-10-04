@@ -277,6 +277,7 @@ import {
   stuckLaunchAttachRemedyLine,
   stuckLaunchEndRowLiveReason,
   stuckLaunchEpisodeEndedLine,
+  stuckLaunchEpisodeEndFailedLine,
   stuckLaunchHeldText,
   stuckLaunchListRemedyLine,
   stuckLaunchOutageQueryFailedLine,
@@ -410,7 +411,7 @@ import { getOutageFlags } from '../src/outage-state.ts'
 import type { ConflictLatchRecord } from '../src/conflict-latch.ts'
 import { OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL } from '../src/retired-keys.ts'
 import { KILL_FAILURE_CLOSING_DESTINATION, KILL_FAILURE_CONTEXT_RECOVERY, KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT } from '../src/kill-failure-alert.ts'
-import { KILL_RETRY_SPACING_MS, KILL_RETRY_TRIES } from '../src/kill-retry.ts'
+import { KILL_RETRY_ALERT_NONE, KILL_RETRY_SPACING_MS, KILL_RETRY_TRIES } from '../src/kill-retry.ts'
 import { describeKillOutcome, KILL_OUTCOME_KILLED } from '../src/checked-kill.ts'
 import { AD_ERROR_CLASS_UNAVAILABLE, LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT } from '../src/ad-error-class.ts'
 import { getFailureCount, recordFailure } from '../src/backoff.ts'
@@ -424,7 +425,7 @@ import {
   renderPersonaRef,
   tmuxExactSessionTarget,
 } from '../src/persona-identity.ts'
-import { createPersonaEpisodes, PERSONA_EPISODE_KIND_STUCK_LAUNCH, type PersonaEpisodes } from '../src/persona-episodes.ts'
+import { createPersonaEpisodes, killFailureStoppedRetryText, PERSONA_EPISODE_KIND_STUCK_LAUNCH, type PersonaEpisodes } from '../src/persona-episodes.ts'
 import type { PersonaTeardownWindowState } from '../src/persona-notifier.ts'
 import { describeThrownValue } from '../src/persona-connection-errors.ts'
 import {
@@ -438,6 +439,7 @@ import {
   isCscbOwnLaunch,
   LAUNCH_CALL_END_LAUNCH_TIMEOUT,
   launchCallWindowOf,
+  noLaunchStartPendingRowLine,
   ownLaunchRecordOf,
   paneShowsStartupDialog,
   PENDING_ROW_STEP_LATCHED,
@@ -445,6 +447,8 @@ import {
   pendingRowRuleApproverStopGatedLine,
   pendingRowRuleApproverStopLine,
   pendingRowRuleNoEpisodesLine,
+  pendingRowRuleNoEpisodesRelaunchingLine,
+  PERSONA_KILL_STOP_CAUSE_NOT_UP,
   readAndStepPendingRow,
   setStuckLaunchEpisodes,
   SPAWN_ACTION_RETRYING,
@@ -527,7 +531,7 @@ import {
   type PendingRowModelVerb,
 } from './test-helpers/pending-row-model.ts'
 import { PRE_PERSONA_ID } from './test-helpers/old-life.ts'
-import { writeAgentDirectorConfig, type AdConfigTables } from './test-helpers/ad-settings.ts'
+import { settingsLinesOtherThanValues, writeAgentDirectorConfig, type AdConfigTables } from './test-helpers/ad-settings.ts'
 import {
   CSCB_OWN_LINE_FORBIDDEN,
   cscbOwnLineForbiddenIn,
@@ -800,7 +804,7 @@ afterEach(() => {
   settingsLines = []
   try {
     expect(pendingTimers).toEqual([])
-    expect(lines).toEqual([])
+    expect(settingsLinesOtherThanValues(lines, settingsHome)).toEqual([])
     assertNoLeak(lines)
   } finally {
     resetAdSettingsForTests()
@@ -1414,6 +1418,24 @@ describe('readAndStepPendingRow: one get, then a covered or undecided row armed 
     expect([starts, h.triggers, h.controller.isArmed(p), pendingOnlyArmedLines(h, p)]).toEqual([[], [], false, []])
     expectOneGetOnly(h, p)
   })
+
+  // b.jg5 SRJ-408, SRJ-513: the own-row read latches only a row carrying P's
+  // own id; a pending row with no launch start under another id reaches the
+  // pending-row step, whose no-launch-start answer logs its one line and
+  // answers latched. Today nothing latches and nothing is armed or started.
+  test.each(ROW_NO_LAUNCH_STARTS)('P\'s get answering a pending row with no launch start (%s) under another persona\'s id: the step\'s one no-launch-start line, the answer latched; no latch, nothing armed, no sequence', async (_form, launch) => {
+    const { h, p, q } = pendingP({ launch_started_at: launch, claude_instance_id: personaInstanceId('other') })
+    expect(personaInstanceId('other')).not.toBe(personaInstanceId(q))
+    const starts = recordSequenceStarts()
+
+    expect(await readAndStepPendingRow(personaOf(h, p))).toEqual({ kind: PENDING_ROW_STEP_LATCHED })
+
+    expect(h.errors.filter((line) => line === noLaunchStartPendingRowLine(refOf(h, p)))).toHaveLength(1)
+    expect([h.latch.isLatched(p), h.latch.isLatched(q)]).toEqual([false, false])
+    expect(h.episodeNotices).toEqual([])
+    expect([starts, h.triggers, h.controller.isArmed(p), pendingOnlyArmedLines(h, p)]).toEqual([[], [], false, []])
+    expectOneGetOnly(h, p)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -1927,6 +1949,27 @@ describe('the stuck-launch posters: closed episodes, a submitted teardown, and f
     expect(deps.postHeld(P, RULE_START, false)).toBe(STUCK_LAUNCH_POST_FAILED)
 
     expect(lines).toEqual([pendingRowRuleNoEpisodesLine(P)])
+  })
+
+  test('the session manager\'s relaunching poster with no episodes instance: its line, then the abort skipped for the failed post; kept, no kill', async () => {
+    setStuckLaunchEpisodes(undefined)
+    const lines: string[] = []
+    const deps = buildPendingRowRuleDeps({ appliedPersona: () => undefined, log: (line) => void lines.push(line) })
+
+    expect(await deps.ownLaunch!.relaunch(P, renderPersonaRef(P), RULE_START)).toEqual({ kind: PENDING_ROW_RELAUNCH_KEPT, why: STUCK_LAUNCH_ABORT_SKIP_POST_FAILED })
+
+    expect(lines).toEqual([pendingRowRuleNoEpisodesRelaunchingLine(P), stuckLaunchAbortSkippedLine(P, STUCK_LAUNCH_ABORT_SKIP_POST_FAILED)])
+  })
+
+  test('an episode end that throws: one line describing the error, no episode reported ended, nothing posted', () => {
+    const err = new Error(`episodes end refused (${sentinelInMessage('episode-end')})`)
+    const lines: string[] = []
+    const episodes = { end: (): boolean => { throw err } }
+
+    expect(endStuckLaunchEpisode(episodes, P, stuckLaunchEndRowLiveReason(LIVE_OUT_OF_PENDING), (line) => void lines.push(line))).toBe(false)
+
+    expect(lines).toEqual([stuckLaunchEpisodeEndFailedLine(P, describeThrownValue(err))])
+    assertNoLeak(lines)
   })
 
   test('a log that throws changes nothing: the text posts once, then posts nothing', () => {
@@ -4314,7 +4357,15 @@ describe('CSCB\'s own stuck launch at B: the relaunching post, one checked kill,
 
     const atB = await abortRoundAtB(h, p, row, ABORT_ORIGIN_APPROVER_STOP)
     expect(row.callTimes('kill')).toEqual([atB])
-    expect([abortAlertLinesOf(h, p), otherNoticesOf(h, p), h.killFailureOpen(p), h.stuckLaunchAbortUsed(p)]).toEqual([[], [], false, false])
+    // SRJ-702, SRJ-1014: the stop's one record, naming its cause and the last outcome's class; no alert text.
+    const stoppedLine = killFailureStoppedRetryText({
+      key: p,
+      decision: { kind: KILL_RETRY_ALERT_NONE },
+      context: KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT,
+      lastOutcomeClass: AD_ERROR_CLASS_UNAVAILABLE,
+      stopCause: PERSONA_KILL_STOP_CAUSE_NOT_UP,
+    }).line
+    expect([abortAlertLinesOf(h, p), otherNoticesOf(h, p), h.killFailureOpen(p), h.stuckLaunchAbortUsed(p)]).toEqual([[stoppedLine], [], false, false])
 
     h.setUp(p, true)
     stopsUp = false

@@ -3,8 +3,8 @@
  * "Atomic file writes"). A reader of the final path sees the old contents or
  * the new, never a partial write.
  *
- * - `atomicWriteFileSync`: the `.tmp` + rename write, for the E10 records
- *   (the Stop-hook and reply-guard records).
+ * - `atomicWriteFileSync`: the `.tmp` + rename write, for the Stop-hook and
+ *   reply-guard records.
  * - `durableWriteFileSync`: the atomic and durable write of the reload files
  *   beside the configuration file (b.av2 SR-8.1): a uniquely named temporary
  *   file, fsync, rename, then fsync of the directory, so the new bytes

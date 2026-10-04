@@ -58,11 +58,16 @@ import {
   buildAdVersionRecheckCouldNotRunLine,
   buildPhase1HostNote,
   CLIENT_DEV_SENTINEL_VERSION,
+  buildBelowPhase1FloorMessage,
+  buildSystemInstallTooOldMessage,
   compareAdVersions,
   createAdVersionRecheck,
   decideAdVersionRecheckOutcome,
   decideHostAdVersion,
+  DEBUG_SKILL_PATH,
+  DEBUG_SKILL_RUNTIME_STOP_POINTER,
   disposeAdVersionRecheck,
+  FOUND_BY_RUNTIME_RECHECK,
   HOST_VERSION_FAIL_BELOW_CLIENT_MINIMUM,
   HOST_VERSION_FAIL_CLIENT_MINIMUM_UNREADABLE,
   HOST_VERSION_FAIL_NOT_FOUND,
@@ -78,7 +83,9 @@ import {
   onAdVersionRecheckTick,
   PHASE1_FLOOR_VERSION,
   PHASE1_HOST_NOTE_PHRASE,
+  PHASE1_REQUIRED_PHRASE,
   PHASE1_RUNBOOK_SECTION_TITLE,
+  PHASE1_SWITCH_OVER_INSTRUCTION,
   RECHECK_OUTCOME_COULD_NOT_RUN,
   RECHECK_OUTCOME_NOT_RUNNING,
   RECHECK_OUTCOME_PASS,
@@ -125,6 +132,7 @@ import {
   type InvalidFlagsHold,
 } from '../src/invalid-flags-hold.ts'
 import { createPersonaEpisodes, PERSONA_EPISODE_KIND_INVALID_FLAGS_HOLD, type PersonaEpisodes } from '../src/persona-episodes.ts'
+import { setSessionNotifier } from '../src/session-manager.ts'
 import { sessionEndingCommandsIn } from './test-helpers/conflict-cases.ts'
 import {
   errBunVersionTooOld,
@@ -157,6 +165,7 @@ import {
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { STALE_VERSION, UNREACHABLE_REASONS } from './test-helpers/install-check-fixtures.ts'
 import { flat } from './test-helpers/markdown.ts'
+import { readStartupEntries } from './test-helpers/persona-notifier.ts'
 import { importSource, stripComments } from './test-helpers/source-audit.ts'
 import { UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
 
@@ -473,6 +482,23 @@ function expectStoppedOnce(rig: RecheckRig, classLabel: string): string {
   return rig.records[0]!.message
 }
 
+/**
+ * Assert a runtime re-check's entry, of either class, points to the debug
+ * skill and to neither the switch-over runbook nor the install skill, and
+ * carries no instruction to upgrade or install agent-director (b.jg5 SRJ-205,
+ * SRJ-208, SRJ-1013; hatch A3).
+ */
+function expectRuntimeEntryPointsToDebugSkill(message: string): void {
+  for (const text of [RUNTIME_RECHECK_PHRASE, DEBUG_SKILL_RUNTIME_STOP_POINTER, DEBUG_SKILL_PATH]) expect(message).toContain(text)
+  for (const text of [PHASE1_RUNBOOK_SECTION_TITLE, PHASE1_SWITCH_OVER_INSTRUCTION]) expect(message).not.toContain(text)
+  for (const line of renderInstallSkillInstructions().split('\n').filter((line) => line !== '')) expect(message).not.toContain(line)
+  const text = flat(message)
+  expect(text).not.toMatch(/switch-over runbook/i)
+  expect(text).not.toMatch(/\binstall agent-director\b/i)
+  expect(text).not.toMatch(/\bupgrade agent-director\b/i)
+  for (const [, pattern] of UPGRADE_FORMS) expect(text).not.toMatch(pattern)
+}
+
 afterEach(() => {
   for (const recheck of liveRigs.splice(0)) recheck.dispose()
   resetAdVersionRecheckForTests()
@@ -567,31 +593,30 @@ describe('runtime re-check: a version below the floor stops the server (ad-below
     ['the release before Phase 1', OLD_AD_VERSION, binaryPathFor('below-old')],
     ["the client's dev sentinel", DEV_PLACEHOLDER_VERSION, binaryPathFor('below-dev')],
     ['an unparseable version the client resolved with (fail closed)', DEV_UNPARSEABLE_VERSION, binaryPathFor('below-unparseable')],
-  ])('%s (%s): one record naming the found version, the floor, the path and the runtime phrase, then one non-zero stop', async (_label, version, path) => {
+  ])('%s (%s): one record naming the found version, the floor, the path, the runtime phrase, that Phase 1 is required and the debug skill, then one non-zero stop', async (_label, version, path) => {
     const rig = makeRecheckRig({ outcomes: [{ version, path }] })
     await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
     const message = expectStoppedOnce(rig, AD_BELOW_PHASE1_FLOOR)
-    for (const text of [version, PHASE1_FLOOR_VERSION, path, RUNTIME_RECHECK_PHRASE, PHASE1_RUNBOOK_SECTION_TITLE]) {
-      expect(message).toContain(text)
-    }
-    expect(message).not.toContain(renderInstallSkillInstructions())
-    for (const [, pattern] of UPGRADE_FORMS) expect(flat(message)).not.toMatch(pattern)
+    expect(message).toBe(buildBelowPhase1FloorMessage({ foundVersion: version, binaryPath: path }, FOUND_BY_RUNTIME_RECHECK))
+    for (const text of [version, PHASE1_FLOOR_VERSION, path, PHASE1_REQUIRED_PHRASE]) expect(message).toContain(text)
+    expectRuntimeEntryPointsToDebugSkill(message)
     expect(rig.recheck.lastVersionSeen()).toBe(BASELINE_VERSION)
   })
 })
 
 describe("runtime re-check: the client's too-old refusal stops the server (ad-system-install-too-old)", () => {
-  test("ErrSystemInstallTooOld: one record naming the error's versions, the floor, the path and the runtime phrase, ending with the install-skill block; then one non-zero stop", async () => {
+  test("ErrSystemInstallTooOld: one record naming the error's versions, the floor, the path, the runtime phrase and the debug skill, with no install-skill block; then one non-zero stop", async () => {
     const path = binaryPathFor('too-old')
     const tooOld = errSystemInstallTooOld(STALE_VERSION, CLIENT_MIN_VERSION, path)
     const rig = makeRecheckRig({ outcomes: [{ throws: tooOld }] })
     await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
     const message = expectStoppedOnce(rig, AD_SYSTEM_INSTALL_TOO_OLD)
-    for (const text of [tooOld.actualVersion, tooOld.requiredVersion, PHASE1_FLOOR_VERSION, tooOld.binaryPath, RUNTIME_RECHECK_PHRASE, PHASE1_RUNBOOK_SECTION_TITLE]) {
-      expect(message).toContain(text)
-    }
-    expect(message.endsWith(renderInstallSkillInstructions())).toBe(true)
-    for (const [, pattern] of UPGRADE_FORMS) expect(flat(message)).not.toMatch(pattern)
+    expect(message).toBe(
+      buildSystemInstallTooOldMessage({ foundVersion: tooOld.actualVersion, requiredVersion: tooOld.requiredVersion, binaryPath: tooOld.binaryPath }, FOUND_BY_RUNTIME_RECHECK),
+    )
+    for (const text of [tooOld.actualVersion, tooOld.requiredVersion, PHASE1_FLOOR_VERSION, tooOld.binaryPath]) expect(message).toContain(text)
+    expect(message.endsWith(`${DEBUG_SKILL_RUNTIME_STOP_POINTER}.`)).toBe(true)
+    expectRuntimeEntryPointsToDebugSkill(message)
   })
 
   test('is recognised by its name, not its class: a plain object carrying the errName stops the server the same way', async () => {
@@ -695,9 +720,10 @@ describe('runtime re-check: a stop happens once, record before stop', () => {
     expectStoppedOnce(rig, AD_BELOW_PHASE1_FLOOR)
     const lines = readFileSync(join(logDir, 'startup-errors.log'), 'utf-8').split('\n').filter((line) => line !== '')
     expect(lines).toHaveLength(1)
-    for (const text of [`[${AD_BELOW_PHASE1_FLOOR}]`, OLD_AD_VERSION, PHASE1_FLOOR_VERSION, path, RUNTIME_RECHECK_PHRASE]) {
+    for (const text of [`[${AD_BELOW_PHASE1_FLOOR}]`, OLD_AD_VERSION, PHASE1_FLOOR_VERSION, path, PHASE1_REQUIRED_PHRASE]) {
       expect(lines[0]).toContain(text)
     }
+    expectRuntimeEntryPointsToDebugSkill(lines[0]!)
   })
 })
 
@@ -1773,6 +1799,9 @@ describe('the ErrInvalidFlags hold below the floor (b.jg5 SRJ-205, AC 23): a reu
 // ---------------------------------------------------------------------------
 
 describe('runtime re-check: no Slack post (source audit)', () => {
+  /** The two gate modules: the runtime re-check's and the startup gate's (b.jg5 SRJ-1002). */
+  const GATE_MODULES: string[] = ['ad-version-gate.ts', 'agent-director-startup.ts']
+
   /** Specifiers of every value import or re-export in comment-stripped code (`import type` / `export type` excluded). */
   function valueImportSpecifiers(code: string): string[] {
     const specifiers: string[] = []
@@ -1783,16 +1812,77 @@ describe('runtime re-check: no Slack post (source audit)', () => {
     return specifiers
   }
 
-  test('src/ad-version-gate.ts value-imports no Slack client, notifier or persona-notifier module', () => {
-    const code = stripComments(readFileSync(join(import.meta.dir, '..', 'src', 'ad-version-gate.ts'), 'utf-8'))
-    const specifiers = valueImportSpecifiers(code)
-    expect(specifiers.length).toBeGreaterThan(0)
-    for (const specifier of specifiers) {
-      expect(specifier).not.toMatch(/^@slack\//)
-      expect(specifier).not.toMatch(/notifier/)
-      expect(specifier).not.toMatch(/persona-slack-|persona-connections|slack-client|server\.ts$/)
+  /** What in `code` could reach Slack: each value import of a Slack client, notifier or persona-notifier module, and each Slack post. */
+  function slackReachIn(code: string): string[] {
+    const imports = valueImportSpecifiers(code).filter(
+      (specifier) => /^@slack\//.test(specifier) || /notifier/.test(specifier) || /persona-slack-|persona-connections|slack-client|server\.ts$/.test(specifier),
+    )
+    const posts = [...code.matchAll(/\bchat\.postMessage\b|\bpostMessage\s*\(/g)].map((m) => m[0])
+    return [...imports, ...posts]
+  }
+
+  const gateCode = (file: string): string => stripComments(readFileSync(join(import.meta.dir, '..', 'src', file), 'utf-8'))
+
+  test.each(GATE_MODULES)('src/%s value-imports no Slack client, notifier or persona-notifier module and posts nothing', (file) => {
+    const code = gateCode(file)
+    expect(valueImportSpecifiers(code).length).toBeGreaterThan(0)
+    expect(slackReachIn(code)).toEqual([])
+  })
+
+  test.each(
+    GATE_MODULES.flatMap((file) =>
+      [
+        ["import { WebClient } from '@slack/web-api'", '@slack/web-api'],
+        ["import { createPersonaNotifier } from './persona-notifier.ts'", './persona-notifier.ts'],
+        ["export { setSessionNotifier } from './server.ts'", './server.ts'],
+        ["const m = await import('./persona-slack-episodes.ts')", './persona-slack-episodes.ts'],
+        ['client.chat.postMessage({ channel, text })', 'chat.postMessage'],
+      ].map(([planted, found]) => [file, planted!, found!] as const),
+    ),
+  )('a planted Slack reach in src/%s is found: %s', (file, planted, found) => {
+    expect(slackReachIn(`${gateCode(file)}\n${planted}\n`)).toEqual([found])
+  })
+
+  test('a type-only Slack import is no reach', () => {
+    expect(slackReachIn("import type { WebClient } from '@slack/web-api'\n")).toEqual([])
+  })
+})
+
+// The routing half (b.jg5 SRJ-1002, SRJ-1014; AC 20): a runtime refusal of
+// either class writes its one startup-errors entry and stops once, and the
+// session manager's notice sink, where a Slack notice would go, gets nothing.
+describe('runtime re-check: a refusal reaches the startup-errors log and the stop only, never a notice (b.jg5 SRJ-1002)', () => {
+  test.each([
+    [
+      'below the floor, the client\'s dev sentinel',
+      { version: DEV_PLACEHOLDER_VERSION, path: binaryPathFor('routing-floor') },
+      AD_BELOW_PHASE1_FLOOR,
+      buildBelowPhase1FloorMessage({ foundVersion: DEV_PLACEHOLDER_VERSION, binaryPath: binaryPathFor('routing-floor') }, FOUND_BY_RUNTIME_RECHECK),
+    ],
+    [
+      'the client\'s too-old refusal',
+      { throws: errSystemInstallTooOld(STALE_VERSION, CLIENT_MIN_VERSION, binaryPathFor('routing-too-old')) },
+      AD_SYSTEM_INSTALL_TOO_OLD,
+      buildSystemInstallTooOldMessage({ foundVersion: STALE_VERSION, requiredVersion: CLIENT_MIN_VERSION, binaryPath: binaryPathFor('routing-too-old') }, FOUND_BY_RUNTIME_RECHECK),
+    ],
+  ] as Array<[string, StubResolveSystemBinaryOutcome, string, string]>)('%s: one entry in the temporary log directory, one stop, no re-check line, and no notice', async (_label, outcome, classLabel, expected) => {
+    const logDir = mkdtempSync(join(tmpdir(), 'cscb-ad-version-routing-'))
+    tempDirs.push(logDir)
+    const notices: Array<[string, string]> = []
+    setSessionNotifier((key, text) => { notices.push([key, text]) })
+    try {
+      const rig = makeRecheckRig({
+        outcomes: [outcome],
+        recordStartupError: (label, message) => recordStartupError(label, message, undefined, { logDir }),
+      })
+      await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
+      expect(expectStoppedOnce(rig, classLabel)).toBe(expected)
+      expect(readStartupEntries(logDir)).toEqual([{ classLabel, text: expected }])
+      expect(rig.logs).toEqual([])
+      expect(notices).toEqual([])
+    } finally {
+      setSessionNotifier(undefined)
     }
-    expect(code).not.toMatch(/\bchat\.postMessage\b|\bpostMessage\s*\(/)
   })
 })
 

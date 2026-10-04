@@ -44,7 +44,7 @@
  * Slack-unreachable `unknown`), an HTTP status number, `retryAfter` and, on a
  * Slack-unreachable outcome only, the error's message rendered redacted by
  * `describeLogMessage` (`message="…"`: URL-like and token-like text replaced,
- * on one line, capped at 300 characters; E14 operator decision B1), the one
+ * on one line, capped at 300 characters), the one
  * rendering the other persona error lines use. Everything else on an outcome
  * — the reason kind, the token key, the check, the class label and the cause
  * text — is built by this module; the cause never holds error text.

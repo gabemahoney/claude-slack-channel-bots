@@ -21,6 +21,7 @@ import {
   AD_ERROR_CLASS_UNCLASSIFIED,
   AD_ERROR_CLASS_UNUSABLE_NAME,
   CSCB_UNKNOWN_ERROR_NAME,
+  describeAdFailureForLog,
   describeAgentDirectorFailure,
   killFailedDescriptionOf,
   type AdErrorClass,
@@ -163,6 +164,9 @@ import {
   _buildReconnectSessionAdapter,
   _runCallTimeoutStartStep,
   deferPendingRow,
+  deferralNoRowLine,
+  deferralNotPendingLine,
+  deferralRefusedLine,
   deferringPendingRowGoneLine,
   deferringPendingRowLine,
   type DeferPendingRowAnswer,
@@ -179,6 +183,9 @@ import {
   LIVENESS_STATUS_SITE,
   RECONNECT_STATUS_SITE,
   reconnectHeldOwnRowLine,
+  reconnectLatchedGateLine,
+  reconnectRetiredOldLifeLine,
+  reconnectStatusCheckFailedLine,
 } from '../src/server.ts'
 import { buildPersonaClientOrExit, type PersonaClientDeps } from '../src/agent-director-startup.ts'
 import {
@@ -1869,11 +1876,8 @@ describe('_buildReconnectSessionAdapter', () => {
     expect(sendKeysCalls).toHaveLength(0)
     expect(findMissingCalls).toHaveLength(0)
     expect(hasPendingWorkingRowEvidence('C1')).toBe(false)
-    expect(lines).toHaveLength(1)
-    expect(lines[0]).toStartWith(
-      `[slack] reconnectSession: persona=C1 status check failed: Error code=EIO message="status failed (${REDACTED_SENTINEL_TAIL})" at `,
-    )
-    expect(lines[0]).toContain('— not typing /mcp reconnect blind; deferring to a later tick')
+    expect(lines).toEqual([reconnectStatusCheckFailedLine('C1', describeThrownValue(statusError))])
+    expect(lines[0]).toContain(`code=EIO message="status failed (${REDACTED_SENTINEL_TAIL})"`)
     assertNoLeak({ lines })
   })
 
@@ -1888,9 +1892,8 @@ describe('_buildReconnectSessionAdapter', () => {
     ['ErrTmuxUnresponsive (by name)', () => errTmuxUnresponsive('status')],
     ['a plain Error', () => new Error('boom')],
   ])("SRJ-115: %s at the state read → 'transient', never 'escalate-dead'; no send-keys, pane read or sweep; one line", async (_label, build) => {
-    const { adapter, statusCalls, sendKeysCalls, findMissingCalls, readPaneCalls } = makeHarness({
-      statusError: build(),
-    })
+    const statusError = build()
+    const { adapter, statusCalls, sendKeysCalls, findMissingCalls, readPaneCalls } = makeHarness({ statusError })
     const lines: string[] = []
     const orig = console.error
     console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
@@ -1906,17 +1909,15 @@ describe('_buildReconnectSessionAdapter', () => {
     expect(sendKeysCalls).toEqual([])
     expect(readPaneCalls).toEqual([])
     expect(findMissingCalls).toHaveLength(0)
-    expect(lines).toHaveLength(1)
-    expect(lines[0]).toStartWith('[slack] reconnectSession: persona=C1 status check failed: ')
+    expect(lines).toEqual([reconnectStatusCheckFailedLine('C1', describeThrownValue(statusError))])
   })
 
   // b.jg5 SRJ-115, SRJ-316: a CONFIG answer at the state read is the same
   // 'transient' with nothing typed, read or swept; the outage wrapper also
   // raises `ad-config-malformed`, which adds its one raise line.
   test("SRJ-115, SRJ-316: a CONFIG answer (ErrConfigMalformed) at the state read → 'transient', never 'escalate-dead'; no send-keys, pane read or sweep; ad-config-malformed raised; the status-check line and one raise line", async () => {
-    const { result, errArgs, statusCalls, sendKeysCalls, findMissingCalls, readPaneCalls, killCalls, spawnCalls, resumeCalls } = await reconnectCapturing({
-      statusError: errConfigMalformed(),
-    })
+    const statusError = errConfigMalformed()
+    const { result, errArgs, statusCalls, sendKeysCalls, findMissingCalls, readPaneCalls, killCalls, spawnCalls, resumeCalls } = await reconnectCapturing({ statusError })
 
     expect(result).toBe('transient')
     expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('C1')])
@@ -1924,7 +1925,7 @@ describe('_buildReconnectSessionAdapter', () => {
     expect(findMissingCalls).toHaveLength(0)
     expect([...getOutageFlags('C1')]).toEqual(['ad-config-malformed'])
     const lines = stringLines(errArgs)
-    expect(lines.filter((l) => l.startsWith('[slack] reconnectSession: persona=C1 status check failed: '))).toHaveLength(1)
+    expect(lines.filter((l) => l === reconnectStatusCheckFailedLine('C1', describeThrownValue(statusError)))).toHaveLength(1)
     expect(lines.filter((l) => l.includes('ad-config-malformed raised for persona=C1'))).toHaveLength(1)
     expect(lines).toHaveLength(2)
     assertNoLeak({ errArgs })
@@ -2001,7 +2002,7 @@ describe('_buildReconnectSessionAdapter', () => {
   // one line describes the error (never the raw value); nothing leaks.
   /** The reconnect's transient line for persona C1. */
   const sendKeysTransientLine = (err: unknown, errorClass: AdErrorClass): string =>
-    reconnectTransientLine('persona=C1', describeAgentDirectorFailure(err), errorClass)
+    reconnectTransientLine('persona=C1', describeAdFailureForLog(err), errorClass)
 
   test.each(UNAVAILABLE_FORMS)("SRJ-105, SRJ-118: send-keys refused with %s → 'transient', never 'escalate-dead'; one send-keys, no sweep, no spawn-failure notice; one described line, nothing leaks", async (_label, build, redacted) => {
     const err = build('send-keys')
@@ -2896,14 +2897,14 @@ describe('_buildReconnectSessionAdapter', () => {
         row.build,
         conflictRecord(row),
         row.notice.text,
-        (outcome: string) => reconnectConflictLine('persona=C1', describeAgentDirectorFailure(row.build()), row.latchCase, outcome),
+        (outcome: string) => reconnectConflictLine('persona=C1', describeAdFailureForLog(row.build()), row.latchCase, outcome),
       ] as const),
       ...reconnectUnusableNameRowsAt('waiting').map((row) => [
         `UNUSABLE NAME at ${row.name}`,
         row.build,
         row.record('C1'),
         row.notice('C1'),
-        (outcome: string) => reconnectUnusableNameLine('persona=C1', describeAgentDirectorFailure(row.build()), outcome),
+        (outcome: string) => reconnectUnusableNameLine('persona=C1', describeAdFailureForLog(row.build()), outcome),
       ] as const),
     ]
 
@@ -3117,7 +3118,7 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(h.findMissingCalls).toEqual([])
       expect(latch.isLatched('C1')).toBe(false)
       expect(triggers).toEqual([])
-      const stopped: PaneReadFailure = { kind: PANE_READ_UNCLASSIFIED, errorClass: AD_ERROR_CLASS_UNCLASSIFIED, description: describeAgentDirectorFailure(err), stopping: true }
+      const stopped: PaneReadFailure = { kind: PANE_READ_UNCLASSIFIED, errorClass: AD_ERROR_CLASS_UNCLASSIFIED, description: describeAdFailureForLog(err), stopping: true }
       expect(promptRowOwnLines(lines, state)).toEqual([promptRowPaneReadStoppingLine('C1', state, stopped)])
     })
 
@@ -3132,7 +3133,7 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(callOrder).toEqual(['status', 'readPane', 'resolveSystemBinary'])
       expect(stops).toEqual([])
       expect(noticeKeys()).toEqual(['C1'])
-      const unclassified: PaneReadFailure = { kind: PANE_READ_UNCLASSIFIED, errorClass: AD_ERROR_CLASS_UNCLASSIFIED, description: describeAgentDirectorFailure(err) }
+      const unclassified: PaneReadFailure = { kind: PANE_READ_UNCLASSIFIED, errorClass: AD_ERROR_CLASS_UNCLASSIFIED, description: describeAdFailureForLog(err) }
       expect(promptRowOwnLines(lines, 'ask_user')).toEqual([promptRowTakenAsAliveLine('C1', 'ask_user', unclassified)])
     })
 
@@ -3291,7 +3292,7 @@ describe('_buildReconnectSessionAdapter', () => {
         expect(posts).toEqual([{ key: 'C1', text: row.notice.text }])
         expect(getFailureCount('C1')).toBe(0)
         expect(triggers).toEqual([...readTriggers])
-        expect(reconnectLatchLines(lines, (outcome) => reconnectConflictLine('persona=C1', describeAgentDirectorFailure(row.build()), row.latchCase, outcome))).toHaveLength(1)
+        expect(reconnectLatchLines(lines, (outcome) => reconnectConflictLine('persona=C1', describeAdFailureForLog(row.build()), row.latchCase, outcome))).toHaveLength(1)
         expect([h.killCalls, h.spawnCalls, h.resumeCalls, h.findMissingCalls]).toEqual([[], [], [], []])
         expect(raised).toHaveLength(raisedBefore)
 
@@ -3596,7 +3597,7 @@ describe('_buildReconnectSessionAdapter', () => {
 
     /** The sweep's refusal line for persona C1 under `prefix`. */
     const sweepRefusedLine = (prefix: string, err: unknown): string =>
-      `[slack] ${prefix}: findMissing sweep refused for persona=C1: ${describeAgentDirectorFailure(err)} — no spawn-failure notice; nothing more is called (b.jg5 SRJ-105)`
+      `[slack] ${prefix}: findMissing sweep refused for persona=C1: ${describeAdFailureForLog(err)} — no spawn-failure notice; nothing more is called (b.jg5 SRJ-105)`
 
     /** Run `site`'s attempts for C1 with every sweep failing with `err`, capturing notices and console.error. */
     async function sweepFailing(site: SweepSite, err: Error) {
@@ -3700,16 +3701,15 @@ describe('_buildReconnectSessionAdapter', () => {
       setSessionNotifier(undefined)
     })
 
-    /** The adapter's latched line for persona C1; `failure` is the failed query's part (`''`: none). */
-    const latchedLine = (failure: string): string =>
-      `[slack] reconnectSession: persona=C1 is latched${failure} — not typing /mcp reconnect; nothing done (b.jg5 SRJ-502)`
+    /** The adapter's latched line for persona C1; `queryFailure` is the failed query's description (none: the query answered). */
+    const latchedLine = (queryFailure?: string): string => reconnectLatchedGateLine('C1', queryFailure)
 
     /** The adapter's latched lines for persona C1 among the lines `errArgs` holds. */
     const latchedLines = (errArgs: unknown[][]): string[] =>
       stringLines(errArgs).filter((l) => l.startsWith('[slack] reconnectSession: persona=C1 is latched'))
 
-    /** The latched line's part for a query that threw `err`. */
-    const queryFailed = (err: unknown): string => ` (the latched query failed: ${describeThrownValue(err)} — taken as latched)`
+    /** The latched line's description of a query that threw `err`. */
+    const queryFailed = (err: unknown): string => describeThrownValue(err)
 
     /** A latch for the adapter: `latched` read at each query, every query's key in `asked`, and each query noted in `events`. */
     function makeLatch(events: string[] = []): { latched: boolean; asked: string[]; isLatched: (key: string) => boolean } {
@@ -3744,7 +3744,7 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(h.sendKeysCalls).toEqual([])
       expect(h.findMissingCalls).toHaveLength(0)
       expect([h.killCalls, h.spawnCalls, h.resumeCalls]).toEqual([[], [], []])
-      expect(stringLines(errArgs)).toEqual([latchedLine('')])
+      expect(stringLines(errArgs)).toEqual([latchedLine()])
     })
 
     test("a stale working row whose persona is latched by the attempt that would type → 'transient' right after its status read, though its evidence has held for 60 s: no pane read, nothing typed; one latched line; its evidence is kept, so once unlatched the next attempt types", async () => {
@@ -3764,7 +3764,7 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(h.readPaneCalls).toEqual(fullPaneReads(1))
       expect(h.sendKeysCalls).toEqual([])
       expect(h.findMissingCalls).toHaveLength(0)
-      expect(stringLines(errArgs)).toEqual([latchedLine('')])
+      expect(stringLines(errArgs)).toEqual([latchedLine()])
 
       latch.latched = false
       expect(await h.adapter('C1')).toBe('success')
@@ -3863,7 +3863,7 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(h.sendKeysCalls).toEqual([])
       expect(h.findMissingCalls).toHaveLength(0)
       expect(raised).toEqual([])
-      expect(latchedLines(errArgs)).toEqual([latchedLine('')])
+      expect(latchedLines(errArgs)).toEqual([latchedLine()])
     })
 
     test("a check_permission row whose persona latched during its read-pane notes no deferral: unlatched, the next attempt PROMPT_ROW_SWEEP_AFTER_MS later starts the run of deferrals (its notice, no sweep) rather than sweeping", async () => {
@@ -3912,7 +3912,7 @@ describe('_buildReconnectSessionAdapter', () => {
 
       expect(result).toBe('transient')
       expect(events).toEqual([...AFTER_PANE_READ, 'findMissing', 'status', 'isLatched'])
-      expect(latchedLines(errArgs)).toEqual(latched ? [latchedLine('')] : [])
+      expect(latchedLines(errArgs)).toEqual(latched ? [latchedLine()] : [])
       const deferrals = stringLines(errArgs).filter((l) => l.startsWith('[slack] reconnectSession: persona=C1 is check_permission — '))
       expect(deferrals).toHaveLength(latched ? 0 : 1)
       expect(h.findMissingCalls).toHaveLength(1)
@@ -3983,7 +3983,7 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(latch.asked).toEqual(Array(queries).fill('C1'))
       expect(h.readPaneCalls).toEqual(fullPaneReads(paneReads))
       expect(h.sendKeysCalls).toEqual([])
-      expect(latchedLines(errArgs)).toEqual(latched ? [latchedLine('')] : [])
+      expect(latchedLines(errArgs)).toEqual(latched ? [latchedLine()] : [])
     })
 
     // b.jg5 SRJ-805: the store is asked again right before typing, after the
@@ -4023,7 +4023,7 @@ describe('_buildReconnectSessionAdapter', () => {
         expect(h.findMissingCalls).toHaveLength(0)
         expect(starts).toEqual([expect.objectContaining({ key: 'C1', lastReadState: state, retiredKey: true, keepsConversation: false, launches: true })])
         expect(stringLines(errArgs).filter((line) => line.includes(' and its key is retired with no new life begun'))).toEqual([
-          `[slack] reconnectSession: persona=C1 is ${state} and its key is retired with no new life begun — not typing /mcp reconnect into its old life; the live-row sequence replaces it (start answered ${LIVE_ROW_START_STARTED}); deferring (b.jg5 SRJ-805)`,
+          reconnectRetiredOldLifeLine('C1', state, LIVE_ROW_START_STARTED),
         ])
       } finally {
         _resetLiveRowSequenceRegistry()
@@ -4092,7 +4092,7 @@ describe('b.jg5 SRJ-115, SRJ-512, SRJ-513: a latching own-row status at the live
     record: row.record,
     notice: row.notice,
     stepLine: (site, err, outcome) =>
-      `[slack] ${site} for persona=C1: ${describeAgentDirectorFailure(err)} — UNUSABLE NAME: ${outcome}; nothing more is called for it (b.jg5 SRJ-105, SRJ-512)`,
+      `[slack] ${site} for persona=C1: ${describeAdFailureForLog(err)} — UNUSABLE NAME: ${outcome}; nothing more is called for it (b.jg5 SRJ-105, SRJ-512)`,
   }))
 
   /** C1's own row `pending` with no launch start: one per form (b.jg5 SRJ-408). */
@@ -4928,8 +4928,7 @@ describe('b.jg5 SRJ-805: the reconnect adapter starts the live-row sequence for 
     h.errors.filter((line) => line.startsWith('[slack] reconnectSession: ') && line.includes(' and its key is retired with no new life begun'))
 
   /** The adapter's one line for persona `key`'s old life read `state`, the start entry answering `startAnswer`. */
-  const oldLifeLine = (key: string, state: string, startAnswer: string): string =>
-    `[slack] reconnectSession: persona=${key} is ${state} and its key is retired with no new life begun — not typing /mcp reconnect into its old life; the live-row sequence replaces it (start answered ${startAnswer}); deferring (b.jg5 SRJ-805)`
+  const oldLifeLine = reconnectRetiredOldLifeLine
 
   /** P's sequence driven to its end: its final launch the reuse the retired-key flag decides, answering fresh-retired. */
   async function expectRetiredSequenceEnds(h: RecoveryHarness, p: string): Promise<void> {
@@ -5239,20 +5238,21 @@ describe('b.jg5 SRJ-409, SRJ-411: the reconnect adapter\'s pending branch and de
   })
 
   // A `get` that finds no `pending` row decides nothing in this run: one line, nothing armed or started.
-  test.each<[string, (h: RecoveryHarness, key: string) => RecoveryStubScript, string]>([
-    ['reads the row waiting', (h, key) => ({ getResult: personaRow(h, key) }), 'its row now reads waiting — '],
-    ['answers ErrSpawnNotFound', () => ({ getError: errSpawnNotFound() }), 'its row is gone (ErrSpawnNotFound) — '],
-    ['is refused (UNAVAILABLE)', () => ({ getError: unavailableAt('get') }), 'its row could not be read again ('],
+  test.each<[string, (h: RecoveryHarness, key: string) => RecoveryStubScript, (key: string, scripted: RecoveryStubScript) => string]>([
+    ['reads the row waiting', (h, key) => ({ getResult: personaRow(h, key) }), (key, scripted) => deferralNotPendingLine(key, scripted.getResult!.state)],
+    ['answers ErrSpawnNotFound', () => ({ getError: errSpawnNotFound() }), (key) => deferralNoRowLine(key)],
+    ['is refused (UNAVAILABLE)', () => ({ getError: unavailableAt('get') }), (key, scripted) => deferralRefusedLine(key, describeThrownValue(scripted.getError))],
   ])('deferPendingRow, P\'s get %s: pending; one line saying so after the deferral line; nothing armed, started or typed', async (_label, script, said) => {
     const { h, p } = pendingP(SAMPLE_LAUNCH_START_WHOLE)
-    h.script({ getResult: undefined, ...script(h, p) })
+    const scripted = script(h, p)
+    h.script({ getResult: undefined, ...scripted })
     const starts = recordSequenceStarts()
 
     expect(await deferPendingRow(p, SAMPLE_LAUNCH_START_WHOLE, appliedLookupOf(h))).toBe('pending')
 
     const lines = deferralLinesOf(h, p)
     expect(lines).toHaveLength(2)
-    expect(lines[1]).toStartWith(`[slack] Deferring persona=${p}: ${said}`)
+    expect(lines[1]).toBe(said(p, scripted))
     expect([starts, h.triggers, h.controller.isArmed(p)]).toEqual([[], [], false])
     expectNothingLaunchedOrTyped(h, p)
   })
@@ -5388,7 +5388,7 @@ describe('b.jg5 SRJ-410: deferPendingRow runs the pending-row rule only at a ret
     expect(await defer(h, p, true, { mayRunRule: false })).toBe('pending')
 
     expect(goneLinesOf(h, p)).toEqual([])
-    expect(h.errors.filter((line) => line.startsWith(`[slack] Deferring persona=${p}: its row now reads ended — `))).toHaveLength(1)
+    expect(h.errors.filter((line) => line === deferralNotPendingLine(p, LIVENESS_DEAD_ROW_ENDED))).toHaveLength(1)
   })
 
   // E28's answers kept: none of these rows is handed to the rule.

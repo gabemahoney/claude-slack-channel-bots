@@ -65,8 +65,10 @@ import {
   adLaunchBoundMsInEffect,
   adSettingsInEffect,
   adVerbCeilingsMs,
+  adTmuxKeyUnit,
   armNeverEarlyWait,
   buildAdSettingsRefusedReadLine,
+  buildAdSettingsValuesLine,
   checkAdCallTimeoutAtStartup,
   createAdSettingsReader,
   DEFAULT_AD_SETTINGS as SRC_DEFAULT_AD_SETTINGS,
@@ -238,6 +240,11 @@ function changedWithout(key: AdTmuxKey): { file: Partial<Record<AdTmuxKey, bigin
   return { file, expected: { ...DEFAULT_TMUX, ...file } }
 }
 
+/** The values line the reader under `rig`'s HOME writes for `tmux` (b.jg5 SRJ-1014). */
+function valuesLine(rig: Pick<ReaderRig, 'path'>, tmux: AdTmuxValues): string {
+  return buildAdSettingsValuesLine(rig.path, tmux)
+}
+
 /** Assert a read was refused and answer its reason. */
 function refusedReason(outcome: AdSettingsReadOutcome): string {
   expect(outcome.kind).toBe('refused')
@@ -249,12 +256,12 @@ function refusedReason(outcome: AdSettingsReadOutcome): string {
 // ---------------------------------------------------------------------------
 
 describe('ad settings: accepted reads', () => {
-  test('with no file the values are the defaults, [pause] timeout_seconds included, and no line is written', () => {
+  test('with no file the values are the defaults, [pause] timeout_seconds included, and the one line written is the values line of the defaults', () => {
     const rig = makeReaderRig()
     const outcome = rig.read()
     expect(outcome).toEqual({ kind: 'accepted', values: DEFAULT_AD_SETTINGS_IN_EFFECT })
     expect(rig.reader.valuesInEffect()).toEqual(inEffect(DEFAULT_TMUX))
-    expect(rig.lines).toEqual([])
+    expect(rig.lines).toEqual([valuesLine(rig, DEFAULT_TMUX)])
   })
 
   test.each<[string, AdConfigInput]>([
@@ -265,14 +272,14 @@ describe('ad settings: accepted reads', () => {
     const rig = makeReaderRig()
     rig.write(input)
     expect(rig.read()).toEqual({ kind: 'accepted', values: inEffect(DEFAULT_TMUX) })
-    expect(rig.lines).toEqual([])
+    expect(rig.lines).toEqual([valuesLine(rig, DEFAULT_TMUX)])
   })
 
   test('nine changed values at or above their minimums are used as given', () => {
     const rig = makeReaderRig()
     rig.write({ tmux: CHANGED_TMUX })
     expect(rig.read()).toEqual({ kind: 'accepted', values: inEffect(CHANGED_TMUX) })
-    expect(rig.lines).toEqual([])
+    expect(rig.lines).toEqual([valuesLine(rig, CHANGED_TMUX)])
   })
 
   test.each(AD_TMUX_KEYS.map((key) => [key]))('%s missing gives its default; the other keys are used as given', (key) => {
@@ -320,7 +327,7 @@ describe('ad settings: accepted reads', () => {
     const rig = makeReaderRig()
     rig.write(input)
     expect(rig.read()).toEqual({ kind: 'accepted', values: inEffect(CHANGED_TMUX) })
-    expect(rig.lines).toEqual([])
+    expect(rig.lines).toEqual([valuesLine(rig, CHANGED_TMUX)])
   })
 
   test('a misspelt key is ignored and leaves its default in force', () => {
@@ -344,13 +351,14 @@ describe('ad settings: refused reads', () => {
     rig.write(form.input)
     const reason = refusedReason(rig.read())
     expect(rig.reader.valuesInEffect()).toEqual(CHANGED_IN_EFFECT)
-    expect(rig.lines).toEqual([buildAdSettingsRefusedReadLine(rig.path, reason, true)])
-    expect(rig.lines[0]!.startsWith(AD_SETTINGS_LOG_PREFIX)).toBe(true)
-    expect(rig.lines[0]).toContain(`"${rig.path}"`)
-    expect(rig.lines[0]).toContain(reason)
+    expect(rig.lines).toEqual([valuesLine(rig, CHANGED_TMUX), buildAdSettingsRefusedReadLine(rig.path, reason, true)])
+    const refusedLine = rig.lines[1]!
+    expect(refusedLine.startsWith(AD_SETTINGS_LOG_PREFIX)).toBe(true)
+    expect(refusedLine).toContain(`"${rig.path}"`)
+    expect(refusedLine).toContain(reason)
     if (form.key !== undefined) {
       expect(reason).toContain(form.key)
-      expect(rig.lines[0]).toContain(form.key)
+      expect(refusedLine).toContain(form.key)
     } else {
       expect(reason).toContain('TOML')
       for (const key of AD_TMUX_KEYS) expect(reason).not.toContain(key)
@@ -424,10 +432,10 @@ function stubFs(overrides: Partial<PersonaConfigFs>): Partial<PersonaConfigFs> {
 const NOT_UTF8_COMMENT_BYTES = Buffer.concat([Buffer.from('# '), Buffer.from([0xc3, 0x28]), Buffer.from('\n')])
 
 describe('ad settings: read failures', () => {
-  test('not found through the seam gives the defaults and no line', () => {
+  test('not found through the seam gives the defaults and only the values line of the defaults', () => {
     const rig = makeReaderRig(stubFs({ openFile: () => { throw errnoError('ENOENT') } }))
     expect(rig.read()).toEqual({ kind: 'accepted', values: DEFAULT_AD_SETTINGS_IN_EFFECT })
-    expect(rig.lines).toEqual([])
+    expect(rig.lines).toEqual([valuesLine(rig, DEFAULT_TMUX)])
   })
 
   test.each<[string, Partial<PersonaConfigFs>, string]>([
@@ -467,8 +475,11 @@ describe('ad settings: read failures', () => {
     const outcome = reader.read()
     expect(outcome).toEqual({ kind: 'refused', reason: 'the home directory cannot be found' })
     expect(reader.valuesInEffect()).toEqual(CHANGED_IN_EFFECT)
-    expect(lines).toEqual([buildAdSettingsRefusedReadLine(join('~', AD_SETTINGS_RELATIVE_PATH), refusedReason(outcome), true)])
-    expect(lines[0]).not.toContain('stub home failure')
+    expect(lines).toEqual([
+      valuesLine({ path: join(home, AD_SETTINGS_RELATIVE_PATH) }, CHANGED_TMUX),
+      buildAdSettingsRefusedReadLine(join('~', AD_SETTINGS_RELATIVE_PATH), refusedReason(outcome), true),
+    ])
+    expect(lines[1]).not.toContain('stub home failure')
     assertNoLeak({ lines, outcome })
   })
 
@@ -480,7 +491,7 @@ describe('ad settings: read failures', () => {
     mkdirSync(rig.path)
     const reason = refusedReason(rig.read())
     expect(rig.reader.valuesInEffect()).toEqual(CHANGED_IN_EFFECT)
-    expect(rig.lines).toEqual([buildAdSettingsRefusedReadLine(rig.path, reason, true)])
+    expect(rig.lines).toEqual([valuesLine(rig, CHANGED_TMUX), buildAdSettingsRefusedReadLine(rig.path, reason, true)])
   })
 })
 
@@ -513,6 +524,7 @@ describe('ad settings: runs of refused reads', () => {
     expect(rig.reader.valuesInEffect()).toEqual(CHANGED_IN_EFFECT)
     expect(rig.lines).toEqual([
       buildAdSettingsRefusedReadLine(rig.path, reason, false),
+      valuesLine(rig, CHANGED_TMUX),
       buildAdSettingsRefusedReadLine(rig.path, reason, true),
     ])
   })
@@ -527,14 +539,121 @@ describe('ad settings: runs of refused reads', () => {
     expect(rig.reader.valuesInEffect()).toEqual(inEffect(CHANGED_AGAIN_TMUX))
   })
 
-  test('a file removed after an accepted read gives the defaults at the next read, with no line', () => {
+  test('a file removed after an accepted read gives the defaults at the next read, with the values line of the defaults and no refused-read line', () => {
     const rig = makeReaderRig()
     rig.write(CHANGED_FILE)
     rig.read()
     rmSync(rig.path)
     expect(rig.read()).toEqual({ kind: 'accepted', values: DEFAULT_AD_SETTINGS_IN_EFFECT })
     expect(rig.reader.valuesInEffect()).toEqual(DEFAULT_AD_SETTINGS_IN_EFFECT)
-    expect(rig.lines).toEqual([])
+    expect(rig.lines).toEqual([valuesLine(rig, CHANGED_TMUX), valuesLine(rig, DEFAULT_TMUX)])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The values line (SRJ-1014: each read that changes the values in effect, with the nine values)
+// ---------------------------------------------------------------------------
+
+const TMUX_KEY_ROWS = AD_TMUX_KEYS.map((key) => [key])
+
+describe('ad settings: the values line (b.jg5 SRJ-1014, SRJ-209)', () => {
+  test('the line names the path and each of the nine keys with its value and unit, and nothing of [pause]', () => {
+    const rig = makeReaderRig()
+    rig.write(CHANGED_FILE)
+    rig.read()
+    expect(rig.lines).toEqual([valuesLine(rig, CHANGED_TMUX)])
+    const line = rig.lines[0]!
+    expect(line.startsWith(AD_SETTINGS_LOG_PREFIX)).toBe(true)
+    expect(line).toContain(`"${rig.path}"`)
+    for (const key of AD_TMUX_KEYS) expect(line).toContain(`${key} ${CHANGED_TMUX[key]} ${adTmuxKeyUnit(key)}`)
+    expect(line).not.toContain(AD_PAUSE_TIMEOUT_KEY)
+    expect(line).not.toContain(String(CHANGED_PAUSE_SECONDS))
+  })
+
+  test('a second read with the same values logs nothing more', () => {
+    const rig = makeReaderRig()
+    rig.write(CHANGED_FILE)
+    rig.read()
+    rig.read()
+    expect(rig.lines).toEqual([valuesLine(rig, CHANGED_TMUX)])
+  })
+
+  test.each(TMUX_KEY_ROWS)('a read changing %s alone logs one line with the new values', (key) => {
+    const rig = makeReaderRig()
+    rig.write(CHANGED_FILE)
+    rig.read()
+    const changed = { ...CHANGED_TMUX, [key]: CHANGED_AGAIN_TMUX[key] }
+    rig.write({ tmux: changed, pauseTimeout: CHANGED_PAUSE_SECONDS })
+    expect(rig.read().kind).toBe('accepted')
+    expect(rig.lines).toEqual([valuesLine(rig, CHANGED_TMUX), valuesLine(rig, changed)])
+  })
+
+  test('a read changing [pause] timeout_seconds alone logs nothing, though the new pause value is in effect', () => {
+    const rig = makeReaderRig()
+    rig.write(CHANGED_FILE)
+    rig.read()
+    rig.write({ tmux: CHANGED_TMUX, pauseTimeout: DEFAULT_PAUSE_SECONDS })
+    rig.read()
+    expect(rig.reader.valuesInEffect()).toEqual(inEffect(CHANGED_TMUX, DEFAULT_PAUSE_SECONDS))
+    expect(rig.lines).toEqual([valuesLine(rig, CHANGED_TMUX)])
+  })
+
+  test('a refused read logs no values line; an accepted read after the refused run, values unchanged, logs none either', () => {
+    const rig = makeReaderRig()
+    rig.write(CHANGED_FILE)
+    rig.read()
+    rig.write(REFUSED_AD_CONFIG_FORMS[0]!.input)
+    const reason = refusedReason(rig.read())
+    rig.read()
+    rig.write(CHANGED_FILE)
+    expect(rig.read().kind).toBe('accepted')
+    expect(rig.lines).toEqual([valuesLine(rig, CHANGED_TMUX), buildAdSettingsRefusedReadLine(rig.path, reason, true)])
+  })
+
+  test('an accepted read after a refused run that changes the values logs one values line', () => {
+    const rig = makeReaderRig()
+    rig.write(CHANGED_FILE)
+    rig.read()
+    rig.write(REFUSED_AD_CONFIG_FORMS[0]!.input)
+    const reason = refusedReason(rig.read())
+    rig.write({ tmux: CHANGED_AGAIN_TMUX })
+    rig.read()
+    expect(rig.lines).toEqual([
+      valuesLine(rig, CHANGED_TMUX),
+      buildAdSettingsRefusedReadLine(rig.path, reason, true),
+      valuesLine(rig, CHANGED_AGAIN_TMUX),
+    ])
+  })
+
+  test('the first accepted read after a run refused from start logs the values line even when they are the defaults', () => {
+    const rig = makeReaderRig()
+    rig.write(REFUSED_AD_CONFIG_FORMS[0]!.input)
+    const reason = refusedReason(rig.read())
+    rmSync(rig.path)
+    rig.read()
+    rig.read()
+    expect(rig.lines).toEqual([buildAdSettingsRefusedReadLine(rig.path, reason, false), valuesLine(rig, DEFAULT_TMUX)])
+  })
+
+  test('a log sink that throws changes nothing: the read is accepted and the values take effect', () => {
+    const home = makeHome()
+    writeAgentDirectorConfig(home, CHANGED_FILE)
+    const reader = createAdSettingsReader({ home: () => home, log: () => { throw new Error('stub log sink failure') } })
+    expect(reader.read()).toEqual({ kind: 'accepted', values: CHANGED_IN_EFFECT })
+    expect(reader.valuesInEffect()).toEqual(CHANGED_IN_EFFECT)
+  })
+
+  test('a file holding fake tokens in another table, an unknown [tmux] key and [pause]: the values line holds none of them', () => {
+    const rig = makeReaderRig()
+    rig.write({
+      tmux: CHANGED_TMUX,
+      pauseTimeout: fakeToken(BOT_TOKEN_PREFIX, 'values-pause'),
+      extraTmuxKeys: { unknown_key: fakeToken(BOT_TOKEN_PREFIX, 'values-tmux') },
+      extra: { other: { text: fakeToken(BOT_TOKEN_PREFIX, 'values-other') } },
+    })
+    rig.read()
+    expect(rig.lines).toEqual([valuesLine(rig, CHANGED_TMUX)])
+    assertNoLeak({ lines: rig.lines })
   })
 })
 
@@ -550,15 +669,13 @@ function tmuxWithKeyAt(key: AdTmuxKey, value: bigint): AdTmuxValues {
   return tmux
 }
 
-const TMUX_KEY_ROWS = AD_TMUX_KEYS.map((key) => [key])
-
 describe('ad settings: the 64-bit bound', () => {
   test.each(TMUX_KEY_ROWS)('%s at AD_SETTING_INTEGER_MAX is accepted and used as given', (key) => {
     const rig = makeReaderRig()
     const tmux = tmuxWithKeyAt(key, AD_SETTING_INTEGER_MAX)
     rig.write({ tmux })
     expect(rig.read()).toEqual({ kind: 'accepted', values: inEffect(tmux) })
-    expect(rig.lines).toEqual([])
+    expect(rig.lines).toEqual([valuesLine(rig, tmux)])
   })
 
   test('all nine keys and [pause] timeout_seconds at AD_SETTING_INTEGER_MAX are accepted: the grace minimum stays exact at the bound', () => {
@@ -566,7 +683,7 @@ describe('ad settings: the 64-bit bound', () => {
     const tmux = Object.fromEntries(AD_TMUX_KEYS.map((key) => [key, AD_SETTING_INTEGER_MAX])) as AdTmuxValues
     rig.write({ tmux, pauseTimeout: AD_SETTING_INTEGER_MAX })
     expect(rig.read()).toEqual({ kind: 'accepted', values: inEffect(tmux, AD_SETTING_INTEGER_MAX) })
-    expect(rig.lines).toEqual([])
+    expect(rig.lines).toEqual([valuesLine(rig, tmux)])
   })
 
   test.each(TMUX_KEY_ROWS)('%s at AD_SETTING_INTEGER_MAX + 1 is refused as too large: the last values stay, one line', (key) => {
@@ -577,7 +694,7 @@ describe('ad settings: the 64-bit bound', () => {
     const reason = refusedReason(rig.read())
     expect(reason).toBe(`[${AD_TMUX_TABLE}] ${key} is too large for agent-director`)
     expect(rig.reader.valuesInEffect()).toEqual(CHANGED_IN_EFFECT)
-    expect(rig.lines).toEqual([buildAdSettingsRefusedReadLine(rig.path, reason, true)])
+    expect(rig.lines).toEqual([valuesLine(rig, CHANGED_TMUX), buildAdSettingsRefusedReadLine(rig.path, reason, true)])
   })
 })
 
@@ -614,7 +731,7 @@ describe('ad settings: [pause] timeout_seconds', () => {
     ['a float', { tmux: CHANGED_TMUX, pauseTimeout: Number(CHANGED_PAUSE_SECONDS) }, undefined],
     ['[pause] given as a value instead of a table', { tmux: CHANGED_TMUX, extra: { pause: CHANGED_PAUSE_SECONDS } }, undefined],
     ['an integer above AD_SETTING_INTEGER_MAX', { tmux: CHANGED_TMUX, pauseTimeout: AD_SETTING_INTEGER_MAX + 1n }, 'an integer too large for agent-director'],
-  ])('%s is not used; the nine [tmux] values are accepted and no line is written', (_label, input, found) => {
+  ])('%s is not used; the nine [tmux] values are accepted and the only line is their values line', (_label, input, found) => {
     const rig = makeReaderRig()
     rig.write(input)
     const outcome = rig.read()
@@ -623,7 +740,7 @@ describe('ad settings: [pause] timeout_seconds', () => {
     expect(values.tmux).toEqual(CHANGED_TMUX)
     expect(values.pauseTimeout.kind).toBe('not-used')
     if (found !== undefined) expect(values.pauseTimeout).toEqual({ kind: 'not-used', found })
-    expect(rig.lines).toEqual([])
+    expect(rig.lines).toEqual([valuesLine(rig, CHANGED_TMUX)])
   })
 
   test('a refused read keeps the last accepted [pause] timeout_seconds', () => {
@@ -686,6 +803,11 @@ function makeTickRig(opts: { initial?: AdConfigInput; outcomes?: readonly StubRe
   }
 }
 
+/** The values line the installed reader under `rig`'s HOME writes for `tmux`. */
+function tickValuesLine(rig: Pick<TickRig, 'home'>, tmux: AdTmuxValues): string {
+  return buildAdSettingsValuesLine(join(rig.home, AD_SETTINGS_RELATIVE_PATH), tmux)
+}
+
 describe('ad settings: install and the re-read at each 120 s re-check tick', () => {
   test('with nothing installed the accessor answers the defaults', () => {
     expect(adSettingsInEffect()).toEqual(DEFAULT_AD_SETTINGS_IN_EFFECT)
@@ -713,6 +835,7 @@ describe('ad settings: install and the re-read at each 120 s re-check tick', () 
     await rig.clock.advance(1)
     expect(rig.readCount()).toBe(2)
     expect(adSettingsInEffect()).toEqual(inEffect(CHANGED_AGAIN_TMUX))
+    expect(rig.lines).toEqual([tickValuesLine(rig, CHANGED_TMUX), tickValuesLine(rig, CHANGED_AGAIN_TMUX)])
     disposeAdVersionRecheck()
   })
 
@@ -722,7 +845,8 @@ describe('ad settings: install and the re-read at each 120 s re-check tick', () 
     await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS * 3)
     expect(rig.readCount()).toBe(4)
     expect(adSettingsInEffect()).toEqual(CHANGED_IN_EFFECT)
-    expect(rig.lines).toHaveLength(1)
+    expect(rig.lines).toHaveLength(2)
+    expect(rig.lines[0]).toBe(tickValuesLine(rig, CHANGED_TMUX))
     disposeAdVersionRecheck()
   })
 
@@ -1060,7 +1184,8 @@ describe('ad settings: the derived waits at check time', () => {
     rig.write(REFUSED_AD_CONFIG_FORMS[0]!.input)
     await rig.clock.advance(AD_VERSION_RECHECK_INTERVAL_MS)
     expect(rig.readCount()).toBe(2)
-    expect(rig.lines).toHaveLength(1)
+    expect(rig.lines).toHaveLength(2)
+    expect(rig.lines[0]).toBe(tickValuesLine(rig, WAITS_CHANGED_TMUX))
     expect(derivedWaitsInEffect()).toEqual(expectedWaits(WAITS_CHANGED_TMUX))
     disposeAdVersionRecheck()
   })
@@ -1843,6 +1968,7 @@ describe('ad settings: SRD pins (b.jg5 SRJ-209, SRJ-210, SRJ-213)', () => {
       },
     ],
     ['[pause] timeout_seconds default', () => DEFAULT_AD_SETTINGS.pause.timeout_seconds, 30n],
+    ["each [tmux] key's unit on the values line, in the keys' order", () => AD_TMUX_KEYS.map(adTmuxKeyUnit), ['s', 's', 's', 's', 'ms', 'ms', 'ms', 'ms', 'ms']],
     ['starting_session_seconds minimum', () => AD_SETTING_MINIMUMS.starting_session_seconds, 60n],
     ['stopping_window_seconds minimum', () => AD_SETTING_MINIMUMS.stopping_window_seconds, 30n],
     ['pending_grace_seconds minimum: floor and addend', () => AD_SETTING_MINIMUMS.pending_grace_seconds, { floor: 30n, addend: 20n }],

@@ -13,7 +13,9 @@
  *   itself, in P's serializer turn with its recovery post, `find-missing` and
  *   retry, is tests/conflict-latch.test.ts's.
  * - The record: write, read and removal in the test's own `mkdtempSync`
- *   directory standing in for the state directory.
+ *   directory standing in for the state directory, and the write-failure
+ *   line (b.jg5 SRJ-1014) for a failed write whose error carries a fake
+ *   token and URL: the path, the safe code and the redacted message.
  * - The wiring: `main()` cannot run in a test, so "the record holds the
  *   server's PID and bound port while it runs and is gone after shutdown" and
  *   the route's delegation are proven by a comment-stripped source audit of
@@ -106,6 +108,7 @@ import { isProcessRunning } from '../src/pid.ts'
 import { reloadFilePaths } from '../src/reload.ts'
 import {
   BOT_TOKEN_PREFIX,
+  LEAK_SENTINEL,
   REDACTED_SENTINEL_TAIL,
   assertNoLeak,
   fakeToken,
@@ -543,6 +546,24 @@ describe('the server.port record', () => {
     expect(serverPortWriteFailedLine('/state/server.port', 'Error code=EACCES denied')).toBe(
       '[slack] server.port: could not write /state/server.port; clear-latch cannot reach this server until it restarts: Error code=EACCES denied',
     )
+  })
+
+  test('a write that fails is rethrown, and the line server.ts logs for it (the record\'s path and the error through describeThrownValue) holds the safe code and the redacted message; nothing leaks (SRJ-1014)', () => {
+    // No stack frame, so the described error is known in full.
+    const err = Object.assign(new Error(`write refused (${sentinelInMessage('port')})`), { code: 'EACCES', detail: LEAK_SENTINEL, stack: undefined })
+    let thrown: unknown
+    try {
+      writeServerPortRecord(recordPath(), { pid: process.pid, port: 3101 }, () => {
+        throw err
+      })
+    } catch (caught) {
+      thrown = caught
+    }
+    expect(thrown).toBe(err)
+    const line = serverPortWriteFailedLine(recordPath(), describeThrownValue(thrown))
+    expect(line).toBe(serverPortWriteFailedLine(recordPath(), `Error code=EACCES message="write refused (${REDACTED_SENTINEL_TAIL})"`))
+    expect(existsSync(recordPath())).toBe(false)
+    logs.push(line)
   })
 
   describe('a record that cannot be used reads as its cause and never throws', () => {

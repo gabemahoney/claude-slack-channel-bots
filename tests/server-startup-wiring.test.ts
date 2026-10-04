@@ -3444,16 +3444,18 @@ describe('main() builds the one unclassified-error episodes instance over the no
     expect(importSource(SERVER_CODE, 'getAppliedPersona')).toBeUndefined()
   })
 
-  test('its log-only route is one recordStartupError call with the exported persona-unclassified-error label and a text naming the persona\'s key and the alert\'s text', () => {
+  test('its log-only route is one recordStartupError call with the exported persona-unclassified-error label and the exported entry text of the persona\'s key and the alert\'s text', () => {
+    const ENTRY_TEXT = 'personaUnclassifiedErrorEntryText'
     const route = onlyCallProps(FACTORY).get(LOG_ONLY)
     expect(route).toBeDefined()
-    // `(key, text) => recordStartupError(PERSONA_UNCLASSIFIED_ERROR_LABEL, `…${key}…${text}…`)`
+    // `(key, text) => recordStartupError(PERSONA_UNCLASSIFIED_ERROR_LABEL, personaUnclassifiedErrorEntryText(key, text))`
     // (block or expression body); the parameters' names are free.
-    const call = `recordStartupError\\(${LABEL}, \`[^\`]*\\$\\{\\1\\}[^\`]*\\$\\{\\2\\}[^\`]*\`\\)`
+    const call = `recordStartupError\\(${LABEL}, ${ENTRY_TEXT}\\(\\1, \\2\\)\\)`
     expect(route).toMatch(new RegExp(`^\\((\\w+), (\\w+)\\) => (?:\\{ ${call};? \\}|${call})$`))
     expect(importSource(SERVER_CODE, 'recordStartupError')).toBe('./startup-errors.ts')
     expect(importSource(SERVER_CODE, LABEL)).toBe('./persona-episodes.ts')
-    for (const name of ['recordStartupError', LABEL]) {
+    expect(importSource(SERVER_CODE, ENTRY_TEXT)).toBe('./persona-episodes.ts')
+    for (const name of ['recordStartupError', LABEL, ENTRY_TEXT]) {
       expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${name}\\b`, 'g'), SERVER_CODE)).toEqual([])
     }
   })

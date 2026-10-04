@@ -1236,7 +1236,7 @@ async function restartRetryWork(
     return RESTART_OUTCOME_IN_FLIGHT
   }
   if (isAtCap(key, RESTART_FAILURE_CAP)) {
-    console.error(`[slack] Restart retry skipped for persona=${key} — the persona is at the restart cap; nothing killed or launched`)
+    console.error(restartRetryCapSkippedLine(key))
     return RESTART_OUTCOME_CAPPED
   }
   return runRestartWork(d, key, cwd, undefined)
@@ -1296,6 +1296,27 @@ export async function runRestartWorkInTurn(key: string, cwd: string, permit: Lat
  */
 export function restartRetrySkippedLine(key: string, cause: RetryBlockCause | undefined): string {
   return `[slack] Restart retry skipped for persona=${key} — ${retryBlockSkipText(cause)}; no agent-director call`
+}
+
+/**
+ * The retry entry's skip line for persona `key` at the restart cap
+ * (`RESTART_FAILURE_CAP`): nothing is killed or launched. Pure.
+ *
+ *   [slack] Restart retry skipped for persona=<key> — the persona is at the restart cap; nothing killed or launched
+ */
+export function restartRetryCapSkippedLine(key: string): string {
+  return `[slack] Restart retry skipped for persona=${key} — the persona is at the restart cap; nothing killed or launched`
+}
+
+/**
+ * The line for a `pending` deferral (`RestartDeps.deferPendingRow`) that
+ * threw or rejected for persona `key`; `failure` is the thrown value as
+ * `describeThrownValue` renders it (redacted). Pure.
+ *
+ *   [slack] restart: the pending deferral failed for persona=<key>: <failure>
+ */
+export function pendingDeferralFailedLine(key: string, failure: string): string {
+  return `[slack] restart: the pending deferral failed for persona=${key}: ${failure}`
 }
 
 /** The retry entry's in-flight check: `isInFlight(key)`, with a throw counted as in flight (logged). */
@@ -1503,7 +1524,7 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     //
     // For the escalate-dead verdicts (a `dead-session` reconnect, whatever its
     // cause, and a row whose read-pane answered GONE or found the row absent)
-    // CSCB recovers itself (b.sv7 / Epic t1.tkk.e4): the reconnectSession
+    // CSCB recovers itself (b.sv7): the reconnectSession
     // adapter fires the internal memoized findMissing sweep before returning,
     // which may reconcile the frozen `working` row to `missing`. It may also
     // leave the row live (in `unverified_ids`, or, when `pending`, not judged
@@ -2041,7 +2062,7 @@ async function deferPending(d: RestartDeps, key: string, probe: LivenessProbe): 
     const answer = await d.deferPendingRow(key, pendingLivenessReading(probe.launchStartedAt))
     return isDeadRowRead(answer) ? answer : undefined
   } catch (err) {
-    console.error(`[slack] restart: the pending deferral failed for persona=${key}: ${describeThrownValue(err)}`)
+    console.error(pendingDeferralFailedLine(key, describeThrownValue(err)))
     return undefined
   }
 }

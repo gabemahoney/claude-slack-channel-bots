@@ -31,7 +31,7 @@ import {
   AD_ERROR_CLASS_UNAVAILABLE,
   AD_ERROR_CLASS_UNCLASSIFIED,
   AD_ERROR_CLASS_UNUSABLE_NAME,
-  describeAgentDirectorFailure,
+  describeAdFailureForLog,
   type AdErrorClass,
 } from '../src/ad-error-class.ts'
 import { UNUSABLE_RECORDED_NAME_PHRASE } from '../src/ad-description-phrases.ts'
@@ -122,7 +122,7 @@ describe('paneReadFailureOf: each value a read-pane throws maps to exactly one o
     const value = make()
     const outcome = paneReadFailureOf(value)
     expect([outcome.kind, outcome.errorClass]).toEqual([kind, errorClass])
-    expect(outcome.description).toBe(describeAgentDirectorFailure(value))
+    expect(outcome.description).toBe(describeAdFailureForLog(value))
     expect(outcome.description.includes('\n')).toBe(false)
     if (KEEPS_ERROR.has(kind)) expect('error' in outcome && outcome.error).toBe(value)
     else expect('error' in outcome).toBe(false)
@@ -133,6 +133,13 @@ describe('paneReadFailureOf: each value a read-pane throws maps to exactly one o
     expect(new Set(ROWS.map(([, , kind]) => kind))).toEqual(new Set(PANE_READ_FAILURE_KINDS))
     const kinds = new Set<string>([...PANE_READ_FAILURE_KINDS, PANE_READ_PANE, PANE_READ_LATCHED])
     expect(kinds.size).toBe(PANE_READ_FAILURE_KINDS.length + 2)
+  })
+
+  test.each([ERR_SCHEMA_MIGRATION_REQUIRED_NAME, ERR_STORE_OPEN_NAME])('ErrUnknownErrorName carrying %s: the description names the reported name, never the client\'s placeholder (b.jg5 SRJ-104)', (name) => {
+    const value = errUnknownErrorName(name)
+    const outcome = paneReadFailureOf(value)
+    expect(outcome.description.startsWith(`${name} `)).toBe(true)
+    expect(outcome.description).not.toContain(value.errName)
   })
 
   test('an agent-director error whose every property read throws maps as one with no name (UNCLASSIFIED) without throwing', () => {

@@ -297,9 +297,10 @@
  * (`createFullModeRetryAction`) logs one line of its own, to the server log
  * (`latched query failed: <thrown> — taken as latched`, or `held query
  * failed: <thrown> — taken as held`), when its latched or held query throws.
- * A cause's thrown value and a failed
- * action reach a line only through `describeThrownValue` (its message
- * redacted by `redactSlackLogText`). A cause kind, an again-reason and a row
+ * A cause's thrown value reaches a line only through
+ * `describeThrownValueWithoutStack` (one line, no stack frames), and a failed
+ * action only through `describeThrownValue` (each with its message redacted
+ * by `redactSlackLogText`). A cause kind, an again-reason and a row
  * state are labels (anything else is logged as `unnamed`) and a stop reason
  * is CSCB-written text; none carries agent-director failure text.
  *
@@ -321,7 +322,7 @@ import {
 import { ERR_SPAWN_NOT_FOUND_NAME, ERR_TMUX_KILL_FAILED_NAME } from './agent-director-errors.ts'
 import { doublingBackoffDelay } from './backoff.ts'
 import { AGENT_DIRECTOR_LIVE_STATES, LIVENESS_LIVE } from './liveness-reading.ts'
-import { describeThrownValue } from './persona-connection-errors.ts'
+import { describeThrownValue, describeThrownValueWithoutStack } from './persona-connection-errors.ts'
 import { SYSTEM_PERSONA_CONNECTION_CLOCK, type PersonaConnectionClock } from './persona-connections.ts'
 import type { RestartRetryOutcome } from './restart.ts'
 
@@ -811,6 +812,114 @@ export type UnavailableRetryRunNowLineInput =
   | { readonly result: typeof UNAVAILABLE_RETRY_RUN_NOW_RAN; readonly pendingOnly: boolean }
   | { readonly result: typeof UNAVAILABLE_RETRY_RUN_NOW_ARMED; readonly description: string }
 
+/** The head of every line the retry controller logs for persona `key`. */
+function unavailableRetryLineHead(key: string): string {
+  return `[slack] unavailable-retry: persona=${key}`
+}
+
+/**
+ * The arm line (b.jg5 SRJ-302, SRJ-1014), `description` the cause's
+ * description (`<kind>`, or `<kind>: <one-line error>` with no stack frame):
+ *
+ *   [slack] unavailable-retry: persona=<key> armed[ in pending-only mode] (<description>) — first retry in <s> s
+ *
+ * Pure.
+ */
+export function unavailableRetryArmedLine(key: string, pendingOnly: boolean, description: string | undefined, waitMs: number): string {
+  const inMode = pendingOnly ? ` in ${UNAVAILABLE_RETRY_MODE_PENDING_ONLY} mode` : ''
+  return `${unavailableRetryLineHead(key)} armed${inMode} (${description}) — first retry in ${waitMs / 1000} s`
+}
+
+/**
+ * The retry line (b.jg5 SRJ-302, SRJ-1014), at the start of retry `retry`:
+ *
+ *   [slack] unavailable-retry: persona=<key> retry <n> — rerunning its recovery
+ *   [slack] unavailable-retry: persona=<key> retry <n> (pending-only) — reading its row
+ *
+ * Pure.
+ */
+export function unavailableRetryRetryLine(key: string, retry: number, pendingOnly: boolean): string {
+  return pendingOnly
+    ? `${unavailableRetryLineHead(key)} retry ${retry} (${UNAVAILABLE_RETRY_MODE_PENDING_ONLY}) — reading its row`
+    : `${unavailableRetryLineHead(key)} retry ${retry} — rerunning its recovery`
+}
+
+/**
+ * The re-armed line (b.jg5 SRJ-302, SRJ-1014): retry `retry`, run in
+ * pending-only mode when `ranPendingOnly`, answered `reason`; `newMode` names
+ * the mode when the retry changed it:
+ *
+ *   [slack] unavailable-retry: persona=<key> retry <n>[ (pending-only)]: <reason> — re-armed[ in <mode> mode], next retry in <s> s
+ *
+ * Pure.
+ */
+export function unavailableRetryReArmedLine(
+  key: string,
+  retry: number,
+  ranPendingOnly: boolean,
+  reason: string,
+  newMode: UnavailableRetryMode | undefined,
+  waitMs: number,
+): string {
+  const ran = ranPendingOnly ? ` (${UNAVAILABLE_RETRY_MODE_PENDING_ONLY})` : ''
+  const next = newMode === undefined ? '' : ` in ${newMode} mode`
+  return `${unavailableRetryLineHead(key)} retry ${retry}${ran}: ${reason} — re-armed${next}, next retry in ${waitMs / 1000} s`
+}
+
+/**
+ * The mode line (b.jg5 SRJ-301, SRJ-1014): a full-mode arm promoted a
+ * pending-only timer, `description` the cause's:
+ *
+ *   [slack] unavailable-retry: persona=<key> promoted to full mode (<description>) — its due time is kept
+ *
+ * Pure.
+ */
+export function unavailableRetryPromotedLine(key: string, description: string | undefined): string {
+  return `${unavailableRetryLineHead(key)} promoted to ${UNAVAILABLE_RETRY_MODE_FULL} mode (${description}) — its due time is kept`
+}
+
+/**
+ * The stop line (b.jg5 SRJ-305, SRJ-1014), naming a pending-only mode and the
+ * row read, when given:
+ *
+ *   [slack] unavailable-retry: persona=<key> stopped[ (pending-only[, row <state>])] — <reason>
+ *
+ * Pure.
+ */
+export function unavailableRetryStoppedLine(key: string, pendingOnly: boolean, row: string | undefined, reason: string): string {
+  const tags: string[] = []
+  if (pendingOnly) tags.push(UNAVAILABLE_RETRY_MODE_PENDING_ONLY)
+  if (row !== undefined) tags.push(`row ${row}`)
+  const tagged = tags.length > 0 ? ` (${tags.join(', ')})` : ''
+  return `${unavailableRetryLineHead(key)} stopped${tagged} — ${reason}`
+}
+
+/**
+ * The kept line (b.jg5 SRJ-306, SRJ-1014): a condition ended, but the timer
+ * is kept for `kept` (its last row read `pending`, a `kill-failed` cause):
+ *
+ *   [slack] unavailable-retry: persona=<key> kept — <condition ended>, but <why>[ and <why>]
+ *
+ * Pure.
+ */
+export function unavailableRetryKeptLine(key: string, ended: string, kept: readonly string[]): string {
+  return `${unavailableRetryLineHead(key)} kept — ${ended}, but ${kept.join(' and ')}`
+}
+
+/**
+ * The line of an arm of persona `key` refused because the controller is
+ * closed (`close(reason)`, the server's shutdown), `cause` the refused
+ * cause's description (its kind, with its error's description when it
+ * carries one) and `closedReason` the reason `close` was given:
+ *
+ *   [slack] unavailable-retry: persona=<key> not armed (<cause>) — <closedReason>
+ *
+ * Pure.
+ */
+export function unavailableRetryNotArmedClosedLine(key: string, cause: string, closedReason: string): string {
+  return `[slack] unavailable-retry: persona=${key} not armed (${cause}) — ${closedReason}`
+}
+
 /**
  * The line of an arm of persona `key` refused inside its latch re-check
  * (b.jg5 SRJ-505), `cause` the refused cause's description (its kind, with
@@ -1291,11 +1400,7 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
     if (!isCurrent(entry)) return
     const retry = entry.refusals + 1
     const mode = entry.mode
-    log(
-      mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY
-        ? `[slack] unavailable-retry: persona=${entry.key} retry ${retry} (pending-only) — reading its row`
-        : `[slack] unavailable-retry: persona=${entry.key} retry ${retry} — rerunning its recovery`,
-    )
+    log(unavailableRetryRetryLine(entry.key, retry, mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY))
     try {
       deps.onRetryFire?.(entry.key, clock.now())
     } catch {
@@ -1359,9 +1464,16 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
     entry.refusals += 1
     const waitMs = waitAfter(entry.refusals)
     schedule(entry, waitMs)
-    const ran = mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY ? ' (pending-only)' : ''
-    const next = entry.mode !== mode ? ` in ${entry.mode} mode` : ''
-    log(`[slack] unavailable-retry: persona=${entry.key} retry ${retry}${ran}: ${reason} — re-armed${next}, next retry in ${waitMs / 1000} s`)
+    log(
+      unavailableRetryReArmedLine(
+        entry.key,
+        retry,
+        mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
+        reason,
+        entry.mode !== mode ? entry.mode : undefined,
+        waitMs,
+      ),
+    )
   }
 
   /**
@@ -1416,7 +1528,7 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
     if (entry.lastRow === UNAVAILABLE_RETRY_ROW_PENDING) kept.push(UNAVAILABLE_RETRY_KEPT_ROW_PENDING)
     if (entry.causes.includes(UNAVAILABLE_RETRY_CAUSE_KILL_FAILED)) kept.push(UNAVAILABLE_RETRY_KEPT_KILL_FAILED)
     if (kept.length > 0) {
-      log(`[slack] unavailable-retry: persona=${entry.key} kept — ${ended}, but ${kept.join(' and ')}`)
+      log(unavailableRetryKeptLine(entry.key, ended, kept))
       return true
     }
     stopEntry(entry, ended)
@@ -1439,11 +1551,7 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
   function stopEntry(entry: RetryEntry, reason: string, row?: string): void {
     clearTimer(entry)
     entries.delete(entry.key)
-    const tags: string[] = []
-    if (entry.mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY) tags.push(UNAVAILABLE_RETRY_MODE_PENDING_ONLY)
-    if (row !== undefined) tags.push(`row ${row}`)
-    const tagged = tags.length > 0 ? ` (${tags.join(', ')})` : ''
-    log(`[slack] unavailable-retry: persona=${entry.key} stopped${tagged} — ${reason}`)
+    log(unavailableRetryStoppedLine(entry.key, entry.mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY, row, reason))
     stopped(entry.key, reason)
   }
 
@@ -1511,7 +1619,7 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
    */
   function armIn(key: string, cause: UnavailableRetryCause, mode: UnavailableRetryMode): boolean {
     if (closedReason !== undefined) {
-      log(`[slack] unavailable-retry: persona=${key} not armed (${describeCause(cause)}) — ${closedReason}`)
+      log(unavailableRetryNotArmedClosedLine(key, describeCause(cause), closedReason))
       return false
     }
     // b.jg5 SRJ-505: inside a latch re-check of a latched persona no cause
@@ -1546,7 +1654,7 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
         existing.lastRow = UNAVAILABLE_RETRY_ROW_PENDING
       } else if (existing.mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY) {
         existing.mode = UNAVAILABLE_RETRY_MODE_FULL
-        log(`[slack] unavailable-retry: persona=${key} promoted to full mode (${description}) — its due time is kept`)
+        log(unavailableRetryPromotedLine(key, description))
       }
       return true
     }
@@ -1561,8 +1669,7 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
       log(`[slack] unavailable-retry: persona=${key} arm failed: ${describeThrownValue(err)} — not armed`)
       return false
     }
-    const inMode = mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY ? ' in pending-only mode' : ''
-    log(`[slack] unavailable-retry: persona=${key} armed${inMode} (${description}) — first retry in ${waitMs / 1000} s`)
+    log(unavailableRetryArmedLine(key, mode === UNAVAILABLE_RETRY_MODE_PENDING_ONLY, description, waitMs))
     return true
   }
 
@@ -2175,11 +2282,15 @@ function conditionEndedReason(condition: unknown): string {
   return `the ${labelOf(condition)} condition ended`
 }
 
-/** `<kind>`, or `<kind>: <describeThrownValue(error)>` when the cause carries a thrown value. Never throws. */
+/**
+ * `<kind>`, or `<kind>: <describeThrownValueWithoutStack(error)>` when the
+ * cause carries a thrown value: one line with no stack frames, so the armed,
+ * promoted and not-armed lines carry no host path. Never throws.
+ */
 function describeCause(cause: UnavailableRetryCause): string {
   const kind = causeKind(cause)
   try {
-    return 'error' in cause && cause.error !== undefined ? `${kind}: ${describeThrownValue(cause.error)}` : kind
+    return 'error' in cause && cause.error !== undefined ? `${kind}: ${describeThrownValueWithoutStack(cause.error)}` : kind
   } catch {
     return kind
   }

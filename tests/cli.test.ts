@@ -94,6 +94,9 @@
  */
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+
+import { SocketModeClient } from '@slack/socket-mode'
+import { WebClient } from '@slack/web-api'
 import { spawnSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import {
@@ -154,6 +157,7 @@ import {
   TEARDOWN_POLL_FIRST_WAIT_MS,
   TEARDOWN_KILL_OPTIONS,
   TEARDOWN_POLL_MAX_WAIT_MS,
+  teardownKillReadOf,
   CLI_TEARDOWN_FAILED_LABEL,
   agentDirectorInitFailedLine,
   answerCheckFailedTryLine,
@@ -211,7 +215,14 @@ import {
   type StartupGateRefusalKind,
 } from '../src/agent-director-startup.ts'
 import { getClient, resetClientForTests, setClientForTests } from '../src/agent-director-client.ts'
-import { KILL_OUTCOME_SESSION_GONE, describeKillOutcome, killOutcomeOf } from '../src/checked-kill.ts'
+import {
+  KILL_OUTCOME_ROW_FINISHED,
+  KILL_OUTCOME_SESSION_GONE,
+  KILL_ROW_FINISHED_ENDED,
+  describeKillOutcome,
+  killOutcomeOf,
+  type AnyKillOutcome,
+} from '../src/checked-kill.ts'
 import {
   KILL_FAILURE_ORDINARY_CLI_TEARDOWN_CLOSING,
   KILL_FAILURE_SURVIVOR_CLI_TEARDOWN_CLOSING,
@@ -234,7 +245,14 @@ import {
   KILL_RETRY_NEXT_NOT_RETRIED,
   KILL_RETRY_SPACING_MS,
   KILL_RETRY_TRIES,
+  KILL_RETRY_END_ROW_FINISHED,
+  KILL_RETRY_NEXT_NOT_LIVE,
+  KILL_RETRY_NEXT_SUCCESS,
+  KILL_RETRY_VERDICT_FINISHED,
+  KILL_RETRY_VERDICT_GO,
   killRetryEndLine,
+  killRetryReadLine,
+  killRetrySeedOfState,
   killRetryTryLine,
 } from '../src/kill-retry.ts'
 import { buildBelowPhase1FloorMessage } from '../src/ad-version-gate.ts'
@@ -3734,6 +3752,84 @@ describe('the teardown\'s kill by class (b.jg5 SRJ-904, SRJ-702, SRJ-110; AC 64,
       outcome: killOutcomeOf({ thrown: killError }, TEARDOWN_KILL_OPTIONS), end: KILL_RETRY_END_READ_CONFIG, tries, reads, alert: { kind: KILL_RETRY_ALERT_NONE },
     }))
     expect(lines.filter((l) => l.includes('stop before try'))).toEqual([])
+  })
+
+  // b.jg5 SRJ-1014 (SRJ-702's lines; hatch note E33): the teardown's kill
+  // writes each try line, each between-try status read line and its end line
+  // through the kill retry's own builders, with the teardown's prefix; a fake
+  // token in a try's or a read's description comes out redacted. The text of
+  // each line per outcome kind is tests/kill-retry.test.ts's.
+  test.each(forEachKillPath<{ kc: KillCase; first: unknown; expected: string[]; redacted: number }>([
+    ['a first try answering UNAVAILABLE, a read answering UNCLASSIFIED, then a try answering CONFLICT, each carrying a fake token', () => {
+      const first = errTmuxUnresponsive(KILL_VERB, `no answer (${sentinelInMessage('cli-try-unavailable')})`)
+      const readError = errInternal(`the store could not be read (${sentinelInMessage('cli-read-unclassified')})`)
+      const conflict = errTmuxSessionConflict(KILL_VERB, 'not-this-launch', sentinelInMessage('cli-try-conflict'))
+      const second = killOutcomeOf({ thrown: conflict }, TEARDOWN_KILL_OPTIONS)
+      return {
+        first,
+        kc: { kills: [thrown(first), thrown(conflict)], reads: [thrown(readError)], calls: [2, 1], fails: [conflict, AD_ERROR_CLASS_CONFLICT] },
+        expected: [
+          killRetryReadLine(opsKillLogPrefix(), opsId(), 2, teardownKillReadOf({ error: readError }), KILL_RETRY_VERDICT_GO, killRetrySeedOfState(WAITING_ROW.state)),
+          killRetryTryLine(opsKillLogPrefix(), opsId(), 2, KILL_RETRY_TRIES, second, KILL_RETRY_NEXT_NOT_RETRIED),
+          killRetryEndLine(opsKillLogPrefix(), opsId(), { outcome: second, end: KILL_RETRY_END_SETTLED, tries: 2, reads: 1, alert: { kind: KILL_RETRY_ALERT_NONE } }),
+        ],
+        // Every line quotes a description carrying the fake token: both tries, the read, and the end line's outcome.
+        redacted: 4,
+      }
+    }],
+    ['a first try answering UNAVAILABLE carrying a fake token, then a read of ended', () => {
+      const first = errTmuxUnresponsive(KILL_VERB, `no answer (${sentinelInMessage('cli-try-finished')})`)
+      const finished: AnyKillOutcome = { kind: KILL_OUTCOME_ROW_FINISHED, read: KILL_ROW_FINISHED_ENDED }
+      return {
+        first,
+        kc: stops([thrown(first)], [1, 1], [ENDED_ROW]),
+        expected: [
+          killRetryReadLine(opsKillLogPrefix(), opsId(), 2, teardownKillReadOf({ row: ENDED_ROW }), KILL_RETRY_VERDICT_FINISHED, killRetrySeedOfState(WAITING_ROW.state)),
+          killRetryEndLine(opsKillLogPrefix(), opsId(), { outcome: finished, end: KILL_RETRY_END_ROW_FINISHED, tries: 1, reads: 1, alert: { kind: KILL_RETRY_ALERT_NONE } }),
+        ],
+        // Only the first try quotes a description.
+        redacted: 1,
+      }
+    }],
+  ], ''))('%s: %s: each try, read and end line is the kill retry\'s builder\'s, with the teardown\'s prefix, its descriptions redacted', async (command, _label, { overrides, make }, cmd) => {
+    const { kc, first, expected, redacted } = make()
+    await runKillCase(command, cmd, overrides, kc)
+
+    const firstOutcome = killOutcomeOf({ thrown: first }, TEARDOWN_KILL_OPTIONS)
+    const lines = opsKillRetryLines()
+    // The first try is tried again: what follows it has no exported value,
+    // so its line is the builder's head for that outcome (shared by every
+    // exported form) and none of those forms.
+    const forms = ([KILL_RETRY_NEXT_SUCCESS, KILL_RETRY_NEXT_NOT_RETRIED, KILL_RETRY_NEXT_NOT_LIVE] as const).map((next) => killRetryTryLine(opsKillLogPrefix(), opsId(), 1, KILL_RETRY_TRIES, firstOutcome, next))
+    let shared = 0
+    while (shared < forms[0]!.length && forms.every((form) => form[shared] === forms[0]![shared])) shared++
+    expect([lines[0]!.startsWith(forms[0]!.slice(0, shared)), forms.includes(lines[0]!)]).toEqual([true, false])
+    expect(lines.slice(1)).toEqual(expected)
+    expect(lines.filter((line) => line.includes(REDACTED_SENTINEL_TAIL))).toHaveLength(redacted)
+    expect(lines[0]).toContain(REDACTED_SENTINEL_TAIL)
+    assertNoLeak({ lines })
+  })
+
+  // b.jg5 SRJ-1002, SRJ-909 (AC 64): a CONFLICT or an UNUSABLE NAME at the
+  // CLI's kill is printed, logged and recorded (runKillCase checks the
+  // three and the unchanged state directory: no latch, no record), and the
+  // CLI builds no Slack client and makes no Slack call: no Web API call and
+  // no Socket Mode start while the teardown runs.
+  test.each(forEachKillPath<{ error: unknown; errorClass: AdErrorClass }>([
+    ['CONFLICT (not this launch\'s session)', () => ({ error: errTmuxSessionConflict(KILL_VERB, 'not-this-launch', opsSession()), errorClass: AD_ERROR_CLASS_CONFLICT })],
+    ['UNUSABLE NAME', () => ({ error: errUnusableName(), errorClass: AD_ERROR_CLASS_UNUSABLE_NAME })],
+  ], 'a kill answering '))('%s: %s: printed, logged and recorded as cli-teardown-failed; no Slack call of any kind', async (command, _label, { overrides, make }, cmd) => {
+    const { error, errorClass } = make()
+    const apiCall = spyOn(WebClient.prototype, 'apiCall')
+    const socketStart = spyOn(SocketModeClient.prototype, 'start')
+    try {
+      await runKillCase(command, cmd, overrides, { kills: [thrown(error)], calls: [1, 0], fails: [error, errorClass] })
+      expect(startupErrorEntries().map((entry) => entry.classLabel)).toEqual([CLI_TEARDOWN_FAILED_LABEL])
+      expect([apiCall.mock.calls.length, socketStart.mock.calls.length]).toEqual([0, 0])
+    } finally {
+      apiCall.mockRestore()
+      socketStart.mockRestore()
+    }
   })
 
   // Hatch note E24: the reads between tries are SRJ-115 sites; the CLI never writes retired-keys.json (SRJ-801).

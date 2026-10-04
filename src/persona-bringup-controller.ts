@@ -52,7 +52,7 @@
  * entry and handed to the manager when a directory or claude_config_dir
  * retry reaches Slack; the
  * credentials file is never read again by a retry, so an edit made meanwhile
- * is not used (it is E11's pending change). The manager itself keeps the same
+ * is not used (it is a pending change). The manager itself keeps the same
  * tokens for its own retries and reopens. The tokens are never logged,
  * returned or written, and no query exposes them. Beside them the entry holds
  * the digest of the bytes that read produced, or a missing/unreadable marker

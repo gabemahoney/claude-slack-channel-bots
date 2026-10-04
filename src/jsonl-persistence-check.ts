@@ -449,7 +449,7 @@ interface Layer2Effects {
 
 /**
  * Why the collision ladder will replace this row with a fresh spawn instead
- * of resuming it (E3 Task 3 guards, via `compareRowToPersona`), or undefined
+ * of resuming it (the guards of `compareRowToPersona`), or undefined
  * when the row matches the persona. A claude_config_dir with no real path
  * gives no `config_dir` verdict, so no mismatch (bug b.g57).
  */

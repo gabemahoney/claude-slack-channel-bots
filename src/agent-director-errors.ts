@@ -5,8 +5,7 @@
  * An agent-director error's class (GONE, UNAVAILABLE, CONFLICT, UNUSABLE NAME,
  * CONFIG, ENVIRONMENT, LAUNCH FAILURE, STATE, DIRECTORY, UNCLASSIFIED) is
  * decided by the classifier in `src/ad-error-class.ts` (b.jg5 SRJ-104). No new
- * `instanceof` ladder decides a class; existing sites move to the classifier
- * as later Epics change them. This module re-exports the client's error
+ * `instanceof` ladder decides a class. This module re-exports the client's error
  * classes so the classifier, the rest of CSCB and the tests import them from
  * one place, and keeps the subset list in sync with SRD edits. Per SR-0.2 CSCB
  * never parses free-form error message text or exit codes, apart from matching
@@ -30,7 +29,7 @@
  *
  * The first four are re-exported below. The last three are recognised by name
  * (SRJ-101 interim rule), not imported, re-exported once the Phase 1 client is
- * adopted (E37): the branch's 0.10.0 client lacks them, and a named import or
+ * adopted: the branch's 0.10.0 client lacks them, and a named import or
  * re-export of a missing export fails every module that loads it. Their names
  * are exported below once, as plain strings. So are the three store-open
  * `unknownName`s (`ErrSchemaMismatch`, `ErrSchemaMigrationRequired`,
@@ -122,7 +121,7 @@ export class ErrSpawnCapReached extends AgentDirectorError {
  * by their name and never imports the classes, which the branch's 0.10.0
  * client lacks. The startup catalogue check, the stub's by-name builders and
  * the classifier take the names from here. Re-exported as classes once the
- * Phase 1 client is adopted (E37).
+ * Phase 1 client is adopted.
  */
 export const ERR_TMUX_KILL_FAILED_NAME = 'ErrTmuxKillFailed'
 export const ERR_TMUX_UNRESPONSIVE_NAME = 'ErrTmuxUnresponsive'

@@ -84,9 +84,11 @@
  * latched, or that its CONFLICT or UNUSABLE NAME answer latched.
  *
  * Each failure outcome carries the classifier's class and the redacted
- * one-line description `describeAgentDirectorFailure` renders (the safe
- * `errName`, then the description through `redactSlackLogText`, on one line,
- * capped); {@link paneReadClassNote} renders the class for the end of a
+ * one-line description `describeAdFailureForLog` renders (b.jg5 SRJ-104:
+ * the reported name, so an `ErrUnknownErrorName` shows the name and the
+ * description agent-director sent, never the client's placeholder; else the
+ * safe `errName`; then the description through `redactSlackLogText`, on one
+ * line, capped); {@link paneReadClassNote} renders the class for the end of a
  * site's log line. An UNCLASSIFIED outcome the shared reader answers for an
  * `ErrInvalidFlags` whose version re-check decided that the server stops
  * carries the stop mark `stopping: true` ({@link PaneReadUnclassified}).
@@ -104,7 +106,7 @@ import {
   AD_ERROR_CLASS_UNAVAILABLE,
   AD_ERROR_CLASS_UNUSABLE_NAME,
   classifyAdError,
-  describeAgentDirectorFailure,
+  describeAdFailureForLog,
   hasAdErrorName,
   type AdErrorClass,
 } from './ad-error-class.ts'
@@ -188,7 +190,7 @@ export interface PaneReadPane {
 interface PaneReadFailureFields {
   /** The class `classifyAdError` gave the thrown value (b.jg5 SRJ-104). */
   readonly errorClass: AdErrorClass
-  /** The value as `describeAgentDirectorFailure` renders it: redacted, on one line, capped. */
+  /** The value as `describeAdFailureForLog` renders it: the reported name, redacted, on one line, capped. */
   readonly description: string
 }
 
@@ -254,7 +256,7 @@ export const PANE_READ_NOT_READ_LATCHED: PaneReadLatched = Object.freeze({ kind:
  */
 export function paneReadFailureOf(value: unknown): PaneReadFailure {
   const { errorClass } = classifyAdError(value)
-  const description = describeAgentDirectorFailure(value)
+  const description = describeAdFailureForLog(value)
   switch (errorClass) {
     case AD_ERROR_CLASS_GONE:
       return { kind: PANE_READ_GONE, errorClass, description }

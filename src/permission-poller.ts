@@ -1015,7 +1015,7 @@ function noteNotUpSkip(deps: PollerDeps, persona: Pick<Persona, 'name' | 'key'>)
 /**
  * Whether state kept for `personaKey` (a tracked prompt, a wedge state) is
  * held this tick: the persona is applied and not up. The skip episode is
- * opened when it is. A persona no longer applied is not held (E3's handling).
+ * opened when it is. A persona no longer applied is not held.
  */
 function isHeldForNotUpPersona(deps: PollerDeps, personaKey: string): boolean {
   const persona = deps.getPersona(personaKey)

@@ -14,7 +14,7 @@
  * The preview is rendered from the plan, never from a second diff:
  * - `renderPreview` / `renderPreviewLines`: the body of `config.json.pending`
  *   (b.av2 SR-8.4). A header with the counts (`changePlanCounts`,
- *   `renderChangePlanCounts`, reused by E12's `reload-applied`), then one
+ *   `renderChangePlanCounts`, reused by the `reload-applied` line), then one
  *   line per affected persona and changed setting; removals and destructive
  *   modifies start with `DESTRUCTIVE:` and say the persona will be retired:
  *   its session stopped and never resumed, and a destructive modify's brought
@@ -150,7 +150,7 @@ export interface ChangePlanFacts {
    */
   credentialsProblem?(path: string): string | undefined
   /**
-   * An applied persona's current bring-up state (E5's outcome and causes);
+   * An applied persona's current bring-up state (its outcome and causes);
    * undefined for a persona the controller does not know (not broken);
    * `FACT_UNKNOWN` when the state could not be queried.
    */
@@ -644,7 +644,7 @@ export function buildChangePlan(applied: PersonaConfig, candidate: ChangePlanCan
 }
 
 // ---------------------------------------------------------------------------
-// Counts (the preview header's terms, reused by E12's `reload-applied`)
+// Counts (the preview header's terms, reused by the `reload-applied` line)
 // ---------------------------------------------------------------------------
 
 /** The preview header's counts (b.av2 SR-8.4). */

@@ -18,11 +18,10 @@
  * emitting is the caller's job, through an injected `PersonaDiagnosticLogger`.
  * These lines never go to `startup-errors.log`, and no log file is added.
  *
- * The label set grows as later work lands (E2 Task 2 added credentials-refused
- * and Slack-unreachable, E2 Task 3 connection lost/restored, E3 Task 7 the
- * unclaimed channel and the DM drop, E5 Task 1 the per-persona start
- * line, E7 Task 2 the destination failure, E13 Task 1 the failed credentials
- * change, E13 Task 2 the unresolvable claude_config_dir; later Epics theirs).
+ * The labels cover credentials refused, Slack unreachable, connection lost
+ * and restored, the unclaimed channel and the DM drop, the per-persona start
+ * line, the destination failure, the failed credentials change and the
+ * unresolvable claude_config_dir.
  *
  * SPDX-License-Identifier: MIT
  */

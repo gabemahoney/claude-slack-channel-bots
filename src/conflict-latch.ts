@@ -161,7 +161,7 @@
  *   [slack] conflict-latch: persona=<key> forget observer failed: <error>
  *   [slack] conflict-latch: persona=<key> re-check timer could not be set: <error> — not armed
  *   [slack] conflict-latch: persona=<key> re-check round failed: <error>
- *   [slack] conflict-latch: re-check of <ref> — case=<case> call=<call> answer=<answer>  (logged by the session manager's round)
+ *   [slack] conflict-latch: re-check of <ref> — case=<case> step=<step> call=<call> answer=<answer>  (logged by the session manager's round)
  *
  * where `<state>` is {@link describeLatchRowState}'s rendering. A same-case
  * set logs nothing. No line carries a token: the session name and the
@@ -367,7 +367,7 @@ export const REFUSED_OPERATION_PLAIN_SPAWN = 'plain-spawn'
 export const REFUSED_OPERATION_REUSE_SPAWN = 'reuse-spawn'
 /** A `resume` was refused. */
 export const REFUSED_OPERATION_RESUME = 'resume'
-/** P's bring-up by the restart path's decision: a latch from a `provenance_conflict` note (E14). */
+/** P's bring-up by the restart path's decision: a latch from a `provenance_conflict` note (b.jg5 SRJ-114). */
 export const REFUSED_OPERATION_BRING_UP = 'bring-up'
 /** P's next check or recovery, decided afresh from its row by the restart path's decision: a pane verb's or a kill's CONFLICT. */
 export const REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY = 'next-check-or-recovery'
@@ -611,14 +611,11 @@ export function createConflictLatch(deps: ConflictLatchDeps): ConflictLatch {
     const record = buildRecord(key, input)
     records.set(key, record)
     if (previous === undefined) {
-      safeLog(deps.log, `[slack] conflict-latch: persona=${key} latched — ${describeRecord(record)}`)
+      safeLog(deps.log, conflictLatchSetLine(key, record))
       notify({ key, outcome: CONFLICT_LATCH_SET_LATCHED, record })
       return CONFLICT_LATCH_SET_LATCHED
     }
-    safeLog(
-      deps.log,
-      `[slack] conflict-latch: persona=${key} relatched — ${describeRecord(record, previous.latchCase)}`,
-    )
+    safeLog(deps.log, conflictLatchSetLine(key, record, previous.latchCase))
     notify({ key, outcome: CONFLICT_LATCH_SET_RELATCHED, record, previous })
     return CONFLICT_LATCH_SET_RELATCHED
   }
@@ -712,6 +709,20 @@ function normaliseRowState(rowState: LatchRowState): LatchRowState {
   return rowState.kind === LATCH_ROW_STATE_KIND_NO_ROW ? LATCH_ROW_STATE_NO_ROW : LATCH_ROW_STATE_UNREADABLE
 }
 
+/**
+ * The latch-set line (b.jg5 SRJ-501, SRJ-1014): a new latch, or, with
+ * `previousCase`, a relatch with a different case. The record's session and
+ * description are redacted before they are stored, so the line carries no
+ * token. Pure.
+ *
+ *   [slack] conflict-latch: persona=<key> latched — case=<case> session="<name>" refused=<operation> state=<state>[ message="<description>"]
+ *   [slack] conflict-latch: persona=<key> relatched — case=<case> (was <case>) session="<name>" refused=<operation> state=<state>[ message="<description>"]
+ */
+export function conflictLatchSetLine(key: string, record: ConflictLatchRecord, previousCase?: LatchCase): string {
+  const what = previousCase === undefined ? 'latched' : 'relatched'
+  return `[slack] conflict-latch: persona=${key} ${what} — ${describeRecord(record, previousCase)}`
+}
+
 /** `case=<case>[ (was <case>)] session="<name>" refused=<operation> state=<state>[ message="<description>"]`. */
 function describeRecord(record: ConflictLatchRecord, previousCase?: LatchCase): string {
   const was = previousCase === undefined ? '' : ` (was ${previousCase})`
@@ -774,6 +785,25 @@ export function unusableNameSetInput(
     sessionName: conflictSessionName(description, key),
     ...(description === undefined ? {} : { description }),
   }
+}
+
+// ---------------------------------------------------------------------------
+// A persona no longer in the applied configuration (b.jg5 SRJ-1002)
+// ---------------------------------------------------------------------------
+
+/**
+ * The outcome a CONFLICT or UNUSABLE NAME latch entry gives, in its site's
+ * one line, for a persona no longer in the applied configuration (b.jg5
+ * SRJ-1002): the case (`unusable-recorded-name` for an UNUSABLE NAME) and the
+ * refused operation, and that nothing is latched or posted. The site's line
+ * already names the persona reference, the call and the redacted
+ * description; no startup-errors entry is written, since SRJ-1013 has no
+ * class for it. Pure.
+ *
+ *   the persona is not in the applied configuration (case=<case> refused=<operation>), so nothing is latched or posted (b.jg5 SRJ-1002)
+ */
+export function notConfiguredLatchOutcome(latchCase: LatchCase, operation: RefusedOperation): string {
+  return `the persona is not in the applied configuration (case=${latchCase} refused=${operation}), so nothing is latched or posted (b.jg5 SRJ-1002)`
 }
 
 // ---------------------------------------------------------------------------
@@ -2192,14 +2222,34 @@ export function bindLatchRecheck(
 }
 
 /**
- * The re-check round's one line (b.jg5 SRJ-505, SRJ-1014): the persona
- * reference, the latch's case, the call made (`none` when it made none
- * after its read) and the answer's class, each a CSCB-written label:
- *
- *   [slack] conflict-latch: re-check of <ref> — case=<case> call=<call> answer=<answer>
- *
- * Carries no agent-director description. Pure.
+ * The round line's step when step 1's read itself changed the latch (it
+ * relatched the persona with another case, or the persona was no longer
+ * latched once it was done), so no decision was made.
  */
-export function latchRecheckRoundLine(ref: string, latchCase: LatchCase, call: string, answer: string): string {
-  return `[slack] conflict-latch: re-check of ${ref} — case=${latchCase} call=${call} answer=${answer}`
+export const RECHECK_LINE_STEP_NOT_DECIDED = 'not-decided'
+
+/** Step 1's outcome as the round line names it: a {@link LatchRecheckStep}, or {@link RECHECK_LINE_STEP_NOT_DECIDED}. */
+export type LatchRecheckLineStep = LatchRecheckStep | typeof RECHECK_LINE_STEP_NOT_DECIDED
+
+/**
+ * The re-check round's one line (b.jg5 SRJ-505, SRJ-1014): the persona
+ * reference, the latch's case, step 1's outcome (`RECHECK_STEP_*`, or
+ * {@link RECHECK_LINE_STEP_NOT_DECIDED}), the call made (`none` when it made
+ * none after its read) and the answer's class, each a CSCB-written label:
+ *
+ *   [slack] conflict-latch: re-check of <ref> — case=<case> step=<step> call=<call> answer=<answer>
+ *
+ * So a spawn latch's retry after step 1 found no row reads
+ * `step=spawn-retry`, and a "not this launch's session" latch's finished-row
+ * retry `step=finished-row-retry` (HO rev 15). Carries no agent-director
+ * description. Pure.
+ */
+export function latchRecheckRoundLine(
+  ref: string,
+  latchCase: LatchCase,
+  step: LatchRecheckLineStep,
+  call: string,
+  answer: string,
+): string {
+  return `[slack] conflict-latch: re-check of ${ref} — case=${latchCase} step=${step} call=${call} answer=${answer}`
 }

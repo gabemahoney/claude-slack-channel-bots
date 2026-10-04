@@ -639,6 +639,11 @@ const SAFE_DESCRIBERS = [
   'describeLogMessage',
   'describeSlackCallFailure',
   'describeAgentDirectorFailure',
+  // The reported-name describers (src/ad-error-class.ts): a safe reported name and the message only through renderLogMessageText.
+  'describeReportedAdFailure',
+  'describeAdFailureForLog',
+  // describeThrownValue without the stack's frames (src/persona-connection-errors.ts).
+  'describeThrownValueWithoutStack',
   'describeCliFailure',
   'describeRefreshFailure',
   'redactSlackLogText',
@@ -655,12 +660,16 @@ const SAFE_CALL = new RegExp(`(?<![\\w$.])(?:${SAFE_DESCRIBERS.join('|')})\\s*\\
 const ERROR_NAME_SOURCE = '(?:e|err|error)\\d*|[a-z][\\w$]*Err\\d*'
 const ERROR_NAME = new RegExp(`^(?:${ERROR_NAME_SOURCE})$`)
 
-/** `text` with every safe describer call (its arguments included) replaced by a placeholder. */
+/**
+ * `text` with every safe describer call (its arguments included) replaced by
+ * an empty string literal: a placeholder no name can match, so a local that
+ * happens to share a placeholder's name never taints every described call.
+ */
 function withoutSafeCalls(text: string): string {
   let out = text
   for (let m = SAFE_CALL.exec(out); m; m = SAFE_CALL.exec(out)) {
     const [, end] = balancedAfter(out, m.index, '(', ')')
-    out = `${out.slice(0, m.index)}described${out.slice(end + 1)}`
+    out = `${out.slice(0, m.index)}""${out.slice(end + 1)}`
   }
   return out
 }
@@ -921,6 +930,14 @@ describe("a caught error's text reaches a log line under src/ only redacted (E14
     ['a message through describeLogMessage', 'try { f() } catch (err) { console.error(`x: ${describeLogMessage(err.message)}`) }', []],
     ['a bare err.message beside a redacted one', 'try { f() } catch (err) { log(`x: ${redactSlackLogText(err.message)} (${err.message})`) }', ["reads a caught error's message or stack"]],
     ['an agent-director describer as a startup-error cause', "try { f() } catch (err) { recordStartupError('c', `m: ${describeAgentDirectorFailure(err)}`, describeAgentDirectorFailure(err)) }", []],
+    ['the reported-name describer', 'try { f() } catch (err) { log(`x: ${describeReportedAdFailure(err)}`) }', []],
+    ['the log describer of an agent-director failure', 'try { f() } catch (err) { log(`x: ${describeAdFailureForLog(err)}`) }', []],
+    ['the stack-free describer', 'try { f() } catch (err) { log(`x: ${describeThrownValueWithoutStack(err)}`) }', []],
+    [
+      'a tainted local named like a described call does not taint the described calls',
+      'try { f() } catch (err) { const described = String(err); log(`x: ${described}`); log(`y: ${describeThrownValue(err)}`) }',
+      ['interpolates a caught error'],
+    ],
   ])('rule check: %s', (_label, code, rules) => {
     expect(rawErrorFindings(code).map((f) => f.rule)).toEqual(rules)
   })

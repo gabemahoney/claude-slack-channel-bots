@@ -484,10 +484,38 @@ export function setOutageFlag(key: string, cls: OutageClass, detail?: string): v
  * bypassing run made for a latched persona still raises its outage.
  */
 export function raiseTmuxUnavailable(key: string, err: unknown, verb?: AdVerb): void {
+  raiseTmuxUnavailableVia(key, err, verb)
+}
+
+/**
+ * {@link raiseTmuxUnavailable}, its onset emitted through `post` when given
+ * (the wrappers pass {@link notifyIsolated}), else `deps.notify` directly.
+ */
+function raiseTmuxUnavailableVia(
+  key: string,
+  err: unknown,
+  verb: AdVerb | undefined,
+  post?: (key: string, text: string, options?: OutageNoticeOptions) => void,
+): void {
   if (verb !== 'find-missing' && isInsideLatchRecheck(key)) return
-  raiseFlag(key, 'tmux-unavailable', undefined, () =>
-    isDifferentTmuxServerError(err) ? tmuxServerChangedOnset() : ONSET_TEMPLATES['tmux-unavailable'](),
+  raiseFlag(
+    key,
+    'tmux-unavailable',
+    undefined,
+    () => (isDifferentTmuxServerError(err) ? tmuxServerChangedOnset() : ONSET_TEMPLATES['tmux-unavailable']()),
+    undefined,
+    post,
   )
+}
+
+/**
+ * {@link setOutageFlag} for `ad-unreachable` and `cwd-unreachable` from the
+ * wrappers' catch block: the onset goes out through {@link notifyIsolated},
+ * so a `notify` that throws or rejects is logged once and can never replace
+ * the error the wrapper rethrows. Never throws.
+ */
+function setOutageFlagIsolated(key: string, cls: 'ad-unreachable' | 'cwd-unreachable', detail: string | undefined): void {
+  raiseFlag(key, cls, detail, () => ONSET_TEMPLATES[cls](detail), undefined, notifyIsolated)
 }
 
 /**
@@ -541,15 +569,29 @@ function notifyIsolated(key: string, text: string, options?: OutageNoticeOptions
 }
 
 /**
- * The `ad-config-malformed` raise line (b.jg5 SRJ-1014), built from the
- * classification's own fields only (`describeAdErrorClassification`: the
+ * The `ad-config-malformed` raise line (b.jg5 SRJ-316, SRJ-1014), built from
+ * the classification's own fields only (`describeAdErrorClassification`: the
  * class, the reported name when safe, the rendered message), never from the
- * thrown value.
+ * thrown value. Pure.
+ *
+ *   [slack] outage-state: ad-config-malformed raised for persona=<key>: <classification> — no action is taken; the retry timer retries the persona (b.jg5 SRJ-316)
  */
+export function adConfigMalformedRaisedLine(key: string, classification: AdErrorClassification): string {
+  return `[slack] outage-state: ${AD_CONFIG_MALFORMED} raised for persona=${key}: ${describeAdErrorClassification(classification)} — no action is taken; the retry timer retries the persona (b.jg5 SRJ-316)`
+}
+
+/**
+ * The `ad-config-malformed` clear line (b.jg5 SRJ-312, SRJ-1014). Pure.
+ *
+ *   [slack] outage-state: ad-config-malformed cleared for persona=<key> — agent-director read its store again (b.jg5 SRJ-312)
+ */
+export function adConfigMalformedClearedLine(key: string): string {
+  return `[slack] outage-state: ${AD_CONFIG_MALFORMED} cleared for persona=${key} — agent-director read its store again (b.jg5 SRJ-312)`
+}
+
+/** Log {@link adConfigMalformedRaisedLine}. */
 function logAdConfigMalformedRaised(key: string, classification: AdErrorClassification): void {
-  console.error(
-    `[slack] outage-state: ad-config-malformed raised for persona=${key}: ${describeAdErrorClassification(classification)} — no action is taken; the retry timer retries the persona (b.jg5 SRJ-316)`,
-  )
+  console.error(adConfigMalformedRaisedLine(key, classification))
 }
 
 /**
@@ -605,9 +647,7 @@ export function clearOutageFlag(key: string, cls: OutageClass, reading?: string)
   // Mutate state BEFORE emit.
   entry.flags.delete(cls)
   if (cls === AD_CONFIG_MALFORMED) {
-    console.error(
-      `[slack] outage-state: ad-config-malformed cleared for persona=${key} — agent-director read its store again (b.jg5 SRJ-312)`,
-    )
+    console.error(adConfigMalformedClearedLine(key))
   }
   if (entry.flags.size === 0 && entry.badStretchClasses.size > 0) {
     // Snapshot history and reset BEFORE the notify call.
@@ -633,7 +673,7 @@ function flagCleared(key: string, cls: OutageClass, reading: string | undefined)
  * resetAllToHealthy — silently wipes each given persona's flag set and
  * bad-stretch history to a clean slate. No `notify` calls. Called at boot by
  * server.ts with the applied persona keys, before any persona is brought up,
- * as a defensive boundary for pre-start observations (added in Epic 2), and
+ * as a defensive boundary for pre-start observations, and
  * with one key by a teardown (b.av2 SR-6.5), which clears that persona's
  * flags with no all-clear notice; other personas' entries are untouched. It
  * never calls the cleared-flag observer, so it stops no retry timer.
@@ -708,7 +748,11 @@ export function resetAllToHealthy(keys: string[]): void {
  * or reported, and an ENVIRONMENT or CONFIG answer raises its outage only for
  * a persona in the applied configuration (`OutageDetectionOptions`).
  *
- * The original error is always rethrown so callers can handle it normally.
+ * The original error is always rethrown so callers can handle it normally:
+ * every onset raised here (`ad-unreachable`, `tmux-unavailable`,
+ * `cwd-unreachable`, `ad-config-malformed`) goes out through
+ * `notifyIsolated`, so a notify that throws or rejects is logged once and
+ * never replaces the error.
  */
 export async function withOutageDetection<T>(
   key: string,
@@ -739,15 +783,17 @@ export async function withOutageDetection<T>(
     // b.jg5 SRJ-110 (hatch A3): a call that arms nothing raises an
     // ENVIRONMENT or CONFIG outage only for a configured persona.
     const raisesOutage = armsNothing === undefined || armsNothingPersonaConfigured(armsNothing)
+    // Every onset here goes out through `notifyIsolated`: a notify that
+    // throws or rejects is logged and never replaces `err`.
     if (err instanceof ErrSystemInstallDisappeared) {
-      setOutageFlag(key, 'ad-unreachable', err.binaryPath)
+      setOutageFlagIsolated(key, 'ad-unreachable', err.binaryPath)
     } else if (errorClass === AD_ERROR_CLASS_ENVIRONMENT) {
-      if (raisesOutage) raiseTmuxUnavailable(key, err, adCallVerb(call))
+      if (raisesOutage) raiseTmuxUnavailableVia(key, err, adCallVerb(call), notifyIsolated)
     } else if (errorClass === AD_ERROR_CLASS_CONFIG) {
       if (raisesOutage) raiseAdConfigMalformed(key, err)
     } else if (err instanceof ErrCwdNotFound || err instanceof ErrCwdNotADirectory) {
       if (workingDirectory !== undefined) {
-        setOutageFlag(key, 'cwd-unreachable', workingDirectory)
+        setOutageFlagIsolated(key, 'cwd-unreachable', workingDirectory)
       } else {
         console.error(
           `[slack] outage-state: withOutageDetection: cwd error on persona=${key} but workingDirectory is undefined — verb-class drift; rethrowing without raising flag: ${describeThrownValue(err)}`,

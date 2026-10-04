@@ -7,9 +7,9 @@
  * 0.10.0 client's own result and parameter types, as types. None of it is imported from
  * `agent-director`, whose 0.10.0 client lacks these fields. The test stub
  * (`tests/test-helpers/agent-director-stub.ts`) types its canned results with
- * the declarations here; later Epics' readers of these fields (E14, E17, E20,
- * E28) will take them from here too. Once the Phase 1 client is adopted, its
- * own types replace this module (b.jg5 E37).
+ * the declarations here, and every reader of these fields in `src/` takes them
+ * from here too. Once the Phase 1 client is adopted, its own types replace
+ * this module.
  *
  * The fields:
  *   - `kill_sent` on a `kill` result: whether agent-director sent a kill.

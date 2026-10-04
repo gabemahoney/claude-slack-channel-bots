@@ -29,7 +29,7 @@
  *   line 2: "fingerprint: sha256:" + 64 lower-case hex digits
  *
  * `composePendingFile` writes that layout and `parsePendingFingerprint`
- * recovers the fingerprint from it (E12 compares a confirmation's fingerprint
+ * recovers the fingerprint from it (the apply compares a confirmation's fingerprint
  * with that of the current contents). The operator never types it.
  *
  * Pure (b.av2 SR-13.1): no function here reads a file, logs or holds state,

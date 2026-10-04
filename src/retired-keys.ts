@@ -522,6 +522,202 @@ function keyRef(key: string): string {
   return `persona=${PERSONA_KEY_RE.test(key) ? key : JSON.stringify(key)}`
 }
 
+/**
+ * The record-change line of a recording (b.jg5 SRJ-803, SRJ-1014):
+ * `described` names each key written (`persona=<key> (cause=<cause>…)`),
+ * `file` the record's path JSON-quoted, `carried` the suffix for changes held
+ * only in memory that the write carries (empty when none). Pure.
+ *
+ *   [slack] retired-keys: recorded <keys> in "<path>"[; it carries …] (b.jg5 SRJ-803)
+ */
+export function retiredKeysRecordedLine(described: string, file: string, carried: string): string {
+  return `${RETIRED_KEYS_LOG_PREFIX} recorded ${described} in ${file}${carried} (b.jg5 SRJ-803)`
+}
+
+/**
+ * The record-change line of a "new life has begun" mark (b.jg5 SRJ-806,
+ * SRJ-1014). Pure.
+ *
+ *   [slack] retired-keys: persona=<key> marked: its new life has begun, in "<path>"[; it carries …] (b.jg5 SRJ-806)
+ */
+export function retiredKeysMarkedLine(key: string, file: string, carried: string): string {
+  return `${RETIRED_KEYS_LOG_PREFIX} ${keyRef(key)} marked: its new life has begun, in ${file}${carried} (b.jg5 SRJ-806)`
+}
+
+/**
+ * The record-change line of an entry's clear (b.jg5 SRJ-807, SRJ-1014),
+ * `onRead` the read that cleared it, when given. Pure.
+ *
+ *   [slack] retired-keys: persona=<key> entry cleared from "<path>"[ on <read>][; it carries …] (b.jg5 SRJ-807)
+ */
+export function retiredKeysClearedLine(key: string, file: string, onRead: string | undefined, carried: string): string {
+  return `${RETIRED_KEYS_LOG_PREFIX} ${keyRef(key)} entry cleared from ${file}${onReadSuffix(onRead)}${carried} (b.jg5 SRJ-807)`
+}
+
+/** ` on <read>` for a clear's `onRead`, when given and not empty, else nothing. Pure. */
+function onReadSuffix(onRead: string | undefined): string {
+  return onRead === undefined || onRead === '' ? '' : ` on ${onRead}`
+}
+
+/** A recorded key written as a new entry (its cause): {@link retiredKeyWrittenText}'s default. */
+export const RETIRED_KEY_WRITTEN_NEW = 'new'
+/** A recorded key written over a marked entry, whose "new life has begun" mark the write clears. */
+export const RETIRED_KEY_WRITTEN_MARK_CLEARED = 'mark-cleared'
+/** A key held only in memory (a failed `absent-at-start` recording, b.jg5 SRJ-714) that the write now carries. */
+export const RETIRED_KEY_WRITTEN_HELD = 'held-in-memory'
+
+/** How a recording writes one key ({@link retiredKeyWrittenText}). */
+export type RetiredKeyWrittenAs =
+  | typeof RETIRED_KEY_WRITTEN_NEW
+  | typeof RETIRED_KEY_WRITTEN_MARK_CLEARED
+  | typeof RETIRED_KEY_WRITTEN_HELD
+
+/**
+ * What a recording's line says of one key it writes (b.jg5 SRJ-803): the
+ * persona reference and its cause, with what the write does to it besides.
+ * `retiredKeysRecordedLine`'s `described` is these, distinct, joined with
+ * `, ` in the batch's order. Pure.
+ *
+ *   persona=<key> (cause=<cause>)
+ *   persona=<key> (cause=<cause>, its "new life has begun" mark cleared)
+ *   persona=<key> (cause=<cause>, held only in memory)
+ */
+export function retiredKeyWrittenText(key: string, cause: string, as: RetiredKeyWrittenAs = RETIRED_KEY_WRITTEN_NEW): string {
+  const note =
+    as === RETIRED_KEY_WRITTEN_MARK_CLEARED
+      ? ', its "new life has begun" mark cleared'
+      : as === RETIRED_KEY_WRITTEN_HELD
+        ? ', held only in memory'
+        : ''
+  return `${keyRef(key)} (cause=${cause}${note})`
+}
+
+/**
+ * The suffix of a record-change line whose write carries the changes held
+ * only in memory for `keys` (b.jg5 SRJ-714, SRJ-806): the keys sorted and
+ * distinct; nothing when there are none. Pure.
+ *
+ *   ; it carries the changes held only in memory for persona=<key>[, persona=<key>…]
+ */
+export function retiredKeysCarriedSuffix(keys: Iterable<string>): string {
+  const held = [...new Set(keys)].sort()
+  return held.length === 0 ? '' : `; it carries the changes held only in memory for ${held.map(keyRef).join(', ')}`
+}
+
+/**
+ * The line of a recording whose write failed (b.jg5 SRJ-803, SRJ-714):
+ * `described` as for {@link retiredKeysRecordedLine}, `detail` what the
+ * write did (its errno and what the file holds), `heldInMemory` the
+ * `absent-at-start` keys the server now holds as retired in memory (none:
+ * the record in memory is unchanged). Pure.
+ *
+ *   [slack] retired-keys: cannot record <keys> in "<path>"<detail>; this server holds persona=<key>[, …] as retired in memory for its life, and the next write of the record that succeeds carries them (b.jg5 SRJ-803, SRJ-714)
+ *   [slack] retired-keys: cannot record <keys> in "<path>"<detail>; the record in memory is unchanged (b.jg5 SRJ-803)
+ */
+export function retiredKeysCannotRecordLine(described: string, file: string, detail: string, heldInMemory: readonly string[]): string {
+  const inMemory =
+    heldInMemory.length > 0
+      ? `this server holds ${heldInMemory.map(keyRef).join(', ')} as retired in memory for its life, and the next write of the record that succeeds carries them (b.jg5 SRJ-803, SRJ-714)`
+      : 'the record in memory is unchanged (b.jg5 SRJ-803)'
+  return `${RETIRED_KEYS_LOG_PREFIX} cannot record ${described} in ${file}${detail}; ${inMemory}`
+}
+
+/**
+ * The line of a "new life has begun" mark whose write failed (b.jg5
+ * SRJ-806), `detail` what the write did. Pure.
+ *
+ *   [slack] retired-keys: cannot mark persona=<key> in "<path>"<detail>; this server holds its mark in memory, and its next launch decision writes it again (b.jg5 SRJ-806)
+ */
+export function retiredKeysCannotMarkLine(key: string, file: string, detail: string): string {
+  return (
+    `${RETIRED_KEYS_LOG_PREFIX} cannot mark ${keyRef(key)} in ${file}${detail}; this server holds its mark in memory, ` +
+    'and its next launch decision writes it again (b.jg5 SRJ-806)'
+  )
+}
+
+/**
+ * The line of an entry's clear whose write failed (b.jg5 SRJ-807), `onRead`
+ * the read that cleared it, when given, `detail` what the write did. Pure.
+ *
+ *   [slack] retired-keys: cannot clear persona=<key> from "<path>"[ on <read>]<detail>; the entry stays, and the next qualifying read clears it again (b.jg5 SRJ-807)
+ */
+export function retiredKeysCannotClearLine(key: string, file: string, onRead: string | undefined, detail: string): string {
+  return (
+    `${RETIRED_KEYS_LOG_PREFIX} cannot clear ${keyRef(key)} from ${file}${onReadSuffix(onRead)}${detail}; the entry stays, and the next ` +
+    'qualifying read clears it again (b.jg5 SRJ-807)'
+  )
+}
+
+/**
+ * The restore line (b.jg5 SRJ-804) when the record held before the apply
+ * was written back to `file`. Pure.
+ *
+ *   [slack] retired-keys: restored the record held before the apply in "<path>" (b.jg5 SRJ-804)
+ */
+export function retiredKeysRestoredLine(file: string): string {
+  return `${RETIRED_KEYS_LOG_PREFIX} restored the record held before the apply in ${file} (b.jg5 SRJ-804)`
+}
+
+/**
+ * The restore line (b.jg5 SRJ-804) when the record held before the apply
+ * was empty and the file was removed; `unsyncedErrno`, when given (the
+ * remove's errno suffix, possibly empty), says its directory could not be
+ * synced. Pure.
+ *
+ *   [slack] retired-keys: restored the record held before the apply: it was empty, so "<path>" was removed (b.jg5 SRJ-804)
+ *   [slack] retired-keys: restored the record held before the apply: it was empty, so "<path>" was removed, but its directory could not be synced<errno>, so it may reappear after a crash (b.jg5 SRJ-804)
+ */
+export function retiredKeysRestoredEmptyRemovedLine(file: string, unsyncedErrno?: string): string {
+  if (unsyncedErrno === undefined) {
+    return `${RETIRED_KEYS_LOG_PREFIX} restored the record held before the apply: it was empty, so ${file} was removed (b.jg5 SRJ-804)`
+  }
+  return (
+    `${RETIRED_KEYS_LOG_PREFIX} restored the record held before the apply: it was empty, so ${file} was removed, but its ` +
+    `directory could not be synced${unsyncedErrno}, so it may reappear after a crash (b.jg5 SRJ-804)`
+  )
+}
+
+/**
+ * The restore line (b.jg5 SRJ-804) when the record held before the apply
+ * was empty, removing `file` failed (`removeDetail`, its errno suffix) and an
+ * empty record was written in its place. Pure.
+ *
+ *   [slack] retired-keys: restored the record held before the apply: it was empty, and removing "<path>" failed<errno>, so an empty record was written (b.jg5 SRJ-804)
+ */
+export function retiredKeysRestoredEmptyWrittenLine(file: string, removeDetail: string): string {
+  return (
+    `${RETIRED_KEYS_LOG_PREFIX} restored the record held before the apply: it was empty, and removing ${file} failed` +
+    `${removeDetail}, so an empty record was written (b.jg5 SRJ-804)`
+  )
+}
+
+/**
+ * The failed restore line (b.jg5 SRJ-804) of an empty record: removing
+ * `file` failed (`removeDetail`) and so did writing an empty record
+ * (`writeDetail`). Pure.
+ *
+ *   [slack] retired-keys: cannot restore the record held before the apply: removing "<path>" failed<errno>, and writing an empty record failed<detail>; the keys it holds stay retired (b.jg5 SRJ-804)
+ */
+export function retiredKeysCannotRestoreEmptyLine(file: string, removeDetail: string, writeDetail: string): string {
+  return (
+    `${RETIRED_KEYS_LOG_PREFIX} cannot restore the record held before the apply: removing ${file} failed${removeDetail}, and ` +
+    `writing an empty record failed${writeDetail}; the keys it holds stay retired (b.jg5 SRJ-804)`
+  )
+}
+
+/**
+ * The failed restore line (b.jg5 SRJ-804) of a record that is not empty,
+ * `detail` what the write did. Pure.
+ *
+ *   [slack] retired-keys: cannot restore the record held before the apply in "<path>"<detail>; the keys it could not remove stay retired (b.jg5 SRJ-804)
+ */
+export function retiredKeysCannotRestoreLine(file: string, detail: string): string {
+  return (
+    `${RETIRED_KEYS_LOG_PREFIX} cannot restore the record held before the apply in ${file}${detail}; the keys it ` +
+    'could not remove stay retired (b.jg5 SRJ-804)'
+  )
+}
+
 /** Log `line`, swallowing a throwing log. */
 function safeLog(log: (line: string) => void, line: string): void {
   try {
@@ -592,8 +788,7 @@ function createRetiredKeyStore(
 
   /** ` carrying <keys> held only in memory` when a write carries held changes, else nothing. */
   function carriedSuffix(): string {
-    const held = [...new Set([...heldKeys, ...heldMarks])].sort()
-    return held.length === 0 ? '' : `; it carries the changes held only in memory for ${held.map(keyRef).join(', ')}`
+    return retiredKeysCarriedSuffix([...heldKeys, ...heldMarks])
   }
 
   /** The record in memory becomes `next`, all of it written. */
@@ -662,13 +857,13 @@ function createRetiredKeyStore(
       if (existing !== undefined && existing.newLifeBegunAt === null) {
         // SRJ-803: a key held only in memory makes the batch write; any other unmarked key is left as it is.
         if (heldKeys.has(key) && !changed.some((c) => c.key === key)) {
-          writing.push(`${keyRef(key)} (cause=${existing.cause}, held only in memory)`)
+          writing.push(retiredKeyWrittenText(key, existing.cause, RETIRED_KEY_WRITTEN_HELD))
         }
         continue
       }
       next.set(key, { retiredAt: at, cause, newLifeBegunAt: null })
       changed.push({ key, cause })
-      writing.push(`${keyRef(key)} (cause=${cause}${existing !== undefined ? ', its "new life has begun" mark cleared' : ''})`)
+      writing.push(retiredKeyWrittenText(key, cause, existing !== undefined ? RETIRED_KEY_WRITTEN_MARK_CLEARED : RETIRED_KEY_WRITTEN_NEW))
     }
     if (writing.length === 0) return { outcome: RETIRED_KEYS_UNCHANGED, snapshot: before }
 
@@ -677,7 +872,7 @@ function createRetiredKeyStore(
     const attempt = writeWhole(next)
     if (attempt.ok) {
       committed(next)
-      safeLog(deps.log, `${RETIRED_KEYS_LOG_PREFIX} recorded ${described} in ${file}${carried} (b.jg5 SRJ-803)`)
+      safeLog(deps.log, retiredKeysRecordedLine(described, file, carried))
       return { outcome: RETIRED_KEYS_WRITTEN, snapshot: before }
     }
 
@@ -694,11 +889,7 @@ function createRetiredKeyStore(
       heldKeys = new Set([...heldKeys, ...held])
       heldMarks = keptMarks
     }
-    const inMemory =
-      held.length > 0
-        ? `this server holds ${held.map(keyRef).join(', ')} as retired in memory for its life, and the next write of the record that succeeds carries them (b.jg5 SRJ-803, SRJ-714)`
-        : 'the record in memory is unchanged (b.jg5 SRJ-803)'
-    safeLog(deps.log, `${RETIRED_KEYS_LOG_PREFIX} cannot record ${described} in ${file}${attempt.detail}; ${inMemory}`)
+    safeLog(deps.log, retiredKeysCannotRecordLine(described, file, attempt.detail, held))
     return { outcome: RETIRED_KEYS_WRITE_FAILED, snapshot: before }
   }
 
@@ -712,17 +903,13 @@ function createRetiredKeyStore(
     const attempt = writeWhole(next)
     if (attempt.ok) {
       committed(next)
-      safeLog(deps.log, `${RETIRED_KEYS_LOG_PREFIX} ${keyRef(key)} marked: its new life has begun, in ${file}${carried} (b.jg5 SRJ-806)`)
+      safeLog(deps.log, retiredKeysMarkedLine(key, file, carried))
       return RETIRED_KEYS_WRITTEN
     }
     // SRJ-806: a mark whose write fails stays set in memory for this server's life.
     entries = next
     heldMarks = new Set([...heldMarks, key])
-    safeLog(
-      deps.log,
-      `${RETIRED_KEYS_LOG_PREFIX} cannot mark ${keyRef(key)} in ${file}${attempt.detail}; this server holds its mark in memory, ` +
-        'and its next launch decision writes it again (b.jg5 SRJ-806)',
-    )
+    safeLog(deps.log, retiredKeysCannotMarkLine(key, file, attempt.detail))
     return RETIRED_KEYS_WRITE_FAILED
   }
 
@@ -731,18 +918,13 @@ function createRetiredKeyStore(
     const next = new Map(entries)
     next.delete(key)
     const carried = carriedSuffix()
-    const read = onRead === undefined || onRead === '' ? '' : ` on ${onRead}`
     const attempt = writeWhole(next)
     if (attempt.ok) {
       committed(next)
-      safeLog(deps.log, `${RETIRED_KEYS_LOG_PREFIX} ${keyRef(key)} entry cleared from ${file}${read}${carried} (b.jg5 SRJ-807)`)
+      safeLog(deps.log, retiredKeysClearedLine(key, file, onRead, carried))
       return RETIRED_KEYS_WRITTEN
     }
-    safeLog(
-      deps.log,
-      `${RETIRED_KEYS_LOG_PREFIX} cannot clear ${keyRef(key)} from ${file}${read}${attempt.detail}; the entry stays, and the next ` +
-        'qualifying read clears it again (b.jg5 SRJ-807)',
-    )
+    safeLog(deps.log, retiredKeysCannotClearLine(key, file, onRead, attempt.detail))
     return RETIRED_KEYS_WRITE_FAILED
   }
 
@@ -754,17 +936,13 @@ function createRetiredKeyStore(
       remove(path)
       fileBytes = null
       committed(empty)
-      safeLog(deps.log, `${RETIRED_KEYS_LOG_PREFIX} restored the record held before the apply: it was empty, so ${file} was removed (b.jg5 SRJ-804)`)
+      safeLog(deps.log, retiredKeysRestoredEmptyRemovedLine(file))
       return RETIRED_KEYS_REMOVED
     } catch (err) {
       if (err instanceof DurableUnlinkUnsyncedError) {
         fileBytes = null
         committed(empty)
-        safeLog(
-          deps.log,
-          `${RETIRED_KEYS_LOG_PREFIX} restored the record held before the apply: it was empty, so ${file} was removed, but its ` +
-            `directory could not be synced${errnoSuffix(err)}, so it may reappear after a crash (b.jg5 SRJ-804)`,
-        )
+        safeLog(deps.log, retiredKeysRestoredEmptyRemovedLine(file, errnoSuffix(err)))
         return RETIRED_KEYS_REMOVED
       }
       removeDetail = errnoSuffix(err)
@@ -772,18 +950,10 @@ function createRetiredKeyStore(
     const attempt = writeWhole(empty)
     if (attempt.ok) {
       committed(empty)
-      safeLog(
-        deps.log,
-        `${RETIRED_KEYS_LOG_PREFIX} restored the record held before the apply: it was empty, and removing ${file} failed` +
-          `${removeDetail}, so an empty record was written (b.jg5 SRJ-804)`,
-      )
+      safeLog(deps.log, retiredKeysRestoredEmptyWrittenLine(file, removeDetail))
       return RETIRED_KEYS_WRITTEN
     }
-    safeLog(
-      deps.log,
-      `${RETIRED_KEYS_LOG_PREFIX} cannot restore the record held before the apply: removing ${file} failed${removeDetail}, and ` +
-        `writing an empty record failed${attempt.detail}; the keys it holds stay retired (b.jg5 SRJ-804)`,
-    )
+    safeLog(deps.log, retiredKeysCannotRestoreEmptyLine(file, removeDetail, attempt.detail))
     return RETIRED_KEYS_WRITE_FAILED
   }
 
@@ -792,14 +962,10 @@ function createRetiredKeyStore(
     const attempt = writeWhole(target.entries)
     if (attempt.ok) {
       committed(target.entries)
-      safeLog(deps.log, `${RETIRED_KEYS_LOG_PREFIX} restored the record held before the apply in ${file} (b.jg5 SRJ-804)`)
+      safeLog(deps.log, retiredKeysRestoredLine(file))
       return RETIRED_KEYS_WRITTEN
     }
-    safeLog(
-      deps.log,
-      `${RETIRED_KEYS_LOG_PREFIX} cannot restore the record held before the apply in ${file}${attempt.detail}; the keys it ` +
-        'could not remove stay retired (b.jg5 SRJ-804)',
-    )
+    safeLog(deps.log, retiredKeysCannotRestoreLine(file, attempt.detail))
     return RETIRED_KEYS_WRITE_FAILED
   }
 

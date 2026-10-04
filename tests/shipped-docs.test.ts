@@ -76,7 +76,7 @@ import { UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
 import { CRONTABLE_TEMPLATE_HEADER } from '../src/cron-bootstrap.ts'
 import type { Via } from '../src/delivery-decision.ts'
 import { MCP_INSTRUCTIONS } from '../src/registry.ts'
-import { PHASE1_RUNBOOK_SECTION_TITLE } from '../src/ad-version-gate.ts'
+import { DEBUG_SKILL_PATH, DEBUG_SKILL_RUNTIME_STOP_SECTION_TITLE, PHASE1_RUNBOOK_SECTION_TITLE } from '../src/ad-version-gate.ts'
 import { AD_BELOW_PHASE1_FLOOR, AD_SYSTEM_INSTALL_TOO_OLD } from '../src/install-check.ts'
 import {
   DESTRUCTIVE_PREFIX,
@@ -1335,5 +1335,12 @@ describe('the agent-director refusal classes name the switch-over runbook (b.jg5
   test('self-check: a README item takes its indented continuation lines and stops at the next item', () => {
     const fixture = `- \`${AD_BELOW_PHASE1_FLOOR}\` — first\n  second\n- \`next\` — third`
     expect(labelItem(fixture, AD_BELOW_PHASE1_FLOOR, 'fixture')).toBe(`- \`${AD_BELOW_PHASE1_FLOOR}\` — first second`)
+  })
+})
+
+describe('the runtime re-check\'s pointer names a debug skill section that exists (b.jg5 SRJ-1104)', () => {
+  test(`${DEBUG_SKILL_PATH} has exactly one heading titled "${DEBUG_SKILL_RUNTIME_STOP_SECTION_TITLE}"`, () => {
+    const titles = headings(readRepoFile(DEBUG_SKILL_PATH)).map((h) => h.title)
+    expect(titles.filter((title) => title === DEBUG_SKILL_RUNTIME_STOP_SECTION_TITLE)).toHaveLength(1)
   })
 })

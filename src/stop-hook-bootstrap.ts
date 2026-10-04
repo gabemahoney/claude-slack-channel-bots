@@ -787,7 +787,7 @@ export function preLaunchReplyGuard(
 }
 
 /**
- * Teardown helper for a removed persona (b.av2 SR-6.5; E12 calls it): delete
+ * Teardown helper for a removed persona (b.av2 SR-6.5; the persona's teardown calls it): delete
  * persona `key`'s record under `stateDir` (a record already gone is success)
  * and forget its launched-with dir. Does not re-run the hook patch. Never
  * throws; a failure is one server-log line naming the key and the path.

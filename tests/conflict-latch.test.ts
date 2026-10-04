@@ -409,6 +409,24 @@
  * `console.error` the newest live harness's after each cleanup, and what
  * was in effect before the first build once all are cleaned up.
  *
+ * The lines (b.jg5 SRJ-1014), each from its exported builder: the latch-set
+ * and relatch lines (`conflictLatchSetLine`, its words pinned once in the
+ * relatch case); the latched gate's line at a new launch of a latched P
+ * (`latchedLaunchSkipLine`); the re-check round's line naming step 1's
+ * outcome and the call (`latchRecheckRoundLine`: a spawn latch's retry after
+ * step 1 found no row, `step=spawn-retry`; a "not this launch's session"
+ * latch's finished-row retry, `step=finished-row-retry`, HO rev 15; a read
+ * with no information; a read that relatched, `step=not-decided`; a table
+ * decision); the `latch-recheck:` lines (not up, a launch in flight, an
+ * unresolvable claude_config_dir, a probe dropped, a collision that gives no
+ * information); the `latch-clear:` lines and the cleared line, "cleared by
+ * hand" among its reasons. SRJ-1002: a CONFLICT or an UNUSABLE NAME met at
+ * the restart path's kill or the shared read-pane for a persona removed from
+ * the applied configuration sets no latch, posts nothing, writes no
+ * startup-errors entry and logs one line with `notConfiguredLatchOutcome`,
+ * while a configured persona beside it latches; with no configured-persona
+ * query installed, or one that throws, the removed persona latches as before.
+ *
  * Pure module under test, except the recovery-harness cases: one
  * `createConflictLatch` per test over a line capture and a recording
  * observer; `afterEach` runs `assertNoLeak` over every line, event and record
@@ -529,11 +547,17 @@ import {
   RECHECK_READING_FAILED_VALUE,
   RECHECK_READING_NO_ROW_VALUE,
   RECHECK_READING_STATE,
+  RECHECK_LINE_STEP_NOT_DECIDED,
   RECHECK_STEP_CLEAR_GONE,
+  RECHECK_STEP_FINISHED_ROW_RETRY,
   RECHECK_STEP_NO_INFORMATION,
   RECHECK_STEP_SPAWN_RETRY,
   RECHECK_STEP_TABLE,
+  conflictLatchSetLine,
   createLatchClear,
+  latchRecheckRoundLine,
+  notConfiguredLatchOutcome,
+  type LatchRecheckLineStep,
   decideClearedProbeRetry,
   latchClearedLine,
   type LatchClear,
@@ -594,7 +618,9 @@ import {
   AGENT_DIRECTOR_PENDING_STATE,
   LIVENESS_DEAD_ROW_ENDED,
   LIVENESS_DEAD_ROW_MISSING,
+  LIVENESS_READING_DEAD_ENDED,
 } from '../src/liveness-reading.ts'
+import { killOutcomeOf } from '../src/checked-kill.ts'
 import { describeThrownValue, MAX_LOGGED_MESSAGE_LENGTH, renderLogMessageText } from '../src/persona-connection-errors.ts'
 import { adConfigMalformedOnset, getOutageFlags, type OutageClass } from '../src/outage-state.ts'
 import { classifyAdError } from '../src/ad-error-class.ts'
@@ -680,7 +706,20 @@ import {
   latchClearRetryAtOnceLineHead,
   latchClearRetryFailedLine,
   latchClearRunFailedLine,
+  latchRecheckCollisionNoInformationLine,
+  latchRecheckConfigDirLine,
+  latchRecheckLaunchInFlightLine,
+  latchRecheckNotUpLine,
+  latchRecheckProbeDroppedLine,
   latchRecheckUnmatchedLine,
+  latchedLaunchSkipLine,
+  latchOnRestartKillOutcome,
+  readPersonaOwnPane,
+  COLLISION_GET_SITE,
+  _resetConfigDirFs,
+  _resetConfiguredPersonaQuery,
+  _setConfigDirFs,
+  setConfiguredPersonaQuery,
   oldLifeHoldLaunchLine,
   runLatchClearSequence,
   sweepDeadTmuxChannel,
@@ -1185,9 +1224,7 @@ describe('the latch record', () => {
       refusedOperation: REFUSED_OPERATION_RESUME,
       rowState: ENDED,
     })
-    expect(run.lines).toEqual([
-      `[slack] conflict-latch: persona=${KEY} latched — case=${LATCH_CASE_OWN_ID} session=${JSON.stringify(personaTmuxSessionName(KEY))} refused=${REFUSED_OPERATION_RESUME} state=ended`,
-    ])
+    expect(run.lines).toEqual([conflictLatchSetLine(KEY, run.latch.record(KEY)!)])
   })
 
   test('the hold cases are recorded with the refused operation none', () => {
@@ -1256,6 +1293,8 @@ describe('relatch', () => {
       [CONFLICT_LATCH_SET_LATCHED, previous, undefined],
       [CONFLICT_LATCH_SET_RELATCHED, second, previous],
     ])
+    expect(run.lines).toEqual([conflictLatchSetLine(KEY, previous!), conflictLatchSetLine(KEY, run.latch.record(KEY)!, LATCH_CASE_OWN_ID)])
+    // The pin (SRJ-1014): the set and relatch lines' words, with the case, the session, the refused operation, the state and the description.
     expect(run.lines).toEqual([
       `[slack] conflict-latch: persona=${KEY} latched — case=${LATCH_CASE_OWN_ID} session=${JSON.stringify(personaTmuxSessionName(KEY))} refused=${REFUSED_OPERATION_RESUME} state=ended message=${JSON.stringify(CONFLICT_OWN_ID_PHRASE)}`,
       `[slack] conflict-latch: persona=${KEY} relatched — case=${LATCH_CASE_LEFTOVER} (was ${LATCH_CASE_OWN_ID}) session=${JSON.stringify(STUB_TMUX_SESSION_NAME)} refused=${REFUSED_OPERATION_PLAIN_SPAWN} state=${LATCH_ROW_STATE_KIND_NO_ROW} message=${JSON.stringify(CONFLICT_LEFTOVER_PHRASE)}`,
@@ -2519,6 +2558,8 @@ describe('AC 46: no automated path kills, launches or recovers a latched persona
     const { launched, qCalls, notScheduledLines, attemptsBefore } = await driveEveryPath(run)
     // Each request for P logged the not-scheduling line once, and nothing else naming P.
     expect(notScheduledLines).toEqual([[notSchedulingLine(p)], [notSchedulingLine(p)]])
+    // The new launch met the latched gate: its one line, naming P and the latch's case (SRJ-502, SRJ-1014).
+    expect(h.errors.filter((line) => line === latchedLaunchSkipLine(`[slack] ${COLLISION_GET_SITE.site}:`, personaRefOf(h, p), row.latchCase))).toHaveLength(1)
 
     const { scheduled, qCalls: qTickCalls } = await runHealthTick(run)
     qCalls.push(['the health tick', qTickCalls])
@@ -2614,6 +2655,89 @@ describe('AC 46: no automated path kills, launches or recovers a latched persona
     expect(h.episodeNotices).toEqual([{ key: p, text: plainSpawnRow.notice.text }])
     expect(h.notices).toEqual([])
     expect(personaCallCounts(h, q)).toEqual({})
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-1002 (SRJ-501, SRJ-512): a CONFLICT or an UNUSABLE NAME met for a
+// persona no longer in the applied configuration latches nothing, on the
+// recovery harness (its configured-persona query over the live applied set)
+// ---------------------------------------------------------------------------
+
+/** The site labels the not-configured cases give the shared read-pane and the restart path's kill latch. */
+const NOT_CONFIGURED_PANE_SITE = 'notConfiguredPaneRead'
+const NOT_CONFIGURED_KILL_SITE = 'notConfiguredKill'
+
+/** A latch entry run for persona `key` of `h` meeting the answer `err`. */
+type LatchEntryRun = (h: RecoveryHarness, key: string, err: Error) => Promise<unknown>
+
+/**
+ * The latch entries a CONFLICT or an UNUSABLE NAME reaches, each with a
+ * CONFLICT row and an UNUSABLE NAME row of its site: the restart path's kill
+ * (`latchOnRestartKillOutcome`: the CONFLICT and unusable-name entries with
+ * the state the run read, `ended`) and the shared read-pane
+ * (`readPersonaOwnPane`: the latch-on-answer entries). The launch site's guard
+ * is tests/session-manager.test.ts's.
+ */
+const NOT_CONFIGURED_ENTRIES: ReadonlyArray<readonly [string, LatchEntryRun, () => ConflictCaseRow, () => UnusableNameCaseRow]> = [
+  [
+    'the restart path\'s kill',
+    (_h, key, err) => latchOnRestartKillOutcome(key, killOutcomeOf({ thrown: err }), NOT_CONFIGURED_KILL_SITE, LIVENESS_READING_DEAD_ENDED),
+    () => RESTART_KILL_CONFLICT_CASE_ROWS[0]!,
+    () => RESTART_KILL_UNUSABLE_NAME_CASE_ROWS[0]!,
+  ],
+  [
+    'the shared read-pane',
+    (h, key, err) => {
+      h.script({ readPaneError: err })
+      return readPersonaOwnPane(key, { nLines: PROBE_PANE_READ_LINES, lastRead: ENDED, site: NOT_CONFIGURED_PANE_SITE })
+    },
+    () => livenessPaneConflictRowsAt('working-row verdict')[0]!,
+    () => UNUSABLE_NAME_CASE_ROWS.find((row) => row.site === 'read-pane')!,
+  ],
+]
+
+describe('SRJ-1002: a CONFLICT or an UNUSABLE NAME met for a persona no longer in the applied configuration sets no latch, posts nothing and writes no startup-errors entry, with one line naming the persona, the case and the refused operation; a configured persona beside it latches (recovery harness; SRJ-501, SRJ-512, SRJ-1002, SRJ-1014)', () => {
+  const CASES = NOT_CONFIGURED_ENTRIES.flatMap(([entry, run, conflictRow, unusableRow]) => [
+    [entry, 'a CONFLICT', run, (): Error => conflictRow().build(), (): LatchCase => conflictRow().latchCase, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY],
+    [entry, 'an UNUSABLE NAME', run, (): Error => unusableRow().build(), (): LatchCase => LATCH_CASE_UNUSABLE_RECORDED_NAME, REFUSED_OPERATION_NONE],
+  ] as const)
+
+  test.each(CASES)('%s meeting %s: P, removed, is not latched and gets no post or entry, its one line carrying the not-configured outcome; Q, applied, latches with one post', async (_entry, _answer, run, build, latchCaseOf, operation) => {
+    const h = makeRecoveryHarness()
+    harnesses.push(h)
+    const [p, q] = h.keys as [string, string]
+    h.remove(p)
+
+    await run(h, p, build())
+    await run(h, q, build())
+
+    const outcome = notConfiguredLatchOutcome(latchCaseOf(), operation)
+    const outcomeLines = h.errors.filter((line) => line.includes(outcome))
+    expect(outcomeLines).toHaveLength(1)
+    expect([outcomeLines[0]!.includes(p), outcomeLines[0]!.includes(q)]).toEqual([true, false])
+    // Latches nothing: no latch entry, no latch event and no post for P.
+    expect([h.latch.isLatched(p), h.latch.record(p), h.latchEvents.filter((event) => event.key === p)]).toEqual([false, undefined, []])
+    expect(h.episodeNotices.map((notice) => notice.key)).toEqual([q])
+    expect(h.latch.record(q)?.latchCase).toBe(latchCaseOf())
+    expect([h.notices, h.startupErrors()]).toEqual([[], []])
+  })
+
+  test.each(NOT_CONFIGURED_ENTRIES.flatMap(([entry, run, conflictRow]) => [
+    [entry, 'no configured-persona query installed', run, conflictRow, () => _resetConfiguredPersonaQuery()],
+    [entry, 'a configured-persona query that throws', run, conflictRow, () => setConfiguredPersonaQuery(() => { throw new Error('the query broke') })],
+  ] as const))('%s with %s: a removed P latches as a configured persona would, with one post and no not-configured line', async (_entry, _query, run, conflictRow, install) => {
+    const h = makeRecoveryHarness()
+    harnesses.push(h)
+    const [p] = h.keys as [string]
+    h.remove(p)
+    install()
+
+    await run(h, p, conflictRow().build())
+
+    expect(h.latch.record(p)?.latchCase).toBe(conflictRow().latchCase)
+    expect(h.episodeNotices.map((notice) => notice.key)).toEqual([p])
+    expect(h.errors.filter((line) => line.includes(notConfiguredLatchOutcome(conflictRow().latchCase, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY)))).toEqual([])
   })
 })
 
@@ -5799,13 +5923,102 @@ function recheckSite(): string {
 }
 
 /**
- * The round's not-up line for a launch `call` of the persona rendered `ref`
- * (b.av2 SR-6.4), pinned here from `latchRecheckLaunch`'s doc: no builder
- * of it is exported.
+ * The lines `build` makes whatever it is given as its one open part (a label
+ * the session manager does not export, such as the launch a line names): a
+ * pattern of the builder's own text before and after that part.
  */
-function recheckNotUpLine(ref: string, call: string): string {
-  return `[slack] ${recheckSite()}: ${ref} is not up — no ${call} in this re-check; the persona stays latched (b.av2 SR-6.4; b.jg5 SRJ-505)`
+function builtAround(build: (hole: string) => string): RegExp {
+  const hole = '\u0000'
+  const [head, tail] = build(hole).split(hole) as [string, string]
+  const quote = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(`^${quote(head)}.*${quote(tail)}$`)
 }
+
+/** Persona `key`'s re-check round lines in `h` (`latchRecheckRoundLine`, one per round), in order. */
+function roundLinesOf(h: RecoveryHarness, key: string): string[] {
+  const head = latchRecheckRoundLine(personaRefOf(h, key), '\u0000' as LatchCase, RECHECK_STEP_TABLE, RECHECK_CALL_NONE, '').split('\u0000')[0]!
+  return h.errors.filter((line) => line.startsWith(head))
+}
+
+/** The round line's head (`latchRecheckRoundLine` up to its answer) for `key`'s round with `latchCase`, step 1's outcome `step` and the call `call`. */
+function roundLineHead(h: RecoveryHarness, key: string, latchCase: LatchCase, step: LatchRecheckLineStep, call: string): string {
+  return latchRecheckRoundLine(personaRefOf(h, key), latchCase, step, call, '')
+}
+
+describe('the round line names step 1\'s outcome and the call: a spawn latch\'s retry after step 1 found no row and a "not this launch\'s session" latch\'s finished-row retry each say so (HO rev 15), and so do a read that gave no information and one that relatched (recovery harness; SRJ-505, SRJ-1014)', () => {
+  test.each([
+    ['a reuse spawn latch', anotherStoreReuseRow, RECHECK_CALL_REUSE_SPAWN, (_model: PendingRowModel) => {}],
+    // Refused again by the scan: still latched with no post.
+    ['a plain spawn latch', scanLeftoverRow, RECHECK_CALL_PLAIN_SPAWN, (model: PendingRowModel) => model.scriptPlainSpawns(scanRefusal(scanLeftoverRow().build()))],
+  ] as const)('%s whose step 1 finds no row: one round line, step=spawn-retry, the spawn its call', async (_label, rowOf, call, script) => {
+    const row = rowOf()
+    expect(recheckEntryAt(row.recheck, 'no row').decision).toMatchObject({ step: RECHECK_STEP_SPAWN_RETRY, call })
+    const { h, p, model, record } = latchForRecheck(row, { state: PENDING_ROW_MODEL_NO_ROW })
+    script(model)
+    const round = await recheckRound(h, p)
+    expect(round.verbs.slice(0, 2)).toEqual(['status', 'spawn'])
+    const lines = roundLinesOf(h, p)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toStartWith(roundLineHead(h, p, record.latchCase, RECHECK_STEP_SPAWN_RETRY, call))
+    await stopApprover(h, p)
+  })
+
+  test.each([
+    ['missing', RECHECK_CALL_RESUME, ['status', 'get', 'resume']],
+    ['no row', RECHECK_CALL_PLAIN_SPAWN, ['status', 'get', 'spawn']],
+  ] as const)('a "not this launch\'s session" latch whose step 1 reads %s: one round line, step=finished-row-retry, the finished-row retry and the launch its get decided as its call', async (reading, launch, verbs) => {
+    const row = statusOnlyRow()
+    expect(recheckEntryAt(row.recheck, reading).decision).toMatchObject({ step: RECHECK_STEP_FINISHED_ROW_RETRY, call: RECHECK_CALL_FINISHED_ROW })
+    const entry = finishedRowEntryFor(reading)
+    expect(entry.call).toBe(launch)
+    const run = latchForRecheck(row, { state: reading === 'no row' ? PENDING_ROW_MODEL_NO_ROW : rowStateOfReading(reading) })
+    const { h, p, model, record } = run
+    // A launch answer that gives no information: P stays latched with no post.
+    scriptLaunchAnswer(model, launch, entry.answers!.noInformation[0]!.answer())
+    const round = await recheckRound(h, p)
+    expect(round.verbs).toEqual([...verbs])
+    expectStillLatched(run, round.at)
+    const lines = roundLinesOf(h, p)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toStartWith(roundLineHead(h, p, record.latchCase, RECHECK_STEP_FINISHED_ROW_RETRY, `${RECHECK_CALL_FINISHED_ROW}:${launch}`))
+  })
+
+  test('a step-1 read that gives no information: one round line, step=no-information and no call', async () => {
+    const run = latchForRecheck(statusOnlyRow(), { state: rowStateOfReading('waiting') })
+    const { h, p, model, record } = run
+    model.scriptStatus(recheckNoInformationAnswers('status')[0]!.answer()!)
+    const round = await recheckRound(h, p)
+    expect(round.verbs).toEqual(['status'])
+    expectStillLatched(run, round.at)
+    const lines = roundLinesOf(h, p)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toStartWith(roundLineHead(h, p, record.latchCase, RECHECK_STEP_NO_INFORMATION, RECHECK_CALL_NONE))
+  })
+
+  test('a step-1 read that relatches P with another case: one round line naming the case it had, step=not-decided and no call', async () => {
+    const { h, p, record } = latchForRecheck(statusOnlyRow(), { state: AGENT_DIRECTOR_PENDING_STATE, launchStartedAt: SAMPLE_LAUNCH_START_NONE })
+    const round = await recheckRound(h, p)
+    expect(round.verbs).toEqual(['status'])
+    expect(h.latch.record(p)).toEqual(launchStartRecord(p))
+    const lines = roundLinesOf(h, p)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toStartWith(roundLineHead(h, p, record.latchCase, RECHECK_LINE_STEP_NOT_DECIDED, RECHECK_CALL_NONE))
+  })
+
+  test('a step-1 read the table decides (a "this row\'s own id" resume on a row read ended): one round line, step=step-2 and the probe its call', async () => {
+    const row = ownIdResumeRow()
+    const ended = recheckEntryAt(row.recheck, 'ended')
+    expect(ended.decision).toMatchObject({ step: RECHECK_STEP_TABLE, call: RECHECK_CALL_PROBE })
+    const run = latchForRecheck(row, { state: LIVENESS_DEAD_ROW_ENDED, readPane: [ended.answers!.stillLatched[0]!.answer()] })
+    const { h, p, record } = run
+    const round = await recheckRound(h, p)
+    expect(round.verbs).toEqual(['status', 'readPane'])
+    expectStillLatched(run, round.at)
+    const lines = roundLinesOf(h, p)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toStartWith(roundLineHead(h, p, record.latchCase, RECHECK_STEP_TABLE, RECHECK_CALL_PROBE))
+  })
+})
 
 describe('a round\'s launch asks the gates every launch path asks: a persona not up, held on ErrInvalidFlags or held back for an old life gets no launch and stays latched with no post (recovery harness; b.av2 SR-6.4; SRJ-505, SRJ-207, SRJ-810)', () => {
   test('not up (its bring-up has not succeeded, the relaunch gate main() passes): its status read and the not-up line, no spawn, P still latched with no post; once up, the next round makes the reuse', async () => {
@@ -5815,11 +6028,57 @@ describe('a round\'s launch asks the gates every launch path asks: a persona not
     let round = await recheckRound(h, p)
     expect(round.verbs).toEqual(['status'])
     expectStillLatched(run, round.at)
-    expect(h.errors.filter((line) => line === recheckNotUpLine(personaRefOf(h, p), RECHECK_CALL_REUSE_SPAWN))).toHaveLength(1)
+    expect(h.errors.filter((line) => line === latchRecheckNotUpLine(personaRefOf(h, p), RECHECK_CALL_REUSE_SPAWN))).toHaveLength(1)
     h.setUp(p, true)
     round = await recheckRound(h, p)
     expect(round.verbs.slice(0, 2)).toEqual(['status', 'spawn'])
     expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, p)])
+    await stopApprover(h, p)
+  })
+
+  test('a launch already in flight for P (its spawn held open, P latched meanwhile): the round\'s status read and the in-flight line, no second spawn, P still latched with no post', async () => {
+    const h = makeRecheckHarness()
+    const [p] = h.keys as [string]
+    const model = makePendingRowModel(h, p, { sessionId: 'session-of-p', state: PENDING_ROW_MODEL_NO_ROW })
+    const id = personaInstanceId(p)
+    const hold = holdSpawns(h.stub.client, (spawned) => spawned === id)
+    const launching = h.launch(p)
+    await hold.entered(id)
+    anotherStoreReuseRow().latchOn(h.latchSet, p)
+    const record = h.latch.record(p)
+    model.setState(LIVENESS_DEAD_ROW_ENDED)
+
+    // The round, with the launch still held (so no settling of launches).
+    await h.advance(h.latchRecheck.nextDueAt()! - h.clock.now())
+    await h.latchRecheck.whenRoundSettled(p)
+
+    expect(h.errors.filter((line) => line === latchRecheckLaunchInFlightLine(personaRefOf(h, p), RECHECK_CALL_REUSE_SPAWN))).toHaveLength(1)
+    expect(hold.calls).toHaveLength(1)
+    expect([h.latch.record(p), h.episodeNotices.length]).toEqual([record, 1])
+    hold.release(id)
+    await launching
+    await h.settle()
+    await stopApprover(h, p)
+  })
+
+  test('its claude_config_dir unresolvable (bug b.g57): its status read and the config-dir line, no spawn, P still latched with no post; once it resolves, the next round makes the reuse', async () => {
+    const run = latchForRecheck(anotherStoreReuseRow(), { state: LIVENESS_DEAD_ROW_ENDED })
+    const { h, p } = run
+    const gone = (): never => {
+      throw Object.assign(new Error('no such directory'), { code: 'ENOENT' })
+    }
+    _setConfigDirFs({ realpath: gone, lstat: gone })
+    let round: RecheckRoundRun
+    try {
+      round = await recheckRound(h, p)
+    } finally {
+      _resetConfigDirFs()
+    }
+    expect(round.verbs).toEqual(['status'])
+    expectStillLatched(run, round.at)
+    expect(h.errors.filter((line) => line === latchRecheckConfigDirLine(personaRefOf(h, p), RECHECK_CALL_REUSE_SPAWN))).toHaveLength(1)
+    round = await recheckRound(h, p)
+    expect(round.verbs.slice(0, 2)).toEqual(['status', 'spawn'])
     await stopApprover(h, p)
   })
 
@@ -6479,6 +6738,9 @@ describe('the cleared probe\'s find-missing and single retry: a refused run hold
     expect(round.verbs).toEqual(['status', 'readPane', 'findMissing', 'spawn'])
     expectStillLatched(run, round.at)
     expect(noInformationState(h, p)).toEqual(NO_INFORMATION_STATE)
+    // Its one line (SRJ-1014), the launch it names left open.
+    const collision = builtAround((what) => latchRecheckCollisionNoInformationLine(personaRefOf(h, p), what))
+    expect(h.errors.filter((line) => collision.test(line))).toHaveLength(1)
     round = await recheckRound(h, p)
     expect(round.verbs).toEqual(['status', 'readPane'])
   })
@@ -6495,7 +6757,7 @@ describe('the cleared probe\'s find-missing and single retry: a refused run hold
     expect(round.verbs).toEqual(['status', 'readPane', 'findMissing', verb])
     expect(h.latch.record(p)).toEqual({ ...record, probeDropped: true })
     expect(h.episodeNotices).toHaveLength(1)
-    expect(h.errors.filter((line) => line.includes('"this row\'s own id" single retry was refused again with that case — its probe is dropped for the rest of this episode'))).toHaveLength(1)
+    expect(h.errors.filter((line) => line === latchRecheckProbeDroppedLine(personaRefOf(h, p)))).toHaveLength(1)
     // The probe dropped: the latched operation itself, no read-pane and no find-missing; refused again, still no post.
     refuse(model, row.build())
     round = await recheckRound(h, p)
@@ -6893,7 +7155,9 @@ describe('the exported after-clear sequence (runLatchClearSequence) and the buil
 
   // The sequence's three failure lines, from their builders; `persona=<key>`
   // is the session manager's key-only reference (not exported).
-  const latchClearLinesIn = (h: RecoveryHarness): string[] => h.errors.filter((line) => line.startsWith('[slack] latch-clear: '))
+  /** The after-clear sequence's lines: their head is its builders' (`latchClearNotAppliedLine`'s, up to the persona reference). */
+  const latchClearHead = latchClearNotAppliedLine('\u0000').split('\u0000')[0]!
+  const latchClearLinesIn = (h: RecoveryHarness): string[] => h.errors.filter((line) => line.startsWith(latchClearHead))
   const notRunInTurnLine = (key: string, thrown: unknown): string => latchClearNotRunInTurnLine(`persona=${key}`, describeThrownValue(thrown))
   const clearFailedLine = (key: string, thrown: unknown): string => latchClearClearFailedLine(`persona=${key}`, describeThrownValue(thrown))
   const runFailedLine = (key: string, thrown: unknown): string => latchClearRunFailedLine(`persona=${key}`, describeThrownValue(thrown))

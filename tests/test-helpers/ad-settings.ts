@@ -14,6 +14,9 @@
  * with the caller's text on its first (offending) line, so a leak case can
  * put a fake token there.
  *
+ * `settingsLinesOtherThanValues(lines, home)` drops the settings reader's
+ * values lines (b.jg5 SRJ-1014) for the settings file under `home`.
+ *
  * `REFUSED_AD_CONFIG_FORMS` is SRJ-1304's list of refused forms, one entry
  * each, for `test.each`. Every threshold in it is derived from
  * `DEFAULT_AD_SETTINGS`, `AD_SETTING_MINIMUMS` and
@@ -37,7 +40,9 @@ import {
   AD_PAUSE_TIMEOUT_KEY,
   AD_SETTING_MINIMUMS,
   AD_SETTINGS_RELATIVE_PATH,
+  AD_TMUX_KEYS,
   AD_TMUX_TABLE,
+  buildAdSettingsValuesLine,
   DEFAULT_AD_SETTINGS,
   pendingGraceMinimumSeconds,
   type AdTmuxKey,
@@ -204,3 +209,16 @@ export const REFUSED_AD_CONFIG_FORMS: readonly RefusedAdConfigForm[] = Object.fr
     key: 'pending_grace_seconds',
   },
 ])
+
+/**
+ * The settings reader's lines other than its values lines (b.jg5 SRJ-1014),
+ * which it writes at its first accepted read and at each change of the nine
+ * values: a values line starts as `buildAdSettingsValuesLine` renders it for
+ * the settings file under `home`, up to the first key. With no `home`, every
+ * line is kept.
+ */
+export function settingsLinesOtherThanValues(lines: readonly string[], home: string | undefined): string[] {
+  if (home === undefined) return [...lines]
+  const head = buildAdSettingsValuesLine(join(home, AD_SETTINGS_RELATIVE_PATH), DEFAULT_AD_SETTINGS.tmux).split(AD_TMUX_KEYS[0]!)[0]!
+  return lines.filter((line) => !line.startsWith(head))
+}

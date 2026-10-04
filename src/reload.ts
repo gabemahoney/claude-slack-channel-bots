@@ -490,7 +490,7 @@ export interface ReloadControllerDeps {
   /**
    * An applied persona's current bring-up state (production: the bring-up
    * controller's `state`), for the preview of a credentials change and again
-   * when apply steps 4 and 6 run (E13 Director decision 4): a persona broken
+   * when apply steps 4 and 6 run: a persona broken
    * by its credentials is brought up at apply rather than reconnected (b.av2
    * SR-8.6). Without it no persona counts as broken by its credentials in the
    * preview, and the steps follow the plan's split.
@@ -1393,7 +1393,7 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
 
   /**
    * Whether a persona is broken by its credentials now, for apply steps 4 and
-   * 6 (E13 Director decision 4): from the bring-up state when it can be
+   * 6: from the bring-up state when it can be
    * queried, else undefined (the plan's split decides).
    */
   function credentialsBrokenNow(key: string): boolean | undefined {

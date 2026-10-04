@@ -83,6 +83,8 @@ import {
   latchRowStateRead,
   REFUSED_OPERATION_PLAIN_SPAWN,
   REFUSED_OPERATION_RESUME,
+  unusableNameNoticeText,
+  unusableNameSetInput,
   type ConflictLatch,
   type ConflictLatchRecord,
   type ConflictLatchSetInput,
@@ -114,14 +116,17 @@ import {
   createPersonaEpisodes,
   createUnclassifiedErrorEpisodes,
   PERSONA_UNCLASSIFIED_ERROR_LABEL,
+  personaUnclassifiedErrorEntryText,
   unclassifiedErrorAlertText,
   type UnclassifiedErrorEpisodes,
   PERSONA_EPISODE_KIND_CONFLICT,
   PERSONA_EPISODE_KIND_INVALID_FLAGS_HOLD,
   PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE,
+  PERSONA_EPISODE_KIND_UNUSABLE_RECORDED_NAME,
   PERSONA_EPISODE_KINDS,
   type PersonaEpisodes,
 } from '../src/persona-episodes.ts'
+import { unescapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import {
   bindInvalidFlagsHoldSetReaction,
   createInvalidFlagsHold,
@@ -141,6 +146,7 @@ import {
 import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import {
   createPersonaLifecycle,
+  DESTINATION_HOLD_CANCEL_AT_WINDOW_STEP,
   LIVE_ROW_SEQUENCE_STOP_AGAIN_STEP,
   LIVE_ROW_SEQUENCE_STOP_STEP,
   OLD_LIFE_WAITS_STEP,
@@ -180,7 +186,7 @@ import {
   type PersonaTeardownKillResult,
 } from '../src/session-manager.ts'
 import { LIVE_ROW_OUTCOME_STOPPED, LIVE_ROW_STOP_HOLD_ENDED, LIVE_ROW_STOP_TEARDOWN } from '../src/live-row-sequence.ts'
-import { UNAVAILABLE_RETRY_ROW_ABSENT } from '../src/unavailable-retry.ts'
+import { UNAVAILABLE_RETRY_ROW_ABSENT, unavailableRetryStoppedLine } from '../src/unavailable-retry.ts'
 import {
   callCounts,
   callCountsSince,
@@ -628,10 +634,11 @@ function cleanTeardownLines(p: Persona, outcome: KillOutcome = KILL_SUCCEEDED, t
 /**
  * The start of the teardown's turn for `p`, before its first step (b.jg5
  * SRJ-1002, SRJ-1003): its outage state forgotten silently, then its notice
- * window opened.
+ * window opened, then the notices its destination hold kept dropped
+ * (`DESTINATION_HOLD_CANCEL_AT_WINDOW_STEP`), nothing awaited in between.
  */
 function turnStart(p: Persona): string[] {
-  return [`resetOutageState:${p.key}`, `notifier.openTeardownWindow:${p.key}`]
+  return [`resetOutageState:${p.key}`, `notifier.openTeardownWindow:${p.key}`, `destinationHold.cancel:${p.key}`]
 }
 
 /**
@@ -1304,8 +1311,9 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
   // in the turn, so each of their steps fails: stopRetryTimer (in the first group, again once the launch in flight
   // settled and once more after the kill), the latch forget (in the first group, again once the launch settled and
   // once more after the kill), and the hold and episodes forgets (in the first group and again once the launch
-  // settled) (b.jg5 SRJ-715). The outage state is forgotten once, at the turn's start, and the held notices dropped
-  // once; the notice window's open and close are steps of their own (b.jg5 SRJ-1002, SRJ-1003).
+  // settled) (b.jg5 SRJ-715), and the destination hold's cancel (right after the window opens, and again in step 6,
+  // b.jg5 SRJ-1003). The outage state is forgotten once, at the turn's start, and the held notices dropped once; the
+  // notice window's open and close are steps of their own (b.jg5 SRJ-1002, SRJ-1003).
   test.each<[DepName, string[]]>([
     ['notifier.openTeardownWindow', ['opening its notice window']],
     ['notifier.closeTeardownWindow', ['closing its notice window']],
@@ -1317,7 +1325,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     ['routing.forget', ['forgetting its inbound dedupe store']],
     ['forgetAcks', ['forgetting its ack-reaction entries']],
     ['destinations.forget', ['forgetting its DM destination']],
-    ['destinationHold.cancel', ['cancelling its held destination notices']],
+    ['destinationHold.cancel', [DESTINATION_HOLD_CANCEL_AT_WINDOW_STEP, 'cancelling its held destination notices']],
     ['notifier.forget', ['dropping its held notices']],
     ['forgetPersonaPrompts', ['dropping its tracked permission prompts']],
     ['dropSession', ['dropping its MCP session']],
@@ -1661,9 +1669,9 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 
     const turn = teardownTurnTrail(f.b, launchPassOf(f, undefined))
     expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
-    // Every step of the turn failed once (the repeated stops and forgets each count), the window's open and close
-    // included: 35; the submit's end, the turn's last call, is no step (its own case below).
-    expect(turn).toHaveLength(36)
+    // Every step of the turn failed once (the repeated stops, forgets and hold cancels each count), the window's open
+    // and close included: 36; the submit's end, the turn's last call, is no step (its own case below).
+    expect(turn).toHaveLength(37)
     expect(turn.at(-1)).toBe(`notifier.settleTeardown:${f.b.key}`)
     expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete, with ${turn.length - 1} failed step(s)`)
     expect(f.lines.filter((line) => line.includes(' delete '))).toEqual([])
@@ -1678,7 +1686,9 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     await f.lifecycle.teardown(f.b)
 
     const opened = f.trail.indexOf(`notifier.openTeardownWindow:${k}`)
-    expect(f.trail.slice(opened - 1, opened + 2)).toEqual([`resetOutageState:${k}`, `notifier.openTeardownWindow:${k}`, `stopApprover:${k}`])
+    expect(f.trail.slice(opened - 1, opened + 3)).toEqual([
+      `resetOutageState:${k}`, `notifier.openTeardownWindow:${k}`, `destinationHold.cancel:${k}`, `stopApprover:${k}`,
+    ])
     expect(f.trail.slice(-3)).toEqual([expect.stringMatching(/^replyGuard\.launchPass:/), ...turnEnd(f.b)])
     expect(f.trail.filter((c) => c.startsWith('notifier.') && c !== `notifier.forget:${k}`)).toEqual([
       `notifier.submitTeardown:${k}`, `notifier.openTeardownWindow:${k}`, `notifier.closeTeardownWindow:${k}`, `notifier.settleTeardown:${k}`,
@@ -2432,6 +2442,58 @@ describe('persona teardown over the real latch (b.jg5 SRJ-504, SRJ-1002): the ke
     expect(h.startupEntries()).toHaveLength(1)
   })
 
+  // b.jg5 SRJ-1002, SRJ-1003 (hatch A3): as above for an UNUSABLE NAME
+  // latch B's launch in flight sets, and for a destructive modify's old half
+  // (its new half sending notices to another channel): the in-flight latch's
+  // notice is written by the window, reaches neither half's destination, and
+  // the latch is forgotten once the launch settles, so the teardown latches
+  // nothing. Over the real notifier, as main() binds it.
+  test.each<[string, typeof LATCH_CASE_LEFTOVER | 'unusable-name', boolean]>([
+    ['an UNUSABLE NAME latch, B removed', 'unusable-name', false],
+    ['an UNUSABLE NAME latch, a destructive modify\'s old half', 'unusable-name', true],
+    ['a CONFLICT latch, a destructive modify\'s old half', LATCH_CASE_LEFTOVER, true],
+  ])('SRJ-1002, SRJ-1003: %s, set by B\'s launch in flight as it settles during the teardown: one log line and one persona-teardown-notice entry, no Slack call for either half, and once the teardown completes no latch and no episode are left', async (_label, latchKind, destructive) => {
+    const release = Promise.withResolvers<void>()
+    let notice: string | undefined
+    const r = makeLatched({
+      notifier: true,
+      launchInFlight: (latch) =>
+        release.promise.then(() => {
+          const b = r.f.b.key
+          if (latchKind === LATCH_CASE_LEFTOVER) {
+            latch.set(b, LEFTOVER)
+            const record = latch.record(b)!
+            notice = conflictNoticeText({ sessionName: record.sessionName, latchCase: LATCH_CASE_LEFTOVER, description: record.description })
+          } else {
+            latch.set(b, unusableNameSetInput(b, errUnusableName(), LATCH_ROW_STATE_NO_ROW)!)
+            notice = unusableNameNoticeText(b, latch.record(b)!.description)
+          }
+        }),
+    })
+    const h = r.h!
+    const b = r.f.b.key
+    if (destructive) applyNewHalfOf(h, r.f.applied, r.f.b)
+    else h.personas.splice(h.personas.findIndex((p) => p.key === b), 1) // apply step 1: B removed
+
+    const done = r.f.lifecycle.teardown(r.f.b)
+    await flush()
+    expect([r.latch.isLatched(b), h.notifier.teardownWindowState(b)]).toEqual([false, 'open'])
+    release.resolve()
+    await done
+    await flush()
+
+    expect(notice).toBeDefined()
+    expect(r.latch.isLatched(b)).toBe(false)
+    expect(r.latch.record(b)).toBeUndefined()
+    expect(r.episodes.isOpen(b, latchKind === LATCH_CASE_LEFTOVER ? PERSONA_EPISODE_KIND_CONFLICT : PERSONA_EPISODE_KIND_UNUSABLE_RECORDED_NAME)).toBe(false)
+    expect(r.posts).toEqual([{ key: b, text: notice! }])
+    expect(h.startupEntries()).toEqual([teardownNoticeEntry(r.f.b, unescapeSlackControlCharacters(notice!))])
+    expect(h.logs).toEqual([teardownNoticeLine(r.f.b, notice!)])
+    expect(h.stub(b).callLog).toEqual([])
+    expect(h.totalPosts()).toBe(0)
+    expect(r.f.lines.at(-1)).toBe(`${teardownPrefix(r.f.b)}: complete`)
+  })
+
   test('the old half of a destructive modify (B still applied) forgets B\'s latch too: the new half starts unlatched and, meeting the same CONFLICT itself, latches with exactly one post for B', async () => {
     const r = makeLatched()
     const b = r.f.b
@@ -2793,7 +2855,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
       log: (line) => void alertLines.push(line),
       alertThresholdMs: () => 0,
       isConfigured: (key) => f.applied.some((p) => p.key === key),
-      logOnly: (key, text) => recordStartupError(PERSONA_UNCLASSIFIED_ERROR_LABEL, `persona=${key}: ${text}`, undefined, { logDir }),
+      logOnly: (key, text) => recordStartupError(PERSONA_UNCLASSIFIED_ERROR_LABEL, personaUnclassifiedErrorEntryText(key, text), undefined, { logDir }),
     })
     const alerts = createKillFailureAlerts({
       episodes,
@@ -3689,6 +3751,66 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     expect(r.h.clock.pendingCount()).toBe(0)
     expect(r.h.stub(b.key).calls.postMessage).toHaveLength(attempts)
     expect(r.h.posts(r.f.a.key)).toEqual([])
+  })
+
+  // b.jg5 SRJ-1003: the notice the destination hold kept for B before its
+  // teardown is dropped as the window opens (DESTINATION_HOLD_CANCEL_AT_WINDOW_STEP),
+  // nothing awaited in between, so while the teardown waits for B's launch in
+  // flight its retry, come due with B's destination working again, posts
+  // nothing; for a destructive modify's old half it never reaches the new
+  // half's destination. Rows: whether B's key stays applied (the old half).
+  test.each([
+    ['B removed', false],
+    ["B still applied (a destructive modify's old half): nothing reaches the new half's destination", true],
+  ] as const)('b.jg5 SRJ-1003: a notice held for B\'s failing destination before its teardown is never posted while the window is open, nor after (%s)', async (_label, stillApplied) => {
+    const launchInFlight = Promise.withResolvers<void>()
+    const order: string[] = []
+    const r: RealFixture = makeReal({
+      overrides: () => ({
+        destinationHold: {
+          cancel: (key: string) => {
+            order.push(`destinationHold.cancel:${key}`)
+            r.h.hold.cancel(key)
+          },
+        },
+        whenLaunchSettled: (key: string) => {
+          order.push(`whenLaunchSettled:${key}`)
+          return launchInFlight.promise
+        },
+      }),
+    })
+    const b = r.f.b
+    r.h.stub(b.key).script.post.push(...Array<WebApiOutcome>(1000).fill({ kind: 'platform', error: 'not_in_channel' }))
+    await r.h.notifier.notify(b.key, 'a notice for B')
+    expect(r.h.hold.view(b.key)).toMatchObject({ held: true, heldNotices: 1 })
+    const dueAt = r.h.hold.view(b.key).nextDueAt!
+    const attempts = r.h.stub(b.key).calls.postMessage.length
+    const newHalf = stillApplied ? newHalfOfB(r) : undefined
+    if (!stillApplied) removeB(r)
+
+    const done = r.f.lifecycle.teardown(b)
+    await flush()
+    // The window is open and the teardown waits for B's launch; the hold was cancelled before that wait.
+    expect(order).toEqual([`destinationHold.cancel:${b.key}`, `whenLaunchSettled:${b.key}`])
+    expect(r.h.hold.view(b.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
+    r.h.stub(b.key).script.post.length = 0 // B's destination works again
+    await r.h.clock.advance(dueAt - r.h.clock.now() + 1)
+    expect(r.h.stub(b.key).calls.postMessage).toHaveLength(attempts)
+
+    launchInFlight.resolve()
+    await done
+    await r.h.clock.advance(3_600_000)
+
+    expect(order).toEqual([`destinationHold.cancel:${b.key}`, `whenLaunchSettled:${b.key}`, `destinationHold.cancel:${b.key}`])
+    expect(r.h.stub(b.key).calls.postMessage).toHaveLength(attempts)
+    if (newHalf !== undefined) expect(r.h.posts(b.key).filter((post) => post.channel === newHalf.permission_prompts)).toEqual([])
+    expect(r.h.posts(r.f.a.key)).toEqual([])
+    expect(r.h.clock.pendingCount()).toBe(0)
+    expect(r.killClock.pendingCount()).toBe(0)
+    expect(r.f.lines).toEqual(cleanTeardownLines(b, { kind: KILL_OUTCOME_KILLED }))
+    expect(r.f.lines.filter((line) => line.includes(DESTINATION_HOLD_CANCEL_AT_WINDOW_STEP))).toEqual([])
+    expect(r.startupEntries()).toEqual([])
+    assertNoLeak({ lines: r.f.lines, logs: r.h.logs, posts: r.h.allPosts() })
   })
 })
 
@@ -4831,7 +4953,7 @@ describe('persona teardown serialization (SR-6.6)', () => {
       expect(retry.controller.armedKeys()).toEqual([f.a.key])
       expect(retry.clock.pendingCount()).toBe(1)
       const stopped = retry.lines.filter((l) => l.includes(' stopped — '))
-      expect(stopped).toEqual([`[slack] unavailable-retry: persona=${f.b.key} stopped — ${UNAVAILABLE_RETRY_STOP_TORN_DOWN}`])
+      expect(stopped).toEqual([unavailableRetryStoppedLine(f.b.key, false, undefined, UNAVAILABLE_RETRY_STOP_TORN_DOWN)])
     }
 
     const teardownOnly = (f: Fixture) => f.trail.filter((c) => !c.startsWith('restart.'))
@@ -4856,9 +4978,10 @@ describe('persona teardown serialization (SR-6.6)', () => {
       launchGate.resolve(true)
       await done
       const launched = f.trail.indexOf(`restart.launchSession:${f.b.key}`)
-      expect(f.trail.slice(launched + 1, launched + 10)).toEqual([
+      const afterLaunch = [
         ...submitCancels(f.b), ...turnStart(f.b), `stopApprover:${f.b.key}`, `stopLiveRowSequence:${f.b.key}`, `stopRetryTimer:${f.b.key}`,
-      ])
+      ]
+      expect(f.trail.slice(launched + 1, launched + 1 + afterLaunch.length)).toEqual(afterLaunch)
       expect(teardownOnly(f)).toEqual(expectedTeardown(f))
       expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete`)
       expect(isRestartPendingOrActive(f.b.key)).toBe(false)
@@ -4899,7 +5022,8 @@ describe('persona teardown serialization (SR-6.6)', () => {
       // The turn's first step comes right after the retry's work ended (its launch, then the arm).
       const armed = f.trail.indexOf(`restart.retryArmed:${k}`)
       expect(f.trail.indexOf(`restart.launchSession:${k}`)).toBeLessThan(armed)
-      expect(f.trail.slice(armed + 1, armed + 6)).toEqual([...turnStart(f.b), `stopApprover:${k}`, `stopLiveRowSequence:${k}`, `stopRetryTimer:${k}`])
+      const afterArm = [...turnStart(f.b), `stopApprover:${k}`, `stopLiveRowSequence:${k}`, `stopRetryTimer:${k}`]
+      expect(f.trail.slice(armed + 1, armed + 1 + afterArm.length)).toEqual(afterArm)
       expect(teardownOnly(f)).toEqual(
         stillAppliedTeardownTrail(f.b, `${JSON.stringify([f.b.claude_config_dir, undefined])}:[${f.a.key},${k}]`)
           .filter((c) => !c.startsWith('cancelRestartTimer:')),
@@ -4911,7 +5035,7 @@ describe('persona teardown serialization (SR-6.6)', () => {
       expect(retry.controller.isArmed(k)).toBe(false)
       expect(retry.controller.armedKeys()).toEqual([f.a.key])
       expect(retry.clock.pendingCount()).toBe(1)
-      const stoppedB = `[slack] unavailable-retry: persona=${k} stopped — ${UNAVAILABLE_RETRY_STOP_TORN_DOWN}`
+      const stoppedB = unavailableRetryStoppedLine(k, false, undefined, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
       expect(retry.lines.filter((l) => l.includes(' stopped — '))).toEqual([stoppedB, stoppedB])
       expect(retry.lines.filter((l) => l.startsWith(`[slack] unavailable-retry: persona=${k} armed `))).toHaveLength(2)
     })
@@ -4935,10 +5059,11 @@ describe('persona teardown serialization (SR-6.6)', () => {
       const k = f.b.key
       expect(restartOnly(f)).toEqual([`restart.canRestart:${k}`, `restart.submitted:${k}`, `restart.canRestart:${k}`])
       // The submit's registration, its stops and cancel of a launch's wait (b.f2b), then the refused restart work, then B's turn.
-      expect(f.trail.slice(0, 12)).toEqual([
+      const head = [
         `restart.canRestart:${k}`, `restart.submitted:${k}`, ...submitCancels(f.b), `restart.canRestart:${k}`,
         ...turnStart(f.b), `stopApprover:${k}`, `stopLiveRowSequence:${k}`, `stopRetryTimer:${k}`,
-      ])
+      ]
+      expect(f.trail.slice(0, head.length)).toEqual(head)
       expect(teardownOnly(f)).toEqual(expectedTeardown(f))
       expect(isRestartPendingOrActive(k)).toBe(false)
       expectOnlyBRetryStopped(f, retry)

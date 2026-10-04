@@ -43,7 +43,7 @@
  * No module-scope state and no timers: each tracker holds only its own open
  * episode, so trackers for two personas are independent. The connection
  * manager (`persona-connections.ts`) drives it and is the only emitter of these
- * lines for its personas; E5 reuses the convention for directory retries.
+ * lines for its personas; the directory retries use the same convention.
  *
  * SPDX-License-Identifier: MIT
  */

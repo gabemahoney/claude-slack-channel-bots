@@ -19,15 +19,34 @@
  * The module's import boundary is checked by walking its runtime imports
  * through `src/` (`forbiddenServerLoads`, `tests/test-helpers/source-audit.ts`).
  *
- * No process, no timer, no top-level mock.module(), no value import of
+ * The route over every SRJ-1002 context, and the record of a bounded retry
+ * that SRJ-702's stop rule stops (SRJ-702, SRJ-704, SRJ-1013; AC 64), are
+ * checked at the alerts layer too: the server's kill-failure alerts
+ * (`createKillFailureAlerts`) over notice episodes whose sink is the real
+ * persona notifier (`makeNotifierHarness`, one Slack stub per persona, a
+ * zero-post check on every stub), "configured" decided as the server decides
+ * it (the key is in the applied persona set), the log-only route writing
+ * through the real `recordStartupError` into the case's own temp directory,
+ * and each decision made by a real bounded retry (`runKillRetry` on a fake
+ * clock). A launch or recovery attempt's stopped retry is raised through
+ * `raisePersonaKillFailureAlert` (`src/session-manager.ts`), whose stop's
+ * cause comes from the installed keep-going query; that query is removed
+ * after each case. Nothing latches on this layer: no latch is installed.
+ *
+ * No process, no real timer, no top-level mock.module(), no value import of
  * `Client` or `resolveSystemBinary`, no Phase-1-only named import.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
-import { killFailedDescriptionOf } from '../src/ad-error-class.ts'
+import { AD_ERROR_CLASS_UNAVAILABLE, killFailedDescriptionOf } from '../src/ad-error-class.ts'
+import { killOutcomeOf } from '../src/checked-kill.ts'
+import type { Persona } from '../src/config.ts'
 import { NEVER_DELETE_ROW_PHRASE, RETRY_KILL_LATER_PHRASE, survivorPids } from '../src/ad-description-phrases.ts'
 import { CLI_COMMAND_CLEAN_RESTART, CLI_COMMAND_STOP_BOTS, type CliTeardownCommand } from '../src/cli-teardown.ts'
 import {
@@ -77,19 +96,52 @@ import {
   type KillFailureClosing,
   type KillFailureOrdinaryQuotes,
 } from '../src/kill-failure-alert.ts'
-import { KILL_RETRY_ALERT_NONE, KILL_RETRY_ALERT_ORDINARY, KILL_RETRY_ALERT_SURVIVOR, type KillRetryAlert } from '../src/kill-retry.ts'
+import {
+  KILL_RETRY_ALERT_NONE,
+  KILL_RETRY_ALERT_ORDINARY,
+  KILL_RETRY_ALERT_SURVIVOR,
+  KILL_RETRY_END_HOLD_ENDED,
+  KILL_RETRY_END_STOPPED,
+  KILL_RETRY_READ_STATE,
+  KILL_RETRY_SEED_LIVE_UNREAD,
+  killRetryStopped,
+  runKillRetry,
+  type KillRetryAlert,
+  type KillRetryResult,
+} from '../src/kill-retry.ts'
+import { LIVE_ROW_STOP_TEARDOWN, liveRowStopCauseText } from '../src/live-row-sequence.ts'
+import { oldLifeWaitRef } from '../src/old-life-wait.ts'
 import { MAX_LOGGED_MESSAGE_LENGTH, renderLogMessageText } from '../src/persona-connection-errors.ts'
+import { createKillFailureAlerts, createPersonaEpisodes, killFailureStoppedRetryText, type KillFailureAlerts } from '../src/persona-episodes.ts'
 import { personaInstanceId, personaTmuxSessionName } from '../src/persona-identity.ts'
+import { PERSONA_TEARDOWN_NOTICE_LABEL, formatPersonaNotice, personaTeardownNoticeEntryText } from '../src/persona-notifier.ts'
+import {
+  OLD_LIFE_WAIT_STOP_CAUSE_SHUTDOWN,
+  OLD_LIFE_WAIT_STOP_CAUSE_TEARDOWN,
+  PERSONA_KILL_STOP_CAUSE_GENERIC,
+  PERSONA_KILL_STOP_CAUSE_NOT_UP,
+  PERSONA_KILL_STOP_CAUSE_SHUTDOWN,
+  START_SWEEP_KILL_STOP_SHUTDOWN,
+  raisePersonaKillFailureAlert,
+  setPersonaKillKeepGoingQuery,
+  type PersonaKillKeepGoingQuery,
+} from '../src/session-manager.ts'
 import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
+import { recordStartupError } from '../src/startup-errors.ts'
 import {
   KILL_FAILED_DESCRIPTIONS,
   STUB_SURVIVOR_PIDS,
   STUB_TMUX_SESSION_NAME,
+  cannedStatusResult,
   errTmuxKillFailed,
+  errTmuxUnresponsive,
   type KillFailedDescription,
 } from './test-helpers/agent-director-stub.ts'
 import { LAUNCH_START_PRE_PERSONA_KEY } from './test-helpers/conflict-cases.ts'
-import { REDACTED_SENTINEL_TAIL, assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
+import { LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
+import { createFakeClock } from './test-helpers/fake-clock.ts'
+import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
+import { makeNotifierHarness, readStartupEntries, type NotifierHarness, type StartupEntry } from './test-helpers/persona-notifier.ts'
 import { forbiddenServerLoads } from './test-helpers/source-audit.ts'
 
 // ---------------------------------------------------------------------------
@@ -529,7 +581,7 @@ function expectedRoute(version: KillFailureAlertVersion, context: KillFailureAle
     ({ route, destination: false, classLabel: survivor ? PERSONA_KILL_SURVIVOR_LABEL : ordinaryClass, printed, opensEpisode: false, closing, closingSentence: killFailureClosingSentence(version, closing) }) as KillFailureAlertRoute
   if (context === KILL_FAILURE_CONTEXT_START_SWEEP) return logOnly(KILL_FAILURE_ROUTE_START_SWEEP, ORPHAN_CLEANUP_LABEL, KILL_FAILURE_CLOSING_LOG_ONLY)
   if (context === KILL_FAILURE_CONTEXT_CLI_TEARDOWN) return logOnly(KILL_FAILURE_ROUTE_CLI_TEARDOWN, PERSONA_KILL_FAILED_LABEL, KILL_FAILURE_CLOSING_CLI_TEARDOWN, true)
-  if (context === KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN) return logOnly(KILL_FAILURE_ROUTE_PERSONA_TEARDOWN, 'persona-teardown-notice', KILL_FAILURE_CLOSING_LOG_ONLY)
+  if (context === KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN) return logOnly(KILL_FAILURE_ROUTE_PERSONA_TEARDOWN, PERSONA_TEARDOWN_NOTICE_LABEL, KILL_FAILURE_CLOSING_LOG_ONLY)
   if (context === KILL_FAILURE_CONTEXT_OLD_LIFE_WAIT || !configured) return logOnly(KILL_FAILURE_ROUTE_NOT_CONFIGURED, PERSONA_KILL_FAILED_LABEL, KILL_FAILURE_CLOSING_LOG_ONLY)
   const closing = !survivor && latched ? KILL_FAILURE_CLOSING_DESTINATION_LATCHED : KILL_FAILURE_CLOSING_DESTINATION
   return { route: KILL_FAILURE_ROUTE_DESTINATION, destination: true, printed: false, opensEpisode: !survivor, closing, closingSentence: killFailureClosingSentence(version, closing) }
@@ -570,10 +622,325 @@ describe('kill-failure alert: route selection (b.jg5 SRJ-704, SRJ-1013)', () => 
       new Set([KILL_FAILURE_ROUTE_START_SWEEP, KILL_FAILURE_ROUTE_CLI_TEARDOWN, KILL_FAILURE_ROUTE_PERSONA_TEARDOWN, KILL_FAILURE_ROUTE_NOT_CONFIGURED, KILL_FAILURE_ROUTE_DESTINATION]),
     )
     expect(new Set(routes.flatMap((r) => (r.classLabel === undefined ? [] : [r.classLabel])))).toEqual(
-      new Set([ORPHAN_CLEANUP_LABEL, PERSONA_KILL_FAILED_LABEL, 'persona-teardown-notice', PERSONA_KILL_SURVIVOR_LABEL]),
+      new Set([ORPHAN_CLEANUP_LABEL, PERSONA_KILL_FAILED_LABEL, PERSONA_TEARDOWN_NOTICE_LABEL, PERSONA_KILL_SURVIVOR_LABEL]),
     )
     expect(new Set(routes.filter((r) => r.destination).map((r) => r.closing))).toEqual(new Set([KILL_FAILURE_CLOSING_DESTINATION, KILL_FAILURE_CLOSING_DESTINATION_LATCHED]))
     expect(routes.filter((r) => r.printed).map((r) => r.route)).toEqual(routes.filter((r) => r.route === KILL_FAILURE_ROUTE_CLI_TEARDOWN).map((r) => r.route))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The alerts layer: every SRJ-1002 context, and a stopped retry's record
+// (SRJ-702, SRJ-704, SRJ-1002, SRJ-1013; AC 64)
+// ---------------------------------------------------------------------------
+
+/** Every closing sentence of either version: none may appear in a stopped retry's entry, which carries no alert text. */
+const ALL_CLOSING_SENTENCES: readonly string[] = VERSIONS.flatMap((version) => CLOSINGS.map((closing) => killFailureClosingSentence(version, closing)))
+
+/** The head of every kill-retry line the alerts-layer cases' bounded retries write. */
+const RETRY_PREFIX = '[slack] kill-failure-alert-test'
+
+/** A row state that is live: the stub's default `status` row. */
+const LIVE_STATE = cannedStatusResult().state
+
+/** An ErrTmuxUnresponsive at a kill, a fake token in its description. */
+const unresponsiveAtKill = (): Error => errTmuxUnresponsive('kill', `tmux did not answer (${sentinelInMessage('alerts-unresponsive')})`)
+
+/** An ErrTmuxKillFailed naming no survivor, a fake token in its quoted session. */
+const plainKillFailedAtKill = (): Error => errTmuxKillFailed(sentinelInMessage('alerts-kill-failed'), 'outlived-exit-wait')
+
+/** The survivor-naming ErrTmuxKillFailed, a fake token in its quoted session. */
+const survivorKillFailedAtKill = (): Error => errTmuxKillFailed(sentinelInMessage('alerts-survivor'), 'pane-process-survived')
+
+/**
+ * One bounded retry of `instanceId`'s kill on a fake clock: each try answers
+ * the next of `answers` (the last repeating), each read between tries reads
+ * the row live. Answers its result once it settles, no timer left pending.
+ */
+async function retryOnClock(
+  instanceId: string,
+  answers: readonly Error[],
+  extra: { readonly keepGoing?: () => boolean; readonly holdEnded?: () => boolean } = {},
+): Promise<KillRetryResult> {
+  const clock = createFakeClock()
+  let tries = 0
+  const work = runKillRetry({
+    instanceId,
+    kill: async () => killOutcomeOf({ thrown: answers[Math.min(tries++, answers.length - 1)] }),
+    read: async () => ({ kind: KILL_RETRY_READ_STATE, state: LIVE_STATE }),
+    wait: clock,
+    lastRead: KILL_RETRY_SEED_LIVE_UNREAD,
+    ...(extra.keepGoing === undefined ? {} : { keepGoing: extra.keepGoing }),
+    ...(extra.holdEnded === undefined ? {} : { holdEnded: extra.holdEnded }),
+    log: (line) => {
+      assertNoLeak(line)
+    },
+    logPrefix: RETRY_PREFIX,
+  })
+  let settled = false
+  void work.then(() => {
+    settled = true
+  })
+  for (let step = 0; step < 10 && !settled; step++) {
+    await clock.flush()
+    if (!settled && clock.pendingCount() > 0) await clock.runNext()
+  }
+  const result = await work
+  expect(clock.pendingCount()).toBe(0)
+  return result
+}
+
+/**
+ * A bounded retry stopped between tries (SRJ-702), each decision its stop
+ * can leave: the `none` decision (an ErrTmuxUnresponsive stop with no
+ * survivor-naming failure), the ordinary decision quoting an
+ * ErrTmuxKillFailed naming no survivor, and the ordinary decision quoting an
+ * earlier survivor-naming ErrTmuxKillFailed. Each row: its label, the retry,
+ * the decision's kind and the survivor-naming error quoted, if any.
+ */
+const STOPPED_RETRIES: ReadonlyArray<readonly [string, (id: string) => Promise<KillRetryResult>, KillRetryAlert['kind'], (() => Error) | undefined]> = [
+  ['an ErrTmuxUnresponsive try, then the stop, no survivor-naming failure (the none decision)', (id) => retryOnClock(id, [unresponsiveAtKill()], { keepGoing: () => false }), KILL_RETRY_ALERT_NONE, undefined],
+  ['an ErrTmuxKillFailed naming no survivor, then the stop (ordinary)', (id) => retryOnClock(id, [plainKillFailedAtKill()], { keepGoing: () => false }), KILL_RETRY_ALERT_ORDINARY, undefined],
+  ['a survivor-naming ErrTmuxKillFailed, an ErrTmuxUnresponsive try, then the stop (ordinary, quoting the earlier survivor-naming description)', (id) => {
+    let asks = 0
+    return retryOnClock(id, [survivorKillFailedAtKill(), unresponsiveAtKill()], { keepGoing: () => ++asks <= 2 })
+  }, KILL_RETRY_ALERT_ORDINARY, survivorKillFailedAtKill],
+]
+
+describe('kill-failure alert: the alerts layer over every SRJ-1002 context, and a stopped retry\'s record (b.jg5 SRJ-702, SRJ-704, SRJ-1002, SRJ-1013; AC 64)', () => {
+  let baseDir: string
+  let logDir: string
+  let h: NotifierHarness
+  /** A persona of the applied configuration. */
+  let kept: Persona
+  /** A persona an apply removed from it. */
+  let removed: Persona
+  /** The alerts' `[slack]` lines. */
+  let lines: string[]
+  let alerts: KillFailureAlerts
+
+  beforeEach(() => {
+    baseDir = mkdtempSync(join(tmpdir(), 'cscb-kill-failure-alert-'))
+    logDir = join(baseDir, 'state')
+    const config = makeMultiPersonaConfig([{ name: 'Kilo Alerts' }, { name: 'Romeo Alerts' }], baseDir)
+    ;[kept, removed] = config.personas as [Persona, Persona]
+    h = makeNotifierHarness(config, { leakMarker: LEAK_SENTINEL })
+    h.personas.splice(h.personas.findIndex((p) => p.key === removed.key), 1) // an apply removed it
+    lines = []
+    const episodes = createPersonaEpisodes({
+      sink: (key, text, options) => h.notifier.notify(key, text, options),
+      log: (line) => lines.push(line),
+      clock: h.clock,
+      teardownWindow: (key) => h.notifier.teardownWindowState(key),
+    })
+    // As main() builds them: configured is "in the applied persona set now",
+    // and the log-only route is recordStartupError (here into logDir).
+    alerts = createKillFailureAlerts({
+      episodes,
+      log: (line) => lines.push(line),
+      isConfigured: (key) => h.personas.some((p) => p.key === key),
+      logOnly: (classLabel, entry) => recordStartupError(classLabel, entry, undefined, { logDir, omitStderr: true }),
+    })
+  })
+
+  afterEach(() => {
+    try {
+      assertNoLeak({ lines, logs: h.logs, slack: h.allPosts(), entries: readStartupEntries(logDir), notifierEntries: h.startupEntries() })
+    } finally {
+      setPersonaKillKeepGoingQuery(undefined)
+      h.hold.cancelAll()
+      h.cleanup()
+      rmSync(baseDir, { recursive: true, force: true })
+    }
+  })
+
+  /** The entries the log-only route wrote. */
+  const entries = (): StartupEntry[] => readStartupEntries(logDir)
+
+  /** Nothing reached Slack through any persona's client, and the notifier wrote no entry of its own. */
+  async function expectNoSlack(): Promise<void> {
+    await h.clock.flush()
+    expect(h.totalPosts()).toBe(0)
+    expect(h.startupEntries()).toEqual([])
+  }
+
+  /** What `decision` says for `key`'s own row. */
+  function contentFor(key: string, decision: KillRetryAlert): KillFailureAlertContent {
+    const content = killFailureAlertContentOf(decision, personaTmuxSessionName(key), personaInstanceId(key))
+    if (content === undefined) throw new Error('precondition: the decision calls for an alert')
+    return content
+  }
+
+  /** `entry` carries no alert text: no closing sentence of either version. */
+  function expectNoAlertText(entry: StartupEntry): void {
+    expect(ALL_CLOSING_SENTENCES.filter((sentence) => entry.text.includes(sentence))).toEqual([])
+  }
+
+  // b.jg5 SRJ-704, SRJ-1002, SRJ-1013: the start sweep, a CLI teardown, a
+  // persona teardown, an old-life wait's kill and a persona no longer in the
+  // applied configuration reach the log and one entry of their class, never a
+  // destination; only an applied persona outside those contexts gets its
+  // destination. Each case raises for the applied persona and the removed one
+  // beside it.
+  test.each(KILL_FAILURE_CONTEXTS.flatMap((context) => VERSIONS.map((version) => [context, version] as const)))(
+    'context %s, %s version: the applied persona and the removed one each take SRJ-704\'s route; a log-only route writes one entry of its class and posts nothing, a destination posts once through the persona\'s own client',
+    async (context, version) => {
+      const decision: KillRetryAlert =
+        version === KILL_FAILURE_VERSION_SURVIVOR
+          ? { kind: KILL_RETRY_ALERT_SURVIVOR, survivorDescription: survivorDescription() }
+          : { kind: KILL_RETRY_ALERT_ORDINARY, lastKillFailedDescription: stubDescription('outlived-exit-wait') }
+
+      const expectedEntries: StartupEntry[] = []
+      for (const persona of [kept, removed]) {
+        const route = expectedRoute(version, context, persona === kept, false)
+        expect([persona.key, alerts.raise({ key: persona.key, decision, latched: false, context })]).toEqual([persona.key, route.destination ? 'posted' : 'logged'])
+        if (route.destination) continue
+        const ref = `persona=${persona.key}`
+        const text = killFailureAlertText(contentFor(persona.key, decision), route.closing, false)
+        expectedEntries.push({
+          classLabel: route.classLabel!,
+          text: route.classLabel === PERSONA_TEARDOWN_NOTICE_LABEL ? personaTeardownNoticeEntryText(ref, text) : killFailureAlertEntryText(ref, context, text),
+        })
+      }
+      await h.clock.flush()
+
+      const keptRoute = expectedRoute(version, context, true, false)
+      expect(h.posts(kept.key)).toEqual(
+        keptRoute.destination
+          ? [{ channel: kept.permission_prompts, text: formatPersonaNotice(kept, killFailureAlertText(contentFor(kept.key, decision), keptRoute.closing, true)) }]
+          : [],
+      )
+      expect(h.posts(removed.key)).toEqual([])
+      expect(entries()).toEqual(expectedEntries)
+      expect(h.startupEntries()).toEqual([])
+      expect([alerts.isOpen(removed.key), alerts.isOpen(kept.key)]).toEqual([false, keptRoute.opensEpisode])
+    },
+  )
+
+  // b.jg5 SRJ-702, SRJ-704, SRJ-1003: a launch or recovery attempt's kill
+  // tries stopped between tries post nothing and raise neither version,
+  // whatever their decision (`none` included). An applied persona's stop, by
+  // its teardown, by its stopping being up or by a server shutdown, writes
+  // the one line only, quoting the survivor-naming description when a try
+  // returned one, and no startup-errors entry; a persona removed during the
+  // tries gets that line and one persona-kill-failed entry with no alert
+  // text, never persona-teardown-notice.
+  const STOP_CAUSES: ReadonlyArray<readonly [string, PersonaKillKeepGoingQuery | undefined, string | undefined, string]> = [
+    ['its teardown (the live-row sequence names its own stop)', undefined, liveRowStopCauseText(LIVE_ROW_STOP_TEARDOWN), liveRowStopCauseText(LIVE_ROW_STOP_TEARDOWN)],
+    ['its stopping being up', { isShuttingDown: () => false, isPersonaUp: () => false }, undefined, PERSONA_KILL_STOP_CAUSE_NOT_UP],
+    ['a server shutdown', { isShuttingDown: () => true, isPersonaUp: () => true }, undefined, PERSONA_KILL_STOP_CAUSE_SHUTDOWN],
+    ['a cause the server cannot tell (no keep-going query)', undefined, undefined, PERSONA_KILL_STOP_CAUSE_GENERIC],
+  ]
+
+  test.each(
+    ([KILL_FAILURE_CONTEXT_RECOVERY, KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT] as const).flatMap((context) =>
+      STOP_CAUSES.flatMap(([causeLabel, query, given, cause]) =>
+        STOPPED_RETRIES.map(([retryLabel, retry, kind, survivor]) => [context, causeLabel, retryLabel, query, given, cause, retry, kind, survivor] as const),
+      ),
+    ),
+  )('a %s kill stopped by %s, after %s: the applied persona gets the one line only, the removed one that line and one persona-kill-failed entry with no alert text; nothing posted, no episode', async (context, _causeLabel, _retryLabel, query, given, cause, retry, kind, survivor) => {
+    setPersonaKillKeepGoingQuery(query)
+    const stoppedTexts: string[] = []
+    for (const persona of [kept, removed]) {
+      const retried = await retry(personaInstanceId(persona.key))
+      expect([retried.end, retried.alert.kind, killRetryStopped(retried)]).toEqual([KILL_RETRY_END_STOPPED, kind, true])
+      raisePersonaKillFailureAlert(persona.key, retried, 'kill-failure-alert-test', `persona=${persona.key}`, context, alerts, given)
+      const stopped = killFailureStoppedRetryText({ key: persona.key, decision: retried.alert, context, lastOutcomeClass: AD_ERROR_CLASS_UNAVAILABLE, stopCause: cause })
+      if (survivor !== undefined) expect(stopped.line).toContain(JSON.stringify(renderLogMessageText(killFailedDescriptionOf(survivor())!)))
+      stoppedTexts.push(stopped.line, stopped.entry)
+    }
+    const [keptLine, , removedLine, removedEntry] = stoppedTexts
+
+    expect(lines[0]).toBe(keptLine)
+    expect(lines[1]).toBe(removedLine)
+    expect(lines).toHaveLength(3) // the removed persona's entry-written line
+    expect(lines[2]).toContain(PERSONA_KILL_FAILED_LABEL)
+    expect(entries()).toEqual([{ classLabel: PERSONA_KILL_FAILED_LABEL, text: removedEntry }])
+    expectNoAlertText(entries()[0]!)
+    expect(lines.filter((line) => line.includes(PERSONA_TEARDOWN_NOTICE_LABEL))).toEqual([])
+    await expectNoSlack()
+    expect([alerts.isOpen(kept.key), alerts.isOpen(removed.key)]).toEqual([false, false])
+  })
+
+  // b.jg5 SRJ-702, SRJ-811: an old-life wait's kill stopped at a server
+  // shutdown or at the teardown of the last persona waiting on it: the old
+  // key's persona-kill-failed entry naming the wait's reference, with no
+  // alert text; nothing posted. The context's route is always the log-only
+  // one, so an old key still applied (a destructive modify's old half) gets
+  // its entry too.
+  test.each(
+    [OLD_LIFE_WAIT_STOP_CAUSE_SHUTDOWN, OLD_LIFE_WAIT_STOP_CAUSE_TEARDOWN].flatMap((cause) =>
+      STOPPED_RETRIES.map(([retryLabel, retry, kind]) => [cause, retryLabel, retry, kind] as const),
+    ),
+  )('an old-life wait\'s kill stopped (%s), after %s: each old key\'s persona-kill-failed entry with no alert text; answers stopped, nothing posted', async (cause, _retryLabel, retry, kind) => {
+    const expected: StartupEntry[] = []
+    for (const persona of [kept, removed]) {
+      const instanceId = personaInstanceId(persona.key)
+      const ref = oldLifeWaitRef(instanceId, persona.key)
+      const retried = await retry(instanceId)
+      expect(retried.alert.kind).toBe(kind)
+      const input = { key: persona.key, decision: retried.alert, latched: false, context: KILL_FAILURE_CONTEXT_OLD_LIFE_WAIT, instanceId, ref, stopped: true, lastOutcomeClass: AD_ERROR_CLASS_UNAVAILABLE, stopCause: cause } as const
+
+      expect(alerts.raise(input)).toBe('stopped')
+      expected.push({ classLabel: PERSONA_KILL_FAILED_LABEL, text: killFailureStoppedRetryText(input).entry })
+    }
+
+    expect(entries()).toEqual(expected)
+    for (const entry of entries()) expectNoAlertText(entry)
+    await expectNoSlack()
+  })
+
+  // b.jg5 SRJ-702, SRJ-714: a start-sweep kill stopped at a shutdown, raised
+  // here: its orphan-cleanup entry naming the row, with no alert text.
+  test.each(STOPPED_RETRIES)('a start-sweep kill stopped at a shutdown, after %s: one orphan-cleanup entry naming the row, with no alert text; answers stopped, nothing posted', async (_label, retry, kind) => {
+    const instanceId = personaInstanceId(kept.key)
+    const retried = await retry(instanceId)
+    expect(retried.alert.kind).toBe(kind)
+    const input = { key: kept.key, decision: retried.alert, latched: false, context: KILL_FAILURE_CONTEXT_START_SWEEP, ref: `instanceId=${instanceId}`, stopped: true, lastOutcomeClass: AD_ERROR_CLASS_UNAVAILABLE, stopCause: START_SWEEP_KILL_STOP_SHUTDOWN } as const
+
+    expect(alerts.raise(input)).toBe('stopped')
+
+    expect(entries()).toEqual([{ classLabel: ORPHAN_CLEANUP_LABEL, text: killFailureStoppedRetryText(input).entry }])
+    expectNoAlertText(entries()[0]!)
+    await expectNoSlack()
+  })
+
+  // The control (b.jg5 SRJ-702, SRJ-811): an old-life wait's kill whose hold
+  // ends between tries is no stop. Its tries end as a success, so no
+  // persona-kill-failed entry is written; after a survivor-naming failure the
+  // survivor version takes the old key's route (persona-kill-survivor), and
+  // with none nothing is raised.
+  test.each<[string, () => Error, string | undefined]>([
+    ['a survivor-naming ErrTmuxKillFailed: the survivor version, one persona-kill-survivor entry', survivorKillFailedAtKill, PERSONA_KILL_SURVIVOR_LABEL],
+    ['an ErrTmuxUnresponsive: no alert, no entry', unresponsiveAtKill, undefined],
+  ])('control: an old-life wait\'s hold ends after a first try answering %s; never a persona-kill-failed entry, nothing posted', async (_label, first, classLabel) => {
+    const instanceId = personaInstanceId(removed.key)
+    const ref = oldLifeWaitRef(instanceId, removed.key)
+    let tried = false
+    const retried = await retryOnClock(instanceId, [first(), plainKillFailedAtKill()], {
+      holdEnded: () => tried,
+      keepGoing: () => {
+        tried = true
+        return true
+      },
+    })
+    expect([retried.end, killRetryStopped(retried)]).toEqual([KILL_RETRY_END_HOLD_ENDED, false])
+
+    const result = alerts.raise({ key: removed.key, decision: retried.alert, latched: false, context: KILL_FAILURE_CONTEXT_OLD_LIFE_WAIT, instanceId, ref, stopped: retried.end === KILL_RETRY_END_STOPPED })
+
+    if (classLabel === undefined) {
+      expect([result, retried.alert.kind]).toEqual(['none', KILL_RETRY_ALERT_NONE])
+      expect(entries()).toEqual([])
+      expect(lines).toEqual([])
+    } else {
+      expect(result).toBe('logged')
+      const route = expectedRoute(KILL_FAILURE_VERSION_SURVIVOR, KILL_FAILURE_CONTEXT_OLD_LIFE_WAIT, false, false)
+      expect(route.classLabel).toBe(classLabel)
+      const text = killFailureAlertText(contentFor(removed.key, retried.alert), route.closing, false)
+      expect(entries()).toEqual([{ classLabel, text: killFailureAlertEntryText(ref, KILL_FAILURE_CONTEXT_OLD_LIFE_WAIT, text) }])
+    }
+    expect(entries().filter((entry) => entry.classLabel === PERSONA_KILL_FAILED_LABEL)).toEqual([])
+    await expectNoSlack()
   })
 })
 

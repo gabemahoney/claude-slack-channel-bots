@@ -320,6 +320,7 @@ import {
   KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN,
   KILL_FAILURE_CONTEXT_START_SWEEP,
   KILL_FAILURE_VERSION_ORDINARY,
+  KILL_FAILURE_VERSION_SURVIVOR,
   PERSONA_KILL_FAILED_LABEL,
   PERSONA_KILL_SURVIVOR_LABEL,
   describeKillFailureDescriptions,
@@ -437,7 +438,8 @@ export const PERSONA_EPISODE_KIND_INVALID_FLAGS_HOLD = 'invalid-flags-hold'
  * launch or recovery attempt until a retry finds nothing left to recover or,
  * pending-only, reads the row live out of `pending`, the persona reaches the
  * restart cap or is torn down. Posted by its episodes
- * (`createUnclassifiedErrorEpisodes`, below); a latch's end is E13's.
+ * (`createUnclassifiedErrorEpisodes`, below); a latch ends it through the
+ * latch's holds (`src/conflict-latch.ts`).
  */
 export const PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR = 'unclassified-error'
 
@@ -979,7 +981,7 @@ export interface TmuxUnresponsiveConditionDeps {
    */
   healthCheckOn?: () => boolean
   /**
-   * The alert threshold in effect, in milliseconds (production: E6's
+   * The alert threshold in effect, in milliseconds (production:
    * `adAlertThresholdMsInEffect`), read at the arm and at every check.
    * Absent: no alert check is armed.
    */
@@ -1058,6 +1060,66 @@ export interface TmuxUnresponsiveCondition extends TmuxUnresponsiveSink {
    * the check), false and no line.
    */
   cancelAlert(key: string, stopReason?: string): boolean
+}
+
+/**
+ * A `tmux-unresponsive` line (b.jg5 SRJ-307 to SRJ-310, SRJ-1014): the
+ * persona reference, the condition and `text`. Pure.
+ *
+ *   [slack] persona-episodes: persona=<key> tmux-unresponsive <text>
+ */
+export function tmuxUnresponsiveLine(key: string, text: string): string {
+  return `[slack] persona-episodes: persona=${key} ${PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE} ${text}`
+}
+
+/**
+ * The start line: `<verb> failed: <description>`, `description` the refusing
+ * verb's error as `describeAgentDirectorFailure` renders it (redacted; the
+ * caller describes it, so no raw error reaches the builder). Pure.
+ */
+export function tmuxUnresponsiveStartedLine(key: string, verb: string, description: string): string {
+  return tmuxUnresponsiveLine(key, `started — ${verb} failed: ${description}`)
+}
+
+/**
+ * The onset line, `muted` when the key's submitted teardown kept it from its
+ * destination, `where` `a health tick` or `a retry`, `sinceFirstS` whole
+ * seconds since the first refusal. Pure.
+ */
+export function tmuxUnresponsiveOnsetLine(key: string, muted: boolean, where: string, sinceFirstS: number): string {
+  const what = muted ? `onset not posted — ${MUTED_BY_TEARDOWN}; it counts as posted in its episode;` : 'onset posted —'
+  return tmuxUnresponsiveLine(key, `${what} still not answering at ${where}, ${sinceFirstS} s after its first refusal`)
+}
+
+/** The onset held back because the episode's alert already posted (b.jg5 SRJ-308). */
+export const TMUX_UNRESPONSIVE_ONSET_HELD_BY_ALERT = 'onset not posted — its alert already posted'
+
+/** The onset held back because a stop of the retry timer holds it (b.jg5 SRJ-308). */
+export const TMUX_UNRESPONSIVE_ONSET_HELD_BY_STOP = 'onset not posted — its retry timer stopped and no refusal has re-armed it'
+
+/**
+ * The alert line, `muted` as for the onset, `forS` whole seconds not
+ * answering, `thresholdS` the threshold in whole seconds. Pure.
+ */
+export function tmuxUnresponsiveAlertLine(key: string, muted: boolean, forS: number, thresholdS: number): string {
+  return tmuxUnresponsiveLine(
+    key,
+    `${muted ? `alert not posted — ${MUTED_BY_TEARDOWN}; it counts as posted in its episode;` : 'alert posted —'} ` +
+      `not answering for ${forS} s, over its alert threshold of ${thresholdS} s`,
+  )
+}
+
+/** The alert check's cancel line (b.jg5 SRJ-309), naming the retry timer's stop reason. Pure. */
+export function tmuxUnresponsiveAlertCheckCancelledLine(key: string, stopReason: string): string {
+  return tmuxUnresponsiveLine(key, `alert check cancelled — its retry timer stopped: ${stopReason}`)
+}
+
+/** The alert check armed again after a cancel (b.jg5 SRJ-309). */
+export const TMUX_UNRESPONSIVE_ALERT_CHECK_ARMED_AGAIN = 'alert check armed again — a new refusal armed its retry timer again'
+
+/** The end line, naming the end reason's text (an unknown reason as `an unnamed reason`). Pure. */
+export function tmuxUnresponsiveEndedLine(key: string, reason: unknown): string {
+  return tmuxUnresponsiveLine(key, `ended — ${endText(reason)}`)
 }
 
 /**
@@ -1158,7 +1220,7 @@ export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionD
     if (current === undefined || rearmable.get(key) !== current.episode) return
     rearmable.delete(key)
     if (alerts.has(key) || current.posted.includes(ALERT_MARK)) return
-    if (armAlert(key)) line(key, 'alert check armed again — a new refusal armed its retry timer again')
+    if (armAlert(key)) line(key, TMUX_UNRESPONSIVE_ALERT_CHECK_ARMED_AGAIN)
   }
 
   /**
@@ -1196,12 +1258,7 @@ export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionD
       if (thresholdMs === undefined) return
       const muted = episodes.teardownWindowState(key) === 'submitted'
       if (!episodes.post(key, kind, tmuxUnresponsiveAlertText(key, thresholdMs), ALERT_MARK)) return
-      line(
-        key,
-        `${muted ? `alert not posted — ${MUTED_BY_TEARDOWN}; it counts as posted in its episode;` : 'alert posted —'} ` +
-          `not answering for ${seconds(episodes.clock.now() - current.startedAt)} s, ` +
-          `over its alert threshold of ${seconds(thresholdMs)} s`,
-      )
+      safeLog(deps.log, tmuxUnresponsiveAlertLine(key, muted, seconds(episodes.clock.now() - current.startedAt), seconds(thresholdMs)))
     } catch (err) {
       line(key, `alert check failed: ${describeThrownValue(err)}`)
     }
@@ -1221,19 +1278,18 @@ export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionD
     if (current.posted.includes(ALERT_MARK)) {
       if (onsetHeld.get(key) === current.episode) return
       onsetHeld.set(key, current.episode)
-      line(key, 'onset not posted — its alert already posted')
+      line(key, TMUX_UNRESPONSIVE_ONSET_HELD_BY_ALERT)
       return
     }
     if (timerStopped.get(key)?.episode === current.episode) {
       if (onsetHeldStopped.get(key) === current.episode) return
       onsetHeldStopped.set(key, current.episode)
-      line(key, 'onset not posted — its retry timer stopped and no refusal has re-armed it')
+      line(key, TMUX_UNRESPONSIVE_ONSET_HELD_BY_STOP)
       return
     }
     const muted = episodes.teardownWindowState(key) === 'submitted'
     if (!episodes.post(key, kind, tmuxUnresponsiveOnsetText(key), ONSET_MARK)) return
-    const what = muted ? `onset not posted — ${MUTED_BY_TEARDOWN}; it counts as posted in its episode;` : 'onset posted —'
-    line(key, `${what} still not answering at ${where}, ${seconds(now - current.startedAt)} s after its first refusal`)
+    safeLog(deps.log, tmuxUnresponsiveOnsetLine(key, muted, where, seconds(now - current.startedAt)))
   }
 
   return {
@@ -1245,7 +1301,7 @@ export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionD
         return 'continued'
       }
       if (episodes.begin(key, kind) === 'closed') return 'closed'
-      line(key, `started — ${verb} failed: ${describeAgentDirectorFailure(error)}`)
+      safeLog(deps.log, tmuxUnresponsiveStartedLine(key, verb, describeAgentDirectorFailure(error)))
       const episode = episodes.view(key, kind)?.episode
       if (episode !== undefined) episodes.whenClosed(key, kind, () => dropMarks(key, episode))
       armAlert(key)
@@ -1265,7 +1321,7 @@ export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionD
       const muted = episodes.teardownWindowState(key) === 'submitted'
       const recovered = noticePosted && !silent && episodes.post(key, kind, tmuxUnresponsiveRecoveryText(key), RECOVERY_MARK)
       episodes.end(key, kind)
-      line(key, `ended — ${endText(reason)}`)
+      safeLog(deps.log, tmuxUnresponsiveEndedLine(key, reason))
       if (recovered) line(key, muted ? `recovery not posted — ${MUTED_BY_TEARDOWN}` : 'recovery posted')
       else if (noticePosted && silent) line(key, 'recovery not posted — a silent end (a CONFLICT answer ended it)')
       try {
@@ -1316,7 +1372,7 @@ export function createTmuxUnresponsiveCondition(deps: TmuxUnresponsiveConditionD
         if (terminal && rearmable.get(key) === episode) rearmable.delete(key)
         if (!cancelPendingAlert(key, episode)) return false
         if (!terminal) rearmable.set(key, episode)
-        if (stopReason !== undefined) line(key, `alert check cancelled — its retry timer stopped: ${stopReason}`)
+        if (stopReason !== undefined) safeLog(deps.log, tmuxUnresponsiveAlertCheckCancelledLine(key, stopReason))
         return true
       } catch (err) {
         line(key, `alert check cancel failed: ${describeThrownValue(err)}`)
@@ -1348,6 +1404,18 @@ function endText(reason: unknown): string {
  * binds the episode's log-only route to `recordStartupError` with it.
  */
 export const PERSONA_UNCLASSIFIED_ERROR_LABEL = 'persona-unclassified-error'
+
+/**
+ * The `persona-unclassified-error` entry text of an unclassified-error alert
+ * for persona `key`, no longer in the applied configuration (b.jg5 SRJ-313,
+ * SRJ-1013): `persona=<key>: <text>`, `text` the alert's unescaped text the
+ * episode's log-only route is given. `main()` binds that route to
+ * `recordStartupError` with `PERSONA_UNCLASSIFIED_ERROR_LABEL` and this text.
+ * Pure.
+ */
+export function personaUnclassifiedErrorEntryText(key: string, text: string): string {
+  return `persona=${key}: ${text}`
+}
 
 /** End reason: a retry of the persona's timer found nothing left to recover (b.jg5 SRJ-313). */
 export const UNCLASSIFIED_ERROR_END_RECOVERED = 'a retry found nothing left to recover'
@@ -1468,8 +1536,20 @@ export interface UnclassifiedErrorEpisodesDeps {
   episodes: PersonaEpisodes
   /** Receives the episode's `[slack]` lines (the server log). A throwing log is swallowed. */
   log: (line: string) => void
-  /** The alert threshold in effect, in milliseconds (production: E6's `adAlertThresholdMsInEffect`), read at each check. */
+  /** The alert threshold in effect, in milliseconds (production: `adAlertThresholdMsInEffect`), read at each check. */
   alertThresholdMs: () => number
+  /**
+   * The reference each line names a key by; absent, `persona=<key>`. The
+   * old-life wait's episodes, keyed by a held instance id, pass
+   * `instanceId=<id>` (b.jg5 SRJ-1007).
+   */
+  ref?: (key: string) => string
+  /**
+   * Why a key takes the log-only route, in the alert's line; absent,
+   * {@link UNCLASSIFIED_NOT_CONFIGURED_WORDING}. The old-life wait's episodes
+   * pass that the row is an old life the server is ending.
+   */
+  notConfiguredWording?: string
   /**
    * Whether the persona is in the applied configuration, read when the alert
    * is posted: true, the alert goes to the episodes' sink (the persona's
@@ -1529,6 +1609,9 @@ export interface UnclassifiedErrorEpisodes extends UnclassifiedErrorSink {
 /** The unclassified-error alert's mark in its episode. */
 const UNCLASSIFIED_ALERT_MARK = 'alert'
 
+/** Why a key takes the unclassified-error alert's log-only route, in its line, unless the episodes are given their own wording. */
+export const UNCLASSIFIED_NOT_CONFIGURED_WORDING = 'the persona is not in the applied configuration'
+
 /**
  * Build one server's unclassified-error episodes over `deps.episodes` (b.jg5
  * SRJ-313); see the module comment. No timer, no agent-director call; nothing
@@ -1543,9 +1626,20 @@ export function createUnclassifiedErrorEpisodes(deps: UnclassifiedErrorEpisodesD
    * episode closes, by an end, `forget`, `forgetAll` or `close`.
    */
   const alerted = new Map<string, number>()
+  const notConfigured = deps.notConfiguredWording ?? UNCLASSIFIED_NOT_CONFIGURED_WORDING
 
   function line(key: string, text: string): void {
-    safeLog(deps.log, `[slack] persona-episodes: persona=${key} ${kind} ${text}`)
+    safeLog(deps.log, `[slack] persona-episodes: ${refOf(key)} ${kind} ${text}`)
+  }
+
+  /** The line's reference for `key`: the `ref` hook's, else `persona=<key>`; a throwing hook gives the default. */
+  function refOf(key: string): string {
+    if (deps.ref === undefined) return `persona=${key}`
+    try {
+      return deps.ref(key)
+    } catch {
+      return `persona=${key}`
+    }
   }
 
   /** The configured-key lookup; absent reads as configured, a throw as not configured (logged). */
@@ -1587,7 +1681,7 @@ export function createUnclassifiedErrorEpisodes(deps: UnclassifiedErrorEpisodesD
     }
     const text = unclassifiedErrorAlertText(classification, { escapeForSlack: false })
     if (deps.logOnly === undefined) {
-      line(key, `alert not routed — the persona is not in the applied configuration and no log-only route is installed; ${met}`)
+      line(key, `alert not routed — ${notConfigured} and no log-only route is installed; ${met}`)
       return
     }
     try {
@@ -1597,7 +1691,7 @@ export function createUnclassifiedErrorEpisodes(deps: UnclassifiedErrorEpisodesD
       line(key, `log-only alert failed: ${describeThrownValue(err)}`)
       return
     }
-    line(key, `alert written to the server log and startup-errors.log (${PERSONA_UNCLASSIFIED_ERROR_LABEL}) — the persona is not in the applied configuration; ${met}`)
+    line(key, `alert written to the server log and startup-errors.log (${PERSONA_UNCLASSIFIED_ERROR_LABEL}) — ${notConfigured}; ${met}`)
   }
 
   function end(key: string, reason: UnclassifiedErrorEndReason): boolean {
@@ -1717,7 +1811,7 @@ export type KillFailureEndReason = typeof KILL_FAILURE_END_ROW_FINISHED | typeof
  *   - `not-routed`: a log-only route with no log-only sink installed, or one
  *     that threw (one line says so);
  *   - `closed`: after the episodes' `close` (shutdown), nothing is posted;
- *   - `stopped`: an ordinary decision whose tries were stopped
+ *   - `stopped`: an ordinary or `none` decision whose tries were stopped
  *     (`KillFailureRaiseInput.stopped`): one line, nothing posted and no
  *     episode; for a persona no longer configured, also one
  *     `persona-kill-failed` entry with no alert text;
@@ -1744,7 +1838,7 @@ export interface KillFailureRaiseInput {
    * True when the retry's tries were stopped by its keep-going check while
    * the persona was not latched (it is torn down or not up, or the server is
    * shutting down), or the last outcome's version re-check decided that the
-   * server stops. A stopped ordinary decision is no notice (b.jg5 SRJ-702,
+   * server stops. A stopped decision, `ordinary` or `none`, is no notice (b.jg5 SRJ-702,
    * SRJ-1003, SRJ-1013), inside a teardown window or not: neither version is
    * raised, nothing is posted and no episode is read or changed; one line
    * names the persona, the context, the last outcome's class
@@ -1820,7 +1914,7 @@ export interface KillFailureAlertsDeps {
 export interface KillFailureAlerts {
   /**
    * Raise the alert the retry's decision calls for (b.jg5 SRJ-704). An
-   * ordinary decision with `stopped` is decided first, before every route
+   * ordinary or `none` decision with `stopped` is decided first, before every route
    * below, the teardown window's included: one line, and for a persona no
    * longer configured one `persona-kill-failed` entry with no alert text
    * (SRJ-702); it answers `stopped`. While the
@@ -1951,7 +2045,7 @@ export function createKillFailureAlerts(deps: KillFailureAlertsDeps): KillFailur
   }
 
   /**
-   * An ordinary decision whose tries SRJ-702's stop rule stopped (b.jg5
+   * An ordinary or `none` decision whose tries SRJ-702's stop rule stopped (b.jg5
    * SRJ-702, SRJ-704, SRJ-1003, SRJ-1013): no notice, whether or not the
    * key's teardown window is open. Nothing is posted, no episode is read or
    * changed and no alert text is written: one line naming the persona, the
@@ -1989,6 +2083,12 @@ export function createKillFailureAlerts(deps: KillFailureAlertsDeps): KillFailur
 
   function raise(input: KillFailureRaiseInput): KillFailureRaiseResult {
     const { key, context } = input
+    // b.jg5 SRJ-702, SRJ-1003: a retry whose tries were stopped is no notice,
+    // inside a teardown window or not, whatever its decision (`ordinary`, or
+    // `none` for a stop with no `ErrTmuxKillFailed` standing and no
+    // survivor-naming failure): it is decided before every route. A stopped
+    // retry never ends in a success, so it never carries the survivor version.
+    if (input.stopped === true && input.decision.kind !== KILL_FAILURE_VERSION_SURVIVOR) return raiseStopped(input)
     const content = killFailureAlertContentOf(
       input.decision,
       input.session ?? personaTmuxSessionName(key),
@@ -1996,9 +2096,6 @@ export function createKillFailureAlerts(deps: KillFailureAlertsDeps): KillFailur
     )
     if (content === undefined) return 'none'
     const { version } = content
-    // b.jg5 SRJ-702, SRJ-1003: a retry whose tries were stopped is no notice,
-    // inside a teardown window or not: it is decided before every route.
-    if (version === KILL_FAILURE_VERSION_ORDINARY && input.stopped === true) return raiseStopped(input)
     // b.jg5 SRJ-704: a start-sweep or CLI teardown kill matches first.
     if (
       context !== KILL_FAILURE_CONTEXT_START_SWEEP &&

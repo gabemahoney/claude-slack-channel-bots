@@ -1196,13 +1196,18 @@ import {
   createUnclassifiedErrorEpisodes,
   killFailureStoppedRetryText,
   PERSONA_EPISODE_KIND_KILL_FAILURE,
-  PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE,
   PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR,
   PERSONA_UNCLASSIFIED_ERROR_LABEL,
+  personaUnclassifiedErrorEntryText,
   TMUX_UNRESPONSIVE_END_LATCHED,
   TMUX_UNRESPONSIVE_END_RETRY,
   TMUX_UNRESPONSIVE_END_TEXT,
   TMUX_UNRESPONSIVE_END_TICK,
+  tmuxUnresponsiveAlertLine,
+  tmuxUnresponsiveEndedLine,
+  tmuxUnresponsiveLine,
+  tmuxUnresponsiveOnsetLine,
+  tmuxUnresponsiveStartedLine,
   UNCLASSIFIED_ERROR_END_CAPPED,
   UNCLASSIFIED_ERROR_END_LATCHED,
   type KillFailureEndReason,
@@ -1212,7 +1217,7 @@ import {
   type TmuxUnresponsiveEndResult,
   type UnclassifiedErrorEndReason,
 } from '../../src/persona-episodes.ts'
-import { PERSONA_KEY_RE, personaInstanceId, personaSpawnEnv, personaTmuxSessionName } from '../../src/persona-identity.ts'
+import { personaInstanceId, personaSpawnEnv, personaTmuxSessionName } from '../../src/persona-identity.ts'
 import { createPersonaRouting, type PersonaRouting } from '../../src/persona-routing.ts'
 import { createPersonaSerializer, type PersonaSerialize, type PersonaSerializer } from '../../src/persona-serializer.ts'
 import { createPersonaRelaunchGate, createPersonaUpPredicate, type PersonaUpQuery } from '../../src/persona-start.ts'
@@ -1331,6 +1336,8 @@ import {
   RETIRED_KEYS_LOG_PREFIX,
   RETIRED_KEYS_UNCHANGED,
   RETIRED_KEYS_WRITTEN,
+  retiredKeysCannotClearLine,
+  retiredKeysClearedLine,
   type OldLifeHold,
   type OldLifeHoldBegin,
   type OldLifeHoldSet,
@@ -1341,6 +1348,7 @@ import {
 } from '../../src/retired-keys.ts'
 import { createSlowRecoveryTracker, type SlowRecoveryTracker } from '../../src/slow-recovery.ts'
 import { recordStartupError } from '../../src/startup-errors.ts'
+import { errnoSuffix } from '../../src/persona-credentials.ts'
 import {
   createFullModeRetryAction,
   createUnavailableRetryController,
@@ -1362,6 +1370,8 @@ import {
   UNAVAILABLE_RETRY_STOP_LATCHED,
   UNAVAILABLE_RETRY_STOP_SHUTDOWN,
   UNAVAILABLE_RETRY_STOP_TORN_DOWN,
+  unavailableRetryReArmedLine,
+  unavailableRetryStoppedLine,
   type RetryRunGateDeps,
   type UnavailableRetryAction,
   type UnavailableRetryConditionEndResult,
@@ -2335,7 +2345,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     log,
     alertThresholdMs: adAlertThresholdMsInEffect,
     isConfigured: (key) => applied.has(key),
-    logOnly: (key, text) => recordStartupError(PERSONA_UNCLASSIFIED_ERROR_LABEL, `persona=${key}: ${text}`),
+    logOnly: (key, text) => recordStartupError(PERSONA_UNCLASSIFIED_ERROR_LABEL, personaUnclassifiedErrorEntryText(key, text)),
   })
   // As main() builds it (b.jg5 SRJ-610, SRJ-1010, SRJ-1016): the one
   // slow-recovery tracker over the same episodes instance, so its count and
@@ -3824,12 +3834,11 @@ export function personaRow(h: RecoveryHarness, key: string, overrides: PersonaGe
   return cannedGetResult(overrides, personaOf(h, key), h.home)
 }
 
-/** How the retired-key store's lines name key `key`: `persona=<key>`, the key JSON-quoted unless it is a persona key. */
-function retiredKeyRef(key: string): string {
-  return `persona=${PERSONA_KEY_RE.test(key) ? key : JSON.stringify(key)}`
-}
-
-/** How the retired-key store's clear lines name the read that cleared (b.jg5 SRJ-807): the state it read and the site's `<site>: <what>`. */
+/**
+ * How the retired-key store's clear lines name the read that cleared (b.jg5
+ * SRJ-807): the state it read and the site's `<site>: <what>`, as the session
+ * manager words it inline (no exported builder).
+ */
 function retiredClearReadText(state: string, at: Pick<OwnRowReadSite, 'site' | 'what'>): string {
   return `its row read ${state} with its mark set (${at.site}: ${at.what})`
 }
@@ -3839,18 +3848,18 @@ function retiredClearReadText(state: string, at: Pick<OwnRowReadSite, 'site' | '
  * the record at `path`, on its row read `state` at `at` (b.jg5 SRJ-807).
  */
 export function retiredEntryClearedLine(path: string, key: string, state: string, at: Pick<OwnRowReadSite, 'site' | 'what'>): string {
-  return `${RETIRED_KEYS_LOG_PREFIX} ${retiredKeyRef(key)} entry cleared from ${JSON.stringify(path)} on ${retiredClearReadText(state, at)} (b.jg5 SRJ-807)`
+  return retiredKeysClearedLine(key, JSON.stringify(path), retiredClearReadText(state, at), '')
 }
 
 /**
  * The retired-key store's one line for that clear when its write was refused
- * before it touched the file (`failRetiredKeyWrites`): the entry stays.
+ * before it touched the file (`failRetiredKeyWrites`): the entry stays. The
+ * failed write's detail is its errno (`errnoSuffix`) and the store's own
+ * "the file is unchanged" (no exported builder).
  */
 export function retiredEntryClearFailedLine(path: string, key: string, state: string, at: Pick<OwnRowReadSite, 'site' | 'what'>): string {
-  return (
-    `${RETIRED_KEYS_LOG_PREFIX} cannot clear ${retiredKeyRef(key)} from ${JSON.stringify(path)} on ${retiredClearReadText(state, at)} ` +
-    `(${RECOVERY_RETIRED_KEY_WRITE_FAILURE_CODE}); the file is unchanged; the entry stays, and the next qualifying read clears it again (b.jg5 SRJ-807)`
-  )
+  const detail = `${errnoSuffix({ code: RECOVERY_RETIRED_KEY_WRITE_FAILURE_CODE })}; the file is unchanged`
+  return retiredKeysCannotClearLine(key, JSON.stringify(path), retiredClearReadText(state, at), detail)
 }
 
 /** The retired-key store's lines among `lines`, in order. */
@@ -3915,24 +3924,19 @@ export interface ReArmedModes {
   readonly switchedTo?: UnavailableRetryMode
 }
 
-/** The retry timer's line for a retry answered `again`: its reason and the next wait, after `refusals` refusals. */
+/** The retry timer's line for a retry answered `again` (`unavailableRetryReArmedLine`): its reason and the next wait, after `refusals` refusals. */
 export function reArmedLine(key: string, retry: number, reason: string, refusals: number, modes: ReArmedModes = {}): string {
-  const ran = modes.ranPendingOnly === true ? ` (${UNAVAILABLE_RETRY_MODE_PENDING_ONLY})` : ''
-  const switched = modes.switchedTo !== undefined ? ` in ${modes.switchedTo} mode` : ''
-  return `[slack] unavailable-retry: persona=${key} retry ${retry}${ran}: ${reason} — re-armed${switched}, next retry in ${retryWaitMs(refusals) / 1000} s`
+  return unavailableRetryReArmedLine(key, retry, modes.ranPendingOnly === true, reason, modes.switchedTo, retryWaitMs(refusals))
 }
 
-/** The retry timer's line for a stopped timer; `tags` are the parenthesised mode and row, when the stop names them. */
-export function stoppedLine(key: string, reason: string, ...tags: string[]): string {
-  const tagged = tags.length > 0 ? ` (${tags.join(', ')})` : ''
-  return `[slack] unavailable-retry: persona=${key} stopped${tagged} — ${reason}`
+/** The retry timer's line for a stopped full-mode timer (`unavailableRetryStoppedLine`). */
+export function stoppedLine(key: string, reason: string): string {
+  return unavailableRetryStoppedLine(key, false, undefined, reason)
 }
 
-/** The stopped line of a pending-only timer, naming the row its retry read when given. */
+/** The stopped line of a pending-only timer (`unavailableRetryStoppedLine`), naming the row its retry read when given. */
 export function pendingOnlyStoppedLine(key: string, reason: string, row?: string): string {
-  return row === undefined
-    ? stoppedLine(key, reason, UNAVAILABLE_RETRY_MODE_PENDING_ONLY)
-    : stoppedLine(key, reason, UNAVAILABLE_RETRY_MODE_PENDING_ONLY, `row ${row}`)
+  return unavailableRetryStoppedLine(key, true, row, reason)
 }
 
 /** The retry timer's lines for persona `key` in `h.lines`, in order. */
@@ -4639,13 +4643,14 @@ export async function driveToB(h: RecoveryHarness, row: PendingRowModel): Promis
   await h.drive(h.settle())
 }
 
-// The `tmux-unresponsive` condition's log lines (SRJ-307 to SRJ-310). The
-// lines have no exported builder, so these hold their fixed words; a case
-// gives the seconds from its clock and the threshold in effect.
+// The `tmux-unresponsive` condition's log lines (SRJ-307 to SRJ-310), through
+// src/persona-episodes.ts's builders; a case gives the seconds from its clock
+// and the threshold in effect. The recovery and silent-end lines have no
+// builder of their own: their words are held here, after the builders' prefix.
 
-/** The prefix of every line persona `key`'s condition logs. */
+/** The prefix of every line persona `key`'s condition logs (`tmuxUnresponsiveLine`). */
 export function conditionLinePrefix(key: string): string {
-  return `[slack] persona-episodes: persona=${key} ${PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE} `
+  return tmuxUnresponsiveLine(key, '')
 }
 
 /** Persona `key`'s condition lines, in order. */
@@ -4655,12 +4660,16 @@ export function conditionLines(h: RecoveryHarness, key: string): string[] {
 
 /** Persona `key`'s condition started lines. */
 export function conditionStartedLines(h: RecoveryHarness, key: string): string[] {
-  return conditionLines(h, key).filter((line) => line.startsWith(`${conditionLinePrefix(key)}started`))
+  const hole = '\u0000'
+  const head = tmuxUnresponsiveStartedLine(key, hole, '').split(hole)[0]!
+  return conditionLines(h, key).filter((line) => line.startsWith(head))
 }
 
 /** Persona `key`'s condition ended lines. */
 export function conditionEndedLines(h: RecoveryHarness, key: string): string[] {
-  return conditionLines(h, key).filter((line) => line.startsWith(`${conditionLinePrefix(key)}ended`))
+  const ended = tmuxUnresponsiveEndedLine(key, TMUX_UNRESPONSIVE_END_TICK)
+  const head = ended.slice(0, ended.length - TMUX_UNRESPONSIVE_END_TEXT[TMUX_UNRESPONSIVE_END_TICK].length)
+  return conditionLines(h, key).filter((line) => line.startsWith(head))
 }
 
 /** Whole seconds, rounded down, of `ms`: how the lines give a span. */
@@ -4670,27 +4679,27 @@ function wholeSeconds(ms: number): number {
 
 /** The onset's line: posted at `where`, `sinceMs` after the first refusal. */
 export function conditionOnsetLine(key: string, where: 'a health tick' | 'a retry', sinceMs: number): string {
-  return `${conditionLinePrefix(key)}onset posted — still not answering at ${where}, ${wholeSeconds(sinceMs)} s after its first refusal`
+  return tmuxUnresponsiveOnsetLine(key, false, where, wholeSeconds(sinceMs))
 }
 
 /** The alert's line: posted `lastedMs` after the first refusal, over `thresholdMs`. */
 export function conditionAlertLine(key: string, lastedMs: number, thresholdMs: number): string {
-  return `${conditionLinePrefix(key)}alert posted — not answering for ${wholeSeconds(lastedMs)} s, over its alert threshold of ${wholeSeconds(thresholdMs)} s`
+  return tmuxUnresponsiveAlertLine(key, false, wholeSeconds(lastedMs), wholeSeconds(thresholdMs))
 }
 
 /** The ended line for `reason`. */
 export function conditionEndedLine(key: string, reason: TmuxUnresponsiveEndReason): string {
-  return `${conditionLinePrefix(key)}ended — ${TMUX_UNRESPONSIVE_END_TEXT[reason]}`
+  return tmuxUnresponsiveEndedLine(key, reason)
 }
 
 /** The recovery's line, after the ended line. */
 export function conditionRecoveryLine(key: string): string {
-  return `${conditionLinePrefix(key)}recovery posted`
+  return tmuxUnresponsiveLine(key, 'recovery posted')
 }
 
 /** A silent end's line after an onset, after the ended line. */
 export function conditionSilentEndLine(key: string): string {
-  return `${conditionLinePrefix(key)}recovery not posted — a silent end (a CONFLICT answer ended it)`
+  return tmuxUnresponsiveLine(key, 'recovery not posted — a silent end (a CONFLICT answer ended it)')
 }
 
 // The unclassified-error episodes' log lines (b.jg5 SRJ-313, SRJ-1009). As

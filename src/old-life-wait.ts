@@ -158,6 +158,13 @@ export interface OldLifeWaitAnswers {
   readonly unclassified?: unknown
   /** The round's last kill's bounded retry result; absent when it made no kill. */
   readonly lastKill?: KillRetryResult
+  /**
+   * The class (by name, through `src/ad-error-class.ts`) of the last answer
+   * that failed a `get` or a `find-missing` run of the round; absent when
+   * none failed. Names the class in the end line of a round a failed `get`
+   * or run ended (an ENVIRONMENT `get` included).
+   */
+  readonly failedCallClass?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -188,7 +195,7 @@ export const OLD_LIFE_WAIT_END_ENVIRONMENT = 'environment'
 export const OLD_LIFE_WAIT_END_CONFIG = 'config'
 /** An UNCLASSIFIED answer. */
 export const OLD_LIFE_WAIT_END_UNCLASSIFIED = 'unclassified'
-/** A `get` or a run failed. */
+/** A `get` or a run failed with an answer of no class above. */
 export const OLD_LIFE_WAIT_END_CALL_FAILED = 'call-failed'
 /** A dependency failed. */
 export const OLD_LIFE_WAIT_END_INTERNAL_ERROR = 'internal-error'
@@ -309,10 +316,27 @@ export function decideOldLifeWaitEnd(input: OldLifeWaitEndInput): OldLifeWaitEnd
       return kept(OLD_LIFE_WAIT_END_CONFIG)
     case LIVE_ROW_OUTCOME_READ_REFUSED:
     case LIVE_ROW_OUTCOME_RUN_REFUSED:
-      return kept(notices.length > 0 ? OLD_LIFE_WAIT_END_REFUSED : OLD_LIFE_WAIT_END_CALL_FAILED)
+      return kept(notices.length > 0 ? OLD_LIFE_WAIT_END_REFUSED : endKindOfFailedCall(answers.failedCallClass))
     default:
       // A dependency's failure, or an end the no-launch form never reaches.
       return kept(OLD_LIFE_WAIT_END_INTERNAL_ERROR)
+  }
+}
+
+/**
+ * The end kind of a round a failed `get` or run ended, by the failing
+ * answer's class: UNAVAILABLE, ENVIRONMENT, CONFIG or UNCLASSIFIED by name,
+ * as an abort's is; any other class, or none recorded, a failed call.
+ */
+function endKindOfFailedCall(errorClass: string | undefined): OldLifeWaitEndKind {
+  switch (errorClass) {
+    case AD_ERROR_CLASS_UNAVAILABLE:
+    case AD_ERROR_CLASS_ENVIRONMENT:
+    case AD_ERROR_CLASS_CONFIG:
+    case AD_ERROR_CLASS_UNCLASSIFIED:
+      return endKindOfClass(errorClass)
+    default:
+      return OLD_LIFE_WAIT_END_CALL_FAILED
   }
 }
 
@@ -396,7 +420,7 @@ function describeEnd(kind: OldLifeWaitEndKind): string {
     case OLD_LIFE_WAIT_END_UNAVAILABLE:
       return 'an UNAVAILABLE answer'
     case OLD_LIFE_WAIT_END_ENVIRONMENT:
-      return 'an ENVIRONMENT answer'
+      return 'an ENVIRONMENT answer (tmux-unavailable is raised for the waiting personas)'
     case OLD_LIFE_WAIT_END_CONFIG:
       return 'a CONFIG answer, or no kill of a row last read pending while agent-director refuses its config file'
     case OLD_LIFE_WAIT_END_UNCLASSIFIED:

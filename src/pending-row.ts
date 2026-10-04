@@ -148,7 +148,7 @@ import {
   AD_ERROR_CLASS_UNAVAILABLE,
   AD_ERROR_CLASS_UNUSABLE_NAME,
   classifyAdError,
-  describeAgentDirectorFailure,
+  describeAdFailureForLog,
   hasAdErrorName,
   type AdErrorClass,
 } from './ad-error-class.ts'
@@ -1028,7 +1028,7 @@ export const PENDING_ROW_LAP_ENTER_NOT_SENT_LATCHED: PendingRowLapEnterLatched =
  */
 export function pendingRowLapEnterFailureOf(value: unknown): PendingRowLapEnterFailure {
   const { errorClass } = classifyAdError(value)
-  const description = describeAgentDirectorFailure(value)
+  const description = describeAdFailureForLog(value)
   if (errorClass === AD_ERROR_CLASS_GONE) return { kind: PENDING_ROW_LAP_ENTER_GONE, errorClass, description }
   if (hasAdErrorName(value, ERR_SPAWN_NOT_FOUND_NAME)) return { kind: PENDING_ROW_LAP_ENTER_ABSENT, errorClass, description }
   if (hasAdErrorName(value, ERR_SPAWN_NOT_INTERACTIVE_NAME)) {
@@ -1675,7 +1675,7 @@ function describeRuleGet(get: PendingRowRuleGet): string {
     case PENDING_ROW_GET_LATCHED:
       return 'get: the persona latched'
     case PENDING_ROW_GET_REFUSED:
-      return `get failed (${describeAgentDirectorFailure(get.error)})`
+      return `get failed (${describeAdFailureForLog(get.error)})`
   }
 }
 

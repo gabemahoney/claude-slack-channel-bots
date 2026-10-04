@@ -22,14 +22,17 @@
  * onset (SRJ-1018); the unusable-name post for each fault (SRJ-1019); the
  * launch-start-not-recorded post (SRJ-1020); the re-bound socket's onset and
  * the all-clear (SRJ-1021); and, under SRJ-1001 (whose rules hold for every
- * server notice), the persona prefix and every outage onset. The teardown
+ * server notice), the persona prefix, every outage onset and the
+ * spawn-failure notice. The teardown
  * window's notices (SRJ-1003) are the kill outcome's one-line renderings.
  * agent-director's words come from the stub's descriptions; a fake token
  * (`sentinelInMessage`) rides in every quoted description that can carry one.
  *
  * Checks: each entry's text names no `clear-latch` term (the case title names
  * the SRJ id, the builder and the variant); every rendered text passes
- * `assertNoLeak`; the completeness guard holds every id from SRJ-1003 to
+ * `assertNoLeak`; every Slack notice that quotes agent-director's description
+ * (`SLACK_QUOTING_NOTICES`) escapes Slack's control characters in it exactly
+ * once; the completeness guard holds every id from SRJ-1003 to
  * SRJ-1021 either in the catalogue or in `NOT_APPLICABLE` with its reason,
  * never both; and the finder's self-check shows it finds each term, so the
  * checks are not vacuous.
@@ -134,6 +137,7 @@ import {
   tmuxUnresponsiveAlertText,
   tmuxUnresponsiveOnsetText,
   tmuxUnresponsiveRecoveryText,
+  personaUnclassifiedErrorEntryText,
   unclassifiedErrorAlertText,
 } from '../src/persona-episodes.ts'
 import { personaInstanceId, personaTmuxSessionName } from '../src/persona-identity.ts'
@@ -146,6 +150,7 @@ import {
   type PersonaTeardownNoticeOccasion,
 } from '../src/persona-notifier.ts'
 import { retiredKeysUnreadableMessage } from '../src/retired-keys.ts'
+import { spawnFailureNoticeText } from '../src/session-manager.ts'
 import { REDACTED_TOKEN_PLACEHOLDER } from '../src/slack-log-redaction.ts'
 import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import { slowRecoveryText } from '../src/slow-recovery.ts'
@@ -480,7 +485,7 @@ function startupErrorEntries(): NoticeEntry[] {
       ),
     ),
     entry('SRJ-1013', 'unclassifiedErrorAlertText', 'persona-unclassified-error', () =>
-      `persona=${KEY}: ${unclassifiedErrorAlertText(unclassifiedQuote(), { escapeForSlack: false })}`,
+      personaUnclassifiedErrorEntryText(KEY, unclassifiedErrorAlertText(unclassifiedQuote(), { escapeForSlack: false })),
     ),
     ...([CLI_COMMAND_STOP_BOTS, CLI_COMMAND_CLEAN_RESTART] as const).map((command) =>
       entry('SRJ-1013', 'teardownFailureLine', `cli-teardown-failed, ${command}`, () =>
@@ -561,6 +566,9 @@ function commonEntries(): NoticeEntry[] {
     entry('SRJ-1001', 'ALL_CLEAR_TEMPLATE', 'all-clear listing every class', () =>
       ALL_CLEAR_TEMPLATE(new Map<OutageClass, ClassRecord>(OUTAGE_CLASS_ORDER.map((outage) => [outage, {} as ClassRecord]))),
     ),
+    entry('SRJ-1001', 'spawnFailureNoticeText', 'token-bearing description', () =>
+      spawnFailureNoticeText(errGeneric('spawn', 'ErrTmuxSessionCreate', withToken('tmux new-session failed', 'spawn-failure'))),
+    ),
   ]
 }
 
@@ -597,6 +605,25 @@ const NOT_APPLICABLE: Readonly<Partial<Record<NoticeSrj, string>>> = Object.free
 
 /** Every id the completeness guard covers: SRJ-1003 to SRJ-1021. */
 const GUARDED_IDS: readonly NoticeSrj[] = Array.from({ length: 21 - 3 + 1 }, (_, i) => `SRJ-10${String(3 + i).padStart(2, '0')}` as NoticeSrj)
+
+/** A description of agent-director's holding each of Slack's control characters, a broadcast and a mention among them. */
+const SLACK_MARKUP_DESCRIPTION = 'quoted <!channel> & <@U0MENTION> end'
+
+/**
+ * Every Slack-bound notice that quotes agent-director's description, each
+ * rendering `description` in its Slack form (SRJ-1001): the escaping audit's
+ * table.
+ */
+const SLACK_QUOTING_NOTICES: readonly (readonly [title: string, render: (description: string) => string])[] = [
+  ['SRJ-1004 conflictNoticeText', (description) =>
+    conflictNoticeText({ sessionName: personaTmuxSessionName(KEY), latchCase: LATCH_CASE_LEFTOVER as ConflictLatchCase, description })],
+  ['SRJ-1007 killFailureAlertText (Slack)', (description) =>
+    killFailureAlertText(ordinaryContent(personaInstanceId(KEY), { lastKillFailedDescription: description }), KILL_FAILURE_CLOSING_DESTINATION, true)],
+  ['SRJ-1009 unclassifiedErrorAlertText (Slack)', (description) => unclassifiedErrorAlertText(classifyAdError(errGeneric('spawn', 'ErrFromALaterBinary', description)))],
+  ['SRJ-1018 adConfigMalformedOnset', (description) => adConfigMalformedOnset(errUnknownErrorName('ErrConfigMalformed', description))],
+  ['SRJ-1019 unusableNameNoticeText', (description) => unusableNameNoticeText(KEY, description)],
+  ['SRJ-1001 spawnFailureNoticeText', (description) => spawnFailureNoticeText(errGeneric('spawn', 'ErrTmuxSessionCreate', description))],
+]
 
 /** `<SRJ id> <builder>: <variant>`, for case titles. */
 function titleOf(e: NoticeEntry): string {
@@ -647,6 +674,7 @@ describe('SRJ-511 (AC 47): no SRJ-10xx notice names clear-latch', () => {
     // Not vacuous: the fake tokens reach every builder that quotes agent-director, as its redaction placeholder.
     const redacted = [REDACTED_TOKEN_PLACEHOLDER, escapeSlackControlCharacters(REDACTED_TOKEN_PLACEHOLDER)]
     expect([...new Set(texts.filter(([, text]) => redacted.some((r) => text.includes(r))).map(([e]) => e.srj))].sort()).toEqual([
+      'SRJ-1001',
       'SRJ-1003',
       'SRJ-1004',
       'SRJ-1007',
@@ -655,6 +683,23 @@ describe('SRJ-511 (AC 47): no SRJ-10xx notice names clear-latch', () => {
       'SRJ-1018',
       'SRJ-1019',
     ])
+  })
+})
+
+describe('SRJ-1001: a Slack notice quoting agent-director escapes its description exactly once', () => {
+  test.each(SLACK_QUOTING_NOTICES)('%s', (_title, render) => {
+    const text = render(SLACK_MARKUP_DESCRIPTION)
+    const escaped = escapeSlackControlCharacters(SLACK_MARKUP_DESCRIPTION)
+    expect(text.split(escaped)).toHaveLength(2)
+    expect(text).not.toContain('<!channel>')
+    expect(text).not.toContain('<@U0MENTION>')
+    expect(text).not.toContain(escapeSlackControlCharacters(escaped))
+  })
+
+  test('self-check: the description is escaped to entities, and escaping it twice gives a different text', () => {
+    const escaped = escapeSlackControlCharacters(SLACK_MARKUP_DESCRIPTION)
+    expect(escaped).toBe('quoted &lt;!channel&gt; &amp; &lt;@U0MENTION&gt; end')
+    expect(escapeSlackControlCharacters(escaped)).not.toBe(escaped)
   })
 })
 

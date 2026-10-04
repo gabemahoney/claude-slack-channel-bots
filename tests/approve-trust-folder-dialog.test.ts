@@ -155,6 +155,7 @@ import {
   approverAbsentMessage,
   approverBoundMessage,
   approverCapMessage,
+  approverFailedMessage,
   approverConflictMessage,
   approverFinishedMessage,
   approverGoneMessage,
@@ -231,6 +232,7 @@ import {
   pendingRowRuleApproverStopGatedLine,
   pendingRowRuleApproverStopGateFailedWhy,
   pendingRowRuleApproverStopLine,
+  pendingRowRuleApproverStopNotInstalledLine,
   setPendingRowRule,
   setConfiguredPersonaQuery,
   setConflictLatch,
@@ -290,7 +292,7 @@ import {
   type ConflictLatchRecord,
   type ConflictLatchSetEvent,
 } from '../src/conflict-latch.ts'
-import { describeAgentDirectorFailure } from '../src/ad-error-class.ts'
+import { describeAdFailureForLog } from '../src/ad-error-class.ts'
 import type { Phase1StatusResult } from '../src/ad-phase1-types.ts'
 import {
   AD_SETTING_INTEGER_MAX,
@@ -351,7 +353,7 @@ import {
   NO_LAUNCH_START_FORMS,
   type ConflictCaseRow,
 } from './test-helpers/conflict-cases.ts'
-import { writeAgentDirectorConfig, type AdConfigTables } from './test-helpers/ad-settings.ts'
+import { settingsLinesOtherThanValues, writeAgentDirectorConfig, type AdConfigTables } from './test-helpers/ad-settings.ts'
 import { assertNoLeak, LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
@@ -598,7 +600,7 @@ afterEach(() => {
     expect(retryArms.filter((arm) => !ANY_CONTEXT_CAUSES.has(arm.kind))).toEqual([])
     expect(conditionStarts).toEqual([])
     expect(unclassifiedReports).toEqual([])
-    expect(settingsLines).toEqual([])
+    expect(settingsLinesOtherThanValues(settingsLines, settingsHome)).toEqual([])
     assertNoLeak(leakCheck)
   } finally {
     _resetApproverClock()
@@ -1201,7 +1203,7 @@ describe('approvePreSessionDialogs: B, measured from the launch start and never 
     expect(clock.now()).toBe(startMs + boundMs)
     expect(statusAt).toEqual(evenTimes(startMs, SLOW, boundMs / SLOW))
     expect(calls.readPaneCalls).toEqual([])
-    const refused = approverLogLine(approverStatusRefusedMessage(PLAIN.ref, describeAgentDirectorFailure(err)))
+    const refused = approverLogLine(approverStatusRefusedMessage(PLAIN.ref, describeAdFailureForLog(err)))
     const message = approverBoundMessage(PLAIN.ref, boundMs, APPROVER_BOUND_FROM_APPROVER_START)
     expect(approverLines()).toEqual([...statusAt.map(() => refused), approverLogLine(message)])
     expect(startupEntries()).toEqual([{ label: STARTUP_ERROR_APPROVE_NOT_READY, message }])
@@ -1370,7 +1372,7 @@ describe('approvePreSessionDialogs: each answer by class, one case per cell (b.j
 
   /** The one line a refused call that keeps the approver polling gives. */
   function pollingOnLine(verb: ApproverVerb, err: Error): string {
-    const failure = describeAgentDirectorFailure(err)
+    const failure = describeAdFailureForLog(err)
     return approverLogLine(
       verb === 'status' ? approverStatusRefusedMessage(PLAIN.ref, failure) : approverPaneCallFailedMessage(PLAIN.ref, verb, failure),
     )
@@ -1407,7 +1409,7 @@ describe('approvePreSessionDialogs: each answer by class, one case per cell (b.j
     expect(await approve(PLAIN, true)).toBe(APPROVER_STOP_GONE)
 
     expectStoppedAtFirstLap(verb)
-    expect(approverLines()).toEqual([approverLogLine(approverGoneMessage(PLAIN.ref, verb, describeAgentDirectorFailure(err)))])
+    expect(approverLines()).toEqual([approverLogLine(approverGoneMessage(PLAIN.ref, verb, describeAdFailureForLog(err)))])
     expect(startupEntries()).toEqual([])
     expect(outageNotices).toEqual([])
     expect(retryArms).toEqual([])
@@ -1432,7 +1434,7 @@ describe('approvePreSessionDialogs: each answer by class, one case per cell (b.j
 
       expectStoppedAtFirstLap(verb)
       expect(approverLines()).toEqual([
-        approverLogLine(approverNotInteractiveMessage(PLAIN.ref, verb, describeAgentDirectorFailure(err))),
+        approverLogLine(approverNotInteractiveMessage(PLAIN.ref, verb, describeAdFailureForLog(err))),
       ])
       expect(startupEntries()).toEqual([])
       expect(retryArms).toEqual([])
@@ -1449,7 +1451,7 @@ describe('approvePreSessionDialogs: each answer by class, one case per cell (b.j
 
       expectStoppedAtFirstLap(verb)
       expect(approverLines()).toEqual([
-        approverLogLine(approverTmuxUnavailableMessage(PLAIN.ref, verb, describeAgentDirectorFailure(err))),
+        approverLogLine(approverTmuxUnavailableMessage(PLAIN.ref, verb, describeAdFailureForLog(err))),
       ])
       expect([...getOutageFlags(PLAIN.key)]).toEqual([TMUX_UNAVAILABLE])
       expect(outageNotices).toEqual([{ key: PLAIN.key, text: ONSET_TEMPLATES[TMUX_UNAVAILABLE]() }])
@@ -1475,7 +1477,7 @@ describe('approvePreSessionDialogs: each answer by class, one case per cell (b.j
       const lines = approverLines()
       expect(lines).toHaveLength(1)
       expectLineAroundOutcome(lines[0], (outcome) =>
-        approverConflictMessage(NAMED.ref, verb, describeAgentDirectorFailure(err), outcome),
+        approverConflictMessage(NAMED.ref, verb, describeAdFailureForLog(err), outcome),
       )
       expect(startupEntries()).toEqual([])
       expect(retryArms).toEqual([])
@@ -1499,7 +1501,7 @@ describe('approvePreSessionDialogs: each answer by class, one case per cell (b.j
       expect(latch.record(NAMED.key)).toEqual(row.record(NAMED.key))
       const lines = approverLines()
       expect(lines).toHaveLength(1)
-      const failure = describeAgentDirectorFailure(err)
+      const failure = describeAdFailureForLog(err)
       if (verb === 'status') {
         // The shared own-row read latched it and wrote its own line.
         expect(lines[0]!.startsWith(`${APPROVER_LOG_PREFIX}${APPROVER_STATUS_READ_WHAT} for ${NAMED.ref}: ${failure}`)).toBe(true)
@@ -2258,7 +2260,7 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
     const lines = approverLines()
     expect(lines).toHaveLength(1)
     expectLineAroundOutcome(lines[0], (outcome) =>
-      approverConflictMessage(PLAIN.ref, 'read-pane', describeAgentDirectorFailure(row.build()), outcome),
+      approverConflictMessage(PLAIN.ref, 'read-pane', describeAdFailureForLog(row.build()), outcome),
     )
   })
 
@@ -2335,7 +2337,7 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
       const lines = approverLines()
       expect(lines).toHaveLength(2)
       expect(lines[0]).toBe(approverLogLine(approverStopRequestedMessage(PLAIN.ref, reason)))
-      expectLineAroundOutcome(lines[1], (outcome) => line(describeAgentDirectorFailure(err), outcome))
+      expectLineAroundOutcome(lines[1], (outcome) => line(describeAdFailureForLog(err), outcome))
     },
   )
 
@@ -2451,7 +2453,7 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
       expect(dialogApproverLaunchStart(PLAIN.key)).toBe(LAUNCH_START_MS)
 
       expect(await runUntilStopped(PLAIN)).toEqual({ reason: APPROVER_STOP_LIVE, launchStartMs: LAUNCH_START_MS })
-      expect(approverLines()).toEqual([approverLogLine(approverStatusRefusedMessage(PLAIN.ref, describeAgentDirectorFailure(err)))])
+      expect(approverLines()).toEqual([approverLogLine(approverStatusRefusedMessage(PLAIN.ref, describeAdFailureForLog(err)))])
     },
   )
 
@@ -2540,7 +2542,7 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
     expect(await attempt).toBeUndefined()
 
     expect(await runUntilStopped(PLAIN)).toEqual({ reason: APPROVER_STOP_LIVE, launchStartMs: LAUNCH_START_MS })
-    expect(approverLines()).toEqual([approverLogLine(approverPaneCallFailedMessage(PLAIN.ref, 'send-keys', describeAgentDirectorFailure(err)))])
+    expect(approverLines()).toEqual([approverLogLine(approverPaneCallFailedMessage(PLAIN.ref, 'send-keys', describeAdFailureForLog(err)))])
   })
 
   /** [the reason, the status answers, the launch start kept, optional setup]. */
@@ -2683,7 +2685,7 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
       reason: APPROVER_STOP_GONE,
       kept: LAUNCH_START_MS,
       calls: ['status', 'read-pane'],
-      lines: (who, err) => [approverLogLine(approverGoneMessage(who.ref, 'read-pane', describeAgentDirectorFailure(err)))],
+      lines: (who, err) => [approverLogLine(approverGoneMessage(who.ref, 'read-pane', describeAdFailureForLog(err)))],
     },
     {
       name: 'ErrSpawnNotInteractive at its Enter (a needle on screen)',
@@ -2697,7 +2699,7 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
       reason: APPROVER_STOP_NOT_INTERACTIVE,
       kept: LAUNCH_START_MS,
       calls: ['status', 'read-pane', 'send-keys'],
-      lines: (who, err) => [approverLogLine(approverNotInteractiveMessage(who.ref, 'send-keys', describeAgentDirectorFailure(err)))],
+      lines: (who, err) => [approverLogLine(approverNotInteractiveMessage(who.ref, 'send-keys', describeAdFailureForLog(err)))],
     },
     {
       name: 'ENVIRONMENT (ErrTmuxNotAvailable) at its status',
@@ -2710,7 +2712,7 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
       reason: APPROVER_STOP_TMUX_UNAVAILABLE,
       kept: undefined,
       calls: ['status'],
-      lines: (who, err) => [approverLogLine(approverTmuxUnavailableMessage(who.ref, 'status', describeAgentDirectorFailure(err)))],
+      lines: (who, err) => [approverLogLine(approverTmuxUnavailableMessage(who.ref, 'status', describeAdFailureForLog(err)))],
     },
     {
       name: 'UNAVAILABLE at its read-pane (polling goes on), then a lap reading the row live',
@@ -2723,7 +2725,7 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
       reason: APPROVER_STOP_LIVE,
       kept: LAUNCH_START_MS,
       calls: ['status', 'read-pane', 'status'],
-      lines: (who, err) => [approverLogLine(approverPaneCallFailedMessage(who.ref, 'read-pane', describeAgentDirectorFailure(err)))],
+      lines: (who, err) => [approverLogLine(approverPaneCallFailedMessage(who.ref, 'read-pane', describeAdFailureForLog(err)))],
     },
     {
       name: 'CONFLICT at its read-pane (P latched)',
@@ -2739,7 +2741,7 @@ describe('the approver registry: start, stop, stop-all and the running query (b.
       calls: ['status', 'read-pane'],
       lines: (who, err) => (lines) => {
         expect(lines).toHaveLength(1)
-        expectLineAroundOutcome(lines[0], (outcome) => approverConflictMessage(who.ref, 'read-pane', describeAgentDirectorFailure(err), outcome))
+        expectLineAroundOutcome(lines[0], (outcome) => approverConflictMessage(who.ref, 'read-pane', describeAdFailureForLog(err), outcome))
       },
     },
     {
@@ -3210,6 +3212,49 @@ describe('the pending-row rule runs once at the approver\'s stop, for the stops 
 
     expect(countsSince(callCountsOf(calls), atStop)).toEqual({})
     expect(approverStopRunLines()).toEqual([pendingRowRuleApproverStopDroppedLine(who.ref)])
+  })
+
+  test('with no pending-row rule installed, a stop in the run set on a pending read: its one line, no turn and no call (b.jg5 SRJ-404, SRJ-410)', async () => {
+    _resetPendingRowRule()
+    startAtG()
+    _setDialogReadyTimeoutMs(CAP_MS)
+    pendingNoDialog()
+    startDialogApprover(who.key, false, who.ref)
+    expect((await untilStopped())?.reason).toBe(APPROVER_STOP_CAP)
+    const atStop = callCountsOf(calls)
+
+    await runTurns()
+
+    expect(turns).toEqual([])
+    expect(countsSince(callCountsOf(calls), atStop)).toEqual({})
+    expect(errLines.filter((line) => line === pendingRowRuleApproverStopNotInstalledLine(who.ref, APPROVER_STOP_CAP))).toHaveLength(1)
+    expect(approverStopRunLines()).toEqual([])
+  })
+
+  test('a loop that threw: its one failed line, the error described and redacted, and the stop reason failed (b.jg5 SRJ-1014)', async () => {
+    const failure = new Error(`the approver clock failed (${sentinelInMessage('approver-failed')})`)
+    startAtG()
+    let failing = false
+    pendingNoDialog({
+      readPaneFn: () => {
+        failing = true
+        return undefined
+      },
+    })
+    const base = clock
+    _setApproverClock({
+      now: () => {
+        if (failing) throw failure
+        return base.now()
+      },
+      setTimeout: (callback, delayMs) => base.setTimeout(callback, delayMs),
+      clearTimeout: (handle) => base.clearTimeout(handle),
+    })
+    startDialogApprover(who.key, false, who.ref)
+    expect((await untilStopped())?.reason).toBe(APPROVER_STOP_FAILED)
+
+    expect(errLines.filter((line) => line === approverLogLine(approverFailedMessage(who.ref, describeThrownValue(failure))))).toHaveLength(1)
+    expect(errLines.filter((line) => line.includes(failure.message))).toEqual([])
   })
 
   // b.jg5 SRJ-404, SRJ-305, SRJ-303: the installed gate is the retry

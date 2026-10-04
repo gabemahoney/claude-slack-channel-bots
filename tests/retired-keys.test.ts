@@ -137,9 +137,25 @@ import {
   RETIRED_KEYS_UNREADABLE_LABEL,
   RETIRED_KEYS_WRITE_FAILED,
   RETIRED_KEYS_WRITTEN,
+  RETIRED_KEY_WRITTEN_HELD,
+  RETIRED_KEY_WRITTEN_MARK_CLEARED,
+  retiredKeyWrittenText,
+  retiredKeysCannotClearLine,
+  retiredKeysCannotMarkLine,
+  retiredKeysCannotRecordLine,
+  retiredKeysCannotRestoreEmptyLine,
+  retiredKeysCannotRestoreLine,
+  retiredKeysCarriedSuffix,
+  retiredKeysClearedLine,
+  retiredKeysMarkedLine,
   retiredKeysPath,
+  retiredKeysRecordedLine,
+  retiredKeysRestoredEmptyRemovedLine,
+  retiredKeysRestoredEmptyWrittenLine,
+  retiredKeysRestoredLine,
   retiredKeysUnreadableMessage,
   serializeRetiredKeys,
+  type RetiredKeyCause,
   type RetiredKeyEntry,
   type RetiredKeyRecord,
   type RetiredKeyStore,
@@ -147,6 +163,7 @@ import {
   type RetiredKeysWriter,
 } from '../src/retired-keys.ts'
 import { recordStartupError } from '../src/startup-errors.ts'
+import { errnoSuffix } from '../src/persona-credentials.ts'
 import { LATCH_CASE_CONFLICTING_LABELS, latchRowStateRead, REFUSED_OPERATION_BRING_UP } from '../src/conflict-latch.ts'
 import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_LIVE_STATES, AGENT_DIRECTOR_PENDING_STATE } from '../src/liveness-reading.ts'
 import { personaInstanceId } from '../src/persona-identity.ts'
@@ -243,6 +260,22 @@ afterEach(() => {
 /** An errno-style error, as `node:fs` throws. */
 function errnoError(code: string): NodeJS.ErrnoException {
   return Object.assign(new Error(`${code}: injected failure`), { code })
+}
+
+/** How the store's lines name its file: its path JSON-quoted. */
+function fileOf(rig: Rig): string {
+  return JSON.stringify(rig.store.path)
+}
+
+/**
+ * `line` is `build`'s line with a failed write's detail in its place: the
+ * head before the detail followed by `failure`'s errno (`errnoSuffix`, how
+ * the detail starts), and the tail after it.
+ */
+function expectWithWriteDetail(line: string, build: (detail: string) => string, failure: Error): void {
+  const [head, tail] = build('\u0000').split('\u0000') as [string, string]
+  expect(line.startsWith(`${head}${errnoSuffix(failure)}`)).toBe(true)
+  expect(line.endsWith(tail)).toBe(true)
 }
 
 /** What `act` throws; fails when it returns. */
@@ -575,17 +608,43 @@ describe('record, mark and clear (b.jg5 SRJ-803, SRJ-806, SRJ-807)', () => {
 
     rig.store.record([{ key: 'gamma', cause: RETIRED_KEY_CAUSE_REMOVED }])
     rig.store.mark('gamma')
-    rig.writeFails = errnoError('EIO')
+    const failure = errnoError('EIO')
+    rig.writeFails = failure
     rig.store.clear('gamma')
     expect(rig.logs).toHaveLength(3)
     for (const line of rig.logs) {
       expect(line.startsWith(RETIRED_KEYS_LOG_PREFIX)).toBe(true)
       expect(line).toContain(rig.store.path)
     }
+    expectWithWriteDetail(rig.logs[2]!, (detail) => retiredKeysCannotClearLine('gamma', fileOf(rig), undefined, detail), failure)
 
     const loaded = loadRetiredKeyStore(dir, { log: () => { throw new Error('log down') } })
     expect(loaded.kind).toBe('loaded')
     if (loaded.kind === 'loaded') expect(loaded.store.clear('gamma')).toBe(RETIRED_KEYS_WRITTEN)
+  })
+
+  // SRJ-1014: each retired-key record change, through its builder. The
+  // recording's `described` is what it says of each key written
+  // (`retiredKeyWrittenText`).
+  test('a record, a mark and a clear (with and without the read that cleared it) each log the line their builder gives', () => {
+    const rig = openStore()
+    const file = JSON.stringify(rig.store.path)
+    const onRead = 'a status read of its new life'
+
+    rig.store.record([{ key: 'gamma', cause: RETIRED_KEY_CAUSE_REMOVED }])
+    rig.store.mark('gamma')
+    rig.store.clear('gamma', onRead)
+    rig.store.record([{ key: 'delta', cause: RETIRED_KEY_CAUSE_ABSENT_AT_START }])
+    rig.store.clear('delta')
+
+    expect(rig.logs).toEqual([
+      retiredKeysRecordedLine(retiredKeyWrittenText('gamma', RETIRED_KEY_CAUSE_REMOVED), file, ''),
+      retiredKeysMarkedLine('gamma', file, ''),
+      retiredKeysClearedLine('gamma', file, onRead, ''),
+      retiredKeysRecordedLine(retiredKeyWrittenText('delta', RETIRED_KEY_CAUSE_ABSENT_AT_START), file, ''),
+      retiredKeysClearedLine('delta', file, undefined, ''),
+    ])
+    assertNoLeak(rig.logs)
   })
 })
 
@@ -632,6 +691,45 @@ describe('restore puts back the record held before a batch (b.jg5 SRJ-804)', () 
 
     expect(readRetiredKeysRecord(dir)).toEqual(new Map())
     expect(rig.store.keys()).toEqual([])
+  })
+
+  // SRJ-1014: a restore, written or failed, is a record change; it logs one
+  // line, after the batch's own, its builder's for the form the restore took.
+  // Rows: the form, what the record held before the batch (null: no file),
+  // the failures, and the line's check.
+  test.each<[string, Readonly<Record<string, RetiredKeySeed>> | null, { remove?: Error; write?: Error }, (rig: Rig, line: string) => void]>([
+    ['a record held before, written back', { beta: { cause: RETIRED_KEY_CAUSE_REMOVED } }, {}, (rig, line) => expect(line).toBe(retiredKeysRestoredLine(fileOf(rig)))],
+    [
+      'a record held before, whose write fails',
+      { beta: { cause: RETIRED_KEY_CAUSE_REMOVED } },
+      { write: errnoError('EIO') },
+      (rig, line) => expectWithWriteDetail(line, (detail) => retiredKeysCannotRestoreLine(fileOf(rig), detail), rig.writeFails!),
+    ],
+    ['an empty record, its file removed', null, {}, (rig, line) => expect(line).toBe(retiredKeysRestoredEmptyRemovedLine(fileOf(rig)))],
+    [
+      'an empty record whose remove fails, written empty',
+      null,
+      { remove: errnoError('EACCES') },
+      (rig, line) => expect(line).toBe(retiredKeysRestoredEmptyWrittenLine(fileOf(rig), errnoSuffix(rig.removeFails))),
+    ],
+    [
+      'an empty record whose remove and write both fail',
+      null,
+      { remove: errnoError('EACCES'), write: errnoError('EIO') },
+      (rig, line) => expectWithWriteDetail(line, (detail) => retiredKeysCannotRestoreEmptyLine(fileOf(rig), errnoSuffix(rig.removeFails), detail), rig.writeFails!),
+    ],
+  ])('%s: one line after the batch\'s own, its builder\'s', (_label, seed, fails, check) => {
+    if (seed !== null) writeRetiredKeysRecord(dir, seed)
+    const rig = openStore()
+    const { snapshot } = rig.store.record([{ key: 'alpha', cause: RETIRED_KEY_CAUSE_REMOVED }])
+    rig.removeFails = fails.remove
+    rig.writeFails = fails.write
+
+    rig.store.restore(snapshot)
+
+    expect(rig.logs).toHaveLength(2)
+    check(rig, rig.logs[1]!)
+    assertNoLeak(rig.logs)
   })
 
   test('a restore that cannot remove or write leaves the keys it could not remove retired, in memory and in the file', () => {
@@ -958,6 +1056,62 @@ describe('an interrupted write leaves the previous record (b.jg5 SRJ-802)', () =
 
     expect(readdirSync(dir)).toEqual([])
     expect(rig.store.keys()).toEqual([])
+  })
+})
+
+describe('the record-change lines of a mark cleared, a key held in memory and a failed write, through their builders (b.jg5 SRJ-803, SRJ-806, SRJ-807, SRJ-714, SRJ-1014)', () => {
+  test('a marked key recorded again: its mark cleared; a key held only in memory written by the next record, and carried by the next write of another key', () => {
+    writeRetiredKeysRecord(dir, SEED)
+    const rig = openStore()
+    rig.store.record([{ key: 'alpha', cause: RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY }])
+    rig.writeFails = errnoError('EIO')
+    rig.store.record([{ key: 'held', cause: RETIRED_KEY_CAUSE_ABSENT_AT_START }])
+    rig.writeFails = undefined
+    rig.store.mark('beta')
+    rig.writeFails = errnoError('EIO')
+    rig.store.record([{ key: 'kept', cause: RETIRED_KEY_CAUSE_ABSENT_AT_START }])
+    rig.writeFails = undefined
+    rig.store.record([{ key: 'kept', cause: RETIRED_KEY_CAUSE_REMOVED }, { key: 'gamma', cause: RETIRED_KEY_CAUSE_REMOVED }])
+    const file = fileOf(rig)
+
+    expect(rig.logs).toHaveLength(5)
+    expect(rig.logs[0]).toBe(retiredKeysRecordedLine(retiredKeyWrittenText('alpha', RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY, RETIRED_KEY_WRITTEN_MARK_CLEARED), file, ''))
+    expect(rig.logs[2]).toBe(retiredKeysMarkedLine('beta', file, retiredKeysCarriedSuffix(['held'])))
+    expect(rig.logs[4]).toBe(
+      retiredKeysRecordedLine(
+        [retiredKeyWrittenText('kept', RETIRED_KEY_CAUSE_ABSENT_AT_START, RETIRED_KEY_WRITTEN_HELD), retiredKeyWrittenText('gamma', RETIRED_KEY_CAUSE_REMOVED)].join(', '),
+        file,
+        retiredKeysCarriedSuffix(['kept']),
+      ),
+    )
+    assertNoLeak(rig.logs)
+  })
+
+  test.each<[string, RetiredKeyCause, string[]]>([
+    ['a removed key: the record in memory is unchanged', RETIRED_KEY_CAUSE_REMOVED, []],
+    ['an absent-at-start key: held as retired in memory', RETIRED_KEY_CAUSE_ABSENT_AT_START, ['gamma']],
+  ])('a recording whose write fails, %s: its one line', (_label, cause, held) => {
+    const rig = openStore()
+    const failure = errnoError('EIO')
+    rig.writeFails = failure
+
+    rig.store.record([{ key: 'gamma', cause }])
+
+    expect(rig.logs).toHaveLength(1)
+    expectWithWriteDetail(rig.logs[0]!, (detail) => retiredKeysCannotRecordLine(retiredKeyWrittenText('gamma', cause), fileOf(rig), detail, held), failure)
+    assertNoLeak(rig.logs)
+  })
+
+  test('a mark whose write fails: its one line', () => {
+    writeRetiredKeysRecord(dir, SEED)
+    const rig = openStore()
+    const failure = errnoError('EIO')
+    rig.writeFails = failure
+
+    rig.store.mark('beta')
+
+    expect(rig.logs).toHaveLength(1)
+    expectWithWriteDetail(rig.logs[0]!, (detail) => retiredKeysCannotMarkLine('beta', fileOf(rig), detail), failure)
   })
 })
 

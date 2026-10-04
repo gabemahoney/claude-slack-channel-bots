@@ -3,10 +3,13 @@
  *
  * Role: holds the one named Phase 1 floor constant (b.jg5 SRJ-201), the floor
  * comparison over a version string (b.jg5 SRJ-202), the title of the README
- * switch-over runbook section that CSCB's gate messages point the operator to,
- * the `ad-below-phase1-floor` message (b.jg5 SRJ-203, SRJ-208, SRJ-1013)
- * and the `ad-system-install-too-old` message for the client's own too-old
- * refusal (b.jg5 SRJ-208), each in a startup and a runtime form, the
+ * switch-over runbook section that the startup gate's messages point the
+ * operator to, the debug skill's path and section that a runtime re-check's
+ * stop points to instead, the `ad-below-phase1-floor` message (b.jg5 SRJ-203,
+ * SRJ-208, SRJ-1013) and the `ad-system-install-too-old` message for the
+ * client's own too-old refusal (b.jg5 SRJ-208), each in a startup and a
+ * runtime form (startup refusals name the switch-over runbook; runtime stops
+ * name the debug skill, and neither the runbook nor the install skill), the
  * runtime re-check of the host binary (b.jg5 SRJ-204, SRJ-205), the
  * host-version decision (b.jg5 SRJ-211, SRJ-212) and the Phase 1 notes its
  * callers build: {@link buildPhase1HostNote} for `/publish` and
@@ -77,9 +80,9 @@
  * agent-director errors are classified by name (their `errName`, else `name`,
  * read as a string) and their fields are read structurally: no `instanceof`
  * and no value import from `agent-director`. The module starts no process and
- * reads no file of its own (the too-old stop's install-skill block comes from
- * `install-skill-pointer.ts`, which reads CSCB's own `package.json` once, at
- * its first render). Nothing is armed, read or logged at import or at
+ * reads no file. A stop holds no Slack sink: it reaches only the injected
+ * `recordStartupError` (a startup-errors entry and its server-log line) and
+ * `stop` (b.jg5 SRJ-1002). Nothing is armed, read or logged at import or at
  * {@link createAdVersionRecheck}; the module-level state is a handle, a
  * disposed flag and the tick- and version-changed-listener registries, cleared by
  * {@link resetAdVersionRecheckForTests}.
@@ -90,7 +93,6 @@
 import type { ResolveSystemBinaryResult, UnreachableReason } from 'agent-director'
 
 import { AD_BELOW_PHASE1_FLOOR, AD_SYSTEM_INSTALL_TOO_OLD } from './install-check-labels.ts'
-import { renderInstallSkillInstructions } from './install-skill-pointer.ts'
 import { describeThrownValue, isSafeIdentifier } from './persona-connection-errors.ts'
 import type { PersonaConnectionClock } from './persona-connections.ts'
 import { redactSlackLogText } from './slack-log-redaction.ts'
@@ -98,26 +100,47 @@ import { redactSlackLogText } from './slack-log-redaction.ts'
 /**
  * CSCB's Phase 1 floor: the Phase 1 agent-director release's version.
  *
- * b.jg5 SRJ-201 RESEARCH NEEDED: the value below is the working default (the
- * minor bump over 0.10.x). E37 confirms it from the release candidate and E51 from
- * the release.
+ * b.jg5 SRJ-201: the minor bump over 0.10.x, the version the Phase 1 release
+ * candidate counts as (`0.11.0-rc.1`).
  */
 export const PHASE1_FLOOR_VERSION = '0.11.0'
 
 /**
  * Title of the README runbook section for switching over to agent-director
- * Phase 1. Every message, test, doc and later Epic that names the section
- * takes the title from this constant.
+ * Phase 1. Every message, test and doc that names the section takes the
+ * title from this constant.
  */
 export const PHASE1_RUNBOOK_SECTION_TITLE = 'Switching over to agent-director Phase 1'
 
 /**
- * The operator instruction every `ad-below-phase1-floor` entry carries
- * (b.jg5 SRJ-1013). It names the switch-over runbook and gives no instruction
- * to upgrade agent-director (b.jg5 SRJ-208).
+ * The phrase every `ad-below-phase1-floor` entry carries, from the startup
+ * gate and from a runtime re-check (b.jg5 SRJ-1013).
  */
-export const PHASE1_SWITCH_OVER_INSTRUCTION =
-  'this CSCB release requires agent-director Phase 1 or later: follow the switch-over runbook in the README'
+export const PHASE1_REQUIRED_PHRASE = 'this CSCB release requires agent-director Phase 1 or later'
+
+/**
+ * The operator instruction the startup gate's `ad-below-phase1-floor` entry
+ * carries (b.jg5 SRJ-1013). It names the switch-over runbook and gives no
+ * instruction to upgrade agent-director (b.jg5 SRJ-208). A runtime re-check's
+ * entry carries {@link PHASE1_REQUIRED_PHRASE} and
+ * {@link DEBUG_SKILL_RUNTIME_STOP_POINTER} in its place.
+ */
+export const PHASE1_SWITCH_OVER_INSTRUCTION = `${PHASE1_REQUIRED_PHRASE}: follow the switch-over runbook in the README`
+
+/** The debug skill's path in the package, which a runtime re-check's entry points to (b.jg5 SRJ-205, SRJ-208). */
+export const DEBUG_SKILL_PATH = 'skills/debug-slack-channel-bots/SKILL.md'
+
+/** The debug skill's section for a stop by the runtime re-check (b.jg5 SRJ-1104). */
+export const DEBUG_SKILL_RUNTIME_STOP_SECTION_TITLE = 'Found while the server was running'
+
+/**
+ * The pointer a runtime re-check's entry of either class ends with, in place
+ * of the switch-over runbook and the install skill (b.jg5 SRJ-205, SRJ-208,
+ * SRJ-1013): the debug skill's path and its section for this stop. It carries
+ * no instruction to upgrade or install agent-director.
+ */
+export const DEBUG_SKILL_RUNTIME_STOP_POINTER =
+  `see the debug skill (${DEBUG_SKILL_PATH}), section "${DEBUG_SKILL_RUNTIME_STOP_SECTION_TITLE}", for what to do`
 
 /** Strict SemVer rule, identical to the 0.10.0 client's parser regex. */
 const STRICT_SEMVER_RE = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/
@@ -248,26 +271,32 @@ export interface BelowPhase1FloorParts {
 }
 
 /**
- * The `ad-below-phase1-floor` message (b.jg5 SRJ-203, SRJ-205, SRJ-1013): the
- * version found, the version required (the floor or later, its release
- * candidates included), the binary path, which check found it,
- * {@link PHASE1_SWITCH_OVER_INSTRUCTION} and the runbook section's title.
- * The startup form (the default) says the startup check found it; the runtime
- * form carries {@link RUNTIME_RECHECK_PHRASE} and says the server stopped.
- * Neither carries an instruction to upgrade agent-director, an install or
- * upgrade command or an install-skill block (b.jg5 SRJ-208). Built from
- * versions, a path and fixed text only.
+ * The `ad-below-phase1-floor` message (b.jg5 SRJ-203, SRJ-205, SRJ-208,
+ * SRJ-1013): the version found, the version required (the floor or later,
+ * its release candidates included), the binary path and which check found it.
+ * The startup form (the default) says the startup check found it and ends
+ * with {@link PHASE1_SWITCH_OVER_INSTRUCTION} and the runbook section's
+ * title. The runtime form carries {@link RUNTIME_RECHECK_PHRASE}, says the
+ * server stopped and ends with {@link PHASE1_REQUIRED_PHRASE} and
+ * {@link DEBUG_SKILL_RUNTIME_STOP_POINTER}, naming neither the switch-over
+ * runbook nor the install skill. Neither form carries an instruction to
+ * upgrade or install agent-director, an install or upgrade command or an
+ * install-skill block. Built from versions, a path and fixed text only.
  */
 export function buildBelowPhase1FloorMessage(
   parts: BelowPhase1FloorParts,
   foundBy: RefusalFoundBy = FOUND_BY_STARTUP_CHECK,
 ): string {
+  const note =
+    foundBy === FOUND_BY_RUNTIME_RECHECK
+      ? `${PHASE1_REQUIRED_PHRASE}; ${DEBUG_SKILL_RUNTIME_STOP_POINTER}.`
+      : `${PHASE1_SWITCH_OVER_INSTRUCTION} (section "${PHASE1_RUNBOOK_SECTION_TITLE}").`
   return (
     `agent-director version ${parts.foundVersion} is below CSCB's Phase 1 floor: ` +
     `version ${PHASE1_FLOOR_VERSION} or later is required ` +
     `(release candidates ${PHASE1_FLOOR_VERSION}-rc.N included). ` +
     `Binary at ${parts.binaryPath}; ${foundBySentence(foundBy)}. ` +
-    `Note: ${PHASE1_SWITCH_OVER_INSTRUCTION} (section "${PHASE1_RUNBOOK_SECTION_TITLE}").`
+    `Note: ${note}`
   )
 }
 
@@ -293,31 +322,40 @@ export interface SystemInstallTooOldParts {
  * the version the client requires (its minimum, taken from the error), that
  * this CSCB release needs {@link PHASE1_FLOOR_VERSION} or later (release
  * candidates included) so the operator does not install a version between
- * the two and meet the floor refusal next, the binary path, that this CSCB
- * release and agent-director Phase 1 are installed together, and the
- * switch-over runbook section's title as the way to install agent-director. It carries no
- * instruction to upgrade agent-director and no install or upgrade command,
- * because the runbook's `state.db` backup and `serve` restarts must come with
- * the install. The startup form (the default) names no check; the runtime
- * form adds {@link RUNTIME_RECHECK_PHRASE} and that the server stopped
- * (b.jg5 SRJ-205). The install-skill block is not part of this text: the
- * startup gate and the runtime re-check each append it. Built from versions,
- * a path and fixed text only.
+ * the two and meet the floor refusal next, the binary path and that this
+ * CSCB release and agent-director Phase 1 are installed together. It carries
+ * no instruction to upgrade agent-director and no install or upgrade
+ * command, because the runbook's `state.db` backup and `serve` restarts must
+ * come with the install.
+ * - The startup form (the default) names no check and ends with the
+ *   switch-over runbook section's title as the way to install
+ *   agent-director; the startup gate appends the install-skill block to it.
+ * - The runtime form adds {@link RUNTIME_RECHECK_PHRASE} and that the server
+ *   stopped (b.jg5 SRJ-205), and ends with
+ *   {@link DEBUG_SKILL_RUNTIME_STOP_POINTER} in place of the switch-over
+ *   runbook; nothing is appended to it, so it names neither the runbook nor
+ *   the install skill and carries no instruction to install agent-director
+ *   (b.jg5 SRJ-208, SRJ-1013).
+ * Built from versions, a path and fixed text only.
  */
 export function buildSystemInstallTooOldMessage(
   parts: SystemInstallTooOldParts,
   foundBy: RefusalFoundBy = FOUND_BY_STARTUP_CHECK,
 ): string {
-  const found = foundBy === FOUND_BY_RUNTIME_RECHECK ? `; ${RUNTIME_RECHECK_PHRASE}, so the server stopped` : ''
+  const runtime = foundBy === FOUND_BY_RUNTIME_RECHECK
+  const found = runtime ? `; ${RUNTIME_RECHECK_PHRASE}, so the server stopped` : ''
+  const remedy = runtime
+    ? `This CSCB release and agent-director Phase 1 are installed together; ${DEBUG_SKILL_RUNTIME_STOP_POINTER}.`
+    : `This CSCB release and agent-director Phase 1 are installed together: ` +
+      `install agent-director by following the switch-over runbook in the README ` +
+      `(section "${PHASE1_RUNBOOK_SECTION_TITLE}").`
   return (
     `agent-director system install is too old: version ${parts.foundVersion} is below ` +
     `the agent-director client's minimum; version ${parts.requiredVersion} or later is required ` +
     `by the client, and this CSCB release needs ${PHASE1_FLOOR_VERSION} or later ` +
     `(release candidates included). ` +
     `Binary at ${parts.binaryPath}${found}. ` +
-    `This CSCB release and agent-director Phase 1 are installed together: ` +
-    `install agent-director by following the switch-over runbook in the README ` +
-    `(section "${PHASE1_RUNBOOK_SECTION_TITLE}").`
+    remedy
   )
 }
 
@@ -439,16 +477,6 @@ function safeLine(value: unknown): string {
   return typeof value === 'string' && value !== '' ? redactToOneLine(value) : UNKNOWN_FIELD
 }
 
-/** The install-skill block the too-old entry ends with; empty if it cannot be rendered. */
-function installSkillBlock(): string {
-  try {
-    return renderInstallSkillInstructions()
-  } catch {
-    // A CSCB packaging bug; the stop must still happen, with the rest of the message.
-    return ''
-  }
-}
-
 /** The could-not-run description of a thrown or rejected value. */
 function describeCouldNotRun(error: unknown): string {
   const name = thrownName(error)
@@ -476,8 +504,8 @@ function safeReason(error: unknown): string {
  *   with the runtime floor message;
  * - rejected with an error named `ErrSystemInstallTooOld`: stop as
  *   `ad-system-install-too-old`, with the runtime too-old message built from
- *   the error's `actualVersion`, `requiredVersion` and `binaryPath`, ending
- *   with the install-skill block;
+ *   the error's `actualVersion`, `requiredVersion` and `binaryPath`, which
+ *   points to the debug skill and has no install-skill block;
  * - anything else (`ErrSystemInstallUnreachable`, `ErrSystemInstallNotFound`,
  *   any other named error, a non-error throw, the time limit expiring): could
  *   not run (b.jg5 SRJ-206).
@@ -511,15 +539,14 @@ export function decideAdVersionRecheckOutcome(result: AdVersionRecheckCallResult
     return {
       kind: RECHECK_OUTCOME_STOP,
       classLabel: AD_SYSTEM_INSTALL_TOO_OLD,
-      message:
-        buildSystemInstallTooOldMessage(
-          {
-            foundVersion: stringField(error, 'actualVersion') ?? UNKNOWN_FIELD,
-            requiredVersion: stringField(error, 'requiredVersion') ?? UNKNOWN_FIELD,
-            binaryPath: safeLine(readField(error, 'binaryPath')),
-          },
-          FOUND_BY_RUNTIME_RECHECK,
-        ) + installSkillBlock(),
+      message: buildSystemInstallTooOldMessage(
+        {
+          foundVersion: stringField(error, 'actualVersion') ?? UNKNOWN_FIELD,
+          requiredVersion: stringField(error, 'requiredVersion') ?? UNKNOWN_FIELD,
+          binaryPath: safeLine(readField(error, 'binaryPath')),
+        },
+        FOUND_BY_RUNTIME_RECHECK,
+      ),
     }
   }
   return { kind: RECHECK_OUTCOME_COULD_NOT_RUN, description: describeCouldNotRun(error) }

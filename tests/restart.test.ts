@@ -19,6 +19,8 @@ import {
   runRestartRetryInTurn,
   runRestartWorkInTurn,
   holdRestartActive,
+  pendingDeferralFailedLine,
+  restartRetryCapSkippedLine,
   restartRetrySkippedLine,
   RESTART_FAILURE_CAP,
   RESTART_OUTCOME_ALREADY_CONNECTED,
@@ -74,7 +76,7 @@ import {
   isAtCap,
   recordFailure,
 } from '../src/backoff.ts'
-import { _buildIsSessionAliveAdapter, _buildKillSessionAdapter, _buildReconnectSessionAdapter, deferPendingRow } from '../src/server.ts'
+import { _buildIsSessionAliveAdapter, _buildKillSessionAdapter, _buildReconnectSessionAdapter, deferPendingRow, deferringPendingRowLine } from '../src/server.ts'
 import {
   KILL_OUTCOME_KILLED,
   KILL_OUTCOME_NOT_KILLED,
@@ -245,6 +247,7 @@ import {
   UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
   UNAVAILABLE_RETRY_MODE_FULL,
   UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
+  RETRY_BLOCK_LAUNCH,
   RETRY_BLOCK_LIVE_ROW_SEQUENCE,
   type RetryBlockCause,
   holdsLatchRecheckPermit,
@@ -5282,13 +5285,12 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
 // ---------------------------------------------------------------------------
 
 /** The retry entry's line for persona `key` at the restart cap. */
-const capSkipLine = (key: string): string =>
-  `[slack] Restart retry skipped for persona=${key} — the persona is at the restart cap; nothing killed or launched`
+const capSkipLine = restartRetryCapSkippedLine
 
 describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the delay gate or a restart timer', () => {
   const P = 'persona_p'
   const CWD = '/cwd/p'
-  const skipLine = `[slack] Restart retry skipped for persona=${P} — a launch is in flight; no agent-director call`
+  const skipLine = restartRetrySkippedLine(P, RETRY_BLOCK_LAUNCH)
   let errLines: string[]
   let errArgs: unknown[][]
   let origConsoleError: typeof console.error
@@ -5972,7 +5974,8 @@ describe('b.jg5 SRJ-314: an unknown or thrown liveness probe kills and launches 
 describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever the connection shows', () => {
   const P = 'persona_p'
   const CWD = '/cwd/p'
-  const DEFER_FAILED = `[slack] restart: the pending deferral failed for persona=${P}`
+  /** The pending-deferral failure line's head for P, ahead of its failure. */
+  const DEFER_FAILED = pendingDeferralFailedLine(P, '\u0000').split('\u0000')[0]!
   let errLines: string[]
   let errArgs: unknown[][]
   let origConsoleError: typeof console.error
@@ -6088,10 +6091,11 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
 
   test.each(CONNECTIONS)('a deferral that throws, P %s → one redacted line; still no reconnect, kill or launch, nothing counted or armed; pending-deferred', async (_conn, connected, stream) => {
     recordFailure(P)
+    const thrown = Object.assign(new Error(`defer refused (${sentinelInMessage('defer')})`), { note: LEAK_SENTINEL })
     const { deps, deferred, connectionReads } = pendingDeps(pendingLivenessReading(SAMPLE_LAUNCH_START_FRACTIONAL), connected, stream)
     deps.deferPendingRow = (key, r) => {
       deferred.push([key, r])
-      throw Object.assign(new Error(`defer refused (${sentinelInMessage('defer')})`), { note: LEAK_SENTINEL })
+      throw thrown
     }
     initRestart(deps)
 
@@ -6101,8 +6105,8 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
     expect(connectionReads).toEqual([])
     expectNothingDone(deps)
     const failed = errLines.filter((l) => l.startsWith(DEFER_FAILED))
-    expect(failed).toHaveLength(1)
-    expect(failed[0]).toStartWith(`${DEFER_FAILED}: Error message="defer refused (${REDACTED_SENTINEL_TAIL})" at `)
+    expect(failed).toEqual([pendingDeferralFailedLine(P, describeThrownValue(thrown))])
+    expect(failed[0]).toContain(`Error message="defer refused (${REDACTED_SENTINEL_TAIL})" at `)
     expect(otherLines()).toEqual([])
     assertNoLeak({ errArgs })
   })
@@ -6203,11 +6207,12 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
 
   test.each(PROBE_POINTS)('a deferral that rejects at %s → one redacted line; still no kill or launch, nothing counted or armed; pending-deferred', async (point) => {
     recordFailure(P)
+    const thrown = Object.assign(new Error(`defer rejected (${sentinelInMessage('defer')})`), { note: LEAK_SENTINEL })
     const { deps, deferred } = pendingAt(point, pendingLivenessReading(SAMPLE_LAUNCH_START_FRACTIONAL))
     deps.deferPendingRow = async (key, r) => {
       deferred.push([key, r])
       await Promise.resolve()
-      throw Object.assign(new Error(`defer rejected (${sentinelInMessage('defer')})`), { note: LEAK_SENTINEL })
+      throw thrown
     }
     initRestart(deps)
 
@@ -6216,8 +6221,8 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
     expect(deferred).toHaveLength(1)
     expectNothingDoneAt(point, deps)
     const failed = errLines.filter((l) => l.startsWith(DEFER_FAILED))
-    expect(failed).toHaveLength(1)
-    expect(failed[0]).toStartWith(`${DEFER_FAILED}: Error message="defer rejected (${REDACTED_SENTINEL_TAIL})" at `)
+    expect(failed).toEqual([pendingDeferralFailedLine(P, describeThrownValue(thrown))])
+    expect(failed[0]).toContain(`Error message="defer rejected (${REDACTED_SENTINEL_TAIL})" at `)
     assertNoLeak({ errArgs })
   })
 
@@ -6316,8 +6321,8 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
       expect(launchSessionCalls).toEqual([])
       expect(armed).toEqual([])
       expect(getFailureCount(KEY)).toBe(1)
-      expect(errLines).toHaveLength(1)
-      expect(errLines[0]).toStartWith(`[slack] Deferring persona=${KEY}`)
+      // b.jg5 SRJ-409, SRJ-1014: the deferral's one line, naming the launch start when there is one.
+      expect(errLines).toEqual([deferringPendingRowLine(KEY, start)])
       if (start !== undefined) expect(errLines[0]).toContain(start)
     })
   })
@@ -6470,11 +6475,11 @@ describe('b.jg5 SRJ-409, SRJ-411: on the recovery harness, a pending reading at 
   const COVERED = (h: RecoveryHarness, key: string) => personaRow(h, key, { state: AGENT_DIRECTOR_PENDING_STATE })
   const ELSEWHERE = (h: RecoveryHarness, key: string) => personaRow(h, key, { state: AGENT_DIRECTOR_PENDING_STATE, cwd: h.home })
 
-  /** The run's own deferral line: exactly one, naming the reading's launch start. */
+  /** The run's own deferral line (`deferringPendingRowLine`): exactly one, naming the reading's launch start. */
   function expectOneDeferral(h: RecoveryHarness, p: string): void {
-    const deferrals = h.errors.filter((l) => l.startsWith(`[slack] Deferring persona=${p}: its row reads pending`))
-    expect(deferrals).toHaveLength(1)
-    expect(deferrals[0]).toContain(`(launch started ${START})`)
+    const deferrals = h.errors.filter((l) => l.startsWith(deferringPendingRowLine(p).split(' — ')[0]!))
+    expect(deferrals).toEqual([deferringPendingRowLine(p, START)])
+    expect(deferrals[0]).toContain(START)
   }
 
   /** At the re-probe, its pending line came first; at the first probe there is none. */

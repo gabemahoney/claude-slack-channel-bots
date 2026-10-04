@@ -186,6 +186,7 @@ import {
   createTmuxUnresponsiveCondition,
   createUnclassifiedErrorEpisodes,
   PERSONA_UNCLASSIFIED_ERROR_LABEL,
+  personaUnclassifiedErrorEntryText,
   TMUX_UNRESPONSIVE_END_LATCHED,
   TMUX_UNRESPONSIVE_END_RETRY,
   TMUX_UNRESPONSIVE_END_TICK,
@@ -1285,7 +1286,7 @@ const personaDestinations = createPersonaDestinations({ log: (line) => console.e
  * episode. Shared by the notifier and the permission poller, so one persona's
  * prompts and notices share one episode. Built at module scope like the
  * notifier it is given to: side-effect-free, no Slack call, and no timer until
- * a notice is held (the real clock is its default). E12's teardown reaches a
+ * a notice is held (the real clock is its default). A persona's teardown reaches a
  * persona's `cancel(key)` here, beside `personaDestinations.forget(key)`;
  * shutdown cancels every persona.
  */
@@ -1855,7 +1856,7 @@ export function _buildKillSessionAdapter(
       )
       return KILL_SESSION_NOT_KILLED_GUARD
     }
-    // The restart path kills only after a `dead` reading (b.jg5 E9), so this
+    // The restart path kills only after a `dead` reading (b.jg5 SRJ-314), so this
     // kill is not of a row read live: not tmux-touching, and one try of the
     // bounded retry (b.jg5 SRJ-702). It runs inside the restart work's
     // recovery attempt.
@@ -2231,9 +2232,7 @@ export function _buildReconnectSessionAdapter(
       if (applyOwnRowStatusStep(key, { thrown: err }, RECONNECT_STATUS_SITE)) return reconnectLatchedByRead(key)
       // b.f2b: nothing is known about the session, so nothing is typed.
       forgetWorkingRowEvidence(key)
-      console.error(
-        `[slack] reconnectSession: persona=${key} status check failed: ${describeThrownValue(err)} — not typing /mcp reconnect blind; deferring to a later tick (b.f2b/b.rmy)`,
-      )
+      console.error(reconnectStatusCheckFailedLine(key, describeThrownValue(err)))
       return 'transient'
     }
     // b.jg5 SRJ-502: the state read is awaited, and the persona may have
@@ -2287,7 +2286,7 @@ export function _buildReconnectSessionAdapter(
     // 'dead-session' maps to an escalate-dead answer (b.9a7-amended),
     // carrying the verdict swept with (b.jg5 SRJ-611): restart.ts does not
     // re-enter scheduleRestart on it. For the escalate-dead case
-    // (b.sv7 / Epic t1.tkk.e4), CSCB recovers ITSELF: we fire the internal
+    // (b.sv7), CSCB recovers ITSELF: we fire the internal
     // sweep wrapper here, which may reconcile the frozen `working` row to
     // `missing`, and restart.ts probes liveness again in the same restart run
     // (b.d61): a re-probe that reads `dead` relaunches at once, with its
@@ -2439,10 +2438,35 @@ function replaceOwnRowOldLife(key: string, state: string, why: OwnRowOldLife): '
   })
   console.error(
     why === OWN_ROW_OLD_LIFE_RETIRED
-      ? `[slack] reconnectSession: persona=${key} is ${state} and its key is retired with no new life begun — not typing /mcp reconnect into its old life; the live-row sequence replaces it (start answered ${startAnswer}); deferring (b.jg5 SRJ-805)`
+      ? reconnectRetiredOldLifeLine(key, state, startAnswer)
       : reconnectHeldOwnRowLine(key, state, startAnswer),
   )
   return 'transient'
+}
+
+/**
+ * The reconnect adapter's line for a `status` read that failed (b.f2b,
+ * b.rmy): nothing is typed and the persona is deferred to a later tick;
+ * `failure` is the thrown value as `describeThrownValue` renders it
+ * (redacted). Pure.
+ *
+ *   [slack] reconnectSession: persona=<key> status check failed: <failure> — not typing /mcp reconnect blind; deferring to a later tick (b.f2b/b.rmy)
+ */
+export function reconnectStatusCheckFailedLine(key: string, failure: string): string {
+  return `[slack] reconnectSession: persona=${key} status check failed: ${failure} — not typing /mcp reconnect blind; deferring to a later tick (b.f2b/b.rmy)`
+}
+
+/**
+ * The reconnect adapter's line for a retired key's old life (b.jg5 SRJ-805;
+ * `replaceOwnRowOldLife`): its key is recorded as retired with no "new life
+ * has begun" mark, so nothing is typed and the live-row sequence replaces it:
+ *
+ *   [slack] reconnectSession: persona=<key> is <state> and its key is retired with no new life begun — not typing /mcp reconnect into its old life; the live-row sequence replaces it (start answered <answer>); deferring (b.jg5 SRJ-805)
+ *
+ * Pure.
+ */
+export function reconnectRetiredOldLifeLine(key: string, state: string, startAnswer: string): string {
+  return `[slack] reconnectSession: persona=${key} is ${state} and its key is retired with no new life begun — not typing /mcp reconnect into its old life; the live-row sequence replaces it (start answered ${startAnswer}); deferring (b.jg5 SRJ-805)`
 }
 
 /**
@@ -2499,16 +2523,27 @@ function reconnectLatchedAt(key: string, isLatched: ((key: string) => boolean) |
   // b.jg5 SRJ-502, SRJ-505: the latch re-check's own run of the restart
   // path's decision passes this gate while its permit holds.
   if (holdsLatchRecheckPermit(key)) return false
-  let failure = ''
+  let queryFailure: string | undefined
   try {
     if (isLatched(key) !== true) return false
   } catch (err) {
-    failure = ` (the latched query failed: ${describeThrownValue(err)} — taken as latched)`
+    queryFailure = describeThrownValue(err)
   }
-  console.error(
-    `[slack] reconnectSession: persona=${key} is latched${failure} — not typing /mcp reconnect; nothing done (b.jg5 SRJ-502)`,
-  )
+  console.error(reconnectLatchedGateLine(key, queryFailure))
   return true
+}
+
+/**
+ * The reconnect adapter's latched gate line (b.jg5 SRJ-502;
+ * `reconnectLatchedAt`): nothing is typed. `queryFailure`, when given, is
+ * what the latched query threw as `describeThrownValue` renders it
+ * (redacted), the persona then taken as latched. Pure.
+ *
+ *   [slack] reconnectSession: persona=<key> is latched[ (the latched query failed: <queryFailure> — taken as latched)] — not typing /mcp reconnect; nothing done (b.jg5 SRJ-502)
+ */
+export function reconnectLatchedGateLine(key: string, queryFailure?: string): string {
+  const failure = queryFailure === undefined ? '' : ` (the latched query failed: ${queryFailure} — taken as latched)`
+  return `[slack] reconnectSession: persona=${key} is latched${failure} — not typing /mcp reconnect; nothing done (b.jg5 SRJ-502)`
 }
 
 /**
@@ -2876,11 +2911,11 @@ export async function deferPendingRow(
     switch (step.kind) {
       case PENDING_ROW_STEP_NOT_PENDING:
         if (atRetry && isFinishedRowState(step.state)) return deferralGone(key, step.state)
-        console.error(`[slack] Deferring persona=${key}: its row now reads ${renderLogMessageText(step.state)} — nothing more in this run; the next run decides (b.jg5 SRJ-409)`)
+        console.error(deferralNotPendingLine(key, step.state))
         break
       case PENDING_ROW_STEP_NO_ROW:
         if (atRetry) return deferralGone(key, LIVENESS_DEAD_ROW_NO_ROW)
-        console.error(`[slack] Deferring persona=${key}: its row is gone (ErrSpawnNotFound) — nothing more in this run; the next run decides (b.jg5 SRJ-409)`)
+        console.error(deferralNoRowLine(key))
         break
       case PENDING_ROW_COVERED: {
         if (!atRetry) break
@@ -2889,7 +2924,7 @@ export async function deferPendingRow(
         break
       }
       case PENDING_ROW_STEP_REFUSED:
-        console.error(`[slack] Deferring persona=${key}: its row could not be read again (${describeThrownValue(step.error)}) — nothing more in this run; the next run decides (b.jg5 SRJ-409)`)
+        console.error(deferralRefusedLine(key, describeThrownValue(step.error)))
         break
       case PENDING_ROW_STEP_LATCHED:
         // The shared read logged the latch; the latch's gates stop later work.
@@ -2900,9 +2935,51 @@ export async function deferPendingRow(
         break
     }
   } catch (err) {
-    console.error(`[slack] Deferring persona=${key}: the pending-row step failed: ${describeThrownValue(err)} — nothing more in this run`)
+    console.error(deferralStepFailedLine(key, describeThrownValue(err)))
   }
   return 'pending'
+}
+
+/**
+ * `deferPendingRow`'s line when the step's read finds the row no longer
+ * `pending` (b.jg5 SRJ-409), `state` as read (rendered by
+ * `renderLogMessageText`). Pure.
+ *
+ *   [slack] Deferring persona=<key>: its row now reads <state> — nothing more in this run; the next run decides (b.jg5 SRJ-409)
+ */
+export function deferralNotPendingLine(key: string, state: string): string {
+  return `[slack] Deferring persona=${key}: its row now reads ${renderLogMessageText(state)} — nothing more in this run; the next run decides (b.jg5 SRJ-409)`
+}
+
+/**
+ * `deferPendingRow`'s line when the step's read finds no row
+ * (`ErrSpawnNotFound`; b.jg5 SRJ-409). Pure.
+ *
+ *   [slack] Deferring persona=<key>: its row is gone (ErrSpawnNotFound) — nothing more in this run; the next run decides (b.jg5 SRJ-409)
+ */
+export function deferralNoRowLine(key: string): string {
+  return `[slack] Deferring persona=${key}: its row is gone (ErrSpawnNotFound) — nothing more in this run; the next run decides (b.jg5 SRJ-409)`
+}
+
+/**
+ * `deferPendingRow`'s line when the step's read was refused (b.jg5 SRJ-409);
+ * `failure` is the refusal as `describeThrownValue` renders it (redacted).
+ * Pure.
+ *
+ *   [slack] Deferring persona=<key>: its row could not be read again (<failure>) — nothing more in this run; the next run decides (b.jg5 SRJ-409)
+ */
+export function deferralRefusedLine(key: string, failure: string): string {
+  return `[slack] Deferring persona=${key}: its row could not be read again (${failure}) — nothing more in this run; the next run decides (b.jg5 SRJ-409)`
+}
+
+/**
+ * `deferPendingRow`'s line when the pending-row step threw; `failure` is the
+ * thrown value as `describeThrownValue` renders it (redacted). Pure.
+ *
+ *   [slack] Deferring persona=<key>: the pending-row step failed: <failure> — nothing more in this run
+ */
+export function deferralStepFailedLine(key: string, failure: string): string {
+  return `[slack] Deferring persona=${key}: the pending-row step failed: ${failure} — nothing more in this run`
 }
 
 /** What `deferPendingRow` is told about its caller. */
@@ -3220,8 +3297,8 @@ export async function main(): Promise<void> {
   // from its list and the retired-key record.
   const oldLifeHolds: OldLifeHoldSet = createOldLifeHoldSet({ log: (line) => console.error(line) })
 
-  // The agent-director store owns session-id state; CSCB's own sessions.json
-  // registry was deleted (SR-7.1, Epic 2).
+  // The agent-director store owns session-id state; CSCB keeps no
+  // sessions.json registry (SR-7.1).
 
   // b.av2 SR-8.7: every start runs the last-applied record
   // (config.json.last-applied) when there is one, so an edit of config.json
@@ -3271,7 +3348,7 @@ export async function main(): Promise<void> {
     // rewrite and the teardown's kill; no pending-row rule run follows.
     stopApprover: (key) => stopDialogApprover(key, APPROVER_STOP_RETIRED_KEY),
     lifecycle: {
-      // b.jg5 SRJ-205 (the E4 gate): the pass's launch pool reads
+      // b.jg5 SRJ-205: the pass's launch pool reads
       // `shuttingDown` live before starting each launch, so a shutdown begun
       // during the pass (a version re-check's stop included) starts no
       // queued launch and changes no agent-director row.
@@ -3593,7 +3670,7 @@ export async function main(): Promise<void> {
     log: (line) => console.error(line),
     alertThresholdMs: adAlertThresholdMsInEffect,
     isConfigured: (key) => getAppliedPersona(key) !== undefined,
-    logOnly: (key, text) => recordStartupError(PERSONA_UNCLASSIFIED_ERROR_LABEL, `persona=${key}: ${text}`),
+    logOnly: (key, text) => recordStartupError(PERSONA_UNCLASSIFIED_ERROR_LABEL, personaUnclassifiedErrorEntryText(key, text)),
   })
 
   // b.jg5 SRJ-704, SRJ-1007, SRJ-1016: the kill-failure alerts, their
@@ -4042,7 +4119,7 @@ export async function main(): Promise<void> {
     console.error('[slack] Running in dry-run mode — Slack disabled')
   } else {
     // A clean outage slate for every applied persona before any of them is
-    // brought up (Epic 2 boundary for pre-start observations).
+    // brought up (the boundary for pre-start observations).
     resetAllToHealthy(personaConfig.personas.map((p) => p.key))
 
     // SR-2.1 permission poller — single-threaded interval loop monitors AD
@@ -4194,7 +4271,7 @@ export async function main(): Promise<void> {
   console.error(`  claude --mcp-config ~/.claude/slack-mcp.json --dangerously-load-development-channels server:${MCP_SERVER_NAME}`)
   console.error('')
 
-  // Cron scheduler — the once-per-minute dispatch tick (b.he5 E2). It is its
+  // Cron scheduler — the once-per-minute dispatch tick (b.he5). It is its
   // own /interject client, so it MUST start only AFTER Bun.serve() is listening
   // (unlike startPermissionPoller, which starts before Bun.serve — do not copy
   // that placement). Uses the ACTUAL bound port (httpServer.port) so port-0

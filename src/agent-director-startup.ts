@@ -110,7 +110,7 @@ const SUPPORTED_PLATFORMS = ['linux-x64', 'darwin-arm64'] as const
  *
  * The three Phase-1-only names (`PHASE1_ONLY_ERR_NAMES`, b.jg5 SRJ-102) are
  * required although CSCB recognises those errors by name until the Phase 1
- * client is adopted (E37): a client without their classes turns a Phase 1
+ * client is adopted: a client without their classes turns a Phase 1
  * binary's errors into `ErrUnknownErrorName`, which the classifier would
  * misclassify. The check reads names in the dist text and imports none of
  * them (SRJ-101 interim rule).
@@ -672,7 +672,7 @@ export type PersonaClientDeps = Pick<StartupGateDeps, 'createClient' | 'closeCli
  * version probe use the client's default). Once the start has resolved its
  * configuration, this builds a client with the configured value, through the
  * gate's own construction ({@link buildAdClientOptions}, the same catches)
- * and E2's Phase 1 floor on its `binaryVersion`. It repeats no API-surface
+ * and the Phase 1 floor (b.jg5 SRJ-202) on its `binaryVersion`. It repeats no API-surface
  * probe and no same-user check: they cover the installed package and the
  * store, which the gate has already checked in this process.
  *

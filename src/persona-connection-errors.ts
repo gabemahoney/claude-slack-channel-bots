@@ -98,6 +98,22 @@ const AGENT_DIRECTOR_BASE_ERROR = 'AgentDirectorError'
  * Never throws.
  */
 export function describeThrownValue(value: unknown): string {
+  return describeThrown(value, true)
+}
+
+/**
+ * {@link describeThrownValue}'s description with no stack frames:
+ * `<Type>[ errName=<errName>][ code=<code>][ message="<message>"]`. For a
+ * line that names an expected failure's cause rather than a CSCB fault (the
+ * retry timer's cause, `src/unavailable-retry.ts`), so it carries no host
+ * path. Never throws.
+ */
+export function describeThrownValueWithoutStack(value: unknown): string {
+  return describeThrown(value, false)
+}
+
+/** The describer of {@link describeThrownValue}, with or without the stack's frames. Never throws. */
+function describeThrown(value: unknown, withStack: boolean): string {
   try {
     if (typeof value === 'string') return ['string', describeLogMessage(value)].filter(Boolean).join(' ')
     if (!(value instanceof Error)) return value === null ? 'null' : typeof value
@@ -111,7 +127,7 @@ export function describeThrownValue(value: unknown): string {
     if (typeof code === 'string' && SAFE_IDENTIFIER_RE.test(code)) parts.push(`code=${code}`)
     const message = describeLogMessage(readProp(value, 'message'))
     if (message !== '') parts.push(message)
-    const frames = stackFrames(value)
+    const frames = withStack ? stackFrames(value) : []
     if (frames.length > 0) parts.push(frames.join(FRAME_SEPARATOR))
     return parts.join(' ')
   } catch {

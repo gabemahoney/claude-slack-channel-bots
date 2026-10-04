@@ -131,7 +131,7 @@ export function deriveMemoryReadAllowRules(personaConfig: PersonaConfig, home: s
  * the template is a per-installation artifact owned by agent-director; CSCB's
  * dry-run mode is a CSCB-side testing concern that does not propagate to AD.
  * (Session-manager spawn-time logic that omits this flag in dry-run is its
- * own decision and is unchanged in Epic 1.)
+ * own decision.)
  *
  * Conditionally appends `--append-system-prompt-file <path>` when
  * `system_prompt_mode === 'append'` and the path is R_OK-readable. An
@@ -211,7 +211,7 @@ export function buildTemplateParams(
     // config schema. Per-persona CLAUDE_CONFIG_DIR and CSCB_CRONTABLE_PATH,
     // and CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false for every persona, are
     // supplied at spawn time via SpawnParams.extra_env (SR-1.1; see
-    // buildSpawnParams in session-manager.ts, landed in Epic 2). agent-director
+    // buildSpawnParams in session-manager.ts). agent-director
     // stores that env with the row at spawn, and a resume restores it.
   }
 }

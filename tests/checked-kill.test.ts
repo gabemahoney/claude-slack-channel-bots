@@ -43,8 +43,12 @@ import {
   AD_ERROR_CLASS_UNCLASSIFIED,
   AD_ERROR_CLASS_UNUSABLE_NAME,
   classifyAdError,
+  describeAdErrorClassification,
+  describeAgentDirectorFailure,
+  killFailedDescriptionOf,
   type AdErrorClass,
 } from '../src/ad-error-class.ts'
+import { UNUSABLE_RECORDED_NAME_PHRASE } from '../src/ad-description-phrases.ts'
 import {
   RECHECK_OUTCOME_COULD_NOT_RUN,
   RECHECK_OUTCOME_PASS,
@@ -81,6 +85,7 @@ import {
   type KillRowFinishedRead,
   type KillUnlistedClass,
 } from '../src/checked-kill.ts'
+import { describeLogMessage } from '../src/persona-connection-errors.ts'
 import { REDACTED_TOKEN_PLACEHOLDER } from '../src/slack-log-redaction.ts'
 import {
   CONFLICT_CASES,
@@ -510,6 +515,59 @@ describe('describeKillOutcome', () => {
     expect(describeKillOutcome(killOutcomeOf({ thrown: unusable }))).toBe(
       `outcome=${KILL_OUTCOME_NOT_KILLED} class=${AD_ERROR_CLASS_UNUSABLE_NAME} name=${unusable.unknownName} message=${JSON.stringify((unusable.envelope as { err_description: string }).err_description)}`,
     )
+  })
+
+  // b.jg5 SRJ-1014: each outcome kind that quotes agent-director, rendered
+  // from a description carrying a fake token, is its class and agent-director's
+  // words through the shared describers: redacted, on one line.
+  test.each<[string, () => Error, (thrown: Error) => string, AdErrorClass]>([
+    [
+      'a kill failure naming no survivor',
+      () => errTmuxKillFailed(sentinelInMessage('render-kill-failed'), 'outlived-exit-wait'),
+      (thrown) => `class=${AD_ERROR_CLASS_UNAVAILABLE} ${ERR_TMUX_KILL_FAILED_NAME} ${describeLogMessage(killFailedDescriptionOf(thrown))}`,
+      AD_ERROR_CLASS_UNAVAILABLE,
+    ],
+    [
+      'a survivor-naming kill failure',
+      () => errTmuxKillFailed(sentinelInMessage('render-survivor'), 'pane-process-survived'),
+      (thrown) => `class=${AD_ERROR_CLASS_UNAVAILABLE} ${ERR_TMUX_KILL_FAILED_NAME} ${describeLogMessage(killFailedDescriptionOf(thrown))}`,
+      AD_ERROR_CLASS_UNAVAILABLE,
+    ],
+    [
+      'CONFLICT',
+      () => errTmuxSessionConflict('kill', 'not-this-launch', sentinelInMessage('render-conflict')),
+      (thrown) => `class=${AD_ERROR_CLASS_CONFLICT} ${describeAgentDirectorFailure(thrown)}`,
+      AD_ERROR_CLASS_CONFLICT,
+    ],
+    [
+      'UNUSABLE NAME',
+      () => errInternal(`${UNUSABLE_RECORDED_NAME_PHRASE} contains ${sentinelInMessage('render-unusable')}; nothing was done`),
+      (thrown) => describeAdErrorClassification(classifyAdError(thrown)),
+      AD_ERROR_CLASS_UNUSABLE_NAME,
+    ],
+    [
+      'UNAVAILABLE (ErrTmuxUnresponsive)',
+      () => errTmuxUnresponsive('kill', `no answer (${sentinelInMessage('render-unavailable')})`),
+      (thrown) => `class=${AD_ERROR_CLASS_UNAVAILABLE} ${describeAgentDirectorFailure(thrown)}`,
+      AD_ERROR_CLASS_UNAVAILABLE,
+    ],
+    [
+      'UNCLASSIFIED (ErrInternal)',
+      () => errInternal(`the store could not be read (${sentinelInMessage('render-unclassified')})`),
+      (thrown) => describeAdErrorClassification(classifyAdError(thrown)),
+      AD_ERROR_CLASS_UNCLASSIFIED,
+    ],
+  ])('%s, its description carrying a fake token: the not-killed form with its class and the redacted description, on one line', (_label, build, failure, errorClass) => {
+    const thrown = build()
+    const outcome = killOutcomeOf({ thrown })
+    const line = describeKillOutcome(outcome)
+
+    expect(outcome).toMatchObject({ kind: KILL_OUTCOME_NOT_KILLED, errorClass })
+    expect(line).toBe(`outcome=${KILL_OUTCOME_NOT_KILLED} ${failure(thrown)}`)
+    expect(line.startsWith(`outcome=${KILL_OUTCOME_NOT_KILLED} class=${errorClass}`)).toBe(true)
+    expect(line).toContain(REDACTED_SENTINEL_TAIL)
+    expect(line).not.toMatch(/[\r\n]/)
+    assertNoLeak({ line })
   })
 
   test.each(NON_SUCCESS_ROWS.map(([label, build, expected]) => [label, expected, build] as const))(

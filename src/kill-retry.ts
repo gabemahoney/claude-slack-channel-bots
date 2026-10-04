@@ -456,11 +456,11 @@ export async function runKillRetry<O extends AnyKillOutcome = KillOutcome>(
     const heldBeforeTry = endedByHold(`before try ${tries + 1}`)
     if (heldBeforeTry !== undefined) return heldBeforeTry
     if (!waited) {
-      emit(options, killRetryStopLine(options.logPrefix, options.instanceId, tries + 1, 'the wait between tries failed'))
+      emit(options, killRetryStopLine(options.logPrefix, options.instanceId, tries + 1, KILL_RETRY_STOP_WAIT_FAILED))
       return finish(outcome, KILL_RETRY_END_STOPPED)
     }
     if (!keepGoing(options)) {
-      emit(options, killRetryStopLine(options.logPrefix, options.instanceId, tries + 1, "the caller's keep-going check answered false"))
+      emit(options, killRetryStopLine(options.logPrefix, options.instanceId, tries + 1, KILL_RETRY_STOP_KEEP_GOING_FALSE))
       return finish(outcome, KILL_RETRY_END_STOPPED)
     }
     reads++
@@ -479,7 +479,7 @@ export async function runKillRetry<O extends AnyKillOutcome = KillOutcome>(
     }
     if (verdict.lastRead !== undefined) lastRead = verdict.lastRead
     if (!keepGoing(options)) {
-      emit(options, killRetryStopLine(options.logPrefix, options.instanceId, tries + 1, "the caller's keep-going check answered false"))
+      emit(options, killRetryStopLine(options.logPrefix, options.instanceId, tries + 1, KILL_RETRY_STOP_KEEP_GOING_FALSE))
       return finish(outcome, KILL_RETRY_END_STOPPED)
     }
   }
@@ -552,7 +552,7 @@ function emit(options: Pick<KillRetryOptions<AnyKillOutcome>, 'log'>, line: stri
 // ---------------------------------------------------------------------------
 
 /** Another try follows, after the wait and a read. */
-const KILL_RETRY_NEXT_AGAIN = 'again'
+export const KILL_RETRY_NEXT_AGAIN = 'again'
 /** The outcome stands: a success. */
 export const KILL_RETRY_NEXT_SUCCESS = 'success'
 /** The outcome stands: a class that is never tried again. */
@@ -560,9 +560,9 @@ export const KILL_RETRY_NEXT_NOT_RETRIED = 'not-retried'
 /** The outcome stands: the row was not last read live, so one try. */
 export const KILL_RETRY_NEXT_NOT_LIVE = 'not-live'
 /** The outcome stands: every try was used. */
-const KILL_RETRY_NEXT_EXHAUSTED = 'exhausted'
+export const KILL_RETRY_NEXT_EXHAUSTED = 'exhausted'
 /** The outcome stands: the pass budget was spent, so one try. */
-const KILL_RETRY_NEXT_BUDGET_SPENT = 'budget-spent'
+export const KILL_RETRY_NEXT_BUDGET_SPENT = 'budget-spent'
 
 /** What follows a try. */
 export type KillRetryTryNext =
@@ -594,16 +594,16 @@ function endOfTryNext(next: KillRetryTryNext): KillRetryEnd {
 // ---------------------------------------------------------------------------
 
 /** The read found the row finished: the tries end as a success. */
-const KILL_RETRY_VERDICT_FINISHED = 'finished'
+export const KILL_RETRY_VERDICT_FINISHED = 'finished'
 /** The read latched the persona: the tries end. */
-const KILL_RETRY_VERDICT_LATCHED = 'latched'
+export const KILL_RETRY_VERDICT_LATCHED = 'latched'
 /** A CONFIG answer on a row last read `pending`, or on any row under `configReadEndsTries`: the tries end. */
-const KILL_RETRY_VERDICT_CONFIG_STOP = 'config-stop'
+export const KILL_RETRY_VERDICT_CONFIG_STOP = 'config-stop'
 /** The try goes ahead. */
-const KILL_RETRY_VERDICT_GO = 'go'
+export const KILL_RETRY_VERDICT_GO = 'go'
 
 /** What a read decides. */
-type KillRetryReadVerdict =
+export type KillRetryReadVerdict =
   | typeof KILL_RETRY_VERDICT_FINISHED
   | typeof KILL_RETRY_VERDICT_LATCHED
   | typeof KILL_RETRY_VERDICT_CONFIG_STOP
@@ -815,7 +815,7 @@ function readVerdictText(verdict: KillRetryReadVerdict, read: KillRetryRead, las
  *   `<prefix>: status read before kill try <n> for <id>: <state, or the class and the redacted failure> — <what it decides>`
  * `lastRead` is the state last read before this read. Never throws.
  */
-function killRetryReadLine(
+export function killRetryReadLine(
   prefix: string,
   instanceId: string,
   nextTry: number,
@@ -826,11 +826,19 @@ function killRetryReadLine(
   return `${prefix}: status read before kill try ${nextTry} for ${renderId(instanceId)}: ${describeRead(read)} — ${readVerdictText(verdict, read, lastRead)} (b.jg5 SRJ-702)`
 }
 
+/** A stop line's reason: the wait between tries failed. */
+export const KILL_RETRY_STOP_WAIT_FAILED = 'the wait between tries failed'
+
+/** A stop line's reason: the caller's keep-going check answered false (or threw). */
+export const KILL_RETRY_STOP_KEEP_GOING_FALSE = "the caller's keep-going check answered false"
+
 /**
- * The line when the tries stop before try `nextTry`:
+ * The line when the tries stop before try `nextTry` (SRJ-702, SRJ-1014),
+ * `why` {@link KILL_RETRY_STOP_WAIT_FAILED} or
+ * {@link KILL_RETRY_STOP_KEEP_GOING_FALSE}:
  *   `<prefix>: kill tries for <id> stop before try <n>: <why> — no further kill; the last try's outcome stands`
  */
-function killRetryStopLine(prefix: string, instanceId: string, nextTry: number, why: string): string {
+export function killRetryStopLine(prefix: string, instanceId: string, nextTry: number, why: string): string {
   return `${prefix}: kill tries for ${renderId(instanceId)} stop before try ${nextTry}: ${why} — no further kill; the last try's outcome stands (b.jg5 SRJ-702)`
 }
 
