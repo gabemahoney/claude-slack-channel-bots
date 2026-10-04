@@ -16,6 +16,7 @@ import {
   _resetRestartState,
   isRestartPendingOrActive,
   runRestartRetry,
+  runRestartWorkInTurn,
   RESTART_FAILURE_CAP,
   RESTART_OUTCOME_ALREADY_CONNECTED,
   RESTART_OUTCOME_CAPPED,
@@ -157,6 +158,7 @@ import {
   LATCH_CASE_LEFTOVER,
   latchRowStateRead,
   launchStartNotRecordedNoticeText,
+  REFUSED_OPERATION_BRING_UP,
   REFUSED_OPERATION_PLAIN_SPAWN,
   type ConflictLatch,
   type ConflictLatchRecord,
@@ -240,6 +242,11 @@ import {
   UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
   UNAVAILABLE_RETRY_MODE_FULL,
   UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
+  holdsLatchRecheckPermit,
+  latchRecheckScopeOf,
+  runInLatchRecheck,
+  type LatchRecheckPermit,
+  type LatchRecheckScope,
   type UnavailableRetryController,
 } from '../src/unavailable-retry.ts'
 import { RECHECK_OUTCOME_PASS, RECHECK_OUTCOME_STOP, installAdVersionRecheck, resetAdVersionRecheckForTests } from '../src/ad-version-gate.ts'
@@ -8750,5 +8757,487 @@ describe('b.jg5 SRJ-704, SRJ-1007: the kill-failure alert at the restart path\'s
     expect(killFailureLines(h, p)).toEqual([])
     expect(h.killFailureOpen(p)).toBe(false)
     expect(h.startupErrors()).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-505, SRJ-502 — the latch re-check's own run of the restart path's
+// decision (`runRestartWorkInTurn`)
+//
+// SRJ-505 makes "one run of the restart path's decision for P" with P still
+// latched (here a bring-up refused with conflicting labels on a row read
+// `ended`); SRJ-502's "beyond the re-check" lets only that run past the
+// latch. The re-check makes the run from inside the operation that holds P's
+// serializer turn, with its permit, and revokes the permit at the run's first
+// refusal (any set of P's latch). Over the file's deps with a real latch:
+// with the permit holding, every latched gate of the work (at its start,
+// after the liveness probe, after an escalate-dead reconnect, after the
+// re-probe and before the kill) lets the run through, and it makes its
+// decision once, with the work's usual accounting; with a permit that does
+// not hold or throws it answers latched with no call. Revoked mid-run, the
+// next gate stops it and nothing more is called. The permit is P's alone and
+// lives only inside the run: no later scheduled, lost-message or retried run
+// for P, and no run for Q made inside P's, gets past the latch. Inside the
+// run, while P is latched, an `unknown` reading arms nothing (no
+// information); once P's latch is gone it arms as before. On a real persona
+// serializer the run settles inside P's turn with no submission of its own,
+// and a retry for P submitted meanwhile waits for the turn, then meets the
+// latch. Through the real reconnect adapter, its latched gate passes on the
+// permit and meets the latch once the permit is revoked. Which latch's
+// re-check makes this run, and the clear after a run with no refusal, are
+// tests/conflict-latch.test.ts's and tests/session-manager.test.ts's. Every
+// line is leak-checked.
+// ---------------------------------------------------------------------------
+
+describe('b.jg5 SRJ-505, SRJ-502: the latch re-check\'s own run of the restart path\'s decision (runRestartWorkInTurn)', () => {
+  const P = 'persona_p'
+  const Q = 'persona_q'
+  const CWD: Record<string, string> = { [P]: '/cwd/p', [Q]: '/cwd/q' }
+  /** A permit that holds throughout. */
+  const HOLDING: LatchRecheckPermit = { holds: () => true }
+  /** The restart work's line for a launch that answered skipped for a latched persona. */
+  const endedLatchedLine = (key: string): string =>
+    `[slack] Session relaunch for persona=${key} ended latched — not counted; nothing more is done for it`
+  let errLines: string[]
+  let origConsoleError: typeof console.error
+  let latch: ConflictLatch
+
+  beforeEach(() => {
+    errLines = []
+    origConsoleError = console.error
+    console.error = (...args: unknown[]) => { errLines.push(args.map(String).join(' ')) }
+    latch = createConflictLatch({ log: (line) => { errLines.push(line) } })
+  })
+
+  afterEach(() => {
+    console.error = origConsoleError
+    cancelAllRestartTimers()
+    assertNoLeak({ errLines })
+  })
+
+  /** Latch `key` as a refused bring-up whose CONFLICT names conflicting labels, its row read `ended`: a latch whose re-check runs the restart path's decision. */
+  function latchPersona(key: string): void {
+    latch.setFromConflict(key, errTmuxSessionConflict('spawn', 'conflicting-labels'), { refusedOperation: REFUSED_OPERATION_BRING_UP, rowState: latchRowStateRead('ended') })
+  }
+
+  /** Relatch `key` with another case: a refusal met during the run. */
+  function relatch(key: string): void {
+    latch.setFromConflict(key, errTmuxSessionConflict('spawn', 'scan-leftover'), { refusedOperation: REFUSED_OPERATION_PLAIN_SPAWN, rowState: latchRowStateRead('ended') })
+  }
+
+  /** A permit revoked, as the re-check revokes it, at the first set of `key`'s latch after it is made. */
+  function permitUntilRefused(key: string): { permit: LatchRecheckPermit; refused: () => boolean } {
+    let refused = false
+    latch.addSetObserver((event) => {
+      if (event.key === key) refused = true
+    })
+    return { permit: { holds: () => !refused }, refused: () => refused }
+  }
+
+  /** The file's deps with the latched query over the case's latch. */
+  function latchedDeps(opts: DepsOpts = {}): ReturnType<typeof makeDeps> {
+    const deps = makeDeps(opts)
+    deps.isLatched = (key) => latch.isLatched(key)
+    return deps
+  }
+
+  type RunCalls = { probes: string[]; reconnects: string[]; kills: string[]; launches: string[] }
+  const NO_CALLS: RunCalls = { probes: [], reconnects: [], kills: [], launches: [] }
+  /** The probe, reconnect, kill and launch calls the deps saw, by key. */
+  const runCalls = (deps: ReturnType<typeof makeDeps>): RunCalls => ({
+    probes: deps.isSessionAliveCalls,
+    reconnects: deps.reconnectSessionCalls,
+    kills: deps.killSessionCalls,
+    launches: deps.launchSessionCalls.map((c) => c.key),
+  })
+  /** Every line saying the restart work stopped for a latched persona. */
+  const latchedStops = (): string[] => errLines.filter((l) => l.startsWith('[slack] Skipping restart for persona=') || l.includes(' ended latched '))
+
+  /** The liveness probe answers `readings` in turn, calling `onProbe(n)` before the n-th (from 0). */
+  function probing(deps: ReturnType<typeof makeDeps>, readings: LivenessReading[], onProbe: (n: number) => void = () => {}): void {
+    let n = 0
+    deps.isSessionAlive = async (key) => {
+      deps.isSessionAliveCalls.push(key)
+      onProbe(n)
+      return readings[n++]!
+    }
+  }
+
+  /** The reconnect answers `answer`, calling `onReconnect` first. */
+  function reconnecting(deps: ReturnType<typeof makeDeps>, answer: ReconnectSessionResult, onReconnect: () => void = () => {}): void {
+    deps.reconnectSession = async (key) => {
+      deps.reconnectSessionCalls.push(key)
+      onReconnect()
+      return answer
+    }
+  }
+
+  // P has one failure on record: a success resets it, a counted failure raises it.
+  const DECISIONS: Array<[string, DepsOpts, (deps: ReturnType<typeof makeDeps>) => void, RestartRetryOutcome, RunCalls, number]> = [
+    ['dead: the launch', {}, () => {}, RESTART_OUTCOME_LAUNCHED, { ...NO_CALLS, probes: [P], launches: [P] }, 0],
+    ['dead with ErrSystemInstallDisappeared: the checked kill, then the launch', { isSessionAliveResult: LIVENESS_READING_DEAD_INSTALL_GONE }, () => {}, RESTART_OUTCOME_LAUNCHED, { ...NO_CALLS, probes: [P], kills: [P], launches: [P] }, 0],
+    ['dead, the launch failing: one failure counted', { launchSessionResult: false }, () => {}, RESTART_OUTCOME_COUNTED_FAILURE, { ...NO_CALLS, probes: [P], launches: [P] }, 2],
+    ['live, P connected: nothing more', { isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: true }, () => {}, RESTART_OUTCOME_ALREADY_CONNECTED, { ...NO_CALLS, probes: [P] }, 1],
+    ['live, P disconnected: the reconnect', { isSessionAliveResult: LIVENESS_READING_LIVE }, (deps) => reconnecting(deps, 'success'), RESTART_OUTCOME_RECONNECTED, { ...NO_CALLS, probes: [P], reconnects: [P] }, 0],
+    [
+      'live, then escalate-dead and a re-probe of ErrSystemInstallDisappeared: the reconnect, the re-probe, the kill and the launch',
+      {},
+      (deps) => {
+        probing(deps, [LIVENESS_READING_LIVE, LIVENESS_READING_DEAD_INSTALL_GONE])
+        reconnecting(deps, ESCALATE_DEAD_WORKING_GONE)
+      },
+      RESTART_OUTCOME_LAUNCHED,
+      { probes: [P, P], reconnects: [P], kills: [P], launches: [P] },
+      0,
+    ],
+  ]
+
+  test.each(DECISIONS)('with a permit that holds, the run for latched P whose probe reads %s: every latched gate lets it through and it makes its decision once, with the work\'s accounting, no arm and no skip line; the run itself leaves P latched', async (_label, opts, setUp, outcome, calls, failures) => {
+    recordFailure(P)
+    latchPersona(P)
+    const deps = latchedDeps(opts)
+    setUp(deps)
+    initRestart(deps)
+
+    expect(await runRestartWorkInTurn(P, CWD[P]!, HOLDING)).toBe(outcome)
+
+    expect(runCalls(deps)).toEqual(calls)
+    expect(deps.launchSessionCalls.map((c) => c.cwd)).toEqual(calls.launches.map(() => CWD[P]!))
+    expect(getFailureCount(P)).toBe(failures)
+    expect(deps.armRetryTimerCalls).toEqual([])
+    expect(deps.onCapReachedCalls).toEqual([])
+    expect(latchedStops()).toEqual([])
+    expect(latch.isLatched(P)).toBe(true)
+    expect(isRestartPendingOrActive(P)).toBe(false)
+  })
+
+  test.each<[string, LatchRecheckPermit]>([
+    ['a permit that does not hold', { holds: () => false }],
+    ['a permit whose query throws', { holds: () => { throw new Error('permit query broke') } }],
+  ])('with %s, the run for latched P answers latched at its first gate: no probe, reconnect, kill or launch, nothing counted or armed, one skip line', async (_label, permit) => {
+    recordFailure(P)
+    latchPersona(P)
+    const deps = latchedDeps()
+    initRestart(deps)
+
+    expect(await runRestartWorkInTurn(P, CWD[P]!, permit)).toBe(RESTART_OUTCOME_LATCHED)
+
+    expect(runCalls(deps)).toEqual(NO_CALLS)
+    expect(getFailureCount(P)).toBe(1)
+    expect(deps.armRetryTimerCalls).toEqual([])
+    expect(latchedStops()).toEqual([latchedSkipLine(P)])
+    expect(isRestartPendingOrActive(P)).toBe(false)
+  })
+
+  // The refusal is P relatched with another case while the call awaits; the
+  // re-check's permit is revoked by it, so the next latched gate stops the run.
+  const REFUSALS: Array<[string, (deps: ReturnType<typeof makeDeps>, refuse: () => void) => void, RunCalls, string]> = [
+    ['its liveness probe (reading dead)', (deps, refuse) => probing(deps, [LIVENESS_READING_DEAD], refuse), { ...NO_CALLS, probes: [P] }, latchedSkipLine(P)],
+    [
+      'its escalate-dead reconnect',
+      (deps, refuse) => {
+        probing(deps, [LIVENESS_READING_LIVE, LIVENESS_READING_DEAD])
+        reconnecting(deps, ESCALATE_DEAD_WORKING_GONE, refuse)
+      },
+      { ...NO_CALLS, probes: [P], reconnects: [P] },
+      latchedSkipLine(P),
+    ],
+    [
+      'its re-probe (reading ErrSystemInstallDisappeared)',
+      (deps, refuse) => {
+        probing(deps, [LIVENESS_READING_LIVE, LIVENESS_READING_DEAD_INSTALL_GONE], (n) => { if (n === 1) refuse() })
+        reconnecting(deps, ESCALATE_DEAD_WORKING_GONE)
+      },
+      { ...NO_CALLS, probes: [P, P], reconnects: [P] },
+      latchedSkipLine(P),
+    ],
+    [
+      'its launch (answered skipped)',
+      (deps, refuse) => {
+        deps.launchSession = async (key, cwd, sessionId) => {
+          deps.launchSessionCalls.push({ key, cwd, sessionId })
+          refuse()
+          return 'skipped'
+        }
+      },
+      { ...NO_CALLS, probes: [P], launches: [P] },
+      endedLatchedLine(P),
+    ],
+  ]
+
+  test.each(REFUSALS)('a permitted run for latched P that meets a refusal at %s stops at the next latched gate: latched, nothing more called, nothing counted or armed, one line saying so', async (_at, setUp, calls, line) => {
+    recordFailure(P)
+    latchPersona(P)
+    const { permit, refused } = permitUntilRefused(P)
+    const deps = latchedDeps()
+    setUp(deps, () => relatch(P))
+    initRestart(deps)
+
+    expect(await runRestartWorkInTurn(P, CWD[P]!, permit)).toBe(RESTART_OUTCOME_LATCHED)
+
+    expect(refused()).toBe(true)
+    expect(runCalls(deps)).toEqual(calls)
+    expect(getFailureCount(P)).toBe(1)
+    expect(deps.armRetryTimerCalls).toEqual([])
+    expect(deps.onCapReachedCalls).toEqual([])
+    expect(latchedStops()).toEqual([line])
+    expect(isRestartPendingOrActive(P)).toBe(false)
+  })
+
+  // Under the permit the work's latched checks after a launch or a kill count
+  // only a latch that revoked it (`readLatchedForCall`): a call declined or
+  // failed for another reason, while P is still latched with the permit
+  // holding, gets the answer it gets for any persona.
+  test('a permitted run for latched P whose launch answers skipped with the permit still holding (declined by its own gate, no refusal): launch-skipped, never latched; nothing counted or armed, no latched line', async () => {
+    recordFailure(P)
+    latchPersona(P)
+    const deps = latchedDeps({ launchSessionResult: 'skipped' })
+    initRestart(deps)
+
+    expect(await runRestartWorkInTurn(P, CWD[P]!, HOLDING)).toBe(RESTART_OUTCOME_LAUNCH_SKIPPED)
+
+    expect(latch.isLatched(P)).toBe(true)
+    expect(runCalls(deps)).toEqual({ ...NO_CALLS, probes: [P], launches: [P] })
+    expect(getFailureCount(P)).toBe(1)
+    expect(deps.armRetryTimerCalls).toEqual([])
+    expect(deps.onCapReachedCalls).toEqual([])
+    expect(latchedStops()).toEqual([])
+    expect(isRestartPendingOrActive(P)).toBe(false)
+  })
+
+  test('a permitted run for latched P whose launch revokes the permit (an answer with no information) and answers skipped: latched, not counted, one ended-latched line', async () => {
+    recordFailure(P)
+    latchPersona(P)
+    let revoked = false
+    const permit: LatchRecheckPermit = { holds: () => !revoked }
+    const deps = latchedDeps({
+      launchSession: async () => {
+        revoked = true
+        return 'skipped'
+      },
+    })
+    initRestart(deps)
+
+    expect(await runRestartWorkInTurn(P, CWD[P]!, permit)).toBe(RESTART_OUTCOME_LATCHED)
+
+    expect(runCalls(deps)).toEqual({ ...NO_CALLS, probes: [P], launches: [P] })
+    expect(getFailureCount(P)).toBe(1)
+    expect(deps.armRetryTimerCalls).toEqual([])
+    expect(latchedStops()).toEqual([endedLatchedLine(P)])
+  })
+
+  test('a permitted run for latched P whose kill (after an ErrSystemInstallDisappeared reading) fails UNAVAILABLE with the permit still holding: refused, never latched; no launch, nothing counted, the not-latched kill line', async () => {
+    recordFailure(P)
+    latchPersona(P)
+    const answer = killOutcomeOf({ thrown: errTmuxKillFailed() })
+    const deps = latchedDeps({ isSessionAliveResult: LIVENESS_READING_DEAD_INSTALL_GONE, killSession: async () => answer })
+    initRestart(deps)
+
+    expect(await runRestartWorkInTurn(P, CWD[P]!, HOLDING)).toBe(RESTART_OUTCOME_REFUSED)
+
+    expect(latch.isLatched(P)).toBe(true)
+    expect(runCalls(deps)).toEqual({ ...NO_CALLS, probes: [P], kills: [P] })
+    expect(getFailureCount(P)).toBe(1)
+    expect(deps.onCapReachedCalls).toEqual([])
+    expect(errLines.filter((l) => l === killNotSucceededLine(P, describeKillOutcome(answer), false))).toHaveLength(1)
+    expect(errLines.filter((l) => l === killNotSucceededLine(P, describeKillOutcome(answer), true))).toEqual([])
+    expect(latchedStops()).toEqual([])
+    expect(isRestartPendingOrActive(P)).toBe(false)
+  })
+
+  test('control: the same kill failure in a run whose permit no longer holds (P relatched during the kill): latched, with the latched kill line', async () => {
+    recordFailure(P)
+    latchPersona(P)
+    const { permit, refused } = permitUntilRefused(P)
+    const answer = killOutcomeOf({ thrown: errTmuxKillFailed() })
+    const deps = latchedDeps({
+      isSessionAliveResult: LIVENESS_READING_DEAD_INSTALL_GONE,
+      killSession: async () => {
+        relatch(P)
+        return answer
+      },
+    })
+    initRestart(deps)
+
+    expect(await runRestartWorkInTurn(P, CWD[P]!, permit)).toBe(RESTART_OUTCOME_LATCHED)
+
+    expect(refused()).toBe(true)
+    expect(runCalls(deps)).toEqual({ ...NO_CALLS, probes: [P], kills: [P] })
+    expect(getFailureCount(P)).toBe(1)
+    expect(errLines.filter((l) => l === killNotSucceededLine(P, describeKillOutcome(answer), true))).toHaveLength(1)
+  })
+
+  test.each<[string, boolean, string[]]>([
+    ['P still latched: the answer gives no information, so the arm hook is not called', false, []],
+    ['P\'s latch forgotten during the probe: the arm hook is called as before', true, [P]],
+  ])('a permitted run whose liveness probe reads unknown, %s; nothing else is called or counted', async (_label, forgets, armed) => {
+    recordFailure(P)
+    latchPersona(P)
+    const deps = latchedDeps()
+    probing(deps, [LIVENESS_READING_UNKNOWN], () => { if (forgets) latch.forget(P) })
+    initRestart(deps)
+
+    expect(await runRestartWorkInTurn(P, CWD[P]!, HOLDING)).toBe(RESTART_OUTCOME_LIVENESS_UNKNOWN)
+
+    expect(deps.armRetryTimerCalls).toEqual(armed)
+    expect(runCalls(deps)).toEqual({ ...NO_CALLS, probes: [P] })
+    expect(getFailureCount(P)).toBe(1)
+    expect(errLines.filter((l) => l.startsWith(`[slack] Liveness unknown for persona=${P}`))).toHaveLength(1)
+    expect(latchedStops()).toEqual([])
+  })
+
+  test.each(RESTART_ENTRIES)('the permit carries to no later run: after a permitted run that launched P and left it latched, %s for P makes no call and logs one line saying P is latched', async (_entry, run) => {
+    latchPersona(P)
+    const deps = latchedDeps()
+    initRestart(deps)
+    expect(await runRestartWorkInTurn(P, CWD[P]!, HOLDING)).toBe(RESTART_OUTCOME_LAUNCHED)
+    const from = errLines.length
+
+    await run(P, CWD[P]!)
+
+    expect(holdsLatchRecheckPermit(P)).toBe(false)
+    expect(runCalls(deps)).toEqual({ ...NO_CALLS, probes: [P], launches: [P] })
+    const lines = errLines.slice(from).filter((l) => l.includes(`persona=${P}`))
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toContain(' — the persona is latched; ')
+    expect(isRestartPendingOrActive(P)).toBe(false)
+  })
+
+  test('the permit is P\'s alone and lives only inside the run: inside it the scope is the caller\'s with the permit added, a retry for latched Q made there answers latched with no call for Q, and after it the caller\'s scope holds no permit', async () => {
+    latchPersona(P)
+    latchPersona(Q)
+    const inside: unknown[] = []
+    const deps = latchedDeps({
+      launchSession: async () => {
+        inside.push({
+          scope: latchRecheckScopeOf(P),
+          permitForP: holdsLatchRecheckPermit(P),
+          permitForQ: holdsLatchRecheckPermit(Q),
+          retryForQ: await runRestartRetry(Q, CWD[Q]!, () => false),
+        })
+        return true
+      },
+    })
+    initRestart(deps)
+    // The round's own scope, with a field of its own the run must keep.
+    const round: LatchRecheckScope & { readonly roundField: string } = { key: P, isLatched: (key) => latch.isLatched(key), roundField: 'the round\'s' }
+
+    const after = await runInLatchRecheck(round, async () => ({
+      outcome: await runRestartWorkInTurn(P, CWD[P]!, HOLDING),
+      scope: latchRecheckScopeOf(P),
+      permitForP: holdsLatchRecheckPermit(P),
+    }))
+
+    expect(inside).toEqual([{ scope: { ...round, permit: HOLDING }, permitForP: true, permitForQ: false, retryForQ: RESTART_OUTCOME_LATCHED }])
+    expect(after).toEqual({ outcome: RESTART_OUTCOME_LAUNCHED, scope: round, permitForP: false })
+    expect(runCalls(deps)).toEqual({ ...NO_CALLS, probes: [P], launches: [P] })
+    expect(latchedStops()).toEqual([latchedSkipLine(Q)])
+  })
+
+  test('on the persona serializer, from inside the operation holding P\'s turn: the run settles with no submission of its own (no deadlock), while a retry for P submitted meanwhile waits for the turn and then meets the latch with no call', async () => {
+    latchPersona(P)
+    const serializer = createPersonaSerializer()
+    const submitted: string[] = []
+    const launchReached = Promise.withResolvers<void>()
+    const launchRelease = Promise.withResolvers<void>()
+    const deps = latchedDeps({
+      launchSession: async () => {
+        launchReached.resolve()
+        await launchRelease.promise
+        return true
+      },
+    })
+    deps.serialize = <T>(key: string, operation: () => T | Promise<T>): Promise<T> => {
+      submitted.push(key)
+      return serializer.run(key, operation)
+    }
+    initRestart(deps)
+
+    // The re-check's round holds P's turn, as the re-check timer submits it.
+    const round = serializer.run(P, () => runRestartWorkInTurn(P, CWD[P]!, HOLDING))
+    await launchReached.promise
+    expect(isRestartPendingOrActive(P)).toBe(true)
+    const retry = runRestartRetry(P, CWD[P]!, () => false)
+    for (let i = 0; i < 20; i++) await Promise.resolve()
+
+    // The retry is queued behind the turn: none of its work has run.
+    expect(submitted).toEqual([P])
+    expect(runCalls(deps)).toEqual({ ...NO_CALLS, probes: [P], launches: [P] })
+    expect(latchedStops()).toEqual([])
+
+    launchRelease.resolve()
+    expect(await round).toBe(RESTART_OUTCOME_LAUNCHED)
+    expect(await retry).toBe(RESTART_OUTCOME_LATCHED)
+
+    // The only submission was the retry's; it met the latch with no call.
+    expect(submitted).toEqual([P])
+    expect(runCalls(deps)).toEqual({ ...NO_CALLS, probes: [P], launches: [P] })
+    expect(latchedStops()).toEqual([latchedSkipLine(P)])
+    expect(isRestartPendingOrActive(P)).toBe(false)
+  })
+
+  test('before initRestart it answers not-initialised with one line and marks nothing active', async () => {
+    expect(await runRestartWorkInTurn(P, CWD[P]!, HOLDING)).toBe(RESTART_OUTCOME_NOT_INITIALISED)
+
+    expect(errLines).toEqual([`[slack] runRestartWorkInTurn: deps not initialized — skipping the re-check's run for persona=${P}`])
+    expect(isRestartPendingOrActive(P)).toBe(false)
+  })
+
+  describe('through the real reconnect adapter over the stub', () => {
+    let statusCalls: StatusParams[]
+    let readPaneCalls: ReadPaneParams[]
+    let sendKeysCalls: SendKeysParams[]
+    /** Called at each `status` read, before it answers `waiting`. */
+    let onStatus: () => void
+
+    beforeEach(() => {
+      statusCalls = []
+      readPaneCalls = []
+      sendKeysCalls = []
+      onStatus = () => {}
+      const stub = makeStubClient({
+        statusFn: () => {
+          onStatus()
+          return { state: 'waiting' }
+        },
+        statusCalls,
+        readPaneCalls,
+        sendKeysCalls,
+      })
+      _resetOutageState()
+      initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
+      setClientForTests(stub as unknown as Client)
+      _resetFindMissingMemo()
+    })
+
+    afterEach(() => {
+      resetClientForTests()
+      _resetOutageState()
+      _resetFindMissingMemo()
+    })
+
+    test.each<[string, boolean, RestartRetryOutcome]>([
+      ['with the permit holding, its latched gate lets the run through: /mcp reconnect is typed into P\'s session and the run answers reconnected', false, RESTART_OUTCOME_RECONNECTED],
+      ['with the permit revoked during its state read (P relatched), its latched gate stops the run: no pane read, nothing typed, the reconnect deferred', true, RESTART_OUTCOME_RECONNECT_DEFERRED],
+    ])('a permitted run for latched P whose probe reads live and disconnected reaches the reconnect adapter (main()\'s, with the latched query): %s; no kill or launch', async (_label, refuseAtRead, outcome) => {
+      recordFailure(P)
+      latchPersona(P)
+      const { permit, refused } = permitUntilRefused(P)
+      if (refuseAtRead) onStatus = () => relatch(P)
+      const deps = latchedDeps({ isSessionAliveResult: LIVENESS_READING_LIVE })
+      deps.reconnectSession = _buildReconnectSessionAdapter(undefined, (key) => latch.isLatched(key))
+      initRestart(deps)
+
+      expect(await runRestartWorkInTurn(P, CWD[P]!, permit)).toBe(outcome)
+
+      expect(refused()).toBe(refuseAtRead)
+      expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(P)])
+      expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(refuseAtRead ? [] : [personaInstanceId(P)])
+      if (refuseAtRead) expect(readPaneCalls).toEqual([])
+      expect(deps.killSessionCalls).toEqual([])
+      expect(deps.launchSessionCalls).toEqual([])
+      expect(getFailureCount(P)).toBe(refuseAtRead ? 1 : 0)
+      expect(deps.armRetryTimerCalls).toEqual([])
+    })
   })
 })

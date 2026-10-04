@@ -62,8 +62,9 @@
  *   instance, as `main()`'s `isSessionAliveAdapter`, which the lost-message
  *   driver's row read is too), the
  *   reconnect and kill adapters (`_buildReconnectSessionAdapter`,
- *   `_buildKillSessionAdapter`, over the applied-persona lookup, the kill
- *   adapter with the kill-retry clock below) and
+ *   `_buildKillSessionAdapter`, over the applied-persona lookup; the
+ *   reconnect adapter, as `main()` builds it, with the latch's latched query;
+ *   the kill adapter with the kill-retry clock below) and
  *   `launchSession` over the applied configuration with the relaunch gate as
  *   `canLaunch` and, as `main()` binds it, the escalate-dead verdict the
  *   restart work hands a relaunch passed on unchanged as `deadEvidence`
@@ -138,7 +139,9 @@
  *   (`close()`, not awaited: every sequence's stop signal is set, so none
  *   makes a call after the one in progress, and no start is taken after
  *   it; b.jg5 SRJ-706), closes the controller
- *   (`close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)`), then the episodes
+ *   (`close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)`), stops every latch re-check
+ *   timer (`latchRecheck`'s `stopAll`, as `main()`'s shutdown does right
+ *   after the controller: none is armed again; b.jg5 SRJ-505), then the episodes
  *   (`episodes.close()`: every alert check cancelled, a later condition
  *   start answers `closed`), then stops every dialog approver
  *   (`stopAllDialogApprovers`, not awaited: none makes a call after the one
@@ -158,7 +161,8 @@
  *   waits on is stopped with the teardown reason; b.jg5 SRJ-811), the step
  *   production's turn takes right after the timer's stop; then it
  *   forgets the persona's latch silently (`latch.forget(key)`: no post, no
- *   set observer call, no line), the turn's step that production's
+ *   set observer call, no line; its forget observer stops the persona's
+ *   latch re-check timer, b.jg5 SRJ-505), the turn's step that production's
  *   `forgetConflictLatch` binds (b.jg5 SRJ-504), and then its
  *   `ErrInvalidFlags` hold (`forget(key)`: no post, no retry), the step
  *   production's `forgetInvalidFlagsHold` binds (b.jg5 SRJ-207, SRJ-715). The teardown's turn then
@@ -183,7 +187,8 @@
  *   `stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)`, then the condition's
  *   `cancelAlert` with the same reason), `forgetOldLifeWaits` (the session
  *   manager's teardown member, b.jg5 SRJ-811), `forgetConflictLatch` (`latch`'s
- *   `forget`), `forgetInvalidFlagsHold` (`invalidFlagsHold`'s `forget`),
+ *   `forget`, whose forget observer stops the persona's latch re-check
+ *   timer), `forgetInvalidFlagsHold` (`invalidFlagsHold`'s `forget`),
  *   `forgetNoticeEpisodes` (`episodes.forget`), `resetOutageState`
  *   (`resetAllToHealthy`), `killInstance` (`killPersonaInstanceForTeardown`
  *   with `killRetryClock`, so `drive` moves the clock to its waits) and
@@ -384,8 +389,11 @@
  *   and its episodes and counts forgotten, every kind (`episodes.forget(key)`,
  *   the stuck-launch episode included, whose close disposes the abort's
  *   per-episode state, SRJ-412). It throws if the own-launch record or a
- *   used abort outlives that.
- *   The stub's row is untouched; the latch, the outage flags, the holds, the
+ *   used abort outlives that. Its latch is dropped silently and its latch
+ *   re-check timer stopped (`latch.forget(key)`, then `latchRecheck`'s
+ *   `stop(key)`; b.jg5 SRJ-504: a server restart drops every latch and its
+ *   timer, and the persona latches again at its next attempt).
+ *   The stub's row is untouched; the outage flags, the holds, the
  *   retired-key store, the restart module's counts and the findMissing memo
  *   are kept (a case that needs them gone builds a new harness). It throws
  *   while the persona has a launch in flight or a live-row sequence running
@@ -427,7 +435,37 @@
  *   The harness has no health tick, so `HealthCheckDeps.isLatched` is not
  *   bound here; a tick case binds `latch.isLatched` itself. `teardown(key)`
  *   forgets the persona's latch silently (b.jg5 SRJ-504), as production's
- *   teardown does.
+ *   teardown does. `latchSet` is the latch's own set entries (`set`,
+ *   `setFromConflict`, `setFromUnusableName`, `setLaunchStartNotRecorded`,
+ *   `setProbeDropped`), so a case latches P as a latching site does, every
+ *   observer above and the re-check's arm running (a conflict-cases row's
+ *   `latchOn(h.latchSet, key)`).
+ * - `latchRecheck` (E30; b.jg5 SRJ-505, SRJ-506): the latch re-check,
+ *   composed through the session manager's one builder exactly as `main()`
+ *   composes it (`buildLatchRecheck` over the latch, the harness clock, the
+ *   harness's serializer `serializer.run` as `main()`'s
+ *   `personaLifecycle.run`, the live applied configuration, `console.error`
+ *   as its log, so its lines and its round's lines go to `errors`, and the
+ *   latch notice's episodes; its silent clear forgets the latch and stops
+ *   the timer). With `options.latchRecheck` (false when unset, so the
+ *   suites that assert no call and no timer for a latched persona on the
+ *   other automated paths keep their meaning) its observer is bound after
+ *   the holds and the notice (`bindLatchRecheck`), so a set runs the holds,
+ *   the notice, then the timer's arm: a persona that latches gets one
+ *   timer, its first round
+ *   `LATCH_RECHECK_INTERVAL_MS` later on the harness clock whatever
+ *   `health_check_interval` is, each next one that long after the previous
+ *   round settled. Its timers are tracked: `latchRecheck.nextDueAt()` (the
+ *   earliest pending re-check's due time, or undefined) and
+ *   `pendingTimers()`, beside the controller's `isArmed(key)`,
+ *   `armedKeys()` and `whenRoundSettled(key)`. `advanceToRecheck()` moves
+ *   the clock to the earliest pending re-check, settles its round
+ *   (`settle()`) and answers the time it fired at; it throws when none is
+ *   pending. `advance` awaits the rounds a firing starts (flush-bounded) and
+ *   `settle()` awaits them in real time. Its stops: a clear (the silent
+ *   clear's `stop`), every forget of the persona's latch (the binding's
+ *   forget observer: `teardown(key)`, `teardownDeps().forgetConflictLatch`,
+ *   `restartServer(key)`), `shutdown()`'s `stopAll` and `cleanup()`'s.
  * - `invalidFlagsHold` (b.jg5 SRJ-207, SRJ-1008, SRJ-1016, SRJ-305): one
  *   `ErrInvalidFlags` hold per harness (`createInvalidFlagsHold`, its lines
  *   to `lines`), composed as `main()` composes it: installed in the session
@@ -856,7 +894,9 @@
  * - `cleanup()`: first stops and forgets every dialog approver
  *   (`_resetDialogApprovers`, silently: none makes a call after the one in
  *   progress) and clears the timers they left on the harness clock, then
- *   stops every retry timer (`stopAll`), forgets every
+ *   stops every retry timer (`stopAll`) and every latch re-check timer
+ *   (`latchRecheck`'s `stopAll`; a round already running is not cancelled,
+ *   so a case settles before it ends), forgets every
  *   episode and clears every count (`episodes.forgetAll()`, which cancels
  *   every alert check; so no slow-recovery count or episode is left behind,
  *   and two harnesses built one after the other, each with its own episodes
@@ -1063,11 +1103,14 @@ import { replySettingsOf, type Persona, type PersonaConfig } from '../../src/con
 import {
   bindConflictLatchHolds,
   bindConflictNotice,
+  bindLatchRecheck,
   createConflictLatch,
   type ConflictLatch,
   type ConflictLatchRecord,
   type ConflictLatchSetOutcome,
   type ConflictNoticeEpisodes,
+  type LatchRecheckClock,
+  type LatchRecheckController,
 } from '../../src/conflict-latch.ts'
 import {
   AGENT_DIRECTOR_PENDING_STATE,
@@ -1197,6 +1240,7 @@ import {
   _setNow,
   _setDialogReadyTimeoutMs,
   _whenDialogApproverStopped,
+  buildLatchRecheck,
   buildLiveRowSequenceDeps,
   cancelWorkingRowWait,
   createOldLifeHoldEndRetry,
@@ -1426,6 +1470,15 @@ export interface RecoveryHarnessOptions {
    * installed" line and keeps the pending-only arm only.
    */
   pendingRowRule?: boolean
+  /**
+   * Bind the latch re-check (b.jg5 SRJ-505) to the latch as `main()` binds
+   * it (`bindLatchRecheck`), so a persona that latches gets its re-check
+   * timer and its rounds; false when unset: the re-check is built through
+   * the same builder but its observer is not bound, so no latch arms a timer
+   * and the suites that assert no call or timer for a latched persona on
+   * the other automated paths keep their meaning.
+   */
+  latchRecheck?: boolean
 }
 
 /** The stub client's agent-director verbs, by method name, whose calls the harness stamps with the harness clock. */
@@ -1610,6 +1663,20 @@ interface LostMessageDriver {
 /** The harness's latch, read-only: the latched query and the record. */
 export type RecoveryLatchView = Pick<ConflictLatch, 'isLatched' | 'record'>
 
+/** The harness latch's own set entries, through which a latching site sets it (and the probe-dropped mark, b.jg5 SRJ-505). */
+export type RecoveryLatchSetEntries = Pick<ConflictLatch, 'set' | 'setFromConflict' | 'setFromUnusableName' | 'setLaunchStartNotRecorded' | 'setProbeDropped'>
+
+/**
+ * The harness's latch re-check timers, read-only (b.jg5 SRJ-505): the
+ * controller's queries, and the tracked re-check timers on the harness clock.
+ */
+export interface RecoveryLatchRecheckView extends Pick<LatchRecheckController, 'isArmed' | 'armedKeys' | 'whenRoundSettled'> {
+  /** The earliest due time of a pending re-check timer, or undefined when none is pending. */
+  nextDueAt(): number | undefined
+  /** How many of the harness clock's pending timers are re-check timers. */
+  pendingTimers(): number
+}
+
 /** The harness's `ErrInvalidFlags` hold, read-only: the held query, the version a hold began under and the keys held. */
 export type RecoveryInvalidFlagsHoldView = Pick<InvalidFlagsHold, 'isHeld' | 'beganUnder' | 'heldKeys'>
 
@@ -1725,6 +1792,16 @@ export interface RecoveryHarness {
   killFailureOpen(key: string): boolean
   /** The harness's one latch, read-only (`isLatched`, `record`); composed as `main()` composes it. */
   readonly latch: RecoveryLatchView
+  /** The latch's own set entries: latch P as a latching site does, every observer running; see the module comment. */
+  readonly latchSet: RecoveryLatchSetEntries
+  /** The latch re-check, built through `buildLatchRecheck` as `main()` builds it, read-only; see the module comment. */
+  readonly latchRecheck: RecoveryLatchRecheckView
+  /**
+   * Move the clock to the earliest pending latch re-check timer, settle the
+   * round it starts (`settle()`), and answer the clock time it fired at;
+   * throws when no re-check timer is pending.
+   */
+  advanceToRecheck(): Promise<number>
   /**
    * The harness's one `ErrInvalidFlags` hold, read-only (`isHeld`,
    * `beganUnder`, `heldKeys`; b.jg5 SRJ-207); composed as `main()` composes
@@ -2196,6 +2273,9 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   const hold = (key: string, name: RecoveryLatchHold): void => {
     latchEvents.push({ step: 'hold', key, hold: name })
   }
+  // The latch notices' episodes, as main()'s `noticeEpisodes`: the CONFLICT
+  // notice and the latch re-check get the same one.
+  const noticeEpisodes = recordingNoticeEpisodes(episodes, (key, text) => latchEvents.push({ step: 'notice', key, text }))
   const unbindLatch = [
     latch.addSetObserver(({ key, outcome, record }) => {
       latchEvents.push({ step: 'set', key, outcome, record })
@@ -2230,8 +2310,45 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       },
       log,
     ),
-    bindConflictNotice(latch, recordingNoticeEpisodes(episodes, (key, text) => latchEvents.push({ step: 'notice', key, text }))),
+    bindConflictNotice(latch, noticeEpisodes),
   ]
+  // As main() builds it (b.jg5 SRJ-505), right after the notice: the latch
+  // re-check through the session manager's one builder, over the latch, the
+  // harness clock (each re-check timer tracked, so `latchRecheck.nextDueAt`
+  // and `advanceToRecheck` find it), the harness's serializer (main()'s
+  // `personaLifecycle.run`), the live applied configuration, `console.error`
+  // (so its lines go to `errors`) and the latch notices' episodes; its
+  // observer bound after the holds and the notice, so a set runs them, then
+  // the timer's arm (with `options.latchRecheck` only). The binding's forget
+  // observer stops a persona's timer at every forget of its latch.
+  // `shutdown()` and `cleanup()` stop every timer; `cleanup()` removes the
+  // binding with the other set observers.
+  const latchRecheckTimers = new Set<unknown>()
+  const latchRecheckClock: LatchRecheckClock = {
+    setTimeout: (callback, delayMs) => {
+      const handle = clock.setTimeout(() => {
+        latchRecheckTimers.delete(handle)
+        callback()
+      }, delayMs)
+      latchRecheckTimers.add(handle)
+      return handle
+    },
+    clearTimeout: (handle) => {
+      latchRecheckTimers.delete(handle)
+      clock.clearTimeout(handle)
+    },
+  }
+  const latchRecheck = buildLatchRecheck({
+    latch,
+    clock: latchRecheckClock,
+    serialize: serializer.run,
+    appliedConfig,
+    log: (line) => console.error(line),
+    episodes: noticeEpisodes,
+  })
+  if (options.latchRecheck === true) unbindLatch.push(bindLatchRecheck(latch, latchRecheck))
+  /** Every key a latch re-check round may run for: the configured and the armed. */
+  const recheckKeys = (): string[] => [...new Set([...keys, ...latchRecheck.armedKeys()])]
 
   // As main() builds it (b.jg5 SRJ-207, SRJ-1008, SRJ-305): one hold per
   // harness, its lines to `lines`, its set reaction bound to the controller's
@@ -2586,7 +2703,8 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     isSessionAlive: isSessionAliveAdapter,
     isSessionConnected: (key) => connected.has(key),
     hasSessionStream: (key) => connected.has(key),
-    reconnectSession: _buildReconnectSessionAdapter(appliedPersona, undefined, appliedPersona),
+    // As main() builds it: with the latch's latched query (b.jg5 SRJ-502).
+    reconnectSession: _buildReconnectSessionAdapter(appliedPersona, (key) => latch.isLatched(key), appliedPersona),
     killSession: _buildKillSessionAdapter(appliedPersona, killRetryClock),
     // As main() binds it: the verdict an escalate-dead relaunch carries is
     // passed on unchanged, into the ladder (b.jg5 SRJ-611).
@@ -2734,10 +2852,13 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     return [...new Set([...keys, ...controller.armedKeys(), ...attempts.map((a) => a.key)])]
   }
 
-  /** Await every in-flight retry run, for at most `settleFlushes` clock flushes. */
+  /** Await every in-flight retry run and latch re-check round, for at most `settleFlushes` clock flushes. */
   async function settleRuns(): Promise<void> {
     let settled = false
-    const all = Promise.all(runKeys().map((key) => controller.whenRunSettled(key))).then(() => {
+    const all = Promise.all([
+      ...runKeys().map((key) => controller.whenRunSettled(key)),
+      ...recheckKeys().map((key) => latchRecheck.whenRoundSettled(key)),
+    ]).then(() => {
       settled = true
     })
     for (let flushes = 0; flushes < settleFlushes && !settled; flushes++) await clock.flush()
@@ -2766,16 +2887,17 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   }
 
   /**
-   * Await every configured persona's launch in flight and every retry run in
-   * flight, and then every running dialog approver's next sleep on the
-   * harness clock (or its stop), in 1 ms real-time steps, for at most
-   * `settleMs`.
+   * Await every configured persona's launch in flight, every retry run and
+   * every latch re-check round in flight, and then every running dialog
+   * approver's next sleep on the harness clock (or its stop), in 1 ms
+   * real-time steps, for at most `settleMs`.
    */
   async function settleLaunches(): Promise<void> {
     let settled = false
     const all = Promise.all([
       ...keys.map((key) => whenLaunchSettled(key)),
       ...runKeys().map((key) => controller.whenRunSettled(key)),
+      ...recheckKeys().map((key) => latchRecheck.whenRoundSettled(key)),
       ...retriesAtOnceInFlight,
       ...ruleRunsInFlight,
     ]).then(() => {
@@ -3167,6 +3289,29 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       }
     },
     latchEvents,
+    latchSet: Object.freeze({
+      set: (key: string, input: Parameters<ConflictLatch['set']>[1]) => latch.set(key, input),
+      setFromConflict: (key: string, value: unknown, fields: Parameters<ConflictLatch['setFromConflict']>[2]) => latch.setFromConflict(key, value, fields),
+      setFromUnusableName: (key: string, value: unknown, rowState: Parameters<ConflictLatch['setFromUnusableName']>[2]) =>
+        latch.setFromUnusableName(key, value, rowState),
+      setLaunchStartNotRecorded: (key: string, rowState: Parameters<ConflictLatch['setLaunchStartNotRecorded']>[1]) =>
+        latch.setLaunchStartNotRecorded(key, rowState),
+      setProbeDropped: (key: string) => latch.setProbeDropped(key),
+    }),
+    latchRecheck: Object.freeze({
+      isArmed: (key: string) => latchRecheck.isArmed(key),
+      armedKeys: () => latchRecheck.armedKeys(),
+      whenRoundSettled: (key: string) => latchRecheck.whenRoundSettled(key),
+      nextDueAt: () => nextDueOf(latchRecheckTimers),
+      pendingTimers: () => latchRecheckTimers.size,
+    }),
+    async advanceToRecheck() {
+      const due = nextDueOf(latchRecheckTimers)
+      if (due === undefined) throw new Error('recovery harness: no latch re-check timer is pending')
+      await advance(due - clock.now())
+      await settleLaunches()
+      return due
+    },
     slowRecovery: Object.freeze({ count: (key: string) => slowRecovery.count(key), isOpen: (key: string) => slowRecovery.isOpen(key) }),
     lostMessageNotices,
     slack: slackStubOf,
@@ -3293,6 +3438,11 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       // the abort's per-episode state (SRJ-412), as a new process starts
       // with none.
       episodes.forget(key)
+      // Its latch and its latch re-check timer (b.jg5 SRJ-504, SRJ-505): a
+      // new process holds none; dropped silently, the timer stopped through
+      // the forget observer and once more directly.
+      latch.forget(key)
+      latchRecheck.stop(key)
       if (ownLaunchRecordOf(key) !== undefined || stuckLaunchAbort?.isAbortUsed(key) === true) {
         throw new Error(`recovery harness: persona ${key}'s own-launch record or stuck-launch abort state outlived restartServer`)
       }
@@ -3341,6 +3491,9 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       // controller closes.
       void sequences.close()
       controller.close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
+      // As main()'s shutdown (b.jg5 SRJ-505), right after the controller:
+      // every latch re-check timer stops and none is armed again.
+      latchRecheck.stopAll()
       episodes.close()
       waitUnclassifiedErrors.close()
       // As main()'s shutdown (b.jg5 SRJ-404): every approver is marked and
@@ -3453,6 +3606,8 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       for (const handle of approverTimers) clock.clearTimeout(handle)
       approverTimers.clear()
       controller.stopAll('the recovery harness is cleaned up')
+      // Every latch re-check timer, before the pending timers are counted.
+      latchRecheck.stopAll()
       episodes.forgetAll()
       waitUnclassifiedErrors.close()
       lostMessageDriver?.hold.cancelAll()

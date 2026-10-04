@@ -174,8 +174,60 @@
  * session" row is SRJ-613's kill backstop (`killBackstop`: the abort's kill
  * on a `pending` row answering it latches the persona with nothing sent).
  * Its UNUSABLE NAME rows: one per fault, refused operation none, recording
- * `pending` ({@link STUCK_LAUNCH_ABORT_UNUSABLE_NAME_CASE_ROWS}). The latch
- * re-check's columns are E30's.
+ * `pending` ({@link STUCK_LAUNCH_ABORT_UNUSABLE_NAME_CASE_ROWS}).
+ *
+ * The re-check columns (E30; b.jg5 SRJ-505, SRJ-506, SRJ-1005, SRJ-1304):
+ * every row of every site kind (the CONFLICT rows, the sequence `resume`
+ * rows, the UNUSABLE NAME rows, the launch-start rows and the note rows
+ * below) carries `recheck`, its {@link RecheckColumns}:
+ *   - `readVerb`: the read step 1 makes, `get` for "conflicting labels",
+ *     `status` otherwise;
+ *   - `action`: SRJ-505's table action for the row's refused operation and
+ *     case (`RECHECK_ACTION_*` of `src/conflict-latch.ts`);
+ *   - `entries`, one per state step 1 can read ({@link RecheckReadingName}: a
+ *     failed read, no row, `pending`, `waiting`, `ended`, `missing`, and for
+ *     a `get` row those three states with the note on the row; select one
+ *     with {@link recheckEntryAt}). Each holds the reading (`reading`), the
+ *     whole decision (`decision`: step 1's outcome, the action, the one call
+ *     after the read, and SRJ-1005's reason when the reading clears), the
+ *     call for a retired key (`retiredKeyCall`: the reuse in place of a
+ *     `resume` or a plain spawn) and, for a call one verb answers (the probe,
+ *     the lap `read-pane`, a plain spawn, a reuse, a `resume`), what its
+ *     answers do ({@link RecheckAnswers}: still latched, cleared with their
+ *     reason, a probe that finds the condition cleared, a relatch with its
+ *     case, no information, CONFIG).
+ * The decisions are written from SRJ-505's text here, never by calling
+ * `decideLatchRecheck`, so a test compares the two. Thus a plain-spawn row
+ * reads: no row, the plain spawn; `pending`, no retry; `ended` or
+ * `missing`, a spawn with `--reuse-finished` (on E28 T4's `rowAfter`, which
+ * gives the recorded state); a `resume` or reuse row (HO rev 28): a live
+ * row, `pending` included, no call and no post; `ended` or `missing`, the
+ * case's probe or retry; no row, a `resume` latch cleared and a reuse latch's
+ * reuse retried as a fresh spawn, whatever the case ("another agent-director
+ * store" is a no-probe retry; "conflicting labels" with no note on a
+ * `pending` row makes the one-line `read-pane` and no launch); a "not this
+ * launch's session" row at any verb: `status` only, the finished-row retry
+ * on `ended`, `missing` or no row ({@link FINISHED_ROW_RETRY_ENTRIES}: its one
+ * `get`, then the launch per row state); the hold rows: `status` only. The
+ * `resume` and reuse "this row's own id" rows also carry
+ * `probeDroppedRecheck`, the columns once the episode's probe is dropped.
+ * Every CONFLICT row also carries `record(key)` and every row `latchOn(latch,
+ * key)`, which latches persona `key` as the row's site does through the
+ * latch's own set entry ({@link RecheckLatchEntries}). Answer sets built with
+ * the stub's builders: {@link recheckNoInformationAnswers},
+ * {@link RECHECK_CONFIG_ANSWER}, {@link RECHECK_UNUSABLE_NAME_ANSWER} and the
+ * one-line probe's {@link RECHECK_PANE_ANSWER}, {@link RECHECK_GONE_ANSWER}
+ * and {@link recheckPaneConflictAnswer}; a `resume`'s or reuse's refusals
+ * carry HO rev 28's restore sentences (the stub's `withRestoreSentence` with
+ * `RESTORE_SENTENCES`, and `errTmuxSessionCreateStaysPending`), on which no
+ * expectation depends. Each CONFLICT answer is checked at import to
+ * recognise as the case its column says.
+ *
+ * The note rows ({@link NOTE_LATCH_CASE_ROWS}, b.jg5 SRJ-114): a latch from
+ * the `provenance_conflict` note on P's own row read `pending`, `waiting`
+ * or `ended` ("conflicting labels", P's bring-up refused, the state read),
+ * each with `build(persona, home)` (the row as a `get` answers it),
+ * `notice(key)`, `record(key)`, `latchOn` and `recheck`.
  *
  * The `resume` rows (b.jg5 SRJ-113, SRJ-501, SRJ-507; HO rev 15, rev 20):
  * the site kind `resume`, each refusing the `resume`
@@ -409,9 +461,39 @@ import {
   LATCH_CASE_PANE_NOT_FOUND,
   LATCH_CASE_UNRECOGNISED,
   LATCH_CASE_UNUSABLE_RECORDED_NAME,
+  LATCH_RECOVERY_REASON_RELAUNCH_NOT_REFUSED,
+  LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED,
+  LATCH_RECOVERY_REASON_ROW_GONE,
+  LATCH_ROW_STATE_KIND_NO_ROW,
   LATCH_ROW_STATE_KIND_READ,
   LATCH_ROW_STATE_NO_ROW,
   LATCH_ROW_STATE_UNREADABLE,
+  RECHECK_ACTION_CONFLICTING_LABELS,
+  RECHECK_ACTION_NONE,
+  RECHECK_ACTION_PLAIN_SPAWN_RETRY,
+  RECHECK_ACTION_PROBE,
+  RECHECK_ACTION_RESTART_DECISION,
+  RECHECK_ACTION_RETRY,
+  RECHECK_ACTION_STATUS_ONLY,
+  RECHECK_CALL_FINISHED_ROW,
+  RECHECK_CALL_NONE,
+  RECHECK_CALL_PENDING_READ_PANE,
+  RECHECK_CALL_PLAIN_SPAWN,
+  RECHECK_CALL_PROBE,
+  RECHECK_CALL_RESTART_DECISION,
+  RECHECK_CALL_RESUME,
+  RECHECK_CALL_REUSE_SPAWN,
+  RECHECK_READING_FAILED_VALUE,
+  RECHECK_READING_NO_ROW,
+  RECHECK_READING_NO_ROW_VALUE,
+  RECHECK_READING_STATE,
+  RECHECK_STEP_CLEAR_GONE,
+  RECHECK_STEP_CLEAR_REPORTED_IN,
+  RECHECK_STEP_FINISHED_ROW_RETRY,
+  RECHECK_STEP_NO_INFORMATION,
+  RECHECK_STEP_SPAWN_RETRY,
+  RECHECK_STEP_TABLE,
+  REFUSED_OPERATION_BRING_UP,
   REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
   REFUSED_OPERATION_NONE,
   REFUSED_OPERATION_PLAIN_SPAWN,
@@ -421,25 +503,37 @@ import {
   UNUSABLE_NAME_NOTICE_POINTER,
   UNUSABLE_NAME_NOTICE_REASON,
   UNUSABLE_NAME_NOTICE_SEPARATOR,
+  latchRecoveryReasonRowReads,
   latchRowStateRead,
   launchStartNotRecordedNoticeText,
   launchStartNotRecordedSetInput,
+  recogniseConflictCase,
   takesUnrecognisedHandling,
   unusableNameNoticeText,
   unusableNameSetInput,
   type ConflictCaseWithSentence,
+  type ConflictLatch,
   type ConflictLatchCase,
   type ConflictLatchRecord,
   type ConflictLatchSetInput,
+  type ConflictLatchSetOutcome,
+  type LatchCase,
+  type LatchRecheckAction,
+  type LatchRecheckCall,
+  type LatchRecheckDecision,
+  type LatchRecheckReading,
+  type LatchRecheckStep,
+  type LatchRecoveryReason,
   type LatchRowState,
   type RefusedOperation,
 } from '../../src/conflict-latch.ts'
-import { classifyAdError } from '../../src/ad-error-class.ts'
+import { classifyAdError, conflictDescriptionOf } from '../../src/ad-error-class.ts'
 import { renderLogMessageText } from '../../src/persona-connection-errors.ts'
 import { personaInstanceId, personaTmuxSessionName } from '../../src/persona-identity.ts'
 import { PROMPT_ROW_STATES, STUCK_LAUNCH_ABORT_SITE, type ApproverVerb } from '../../src/session-manager.ts'
 import { escapeSlackControlCharacters } from '../../src/slack-text-escape.ts'
 import {
+  RESTORE_SENTENCES,
   SAMPLE_LAUNCH_START_NONE,
   SAMPLE_LAUNCH_START_WHOLE,
   SAMPLE_LAUNCH_STARTS,
@@ -448,9 +542,20 @@ import {
   cannedGetResult,
   cannedListRow,
   cannedStatusResult,
+  errConfigMalformed,
+  errInstanceIdCollision,
+  errInternal,
+  errSchemaMismatch,
+  errSpawnNotFound,
+  errTmuxCaptureFailed,
+  errTmuxNotAvailable,
   errTmuxSessionConflict,
+  errTmuxSessionCreate,
+  errTmuxSessionCreateStaysPending,
   errUnusableName,
   provenanceNote,
+  unavailableForms,
+  withRestoreSentence,
   type CannedGetResult,
   type CannedRowPersona,
   type ConflictCase,
@@ -706,6 +811,23 @@ export interface ConflictCaseRow {
    * row, so the row's `rowState` is its reading (no row, or `ended`).
    */
   readonly rowAfter?: PlainSpawnRowAfter
+  /** The whole latch record a latch of persona `key` from this row holds ({@link expectedLatchRecord} of the set `setFromConflict` makes). */
+  readonly record: (key: string) => ConflictLatchRecord
+  /**
+   * Latch persona `key` as the row's site does, through the latch's
+   * `setFromConflict` with the row's error, refused operation and recorded
+   * state; answers the set's outcome.
+   */
+  readonly latchOn: (latch: RecheckLatchEntries, key: string) => ConflictLatchSetOutcome | undefined
+  /** The re-check's columns for this row (E30; b.jg5 SRJ-505): see {@link RecheckColumns}. */
+  readonly recheck: RecheckColumns
+  /**
+   * Set on the `resume` and reuse "this row's own id" rows only: the
+   * columns once the episode's probe is dropped (the record's
+   * `probeDropped`, set by the latch's `setProbeDropped`): the latched
+   * operation retried with no probe.
+   */
+  readonly probeDroppedRecheck?: RecheckColumns
 }
 
 /** The row a plain spawn's CONFLICT leaves (`ConflictCaseRow.rowAfter`): none after the pre-spawn scan's refusal, `ended` after "duplicate session". */
@@ -938,6 +1060,497 @@ const PENDING = latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE)
 const ASK_USER = latchRowStateRead('ask_user')
 const CHECK_PERMISSION = latchRowStateRead('check_permission')
 
+// ---------------------------------------------------------------------------
+// The re-check columns (E30; b.jg5 SRJ-505, SRJ-506, SRJ-1005, SRJ-1304)
+// ---------------------------------------------------------------------------
+
+/** The read step 1 makes of P's row: `get` for "conflicting labels" (only `get` shows a note), `status` otherwise. */
+export type RecheckReadVerb = 'status' | 'get'
+
+/**
+ * One answer to a re-check's call as a case scripts it (on the stub, or as
+ * the row model's scripted answer): an error the call rejects with, or
+ * `undefined` for the call's own success (a pane; a launch that was not
+ * refused).
+ */
+export interface RecheckAnswer {
+  /** Readable name for `test.each`. */
+  readonly name: string
+  readonly answer: () => Error | undefined
+}
+
+/** An answer that clears the latch, with SRJ-1005's reason for the recovery notice. */
+export interface RecheckClearingAnswer extends RecheckAnswer {
+  readonly reason: LatchRecoveryReason
+}
+
+/** An answer that relatches P with another case: a new episode with one new post. */
+export interface RecheckRelatchingAnswer extends RecheckAnswer {
+  readonly latchCase: LatchCase
+}
+
+/**
+ * What the answers to one re-check call do (b.jg5 SRJ-505's "Still latched"
+ * and "Cleared" columns, SRJ-506's retry answers), for the calls whose verb
+ * is one: the probe and the lap `read-pane` (`read-pane`), a plain spawn or a
+ * reuse (`spawn`) and a `resume`. A run of the restart path's decision and
+ * the finished-row retry have none here (their answers are a run's, and
+ * {@link FINISHED_ROW_RETRY_ENTRIES}' each launch's).
+ */
+export interface RecheckAnswers {
+  /** The agent-director verb the call makes. */
+  readonly verb: string
+  /**
+   * Keep P latched, the record unchanged, with no post and no further call:
+   * the probe's still-latched answer, a CONFLICT with the latch's own case
+   * (a `resume`'s or reuse's also with each of HO rev 28's restore
+   * sentences, which decide nothing), and, at the probe, a CONFLICT with
+   * another case (kept as it is: no relatch).
+   */
+  readonly stillLatched: readonly RecheckAnswer[]
+  /** Clear the latch (a retry's answer that was not refused, a definite failure, the lap `read-pane`'s pane or GONE). */
+  readonly cleared: readonly RecheckClearingAnswer[]
+  /** The probe only: answers that find the condition cleared; P stays latched (SRJ-506's `find-missing` and single retry follow). */
+  readonly probeFoundCleared: readonly RecheckAnswer[]
+  /** Relatch P: a CONFLICT with another case at a retry or the lap `read-pane`, and UNUSABLE NAME at any call. */
+  readonly relatches: readonly RecheckRelatchingAnswer[]
+  /** Give no information: P stays latched, nothing starts, nothing is raised, armed or fed ({@link recheckNoInformationAnswers}). */
+  readonly noInformation: readonly RecheckAnswer[]
+  /** CONFIG: P stays latched and `ad-config-malformed` is raised ({@link RECHECK_CONFIG_ANSWER}). */
+  readonly config: RecheckAnswer
+}
+
+/** One state step 1 can read (`RECHECK_READING_NAMES`): a failed read, no row, a state, or (a `get` only) a state with the note. */
+export type RecheckReadingName =
+  | 'read fails'
+  | 'no row'
+  | 'pending'
+  | 'waiting'
+  | 'ended'
+  | 'missing'
+  | 'pending, with the note'
+  | 'waiting, with the note'
+  | 'ended, with the note'
+
+/**
+ * One entry of a row's re-check columns: what step 1's read gave and what
+ * the re-check then does, as SRJ-505 says.
+ */
+export interface RecheckEntry {
+  readonly name: RecheckReadingName
+  /** Step 1's reading (`src/conflict-latch.ts`'s `LatchRecheckReading`; a `get` reading says whether the note is on the row). */
+  readonly reading: LatchRecheckReading
+  /**
+   * The re-check's decision for the row's record and that reading, whole
+   * (`decideLatchRecheck`'s answer, `LatchRecheckDecision`): step 1's
+   * outcome, the action, the one call after the read (none for a "still
+   * latched" reading) and, for a reading that clears, SRJ-1005's reason.
+   */
+  readonly decision: LatchRecheckDecision
+  /** The call when the key is recorded in `retired-keys.json` (b.jg5 SRJ-805): a `resume` or a plain spawn is the reuse. */
+  readonly retiredKeyCall: LatchRecheckCall
+  /** What the call's answers do; absent for no call, a run of the restart path's decision and the finished-row retry. */
+  readonly answers?: RecheckAnswers
+}
+
+/**
+ * The re-check's columns of one latch case row (E30; b.jg5 SRJ-505,
+ * SRJ-1304): the read step 1 makes, SRJ-505's table action for the row's
+ * refused operation and case, and one entry per state step 1 can read.
+ */
+export interface RecheckColumns {
+  readonly readVerb: RecheckReadVerb
+  /** SRJ-505's "Re-check action" for the row's (refused operation, case): `RECHECK_ACTION_*`. */
+  readonly action: LatchRecheckAction
+  readonly entries: readonly RecheckEntry[]
+}
+
+/** The latch's set entries a latching site sets it through (a `ConflictLatch` fits; the recovery harness's `latchSet`). */
+export type RecheckLatchEntries = Pick<ConflictLatch, 'set' | 'setFromConflict' | 'setFromUnusableName' | 'setLaunchStartNotRecorded'>
+
+/** The live state a row reads once its session has reported in, as the entries read it. */
+const REPORTED_IN_STATE = cannedStatusResult().state
+
+/** The live states a row has reported in by (SRJ-505 step 1): every live state but `pending`. */
+const REPORTED_IN_STATES: ReadonlySet<string> = new Set([...AGENT_DIRECTOR_LIVE_STATES].filter((state) => state !== AGENT_DIRECTOR_PENDING_STATE))
+
+/** A step-1 reading of a row in `state`, with the note (a `get`'s) or not; a `status` reading says nothing of the note. */
+function stateReading(state: string, readVerb: RecheckReadVerb, note = false): LatchRecheckReading {
+  return readVerb === 'get' ? Object.freeze({ kind: RECHECK_READING_STATE, state, notePresent: note }) : Object.freeze({ kind: RECHECK_READING_STATE, state })
+}
+
+/** The step-1 readings a row of `readVerb` gets an entry for, in entry order. */
+function step1Readings(readVerb: RecheckReadVerb): ReadonlyArray<readonly [RecheckReadingName, LatchRecheckReading]> {
+  const plain: Array<readonly [RecheckReadingName, LatchRecheckReading]> = [
+    ['read fails', RECHECK_READING_FAILED_VALUE],
+    ['no row', RECHECK_READING_NO_ROW_VALUE],
+    ['pending', stateReading(AGENT_DIRECTOR_PENDING_STATE, readVerb)],
+    ['waiting', stateReading(REPORTED_IN_STATE, readVerb)],
+    ['ended', stateReading(LIVENESS_DEAD_ROW_ENDED, readVerb)],
+    ['missing', stateReading(LIVENESS_DEAD_ROW_MISSING, readVerb)],
+  ]
+  if (readVerb === 'status') return plain
+  return [
+    ...plain,
+    ['pending, with the note', stateReading(AGENT_DIRECTOR_PENDING_STATE, readVerb, true)],
+    ['waiting, with the note', stateReading(REPORTED_IN_STATE, readVerb, true)],
+    ['ended, with the note', stateReading(LIVENESS_DEAD_ROW_ENDED, readVerb, true)],
+  ]
+}
+
+/** The record fields the re-check decides on. */
+interface RecheckRecord {
+  readonly latchCase: LatchCase
+  readonly refusedOperation: RefusedOperation
+  readonly rowState: LatchRowState
+  readonly probeDropped?: true
+}
+
+/** The CONFLICT a re-check's "same case" and "another case" answers are built from: the stub's case and options. */
+interface RecheckStubCase {
+  readonly stubCase: ConflictCase
+  readonly options: ConflictOptions
+}
+
+/** The cases SRJ-505's no-probe retry row names for a `resume`, a reuse or a bring-up. */
+const NO_PROBE_RETRY_CASES: ReadonlySet<LatchCase> = new Set<LatchCase>([
+  LATCH_CASE_NO_VALID_ID,
+  LATCH_CASE_DIFFERENT_ID,
+  LATCH_CASE_ANOTHER_STORE,
+  LATCH_CASE_LEFTOVER,
+])
+
+/** Whether the refused operation is a `resume` or a reuse: the launches HO rev 28 gates on step 1's read. */
+function isLatchedLaunch(refusedOperation: RefusedOperation): boolean {
+  return refusedOperation === REFUSED_OPERATION_RESUME || refusedOperation === REFUSED_OPERATION_REUSE_SPAWN
+}
+
+/**
+ * SRJ-505's table action for a record: the first table row that matches its
+ * refused operation and case (the "this row's own id" probe dropped for the
+ * episode, then the probe, then the no-probe retry, the plain spawn, "not
+ * this launch's session", "conflicting labels", the two hold cases, and
+ * unrecognised text with "never reported in"); none for a pair no row names.
+ */
+function recheckTableAction(record: RecheckRecord): LatchRecheckAction {
+  const { latchCase, refusedOperation } = record
+  if (isLatchedLaunch(refusedOperation) && latchCase === LATCH_CASE_OWN_ID) {
+    return record.probeDropped === true ? RECHECK_ACTION_RETRY : RECHECK_ACTION_PROBE
+  }
+  if (latchCase === LATCH_CASE_PANE_NOT_FOUND) return RECHECK_ACTION_PROBE
+  if (NO_PROBE_RETRY_CASES.has(latchCase) && isLatchedLaunch(refusedOperation)) return RECHECK_ACTION_RETRY
+  if (NO_PROBE_RETRY_CASES.has(latchCase) && refusedOperation === REFUSED_OPERATION_BRING_UP) return RECHECK_ACTION_RESTART_DECISION
+  if (refusedOperation === REFUSED_OPERATION_PLAIN_SPAWN) return RECHECK_ACTION_PLAIN_SPAWN_RETRY
+  if (latchCase === LATCH_CASE_NOT_THIS_LAUNCH) return RECHECK_ACTION_STATUS_ONLY
+  if (latchCase === LATCH_CASE_CONFLICTING_LABELS) return RECHECK_ACTION_CONFLICTING_LABELS
+  if (latchCase === LATCH_CASE_UNUSABLE_RECORDED_NAME || latchCase === LATCH_CASE_LAUNCH_START_NOT_RECORDED) return RECHECK_ACTION_STATUS_ONLY
+  return RECHECK_ACTION_NONE
+}
+
+/** Whether no table row names the record's pair: step 1 only, with one line naming it (hatch A3). */
+function isUnmatchedPair(record: RecheckRecord): boolean {
+  return recheckTableAction(record) === RECHECK_ACTION_NONE && !takesUnrecognisedHandling(record.latchCase)
+}
+
+/**
+ * Whether the latch record shows the row had not reported in when the latch
+ * was set (SRJ-505 step 1): it then read `pending`, `ended` or `missing`, or
+ * there was no row. An unreadable state, or a live one, did not.
+ */
+function recordedBeforeReportingIn(rowState: LatchRowState): boolean {
+  if (rowState.kind === LATCH_ROW_STATE_KIND_NO_ROW) return true
+  if (rowState.kind !== LATCH_ROW_STATE_KIND_READ) return false
+  return rowState.state === AGENT_DIRECTOR_PENDING_STATE || AGENT_DIRECTOR_DEAD_STATES.has(rowState.state)
+}
+
+function decision(step: LatchRecheckStep, action: LatchRecheckAction, call: LatchRecheckCall = RECHECK_CALL_NONE, reason?: LatchRecoveryReason): LatchRecheckDecision {
+  return Object.freeze({ step, action, call, ...(reason === undefined ? {} : { clear: Object.freeze({ reason }) }) })
+}
+
+/**
+ * The re-check's decision for `record` on step 1's `reading`, written from
+ * SRJ-505's text (step 1's three bullets, then the first matching table
+ * row, HO rev 28's gate on a latched `resume` or reuse, and hatch A3's
+ * unmatched pair), so the table checks `decideLatchRecheck` independently.
+ */
+function expectedRecheckDecision(record: RecheckRecord, reading: LatchRecheckReading): LatchRecheckDecision {
+  const { latchCase, refusedOperation } = record
+  const action = recheckTableAction(record)
+  // Step 1: a failed read gives no information.
+  if (reading.kind !== RECHECK_READING_STATE && reading.kind !== RECHECK_READING_NO_ROW) {
+    return decision(RECHECK_STEP_NO_INFORMATION, RECHECK_ACTION_NONE)
+  }
+  // Step 1: `ErrSpawnNotFound` clears, except "not this launch's session"
+  // (the finished-row retry) and a spawn latch (that spawn retried, whatever
+  // the case, with no probe; HO rev 15).
+  if (reading.kind === RECHECK_READING_NO_ROW) {
+    if (latchCase === LATCH_CASE_NOT_THIS_LAUNCH) return decision(RECHECK_STEP_FINISHED_ROW_RETRY, RECHECK_ACTION_STATUS_ONLY, RECHECK_CALL_FINISHED_ROW)
+    if (refusedOperation === REFUSED_OPERATION_PLAIN_SPAWN) return decision(RECHECK_STEP_SPAWN_RETRY, RECHECK_ACTION_PLAIN_SPAWN_RETRY, RECHECK_CALL_PLAIN_SPAWN)
+    if (refusedOperation === REFUSED_OPERATION_REUSE_SPAWN) return decision(RECHECK_STEP_SPAWN_RETRY, RECHECK_ACTION_RETRY, RECHECK_CALL_REUSE_SPAWN)
+    return decision(RECHECK_STEP_CLEAR_GONE, RECHECK_ACTION_NONE, RECHECK_CALL_NONE, LATCH_RECOVERY_REASON_ROW_GONE)
+  }
+  const { state } = reading
+  const noted = latchCase === LATCH_CASE_CONFLICTING_LABELS && reading.notePresent === true
+  // Step 1: a row that has reported in since the latch was set clears it,
+  // never for "not this launch's session", nor while the note keeps a
+  // "conflicting labels" latch.
+  if (REPORTED_IN_STATES.has(state) && recordedBeforeReportingIn(record.rowState) && latchCase !== LATCH_CASE_NOT_THIS_LAUNCH && !noted) {
+    return decision(RECHECK_STEP_CLEAR_REPORTED_IN, RECHECK_ACTION_NONE, RECHECK_CALL_NONE, latchRecoveryReasonRowReads(state))
+  }
+  // Step 2.
+  const finished = AGENT_DIRECTOR_DEAD_STATES.has(state)
+  const latchedLaunch = refusedOperation === REFUSED_OPERATION_RESUME ? RECHECK_CALL_RESUME : RECHECK_CALL_REUSE_SPAWN
+  // HO rev 28: a latched `resume` or reuse is probed or retried only on a row read `ended` or `missing`.
+  const gated = (call: LatchRecheckCall): LatchRecheckCall => (isLatchedLaunch(refusedOperation) && !finished ? RECHECK_CALL_NONE : call)
+  const table = (call: LatchRecheckCall = RECHECK_CALL_NONE, reason?: LatchRecoveryReason): LatchRecheckDecision =>
+    decision(RECHECK_STEP_TABLE, action, call, reason)
+  switch (action) {
+    case RECHECK_ACTION_PROBE:
+      return table(gated(RECHECK_CALL_PROBE))
+    case RECHECK_ACTION_RETRY:
+      return table(gated(latchedLaunch))
+    case RECHECK_ACTION_RESTART_DECISION:
+      return table(RECHECK_CALL_RESTART_DECISION)
+    case RECHECK_ACTION_PLAIN_SPAWN_RETRY:
+      // With `--reuse-finished` on a finished row, never a plain spawn; no retry on a live one, `pending` included.
+      return table(finished ? RECHECK_CALL_REUSE_SPAWN : RECHECK_CALL_NONE)
+    case RECHECK_ACTION_STATUS_ONLY:
+      if (latchCase === LATCH_CASE_NOT_THIS_LAUNCH) {
+        return finished ? decision(RECHECK_STEP_FINISHED_ROW_RETRY, action, RECHECK_CALL_FINISHED_ROW) : table()
+      }
+      // "launch start not recorded": a row read `ended` or `missing` clears it.
+      if (latchCase === LATCH_CASE_LAUNCH_START_NOT_RECORDED && finished) return table(RECHECK_CALL_NONE, latchRecoveryReasonRowReads(state))
+      return table()
+    case RECHECK_ACTION_CONFLICTING_LABELS:
+      if (noted) return table()
+      if (state === AGENT_DIRECTOR_PENDING_STATE) return table(RECHECK_CALL_PENDING_READ_PANE)
+      if (!finished) return table(RECHECK_CALL_RESTART_DECISION)
+      return table(isLatchedLaunch(refusedOperation) ? latchedLaunch : RECHECK_CALL_RESTART_DECISION)
+    default:
+      return isUnmatchedPair(record) ? Object.freeze({ ...table(), unmatched: true as const }) : table()
+  }
+}
+
+/** `call` as made for a key recorded in `retired-keys.json` (b.jg5 SRJ-805): a `resume` or a plain spawn is the reuse. */
+function retiredKeyCallOf(call: LatchRecheckCall): LatchRecheckCall {
+  return call === RECHECK_CALL_RESUME || call === RECHECK_CALL_PLAIN_SPAWN ? RECHECK_CALL_REUSE_SPAWN : call
+}
+
+/** The verb a re-check call makes, for the calls {@link RecheckAnswers} covers. */
+function recheckCallVerb(call: LatchRecheckCall): string | undefined {
+  switch (call) {
+    case RECHECK_CALL_PROBE:
+    case RECHECK_CALL_PENDING_READ_PANE:
+      return 'read-pane'
+    case RECHECK_CALL_PLAIN_SPAWN:
+    case RECHECK_CALL_REUSE_SPAWN:
+      return SPAWN_VERB
+    case RECHECK_CALL_RESUME:
+      return 'resume'
+    default:
+      return undefined
+  }
+}
+
+/** A CONFLICT answer built through the stub, checked to recognise as `expected` (or, with `not`, as any other case). */
+function conflictAnswer(name: string, verb: string, stubCase: ConflictCase, options: ConflictOptions, expected: LatchCase, not = false): RecheckAnswer {
+  const answer = (): Error => errTmuxSessionConflict(verb, stubCase, STUB_TMUX_SESSION_NAME, options)
+  const recognised = recogniseConflictCase(conflictDescriptionOf(answer()))
+  if ((recognised === expected) === not) {
+    throw new Error(`conflict-cases: the ${verb} CONFLICT ${stubCase} recognises as ${recognised}, ${not ? 'which must differ from' : 'not'} ${expected}`)
+  }
+  return Object.freeze({ name, answer })
+}
+
+/** A built answer as a {@link RecheckAnswer}. */
+function builtAnswer(name: string, build: () => Error | undefined): RecheckAnswer {
+  return Object.freeze({ name, answer: build })
+}
+
+/** A pane (the one-line `read-pane`'s success): the call answers the pane. */
+export const RECHECK_PANE_ANSWER: RecheckAnswer = builtAnswer('a pane', () => undefined)
+
+/** GONE at the one-line `read-pane`: `ErrTmuxCaptureFailed`. */
+export const RECHECK_GONE_ANSWER: RecheckAnswer = builtAnswer('ErrTmuxCaptureFailed (GONE)', () => errTmuxCaptureFailed())
+
+/** A CONFLICT at the one-line `read-pane`, built through the stub's `errTmuxSessionConflict('read-pane', …)`. */
+export function recheckPaneConflictAnswer(stubCase: ConflictCase, options: ConflictOptions = {}): RecheckAnswer {
+  return builtAnswer(`ErrTmuxSessionConflict (${stubCase})`, () => errTmuxSessionConflict('read-pane', stubCase, STUB_TMUX_SESSION_NAME, options))
+}
+
+/** CONFIG at any re-check call: `ErrConfigMalformed` (keeps the latch, raises `ad-config-malformed`). */
+export const RECHECK_CONFIG_ANSWER: RecheckAnswer = builtAnswer('ErrConfigMalformed (CONFIG)', () => errConfigMalformed())
+
+/** UNUSABLE NAME at any re-check call: the stub's `errUnusableName()` (relatches with "unusable recorded name"). */
+export const RECHECK_UNUSABLE_NAME_ANSWER: RecheckRelatchingAnswer = Object.freeze({
+  ...builtAnswer('ErrInternal, unusable recorded name (UNUSABLE NAME)', () => errUnusableName()),
+  latchCase: LATCH_CASE_UNUSABLE_RECORDED_NAME,
+})
+
+/**
+ * The answers that give a re-check no information at a call of `verb`
+ * (b.jg5 SRJ-505, AC 71): UNAVAILABLE (`ErrTmuxUnresponsive`,
+ * `ErrCallTimeout`, `ErrUnknownErrorName`), ENVIRONMENT
+ * (`ErrTmuxNotAvailable`) and UNCLASSIFIED (an `ErrInternal` that is no
+ * unusable recorded name, `ErrSchemaMismatch`); at `read-pane` also an
+ * absent row (`ErrSpawnNotFound`), and at a spawn `ErrInstanceIdCollision`.
+ */
+export function recheckNoInformationAnswers(verb: string): readonly RecheckAnswer[] {
+  return Object.freeze([
+    ...unavailableForms('ErrTmuxUnresponsive', 'ErrCallTimeout', 'ErrUnknownErrorName').map(([label, make]) => builtAnswer(`${label} (UNAVAILABLE)`, () => make(verb))),
+    builtAnswer('ErrTmuxNotAvailable (ENVIRONMENT)', () => errTmuxNotAvailable(undefined, verb)),
+    builtAnswer('ErrInternal (UNCLASSIFIED)', () => errInternal()),
+    builtAnswer('ErrSchemaMismatch (UNCLASSIFIED)', () => errSchemaMismatch()),
+    ...(verb === 'read-pane' ? [builtAnswer('ErrSpawnNotFound (absent)', () => errSpawnNotFound())] : []),
+    ...(verb === SPAWN_VERB ? [builtAnswer('ErrInstanceIdCollision', () => errInstanceIdCollision())] : []),
+  ])
+}
+
+/** The stub case of a CONFLICT with a case other than `latchCase` at a launch `call`. */
+function anotherLaunchCase(call: LatchRecheckCall, latchCase: LatchCase): readonly [ConflictCase, LatchCase] {
+  if (latchCase === LATCH_CASE_LEFTOVER) return ['no-valid-id', LATCH_CASE_NO_VALID_ID]
+  return [call === RECHECK_CALL_PLAIN_SPAWN ? 'scan-leftover' : 'leftover', LATCH_CASE_LEFTOVER]
+}
+
+/**
+ * What the answers to re-check `call` do for a latch of `latchCase`, its
+ * same-case CONFLICT built from `same`; a clearing answer gives `reason`.
+ * Undefined for a call no verb answers alone.
+ */
+function recheckAnswersFor(call: LatchRecheckCall, latchCase: LatchCase, same: RecheckStubCase, reason: LatchRecoveryReason): RecheckAnswers | undefined {
+  const verb = recheckCallVerb(call)
+  if (verb === undefined) return undefined
+  const sameCase = conflictAnswer('a CONFLICT with the latch\'s own case', verb, same.stubCase, same.options, latchCase)
+  const common = { verb, noInformation: recheckNoInformationAnswers(verb), config: RECHECK_CONFIG_ANSWER }
+  if (call === RECHECK_CALL_PROBE) {
+    const ownId = latchCase === LATCH_CASE_OWN_ID
+    const other = ownId ? (['pane-not-found', LATCH_CASE_PANE_NOT_FOUND] as const) : (['conflicting-labels', LATCH_CASE_CONFLICTING_LABELS] as const)
+    return Object.freeze({
+      ...common,
+      stillLatched: Object.freeze([
+        ...(ownId ? [RECHECK_PANE_ANSWER] : []),
+        sameCase,
+        conflictAnswer('a CONFLICT with another case (kept, no relatch)', verb, other[0], {}, latchCase, true),
+      ]),
+      cleared: Object.freeze([]),
+      probeFoundCleared: Object.freeze(ownId ? [RECHECK_GONE_ANSWER] : [RECHECK_PANE_ANSWER, RECHECK_GONE_ANSWER]),
+      relatches: Object.freeze([RECHECK_UNUSABLE_NAME_ANSWER]),
+    })
+  }
+  if (call === RECHECK_CALL_PENDING_READ_PANE) {
+    return Object.freeze({
+      ...common,
+      stillLatched: Object.freeze([sameCase]),
+      cleared: Object.freeze([
+        Object.freeze({ ...RECHECK_PANE_ANSWER, reason }),
+        Object.freeze({ ...RECHECK_GONE_ANSWER, reason }),
+      ]),
+      probeFoundCleared: Object.freeze([]),
+      relatches: Object.freeze([
+        Object.freeze({ ...conflictAnswer('a CONFLICT with another case', verb, 'pane-not-found', {}, LATCH_CASE_PANE_NOT_FOUND), latchCase: LATCH_CASE_PANE_NOT_FOUND }),
+        RECHECK_UNUSABLE_NAME_ANSWER,
+      ]),
+    })
+  }
+  // A launch: a plain spawn, a reuse or a `resume`. A `resume`'s or reuse's
+  // refusal may carry HO rev 28's restore sentence, which decides nothing.
+  const restores = call === RECHECK_CALL_PLAIN_SPAWN ? [] : RESTORE_SENTENCES
+  const [otherStubCase, otherCase] = anotherLaunchCase(call, latchCase)
+  return Object.freeze({
+    ...common,
+    stillLatched: Object.freeze([
+      sameCase,
+      ...restores.map((sentence) =>
+        builtAnswer(`${sameCase.name}, the restore sentence "${sentence}"`, () => withRestoreSentence(errTmuxSessionConflict(verb, same.stubCase, STUB_TMUX_SESSION_NAME, same.options), sentence)),
+      ),
+    ]),
+    cleared: Object.freeze([
+      Object.freeze({ ...builtAnswer('a launch that is not refused', () => undefined), reason }),
+      Object.freeze({
+        ...(call === RECHECK_CALL_PLAIN_SPAWN
+          ? builtAnswer('ErrTmuxSessionCreate (a definite failure)', () => errTmuxSessionCreate(verb))
+          : builtAnswer('ErrTmuxSessionCreate whose row stays pending (a definite failure)', () => errTmuxSessionCreateStaysPending(verb))),
+        reason,
+      }),
+    ]),
+    probeFoundCleared: Object.freeze([]),
+    relatches: Object.freeze([
+      Object.freeze({ ...conflictAnswer('a CONFLICT with another case', verb, otherStubCase, {}, otherCase), latchCase: otherCase }),
+      RECHECK_UNUSABLE_NAME_ANSWER,
+    ]),
+  })
+}
+
+/**
+ * The re-check columns of a latch with `record`, read with `readVerb`, its
+ * CONFLICT answers built from `same` (a hold latch makes no call, so none).
+ * The entries' order follows {@link RecheckReadingName}.
+ */
+function recheckColumnsOf(record: RecheckRecord, same: RecheckStubCase | undefined): RecheckColumns {
+  const readVerb: RecheckReadVerb = record.latchCase === LATCH_CASE_CONFLICTING_LABELS ? 'get' : 'status'
+  const entries = step1Readings(readVerb).map(([name, reading]): RecheckEntry => {
+    const decided = expectedRecheckDecision(record, reading)
+    const answers = same === undefined ? undefined : recheckAnswersFor(decided.call, record.latchCase, same, LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED)
+    return Object.freeze({
+      name,
+      reading,
+      decision: decided,
+      retiredKeyCall: retiredKeyCallOf(decided.call),
+      ...(answers === undefined ? {} : { answers }),
+    })
+  })
+  return Object.freeze({ readVerb, action: recheckTableAction(record), entries: Object.freeze(entries) })
+}
+
+/** One state of a row read by a "not this launch's session" latch's finished-row retry's one `get`. */
+export interface FinishedRowRetryEntry {
+  /** Readable name for `test.each`. */
+  readonly name: string
+  /** What the one `get` gave. */
+  readonly reading: LatchRecheckReading
+  /** Whether the row read has a session id (`claude_session_id`). */
+  readonly hasSessionId: boolean
+  /** The launch (`decideFinishedRowLaunch`'s answer): a `resume`, a reuse, the plain first spawn, or none. */
+  readonly call: LatchRecheckCall
+  /** The launch for a key recorded in `retired-keys.json`: the reuse in place of a `resume` or a plain spawn (b.jg5 SRJ-805). */
+  readonly retiredKeyCall: LatchRecheckCall
+  /** What the launch's answers do; a launch that is not refused clears with "its row finished and a relaunch was not refused". */
+  readonly answers?: RecheckAnswers
+}
+
+function finishedRowEntry(name: string, reading: LatchRecheckReading, hasSessionId: boolean, call: LatchRecheckCall): FinishedRowRetryEntry {
+  const answers = recheckAnswersFor(call, LATCH_CASE_NOT_THIS_LAUNCH, { stubCase: 'not-this-launch', options: {} }, LATCH_RECOVERY_REASON_RELAUNCH_NOT_REFUSED)
+  return Object.freeze({ name, reading, hasSessionId, call, retiredKeyCall: retiredKeyCallOf(call), ...(answers === undefined ? {} : { answers }) })
+}
+
+/**
+ * A "not this launch's session" latch's finished-row retry (b.jg5 SRJ-505;
+ * hatch A3; HO rev 28), one entry per state its one `get` can read: a
+ * failed read and a row read live (`pending` included) make no launch; a row
+ * read `ended` or `missing` gets a `resume` when it has a session id, else a
+ * reuse; no row left gets the plain first spawn. Never a kill and never a
+ * plain spawn over a row. While the leftover runs, the launch relatches with
+ * "left over from an earlier life" (the plain spawn through the pre-spawn
+ * scan's refusal, which writes no row).
+ */
+export const FINISHED_ROW_RETRY_ENTRIES: readonly FinishedRowRetryEntry[] = Object.freeze([
+  finishedRowEntry('get fails', RECHECK_READING_FAILED_VALUE, false, RECHECK_CALL_NONE),
+  finishedRowEntry('no row', RECHECK_READING_NO_ROW_VALUE, false, RECHECK_CALL_PLAIN_SPAWN),
+  finishedRowEntry('pending', stateReading(AGENT_DIRECTOR_PENDING_STATE, 'get'), true, RECHECK_CALL_NONE),
+  finishedRowEntry('waiting', stateReading(REPORTED_IN_STATE, 'get'), true, RECHECK_CALL_NONE),
+  finishedRowEntry('ended, with a session id', stateReading(LIVENESS_DEAD_ROW_ENDED, 'get'), true, RECHECK_CALL_RESUME),
+  finishedRowEntry('ended, with no session id', stateReading(LIVENESS_DEAD_ROW_ENDED, 'get'), false, RECHECK_CALL_REUSE_SPAWN),
+  finishedRowEntry('missing, with a session id', stateReading(LIVENESS_DEAD_ROW_MISSING, 'get'), true, RECHECK_CALL_RESUME),
+  finishedRowEntry('missing, with no session id', stateReading(LIVENESS_DEAD_ROW_MISSING, 'get'), false, RECHECK_CALL_REUSE_SPAWN),
+])
+
+/** The entry of `columns` for step-1 reading `name`; throws when the columns have none (a `status` row has no note entries). */
+export function recheckEntryAt(columns: RecheckColumns, name: RecheckReadingName): RecheckEntry {
+  const entry = columns.entries.find((candidate) => candidate.name === name)
+  if (entry === undefined) throw new Error(`conflict-cases: no re-check entry ${JSON.stringify(name)} (read with ${columns.readVerb})`)
+  return entry
+}
+
 function row(
   site: ConflictCaseSite,
   refusedOperation: RefusedOperation,
@@ -950,6 +1563,8 @@ function row(
   const variant = Object.keys(options).filter((key) => options[key as keyof ConflictOptions] === true)
   const sessionName = STUB_TMUX_SESSION_NAME
   const build = () => errTmuxSessionConflict(verb, stubCase, sessionName, options)
+  const same: RecheckStubCase = { stubCase, options }
+  const ownIdLaunch = latchCase === LATCH_CASE_OWN_ID && isLatchedLaunch(refusedOperation)
   return Object.freeze({
     name: `${site}: ${stubCase}${variant.length === 0 ? '' : ` (${variant.join(', ')})`}`,
     site,
@@ -962,6 +1577,11 @@ function row(
     refusedOperation,
     rowState,
     notice: expectedConflictNotice({ latchCase, sessionName, description: build().errDescription }),
+    record: (key: string) =>
+      expectedLatchRecord(key, { latchCase, refusedOperation, rowState, sessionName, description: build().errDescription }),
+    latchOn: (latch: RecheckLatchEntries, key: string) => latch.setFromConflict(key, build(), { refusedOperation, rowState }),
+    recheck: recheckColumnsOf({ latchCase, refusedOperation, rowState }, same),
+    ...(ownIdLaunch ? { probeDroppedRecheck: recheckColumnsOf({ latchCase, refusedOperation, rowState, probeDropped: true }, same) } : {}),
   })
 }
 
@@ -1493,6 +2113,10 @@ export interface UnusableNameCaseRow {
   readonly notice: (key: string) => string
   /** The whole latch record a latch of persona `key` from this row holds ({@link expectedLatchRecord} of `unusableNameSetInput`). */
   readonly record: (key: string) => ConflictLatchRecord
+  /** Latch persona `key` as the row's site does, through the latch's `setFromUnusableName` with the row's error and state. */
+  readonly latchOn: (latch: RecheckLatchEntries, key: string) => ConflictLatchSetOutcome | undefined
+  /** The re-check's columns (E30; b.jg5 SRJ-505's "unusable recorded name" row: `status` only). */
+  readonly recheck: RecheckColumns
 }
 
 /**
@@ -1551,6 +2175,8 @@ function unusableNameRow(
     sessionName: (key: string) => personaTmuxSessionName(key),
     notice: (key: string) => unusableNameNoticeText(key, message),
     record,
+    latchOn: (latch: RecheckLatchEntries, key: string) => latch.setFromUnusableName(key, build(), rowState),
+    recheck: recheckColumnsOf({ latchCase: LATCH_CASE_UNUSABLE_RECORDED_NAME, refusedOperation: REFUSED_OPERATION_NONE, rowState }, undefined),
   })
 }
 
@@ -1795,6 +2421,10 @@ export interface LaunchStartCaseRowOf<S extends LaunchStartReadShape> extends La
   readonly notice: (key: string) => string
   /** The whole latch record a latch of persona `key` from this row holds: {@link launchStartRecord}. */
   readonly record: (key: string) => ConflictLatchRecord
+  /** Latch persona `key` as the reading site does, through the latch's `setLaunchStartNotRecorded` with `pending`. */
+  readonly latchOn: (latch: RecheckLatchEntries, key: string) => ConflictLatchSetOutcome
+  /** The re-check's columns (E30; b.jg5 SRJ-505's "launch start not recorded" row: `status` only). */
+  readonly recheck: RecheckColumns
 }
 
 /**
@@ -1807,6 +2437,12 @@ export interface LaunchStartCaseRowOf<S extends LaunchStartReadShape> extends La
 export function launchStartRecord(key: string): ConflictLatchRecord {
   return expectedLatchRecord(key, launchStartNotRecordedSetInput(key, PENDING))
 }
+
+/** The re-check columns every "launch start not recorded" latch shares (recorded `pending`, refused operation none). */
+const LAUNCH_START_RECHECK: RecheckColumns = recheckColumnsOf(
+  { latchCase: LATCH_CASE_LAUNCH_START_NOT_RECORDED, refusedOperation: REFUSED_OPERATION_NONE, rowState: PENDING },
+  undefined,
+)
 
 /** One latching launch-start row: narrow on `shape` for the read's own answer type. */
 export type LaunchStartCaseRow = { [S in LaunchStartReadShape]: LaunchStartCaseRowOf<S> }[LaunchStartReadShape]
@@ -1858,6 +2494,8 @@ function launchStartRow<S extends LaunchStartReadShape>(
     sessionName: (key: string) => personaTmuxSessionName(key),
     notice: (key: string) => launchStartNotRecordedNoticeText(key),
     record: launchStartRecord,
+    latchOn: (latch: RecheckLatchEntries, key: string) => latch.setLaunchStartNotRecorded(key, PENDING),
+    recheck: LAUNCH_START_RECHECK,
   })
 }
 
@@ -1880,6 +2518,69 @@ export const LAUNCH_START_CASE_ROWS: readonly LaunchStartCaseRow[] = Object.free
  * note's "conflicting labels" (SRJ-513's precedence).
  */
 export const LAUNCH_START_AND_NOTE_ROW: LaunchStartCaseRowOf<'get'> = launchStartRow('get', 'current life', 'absent', provenanceNote)
+
+// ---------------------------------------------------------------------------
+// The note latch (b.jg5 SRJ-114, SRJ-501, SRJ-505)
+// ---------------------------------------------------------------------------
+
+/**
+ * One latch from the `provenance_conflict` note on P's own row (b.jg5
+ * SRJ-114, SRJ-501): "conflicting labels", P's bring-up refused, the row's
+ * state as the `get` read it. Its re-check reads with `get`.
+ */
+export interface NoteLatchCaseRow {
+  /** Readable row name for `test.each`. */
+  readonly name: string
+  /** The state P's row read with the note. */
+  readonly state: string
+  /** P's row with the note in that state, as a `get` answers it (the stub's persona-form `cannedGetResult`). */
+  readonly build: (persona: CannedRowPersona, home: string) => CannedGetResult
+  readonly latchCase: typeof LATCH_CASE_CONFLICTING_LABELS
+  readonly refusedOperation: typeof REFUSED_OPERATION_BRING_UP
+  readonly rowState: LatchRowState
+  /** The CONFLICT notice body a note latch of persona `key` posts (no description; its session `slack_bot_<key>`). */
+  readonly notice: (key: string) => string
+  /** The whole latch record a note latch of persona `key` holds. */
+  readonly record: (key: string) => ConflictLatchRecord
+  /** Latch persona `key` as the shared own-row read does, through the latch's `set`. */
+  readonly latchOn: (latch: RecheckLatchEntries, key: string) => ConflictLatchSetOutcome
+  /** The re-check's columns (b.jg5 SRJ-505's "conflicting labels" row, a latch from a note: `get` first). */
+  readonly recheck: RecheckColumns
+}
+
+function noteLatchRow(state: string): NoteLatchCaseRow {
+  const rowState = latchRowStateRead(state)
+  const input = (key: string): ConflictLatchSetInput => ({
+    latchCase: LATCH_CASE_CONFLICTING_LABELS,
+    refusedOperation: REFUSED_OPERATION_BRING_UP,
+    rowState,
+    sessionName: personaTmuxSessionName(key),
+  })
+  return Object.freeze({
+    name: `note: ${state}`,
+    state,
+    build: (persona: CannedRowPersona, home: string) => cannedGetResult({ state, liveness_note: provenanceNote }, persona, home),
+    latchCase: LATCH_CASE_CONFLICTING_LABELS,
+    refusedOperation: REFUSED_OPERATION_BRING_UP,
+    rowState,
+    notice: (key: string) => expectedConflictNotice({ latchCase: LATCH_CASE_CONFLICTING_LABELS, sessionName: personaTmuxSessionName(key) }).text,
+    record: (key: string) => expectedLatchRecord(key, input(key)),
+    latchOn: (latch: RecheckLatchEntries, key: string) => latch.set(key, input(key)),
+    recheck: recheckColumnsOf(
+      { latchCase: LATCH_CASE_CONFLICTING_LABELS, refusedOperation: REFUSED_OPERATION_BRING_UP, rowState },
+      { stubCase: 'conflicting-labels', options: {} },
+    ),
+  })
+}
+
+/**
+ * The note latches (b.jg5 SRJ-114, SRJ-505): P's own row read with the note
+ * `pending` (with the stub's sample launch start, so no launch-start latch),
+ * `waiting` (a live, reported-in row) and `ended`, for `test.each`.
+ */
+export const NOTE_LATCH_CASE_ROWS: readonly NoteLatchCaseRow[] = Object.freeze(
+  [AGENT_DIRECTOR_PENDING_STATE, REPORTED_IN_STATE, LIVENESS_DEAD_ROW_ENDED].map(noteLatchRow),
+)
 
 /**
  * Why a non-latching row latches nothing: a `pending` row with a launch

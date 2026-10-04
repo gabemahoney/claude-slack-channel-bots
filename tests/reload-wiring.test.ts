@@ -37,8 +37,9 @@
  * after the bring-up controller exists and before detection is armed), passes
  * no `applySteps` override (which would replace that fan-out), and that the
  * restart timers, the connection manager (the deferred socket close after a
- * Web API auth error, b.ujn), the bring-up retries and the lifecycle share
- * one per-persona serializer (the UNAVAILABLE retry controller reaches it only
+ * Web API auth error, b.ujn), the bring-up retries, the lifecycle, the
+ * pending-row rule and the latch re-check's rounds (b.jg5 SRJ-505) share one
+ * per-persona serializer (the UNAVAILABLE retry controller reaches it only
  * through the restart module's retry entry, never directly), that the
  * teardown stops a key's UNAVAILABLE retry timer through the one retry
  * controller main() builds (b.jg5 SRJ-305) and, in the same binding, cancels
@@ -80,8 +81,9 @@
  * but src/server.ts (and, for the one name check that the teardown's delete is
  * gone, every src/*.ts file's text), imports only the pure `configInEffect` from
  * src/reload.ts and the pure `replySettingsOf`, constants and types from
- * src/config.ts (and only types from src/persona-notifier.ts and
- * src/persona-lifecycle.ts), runs no server code, and touches no home
+ * src/config.ts (and only types from src/persona-notifier.ts,
+ * src/persona-lifecycle.ts and src/session-manager.ts), runs no server code,
+ * and touches no home
  * directory.
  *
  * SPDX-License-Identifier: MIT
@@ -116,6 +118,7 @@ import {
 } from '../src/config.ts'
 import type { PersonaLifecycleDeps } from '../src/persona-lifecycle.ts'
 import type * as PersonaNotifierModule from '../src/persona-notifier.ts'
+import type * as SessionManagerModule from '../src/session-manager.ts'
 import type { PersonaNotifier, PersonaNotifierDeps } from '../src/persona-notifier.ts'
 
 /** server.ts with every comment removed (see stripComments). */
@@ -340,6 +343,9 @@ function onlyCallProps(name: string): Map<string, string> {
   return objectProperties(onlyCallArguments(SERVER_CODE, name))
 }
 
+/** The latch re-check's one builder (b.jg5 SRJ-505), which takes the persona serializer's run; renaming it fails the typecheck. */
+const LATCH_RECHECK_BUILDER: keyof typeof SessionManagerModule = 'buildLatchRecheck'
+
 /** The name the one `const <name> = <factory>(…)` binds; fails unless there is exactly one. */
 function constOf(factory: string): string {
   const decls = [...SERVER_CODE.matchAll(new RegExp(`\\bconst\\s+(\\w+)\\s*=\\s*${factory}\\s*\\(`, 'g'))]
@@ -444,14 +450,17 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
   // Web API call was refused for its token would not wait behind a lifecycle
   // operation holding the persona. The pending-row rule's install
   // (`setPendingRowRule`) takes the same run, so the one run at an approver's
-  // stop is queued in P's turn (b.jg5 SRJ-410).
-  test('one per-persona serializer, built once at module scope: its run is the serialize of initRestart, the connection manager, the bring-up controller, the lifecycle and the pending-row rule\'s install, and is used nowhere else', () => {
+  // stop is queued in P's turn (b.jg5 SRJ-410). So does the latch re-check's
+  // builder (`buildLatchRecheck`, b.jg5 SRJ-505): each round waits for P's
+  // turn and runs the restart path's decision inside it, so it never overlaps
+  // a teardown, a bring-up or a restart for P.
+  test('one per-persona serializer, built once at module scope: its run is the serialize of initRestart, the connection manager, the bring-up controller, the lifecycle, the pending-row rule\'s install and the latch re-check\'s builder, and is used nowhere else', () => {
     const serializer = constOf('createPersonaSerializer')
     expect(callsOf(SERVER_CODE, 'createPersonaSerializer')).toHaveLength(1)
     const decl = SERVER_CODE.search(new RegExp(`^const\\s+${serializer}\\s*=\\s*createPersonaSerializer\\s*\\(\\s*\\)\\s*$`, 'm'))
     expect(decl).toBeGreaterThanOrEqual(0)
     expect(insideMain(SERVER_CODE, decl)).toBe(false)
-    const factories = ['initRestart', 'createPersonaConnectionManager', 'createPersonaBringUpController', 'createPersonaLifecycle', 'setPendingRowRule']
+    const factories = ['initRestart', 'createPersonaConnectionManager', 'createPersonaBringUpController', 'createPersonaLifecycle', 'setPendingRowRule', LATCH_RECHECK_BUILDER]
     for (const factory of factories) {
       expect([factory, onlyCallProps(factory).get('serialize')]).toEqual([factory, `${serializer}.run`])
     }

@@ -81,6 +81,7 @@ import {
   APPROVER_STOP_RETIRED_KEY,
   APPROVER_STOP_TEARDOWN,
   applyOwnRowStatusStep,
+  buildLatchRecheck,
   buildLiveRowSequenceDeps,
   cancelWorkingRowWait,
   checkLaunchConfigDir,
@@ -196,9 +197,11 @@ import {
 import {
   bindConflictLatchHolds,
   bindConflictNotice,
+  bindLatchRecheck,
   createConflictLatch,
   latchRowStateRead,
   type ConflictLatch,
+  type LatchRecheckController,
 } from './conflict-latch.ts'
 import { createPendingRowRule, endStuckLaunchEpisodeForLatch, PENDING_ROW_COVERED, PENDING_ROW_RULE_GONE } from './pending-row.ts'
 import {
@@ -300,6 +303,7 @@ import {
 import {
   createFullModeRetryAction,
   createUnavailableRetryController,
+  holdsLatchRecheckPermit,
   isInsideTimerRetry,
   runDetachedRecoveryAttempt,
   runOutsideAttempts,
@@ -473,6 +477,12 @@ let bringUps: PersonaBringUpController | undefined
  * SRJ-305); built in main() before the start pass, closed on shutdown.
  */
 let unavailableRetry: UnavailableRetryController | undefined
+
+/**
+ * The per-persona latch re-check timers (b.jg5 SRJ-505); built in main()
+ * before the start pass, every timer stopped on shutdown.
+ */
+let latchRecheckTimers: LatchRecheckController | undefined
 
 /**
  * The per-persona notice episodes (b.jg5 SRJ-1016); built in main() before
@@ -1356,6 +1366,10 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   // armed again (a launch still in flight that meets UNAVAILABLE arms
   // nothing), so no retry is pending after this and none fires.
   unavailableRetry?.close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)
+  // b.jg5 SRJ-505: every latched persona's re-check timer stops and none is
+  // armed again, so no re-check round is due after this; a round already in
+  // its turn finishes and schedules nothing. Before the client is released.
+  latchRecheckTimers?.stopAll()
   // b.jg5 SRJ-1016: every persona's notice episodes end silently, which
   // cancels every tmux-unresponsive alert check and ends every
   // unclassified-error episode, and none begins again (a launch still in
@@ -2463,10 +2477,15 @@ function escalateDeadWith(source: DeadEvidenceSource): ReconnectEscalateDead {
  * the persona,
  * when `isLatched` answers exactly `true` for persona `key` or throws (fail
  * safe: the line names what it threw); false when it answers anything else or
- * is absent. Never throws.
+ * is absent, and false for a call that carries the latch re-check's permit
+ * (`holdsLatchRecheckPermit`: the re-check's own run of the restart path's
+ * decision, until its first refusal). Never throws.
  */
 function reconnectLatchedAt(key: string, isLatched: ((key: string) => boolean) | undefined): boolean {
   if (isLatched === undefined) return false
+  // b.jg5 SRJ-502, SRJ-505: the latch re-check's own run of the restart
+  // path's decision passes this gate while its permit holds.
+  if (holdsLatchRecheckPermit(key)) return false
   let failure = ''
   try {
     if (isLatched(key) !== true) return false
@@ -3421,6 +3440,26 @@ export async function main(): Promise<void> {
     (line) => console.error(line),
   )
   bindConflictNotice(conflictLatch, noticeEpisodes)
+  // b.jg5 SRJ-505: the latch re-check, built once through the session
+  // manager's one builder (the recovery harness calls the same), on the
+  // system clock and the one persona lifecycle serializer. Its observer is
+  // bound after the holds and the notice, so a set runs the read, the set,
+  // the holds, the notice, then the timer's arm: a persona that latches gets
+  // one timer, its first round 120 s later whatever health_check_interval
+  // is, and a relatch adds none. Its clear hand-off forgets the latch and
+  // stops the timer; the binding also stops a persona's timer at every
+  // forget of its latch (the persona teardown's, bound below), and
+  // shutdown() stops every timer. The health tick is not handed it.
+  const latchRecheck = buildLatchRecheck({
+    latch: conflictLatch,
+    clock: SYSTEM_PERSONA_CONNECTION_CLOCK,
+    serialize: personaLifecycle.run,
+    appliedConfig: () => personaConfig,
+    log: (line) => console.error(line),
+    episodes: noticeEpisodes,
+  })
+  latchRecheckTimers = latchRecheck
+  bindLatchRecheck(conflictLatch, latchRecheck)
   // b.jg5 SRJ-1011: the persona routing's lost-message state reads it.
   personaLatch = conflictLatch
   // b.jg5 SRJ-501, SRJ-502: the collision ladder latches through it on a

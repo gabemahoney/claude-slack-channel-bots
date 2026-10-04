@@ -16,7 +16,10 @@
  * phase and classes each notice carries to the notifier, the all-clear's
  * `allClearOf` rendering any subset of its classes over the same bad
  * stretch (b.jg5 SRJ-1002, SRJ-1003; the notifier's split of it is
- * tests/persona-notifier.test.ts's).
+ * tests/persona-notifier.test.ts's), and the latch re-check's no-information
+ * scope at the wrappers and the site entries (b.jg5 SRJ-505, SRJ-506: AC 71;
+ * the scope's own queries and the retry timer's side are
+ * tests/unavailable-retry.test.ts's).
  *
  * Every wrapped call declares its verb. The trigger-sink and condition-sink
  * cases install recording fake sinks (no timer, no episodes) and run the
@@ -36,9 +39,15 @@ import {
   ErrTmuxNotAvailable,
   ErrCwdNotFound,
   ErrSpawnNotFound,
+  ERR_SCHEMA_MIGRATION_REQUIRED_NAME,
+  ERR_STORE_OPEN_NAME,
 } from '../src/agent-director-errors.ts'
 import {
   _resetOutageState,
+  armPendingOnlyAfterLaunchFailure,
+  armPendingOnlyForPendingRow,
+  reportLostRaceAtSite,
+  reportReuseCollisionAtSite,
   initOutageState,
   getOutageFlags,
   setOutageFlag,
@@ -66,6 +75,8 @@ import { LIVENESS_LIVE } from '../src/liveness-reading.ts'
 import {
   AD_CALL_KILL_ROW_NOT_READ_LIVE,
   AD_CALL_KILL_ROW_READ_LIVE,
+  AD_ERROR_CLASS_ENVIRONMENT,
+  AD_ERROR_CLASS_UNAVAILABLE,
   AD_ERROR_CLASS_UNCLASSIFIED,
   AD_VERB_KILL,
   AD_VERBS,
@@ -88,6 +99,8 @@ import {
   STUB_TMUX_SOCKET_PATH,
   errCallTimeout,
   errConfigMalformed,
+  errCwdNotADirectory,
+  errCwdNotFound,
   errGeneric,
   errInstanceIdCollision,
   errInternal,
@@ -120,7 +133,10 @@ import {
   UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
   UNAVAILABLE_RETRY_ROW_PENDING,
   runInAttempt,
+  runInLatchRecheck,
+  unavailableRetryCauseFor,
   type AttemptErrorRecord,
+  type LatchRecheckScope,
   type UnavailableRetryCause,
 } from '../src/unavailable-retry.ts'
 import { APP_TOKEN_PREFIX, REDACTED_SENTINEL_TAIL, assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
@@ -3034,6 +3050,398 @@ describe('UNCLASSIFIED is reported to the unclassified sink in P\'s attempt only
     expect(rejected).toBe(err)
     expect(reportsOf(reports, err)).toEqual([{ key: P1, same: true }])
     assertNoLeak({ emissions, lastError, kinds: arms.map((a) => a.kind), flags: [...getOutageFlags(P1)], starts })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jg5 SRJ-505 (AC 71), SRJ-506, SRJ-307, SRJ-313, SRJ-316: inside a latch
+// re-check of a persona that is still latched (`runInLatchRecheck`), an
+// answer through the wrappers or a site entry gives no information: nothing
+// is armed (pending-only included), no `tmux-unresponsive` condition starts,
+// `tmux-unavailable` is not raised (a `find-missing` call's excepted, SRJ-506)
+// and nothing reaches the unclassified sink. CONFIG still raises
+// `ad-config-malformed`, `ErrSystemInstallDisappeared` `ad-unreachable` and
+// DIRECTORY `cwd-unreachable`, and every clear is as ever. Once the latch has
+// cleared, and outside every re-check, all is as today. The scope's latch
+// query is a stand-in the case clears; the re-check round end to end (AC 71
+// through the round) is tests/conflict-latch.test.ts's and
+// tests/tmux-unresponsive.test.ts's.
+// ---------------------------------------------------------------------------
+
+describe('the latch re-check\'s no-information scope at the wrappers and the site entries (b.jg5 SRJ-505, SRJ-506, SRJ-307, SRJ-313, SRJ-316: AC 71)', () => {
+  /** The binary path the `ErrSystemInstallDisappeared` answers here carry. */
+  const AD_PATH = '/bin/ad'
+
+  /** Everything the sinks, the cleared-flag observer and the notifier received. */
+  interface ScopeRecords {
+    readonly emissions: Emission[]
+    readonly arms: RecordedArm[]
+    readonly pendingArms: string[]
+    readonly starts: string[]
+    readonly ends: string[]
+    readonly reports: Array<{ key: string; error: unknown }>
+    readonly cleared: RecordedClear[]
+  }
+
+  /**
+   * A fresh outage state over the default stub client with every sink
+   * recording: the trigger sink (`arm`, answering true, and `armPendingOnly`),
+   * the condition sink, the unclassified sink and the cleared-flag observer.
+   */
+  function makeScopeHarness(): ScopeRecords {
+    const r: ScopeRecords = { emissions: [], arms: [], pendingArms: [], starts: [], ends: [], reports: [], cleared: [] }
+    const client = makeStubClient()
+    _resetOutageState()
+    initOutageState({
+      notify: (key, text) => { r.emissions.push({ key, text }) },
+      getClient: () => client as unknown as Client,
+      triggerSink: {
+        arm: (key, cause) => { r.arms.push({ key, kind: cause.kind, error: cause.error }); return true },
+        armPendingOnly: (key) => { r.pendingArms.push(key) },
+      },
+      conditionSink: {
+        start: (key) => { r.starts.push(key); return 'started' },
+        end: (key) => { r.ends.push(key); return 'ended' },
+      },
+      unclassifiedSink: { report: (key, error) => { r.reports.push({ key, error }); return 'begun' } },
+      onFlagCleared: (key, cls, reading) => { r.cleared.push({ key, cls, reading }) },
+    })
+    return r
+  }
+
+  /** P's latch as the re-check's scope reads it: latched until `clear()`. */
+  function latchedP(): { readonly scope: LatchRecheckScope; clear(): void } {
+    let latched = true
+    return { scope: { key: P1, isLatched: (key) => key === P1 && latched }, clear: () => { latched = false } }
+  }
+
+  /** Where a call runs in P's re-check. */
+  const LAUNCH_IN_RECHECK = 'a launch attempt opened in P\'s re-check'
+  const RECHECK_IN_RECOVERY = 'P\'s re-check opened in P\'s recovery attempt'
+  const NO_ATTEMPT = 'P\'s re-check, in no attempt'
+  type Place = typeof LAUNCH_IN_RECHECK | typeof RECHECK_IN_RECOVERY | typeof NO_ATTEMPT
+  const PLACES: readonly Place[] = [LAUNCH_IN_RECHECK, RECHECK_IN_RECOVERY, NO_ATTEMPT]
+
+  /** A run's result and the last error P's attempt recorded (none with no attempt). */
+  type Run = { result: unknown; lastError: AttemptErrorRecord | undefined }
+
+  /** Run `body` at `place` inside the re-check over `scope`. */
+  function inRecheck(place: Place, scope: LatchRecheckScope, body: () => unknown): Promise<Run> {
+    if (place === LAUNCH_IN_RECHECK) {
+      return runInLatchRecheck(scope, () => runInAttempt(P1, 'launch', async (attempt) => ({ result: await body(), lastError: attempt.lastError })))
+    }
+    if (place === RECHECK_IN_RECOVERY) {
+      return runInAttempt(P1, 'recovery', (attempt) => runInLatchRecheck(scope, async () => ({ result: await body(), lastError: attempt.lastError })))
+    }
+    return runInLatchRecheck(scope, async () => ({ result: await body(), lastError: undefined }))
+  }
+
+  /** Run `body` at `place` with no re-check around it: in P's attempt of the same kind, or in none. */
+  async function outsideRecheck(place: Place, body: () => unknown): Promise<Run> {
+    if (place === NO_ATTEMPT) return { result: await body(), lastError: undefined }
+    return runInAttempt(P1, place === LAUNCH_IN_RECHECK ? 'launch' : 'recovery', async (attempt) => ({ result: await body(), lastError: attempt.lastError }))
+  }
+
+  /** Run `call` for P through `wrap` with an `fn` that runs `during` (when given) and throws `err`; answer what it rejected with. */
+  async function rejectAfter(wrap: AnyWrap, call: AdCall, err: unknown, during?: () => void): Promise<unknown> {
+    try {
+      await wrap(P1, WRAP_WORKDIR, call, async () => {
+        during?.()
+        throw err
+      })
+    } catch (rejected) {
+      return rejected
+    }
+    throw new Error(`${declaredName(call)} did not reject`)
+  }
+
+  /** What a run whose call met `err` left, whole, for comparing runs (`same`: the value itself). */
+  function snapshot(r: ScopeRecords, err: unknown, run: Run) {
+    return {
+      rethrown: run.result === err,
+      lastError: run.lastError,
+      arms: r.arms.map((a) => ({ key: a.key, kind: a.kind, same: a.error === err })),
+      pendingArms: r.pendingArms,
+      starts: r.starts,
+      ends: r.ends,
+      reports: r.reports.map((x) => ({ key: x.key, same: x.error === err })),
+      flags: [...getOutageFlags(P1)].sort(),
+      otherFlags: [...getOutageFlags(P2)],
+      emissions: r.emissions,
+      cleared: r.cleared,
+    }
+  }
+
+  /** Nothing armed, started, raised, posted, cleared or reported. */
+  const NOTHING = { arms: [], pendingArms: [], starts: [], ends: [], reports: [], flags: [], otherFlags: [], emissions: [], cleared: [] }
+
+  /** The calls a re-check's probe or retry makes: `[wrapper name, call, wrap]`. */
+  const PROBE_AND_RETRY_CALLS: ReadonlyArray<readonly [string, AdCall, AnyWrap]> = [
+    ['withOutageDetection', 'read-pane', withOutageDetection],
+    ['withSpawnDetection', 'spawn', withSpawnDetection],
+    ['withSpawnDetection', 'resume', withSpawnDetection],
+  ]
+
+  /**
+   * The answers to a probe or retry that give no information (b.jg5
+   * SRJ-505), each built for the verb, with its class by name.
+   */
+  const NO_INFORMATION_ANSWERS: ReadonlyArray<readonly [string, (verb: string) => unknown, string]> = [
+    ...unavailableForms('ErrTmuxUnresponsive', 'ErrCallTimeout', ['ErrUnknownErrorName', 'an UNAVAILABLE-classed ErrUnknownErrorName'], 'a wrapped UnknownError')
+      .map(([label, build]) => [label, build, AD_ERROR_CLASS_UNAVAILABLE] as const),
+    ['ErrTmuxNotAvailable', (verb) => errTmuxNotAvailable(undefined, verb), AD_ERROR_CLASS_ENVIRONMENT],
+    ['ErrTmuxNotAvailable, the different-server form', (verb) => errTmuxNotAvailableDifferentServer(STUB_TMUX_SOCKET_PATH, verb), AD_ERROR_CLASS_ENVIRONMENT],
+    ['an unclassified ErrInternal', () => errInternal(), AD_ERROR_CLASS_UNCLASSIFIED],
+    ['ErrSchemaMismatch', () => errSchemaMismatch(), AD_ERROR_CLASS_UNCLASSIFIED],
+    ['ErrSchemaMigrationRequired', () => errUnknownErrorName(ERR_SCHEMA_MIGRATION_REQUIRED_NAME), AD_ERROR_CLASS_UNCLASSIFIED],
+    ['ErrStoreOpen', () => errUnknownErrorName(ERR_STORE_OPEN_NAME), AD_ERROR_CLASS_UNCLASSIFIED],
+  ]
+
+  /** One row: `[wrapper name, call name, answer, wrap, call, build, class]`. */
+  type NoInformationRow = [string, string, string, AnyWrap, AdCall, (verb: string) => unknown, string]
+
+  /** Every probe or retry call with every no-information answer, and the reads of the row that fail. */
+  const NO_INFORMATION_ROWS: readonly NoInformationRow[] = [
+    ...PROBE_AND_RETRY_CALLS.flatMap(([w, call, wrap]) =>
+      NO_INFORMATION_ANSWERS.map(([label, build, cls]): NoInformationRow => [w, declaredName(call), label, wrap, call, build, cls])),
+    ['withOutageDetection', 'status', 'ErrCallTimeout (a failed read)', withOutageDetection, 'status', (verb) => errCallTimeout(verb), AD_ERROR_CLASS_UNAVAILABLE],
+    ['withOutageDetection', 'status', 'an unclassified ErrInternal (a failed read)', withOutageDetection, 'status', () => errInternal(), AD_ERROR_CLASS_UNCLASSIFIED],
+    ['withOutageDetection', 'get', 'ErrTmuxNotAvailable (a failed read)', withOutageDetection, 'get', (verb) => errTmuxNotAvailable(undefined, verb), AD_ERROR_CLASS_ENVIRONMENT],
+  ]
+
+  /** Every server-log line (`console.error`) the running case wrote. */
+  let lines: string[]
+  let errorSpy: ReturnType<typeof spyOn>
+
+  beforeEach(() => {
+    lines = []
+    errorSpy = spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+      lines.push(args.map(String).join(' '))
+    })
+  })
+
+  afterEach(() => {
+    errorSpy.mockRestore()
+    assertNoLeak(lines)
+  })
+
+  test.each(NO_INFORMATION_ROWS)('%s, %s answering %s for a latched P, at each place in its re-check: no arm or pending-only arm, no tmux-unresponsive start, no flag or notice, nothing to the unclassified sink; rethrown unchanged; an attempt records it as not armed', async (_w, _c, _label, wrap, call, build, cls) => {
+    const verb = adCallVerb(call)!
+    for (const place of PLACES) {
+      const r = makeScopeHarness()
+      const err = build(verb)
+      expect(classifyAdError(err).errorClass as string).toBe(cls)
+
+      const run = await inRecheck(place, latchedP().scope, () => rejectAfter(wrap, call, err))
+
+      const lastError = place === NO_ATTEMPT ? undefined : { verb, causeKind: unavailableRetryCauseFor(err, verb)!.kind, armed: false }
+      expect({ place, ...snapshot(r, err, run) }).toEqual({ place, ...NOTHING, rethrown: true, lastError })
+    }
+  })
+
+  test.each(NO_INFORMATION_ROWS)('%s, %s answering %s: once P\'s latch has cleared, before the call or while it runs, each place in the re-check handles it exactly as the same place outside every re-check', async (_w, _c, _label, wrap, call, build) => {
+    const verb = adCallVerb(call)!
+    for (const place of PLACES) {
+      for (const when of ['before the call', 'while the call runs'] as const) {
+        const outsideRecords = makeScopeHarness()
+        const outsideErr = build(verb)
+        const outside = snapshot(outsideRecords, outsideErr, await outsideRecheck(place, () => rejectAfter(wrap, call, outsideErr)))
+
+        const r = makeScopeHarness()
+        const err = build(verb)
+        const latch = latchedP()
+        if (when === 'before the call') latch.clear()
+        const cleared = snapshot(r, err, await inRecheck(place, latch.scope, () => rejectAfter(wrap, call, err, latch.clear)))
+
+        expect({ place, when, ...cleared }).toEqual({ place, when, ...outside })
+        // Not vacuous: in P's attempt the answer arms P.
+        if (place !== NO_ATTEMPT) expect({ place, arms: outside.arms.length }).toEqual({ place, arms: 1 })
+      }
+    }
+  })
+
+  test.each(wrapRows(['spawn', 'resume', 'read-pane', 'status', 'get']))('%s, %s: CONFIG for a latched P, at each place in its re-check, raises P\'s ad-config-malformed with its one onset (a second CONFIG posts nothing) and arms nothing; no condition start, nothing to the unclassified sink; an attempt records it as not armed', async (_w, _c, wrap, call) => {
+    const verb = adCallVerb(call)!
+    for (const place of PLACES) {
+      const r = makeScopeHarness()
+      const err = errConfigMalformed()
+      const second = errConfigMalformed('starting_session_seconds', '10')
+      const { scope } = latchedP()
+
+      const run = await inRecheck(place, scope, () => rejectAfter(wrap, call, err))
+      const secondRun = await inRecheck(place, scope, () => rejectAfter(wrap, call, second))
+
+      const lastError = place === NO_ATTEMPT ? undefined : { verb, causeKind: UNAVAILABLE_RETRY_CAUSE_CONFIG, armed: false }
+      expect({ place, ...snapshot(r, err, run) }).toEqual({
+        place,
+        ...NOTHING,
+        rethrown: true,
+        lastError,
+        flags: ['ad-config-malformed'],
+        emissions: [{ key: P1, text: adConfigMalformedOnset(err) }],
+      })
+      expect({ place, rethrown: secondRun.result === second }).toEqual({ place, rethrown: true })
+    }
+  })
+
+  test.each<[string, AnyWrap, AdCall, () => unknown]>([
+    ['ErrSystemInstallDisappeared from status (ad-unreachable)', withOutageDetection, 'status', () => errSystemInstallDisappeared('status', AD_PATH)],
+    ['ErrSystemInstallDisappeared from spawn (ad-unreachable)', withSpawnDetection, 'spawn', () => errSystemInstallDisappeared('spawn', AD_PATH)],
+    ['ErrCwdNotFound from spawn (cwd-unreachable)', withSpawnDetection, 'spawn', () => errCwdNotFound('spawn', WRAP_WORKDIR)],
+    ['ErrCwdNotADirectory from resume (cwd-unreachable)', withSpawnDetection, 'resume', () => errCwdNotADirectory('resume', WRAP_WORKDIR)],
+  ])('%s for a latched P, at each place in its re-check: the same flag and onset as outside every re-check; it arms nothing and reaches no unclassified sink', async (_label, wrap, call, build) => {
+    for (const place of PLACES) {
+      const outsideRecords = makeScopeHarness()
+      await outsideRecheck(place, () => rejectAfter(wrap, call, build()))
+      const outside = { flags: [...getOutageFlags(P1)], emissions: outsideRecords.emissions }
+
+      const r = makeScopeHarness()
+      const err = build()
+      const run = await inRecheck(place, latchedP().scope, () => rejectAfter(wrap, call, err))
+
+      expect(outside.emissions).toHaveLength(1)
+      expect({ place, rethrown: run.result === err, flags: [...getOutageFlags(P1)], emissions: r.emissions }).toEqual({ place, rethrown: true, ...outside })
+      expect({ place, arms: r.arms, pendingArms: r.pendingArms, starts: r.starts, reports: r.reports }).toEqual({ place, arms: [], pendingArms: [], starts: [], reports: [] })
+    }
+  })
+
+  /** Raise P's tmux-unavailable, ad-unreachable and ad-config-malformed, so a clear would show. */
+  function raiseEveryClearable(): void {
+    setOutageFlag(P1, 'tmux-unavailable')
+    setOutageFlag(P1, 'ad-unreachable', AD_PATH)
+    raiseAdConfigMalformed(P1, errConfigMalformed())
+  }
+
+  test.each([...PLACES])('every clear is as ever for a latched P at %s: a read-pane success clears all three flags with one all-clear and ends the condition; a GONE answer clears tmux-unavailable and ends it', async (place) => {
+    /** One read-pane at `where` that succeeds, or answers GONE, over all three flags raised. */
+    async function clearRun(where: 'inside' | 'outside', gone: boolean) {
+      const r = makeScopeHarness()
+      raiseEveryClearable()
+      const before = r.emissions.length
+      const body = (): Promise<unknown> => gone
+        ? rejectAfter(withOutageDetection, 'read-pane', errTmuxCaptureFailed())
+        : withOutageDetection(P1, WRAP_WORKDIR, 'read-pane', async () => 'pane text')
+      await (where === 'inside' ? inRecheck(place, latchedP().scope, body) : outsideRecheck(place, body))
+      return { flags: [...getOutageFlags(P1)].sort(), posted: r.emissions.slice(before), ends: r.ends, cleared: r.cleared, arms: r.arms }
+    }
+
+    const success = await clearRun('inside', false)
+    expect(success).toEqual(await clearRun('outside', false))
+    expect(success).toMatchObject({ flags: [], ends: [P1] })
+    expect(success.posted).toHaveLength(1)
+
+    const gone = await clearRun('inside', true)
+    expect(gone).toEqual(await clearRun('outside', true))
+    expect(gone).toMatchObject({ flags: ['ad-config-malformed', 'ad-unreachable'], ends: [P1] })
+  })
+
+  test.each([...PLACES])('a find-missing run for a latched P at %s (the bypassing run, SRJ-506) raises as for any caller: ENVIRONMENT raises P\'s tmux-unavailable with its onset, CONFIG its ad-config-malformed; neither arms, starts a tmux-unresponsive condition or reaches the unclassified sink', async (place) => {
+    const answers: ReadonlyArray<readonly [string, unknown, OutageClass, string]> = [
+      ['ErrTmuxNotAvailable', errTmuxNotAvailable(undefined, 'find-missing'), 'tmux-unavailable', ONSET_TEMPLATES['tmux-unavailable']()],
+      ['the different-server form', errTmuxNotAvailableDifferentServer(STUB_TMUX_SOCKET_PATH, 'find-missing'), 'tmux-unavailable', tmuxServerChangedOnset()],
+    ]
+    const config = errConfigMalformed()
+    for (const [form, err, cls, onset] of [...answers, ['CONFIG', config, 'ad-config-malformed', adConfigMalformedOnset(config)] as const]) {
+      const r = makeScopeHarness()
+
+      const run = await inRecheck(place, latchedP().scope, () => rejectAfter(withOutageDetection, 'find-missing', err))
+
+      expect({ form, rethrown: run.result === err, flags: [...getOutageFlags(P1)], emissions: r.emissions })
+        .toEqual({ form, rethrown: true, flags: [cls], emissions: [{ key: P1, text: onset }] })
+      expect({ form, arms: r.arms, pendingArms: r.pendingArms, starts: r.starts, reports: r.reports })
+        .toEqual({ form, arms: [], pendingArms: [], starts: [], reports: [] })
+    }
+  })
+
+  test('raiseTmuxUnavailable inside P\'s re-check of a latched P raises nothing for P unless its verb is find-missing; another persona\'s is raised; once P\'s latch has cleared, P\'s is raised with no verb', async () => {
+    const r = makeScopeHarness()
+    const latch = latchedP()
+    const onset = ONSET_TEMPLATES['tmux-unavailable']()
+
+    await runInLatchRecheck(latch.scope, () => {
+      // The liveness adapter's raise (no verb), and one declaring a verb other than find-missing.
+      raiseTmuxUnavailable(P1, errTmuxNotAvailable(undefined, 'status'))
+      raiseTmuxUnavailable(P1, errTmuxNotAvailable(undefined, 'read-pane'), 'read-pane')
+      expect(getOutageFlags(P1).size).toBe(0)
+      raiseTmuxUnavailable(P2, errTmuxNotAvailable(undefined, 'status'))
+      raiseTmuxUnavailable(P1, errTmuxNotAvailable(undefined, 'find-missing'), 'find-missing')
+    })
+    expect(r.emissions).toEqual([{ key: P2, text: onset }, { key: P1, text: onset }])
+
+    const after = makeScopeHarness()
+    latch.clear()
+    await runInLatchRecheck(latch.scope, () => raiseTmuxUnavailable(P1, errTmuxNotAvailable(undefined, 'status')))
+    expect(after.emissions).toEqual([{ key: P1, text: onset }])
+  })
+
+  test('the scope is P\'s only: inside P\'s re-check, Q\'s calls in Q\'s attempt arm Q, start its condition, raise its tmux-unavailable and reach the unclassified sink as ever; P gets nothing', async () => {
+    const r = makeScopeHarness()
+    const unavailable = errTmuxUnresponsive('read-pane')
+    const environment = errTmuxNotAvailable(undefined, 'spawn')
+    const unclassified = errInternal()
+
+    await runInLatchRecheck(latchedP().scope, () => runInAttempt(P2, 'launch', async () => {
+      for (const [wrap, call, err] of [[withOutageDetection, 'read-pane', unavailable], [withSpawnDetection, 'spawn', environment], [withSpawnDetection, 'spawn', unclassified]] as const) {
+        await wrap(P2, WRAP_WORKDIR, call, async () => { throw err }).catch(() => undefined)
+      }
+    }))
+
+    expect(r.arms.map((a) => [a.key, a.kind])).toEqual([
+      [P2, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+      [P2, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
+      [P2, UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED],
+    ])
+    expect(r.starts).toEqual([P2])
+    expect(r.reports.map((x) => ({ key: x.key, same: x.error === unclassified }))).toEqual([{ key: P2, same: true }])
+    expect([...getOutageFlags(P2)]).toEqual(['tmux-unavailable'])
+    expect(getOutageFlags(P1).size).toBe(0)
+  })
+
+  /** The site entries that arm, start or report for P, and the reporting point called directly: `[name, entry, answers whether it armed]`. */
+  const SITE_ENTRIES: ReadonlyArray<readonly [string, () => unknown, boolean]> = [
+    ['reportAgentDirectorError, the liveness adapter\'s bare status answering ErrCallTimeout', () => reportAgentDirectorError(P1, errCallTimeout('status'), 'status'), false],
+    ['reportAgentDirectorError, a read-pane answering ErrTmuxUnresponsive', () => reportAgentDirectorError(P1, errTmuxUnresponsive('read-pane'), 'read-pane'), false],
+    ['reportAgentDirectorError, a read-pane answering an unclassified ErrInternal', () => reportAgentDirectorError(P1, errInternal(), 'read-pane'), false],
+    ['reportDeferredUnavailable, a kill of a row read live answering ErrTmuxUnresponsive', () => reportDeferredUnavailable(P1, errTmuxUnresponsive('kill'), AD_CALL_KILL_ROW_READ_LIVE), false],
+    ['reportUnclassifiedAtSite, resume\'s ErrInvalidFlags after its re-check', async () => {
+      const err = errInvalidFlags('resume')
+      const { classification } = await classifyWithInvalidFlagsRecheck(err, async () => ({ kind: RECHECK_OUTCOME_NOT_RUNNING }))
+      return reportUnclassifiedAtSite(P1, err, 'resume', classification)
+    }, true],
+    ['reportReuseCollisionAtSite', () => reportReuseCollisionAtSite(P1), true],
+    ['reportLostRaceAtSite', () => reportLostRaceAtSite(P1), true],
+    ['armPendingOnlyAfterLaunchFailure', () => armPendingOnlyAfterLaunchFailure(P1), true],
+    ['armPendingOnlyForPendingRow', () => armPendingOnlyForPendingRow(P1), true],
+  ]
+
+  test.each(SITE_ENTRIES)('%s, in a launch attempt opened in P\'s re-check of a latched P: no arm or pending-only arm, no condition start, nothing to the unclassified sink, and it answers that nothing armed; once P\'s latch has cleared it does exactly what it does outside every re-check', async (_label, entry, answersArmed) => {
+    /** What one run of the entry left. */
+    const recordsOf = (r: ScopeRecords, run: Run) => ({
+      answered: run.result,
+      lastError: run.lastError,
+      arms: r.arms.map((a) => [a.key, a.kind]),
+      pendingArms: r.pendingArms,
+      starts: r.starts,
+      reports: r.reports.map((x) => x.key),
+      flags: [...getOutageFlags(P1)],
+    })
+
+    const r = makeScopeHarness()
+    const inside = recordsOf(r, await inRecheck(LAUNCH_IN_RECHECK, latchedP().scope, entry))
+
+    const outsideRecords = makeScopeHarness()
+    const outside = recordsOf(outsideRecords, await outsideRecheck(LAUNCH_IN_RECHECK, entry))
+
+    const clearedRecords = makeScopeHarness()
+    const latch = latchedP()
+    latch.clear()
+    const cleared = recordsOf(clearedRecords, await inRecheck(LAUNCH_IN_RECHECK, latch.scope, entry))
+
+    expect(inside).toMatchObject({ answered: answersArmed ? false : undefined, arms: [], pendingArms: [], starts: [], reports: [], flags: [] })
+    expect(cleared).toEqual(outside)
+    // Not vacuous: outside every re-check the entry arms, or reports, for P.
+    expect(outside.arms.length + outside.pendingArms.length + outside.reports.length).toBeGreaterThan(0)
+    expect(outside.answered).toBe(answersArmed ? true : undefined)
   })
 })
 

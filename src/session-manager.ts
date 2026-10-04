@@ -393,6 +393,28 @@
  * there has settled; a persona teardown forgets the key's waits and stops a
  * wait no persona left waits on (`forgetOldLifeWaits`).
  *
+ * The latch re-check (b.jg5 SRJ-505, SRJ-506, SRJ-502): `buildLatchRecheck`
+ * composes the re-check timers (`src/conflict-latch.ts`) over the round,
+ * `runLatchRecheckRound`, which `main()` and the recovery harness build
+ * alike. Each round of a latched persona runs inside its no-information
+ * scope (`runInLatchRecheck`, `src/unavailable-retry.ts`): step 1's read
+ * through the shared own-row reads, then exactly the one call the decision
+ * (`decideLatchRecheck`) names, or none: the one-line probe or lap
+ * `read-pane` through the wrapper, a retry through the one handler for each
+ * launch (`plainSpawnOutcomeAt`, `reuseSpawnForPersona`, `resumeAtSite`),
+ * registered as the persona's launch in flight, or one run of the restart
+ * path's decision (`runRestartWorkInTurn`, `src/restart.ts`) with the
+ * re-check's permit, which every latched gate and mid-path stop honours for
+ * that run only (`holdsLatchRecheckPermit`, read by `latchGateReadingOf`).
+ * Inside the scope, the handlers hand an answer that clears the latch to the
+ * clear hand-off before their after-launch step and before a definite
+ * failure's class handling (`clearLatchBeforeOutcome`); a collision gives no
+ * information (`latchRecheckCollided`); an UNAVAILABLE answer makes no `get`
+ * (`afterLaunchUnavailable`); and a CONFLICT or UNUSABLE NAME relatches with
+ * the state the re-check read, never a latch-time read. Outside it, a launch
+ * whose persona was latched elsewhere during its awaited call sets nothing
+ * on its own CONFLICT or UNUSABLE NAME (`latchedElsewhereDuringCall`).
+ *
  * No tmux process-tree walks, no JSONL existence checks for resume eligibility:
  * the library encapsulates both.
  *
@@ -473,6 +495,7 @@ import {
   AD_ERROR_CLASS_ENVIRONMENT,
   AD_ERROR_CLASS_GONE,
   AD_ERROR_CLASS_LAUNCH_FAILURE,
+  AD_ERROR_CLASS_STATE,
   AD_ERROR_CLASS_UNAVAILABLE,
   AD_ERROR_CLASS_UNCLASSIFIED,
   AD_ERROR_CLASS_UNUSABLE_NAME,
@@ -593,7 +616,51 @@ import {
   CONFLICT_LATCH_SET_LATCHED,
   CONFLICT_LATCH_SET_RELATCHED,
   CONFLICT_LATCH_SET_SAME_CASE,
+  LATCH_CASE_CONFLICTING_LABELS,
   LATCH_CASE_LAUNCH_START_NOT_RECORDED,
+  LATCH_RECOVERY_REASON_RELAUNCH_NOT_REFUSED,
+  LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED,
+  RECHECK_CALL_FINISHED_ROW,
+  RECHECK_CALL_NONE,
+  RECHECK_CALL_PENDING_READ_PANE,
+  RECHECK_CALL_PLAIN_SPAWN,
+  RECHECK_CALL_PROBE,
+  RECHECK_CALL_RESTART_DECISION,
+  RECHECK_CALL_RESUME,
+  RECHECK_CALL_REUSE_SPAWN,
+  RECHECK_CLEARED_BY_FINISHED_ROW_RETRY,
+  RECHECK_CLEARED_BY_LAUNCH_START_FINISHED,
+  RECHECK_CLEARED_BY_PENDING_READ_PANE,
+  RECHECK_CLEARED_BY_PROBE,
+  RECHECK_CLEARED_BY_RESTART_DECISION,
+  RECHECK_CLEARED_BY_RETRY,
+  RECHECK_CLEARED_BY_STEP_1,
+  RECHECK_READING_FAILED,
+  RECHECK_READING_FAILED_VALUE,
+  RECHECK_READING_NO_ROW,
+  RECHECK_READING_NO_ROW_VALUE,
+  RECHECK_READING_STATE,
+  RECHECK_STEP_TABLE,
+  RECHECK_VERDICT_CLEARED,
+  RECHECK_VERDICT_RELATCH,
+  RECHECK_VERDICT_UNUSABLE_NAME,
+  createLatchRecheckController,
+  createSilentLatchRecheckClear,
+  decideFinishedRowLaunch,
+  decideLatchRecheck,
+  decideLatchRecheckPendingReadPane,
+  decideLatchRecheckProbe,
+  latchRecheckRoundLine,
+  type ConflictNoticeEpisodes,
+  type LatchCase,
+  type LatchRecheckCall,
+  type LatchRecheckClearHandOff,
+  type LatchRecheckClearedBy,
+  type LatchRecheckClock,
+  type LatchRecheckController,
+  type LatchRecheckPaneAnswer,
+  type LatchRecheckReading,
+  type LatchRecoveryReason,
   LATCH_CASE_NOT_THIS_LAUNCH,
   LATCH_ROW_STATE_KIND_NO_ROW,
   LATCH_ROW_STATE_KIND_READ,
@@ -655,9 +722,13 @@ import {
   RETRY_BLOCK_OLD_LIFE_WAIT,
   claimTimerRetryRuleRun,
   currentAttemptLastError,
+  holdsLatchRecheckPermit,
+  isInsideLatchRecheck,
   isInsideTimerRetry,
+  latchRecheckScopeOf,
   runDetachedRecoveryAttempt,
   runInAttempt,
+  runInLatchRecheck,
   runOutsideAttempts,
   retryRunGateStop,
   unavailableRetryCauseFor,
@@ -672,6 +743,8 @@ import {
   UNAVAILABLE_RETRY_PENDING_STEP_SEQUENCE_STARTED,
   UNAVAILABLE_RETRY_ROW_ABSENT,
   type AttemptView,
+  type LatchRecheckPermit,
+  type LatchRecheckScope,
   type RetryBlockCause,
   type RetryRunGateDeps,
   type UnavailableRetryPendingStep,
@@ -781,7 +854,17 @@ import {
 } from './persona-connection-errors.ts'
 import { describeDestinationFailureCause } from './persona-destination.ts'
 import { redactSlackLogText } from './slack-log-redaction.ts'
-import { RESTART_FAILURE_CAP, recordLaunchResultOutsideRestartWork } from './restart.ts'
+import {
+  RESTART_FAILURE_CAP,
+  RESTART_OUTCOME_ALREADY_CONNECTED,
+  RESTART_OUTCOME_CAPPED,
+  RESTART_OUTCOME_COUNTED_FAILURE,
+  RESTART_OUTCOME_LAUNCHED,
+  RESTART_OUTCOME_RECONNECTED,
+  recordLaunchResultOutsideRestartWork,
+  runRestartWorkInTurn,
+  type RestartRetryOutcome,
+} from './restart.ts'
 import {
   AGENT_DIRECTOR_DEAD_STATES,
   AGENT_DIRECTOR_LIVE_STATES,
@@ -1335,8 +1418,12 @@ interface LatchGateReading {
 /**
  * Read persona `key`'s latch for the latched gate (`LatchGateReading`). Fails
  * safe: an `isLatched` that throws counts as latched (case unknown), and so
- * does a latched persona whose `record` throws or answers nothing. Logs
- * nothing (the gate logs one line); never throws.
+ * does a latched persona whose `record` throws or answers nothing. A call
+ * that carries the latch re-check's permit (`holdsLatchRecheckPermit`: the
+ * re-check's own run of the restart path's decision, until its first
+ * refusal) reads not latched, so it passes this gate and every stop built
+ * on it (`personaLatchedNow`); no other caller does (b.jg5 SRJ-502, SRJ-505).
+ * Logs nothing (the gate logs one line); never throws.
  */
 function latchGateReadingOf(key: string): LatchGateReading | undefined {
   const latch = conflictLatch
@@ -1348,6 +1435,9 @@ function latchGateReadingOf(key: string): LatchGateReading | undefined {
     return { latchCase: LATCH_CASE_UNKNOWN, failure: `the latched query failed: ${describeThrownValue(err)}` }
   }
   if (!latched) return undefined
+  // b.jg5 SRJ-502, SRJ-505: the re-check's own run of the restart path's
+  // decision passes every latched gate while its permit holds.
+  if (holdsLatchRecheckPermit(key)) return undefined
   try {
     const record: ConflictLatchRecord | undefined = latch.record(key)
     return { latchCase: record?.latchCase ?? LATCH_CASE_UNKNOWN }
@@ -1487,10 +1577,17 @@ async function latchTimeRowState(key: string, site: string): Promise<LatchTimeRe
  * The row state to record for a latch met by a call whose path last read
  * `lastRead`: `lastRead` itself, or, when the path read nothing
  * (`NOTHING_READ`), the one latch-time `status` read (`latchTimeRowState`),
- * its lines prefixed `site`.
+ * its lines prefixed `site`; inside a latch re-check of a latched persona,
+ * no read: the state the re-check last read (b.jg5 SRJ-505).
  */
 async function recordedRowState(key: string, lastRead: LastRowRead, site: string): Promise<LatchTimeRead> {
-  return lastRead === NOTHING_READ ? latchTimeRowState(key, site) : { rowState: lastRead }
+  if (lastRead !== NOTHING_READ) return { rowState: lastRead }
+  // b.jg5 SRJ-505, SRJ-506: inside a latch re-check of a latched persona a
+  // refusal makes no latch-time read: the state the re-check last read is
+  // the state the relatch records, and no further call follows.
+  const recheck = latchRecheckRoundScopeOf(key)
+  if (recheck !== undefined && isInsideLatchRecheck(key)) return { rowState: recheck.lastRead }
+  return latchTimeRowState(key, site)
 }
 
 /** The latch line's outcome when the latch-time `status` read latched the persona itself. */
@@ -1655,7 +1752,10 @@ async function unusableNameAt(
 
 /**
  * The refusal handling of a spawn or `resume` the collision ladder makes
- * (b.jg5 SRJ-105): the CONFLICT row first (`conflictAt`, which latches the
+ * (b.jg5 SRJ-105). First, for a CONFLICT or an UNUSABLE NAME, the latch
+ * check after the awaited call (`latchedElsewhereDuringCall`, b.jg5
+ * SRJ-502): a persona latched elsewhere during the call answers `latched`
+ * with nothing set. Then the CONFLICT row (`conflictAt`, which latches the
  * persona and answers `latched`, with the refused operation "plain spawn"
  * for a spawn and "resume" for a resume, and `lastRead` as its row state),
  * then the UNUSABLE NAME row (`unusableNameAt`, which latches it with the
@@ -1672,6 +1772,7 @@ async function launchRefusalAt(
   lastRead: LastRowRead,
 ): Promise<SpawnPersonaResult | undefined> {
   const operation = verb === 'resume' ? REFUSED_OPERATION_RESUME : REFUSED_OPERATION_PLAIN_SPAWN
+  if (latchedElsewhereDuringCall(key, err, 'spawnForPersona', what, ref)) return { key, action: 'latched' }
   return (
     (await conflictAt(key, err, operation, lastRead, what, ref)) ??
     (await unusableNameAt(key, err, lastRead, 'spawnForPersona', what, ref)) ??
@@ -6790,8 +6891,9 @@ async function sharedFindMissingSweep(
     if (joined !== null && key !== undefined) {
       const { errorClass } = classifyAdError(err)
       if (errorClass === AD_ERROR_CLASS_ENVIRONMENT) {
-        // b.jg5 SRJ-1021: the raising error picks the onset.
-        raiseTmuxUnavailable(key, err)
+        // b.jg5 SRJ-1021: the raising error picks the onset. A `find-missing`
+        // run raises it for a latched persona too (b.jg5 SRJ-506).
+        raiseTmuxUnavailable(key, err, 'find-missing')
       } else if (errorClass === AD_ERROR_CLASS_CONFIG) {
         // b.jg5 SRJ-316: one outage per persona that met the answer.
         raiseAdConfigMalformed(key, err)
@@ -8654,10 +8756,11 @@ export interface SpawnPersonaResult {
    * SRJ-113 count (b.jg5). Every launch's LAUNCH FAILURE sets it
    * (`launchFailureResult`: the plain spawn's, the reuse spawn's and the
    * `resume`'s failure handling); the reuse spawn sets it for DIRECTORY too,
-   * and so does the live-row sequence's `resume` leg. The live-row
-   * sequence's launch entry counts a failure only when it is set
-   * (`sequenceLaunchCounted`); the restart path counts any `failed` result
-   * that is not stopping.
+   * and so do the live-row sequence's `resume` leg and a latch re-check's
+   * plain spawn and `resume`. The live-row sequence's launch entry and a
+   * latch re-check's retry count a failure only when it is set
+   * (`countLaunchOutsideRestartWork`); the restart path counts any `failed`
+   * result that is not stopping.
    */
   countedClass?: true
 }
@@ -9764,10 +9867,16 @@ export async function plainSpawnOutcomeAt<R>(site: PlainSpawnSite<R>): Promise<S
       undoPreLaunchReplyGuard(replyGuardUndo, ref)
       return site.collided(err)
     }
+    // b.jg5 SRJ-506: a latch re-check's retry whose answer is definite clears
+    // the latch before the answer's class handling.
+    if (isDefiniteLaunchAnswer(err, 'spawn')) clearLatchBeforeOutcome(key)
     const notSpawned = await plainSpawnFailedAt(persona, err, isStartup, ref, site.what, site.lastRead)
     return site.marksDirectoryCounted === true ? withDirectoryCounted(notSpawned, err) : notSpawned
   }
   console.error(site.spawnedLine(launched))
+  // b.jg5 SRJ-506: a latch re-check's retry that was not refused clears the
+  // latch before the after-launch step, so its approver runs unlatched.
+  clearLatchBeforeOutcome(key)
   afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, launched)
   return { key, action: 'spawned' }
 }
@@ -11139,6 +11248,9 @@ async function resumeAtSite<R>(site: ResumeSite<R>): Promise<SpawnPersonaResult 
       client.resume({ claude_instance_id: personaInstanceId(key) }),
     )
     console.error(`${head} resumed ${ref}`)
+    // b.jg5 SRJ-506: a latch re-check's retry that was not refused clears the
+    // latch before the after-launch step, so its approver runs unlatched.
+    clearLatchBeforeOutcome(key)
     // A resumed bot faces the same startup dialogs as a fresh one. Its row
     // reads `pending` from the resume until its session reports in (HO C5),
     // so the approver clears the dialog through agent-director, as after a
@@ -11146,6 +11258,10 @@ async function resumeAtSite<R>(site: ResumeSite<R>): Promise<SpawnPersonaResult 
     afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_RESUME, launched)
     return { key, action: 'resumed' }
   } catch (err) {
+    // b.jg5 SRJ-506: a latch re-check's retry whose answer is definite clears
+    // the latch before the answer's own row (the no-transcript reuse, the
+    // spawn after ErrSpawnNotFound, a counted failure) is handled.
+    if (isDefiniteLaunchAnswer(err, 'resume')) clearLatchBeforeOutcome(key)
     if (isNoTranscriptResumeError(err)) return site.noTranscript(err)
     if (hasAdErrorName(err, ERR_SPAWN_NOT_RESUMABLE_NAME)) return site.notResumable(err)
     if (hasAdErrorName(err, ERR_SPAWN_NOT_FOUND_NAME)) {
@@ -12860,6 +12976,15 @@ async function afterLaunchUnavailable(
     launchArmed || currentAttemptLastError(key)?.armed === true ? { key, action: SPAWN_ACTION_RETRYING } : refused
   const timeoutForm = launchTimeoutFormOf(err, verb)
   const formText = launchUnavailableFormText(timeoutForm, describeAgentDirectorFailure(err))
+  // b.jg5 SRJ-505: inside a latch re-check of a latched persona the answer
+  // gives no information, and a retry that leaves the persona latched makes
+  // no further call: no `get`.
+  if (isInsideLatchRecheck(key)) {
+    console.error(
+      `[slack] spawnForPersona: the ${what} of ${ref} ended in ${formText} inside its latch re-check — no information: no get, nothing more is called; the persona stays latched (b.jg5 SRJ-505)`,
+    )
+    return refused
+  }
   const log = (read: string, thisLaunchRow: ThisLaunchRowRecord | undefined, outcome: string): void => {
     console.error(launchUnavailableGetLine(ref, what, formText, read, thisLaunchRow, outcome))
   }
@@ -13931,6 +14056,9 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *    (`setConflictLatch`) holds latched answers `latched` before any other
  *    step, with one log line naming its case, and nothing else runs. A call
  *    joining a launch already in flight still gets that launch's result.
+ *    Only the latch re-check's own run of the restart path's decision
+ *    passes it, while its permit holds (`holdsLatchRecheckPermit`, b.jg5
+ *    SRJ-505).
  * 2. Pre-launch claude_config_dir check (bug b.g57, `checkLaunchConfigDir`),
  *    dry run included: when the directory cannot be resolved to a real path,
  *    nothing else runs (no trust patch, no reply-guard step, no
@@ -14841,8 +14969,14 @@ export async function reuseSpawnForPersona(
     launched = await launchCallWithWindow(key, persona.working_directory, 'spawn', (client) => client.spawn(params))
   } catch (err) {
     if (options.firstLaunch === true && hasAdErrorName(err, ERR_INSTANCE_ID_COLLISION_NAME)) undoPreLaunchReplyGuard(replyGuardUndo, ref)
+    // b.jg5 SRJ-506: a latch re-check's retry whose answer is definite clears
+    // the latch before the answer's class handling.
+    if (isDefiniteLaunchAnswer(err, 'spawn')) clearLatchBeforeOutcome(key)
     return reuseSpawnFailedAt(persona, err, options.isStartup, ref, options.lastRead, retiredAtStart)
   }
+  // b.jg5 SRJ-506: a latch re-check's retry that was not refused clears the
+  // latch before the after-launch step, so its approver runs unlatched.
+  clearLatchBeforeOutcome(key)
   // b.jg5 SRJ-112: a reuse of an id with no row is an ordinary fresh spawn; no earlier life is kept.
   const earlierLife =
     options.lastRead === LATCH_ROW_STATE_NO_ROW
@@ -14878,6 +15012,9 @@ export async function reuseSpawnForPersona(
  *     `spawn-failed` entry, nothing counted, nothing reported to the
  *     unclassified-error episode and nothing armed. Never another launch, a
  *     delete or a tmux-touching call;
+ *   - a CONFLICT or an UNUSABLE NAME for a persona latched elsewhere during
+ *     the call (`latchedElsewhereDuringCall`, b.jg5 SRJ-502): `latched`,
+ *     nothing set; a call inside a latch re-check skips this check;
  *   - CONFLICT (`conflictAt`): the persona latches with the case its
  *     description gives ("another agent-director store" and "conflicting
  *     labels" included) and `lastRead` ("no row" for a reuse of an id with
@@ -14924,6 +15061,7 @@ async function reuseSpawnFailedAt(
     return { key, action: REUSE_SPAWN_COLLIDED }
   }
   if (isInvalidFlagsError(err)) return invalidFlagsAtReuse(key, err, ref)
+  if (latchedElsewhereDuringCall(key, err, REUSE_SPAWN_SITE, REUSE_SPAWN_WHAT, ref)) return { key, action: 'latched' }
   const latched =
     (await conflictAt(key, err, REFUSED_OPERATION_REUSE_SPAWN, lastRead, REUSE_SPAWN_WHAT, ref, REUSE_SPAWN_SITE)) ??
     (await unusableNameAt(key, err, lastRead, REUSE_SPAWN_SITE, REUSE_SPAWN_WHAT, ref))
@@ -15125,6 +15263,10 @@ export function startLiveRowSequence(request: LiveRowSequenceRequest): LiveRowSe
     console.error(`${LIVE_ROW_SEQUENCE_LOG_PREFIX} ${ref}: no sequence registry is installed — nothing started (b.jg5 SRJ-706)`)
     return LIVE_ROW_START_NOT_INSTALLED
   }
+  // b.jg5 SRJ-506 (hatch A3): a latch re-check's run of the restart path's
+  // decision that reaches a sequence completed with no refusal, so the latch
+  // clears before the sequence, which stops for a latched persona, begins.
+  if (holdsLatchRecheckPermit(request.key)) clearLatchBeforeOutcome(request.key)
   const answer = registry.start(retiredKeyRequest(request, ref))
   // b.jg5 SRJ-811: a request that ends in a launch refused because an
   // old-life wait runs on its id arms its persona's retry timer.
@@ -15826,27 +15968,30 @@ async function sequenceLaunchAttempt(
     const called = await sequenceLaunchCall(persona, config, request, ref, params)
     return called.action === LIVE_ROW_OUTCOME_NOT_LAUNCHED ? called : retryingWhenArmed(called, attempt)
   })
-  if (result.action !== LIVE_ROW_OUTCOME_NOT_LAUNCHED) countSequenceLaunch(key, ref, result)
+  if (result.action !== LIVE_ROW_OUTCOME_NOT_LAUNCHED) countLaunchOutsideRestartWork(key, ref, result, LIVE_ROW_SEQUENCE_LOG_PREFIX)
   return result
 }
 
 /**
- * Count the sequence launch's `result` once (b.jg5 SRJ-112, SRJ-113,
- * SRJ-602), as the restart path counts a launch result
- * (`launchSession`'s reading), by class: a success records a success; a
- * `failed` result that is not stopping and is marked `countedClass`
- * (LAUNCH FAILURE or DIRECTORY) records one counted launch failure (the cap
- * notice at the cap); any other `failed` result and a retrying, latched,
- * held or deferred result record nothing. The step-6 launch is not routed
- * through `launchSession`, so nothing else counts it. Never throws.
+ * Count once, by class, the `result` of a launch of persona `key` whose
+ * result does not come back through the restart path's `launchSession`
+ * (b.jg5 SRJ-105, SRJ-111, SRJ-112, SRJ-113, SRJ-602): the live-row
+ * sequence's step-6 launch (`sequenceLaunchAttempt`) and a latch re-check's
+ * own retry (`latchRecheckLaunch`, SRJ-506), as the restart path counts a
+ * launch result (`recordLaunchResultOutsideRestartWork`): a success records
+ * a success; a `failed` result that is not stopping and is marked
+ * `countedClass` (LAUNCH FAILURE or DIRECTORY) records one counted launch
+ * failure (the cap notice at the cap); any other `failed` result and a
+ * retrying, latched, held or deferred result record nothing. `head` heads
+ * the line logged if counting throws. Never throws.
  */
-function countSequenceLaunch(key: string, ref: string, result: SpawnPersonaResult): void {
+function countLaunchOutsideRestartWork(key: string, ref: string, result: SpawnPersonaResult, head: string): void {
   const succeeded = LIVE_ROW_LAUNCH_SUCCESS_ACTIONS.has(result.action)
   if (!succeeded && !sequenceLaunchCounted(result)) return
   try {
     recordLaunchResultOutsideRestartWork(key, succeeded)
   } catch (err) {
-    console.error(`${LIVE_ROW_SEQUENCE_LOG_PREFIX} counting the launch of ${ref} failed: ${describeThrownValue(err)}`)
+    console.error(`${head} counting the launch of ${ref} failed: ${describeThrownValue(err)}`)
   }
 }
 
@@ -15870,7 +16015,7 @@ async function sequenceLaunchCall(
   console.error(`${LIVE_ROW_SEQUENCE_LOG_PREFIX} resuming ${ref} (b.jg5 SRJ-705)`)
   // b.jg5 SRJ-113, SRJ-301, SRJ-409 (HO rev 28): the handler's
   // `resumeFailedAt` marks an `ErrTmuxSessionCreate` result `countedClass`
-  // (`countSequenceLaunch` counts it) and arms the persona's retry timer at
+  // (`countLaunchOutsideRestartWork` counts it) and arms the persona's retry timer at
   // once in pending-only mode itself; a DIRECTORY failure is marked
   // `countedClass` here; any other failure is not counted.
   return resumeAtSite<LiveRowSequenceLaunchEntryResult>({
@@ -19282,6 +19427,14 @@ function createLaunchPool(
  * stop the retry timer; the restart path never counts either (SRJ-302). The richer `SpawnPersonaResult` is collapsed here
  * because the restart subsystem only cares about did-it-relaunch.
  *
+ * Inside the latch re-check's run of the restart path's decision (b.jg5
+ * SRJ-505, SRJ-506), a `failed` result while the persona is still latched
+ * (`isInsideLatchRecheck`: an UNAVAILABLE, ENVIRONMENT, UNCLASSIFIED or
+ * CONFIG answer; a definite answer clears the latch before its class
+ * handling) gave no information: it answers `'skipped'`, never false, and
+ * revokes the run's permit (`revokeLatchRecheckRunPermit`), so the run ends
+ * latched, counts nothing and is not cleared after it.
+ *
  * `options.deadEvidence` is the escalate-dead verdict the restart path's
  * relaunch carries (b.jg5 SRJ-611), handed to `spawnForPersona` unchanged;
  * absent, the launch is as it always was.
@@ -19300,10 +19453,790 @@ export async function launchSession(
   if (result.action === 'deferred' || result.action === 'latched' || result.action === 'held' || result.stopping) {
     return 'skipped'
   }
+  // b.jg5 SRJ-505, SRJ-506: inside the latch re-check's run of the restart
+  // path's decision, a `failed` launch that left the persona latched gave no
+  // information (its definite answers clear the latch first): it is no
+  // counted launch failure, and it revokes the run's permit, so the run ends
+  // latched and is not cleared after it.
+  if (result.action === 'failed' && isInsideLatchRecheck(key)) {
+    revokeLatchRecheckRunPermit(key)
+    return 'skipped'
+  }
   // b.jg5 SRJ-1015, SRJ-706, SRJ-811: a launch handed to P's retry timer, or
   // held for P's live-row sequence or an old-life hold or its wait (either
   // `sequenceWaitingCause`), records nothing and is a refusal at a retry,
   // which re-arms the timer (SRJ-302).
   if (result.action === SPAWN_ACTION_RETRYING || result.action === 'sequence-waiting') return 'refused'
   return result.action !== 'failed'
+}
+
+// ---------------------------------------------------------------------------
+// The latch re-check round (b.jg5 SRJ-505, SRJ-506, SRJ-502)
+// ---------------------------------------------------------------------------
+
+/** The head of the re-check round's own lines. */
+const LATCH_RECHECK_SITE = 'latch-recheck'
+
+/** Step 1's `status` read of a latched persona's row (b.jg5 SRJ-505, SRJ-115). */
+export const LATCH_RECHECK_STATUS_READ_SITE: OwnRowReadSite = Object.freeze({ site: LATCH_RECHECK_SITE, what: 'status read' })
+
+/** Step 1's `get` read of a "conflicting labels" latch's row (b.jg5 SRJ-505, SRJ-114). */
+export const LATCH_RECHECK_GET_READ_SITE: OwnRowReadSite = Object.freeze({ site: LATCH_RECHECK_SITE, what: 'get read' })
+
+/** The one `get` before a "not this launch's session" latch's finished-row retry (b.jg5 SRJ-505, SRJ-114; HO rev 28). */
+export const LATCH_RECHECK_FINISHED_ROW_GET_SITE: OwnRowReadSite = Object.freeze({
+  site: LATCH_RECHECK_SITE,
+  what: "finished-row retry's get",
+})
+
+/** What the re-check's plain spawn's lines call it. */
+const LATCH_RECHECK_PLAIN_SPAWN_WHAT = "latch re-check's plain spawn"
+
+/** The head of the re-check's `resume` lines. */
+const LATCH_RECHECK_RESUME_HEAD = `[slack] ${LATCH_RECHECK_SITE}:`
+
+/**
+ * The round's own latch re-check scope (`runInLatchRecheck`), read back by
+ * the launch handlers and the latch entries through
+ * `latchRecheckRoundScopeOf`:
+ *   - `lastRead`: the row state the re-check last read (step 1's, or the
+ *     finished-row retry's `get`), which a relatch records in place of a
+ *     latch-time `status` read (`recordedRowState`, b.jg5 SRJ-506);
+ *   - `clear`: hands the latch's clear to the clear hand-off, once per round,
+ *     for a retry's or run's answer that clears it (`clearLatchBeforeOutcome`).
+ */
+interface LatchRecheckRoundScope extends LatchRecheckScope {
+  lastRead: LatchRowState
+  readonly clear: () => void
+}
+
+/** The round's scope for persona `key` the current call runs in, if any. Never throws. */
+function latchRecheckRoundScopeOf(key: string): LatchRecheckRoundScope | undefined {
+  const scope = latchRecheckScopeOf(key)
+  return scope !== undefined && 'clear' in scope && 'lastRead' in scope ? (scope as LatchRecheckRoundScope) : undefined
+}
+
+/**
+ * The clear hook of the three launch handlers (`plainSpawnOutcomeAt`,
+ * `resumeAtSite`, `reuseSpawnForPersona`) and the live-row sequence's start
+ * entry (b.jg5 SRJ-506; hatch A3): inside a latch re-check of persona `key`
+ * that is still latched, an answer that clears the latch (a launch that was
+ * not refused, a definite failure, a run of the restart path's decision
+ * that reached a sequence) hands the clear off now, before the after-launch
+ * step (the dialog approver, the pending-only arm), before a definite
+ * failure's class handling, and before a sequence begins: each of those
+ * stops for, or arms nothing for, a latched persona. Does nothing anywhere
+ * else. Never throws.
+ */
+function clearLatchBeforeOutcome(key: string): void {
+  if (!isInsideLatchRecheck(key)) return
+  latchRecheckRoundScopeOf(key)?.clear()
+}
+
+/**
+ * Whether a launch's thrown `err` is a definite answer to a latch re-check's
+ * retry (b.jg5 SRJ-506): one that is no CONFLICT, no UNUSABLE NAME, no
+ * CONFIG, no collision (`ErrInstanceIdCollision`) and gives information
+ * (not UNAVAILABLE, ENVIRONMENT or UNCLASSIFIED, `ErrInvalidFlags` included,
+ * SRJ-505). For a spawn, plain or reuse, that is a LAUNCH FAILURE or a
+ * DIRECTORY answer (every other name is UNCLASSIFIED to it); for a `resume`
+ * also its STATE rows (no transcript, `ErrSpawnNotResumable`,
+ * `ErrSpawnNotFound`) and GONE. Decided by name and class
+ * (`src/ad-error-class.ts`). Pure; never throws.
+ */
+function isDefiniteLaunchAnswer(err: unknown, verb: 'spawn' | 'resume'): boolean {
+  if (hasAdErrorName(err, ERR_INSTANCE_ID_COLLISION_NAME) || isInvalidFlagsError(err)) return false
+  const { errorClass } = classifyAdError(err)
+  if (errorClass === AD_ERROR_CLASS_LAUNCH_FAILURE || errorClass === AD_ERROR_CLASS_DIRECTORY) return true
+  return verb === 'resume' && (errorClass === AD_ERROR_CLASS_STATE || errorClass === AD_ERROR_CLASS_GONE)
+}
+
+/**
+ * The latch check after an awaited launch call (b.jg5 SRJ-502), asked
+ * before a CONFLICT or an UNUSABLE NAME answer sets anything:
+ * when persona `key` was latched elsewhere while the call was awaited (a
+ * health tick's read, a start pass launch), that latch stands, so nothing is
+ * set, nothing more is posted and nothing more is called: one line, and
+ * true. A call made inside a latch re-check skips the check: the persona is
+ * latched by design there, and the call's CONFLICT is the round's answer
+ * (same case: no post; a new case: a relatch). False for any other answer.
+ * Never throws.
+ *
+ *   [slack] <site>: <what> refused for <ref>: <failure> — the persona was latched elsewhere during the call, so that latch stands: nothing is set and nothing more is called for it (b.jg5 SRJ-502)
+ */
+function latchedElsewhereDuringCall(key: string, err: unknown, site: string, what: string, ref: string): boolean {
+  const { errorClass } = classifyAdError(err)
+  if (errorClass !== AD_ERROR_CLASS_CONFLICT && errorClass !== AD_ERROR_CLASS_UNUSABLE_NAME) return false
+  if (latchRecheckScopeOf(key) !== undefined || !personaLatchedNow(key)) return false
+  console.error(
+    `[slack] ${site}: ${what} refused for ${ref}: ${describeAgentDirectorFailure(err)} — the persona was latched elsewhere during the call, so that latch stands: nothing is set and nothing more is called for it (b.jg5 SRJ-502)`,
+  )
+  return true
+}
+
+/**
+ * The collision row of a latch re-check's own launch (b.jg5 SRJ-505,
+ * SRJ-506, SRJ-111, SRJ-112; hatch A3), at the re-check's plain-spawn sites,
+ * its reuse and the plain spawn after its `resume`'s `ErrSpawnNotFound`: an
+ * `ErrInstanceIdCollision` gives no information while persona `key` is still
+ * latched, so it stays latched with no post, no get-then-act and no further
+ * call (`latched`). Once the latch has cleared (a `resume` whose definite
+ * answer cleared it went on to a spawn that collided), the persona is
+ * handled as after a second collision: its retry timer is armed with the
+ * reuse-collision cause and the answer is `retrying`. One line either way.
+ * Never throws.
+ */
+function latchRecheckCollided(key: string, ref: string, what: string): SpawnPersonaResult {
+  if (isInsideLatchRecheck(key)) {
+    console.error(
+      `[slack] ${LATCH_RECHECK_SITE}: the ${what} of ${ref} answered ErrInstanceIdCollision — no information: no get-then-act and nothing more is called; the persona stays latched (b.jg5 SRJ-505, SRJ-506)`,
+    )
+    return { key, action: 'latched' }
+  }
+  const armed = reportReuseCollisionAtSite(key)
+  console.error(
+    `[slack] ${LATCH_RECHECK_SITE}: the ${what} of ${ref} collided with a live row after the latch cleared — nothing launched; answering retrying, the retry timer ${armed ? 'is armed' : 'could not be armed'} (cause=${UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION}; b.jg5 SRJ-112, SRJ-1015)`,
+  )
+  return { key, action: SPAWN_ACTION_RETRYING }
+}
+
+/** The restart path's decision's outcomes that complete with no refusal: the run's clear (b.jg5 SRJ-506; hatch A3). */
+const RESTART_DECISION_CLEARING_OUTCOMES: ReadonlySet<RestartRetryOutcome> = new Set<RestartRetryOutcome>([
+  RESTART_OUTCOME_ALREADY_CONNECTED,
+  RESTART_OUTCOME_RECONNECTED,
+  RESTART_OUTCOME_LAUNCHED,
+  RESTART_OUTCOME_COUNTED_FAILURE,
+  RESTART_OUTCOME_CAPPED,
+])
+
+/** What the re-check round needs (b.jg5 SRJ-505), built by `buildLatchRecheck`. */
+export interface LatchRecheckRoundDeps {
+  /** The server's latch: its own query and record, and, for the run's permit, its set observers. */
+  readonly latch: Pick<ConflictLatch, 'isLatched' | 'record'> & Partial<Pick<ConflictLatch, 'addSetObserver'>>
+  /** The applied configuration now, read at each round. */
+  readonly appliedConfig: () => PersonaConfig | null | undefined
+  /** The one clear hand-off: every cleared outcome, and a probe that found the condition cleared. */
+  readonly clearHandOff: LatchRecheckClearHandOff
+  /**
+   * The run of the restart path's decision from inside the round's
+   * serializer turn, with the re-check's permit (default
+   * `runRestartWorkInTurn`, `src/restart.ts`).
+   */
+  readonly runRestartDecision?: (key: string, cwd: string, permit: LatchRecheckPermit) => Promise<RestartRetryOutcome>
+  /** Where the round's lines go. */
+  readonly log: (line: string) => void
+}
+
+/** `latch.record(key)`, a throw read as no record. Never throws. */
+function latchRecordOf(latch: Pick<ConflictLatch, 'record'>, key: string): ConflictLatchRecord | undefined {
+  try {
+    return latch.record(key)
+  } catch {
+    return undefined
+  }
+}
+
+/** The applied persona of `key` and its configuration, or undefined when it is not applied. Never throws. */
+function appliedPersonaOf(
+  appliedConfig: () => PersonaConfig | null | undefined,
+  key: string,
+): { readonly persona: Persona; readonly config: PersonaConfig } | undefined {
+  try {
+    const config = appliedConfig() ?? undefined
+    const persona = config?.personas.find((p) => p.key === key)
+    return config !== undefined && persona !== undefined ? { persona, config } : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** A step-1 reading as a latch records it: the state read, no row, or unreadable. */
+function latchRowStateOfReading(reading: LatchRecheckReading): LatchRowState {
+  switch (reading.kind) {
+    case RECHECK_READING_STATE:
+      return latchRowStateRead(reading.state)
+    case RECHECK_READING_NO_ROW:
+      return LATCH_ROW_STATE_NO_ROW
+    case RECHECK_READING_FAILED:
+      return LATCH_ROW_STATE_UNREADABLE
+  }
+}
+
+/**
+ * A shared own-row `get` read as a re-check reading: a row's state, with
+ * whether the latching `provenance_conflict` note is on it; no row; and a
+ * failed read, or one that latched with an UNUSABLE NAME answer, as failed.
+ */
+function recheckReadingOfGet(read: OwnRowRead): LatchRecheckReading {
+  switch (read.kind) {
+    case OWN_ROW_READ_ROW:
+      return Object.freeze({
+        kind: RECHECK_READING_STATE,
+        state: read.row.state,
+        notePresent: isLatchingLivenessNote(read.row.liveness_note),
+      })
+    case OWN_ROW_READ_ABSENT:
+      return RECHECK_READING_NO_ROW_VALUE
+    default:
+      return RECHECK_READING_FAILED_VALUE
+  }
+}
+
+/**
+ * Step 1's read (b.jg5 SRJ-505): one `get` through the shared own-row read
+ * for a "conflicting labels" latch (only `get` shows a note), else one
+ * `status` through the shared own-row `status` read. Neither skips a latched
+ * persona; either may latch it (the note, a `pending` row with no launch
+ * start, an UNUSABLE NAME answer), and the round compares the case before
+ * and after. A `status` that latched with the same case reads as the state
+ * it recorded (unreadable: failed). Never throws.
+ */
+async function latchRecheckStep1Read(key: string, record: ConflictLatchRecord, ref: string): Promise<LatchRecheckReading> {
+  if (record.latchCase === LATCH_CASE_CONFLICTING_LABELS) {
+    return recheckReadingOfGet(await readPersonaOwnRow(key, { ...LATCH_RECHECK_GET_READ_SITE, ref }))
+  }
+  const read = await readPersonaOwnRowStatus(key, { ...LATCH_RECHECK_STATUS_READ_SITE, ref })
+  switch (read.kind) {
+    case OWN_ROW_STATUS_STATE:
+      return Object.freeze({ kind: RECHECK_READING_STATE, state: read.state })
+    case OWN_ROW_STATUS_ABSENT:
+      return RECHECK_READING_NO_ROW_VALUE
+    case OWN_ROW_STATUS_REFUSED:
+      return RECHECK_READING_FAILED_VALUE
+    case OWN_ROW_STATUS_LATCHED:
+      return read.rowState.kind === LATCH_ROW_STATE_KIND_READ
+        ? Object.freeze({ kind: RECHECK_READING_STATE, state: read.rowState.state })
+        : RECHECK_READING_FAILED_VALUE
+  }
+}
+
+/** One re-check `read-pane` answer: as the verdicts read it, and the mapper's failure (with its thrown value) when it failed. */
+interface LatchRecheckPaneRead {
+  readonly answer: LatchRecheckPaneAnswer
+  readonly failure?: PaneReadFailure
+}
+
+/**
+ * One `read-pane` of persona `key`'s own row with `n_lines` 1
+ * (`PROBE_PANE_READ_LINES`) through the wrapper, never the shared reader
+ * (which skips a latched persona and latches): the probe, or, with
+ * `allowPending`, a "conflicting labels" latch's lap `read-pane` of a
+ * `pending` row (`allow_pending: true`), which types nothing (b.jg5
+ * SRJ-505, SRJ-117, SRJ-410). A failure is mapped by the pure mapper
+ * (`paneReadFailureOf`), a CONFLICT's case recognised from its description.
+ * Sets nothing. Never throws.
+ */
+async function latchRecheckReadPane(key: string, allowPending: boolean): Promise<LatchRecheckPaneRead> {
+  try {
+    const claude_instance_id = personaInstanceId(key)
+    await withOutageDetection(key, undefined, 'read-pane', (client) =>
+      client.readPane(
+        allowPending
+          ? { claude_instance_id, n_lines: PROBE_PANE_READ_LINES, allow_pending: true }
+          : { claude_instance_id, n_lines: PROBE_PANE_READ_LINES },
+      ),
+    )
+    return { answer: { kind: PANE_READ_PANE } }
+  } catch (err) {
+    return latchRecheckPaneFailure(paneReadFailureOf(err))
+  }
+}
+
+/** A failed re-check `read-pane` as the verdicts read it: its kind and, for a CONFLICT, the case its description gives. */
+function latchRecheckPaneFailure(failure: PaneReadFailure): LatchRecheckPaneRead {
+  return failure.kind === PANE_READ_CONFLICT
+    ? { answer: { kind: failure.kind, conflictCase: recogniseConflictCase(conflictDescriptionOf(failure.error)) }, failure }
+    : { answer: { kind: failure.kind }, failure }
+}
+
+/** The thrown value a failed `read-pane` carried, for a CONFLICT or an UNUSABLE NAME. */
+function paneReadErrorOf(failure: PaneReadFailure | undefined): unknown {
+  return failure !== undefined && (failure.kind === PANE_READ_CONFLICT || failure.kind === PANE_READ_UNUSABLE_NAME)
+    ? failure.error
+    : undefined
+}
+
+/**
+ * One latch re-check round for persona `key` (b.jg5 SRJ-505), run by the
+ * re-check timer inside the persona's lifecycle serializer turn, inside the
+ * re-check's no-information scope (`runInLatchRecheck`) for every call it
+ * makes. One line per round (`latchRecheckRoundLine`): the case, the call
+ * made or none, and the answer's class. In order:
+ *
+ *   1. Step 1's read (`latchRecheckStep1Read`: `get` for a "conflicting
+ *      labels" latch, else `status`, through the shared reads, so their note,
+ *      launch-start, UNUSABLE NAME and retired-key rules apply). A read that
+ *      latched the persona with another case (a relatch, with its one post)
+ *      ends the round, and the next follows the new case; a failed read gives
+ *      no information and ends it; a read that latched with the same case
+ *      (the note on a "conflicting labels" row) reads as the row it read.
+ *   2. The decision (`decideLatchRecheck`), with the key's retired-key
+ *      reading (`retiredKeyReadingOf`), then exactly the one call it names,
+ *      or none:
+ *      - a clear by the read goes to the clear hand-off, with no call;
+ *      - the probe and the lap `read-pane` (`latchRecheckReadPane`), judged by
+ *        `decideLatchRecheckProbe` and `decideLatchRecheckPendingReadPane`: a
+ *        probe that finds the condition cleared is handed off as such (the
+ *        persona stays latched); the lap read's pane or GONE clears; a new
+ *        CONFLICT case there relatches through the CONFLICT entry, and an
+ *        UNUSABLE NAME relatches through the unusable-name entry, each with
+ *        the state step 1 read;
+ *      - a plain spawn, a reuse or a `resume` (`latchRecheckLaunch`), through
+ *        the one handler for each, as the persona's launch in flight and a
+ *        launch attempt;
+ *      - the finished-row retry: one `get`, then the launch it decides
+ *        (`decideFinishedRowLaunch`), or none for a row read live;
+ *      - one run of the restart path's decision with the re-check's permit
+ *        (`latchRecheckRestartDecision`).
+ * Every retry passes the state the re-check last read as its `lastRead`,
+ * never nothing, so its CONFLICT relatches with no latch-time read. An
+ * answer that leaves the persona latched leads to no further call. A
+ * persona not in the applied configuration, or with no latch, gets nothing
+ * after its read. Never throws.
+ */
+export async function runLatchRecheckRound(key: string, deps: LatchRecheckRoundDeps): Promise<void> {
+  const record = latchRecordOf(deps.latch, key)
+  if (record === undefined) return
+  const found = appliedPersonaOf(deps.appliedConfig, key)
+  const ref = found === undefined ? keyRef(key) : personaRef(found.persona)
+  let decidedRecord = record
+  let clearedBy: Exclude<LatchRecheckClearedBy, typeof RECHECK_CLEARED_BY_PROBE> = RECHECK_CLEARED_BY_RETRY
+  let handedOff = false
+  const log = (line: string): void => {
+    try {
+      deps.log(line)
+    } catch {
+      /* a failing log changes nothing the round does */
+    }
+  }
+  const handOff = (cleared: Parameters<LatchRecheckClearHandOff>[1]): void => {
+    if (handedOff) return
+    if (cleared.by !== RECHECK_CLEARED_BY_PROBE) handedOff = true
+    try {
+      deps.clearHandOff(key, cleared)
+    } catch (thrown) {
+      log(`[slack] ${LATCH_RECHECK_SITE}: the clear hand-off failed for ${ref}: ${describeThrownValue(thrown)}`)
+    }
+  }
+  const reasonOf = (by: typeof clearedBy): LatchRecoveryReason =>
+    by === RECHECK_CLEARED_BY_FINISHED_ROW_RETRY ? LATCH_RECOVERY_REASON_RELAUNCH_NOT_REFUSED : LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED
+  const scope: LatchRecheckRoundScope = {
+    key,
+    isLatched: (k) => deps.latch.isLatched(k),
+    lastRead: record.rowState,
+    clear: () => handOff({ by: clearedBy, record: decidedRecord, reason: reasonOf(clearedBy) }),
+  }
+  const line = (latchCase: LatchCase, call: string, said: string): void =>
+    log(latchRecheckRoundLine(ref, latchCase, call, said))
+
+  await runInLatchRecheck(scope, async () => {
+    const reading = await latchRecheckStep1Read(key, record, ref)
+    const after = latchRecordOf(deps.latch, key)
+    if (after === undefined) {
+      line(record.latchCase, RECHECK_CALL_NONE, 'not-latched')
+      return
+    }
+    if (after.latchCase !== record.latchCase) {
+      line(record.latchCase, RECHECK_CALL_NONE, `relatched-by-read (case=${after.latchCase})`)
+      return
+    }
+    decidedRecord = after
+    if (reading.kind === RECHECK_READING_FAILED) {
+      line(after.latchCase, RECHECK_CALL_NONE, 'no-information')
+      return
+    }
+    scope.lastRead = latchRowStateOfReading(reading)
+    const decision = decideLatchRecheck({ record: after, reading, retiredKeyRecorded: retiredKeyReadingOf(key).recorded })
+    if (decision.unmatched === true) {
+      log(
+        `[slack] ${LATCH_RECHECK_SITE}: ${ref}'s latch (refused=${after.refusedOperation}, case=${after.latchCase}) matches no re-check row — its read only (b.jg5 SRJ-505)`,
+      )
+    }
+    if (decision.clear !== undefined) {
+      handOff({
+        by: decision.step === RECHECK_STEP_TABLE ? RECHECK_CLEARED_BY_LAUNCH_START_FINISHED : RECHECK_CLEARED_BY_STEP_1,
+        record: after,
+        reason: decision.clear.reason,
+      })
+      line(after.latchCase, RECHECK_CALL_NONE, `cleared (${decision.step})`)
+      return
+    }
+    if (decision.call === RECHECK_CALL_NONE) {
+      line(after.latchCase, RECHECK_CALL_NONE, 'still-latched')
+      return
+    }
+    if (found === undefined) {
+      line(after.latchCase, RECHECK_CALL_NONE, 'not-applied')
+      return
+    }
+    const answerAfter = (action: string): string => {
+      const now = latchRecordOf(deps.latch, key)
+      if (now === undefined) return `cleared (${action})`
+      if (now.latchCase !== after.latchCase) return `relatched (case=${now.latchCase})`
+      return action === 'latched' ? 'still-latched' : `no-information (${action})`
+    }
+    switch (decision.call) {
+      case RECHECK_CALL_PROBE:
+      case RECHECK_CALL_PENDING_READ_PANE: {
+        const pending = decision.call === RECHECK_CALL_PENDING_READ_PANE
+        const read = await latchRecheckReadPane(key, pending)
+        const verdict = pending
+          ? decideLatchRecheckPendingReadPane(after.latchCase, read.answer)
+          : decideLatchRecheckProbe(after.latchCase, read.answer)
+        let answer: string = verdict
+        if (verdict === RECHECK_VERDICT_CLEARED) {
+          if (pending) {
+            clearedBy = RECHECK_CLEARED_BY_PENDING_READ_PANE
+            handOff({ by: clearedBy, record: after, reason: LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED })
+          } else {
+            handOff({ by: RECHECK_CLEARED_BY_PROBE, record: after })
+            answer = 'probe-cleared'
+          }
+        } else if (verdict === RECHECK_VERDICT_RELATCH) {
+          answer = `relatch: ${latchOnConflict(key, paneReadErrorOf(read.failure), REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, scope.lastRead)}`
+        } else if (verdict === RECHECK_VERDICT_UNUSABLE_NAME) {
+          answer = `unusable-name: ${latchOnUnusableName(key, paneReadErrorOf(read.failure), scope.lastRead)}`
+        }
+        line(after.latchCase, decision.call, `${answer} (${read.answer.kind})`)
+        return
+      }
+      case RECHECK_CALL_PLAIN_SPAWN:
+      case RECHECK_CALL_REUSE_SPAWN:
+      case RECHECK_CALL_RESUME: {
+        clearedBy = RECHECK_CLEARED_BY_RETRY
+        const action = await latchRecheckLaunch(decision.call, found, ref, scope.lastRead)
+        line(after.latchCase, decision.call, answerAfter(action))
+        return
+      }
+      case RECHECK_CALL_FINISHED_ROW: {
+        const got = await readPersonaOwnRow(key, { ...LATCH_RECHECK_FINISHED_ROW_GET_SITE, ref })
+        const read = recheckReadingOfGet(got)
+        const now = latchRecordOf(deps.latch, key)
+        if (now === undefined || now.latchCase !== after.latchCase) {
+          line(after.latchCase, RECHECK_CALL_FINISHED_ROW, answerAfter('latched'))
+          return
+        }
+        if (read.kind === RECHECK_READING_FAILED) {
+          line(after.latchCase, RECHECK_CALL_FINISHED_ROW, 'no-information (get)')
+          return
+        }
+        scope.lastRead = latchRowStateOfReading(read)
+        const hasSessionId = got.kind === OWN_ROW_READ_ROW && typeof got.row.claude_session_id === 'string' && got.row.claude_session_id !== ''
+        const launch = decideFinishedRowLaunch(read, hasSessionId, retiredKeyReadingOf(key).recorded)
+        if (launch === RECHECK_CALL_NONE) {
+          line(after.latchCase, RECHECK_CALL_FINISHED_ROW, `still-latched (row ${describeLatchRowState(scope.lastRead)}; no launch)`)
+          return
+        }
+        clearedBy = RECHECK_CLEARED_BY_FINISHED_ROW_RETRY
+        const action = await latchRecheckLaunch(launch, found, ref, scope.lastRead)
+        line(after.latchCase, `${RECHECK_CALL_FINISHED_ROW}:${launch}`, answerAfter(action))
+        return
+      }
+      case RECHECK_CALL_RESTART_DECISION: {
+        clearedBy = RECHECK_CLEARED_BY_RESTART_DECISION
+        const outcome = await latchRecheckRestartDecision(key, found.persona, deps, scope)
+        line(after.latchCase, RECHECK_CALL_RESTART_DECISION, answerAfter(outcome))
+        return
+      }
+    }
+  })
+}
+
+/**
+ * A latch re-check's one launch of persona `found.persona` (b.jg5 SRJ-505,
+ * SRJ-506): `call` a plain spawn, a reuse or a `resume`, through the one
+ * handler for each, never copied: the plain-spawn outcome handler
+ * (`plainSpawnOutcomeAt`, SRJ-111), the reuse launch
+ * (`reuseSpawnForPersona`, SRJ-112) and the `resume` outcome handler
+ * (`resumeAtSite`, SRJ-113). `lastRead` is the state the re-check last read,
+ * which a CONFLICT or UNUSABLE NAME answer records, so a relatch makes no
+ * latch-time read. Inside the re-check's scope each answer is handled as
+ * SRJ-506 says: a launch that was not refused, or a definite failure,
+ * clears the latch first through the handlers' clear hook
+ * (`clearLatchBeforeOutcome`); an `ErrInstanceIdCollision` gives no
+ * information (`latchRecheckCollided`); an UNAVAILABLE answer makes no `get`
+ * (`afterLaunchUnavailable`); nothing is armed, started or fed while the
+ * persona is latched. A `resume`'s no-transcript answer, which clears, goes
+ * on to the no-transcript step's reuse (`noTranscriptReuse`, its
+ * lost-transcript diagnosis included); its `ErrSpawnNotResumable`, which
+ * clears, arms the lost-race cause and answers `retrying`, as the lost race
+ * does. A definite answer is handled by its own class (SRJ-105, SRJ-111 to
+ * SRJ-113), counting included: once the launch settles its result is counted
+ * as any launch outside the restart path's is
+ * (`countLaunchOutsideRestartWork`): a success resets the persona's failure
+ * count, and a LAUNCH FAILURE or DIRECTORY answer (marked `countedClass`) is
+ * one counted launch failure; nothing else is counted.
+ *
+ * The launch is registered as the persona's launch in flight (a teardown
+ * waits for it through `whenLaunchSettled`) and runs as a launch attempt
+ * (`runInAttempt`), as `spawnForPersona`'s ladder does; with a launch already
+ * in flight for the persona, a dry run or a `claude_config_dir` that does not
+ * resolve, no call is made. The pre-launch trust patch runs once before a
+ * plain spawn or a `resume` (the reuse runs its own). Answers the launch's
+ * action, or why none was made. Never throws.
+ */
+async function latchRecheckLaunch(
+  call: LatchRecheckCall,
+  found: { readonly persona: Persona; readonly config: PersonaConfig },
+  ref: string,
+  lastRead: LatchRowState,
+): Promise<string> {
+  const { persona, config } = found
+  const { key } = persona
+  if (inFlightLaunches.has(key)) {
+    console.error(`[slack] ${LATCH_RECHECK_SITE}: a launch is in flight for ${ref} — no ${call} in this re-check (b.jg5 SRJ-505)`)
+    return 'launch-in-flight'
+  }
+  if (isDryRun()) {
+    console.error(`[slack] dry-run: skipping the latch re-check's ${call} for ${ref}`)
+    return 'dry-run'
+  }
+  const configDir = checkLaunchConfigDir(persona)
+  if (!configDir.ok) {
+    console.error(
+      `[slack] ${LATCH_RECHECK_SITE}: ${ref}'s claude_config_dir does not resolve — no ${call} in this re-check; the persona stays latched (b.jg5 SRJ-505)`,
+    )
+    return 'config-dir-unresolvable'
+  }
+  const params = buildSpawnParams(persona, config, configDirLabelValue(configDir.realPath, spawnHomeDir()))
+  // b.f2b, b.jdc: as at any launch, the earlier row's idle evidence and
+  // deferrals say nothing about the session this launch brings up.
+  forgetWorkingRowEvidence(key)
+  endWorkingRowDeferral(key)
+  endPromptRowDeferral(key)
+  const launch = runInAttempt(key, 'launch', () => latchRecheckLaunchCall(call, found, ref, params, lastRead))
+  inFlightLaunches.set(key, launch)
+  try {
+    const result = await launch
+    // b.jg5 SRJ-506: a definite answer is handled by its own class, counting
+    // included, as any launch outside the restart path's is.
+    countLaunchOutsideRestartWork(key, ref, result, `[slack] ${LATCH_RECHECK_SITE}:`)
+    return result.action
+  } finally {
+    if (inFlightLaunches.get(key) === launch) {
+      inFlightLaunches.delete(key)
+      cancelledLaunchWaits.delete(key)
+      cancelledComingApprovers.delete(key)
+    }
+  }
+}
+
+/** `latchRecheckLaunch`'s one call through its handler. Never throws. */
+async function latchRecheckLaunchCall(
+  call: LatchRecheckCall,
+  found: { readonly persona: Persona; readonly config: PersonaConfig },
+  ref: string,
+  params: SpawnParams,
+  lastRead: LatchRowState,
+): Promise<SpawnPersonaResult> {
+  const { persona, config } = found
+  const { key } = persona
+  if (call === RECHECK_CALL_REUSE_SPAWN) {
+    const reused = await reuseSpawnForPersona(persona, config, { isStartup: false, lastRead })
+    return isReuseSpawnCollided(reused) ? latchRecheckCollided(key, ref, REUSE_SPAWN_WHAT) : reused
+  }
+  // b.av2 SR-6.2: the trust patch precedes every launch.
+  runPreLaunchTrustPatch(persona, ref)
+  if (call === RECHECK_CALL_PLAIN_SPAWN) {
+    return plainSpawnOutcomeAt<SpawnPersonaResult>({
+      persona,
+      isStartup: false,
+      ref,
+      params,
+      what: LATCH_RECHECK_PLAIN_SPAWN_WHAT,
+      lastRead,
+      marksDirectoryCounted: true,
+      spawnedLine: () => `[slack] ${LATCH_RECHECK_SITE}: ${LATCH_RECHECK_PLAIN_SPAWN_WHAT} of ${ref} was not refused — spawned`,
+      collided: () => Promise.resolve(latchRecheckCollided(key, ref, LATCH_RECHECK_PLAIN_SPAWN_WHAT)),
+    })
+  }
+  return resumeAtSite<SpawnPersonaResult>({
+    persona,
+    isStartup: false,
+    ref,
+    lastRead,
+    params,
+    head: LATCH_RECHECK_RESUME_HEAD,
+    marksDirectoryCounted: true,
+    noTranscript: async (err) => {
+      console.error(
+        `${LATCH_RECHECK_RESUME_HEAD} ${describeAgentDirectorFailure(err)} on the re-check's resume of ${ref} — a reuse spawn of the same id follows; nothing is deleted (b.jg5 SRJ-707, SRJ-506)`,
+      )
+      const reused = await noTranscriptReuse(persona, config, err, { isStartup: false, lastRead, trustPatchRan: true, retiredAtStart: undefined })
+      return isReuseSpawnCollided(reused) ? latchRecheckCollided(key, ref, REUSE_SPAWN_WHAT) : reused
+    },
+    notResumable: () => {
+      const armed = reportLostRaceAtSite(key)
+      console.error(
+        `${LATCH_RECHECK_RESUME_HEAD} ErrSpawnNotResumable on the re-check's resume of ${ref} — its row turned live since the re-check read it; nothing is killed or launched, answering retrying; the retry timer ${armed ? 'is armed' : 'could not be armed'} (cause=${UNAVAILABLE_RETRY_CAUSE_LOST_RACE}; b.jg5 SRJ-710, SRJ-506)`,
+      )
+      return Promise.resolve({ key, action: SPAWN_ACTION_RETRYING })
+    },
+    plainSpawnCollided: () => Promise.resolve(latchRecheckCollided(key, ref, RESUME_NOT_FOUND_SPAWN_WHAT)),
+  })
+}
+
+/**
+ * A latch re-check's one run of the restart path's decision for persona
+ * `persona` (b.jg5 SRJ-505, SRJ-506, SRJ-502), inside the round's serializer
+ * turn (`runRestartWorkInTurn`, never the retry entry, which would wait on
+ * that turn). It carries the re-check's permit, so the restart work's latched
+ * gates, the launch it reaches (`spawnForPersona`'s gate, `launchSession`) and
+ * every stop built on `personaLatchedNow` let it through. The permit is
+ * revoked at the run's first refusal: any set of the persona's latch while
+ * the run goes (a CONFLICT, whatever its case, an UNUSABLE NAME, a note or
+ * a `pending` row with no launch start its reads meet), seen through a set
+ * observer on the latch that lives for the run only; and by the run's launch
+ * when its answer gives no information while the persona is still latched
+ * (UNAVAILABLE, ENVIRONMENT, UNCLASSIFIED, or CONFIG, which keeps the latch:
+ * `launchSession`, SRJ-506), which is then no counted launch failure. From
+ * then on every gate stops it, so a run that leaves the persona latched makes
+ * no further call, and it is not cleared after it.
+ * A run whose answer clears the latch does so before any step that stops for
+ * a latched persona: a launch's through the handlers' clear hook, a
+ * sequence's through the start entry's; and a run that completes with no
+ * refusal (connected, reconnected, launched, or a counted failure) clears it
+ * after the run when nothing has. Answers the run's outcome. Never throws.
+ */
+async function latchRecheckRestartDecision(
+  key: string,
+  persona: Persona,
+  deps: LatchRecheckRoundDeps,
+  scope: LatchRecheckRoundScope,
+): Promise<string> {
+  let refused = false
+  let noInformation = false
+  let ended = false
+  const permit: LatchRecheckRunPermit = {
+    holds: () => !refused && !noInformation && !ended,
+    revoke: () => {
+      noInformation = true
+    },
+  }
+  let removeObserver: (() => void) | undefined
+  try {
+    removeObserver = deps.latch.addSetObserver?.((event) => {
+      if (event.key === key) refused = true
+    })
+  } catch {
+    removeObserver = undefined
+  }
+  let outcome: RestartRetryOutcome
+  try {
+    outcome = await (deps.runRestartDecision ?? runRestartWorkInTurn)(key, persona.working_directory, permit)
+  } catch (thrown) {
+    console.error(`[slack] ${LATCH_RECHECK_SITE}: the run of the restart path's decision failed for ${personaRef(persona)}: ${describeThrownValue(thrown)}`)
+    return 'failed'
+  } finally {
+    ended = true
+    try {
+      removeObserver?.()
+    } catch {
+      /* the observer only revokes a permit that no longer holds */
+    }
+  }
+  let stillLatched: boolean
+  try {
+    stillLatched = deps.latch.isLatched(key) === true
+  } catch {
+    stillLatched = true
+  }
+  if (stillLatched && !refused && !noInformation && RESTART_DECISION_CLEARING_OUTCOMES.has(outcome)) scope.clear()
+  return outcome
+}
+
+/**
+ * The latch re-check's permit for its one run of the restart path's decision
+ * (`latchRecheckRestartDecision`), which the run's own launch revokes
+ * (`revoke`) when its answer gives no information while the persona is still
+ * latched (`launchSession`, b.jg5 SRJ-505, SRJ-506): from then on every
+ * latched gate stops the run, and the run is not cleared after it.
+ */
+interface LatchRecheckRunPermit extends LatchRecheckPermit {
+  readonly revoke: () => void
+}
+
+/**
+ * Revoke the permit of the latch re-check's run of the restart path's
+ * decision the current call runs in for persona `key`
+ * (`LatchRecheckRunPermit`), if any; a scope with no permit, or a permit the
+ * re-check did not make, is left as it is. Never throws.
+ */
+function revokeLatchRecheckRunPermit(key: string): void {
+  const permit = latchRecheckScopeOf(key)?.permit
+  if (permit === undefined || !('revoke' in permit) || typeof permit.revoke !== 'function') return
+  try {
+    permit.revoke()
+  } catch {
+    /* a permit that cannot be revoked leaves the run's own gates to stop it */
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The re-check's production dependencies (b.jg5 SRJ-505)
+// ---------------------------------------------------------------------------
+
+/** What `buildLatchRecheck` composes the re-check from. */
+export interface LatchRecheckInput {
+  /** The server's one latch. */
+  readonly latch: Pick<ConflictLatch, 'isLatched' | 'record' | 'forget' | 'addSetObserver'>
+  /** The re-check timers' clock (the system clock in production). */
+  readonly clock: LatchRecheckClock
+  /** The one persona lifecycle serializer's submit (`PersonaSerializer.run`). */
+  readonly serialize: <T>(key: string, operation: () => T | Promise<T>) => Promise<T>
+  /** The applied configuration now, read at each round. */
+  readonly appliedConfig: () => PersonaConfig | null | undefined
+  /** Where the re-check's lines go. */
+  readonly log: (line: string) => void
+  /**
+   * The server's notice episodes (the latch notices'), for the clear's
+   * recovery post and episode end (SRJ-506's clear). The silent clear reads
+   * nothing of them.
+   */
+  readonly episodes: ConflictNoticeEpisodes
+}
+
+/**
+ * The re-check's production composition (b.jg5 SRJ-505), built once per
+ * server: `main()` and the recovery harness both call it, so the re-check
+ * runs identically in both. It builds the re-check timers
+ * (`createLatchRecheckController`) over `input.clock`, the latch's own
+ * query and the one persona serializer, each round being
+ * `runLatchRecheckRound` with:
+ *   - step 1's reads through the shared own-row reads (`readPersonaOwnRow`,
+ *     `readPersonaOwnRowStatus`), with their latch rules;
+ *   - the probe and the lap `read-pane` through the outage wrapper with the
+ *     one-line count;
+ *   - the retries through the one handler each (`plainSpawnOutcomeAt`,
+ *     `reuseSpawnForPersona`, `resumeAtSite`) and the run of the restart
+ *     path's decision through `runRestartWorkInTurn` with the re-check's
+ *     permit;
+ *   - the no-information scope (`runInLatchRecheck`), the latch's CONFLICT
+ *     and unusable-name entries for a relatch, and the CONFIG outage raised
+ *     by the wrapper;
+ *   - the clear hand-off: the silent clear (`createSilentLatchRecheckClear`:
+ *     the latch's silent forget and this controller's stop of the persona's
+ *     timer).
+ * Answers the controller; the caller binds its observer to the latch
+ * (`bindLatchRecheck`) after the holds and the notice, stops a persona's
+ * timer wherever it forgets the persona's latch at a teardown, and calls
+ * `stopAll` at shutdown. The builder reads nothing and starts nothing when
+ * called.
+ */
+export function buildLatchRecheck(input: LatchRecheckInput): LatchRecheckController {
+  let controller: LatchRecheckController | undefined
+  const clearHandOff = createSilentLatchRecheckClear({
+    latch: input.latch,
+    stopTimer: (key) => {
+      controller?.stop(key)
+    },
+  })
+  controller = createLatchRecheckController({
+    clock: input.clock,
+    isLatched: (key) => input.latch.isLatched(key),
+    serialize: input.serialize,
+    round: (key) => runLatchRecheckRound(key, { latch: input.latch, appliedConfig: input.appliedConfig, clearHandOff, log: input.log }),
+    log: input.log,
+  })
+  return controller
 }

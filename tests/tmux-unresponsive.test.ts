@@ -60,6 +60,12 @@
  *   pending-only retry reading the row live but not connected stops the
  *   timer and cancels its alert check, nothing posts while no timer runs,
  *   and a later refusal arms the check again from the first refusal.
+ * - A latch re-check (SRJ-505, AC 71): with the re-check bound, a latched
+ *   P's one-line probe or retry (plain spawn, reuse, resume) answering
+ *   `ErrTmuxUnresponsive` or `ErrCallTimeout`, round after round past the
+ *   alert threshold with a health tick after each, starts no condition and
+ *   posts nothing but the latch's notice; once a round's step-1 read clears
+ *   the latch, the same answer inside a launch attempt starts it.
  * - Isolation: the other persona's condition, ends and notices are untouched.
  * - A lost message (SRJ-1011), through the harness's lost-message driver (the
  *   real routing bound as `main()` binds it): while P's condition holds it
@@ -237,7 +243,19 @@ import {
 } from './test-helpers/agent-director-stub.ts'
 import { LIVE_ROW_OUTCOME_ABORTED, LIVE_ROW_OUTCOME_LAUNCHED, LIVE_ROW_SEQUENCE_ENTRY_GET } from '../src/live-row-sequence.ts'
 import type { AdConfigTables } from './test-helpers/ad-settings.ts'
-import { APPROVER_VERB_CALLS, conflictForPersona, conflictNoticeForPersona } from './test-helpers/conflict-cases.ts'
+import { APPROVER_VERB_CALLS, CONFLICT_CASE_ROWS, conflictForPersona, conflictNoticeForPersona } from './test-helpers/conflict-cases.ts'
+import { makePendingRowModel, PENDING_ROW_MODEL_NO_ROW } from './test-helpers/pending-row-model.ts'
+import {
+  LATCH_CASE_ANOTHER_STORE,
+  LATCH_CASE_LEFTOVER,
+  LATCH_CASE_OWN_ID,
+  LATCH_RECHECK_INTERVAL_MS,
+  LATCH_ROW_STATE_KIND_NO_ROW,
+  LATCH_ROW_STATE_KIND_READ,
+  REFUSED_OPERATION_PLAIN_SPAWN,
+  REFUSED_OPERATION_RESUME,
+  REFUSED_OPERATION_REUSE_SPAWN,
+} from '../src/conflict-latch.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import {
   callCounts,
@@ -2703,5 +2721,72 @@ describe('tmux-unresponsive: a lost message reads the holds query (SRJ-1011, SRJ
     await expectLostMessageReports(h, p, 'auto-restart-disabled')
     expectNeverStarted(h, b)
     expectNoPostYet(h)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// AC 71: a latch re-check's probe or retry answering UNAVAILABLE starts
+// nothing (SRJ-307, SRJ-505; E30 T1). P latched as a case-table row's site
+// latches it, its row on the row model, the re-check bound as main() binds
+// it, the health check on: round after round past the alert threshold in
+// effect, its one-line read-pane probe or its retry (a plain spawn, a reuse,
+// a resume) answers the UNAVAILABLE form, and a health tick runs after each
+// round; no condition starts and nothing but the latch's own notice posts.
+// Once a later round's step-1 read clears the latch, a tmux-touching
+// UNAVAILABLE inside a launch attempt starts the condition as before.
+// ---------------------------------------------------------------------------
+
+describe('tmux-unresponsive: a latch re-check\'s probe or retry answering UNAVAILABLE starts nothing (AC 71; SRJ-307, SRJ-505)', () => {
+  /** A resume or reuse latch row of `latchCase`, its row recorded `ended`; or the plain spawn's scan-leftover row, with no row. */
+  const rowOf = (refusedOperation: string, latchCase: string, state: string | undefined) =>
+    CONFLICT_CASE_ROWS.find(
+      (row) =>
+        row.refusedOperation === refusedOperation &&
+        row.latchCase === latchCase &&
+        (state === undefined ? row.rowState.kind === LATCH_ROW_STATE_KIND_NO_ROW : row.rowState.kind === LATCH_ROW_STATE_KIND_READ && row.rowState.state === state),
+    )!
+  /** Each re-check call that touches tmux: the latch, its row's state, the verb, and where the model takes its answer. */
+  const CALLS = [
+    ['the probe (read-pane)', rowOf(REFUSED_OPERATION_RESUME, LATCH_CASE_OWN_ID, LIVENESS_DEAD_ROW_ENDED), LIVENESS_DEAD_ROW_ENDED, 'read-pane'],
+    ['the plain spawn retry', rowOf(REFUSED_OPERATION_PLAIN_SPAWN, LATCH_CASE_LEFTOVER, undefined), PENDING_ROW_MODEL_NO_ROW, 'spawn'],
+    ['the reuse retry', rowOf(REFUSED_OPERATION_REUSE_SPAWN, LATCH_CASE_ANOTHER_STORE, LIVENESS_DEAD_ROW_ENDED), LIVENESS_DEAD_ROW_ENDED, 'spawn'],
+    ['the resume retry', rowOf(REFUSED_OPERATION_RESUME, LATCH_CASE_ANOTHER_STORE, LIVENESS_DEAD_ROW_ENDED), LIVENESS_DEAD_ROW_ENDED, 'resume'],
+  ] as const
+  const CASES = CALLS.flatMap(([name, row, state, verb]) =>
+    unavailableForms('ErrTmuxUnresponsive', 'ErrCallTimeout').map(([form, make]) => [`${name}, ${form}`, row, state, verb, make] as const),
+  )
+
+  test.each(CASES)('%s: no condition starts and nothing but the latch\'s one CONFLICT notice posts over the health ticks and rounds past the alert threshold; once the latch clears, a launch attempt\'s UNAVAILABLE starts the condition as before', async (_label, row, state, verb, make) => {
+    const { h, p, b } = build({ ...TICK_MODE, latchRecheck: true })
+    const rounds = Math.ceil(adAlertThresholdMsInEffect() / LATCH_RECHECK_INTERVAL_MS) + 1
+    const answers = Array.from({ length: rounds }, () => make(verb))
+    const model = makePendingRowModel(h, p, { state, sessionId: 'session-of-p', ...(verb === 'read-pane' ? { readPane: answers } : {}) })
+    for (const answer of answers) {
+      if (verb === 'resume') model.scriptResumes(answer)
+      else if (verb === 'spawn' && row.refusedOperation === REFUSED_OPERATION_PLAIN_SPAWN) model.scriptPlainSpawns(answer)
+      else if (verb === 'spawn') model.scriptReuseSpawns(answer)
+    }
+    row.latchOn(h.latchSet, p)
+    const latchNotice = { key: p, text: row.notice.text }
+
+    for (let n = 0; n < rounds; n++) {
+      await h.advanceToRecheck()
+      tick(h)
+      expect(h.latch.isLatched(p)).toBe(true)
+    }
+    expect(h.clock.now()).toBeGreaterThan(adAlertThresholdMsInEffect())
+    expect(model.calls.filter((call) => call.verb === verb)).toHaveLength(rounds)
+    expectNeverStarted(h, p)
+    expect(h.triggers.filter((trigger) => trigger.key === p)).toEqual([])
+    expectPosts(h, [latchNotice])
+
+    // A row that reported in since the latch clears it at step 1; then a tmux-touching UNAVAILABLE inside a launch attempt starts the condition.
+    model.setState(cannedStatusResult().state)
+    await h.advanceToRecheck()
+    expect(h.latch.isLatched(p)).toBe(false)
+    const at = h.clock.now()
+    await runInAttempt(p, 'launch', () => expect(withOutageDetection(p, undefined, verb, () => Promise.reject(make(verb)))).rejects.toThrow())
+    expectHolds(h, p, verb, at)
+    expectNeverStarted(h, b)
   })
 })

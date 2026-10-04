@@ -108,6 +108,16 @@
  * no flag; `ErrSystemInstallDisappeared`, which is UNCLASSIFIED, still raises
  * `ad-unreachable` in the wrappers.
  *
+ * A latch re-check (b.jg5 SRJ-505). Inside a latch re-check of a persona
+ * that is still latched (`isInsideLatchRecheck`, `src/unavailable-retry.ts`)
+ * an answer gives no information: the reporting point arms nothing, no
+ * `tmux-unresponsive` condition starts or continues, `tmux-unavailable` is
+ * not raised (a `find-missing` run's ENVIRONMENT answer excepted, b.jg5
+ * SRJ-506), nothing reaches the unclassified sink and neither pending-only
+ * arm arms. Unchanged there: `ad-config-malformed` on a CONFIG answer,
+ * `ad-unreachable` on `ErrSystemInstallDisappeared`, `cwd-unreachable` on a
+ * DIRECTORY answer, and every clear on a success or a GONE answer.
+ *
  * SPDX-License-Identifier: MIT
  */
 
@@ -148,6 +158,7 @@ import {
   UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
   UNAVAILABLE_RETRY_ROW_PENDING,
   isInsideAttempt,
+  isInsideLatchRecheck,
   reportAttemptCause,
   reportAttemptError,
   unavailableRetryCauseFor,
@@ -465,8 +476,15 @@ export function setOutageFlag(key: string, cls: OutageClass, detail?: string): v
  * `ONSET_TEMPLATES['tmux-unavailable']`. No detail is recorded, so the
  * all-clear is the existing one. Same-flag dedupe as `setOutageFlag`: while
  * the flag is raised, a second error of either form posts nothing.
+ *
+ * Inside a latch re-check of a latched persona (`isInsideLatchRecheck`,
+ * b.jg5 SRJ-505) nothing is raised: the re-check's answers give no
+ * information. `verb`, the verb whose answer raises it, excepts one: a
+ * `find-missing` run raises it as for any caller (b.jg5 SRJ-506), so a
+ * bypassing run made for a latched persona still raises its outage.
  */
-export function raiseTmuxUnavailable(key: string, err: unknown): void {
+export function raiseTmuxUnavailable(key: string, err: unknown, verb?: AdVerb): void {
+  if (verb !== 'find-missing' && isInsideLatchRecheck(key)) return
   raiseFlag(key, 'tmux-unavailable', undefined, () =>
     isDifferentTmuxServerError(err) ? tmuxServerChangedOnset() : ONSET_TEMPLATES['tmux-unavailable'](),
   )
@@ -724,7 +742,7 @@ export async function withOutageDetection<T>(
     if (err instanceof ErrSystemInstallDisappeared) {
       setOutageFlag(key, 'ad-unreachable', err.binaryPath)
     } else if (errorClass === AD_ERROR_CLASS_ENVIRONMENT) {
-      if (raisesOutage) raiseTmuxUnavailable(key, err)
+      if (raisesOutage) raiseTmuxUnavailable(key, err, adCallVerb(call))
     } else if (errorClass === AD_ERROR_CLASS_CONFIG) {
       if (raisesOutage) raiseAdConfigMalformed(key, err)
     } else if (err instanceof ErrCwdNotFound || err instanceof ErrCwdNotADirectory) {
@@ -850,7 +868,8 @@ export function reportUnclassifiedAtSite(
 ): boolean {
   if (!isInsideAttempt(key)) return false
   const armed = reportAttemptCause(key, { kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, error: err }, adCallVerb(call), deps?.triggerSink)
-  sendUnclassified(key, err, classification)
+  // b.jg5 SRJ-313, SRJ-505: a latch re-check's answer feeds no episode.
+  if (!isInsideLatchRecheck(key)) sendUnclassified(key, err, classification)
   return armed
 }
 
@@ -907,6 +926,8 @@ export function reportLostRaceAtSite(key: string): boolean {
 export function armPendingOnlyAfterLaunchFailure(key: string): boolean {
   try {
     if (!isInsideAttempt(key)) return false
+    // b.jg5 SRJ-505: nothing is armed inside a latch re-check of a latched persona.
+    if (isInsideLatchRecheck(key)) return false
     const sink = deps?.triggerSink
     if (sink?.armPendingOnly === undefined) return false
     sink.armPendingOnly(key)
@@ -932,6 +953,8 @@ export function armPendingOnlyAfterLaunchFailure(key: string): boolean {
  */
 export function armPendingOnlyForPendingRow(key: string): boolean {
   try {
+    // b.jg5 SRJ-505: nothing is armed inside a latch re-check of a latched persona.
+    if (isInsideLatchRecheck(key)) return false
     const sink = deps?.triggerSink
     if (sink?.armPendingOnly === undefined) return false
     sink.armPendingOnly(key)
@@ -951,6 +974,8 @@ export function armPendingOnlyForPendingRow(key: string): boolean {
 function reportUnclassified(key: string, err: unknown, verb: AdVerb | undefined): void {
   try {
     if (deps?.unclassifiedSink === undefined || verb === undefined || !isInsideAttempt(key)) return
+    // b.jg5 SRJ-313, SRJ-505: a latch re-check's answer feeds no episode.
+    if (isInsideLatchRecheck(key)) return
     if (classifyAdError(err).errorClass !== AD_ERROR_CLASS_UNCLASSIFIED) return
     // The sink classifies the value itself (`UnclassifiedErrorSink.report`).
     sendUnclassified(key, err)
@@ -979,6 +1004,8 @@ function startTmuxUnresponsive(key: string, err: unknown, call: AdCall, verb: Ad
     const sink = deps?.conditionSink
     if (sink === undefined || verb === undefined) return
     if (!isInsideAttempt(key) || !isTmuxTouchingCall(call)) return
+    // b.jg5 SRJ-307, SRJ-505: a latch re-check's probe or retry starts none.
+    if (isInsideLatchRecheck(key)) return
     if (unavailableRetryCauseFor(err, verb)?.kind !== UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE) return
     sink.start(key, verb, err)
   } catch {

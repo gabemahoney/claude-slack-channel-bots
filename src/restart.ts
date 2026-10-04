@@ -97,7 +97,14 @@
  * serializer, or the reconnect's findMissing sweep, can latch the persona
  * during those awaits.
  * A launch that answers `'skipped'` for a persona that latched at it answers
- * the same. A latched query that throws counts as latched (fail safe).
+ * the same. A latched query that throws counts as latched (fail safe). The
+ * one exception is the latch re-check's own run of the restart path's
+ * decision (b.jg5 SRJ-505), made through `runRestartWorkInTurn` from inside
+ * the persona's serializer turn with the re-check's permit: every latched
+ * gate of the work lets that run through while the permit holds
+ * (`holdsLatchRecheckPermit`, `src/unavailable-retry.ts`), and the re-check
+ * revokes it at the run's first refusal. Inside a latch re-check of a
+ * latched persona the arm hook is not called on an `unknown` reading.
  * A persona held on `ErrInvalidFlags` gets no attempt either (b.jg5 SRJ-207,
  * SRJ-303): the optional held query (`RestartDeps.isHeld`) is asked right
  * after each latched gate, so a fired restart timer, the retry entry (before
@@ -150,7 +157,17 @@ import {
 } from './backoff.ts'
 import type { PersonaSerialize } from './persona-serializer.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
-import { readRetryBlockCause, retryBlockSkipText, runInAttempt, type RetryBlockCause } from './unavailable-retry.ts'
+import {
+  holdsLatchRecheckPermit,
+  isInsideLatchRecheck,
+  latchRecheckScopeOf,
+  readRetryBlockCause,
+  retryBlockSkipText,
+  runInAttempt,
+  runInLatchRecheck,
+  type LatchRecheckPermit,
+  type RetryBlockCause,
+} from './unavailable-retry.ts'
 import { AD_ERROR_CLASS_CONFLICT, AD_ERROR_CLASS_UNUSABLE_NAME } from './ad-error-class.ts'
 import {
   KILL_OUTCOME_NOT_KILLED,
@@ -1160,6 +1177,48 @@ export async function runRestartRetry(
 }
 
 /**
+ * The latch re-check's run of the restart path's decision for persona `key`
+ * (b.jg5 SRJ-505, SRJ-502), from inside the operation that holds the
+ * persona's lifecycle serializer turn: the restart work (`runRestartWork`)
+ * with no serializer of its own, since awaiting the retry entry
+ * (`runRestartRetry`, which submits through `RestartDeps.serialize`) from
+ * inside that turn would never settle (`src/persona-serializer.ts`
+ * re-entrancy rule). `cwd` is the persona's working directory.
+ *
+ * `permit` is the re-check's permit for this one run: the run opens a latch
+ * re-check scope of its own carrying it (the caller's scope's fields kept),
+ * so the latched gates of the restart work and of the launch it reaches
+ * (`skipIfLatched`; the session manager's launch gate and mid-path stops)
+ * pass while `permit.holds()` answers true, and meet the latch again once it
+ * answers false: the caller revokes it at the run's first refusal, and the
+ * launch revokes it when its answer gives no information while the persona
+ * is still latched (answering `'skipped'`, so the work ends latched with
+ * nothing counted), so a run that leaves the persona latched makes no further
+ * call. Under the permit, the work's latched checks after a launch or a kill
+ * count only a latch that revoked it (`readLatchedForCall`). The permit carries
+ * to no later call or run. The work's held, sequence, not-up and old-life
+ * gates, the shutdown check and its accounting are as for any run, and it
+ * runs as one recovery attempt. Before `initRestart` it answers
+ * `RESTART_OUTCOME_NOT_INITIALISED` and logs. Never used by the retry timer,
+ * the health tick or any path but the re-check.
+ */
+export async function runRestartWorkInTurn(key: string, cwd: string, permit: LatchRecheckPermit): Promise<RestartRetryOutcome> {
+  const d = deps
+  if (!d) {
+    console.error(`[slack] runRestartWorkInTurn: deps not initialized — skipping the re-check's run for persona=${key}`)
+    return RESTART_OUTCOME_NOT_INITIALISED
+  }
+  const outer = latchRecheckScopeOf(key)
+  const scope = { ...(outer ?? { key, isLatched: (k: string) => readLatched(d, k).latched }), permit }
+  markActive(key)
+  try {
+    return await runInLatchRecheck(scope, () => runRestartWork(d, key, cwd, undefined))
+  } finally {
+    unmarkActive(key)
+  }
+}
+
+/**
  * The retry entry's skip line for work in flight (b.jg5 SRJ-303), naming what
  * blocks the retry (`retryBlockSkipText`: a launch call, the persona's
  * live-row sequence, or an old-life wait step for a hold it waits on; a
@@ -1476,8 +1535,12 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     // b.jg5 SRJ-502, SRJ-1015: the launch met a CONFLICT and the persona
     // latched (or it was latched by the time the launch ran). Nothing is
     // recorded, and the outcome says so. A latched query that throws here
-    // counts as latched too: `skipped` records nothing either way.
-    const reading = readLatched(d, key)
+    // counts as latched too: `skipped` records nothing either way. Under the
+    // latch re-check's permit, latched means latched for this call
+    // (`readLatchedForCall`): the launch's refusal, or an answer that gave no
+    // information, revoked the permit (b.jg5 SRJ-505, SRJ-506); a permitted
+    // run's launch declined for another reason is launch-skipped below.
+    const reading = readLatchedForCall(d, key)
     if (reading.latched) {
       console.error(`[slack] Session relaunch for persona=${key} ended latched${latchedFailure(reading)} — not counted; nothing more is done for it`)
       return RESTART_OUTCOME_LATCHED
@@ -1557,8 +1620,9 @@ function countLaunchFailure(
 /**
  * Record the result of a launch for persona `key` whose result does not come
  * back through the restart work's `launchSession` (the live-row sequence's
- * final launch, `launchForLiveRowSequence` in `src/session-manager.ts`; b.jg5
- * SRJ-112, SRJ-113, SRJ-602), as the restart work records its own launch's:
+ * final launch, `launchForLiveRowSequence`, and a latch re-check's own retry,
+ * both in `src/session-manager.ts`; b.jg5 SRJ-112, SRJ-113, SRJ-506,
+ * SRJ-602), as the restart work records its own launch's:
  * a success (`launched` true) resets the persona's failure count and cap
  * latch; a counted failure is recorded, with the cap notice through the
  * installed restart dependencies' `onCapReached` once per episode (none when
@@ -1630,7 +1694,9 @@ type KillDecision =
  * adapter has latched (b.jg5 SRJ-501, SRJ-512; never sent again), and for
  * any other non-success after which the persona is latched (a `status` read
  * between the kill's tries latched it, b.jg5 SRJ-702, or a latch set
- * elsewhere; the latched query, a throw counting as latched), and
+ * elsewhere; the latched query, a throw counting as latched, read as the
+ * latched gate reads it, so a call under the latch re-check's permit counts
+ * only a latch that revoked the permit, `readLatchedForCall`), and
  * `RESTART_OUTCOME_REFUSED` for every other non-success (UNAVAILABLE,
  * `ErrTmuxKillFailed` included, ENVIRONMENT, CONFIG, UNCLASSIFIED,
  * `ErrSystemInstallDisappeared` and a class the kill has no row for
@@ -1692,11 +1758,13 @@ async function killBeforeRelaunch(
   }
   // b.jg5 SRJ-702, SRJ-502: a CONFLICT or an UNUSABLE NAME latched the
   // persona at the adapter; so may a `status` read between the kill's tries,
-  // or a latch set elsewhere while the kill ran.
+  // or a latch set elsewhere while the kill ran. Under the latch re-check's
+  // permit only a latch that revoked it counts (`readLatchedForCall`), so a
+  // permitted run's kill that failed otherwise is refused, never latched.
   const latched =
     (killed.kind === KILL_OUTCOME_NOT_KILLED &&
       (killed.errorClass === AD_ERROR_CLASS_CONFLICT || killed.errorClass === AD_ERROR_CLASS_UNUSABLE_NAME)) ||
-    readLatched(d, key).latched
+    readLatchedForCall(d, key).latched
   console.error(killNotSucceededLine(key, describeKillOutcome(killed), latched))
   return { kind: KILL_DECISION_STOP, outcome: latched ? RESTART_OUTCOME_LATCHED : RESTART_OUTCOME_REFUSED }
 }
@@ -1979,6 +2047,9 @@ function tellSlowRecovery(
  */
 function armOnUnknown(d: RestartDeps, key: string): void {
   if (d.armRetryTimer === undefined) return
+  // b.jg5 SRJ-505: inside a latch re-check of a latched persona an `unknown`
+  // reading gives no information, so nothing is armed.
+  if (isInsideLatchRecheck(key)) return
   try {
     d.armRetryTimer(key)
   } catch (err) {
@@ -2012,6 +2083,19 @@ function readLatched(d: RestartDeps, key: string): LatchedReading {
   }
 }
 
+/**
+ * `readLatched` as the work's latched checks read it (b.jg5 SRJ-502,
+ * SRJ-505): a call that carries the latch re-check's permit
+ * (`holdsLatchRecheckPermit`: the re-check's own run of the restart path's
+ * decision, until its first refusal) reads not latched, as the session
+ * manager's latched gate reads it, so "latched" means latched for this call:
+ * by its own refusal, or with no permit to pass. Logs nothing; never throws.
+ */
+function readLatchedForCall(d: RestartDeps, key: string): LatchedReading {
+  const reading = readLatched(d, key)
+  return reading.latched && holdsLatchRecheckPermit(key) ? { latched: false } : reading
+}
+
 /** ` (the latched query failed: <why> — taken as latched)` for a query that threw, else empty. */
 function latchedFailure(reading: LatchedReading): string {
   return reading.failure === undefined ? '' : ` (the latched query failed: ${reading.failure} — taken as latched)`
@@ -2022,10 +2106,14 @@ function latchedFailure(reading: LatchedReading): string {
  * latched query throws, log one line saying the restart work makes no
  * attempt for it (naming what the query threw, if it did) and return true,
  * so the caller returns `RESTART_OUTCOME_LATCHED` before any agent-director
- * call. Records neither a success nor a failure.
+ * call. Records neither a success nor a failure. The one exception is the
+ * latch re-check's own run of the restart path's decision
+ * (`runRestartWorkInTurn`), whose permit passes the gate until the run meets
+ * a refusal (`holdsLatchRecheckPermit`, b.jg5 SRJ-502's "beyond the
+ * re-check", SRJ-505); every other caller still meets it.
  */
 function skipIfLatched(d: RestartDeps, key: string): boolean {
-  const reading = readLatched(d, key)
+  const reading = readLatchedForCall(d, key)
   if (!reading.latched) return false
   console.error(
     `[slack] Skipping restart for persona=${key} — the persona is latched${latchedFailure(reading)}; no agent-director call, nothing recorded (b.jg5 SRJ-502)`,

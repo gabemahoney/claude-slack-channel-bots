@@ -49,7 +49,9 @@
  * `setLaunchStartNotRecorded` for a `pending` row with no launch start. Every set
  * calls each set observer once with the key, the outcome and the record, so
  * the CONFLICT notice and the holds react to it. `forget(key)` drops one
- * persona's latch silently: no post, no observer call, no line. The persona
+ * persona's latch silently: no post, no set observer call, no line; its
+ * forget observers (`addForgetObserver`: the re-check timer's stop, bound
+ * by {@link bindLatchRecheck}) are told the key. The persona
  * teardown calls it (`runTeardown`, `src/persona-lifecycle.ts`) after the
  * launch in flight settled and right before it forgets the persona's notice
  * episodes, which ends the CONFLICT episode with it. There is no forget-all.
@@ -76,8 +78,8 @@
  * on by the session manager's shared own-row `get` read and own-row `status`
  * step (so also by the dialog approver's `status` read and the liveness and
  * reconnect adapters in `src/server.ts`), which latch through `set` with
- * this input. Sites still to come latch through the same input: the start
- * sweep's `list` (E26) and the re-check's relatch (E30).
+ * this input. The re-check's step-1 read latches through the same shared
+ * reads, so through the same input.
  *
  * The notices (SRJ-1004, SRJ-1019, SRJ-1020, SRJ-508, SRJ-1016): {@link conflictNoticeText}
  * builds the CONFLICT notice's body from a CONFLICT latch's record, from the
@@ -121,8 +123,25 @@
  *
  * Every latching site latches through `set`, `setFromConflict`,
  * `setFromUnusableName` or `setLaunchStartNotRecorded`. A latch is dropped
- * only by the persona's teardown (`forget`, silently); nothing re-checks or
- * clears a latch, so nothing posts the recovery notice.
+ * by the persona's teardown (`forget`, silently) and by the re-check's clear
+ * hand-off (below). `setProbeDropped` marks the record's episode as having
+ * its "this row's own id" probe dropped (`probeDropped`); a new case's
+ * record starts without the mark.
+ *
+ * The re-check (SRJ-505): {@link LATCH_RECHECK_INTERVAL_MS}, step 1's reading
+ * ({@link LatchRecheckReading}), the step, action and call identifiers
+ * (`RECHECK_STEP_*`, `RECHECK_ACTION_*`, `RECHECK_CALL_*`), the pure decision
+ * ({@link decideLatchRecheck}) and the finished-row retry's launch
+ * ({@link decideFinishedRowLaunch}), the verdicts on a `read-pane` answer
+ * ({@link decideLatchRecheckProbe}, {@link decideLatchRecheckPendingReadPane}),
+ * the clear hand-off's type with its silent form
+ * ({@link createSilentLatchRecheckClear}), the per-persona timer
+ * ({@link createLatchRecheckController}, bound by {@link bindLatchRecheck})
+ * and the round's line ({@link latchRecheckRoundLine}). The round itself,
+ * which makes the calls, is the session manager's (`src/session-manager.ts`),
+ * built with its production dependencies by `buildLatchRecheck` there. The
+ * silent clear forgets the latch and stops the timer, with no recovery post;
+ * SRJ-506's clear takes its place through that builder.
  *
  * Log lines, to the injected log (a throwing log is swallowed):
  *
@@ -130,14 +149,19 @@
  *   [slack] conflict-latch: persona=<key> relatched — case=<case> (was <case>) session="<name>" refused=<operation> state=<state>[ message="<description>"]
  *   [slack] conflict-latch: persona=<key> set observer failed: <error>
  *   [slack] conflict-latch: persona=<key> hold failed (<hold>): <error>
+ *   [slack] conflict-latch: persona=<key> forget observer failed: <error>
+ *   [slack] conflict-latch: persona=<key> re-check timer could not be set: <error> — not armed
+ *   [slack] conflict-latch: persona=<key> re-check round failed: <error>
+ *   [slack] conflict-latch: re-check of <ref> — case=<case> call=<call> answer=<answer>  (logged by the session manager's round)
  *
  * where `<state>` is {@link describeLatchRowState}'s rendering. A same-case
  * set logs nothing. No line carries a token: the session name and the
  * description are redacted before they are stored.
  *
- * No agent-director call, no timer, no persistence and no module-scope
- * state; nothing runs at import or at creation. No label option name is
- * spelled here (b.jg5 SRJ-716).
+ * No agent-director call, no persistence and no module-scope state; the
+ * only timer is the re-check controller's, on its injected clock, and
+ * nothing runs at import or at creation. No label option name is spelled
+ * here (b.jg5 SRJ-716).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -159,7 +183,19 @@ import {
   CONFLICT_OWN_ID_PHRASE,
   CONFLICT_PANE_NOT_FOUND_PHRASE,
 } from './ad-description-phrases.ts'
-import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_PENDING_STATE } from './liveness-reading.ts'
+import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_LIVE_STATES, AGENT_DIRECTOR_PENDING_STATE } from './liveness-reading.ts'
+import {
+  PANE_READ_ABSENT,
+  PANE_READ_CONFIG,
+  PANE_READ_CONFLICT,
+  PANE_READ_ENVIRONMENT,
+  PANE_READ_GONE,
+  PANE_READ_PANE,
+  PANE_READ_UNAVAILABLE,
+  PANE_READ_UNCLASSIFIED,
+  PANE_READ_UNUSABLE_NAME,
+  type PaneReadOutcome,
+} from './pane-read.ts'
 import {
   describeLogMessage,
   describeThrownValue,
@@ -415,6 +451,14 @@ export interface ConflictLatchRecord {
   readonly rowState: LatchRowState
   /** agent-director's description, redacted, on one line and capped (`renderLogMessageText`); absent when there was none. */
   readonly description?: string
+  /**
+   * Set (true) once this episode's "this row's own id" probe is dropped
+   * (b.jg5 SRJ-505's first table row: the single retry after a cleared probe
+   * was refused again with that case), through the latch's
+   * `setProbeDropped`; absent otherwise. A same-case set keeps it; a new
+   * case begins a new episode and a new record without it.
+   */
+  readonly probeDropped?: true
 }
 
 /** What `set` takes: the record's fields and, when there is one, agent-director's description. */
@@ -502,10 +546,29 @@ export interface ConflictLatch {
   isLatched(key: string): boolean
   /** `key`'s record, or `undefined` when it is not latched. */
   record(key: string): ConflictLatchRecord | undefined
-  /** Drop `key`'s latch silently (its teardown): no post, no observer call, no line. Answers whether it was latched. */
+  /**
+   * Drop `key`'s latch silently (its teardown, the re-check's silent clear):
+   * no post, no set observer call, no line. Each forget observer is then told
+   * the key (the re-check timer's stop), when a latch was dropped. Answers
+   * whether it was latched.
+   */
   forget(key: string): boolean
+  /**
+   * Mark `key`'s latch episode as having its probe dropped (b.jg5 SRJ-505):
+   * the record is replaced by the same record with `probeDropped` set, with
+   * no observer call and no line. Answers false, doing nothing, when `key`
+   * is not latched. The mark lasts until a set with a new case replaces the
+   * record (a new episode) or the latch is forgotten.
+   */
+  setProbeDropped(key: string): boolean
   /** Add a set observer; the returned function removes it. */
   addSetObserver(observer: ConflictLatchSetObserver): () => void
+  /**
+   * Add a forget observer, told the key after each `forget` that dropped a
+   * latch; it posts nothing (the re-check timer's stop). A throw is logged
+   * and swallowed. The returned function removes it.
+   */
+  addForgetObserver(observer: (key: string) => void): () => void
 }
 
 // ---------------------------------------------------------------------------
@@ -516,6 +579,7 @@ export interface ConflictLatch {
 export function createConflictLatch(deps: ConflictLatchDeps): ConflictLatch {
   const records = new Map<string, ConflictLatchRecord>()
   const observers = new Set<ConflictLatchSetObserver>()
+  const forgetObservers = new Set<(key: string) => void>()
 
   function notify(event: ConflictLatchSetEvent): void {
     const failed = (thrown: unknown): void =>
@@ -576,12 +640,36 @@ export function createConflictLatch(deps: ConflictLatchDeps): ConflictLatch {
 
     record: (key) => records.get(key),
 
-    forget: (key) => records.delete(key),
+    forget(key) {
+      if (!records.delete(key)) return false
+      for (const observer of [...forgetObservers]) {
+        try {
+          observer(key)
+        } catch (thrown) {
+          safeLog(deps.log, `[slack] conflict-latch: persona=${key} forget observer failed: ${describeThrownValue(thrown)}`)
+        }
+      }
+      return true
+    },
+
+    setProbeDropped(key) {
+      const record = records.get(key)
+      if (record === undefined) return false
+      if (record.probeDropped !== true) records.set(key, Object.freeze({ ...record, probeDropped: true as const }))
+      return true
+    },
 
     addSetObserver(observer) {
       observers.add(observer)
       return () => {
         observers.delete(observer)
+      }
+    },
+
+    addForgetObserver(observer) {
+      forgetObservers.add(observer)
+      return () => {
+        forgetObservers.delete(observer)
       }
     },
   }
@@ -951,15 +1039,16 @@ export function launchStartNotRecordedNoticeText(key: string): string {
 // ---------------------------------------------------------------------------
 // The recovery notice (b.jg5 SRJ-1005)
 //
-// Built here, posted elsewhere: E30's re-check and clear post it (every
-// reason but "cleared by hand"), and E31's `clear-latch` posts it with
-// "cleared by hand"; nothing in this module posts it. Two no-post rules
-// before a clear are E30's to enforce: a "not this launch's session" latch
-// posts none when its finished-row retry is made or relatches P, only when
-// that retry clears it (`LATCH_RECOVERY_REASON_RELAUNCH_NOT_REFUSED`); a
-// latch whose refused operation is a spawn posts none when step 1 finds no
-// row and the spawn is retried or that retry is refused, only when the retry
-// clears it (`LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED`).
+// Built here; nothing in this module posts it. The re-check's clear
+// hand-off is where a re-check's clear is handed (every reason but "cleared
+// by hand"; the silent clear posts nothing yet), and a `clear-latch` posts
+// it with "cleared by hand". The re-check posts nothing before a clear: a
+// "not this launch's session" latch posts none when its finished-row retry
+// is made or relatches P, only when that retry clears it
+// (`LATCH_RECOVERY_REASON_RELAUNCH_NOT_REFUSED`); a latch whose refused
+// operation is a spawn posts none when step 1 finds no row and the spawn is
+// retried or that retry is refused, only when the retry clears it
+// (`LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED`).
 // ---------------------------------------------------------------------------
 
 /** A CONFLICT latch: a CONFLICT case or unrecognised text ("Conflict cleared"). */
@@ -1146,8 +1235,8 @@ export function latchNoticeEpisodeKindOf(latchCase: LatchCase): PersonaEpisodeKi
  * Every post goes through the episodes' sink (the persona notifier), never
  * straight to Slack, and reads no other notice's latch, b.f2b's
  * `unproven-idle` and `blocked-on-prompt` included, so none holds it back.
- * After the episodes' `close` (shutdown) it opens and posts nothing. The
- * clear's end of an episode is E30's, and a teardown's `forget` ends them.
+ * After the episodes' `close` (shutdown) it opens and posts nothing. A
+ * teardown's `forget` ends them; the re-check's silent clear ends none.
  */
 export function createConflictNoticeObserver(episodes: ConflictNoticeEpisodes): ConflictLatchSetObserver {
   return ({ key, outcome, record }) => {
@@ -1256,4 +1345,718 @@ export function bindConflictLatchHolds(
   log: (line: string) => void,
 ): () => void {
   return latch.addSetObserver(createConflictLatchHoldObserver(holds, log))
+}
+
+// ---------------------------------------------------------------------------
+// The re-check (b.jg5 SRJ-505): its interval, step 1's reading, the decision
+// ---------------------------------------------------------------------------
+
+/**
+ * The re-check's interval (b.jg5 SRJ-505): at most one re-check per latched
+ * persona per 120 s, on its own timer, whatever `health_check_interval` is
+ * (0 included). The first comes one interval after the persona latches,
+ * each next one interval after the previous one has settled.
+ */
+export const LATCH_RECHECK_INTERVAL_MS = 120_000
+
+/** Step 1 read the row in a state (with `get`, whether the `provenance_conflict` note is on it). */
+export const RECHECK_READING_STATE = 'state'
+/** Step 1's read answered `ErrSpawnNotFound`: no row. */
+export const RECHECK_READING_NO_ROW = 'no-row'
+/** Step 1's read failed: no information. */
+export const RECHECK_READING_FAILED = 'failed'
+
+/**
+ * What step 1's read of the row gave (b.jg5 SRJ-505): a state, with
+ * `notePresent` true when its `get` showed the latching `provenance_conflict`
+ * note (a "conflicting labels" latch's read; a `status` shows no note); no
+ * row; or a failed read.
+ */
+export type LatchRecheckReading =
+  | { readonly kind: typeof RECHECK_READING_STATE; readonly state: string; readonly notePresent?: boolean }
+  | { readonly kind: typeof RECHECK_READING_NO_ROW }
+  | { readonly kind: typeof RECHECK_READING_FAILED }
+
+/** No row, as a reading. */
+export const RECHECK_READING_NO_ROW_VALUE: LatchRecheckReading = Object.freeze({ kind: RECHECK_READING_NO_ROW })
+/** A failed read, as a reading. */
+export const RECHECK_READING_FAILED_VALUE: LatchRecheckReading = Object.freeze({ kind: RECHECK_READING_FAILED })
+
+/** Step 1: the row has reported in since the latch was set, so the latch clears. */
+export const RECHECK_STEP_CLEAR_REPORTED_IN = 'clear-reported-in'
+/** Step 1: `ErrSpawnNotFound` clears the latch (the row is gone). */
+export const RECHECK_STEP_CLEAR_GONE = 'clear-gone'
+/** Step 1: no row, for a latch whose refused operation is a spawn: that spawn is retried, P still latched. */
+export const RECHECK_STEP_SPAWN_RETRY = 'spawn-retry'
+/** Step 1: no row, for "not this launch's session": the finished-row retry, P still latched. */
+export const RECHECK_STEP_FINISHED_ROW_RETRY = 'finished-row-retry'
+/** Step 1 decided nothing: step 2's table decides. */
+export const RECHECK_STEP_TABLE = 'step-2'
+/** Step 1's read failed: no information; the round ends with no other call. */
+export const RECHECK_STEP_NO_INFORMATION = 'no-information'
+
+/** One of step 1's outcomes. */
+export type LatchRecheckStep =
+  | typeof RECHECK_STEP_CLEAR_REPORTED_IN
+  | typeof RECHECK_STEP_CLEAR_GONE
+  | typeof RECHECK_STEP_SPAWN_RETRY
+  | typeof RECHECK_STEP_FINISHED_ROW_RETRY
+  | typeof RECHECK_STEP_TABLE
+  | typeof RECHECK_STEP_NO_INFORMATION
+
+/** Table action: `status` only (the read is the whole re-check). */
+export const RECHECK_ACTION_STATUS_ONLY = 'status-only'
+/** Table action: the one-line `read-pane` probe. */
+export const RECHECK_ACTION_PROBE = 'probe'
+/** Table action: the latched operation retried at the cadence. */
+export const RECHECK_ACTION_RETRY = 'retry'
+/** Table action: a plain spawn's retry, keyed on the row step 1 read. */
+export const RECHECK_ACTION_PLAIN_SPAWN_RETRY = 'plain-spawn-retry'
+/** Table action: "conflicting labels" by the row's state. */
+export const RECHECK_ACTION_CONFLICTING_LABELS = 'conflicting-labels'
+/** Table action: the restart path's decision (a bring-up latch's latched operation). */
+export const RECHECK_ACTION_RESTART_DECISION = 'restart-decision'
+/** Table action: none. */
+export const RECHECK_ACTION_NONE = 'none'
+
+/** One of the table's actions. */
+export type LatchRecheckAction =
+  | typeof RECHECK_ACTION_STATUS_ONLY
+  | typeof RECHECK_ACTION_PROBE
+  | typeof RECHECK_ACTION_RETRY
+  | typeof RECHECK_ACTION_PLAIN_SPAWN_RETRY
+  | typeof RECHECK_ACTION_CONFLICTING_LABELS
+  | typeof RECHECK_ACTION_RESTART_DECISION
+  | typeof RECHECK_ACTION_NONE
+
+/** The call: none. */
+export const RECHECK_CALL_NONE = 'none'
+/** The call: one `read-pane` with `n_lines` 1 (the probe). */
+export const RECHECK_CALL_PROBE = 'read-pane'
+/** The call: the lap's `read-pane` with `n_lines` 1 and `allow_pending`, typing nothing ("conflicting labels" on a `pending` row). */
+export const RECHECK_CALL_PENDING_READ_PANE = 'read-pane-pending'
+/** The call: a plain spawn. */
+export const RECHECK_CALL_PLAIN_SPAWN = 'plain-spawn'
+/** The call: a spawn with `reuse_finished` (an ordinary fresh spawn when no row exists). */
+export const RECHECK_CALL_REUSE_SPAWN = 'reuse-spawn'
+/** The call: a `resume`. */
+export const RECHECK_CALL_RESUME = 'resume'
+/** The call: one run of the restart path's decision. */
+export const RECHECK_CALL_RESTART_DECISION = 'restart-decision'
+/** The call: the finished-row retry: one `get`, then the launch it decides (`decideFinishedRowLaunch`). */
+export const RECHECK_CALL_FINISHED_ROW = 'finished-row-retry'
+
+/** The one call a re-check makes after step 1's read, or none. */
+export type LatchRecheckCall =
+  | typeof RECHECK_CALL_NONE
+  | typeof RECHECK_CALL_PROBE
+  | typeof RECHECK_CALL_PENDING_READ_PANE
+  | typeof RECHECK_CALL_PLAIN_SPAWN
+  | typeof RECHECK_CALL_REUSE_SPAWN
+  | typeof RECHECK_CALL_RESUME
+  | typeof RECHECK_CALL_RESTART_DECISION
+  | typeof RECHECK_CALL_FINISHED_ROW
+
+/** What the decision is given. */
+export interface LatchRecheckDecisionInput {
+  /** The latch record now held: its case, refused operation, recorded state and probe-dropped mark. */
+  readonly record: Pick<ConflictLatchRecord, 'latchCase' | 'refusedOperation' | 'rowState' | 'probeDropped'>
+  /** What step 1's read gave. */
+  readonly reading: LatchRecheckReading
+  /**
+   * Whether the persona's key is recorded in `retired-keys.json` now (the
+   * caller reads `retiredKeyReadingOf`). While it is, a retry that would be a
+   * `resume` or a plain spawn is the reuse (b.jg5 SRJ-805).
+   */
+  readonly retiredKeyRecorded: boolean
+}
+
+/** What one re-check does after step 1's read. */
+export interface LatchRecheckDecision {
+  readonly step: LatchRecheckStep
+  readonly action: LatchRecheckAction
+  readonly call: LatchRecheckCall
+  /**
+   * Present when step 1's reading clears the latch (gone, reported in, or a
+   * "launch start not recorded" row read `ended` or `missing`): the
+   * recovery notice's reason (SRJ-1005).
+   */
+  readonly clear?: { readonly reason: LatchRecoveryReason }
+  /** True for a latch whose refused operation and case match no table row: step 1 only, with one line naming the pair. */
+  readonly unmatched?: true
+}
+
+/** The states a row has reported in by (SRJ-505 step 1's second bullet): the live states other than `pending`. */
+const REPORTED_IN_STATES: ReadonlySet<string> = new Set(
+  [...AGENT_DIRECTOR_LIVE_STATES].filter((state) => state !== AGENT_DIRECTOR_PENDING_STATE),
+)
+
+/** The cases of the table's no-probe row for a `resume`, a reuse or a bring-up (HO rev 15). */
+const NO_PROBE_RETRY_CASES: ReadonlySet<LatchCase> = new Set<LatchCase>([
+  LATCH_CASE_NO_VALID_ID,
+  LATCH_CASE_DIFFERENT_ID,
+  LATCH_CASE_ANOTHER_STORE,
+  LATCH_CASE_LEFTOVER,
+])
+
+/** A decision with no call. */
+function decided(step: LatchRecheckStep, action: LatchRecheckAction, call: LatchRecheckCall = RECHECK_CALL_NONE): LatchRecheckDecision {
+  return Object.freeze({ step, action, call })
+}
+
+/** `call` as made for a key recorded in `retired-keys.json`: a `resume` or a plain spawn is the reuse (b.jg5 SRJ-805). */
+function retiredAware(call: LatchRecheckCall, retiredKeyRecorded: boolean): LatchRecheckCall {
+  return retiredKeyRecorded && (call === RECHECK_CALL_RESUME || call === RECHECK_CALL_PLAIN_SPAWN) ? RECHECK_CALL_REUSE_SPAWN : call
+}
+
+/**
+ * The re-check's decision for one latched persona (b.jg5 SRJ-505), from its
+ * latch record, step 1's reading and whether its key is retired. Pure; makes
+ * no call.
+ *
+ * Step 1:
+ *   - a failed read gives no information: no call;
+ *   - no row (`ErrSpawnNotFound`): for "not this launch's session" the
+ *     finished-row retry; for a latch whose refused operation is a spawn,
+ *     plain or reuse, that spawn retried, whatever the case, with no probe
+ *     (HO rev 15); otherwise the latch clears ("its agent-director row is
+ *     gone"), a `resume` latch included (HO rev 28);
+ *   - a row reading `waiting`, `working`, `ask_user` or `check_permission`
+ *     clears the latch only when the recorded state did not count as live
+ *     (`rowStateCountsAsLive`: it read `pending`, `ended`, `missing` or no
+ *     row), never for "not this launch's session", and never while the
+ *     `provenance_conflict` note is on a "conflicting labels" latch's row.
+ *
+ * Step 2, the first table row that matches:
+ *   1. a `resume` or reuse on "this row's own id" whose probe was dropped:
+ *      the latched operation retried;
+ *   2. a `resume` or reuse on "this row's own id": the one-line probe;
+ *   3. any operation on "the agent's pane was not found": the probe;
+ *   4. a `resume`, a reuse or a bring-up on "no valid instance id", "a
+ *      different instance id", "another agent-director store" or "left over
+ *      from an earlier life": the latched operation retried (a bring-up's is
+ *      the restart path's decision);
+ *   5. a plain spawn, whatever the case: on a row read `ended` or `missing`
+ *      a spawn with `reuse_finished`, never a plain spawn; on any live state,
+ *      `pending` included, no retry;
+ *   6. "not this launch's session", whatever the verb: `status` only; a row
+ *      read `ended` or `missing` leads to the finished-row retry; the refused
+ *      call is never retried;
+ *   7. "conflicting labels": with the note on the row, nothing; on a
+ *      `pending` row the lap's one-line `read-pane`, typing nothing; on
+ *      another live row one run of the restart path's decision; on a row
+ *      read `ended` or `missing` the latched `resume` or reuse, or for any
+ *      other refused operation the restart path's decision;
+ *   8. "unusable recorded name": `status` only;
+ *   9. "launch start not recorded": `status` only; a row read `ended` or
+ *      `missing` clears it;
+ *   10. unrecognised text and "never reported in": none;
+ *   any other pair: none, marked `unmatched`.
+ * HO rev 28: in rows 1 to 4 a latched `resume` or reuse is probed or retried
+ * only when step 1 read the row `ended` or `missing`; any other reading,
+ * `pending` included, decides no call (and no post). That gate is its own
+ * test, never `rowStateCountsAsLive`. A retry of a retired key's `resume` or
+ * plain spawn is the reuse (`retiredKeyRecorded`).
+ */
+export function decideLatchRecheck(input: LatchRecheckDecisionInput): LatchRecheckDecision {
+  const { record, reading, retiredKeyRecorded } = input
+  const { latchCase, refusedOperation } = record
+  if (reading.kind === RECHECK_READING_FAILED) return decided(RECHECK_STEP_NO_INFORMATION, RECHECK_ACTION_NONE)
+  if (reading.kind === RECHECK_READING_NO_ROW) {
+    if (latchCase === LATCH_CASE_NOT_THIS_LAUNCH) {
+      return decided(RECHECK_STEP_FINISHED_ROW_RETRY, RECHECK_ACTION_STATUS_ONLY, RECHECK_CALL_FINISHED_ROW)
+    }
+    if (refusedOperation === REFUSED_OPERATION_PLAIN_SPAWN) {
+      return decided(RECHECK_STEP_SPAWN_RETRY, RECHECK_ACTION_PLAIN_SPAWN_RETRY, retiredAware(RECHECK_CALL_PLAIN_SPAWN, retiredKeyRecorded))
+    }
+    if (refusedOperation === REFUSED_OPERATION_REUSE_SPAWN) {
+      return decided(RECHECK_STEP_SPAWN_RETRY, RECHECK_ACTION_RETRY, RECHECK_CALL_REUSE_SPAWN)
+    }
+    return Object.freeze({
+      step: RECHECK_STEP_CLEAR_GONE,
+      action: RECHECK_ACTION_NONE,
+      call: RECHECK_CALL_NONE,
+      clear: Object.freeze({ reason: LATCH_RECOVERY_REASON_ROW_GONE }),
+    })
+  }
+  const { state } = reading
+  const noted = latchCase === LATCH_CASE_CONFLICTING_LABELS && reading.notePresent === true
+  if (
+    REPORTED_IN_STATES.has(state) &&
+    latchCase !== LATCH_CASE_NOT_THIS_LAUNCH &&
+    !rowStateCountsAsLive(record.rowState) &&
+    !noted
+  ) {
+    return Object.freeze({
+      step: RECHECK_STEP_CLEAR_REPORTED_IN,
+      action: RECHECK_ACTION_NONE,
+      call: RECHECK_CALL_NONE,
+      clear: Object.freeze({ reason: latchRecoveryReasonRowReads(state) }),
+    })
+  }
+  return tableDecision(record, state, noted, retiredKeyRecorded)
+}
+
+/** Step 2: the first table row matching `record`, for a row step 1 read in `state`. */
+function tableDecision(
+  record: LatchRecheckDecisionInput['record'],
+  state: string,
+  noted: boolean,
+  retiredKeyRecorded: boolean,
+): LatchRecheckDecision {
+  const { latchCase, refusedOperation } = record
+  const finished = AGENT_DIRECTOR_DEAD_STATES.has(state)
+  const launchOp = refusedOperation === REFUSED_OPERATION_RESUME || refusedOperation === REFUSED_OPERATION_REUSE_SPAWN
+  const latchedLaunch = retiredAware(
+    refusedOperation === REFUSED_OPERATION_RESUME ? RECHECK_CALL_RESUME : RECHECK_CALL_REUSE_SPAWN,
+    retiredKeyRecorded,
+  )
+  // HO rev 28: a latched `resume` or reuse is probed or retried only on a finished row.
+  const gated = (call: LatchRecheckCall): LatchRecheckCall => (launchOp && !finished ? RECHECK_CALL_NONE : call)
+  const table = (action: LatchRecheckAction, call: LatchRecheckCall = RECHECK_CALL_NONE): LatchRecheckDecision =>
+    decided(RECHECK_STEP_TABLE, action, call)
+
+  if (launchOp && latchCase === LATCH_CASE_OWN_ID) {
+    return record.probeDropped === true
+      ? table(RECHECK_ACTION_RETRY, gated(latchedLaunch))
+      : table(RECHECK_ACTION_PROBE, gated(RECHECK_CALL_PROBE))
+  }
+  if (latchCase === LATCH_CASE_PANE_NOT_FOUND) return table(RECHECK_ACTION_PROBE, gated(RECHECK_CALL_PROBE))
+  if (NO_PROBE_RETRY_CASES.has(latchCase)) {
+    if (launchOp) return table(RECHECK_ACTION_RETRY, gated(latchedLaunch))
+    if (refusedOperation === REFUSED_OPERATION_BRING_UP) return table(RECHECK_ACTION_RESTART_DECISION, RECHECK_CALL_RESTART_DECISION)
+  }
+  if (refusedOperation === REFUSED_OPERATION_PLAIN_SPAWN) {
+    return table(RECHECK_ACTION_PLAIN_SPAWN_RETRY, finished ? RECHECK_CALL_REUSE_SPAWN : RECHECK_CALL_NONE)
+  }
+  if (latchCase === LATCH_CASE_NOT_THIS_LAUNCH) {
+    return finished
+      ? decided(RECHECK_STEP_FINISHED_ROW_RETRY, RECHECK_ACTION_STATUS_ONLY, RECHECK_CALL_FINISHED_ROW)
+      : table(RECHECK_ACTION_STATUS_ONLY)
+  }
+  if (latchCase === LATCH_CASE_CONFLICTING_LABELS) {
+    if (noted) return table(RECHECK_ACTION_CONFLICTING_LABELS)
+    if (state === AGENT_DIRECTOR_PENDING_STATE) return table(RECHECK_ACTION_CONFLICTING_LABELS, RECHECK_CALL_PENDING_READ_PANE)
+    if (!finished) return table(RECHECK_ACTION_CONFLICTING_LABELS, RECHECK_CALL_RESTART_DECISION)
+    return table(RECHECK_ACTION_CONFLICTING_LABELS, launchOp ? latchedLaunch : RECHECK_CALL_RESTART_DECISION)
+  }
+  if (latchCase === LATCH_CASE_UNUSABLE_RECORDED_NAME) return table(RECHECK_ACTION_STATUS_ONLY)
+  if (latchCase === LATCH_CASE_LAUNCH_START_NOT_RECORDED) {
+    if (!finished) return table(RECHECK_ACTION_STATUS_ONLY)
+    return Object.freeze({
+      step: RECHECK_STEP_TABLE,
+      action: RECHECK_ACTION_STATUS_ONLY,
+      call: RECHECK_CALL_NONE,
+      clear: Object.freeze({ reason: latchRecoveryReasonRowReads(state) }),
+    })
+  }
+  if (takesUnrecognisedHandling(latchCase)) return table(RECHECK_ACTION_NONE)
+  return Object.freeze({ step: RECHECK_STEP_TABLE, action: RECHECK_ACTION_NONE, call: RECHECK_CALL_NONE, unmatched: true as const })
+}
+
+/**
+ * The launch of a "not this launch's session" latch's finished-row retry
+ * (b.jg5 SRJ-505; hatch A3), from the one `get` it makes (`reading`) and
+ * whether that row has a session id: a row read `ended` or `missing` with a
+ * session id gets a `resume`, one with none a reuse spawn; no row left gets
+ * the plain first spawn; a row read live, `pending` included, gets no
+ * launch (HO rev 28), and so does a failed read (no information). Never a
+ * kill and never a plain spawn over a row. A key recorded in
+ * `retired-keys.json` gets the reuse in place of a `resume` or a plain spawn
+ * (b.jg5 SRJ-805). Pure.
+ */
+export function decideFinishedRowLaunch(
+  reading: LatchRecheckReading,
+  hasSessionId: boolean,
+  retiredKeyRecorded: boolean,
+): LatchRecheckCall {
+  switch (reading.kind) {
+    case RECHECK_READING_FAILED:
+      return RECHECK_CALL_NONE
+    case RECHECK_READING_NO_ROW:
+      return retiredAware(RECHECK_CALL_PLAIN_SPAWN, retiredKeyRecorded)
+    case RECHECK_READING_STATE:
+      if (!AGENT_DIRECTOR_DEAD_STATES.has(reading.state)) return RECHECK_CALL_NONE
+      return retiredAware(hasSessionId ? RECHECK_CALL_RESUME : RECHECK_CALL_REUSE_SPAWN, retiredKeyRecorded)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The re-check's verdict on a `read-pane` answer (b.jg5 SRJ-505, SRJ-117)
+// ---------------------------------------------------------------------------
+
+/** The answer keeps the persona latched with its case (no post, record unchanged). */
+export const RECHECK_VERDICT_STILL_LATCHED = 'still-latched'
+/** The answer finds the condition cleared. */
+export const RECHECK_VERDICT_CLEARED = 'cleared'
+/** The answer gives no information: still latched, no condition, no outage, no post. */
+export const RECHECK_VERDICT_NO_INFORMATION = 'no-information'
+/** CONFIG: still latched; the `ad-config-malformed` outage is raised (by the wrapper). */
+export const RECHECK_VERDICT_CONFIG = 'config'
+/** UNUSABLE NAME: the persona relatches with "unusable recorded name". */
+export const RECHECK_VERDICT_UNUSABLE_NAME = 'unusable-name'
+/** A CONFLICT with another case, at a retry: the persona relatches with it. */
+export const RECHECK_VERDICT_RELATCH = 'relatch'
+/** Any probe answer the table does not name as cleared: still latched, with no set and no post. */
+export const RECHECK_VERDICT_KEPT = 'kept'
+
+/** What a re-check makes of one `read-pane` answer. */
+export type LatchRecheckVerdict =
+  | typeof RECHECK_VERDICT_STILL_LATCHED
+  | typeof RECHECK_VERDICT_CLEARED
+  | typeof RECHECK_VERDICT_NO_INFORMATION
+  | typeof RECHECK_VERDICT_CONFIG
+  | typeof RECHECK_VERDICT_UNUSABLE_NAME
+  | typeof RECHECK_VERDICT_RELATCH
+  | typeof RECHECK_VERDICT_KEPT
+
+/**
+ * One `read-pane` answer as the verdicts read it: the pure mapper's outcome
+ * kind (`PANE_READ_*`, `src/pane-read.ts`; `PANE_READ_PANE` for a pane) and,
+ * for a CONFLICT, the case its description gives (`recogniseConflictCase`).
+ */
+export interface LatchRecheckPaneAnswer {
+  readonly kind: PaneReadOutcome['kind']
+  readonly conflictCase?: ConflictLatchCase
+}
+
+/** The verdict shared by both `read-pane`s for the answers that give no information, CONFIG and UNUSABLE NAME; undefined for the rest. */
+function commonPaneVerdict(answer: LatchRecheckPaneAnswer): LatchRecheckVerdict | undefined {
+  switch (answer.kind) {
+    case PANE_READ_UNAVAILABLE:
+    case PANE_READ_ENVIRONMENT:
+    case PANE_READ_UNCLASSIFIED:
+    // b.jg5 SRJ-117: `ErrSpawnNotFound` from `read-pane`: the next re-check's read decides.
+    case PANE_READ_ABSENT:
+      return RECHECK_VERDICT_NO_INFORMATION
+    case PANE_READ_CONFIG:
+      return RECHECK_VERDICT_CONFIG
+    case PANE_READ_UNUSABLE_NAME:
+      return RECHECK_VERDICT_UNUSABLE_NAME
+    default:
+      return undefined
+  }
+}
+
+/**
+ * The probe's verdict (b.jg5 SRJ-505, SRJ-117's "Latch re-check probe" row)
+ * for a latch of `latchCase` on one one-line `read-pane` answer: a pane
+ * keeps "this row's own id" latched and clears "the agent's pane was not
+ * found"; GONE clears both; a CONFLICT with the latch's own case keeps it
+ * latched; UNAVAILABLE, ENVIRONMENT, UNCLASSIFIED and an absent row give no
+ * information; CONFIG keeps it (`config`); UNUSABLE NAME relatches
+ * (`unusable-name`); any other answer, a CONFLICT with another case
+ * included, keeps the latch as it is, with no relatch and no post (`kept`).
+ * Pure.
+ */
+export function decideLatchRecheckProbe(latchCase: LatchCase, answer: LatchRecheckPaneAnswer): LatchRecheckVerdict {
+  const probed = latchCase === LATCH_CASE_OWN_ID || latchCase === LATCH_CASE_PANE_NOT_FOUND
+  switch (answer.kind) {
+    case PANE_READ_PANE:
+      if (latchCase === LATCH_CASE_OWN_ID) return RECHECK_VERDICT_STILL_LATCHED
+      return latchCase === LATCH_CASE_PANE_NOT_FOUND ? RECHECK_VERDICT_CLEARED : RECHECK_VERDICT_KEPT
+    case PANE_READ_GONE:
+      return probed ? RECHECK_VERDICT_CLEARED : RECHECK_VERDICT_KEPT
+    case PANE_READ_CONFLICT:
+      return answer.conflictCase === latchCase ? RECHECK_VERDICT_STILL_LATCHED : RECHECK_VERDICT_KEPT
+    default:
+      return commonPaneVerdict(answer) ?? RECHECK_VERDICT_KEPT
+  }
+}
+
+/**
+ * The verdict on a "conflicting labels" latch's `read-pane` of a `pending`
+ * row (b.jg5 SRJ-505, SRJ-117), which is that latch's retry, not a probe:
+ * a pane or GONE clears it as a retry's answer (SRJ-506); a CONFLICT with
+ * the latch's own case keeps it (no post), and one with another case
+ * relatches (`relatch`); UNAVAILABLE, ENVIRONMENT, UNCLASSIFIED and an
+ * absent row give no information; CONFIG keeps it; UNUSABLE NAME relatches.
+ * Pure.
+ */
+export function decideLatchRecheckPendingReadPane(latchCase: LatchCase, answer: LatchRecheckPaneAnswer): LatchRecheckVerdict {
+  switch (answer.kind) {
+    case PANE_READ_PANE:
+    case PANE_READ_GONE:
+      return RECHECK_VERDICT_CLEARED
+    case PANE_READ_CONFLICT:
+      return answer.conflictCase === latchCase ? RECHECK_VERDICT_STILL_LATCHED : RECHECK_VERDICT_RELATCH
+    default:
+      return commonPaneVerdict(answer) ?? RECHECK_VERDICT_NO_INFORMATION
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The re-check's clear hand-off (b.jg5 SRJ-505, SRJ-506)
+// ---------------------------------------------------------------------------
+
+/** Cleared by step 1's read: the row is gone, or it reported in. */
+export const RECHECK_CLEARED_BY_STEP_1 = 'step-1'
+/** Cleared by a "launch start not recorded" latch's row read `ended` or `missing` (its clear is followed by one bring-up retry, SRJ-506). */
+export const RECHECK_CLEARED_BY_LAUNCH_START_FINISHED = 'launch-start-finished'
+/** Cleared by a retry at the cadence (or step 1's spawn retry) that was not refused. */
+export const RECHECK_CLEARED_BY_RETRY = 'retry'
+/** Cleared by a "not this launch's session" latch's finished-row retry that was not refused. */
+export const RECHECK_CLEARED_BY_FINISHED_ROW_RETRY = 'finished-row-retry'
+/** Cleared by a "conflicting labels" latch's `read-pane` of a `pending` row (a pane or GONE). */
+export const RECHECK_CLEARED_BY_PENDING_READ_PANE = 'pending-read-pane'
+/** Cleared by a run of the restart path's decision that completed with no refusal. */
+export const RECHECK_CLEARED_BY_RESTART_DECISION = 'restart-decision'
+/** A probe that found the condition cleared: the latch is not cleared by it (SRJ-506's `find-missing` and single retry follow). */
+export const RECHECK_CLEARED_BY_PROBE = 'probe'
+
+/** What cleared, or (for a probe) found the condition cleared. */
+export type LatchRecheckClearedBy =
+  | typeof RECHECK_CLEARED_BY_STEP_1
+  | typeof RECHECK_CLEARED_BY_LAUNCH_START_FINISHED
+  | typeof RECHECK_CLEARED_BY_RETRY
+  | typeof RECHECK_CLEARED_BY_FINISHED_ROW_RETRY
+  | typeof RECHECK_CLEARED_BY_PENDING_READ_PANE
+  | typeof RECHECK_CLEARED_BY_RESTART_DECISION
+  | typeof RECHECK_CLEARED_BY_PROBE
+
+/**
+ * What the re-check hands off for persona P: a cleared outcome, or a probe
+ * that found the condition cleared. `record` is P's latch record when the
+ * round decided (the probe's or retry's latched operation). `reason` is
+ * SRJ-1005's for the recovery notice (a probe has none: its single retry's
+ * answer gives it). `by` says what cleared: step 1, a "launch start not
+ * recorded" row read finished and a "conflicting labels" latch's `pending`
+ * `read-pane` launched nothing, so the bring-up the latch held back is still
+ * owed; a retry, a finished-row retry and a run of the restart path's
+ * decision keep their own outcome (SRJ-506).
+ */
+export type LatchRecheckCleared =
+  | {
+      readonly by: Exclude<LatchRecheckClearedBy, typeof RECHECK_CLEARED_BY_PROBE>
+      readonly record: ConflictLatchRecord
+      readonly reason: LatchRecoveryReason
+    }
+  | { readonly by: typeof RECHECK_CLEARED_BY_PROBE; readonly record: ConflictLatchRecord }
+
+/**
+ * The one clear hand-off (b.jg5 SRJ-505, SRJ-506): called synchronously, once
+ * per cleared outcome, before any step of the clearing path that stops for a
+ * latched persona (the dialog approver, a live-row sequence) and before a
+ * definite failure's class handling. Must not throw (a throw is logged and
+ * swallowed by the caller). Anything asynchronous it starts must not await
+ * the persona's lifecycle serializer from inside the round (the round holds
+ * that turn).
+ */
+export type LatchRecheckClearHandOff = (key: string, cleared: LatchRecheckCleared) => void
+
+/** What the silent clear needs: the latch's silent forget and the re-check timer's stop. */
+export interface SilentLatchRecheckClearDeps {
+  readonly latch: Pick<ConflictLatch, 'forget'>
+  /** Stop persona `key`'s re-check timer (`LatchRecheckController.stop`). */
+  readonly stopTimer: (key: string) => void
+}
+
+/**
+ * The silent clear hand-off: for a cleared outcome, the latch's silent
+ * forget (no post, no observer call, no line) and the persona's re-check
+ * timer stop; for a probe that found the condition cleared, nothing (the
+ * persona stays latched; the round's line names it). No recovery post, no
+ * episode end and no bring-up: SRJ-506's clear replaces this hand-off
+ * whole, through the re-check's dependency builder. Never throws.
+ */
+export function createSilentLatchRecheckClear(deps: SilentLatchRecheckClearDeps): LatchRecheckClearHandOff {
+  return (key, cleared) => {
+    if (cleared.by === RECHECK_CLEARED_BY_PROBE) return
+    try {
+      deps.latch.forget(key)
+    } finally {
+      deps.stopTimer(key)
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The re-check timer (b.jg5 SRJ-505)
+// ---------------------------------------------------------------------------
+
+/** The timers the re-check controller uses (the system clock in production, a fake clock in tests). */
+export interface LatchRecheckClock {
+  setTimeout(callback: () => void, delayMs: number): unknown
+  clearTimeout(handle: unknown): void
+}
+
+/** Dependencies of {@link createLatchRecheckController}. */
+export interface LatchRecheckControllerDeps {
+  readonly clock: LatchRecheckClock
+  /** The latch's own query. A throw counts as latched. */
+  readonly isLatched: (key: string) => boolean
+  /** Submit one operation for `key` through the persona lifecycle serializer (`PersonaSerializer.run`). */
+  readonly serialize: <T>(key: string, operation: () => T | Promise<T>) => Promise<T>
+  /** One re-check round for `key`, run inside its serializer turn. A rejection is logged. */
+  readonly round: (key: string) => Promise<void>
+  /** Receives the controller's own lines (a failed round, a failed clock). A throwing log is swallowed. */
+  readonly log: (line: string) => void
+  /** The interval; `LATCH_RECHECK_INTERVAL_MS` when absent. */
+  readonly intervalMs?: number
+}
+
+/** One server's re-check timers, one per latched persona. */
+export interface LatchRecheckController {
+  /** The latch's set observer: a persona that goes from unlatched to latched gets its timer; a relatch or a same-case set changes nothing. */
+  readonly observer: ConflictLatchSetObserver
+  /** Arm `key`'s timer, its first round one interval from now. Answers false, doing nothing, when it is armed already or after `stopAll`. */
+  arm(key: string): boolean
+  /** Stop `key`'s timer (a clear, a teardown's forget). A round in progress finishes and schedules nothing. Answers whether one was armed; a stop of no timer is a no-op. */
+  stop(key: string): boolean
+  /** Stop every timer and arm none again (shutdown). */
+  stopAll(): void
+  /** Whether `key` has a timer (waiting or running its round). */
+  isArmed(key: string): boolean
+  /** The keys with a timer. */
+  armedKeys(): string[]
+  /** Resolves once `key`'s round in progress, if any, has settled (with its next arm); at once when none runs. Never rejects. */
+  whenRoundSettled(key: string): Promise<void>
+}
+
+/** One persona's timer: its pending handle and its round in progress. */
+interface LatchRecheckEntry {
+  handle: unknown
+  settled: Promise<void> | undefined
+}
+
+/**
+ * Build one server's re-check timers (b.jg5 SRJ-505) over an injected clock,
+ * the latch's query, the persona serializer and the round; it imports
+ * nothing from the session manager. A persona's timer is armed when it goes
+ * from unlatched to latched (its `observer`, bound after the holds and the
+ * notice, `bindLatchRecheck`); its first round is due one interval after the
+ * latch, whatever `health_check_interval` is. Each fire submits one round
+ * through the serializer (never awaited inside a turn the persona holds) and
+ * the next is due one interval after that round settles, so rounds never
+ * overlap; a fire, and a round when its turn comes, do nothing when the
+ * persona is no longer latched, its timer was stopped, or `stopAll` ran. A
+ * relatch neither restarts the timer nor adds one. Stops: `stop` (the clear
+ * hand-off; a teardown's forget, bound beside it), and `stopAll` at
+ * shutdown. No line for an arm or a stop; nothing runs at creation.
+ */
+export function createLatchRecheckController(deps: LatchRecheckControllerDeps): LatchRecheckController {
+  const entries = new Map<string, LatchRecheckEntry>()
+  const intervalMs = deps.intervalMs ?? LATCH_RECHECK_INTERVAL_MS
+  let closed = false
+
+  function latched(key: string): boolean {
+    try {
+      return deps.isLatched(key) === true
+    } catch {
+      return true
+    }
+  }
+
+  function schedule(key: string, entry: LatchRecheckEntry): void {
+    try {
+      entry.handle = deps.clock.setTimeout(() => fire(key, entry), intervalMs)
+    } catch (thrown) {
+      if (entries.get(key) === entry) entries.delete(key)
+      safeLog(deps.log, `[slack] conflict-latch: persona=${key} re-check timer could not be set: ${describeThrownValue(thrown)} — not armed`)
+    }
+  }
+
+  function goes(key: string, entry: LatchRecheckEntry): boolean {
+    return !closed && entries.get(key) === entry && latched(key)
+  }
+
+  function fire(key: string, entry: LatchRecheckEntry): void {
+    entry.handle = undefined
+    if (entries.get(key) !== entry) return
+    if (!goes(key, entry)) {
+      entries.delete(key)
+      return
+    }
+    const round = deps.serialize(key, async () => {
+      if (goes(key, entry)) await deps.round(key)
+    })
+    entry.settled = round
+      .catch((thrown: unknown) => {
+        safeLog(deps.log, `[slack] conflict-latch: persona=${key} re-check round failed: ${describeThrownValue(thrown)}`)
+      })
+      .then(() => {
+        entry.settled = undefined
+        if (entries.get(key) !== entry) return
+        if (!goes(key, entry)) {
+          entries.delete(key)
+          return
+        }
+        schedule(key, entry)
+      })
+  }
+
+  function arm(key: string): boolean {
+    if (closed || entries.has(key)) return false
+    const entry: LatchRecheckEntry = { handle: undefined, settled: undefined }
+    entries.set(key, entry)
+    schedule(key, entry)
+    return entries.get(key) === entry
+  }
+
+  function stop(key: string): boolean {
+    const entry = entries.get(key)
+    if (entry === undefined) return false
+    entries.delete(key)
+    if (entry.handle !== undefined) {
+      try {
+        deps.clock.clearTimeout(entry.handle)
+      } catch {
+        /* a timer that fires anyway finds its entry gone and does nothing */
+      }
+      entry.handle = undefined
+    }
+    return true
+  }
+
+  return {
+    observer: ({ key, outcome }) => {
+      if (outcome === CONFLICT_LATCH_SET_LATCHED) arm(key)
+    },
+    arm,
+    stop,
+    stopAll() {
+      closed = true
+      for (const key of [...entries.keys()]) stop(key)
+    },
+    isArmed: (key) => entries.has(key),
+    armedKeys: () => [...entries.keys()],
+    async whenRoundSettled(key) {
+      await entries.get(key)?.settled
+    },
+  }
+}
+
+/**
+ * Bind the re-check timers to `latch`: the controller's set observer (a new
+ * latch arms its timer) and a forget observer that stops the persona's timer
+ * at every forget of its latch (its teardown's, through `main()`'s
+ * `forgetConflictLatch` binding; the silent clear's). Answers the removal of
+ * both. `main()` binds it after the holds and the notice, so a set runs the
+ * read, the set, the holds, the notice, then the timer's arm.
+ */
+export function bindLatchRecheck(
+  latch: Pick<ConflictLatch, 'addSetObserver' | 'addForgetObserver'>,
+  controller: Pick<LatchRecheckController, 'observer' | 'stop'>,
+): () => void {
+  const removeSet = latch.addSetObserver(controller.observer)
+  const removeForget = latch.addForgetObserver((key) => {
+    controller.stop(key)
+  })
+  return () => {
+    removeSet()
+    removeForget()
+  }
+}
+
+/**
+ * The re-check round's one line (b.jg5 SRJ-505, SRJ-1014): the persona
+ * reference, the latch's case, the call made (`none` when it made none
+ * after its read) and the answer's class, each a CSCB-written label:
+ *
+ *   [slack] conflict-latch: re-check of <ref> — case=<case> call=<call> answer=<answer>
+ *
+ * Carries no agent-director description. Pure.
+ */
+export function latchRecheckRoundLine(ref: string, latchCase: LatchCase, call: string, answer: string): string {
+  return `[slack] conflict-latch: re-check of ${ref} — case=${latchCase} call=${call} answer=${answer}`
 }

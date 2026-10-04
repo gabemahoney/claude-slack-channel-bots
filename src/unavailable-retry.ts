@@ -203,6 +203,18 @@
  * retry on the latched query, with no agent-director call, and a full-mode
  * retry whose restart work answers `latched` stops the same way.
  *
+ * The latch re-check scope (b.jg5 SRJ-505). A latched persona's re-check
+ * runs through `runInLatchRecheck(scope, fn)`, a third context beside the
+ * attempt context and the retry marker, carried the same way. While the
+ * persona is still latched (`isInsideLatchRecheck`), the reporting step arms
+ * nothing for any cause, in any context, and the controller's `arm` and
+ * `armPendingOnly` arm nothing for it, whoever asks (one `not armed … —
+ * inside its latch re-check` line), so an answer to the re-check's read,
+ * probe or retry, or to a call inside a launch or recovery attempt opened
+ * within it, gives no information; the outage wrappers honour the same query
+ * (`src/outage-state.ts`). `latchRecheckScopeOf` hands the caller's scope
+ * object back. `runOutsideAttempts` leaves it.
+ *
  * The `ErrInvalidFlags` hold (b.jg5 SRJ-207, SRJ-303, SRJ-305). When a
  * persona is held, its timer stops through `stop` with
  * `UNAVAILABLE_RETRY_STOP_HELD` (`main()`'s hold reaction), never the
@@ -994,8 +1006,10 @@ export interface UnavailableRetryView {
  * controller is one: its `arm` arms the persona's timer with the cause.
  * `arm` answers true when the persona has a timer after the call (armed now,
  * or already armed or running), false when nothing is armed (refused after
- * `close`, or the first timer could not be set). Must not throw; a throw is
- * caught by the reporting point and counts as not armed.
+ * `close`, or the first timer could not be set), and false inside a latch
+ * re-check of the latched persona (`isInsideLatchRecheck`), where the call
+ * arms and records nothing, even when a timer is already armed. Must not
+ * throw; a throw is caught by the reporting point and counts as not armed.
  */
 export interface UnavailableRetryTriggerSink {
   arm(key: string, cause: UnavailableRetryCause): boolean
@@ -1022,7 +1036,11 @@ export interface UnavailableRetryController extends UnavailableRetryTriggerSink 
    * recorded as `unnamed`. Never throws: if the clock throws while setting
    * the first timer, the persona is forgotten and one arm failed line is
    * logged. Answers true when the persona has a timer after the call; false
-   * after `close` and when the first timer could not be set.
+   * after `close` and when the first timer could not be set. Inside a latch
+   * re-check of the latched persona (`isInsideLatchRecheck`, b.jg5 SRJ-505)
+   * nothing is armed or recorded and one not-armed line is logged; the
+   * answer is false, even when a timer is already armed, which is left as
+   * it was: the call armed nothing.
    */
   arm(key: string, cause: UnavailableRetryCause): boolean
   /**
@@ -1474,11 +1492,20 @@ export function createUnavailableRetryController(deps: UnavailableRetryDeps): Un
    * An armed entry keeps its due time; a full-mode arm promotes a
    * pending-only entry. During a run, a full-mode arm cancels a condition
    * end deferred to that run (`conditionEnded`); a pending-only arm does not. Answers true when the persona has a timer after the
-   * call. Never throws.
+   * call; inside a latch re-check of the latched persona it arms and records
+   * nothing and answers false, an armed timer included (see `arm`). Never
+   * throws.
    */
   function armIn(key: string, cause: UnavailableRetryCause, mode: UnavailableRetryMode): boolean {
     if (closedReason !== undefined) {
       log(`[slack] unavailable-retry: persona=${key} not armed (${describeCause(cause)}) — ${closedReason}`)
+      return false
+    }
+    // b.jg5 SRJ-505: inside a latch re-check of a latched persona no cause
+    // arms its timer, whichever path asks (the reporting step, the restart
+    // work's arm hook, a gate's own arm).
+    if (isInsideLatchRecheck(key)) {
+      log(`[slack] unavailable-retry: persona=${key} not armed (${describeCause(cause)}) — inside its latch re-check, an answer gives no information`)
       return false
     }
     const existing = entries.get(key)
@@ -2296,8 +2323,10 @@ export async function runInAttempt<T>(
  */
 export function runOutsideAttempts<T>(fn: () => T): T {
   // Outside every retry too: work a retry starts and does not await (a
-  // dialog approver, a live-row sequence) is no retry of the timer.
-  return attemptContext.exit(() => timerRetryContext.exit(fn))
+  // dialog approver, a live-row sequence) is no retry of the timer. And
+  // outside every latch re-check: such work is no part of the re-check, so
+  // it gets no re-check scope and no re-check permit (b.jg5 SRJ-502, SRJ-505).
+  return attemptContext.exit(() => timerRetryContext.exit(() => latchRecheckContext.exit(fn)))
 }
 
 /**
@@ -2400,6 +2429,142 @@ export function claimTimerRetryRuleRun(key: string): boolean {
   }
 }
 
+// ---------------------------------------------------------------------------
+// The latch re-check scope (b.jg5 SRJ-505, SRJ-307, SRJ-313)
+// ---------------------------------------------------------------------------
+
+/**
+ * What a latch re-check of one persona opens its scope with
+ * (`runInLatchRecheck`): the persona's key and the latch's query. The scope
+ * applies only while that query answers the persona latched, so once a
+ * retry's answer clears the latch the rest of that path is handled as
+ * ordinary. A caller may extend it with its own fields (the session
+ * manager's round carries its permit and its clear hook) and read them back
+ * through `latchRecheckScopeOf`.
+ */
+export interface LatchRecheckScope {
+  readonly key: string
+  /** The latch's own query (never one a re-check permit passes). A throw counts as latched. */
+  readonly isLatched: (key: string) => boolean
+  /**
+   * The re-check's permit (b.jg5 SRJ-502's "beyond the re-check"), present
+   * only in the scope of the re-check's own run of the restart path's
+   * decision (`runRestartWorkInTurn`, `src/restart.ts`).
+   */
+  readonly permit?: LatchRecheckPermit
+}
+
+/**
+ * The latch re-check's permit for one run of the restart path's decision
+ * (b.jg5 SRJ-502, SRJ-505): while `holds()` answers true, the latched gates
+ * and mid-path stops that run reaches let it through for the persona; the
+ * re-check revokes it at the run's first refusal (any latch set for the
+ * persona) and when the run's launch answers with no information while the
+ * persona is still latched, so a run that leaves the persona latched makes
+ * no further call.
+ */
+export interface LatchRecheckPermit {
+  holds(): boolean
+}
+
+/**
+ * True when the current call runs inside a latch re-check of persona `key`
+ * whose scope carries a permit that still holds (b.jg5 SRJ-502, SRJ-505):
+ * the re-check's own run of the restart path's decision, until its first
+ * refusal. Every latched gate asks it, and only such a call passes; the
+ * retry timer, the health tick, the start sweep, the live-row sequence, the
+ * dialog approver and the pending-row rule never run inside a re-check
+ * (`runOutsideAttempts` leaves it). A permit that throws does not hold.
+ * Never throws.
+ */
+export function holdsLatchRecheckPermit(key: string): boolean {
+  const permit = latchRecheckScopeOf(key)?.permit
+  if (permit === undefined) return false
+  try {
+    return permit.holds() === true
+  } catch {
+    return false
+  }
+}
+
+/** One running re-check as the scope holds it. */
+interface LatchRecheckFrame {
+  readonly scope: LatchRecheckScope
+  readonly parent: LatchRecheckFrame | undefined
+  /** False once the re-check's function has settled; a continuation that outlives it is then outside it. */
+  open: boolean
+}
+
+/**
+ * The latch re-check the current call runs in (b.jg5 SRJ-505), carried
+ * across awaits, timers and microtasks by `AsyncLocalStorage`, as the attempt
+ * context is, so it covers every agent-director call the re-check makes for
+ * its persona, a call inside a launch or recovery attempt opened within it
+ * included. `runOutsideAttempts` leaves it. It holds only the running
+ * re-checks' frames.
+ */
+const latchRecheckContext = new AsyncLocalStorage<LatchRecheckFrame>()
+
+/**
+ * Run `fn` as a latch re-check of persona `scope.key` (b.jg5 SRJ-505), and
+ * settle with its result. While `fn` runs, and in every await it makes, the
+ * persona is inside its re-check scope (`latchRecheckScopeOf`), and, while
+ * it is latched, the reporting point and the outage wrappers treat each of
+ * its answers as giving no information (`isInsideLatchRecheck`): no retry
+ * timer is armed for any cause, no `tmux-unresponsive` condition starts or
+ * continues, no `tmux-unavailable` outage is raised (a `find-missing` run's
+ * excepted, b.jg5 SRJ-506) and no unclassified-error episode is fed. The
+ * CONFIG outage, `ad-unreachable` and `cwd-unreachable` are raised as ever,
+ * and every clear on a success is made as ever. A continuation of `fn` that
+ * outlives it (a timer it set) is outside the re-check.
+ */
+export async function runInLatchRecheck<T>(scope: LatchRecheckScope, fn: () => T | Promise<T>): Promise<T> {
+  let parent = latchRecheckContext.getStore()
+  while (parent !== undefined && !parent.open) parent = parent.parent
+  const frame: LatchRecheckFrame = { scope, parent, open: true }
+  try {
+    return await latchRecheckContext.run(frame, fn)
+  } finally {
+    frame.open = false
+  }
+}
+
+/**
+ * The scope of the innermost running latch re-check of persona `key` the
+ * current call is inside, latched or not, or `undefined` outside every one.
+ * The object `runInLatchRecheck` was given, so a caller reads back its own
+ * fields. Read-only; never throws.
+ */
+export function latchRecheckScopeOf(key: string): LatchRecheckScope | undefined {
+  try {
+    for (let frame = latchRecheckContext.getStore(); frame !== undefined; frame = frame.parent) {
+      if (frame.open && frame.scope.key === key) return frame.scope
+    }
+    return undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * True when the current call runs inside a latch re-check of persona `key`
+ * and the persona is still latched (b.jg5 SRJ-505): an answer met here gives
+ * no information, so nothing is armed, started, raised (CONFIG's outage
+ * aside) or fed for it, and no further call follows a launch's UNAVAILABLE
+ * answer (SRJ-407's `get`). A latch query that throws counts as latched.
+ * False outside every re-check of `key`, and once the latch has cleared.
+ * Never throws.
+ */
+export function isInsideLatchRecheck(key: string): boolean {
+  const scope = latchRecheckScopeOf(key)
+  if (scope === undefined) return false
+  try {
+    return scope.isLatched(key) === true
+  } catch {
+    return true
+  }
+}
+
 /** A live view of `frame`: its `lastError` reads the frame's current record. */
 function viewOf(frame: AttemptFrame): AttemptView {
   return {
@@ -2479,8 +2644,10 @@ export function reportAttemptError(
  * SRJ-313) passes `UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED`. The same context
  * rule applies: inside an attempt for `key` the sink arms with `cause` and
  * the innermost attempt records it as its last error; outside one, only the
- * ENVIRONMENT and CONFIG causes arm. Answers whether the sink armed. Never
- * throws.
+ * ENVIRONMENT and CONFIG causes arm. Inside a latch re-check of a latched
+ * persona (`isInsideLatchRecheck`, b.jg5 SRJ-505) no cause arms, in any
+ * context: the sink is not called, and an attempt records the error as not
+ * armed. Answers whether the sink armed. Never throws.
  */
 export function reportAttemptCause(
   key: string,
@@ -2490,9 +2657,12 @@ export function reportAttemptCause(
 ): boolean {
   try {
     const frame = innermostFrame(key)
-    if (frame === undefined && (cause === undefined || !UNAVAILABLE_RETRY_ANY_CONTEXT_CAUSES.has(cause.kind))) return false
+    // b.jg5 SRJ-505: inside a latch re-check of a latched persona an answer
+    // gives no information, so no cause arms its timer, in any context.
+    const noInformation = isInsideLatchRecheck(key)
+    if (frame === undefined && (noInformation || cause === undefined || !UNAVAILABLE_RETRY_ANY_CONTEXT_CAUSES.has(cause.kind))) return false
     let armed = false
-    if (cause !== undefined && sink !== undefined) {
+    if (cause !== undefined && sink !== undefined && !noInformation) {
       try {
         armed = sink.arm(key, cause) === true
       } catch {

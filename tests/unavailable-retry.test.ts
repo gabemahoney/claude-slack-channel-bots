@@ -188,6 +188,18 @@
  * row the lap brought to `waiting`, the held post at B, the abort of CSCB's
  * own launch past B (a refusal naming the live-row sequence it started), and
  * a retry that finds only P's approver running making the run and no lap.
+ * The latch re-check's no-information scope (b.jg5 SRJ-505, SRJ-502,
+ * SRJ-313), over a stand-in latch query each case clears: its queries
+ * (`latchRecheckScopeOf`, `isInsideLatchRecheck`, `holdsLatchRecheckPermit`)
+ * across awaits and nesting, left by `runOutsideAttempts` and by a
+ * continuation that outlives the re-check; the bare controller's `arm` and
+ * `armPendingOnly` and the reporting point refusing every cause inside it
+ * while the persona is latched, an attempt recording the error as not armed,
+ * and arming as ever once the latch has cleared; and, on the harness, the
+ * restart work's arm hook not called on an `unknown` reading and every
+ * no-information answer, under a launch attempt opened in the re-check,
+ * arming nothing and feeding no unclassified-error episode. The wrappers'
+ * side is tests/outage-state.test.ts's.
  * Only the pin case holds the SRD's numbers; every other case derives its
  * waits from the exported base and ceiling through `doublingBackoffDelay`. No
  * retry timer is real; the only real-time waits are the spawn path's 1 ms
@@ -588,6 +600,17 @@ import {
   type PendingRowModel,
   type PendingRowModelOptions,
 } from './test-helpers/pending-row-model.ts'
+import { withSpawnDetection } from '../src/outage-state.ts'
+import {
+  UNAVAILABLE_RETRY_ANY_CONTEXT_CAUSES,
+  holdsLatchRecheckPermit,
+  isInsideLatchRecheck,
+  latchRecheckScopeOf,
+  reportAttemptCause,
+  runInLatchRecheck,
+  type LatchRecheckPermit,
+  type LatchRecheckScope,
+} from '../src/unavailable-retry.ts'
 
 const KEY = 'alpha'
 const OTHER = 'beta'
@@ -9709,5 +9732,345 @@ describe('unavailable retry: the run-now entry (SRJ-810: an old-life hold that e
     expect(attempts).toEqual([])
     expect([controller.isArmed(KEY), controller.isArmed(OTHER), clock.pendingCount()]).toEqual([false, false, 0])
     expect(lines.filter((line) => line.includes(' not retried now '))).toEqual([KEY, OTHER].map((key) => unavailableRetryRunNowLine(key, WHY, { result: UNAVAILABLE_RETRY_RUN_NOW_CLOSED, closedReason: UNAVAILABLE_RETRY_STOP_SHUTDOWN })))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The latch re-check's no-information scope (b.jg5 SRJ-505, SRJ-502,
+// SRJ-313): its queries, the bare controller and the reporting point inside
+// it, and on the harness the restart work's arm hook and the
+// unclassified-error episode. The scope's latch query is a stand-in each
+// case clears; the re-check round end to end is tests/conflict-latch.test.ts's.
+// ---------------------------------------------------------------------------
+
+/** A latch re-check scope for `key`, carrying `permit` when given, over a stand-in latch query: latched until `clear()`. */
+function standInLatch(key: string, permit?: LatchRecheckPermit): { readonly scope: LatchRecheckScope; clear(): void; relatch(): void } {
+  let latched = true
+  return {
+    scope: { key, isLatched: (asked) => asked === key && latched, ...(permit !== undefined ? { permit } : {}) },
+    clear: () => { latched = false },
+    relatch: () => { latched = true },
+  }
+}
+
+/** The controller's one line for an arm of persona `key` with a cause of `kind` refused inside its latch re-check. */
+function notArmedInRecheckLine(key: string, kind: string): string {
+  return `[slack] unavailable-retry: persona=${key} not armed (${kind}) — inside its latch re-check, an answer gives no information`
+}
+
+/** Where a call runs in KEY's re-check. */
+const RECHECK_ALONE = 'KEY\'s re-check, in no attempt'
+const LAUNCH_IN_RECHECK = 'a launch attempt opened in KEY\'s re-check'
+const RECHECK_IN_RECOVERY = 'KEY\'s re-check opened in KEY\'s recovery attempt'
+type RecheckPlace = typeof RECHECK_ALONE | typeof LAUNCH_IN_RECHECK | typeof RECHECK_IN_RECOVERY
+const RECHECK_PLACES: readonly RecheckPlace[] = [RECHECK_ALONE, LAUNCH_IN_RECHECK, RECHECK_IN_RECOVERY]
+
+/** Run `body` at `place` in the re-check over `scope` (for `key`); answer its result and the last error `key`'s attempt recorded (none with no attempt). */
+function inRecheckAt<T>(
+  place: RecheckPlace,
+  scope: LatchRecheckScope,
+  body: () => T | Promise<T>,
+  key = KEY,
+): Promise<{ result: T; lastError: AttemptErrorRecord | undefined }> {
+  if (place === LAUNCH_IN_RECHECK) {
+    return runInLatchRecheck(scope, () => runInAttempt(key, 'launch', async (attempt) => ({ result: await body(), lastError: attempt.lastError })))
+  }
+  if (place === RECHECK_IN_RECOVERY) {
+    return runInAttempt(key, 'recovery', (attempt) => runInLatchRecheck(scope, async () => ({ result: await body(), lastError: attempt.lastError })))
+  }
+  return runInLatchRecheck(scope, async () => ({ result: await body(), lastError: undefined }))
+}
+
+describe('unavailable retry: the latch re-check scope and its queries (SRJ-505, SRJ-502)', () => {
+  test('outside every re-check: no scope, not inside one, no permit', () => {
+    expect([latchRecheckScopeOf(KEY), isInsideLatchRecheck(KEY), holdsLatchRecheckPermit(KEY)]).toEqual([undefined, false, false])
+  })
+
+  test('inside a re-check of KEY: the caller\'s own scope object for KEY only, across awaits, a microtask and a promise continuation; isInsideLatchRecheck follows the latch query at each ask; runInLatchRecheck answers fn\'s result; nothing once it has settled', async () => {
+    const latch = standInLatch(KEY)
+    type Seen = readonly [scope: LatchRecheckScope | undefined, other: LatchRecheckScope | undefined, inside: boolean, otherInside: boolean]
+    const seen = (): Seen => [latchRecheckScopeOf(KEY), latchRecheckScopeOf(OTHER), isInsideLatchRecheck(KEY), isInsideLatchRecheck(OTHER)]
+    const marks: Seen[] = []
+
+    const result = await runInLatchRecheck(latch.scope, async () => {
+      marks.push(seen())
+      await Promise.resolve()
+      marks.push(seen())
+      await new Promise<void>((done) => queueMicrotask(() => {
+        marks.push(seen())
+        done()
+      }))
+      latch.clear()
+      marks.push(seen())
+      latch.relatch()
+      await Promise.resolve().then(() => { marks.push(seen()) })
+      return 'answered'
+    })
+
+    const inside: Seen = [latch.scope, undefined, true, false]
+    expect(result).toBe('answered')
+    expect(marks).toEqual([inside, inside, inside, [latch.scope, undefined, false, false], inside])
+    expect(marks.every(([scope]) => scope === latch.scope)).toBe(true)
+    expect(seen()).toEqual([undefined, undefined, false, false])
+  })
+
+  test.each<[string, () => boolean, boolean]>([
+    ['throws (fail safe: latched)', () => { throw new Error('the latch query failed') }, true],
+    ['answers false', () => false, false],
+    ['answers something other than true', () => 1 as unknown as boolean, false],
+  ])('a latch query that %s: isInsideLatchRecheck answers %p', async (_what, isLatched, expected) => {
+    expect(await runInLatchRecheck({ key: KEY, isLatched }, () => isInsideLatchRecheck(KEY))).toBe(expected)
+  })
+
+  test('nested re-checks: the innermost for the same key answers until it settles, then the outer again; one for another key leaves the outer key\'s scope in place; a rejecting fn rejects with its own error and leaves no scope', async () => {
+    const outer = standInLatch(KEY)
+    const inner = standInLatch(KEY)
+    const other = standInLatch(OTHER)
+    inner.clear()
+
+    const marks = await runInLatchRecheck(outer.scope, async () => {
+      const inInner = await runInLatchRecheck(inner.scope, async () => {
+        await Promise.resolve()
+        return [latchRecheckScopeOf(KEY), isInsideLatchRecheck(KEY)] as const
+      })
+      const inOther = await runInLatchRecheck(other.scope, () => [latchRecheckScopeOf(KEY), latchRecheckScopeOf(OTHER), isInsideLatchRecheck(OTHER)] as const)
+      return { inInner, inOther, after: [latchRecheckScopeOf(KEY), isInsideLatchRecheck(KEY)] as const }
+    })
+
+    expect(marks.inInner[0]).toBe(inner.scope)
+    expect(marks.inInner[1]).toBe(false)
+    expect(marks.inOther).toEqual([outer.scope, other.scope, true])
+    expect(marks.after).toEqual([outer.scope, true])
+
+    const failure = new Error('the re-check failed')
+    await expect(runInLatchRecheck(outer.scope, async () => {
+      await Promise.resolve()
+      throw failure
+    })).rejects.toBe(failure)
+    expect(latchRecheckScopeOf(KEY)).toBeUndefined()
+  })
+
+  test('runOutsideAttempts leaves the re-check and its permit, from the re-check and from a launch attempt opened in it', async () => {
+    const latch = standInLatch(KEY, { holds: () => true })
+    const seen = (): readonly boolean[] => [latchRecheckScopeOf(KEY) !== undefined, isInsideLatchRecheck(KEY), holdsLatchRecheckPermit(KEY)]
+
+    const marks = await runInLatchRecheck(latch.scope, async () => {
+      const fromRecheck = { inside: seen(), outside: runOutsideAttempts(seen) }
+      const fromAttempt = await runInAttempt(KEY, 'launch', () => ({ inside: seen(), outside: runOutsideAttempts(seen), attemptOutside: runOutsideAttempts(() => isInsideAttempt(KEY)) }))
+      return { fromRecheck, fromAttempt }
+    })
+
+    expect(marks).toEqual({
+      fromRecheck: { inside: [true, true, true], outside: [false, false, false] },
+      fromAttempt: { inside: [true, true, true], outside: [false, false, false], attemptOutside: false },
+    })
+  })
+
+  test('a continuation that outlives the re-check is outside it, and a re-check started from it is not nested in the settled one', async () => {
+    const latch = standInLatch(KEY)
+    const later = standInLatch(OTHER)
+    const gate = Promise.withResolvers<void>()
+    const seen = Promise.withResolvers<{ after: readonly unknown[]; nested: readonly unknown[] }>()
+
+    await runInLatchRecheck(latch.scope, () => {
+      void gate.promise.then(() => {
+        const after = [latchRecheckScopeOf(KEY), isInsideLatchRecheck(KEY)] as const
+        runInLatchRecheck(later.scope, () => [latchRecheckScopeOf(KEY), latchRecheckScopeOf(OTHER)] as const)
+          .then((nested) => seen.resolve({ after, nested }), seen.reject)
+      })
+    })
+    gate.resolve()
+
+    const { after, nested } = await seen.promise
+    expect(after).toEqual([undefined, false])
+    expect(nested[0]).toBeUndefined()
+    expect(nested[1]).toBe(later.scope)
+  })
+
+  test.each<[string, LatchRecheckPermit | undefined, boolean]>([
+    ['no permit (the round\'s own scope)', undefined, false],
+    ['a permit that holds', { holds: () => true }, true],
+    ['a revoked permit', { holds: () => false }, false],
+    ['a permit that throws', { holds: () => { throw new Error('the permit failed') } }, false],
+    ['a permit answering something other than true', { holds: () => 1 as unknown as boolean }, false],
+  ])('holdsLatchRecheckPermit inside a re-check of KEY carrying %s answers %p for KEY, and false for OTHER and once the re-check has settled', async (_what, permit, holds) => {
+    const latch = standInLatch(KEY, permit)
+
+    expect(await runInLatchRecheck(latch.scope, () => [holdsLatchRecheckPermit(KEY), holdsLatchRecheckPermit(OTHER)])).toEqual([holds, false])
+    expect(holdsLatchRecheckPermit(KEY)).toBe(false)
+  })
+
+  test('the permit is read at each ask: revoked during the run, it no longer holds from then on', async () => {
+    let holds = true
+    const latch = standInLatch(KEY, { holds: () => holds })
+
+    const marks = await runInLatchRecheck(latch.scope, async () => {
+      const before = holdsLatchRecheckPermit(KEY)
+      holds = false
+      await Promise.resolve()
+      return [before, holdsLatchRecheckPermit(KEY)]
+    })
+
+    expect(marks).toEqual([true, false])
+  })
+})
+
+describe('unavailable retry: nothing arms a persona\'s timer inside its latch re-check while it is latched (SRJ-505, SRJ-502, SRJ-313)', () => {
+  /** Every cause the controller arms with, by `arm`, and the pending-row cause by `armPendingOnly`: `[name, arm, kind, what the call answers when refused]`. */
+  const CONTROLLER_ARMS: ReadonlyArray<readonly [string, (c: UnavailableRetryController, key: string) => unknown, string, unknown]> = [
+    ...[
+      UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
+      UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
+      UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
+      UNAVAILABLE_RETRY_CAUSE_CONFIG,
+      UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
+      UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
+      UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION,
+      UNAVAILABLE_RETRY_CAUSE_LOST_RACE,
+    ].map((kind) => [`arm with the ${kind} cause`, (c: UnavailableRetryController, key: string) => c.arm(key, { kind } as UnavailableRetryCause), kind, false] as const),
+    ['armPendingOnly', (c, key) => c.armPendingOnly(key), UNAVAILABLE_RETRY_CAUSE_PENDING_ROW, undefined],
+  ]
+
+  test.each(CONTROLLER_ARMS)('%s for KEY at each place in its re-check: nothing armed, no timer, the one not-armed line naming the cause and the re-check; OTHER armed beside it as ever', async (_what, arm, kind, refused) => {
+    for (const place of RECHECK_PLACES) {
+      const { clock, controller, lines } = makeRig()
+
+      const { result } = await inRecheckAt(place, standInLatch(KEY).scope, () => {
+        const answered = arm(controller, KEY)
+        return { answered, other: controller.arm(OTHER, UNAVAILABLE) }
+      })
+
+      expect({ place, ...result }).toEqual({ place, answered: refused, other: true })
+      expect({ place, armed: controller.armedKeys(), view: controller.view(KEY), timers: delays(clock) }).toEqual({ place, armed: [OTHER], view: undefined, timers: [waitMs(0)] })
+      expect({ place, lines: lines.filter((line) => line.includes(`persona=${KEY} `)) }).toEqual({ place, lines: [notArmedInRecheckLine(KEY, kind)] })
+    }
+  })
+
+  test.each<[string, (c: UnavailableRetryController) => void]>([
+    ['in full mode', (c) => { c.arm(KEY, UNAVAILABLE) }],
+    ['in pending-only mode', (c) => { c.armPendingOnly(KEY) }],
+  ])('a timer already armed %s is left as it was by an arm inside the re-check: no cause recorded, no promotion, its due time kept; one not-armed line', async (_mode, armFirst) => {
+    const { controller, lines } = makeRig()
+    armFirst(controller)
+    const before = controller.view(KEY)
+    const linesBefore = lines.length
+
+    await runInLatchRecheck(standInLatch(KEY).scope, () => {
+      controller.arm(KEY, { kind: UNAVAILABLE_RETRY_CAUSE_CONFIG })
+    })
+
+    expect(controller.view(KEY)).toEqual(before)
+    expect(lines.slice(linesBefore)).toEqual([notArmedInRecheckLine(KEY, UNAVAILABLE_RETRY_CAUSE_CONFIG)])
+  })
+
+  test('once KEY\'s latch has cleared, in the same re-check, arm and armPendingOnly arm as ever, with no not-armed line', async () => {
+    const full = makeRig()
+    const pendingOnly = makeRig()
+    const latch = standInLatch(KEY)
+
+    await runInLatchRecheck(latch.scope, () => {
+      latch.clear()
+      expect(full.controller.arm(KEY, UNAVAILABLE)).toBe(true)
+      pendingOnly.controller.armPendingOnly(KEY)
+    })
+
+    expect(full.controller.view(KEY)).toMatchObject({ phase: 'waiting', dueAt: waitMs(0), causes: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE], mode: UNAVAILABLE_RETRY_MODE_FULL })
+    expect(pendingOnly.controller.view(KEY)).toMatchObject({ phase: 'waiting', causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW], mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY })
+    expect([...full.lines, ...pendingOnly.lines].filter((line) => line.includes('inside its latch re-check'))).toEqual([])
+  })
+
+  /** What the reporting point is handed: `[name, report it to a sink, its verb, the cause kind it arms]`. */
+  const REPORTS: ReadonlyArray<readonly [string, (sink: UnavailableRetryTriggerSink) => boolean, string, string]> = [
+    ['UNAVAILABLE (ErrTmuxUnresponsive) from read-pane', (sink) => reportAttemptError(KEY, errTmuxUnresponsive('read-pane'), 'read-pane', sink), 'read-pane', UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+    ['UNAVAILABLE (ErrCallTimeout) from spawn', (sink) => reportAttemptError(KEY, errCallTimeout('spawn'), 'spawn', sink), 'spawn', UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+    ['a failed read (an unclassified ErrInternal from status)', (sink) => reportAttemptError(KEY, errInternal(), 'status', sink), 'status', UNAVAILABLE_RETRY_CAUSE_READ_ERROR],
+    ['ENVIRONMENT (ErrTmuxNotAvailable) from resume', (sink) => reportAttemptError(KEY, errTmuxNotAvailable(undefined, 'resume'), 'resume', sink), 'resume', UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
+    ['CONFIG (ErrConfigMalformed) from spawn', (sink) => reportAttemptError(KEY, errConfigMalformed(), 'spawn', sink), 'spawn', UNAVAILABLE_RETRY_CAUSE_CONFIG],
+    ['UNCLASSIFIED (an unclassified ErrInternal) from spawn', (sink) => reportAttemptError(KEY, errInternal(), 'spawn', sink), 'spawn', UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED],
+    ['ErrTmuxKillFailed from kill', (sink) => reportAttemptError(KEY, errTmuxKillFailed(), 'kill', sink), 'kill', UNAVAILABLE_RETRY_CAUSE_KILL_FAILED],
+    ['reportAttemptCause with the reuse-collision cause', (sink) => reportAttemptCause(KEY, { kind: UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION }, 'spawn', sink), 'spawn', UNAVAILABLE_RETRY_CAUSE_REUSE_COLLISION],
+    ['reportAttemptCause with the UNCLASSIFIED cause (a site\'s own classification)', (sink) => reportAttemptCause(KEY, { kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, error: errInvalidFlags('resume') }, 'resume', sink), 'resume', UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED],
+  ]
+
+  test.each(REPORTS)('%s at each place in a re-check of a latched KEY: answers false, the controller is never asked (no timer, no line), an attempt records it as not armed; once the latch has cleared, it arms as outside every re-check', async (_what, report, verb, kind) => {
+    for (const place of RECHECK_PLACES) {
+      const { controller, lines } = makeRig()
+      const latch = standInLatch(KEY)
+
+      const inside = await inRecheckAt(place, latch.scope, () => report(controller))
+
+      const inAttempt = place !== RECHECK_ALONE
+      expect({ place, answered: inside.result, lastError: inside.lastError, armed: controller.isArmed(KEY), lines })
+        .toEqual({ place, answered: false, lastError: inAttempt ? { verb, causeKind: kind, armed: false } : undefined, armed: false, lines: [] })
+
+      latch.clear()
+      const cleared = await inRecheckAt(place, latch.scope, () => report(controller))
+
+      const arms = inAttempt || UNAVAILABLE_RETRY_ANY_CONTEXT_CAUSES.has(kind)
+      expect({ place, answered: cleared.result, lastError: cleared.lastError, causes: controller.view(KEY)?.causes })
+        .toEqual({ place, answered: arms, lastError: inAttempt ? { verb, causeKind: kind, armed: true } : undefined, causes: arms ? [kind] : undefined })
+    }
+  })
+
+  test('the restart work\'s arm hook is not called on an unknown liveness reading inside a re-check of a latched persona (no timer, no not-armed line); once its latch has cleared, the same run calls it', async () => {
+    const hooked: string[] = []
+    const h = (harness = makeRecoveryHarness({
+      restartDeps: {
+        armRetryTimer: (k) => {
+          hooked.push(k)
+          harness!.controller.arm(k, { kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR })
+        },
+      },
+    }))
+    const [key, other] = h.keys as [string, string]
+    h.script({ statusFn: () => errCallTimeout('status') })
+    const latch = standInLatch(key)
+    const run = (): Promise<RestartRetryOutcome> => runInLatchRecheck(latch.scope, () => runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight))
+
+    expect(await run()).toBe(RESTART_OUTCOME_LIVENESS_UNKNOWN)
+    expect(callCounts(h)).toEqual({ statusCalls: 1 })
+    expect({ hooked, armed: h.controller.isArmed(key), triggers: h.triggers }).toEqual({ hooked: [], armed: false, triggers: [] })
+    expect(h.lines.filter((line) => line.includes('inside its latch re-check'))).toEqual([])
+
+    latch.clear()
+    expect(await run()).toBe(RESTART_OUTCOME_LIVENESS_UNKNOWN)
+    expect(hooked).toEqual([key])
+    expect(h.controller.view(key)?.causes).toContain(UNAVAILABLE_RETRY_CAUSE_READ_ERROR)
+    expectUntouched(h, other)
+  })
+
+  /** A no-information answer met in a launch attempt opened in the re-check: `[name, its call, its value]`. */
+  const HARNESS_ANSWERS: ReadonlyArray<readonly [string, 'read-pane' | 'status' | 'spawn' | 'resume', () => Error, string]> = [
+    ['UNAVAILABLE (ErrTmuxUnresponsive) from a read-pane probe', 'read-pane', () => errTmuxUnresponsive('read-pane'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+    ['a failed read of the row (ErrCallTimeout from status)', 'status', () => errCallTimeout('status'), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
+    ['ENVIRONMENT (ErrTmuxNotAvailable) from a resume retry', 'resume', () => errTmuxNotAvailable(undefined, 'resume'), UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
+    ['CONFIG (ErrConfigMalformed) from a spawn retry', 'spawn', () => errConfigMalformed(), UNAVAILABLE_RETRY_CAUSE_CONFIG],
+    ...UNCLASSIFIED_ERRORS.map(([what, make]) => [`UNCLASSIFIED (${what}) from a spawn retry`, 'spawn', () => make('spawn'), UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED] as const),
+  ]
+
+  test.each(HARNESS_ANSWERS)('on the harness, %s in a launch attempt opened in the re-check of a latched persona arms no trigger and no timer, starts no tmux-unresponsive condition and feeds no unclassified-error episode; once its latch has cleared, the same answer arms its cause as ever (an UNCLASSIFIED one beginning the episode)', async (_what, call, make, kind) => {
+    const h = (harness = makeRecoveryHarness())
+    const [key, other] = h.keys as [string, string]
+    const latch = standInLatch(key)
+    const meet = (err: Error): Promise<unknown> => runInLatchRecheck(latch.scope, () =>
+      runInAttempt(key, 'launch', () => {
+        const wrap = call === 'spawn' || call === 'resume' ? withSpawnDetection : withOutageDetection
+        return wrap(key, personaOf(h, key).working_directory, call, async () => { throw err }).catch((rejected: unknown) => rejected)
+      }))
+
+    const err = make()
+    expect(await meet(err)).toBe(err)
+    expect({ triggers: h.triggers, armed: h.controller.isArmed(key), condition: h.tmuxUnresponsive.holds(key), conditionLines: conditionLines(h, key) })
+      .toEqual({ triggers: [], armed: false, condition: false, conditionLines: [] })
+    expect({ episode: h.unclassifiedErrorOpen(key), lines: unclassifiedLines(h, key), posts: h.episodeNotices }).toEqual({ episode: false, lines: [], posts: [] })
+    expect(getOutageFlags(key).has('tmux-unavailable')).toBe(false)
+
+    latch.clear()
+    const again = make()
+    expect(await meet(again)).toBe(again)
+    expect(h.triggers).toEqual([{ key, kind }])
+    expect(h.controller.view(key)?.causes).toEqual([kind])
+    expect(h.unclassifiedErrorOpen(key)).toBe(kind === UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED)
+    expectUntouchedEpisode(h, other)
   })
 })

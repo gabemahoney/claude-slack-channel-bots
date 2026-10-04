@@ -249,6 +249,20 @@
  *   into the full-mode retry action, `initRestart` and `initHealthCheck`, and
  *   the latch is named nowhere else. The condition's three ends and the
  *   unclassified episodes' two ends are each located in their binding.
+ * - b.jg5 SRJ-505: the latch re-check is built exactly once, by the session
+ *   manager's builder (`buildLatchRecheck`, which the recovery harness also
+ *   calls), bound to a const in main()'s own statement list, over exactly
+ *   the one latch, the system clock, the one persona lifecycle serializer's
+ *   run (the restart module's), the applied configuration read at each round,
+ *   the server log and the one notice episodes instance, after the latch's
+ *   holds and CONFLICT notice are bound and before the start pass; it is bound
+ *   to the latch once (`bindLatchRecheck`), after both, with no await since
+ *   its build. server.ts builds no re-check controller, round or clear of its
+ *   own, adds no set or forget observer by hand, and hands the re-check to
+ *   nothing else (the health tick, the restart module and the retry
+ *   controller included); it is held in one module-scope holder, assigned it
+ *   once, that shutdown() stops once (`stopAll()`), after the shutting-down
+ *   flag, before it first yields and before `closeClient()`.
  * - b.jg5 SRJ-610 / SRJ-1010 / SRJ-1016 / SRJ-502: the one slow-recovery
  *   tracker (`createSlowRecoveryTracker`) is built once, in main()'s own
  *   statement list, over the one notice episodes instance and the server log,
@@ -416,7 +430,7 @@ import type { ReloadControllerDeps } from '../src/reload.ts'
 import { RETIRED_KEYS_FILE_NAME } from '../src/retired-keys.ts'
 import type * as RetiredKeysModule from '../src/retired-keys.ts'
 import type * as ConflictLatchModule from '../src/conflict-latch.ts'
-import type { ConflictLatch, ConflictLatchDeps, ConflictLatchHolds } from '../src/conflict-latch.ts'
+import type { ConflictLatch, ConflictLatchDeps, ConflictLatchHolds, LatchRecheckController } from '../src/conflict-latch.ts'
 import type * as PersonaEpisodesModule from '../src/persona-episodes.ts'
 import type * as SlowRecoveryModule from '../src/slow-recovery.ts'
 import type * as PendingRowModule from '../src/pending-row.ts'
@@ -438,7 +452,7 @@ import type * as KillRetryModule from '../src/kill-retry.ts'
 import type * as SessionManagerModule from '../src/session-manager.ts'
 import type * as LiveRowSequenceModule from '../src/live-row-sequence.ts'
 import type { LiveRowSequenceRegistry, LiveRowSequenceRegistryOptions } from '../src/live-row-sequence.ts'
-import type { OldLifeHoldEndRetryDeps, OldLifeWaitBindings, PendingRowRuleDepsInput, PendingRowRuleInstall } from '../src/session-manager.ts'
+import type { LatchRecheckInput, OldLifeHoldEndRetryDeps, OldLifeWaitBindings, PendingRowRuleDepsInput, PendingRowRuleInstall } from '../src/session-manager.ts'
 import type { SessionAdmissionOptions } from '../src/registry.ts'
 import type { OldLifeHoldSet } from '../src/retired-keys.ts'
 import type { HealthCheckDeps } from '../src/health-check.ts'
@@ -569,6 +583,13 @@ function latchHoldProps(): Map<string, string> {
 
 /** The latch's factory (b.jg5 SRJ-501); renaming it fails the typecheck. */
 const LATCH_FACTORY: keyof typeof ConflictLatchModule = 'createConflictLatch'
+
+/** The latch re-check's one builder, the session manager's (b.jg5 SRJ-505); renaming it fails the typecheck. */
+const RECHECK_BUILDER: keyof typeof SessionManagerModule = 'buildLatchRecheck'
+/** The latch re-check's binder (b.jg5 SRJ-505); renaming it fails the typecheck. */
+const RECHECK_BIND: keyof typeof ConflictLatchModule = 'bindLatchRecheck'
+/** The builder's latch input (b.jg5 SRJ-505); renaming it fails the typecheck. */
+const RECHECK_LATCH: keyof LatchRecheckInput = 'latch'
 
 /** Every path that can launch, and so latch or meet a latched persona (b.jg5 SRJ-501, SRJ-502): the retry controller's retries, the restart module, the start bring-up and the health check. */
 function latchStartPass(): number[] {
@@ -3688,7 +3709,7 @@ describe('main() builds the one per-persona latch, in server memory only, before
     expect(indicesOf(new RegExp(`\\.\\s*${ADD_OBSERVER}\\s*\\(`, 'g'), SERVER_CODE)).toEqual([])
   })
 
-  test('nothing in main() loads latch state from a file: no statement of main() sets the latch, the instance is named only at its build, its two bindings, its install, its four latched queries in main() (the retry action\'s, the restart work\'s, the reconnect adapter\'s inside the restart module\'s call, and the health tick\'s), the persona routing\'s holder assignment and the teardown\'s forget, and the latch module imports no file-system module', () => {
+  test('nothing in main() loads latch state from a file: no statement of main() sets the latch, the instance is named only at its build, its two bindings, its install, the latch re-check\'s build and binding, its four latched queries in main() (the retry action\'s, the restart work\'s, the reconnect adapter\'s inside the restart module\'s call, and the health tick\'s), the persona routing\'s holder assignment and the teardown\'s forget, and the latch module imports no file-system module', () => {
     const latch = constOf(LATCH_FACTORY)
     const IS_LATCHED: keyof ConflictLatch = 'isLatched'
 
@@ -3699,7 +3720,9 @@ describe('main() builds the one per-persona latch, in server memory only, before
     expect(sets).toEqual([])
 
     // Named only at its build, then once inside each of: the holds' binding
-    // and the notice's binding (b.jg5 SRJ-502, SRJ-508), the session
+    // and the notice's binding (b.jg5 SRJ-502, SRJ-508), the latch
+    // re-check's build (its `latch` input) and its binding (b.jg5 SRJ-505;
+    // both pinned in the re-check's describe below), the session
     // manager's install, the retry run's gate's latched query (the retry
     // action's and the approver-stop run's, b.jg5 SRJ-404), the health
     // check's latched query, and the persona teardown's latch forget (b.jg5 SRJ-504; its
@@ -3711,7 +3734,7 @@ describe('main() builds the one per-persona latch, in server memory only, before
     // queries' forms are pinned in the describe below; the holder's in the
     // persona routing's describe.
     const named = indicesOf(new RegExp(`\\b${latch}\\b`, 'g'), SERVER_CODE)
-    expect(named).toHaveLength(10)
+    expect(named).toHaveLength(12)
     const decl = SERVER_CODE.match(new RegExp(`\\bconst\\s+${latch}\\b`))!
     expect(named[0]).toBe(decl.index! + decl[0].length - latch.length)
     const withinAt = (at: number) => {
@@ -3720,8 +3743,9 @@ describe('main() builds the one per-persona latch, in server memory only, before
     }
     const within = (call: string) => withinAt(onlyCallOf(call))
     expect(
-      [BIND_LATCH_HOLDS, BIND, 'setConflictLatch', 'createFullModeRetryAction', 'initRestart', 'initHealthCheck', 'createPersonaLifecycle'].map(within),
-    ).toEqual([1, 1, 1, 0, 2, 1, 1])
+      [BIND_LATCH_HOLDS, BIND, RECHECK_BUILDER, RECHECK_BIND, 'setConflictLatch', 'createFullModeRetryAction', 'initRestart', 'initHealthCheck', 'createPersonaLifecycle'].map(within),
+    ).toEqual([1, 1, 1, 1, 1, 0, 2, 1, 1])
+    expect(onlyCallProps(RECHECK_BUILDER).get(RECHECK_LATCH)).toBe(latch)
     expect(withinRetryRunGate(named)).toBe(1)
     // The restart module's second: the reconnect adapter's, built inside its call.
     const [restartOpen, restartClose] = balancedAfter(SERVER_CODE, onlyCallOf('initRestart'), '(', ')')
@@ -3729,7 +3753,7 @@ describe('main() builds the one per-persona latch, in server memory only, before
     expect(adapter > restartOpen && adapter < restartClose).toBe(true)
     expect(withinAt(adapter)).toBe(1)
     expect(onlyCallProps('createPersonaLifecycle').get('forgetConflictLatch')).toContain(`${latch}.`)
-    // The tenth: the routing holder's one assignment, the bare latch.
+    // The twelfth: the routing holder's one assignment, the bare latch.
     const routing = routingHolder(ROUTING_LATCHED, IS_LATCHED, latch, [CHECK_LATCHED])
     expect(named.filter((offset) => offset > routing.at && offset < routing.end)).toHaveLength(1)
 
@@ -3912,6 +3936,148 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
     const CHECK: keyof typeof ServerModule = 'armMissingTmuxUnavailableRetry'
     const [checkStart, checkEnd] = exportedFunctionBody(CHECK)
     expect(queries.filter((offset) => offset > checkStart && offset < checkEnd)).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: b.jg5 SRJ-505 — the latch re-check
+//
+// Nothing in the type system makes main() build the re-check, build it once,
+// over the one latch and the one persona serializer, bind it (its set
+// observer arms a persona's timer at a new latch; its forget observer stops
+// the timer at a teardown's forget), bind it after the holds and the notice
+// (set observers run in the order they are added), before the start pass (a
+// launch there can latch), or stop it at shutdown before the client is
+// released. A wiring that dropped, doubled or reordered any of these would
+// type-check and pass every behaviour suite while a latched persona was never
+// looked at again, its rounds ran on a second serializer beside the
+// lifecycle's (overlapping a teardown or a restart), or a round fired during
+// shutdown. What the re-check does is tested in tests/conflict-latch.test.ts,
+// tests/session-manager.test.ts and tests/restart.test.ts; pinned here: the
+// build, its input, the binding, the holder and the shutdown stop.
+// ---------------------------------------------------------------------------
+
+describe('main() builds the latch re-check once, through the session manager\'s builder over the one latch, the system clock and the one persona serializer, binds it after the latch\'s holds and CONFLICT notice and before the start pass, and shutdown stops every re-check timer before the client is released (b.jg5 SRJ-505)', () => {
+  // Tied to src by type: renaming any of these fails the typecheck.
+  const BIND_NOTICE: keyof typeof ConflictLatchModule = 'bindConflictNotice'
+  const EPISODES_FACTORY: keyof typeof PersonaEpisodesModule = 'createPersonaEpisodes'
+  const CONTROLLER_FACTORY: keyof typeof ConflictLatchModule = 'createLatchRecheckController'
+  const SILENT_CLEAR: keyof typeof ConflictLatchModule = 'createSilentLatchRecheckClear'
+  const ROUND: keyof typeof SessionManagerModule = 'runLatchRecheckRound'
+  const IN_TURN: keyof typeof RestartModule = 'runRestartWorkInTurn'
+  const ADD_SET: keyof ConflictLatch = 'addSetObserver'
+  const ADD_FORGET: keyof ConflictLatch = 'addForgetObserver'
+  const STOP_ALL: keyof LatchRecheckController = 'stopAll'
+  const STOP: keyof LatchRecheckController = 'stop'
+  const ARM: keyof LatchRecheckController = 'arm'
+  const CLOCK: keyof LatchRecheckInput = 'clock'
+  const SERIALIZE: keyof LatchRecheckInput = 'serialize'
+  const APPLIED_CONFIG: keyof LatchRecheckInput = 'appliedConfig'
+  const LOG: keyof LatchRecheckInput = 'log'
+  const EPISODES: keyof LatchRecheckInput = 'episodes'
+
+  /** The module-scope holder shutdown() stops: the one `let <name>: LatchRecheckController | undefined`, outside main(). */
+  function holder(): string {
+    const decls = [...SERVER_CODE.matchAll(/^let\s+(\w+)\s*:\s*LatchRecheckController\s*\|\s*undefined\s*$/gm)]
+    expect(decls).toHaveLength(1)
+    expect(insideMain(decls[0]!.index!)).toBe(false)
+    declaredOnce(decls[0]![1]!)
+    return decls[0]![1]!
+  }
+
+  test('the re-check is built exactly once, by the session manager\'s builder, bound to a const in main()\'s own statement list (not at module scope, behind no branch), after the latch, the notice episodes and both the holds\' and the notice\'s bindings, and before the start pass; server.ts declares neither name and builds no re-check controller, round, clear or in-turn run of its own', () => {
+    expect(importSource(SERVER_CODE, RECHECK_BUILDER)).toBe('./session-manager.ts')
+    for (const name of [RECHECK_BUILDER, RECHECK_BIND]) {
+      expect([name, indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${name}\\b`, 'g'), SERVER_CODE)]).toEqual([name, []])
+    }
+    // The composition lives in the builder only, so main() and the recovery harness run the same re-check.
+    for (const name of [CONTROLLER_FACTORY, SILENT_CLEAR, ROUND, IN_TURN]) {
+      expect([name, indicesOf(new RegExp(`\\b${name}\\b`, 'g'), SERVER_CODE)]).toEqual([name, []])
+    }
+    // Named only at its import and the one call.
+    expect(indicesOf(new RegExp(`\\b${RECHECK_BUILDER}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
+    const at = onlyCallOf(RECHECK_BUILDER)
+    const recheck = constOf(RECHECK_BUILDER)
+    declaredOnce(recheck)
+    const decl = SERVER_CODE.search(new RegExp(`\\bconst\\s+${recheck}\\s*=\\s*${RECHECK_BUILDER}\\s*\\(`))
+    expect(decl).toBeGreaterThan(-1)
+    expect(atMainTopLevel(SERVER_CODE, decl)).toBe(true)
+
+    for (const earlier of [LATCH_FACTORY, EPISODES_FACTORY, BIND_LATCH_HOLDS, BIND_NOTICE]) {
+      expect([earlier, at > onlyCallOf(earlier)]).toEqual([earlier, true])
+    }
+    for (const later of latchStartPass()) expect(at).toBeLessThan(later)
+  })
+
+  test('its input is exactly the one latch, the system clock, the one persona lifecycle serializer\'s run (the restart module\'s too, so a round never overlaps a teardown, a bring-up or a restart for the persona), the applied configuration read at each round, the server log and the one notice episodes instance', () => {
+    const props = onlyCallProps(RECHECK_BUILDER)
+    expect([...props.keys()].sort()).toEqual([APPLIED_CONFIG, CLOCK, EPISODES, RECHECK_LATCH, LOG, SERIALIZE].sort())
+    expect(props.get(RECHECK_LATCH)).toBe(constOf(LATCH_FACTORY))
+    expect(props.get(CLOCK)).toBe('SYSTEM_PERSONA_CONNECTION_CLOCK')
+    expect(importSource(SERVER_CODE, 'SYSTEM_PERSONA_CONNECTION_CLOCK')).toBe('./persona-connections.ts')
+    const serialize = `${constOf('createPersonaSerializer')}.run`
+    expect(props.get(SERIALIZE)).toBe(serialize)
+    expect(onlyCallProps('initRestart').get('serialize')).toBe(serialize)
+    expect(props.get(APPLIED_CONFIG)).toBe(`() => ${loadedConfigName(SERVER_CODE)}`)
+    expect(props.get(LOG)).toMatch(/^\(?(\w+)\)? => console\.error\(\1\)$/)
+    expect(props.get(EPISODES)).toBe(constOf(EPISODES_FACTORY))
+  })
+
+  test('it is bound exactly once, in main()\'s own statement list, to the one latch, after its build with no await between, after the holds\' and the notice\'s bindings (so a set runs the holds, the notice, then the timer\'s arm) and before the start pass; server.ts adds no set or forget observer by hand', () => {
+    const at = onlyCallOf(RECHECK_BIND)
+    expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+    expect(importSource(SERVER_CODE, RECHECK_BIND)).toBe('./conflict-latch.ts')
+    expect(onlyCallArgs(RECHECK_BIND)).toEqual([constOf(LATCH_FACTORY), constOf(RECHECK_BUILDER)])
+    // Named only at its import and the one call.
+    expect(indicesOf(new RegExp(`\\b${RECHECK_BIND}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
+
+    const built = onlyCallOf(RECHECK_BUILDER)
+    expect(at).toBeGreaterThan(built)
+    expect(indicesOf(/\bawait\b/g, SERVER_CODE.slice(built, at))).toEqual([])
+    expect(at).toBeGreaterThan(onlyCallOf(BIND_LATCH_HOLDS))
+    expect(at).toBeGreaterThan(onlyCallOf(BIND_NOTICE))
+    for (const later of latchStartPass()) expect(at).toBeLessThan(later)
+
+    expect(indicesOf(new RegExp(`\\.\\s*(?:${ADD_SET}|${ADD_FORGET})\\s*\\(`, 'g'), SERVER_CODE)).toEqual([])
+  })
+
+  test('the re-check is named only at its build, the holder\'s one assignment and its binding (the health tick, the restart module and the retry controller are not handed it); the holder is assigned it once, in main()\'s own statement list after the build, and named only at its declaration, that assignment and shutdown\'s stop', () => {
+    const recheck = constOf(RECHECK_BUILDER)
+    const named = indicesOf(new RegExp(`\\b${recheck}\\b`, 'g'), SERVER_CODE)
+    expect(named).toHaveLength(3)
+    expect(withinCall(named, onlyCallOf(RECHECK_BIND))).toBe(1)
+    for (const call of ['initHealthCheck', 'initRestart', 'createUnavailableRetryController']) {
+      expect([call, withinCall(named, onlyCallOf(call))]).toEqual([call, 0])
+    }
+
+    const name = holder()
+    const assigned = assignmentsTo(name)
+    expect(assigned.map((a) => a.value)).toEqual([recheck])
+    expect(atMainTopLevel(SERVER_CODE, assigned[0]!.at)).toBe(true)
+    expect(assigned[0]!.at).toBeGreaterThan(onlyCallOf(RECHECK_BUILDER))
+    expect(indicesOf(new RegExp(`(?<![\\w.$])${name}\\b`, 'g'), SERVER_CODE)).toHaveLength(3)
+  })
+
+  test('shutdown() stops every re-check timer exactly once, through the holder, with no argument, after the shutting-down flag is raised, before it first yields and before closeClient(); nothing else in server.ts stops, or arms, a re-check timer', () => {
+    const [start, end] = shutdownBody(SERVER_CODE)
+    const inShutdown = (offset: number) => offset > start && offset < end
+    const name = holder()
+    const stops = indicesOf(new RegExp(`(?<![\\w.$])${name}\\s*\\?\\.\\s*${STOP_ALL}\\s*\\(\\s*\\)`, 'g'), SERVER_CODE)
+    expect(stops).toHaveLength(1)
+    const at = stops[0]!
+    expect(inShutdown(at)).toBe(true)
+    const recheck = constOf(RECHECK_BUILDER)
+    expect(indicesOf(new RegExp(`\\b(?:${name}|${recheck})\\s*[?!]?\\.\\s*(?:${STOP_ALL}|${STOP}|${ARM})\\s*\\(`, 'g'), SERVER_CODE)).toEqual([at])
+
+    const raises = indicesOf(/(?<![\w.$])shuttingDown\s*=\s*true\b/g, SERVER_CODE)
+    expect(raises).toHaveLength(1)
+    expect(at).toBeGreaterThan(raises[0]!)
+    const firstAwait = SERVER_CODE.slice(start, end).search(/\bawait\b/)
+    expect(firstAwait).toBeGreaterThan(-1)
+    expect(at).toBeLessThan(start + firstAwait)
+    const clientCloses = indicesOf(/(?<![\w.$])closeClient\s*\(/g, SERVER_CODE).filter(inShutdown)
+    expect(clientCloses).toHaveLength(1)
+    expect(at).toBeLessThan(clientCloses[0]!)
   })
 })
 
