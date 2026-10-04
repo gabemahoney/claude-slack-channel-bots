@@ -2275,7 +2275,7 @@ This gracefully exits the managed Claude Code sessions, stops and restarts the s
 This release and agent-director Phase 1 are installed together, and rolled back together, by the two runbooks below. Beside them:
 
 1. **Install the new CSCB together with agent-director Phase 1**: installing the npm package is not the whole install. This release needs agent-director Phase 1 on the host, installed with it by the runbook in [Switching over to agent-director Phase 1](#switching-over-to-agent-director-phase-1), which also says when to install the package. The npm `agent-director` package CSCB pulls in is only the client; the binary is installed system-wide (see [Prerequisites](#prerequisites)).
-2. **(Optional) Run a periodic agent-director `find-missing` sweep**. CSCB itself runs `find-missing` once before a resume during dead-session recovery, so a bot that died on reboot comes back with its history intact. If agent-director doesn't answer that sweep (it times out or reports tmux not answering), CSCB stops the recovery there, with no resume and no fresh session, and retries it later. CSCB's own recovery needs no periodic sweep; one reconciles the rows of agent-director's other users on a cadence. A host that runs one keeps it in its sweep loop, `~/startup/find-missing-loop.sh`, the loop the switch-over runbook names, or in a cron entry:
+2. **(Optional) Run a periodic agent-director `find-missing` sweep**. CSCB itself runs `find-missing` once before a resume during dead-session recovery, so a bot that died on reboot comes back with its history intact. If agent-director doesn't answer that sweep (it times out or reports tmux not answering), CSCB stops the recovery there, with no resume and no fresh session, and retries it later. CSCB's own recovery needs no periodic sweep; one reconciles the rows of agent-director's other users on a cadence. A host that follows the switch-over runbook runs one: [switch-over step 11](#step-11-schedule-the-daily-expire) adds it where the host has none. Run it as a cron entry, a systemd timer or a loop script (the switch-over runbook calls this the host's sweep schedule). As a cron entry:
    ```cron
    * * * * * $HOME/.agent-director/bin/agent-director find-missing
    ```
@@ -2333,7 +2333,7 @@ Do this beforehand, with the old CSCB running and still installed as the global 
 
 1. **The go line.** Confirm that agent-director's Phase 1 install-gate record has this host's dated go line. It is written before the Phase 1 install and is the approval for the switch-over. If it does not, stop here, before anything goes down. This runbook never writes the go line.
 2. **agent-director's version.** Run `agent-director version` in the bot server's launcher environment, as the workers' user, the same as the Claude Code check below, and confirm that it shows 0.10.0, the only supported starting point. If it does not, stop here, before anything goes down. A host on an earlier version (below 0.7.0, or 0.7.0 to 0.9.x) first brings agent-director to 0.10.0, outside this runbook; this step names no command for it.
-3. **The tmux socket (operator action).** Pin the tmux socket for the bot server's launcher, `find-missing-loop.sh` and the workers. Run `tmux display-message -p '#{socket_path}'` from the bot server's launcher, the loop's environment and a worker's. Confirm that all three print the same path, that it is the pinned path (a `TMUX_TMPDIR` that names a missing path falls back silently to `/tmp`), and that the three share one HOME. Record the result in the switch-over log.
+3. **The tmux socket (operator action).** Pin the tmux socket for the bot server's launcher, the host's sweep schedule and the workers. The sweep schedule is whatever runs `agent-director find-missing` on a schedule on your host: a cron entry, a systemd timer or a loop script. Run `tmux display-message -p '#{socket_path}'` from the bot server's launcher, the sweep schedule's environment and a worker's. Confirm that all three print the same path, that it is the pinned path (a `TMUX_TMPDIR` that names a missing path falls back silently to `/tmp`), and that the three share one HOME. A host with no sweep schedule checks the other two, and runs the one step 11 adds in the same environment. Record the result in the switch-over log.
 4. **tmux.** Confirm tmux 3.2 or later, with `remain-on-exit` off.
 5. **Claude Code.** Run `claude --version` in the bot server's launcher environment (the same user and `PATH` the server launches workers with), and confirm that the workers' Claude Code is 2.1.280 or later: the minimum agent-director states for its exec-form hooks, and the version the fleet runs. On a Claude Code too old for exec-form hooks (older than 2.1.139), each hook prints nothing, agent-director records `ad.hook.ignored` with the reason `no_exec_form`, and every launch stays `pending`. If it is older than 2.1.280, stop here, before anything goes down.
 6. **agent-director's timing settings.** Read all nine keys of the `[tmux]` table of `~/.agent-director/config.toml` (see [agent-director's timing settings](#agent-directors-timing-settings); a missing file, a missing key or `0` means the default) and its `[pause] timeout_seconds` (30 s when the file or the key is missing). Record the effective values in the switch-over log. Confirm that the three windows, `pending_grace_seconds`, `stopping_window_seconds` and `starting_session_seconds`, are the values you intend and each is at or above its minimum: `starting_session_seconds` 60, `stopping_window_seconds` 30, and `pending_grace_seconds` the larger of 30 and ⌈(`create_timeout_ms` + `pipe_close_wait_ms`) / 1000⌉ + 20. A `pending_grace_seconds` above 540 s shortens agent-director's SessionStart wait to 540 s.
@@ -2349,7 +2349,7 @@ Do this beforehand, with the old CSCB running and still installed as the global 
 8. **Leftover sessions.** As the workers' user, on the pinned socket, compare `tmux ls` with `agent-director list`, and record in the switch-over log every `slack_bot_` session that no row names.
 9. **Stage the new release without installing it.** Choose its exact version, record it in the switch-over log and confirm that it is available to install. Write the persona configuration, with `agent_director_call_timeout_ms`, in a separate file, never `config.json`, which the old CSCB reads. Prepare the Slack apps. Nothing is installed over the global package yet, so step 3's `stop --stop-bots` is the old version's own and reads the old, pre-persona `config.json`. Steps 1, 2, 3, 5 and 6 of [Upgrading to personas](#upgrading-to-personas) belong here.
 10. **Copies for rollback.** Keep copies of the pre-persona `config.json`, the crontable, the `/interject` callers (the host crontab's `curl` lines included), `access.json` and the Slack token environment variables the old CSCB uses. Record the old CSCB's exact version in the switch-over log beside them.
-11. **The orchestrator prompt (operator action).** The orchestrator system prompt's "ship now" wording may go out any time before the switch-over.
+11. **The orchestrator prompt (operator action).** The shared orchestrator prompt's "ship now" wording may go out any time before the switch-over. The shared orchestrator prompt is the system prompt your orchestrator bots load, for example the file `append_system_prompt_file` names.
 
 #### Step 2: Disable CSCB's autostart
 
@@ -2434,7 +2434,7 @@ Every other agent on the host is started again by its owner (operator action), w
 
 #### Step 10: Start the new CSCB
 
-1. **The orchestrator prompt's worker cleanup (operator action).** Before the new CSCB starts, change worker cleanup in the shared orchestrator prompt, `~/.claude/channels/slack/system-prompt.md`, and its source copy, `~/projects/horde_admin/cscb_system_prompt.md`, from row-delete cleanup to "kill, then leave the row". This change goes out in the same deploy as agent-director Phase 1. Kill-then-leave works on 0.10.0 too, so a rollback does not revert it.
+1. **The orchestrator prompt's worker cleanup (operator action).** Before the new CSCB starts, change worker cleanup in the shared orchestrator prompt, and in its source copy if you keep one, from row-delete cleanup to "kill, then leave the row". This change goes out in the same deploy as agent-director Phase 1. Kill-then-leave works on 0.10.0 too, so a rollback does not revert it.
 2. **Start the new CSCB**, then re-enable the host's autostart for CSCB (operator action):
    ```sh
    claude-slack-channel-bots start
@@ -2444,9 +2444,9 @@ Every other agent on the host is started again by its owner (operator action), w
 
 #### Step 11: Schedule the daily expire
 
-Schedule a daily `agent-director expire` at the default retention, never `--older-than 0d`, as the workers' user in the tmux environment step 1 pinned (operator action). Add it to the host's sweep loop, `~/startup/find-missing-loop.sh`, the script step 1's socket check names: nothing on the host runs `expire` before this step.
+Schedule a daily `agent-director expire` at the default retention, never `--older-than 0d`, as the workers' user in the tmux environment step 1 pinned (operator action). Add it to the host's sweep schedule, the one step 1's socket check names: whatever runs `agent-director find-missing` on a schedule on your host, such as a cron entry, a systemd timer or a loop script. Nothing on the host runs `expire` before this step. A host with no sweep schedule must add one now (operator action), as the workers' user in the tmux environment step 1 pinned, running both `agent-director find-missing` on a schedule ([Migration](#migration) shows it as a cron entry) and the daily `expire`.
 
-The orchestrator system prompt's "hold until after" wording goes out now (operator action).
+The shared orchestrator prompt's "hold until after" wording goes out now (operator action).
 
 ### Rolling back the switch-over
 
@@ -2462,9 +2462,9 @@ This runbook takes the host back to the previous CSCB on agent-director 0.10.0, 
 
 Disable the host's autostart for CSCB until step 9 (operator action), and record it in the switch-over log.
 
-#### Step 2: Remove the daily expire from the sweep loop
+#### Step 2: Remove the daily expire from the sweep schedule
 
-Remove the daily `agent-director expire` run that switch-over step 11 added to the host's sweep loop, `~/startup/find-missing-loop.sh` (operator action), and record it in the switch-over log. This comes before the previous binary is restored, because the older `expire` does not check tmux.
+Remove the daily `agent-director expire` run that switch-over step 11 added to the host's sweep schedule, the cron entry, systemd timer or loop script that runs it (operator action), and record it in the switch-over log. This comes before the previous binary is restored, because the older `expire` does not check tmux.
 
 #### Step 3: Stop the new CSCB with its bots
 
@@ -2497,7 +2497,7 @@ A row still live after that (for example a retired key whose kill failed, which 
 
 Nothing goes on to step 6 while such a worker runs, because every agent must be stopped before the previous binary is restored.
 
-**When "Operator actions" cannot end it either**, the rollback stops here, with Phase 1 still installed, and the worker is taken to agent-director. So that the fleet does not stay down while agent-director investigates, start the new CSCB again, restore step 2's daily `expire` in `~/startup/find-missing-loop.sh`, and re-enable the host's autostart for CSCB (operator action). If that start is refused, the new CSCB stays stopped until agent-director has dealt with that worker; then follow "A refusal after Phase 1 was installed" in [Arrived here from a startup refusal?](#arrived-here-from-a-startup-refusal).
+**When "Operator actions" cannot end it either**, the rollback stops here, with Phase 1 still installed, and the worker is taken to agent-director. So that the fleet does not stay down while agent-director investigates, start the new CSCB again, restore step 2's daily `expire` to the host's sweep schedule, and re-enable the host's autostart for CSCB (operator action). If that start is refused, the new CSCB stays stopped until agent-director has dealt with that worker; then follow "A refusal after Phase 1 was installed" in [Arrived here from a startup refusal?](#arrived-here-from-a-startup-refusal).
 
 #### Step 5: Check for leftover persona sessions
 
@@ -2522,7 +2522,7 @@ Check each result, then run `agent-director find-missing` and switch-over step 5
 
 #### Step 7: Revert the orchestrator prompt's hold wording
 
-Revert the orchestrator system prompt's "hold until after" wording that switch-over step 11 put out (operator action). The worker cleanup switch-over step 10 changed to "kill, then leave the row" stays: it works on 0.10.0 too.
+Revert the shared orchestrator prompt's "hold until after" wording that switch-over step 11 put out (operator action). The worker cleanup switch-over step 10 changed to "kill, then leave the row" stays: it works on 0.10.0 too.
 
 #### Step 8: Reinstall the previous CSCB
 

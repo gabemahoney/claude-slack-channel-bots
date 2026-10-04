@@ -2211,11 +2211,14 @@ const stepLink = (n: number) => (carrier: RunbookCarrier) => `(#${carrier.stepAn
 const UPGRADING_TITLE = 'Upgrading to personas'
 
 /**
- * A link to `UPGRADING_TITLE`'s README heading as the carrier writes it: a
+ * A link to the README heading titled `title` as the carrier writes it: a
  * same-file anchor in the README, `README.md#…` in the CHANGELOG copy (b.jg5
  * SRJ-1107; the E35 T1 PM note).
  */
-const upgradingLink = (carrier: RunbookCarrier) => `(${carrier.name.startsWith(`${CHANGELOG_FILE} `) ? 'README.md' : ''}#${headingSlug(UPGRADING_TITLE)})`
+const readmeLink = (title: string) => (carrier: RunbookCarrier) => `(${carrier.name.startsWith(`${CHANGELOG_FILE} `) ? 'README.md' : ''}#${headingSlug(title)})`
+
+/** A link to `UPGRADING_TITLE`'s README heading as the carrier writes it. */
+const upgradingLink = readmeLink(UPGRADING_TITLE)
 
 /**
  * SRJ-1101's words for a kill a runbook step tells a human to run: its result
@@ -2279,14 +2282,21 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
     ci(`brings agent-director to ${OLD_AD_VERSION}, outside this runbook`),
     ci('names no command for it'),
   ]],
-  ['step 1 › The tmux socket', 'the tmux socket pinned for the launcher, find-missing-loop.sh and the workers, checked from all three, one HOME, recorded', [
-    code('find-missing-loop.sh'),
+  ['step 1 › The tmux socket', "the tmux socket pinned for the launcher, the host's sweep schedule and the workers, checked from all three, one HOME, recorded", [
+    ci("pin the tmux socket for the bot server's launcher, the host's sweep schedule and the workers"),
     code("tmux display-message -p '#{socket_path}'"),
+    ci("from the bot server's launcher, the sweep schedule's environment and a worker's"),
     ci('all three print the same path'),
     ci('it is the pinned path'),
     `${code('TMUX_TMPDIR')} that names a missing path falls back silently to ${code('/tmp')}`,
     ci('the three share one HOME'),
     ci('record the result in the switch-over log'),
+  ]],
+  ['step 1 › The tmux socket', "the host's sweep schedule named generically: whatever runs agent-director find-missing on a schedule, a cron entry, a systemd timer or a loop script (b.3ut)", [
+    ci('the sweep schedule is whatever runs `agent-director find-missing` on a schedule on your host: a cron entry, a systemd timer or a loop script'),
+  ]],
+  ['step 1 › The tmux socket', 'a host with no sweep schedule checks the other two and runs the one step 11 adds in the same environment (b.3ut)', [
+    ci('a host with no sweep schedule checks the other two, and runs the one step 11 adds in the same environment'),
   ]],
   ['step 1 › The tmux socket', 'operator action: pinning the tmux socket (C7)', [OPERATOR_ACTION]],
   ['step 1 › tmux', `tmux ${vocab('tmuxMinimum')} or later with remain-on-exit off`, [
@@ -2364,7 +2374,12 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
     ci('the Slack token environment variables the old CSCB uses'),
   ]],
   ['step 1 › Copies for rollback', "the old CSCB's exact version recorded in the switch-over log", [ci("record the old CSCB's exact version in the switch-over log")]],
-  ['step 1 › The orchestrator prompt', 'the §6 "ship now" wording may go out any time before', [ci('"ship now" wording may go out any time before')]],
+  ['step 1 › The orchestrator prompt', 'the shared orchestrator prompt\'s §6 "ship now" wording may go out any time before', [
+    ci('the shared orchestrator prompt\'s "ship now" wording may go out any time before'),
+  ]],
+  ['step 1 › The orchestrator prompt', 'the shared orchestrator prompt named generically, at its first use: the system prompt the orchestrator bots load, for example the append_system_prompt_file file (b.3ut)', [
+    ci(`the shared orchestrator prompt is the system prompt your orchestrator bots load, for example the file ${code('append_system_prompt_file' satisfies (typeof SERVER_PATH_SETTINGS)[number])} names`),
+  ]],
   ['step 1 › The orchestrator prompt', 'operator action: the §6 "ship now" wording', [OPERATOR_ACTION]],
   ['step 1', `the conversion steps kept in "${UPGRADING_TITLE}" are linked (SRJ-1103; the E35 T1 PM note)`, [upgradingLink]],
 
@@ -2502,10 +2517,8 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
     ci('which also starts its `serve` processes on the Phase 1 binary'),
   ]],
   ['step 9', 'operator action: the other agents started again by their owners (C15)', [ci(`started again by its owner ${OPERATOR_ACTION}`)]],
-  ['step 10 › The orchestrator prompt', 'the shared orchestrator prompt and its source copy change worker cleanup to "kill, then leave the row" before the new CSCB starts', [
-    code('~/.claude/channels/slack/system-prompt.md'),
-    code('~/projects/horde_admin/cscb_system_prompt.md'),
-    ci('from row-delete cleanup to "kill, then leave the row"'),
+  ['step 10 › The orchestrator prompt', 'the shared orchestrator prompt, and its source copy if one is kept, change worker cleanup to "kill, then leave the row" before the new CSCB starts', [
+    ci('change worker cleanup in the shared orchestrator prompt, and in its source copy if you keep one, from row-delete cleanup to "kill, then leave the row"'),
     ci('before the new CSCB starts'),
     ci('in the same deploy as agent-director Phase 1'),
     ci(`kill-then-leave works on ${OLD_AD_VERSION} too, so a rollback does not revert it`),
@@ -2535,11 +2548,15 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
     ci("as the workers' user in the tmux environment step 1 pinned"),
   ]],
   ['step 11', 'operator action: scheduling the daily expire (C6)', [ci(`step 1 pinned ${OPERATOR_ACTION}`)]],
-  ['step 11', "the daily expire goes into the host's sweep loop, find-missing-loop.sh", [
-    ci("add it to the host's sweep loop, `~/startup/find-missing-loop.sh`"),
+  ['step 11', "the daily expire goes into the host's sweep schedule, the one step 1's socket check names: whatever runs agent-director find-missing on a schedule", [
+    ci("add it to the host's sweep schedule, the one step 1's socket check names: whatever runs `agent-director find-missing` on a schedule on your host, such as a cron entry, a systemd timer or a loop script"),
     ci('nothing on the host runs `expire` before this step'),
   ]],
-  ['step 11', 'the §6 "hold until after" wording goes out then', [ci('"hold until after" wording goes out now')]],
+  ['step 11', "a host with no sweep schedule adds one now (operator action), as the workers' user in the pinned tmux environment, running both find-missing on a schedule (Migration, linked, shows it as a cron entry) and the daily expire (b.3ut; the User's ruling)", [
+    ci("a host with no sweep schedule must add one now (operator action), as the workers' user in the tmux environment step 1 pinned, running both `agent-director find-missing` on a schedule"),
+    (carrier) => `([Migration]${readmeLink(MIGRATION_HEADING.slice('## '.length))(carrier)} shows it as a cron entry) and the daily \`expire\`.`,
+  ]],
+  ['step 11', 'the shared orchestrator prompt\'s §6 "hold until after" wording goes out then', [ci('the shared orchestrator prompt\'s "hold until after" wording goes out now')]],
   ['step 11', 'operator action: the §6 "hold until after" wording', [ci(`goes out now ${OPERATOR_ACTION}`)]],
 ]
 
@@ -2985,15 +3002,14 @@ const ROLLBACK_ELEMENTS: [where: string, element: string, required: readonly Ite
     ci('record it in the switch-over log'),
   ]],
   ['step 1', "operator action: disabling the host's autostart for CSCB", [ci(`until step 9 ${OPERATOR_ACTION}`)]],
-  ['step 2', "the daily agent-director expire switch-over step 11 added removed from the host's sweep loop, recorded", [
-    ci("remove the daily `agent-director expire` run that switch-over step 11 added to the host's sweep loop"),
-    code('~/startup/find-missing-loop.sh'),
+  ['step 2', "the daily agent-director expire switch-over step 11 added removed from the host's sweep schedule, whatever runs it, recorded", [
+    ci("remove the daily `agent-director expire` run that switch-over step 11 added to the host's sweep schedule, the cron entry, systemd timer or loop script that runs it"),
     ci('record it in the switch-over log'),
   ]],
   ['step 2', 'before the previous binary is restored, because the older expire does not check tmux', [
     ci('before the previous binary is restored, because the older `expire` does not check tmux'),
   ]],
-  ['step 2', 'operator action: removing the daily expire', [ci(`${code('~/startup/find-missing-loop.sh')} ${OPERATOR_ACTION}`)]],
+  ['step 2', 'operator action: removing the daily expire', [ci(`loop script that runs it ${OPERATOR_ACTION}`)]],
 
   // Step 3.
   ['step 3', `the new CSCB stopped with ${CLI_COMMAND_STOP_BOTS}, whose failure lines the README describes (E32, E33)`, [
@@ -3045,7 +3061,7 @@ const ROLLBACK_ELEMENTS: [where: string, element: string, required: readonly Ite
   ['step 4', "then the new CSCB started again, step 2's expire restored and the autostart re-enabled, so the fleet does not stay down", [
     ci('so that the fleet does not stay down while agent-director investigates'),
     ci('start the new CSCB again'),
-    ci("restore step 2's daily `expire` in `~/startup/find-missing-loop.sh`"),
+    ci("restore step 2's daily `expire` to the host's sweep schedule"),
     ci("re-enable the host's autostart for CSCB"),
   ]],
   ['step 4', "operator action: the new CSCB's restart, the expire and the autostart", [ci(`autostart for CSCB ${OPERATOR_ACTION}`)]],
@@ -3134,7 +3150,7 @@ const ROLLBACK_ELEMENTS: [where: string, element: string, required: readonly Ite
   ['step 6 › Start the other agents again', 'operator action: the other agents started again (C15)', [OPERATOR_ACTION]],
 
   // Steps 7 to 9.
-  ['step 7', 'the §6 "hold until after" wording reverted', [ci('revert the orchestrator system prompt\'s "hold until after" wording that switch-over step 11 put out')]],
+  ['step 7', 'the shared orchestrator prompt\'s §6 "hold until after" wording reverted', [ci('revert the shared orchestrator prompt\'s "hold until after" wording that switch-over step 11 put out')]],
   ['step 7', 'operator action: reverting the "hold until after" wording', [ci(`put out ${OPERATOR_ACTION}`)]],
   ['step 7', `the "kill, then leave the row" cleanup stays: it works on ${OLD_AD_VERSION} too (reconcile note)`, [
     ci('the worker cleanup switch-over step 10 changed to "kill, then leave the row" stays'),
@@ -3435,6 +3451,54 @@ describe(`the rollback runbook, "${ROLLBACK_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-1
         expect(headingAt(readme, anchor)?.text).toBe(heading)
       }
     })
+  })
+})
+
+/**
+ * Paths that exist on one host only, which neither runbook names in either
+ * carrier, nor the README's Migration section (b.3ut): the steps name the
+ * host's sweep schedule and the shared orchestrator prompt generically
+ * instead. Read over those sections only: elsewhere the README quotes a
+ * server log line naming the sweep script, and `horde_admin` is an example
+ * persona name.
+ */
+const HOST_SPECIFIC_PATHS = ['find-missing-loop.sh', '~/startup/', 'horde_admin/cscb_system_prompt.md', '~/.claude/channels/slack/system-prompt.md'] as const
+
+/** The `HOST_SPECIFIC_PATHS` a text names. Pure. */
+const hostPathsIn = (section: string) => HOST_SPECIFIC_PATHS.filter((path) => section.includes(path))
+
+/** Each runbook section in each carrier, by name: the switch-over's, then the rollback's. */
+const RUNBOOK_SECTIONS: [name: string, read: () => string][] = [
+  ...SWITCH_OVER_CARRIERS.map(([name, read]): [string, () => string] => [`${name}, switch-over`, () => read().section]),
+  ...ROLLBACK_CARRIERS.map(([name, read]): [string, () => string] => [`${name}, rollback`, () => read().section]),
+]
+
+describe('the runbooks name no host-specific path (b.3ut)', () => {
+  test.each([
+    ...RUNBOOK_SECTIONS,
+    [`README.md "${MIGRATION_HEADING}" (to the next \`##\`, both runbooks included)`, () => requiredSection(operatorText('README.md'), MIGRATION_HEADING, 'README.md')],
+  ] satisfies [string, () => string][])(`%s: the text, its headings included, names none of ${HOST_SPECIFIC_PATHS.join(', ')}`, (_name, read) => {
+    expect(hostPathsIn(read())).toEqual([])
+  })
+
+  test.each(RUNBOOK_SECTIONS)('%s: the section never calls the shared orchestrator prompt the "orchestrator system prompt"', (_name, read) => {
+    expect(flat(read())).not.toMatch(ci('orchestrator system prompt'))
+  })
+
+  test('self-check: the README with the host-specific wording put back in steps 10 and 11 and rollback steps 2 and 4 is reported in both runbooks', () => {
+    const edited = operatorText('README.md')
+      .replace(', and in its source copy if you keep one,', ', `~/.claude/channels/slack/system-prompt.md`, and its source copy, `~/projects/horde_admin/cscb_system_prompt.md`,')
+      .replace("Add it to the host's sweep schedule, the one", "Add it to the host's sweep loop, `~/startup/find-missing-loop.sh`, the script")
+      .replace("added to the host's sweep schedule, the cron entry, systemd timer or loop script that runs it", "added to the host's sweep loop, `~/startup/find-missing-loop.sh`")
+      .replace("restore step 2's daily `expire` to the host's sweep schedule", "restore step 2's daily `expire` in `~/startup/find-missing-loop.sh`")
+    const switchOver = readRunbookCarrier('README.md', edited, SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT)
+    const rollback = readRunbookCarrier('README.md', edited, ROLLBACK_HEADING, ROLLBACK_STEP_COUNT)
+    expect({ switchOver: hostPathsIn(switchOver.section), rollback: hostPathsIn(rollback.section) }).toEqual({
+      switchOver: [...HOST_SPECIFIC_PATHS],
+      rollback: ['find-missing-loop.sh', '~/startup/'],
+    })
+    expect(hostPathsIn(textAt(rollback, 'step 2'))).toEqual(['find-missing-loop.sh', '~/startup/'])
+    expect(hostPathsIn(textAt(rollback, 'step 4'))).toEqual(['find-missing-loop.sh', '~/startup/'])
   })
 })
 
@@ -5450,8 +5514,10 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
     ci("the job must run as the workers' user and resolve their tmux socket"),
     ci('the socket switch-over step 1 pins'),
   ]],
-  ["Migration: a host's sweep runs in its sweep loop, the one the switch-over runbook names", sectionOf('README.md', MIGRATION_HEADING), [
-    code('~/startup/find-missing-loop.sh'),
+  ["Migration: a host that follows the switch-over runbook runs a periodic sweep, which switch-over step 11 (linked) adds where the host has none; it runs as a cron entry, a systemd timer or a loop script, the runbook's sweep schedule (b.3ut)", sectionOf('README.md', MIGRATION_HEADING), [
+    ci('a host that follows the switch-over runbook runs one'),
+    '[switch-over step 11](#step-11-schedule-the-daily-expire) adds it where the host has none',
+    ci("run it as a cron entry, a systemd timer or a loop script (the switch-over runbook calls this the host's sweep schedule)"),
   ]],
 
   // Destructive changes: the retired persona, no delete, checked kills.
