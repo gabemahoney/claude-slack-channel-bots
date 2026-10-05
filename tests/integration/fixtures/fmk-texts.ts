@@ -179,6 +179,50 @@
  *                                    `killFailureAlertEntryText.start-sweep`
  *                                    builds it, with context
  *                                    KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN)
+ * Scenario 6, a wedged tmux (test-18; b.jg5 SRJ-1408, SRJ-302, SRJ-307 to
+ * SRJ-310, SRJ-702, SRJ-1006, AC 56):
+ *   tmuxUnresponsiveAlertText <key>  the `tmux-unresponsive` alert's body for
+ *                                    persona <key> at the alert threshold of
+ *                                    agent-director's default settings
+ *                                    (src/persona-episodes.ts, the threshold
+ *                                    as `adAlertThresholdMs.default` below)
+ *   tmuxUnresponsiveRecoveryText <key>
+ *                                    the recovery's body (src/persona-episodes.ts)
+ *   tmuxUnresponsiveStartedLine.head <key>
+ *                                    the condition's started line
+ *                                    (`tmuxUnresponsiveStartedLine`,
+ *                                    src/persona-episodes.ts) up to the
+ *                                    refusing verb: a script reads the
+ *                                    persona's first refusal's time from it
+ *   adAlertThresholdMs.default       the alert threshold in milliseconds at
+ *                                    agent-director's default settings
+ *                                    (`adAlertThresholdMs` of
+ *                                    DEFAULT_AD_SETTINGS_IN_EFFECT,
+ *                                    src/ad-settings.ts)
+ *   UNAVAILABLE_RETRY_BASE_S         the retry timer's first wait and its
+ *   UNAVAILABLE_RETRY_CEILING_S      ceiling, in seconds (src/unavailable-retry.ts)
+ *   TMUX_UNRESPONSIVE_ONSET_FLOOR_MS the onset's floor with the health check
+ *                                    off (src/persona-episodes.ts)
+ *   restartCapReachedNoticeText      the restart-cap notice's body
+ *                                    (src/session-manager.ts), for absence
+ *                                    checks
+ *   restartRetryCapSkippedLine <key> the retry entry's line for a persona at
+ *                                    the restart cap (src/restart.ts)
+ *   UNAVAILABLE_RETRY_STOP_CAPPED    the retry timer's stop reason at the
+ *                                    restart cap (src/unavailable-retry.ts)
+ *   DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS
+ *                                    CSCB's default agent-director call
+ *                                    timeout (src/config.ts, b.jg5 SRJ-213)
+ *   KILL_RETRY_SPACING_MS            the wait between a kill's tries
+ *                                    (src/kill-retry.ts)
+ *   killRetryTryLine.head <instance-id> <try> <max>
+ *   killRetryTryLine.tail <next>     the parts of the bounded retry's per-try
+ *                                    line (`killRetryTryLine`, no prefix)
+ *                                    before and after its outcome, for try
+ *                                    <try> of <max> of <instance-id>, and for
+ *                                    what follows it, <next> the name of a
+ *                                    `KILL_RETRY_NEXT_*` export of
+ *                                    src/kill-retry.ts
  *
  * SPDX-License-Identifier: MIT
  */
@@ -355,6 +399,27 @@ async function alertText(content: unknown, closing: unknown, forSlack: boolean):
   return (await fn<(c: unknown, closing: unknown, forSlack: boolean) => string>('kill-failure-alert.ts', 'killFailureAlertText'))(content, closing, forSlack)
 }
 
+/** The alert threshold at agent-director's default settings (`adAlertThresholdMs`). */
+async function defaultAlertThresholdMs(): Promise<number> {
+  const defaults = await value('ad-settings.ts', 'DEFAULT_AD_SETTINGS_IN_EFFECT')
+  return (await fn<(values: unknown) => number>('ad-settings.ts', 'adAlertThresholdMs'))(defaults)
+}
+
+/** A stand-in verb, for the entry that cuts the condition's started line at its verb: found once in it. */
+const VERB_STAND_IN = 'FMKTEXTSVERBSTANDIN'
+
+/**
+ * The bounded retry's per-try line (`killRetryTryLine`, no prefix) for try
+ * `n` of `max` of `instanceId`, followed by `next`, cut around its outcome
+ * (an `ErrTmuxKillFailed` naming no survivor, so no survivor clause sits
+ * between the outcome and what follows).
+ */
+async function killRetryTryLineParts(instanceId: string, n: number, max: number, next: unknown): Promise<{ readonly head: string; readonly tail: string }> {
+  const outcome = await killFailedOutcome(DESCRIPTION_STAND_IN)
+  const tryLine = await fn<(prefix: string, id: string, n: number, max: number, outcome: unknown, next: unknown) => string>('kill-retry.ts', 'killRetryTryLine')
+  return around(tryLine('', instanceId, n, max, outcome, next), await describeKillOutcome(outcome), 'killRetryTryLine')
+}
+
 /** The entries, by the name a script passes. */
 const ENTRIES: Readonly<Record<string, Entry>> = {
   personaInstanceId: {
@@ -514,6 +579,54 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
       // The window's persona reference, `persona <ref>` (src/persona-notifier.ts
       // teardownRef; no exported builder).
       return entry(`persona ${ref}`, unescaped)
+    },
+  },
+  // Scenario 6 (test-18; b.jg5 SRJ-1408).
+  tmuxUnresponsiveAlertText: {
+    args: ['key'],
+    print: async ([key]) => (await fn<(k: string, ms: number) => string>('persona-episodes.ts', 'tmuxUnresponsiveAlertText'))(key, await defaultAlertThresholdMs()),
+  },
+  tmuxUnresponsiveRecoveryText: {
+    args: ['key'],
+    print: async ([key]) => (await fn<(k: string) => string>('persona-episodes.ts', 'tmuxUnresponsiveRecoveryText'))(key),
+  },
+  'tmuxUnresponsiveStartedLine.head': {
+    args: ['key'],
+    print: async ([key]) => {
+      const line = (await fn<(k: string, verb: string, d: string) => string>('persona-episodes.ts', 'tmuxUnresponsiveStartedLine'))(key, VERB_STAND_IN, DESCRIPTION_STAND_IN)
+      return around(line, VERB_STAND_IN, 'tmuxUnresponsiveStartedLine').head
+    },
+  },
+  'adAlertThresholdMs.default': { args: [], print: async () => String(await defaultAlertThresholdMs()) },
+  UNAVAILABLE_RETRY_BASE_S: { args: [], print: () => text('unavailable-retry.ts', 'UNAVAILABLE_RETRY_BASE_S') },
+  UNAVAILABLE_RETRY_CEILING_S: { args: [], print: () => text('unavailable-retry.ts', 'UNAVAILABLE_RETRY_CEILING_S') },
+  TMUX_UNRESPONSIVE_ONSET_FLOOR_MS: { args: [], print: () => text('persona-episodes.ts', 'TMUX_UNRESPONSIVE_ONSET_FLOOR_MS') },
+  restartCapReachedNoticeText: {
+    args: [],
+    print: async () => (await fn<() => string>('session-manager.ts', 'restartCapReachedNoticeText'))(),
+  },
+  restartRetryCapSkippedLine: {
+    args: ['key'],
+    print: async ([key]) => (await fn<(k: string) => string>('restart.ts', 'restartRetryCapSkippedLine'))(key),
+  },
+  UNAVAILABLE_RETRY_STOP_CAPPED: { args: [], print: () => text('unavailable-retry.ts', 'UNAVAILABLE_RETRY_STOP_CAPPED') },
+  DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS: { args: [], print: () => text('config.ts', 'DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS') },
+  KILL_RETRY_SPACING_MS: { args: [], print: () => text('kill-retry.ts', 'KILL_RETRY_SPACING_MS') },
+  'killRetryTryLine.head': {
+    args: ['instance-id', 'try', 'max'],
+    print: async ([instanceId, rawTry, rawMax]) => {
+      const n = tryNumber(rawTry)
+      const max = tryNumber(rawMax)
+      const next = await value('kill-retry.ts', 'KILL_RETRY_NEXT_AGAIN')
+      return (await killRetryTryLineParts(instanceId, n, max, next)).head
+    },
+  },
+  'killRetryTryLine.tail': {
+    args: ['next'],
+    print: async ([nextName]) => {
+      if (!/^KILL_RETRY_NEXT_[A-Z_]+$/.test(nextName)) throw new PrinterFailure(`next '${nextName}' is not a KILL_RETRY_NEXT_* export's name`, USAGE_EXIT)
+      const next = await value('kill-retry.ts', nextName)
+      return (await killRetryTryLineParts(DESCRIPTION_STAND_IN.toLowerCase(), 1, 1, next)).tail
     },
   },
 }
