@@ -79,8 +79,8 @@ const SUBSTITUTIONS: readonly Substitution[] = [
   { step: 8, kind: 'harness-stops-agents', basis: "step 8's stop of every other agent is the harness's" },
   {
     step: 8,
-    kind: 'rc-install-script',
-    basis: "step 8's Phase 1 install is the release candidate's install script, and its serve restart and start-time check cover only the agent-director processes the container runs",
+    kind: 'release-install-script',
+    basis: "step 8's Phase 1 install is the release's install script, and its serve restart and start-time check cover only the agent-director processes the container runs",
   },
   { step: 8, kind: 'container-settings', basis: "the timing-settings checks of steps 1 and 8 read the container's agent-director config" },
   { step: 9, kind: 'no-agents-restarted', basis: 'step 9 starts none again' },

@@ -73,8 +73,8 @@
 #   autostart-skipped          steps 2, 10: the host's autostart for CSCB
 #   harness-stops-agents       step 8: the stop of every other agent is the
 #                              harness's (none is seeded)
-#   rc-install-script          step 8: the Phase 1 install is the release
-#                              candidate's install.sh, and the `serve` restart
+#   release-install-script     step 8: the Phase 1 install is the release's
+#                              install.sh, and the `serve` restart
 #                              and start-time check cover only the container's
 #                              agent-director processes
 #   no-agents-restarted        step 9: no other agent is started again
@@ -108,19 +108,19 @@
 #   5   a read-only `tmux ls`: no old session, no live old row.
 #   6   not needed (no leftover with a row), recorded.
 #   7   the build under test installed over the same install path (no
-#       side-by-side path); the release candidate's client swapped in and
-#       checked with the image's check; nothing started; the persona
+#       side-by-side path); the release's client checked with the image's
+#       check (ad-client-check.sh --package); nothing started; the persona
 #       configuration put in place as config.json; each persona's credentials
 #       file written by the new CLI's `credentials`; the crontable targets and
 #       `/interject` callers rewritten to name personas; the new install check
 #       passing on the still-installed 0.10.0 with its Phase 1 note.
 #   8   the go line; the harness's stop of other agents (none; every non-CSCB
 #       row ended or missing, no tmux session left); the store's online
-#       backup (`ad_store_backup`); the release candidate's install.sh, run
-#       in the scenario HOME as the runbook's install command
-#       (`install_ad_rc`: --binary at the image's release-candidate binary,
-#       --no-symlink --no-hooks, stdin from /dev/null), then the re-shim;
-#       `agent-director version` the release candidate's; no [tmux] table
+#       backup (`ad_store_backup`); the release's install.sh, run in the
+#       scenario HOME as the runbook's install command (`install_ad_release`:
+#       --binary at the image's release binary, --admin-binary at its
+#       agent-director-admin, --no-symlink --no-hooks, stdin from /dev/null),
+#       then the re-shim; `agent-director version` the release's; no [tmux] table
 #       written; no agent-director process older than the install; the
 #       settings again on the installed build, with the call-timeout need
 #       against config.json; `agent-director list` without
@@ -269,7 +269,7 @@
 #     so it is not in the CSCB process record and every line is read): no
 #     launch, kill or delete from any parent, no harness call, and at least
 #     one probe.
-# Then `swap_ad_binary rc` puts the release candidate back (compared with the
+# Then `swap_ad_binary release` puts the release back (compared with the
 # image's binary) before the closing checks. Legs A and B's servers' version
 # probes are `assert_no_cscb_include_finished`'s positive control.
 #
@@ -318,8 +318,8 @@
 #     `force-killed` or `already terminal`, and `[slack] teardownBots: pause
 #     failed for channel=<channel id> — escalating to kill`
 #
-# Pinned versions come from the image: the release candidate's from
-# /opt/agent-director-rc/client/release.json, 0.10.0 from scenario.sh's
+# Pinned versions come from the image: the release's from
+# /opt/agent-director/client/release.json, 0.10.0 from scenario.sh's
 # SCENARIO_AD_010_VERSION, the old CSCB's and the build under test's from
 # their tarballs' package.json.
 #
@@ -342,19 +342,19 @@ source "$(dirname "$0")/lib/scenario.sh"
 # The image's fixed files (docker/Dockerfile.test.base) and pinned versions
 # ---------------------------------------------------------------------------
 
-RC_RELEASE_JSON=/opt/agent-director-rc/client/release.json
-RC_CLIENT_CHECK=/opt/agent-director-rc/check/rc-client-check.sh
+REL_RELEASE_JSON=/opt/agent-director/client/release.json
+REL_CLIENT_CHECK=/opt/agent-director/check/ad-client-check.sh
 AD_010_CLIENT_TGZ=/opt/agent-director-0.10.0/agent-director-0.10.0.tgz
 CSCB_010_TGZ=/opt/claude-slack-channel-bots-0.10.0/claude-slack-channel-bots-0.10.0.tgz
 PACKAGE_TGZ=/tmp/package.tgz
 SWITCH_OVER_TS="${SCENARIO_FIXTURES}/switch-over.ts"
 
-for f in "${RC_RELEASE_JSON}" "${RC_CLIENT_CHECK}" "${AD_010_CLIENT_TGZ}" "${CSCB_010_TGZ}" "${PACKAGE_TGZ}" "${SWITCH_OVER_TS}"; do
+for f in "${REL_RELEASE_JSON}" "${REL_CLIENT_CHECK}" "${AD_010_CLIENT_TGZ}" "${CSCB_010_TGZ}" "${PACKAGE_TGZ}" "${SWITCH_OVER_TS}"; do
     [[ -f "${f}" ]] || fail "setup: ${f} is missing from the image"
 done
-RC_VERSION="$(jq -r '.version // empty' "${RC_RELEASE_JSON}")" || fail "setup: could not read ${RC_RELEASE_JSON}"
-RC_COMMIT="$(jq -r '.commit // empty' "${RC_RELEASE_JSON}")" || fail "setup: could not read ${RC_RELEASE_JSON}"
-[[ -n "${RC_VERSION}" && -n "${RC_COMMIT}" ]] || fail "setup: ${RC_RELEASE_JSON} names no version or no commit"
+REL_VERSION="$(jq -r '.version // empty' "${REL_RELEASE_JSON}")" || fail "setup: could not read ${REL_RELEASE_JSON}"
+REL_COMMIT="$(jq -r '.commit // empty' "${REL_RELEASE_JSON}")" || fail "setup: could not read ${REL_RELEASE_JSON}"
+[[ -n "${REL_VERSION}" && -n "${REL_COMMIT}" ]] || fail "setup: ${REL_RELEASE_JSON} names no version or no commit"
 
 # tarball_field <tgz> <jq-filter>: a field of the package.json a package tarball holds.
 tarball_field() {
@@ -470,7 +470,7 @@ RUNBOOK_COUNT=""
 # The substitution kinds SRJ-1402 allows (see the table in the header).
 SUBSTITUTION_KINDS=(install-gate-fixture container-settings one-socket claude-code-check-skipped
     staging-build-under-test slack-fixtures prompt-wording-skipped autostart-skipped
-    harness-stops-agents rc-install-script no-agents-restarted container-list expire-skipped)
+    harness-stops-agents release-install-script no-agents-restarted container-list expire-skipped)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1292,21 +1292,21 @@ fi
 n="$(find "${CSCB_GLOBAL}" -name package.json -path "*/node_modules/${PKG_NAME}/package.json" | wc -l)"
 [[ "${n}" == 1 ]] || fail "step 7: ${n} copies of ${PKG_NAME} under ${CSCB_GLOBAL}, not one (no side-by-side install)"
 runbook_substitute 7 staging-build-under-test "the staged build under test is installed from its tarball over the global install, not from the registry by version"
-# The release candidate's client, swapped in and checked by the image's check.
+# The release's client, checked by the image's check.
 # The scenario HOME still runs 0.10.0 here, so the check, which probes the
 # first agent-director on PATH and Client.create() under HOME, runs with a
-# HOME of its own and the release candidate's binary first on PATH.
-mkdir "${SCENARIO_ROOT}/rc-check-home" || fail "step 7: could not create the check's HOME"
-if ! env HOME="${SCENARIO_ROOT}/rc-check-home" PATH="$(dirname -- "${SCENARIO_RC_BIN}"):${PATH}" \
-    "${RC_CLIENT_CHECK}" --package "${CSCB_PKG_DIR}" > "${SCENARIO_ROOT}/rc-client-check.out" 2>&1; then
-    sed 's/^/  | /' "${SCENARIO_ROOT}/rc-client-check.out" >&2
-    fail "step 7: the release-candidate client check on ${CSCB_PKG_DIR} failed: $(grep -m1 '^ERROR:' "${SCENARIO_ROOT}/rc-client-check.out" || echo 'no ERROR line')"
+# HOME of its own and the release's binary first on PATH.
+mkdir "${SCENARIO_ROOT}/ad-check-home" || fail "step 7: could not create the check's HOME"
+if ! env HOME="${SCENARIO_ROOT}/ad-check-home" PATH="$(dirname -- "${SCENARIO_RELEASE_BIN}"):${PATH}" \
+    "${REL_CLIENT_CHECK}" --package "${CSCB_PKG_DIR}" > "${SCENARIO_ROOT}/ad-client-check.out" 2>&1; then
+    sed 's/^/  | /' "${SCENARIO_ROOT}/ad-client-check.out" >&2
+    fail "step 7: the release's client check on ${CSCB_PKG_DIR} failed: $(grep -m1 '^ERROR:' "${SCENARIO_ROOT}/ad-client-check.out" || echo 'no ERROR line')"
 fi
-record "$(cat "${SCENARIO_ROOT}/rc-client-check.out")"
+record "$(cat "${SCENARIO_ROOT}/ad-client-check.out")"
 # The CLI at the one install path is the build under test's from here on.
 export SCENARIO_CLI="${CSCB_CLI}"
 RUNBOOK_PKG="${CSCB_PKG_DIR}"
-record "installed: ${PKG_NAME} ${STAGED_VERSION} at ${CSCB_PKG_DIR} (CLI ${CSCB_CLI}), the release candidate's client"
+record "installed: ${PKG_NAME} ${STAGED_VERSION} at ${CSCB_PKG_DIR} (CLI ${CSCB_CLI}), the release's client"
 no_bot_server "step 7: nothing is started"
 
 write_config < "${STAGED_CONFIG}"
@@ -1405,15 +1405,15 @@ record "store backup: ${STORE_BACKUP} (sqlite3 .backup; integrity check ok)"
 
 install_ticks="$(_scenario_proc_starttime "${BASHPID}")"
 [[ "${install_ticks}" =~ ^[0-9]+$ ]] || fail "step 8: could not read the time before the install"
-install_ad_rc "step 8: install agent-director Phase 1"
+install_ad_release "step 8: install agent-director Phase 1"
 ad_capture version
 (( AD_RC == 0 )) || fail "step 8: agent-director version exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
 got="$(jq -r '.version // empty' "${AD_OUT}")"
-[[ "${got}" == "${RC_VERSION}" && "$(jq -r '.commit // empty' "${AD_OUT}")" == "${RC_COMMIT}" ]] \
-    || fail "step 8: agent-director version reports '${got}', not the release candidate's ${RC_VERSION} (${RC_COMMIT})"
+[[ "${got}" == "${REL_VERSION}" && "$(jq -r '.commit // empty' "${AD_OUT}")" == "${REL_COMMIT}" ]] \
+    || fail "step 8: agent-director version reports '${got}', not the release's ${REL_VERSION} (${REL_COMMIT})"
 real_v="$("${HOME}/.agent-director/bin/agent-director.real" version | jq -r '.version // empty')"
-[[ "${real_v}" == "${RC_VERSION}" ]] || fail "step 8: the binary behind the shim reports '${real_v}', not ${RC_VERSION}"
-runbook_substitute 8 rc-install-script "the Phase 1 install is the release candidate's install.sh, run in the scenario HOME, then the re-shim; the serve restart and start-time check cover the container's agent-director processes"
+[[ "${real_v}" == "${REL_VERSION}" ]] || fail "step 8: the binary behind the shim reports '${real_v}', not ${REL_VERSION}"
+runbook_substitute 8 release-install-script "the Phase 1 install is the release's install.sh, run in the scenario HOME, then the re-shim; the serve restart and start-time check cover the container's agent-director processes"
 [[ ! -e "${HOME}/.agent-director/config.toml" ]] || fail "step 8: a config.toml was written; the scenario writes no [tmux] table"
 older=()
 count=0
@@ -1428,7 +1428,7 @@ for proc in /proc/[0-9]*; do
     (( st >= install_ticks )) || older+=("${pid}")
 done
 (( ${#older[@]} == 0 )) || fail "step 8: agent-director process(es) older than the install still run: ${older[*]}"
-record "agent-director ${got} (${RC_COMMIT}); ${count} agent-director process(es) of the scenario run, none older than the install"
+record "agent-director ${got} (${REL_COMMIT}); ${count} agent-director process(es) of the scenario run, none older than the install"
 
 read_settings "${CSCB_PKG_DIR}" "${SCENARIO_ROOT}/settings-step8"
 check_windows "step 8"
@@ -2223,11 +2223,11 @@ done < "${LEG_C_LOG}"
 (( probes >= 1 )) || fail "leg C: no version probe reached the shim: the refused server never read agent-director's version"
 record "leg C: ${probes} version probe(s), no other agent-director call; nothing reached the Slack stub; no server left running; no tmux session"
 
-# The release candidate back behind the shim (the swap checks the shim).
-swap_ad_binary rc "leg C: the release candidate back behind the shim"
-cmp -s -- "${SCENARIO_RC_BIN}" "${HOME}/.agent-director/bin/agent-director.real" \
-    || fail "leg C: the binary behind the shim is not the release candidate's"
-record "leg C: the release candidate ${RC_VERSION} back behind the shim"
+# The release back behind the shim (the swap checks the shim).
+swap_ad_binary release "leg C: the release back behind the shim"
+cmp -s -- "${SCENARIO_RELEASE_BIN}" "${HOME}/.agent-director/bin/agent-director.real" \
+    || fail "leg C: the binary behind the shim is not the release's"
+record "leg C: the release ${REL_VERSION} back behind the shim"
 
 # ---------------------------------------------------------------------------
 # Closing

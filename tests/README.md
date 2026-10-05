@@ -359,7 +359,7 @@ section. Every record a step asks for goes to the switch-over log.
 | 2 | `autostart-skipped` |
 | 3 to 6 | none |
 | 7 | `staging-build-under-test`, `slack-fixtures` |
-| 8 | `install-gate-fixture`, `harness-stops-agents`, `rc-install-script`, `container-settings` |
+| 8 | `install-gate-fixture`, `harness-stops-agents`, `release-install-script`, `container-settings` |
 | 9 | `no-agents-restarted` |
 | 10 | `prompt-wording-skipped`, `autostart-skipped`, `container-list`, `install-gate-fixture` |
 | 11 | `expire-skipped`, `prompt-wording-skipped` |
@@ -368,15 +368,16 @@ Points where the script meets the runbook:
 
 - Step 3 runs the old package's own `stop --stop-bots` through the old CLI
   (`cscb_run`), against the seeded fleet on 0.10.0.
-- Step 7 installs the build under test over the same install path, swaps in
-  the release candidate's client and checks it, then exports `SCENARIO_CLI`
+- Step 7 installs the build under test over the same install path, checks
+  the release's client it resolves with the image's
+  `ad-client-check.sh --package`, then exports `SCENARIO_CLI`
   as that path's CLI, so later starts and the trap's stop use the new build.
   Each persona's credentials file is written by the new CLI's `credentials`
   command, run with a generated `curl` wrapper first on its PATH that sends
   its Slack API calls to the stub (declared as `slack-fixtures`).
 - Step 8 takes the store's online backup with `ad_store_backup`, then runs
-  the release candidate's `install.sh` in the scenario HOME and re-shims
-  (`install_ad_rc`). It reads the settings again through
+  the release's `install.sh` in the scenario HOME and re-shims
+  (`install_ad_release`). It reads the settings again through
   `switch-over.ts settings` on the installed build and checks that a `get` of
   each seeded row shows no `launch_started_at`.
 - Step 10 starts the new CSCB live through the CLI at the install path, each
@@ -524,7 +525,7 @@ installed package's `PHASE1_FLOOR_VERSION`. Each check is its own `fail`:
   delete from any parent and on any harness call, and needs at least one
   `version` probe.
 
-`swap_ad_binary rc` then puts the release candidate back behind the shim,
+`swap_ad_binary release` then puts the release back behind the shim,
 checked against the image's binary. The `version` probes of leg A's and leg
 B's servers are `assert_no_cscb_include_finished`'s positive control.
 
