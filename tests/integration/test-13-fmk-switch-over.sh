@@ -108,8 +108,9 @@
 #   5   a read-only `tmux ls`: no old session, no live old row.
 #   6   not needed (no leftover with a row), recorded.
 #   7   the build under test installed over the same install path (no
-#       side-by-side path); the release's client checked with the image's
-#       check (ad-client-check.sh --package); nothing started; the persona
+#       side-by-side path), the global install's agent-director override
+#       first pointed at the image's release client tarball; the release's
+#       client checked with the image's check (ad-client-check.sh --package); nothing started; the persona
 #       configuration put in place as config.json; each persona's credentials
 #       file written by the new CLI's `credentials`; the crontable targets and
 #       `/interject` callers rewritten to name personas; the new install check
@@ -1279,6 +1280,17 @@ record "not needed: step 5 found no leftover with a row"
 # ---------------------------------------------------------------------------
 
 runbook_step 7
+# The release's client in place of 0.10.0's: the global install's override
+# now names the image's release client tarball (the npm tarball the base
+# fetched and pinned), so the build under test resolves the release's client
+# as an operator's install from the registry would.
+REL_CLIENT_TGZ="$(jq -r '.client_tarball // empty' "${REL_RELEASE_JSON}")" \
+    || fail "step 7: could not read ${REL_RELEASE_JSON}"
+[[ -f "${REL_CLIENT_TGZ}" ]] || fail "step 7: the release's client tarball '${REL_CLIENT_TGZ}' is missing from the image"
+global_pkg_json="$(jq --arg ad "file:${REL_CLIENT_TGZ}" '.overrides["agent-director"] = $ad' \
+    "${CSCB_GLOBAL}/install/global/package.json")" \
+    || fail "step 7: could not read the global install's package.json"
+write_file "${CSCB_GLOBAL}/install/global/package.json" <<< "${global_pkg_json}"
 global_install "${PACKAGE_TGZ}" || fail "step 7: the global install of ${PACKAGE_TGZ} failed"
 [[ "$(jq -r '.version' "${CSCB_PKG_DIR}/package.json")" == "${STAGED_VERSION}" ]] \
     || fail "step 7: ${CSCB_PKG_DIR} is not the staged ${STAGED_VERSION}"

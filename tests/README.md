@@ -368,9 +368,10 @@ Points where the script meets the runbook:
 
 - Step 3 runs the old package's own `stop --stop-bots` through the old CLI
   (`cscb_run`), against the seeded fleet on 0.10.0.
-- Step 7 installs the build under test over the same install path, checks
-  the release's client it resolves with the image's
-  `ad-client-check.sh --package`, then exports `SCENARIO_CLI`
+- Step 7 points the global install's agent-director override at the
+  image's release client tarball, installs the build under test over the
+  same install path, checks the release's client it resolves with the
+  image's `ad-client-check.sh --package`, then exports `SCENARIO_CLI`
   as that path's CLI, so later starts and the trap's stop use the new build.
   Each persona's credentials file is written by the new CLI's `credentials`
   command, run with a generated `curl` wrapper first on its PATH that sends
