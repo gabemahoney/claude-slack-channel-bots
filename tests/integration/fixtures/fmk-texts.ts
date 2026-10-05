@@ -115,6 +115,70 @@
  *   tmuxUnresponsiveOnsetText <key>  the `tmux-unresponsive` onset's body
  *                                    (src/persona-episodes.ts), for absence
  *                                    checks
+ * Scenarios 16 and 15, an upgrade's start sweep with one failing kill and a
+ * persona removal whose kill fails (test-14; b.jg5 SRJ-1417, SRJ-714,
+ * SRJ-715, SRJ-801, SRJ-802, SRJ-1003, SRJ-1007, SRJ-1013, SRJ-1020):
+ *   SERVICE_LABEL, PERSONA_LABEL_KEY the `service` label CSCB's rows carry and
+ *                                    the `persona` label's key
+ *                                    (src/persona-identity.ts)
+ *   personaTmuxSessionName <key>     a persona's own tmux session name
+ *                                    (src/persona-identity.ts)
+ *   PENDING_FILE_SUFFIX              the suffixes of the pending file and the
+ *   APPLY_FILE_SUFFIX                confirmation beside config.json
+ *                                    (src/reload.ts)
+ *   PERSONA_TEARDOWN_NOTICE_LABEL    the persona teardown's startup-errors
+ *                                    class (src/kill-failure-alert.ts)
+ *   RETIRED_KEYS_FILE_NAME           the retired-key record's file name, its
+ *   retiredKeysPath <state-dir>      path in the server's state directory
+ *   RETIRED_KEY_CAUSE_REMOVED        and the causes `removed` and
+ *   RETIRED_KEY_CAUSE_ABSENT_AT_START `absent-at-start` (src/retired-keys.ts)
+ *   startSweepKillFailedEntry.pre-persona <instance-id> <state> <session> <description>
+ *                                    the start sweep's `orphan-cleanup` entry
+ *                                    head for a pre-persona row (no `persona`
+ *                                    label), as `startSweepKillFailedEntry`
+ *                                    above; its alert is
+ *                                    `killFailureAlertEntryText.start-sweep`
+ *                                    with the row's instance id
+ *   startSweepKillSucceededLine.head <instance-id> <persona>
+ *   startSweepKillSucceededLine.pre-persona-head <instance-id>
+ *   startSweepKillSucceededLine.tail <instance-id>
+ *                                    the parts of the start sweep's per-row
+ *                                    line for a kill whose success stands
+ *                                    (`startSweepKillSucceededLine`,
+ *                                    src/session-manager.ts) before and after
+ *                                    the outcome: for a swept row (<persona>
+ *                                    as the line names it: an absent
+ *                                    persona's label value) or a pre-persona
+ *                                    row
+ *   startSweepSummaryLine <listed> <killed> <kept> <kill-failed> <recorded-as-retired> <left-for-latch>
+ *                                    the start sweep's summary line for those
+ *                                    counts (src/session-manager.ts)
+ *   startSweepSummaryLine.head       its fixed part before the first count
+ *   startSweepLatchedFromOwnRowLine.launch-start-not-recorded <name> <instance-id>
+ *                                    the start sweep's line for the persona
+ *                                    named <name> latched from its own listed
+ *                                    row with the case "launch start not
+ *                                    recorded" (src/session-manager.ts,
+ *                                    LATCH_CASE_LAUNCH_START_NOT_RECORDED,
+ *                                    src/conflict-latch.ts)
+ *   launchStartNotRecordedNoticeText <key>
+ *                                    the launch-start-not-recorded post's body
+ *                                    for persona <key>, naming its session
+ *                                    (src/conflict-latch.ts); the posted text
+ *                                    is `formatPersonaNotice` above, then this
+ *   personaTeardownNoticeEntryText.kill-failure <name> <session> <description>
+ *                                    the kill-failure alert's ordinary version
+ *                                    on the persona-teardown route, in its
+ *                                    `persona-teardown-notice` entry form: the
+ *                                    persona named <name>, "raised during its
+ *                                    teardown", then the alert for its own row
+ *                                    and <session> with that route's closing
+ *                                    sentence, unescaped
+ *                                    (`personaTeardownNoticeEntryText`,
+ *                                    src/persona-notifier.ts; the alert as
+ *                                    `killFailureAlertEntryText.start-sweep`
+ *                                    builds it, with context
+ *                                    KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN)
  *
  * SPDX-License-Identifier: MIT
  */
@@ -246,6 +310,32 @@ async function killRetryEndLineParts(instanceId: string): Promise<{ readonly hea
   return around(line, await describeKillOutcome(outcome), 'killRetryEndLine')
 }
 
+/**
+ * A stand-in count, for the entry that cuts the start sweep's summary line
+ * at its first count: found once in the line it is put in.
+ */
+const COUNT_STAND_IN = 918273645
+
+/** `<n>` as a whole number from 0. */
+function count(raw: string): number {
+  const n = Number(raw)
+  if (!/^[0-9]+$/.test(raw) || !Number.isSafeInteger(n)) throw new PrinterFailure(`count '${raw}' is not a whole number from 0`, USAGE_EXIT)
+  return n
+}
+
+/**
+ * The start sweep's line for a kill whose success stands
+ * (`startSweepKillSucceededLine`, src/session-manager.ts) for `instanceId`
+ * (named `persona`; none for a pre-persona row), cut around its outcome
+ * (`describeKillOutcome` of a kill that answered `kill_sent` true).
+ */
+async function startSweepKillSucceededParts(instanceId: string, persona: string | undefined): Promise<{ readonly head: string; readonly tail: string }> {
+  const killOutcomeOf = await fn<(settled: { result: unknown }) => unknown>('checked-kill.ts', 'killOutcomeOf')
+  const outcome = killOutcomeOf({ result: { kill_sent: true } })
+  const line = (await fn<(id: string, p: string | undefined, o: unknown) => string>('session-manager.ts', 'startSweepKillSucceededLine'))(instanceId, persona, outcome)
+  return around(line, await describeKillOutcome(outcome), 'startSweepKillSucceededLine')
+}
+
 /** The ordinary alert's content for `description` (`killFailureAlertContentOf`). */
 async function ordinaryContent(instanceId: string, session: string, description: string): Promise<unknown> {
   const ordinary = await value('kill-retry.ts', 'KILL_RETRY_ALERT_ORDINARY')
@@ -336,6 +426,95 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   tmuxUnresponsiveOnsetText: {
     args: ['key'],
     print: async ([key]) => (await fn<(k: string) => string>('persona-episodes.ts', 'tmuxUnresponsiveOnsetText'))(key),
+  },
+  // Scenarios 16 and 15 (test-14; b.jg5 SRJ-1417, SRJ-714, SRJ-715).
+  SERVICE_LABEL: { args: [], print: () => text('persona-identity.ts', 'SERVICE_LABEL') },
+  PERSONA_LABEL_KEY: { args: [], print: () => text('persona-identity.ts', 'PERSONA_LABEL_KEY') },
+  personaTmuxSessionName: {
+    args: ['key'],
+    print: async ([key]) => (await fn<(k: string) => string>('persona-identity.ts', 'personaTmuxSessionName'))(key),
+  },
+  PENDING_FILE_SUFFIX: { args: [], print: () => text('reload.ts', 'PENDING_FILE_SUFFIX') },
+  APPLY_FILE_SUFFIX: { args: [], print: () => text('reload.ts', 'APPLY_FILE_SUFFIX') },
+  PERSONA_TEARDOWN_NOTICE_LABEL: { args: [], print: () => text('kill-failure-alert.ts', 'PERSONA_TEARDOWN_NOTICE_LABEL') },
+  RETIRED_KEYS_FILE_NAME: { args: [], print: () => text('retired-keys.ts', 'RETIRED_KEYS_FILE_NAME') },
+  retiredKeysPath: {
+    args: ['state-dir'],
+    print: async ([stateDir]) => (await fn<(dir: string) => string>('retired-keys.ts', 'retiredKeysPath'))(stateDir),
+  },
+  RETIRED_KEY_CAUSE_REMOVED: { args: [], print: () => text('retired-keys.ts', 'RETIRED_KEY_CAUSE_REMOVED') },
+  RETIRED_KEY_CAUSE_ABSENT_AT_START: { args: [], print: () => text('retired-keys.ts', 'RETIRED_KEY_CAUSE_ABSENT_AT_START') },
+  'startSweepKillFailedEntry.pre-persona': {
+    args: ['instance-id', 'state', 'session', 'description'],
+    print: async ([instanceId, state, session, description]) => {
+      const outcome = await describeKillOutcome(await killFailedOutcome(description))
+      const entry = await fn<(input: object) => string>('session-manager.ts', 'startSweepKillFailedEntry')
+      return entry({ instanceId, state, session, outcome, stoppedAtShutdown: false })
+    },
+  },
+  'startSweepKillSucceededLine.head': {
+    args: ['instance-id', 'persona'],
+    print: async ([instanceId, persona]) => (await startSweepKillSucceededParts(instanceId, persona)).head,
+  },
+  'startSweepKillSucceededLine.pre-persona-head': {
+    args: ['instance-id'],
+    print: async ([instanceId]) => (await startSweepKillSucceededParts(instanceId, undefined)).head,
+  },
+  'startSweepKillSucceededLine.tail': {
+    args: ['instance-id'],
+    print: async ([instanceId]) => (await startSweepKillSucceededParts(instanceId, undefined)).tail,
+  },
+  startSweepSummaryLine: {
+    args: ['listed', 'killed', 'kept', 'kill-failed', 'recorded-as-retired', 'left-for-latch'],
+    print: async ([listed, killed, kept, killFailed, recorded, left]) => {
+      const summary = await fn<(result: object) => string>('session-manager.ts', 'startSweepSummaryLine')
+      return summary({
+        listed: count(listed),
+        killed: count(killed),
+        kept: count(kept),
+        killFailed: count(killFailed),
+        recordedAsRetired: count(recorded),
+        leftForLatch: count(left),
+      })
+    },
+  },
+  'startSweepSummaryLine.head': {
+    args: [],
+    print: async () => {
+      const summary = await fn<(result: object) => string>('session-manager.ts', 'startSweepSummaryLine')
+      const line = summary({ listed: COUNT_STAND_IN, killed: 0, kept: 0, killFailed: 0, recordedAsRetired: 0, leftForLatch: 0 })
+      return around(line, String(COUNT_STAND_IN), 'startSweepSummaryLine').head
+    },
+  },
+  'startSweepLatchedFromOwnRowLine.launch-start-not-recorded': {
+    args: ['name', 'instance-id'],
+    print: async ([name, instanceId]) => {
+      const ref = (await fn<(n: string) => string>('persona-identity.ts', 'renderPersonaRef'))(name)
+      const latchCase = await text('conflict-latch.ts', 'LATCH_CASE_LAUNCH_START_NOT_RECORDED')
+      return (await fn<(r: string, id: string, c: string) => string>('session-manager.ts', 'startSweepLatchedFromOwnRowLine'))(ref, instanceId, latchCase)
+    },
+  },
+  launchStartNotRecordedNoticeText: {
+    args: ['key'],
+    print: async ([key]) => (await fn<(k: string) => string>('conflict-latch.ts', 'launchStartNotRecordedNoticeText'))(key),
+  },
+  'personaTeardownNoticeEntryText.kill-failure': {
+    args: ['name', 'session', 'description'],
+    print: async ([name, session, description]) => {
+      const key = (await fn<(n: string) => string>('persona-identity.ts', 'personaKey'))(name)
+      const instanceId = (await fn<(k: string) => string>('persona-identity.ts', 'personaInstanceId'))(key)
+      const context = await value('kill-failure-alert.ts', 'KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN')
+      const route = await ordinaryRoute(context, false)
+      const alert = await alertText(await ordinaryContent(instanceId, session, description), route.closing, false)
+      // The persona notifier's teardown window writes the text with Slack's
+      // control-character escapes undone (src/persona-notifier.ts writeTeardownNotice).
+      const unescaped = (await fn<(t: string) => string>('slack-text-escape.ts', 'unescapeSlackControlCharacters'))(alert)
+      const ref = (await fn<(n: string, k: string) => string>('persona-identity.ts', 'renderPersonaRef'))(name, key)
+      const entry = await fn<(personaRef: string, text: string) => string>('persona-notifier.ts', 'personaTeardownNoticeEntryText')
+      // The window's persona reference, `persona <ref>` (src/persona-notifier.ts
+      // teardownRef; no exported builder).
+      return entry(`persona ${ref}`, unescaped)
+    },
   },
 }
 

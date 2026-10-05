@@ -118,6 +118,20 @@
 #                    other command prints nothing) and leave the session; other
 #                    commands run. After a change to `log`, the next call
 #                    kills the session.
+#   fail_kill_targets
+#                    `fail-kill` limited to a target list (a harness addition,
+#                    confirm at the reconcile pass): `tmux_shim_mode fail-kill
+#                    --targets` writes the mode line, then one target per line;
+#                    a kill-pane of the listed pane id, a kill-session of the
+#                    listed session id (alone, in a flag cluster and in a
+#                    chained call) and, with the session's name listed, a kill
+#                    by `=name` and `name:` each exit 1 with one `tmux-shim:`
+#                    line and leave the session, while a kill of an unlisted
+#                    pane runs and ends its session; each call adds its one log
+#                    line first. The setter refuses --targets with another
+#                    mode, no target and an empty one, changing nothing; a
+#                    list beside mode `log` runs nothing (exit 70); after
+#                    `log` the next kill runs.
 #   fail_create      at the shim: `new-session`, its alias `new` and a call
 #                    with no command (tmux's default new-session) each exit 1
 #                    with no standard output and one `tmux-shim:` line on
@@ -1698,6 +1712,93 @@ leg_fail_kill() {
     shim_call fk-log kill-session -t "=${session}"
     (( SHIM_RC == 0 )) || fail "${step}: kill-session in log mode, right after the change, exited ${SHIM_RC}"
     ! has_session "${session}" || fail "${step}: kill-session in log mode left the session"
+}
+
+# fk_ids <session>: print the session's id and its pane's id, `$N %N` (asked
+# with the real tmux).
+fk_ids() {
+    "${SCENARIO_REAL_TMUX}" display-message -p -t "=$1:" '#{session_id} #{pane_id}'
+}
+
+# fk_call <name> <arg>...: `shim_call`, failing unless the call added exactly
+# one `call` line to the tmux shim's log (written before the mode acts).
+fk_call() {
+    local name="$1" before
+    shift
+    before="$(call_count "${SCENARIO_TMUX_SHIM_LOG}")"
+    shim_call "${name}" "$@"
+    [[ "$(call_count "${SCENARIO_TMUX_SHIM_LOG}")" == "$(( before + 1 ))" ]] \
+        || fail "fail-kill targets: the call ${name} did not add exactly one call line to the shim's log"
+}
+
+# True when the scenario's tmux server holds no session named exactly <name>.
+fk_no_session() {
+    ! has_session "$1"
+}
+
+# fail-kill's target list (a harness addition, confirm at the reconcile pass).
+leg_fail_kill_targets() {
+    local step="fail-kill targets" listed="t0-fk-listed" other="t0-fk-other" ids sid pane other_pane want
+    "${SCENARIO_REAL_TMUX}" new-session -d -s "${listed}" -- sleep 600 || fail "${step}: could not make ${listed}"
+    "${SCENARIO_REAL_TMUX}" new-session -d -s "${other}" -- sleep 600 || fail "${step}: could not make ${other}"
+    ids="$(fk_ids "${listed}")" || fail "${step}: could not read ${listed}'s ids"
+    read -r sid pane <<< "${ids}"
+    ids="$(fk_ids "${other}")" || fail "${step}: could not read ${other}'s ids"
+    read -r _ other_pane <<< "${ids}"
+
+    # The setter writes the mode line, then one target per line.
+    tmux_shim_mode fail-kill --targets "${sid}" "${pane}"
+    want="$(printf 'fail-kill\n%s\n%s' "${sid}" "${pane}")"
+    [[ "$(cat "${SCENARIO_TMUX_SHIM_MODE_FILE}")" == "${want}" ]] \
+        || fail "${step}: the mode file holds '$(tr '\n' '|' < "${SCENARIO_TMUX_SHIM_MODE_FILE}")', not the mode and both targets"
+
+    # A kill aimed at a listed target, in agent-director's forms, a flag
+    # cluster's and a chained call's: refused, nothing killed.
+    fk_call fkt-pane -u kill-pane -t "${pane}"
+    expect_shim_refused "${step}: kill-pane -t ${pane}"
+    fk_call fkt-session -u kill-session -t "${sid}"
+    expect_shim_refused "${step}: kill-session -t ${sid}"
+    fk_call fkt-cluster kill-session -Ct"${sid}"
+    expect_shim_refused "${step}: kill-session -Ct${sid}"
+    fk_call fkt-chained display-message -p -t "${listed}" '#{session_name}' ';' kill-session -t "${sid}"
+    expect_shim_refused "${step}: a chained call holding a listed kill"
+    has_session "${listed}" || fail "${step}: a refused kill killed ${listed}"
+    [[ "$(fk_ids "${listed}")" == "${sid} ${pane}" ]] || fail "${step}: ${listed}'s pane changed under a refused kill"
+
+    # A kill aimed at an unlisted target runs the real tmux.
+    fk_call fkt-other-pane kill-pane -t "${other_pane}"
+    (( SHIM_RC == 0 )) || fail "${step}: kill-pane of the unlisted ${other_pane} exited ${SHIM_RC}: $(cat "${SHIM_ERR}")"
+    wait_until 10 "${step}: kill-pane of the unlisted ${other_pane} left ${other}" fk_no_session "${other}"
+    has_session "${listed}" || fail "${step}: the unlisted kill killed ${listed}"
+
+    # A listed session name matches `=name` and `name:`.
+    tmux_shim_mode fail-kill --targets "${listed}"
+    fk_call fkt-name-eq kill-session -t "=${listed}"
+    expect_shim_refused "${step}: kill-session -t =${listed}"
+    fk_call fkt-name-colon kill-pane -t "${listed}:"
+    expect_shim_refused "${step}: kill-pane -t ${listed}:"
+    has_session "${listed}" || fail "${step}: a refused kill by name killed ${listed}"
+
+    # The setter's refusals leave the mode file as it was.
+    want="$(cat "${SCENARIO_TMUX_SHIM_MODE_FILE}")"
+    expect_fails_in_home "${step}" "${HOME}" "tmux_shim_mode: only fail-kill takes --targets" tmux_shim_mode log --targets "${sid}"
+    expect_fails_in_home "${step}" "${HOME}" "tmux_shim_mode: --targets names no target" tmux_shim_mode fail-kill --targets
+    expect_fails_in_home "${step}" "${HOME}" "is empty or holds a control character" tmux_shim_mode fail-kill --targets ""
+    [[ "$(cat "${SCENARIO_TMUX_SHIM_MODE_FILE}")" == "${want}" ]] || fail "${step}: a refused tmux_shim_mode changed the mode file"
+
+    # A list beside another mode: the shim runs nothing and exits 70.
+    printf 'log\n%s\n' "${sid}" | write_file "${SCENARIO_TMUX_SHIM_MODE_FILE}"
+    fk_call fkt-list-log kill-session -t "${sid}"
+    (( SHIM_RC == 70 )) && grep -q '^tmux-shim: ' "${SHIM_ERR}" \
+        || fail "${step}: a list beside mode log gave exit ${SHIM_RC}: $(cat "${SHIM_ERR}")"
+    has_session "${listed}" || fail "${step}: the refused call killed ${listed}"
+
+    # Back to `log`: the next kill runs.
+    tmux_shim_mode log
+    [[ "$(cat "${SCENARIO_TMUX_SHIM_MODE_FILE}")" == log ]] || fail "${step}: tmux_shim_mode log left the list in the mode file"
+    fk_call fkt-log kill-session -t "${sid}"
+    (( SHIM_RC == 0 )) || fail "${step}: kill-session in log mode exited ${SHIM_RC}"
+    ! has_session "${listed}" || fail "${step}: kill-session in log mode left ${listed}"
 }
 
 leg_fail_create() {
@@ -3306,6 +3407,7 @@ LEGS=(
     shim_check
     tmux_shim_log
     fail_kill
+    fail_kill_targets
     fail_create
     slow_create
     wedge

@@ -589,6 +589,16 @@
 #                                      slow-create, wedge; `log` from setup on), and for slow-create
 #                                      or wedge its delay in seconds (the shim's defaults: 15, 60),
 #                                      by an atomic write of the mode file; the next call reads it
+#   tmux_shim_mode fail-kill --targets <target>...
+#                                      (a harness addition, confirm at the reconcile pass)
+#                                      `fail-kill` limited to the targets given (session names,
+#                                      session ids `$N`, pane ids `%N`): the mode file holds the mode
+#                                      line, then one target per line, written atomically; only a
+#                                      kill-session or kill-pane aimed at a listed target fails, and
+#                                      every other call runs the real tmux (the shim's header states
+#                                      the matching). Refuses --targets with another mode, no target,
+#                                      and an empty target or one holding a control character. A
+#                                      later `tmux_shim_mode` call replaces the list
 #
 #   Closing assertions and CSCB's agent-director calls (fmk mode; see "Closing assertions").
 #   Each reads SCENARIO_TMUX_SHIM_LOG, SCENARIO_AD_SHIM_LOG and SCENARIO_CSCB_RECORD (a
@@ -1689,7 +1699,24 @@ cscb_run() {
 
 tmux_shim_mode() {
     local mode="${1:-}" delay="${2:-}" m known=0
+    local t text
     [[ "${SCENARIO_FMK}" == 1 ]] || fail "tmux_shim_mode: the tmux shim is for fmk scripts only"
+    # fail-kill's target list (a harness addition, confirm at the reconcile
+    # pass): `fail-kill --targets <target>...`, one target per line after
+    # the mode line.
+    if [[ "${delay}" == --targets ]]; then
+        [[ "${mode}" == fail-kill ]] || fail "tmux_shim_mode: only fail-kill takes --targets"
+        (( $# > 2 )) || fail "tmux_shim_mode: --targets names no target"
+        shift 2
+        text="${mode}"
+        for t in "$@"; do
+            [[ -n "${t}" && "${t}" != *[[:cntrl:]]* ]] \
+                || fail "tmux_shim_mode: target '${t}' is empty or holds a control character"
+            text+=$'\n'"${t}"
+        done
+        write_file "${SCENARIO_TMUX_SHIM_MODE_FILE}" <<< "${text}"
+        return 0
+    fi
     for m in "${SCENARIO_TMUX_SHIM_MODES[@]}"; do
         [[ "${m}" == "${mode}" ]] && known=1
     done

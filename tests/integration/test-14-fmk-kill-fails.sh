@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# Test 14 (HO §7 scenario 2; b.jg5 SRJ-1403; AC 24, AC 64): a kill that
-# really fails. With the tmux shim in `fail-kill`, a live row's agent-director
-# `kill` finds its worker still running after the kill exit wait and answers
-# ErrTmuxKillFailed, at the start sweep, at a `config_dir` mismatch and at a
-# `cwd` mismatch. At each site no CSCB delete or launch follows, the row is
-# kept, and one kill-failure alert quoting agent-director's description is
-# routed per SRJ-704 (b.jg5 SRJ-704, SRJ-705, SRJ-707, SRJ-411, SRJ-714,
-# SRJ-1002, SRJ-1007, SRJ-1013, SRJ-1014, SRJ-1401, SRJ-1418).
+# Test 14 (HO §7 scenarios 16, 2 and 15; b.jg5 SRJ-1403, SRJ-1417; AC 1,
+# AC 24, AC 64): a kill that really fails. With the tmux shim in `fail-kill`,
+# a live row's agent-director `kill` finds its worker still running after the
+# kill exit wait and answers ErrTmuxKillFailed: at an upgrade's first start
+# sweep over pre-persona rows (scenario 16), at the start sweep, at a
+# `config_dir` mismatch and at a `cwd` mismatch (scenario 2), and at a
+# persona removal's teardown (scenario 15). At each site no CSCB delete or
+# launch follows, the row is kept, and one kill-failure alert quoting
+# agent-director's description is routed per SRJ-704 (b.jg5 SRJ-704,
+# SRJ-705, SRJ-707, SRJ-411, SRJ-513, SRJ-714, SRJ-715, SRJ-801, SRJ-802,
+# SRJ-803, SRJ-1002, SRJ-1003, SRJ-1007, SRJ-1013, SRJ-1014, SRJ-1020,
+# SRJ-1401, SRJ-1418).
 #
 # fmk setup (lib/scenario.sh fmk mode; b.jg5 SRJ-1306, SRJ-1401):
 # - its own HOME, agent-director store and tmux server, all under
@@ -14,10 +18,11 @@
 #   tmux shim first on the PATH of every CSCB process (the bot server, `start`
 #   and `stop` runs), which agent-director inherits;
 # - the 0.10.0 start (SCENARIO_AD_START=0.10.0: 0.10.0's binary behind the
-#   shim, no store), then, as the script's first step, the release's
-#   install.sh over it (`install_ad_release`, which re-shims both paths and
-#   checks the shims). E47 T2's scenario 16 seeds its 0.10.0 rows before that
-#   install and runs its section right after it;
+#   shim, no store); scenario 16's rows seeded on it from the scenario's own
+#   shell (`seed_prepersona_fleet`, `seed_010_row`: 0.10.0's own `spawn`,
+#   which makes the store); then the release's install.sh over it
+#   (`install_ad_release`, which migrates the store, re-shims both paths and
+#   checks the shims), after which every leg runs on the release;
 # - agent-director at its default settings (no config.toml): kill_exit_wait_ms
 #   at its default, 5000 ms, measured (slowest exit 603 ms) (RN-6; HO rev 31);
 #   the bounded retry makes 3 tries 2 s apart (KILL_RETRY_TRIES,
@@ -29,10 +34,15 @@
 #   reconnects or relaunches a persona; posts are read from the stub's record;
 # - the tmux shim's mode per leg: `log` while a leg launches its persona,
 #   `fail-kill` for the kills the leg checks, `log` again at the leg's end;
+#   legs 0 and 4 limit `fail-kill` to one row's session name, session id and
+#   pane id (`tmux_shim_mode fail-kill --targets`, a harness addition,
+#   confirm at the reconcile pass), so every other kill runs the real tmux;
 # - the stub worker's mode per working directory (`stub_mode`): the start
 #   sweep's persona reports in (`dev-channels`, the approver's Enter), the
 #   `config_dir` and `cwd` personas never do (`silent`), so their rows stay
-#   `pending` with a launch start;
+#   `pending` with a launch start; the removed persona reports in
+#   (`dev-channels`); of the 0.10.0 rows, P's never reports in (`silent`) and
+#   the others report in at once (`at-once`, `seed_010_row`'s default);
 # - each leg has its own persona (key, credentials, channel, directories) and
 #   reads only its own ids, and only lines written after its start mark (a
 #   later start re-sweeps rows an earlier leg kept): server.log and
@@ -53,6 +63,42 @@
 #   symlink, a missing target), each leaving the link as it was.
 #
 # Legs, in run order (each a function `leg_<name>`):
+#   0. upgrade_sweep (scenario 16; SRJ-1417, SRJ-714) seeded on 0.10.0
+#                   before the install: two pre-persona rows (A and B: a
+#                   `channel` label, no `persona` label, named as the
+#                   pre-persona package names them, workers reporting in at
+#                   once); P's own row (`cscb_<P key>`, its `persona` label,
+#                   in a directory other than P's configured one, its worker
+#                   `silent`), which after the migration reads `pending` with
+#                   no launch start (SRJ-513, SRJ-1020); and absent persona
+#                   Q's live row. config.json names P (a Slack destination)
+#                   and not Q; `fail-kill` is limited to A's session and pane;
+#                   a start; once the start sweep's summary line is logged,
+#                   `log`. Then the summary's counts (4 listed, 1 recorded as
+#                   retired, 1 left for a latch, and every live stray not
+#                   killed kept with its kill failed); A's kill: each of its
+#                   KILL_RETRY_TRIES tries answered ErrTmuxKillFailed, its
+#                   session still there, exactly one `orphan-cleanup` entry
+#                   naming A (the pre-persona row's head, then the alert's
+#                   ordinary version in its start-sweep form) and one
+#                   server-log line of it; B's and Q's kills each either
+#                   succeeded (the sweep's per-row line, no entry, the
+#                   session gone) or did not (exactly one entry, the session
+#                   still there), which is logged: the release answers
+#                   ErrTmuxKillFailed with no kill sent for a 0.10.0 launch's
+#                   session, which carries no label it reads (HO rev 31 §2
+#                   (a)), and the pass's retry budget gives a later row one
+#                   try (AC 56); P latched from its own listed row, no CSCB
+#                   kill of P's row, and exactly one launch-start-not-recorded
+#                   post at P's destination; Q's key in the retired-key record
+#                   with cause `absent-at-start`; no CSCB delete; every seeded
+#                   row present (harness `get`); every running stub worker in
+#                   a session a row of the harness's `list` records; nothing
+#                   about A in the Slack stub's record. A plain stop; then the
+#                   harness plays the human acting on the alerts ("Operator
+#                   actions"): it ends each old worker's session by its
+#                   session id and runs `find-missing` until A's, B's and Q's
+#                   rows read finished, so no later start sweeps them live.
 #   1. start_sweep  persona X reports in (`log`); a plain stop; X removed from
 #                   config.json; `fail-kill`; a start. The start sweep
 #                   (`reconcileOrphans`) sweeps X's live row (absent persona)
@@ -97,6 +143,24 @@
 #                   re-point, with no start in between), and the live-row
 #                   sequence's kill fails. Then the same checks as leg 2,
 #                   for W, through one further retry.
+#   4. persona_removal (scenario 15; SRJ-1417, SRJ-715, SRJ-1003, SRJ-803)
+#                   persona R (Slack destination, `dev-channels`) is up, its
+#                   row `waiting`. `fail-kill` limited to R's session and
+#                   pane; the operator removes R from config.json and
+#                   confirms the apply by renaming the pending file to the
+#                   apply file (README "Reload"). R's teardown kill: each of
+#                   its KILL_RETRY_TRIES tries answered ErrTmuxKillFailed, its
+#                   tries ended exhausted; exactly one `persona-teardown-notice`
+#                   entry naming R, "raised during its teardown", carrying the
+#                   alert's ordinary version with the log-only closing
+#                   sentence, and one server-log line of it; no CSCB delete;
+#                   R's row present; R's key in the retired-key record with
+#                   cause `removed`; nothing about R in the Slack stub's
+#                   record after the edit, and no `tmux-unresponsive` post.
+#                   `log`; a plain stop.
+#   Rows a leg keeps are swept again by a later start (leg 1's first start,
+#   in `log`, sweeps P's row, P being absent then), so every check reads
+#   only its own ids and window.
 #   The `resume_enabled=false` site is not driven here: SRJ-1403 leaves it,
 #   with `ErrSpawnNotResumable` with dead evidence, to SRJ-110's unit test
 #   (dead evidence means the session is gone, so agent-director's kill sends
@@ -134,7 +198,25 @@
 #     src/persona-episodes.ts), for absence checks;
 #   - instance ids (`personaInstanceId`, src/persona-identity.ts; each alert's
 #     session is the one the row records, read with a harness `get`) and the
-#     last-applied record's suffix (LAST_APPLIED_FILE_SUFFIX, src/reload.ts).
+#     last-applied record's suffix (LAST_APPLIED_FILE_SUFFIX, src/reload.ts);
+#   - legs 0 and 4: the `service` label and the `persona` label's key
+#     (SERVICE_LABEL, PERSONA_LABEL_KEY) and a persona's session name
+#     (`personaTmuxSessionName`), src/persona-identity.ts, for the 0.10.0 rows;
+#     the start sweep's summary line and its fixed head
+#     (`startSweepSummaryLine`), its per-row line for a kill whose success
+#     stands (`startSweepKillSucceededLine`), its pre-persona `orphan-cleanup`
+#     entry head (`startSweepKillFailedEntry`) and its line for a persona
+#     latched from its own listed row (`startSweepLatchedFromOwnRowLine`, case
+#     LATCH_CASE_LAUNCH_START_NOT_RECORDED), src/session-manager.ts; the
+#     launch-start-not-recorded post's body (`launchStartNotRecordedNoticeText`,
+#     src/conflict-latch.ts) after the notifier's prefix; the persona
+#     teardown's class (PERSONA_TEARDOWN_NOTICE_LABEL) and its entry for the
+#     alert (`personaTeardownNoticeEntryText`, src/persona-notifier.ts); the
+#     retired-key record's path (`retiredKeysPath`) and the causes
+#     RETIRED_KEY_CAUSE_REMOVED and RETIRED_KEY_CAUSE_ABSENT_AT_START,
+#     src/retired-keys.ts (the record's `keys` and `cause` fields are its
+#     format's, SRJ-802, which exports no field name); the pending and apply
+#     files' suffixes (PENDING_FILE_SUFFIX, APPLY_FILE_SUFFIX, src/reload.ts).
 #
 # Outcomes the SRD leaves open are logged as `NOTE:` lines, not asserted: the
 # CSCB calls of a leg's id before its first kill, counted by verb, and the
@@ -151,8 +233,70 @@ SCENARIO_AD_START=0.10.0
 # shellcheck source=lib/scenario.sh
 source "$(dirname "$0")/lib/scenario.sh"
 
-# E47 T2's scenario 16 seeds its 0.10.0 rows here, before the release's
-# install, and runs its section right after it.
+# ---------------------------------------------------------------------------
+# Values from the installed package (fixtures/fmk-texts.ts)
+# ---------------------------------------------------------------------------
+
+T14_PRINTER="${SCENARIO_FIXTURES}/fmk-texts.ts"
+
+# t14_text <entry> [<arg>...]: print the printer's value for <entry>.
+t14_text() {
+    bun "${T14_PRINTER}" "$@"
+}
+
+# t14_value <var> <entry> [<arg>...]: set <var> to the printer's value; fail
+# naming the entry when the printer fails.
+t14_value() {
+    local -n t14_value_out="$1"
+    shift
+    t14_value_out="$(t14_text "$@")" || fail "the value printer failed for $*"
+}
+
+# ---------------------------------------------------------------------------
+# Scenario 16's rows, seeded on 0.10.0 before the release's install
+# ---------------------------------------------------------------------------
+
+t14_value SVC_LABEL SERVICE_LABEL
+t14_value PERSONA_LABEL PERSONA_LABEL_KEY
+
+# Two pre-persona rows (a `channel` label, no `persona` label), each with a
+# worker that reports in at once: A's kill is the one that fails, B's
+# succeeds. Their routes' channel names give their ids and session names
+# (`seed_prepersona_fleet`).
+U_CONFIG="${SCENARIO_ROOT}/prepersona-config.json"
+UA_CHANNEL="C0T14PPA"
+UB_CHANNEL="C0T14PPB"
+UA_WORK="$(make_workdir "${SCENARIO_TAG}prepersona_a")"
+UB_WORK="$(make_workdir "${SCENARIO_TAG}prepersona_b")"
+jq -n --arg a "${UA_CHANNEL}" --arg b "${UB_CHANNEL}" --arg da "${UA_WORK}" --arg db "${UB_WORK}" \
+    '{routes: {($a): {cwd: $da}, ($b): {cwd: $db}}}' > "${U_CONFIG}" || fail "setup: could not write ${U_CONFIG}"
+U_ROWS="$(seed_prepersona_fleet "${U_CONFIG}" "${UA_CHANNEL}=${SCENARIO_TAG} fails" "${UB_CHANNEL}=${SCENARIO_TAG} ends")"
+read -r _ UA_ID UA_SESSION UA_SID UA_PANE <<< "$(grep "^${UA_CHANNEL} " <<< "${U_ROWS}")"
+read -r _ UB_ID UB_SESSION _ _ <<< "$(grep "^${UB_CHANNEL} " <<< "${U_ROWS}")"
+[[ -n "${UA_PANE:-}" && -n "${UB_SESSION:-}" ]] || fail "setup: seed_prepersona_fleet printed '${U_ROWS}'"
+
+# P, which the configuration names: its own row (`cscb_<key>`, its `persona`
+# label) in a working directory other than P's configured one, with a worker
+# that never reports in, so after the migration it reads `pending` with no
+# launch start (b.jg5 SRJ-513, SRJ-1020).
+P_NAME="${SCENARIO_TAG}latched"
+P_KEY="$(persona_key "${P_NAME}")"
+t14_value P_ID personaInstanceId "${P_KEY}"
+t14_value P_SESSION personaTmuxSessionName "${P_KEY}"
+P_WORK="$(make_workdir "${SCENARIO_TAG}latched_work")"
+P_ROW_WORK="$(make_workdir "${SCENARIO_TAG}latched_row")"
+stub_mode "${P_ROW_WORK}" "${STUB_MODE_SILENT}"
+seed_010_row "${P_ID}" "${P_SESSION}" "${P_ROW_WORK}" "${SVC_LABEL}" "${PERSONA_LABEL}=${P_KEY}" > /dev/null
+
+# Q, which the configuration does not name: its live row, its worker
+# reporting in at once.
+Q_NAME="${SCENARIO_TAG}absent"
+Q_KEY="$(persona_key "${Q_NAME}")"
+t14_value Q_ID personaInstanceId "${Q_KEY}"
+t14_value Q_SESSION personaTmuxSessionName "${Q_KEY}"
+Q_WORK="$(make_workdir "${SCENARIO_TAG}absent_work")"
+seed_010_row "${Q_ID}" "${Q_SESSION}" "${Q_WORK}" "${SVC_LABEL}" "${PERSONA_LABEL}=${Q_KEY}" > /dev/null
+
 install_ad_release "setup: the release's install.sh over the 0.10.0 start"
 check_ad_shim "setup: the agent-director shim after the release's install"
 
@@ -176,29 +320,20 @@ POST_WAIT_S=60
 NO_SECOND_ALERT_HOLD_S=5
 # The Slack stub writing its ready file.
 STUB_WAIT_S=30
+# A stub process in no tmux pane ending (a short-lived run outside tmux).
+WORKER_GONE_S=10
 # Before the first pending-only retry (30 s after the launch, SRJ-302) the
 # `cwd` symlink must be re-pointed: at most this many seconds after the launch
 # start.
 REPOINT_BEFORE_S=25
 
+# A reload's preview reaching the pending file after a config.json edit (the
+# reload tick runs 5 s after the previous pass).
+RELOAD_WAIT_S=60
+
 # ---------------------------------------------------------------------------
-# Values from the installed package (fixtures/fmk-texts.ts)
+# More values from the installed package
 # ---------------------------------------------------------------------------
-
-T14_PRINTER="${SCENARIO_FIXTURES}/fmk-texts.ts"
-
-# t14_text <entry> [<arg>...]: print the printer's value for <entry>.
-t14_text() {
-    bun "${T14_PRINTER}" "$@"
-}
-
-# t14_value <var> <entry> [<arg>...]: set <var> to the printer's value; fail
-# naming the entry when the printer fails.
-t14_value() {
-    local -n t14_value_out="$1"
-    shift
-    t14_value_out="$(t14_text "$@")" || fail "the value printer failed for $*"
-}
 
 t14_value KILL_TRIES KILL_RETRY_TRIES
 t14_value PHRASE_RETRY RETRY_KILL_LATER_PHRASE
@@ -206,6 +341,12 @@ t14_value PHRASE_NEVER_DELETE NEVER_DELETE_ROW_PHRASE
 t14_value ORPHAN_LABEL ORPHAN_CLEANUP_LABEL
 t14_value LAST_APPLIED_SUFFIX LAST_APPLIED_FILE_SUFFIX
 [[ "${KILL_TRIES}" =~ ^[1-9][0-9]*$ ]] || fail "setup: KILL_RETRY_TRIES '${KILL_TRIES}' is not a whole number"
+t14_value PENDING_SUFFIX PENDING_FILE_SUFFIX
+t14_value APPLY_SUFFIX APPLY_FILE_SUFFIX
+t14_value TEARDOWN_LABEL PERSONA_TEARDOWN_NOTICE_LABEL
+t14_value CAUSE_REMOVED RETIRED_KEY_CAUSE_REMOVED
+t14_value CAUSE_ABSENT RETIRED_KEY_CAUSE_ABSENT_AT_START
+t14_value SUMMARY_HEAD startSweepSummaryLine.head
 
 # ---------------------------------------------------------------------------
 # Personas: one per leg, each with its own key, credentials and channel
@@ -247,7 +388,22 @@ W_CFG="${CFG_ROOT}/${SCENARIO_TAG}cwd_cfg"
 W_KEY="$(persona_key "${W_NAME}")"
 t14_value W_ID personaInstanceId "${W_KEY}"
 
-mkdir -p "${X_CFG}" "${C_CFG_ONE}" "${C_CFG_TWO}" "${W_CFG}"
+# Scenario 16: P's configuration (its key, row and working directories are
+# above, with the 0.10.0 seeding).
+P_LABEL="${SCENARIO_TAG}latched1"
+P_CHANNEL="C0T14LAT1"
+P_CFG="${CFG_ROOT}/${SCENARIO_TAG}latched_cfg"
+
+# Scenario 15, the persona removal: R.
+R_NAME="${SCENARIO_TAG}removed"
+R_LABEL="${SCENARIO_TAG}removed1"
+R_CHANNEL="C0T14REM1"
+R_WORK="$(make_workdir "${SCENARIO_TAG}removed_work")"
+R_CFG="${CFG_ROOT}/${SCENARIO_TAG}removed_cfg"
+R_KEY="$(persona_key "${R_NAME}")"
+t14_value R_ID personaInstanceId "${R_KEY}"
+
+mkdir -p "${X_CFG}" "${C_CFG_ONE}" "${C_CFG_TWO}" "${W_CFG}" "${P_CFG}" "${R_CFG}"
 ln -s -- "${C_CFG_ONE}" "${C_CFG_LINK}"
 ln -s -- "${W_ONE}" "${W_LINK}"
 
@@ -267,7 +423,7 @@ t14_expect_refusal "does not exist" "${C_CFG_LINK}" "${CFG_ROOT}/${SCENARIO_TAG}
 [[ "$(realpath -e -- "${C_CFG_LINK}")" == "$(realpath -e -- "${C_CFG_ONE}")" ]] \
     || fail "setup: a refused repoint_symlink changed ${C_CFG_LINK}"
 
-for t14_label in "${X_LABEL}" "${C_LABEL}" "${W_LABEL}"; do
+for t14_label in "${X_LABEL}" "${C_LABEL}" "${W_LABEL}" "${P_LABEL}" "${R_LABEL}"; do
     printf '{"bot_token": "%s", "app_token": "%s"}\n' "$(fake_token bot "${t14_label}")" "$(fake_token app "${t14_label}")" \
         | write_file "${CREDS_DIR}/${t14_label}.json" 600
 done
@@ -282,11 +438,10 @@ t14_persona_json() {
 
 T14_RECORD_ASIDE=0
 
-# t14_config_for_next_start [<persona-json>...]: the operator's edit while the
-# server is stopped: config.json holds these personas, and the last-applied
-# record is moved aside, so the next start applies config.json as it stands.
-t14_config_for_next_start() {
-    local joined="" entry record
+# t14_write_config [<persona-json>...]: the operator's edit of config.json:
+# it holds these personas.
+t14_write_config() {
+    local joined="" entry
     for entry in "$@"; do
         joined+="${joined:+, }${entry}"
     done
@@ -299,6 +454,14 @@ t14_config_for_next_start() {
   "exit_timeout": 5
 }
 EOF
+}
+
+# t14_config_for_next_start [<persona-json>...]: the operator's edit while the
+# server is stopped: config.json holds these personas, and the last-applied
+# record is moved aside, so the next start applies config.json as it stands.
+t14_config_for_next_start() {
+    local record
+    t14_write_config "$@"
     record="${SLACK_STATE_DIR}/config.json${LAST_APPLIED_SUFFIX}"
     if [[ -e "${record}" ]]; then
         T14_RECORD_ASIDE=$(( T14_RECORD_ASIDE + 1 ))
@@ -313,7 +476,7 @@ EOF
 STUB_DIR="${SCENARIO_ROOT}/slack-stub"
 STUB_RECORD="${STUB_DIR}/record.jsonl"
 mkdir "${STUB_DIR}"
-python3 - "${X_LABEL}" "${C_LABEL}" "${W_LABEL}" << 'EOF' | write_file "${STUB_DIR}/control.json"
+python3 - "${X_LABEL}" "${C_LABEL}" "${W_LABEL}" "${P_LABEL}" "${R_LABEL}" << 'EOF' | write_file "${STUB_DIR}/control.json"
 import json, sys
 print(json.dumps({
     "tokens": [{"suffix": s, "label": s, "auth": "ok", "connections": "ok"} for s in sys.argv[1:]],
@@ -578,6 +741,345 @@ t14_no_launch_since() {
     [[ "${n}" == 0 ]] || fail "$3: ${n} CSCB delete call(s) after the first failed kill"
 }
 
+# t14_count_entries <label> <fragment>...: the startup-errors entries of
+# class <label> written after the leg's mark that hold every fragment.
+t14_count_entries() {
+    local label="$1"
+    shift
+    t14_count_after "${SLACK_STATE_DIR}/startup-errors.log" "${MARK_ERRORS}" "$(matcher "] [${label}] " "$@")"
+}
+
+# t14_retired_cause <key>: print the cause the retired-key record holds for
+# <key> (nothing when the record or the key's entry is missing). The record's
+# `keys` and `cause` fields are its format's (b.jg5 SRJ-802;
+# src/retired-keys.ts serializeRetiredKeys, which exports no field name).
+t14_retired_cause() {
+    local path
+    t14_value path retiredKeysPath "${SLACK_STATE_DIR}"
+    [[ -f "${path}" ]] || return 0
+    jq -r --arg k "$1" '.keys[$k].cause // empty' "${path}"
+}
+
+# t14_stub_workers: print each running stub worker process (a process whose
+# argv holds the stub's path, ${SCENARIO_BIN}/claude) as `<pid> <session>`,
+# <session> the scenario's tmux session whose pane runs it or its parent
+# chain, `-` for none.
+t14_stub_workers() {
+    local panes="${SCENARIO_ROOT}/t14-panes.txt"
+    "${SCENARIO_REAL_TMUX}" list-panes -a -F '#{pane_pid} #{session_name}' > "${panes}" 2> /dev/null || : > "${panes}"
+    python3 - "${SCENARIO_BIN}/claude" "${panes}" << 'EOF'
+import os, sys
+stub = sys.argv[1].encode()
+panes = {}
+with open(sys.argv[2], encoding="utf-8") as f:
+    for line in f:
+        pid, _, session = line.rstrip("\n").partition(" ")
+        if pid.isdigit():
+            panes[int(pid)] = session
+def stat(pid):
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as f:
+            s = f.read()
+        fields = s[s.rindex(")") + 2:].split()
+        return fields[0], int(fields[1])
+    except (OSError, ValueError, IndexError):
+        return "", 0
+for d in os.listdir("/proc"):
+    if not d.isdigit():
+        continue
+    try:
+        with open(f"/proc/{d}/cmdline", "rb") as f:
+            argv = f.read().split(b"\0")
+    except OSError:
+        continue
+    if stub not in argv:
+        continue
+    state, _ = stat(d)
+    if state in ("", "Z", "X"):
+        continue
+    pid, session, seen = int(d), "-", 0
+    while pid > 1 and seen < 64:
+        if pid in panes:
+            session = panes[pid]
+            break
+        pid = stat(pid)[1]
+        seen += 1
+    print(d, session)
+EOF
+}
+
+# t14_proc_desc <pid>: print <pid>'s command line and its parent's (best
+# effort: nothing for a process already gone).
+t14_proc_desc() {
+    local ppid=""
+    { ppid="$(awk '{ print $4 }' "/proc/$1/stat")"; } 2> /dev/null || ppid=""
+    printf 'argv: %s; parent %s: %s' \
+        "$({ tr '\0' ' ' < "/proc/$1/cmdline"; } 2> /dev/null)" "${ppid:-?}" \
+        "$({ [[ -n "${ppid}" ]] && tr '\0' ' ' < "/proc/${ppid}/cmdline"; } 2> /dev/null)"
+}
+
+# t14_proc_gone <pid>: true once <pid> is gone (or a zombie).
+t14_proc_gone() {
+    ! pid_alive "$1"
+}
+
+# t14_check_workers_have_rows <step>: every running stub worker runs in a tmux
+# session that a row of the harness's `list` records (no old worker is left
+# running without a row). A stub process in no pane that ends within
+# WORKER_GONE_S (a short-lived run of the stub outside tmux, such as a
+# version probe) is no worker; one still running then fails, with its
+# command line and its parent's.
+t14_check_workers_have_rows() {
+    local step="$1" workers pid session what n=0
+    workers="$(t14_stub_workers)" || fail "${step}: could not read the stub workers"
+    ad_capture list
+    [[ "${AD_RC}" == 0 ]] || fail "${step}: harness list exited ${AD_RC}: $(tr '\n' ' ' < "${AD_ERR}")"
+    while read -r pid session; do
+        [[ -n "${pid}" ]] || continue
+        if [[ "${session}" == - ]]; then
+            what="$(t14_proc_desc "${pid}")"
+            if wait_until "${WORKER_GONE_S}" "${step}: stub process ${pid} runs in no tmux pane: ${what}" t14_proc_gone "${pid}"; then
+                echo "${TEST_NAME}: NOTE: ${step}: stub process ${pid} (${what}), in no tmux pane, ended within ${WORKER_GONE_S} s"
+                continue
+            fi
+        fi
+        n=$(( n + 1 ))
+        jq -e --arg s "${session}" 'any(.spawns[]; .tmux_session_name == $s)' "${AD_OUT}" > /dev/null \
+            || fail "${step}: stub worker ${pid} runs in session ${session}, which no row of the harness's list records"
+    done <<< "${workers}"
+    echo "${TEST_NAME}: ${step}: ${n} stub worker(s) running, each in a session a listed row records"
+}
+
+# t14_session_ids <session>: print the session's id and its pane's id, `$N %N`,
+# read with the real tmux from the scenario's own shell.
+t14_session_ids() {
+    "${SCENARIO_REAL_TMUX}" display-message -p -t "=$1:" '#{session_id} #{pane_id}'
+}
+
+# t14_has_session <session>: true when the scenario's tmux server holds it.
+t14_has_session() {
+    "${SCENARIO_REAL_TMUX}" has-session -t "=$1" 2> /dev/null
+}
+
+# t14_no_records_about <step> <fragment>...: no Slack stub record after the
+# leg's mark holds any <fragment> in its text or names it as its channel.
+t14_no_records_about() {
+    local step="$1" n frags
+    shift
+    frags="$(printf '%s\n' "$@" | jq -R . | jq -s .)"
+    n="$(t14_after "${STUB_RECORD}" "${MARK_RECORD}" \
+        | jq -s --argjson f "${frags}" '[.[] | select(.event == "api" and (. as $r | any($f[]; . as $x | (($r.channel // "") == $x) or (($r.text // "") | contains($x)))))] | length')"
+    [[ "${n}" == 0 ]] || fail "${step}: ${n} Slack stub record(s) about $* after the mark"
+}
+
+# t14_check_summary <step>: exactly one start-sweep summary line after the
+# leg's mark, one the printer renders for four rows listed, <k> killed, the
+# other 3 - <k> live strays kept with their kills failed (A's at least), one
+# key recorded as retired and one row left for a latch; <k> is logged.
+t14_check_summary() {
+    local step="$1" k line n found=""
+    n="$(t14_count_after "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" "${SUMMARY_HEAD}")"
+    for (( k = 0; k <= 2; k++ )); do
+        t14_value line startSweepSummaryLine 4 "${k}" "$(( 3 - k ))" "$(( 3 - k ))" 1 1
+        if [[ "$(t14_count_after "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" "${line}")" == 1 ]]; then
+            found="${line}"
+        fi
+    done
+    if [[ "${n}" != 1 || -z "${found}" ]]; then
+        t14_after "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" | grep -F -- "${SUMMARY_HEAD}" | sed 's/^/  | /' >&2 || true
+        fail "${step}: ${n} start-sweep summary line(s), not one for 4 listed, the live strays not killed kept with their kills failed, 1 recorded as retired and 1 left for a latch"
+    fi
+    echo "${TEST_NAME}: NOTE: ${step}: the start sweep's summary: ${found}"
+}
+
+# t14_check_kill_failed_tries <id> <step>: each of the KILL_RETRY_TRIES tries
+# of the first kill-retry of <id> after the leg's mark answered
+# ErrTmuxKillFailed (its per-try line holds the outcome's fixed part); set
+# LAST_DESCRIPTION to the last try's description. The descriptions'
+# kill-failure words are not checked here: a 0.10.0 launch's description is
+# capped in the log before them (`renderLogMessageText`); legs 1 to 4 check
+# them.
+t14_check_kill_failed_tries() {
+    local id="$1" step="$2" n desc
+    for (( n = 1; n <= KILL_TRIES; n++ )); do
+        desc="$(t14_try_description "${id}" "${n}" 1)" || exit 1
+        echo "${TEST_NAME}: ${step}: kill try ${n} of ${KILL_TRIES} for ${id}: ErrTmuxKillFailed: ${desc}"
+        LAST_DESCRIPTION="${desc}"
+    done
+}
+
+# t14_check_other_stray <id> <persona> <session> <step>: the start sweep's
+# kill of the live stray <id> (<persona> as its lines name it, empty for a
+# pre-persona row) either succeeded (its per-row line, no `orphan-cleanup`
+# entry naming it, <session> gone) or did not (no such line, exactly one
+# entry naming it, <session> still there); which one is logged.
+t14_check_other_stray() {
+    local id="$1" persona="$2" session="$3" step="$4" head tail ok entries kills
+    t14_value tail startSweepKillSucceededLine.tail "${id}"
+    if [[ -n "${persona}" ]]; then
+        t14_value head startSweepKillSucceededLine.head "${id}" "${persona}"
+    else
+        t14_value head startSweepKillSucceededLine.pre-persona-head "${id}"
+    fi
+    ok="$(t14_count_after "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" "$(matcher "${head}" "${tail}")")"
+    entries="$(t14_count_entries "${ORPHAN_LABEL}" "${id}")"
+    kills="$(t14_cscb_count_since "${MARK_TIME}" kill "${id}")"
+    if [[ "${ok}" == 1 && "${entries}" == 0 ]]; then
+        ! t14_has_session "${session}" || fail "${step}: ${session} still runs after the kill of ${id} succeeded"
+        echo "${TEST_NAME}: NOTE: ${step}: the kill of ${id} succeeded after ${kills} CSCB kill(s); ${session} is gone"
+    elif [[ "${ok}" == 0 && "${entries}" == 1 ]]; then
+        t14_has_session "${session}" || fail "${step}: ${session} is gone although the kill of ${id} did not succeed"
+        echo "${TEST_NAME}: NOTE: ${step}: the kill of ${id} did not succeed after ${kills} CSCB kill(s); its row is kept with one ${ORPHAN_LABEL} entry and ${session} still runs"
+    else
+        fail "${step}: ${ok} kill-succeeded line(s) and ${entries} ${ORPHAN_LABEL} entries for ${id}, not one or the other"
+    fi
+}
+
+# True once a harness `find-missing` run leaves A's, B's and Q's rows
+# finished (`missing` or `ended`).
+t14_old_rows_finished() {
+    local id state
+    ad_capture find-missing
+    [[ "${AD_RC}" == 0 ]] || return 1
+    for id in "${UA_ID}" "${UB_ID}" "${Q_ID}"; do
+        state="$(t14_row_state "${id}")"
+        [[ "${state}" == missing || "${state}" == ended ]] || return 1
+    done
+}
+
+# t14_end_old_workers <step>: the human ends each 0.10.0 row's session still
+# running, by its session id, from the scenario's own shell, then runs
+# `find-missing` until A's, B's and Q's rows read finished.
+t14_end_old_workers() {
+    local step="$1" session ids sid id
+    for session in "${UA_SESSION}" "${UB_SESSION}" "${Q_SESSION}" "${P_SESSION}"; do
+        t14_has_session "${session}" || continue
+        ids="$(t14_session_ids "${session}")" || fail "${step}: could not read ${session}'s id"
+        read -r sid _ <<< "${ids}"
+        end_session "${sid}"
+    done
+    wait_until "${ROW_WAIT_S}" "${step}: find-missing never marked the old workers' rows finished" t14_old_rows_finished
+    for id in "${UA_ID}" "${UB_ID}" "${Q_ID}" "${P_ID}"; do
+        echo "${TEST_NAME}: NOTE: ${step}: after the human ended the old workers, ${id} reads '$(t14_row_state "${id}")'"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Leg 0 (scenario 16): an upgrade's start sweep with one failing kill
+# ---------------------------------------------------------------------------
+
+leg_upgrade_sweep() {
+    local step="upgrade start sweep" ua_state id m n before kills entry_head alert expected prefix body
+    local ids sid pane head tail
+
+    # After the migration: P's own row reads `pending` with no launch start;
+    # the other rows are live, their workers running.
+    ad_capture status --claude-instance-id "${P_ID}"
+    [[ "${AD_RC}" == 0 ]] && jq -e '.state == "pending" and ((.launch_started_at // "") == "")' "${AD_OUT}" > /dev/null \
+        || fail "${step}: after the migration ${P_ID} does not read pending with no launch start: $(tr '\n' ' ' < "${AD_OUT}" "${AD_ERR}")"
+    for id in "${UA_ID}" "${UB_ID}" "${Q_ID}"; do
+        echo "${TEST_NAME}: ${step}: ${id} reads '$(t14_row_state "${id}")' after the migration"
+    done
+    ua_state="$(t14_row_state "${UA_ID}")"
+    [[ -n "${ua_state}" && "${ua_state}" != pending ]] || fail "${step}: ${UA_ID} reads '${ua_state}' after the migration, not a reported-in live state"
+    ids="$(t14_session_ids "${UA_SESSION}")" || fail "${step}: no session ${UA_SESSION}"
+    read -r sid pane <<< "${ids}"
+    [[ "${sid}" == "${UA_SID}" && "${pane}" == "${UA_PANE}" ]] \
+        || fail "${step}: ${UA_SESSION} is now '${ids}', not the seeded ${UA_SID} ${UA_PANE}"
+
+    # The configuration names P (a Slack destination) and not Q; A's session
+    # and pane are fail-kill's only targets.
+    stub_mode "${P_WORK}" "${STUB_MODE_SILENT}"
+    tmux_shim_mode log
+    t14_config_for_next_start "$(t14_persona_json "${P_NAME}" "${P_LABEL}" "${P_WORK}" "${P_CFG}" "${P_CHANNEL}")"
+    t14_mark
+    tmux_shim_mode fail-kill --targets "${UA_SESSION}" "${UA_SID}" "${UA_PANE}"
+    m="$(completion_match 1)" || exit 1
+    before="$(count_log "${m}")"
+    start_server --live
+    wait_until "${KILL_WAIT_S}" "${step}: the start sweep never logged its summary line" \
+        t14_count_after_at_least "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" "${SUMMARY_HEAD}" 1
+    tmux_shim_mode log
+    wait_for_count "${m}" "$(( before + 1 ))" "${START_WAIT_S}" "${step}: the start pass never completed"
+
+    # The sweep's counts: four rows listed; every live stray it did not kill
+    # kept with its kill failed; Q's key recorded; P's row left for its latch.
+    # How many of B's and Q's kills succeed is agent-director's (a 0.10.0
+    # launch's session carries no label the release reads, so its kill may
+    # answer ErrTmuxKillFailed with no kill sent, HO rev 31 §2 (a)); it is
+    # logged, not asserted.
+    t14_check_summary "${step}"
+
+    # A: each try answered ErrTmuxKillFailed; exactly KILL_RETRY_TRIES CSCB
+    # kills; its session still there.
+    t14_check_kill_failed_tries "${UA_ID}" "${step}"
+    kills="$(t14_cscb_count_since "${MARK_TIME}" kill "${UA_ID}")"
+    [[ "${kills}" == "${KILL_TRIES}" ]] || fail "${step}: ${kills} CSCB kill(s) of ${UA_ID}, not ${KILL_TRIES}"
+    t14_has_session "${UA_SESSION}" || fail "${step}: ${UA_SESSION} is gone after its failed kill"
+
+    # Exactly one orphan-cleanup entry names A: its row, state, session and
+    # outcome, then the alert's ordinary version in its start-sweep form; one
+    # server-log line of it.
+    n="$(t14_count_entries "${ORPHAN_LABEL}" "${UA_ID}")"
+    [[ "${n}" == 1 ]] || fail "${step}: ${n} ${ORPHAN_LABEL} entries naming ${UA_ID}, not 1"
+    t14_value entry_head startSweepKillFailedEntry.pre-persona "${UA_ID}" "${ua_state}" "${UA_SESSION}" "${LAST_DESCRIPTION}"
+    t14_value alert killFailureAlertEntryText.start-sweep "${UA_ID}" "${UA_SESSION}" "${LAST_DESCRIPTION}"
+    n="$(t14_count_entries "${ORPHAN_LABEL}" "${entry_head}" "${alert}")"
+    if [[ "${n}" != 1 ]]; then
+        t14_after "${SLACK_STATE_DIR}/startup-errors.log" "${MARK_ERRORS}" | sed 's/^/  | /' >&2
+        echo "  | expected: [${ORPHAN_LABEL}] ${entry_head} … ${alert}" >&2
+        fail "${step}: the ${ORPHAN_LABEL} entry for ${UA_ID} is not the pre-persona head and the start-sweep alert the printer renders"
+    fi
+    n="$(t14_count_after "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" "$(matcher "[${ORPHAN_LABEL}] ${entry_head}" "${alert}")")"
+    [[ "${n}" == 1 ]] || fail "${step}: ${n} server-log line(s) of A's ${ORPHAN_LABEL} entry, not 1"
+
+    # B's and Q's kills: each either succeeded (its per-row line, no entry,
+    # its session gone) or did not (no such line, exactly one entry naming
+    # it, its session still there); which one is logged.
+    t14_check_other_stray "${UB_ID}" "" "${UB_SESSION}" "${step}"
+    t14_check_other_stray "${Q_ID}" "${Q_KEY}" "${Q_SESSION}" "${step}"
+    n="$(t14_count_entries "${ORPHAN_LABEL}")"
+    echo "${TEST_NAME}: NOTE: ${step}: ${n} ${ORPHAN_LABEL} entries after the start"
+
+    # P latched from its own listed row; no CSCB kill of P's row; its one
+    # launch-start-not-recorded post at its destination.
+    t14_value expected startSweepLatchedFromOwnRowLine.launch-start-not-recorded "${P_NAME}" "${P_ID}"
+    n="$(t14_count_after "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" "${expected}")"
+    [[ "${n}" == 1 ]] || fail "${step}: ${n} line(s) of ${P_NAME} latched from its own listed row, not 1"
+    n="$(t14_cscb_count_since "${MARK_TIME}" kill "${P_ID}")"
+    [[ "${n}" == 0 ]] || fail "${step}: ${n} CSCB kill(s) of ${P_ID}, whose persona latched"
+    t14_value prefix formatPersonaNotice "${P_NAME}"
+    t14_value body launchStartNotRecordedNoticeText "${P_KEY}"
+    wait_until "${POST_WAIT_S}" "${step}: no launch-start-not-recorded post for ${P_NAME} reached ${P_CHANNEL}" \
+        t14_post_arrived "${MARK_RECORD}" "${P_CHANNEL}" "${prefix}${body}"
+    n="$(t14_count_posts "${MARK_RECORD}" "" "${prefix}${body}")"
+    [[ "${n}" == 1 ]] || fail "${step}: ${n} launch-start-not-recorded post(s) for ${P_NAME}, not 1"
+    t14_note_posts "${MARK_RECORD}" "${P_CHANNEL}" "${step}"
+
+    # Q's key is recorded as retired, absent at the start.
+    n="$(t14_retired_cause "${Q_KEY}")"
+    [[ "${n}" == "${CAUSE_ABSENT}" ]] || fail "${step}: the retired-key record gives ${Q_KEY} the cause '${n}', not ${CAUSE_ABSENT}"
+
+    # No delete; every seeded row present; every running worker has a row;
+    # nothing about A reaches the Slack stub.
+    n="$(t14_cscb_count_since "${MARK_TIME}" delete "")"
+    [[ "${n}" == 0 ]] || fail "${step}: ${n} CSCB delete call(s)"
+    for id in "${UA_ID}" "${UB_ID}" "${Q_ID}" "${P_ID}"; do
+        t14_row_get "${id}"
+        echo "${TEST_NAME}: ${step}: ${id}'s row is kept, reading $(jq -r '.state' "${AD_OUT}")"
+    done
+    t14_check_workers_have_rows "${step}"
+    t14_no_records_about "${step}" "${UA_ID}" "${UA_SESSION}" "${UA_CHANNEL}"
+
+    stop_server
+
+    # The human acts on the alerts (HO rev 31 §2 (a), "Operator actions"):
+    # each old worker's session still running is ended by its session id,
+    # and a find-missing run marks its row; so no later start sweeps these
+    # rows as live strays (a later pass's retry budget is its own legs').
+    t14_end_old_workers "${step}"
+}
+
 # ---------------------------------------------------------------------------
 # Leg 1: the start sweep
 # ---------------------------------------------------------------------------
@@ -786,9 +1288,84 @@ leg_cwd() {
     stop_server
 }
 
+# ---------------------------------------------------------------------------
+# Leg 4 (scenario 15): a persona removal whose kill fails
+# ---------------------------------------------------------------------------
+
+leg_persona_removal() {
+    local step="persona removal" session ids sid pane pending apply end kills entry ref n state
+    stub_mode "${R_WORK}" "${STUB_MODE_DEV_CHANNELS}"
+    tmux_shim_mode log
+    t14_config_for_next_start "$(t14_persona_json "${R_NAME}" "${R_LABEL}" "${R_WORK}" "${R_CFG}" "${R_CHANNEL}")"
+    t14_start_and_wait 1
+    wait_until "${ROW_WAIT_S}" "${step}: ${R_ID} never reported in (waiting)" t14_row_is "${R_ID}" waiting
+    t14_row_get "${R_ID}"
+    session="$(jq -r '.tmux_session_name // empty' "${AD_OUT}")"
+    [[ -n "${session}" ]] || fail "${step}: ${R_ID}'s row names no tmux session"
+    ids="$(t14_session_ids "${session}")" || fail "${step}: no session ${session} on the scenario's tmux server"
+    read -r sid pane <<< "${ids}"
+
+    # `fail-kill` limited to R's session and pane; the operator removes R
+    # from config.json and confirms the apply by renaming the pending file.
+    t14_mark
+    tmux_shim_mode fail-kill --targets "${session}" "${sid}" "${pane}"
+    pending="${SLACK_STATE_DIR}/config.json${PENDING_SUFFIX}"
+    apply="${SLACK_STATE_DIR}/config.json${APPLY_SUFFIX}"
+    [[ ! -e "${pending}" ]] || fail "${step}: ${pending} exists before the edit"
+    t14_write_config
+    wait_for_file "${pending}" "${RELOAD_WAIT_S}" "${step}: no pending file after R's removal from config.json"
+    mv -f -- "${pending}" "${apply}" || fail "${step}: could not rename ${pending} to ${apply}"
+
+    # The teardown's kill: each try answered ErrTmuxKillFailed, its tries
+    # ended exhausted with the ordinary alert decided; exactly
+    # KILL_RETRY_TRIES CSCB kills.
+    end="$(t14_end_matcher "${R_ID}")" || exit 1
+    wait_until "${KILL_WAIT_S}" "${step}: ${R_ID}'s teardown kill tries never ended exhausted" \
+        t14_count_after_at_least "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" "${end}" 1
+    t14_check_try_descriptions "${R_ID}" 1 "${step}"
+    kills="$(t14_cscb_count_since "${MARK_TIME}" kill "${R_ID}")"
+    [[ "${kills}" == "${KILL_TRIES}" ]] || fail "${step}: ${kills} CSCB kill(s) of ${R_ID}, not ${KILL_TRIES}"
+    t14_has_session "${session}" || fail "${step}: ${session} is gone after its failed kill"
+
+    # Exactly one persona-teardown-notice entry naming R, "raised during its
+    # teardown", carrying the ordinary alert for the persona-teardown route;
+    # one server-log line of it.
+    t14_value entry personaTeardownNoticeEntryText.kill-failure "${R_NAME}" "${session}" "${LAST_DESCRIPTION}"
+    wait_until "${POST_WAIT_S}" "${step}: no ${TEARDOWN_LABEL} entry carrying R's kill-failure alert" \
+        t14_count_after_at_least "${SLACK_STATE_DIR}/startup-errors.log" "${MARK_ERRORS}" "] [${TEARDOWN_LABEL}] ${entry}" 1
+    ref="$(persona_ref "${R_NAME}")" || exit 1
+    n="$(t14_count_entries "${TEARDOWN_LABEL}" "${ref}")"
+    if [[ "${n}" != 1 ]]; then
+        t14_after "${SLACK_STATE_DIR}/startup-errors.log" "${MARK_ERRORS}" | sed 's/^/  | /' >&2
+        fail "${step}: ${n} ${TEARDOWN_LABEL} entries naming ${R_NAME}, not 1"
+    fi
+    n="$(t14_count_entries "${TEARDOWN_LABEL}" "${entry}")"
+    [[ "${n}" == 1 ]] || fail "${step}: ${n} ${TEARDOWN_LABEL} entries carrying R's kill-failure alert, not 1"
+    n="$(t14_count_after "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" "[${TEARDOWN_LABEL}] ${entry}")"
+    [[ "${n}" == 1 ]] || fail "${step}: ${n} server-log line(s) of R's ${TEARDOWN_LABEL} entry, not 1"
+
+    # No delete; R's row present; R's key recorded as retired, removed.
+    n="$(t14_cscb_count_since "${MARK_TIME}" delete "")"
+    [[ "${n}" == 0 ]] || fail "${step}: ${n} CSCB delete call(s) after the edit"
+    state="$(t14_row_state "${R_ID}")"
+    [[ -n "${state}" ]] || fail "${step}: ${R_ID}'s row is gone: $(tr '\n' ' ' < "${AD_ERR}")"
+    echo "${TEST_NAME}: ${step}: ${R_ID}'s row is kept, reading ${state}"
+    n="$(t14_retired_cause "${R_KEY}")"
+    [[ "${n}" == "${CAUSE_REMOVED}" ]] || fail "${step}: the retired-key record gives ${R_KEY} the cause '${n}', not ${CAUSE_REMOVED}"
+
+    # Nothing about the failure reaches the Slack stub.
+    t14_no_records_about "${step}" "${R_CHANNEL}" "${R_ID}" "${R_NAME}" "${session}"
+    t14_no_unresponsive_post "${R_KEY}" "${step}"
+
+    tmux_shim_mode log
+    stop_server
+}
+
+leg_upgrade_sweep
 leg_start_sweep
 leg_config_dir
 leg_cwd
+leg_persona_removal
 
 # The closing assertions (b.jg5 SRJ-1401, SRJ-1418).
 assert_no_server_tmux

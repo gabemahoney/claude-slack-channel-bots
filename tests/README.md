@@ -210,7 +210,8 @@ tests/
                                    # after every install, re-shim, swap and restore, with the log kept; a 0.10.0 start; every guarded helper refusing a HOME outside
                                    # SCENARIO_ROOT; the tmux shim logging argv and parent, and each of its modes (fail-kill, fail-create, slow-create, wedge) behaving
                                    # as its header says; `cscb_run` putting the shim first on a CSCB process's PATH and recording it, the scenario shell keeping the
-                                   # real tmux; a live one-persona start whose dialog the approver clears through agent-director, with no tmux line whose parent is
+                                   # real tmux; fail-kill limited to a target list failing only the kills aimed at a listed target, and the setter's refusals
+                                   # (`fail_kill_targets`); a live one-persona start whose dialog the approver clears through agent-director, with no tmux line whose parent is
                                    # the bot server and the three closing assertions passing, both positive controls met by that start's own lines; harness
                                    # finished-row kills (agent-director-admin's `kill-finished`) passing; each assertion, positive control and count helper failing on a violating log; the
                                    # closing enforcement; and the trap stopping the scenario's tmux server. Its stub legs show the stub's MCP session registered as
@@ -230,15 +231,16 @@ tests/
                                    # re-bind (`tmux_server_steps`). The re-fire legs wait out agent-director's default G (60 s); only after them does
                                    # `store_statements` write a `[tmux]` table (`starting_session_seconds = 60`, `stopping_window_seconds = 30`), so the
                                    # kill need not wait 300 s. It runs about two and a half minutes and ends with the three closing assertions
-    test-14-fmk-kill-fails.sh      # HO §7 scenario 2 (b.jg5 SRJ-1403), fmk: a kill that really fails deletes and launches nothing; with the tmux shim in fail-kill,
-                                   # for a persona removed from the config at a start, a config_dir mismatch and a cwd mismatch, each kill answers ErrTmuxKillFailed,
-                                   # the row is kept and one alert is routed per SRJ-704 (see fmk scenario list)
+    test-14-fmk-kill-fails.sh      # HO §7 scenarios 16, 2 and 15, in that order (b.jg5 SRJ-1403, SRJ-1417), fmk: a kill that really fails deletes and launches
+                                   # nothing; with the tmux shim in fail-kill, for pre-persona rows seeded on 0.10.0 met at an upgrade's first start, a persona
+                                   # removed from the config at a start, a config_dir mismatch, a cwd mismatch and a persona removed while the server runs, each kill
+                                   # answers ErrTmuxKillFailed, the row is kept and one alert is routed per SRJ-704 (see fmk scenario list)
     lib/
       scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards (see Scenario helper below)
     fixtures/
       agent-director-shim.sh       # the logging agent-director shim of fmk mode: logs each call's argv and parent, then execs the real binary beside it
       tmux-shim.sh                 # the logging tmux shim of fmk mode, first on the PATH of every CSCB process: logs each call's argv and parent, then acts on its
-                                   # mode (log, fail-kill, fail-create, slow-create, wedge)
+                                   # mode (log, fail-kill, fail-create, slow-create, wedge); fail-kill may be limited to a target list
       fmk-driver.ts                # the driver of the calls an fmk scenario forces, run through `cscb_run`, each through the installed package's production code
                                    # with one `DRIVER:` outcome line: a `resume` (scenario 5) and a reuse spawn (scenarios 8 and 25) through the package's
                                    # forced-launch seams, and the persona's pane read under another TMUX_TMPDIR (scenario 26); refuses to run without the image
@@ -546,6 +548,13 @@ has the shim on its PATH.
   reads it. Only `slow-create` and `wedge` take a delay, a whole or decimal
   number of seconds. It fails on an unknown mode, a delay for any other mode
   and in shared mode. The mode is `log` from setup on.
+- `tmux_shim_mode fail-kill --targets <target>...` (a harness addition, to
+  confirm at the reconcile pass) sets `fail-kill` limited to the targets
+  given, each a session name, a session id (`$N`) or a pane id (`%N`): the
+  mode file holds the mode line, then one target per line, written
+  atomically. It fails on `--targets` after any other mode, on no target and
+  on an empty target or one holding a control character. A later
+  `tmux_shim_mode` call replaces the list.
 
 The tmux shim (`fixtures/tmux-shim.sh`, installed as
 `$SCENARIO_ROOT/tmux-shim/bin/tmux`):
@@ -563,7 +572,11 @@ The tmux shim (`fixtures/tmux-shim.sh`, installed as
   runs nothing and exits 70, so no call goes unlogged;
 - then reads its mode from the mode file: one line, `<mode>` or
   `<mode> <delay-s>`. No file reads as `log`; an unreadable file, an unknown
-  mode or a delay that is not a number of seconds runs nothing and exits 70;
+  mode or a delay that is not a number of seconds runs nothing and exits 70.
+  For `fail-kill` only, the lines after the first are its target list (see
+  fail-kill's target list below); a list beside any other mode runs nothing
+  and exits 70. The file is opened once per call, so the mode and its list
+  come from one version of it;
 - reads each command of a chained call after tmux's global options, and
   matches a command name as tmux does (its full name, its alias or a prefix
   no other command shares). A call with no command, and neither `-c` nor
@@ -572,7 +585,7 @@ The tmux shim (`fixtures/tmux-shim.sh`, installed as
 | Mode | Acts on a call whose commands include | What it does to that call | Every other call |
 |---|---|---|---|
 | `log` | (none) | | runs the real tmux |
-| `fail-kill` | `kill-session` or `kill-pane` | runs nothing, so kills nothing; one `tmux-shim:` line on standard error; exits 1 | runs the real tmux |
+| `fail-kill` | `kill-session` or `kill-pane` (with a target list, one aimed at a listed target) | runs nothing, so kills nothing; one `tmux-shim:` line on standard error; exits 1 | runs the real tmux (with a target list, a kill aimed elsewhere included) |
 | `fail-create` | `new-session` | runs nothing, so creates nothing; nothing on standard output and one `tmux-shim:` line (which tmux never gives) on standard error; exits 1. agent-director answers `ErrTmuxSessionCreate` and a plain spawn's row stays `pending` | runs the real tmux |
 | `slow-create` | `new-session` | runs the whole chained call through the real tmux (agent-director's `@ad_owner` and `@ad_pane` labels with it), then waits the delay (default 15 s, longer than agent-director's default `create_timeout_ms` of 5000) and exits with tmux's status: the launch times out with its session present | runs the real tmux |
 | `wedge` | any command | waits the delay (default 60 s, longer than every agent-director call timeout at its defaults), then prints one `tmux-shim:` line on standard error and exits 1, having run no tmux | (every call is waited) |
@@ -580,6 +593,20 @@ The tmux shim (`fixtures/tmux-shim.sh`, installed as
 A wait runs `sleep` with its standard streams on `/dev/null`, so a `sleep`
 left behind when agent-director's call timeout kills the shim holds none of
 agent-director's pipes.
+
+fail-kill's target list (a harness addition, to confirm at the reconcile
+pass). With no list, `fail-kill` fails every kill, as the table says. With
+one, only a call holding a `kill-session` or `kill-pane` aimed at a listed
+target fails, and fails whole, running none of its commands; every other
+call runs the real tmux. A kill's target is its `-t` value (`-t <t>`,
+`-t<t>`, or `t` last in a flag cluster such as `-at <t>`), read up to `--`
+or its first word that is not a flag; a kill with no `-t` is aimed at no
+listed target. A target and a listed one are compared after a leading `=`
+and everything from the first `:` on are dropped from each, so `=name`,
+`name:`, `$N` and `%N` (agent-director's own forms, `kill-session -t $N` and
+`kill-pane -t %N`) match the listed `name`, `$N` or `%N`. Blank lines in the
+list are skipped. A scenario that limits one row's kill lists that row's
+session name, session id and pane id.
 
 The CSCB process record (`SCENARIO_CSCB_RECORD`,
 `$SCENARIO_ROOT/cscb-processes`) never drops a process. Each entry holds the
@@ -726,8 +753,9 @@ These hold for every fmk script (b.jg5 SRJ-1401):
   self-check rather than a scenario, writes one once its re-fire legs are
   done, for its finished-row kill (see Layout).
 - It runs with both shims: `tmux-shim.sh` first on the PATH of its CSCB
-  processes, in `log` mode unless the scenario sets `fail-kill`,
-  `fail-create`, `slow-create` or `wedge` with `tmux_shim_mode`; and
+  processes, in `log` mode unless the scenario sets `fail-kill` (whole, or
+  limited to a target list), `fail-create`, `slow-create` or `wedge` with
+  `tmux_shim_mode`; and
   `agent-director-shim.sh` in front of the agent-director binary.
 - It ends with `assert_no_server_tmux`, `assert_no_cscb_include_finished` and
   `assert_no_cscb_delete`, whatever the shim's mode, and the trap fails a
@@ -770,7 +798,9 @@ script's header comment is its full specification.
 
 | Scenario | Script | Sites | Outcomes checked | Modes, helpers and settings |
 |---|---|---|---|---|
-| 2 (b.jg5 SRJ-1403; AC 24, AC 64) | `test-14-fmk-kill-fails.sh` | The start sweep (a persona removed while its worker runs); a `config_dir` mismatch, met at the collision ladder's `pending` branch (SRJ-411) by a start; a `cwd` mismatch, met by a running server's first pending-only retry. `resume_enabled=false` is not driven here: SRJ-1403 leaves it, with `ErrSpawnNotResumable` with dead evidence, to SRJ-110's unit test (dead evidence means the session is gone, so agent-director's kill sends no kill for the shim to fail) | Every kill try answers `ErrTmuxKillFailed`, `KILL_RETRY_TRIES` tries; no CSCB delete or launch (spawn or resume) of the leg's id follows; the row is kept (read afterwards, present). One alert is routed per SRJ-704: at the start sweep, one `orphan-cleanup` startup-errors entry and one server-log line, nothing to Slack; at a `config_dir` or `cwd` mismatch, one ordinary alert at the persona's destination, quoting agent-director's description, and no second alert through one further retry. No `tmux-unresponsive` post (SRJ-307) | tmux-shim `fail-kill` for the kills checked (`log` while a leg launches); stub modes `dev-channels` (reporting, the start sweep's persona) and `silent` (the mismatch personas, whose rows stay `pending`); the mismatch made by re-pointing a symlinked directory (`repoint_symlink`); agent-director's default settings, no `config.toml`, so `kill_exit_wait_ms` is its default, 5000 ms, measured (slowest exit 603 ms), and the retry makes 3 tries 2 s apart; `health_check_interval` 0; starts on 0.10.0 (`SCENARIO_AD_START=0.10.0`), then `install_ad_release` as its first step; values from `fixtures/fmk-texts.ts`; posts from the Slack stub's record |
+| 16 (b.jg5 SRJ-1417, SRJ-714; AC 1, AC 64) | `test-14-fmk-kill-fails.sh` (leg 0, its first) | An upgrade's first start sweep (`reconcileOrphans`) over rows seeded on 0.10.0 before `install_ad_release`: two pre-persona rows A and B (a `channel` label, no `persona` label, named as the pre-persona package names them, workers reporting in at once); persona P's own row (`cscb_<P key>`, its `persona` label, a working directory other than P's configured one, a worker that never reports in), which after the migration reads `pending` with no launch start (SRJ-513, SRJ-1020); and absent persona Q's live row. `config.json` names P (a Slack destination) and not Q | CSCB makes no `delete`, and every seeded row is present afterwards (harness `get`). A's kill: each of its `KILL_RETRY_TRIES` tries answers `ErrTmuxKillFailed`, its session still runs, and exactly one `orphan-cleanup` startup-errors entry names A's row, state, session and class (the pre-persona row's head, then the alert's ordinary version in its start-sweep form), with one server-log line of it and nothing about A in the Slack stub's record. B's and Q's outcomes are logged as `NOTE:` lines, not asserted: the release answers `ErrTmuxKillFailed`, with no kill sent, for a session a 0.10.0 launch made, which carries no label the release reads, and the pass's retry budget gives a later row one try; so each either succeeded (the sweep's per-row line, no entry, its session gone) or did not (exactly one entry, its session still running). Every running stub worker is in a session a row of the harness's `list` records. P latches from its own listed row, with exactly one launch-start-not-recorded post at P's destination and no CSCB kill of P's row. Q's key is in the retired-key record with cause `absent-at-start`. The sweep's summary line gives its counts. After the leg the harness plays the operator acting on the alerts: it ends each old worker's session by its session id and runs `find-missing` until A's, B's and Q's rows read finished, so no later start sweeps them live | tmux-shim `fail-kill` limited to A's session name, session id and pane id (`tmux_shim_mode fail-kill --targets`), `log` once the sweep's summary line is logged; the seeders `seed_prepersona_fleet` (A, B) and `seed_010_row` (P, Q) on 0.10.0 (`SCENARIO_AD_START=0.10.0`) before `install_ad_release`; stub modes `at-once` (A, B and Q) and `silent` (P); agent-director's default settings; `health_check_interval` 0; values from `fixtures/fmk-texts.ts`; posts from the Slack stub's record |
+| 2 (b.jg5 SRJ-1403; AC 24, AC 64) | `test-14-fmk-kill-fails.sh` | The start sweep (a persona removed while its worker runs); a `config_dir` mismatch, met at the collision ladder's `pending` branch (SRJ-411) by a start; a `cwd` mismatch, met by a running server's first pending-only retry. `resume_enabled=false` is not driven here: SRJ-1403 leaves it, with `ErrSpawnNotResumable` with dead evidence, to SRJ-110's unit test (dead evidence means the session is gone, so agent-director's kill sends no kill for the shim to fail) | Every kill try answers `ErrTmuxKillFailed`, `KILL_RETRY_TRIES` tries; no CSCB delete or launch (spawn or resume) of the leg's id follows; the row is kept (read afterwards, present). One alert is routed per SRJ-704: at the start sweep, one `orphan-cleanup` startup-errors entry and one server-log line, nothing to Slack; at a `config_dir` or `cwd` mismatch, one ordinary alert at the persona's destination, quoting agent-director's description, and no second alert through one further retry. No `tmux-unresponsive` post (SRJ-307) | tmux-shim `fail-kill` for the kills checked (`log` while a leg launches); stub modes `dev-channels` (reporting, the start sweep's persona) and `silent` (the mismatch personas, whose rows stay `pending`); the mismatch made by re-pointing a symlinked directory (`repoint_symlink`); agent-director's default settings, no `config.toml`, so `kill_exit_wait_ms` is its default, 5000 ms, measured (slowest exit 603 ms), and the retry makes 3 tries 2 s apart; `health_check_interval` 0; starts on 0.10.0 (`SCENARIO_AD_START=0.10.0`), with scenario 16's seeding before `install_ad_release`, so legs 1 to 3 run on the release; values from `fixtures/fmk-texts.ts`; posts from the Slack stub's record |
+| 15 (b.jg5 SRJ-1417, SRJ-715; AC 1, AC 64) | `test-14-fmk-kill-fails.sh` (leg 4, after scenario 2's legs) | A persona removal's teardown: persona R (a Slack destination, its worker reporting in) is up and its row `waiting`; the operator removes R from `config.json` and confirms the apply by renaming the pending file to the apply file (README "Reload") | R's teardown kill: each of its `KILL_RETRY_TRIES` tries answers `ErrTmuxKillFailed`, its tries ending exhausted; exactly one `persona-teardown-notice` startup-errors entry naming R, carrying the alert's ordinary version with the log-only closing sentence, and one server-log line of it; no CSCB delete; R's row present; R's key in the retired-key record with cause `removed`; nothing about R in the Slack stub's record after the edit, and no `tmux-unresponsive` post | tmux-shim `fail-kill` limited to R's session name, session id and pane id (`tmux_shim_mode fail-kill --targets`), `log` at the leg's end; stub mode `dev-channels`; agent-director's default settings; `health_check_interval` 0; values from `fixtures/fmk-texts.ts`; posts from the Slack stub's record |
 
 ### Harness-only steps
 
