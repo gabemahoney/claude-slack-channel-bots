@@ -47,8 +47,8 @@
  *   `fmk-driver.ts`, `stub-mcp-session.ts` and `fmk-texts.ts` (a listed
  *   three) each check the marker first and statically import only `node:`
  *   built-ins, type-only imports included; and scenario.sh's `install_ad_shim`, `ad_store_edit`,
- *   `ad_store_id`, `stub_mode` and `ad_store_pending_no_launch` call
- *   `require_scenario_home` before their first
+ *   `ad_store_id`, `stub_mode`, `ad_store_pending_no_launch` and
+ *   `write_ad_settings` call `require_scenario_home` before their first
  *   sqlite3, copy, move or install step, a call of a scenario.sh function
  *   that makes one (such as `_scenario_place`) counting as one. Shell is read
  *   with comments, heredoc bodies and quoted text blanked; the shebang,
@@ -1683,6 +1683,9 @@ const HOME_GUARDED_ADMIN_HELPERS: readonly string[] = ['install_ad_admin_shim']
 /** The stub-worker and store helpers held to the same rule: the stub mode selector (a move) and the no-launch-start statement (a store edit). */
 const HOME_GUARDED_STUB_HELPERS: readonly string[] = ['stub_mode', 'ad_store_pending_no_launch']
 
+/** Scenario 24's agent-director settings writer, held to the same rule: it replaces the scenario HOME's config.toml through `write_file` (a move). */
+const HOME_GUARDED_AD_SETTINGS_HELPERS: readonly string[] = ['write_ad_settings']
+
 /**
  * The label, seeding, tmux-step, store-statement and 0.10.0-seeder helpers
  * held to the same rule: each reads or edits the store (directly or through
@@ -1701,6 +1704,7 @@ const HOME_GUARDED_SEEDING_HELPERS: readonly string[] = [
   'relabel_session',
   'ad_owner_global_set',
   'rebind_tmux_socket',
+  'restore_tmux_socket',
   'ad_store_mark_finished',
   'ad_store_seed_pending',
   'ad_store_unusable_name',
@@ -2370,6 +2374,18 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       expect(helperHomeCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), readFileSync(SCENARIO_PATH, 'utf-8'), HOME_GUARDED_STUB_HELPERS)).toEqual([])
     })
 
+    test('the current tree: write_ad_settings runs require_scenario_home before its settings write', () => {
+      expect(helperHomeCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), readFileSync(SCENARIO_PATH, 'utf-8'), HOME_GUARDED_AD_SETTINGS_HELPERS)).toEqual([])
+    })
+
+    test('write_ad_settings without its require_scenario_home is flagged at its settings write', () => {
+      const source = readFileSync(SCENARIO_PATH, 'utf-8')
+      const unguarded = source.replace(/(\nwrite_ad_settings\(\) \{\n(?:.*\n)*?)    require_scenario_home "\$\{step\}"\n/, '$1')
+
+      expect(unguarded).not.toBe(source)
+      expectNamedFindings(helperHomeCheckFindings('scenario.sh', unguarded, HOME_GUARDED_AD_SETTINGS_HELPERS), 'scenario.sh', RULE.homeCheckFirst)
+    })
+
     test('stub_mode without its require_scenario_home is flagged at its move', () => {
       const source = readFileSync(SCENARIO_PATH, 'utf-8')
       const unguarded = source.replace(/(\nstub_mode\(\) \{\n(?:.*\n)*?)    require_scenario_home "\$\{step\}"\n/, '$1')
@@ -2386,36 +2402,13 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       ['ad_store_mark_finished', 'its store read, through another helper'],
       ['seed_leftover', 'its seeding, through _scenario_seed'],
       ['rebind_tmux_socket', 'its socket move'],
+      ['restore_tmux_socket', 'its socket move'],
     ])('%s without its require_scenario_home is flagged at %s', (helper) => {
       const source = readFileSync(SCENARIO_PATH, 'utf-8')
       const unguarded = source.replace(new RegExp(`(\\n${helper}\\(\\) \\{\\n(?:.*\\n)*?)    require_scenario_home "[^"\\n]*"\\n`), '$1')
 
       expect(unguarded).not.toBe(source)
       expectNamedFindings(helperHomeCheckFindings('scenario.sh', unguarded, [helper]), 'scenario.sh', RULE.homeCheckFirst)
-    })
-
-    test("the current tree: scenario 10's [tmux] table writer (write_ad_tmux_table) runs require_scenario_home before its file write", () => {
-      expect(helperHomeCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), readFileSync(SCENARIO_PATH, 'utf-8'), ['write_ad_tmux_table'])).toEqual([])
-    })
-
-    test('write_ad_tmux_table without its require_scenario_home is flagged at its file write, through write_file', () => {
-      const source = readFileSync(SCENARIO_PATH, 'utf-8')
-      const unguarded = source.replace(/(\nwrite_ad_tmux_table\(\) \{\n(?:.*\n)*?)    require_scenario_home "[^"\n]*"\n/, '$1')
-
-      expect(unguarded).not.toBe(source)
-      expectNamedFindings(helperHomeCheckFindings('scenario.sh', unguarded, ['write_ad_tmux_table']), 'scenario.sh', RULE.homeCheckFirst)
-    })
-
-    test("the current tree: scenario 26's socket restore (restore_tmux_socket) runs require_scenario_home before its socket move", () => {
-      expect(helperHomeCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), readFileSync(SCENARIO_PATH, 'utf-8'), ['restore_tmux_socket'])).toEqual([])
-    })
-
-    test('restore_tmux_socket without its require_scenario_home is flagged at its socket move', () => {
-      const source = readFileSync(SCENARIO_PATH, 'utf-8')
-      const unguarded = source.replace(/(\nrestore_tmux_socket\(\) \{\n(?:.*\n)*?)    require_scenario_home "[^"\n]*"\n/, '$1')
-
-      expect(unguarded).not.toBe(source)
-      expectNamedFindings(helperHomeCheckFindings('scenario.sh', unguarded, ['restore_tmux_socket']), 'scenario.sh', RULE.homeCheckFirst)
     })
   })
 

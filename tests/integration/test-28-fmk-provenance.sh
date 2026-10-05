@@ -95,8 +95,12 @@
 #      (PROBE_PANE_READ_LINES) and its teardown's `kill` of A both have that
 #      `stop` run as their parent, the
 #      kill is a plain `kill` (no --include-finished), and A's worker and the
-#      renamed session are gone. The server is started again and both rows
-#      read `waiting`.
+#      renamed session are gone. Over the teardown (between two tmux shim
+#      marks) at least one tmux shim line matches TMUX_KILL_RE
+#      (`kill-session` or `kill-pane` as a word) with an agent-director
+#      process as its parent: agent-director's own kill of the session, the
+#      positive control of leg 6's no-kill scan (`ad_parented_tmux_kills`).
+#      The server is started again and both rows read `waiting`.
 #   3. Another TMUX_TMPDIR (SRJ-1428 bullet 3; SRJ-612). For each persona,
 #      fixtures/fmk-driver.ts's `read-pane-other-tmux-tmpdir` through
 #      `cscb_run` (the persona's own-pane read through the package's
@@ -142,8 +146,9 @@
 #      (`restart_tmux_server`: kill-server, then a new server with one
 #      session) and runs the find-missing loop (`run_find_missing_loop`,
 #      FM_INTERVAL_S; working default D2) until each row has been marked
-#      `missing` (it reads `missing`, the loop's log lists it, or it already
-#      records another launch), then stops it. Each row then reads `waiting`
+#      `missing` (it reads `missing`, the `ids` of a loop run started in this
+#      leg (its run.<n>.out, read with jq) hold its instance id, or it
+#      already records another launch), then stops it. Each row then reads `waiting`
 #      with a new launch token (a new worker). Per persona, since the tmux
 #      restart: exactly one `resume` by the bot server, at most one plain
 #      `spawn` before it (the launch's collision path) and no spawn with
@@ -158,14 +163,15 @@
 #      restart delay), and the bot server is restarted without teardown.
 #   6. Remain-on-exit (SRJ-1428 bullet 6; SRJ-505's own-id row, SRJ-506,
 #      SRJ-1004, SRJ-1005). Once A's session is more than the starting-session
-#      bound (DEFAULT_AD_SETTINGS starting_session_seconds) old, the harness
-#      turns remain-on-exit on for it (`set_remain_on_exit`) and ends A's
+#      bound (`DEFAULT_AD_SETTINGS <AD_TMUX_TABLE> starting_session_seconds`)
+#      old, the harness turns remain-on-exit on for it (`set_remain_on_exit`) and ends A's
 #      worker with no SessionEnd (`end_worker_without_session_end`, SIGKILL
 #      to the pane's process): the row still reads `waiting` and the session
 #      remains. The find-missing loop (D2) runs until the row reads `missing`
 #      while the dead session remains, then stops; B is untouched. The bot
 #      server is restarted without teardown. A latches on CONFLICT_OWN_ID_PHRASE
-#      (its latch line, case LATCH_CASE_OWN_ID); since the restart server.log
+#      (its latch line: conflictLatchSetLineHead, case LATCH_CASE_OWN_ID, then
+#      agent-director's description); since the restart server.log
 #      holds at least one UNAVAILABLE line carrying STILL_STOPPING_PHRASE or
 #      STILL_STARTING_PHRASE, every one before the first CONFLICT line. Posts
 #      for A since the leg began: one latch post, last, carrying in order the
@@ -173,32 +179,40 @@
 #      session name, the own-id sentence, CONFLICT_NOTICE_POINTER_LINE and
 #      CONFLICT_NOTICE_HUMAN_ONLY_LINE, with no session-ending command form
 #      (`sessionEndingCommandsIn`); before it only the tmux-unresponsive onset
-#      and alert (tmuxUnresponsiveOnsetText, tmuxUnresponsiveAlertText; SRJ-308,
-#      SRJ-309), each at most once, which the UNAVAILABLE answers post when
+#      and alert (tmuxUnresponsiveOnsetText, and tmuxUnresponsiveAlertText at
+#      agent-director's default settings; SRJ-308, SRJ-309), each at most
+#      once, which the UNAVAILABLE answers post when
 #      the CONFLICT comes late (the session's age above makes it come at the
 #      retry after the stopping window, before the onset's floor, so none is
 #      expected). No kill sent (working default D3): no CSCB `kill` or
-#      `delete` of A, no tmux shim line carrying kill-session or kill-pane
-#      since the leg began, and the dead session still holds A's name; at
+#      `delete` of A, no tmux shim line, whatever its parent, matching
+#      TMUX_KILL_RE since the leg began (`tmux_kill_lines`; leg 2's teardown
+#      is its positive control), and the dead session still holds A's name; at
 #      least one `resume` by the bot server, no spawn with --reuse-finished,
 #      and the row still reads `missing` with its launch token (nothing
 #      launched). The harness removes the dead session by its id
 #      (`end_session`); up to the next `resume`, the bot server's calls of A
 #      (and any `find-missing`) are exactly `status`, the one-line `read-pane`
 #      (PROBE_PANE_READ_LINES), `find-missing` and `resume`; the round logs
-#      the probe cleared on PANE_READ_GONE; A's row reads `waiting`; and A's
-#      posts in the leg end with the latch post and then exactly one recovery
-#      post, formatPersonaNotice of conflictRecoveryText for the session with
-#      LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED.
+#      the probe cleared on PANE_READ_GONE (its round line printed whole by
+#      latchRecheckRoundLine up to the answer's `;`); A's row reads
+#      `waiting`; and A's posts in the leg end with the latch post and then
+#      exactly one recovery post, formatPersonaNotice of conflictRecoveryText
+#      for the session with LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED. Once
+#      that post has settled, the whole window since the dead session's
+#      removal holds exactly one CSCB `resume` of A and exactly one CSCB
+#      `find-missing`.
 #   7. Pending row with no launch start (SRJ-1428 bullet 7; SRJ-513, SRJ-505,
 #      SRJ-506, SRJ-1020, SRJ-1401; AC 86). The harness's statement
 #      (`ad_store_pending_no_launch`) makes B's live row `pending` with no
 #      launch start, its session and worker left in place, and the bot server
 #      is restarted without teardown. B latches with case
-#      LATCH_CASE_LAUNCH_START_NOT_RECORDED, and its one post is exactly
+#      LATCH_CASE_LAUNCH_START_NOT_RECORDED (its latch line's printed head and
+#      the case), and its one post is exactly
 #      formatPersonaNotice of launchStartNotRecordedNoticeText. The first
 #      re-check holds the latch with one `status` of B and nothing else (its
-#      round line: step RECHECK_STEP_TABLE, call RECHECK_CALL_NONE, answer
+#      round line, printed whole by latchRecheckRoundLine: step
+#      RECHECK_STEP_TABLE, call RECHECK_CALL_NONE, answer
 #      RECHECK_VERDICT_STILL_LATCHED); no CSCB `send-keys` or `kill` of B while
 #      it is latched; the worker runs and the row reads `pending`. The
 #      find-missing loop runs until the row reads `missing`, then stops. The
@@ -242,10 +256,13 @@
 # the still-running old session is logged, not asserted.
 #
 # Waits and their derivation:
-#   - RETRY_THIRD_S and RETRY_FOURTH_S, from UNAVAILABLE_RETRY_BASE_S
-#     (src/unavailable-retry.ts, 30): the retries fall at 1, 3, 7 and 15
-#     times it after the first refusal (each wait doubles the one before,
-#     SRJ-302), so 210 s and 450 s. Leg 6 waits for its latch up to
+#   - RETRY_THIRD_S and RETRY_FOURTH_S, printed (`unavailableRetryDueS 3`
+#     and `4`): when the retry timer's third and fourth retries fall due
+#     after the first refusal, the sum of the waits before each, from
+#     src/backoff.ts doublingBackoffDelay over src/unavailable-retry.ts
+#     UNAVAILABLE_RETRY_BASE_S and UNAVAILABLE_RETRY_CEILING_S (each wait
+#     doubles the one before up to the ceiling, SRJ-302; 210 s and 450 s in
+#     this build). Leg 6 waits for its latch up to
 #     RETRY_FOURTH_S and RETRY_ALLOWANCE_S after the restart: the fourth
 #     retry is past both the stopping window and the starting-session bound
 #     (DEFAULT_AD_SETTINGS, 90 s and 300 s; checked with the values).
@@ -267,22 +284,24 @@
 #     post reaching the stub, a killed session ending and the calls that
 #     follow a step.
 #
-# Matched fragments with no builder of their own (ruling S7), each quoted
-# where it is matched with a comment naming its source: the printed heads of
-# waitingRowPaneGoneLine, reconnectGoneLine and escalateDeadSweepLine
-# (src/session-manager.ts), whose tails carry agent-director's answer or a
-# verdict (the reconnect line's head stops before the persona's reference, so
-# it is matched with the persona's key after it); src/restart.ts's
+# Printed line heads: waitingRowPaneGoneLine, reconnectGoneLine and
+# escalateDeadSweepLine (src/session-manager.ts), whose tails carry
+# agent-director's answer or a verdict (the reconnect line's head stops
+# before the persona's reference, so it is matched with the persona's key
+# after it), and the latch line's (src/conflict-latch.ts conflictLatchSetLine,
+# `conflictLatchSetLineHead`, up to `case=`; its tail carries
+# agent-director's description). The re-check round lines are printed whole
+# (src/conflict-latch.ts latchRecheckRoundLine, `latchRecheckRoundLine`).
+# Matched fragments with no export of their own (ruling S7), each quoted
+# where it is used with a comment naming its source: src/restart.ts's
 # counted-failure and cap lines (`[slack] Session relaunch failed for
 # persona=<key>`, `[slack] Cap reached for persona=<key> `), inline literals;
-# the latch line's head (src/conflict-latch.ts conflictLatchSetLine, whose
-# whole line carries agent-director's description); the re-check round
-# line's head and fields (src/conflict-latch.ts latchRecheckRoundLine) with
-# the answers src/session-manager.ts composes inline (`probe-cleared (gone)`,
-# `still-latched`, `cleared (<step>)`); and the quotes around the session
-# name in the CONFLICT notice's first line (src/conflict-latch.ts
-# slackQuotedSession). The spawn-failure notice's first line is the printed
-# restart-cap notice's first line.
+# the round lines' answers and the cleared probe's call that
+# src/session-manager.ts composes inline (`probe-cleared (<kind>);`,
+# `<probe>+find-missing+<retry>`, `still-latched`, `cleared (<step>)`); and
+# the quotes around the session name in the CONFLICT notice's first line
+# (src/conflict-latch.ts slackQuotedSession). The spawn-failure notice's
+# first line is the printed restart-cap notice's first line.
 set -euo pipefail
 
 TEST_NAME="test-28-fmk-provenance"
@@ -312,8 +331,11 @@ PROBE_LINES="$(_scenario_printed "${STEP_VALUES}" PROBE_PANE_READ_LINES)"
 READ_PANE="$(_scenario_printed "${STEP_VALUES}" PANE_READ_PANE)"
 # src/config.ts.
 POLL_INTERVAL_MS="$(_scenario_printed "${STEP_VALUES}" MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS)"
-# src/unavailable-retry.ts.
-RETRY_BASE_S="$(_scenario_printed "${STEP_VALUES}" UNAVAILABLE_RETRY_BASE_S)"
+# src/unavailable-retry.ts over src/backoff.ts doublingBackoffDelay: when the
+# retry timer's third and fourth retries fall due after its arm (the first
+# refusal), each later wait doubling the one before up to its ceiling (SRJ-302).
+RETRY_THIRD_S="$(_scenario_printed "${STEP_VALUES}" unavailableRetryDueS 3)"
+RETRY_FOURTH_S="$(_scenario_printed "${STEP_VALUES}" unavailableRetryDueS 4)"
 # src/ad-description-phrases.ts.
 DIFFERENT_SERVER_PHRASE="$(_scenario_printed "${STEP_VALUES}" DIFFERENT_TMUX_SERVER_PHRASE)"
 # src/outage-state.ts, as each persona's notice (src/persona-notifier.ts formatPersonaNotice).
@@ -332,7 +354,6 @@ RECONNECT_GONE_HEAD="$(_scenario_printed "${STEP_VALUES}" reconnectGoneLineHead)
 
 
 # Legs 5 to 7 (E49 T3).
-REF_A="$(persona_ref "${PERSONA_A}")"
 REF_B="$(persona_ref "${PERSONA_B}")"
 SESSION_B="$(_scenario_printed "${STEP_VALUES}" personaTmuxSessionName "${KEY_B}")"
 # src/pane-read.ts.
@@ -341,9 +362,12 @@ READ_GONE="$(_scenario_printed "${STEP_VALUES}" PANE_READ_GONE)"
 OWN_ID_PHRASE="$(_scenario_printed "${STEP_VALUES}" CONFLICT_OWN_ID_PHRASE)"
 STOPPING_PHRASE="$(_scenario_printed "${STEP_VALUES}" STILL_STOPPING_PHRASE)"
 STARTING_PHRASE="$(_scenario_printed "${STEP_VALUES}" STILL_STARTING_PHRASE)"
-# src/ad-settings.ts: agent-director's defaults (no `[tmux]` table here).
-STOPPING_WINDOW_S="$(_scenario_printed "${STEP_VALUES}" DEFAULT_AD_SETTINGS stopping_window_seconds)"
-STARTING_BOUND_S="$(_scenario_printed "${STEP_VALUES}" DEFAULT_AD_SETTINGS starting_session_seconds)"
+# src/ad-settings.ts: agent-director's defaults (no `[tmux]` table here), in
+# the package's `[tmux]` table under agent-director's own key names (the
+# printer refuses a key the package records no default for).
+TMUX_TABLE="$(_scenario_printed "${STEP_VALUES}" AD_TMUX_TABLE)"
+STOPPING_WINDOW_S="$(_scenario_printed "${STEP_VALUES}" DEFAULT_AD_SETTINGS "${TMUX_TABLE}" stopping_window_seconds)"
+STARTING_BOUND_S="$(_scenario_printed "${STEP_VALUES}" DEFAULT_AD_SETTINGS "${TMUX_TABLE}" starting_session_seconds)"
 # src/conflict-latch.ts.
 RECHECK_MS="$(_scenario_printed "${STEP_VALUES}" LATCH_RECHECK_INTERVAL_MS)"
 OWN_ID_CASE="$(_scenario_printed "${STEP_VALUES}" LATCH_CASE_OWN_ID)"
@@ -356,8 +380,7 @@ CONFLICT_RECOVERY_A="$(_scenario_printed "${STEP_VALUES}" formatPersonaNotice "$
 # src/persona-episodes.ts: the tmux-unresponsive onset and alert (SRJ-1006),
 # which an UNAVAILABLE of leg 6's resume may post before the latch.
 UNRESPONSIVE_ONSET_A="$(_scenario_printed "${STEP_VALUES}" formatPersonaNotice "${PERSONA_A}" tmuxUnresponsiveOnsetText "${KEY_A}")"
-UNRESPONSIVE_ALERT_A="$(_scenario_printed "${STEP_VALUES}" formatPersonaNotice "${PERSONA_A}" \
-    tmuxUnresponsiveAlertText "${KEY_A}" DEFAULT_AD_SETTINGS_IN_EFFECT)"
+UNRESPONSIVE_ALERT_A="$(_scenario_printed "${STEP_VALUES}" formatPersonaNotice "${PERSONA_A}" tmuxUnresponsiveAlertText "${KEY_A}")"
 CALL_PROBE="$(_scenario_printed "${STEP_VALUES}" RECHECK_CALL_PROBE)"
 CALL_RESUME="$(_scenario_printed "${STEP_VALUES}" RECHECK_CALL_RESUME)"
 CALL_NONE="$(_scenario_printed "${STEP_VALUES}" RECHECK_CALL_NONE)"
@@ -375,9 +398,28 @@ SPAWN_FAILURE_HEAD="${CAP_NOTICE%%$'\n'*}"
 # src/session-manager.ts latchClearRetryAnsweredLine: the head of the
 # after-clear retry's answer line, before the outcome it carries.
 RETRY_AT_ONCE_HEAD_B="$(_scenario_printed "${STEP_VALUES}" latchClearRetryAtOnceLineHead "${REF_B}")"
+# src/conflict-latch.ts conflictLatchSetLine: the head of A's and B's latch
+# lines, up to and including `case=` (agent-director's description follows
+# the case).
+LATCH_HEAD_A="$(_scenario_printed "${STEP_VALUES}" conflictLatchSetLineHead "${KEY_A}" latched)"
+LATCH_HEAD_B="$(_scenario_printed "${STEP_VALUES}" conflictLatchSetLineHead "${KEY_B}" latched)"
+# src/conflict-latch.ts latchRecheckRoundLine, printed whole: leg 6's probe
+# cleared (the answer src/session-manager.ts runLatchRecheckRound composes
+# inline, `probe-cleared (<pane read kind>); …`, matched up to the `;`, and
+# the call `<probe>+find-missing+<retry>`, latchRecheckClearedProbeRetry's
+# label), and leg 7's status-only rounds (the answers `still-latched` and
+# `cleared (<step>)`, composed inline there too).
+ROUND_CLEARED_A="$(_scenario_printed "${STEP_VALUES}" latchRecheckRoundLine "${PERSONA_A}" "${OWN_ID_CASE}" \
+    "${STEP_TABLE}" "${CALL_PROBE}+find-missing+${CALL_RESUME}" "probe-cleared (${READ_GONE});")"
+ROUND_HELD_B="$(_scenario_printed "${STEP_VALUES}" latchRecheckRoundLine "${PERSONA_B}" "${HOLD_CASE}" \
+    "${STEP_TABLE}" "${CALL_NONE}" "${VERDICT_STILL_LATCHED}")"
+ROUND_CLEARED_B="$(_scenario_printed "${STEP_VALUES}" latchRecheckRoundLine "${PERSONA_B}" "${HOLD_CASE}" \
+    "${STEP_TABLE}" "${CALL_NONE}" "cleared (${STEP_TABLE})")"
 
-[[ "${PROBE_LINES}" =~ ^[1-9][0-9]*$ && "${POLL_INTERVAL_MS}" =~ ^[1-9][0-9]*$ && "${RETRY_BASE_S}" =~ ^[1-9][0-9]*$ ]] \
-    || fail "${STEP_VALUES}: the probe's line count '${PROBE_LINES}', the poll interval '${POLL_INTERVAL_MS}' or the retry base '${RETRY_BASE_S}' is not a whole number"
+[[ "${PROBE_LINES}" =~ ^[1-9][0-9]*$ && "${POLL_INTERVAL_MS}" =~ ^[1-9][0-9]*$ ]] \
+    || fail "${STEP_VALUES}: the probe's line count '${PROBE_LINES}' or the poll interval '${POLL_INTERVAL_MS}' is not a whole number"
+[[ "${RETRY_THIRD_S}" =~ ^[1-9][0-9]*$ && "${RETRY_FOURTH_S}" =~ ^[1-9][0-9]*$ && "${RETRY_THIRD_S}" -lt "${RETRY_FOURTH_S}" ]] \
+    || fail "${STEP_VALUES}: the third and fourth retries' due times '${RETRY_THIRD_S}' and '${RETRY_FOURTH_S}' are not rising whole numbers"
 [[ -n "${SPAWN_FAILURE_HEAD}" && "${SPAWN_FAILURE_HEAD}" != "${CAP_NOTICE}" ]] \
     || fail "${STEP_VALUES}: the restart-cap notice '${CAP_NOTICE}' has no first line of its own"
 [[ "${RECHECK_MS}" =~ ^[1-9][0-9]*$ && "${STOPPING_WINDOW_S}" =~ ^[1-9][0-9]*$ && "${STARTING_BOUND_S}" =~ ^[1-9][0-9]*$ ]] \
@@ -385,10 +427,6 @@ RETRY_AT_ONCE_HEAD_B="$(_scenario_printed "${STEP_VALUES}" latchClearRetryAtOnce
 RECHECK_S=$(( (RECHECK_MS + 999) / 1000 ))
 [[ "${CHANGED_ONSET_A}" != "${GENERIC_ONSET_A}" && "${CHANGED_ONSET_B}" != "${GENERIC_ONSET_B}" ]] \
     || fail "${STEP_VALUES}: the tmux-server-changed onset is the generic tmux-unavailable onset"
-# The retry timer's waits double from the base (SRJ-302): its third retry is
-# due 1 + 2 + 4 bases after the first refusal, its fourth 1 + 2 + 4 + 8.
-RETRY_THIRD_S=$(( RETRY_BASE_S * 7 ))
-RETRY_FOURTH_S=$(( RETRY_BASE_S * 15 ))
 # Leg 6's resume meets the own-id CONFLICT once the session is older than the
 # starting-session bound and the row ended more than the stopping window ago;
 # the retry timer's fourth retry is past both, from any start.
@@ -459,7 +497,9 @@ row_json() {
 # True when row <id> reads <state> (a read-only store read, which adds no
 # line to the shim's log).
 row_reads() {
-    [[ "$(_scenario_store_read "row state" "SELECT state FROM spawns WHERE claude_instance_id = '$1'")" == "$2" ]]
+    local state
+    state="$(_scenario_store_read "row state" "SELECT state FROM spawns WHERE claude_instance_id = '$1'")" || exit 1
+    [[ "${state}" == "$2" ]]
 }
 
 both_rows_read() {
@@ -547,7 +587,7 @@ start_and_settle() {
     local step="$1"
     start_server --live
     START_COUNT=$(( START_COUNT + 1 ))
-    wait_for_count "$(completion_match 2)" "${START_COUNT}" "${START_WAIT_S}" "${step}: start pass ${START_COUNT} never completed"
+    wait_for_count "${COMPLETE_2}" "${START_COUNT}" "${START_WAIT_S}" "${step}: start pass ${START_COUNT} never completed"
     wait_until "${REPORT_WAIT_S}" "${step}: the rows never both read waiting" both_rows_read waiting
 }
 
@@ -705,6 +745,50 @@ ad_parented_tmux_count() {
         _scenario_decode_words || continue
         printf -v rest '%s ' ${_L_WORDS[@]+"${_L_WORDS[@]}"}
         [[ "${rest}" == *"$1"* ]] || continue
+        _scenario_eval_words parent "${_L_PARENT}" || continue
+        w="${parent[0]:-}"
+        [[ "${w##*/}" == agent-director || "${w##*/}" == agent-director.real ]] && n=$(( n + 1 ))
+    done
+    echo "${n}"
+}
+
+# A tmux shim line (or its words) that ends a session or a pane.
+TMUX_KILL_RE='(^|[[:space:]])kill-(session|pane)([[:space:]]|$)'
+
+# tmux_shim_mark: print how many lines the tmux shim's log holds now (0 when
+# it holds none).
+tmux_shim_mark() {
+    if [[ -f "${SCENARIO_TMUX_SHIM_LOG}" ]]; then
+        wc -l < "${SCENARIO_TMUX_SHIM_LOG}" | tr -d ' '
+    else
+        echo 0
+    fi
+}
+
+# tmux_kill_lines <from-mark>: print how many of the tmux shim log's lines
+# after <from-mark>, whatever their parent, match TMUX_KILL_RE.
+tmux_kill_lines() {
+    local lines=() line n=0
+    [[ -f "${SCENARIO_TMUX_SHIM_LOG}" ]] || fail "tmux_kill_lines: no tmux shim log at ${SCENARIO_TMUX_SHIM_LOG}"
+    mapfile -t lines < <(tail -n "+$(( $1 + 1 ))" "${SCENARIO_TMUX_SHIM_LOG}")
+    for line in ${lines[@]+"${lines[@]}"}; do
+        [[ "${line}" =~ ${TMUX_KILL_RE} ]] && n=$(( n + 1 ))
+    done
+    echo "${n}"
+}
+
+# ad_parented_tmux_kills <from-mark> <to-mark>: print how many tmux shim
+# `call` lines after <from-mark> up to <to-mark> match TMUX_KILL_RE (the line
+# as tmux_kill_lines reads it) and have an agent-director process as their
+# parent (as for ad_parented_tmux_count).
+ad_parented_tmux_kills() {
+    local lines=() line parent=() n=0 w
+    [[ -f "${SCENARIO_TMUX_SHIM_LOG}" ]] || fail "ad_parented_tmux_kills: no tmux shim log at ${SCENARIO_TMUX_SHIM_LOG}"
+    (( $2 > $1 )) || { echo 0; return 0; }
+    mapfile -t lines < <(sed -n "$(( $1 + 1 )),$2p" "${SCENARIO_TMUX_SHIM_LOG}")
+    for line in ${lines[@]+"${lines[@]}"}; do
+        [[ "${line}" =~ ${TMUX_KILL_RE} ]] || continue
+        _scenario_split_line "${line}" && [[ "${_L_KIND}" == call && "${_L_PARENT}" != '?' ]] || continue
         _scenario_eval_words parent "${_L_PARENT}" || continue
         w="${parent[0]:-}"
         [[ "${w##*/}" == agent-director || "${w##*/}" == agent-director.real ]] && n=$(( n + 1 ))
@@ -906,19 +990,39 @@ session_id_of() {
     "${SCENARIO_REAL_TMUX}" display-message -p -t "=$1:" '#{session_id}' 2> /dev/null || true
 }
 
-# True when row <id> has been marked `missing` since <old-token> was noted:
-# it reads `missing`, the find-missing loop's log lists it, or it records
-# another launch (a relaunch after the mark may already have moved it on).
+# row_token <step> <id>: print row <id>'s launch token (empty when it has
+# none); fail when the row cannot be read.
+row_token() {
+    local row
+    row="$(row_json "$1" "$2")" || exit 1
+    [[ -n "${row}" && "${row}" != null ]] || fail "$1: no row ${2} to read"
+    jq -r '.launch_token // empty' <<< "${row}" || fail "$1: jq could not read row ${2}"
+}
+
+# marked_missing <id> <old-token> <runs-before>: true when row <id> has been
+# marked `missing` since <old-token> was noted: it reads `missing`, a
+# find-missing loop run after run <runs-before> (each run's output,
+# run.<n>.out, a JSON object) lists it in its `ids`, or it records another
+# launch (a relaunch after the mark may already have moved it on). A run
+# whose output is not yet whole JSON lists nothing.
 marked_missing() {
-    row_reads "$1" missing && return 0
-    grep -qF -- "\"$1\"" "${FIND_MISSING_LOOP_LOG}" 2> /dev/null && return 0
-    [[ "$(jq -r '.launch_token // empty' <<< "$(row_json marked_missing "$1")")" != "$2" ]]
+    local id="$1" old="$2" from="$3" runs n token
+    row_reads "${id}" missing && return 0
+    runs="$(find_missing_loop_runs)" || exit 1
+    for (( n = from + 1; n <= runs; n++ )); do
+        jq -e --arg id "${id}" '.ids | index($id) != null' "${SCENARIO_ROOT}/find-missing-loop/run.${n}.out" > /dev/null 2>&1 \
+            && return 0
+    done
+    token="$(row_token marked_missing "${id}")" || exit 1
+    [[ "${token}" != "${old}" ]]
 }
 
 # True when row <id> reads `waiting` with a launch token other than <old-token>.
 relaunched_waiting() {
-    row_reads "$1" waiting \
-        && [[ "$(jq -r '.launch_token // empty' <<< "$(row_json relaunched_waiting "$1")")" != "$2" ]]
+    local token
+    row_reads "$1" waiting || return 1
+    token="$(row_token relaunched_waiting "$1")" || exit 1
+    [[ "${token}" != "$2" ]]
 }
 
 # ---------------------------------------------------------------------------
@@ -939,10 +1043,15 @@ EMPTY_TMPDIR="${SCENARIO_ROOT}/tmux-empty"
 mkdir -m 700 "${EMPTY_TMPDIR}" || fail "${STEP}: could not create ${EMPTY_TMPDIR}"
 
 start_slack_stub "${SCENARIO_ROOT}/slack-stub" "${SUFFIX_A}" "${SUFFIX_B}"
-printf '{"bot_token": "%s", "app_token": "%s"}\n' "$(fake_token bot "${SUFFIX_A}")" "$(fake_token app "${SUFFIX_A}")" \
-    | write_file "${CREDS}/alpha.json" 600
-printf '{"bot_token": "%s", "app_token": "%s"}\n' "$(fake_token bot "${SUFFIX_B}")" "$(fake_token app "${SUFFIX_B}")" \
-    | write_file "${CREDS}/beta.json" 600
+for suffix in "${SUFFIX_A}" "${SUFFIX_B}"; do
+    BOT_TOKEN="$(fake_token bot "${suffix}")"
+    APP_TOKEN="$(fake_token app "${suffix}")"
+    file="${CREDS}/alpha.json"
+    [[ "${suffix}" == "${SUFFIX_B}" ]] && file="${CREDS}/beta.json"
+    printf '{"bot_token": "%s", "app_token": "%s"}\n' "${BOT_TOKEN}" "${APP_TOKEN}" | write_file "${file}" 600
+done
+# The start pass's completion line for both personas.
+COMPLETE_2="$(completion_match 2)"
 write_personas_config 0
 
 STEP="leg 1 (start)"
@@ -988,7 +1097,8 @@ echo "${TEST_NAME}: ${STEP}: CSCB calls of ${ID_A} since the restart: ${WIN_VERB
 SLICE="$(log_slice "${LOG_R}")"
 # src/session-manager.ts reconnectGoneLine: the head, then the persona's
 # reference (renderPersonaRef's or the bare key's form), which holds the key.
-for m in "${WAITING_GONE_HEAD_A}" "${ESCALATE_HEAD_A}" "$(matcher "${RECONNECT_GONE_HEAD}" "${KEY_A}")"; do
+RECONNECT_GONE_A="$(matcher "${RECONNECT_GONE_HEAD}" "${KEY_A}")"
+for m in "${WAITING_GONE_HEAD_A}" "${ESCALATE_HEAD_A}" "${RECONNECT_GONE_A}"; do
     n="$(count_in "${SLICE}" "${m}")"
     [[ "${n}" == 0 ]] || fail "${STEP}: server.log holds ${n} line(s) '$(matcher_text "${m}")' since the restart"
 done
@@ -1008,6 +1118,10 @@ expect_nothing_launched "${STEP}" "${MARK_R}" "${ID_A}"
 # The teardown: its precheck's pane read and its kill, both by the CLI.
 STEP="leg 2 (teardown)"
 MARK_T="$(ad_shim_mark)"
+# The tmux shim's log before the teardown: the window in which
+# agent-director's own kill of A's session (on the teardown's `kill`) is
+# leg 6's positive control.
+TMUX_MARK_T="$(tmux_shim_mark)"
 stop_server --stop-bots
 STOP_PID="$(last_record_pid stop)"
 [[ "${STOP_PID}" =~ ^[0-9]+$ ]] || fail "${STEP}: the record holds no stop run"
@@ -1028,6 +1142,13 @@ for i in "${!WIN_VERBS[@]}"; do
 done
 wait_until "${KILL_END_WAIT_S}" "${STEP}: the renamed session ${RENAMED_A} outlived the teardown" no_session "${RENAMED_A}"
 wait_until "${KILL_END_WAIT_S}" "${STEP}: A's worker outlived the teardown" worker_gone "${ID_A}"
+TMUX_MARK_T_END="$(tmux_shim_mark)"
+# Leg 6's positive control: the tmux kill form agent-director uses for a
+# kill, seen through the same regex leg 6 scans with.
+TEARDOWN_TMUX_KILLS="$(ad_parented_tmux_kills "${TMUX_MARK_T}" "${TMUX_MARK_T_END}")"
+(( TEARDOWN_TMUX_KILLS >= 1 )) \
+    || fail "${STEP}: positive control: no agent-director-parented tmux shim line matching '${TMUX_KILL_RE}' during the teardown's kill"
+echo "${TEST_NAME}: ${STEP}: ${TEARDOWN_TMUX_KILLS} agent-director-parented tmux line(s) matching '${TMUX_KILL_RE}' during the teardown"
 
 STEP="leg 2 (start again)"
 start_and_settle "${STEP}"
@@ -1072,7 +1193,8 @@ POSTS_S="$(slack_record_mark "${RECORD}")"
 MARK_S="$(ad_shim_mark)"
 rebind_tmux_socket > "${SCENARIO_ROOT}/rebind.out"
 MOVED_SOCKET="${REBOUND_SOCKET}"
-echo "${TEST_NAME}: ${STEP}: re-bound: $(cat "${SCENARIO_ROOT}/rebind.out")"
+rebound="$(cat -- "${SCENARIO_ROOT}/rebind.out")" || fail "${STEP}: could not read rebind_tmux_socket's output"
+echo "${TEST_NAME}: ${STEP}: re-bound: ${rebound}"
 
 LOG_S="$(wc -l < "${SLACK_STATE_DIR}/server.log")"
 for id in "${ID_A}" "${ID_B}"; do
@@ -1081,7 +1203,7 @@ done
 stop_server
 start_server --live
 START_COUNT=$(( START_COUNT + 1 ))
-wait_for_count "$(completion_match 2)" "${START_COUNT}" "${START_WAIT_S}" "${STEP}: start pass ${START_COUNT} never completed"
+wait_for_count "${COMPLETE_2}" "${START_COUNT}" "${START_WAIT_S}" "${STEP}: start pass ${START_COUNT} never completed"
 wait_until "${POST_WAIT_S}" "${STEP}: no post for ${PERSONA_A} after the restart" posts_at_least "${SUFFIX_A}" "${POSTS_S}" 1
 wait_until "${POST_WAIT_S}" "${STEP}: no post for ${PERSONA_B} after the restart" posts_at_least "${SUFFIX_B}" "${POSTS_S}" 1
 ONSET_AT="$(date +%s)"
@@ -1166,10 +1288,13 @@ declare -A OLD_TOKEN=()
 for id in "${ID_A}" "${ID_B}"; do
     OLD_TOKEN[${id}]="${LAUNCH_TOKEN[${id}]}"
 done
-echo "${TEST_NAME}: ${STEP}: restarted: $(restart_tmux_server)"
+restarted="$(restart_tmux_server)" || exit 1
+echo "${TEST_NAME}: ${STEP}: restarted: ${restarted}"
+FM_RUNS_BEFORE="$(find_missing_loop_runs)"
 run_find_missing_loop "${FM_INTERVAL_S}"
 for id in "${ID_A}" "${ID_B}"; do
-    wait_until "${MARK_WAIT_S}" "${STEP}: row ${id} was never marked missing" marked_missing "${id}" "${OLD_TOKEN[${id}]}"
+    wait_until "${MARK_WAIT_S}" "${STEP}: row ${id} was never marked missing" \
+        marked_missing "${id}" "${OLD_TOKEN[${id}]}" "${FM_RUNS_BEFORE}"
 done
 stop_find_missing_loop
 sed 's/^/  loop| /' "${FIND_MISSING_LOOP_LOG}"
@@ -1201,8 +1326,9 @@ for persona in "${PERSONA_A}" "${PERSONA_B}"; do
     expect_one_relaunch "${STEP}" "${id}"
     # The restart path's decision: its liveness read found the row missing,
     # then its launch with no kill (src/restart.ts killBeforeRelaunch).
-    for m in "$(_scenario_printed "${STEP}" relaunchWithoutKillLine "${key}" RELAUNCH_NO_KILL_ROW_READ LIVENESS_READING_DEAD_MISSING)" \
-        "$(_scenario_printed "${STEP}" relaunchAfterKillLine "${key}" "${work}" RELAUNCH_KILL_NONE)"; do
+    without_kill="$(_scenario_printed "${STEP}" relaunchWithoutKillLine "${key}" RELAUNCH_NO_KILL_ROW_READ LIVENESS_READING_DEAD_MISSING)"
+    after_kill="$(_scenario_printed "${STEP}" relaunchAfterKillLine "${key}" "${work}" RELAUNCH_KILL_NONE)"
+    for m in "${without_kill}" "${after_kill}"; do
         n="$(count_in "${SLICE}" "${m}")"
         [[ "${n}" == 1 ]] || fail "${STEP}: server.log holds ${n} line(s) '${m}' for ${persona} since the tmux restart, not 1"
     done
@@ -1241,12 +1367,15 @@ if (( wait_s > 0 )); then
 fi
 POSTS_E="$(slack_record_mark "${RECORD}")"
 MARK_E="$(ad_shim_mark)"
-TMUX_MARK_E="$(wc -l < "${SCENARIO_TMUX_SHIM_LOG}")"
+TMUX_MARK_E="$(tmux_shim_mark)"
 set_remain_on_exit "${SESSION_A}"
 SID_A_DEAD="$(session_id_of "${SESSION_A}")"
 [[ "${SID_A_DEAD}" =~ ^\$[0-9]+$ ]] || fail "${STEP}: no session ${SESSION_A} on the scenario's tmux server"
-pane_a="$(jq -r '.pane_id // empty' <<< "$(row_json "${STEP}" "${ID_A}")")"
-echo "${TEST_NAME}: ${STEP}: ended: $(end_worker_without_session_end "${pane_a}")"
+row="$(row_json "${STEP}" "${ID_A}")"
+pane_a="$(jq -r '.pane_id // empty' <<< "${row}")"
+[[ "${pane_a}" =~ ^%[0-9]+$ ]] || fail "${STEP}: row ${ID_A} records pane '${pane_a}', not a pane id"
+ended="$(end_worker_without_session_end "${pane_a}")" || exit 1
+echo "${TEST_NAME}: ${STEP}: ended: ${ended}"
 row_reads "${ID_A}" waiting || fail "${STEP}: row ${ID_A} no longer reads waiting right after its worker ended"
 has_session "${SESSION_A}" || fail "${STEP}: session ${SESSION_A} did not remain after its worker ended"
 run_find_missing_loop "${FM_INTERVAL_S}"
@@ -1263,10 +1392,10 @@ stop_server
 start_server --live
 START_COUNT=$(( START_COUNT + 1 ))
 RESTART_AT="$(date +%s)"
-wait_for_count "$(completion_match 2)" "${START_COUNT}" "${START_WAIT_S}" "${STEP}: start pass ${START_COUNT} never completed"
-# src/conflict-latch.ts conflictLatchSetLine: the latch line's head; its tail
-# carries agent-director's description.
-LATCH_OWN_ID_A="$(matcher "[slack] conflict-latch: persona=${KEY_A} latched — case=${OWN_ID_CASE}" "${OWN_ID_PHRASE}")"
+wait_for_count "${COMPLETE_2}" "${START_COUNT}" "${START_WAIT_S}" "${STEP}: start pass ${START_COUNT} never completed"
+# A's own-id latch line: its printed head and case, then agent-director's
+# description, which carries the own-id phrase.
+LATCH_OWN_ID_A="$(matcher "${LATCH_HEAD_A}${OWN_ID_CASE} " "${OWN_ID_PHRASE}")"
 wait_for_log "${LATCH_OWN_ID_A}" $(( RETRY_FOURTH_S + RETRY_ALLOWANCE_S )) "${STEP}: ${PERSONA_A} never latched on '${OWN_ID_PHRASE}'"
 echo "${TEST_NAME}: ${STEP}: latched $(( $(date +%s) - RESTART_AT ))s after the restart"
 SLICE="$(log_slice "${LOG_E}")"
@@ -1334,8 +1463,10 @@ done
 row="$(row_json "${STEP}" "${ID_A}")"
 [[ "$(jq -r '.state' <<< "${row}")" == missing && "$(jq -r '.launch_token // empty' <<< "${row}")" == "${LAUNCH_TOKEN[${ID_A}]}" ]] \
     || fail "${STEP}: row ${ID_A} no longer reads missing with its launch token: $(jq -c '{state, launch_token}' <<< "${row}")"
-n="$(tail -n "+$(( TMUX_MARK_E + 1 ))" "${SCENARIO_TMUX_SHIM_LOG}" | grep -cE '(^|[[:space:]])kill-(session|pane)([[:space:]]|$)' || true)"
-[[ "${n:-0}" == 0 ]] || fail "${STEP}: the tmux shim's log holds ${n} kill-session or kill-pane line(s) since the leg began"
+# Leg 2's teardown showed agent-director's kill through this regex (its
+# positive control, TEARDOWN_TMUX_KILLS); none since this leg began.
+n="$(tmux_kill_lines "${TMUX_MARK_E}")"
+[[ "${n}" == 0 ]] || fail "${STEP}: the tmux shim's log holds ${n} line(s) matching '${TMUX_KILL_RE}' since the leg began"
 [[ "$(session_id_of "${SESSION_A}")" == "${SID_A_DEAD}" ]] || fail "${STEP}: the dead session ${SID_A_DEAD} is no longer ${SESSION_A}"
 
 STEP="leg 6 (dead session removed)"
@@ -1352,10 +1483,7 @@ for i in "${!WIN_VERBS[@]}"; do
         || fail "${STEP}: its ${WIN_VERBS[i]} has parent ${WIN_PPIDS[i]}, not the bot server ${SERVER_PID}"
 done
 [[ " ${WIN_ARGS[1]} " == *" --n-lines ${PROBE_LINES} "* ]] || fail "${STEP}: its read-pane does not read ${PROBE_LINES} line(s): ${WIN_ARGS[1]}"
-# The re-check round line (src/conflict-latch.ts latchRecheckRoundLine) with
-# the answer src/session-manager.ts runLatchRecheckRound composes inline.
-ROUND_CLEARED_A="$(matcher "[slack] conflict-latch: re-check of ${REF_A} — case=${OWN_ID_CASE} " \
-    " call=${CALL_PROBE}+find-missing+${CALL_RESUME} answer=probe-cleared (${READ_GONE})")"
+# The re-check round line (ROUND_CLEARED_A, printed with the values).
 wait_for_log "${ROUND_CLEARED_A}" "${POST_WAIT_S}" "${STEP}: the round logged no probe cleared on ${READ_GONE}"
 wait_until "${REPORT_WAIT_S}" "${STEP}: the resumed row never reported in (waiting)" row_reads "${ID_A}" waiting
 expect_status "${STEP}" "${ID_A}" waiting
@@ -1366,6 +1494,12 @@ posts_of "${SUFFIX_A}" "${POSTS_E}"
 (( ${#POSTS[@]} == want )) || fail "${STEP}: ${#POSTS[@]} posts for ${PERSONA_A} in the leg, not ${want} (the latch post and the recovery post after ${UNRESPONSIVE_POSTS} tmux-unresponsive post(s))"
 [[ "${POSTS[want-2]}" == "${LATCH_POST}" ]] || fail "${STEP}: the latch post changed: ${POSTS[want-2]}"
 [[ "${POSTS[want-1]}" == "${CONFLICT_RECOVERY_A}" ]] || fail "${STEP}: the recovery post reads '${POSTS[want-1]}', not '${CONFLICT_RECOVERY_A}'"
+# One find-missing and one resume over the whole window since the dead
+# session's removal, not only up to the first resume.
+n="$(cscb_ad_count_between "${MARK_H}" - resume "--claude-instance-id ${ID_A}")"
+[[ "${n}" == 1 ]] || fail "${STEP}: CSCB made ${n} resume call(s) of ${ID_A} since the dead session's removal, not 1"
+n="$(cscb_ad_count_between "${MARK_H}" - find-missing)"
+[[ "${n}" == 1 ]] || fail "${STEP}: CSCB made ${n} find-missing call(s) since the dead session's removal, not 1"
 note_worker "${STEP}" "${ID_A}"
 
 # ---------------------------------------------------------------------------
@@ -1382,18 +1516,15 @@ SID_B_OLD="$(session_id_of "${SESSION_B}")"
 [[ "${SID_B_OLD}" =~ ^\$[0-9]+$ ]] || fail "${STEP}: no session ${SESSION_B} on the scenario's tmux server"
 ad_store_pending_no_launch "${ID_B}"
 expect_worker_runs "${STEP}" "${ID_B}"
-# src/conflict-latch.ts conflictLatchSetLine: the latch line's head.
-LATCH_HOLD_B="[slack] conflict-latch: persona=${KEY_B} latched — case=${HOLD_CASE}"
-# The status-only re-check's round lines (src/conflict-latch.ts
-# latchRecheckRoundLine), with the answers src/session-manager.ts
-# runLatchRecheckRound composes inline (`still-latched`, `cleared (<step>)`).
-ROUND_HELD_B="[slack] conflict-latch: re-check of ${REF_B} — case=${HOLD_CASE} step=${STEP_TABLE} call=${CALL_NONE} answer=${VERDICT_STILL_LATCHED}"
-ROUND_CLEARED_B="[slack] conflict-latch: re-check of ${REF_B} — case=${HOLD_CASE} step=${STEP_TABLE} call=${CALL_NONE} answer=cleared (${STEP_TABLE})"
+# B's latch line: its printed head and the hold case. The status-only
+# re-check's round lines are ROUND_HELD_B and ROUND_CLEARED_B (printed with
+# the values).
+LATCH_HOLD_B="${LATCH_HEAD_B}${HOLD_CASE} "
 held_before="$(count_log "${ROUND_HELD_B}")"
 stop_server
 start_server --live
 START_COUNT=$(( START_COUNT + 1 ))
-wait_for_count "$(completion_match 2)" "${START_COUNT}" "${START_WAIT_S}" "${STEP}: start pass ${START_COUNT} never completed"
+wait_for_count "${COMPLETE_2}" "${START_COUNT}" "${START_WAIT_S}" "${STEP}: start pass ${START_COUNT} never completed"
 wait_for_log "${LATCH_HOLD_B}" "${START_WAIT_S}" "${STEP}: ${PERSONA_B} never latched with '${HOLD_CASE}'"
 MARK_L="$(ad_shim_mark)"
 wait_until "${POST_WAIT_S}" "${STEP}: no post for ${PERSONA_B} after the latch" posts_at_least "${SUFFIX_B}" "${POSTS_P}" 1
@@ -1456,8 +1587,9 @@ n="$(count_log "${RETRY_AT_ONCE_HEAD_B}")"
 window_any "${STEP}" "${MARK_HELD}" "${MARK_R}" "${ID_B}"
 expect_one_relaunch "${STEP}" "${ID_B}"
 SLICE="$(log_slice "${LOG_P}")"
-for m in "$(_scenario_printed "${STEP}" relaunchWithoutKillLine "${KEY_B}" RELAUNCH_NO_KILL_ROW_READ LIVENESS_READING_DEAD_MISSING)" \
-    "$(_scenario_printed "${STEP}" relaunchAfterKillLine "${KEY_B}" "${WORK_B}" RELAUNCH_KILL_NONE)"; do
+without_kill="$(_scenario_printed "${STEP}" relaunchWithoutKillLine "${KEY_B}" RELAUNCH_NO_KILL_ROW_READ LIVENESS_READING_DEAD_MISSING)"
+after_kill="$(_scenario_printed "${STEP}" relaunchAfterKillLine "${KEY_B}" "${WORK_B}" RELAUNCH_KILL_NONE)"
+for m in "${without_kill}" "${after_kill}"; do
     n="$(count_in "${SLICE}" "${m}")"
     [[ "${n}" == 1 ]] || fail "${STEP}: server.log holds ${n} line(s) '${m}' since the leg began, not 1"
 done
@@ -1469,7 +1601,9 @@ SLICE="$(log_slice "${LOG_P}")"
 echo_log_lines "${STEP}" "${SLICE}" "${RETRY_AT_ONCE_HEAD_B}"
 echo_log_lines "${STEP}" "${SLICE}" "persona=${KEY_B} "
 echo_posts "${STEP}" "${SUFFIX_B}" "${POSTS_P}"
-echo "${TEST_NAME}: ${STEP}: row ${ID_B}: $(jq -c '{state, launch_token, pid}' <<< "$(row_json "${STEP}" "${ID_B}")")"
+row="$(row_json "${STEP}" "${ID_B}")"
+summary="$(jq -c '{state, launch_token, pid}' <<< "${row}")" || fail "${STEP}: jq could not read row ${ID_B}"
+echo "${TEST_NAME}: ${STEP}: row ${ID_B}: ${summary}"
 if [[ "$(session_id_of "${SESSION_B}")" == "${SID_B_OLD}" ]]; then
     end_session "${SID_B_OLD}"
     echo "${TEST_NAME}: ${STEP}: the old session ${SID_B_OLD} ended by the harness"

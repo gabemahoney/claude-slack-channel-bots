@@ -72,33 +72,51 @@
  *                                                package's personaKey, as the config
  *                                                loader derives it)
  *
- *   Scenario 10 (test-22-fmk-wrong-server.sh):
+ *   Scenario 10 (test-22-fmk-wrong-server.sh). An entry of the same name in
+ *   another scenario's lane takes the same arguments and prints the same value:
  *   personaInstanceId <key>                      src/persona-identity.ts, `cscb_<key>`
  *   personaTmuxSessionName <key>                 src/persona-identity.ts, `slack_bot_<key>`
  *   CONFLICT_NOTICE_FIRST_LINE_HEAD              src/conflict-latch.ts, the CONFLICT notice's parts
  *   CONFLICT_NOTICE_POINTER_LINE                 (SRJ-1004) CSCB writes around agent-director's
  *   CONFLICT_NOTICE_HUMAN_ONLY_LINE              description
- *   conflictCaseSentence <latch-case>            src/conflict-latch.ts, a case's sentence (a case
+ *   conflictCaseSentence <case>                  src/conflict-latch.ts, a latch case's sentence
+ *                                                (<case> one of the package's LATCH_CASES; a case
  *                                                with none is a failure)
  *   LATCH_CASE_OWN_ID                            src/conflict-latch.ts, the "this row's own id" case
- *   conflictRecoveryText <session-name> <reason-export>
+ *   conflictRecoveryText <session-name> <reason>
  *                                                src/conflict-latch.ts, the CONFLICT recovery
- *                                                notice's body; <reason-export> names one of the
- *                                                package's LATCH_RECOVERY_REASON_* values without
- *                                                a state (LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED,
- *                                                for one)
+ *                                                notice's body; <reason> is one of
+ *                                                LATCH_RECOVERY_REASON_ROW_GONE,
+ *                                                LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED,
+ *                                                LATCH_RECOVERY_REASON_RELAUNCH_NOT_REFUSED,
+ *                                                LATCH_RECOVERY_REASON_CLEARED_BY_HAND, or
+ *                                                `latchRecoveryReasonRowReads <state>`
  *   LATCH_RECHECK_INTERVAL_MS                    src/conflict-latch.ts, in decimal
- *   RECHECK_CALL_PROBE RECHECK_CALL_RESUME       src/conflict-latch.ts, the call and verdict
- *   RECHECK_VERDICT_STILL_LATCHED                labels a re-check's round line carries
+ *   RECHECK_CALL_PROBE RECHECK_CALL_RESUME       src/conflict-latch.ts, the call, step and verdict
+ *   RECHECK_STEP_TABLE                           labels a re-check's round line carries
+ *   RECHECK_VERDICT_STILL_LATCHED
+ *   conflictLatchSetLineHead <key> <latched|relatched>
+ *                                                src/conflict-latch.ts conflictLatchSetLine for a
+ *                                                new latch (CONFLICT_LATCH_SET_LATCHED) or a
+ *                                                relatch (CONFLICT_LATCH_SET_RELATCHED) of persona
+ *                                                <key>, cut where the case begins: the head of
+ *                                                every such line, up to and including `case=`
+ *   latchRecheckRoundLine <persona-name> <case> <step> <call> <answer>
+ *                                                the re-check round's server-log line, the
+ *                                                reference renderPersonaRef(<persona-name>)
  *   PROBE_PANE_READ_LINES                        src/pane-read.ts, in decimal
  *   PANE_READ_PANE PANE_READ_GONE                src/pane-read.ts, a pane read's outcome kinds
  *   CONFLICT_OWN_ID_PHRASE STILL_STOPPING_PHRASE STILL_STARTING_PHRASE
  *                                                src/ad-description-phrases.ts
- *   AD_SETTINGS_RELATIVE_PATH AD_TMUX_TABLE      src/ad-settings.ts (the path re-exported from
- *                                                src/ad-config-file.ts)
- *   AD_SETTING_MINIMUMS                          src/ad-settings.ts: one `<key>=<minimum>` line
- *                                                per key whose minimum is a whole number, in the
- *                                                export's order, each key one of AD_TMUX_KEYS
+ *   AD_SETTINGS_RELATIVE_PATH                    src/ad-settings.ts, the settings file's path
+ *                                                relative to a HOME
+ *   AD_TMUX_TABLE                                src/ad-settings.ts, the timing keys' table
+ *   AD_PAUSE_TABLE                               src/ad-settings.ts, `pause`'s table
+ *   AD_PAUSE_TIMEOUT_KEY                         src/ad-settings.ts, `pause`'s wait key
+ *   AD_SETTING_MINIMUMS <key> [<part>]           src/ad-settings.ts: agent-director's minimum
+ *                                                for [tmux] <key>, in decimal; for a minimum
+ *                                                with parts (pending_grace_seconds), the
+ *                                                named <part> (`floor` or `addend`)
  *   MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS          src/config.ts, in decimal: the longest permission
  *                                                poll interval a config may set
  *   sessionEndingCommandsIn                      reads a post's text on standard input and prints
@@ -117,13 +135,24 @@
  *                                                built with no detail (`tmux-unavailable`: the
  *                                                generic onset); a class with no template is a
  *                                                failure
- *   ALL_CLEAR_TEMPLATE <outage-class>...         src/outage-state.ts, the all-clear for a bad
- *                                                stretch that resolved the given classes, each
- *                                                with no recorded detail (each one of
- *                                                OUTAGE_CLASS_ORDER)
+ *   ALL_CLEAR_TEMPLATE <outage-class>…           src/outage-state.ts: the all-clear for a bad
+ *                                                stretch of the given classes (each one of the
+ *                                                package's OUTAGE_CLASS_ORDER, given once),
+ *                                                none with a detail (posted as a persona
+ *                                                notice: wrap it in formatPersonaNotice)
  *   DIFFERENT_TMUX_SERVER_PHRASE                 src/ad-description-phrases.ts
  *   UNAVAILABLE_RETRY_BASE_S                     src/unavailable-retry.ts, in decimal: the retry
  *                                                timer's first wait, which each later wait doubles
+ *   UNAVAILABLE_RETRY_CEILING_S                  src/unavailable-retry.ts, the retry timer's
+ *                                                longest wait, in seconds, in decimal
+ *   unavailableRetryDueS <retry>                 when the retry timer's retry <retry> (from 1)
+ *                                                falls due after its arm, in seconds, in
+ *                                                decimal: the sum of src/backoff.ts
+ *                                                doublingBackoffDelay(UNAVAILABLE_RETRY_BASE_S,
+ *                                                <k>, UNAVAILABLE_RETRY_CEILING_S) for <k> from 0
+ *                                                to <retry> - 1, the waits src/unavailable-retry.ts
+ *                                                arms (each re-arm is measured from the end of the
+ *                                                run before it, so the real due time is no earlier)
  *   waitingRowPaneGoneLineHead <key>             src/session-manager.ts: the head of a line, the
  *   escalateDeadSweepLineHead <key>              text the builder (waitingRowPaneGoneLine,
  *   reconnectGoneLineHead                        escalateDeadSweepLine, reconnectGoneLine) writes
@@ -135,13 +164,10 @@
  *                                                form
  *   launchStartNotRecordedNoticeText <key>       src/conflict-latch.ts, the "launch start not
  *                                                recorded" notice's body for persona <key> (SRJ-1020)
- *   holdRecoveryText latchRecoveryReasonRowReads <state>
- *   holdRecoveryText <reason-export>             src/conflict-latch.ts, the hold recovery notice's body
- *                                                for the reason latchRecoveryReasonRowReads builds for
- *                                                <state>, or for the package's LATCH_RECOVERY_REASON_*
- *                                                value named
+ *   holdRecoveryText <reason>                    src/conflict-latch.ts, the hold recovery notice's
+ *                                                body; <reason> as for conflictRecoveryText
  *   LATCH_CASE_LAUNCH_START_NOT_RECORDED         src/conflict-latch.ts, the hold case
- *   RECHECK_STEP_TABLE RECHECK_CALL_NONE         src/conflict-latch.ts, the step and call labels a
+ *   RECHECK_CALL_NONE                            src/conflict-latch.ts, the call label a
  *                                                status-only re-check's round line carries
  *   relaunchAfterKillLine <key> <cwd> RELAUNCH_KILL_NONE
  *                                                src/restart.ts, the restart work's line before a
@@ -153,15 +179,16 @@
  *                                                LIVENESS_READING_DEAD* reading named
  *   latchClearRetryAtOnceLineHead <ref>          src/session-manager.ts, the head of the after-clear
  *                                                retry's answer line for persona reference <ref>
- *   DEFAULT_AD_SETTINGS <tmux-key>               src/ad-settings.ts, agent-director's default for one
- *                                                `[tmux]` key (one of AD_TMUX_KEYS), in decimal
+ *   DEFAULT_AD_SETTINGS <table> <key>            src/ad-settings.ts: agent-director's default
+ *                                                for `[<table>] <key>` (for example `tmux
+ *                                                starting_session_seconds`), in decimal
  *   tmuxUnresponsiveOnsetText <key>              src/persona-episodes.ts, the tmux-unresponsive
  *                                                onset's body for persona <key> (SRJ-1006)
- *   tmuxUnresponsiveAlertText <key> DEFAULT_AD_SETTINGS_IN_EFFECT
- *                                                src/persona-episodes.ts, the tmux-unresponsive
+ *   tmuxUnresponsiveAlertText <key>              src/persona-episodes.ts, the tmux-unresponsive
  *                                                alert's body for persona <key> at the alert
- *                                                threshold agent-director's defaults give
- *                                                (src/ad-settings.ts adAlertThresholdMs)
+ *                                                threshold of agent-director's default settings
+ *                                                (src/ad-settings.ts adAlertThresholdMs of
+ *                                                DEFAULT_AD_SETTINGS_IN_EFFECT)
  *   restartCapReachedNoticeText                  src/session-manager.ts, the restart-cap notice's body,
  *                                                a spawn-failure notice (several lines)
  *
@@ -327,44 +354,188 @@ function builderEntry(relPath: string, name: string, argNames: readonly string[]
   }
 }
 
-/** `conflictRecoveryText(<session-name>, <the package's LATCH_RECOVERY_REASON_* value named>)`. */
-const recoveryText: Entry = {
-  synopsis: '<session-name> <reason-export>',
+// ---------------------------------------------------------------------------
+// The latch entries scenario 10 and scenario 26 share with the latch
+// scenarios (E42–E43): the same names, arguments and values as theirs.
+// ---------------------------------------------------------------------------
+
+/** Export `name` of conflict-latch.ts, which must be an array of strings. */
+async function latchStrings(context: EntryContext, name: string): Promise<readonly string[]> {
+  const value = await packageExport(context, 'conflict-latch.ts', name)
+  if (!Array.isArray(value) || value.some((v) => typeof v !== 'string')) {
+    fail(PRINTER_FAIL_EXIT, `the installed package's src/conflict-latch.ts export ${name} is not an array of strings`)
+  }
+  return value as string[]
+}
+
+/** `value` when the package's LATCH_CASES holds it (a CONFLICT case only, with `conflictOnly`); a usage failure otherwise. */
+async function latchCaseArgument(context: EntryContext, entry: string, value: string, conflictOnly = false): Promise<string> {
+  const cases = await latchStrings(context, 'LATCH_CASES')
+  if (!cases.includes(value)) usageFail(`${entry}: '${value}' is not a latch case (${cases.join(', ')})`)
+  if (conflictOnly && (await latchStrings(context, 'HOLD_LATCH_CASES')).includes(value)) {
+    usageFail(`${entry}: '${value}' is a hold case, which takes no CONFLICT notice`)
+  }
+  return value
+}
+
+/** The SRJ-1005 reasons with no state, by the export that holds each. */
+const RECOVERY_REASON_EXPORTS: readonly string[] = [
+  'LATCH_RECOVERY_REASON_ROW_GONE',
+  'LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED',
+  'LATCH_RECOVERY_REASON_RELAUNCH_NOT_REFUSED',
+  'LATCH_RECOVERY_REASON_CLEARED_BY_HAND',
+]
+
+/** The state-bearing reason's builder, by its export name. */
+const ROW_READS_REASON = 'latchRecoveryReasonRowReads'
+
+/** The reason the words `<reason> [<state>]` name: one of RECOVERY_REASON_EXPORTS (no state), or ROW_READS_REASON with its state. */
+async function recoveryReasonArgument(context: EntryContext, entry: string, words: readonly string[]): Promise<unknown> {
+  const [name, ...rest] = words
+  if (name === ROW_READS_REASON && rest.length === 1 && rest[0] !== '') {
+    return (await packageFunction<(state: string) => unknown>(context, 'conflict-latch.ts', ROW_READS_REASON))(rest[0])
+  }
+  if (name !== undefined && RECOVERY_REASON_EXPORTS.includes(name) && rest.length === 0) {
+    return await packageExport(context, 'conflict-latch.ts', name)
+  }
+  usageFail(`${entry}: the reason must be one of ${RECOVERY_REASON_EXPORTS.join(', ')}, or ${ROW_READS_REASON} <state> (got '${words.join(' ')}')`)
+}
+
+/** `personaInstanceId(key)`: a persona's agent-director instance id. */
+const personaInstanceId: Entry = {
+  synopsis: '<key>',
   async print(args, context) {
-    const entry = 'conflictRecoveryText'
-    expectArguments(entry, args, ['session-name', 'reason-export'])
-    const [sessionName, reasonExport] = args
-    if (!reasonExport.startsWith('LATCH_RECOVERY_REASON_')) {
-      usageFail(`${entry}: <reason-export> must name a LATCH_RECOVERY_REASON_* value (got '${reasonExport}')`)
-    }
-    const reason = await packageExport(context, 'conflict-latch.ts', reasonExport)
-    if (typeof reason !== 'object' || reason === null || typeof (reason as { kind?: unknown }).kind !== 'string') {
-      fail(PRINTER_FAIL_EXIT, `the installed package's src/conflict-latch.ts export ${reasonExport} is not a recovery reason`)
-    }
-    const build = await packageFunction<(sessionName: string, reason: unknown) => unknown>(context, 'conflict-latch.ts', entry)
-    return builtString(entry, build(sessionName, reason))
+    const entry = 'personaInstanceId'
+    expectArguments(entry, args, ['key'])
+    return builtString(entry, (await packageFunction<(key: string) => unknown>(context, 'persona-identity.ts', entry))(args[0]))
   },
 }
 
-/** Each `[tmux]` key whose minimum is a whole number, as `<key>=<minimum>` lines (AD_TMUX_KEYS checked). */
-const settingMinimums: Entry = {
-  synopsis: '',
+/** `conflictCaseSentence(case)`: SRJ-1004's case sentence; a failure for a case that has none. */
+const conflictCaseSentence: Entry = {
+  synopsis: '<case>',
+  async print(args, context) {
+    const entry = 'conflictCaseSentence'
+    expectArguments(entry, args, ['case'])
+    const latchCase = await latchCaseArgument(context, entry, args[0])
+    const sentence = (await packageFunction<(latchCase: string) => unknown>(context, 'conflict-latch.ts', entry))(latchCase)
+    if (sentence === undefined) fail(PRINTER_FAIL_EXIT, `${entry}: case '${latchCase}' has no case sentence`)
+    return builtString(entry, sentence)
+  },
+}
+
+/** `launchStartNotRecordedNoticeText(key)`: SRJ-1020's notice body. */
+const launchStartNotRecordedNoticeText: Entry = {
+  synopsis: '<key>',
+  async print(args, context) {
+    const entry = 'launchStartNotRecordedNoticeText'
+    expectArguments(entry, args, ['key'])
+    return builtString(entry, (await packageFunction<(key: string) => unknown>(context, 'conflict-latch.ts', entry))(args[0]))
+  },
+}
+
+/** `conflictRecoveryText(session, reason)`: the CONFLICT recovery notice body. */
+const conflictRecoveryText: Entry = {
+  synopsis: `<session-name> <${RECOVERY_REASON_EXPORTS.join('|')}|${ROW_READS_REASON} <state>>`,
+  async print(args, context) {
+    const entry = 'conflictRecoveryText'
+    const [sessionName, ...reasonWords] = args
+    if (sessionName === undefined || sessionName === '') usageFail(`${entry} takes <session-name> <reason> [<state>]`)
+    const reason = await recoveryReasonArgument(context, entry, reasonWords)
+    return builtString(entry, (await packageFunction<(s: string, r: unknown) => unknown>(context, 'conflict-latch.ts', entry))(sessionName, reason))
+  },
+}
+
+/** `holdRecoveryText(reason)`: the hold recovery notice body. */
+const holdRecoveryText: Entry = {
+  synopsis: `<${RECOVERY_REASON_EXPORTS.join('|')}|${ROW_READS_REASON} <state>>`,
+  async print(args, context) {
+    const entry = 'holdRecoveryText'
+    const reason = await recoveryReasonArgument(context, entry, args)
+    return builtString(entry, (await packageFunction<(r: unknown) => unknown>(context, 'conflict-latch.ts', entry))(reason))
+  },
+}
+
+/** `latchRecheckRoundLine(ref, case, step, call, answer)`: the re-check round's server-log line, `ref` the persona reference `renderPersonaRef` gives the name. */
+const latchRecheckRoundLine: Entry = {
+  synopsis: '<persona-name> <case> <step> <call> <answer>',
+  async print(args, context) {
+    const entry = 'latchRecheckRoundLine'
+    expectArguments(entry, args, ['persona-name', 'case', 'step', 'call', 'answer'])
+    const [name, caseWord, step, call, answer] = args
+    const latchCase = await latchCaseArgument(context, entry, caseWord)
+    const ref = (await packageFunction<(name: string) => unknown>(context, 'persona-identity.ts', 'renderPersonaRef'))(name)
+    const build = await packageFunction<(ref: unknown, c: string, s: string, call: string, a: string) => unknown>(context, 'conflict-latch.ts', entry)
+    return builtString(entry, build(builtString(entry, ref), latchCase, step, call, answer))
+  },
+}
+
+/** `personaTmuxSessionName(key)`: the tmux session name a persona's launches ask for. */
+const personaTmuxSessionName: Entry = {
+  synopsis: '<key>',
+  async print(args, context) {
+    const entry = 'personaTmuxSessionName'
+    expectArguments(entry, args, ['key'])
+    return builtString(entry, (await packageFunction<(key: string) => unknown>(context, 'persona-identity.ts', entry))(args[0]))
+  },
+}
+
+// ---------------------------------------------------------------------------
+// agent-director's settings, as scenario 24's lane prints them (the same
+// names, arguments and values).
+// ---------------------------------------------------------------------------
+
+/** A value in decimal: a `bigint`, or a `number` that is a safe integer; a failure for anything else. */
+function decimal(entry: string, value: unknown): string {
+  if (typeof value === 'bigint') return value.toString()
+  if (typeof value === 'number' && Number.isSafeInteger(value)) return String(value)
+  fail(PRINTER_FAIL_EXIT, `${entry} gave ${typeof value === 'number' ? String(value) : `a ${typeof value}`}, not an integer`)
+}
+
+/**
+ * `DEFAULT_AD_SETTINGS[<table>][<key>]` in decimal: agent-director's default
+ * for one setting as CSCB records it (an integer, a `bigint` in the package).
+ */
+const adSettingDefault: Entry = {
+  synopsis: '<table> <key>',
+  async print(args, context) {
+    const entry = 'DEFAULT_AD_SETTINGS'
+    expectArguments(entry, args, ['table', 'key'])
+    const [table, key] = args
+    const defaults = await packageExport(context, 'ad-settings.ts', entry)
+    if (typeof defaults !== 'object' || defaults === null) fail(PRINTER_FAIL_EXIT, `the installed package's src/ad-settings.ts export ${entry} is not an object`)
+    const tables = defaults as Record<string, unknown>
+    const values = Object.hasOwn(tables, table) ? tables[table] : undefined
+    if (typeof values !== 'object' || values === null) usageFail(`${entry}: the installed package records no table '${table}'`)
+    const keyed = values as Record<string, unknown>
+    const value = Object.hasOwn(keyed, key) ? keyed[key] : undefined
+    if (value === undefined) usageFail(`${entry}: the installed package records no key '${key}' in table '${table}'`)
+    if (typeof value === 'bigint') return value.toString()
+    if (typeof value === 'number' && Number.isSafeInteger(value)) return String(value)
+    fail(PRINTER_FAIL_EXIT, `the installed package's ${entry}.${table}.${key} is a ${typeof value}, not an integer`)
+  },
+}
+
+/** `AD_SETTING_MINIMUMS[<key>]` in decimal, or `AD_SETTING_MINIMUMS[<key>][<part>]` for a key whose minimum has parts (`floor`, `addend`). */
+const adSettingMinimum: Entry = {
+  synopsis: '<key> [<part>]',
   async print(args, context) {
     const entry = 'AD_SETTING_MINIMUMS'
-    expectArguments(entry, args, [])
+    const [key, part] = args
+    if (args.length < 1 || args.length > 2 || args.some((a) => a === '')) usageFail(`${entry} takes <key> [<part>] (got ${args.length} argument${args.length === 1 ? '' : 's'})`)
     const minimums = await packageExport(context, 'ad-settings.ts', entry)
-    const keys = await packageExport(context, 'ad-settings.ts', 'AD_TMUX_KEYS')
-    if (typeof minimums !== 'object' || minimums === null || !Array.isArray(keys)) {
-      fail(PRINTER_FAIL_EXIT, `the installed package's src/ad-settings.ts ${entry} or AD_TMUX_KEYS is not of the kind this entry prints`)
+    if (typeof minimums !== 'object' || minimums === null) fail(PRINTER_FAIL_EXIT, `the installed package's src/ad-settings.ts export ${entry} is not an object`)
+    const byKey = minimums as Record<string, unknown>
+    const value = Object.hasOwn(byKey, key) ? byKey[key] : undefined
+    if (value === undefined) usageFail(`${entry}: the installed package records no minimum for '${key}'`)
+    if (typeof value === 'object' && value !== null) {
+      const parts = value as Record<string, unknown>
+      if (part === undefined) usageFail(`${entry}: the minimum of '${key}' has parts (${Object.keys(parts).join(', ')}); name one`)
+      if (!Object.hasOwn(parts, part)) usageFail(`${entry}: the minimum of '${key}' has no part '${part}'`)
+      return decimal(`${entry}.${key}.${part}`, parts[part])
     }
-    const lines: string[] = []
-    for (const [key, value] of Object.entries(minimums)) {
-      if (typeof value !== 'bigint' && typeof value !== 'number') continue
-      if (!keys.includes(key)) fail(PRINTER_FAIL_EXIT, `${entry} names ${key}, which is not one of AD_TMUX_KEYS`)
-      lines.push(`${key}=${String(value)}`)
-    }
-    if (lines.length === 0) fail(PRINTER_FAIL_EXIT, `${entry} holds no whole-number minimum`)
-    return lines.join('\n')
+    if (part !== undefined) usageFail(`${entry}: the minimum of '${key}' has no parts`)
+    return decimal(`${entry}.${key}`, value)
   },
 }
 
@@ -404,19 +575,28 @@ const onsetTemplate: Entry = {
   },
 }
 
-/** `ALL_CLEAR_TEMPLATE(<map of each given class to a record with no detail>)`. */
-const allClearTemplate: Entry = {
-  synopsis: '<outage-class>...',
+/**
+ * `ALL_CLEAR_TEMPLATE(<a bad stretch of the given classes, none with a detail>)`:
+ * the all-clear notice. Each class must be one of the package's
+ * `OUTAGE_CLASS_ORDER`, given once.
+ */
+const allClear: Entry = {
+  synopsis: '<outage-class>…',
   async print(args, context) {
     const entry = 'ALL_CLEAR_TEMPLATE'
-    if (args.length === 0) usageFail(`${entry} takes <outage-class>... (got 0)`)
+    if (args.length === 0) usageFail(`${entry} takes <outage-class>… (got none)`)
     const order = await packageExport(context, 'outage-state.ts', 'OUTAGE_CLASS_ORDER')
-    if (!Array.isArray(order)) fail(PRINTER_FAIL_EXIT, `the installed package's src/outage-state.ts export OUTAGE_CLASS_ORDER is not an array`)
-    for (const outageClass of args) {
-      if (!order.includes(outageClass)) usageFail(`${entry}: '${outageClass}' is not one of OUTAGE_CLASS_ORDER (${order.join(', ')})`)
+    if (!Array.isArray(order) || order.some((c) => typeof c !== 'string')) {
+      fail(PRINTER_FAIL_EXIT, "the installed package's src/outage-state.ts export OUTAGE_CLASS_ORDER is not an array of class names")
+    }
+    const resolved = new Map<string, object>()
+    for (const cls of args) {
+      if (!order.includes(cls)) usageFail(`${entry}: '${cls}' is not one of the package's outage classes (${order.join(', ')})`)
+      if (resolved.has(cls)) usageFail(`${entry}: ${cls} is given twice`)
+      resolved.set(cls, {})
     }
     const build = await packageFunction<(resolved: Map<string, object>) => unknown>(context, 'outage-state.ts', entry)
-    return builtString(entry, build(new Map(args.map((outageClass) => [outageClass, {}]))))
+    return builtString(entry, build(resolved))
   },
 }
 
@@ -465,33 +645,35 @@ const reconnectGoneHead: Entry = {
   },
 }
 
-/** Fails unless `reason` is a recovery reason (an object with a string `kind`). */
-function expectRecoveryReason(entry: string, reason: unknown): void {
-  if (typeof reason !== 'object' || reason === null || typeof (reason as { kind?: unknown }).kind !== 'string') {
-    fail(PRINTER_FAIL_EXIT, `${entry}: the installed package's reason is not a recovery reason`)
-  }
+/** The printer's words for what a latch-set line reports, by the package export each selects. */
+const LATCH_SET_OUTCOME_EXPORTS: Readonly<Record<string, string>> = {
+  latched: 'CONFLICT_LATCH_SET_LATCHED',
+  relatched: 'CONFLICT_LATCH_SET_RELATCHED',
 }
 
-/** `holdRecoveryText(<reason>)`: the reason `latchRecoveryReasonRowReads(<state>)` builds, or the package's LATCH_RECOVERY_REASON_* value named. */
-const holdRecovery: Entry = {
-  synopsis: 'latchRecoveryReasonRowReads <state> | <reason-export>',
+/**
+ * `conflictLatchSetLine(<key>, <record>[, <previous case>])` up to and
+ * including `case=`: the head of persona <key>'s latch-set lines for a new
+ * latch (no previous case) or a relatch (a previous case). The record's
+ * case, session and refused operation are the sentinel and its row state the
+ * package's LATCH_ROW_STATE_NO_ROW; the line is cut where the case begins.
+ */
+const conflictLatchSetHead: Entry = {
+  synopsis: '<key> <latched|relatched>',
   async print(args, context) {
-    const entry = 'holdRecoveryText'
-    let reason: unknown
-    if (args[0] === 'latchRecoveryReasonRowReads') {
-      expectArguments(entry, args, ['reason-builder', 'state'])
-      const rowReads = await packageFunction<(state: string) => unknown>(context, 'conflict-latch.ts', 'latchRecoveryReasonRowReads')
-      reason = rowReads(args[1])
-    } else {
-      expectArguments(entry, args, ['reason-export'])
-      if (!args[0].startsWith('LATCH_RECOVERY_REASON_')) {
-        usageFail(`${entry}: <reason-export> must name a LATCH_RECOVERY_REASON_* value (got '${args[0]}')`)
-      }
-      reason = await packageExport(context, 'conflict-latch.ts', args[0])
-    }
-    expectRecoveryReason(entry, reason)
-    const build = await packageFunction<(reason: unknown) => unknown>(context, 'conflict-latch.ts', entry)
-    return builtString(entry, build(reason))
+    const entry = 'conflictLatchSetLineHead'
+    expectArguments(entry, args, ['key', 'latched|relatched'])
+    const [key, word] = args
+    const outcomeExport = Object.hasOwn(LATCH_SET_OUTCOME_EXPORTS, word) ? LATCH_SET_OUTCOME_EXPORTS[word] : undefined
+    if (outcomeExport === undefined) usageFail(`${entry}: the outcome must be latched or relatched (got '${word}')`)
+    const outcome = await packageString(context, 'conflict-latch.ts', outcomeExport)
+    if (outcome !== word) fail(PRINTER_FAIL_EXIT, `the installed package's src/conflict-latch.ts ${outcomeExport} is '${outcome}', not '${word}'`)
+    const relatched = await packageString(context, 'conflict-latch.ts', 'CONFLICT_LATCH_SET_RELATCHED')
+    const noRow = await packageExport(context, 'conflict-latch.ts', 'LATCH_ROW_STATE_NO_ROW')
+    const record = { sessionName: HEAD_SENTINEL, latchCase: HEAD_SENTINEL, refusedOperation: HEAD_SENTINEL, rowState: noRow }
+    const build = await packageFunction<(key: string, record: object, previousCase?: string) => unknown>(context, 'conflict-latch.ts', 'conflictLatchSetLine')
+    const line = builtString(entry, outcome === relatched ? build(key, record, HEAD_SENTINEL) : build(key, record))
+    return headBefore(entry, line)
   },
 }
 
@@ -526,38 +708,47 @@ const relaunchWithoutKill: Entry = {
   },
 }
 
-/** `DEFAULT_AD_SETTINGS.tmux[<key>]`, in decimal: agent-director's default for one `[tmux]` key (one of AD_TMUX_KEYS). */
-const defaultAdSetting: Entry = {
-  synopsis: '<tmux-key>',
-  async print(args, context) {
-    const entry = 'DEFAULT_AD_SETTINGS'
-    expectArguments(entry, args, ['tmux-key'])
-    const keys = await packageExport(context, 'ad-settings.ts', 'AD_TMUX_KEYS')
-    if (!Array.isArray(keys)) fail(PRINTER_FAIL_EXIT, `the installed package's src/ad-settings.ts export AD_TMUX_KEYS is not an array`)
-    if (!keys.includes(args[0])) usageFail(`${entry}: '${args[0]}' is not one of AD_TMUX_KEYS (${keys.join(', ')})`)
-    const defaults = await packageExport(context, 'ad-settings.ts', entry)
-    const tmux = typeof defaults === 'object' && defaults !== null ? (defaults as { tmux?: unknown }).tmux : undefined
-    const value = typeof tmux === 'object' && tmux !== null ? (tmux as Record<string, unknown>)[args[0]] : undefined
-    if (typeof value !== 'bigint' && typeof value !== 'number') {
-      fail(PRINTER_FAIL_EXIT, `the installed package's src/ad-settings.ts ${entry} holds no whole-number tmux.${args[0]}`)
-    }
-    return String(value)
-  },
-}
-
-/** `tmuxUnresponsiveAlertText(<key>, adAlertThresholdMs(DEFAULT_AD_SETTINGS_IN_EFFECT))`: the alert at agent-director's defaults. */
+/** `tmuxUnresponsiveAlertText(<key>, adAlertThresholdMs(DEFAULT_AD_SETTINGS_IN_EFFECT))`: the alert at agent-director's default settings. */
 const unresponsiveAlert: Entry = {
-  synopsis: '<key> DEFAULT_AD_SETTINGS_IN_EFFECT',
+  synopsis: '<key>',
   async print(args, context) {
     const entry = 'tmuxUnresponsiveAlertText'
-    expectArguments(entry, args, ['key', 'settings-export'])
-    if (args[1] !== 'DEFAULT_AD_SETTINGS_IN_EFFECT') usageFail(`${entry}: <settings-export> must be DEFAULT_AD_SETTINGS_IN_EFFECT (got '${args[1]}')`)
-    const settings = await packageExport(context, 'ad-settings.ts', args[1])
+    expectArguments(entry, args, ['key'])
+    const settings = await packageExport(context, 'ad-settings.ts', 'DEFAULT_AD_SETTINGS_IN_EFFECT')
     const threshold = await packageFunction<(values: unknown) => unknown>(context, 'ad-settings.ts', 'adAlertThresholdMs')
     const thresholdMs = threshold(settings)
     if (typeof thresholdMs !== 'number' || !Number.isFinite(thresholdMs)) fail(PRINTER_FAIL_EXIT, `${entry}: adAlertThresholdMs gave no finite number`)
     const build = await packageFunction<(key: string, thresholdMs: number) => unknown>(context, 'persona-episodes.ts', entry)
     return builtString(entry, build(args[0], thresholdMs))
+  },
+}
+
+/**
+ * When the retry timer's retry <retry> (from 1) falls due after its arm, in
+ * seconds: `doublingBackoffDelay(UNAVAILABLE_RETRY_BASE_S, k,
+ * UNAVAILABLE_RETRY_CEILING_S)` summed for k from 0 to <retry> - 1, the waits
+ * src/unavailable-retry.ts arms (its first at the base, each later one after
+ * k refusals).
+ */
+const unavailableRetryDue: Entry = {
+  synopsis: '<retry>',
+  async print(args, context) {
+    const entry = 'unavailableRetryDueS'
+    expectArguments(entry, args, ['retry'])
+    if (!/^[1-9][0-9]{0,2}$/.test(args[0])) usageFail(`${entry}: <retry> must be a whole number from 1 to 999 (got '${args[0]}')`)
+    const base = await packageExport(context, 'unavailable-retry.ts', 'UNAVAILABLE_RETRY_BASE_S')
+    const ceiling = await packageExport(context, 'unavailable-retry.ts', 'UNAVAILABLE_RETRY_CEILING_S')
+    if (typeof base !== 'number' || typeof ceiling !== 'number') {
+      fail(PRINTER_FAIL_EXIT, "the installed package's src/unavailable-retry.ts UNAVAILABLE_RETRY_BASE_S or UNAVAILABLE_RETRY_CEILING_S is not a number")
+    }
+    const delay = await packageFunction<(base: number, priorAttempts: number, ceiling: number) => unknown>(context, 'backoff.ts', 'doublingBackoffDelay')
+    let due = 0
+    for (let k = 0; k < Number(args[0]); k++) {
+      const wait = delay(base, k, ceiling)
+      if (typeof wait !== 'number' || !Number.isFinite(wait)) fail(PRINTER_FAIL_EXIT, `${entry}: doublingBackoffDelay gave ${String(wait)}, not a finite number`)
+      due += wait
+    }
+    return decimal(entry, due)
   },
 }
 
@@ -573,18 +764,21 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   INVALID_FLAGS_HOLD_ALERT_TEXT: constantEntry('invalid-flags-hold.ts', 'INVALID_FLAGS_HOLD_ALERT_TEXT'),
   formatPersonaNotice: personaNotice,
   // Scenario 10 (test-22-fmk-wrong-server.sh).
-  personaInstanceId: builderEntry('persona-identity.ts', 'personaInstanceId', ['key']),
-  personaTmuxSessionName: builderEntry('persona-identity.ts', 'personaTmuxSessionName', ['key']),
+  personaInstanceId,
+  personaTmuxSessionName,
   CONFLICT_NOTICE_FIRST_LINE_HEAD: constantEntry('conflict-latch.ts', 'CONFLICT_NOTICE_FIRST_LINE_HEAD'),
   CONFLICT_NOTICE_POINTER_LINE: constantEntry('conflict-latch.ts', 'CONFLICT_NOTICE_POINTER_LINE'),
   CONFLICT_NOTICE_HUMAN_ONLY_LINE: constantEntry('conflict-latch.ts', 'CONFLICT_NOTICE_HUMAN_ONLY_LINE'),
-  conflictCaseSentence: builderEntry('conflict-latch.ts', 'conflictCaseSentence', ['latch-case']),
+  conflictCaseSentence,
   LATCH_CASE_OWN_ID: constantEntry('conflict-latch.ts', 'LATCH_CASE_OWN_ID'),
-  conflictRecoveryText: recoveryText,
+  conflictRecoveryText,
   LATCH_RECHECK_INTERVAL_MS: constantEntry('conflict-latch.ts', 'LATCH_RECHECK_INTERVAL_MS'),
   RECHECK_CALL_PROBE: constantEntry('conflict-latch.ts', 'RECHECK_CALL_PROBE'),
   RECHECK_CALL_RESUME: constantEntry('conflict-latch.ts', 'RECHECK_CALL_RESUME'),
+  RECHECK_STEP_TABLE: constantEntry('conflict-latch.ts', 'RECHECK_STEP_TABLE'),
   RECHECK_VERDICT_STILL_LATCHED: constantEntry('conflict-latch.ts', 'RECHECK_VERDICT_STILL_LATCHED'),
+  conflictLatchSetLineHead: conflictLatchSetHead,
+  latchRecheckRoundLine,
   PROBE_PANE_READ_LINES: constantEntry('pane-read.ts', 'PROBE_PANE_READ_LINES'),
   PANE_READ_PANE: constantEntry('pane-read.ts', 'PANE_READ_PANE'),
   PANE_READ_GONE: constantEntry('pane-read.ts', 'PANE_READ_GONE'),
@@ -593,27 +787,30 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   STILL_STARTING_PHRASE: constantEntry('ad-description-phrases.ts', 'STILL_STARTING_PHRASE'),
   AD_SETTINGS_RELATIVE_PATH: constantEntry('ad-settings.ts', 'AD_SETTINGS_RELATIVE_PATH'),
   AD_TMUX_TABLE: constantEntry('ad-settings.ts', 'AD_TMUX_TABLE'),
-  AD_SETTING_MINIMUMS: settingMinimums,
+  AD_PAUSE_TABLE: constantEntry('ad-settings.ts', 'AD_PAUSE_TABLE'),
+  AD_PAUSE_TIMEOUT_KEY: constantEntry('ad-settings.ts', 'AD_PAUSE_TIMEOUT_KEY'),
+  AD_SETTING_MINIMUMS: adSettingMinimum,
   MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS: constantEntry('config.ts', 'MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS'),
   sessionEndingCommandsIn: sessionEndingForms,
   // Scenario 26 (test-28-fmk-provenance.sh).
   tmuxServerChangedOnset: builderEntry('outage-state.ts', 'tmuxServerChangedOnset', []),
   ONSET_TEMPLATES: onsetTemplate,
-  ALL_CLEAR_TEMPLATE: allClearTemplate,
+  ALL_CLEAR_TEMPLATE: allClear,
   DIFFERENT_TMUX_SERVER_PHRASE: constantEntry('ad-description-phrases.ts', 'DIFFERENT_TMUX_SERVER_PHRASE'),
   UNAVAILABLE_RETRY_BASE_S: constantEntry('unavailable-retry.ts', 'UNAVAILABLE_RETRY_BASE_S'),
+  UNAVAILABLE_RETRY_CEILING_S: constantEntry('unavailable-retry.ts', 'UNAVAILABLE_RETRY_CEILING_S'),
+  unavailableRetryDueS: unavailableRetryDue,
   waitingRowPaneGoneLineHead: waitingRowPaneGoneHead,
   escalateDeadSweepLineHead: escalateDeadSweepHead,
   reconnectGoneLineHead: reconnectGoneHead,
-  launchStartNotRecordedNoticeText: builderEntry('conflict-latch.ts', 'launchStartNotRecordedNoticeText', ['key']),
-  holdRecoveryText: holdRecovery,
+  launchStartNotRecordedNoticeText,
+  holdRecoveryText,
   LATCH_CASE_LAUNCH_START_NOT_RECORDED: constantEntry('conflict-latch.ts', 'LATCH_CASE_LAUNCH_START_NOT_RECORDED'),
-  RECHECK_STEP_TABLE: constantEntry('conflict-latch.ts', 'RECHECK_STEP_TABLE'),
   RECHECK_CALL_NONE: constantEntry('conflict-latch.ts', 'RECHECK_CALL_NONE'),
   relaunchAfterKillLine: relaunchAfterKill,
   relaunchWithoutKillLine: relaunchWithoutKill,
   latchClearRetryAtOnceLineHead: builderEntry('session-manager.ts', 'latchClearRetryAtOnceLineHead', ['ref']),
-  DEFAULT_AD_SETTINGS: defaultAdSetting,
+  DEFAULT_AD_SETTINGS: adSettingDefault,
   tmuxUnresponsiveOnsetText: builderEntry('persona-episodes.ts', 'tmuxUnresponsiveOnsetText', ['key']),
   tmuxUnresponsiveAlertText: unresponsiveAlert,
   restartCapReachedNoticeText: builderEntry('session-manager.ts', 'restartCapReachedNoticeText', []),

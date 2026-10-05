@@ -301,6 +301,34 @@
 #                                      then a harness `status` read (`ad_capture`) must read `pending`
 #                                      with no launch_started_at, or it fails
 #
+#   agent-director's settings file (fmk mode; harness addition, scenario 24, test-26, and
+#   scenario 10; the image guard, then the HOME check, before any write)
+#   write_ad_settings [--pause <value>] [<key>=<value>...]
+#                                      replace the scenario HOME's agent-director settings file
+#                                      (HOME joined with the package's AD_SETTINGS_RELATIVE_PATH,
+#                                      read through fixtures/fmk-texts.ts, as are the table names and
+#                                      the pause key) whole, by one rename (`write_file`), so no
+#                                      reader sees half a file: a `[tmux]` table holding each
+#                                      `<key> = <value>` in the order given, when any is given, then a
+#                                      `[pause]` table holding `timeout_seconds = <value>` with
+#                                      --pause. Each <value> is written as the TOML value text given
+#                                      (`120`, `29` below a minimum, `"120"` a string), so a refused
+#                                      value can be written on purpose. No table (no argument)
+#                                      removes the file: agent-director's defaults. Fails for a
+#                                      <key> that is not a TOML bare key of lowercase letters, digits
+#                                      and `_`, a key given twice, an empty <value> or one holding a
+#                                      control character, and refuses a settings directory that
+#                                      resolves outside SCENARIO_ROOT or a settings path that is not a
+#                                      regular file. Reads the file back and fails unless it holds
+#                                      exactly what was written; sets AD_SETTINGS_FILE to its path.
+#                                      `_scenario_ad_tmux_setting`, the stub's re-fire and
+#                                      `ad_store_mark_finished` read the `[tmux]` values it writes.
+#                                      Examples:
+#                                        write_ad_settings pending_grace_seconds=120 stopping_window_seconds=30
+#                                        write_ad_settings --pause 45 pending_grace_seconds=120
+#                                        write_ad_settings starting_session_seconds='"120"'
+#                                        write_ad_settings          (removes the file)
+#
 #   Stub workers (fmk mode; fixtures/stub-claude.sh's header states the modes, the
 #   SessionStart re-fire, its stop line and the MCP session; each runs both guards first)
 #   STUB_MODE_DEV_CHANNELS STUB_MODE_AT_ONCE STUB_MODE_SILENT STUB_MODE_UNRECOGNISED
@@ -611,24 +639,12 @@
 #
 #   Scenario 10's harness additions (fmk mode; b.jg5 SRJ-1412, SRJ-1306, SRJ-1401). Each is a
 #   harness addition, confirm at the reconcile pass; each runs `require_ci_image` first, and
-#   `write_ad_tmux_table` and `start_second_tmux_server` also `require_scenario_home`, before
-#   any step. A harness
+#   `start_second_tmux_server` and the window copies of `cscb_ad_calls_between` and
+#   `cscb_ad_count_between` also `require_scenario_home`, before any step. Scenario 10 writes
+#   its `[tmux]` table with `write_ad_settings` (above). A harness
 #   agent-director call under another tmux environment needs no helper: a prefix assignment
 #   on the call (`TMUX_TMPDIR=<dir> ad_capture …`, `TMUX=<value> ad_capture …`) holds for
 #   that one call only, from the scenario's own shell, and reaches the binary behind the shim.
-#   write_ad_tmux_table [<key>=<toml-value>...]
-#                                      (harness addition, confirm at the reconcile pass) write
-#                                      the scenario HOME's agent-director config file, at
-#                                      $HOME/<AD_SETTINGS_RELATIVE_PATH>, as one `[<AD_TMUX_TABLE>]`
-#                                      table (path and table name printed by fixtures/fmk-texts.ts
-#                                      from src/ad-settings.ts) of the given pairs, in order, each
-#                                      `<key> = <toml-value>` with the value text as given (so a
-#                                      string or a below-minimum value is written as given; the
-#                                      caller picks values at or above their minimums); the file
-#                                      is replaced whole (`write_file`), then read back; with no
-#                                      pair the file is removed. Refuses a path that leaves HOME
-#                                      or resolves outside SCENARIO_ROOT, and a pair that is not
-#                                      `<key>=<value>` on one line
 #   start_second_tmux_server [<session-name>]
 #                                      (harness addition, confirm at the reconcile pass) start
 #                                      another tmux server, with the real tmux from the scenario's
@@ -679,7 +695,10 @@
 #                                      `<socket>.rebound-<n>` socket under SCENARIO_ROOT/tmux, whose
 #                                      server's own socket path is <socket>) with its sessions and
 #                                      panes, ends the other server at <socket> (kill-server, then
-#                                      waits until its process is gone), moves <moved-socket> back
+#                                      waits until its process is gone; every tmux call names its
+#                                      socket with -S, and the server at <socket> is ended only
+#                                      when its PID is not the recorded server's, so the recorded
+#                                      server is never the one ended), moves <moved-socket> back
 #                                      to <socket>, and fails unless <socket> then answers with the
 #                                      recorded server's PID and the same sessions, panes and pane
 #                                      processes, each pane process still running; prints the
@@ -2889,6 +2908,105 @@ end_session() {
 }
 
 # ---------------------------------------------------------------------------
+# agent-director's settings file (fmk mode; harness addition, scenario 24,
+# test-26, and scenario 10)
+# ---------------------------------------------------------------------------
+
+# The settings file's path relative to HOME, the `[tmux]` and `[pause]`
+# table names and the pause wait's key, as the installed package exports
+# them (AD_SETTINGS_RELATIVE_PATH, AD_TMUX_TABLE, AD_PAUSE_TABLE,
+# AD_PAUSE_TIMEOUT_KEY), read through the printer at a shell's first
+# write_ad_settings.
+_SCENARIO_AD_SETTINGS_NAMES=()
+
+# _scenario_ad_settings_names <step>: fill _SCENARIO_AD_SETTINGS_NAMES, once
+# per shell; fail when the printer fails or a name is not of its kind.
+_scenario_ad_settings_names() {
+    local step="$1" entry value names=()
+    (( ${#_SCENARIO_AD_SETTINGS_NAMES[@]} == 4 )) && return 0
+    for entry in AD_SETTINGS_RELATIVE_PATH AD_TMUX_TABLE AD_PAUSE_TABLE AD_PAUSE_TIMEOUT_KEY; do
+        value="$(bun "${SCENARIO_FIXTURES}/fmk-texts.ts" "${entry}")" || fail "${step}: fmk-texts: ${entry}"
+        names+=("${value}")
+    done
+    [[ -n "${names[0]}" && "${names[0]}" != /* && "/${names[0]}/" != */../* && "${names[0]}" != *[[:cntrl:]]* ]] \
+        || fail "${step}: the package's AD_SETTINGS_RELATIVE_PATH '${names[0]}' is not a relative path inside HOME"
+    for value in "${names[@]:1}"; do
+        [[ "${value}" =~ ^[a-z_]+$ ]] || fail "${step}: the package gives table or key name '${value}', not a TOML bare key"
+    done
+    _SCENARIO_AD_SETTINGS_NAMES=("${names[@]}")
+}
+
+# _scenario_ad_settings_value <step> <name> <value>: fail unless <value> is
+# one line of TOML value text: not empty, no control character.
+_scenario_ad_settings_value() {
+    [[ -n "$3" && "$3" != *[[:cntrl:]]* ]] || fail "$1: the value of $2 is empty or holds a control character"
+}
+
+write_ad_settings() {
+    local step="write_ad_settings $*" pause="" have_pause=0 pairs=() seen=" " key value path dir real_root real_dir content
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    [[ "${SCENARIO_FMK}" == 1 ]] || fail "${step}: the scenario HOME's agent-director settings are for fmk scripts only"
+    while (( $# > 0 )); do
+        case "$1" in
+            --pause)
+                (( $# >= 2 )) || fail "${step}: --pause takes a value"
+                (( ! have_pause )) || fail "${step}: --pause is given twice"
+                _scenario_ad_settings_value "${step}" --pause "$2"
+                have_pause=1
+                pause="$2"
+                shift 2
+                ;;
+            *=*)
+                key="${1%%=*}"
+                value="${1#*=}"
+                [[ "${key}" =~ ^[a-z_][a-z0-9_]*$ ]] \
+                    || fail "${step}: key '${key}' is not a TOML bare key of lowercase letters, digits and _"
+                [[ "${seen}" != *" ${key} "* ]] || fail "${step}: ${key} is given twice"
+                seen+="${key} "
+                _scenario_ad_settings_value "${step}" "${key}" "${value}"
+                pairs+=("${key} = ${value}")
+                shift
+                ;;
+            *) fail "${step}: '$1' is neither <key>=<value> nor --pause <value>" ;;
+        esac
+    done
+    _scenario_ad_settings_names "${step}"
+    path="${HOME}/${_SCENARIO_AD_SETTINGS_NAMES[0]}"
+    dir="${path%/*}"
+    [[ "${path}" == "${SCENARIO_ROOT}"/* ]] || fail "${step}: refused: ${path} is not under SCENARIO_ROOT ${SCENARIO_ROOT}"
+    if [[ -e "${path}" || -L "${path}" ]]; then
+        [[ -f "${path}" && ! -L "${path}" ]] || fail "${step}: refused: ${path} is not a regular file"
+    fi
+    AD_SETTINGS_FILE="${path}"
+    if (( ${#pairs[@]} == 0 && ! have_pause )); then
+        # No table: no file, so agent-director's defaults.
+        rm -f -- "${path}" || fail "${step}: could not remove ${path}"
+        [[ ! -e "${path}" ]] || fail "${step}: ${path} is still there after its removal"
+        return 0
+    fi
+    mkdir -p -- "${dir}" || fail "${step}: could not create ${dir}"
+    real_root="$(realpath -e -- "${SCENARIO_ROOT}" 2> /dev/null)" || fail "${step}: cannot resolve SCENARIO_ROOT ${SCENARIO_ROOT}"
+    real_dir="$(realpath -e -- "${dir}" 2> /dev/null)" || fail "${step}: cannot resolve ${dir}"
+    [[ "${real_dir}" == "${real_root}"/* ]] \
+        || fail "${step}: refused: ${dir} resolves to ${real_dir}, which is not under SCENARIO_ROOT ${real_root}"
+    content=""
+    if (( ${#pairs[@]} > 0 )); then
+        printf -v content '[%s]\n' "${_SCENARIO_AD_SETTINGS_NAMES[1]}"
+        printf -v value '%s\n' "${pairs[@]}"
+        content+="${value}"
+    fi
+    if (( have_pause )); then
+        [[ -z "${content}" ]] || content+=$'\n'
+        printf -v value '[%s]\n%s = %s\n' "${_SCENARIO_AD_SETTINGS_NAMES[2]}" "${_SCENARIO_AD_SETTINGS_NAMES[3]}" "${pause}"
+        content+="${value}"
+    fi
+    # One rename, so agent-director and CSCB never read half a file.
+    write_file "${path}" 0644 < <(printf '%s' "${content}")
+    [[ "$(cat -- "${path}" && printf x)" == "${content}x" ]] || fail "${step}: ${path} does not hold what was written"
+}
+
+# ---------------------------------------------------------------------------
 # Store statements and the human's agent-director actions (fmk mode)
 # ---------------------------------------------------------------------------
 
@@ -3690,42 +3808,6 @@ _scenario_printed() {
     printf '%s\n' "${out}"
 }
 
-write_ad_tmux_table() {
-    local step="write_ad_tmux_table $*" rel table path dir real_root real_dir pair key value body got
-    require_ci_image "${step}"
-    require_scenario_home "${step}"
-    [[ "${SCENARIO_FMK}" == 1 ]] || fail "${step}: the scenario HOME's agent-director config is for fmk scripts only"
-    rel="$(_scenario_printed "${step}" AD_SETTINGS_RELATIVE_PATH)" || exit 1
-    [[ -n "${rel}" && "${rel}" != /* && "/${rel}/" != */../* && "${rel}" != *[[:cntrl:]]* ]] \
-        || fail "${step}: refused: the settings path '${rel}' is not a relative path inside HOME"
-    path="${HOME}/${rel}"
-    dir="$(dirname -- "${path}")"
-    real_root="$(realpath -e -- "${SCENARIO_ROOT}" 2> /dev/null)" \
-        || fail "${step}: refused: cannot resolve SCENARIO_ROOT ${SCENARIO_ROOT}"
-    real_dir="$(realpath -m -- "${dir}" 2> /dev/null)" || fail "${step}: cannot resolve ${dir}"
-    [[ "${real_dir}" == "${real_root}"/* ]] \
-        || fail "${step}: refused: ${dir} resolves to ${real_dir}, which is not under SCENARIO_ROOT ${real_root}"
-    if (( $# == 0 )); then
-        rm -f -- "${path}" || fail "${step}: could not remove ${path}"
-        [[ ! -e "${path}" ]] || fail "${step}: ${path} is still there after its removal"
-        return 0
-    fi
-    table="$(_scenario_printed "${step}" AD_TMUX_TABLE)" || exit 1
-    [[ "${table}" =~ ^[A-Za-z0-9_]+$ ]] || fail "${step}: the printed table name '${table}' is not a bare TOML key"
-    body="[${table}]"$'\n'
-    for pair in "$@"; do
-        key="${pair%%=*}"
-        value="${pair#*=}"
-        [[ "${pair}" == *=* && "${key}" =~ ^[A-Za-z0-9_]+$ && -n "${value}" && "${value}" != *[$'\n\r']* ]] \
-            || fail "${step}: '${pair}' is not <key>=<TOML value> on one line"
-        body+="${key} = ${value}"$'\n'
-    done
-    mkdir -p -- "${dir}" || fail "${step}: could not create ${dir}"
-    write_file "${path}" < <(printf '%s' "${body}")
-    got="$(cat -- "${path}" && printf x)" || fail "${step}: could not read ${path} back"
-    [[ "${got%x}" == "${body}" ]] || fail "${step}: ${path} does not hold the table as written"
-}
-
 start_second_tmux_server() {
     local name="${1:-${SCENARIO_TAG}_second}" step="start_second_tmux_server" dir sock out pid sid got
     require_ci_image "${step}"
@@ -3771,6 +3853,7 @@ ad_shim_mark() {
 _scenario_ad_window() {
     local step="$1" from="$2" to="$3" file
     require_ci_image "${step}"
+    require_scenario_home "${step}"
     [[ "${from}" =~ ^[0-9]+$ ]] || fail "${step}: mark '${from}' is not a line count"
     if [[ "${to}" == - ]]; then
         to="$(ad_shim_mark)"
@@ -3867,17 +3950,20 @@ restore_tmux_socket() {
     [[ "${old_pid}" =~ ^[0-9]+$ ]] || fail "${step}: tmux gave server pid '${old_pid}' on ${moved}"
     [[ "${path}" == "${sock}" ]] || fail "${step}: the server on ${moved} has socket path '${path}', not ${sock}"
     before="$(_scenario_panes_of "${step}" -S "${moved}")" || exit 1
-    # The other server, at the socket path.
-    out="$(_scenario_tmux list-sessions -F '#{pid}')" \
+    # The other server, at the socket path, named with -S like every call
+    # here, so the one ended is the server at <socket> and never the recorded
+    # one (on <moved-socket>).
+    out="$(_scenario_tmux -S "${sock}" list-sessions -F '#{pid}')" \
         || fail "${step}: no tmux server answers at ${sock}: $(_scenario_tmux_err)"
     new_pid="${out%%$'\n'*}"
     [[ "${new_pid}" =~ ^[0-9]+$ && "${new_pid}" != "${old_pid}" ]] \
         || fail "${step}: ${sock} answers with server pid '${new_pid}', not another server than the recorded ${old_pid}"
-    _scenario_tmux kill-server || fail "${step}: tmux kill-server at ${sock} failed: $(_scenario_tmux_err)"
+    _scenario_tmux -S "${sock}" kill-server || fail "${step}: tmux kill-server at ${sock} failed: $(_scenario_tmux_err)"
     _scenario_poll_until "${SCENARIO_TMUX_STOP_S}" _scenario_pid_gone "${new_pid}" \
         || fail "${step}: the other tmux server ${new_pid} still runs ${SCENARIO_TMUX_STOP_S} s after kill-server"
+    pid_alive "${old_pid}" || fail "${step}: the recorded tmux server ${old_pid} is gone"
     mv -f -- "${moved}" "${sock}" || fail "${step}: could not move ${moved} back to ${sock}"
-    out="$(_scenario_tmux list-sessions -F '#{pid}')" \
+    out="$(_scenario_tmux -S "${sock}" list-sessions -F '#{pid}')" \
         || fail "${step}: no tmux server answers at ${sock} after the move: $(_scenario_tmux_err)"
     [[ "${out%%$'\n'*}" == "${old_pid}" ]] \
         || fail "${step}: ${sock} answers with server pid '${out%%$'\n'*}', not the recorded server's ${old_pid}"

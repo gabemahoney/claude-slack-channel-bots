@@ -24,15 +24,16 @@
 # asks a permission, so the poller has nothing to find).
 #
 # Scenario 10 writes the scenario HOME's agent-director `[tmux]` table
-# (SRJ-1306, SRJ-1401) before the server starts, through `write_ad_tmux_table`:
-# the file at AD_SETTINGS_RELATIVE_PATH, table AD_TMUX_TABLE, and each key
-# whose minimum is a whole number at that minimum (AD_SETTING_MINIMUMS, read
-# through the printer with its AD_TMUX_KEYS check): `stopping_window_seconds`
-# and `starting_session_seconds` (30 and 60 in the release), every name and
-# value from src/ad-settings.ts, none typed here. BOUND_S is the larger
-# minimum: the session must be older than both the stopping window (the
-# statement's rule) and the starting-session bound (the finished-row kill's
-# rule, and the own-id CONFLICT's rather than UNAVAILABLE's) before part B.
+# (SRJ-1306, SRJ-1401) before the server starts, through `write_ad_settings`:
+# the file at AD_SETTINGS_RELATIVE_PATH, table AD_TMUX_TABLE (both printed by
+# the writer), with `stopping_window_seconds` and `starting_session_seconds`
+# each at its minimum (`AD_SETTING_MINIMUMS <key>`, src/ad-settings.ts: 30 and
+# 60 in the release). The two key names are agent-director's own; the printer
+# refuses a key the package records no minimum for, and every value is
+# printed, none typed here. BOUND_S is the larger minimum: the session must
+# be older than both the stopping window (the statement's rule) and the
+# starting-session bound (the finished-row kill's rule, and the own-id
+# CONFLICT's rather than UNAVAILABLE's) before part B.
 #
 # Every notice text, phrase, label, interval and line count compared below is
 # printed from the installed package by fixtures/fmk-texts.ts (src/ exports
@@ -58,11 +59,17 @@
 #      its recorded socket), and each is logged with the scenario's shell as
 #      parent. The script checks that each prefix assignment did not outlive
 #      its call, not which environment the binary saw (the shim logs a call's
-#      arguments and parent, not its environment). Then the row still reads `waiting`, the worker runs, and over a
-#      hold of one re-check interval and HOLD_EXTRA_S more, no CSCB process
-#      makes a `resume`, `spawn`, `kill`, `read-pane` or `send-keys` for the
-#      persona, nor any `find-missing`; the Slack record holds no post for the
-#      persona, and server.log holds no latch line for it.
+#      arguments and parent, not its environment). Then the row still reads
+#      `waiting`, the worker runs, and over a hold of one re-check interval and
+#      HOLD_EXTRA_S more, no CSCB process makes a `resume`, `spawn`, `kill`,
+#      `read-pane` or `send-keys` for the persona, nor any `find-missing`; the
+#      Slack record holds no post for the persona, and server.log holds no
+#      latch or relatch line for it (conflictLatchSetLineHead). The hold is a
+#      no-trigger window: nothing in it would make CSCB call for the persona
+#      (no health tick, no latch, no restart), so its no-call checks cannot
+#      fail on their own. SRJ-1412 A's "CSCB does nothing" rests on the two
+#      runs' `ids` checks and on the row still reading `waiting` with the
+#      worker running after them; the hold only shows that nothing follows.
 #   3. Part B, up to the latch (SRJ-1412 B (1), (2)). Once the worker's
 #      session is more than BOUND_S old, the harness's one sqlite3 statement
 #      (`ad_store_mark_finished <id> missing`, E39 T4's scenario 10 part B
@@ -75,8 +82,10 @@
 #      STILL_STOPPING_PHRASE or STILL_STARTING_PHRASE comes before the first
 #      line carrying CONFLICT_OWN_ID_PHRASE (the wait past BOUND_S means the
 #      `resume` meets the CONFLICT directly: an UNAVAILABLE is allowed, not
-#      expected); the persona latches with case
-#      LATCH_CASE_OWN_ID; and the Slack record holds exactly one post for the
+#      expected); the persona latches with case LATCH_CASE_OWN_ID (its latch
+#      line: conflictLatchSetLineHead, the case, then agent-director's
+#      description carrying CONFLICT_OWN_ID_PHRASE); and the Slack record
+#      holds exactly one post for the
 #      persona since part B began, carrying, in order, the persona prefix and
 #      CONFLICT_NOTICE_FIRST_LINE_HEAD with the quoted session name, the
 #      own-id case sentence (conflictCaseSentence), CONFLICT_NOTICE_POINTER_LINE
@@ -87,15 +96,18 @@
 #      window of CSCB calls from the end of the previous one makes exactly one
 #      `status` and then one `read-pane` with `--n-lines` PROBE_PANE_READ_LINES
 #      for the instance id, both by the bot server, and nothing else but
-#      `version`; each round logs the probe holding (`still-latched` on a
-#      pane); no further post is made; the worker runs and the row still
-#      reads `missing`.
+#      `version`; each round logs the probe holding (its round line,
+#      latchRecheckRoundLine with RECHECK_STEP_TABLE, RECHECK_CALL_PROBE and
+#      the answer `still-latched (pane)`); no further post is made; the
+#      worker runs and the row still reads `missing`.
 #   5. The human's finished-row kill (SRJ-1412 B (4); AC 16), right after the
 #      second re-check: `ad_kill_include_finished <id>`, agent-director-admin's
 #      `kill-finished --claude-instance-id <id>` (agent-director 0.11.0's form
 #      of `kill --include-finished`), from the scenario's own shell. It
 #      reports `kill_sent` true; the worker's session and process are gone;
-#      the row keeps its `state`, `ended_at` and `row_version`.
+#      the row is unchanged: every column after the kill holds its value from
+#      before it (`_scenario_row_diff_check`, which names each changed
+#      column).
 #   6. The cleared probe (SRJ-1412 B (5), (6); SRJ-506, SRJ-1005; AC 5). From
 #      the end of the second re-check to the first CSCB `resume` after it, the
 #      bot server makes exactly `status`, the one-line `read-pane`,
@@ -105,7 +117,9 @@
 #      launch proceeds (the approver clears the new stub's dialog and the row
 #      reads `waiting`); and the second and last post of part B is exactly
 #      formatPersonaNotice of conflictRecoveryText for the session with
-#      LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED.
+#      LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED. Once that post has settled,
+#      the whole window from the end of the second re-check holds exactly one
+#      CSCB `resume` of the instance id and exactly one CSCB `find-missing`.
 #   7. Close. The agent-director shim's log holds exactly one finished-row
 #      kill, the harness's, whose parent is the scenario's shell (its pid and
 #      its command line); no CSCB process made a `kill` or a `delete`, and none
@@ -129,14 +143,19 @@
 #     latch, a post reaching the stub, the killed session ending and a round's
 #     calls after its read-pane.
 #
-# Matched fragments with no builder of their own (ruling S7), each quoted
-# where it is matched with a comment naming its source: the latch line's head
-# (src/conflict-latch.ts conflictLatchSetLine, whose whole line carries
-# agent-director's description), the re-check round line's head and fields
-# (src/conflict-latch.ts latchRecheckRoundLine) with the answers
-# src/session-manager.ts composes inline (`still-latched (pane)`,
-# `probe-cleared (gone); …`), and the quotes around the session name in the
-# CONFLICT notice's first line (src/conflict-latch.ts slackQuotedSession).
+# The latch line's head is printed from src/conflict-latch.ts
+# conflictLatchSetLine (`conflictLatchSetLineHead`, up to `case=`; the rest
+# of the line carries agent-director's description, so the case and
+# CONFLICT_OWN_ID_PHRASE are matched after it), and each re-check round line
+# whole from src/conflict-latch.ts latchRecheckRoundLine
+# (`latchRecheckRoundLine`). Matched fragments with no export of their own
+# (ruling S7), each quoted where it is used with a comment naming its source:
+# the round lines' answers src/session-manager.ts runLatchRecheckRound
+# composes inline (`<verdict> (<pane read kind>)` for a probe that holds,
+# `probe-cleared (<pane read kind>);` and the call `<probe>+find-missing+<retry>`
+# from latchRecheckClearedProbeRetry for one that cleared, of which only that
+# part is matched), and the quotes around the session name in the CONFLICT
+# notice's first line (src/conflict-latch.ts slackQuotedSession).
 set -euo pipefail
 
 TEST_NAME="test-22-fmk-wrong-server"
@@ -150,7 +169,6 @@ source "$(dirname "$0")/lib/scenario.sh"
 STEP_VALUES="values"
 PERSONA_NAME="${SCENARIO_TAG}_wrong"
 PERSONA_KEY="$(persona_key "${PERSONA_NAME}")"
-PERSONA_REF="$(persona_ref "${PERSONA_NAME}")"
 CHANNEL="C0T22WRG1"
 SLACK_SUFFIX="t22wrong"
 
@@ -168,7 +186,12 @@ RECOVERY_POST="$(_scenario_printed "${STEP_VALUES}" formatPersonaNotice "${PERSO
     conflictRecoveryText "${SESSION_NAME}" LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED)"
 CALL_PROBE="$(_scenario_printed "${STEP_VALUES}" RECHECK_CALL_PROBE)"
 CALL_RESUME="$(_scenario_printed "${STEP_VALUES}" RECHECK_CALL_RESUME)"
+STEP_TABLE="$(_scenario_printed "${STEP_VALUES}" RECHECK_STEP_TABLE)"
 VERDICT_STILL_LATCHED="$(_scenario_printed "${STEP_VALUES}" RECHECK_VERDICT_STILL_LATCHED)"
+# The heads of the persona's latch and relatch lines (conflictLatchSetLine,
+# up to and including `case=`).
+LATCH_HEAD="$(_scenario_printed "${STEP_VALUES}" conflictLatchSetLineHead "${PERSONA_KEY}" latched)"
+RELATCH_HEAD="$(_scenario_printed "${STEP_VALUES}" conflictLatchSetLineHead "${PERSONA_KEY}" relatched)"
 # src/pane-read.ts.
 PROBE_LINES="$(_scenario_printed "${STEP_VALUES}" PROBE_PANE_READ_LINES)"
 READ_PANE="$(_scenario_printed "${STEP_VALUES}" PANE_READ_PANE)"
@@ -179,19 +202,22 @@ POLL_INTERVAL_MS="$(_scenario_printed "${STEP_VALUES}" MAX_AGENT_DIRECTOR_POLL_I
 OWN_ID_PHRASE="$(_scenario_printed "${STEP_VALUES}" CONFLICT_OWN_ID_PHRASE)"
 STOPPING_PHRASE="$(_scenario_printed "${STEP_VALUES}" STILL_STOPPING_PHRASE)"
 STARTING_PHRASE="$(_scenario_printed "${STEP_VALUES}" STILL_STARTING_PHRASE)"
-# src/ad-settings.ts: each `[tmux]` key with a whole-number minimum, `<key>=<n>`.
-MINIMUMS_TEXT="$(_scenario_printed "${STEP_VALUES}" AD_SETTING_MINIMUMS)"
-mapfile -t TMUX_PAIRS <<< "${MINIMUMS_TEXT}"
+# src/ad-settings.ts: the stopping window's and the starting-session bound's
+# minimums (agent-director's own key names; the printer refuses a key the
+# package records no minimum for).
+KEY_STOPPING=stopping_window_seconds
+KEY_STARTING=starting_session_seconds
+MIN_STOPPING="$(_scenario_printed "${STEP_VALUES}" AD_SETTING_MINIMUMS "${KEY_STOPPING}")"
+MIN_STARTING="$(_scenario_printed "${STEP_VALUES}" AD_SETTING_MINIMUMS "${KEY_STARTING}")"
 
 [[ "${RECHECK_MS}" =~ ^[1-9][0-9]*$ && "${PROBE_LINES}" =~ ^[1-9][0-9]*$ && "${POLL_INTERVAL_MS}" =~ ^[1-9][0-9]*$ ]] \
     || fail "${STEP_VALUES}: the re-check interval '${RECHECK_MS}', the probe's line count '${PROBE_LINES}' or the poll interval '${POLL_INTERVAL_MS}' is not a whole number"
+[[ "${MIN_STOPPING}" =~ ^[1-9][0-9]*$ && "${MIN_STARTING}" =~ ^[1-9][0-9]*$ ]] \
+    || fail "${STEP_VALUES}: the minimums '${MIN_STOPPING}' (${KEY_STOPPING}) and '${MIN_STARTING}' (${KEY_STARTING}) are not whole numbers above 0"
 RECHECK_S=$(( (RECHECK_MS + 999) / 1000 ))
-BOUND_S=0
-for pair in "${TMUX_PAIRS[@]}"; do
-    [[ "${pair}" =~ ^[a-z_]+=([0-9]+)$ ]] || fail "${STEP_VALUES}: AD_SETTING_MINIMUMS printed '${pair}', not <key>=<n>"
-    (( BASH_REMATCH[1] > BOUND_S )) && BOUND_S="${BASH_REMATCH[1]}"
-done
-(( BOUND_S > 0 )) || fail "${STEP_VALUES}: AD_SETTING_MINIMUMS printed no minimum above 0"
+TMUX_PAIRS=("${KEY_STOPPING}=${MIN_STOPPING}" "${KEY_STARTING}=${MIN_STARTING}")
+BOUND_S="${MIN_STOPPING}"
+(( MIN_STARTING <= BOUND_S )) || BOUND_S="${MIN_STARTING}"
 
 # Waits, in seconds (see the header).
 STUB_WAIT_S=20
@@ -252,7 +278,9 @@ row_json() {
 # True when the persona's row reads <state> (a read-only store read, which
 # adds no line to the shim's log).
 row_reads() {
-    [[ "$(_scenario_store_read "row state" "SELECT state FROM spawns WHERE claude_instance_id = '${INSTANCE_ID}'")" == "$1" ]]
+    local state
+    state="$(_scenario_store_read "row state" "SELECT state FROM spawns WHERE claude_instance_id = '${INSTANCE_ID}'")" || exit 1
+    [[ "${state}" == "$1" ]]
 }
 
 # expect_status <step> <state>: a harness `status` read of the persona's row
@@ -313,7 +341,9 @@ post_count() {
 }
 
 posts_at_least() {
-    (( $(post_count "$1") >= $2 ))
+    local n
+    n="$(post_count "$1")" || exit 1
+    (( n >= $2 ))
 }
 
 # post_text <after-seq> <n>: print the text of the <n>th post (from 1) after
@@ -395,13 +425,14 @@ expect_window() {
 # the persona's instance id, and the shim logged it, after <mark>, with the
 # scenario's shell as parent.
 harness_find_missing() {
-    local step="$1" mark="$2" lines=() i n=0
+    local step="$1" mark="$2" lines=() i n=0 answer
     (( AD_RC == 0 )) || fail "${step}: find-missing exited ${AD_RC}: $(tr '\n' ' ' < "${AD_ERR}")"
     jq -e 'type == "object" and (.ids | type) == "array"' "${AD_OUT}" > /dev/null 2>&1 \
         || fail "${step}: find-missing printed no JSON object with an ids array: $(head -c 300 "${AD_OUT}")"
     jq -e --arg id "${INSTANCE_ID}" '.ids | index($id) == null' "${AD_OUT}" > /dev/null \
         || fail "${step}: find-missing listed ${INSTANCE_ID} in its ids: $(tr '\n' ' ' < "${AD_OUT}")"
-    echo "${TEST_NAME}: ${step}: find-missing answered $(jq -c '.' "${AD_OUT}")"
+    answer="$(jq -c '.' "${AD_OUT}")" || fail "${step}: jq could not read find-missing's answer"
+    echo "${TEST_NAME}: ${step}: find-missing answered ${answer}"
     mapfile -t lines < <(tail -n "+$(( mark + 1 ))" "${SCENARIO_AD_SHIM_LOG}")
     for i in "${!lines[@]}"; do
         _scenario_split_line "${lines[i]}" && [[ "${_L_KIND}" == call ]] || continue
@@ -413,22 +444,19 @@ harness_find_missing() {
     (( n == 1 )) || fail "${step}: the shim logged ${n} find-missing call(s) from the scenario's shell since the call, not 1"
 }
 
-# The fragments of the persona's latch line (src/conflict-latch.ts
-# conflictLatchSetLine: `[slack] conflict-latch: persona=<key> latched — case=<case> …`;
-# its tail carries agent-director's description, so only its head is matched).
-LATCH_ANY="$(matcher "[slack] conflict-latch: persona=${PERSONA_KEY} " "latched — ")"
-LATCH_OWN_ID="$(matcher "[slack] conflict-latch: persona=${PERSONA_KEY} latched — case=${OWN_ID_CASE}" "${OWN_ID_PHRASE}")"
-# The re-check round line (src/conflict-latch.ts latchRecheckRoundLine,
-# `[slack] conflict-latch: re-check of <ref> — case=<case> step=<step> call=<call> answer=<answer>`),
-# with the answers src/session-manager.ts runLatchRecheckRound composes inline:
-# `<verdict> (<pane read kind>)` for a probe that holds, and
-# `probe-cleared (<pane read kind>); …` with call
-# `<probe>+find-missing+<retry>` for one that cleared
-# (latchRecheckClearedProbeRetry's call label).
-ROUND_HELD="$(matcher "[slack] conflict-latch: re-check of ${PERSONA_REF} — case=${OWN_ID_CASE} " \
-    " call=${CALL_PROBE} answer=${VERDICT_STILL_LATCHED} (${READ_PANE})")"
-ROUND_CLEARED="$(matcher "[slack] conflict-latch: re-check of ${PERSONA_REF} — case=${OWN_ID_CASE} " \
-    " call=${CALL_PROBE}+find-missing+${CALL_RESUME} answer=probe-cleared (${READ_GONE})")"
+# The persona's own-id latch line: its printed head and case, then
+# agent-director's description, which carries the own-id phrase.
+LATCH_OWN_ID="$(matcher "${LATCH_HEAD}${OWN_ID_CASE} " "${OWN_ID_PHRASE}")"
+# The re-check round lines (src/conflict-latch.ts latchRecheckRoundLine, printed
+# whole), with the answers src/session-manager.ts runLatchRecheckRound composes
+# inline: `<verdict> (<pane read kind>)` for a probe that holds, and
+# `probe-cleared (<pane read kind>); …` with the call
+# `<probe>+find-missing+<retry>` (latchRecheckClearedProbeRetry's call label)
+# for one that cleared, of which the line up to the `;` is matched.
+ROUND_HELD="$(_scenario_printed "${STEP_VALUES}" latchRecheckRoundLine "${PERSONA_NAME}" "${OWN_ID_CASE}" \
+    "${STEP_TABLE}" "${CALL_PROBE}" "${VERDICT_STILL_LATCHED} (${READ_PANE})")"
+ROUND_CLEARED="$(_scenario_printed "${STEP_VALUES}" latchRecheckRoundLine "${PERSONA_NAME}" "${OWN_ID_CASE}" \
+    "${STEP_TABLE}" "${CALL_PROBE}+find-missing+${CALL_RESUME}" "probe-cleared (${READ_GONE});")"
 
 # ---------------------------------------------------------------------------
 # Leg 1: set-up and start
@@ -442,13 +470,14 @@ mkdir -p "${CONFIG_DIR}" || fail "${STEP}: could not create ${CONFIG_DIR}"
 WORK="$(make_workdir wrong)"
 stub_mode "${WORK}" "${STUB_MODE_DEV_CHANNELS}"
 
-# The [tmux] table, before the server starts: every whole-number minimum.
-write_ad_tmux_table "${TMUX_PAIRS[@]}"
+# The [tmux] table, before the server starts: both keys at their minimums.
+write_ad_settings "${TMUX_PAIRS[@]}"
 echo "${TEST_NAME}: ${STEP}: [tmux] ${TMUX_PAIRS[*]} (session must pass ${BOUND_S}s); re-check every ${RECHECK_S}s"
 
 start_slack_stub "${SCENARIO_ROOT}/slack-stub" "${SLACK_SUFFIX}"
-printf '{"bot_token": "%s", "app_token": "%s"}\n' "$(fake_token bot "${SLACK_SUFFIX}")" "$(fake_token app "${SLACK_SUFFIX}")" \
-    | write_file "${CREDS}/wrong.json" 600
+BOT_TOKEN="$(fake_token bot "${SLACK_SUFFIX}")"
+APP_TOKEN="$(fake_token app "${SLACK_SUFFIX}")"
+printf '{"bot_token": "%s", "app_token": "%s"}\n' "${BOT_TOKEN}" "${APP_TOKEN}" | write_file "${CREDS}/wrong.json" 600
 write_config << EOF
 {
   "personas": [
@@ -471,13 +500,14 @@ EOF
 
 STEP="leg 1 (start)"
 start_server --live
-wait_for_log "$(completion_match 1)" "${START_WAIT_S}" "${STEP}: the start pass never completed"
+COMPLETE_1="$(completion_match 1)"
+wait_for_log "${COMPLETE_1}" "${START_WAIT_S}" "${STEP}: the start pass never completed"
 expect_completion 1 "${STEP}" "0 not brought up"
 wait_until "${REPORT_WAIT_S}" "${STEP}: row ${INSTANCE_ID} never reported in (waiting)" row_reads waiting
 expect_status "${STEP}" waiting
 note_worker "${STEP}"
-(( $(cscb_ad_count send-keys "--claude-instance-id ${INSTANCE_ID}") >= 1 )) \
-    || fail "${STEP}: no CSCB send-keys cleared the stub's dialog"
+n="$(cscb_ad_count send-keys "--claude-instance-id ${INSTANCE_ID}")"
+(( n >= 1 )) || fail "${STEP}: no CSCB send-keys cleared the stub's dialog"
 
 # ---------------------------------------------------------------------------
 # Leg 2: part A, find-missing from another tmux environment
@@ -514,8 +544,10 @@ n="$(cscb_ad_count_between "${MARK_A}" - find-missing)"
 [[ "${n}" == 0 ]] || fail "${STEP}: a CSCB process made ${n} find-missing call(s) after part A"
 n="$(post_count 0)"
 [[ "${n}" == 0 ]] || fail "${STEP}: the Slack record holds ${n} post(s) for ${PERSONA_NAME}"
-n="$(count_log "${LATCH_ANY}")"
-[[ "${n}" == 0 ]] || fail "${STEP}: server.log holds ${n} latch line(s) for ${PERSONA_KEY}"
+for head in "${LATCH_HEAD}" "${RELATCH_HEAD}"; do
+    n="$(count_log "${head}")"
+    [[ "${n}" == 0 ]] || fail "${STEP}: server.log holds ${n} line(s) '${head}' for ${PERSONA_KEY}"
+done
 expect_status "${STEP}: after the hold" waiting
 expect_worker_runs "${STEP}: after the hold"
 
@@ -568,7 +600,8 @@ for phrase in "${STOPPING_PHRASE}" "${STARTING_PHRASE}"; do
     if [[ -n "${last}" ]]; then
         (( last < conflict_line )) \
             || fail "${STEP}: an UNAVAILABLE line carrying '${phrase}' (line ${last}) comes after the CONFLICT (line ${conflict_line})"
-        echo "${TEST_NAME}: ${STEP}: UNAVAILABLE '${phrase}' $(count_log "${phrase}") time(s) before the CONFLICT"
+        phrase_n="$(count_log "${phrase}")"
+        echo "${TEST_NAME}: ${STEP}: UNAVAILABLE '${phrase}' ${phrase_n} time(s) before the CONFLICT"
     fi
 done
 echo "${TEST_NAME}: ${STEP}: ${n} resume(s) by the new bot server before the latch"
@@ -596,7 +629,7 @@ forms="$(printf '%s' "${LATCH_POST}" | bun "${SCENARIO_FIXTURES}/fmk-texts.ts" s
 STEP="leg 4 (held latch)"
 mark="$(ad_shim_mark)"
 MARK_LATCH="${mark}"
-for round in $(seq 1 "${HELD_RECHECKS}"); do
+for (( round = 1; round <= HELD_RECHECKS; round++ )); do
     wait_until "$(( RECHECK_S + RECHECK_ALLOWANCE_S ))" "${STEP}: re-check ${round} made no read-pane" \
         shim_line_after "${mark}" read-pane
     sleep "${SETTLE_S}"
@@ -618,18 +651,19 @@ MARK_HELD="${mark}"
 # ---------------------------------------------------------------------------
 
 STEP="leg 5 (finished-row kill)"
-before="$(row_json "${STEP}")"
+# The whole row, before and after (one-element JSON arrays).
+before="$(_scenario_row_json "${STEP}: before the kill" "${INSTANCE_ID}")"
 ad_kill_include_finished "${INSTANCE_ID}" > /dev/null
 jq -e '.kill_sent == true' "${AD_KILL_OUT}" > /dev/null \
     || fail "${STEP}: the kill answered $(tr '\n' ' ' < "${AD_KILL_OUT}"), not kill_sent true"
 wait_until "${KILL_END_WAIT_S}" "${STEP}: session ${SESSION_NAME} outlived the kill" no_session "${SESSION_NAME}"
 wait_until "${KILL_END_WAIT_S}" "${STEP}: the worker outlived the kill" worker_gone
-after="$(row_json "${STEP}")"
-for column in state ended_at row_version; do
-    [[ "$(jq -c --arg c "${column}" '.[$c]' <<< "${after}")" == "$(jq -c --arg c "${column}" '.[$c]' <<< "${before}")" ]] \
-        || fail "${STEP}: the kill changed the row's ${column}: $(jq -c --arg c "${column}" '.[$c]' <<< "${before}") -> $(jq -c --arg c "${column}" '.[$c]' <<< "${after}")"
-done
-echo "${TEST_NAME}: ${STEP}: kill-finished answered $(jq -c '.' "${AD_KILL_OUT}")"
+after="$(_scenario_row_json "${STEP}: after the kill" "${INSTANCE_ID}")"
+# Every column keeps its value (an empty object: no column may change); a
+# failure names each changed column with its value before and after.
+_scenario_row_diff_check "${STEP}: the row is unchanged by the kill" "${before}" "${after}" '{}'
+answer="$(jq -c '.' "${AD_KILL_OUT}")"
+echo "${TEST_NAME}: ${STEP}: kill-finished answered ${answer}"
 
 # ---------------------------------------------------------------------------
 # Leg 6: the cleared probe, one find-missing and one resume, one recovery post
@@ -659,6 +693,12 @@ got="$(post_text "${POSTS_B}" 2)"
 got="${got%x}"
 [[ "${got}" == "${RECOVERY_POST}" ]] \
     || fail "${STEP}: the recovery post reads '${got}', not '${RECOVERY_POST}'"
+# One find-missing and one resume over the whole window from the second
+# re-check on, not only up to the first resume.
+n="$(cscb_ad_count_between "${MARK_HELD}" - resume "--claude-instance-id ${INSTANCE_ID}")"
+[[ "${n}" == 1 ]] || fail "${STEP}: CSCB made ${n} resume call(s) of ${INSTANCE_ID} since the second re-check, not 1"
+n="$(cscb_ad_count_between "${MARK_HELD}" - find-missing)"
+[[ "${n}" == 1 ]] || fail "${STEP}: CSCB made ${n} find-missing call(s) since the second re-check, not 1"
 
 # ---------------------------------------------------------------------------
 # Leg 7: close

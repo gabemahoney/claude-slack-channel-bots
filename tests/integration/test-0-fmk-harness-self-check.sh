@@ -87,7 +87,8 @@
 #                    every install, re-shim, swap, hide and restore helper,
 #                    `ad`, `ad_store_edit`, `ad_store_id`,
 #                    `ad_store_pending_no_launch`, `stub_mode`,
-#                    `stub_press_enter`, `write_mcp_config` and every label,
+#                    `stub_press_enter`, `write_mcp_config`,
+#                    `write_ad_settings` and every label,
 #                    seeding, tmux-step, store-statement, operator-action,
 #                    find-missing-loop and 0.10.0-seeder helper fails with the
 #                    guard's reason, and the decoy is left exactly as it was.
@@ -1562,6 +1563,7 @@ leg_guard_refusals() {
         expect_fails_in_home "${step}" "${home}" "${reason}" stub_mode "${SCENARIO_ROOT}/work" "${STUB_MODE_AT_ONCE}"
         expect_fails_in_home "${step}" "${home}" "${reason}" stub_press_enter "${T0_SESSION}"
         expect_fails_in_home "${step}" "${home}" "${reason}" write_mcp_config "${SCENARIO_PORT}"
+        expect_fails_in_home "${step}" "${home}" "${reason}" write_ad_settings pending_grace_seconds=120
         # The labels, seeding, the human's tmux steps, the store statements,
         # the operator's actions, the find-missing loop and the 0.10.0
         # seeders. Each would act on the scenario's own tmux server or
@@ -1585,6 +1587,9 @@ leg_guard_refusals() {
         expect_fails_in_home "${step}" "${home}" "${reason}" respawn_worker_pane "${T0_SESSION}" sleep 1
         expect_fails_in_home "${step}" "${home}" "${reason}" restart_tmux_server
         expect_fails_in_home "${step}" "${home}" "${reason}" rebind_tmux_socket
+        expect_fails_in_home "${step}" "${home}" "${reason}" restore_tmux_socket "${SCENARIO_ROOT}/tmux/tmux-0/default.rebound-1"
+        expect_fails_in_home "${step}" "${home}" "${reason}" start_second_tmux_server
+        expect_fails_in_home "${step}" "${home}" "${reason}" end_worker_without_session_end %1
         # shellcheck disable=SC2016 # $0 is a literal tmux session id
         expect_fails_in_home "${step}" "${home}" "${reason}" end_session '$0'
         expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_mark_finished "${T0_ROW_ID}" missing
