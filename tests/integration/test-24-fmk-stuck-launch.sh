@@ -210,20 +210,29 @@
 #      relaunch reports in at once); [harness] a grouped viewer session is
 #      attached to V's session (`attach_viewer`: `new-session -t`, in the
 #      same session group).
-#   6. [harness] After the approver's first lap of R's row (its first
-#      bot-server `status` of R's row after the harness's first `pending`
-#      read), then its next bot-server `read-pane` of R's row, and
-#      LAP_SETTLE_S later (so that pane read has been answered and the next
-#      lap's comes after the relabel's two label writes), R's own session is
-#      relabelled with an earlier launch's token (`relabel_session`: a fresh
+#   6. [harness] R's own session is relabelled with an earlier launch's
+#      token. Its labels are drawn and checked first, as `relabel_session`
+#      draws and checks them, with nothing written (`plan_relabel`: a fresh
 #      token other than the label's and the row's current launch token).
-#      Checked there: the relabel is before B from L_R; no bot-server
-#      `status` or `read-pane` of R's row falls between the relabel's start
-#      and its end (else the leg fails: the relabel raced the approver's
-#      lap); the session's `@ad_owner` reads `ad_owner_label <token>
-#      <session id> cscb_<R> <store id>`, ending with the scenario store's
-#      own id; the worker pane's `@ad_pane` reads `<token> <pane id>`; that
-#      pane runs R's worker.
+#      They are written in one tmux invocation (`write_relabel`: both
+#      `set-option`s one command list, which the tmux server runs as one
+#      step, so no agent-director lookup or pane listing reads one label new
+#      and the other old). The write is anchored on the approver's lap: after
+#      its first lap of R's row (its first bot-server `status` of R's row
+#      after the harness's first `pending` read), on its next bot-server
+#      `read-pane` of R's row, once that call's process has exited (its
+#      answer), and only while the next lap is due (that `read-pane`'s time
+#      plus DIALOG_POLL_INTERVAL_MS) at least RELABEL_MARGIN_S +
+#      RELABEL_WRITE_S later; otherwise on the next lap's `read-pane`, for
+#      at most RELABEL_ATTEMPTS laps (else the leg fails). Checked there:
+#      the relabel is before B from L_R; no bot-server `status` or
+#      `read-pane` of R's row falls between the anchoring `read-pane` and
+#      the relabel's end, read once the next lap's `status` is logged (else
+#      the leg fails: the relabel raced the approver's lap); the session's
+#      `@ad_owner` reads `ad_owner_label <token> <session id> cscb_<R>
+#      <store id>`, ending with the scenario store's own id; the worker
+#      pane's `@ad_pane` reads `<token> <pane id>`; that pane runs R's
+#      worker.
 #   7. [harness] Both rows are read every HOLD_POLL_S until the bot server's
 #      `kill` of each is in the shim's log, bounded at ABORT_WAIT_S from the
 #      later launch start (each persona's reads stop at its own kill).
@@ -286,7 +295,9 @@
 #   ends with the sentinel, and R's held worker too.
 # Recorded, not asserted: the start pass's summary, the bot server's
 # `find-missing` runs with their times from L_R, the relabel's time from L_R
-# and the approver's first lap's, R's abort kill and latch-set lines, the
+# and the approver's first lap's, the relabel's margins (its start less the
+# anchoring `read-pane`, the next lap's due time and its logged `status`
+# less the relabel's end, and its length), R's abort kill and latch-set lines, the
 # bot server's `read-pane` calls of R's row from the relabel to the kill, R's
 # re-check round lines and the bot server's calls of R's row after the latch,
 # R's row after the re-check and after its worker ended, R's pending-row
@@ -329,12 +340,15 @@
 #   AGAIN_WAIT_S = UNAVAILABLE_RETRY_CEILING_S + HELD_SLACK_S from the held
 #   post: no retry wait is longer than the ceiling;
 # - the relabelled-session and grouped-viewer legs: LAP_WAIT_S bounds the
-#   approver's first lap after R's first `pending` read and its next pane
-#   read (it laps every DIALOG_POLL_INTERVAL_MS before G), and the relabel
-#   must end before B from L_R; the harness sees the approver's pane read
-#   within SCENARIO_POLL_S (lib/scenario.sh's poll) and waits LAP_SETTLE_S
-#   more, and the two together are at most half a lap (checked at setup), so
-#   the relabel ends before the approver's next lap; ABORT_WAIT_S bounds
+#   approver's first lap after R's first `pending` read, each next pane read
+#   and its answer, and the lap after the relabel (it laps every
+#   DIALOG_POLL_INTERVAL_MS before G), and the relabel must end before B
+#   from L_R; the harness looks for these every LAP_POLL_S and starts the
+#   relabel only while the next lap is due at least RELABEL_MARGIN_S +
+#   RELABEL_WRITE_S later, so a write within RELABEL_WRITE_S ends at least
+#   RELABEL_MARGIN_S before that lap, whatever this run's detection took;
+#   the part of a lap this leaves holds at least ten polls (checked at
+#   setup), and a lap seen too late moves the anchor to the next; ABORT_WAIT_S bounds
 #   each kill as in the own-launch leg, from the later launch start; V's
 #   relaunch is bounded at UNAVAILABLE_RETRY_CEILING_S + RELAUNCH_SLACK_S
 #   after the kills (the own-launch leg's RELAUNCH_WAIT_S less B); LATCH_WAIT_S
@@ -481,8 +495,11 @@ HOLD_READ_GAP_S=5
 GONE_WAIT_S=10        # after the kill: the worker's process gone
 OTHER_START_MARGIN_S=15
 HELD_SLACK_S=40
-LAP_WAIT_S=30         # after R's first pending read: the approver's first lap, then its next pane read
-LAP_SETTLE_S=0.15     # after the approver's pane read is logged: its call answered, before the relabel
+LAP_WAIT_S=30         # after R's first pending read: the approver's first lap; then each next pane read, its answer, and the lap after the relabel
+LAP_POLL_S=0.02       # the relabel's anchor: how often the harness looks for the approver's calls of R and the pane read's answer
+RELABEL_MARGIN_S=0.4  # the least time from the relabel's end to the approver's next lap due
+RELABEL_WRITE_S=0.1   # the time allowed for the relabel's one tmux invocation
+RELABEL_ATTEMPTS=5    # the approver's laps the relabel may anchor on, at most
 LATCH_WAIT_S=30       # after R's kill: the latch-set line
 RECHECK_SLACK_S=60
 
@@ -820,6 +837,31 @@ server_called_after() {
     server_call_after "$@" > /dev/null
 }
 
+# server_call_pid_after <id> <srv> <verb> <time>: as `server_call_after`, but
+# print `<time> <pid>`, the pid being the call's agent-director process (the
+# shim `exec`s it, so the logged pid is that process's).
+server_call_pid_after() {
+    awk -F'\t' -v id="$1" -v p="$2" -v v="$3" -v t="$4" '
+        $1 == "call" && $4 == p && $2 + 0 > t + 0 && index($6, id) {
+            n = split($6, w, " ")
+            for (i = 1; i <= n; i++) if (w[i] == v) { print $2 " " $3; found = 1; exit }
+        }
+        END { exit !found }' "${SCENARIO_AD_SHIM_LOG}"
+}
+
+# lap_wait_until <timeout-s> <message> <command> [<arg>...]: as `wait_until`
+# (lib/scenario.sh), polling every LAP_POLL_S, for the relabel's anchor on
+# the approver's lap.
+lap_wait_until() {
+    local timeout_s="$1" msg="$2" deadline
+    shift 2
+    deadline=$(( $(_scenario_now_ms) + timeout_s * 1000 ))
+    while ! "$@"; do
+        (( $(_scenario_now_ms) < deadline )) || fail "${msg} (not within ${timeout_s}s)"
+        sleep "${LAP_POLL_S}"
+    done
+}
+
 # log_hits <from-line> <fragment>...: print `<line number> TAB <time> TAB
 # <text>` for each line of $SLACK_STATE_DIR/server.log after line
 # <from-line> that holds every fixed-string <fragment> in order, <time> being
@@ -1109,11 +1151,12 @@ for t in "${COUNTED_FAILURE_HEADS[@]}"; do
         || fail "setup: the installed package's src/restart.ts does not hold the counted-failure fragment '${t}'; the no-counted-failure checks would count nothing"
 done
 
-# The relabel ends before the approver's next lap: the harness sees the
-# approver's pane read within SCENARIO_POLL_S, then waits LAP_SETTLE_S; both
-# together are at most half a lap (DIALOG_POLL_INTERVAL_MS).
-awk -v s="${LAP_SETTLE_S}" -v p="${SCENARIO_POLL_S}" -v lap="${PACE_MS}" 'BEGIN { exit !(2 * int((s + p) * 1000 + 0.5) <= lap + 0) }' \
-    || fail "setup: LAP_SETTLE_S ${LAP_SETTLE_S}s and SCENARIO_POLL_S ${SCENARIO_POLL_S}s together are more than half the approver's lap (${PACE_MS}ms)"
+# The relabel starts only while the approver's next lap is due at least
+# RELABEL_MARGIN_S + RELABEL_WRITE_S away (DIALOG_POLL_INTERVAL_MS after the
+# anchoring pane read); what that leaves of a lap, for the harness to see
+# the pane read and its answer, holds at least ten of its LAP_POLL_S polls.
+awk -v m="${RELABEL_MARGIN_S}" -v w="${RELABEL_WRITE_S}" -v p="${LAP_POLL_S}" -v lap="${PACE_MS}" 'BEGIN { exit !(lap / 1000 - m - w >= 10 * p) }' \
+    || fail "setup: RELABEL_MARGIN_S ${RELABEL_MARGIN_S}s and RELABEL_WRITE_S ${RELABEL_WRITE_S}s leave less than ten LAP_POLL_S (${LAP_POLL_S}s) polls of the approver's lap (${PACE_MS}ms)"
 
 # The relabelled-session and grouped-viewer legs' values.
 NOT_THIS_LAUNCH_PHRASE="$(fmk_text CONFLICT_NOT_THIS_LAUNCH_PHRASE)" || fail "setup: fmk-texts.ts could not print CONFLICT_NOT_THIS_LAUNCH_PHRASE"
@@ -1480,6 +1523,51 @@ leg_other_process() {
 # grouped viewer is attached
 # ---------------------------------------------------------------------------
 
+# plan_relabel <step> <session>: the labels `relabel_session`
+# (lib/scenario.sh) writes to make <session> an earlier launch of its own
+# instance id, drawn and checked as it draws and checks them, with nothing
+# written: RELABEL_SID and RELABEL_PANE (the session, and its worker pane:
+# the one whose `@ad_pane` names the label's token), RELABEL_TOKEN (a fresh
+# token other than the label's and the row's current launch token),
+# RELABEL_OWNER (`ad_owner_label`, ending with the scenario store's own id
+# from `ad_store_id`) and RELABEL_PANE_LABEL (`ad_pane_label`).
+plan_relabel() {
+    local step="$1: the relabel of $2" session="$2" cur store old id
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_tmux_check "${step}"
+    RELABEL_SID="$(_scenario_session_id "${step}" "${session}")" || exit 1
+    cur="$(_scenario_tmux show-options -qv -t "${RELABEL_SID}" @ad_owner)" \
+        || fail "${step}: could not read @ad_owner of ${RELABEL_SID}: $(_scenario_tmux_err)"
+    store="$(ad_store_id)" || exit 1
+    [[ "${cur}" =~ ^ad1\ ([0-9a-f]{16})\ (\$[0-9]+)\ (.+)\ ([0-9a-f]{16})$ \
+        && "${BASH_REMATCH[2]}" == "${RELABEL_SID}" && "${BASH_REMATCH[4]}" == "${store}" ]] \
+        || fail "${step}: session ${RELABEL_SID} carries no valid label of this store (its @ad_owner reads '${cur}')"
+    old="${BASH_REMATCH[1]}"
+    id="${BASH_REMATCH[3]}"
+    _scenario_check_instance_id "${step}" "${id}"
+    RELABEL_PANE="$(_scenario_worker_pane "${step}" "${RELABEL_SID}" "${old}")" || exit 1
+    RELABEL_TOKEN="$(ad_new_token "${id}" "${old}")" || exit 1
+    RELABEL_OWNER="$(ad_owner_label "${RELABEL_TOKEN}" "${RELABEL_SID}" "${id}" "${store}")" || exit 1
+    RELABEL_PANE_LABEL="$(ad_pane_label "${RELABEL_TOKEN}" "${RELABEL_PANE}")" || exit 1
+}
+
+# write_relabel <step>: write plan_relabel's labels in one tmux invocation,
+# the session's `@ad_owner` and its worker pane's `@ad_pane` as one command
+# list. The tmux server runs a client's command list as one step, so no
+# other client's command (agent-director's lookup, which reads `@ad_owner`,
+# or its pane listing, which reads `@ad_pane`) comes between the two writes:
+# every reader sees both labels old or both new. agent-director writes a
+# session's two labels the same way (its "label by id" call).
+write_relabel() {
+    require_ci_image "$1"
+    require_scenario_home "$1"
+    _scenario_tmux_check "$1"
+    _scenario_tmux set-option -t "${RELABEL_SID}" @ad_owner "${RELABEL_OWNER}" \; \
+        set-option -p -t "${RELABEL_PANE}" @ad_pane "${RELABEL_PANE_LABEL}" \
+        || fail "$1: could not set @ad_owner on ${RELABEL_SID} and @ad_pane on ${RELABEL_PANE} in one tmux invocation: $(_scenario_tmux_err)"
+}
+
 # check_relabelled_session: the relabelled-session leg's checks (step 9 of
 # the header), over the shared run's locals.
 check_relabelled_session() {
@@ -1613,8 +1701,8 @@ legs_relabelled_session_and_grouped_viewer() {
     local step="relabel and viewer" creds="${SCENARIO_ROOT}/credentials-rv" r_work v_work r_creds v_creds r_sid v_sid srv log0 posts0 leg_start
     local r_l_ms r_l_s r_b_at r_session r_worker r_pending_at v_l_ms v_l_s v_b_at v_session v_worker viewer viewer_sid
     local r_reads="${SCENARIO_ROOT}/relabel-reads.tsv" v_reads="${SCENARIO_ROOT}/viewer-reads.tsv" table="${SCENARIO_ROOT}/rv-calls.tsv"
-    local lap_at pane_at relabel_at relabel_end out label_sid label_pane token store got want deadline r_killed="" v_killed="" r_kill_seen v_kill_seen
-    local latch_seen raced verb
+    local lap_at pane_at relabel_at relabel_end label_sid label_pane token store got want deadline r_killed="" v_killed="" r_kill_seen v_kill_seen
+    local latch_seen raced verb anchor_from attempt pane_pid next_due next_at slacks=""
 
     new_state_dir relabel-viewer
     mkdir -m 700 "${creds}"
@@ -1683,21 +1771,36 @@ legs_relabelled_session_and_grouped_viewer() {
         || fail "${step}: tmux could not read the viewer ${viewer_sid}'s name"
     echo "${TEST_NAME}: ${step}: the grouped viewer ${viewer} (${viewer_sid}) is attached to V's session ${v_session}"
 
-    # Step 6 [harness]: after the approver's first lap of R's row (its first
-    # bot-server status of R after the pending read) and its next pane read,
-    # R's own session is relabelled with an earlier launch's token.
-    wait_until "${LAP_WAIT_S}" "${step}: no bot-server status of ${R_ID} within ${LAP_WAIT_S}s of its pending read (the approver's first lap)" \
+    # Step 6 [harness]: R's own session is relabelled with an earlier launch's
+    # token, its labels drawn now and written in one tmux invocation after
+    # the approver's first lap of R's row (its first bot-server status of R
+    # after the pending read), on a later read-pane of R once that call is
+    # answered, while the next lap is due at least RELABEL_MARGIN_S +
+    # RELABEL_WRITE_S away; else on the next lap's read-pane.
+    plan_relabel "${step}" "${r_session}"
+    lap_wait_until "${LAP_WAIT_S}" "${step}: no bot-server status of ${R_ID} within ${LAP_WAIT_S}s of its pending read (the approver's first lap)" \
         server_called_after "${R_ID}" "${srv}" status "${r_pending_at}"
     lap_at="$(server_call_after "${R_ID}" "${srv}" status "${r_pending_at}")"
-    wait_until "${LAP_WAIT_S}" "${step}: no bot-server read-pane of ${R_ID} within ${LAP_WAIT_S}s of the approver's first lap" \
-        server_called_after "${R_ID}" "${srv}" read-pane "${lap_at}"
-    pane_at="$(server_call_after "${R_ID}" "${srv}" read-pane "${lap_at}")"
-    sleep "${LAP_SETTLE_S}"
-    relabel_at="$(now_s)"
-    before "${relabel_at}" "${r_b_at}" || fail "${step}: the relabel would come at or after B"
-    out="$(relabel_session "${r_session}")"
-    relabel_end="$(now_s)"
-    read -r label_sid label_pane token <<< "${out}"
+    anchor_from="${lap_at}"
+    for (( attempt = 1; ; attempt++ )); do
+        lap_wait_until "${LAP_WAIT_S}" "${step}: no bot-server read-pane of ${R_ID} within ${LAP_WAIT_S}s of the approver's lap (anchor ${attempt})" \
+            server_called_after "${R_ID}" "${srv}" read-pane "${anchor_from}"
+        read -r pane_at pane_pid <<< "$(server_call_pid_after "${R_ID}" "${srv}" read-pane "${anchor_from}")"
+        next_due="$(plus_s "${pane_at}" "$(ms_to_s "${PACE_MS}")")"
+        lap_wait_until "${LAP_WAIT_S}" "${step}: the approver's read-pane of ${R_ID} (process ${pane_pid}) not answered" pid_gone "${pane_pid}"
+        relabel_at="${EPOCHREALTIME/,/.}"
+        before "${relabel_at}" "${r_b_at}" || fail "${step}: the relabel would come at or after B"
+        awk -v a="${relabel_at}" -v d="${next_due}" -v m="${RELABEL_MARGIN_S}" -v w="${RELABEL_WRITE_S}" 'BEGIN { exit !(d - a >= m + w) }' && break
+        slacks+="${slacks:+, }$(seconds_between "${relabel_at}" "${next_due}")s"
+        (( attempt < RELABEL_ATTEMPTS )) \
+            || fail "${step}: in ${RELABEL_ATTEMPTS} laps of ${R_ID}, none left ${RELABEL_MARGIN_S}s + ${RELABEL_WRITE_S}s before the next lap once its read-pane was answered (left: ${slacks})"
+        anchor_from="${pane_at}"
+    done
+    write_relabel "${step}"
+    relabel_end="${EPOCHREALTIME/,/.}"
+    label_sid="${RELABEL_SID}"
+    label_pane="${RELABEL_PANE}"
+    token="${RELABEL_TOKEN}"
     # The seeding rules: the label keeps the store's own id; the worker pane carries @ad_pane with the label's token.
     store="$(ad_store_id)"
     want="$(ad_owner_label "${token}" "${label_sid}" "${R_ID}" "${store}")"
@@ -1709,13 +1812,18 @@ legs_relabelled_session_and_grouped_viewer() {
     got="$("${SCENARIO_REAL_TMUX}" display-message -p -t "${label_pane}" '#{pane_pid}')" || fail "${step}: tmux could not read the process of ${label_pane}"
     [[ "${got}" == "${r_worker}" ]] || fail "${step}: the relabelled pane ${label_pane} runs ${got}, not R's worker ${r_worker}"
     before "$(now_s)" "${r_b_at}" || fail "${step}: the relabel ended at or after B"
-    # No approver lap of R between the relabel's start and its end (its two label writes).
+    # No approver lap of R from the anchoring read-pane to the relabel's end
+    # (its two label writes), read once the next lap's status is logged.
+    lap_wait_until "${LAP_WAIT_S}" "${step}: no bot-server status of ${R_ID} within ${LAP_WAIT_S}s of the relabel (the approver's next lap)" \
+        server_called_after "${R_ID}" "${srv}" status "${relabel_end}"
+    next_at="$(server_call_after "${R_ID}" "${srv}" status "${relabel_end}")"
     for verb in status read-pane; do
-        raced="$(server_call_after "${R_ID}" "${srv}" "${verb}" "${relabel_at}" || true)"
+        raced="$(server_call_after "${R_ID}" "${srv}" "${verb}" "${pane_at}" || true)"
         [[ -z "${raced}" ]] || ! before "${raced}" "${relabel_end}" \
-            || fail "${step}: the relabel raced the approver's lap: a bot-server ${verb} of ${R_ID} at +$(seconds_between "${relabel_at}" "${raced}")s from the relabel's start, before its end at +$(seconds_between "${relabel_at}" "${relabel_end}")s"
+            || fail "${step}: the relabel raced the approver's lap: a bot-server ${verb} of ${R_ID} at +$(seconds_between "${pane_at}" "${raced}")s from the anchoring read-pane, before the relabel's end at +$(seconds_between "${pane_at}" "${relabel_end}")s (its start at +$(seconds_between "${pane_at}" "${relabel_at}")s)"
     done
-    echo "${TEST_NAME}: ${step}: R's session ${label_sid} relabelled at +$(seconds_between "${r_l_s}" "${relabel_at}")s from its launch start in $(seconds_between "${relabel_at}" "${relabel_end}")s (the approver's first lap at +$(seconds_between "${r_l_s}" "${lap_at}")s, its next pane read at +$(seconds_between "${r_l_s}" "${pane_at}")s): @ad_owner '${want}', pane ${label_pane} @ad_pane '${token} ${label_pane}'"
+    echo "${TEST_NAME}: ${step}: R's session ${label_sid} relabelled at +$(seconds_between "${r_l_s}" "${relabel_at}")s from its launch start (the approver's first lap at +$(seconds_between "${r_l_s}" "${lap_at}")s, the anchoring read-pane at +$(seconds_between "${r_l_s}" "${pane_at}")s, anchor ${attempt}${slacks:+; earlier anchors left ${slacks}}): @ad_owner '${want}', pane ${label_pane} @ad_pane '${token} ${label_pane}'"
+    echo "${TEST_NAME}: ${step}: the relabel's margins (recorded): relabel start - last lap's read-pane $(seconds_between "${pane_at}" "${relabel_at}")s; next lap due - relabel end $(seconds_between "${relabel_end}" "${next_due}")s (due at the read-pane + ${PACE_MS}ms); next lap's status - relabel end $(seconds_between "${relabel_end}" "${next_at}")s; relabel duration $(seconds_between "${relabel_at}" "${relabel_end}")s"
 
     # Step 7 [harness]: read both rows until the bot server's kill of each, bounded from the later launch start.
     : > "${r_reads}"
