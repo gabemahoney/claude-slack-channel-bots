@@ -54,6 +54,7 @@ import * as invalidFlagsHold from '../src/invalid-flags-hold.ts'
 import * as paneRead from '../src/pane-read.ts'
 import * as personaIdentity from '../src/persona-identity.ts'
 import * as personaNotifier from '../src/persona-notifier.ts'
+import * as sessionManager from '../src/session-manager.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 
 const REPO_ROOT = join(import.meta.dir, '..')
@@ -72,6 +73,7 @@ const MODULES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
   'pane-read.ts': paneRead,
   'persona-identity.ts': personaIdentity,
   'persona-notifier.ts': personaNotifier,
+  'session-manager.ts': sessionManager,
 }
 
 /** What the printer requires an export to be. */
@@ -360,6 +362,12 @@ describe("the printer's references (tests/integration/fixtures/fmk-texts.ts)", (
     ]) {
       expect(named.has(ref)).toBe(true)
     }
+  })
+
+  test("scenario 20's after-clear retry line head is read: session-manager.ts's latchClearRetryAtOnceLineHead, a function", () => {
+    const named = new Set(reading.refs.map((r) => `${r.file}:${r.name}:${r.kind}`))
+    expect(named.has('session-manager.ts:latchClearRetryAtOnceLineHead:function')).toBe(true)
+    expect(typeof sessionManager.latchClearRetryAtOnceLineHead).toBe('function')
   })
 
   test('every file the printer names is a src/ module this file imports', () => {

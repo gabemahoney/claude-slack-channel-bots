@@ -143,6 +143,10 @@
  *   PANE_READ_PANE, PANE_READ_CONFLICT, PANE_READ_GONE
  *                                                src/pane-read.ts, the `read-pane` answer kinds
  *                                                a probe round's answer names
+ *   latchClearRetryAtOnceLineHead <persona-name>
+ *                                                src/session-manager.ts, the head of the
+ *                                                after-clear retry's lines, the reference
+ *                                                renderPersonaRef(<persona-name>)
  * The body entries print a body without the persona prefix; wrap one in
  * `formatPersonaNotice <persona-name> <entry> …` for the posted text.
  *
@@ -648,6 +652,18 @@ const latchRecheckRoundLine: Entry = {
   },
 }
 
+/** `latchClearRetryAtOnceLineHead(ref)`: the head of the after-clear retry's lines, `ref` the persona reference `renderPersonaRef` gives the name. */
+const latchClearRetryAtOnceLineHead: Entry = {
+  synopsis: '<persona-name>',
+  async print(args, context) {
+    const entry = 'latchClearRetryAtOnceLineHead'
+    expectArguments(entry, args, ['persona-name'])
+    const ref = (await packageFunction<(name: string) => unknown>(context, 'persona-identity.ts', 'renderPersonaRef'))(args[0])
+    const build = await packageFunction<(ref: string) => unknown>(context, 'session-manager.ts', entry)
+    return builtString(entry, build(builtString(entry, ref)))
+  },
+}
+
 /** `personaTmuxSessionName(key)`: the tmux session name a persona's launches ask for. */
 const personaTmuxSessionName: Entry = {
   synopsis: '<key>',
@@ -729,6 +745,7 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   DEFAULT_AD_SETTINGS: defaultAdSetting,
   RECHECK_VERDICT_STILL_LATCHED: constantEntry('conflict-latch.ts', 'RECHECK_VERDICT_STILL_LATCHED'),
   ...constantEntries('pane-read.ts', PANE_READ_KIND_NAMES),
+  latchClearRetryAtOnceLineHead,
 }
 
 /** The value entry `name` prints for `args`; a usage failure for no entry or an unknown one. */

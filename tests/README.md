@@ -303,18 +303,42 @@ tests/
     test-23-fmk-latch-recheck.sh  # HO §7 scenario 20 (b.jg5 SRJ-1422), fmk: each latch case is re-checked with exactly its call
                                    # Part 2's cases, one persona each: no valid instance id, a different instance id, another agent-director store,
                                    # left over from an earlier life, the scan's refusal with no row, "duplicate session" with the row `ended`, this
-                                   # row's own id, the agent's pane was not found, and the unusable recorded name. The script header holds the per-case
-                                   # table (each case's set-up step, round call and clear), the lives, the waits and the runtime. Checks: with
+                                   # row's own id, the agent's pane was not found, the unusable recorded name, "not this launch's session" (two legs,
+                                   # personas `relabelone` and `relabeltwo`) and "launch start not recorded" (persona `nostart`). The script header
+                                   # holds the per-case table (each case's set-up step, round call and clear), the lives, the waits and the runtime. Checks: with
                                    # `health_check_interval` 0, each re-check, 120 s apart, is one `status` read of the row plus exactly SRJ-505's
                                    # call for its case and nothing else, counted from the agent-director shim's log (CSCB-parented lines only); at
                                    # least two still-latched rounds per case; a same-case re-refusal posts nothing; each case latches with exactly one
                                    # post; the cadence retries clear with no CSCB `find-missing` before them; each probe clear makes exactly one
                                    # `find-missing` and one retry; each clear makes one recovery post; the unusable recorded name is re-checked by
                                    # `status` alone and stays latched to the end. Finished rows come from the stub's exit (`stub_type_exit`: the
-                                   # worker's SessionEnd hooks make agent-director mark the row `ended`); no step passes `--include-finished`. The
-                                   # harness runs no `find-missing`. Modes: tmux shim `log`, the stub's dev-channels hold (and report-in at once for
-                                   # the pane-not-found persona's relaunch), agent-director's defaults (no config.toml). It runs about 17 minutes and
-                                   # ends with a plain `stop`, then the three closing assertions
+                                   # worker's SessionEnd hooks make agent-director mark the row `ended`); no step passes `--include-finished`.
+                                   # Then, in run order, the cases cleared only once their row reads `missing`. "Launch start not recorded": the
+                                   # set-up stop seeds the persona's live row `pending` with no launch start (`ad_store_pending_no_launch`; it
+                                   # never reports in by itself, as it records no pane, and the harness never ends its session); the start pass's
+                                   # first `list` latches it before any bring-up call, with one launch-start-not-recorded notice; each round is `status`
+                                   # alone; once a store-wide `find-missing` marks the row `missing` (whichever runs first: in practice CSCB's own,
+                                   # in the own-id probe round's clear; the script accepts either and logs whose it was), the next round clears it
+                                   # with one "Hold cleared" post ("its agent-director row reads missing") and one bring-up retry by the restart
+                                   # path's decision, with no CSCB `find-missing` between that `status` and the retry. What the retry meets beside
+                                   # the still-running session is logged, not asserted. "Not this launch's session": the set-up stop relabels each
+                                   # leg's own session with an earlier launch's token (`relabel_session`: `@ad_owner` with that token and the
+                                   # store's id, the worker pane's `@ad_pane` with the same token); the latch life's bring-up reconnect `send-keys`
+                                   # on the `waiting` row is refused with nothing typed into the pane (AC 44, from the tmux shim's log), and
+                                   # latches with one post; each round is `status` alone: the refused call is never retried, and a live reading
+                                   # never clears the latch (the row's state and row_version unchanged). After the last clearing round above, right
+                                   # after one more round of each leg, the harness respawns leg 1's worker pane with `sleep` (the relabelled
+                                   # session stays) and ends leg 2's session by its id, then starts its find-missing loop (`run_find_missing_loop`,
+                                   # every 30 s), which marks each leg's row `missing`. Leg 1: the next round is one `status`, one `get` and one
+                                   # `resume`, refused with "left over from an earlier life": it relatches with one new post and no recovery post,
+                                   # each following round is `status` then `resume`, and it stays latched to the end. Leg 2: the same round's
+                                   # `resume` launches, and it clears with one recovery post ("its row finished and a relaunch was not refused"),
+                                   # nothing posted between the latch's notice and it. The harness runs no `find-missing` before its loop, which
+                                   # serves the latched personas' rows; the loop's calls are the harness's, never counted as CSCB's. Modes: tmux
+                                   # shim `log`, the stub's dev-channels hold (and report-in at once for the pane-not-found persona's relaunch),
+                                   # `health_check_interval` 0 (so the waiting-row `read-pane` a health tick makes is not shown; the reconnect
+                                   # comes from a server restart), agent-director's defaults (no config.toml). It runs about 24 minutes and ends
+                                   # with the loop stopped, a plain `stop`, then the three closing assertions
     test-27-fmk-unusable-name.sh  # HO §7 scenario 25 (b.jg5 SRJ-1427), fmk: an unusable recorded name latches with no tmux call; after the harness's delete it clears and comes up fresh
                                    # Set-up: in the first life persona `unusable` (U) reaches `waiting`; the harness types the stub's exit sentinel into its
                                    # pane (a human quitting Claude Code), so the row ends; then `stop --stop-bots`. With the server stopped, E39's scenario
