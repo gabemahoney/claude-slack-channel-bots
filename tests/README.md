@@ -241,7 +241,7 @@ tests/
                                    # about 90 s and ends with the three closing assertions
     test-16-fmk-conflict.sh  # HO §7 scenarios 4 and 19 (b.jg5 SRJ-1405, SRJ-1420), fmk: a session holding a persona's name latches it; re-checks retry until the harness removes it
                                    # Built in five phases, one function each, so scenario 19's legs join the same phases: 1. the first life; 2. `stop
-                                   # --stop-bots`; 3. harness seeding with the server stopped; 4. the second life; 5. a restart-leg hook (empty). It holds
+                                   # --stop-bots`; 3. harness seeding with the server stopped; 4. the second life; 5. the restart leg. It holds
                                    # scenario 4's leg (persona `nolabel`). Set-up: in the first life the persona reaches `waiting`; the harness then types the
                                    # stub's exit sentinel into its pane (a human quitting Claude Code), so the stub fires SessionEnd, agent-director marks the
                                    # row `ended` and the session ends; then `stop --stop-bots`. With the server stopped, the harness makes a session with no
@@ -253,9 +253,36 @@ tests/
                                    # `row_version` unchanged; the harness ends the session by its session id, the next round's `resume` launches with no
                                    # `find-missing` between that round's `status` and `resume`, the persona reaches `waiting` with its first-life
                                    # claude_session_id, and exactly one recovery post follows ("a retry of the refused operation was not refused"); no tmux
-                                   # command CSCB caused touches the seeded session; the row present at the end. The harness runs no `find-missing`. Modes:
-                                   # tmux shim `log`, the stub's dev-channels hold, `health_check_interval` 0, agent-director's defaults (no config.toml).
-                                   # It runs about 7 minutes and ends with the three closing assertions
+                                   # command CSCB caused touches the seeded session; the row present at the end.
+                                   # Scenario 19's legs (personas `scanleft`, `envonly`, `otherstore`, `pendleft`): the second life runs in a state dir of
+                                   # its own (each start replays its state dir's `config.json.last-applied`, and this life adds these personas). Each
+                                   # seeded session is named as the package names the persona's launches (`slack_bot_<key>`), its pane running `sleep`;
+                                   # every `@ad_owner` label ends with the scenario store's id (`ad_store_id`) except the other-store variant's, and every
+                                   # seeded leftover's pane carries `@ad_pane`. In run order: (1) a leftover labelled with an earlier launch (`scanleft`,
+                                   # `seed_leftover`, no row): the bring-up's plain spawn is refused by agent-director's pre-spawn scan ("left over from an
+                                   # earlier life"), which writes no row; the harness reads one `ad.launch.name_held` trail record with `row_result`
+                                   # `not_inserted` per refused plain spawn, naming the leftover's session and tmux id (read from the trail, never from the
+                                   # post, whose description is capped); one CONFLICT post; rounds are `status` (no row) then the plain spawn; never
+                                   # `kill`; it stays latched through phase 4. (2) An environment-only session (`envonly`, `seed_env_only`): "no valid
+                                   # instance id" at "duplicate session", the new row `ended`; rounds are `status` then a spawn with `--reuse-finished`,
+                                   # the row's state and `row_version` unchanged. (3) Another store's label (`otherstore`, `seed_other_store`, a different
+                                   # 16-hex store id): "another agent-director store" at "duplicate session", the row `ended`; the post's lines in
+                                   # SRJ-1004's order (the must-not-be-ended line, the pointer line to "Operator actions", the list line, the human-only
+                                   # line); reuse rounds. (4) A `pending` row beside a leftover (`pendleft`): its first-life row is seeded `pending` beside
+                                   # a `seed_leftover` leftover (`ad_store_seed_pending`), then one `ad_store_edit` statement clears its
+                                   # claude_session_id (a launch stopped before its create recorded no Claude session); CSCB's own pending-row runs mark
+                                   # it `missing` (reason `tmux_name_held`, one `ad.launch.name_held` record from `ad_find_missing`) no earlier than G and
+                                   # by B after its launch start; never `kill`ed; the restart path's reuse spawn is refused as "left over from an earlier
+                                   # life" with one post; rounds are `status` then the reuse spawn. The harness ends the seeded sessions of (2) to (4) by
+                                   # their session ids, and each clears at its next round (`pendleft` on a fresh Claude session). (5) Phase 5, the
+                                   # restart leg: a plain `stop`, then a start; the bring-up's plain spawn relatches `scanleft` with exactly one new post,
+                                   # and no other persona posts or latches; once the harness ends the leftover by its session id, it clears. Each clear:
+                                   # the round's `status` then its retry, with no CSCB `find-missing` between them, and one recovery post ("a retry of the
+                                   # refused operation was not refused"). No CSCB `kill`, `kill-finished` or `delete` names a scenario 19 persona's id.
+                                   # Before the closing `stop --stop-bots` the harness types the stub's exit line into every worker's pane, so no
+                                   # `pause` waits out its 30 s timeout. The harness runs no `find-missing`. Modes: tmux shim `log`, the stub's
+                                   # dev-channels hold, `health_check_interval` 0, agent-director's defaults (no config.toml). It runs about 9 minutes and
+                                   # ends with the three closing assertions
     lib/
       scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards (see Scenario helper below)
     fixtures/

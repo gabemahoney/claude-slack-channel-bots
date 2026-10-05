@@ -121,6 +121,15 @@
  *   latchRecheckRoundLine <persona-name> <case> <step> <call> <answer>
  *                                                the re-check round's server-log line, the
  *                                                reference renderPersonaRef(<persona-name>)
+ * Scenario 19's entries (test-16):
+ *   personaTmuxSessionName <key>                 src/persona-identity.ts, the session name a
+ *                                                persona's launches ask for
+ *   LATCH_ROW_STATE_KIND_NO_ROW                  src/conflict-latch.ts, the latch-set line's
+ *                                                word for no row (conflictLatchSetLine's
+ *                                                <row-state>)
+ *   adGraceMs, adLaunchBoundMs                   src/ad-settings.ts, G and B in milliseconds at
+ *                                                agent-director's default settings
+ *                                                (DEFAULT_AD_SETTINGS_IN_EFFECT), in decimal
  * The body entries print a body without the persona prefix; wrap one in
  * `formatPersonaNotice <persona-name> <entry> …` for the posted text.
  *
@@ -626,6 +635,30 @@ const latchRecheckRoundLine: Entry = {
   },
 }
 
+/** `personaTmuxSessionName(key)`: the tmux session name a persona's launches ask for. */
+const personaTmuxSessionName: Entry = {
+  synopsis: '<key>',
+  async print(args, context) {
+    const entry = 'personaTmuxSessionName'
+    expectArguments(entry, args, ['key'])
+    return builtString(entry, (await packageFunction<(key: string) => unknown>(context, 'persona-identity.ts', entry))(args[0]))
+  },
+}
+
+/** An entry printing ad-settings.ts's `name(DEFAULT_AD_SETTINGS_IN_EFFECT)` in decimal: a wait at agent-director's default settings, in milliseconds. No argument. */
+function adSettingsDefaultMs(name: string): Entry {
+  return {
+    synopsis: '',
+    async print(args, context) {
+      expectArguments(name, args, [])
+      const defaults = await packageExport(context, 'ad-settings.ts', 'DEFAULT_AD_SETTINGS_IN_EFFECT')
+      const value = (await packageFunction<(values: unknown) => unknown>(context, 'ad-settings.ts', name))(defaults)
+      if (typeof value !== 'number' || !Number.isFinite(value)) fail(PRINTER_FAIL_EXIT, `${name} gave ${String(value)}, not a finite number`)
+      return String(value)
+    },
+  }
+}
+
 /** The printer's entries, by the name a script passes. Later scenarios add entries here. */
 const ENTRIES: Readonly<Record<string, Entry>> = {
   // Scenario 8 (test-20-fmk-old-binary.sh).
@@ -653,6 +686,11 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   conflictLatchSetLine,
   latchClearedLine,
   latchRecheckRoundLine,
+  // Scenario 19 (test-16-fmk-conflict.sh).
+  personaTmuxSessionName,
+  LATCH_ROW_STATE_KIND_NO_ROW: constantEntry('conflict-latch.ts', 'LATCH_ROW_STATE_KIND_NO_ROW'),
+  adGraceMs: adSettingsDefaultMs('adGraceMs'),
+  adLaunchBoundMs: adSettingsDefaultMs('adLaunchBoundMs'),
 }
 
 /** The value entry `name` prints for `args`; a usage failure for no entry or an unknown one. */
