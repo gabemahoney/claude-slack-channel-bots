@@ -41,7 +41,17 @@ When reviewing tests, check for:
 - [ ] A test that spawns the CLI runs it through `runCli` in `tests/cli.test.ts`: Bun started by absolute path, its `env` a direct `hostSafeChildEnv` call (a `mkdtempSync` HOME, no tool so `PATH` is `EMPTY_CHILD_PATH`, the process's one fenced `TMUX_TMPDIR`, and as extras `SLACK_STATE_DIR` and the fixed `BUN_RUNTIME_TRANSPILER_CACHE_PATH=0` so Bun writes no cache under the temp HOME; nothing else from `process.env`), with a time limit, never reaching a subcommand that acts. A CLI child with the real HOME, the parent's `PATH` or any other inherited variable, an env built outside a direct `hostSafeChildEnv` call, or no time limit is a defect
 - [ ] A child `bun` process that runs code against a fake home goes through `runInFakeHome` (`tests/test-helpers/fake-home-subprocess.ts`), whose child env is a direct `hostSafeChildEnv` call; a real FIFO is made with `makeFifo` and guarded with `mkfifoAvailable()` from `tests/test-helpers/fifo.ts`. A test that spawns `mkfifo` itself, or gives a child the parent's `PATH` or `process.env`, is a defect
 - [ ] No test sets or relies on a real Slack token: any `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` a suite sets is a fake, restored afterwards, and every token follows the fakes-only rule under Credentials and Leak Checks
-- [ ] Integration scripts and their drivers (`tests/integration/*.sh`, `tests/integration/fixtures/driver.ts`, `tests/integration/fixtures/phase1-client-check.ts`) are run only through the `ci` skill in the `cscb-ci` container; a change or instruction that runs them on a host is a defect
+- [ ] Integration scripts, their drivers and their shims (`tests/integration/*.sh`; under `tests/integration/fixtures/`: the drivers `driver.ts` and `fmk-driver.ts`, the fake worker `stub-claude.sh` with its MCP session client `stub-mcp-session.ts`, the shims `tmux-shim.sh` and `agent-director-shim.sh`, and `phase1-client-check.ts`) are run only through the `ci` skill in the `cscb-ci` container; a change or instruction that runs them on a host is a defect
+- [ ] Every new `tests/integration/test-*.sh` is named in `tests/README.md`'s Layout in the same change, and a removed one is recorded there without its file name; `tests/shipped-docs.test.ts` (b.jg5 SRJ-1112) fails otherwise
+
+### fmk Scenarios
+For every script whose `TEST_NAME` carries `-fmk-` (b.jg5 SRJ-1401, SRJ-1306; see `tests/README.md`'s "Rules for every fmk scenario", "Harness-only steps" and "Seeding rules", and `tests/integration/lib/scenario.sh`'s header):
+- [ ] It ends with the three closing assertions, `assert_no_server_tmux`, `assert_no_cscb_include_finished` and `assert_no_cscb_delete`, in the script's own shell before its PASS line, whatever the tmux shim's mode
+- [ ] A check that counts or rules out CSCB's agent-director calls reads only the shim log lines whose parent is a CSCB process, through `cscb_ad_calls` or `cscb_ad_count`; counting the stub's, the harness's or a `stop` line as CSCB's, or reading a pane's text instead of the shim log, is a defect
+- [ ] The harness plays the human from the scenario's own shell (`ad` or `ad_capture` as a plain command, never under `timeout` or another wrapper), and every seeded or relabelled session follows the seeding rules: each `@ad_owner` label ends with the scenario store's id from `ad_store_id` (except `seed_other_store`'s), and every seeded leftover carries `@ad_pane` on its worker's pane
+- [ ] Every harness step keeps its two guards first, `require_ci_image` (the image marker `/etc/cscb-ci-image`) and `require_scenario_home` (a HOME under `SCENARIO_ROOT`), and `fmk-driver.ts`, `stub-mcp-session.ts` and `phase1-client-check.ts` refuse without the marker before they import the package; a step that drops or reorders a refusal is a defect
+- [ ] No fixture, driver or script calls agent-director's `delete`; the one `delete` under `tests/integration` is scenario 25's `ad_delete_unusable_row`, and `tests/host-safety.test.ts` audits that
+- [ ] A check that no row was deleted reads the row afterwards (present, in any state); a scenario runs at agent-director's default settings unless it is scenario 10 or 24 (or Test 0's documented `[tmux]` table), and CSCB's timings change only through its configuration and the package's exported seams
 
 ### Patterns
 - [ ] Factory functions used for fixtures (not inline object literals)
@@ -111,7 +121,7 @@ When reviewing tests, check for:
 
 ### Conciseness
 - [ ] 3+ tests with the same structure and different inputs use `test.each`
-- [ ] No meta-tests — tests of factories, stubs, or other test infrastructure add no value; real tests validate them
+- [ ] No meta-tests — tests of factories, stubs, or other test infrastructure add no value; real tests validate them. `tests/integration/test-0-fmk-harness-self-check.sh` is not one: it is the `/ci` check of the fmk harness that the Epic requires, run in the container before every fmk scenario, not a unit meta-test
 - [ ] No constants wrapping simple domain strings (`const STATUS_OPEN = 'open'`) — inline them
 - [ ] Tests assert behavior (outputs, state, captured calls), not implementation (which internal function was called, with what encoding)
 - [ ] No gold-plating — 80/20 rule; redundant permutations of an already-covered behavior should be removed

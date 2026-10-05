@@ -122,9 +122,10 @@ scratch HOME, every `homedir()` path lands in `$S`, never in the real
 ## Docker integration suite
 
 Bash scripts that install the packed package, write a persona config and
-start the server in dry run. Four scripts leave dry run: Test 4 runs its
-driver, which spawns under a stub `claude` and starts no server, and Test 0
-and Tests 10 and 12 start a live server, against the loopback Slack stub.
+start the server in dry run. Test 4, Test 0, Tests 10 and 12 and every fmk
+scenario leave dry run: Test 4 runs its driver, which spawns under a stub
+`claude` and starts no server, and the others start a live server, against
+the loopback Slack stub.
 `/ci` packs
 the package, builds the image from `docker/Dockerfile.test` (on the base in
 `docker/Dockerfile.test.base`, see `docker/README.md`) and runs `tests/runner.sh` inside it. The verdict is
@@ -252,6 +253,7 @@ tests/
                                    # client-built errors classify by class, the description and predicate helpers hold; refuses to run without the image marker /etc/cscb-ci-image
                                    # (its pure checker is unit-tested in tests/phase1-client-check.test.ts)
     .shellcheckrc                  # lets shellcheck follow `source lib/scenario.sh` without -x
+    bunfig.toml                    # loads the host-safety preload guard for a bun test started here
     session-leader.test.ts         # bun test, not run by runner.sh
   runner.sh                        # sequential runner (Tests 1-4, then discovery), writes /test-results/verdict.txt
   README.md
@@ -265,8 +267,15 @@ docker/
 `tests/runner.sh` runs Tests 1 to 4 first, in that order, then every other
 `tests/integration/test-*.sh` it finds, in version order (`sort -V`, so
 `test-5` runs before `test-10`, and `test-0-fmk-harness-self-check.sh` runs
-right after Test 4 and before every fmk scenario). A new scenario script needs no runner edit;
-this layout shows the suite's shape, not a fixed list.
+right after Test 4 and before every fmk scenario). A new scenario script needs no runner edit,
+but this layout names every `tests/integration/test-*.sh` on disk and no
+other script: `tests/shipped-docs.test.ts` fails on a script it does not name
+and on a `test-<n>-<name>.sh` it names that is not on disk (see Adding a new
+test).
+
+There is no Test 11. It is retired, with its driver: CSCB makes no tmux call
+of its own (b.jg5 SRJ-601), and fmk scenarios 3 and 17 replace it (b.jg5
+SRJ-1305).
 
 ### Testplan tickets
 
@@ -280,7 +289,7 @@ you change the script, update the testplan. Today that is Tests 1 to 3
 A script with no ticket is specified by its header comment, and by its
 driver's where it has one (Test 4 and `fixtures/driver.ts`). Test 0 has no
 testplan ticket: its header comment lists each leg and what it shows. Tests
-5 to 12 have none either: each header comment lists what it checks, and the
+5 onwards have none either: each header comment lists what it checks, and the
 log fragments it expects are taken from `src/` (the function that writes
 each is named in the header or in a constants block near the top), so the
 transcription rule does not apply to them.
@@ -293,7 +302,8 @@ script (see Live acceptance plan below).
 Every script runs against a persona config written inside the container, never
 a config or credentials file from the host:
 
-- Every `start` but those of Tests 10 and 12 runs with `SLACK_DRY_RUN=1`, and every `start`
+- Every `start` but the live starts of Test 0, Tests 10 and 12 and the fmk
+  scenarios runs with `SLACK_DRY_RUN=1`, and every `start`
   runs with the token environment variables unset. Dry run reads no
   credentials file, so a dry-run script never creates the credentials files
   its config names, and it skips each persona's spawn with a persona-keyed
@@ -311,9 +321,11 @@ a config or credentials file from the host:
   conversion error.
 - Test 4 runs without dry run but opens no Slack connection: its driver builds
   a one-persona config in memory and spawns under a stub `claude`.
-- Tests 5 to 10 and Test 12 each write their own config into their own
-  scratch state dir (see Scenario helper), never the shared one. Tests 10 and
-  12 are the scenarios outside dry run (see Slack stub).
+- Test 0 and Tests 5 onwards each write their own config into their own
+  scratch state dir (see Scenario helper), never the shared one. Tests 5 to
+  12 run in the container's shared HOME; Test 0 and every fmk scenario run in
+  their own HOME. Test 0, Tests 10 and 12 and the fmk scenarios are the
+  scenarios outside dry run (see Slack stub).
 
 ### Execution model
 
@@ -336,15 +348,16 @@ and tmux server, all under its `SCENARIO_ROOT` (see Scenario helper), and
 shares none of them with another script.
 
 Test 10's live start runs the server's start sweep (`reconcileOrphans`,
-`src/session-manager.ts`), which kills and deletes every `service=cscb`
-agent-director row whose persona is not in Test 10's own config (and any row
-with a foreign instance ID or another working directory; a row with no
-persona label is killed when live and kept). Every persona row an earlier
-script left behind is gone after Test 10's start, and Test 12's live start
-does the same to Test 10's rows; that is acceptable only because the
-container is ephemeral and the scripts run one at a time. The sweep reaches
-only the shared store: an fmk script's rows are in its own store, which no
-other script's start sees.
+`src/session-manager.ts`) over the shared store. The sweep kills each live
+`service=cscb` agent-director row whose persona is not in Test 10's own
+config (and each live row with a foreign instance ID or another working
+directory, and each live row with no persona label), deletes no row, and
+records the key of every row whose persona is absent as retired. A finished
+row is never killed. So every row an earlier script left behind stays in the
+store after Test 10's start, and Test 12's live start does the same to Test
+10's rows. The sweep reaches only the shared
+store: an fmk script's rows are in its own store, which no other script's
+start sees.
 
 ### Scenario helper
 
@@ -1014,8 +1027,8 @@ and its MCP session are children of the stub, never of a CSCB process, so
 
 `tests/integration/fixtures/slack-stub-server.ts` is a Bun HTTP and WebSocket
 server on 127.0.0.1 that stands in for Slack, because real Slack is not
-reachable in the container. Tests 10 and 12 start it in the background and
-point the server at it through the Slack API base URL override, an environment
+reachable in the container. Test 0, Tests 10 and 12 and the fmk scenarios
+start it in the background and point the server at it through the Slack API base URL override, an environment
 variable for the integration suite only (see Environment Variables in
 `docs/architecture.md`). The server honours it only for an
 `http://127.0.0.1…` or `http://[::1]…` URL, and the stub listens on
@@ -1052,7 +1065,7 @@ stdout/stderr where `docker logs` can capture them — never into `verdict.txt`.
 
 1. Write the testplan ticket in `testplans/` (the source of truth — describes
    what is being tested and why, in human prose).
-   A self-describing scenario with no ticket (as Test 0 and Tests 5 to 12) skips this
+   A self-describing scenario with no ticket (as Test 0 and Tests 5 onwards) skips this
    step: its header comment lists what it checks, and its expected log
    fragments are taken from `src/` in the header or a constants block.
 2. Add `tests/integration/test-N-<short-name>.sh`, with `N` the next unused
@@ -1092,7 +1105,14 @@ stdout/stderr where `docker logs` can capture them — never into `verdict.txt`.
 3. Make it executable. The runner picks it up by name and runs every
    `test-*.sh` through `bash`, so the mode bit is not what makes it run;
    don't edit `tests/runner.sh`.
-4. Run `shellcheck tests/integration/*.sh tests/integration/lib/*.sh tests/runner.sh`
+4. Name the script in the Layout above, in the same change, by its whole file
+   name with a one-line comment on what it checks. `tests/shipped-docs.test.ts`
+   (b.jg5 SRJ-1112) fails while any `tests/integration/test-*.sh` on disk is
+   not named in this README. When a script is removed, record it here by its
+   test number and what replaces it, never by its file name: the same check
+   fails on a `test-<n>-<name>.sh` this README names that is not on disk (the
+   `test-N-<short-name>.sh` template above names no script).
+5. Run `shellcheck tests/integration/*.sh tests/integration/lib/*.sh tests/runner.sh`
    from the repo root. `tests/integration/.shellcheckrc` lets shellcheck follow
    the helper without `-x`. The suite must stay warning-free.
 
