@@ -34,12 +34,14 @@ import {
   needHuman,
   pause,
   personaPostsAfter,
+  personaRowId,
   previewHeader,
   promptState,
   q,
   recorded,
   removalRowProblems,
   removedPreviewLine,
+  type Row,
   rows,
   run,
   S,
@@ -269,6 +271,22 @@ export const check26: CheckDef<CheckContext> = {
   run: async () => pass([]),
 }
 
+/**
+ * Check 27: whether the row of `removed` is among `before` (the rows before
+ * its removal), so its teardown keeps it (b.jg5 SRJ-715, AC 77). Pure.
+ */
+export function rowKeptByRemoval(before: readonly Row[], removed: PersonaLetter): boolean {
+  return before.some((r) => r.id === personaRowId(removed))
+}
+
+/**
+ * Check 28's kept rows: D's when Check 27 found D's row before removing D
+ * (`dRowKept`, set whether or not D connected in Check 25), else none. Pure.
+ */
+export function rebootKeptRows(dRowKept: boolean | undefined): PersonaLetter[] {
+  return dRowKept === true ? ['d'] : []
+}
+
 /** Check 27's prompt, as declared to the prompt guard: left open on purpose. */
 export const CHECK27_PROMPT = /removal-prompt\.txt/
 
@@ -287,6 +305,7 @@ export const check27: CheckDef<CheckContext> = {
     const pid = await serverPid(ctx)
     const before = await rows(ctx)
     f.add(`rows before: ${before.map((r) => r.id).join(', ')}`)
+    ctx.shared.dRowKept = rowKeptByRemoval(before, 'd')
     // Step 2 (optional, run): D raises a prompt that is left unanswered (the prompt guard leaves it open: the check later clicks it to prove it inert).
     ctx.promptGuard.expect({ persona: 'd', command: CHECK27_PROMPT, leaveOpen: true })
     const tm = await tmark(ctx)
@@ -367,9 +386,9 @@ export const check28: CheckDef<CheckContext> = {
     // Step 1.
     f.expect(await recorded(ctx), 'step 1: config.json and the record differ')
     f.expect(!(await fileExists(ctx, '"$S/config.json.pending"')), 'step 1: a change is pending')
-    // One live row per configured persona, plus D's row, kept and not live, when this run added D (Check 25) and
-    // Check 27 removed it: a teardown kills the row and keeps it (b.jg5 SRJ-715, AC 77).
-    const keptRows: PersonaLetter[] = (ctx.shared.broughtUp ?? []).includes('d') ? ['d'] : []
+    // One live row per configured persona, plus D's row, kept and not live, when Check 27 found it before removing D
+    // (whether or not D connected in Check 25): a teardown kills the row and keeps it (b.jg5 SRJ-715, AC 77).
+    const keptRows = rebootKeptRows(ctx.shared.dRowKept)
     const rowsAt1 = await rows(ctx)
     const rows1 = rowsAt1.map((r) => r.id).sort()
     f.add(`rows before: ${rowsAt1.map((r) => `${r.id}(${r.state})`).join(', ')}`)

@@ -4,8 +4,11 @@
  *
  * Checks 14, 16 and 20 need a second workspace user (live.json
  * `second_user`); without one they are SKIPPED (no second account). They
- * run on every run with the same second account: none of them reads that
- * account's Slack DM history from before the run.
+ * run on every run with the same second account: every assertion judges
+ * only the messages after the check's own post (14) or first ask (16, 20).
+ * Checks 14 and 20 read the DM's earlier history only for a note: whether
+ * the DM already held older messages (an earlier run's, reused) or not
+ * (`heldBefore`).
  * - Check 14's "first-time user" is first-time to this run's server: the
  *   server runs in this run's fresh container (its state dir in the
  *   container's own layer), so it has no record of the account until the
@@ -13,7 +16,8 @@
  *   line and no persona tag in this container names the account's user ID
  *   (`priorContact`); when one does, it is SKIPPED "not verified". The DM
  *   with B may exist from an earlier run (`openDm` returns it); every
- *   assertion is on what follows the check's own posts.
+ *   assertion is on what follows the check's own posts, and the check
+ *   notes whether the DM was new or reused.
  * - Checks 16 and 20 judge the DM with A by what it holds after the check's
  *   first ask (`postsAfter`): in 16 nothing, in 20 A's message, in the DM
  *   the call's result names (`sentDmId`).
@@ -123,6 +127,15 @@ export function priorContact(logLines: readonly string[], tagLines: readonly str
  */
 export function postsAfter(messages: readonly SlackMessage[], after: string, from?: BotRef, text?: string): SlackMessage[] {
   return messages.filter((m) => tsAfter(m.ts, after) && (from === undefined || isFrom(m, from)) && (text === undefined || m.text.includes(text)))
+}
+
+/**
+ * True when `messages` (a DM's history) holds a message older than `ts`
+ * (the check's own post in it, or its first ask): the DM is an earlier run's,
+ * reused, not one this check opened. Checks 14 and 20 note it. Pure.
+ */
+export function heldBefore(messages: readonly SlackMessage[], ts: string): boolean {
+  return messages.some((m) => tsAfter(ts, m.ts))
 }
 
 /** The DM a successful reply call names (`Sent 1 message(s) to D…`), or `null` when it names none. */
@@ -276,6 +289,12 @@ export const check14: CheckDef<CheckContext> = {
     const bNewDm = await second.human.openDm(ids.bots.b.userId)
     const tsDm = await second.human.post(bNewDm, 'Reply with the word open-dm.')
     f.add(`TS_CH ${tsCh}, TS_DM ${tsDm}, B_NEW_DM_ID ${bNewDm}`)
+    // Whether the DM with B was opened here or reused: read after the check's own post, judged on what is older than it.
+    f.note(
+      heldBefore(await second.human.history(bNewDm, '0'), tsDm)
+        ? "Check 14: the DM with B already held messages older than TS_DM (an earlier run's DM, reused)"
+        : 'Check 14: the DM with B held no message older than TS_DM (a new DM, or one no earlier run posted in)',
+    )
     const aAns = await second.human.waitForBotMessage(ids.aHome, bot(ctx, 'a'), tsCh, (t) => t.toLowerCase().includes('open-channel'), REPLY_TIMEOUT_MS)
     const bAns = await second.human.waitForBotMessage(bNewDm, bot(ctx, 'b'), tsDm, (t) => t.toLowerCase().includes('open-dm'), REPLY_TIMEOUT_MS)
     f.expect(aAns !== null, 'A did not answer open-channel')
@@ -558,6 +577,12 @@ export const check20: CheckDef<CheckContext> = {
       const firstAsk = o.asks[0]!.ts
       const msgs = await second.human.history(dm!, firstAsk)
       f.expect(postsAfter(msgs, firstAsk, bot(ctx, 'a'), 'DMs-on outbound check').length > 0, "the DM does not hold A's message from this check")
+      // Whether AC 38's "opens a DM" was met by a new DM or an earlier run's: judged on what is older than the first ask.
+      f.note(
+        heldBefore(await second.human.history(dm!, '0'), firstAsk)
+          ? "Check 20: the DM with A already held messages older than the first ask (an earlier run's DM, reused)"
+          : 'Check 20: the DM with A held no message older than the first ask (a new DM, or one no earlier run posted in)',
+      )
     }
     return f.result()
   },

@@ -44,11 +44,15 @@
  * - Checks 14, 16 and 20 rerun with the same second account: an earlier
  *   run's DM is no skip. Check 14 is SKIPPED "not verified" only when this
  *   run's server log or a persona tag names the second user's whole ID before
- *   it posts, and otherwise reaches A and B (in the earlier run's DM) with no
- *   approval step, judged on this run's answers only; Check 16 fails on any
- *   message in the DM with A newer than its first ask (top-level or in a
- *   thread, from anyone), never on an older one; Check 20 passes only on A's
- *   message newer than the first ask, in the DM its call result names;
+ *   it posts (no Slack call and no container step but its two searches before
+ *   that decision), and otherwise reaches A and B (in the earlier run's DM)
+ *   with no approval step, judged on this run's answers only; Check 16 fails
+ *   on any message in the DM with A newer than its first ask (top-level or in
+ *   a thread, from anyone), never on an older one; Check 20 passes only on
+ *   A's message newer than the first ask, in the DM its call result names;
+ *   16 and 20 make no second-account Slack call before the first ask; 14 and
+ *   20 note whether their DM held a message older than their own post or
+ *   first ask (`heldBefore`: an earlier run's DM, reused) or not;
  * - Check 8 asks for a bug when the RAW prefix lacks user/bot_id; Check 9
  *   falls back to the message text and needs one RAW line of each kind;
  *   `waitTags` polls to a deadline; Check 12's limit search fails on any
@@ -82,8 +86,9 @@
  *   Check 27 runs a guarded `agent-director find-missing` before it judges
  *   the rows, expects D's row kept and not live and A, B and C's unchanged,
  *   and exactly one teardown line for D's kill that succeeded with its row
- *   kept; Check 28 expects one live row per persona, plus D's kept row when
- *   this run brought D up;
+ *   kept, and records whether D's row was there before the removal
+ *   (`dRowKept`); Check 28 expects one live row per persona, plus D's kept
+ *   row when Check 27 found it (whether or not D connected in Check 25);
  * - the guarded restart and Check 28's start after the reboot wait for each
  *   persona's Session connected line, not only the summary: a persona that
  *   connects after the summary (parked on a `working` row, b.f2b) is no
@@ -156,6 +161,7 @@ import {
   CHECK23_B_EXTRA,
   CHECK23_PROMPT_A,
   CHECK23_PROMPT_B,
+  heldBefore,
   namesSlackId,
   newCallTo,
   OUTBOUND_ASKS,
@@ -195,7 +201,18 @@ import {
   waitTags,
   type Row,
 } from '../ci-live/checks/helpers.ts'
-import { check27, check28, CHECK27_PROMPT, check29a, parseCount, parseLeakcount, parsePersonaCounts, personaCountsProblem } from '../ci-live/checks/lifecycle-checks.ts'
+import {
+  check27,
+  check28,
+  CHECK27_PROMPT,
+  check29a,
+  parseCount,
+  parseLeakcount,
+  parsePersonaCounts,
+  personaCountsProblem,
+  rebootKeptRows,
+  rowKeptByRemoval,
+} from '../ci-live/checks/lifecycle-checks.ts'
 import { FINAL_CHECKS, hostCheck, PLAN_CHECKS, teardownCheck } from '../ci-live/checks/list.ts'
 import { AD_CLIENT_CHECK_FAILED, installCheck, s2Check, s3Check } from '../ci-live/checks/setup-checks.ts'
 import { AD_CLIENT_CHECK, AD_CLIENT_CHECK_PASSED } from '../ci-live/lib/ad-client-check.ts'
@@ -332,7 +349,17 @@ function scriptedHuman(clock: CheckContext['clock'], canned: Record<string, Cann
       return { ok: true, messages: [] }
     },
   }
-  return { human: new HumanSession(api, clock), posts }
+  return { human: new HumanSession(api, clock), posts, api }
+}
+
+/** `api`, recording each call in `calls` as `<who> <method>`, in order. */
+function recordingApi(api: HumanApi, who: string, calls: string[]): HumanApi {
+  return {
+    call: (method, params) => {
+      calls.push(`${who} ${method}`)
+      return api.call(method, params)
+    },
+  }
 }
 
 /** A browser that does nothing (its generated token is a sentinel-bearing fake). */
@@ -1216,6 +1243,17 @@ describe('Checks 14, 16 and 20 on a rerun: the run-scoped decisions', () => {
     expect(postsAfter(messages, '1700000100.000008')).toEqual([])
   })
 
+  const TS = '1700000100.000005'
+  test.each<[string, string[], boolean]>([
+    ['a message older than the ts (an earlier run\'s, in a lower second)', ['1699999999.999999', '1700000100.000006'], true],
+    ['a message older than the ts by its microseconds', ['1700000100.000004'], true],
+    ['only messages newer than the ts', ['1700000100.000006', '1700000101.000001'], false],
+    ['only a message at the ts (the check\'s own post)', [TS], false],
+    ['no message', [], false],
+  ])('heldBefore: %s is %p', (_what, tss, held) => {
+    expect(heldBefore(tss.map((ts) => ({ ts, text: 'x', user: A.userId })), TS)).toBe(held)
+  })
+
   test.each([
     ['a sent result', `chat_id=${ID} error=false result=Sent 1 message(s) to D0DRYSECDM (the DM with ${ID}) [ts: 1700000300.000001]`, 'D0DRYSECDM'],
     ['a refusal', `chat_id=${ID} error=true result=Persona "persona_a" (key=persona_a) may not target "${ID}"`, null],
@@ -1322,6 +1360,7 @@ describe('Checks 16 and 20 against a scripted A', () => {
    * the second user and posts A's message there. `earlier` is what
    * `replies a` printed before the check (an earlier check's call). Every
    * message gets the next ts, so A's done belongs to the ask it follows.
+   * `calls` records each Slack call, as `human <method>` or `second <method>`.
    */
   function scriptedA(steps: AskStep[], earlier: string[] = [], dmBefore: DmBefore = 'none') {
     const clock = virtualClock()
@@ -1357,10 +1396,17 @@ describe('Checks 16 and 20 against a scripted A', () => {
     }
     const api = scriptedSlack({ messages, nextTs, poster: DRY_RUN_IDS.humanUserId, onPost, dms: () => (dmOpen ? [{ id: NEW_DM, user: A.userId }] : []) })
     const { container } = fakeContainer([['', (script) => (script === 'mark' ? '1:0' : script === 'replies a' ? replyLines.join('\n') : '')]])
-    const ctx = makeCtx({ mode: 'real', clock, human: new HumanSession(api, clock), second: { human: new HumanSession(api, clock), userId: SECOND_ID }, container })
+    const calls: string[] = []
+    const ctx = makeCtx({
+      mode: 'real',
+      clock,
+      human: new HumanSession(recordingApi(api, 'human', calls), clock),
+      second: { human: new HumanSession(recordingApi(api, 'second', calls), clock), userId: SECOND_ID },
+      container,
+    })
     /** The evidence line each ask should leave. */
     const askEvidence = () => asks.map((a, i) => `ask ${i + 1}: TS ${a.ts}, ${a.done ? `done ${a.done}` : 'no done from A'}`)
-    return { ctx, asks, askEvidence }
+    return { ctx, asks, askEvidence, calls }
   }
 
   async function runWith(check: CheckDef<CheckContext>, steps: AskStep[], earlier: string[] = [], dmBefore: DmBefore = 'none') {
@@ -1443,6 +1489,27 @@ describe('Checks 16 and 20 against a scripted A', () => {
     expect(asks.length).toBe(1)
   })
 
+  test.each(BOTH)("Check %s on a rerun makes no Slack call as the second user before A is first asked, and reads the DM after it", async (_id, check, call) => {
+    const { calls } = await runWith(check, [{ done: true, call }], [], 'earlier')
+    const ask = calls.indexOf('human chat.postMessage')
+    expect(ask).toBeGreaterThan(-1)
+    expect(calls.slice(0, ask).filter((c) => c.startsWith('second '))).toEqual([])
+    expect(calls.slice(ask).filter((c) => c.startsWith('second ')).length).toBeGreaterThan(0)
+  })
+
+  const REUSED_20 = "Check 20: the DM with A already held messages older than the first ask (an earlier run's DM, reused)"
+  const NEW_20 = 'Check 20: the DM with A held no message older than the first ask (a new DM, or one no earlier run posted in)'
+
+  test.each<[string, DmBefore, string]>([
+    ["an earlier run's DM, holding A's old message", 'earlier', REUSED_20],
+    ['no DM before the check (A opens it)', 'none', NEW_20],
+    ['an empty DM listed before the check', 'empty', NEW_20],
+  ])('Check 20 passes and notes whether the DM was reused: %s', async (_what, dmBefore, note) => {
+    const { r } = await runWith(check20, [{ done: true, call: SENT }], [], dmBefore)
+    expect([r.status, r.reason]).toEqual(['PASS', undefined])
+    expect((r.notes ?? []).filter((n) => n.startsWith('Check 20: the DM with A'))).toEqual([note])
+  })
+
   test.each([
     ['top-level, from A', [{ done: true, call: REFUSED, dmPost: { user: A.userId, inThread: false } }]],
     ["in the thread under the earlier run's message, from A", [{ done: true, call: REFUSED, dmPost: { user: A.userId, inThread: true } }]],
@@ -1490,15 +1557,17 @@ describe("Check 14: a first-time user to this run's server, with the same second
    * guarded restart comes up, and the access-control search prints
    * `accessLines`. On the second account's session A answers open-channel in
    * A-home and, when `bAnswers`, B answers open-dm in the DM with B, which
-   * holds the earlier run's exchange.
+   * holds the earlier run's exchange (unless `earlier` is false: a new DM).
+   * `slackCalls` records each Slack call, as `human <method>` or
+   * `second <method>`.
    */
-  function check14Run(opts: { log?: string[]; tagLines?: string[]; bAnswers?: boolean; accessLines?: string[] } = {}) {
-    const { log = [], tagLines = [], bAnswers = true, accessLines = [] } = opts
+  function check14Run(opts: { log?: string[]; tagLines?: string[]; bAnswers?: boolean; accessLines?: string[]; earlier?: boolean } = {}) {
+    const { log = [], tagLines = [], bAnswers = true, accessLines = [], earlier = true } = opts
     const clock = virtualClock()
     const start = timedLog(clock, startLog(155))
     let seq = 0
     const nextTs = () => `1700000100.${String(++seq).padStart(6, '0')}`
-    const messages: ScriptedMessage[] = [...EARLIER]
+    const messages: ScriptedMessage[] = earlier ? [...EARLIER] : []
     const answer = (channel: string, user: string, text: string) => messages.push({ channel, ts: nextTs(), text, user })
     const api = scriptedSlack({
       messages,
@@ -1532,16 +1601,35 @@ describe("Check 14: a first-time user to this run's server, with the same second
       ['access.json.corrupt', '0'],
       ['', (script) => (script === 'mark' ? '1:0' : (start.since(script) ?? ''))],
     ])
-    const ctx = makeCtx({ mode: 'real', clock, human: scriptedHuman(clock).human, second: { human: new HumanSession(api, clock), userId: SECOND_ID }, container })
+    const slackCalls: string[] = []
+    const ctx = makeCtx({
+      mode: 'real',
+      clock,
+      human: new HumanSession(recordingApi(scriptedHuman(clock).api, 'human', slackCalls), clock),
+      second: { human: new HumanSession(recordingApi(api, 'second', slackCalls), clock), userId: SECOND_ID },
+      container,
+    })
     /** What the second account posted in this run. */
     const posted = () => messages.filter((m) => m.user === SECOND_ID && !EARLIER.includes(m))
-    return { ctx, scripts, posted }
+    return { ctx, scripts, posted, slackCalls }
   }
 
   test("an earlier run's DM with B, and a log line naming only a longer ID: the check runs in that DM, A and B answer with no approval step, a PASS", async () => {
-    const r = await check14.run(check14Run({ log: [`[slack] dropped message user=${SECOND_ID}9 channel=C0DRYOTHER`] }).ctx)
+    const run = check14Run({ log: [`[slack] dropped message user=${SECOND_ID}9 channel=C0DRYOTHER`] })
+    const r = await check14.run(run.ctx)
     expect([r.status, r.reason]).toEqual(['PASS', undefined])
     expect(r.evidence).toContain(`TS_CH 1700000100.000001, TS_DM 1700000100.000003, B_NEW_DM_ID ${B_DM}`)
+    // Its first Slack call is the human's invite, after the search for the second user.
+    expect(run.slackCalls[0]).toBe('human conversations.invite')
+  })
+
+  test.each<[string, boolean, string]>([
+    ["an earlier run's DM with B, holding that run's exchange", true, "Check 14: the DM with B already held messages older than TS_DM (an earlier run's DM, reused)"],
+    ['a new DM with B', false, 'Check 14: the DM with B held no message older than TS_DM (a new DM, or one no earlier run posted in)'],
+  ])('Check 14 passes and notes whether the DM was reused: %s', async (_what, earlier, note) => {
+    const r = await check14.run(check14Run({ earlier }).ctx)
+    expect([r.status, r.reason]).toEqual(['PASS', undefined])
+    expect((r.notes ?? []).filter((n) => n.startsWith('Check 14: the DM with B'))).toEqual([note])
   })
 
   test.each([
@@ -1555,7 +1643,7 @@ describe("Check 14: a first-time user to this run's server, with the same second
   test.each([
     ['a server log line', { log: [`[slack] Dispatching to persona "persona_a" (key=persona_a) chat_id=C0DRYAHOME user=${SECOND_ID}`] }, '1 server log line(s)'],
     ['a persona tag', { tagLines: [`<channel source="slack" chat_id="C0DRYAHOME" user_id="${SECOND_ID}" via="receive_all">`] }, '1 persona tag(s)'],
-  ])("this run's server already saw the second user (%s): SKIPPED \"not verified\" before any setup or post", async (_what, opts, what) => {
+  ])("this run's server already saw the second user (%s): SKIPPED \"not verified\" before any setup, post, invite or Slack read", async (_what, opts, what) => {
     const run = check14Run(opts)
     const r = await check14.run(run.ctx)
     expect([r.status, r.reason]).toEqual([
@@ -1565,6 +1653,7 @@ describe("Check 14: a first-time user to this run's server, with the same second
     expect(run.scripts.length).toBe(2)
     expect(run.scripts.every((s) => s.includes(`'${SECOND_ID}'`))).toBe(true)
     expect(run.posted()).toEqual([])
+    expect(run.slackCalls).toEqual([])
   })
 })
 
@@ -1915,12 +2004,14 @@ const ROWS = (['a', 'b', 'c'] as const).map((l) => rowLine(l)).join('\n')
  * the rows (`rows(n)` for the n-th read, from 0: steps 1, 3 and 5; A, B and
  * C live by default) and a running server; nothing answers in Slack, so the
  * other steps record their own findings; time is virtual. `broughtUp` is the
- * personas this run brought up (`ctx.shared.broughtUp`; unset by default).
+ * personas this run brought up (`ctx.shared.broughtUp`) and `dRowKept`
+ * whether Check 27 found D's row before removing D (`ctx.shared.dRowKept`);
+ * each unset by default.
  */
 function rebootedRun(
   cAt: number | null,
   lines: readonly (readonly [number, string])[] = startLog(cAt),
-  opts: { rows?: (n: number) => string; broughtUp?: PersonaLetter[] } = {},
+  opts: { rows?: (n: number) => string; broughtUp?: PersonaLetter[]; dRowKept?: boolean } = {},
 ) {
   const clock = virtualClock()
   const log = timedLog(clock, lines)
@@ -1931,7 +2022,10 @@ function rebootedRun(
     ['kill -0', 'running'],
     ['', (script) => (script === 'mark' || script === 'cat ~/cscb-live/reboot-log-mark' ? '1:0' : script === 'rows' ? rowsAt(reads++) : (log.since(script) ?? ''))],
   ])
-  const shared = opts.broughtUp === undefined ? {} : { broughtUp: opts.broughtUp }
+  const shared = {
+    ...(opts.broughtUp === undefined ? {} : { broughtUp: opts.broughtUp }),
+    ...(opts.dRowKept === undefined ? {} : { dRowKept: opts.dRowKept }),
+  }
   return makeCtx({ mode: 'real', clock, human: scriptedHuman(clock).human, browser: idleBrowser(), container, shared, restartContainer: async () => log.begin() })
 }
 
@@ -2167,6 +2261,24 @@ describe("the row helpers: one live row per persona, a removed persona's row kep
   ])('removalRowProblems rejects %s', (_what, before, after, problems) => {
     expect(removalRowProblems(before, after, 'd')).toEqual(problems)
   })
+
+  test.each<[string, Row[], PersonaLetter, boolean]>([
+    ["D's row live among the rows before", BEFORE, 'd', true],
+    ["D's row there but not live (D never connected in Check 25)", [...LIVE, row('d', 'ended')], 'd', true],
+    ['no row for D', LIVE, 'd', false],
+    ["another id carrying D's persona label", [...LIVE, { id: 'cscb_x', persona: personaName('d'), state: 'idle' }], 'd', false],
+    ["C's removal, judged on C's row", LIVE, 'c', true],
+  ])('rowKeptByRemoval: %s is %p', (_what, before, removed, kept) => {
+    expect(rowKeptByRemoval(before, removed)).toBe(kept)
+  })
+
+  test.each<[boolean | undefined, PersonaLetter[]]>([
+    [true, ['d']],
+    [false, []],
+    [undefined, []],
+  ])("rebootKeptRows(%p) (Check 27's finding; unset when it never ran) is %p", (dRowKept, kept) => {
+    expect(rebootKeptRows(dRowKept)).toEqual(kept)
+  })
 })
 
 describe("Check 27: D's row is killed and kept, judged after a guarded find-missing", () => {
@@ -2179,18 +2291,20 @@ describe("Check 27: D's row is killed and kept, judged after a guarded find-miss
    * its lines (its reload-applied line written for the container's state
    * directory). Rows: A, B, C and D live; D's row is `missing` once
    * find-missing has run (its agent process is gone), or no longer there
-   * with `deleted`. `findMissing` is the guarded find-missing's answer.
+   * with `deleted`; never there with `withoutD`. `findMissing` is the
+   * guarded find-missing's answer.
    * The first mark is the log's start (`1:0`), every later one its end, so
    * nothing is logged after them. Nothing answers in Slack; time is virtual.
    */
-  function removalRun(real: { preview: string[]; logs: string[] }, opts: { findMissing?: Partial<ProcResult>; deleted?: boolean } = {}) {
+  function removalRun(real: { preview: string[]; logs: string[] }, opts: { findMissing?: Partial<ProcResult>; deleted?: boolean; withoutD?: boolean } = {}) {
     const clock = virtualClock()
-    const { findMissing = { stdout: `${personaRowId('d')}: missing` }, deleted = false } = opts
+    const { findMissing = { stdout: `${personaRowId('d')}: missing` }, deleted = false, withoutD = false } = opts
     let marked = false
     let marks = 0
     const log = [...real.logs.filter((l) => !l.startsWith('[slack] reload-applied:')), appliedLine({ removed: 1 })]
     const pending = [PENDING_FILE_HEADER, `fingerprint: sha256:${'0'.repeat(64)}`, '', ...real.preview].join('\n')
-    const rowsNow = () => [...(['a', 'b', 'c'] as const).map((l) => rowLine(l)), ...(marked && deleted ? [] : [rowLine('d', marked ? 'missing' : 'idle')])].join('\n')
+    const dRow = () => (withoutD || (marked && deleted) ? [] : [rowLine('d', marked ? 'missing' : 'idle')])
+    const rowsNow = () => [...(['a', 'b', 'c'] as const).map((l) => rowLine(l)), ...dRow()].join('\n')
     const { container, scripts } = fakeContainer([
       [
         'agent-director find-missing',
@@ -2229,6 +2343,15 @@ describe("Check 27: D's row is killed and kept, judged after a guarded find-miss
     expect(run.scripts.indexOf(COMPLETE_D)).toBeLessThan(at)
     expect(run.scripts.lastIndexOf('rows')).toBeGreaterThan(at)
     expect(r.evidence).toContain(`rows after: ${[...(['a', 'b', 'c'] as const).map((l) => `${personaRowId(l)}(idle)`), `${personaRowId('d')}(missing)`].join(', ')}`)
+    // D's row was there before the removal: Check 28 expects it kept.
+    expect(run.ctx.shared.dRowKept).toBe(true)
+  })
+
+  test("no row for D before the removal: a finding, and Check 28 is told to expect no row for D", async () => {
+    const run = removalRun(await realRemovalOfD(), { withoutD: true })
+    const r = await check27.run(run.ctx)
+    expect(findingsOf(r)).toContain('rows after the removal: no cscb_persona_d row before the removal')
+    expect(run.ctx.shared.dRowKept).toBe(false)
   })
 
   test("the control: find-missing refused by the guard leaves D's row live, which is a finding", async () => {
@@ -2250,21 +2373,25 @@ describe("Check 27: D's row is killed and kept, judged after a guarded find-miss
   })
 })
 
-describe("Check 28: one live row per persona at steps 1, 3 and 5, plus D's kept row when this run brought D up", () => {
+describe("Check 28: one live row per persona at steps 1, 3 and 5, plus D's kept row when Check 27 found D's row", () => {
   /** Check 28's row findings (steps 1, 3 and 5). */
   const ROW_FINDING = /^step [135]: (not one|the rows changed)/
   const rowFindings = (r: CheckResult) => (r.reason ?? '').split('; ').filter((x) => ROW_FINDING.test(x))
   const withD = (state: string) => `${ROWS}\n${rowLine('d', state)}`
-  const ALL: PersonaLetter[] = ['a', 'b', 'c', 'd']
 
-  test.each(NOT_LIVE_ROW_STATES.map((state) => [state]))("D's row kept %s at every step, D brought up by this run: no row finding", async (state) => {
-    const r = await check28.run(rebootedRun(155, undefined, { rows: () => withD(state), broughtUp: ALL }))
+  test.each(NOT_LIVE_ROW_STATES.map((state) => [state]))("D's row kept %s at every step, Check 27 having found it: no row finding", async (state) => {
+    const r = await check28.run(rebootedRun(155, undefined, { rows: () => withD(state), dRowKept: true }))
     expect(rowFindings(r)).toEqual([])
     expect(r.evidence).toContain(`rows before: ${[...(['a', 'b', 'c'] as const).map((l) => `${personaRowId(l)}(idle)`), `${personaRowId('d')}(${state})`].join(', ')}`)
   })
 
+  test("D's row kept, Check 27 having found it, though D never connected in Check 25 (not among the personas brought up): no row finding", async () => {
+    const r = await check28.run(rebootedRun(155, undefined, { rows: () => withD('ended'), broughtUp: ['a', 'b', 'c'], dRowKept: true }))
+    expect(rowFindings(r)).toEqual([])
+  })
+
   test("the control: D's kept row live is a finding at each step", async () => {
-    const r = await check28.run(rebootedRun(155, undefined, { rows: () => withD('idle'), broughtUp: ALL }))
+    const r = await check28.run(rebootedRun(155, undefined, { rows: () => withD('idle'), dRowKept: true }))
     const live = 'cscb_persona_d is idle: kept but live, not ended or missing'
     expect(rowFindings(r)).toEqual([
       `step 1: not one live row per persona plus D's kept row: ${live}`,
@@ -2273,8 +2400,11 @@ describe("Check 28: one live row per persona at steps 1, 3 and 5, plus D's kept 
     ])
   })
 
-  test('the control: a row for D when this run never brought D up is a finding at each step', async () => {
-    const r = await check28.run(rebootedRun(155, undefined, { rows: () => withD('ended'), broughtUp: ['a', 'b', 'c'] }))
+  test.each<[string, boolean | undefined]>([
+    ['Check 27 found no row for D', false],
+    ['Check 27 never ran (unset)', undefined],
+  ])('the control: a row for D when %s is a finding at each step', async (_what, dRowKept) => {
+    const r = await check28.run(rebootedRun(155, undefined, { rows: () => withD('ended'), ...(dRowKept === undefined ? {} : { dRowKept }) }))
     expect(rowFindings(r)).toEqual([
       'step 1: not one live row per persona: an unexpected row cscb_persona_d',
       'step 3: the rows changed: an unexpected row cscb_persona_d',
@@ -2283,7 +2413,7 @@ describe("Check 28: one live row per persona at steps 1, 3 and 5, plus D's kept 
   })
 
   test("the control: D's kept row gone at step 3 (before the reboot) is a finding there, and again at step 5", async () => {
-    const r = await check28.run(rebootedRun(155, undefined, { rows: (n) => (n === 0 ? withD('ended') : ROWS), broughtUp: ALL }))
+    const r = await check28.run(rebootedRun(155, undefined, { rows: (n) => (n === 0 ? withD('ended') : ROWS), dRowKept: true }))
     expect(rowFindings(r)).toEqual([
       'step 3: the rows changed: cscb_persona_a, cscb_persona_b, cscb_persona_c',
       'step 3: the rows changed: 0 cscb_persona_d row(s), not one',
@@ -2523,13 +2653,9 @@ describe('expected texts match the package', () => {
     expect(COMPLETE_FIRST_START).toBe(line)
   })
 
-  test.each<[string, Parameters<typeof startSummaryEnding>[0]]>([
-    ['every count 0 (the clean ending)', {}],
-    ["the retried ending (Check 28's acceptRetried: one persona not brought up)", { notBroughtUp: 1 }],
-    ['every count its own value', { failed: 1, notBroughtUp: 2, notReconnected: 3, latched: 4, retrying: 5, sequenceWaiting: 6, held: 7, freshRetired: 8 }],
-  ])("the checks' summary ending with %s is the package's builder's", (_what, counts) => {
-    const all = { failed: 0, notBroughtUp: 0, notReconnected: 0, latched: 0, retrying: 0, sequenceWaiting: 0, held: 0, freshRetired: 0, ...counts }
-    expect(startSummaryEnding(counts)).toBe(startupSummaryEnding(all))
+  test("the checks' summary ending with the retried count (Check 28's acceptRetried: one persona not brought up), every other count defaulted to 0, is the package's builder's", () => {
+    const all = { failed: 0, notBroughtUp: 1, notReconnected: 0, latched: 0, retrying: 0, sequenceWaiting: 0, held: 0, freshRetired: 0 }
+    expect(startSummaryEnding({ notBroughtUp: 1 })).toBe(startupSummaryEnding(all))
   })
 
   test("the import-free modules the checks build from are the ones src/reload-plan.ts and src/session-manager.ts re-export, unchanged", () => {
@@ -2541,9 +2667,9 @@ describe('expected texts match the package', () => {
     ])
   })
 
-  test.each(['a', 'b', 'c', 'd'] as const)("persona %s's removal line (Checks 27 and 28) is the package's retired removal line, never the old 'will be destroyed' one", (letter) => {
-    const n = personaName(letter)
-    const line = removedPreviewLine(letter)
+  test("a persona's removal line (Checks 27 and 28) is the package's retired removal line, never the old 'will be destroyed' one", () => {
+    const n = personaName('d')
+    const line = removedPreviewLine('d')
     expect(line).toBe(removedLine({ key: n, name: n, index: 0 }))
     expect(line).not.toContain('destroyed')
   })
@@ -2775,8 +2901,6 @@ describe("tags and tagstext over a transcript (the container's helpers and the p
     const SECOND_ID = 'U0DRYSECND'
     const secondTag = (ts: string) => `<channel source="slack" chat_id="${DRY_RUN_IDS.aHome}" user_id="${SECOND_ID}" ts="${ts}" via="receive_all">`
     const secondBody = (ts: string) => `${secondTag(ts)}\nHello from the second user.\n</channel>`
-    /** The helpers' own `S=` line: the server's state dir under the container user's home. */
-    const STATE_LINE = /^S=.*$/m.exec(containerHelpers)![0]
     /** What the two scripts run by name. */
     const CONTACT_TOOLS = ['bash', 'cat', 'grep', 'jq']
 
@@ -2792,7 +2916,10 @@ describe("tags and tagstext over a transcript (the container's helpers and the p
 
     /** Run one script as the container's `sh` does (bash, `S` set as the helpers set it) in the fixture home; its output lines. */
     function inContainer(script: string): string[] {
-      const r = Bun.spawnSync([Bun.which('bash')!, '-c', `${STATE_LINE}\n${script}`], { env: hostSafeChildEnv(home, { tools: CONTACT_TOOLS }) })
+      // The helpers' own `S=` line (the server's state dir under the container user's home), found when the case runs.
+      const stateLine = /^S=.*$/m.exec(containerHelpers)?.[0]
+      expect(stateLine).toBeDefined()
+      const r = Bun.spawnSync([Bun.which('bash')!, '-c', `${stateLine}\n${script}`], { env: hostSafeChildEnv(home, { tools: CONTACT_TOOLS }) })
       expect(r.stderr.toString()).toBe('')
       return r.stdout.toString().split('\n').filter((l) => l !== '')
     }

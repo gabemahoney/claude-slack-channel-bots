@@ -1422,15 +1422,6 @@ describe('answerSignInCodeFromMailbox', () => {
     expect([run.outcome, run.events, run.elapsedMs, run.calls]).toEqual(['needs-code', ["info sign-in code: no test email to match Slack's mail against (live.json test_email)"], 0, []])
   })
 
-  test("Slack's code for another account of the same inbox is never typed (its source read once), the test human's newer one is", async () => {
-    const decoy = slackMail(OTHER_CODE, { at: 10 * SECOND, recipients: [TAGLESS] })
-    const run = await signIn({ messages: [decoy, slackMail(CODE, { at: 20 * SECOND })] })
-    expect(run.outcome).toBe('signed-in')
-    expect(run.events).toEqual([WAITING, 'secret CODE', 'secret bare CODE', READ, 'type CODE @20s'])
-    expect(run.calls.filter((c) => c.endsWith(decoy.id))).toEqual([`source ${decoy.id}`])
-    expectNoCodeOrSecret(run)
-  })
-
   describe.each(ACCOUNTS)('signing in as %s, with both accounts\' mail forwarded to the one mailbox', (_who, own, tagless, other) => {
     /** No log line names either account's address, in any form or case. */
     const expectNoAddress = (run: SignInRun): void => {

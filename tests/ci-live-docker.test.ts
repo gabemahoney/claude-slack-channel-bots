@@ -66,10 +66,8 @@
  * - each account's emailed sign-in code is read from the test mailbox with
  *   its own address; the second account's address is registered with the
  *   redactor in every `addressForms` form before any sign-in (and by
- *   `mailbox`); a second account the mailbox gave no code skips Checks 14, 16
- *   and 20 with a fixed reason naming no address; and those checks read none
- *   of its DM history from before the check (no `usedDm`), so they rerun
- *   with the same account;
+ *   `mailbox`); and a second account the mailbox gave no code skips Checks
+ *   14, 16 and 20 with a fixed reason naming no address;
  * - the prompt guard runs from the first plan check to the last (its hooks
  *   around each, stopped before Teardown, halted by a stop's cleanup, its
  *   report in the results), reaches the container only through the checks'
@@ -137,7 +135,8 @@
  *   text modules (`src/reload-preview-clauses.ts` and
  *   `src/startup-summary-ending.ts`, b.jg5 SRJ-1111), each imported by a
  *   runner file, and packages only node builtins and playwright-core; every
- *   form of load counts (type-only, re-export, dynamic, `require`), and one
+ *   form of load counts (type-only, re-export, dynamic, `require`, a
+ *   `/// <reference path>` or `types` directive), and one
  *   the audit cannot follow is refused. Neither module imports anything, so
  *   the host runner never loads the Slack SDKs, the agent-director client or
  *   `bun:sqlite`.
@@ -1969,32 +1968,6 @@ describe('runner wiring (source audit of ci-live/)', () => {
     ])
     expect(text).toContain("const needReasons = sessions?.secondSkip ? { 'second-user': sessions.secondSkip } : undefined")
   })
-
-  test('Checks 14, 16 and 20 rerun with the same second account: nothing reads its DM history from before the check (no usedDm); 14 skips only when this run has already seen the account, before any setup; 16 only when A made no call; 20 never', () => {
-    expect(runnerSources().filter((p) => /\busedDm\b/.test(stripComments(readFileSync(p, 'utf-8')))).map((p) => relative(CI_LIVE, p))).toEqual([])
-    const text = code(join('checks', 'dm-checks.ts'))
-    /** A check's definition, up to the next export; from its run method's body when `run` is set. */
-    const body = (id: string, run = false): string => {
-      const at = text.indexOf(`export const check${id}:`)
-      const def = text.slice(at, text.indexOf('\nexport ', at + 1))
-      return run ? def.slice(def.indexOf('async run(ctx) {') + 'async run(ctx) {'.length) : def
-    }
-    const skips = (id: string): string[] => callsOf(body(id), 'skipped').map((at) => callArguments(body(id), at).replace(/\s+/g, ' ').trim())
-    expect(skips('14')).toEqual(['`not verified: ${prior}`'])
-    expect(skips('16').map((s) => s.startsWith('`not run: A made no reply-tool call to ${second.userId} '))).toEqual([true])
-    expect(skips('20')).toEqual([])
-    // Check 14: the run-scoped question (this container's server log and persona tags) comes first; nothing posts, invites, restarts or reads Slack before it.
-    const c14 = body('14', true)
-    const guard = 'if (prior !== null) return skipped('
-    expectInOrder(c14, ['const seen = await contactLines(ctx, second.userId)', 'const prior = priorContact(seen.log, seen.tags, second.userId)', guard])
-    expect(c14.slice(0, c14.indexOf(guard))).not.toMatch(/second\.human|needHuman\(|\b(run|guarded|guardedRestart|mark)\(/)
-    // Checks 16 and 20: the second user's Slack is read only after A is asked.
-    for (const id of ['16', '20']) {
-      const b = body(id, true)
-      const ask = b.indexOf('askForOutboundCall(')
-      expect([id, ask > 0, b.indexOf('second.human.') > ask]).toEqual([id, true, true])
-    }
-  })
 })
 
 // ---------------------------------------------------------------------------
@@ -2020,11 +1993,14 @@ const CI_LIVE_PACKAGES = /^(?:node:.+|playwright-core)$/
  * comment naming a module is not a load), as its specifier: a static import
  * (type-only and side-effect only included: the runner's typecheck follows
  * them too), an `export … from`, `import x = require`, an `import('…')` type,
- * a dynamic `import()` or a `require()`. A load not given one string literal
- * is `null`: the audit cannot tell what it loads.
+ * a dynamic `import()` or a `require()`, and a `/// <reference path="…">` or
+ * `types="…"` directive (the typecheck follows those too), directives first.
+ * A load not given one string literal is `null`: the audit cannot tell what
+ * it loads.
  */
 function moduleLoads(source: string): (string | null)[] {
-  const loads: (string | null)[] = []
+  const file = ts.createSourceFile('audit.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+  const loads: (string | null)[] = [...file.referencedFiles, ...file.typeReferenceDirectives].map((d) => d.fileName)
   const text = (node: ts.Node | undefined): string | null => (node !== undefined && ts.isStringLiteralLike(node) ? node.text : null)
   const visit = (node: ts.Node): void => {
     if (ts.isImportDeclaration(node) || (ts.isExportDeclaration(node) && node.moduleSpecifier !== undefined)) loads.push(text(node.moduleSpecifier))
@@ -2035,7 +2011,7 @@ function moduleLoads(source: string): (string | null)[] {
     }
     ts.forEachChild(node, visit)
   }
-  visit(ts.createSourceFile('audit.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS))
+  visit(file)
   return loads
 }
 
@@ -2079,11 +2055,11 @@ function runnerFiles(): Map<string, string> {
   return new Map(runnerSources().map((p) => [relative(CI_LIVE, p), readFileSync(p, 'utf-8')]))
 }
 
-/** The runner's files with `line` added at the end of the one at `rel` (which must exist). */
-function withLine(rel: string, line: string): Map<string, string> {
+/** The runner's files with `line` added at the end of the one at `rel` (which must exist), or at its start with `first`. */
+function withLine(rel: string, line: string, first = false): Map<string, string> {
   const files = runnerFiles()
   expect(files.has(rel)).toBe(true)
-  files.set(rel, `${files.get(rel)}\n${line}\n`)
+  files.set(rel, first ? `${line}\n${files.get(rel)}` : `${files.get(rel)}\n${line}\n`)
   return files
 }
 
@@ -2092,6 +2068,9 @@ const HELPERS_TS = join('checks', 'helpers.ts')
 describe("the runner's loads from outside ci-live/ (source audit)", () => {
   test('moduleLoads finds every form of load, and none in a string or comment', () => {
     const source = [
+      '/// <reference path="./m.ts" />',
+      '/// <reference types="n" />',
+      '/// <reference lib="dom" />',
       "import { a } from './a.ts'",
       "import type { B } from './b.ts'",
       "import './c.ts'",
@@ -2105,8 +2084,10 @@ describe("the runner's loads from outside ci-live/ (source audit)", () => {
       "// import { k } from './k.ts'",
       "const l = \"await import('./l.ts')\"",
       'export { a }',
+      // After a statement a reference is a plain comment: the typecheck does not follow it.
+      '/// <reference path="./o.ts" />',
     ].join('\n')
-    expect(moduleLoads(source)).toEqual(['./a.ts', './b.ts', './c.ts', './d.ts', './e.ts', './f.ts', './g.ts', './h.ts', './i.ts', null])
+    expect(moduleLoads(source)).toEqual(['./m.ts', 'n', './a.ts', './b.ts', './c.ts', './d.ts', './e.ts', './f.ts', './g.ts', './h.ts', './i.ts', null])
   })
 
   test("the runner imports from outside ci-live/ only src/'s two import-free text modules (each imported by a runner file) and packages only node builtins and playwright-core", () => {
@@ -2135,6 +2116,14 @@ describe("the runner's loads from outside ci-live/ (source audit)", () => {
 
   test.each(flagged)('refuses %s', (_label, rel, line, problem) => {
     expect(ciLiveLoadProblems(withLine(rel, line))).toEqual([`${rel}: ${problem}`])
+  })
+
+  // A reference directive is one only before the file's first statement, so it is planted at the start.
+  test.each<[label: string, line: string, problem: string]>([
+    ['a /// <reference path> to another src/ module', '/// <reference path="../../src/session-manager.ts" />', outside('../../src/session-manager.ts')],
+    ['a /// <reference types> naming a package', '/// <reference types="bun-types" />', 'imports the package bun-types'],
+  ])('refuses %s', (_label, line, problem) => {
+    expect(ciLiveLoadProblems(withLine(HELPERS_TS, line, true))).toEqual([`${HELPERS_TS}: ${problem}`])
   })
 
   test.each(CI_LIVE_SRC_MODULES.map((m) => [m]))('refuses a runner that no longer imports src/%s (the positive control)', (m) => {
