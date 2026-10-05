@@ -227,6 +227,13 @@ tests/
                                    # re-bind (`tmux_server_steps`). The re-fire legs wait out agent-director's default G (60 s); only after them does
                                    # `store_statements` write a `[tmux]` table (`starting_session_seconds = 60`, `stopping_window_seconds = 30`), so the
                                    # kill need not wait 300 s. It runs about two and a half minutes and ends with the three closing assertions
+    test-24-fmk-stuck-launch.sh    # HO §7 scenario 21 (b.jg5 SRJ-1423, AC 9), fmk mode, live against the Slack stub, in two legs, in this order: CSCB's own resumed launch,
+                                   # held at the stub's unrecognised dialog, gets no `find-missing` before G and unjudged pending-row runs at most one per retry
+                                   # interval after it; at B the approver writes its log line only, and the rule posts one relaunching notice, makes one `kill` with
+                                   # `kill_sent` true, then `find-missing` marks the row `missing` and a `resume` of the same session id brings it to `waiting`, nothing
+                                   # counted; then a `pending` row the harness's own `resume` launched (a harness call playing another process) gets one held post
+                                   # with the attach remedy, no second at a later retry, and no kill or launch from CSCB. agent-director at its defaults (waits of at
+                                   # least 300 s), `health_check_interval` 0
     lib/
       scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards (see Scenario helper below)
     fixtures/
@@ -752,6 +759,17 @@ These hold for every fmk script (b.jg5 SRJ-1401):
 - Posts are read from the Slack stub's record (`slack-stub-server.ts
   --record`).
 - Shim logs are read by parent process, as above, never by scraping a pane.
+
+### fmk scenarios
+
+Each HO §7 scenario maps to the script that runs it. A script's header
+comment is its specification; this list says what each checks and how it is
+set up. Every one follows Rules for every fmk scenario and ends with the
+three closing assertions.
+
+| Scenario | Script | What it checks | Set-up |
+|---|---|---|---|
+| 21 (b.jg5 SRJ-1423, AC 9) | `test-24-fmk-stuck-launch.sh` | A launch stuck at a startup prompt the approver does not recognise, in two legs. The own-launch leg (`leg_own_stuck_launch`, persona P): CSCB's start pass resumes P's finished row, and the launch, held at the stub's unrecognised dialog, reads `pending` with the same `claude_session_id` and a launch start. The bot server runs no `find-missing` from the launch start to G; from G its pending-row runs read the row not judged, at least one a retry's, consecutive runs at least 2 × `UNAVAILABLE_RETRY_BASE_S` (60 s) apart, the gap ending at the approver's stop's run excepted. At B: exactly one `server.log` line equal to the approver's line at B, and no post from the approver; the rule's run at that stop makes exactly one relaunching post and exactly one bot-server `kill --claude-instance-id cscb_<P>` (no `--include-finished`) whose abort line carries `kill_sent` true, after which P's worker is gone; a bot-server `find-missing` then marks the row `missing`, and a bot-server `resume` of the same session id brings it to `waiting`. Exactly two bot-server `resume`s of P's row (the start pass's and the relaunch), no reuse spawn, no counted failure, and no post but the relaunching one (no spawn-failure or held post). The other-process leg (`leg_other_process`, persona Q): the harness's own `resume` of Q's finished row, a harness call through the shim from the scenario's shell playing another process, holds Q at the unrecognised dialog; the server started after it finds the row `pending` and makes exactly one held post, equal to the held notice for Q's session and launch start with the attach remedy, and no second held post at a later retry. The harness's `resume` is the only one of Q's row; no CSCB process kills, resumes or reuse-spawns it | Each leg in its own state dir with one persona and its own Slack stub (posts read from its record). The stub in `dev-channels` for each bring-up; a plain `stop` (no `--stop-bots`), then the worker ended with the stub's sentinel, so the row is finished with its `claude_session_id`; the persona's working directory then selected for `unrecognised-dialog`. Own-launch leg: a live start makes the held resume; the directory is then selected for `at-once`, so the relaunch reports in at once. Other-process leg: the harness's `resume`, then a live start timed so its retries reach B; cleanup is the harness's Enter into Q's pane (`stub_press_enter`, playing a human), after which the row reads `waiting`. `health_check_interval` 0 (the retry timer drives every pending-row run), `session_restart_delay` 5, `exit_timeout` 5. agent-director at its defaults (no `config.toml`, no `[tmux]` table), so the waits derive from G (60 s) and B (300 s) and run at least 300 s from each launch start. The tmux shim in `log` throughout. G, B, the retry timer's base and ceiling, the approver's line at B, the pending-row rule's lines, the relaunching and held posts, the poster's lines, the abort kill line's head and the live-row sequence's marked-missing lines printed by `fmk-texts.ts` |
 
 ### Harness-only steps
 
