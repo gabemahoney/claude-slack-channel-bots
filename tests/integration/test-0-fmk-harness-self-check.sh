@@ -91,7 +91,8 @@
 #                    every label, seeding, tmux-step, store-statement,
 #                    operator-action, find-missing-loop and 0.10.0-seeder
 #                    helper fails with the guard's reason, and the decoy is
-#                    left exactly as it was.
+#                    left exactly as it was. So do `stub_type_line` and
+#                    `repoint_symlink`.
 #   shim_check       `check_ad_shim` passes a correct layout and fails, with
 #                    its reason, on a symlink to the shim and on a copy of the
 #                    shim without its marker line.
@@ -119,6 +120,20 @@
 #                    other command prints nothing) and leave the session; other
 #                    commands run. After a change to `log`, the next call
 #                    kills the session.
+#   fail_kill_targets
+#                    `fail-kill` limited to a target list (a harness addition,
+#                    confirm at the reconcile pass): `tmux_shim_mode fail-kill
+#                    --targets` writes the mode line, then one target per line;
+#                    a kill-pane of the listed pane id, a kill-session of the
+#                    listed session id (alone, in a flag cluster and in a
+#                    chained call) and, with the session's name listed, a kill
+#                    by `=name` and `name:` each exit 1 with one `tmux-shim:`
+#                    line and leave the session, while a kill of an unlisted
+#                    pane runs and ends its session; each call adds its one log
+#                    line first. The setter refuses --targets with another
+#                    mode, no target and an empty one, changing nothing; a
+#                    list beside mode `log` runs nothing (exit 70); after
+#                    `log` the next kill runs.
 #   fail_create      at the shim: `new-session`, its alias `new` and a call
 #                    with no command (tmux's default new-session) each exit 1
 #                    with no standard output and one `tmux-shim:` line on
@@ -210,6 +225,22 @@
 #                    row; `write_mcp_config` refuses a value that is not a
 #                    port, and the setup's MCP config names the server
 #                    `slack-channel-router` at the scenario's port over http.
+#                    `stub_type_line` (a harness addition, confirm at the
+#                    reconcile pass) refuses with TMUX set or another
+#                    TMUX_TMPDIR, an empty or blank line and a line holding a
+#                    control character.
+#   repoint_refusals `repoint_symlink` (a harness addition, confirm at the
+#                    reconcile pass) refuses by real path, saying why, and
+#                    leaves the link as it was: a link under SCENARIO_ROOT as
+#                    written whose directory resolves outside it (through a
+#                    symlinked directory to the guard_refusals leg's scratch
+#                    directory under /tmp), a target symlink under
+#                    SCENARIO_ROOT that resolves to /tmp, and a target that is
+#                    a file; then it re-points the same link to a directory
+#                    under SCENARIO_ROOT (the positive control). Its refusals
+#                    as written (a link or target outside SCENARIO_ROOT, a
+#                    link that is not a symlink, a missing target) are
+#                    test-14's setup check.
 #
 # The re-fire legs read SessionStart records in the scenario HOME's
 # ~/.agent-director/ad-trail.jsonl: `ad.hook.fired` (by instance id) and
@@ -1573,6 +1604,8 @@ leg_guard_refusals() {
         expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_pending_no_launch "${T0_ROW_ID}"
         expect_fails_in_home "${step}" "${home}" "${reason}" stub_mode "${SCENARIO_ROOT}/work" "${STUB_MODE_AT_ONCE}"
         expect_fails_in_home "${step}" "${home}" "${reason}" stub_press_enter "${T0_SESSION}"
+        expect_fails_in_home "${step}" "${home}" "${reason}" stub_type_line "${T0_SESSION}" "a line"
+        expect_fails_in_home "${step}" "${home}" "${reason}" repoint_symlink "${SCENARIO_ROOT}/t0-guard-link" "${SCENARIO_ROOT}/work"
         expect_fails_in_home "${step}" "${home}" "${reason}" write_mcp_config "${SCENARIO_PORT}"
         # The labels, seeding, the human's tmux steps, the store statements,
         # the operator's actions, the find-missing loop and the 0.10.0
@@ -1710,6 +1743,93 @@ leg_fail_kill() {
     shim_call fk-log kill-session -t "=${session}"
     (( SHIM_RC == 0 )) || fail "${step}: kill-session in log mode, right after the change, exited ${SHIM_RC}"
     ! has_session "${session}" || fail "${step}: kill-session in log mode left the session"
+}
+
+# fk_ids <session>: print the session's id and its pane's id, `$N %N` (asked
+# with the real tmux).
+fk_ids() {
+    "${SCENARIO_REAL_TMUX}" display-message -p -t "=$1:" '#{session_id} #{pane_id}'
+}
+
+# fk_call <name> <arg>...: `shim_call`, failing unless the call added exactly
+# one `call` line to the tmux shim's log (written before the mode acts).
+fk_call() {
+    local name="$1" before
+    shift
+    before="$(call_count "${SCENARIO_TMUX_SHIM_LOG}")"
+    shim_call "${name}" "$@"
+    [[ "$(call_count "${SCENARIO_TMUX_SHIM_LOG}")" == "$(( before + 1 ))" ]] \
+        || fail "fail-kill targets: the call ${name} did not add exactly one call line to the shim's log"
+}
+
+# True when the scenario's tmux server holds no session named exactly <name>.
+fk_no_session() {
+    ! has_session "$1"
+}
+
+# fail-kill's target list (a harness addition, confirm at the reconcile pass).
+leg_fail_kill_targets() {
+    local step="fail-kill targets" listed="t0-fk-listed" other="t0-fk-other" ids sid pane other_pane want
+    "${SCENARIO_REAL_TMUX}" new-session -d -s "${listed}" -- sleep 600 || fail "${step}: could not make ${listed}"
+    "${SCENARIO_REAL_TMUX}" new-session -d -s "${other}" -- sleep 600 || fail "${step}: could not make ${other}"
+    ids="$(fk_ids "${listed}")" || fail "${step}: could not read ${listed}'s ids"
+    read -r sid pane <<< "${ids}"
+    ids="$(fk_ids "${other}")" || fail "${step}: could not read ${other}'s ids"
+    read -r _ other_pane <<< "${ids}"
+
+    # The setter writes the mode line, then one target per line.
+    tmux_shim_mode fail-kill --targets "${sid}" "${pane}"
+    want="$(printf 'fail-kill\n%s\n%s' "${sid}" "${pane}")"
+    [[ "$(cat "${SCENARIO_TMUX_SHIM_MODE_FILE}")" == "${want}" ]] \
+        || fail "${step}: the mode file holds '$(tr '\n' '|' < "${SCENARIO_TMUX_SHIM_MODE_FILE}")', not the mode and both targets"
+
+    # A kill aimed at a listed target, in agent-director's forms, a flag
+    # cluster's and a chained call's: refused, nothing killed.
+    fk_call fkt-pane -u kill-pane -t "${pane}"
+    expect_shim_refused "${step}: kill-pane -t ${pane}"
+    fk_call fkt-session -u kill-session -t "${sid}"
+    expect_shim_refused "${step}: kill-session -t ${sid}"
+    fk_call fkt-cluster kill-session -Ct"${sid}"
+    expect_shim_refused "${step}: kill-session -Ct${sid}"
+    fk_call fkt-chained display-message -p -t "${listed}" '#{session_name}' ';' kill-session -t "${sid}"
+    expect_shim_refused "${step}: a chained call holding a listed kill"
+    has_session "${listed}" || fail "${step}: a refused kill killed ${listed}"
+    [[ "$(fk_ids "${listed}")" == "${sid} ${pane}" ]] || fail "${step}: ${listed}'s pane changed under a refused kill"
+
+    # A kill aimed at an unlisted target runs the real tmux.
+    fk_call fkt-other-pane kill-pane -t "${other_pane}"
+    (( SHIM_RC == 0 )) || fail "${step}: kill-pane of the unlisted ${other_pane} exited ${SHIM_RC}: $(cat "${SHIM_ERR}")"
+    wait_until 10 "${step}: kill-pane of the unlisted ${other_pane} left ${other}" fk_no_session "${other}"
+    has_session "${listed}" || fail "${step}: the unlisted kill killed ${listed}"
+
+    # A listed session name matches `=name` and `name:`.
+    tmux_shim_mode fail-kill --targets "${listed}"
+    fk_call fkt-name-eq kill-session -t "=${listed}"
+    expect_shim_refused "${step}: kill-session -t =${listed}"
+    fk_call fkt-name-colon kill-pane -t "${listed}:"
+    expect_shim_refused "${step}: kill-pane -t ${listed}:"
+    has_session "${listed}" || fail "${step}: a refused kill by name killed ${listed}"
+
+    # The setter's refusals leave the mode file as it was.
+    want="$(cat "${SCENARIO_TMUX_SHIM_MODE_FILE}")"
+    expect_fails_in_home "${step}" "${HOME}" "tmux_shim_mode: only fail-kill takes --targets" tmux_shim_mode log --targets "${sid}"
+    expect_fails_in_home "${step}" "${HOME}" "tmux_shim_mode: --targets names no target" tmux_shim_mode fail-kill --targets
+    expect_fails_in_home "${step}" "${HOME}" "is empty or holds a control character" tmux_shim_mode fail-kill --targets ""
+    [[ "$(cat "${SCENARIO_TMUX_SHIM_MODE_FILE}")" == "${want}" ]] || fail "${step}: a refused tmux_shim_mode changed the mode file"
+
+    # A list beside another mode: the shim runs nothing and exits 70.
+    printf 'log\n%s\n' "${sid}" | write_file "${SCENARIO_TMUX_SHIM_MODE_FILE}"
+    fk_call fkt-list-log kill-session -t "${sid}"
+    (( SHIM_RC == 70 )) && grep -q '^tmux-shim: ' "${SHIM_ERR}" \
+        || fail "${step}: a list beside mode log gave exit ${SHIM_RC}: $(cat "${SHIM_ERR}")"
+    has_session "${listed}" || fail "${step}: the refused call killed ${listed}"
+
+    # Back to `log`: the next kill runs.
+    tmux_shim_mode log
+    [[ "$(cat "${SCENARIO_TMUX_SHIM_MODE_FILE}")" == log ]] || fail "${step}: tmux_shim_mode log left the list in the mode file"
+    fk_call fkt-log kill-session -t "${sid}"
+    (( SHIM_RC == 0 )) || fail "${step}: kill-session in log mode exited ${SHIM_RC}"
+    ! has_session "${listed}" || fail "${step}: kill-session in log mode left ${listed}"
 }
 
 leg_fail_create() {
@@ -2103,6 +2223,14 @@ leg_stub_helpers() {
     expect_fails_in_home "${step}" "${HOME}" "refused: TMUX_TMPDIR '/tmp' is not the scenario's" \
         with_tmux_tmpdir /tmp stub_press_enter "${T0_SESSION}"
     press_enter_exact "${step}"
+    # stub_type_line's refusals (a harness addition, confirm at the
+    # reconcile pass), beside stub_press_enter's.
+    expect_fails_in_home "${step}" "${HOME}" "refused: TMUX is set" with_tmux_set stub_type_line "${T0_SESSION}" "a line"
+    expect_fails_in_home "${step}" "${HOME}" "refused: TMUX_TMPDIR '/tmp' is not the scenario's" \
+        with_tmux_tmpdir /tmp stub_type_line "${T0_SESSION}" "a line"
+    expect_fails_in_home "${step}" "${HOME}" "the line is empty or blank" stub_type_line "${T0_SESSION}" ""
+    expect_fails_in_home "${step}" "${HOME}" "the line is empty or blank" stub_type_line "${T0_SESSION}" "   "
+    expect_fails_in_home "${step}" "${HOME}" "the line holds a control character" stub_type_line "${T0_SESSION}" $'a\x1b[Aline'
 
     expect_fails_in_home "${step}" "${HOME}" "holds a character other than letters, digits and ._:@-" \
         ad_store_pending_no_launch "t0 bad'id"
@@ -2115,6 +2243,49 @@ leg_stub_helpers() {
         || fail "${step}: ${file} is not JSON"
     [[ "${got}" == "http http://127.0.0.1:${SCENARIO_PORT}/mcp" ]] \
         || fail "${step}: ${file} names '${got}', not the scenario's port ${SCENARIO_PORT}"
+}
+
+# repoint_symlink's refusals by real path (a harness addition, confirm at the
+# reconcile pass): each fails with its reason and leaves the link as it was;
+# then the same link is re-pointed, so the refusals are not the setup's.
+leg_repoint_refusals() {
+    local step="repoint refusals" one two outside_link via to_tmp file link
+    [[ -n "${OUTSIDE_HOME}" && -d "${OUTSIDE_HOME}" && -L "${SCENARIO_ROOT}/home-link-outside" ]] \
+        || fail "${step}: the guard_refusals leg's scratch directory and its link under SCENARIO_ROOT are not there"
+    one="$(make_workdir t0-repoint-one)"
+    two="$(make_workdir t0-repoint-two)"
+    link="${SCENARIO_ROOT}/work/t0-repoint-link"
+    ln -s -- "${one}" "${link}"
+
+    # A link under SCENARIO_ROOT as written, whose directory resolves outside
+    # it (SCENARIO_ROOT/home-link-outside is a symlink to the scratch
+    # directory under /tmp).
+    outside_link="${OUTSIDE_HOME}/t0-repoint-link"
+    ln -s -- "${one}" "${outside_link}"
+    via="${SCENARIO_ROOT}/home-link-outside/t0-repoint-link"
+    expect_fails_in_home "${step}" "${HOME}" "refused: the link's directory resolves to" repoint_symlink "${via}" "${two}"
+    [[ "$(readlink -- "${outside_link}")" == "${one}" ]] || fail "${step}: a refused repoint_symlink changed ${outside_link}"
+    [[ -z "$(find "${OUTSIDE_HOME}" -maxdepth 1 -name '.scenario-repoint.*' -print -quit)" ]] \
+        || fail "${step}: a refused repoint_symlink left a new link in ${OUTSIDE_HOME}"
+
+    # A target symlink under SCENARIO_ROOT that resolves to /tmp.
+    to_tmp="${SCENARIO_ROOT}/work/t0-repoint-to-tmp"
+    ln -s -- /tmp "${to_tmp}"
+    expect_fails_in_home "${step}" "${HOME}" "refused: the target resolves to $(realpath -e -- /tmp)" repoint_symlink "${link}" "${to_tmp}"
+    [[ "$(readlink -- "${link}")" == "${one}" ]] || fail "${step}: a refused repoint_symlink (target resolving to /tmp) changed ${link}"
+
+    # A target that is a file.
+    file="${SCENARIO_ROOT}/work/t0-repoint-file"
+    : > "${file}"
+    expect_fails_in_home "${step}" "${HOME}" "is not a directory" repoint_symlink "${link}" "${file}"
+    [[ "$(readlink -- "${link}")" == "${one}" ]] || fail "${step}: a refused repoint_symlink (target a file) changed ${link}"
+    [[ -z "$(find "${SCENARIO_ROOT}/work" -maxdepth 1 -name '.scenario-repoint.*' -print -quit)" ]] \
+        || fail "${step}: a refused repoint_symlink left a new link in ${SCENARIO_ROOT}/work"
+
+    # The positive control: the same link re-pointed.
+    repoint_symlink "${link}" "${two}"
+    [[ -L "${link}" && "$(realpath -e -- "${link}")" == "$(realpath -e -- "${two}")" ]] \
+        || fail "${step}: repoint_symlink ${link} ${two} left it resolving to '$(realpath -e -- "${link}" 2> /dev/null)'"
 }
 
 # press_enter_exact <step>: `stub_press_enter` matches a session name exactly.
@@ -3355,6 +3526,7 @@ LEGS=(
     shim_check
     tmux_shim_log
     fail_kill
+    fail_kill_targets
     fail_create
     slow_create
     wedge
@@ -3365,6 +3537,7 @@ LEGS=(
     harness_include_finished
     stub_direct
     stub_helpers
+    repoint_refusals
     refire_hold
     refire_at_once
     refire_trusted_config_dir

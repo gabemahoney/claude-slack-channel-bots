@@ -333,6 +333,23 @@
 #                                      such pane, say), and refuses when TMUX_TMPDIR is not the
 #                                      scenario's or TMUX is set; it does not read the pane to check
 #                                      the effect
+#   STUB_MODE_TRANSCRIPT_ON_FIRST_MESSAGE
+#                                      (a harness addition, confirm at the reconcile pass) the mode
+#                                      `transcript-on-first-message`, a known mode of `stub_mode`:
+#                                      `dev-channels`, except that reporting in writes no transcript
+#                                      (SessionStart finds none) and the first message after it does
+#   STUB_EXIT_SENTINEL                 (a harness addition, confirm at the reconcile pass) the stub's
+#                                      exit sentinel line, `__CSCB_TEST_EXIT__`: typed into a stub's
+#                                      pane (`stub_type_line`) it fires SessionEnd and exits
+#   stub_type_line <target> <line>     (a harness addition, confirm at the reconcile pass) a human
+#                                      typing <line> into the tmux pane <target> (as for
+#                                      `stub_press_enter`), then Enter: two send-keys of the real
+#                                      tmux on the scenario's own tmux server, from the scenario's own
+#                                      shell (never a CSCB process), the line as literal keys (-l);
+#                                      fails, with tmux's message, when tmux refuses, refuses when
+#                                      TMUX_TMPDIR is not the scenario's or TMUX is set, and refuses an
+#                                      empty or blank line (Enter alone is `stub_press_enter`) or one
+#                                      holding a control character; it does not read the pane
 #   write_mcp_config [<port>]          write $HOME/.claude/slack-mcp.json, the MCP config the stub's
 #                                      session reads, naming http://127.0.0.1:<port>/mcp under the
 #                                      server name slack-channel-router, as the package's install
@@ -571,6 +588,20 @@
 #                                      `<channel id> <instance id> <session name> <session id>
 #                                      <pane id>`
 #
+#   The human's filesystem steps (fmk mode; harness addition, confirm at the reconcile pass;
+#   both guards first; no tmux or agent-director call)
+#   repoint_symlink <link> <target>    re-point the existing symlink <link> to the existing
+#                                      directory <target>, both under SCENARIO_ROOT (as written
+#                                      and by real path; <link>'s directory by real path), by a
+#                                      new link beside it renamed over it; fails unless <link>
+#                                      then resolves to <target>'s real path. Refuses a <link>
+#                                      or <target> outside SCENARIO_ROOT, a <link> that is not
+#                                      a symlink, and a missing <target> or one that is not a
+#                                      directory. A persona whose working_directory or
+#                                      claude_config_dir is <link> then compares, by real path,
+#                                      unequal to the row its last launch recorded (a real
+#                                      cwd or config_dir mismatch, with no config edit)
+#
 #   CSCB processes and the tmux shim (see "CSCB processes and the tmux shim")
 #   cscb_run <command> [<arg>...]      run <command> as a CSCB process (a CLI command of the package
 #                                      under test or another, such as scenario 1's pre-persona CLI, or
@@ -586,6 +617,16 @@
 #                                      slow-create, wedge; `log` from setup on), and for slow-create
 #                                      or wedge its delay in seconds (the shim's defaults: 15, 60),
 #                                      by an atomic write of the mode file; the next call reads it
+#   tmux_shim_mode fail-kill --targets <target>...
+#                                      (a harness addition, confirm at the reconcile pass)
+#                                      `fail-kill` limited to the targets given (session names,
+#                                      session ids `$N`, pane ids `%N`): the mode file holds the mode
+#                                      line, then one target per line, written atomically; only a
+#                                      kill-session or kill-pane aimed at a listed target fails, and
+#                                      every other call runs the real tmux (the shim's header states
+#                                      the matching). Refuses --targets with another mode, no target,
+#                                      and an empty target or one holding a control character. A
+#                                      later `tmux_shim_mode` call replaces the list
 #
 #   Closing assertions and CSCB's agent-director calls (fmk mode; see "Closing assertions").
 #   Each reads SCENARIO_TMUX_SHIM_LOG, SCENARIO_AD_SHIM_LOG and SCENARIO_CSCB_RECORD (a
@@ -784,6 +825,13 @@ STUB_MODE_UNRECOGNISED=unrecognised-dialog
 STUB_MODE_FOLDER_TRUST=folder-trust
 SCENARIO_STUB_MODES=("${STUB_MODE_DEV_CHANNELS}" "${STUB_MODE_AT_ONCE}" "${STUB_MODE_SILENT}"
     "${STUB_MODE_UNRECOGNISED}" "${STUB_MODE_FOLDER_TRUST}")
+# Harness additions, confirm at the reconcile pass: the stub mode that writes
+# its transcript only at the first message after reporting in, and the
+# stub's exit sentinel line (fixtures/stub-claude.sh SENTINEL), which a
+# scenario types with `stub_type_line`.
+STUB_MODE_TRANSCRIPT_ON_FIRST_MESSAGE=transcript-on-first-message
+SCENARIO_STUB_MODES+=("${STUB_MODE_TRANSCRIPT_ON_FIRST_MESSAGE}")
+STUB_EXIT_SENTINEL=__CSCB_TEST_EXIT__
 SCENARIO_STUB_MCP_SRC="${SCENARIO_FIXTURES}/stub-mcp-session.ts"
 SCENARIO_STUB_MODES_NAME=stub-claude-modes
 
@@ -1691,7 +1739,24 @@ cscb_run() {
 
 tmux_shim_mode() {
     local mode="${1:-}" delay="${2:-}" m known=0
+    local t text
     [[ "${SCENARIO_FMK}" == 1 ]] || fail "tmux_shim_mode: the tmux shim is for fmk scripts only"
+    # fail-kill's target list (a harness addition, confirm at the reconcile
+    # pass): `fail-kill --targets <target>...`, one target per line after
+    # the mode line.
+    if [[ "${delay}" == --targets ]]; then
+        [[ "${mode}" == fail-kill ]] || fail "tmux_shim_mode: only fail-kill takes --targets"
+        (( $# > 2 )) || fail "tmux_shim_mode: --targets names no target"
+        shift 2
+        text="${mode}"
+        for t in "$@"; do
+            [[ -n "${t}" && "${t}" != *[[:cntrl:]]* ]] \
+                || fail "tmux_shim_mode: target '${t}' is empty or holds a control character"
+            text+=$'\n'"${t}"
+        done
+        write_file "${SCENARIO_TMUX_SHIM_MODE_FILE}" <<< "${text}"
+        return 0
+    fi
     for m in "${SCENARIO_TMUX_SHIM_MODES[@]}"; do
         [[ "${m}" == "${mode}" ]] && known=1
     done
@@ -2236,6 +2301,31 @@ stub_press_enter() {
     err="${SCENARIO_ROOT}/stub-press-enter.err"
     "${SCENARIO_REAL_TMUX}" send-keys -t "${exact}" Enter 2> "${err}" || rc=$?
     (( rc == 0 )) || fail "${step}: tmux send-keys exited ${rc}: $(tr '\n' ' ' < "${err}")"
+}
+
+# A harness addition, confirm at the reconcile pass.
+stub_type_line() {
+    local target="${1:-}" text="${2:-}" step exact err rc=0
+    step="stub_type_line ${target}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    (( $# == 2 )) || fail "${step}: takes <target> <line>"
+    _scenario_tmux_check "${step}"
+    [[ -n "${target}" ]] || fail "${step}: no pane named"
+    [[ "${text}" =~ [^[:space:]] ]] || fail "${step}: the line is empty or blank (an Enter alone is stub_press_enter)"
+    [[ "${text}" != *[[:cntrl:]]* ]] || fail "${step}: the line holds a control character"
+    # The same exact targets as stub_press_enter.
+    case "${target}" in
+        %*) exact="${target}" ;;
+        *:*) exact="=${target}" ;;
+        *) exact="=${target}:" ;;
+    esac
+    err="${SCENARIO_ROOT}/stub-type-line.err"
+    # The line as literal keys (-l: no key name is looked up), then Enter.
+    "${SCENARIO_REAL_TMUX}" send-keys -t "${exact}" -l -- "${text}" 2> "${err}" || rc=$?
+    (( rc == 0 )) || fail "${step}: tmux send-keys of the line exited ${rc}: $(tr '\n' ' ' < "${err}")"
+    "${SCENARIO_REAL_TMUX}" send-keys -t "${exact}" Enter 2> "${err}" || rc=$?
+    (( rc == 0 )) || fail "${step}: tmux send-keys of Enter exited ${rc}: $(tr '\n' ' ' < "${err}")"
 }
 
 write_mcp_config() {
@@ -2838,6 +2928,46 @@ end_session() {
     if _scenario_tmux has-session -t "${sid}"; then
         fail "${step}: session ${sid} still exists after kill-session"
     fi
+}
+
+# ---------------------------------------------------------------------------
+# The human's filesystem steps (fmk mode; harness addition, confirm at the
+# reconcile pass)
+# ---------------------------------------------------------------------------
+
+repoint_symlink() {
+    local link="${1:-}" target="${2:-}" step real_root real_dir real_target tmp got
+    step="repoint_symlink ${link} ${target}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    [[ "${SCENARIO_FMK}" == 1 ]] || fail "${step}: the harness's filesystem steps are for fmk scripts only"
+    (( $# == 2 )) || fail "${step}: takes <link> <target>"
+    real_root="$(realpath -e -- "${SCENARIO_ROOT}" 2> /dev/null)" \
+        || fail "${step}: cannot resolve SCENARIO_ROOT ${SCENARIO_ROOT}"
+    [[ "${link}" == "${SCENARIO_ROOT}"/* ]] \
+        || fail "${step}: refused: the link ${link} is not under SCENARIO_ROOT ${SCENARIO_ROOT}"
+    [[ "${target}" == "${SCENARIO_ROOT}"/* ]] \
+        || fail "${step}: refused: the target ${target} is not under SCENARIO_ROOT ${SCENARIO_ROOT}"
+    [[ -L "${link}" ]] || fail "${step}: refused: ${link} is not a symlink"
+    # The link's own directory, by real path (the link itself is not followed).
+    real_dir="$(realpath -e -- "$(dirname -- "${link}")" 2> /dev/null)" \
+        || fail "${step}: cannot resolve the directory of ${link}"
+    [[ "${real_dir}" == "${real_root}" || "${real_dir}" == "${real_root}"/* ]] \
+        || fail "${step}: refused: the link's directory resolves to ${real_dir}, which is not under SCENARIO_ROOT ${real_root}"
+    [[ -e "${target}" ]] || fail "${step}: refused: the target ${target} does not exist"
+    [[ -d "${target}" ]] || fail "${step}: refused: the target ${target} is not a directory"
+    real_target="$(realpath -e -- "${target}" 2> /dev/null)" || fail "${step}: cannot resolve the target ${target}"
+    [[ "${real_target}" == "${real_root}"/* ]] \
+        || fail "${step}: refused: the target resolves to ${real_target}, which is not under SCENARIO_ROOT ${real_root}"
+    tmp="${real_dir}/.scenario-repoint.$$.${RANDOM}"
+    [[ ! -e "${tmp}" && ! -L "${tmp}" ]] || fail "${step}: ${tmp} already exists"
+    ln -s -- "${real_target}" "${tmp}" || fail "${step}: could not make a new link beside ${link}"
+    # One rename, so a reader never finds the link missing.
+    mv -f -T -- "${tmp}" "${link}" || { rm -f -- "${tmp}"; fail "${step}: could not rename the new link over ${link}"; }
+    [[ -L "${link}" ]] || fail "${step}: ${link} is no longer a symlink after the re-point"
+    got="$(realpath -e -- "${link}" 2> /dev/null)" || fail "${step}: ${link} does not resolve after the re-point"
+    [[ "${got}" == "${real_target}" ]] \
+        || fail "${step}: ${link} resolves to ${got} after the re-point, not to ${real_target}"
 }
 
 # ---------------------------------------------------------------------------

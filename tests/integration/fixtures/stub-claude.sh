@@ -49,6 +49,28 @@
 #                        directory is trusted when
 #                        `projects[<dir>].hasTrustDialogAccepted` is `true` for
 #                        its real path or for $PWD.
+#   transcript-on-first-message
+#                        (a harness addition, confirm at the reconcile pass)
+#                        as `dev-channels` (the same dialog, reporting in on
+#                        the first line that reaches stdin), except that
+#                        reporting in writes no transcript: until the first
+#                        message, every SessionStart (the report-in's and the
+#                        re-fire's) names a `transcript_path` with no file at
+#                        it, so agent-director's SessionStart finds none. The
+#                        transcript is written at the first message after
+#                        reporting in: the first line that is not the
+#                        sentinel, does not start with `/` (a slash command
+#                        typed into the pane, such as CSCB's `/exit` at a
+#                        `pause` or `/mcp reconnect`, is no message) and is
+#                        not empty or blank (an extra Enter, which writes
+#                        nothing in Claude Code either), as a human typing
+#                        into the pane (lib/scenario.sh `stub_type_line`).
+#                        Once written it stays, as in every other mode: the
+#                        life's later SessionStarts (its re-fire's) name it,
+#                        and a resumed launch of that session id (see
+#                        RESUME) finds it at its SessionStart; a resumed
+#                        launch of a session never messaged finds none until
+#                        its own first message.
 #
 # Only the dev-channels dialog holds DEV_CHANNELS_DIALOG_NEEDLE, and only the
 # folder-trust prompt holds TRUST_DIALOG_NEEDLE.
@@ -61,6 +83,8 @@
 #     RE-FIRE). agent-director derives the row's session_id from the payload's
 #     `transcript_path` basename, so a later `claude --resume <session_id>`
 #     finds that transcript.
+#   - In `transcript-on-first-message` reporting in writes no transcript; the
+#     first message does (see its entry above). Everything else here holds.
 #   - After reporting in the stub keeps reading stdin, so the process and its
 #     tmux pane stay alive. Further lines are ignored, apart from the sentinel
 #     and `/mcp reconnect` (see THE MCP SESSION).
@@ -221,6 +245,11 @@ PROJ_DIR="${HOME}/.claude/projects/${PROJ_KEY}"
 TRANSCRIPT="${PROJ_DIR}/${SESSION_ID}.jsonl"
 
 ensure_transcript() {
+    # transcript-on-first-message (a harness addition): no transcript until
+    # the first message (handle_line sets TRANSCRIPT_DUE).
+    if [[ "${MODE}" == "${MODE_TRANSCRIPT_ON_FIRST_MESSAGE}" && "${TRANSCRIPT_DUE:-0}" != 1 ]]; then
+        return 0
+    fi
     mkdir -p "${PROJ_DIR}" 2>/dev/null || true
     if [[ ! -f "${TRANSCRIPT}" ]]; then
         # Minimal transcript so `claude --resume` has a file to reference.
@@ -238,6 +267,8 @@ MODE_AT_ONCE=at-once
 MODE_SILENT=silent
 MODE_UNRECOGNISED=unrecognised-dialog
 MODE_FOLDER_TRUST=folder-trust
+# A harness addition, confirm at the reconcile pass.
+MODE_TRANSCRIPT_ON_FIRST_MESSAGE=transcript-on-first-message
 
 STUB_DIR="${BASH_SOURCE[0]%/*}"
 [[ "${STUB_DIR}" == "${BASH_SOURCE[0]}" ]] && STUB_DIR=.
@@ -251,6 +282,7 @@ if [[ -f "${STUB_MODES_FILE}" ]]; then
 fi
 case "${MODE}" in
     "${MODE_DEV_CHANNELS}" | "${MODE_AT_ONCE}" | "${MODE_SILENT}" | "${MODE_UNRECOGNISED}" | "${MODE_FOLDER_TRUST}") ;;
+    "${MODE_TRANSCRIPT_ON_FIRST_MESSAGE}") ;;
     *)
         printf 'stub-claude: unknown mode %q selected for %s; running %s\n' \
             "${MODE}" "${REALCWD}" "${MODE_DEV_CHANNELS}" >&2
@@ -602,6 +634,10 @@ case "${MODE}" in
         print_dev_channels_dialog
         AWAITING_ENTER=1
         ;;
+    "${MODE_TRANSCRIPT_ON_FIRST_MESSAGE}")
+        print_dev_channels_dialog
+        AWAITING_ENTER=1
+        ;;
     "${MODE_UNRECOGNISED}")
         print_unrecognised_dialog
         AWAITING_ENTER=1
@@ -627,6 +663,14 @@ handle_line() {
     if [[ "${line}" == "${SENTINEL}" ]]; then
         [[ "${MODE}" == "${MODE_SILENT}" ]] || fire_session_end
         exit 0
+    fi
+    # transcript-on-first-message: the first message after reporting in
+    # writes the transcript; a slash command (a line starting with `/`, such
+    # as `/exit` or `/mcp reconnect`) is no message.
+    if (( REPORTED )) && [[ "${MODE}" == "${MODE_TRANSCRIPT_ON_FIRST_MESSAGE}" \
+        && "${line}" =~ [^[:space:]] && ! "${line}" =~ ^[[:space:]]*/ ]]; then
+        TRANSCRIPT_DUE=1
+        ensure_transcript
     fi
     if (( AWAITING_ENTER )); then
         report_in

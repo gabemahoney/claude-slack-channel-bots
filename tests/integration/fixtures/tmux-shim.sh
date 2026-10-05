@@ -32,7 +32,13 @@
 #                         `<mode>` or `<mode> <delay-s>`, written by
 #                         scenario.sh's `tmux_shim_mode` (atomically). No file
 #                         reads as `log`. An unreadable file or an unknown mode
-#                         runs nothing and exits 70.
+#                         runs nothing and exits 70. For `fail-kill` only,
+#                         the lines after the first, when there are any, are
+#                         its target list, one target per line (see
+#                         "fail-kill's target list"); a list with any other
+#                         mode runs nothing and exits 70. The file is opened
+#                         once per call, so the mode and its list are read
+#                         from one version of it.
 #   <root>/tmux-shim.log  the log.
 #
 # MODES
@@ -41,6 +47,9 @@
 #   fail-kill     a call whose commands include `kill-session` or `kill-pane`
 #                 runs nothing (so kills nothing), prints one line to standard
 #                 error and exits 1; every other call runs the real tmux.
+#                 With a target list, only a call holding a `kill-session` or
+#                 `kill-pane` aimed at a listed target does so; every other
+#                 call, a kill aimed elsewhere included, runs the real tmux.
 #   fail-create   a call whose commands include `new-session` runs nothing (so
 #                 creates nothing), writes nothing to standard output, writes
 #                 one line that tmux never gives (it starts `tmux-shim:`) to
@@ -70,6 +79,18 @@
 # `killp`) or a prefix no other tmux command shares (`new-s…`, `kill-ses…`,
 # `kill-p…`). A call with no command and neither -c nor -V is tmux's default
 # `new-session`.
+#
+# fail-kill's target list (a harness addition, confirm at the reconcile
+# pass). Each listed target is a session name, a session id (`$N`) or a pane
+# id (`%N`). A kill command's target is its `-t` value (`-t <t>`, `-t<t>`, or
+# `t` last in a flag cluster such as `-at <t>`), read up to `--` or its first
+# word that is not a flag; a kill with no `-t` is aimed at no listed target.
+# A target and a listed one are compared after a leading `=` and everything
+# from the first `:` on are dropped from each, so `=name`, `name:`, `$N` and
+# `%N` (agent-director's own forms: `kill-pane -t %N`, `kill-session -t $N`)
+# all match the listed `name`, `$N` or `%N`. A chained call holding one
+# such kill fails whole, running none of its commands. Blank lines in the
+# list are skipped.
 #
 # LINE FORMAT (the agent-director shim's format, fixtures/agent-director-shim.sh)
 # -----------
@@ -133,12 +154,23 @@ fi
 
 mode=log
 delay=""
+# fail-kill's target list: the mode file's lines after the first (a harness
+# addition, confirm at the reconcile pass).
+target_lines=()
 if [[ -e "${mode_file}" ]]; then
     mode=""
-    if ! { IFS=$' \t' read -r mode delay _ < "${mode_file}" || [[ -n "${mode}" ]]; } 2> /dev/null; then
+    if ! { { IFS=$' \t' read -r mode delay _ || [[ -n "${mode}" ]]; } && mapfile -t target_lines; } < "${mode_file}" 2> /dev/null; then
         printf 'tmux-shim: could not read the mode file %s; tmux was not run\n' "${mode_file}" >&2
         exit 70
     fi
+fi
+targets=()
+for t in ${target_lines[@]+"${target_lines[@]}"}; do
+    [[ -n "${t}" ]] && targets+=("${t}")
+done
+if (( ${#targets[@]} > 0 )) && [[ "${mode}" != fail-kill ]]; then
+    printf 'tmux-shim: the mode file %s lists targets for mode %q; only fail-kill takes them; tmux was not run\n' "${mode_file}" "${mode}" >&2
+    exit 70
 fi
 case "${mode}" in
     log | fail-kill | fail-create) ;;
@@ -216,6 +248,7 @@ while (( i < n )); do
     esac
 done
 
+cmd_start="${i}"
 commands=()
 want_name=1
 for (( ; i < n; i++ )); do
@@ -252,12 +285,93 @@ for c in ${commands[@]+"${commands[@]}"}; do
 done
 
 # ---------------------------------------------------------------------------
+# fail-kill's target list (a harness addition, confirm at the reconcile pass):
+# whether a kill command of the call is aimed at a listed target.
+# ---------------------------------------------------------------------------
+
+# target_key <target>: print <target> without a leading `=` and without
+# everything from its first `:` on.
+target_key() {
+    local t="${1#=}"
+    printf '%s' "${t%%:*}"
+}
+
+# is_listed <target>: true when <target> matches a listed target.
+is_listed() {
+    local want got
+    want="$(target_key "$1")"
+    [[ -n "${want}" ]] || return 1
+    for got in "${targets[@]}"; do
+        [[ "$(target_key "${got}")" == "${want}" ]] && return 0
+    done
+    return 1
+}
+
+# kill_aimed_at_listed: true when a kill-session or kill-pane command of the
+# call has a `-t` value that is a listed target. Each command's words run
+# from its name to the argument that ends it with `;`.
+kill_aimed_at_listed() {
+    local k word name="" is_kill=0 flags_done=0 want_target=0 ends letters x
+    for (( k = cmd_start; k < n; k++ )); do
+        word="${args[k]}"
+        ends=0
+        if [[ "${word}" == *';' && "${word}" != *'\;' ]]; then
+            ends=1
+            word="${word%;}"
+        fi
+        if [[ -z "${name}" ]]; then
+            if [[ -n "${word}" ]]; then
+                name="${word}"
+                is_kill=0
+                flags_done=0
+                want_target=0
+                if is_command "${name}" kill-session "" 8 || is_command "${name}" kill-pane killp 6; then
+                    is_kill=1
+                fi
+            fi
+        elif (( is_kill )); then
+            if (( want_target )); then
+                is_listed "${word}" && return 0
+                want_target=0
+                flags_done=1
+            elif (( ! flags_done )); then
+                if [[ "${word}" == -- ]]; then
+                    flags_done=1
+                elif [[ "${word}" == -?* ]]; then
+                    letters="${word:1}"
+                    for (( x = 0; x < ${#letters}; x++ )); do
+                        if [[ "${letters:x:1}" == t ]]; then
+                            if (( x + 1 < ${#letters} )); then
+                                is_listed "${letters:x+1}" && return 0
+                                flags_done=1
+                            else
+                                want_target=1
+                            fi
+                            break
+                        fi
+                    done
+                else
+                    flags_done=1
+                fi
+            fi
+        fi
+        (( ends )) && name=""
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------------
 # Act.
 # ---------------------------------------------------------------------------
 
 case "${mode}" in
     fail-kill)
-        if (( has_kill )); then
+        if (( has_kill )) && (( ${#targets[@]} > 0 )); then
+            if kill_aimed_at_listed; then
+                printf 'tmux-shim: fail-kill: a kill-session or kill-pane call aimed at a listed target fails in this mode; nothing was killed\n' >&2
+                exit 1
+            fi
+        elif (( has_kill )); then
             printf 'tmux-shim: fail-kill: a kill-session or kill-pane call fails in this mode; nothing was killed\n' >&2
             exit 1
         fi
