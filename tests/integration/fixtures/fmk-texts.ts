@@ -55,7 +55,40 @@
  *                                 src/ad-settings.ts DEFAULT_AD_SETTINGS, its
  *                                 `tmux.pending_grace_seconds`: agent-director's
  *                                 default pending grace period G, in whole seconds
- * None of them takes an argument.
+ *   DEFAULT_AD_SETTINGS.tmux.create_timeout_ms
+ *                                 src/ad-settings.ts DEFAULT_AD_SETTINGS, its
+ *                                 `tmux.create_timeout_ms`: agent-director's default
+ *                                 bound on its session-creating tmux call, in
+ *                                 milliseconds
+ *   DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS
+ *                                 src/config.ts DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS:
+ *                                 CSCB's default bound on one agent-director call, in
+ *                                 milliseconds
+ *   LAUNCH_TIMEOUT_PHRASE         src/ad-description-phrases.ts LAUNCH_TIMEOUT_PHRASE:
+ *                                 the phrase an ErrTmuxUnresponsive carries when it
+ *                                 ends a launch call as a launch timeout
+ *   LAUNCH_UNAVAILABLE_OUTCOME_APPROVER
+ *                                 src/session-manager.ts
+ *                                 LAUNCH_UNAVAILABLE_OUTCOME_APPROVER: the outcome the
+ *                                 one `get` after a launch timeout logs for a covered
+ *                                 `pending` row whose approver it started
+ *   LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT
+ *                                 src/ad-error-class.ts LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT:
+ *                                 the name the post-timeout get line gives a launch
+ *                                 timeout that was CSCB's own call timeout
+ *   PENDING_ROW_RULE_LOG_HEAD     src/pending-row.ts PENDING_ROW_RULE_LOG_HEAD: the
+ *                                 head of the pending-row rule's lines
+ *   UNAVAILABLE_RETRY_BASE_S      src/unavailable-retry.ts UNAVAILABLE_RETRY_BASE_S: the
+ *                                 retry timer's first wait, in seconds
+ *   UNAVAILABLE_RETRY_CEILING_S   src/unavailable-retry.ts UNAVAILABLE_RETRY_CEILING_S:
+ *                                 the retry timer's longest wait, in seconds
+ * None of the above takes an argument.
+ *   tmuxUnresponsiveEndedLines <key>
+ *                                 src/persona-episodes.ts tmuxUnresponsiveEndedLine for
+ *                                 persona key <key>, once for each end reason
+ *                                 TMUX_UNRESPONSIVE_END_TEXT names, in its order, one
+ *                                 line each: every ended line the persona's
+ *                                 tmux-unresponsive condition can log
  *
  * It makes no agent-director call, starts no process or server, opens no
  * socket, reads no token and writes no file.
@@ -133,6 +166,38 @@ function noArguments(name: string, read: () => Promise<string>): Entry {
   }
 }
 
+/** An entry that takes exactly one argument, named `argName` in its usage error, and prints `read(arg)`. */
+function oneArgument(name: string, argName: string, read: (arg: string) => Promise<string>): Entry {
+  return async (args) => {
+    if (args.length !== 1) throw new PrinterFailure(USAGE_EXIT, `${name} takes one argument, <${argName}> (got ${args.length})`)
+    return await read(args[0]!)
+  }
+}
+
+/**
+ * Every ended line of persona `key`'s tmux-unresponsive condition: the
+ * package's `tmuxUnresponsiveEndedLine(key, reason)` for each reason its
+ * `TMUX_UNRESPONSIVE_END_TEXT` names, in that order, joined by newlines.
+ */
+async function tmuxUnresponsiveEndedLines(key: string): Promise<string> {
+  const build = await packageExport('persona-episodes.ts', 'tmuxUnresponsiveEndedLine')
+  const texts = await packageExport('persona-episodes.ts', 'TMUX_UNRESPONSIVE_END_TEXT')
+  if (typeof build !== 'function') throw new PrinterFailure(PACKAGE_EXIT, "the installed package's src/persona-episodes.ts tmuxUnresponsiveEndedLine is not a function")
+  if (typeof texts !== 'object' || texts === null) {
+    throw new PrinterFailure(PACKAGE_EXIT, "the installed package's src/persona-episodes.ts TMUX_UNRESPONSIVE_END_TEXT is not an object")
+  }
+  const reasons = Object.keys(texts)
+  if (reasons.length === 0) throw new PrinterFailure(PACKAGE_EXIT, "the installed package's src/persona-episodes.ts TMUX_UNRESPONSIVE_END_TEXT names no end reason")
+  const lines = reasons.map((reason) => {
+    const line: unknown = (build as (key: string, reason: unknown) => unknown)(key, reason)
+    if (typeof line !== 'string' || line.includes('\n')) {
+      throw new PrinterFailure(PACKAGE_EXIT, `the installed package's src/persona-episodes.ts tmuxUnresponsiveEndedLine gave no one-line text for reason ${reason}`)
+    }
+    return line
+  })
+  return lines.join('\n')
+}
+
 /** The entries, by the name a script passes. */
 const ENTRIES: Readonly<Record<string, Entry>> = {
   APPROVER_LOG_PREFIX: noArguments('APPROVER_LOG_PREFIX', () => stringExport('session-manager.ts', 'APPROVER_LOG_PREFIX')),
@@ -142,6 +207,23 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   'DEFAULT_AD_SETTINGS.tmux.pending_grace_seconds': noArguments('DEFAULT_AD_SETTINGS.tmux.pending_grace_seconds', () =>
     wholeNumberAt('ad-settings.ts', 'DEFAULT_AD_SETTINGS', ['tmux', 'pending_grace_seconds']),
   ),
+  'DEFAULT_AD_SETTINGS.tmux.create_timeout_ms': noArguments('DEFAULT_AD_SETTINGS.tmux.create_timeout_ms', () =>
+    wholeNumberAt('ad-settings.ts', 'DEFAULT_AD_SETTINGS', ['tmux', 'create_timeout_ms']),
+  ),
+  DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS: noArguments('DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS', () =>
+    wholeNumberAt('config.ts', 'DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS', []),
+  ),
+  LAUNCH_TIMEOUT_PHRASE: noArguments('LAUNCH_TIMEOUT_PHRASE', () => stringExport('ad-description-phrases.ts', 'LAUNCH_TIMEOUT_PHRASE')),
+  LAUNCH_UNAVAILABLE_OUTCOME_APPROVER: noArguments('LAUNCH_UNAVAILABLE_OUTCOME_APPROVER', () =>
+    stringExport('session-manager.ts', 'LAUNCH_UNAVAILABLE_OUTCOME_APPROVER'),
+  ),
+  LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT: noArguments('LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT', () =>
+    stringExport('ad-error-class.ts', 'LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT'),
+  ),
+  PENDING_ROW_RULE_LOG_HEAD: noArguments('PENDING_ROW_RULE_LOG_HEAD', () => stringExport('pending-row.ts', 'PENDING_ROW_RULE_LOG_HEAD')),
+  UNAVAILABLE_RETRY_BASE_S: noArguments('UNAVAILABLE_RETRY_BASE_S', () => wholeNumberAt('unavailable-retry.ts', 'UNAVAILABLE_RETRY_BASE_S', [])),
+  UNAVAILABLE_RETRY_CEILING_S: noArguments('UNAVAILABLE_RETRY_CEILING_S', () => wholeNumberAt('unavailable-retry.ts', 'UNAVAILABLE_RETRY_CEILING_S', [])),
+  tmuxUnresponsiveEndedLines: oneArgument('tmuxUnresponsiveEndedLines', 'key', tmuxUnresponsiveEndedLines),
 }
 
 async function main(argv: readonly string[]): Promise<number> {
