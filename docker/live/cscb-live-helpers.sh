@@ -6,7 +6,7 @@
 #
 # Changes from the plan's file: TEST_HOST / TEST_USER are the container's,
 # PATH starts with the image's agent-director directory
-# (/opt/agent-director-rc/bin) and includes the test user's bun global bin
+# (/opt/agent-director/bin) and includes the test user's bun global bin
 # (where the customer install puts `claude-slack-channel-bots`), missing
 # files read as empty, and two read-only helpers the runner uses (`tmark`,
 # `rows`) are added.
@@ -15,7 +15,7 @@
 # token-shaped matches in it.
 TEST_HOST='@TEST_HOST@'   # the container's hostname
 TEST_USER='testuser'
-export PATH="/opt/agent-director-rc/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin"
+export PATH="/opt/agent-director/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin"
 S=~/.claude/channels/slack
 LOG="$S/server.log"
 TRAIL="$S/permission-trail.jsonl"

@@ -68,35 +68,54 @@
  *   report in the results), reaches the container only through the checks'
  *   helpers, and its one agent-director command, the fallback deny, runs
  *   behind the plan's `guard`;
- * - the /ci images name one base tag, `BASE_IMAGE`: the `FROM` lines of
+ * - the /ci images carry agent-director's release, never a release
+ *   candidate. They name one base tag, `BASE_IMAGE`: the `FROM` lines of
  *   `docker/Dockerfile.test` and `docker/Dockerfile.live` and the `/ci` and
- *   `/ci-live` skills; the base (`docker/Dockerfile.test.base`) reads one
- *   file from the repo context, the client-under-test check
- *   (`RC_CLIENT_CHECK_SOURCE`, never `package.json`), and installs nothing
- *   but its global agent-director client, from the release candidate's
- *   client tarball (no registry); it takes the release candidate and
- *   `install.sh` only from their named build contexts, checks them
- *   (SHA256SUMS, the pinned version and commit, the pinned SHA-256) before
- *   installing them, puts the release candidate's binary in a directory of
- *   its own first on PATH (never /usr/local/bin) and the 0.10.0 binary,
- *   fetched for its pinned release, off PATH, installs `sqlite3` and `file`
- *   and writes the marker /etc/cscb-ci-image; the pinned release candidate's
- *   version is a candidate of CSCB's Phase 1 floor (its major.minor.patch is
- *   `PHASE1_FLOOR_VERSION`), which confirms the floor (b.jg5 SRJ-201,
- *   SRJ-202); `Dockerfile.live` and the three
- *   `docker/live` scripts' PATH lines use the base's release-candidate
- *   directory;
- * - the client under test (`ci-live/lib/rc-client.ts`): the base copies the
- *   check to `RC_CLIENT_CHECK` and installs its global client from the path
- *   in the release record, then runs `--client` on it; `Dockerfile.live`
- *   copies no `package.json`, installs no agent-director (its one package
- *   install is Claude Code's) and runs `--client` on that global client after
- *   staging its binary, stopping the build on failure; test-1 runs
- *   `--package` on the package it installed into /test-repo right after the
- *   install, failing the test on failure, then, before its other steps, runs
- *   the Phase 1 class-check fixture (`fixtures/phase1-client-check.ts`) with
- *   bun on that package, failing the test with the fixture's first FAIL line.
- *   The check's path is imported, never typed;
+ *   `/ci-live` skills (a planted previous tag is refused). The base
+ *   (`docker/Dockerfile.test.base`) reads one file from the repo context, the
+ *   client-under-test check (`AD_CLIENT_CHECK_SOURCE`, never
+ *   `package.json`), and only `install.sh` from its one named build context
+ *   (no release-candidate context, no SHA256SUMS); pins a plain release that
+ *   is CSCB's Phase 1 floor (`PHASE1_FLOOR_VERSION`) and `package.json`'s
+ *   pin, with its commit and SHA-256s (b.jg5 SRJ-201); checks `install.sh`
+ *   against its SHA-256 before installing it off PATH; installs the release's
+ *   binaries with that `install.sh --from-release` of the pinned tag and both
+ *   pinned SHA-256s (no hooks, no symlink, a throwaway HOME); puts the binary
+ *   alone in a directory first on PATH (never /usr/local/bin) and checks its
+ *   SHA-256, version, commit and place on PATH; keeps `agent-director-admin`
+ *   off PATH (not in a PATH directory, not linked there, checked by the
+ *   build) with its SHA-256 checked; checks the npm client tarball before the
+ *   release record names it; installs its global client from npm at the
+ *   release's version as its one package install and runs the check's
+ *   `--client` on it, writing nothing into it (no swap); fetches the 0.10.0
+ *   binary for its pinned release off PATH, packs the 0.10.0 legs, installs
+ *   `sqlite3` and `file` and writes the marker /etc/cscb-ci-image. Each rule
+ *   is pinned by a row that plants its breach in the real base text.
+ *   `Dockerfile.live` and the three `docker/live` scripts' PATH lines use the
+ *   base's default binary directory. The `/ci` skill reads the release from
+ *   the base's `ARG AD_VERSION`, extracts `install.sh` at its tag, passes
+ *   only that context, fetches nothing and types no commit; the `/ci-live`
+ *   skill downloads the release's linux-amd64 binary into a scratch
+ *   directory, checks it against the base's `AD_SHA256`, only sets its
+ *   execute bit (never runs it) and stages it in both runs. No image file
+ *   (`docker/`, its docs aside), `ci-live/lib/` module or skill names a
+ *   release-candidate version, context, directory variable, SHA256SUMS, swap
+ *   helper or pin, or a commit other than the release's; the SRD's
+ *   release-candidate-counts wording (`<P1>-rc.N` counts as `<P1>`) passes;
+ * - the client under test (`ci-live/lib/ad-client-check.ts`): the check
+ *   changes nothing (it writes only in its scratch directory and runs no
+ *   package manager); `Dockerfile.live` copies no `package.json`, installs no
+ *   agent-director (its one package install is Claude Code's) and runs
+ *   `--client` on the base's global client after staging its binary,
+ *   stopping the build on failure, with no swap; only the check's step 5
+ *   (binary) routes to `--agent-director-binary`; test-1 runs `--package` on
+ *   the package it installed into /test-repo right after the install,
+ *   failing the test on failure, installs nothing else and writes nothing
+ *   into node_modules, then, before its other steps, runs the Phase 1
+ *   class-check fixture (`fixtures/phase1-client-check.ts`) with bun on that
+ *   package, failing the test with the fixture's first FAIL line. Each place
+ *   that loses its check, gains a swap or installs agent-director is refused
+ *   by a planted row. The check's path is imported, never typed;
  * - `Dockerfile.live` pins Claude Code: one `ARG CLAUDE_CODE_VERSION=`
  *   declaration, assigned nowhere else, a plain major.minor.patch release at
  *   or above `MIN_CLAUDE_CODE_VERSION` (imported from
@@ -152,10 +171,10 @@ import {
 } from '../ci-live/lib/docker.ts'
 import { CHILD_ENV_ALLOWLIST, minimalChildEnv, type ProcResult, type SpawnOptions } from '../ci-live/lib/proc.ts'
 import { isLiveRunnerPid, lockHolder, lockPid, nodeLockDeps, RunLock, type LockDeps } from '../ci-live/lib/run-lock.ts'
-import { RC_CLIENT_CHECK, RC_CLIENT_CHECK_SOURCE } from '../ci-live/lib/rc-client.ts'
+import { AD_CLIENT_CHECK, AD_CLIENT_CHECK_SOURCE } from '../ci-live/lib/ad-client-check.ts'
 import { NotRunnableError } from '../ci-live/lib/secrets.ts'
-import { meetsPhase1Floor, PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
-import { MIN_CLAUDE_CODE_VERSION } from './test-helpers/agent-director-versions.ts'
+import { DEBUG_SKILL_PATH, meetsPhase1Floor, PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
+import { MIN_CLAUDE_CODE_VERSION, OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import { balancedAfter, callArguments, callsOf, indicesOf, objectProperties, onlyCallArguments, splitTopLevel, stripComments } from './test-helpers/source-audit.ts'
 import { APP_TOKEN_PREFIX, assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL } from './test-helpers/credentials.ts'
 
@@ -904,14 +923,14 @@ describe('hostAgentDirectorBinary', () => {
 
   describe(`selectAgentDirectorBinary: the binary given with ${AGENT_DIRECTOR_BINARY_OPTION}, else the host search`, () => {
     const OPTION = AGENT_DIRECTOR_BINARY_OPTION
-    const GIVEN = '/rc/agent-director'
+    const GIVEN = '/given/agent-director'
     /** A home install and a PATH binary, both executable: a fallback to the search would find them. */
     const SEARCHABLE: Record<string, Entry> = { [HOME_BIN]: 'exec', '/opt/a/agent-director': 'exec', '/opt/dir': 'dir' }
     /** Every path the probe read, once each. */
     const touched = (calls: string[]) => [...new Set(calls.map((c) => c.slice(c.indexOf(' ') + 1)))]
 
     test('a given binary is returned by its real path, and the given path and its real path are all the probe reads: no home install or PATH candidate', () => {
-      const real = '/rc/store/agent-director-0.11.0-rc.1'
+      const real = '/given/store/agent-director-linux-amd64'
       const p = fakeProbe({ ...SEARCHABLE, [GIVEN]: `-> ${real}`, [real]: 'exec' })
       expect(selectAgentDirectorBinary(GIVEN, HOME, onPath('/opt/a'), p.probe)).toEqual({ source: 'given', path: real })
       expect(p.calls).toEqual([`realpath ${GIVEN}`, `isFile ${real}`, `access ${real}`])
@@ -994,7 +1013,7 @@ describe('hostAgentDirectorBinary', () => {
 
     test(`a file given with ${AGENT_DIRECTOR_BINARY_OPTION} behind a symlink is selected by its real path, over the home install and PATH binaries`, () => {
       const { home, path } = searchable()
-      const real = file('rc/agent-director-0.11.0-rc.1', 0o755)
+      const real = file('store/agent-director-linux-amd64', 0o755)
       mkdirSync(join(root, 'given'))
       symlinkSync(real, join(root, 'given', 'agent-director'))
       expect(selectAgentDirectorBinary(join(root, 'given', 'agent-director'), home, path)).toEqual({ source: 'given', path: real })
@@ -1903,9 +1922,39 @@ describe('runner wiring (source audit of ci-live/)', () => {
 
 const REPO = join(import.meta.dir, '..')
 const BASE_DOCKERFILE = join('docker', 'Dockerfile.test.base')
+const CI_SKILL = join('.claude', 'skills', 'ci', 'SKILL.md')
+const CI_LIVE_SKILL = join('.claude', 'skills', 'ci-live', 'SKILL.md')
+
+/** The base's one named build context: the directory holding the release's install.sh. */
+const INSTALL_CONTEXT = 'agent-director-install'
+
+/** Where `bun add -g` puts the base's global agent-director client (bun's global layout under root's HOME). */
+const GLOBAL_CLIENT_DIR = '/root/.bun/install/global/node_modules/agent-director'
+
+/** The base's one package install: the global agent-director client from npm at exactly the release's version. */
+const GLOBAL_CLIENT_INSTALL = 'bun add -g --ignore-scripts "agent-director@${AD_VERSION}"'
+
+/** The release pins the base checks downloads against. */
+const RELEASE_SHA256_ARGS = ['AD_SHA256', 'AD_ADMIN_SHA256', 'AD_INSTALL_SH_SHA256', 'AD_CLIENT_TGZ_SHA256'] as const
+
+/** A 40-hex commit standing alone (not part of a longer hex string such as a SHA-256). */
+const COMMIT_RE = /(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])/g
+
+/** A statement that copies, moves, unpacks, links or removes files: what swapping a client is made of. */
+const FILE_WRITE = /^(?:[A-Z_][A-Z0-9_]*=\S+\s+)*(?:cp|mv|rm|tar|ln|rsync|install|unzip)\s/
+
+/** A statement that runs a package manager's install (an error text naming one does not). */
+const PACKAGE_MANAGER_RUN = /^(?:if\s+!?\s*)?\(?\s*(?:[A-Z_][A-Z0-9_]*=\S+\s+)*(?:npm|npx|pnpm|yarn|bun\s+(?:add|install|link|remove|pm))\s/
+
+const escapeRegExp = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
 function repoFile(rel: string): string {
   return readFileSync(join(REPO, rel), 'utf-8')
+}
+
+/** The agent-director version package.json pins. */
+function packageAdPin(): string {
+  return JSON.parse(repoFile('package.json')).dependencies['agent-director']
 }
 
 /** A Dockerfile's instructions: comment and blank lines dropped, continuation lines joined. */
@@ -1930,9 +1979,12 @@ function instructionsOf(text: string): string[] {
   return out
 }
 
+/** The RUN instructions holding `fragment`. */
+const runsWith = (instructions: string[], fragment: string): string[] => instructions.filter((i) => i.startsWith('RUN ') && i.includes(fragment))
+
 /** The one RUN instruction holding `fragment`. */
 function runWith(instructions: string[], fragment: string): string {
-  const runs = instructions.filter((i) => i.startsWith('RUN ') && i.includes(fragment))
+  const runs = runsWith(instructions, fragment)
   expect(runs.length).toBe(1)
   return runs[0]!
 }
@@ -1951,25 +2003,30 @@ function shellVars(run: string, args: Record<string, string>): Map<string, strin
   return vars
 }
 
-/** Where a RUN's `install -m <mode> <src>/<file> <target>` statement puts `file` (expanded), and where the statement is. */
-function installTarget(run: string, file: string, vars: Map<string, string>): { at: number, target: string } {
-  const m = new RegExp(`(?:^|;)\\s*install\\s+-m\\s+\\d+\\s+"?[^\\s";]*/${file.replace(/\./g, '\\.')}"?\\s+"?([^\\s";]+)"?\\s*(?:;|$)`).exec(run)
-  expect(m).not.toBeNull()
-  return { at: m!.index, target: expand(m![1]!, vars) }
+/** A RUN's `install -m <mode> <source> <target>` statements: where each is, and its source and target expanded over `vars`. */
+function installStatements(run: string, vars: Map<string, string>): { at: number, source: string, target: string }[] {
+  return [...run.matchAll(/(?:^|;)\s*install\s+-m\s+\d+\s+"?([^\s";]+)"?\s+"?([^\s";]+)"?\s*(?=;|$)/g)]
+    .map((m) => ({ at: m.index!, source: expand(m[1]!, vars), target: expand(m[2]!, vars) }))
 }
 
-/** `docker/Dockerfile.test.base`: its instructions, ARG defaults, bind mounts (context → target) and default PATH, whose first directory is the release candidate's binary directory. */
-function baseImage() {
-  const instructions = dockerInstructions(BASE_DOCKERFILE)
-  const args = Object.fromEntries(instructions.flatMap((i) => {
+/** A Dockerfile text's instructions, ARG defaults, bind mounts (context → target) and `ENV PATH` lines (each split at `:`). */
+function imageParts(text: string) {
+  const instructions = instructionsOf(text)
+  const args: Record<string, string> = Object.fromEntries(instructions.flatMap((i) => {
     const m = /^ARG (\w+)=(\S+)$/.exec(i)
     return m ? [[m[1]!, m[2]!]] : []
   }))
   const mounts = new Map([...instructions.join('\n').matchAll(/--mount=type=bind,from=([\w-]+),target=(\S+)/g)].map((m) => [m[1]!, m[2]!]))
-  const env = instructions.filter((i) => i.startsWith('ENV PATH='))
-  expect(env.length).toBe(1)
-  const path = env[0]!.slice('ENV PATH='.length).split(':')
-  return { instructions, args, mounts, path, rcBinDir: path[0]! }
+  const paths = instructions.filter((i) => i.startsWith('ENV PATH=')).map((i) => i.slice('ENV PATH='.length).split(':'))
+  return { instructions, args, mounts, paths }
+}
+
+/** `docker/Dockerfile.test.base`, as {@link imageParts} reads it, with its one default PATH, whose first directory is the default agent-director binary's. */
+function baseImage() {
+  const parts = imageParts(repoFile(BASE_DOCKERFILE))
+  expect(parts.paths.length).toBe(1)
+  const path = parts.paths[0]!
+  return { ...parts, path, binDir: path[0]! }
 }
 
 /**
@@ -2003,19 +2060,294 @@ function ifBody(statements: string[], at: number): { depth: number, text: string
   throw new Error(`no fi closes ${statements[at]}`)
 }
 
-describe('the /ci images (source audit)', () => {
-  const baseRepo = BASE_IMAGE.slice(0, BASE_IMAGE.indexOf(':'))
+/** The statements among `statements` that write files `target` matches: a swap. */
+const swapStatements = (statements: string[], target: RegExp): string[] => statements.filter((s) => FILE_WRITE.test(s) && target.test(s))
 
-  test.each([
-    join('docker', 'Dockerfile.test'),
-    join('docker', 'Dockerfile.live'),
-    BASE_DOCKERFILE,
-    join('.claude', 'skills', 'ci', 'SKILL.md'),
-    join('.claude', 'skills', 'ci-live', 'SKILL.md'),
-  ])('every base-image tag %s names is BASE_IMAGE', (rel) => {
-    const tags = [...repoFile(rel).matchAll(new RegExp(`${baseRepo}:[\\w-]+(?:\\.[\\w-]+)*`, 'g'))].map((m) => m[0])
-    expect(tags.length).toBeGreaterThan(0)
-    expect(tags.filter((tag) => tag !== BASE_IMAGE)).toEqual([])
+/** `text` with `from` replaced by `to`, checked to change it (a planted row that plants nothing would pass vacuously). */
+function planted(text: string, from: string | RegExp, to: string): string {
+  const out = text.replace(from, to)
+  expect(out).not.toBe(text)
+  return out
+}
+
+/** The base-image tags `text` names that are not BASE_IMAGE; a text naming none is a problem too. */
+function baseTagProblems(text: string): string[] {
+  const repo = BASE_IMAGE.slice(0, BASE_IMAGE.indexOf(':'))
+  const tags = [...text.matchAll(new RegExp(`${escapeRegExp(repo)}:[\\w-]+(?:\\.[\\w-]+)*`, 'g'))].map((m) => m[0])
+  if (tags.length === 0) return [`names no ${repo} tag`]
+  return tags.filter((tag) => tag !== BASE_IMAGE).map((tag) => `names ${tag}, not ${BASE_IMAGE}`)
+}
+
+/** BASE_IMAGE's tag one version back, derived from it. */
+function previousBaseTag(): string {
+  const m = /^(.+:v)(\d+)$/.exec(BASE_IMAGE)
+  if (m === null || Number(m[2]) === 0) throw new Error(`${BASE_IMAGE} has no previous version`)
+  return `${m[1]}${Number(m[2]) - 1}`
+}
+
+/**
+ * What is wrong with a base Dockerfile text (`docker/Dockerfile.test.base`'s
+ * shape): empty when it reads only the client check from the repo context
+ * and only the install script from its one named context (no
+ * release-candidate context, no SHA256SUMS); pins a plain release that is
+ * CSCB's Phase 1 floor and package.json's pin, with its commit and SHA-256s;
+ * checks install.sh against its pin before installing it off PATH; installs
+ * the release's binaries with that install.sh's `--from-release` of the
+ * pinned tag and both pinned SHA-256s (no hooks, no symlink, a throwaway
+ * HOME); puts the binary alone, first on PATH (not /usr/local/bin) and checks
+ * its SHA-256, version and commit and that it is the first agent-director on
+ * PATH; keeps agent-director-admin off PATH (not in a PATH directory, not
+ * linked, checked by the build) with its SHA-256 checked, it and its
+ * directory left mode 0755 so testuser can run it; fetches the npm
+ * client tarball at the release's version and checks it before the release
+ * record names it; installs the global client from npm at that version as
+ * its one package install and runs the client check's `--client` on it; and
+ * writes nothing into the global client (no swap).
+ */
+function baseLayoutProblems(text: string): string[] {
+  const problems: string[] = []
+  const { instructions, args, mounts, paths } = imageParts(text)
+  if (paths.length !== 1) return [`${paths.length} ENV PATH lines, not one`]
+  const path = paths[0]!
+  const binDir = path[0]!
+  const statements = shellStatements(instructions)
+
+  const copy = `COPY --chmod=0755 ${AD_CLIENT_CHECK_SOURCE} ${AD_CLIENT_CHECK}`
+  const copies = instructions.filter((i) => /^(COPY|ADD)\s/i.test(i))
+  if (copies.length !== 1 || copies[0] !== copy) problems.push(`the repo context is read by ${JSON.stringify(copies)}, not only ${copy}`)
+  const installs = statements.filter((s) => /\bnpm\s+(i|install|add)\b|\bbun\s+(add|install)\b|\s(-g|--global)\b/.test(s))
+  if (installs.length !== 1 || installs[0] !== GLOBAL_CLIENT_INSTALL) problems.push(`the package installs are ${JSON.stringify(installs)}, not only ${GLOBAL_CLIENT_INSTALL}`)
+
+  const stages = instructions.flatMap((i) => /^FROM\s+\S+\s+AS\s+(\S+)$/i.exec(i)?.[1] ?? [])
+  if (JSON.stringify([...mounts.keys()]) !== JSON.stringify([INSTALL_CONTEXT]) || JSON.stringify(stages) !== JSON.stringify([INSTALL_CONTEXT])) {
+    problems.push(`the named contexts are ${JSON.stringify([...mounts.keys()])} with fallback stages ${JSON.stringify(stages)}, not only ${INSTALL_CONTEXT}`)
+  }
+  if (instructions.some((i) => i.includes('SHA256SUMS'))) problems.push('a SHA256SUMS is read')
+
+  const version = args.AD_VERSION ?? ''
+  if (!PLAIN_RELEASE.test(version)) problems.push(`AD_VERSION ${version || '(none)'} is not a plain major.minor.patch release`)
+  else if (version !== PHASE1_FLOOR_VERSION || version !== packageAdPin() || !meetsPhase1Floor(version)) {
+    problems.push(`AD_VERSION ${version} is not the Phase 1 floor ${PHASE1_FLOOR_VERSION} that package.json pins (${packageAdPin()})`)
+  }
+  if (!/^[0-9a-f]{40}$/.test(args.AD_COMMIT ?? '')) problems.push('AD_COMMIT is not a 40-hex commit')
+  for (const name of RELEASE_SHA256_ARGS) if (!/^[0-9a-f]{64}$/.test(args[name] ?? '')) problems.push(`${name} is not a pinned SHA-256`)
+
+  // The release layer: install.sh from its context, then its --from-release.
+  const releaseRuns = runsWith(instructions, `from=${INSTALL_CONTEXT},`)
+  if (releaseRuns.length !== 1) return [...problems, `${releaseRuns.length} RUNs bind ${INSTALL_CONTEXT}, not one`]
+  const release = releaseRuns[0]!
+  const vars = shellVars(release, args)
+  const releaseStatements = shellStatements([release])
+  const placed = installStatements(release, vars)
+  const placedOne = (file: string) => {
+    const all = placed.filter((p) => basename(p.source) === file)
+    if (all.length !== 1) problems.push(`${all.length} installs of ${file} in the release layer, not one`)
+    return all.length === 1 ? all[0]! : undefined
+  }
+  /** Whether `release` checks a value against `pin` (`!= "${pin}"`) after `at`. */
+  const checkedAfter = (pin: string, at: number): boolean => {
+    const check = release.indexOf(`!= "\${${pin}}"`)
+    return check >= 0 && check > at
+  }
+
+  if (vars.get('INSTALL_CTX') !== mounts.get(INSTALL_CONTEXT) || !release.includes('"${INSTALL_CTX}/install.sh"')) problems.push(`install.sh is not read from the ${INSTALL_CONTEXT} context`)
+  const script = placedOne('install.sh')
+  if (script !== undefined) {
+    const check = release.indexOf('!= "${AD_INSTALL_SH_SHA256}"')
+    if (check < 0 || check > script.at) problems.push('install.sh is not checked against AD_INSTALL_SH_SHA256 before it is installed')
+    if (path.includes(dirname(script.target))) problems.push(`install.sh is installed on PATH, at ${script.target}`)
+  }
+
+  if (vars.get('AD_TAG') !== `v${version}`) problems.push(`the release layer's AD_TAG is ${vars.get('AD_TAG')}, not v${version}`)
+  const fromRelease = releaseStatements.filter((s) => s.includes('--from-release'))
+  if (fromRelease.length !== 1) problems.push(`${fromRelease.length} install.sh --from-release runs, not one`)
+  else {
+    const call = fromRelease[0]!
+    const missing = ['--from-release "${AD_TAG}"', '--sha256 "${AD_SHA256}"', '--admin-sha256 "${AD_ADMIN_SHA256}"', '--no-hooks', '--no-symlink'].filter((flag) => !call.includes(flag))
+    if (missing.length > 0) problems.push(`install.sh --from-release runs without ${missing.join(', ')}`)
+    const ran = /\bbash\s+"?([^\s"]+)"?\s+--from-release\b/.exec(call)?.[1]
+    if (script === undefined || ran === undefined || expand(ran, vars) !== script.target) problems.push('the --from-release run is not of the checked install.sh')
+    if (!/(?:^|\s)HOME=/.test(call)) problems.push("install.sh --from-release runs with the image's own HOME, not a throwaway one")
+  }
+
+  const bin = placedOne('agent-director')
+  if (bin !== undefined) {
+    if (bin.target !== join(binDir, 'agent-director') || binDir === '/usr/local/bin' || !path.includes('/usr/local/bin')) {
+      problems.push(`the release's binary goes to ${bin.target}, not to ${binDir}, first on PATH and not /usr/local/bin`)
+    }
+    for (const pin of ['AD_SHA256', 'AD_VERSION', 'AD_COMMIT']) if (!checkedAfter(pin, bin.at)) problems.push(`the installed binary is not checked against ${pin}`)
+    if (vars.get('AD_BIN') !== bin.target || release.indexOf('"$(command -v agent-director)" != "${AD_BIN}"') < bin.at) problems.push("the build does not check that the release's binary is the first agent-director on PATH")
+  }
+  if (instructions.some((i) => i.includes('/usr/local/bin/agent-director'))) problems.push('/usr/local/bin holds an agent-director')
+
+  const admin = placedOne('agent-director-admin')
+  if (admin !== undefined) {
+    if (path.includes(dirname(admin.target))) problems.push(`agent-director-admin is installed on PATH, at ${admin.target}`)
+    if (!checkedAfter('AD_ADMIN_SHA256', admin.at)) problems.push('the installed agent-director-admin is not checked against AD_ADMIN_SHA256')
+  }
+  const adminOnPath = statements.filter((s) => (/^ln\s/.test(s) && /agent-director-admin|\$\{AD_ADMIN\}/.test(s)) || path.some((dir) => s.includes(`${dir}/agent-director-admin`)))
+  if (adminOnPath.length > 0) problems.push(`agent-director-admin is put on PATH by ${JSON.stringify(adminOnPath)}`)
+  if (!releaseStatements.some((s) => /^if command -v agent-director-admin\b/.test(s))) problems.push('the build does not check that no agent-director-admin is on PATH')
+  // Off PATH, yet runnable by testuser: the last numeric mode the layer gives the admin binary and its directory leaves them other-readable and other-executable.
+  const unquoted = (word: string) => expand(word.replace(/"/g, ''), vars)
+  const modesOf = (target: string): string[] => releaseStatements.flatMap((s) => {
+    const install = /^install\s+-m\s+([0-7]{3,4})\s+\S+\s+(\S+)$/.exec(s)
+    if (install) return unquoted(install[2]!) === target ? [install[1]!] : []
+    const chmod = /^chmod\s+([0-7]{3,4})\s+(.+)$/.exec(s)
+    return chmod !== null && chmod[2]!.split(/\s+/).some((w) => unquoted(w) === target) ? [chmod[1]!] : []
+  })
+  for (const [what, target] of [['agent-director-admin', vars.get('AD_ADMIN')], ["agent-director-admin's directory", vars.get('AD_ADMIN_DIR')]] as const) {
+    const mode = target === undefined ? undefined : modesOf(target).at(-1)
+    if (mode === undefined || (parseInt(mode, 8) & 0o005) !== 0o005) problems.push(`${what} is left mode ${mode ?? '(never set)'}, not 0755 (testuser cannot run it)`)
+  }
+
+  // The client layer: the npm client tarball and the release record, then the global client and its check.
+  const clientRuns = runsWith(instructions, ' --client ')
+  if (clientRuns.length !== 1) return [...problems, `${clientRuns.length} RUNs run the client check's --client, not one`]
+  const client = clientRuns[0]!
+  const at = instructions.indexOf(client)
+  const clientVars = shellVars(client, args)
+  const clientStatements = shellStatements([client])
+  const copyAt = instructions.indexOf(copy)
+  if (copyAt < 0 || copyAt > at || instructions.indexOf(release) > at) problems.push('the client layer runs before the client check is copied or the release is installed')
+  if (!/^RUN set -[a-z]*e[a-z]*;/.test(client)) problems.push('the client layer does not run under set -e')
+  if (clientVars.get('AD_CHECK') !== AD_CLIENT_CHECK || clientVars.get('GLOBAL_CLIENT') !== GLOBAL_CLIENT_DIR) problems.push(`the client layer's check is ${clientVars.get('AD_CHECK')} on ${clientVars.get('GLOBAL_CLIENT')}`)
+  if (clientVars.get('CLIENT_TGZ_URL') !== `https://registry.npmjs.org/agent-director/-/agent-director-${version}.tgz`) problems.push(`the client tarball comes from ${clientVars.get('CLIENT_TGZ_URL')}, not npm at ${version}`)
+  const tgzCheck = client.indexOf('!= "${AD_CLIENT_TGZ_SHA256}"')
+  if (tgzCheck < 0 || tgzCheck > client.indexOf('release.json')) problems.push('the npm client tarball is not checked against AD_CLIENT_TGZ_SHA256 before the release record names it')
+  const record = ['--arg version "${AD_VERSION}"', '--arg commit "${AD_COMMIT}"', '--arg client_tarball "${CLIENT_TGZ}"'].filter((field) => !client.includes(field))
+  if (record.length > 0) problems.push(`the release record lacks ${record.join(', ')}`)
+  const install = clientStatements.indexOf(GLOBAL_CLIENT_INSTALL)
+  const check = clientStatements.indexOf('"${AD_CHECK}" --client "${GLOBAL_CLIENT}"')
+  if (install < 0 || check < install) problems.push("the global client is not checked with the client check's --client after its install")
+  const swaps = swapStatements(statements, /node_modules|\$\{GLOBAL_CLIENT\}/)
+  if (swaps.length > 0) problems.push(`files are written into the global client: ${JSON.stringify(swaps)}`)
+  return problems
+}
+
+/**
+ * What is wrong with a /ci skill text: empty when it reads the release from
+ * the base's `ARG AD_VERSION` (never typed), extracts install.sh at the
+ * release tag `v<AD_VERSION>` as its one `git show`, passes only the install
+ * script's named context (no release-candidate context), fetches nothing into
+ * agent-director's tree and types no commit.
+ */
+function ciSkillProblems(text: string): string[] {
+  const problems: string[] = []
+  const assigned = (name: string) => [...text.matchAll(new RegExp(`^\\s*${name}=(.*)$`, 'gm'))].map((m) => m[1]!)
+  const sed = `"$(sed -n 's/^ARG AD_VERSION=//p' ${BASE_DOCKERFILE})"`
+  if (JSON.stringify(assigned('AD_VERSION')) !== JSON.stringify([sed])) problems.push(`AD_VERSION is assigned ${JSON.stringify(assigned('AD_VERSION'))}, not only ${sed}`)
+  if (JSON.stringify(assigned('AD_TAG')) !== JSON.stringify(['"v${AD_VERSION}"'])) problems.push(`AD_TAG is assigned ${JSON.stringify(assigned('AD_TAG'))}, not only "v\${AD_VERSION}"`)
+  const shows = [...text.matchAll(/\bgit -C "\$\{CSCB_AD_SRC_DIR\}" show "([^"]*)"/g)].map((m) => m[1])
+  if (JSON.stringify(shows) !== JSON.stringify(['${AD_TAG}:skills/install-agent-director/install.sh'])) problems.push(`install.sh is extracted with ${JSON.stringify(shows)}, not at the release tag`)
+  const contexts = [...text.matchAll(/--build-context\s+([\w-]+)=/g)].map((m) => m[1])
+  if (JSON.stringify(contexts) !== JSON.stringify([INSTALL_CONTEXT])) problems.push(`the build contexts are ${JSON.stringify(contexts)}, not only ${INSTALL_CONTEXT}`)
+  const fetches = text.match(/\bgit\s+(?:-C\s+\S+\s+)?(?:fetch|pull|clone)\b[^\n]*/g) ?? []
+  if (fetches.length > 0) problems.push(`it fetches into agent-director's tree: ${JSON.stringify(fetches)}`)
+  const commits = text.match(COMMIT_RE) ?? []
+  if (commits.length > 0) problems.push(`it types the commit(s) ${commits.join(', ')}`)
+  return problems
+}
+
+/**
+ * What is wrong with a /ci-live skill text: empty when it reads the release
+ * and its binary's SHA-256 from the base's ARGs (never typed), downloads the
+ * release's `agent-director-linux-amd64` into a fresh scratch directory,
+ * checks it against `AD_SHA256`, only gives it its execute bit (never runs
+ * it), stages it in both runs with `--agent-director-binary <AD_BIN>`, and
+ * types no commit.
+ */
+function ciLiveSkillProblems(text: string): string[] {
+  const problems: string[] = []
+  for (const arg of ['AD_VERSION', 'AD_SHA256']) {
+    const assigned = [...text.matchAll(new RegExp(`^\\s*${arg}=(.*)$`, 'gm'))].map((m) => m[1])
+    const sed = `"$(sed -n 's/^ARG ${arg}=//p' ${BASE_DOCKERFILE})"`
+    if (JSON.stringify(assigned) !== JSON.stringify([sed])) problems.push(`${arg} is assigned ${JSON.stringify(assigned)}, not only ${sed}`)
+  }
+  const downloads = [...text.matchAll(/\bcurl\s[^\n]*?-o\s+"\$\{AD_BIN\}"\s+"([^"]+)"/g)].map((m) => m[1])
+  const asset = 'https://github.com/${AD_REPO}/releases/download/v${AD_VERSION}/agent-director-linux-amd64'
+  if (JSON.stringify(downloads) !== JSON.stringify([asset])) problems.push(`the binary is downloaded from ${JSON.stringify(downloads)}, not only ${asset}`)
+  if (!/^\s*AD_BIN_DIR="\$\(mktemp -d\s/m.test(text)) problems.push('the binary is not downloaded into a fresh scratch directory')
+  if (!text.includes('!= "${AD_SHA256}"')) problems.push('the downloaded binary is not checked against AD_SHA256')
+  const allowed = [/\bcurl -fsSL -o "\$\{AD_BIN\}" /, /\bsha256sum "\$\{AD_BIN\}"/, /^\s*chmod 0755 "\$\{AD_BIN\}"$/, /^\s*echo "release binary: \$\{AD_BIN\}"$/]
+  const uses = text.split('\n').filter((l) => l.includes('${AD_BIN}') && !/^\s*AD_BIN=/.test(l) && !allowed.some((re) => re.test(l)))
+  if (uses.length > 0) problems.push(`the binary is used beyond its download, check and execute bit: ${JSON.stringify(uses.map((l) => l.trim()))}`)
+  const given = [...text.matchAll(new RegExp(`\\bbun ci-live/run\\.ts\\b[^\\n]*?${escapeRegExp(AGENT_DIRECTOR_BINARY_OPTION)}\\s+['"]?([^\\s'"\`]+)`, 'g'))].map((m) => m[1]!)
+  if (given.length < 2 || given.some((g) => g !== '<AD_BIN>')) problems.push(`the runs stage ${JSON.stringify(given)}, not the downloaded <AD_BIN>`)
+  const commits = text.match(COMMIT_RE) ?? []
+  if (commits.length > 0) problems.push(`it types the commit(s) ${commits.join(', ')}`)
+  return problems
+}
+
+/** The release candidate's old layout names: its build context or directory, its operator variable, its sums file, the swap helper and its pins. */
+const RC_LAYOUT_NAMES: ReadonlyArray<readonly [string, RegExp]> = [
+  ["the release candidate's build context or directory", /\bagent-director-rc\b/],
+  ["the release candidate's directory variable", /\bCSCB_AD_RC_DIR\b/],
+  ['a SHA256SUMS file', /\bSHA256SUMS\b/],
+  ['the swap helper', /\brc-client\b|\bRC_CLIENT_\w+/],
+  ['a release-candidate pin', /\bAD_RC_\w+/],
+]
+
+/** What the images left behind of the release candidate: its old layout names, or a release-candidate version. */
+const RC_LEFTOVERS: ReadonlyArray<readonly [string, RegExp]> = [
+  ...RC_LAYOUT_NAMES,
+  ['a release-candidate version', /(?:\d+\.\d+\.\d+)?-rc\.\d+\b/],
+]
+
+/** Each of `leftovers` that `text` names, with its first match. */
+const leftoversIn = (text: string, leftovers: ReadonlyArray<readonly [string, RegExp]>): string[] => leftovers.flatMap(([what, re]) => {
+  const m = re.exec(text)
+  return m ? [`${what}: ${m[0]}`] : []
+})
+
+/**
+ * What in an integration-tree text names the release candidate's old layout
+ * ({@link RC_LAYOUT_NAMES}). A version string such as `<P1>-rc.N` is not
+ * checked: a scenario may use one as a stand-in version.
+ */
+const rcLayoutProblems = (text: string): string[] => leftoversIn(text, RC_LAYOUT_NAMES)
+
+/**
+ * What in `text` pins a release candidate: one of {@link RC_LEFTOVERS}, or a
+ * commit other than `releaseCommit` (the release's, `AD_COMMIT`). The SRD's
+ * release-candidate-counts wording (`<P1>-rc.N` counts as `<P1>`) names no
+ * release candidate's version and passes.
+ */
+function rcPinProblems(text: string, releaseCommit: string): string[] {
+  const leftovers = leftoversIn(text, RC_LEFTOVERS)
+  const commits = [...new Set(text.match(COMMIT_RE) ?? [])].filter((commit) => commit !== releaseCommit)
+  return [...leftovers, ...commits.map((commit) => `a commit other than the release's: ${commit}`)]
+}
+
+/** Every file under `rel` (relative to the repo), recursively. */
+function filesUnder(rel: string): string[] {
+  return readdirSync(join(REPO, rel), { withFileTypes: true }).flatMap((e) => e.isDirectory() ? filesUnder(join(rel, e.name)) : [join(rel, e.name)])
+}
+
+/** The image files (docker/, its docs aside), the ci-live/lib modules and the skills (the repo's and the package's). */
+function rcAuditFiles(): string[] {
+  return [
+    ...filesUnder('docker').filter((f) => !f.endsWith('.md')),
+    ...filesUnder(join('ci-live', 'lib')),
+    ...filesUnder(join('.claude', 'skills')),
+    ...filesUnder('skills'),
+  ]
+}
+
+/** The integration tree (scenarios, their helpers and fixtures), audited for the old layout names only ({@link rcLayoutProblems}). */
+function rcLayoutAuditFiles(): string[] {
+  return filesUnder(join('tests', 'integration'))
+}
+
+describe('the /ci images (source audit)', () => {
+  const TAGGED = [join('docker', 'Dockerfile.test'), join('docker', 'Dockerfile.live'), BASE_DOCKERFILE, CI_SKILL, CI_LIVE_SKILL]
+
+  test.each(TAGGED)('every base-image tag %s names is BASE_IMAGE; a planted previous tag is refused', (rel) => {
+    expect(BASE_IMAGE).toMatch(/:v\d+$/)
+    const text = repoFile(rel)
+    expect(baseTagProblems(text)).toEqual([])
+    const previous = previousBaseTag()
+    expect(baseTagProblems(planted(text, BASE_IMAGE, previous))).toEqual([`names ${previous}, not ${BASE_IMAGE}`])
   })
 
   test.each([join('docker', 'Dockerfile.test'), join('docker', 'Dockerfile.live')])('%s is built FROM BASE_IMAGE and nothing else', (rel) => {
@@ -2023,80 +2355,113 @@ describe('the /ci images (source audit)', () => {
   })
 
   test("the /ci skill's BASE_TAG is BASE_IMAGE, and it builds docker/Dockerfile.test.base under that tag", () => {
-    const skill = repoFile(join('.claude', 'skills', 'ci', 'SKILL.md'))
+    const skill = repoFile(CI_SKILL)
     expect([...skill.matchAll(/^\s*BASE_TAG=(\S+)/gm)].map((m) => m[1])).toEqual([BASE_IMAGE])
     expect(skill).toContain('-f docker/Dockerfile.test.base -t "${BASE_TAG}" .')
   })
 
-  test("the base reads one file from the repo context, the client-under-test check (no other COPY or ADD, so no package.json), and its one install is the global client from the release candidate's tarball (none from the registry); the 0.10.0 legs are packed at exact versions", () => {
-    const { instructions, args } = baseImage()
-    expect(instructions.filter((i) => /^(COPY|ADD)\s/i.test(i))).toEqual([`COPY --chmod=0755 ${RC_CLIENT_CHECK_SOURCE} ${RC_CLIENT_CHECK}`])
-    expect(shellStatements(instructions).filter((s) => /\bnpm\s+(i|install|add)\b|\bbun\s+(add|install)\b|\s(-g|--global)\b/.test(s))).toEqual([
-      'bun add -g --ignore-scripts "${RC_CLIENT_TGZ}"',
-    ])
-    expect([args.AD_PREV_VERSION, args.CSCB_PREV_VERSION].map((v) => /^\d+\.\d+\.\d+$/.test(v ?? ''))).toEqual([true, true])
-    const pack = runWith(instructions, 'npm pack')
-    expect([pack.includes('"agent-director@${AD_PREV_VERSION}"'), pack.includes('"claude-slack-channel-bots@${CSCB_PREV_VERSION}"')]).toEqual([true, true])
-  })
-
-  test('the base binds only the agent-director-rc and agent-director-install contexts, each with a fallback stage of its name', () => {
-    const { instructions, mounts } = baseImage()
-    expect([...mounts.keys()]).toEqual(['agent-director-rc', 'agent-director-install'])
-    expect(instructions.filter((i) => /^FROM\s+\S+\s+AS\s+agent-director-(rc|install)$/i.test(i)).length).toBe(2)
-  })
-
-  test("the release candidate is read from its context and checked against SHA256SUMS and the pinned version and commit before its binary is installed, first on PATH in a directory of its own (not /usr/local/bin), which the build checks", () => {
-    const { instructions, args, mounts, path, rcBinDir } = baseImage()
-    const rc = runWith(instructions, 'from=agent-director-rc,')
-    const vars = shellVars(rc, args)
-    expect(vars.get('RC_CTX')).toBe(mounts.get('agent-director-rc')!)
-    expect(rc).toContain('"${RC_CTX}/SHA256SUMS"')
-    expect(args.AD_RC_VERSION).toMatch(/^\d+\.\d+\.\d+-rc\.\d+$/)
-    expect(args.AD_RC_COMMIT).toMatch(/^[0-9a-f]{40}$/)
-    const binary = installTarget(rc, 'agent-director-linux-amd64', vars)
-    const checks = [rc.indexOf('sha256sum -c'), rc.indexOf('!= "${AD_RC_VERSION}"'), rc.indexOf('!= "${AD_RC_COMMIT}"')]
-    expect(checks.map((at) => at >= 0 && at < binary.at)).toEqual([true, true, true])
-    expect([rcBinDir === '/usr/local/bin', path.includes('/usr/local/bin')]).toEqual([false, true])
-    expect(binary.target).toBe(join(rcBinDir, 'agent-director'))
-    expect(instructions.filter((i) => i.includes('/usr/local/bin/agent-director'))).toEqual([])
-    expect(rc.indexOf('command -v agent-director')).toBeGreaterThan(binary.at)
-  })
-
-  test("the pinned release candidate is a candidate of CSCB's Phase 1 floor: its major.minor.patch is PHASE1_FLOOR_VERSION, and it passes the floor (b.jg5 SRJ-201, SRJ-202)", () => {
-    const rc = semver.parse(baseImage().args.AD_RC_VERSION ?? '')
-    expect(rc).not.toBeNull()
-    expect(rc!.prerelease.length).toBeGreaterThan(0)
-    expect(`${rc!.major}.${rc!.minor}.${rc!.patch}`).toBe(PHASE1_FLOOR_VERSION)
-    expect(meetsPhase1Floor(rc!.version)).toBe(true)
-  })
-
-  test('install.sh is read from its context and checked against the pinned SHA-256 before it is installed off PATH', () => {
-    const { instructions, args, mounts, path } = baseImage()
-    expect(args.AD_INSTALL_SH_SHA256).toMatch(/^[0-9a-f]{64}$/)
-    const run = runWith(instructions, 'from=agent-director-install,')
-    const vars = shellVars(run, args)
-    expect(vars.get('INSTALL_CTX')).toBe(mounts.get('agent-director-install')!)
-    expect(run).toContain('"${INSTALL_CTX}/install.sh"')
-    const script = installTarget(run, 'install.sh', vars)
-    const check = run.indexOf('!= "${AD_INSTALL_SH_SHA256}"')
-    expect(check >= 0 && check < script.at).toBe(true)
-    expect([script.target.startsWith('/'), path.includes(dirname(script.target))]).toEqual([true, false])
-  })
-
-  test("the /ci skill extracts install.sh at the commit it reads from the base's ARG AD_INSTALL_SH_COMMIT, and types no commit of its own", () => {
-    const skill = repoFile(join('.claude', 'skills', 'ci', 'SKILL.md'))
+  test("the base's layout: the release (CSCB's Phase 1 floor and package.json's pin, a plain release) installed by its own install.sh --from-release with pinned SHA-256s, its binary alone first on PATH and checked, agent-director-admin off PATH, the global client from npm at the pin checked by the client check, and nothing else from the repo or a context (b.jg5 SRJ-201, SRJ-1306)", () => {
     const { args } = baseImage()
-    expect(args.AD_INSTALL_SH_COMMIT).toMatch(/^[0-9a-f]{40}$/)
-    // What the skill's `sed -n 's/^ARG AD_INSTALL_SH_COMMIT=//p'` prints: that ARG's default, once.
-    const sedOutput = repoFile(BASE_DOCKERFILE).split('\n').flatMap((l) => l.startsWith('ARG AD_INSTALL_SH_COMMIT=') ? [l.slice('ARG AD_INSTALL_SH_COMMIT='.length)] : [])
-    expect(sedOutput).toEqual([args.AD_INSTALL_SH_COMMIT!])
-    expect([...skill.matchAll(/^\s*AD_INSTALL_SH_COMMIT=(.*)$/gm)].map((m) => m[1])).toEqual([
-      `"$(sed -n 's/^ARG AD_INSTALL_SH_COMMIT=//p' ${BASE_DOCKERFILE})"`,
+    expect(args.AD_VERSION).toBe(PHASE1_FLOOR_VERSION)
+    expect(packageAdPin()).toBe(PHASE1_FLOOR_VERSION)
+    expect(baseLayoutProblems(repoFile(BASE_DOCKERFILE))).toEqual([])
+  })
+
+  // Each row plants one change in the real base text; the audit must name it.
+  test.each<[string, (text: string) => string, string]>([
+    ['the release-candidate context back', (t) => planted(planted(t, `FROM ubuntu:22.04 AS ${INSTALL_CONTEXT}`, `FROM ubuntu:22.04 AS agent-director-rc\nFROM ubuntu:22.04 AS ${INSTALL_CONTEXT}`), `--mount=type=bind,from=${INSTALL_CONTEXT},`, `--mount=type=bind,from=agent-director-rc,target=/mnt/agent-director-rc \\\n    --mount=type=bind,from=${INSTALL_CONTEXT},`), 'the named contexts are ["agent-director-rc","agent-director-install"]'],
+    ['a SHA256SUMS check', (t) => planted(t, '    STAGE=$(mktemp -d); \\', '    sha256sum -c "${INSTALL_CTX}/SHA256SUMS"; \\\n    STAGE=$(mktemp -d); \\'), 'a SHA256SUMS is read'],
+    ["a release candidate's version pin", (t) => planted(t, /^ARG AD_VERSION=\S+$/m, `ARG AD_VERSION=${PHASE1_RC_VERSION}`), `AD_VERSION ${PHASE1_RC_VERSION} is not a plain major.minor.patch release`],
+    ['a pin that is not the floor or package.json\'s', (t) => planted(t, /^ARG AD_VERSION=\S+$/m, `ARG AD_VERSION=${OLD_AD_VERSION}`), `AD_VERSION ${OLD_AD_VERSION} is not the Phase 1 floor`],
+    ['install.sh unchecked', (t) => planted(t, '!= "${AD_INSTALL_SH_SHA256}"', '= ""'), 'install.sh is not checked against AD_INSTALL_SH_SHA256'],
+    ['install.sh run without its pinned SHA-256s', (t) => planted(t, ' --sha256 "${AD_SHA256}" --admin-sha256 "${AD_ADMIN_SHA256}"', ''), 'install.sh --from-release runs without --sha256 "${AD_SHA256}", --admin-sha256 "${AD_ADMIN_SHA256}"'],
+    ['the binary SHA-256 check dropped', (t) => planted(t, '"${BIN_SHA256}" != "${AD_SHA256}"', '-z "${BIN_SHA256}"'), 'the installed binary is not checked against AD_SHA256'],
+    ['the version check dropped', (t) => planted(t, '"${REPORTED_VERSION}" != "${AD_VERSION}"', '-z "${REPORTED_VERSION}"'), 'the installed binary is not checked against AD_VERSION'],
+    ['the commit check dropped', (t) => planted(t, '"${REPORTED_COMMIT}" != "${AD_COMMIT}"', '-z "${REPORTED_COMMIT}"'), 'the installed binary is not checked against AD_COMMIT'],
+    ['the binary in /usr/local/bin', (t) => planted(t, 'AD_BIN_DIR="${AD_ROOT}/bin"', 'AD_BIN_DIR=/usr/local/bin'), "the release's binary goes to /usr/local/bin/agent-director"],
+    ['agent-director-admin installed beside the binary', (t) => planted(t, 'AD_ADMIN_DIR="${AD_ROOT}/admin"', 'AD_ADMIN_DIR="${AD_BIN_DIR}"'), 'agent-director-admin is installed on PATH'],
+    ["agent-director-admin's directory on PATH", (t) => planted(t, /^ENV PATH=(\S+)$/m, 'ENV PATH=$1:/opt/agent-director/admin'), 'agent-director-admin is installed on PATH'],
+    ['agent-director-admin linked onto PATH', (t) => planted(t, '    chmod -R a+rX "${AD_ROOT}"; \\', '    ln -s "${AD_ADMIN}" /usr/local/bin/agent-director-admin; \\\n    chmod -R a+rX "${AD_ROOT}"; \\'), 'agent-director-admin is put on PATH by'],
+    ["the build's agent-director-admin PATH check dropped", (t) => planted(t, 'if command -v agent-director-admin >/dev/null 2>&1; then', 'if false; then'), 'the build does not check that no agent-director-admin is on PATH'],
+    ['agent-director-admin left 0700', (t) => planted(t, '    chmod 0755 "${AD_ADMIN_DIR}" "${AD_ADMIN}"; \\', '    chmod 0755 "${AD_ADMIN_DIR}" "${AD_ADMIN}"; \\\n    chmod 0700 "${AD_ADMIN}"; \\'), 'agent-director-admin is left mode 0700, not 0755'],
+    ["agent-director-admin's directory left 0700", (t) => planted(t, '    chmod 0755 "${AD_ADMIN_DIR}" "${AD_ADMIN}"; \\', '    chmod 0755 "${AD_ADMIN_DIR}" "${AD_ADMIN}"; \\\n    chmod 0700 "${AD_ADMIN_DIR}"; \\'), "agent-director-admin's directory is left mode 0700, not 0755"],
+    ['the global client from a tarball, not npm', (t) => planted(t, GLOBAL_CLIENT_INSTALL, 'bun add -g --ignore-scripts "${CLIENT_TGZ}"'), 'the package installs are'],
+    ['a swap of the global client', (t) => planted(t, '    "${AD_CHECK}" --client "${GLOBAL_CLIENT}"', '    tar -xzf "${CLIENT_TGZ}" -C "${GLOBAL_CLIENT}" --strip-components=1; \\\n    "${AD_CHECK}" --client "${GLOBAL_CLIENT}"'), 'files are written into the global client'],
+    ['the global client losing its check', (t) => planted(t, '    "${AD_CHECK}" --client "${GLOBAL_CLIENT}"', '    ls "${GLOBAL_CLIENT}"'), "0 RUNs run the client check's --client, not one"],
+    ['the client tarball unchecked', (t) => planted(t, '!= "${AD_CLIENT_TGZ_SHA256}"', '= ""'), 'the npm client tarball is not checked against AD_CLIENT_TGZ_SHA256'],
+  ])('a base with %s is refused', (_name, mutate, problem) => {
+    const problems = baseLayoutProblems(mutate(repoFile(BASE_DOCKERFILE)))
+    expect(problems.filter((p) => p.includes(problem)).length).toBeGreaterThan(0)
+  })
+
+  test("the /ci skill extracts install.sh at the release tag it reads from the base's ARG AD_VERSION, passes only that context, fetches nothing and types no commit; a planted release-candidate context, typed commit or fetch is refused", () => {
+    const skill = repoFile(CI_SKILL)
+    // What the skill's `sed -n 's/^ARG AD_VERSION=//p'` prints: that ARG's default, once.
+    const sedOutput = repoFile(BASE_DOCKERFILE).split('\n').flatMap((l) => l.startsWith('ARG AD_VERSION=') ? [l.slice('ARG AD_VERSION='.length)] : [])
+    expect(sedOutput).toEqual([baseImage().args.AD_VERSION!])
+    expect(ciSkillProblems(skill)).toEqual([])
+
+    const context = `--build-context ${INSTALL_CONTEXT}=`
+    expect(ciSkillProblems(planted(skill, context, `--build-context agent-director-rc="\${CSCB_AD_RC_DIR}" \\\n       ${context}`))).toEqual(['the build contexts are ["agent-director-rc","agent-director-install"], not only agent-director-install'])
+    const commit = baseImage().args.AD_COMMIT!
+    expect(ciSkillProblems(planted(skill, /"\$\{AD_TAG\}:skills\//g, `"${commit}:skills/`))).toEqual([
+      `install.sh is extracted with ["${commit}:skills/install-agent-director/install.sh"], not at the release tag`,
+      `it types the commit(s) ${commit}`,
     ])
-    expect([...skill.matchAll(/\bgit -C "\$\{CSCB_AD_SRC_DIR\}" show "([^"]*)"/g)].map((m) => m[1])).toEqual([
-      '${AD_INSTALL_SH_COMMIT}:skills/install-agent-director/install.sh',
+    expect(ciSkillProblems(planted(skill, /^(\s*)(AD_INSTALL_CTX="\$\(mktemp)/m, '$1git -C "${CSCB_AD_SRC_DIR}" fetch --tags\n$1$2'))).toEqual([
+      'it fetches into agent-director\'s tree: ["git -C \\"${CSCB_AD_SRC_DIR}\\" fetch --tags"]',
     ])
-    expect(skill.match(/\b[0-9a-f]{40}\b/g) ?? []).toEqual([])
+  })
+
+  test("the /ci-live skill downloads the release's linux-amd64 asset into a scratch directory, checks it against the base's AD_SHA256, never runs it, and stages it in both runs; a planted run of it or a release-candidate binary is refused (b.jg5 SRJ-1301)", () => {
+    const skill = repoFile(CI_LIVE_SKILL)
+    expect(ciLiveSkillProblems(skill)).toEqual([])
+    expect(ciLiveSkillProblems(planted(skill, '       chmod 0755 "${AD_BIN}"', '       chmod 0755 "${AD_BIN}"\n       "${AD_BIN}" version'))).toEqual([
+      'the binary is used beyond its download, check and execute bit: ["\\"${AD_BIN}\\" version"]',
+    ])
+    expect(ciLiveSkillProblems(planted(skill, `--dry-run ${AGENT_DIRECTOR_BINARY_OPTION} <AD_BIN>`, `--dry-run ${AGENT_DIRECTOR_BINARY_OPTION} "\${CSCB_AD_RC_DIR}/agent-director-linux-amd64"`))[0]).toContain('not the downloaded <AD_BIN>')
+  })
+
+  test("no image file, ci-live/lib module or skill pins a release candidate: no release-candidate version, context, directory variable, SHA256SUMS, swap helper or pin, and no commit but the release's AD_COMMIT", () => {
+    const files = rcAuditFiles()
+    for (const rel of [BASE_DOCKERFILE, LIVE_DOCKERFILE, AD_CLIENT_CHECK_SOURCE, join('ci-live', 'lib', 'docker.ts'), CI_SKILL, CI_LIVE_SKILL, DEBUG_SKILL_PATH]) expect(files).toContain(rel)
+    const commit = baseImage().args.AD_COMMIT!
+    expect(files.flatMap((rel) => rcPinProblems(repoFile(rel), commit).map((p) => `${rel}: ${p}`))).toEqual([])
+  })
+
+  /** Another commit, derived from the release's. */
+  const otherCommit = (commit: string): string => [...commit].reverse().join('')
+
+  // Each row: a line planted in the real base text (given the release's commit), and what the audit reports.
+  test.each<[string, (commit: string) => string, (commit: string) => string[]]>([
+    ["a release candidate's version", () => `ARG AD_VERSION=${PHASE1_RC_VERSION}`, () => [`a release-candidate version: ${PHASE1_RC_VERSION}`]],
+    ["a commit other than the release's", (c) => `ARG AD_COMMIT=${otherCommit(c)}`, (c) => [`a commit other than the release's: ${otherCommit(c)}`]],
+    ["the release candidate's build context", () => '--build-context agent-director-rc="${CSCB_AD_RC_DIR}"', () => ["the release candidate's build context or directory: agent-director-rc", "the release candidate's directory variable: CSCB_AD_RC_DIR"]],
+    ['a SHA256SUMS check', () => 'sha256sum -c SHA256SUMS', () => ['a SHA256SUMS file: SHA256SUMS']],
+    ['the swap helper', () => 'COPY docker/rc-client-check.sh /opt/check.sh', () => ['the swap helper: rc-client']],
+    ['a release-candidate pin', () => 'ARG AD_RC_COMMIT=x', () => ['a release-candidate pin: AD_RC_COMMIT']],
+    ["the SRD's release-candidate-counts wording (excepted)", () => `# any ${PHASE1_FLOOR_VERSION}-rc.N counts as ${PHASE1_FLOOR_VERSION} (release candidates included)`, () => []],
+  ])('a planted %s in an image file is reported', (_name, line, expected) => {
+    const commit = baseImage().args.AD_COMMIT!
+    expect(rcPinProblems(`${repoFile(BASE_DOCKERFILE)}\n${line(commit)}\n`, commit)).toEqual(expected(commit))
+  })
+
+  test("no file in the integration tree names the release candidate's old layout: no build context or directory, directory variable, SHA256SUMS, swap helper or pin", () => {
+    const files = rcLayoutAuditFiles()
+    expect(files).toContain(TEST_1)
+    expect(files.flatMap((rel) => rcLayoutProblems(repoFile(rel)).map((p) => `${rel}: ${p}`))).toEqual([])
+  })
+
+  // Each row: a line planted in the real test-1 scenario, and what the integration-tree audit reports.
+  test.each<[string, () => string, string[]]>([
+    ["the release candidate's directory variable", () => 'AD_SRC="${CSCB_AD_RC_DIR}/agent-director-linux-amd64"', ["the release candidate's directory variable: CSCB_AD_RC_DIR"]],
+    ["the release candidate's directory", () => 'AD_BIN=/opt/agent-director-rc/bin/agent-director', ["the release candidate's build context or directory: agent-director-rc"]],
+    ['a SHA256SUMS check', () => 'sha256sum -c SHA256SUMS', ['a SHA256SUMS file: SHA256SUMS']],
+    ['the swap helper', () => 'RC_CHECK=/opt/check/rc-client-check.sh', ['the swap helper: rc-client']],
+    ['a release-candidate pin', () => 'echo "${AD_RC_VERSION}"', ['a release-candidate pin: AD_RC_VERSION']],
+    ["a scenario's release-candidate version stand-in (allowed)", () => `STANDIN_VERSION="${PHASE1_FLOOR_VERSION}-rc.3"`, []],
+  ])('a planted %s in an integration scenario is judged by the integration-tree audit', (_name, line, expected) => {
+    expect(rcLayoutProblems(`${repoFile(TEST_1)}\n${line()}\n`)).toEqual(expected)
   })
 
   test('the 0.10.0 binary is fetched for its pinned release into a directory off PATH', () => {
@@ -2110,6 +2475,13 @@ describe('the /ci images (source audit)', () => {
     expect(path).not.toContain(dirname(target))
   })
 
+  test('the 0.10.0 legs are packed at exact versions', () => {
+    const { instructions, args } = baseImage()
+    expect([args.AD_PREV_VERSION, args.CSCB_PREV_VERSION].map((v) => /^\d+\.\d+\.\d+$/.test(v ?? ''))).toEqual([true, true])
+    const pack = runWith(instructions, 'npm pack')
+    expect([pack.includes('"agent-director@${AD_PREV_VERSION}"'), pack.includes('"claude-slack-channel-bots@${CSCB_PREV_VERSION}"')]).toEqual([true, true])
+  })
+
   test('the base installs sqlite3 and file with apt and writes the marker /etc/cscb-ci-image', () => {
     const { instructions } = baseImage()
     const packages = instructions.flatMap((i) => [...i.matchAll(/apt-get install -y((?:\s+[a-z0-9][\w.+-]*)+)/g)].flatMap((m) => m[1]!.trim().split(/\s+/)))
@@ -2117,83 +2489,143 @@ describe('the /ci images (source audit)', () => {
     expect(instructions.filter((i) => /^RUN\s.*>\s*\/etc\/cscb-ci-image(\s|$)/.test(i)).length).toBe(1)
   })
 
-  test("Dockerfile.live copies the staged binary over the base's release-candidate binary and checks that it is the first agent-director on PATH", () => {
-    const bin = join(baseImage().rcBinDir, 'agent-director')
-    const live = dockerInstructions(join('docker', 'Dockerfile.live'))
+  test("Dockerfile.live copies the staged binary over the base's default binary and checks that it is the first agent-director on PATH", () => {
+    const bin = join(baseImage().binDir, 'agent-director')
+    const live = dockerInstructions(LIVE_DOCKERFILE)
     expect(live.filter((i) => i.startsWith('COPY --from=agent-director-bin '))).toEqual([`COPY --from=agent-director-bin agent-director ${bin}`])
     expect(runWith(live, 'command -v agent-director')).toContain(`if [ "$(command -v agent-director)" != ${bin} ]`)
     expect(live.filter((i) => i.includes('/usr/local/bin/agent-director'))).toEqual([])
   })
 
-  test.each(['cscb-live-helpers.sh', 'cscb-live-preflight.sh', 'entrypoint.sh'])("docker/live/%s's PATH lines start with the base's release-candidate directory", (file) => {
-    const { rcBinDir } = baseImage()
+  test.each(['cscb-live-helpers.sh', 'cscb-live-preflight.sh', 'entrypoint.sh'])("docker/live/%s's PATH lines start with the base's default binary directory", (file) => {
+    const { binDir } = baseImage()
     const firsts = [...repoFile(join('docker', 'live', file)).matchAll(/^\s*export PATH="([^"]*)"/gm)].map((m) => m[1]!.split(':')[0])
     expect(firsts.length).toBeGreaterThan(0)
-    expect(firsts.filter((dir) => dir !== rcBinDir)).toEqual([])
+    expect(firsts.filter((dir) => dir !== binDir)).toEqual([])
   })
 })
 
 // ---------------------------------------------------------------------------
-// The client under test (source audit of the base, Dockerfile.live and test-1)
+// The client under test (source audit of the check, Dockerfile.live and test-1)
 // ---------------------------------------------------------------------------
 
 const LIVE_DOCKERFILE = join('docker', 'Dockerfile.live')
 const TEST_1 = join('tests', 'integration', 'test-1-install-startup.sh')
 
-const escapeRegExp = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+/**
+ * What in a client-check script text writes outside its own scratch
+ * directory: a file-writing statement (cp, mv, rm, tar, ln, rsync, install,
+ * unzip) or `mkdir` that does not work in `${SCRATCH}` or names the client or
+ * the package, a redirection to a file outside `${SCRATCH}` (or /dev/null),
+ * or a package manager's install. Empty for a check that changes nothing.
+ */
+function checkOnlyProblems(text: string): string[] {
+  const lines = text.split('\n').filter((l) => !l.trimStart().startsWith('#'))
+  const statements = shellStatements(instructionsOf(lines.join('\n')))
+  const writes = statements.filter((s) => (FILE_WRITE.test(s) || /^mkdir\s/.test(s)) && (!s.includes('${SCRATCH}') || /\$\{(CLIENT_DIR|TARGET|ENTRY)\}|node_modules/.test(s)))
+  const redirects = lines.filter((l) => !l.includes('((')).flatMap((l) => [...l.matchAll(/(?:^|[\s)])\d?>>?\s*(?!&)("[^"]*"|[^\s;|&)]+)/g)].map((m) => m[1]!))
+    .filter((target) => !target.startsWith('"${SCRATCH}/') && target !== '/dev/null')
+  const managers = statements.filter((s) => PACKAGE_MANAGER_RUN.test(s))
+  return [
+    ...writes.map((s) => `writes files: ${s}`),
+    ...redirects.map((target) => `redirects into ${target}`),
+    ...managers.map((s) => `runs a package manager: ${s}`),
+  ]
+}
 
-/** The base's RUN that installs and checks its global client: the RUN, its position, its plain assignments and its statements. */
-function baseGlobalClientRun() {
-  const { instructions, args } = baseImage()
-  const run = runWith(instructions, ' --client ')
-  return { instructions, args, run, at: instructions.indexOf(run), vars: shellVars(run, args), statements: shellStatements([run]) }
+/**
+ * What is wrong with a Dockerfile.live text's client check: empty when it
+ * reads no package.json, its one package install is Claude Code's (no
+ * agent-director), and after staging its binary and checking it is first on
+ * PATH it runs `AD_CLIENT_CHECK --client` once, on the base's global client,
+ * stopping the build when it fails, and writes nothing into a client (no swap).
+ */
+function liveClientCheckProblems(text: string): string[] {
+  const problems: string[] = []
+  const live = instructionsOf(text)
+  if (live.some((i) => i.includes('package.json'))) problems.push('it reads a package.json')
+  const installs = shellStatements(live).filter((s) => /\b(npm|npx|bunx?|pnpm|yarn)\s/.test(s) || s.includes('agent-director@'))
+  if (JSON.stringify(installs) !== JSON.stringify([PINNED_CLAUDE_CODE_INSTALL])) problems.push(`the package installs are ${JSON.stringify(installs)}, not only Claude Code's`)
+  const runs = runsWith(live, 'command -v agent-director')
+  if (runs.length !== 1) return [...problems, `${runs.length} RUNs check the staged binary, not one`]
+  const run = runs[0]!
+  if (live.indexOf(run) < live.findIndex((i) => i.startsWith('COPY --from=agent-director-bin '))) problems.push('the check runs before the binary is staged')
+  const statements = shellStatements([run])
+  const checkRe = new RegExp(`^if ! "?${escapeRegExp(AD_CLIENT_CHECK)}"? --client "?([^\\s"]+)"?$`)
+  const checks = statements.flatMap((s, i) => checkRe.test(s) ? [i] : [])
+  if (checks.length !== 1) problems.push(`${checks.length} runs of ${AD_CLIENT_CHECK} --client, not one`)
+  else {
+    const at = checks[0]!
+    if (checkRe.exec(statements[at]!)![1] !== GLOBAL_CLIENT_DIR) problems.push(`the check runs on ${checkRe.exec(statements[at]!)![1]}, not the base's global client`)
+    if (at < statements.findIndex((s) => s.includes('command -v agent-director'))) problems.push('the check runs before the staged binary is found first on PATH')
+    if (ifBody(statements, at).filter((s) => s.depth === 0).at(-1)?.text !== 'exit 1') problems.push('a failed check does not stop the build')
+  }
+  const swaps = swapStatements(statements, /node_modules|agent-director\/client/)
+  if (swaps.length > 0) problems.push(`files are written into a client: ${JSON.stringify(swaps)}`)
+  return problems
+}
+
+/**
+ * What is wrong with a test-1 text's client check: empty when, directly after
+ * `bun install /tmp/package.tgz` in /test-repo, it runs `AD_CLIENT_CHECK
+ * --package` on the installed package (only plain assignments between) and
+ * fails the test when the check fails; its one package install is the
+ * package's; and nothing writes into node_modules (no swap).
+ */
+function test1ClientCheckProblems(text: string): string[] {
+  const problems: string[] = []
+  const lines = instructionsOf(text)
+  const install = lines.findIndex((l) => /^bun install \/tmp\/package\.tgz\s/.test(l))
+  if (install < 0) return ['no bun install /tmp/package.tgz']
+  const repoDir = lines.slice(0, install).flatMap((l) => /^cd (\/\S+)$/.exec(l)?.[1] ?? []).at(-1)
+  if (repoDir !== '/test-repo') problems.push(`the package is installed in ${repoDir}, not /test-repo`)
+  const vars = new Map<string, string>()
+  let at = install + 1
+  for (let m; (m = /^([A-Z_][A-Z0-9_]*)=([^\s$"'`;()]+)$/.exec(lines[at] ?? '')); at++) vars.set(m[1]!, m[2]!)
+  const call = /^if ! (?:\w+=\$\()?"?([^\s"]+)"? --package "?([^\s")]+)"?[\s)].*; then$/.exec(lines[at] ?? '')
+  const pkgName = JSON.parse(repoFile('package.json')).name as string
+  if (call === null || expand(call[1]!, vars) !== AD_CLIENT_CHECK || expand(call[2]!, vars) !== join(repoDir ?? '', 'node_modules', pkgName)) {
+    problems.push(`directly after the install, ${JSON.stringify(lines[at])} is not ${AD_CLIENT_CHECK} --package on the installed package`)
+  } else if (lines.slice(at + 1, lines.indexOf('fi', at)).filter((l) => /^fail\s/.test(l)).length !== 1) {
+    problems.push('a failed check does not fail the test')
+  }
+  const statements = shellStatements(lines)
+  const installs = statements.filter((s) => PACKAGE_MANAGER_RUN.test(s))
+  if (JSON.stringify(installs) !== JSON.stringify(['bun install /tmp/package.tgz'])) problems.push(`the package installs are ${JSON.stringify(installs)}, not only the package's`)
+  const swaps = swapStatements(statements, /node_modules|agent-director/)
+  if (swaps.length > 0) problems.push(`files are written into the installed package: ${JSON.stringify(swaps)}`)
+  return problems
 }
 
 describe('the client under test (source audit)', () => {
-  test("the base copies the check from RC_CLIENT_CHECK_SOURCE to RC_CLIENT_CHECK, then installs its global client from the tarball path the release record holds and runs the check's --client on it", () => {
-    const { instructions, args, run, at, vars, statements } = baseGlobalClientRun()
-    const copy = instructions.indexOf(`COPY --chmod=0755 ${RC_CLIENT_CHECK_SOURCE} ${RC_CLIENT_CHECK}`)
-    expect([copy >= 0, copy < at]).toEqual([true, true])
-    expect(statSync(join(REPO, RC_CLIENT_CHECK_SOURCE)).isFile()).toBe(true)
-
-    // The release record the release candidate's RUN writes holds the client tarball's fixed path.
-    const rc = runWith(instructions, 'from=agent-director-rc,')
-    const rcVars = shellVars(rc, args)
-    const record = expand(/>\s*"?([^\s";]*\/release\.json)"?/.exec(rc)![1]!, rcVars)
-    expect(rc).toContain('--arg client_tarball "${RC_CLIENT_TGZ}"')
-    expect(rcVars.get('RC_CLIENT_TGZ')).toMatch(/^\/[^$]*\.tgz$/)
-    expect(instructions.indexOf(rc)).toBeLessThan(at)
-
-    // The global client: read from that record, installed from that path, then checked under set -e.
-    expect(run).toMatch(/^RUN set -[a-z]*e[a-z]*;/)
-    expect(/(?:^|;)\s*RC_CLIENT_TGZ=\$\(jq -er '\.client_tarball \| strings' (\S+)\)/.exec(run)?.[1]).toBe(record)
-    expect(vars.get('RC_CHECK')).toBe(RC_CLIENT_CHECK)
-    expect(vars.get('GLOBAL_CLIENT')).toBe('/root/.bun/install/global/node_modules/agent-director')
-    const install = statements.indexOf('bun add -g --ignore-scripts "${RC_CLIENT_TGZ}"')
-    const check = statements.indexOf('"${RC_CHECK}" --client "${GLOBAL_CLIENT}"')
-    expect([install >= 0, check > install]).toEqual([true, true])
+  test('the client check changes nothing: it writes only in its own scratch directory and runs no package manager; a planted copy over the client, removal or write into it is reported', () => {
+    expect(statSync(join(REPO, AD_CLIENT_CHECK_SOURCE)).isFile()).toBe(true)
+    const script = repoFile(AD_CLIENT_CHECK_SOURCE)
+    expect(checkOnlyProblems(script)).toEqual([])
+    const before = '# --- 4 exports'
+    expect(checkOnlyProblems(planted(script, before, `cp -a "\${SCRATCH}/tarball/." "\${CLIENT_DIR}/"\n${before}`))).toEqual(['writes files: cp -a "${SCRATCH}/tarball/." "${CLIENT_DIR}/"'])
+    expect(checkOnlyProblems(planted(script, before, `rm -rf "\${CLIENT_DIR}"\n${before}`))).toEqual(['writes files: rm -rf "${CLIENT_DIR}"'])
+    expect(checkOnlyProblems(planted(script, before, `jq . "\${AD_TGZ}" > "\${CLIENT_DIR}/package.json"\n${before}`))).toEqual(['redirects into "${CLIENT_DIR}/package.json"'])
+    expect(checkOnlyProblems(planted(script, before, `bun add "agent-director@\${AD_VERSION}"\n${before}`))).toEqual(['runs a package manager: bun add "agent-director@${AD_VERSION}"'])
   })
 
-  test("Dockerfile.live copies no package.json, installs no agent-director (its one package install is Claude Code's), and after staging its binary runs RC_CLIENT_CHECK --client on the base's global client, stopping the build when it fails", () => {
-    const live = dockerInstructions(LIVE_DOCKERFILE)
-    expect(live.filter((i) => i.includes('package.json'))).toEqual([])
-    expect(shellStatements(live).filter((s) => /\b(npm|npx|bunx?|pnpm|yarn)\s/.test(s) || s.includes('agent-director@'))).toEqual([
-      'npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"',
-    ])
-
-    const run = runWith(live, 'command -v agent-director')
-    expect(live.indexOf(run)).toBeGreaterThan(live.findIndex((i) => i.startsWith('COPY --from=agent-director-bin ')))
-    const statements = shellStatements([run])
-    const checkRe = new RegExp(`^if ! "?${escapeRegExp(RC_CLIENT_CHECK)}"? --client "?([^\\s"]+)"?$`)
-    const checks = statements.flatMap((s, i) => checkRe.test(s) ? [i] : [])
-    expect(checks.length).toBe(1)
-    expect(checkRe.exec(statements[checks[0]!]!)![1]).toBe(baseGlobalClientRun().vars.get('GLOBAL_CLIENT')!)
-    expect(checks[0]!).toBeGreaterThan(statements.findIndex((s) => s.includes('command -v agent-director')))
-    expect(ifBody(statements, checks[0]!).filter((s) => s.depth === 0).at(-1)?.text).toBe('exit 1')
+  test("Dockerfile.live copies no package.json, installs no agent-director (its one package install is Claude Code's), and after staging its binary runs AD_CLIENT_CHECK --client on the base's global client, stopping the build when it fails", () => {
+    expect(liveClientCheckProblems(repoFile(LIVE_DOCKERFILE))).toEqual([])
   })
 
-  test("Dockerfile.live's failed-check line names --agent-director-binary only for the check's step 3 (binary), routing each ERROR line the check can print", () => {
-    const run = runWith(dockerInstructions(LIVE_DOCKERFILE), 'command -v agent-director')
+  test.each<[string, (text: string) => string, string]>([
+    ['its client check gone', (t) => planted(t, `${AD_CLIENT_CHECK} --client`, '/bin/true --client'), `0 runs of ${AD_CLIENT_CHECK} --client, not one`],
+    ['a swap before its check', (t) => planted(t, `    if ! ${AD_CLIENT_CHECK} --client`, `    cp -a /opt/agent-director/client/agent-director/. ${GLOBAL_CLIENT_DIR}/; \\\n    if ! ${AD_CLIENT_CHECK} --client`), 'files are written into a client'],
+    ['an agent-director install', (t) => planted(t, `    ${PINNED_CLAUDE_CODE_INSTALL}; \\`, `    bun add -g "agent-director@${PHASE1_RC_VERSION}"; \\\n    ${PINNED_CLAUDE_CODE_INSTALL}; \\`), 'the package installs are'],
+    ['a failed check that does not stop the build', (t) => planted(t, /(fi; \\\n {8})exit 1; \\\n(\s+fi; \\\n\s+rm -f)/, '$1true; \\\n$2'), 'a failed check does not stop the build'],
+  ])('a Dockerfile.live with %s is refused', (_name, mutate, problem) => {
+    const problems = liveClientCheckProblems(mutate(repoFile(LIVE_DOCKERFILE)))
+    expect(problems.filter((p) => p.includes(problem)).length).toBeGreaterThan(0)
+  })
+
+  /** The check's ERROR lines (one per step, its refusal and a usage error) that Dockerfile.live `text` routes to a line naming --agent-director-binary. */
+  function routedToOption(text: string): string[] {
+    const run = runWith(instructionsOf(text), 'command -v agent-director')
     const echoed = '"((?:[^"\\\\]|\\\\.)*)"'
     const routes = [...run.matchAll(new RegExp(`\\b(?:if|elif)\\s+grep\\s+-qE\\s+'([^']*)'\\s+\\S+;\\s*then\\s+echo\\s+${echoed}`, 'g'))].map((m) => ({ re: new RegExp(m[1]!), text: m[2]! }))
     const fallback = new RegExp(`\\belse\\s+echo\\s+${echoed}`).exec(run)?.[1]
@@ -2202,49 +2634,50 @@ describe('the client under test (source audit)', () => {
     const lineFor = (error: string) => routes.find((r) => r.re.test(error))?.text ?? fallback!
 
     // Every step the check fails at, in the check's own ERROR shape, plus its usage and refusal lines.
-    const script = repoFile(RC_CLIENT_CHECK_SOURCE).split('\n').filter((l) => !l.trimStart().startsWith('#')).join('\n')
+    const script = repoFile(AD_CLIENT_CHECK_SOURCE).split('\n').filter((l) => !l.trimStart().startsWith('#')).join('\n')
+    const prefix = /\becho "(ERROR: [^"$]+) \$1: \$2"/.exec(script)?.[1]
+    expect(prefix).toBeDefined()
     const steps = [...new Set([...script.matchAll(/\bfail (?:'([^']+)'|(\w+))\s/g)].map((m) => m[1] ?? m[2]!))]
-    expect(steps).toContain('3 (binary)')
-    expect(steps).toContain('4 (floor)')
+    expect(steps).toEqual(expect.arrayContaining(['5 (binary)', '6 (floor)', '7 (client-create)']))
+    const name = basename(AD_CLIENT_CHECK)
     const errors = [
-      ...steps.map((step) => `ERROR: rc-client check ${step}: what differs`),
-      'ERROR: rc-client-check.sh: /etc/cscb-ci-image is absent: this check runs only in a cscb-ci image (it runs agent-director); refusing to run',
-      'ERROR: rc-client-check.sh: unknown mode --x (usage: rc-client-check.sh --package <dir> | --client <dir>)',
+      ...steps.map((step) => `${prefix} ${step}: what differs`),
+      `ERROR: ${name}: /etc/cscb-ci-image is absent: this check runs only in a cscb-ci image (it runs agent-director); refusing to run`,
+      `ERROR: ${name}: unknown mode --x (usage: ${name} --package <dir> | --client <dir>)`,
     ]
-    expect(errors.filter((e) => lineFor(e).includes('--agent-director-binary'))).toEqual(['ERROR: rc-client check 3 (binary): what differs'])
+    return errors.filter((e) => lineFor(e).includes(AGENT_DIRECTOR_BINARY_OPTION))
+  }
+
+  test("Dockerfile.live's failed-check line names --agent-director-binary only for the check's step 5 (binary), routing each ERROR line the check can print; a route that sends the floor step there is refused", () => {
+    const text = repoFile(LIVE_DOCKERFILE)
+    const binaryOnly = routedToOption(text)
+    expect(binaryOnly.length).toBe(1)
+    expect(binaryOnly[0]).toMatch(/ 5 \(binary\): what differs$/)
+    expect(routedToOption(planted(text, /check 5 '/, "check [56] '")).length).toBe(2)
   })
 
-  test("test-1 runs RC_CLIENT_CHECK --package on the package it installed into /test-repo, directly after the install, and fails the test when the check fails", () => {
-    const lines = dockerInstructions(TEST_1)
-    const install = lines.findIndex((l) => /^bun install \/tmp\/package\.tgz\s/.test(l))
-    expect(install).toBeGreaterThan(0)
-    const repoDir = lines.slice(0, install).flatMap((l) => /^cd (\/\S+)$/.exec(l)?.[1] ?? []).at(-1)
-    expect(repoDir).toBe('/test-repo')
-
-    // Directly after: plain assignments only, then the check.
-    const vars = new Map<string, string>()
-    let at = install + 1
-    for (let m; (m = /^([A-Z_][A-Z0-9_]*)=([^\s$"'`;()]+)$/.exec(lines[at] ?? '')); at++) vars.set(m[1]!, m[2]!)
-    const call = /^if ! (?:\w+=\$\()?"?([^\s"]+)"? --package "?([^\s")]+)"?[\s)]/.exec(lines[at]!)
-    expect(call).not.toBeNull()
-    expect(expand(call![1]!, vars)).toBe(RC_CLIENT_CHECK)
-    const pkgName = JSON.parse(repoFile('package.json')).name as string
-    expect(expand(call![2]!, vars)).toBe(join(repoDir!, 'node_modules', pkgName))
-    expect(lines[at]).toMatch(/; then$/)
-
-    // A failed check fails the test.
-    const fi = lines.indexOf('fi', at)
-    expect(lines.slice(at + 1, fi).filter((l) => /^fail\s/.test(l)).length).toBe(1)
+  test("test-1 runs AD_CLIENT_CHECK --package on the package it installed into /test-repo, directly after the install, and fails the test when the check fails; it installs only the package and writes nothing into node_modules", () => {
+    expect(test1ClientCheckProblems(repoFile(TEST_1))).toEqual([])
   })
 
-  test("test-1 runs the Phase 1 class-check fixture with bun on the same installed package directly after the RC_CLIENT_CHECK --package check and before its other steps, and fails the test with the fixture's first FAIL line when it fails", () => {
+  test.each<[string, (text: string) => string, string]>([
+    ['its client check gone', (t) => planted(t, '"${AD_CLIENT_CHECK}" --package', 'true --package'), `is not ${AD_CLIENT_CHECK} --package on the installed package`],
+    ['a swap after the install', (t) => planted(t, /^AD_CLIENT_CHECK=/m, 'cp -a /opt/agent-director/client/agent-director/. /test-repo/node_modules/agent-director/\nAD_CLIENT_CHECK='), 'files are written into the installed package'],
+    ['a failed check that does not fail the test', (t) => planted(t, 'fail "the agent-director client check', 'echo "the agent-director client check'), 'a failed check does not fail the test'],
+    ['an agent-director install', (t) => planted(t, /^AD_CLIENT_CHECK=/m, `bun add "agent-director@${PHASE1_RC_VERSION}"\nAD_CLIENT_CHECK=`), 'the package installs are'],
+  ])('a test-1 with %s is refused', (_name, mutate, problem) => {
+    const problems = test1ClientCheckProblems(mutate(repoFile(TEST_1)))
+    expect(problems.filter((p) => p.includes(problem)).length).toBeGreaterThan(0)
+  })
+
+  test("test-1 runs the Phase 1 class-check fixture with bun on the same installed package directly after the AD_CLIENT_CHECK --package check and before its other steps, and fails the test with the fixture's first FAIL line when it fails", () => {
     const lines = dockerInstructions(TEST_1)
     const helper = lines.findIndex((l) => /^if ! /.test(l) && l.includes(' --package '))
     expect(helper).toBeGreaterThan(0)
     const helperFi = lines.indexOf('fi', helper)
     const helperPkg = /\s--package "?([^\s")]+)"?/.exec(lines[helper]!)![1]!
 
-    // Exactly one run of the fixture, on the package the check swapped the client into.
+    // Exactly one run of the fixture, on the package the check checked.
     const runRe = /^if ! (?:\w+=\$\()?CSCB_PKG_DIR="?([^\s"]+)"? bun "?([^\s")]+)"? 2>(\S+)\); then$/
     const runs = lines.flatMap((l, i) => runRe.test(l) ? [i] : [])
     expect(runs.length).toBe(1)
@@ -2391,7 +2824,7 @@ function failedBuildStderr(own: string[], final = 'ERROR: failed to solve: '): s
   const quoted = `/bin/sh -c ${run.slice('RUN '.length)}`.replace(/"/g, '\\"')
   return [
     `#9 [4/4] ${run}`,
-    '#9 0.051 + chmod 0755 /opt/agent-director-rc/bin/agent-director',
+    `#9 0.051 + chmod 0755 ${join(baseImage().binDir, 'agent-director')}`,
     ...own.map((line, i) => `#9 0.${120 + i} ${line}`),
     `#9 ERROR: process "${quoted}" did not complete successfully: exit code: 1`,
     '------',
@@ -2417,22 +2850,22 @@ describe("the staged binary's failure texts", () => {
   const OPTION = AGENT_DIRECTOR_BINARY_OPTION
   const NO_ADVICE = /\bnpm\b|host agent-director|install|upgrad/i
 
-  // Each row: a fragment of one ERROR line Dockerfile.live echoes, the rc-client check line printed before it (if any), and the runner's message.
+  // Each row: a fragment of one ERROR line Dockerfile.live echoes, the client check's line printed before it (if any), and the runner's message.
   const ROUTES: [string, string[], string][] = [
     [
-      'is not the release candidate',
-      ['ERROR: rc-client check 3 (binary): the binary reports 0.10.0, not 0.11.0-rc.1'],
-      `the staged agent-director binary is not the release candidate this image's agent-director client is checked against: give the release candidate's binary with ${OPTION} <path>`,
+      'is not the agent-director release',
+      [`ERROR: ad-client check 5 (binary): the first agent-director binary on PATH reports version ${OLD_AD_VERSION}, not the release's ${PHASE1_FLOOR_VERSION}`],
+      `the staged agent-director binary is not the agent-director release this image's agent-director client is checked against: give that release's agent-director-linux-amd64 with ${OPTION} <path>`,
     ],
     [
       'do not pair',
-      ['ERROR: rc-client check 4 (floor): the binary is below the client floor'],
-      "the release candidate's agent-director binary and client do not pair: the release candidate pinned in docker/Dockerfile.test.base is not usable as is",
+      ['ERROR: ad-client check 6 (floor): the binary is below the client floor'],
+      `the agent-director release's binary and client do not pair: the release pinned in ${BASE_DOCKERFILE} is not usable as is`,
     ],
     [
       'predates this tree',
-      ['ERROR: rc-client-check.sh: /etc/cscb-ci-image is absent: this check runs only in a cscb-ci image (it runs agent-director); refusing to run'],
-      `the base image ${BASE_IMAGE} predates this tree's docker/Dockerfile.test.base or docker/rc-client-check.sh: bump the base image version (docker/README.md)`,
+      [`ERROR: ${basename(AD_CLIENT_CHECK)}: /etc/cscb-ci-image is absent: this check runs only in a cscb-ci image (it runs agent-director); refusing to run`],
+      `the base image ${BASE_IMAGE} predates this tree's ${BASE_DOCKERFILE} or ${AD_CLIENT_CHECK_SOURCE}: bump the base image version (docker/README.md)`,
     ],
     ['agent-director on PATH is', [], "the staged agent-director binary is not the first agent-director on the image's PATH"],
   ]
@@ -2457,8 +2890,8 @@ describe("the staged binary's failure texts", () => {
     for (const [fragment] of ROUTES) expect([fragment, stderr.split(fragment).length - 1 >= 3]).toEqual([fragment, true])
     expect(liveBuildErrorLines(stderr)).toEqual([])
     expect(liveBuildFailureMessage(17, stderr)).toBe('docker build of the live image failed (exit 17)')
-    // An rc-client check line alone, with no Dockerfile.live line after it, names no reason either.
-    expect(liveBuildFailureMessage(1, failedBuildStderr(['ERROR: rc-client check 3 (binary): the binary reports 0.10.0']))).toBe('docker build of the live image failed (exit 1)')
+    // A client check line alone, with no Dockerfile.live line after it, names no reason either.
+    expect(liveBuildFailureMessage(1, failedBuildStderr([`ERROR: ad-client check 5 (binary): the binary reports ${OLD_AD_VERSION}`]))).toBe('docker build of the live image failed (exit 1)')
   })
 
   test("docker 29's final `ERROR: failed to build: failed to solve:` line is docker's own, never one of the build's ERROR lines", () => {

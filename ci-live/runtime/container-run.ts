@@ -189,8 +189,8 @@ export class ContainerRun {
    * `agent-director-bin`, and that dir is removed after the build, on a
    * failure too, and by the run's cleanup (`removeStage`) when a stop ends
    * the run mid-build; nothing else is copied on the host and the binary is
-   * never run here. Dockerfile.live checks it against the release
-   * candidate's client in the base image and fails the build with one ERROR
+   * never run here. Dockerfile.live checks it against the agent-director
+   * release's client in the base image and fails the build with one ERROR
    * line on a mismatch; the failure message is `liveBuildFailureMessage`'s.
    */
   async buildImage(): Promise<void> {

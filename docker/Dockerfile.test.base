@@ -1,41 +1,49 @@
-# docker/Dockerfile.test.base — the /ci base image, cscb-ci-base:v5.
+# docker/Dockerfile.test.base — the /ci base image, cscb-ci-base:v6.
 #
 # Source-independent layers shared by the /ci image (docker/Dockerfile.test)
 # and the /ci-live image (docker/Dockerfile.live). From the repo build context
-# it reads one file, docker/rc-client-check.sh (no package.json). Built once
+# it reads one file, docker/ad-client-check.sh (no package.json). Built once
 # per host by the /ci skill:
 #
 #   docker build --network=host --secret id=gh_token,env=GH_TOKEN \
-#     --build-context agent-director-rc=<release-candidate directory> \
 #     --build-context agent-director-install=<directory holding install.sh> \
-#     -f docker/Dockerfile.test.base -t cscb-ci-base:v5 .
+#     -f docker/Dockerfile.test.base -t cscb-ci-base:v6 .
+#
+# agent-director is the release pinned below (AD_VERSION, AD_COMMIT): its
+# binaries come from agent-director's GitHub release, installed by that
+# release's own install.sh (`--from-release`, both assets checked against
+# their pinned SHA-256), and its TypeScript client from npm at the same
+# version.
 #
 # Fixed paths (all readable by every user, testuser included, except the
 # global client under /root, which is root-only):
-#   /opt/agent-director-rc/bin/agent-director
-#       the release candidate's binary, the image's default agent-director.
-#       Its directory holds nothing else and is first on the default PATH,
-#       so a scenario can leave it off PATH and still find bun.
-#   /opt/agent-director-rc/client/agent-director-0.10.0.tgz
-#       the release candidate's TypeScript client tarball (package version
-#       0.10.0 by design), as SHA256SUMS lists it.
-#   /opt/agent-director-rc/client/agent-director/
-#       that tarball unpacked (its package/ directory's contents).
-#   /opt/agent-director-rc/client/release.json
+#   /opt/agent-director/bin/agent-director
+#       the release's binary, the image's default agent-director. Its
+#       directory holds nothing else and is first on the default PATH, so a
+#       scenario can leave it off PATH and still find bun.
+#   /opt/agent-director/admin/agent-director-admin
+#       the release's operator tool (`delete`, `kill-finished`), from the
+#       same install; never on PATH. It and its directory are mode 0755, so
+#       testuser can run it by this path (the scenario harness does, and
+#       install.sh --binary takes it as --admin-binary).
+#   /opt/agent-director/install/install.sh
+#       the release's install script, from agent-director's source tree at
+#       the release tag; off PATH; its directory holds nothing else.
+#   /opt/agent-director/client/agent-director-<AD_VERSION>.tgz
+#       the release's TypeScript client tarball, fetched from the npm
+#       registry and checked against its pinned SHA-256.
+#   /opt/agent-director/client/release.json
 #       the release record: {"version", "commit", "client_tarball",
 #       "client_tarball_sha256"}.
-#   /opt/agent-director-rc/install/install.sh
-#       the release candidate's install script, from agent-director's source
-#       tree at the pinned commit; off PATH; its directory holds nothing else.
-#   /opt/agent-director-rc/check/rc-client-check.sh
-#       the client-under-test check (docker/rc-client-check.sh), off PATH:
-#       `--package <dir>` swaps the release candidate's client into an
-#       installed package's resolved agent-director and checks it;
-#       `--client <dir>` checks a client only. test-1,
-#       ci-live/checks/setup-checks.ts and docker/Dockerfile.live run it.
+#   /opt/agent-director/check/ad-client-check.sh
+#       the client-under-test check (docker/ad-client-check.sh), off PATH:
+#       `--package <dir>` checks the agent-director client an installed
+#       package resolves; `--client <dir>` checks a client as it is. It
+#       changes nothing. test-1, ci-live/checks/setup-checks.ts and
+#       docker/Dockerfile.live run it.
 #   /root/.bun/install/global/node_modules/agent-director
-#       the global agent-director client: the release candidate's, installed
-#       from its tarball above and checked by the build. Root-only (/root is
+#       the global agent-director client: the release's, installed from npm
+#       at the exact version and checked by the build. Root-only (/root is
 #       0700): read by this base build and by docker/Dockerfile.live, which
 #       both run as root; testuser cannot read it.
 #   /opt/agent-director-0.10.0/bin/agent-director
@@ -46,20 +54,20 @@
 #       the published pre-persona claude-slack-channel-bots 0.10.0 package,
 #       from npm.
 #   /etc/cscb-ci-image
-#       the image marker: tests/runner.sh and rc-client-check.sh refuse to
+#       the image marker: tests/runner.sh and ad-client-check.sh refuse to
 #       run without it.
-# No agent-director client is installed from the npm registry (the 0.10.0
-# client is only kept as its tarball), and /usr/local/bin holds no
+# The install leaves no store behind: install.sh runs with a throwaway HOME,
+# which the build removes, so no ~/.agent-director exists in the image. The
+# 0.10.0 client is only kept as its tarball, and /usr/local/bin holds no
 # agent-director.
 #
 # Every failed check prints one line starting `ERROR:` naming its cause.
 
-# Fallback stages for the two named build contexts. A
-# `--build-context <name>=<dir>` replaces the stage of the same name; without
-# it the stage is a plain ubuntu root, which holds none of the files the
-# checks below look for, so the build stops with an ERROR line naming the
-# missing context.
-FROM ubuntu:22.04 AS agent-director-rc
+# Fallback stage for the named build context. A
+# `--build-context agent-director-install=<dir>` replaces the stage of that
+# name; without it the stage is a plain ubuntu root, which holds no
+# install.sh, so the build stops with an ERROR line naming the missing
+# context.
 FROM ubuntu:22.04 AS agent-director-install
 
 FROM ubuntu:22.04
@@ -98,11 +106,11 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
 # Cozempic — Test 3 probes for it on PATH.
 RUN pip install cozempic
 
-# The release candidate's binary directory, first on the default PATH. The
-# directory is created by the release-candidate layer below.
-ENV PATH=/opt/agent-director-rc/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# The default agent-director binary's directory, first on the default PATH.
+# The directory is created by the release layer below.
+ENV PATH=/opt/agent-director/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# The 0.10.0 legs, installable beside the release candidate: the published
+# The 0.10.0 legs, installable beside the release: the published
 # agent-director 0.10.0 client and the published pre-persona
 # claude-slack-channel-bots 0.10.0 package, kept as npm tarballs (fetched by
 # exact version, no install scripts run).
@@ -122,9 +130,9 @@ RUN set -eu; \
     chmod -R a+rX "${AD_PREV_DIR}" "${CSCB_PREV_DIR}"
 
 # agent-director 0.10.0's binary, fetched for the pinned release v0.10.0 into
-# /opt/agent-director-0.10.0/bin, which is not on PATH. The release repo is
-# private, so a GitHub token is required at build time, as the BuildKit secret
-# `gh_token` (see the /ci skill):
+# /opt/agent-director-0.10.0/bin, which is not on PATH. This leg reads the
+# release through GitHub's API with a token, so a GitHub token is required at
+# build time, as the BuildKit secret `gh_token` (see the /ci skill):
 #   docker build --secret id=gh_token,env=GH_TOKEN ...
 # Never pass it as a build-arg or ENV: an ARG's value is recorded in the image
 # history (`docker history --no-trunc`) of this image and of every image built
@@ -136,7 +144,7 @@ RUN --mount=type=secret,id=gh_token set -eu; \
     AD_PREV_BIN_DIR="/opt/agent-director-${AD_PREV_VERSION}/bin"; \
     AD_PREV_BIN="${AD_PREV_BIN_DIR}/agent-director"; \
     if [ ! -s /run/secrets/gh_token ]; then \
-        echo "ERROR: the gh_token build secret is required (the agent-director release repo is private): pass it with docker build --secret id=gh_token,env=GH_TOKEN, GH_TOKEN set in that command's environment" >&2; \
+        echo "ERROR: the gh_token build secret is required (the agent-director ${AD_PREV_VERSION} leg reads its release through GitHub's API with a token): pass it with docker build --secret id=gh_token,env=GH_TOKEN, GH_TOKEN set in that command's environment" >&2; \
         exit 1; \
     fi; \
     gh_auth() { printf 'header = "Authorization: Bearer %s"\n' "$(cat /run/secrets/gh_token)"; }; \
@@ -166,146 +174,168 @@ RUN --mount=type=secret,id=gh_token set -eu; \
     fi; \
     echo "agent-director ${PREV_REPORTED} binary installed off PATH at ${AD_PREV_BIN}"
 
-# The release candidate and its install script, read only from two named build
-# contexts (never from the repo context):
-# - agent-director-rc: the release candidate's directory. Only
-#   agent-director-linux-amd64, agent-director-0.10.0.tgz and SHA256SUMS are
-#   read. Each of the two files must have exactly one SHA256SUMS entry and
-#   match it (sha256sum -c), and the binary's `version` must report the pinned
-#   AD_RC_VERSION and AD_RC_COMMIT.
+# The release: its install script, read only from the named build context
+# agent-director-install (never from the repo context), then run to install
+# the release's binaries.
 # - agent-director-install: a directory holding install.sh, taken from
-#   agent-director's source tree at AD_INSTALL_SH_COMMIT; it must match the
-#   pinned AD_INSTALL_SH_SHA256.
-# The binary goes to /opt/agent-director-rc/bin (first on PATH, nothing else
-# in it); the client tarball, its unpacked copy and the release record go to
-# /opt/agent-director-rc/client; install.sh goes to
-# /opt/agent-director-rc/install (off PATH). The build then checks that the
-# first agent-director on PATH is the release candidate's and that no other
-# PATH directory holds one.
-ARG AD_RC_VERSION=0.11.0-rc.1
-ARG AD_RC_COMMIT=d787cb434043868543c3c98105e3394026d6ca5f
-ARG AD_INSTALL_SH_COMMIT=d787cb434043868543c3c98105e3394026d6ca5f
-ARG AD_INSTALL_SH_SHA256=af7818b9f061efa95749ed024823abe8302d0d9c12bfb6cdfc7241ec39018859
-RUN --mount=type=bind,from=agent-director-rc,target=/mnt/agent-director-rc \
-    --mount=type=bind,from=agent-director-install,target=/mnt/agent-director-install \
+#   agent-director's source tree at the release tag v${AD_VERSION} (the /ci
+#   skill fills it with a read-only `git show`); it must match the pinned
+#   AD_INSTALL_SH_SHA256. It goes to /opt/agent-director/install (off PATH).
+# - That install.sh then installs the release: `--from-release
+#   v${AD_VERSION}` downloads agent-director-linux-amd64 and
+#   agent-director-admin-linux-amd64 from agent-director's GitHub release
+#   (its public download URLs; no token is passed), checks them against the pinned AD_SHA256 and
+#   AD_ADMIN_SHA256 (`--sha256`, `--admin-sha256`), refuses a pair whose
+#   version stamps differ, installs them and opens the store, migrating it to
+#   the release's schema. It runs with a throwaway HOME (its
+#   ~/.agent-director, store included, is removed afterwards), with
+#   `--no-hooks` and `--no-symlink`, and with a stand-in `claude` on PATH for
+#   that one command: install.sh's pre-flight requires a `claude` on PATH and
+#   only prints its `--version`, and this image has no Claude Code.
+# The installed agent-director goes to /opt/agent-director/bin (first on
+# PATH, nothing else in it) and agent-director-admin to
+# /opt/agent-director/admin (mode 0755, never on PATH). Each must still match
+# its pinned SHA-256, and agent-director's `version` must report the pinned
+# AD_VERSION and AD_COMMIT. The build then checks that the first
+# agent-director on PATH is the release's, that no other PATH directory holds
+# one, and that no agent-director-admin is on PATH.
+ARG AD_VERSION=0.11.0
+ARG AD_COMMIT=d0b1890d12e286c842439815fd6b8ecdb790bc24
+ARG AD_SHA256=a72e4c5001b96294427e06e3972c82b3f070ef8932a0fc83aef1dc73418747bf
+ARG AD_ADMIN_SHA256=103c1ee017230f5b6e97224b403a23cf942a332cf3e74bb30f7dd0072bf0dbb6
+ARG AD_INSTALL_SH_SHA256=be9de3727b1ddbeec333b1ee70634b4b6cbad39aca81fbd8d2b8ed41fe993825
+RUN --mount=type=bind,from=agent-director-install,target=/mnt/agent-director-install \
     set -eu; \
-    RC_CTX=/mnt/agent-director-rc; \
+    AD_TAG="v${AD_VERSION}"; \
     INSTALL_CTX=/mnt/agent-director-install; \
-    RC_ROOT=/opt/agent-director-rc; \
-    RC_BIN_DIR="${RC_ROOT}/bin"; \
-    RC_BIN="${RC_BIN_DIR}/agent-director"; \
-    RC_CLIENT_DIR="${RC_ROOT}/client"; \
-    RC_CLIENT_TGZ_NAME=agent-director-0.10.0.tgz; \
-    RC_CLIENT_TGZ="${RC_CLIENT_DIR}/${RC_CLIENT_TGZ_NAME}"; \
-    RC_INSTALL_DIR="${RC_ROOT}/install"; \
-    RC_INSTALL_SH="${RC_INSTALL_DIR}/install.sh"; \
-    if [ ! -f "${RC_CTX}/SHA256SUMS" ]; then \
-        echo "ERROR: the agent-director-rc build context is missing or holds no SHA256SUMS: pass --build-context agent-director-rc=<release-candidate directory>" >&2; \
+    AD_ROOT=/opt/agent-director; \
+    AD_BIN_DIR="${AD_ROOT}/bin"; \
+    AD_BIN="${AD_BIN_DIR}/agent-director"; \
+    AD_ADMIN_DIR="${AD_ROOT}/admin"; \
+    AD_ADMIN="${AD_ADMIN_DIR}/agent-director-admin"; \
+    AD_INSTALL_DIR="${AD_ROOT}/install"; \
+    AD_INSTALL_SH="${AD_INSTALL_DIR}/install.sh"; \
+    if [ ! -f "${INSTALL_CTX}/install.sh" ]; then \
+        echo "ERROR: the agent-director-install build context is missing or holds no install.sh: pass --build-context agent-director-install=<directory holding install.sh from agent-director's tree at ${AD_TAG}>" >&2; \
         exit 1; \
     fi; \
     STAGE=$(mktemp -d); \
-    cp "${RC_CTX}/SHA256SUMS" "${STAGE}/SHA256SUMS"; \
-    for f in agent-director-linux-amd64 "${RC_CLIENT_TGZ_NAME}"; do \
-        if [ ! -f "${RC_CTX}/${f}" ]; then \
-            echo "ERROR: the agent-director-rc build context holds no ${f}" >&2; \
-            exit 1; \
-        fi; \
-        ENTRIES=$(awk -v f="${f}" '$2 == f || $2 == "*" f' "${STAGE}/SHA256SUMS"); \
-        if [ -z "${ENTRIES}" ]; then \
-            echo "ERROR: SHA256SUMS in the agent-director-rc build context has no entry for ${f}" >&2; \
-            exit 1; \
-        fi; \
-        if [ "$(printf '%s\n' "${ENTRIES}" | wc -l)" -ne 1 ]; then \
-            echo "ERROR: SHA256SUMS in the agent-director-rc build context has more than one entry for ${f}" >&2; \
-            exit 1; \
-        fi; \
-        cp "${RC_CTX}/${f}" "${STAGE}/${f}"; \
-        if ! (cd "${STAGE}" && printf '%s\n' "${ENTRIES}" | sha256sum -c --strict --status -); then \
-            echo "ERROR: ${f} in the agent-director-rc build context does not match its SHA256SUMS entry" >&2; \
-            exit 1; \
-        fi; \
-    done; \
-    if [ ! -f "${INSTALL_CTX}/install.sh" ]; then \
-        echo "ERROR: the agent-director-install build context is missing or holds no install.sh: pass --build-context agent-director-install=<directory holding install.sh from agent-director's tree at ${AD_INSTALL_SH_COMMIT}>" >&2; \
-        exit 1; \
-    fi; \
     cp "${INSTALL_CTX}/install.sh" "${STAGE}/install.sh"; \
     INSTALL_SH_SHA256=$(sha256sum "${STAGE}/install.sh" | cut -d' ' -f1); \
     if [ "${INSTALL_SH_SHA256}" != "${AD_INSTALL_SH_SHA256}" ]; then \
-        echo "ERROR: install.sh in the agent-director-install build context has SHA-256 ${INSTALL_SH_SHA256}, not the pinned ${AD_INSTALL_SH_SHA256} (agent-director commit ${AD_INSTALL_SH_COMMIT})" >&2; \
+        echo "ERROR: install.sh in the agent-director-install build context has SHA-256 ${INSTALL_SH_SHA256}, not the pinned ${AD_INSTALL_SH_SHA256} (agent-director ${AD_TAG})" >&2; \
         exit 1; \
     fi; \
-    chmod 0755 "${STAGE}/agent-director-linux-amd64"; \
-    RC_VERSION_JSON=$("${STAGE}/agent-director-linux-amd64" version) \
-        || { echo "ERROR: the release candidate's agent-director-linux-amd64 version failed" >&2; exit 1; }; \
-    RC_REPORTED_VERSION=$(printf '%s' "${RC_VERSION_JSON}" | jq -ner 'input | .version | strings') \
-        || { echo "ERROR: the release candidate's agent-director-linux-amd64 version did not print a JSON object with a string version field" >&2; exit 1; }; \
-    RC_REPORTED_COMMIT=$(printf '%s' "${RC_VERSION_JSON}" | jq -ner 'input | .commit | strings') \
-        || { echo "ERROR: the release candidate's agent-director-linux-amd64 version did not print a JSON object with a string commit field" >&2; exit 1; }; \
-    if [ "${RC_REPORTED_VERSION}" != "${AD_RC_VERSION}" ]; then \
-        echo "ERROR: the release candidate's binary reports version ${RC_REPORTED_VERSION}, not the pinned AD_RC_VERSION ${AD_RC_VERSION}" >&2; \
+    mkdir -p "${AD_INSTALL_DIR}"; \
+    install -m 0755 "${STAGE}/install.sh" "${AD_INSTALL_SH}"; \
+    AD_HOME="${STAGE}/home"; \
+    SHIM_DIR="${STAGE}/shim"; \
+    mkdir -p "${AD_HOME}" "${SHIM_DIR}"; \
+    printf '%s\n' '#!/bin/sh' 'echo "claude: build-time stand-in for install.sh pre-flight (no Claude Code in this image)"' > "${SHIM_DIR}/claude"; \
+    chmod 0755 "${SHIM_DIR}/claude"; \
+    if ! HOME="${AD_HOME}" PATH="${SHIM_DIR}:${PATH}" bash "${AD_INSTALL_SH}" --from-release "${AD_TAG}" \
+            --sha256 "${AD_SHA256}" --admin-sha256 "${AD_ADMIN_SHA256}" --no-hooks --no-symlink \
+            > "${STAGE}/install.out" 2> "${STAGE}/install.err"; then \
+        echo "ERROR: ${AD_INSTALL_SH} --from-release ${AD_TAG} failed: $(tr -s '\n\t ' ' ' < "${STAGE}/install.err" | cut -c1-800)" >&2; \
         exit 1; \
     fi; \
-    if [ "${RC_REPORTED_COMMIT}" != "${AD_RC_COMMIT}" ]; then \
-        echo "ERROR: the release candidate's binary reports commit ${RC_REPORTED_COMMIT}, not the pinned AD_RC_COMMIT ${AD_RC_COMMIT}" >&2; \
-        exit 1; \
-    fi; \
-    mkdir -p "${RC_BIN_DIR}" "${RC_CLIENT_DIR}/agent-director" "${RC_INSTALL_DIR}"; \
-    install -m 0755 "${STAGE}/agent-director-linux-amd64" "${RC_BIN}"; \
-    install -m 0644 "${STAGE}/${RC_CLIENT_TGZ_NAME}" "${RC_CLIENT_TGZ}"; \
-    tar -xzf "${RC_CLIENT_TGZ}" -C "${RC_CLIENT_DIR}/agent-director" --strip-components=1 --no-same-owner \
-        || { echo "ERROR: could not unpack ${RC_CLIENT_TGZ}" >&2; exit 1; }; \
-    if [ "$(jq -r '.name' "${RC_CLIENT_DIR}/agent-director/package.json")" != agent-director ]; then \
-        echo "ERROR: ${RC_CLIENT_TGZ} does not unpack to the agent-director package" >&2; \
-        exit 1; \
-    fi; \
-    CLIENT_TGZ_SHA256=$(sha256sum "${RC_CLIENT_TGZ}" | cut -d' ' -f1); \
-    jq -n --arg version "${AD_RC_VERSION}" --arg commit "${AD_RC_COMMIT}" \
-        --arg client_tarball "${RC_CLIENT_TGZ}" --arg client_tarball_sha256 "${CLIENT_TGZ_SHA256}" \
-        '{version: $version, commit: $commit, client_tarball: $client_tarball, client_tarball_sha256: $client_tarball_sha256}' \
-        > "${RC_CLIENT_DIR}/release.json"; \
-    install -m 0755 "${STAGE}/install.sh" "${RC_INSTALL_SH}"; \
-    bash "${RC_INSTALL_SH}" --help | grep -q -- '--binary' \
-        || { echo "ERROR: ${RC_INSTALL_SH} --help does not print its usage" >&2; exit 1; }; \
+    INSTALLED_BIN="${AD_HOME}/.agent-director/bin/agent-director"; \
+    INSTALLED_ADMIN="${AD_HOME}/.agent-director/admin/agent-director-admin"; \
+    for f in "${INSTALLED_BIN}" "${INSTALLED_ADMIN}"; do \
+        if [ ! -f "${f}" ]; then \
+            echo "ERROR: ${AD_INSTALL_SH} --from-release ${AD_TAG} installed no ${f}" >&2; \
+            exit 1; \
+        fi; \
+    done; \
+    STORE_SCHEMA=$(sqlite3 "${AD_HOME}/.agent-director/state.db" 'PRAGMA user_version;' 2>/dev/null || echo unreadable); \
+    mkdir -p "${AD_BIN_DIR}" "${AD_ADMIN_DIR}"; \
+    install -m 0755 "${INSTALLED_BIN}" "${AD_BIN}"; \
+    install -m 0755 "${INSTALLED_ADMIN}" "${AD_ADMIN}"; \
     rm -rf "${STAGE}"; \
-    chmod -R a+rX "${RC_ROOT}"; \
-    if [ "$(command -v agent-director)" != "${RC_BIN}" ]; then \
-        echo "ERROR: the first agent-director on PATH is $(command -v agent-director || echo none), not ${RC_BIN}" >&2; \
+    BIN_SHA256=$(sha256sum "${AD_BIN}" | cut -d' ' -f1); \
+    if [ "${BIN_SHA256}" != "${AD_SHA256}" ]; then \
+        echo "ERROR: ${AD_BIN} has SHA-256 ${BIN_SHA256}, not the pinned AD_SHA256 ${AD_SHA256} of the release's agent-director-linux-amd64" >&2; \
         exit 1; \
     fi; \
-    if [ "$(ls -A "${RC_BIN_DIR}")" != agent-director ]; then \
-        echo "ERROR: ${RC_BIN_DIR} holds more than agent-director" >&2; \
+    ADMIN_SHA256=$(sha256sum "${AD_ADMIN}" | cut -d' ' -f1); \
+    if [ "${ADMIN_SHA256}" != "${AD_ADMIN_SHA256}" ]; then \
+        echo "ERROR: ${AD_ADMIN} has SHA-256 ${ADMIN_SHA256}, not the pinned AD_ADMIN_SHA256 ${AD_ADMIN_SHA256} of the release's agent-director-admin-linux-amd64" >&2; \
         exit 1; \
     fi; \
-    OTHERS=$(IFS=:; for d in ${PATH}; do [ "${d}" != "${RC_BIN_DIR}" ] && [ -e "${d}/agent-director" ] && echo "${d}/agent-director"; done; true); \
+    VERSION_JSON=$("${AD_BIN}" version) \
+        || { echo "ERROR: ${AD_BIN} version failed" >&2; exit 1; }; \
+    REPORTED_VERSION=$(printf '%s' "${VERSION_JSON}" | jq -ner 'input | .version | strings') \
+        || { echo "ERROR: ${AD_BIN} version did not print a JSON object with a string version field" >&2; exit 1; }; \
+    REPORTED_COMMIT=$(printf '%s' "${VERSION_JSON}" | jq -ner 'input | .commit | strings') \
+        || { echo "ERROR: ${AD_BIN} version did not print a JSON object with a string commit field" >&2; exit 1; }; \
+    if [ "${REPORTED_VERSION}" != "${AD_VERSION}" ]; then \
+        echo "ERROR: the release's binary ${AD_BIN} reports version ${REPORTED_VERSION}, not the pinned AD_VERSION ${AD_VERSION}" >&2; \
+        exit 1; \
+    fi; \
+    if [ "${REPORTED_COMMIT}" != "${AD_COMMIT}" ]; then \
+        echo "ERROR: the release's binary ${AD_BIN} reports commit ${REPORTED_COMMIT}, not the pinned AD_COMMIT ${AD_COMMIT}" >&2; \
+        exit 1; \
+    fi; \
+    chmod -R a+rX "${AD_ROOT}"; \
+    chmod 0755 "${AD_ADMIN_DIR}" "${AD_ADMIN}"; \
+    if [ "$(command -v agent-director)" != "${AD_BIN}" ]; then \
+        echo "ERROR: the first agent-director on PATH is $(command -v agent-director || echo none), not ${AD_BIN}" >&2; \
+        exit 1; \
+    fi; \
+    if [ "$(ls -A "${AD_BIN_DIR}")" != agent-director ]; then \
+        echo "ERROR: ${AD_BIN_DIR} holds more than agent-director" >&2; \
+        exit 1; \
+    fi; \
+    OTHERS=$(IFS=:; for d in ${PATH}; do [ "${d}" != "${AD_BIN_DIR}" ] && [ -e "${d}/agent-director" ] && echo "${d}/agent-director"; done; true); \
     if [ -n "${OTHERS}" ]; then \
         echo "ERROR: another agent-director is on PATH: $(echo ${OTHERS})" >&2; \
         exit 1; \
     fi; \
-    echo "agent-director ${RC_REPORTED_VERSION} (${RC_REPORTED_COMMIT}) installed at ${RC_BIN}; client ${CLIENT_TGZ_SHA256} at ${RC_CLIENT_TGZ}; install.sh at ${RC_INSTALL_SH}"
-
-# The client-under-test check, the one file this image reads from the repo
-# context, at a fixed path off PATH and outside the release candidate's
-# binary directory. It refuses to run without /etc/cscb-ci-image (written
-# above).
-COPY --chmod=0755 docker/rc-client-check.sh /opt/agent-director-rc/check/rc-client-check.sh
-
-# The global agent-director client: the release candidate's, installed from
-# the tarball the release record names (it has no dependencies, so nothing is
-# fetched from the registry), then checked with the check's client-only use:
-# its files equal the tarball's, it exports the Phase 1 classes, and it pairs
-# with the release candidate's binary first on PATH. The check's summary line
-# is the last line this layer prints.
-RUN set -eu; \
-    RC_CHECK=/opt/agent-director-rc/check/rc-client-check.sh; \
-    GLOBAL_CLIENT=/root/.bun/install/global/node_modules/agent-director; \
-    RC_CLIENT_TGZ=$(jq -er '.client_tarball | strings' /opt/agent-director-rc/client/release.json) \
-        || { echo "ERROR: /opt/agent-director-rc/client/release.json names no client_tarball" >&2; exit 1; }; \
-    bun add -g --ignore-scripts "${RC_CLIENT_TGZ}" > /tmp/rc-client-install.log 2>&1 \
-        || { echo "ERROR: bun add -g ${RC_CLIENT_TGZ} failed: $(tail -n 1 /tmp/rc-client-install.log)" >&2; exit 1; }; \
-    rm -f /tmp/rc-client-install.log; \
-    if [ ! -f "${GLOBAL_CLIENT}/package.json" ]; then \
-        echo "ERROR: bun add -g ${RC_CLIENT_TGZ} left no client at ${GLOBAL_CLIENT}" >&2; \
+    if command -v agent-director-admin >/dev/null 2>&1; then \
+        echo "ERROR: agent-director-admin is on PATH at $(command -v agent-director-admin); it must stay off PATH" >&2; \
         exit 1; \
     fi; \
-    "${RC_CHECK}" --client "${GLOBAL_CLIENT}"
+    echo "agent-director ${REPORTED_VERSION} (${REPORTED_COMMIT}) installed by ${AD_INSTALL_SH} --from-release ${AD_TAG} at ${AD_BIN}, agent-director-admin at ${AD_ADMIN} (off PATH); the install's store reached schema v${STORE_SCHEMA}"
+
+# The client-under-test check, the one file this image reads from the repo
+# context, at a fixed path off PATH and outside the default binary's
+# directory. It refuses to run without /etc/cscb-ci-image (written above).
+COPY --chmod=0755 docker/ad-client-check.sh /opt/agent-director/check/ad-client-check.sh
+
+# The release's client: its npm tarball, fetched from the registry by exact
+# version and checked against the pinned AD_CLIENT_TGZ_SHA256, then the
+# release record naming the release's version and commit and that tarball.
+# The global agent-director client is then installed from npm at exactly
+# AD_VERSION (it has no dependencies and no install scripts run) and checked
+# with the check's client-only use: its version is the release's, its files
+# equal the tarball's, it exports the Phase 1 classes, and it pairs with the
+# release's binary first on PATH. The check's summary line is the last line
+# this layer prints.
+ARG AD_CLIENT_TGZ_SHA256=69cf2d1774c77ee706edb6e6d0d67049dd1039596c8e5239f26b03a8e71baa31
+RUN set -eu; \
+    AD_CHECK=/opt/agent-director/check/ad-client-check.sh; \
+    CLIENT_DIR=/opt/agent-director/client; \
+    CLIENT_TGZ="${CLIENT_DIR}/agent-director-${AD_VERSION}.tgz"; \
+    CLIENT_TGZ_URL="https://registry.npmjs.org/agent-director/-/agent-director-${AD_VERSION}.tgz"; \
+    GLOBAL_CLIENT=/root/.bun/install/global/node_modules/agent-director; \
+    mkdir -p "${CLIENT_DIR}"; \
+    curl -fsSL -o "${CLIENT_TGZ}" "${CLIENT_TGZ_URL}" \
+        || { echo "ERROR: could not download the agent-director ${AD_VERSION} client tarball from ${CLIENT_TGZ_URL}" >&2; exit 1; }; \
+    CLIENT_TGZ_SHA256=$(sha256sum "${CLIENT_TGZ}" | cut -d' ' -f1); \
+    if [ "${CLIENT_TGZ_SHA256}" != "${AD_CLIENT_TGZ_SHA256}" ]; then \
+        echo "ERROR: the agent-director ${AD_VERSION} client tarball from npm has SHA-256 ${CLIENT_TGZ_SHA256}, not the pinned AD_CLIENT_TGZ_SHA256 ${AD_CLIENT_TGZ_SHA256}" >&2; \
+        exit 1; \
+    fi; \
+    jq -n --arg version "${AD_VERSION}" --arg commit "${AD_COMMIT}" \
+        --arg client_tarball "${CLIENT_TGZ}" --arg client_tarball_sha256 "${AD_CLIENT_TGZ_SHA256}" \
+        '{version: $version, commit: $commit, client_tarball: $client_tarball, client_tarball_sha256: $client_tarball_sha256}' \
+        > "${CLIENT_DIR}/release.json"; \
+    chmod -R a+rX "${CLIENT_DIR}"; \
+    bun add -g --ignore-scripts "agent-director@${AD_VERSION}" > /tmp/ad-client-install.log 2>&1 \
+        || { echo "ERROR: bun add -g agent-director@${AD_VERSION} failed: $(tail -n 1 /tmp/ad-client-install.log)" >&2; exit 1; }; \
+    rm -f /tmp/ad-client-install.log; \
+    if [ ! -f "${GLOBAL_CLIENT}/package.json" ]; then \
+        echo "ERROR: bun add -g agent-director@${AD_VERSION} left no client at ${GLOBAL_CLIENT}" >&2; \
+        exit 1; \
+    fi; \
+    "${AD_CHECK}" --client "${GLOBAL_CLIENT}"

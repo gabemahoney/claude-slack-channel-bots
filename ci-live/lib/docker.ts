@@ -37,7 +37,7 @@ import { join, resolve, sep } from 'node:path'
 import { countTokenShaped } from './redact.ts'
 import type { ProcResult, SpawnFn } from './proc.ts'
 
-export const BASE_IMAGE = 'cscb-ci-base:v5'
+export const BASE_IMAGE = 'cscb-ci-base:v6'
 export const LIVE_IMAGE = 'cscb-ci-live:latest'
 export const CONTAINER_LABEL_KEY = 'cscb-live'
 export const CONTAINER_LABEL = `${CONTAINER_LABEL_KEY}=1`
@@ -270,7 +270,7 @@ const DOCKER_OWN_ERROR_RE = /^ERROR: (?:failed to (?:build|solve)|process ")/
 
 /**
  * The ERROR lines the live image build's own commands printed (Dockerfile.live
- * and the rc-client check), each without its BuildKit prefix: only lines that
+ * and the ad-client check), each without its BuildKit prefix: only lines that
  * start with `ERROR: `, never docker's own failure lines, nor the Dockerfile
  * excerpt or the shell trace that quote the RUN text.
  */
@@ -283,21 +283,22 @@ export function liveBuildErrorLines(stderr: string): string[] {
 
 /**
  * Dockerfile.live's routed ERROR lines (each a line's start) and what the
- * runner says for each. Only a staged binary that is not the release
- * candidate is the runner's to fix, with `--agent-director-binary`.
+ * runner says for each. Only a staged binary that is not the pinned
+ * agent-director release's is the runner's to fix, with
+ * `--agent-director-binary`.
  */
 const LIVE_BUILD_FAILURES: ReadonlyArray<readonly [string, string]> = [
   [
-    'ERROR: the staged agent-director binary is not the release candidate ',
-    "the staged agent-director binary is not the release candidate this image's agent-director client is checked against: give the release candidate's binary with --agent-director-binary <path>",
+    'ERROR: the staged agent-director binary is not the agent-director release ',
+    "the staged agent-director binary is not the agent-director release this image's agent-director client is checked against: give that release's agent-director-linux-amd64 with --agent-director-binary <path>",
   ],
   [
-    "ERROR: the release candidate's agent-director binary and client do not pair ",
-    "the release candidate's agent-director binary and client do not pair: the release candidate pinned in docker/Dockerfile.test.base is not usable as is",
+    "ERROR: the agent-director release's binary and client do not pair ",
+    "the agent-director release's binary and client do not pair: the release pinned in docker/Dockerfile.test.base is not usable as is",
   ],
   [
-    "ERROR: the base image's global agent-director client or its rc-client check failed ",
-    `the base image ${BASE_IMAGE} predates this tree's docker/Dockerfile.test.base or docker/rc-client-check.sh: bump the base image version (docker/README.md)`,
+    "ERROR: the base image's global agent-director client or its ad-client check failed ",
+    `the base image ${BASE_IMAGE} predates this tree's docker/Dockerfile.test.base or docker/ad-client-check.sh: bump the base image version (docker/README.md)`,
   ],
   [
     'ERROR: agent-director on PATH is ',

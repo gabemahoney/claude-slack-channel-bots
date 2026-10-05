@@ -2,9 +2,10 @@
  * setup-checks.ts — testplans/b.yko Part 1 in the container: the pre-flight,
  * the install from the README (1.4), the persona setup (1.5, written by the
  * runner as the wizard's answers would be), and Checks S1–S3. After the
- * install, the image's client-under-test check (`RC_CLIENT_CHECK`) swaps
- * agent-director's release-candidate client into the installed package and
- * checks it, before the package checksums Check S2 compares against.
+ * install, the image's client-under-test check (`AD_CLIENT_CHECK`) checks
+ * the agent-director client the installed package resolves (the release's,
+ * from npm at the package's exact pin), changing nothing, before the package
+ * checksums Check S2 compares against.
  *
  * These need no workspace, so a dry run runs them for real (with placeholder
  * IDs in config.json).
@@ -12,7 +13,7 @@
 
 import { SYSTEM_PROMPT_PATH, buildLiveConfig, renderConfig, systemPromptFromTemplate } from '../lib/live-config.ts'
 import { CONTAINER_HOME, CONTAINER_TARBALL } from '../lib/docker.ts'
-import { RC_CLIENT_CHECK, RC_CLIENT_CHECK_PASSED } from '../lib/rc-client.ts'
+import { AD_CLIENT_CHECK, AD_CLIENT_CHECK_PASSED } from '../lib/ad-client-check.ts'
 import type { CheckContext } from './context.ts'
 import { Findings, pass, type CheckDef } from './framework.ts'
 import { guarded, lines, run, S } from './helpers.ts'
@@ -23,10 +24,10 @@ const PREFLIGHT_OK = (phase: string) => `pre-flight passed (${phase})`
  * How the install check's reason starts when the client-under-test check
  * fails; the check's own `ERROR:` line follows it.
  */
-export const RC_CLIENT_CHECK_FAILED = 'the release-candidate client check on the installed package failed'
+export const AD_CLIENT_CHECK_FAILED = 'the client check on the installed package failed'
 
-/** The client-under-test check's bound: a copy, a tarball unpack and three bun runs. */
-const RC_CLIENT_CHECK_TIMEOUT_MS = 120_000
+/** The client-under-test check's bound: a tarball unpack, four bun runs and one agent-director version run. */
+const AD_CLIENT_CHECK_TIMEOUT_MS = 120_000
 
 export const preflightCheck: CheckDef<CheckContext> = {
   id: 'preflight',
@@ -73,14 +74,13 @@ export const installCheck: CheckDef<CheckContext> = {
     const layout = await run(ctx, '[ -f "$PKG/README.md" ] && [ -f "$PKG/slack-app-manifest.yml" ] && [ -d "$PKG/skills" ]')
     f.expect(layout.code === 0, 'PKG does not hold README.md, slack-app-manifest.yml and skills/')
 
-    // The client under test: the release candidate's client swapped into
-    // the package's resolved agent-director and checked, before the checksums
-    // S2 compares against.
-    const rc = await guarded(ctx, `${RC_CLIENT_CHECK} --package "$PKG"`, RC_CLIENT_CHECK_TIMEOUT_MS)
-    const passed = rc.out.split('\n').find((l) => l.startsWith(RC_CLIENT_CHECK_PASSED))
+    // The client under test: the agent-director client the package resolves,
+    // checked as installed, before the checksums S2 compares against.
+    const check = await guarded(ctx, `${AD_CLIENT_CHECK} --package "$PKG"`, AD_CLIENT_CHECK_TIMEOUT_MS)
+    const passed = check.out.split('\n').find((l) => l.startsWith(AD_CLIENT_CHECK_PASSED))
     if (passed !== undefined) f.add(passed)
-    const rcError = rc.err.split('\n').find((l) => l.startsWith('ERROR:')) ?? (rc.ok ? `exit ${rc.code}` : 'the guard refused the container shell')
-    if (!f.expect(rc.ok && rc.code === 0 && passed !== undefined, `${RC_CLIENT_CHECK_FAILED}: ${rcError}`)) {
+    const checkError = check.err.split('\n').find((l) => l.startsWith('ERROR:')) ?? (check.ok ? `exit ${check.code}` : 'the guard refused the container shell')
+    if (!f.expect(check.ok && check.code === 0 && passed !== undefined, `${AD_CLIENT_CHECK_FAILED}: ${checkError}`)) {
       return f.result()
     }
 

@@ -40,9 +40,9 @@
  * release candidates pass, later versions pass, and an earlier version's
  * release candidate is refused. Its lexical traps (`LEXICAL_TRAPS`) are not
  * empty, so a string comparison planted in the floor check fails a case.
- * `tests/ci-live-docker.test.ts` checks that the release candidate pinned in
- * `docker/Dockerfile.test.base` (`AD_RC_VERSION`) has the floor as its
- * major.minor.patch and passes it (SRJ-201, SRJ-202). Here, the
+ * `tests/ci-live-docker.test.ts` checks that the agent-director release
+ * pinned in `docker/Dockerfile.test.base` (`AD_VERSION`) is the floor itself,
+ * a plain release that `package.json` pins (SRJ-201). Here, the
  * `PHASE1_RC_VERSION` case (it parses as the floor with pre-release `rc.1`,
  * SRJ-1304) guards the versions helper's shape only, since the helper builds
  * it from the floor; and any `<floor>-rc.N` passes the floor (SRJ-202).

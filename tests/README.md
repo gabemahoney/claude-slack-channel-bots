@@ -145,7 +145,7 @@ only skip.
 ```
 tests/
   integration/
-    test-1-install-startup.sh      # b.j9i: install the package, then swap the release candidate's agent-director client into it and check it (rc-client-check.sh --package),
+    test-1-install-startup.sh      # b.j9i: install the package, then check the agent-director client it resolves, the release's from npm, changing nothing (ad-client-check.sh --package),
                                    # then run fixtures/phase1-client-check.ts on the installed package; a pre-persona config fails start; the persona config starts in dry run
     test-2-dryrun-spawn-skip.sh    # b.3hy: persona load line, per-persona dry-run spawn skip, /interject 404 and 503
     test-3-cozempic-restart.sh     # b.set: cozempic probe, stop --stop-bots per persona, clean restart
@@ -179,7 +179,7 @@ tests/
   README.md
 docker/
   Dockerfile.test.base             # source-independent base image (see docker/README.md)
-  rc-client-check.sh               # the client-under-test check, copied into the base (see docker/README.md)
+  ad-client-check.sh               # the client-under-test check (check only), copied into the base (see docker/README.md)
   Dockerfile.test                  # top image: the tests and the packed package
   entrypoint.sh                    # sets up testuser's Claude config, then runs tests/runner.sh
 ```
@@ -241,7 +241,7 @@ a config or credentials file from the host:
 the scripts in its order (see Layout) in one container, so state one script
 leaves (the installed package, the running daemon, its PID file and server
 log) is consumed by the scripts after it: Test 1 installs the package, checks
-the agent-director client it resolves (`rc-client-check.sh --package`, then
+the agent-director client it resolves (`ad-client-check.sh --package`, then
 `fixtures/phase1-client-check.ts`) and starts the daemon, Tests 2 and 3 use that daemon, Test 4 uses the installed package. The
 runner stops at the first failure and runs nothing after it.
 

@@ -18,13 +18,15 @@
  * - a dry run (no workspace) runs exactly the pre-flight, install, setup,
  *   S2, S3, 29a, Teardown and HOST checks;
  * - Part 1.4's install runs the image's client-under-test check
- *   (`RC_CLIENT_CHECK --package "$PKG"`, behind the guard) once, after the
+ *   (`AD_CLIENT_CHECK --package "$PKG"`, behind the guard) once, after the
  *   install and its trust step and before the state check, the package
- *   checksums and the skill link, and records its summary line; a check that
- *   exits non-zero, prints no summary or is refused by the guard is a
- *   blocking FAIL whose reason is `RC_CLIENT_CHECK_FAILED` and the check's
- *   own `ERROR:` line (or the exit or the refusal), and nothing after it runs;
- *   a failed install never reaches the check;
+ *   checksums and the skill link, and records its summary line; the check is
+ *   check-only: no other step touches the client the package resolves; a
+ *   check that exits non-zero, prints no summary or is refused by the guard
+ *   is a blocking FAIL whose reason is `AD_CLIENT_CHECK_FAILED` and the
+ *   check's own `ERROR:` line (or the exit or the refusal), advising no
+ *   upgrade, and nothing after it runs; a failed install never reaches the
+ *   check;
  * - no live check passes against a silent workspace (nothing answers);
  * - HOST fails on any change to the host's service=cscb rows, CSCB tmux
  *   sessions, port-3100 listener or config.json hash, and on a probe that
@@ -84,6 +86,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
 import { parsePersonaConfigBytes } from '../src/config.ts'
 import { checkPersonaTarget } from '../src/registry.ts'
 import { renderAppliedLogLine } from '../src/reload-apply.ts'
@@ -147,7 +150,8 @@ import {
 } from '../ci-live/checks/helpers.ts'
 import { check28, CHECK27_PROMPT, check29a, parseCount, parseLeakcount, parsePersonaCounts, personaCountsProblem } from '../ci-live/checks/lifecycle-checks.ts'
 import { FINAL_CHECKS, hostCheck, PLAN_CHECKS, teardownCheck } from '../ci-live/checks/list.ts'
-import { installCheck, RC_CLIENT_CHECK_FAILED, s2Check, s3Check } from '../ci-live/checks/setup-checks.ts'
+import { AD_CLIENT_CHECK_FAILED, installCheck, s2Check, s3Check } from '../ci-live/checks/setup-checks.ts'
+import { AD_CLIENT_CHECK, AD_CLIENT_CHECK_PASSED } from '../ci-live/lib/ad-client-check.ts'
 import { FlowError, type BrowserDriver, type HumanApi } from '../ci-live/lib/browser-types.ts'
 import type { ContainerExec } from '../ci-live/lib/container.ts'
 import {
@@ -164,7 +168,6 @@ import {
 import { HumanSession } from '../ci-live/lib/human-session.ts'
 import { buildLiveConfig, renderConfig } from '../ci-live/lib/live-config.ts'
 import type { ProcResult } from '../ci-live/lib/proc.ts'
-import { RC_CLIENT_CHECK, RC_CLIENT_CHECK_PASSED } from '../ci-live/lib/rc-client.ts'
 import { RESULTS_COLUMNS } from '../ci-live/lib/results.ts'
 import type { PersonaLetter } from '../ci-live/lib/personas.ts'
 import { MINUTE, SECOND } from '../ci-live/lib/wait.ts'
@@ -172,6 +175,7 @@ import { emptyAppsState } from '../ci-live/lib/apps-state.ts'
 import { virtualClock } from './test-helpers/ci-live.ts'
 import { APP_TOKEN_PREFIX, assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL } from './test-helpers/credentials.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
+import { BELOW_CLIENT_MIN_VERSION, CLIENT_MIN_VERSION, OLD_AD_VERSION } from './test-helpers/agent-director-versions.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -692,13 +696,20 @@ describe('host-state', () => {
 // ---------------------------------------------------------------------------
 
 describe('Part 1.4 install', () => {
-  const SUMMARY = `${RC_CLIENT_CHECK_PASSED}client /home/testuser/.bun/install/global/node_modules/agent-director`
+  // The client the package resolves, and the helper's own success line for it (docker/ad-client-check.sh).
+  const CLIENT = '/home/testuser/.bun/install/global/node_modules/agent-director'
+  // Versions come from src/ and the shared helper; the hash and commit are placeholders (installCheck only passes these lines through).
+  const RELEASE = PHASE1_FLOOR_VERSION
+  const TGZ = `/opt/agent-director/client/agent-director-${RELEASE}.tgz`
+  const TGZ_SHA256 = 'a'.repeat(64)
+  const COMMIT = 'c'.repeat(40)
+  const SUMMARY = `${AD_CLIENT_CHECK_PASSED}${CLIENT} is agent-director ${RELEASE} from npm (tarball sha256 ${TGZ_SHA256}); agent-director ${RELEASE} (${COMMIT}) at /opt/agent-director/bin/agent-director; client floor ${CLIENT_MIN_VERSION}`
   const PASSING: ReadonlyArray<readonly [string, Reply]> = [
     ['env | cut', '0'],
     ["echo 'test host'", 'test host'],
     ['bun install -g', ''],
     ['echo "PKG=$PKG"', 'PKG=/home/testuser/pkg\n/home/testuser/pkg\n1.2.3'],
-    [RC_CLIENT_CHECK, `unpacking the client tarball\n${SUMMARY}`],
+    [AD_CLIENT_CHECK, SUMMARY],
     ['ls -A "$S"', 'config.json'],
     ['jq -c . "$S/config.json"', '{"personas":[]}'],
     ['pkg-before.sha256', '42'],
@@ -714,46 +725,59 @@ describe('Part 1.4 install', () => {
     const { r, scripts } = await run()
     expect([r.status, r.reason]).toEqual(['PASS', undefined])
     expect(r.evidence).toContain(SUMMARY)
-    expect(scripts.filter((s) => s.includes(RC_CLIENT_CHECK))).toEqual([`guard || exit 90\n${RC_CLIENT_CHECK} --package "$PKG"`])
+    expect(scripts.filter((s) => s.includes(AD_CLIENT_CHECK))).toEqual([`guard || exit 90\n${AD_CLIENT_CHECK} --package "$PKG"`])
   })
 
   test('the client-under-test check runs after the install and its trust step, and before the state check, the checksums and the skill link', async () => {
     const { scripts } = await run()
-    const rc = at(scripts, RC_CLIENT_CHECK)
-    const order = [at(scripts, 'bun pm -g trust'), at(scripts, '$PKG/README.md'), rc, at(scripts, 'ls -A "$S"'), at(scripts, 'pkg-before.sha256'), at(scripts, 'ln -s "$PKG/skills')]
+    const check = at(scripts, AD_CLIENT_CHECK)
+    const order = [at(scripts, 'bun pm -g trust'), at(scripts, '$PKG/README.md'), check, at(scripts, 'ls -A "$S"'), at(scripts, 'pkg-before.sha256'), at(scripts, 'ln -s "$PKG/skills')]
     expect(order.every((i) => i >= 0)).toBe(true)
     expect(order).toEqual([...order].sort((a, b) => a - b))
   })
 
-  // The ERROR lines in docker/rc-client-check.sh's own shapes, for the client the package resolves.
-  const CLIENT = '/home/testuser/.bun/install/global/node_modules/agent-director'
-  const TGZ = '/opt/agent-director-rc/client/agent-director-0.10.0.tgz'
-  const CONTENT = `ERROR: rc-client check 1 (content): the client at ${CLIENT} is not the release candidate's client: 1 difference(s) from ${TGZ}, first: Files <tarball>/dist/index.js and ${CLIENT}/dist/index.js differ`
-  const EXPORTS = `ERROR: rc-client check 2 (exports): the client at ${CLIENT} does not export ErrTmuxUnresponsive ErrTmuxSessionConflict as AgentDirectorError classes`
-  const BINARY = "ERROR: rc-client check 3 (binary): the first agent-director binary on PATH, /opt/agent-director-rc/bin/agent-director, reports version 0.10.0 (0123456789abcdef0123456789abcdef01234567), not the release candidate's 0.11.0-rc.1 (d787cb434043868543c3c98105e3394026d6ca5f)"
-  const REFUSAL = 'ERROR: rc-client-check.sh: /etc/cscb-ci-image is absent: this check runs only in a cscb-ci image (it runs agent-director); refusing to run'
-  const USAGE = 'ERROR: rc-client-check.sh: /home/testuser/pkg holds no package.json (usage: rc-client-check.sh --package <dir> | --client <dir>)'
+  test("the client is checked as installed: every script is one of the install steps, and none but the check names the package's client or the image's agent-director files", async () => {
+    const { scripts } = await run()
+    const steps = ['env | cut', "echo 'test host'", 'bun install -g', 'echo "PKG=$PKG"', '$PKG/README.md', AD_CLIENT_CHECK, 'ls -A "$S"', 'jq -c . "$S/config.json"', 'pkg-before.sha256', 'ln -s "$PKG/skills']
+    expect(scripts.map((s) => steps.filter((k) => s.includes(k)))).toEqual(steps.map((k) => [k]))
+    const others = scripts.filter((s) => !s.includes(AD_CLIENT_CHECK))
+    for (const touch of ['node_modules/agent-director', '/opt/agent-director', '--client']) {
+      expect(others.filter((s) => s.includes(touch))).toEqual([])
+    }
+  })
+
+  // The ERROR lines in docker/ad-client-check.sh's own shapes, for the client the package resolves.
+  const TARBALL = `ERROR: ad-client check 1 (tarball): ${TGZ} has SHA-256 ${'0'.repeat(64)}, not the pinned ${TGZ_SHA256}`
+  const VERSION = `ERROR: ad-client check 2 (version): the client at ${CLIENT} is agent-director ${OLD_AD_VERSION}, not the release's ${RELEASE}`
+  const CONTENT = `ERROR: ad-client check 3 (content): the client at ${CLIENT} is not the npm client tarball's contents: 1 difference(s) from ${TGZ}, first: Files <tarball>/dist/index.js and ${CLIENT}/dist/index.js differ`
+  const BINARY = `ERROR: ad-client check 5 (binary): the first agent-director binary on PATH, /opt/agent-director/bin/agent-director, reports version ${OLD_AD_VERSION} (${'0'.repeat(40)}), not the release's ${RELEASE} (${COMMIT}) that the client ${RELEASE} pairs with`
+  const CREATE = `ERROR: ad-client check 7 (client-create): Client.create() from ${CLIENT}/dist/index.js failed: ErrSystemInstallTooOld: agent-director ${BELOW_CLIENT_MIN_VERSION} is below ${CLIENT_MIN_VERSION}`
+  const REFUSAL = 'ERROR: ad-client-check.sh: /etc/cscb-ci-image is absent: this check runs only in a cscb-ci image (it runs agent-director); refusing to run'
+  const USAGE = 'ERROR: ad-client-check.sh: /home/testuser/pkg holds no package.json (usage: ad-client-check.sh --package <dir> | --client <dir>)'
   const failures: ReadonlyArray<readonly [string, Partial<ProcResult>, string]> = [
-    ['a content mismatch', { code: 1, stderr: `cp: done\n${CONTENT}` }, CONTENT],
-    ['a missing Phase 1 export', { code: 1, stderr: EXPORTS }, EXPORTS],
+    ['a client tarball off its pinned SHA-256', { code: 1, stderr: TARBALL }, TARBALL],
+    ['a client that is not the release', { code: 1, stderr: VERSION }, VERSION],
+    ['a content mismatch, after other stderr', { code: 1, stderr: `tar: Ignoring unknown extended header keyword\n${CONTENT}` }, CONTENT],
     ['the wrong binary on PATH', { code: 1, stderr: BINARY }, BINARY],
+    ['Client.create() failing', { code: 1, stderr: CREATE }, CREATE],
     ["the check's refusal", { code: 3, stderr: REFUSAL }, REFUSAL],
     ["the check's usage error", { code: 2, stderr: USAGE }, USAGE],
     ['a non-zero exit with no ERROR line', { code: 139, stderr: 'Segmentation fault' }, 'exit 139'],
-    ['exit 0 with no summary line', { code: 0, stdout: 'unpacking the client tarball' }, 'exit 0'],
+    ['exit 0 with no summary line', { code: 0, stdout: '' }, 'exit 0'],
     ['the guard refusing the shell', { code: 90 }, 'the guard refused the container shell'],
   ]
 
-  test.each(failures)('a blocking FAIL on %s, with its own reason, and nothing after the check runs', async (_what, reply, detail) => {
-    const { r, scripts } = await run([[RC_CLIENT_CHECK, reply]])
-    expect([installCheck.blocking, r.status, r.reason]).toEqual([true, 'FAIL', `${RC_CLIENT_CHECK_FAILED}: ${detail}`])
-    expect(scripts.at(-1)).toContain(RC_CLIENT_CHECK)
+  test.each(failures)('a blocking FAIL on %s, with its own reason, advising no upgrade, and nothing after the check runs', async (_what, reply, detail) => {
+    const { r, scripts } = await run([[AD_CLIENT_CHECK, reply]])
+    expect([installCheck.blocking, r.status, r.reason]).toEqual([true, 'FAIL', `${AD_CLIENT_CHECK_FAILED}: ${detail}`])
+    expect(r.reason).not.toMatch(/upgrad|reinstall|install-agent-director|@latest/i)
+    expect(scripts.at(-1)).toContain(AD_CLIENT_CHECK)
   })
 
   test('a failed install stops before the client-under-test check', async () => {
     const { r, scripts } = await run([['bun install -g', { code: 1 }]])
     expect([r.status, r.reason]).toEqual(['FAIL', 'the install failed (exit 1; see ~/cscb-live/install.log in the container)'])
-    expect(at(scripts, RC_CLIENT_CHECK)).toBe(-1)
+    expect(at(scripts, AD_CLIENT_CHECK)).toBe(-1)
   })
 })
 

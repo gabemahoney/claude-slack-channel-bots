@@ -2,15 +2,15 @@
 # Test 1 (b.j9i): install package, start daemon in dry-run, verify startup.
 #
 # Right after the install, the image's client-under-test check
-# (/opt/agent-director-rc/check/rc-client-check.sh --package) replaces the
-# agent-director client the installed package resolves with the release
-# candidate's and checks it; a failed check ends the test with one FAIL line
-# carrying the check's ERROR line. Then the Phase 1 class check
-# (fixtures/phase1-client-check.ts, run with bun and CSCB_PKG_DIR set to the
-# installed package) checks that the installed package uses the swapped-in
-# client's own Phase 1 error classes; a failed check ends the test with one
-# FAIL line naming the fixture's first failing check, and a passed one logs
-# the fixture's PASS line. Tests 2 onward use this install.
+# (/opt/agent-director/check/ad-client-check.sh --package) checks the
+# agent-director client the installed package resolves, as the install left
+# it: the release's client from npm at the package's exact pin; a failed
+# check ends the test with one FAIL line carrying the check's ERROR line.
+# Then the Phase 1 class check (fixtures/phase1-client-check.ts, run with bun
+# and CSCB_PKG_DIR set to the installed package) checks that the installed
+# package uses that client's own Phase 1 error classes; a failed check ends
+# the test with one FAIL line naming the fixture's first failing check, and a
+# passed one logs the fixture's PASS line. Tests 2 onward use this install.
 #
 # The config is a persona config (b.av2 SR-13.5): persona "alpha" in two
 # channels (delivery all, prompts to the first), and the zero-channel persona
@@ -43,22 +43,23 @@ cd /test-repo
 bun install /tmp/package.tgz >/tmp/bun-install.log 2>&1 \
     || fail "bun install /tmp/package.tgz failed (see /tmp/bun-install.log)"
 
-# --- The client under test: the release candidate's ----------------------
-# The image's check swaps agent-director's release-candidate client into the
-# agent-director the installed package resolves, then checks it (content,
-# Phase 1 classes, the binary first on PATH, the floor, Client.create()).
-RC_CLIENT_CHECK=/opt/agent-director-rc/check/rc-client-check.sh
+# --- The client under test: the release's, from npm ----------------------
+# The image's check reads the agent-director the installed package resolves
+# and checks it, changing nothing (the npm tarball's pinned SHA-256, the
+# exact pin, its contents, Phase 1 classes, the binary first on PATH, the
+# floor, Client.create()).
+AD_CLIENT_CHECK=/opt/agent-director/check/ad-client-check.sh
 INSTALLED_PKG=/test-repo/node_modules/claude-slack-channel-bots
-if ! RC_CHECK_OUT=$("${RC_CLIENT_CHECK}" --package "${INSTALLED_PKG}" 2>/tmp/test-1-rc-client-check.err); then
-    RC_CHECK_ERR=$(grep -m 1 '^ERROR:' /tmp/test-1-rc-client-check.err || true)
-    fail "the release-candidate client check on ${INSTALLED_PKG} failed: ${RC_CHECK_ERR:-no ERROR line (see /tmp/test-1-rc-client-check.err)}"
+if ! AD_CHECK_OUT=$("${AD_CLIENT_CHECK}" --package "${INSTALLED_PKG}" 2>/tmp/test-1-ad-client-check.err); then
+    AD_CHECK_ERR=$(grep -m 1 '^ERROR:' /tmp/test-1-ad-client-check.err || true)
+    fail "the agent-director client check on ${INSTALLED_PKG} failed: ${AD_CHECK_ERR:-no ERROR line (see /tmp/test-1-ad-client-check.err)}"
 fi
-echo "${RC_CHECK_OUT}"
+echo "${AD_CHECK_OUT}"
 
 # --- The Phase 1 class check on the installed package ---------------------
 # The fixture imports the installed package's error modules and the
-# agent-director client that package resolves (the release candidate's, just
-# swapped in) and checks that the package uses the client's own Phase 1
+# agent-director client that package resolves (the one just checked) and
+# checks that the package uses the client's own Phase 1
 # classes. Its FAIL lines go to a file, so the runner's verdict is this test's
 # FAIL line, which names the fixture's first failing check.
 PHASE1_CHECK="${FIXTURES}/phase1-client-check.ts"

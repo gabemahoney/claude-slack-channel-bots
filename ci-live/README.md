@@ -29,18 +29,21 @@ exception is `hgx`, which takes a value only as an argument (see
     created on the current VM through mail.tm's API, and its address is also
     in `/tmp/cscb-test-mailbox-address.txt`.
 - On the VM: docker, the `/ci` base image (if
-  `docker image inspect cscb-ci-base:v5` fails, run `/ci` once, with
-  `CSCB_AD_RC_DIR` and `CSCB_AD_SRC_DIR` set: see `docker/README.md`), Google
-  Chrome (`google-chrome --version`), bun, and the release candidate's
-  directory in `CSCB_AD_RC_DIR`. A run on the release candidate takes its
-  binary explicitly: steps 5 and 6 pass
-  `--agent-director-binary "$CSCB_AD_RC_DIR/agent-director-linux-amd64"`,
-  and the runner stages that file in the live image without running it on
-  the host. The image build checks it against the release candidate's
-  client in the base image. Without the option the runner stages the host's
-  own agent-director binary, which the build refuses unless it is the
-  release candidate (see "The live image's agent-director" in
-  `docker/README.md`).
+  `docker image inspect cscb-ci-base:v6` fails, run `/ci` once, with
+  `CSCB_AD_SRC_DIR` set: see `docker/README.md`), Google Chrome
+  (`google-chrome --version`), bun, and `CSCB_AD_SRC_DIR` set to a checkout
+  of agent-director's source tree holding the tag of the release the base
+  pins (`ARG AD_VERSION` in `docker/Dockerfile.test.base`, `v0.11.0`). A run
+  takes its agent-director binary explicitly: the release's
+  `agent-director-linux-amd64`, downloaded from agent-director's GitHub
+  release into a scratch directory and checked against the base's pinned
+  SHA-256 (see [Stage the release binary](#stage-the-release-binary)).
+  Steps 5 and 6 pass it with `--agent-director-binary`, and the runner
+  stages that file in the live image without running it on the host. The
+  image build checks it against the release's client in the base image.
+  Without the option the runner stages the host's own agent-director
+  binary, which the build refuses unless it is that release's (see "The
+  live image's agent-director" in `docker/README.md`).
 
 Not there yet: the refresh token (step 1), the Claude credentials if your
 shell lacks them (step 2), the test human's browser session (step 4), and the
@@ -248,17 +251,42 @@ address, confirm it with `mailbox --forwarding`, and point the filter's
 
 ## 5. Check the harness (optional)
 
+### Stage the release binary
+
+The dry run and step 6 both need it. From the repo root, download the
+release's binary into a fresh scratch directory outside the checkout, and
+check it against the pin. The release's
+repository is read from its own `install.sh` at the release tag, in
+`CSCB_AD_SRC_DIR`:
+
 ```sh
-bun ci-live/run.ts --dry-run --agent-director-binary "$CSCB_AD_RC_DIR/agent-director-linux-amd64"
+AD_VERSION="$(sed -n 's/^ARG AD_VERSION=//p' docker/Dockerfile.test.base)"
+AD_SHA256="$(sed -n 's/^ARG AD_SHA256=//p' docker/Dockerfile.test.base)"
+AD_REPO="$(git -C "$CSCB_AD_SRC_DIR" show "v$AD_VERSION:skills/install-agent-director/install.sh" | sed -n 's/^readonly RELEASE_REPO_SLUG="\(.*\)"$/\1/p')"
+AD_BIN_DIR="$(mktemp -d)"
+AD_BIN="$AD_BIN_DIR/agent-director-linux-amd64"
+curl -fsSL -o "$AD_BIN" "https://github.com/$AD_REPO/releases/download/v$AD_VERSION/agent-director-linux-amd64"
+[ "$(sha256sum "$AD_BIN" | cut -d' ' -f1)" = "$AD_SHA256" ] && chmod 0755 "$AD_BIN" && echo "$AD_BIN"
+```
+
+The last line prints the path only when the SHA-256 matches. The file only
+gets its execute bit, which the runner requires: never run it, and never
+copy it into `~/.agent-director`, `~/.local/bin`, `node_modules` or anything
+on `PATH`. Remove `$AD_BIN_DIR` after your last run.
+
+### The dry run
+
+```sh
+bun ci-live/run.ts --dry-run --agent-director-binary "$AD_BIN"
 ```
 
 It reads no secret, needs no Claude credentials, takes about a minute (a few
 when the image is rebuilt) and must end with `VERDICT: PASS`. It builds the
 live image with the given binary, which the runner checks by reading only
 (it must be an executable regular file, else the run exits 2 naming the
-option) and never runs on the host. A binary that is not the release
-candidate fails the image build, and the `container` row says to give the
-release candidate's binary with `--agent-director-binary`. Among its rows,
+option) and never runs on the host. A binary that is not the release's
+fails the image build, and the `container` row says to give that release's
+`agent-director-linux-amd64` with `--agent-director-binary`. Among its rows,
 `prompt-guard` shows the prompt guard denying a fixture prompt no check
 expects. It has a lock of its own, so it can run beside a real run.
 
@@ -268,11 +296,12 @@ From the repo root of the checkout you want to test, in a tmux session (a run
 takes about 2 to 3 hours):
 
 ```sh
-bun ci-live/run.ts --agent-director-binary "$CSCB_AD_RC_DIR/agent-director-linux-amd64"
+bun ci-live/run.ts --agent-director-binary "$AD_BIN"
 ```
 
-`--agent-director-binary` takes the binary to stage in the live image, as in
-step 5. It combines with the other run flags (`--only`, `--keep-container`,
+`--agent-director-binary` takes the binary to stage in the live image, the
+one staged in step 5 (a new shell has no `$AD_BIN`: use the path the staging
+printed). It combines with the other run flags (`--only`, `--keep-container`,
 `--clean`, `--create-apps`), never with `--provision-only` or `--stage`,
 which build no image.
 
