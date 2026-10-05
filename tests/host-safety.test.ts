@@ -2440,6 +2440,44 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
 })
 
 // ---------------------------------------------------------------------------
+// Static audit: the value printer and the symlink re-point helper (b.jg5
+// SRJ-1306, SRJ-1401; test-14's harness additions, confirm at the reconcile pass)
+// ---------------------------------------------------------------------------
+
+/** The fmk scenarios' value printer, which imports the package under test as `fmk-driver.ts` does. */
+const FMK_TEXTS_PATH = join(INTEGRATION_DIR, 'fixtures', 'fmk-texts.ts')
+
+/** scenario.sh's re-point of a symlinked directory under SCENARIO_ROOT: a move. */
+const HOME_GUARDED_REPOINT_HELPERS: readonly string[] = ['repoint_symlink']
+
+describe('static audit: fmk-texts.ts and repoint_symlink check the image and HOME first (b.jg5 SRJ-1306)', () => {
+  const NODE_IMPORTS = lines("import { existsSync } from 'node:fs'", "import { join } from 'node:path'")
+  const CHECK = lines(`if (!existsSync('${CI_IMAGE_MARKER}')) {`, "  console.error('FAIL: fmk-texts: refused')", '  process.exit(2)', '}')
+
+  test('the current tree: fmk-texts.ts imports only node: built-ins statically and checks the marker first', () => {
+    expect(existsSync(FMK_TEXTS_PATH)).toBe(true)
+    expect(driverGuardFindings(relative(REPO_ROOT, FMK_TEXTS_PATH), readFileSync(FMK_TEXTS_PATH, 'utf-8'))).toEqual([])
+  })
+
+  test('fmk-texts.ts: a static package import before the marker check is flagged, naming the file and the rule', () => {
+    const source = lines(NODE_IMPORTS, "import { ORPHAN_CLEANUP_LABEL } from 'claude-slack-channel-bots/src/kill-failure-alert.ts'", CHECK)
+    expectNamedFindings(driverGuardFindings('fmk-texts.ts', source), 'fmk-texts.ts', IMAGE_GUARD_RULE.driverStaticImport)
+  })
+
+  test('the current tree: repoint_symlink runs require_scenario_home before its first move', () => {
+    expect(helperHomeCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), readFileSync(SCENARIO_PATH, 'utf-8'), HOME_GUARDED_REPOINT_HELPERS)).toEqual([])
+  })
+
+  test('repoint_symlink without its require_scenario_home is flagged at its move', () => {
+    const source = readFileSync(SCENARIO_PATH, 'utf-8')
+    const unguarded = source.replace(/(\nrepoint_symlink\(\) \{\n(?:.*\n)*?)    require_scenario_home "\$\{step\}"\n/, '$1')
+
+    expect(unguarded).not.toBe(source)
+    expectNamedFindings(helperHomeCheckFindings('scenario.sh', unguarded, HOME_GUARDED_REPOINT_HELPERS), 'scenario.sh', IMAGE_GUARD_RULE.homeCheckFirst)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Static audit: the harness's one agent-director delete (b.jg5 SRJ-1306)
 // ---------------------------------------------------------------------------
 

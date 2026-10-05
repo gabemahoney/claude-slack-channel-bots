@@ -560,6 +560,20 @@
 #                                      `<channel id> <instance id> <session name> <session id>
 #                                      <pane id>`
 #
+#   The human's filesystem steps (fmk mode; harness addition, confirm at the reconcile pass;
+#   both guards first; no tmux or agent-director call)
+#   repoint_symlink <link> <target>    re-point the existing symlink <link> to the existing
+#                                      directory <target>, both under SCENARIO_ROOT (as written
+#                                      and by real path; <link>'s directory by real path), by a
+#                                      new link beside it renamed over it; fails unless <link>
+#                                      then resolves to <target>'s real path. Refuses a <link>
+#                                      or <target> outside SCENARIO_ROOT, a <link> that is not
+#                                      a symlink, and a missing <target> or one that is not a
+#                                      directory. A persona whose working_directory or
+#                                      claude_config_dir is <link> then compares, by real path,
+#                                      unequal to the row its last launch recorded (a real
+#                                      cwd or config_dir mismatch, with no config edit)
+#
 #   CSCB processes and the tmux shim (see "CSCB processes and the tmux shim")
 #   cscb_run <command> [<arg>...]      run <command> as a CSCB process (a CLI command of the package
 #                                      under test or another, such as scenario 1's pre-persona CLI, or
@@ -2787,6 +2801,46 @@ end_session() {
     if _scenario_tmux has-session -t "${sid}"; then
         fail "${step}: session ${sid} still exists after kill-session"
     fi
+}
+
+# ---------------------------------------------------------------------------
+# The human's filesystem steps (fmk mode; harness addition, confirm at the
+# reconcile pass)
+# ---------------------------------------------------------------------------
+
+repoint_symlink() {
+    local link="${1:-}" target="${2:-}" step real_root real_dir real_target tmp got
+    step="repoint_symlink ${link} ${target}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    [[ "${SCENARIO_FMK}" == 1 ]] || fail "${step}: the harness's filesystem steps are for fmk scripts only"
+    (( $# == 2 )) || fail "${step}: takes <link> <target>"
+    real_root="$(realpath -e -- "${SCENARIO_ROOT}" 2> /dev/null)" \
+        || fail "${step}: cannot resolve SCENARIO_ROOT ${SCENARIO_ROOT}"
+    [[ "${link}" == "${SCENARIO_ROOT}"/* ]] \
+        || fail "${step}: refused: the link ${link} is not under SCENARIO_ROOT ${SCENARIO_ROOT}"
+    [[ "${target}" == "${SCENARIO_ROOT}"/* ]] \
+        || fail "${step}: refused: the target ${target} is not under SCENARIO_ROOT ${SCENARIO_ROOT}"
+    [[ -L "${link}" ]] || fail "${step}: refused: ${link} is not a symlink"
+    # The link's own directory, by real path (the link itself is not followed).
+    real_dir="$(realpath -e -- "$(dirname -- "${link}")" 2> /dev/null)" \
+        || fail "${step}: cannot resolve the directory of ${link}"
+    [[ "${real_dir}" == "${real_root}" || "${real_dir}" == "${real_root}"/* ]] \
+        || fail "${step}: refused: the link's directory resolves to ${real_dir}, which is not under SCENARIO_ROOT ${real_root}"
+    [[ -e "${target}" ]] || fail "${step}: refused: the target ${target} does not exist"
+    [[ -d "${target}" ]] || fail "${step}: refused: the target ${target} is not a directory"
+    real_target="$(realpath -e -- "${target}" 2> /dev/null)" || fail "${step}: cannot resolve the target ${target}"
+    [[ "${real_target}" == "${real_root}"/* ]] \
+        || fail "${step}: refused: the target resolves to ${real_target}, which is not under SCENARIO_ROOT ${real_root}"
+    tmp="${real_dir}/.scenario-repoint.$$.${RANDOM}"
+    [[ ! -e "${tmp}" && ! -L "${tmp}" ]] || fail "${step}: ${tmp} already exists"
+    ln -s -- "${real_target}" "${tmp}" || fail "${step}: could not make a new link beside ${link}"
+    # One rename, so a reader never finds the link missing.
+    mv -f -T -- "${tmp}" "${link}" || { rm -f -- "${tmp}"; fail "${step}: could not rename the new link over ${link}"; }
+    [[ -L "${link}" ]] || fail "${step}: ${link} is no longer a symlink after the re-point"
+    got="$(realpath -e -- "${link}" 2> /dev/null)" || fail "${step}: ${link} does not resolve after the re-point"
+    [[ "${got}" == "${real_target}" ]] \
+        || fail "${step}: ${link} resolves to ${got} after the re-point, not to ${real_target}"
 }
 
 # ---------------------------------------------------------------------------

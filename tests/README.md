@@ -159,6 +159,9 @@ why:
   statement of each checks the marker and exits 2 before it reads an argument
   or loads a module; each statically imports only `node:` built-ins.
   (`fixtures/phase1-client-check.ts` also refuses to run without the marker.)
+- `fixtures/fmk-texts.ts`: the same first statement, exiting 2 before it
+  reads an argument or loads a module; it statically imports only `node:`
+  built-ins and loads the installed package only after the check.
 - Every `scenario.sh` step that installs, moves or swaps an agent-director
   binary or the shim, every harness agent-director call (`ad`, `ad_capture`, `ad_admin`, `ad_admin_capture`),
   every harness `sqlite3` read or edit (`ad_store_edit`, `ad_store_id`,
@@ -227,6 +230,9 @@ tests/
                                    # re-bind (`tmux_server_steps`). The re-fire legs wait out agent-director's default G (60 s); only after them does
                                    # `store_statements` write a `[tmux]` table (`starting_session_seconds = 60`, `stopping_window_seconds = 30`), so the
                                    # kill need not wait 300 s. It runs about two and a half minutes and ends with the three closing assertions
+    test-14-fmk-kill-fails.sh      # HO §7 scenario 2 (b.jg5 SRJ-1403), fmk: a kill that really fails deletes and launches nothing; with the tmux shim in fail-kill,
+                                   # for a persona removed from the config at a start, a config_dir mismatch and a cwd mismatch, each kill answers ErrTmuxKillFailed,
+                                   # the row is kept and one alert is routed per SRJ-704 (see fmk scenario list)
     lib/
       scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards (see Scenario helper below)
     fixtures/
@@ -237,6 +243,10 @@ tests/
                                    # with one `DRIVER:` outcome line: a `resume` (scenario 5) and a reuse spawn (scenarios 8 and 25) through the package's
                                    # forced-launch seams, and the persona's pane read under another TMUX_TMPDIR (scenario 26); refuses to run without the image
                                    # marker /etc/cscb-ci-image and imports the installed package and its agent-director client only after that check
+      fmk-texts.ts                 # the fmk scenarios' one value printer: prints a CSCB-defined text, class label, log fragment or setting value from the
+                                   # installed package, through the export that builds or holds it, so no scenario retypes one; its header lists each entry and
+                                   # its `src/` export. Run from the scenario's own shell, never as a CSCB process; refuses to run without the image marker
+                                   # /etc/cscb-ci-image and imports the installed package only after that check
       driver.ts                    # Test 4 driver: builds a one-persona config, calls spawnForPersona directly, then follows the persona's dialog approver through the package's seams
                                    # (running when the launch returns, stops because the row went live, keeps the launch start); deletes no row
       stub-claude.sh               # fake `claude` (Tests 4, 10 and 12, and every fmk script): runs the mode its working directory selects (the dev-channels
@@ -753,6 +763,15 @@ These hold for every fmk script (b.jg5 SRJ-1401):
   --record`).
 - Shim logs are read by parent process, as above, never by scraping a pane.
 
+### fmk scenario list
+
+Each HO §7 scenario's script, what it drives and what it checks. The
+script's header comment is its full specification.
+
+| Scenario | Script | Sites | Outcomes checked | Modes, helpers and settings |
+|---|---|---|---|---|
+| 2 (b.jg5 SRJ-1403; AC 24, AC 64) | `test-14-fmk-kill-fails.sh` | The start sweep (a persona removed while its worker runs); a `config_dir` mismatch, met at the collision ladder's `pending` branch (SRJ-411) by a start; a `cwd` mismatch, met by a running server's first pending-only retry. `resume_enabled=false` is not driven here: SRJ-1403 leaves it, with `ErrSpawnNotResumable` with dead evidence, to SRJ-110's unit test (dead evidence means the session is gone, so agent-director's kill sends no kill for the shim to fail) | Every kill try answers `ErrTmuxKillFailed`, `KILL_RETRY_TRIES` tries; no CSCB delete or launch (spawn or resume) of the leg's id follows; the row is kept (read afterwards, present). One alert is routed per SRJ-704: at the start sweep, one `orphan-cleanup` startup-errors entry and one server-log line, nothing to Slack; at a `config_dir` or `cwd` mismatch, one ordinary alert at the persona's destination, quoting agent-director's description, and no second alert through one further retry. No `tmux-unresponsive` post (SRJ-307) | tmux-shim `fail-kill` for the kills checked (`log` while a leg launches); stub modes `dev-channels` (reporting, the start sweep's persona) and `silent` (the mismatch personas, whose rows stay `pending`); the mismatch made by re-pointing a symlinked directory (`repoint_symlink`); agent-director's default settings, no `config.toml`, so `kill_exit_wait_ms` is its default, 5000 ms, measured (slowest exit 603 ms), and the retry makes 3 tries 2 s apart; `health_check_interval` 0; starts on 0.10.0 (`SCENARIO_AD_START=0.10.0`), then `install_ad_release` as its first step; values from `fixtures/fmk-texts.ts`; posts from the Slack stub's record |
+
 ### Harness-only steps
 
 The harness plays a human's acts with the helpers below (b.jg5 SRJ-1306,
@@ -795,6 +814,7 @@ of another session's.
 | A human's finished-row kill, agent-director-admin's `kill-finished` (scenario 10) | `ad_kill_include_finished` |
 | A human's agent-director-admin `delete` of the row with the unusable name (scenario 25) | `ad_delete_unusable_row` |
 | The host's `find-missing` loop | `run_find_missing_loop` |
+| Re-pointing a persona's symlinked `working_directory` or `claude_config_dir` (scenario 2) | `repoint_symlink` (see The human's filesystem steps) |
 
 The step that set `base-index` is withdrawn: no agent-director verb depends
 on pane indices, and no helper sets it.
@@ -911,6 +931,29 @@ own pending-row runs, and the harness runs no loop for it.
   log holds, and `wait_find_missing_runs <n> [<timeout-s>]` waits for `<n>`
   more (default `<n>` intervals plus 60 s), failing early when the loop
   stops.
+
+#### The human's filesystem steps
+
+`repoint_symlink <link> <target>` is a harness addition, to confirm at the
+reconcile pass. It plays a human re-pointing a persona's symlinked
+`working_directory` or `claude_config_dir` while the persona's row stays in
+the store. agent-director's `spawn` records the real `cwd`, CSCB writes the
+`config_dir` label by real path, and `compareRowToPersona` resolves the
+persona's directories by real path at every comparison. So after the
+re-point the persona compares unequal to the row its last launch recorded:
+a real `cwd` or `config_dir` mismatch, with no config edit.
+
+- `<link>` must be an existing symlink and `<target>` an existing
+  directory, both under `SCENARIO_ROOT` as written and by real path
+  (`<link>`'s directory by real path, the link itself not followed). It
+  refuses anything else, leaving the link as it was.
+- It makes a new link to `<target>`'s real path beside `<link>` and renames
+  it over `<link>`, so a reader never finds the link missing, then fails
+  unless `<link>` resolves to `<target>`'s real path.
+- It makes no tmux or agent-director call. Like every helper here it runs
+  `require_ci_image` and then `require_scenario_home` first, and only in fmk
+  mode; `tests/host-safety.test.ts` audits that the home check comes before
+  its first move.
 
 #### The 0.10.0 seeders
 
@@ -1056,6 +1099,9 @@ variable for the integration suite only (see Environment Variables in
   rewrites it to switch answers mid-run.
 - Every request is one JSONL line in a record file, labelled with the persona
   the scenario assigned to the token and a token hash, never the token.
+- A request's `text` is recorded with token-like text replaced by `<token>`:
+  whole for `chat.postMessage`, so a scenario reads each post's full text,
+  and cut to 300 characters for every other method.
 - It has no `bun test` suite of its own; Test 10 exercises it end to end.
 
 A live start also launches each persona through the real agent-director
