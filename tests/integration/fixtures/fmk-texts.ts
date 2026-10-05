@@ -91,6 +91,50 @@
  *                                                version that does not parse
  *   meetsPhase1Floor <version>                   src/ad-version-gate.ts: whether <version>
  *                                                meets CSCB's Phase 1 floor, `true` or `false`
+ *   AD_SETTINGS_LOG_PREFIX                       src/ad-settings.ts, the prefix of the
+ *                                                settings reader's log lines
+ *   buildAdSettingsValuesLine <path> [<key>=<integer>…]
+ *                                                src/ad-settings.ts: the values line for the
+ *                                                settings file <path>, the nine [tmux] values
+ *                                                DEFAULT_AD_SETTINGS' own but for each given
+ *                                                <key>
+ *   AD_SETTINGS_RELATIVE_PATH                    src/ad-settings.ts, the settings file's path
+ *                                                relative to a HOME
+ *   AD_TMUX_TABLE                                src/ad-settings.ts, the timing keys' table
+ *   AD_PAUSE_TABLE                               src/ad-settings.ts, `pause`'s table
+ *   AD_PAUSE_TIMEOUT_KEY                         src/ad-settings.ts, `pause`'s wait key
+ *   AD_TMUX_KEYS                                 src/ad-settings.ts: the nine [tmux] keys, in
+ *                                                order, joined by single spaces
+ *   AD_SETTING_MINIMUMS <key> [<part>]           src/ad-settings.ts: agent-director's minimum
+ *                                                for [tmux] <key>, in decimal; for a minimum
+ *                                                with parts (pending_grace_seconds), the
+ *                                                named <part> (`floor` or `addend`)
+ *   pendingGraceMinimumSeconds <create-timeout-ms> <pipe-close-wait-ms>
+ *                                                src/ad-settings.ts: the grace period's
+ *                                                minimum, in decimal
+ *   adGraceMs [<key>=<integer>…]                 src/ad-settings.ts: G, in decimal
+ *   adAlertThresholdMs [<key>=<integer>…]        src/ad-settings.ts: the alert threshold, in
+ *                                                decimal
+ *   adLaunchBoundMs [<key>=<integer>…]           src/ad-settings.ts: B, in decimal. These
+ *                                                three take an AdSettingsInEffect built from
+ *                                                the arguments: the [tmux] values
+ *                                                DEFAULT_AD_SETTINGS' own but for each given
+ *                                                <key>, and DEFAULT_AD_SETTINGS_IN_EFFECT's
+ *                                                pauseTimeout
+ *   wholeMinutes <ms>                            src/ad-settings.ts: <ms> in whole minutes,
+ *                                                rounded down, in decimal
+ *   STILL_STOPPING_PHRASE                        src/ad-description-phrases.ts
+ *   STILL_STARTING_PHRASE                        src/ad-description-phrases.ts
+ *   stuckLaunchRelaunchingText <persona-key> <launch-bound-ms>
+ *                                                src/pending-row.ts: the stuck-launch post's
+ *                                                relaunching text for the persona with key
+ *                                                <persona-key> and B <launch-bound-ms>
+ *                                                (posted as a persona notice: wrap it in
+ *                                                formatPersonaNotice)
+ *
+ * In every `<key>=<integer>` argument <key> is one of the package's
+ * AD_TMUX_KEYS and <integer> an integer in decimal; an unknown key, a key
+ * given twice or a value that is not an integer is a usage failure (exit 64).
  *
  * An entry is one `Entry` in `ENTRIES`: its argument synopsis, the export it
  * prints and a `print` function from its arguments to the value. Constants
@@ -303,6 +347,160 @@ const phase1Floor: Entry = {
   },
 }
 
+/** A value in decimal: a `bigint`, or a `number` that is a safe integer; a failure for anything else. */
+function decimal(entry: string, value: unknown): string {
+  if (typeof value === 'bigint') return value.toString()
+  if (typeof value === 'number' && Number.isSafeInteger(value)) return String(value)
+  fail(PRINTER_FAIL_EXIT, `${entry} gave ${typeof value === 'number' ? String(value) : `a ${typeof value}`}, not an integer`)
+}
+
+/** Fails with a usage failure unless `text` is an integer in decimal (an optional `-`, then digits); answers it as a `bigint`. */
+function integerArgument(entry: string, name: string, text: string): bigint {
+  if (!/^-?[0-9]+$/.test(text)) usageFail(`${entry}: <${name}> '${text}' is not an integer`)
+  return BigInt(text)
+}
+
+/** The package's `AD_TMUX_KEYS`: the nine `[tmux]` keys, in order. */
+async function packageTmuxKeys(context: EntryContext): Promise<readonly string[]> {
+  const keys = await packageExport(context, 'ad-settings.ts', 'AD_TMUX_KEYS')
+  if (!Array.isArray(keys) || keys.some((k) => typeof k !== 'string' || !/^[a-z_]+$/.test(k))) {
+    fail(PRINTER_FAIL_EXIT, "the installed package's src/ad-settings.ts export AD_TMUX_KEYS is not an array of key names")
+  }
+  return keys as string[]
+}
+
+/**
+ * The nine `[tmux]` values: `DEFAULT_AD_SETTINGS.tmux`, each key a
+ * `<key>=<integer>` argument names taking that value instead. A key not in
+ * `AD_TMUX_KEYS`, a key given twice or a value that is not an integer is a
+ * usage failure.
+ */
+async function tmuxValuesFrom(entry: string, pairs: readonly string[], context: EntryContext): Promise<Record<string, bigint>> {
+  const keys = await packageTmuxKeys(context)
+  const defaults = await packageExport(context, 'ad-settings.ts', 'DEFAULT_AD_SETTINGS')
+  const tmux = typeof defaults === 'object' && defaults !== null ? (defaults as Record<string, unknown>)['tmux'] : undefined
+  if (typeof tmux !== 'object' || tmux === null) fail(PRINTER_FAIL_EXIT, "the installed package's src/ad-settings.ts export DEFAULT_AD_SETTINGS has no tmux table")
+  const values: Record<string, bigint> = {}
+  for (const key of keys) {
+    const value = (tmux as Record<string, unknown>)[key]
+    if (typeof value !== 'bigint') fail(PRINTER_FAIL_EXIT, `the installed package's DEFAULT_AD_SETTINGS.tmux.${key} is a ${typeof value}, not a bigint`)
+    values[key] = value
+  }
+  const given = new Set<string>()
+  for (const pair of pairs) {
+    const eq = pair.indexOf('=')
+    const key = eq < 0 ? pair : pair.slice(0, eq)
+    if (eq < 0 || !keys.includes(key)) usageFail(`${entry}: '${pair}' is not <key>=<integer> for a [tmux] key (${keys.join(', ')})`)
+    if (given.has(key)) usageFail(`${entry}: ${key} is given twice`)
+    given.add(key)
+    values[key] = integerArgument(entry, key, pair.slice(eq + 1))
+  }
+  return values
+}
+
+/** The values in effect for `<key>=<integer>` arguments: those `[tmux]` values (`tmuxValuesFrom`) and `DEFAULT_AD_SETTINGS_IN_EFFECT`'s `pauseTimeout`. */
+async function settingsInEffectFrom(entry: string, pairs: readonly string[], context: EntryContext): Promise<object> {
+  const tmux = await tmuxValuesFrom(entry, pairs, context)
+  const inEffect = await packageExport(context, 'ad-settings.ts', 'DEFAULT_AD_SETTINGS_IN_EFFECT')
+  const pauseTimeout = typeof inEffect === 'object' && inEffect !== null ? (inEffect as Record<string, unknown>)['pauseTimeout'] : undefined
+  if (typeof pauseTimeout !== 'object' || pauseTimeout === null) fail(PRINTER_FAIL_EXIT, "the installed package's src/ad-settings.ts export DEFAULT_AD_SETTINGS_IN_EFFECT has no pauseTimeout")
+  return { tmux, pauseTimeout }
+}
+
+/** `<name>(<the values in effect for the <key>=<integer> arguments>)` in decimal: a derived wait of `src/ad-settings.ts`. */
+function derivedWaitEntry(name: string): Entry {
+  return {
+    synopsis: '[<key>=<integer>…]',
+    async print(args, context) {
+      const values = await settingsInEffectFrom(name, args, context)
+      const derive = await packageFunction<(values: object) => unknown>(context, 'ad-settings.ts', name)
+      return decimal(name, derive(values))
+    },
+  }
+}
+
+/** `buildAdSettingsValuesLine(<path>, <the [tmux] values for the <key>=<integer> arguments>)`: the server's values line. */
+const adSettingsValuesLine: Entry = {
+  synopsis: '<path> [<key>=<integer>…]',
+  async print(args, context) {
+    const entry = 'buildAdSettingsValuesLine'
+    const [path, ...pairs] = args
+    if (path === undefined || path === '') usageFail(`${entry} takes <path> [<key>=<integer>…] (no <path> given)`)
+    const values = await tmuxValuesFrom(entry, pairs, context)
+    const build = await packageFunction<(path: string, values: object) => unknown>(context, 'ad-settings.ts', entry)
+    return builtString(entry, build(path, values))
+  },
+}
+
+/** `AD_TMUX_KEYS`, the nine keys in order, joined by single spaces. */
+const adTmuxKeys: Entry = {
+  synopsis: '',
+  async print(args, context) {
+    expectArguments('AD_TMUX_KEYS', args, [])
+    return (await packageTmuxKeys(context)).join(' ')
+  },
+}
+
+/** `AD_SETTING_MINIMUMS[<key>]` in decimal, or `AD_SETTING_MINIMUMS[<key>][<part>]` for a key whose minimum has parts (`floor`, `addend`). */
+const adSettingMinimum: Entry = {
+  synopsis: '<key> [<part>]',
+  async print(args, context) {
+    const entry = 'AD_SETTING_MINIMUMS'
+    const [key, part] = args
+    if (args.length < 1 || args.length > 2 || args.some((a) => a === '')) usageFail(`${entry} takes <key> [<part>] (got ${args.length} argument${args.length === 1 ? '' : 's'})`)
+    const minimums = await packageExport(context, 'ad-settings.ts', entry)
+    if (typeof minimums !== 'object' || minimums === null) fail(PRINTER_FAIL_EXIT, `the installed package's src/ad-settings.ts export ${entry} is not an object`)
+    const byKey = minimums as Record<string, unknown>
+    const value = Object.hasOwn(byKey, key) ? byKey[key] : undefined
+    if (value === undefined) usageFail(`${entry}: the installed package records no minimum for '${key}'`)
+    if (typeof value === 'object' && value !== null) {
+      const parts = value as Record<string, unknown>
+      if (part === undefined) usageFail(`${entry}: the minimum of '${key}' has parts (${Object.keys(parts).join(', ')}); name one`)
+      if (!Object.hasOwn(parts, part)) usageFail(`${entry}: the minimum of '${key}' has no part '${part}'`)
+      return decimal(`${entry}.${key}.${part}`, parts[part])
+    }
+    if (part !== undefined) usageFail(`${entry}: the minimum of '${key}' has no parts`)
+    return decimal(`${entry}.${key}`, value)
+  },
+}
+
+/** `pendingGraceMinimumSeconds(<create-timeout-ms>, <pipe-close-wait-ms>)` in decimal. */
+const graceMinimum: Entry = {
+  synopsis: '<create-timeout-ms> <pipe-close-wait-ms>',
+  async print(args, context) {
+    const entry = 'pendingGraceMinimumSeconds'
+    expectArguments(entry, args, ['create-timeout-ms', 'pipe-close-wait-ms'])
+    const [create, pipe] = args
+    const minimum = await packageFunction<(create: bigint, pipe: bigint) => unknown>(context, 'ad-settings.ts', entry)
+    return decimal(entry, minimum(integerArgument(entry, 'create-timeout-ms', create), integerArgument(entry, 'pipe-close-wait-ms', pipe)))
+  },
+}
+
+/** `wholeMinutes(<ms>)` in decimal. */
+const minutesOf: Entry = {
+  synopsis: '<ms>',
+  async print(args, context) {
+    const entry = 'wholeMinutes'
+    expectArguments(entry, args, ['ms'])
+    const ms = integerArgument(entry, 'ms', args[0])
+    const minutes = await packageFunction<(ms: number) => unknown>(context, 'ad-settings.ts', entry)
+    return decimal(entry, minutes(Number(ms)))
+  },
+}
+
+/** `stuckLaunchRelaunchingText(<persona-key>, <launch-bound-ms>)`: the stuck-launch post's relaunching text. */
+const relaunchingText: Entry = {
+  synopsis: '<persona-key> <launch-bound-ms>',
+  async print(args, context) {
+    const entry = 'stuckLaunchRelaunchingText'
+    expectArguments(entry, args, ['persona-key', 'launch-bound-ms'])
+    const [key, bound] = args
+    const ms = integerArgument(entry, 'launch-bound-ms', bound)
+    const build = await packageFunction<(key: string, launchBoundMs: number) => unknown>(context, 'pending-row.ts', entry)
+    return builtString(entry, build(key, Number(ms)))
+  },
+}
+
 /** The printer's entries, by the name a script passes. Later scenarios add entries here. */
 const ENTRIES: Readonly<Record<string, Entry>> = {
   // Scenario 8 (test-20-fmk-old-binary.sh).
@@ -321,6 +519,23 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   AD_SYSTEM_INSTALL_UNREACHABLE: constantEntry('install-check-labels.ts', 'AD_SYSTEM_INSTALL_UNREACHABLE'),
   UNREACHABLE_REASON_UNPARSEABLE_VERSION: constantEntry('ad-version-gate.ts', 'UNREACHABLE_REASON_UNPARSEABLE_VERSION'),
   meetsPhase1Floor: phase1Floor,
+  // Scenario 24 (test-26-fmk-timing-settings.sh).
+  AD_SETTINGS_LOG_PREFIX: constantEntry('ad-settings.ts', 'AD_SETTINGS_LOG_PREFIX'),
+  buildAdSettingsValuesLine: adSettingsValuesLine,
+  AD_SETTINGS_RELATIVE_PATH: constantEntry('ad-settings.ts', 'AD_SETTINGS_RELATIVE_PATH'),
+  AD_TMUX_TABLE: constantEntry('ad-settings.ts', 'AD_TMUX_TABLE'),
+  AD_PAUSE_TABLE: constantEntry('ad-settings.ts', 'AD_PAUSE_TABLE'),
+  AD_PAUSE_TIMEOUT_KEY: constantEntry('ad-settings.ts', 'AD_PAUSE_TIMEOUT_KEY'),
+  AD_TMUX_KEYS: adTmuxKeys,
+  AD_SETTING_MINIMUMS: adSettingMinimum,
+  pendingGraceMinimumSeconds: graceMinimum,
+  adGraceMs: derivedWaitEntry('adGraceMs'),
+  adAlertThresholdMs: derivedWaitEntry('adAlertThresholdMs'),
+  adLaunchBoundMs: derivedWaitEntry('adLaunchBoundMs'),
+  wholeMinutes: minutesOf,
+  STILL_STOPPING_PHRASE: constantEntry('ad-description-phrases.ts', 'STILL_STOPPING_PHRASE'),
+  STILL_STARTING_PHRASE: constantEntry('ad-description-phrases.ts', 'STILL_STARTING_PHRASE'),
+  stuckLaunchRelaunchingText: relaunchingText,
 }
 
 /** The value entry `name` prints for `args`; a usage failure for no entry or an unknown one. */

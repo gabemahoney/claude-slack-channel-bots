@@ -48,8 +48,8 @@
  *   three) each check the marker first and statically import only `node:`
  *   built-ins, type-only imports included; and scenario.sh's `install_ad_shim`, `ad_store_edit`,
  *   `ad_store_id`, `stub_mode`, `ad_store_pending_no_launch`,
- *   `install_ad_stand_in` and `restore_ad_install_with_stand_in` call
- *   `require_scenario_home` before their first
+ *   `install_ad_stand_in`, `restore_ad_install_with_stand_in` and
+ *   `write_ad_settings` call `require_scenario_home` before their first
  *   sqlite3, copy, move or install step, a call of a scenario.sh function
  *   that makes one (such as `_scenario_place`) counting as one. Shell is read
  *   with comments, heredoc bodies and quoted text blanked; the shebang,
@@ -1687,6 +1687,9 @@ const HOME_GUARDED_STUB_HELPERS: readonly string[] = ['stub_mode', 'ad_store_pen
 /** Scenario 8's version stand-in installs held to the same rule: each writes the stand-in's settings (a move) and places the stand-in (a copy). */
 const HOME_GUARDED_STAND_IN_HELPERS: readonly string[] = ['install_ad_stand_in', 'restore_ad_install_with_stand_in']
 
+/** Scenario 24's agent-director settings writer, held to the same rule: it replaces the scenario HOME's config.toml through `write_file` (a move). */
+const HOME_GUARDED_AD_SETTINGS_HELPERS: readonly string[] = ['write_ad_settings']
+
 /**
  * The label, seeding, tmux-step, store-statement and 0.10.0-seeder helpers
  * held to the same rule: each reads or edits the store (directly or through
@@ -2384,6 +2387,18 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
 
       expect(unguarded).not.toBe(source)
       expectNamedFindings(helperHomeCheckFindings('scenario.sh', unguarded, [helper]), 'scenario.sh', RULE.homeCheckFirst)
+    })
+
+    test('the current tree: write_ad_settings runs require_scenario_home before its settings write', () => {
+      expect(helperHomeCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), readFileSync(SCENARIO_PATH, 'utf-8'), HOME_GUARDED_AD_SETTINGS_HELPERS)).toEqual([])
+    })
+
+    test('write_ad_settings without its require_scenario_home is flagged at its settings write', () => {
+      const source = readFileSync(SCENARIO_PATH, 'utf-8')
+      const unguarded = source.replace(/(\nwrite_ad_settings\(\) \{\n(?:.*\n)*?)    require_scenario_home "\$\{step\}"\n/, '$1')
+
+      expect(unguarded).not.toBe(source)
+      expectNamedFindings(helperHomeCheckFindings('scenario.sh', unguarded, HOME_GUARDED_AD_SETTINGS_HELPERS), 'scenario.sh', RULE.homeCheckFirst)
     })
 
     test('stub_mode without its require_scenario_home is flagged at its move', () => {

@@ -49,6 +49,12 @@
 #                        directory is trusted when
 #                        `projects[<dir>].hasTrustDialogAccepted` is `true` for
 #                        its real path or for $PWD.
+#   linger-on-exit       harness addition (scenario 24, and scenario 13's
+#                        "still stopping"): report in at once, as `at-once`;
+#                        then, on the `/exit` line agent-director's `pause`
+#                        types, end the session but keep the process running,
+#                        as a Claude Code still shutting down does, until the
+#                        harness releases it (see LINGERING).
 #
 # Only the dev-channels dialog holds DEV_CHANNELS_DIALOG_NEEDLE, and only the
 # folder-trust prompt holds TRUST_DIALOG_NEEDLE.
@@ -63,11 +69,32 @@
 #     finds that transcript.
 #   - After reporting in the stub keeps reading stdin, so the process and its
 #     tmux pane stay alive. Further lines are ignored, apart from the sentinel
-#     and `/mcp reconnect` (see THE MCP SESSION).
+#     and `/mcp reconnect` (see THE MCP SESSION), and, in `linger-on-exit`,
+#     `/exit` (see LINGERING).
 #   - The sentinel line `__CSCB_TEST_EXIT__` fires every SessionEnd hook the
 #     `--settings` JSON registers and exits 0 (in `silent`, it fires none). In
 #     a dialog mode it does so before the dialog is answered too.
 #   - When stdin closes (the pane was killed), the stub exits 0.
+#
+# LINGERING
+# ---------
+# Harness addition (scenario 24, test-26, and scenario 13): a finished row
+# whose own session still runs. In `linger-on-exit`, once reported in, the
+# line `/exit` (agent-director's `pause` sends C-u, types `/exit` and Enter)
+# makes the stub linger:
+#   - it marks itself lingering: the file `stub-claude-lingering.<stub pid>`
+#     beside the stub, holding its working directory's real path, written by
+#     one rename;
+#   - it fires every SessionEnd hook the `--settings` JSON registers, as the
+#     sentinel does (see HOOK FIRING; reason `exit`, which agent-director takes
+#     as a session that ended), so the row reads `ended`;
+#   - it stops the SessionStart re-fire and ends its MCP session;
+#   - it keeps running, its pane and session with it, ignoring every further
+#     line, until it gets SIGUSR1 (the harness's release, lib/scenario.sh
+#     `stub_release`) or its stdin closes; then it removes its marker and
+#     exits 0.
+# Before it lingers, `/exit` is an ordinary line (ignored), and SIGUSR1 is
+# not handled.
 #
 # RESUME
 # ------
@@ -238,6 +265,7 @@ MODE_AT_ONCE=at-once
 MODE_SILENT=silent
 MODE_UNRECOGNISED=unrecognised-dialog
 MODE_FOLDER_TRUST=folder-trust
+MODE_LINGER_ON_EXIT=linger-on-exit
 
 STUB_DIR="${BASH_SOURCE[0]%/*}"
 [[ "${STUB_DIR}" == "${BASH_SOURCE[0]}" ]] && STUB_DIR=.
@@ -251,6 +279,7 @@ if [[ -f "${STUB_MODES_FILE}" ]]; then
 fi
 case "${MODE}" in
     "${MODE_DEV_CHANNELS}" | "${MODE_AT_ONCE}" | "${MODE_SILENT}" | "${MODE_UNRECOGNISED}" | "${MODE_FOLDER_TRUST}") ;;
+    "${MODE_LINGER_ON_EXIT}") ;;
     *)
         printf 'stub-claude: unknown mode %q selected for %s; running %s\n' \
             "${MODE}" "${REALCWD}" "${MODE_DEV_CHANNELS}" >&2
@@ -619,7 +648,39 @@ case "${MODE}" in
         ;;
     "${MODE_SILENT}")
         ;;
+    "${MODE_LINGER_ON_EXIT}")
+        report_in
+        ;;
 esac
+
+# ---------------------------------------------------------------------------
+# Lingering (`linger-on-exit`; see LINGERING)
+# ---------------------------------------------------------------------------
+
+# The line agent-director's `pause` types.
+PAUSE_EXIT_LINE=/exit
+LINGER_MARKER="${STUB_DIR}/stub-claude-lingering.$$"
+RELEASED=0
+
+# Mark the stub lingering, end the session, then wait for the release or the
+# end of stdin, and exit 0. Never returns.
+linger_after_exit() {
+    local rc
+    trap 'RELEASED=1' USR1
+    trap 'close_mcp_session; rm -f "${HOOK_FILE}" "${STATUS_OUT}" "${STATUS_OUT}.err" "${LINGER_MARKER}"' EXIT
+    { printf '%s\n' "${REALCWD}" > "${LINGER_MARKER}.tmp" && mv -f -- "${LINGER_MARKER}.tmp" "${LINGER_MARKER}"; } 2> /dev/null \
+        || printf 'stub-claude[%s]: could not write %s\n' "$$" "${LINGER_MARKER}" >&2
+    fire_session_end
+    stop_refire
+    close_mcp_session
+    while (( ! RELEASED )); do
+        IFS= read -r -t 1 _
+        rc=$?
+        # A line or a timeout (or the release) goes round again; stdin closed ends it.
+        (( rc == 0 || rc > 128 )) || break
+    done
+    exit 0
+}
 
 # handle_line <line>: one line from stdin.
 handle_line() {
@@ -627,6 +688,9 @@ handle_line() {
     if [[ "${line}" == "${SENTINEL}" ]]; then
         [[ "${MODE}" == "${MODE_SILENT}" ]] || fire_session_end
         exit 0
+    fi
+    if [[ "${MODE}" == "${MODE_LINGER_ON_EXIT}" && "${line}" == "${PAUSE_EXIT_LINE}" ]] && (( REPORTED )); then
+        linger_after_exit
     fi
     if (( AWAITING_ENTER )); then
         report_in

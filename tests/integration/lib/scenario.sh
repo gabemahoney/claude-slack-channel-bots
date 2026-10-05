@@ -78,7 +78,8 @@
 #   binary (`install_ad_010`), with no release install, no agent-director-admin
 #   and no store yet (SCENARIO_AD_START is `release` or `0.10.0`; a
 #   shared-mode script that sets it fails);
-# - writes no agent-director config.toml: agent-director's default settings;
+# - writes no agent-director config.toml: agent-director's default settings
+#   (a scenario that needs others writes them with `write_ad_settings`);
 # - once SCENARIO_PORT is picked, writes the MCP config the stub's session
 #   reads, $HOME/.claude/slack-mcp.json naming that port (`write_mcp_config`),
 #   which is the `mcp_config_path` a persona config defaults to;
@@ -319,6 +320,34 @@
 #                                      then a harness `status` read (`ad_capture`) must read `pending`
 #                                      with no launch_started_at, or it fails
 #
+#   agent-director's settings file (fmk mode; harness addition, scenario 24, test-26, and
+#   scenario 10; the image guard, then the HOME check, before any write)
+#   write_ad_settings [--pause <value>] [<key>=<value>...]
+#                                      replace the scenario HOME's agent-director settings file
+#                                      (HOME joined with the package's AD_SETTINGS_RELATIVE_PATH,
+#                                      read through fixtures/fmk-texts.ts, as are the table names and
+#                                      the pause key) whole, by one rename (`write_file`), so no
+#                                      reader sees half a file: a `[tmux]` table holding each
+#                                      `<key> = <value>` in the order given, when any is given, then a
+#                                      `[pause]` table holding `timeout_seconds = <value>` with
+#                                      --pause. Each <value> is written as the TOML value text given
+#                                      (`120`, `29` below a minimum, `"120"` a string), so a refused
+#                                      value can be written on purpose. No table (no argument)
+#                                      removes the file: agent-director's defaults. Fails for a
+#                                      <key> that is not a TOML bare key of lowercase letters, digits
+#                                      and `_`, a key given twice, an empty <value> or one holding a
+#                                      control character, and refuses a settings directory that
+#                                      resolves outside SCENARIO_ROOT or a settings path that is not a
+#                                      regular file. Reads the file back and fails unless it holds
+#                                      exactly what was written; sets AD_SETTINGS_FILE to its path.
+#                                      `_scenario_ad_tmux_setting`, the stub's re-fire and
+#                                      `ad_store_mark_finished` read the `[tmux]` values it writes.
+#                                      Examples:
+#                                        write_ad_settings pending_grace_seconds=120 stopping_window_seconds=30
+#                                        write_ad_settings --pause 45 pending_grace_seconds=120
+#                                        write_ad_settings starting_session_seconds='"120"'
+#                                        write_ad_settings          (removes the file)
+#
 #   Stub workers (fmk mode; fixtures/stub-claude.sh's header states the modes, the
 #   SessionStart re-fire, its stop line and the MCP session; each runs both guards first)
 #   STUB_MODE_DEV_CHANNELS STUB_MODE_AT_ONCE STUB_MODE_SILENT STUB_MODE_UNRECOGNISED
@@ -341,6 +370,22 @@
 #                                      such pane, say), and refuses when TMUX_TMPDIR is not the
 #                                      scenario's or TMUX is set; it does not read the pane to check
 #                                      the effect
+#   STUB_MODE_LINGER_ON_EXIT           harness addition (scenario 24, test-26, and scenario 13):
+#                                      the mode `linger-on-exit`, selected with `stub_mode` like the
+#                                      others: the stub reports in at once and, on the `/exit` line
+#                                      agent-director's `pause` types, fires SessionEnd (the row reads
+#                                      `ended`) and keeps running, its session with it, until
+#                                      `stub_release`
+#   stub_release <target> [<timeout-s>]
+#                                      harness addition (scenario 24, test-26, and scenario 13):
+#                                      release the lingering stub in the tmux pane <target> (named as
+#                                      for `stub_press_enter`, on the scenario's own tmux server, read
+#                                      with the real tmux from the scenario's own shell): SIGUSR1 to
+#                                      the pane's process, then fail unless it is gone within
+#                                      <timeout-s> (default SCENARIO_STUB_RELEASE_S, 10). Refuses when
+#                                      TMUX_TMPDIR is not the scenario's or TMUX is set, and, before
+#                                      any signal, unless that process is a stub lingering in
+#                                      `linger-on-exit` (its marker `$SCENARIO_BIN/stub-claude-lingering.<pid>`)
 #   write_mcp_config [<port>]          write $HOME/.claude/slack-mcp.json, the MCP config the stub's
 #                                      session reads, naming http://127.0.0.1:<port>/mcp under the
 #                                      server name slack-channel-router, as the package's install
@@ -807,6 +852,15 @@ SCENARIO_STUB_MODES=("${STUB_MODE_DEV_CHANNELS}" "${STUB_MODE_AT_ONCE}" "${STUB_
     "${STUB_MODE_UNRECOGNISED}" "${STUB_MODE_FOLDER_TRUST}")
 SCENARIO_STUB_MCP_SRC="${SCENARIO_FIXTURES}/stub-mcp-session.ts"
 SCENARIO_STUB_MODES_NAME=stub-claude-modes
+
+# Harness addition (scenario 24, and scenario 13): the stub mode that answers
+# `pause`'s `/exit` with SessionEnd and lingers until `stub_release`, the
+# marker a lingering stub writes beside itself (this prefix, then its PID),
+# and the default bound on a released stub exiting, in seconds.
+STUB_MODE_LINGER_ON_EXIT=linger-on-exit
+SCENARIO_STUB_MODES+=("${STUB_MODE_LINGER_ON_EXIT}")
+SCENARIO_STUB_LINGER_PREFIX=stub-claude-lingering.
+SCENARIO_STUB_RELEASE_S=10
 
 # The MCP server name the package's install writes into slack-mcp.json
 # (src/config.ts MCP_SERVER_NAME).
@@ -2303,6 +2357,35 @@ stub_press_enter() {
     (( rc == 0 )) || fail "${step}: tmux send-keys exited ${rc}: $(tr '\n' ' ' < "${err}")"
 }
 
+# Harness addition (scenario 24, test-26, and scenario 13): release a stub
+# lingering in `linger-on-exit` (fixtures/stub-claude.sh, LINGERING).
+stub_release() {
+    local target="${1:-}" timeout_s="${2:-${SCENARIO_STUB_RELEASE_S}}" step exact err pid marker rc=0
+    step="stub_release ${target}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_tmux_check "${step}"
+    [[ -n "${target}" ]] || fail "${step}: no pane named"
+    _scenario_check_timeout "${timeout_s}" "${step}"
+    # Named as for stub_press_enter: a pane id exactly, a session name exactly.
+    case "${target}" in
+        %*) exact="${target}" ;;
+        *:*) exact="=${target}" ;;
+        *) exact="=${target}:" ;;
+    esac
+    err="${SCENARIO_ROOT}/stub-release.err"
+    pid="$("${SCENARIO_REAL_TMUX}" display-message -p -t "${exact}" '#{pane_pid}' 2> "${err}")" || rc=$?
+    (( rc == 0 )) || fail "${step}: tmux display-message exited ${rc}: $(tr '\n' ' ' < "${err}")"
+    [[ "${pid}" =~ ^[1-9][0-9]*$ ]] \
+        || fail "${step}: no pane ${target} on the scenario's tmux server (tmux gave pane pid '${pid}')"
+    marker="${SCENARIO_BIN}/${SCENARIO_STUB_LINGER_PREFIX}${pid}"
+    pid_alive "${pid}" && [[ -f "${marker}" ]] \
+        || fail "${step}: refused: the process of pane ${target} (pid ${pid}) is not a stub lingering in ${STUB_MODE_LINGER_ON_EXIT} (no ${marker})"
+    kill -USR1 "${pid}" 2> "${err}" || fail "${step}: could not signal pid ${pid}: $(tr '\n' ' ' < "${err}")"
+    _scenario_poll_until "${timeout_s}" _scenario_pid_gone "${pid}" \
+        || fail "${step}: the released stub (pid ${pid}) still runs ${timeout_s}s after its release"
+}
+
 write_mcp_config() {
     local port="${1:-${SCENARIO_PORT:-}}" step dir
     step="write_mcp_config ${port}"
@@ -2900,6 +2983,105 @@ end_session() {
     if _scenario_tmux has-session -t "${sid}"; then
         fail "${step}: session ${sid} still exists after kill-session"
     fi
+}
+
+# ---------------------------------------------------------------------------
+# agent-director's settings file (fmk mode; harness addition, scenario 24,
+# test-26, and scenario 10)
+# ---------------------------------------------------------------------------
+
+# The settings file's path relative to HOME, the `[tmux]` and `[pause]`
+# table names and the pause wait's key, as the installed package exports
+# them (AD_SETTINGS_RELATIVE_PATH, AD_TMUX_TABLE, AD_PAUSE_TABLE,
+# AD_PAUSE_TIMEOUT_KEY), read through the printer at a shell's first
+# write_ad_settings.
+_SCENARIO_AD_SETTINGS_NAMES=()
+
+# _scenario_ad_settings_names <step>: fill _SCENARIO_AD_SETTINGS_NAMES, once
+# per shell; fail when the printer fails or a name is not of its kind.
+_scenario_ad_settings_names() {
+    local step="$1" entry value names=()
+    (( ${#_SCENARIO_AD_SETTINGS_NAMES[@]} == 4 )) && return 0
+    for entry in AD_SETTINGS_RELATIVE_PATH AD_TMUX_TABLE AD_PAUSE_TABLE AD_PAUSE_TIMEOUT_KEY; do
+        value="$(bun "${SCENARIO_FIXTURES}/fmk-texts.ts" "${entry}")" || fail "${step}: fmk-texts: ${entry}"
+        names+=("${value}")
+    done
+    [[ -n "${names[0]}" && "${names[0]}" != /* && "/${names[0]}/" != */../* && "${names[0]}" != *[[:cntrl:]]* ]] \
+        || fail "${step}: the package's AD_SETTINGS_RELATIVE_PATH '${names[0]}' is not a relative path inside HOME"
+    for value in "${names[@]:1}"; do
+        [[ "${value}" =~ ^[a-z_]+$ ]] || fail "${step}: the package gives table or key name '${value}', not a TOML bare key"
+    done
+    _SCENARIO_AD_SETTINGS_NAMES=("${names[@]}")
+}
+
+# _scenario_ad_settings_value <step> <name> <value>: fail unless <value> is
+# one line of TOML value text: not empty, no control character.
+_scenario_ad_settings_value() {
+    [[ -n "$3" && "$3" != *[[:cntrl:]]* ]] || fail "$1: the value of $2 is empty or holds a control character"
+}
+
+write_ad_settings() {
+    local step="write_ad_settings $*" pause="" have_pause=0 pairs=() seen=" " key value path dir real_root real_dir content
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    [[ "${SCENARIO_FMK}" == 1 ]] || fail "${step}: the scenario HOME's agent-director settings are for fmk scripts only"
+    while (( $# > 0 )); do
+        case "$1" in
+            --pause)
+                (( $# >= 2 )) || fail "${step}: --pause takes a value"
+                (( ! have_pause )) || fail "${step}: --pause is given twice"
+                _scenario_ad_settings_value "${step}" --pause "$2"
+                have_pause=1
+                pause="$2"
+                shift 2
+                ;;
+            *=*)
+                key="${1%%=*}"
+                value="${1#*=}"
+                [[ "${key}" =~ ^[a-z_][a-z0-9_]*$ ]] \
+                    || fail "${step}: key '${key}' is not a TOML bare key of lowercase letters, digits and _"
+                [[ "${seen}" != *" ${key} "* ]] || fail "${step}: ${key} is given twice"
+                seen+="${key} "
+                _scenario_ad_settings_value "${step}" "${key}" "${value}"
+                pairs+=("${key} = ${value}")
+                shift
+                ;;
+            *) fail "${step}: '$1' is neither <key>=<value> nor --pause <value>" ;;
+        esac
+    done
+    _scenario_ad_settings_names "${step}"
+    path="${HOME}/${_SCENARIO_AD_SETTINGS_NAMES[0]}"
+    dir="${path%/*}"
+    [[ "${path}" == "${SCENARIO_ROOT}"/* ]] || fail "${step}: refused: ${path} is not under SCENARIO_ROOT ${SCENARIO_ROOT}"
+    if [[ -e "${path}" || -L "${path}" ]]; then
+        [[ -f "${path}" && ! -L "${path}" ]] || fail "${step}: refused: ${path} is not a regular file"
+    fi
+    AD_SETTINGS_FILE="${path}"
+    if (( ${#pairs[@]} == 0 && ! have_pause )); then
+        # No table: no file, so agent-director's defaults.
+        rm -f -- "${path}" || fail "${step}: could not remove ${path}"
+        [[ ! -e "${path}" ]] || fail "${step}: ${path} is still there after its removal"
+        return 0
+    fi
+    mkdir -p -- "${dir}" || fail "${step}: could not create ${dir}"
+    real_root="$(realpath -e -- "${SCENARIO_ROOT}" 2> /dev/null)" || fail "${step}: cannot resolve SCENARIO_ROOT ${SCENARIO_ROOT}"
+    real_dir="$(realpath -e -- "${dir}" 2> /dev/null)" || fail "${step}: cannot resolve ${dir}"
+    [[ "${real_dir}" == "${real_root}"/* ]] \
+        || fail "${step}: refused: ${dir} resolves to ${real_dir}, which is not under SCENARIO_ROOT ${real_root}"
+    content=""
+    if (( ${#pairs[@]} > 0 )); then
+        printf -v content '[%s]\n' "${_SCENARIO_AD_SETTINGS_NAMES[1]}"
+        printf -v value '%s\n' "${pairs[@]}"
+        content+="${value}"
+    fi
+    if (( have_pause )); then
+        [[ -z "${content}" ]] || content+=$'\n'
+        printf -v value '[%s]\n%s = %s\n' "${_SCENARIO_AD_SETTINGS_NAMES[2]}" "${_SCENARIO_AD_SETTINGS_NAMES[3]}" "${pause}"
+        content+="${value}"
+    fi
+    # One rename, so agent-director and CSCB never read half a file.
+    write_file "${path}" 0644 < <(printf '%s' "${content}")
+    [[ "$(cat -- "${path}" && printf x)" == "${content}x" ]] || fail "${step}: ${path} does not hold what was written"
 }
 
 # ---------------------------------------------------------------------------

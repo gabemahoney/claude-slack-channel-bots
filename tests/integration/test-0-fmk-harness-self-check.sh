@@ -87,7 +87,8 @@
 #                    every install, re-shim, swap, hide and restore helper,
 #                    `ad`, `ad_store_edit`, `ad_store_id`,
 #                    `ad_store_pending_no_launch`, `stub_mode`,
-#                    `stub_press_enter`, `write_mcp_config` and every label,
+#                    `stub_press_enter`, `write_mcp_config`, `stub_release`,
+#                    `write_ad_settings` and every label,
 #                    seeding, tmux-step, store-statement, operator-action,
 #                    find-missing-loop and 0.10.0-seeder helper fails with the
 #                    guard's reason, and the decoy is left exactly as it was.
@@ -1564,6 +1565,8 @@ leg_guard_refusals() {
         expect_fails_in_home "${step}" "${home}" "${reason}" stub_mode "${SCENARIO_ROOT}/work" "${STUB_MODE_AT_ONCE}"
         expect_fails_in_home "${step}" "${home}" "${reason}" stub_press_enter "${T0_SESSION}"
         expect_fails_in_home "${step}" "${home}" "${reason}" write_mcp_config "${SCENARIO_PORT}"
+        expect_fails_in_home "${step}" "${home}" "${reason}" stub_release "${T0_SESSION}"
+        expect_fails_in_home "${step}" "${home}" "${reason}" write_ad_settings pending_grace_seconds=120
         # The labels, seeding, the human's tmux steps, the store statements,
         # the operator's actions, the find-missing loop and the 0.10.0
         # seeders. Each would act on the scenario's own tmux server or
