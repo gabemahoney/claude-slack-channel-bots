@@ -479,15 +479,17 @@
 # (120 s). SETTLE_S (30) is the stated settle: a round's own calls (one
 # `status` and one call, each one agent-director process, a few seconds at
 # most), the timer's start after the previous round settled, and the shim's
-# process start. Each round line is waited for within n times the interval
-# plus twice SETTLE_S for its n-th round from the latch. A leg's row is read
+# process start. Each round line is waited for within n times the sum of the
+# interval and twice SETTLE_S for its n-th round from the latch. A leg's row is read
 # `missing` within the loop's interval (SCENARIO_FIND_MISSING_INTERVAL_S, 30)
 # plus 60 of the loop's start (its first run is at once); each leg's next
 # round line is waited for within twice the interval plus twice SETTLE_S.
 # Part 1: the approver's first `read-pane` of the held-dialog persona's row
-# within START_WAIT_S of the latch life's start; its report-in after the
-# Enter within REPORT_WAIT_S; the after-clear run's `find-missing` within
-# SETTLE_S of the Enter (not asserted there); a harness `get` with no note
+# within START_WAIT_S of the note persona's latch-set line; its report-in
+# after the Enter within REPORT_WAIT_S; round k+1's line within the sum of
+# the interval and twice SETTLE_S of the harness read showing `waiting`; the
+# after-clear run's `find-missing` for up to SETTLE_S after that line (not
+# asserted there; its presence is checked in step 6); a harness `get` with no note
 # within the loop's interval plus 60 of the loop's start; the note persona's
 # clearing round line within twice the sum of the interval and twice
 # SETTLE_S; the held-dialog persona's worker's end within EXIT_WAIT_S.
@@ -1621,7 +1623,7 @@ cscb_find_missing_after() {
 # p1_check_note_rounds: the note persona's rounds while the note showed (up
 # to the harness get that showed none): each one `get` alone, at the cadence,
 # with no post beyond the latch's; at least MIN_LATCHED_ROUNDS of them before
-# the unset; the row keeps its state and row_version.
+# the unset; the row keeps the state read at the latch.
 p1_check_note_rounds() {
     local key="${CN_KEY}" step="part 1: ${CN_KEY}'s note rounds" id="${PERSONA_ID[${CN_KEY}]}" rounds n i=0 prev s_pos s_us
     n="${FREE_ROUNDS[${key}]}"

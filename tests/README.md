@@ -367,7 +367,7 @@ tests/
                                    # `resume` launches, and it clears with one recovery post ("its row finished and a relaunch was not refused"),
                                    # nothing posted between the latch's notice and it. The harness runs no `find-missing` in Part 2 before its loop, which
                                    # serves the latched personas' rows; the loop's calls are the harness's, never counted as CSCB's. Modes: tmux
-                                   # shim `log`, the stub's dev-channels hold (report-in at once for the note persona and the pane-not-found persona's relaunch; the unrecognised-dialog mode for the held-dialog persona's latch life),
+                                   # shim `log`, the stub's dev-channels hold (report-in at once for the note persona and the pane-not-found persona's relaunch; the unrecognised-dialog mode for the held-dialog persona's latch life, then report-in at once),
                                    # `health_check_interval` 0 (so the waiting-row `read-pane` a health tick makes is not shown; the reconnect
                                    # comes from a server restart), agent-director's defaults (no config.toml). It runs about 32 minutes (Part 1 about 8.5, Part 2 about 24) and ends
                                    # with the loop stopped, a plain `stop`, then the three closing assertions
