@@ -72,13 +72,56 @@
  *                                                package's personaKey, as the config
  *                                                loader derives it)
  *
+ *   Scenario 10 (test-22-fmk-wrong-server.sh):
+ *   personaInstanceId <key>                      src/persona-identity.ts, `cscb_<key>`
+ *   personaTmuxSessionName <key>                 src/persona-identity.ts, `slack_bot_<key>`
+ *   CONFLICT_NOTICE_FIRST_LINE_HEAD              src/conflict-latch.ts, the CONFLICT notice's parts
+ *   CONFLICT_NOTICE_POINTER_LINE                 (SRJ-1004) CSCB writes around agent-director's
+ *   CONFLICT_NOTICE_HUMAN_ONLY_LINE              description
+ *   conflictCaseSentence <latch-case>            src/conflict-latch.ts, a case's sentence (a case
+ *                                                with none is a failure)
+ *   LATCH_CASE_OWN_ID                            src/conflict-latch.ts, the "this row's own id" case
+ *   conflictRecoveryText <session-name> <reason-export>
+ *                                                src/conflict-latch.ts, the CONFLICT recovery
+ *                                                notice's body; <reason-export> names one of the
+ *                                                package's LATCH_RECOVERY_REASON_* values without
+ *                                                a state (LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED,
+ *                                                for one)
+ *   LATCH_RECHECK_INTERVAL_MS                    src/conflict-latch.ts, in decimal
+ *   RECHECK_CALL_PROBE RECHECK_CALL_RESUME       src/conflict-latch.ts, the call and verdict
+ *   RECHECK_VERDICT_STILL_LATCHED                labels a re-check's round line carries
+ *   PROBE_PANE_READ_LINES                        src/pane-read.ts, in decimal
+ *   PANE_READ_PANE PANE_READ_GONE                src/pane-read.ts, a pane read's outcome kinds
+ *   CONFLICT_OWN_ID_PHRASE STILL_STOPPING_PHRASE STILL_STARTING_PHRASE
+ *                                                src/ad-description-phrases.ts
+ *   AD_SETTINGS_RELATIVE_PATH AD_TMUX_TABLE      src/ad-settings.ts (the path re-exported from
+ *                                                src/ad-config-file.ts)
+ *   AD_SETTING_MINIMUMS                          src/ad-settings.ts: one `<key>=<minimum>` line
+ *                                                per key whose minimum is a whole number, in the
+ *                                                export's order, each key one of AD_TMUX_KEYS
+ *   MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS          src/config.ts, in decimal: the longest permission
+ *                                                poll interval a config may set
+ *   sessionEndingCommandsIn                      reads a post's text on standard input and prints
+ *                                                the names of the session-ending command forms
+ *                                                (tests/test-helpers/session-ending-commands.ts,
+ *                                                SRJ-1001) its CSCB-authored lines match, one per
+ *                                                line, nothing when none: every line but the one
+ *                                                that opens with the package's
+ *                                                CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD (lines split
+ *                                                at CONFLICT_NOTICE_LINE_SEPARATOR)
+ *
  * An entry is one `Entry` in `ENTRIES`: its argument synopsis, the export it
  * prints and a `print` function from its arguments to the value. Constants
  * use `constantEntry`; a builder entry checks its own arguments with
- * `expectArguments` and loads its export with `packageFunction`.
+ * `expectArguments` and loads its export with `packageFunction`
+ * (`builderEntry` for a builder of string arguments only).
  *
  * The printer makes no agent-director call, starts no process or server,
- * opens no socket, reads no token and writes no file.
+ * opens no socket, reads no token and writes no file; only
+ * `sessionEndingCommandsIn` reads its standard input. Its one module outside
+ * the installed package is the import-free
+ * tests/test-helpers/session-ending-commands.ts, loaded from this file's own
+ * tree (/tests in the image).
  */
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
@@ -217,6 +260,80 @@ const personaNotice: Entry = {
   },
 }
 
+/** An entry printing the output of the package builder `name` of `relPath` for its string arguments `argNames`. */
+function builderEntry(relPath: string, name: string, argNames: readonly string[]): Entry {
+  return {
+    synopsis: argNames.map((n) => `<${n}>`).join(' '),
+    async print(args, context) {
+      expectArguments(name, args, argNames)
+      const build = await packageFunction<(...parts: string[]) => unknown>(context, relPath, name)
+      return builtString(name, build(...args))
+    },
+  }
+}
+
+/** `conflictRecoveryText(<session-name>, <the package's LATCH_RECOVERY_REASON_* value named>)`. */
+const recoveryText: Entry = {
+  synopsis: '<session-name> <reason-export>',
+  async print(args, context) {
+    const entry = 'conflictRecoveryText'
+    expectArguments(entry, args, ['session-name', 'reason-export'])
+    const [sessionName, reasonExport] = args
+    if (!reasonExport.startsWith('LATCH_RECOVERY_REASON_')) {
+      usageFail(`${entry}: <reason-export> must name a LATCH_RECOVERY_REASON_* value (got '${reasonExport}')`)
+    }
+    const reason = await packageExport(context, 'conflict-latch.ts', reasonExport)
+    if (typeof reason !== 'object' || reason === null || typeof (reason as { kind?: unknown }).kind !== 'string') {
+      fail(PRINTER_FAIL_EXIT, `the installed package's src/conflict-latch.ts export ${reasonExport} is not a recovery reason`)
+    }
+    const build = await packageFunction<(sessionName: string, reason: unknown) => unknown>(context, 'conflict-latch.ts', entry)
+    return builtString(entry, build(sessionName, reason))
+  },
+}
+
+/** Each `[tmux]` key whose minimum is a whole number, as `<key>=<minimum>` lines (AD_TMUX_KEYS checked). */
+const settingMinimums: Entry = {
+  synopsis: '',
+  async print(args, context) {
+    const entry = 'AD_SETTING_MINIMUMS'
+    expectArguments(entry, args, [])
+    const minimums = await packageExport(context, 'ad-settings.ts', entry)
+    const keys = await packageExport(context, 'ad-settings.ts', 'AD_TMUX_KEYS')
+    if (typeof minimums !== 'object' || minimums === null || !Array.isArray(keys)) {
+      fail(PRINTER_FAIL_EXIT, `the installed package's src/ad-settings.ts ${entry} or AD_TMUX_KEYS is not of the kind this entry prints`)
+    }
+    const lines: string[] = []
+    for (const [key, value] of Object.entries(minimums)) {
+      if (typeof value !== 'bigint' && typeof value !== 'number') continue
+      if (!keys.includes(key)) fail(PRINTER_FAIL_EXIT, `${entry} names ${key}, which is not one of AD_TMUX_KEYS`)
+      lines.push(`${key}=${String(value)}`)
+    }
+    if (lines.length === 0) fail(PRINTER_FAIL_EXIT, `${entry} holds no whole-number minimum`)
+    return lines.join('\n')
+  },
+}
+
+/** The import-free session-ending forms helper, in this file's own tree (`/tests` in the image). */
+const SESSION_ENDING_COMMANDS_PATH = join(import.meta.dir, '..', '..', 'test-helpers', 'session-ending-commands.ts')
+
+/** The session-ending command forms a post's CSCB-authored lines match (the post read on standard input). */
+const sessionEndingForms: Entry = {
+  synopsis: '',
+  async print(args, context) {
+    const entry = 'sessionEndingCommandsIn'
+    expectArguments(entry, args, [])
+    const head = await packageString(context, 'conflict-latch.ts', 'CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD')
+    const separator = await packageString(context, 'conflict-latch.ts', 'CONFLICT_NOTICE_LINE_SEPARATOR')
+    const helper = (await import(SESSION_ENDING_COMMANDS_PATH)) as Record<string, unknown>
+    const find = helper[entry]
+    if (typeof find !== 'function') fail(PRINTER_FAIL_EXIT, `${SESSION_ENDING_COMMANDS_PATH} exports no function ${entry}`)
+    const text = await Bun.stdin.text()
+    const own = text.split(separator).filter((line) => !line.startsWith(head))
+    const found = own.flatMap((line) => (find as (text: string) => string[])(line))
+    return [...new Set(found)].join('\n')
+  },
+}
+
 /** The printer's entries, by the name a script passes. Later scenarios add entries here. */
 const ENTRIES: Readonly<Record<string, Entry>> = {
   // Scenario 8 (test-20-fmk-old-binary.sh).
@@ -228,6 +345,30 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX: constantEntry('ad-version-gate.ts', 'AD_VERSION_RECHECK_COULD_NOT_RUN_LOG_PREFIX'),
   INVALID_FLAGS_HOLD_ALERT_TEXT: constantEntry('invalid-flags-hold.ts', 'INVALID_FLAGS_HOLD_ALERT_TEXT'),
   formatPersonaNotice: personaNotice,
+  // Scenario 10 (test-22-fmk-wrong-server.sh).
+  personaInstanceId: builderEntry('persona-identity.ts', 'personaInstanceId', ['key']),
+  personaTmuxSessionName: builderEntry('persona-identity.ts', 'personaTmuxSessionName', ['key']),
+  CONFLICT_NOTICE_FIRST_LINE_HEAD: constantEntry('conflict-latch.ts', 'CONFLICT_NOTICE_FIRST_LINE_HEAD'),
+  CONFLICT_NOTICE_POINTER_LINE: constantEntry('conflict-latch.ts', 'CONFLICT_NOTICE_POINTER_LINE'),
+  CONFLICT_NOTICE_HUMAN_ONLY_LINE: constantEntry('conflict-latch.ts', 'CONFLICT_NOTICE_HUMAN_ONLY_LINE'),
+  conflictCaseSentence: builderEntry('conflict-latch.ts', 'conflictCaseSentence', ['latch-case']),
+  LATCH_CASE_OWN_ID: constantEntry('conflict-latch.ts', 'LATCH_CASE_OWN_ID'),
+  conflictRecoveryText: recoveryText,
+  LATCH_RECHECK_INTERVAL_MS: constantEntry('conflict-latch.ts', 'LATCH_RECHECK_INTERVAL_MS'),
+  RECHECK_CALL_PROBE: constantEntry('conflict-latch.ts', 'RECHECK_CALL_PROBE'),
+  RECHECK_CALL_RESUME: constantEntry('conflict-latch.ts', 'RECHECK_CALL_RESUME'),
+  RECHECK_VERDICT_STILL_LATCHED: constantEntry('conflict-latch.ts', 'RECHECK_VERDICT_STILL_LATCHED'),
+  PROBE_PANE_READ_LINES: constantEntry('pane-read.ts', 'PROBE_PANE_READ_LINES'),
+  PANE_READ_PANE: constantEntry('pane-read.ts', 'PANE_READ_PANE'),
+  PANE_READ_GONE: constantEntry('pane-read.ts', 'PANE_READ_GONE'),
+  CONFLICT_OWN_ID_PHRASE: constantEntry('ad-description-phrases.ts', 'CONFLICT_OWN_ID_PHRASE'),
+  STILL_STOPPING_PHRASE: constantEntry('ad-description-phrases.ts', 'STILL_STOPPING_PHRASE'),
+  STILL_STARTING_PHRASE: constantEntry('ad-description-phrases.ts', 'STILL_STARTING_PHRASE'),
+  AD_SETTINGS_RELATIVE_PATH: constantEntry('ad-settings.ts', 'AD_SETTINGS_RELATIVE_PATH'),
+  AD_TMUX_TABLE: constantEntry('ad-settings.ts', 'AD_TMUX_TABLE'),
+  AD_SETTING_MINIMUMS: settingMinimums,
+  MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS: constantEntry('config.ts', 'MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS'),
+  sessionEndingCommandsIn: sessionEndingForms,
 }
 
 /** The value entry `name` prints for `args`; a usage failure for no entry or an unknown one. */

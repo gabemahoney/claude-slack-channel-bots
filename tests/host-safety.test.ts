@@ -2393,6 +2393,18 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       expect(unguarded).not.toBe(source)
       expectNamedFindings(helperHomeCheckFindings('scenario.sh', unguarded, [helper]), 'scenario.sh', RULE.homeCheckFirst)
     })
+
+    test("the current tree: scenario 10's [tmux] table writer (write_ad_tmux_table) runs require_scenario_home before its file write", () => {
+      expect(helperHomeCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), readFileSync(SCENARIO_PATH, 'utf-8'), ['write_ad_tmux_table'])).toEqual([])
+    })
+
+    test('write_ad_tmux_table without its require_scenario_home is flagged at its file write, through write_file', () => {
+      const source = readFileSync(SCENARIO_PATH, 'utf-8')
+      const unguarded = source.replace(/(\nwrite_ad_tmux_table\(\) \{\n(?:.*\n)*?)    require_scenario_home "[^"\n]*"\n/, '$1')
+
+      expect(unguarded).not.toBe(source)
+      expectNamedFindings(helperHomeCheckFindings('scenario.sh', unguarded, ['write_ad_tmux_table']), 'scenario.sh', RULE.homeCheckFirst)
+    })
   })
 
   describe('fmk-driver.ts, stub-mcp-session.ts and fmk-texts.ts check the marker before their first step', () => {

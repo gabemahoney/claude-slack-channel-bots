@@ -227,6 +227,9 @@ tests/
                                    # re-bind (`tmux_server_steps`). The re-fire legs wait out agent-director's default G (60 s); only after them does
                                    # `store_statements` write a `[tmux]` table (`starting_session_seconds = 60`, `stopping_window_seconds = 30`), so the
                                    # kill need not wait 300 s. It runs about two and a half minutes and ends with the three closing assertions
+    test-22-fmk-wrong-server.sh
+                                   # HO §7 scenario 10 (b.jg5 SRJ-1412), fmk: a find-missing from another tmux environment marks nothing; the own-id conflict latches
+                                   # and clears (see fmk scenario list). It writes the scenario HOME's `[tmux]` table and runs about ten minutes
     lib/
       scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards (see Scenario helper below)
     fixtures/
@@ -635,6 +638,25 @@ by single spaces, hold every fixed-string fragment in order;
 `cscb_ad_count <verb> [<fragment>...]` prints how many. The harness's calls,
 the stub's calls and any `stop` line never count.
 
+Call windows (fmk mode; scenario 10; each a harness addition, confirm at the
+reconcile pass). `ad_shim_mark` prints how many lines the agent-director
+shim's log holds now (0 when there is none), a mark.
+`cscb_ad_calls_between <from-mark> <to-mark|-> <verb> [<fragment>...]` and
+`cscb_ad_count_between` with the same arguments are `cscb_ad_calls` and
+`cscb_ad_count` over only the log's lines after `<from-mark>` up to
+`<to-mark>` (`-`: the log's end now), read from a copy of those lines under
+`SCENARIO_ROOT` with the same CSCB process record, so a script counts one
+re-check round's calls. Each runs `require_ci_image` first.
+
+Slack posts (scenario 10; each a harness addition, confirm at the reconcile
+pass). `slack_record_mark <record>` prints the last `seq` of a Slack stub
+record under `SCENARIO_ROOT` (0 when it holds none).
+`slack_posts <record> <label> [<after-seq>]` prints the text of each
+`chat.postMessage` the stub recorded for the token label `<label>` with a
+`seq` above `<after-seq>` (default 0), in record order, one JSON string per
+line (`jq -r` gives a post's text back). Each runs `require_ci_image` first
+and refuses a record that is not a file under `SCENARIO_ROOT`.
+
 Matchers (E14 director decision 14). A matcher is one or more fixed-string
 fragments that must appear on one line in the given order, with anything
 between them; there is no regex. A plain string is a one-fragment matcher, so
@@ -753,6 +775,15 @@ These hold for every fmk script (b.jg5 SRJ-1401):
   --record`).
 - Shim logs are read by parent process, as above, never by scraping a pane.
 
+### fmk scenario list
+
+Each HO §7 scenario's script, what it drives and what it checks. The
+script's header comment is its full specification.
+
+| Scenario | Script | Sites | Outcomes checked | Modes, helpers and settings |
+|---|---|---|---|---|
+| 10 (b.jg5 SRJ-1412; AC 1, AC 5) | `test-22-fmk-wrong-server.sh` | Part A: two harness `find-missing` runs (`ad_capture`) while the persona's worker runs, one with `TMUX_TMPDIR` set for that call only to an empty directory under `SCENARIO_ROOT`, one with `TMUX` set for that call only to a second tmux server (`start_second_tmux_server`). Part B: the harness's one store statement (`ad_store_mark_finished <id> missing`, scenario 10 part B's), made once the session is older than the larger `[tmux]` minimum; then the bot server restarted without teardown (a plain `stop`, then `start`), whose bring-up makes a plain `spawn` (agent-director answers `ErrInstanceIdCollision`) and then a `resume`; the latch re-check's probe; the human's finished-row kill, `ad_kill_include_finished` (agent-director-admin's `kill-finished`) from the scenario's own shell; the re-check after it | Part A: each run exits 0 with an `ids` array that does not hold the persona's instance id, logged with the scenario's shell as parent, and the prefix assignment does not outlive the call; the script does not check that each run saw the other environment (the shim logs arguments and parent, not environment). Then the row still reads `waiting` and the worker runs, and over one re-check interval and 5 s more no CSCB process makes a `resume`, `spawn`, `kill`, `read-pane` or `send-keys` for the persona, nor any `find-missing`; no post and no latch line. Part B, the latch: the new bot server's `resume` meets the own-id CONFLICT (`CONFLICT_OWN_ID_PHRASE`); an UNAVAILABLE line carrying `STILL_STOPPING_PHRASE` or `STILL_STARTING_PHRASE` may come before it, and none after (the wait past the starting-session bound means none is expected); the persona latches with `LATCH_CASE_OWN_ID`; exactly one post, carrying in order the persona prefix with `CONFLICT_NOTICE_FIRST_LINE_HEAD` and the quoted session name, `conflictCaseSentence`, `CONFLICT_NOTICE_POINTER_LINE` and `CONFLICT_NOTICE_HUMAN_ONLY_LINE` (`src/conflict-latch.ts`), with no session-ending command form in its CSCB-authored lines (`sessionEndingCommandsIn`). The held latch, over two re-checks: each window holds exactly one `status` and then one `read-pane --n-lines` `PROBE_PANE_READ_LINES` by the bot server (`version` left out), the round logs `still-latched (pane)` (src/session-manager.ts runLatchRecheckRound, from `RECHECK_VERDICT_STILL_LATCHED` and `PANE_READ_PANE`), no further post, the worker runs and the row reads `missing`. The kill: `kill_sent` true, the session and worker gone, `state`, `ended_at` and `row_version` unchanged. The clear: from the second re-check to the first `resume` after it, exactly `status`, the one-line `read-pane`, `find-missing` and `resume`, once each; the round logs `probe-cleared (gone)` (src/session-manager.ts, from `PANE_READ_GONE`, agent-director's `ErrTmuxCaptureFailed`); the row reads `waiting` again; the second and last post of part B is exactly `formatPersonaNotice` of `conflictRecoveryText` with `LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED`. Close: one finished-row kill in the shim log, the harness's, parented by the scenario's shell; no CSCB `kill`, and no CSCB `spawn` from the latch on | tmux-shim `log`; the stub's `dev-channels` hold (`STUB_MODE_DEV_CHANNELS`); `health_check_interval` 0; `agent_director_poll_interval_ms` at its allowed maximum (`MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS`, src/config.ts), so the permission poller's `list` calls do not fall in the counted re-check windows; the `[tmux]` table (`write_ad_tmux_table`) with `stopping_window_seconds` 30 and `starting_session_seconds` 60, their minimums from `AD_SETTING_MINIMUMS` (src/ad-settings.ts). Every text, phrase, label, interval and line count from `fixtures/fmk-texts.ts`; calls read with `cscb_ad_calls_between` / `cscb_ad_count_between` between `ad_shim_mark` marks, posts with `slack_record_mark` and `slack_posts`. Runs about ten minutes |
+
 ### Harness-only steps
 
 The harness plays a human's acts with the helpers below (b.jg5 SRJ-1306,
@@ -795,6 +826,8 @@ of another session's.
 | A human's finished-row kill, agent-director-admin's `kill-finished` (scenario 10) | `ad_kill_include_finished` |
 | A human's agent-director-admin `delete` of the row with the unusable name (scenario 25) | `ad_delete_unusable_row` |
 | The host's `find-missing` loop | `run_find_missing_loop` |
+| Scenario 10's `[tmux]` table in the scenario HOME's agent-director config (harness addition, confirm at the reconcile pass) | `write_ad_tmux_table` |
+| Another tmux server on its own socket, for scenario 10 part A's `TMUX` run (harness addition, confirm at the reconcile pass) | `start_second_tmux_server` |
 
 The step that set `base-index` is withdrawn: no agent-director verb depends
 on pane indices, and no helper sets it.
@@ -813,6 +846,37 @@ name that is taken or holds `.`, `:` or a control character. Each prints
 `<session id> <pane id>`, then the token and store id for a labelled
 session, and sets `SEEDED_SESSION_ID`, `SEEDED_PANE_ID`, `SEEDED_TOKEN` and
 `SEEDED_STORE_ID`, which a call inside `$( … )` does not keep.
+
+#### Scenario 10's harness additions
+
+Each is a harness addition, confirm at the reconcile pass.
+
+- `write_ad_tmux_table [<key>=<toml-value>...]` writes the scenario HOME's
+  agent-director config file, `$HOME/<AD_SETTINGS_RELATIVE_PATH>`, as one
+  `[<AD_TMUX_TABLE>]` table (path and table name printed by
+  `fixtures/fmk-texts.ts` from `src/ad-settings.ts`) holding the given pairs
+  in order, each value written as given; the caller picks values at or above
+  their minimums. The file is replaced whole (`write_file`) and read back;
+  with no pair it is removed. It runs in fmk mode only, and refuses a path
+  that leaves HOME or resolves outside `SCENARIO_ROOT`, and a pair that is
+  not `<key>=<value>` on one line.
+- `start_second_tmux_server [<session-name>]` starts another tmux server,
+  with the real tmux from the scenario's own shell, on its own socket
+  `$SCENARIO_ROOT/tmux-second/tmux-<uid>/default`, with one detached session
+  (default `<SCENARIO_TAG>_second`). It names that socket with `-S` on every
+  call, so the scenario's own server is never touched, and the trap stops it
+  with every other tmux socket under `SCENARIO_ROOT`. It refuses as the tmux
+  steps do, and once a second server was started, and fails unless the
+  socket answers with the new server's PID. It sets `SECOND_TMUX_SOCKET` and
+  `SECOND_TMUX` (`<socket>,<server pid>,<session number>`, the `TMUX` value
+  that points at it) and prints `SECOND_TMUX`.
+- A harness agent-director call under another tmux environment needs no
+  helper: a bash prefix assignment on `ad_capture`
+  (`TMUX_TMPDIR=<dir> ad_capture find-missing`,
+  `TMUX="${SECOND_TMUX}" ad_capture find-missing`) holds for that one call
+  only, is made from the scenario's own shell and reaches the binary behind
+  the shim. The shim logs the call's arguments and parent, not its
+  environment.
 
 #### Seeding rules
 

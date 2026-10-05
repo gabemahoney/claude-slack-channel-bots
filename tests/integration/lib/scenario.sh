@@ -609,6 +609,61 @@
 #   cscb_ad_count <verb> [<fragment>...]
 #                                      print how many lines `cscb_ad_calls` would print
 #
+#   Scenario 10's harness additions (fmk mode; b.jg5 SRJ-1412, SRJ-1306, SRJ-1401). Each is a
+#   harness addition, confirm at the reconcile pass; each runs `require_ci_image` first, and
+#   `write_ad_tmux_table` and `start_second_tmux_server` also `require_scenario_home`, before
+#   any step. A harness
+#   agent-director call under another tmux environment needs no helper: a prefix assignment
+#   on the call (`TMUX_TMPDIR=<dir> ad_capture …`, `TMUX=<value> ad_capture …`) holds for
+#   that one call only, from the scenario's own shell, and reaches the binary behind the shim.
+#   write_ad_tmux_table [<key>=<toml-value>...]
+#                                      (harness addition, confirm at the reconcile pass) write
+#                                      the scenario HOME's agent-director config file, at
+#                                      $HOME/<AD_SETTINGS_RELATIVE_PATH>, as one `[<AD_TMUX_TABLE>]`
+#                                      table (path and table name printed by fixtures/fmk-texts.ts
+#                                      from src/ad-settings.ts) of the given pairs, in order, each
+#                                      `<key> = <toml-value>` with the value text as given (so a
+#                                      string or a below-minimum value is written as given; the
+#                                      caller picks values at or above their minimums); the file
+#                                      is replaced whole (`write_file`), then read back; with no
+#                                      pair the file is removed. Refuses a path that leaves HOME
+#                                      or resolves outside SCENARIO_ROOT, and a pair that is not
+#                                      `<key>=<value>` on one line
+#   start_second_tmux_server [<session-name>]
+#                                      (harness addition, confirm at the reconcile pass) start
+#                                      another tmux server, with the real tmux from the scenario's
+#                                      own shell, on its own socket
+#                                      `$SCENARIO_ROOT/tmux-second/tmux-<uid>/default`, with one
+#                                      detached session (default name <SCENARIO_TAG>_second); it
+#                                      names that socket with -S on every call, so the scenario's
+#                                      own server is never touched, and the trap stops it with
+#                                      every other tmux socket under SCENARIO_ROOT. Refuses when
+#                                      TMUX_TMPDIR is not the scenario's or TMUX is set, and once
+#                                      one was started; fails unless the socket then answers with
+#                                      the new server's PID. Sets SECOND_TMUX_SOCKET and
+#                                      SECOND_TMUX, the TMUX value that points at it
+#                                      (`<socket>,<server pid>,<session number>`), and prints
+#                                      SECOND_TMUX
+#   ad_shim_mark                       (harness addition, confirm at the reconcile pass) print
+#                                      how many lines the agent-director shim's log holds now (0
+#                                      when none): a mark for the two helpers below
+#   cscb_ad_calls_between <from-mark> <to-mark|-> <verb> [<fragment>...]
+#   cscb_ad_count_between <from-mark> <to-mark|-> <verb> [<fragment>...]
+#                                      (harness addition, confirm at the reconcile pass)
+#                                      `cscb_ad_calls` and `cscb_ad_count` over only the shim
+#                                      log's lines after <from-mark> up to <to-mark> (`-`: up to
+#                                      the log's end now), read from a copy of those lines under
+#                                      SCENARIO_ROOT with the same CSCB process record
+#   slack_record_mark <record>         (harness addition, confirm at the reconcile pass) print
+#                                      the last `seq` of the Slack stub's record <record> (a file
+#                                      under SCENARIO_ROOT; 0 when it holds none)
+#   slack_posts <record> <label> [<after-seq>]
+#                                      (harness addition, confirm at the reconcile pass) print the
+#                                      text of each `chat.postMessage` the Slack stub recorded for
+#                                      the token label <label> with a `seq` above <after-seq>
+#                                      (default 0), in record order, one JSON string per line
+#                                      (`jq -r` gives a post's text back)
+#
 # Line builders (every fragment is quoted from src/; <ref> is `persona_ref`):
 #   persona_start_match   `[slack] persona-start: personas[<index>] <ref>`
 #                         (src/persona-bringup-controller.ts bringUp, format
@@ -3574,6 +3629,154 @@ cscb_ad_calls() {
 
 cscb_ad_count() {
     _scenario_cscb_ad_scan "cscb_ad_count" count "${1-}" "${@:2}"
+}
+
+# ---------------------------------------------------------------------------
+# Scenario 10's harness additions (fmk mode; each a harness addition, confirm
+# at the reconcile pass)
+# ---------------------------------------------------------------------------
+
+# _scenario_printed <step> <entry> [<arg>...]: print fixtures/fmk-texts.ts's
+# value for <entry>; fail when the printer fails.
+_scenario_printed() {
+    local step="$1" entry="$2" out
+    shift 2
+    out="$(bun "${SCENARIO_FIXTURES}/fmk-texts.ts" "${entry}" "$@")" \
+        || fail "${step}: fmk-texts could not print ${entry}"
+    printf '%s\n' "${out}"
+}
+
+write_ad_tmux_table() {
+    local step="write_ad_tmux_table $*" rel table path dir real_root real_dir pair key value body got
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    [[ "${SCENARIO_FMK}" == 1 ]] || fail "${step}: the scenario HOME's agent-director config is for fmk scripts only"
+    rel="$(_scenario_printed "${step}" AD_SETTINGS_RELATIVE_PATH)" || exit 1
+    [[ -n "${rel}" && "${rel}" != /* && "/${rel}/" != */../* && "${rel}" != *[[:cntrl:]]* ]] \
+        || fail "${step}: refused: the settings path '${rel}' is not a relative path inside HOME"
+    path="${HOME}/${rel}"
+    dir="$(dirname -- "${path}")"
+    real_root="$(realpath -e -- "${SCENARIO_ROOT}" 2> /dev/null)" \
+        || fail "${step}: refused: cannot resolve SCENARIO_ROOT ${SCENARIO_ROOT}"
+    real_dir="$(realpath -m -- "${dir}" 2> /dev/null)" || fail "${step}: cannot resolve ${dir}"
+    [[ "${real_dir}" == "${real_root}"/* ]] \
+        || fail "${step}: refused: ${dir} resolves to ${real_dir}, which is not under SCENARIO_ROOT ${real_root}"
+    if (( $# == 0 )); then
+        rm -f -- "${path}" || fail "${step}: could not remove ${path}"
+        [[ ! -e "${path}" ]] || fail "${step}: ${path} is still there after its removal"
+        return 0
+    fi
+    table="$(_scenario_printed "${step}" AD_TMUX_TABLE)" || exit 1
+    [[ "${table}" =~ ^[A-Za-z0-9_]+$ ]] || fail "${step}: the printed table name '${table}' is not a bare TOML key"
+    body="[${table}]"$'\n'
+    for pair in "$@"; do
+        key="${pair%%=*}"
+        value="${pair#*=}"
+        [[ "${pair}" == *=* && "${key}" =~ ^[A-Za-z0-9_]+$ && -n "${value}" && "${value}" != *[$'\n\r']* ]] \
+            || fail "${step}: '${pair}' is not <key>=<TOML value> on one line"
+        body+="${key} = ${value}"$'\n'
+    done
+    mkdir -p -- "${dir}" || fail "${step}: could not create ${dir}"
+    write_file "${path}" < <(printf '%s' "${body}")
+    got="$(cat -- "${path}" && printf x)" || fail "${step}: could not read ${path} back"
+    [[ "${got%x}" == "${body}" ]] || fail "${step}: ${path} does not hold the table as written"
+}
+
+start_second_tmux_server() {
+    local name="${1:-${SCENARIO_TAG}_second}" step="start_second_tmux_server" dir sock out pid sid got
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_tmux_check "${step}"
+    _scenario_check_session_name "${step}" "${name}"
+    [[ -z "${SECOND_TMUX_SOCKET:-}" ]] \
+        || fail "${step}: a second tmux server was already started (${SECOND_TMUX_SOCKET})"
+    dir="${SCENARIO_ROOT}/tmux-second/tmux-$(id -u)"
+    sock="${dir}/default"
+    [[ "${sock}" != "${TMUX_TMPDIR}"/* ]] || fail "${step}: refused: ${sock} is under the scenario's own TMUX_TMPDIR"
+    mkdir -p -- "${dir}" || fail "${step}: could not create ${dir}"
+    chmod 00700 "${SCENARIO_ROOT}/tmux-second" "${dir}" || fail "${step}: could not set the modes of ${dir}"
+    [[ ! -e "${sock}" ]] || fail "${step}: ${sock} already exists"
+    out="$("${SCENARIO_REAL_TMUX}" -S "${sock}" new-session -d -P -F '#{pid} #{session_id}' -s "${name}" 2> "${SCENARIO_ROOT}/harness-tmux.err")" \
+        || fail "${step}: tmux new-session on ${sock} failed: $(_scenario_tmux_err)"
+    read -r pid sid <<< "${out}"
+    [[ "${pid}" =~ ^[0-9]+$ && "${sid}" =~ ^\$[0-9]+$ ]] \
+        || fail "${step}: tmux new-session printed '${out}', not a server pid and a session id"
+    got="$("${SCENARIO_REAL_TMUX}" -S "${sock}" list-sessions -F '#{pid}' 2> "${SCENARIO_ROOT}/harness-tmux.err")" \
+        || fail "${step}: ${sock} does not answer: $(_scenario_tmux_err)"
+    [[ "${got%%$'\n'*}" == "${pid}" && -S "${sock}" ]] \
+        || fail "${step}: ${sock} answers with server pid '${got%%$'\n'*}', not the new server's ${pid}"
+    pid_alive "${pid}" || fail "${step}: the new tmux server ${pid} is not running"
+    SECOND_TMUX_SOCKET="${sock}"
+    SECOND_TMUX="${sock},${pid},${sid#\$}"
+    printf '%s\n' "${SECOND_TMUX}"
+}
+
+ad_shim_mark() {
+    require_ci_image "ad_shim_mark"
+    [[ "${SCENARIO_FMK}" == 1 ]] || fail "ad_shim_mark: the shim log is for fmk scripts only"
+    if [[ -f "${SCENARIO_AD_SHIM_LOG}" ]]; then
+        wc -l < "${SCENARIO_AD_SHIM_LOG}" | tr -d ' '
+    else
+        echo 0
+    fi
+}
+
+# _scenario_ad_window <step> <from-mark> <to-mark|->: copy the shim log's
+# lines after <from-mark> up to <to-mark> to a new file under SCENARIO_ROOT
+# and print its path.
+_scenario_ad_window() {
+    local step="$1" from="$2" to="$3" file
+    require_ci_image "${step}"
+    [[ "${from}" =~ ^[0-9]+$ ]] || fail "${step}: mark '${from}' is not a line count"
+    if [[ "${to}" == - ]]; then
+        to="$(ad_shim_mark)"
+    fi
+    [[ "${to}" =~ ^[0-9]+$ ]] || fail "${step}: mark '${to}' is not a line count"
+    mkdir -p -- "${SCENARIO_ROOT}/ad-windows" || fail "${step}: could not create ${SCENARIO_ROOT}/ad-windows"
+    file="$(mktemp "${SCENARIO_ROOT}/ad-windows/window.XXXXXX")" || fail "${step}: could not create a window file"
+    if (( to > from )); then
+        sed -n "$(( from + 1 )),${to}p" "${SCENARIO_AD_SHIM_LOG}" > "${file}" \
+            || fail "${step}: could not copy lines $(( from + 1 )) to ${to} of ${SCENARIO_AD_SHIM_LOG}"
+    fi
+    printf '%s\n' "${file}"
+}
+
+cscb_ad_calls_between() {
+    local file
+    file="$(_scenario_ad_window "cscb_ad_calls_between" "${1-}" "${2-}")" || exit 1
+    ( SCENARIO_AD_SHIM_LOG="${file}"; cscb_ad_calls "${3-}" "${@:4}" )
+}
+
+cscb_ad_count_between() {
+    local file
+    file="$(_scenario_ad_window "cscb_ad_count_between" "${1-}" "${2-}")" || exit 1
+    ( SCENARIO_AD_SHIM_LOG="${file}"; cscb_ad_count "${3-}" "${@:4}" )
+}
+
+# _scenario_slack_record <step> <record>: fail unless <record> is a file under
+# SCENARIO_ROOT.
+_scenario_slack_record() {
+    require_ci_image "$1"
+    [[ -n "$2" && "$2" == "${SCENARIO_ROOT}"/* && -f "$2" ]] \
+        || fail "$1: '$2' is not a Slack stub record under SCENARIO_ROOT"
+}
+
+slack_record_mark() {
+    local record="${1:-}" out
+    _scenario_slack_record "slack_record_mark" "${record}"
+    out="$(jq -s 'map(.seq // 0) | max // 0' "${record}")" \
+        || fail "slack_record_mark: jq could not read ${record}"
+    printf '%s\n' "${out}"
+}
+
+slack_posts() {
+    local record="${1:-}" label="${2:-}" after="${3:-0}" step="slack_posts ${2:-}"
+    _scenario_slack_record "${step}" "${record}"
+    [[ -n "${label}" ]] || fail "${step}: no label given"
+    [[ "${after}" =~ ^[0-9]+$ ]] || fail "${step}: '${after}' is not a seq"
+    jq -c --arg l "${label}" --argjson a "${after}" \
+        'select(.event == "api" and .method == "chat.postMessage" and .label == $l and (.seq // 0) > $a) | .text' \
+        "${record}" || fail "${step}: jq could not read ${record}"
 }
 
 # ---------------------------------------------------------------------------
