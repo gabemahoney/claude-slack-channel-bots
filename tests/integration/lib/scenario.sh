@@ -694,6 +694,19 @@
 #                                      one. `assert_no_server_tmux` reads bot-server parents only
 #   cscb_tmux_count [<fragment>...]    (harness addition, confirm at the reconcile pass) print how
 #                                      many lines `cscb_tmux_calls` would print
+#   end_worker_without_session_end <pane-id>
+#                                      (harness addition, confirm at the reconcile pass) a worker
+#                                      whose process ends with no SessionEnd: both guards first,
+#                                      then, from the scenario's own shell with the real tmux (it
+#                                      refuses when TMUX_TMPDIR is not the scenario's or TMUX is
+#                                      set), it reads the pane's main process (#{pane_pid}; the stub
+#                                      is that process) and sends it SIGKILL, so it runs no more of
+#                                      its own code and fires no hook; nothing else is signalled.
+#                                      Fails unless the pane is a live pane (%N) and its process is
+#                                      gone within 10 s. agent-director's row is not touched: it
+#                                      still reads live until a `find-missing` marks it, and with
+#                                      remain-on-exit on the pane and its session remain. Prints
+#                                      `<pane id> <ended pid>`
 #
 # Line builders (every fragment is quoted from src/; <ref> is `persona_ref`):
 #   persona_start_match   `[slack] persona-start: personas[<index>] <ref>`
@@ -3920,6 +3933,31 @@ cscb_tmux_calls() {
 
 cscb_tmux_count() {
     _scenario_cscb_tmux_scan "cscb_tmux_count" count "$@"
+}
+
+# Bound on a worker's process ending after end_worker_without_session_end's
+# SIGKILL, in seconds.
+SCENARIO_WORKER_END_S=10
+
+end_worker_without_session_end() {
+    local pane="${1:-}" step out pid dead
+    step="end_worker_without_session_end ${pane}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_tmux_check "${step}"
+    [[ "${pane}" =~ ^%[0-9]+$ ]] || fail "${step}: '${pane}' is not a pane id (%N)"
+    out="$(_scenario_tmux display-message -p -t "${pane}" '#{pane_pid} #{pane_dead}')" \
+        || fail "${step}: no pane ${pane} on the scenario's tmux server: $(_scenario_tmux_err)"
+    read -r pid dead <<< "${out}"
+    if [[ ! "${pid}" =~ ^[0-9]+$ || "${dead}" != 0 ]] || ! pid_alive "${pid}"; then
+        fail "${step}: pane ${pane} reads pid '${pid}', dead '${dead}': no live process runs in it"
+    fi
+    # SIGKILL: the process runs none of its own code again, so it fires no
+    # hook (the stub fires SessionEnd only on its sentinel) and runs no trap.
+    kill -KILL "${pid}" 2> /dev/null || fail "${step}: could not signal pane ${pane}'s process ${pid}"
+    _scenario_poll_until "${SCENARIO_WORKER_END_S}" _scenario_pid_gone "${pid}" \
+        || fail "${step}: pane ${pane}'s process ${pid} still runs ${SCENARIO_WORKER_END_S} s after SIGKILL"
+    printf '%s %s\n' "${pane}" "${pid}"
 }
 
 # ---------------------------------------------------------------------------

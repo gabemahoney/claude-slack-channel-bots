@@ -133,6 +133,37 @@
  *                                                reconnectGoneLine the text before the persona's
  *                                                reference, which its callers give in more than one
  *                                                form
+ *   launchStartNotRecordedNoticeText <key>       src/conflict-latch.ts, the "launch start not
+ *                                                recorded" notice's body for persona <key> (SRJ-1020)
+ *   holdRecoveryText latchRecoveryReasonRowReads <state>
+ *   holdRecoveryText <reason-export>             src/conflict-latch.ts, the hold recovery notice's body
+ *                                                for the reason latchRecoveryReasonRowReads builds for
+ *                                                <state>, or for the package's LATCH_RECOVERY_REASON_*
+ *                                                value named
+ *   LATCH_CASE_LAUNCH_START_NOT_RECORDED         src/conflict-latch.ts, the hold case
+ *   RECHECK_STEP_TABLE RECHECK_CALL_NONE         src/conflict-latch.ts, the step and call labels a
+ *                                                status-only re-check's round line carries
+ *   relaunchAfterKillLine <key> <cwd> RELAUNCH_KILL_NONE
+ *                                                src/restart.ts, the restart work's line before a
+ *                                                launch with no kill (only the RELAUNCH_KILL_NONE form)
+ *   relaunchWithoutKillLine <key> <reason-export> <dead-reading-export>
+ *                                                src/restart.ts, the restart work's no-kill line with no
+ *                                                verdict carried, for the package's RELAUNCH_NO_KILL_*
+ *                                                reason and its src/liveness-reading.ts
+ *                                                LIVENESS_READING_DEAD* reading named
+ *   latchClearRetryAtOnceLineHead <ref>          src/session-manager.ts, the head of the after-clear
+ *                                                retry's answer line for persona reference <ref>
+ *   DEFAULT_AD_SETTINGS <tmux-key>               src/ad-settings.ts, agent-director's default for one
+ *                                                `[tmux]` key (one of AD_TMUX_KEYS), in decimal
+ *   tmuxUnresponsiveOnsetText <key>              src/persona-episodes.ts, the tmux-unresponsive
+ *                                                onset's body for persona <key> (SRJ-1006)
+ *   tmuxUnresponsiveAlertText <key> DEFAULT_AD_SETTINGS_IN_EFFECT
+ *                                                src/persona-episodes.ts, the tmux-unresponsive
+ *                                                alert's body for persona <key> at the alert
+ *                                                threshold agent-director's defaults give
+ *                                                (src/ad-settings.ts adAlertThresholdMs)
+ *   restartCapReachedNoticeText                  src/session-manager.ts, the restart-cap notice's body,
+ *                                                a spawn-failure notice (several lines)
  *
  * An entry is one `Entry` in `ENTRIES`: its argument synopsis, the export it
  * prints and a `print` function from its arguments to the value. Constants
@@ -434,6 +465,102 @@ const reconnectGoneHead: Entry = {
   },
 }
 
+/** Fails unless `reason` is a recovery reason (an object with a string `kind`). */
+function expectRecoveryReason(entry: string, reason: unknown): void {
+  if (typeof reason !== 'object' || reason === null || typeof (reason as { kind?: unknown }).kind !== 'string') {
+    fail(PRINTER_FAIL_EXIT, `${entry}: the installed package's reason is not a recovery reason`)
+  }
+}
+
+/** `holdRecoveryText(<reason>)`: the reason `latchRecoveryReasonRowReads(<state>)` builds, or the package's LATCH_RECOVERY_REASON_* value named. */
+const holdRecovery: Entry = {
+  synopsis: 'latchRecoveryReasonRowReads <state> | <reason-export>',
+  async print(args, context) {
+    const entry = 'holdRecoveryText'
+    let reason: unknown
+    if (args[0] === 'latchRecoveryReasonRowReads') {
+      expectArguments(entry, args, ['reason-builder', 'state'])
+      const rowReads = await packageFunction<(state: string) => unknown>(context, 'conflict-latch.ts', 'latchRecoveryReasonRowReads')
+      reason = rowReads(args[1])
+    } else {
+      expectArguments(entry, args, ['reason-export'])
+      if (!args[0].startsWith('LATCH_RECOVERY_REASON_')) {
+        usageFail(`${entry}: <reason-export> must name a LATCH_RECOVERY_REASON_* value (got '${args[0]}')`)
+      }
+      reason = await packageExport(context, 'conflict-latch.ts', args[0])
+    }
+    expectRecoveryReason(entry, reason)
+    const build = await packageFunction<(reason: unknown) => unknown>(context, 'conflict-latch.ts', entry)
+    return builtString(entry, build(reason))
+  },
+}
+
+/** `relaunchAfterKillLine(<key>, <cwd>, RELAUNCH_KILL_NONE)`: the restart work's line before a launch with no kill. */
+const relaunchAfterKill: Entry = {
+  synopsis: '<key> <cwd> RELAUNCH_KILL_NONE',
+  async print(args, context) {
+    const entry = 'relaunchAfterKillLine'
+    expectArguments(entry, args, ['key', 'cwd', 'kill-export'])
+    if (args[2] !== 'RELAUNCH_KILL_NONE') usageFail(`${entry}: <kill-export> must be RELAUNCH_KILL_NONE (got '${args[2]}')`)
+    const none = await packageString(context, 'restart.ts', 'RELAUNCH_KILL_NONE')
+    const build = await packageFunction<(key: string, cwd: string, killed: string) => unknown>(context, 'restart.ts', entry)
+    return builtString(entry, build(args[0], args[1], none))
+  },
+}
+
+/** `relaunchWithoutKillLine(<key>, no verdict, <RELAUNCH_NO_KILL_* named>, <LIVENESS_READING_DEAD* named>)`. */
+const relaunchWithoutKill: Entry = {
+  synopsis: '<key> <reason-export> <dead-reading-export>',
+  async print(args, context) {
+    const entry = 'relaunchWithoutKillLine'
+    expectArguments(entry, args, ['key', 'reason-export', 'dead-reading-export'])
+    const [key, reasonExport, readingExport] = args
+    if (!reasonExport.startsWith('RELAUNCH_NO_KILL_')) usageFail(`${entry}: <reason-export> must name a RELAUNCH_NO_KILL_* value (got '${reasonExport}')`)
+    if (!readingExport.startsWith('LIVENESS_READING_DEAD')) {
+      usageFail(`${entry}: <dead-reading-export> must name a LIVENESS_READING_DEAD* value (got '${readingExport}')`)
+    }
+    const reason = await packageString(context, 'restart.ts', reasonExport)
+    const reading = await packageExport(context, 'liveness-reading.ts', readingExport)
+    const build = await packageFunction<(key: string, verdict: undefined, reason: string, reading: unknown) => unknown>(context, 'restart.ts', entry)
+    return builtString(entry, build(key, undefined, reason, reading))
+  },
+}
+
+/** `DEFAULT_AD_SETTINGS.tmux[<key>]`, in decimal: agent-director's default for one `[tmux]` key (one of AD_TMUX_KEYS). */
+const defaultAdSetting: Entry = {
+  synopsis: '<tmux-key>',
+  async print(args, context) {
+    const entry = 'DEFAULT_AD_SETTINGS'
+    expectArguments(entry, args, ['tmux-key'])
+    const keys = await packageExport(context, 'ad-settings.ts', 'AD_TMUX_KEYS')
+    if (!Array.isArray(keys)) fail(PRINTER_FAIL_EXIT, `the installed package's src/ad-settings.ts export AD_TMUX_KEYS is not an array`)
+    if (!keys.includes(args[0])) usageFail(`${entry}: '${args[0]}' is not one of AD_TMUX_KEYS (${keys.join(', ')})`)
+    const defaults = await packageExport(context, 'ad-settings.ts', entry)
+    const tmux = typeof defaults === 'object' && defaults !== null ? (defaults as { tmux?: unknown }).tmux : undefined
+    const value = typeof tmux === 'object' && tmux !== null ? (tmux as Record<string, unknown>)[args[0]] : undefined
+    if (typeof value !== 'bigint' && typeof value !== 'number') {
+      fail(PRINTER_FAIL_EXIT, `the installed package's src/ad-settings.ts ${entry} holds no whole-number tmux.${args[0]}`)
+    }
+    return String(value)
+  },
+}
+
+/** `tmuxUnresponsiveAlertText(<key>, adAlertThresholdMs(DEFAULT_AD_SETTINGS_IN_EFFECT))`: the alert at agent-director's defaults. */
+const unresponsiveAlert: Entry = {
+  synopsis: '<key> DEFAULT_AD_SETTINGS_IN_EFFECT',
+  async print(args, context) {
+    const entry = 'tmuxUnresponsiveAlertText'
+    expectArguments(entry, args, ['key', 'settings-export'])
+    if (args[1] !== 'DEFAULT_AD_SETTINGS_IN_EFFECT') usageFail(`${entry}: <settings-export> must be DEFAULT_AD_SETTINGS_IN_EFFECT (got '${args[1]}')`)
+    const settings = await packageExport(context, 'ad-settings.ts', args[1])
+    const threshold = await packageFunction<(values: unknown) => unknown>(context, 'ad-settings.ts', 'adAlertThresholdMs')
+    const thresholdMs = threshold(settings)
+    if (typeof thresholdMs !== 'number' || !Number.isFinite(thresholdMs)) fail(PRINTER_FAIL_EXIT, `${entry}: adAlertThresholdMs gave no finite number`)
+    const build = await packageFunction<(key: string, thresholdMs: number) => unknown>(context, 'persona-episodes.ts', entry)
+    return builtString(entry, build(args[0], thresholdMs))
+  },
+}
+
 /** The printer's entries, by the name a script passes. Later scenarios add entries here. */
 const ENTRIES: Readonly<Record<string, Entry>> = {
   // Scenario 8 (test-20-fmk-old-binary.sh).
@@ -478,6 +605,18 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
   waitingRowPaneGoneLineHead: waitingRowPaneGoneHead,
   escalateDeadSweepLineHead: escalateDeadSweepHead,
   reconnectGoneLineHead: reconnectGoneHead,
+  launchStartNotRecordedNoticeText: builderEntry('conflict-latch.ts', 'launchStartNotRecordedNoticeText', ['key']),
+  holdRecoveryText: holdRecovery,
+  LATCH_CASE_LAUNCH_START_NOT_RECORDED: constantEntry('conflict-latch.ts', 'LATCH_CASE_LAUNCH_START_NOT_RECORDED'),
+  RECHECK_STEP_TABLE: constantEntry('conflict-latch.ts', 'RECHECK_STEP_TABLE'),
+  RECHECK_CALL_NONE: constantEntry('conflict-latch.ts', 'RECHECK_CALL_NONE'),
+  relaunchAfterKillLine: relaunchAfterKill,
+  relaunchWithoutKillLine: relaunchWithoutKill,
+  latchClearRetryAtOnceLineHead: builderEntry('session-manager.ts', 'latchClearRetryAtOnceLineHead', ['ref']),
+  DEFAULT_AD_SETTINGS: defaultAdSetting,
+  tmuxUnresponsiveOnsetText: builderEntry('persona-episodes.ts', 'tmuxUnresponsiveOnsetText', ['key']),
+  tmuxUnresponsiveAlertText: unresponsiveAlert,
+  restartCapReachedNoticeText: builderEntry('session-manager.ts', 'restartCapReachedNoticeText', []),
 }
 
 /** The value entry `name` prints for `args`; a usage failure for no entry or an unknown one. */
