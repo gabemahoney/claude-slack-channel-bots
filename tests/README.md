@@ -231,7 +231,7 @@ tests/
                                    # re-bind (`tmux_server_steps`). The re-fire legs wait out agent-director's default G (60 s); only after them does
                                    # `store_statements` write a `[tmux]` table (`starting_session_seconds = 60`, `stopping_window_seconds = 30`), so the
                                    # kill need not wait 300 s. It runs about two and a half minutes and ends with the three closing assertions
-    test-13-fmk-switch-over.sh     # SRJ-1402 legs A, B and C, SRJ-1108, SRJ-203, SRJ-1013, fmk mode on agent-director 0.10.0: fmk scenario 1, the switch-over. From a
+    test-13-fmk-switch-over.sh     # SRJ-1402 legs A, B and C, SRJ-1108, SRJ-1401, SRJ-1418, SRJ-203, SRJ-1013, fmk mode on agent-director 0.10.0: fmk scenario 1, the switch-over. From a
                                    # pre-persona 0.10.0 fleet (the published CSCB 0.10.0 on agent-director's 0.10.0 client, two channels seeded by
                                    # `seed_prepersona_fleet`, no server started), it follows the README's switch-over runbook, steps 1 to 11 once each, read from the
                                    # package's README through `switch-over.ts steps`, with only SRJ-1402's declared substitutions; leg A's checks follow step 10's live
@@ -240,7 +240,8 @@ tests/
                                    # refuses it once (one `ad-below-phase1-floor` entry, nothing at the Slack stub, only `version` calls), then puts the release
                                    # candidate back (see Scenario 1: the switch-over (Test 13)).
                                    # Its host files sit under SCENARIO_ROOT/host: the fixture install-gate record, the switch-over log, the staged persona
-                                   # configuration, the `/interject` caller file and the rollback copies; the crontable is in the state directory
+                                   # configuration, the crontable's prompt files, the `/interject` caller file, the token variables file, the store backup
+                                   # and the rollback copies; the crontable is in the state directory
     lib/
       scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards (see Scenario helper below)
     fixtures/
@@ -298,12 +299,17 @@ SRJ-1305).
 ### fmk scenarios
 
 Each fmk scenario of agent-director's handoff to CSCB, §7 (b.jg5 SRJ-14xx),
-is one script, named here as it is added. Test 0 is the harness's
+is one script, named here as it is added; scenario 14 is the one exception,
+with no script. Test 0 is the harness's
 self-check, not a scenario.
 
 | Scenario | Script | What it covers |
 |---|---|---|
 | 1 | `test-13-fmk-switch-over.sh` | The switch-over from a pre-persona 0.10.0 fleet to this build on agent-director Phase 1, by the README's runbook (leg A), then a `clean_restart` on Phase 1 that resumes every persona (leg B) and this build's refusal of agent-director 0.10.0 (leg C) (SRJ-1402, SRJ-203, SRJ-1013) |
+| 14 | none | A stale `serve` after the install. It tests agent-director's own `serve` process, so it is agent-director's to verify: CSCB has no script and runs no check for it (SRJ-1416) |
+
+Scenario 14 has no script by decision, not as a gap: the `/ci` suite covers
+every §7 scenario except scenario 14.
 
 ### Scenario 1: the switch-over (Test 13)
 
@@ -335,7 +341,9 @@ shim, with no store until 0.10.0's first `spawn`. Setup then:
 Following the runbook. Each step is entered once, in order, through
 `runbook_step <n>`, which reads the step titles from the package's own README
 through `switch-over.ts steps` (the staged build up to step 7, the installed
-build from step 8) and prints the title. Each host-only part is replaced only
+build from step 8) and prints the title. It fails unless `<n>` is the next
+step and, on entering steps 4 to 10, fails if a bot server of the scenario
+runs (a live `server.pid`, or the port answering). Each host-only part is replaced only
 through `runbook_substitute <n> <kind> <reason>`, inside step `<n>`'s
 section. Every record a step asks for goes to the switch-over log.
 
@@ -430,8 +438,9 @@ server's calls are its shim lines after the restart:
   per refusal;
 - each persona comes back through a collision then a resume: a plain spawn of
   its instance id (no `--reuse-finished`) and then a resume of that id, one
-  more resume per refusal. The restarted server logs its
-  `ErrInstanceIdCollision` line for the persona, the first between the first
+  more resume per refusal (and at most one more spawn). The restarted server
+  logs its `ErrInstanceIdCollision` line for the persona, one per spawn with
+  no refusal (at most one per spawn with one), the first between the first
   spawn and the first resume;
 - the row reads `pending` with a launch start until it reports in, from the
   harness's reads: every read that starts after the bot server's resumed line
