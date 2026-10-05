@@ -368,18 +368,46 @@ describe('SecretStore reads', () => {
       expect(h.store.readLiveConfig()).toEqual({ workspaceDomain: 'other-ws', testEmail: EMAIL, secondUser: null })
     })
 
+    const SECOND_EMAIL = 'second@example.invalid'
+
+    // A password account keeps its well-formed keys only; a code-only account is its email alone
+    // (no password key); an entry whose password keys are all malformed is dropped, never code-only.
     test.each([
-      [{ email: 'second@example.invalid', password_env: 'SECOND_PW' }, { email: 'second@example.invalid', password_env: 'SECOND_PW' }],
-      [{ email: 'second@example.invalid', password_file: '/f' }, { email: 'second@example.invalid', password_file: '/f' }],
-      [{ email: 'second@example.invalid', password_env: 'lower-case' }, null],
-      [{ email: 'second@example.invalid', password_file: '' }, null],
-      // No password source: a code-only account.
-      [{ email: 'second@example.invalid' }, { email: 'second@example.invalid' }],
-      [{ email: 'not an email', password_env: 'X' }, null],
-    ])('second_user %p gives %p', (second, expected) => {
+      ['a password_env account', { email: SECOND_EMAIL, password_env: 'SECOND_PW' }, { email: SECOND_EMAIL, password_env: 'SECOND_PW' }],
+      ['a password_file account', { email: SECOND_EMAIL, password_file: '/f' }, { email: SECOND_EMAIL, password_file: '/f' }],
+      ['a well-formed password_env beside an empty password_file', { email: SECOND_EMAIL, password_env: 'SECOND_PW', password_file: '' }, { email: SECOND_EMAIL, password_env: 'SECOND_PW' }],
+      ['a well-formed password_file beside a lower-case password_env', { email: SECOND_EMAIL, password_env: 'lower-case', password_file: '/f' }, { email: SECOND_EMAIL, password_file: '/f' }],
+      ['an email alone (code-only)', { email: SECOND_EMAIL }, { email: SECOND_EMAIL }],
+      ['only a lower-case password_env', { email: SECOND_EMAIL, password_env: 'lower-case' }, null],
+      ['only an empty password_file', { email: SECOND_EMAIL, password_file: '' }, null],
+      ['both password keys malformed', { email: SECOND_EMAIL, password_env: 'lower-case', password_file: '' }, null],
+      ['an invalid email with a password key', { email: 'not an email', password_env: 'SECOND_PW' }, null],
+      ['an invalid email alone', { email: 'not an email' }, null],
+      ['no email', { password_env: 'SECOND_PW' }, null],
+      ['a string, not an object', SECOND_EMAIL, null],
+    ] as const)('second_user as %s', (_what, second, expected) => {
       const h = makeStore()
       h.mem.seed(h.paths.liveJson, JSON.stringify({ workspace_domain: 'cscb-ci-test', test_email: EMAIL, second_user: second }))
       expect(h.store.readLiveConfig().secondUser).toEqual(expected)
+    })
+
+    test('an email-only second_user parses as the code-only account readSecondPassword gives null for, reading no file or environment value', () => {
+      const envReads: string[] = []
+      const env = new Proxy<Record<string, string | undefined>>({ SECOND_PW: `second-pw-${LEAK_SENTINEL}` }, {
+        get: (target, key) => {
+          envReads.push(String(key))
+          return target[String(key)]
+        },
+      })
+      const h = makeStore({ env })
+      h.mem.seed(h.paths.liveJson, JSON.stringify({ workspace_domain: 'cscb-ci-test', test_email: EMAIL, second_user: { email: SECOND_EMAIL } }))
+      const second = h.store.readLiveConfig().secondUser
+      if (second === null) throw new Error('expected a code-only second user')
+      const before = { accessed: [...h.store.accessed], reads: [...h.mem.reads] }
+      envReads.length = 0
+      expect(h.store.readSecondPassword(second)).toBeNull()
+      expect({ accessed: h.store.accessed, reads: h.mem.reads, envReads }).toEqual({ ...before, envReads: [] })
+      assertNoLeak([second, h.store.accessed])
     })
 
     test.each([

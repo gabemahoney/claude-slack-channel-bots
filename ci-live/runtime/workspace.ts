@@ -19,11 +19,18 @@
  * from the local stub (its mailbox.json points at the stub's mailbox); the
  * real dir's files are never touched (the store throws if anything tries).
  *
- * When Slack asks the test human for an emailed sign-in code, the browser's
- * launch first reads it from the test mailbox (lib/sign-in-code.ts); only
- * when that gives none does it stop with "run login" (exit 2). The second
- * workspace user's mail is not forwarded: its code still needs `login
- * --second`.
+ * When Slack asks an account for an emailed sign-in code, the browser's
+ * launch first reads it from the test mailbox (lib/sign-in-code.ts), which
+ * both accounts' mail is forwarded to: only Slack mail sent exactly to that
+ * account's own address counts (the test human's `test_email`, the second
+ * workspace user's `second_user.email`). A code-only second account (no
+ * password in live.json) requests its code on every sign-in without a saved
+ * session. Only when the mailbox gives none does the launch stop with "run
+ * login" or "run login --second" (exit 2). The dry run signs no second
+ * account in.
+ *
+ * Both addresses are registered with the redactor before any sign-in: the
+ * test email as it is, the second address in every `addressForms` form.
  */
 
 import { chmodSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
@@ -33,7 +40,7 @@ import { join } from 'node:path'
 import { AppsStateFile } from '../lib/apps-state.ts'
 import type { AppListingBrowser, BrowserDriver, BrowserStats, SlackUrls } from '../lib/browser-types.ts'
 import type { RunLog } from '../lib/log.ts'
-import { MailTmClient } from '../lib/mailbox.ts'
+import { addressForms, MailTmClient } from '../lib/mailbox.ts'
 import { loadRepoManifest, personaManifest, type JsonObject } from '../lib/manifest.ts'
 import { livePathsIn, resolveConfigDir } from '../lib/paths.ts'
 import type { PersonaLetter } from '../lib/personas.ts'
@@ -174,9 +181,10 @@ export function openWorkspace(o: WorkspaceOptions, mode: 'real' | 'dry-run'): Wo
     store.ensureConfigDir()
   }
   const live = store.readLiveConfig()
-  // The email addresses are config, but no log line or result may show them either.
+  // The email addresses are config, but no log line or result may show them either. The
+  // second address in every form mail about it takes (with and without a +tag), before any sign-in.
   o.redactor.addSecret(live.testEmail)
-  o.redactor.addSecret(live.secondUser?.email)
+  if (live.secondUser) for (const form of addressForms(live.secondUser.email)) o.redactor.addSecret(form)
   const api = new SlackApi({ baseUrl: stub ? stub.apiBase : SLACK_API_BASE_URL, fetch })
   const urls = stub ? stub.urls : REAL_SLACK_URLS
   const configTokens = new ConfigTokenSource(

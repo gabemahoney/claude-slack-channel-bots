@@ -48,6 +48,7 @@ import { isCredentialsBroken, type PersonaBringUpState } from './persona-bringup
 import type { CredentialsDigest } from './persona-credentials.ts'
 import { escapeCause } from './persona-diagnostics.ts'
 import { effectiveClaudeConfigDirs, renderPersonaRef } from './persona-identity.ts'
+import { DESTRUCTIVE_PREFIX, DESTRUCTIVE_RETIRED_CLAUSE, REMOVED_RETIRED_CLAUSE } from './reload-preview-clauses.ts'
 
 // ---------------------------------------------------------------------------
 // Diagnostic classes (b.av2 SR-10.3); listed in `RELOAD_DIAGNOSTIC_CLASSES`
@@ -704,15 +705,12 @@ export const PENDING_PREVIEW_TITLE = 'A configuration change is pending; nothing
 /** The text of a plan with no effect. */
 export const NO_EFFECTIVE_CHANGE = 'no effective change'
 
-/** Start of every line that retires a persona: a removal or a destructive modify (b.jg5 SRJ-1510). */
-export const DESTRUCTIVE_PREFIX = 'DESTRUCTIVE:'
-
-/** What a removal's line says the confirmation does to the persona (b.jg5 SRJ-1510). */
-export const REMOVED_RETIRED_CLAUSE = 'the persona will be retired: its session stopped and never resumed'
-
-/** What a destructive modify's line says the confirmation does to the persona (b.jg5 SRJ-1510). */
-export const DESTRUCTIVE_RETIRED_CLAUSE =
-  'the persona will be retired and brought up fresh: its session stopped and never resumed'
+/**
+ * The retiring lines' prefix and clauses (b.jg5 SRJ-1510) live in the
+ * import-free `reload-preview-clauses.ts`, so the /ci-live checks can build
+ * their expected lines from them; re-exported here unchanged.
+ */
+export { DESTRUCTIVE_PREFIX, DESTRUCTIVE_RETIRED_CLAUSE, REMOVED_RETIRED_CLAUSE }
 
 /** Start of an invalid candidate's preview. */
 export const INVALID_PREFIX = 'INVALID:'

@@ -9,7 +9,7 @@ import { isFrom, messageText } from '../lib/human-session.ts'
 import { CONTAINER_HOME } from '../lib/docker.ts'
 import { describeError } from '../lib/errors.ts'
 import { personaEntryFor } from '../lib/live-config.ts'
-import { ROTATED_APP_TOKEN_NAME } from '../lib/personas.ts'
+import { ROTATED_APP_TOKEN_NAME, type PersonaLetter } from '../lib/personas.ts'
 import { describeScan } from '../lib/secrecy-scan.ts'
 import { waitFor, MINUTE, POLL_MS, SECOND } from '../lib/wait.ts'
 import type { CheckContext } from './context.ts'
@@ -26,16 +26,22 @@ import {
   fileExists,
   guarded,
   guardedRestart,
+  isTeardownKeptRowLine,
+  keptRowSetProblems,
   lines,
   mark,
   mention,
   needHuman,
   pause,
   personaPostsAfter,
+  personaRowId,
   previewHeader,
   promptState,
   q,
   recorded,
+  removalRowProblems,
+  removedPreviewLine,
+  type Row,
   rows,
   run,
   S,
@@ -265,6 +271,22 @@ export const check26: CheckDef<CheckContext> = {
   run: async () => pass([]),
 }
 
+/**
+ * Check 27: whether the row of `removed` is among `before` (the rows before
+ * its removal), so its teardown keeps it (b.jg5 SRJ-715, AC 77). Pure.
+ */
+export function rowKeptByRemoval(before: readonly Row[], removed: PersonaLetter): boolean {
+  return before.some((r) => r.id === personaRowId(removed))
+}
+
+/**
+ * Check 28's kept rows: D's when Check 27 found D's row before removing D
+ * (`dRowKept`, set whether or not D connected in Check 25), else none. Pure.
+ */
+export function rebootKeptRows(dRowKept: boolean | undefined): PersonaLetter[] {
+  return dRowKept === true ? ['d'] : []
+}
+
 /** Check 27's prompt, as declared to the prompt guard: left open on purpose. */
 export const CHECK27_PROMPT = /removal-prompt\.txt/
 
@@ -283,6 +305,7 @@ export const check27: CheckDef<CheckContext> = {
     const pid = await serverPid(ctx)
     const before = await rows(ctx)
     f.add(`rows before: ${before.map((r) => r.id).join(', ')}`)
+    ctx.shared.dRowKept = rowKeptByRemoval(before, 'd')
     // Step 2 (optional, run): D raises a prompt that is left unanswered (the prompt guard leaves it open: the check later clicks it to prove it inert).
     ctx.promptGuard.expect({ persona: 'd', command: CHECK27_PROMPT, leaveOpen: true })
     const tm = await tmark(ctx)
@@ -291,10 +314,7 @@ export const check27: CheckDef<CheckContext> = {
     const promptTs = dPrompt?.[0]?.slack_ts
     f.note(`Check 27 step 2: ${promptTs ? `ran (prompt ${promptTs} in D-home)` : 'ran, but D raised no prompt in time'}`)
 
-    const preview = [
-      previewHeader({ removed: 1 }),
-      'DESTRUCTIVE: persona "persona_d" (key=persona_d) is removed: its live session will be destroyed (its instance is torn down).',
-    ]
+    const preview = [previewHeader({ removed: 1 }), removedPreviewLine('d')]
     await confirmedEdit(ctx, f, m, 'del(.personas[] | select(.name == "persona_d"))', preview)
     const names = await lines(ctx, `jq -r '.personas[].name' "$S/config.json"`)
     f.expect(JSON.stringify(names) === JSON.stringify(['persona_a', 'persona_b', 'persona_c']), 'config.json does not name exactly A, B and C')
@@ -304,14 +324,24 @@ export const check27: CheckDef<CheckContext> = {
     const step6 = await sinceGrepE(ctx, m, 'reload-(applied|noop|stale-confirmation|invalid):|persona-start:|at apply|spawnForPersona|Session (connected|disconnected)|persona teardown|updated in place')
     f.expect(step6.some((l) => l.includes('[slack] persona teardown of "persona_d" (key=persona_d): starting')), 'no teardown starting line for D')
     f.expect(step6.some((l) => l.trimEnd().endsWith('[slack] persona teardown of "persona_d" (key=persona_d): complete')), 'no clean teardown complete line for D')
+    f.expect(step6.filter((l) => isTeardownKeptRowLine(l, 'd')).length === 1, "not one teardown line for D's kill that succeeded, its row kept (b.jg5 SRJ-715)")
     f.expect(step6.filter((l) => l.includes(appliedLine({ removed: 1 }))).length === 1, 'not one reload-applied line for one removal')
     f.expect(step6.every((l) => !/persona_[abc]\b/.test(l) && !l.includes('persona-start:')), 'a line names A, B or C, or a persona-start line appeared')
     if (step6.some((l) => l.includes('Session disconnected'))) f.note('Check 27: a Session disconnected line for D appeared')
     f.expect(await recorded(ctx), 'config.json and the record differ')
     f.expect(!(await fileExists(ctx, '"$S/config.json.pending"')) && !(await fileExists(ctx, '"$S/config.json.apply"')), 'a pending or apply file remains')
     f.expect((await serverPid(ctx)) === pid, 'the server PID changed')
-    const after = (await rows(ctx)).map((r) => r.id).sort()
-    f.expect(JSON.stringify(after) === JSON.stringify(ctx.shared.rowsAtCheck25 ?? ['cscb_persona_a', 'cscb_persona_b', 'cscb_persona_c']), `rows after the removal: ${after.join(', ')}`)
+    // The teardown kills D's row and keeps it (b.jg5 SRJ-715, AC 77). A kill never changes a row's state:
+    // agent-director's evidence-based find-missing marks the row once its agent process is gone, so it is
+    // run here (it marks no row whose agent still runs) before the rows are judged.
+    const fm = await guarded(ctx, 'agent-director find-missing')
+    f.expect(fm.ok && fm.code === 0, `agent-director find-missing did not run (exit ${fm.code})`)
+    f.add(`find-missing: ${fm.out.trim().slice(0, 200)}`)
+    const afterRows = await rows(ctx)
+    const after = afterRows.map((r) => r.id).sort()
+    f.add(`rows after: ${afterRows.map((r) => `${r.id}(${r.state})`).join(', ')}`)
+    f.expect(JSON.stringify(after) === JSON.stringify([...(ctx.shared.rowsAtCheck25 ?? ['cscb_persona_a', 'cscb_persona_b', 'cscb_persona_c']), 'cscb_persona_d'].sort()), `rows after the removal: ${after.join(', ')}`)
+    for (const problem of removalRowProblems(before, afterRows, 'd')) f.expect(false, `rows after the removal: ${problem}`)
 
     const m2 = await mark(ctx)
     const t1 = await human.post(ids.dHome, `${mention(ctx, 'd')} reply with the word gone.`)
@@ -356,9 +386,13 @@ export const check28: CheckDef<CheckContext> = {
     // Step 1.
     f.expect(await recorded(ctx), 'step 1: config.json and the record differ')
     f.expect(!(await fileExists(ctx, '"$S/config.json.pending"')), 'step 1: a change is pending')
-    const rows1 = (await rows(ctx)).map((r) => r.id).sort()
-    f.add(`rows before: ${rows1.join(', ')}`)
-    f.expect(JSON.stringify(rows1) === JSON.stringify(['cscb_persona_a', 'cscb_persona_b', 'cscb_persona_c']), 'step 1: not the three rows')
+    // One live row per configured persona, plus D's row, kept and not live, when Check 27 found it before removing D
+    // (whether or not D connected in Check 25): a teardown kills the row and keeps it (b.jg5 SRJ-715, AC 77).
+    const keptRows = rebootKeptRows(ctx.shared.dRowKept)
+    const rowsAt1 = await rows(ctx)
+    const rows1 = rowsAt1.map((r) => r.id).sort()
+    f.add(`rows before: ${rowsAt1.map((r) => `${r.id}(${r.state})`).join(', ')}`)
+    for (const problem of keptRowSetProblems(rowsAt1, ['a', 'b', 'c'], keptRows)) f.expect(false, `step 1: not one live row per persona${keptRows.length > 0 ? " plus D's kept row" : ''}: ${problem}`)
 
     // Step 2: a pending credentials change for B.
     const oldName = ctx.creds.bAppTokenName()
@@ -386,7 +420,7 @@ export const check28: CheckDef<CheckContext> = {
     f.expect(await editConfig(ctx, 'del(.personas[] | select(.name == "persona_c"))'), 'step 3: the guarded edit did not run')
     await pause(ctx, 30 * SECOND)
     const p3 = await waitPending(ctx)
-    const destructiveC = 'DESTRUCTIVE: persona "persona_c" (key=persona_c) is removed: its live session will be destroyed (its instance is torn down).'
+    const destructiveC = removedPreviewLine('c')
     if (f.expect(p3 !== null, 'step 3: no pending file')) {
       f.expect(p3!.preview.filter((l) => l.startsWith('DESTRUCTIVE:')).length === 1 && p3!.preview.includes(destructiveC), "step 3: not exactly C's DESTRUCTIVE line")
       f.expect((p3!.preview[0] ?? '').includes(countsText({ removed: 1, credentials: 1 })), 'step 3: the counts are not 1 removed, 1 with changed credentials')
@@ -394,7 +428,10 @@ export const check28: CheckDef<CheckContext> = {
     }
     f.expect((await sinceGrep(ctx, m3, '[slack] reload-preview: DESTRUCTIVE:')).length === 1, 'step 3: the DESTRUCTIVE preview line was not logged exactly once')
     f.expect((await sinceGrepE(ctx, m3, 'persona-start:|Session disconnected')).length === 0, 'step 3: something was applied')
-    f.expect((await rows(ctx)).length === 3, 'step 3: the rows changed')
+    const rowsAt3 = await rows(ctx)
+    const rows3 = rowsAt3.map((r) => r.id).sort()
+    f.expect(JSON.stringify(rows3) === JSON.stringify(rows1), `step 3: the rows changed: ${rows3.join(', ')}`)
+    for (const problem of keptRowSetProblems(rowsAt3, ['a', 'b', 'c'], keptRows)) f.expect(false, `step 3: the rows changed: ${problem}`)
 
     // Step 4: the reboot.
     await run(ctx, 'guard && mark > ~/cscb-live/reboot-log-mark && { wc -l < "$S/startup-errors.log" 2>/dev/null || echo 0; } > ~/cscb-live/reboot-errors-mark')
@@ -415,7 +452,8 @@ export const check28: CheckDef<CheckContext> = {
     await checkStartLines(ctx, f, bmark, ['a', 'b', 'c'], true, { acceptRetried: 'Check 28' })
     if (complete?.[0]) f.note(`Check 28 summary: ${complete[0].replace(/^.*complete — /, '')}`)
     const rows5 = await rows(ctx)
-    f.expect(rows5.length === 3 && new Set(rows5.map((r) => r.persona)).size === 3, 'step 5: not one row per persona')
+    f.add(`rows after the reboot: ${rows5.map((r) => `${r.id}(${r.state})`).join(', ')}`)
+    for (const problem of keptRowSetProblems(rows5, ['a', 'b', 'c'], keptRows)) f.expect(false, `step 5: not one row per persona${keptRows.length > 0 ? " plus D's kept row" : ''}: ${problem}`)
 
     // Step 6: what is still pending.
     await pause(ctx, 30 * SECOND)

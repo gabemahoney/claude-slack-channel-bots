@@ -395,10 +395,10 @@ Without a second account, Checks 14, 16 and 20 report
 `SKIPPED (no second account)`. To run them:
 
 1. Invite a second account to `cscb-ci-test` (another non-SSO email, no
-   2FA). It must be new to the personas: no post in `a-home`, and no DM with
-   a "CSCB Test" app. It plays both the plan's first-time user (Check 14) and
-   its second test user (Checks 16 and 20). It can have a password, or none
-   (it then signs in by emailed code, below).
+   2FA). It plays both the plan's first-time user (Check 14) and its second
+   test user (Checks 16 and 20), on every run: its Slack history (posts in
+   `a-home`, DMs with the "CSCB Test" apps from earlier runs) does not matter.
+   It can have a password, or none (it then signs in by emailed code, below).
 
    For a code-only account, use another `+tag` address of the test human's
    Gmail (not `<TEST_EMAIL>` itself: Slack allows one account per email),
@@ -456,11 +456,15 @@ Without a second account, Checks 14, 16 and 20 report
 When Slack asks the second account for an emailed code during a run, the run
 reads it from the test mailbox in the same way. With no forwarded mail, or no
 code within 2 minutes, the run goes on and reports Checks 14, 16 and 20 as
-`SKIPPED (second account needs a sign-in code: run login --second)`.
+`SKIPPED (second account needs a sign-in code the test mailbox (mailbox.json) did not give: check its mail is forwarded there, or run login --second)`.
 
-After one run, the account is no longer new to the personas. On a rerun,
-Checks 14, 16 and 20 report `SKIPPED (not verified: … a rerun)` until
-`live.json` names a fresh account.
+The same account serves every run. Check 14's first-time user is new to that
+run's server: each run starts the server in a fresh container with an empty
+state directory. If that server's log or a persona's transcript already names
+the account's user ID when Check 14 starts, it reports
+`SKIPPED (not verified: this run's server has already seen the second account …)`.
+Checks 16 and 20 judge the account's DM with A only by what arrives after the
+check's first ask, so a DM left by an earlier run does not count.
 
 ## A new VM
 
@@ -475,7 +479,7 @@ hgx secrets add --key cscb_live_test_email --value "$(jq -r .test_email ~/.confi
 hgx secrets add --key cscb_live_test_password --value "$(< ~/.config/cscb-test/test_password)" --type generic
 hgx secrets add --key cscb_live_slack_config_token --value "$(< ~/.config/cscb-test/slack_config_token)" --type generic
 hgx secrets add --key cscb_live_slack_config_refresh_token --value "$(< ~/.config/cscb-test/slack_config_refresh_token)" --type generic
-hgx secrets add --key cscb_live_second_password --value "$(< ~/.config/cscb-test/second_password)" --type generic   # a second account only
+hgx secrets add --key cscb_live_second_password --value "$(< ~/.config/cscb-test/second_password)" --type generic   # a second account with a password only
 hgx secrets add --key ci_anthropic_api_key --value "$CI_ANTHROPIC_API_KEY" --type generic
 hgx secrets add --key ci_anthropic_base_url --value "$CI_ANTHROPIC_BASE_URL" --type generic   # gateway key only
 hgx secrets add --key ci_anthropic_model --value "$CI_ANTHROPIC_MODEL" --type generic         # gateway key only
@@ -520,7 +524,11 @@ On the new VM:
    the mailbox's password). The Gmail filter forwards to that mailbox
    whichever VM reads it.
 5. For a second account, write `live.json` with its `second_user` block
-   (step 3 of the second account's steps).
+   (step 3 of the second account's steps). For a code-only account, write
+   `live.json` with the test human's email first (as in
+   [1. The files](#1-the-files)), then add the block with the `jq` command of the second
+   account's step 1. A code-only account needs no `cscb_live_second_password`,
+   and its address is never stored in `hgx`.
 6. Go on with steps 3 to 6 above. Sign in on the new VM too (step 4, and
    `login --second` for a second account): the browser sessions stay on the
    VM that saved them.

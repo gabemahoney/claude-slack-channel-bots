@@ -277,14 +277,4 @@ export class HumanSession {
     }
     return null
   }
-
-  /**
-   * The DM the human has with `user` when it holds a message, else null (no
-   * DM is opened). Slack lists an empty DM with every member and app from the
-   * day an account joins, so only a message shows the two have talked.
-   */
-  async usedDm(user: string): Promise<string | null> {
-    const dm = await this.existingDm(user)
-    return dm !== null && (await this.history(dm, '0')).length > 0 ? dm : null
-  }
 }

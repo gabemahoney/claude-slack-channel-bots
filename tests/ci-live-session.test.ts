@@ -364,13 +364,14 @@ describe('HumanSession', () => {
     await expect(new HumanSession(bad.api, virtualClock()).openDm(BOT.userId)).rejects.toThrow('conversations.open failed: no_dm_id')
   })
 
-  test('usedDm: no listed DM, or a listed empty one (Slack lists one per app from the day an account joins), is null; a DM holding a message is its ID', async () => {
-    const session = (dms: unknown[], messages: unknown[]) =>
-      new HumanSession(humanApi((method) => (method === 'conversations.list' ? { ok: true, channels: dms } : { ok: true, messages })).api, virtualClock())
-    const listed = [{ id: 'D0DRYOTHER', user: 'U0OTHER000' }, { id: 'D0DRYDM001', user: BOT.userId }]
-    expect(await session([{ id: 'D0DRYOTHER', user: 'U0OTHER000' }], [{ ts: '1700000000.000001', text: 'hi' }]).usedDm(BOT.userId)).toBeNull()
-    expect(await session(listed, []).usedDm(BOT.userId)).toBeNull()
-    expect(await session(listed, [{ ts: '1700000000.000001', text: 'hi' }]).usedDm(BOT.userId)).toBe('D0DRYDM001')
+  test('existingDm: the listed DM with the user, empty or not, else null; it only lists (no DM opened, no history read)', async () => {
+    const listing = (dms: unknown[]) => humanApi(() => ({ ok: true, channels: dms }))
+    const other = { id: 'D0DRYOTHER', user: 'U0OTHER000' }
+    const none = listing([other])
+    expect(await new HumanSession(none.api, virtualClock()).existingDm(BOT.userId)).toBeNull()
+    const listed = listing([other, { id: 'D0DRYDM001', user: BOT.userId }])
+    expect(await new HumanSession(listed.api, virtualClock()).existingDm(BOT.userId)).toBe('D0DRYDM001')
+    expect([...none.calls, ...listed.calls].map((c) => c.method)).toEqual(['conversations.list', 'conversations.list'])
   })
 
   test('history drops malformed messages and orders the rest oldest first', async () => {

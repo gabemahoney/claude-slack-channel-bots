@@ -147,7 +147,7 @@ restart resumes.
 Read this section before every run.
 
 - **Operator-run only**, on a **test Slack workspace**. Never on a workspace that production bots serve.
-- **Never on the production install.** Use a dedicated host or VM whose HOME holds no production CSCB state (`~/.claude/channels/slack/`) and no production `~/.agent-director`. The start sweep kills and deletes every `service=cscb` agent-director row that names no configured persona, so a test server sharing `~/.agent-director` with a production CSCB would destroy the production bots. A dedicated OS user is acceptable only on a host that runs no production CSCB at all: only one CSCB server runs per host (they would both need port 3100).
+- **Never on the production install.** Use a dedicated host or VM whose HOME holds no production CSCB state (`~/.claude/channels/slack/`) and no production `~/.agent-director`. The start sweep kills every live `service=cscb` agent-director row that names no configured persona (it keeps the row), so a test server sharing `~/.agent-director` with a production CSCB would kill the production bots. A dedicated OS user is acceptable only on a host that runs no production CSCB at all: only one CSCB server runs per host (they would both need port 3100).
 - **Never through `/ci` or `/release-test`.** Only the operator runs this plan, by hand, or starts `/ci-live`, which runs it in a throwaway container.
 - **Never type or paste a token** into a chat (the wizard's included), this ticket, the results table, a log or a shell command line. Tokens go only into the wizard's credentials command, at its hidden prompts, in the operator's own terminal (Check S1). Every token check in this plan counts matches and never prints one.
 - **A Linux host with bash.** The plan's commands need GNU/Linux and an interactive bash shell: they read `/proc/<pid>/environ`, and use `stat -c`, `sha256sum`, `history -a`, bash arrays, `jq`, `script`, `tmux` and a user crontab `@reboot` line. Only the optional Check 29b needs `sudo`, `iptables` and `systemd-run`. The pre-flight checks the rest.
@@ -238,14 +238,12 @@ production install (see Safety). People take part only by role; no person is
 named in this plan or in its results.
 
 - **The operator** runs every step on the test host, is an admin of the test workspace, posts the plan's messages from their own Slack account, and records the results. The operator is also B's and C's DM contact (`<OPERATOR_USER_ID>`).
-- **The second test user** is a workspace account, other than the operator's, that the operator can sign in as (for example in another browser profile). It has never had a DM with app A. Checks 16 and 20 use it.
-- **The first-time user** is a workspace account, other than the operator's, that has never posted in A-home, never had a DM with any persona app, and was never messaged by one. Check 14 uses it.
+- **The second test user** is a workspace account, other than the operator's, that the operator can sign in as (for example in another browser profile). Checks 16 and 20 use it. Its Slack history does not matter: a DM with app A that an earlier run left is judged only by what arrives in it after the check's first post.
+- **The first-time user** is a workspace account, other than the operator's, that this run's server has never seen: until Check 14 posts, no line of the server's log and no `<channel …>` tag delivered to a persona names its member ID. A server started with a fresh state directory meets every account for the first time, whatever the account's Slack history (posts in A-home, DMs with the persona apps from earlier runs). Check 14 uses it.
 
 One account may serve as both the first-time user and the second test user,
-in that order: Check 14 gives it a post in A-home and a DM with B, but no DM
-with A, so it still qualifies as the second test user for Checks 16 and 20,
-which run later. After the run, the account qualifies for neither role in a
-rerun: Check 20 opens a DM from A.
+in that order (Check 14 runs before Checks 16 and 20), and the same account
+serves every run.
 
 ### 1.2 Workspace prerequisites and placeholders
 
@@ -836,7 +834,7 @@ Expected:
 - Step 4's `cmp` prints `recorded`, and `ls` reports that `config.json.pending` does not exist.
 - Step 3 prints one `[slack] persona-start: personas[<i>] "<name>" (key=<key>): bring-up starting` line for each of `personas[0] "persona_a" (key=persona_a)`, `personas[1] "persona_b" (key=persona_b)` and `personas[2] "persona_c" (key=persona_c)`.
 - It prints at least one `[slack] Session connected: persona "<name>" (key=<key>)` line for each of the three personas.
-- It prints one `[slack] startupSessionManager: complete — 3 persona(s): …` line, ending `0 failed, 0 not brought up, 0 not reconnected`.
+- It prints one `[slack] startupSessionManager: complete — 3 persona(s): …` line, ending `0 failed, 0 not brought up, 0 not reconnected, 0 latched, 0 retrying, 0 waiting on a live-row sequence, 0 held on invalid flags, 0 fresh as retired keys`.
 - It prints no `[slack] persona "<name>" (key=<key>) not brought up:` line and no `persona-credentials-…`, `persona-directory-…` or `persona-slack-unreachable` line.
 
 If any of that is missing, or a failure line is present, stop the check that
@@ -880,7 +878,7 @@ Expected:
   - `[slack] startupSessionManager: 3 persona(s), concurrency=3`
   - one line per persona: `[slack] persona-start: personas[0] "persona_a" (key=persona_a): bring-up starting`, and the same for `persona_b` (`personas[1]`) and `persona_c` (`personas[2]`)
   - one line per persona: `[slack] spawnForPersona: spawned "persona_a" (key=persona_a) instanceId=cscb_persona_a`, and the same for `persona_b` and `persona_c`
-  - `[slack] startupSessionManager: complete — 3 persona(s): 0 resumed, 3 fresh-spawned, 0 fresh-after-amnesia, 0 fresh-after-inconclusive-amnesia, 0 reconnected, 0 no-op, 0 failed, 0 not brought up, 0 not reconnected`
+  - `[slack] startupSessionManager: complete — 3 persona(s): 0 resumed, 3 fresh-spawned, 0 fresh-after-amnesia, 0 fresh-after-inconclusive-amnesia, 0 reconnected, 0 no-op, 0 failed, 0 not brought up, 0 not reconnected, 0 latched, 0 retrying, 0 waiting on a live-row sequence, 0 held on invalid flags, 0 fresh as retired keys`
   - one line per persona: `[slack] Session connected: persona "persona_a" (key=persona_a) cwd="<real path of ~/cscb-live/a>"`, and the same for B and C
 - No line of the form `[slack] persona "<name>" (key=<key>) not brought up:` for any persona.
 - `ls` reports that neither `config.json.pending` nor `config.json.apply` exists, and `cmp` prints `recorded`: the file was applied as it stands, with nothing left to confirm.
@@ -1273,8 +1271,8 @@ A is mentions-only in coordination again.
 
 ## Part 6: Open access
 
-This check verifies the live leg of AC 17: a workspace user who has never
-interacted with the bots gets answers from a persona in a channel and by DM,
+This check verifies the live leg of AC 17: a workspace user the server has
+never seen gets answers from a persona in a channel and by DM,
 with no allowlist and no pairing step. It covers b.av2 SR-10.1 (the server
 neither reads nor writes `access.json`, and a stale one is ignored and left
 in place) and SR-10.2's access rows, and checks what postinstall left on the
@@ -1287,7 +1285,7 @@ nothing is pending.
 
 ### Setup for this check
 
-- **The first-time user** (Part 1.1). Its sidebar and **Apps** list show no conversation with "CSCB Test A", "CSCB Test B" or "CSCB Test C". Invite it to A-home.
+- **The first-time user** (Part 1.1). Before step 1, `if guard; then cat "$S"/server.log* 2>/dev/null | grep -cF '<FIRST_TIME_USER_ID>'; fi` prints `0`, and no persona's transcripts hold a delivered `<channel …>` tag with `user_id="<FIRST_TIME_USER_ID>"`. Otherwise this run's server has already seen the account: record Check 14 as "not verified" with the reason in Notes, and skip it. Invite it to A-home (already a member is fine).
 - **Nothing added for it.** No config edit, allowlist entry or approval of any kind is made for this user, before or during the check.
 
 ### Check 14: a first-time user reaches a persona in a channel and by DM, with no approval step (AC 17)
@@ -1325,7 +1323,7 @@ Steps:
 3. Restart the test server with the "Guarded restart" (Part 2.3), so the start runs with the stale file in place. Its expected results apply unchanged.
 4. Record where the log ends: `MARK=$(mark)`.
 5. Signed in as the first-time user, post in A-home: "Reply with the word open-channel." Work out its `<TS>` (call it `<TS_CH>`).
-6. As the same user, send "Reply with the word open-dm." in a new DM with app B. Work out its `<TS>` (`<TS_DM>`) and note the DM conversation ID as `<B_NEW_DM_ID>`.
+6. As the same user, send "Reply with the word open-dm." in its DM with app B (opened now, or the one an earlier run left). Work out its `<TS>` (`<TS_DM>`) and note the DM conversation ID as `<B_NEW_DM_ID>`. Only what follows `<TS_CH>` and `<TS_DM>` is judged. Record in Notes whether the DM already held messages older than `<TS_DM>` (an earlier run's DM, reused) or none (a new DM, or one no earlier run posted in); either is a pass.
 7. Wait for both answers, then run:
 
    ```sh
@@ -1347,7 +1345,7 @@ Expected:
 - Step 7: `tags a <TS_CH>` prints exactly one tag, with `chat_id="<A_HOME_CHANNEL_ID>"`, `via="receive_all"` and `user_id="<FIRST_TIME_USER_ID>"`. `tags b <TS_DM>` prints exactly one, with `chat_id="<B_NEW_DM_ID>"`, `via="dm"` and `user_id="<FIRST_TIME_USER_ID>"`. The last `replies a` line has `chat_id=<A_HOME_CHANNEL_ID>` and the last `replies b` line has `chat_id=<B_NEW_DM_ID>`, each with `error=false` and a result containing `Sent`. The `grep` prints nothing. `stale file unchanged` is printed, and the count of `.corrupt.` files is `0`.
 - At no point does the first-time user get a pairing code, an approval prompt or any message other than the two answers, in the channel, in the DM or as a Slackbot message. No config edit, allowlist entry or approval is made for the user.
 
-Pass: a user who had never interacted with the bots got answers from A in its channel and from B by DM, with no approval step; the stale `access.json` was neither read nor changed; and postinstall left no `access.json`, a `debug-slack-channel-bots` link into the package and no link to the retired skill.
+Pass: a user the server had never seen got answers from A in its channel and from B by DM, with no approval step; the stale `access.json` was neither read nor changed; and postinstall left no `access.json`, a `debug-slack-channel-bots` link into the package and no link to the retired skill.
 
 
 ---
@@ -1407,10 +1405,10 @@ setup failure. Fix it as the `debug-slack-channel-bots` skill's section "A
 persona can't open a DM: re-install its app to gain `im:write`" says, and
 record it in Notes.
 
-The **second test user** (Part 1.1) must never have had a DM with app A: in
-that account's sidebar and **Apps** list, no conversation with "CSCB Test A"
-exists. Check 14 gave the first-time user a post in A-home and a DM with B
-only, so the same account qualifies.
+The **second test user** (Part 1.1) may already have a DM with app A from
+an earlier run. Checks 16 and 20 judge that DM only by the messages newer than
+the check's own first post in A-home (step 2), so the same account serves
+every run, and Check 14's first-time user may be it.
 
 A DM message's `<TS>` comes from its **Copy link** URL, as for channel
 messages. The same URL's path holds the DM conversation ID (`D…`): note the
@@ -1467,13 +1465,13 @@ Steps:
    since "$MARK" | grep -F 'could not open a DM'
    ```
 
-4. Signed in as the second test user, look for any DM or **Apps** conversation from "CSCB Test A".
+4. Signed in as the second test user, look for its DM or **Apps** conversation with "CSCB Test A" (an earlier run's, if any).
 
 Expected:
 
 - The `replies a` line starts `chat_id=<SECOND_USER_ID> error=true` and contains `Persona "persona_a" (key=persona_a) may not target "<SECOND_USER_ID>": DMs are off for this persona (dm.enabled is false).`
 - The `grep` prints no line naming `persona_a` and `<SECOND_USER_ID>`: no failed DM open was logged.
-- The second test user has no conversation with A and no new message from it.
+- The second test user's DM with A, if it has one, holds no message newer than step 2's post: none from A or anyone, top-level or in a thread.
 
 If the `replies a` command prints nothing, A made no call to
 `<SECOND_USER_ID>`: it chose not to call the tool. Ask once more; if there is still no call, record the check as "not run"
@@ -1662,8 +1660,8 @@ Pass: C started and connected with no failure line, answered the DM in place wit
 
 ### Check 20: a persona with DMs on opens a DM with a user and posts as itself (AC 38)
 
-A's DMs are now on. The second test user still has no DM with A (Check 16
-posted nothing).
+A's DMs are now on. Check 16 posted nothing to the second test user; its DM
+with A may exist from an earlier run.
 
 Steps:
 
@@ -1682,9 +1680,9 @@ Expected:
 
 - The `replies a` line starts `chat_id=<SECOND_USER_ID> error=false` and contains `Sent 1 message(s) to D` followed by the DM's ID and ` (the DM with <SECOND_USER_ID>)`.
 - The `grep` prints nothing. A `missing_scope` failure here means app A lacks `im:write` (see this part's setup).
-- The second test user has a new DM from app A, holding "DMs-on outbound check" under A's name and avatar.
+- The DM ID in that line is the second test user's DM with app A (new on a first run, an earlier run's on a rerun), and that DM holds "DMs-on outbound check" from A, under A's name and avatar, newer than step 2's post. Record in Notes whether that DM already held messages older than step 2's post (an earlier run's DM, reused) or none (a new DM, or one no earlier run posted in); either is a pass.
 
-Pass: A's call opened a DM with the second test user and the message appears there under A's identity.
+Pass: A's call reached the second test user's DM with A and the message appears there under A's identity.
 
 
 ### Check 21: an edit that adds a mention wakes the persona once
@@ -1822,7 +1820,7 @@ then restarts the test server with the "Guarded restart" (Part 2.3):
    `ORIG_DELAY=null` means the key is absent (the default, 60 s), as the wizard left it. Keep `ORIG_DELAY` for the teardown.
 3. Wait about 10 s and read the preview: `showpending`. After its two header lines and a blank line, it is `A configuration change is pending; nothing has been applied. personas: 0 added, 0 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 1 changed.` and `server-wide setting session_restart_delay changed: once applied, it is recorded and takes effect at the next server start after that.`
 4. Confirm, only if the guard passes: `if guard; then mv "$S/config.json.pending" "$S/config.json.apply"; fi`. Wait about 10 s, then run `since "$MARK" | grep -F 'reload-applied:'`. It prints one `[slack] reload-applied: …` line whose counts end `server-wide settings: 1 changed)`. The delay is recorded but not yet in effect.
-5. Run the "Guarded restart" (Part 2.3). Its Expected items apply: the `Starting from the last-applied record` line, each persona's `Session connected` line, `0 failed, 0 not brought up, 0 not reconnected`, no failure line, `cmp` printing `recorded`, and no `config.json.pending`. The start runs the record, so the delay of 0 is now in effect.
+5. Run the "Guarded restart" (Part 2.3). Its Expected items apply: the `Starting from the last-applied record` line, each persona's `Session connected` line, `0 failed, 0 not brought up, 0 not reconnected, 0 latched, 0 retrying, 0 waiting on a live-row sequence, 0 held on invalid flags, 0 fresh as retired keys`, no failure line, `cmp` printing `recorded`, and no `config.json.pending`. The start runs the record, so the delay of 0 is now in effect.
 
 A's destination is A-home (`"permission_prompts": "<A_HOME_CHANNEL_ID>"`). A
 is mentions-only in coordination, so the message must mention A.
@@ -2072,7 +2070,7 @@ Expected:
 
 - Step 4: exactly one `[slack] persona-credentials-refused: personas[3] "persona_d" (key=persona_d) path="<home>/.config/cscb/persona_d-credentials.json": bot_token refused by a Web API call (<method>): Slack error <code>` line, where `<method>` is the refused call (for example `chat.postMessage`) and `<code>` is one of `invalid_auth`, `token_revoked`, `account_inactive` or `not_authed`. `instance running` is printed and the list still has D's row, `cscb_persona_d`: the instance keeps running. The last `replies d` line has `error=true`. No token-shaped text is in the line.
 - If Slack closed D's Socket Mode connection first and the refusal line instead names `the Socket Mode open` or `auth.test`, record that in Notes: the Web API path (b.ujn) was not exercised.
-- Step 5: the restart's start logs `[slack] persona "persona_d" (key=persona_d) not brought up: …` and a summary ending `0 failed, 1 not brought up, 0 not reconnected`, and A, B and C connect as usual. Each refusal reads `[slack] Session refused: persona "persona_d" (key=persona_d) is not up (…) — not registered; its instance is kept and may register once the persona is up`. Record both counts in Notes. A count that keeps climbing at a steady rate (a refusal every few seconds for the whole five minutes) is the unbounded loop the E5 carry describes: file a bug with the counts, and the check still passes on the other items.
+- Step 5: the restart's start logs `[slack] persona "persona_d" (key=persona_d) not brought up: …` and a summary ending `0 failed, 1 not brought up, 0 not reconnected, 0 latched, 0 retrying, 0 waiting on a live-row sequence, 0 held on invalid flags, 0 fresh as retired keys`, and A, B and C connect as usual. Each refusal reads `[slack] Session refused: persona "persona_d" (key=persona_d) is not up (…) — not registered; its instance is kept and may register once the persona is up`. Record both counts in Notes. A count that keeps climbing at a steady rate (a refusal every few seconds for the whole five minutes) is the unbounded loop the E5 carry describes: file a bug with the counts, and the check still passes on the other items.
 - Step 7: the preview is `A configuration change is pending; nothing has been applied. personas: 0 added, 0 removed, 0 destructively modified, 0 modified in place, 1 with changed credentials; server-wide settings: 0 changed.` and `persona "persona_d" (key=persona_d): credentials file "<home>/.config/cscb/persona_d-credentials.json" changed: it is broken by its credentials now, so it will be brought up.` After the rename, one `[slack] reload-applied: …` line with the same counts, and D's `Session connected` line. D replies "restored" in D-home under D's own name and avatar.
 
 Pass: the first refused Web API call marked D credentials-broken with one
@@ -2112,13 +2110,14 @@ Steps:
    if guard; then mv "$S/config.json.pending" "$S/config.json.apply"; fi
    ```
 
-6. Check the apply:
+6. Once D's `persona teardown … complete` line is logged, check the apply. The teardown kills D's row and keeps it, and a kill never changes a row's state: `agent-director find-missing` marks the row once its agent process is gone (it marks no row whose agent still runs), so run it, only if the guard passes, before you list the rows:
 
    ```sh
    since "$MARK" | grep -E 'reload-(applied|noop|stale-confirmation|invalid):|persona-start:|at apply|spawnForPersona|Session (connected|disconnected)|persona teardown|updated in place'
    cmp "$S/config.json" "$S/config.json.last-applied" && echo recorded
    ls "$S/config.json.pending" "$S/config.json.apply"
    [ "$(cat "$S/server.pid")" = "$PID_BEFORE" ] && echo 'same server'
+   if guard; then agent-director find-missing; fi
    agent-director list --label service=cscb
    MARK2=$(mark)
    ```
@@ -2130,16 +2129,16 @@ Steps:
 Expected:
 
 - Step 4: the pending file's preview is `A configuration change is pending; nothing has been applied. personas: 0 added, 1 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 0 changed.` and `DESTRUCTIVE: persona "persona_d" (key=persona_d) is removed: the persona will be retired: its session stopped and never resumed.` The `grep` prints the same two lines once each, prefixed `[slack] reload-preview: `. Nothing about it appears in Slack.
-- Step 6 prints `[slack] persona teardown of "persona_d" (key=persona_d): starting`, `[slack] persona teardown of "persona_d" (key=persona_d): complete` (not `complete, with <n> failed step(s)`), and one `[slack] reload-applied: …` line whose counts read `personas: 0 added, 1 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 0 changed`. A `Session disconnected` line for `persona "persona_d" (key=persona_d)` may also appear; record it in Notes. No line names `persona_a`, `persona_b` or `persona_c`, and there is no `persona-start` line.
-- `recorded` and `same server` are printed, and `ls` reports that neither `config.json.pending` nor `config.json.apply` exists.
-- The list has exactly three rows, `cscb_persona_a`, `cscb_persona_b` and `cscb_persona_c`, with the instance IDs recorded in Check 25 step 1. There is no `cscb_persona_d` row: it was killed and deleted.
+- Step 6 prints `[slack] persona teardown of "persona_d" (key=persona_d): starting`, `[slack] persona teardown of "persona_d" (key=persona_d): complete` (not `complete, with <n> failed step(s)`), exactly one `[slack] persona teardown of "persona_d" (key=persona_d): agent-director kill of cscb_persona_d: <outcome> after <n> kill(s); the row is kept (b.jg5 SRJ-715)` line (a `… kill of cscb_persona_d failed: …` line is not one), and one `[slack] reload-applied: …` line whose counts read `personas: 0 added, 1 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 0 changed`. A `Session disconnected` line for `persona "persona_d" (key=persona_d)` may also appear; record it in Notes. No line names `persona_a`, `persona_b` or `persona_c`, and there is no `persona-start` line.
+- `recorded` and `same server` are printed, `find-missing` exits 0, and `ls` reports that neither `config.json.pending` nor `config.json.apply` exists.
+- The list has exactly four rows: `cscb_persona_a`, `cscb_persona_b` and `cscb_persona_c`, with the instance IDs recorded in Check 25 step 1, each with its persona label and still live; and exactly one `cscb_persona_d` row, carrying a `persona` label naming `persona_d`, kept and not live: its state is `ended` or `missing`. The teardown killed D's row and kept it.
 - Step 7: D posts nothing in D-home or in the DM, and the `grep` prints nothing: D's Slack connection is closed, so its events no longer reach the server.
 - Step 8: the prompt stays in D-home as posted; clicking it changes nothing in it (Slack may mark the click as failed), and `ls` reports that `removal-prompt.txt` does not exist.
 - Step 9: A replies "quillfeather" in A-home under its own name and avatar.
 
-A `cscb_persona_d` row after the apply, a reply from D, a restart, or any lifecycle line for A, B or C fails this check.
+No `cscb_persona_d` row, or one that is still live, after the apply; a row added or deleted, or a change to A's, B's or C's row; a reply from D; a restart; or any lifecycle line for A, B or C fails this check.
 
-Pass: the confirmed removal of D logged one teardown that completed, D's row is gone and D is silent, the server PID and A's, B's and C's rows are unchanged, A still recalls the word, and any prompt D had posted is inert.
+Pass: the confirmed removal of D logged one teardown that completed and one kill that kept D's row, D's row is kept and not live and D is silent, the server PID and A's, B's and C's rows are unchanged, A still recalls the word, and any prompt D had posted is inert.
 
 After Check 27, the applied set is A, B and C again, and nothing is pending, as Check 28 needs.
 
@@ -2310,15 +2309,16 @@ Steps:
 
 Expected:
 
-- Step 1: `test host` and `recorded` are printed. `ls` reports that `config.json.pending` does not exist. The record names `persona_a`, `persona_b` and `persona_c`. The list has exactly three rows, `cscb_persona_a`, `cscb_persona_b` and `cscb_persona_c`.
+- Step 1: `test host` and `recorded` are printed. `ls` reports that `config.json.pending` does not exist. The record names `persona_a`, `persona_b` and `persona_c`. The list has one live row per configured persona, `cscb_persona_a`, `cscb_persona_b` and `cscb_persona_c`, each carrying its persona's label, plus, when Check 27's step 1 list had a `cscb_persona_d` row (live or not, whether or not D connected in Check 25), D's kept row `cscb_persona_d`, not live (state `ended` or `missing`): Check 27's teardown killed it and kept it. When that list had no row for D, the list has no row for D. It has no other row.
 - Step 2: the credentials command prints both `ok` lines and `Wrote <home>/.config/cscb/persona_b-credentials.json with mode 0600. …`. After its two header lines and a blank line, the pending file's preview is `A configuration change is pending; nothing has been applied. personas: 0 added, 0 removed, 0 destructively modified, 0 modified in place, 1 with changed credentials; server-wide settings: 0 changed.` and `persona "persona_b" (key=persona_b): credentials file "<home>/.config/cscb/persona_b-credentials.json" changed: a new connection opens, then the old one closes, instance kept.` The preview names B and the file path and no token, and the `tokcount` prints `0`. The log has the same two lines, prefixed `[slack] reload-preview: `, and no `persona-start`, `Session disconnected`, `persona teardown` or `reload-applied` line: nothing was applied. B replies "still-here" in coordination under its own name and avatar: B keeps serving on its current connection.
-- Step 3: `config.json.pending` has exactly one `DESTRUCTIVE:` line, `DESTRUCTIVE: persona "persona_c" (key=persona_c) is removed: the persona will be retired: its session stopped and never resumed.`, and B's credentials line after it. Its first line's counts read `personas: 0 added, 1 removed, 0 destructively modified, 0 modified in place, 1 with changed credentials; server-wide settings: 0 changed`. The log has exactly one `[slack] reload-preview:` line with that `DESTRUCTIVE:` line, not repeated over the six checks. There is no `persona-start` or `Session disconnected` line, and the list still has the same three rows: nothing was applied.
-- Step 5: `running` is printed. The log has one `[slack] Starting from the last-applied record "<path of config.json>.last-applied"` line and no `No last-applied record` line. It has `[slack] Loaded persona config: 3 persona(s)` and one `[slack] persona-start: personas[<i>] "<name>" (key=<key>): bring-up starting` line for each of `persona_a`, `persona_b` and `persona_c`. It has one `[slack] startupSessionManager: complete — 3 persona(s): …` line ending `0 failed, 0 not brought up, 0 not reconnected`, and no failure line, none for B included: B connected with its credentials file as it stands, the `cscb-live-rotated` token. It has at least one `[slack] Session connected: persona "persona_b" (key=persona_b)` line. The list has exactly one row for each of the three personas, C included. Record the summary line's resumed and fresh counts in Notes. One exception, a transient the server recovers from: when Slack was unreachable for a persona at the start, the summary counts it in `not brought up` and the log has its `persona-slack-unreachable` line (and its `cleared:` line). If that persona then logs `[slack] persona "<name>" (key=<key>): up after its bring-up retry (Slack) — launching` and its `Session connected` line appears within the wait, the summary may end `0 failed, <n> not brought up, 0 not reconnected`, `<n>` being the number of such personas, and their `persona-slack-unreachable` lines up to that retry are not failure lines. Record it in Notes. Any other failure line, or a persona that doesn't connect, still fails this step.
+- Step 3: `config.json.pending` has exactly one `DESTRUCTIVE:` line, `DESTRUCTIVE: persona "persona_c" (key=persona_c) is removed: the persona will be retired: its session stopped and never resumed.`, and B's credentials line after it. Its first line's counts read `personas: 0 added, 1 removed, 0 destructively modified, 0 modified in place, 1 with changed credentials; server-wide settings: 0 changed`. The log has exactly one `[slack] reload-preview:` line with that `DESTRUCTIVE:` line, not repeated over the six checks. There is no `persona-start` or `Session disconnected` line, and the list has the same rows as at step 1, C's row still live and D's kept row (if any) still not live: nothing was applied.
+- Step 5: `running` is printed. The log has one `[slack] Starting from the last-applied record "<path of config.json>.last-applied"` line and no `No last-applied record` line. It has `[slack] Loaded persona config: 3 persona(s)` and one `[slack] persona-start: personas[<i>] "<name>" (key=<key>): bring-up starting` line for each of `persona_a`, `persona_b` and `persona_c`. It has one `[slack] startupSessionManager: complete — 3 persona(s): …` line ending `0 failed, 0 not brought up, 0 not reconnected, 0 latched, 0 retrying, 0 waiting on a live-row sequence, 0 held on invalid flags, 0 fresh as retired keys`, and no failure line, none for B included: B connected with its credentials file as it stands, the `cscb-live-rotated` token. It has at least one `[slack] Session connected: persona "persona_b" (key=persona_b)` line. The list has exactly one live row for each of the three personas, C included, plus D's kept row, not live, when step 1 had it, and no other row. Record the summary line's resumed and fresh counts in Notes. One exception, a transient the server recovers from: when Slack was unreachable for a persona at the start, the summary counts it in `not brought up` and the log has its `persona-slack-unreachable` line (and its `cleared:` line). If that persona then logs `[slack] persona "<name>" (key=<key>): up after its bring-up retry (Slack) — launching` and its `Session connected` line appears within the wait, the summary may end `0 failed, <n> not brought up, 0 not reconnected, 0 latched, 0 retrying, 0 waiting on a live-row sequence, 0 held on invalid flags, 0 fresh as retired keys`, `<n>` being the number of such personas, and their `persona-slack-unreachable` lines up to that retry are not failure lines. Record it in Notes. Any other failure line, or a persona that doesn't connect, still fails this step.
 - Step 6: `config.json.pending` is present again. Its first line's counts read `personas: 0 added, 1 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 0 changed`, it has C's `DESTRUCTIVE:` line, and nothing names `persona_b` (the count prints `0`): the start applied B's credentials change, so it is no longer pending, while the unconfirmed removal of C still is. The log has exactly one `[slack] reload-preview:` line with that `DESTRUCTIVE:` line since the reboot: the first check after the start found the edit and logged it once. `cmp` reports that the files differ, and the record still names all three personas.
 - Step 7: A answers "rebooted" in A-home, B in coordination and C in the DM with C, each under its own name and avatar. After the older token is revoked, B answers "rotated" in coordination and the `grep` prints nothing: B's connection runs on the new token. No post in Slack mentions a pending change, a preview, `DESTRUCTIVE` or the configuration. All three counts print `0`.
 - Step 8: `matches` is printed. `ls` reports that `config.json.pending` does not exist. The log has exactly one line starting `[slack] reload-nothing-pending: the configuration file and the credentials files it references match what is applied; no change is pending`. The last `grep` prints nothing: the revert brought nothing up or down.
 
 A start by hand, C missing after the reboot, a second row for any persona,
+D's kept row live or gone, a row for D when Check 27's step 1 list had none,
 `config.json.pending` missing after the reboot, B's credentials change still
 pending after the reboot, or B not answering after the older token is revoked
 fails this check.
@@ -2547,7 +2547,7 @@ results, and also when the run stopped early.
 
    `stop --stop-bots` stops the server first, then exits each persona in the record (in `config.json` when there is none).
 
-2. If the run stopped before Check 27 removed D, D's instance may still be running: `tmux has-session -t slack_bot_persona_d` succeeding means it is. Its row names a persona no configuration lists after step 4, so the next start's sweep would kill and delete it; on a host that won't start CSCB again, end it from D's tmux session (`tmux attach -t slack_bot_persona_d`, then `/exit`).
+2. If the run stopped before Check 27 removed D, D's instance may still be running: `tmux has-session -t slack_bot_persona_d` succeeding means it is. Its row names a persona no configuration lists after step 4, so the next start's sweep would kill it and keep its row; on a host that won't start CSCB again, end it from D's tmux session (`tmux attach -t slack_bot_persona_d`, then `/exit`).
 
 3. Undo the host changes the run made, only if the guard passes. First the boot line:
 
@@ -2602,9 +2602,12 @@ results, and also when the run stopped early.
 
 agent-director keeps the stopped rows for resume, and the pre-flight fails
 while they exist. A rerun on this host needs them removed with
-agent-director's own tools first, or a fresh test host. A rerun also needs a
-second test user and a first-time user that meet Part 1.1 again: this run's
-accounts now have a DM with A and a history with A and B.
+agent-director's own tools first, or a fresh test host. The same second test
+user and first-time user serve a rerun: Part 1.1 defines the first-time user
+by the run's server, not by the account's Slack history. A rerun whose server
+has already seen the account (its log or a persona's transcripts name it, as
+with a reused state directory) records Check 14 as "not verified" (see its
+setup).
 
 ---
 

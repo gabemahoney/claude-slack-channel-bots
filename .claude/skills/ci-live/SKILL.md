@@ -24,6 +24,8 @@ tmux, agent-director store and port, runs on the default docker network (no
 - Never print, paste, `cat` or pass on a command line a token, the
   configuration token or the test human's password. Check secret files by
   mode and size only (`stat -c '%a %s'`).
+- Never read, print or relay the second account's address, or any other
+  `live.json` value. For Checks 14, 16 and 20, report only their statuses.
 - Never export `ANTHROPIC_*` for this. The container's Claude credentials come
   from `CI_ANTHROPIC_API_KEY`, `CI_ANTHROPIC_BASE_URL`, `CI_ANTHROPIC_MODEL`.
 - Never `bun install` in `ci-live/` without `--ignore-scripts`.
@@ -55,14 +57,14 @@ reboot check them by mode only:
 
 | File | What | Written by |
 |---|---|---|
-| `live.json` | `{"workspace_domain": "<domain>", "test_email": "<TEST_EMAIL>"}`, optional `second_user` (`email`, `password_file` or `password_env`) for Checks 14, 16, 20. Env overrides: `CSCB_LIVE_WORKSPACE`, `CSCB_LIVE_TEST_EMAIL` | operator |
+| `live.json` | `{"workspace_domain": "<domain>", "test_email": "<TEST_EMAIL>"}`, optional `second_user` for Checks 14, 16, 20: an `email`, and optionally a password (`password_file` or `password_env`); without one the account signs in by an emailed code read from the test mailbox. Env overrides: `CSCB_LIVE_WORKSPACE`, `CSCB_LIVE_TEST_EMAIL` | operator |
 | `slack_config_token` (+ optional `slack_config_refresh_token`) | the workspace's app configuration token (manifest API only). Optional once `apps.json` records all four apps: without a usable one the run logs a `WARNING` and reuses the recorded apps unchecked (no drift check or update); still needed to create an app, resolve an unfinished create or delete strays. Rotated with the refresh token when expired, both files saved mode 600 before the new token is used; `bun ci-live/run.ts config-token --rotate` rotates once on demand | operator; the runner rewrites both after a rotation |
 | `test_password` (or env `CSCB_LIVE_TEST_PASSWORD`) | the test human's password (email + password login, no 2FA) | operator |
 | `playwright-state.json`, `playwright-state-second.json` | the test human's and the second account's browser sessions | the runner / `login`, `login --second` |
 | `apps.json` | app, bot, team, channel and user IDs and app-level token names (no secret). A real run without it creates no app and exits 2, unless given `--create-apps`. One that doesn't parse or isn't a JSON object stops every command that reads it (exit 2); it is never read as empty. A persona entry holding only `pending_create` is an unfinished create: the next run adopts the one matching app on the apps list, creates it when there is none, and exits 2 naming them when there are several. An unrecorded app of that name it can't check, or an apps list it can't read, stops provisioning with the intent kept and nothing created: rerun | the runner |
 | `credentials/`, `credentials-staged/` | the personas' credentials files (A–C mounted read-only into the container; D staged until Check 25) | the runner |
 | `run.lock` | the PID of the real-mode command (a run, `--provision-only`, `login`, `config-token` or `apps`) in progress. A stale one (its PID not running, or not a runner) is removed with a `WARNING: removed the stale run lock …` line | the runner |
-| `mailbox.json` (optional) | the mail.tm test mailbox (`provider`, `api`, `address`, `password`, `account_id`, `token`) that receives the test human's forwarded mail; the run reads Slack's emailed sign-in code from it (up to 2 min). `bun ci-live/run.ts mailbox --latest\|--forwarding [--show-body]` shows its newest message or Gmail's forwarding confirm link, and takes no lock | operator; the runner rewrites the token |
+| `mailbox.json` (optional) | the mail.tm test mailbox (`provider`, `api`, `address`, `password`, `account_id`, `token`) that receives the test human's and the second account's forwarded mail; the run reads Slack's emailed sign-in code from it (up to 2 min), counting only mail sent exactly to the signing-in account's own address. `bun ci-live/run.ts mailbox --latest\|--forwarding [--show-body]` shows its newest message or Gmail's forwarding confirm link, and takes no lock | operator; the runner rewrites the token |
 
 Install the runner's own dependency once (Playwright core; it drives the
 installed Google Chrome, headless; no browser download):
@@ -225,8 +227,17 @@ installed Google Chrome, headless; no browser download):
 4. If it exits 2, relay the reason, which names the fix:
    - "Slack asked for an emailed sign-in code" (no test mailbox, or no code
      reached it within 2 minutes): the operator runs
-     `bun ci-live/run.ts login` once in an interactive terminal (it asks for
-     the code without echoing it and saves the session), then reruns.
+     `bun ci-live/run.ts login` once in an interactive terminal, then
+     reruns. `login` (and `login --second`, for the second account) first
+     reads the code from the test mailbox (up to 2 minutes); only when the
+     mailbox gives none does it ask on the terminal, without echoing it. It
+     saves the session.
+   - "Slack showed a captcha ("I'm not a robot") instead of emailing a
+     sign-in code: the runner does not answer captchas; give the account a
+     password (live.json second_user.password_file or password_env)": a
+     code-only second account's code request met a reCAPTCHA. Relay it; the
+     operator gives the account a password in `live.json`, then runs
+     `login --second` and reruns.
    - Secret paths "group- or other-accessible" (typically after a VM
      reboot): relay the message. It names each loose path, its mode, and the
      `chmod` command(s) that fix them all.
@@ -309,6 +320,13 @@ Exit codes: 0 PASS, 1 FAIL, 2 not runnable.
 
 S1 (the wizard chat), 26 and 29b (optional) are reported `SKIPPED`; 14, 16 and
 20 are `SKIPPED (no second account)` unless `live.json` configures
-`second_user`. Part 1.5 and Check 25 are done by the runner with config edits
+`second_user`. With one, they run on every run with the same account (no
+fresh account needed). A sign-in code skips them only when the test mailbox
+does not deliver it; they are then
+`SKIPPED (second account needs a sign-in code the test mailbox (mailbox.json) did not give: check its mail is forwarded there, or run login --second)`.
+Check 14's first-time user is new to this run's server: it is
+`SKIPPED (not verified: …)` only when this run's server log or a persona's
+transcript already names the account. Checks 16 and 20 judge only what
+follows their first ask. Part 1.5 and Check 25 are done by the runner with config edits
 instead of the wizard (noted in the results). The run leaves the apps and
 channels in place for the next run.

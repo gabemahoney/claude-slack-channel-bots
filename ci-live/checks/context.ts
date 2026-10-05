@@ -90,6 +90,11 @@ export interface SharedState {
   cDm?: string
   /** Check 25 step 1: the A, B and C instance IDs. */
   rowsAtCheck25?: string[]
+  /**
+   * Check 27: whether D's row was there before the removal (its teardown
+   * kills the row and keeps it, b.jg5 SRJ-715, AC 77), for Check 28's kept rows.
+   */
+  dRowKept?: boolean
   /** Check 24 setup: the original session_restart_delay (JSON), for the teardown. */
   origDelay?: string
   /** The installed package version and the tarball it came from. */

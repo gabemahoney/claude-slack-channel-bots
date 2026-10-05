@@ -63,6 +63,11 @@
  * - the browser is bounded (one Chrome, at most two contexts and two pages,
  *   idle on about:blank between flows and after a sign-in), and its flows run
  *   one at a time (the prompt guard clicks while a check may);
+ * - each account's emailed sign-in code is read from the test mailbox with
+ *   its own address; the second account's address is registered with the
+ *   redactor in every `addressForms` form before any sign-in (and by
+ *   `mailbox`); and a second account the mailbox gave no code skips Checks
+ *   14, 16 and 20 with a fixed reason naming no address;
  * - the prompt guard runs from the first plan check to the last (its hooks
  *   around each, stopped before Teardown, halted by a stop's cleanup, its
  *   report in the results), reaches the container only through the checks'
@@ -126,6 +131,15 @@
  *   declaration and an unpinned install are each refused, never skipped.
  *   `buildImageArgs` passes no Claude Code build-arg, so the pin is what is
  *   built. No Claude Code version is written in this file.
+ * - the runner loads from outside `ci-live/` only `src/`'s two import-free
+ *   text modules (`src/reload-preview-clauses.ts` and
+ *   `src/startup-summary-ending.ts`, b.jg5 SRJ-1111), each imported by a
+ *   runner file, and packages only node builtins and playwright-core; every
+ *   form of load counts (type-only, re-export, dynamic, `require`, a
+ *   `/// <reference path>` or `types` directive), and one
+ *   the audit cannot follow is refused. Neither module imports anything, so
+ *   the host runner never loads the Slack SDKs, the agent-director client or
+ *   `bun:sqlite`.
  *
  * Nothing here runs docker: spawns go to a recording fake. The wiring that
  * lives in `ci-live/runtime/` and `ci-live/main.ts` (which load
@@ -138,9 +152,10 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, delimiter, dirname, join, relative, resolve } from 'node:path'
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
 import semver from 'semver'
+import ts from 'typescript'
 import { hostAgentDirectorBinary, selectAgentDirectorBinary, type BinaryProbe } from '../ci-live/lib/agent-director-binary.ts'
 import { AGENT_DIRECTOR_BINARY_OPTION } from '../ci-live/lib/args.ts'
 import { BOOT_DONE_FILE, bootProblem, bootReached, parseBootDone, type BootRecord } from '../ci-live/lib/container-boot.ts'
@@ -1913,6 +1928,229 @@ describe('runner wiring (source audit of ci-live/)', () => {
     // A captcha is never answered: no flow clicks or types into the reCAPTCHA frame.
     expect(flow).not.toMatch(/recaptcha[^\n]*\.(click|fill|check|type)\(/i)
     expect(code(join('lib', 'slack-urls.ts'))).toContain('codeSignIn: (domain) => `https://${domain}.slack.com/`')
+  })
+
+  test("the workspace registers the second account's address with the redactor in every addressForms form, and the test email as it is, before any sign-in", () => {
+    const text = code(join('runtime', 'workspace.ts'))
+    expect(text).toMatch(/^import \{[^}]*\baddressForms\b[^}]*\} from '\.\.\/lib\/mailbox\.ts'$/m)
+    const open = text.slice(...balancedAfter(text, text.indexOf('export function openWorkspace('), '{', '}'))
+    const registered = open.split('\n').map((l) => l.trim()).filter((l) => /\baddSecret\(/.test(l) && /\blive\./.test(l))
+    expect(registered).toEqual([
+      'o.redactor.addSecret(live.testEmail)',
+      'if (live.secondUser) for (const form of addressForms(live.secondUser.email)) o.redactor.addSecret(form)',
+    ])
+    // In openWorkspace's own body, before the workspace it returns can launch either account.
+    expectInOrder(open, ['const live = store.readLiveConfig()', ...registered, 'return {', "launch(o, 'human'", "launch(o, 'second'"])
+  })
+
+  test("mailbox registers both accounts' addresses in every addressForms form (the second's when live.json names one) before it reads the mailbox; a live.json it cannot read registers none and the run goes on", () => {
+    const text = code('main.ts')
+    expect(text).toMatch(/^import \{[^}]*\baddressForms\b[^}]*\} from '\.\/lib\/mailbox\.ts'$/m)
+    const mailbox = text.slice(...balancedAfter(text, text.indexOf('async function runMailbox('), '{', '}')).replace(/\s+/g, ' ')
+    expect(mailbox).toContain(
+      'try { const live = store.readLiveConfig() for (const form of addressForms(live.testEmail)) redactor.addSecret(form) if (live.secondUser) for (const form of addressForms(live.secondUser.email)) redactor.addSecret(form) } catch { } const config = store.readMailbox()',
+    )
+    expect((mailbox.match(/\baddressForms\(/g) ?? []).length).toBe(2)
+    expectInOrder(mailbox, ['addressForms(live.secondUser.email)', 'const config = store.readMailbox()', 'await client.listMessages()'])
+  })
+
+  test('a second account whose emailed code the mailbox did not give skips Checks 14, 16 and 20 with one fixed reason naming mailbox.json and login --second (a plain literal: no address), and the reason reaches their rows', () => {
+    const text = code('main.ts')
+    const start = text.indexOf('async function openSessions(')
+    const sessions = text.slice(...balancedAfter(text, text.indexOf('}> {', start) + 2, '{', '}'))
+    const assigned = [...sessions.matchAll(/\bsecondSkip = /g)].map((m) => /^'(?:[^'\\\n]|\\.)*'/.exec(sessions.slice(m.index! + m[0].length))?.[0] ?? null)
+    expect(assigned).toEqual(["'second account needs a sign-in code the test mailbox (mailbox.json) did not give: check its mail is forwarded there, or run login --second'"])
+    expectInOrder(sessions, [
+      'const sb = await ws.secondBrowser()',
+      "if (!(err instanceof SignInCodeNeededError && err.who === 'second')) throw err",
+      'secondSkip = ',
+      'log.info(`session: ${secondSkip}; Checks 14, 16 and 20 are skipped`)',
+    ])
+    expect(text).toContain("const needReasons = sessions?.secondSkip ? { 'second-user': sessions.secondSkip } : undefined")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// What the runner loads from outside ci-live/ (source audit, b.jg5 SRJ-1111)
+// ---------------------------------------------------------------------------
+
+const SRC = join(import.meta.dir, '..', 'src')
+
+/**
+ * The only `src/` modules a runner file may import: the import-free text
+ * modules the checks build their expected texts from (the reload preview's
+ * retired clauses and the start summary's ending). Any other `src/` module
+ * would load the Slack SDKs, the agent-director client or `bun:sqlite` into
+ * the host runner, and `ci-live/tsconfig.json` would typecheck it.
+ */
+const CI_LIVE_SRC_MODULES: readonly string[] = ['reload-preview-clauses.ts', 'startup-summary-ending.ts']
+
+/** The packages a runner file may import: node builtins and ci-live's own dependency, playwright-core. */
+const CI_LIVE_PACKAGES = /^(?:node:.+|playwright-core)$/
+
+/**
+ * Every module load in `source` (a TypeScript file, parsed, so a string or
+ * comment naming a module is not a load), as its specifier: a static import
+ * (type-only and side-effect only included: the runner's typecheck follows
+ * them too), an `export … from`, `import x = require`, an `import('…')` type,
+ * a dynamic `import()` or a `require()`, and a `/// <reference path="…">` or
+ * `types="…"` directive (the typecheck follows those too), directives first.
+ * A load not given one string literal is `null`: the audit cannot tell what
+ * it loads.
+ */
+function moduleLoads(source: string): (string | null)[] {
+  const file = ts.createSourceFile('audit.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+  const loads: (string | null)[] = [...file.referencedFiles, ...file.typeReferenceDirectives].map((d) => d.fileName)
+  const text = (node: ts.Node | undefined): string | null => (node !== undefined && ts.isStringLiteralLike(node) ? node.text : null)
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node) || (ts.isExportDeclaration(node) && node.moduleSpecifier !== undefined)) loads.push(text(node.moduleSpecifier))
+    else if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) loads.push(text(node.moduleReference.expression))
+    else if (ts.isImportTypeNode(node)) loads.push(ts.isLiteralTypeNode(node.argument) ? text(node.argument.literal) : null)
+    else if (ts.isCallExpression(node) && (node.expression.kind === ts.SyntaxKind.ImportKeyword || (ts.isIdentifier(node.expression) && node.expression.text === 'require'))) {
+      loads.push(node.arguments.length === 1 ? text(node.arguments[0]) : null)
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(file)
+  return loads
+}
+
+/**
+ * What is wrong with the runner's loads, `files` being each runner file's
+ * source by its path under `ci-live/`: a load the audit cannot follow; a
+ * package other than `CI_LIVE_PACKAGES`; a relative or absolute path that
+ * leaves `ci-live/` and is not exactly one of `CI_LIVE_SRC_MODULES` (another
+ * `src/` module, the same one named without its `.ts`, or a route through
+ * `tests/` or elsewhere); and, so the rule is not vacuous, a module of
+ * `CI_LIVE_SRC_MODULES` no runner file imports. Empty when the loads are as
+ * the rule says.
+ */
+function ciLiveLoadProblems(files: ReadonlyMap<string, string>): string[] {
+  const problems: string[] = []
+  const imported = new Set<string>()
+  for (const [rel, source] of files) {
+    for (const specifier of moduleLoads(source)) {
+      if (specifier === null) {
+        problems.push(`${rel}: a module load the audit cannot follow`)
+        continue
+      }
+      if (!specifier.startsWith('.') && !isAbsolute(specifier)) {
+        if (!CI_LIVE_PACKAGES.test(specifier)) problems.push(`${rel}: imports the package ${specifier}`)
+        continue
+      }
+      const target = resolve(CI_LIVE, dirname(rel), specifier)
+      const inside = relative(CI_LIVE, target)
+      if (inside !== '..' && !inside.startsWith(`..${sep}`) && !isAbsolute(inside)) continue
+      const module = CI_LIVE_SRC_MODULES.find((m) => target === join(SRC, m))
+      if (module === undefined) problems.push(`${rel}: imports ${specifier}, outside ci-live/ and none of src/'s import-free text modules`)
+      else imported.add(module)
+    }
+  }
+  for (const m of CI_LIVE_SRC_MODULES) if (!imported.has(m)) problems.push(`no runner file imports src/${m}`)
+  return problems
+}
+
+/** Every runner file's source (`runnerSources`) by its path under `ci-live/`. */
+function runnerFiles(): Map<string, string> {
+  return new Map(runnerSources().map((p) => [relative(CI_LIVE, p), readFileSync(p, 'utf-8')]))
+}
+
+/** The runner's files with `line` added at the end of the one at `rel` (which must exist), or at its start with `first`. */
+function withLine(rel: string, line: string, first = false): Map<string, string> {
+  const files = runnerFiles()
+  expect(files.has(rel)).toBe(true)
+  files.set(rel, first ? `${line}\n${files.get(rel)}` : `${files.get(rel)}\n${line}\n`)
+  return files
+}
+
+const HELPERS_TS = join('checks', 'helpers.ts')
+
+describe("the runner's loads from outside ci-live/ (source audit)", () => {
+  test('moduleLoads finds every form of load, and none in a string or comment', () => {
+    const source = [
+      '/// <reference path="./m.ts" />',
+      '/// <reference types="n" />',
+      '/// <reference lib="dom" />',
+      "import { a } from './a.ts'",
+      "import type { B } from './b.ts'",
+      "import './c.ts'",
+      "export { d } from './d.ts'",
+      "export * from './e.ts'",
+      "import f = require('./f.ts')",
+      "type G = import('./g.ts').G",
+      "const h = await import('./h.ts')",
+      "const i = require('./i.ts')",
+      'const j = await import(path)',
+      "// import { k } from './k.ts'",
+      "const l = \"await import('./l.ts')\"",
+      'export { a }',
+      // After a statement a reference is a plain comment: the typecheck does not follow it.
+      '/// <reference path="./o.ts" />',
+    ].join('\n')
+    expect(moduleLoads(source)).toEqual(['./m.ts', 'n', './a.ts', './b.ts', './c.ts', './d.ts', './e.ts', './f.ts', './g.ts', './h.ts', './i.ts', null])
+  })
+
+  test("the runner imports from outside ci-live/ only src/'s two import-free text modules (each imported by a runner file) and packages only node builtins and playwright-core", () => {
+    expect(ciLiveLoadProblems(runnerFiles())).toEqual([])
+  })
+
+  /** The problem for a load of `specifier` that leaves ci-live/ and is none of the import-free modules. */
+  const outside = (specifier: string): string => `imports ${specifier}, outside ci-live/ and none of src/'s import-free text modules`
+
+  const flagged: [label: string, rel: string, line: string, problem: string][] = [
+    ['a named import of another src/ module', HELPERS_TS, "import { startupSummaryLine } from '../../src/session-manager.ts'", outside('../../src/session-manager.ts')],
+    ['a type-only import of another src/ module', join('checks', 'list.ts'), "import type { ReloadPlan } from '../../src/reload-plan.ts'", outside('../../src/reload-plan.ts')],
+    ['a re-export from another src/ module', join('checks', 'lifecycle-checks.ts'), "export { removedLine } from '../../src/reload-plan.ts'", outside('../../src/reload-plan.ts')],
+    ['a side-effect import of another src/ module', join('lib', 'host-state.ts'), "import '../../src/config.ts'", outside('../../src/config.ts')],
+    ['a dynamic import of another src/ module, from ci-live/ itself', 'main.ts', "const sm = await import('../src/session-manager.ts')", outside('../src/session-manager.ts')],
+    ['a require of another src/ module', join('lib', 'proc.ts'), "const rp = require('../../src/reload-plan.ts')", outside('../../src/reload-plan.ts')],
+    ['an import(…) type of another src/ module', HELPERS_TS, "type Counts = import('../../src/session-manager.ts').StartupSummaryCounts", outside('../../src/session-manager.ts')],
+    ['an allowed module named without its .ts', HELPERS_TS, "import { DESTRUCTIVE_PREFIX as P } from '../../src/reload-preview-clauses'", outside('../../src/reload-preview-clauses')],
+    ['a route to src/ through tests/', HELPERS_TS, "import { stripComments } from '../../tests/test-helpers/source-audit.ts'", outside('../../tests/test-helpers/source-audit.ts')],
+    ['an absolute path into src/', HELPERS_TS, `import { x } from '${join(SRC, 'reload-plan.ts')}'`, outside(join(SRC, 'reload-plan.ts'))],
+    ['a dynamic import the audit cannot follow', 'main.ts', 'const m = await import(modulePath)', 'a module load the audit cannot follow'],
+    ['the agent-director client package', HELPERS_TS, "import { Client } from 'agent-director'", 'imports the package agent-director'],
+    ['a Slack SDK package', HELPERS_TS, "import { WebClient } from '@slack/web-api'", 'imports the package @slack/web-api'],
+    ['bun:sqlite', join('lib', 'host-state.ts'), "import { Database } from 'bun:sqlite'", 'imports the package bun:sqlite'],
+  ]
+
+  test.each(flagged)('refuses %s', (_label, rel, line, problem) => {
+    expect(ciLiveLoadProblems(withLine(rel, line))).toEqual([`${rel}: ${problem}`])
+  })
+
+  // A reference directive is one only before the file's first statement, so it is planted at the start.
+  test.each<[label: string, line: string, problem: string]>([
+    ['a /// <reference path> to another src/ module', '/// <reference path="../../src/session-manager.ts" />', outside('../../src/session-manager.ts')],
+    ['a /// <reference types> naming a package', '/// <reference types="bun-types" />', 'imports the package bun-types'],
+  ])('refuses %s', (_label, line, problem) => {
+    expect(ciLiveLoadProblems(withLine(HELPERS_TS, line, true))).toEqual([`${HELPERS_TS}: ${problem}`])
+  })
+
+  test.each(CI_LIVE_SRC_MODULES.map((m) => [m]))('refuses a runner that no longer imports src/%s (the positive control)', (m) => {
+    const files = runnerFiles()
+    const importers = [...files].filter(([, source]) => moduleLoads(source).some((s) => s !== null && s.endsWith(`/src/${m}`)))
+    expect(importers.length).toBeGreaterThan(0)
+    for (const [rel, source] of importers) files.set(rel, planted(source, new RegExp(`^import [^\\n]*/src/${escapeRegExp(m)}'\\n`, 'gm'), ''))
+    expect(ciLiveLoadProblems(files)).toEqual([`no runner file imports src/${m}`])
+  })
+
+  test('allows a second runner file importing an import-free module, and text naming another src/ module in a string or comment', () => {
+    const lifecycle = join('checks', 'lifecycle-checks.ts')
+    expect(ciLiveLoadProblems(withLine(lifecycle, "import { REMOVED_RETIRED_CLAUSE as R } from '../../src/reload-preview-clauses.ts'"))).toEqual([])
+    expect(ciLiveLoadProblems(withLine(lifecycle, "// import { removedLine } from '../../src/reload-plan.ts'\nconst why = \"await import('../../src/session-manager.ts')\""))).toEqual([])
+  })
+
+  test.each(CI_LIVE_SRC_MODULES.map((m) => [m]))('src/%s imports nothing', (m) => {
+    expect(moduleLoads(readFileSync(join(SRC, m), 'utf-8'))).toEqual([])
+  })
+
+  test.each([
+    ['a named import', "import { join } from 'node:path'", ['node:path']],
+    ['a type-only import', "import type { ReloadPlan } from './reload-plan.ts'", ['./reload-plan.ts']],
+    ['a re-export', "export * from './session-manager.ts'", ['./session-manager.ts']],
+    ['a dynamic import', "const c = await import('./config.ts')", ['./config.ts']],
+  ] as const)('refuses %s added to an import-free module', (_label, line, loads) => {
+    for (const m of CI_LIVE_SRC_MODULES) expect(moduleLoads(`${readFileSync(join(SRC, m), 'utf-8')}\n${line}\n`)).toEqual([...loads])
   })
 })
 
