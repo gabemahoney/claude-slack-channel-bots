@@ -48,7 +48,8 @@
  *   `fmk-driver.ts` and `stub-mcp-session.ts` (a listed pair) each check the
  *   marker first and statically import only `node:` built-ins, type-only
  *   imports included; and scenario.sh's `install_ad_shim`, `ad_store_edit`,
- *   `ad_store_id`, `stub_mode` and `ad_store_pending_no_launch` call
+ *   `ad_store_id`, `ad_store_backup`, `stub_mode` and
+ *   `ad_store_pending_no_launch` call
  *   `require_scenario_home` before their first
  *   sqlite3, copy, move or install step, a call of a scenario.sh function
  *   that makes one (such as `_scenario_place`) counting as one. Shell is read
@@ -2094,7 +2095,7 @@ const IMAGE_GUARD_RULE = {
 } as const
 
 /** The scenario.sh helpers whose HOME check must come before their first sqlite3, copy, move or install step. */
-const HOME_GUARDED_HELPERS: readonly string[] = ['install_ad_shim', 'ad_store_edit', 'ad_store_id']
+const HOME_GUARDED_HELPERS: readonly string[] = ['install_ad_shim', 'ad_store_edit', 'ad_store_id', 'ad_store_backup']
 
 /** The stub-worker and store helpers held to the same rule: the stub mode selector (a move) and the no-launch-start statement (a store edit). */
 const HOME_GUARDED_STUB_HELPERS: readonly string[] = ['stub_mode', 'ad_store_pending_no_launch']
@@ -2724,8 +2725,15 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
         '    out="$(sqlite3 -batch -readonly "${HOME}/.agent-director/state.db" \\',
         `        "SELECT value FROM store_meta WHERE key = 'store_id';" 2>&1)" || fail "ad_store_id: \${out}"`,
       ),
+      ad_store_backup: lines(
+        '    local dest="${1:-}" step out',
+        '    step="ad_store_backup ${dest}"',
+        GUARDS,
+        `    out="$(sqlite3 -batch -bail -readonly "\${HOME}/.agent-director/state.db" ".backup '\${dest}'" 2>&1)" \\`,
+        '        || fail "${step}: sqlite3 .backup failed: ${out}"',
+      ),
     }
-    /** A scenario.sh-shaped source: the guards and `_scenario_place`, then the three helpers with `bodies` replacing theirs (undefined leaves one out). */
+    /** A scenario.sh-shaped source: the guards and `_scenario_place`, then the four helpers with `bodies` replacing theirs (undefined leaves one out). */
     function helperSource(bodies: Readonly<Record<string, string | undefined>> = {}): string {
       const helpers = HOME_GUARDED_HELPERS.flatMap((name) => {
         const body = name in bodies ? bodies[name] : BODIES[name]
@@ -2746,6 +2754,8 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       ['ad_store_id: the HOME check only inside an if', { ad_store_id: lines('    if [[ -n "${STRICT:-}" ]]; then', `        ${HOME_GUARD} x`, '    fi', '    sqlite3 -readonly "${HOME}/.agent-director/state.db" "SELECT 1;"') }],
       ['ad_store_id: no HOME check at all', { ad_store_id: lines('    require_ci_image x', '    sqlite3 -readonly "${HOME}/.agent-director/state.db" "SELECT 1;"') }],
       ['ad_store_id: no step the audit can see', { ad_store_id: lines(GUARDS, '    read_store_id_somehow') }],
+      ['ad_store_backup: the .backup before its HOME check', { ad_store_backup: lines('    require_ci_image x', `    sqlite3 -readonly "\${HOME}/.agent-director/state.db" ".backup '$1'"`, `    ${HOME_GUARD} x`) }],
+      ['ad_store_backup: only the image check', { ad_store_backup: lines('    require_ci_image x', `    sqlite3 -readonly "\${HOME}/.agent-director/state.db" ".backup '$1'"`) }],
     ]
 
     test.each(flagged)('flags %s, naming the file and the rule', (_label, bodies) => {
@@ -2773,7 +2783,7 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       expect(helperHomeCheckFindings('scenario.sh', helperSource(bodies))).toEqual([])
     })
 
-    test('the current tree: install_ad_shim, ad_store_edit and ad_store_id run require_scenario_home before their first sqlite3, copy, move or install step', () => {
+    test('the current tree: install_ad_shim, ad_store_edit, ad_store_id and ad_store_backup run require_scenario_home before their first sqlite3, copy, move or install step', () => {
       expect(helperHomeCheckFindings(relative(REPO_ROOT, SCENARIO_PATH), readFileSync(SCENARIO_PATH, 'utf-8'))).toEqual([])
     })
 

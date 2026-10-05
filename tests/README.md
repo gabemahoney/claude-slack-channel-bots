@@ -158,11 +158,15 @@ why:
 - `fixtures/fmk-driver.ts` and `fixtures/stub-mcp-session.ts`: the first
   statement of each checks the marker and exits 2 before it reads an argument
   or loads a module; each statically imports only `node:` built-ins.
-  (`fixtures/phase1-client-check.ts` also refuses to run without the marker.)
+  `fixtures/switch-over.ts` does the same: it checks the marker first and
+  exits 2 without it, and loads the package and the step reader only after
+  that check. (`fixtures/phase1-client-check.ts` also refuses to run without
+  the marker.)
 - Every `scenario.sh` step that installs, moves or swaps an agent-director
   binary or the shim, every harness agent-director call (`ad`, `ad_capture`),
-  every harness `sqlite3` read or edit (`ad_store_edit`, `ad_store_id`,
-  `ad_store_pending_no_launch`) and every stub-worker helper (`stub_mode`,
+  every harness `sqlite3` read, edit or copy (`ad_store_edit`, `ad_store_id`,
+  `ad_store_backup`, `ad_store_pending_no_launch`) and every stub-worker
+  helper (`stub_mode`,
   `stub_press_enter`, `write_mcp_config`) calls `require_ci_image` as its
   first step, which fails with
   `FAIL: <test>: <step>: refused: /etc/cscb-ci-image is absent …`.
@@ -227,6 +231,12 @@ tests/
                                    # re-bind (`tmux_server_steps`). The re-fire legs wait out agent-director's default G (60 s); only after them does
                                    # `store_statements` write a `[tmux]` table (`starting_session_seconds = 60`, `stopping_window_seconds = 30`), so the
                                    # kill need not wait 300 s. It runs about two and a half minutes and ends with the three closing assertions
+    test-13-fmk-switch-over.sh     # SRJ-1402 leg A, SRJ-1108, fmk mode on agent-director 0.10.0: fmk scenario 1, the switch-over. From a pre-persona 0.10.0 fleet (the
+                                   # published CSCB 0.10.0 on agent-director's 0.10.0 client, two channels seeded by `seed_prepersona_fleet`, no server started), it
+                                   # follows the README's switch-over runbook, steps 1 to 11 once each, read from the package's README through `switch-over.ts steps`,
+                                   # with only SRJ-1402's declared substitutions; leg A's checks follow step 10's live start (see Scenario 1: the switch-over (Test 13)).
+                                   # Its host files sit under SCENARIO_ROOT/host: the fixture install-gate record, the switch-over log, the staged persona
+                                   # configuration, the `/interject` caller file and the rollback copies; the crontable is in the state directory
     lib/
       scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards (see Scenario helper below)
     fixtures/
@@ -252,6 +262,10 @@ tests/
                                    # against the agent-director client the installed package resolves: the package's Phase-1-only bindings and SRJ-103 classes are the client's own,
                                    # client-built errors classify by class, the description and predicate helpers hold; refuses to run without the image marker /etc/cscb-ci-image
                                    # (its pure checker is unit-tested in tests/phase1-client-check.test.ts)
+      switch-over.ts               # Test 13's reader of a package directory: `steps <pkg>` prints the README switch-over section's title and each step's
+                                   # heading title (through `runbookSteps`, tests/test-helpers/runbooks.ts); `settings <pkg>` prints agent-director's settings in
+                                   # effect as that package reads them, with each window's minimum, the call-timeout need, G and B; writes nothing; refuses to run
+                                   # without the image marker /etc/cscb-ci-image and loads the package and the step reader only after that check
     .shellcheckrc                  # lets shellcheck follow `source lib/scenario.sh` without -x
     bunfig.toml                    # loads the host-safety preload guard for a bun test started here
     session-leader.test.ts         # bun test, not run by runner.sh
@@ -276,6 +290,123 @@ test).
 There is no Test 11. It is retired, with its driver: CSCB makes no tmux call
 of its own (b.jg5 SRJ-601), and fmk scenarios 3 and 17 replace it (b.jg5
 SRJ-1305).
+
+### fmk scenarios
+
+Each fmk scenario of agent-director's handoff to CSCB, §7 (b.jg5 SRJ-14xx),
+is one script, named here as it is added. Test 0 is the harness's
+self-check, not a scenario.
+
+| Scenario | Script | What it covers |
+|---|---|---|
+| 1 | `test-13-fmk-switch-over.sh` | The switch-over from a pre-persona 0.10.0 fleet to this build on agent-director Phase 1, by the README's runbook: leg A (SRJ-1402) |
+
+### Scenario 1: the switch-over (Test 13)
+
+`test-13-fmk-switch-over.sh` runs the README's switch-over runbook
+("Switching over to agent-director Phase 1") in the container, as an
+operator would, and replaces only the host-only parts SRJ-1402 lists. Its
+header comment is the full statement; this is the outline.
+
+The starting point. The script sets `SCENARIO_AD_START=0.10.0` before
+sourcing `scenario.sh`, so its HOME runs agent-director 0.10.0 behind the
+shim, with no store until 0.10.0's first `spawn`. Setup then:
+
+- installs the published CSCB 0.10.0 tarball as a bun global install under
+  `SCENARIO_ROOT`, its agent-director dependency pinned to the image's 0.10.0
+  client (checked file for file). Its CLI there is the old CLI, and the build
+  under test later takes the same install path;
+- writes the pre-persona `config.json` (two routed channels) to
+  `$HOME/.claude/channels/slack`, with the host's other files the runbook
+  names: a crontable targeting channels, an `/interject` caller file naming
+  channels, `access.json` and the Slack token variables (fake tokens, in a
+  file never sourced);
+- seeds the fleet with `seed_prepersona_fleet`, one row per routed channel
+  named and labelled as 0.10.0 does, each with a running stub worker, and
+  starts no pre-persona server;
+- starts the loopback Slack stub with `--record`, writes the fixture
+  install-gate record (this container's dated go line) and unpacks the build
+  under test into a staging directory.
+
+Following the runbook. Each step is entered once, in order, through
+`runbook_step <n>`, which reads the step titles from the package's own README
+through `switch-over.ts steps` (the staged build up to step 7, the installed
+build from step 8) and prints the title. Each host-only part is replaced only
+through `runbook_substitute <n> <kind> <reason>`, inside step `<n>`'s
+section. Every record a step asks for goes to the switch-over log.
+
+| Step | Substitutions declared |
+|---|---|
+| 1 | `install-gate-fixture`, `one-socket`, `claude-code-check-skipped`, `staging-build-under-test`, `container-settings`, `slack-fixtures`, `prompt-wording-skipped` |
+| 2 | `autostart-skipped` |
+| 3 to 6 | none |
+| 7 | `staging-build-under-test`, `slack-fixtures` |
+| 8 | `install-gate-fixture`, `harness-stops-agents`, `rc-install-script`, `container-settings` |
+| 9 | `no-agents-restarted` |
+| 10 | `prompt-wording-skipped`, `autostart-skipped`, `container-list`, `install-gate-fixture` |
+| 11 | `expire-skipped`, `prompt-wording-skipped` |
+
+Points where the script meets the runbook:
+
+- Step 3 runs the old package's own `stop --stop-bots` through the old CLI
+  (`cscb_run`), against the seeded fleet on 0.10.0.
+- Step 7 installs the build under test over the same install path, swaps in
+  the release candidate's client and checks it, then exports `SCENARIO_CLI`
+  as that path's CLI, so later starts and the trap's stop use the new build.
+  Each persona's credentials file is written by the new CLI's `credentials`
+  command, run with a generated `curl` wrapper first on its PATH that sends
+  its Slack API calls to the stub (declared as `slack-fixtures`).
+- Step 8 takes the store's online backup with `ad_store_backup`, then runs
+  the release candidate's `install.sh` in the scenario HOME and re-shims
+  (`install_ad_rc`). It reads the settings again through
+  `switch-over.ts settings` on the installed build and checks that a `get` of
+  each seeded row shows no `launch_started_at`.
+- Step 10 starts the new CSCB live through the CLI at the install path, each
+  persona's working directory in the stub's dev-channels mode, and waits for
+  each persona's row to read `waiting` within B, CSCB's launch bound from
+  step 8's settings.
+
+Health ticks run through config: the persona configuration sets
+`health_check_interval` (shorter than leg A's wait) and
+`session_restart_delay`. The stub's MCP session keeps each persona connected,
+so a tick does not reconnect it. Once every persona's session is connected,
+the script waits until the bot server has read each persona's row on three
+more ticks, and fails, naming it as a harness defect, if a tick reconnected
+or relaunched a persona.
+
+Leg A's checks, each its own `fail` naming the persona or row. CSCB's calls
+are the agent-director shim's lines from step 10's start on whose parent is a
+CSCB process:
+
+- after the migration, a `get` of each seeded row shows no
+  `launch_started_at` (step 8);
+- every persona starts fresh once: one plain spawn of its instance id by the
+  bot server, with no `--reuse-finished` and no resume, and the start pass
+  counts every persona fresh-spawned and none resumed;
+- pre-persona rows are kept and never resumed: no CSCB call names a seeded
+  instance id, and each seeded row is still present;
+- each persona's dev-channels dialog is cleared through agent-director: the
+  bot server's `read-pane` and `send-keys` on its own row, before the row
+  read `waiting`;
+- no unknown or UNAVAILABLE error leads to a delete, kill or respawn: CSCB
+  makes no `kill` or `delete` call, and exactly one launch per persona;
+- no persona reaches the restart cap: no restart-cap line in `server.log` and
+  no cap notice in the Slack stub's record;
+- no post repeats: no two `chat.postMessage` requests in the stub's record
+  share a channel and text.
+
+The script closes by checking that steps 1 to 11 were each entered once,
+prints the switch-over log, and ends with `assert_no_server_tmux`,
+`assert_no_cscb_include_finished` and `assert_no_cscb_delete`.
+
+The host check. `tests/fmk-switch-over-runbook.test.ts`, run by plain
+`bun test`, reads the README's switch-over section through the shared step
+reader (`runbookSteps`, `tests/test-helpers/runbooks.ts`) and the script's
+marker calls. It fails unless the script enters steps 1 to N of the README
+once each, in order, and declares exactly the substitution table above, each
+inside its step's section, with every marker a top-level line with a literal
+step and kind. So a change to the runbook's steps fails until Test 13
+follows it.
 
 ### Testplan tickets
 
@@ -497,6 +628,11 @@ Harness agent-director calls and store helpers:
   saying why, unless it is 16 lowercase hex characters.
   `ad_store_pending_no_launch <instance-id>` is one such edit (see The stub
   worker).
+- `ad_store_backup <dest>` is the switch-over runbook's online backup of the
+  store (step 8): sqlite3's `.backup`, the store opened read-only, into
+  `<dest>`, a new file under `SCENARIO_ROOT` (as written and by the real path
+  of its directory) whose path holds no `'` or control character. It then
+  fails unless the copy's `PRAGMA integrity_check` reads `ok`.
 - Each of these, `install_ad_shim` and every other install helper above, and
   every helper under Harness-only steps below, calls `require_ci_image` and
   then `require_scenario_home` as its first two steps (see Image marker).
@@ -688,7 +824,8 @@ The contract for a scenario:
   `track_pid` and extra cleanup with `on_exit` instead.
 - In fmk mode, keep HOME, `TMUX_TMPDIR` and PATH as sourcing set them; make
   every harness agent-director call with `ad` or `ad_capture`, every store
-  read or edit with `ad_store_id` or `ad_store_edit`, and every change to the
+  read or edit with `ad_store_id` or `ad_store_edit`, every copy of the store
+  with `ad_store_backup`, and every change to the
   install with the helpers above, followed by `reshim_ad` after any
   `install.sh` run; run every other CSCB CLI command or driver through
   `cscb_run`; and follow Rules for every fmk scenario below.
@@ -779,6 +916,7 @@ of another session's.
 | Scenario 19's `pending` row beside a leftover | `ad_store_seed_pending` |
 | Scenario 25's unusable recorded name | `ad_store_unusable_name` |
 | Scenarios 20 and 26's `pending` row with no launch start | `ad_store_pending_no_launch` (see The stub worker) |
+| The switch-over runbook's online backup of the store (scenario 1, step 8) | `ad_store_backup` (see the store helpers under Scenario helper) |
 | A human ending a leftover or a hand-made session by its session id | `end_session` |
 | A human's `kill` of a finished row with the include-finished option (scenario 10) | `ad_kill_include_finished` |
 | A human's `delete` of the row with the unusable name (scenario 25) | `ad_delete_unusable_row` |

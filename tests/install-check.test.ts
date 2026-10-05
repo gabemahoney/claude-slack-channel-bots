@@ -32,7 +32,7 @@
  *   - the remedies (b.jg5 SRJ-208, SRJ-212; the E2-gate, E5 and E35 hatch
  *     notes): the shared pointer texts name the runbook section's title, the
  *     publishing-host block's heading (`PUBLISHING_HOST_BLOCK_HEADING`, from
- *     `tests/test-helpers/runbooks.ts`) and the client-package check; each of
+ *     `src/ad-version-gate.ts`) and the client-package check; each of
  *     the five floor-unreadable failures carries the client-package remedy
  *     and the section title; the unreachable failure the section title and
  *     the install-cscb skill; the "other" failure the section title and "file
@@ -85,6 +85,7 @@ import {
   HOST_VERSION_FAIL_OTHER,
   INSTALL_CHECK_PHASE1_NOTE_PHRASE,
   PHASE1_RUNBOOK_SECTION_TITLE,
+  PUBLISHING_HOST_BLOCK_HEADING,
   UNREACHABLE_REASON_UNKNOWN,
   UNREACHABLE_REASON_UNPARSEABLE_VERSION,
 } from '../src/ad-version-gate.ts'
@@ -136,7 +137,6 @@ import {
   UNREACHABLE_REASONS,
 } from './test-helpers/install-check-fixtures.ts'
 import { flat } from './test-helpers/markdown.ts'
-import { PUBLISHING_HOST_BLOCK_HEADING } from './test-helpers/runbooks.ts'
 import { INSTALL_OR_REMOVAL_FORMS, UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
 
 // ---------------------------------------------------------------------------

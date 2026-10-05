@@ -227,7 +227,7 @@ for case_name in "${INVALID_CASES[@]}"; do
     step="invalid ${case_name}"
     bad_name="${SCENARIO_TAG}_${case_name}"
     bad_key="$(persona_key "${bad_name}")"
-    fields="$(invalid_fields "${case_name}")"
+    bad_fields="$(invalid_fields "${case_name}")"
     mapfile -t settings < <(invalid_settings "${case_name}")
     (( ${#settings[@]} > 0 )) || fail "${step}: no settings listed for the case"
 
@@ -247,7 +247,7 @@ for case_name in "${INVALID_CASES[@]}"; do
     },
     {
       $(persona_head "${bad_name}" "${SCENARIO_ROOT}/work/${bad_name}"),
-      ${fields}
+      ${bad_fields}
     }
   ],
   "bind": "127.0.0.1",

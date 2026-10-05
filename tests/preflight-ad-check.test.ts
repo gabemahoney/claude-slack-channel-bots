@@ -22,7 +22,7 @@
  * agent-director, or a file removal; E36 T2). The not-found and
  * below-client-minimum failures name the publishing-host block by its
  * heading (`PUBLISHING_HOST_BLOCK_HEADING`, from
- * `tests/test-helpers/runbooks.ts`; b.jg5 SRJ-211, E35 hatch note). Each
+ * `src/ad-version-gate.ts`; b.jg5 SRJ-211, E35 hatch note). Each
  * audit is also run on an in-memory copy with the old SR-2.5 put back, which
  * it must flag.
  *
@@ -47,6 +47,7 @@ import {
   buildPhase1HostNote,
   PHASE1_HOST_NOTE_PHRASE,
   PHASE1_RUNBOOK_SECTION_TITLE,
+  PUBLISHING_HOST_BLOCK_HEADING,
 } from '../src/ad-version-gate.ts'
 import type { InstallCheckFailure } from '../src/install-check.ts'
 import { AD_VERSION_FLOOR_UNREADABLE } from '../src/install-check-labels.ts'
@@ -67,7 +68,6 @@ import {
 } from './test-helpers/agent-director-versions.ts'
 import { cannedFailureResult, STALE_VERSION } from './test-helpers/install-check-fixtures.ts'
 import { flat, requiredSection, splitFences } from './test-helpers/markdown.ts'
-import { PUBLISHING_HOST_BLOCK_HEADING } from './test-helpers/runbooks.ts'
 import { INSTALL_OR_REMOVAL_FORMS, UPGRADE_FORMS, type ForbiddenForm } from './test-helpers/upgrade-forms.ts'
 
 const REPO_ROOT = resolve(import.meta.dir, '..')

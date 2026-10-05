@@ -82,12 +82,13 @@
 #                    directory under /tmp holding a decoy install and store,
 #                    and a symlink under SCENARIO_ROOT that resolves to it),
 #                    every install, re-shim, swap, hide and restore helper,
-#                    `ad`, `ad_store_edit`, `ad_store_id`,
-#                    `ad_store_pending_no_launch`, `stub_mode`,
-#                    `stub_press_enter`, `write_mcp_config` and every label,
-#                    seeding, tmux-step, store-statement, operator-action,
-#                    find-missing-loop and 0.10.0-seeder helper fails with the
-#                    guard's reason, and the decoy is left exactly as it was.
+#                    `ad`, `ad_store_edit`, `ad_store_id`, `ad_store_backup`
+#                    (which writes no copy), `ad_store_pending_no_launch`,
+#                    `stub_mode`, `stub_press_enter`, `write_mcp_config` and
+#                    every label, seeding, tmux-step, store-statement,
+#                    operator-action, find-missing-loop and 0.10.0-seeder
+#                    helper fails with the guard's reason, and the decoy is
+#                    left exactly as it was.
 #   shim_check       `check_ad_shim` passes a correct layout and fails, with
 #                    its reason, on a symlink to the shim and on a copy of the
 #                    shim without its marker line.
@@ -325,6 +326,10 @@
 #                    `ad_delete_unusable_row` and `ad_store_unusable_name`
 #                    refuse the live row, unchanged; `ad_store_unusable_name`
 #                    changes only the finished row's session name.
+#                    `ad_store_backup` refuses a destination outside
+#                    SCENARIO_ROOT, an existing one (left as it was) and a path
+#                    holding a `'`, each with its reason and no copy; then a
+#                    copy of the store reads integrity `ok` and the store's id.
 #   operator_actions once the other row's session is past the starting-session
 #                    bound: `ad_store_mark_finished` marks it `ended`, every
 #                    other column kept, its session still running; then
@@ -728,15 +733,15 @@ row_state_is() {
 # last_tmux_line_with <after> <fragment>...: print the last tmux shim log line
 # after line <after> that holds every fixed-string <fragment>.
 last_tmux_line_with() {
-    local after="$1" line frag found=""
+    local after="$1" line frag hit=""
     shift
     while IFS= read -r line; do
         for frag in "$@"; do
             [[ "${line}" == *"${frag}"* ]] || continue 2
         done
-        found="${line}"
+        hit="${line}"
     done < <(tail -n "+$(( after + 1 ))" "${SCENARIO_TMUX_SHIM_LOG}")
-    printf '%s\n' "${found}"
+    printf '%s\n' "${hit}"
 }
 
 # True when the tmux shim log holds more than <n> lines.
@@ -1043,6 +1048,7 @@ TRAIL_NOT_MISMATCH='.event == "ad.hook.ignored" and .hook_event == "SessionStart
 # trail_read <array-name> <jq-condition> [<jq-option>...]: set the array to
 # the times of the trail's records that <jq-condition> keeps, in trail order
 # (none when there is no trail yet). The options bind its variables.
+# shellcheck disable=SC2034 # trail_read_out is a nameref: it sets the caller's array
 trail_read() {
     local -n trail_read_out="$1"
     local cond="$2" out="${SCENARIO_ROOT}/trail-read.out"
@@ -1513,7 +1519,7 @@ leg_start_on_010() {
 }
 
 leg_guard_refusals() {
-    local step="guard refusals" link real_outside before home reason
+    local step="guard refusals" link real_outside before home reason backup="${SCENARIO_ROOT}/t0-guard-backup.db"
     OUTSIDE_HOME="$(mktemp -d /tmp/test-0-outside-home.XXXXXX)" || fail "${step}: could not make a HOME outside SCENARIO_ROOT"
     # A decoy install and store each helper would act on, were it not refused.
     mkdir -p "${OUTSIDE_HOME}/.agent-director/bin"
@@ -1542,6 +1548,9 @@ leg_guard_refusals() {
         expect_fails_in_home "${step}" "${home}" "${reason}" ad version
         expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_edit "UPDATE spawns SET labels = '{}'"
         expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_id
+        # The copy would land under SCENARIO_ROOT, outside the decoy.
+        expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_backup "${backup}"
+        [[ ! -e "${backup}" && ! -L "${backup}" ]] || fail "${step}: the refused ad_store_backup wrote ${backup}"
         expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_pending_no_launch "${T0_ROW_ID}"
         expect_fails_in_home "${step}" "${home}" "${reason}" stub_mode "${SCENARIO_ROOT}/work" "${STUB_MODE_AT_ONCE}"
         expect_fails_in_home "${step}" "${home}" "${reason}" stub_press_enter "${T0_SESSION}"
@@ -2249,7 +2258,7 @@ leg_stop_no_launch_start() {
 }
 
 leg_refire_grace() {
-    local step="re-fire until G" path pid times=() fired=() n first last g_end gap at_settle
+    local step="re-fire until G" path pid times=() fired=() n first last g_end gap
     local -A settled=()
     g_end="$(seconds_plus "${REFIRE_LS}" "${REFIRE_GRACE_S}")"
     sleep_until "$(seconds_plus "${g_end}" "${REFIRE_SETTLE_S}")"
@@ -2570,10 +2579,10 @@ leg_count_helpers() {
 # expect_count_on <step> <dir> <want> <verb> [<fragment>...]: cscb_ad_count on
 # <dir>'s files prints <want>.
 expect_count_on() {
-    local step="$1" dir="$2" want="$3" got
+    local step="$1" dir="$2" expected="$3" count
     shift 3
-    got="$(on_files "${dir}" cscb_ad_count "$@")" || fail "${step}: cscb_ad_count $* failed"
-    [[ "${got}" == "${want}" ]] || fail "${step}: cscb_ad_count $(quoted "$@") printed ${got}, not ${want}"
+    count="$(on_files "${dir}" cscb_ad_count "$@")" || fail "${step}: cscb_ad_count $* failed"
+    [[ "${count}" == "${expected}" ]] || fail "${step}: cscb_ad_count $(quoted "$@") printed ${count}, not ${expected}"
 }
 
 leg_closing_enforcement() {
@@ -2623,9 +2632,9 @@ row_snapshot() {
 # holds <want>'s values (a JSON object) in <want>'s columns and its value
 # before the edit in every other column.
 expect_row_change() {
-    local step="$1" before="$2" after="$3" want="$4" bad
+    local step="$1" before="$2" after="$3" changes="$4" bad
     [[ -n "${before}" && -n "${after}" ]] || fail "${step}: no row before or after the edit"
-    bad="$(jq -rn --argjson b "${before}" --argjson a "${after}" --argjson w "${want}" '
+    bad="$(jq -rn --argjson b "${before}" --argjson a "${after}" --argjson w "${changes}" '
         ([$a | keys[] as $k | select(($w | has($k)) | not) | select($a[$k] != $b[$k]) | "\($k) \($b[$k] | tojson) -> \($a[$k] | tojson)"]
          + [$w | keys[] as $k | select($a[$k] != $w[$k]) | "\($k) is \($a[$k] | tojson), not \($w[$k] | tojson)"]
          + (if ($a | keys) == ($b | keys) then [] else ["the columns changed"] end))
@@ -2903,6 +2912,25 @@ leg_store_statements() {
     after="$(row_snapshot "${T4_FIN_ID}")"
     expect_row_change "${step}: ad_store_unusable_name" "${before}" "${after}" \
         "$(jq -nc --arg n "${T4_UNUSABLE_NAME}" '{tmux_session_name: $n}')"
+
+    # ad_store_backup's own refusals each write no copy; then one copy.
+    local outside existing="${SCENARIO_ROOT}/t0-backup-existing.db" quoted="${SCENARIO_ROOT}/t0-backup-it's.db"
+    local copy="${SCENARIO_ROOT}/t0-backup.db" out
+    outside="$(mktemp -d /tmp/test-0-backup-outside.XXXXXX)" || fail "${step}: could not make a directory outside SCENARIO_ROOT"
+    expect_fails_in_home "${step}" "${HOME}" "refused: ${outside}/copy.db is not under SCENARIO_ROOT" \
+        ad_store_backup "${outside}/copy.db"
+    rmdir -- "${outside}" || fail "${step}: the refused ad_store_backup wrote under ${outside}"
+    printf 'decoy\n' > "${existing}"
+    expect_fails_in_home "${step}" "${HOME}" "${existing} already exists" ad_store_backup "${existing}"
+    [[ "$(< "${existing}")" == decoy ]] || fail "${step}: the refused ad_store_backup overwrote ${existing}"
+    expect_fails_in_home "${step}" "${HOME}" "the path holds a ' or a control character" ad_store_backup "${quoted}"
+    [[ ! -e "${quoted}" && ! -L "${quoted}" ]] || fail "${step}: the refused ad_store_backup wrote ${quoted}"
+    ad_store_backup "${copy}"
+    [[ -f "${copy}" ]] || fail "${step}: ad_store_backup left no copy at ${copy}"
+    out="$(sqlite3 -batch -bail -readonly "${copy}" "PRAGMA integrity_check;" 2>&1)"
+    [[ "${out}" == ok ]] || fail "${step}: the copy's integrity check reads '${out//$'\n'/ }'"
+    out="$(sqlite3 -batch -bail -readonly "${copy}" "SELECT value FROM store_meta WHERE key = 'store_id';" 2>&1)"
+    [[ "${out}" == "$(ad_store_id)" ]] || fail "${step}: the copy's store id '${out//$'\n'/ }' is not the store's"
 }
 
 leg_operator_actions() {
@@ -2970,7 +2998,7 @@ leg_operator_actions() {
 }
 
 leg_find_missing_loop() {
-    local step="find-missing loop" lines_before cscb_before runs line n=0 prev_end="" start end lines=() mine=() pid
+    local step="find-missing loop" lines_before cscb_before runs line n=0 prev_end="" start end lines=() mine=() pid run_re
     cscb_before="$(cscb_ad_count find-missing)"
     lines_before="$(line_count "${SCENARIO_AD_SHIM_LOG}")"
     run_find_missing_loop "${T4_FM_INTERVAL_S}"
@@ -2989,7 +3017,8 @@ leg_find_missing_loop() {
     (( runs >= 2 )) || fail "${step}: the loop's log holds ${runs} run(s)"
     while IFS= read -r line; do
         n=$(( n + 1 ))
-        [[ "${line}" =~ ^run\ ${n}$'\t'start\ ([0-9]+\.[0-9]+)$'\t'end\ ([0-9]+\.[0-9]+)$'\t'exit\ 0$ ]] \
+        run_re="^run ${n}"$'\t'"start ([0-9]+\.[0-9]+)"$'\t'"end ([0-9]+\.[0-9]+)"$'\t'"exit 0\$"
+        [[ "${line}" =~ ${run_re} ]] \
             || fail "${step}: the loop's log line '${line}' is not run ${n} with exit 0"
         start="${BASH_REMATCH[1]}"
         end="${BASH_REMATCH[2]}"

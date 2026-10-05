@@ -275,6 +275,12 @@
 #   ad_store_id                        open the store read-only and print its store id (store_meta
 #                                      key store_id); fail, saying why, unless it is 16 lowercase hex
 #                                      characters (a 0.10.0 store has none)
+#   ad_store_backup <dest>             the switch-over runbook's online-consistent copy of the store
+#                                      (step 8): sqlite3's `.backup`, the store opened read-only, into
+#                                      <dest>, a new file under SCENARIO_ROOT (as written and by the real
+#                                      path of its directory) whose path holds no `'` or control
+#                                      character; then the copy's `PRAGMA integrity_check` must read
+#                                      `ok`, or it fails
 #   ad_store_pending_no_launch <instance-id>
 #                                      b.jg5 SRJ-1306's `pending` row with no launch start, made from
 #                                      the row (the persona's live row) with one `ad_store_edit`
@@ -2041,6 +2047,33 @@ ad_store_id() {
     printf '%s\n' "${out}"
 }
 
+ad_store_backup() {
+    local dest="${1:-}" step db real_root real_dir out
+    step="ad_store_backup ${dest}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    db="${HOME}/.agent-director/state.db"
+    (( $# == 1 )) || fail "${step}: takes one destination, not $# arguments"
+    [[ "${dest}" == "${SCENARIO_ROOT}"/* ]] \
+        || fail "${step}: refused: ${dest} is not under SCENARIO_ROOT ${SCENARIO_ROOT}"
+    # The path goes inside the dot-command's single quotes.
+    [[ "${dest}" != *[\'[:cntrl:]]* ]] || fail "${step}: the path holds a ' or a control character"
+    [[ ! -e "${dest}" && ! -L "${dest}" ]] || fail "${step}: ${dest} already exists"
+    real_root="$(realpath -e -- "${SCENARIO_ROOT}" 2> /dev/null)" \
+        || fail "${step}: cannot resolve SCENARIO_ROOT ${SCENARIO_ROOT}"
+    real_dir="$(realpath -e -- "$(dirname -- "${dest}")" 2> /dev/null)" \
+        || fail "${step}: the directory of ${dest} does not exist"
+    [[ "${real_dir}" == "${real_root}" || "${real_dir}" == "${real_root}"/* ]] \
+        || fail "${step}: refused: the directory of ${dest} resolves to ${real_dir}, which is not under SCENARIO_ROOT ${real_root}"
+    [[ -f "${db}" ]] || fail "${step}: no store at ${db}"
+    out="$(sqlite3 -batch -bail -readonly -cmd ".timeout ${SCENARIO_STORE_BUSY_MS}" "${db}" ".backup '${dest}'" 2>&1)" \
+        || fail "${step}: sqlite3 .backup failed: ${out//$'\n'/ }"
+    [[ -f "${dest}" ]] || fail "${step}: sqlite3 .backup wrote no file at ${dest}"
+    out="$(sqlite3 -batch -bail -readonly "${dest}" "PRAGMA integrity_check;" 2>&1)" \
+        || fail "${step}: sqlite3 could not check the copy ${dest}: ${out//$'\n'/ }"
+    [[ "${out}" == ok ]] || fail "${step}: the copy's integrity check reads '${out//$'\n'/ }', not ok"
+}
+
 ad_store_pending_no_launch() {
     require_ci_image "ad_store_pending_no_launch"
     require_scenario_home "ad_store_pending_no_launch"
@@ -2507,7 +2540,9 @@ relabel_session() {
     _scenario_set_labels "${step}" "${sid}" "${pane}" "${owner}" "${pane_label}"
     SEEDED_SESSION_ID="${sid}"
     SEEDED_PANE_ID="${pane}"
+    # shellcheck disable=SC2034 # read by the scripts that source this file
     SEEDED_TOKEN="${token}"
+    # shellcheck disable=SC2034 # read by the scripts that source this file
     SEEDED_STORE_ID="${store}"
     printf '%s %s %s\n' "${sid}" "${pane}" "${token}"
 }
@@ -2696,6 +2731,7 @@ rebind_tmux_socket() {
     got="$("${SCENARIO_REAL_TMUX}" -S "${moved}" list-sessions -F '#{pid}' 2> /dev/null)" || got=""
     [[ "${got%%$'\n'*}" == "${old_pid}" ]] \
         || fail "${step}: the moved socket ${moved} answers with server pid '${got%%$'\n'*}', not the old server's ${old_pid}"
+    # shellcheck disable=SC2034 # read by the scripts that source this file
     REBOUND_SOCKET="${moved}"
     printf '%s %s %s\n' "${new_pid}" "${sid}" "${moved}"
 }
@@ -2942,6 +2978,7 @@ run_find_missing_loop() {
     FIND_MISSING_LOOP_INTERVAL_S="${interval}"
     ( _scenario_find_missing_loop "${dir}" "${interval}" ) < /dev/null &
     _SCENARIO_FM_LOOP_PID=$!
+    # shellcheck disable=SC2034 # read by the scripts that source this file
     FIND_MISSING_LOOP_PID="${_SCENARIO_FM_LOOP_PID}"
     track_pid "${_SCENARIO_FM_LOOP_PID}"
 }
@@ -3035,7 +3072,7 @@ _scenario_row_left_pending() {
 }
 
 seed_010_row() {
-    local id="${1:-}" name="${2:-}" dir="${3:-}" step mode label args=() out sid pane ppid argv=() a found=0 state
+    local id="${1:-}" name="${2:-}" dir="${3:-}" step mode label args=() out sid pane ppid argv=() a is_stub=0 state
     step="seed_010_row ${id}"
     require_ci_image "${step}"
     require_scenario_home "${step}"
@@ -3072,9 +3109,9 @@ seed_010_row() {
         || fail "${step}: tmux read '${out}' for session ${name}"
     mapfile -d '' -t argv 2> /dev/null < "/proc/${ppid}/cmdline" || true
     for a in ${argv[@]+"${argv[@]}"}; do
-        [[ "${a}" == "${SCENARIO_BIN}/claude" ]] && found=1
+        [[ "${a}" == "${SCENARIO_BIN}/claude" ]] && is_stub=1
     done
-    (( found )) || fail "${step}: the session's pane process ${ppid} is not the stub ${SCENARIO_BIN}/claude"
+    (( is_stub )) || fail "${step}: the session's pane process ${ppid} is not the stub ${SCENARIO_BIN}/claude"
     if [[ "${mode}" == "${STUB_MODE_AT_ONCE}" ]]; then
         wait_until "${SCENARIO_SEED_REPORT_S}" "${step}: the row never reported in" \
             _scenario_row_left_pending "${step}" "${id}"
@@ -3140,6 +3177,7 @@ seed_prepersona_fleet() {
         fi
         cwd="$(jq -r --arg c "${cid}" '.routes[$c].cwd // empty' "${config}")" \
             || fail "${step}: could not read routes[${cid}].cwd"
+        # shellcheck disable=SC2088 # a literal ~ in config.json, expanded here
         if [[ "${cwd}" == "~" ]]; then
             cwd="${HOME}"
         elif [[ "${cwd}" == "~/"* ]]; then
@@ -3564,6 +3602,7 @@ _scenario_fmk_setup() {
     [[ "$(command -v claude || true)" == "${SCENARIO_BIN}/claude" ]] \
         || fail "claude resolves to '$(command -v claude || true)', not the stub ${SCENARIO_BIN}/claude"
 
+    # shellcheck disable=SC2034 # read by the scripts that source this file
     SCENARIO_AD_BIN="${HOME}/.agent-director/bin/agent-director"
     SCENARIO_AD_SHIM_LOG="${HOME}/.agent-director/bin/agent-director-shim.log"
     # The files the closing enforcement reads, whatever a script later sets
