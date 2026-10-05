@@ -237,8 +237,52 @@
  *                                 "not this launch's session" latch, up to and
  *                                 including `step=`
  *
+ * The pre-trust entries (scenario 22). <ref> is a persona reference as the
+ * server logs it, <key> a persona key, <verb> a launch verb by its value (one
+ * of LAUNCH_VERB_SPAWN, LAUNCH_VERB_RESUME and LAUNCH_VERB_REUSE_SPAWN; any
+ * other fails), and <value> a `pre_trust` value as a launch result carries it:
+ *   PRE_TRUST_LOG_PREFIX          src/session-manager.ts PRE_TRUST_LOG_PREFIX: the head
+ *                                 of every `pre_trust` line
+ *   LAUNCH_VERB_SPAWN             src/session-manager.ts LAUNCH_VERB_SPAWN: the verb a
+ *                                 `pre_trust` line names for a plain spawn
+ *   LAUNCH_VERB_RESUME            src/session-manager.ts LAUNCH_VERB_RESUME: the verb a
+ *                                 `pre_trust` line names for a `resume`
+ *   LAUNCH_VERB_REUSE_SPAWN       src/session-manager.ts LAUNCH_VERB_REUSE_SPAWN: the
+ *                                 verb a `pre_trust` line names for a reuse spawn
+ * None of the above takes an argument.
+ *   preTrustLogLine <ref> <verb> [<value>]
+ *                                 src/session-manager.ts preTrustLogLine(<ref>, <verb>,
+ *                                 <value>): the one line a successful launch writes
+ *                                 about its `pre_trust`; with no <value>, the line for
+ *                                 a result that carries no `pre_trust` field (the
+ *                                 older-binary wording)
+ *   preTrustLogLineHead <ref> <verb>
+ *                                 src/session-manager.ts preTrustLogLine for a present
+ *                                 value, cut where the value begins: the head of
+ *                                 every such line for <ref> and <verb>, whatever
+ *                                 value it shows
+ *   personaInstanceId <key>       src/persona-identity.ts personaInstanceId: the
+ *                                 persona's agent-director instance id
+ *   personaTmuxSessionName <key>  src/persona-identity.ts personaTmuxSessionName: the
+ *                                 persona's tmux session name
+ *   personaDefaultConfigDirLabels <key> <home>
+ *                                 the labels a spawn of persona <key> with no
+ *                                 `claude_config_dir` carries under the home
+ *                                 directory <home>, one per line, in the order
+ *                                 src/session-manager.ts buildSpawnParams lists them:
+ *                                 src/persona-identity.ts SERVICE_LABEL, then
+ *                                 PERSONA_LABEL_PREFIX and <key>, then
+ *                                 CONFIG_DIR_LABEL_PREFIX and
+ *                                 src/session-manager.ts personaConfigDirLabelValue
+ *                                 (no directory, <home>), which resolves
+ *                                 `<home>/.claude` to its real path (the one
+ *                                 derivation the spawn labels and the collision
+ *                                 ladder's `config_dir` comparison share)
+ *
  * It makes no agent-director call, starts no process or server, opens no
  * socket, reads no token and writes no file.
+ * Only `personaDefaultConfigDirLabels` reads the file system: the real path
+ * of `<home>/.claude`.
  */
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
@@ -574,6 +618,29 @@ async function latchRecheckNotThisLaunchRoundHead(ref: string): Promise<string> 
   return cutAt(line, STEP_MARK, 'src/conflict-latch.ts latchRecheckRoundLine')
 }
 
+/** The launch verbs a `pre_trust` line names, by their exports in src/session-manager.ts. */
+const LAUNCH_VERB_EXPORTS = ['LAUNCH_VERB_SPAWN', 'LAUNCH_VERB_RESUME', 'LAUNCH_VERB_REUSE_SPAWN'] as const
+
+/** Where a present `pre_trust` value begins in a built line; cut off with all that follows it. */
+const VALUE_MARK = 'fmk-texts-value-mark'
+
+/** `preTrustLogLine(ref, verb, value)`, `value` undefined for a result with no `pre_trust` field; `entry` names the entry in a usage error. */
+async function preTrustLogLine(entry: string, ref: string, verb: string, value: string | undefined): Promise<string> {
+  const lineOf = await functionExport('session-manager.ts', 'preTrustLogLine')
+  const v = await oneOfExports(entry, 'verb', verb, 'session-manager.ts', LAUNCH_VERB_EXPORTS)
+  return builtText('session-manager.ts', 'preTrustLogLine', lineOf(ref, v, value))
+}
+
+/** The labels a spawn of persona `key` with no claude_config_dir carries under `home`, one per line. */
+async function personaDefaultConfigDirLabels(key: string, home: string): Promise<string> {
+  const service = await stringExport('persona-identity.ts', 'SERVICE_LABEL')
+  const personaPrefix = await stringExport('persona-identity.ts', 'PERSONA_LABEL_PREFIX')
+  const configDirPrefix = await stringExport('persona-identity.ts', 'CONFIG_DIR_LABEL_PREFIX')
+  const labelOf = await functionExport('session-manager.ts', 'personaConfigDirLabelValue')
+  const label = builtText('session-manager.ts', 'personaConfigDirLabelValue', labelOf(undefined, home))
+  return [service, `${personaPrefix}${key}`, `${configDirPrefix}${label}`].join('\n')
+}
+
 /** The entries, by the name a script passes. */
 const ENTRIES: Readonly<Record<string, Entry>> = {
   APPROVER_LOG_PREFIX: noArguments('APPROVER_LOG_PREFIX', () => stringExport('session-manager.ts', 'APPROVER_LOG_PREFIX')),
@@ -664,6 +731,28 @@ const ENTRIES: Readonly<Record<string, Entry>> = {
     conflictNotThisLaunchPost(name!, key!, description!),
   ),
   latchRecheckNotThisLaunchRoundHead: oneArgument('latchRecheckNotThisLaunchRoundHead', 'ref', latchRecheckNotThisLaunchRoundHead),
+  PRE_TRUST_LOG_PREFIX: noArguments('PRE_TRUST_LOG_PREFIX', () => stringExport('session-manager.ts', 'PRE_TRUST_LOG_PREFIX')),
+  LAUNCH_VERB_SPAWN: noArguments('LAUNCH_VERB_SPAWN', () => stringExport('session-manager.ts', 'LAUNCH_VERB_SPAWN')),
+  LAUNCH_VERB_RESUME: noArguments('LAUNCH_VERB_RESUME', () => stringExport('session-manager.ts', 'LAUNCH_VERB_RESUME')),
+  LAUNCH_VERB_REUSE_SPAWN: noArguments('LAUNCH_VERB_REUSE_SPAWN', () => stringExport('session-manager.ts', 'LAUNCH_VERB_REUSE_SPAWN')),
+  preTrustLogLine: async (args) => {
+    if (args.length !== 2 && args.length !== 3) {
+      throw new PrinterFailure(USAGE_EXIT, `preTrustLogLine takes <ref> <verb> [<value>] (got ${args.length} argument(s))`)
+    }
+    return await preTrustLogLine('preTrustLogLine', args[0]!, args[1]!, args[2])
+  },
+  preTrustLogLineHead: exactArguments('preTrustLogLineHead', ['ref', 'verb'], async ([ref, verb]) =>
+    cutAt(await preTrustLogLine('preTrustLogLineHead', ref!, verb!, VALUE_MARK), VALUE_MARK, 'src/session-manager.ts preTrustLogLine'),
+  ),
+  personaInstanceId: oneArgument('personaInstanceId', 'key', async (key) =>
+    builtText('persona-identity.ts', 'personaInstanceId', (await functionExport('persona-identity.ts', 'personaInstanceId'))(key)),
+  ),
+  personaTmuxSessionName: oneArgument('personaTmuxSessionName', 'key', async (key) =>
+    builtText('persona-identity.ts', 'personaTmuxSessionName', (await functionExport('persona-identity.ts', 'personaTmuxSessionName'))(key)),
+  ),
+  personaDefaultConfigDirLabels: exactArguments('personaDefaultConfigDirLabels', ['key', 'home'], ([key, home]) =>
+    personaDefaultConfigDirLabels(key!, home!),
+  ),
 }
 
 async function main(argv: readonly string[]): Promise<number> {
