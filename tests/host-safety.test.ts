@@ -44,9 +44,9 @@
  *   `tests/integration/test-*.sh` that does not source it (found from the
  *   directory) check `/etc/cscb-ci-image` before their first other step; each
  *   script that sources scenario.sh runs nothing before its source line;
- *   `fmk-driver.ts` and `stub-mcp-session.ts` (a listed pair) each check the
- *   marker first and statically import only `node:` built-ins, type-only
- *   imports included; and scenario.sh's `install_ad_shim`, `ad_store_edit`,
+ *   `fmk-driver.ts`, `stub-mcp-session.ts` and `fmk-texts.ts` (a listed
+ *   three) each check the marker first and statically import only `node:`
+ *   built-ins, type-only imports included; and scenario.sh's `install_ad_shim`, `ad_store_edit`,
  *   `ad_store_id`, `stub_mode` and `ad_store_pending_no_launch` call
  *   `require_scenario_home` before their first
  *   sqlite3, copy, move or install step, a call of a scenario.sh function
@@ -1649,13 +1649,15 @@ const RUNNER_PATH = join(TESTS_DIR, 'runner.sh')
 const SCENARIO_PATH = join(INTEGRATION_DIR, 'lib', 'scenario.sh')
 const FMK_DRIVER_PATH = join(INTEGRATION_DIR, 'fixtures', 'fmk-driver.ts')
 const STUB_MCP_SESSION_PATH = join(INTEGRATION_DIR, 'fixtures', 'stub-mcp-session.ts')
+const FMK_TEXTS_PATH = join(INTEGRATION_DIR, 'fixtures', 'fmk-texts.ts')
 
 /**
  * The TypeScript fixtures run as a whole file in the image, each refusing
  * without the marker as its first statement and importing only `node:`
- * built-ins statically: the forced-call driver and the stub's MCP session.
+ * built-ins statically: the forced-call driver, the stub's MCP session and
+ * the scenario value printer.
  */
-const IMAGE_GUARDED_TS_PATHS: readonly string[] = [FMK_DRIVER_PATH, STUB_MCP_SESSION_PATH]
+const IMAGE_GUARDED_TS_PATHS: readonly string[] = [FMK_DRIVER_PATH, STUB_MCP_SESSION_PATH, FMK_TEXTS_PATH]
 
 /** The file only the cscb-ci images carry (docker/Dockerfile.test.base). */
 const CI_IMAGE_MARKER = '/etc/cscb-ci-image'
@@ -1668,7 +1670,7 @@ const IMAGE_GUARD_RULE = {
   sourceFirst: 'source-line-first',
   /** The HOME-under-SCENARIO_ROOT check comes before the helper's first sqlite3, copy, move or install step. */
   homeCheckFirst: 'home-check-before-step',
-  /** fmk-driver.ts and stub-mcp-session.ts statically import only `node:` built-ins. */
+  /** fmk-driver.ts, stub-mcp-session.ts and fmk-texts.ts statically import only `node:` built-ins. */
   driverStaticImport: 'driver-static-import',
 } as const
 
@@ -2201,7 +2203,8 @@ function expectNamedFindings(findings: readonly string[], file: string, rule: st
 
 describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first (b.jg5 SRJ-1306)', () => {
   // What is not a step. Shell: the shebang, comments, blank lines, `set`
-  // options and literal assignments. fmk-driver.ts: static imports of
+  // options and literal assignments. The TypeScript fixtures (fmk-driver.ts,
+  // stub-mcp-session.ts, fmk-texts.ts): static imports of
   // `node:` built-ins; a static import of any other module is a step, since
   // it is evaluated before the check. These files are read, never run.
 
@@ -2392,7 +2395,7 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
     })
   })
 
-  describe('fmk-driver.ts and stub-mcp-session.ts check the marker before their first step', () => {
+  describe('fmk-driver.ts, stub-mcp-session.ts and fmk-texts.ts check the marker before their first step', () => {
     const NODE_IMPORTS = lines("import { existsSync } from 'node:fs'", "import { join } from 'node:path'")
     const CHECK = lines(`if (!existsSync('${CI_IMAGE_MARKER}')) {`, "  console.error('FAIL: fmk-driver: refused')", '  process.exit(2)', '}')
     const AFTER = "const mod = await import(join(process.env['CSCB_PKG_DIR'] ?? '/test-repo', 'src', 'x.ts'))"
@@ -2412,6 +2415,7 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       ['no check at all', RULE.markerFirst, lines(NODE_IMPORTS, AFTER)],
       ['a type-only import of a relative module', RULE.driverStaticImport, lines(NODE_IMPORTS, "import type { McpConfig } from './mcp-types.ts'", CHECK)],
       ['a type-only named binding from a package', RULE.driverStaticImport, lines(NODE_IMPORTS, "import { type Client } from '@modelcontextprotocol/sdk/client/index.js'", CHECK)],
+      ['a static import of a src/ module by relative path before the check', RULE.driverStaticImport, lines(NODE_IMPORTS, "import { PHASE1_FLOOR_VERSION } from '../../../src/ad-version-gate.ts'", CHECK)],
     ]
     const flagged: [file: string, label: string, rule: string, source: string][] = FILES.flatMap((file) => violations.map(([label, rule, source]): [string, string, string, string] => [file, label, rule, source]))
 
@@ -2428,8 +2432,8 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       expect(driverGuardFindings('fmk-driver.ts', source)).toEqual([])
     })
 
-    test('the audited files: the forced-call driver and the stub’s MCP session, both present', () => {
-      expect(FILES).toEqual(['fmk-driver.ts', 'stub-mcp-session.ts'])
+    test('the audited files: the forced-call driver, the stub’s MCP session and the scenario value printer, all present', () => {
+      expect(FILES).toEqual(['fmk-driver.ts', 'stub-mcp-session.ts', 'fmk-texts.ts'])
       for (const path of IMAGE_GUARDED_TS_PATHS) expect(existsSync(path)).toBe(true)
     })
 
